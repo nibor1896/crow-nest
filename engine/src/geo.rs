@@ -104,3 +104,27 @@ pub fn gdn_index(layer: usize) -> usize {
 pub fn attn_index(layer: usize) -> usize {
     layer / 4
 }
+
+/// Prefill chunk policy (#16). `CROW_CHUNK=<n>` is authoritative; without it the
+/// chunk follows the prompt length (rounded up to 512, at most 2048), so a short
+/// prompt keeps the chunk-512 scratch and its larger hot set (N 157 vs 140 at
+/// chunk 2048) and a long prompt takes the fewest PCIe passes over the cold tier.
+/// `CROW_CHUNK_AUTO=1` applies the policy on top of an explicit `CROW_CHUNK`
+/// (cap = max(CROW_CHUNK, 2048)); `CROW_CHUNK_AUTO=0` disables it.
+/// Default since 2026-09-05 (auto on; opt-in before). Gated: chunk 1024 and 2048
+/// deterministic since #22, long-prompt references = ten-task series final4.
+pub fn apply_chunk_policy(cfg: &mut Config, n_prompt: usize) {
+    let explicit = std::env::var("CROW_CHUNK").ok().and_then(|v| v.parse::<usize>().ok());
+    if let Some(c) = explicit {
+        cfg.prompt_chunk = c.max(1);
+    }
+    let auto = match std::env::var("CROW_CHUNK_AUTO").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => explicit.is_none(),
+    };
+    if auto {
+        let need = ((n_prompt + 511) / 512 * 512).max(512);
+        cfg.prompt_chunk = need.min(cfg.prompt_chunk.max(2048));
+    }
+}

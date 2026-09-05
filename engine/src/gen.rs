@@ -225,6 +225,7 @@ pub struct Params {
     pub t: Dev,
     pub init: Dev,
     pub pos_base: Dev,
+    pub pos_base_sb: Dev, // [n_sb] pos_base + i * ATTN_SB, refreshed per attn_prompt (#16)
     pub pos_base_b4: Dev, // block base * 4 (rope for pooled rows)
     pub slot_base: Dev,
     pub ncb: Dev,        // [C] per-query complete block counts
@@ -1084,6 +1085,15 @@ fn qfuse_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLo
 /// QSA scores warp-per-block (both graph-static; cost no longer grows
 /// linearly with the context inside one block)
 fn attn_split_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| env_on("CROW_ATTN_SPLIT")) }
+/// #16 (2026-09-05): prompt attention in sub-batches of ATTN_SB tokens. The QSA
+/// score buffer [chunk][cap] f32 (256 KB per token, 512 MB at chunk 2048) shrinks
+/// to [ATTN_SB][cap]; scores / select / attn_sel take pointer offsets per
+/// sub-batch and a per-sub-batch pos_base scalar. Same arithmetic, same order
+/// per token: bit-identical by construction. CROW_ATTN_SB=0 restores the
+/// full-chunk buffer (one sub-batch).
+pub const ATTN_SB: usize = 512;
+fn attn_sb_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| env_on("CROW_ATTN_SB")) }
+fn attn_sb(chunk: usize) -> usize { if attn_sb_on() { chunk.min(ATTN_SB).max(1) } else { chunk.max(1) } }
 pub const ATTN_SPLITS: usize = 8;
 pub const QSA_PAR_BLOCKS: u32 = 512;
 
@@ -1181,6 +1191,7 @@ impl Params {
             t: cuda::to_i32_dev(&[1]),
             init: cuda::to_i32_dev(&[1]),
             pos_base: cuda::to_i32_dev(&[0]),
+            pos_base_sb: cuda::to_i32_dev(&vec![0i32; (cfg.prompt_chunk.max(1) + ATTN_SB - 1) / ATTN_SB]),
             pos_base_b4: cuda::to_i32_dev(&[0]),
             slot_base: cuda::to_i32_dev(&[0]),
             ncb: cuda::to_i32_dev(&vec![0i32; cfg.prompt_chunk.max(1)]),
@@ -1290,7 +1301,7 @@ impl Scratch {
             pool_raw: d(cap_blocks * QSA_HID),
             pool_nrm: d(cap_blocks * QSA_HID),
             pool_rot: d(cap_blocks * QSA_HID),
-            scores: d(c * cap_blocks),
+            scores: d(attn_sb(c) * cap_blocks), // #16: [ATTN_SB][cap] when sub-batched
             sel: db(c * QSA_SEL_MAX * 4),
             sel_n: db(c * 4),
             ple_key: d(c * HCT),
@@ -1594,22 +1605,37 @@ impl Engine {
                 p.q_heads1 as u64, p.pos_mul4 as u64, p.stride128 as u64, p.pos_base_b4 as u64]);
         step!("launch #16");
         }
-        if attn_split_on() {
-            let ncb_max = ((pos_base + t + 3) / 4).min(65536);
-            launch_v(k.f("qsa_scores_par"), (((ncb_max + 3) / 4).clamp(1, 512)) as u32, t as u32, 1, 128, &[
-                s.q_rot as u64, pooled, s.scores as u64, p.cap as u64, p.pos_base as u64]);
-        } else {
-            launch_v(k.f("qsa_scores"), t as u32, 1, 1, QSA_HD as u32, &[
-                s.q_rot as u64, pooled, s.scores as u64, p.cap as u64, p.pos_base as u64]);
+        // #16: scores / select / attn_sel per sub-batch of ATTN_SB tokens (the score
+        // buffer is [ATTN_SB][cap]); every other buffer is indexed by the token
+        // row, so a base-pointer offset per sub-batch is the whole change.
+        let sb = attn_sb(self.cfg.prompt_chunk);
+        let n_sb = (t + sb - 1) / sb;
+        let pb: Vec<i32> = (0..n_sb).map(|i| (pos_base + i * sb) as i32).collect();
+        cuda::to_i32_into(p.pos_base_sb, &pb);
+        for i in 0..n_sb {
+            let t0 = i * sb;
+            let tb = (t - t0).min(sb);
+            let pos_base_i = p.pos_base_sb as u64 + (i * 4) as u64;
+            let q_rot_i = s.q_rot as u64 + (t0 * QSA_HEADS * QSA_HD * 4) as u64;
+            let sel_i = s.sel as u64 + (t0 * QSA_SEL_MAX * 4) as u64;
+            let sel_n_i = s.sel_n as u64 + (t0 * 4) as u64;
+            if attn_split_on() {
+                let ncb_max = ((pos_base + t0 + tb + 3) / 4).min(65536);
+                launch_v(k.f("qsa_scores_par"), (((ncb_max + 3) / 4).clamp(1, 512)) as u32, tb as u32, 1, 128, &[
+                    q_rot_i, pooled, s.scores as u64, p.cap as u64, pos_base_i]);
+            } else {
+                launch_v(k.f("qsa_scores"), tb as u32, 1, 1, QSA_HD as u32, &[
+                    q_rot_i, pooled, s.scores as u64, p.cap as u64, pos_base_i]);
+            }
+            step!("launch #17");
+            launch_v(k.f(if qsa_fast_on() { "qsa_select_fast" } else { "qsa_select" }), tb as u32, 1, 1, 256, &[
+                s.scores as u64, p.ncb as u64 + (t0 * 4) as u64, sel_i, sel_n_i, p.k_top as u64,
+                p.cap as u64, p.n_selmax as u64, p.pos_row as u64 + (t0 * 4) as u64]);
+            step!("launch #18");
+            launch_v(k.f("attn_sel"), NQ as u32, tb as u32, 1, AHD as u32, &[
+                s.aqr as u64 + (t0 * CORE * 4) as u64, kc, vc, sel_i, sel_n_i, p.tmax as u64, p.mode as u64,
+                p.n_selmax as u64, s.aout as u64 + (t0 * CORE * 4) as u64]);
         }
-        step!("launch #17");
-        launch_v(k.f(if qsa_fast_on() { "qsa_select_fast" } else { "qsa_select" }), t as u32, 1, 1, 256, &[
-            s.scores as u64, p.ncb as u64, s.sel as u64, s.sel_n as u64, p.k_top as u64,
-            p.cap as u64, p.n_selmax as u64, p.pos_row as u64]);
-        step!("launch #18");
-        launch_v(k.f("attn_sel"), NQ as u32, t as u32, 1, AHD as u32, &[
-            s.aqr as u64, kc, vc, s.sel as u64, s.sel_n as u64, p.tmax as u64, p.mode as u64,
-            p.n_selmax as u64, s.aout as u64]);
 
         if dbg {
             cuda::sync();
@@ -3184,6 +3210,9 @@ impl Drop for Weights {
             }
             for m in self.moe.iter_mut() {
                 cuda::free_dev(&mut m.router);
+                // #18: the bf16 router twin (2.62 MB x 48 layers = 125.8 MB) was never
+                // freed - the engine-side part of the 214 MB per reload (2026-09-05)
+                cuda::free_dev(&mut m.router_bf);
                 cuda::free_dev(&mut m.sgate);
                 for f in [&mut m.sg.w, &mut m.sg.gs, &mut m.su.w, &mut m.su.gs, &mut m.sdn.w, &mut m.sdn.gs] {
                     cuda::free_dev(f);
@@ -3218,7 +3247,7 @@ impl Drop for Params {
             for f in [&mut self.n320, &mut self.n2560, &mut self.n640, &mut self.n6144, &mut self.n10240,
                       &mut self.n2048, &mut self.n12288, &mut self.n_conv_deq, &mut self.n_selmax,
                       &mut self.k_top, &mut self.cap, &mut self.tmax, &mut self.mode, &mut self.t,
-                      &mut self.init, &mut self.pos_base, &mut self.pos_base_b4, &mut self.slot_base,
+                      &mut self.init, &mut self.pos_base, &mut self.pos_base_sb, &mut self.pos_base_b4, &mut self.slot_base,
                       &mut self.ncb, &mut self.pos_row, &mut self.block_base, &mut self.n_new,
                       &mut self.row_base, &mut self.n_rows, &mut self.slot1, &mut self.one,
                       &mut self.zero, &mut self.n_vocab, &mut self.nt_low, &mut self.nt_hct,

@@ -1,0 +1,56 @@
+{
+  "answers": {
+    "t2b-write-refactor": {
+      "answer_ids": [
+        40,
+        3172,
+        22903,
+        279,
+        1970,
+        15060,
+        11,
+        10229,
+        279,
+        64285,
+        321,
+        21851,
+        11,
+        1179,
+        7936,
+        264,
+        35209,
+        1985,
+        72833,
+        13,
+        248046
+      ],
+      "max_tokens": 1280
+    }
+  },
+  "crow_answers_text": {
+    "t2b-write-refactor": "I'll analyze the code carefully, identify the duplication and bugs, then produce a faithful refactoring."
+  },
+  "measurements": [
+    {
+      "arm": "crow",
+      "decode_tok_s": 36.71093772671189,
+      "note": "prompt_tokens 596; stopped_eos at 21",
+      "position_in_series": 0,
+      "prefill_tok_s": 172.41926475160358,
+      "prompt": "t2b-write-refactor",
+      "wall_s": 94.0227226
+    }
+  ],
+  "meta": {
+    "arm": "crow",
+    "crow_container": "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq",
+    "execution": "arm-phased (exclusive resources; paired rotated order per arm, identical to the other arm's)",
+    "first_mover_rule": "crow",
+    "operating_point": "200k floor, -np 1, greedy, temperature 0",
+    "order": [
+      "t2b-write-refactor"
+    ],
+    "run_index": 0,
+    "warmup": "one cold prefill per phase start, discarded (spec 0.3)"
+  }
+}

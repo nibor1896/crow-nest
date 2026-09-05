@@ -143,16 +143,8 @@ fn main() {
                 let gen: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(32);
                 let ids = read_ids(&ids_path);
                 cfg.context = CONTEXT_FLOOR;
-                if let Some(c) = std::env::var("CROW_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()) {
-                    cfg.prompt_chunk = c.max(1);
-                }
-                // CROW_CHUNK_AUTO=1 (#16): the prefill chunk follows the prompt length
-                // (round up to 512, at most CROW_CHUNK or 2048), so a short prompt keeps the
-                // chunk-512 scratch and its larger hot set (N 157 vs 140 at chunk 2048)
-                if std::env::var("CROW_CHUNK_AUTO").as_deref() == Ok("1") {
-                    let need = ((ids.len() + 511) / 512 * 512).max(512);
-                    cfg.prompt_chunk = need.min(cfg.prompt_chunk.max(2048));
-                }
+                // #16: CROW_CHUNK explicit, else auto by prompt length (geo.rs)
+                crow_nest_engine::geo::apply_chunk_policy(&mut cfg, ids.len());
                 std::fs::create_dir_all("decode_out").unwrap();
                 let (mut eng, _rep) =
                     Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));

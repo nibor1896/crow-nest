@@ -64,6 +64,10 @@ name = "pin_probe"
 path = "src/bin/pin_probe.rs"
 
 [[bin]]
+name = "pin_leak"
+path = "src/bin/pin_leak.rs"
+
+[[bin]]
 name = "coldtier"
 path = "src/bin/coldtier.rs"
 

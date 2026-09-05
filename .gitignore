@@ -6,6 +6,10 @@ converter/*.hotsets.json
 # build trees
 engine/target/
 engine/target_new*/
+engine/target_auto/
+engine/target_sb/
+engine/target_rel/
+engine/target_probe/
 probes/target/
 handoff-bench/target/
 # python
