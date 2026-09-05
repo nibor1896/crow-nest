@@ -238,13 +238,15 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
             ids.len() as f64 / prefill_s,
             (steps as f64 - if stopped_eos { 0.0 } else { 1.0 }).max(1.0) / dec_s.max(1e-9),
             format!(
-                "prompt_tokens {}{}",
+                "prompt_tokens {}{}{}",
                 ids.len(),
                 if stopped_eos {
                     format!("; stopped_eos at {}", answer.len())
                 } else {
                     String::new()
-                }
+                },
+                // #20: a sampled answer names its profile and seed in the record
+                match &sampler { Some(s) => format!("; {}", s.describe()), None => String::new() }
             ),
             answer,
         )

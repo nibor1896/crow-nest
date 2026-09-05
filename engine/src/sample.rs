@@ -36,6 +36,8 @@ pub struct Sampler {
     pub top_p: f32,
     pub top_k: usize,
     pub presence_penalty: f32,
+    /// CROW_SEED as given (the record names it, so a sampled answer is reproducible)
+    pub seed: u64,
     pub rng: Rng,
     /// tokens generated so far in this answer (presence penalty applies to them)
     seen: std::collections::HashSet<usize>,
@@ -61,13 +63,14 @@ impl Sampler {
             top_p: f("CROW_TOP_P", 0.8),
             top_k: u("CROW_TOP_K", 20),
             presence_penalty: f("CROW_PRESENCE", 1.5),
+            seed: u("CROW_SEED", 0) as u64,
             rng: Rng::new(u("CROW_SEED", 0) as u64),
             seen: Default::default(),
         })
     }
 
     pub fn describe(&self) -> String {
-        format!("sample: temp {} top_p {} top_k {} presence {}", self.temperature, self.top_p, self.top_k, self.presence_penalty)
+        format!("sample: temp {} top_p {} top_k {} presence {} seed {}", self.temperature, self.top_p, self.top_k, self.presence_penalty, self.seed)
     }
 
     /// register a token that is part of the answer (for the presence penalty)
@@ -161,12 +164,12 @@ mod tests {
     use super::*;
     #[test]
     fn greedy_when_cold() {
-        let mut s = Sampler { temperature: 0.0, top_p: 1.0, top_k: 5, presence_penalty: 0.0, rng: Rng::new(1), seen: Default::default() };
+        let mut s = Sampler { temperature: 0.0, top_p: 1.0, top_k: 5, presence_penalty: 0.0, seed: 0, rng: Rng::new(1), seen: Default::default() };
         assert_eq!(s.sample(&[0.1, 3.0, 2.0]), 1);
     }
     #[test]
     fn nucleus_never_picks_outside_top_k() {
-        let mut s = Sampler { temperature: 1.0, top_p: 1.0, top_k: 2, presence_penalty: 0.0, rng: Rng::new(7), seen: Default::default() };
+        let mut s = Sampler { temperature: 1.0, top_p: 1.0, top_k: 2, presence_penalty: 0.0, seed: 0, rng: Rng::new(7), seen: Default::default() };
         let logits = [5.0, 4.0, -50.0, -50.0];
         for _ in 0..200 {
             assert!(s.sample(&logits) < 2);
@@ -174,14 +177,14 @@ mod tests {
     }
     #[test]
     fn presence_penalty_moves_mass() {
-        let mut s = Sampler { temperature: 0.0, top_p: 1.0, top_k: 3, presence_penalty: 5.0, rng: Rng::new(1), seen: Default::default() };
+        let mut s = Sampler { temperature: 0.0, top_p: 1.0, top_k: 3, presence_penalty: 5.0, seed: 0, rng: Rng::new(1), seen: Default::default() };
         s.observe(1);
         assert_eq!(s.sample(&[2.0, 3.0, 1.0]), 0);
     }
     #[test]
     fn seeded_is_reproducible() {
         let logits: Vec<f32> = (0..50).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
-        let mk = || Sampler { temperature: 0.7, top_p: 0.8, top_k: 20, presence_penalty: 1.5, rng: Rng::new(42), seen: Default::default() };
+        let mk = || Sampler { temperature: 0.7, top_p: 0.8, top_k: 20, presence_penalty: 1.5, seed: 42, rng: Rng::new(42), seen: Default::default() };
         let (mut a, mut b) = (mk(), mk());
         let ta: Vec<usize> = (0..20).map(|_| { let t = a.sample(&logits); a.observe(t); t }).collect();
         let tb: Vec<usize> = (0..20).map(|_| { let t = b.sample(&logits); b.observe(t); t }).collect();
