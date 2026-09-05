@@ -187,6 +187,14 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
         let mut trickle_swaps = 0usize;
         let c0 = eng.drain_counters();
         let (ple_r0, ple_m0) = (eng.ple.req, eng.ple.miss);
+        // #20: CROW_SAMPLE=1 -> host-side sampling with the data-sheet profile
+        let mut sampler = crow_nest_engine::sample::Sampler::from_env();
+        if let Some(s) = &mut sampler {
+            eprintln!("[{}]", s.describe());
+            let lg = crow_nest_engine::cuda::dtoh(eng.s.logits, crow_nest_engine::geo::V);
+            next = s.sample(&lg);
+            s.observe(next);
+        }
         let mut answer: Vec<i64> = vec![next as i64];
         let mut stopped_eos = EOS_STOP.contains(&(next as i64));
         let t1 = Instant::now();
@@ -199,6 +207,11 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
                 trickle_swaps += eng.adapt_tick(adapt_max);
             }
             next = eng.decode_step(&mut cnq, next as i64);
+            if let Some(s) = &mut sampler {
+                let lg = crow_nest_engine::cuda::dtoh(eng.s.logits, crow_nest_engine::geo::V);
+                next = s.sample(&lg);
+                s.observe(next);
+            }
             answer.push(next as i64);
             steps += 1;
             if EOS_STOP.contains(&(next as i64)) {

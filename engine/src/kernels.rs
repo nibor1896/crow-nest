@@ -2470,6 +2470,31 @@ extern "C" __global__ void ple_conv_step(const float* __restrict__ gn_row,
     state[c * 9 + 8] = gn_row[c];
 }
 
+// ---------------- #17: bundled hot-set swaps ----------------
+// Exchange the bytes of n pairs (hot VRAM slab <-> pinned cold slab, UVA) in
+// ONE launch: grid (pairs, SPLIT), block 256, 16-byte units, no bounce slot.
+// Replaces 6 stream memcpys per swap (2026-09-05: 8 swaps x 48 layers x 6 =
+// 2304 copies per adaptation tick, mean 29.2 ms vs p50 22.8 ms at 16k).
+extern "C" __global__ void swap_pairs(unsigned long long* __restrict__ pa,
+                                      unsigned long long* __restrict__ pb,
+                                      const int* __restrict__ nbytes_p) {
+    int pair = blockIdx.x;
+    int split = gridDim.y;
+    int part = blockIdx.y;
+    size_t n16 = ((size_t)*nbytes_p) >> 4;
+    size_t per = (n16 + split - 1) / split;
+    size_t lo = (size_t)part * per;
+    size_t hi = lo + per; if (hi > n16) hi = n16;
+    uint4* a = (uint4*)pa[pair];
+    uint4* b = (uint4*)pb[pair];
+    for (size_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+        uint4 x = a[i];
+        uint4 y = b[i];
+        a[i] = y;
+        b[i] = x;
+    }
+}
+
 // ---------------- head: lm_head argmax ----------------
 extern "C" __global__ void argmax_k(const float* __restrict__ logits, int* __restrict__ out,
                                     const int* __restrict__ n_p) {
@@ -2511,7 +2536,7 @@ impl Kernels {
             "sigmoid_el", "sig2_div4", "mix_streams", "inject_residual", "silu_mul640",
             "silu_mul_combo", "acc_scale", "acc_combo", "gate_shared", "conv_silu", "transpose_rt",
             "conv_state_update", "split_qkv", "l2norm_repeat", "beta_g", "delta_rule_persist", "conv_step",
-            "delta_rule_step", "delta_rule_persist_r", "delta_rule_step_r", "rmsnorm_gated", "split_qg", "rope", "rope_p", "stage_cold", "stage_cold_lb", "stage_tiles_lb", "expand_slab", "moe_count", "moe_plan", "moe_scatter", "stage_tiles", "gemm_fp4_tiles", "silu_tiles", "quant_tiles", "store_kv", "attn_sel",
+            "delta_rule_step", "delta_rule_persist_r", "delta_rule_step_r", "rmsnorm_gated", "split_qg", "rope", "rope_p", "stage_cold", "stage_cold_lb", "stage_tiles_lb", "swap_pairs", "expand_slab", "moe_count", "moe_plan", "moe_scatter", "stage_tiles", "gemm_fp4_tiles", "silu_tiles", "quant_tiles", "store_kv", "attn_sel",
             "gate_mul", "rms128", "rope64", "pool4_cache", "qk_k_append", "d2d_block", "qsa_scores",
             "qsa_select", "qsa_select_fast", "router_top10", "gather_ple_fp4", "gate_dot", "gate_apply", "ple_conv",
             "ple_state_update", "ple_conv_step", "argmax_k", "add_flat",

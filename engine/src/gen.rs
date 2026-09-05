@@ -197,6 +197,8 @@ pub struct Ple {
     pub gs_host: Vec<f32>,
     pub n_slots: usize,
     pub slot_map: Vec<i32>,
+    pub batch_tag: Vec<u32>, // #22: slot claimed in batch `batch` (collision probe within one chunk)
+    pub batch: u32,
     pub req: u64,  // PLE rows requested (hit-rate counter, #16)
     pub miss: u64, // PLE rows filled from the container
     pub state: Dev,   // [10240][9] conv state
@@ -344,6 +346,7 @@ pub struct Scratch {
 
 pub struct Engine {
     pub k: Kernels,
+    pub module: cuda::Module, // #18: kept so Drop can unload it after every kernel user is gone
     pub st: ThreeStates,
     pub res: Residency,
     pub w: Weights,
@@ -720,6 +723,7 @@ impl Engine {
         (
             Engine {
                 k,
+                module,
                 st,
                 res,
                 w,
@@ -876,6 +880,8 @@ impl Ple {
             gs_host: vec![0f32; n_slots],
             n_slots,
             slot_map: vec![-1i32; n_slots],
+            batch_tag: vec![0u32; n_slots],
+            batch: 0,
             req: 0,
             miss: 0,
             state,
@@ -963,11 +969,28 @@ impl Ple {
     pub unsafe fn ensure_rows(&mut self, cnq: &mut Cnq, ngids: &[i64]) -> Vec<i32> {
         let mut slots = vec![0i32; ngids.len()];
         let mut fill_rows: Vec<(usize, i64)> = Vec::new();
+        // #22 (2026-09-05): direct-mapped slots collided WITHIN one chunk (16 rows per
+        // token, 16k rows at t = 1024): two ids claimed the same slot, the later
+        // upload won, the other token read a foreign row - and which one won followed
+        // the HashMap iteration order below, i.e. differed per process. Now a slot
+        // claimed earlier in this batch by another id is probed past (linear), so
+        // every id of the batch owns its slot; cross-batch eviction stays direct-mapped.
+        self.batch = self.batch.wrapping_add(1);
+        if self.batch == 0 { for v in self.batch_tag.iter_mut() { *v = 0; } self.batch = 1; }
         for (i, &id) in ngids.iter().enumerate() {
-            let slot = (id as u64 % self.n_slots as u64) as usize;
-            if self.slot_map[slot] != id as i32 {
-                self.slot_map[slot] = id as i32;
-                fill_rows.push((slot, id));
+            let mut slot = (id as u64 % self.n_slots as u64) as usize;
+            let mut probes = 0usize;
+            while self.batch_tag[slot] == self.batch && self.slot_map[slot] != id as i32 {
+                slot = (slot + 1) % self.n_slots;
+                probes += 1;
+                assert!(probes < self.n_slots, "PLE row cache: batch larger than the cache");
+            }
+            if self.batch_tag[slot] != self.batch {
+                self.batch_tag[slot] = self.batch;
+                if self.slot_map[slot] != id as i32 {
+                    self.slot_map[slot] = id as i32;
+                    fill_rows.push((slot, id));
+                }
             }
             slots[i] = slot as i32;
         }
@@ -981,7 +1004,10 @@ impl Ple {
                 let shard = id / rows_per_shard;
                 by_shard.entry(shard).or_default().push((slot, id));
             }
-            for (shard, mut rows) in by_shard {
+            let mut shards: Vec<i64> = by_shard.keys().copied().collect();
+            shards.sort_unstable();
+            for shard in shards {
+                let mut rows = by_shard.remove(&shard).unwrap();
                 rows.sort_by_key(|&(_, id)| id);
                 let (t, _) = &self.shards[shard as usize];
                 let gs = t.global_scale;
@@ -1009,6 +1035,10 @@ fn mma_on() -> bool {
 
 /// CUDA graphs replay switch: capture the per-token kernel sequence once,
 /// then replay (WDDM launch overhead elimination, fable gate 2026-09-03).
+fn swap_bundle_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CROW_SWAP_BUNDLE").as_deref() == Ok("1"))
+}
 fn graph_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CROW_GRAPH").as_deref() == Ok("1"))
@@ -2852,17 +2882,30 @@ impl Engine {
         let nblk_dn = cuda::to_i32_dev(&[((H * INTER) / 64) as i32]);
         let mut total = 0usize;
         let none = std::collections::HashSet::new();
+        // #17: CROW_SWAP_BUNDLE=1 exchanges all pairs of the tick in one launch per
+        // size class (48 layers x <= max_swaps pairs) instead of 6 memcpys per swap
+        let bundle = swap_bundle_on() && self.res.lb.is_none();
+        let (mut gu_pairs, mut dn_pairs) = (Vec::new(), Vec::new());
+        let mut touched: Vec<usize> = Vec::new();
         for l in 0..LAYERS {
             // plan_swaps ranks by u64 counts: scale the decayed window by 1024
             let c: Vec<u64> = self.adapt_ema[l * E..(l + 1) * E].iter().map(|v| (v * 1024.0) as u64).collect();
             let plan = self.res.plan_swaps(l, &c, max_swaps, &none);
             for &(slot, evict, new_id) in &plan {
-                self.res.swap_in(&self.k, l, slot, evict, new_id, nblk_gu, nblk_dn);
+                if bundle {
+                    self.res.swap_in_bundled(l, slot, evict, new_id, &mut gu_pairs, &mut dn_pairs);
+                } else {
+                    self.res.swap_in(&self.k, l, slot, evict, new_id, nblk_gu, nblk_dn);
+                }
                 total += 1;
             }
             if !plan.is_empty() {
-                self.res.flush_layer_tables(l);
+                if bundle { touched.push(l); } else { self.res.flush_layer_tables(l); }
             }
+        }
+        if bundle {
+            self.res.swap_pairs_launch(&self.k, &gu_pairs, &dn_pairs);
+            for &l in &touched { self.res.flush_layer_tables(l); }
         }
         cuda::sync();
         let (mut a, mut b) = (nblk_gu, nblk_dn);
@@ -3055,12 +3098,53 @@ fn engine_lock_release() {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        unsafe { cuda::drop_dbg("before Engine"); }
+        // #18 (2026-09-05): everything the field Drops do not cover — the graph
+        // exec and capture stream, the staging slots and grouped-GEMM plan, the
+        // prefetch rings and events, the routing counters, the trickle stream.
+        // The planner of the next load in the same process reads cuMemGetInfo;
+        // ~400 MB of slack decided between "fits" and "refuses".
+        unsafe {
+            cuda::sync();
+            if self.graph_exec != 0 {
+                cuda::graph_exec_destroy(self.graph_exec as cudarc::driver::sys::CUgraphExec);
+                self.graph_exec = 0;
+            }
+            if self.cap_stream != 0 {
+                cuda::set_stream(0);
+                cuda::stream_destroy(self.cap_stream as cudarc::driver::sys::CUstream);
+                self.cap_stream = 0;
+            }
+            if let Some(tr) = self.trickle.take() {
+                cuda::stream_sync(tr.stream);
+                cuda::event_destroy(tr.ev_side);
+                cuda::event_destroy(tr.ev_commit);
+                cuda::stream_destroy(tr.stream);
+            }
+            for e in self.pf_ev_filled.iter().chain(self.pf_ev_done.iter()) {
+                cuda::event_destroy(*e);
+            }
+            for d in self.pf_ring_gu.iter_mut().chain(self.pf_ring_dn.iter_mut()) {
+                cuda::free_dev(d);
+            }
+            let st = &mut self.stage;
+            for d in [&mut st.gu, &mut st.dn, &mut st.sgu, &mut st.sdn, &mut st.gu_b, &mut st.dn_b,
+                      &mut st.counts, &mut st.offsets, &mut st.cursor, &mut st.perm, &mut st.tiles,
+                      &mut st.n_tiles, &mut st.eptr, &mut st.grp, &mut st.tg, &mut st.max_tiles_p] {
+                cuda::free_dev(d);
+            }
+            cuda::free_dev(&mut self.pf_ncombo);
+            cuda::free_dev(&mut self.sel_counts);
+            // the module last: every CUfunction in self.k points into it
+            self.module.unload();
+        }
         engine_lock_release();
     }
 }
 
 impl Drop for Weights {
     fn drop(&mut self) {
+        unsafe { cuda::drop_dbg("before Weights"); }
         unsafe {
             cuda::free_dev(&mut self.lm_head);
             cuda::free_dev(&mut self.mx_norm);
@@ -3111,6 +3195,7 @@ impl Drop for Weights {
 
 impl Drop for Ple {
     fn drop(&mut self) {
+        unsafe { cuda::drop_dbg("before Ple"); }
         unsafe {
             for f in [&mut self.key.w, &mut self.key.gs, &mut self.value.w, &mut self.value.gs] {
                 cuda::free_dev(f);
@@ -3128,6 +3213,7 @@ impl Drop for Ple {
 
 impl Drop for Params {
     fn drop(&mut self) {
+        unsafe { cuda::drop_dbg("before Params"); }
         unsafe {
             for f in [&mut self.n320, &mut self.n2560, &mut self.n640, &mut self.n6144, &mut self.n10240,
                       &mut self.n2048, &mut self.n12288, &mut self.n_conv_deq, &mut self.n_selmax,
@@ -3149,8 +3235,11 @@ impl Drop for Params {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        unsafe { cuda::drop_dbg("before Scratch"); }
         unsafe {
             for f in [&mut self.h,
+                      &mut self.part_o, // #18: the two attention-split partials were never freed
+                      &mut self.part_ml,
                       &mut self.emb,
                       &mut self.mixed,
                       &mut self.low,

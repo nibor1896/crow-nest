@@ -316,6 +316,7 @@ pub const N_MIN: usize = 32;
 
 impl Drop for ThreeStates {
     fn drop(&mut self) {
+        unsafe { cuda::drop_dbg("before ThreeStates"); }
         unsafe {
             cuda::free_dev(&mut self.kv_buf);
             for v in self.qsa_keys.iter_mut() { cuda::free_dev(v); }

@@ -438,6 +438,44 @@ impl Residency {
         }
     }
 
+    /// #17 bundled variant of `swap_in` (exact NVFP4 tier only): does the
+    /// bookkeeping (cold index, sets) and appends the (hot, cold) slab pointer
+    /// pairs for gate_up and down; the caller exchanges the bytes of ALL pairs
+    /// of a tick with one `swap_pairs` launch per size class. Bit-identical to
+    /// the bounce path: the same bytes end in the same places.
+    pub fn swap_in_bundled(&mut self, l: usize, slot: usize, evict: u32, new_id: u32,
+                           gu_pairs: &mut Vec<(u64, u64)>, dn_pairs: &mut Vec<(u64, u64)>) {
+        assert!(self.lb.is_none(), "swap_in_bundled: exact NVFP4 tier only");
+        let dst_gu = self.hot_gu as u64 + ((l * self.stride + slot) as u64) * self.gu_bytes;
+        let dst_dn = self.hot_dn as u64 + ((l * self.stride + slot) as u64) * self.dn_bytes;
+        let cs = self.cold_index[l].remove(&new_id).expect("incoming expert must be cold");
+        let src_gu = self.cold_gu[l].dev as u64 + cs as u64 * self.gu_bytes;
+        let src_dn = self.cold_dn[l].dev as u64 + cs as u64 * self.dn_bytes;
+        gu_pairs.push((dst_gu, src_gu));
+        dn_pairs.push((dst_dn, src_dn));
+        self.cold_index[l].insert(evict, cs);
+        self.sets[l][slot] = new_id;
+    }
+
+    /// #17: exchange the bytes of the collected pairs (one launch per size class)
+    pub unsafe fn swap_pairs_launch(&self, k: &crate::kernels::Kernels, gu_pairs: &[(u64, u64)], dn_pairs: &[(u64, u64)]) {
+        for (pairs, bytes) in [(gu_pairs, self.gu_bytes), (dn_pairs, self.dn_bytes)] {
+            if pairs.is_empty() { continue; }
+            assert!(bytes % 16 == 0);
+            let a: Vec<u64> = pairs.iter().map(|p| p.0).collect();
+            let b: Vec<u64> = pairs.iter().map(|p| p.1).collect();
+            let mut da = cuda::to_u64_dev(&a);
+            let mut db = cuda::to_u64_dev(&b);
+            let mut nb = cuda::to_i32_dev(&[bytes as i32]);
+            let split: u32 = 8;
+            crate::gen::launch_v(k.f("swap_pairs"), pairs.len() as u32, split, 1, 256, &[da, db, nb]);
+            cuda::sync();
+            cuda::free_dev(&mut da);
+            cuda::free_dev(&mut db);
+            cuda::free_dev(&mut nb);
+        }
+    }
+
     /// Prompt-adaptive residency (A-P3): replace hot slot `slot` of layer `l`
     /// (currently expert `evict`) by expert `new_id`, expanded from its pinned
     /// low-bit record on the GPU. Updates pointer table, bitmap and `sets`.
@@ -645,6 +683,7 @@ pub fn persist_sidecar(
 
 impl Drop for Residency {
     fn drop(&mut self) {
+        unsafe { cuda::drop_dbg("before Residency"); }
         unsafe {
             cuda::free_dev(&mut self.hot_gu);
             cuda::free_dev(&mut self.hot_dn);
@@ -652,6 +691,8 @@ impl Drop for Residency {
             cuda::free_dev(&mut self.bitmaps);
             cuda::free_dev(&mut self.counters);
             cuda::free_dev(&mut self.gs_dev);
+            cuda::free_dev(&mut self.bounce_gu); // #18
+            cuda::free_dev(&mut self.bounce_dn);
             for p in self.cold_gu.iter_mut() { p.free(); }
             for p in self.cold_dn.iter_mut() { p.free(); }
         }

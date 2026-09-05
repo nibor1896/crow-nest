@@ -69,7 +69,7 @@ pub struct Config {
     pub context: usize,       // default 262_144, floor 200_000
     pub n_hot: usize,         // target 160 experts per layer, loader clamps
     pub kv: KvDtype,          // FP8 default, BF16 fallback via config
-    pub ple_cache_bytes: u64, // hot-row cache, default 1.0 GB
+    pub ple_cache_bytes: u64, // hot-row cache, default 128 MB (#16, 2026-09-05; was 1 GB)
     pub prompt_chunk: usize,  // prefill chunk size (correctness stage: 256..512)
     /// pinned-host budget for the cold tier (spec 3.4: ~43-47 GB of 64 GB);
     /// the loader RAISES N if the cold tier would exceed this
@@ -84,7 +84,7 @@ impl Default for Config {
             context: 262_144,
             n_hot: 160,
             kv: KvDtype::Fp8E4m3,
-            ple_cache_bytes: 1 << 30,
+            ple_cache_bytes: 128 << 20, // #16: measured 2026-09-05, +0.2 % misses vs 1 GB, ~7 units freed
             prompt_chunk: 512,
             host_pinned_budget: 46 << 30, // measured host ceiling ~48.5 GB, 2.5 GB margin
             ple: true,

@@ -78,7 +78,14 @@ impl Sampler {
     /// one token from a logits row; greedy when temperature <= 0
     pub fn sample(&mut self, logits: &[f32]) -> usize {
         if self.temperature <= 0.0 {
-            return argmax(logits);
+            // greedy with the presence penalty applied (HF order: penalties, then argmax)
+            let mut best = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (i, &l) in logits.iter().enumerate() {
+                let v = if self.seen.contains(&i) { l - self.presence_penalty } else { l };
+                if v > bv { bv = v; best = i; }
+            }
+            return best;
         }
         // presence penalty (HF semantics: subtract from every token already present)
         // + top_k on the raw scores: keep the k largest candidates

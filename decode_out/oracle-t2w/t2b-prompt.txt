@@ -1,0 +1,41 @@
+Refactor the C++ function below. Keep the observable behaviour EXACTLY identical (same accepted inputs, same results, same error behaviour, same call order of the out-param) while removing the duplication.
+
+```cpp
+// Parses two array fields out of a binary metadata record and stores them.
+// Returns false if the field is missing or has the wrong element type.
+// Field layout: [u32 kind][u32 count][payload...]; kind 1 = u32 elements, kind 2 = u64 elements.
+bool parse_fields(const uint8_t* rec, size_t len,
+                  std::vector<uint32_t>& a_out, std::vector<uint64_t>& b_out) {
+    size_t off = 0;
+    auto read_u32 = [&](uint32_t& v) {
+        if (off + 4 > len) return false;
+        memcpy(&v, rec + off, 4); off += 4; return true;
+    };
+
+    uint32_t kind_a, count_a;
+    if (!read_u32(kind_a) || !read_u32(count_a)) return false;
+    if (kind_a != 1) return false;
+    if (off + (size_t)count_a * 4 > len) return false;
+    a_out.clear();
+    for (uint32_t i = 0; i < count_a; ++i) {
+        uint32_t v; memcpy(&v, rec + off, 4); off += 4;
+        a_out.push_back(v);
+    }
+
+    uint32_t kind_b, count_b;
+    if (!read_u32(kind_b) || !read_u32(kind_b)) return false;
+    if (kind_b != 2) return false;
+    if (off + (size_t)count_b * 8 > len) return false;
+    b_out.clear();
+    for (uint32_t i = 0; i < count_b; ++i) {
+        uint64_t v; memcpy(&v, rec + off, 8); off += 8;
+        b_out.push_back(v);
+    }
+    return true;
+}
+```
+
+Requirements:
+1. State the duplication you remove and how (one generic helper, its signature, what it is parameterised on).
+2. Point out every behavioural DIFFERENCE that already exists between the two blocks above (there is at least one genuine bug and one latent portability hazard — find them, do NOT silently fix them beyond what the contract requires, but say what you would change and why).
+3. Show the refactored code complete.

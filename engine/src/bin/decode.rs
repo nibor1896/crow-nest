@@ -192,6 +192,18 @@ fn main() {
                 }
                 let mut lat = Vec::new();
                 let mut trace = vec![next];
+                // #20: CROW_SAMPLE=1 samples on the host from the logits row (data-sheet
+                // profile, env-overridable); CROW_STOP_EOS=1 ends the run at EOS
+                let mut sampler = crow_nest_engine::sample::Sampler::from_env();
+                if let Some(s) = &mut sampler {
+                    println!("{}", s.describe());
+                    let lg = crow_nest_engine::cuda::dtoh(eng.s.logits, V);
+                    next = s.sample(&lg);
+                    s.observe(next);
+                    trace[0] = next;
+                }
+                let stop_eos = crow_nest_engine::sample::stop_on_eos();
+                let mut stopped_eos = stop_eos && crow_nest_engine::sample::EOS_IDS.contains(&next);
                 // CROW_ADAPT_EVERY=K: re-cut the hot set from the cumulative routing
                 // every K decode tokens (<= CROW_ADAPT_MAX swaps per layer, default 8);
                 // the swap time is charged to that token's latency (amortized cost)
@@ -211,9 +223,23 @@ fn main() {
                     } else if adapt_every > 0 && i % adapt_every == 0 {
                         trickle_swaps += eng.adapt_tick(adapt_max);
                     }
+                    if stopped_eos {
+                        break;
+                    }
                     next = eng.decode_step(&mut cnq, next as i64);
+                    if let Some(s) = &mut sampler {
+                        let lg = crow_nest_engine::cuda::dtoh(eng.s.logits, V);
+                        next = s.sample(&lg);
+                        s.observe(next);
+                    }
                     lat.push(t0.elapsed().as_secs_f64() * 1e3);
                     trace.push(next);
+                    if stop_eos && crow_nest_engine::sample::EOS_IDS.contains(&next) {
+                        stopped_eos = true;
+                    }
+                }
+                if stopped_eos {
+                    println!("stopped at EOS after {} generated tokens", trace.len());
                 }
                 if adapt_stream && adapt_every > 0 {
                     let drained = eng.trickle_drain();
@@ -253,7 +279,7 @@ fn main() {
                 serde_json::to_writer(
                     std::fs::File::create("decode_out/run.json").unwrap(),
                     &serde_json::json!({
-                        "prompt": ids.len(), "generated": gen,
+                        "prompt": ids.len(), "generated": trace.len(), "budget": gen, "stopped_eos": stopped_eos,
                         "prefill_s": prefill_s,
                         "prefill_tok_s": ids.len() as f64 / prefill_s,
                         "warmup_ms": warm, "mean_ms": mean, "p50_ms": p50,
@@ -346,6 +372,32 @@ fn main() {
                     &format!("decode warmup, {} real tokens from {}, top-{n}/layer, frequency order", ids.len(), ids_path),
                 );
                 println!("warmup: sidecar written -> {out}  (in-sample coverage {:.1} % of {} selections)", 100.0 * hit as f64 / tot.max(1) as f64, tot);
+            }
+            "reloadcheck" => {
+                // #18: load, drop, load again in ONE process; report cuMemGetInfo
+                // before/after each cycle (acceptance: delta < 64 MB, second load succeeds)
+                let n: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(2);
+                cfg.context = CONTEXT_FLOOR;
+                if let Some(c) = std::env::var("CROW_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()) {
+                    cfg.prompt_chunk = c.max(1);
+                }
+                let f0 = crow_nest_engine::cuda::free_vram_bytes();
+                println!("reloadcheck: free VRAM before any load {:.1} MB", f0 as f64 / 1e6);
+                for i in 0..n {
+                    let (mut eng, _rep) =
+                        Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |_| {});
+                    let ids = [760i64, 3841, 13477, 37550, 33075, 888, 279, 15217];
+                    let mut next = eng.prefill(&mut cnq, &ids, None);
+                    for _ in 0..3 {
+                        next = eng.decode_step(&mut cnq, next as i64);
+                    }
+                    let f_loaded = crow_nest_engine::cuda::free_vram_bytes();
+                    drop(eng);
+                    crow_nest_engine::cuda::drop_dbg("after Engine dropped");
+                    let f_after = crow_nest_engine::cuda::free_vram_bytes();
+                    println!("reloadcheck cycle {i}: loaded {:.1} MB free, after drop {:.1} MB free, leak vs start {:.1} MB, last token {next}",
+                        f_loaded as f64 / 1e6, f_after as f64 / 1e6, (f0 as f64 - f_after as f64) / 1e6);
+                }
             }
             "layercheck" => {
                 // layer-0 assembly check vs the p10 golden: load engine, feed
