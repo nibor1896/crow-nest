@@ -1,0 +1,2 @@
+{"dtype":"nvfp4","global_scale":0.003476956393569708,"max_abs_err":1.0968832969665527,"max_rel_err":0.9995353817939758,"mean_abs_err":0.15118237950197067,"n":40960,"name":"test.small","section":"text","violations":0}
+{"dtype":"nvfp4","global_scale":0.00009314053750131279,"max_abs_err":0.029177919030189514,"max_rel_err":0.9999924898147583,"mean_abs_err":0.003808998673605339,"n":262144,"name":"test.weight","section":"text","violations":0}

@@ -1,0 +1,982 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Crow — 360B parameters. One GPU. No cloud.</title>
+<meta name="description" content="Crow is a from-scratch inference engine that runs 360B-parameter MoE models on a single RTX 5090 — custom 4.5-bit format, tensor-core kernels, zero cloud.">
+<meta property="og:title" content="Crow — 360B parameters. One GPU. No cloud.">
+<meta property="og:description" content="From-scratch inference engine. Custom CNQ4.5 format. Tensor-core kernels. Your machine.">
+<meta name="theme-color" content="#07080B" data-theme-dark="#07080B" data-theme-light="#F7F6F2">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23F5B942'/%3E%3Cstop offset='1' stop-color='%23FF6A3D'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath fill='url(%23g)' d='M16 2 29 9.5v13L16 30 3 22.5v-13z'/%3E%3Ccircle cx='16' cy='16' r='4.5' fill='%2307080B'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+/* ============ TOKENS ============ */
+:root{
+  --font-body:'Inter',system-ui,-apple-system,sans-serif;
+  --font-display:'Space Grotesk',var(--font-body);
+  --font-mono:'JetBrains Mono',ui-monospace,'Cascadia Code',monospace;
+  --r-sm:10px; --r-md:16px; --r-lg:22px;
+  --maxw:1160px;
+  --ease:cubic-bezier(.22,1,.36,1);
+}
+[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#07080B; --bg-2:#0B0D12; --bg-3:#0E1118;
+  --panel:rgba(255,255,255,.028);
+  --panel-2:rgba(255,255,255,.05);
+  --border:rgba(255,255,255,.085);
+  --border-strong:rgba(255,255,255,.16);
+  --text:#F1F3F8; --text-2:#B7BECD; --muted:#8B93A5; --faint:#5A6172;
+  --a1:#F5B942; --a2:#FF6A3D;
+  --a-grad:linear-gradient(135deg,#F5B942 0%,#FF8A4C 55%,#FF5C39 100%);
+  --a-soft:rgba(245,185,66,.12);
+  --a-glow:rgba(255,138,76,.35);
+  --data:#4FE3CE; --data-soft:rgba(79,227,206,.12);
+  --ok:#4ADE80; --warn:#FBBF24;
+  --grid-line:rgba(255,255,255,.045);
+  --shadow-card:0 1px 0 rgba(255,255,255,.04) inset, 0 20px 50px -30px rgba(0,0,0,.8);
+  --shadow-pop:0 24px 70px -20px rgba(255,106,61,.25);
+  --term-bg:#0A0C11; --term-border:rgba(255,255,255,.09);
+  --spot:255,255,255;
+  --aurora-op:.55; --noise-op:.05;
+}
+[data-theme="light"]{
+  color-scheme:light;
+  --bg:#F7F6F2; --bg-2:#FFFFFF; --bg-3:#F0EEE8;
+  --panel:#FFFFFF;
+  --panel-2:#FBFAF7;
+  --border:rgba(20,22,28,.10);
+  --border-strong:rgba(20,22,28,.22);
+  --text:#101319; --text-2:#3A4150; --muted:#6A7284; --faint:#9AA0AE;
+  --a1:#D99000; --a2:#E84E1D;
+  --a-grad:linear-gradient(135deg,#E8A200 0%,#F06A28 55%,#E8431C 100%);
+  --a-soft:rgba(232,140,0,.10);
+  --a-glow:rgba(240,106,40,.22);
+  --data:#0B9E8C; --data-soft:rgba(11,158,140,.10);
+  --ok:#189A55; --warn:#B57E00;
+  --grid-line:rgba(20,22,28,.05);
+  --shadow-card:0 1px 2px rgba(20,22,28,.04), 0 16px 40px -28px rgba(20,22,28,.25);
+  --shadow-pop:0 24px 60px -24px rgba(232,78,29,.28);
+  --term-bg:#0A0C11; --term-border:rgba(255,255,255,.09);
+  --spot:20,22,28;
+  --aurora-op:.30; --noise-op:.035;
+}
+
+/* ============ BASE ============ */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+body{
+  font-family:var(--font-body);
+  background:var(--bg); color:var(--text);
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+  overflow-x:hidden;
+  transition:background .45s var(--ease), color .45s var(--ease);
+}
+::selection{background:var(--a1);color:#0B0C10}
+::-webkit-scrollbar{width:10px}
+::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:99px;border:3px solid var(--bg)}
+::-webkit-scrollbar-track{background:transparent}
+a{color:inherit;text-decoration:none}
+button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+:focus-visible{outline:2px solid var(--a1);outline-offset:3px;border-radius:4px}
+.mono{font-family:var(--font-mono)}
+.wrap{max-width:var(--maxw);margin:0 auto;padding:0 28px}
+@media(max-width:640px){.wrap{padding:0 20px}}
+
+/* grain */
+body::after{
+  content:"";position:fixed;inset:0;z-index:70;pointer-events:none;opacity:var(--noise-op);
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* ============ NAV ============ */
+.nav{
+  position:fixed;top:0;left:0;right:0;z-index:60;
+  transition:background .35s var(--ease),border-color .35s var(--ease),backdrop-filter .35s;
+  border-bottom:1px solid transparent;
+}
+.nav.scrolled{background:color-mix(in srgb,var(--bg) 78%,transparent);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom-color:var(--border)}
+.nav-inner{max-width:var(--maxw);margin:0 auto;padding:0 28px;height:64px;display:flex;align-items:center;gap:28px}
+.brand{display:flex;align-items:center;gap:10px;font-family:var(--font-display);font-weight:700;font-size:17px;letter-spacing:-.02em}
+.brand svg{width:26px;height:26px;display:block}
+.nav-links{display:flex;gap:4px;margin-left:12px}
+.nav-links a{
+  font-size:13.5px;font-weight:500;color:var(--muted);padding:7px 12px;border-radius:8px;
+  transition:color .2s,background .2s;
+}
+.nav-links a:hover{color:var(--text);background:var(--panel-2)}
+.nav-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+.gh-btn{
+  display:flex;align-items:center;gap:7px;font-size:13px;font-weight:600;
+  padding:7px 14px;border:1px solid var(--border);border-radius:9px;background:var(--panel);
+  transition:border-color .2s,background .2s,transform .2s;
+}
+.gh-btn:hover{border-color:var(--border-strong);transform:translateY(-1px)}
+.gh-btn svg{width:15px;height:15px}
+@media(max-width:820px){.nav-links{display:none}}
+
+/* theme toggle */
+.theme-btn{
+  position:relative;width:60px;height:30px;border-radius:99px;
+  border:1px solid var(--border);background:var(--panel-2);
+  transition:border-color .2s;
+}
+.theme-btn:hover{border-color:var(--border-strong)}
+.theme-btn .knob{
+  position:absolute;top:2.5px;left:3px;width:22px;height:22px;border-radius:50%;
+  background:var(--a-grad);box-shadow:0 0 14px var(--a-glow);
+  transition:transform .4s var(--ease);
+  display:grid;place-items:center;
+}
+[data-theme="light"] .theme-btn .knob{transform:translateX(29px)}
+.theme-btn svg{width:12px;height:12px;position:absolute;transition:opacity .25s,transform .4s var(--ease)}
+.theme-btn .ic-sun{opacity:1;transform:rotate(0)}
+.theme-btn .ic-moon{opacity:0;transform:rotate(-90deg)}
+[data-theme="light"] .theme-btn .ic-sun{opacity:0;transform:rotate(90deg)}
+[data-theme="light"] .theme-btn .ic-moon{opacity:1;transform:rotate(0)}
+
+/* ============ HERO ============ */
+.hero{position:relative;padding:172px 0 84px;text-align:center;overflow:hidden}
+.aurora{position:absolute;inset:0;pointer-events:none;opacity:var(--aurora-op)}
+.aurora .blob{position:absolute;border-radius:50%;filter:blur(90px);will-change:transform}
+.aurora .b1{width:640px;height:640px;left:50%;top:-260px;transform:translateX(-72%);
+  background:radial-gradient(circle,rgba(245,185,66,.34),transparent 62%);animation:drift1 19s ease-in-out infinite alternate}
+.aurora .b2{width:720px;height:560px;left:50%;top:-140px;transform:translateX(6%);
+  background:radial-gradient(circle,rgba(255,90,50,.26),transparent 62%);animation:drift2 23s ease-in-out infinite alternate}
+.aurora .b3{width:500px;height:500px;left:50%;top:120px;transform:translateX(-30%);
+  background:radial-gradient(circle,rgba(79,227,206,.10),transparent 60%);animation:drift1 27s ease-in-out infinite alternate-reverse}
+@keyframes drift1{to{transform:translateX(-60%) translateY(60px) scale(1.12)}}
+@keyframes drift2{to{transform:translateX(-4%) translateY(80px) scale(1.08)}}
+.gridlines{
+  position:absolute;inset:0;pointer-events:none;
+  background-image:linear-gradient(var(--grid-line) 1px,transparent 1px),linear-gradient(90deg,var(--grid-line) 1px,transparent 1px);
+  background-size:56px 56px;
+  -webkit-mask-image:radial-gradient(ellipse 90% 68% at 50% 0%,#000 30%,transparent 78%);
+  mask-image:radial-gradient(ellipse 90% 68% at 50% 0%,#000 30%,transparent 78%);
+}
+@media (prefers-reduced-motion:reduce){.aurora .blob{animation:none}}
+
+.hero-badge{
+  display:inline-flex;align-items:center;gap:9px;
+  font-family:var(--font-mono);font-size:12px;letter-spacing:.02em;color:var(--text-2);
+  padding:7px 16px;border-radius:99px;border:1px solid var(--border);
+  background:color-mix(in srgb,var(--bg-2) 60%,transparent);
+  backdrop-filter:blur(8px);
+  box-shadow:var(--shadow-card);
+  animation:rise .8s var(--ease) both;
+}
+.pulse-dot{width:7px;height:7px;border-radius:50%;background:var(--ok);position:relative;flex:none}
+.pulse-dot::after{content:"";position:absolute;inset:-4px;border-radius:50%;border:1px solid var(--ok);opacity:.5;animation:pulse 2s ease-out infinite}
+@keyframes pulse{from{transform:scale(.5);opacity:.7}to{transform:scale(1.5);opacity:0}}
+
+h1{
+  font-family:var(--font-display);font-weight:700;
+  font-size:clamp(46px,7.4vw,96px);
+  line-height:1.0;letter-spacing:-.045em;
+  margin:30px auto 0;max-width:15ch;
+}
+h1 .line{display:block;overflow:hidden}
+h1 .line>span{display:inline-block;animation:rise .9s var(--ease) both}
+h1 .line:nth-child(2)>span{animation-delay:.1s}
+h1 .line:nth-child(3)>span{animation-delay:.2s}
+.grad{
+  background:var(--a-grad);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+@keyframes rise{from{opacity:0;transform:translateY(26px)}to{opacity:1;transform:translateY(0)}}
+
+.hero-sub{
+  margin:26px auto 0;max-width:560px;
+  font-size:clamp(15px,1.6vw,17.5px);line-height:1.65;color:var(--muted);
+  animation:rise .9s var(--ease) .3s both;
+}
+.hero-sub strong{color:var(--text-2);font-weight:600}
+.hero-cta{display:flex;gap:14px;justify-content:center;margin-top:38px;flex-wrap:wrap;animation:rise .9s var(--ease) .42s both}
+.btn{
+  display:inline-flex;align-items:center;gap:9px;
+  font-size:14.5px;font-weight:600;letter-spacing:-.01em;
+  padding:13px 26px;border-radius:12px;
+  transition:transform .25s var(--ease),box-shadow .25s,border-color .2s,background .2s;
+}
+.btn:active{transform:scale(.97)}
+.btn-primary{
+  background:var(--a-grad);color:#14100A;
+  box-shadow:0 0 0 1px rgba(255,140,60,.25),0 14px 40px -12px var(--a-glow);
+}
+.btn-primary:hover{transform:translateY(-2px);box-shadow:0 0 0 1px rgba(255,140,60,.35),0 20px 50px -12px var(--a-glow)}
+.btn-ghost{border:1px solid var(--border);background:var(--panel);color:var(--text)}
+.btn-ghost:hover{border-color:var(--border-strong);transform:translateY(-2px);background:var(--panel-2)}
+.btn svg{width:15px;height:15px}
+.hero-chips{
+  display:flex;gap:22px;justify-content:center;flex-wrap:wrap;margin-top:34px;
+  font-family:var(--font-mono);font-size:11.5px;color:var(--faint);letter-spacing:.04em;
+  animation:rise .9s var(--ease) .52s both;
+}
+.hero-chips span{display:inline-flex;align-items:center;gap:7px}
+.hero-chips i{width:3px;height:3px;border-radius:50%;background:var(--a1);flex:none}
+
+/* ============ TERMINAL ============ */
+.term{
+  width:min(780px,92vw);margin:64px auto 0;text-align:left;
+  background:var(--term-bg);border:1px solid var(--term-border);border-radius:var(--r-md);
+  box-shadow:0 40px 100px -30px rgba(0,0,0,.75),0 0 90px -30px var(--a-glow),var(--shadow-card);
+  overflow:hidden;position:relative;
+  animation:rise 1s var(--ease) .62s both;
+}
+.term::before{content:"";position:absolute;inset:0 0 auto 0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(255,150,70,.5),transparent)}
+.term-head{display:flex;align-items:center;gap:8px;padding:13px 18px;border-bottom:1px solid rgba(255,255,255,.07)}
+.tdot{width:11px;height:11px;border-radius:50%}
+.tdot.r{background:#FF5F57}.tdot.y{background:#FEBC2E}.tdot.g{background:#28C840}
+.term-title{margin-left:10px;font-family:var(--font-mono);font-size:11.5px;color:#7D8592}
+.term-badge{margin-left:auto;font-family:var(--font-mono);font-size:10.5px;color:#5C6572;border:1px solid rgba(255,255,255,.09);padding:3px 9px;border-radius:6px}
+.term-body{padding:20px 22px 24px;font-family:var(--font-mono);font-size:13px;line-height:1.75;color:#D7DDE8;min-height:264px}
+.tline{white-space:pre-wrap;word-break:break-word}
+.t-prompt{color:#FF8A4C;user-select:none}
+.t-ok{color:#4FE3CE}
+.t-ok::before{content:"✓ ";color:#4FE3CE}
+.t-listen::before{content:"● ";color:#4ADE80;animation:blink 1.6s step-end infinite}
+@keyframes blink{50%{opacity:.35}}
+.t-dim{color:#7D8592}
+.t-out{color:#E8EDF5}
+.t-stats{color:#8B93A5}
+.t-stats b{color:#FFB65C;font-weight:500}
+.caret{display:inline-block;width:8px;height:16px;background:#FF8A4C;vertical-align:-3px;margin-left:2px;animation:caret 1s step-end infinite}
+@keyframes caret{50%{opacity:0}}
+.t-hidden{display:none}
+
+/* ============ STATS STRIP ============ */
+.stats{position:relative;z-index:2;border-top:1px solid var(--border);border-bottom:1px solid var(--border);
+  background:color-mix(in srgb,var(--bg-2) 45%,transparent)}
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);}
+.stat{padding:34px 20px;text-align:center;position:relative}
+.stat+.stat::before{content:"";position:absolute;left:0;top:26%;bottom:26%;width:1px;background:var(--border)}
+.stat .num{font-family:var(--font-display);font-weight:700;font-size:clamp(28px,3.4vw,42px);letter-spacing:-.03em}
+.stat .num small{font-size:.55em;color:var(--muted);font-weight:600;margin-left:2px}
+.stat .lbl{margin-top:6px;font-family:var(--font-mono);font-size:11px;color:var(--faint);letter-spacing:.08em;text-transform:uppercase}
+@media(max-width:720px){.stats-grid{grid-template-columns:1fr 1fr}.stat:nth-child(3)::before{display:none}.stat{padding:26px 12px}}
+
+/* ============ SECTIONS ============ */
+section{position:relative;padding:110px 0}
+.sec-head{margin-bottom:54px}
+.kicker{
+  display:inline-flex;align-items:center;gap:8px;
+  font-family:var(--font-mono);font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--a1);
+}
+.kicker::before{content:"";width:22px;height:1px;background:var(--a-grad)}
+.sec-title{
+  font-family:var(--font-display);font-weight:700;letter-spacing:-.035em;
+  font-size:clamp(30px,4.4vw,52px);line-height:1.06;margin-top:16px;max-width:20ch;
+}
+.sec-sub{margin-top:16px;color:var(--muted);font-size:16px;line-height:1.65;max-width:52ch}
+
+/* reveal */
+.reveal{opacity:0;transform:translateY(28px);transition:opacity .8s var(--ease),transform .8s var(--ease);transition-delay:var(--d,0s)}
+.reveal.in{opacity:1;transform:none}
+@media (prefers-reduced-motion:reduce){.reveal{opacity:1;transform:none;transition:none}}
+
+/* ============ BENTO ============ */
+.bento{display:grid;grid-template-columns:repeat(6,1fr);gap:16px}
+.card{
+  position:relative;overflow:hidden;
+  grid-column:span 2;
+  background:var(--panel);border:1px solid var(--border);border-radius:var(--r-lg);
+  padding:26px 26px 24px;
+  box-shadow:var(--shadow-card);
+  transition:transform .35s var(--ease),border-color .3s,background .3s;
+}
+.card:hover{transform:translateY(-3px);border-color:var(--border-strong)}
+.card.wide{grid-column:span 3}
+.card.full{grid-column:span 6}
+/* cursor spotlight */
+.card::before{
+  content:"";position:absolute;inset:0;pointer-events:none;opacity:0;transition:opacity .35s;
+  background:radial-gradient(420px circle at var(--mx,50%) var(--my,50%),rgba(var(--spot),.055),transparent 65%);
+}
+.card:hover::before{opacity:1}
+.card .ic{
+  width:38px;height:38px;border-radius:11px;display:grid;place-items:center;margin-bottom:18px;
+  background:var(--a-soft);border:1px solid color-mix(in srgb,var(--a1) 22%,transparent);
+  color:var(--a1);
+}
+.card .ic svg{width:18px;height:18px}
+.card h3{font-family:var(--font-display);font-size:18.5px;font-weight:600;letter-spacing:-.02em}
+.card p{margin-top:8px;font-size:13.8px;line-height:1.6;color:var(--muted)}
+.card .viz{margin-top:20px}
+.card .tag{
+  position:absolute;top:22px;right:22px;
+  font-family:var(--font-mono);font-size:10.5px;letter-spacing:.06em;color:var(--a1);
+  border:1px solid color-mix(in srgb,var(--a1) 30%,transparent);border-radius:6px;padding:3px 8px;
+  background:var(--a-soft);
+}
+/* viz: bit cells */
+.bits{display:flex;gap:14px;align-items:flex-end}
+.bits .group{display:flex;gap:3px;padding:5px;border:1px dashed var(--border-strong);border-radius:8px}
+.bits i{width:13px;height:22px;border-radius:3px;background:var(--a-grad);opacity:.85}
+.bits i.alt{background:var(--data);opacity:.55}
+.bits-cap{margin-top:10px;display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:10.5px;color:var(--faint)}
+/* viz: speed bars */
+.hbar{display:grid;grid-template-columns:52px 1fr 62px;align-items:center;gap:10px;font-family:var(--font-mono);font-size:11px;color:var(--muted)}
+.hbar+.hbar{margin-top:9px}
+.hbar .track{height:7px;border-radius:99px;background:var(--panel-2);border:1px solid var(--border);overflow:hidden}
+.hbar .fill{height:100%;border-radius:99px;background:var(--border-strong);width:0;transition:width 1.1s var(--ease)}
+.hbar.hot .fill{background:var(--a-grad)}
+.hbar .val{text-align:right;color:var(--text-2)}
+/* viz: expert grid */
+.xgrid{display:grid;grid-template-columns:repeat(16,1fr);gap:4px}
+.xgrid i{aspect-ratio:1;border-radius:3px;background:var(--panel-2);border:1px solid var(--border)}
+.xgrid i.hot{background:var(--a-grad);border-color:transparent;box-shadow:0 0 8px var(--a-glow)}
+.xgrid i.cold{background:var(--data);border-color:transparent;opacity:.8}
+.xgrid-cap{margin-top:10px;display:flex;gap:16px;font-family:var(--font-mono);font-size:10.5px;color:var(--faint)}
+.xgrid-cap b{color:var(--text-2);font-weight:500}
+.dotk{display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:5px;vertical-align:0}
+/* viz: ctx bar */
+.ctxbar{position:relative;height:12px;border-radius:99px;background:var(--panel-2);border:1px solid var(--border);overflow:visible}
+.ctxbar .fill{position:absolute;inset:2px;border-radius:99px;background:var(--a-grad);opacity:.9}
+.ctxbar .tick{position:absolute;top:-7px;bottom:-7px;width:1px;background:var(--border-strong)}
+.ctxbar .tick::after{content:attr(data-l);position:absolute;top:-18px;left:50%;transform:translateX(-50%);font-family:var(--font-mono);font-size:9.5px;color:var(--faint);white-space:nowrap}
+.ctx-cap{display:flex;justify-content:space-between;margin-top:16px;font-family:var(--font-mono);font-size:10.5px;color:var(--faint)}
+/* viz: graph nodes */
+.nodeviz{display:flex;align-items:center;gap:0;font-family:var(--font-mono);font-size:11px;color:var(--muted)}
+.nodeviz .n{padding:8px 12px;border:1px solid var(--border);border-radius:8px;background:var(--panel-2);white-space:nowrap}
+.nodeviz .n.hot{border-color:color-mix(in srgb,var(--a1) 40%,transparent);color:var(--a1);background:var(--a-soft)}
+.nodeviz .arr{padding:0 8px;color:var(--faint)}
+.bignum{font-family:var(--font-display);font-weight:700;font-size:44px;letter-spacing:-.03em;line-height:1}
+.bignum small{font-size:.42em;color:var(--muted);font-weight:600;letter-spacing:0}
+.checklist{margin-top:16px;display:grid;gap:9px}
+.checklist li{list-style:none;display:flex;gap:9px;font-size:13px;color:var(--text-2);align-items:baseline}
+.checklist li::before{content:"✓";color:var(--ok);font-weight:700;font-size:12px}
+@media(max-width:920px){.card,.card.wide{grid-column:span 3}}
+@media(max-width:620px){.card,.card.wide{grid-column:span 6}}
+
+/* ============ BENCHMARKS ============ */
+.bench{
+  border:1px solid var(--border);border-radius:var(--r-lg);
+  background:
+    radial-gradient(700px 300px at 15% 0%,var(--a-soft),transparent 70%),
+    var(--panel);
+  padding:52px;display:grid;grid-template-columns:1fr 1fr;gap:60px;
+  box-shadow:var(--shadow-card);
+}
+.bench-col h4{font-family:var(--font-mono);font-size:11.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);margin-bottom:26px;display:flex;justify-content:space-between}
+.bench-col h4 span{color:var(--muted)}
+.brow{margin-bottom:26px}
+.brow .btop{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:9px}
+.brow .bname{font-size:13.5px;font-weight:600;color:var(--text-2);display:flex;align-items:center;gap:8px}
+.brow .bname i{width:8px;height:8px;border-radius:2.5px;flex:none}
+.brow.crow .bname i{background:var(--a-grad);box-shadow:0 0 8px var(--a-glow)}
+.brow.ref .bname i{background:var(--faint)}
+.brow .bval{font-family:var(--font-mono);font-size:14px;color:var(--text)}
+.brow .btrack{height:12px;border-radius:99px;background:var(--panel-2);border:1px solid var(--border);overflow:hidden}
+.brow .bfill{height:100%;border-radius:99px;width:0;transition:width 1.4s var(--ease)}
+.brow.crow .bfill{background:var(--a-grad);box-shadow:0 0 16px var(--a-glow)}
+.brow.ref .bfill{background:var(--border-strong)}
+.brow .bgain{margin-top:7px;font-family:var(--font-mono);font-size:11px;color:var(--data)}
+.bench-note{grid-column:1/-1;border-top:1px solid var(--border);padding-top:20px;font-family:var(--font-mono);font-size:11px;line-height:1.8;color:var(--faint)}
+.bench-note b{color:var(--muted);font-weight:500}
+@media(max-width:880px){.bench{grid-template-columns:1fr;padding:34px 26px;gap:40px}}
+
+/* ============ PIPELINE ============ */
+.pipe{display:flex;align-items:stretch;gap:10px;flex-wrap:wrap}
+.pipe .node{
+  flex:1;min-width:150px;position:relative;
+  border:1px solid var(--border);border-radius:14px;background:var(--panel);
+  padding:18px 16px;box-shadow:var(--shadow-card);
+  transition:border-color .25s,transform .25s var(--ease);
+}
+.pipe .node:hover{transform:translateY(-2px);border-color:color-mix(in srgb,var(--a1) 45%,transparent)}
+.pipe .node .pn{font-family:var(--font-mono);font-size:10px;color:var(--a1);letter-spacing:.1em}
+.pipe .node .pt{font-family:var(--font-display);font-weight:600;font-size:15px;margin-top:5px;letter-spacing:-.01em}
+.pipe .node .pd{font-size:11.5px;color:var(--muted);margin-top:4px;line-height:1.5}
+.pipe .link{align-self:center;color:var(--faint);font-family:var(--font-mono);flex:none}
+@media(max-width:920px){.pipe .link{display:none}.pipe .node{min-width:44%}}
+
+/* ============ CODE ============ */
+.code-window{
+  border-radius:var(--r-lg);overflow:hidden;border:1px solid var(--term-border);
+  background:var(--term-bg);box-shadow:0 40px 100px -40px rgba(0,0,0,.7),var(--shadow-card);
+}
+.code-tabs{display:flex;align-items:center;border-bottom:1px solid rgba(255,255,255,.07);padding:0 10px}
+.code-tab{
+  font-family:var(--font-mono);font-size:12px;color:#7D8592;padding:13px 16px;
+  border-bottom:2px solid transparent;margin-bottom:-1px;transition:color .2s,border-color .2s;
+}
+.code-tab.on{color:#F1F3F8;border-bottom-color:var(--a1)}
+.code-tab:hover{color:#C6CDD9}
+.code-copy{
+  margin-left:auto;display:flex;align-items:center;gap:6px;
+  font-family:var(--font-mono);font-size:11px;color:#7D8592;padding:6px 11px;border-radius:7px;
+  border:1px solid rgba(255,255,255,.09);transition:color .2s,border-color .2s;
+}
+.code-copy:hover{color:#E8EDF5;border-color:rgba(255,255,255,.2)}
+.code-copy svg{width:12px;height:12px}
+.code-pane{display:none;padding:22px 24px;font-family:var(--font-mono);font-size:12.8px;line-height:1.85;color:#C9D1E0;overflow-x:auto;white-space:pre-wrap}
+.code-pane.on{display:block}
+.code-pane .c{color:#5C6572}
+.code-pane .k{color:#FF8A4C}
+.code-pane .s{color:#4FE3CE}
+.code-pane .f{color:#FFD37A}
+.code-pane .n{color:#C792EA}
+
+/* ============ FOOTER ============ */
+footer{border-top:1px solid var(--border);padding:70px 0 0;overflow:hidden}
+.foot-grid{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:40px;padding-bottom:60px}
+.foot-brand p{margin-top:14px;font-size:13px;color:var(--muted);line-height:1.7;max-width:30ch}
+.foot-col h5{font-family:var(--font-mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin-bottom:16px}
+.foot-col a{display:block;font-size:13.5px;color:var(--muted);padding:5px 0;transition:color .2s}
+.foot-col a:hover{color:var(--text)}
+.foot-bottom{border-top:1px solid var(--border);padding:22px 0;display:flex;justify-content:space-between;align-items:center;font-family:var(--font-mono);font-size:11px;color:var(--faint);flex-wrap:wrap;gap:10px}
+.foot-word{
+  font-family:var(--font-display);font-weight:700;text-align:center;
+  font-size:clamp(70px,15.5vw,220px);letter-spacing:-.05em;line-height:.86;
+  user-select:none;
+  background:linear-gradient(180deg,var(--text) 0%,transparent 92%);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+  opacity:.10;transform:translateY(8%);
+}
+@media(max-width:820px){.foot-grid{grid-template-columns:1fr 1fr}}
+
+/* theme transition polish */
+.theme-fade *{transition:background-color .45s var(--ease),border-color .45s var(--ease),color .45s var(--ease) !important}
+</style>
+</head>
+<body>
+
+<!-- ================= NAV ================= -->
+<header class="nav" id="nav">
+  <div class="nav-inner">
+    <a class="brand" href="#">
+      <svg viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#F5B942"/><stop offset="1" stop-color="#FF6A3D"/></linearGradient></defs>
+        <path d="M16 2.5 28.5 9.7v12.6L16 29.5 3.5 22.3V9.7L16 2.5Z" fill="url(#lg)"/>
+        <path d="M9.5 19.5c3.2.2 5.4-.8 6.8-2.4l6.2 2.6-4.4 1.9c-3.1 1.2-6.6.2-8.6-2.1Z" fill="#0B0C10"/>
+        <circle cx="20.6" cy="12.6" r="2" fill="#0B0C10"/>
+      </svg>
+      crow-nest
+    </a>
+    <nav class="nav-links" aria-label="Main">
+      <a href="#engine">Engine</a>
+      <a href="#benchmarks">Benchmarks</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#quickstart">Quickstart</a>
+    </nav>
+    <div class="nav-right">
+      <button class="theme-btn" id="themeBtn" aria-label="Toggle color theme" aria-pressed="false" title="Toggle theme">
+        <span class="knob">
+          <svg class="ic-moon" viewBox="0 0 24 24" fill="#14100A"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+          <svg class="ic-sun" viewBox="0 0 24 24" fill="#14100A"><circle cx="12" cy="12" r="4.4"/><path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3M4.6 4.6l2.1 2.1M17.3 17.3l2.1 2.1M4.6 19.4l2.1-2.1M17.3 6.7l2.1-2.1" stroke="#14100A" stroke-width="2" stroke-linecap="round"/></svg>
+        </span>
+      </button>
+      <a class="gh-btn" href="https://github.com/" target="_blank" rel="noopener">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56 0-.27-.01-1.17-.02-2.12-3.2.7-3.88-1.36-3.88-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.03 1.76 2.69 1.25 3.35.96.1-.75.4-1.25.72-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.28 1.18-3.09-.12-.29-.51-1.46.11-3.05 0 0 .96-.31 3.15 1.18a10.9 10.9 0 0 1 5.74 0c2.19-1.49 3.15-1.18 3.15-1.18.62 1.59.23 2.76.11 3.05.74.81 1.18 1.83 1.18 3.09 0 4.42-2.7 5.39-5.27 5.68.41.36.78 1.06.78 2.14 0 1.54-.01 2.79-.01 3.17 0 .31.21.67.8.56A11.52 11.52 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/></svg>
+        GitHub
+      </a>
+    </div>
+  </div>
+</header>
+
+<!-- ================= HERO ================= -->
+<div class="hero">
+  <div class="aurora" aria-hidden="true"><div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div></div>
+  <div class="gridlines" aria-hidden="true"></div>
+  <div class="wrap">
+    <div class="hero-badge"><span class="pulse-dot"></span>work in progress · 360B on a single RTX 5090</div>
+    <h1>
+      <span class="line"><span>360B parameters.</span></span>
+      <span class="line"><span class="grad">One GPU.</span></span>
+      <span class="line"><span>No cloud.</span></span>
+    </h1>
+    <p class="hero-sub">
+      Crow is a from-scratch inference engine that runs giant Mixture-of-Experts models locally —
+      a <strong>custom 4.5-bit weight format</strong>, hand-written <strong>tensor-core kernels</strong>, and a
+      <strong>residency scheduler</strong> that keeps the right 3% of experts in VRAM.
+    </p>
+    <div class="hero-cta">
+      <a class="btn btn-primary" href="#quickstart">
+        Get started
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </a>
+      <a class="btn btn-ghost" href="#benchmarks">See the numbers</a>
+    </div>
+    <div class="hero-chips">
+      <span><i></i> written in Rust</span>
+      <span><i></i> raw CUDA via NVRTC</span>
+      <span><i></i> OpenAI-compatible API</span>
+      <span><i></i> zero telemetry</span>
+    </div>
+
+    <!-- terminal -->
+    <div class="term" aria-label="Demo terminal">
+      <div class="term-head">
+        <span class="tdot r"></span><span class="tdot y"></span><span class="tdot g"></span>
+        <span class="term-title">crow — zsh</span>
+        <span class="term-badge">RTX 5090 · sm_120a</span>
+      </div>
+      <div class="term-body">
+        <div class="tline"><span class="t-prompt">$ </span><span id="cmdText"></span><span class="caret" id="cmdCaret"></span></div>
+        <div id="bootBlock" class="t-hidden">
+          <div class="tline t-ok">container loaded        104.7 GB → 32.4 GB VRAM <span class="t-dim">(hot · 160 experts/layer)</span></div>
+          <div class="tline t-ok">kernels compiled        51 NVRTC modules <span class="t-dim">(m16n8k64 FP4 MMA)</span></div>
+          <div class="tline t-ok">kv cache                FP8 · 262,144 tokens reserved</div>
+          <div class="tline t-ok">cuda graph captured     1 replay per token <span class="t-dim">(was ~1,000 launches)</span></div>
+          <div class="tline t-listen">listening               http://0.0.0.0:8080 <span class="t-dim">(OpenAI-compatible)</span></div>
+        </div>
+        <div id="genBlock" class="t-hidden">
+          <div class="tline"><span class="t-prompt">&gt; </span><span class="t-out" id="qText"></span></div>
+          <div class="tline t-out" id="genText"></div>
+          <div class="tline t-stats"><span id="statLine"><b id="tpsVal">0.0</b> tok/s · <span id="tokVal">0</span> tokens · 0 cold stalls</span><span class="caret" style="height:13px;width:7px"></span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ================= STATS ================= -->
+<div class="stats">
+  <div class="wrap">
+    <div class="stats-grid">
+      <div class="stat reveal"><div class="num"><span data-count="360" data-decimals="0">0</span><small>B</small></div><div class="lbl">parameters</div></div>
+      <div class="stat reveal" style="--d:.08s"><div class="num"><span data-count="4.5" data-decimals="1">0</span><small>bit</small></div><div class="lbl">per weight · CNQ4.5</div></div>
+      <div class="stat reveal" style="--d:.16s"><div class="num"><span data-count="262" data-decimals="0">0</span><small>k</small></div><div class="lbl">context window</div></div>
+      <div class="stat reveal" style="--d:.24s"><div class="num"><span data-count="1" data-decimals="0">0</span><small>×</small></div><div class="lbl">consumer GPU</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- ================= ENGINE / BENTO ================= -->
+<section id="engine">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <span class="kicker">The engine</span>
+      <h2 class="sec-title">Every layer of the stack, rebuilt.</h2>
+      <p class="sec-sub">No wrapper around someone else's runtime. Custom weight format, custom kernels, custom memory scheduler — compiled for your exact GPU at load time.</p>
+    </div>
+
+    <div class="bento">
+      <!-- CNQ4.5 -->
+      <div class="card wide reveal">
+        <span class="tag">CNQ4.5</span>
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 6h16M4 12h10M4 18h16"/><circle cx="18" cy="12" r="2.2"/></svg></div>
+        <h3>4.5-bit weights that behave</h3>
+        <p>FP4 payloads with UE4M3 subblock scales, MSE-fitted per 16-element block. 2.17&thinsp;% clipped elements, layer-level error 0.09 rel L2 — measured, not promised.</p>
+        <div class="viz">
+          <div class="bits" aria-hidden="true">
+            <div class="group"><i></i><i></i><i></i><i></i><i class="alt"></i><i></i><i></i><i></i></div>
+            <div class="group"><i></i><i class="alt"></i><i></i><i></i><i></i><i></i><i class="alt"></i><i></i></div>
+            <div class="group"><i></i><i></i><i class="alt"></i><i></i><i></i><i></i><i></i><i></i></div>
+          </div>
+          <div class="bits-cap"><span>4-bit payload</span><span>fp8 scale / 16</span><span>−21&thinsp;% MSE vs ceiling</span></div>
+        </div>
+      </div>
+
+      <!-- Kernels -->
+      <div class="card wide reveal" style="--d:.08s">
+        <span class="tag">sm_120a</span>
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4 14h6l-1 8 9-12h-6l1-8Z"/></svg></div>
+        <h3>Tensor cores all the way down</h3>
+        <p>Every dense and routed GEMV runs m16n8k64 FP4 MMA — 51 kernels NVRTC-compiled at load, tuned to your GPU, with the naive path kept as fallback.</p>
+        <div class="viz">
+          <div class="hbar"><span>naive</span><div class="track"><div class="fill" data-w="100"></div></div><span class="val">0.653&thinsp;ms</span></div>
+          <div class="hbar hot"><span>mma</span><div class="track"><div class="fill" data-w="9"></div></div><span class="val">0.060&thinsp;ms</span></div>
+          <div class="hbar hot"><span>mma t=2048</span><div class="track"><div class="fill" data-w="2"></div></div><span class="val">23.9&thinsp;ms</span></div>
+        </div>
+      </div>
+
+      <!-- Residency -->
+      <div class="card wide reveal">
+        <span class="tag">residency</span>
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5"/><path d="M17.2 13.8v6.4M14 17h6.4"/></svg></div>
+        <h3>The right experts, always hot</h3>
+        <p>A traffic-trained hot-set pins 160 of 512 experts per layer in VRAM. Everything else streams zero-copy from pinned memory at ~25&thinsp;GB/s — the router never waits.</p>
+        <div class="viz">
+          <div class="xgrid" id="xgrid" aria-hidden="true"></div>
+          <div class="xgrid-cap">
+            <span><span class="dotk" style="background:var(--a1)"></span>hot <b>160/512</b></span>
+            <span><span class="dotk" style="background:var(--data)"></span>streamed <b id="coldCount">0</b></span>
+            <span style="margin-left:auto">96&thinsp;% coverage</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Context -->
+      <div class="card wide reveal" style="--d:.08s">
+        <span class="tag">262k ctx</span>
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2.5-7 5 14L17 12h4"/></svg></div>
+        <h3>262,144 tokens of memory</h3>
+        <p>FP8 key-value cache and GDN state under one budget manager. The loader clamps the cache, never your context — 200k is the floor, not the ceiling.</p>
+        <div class="viz">
+          <div class="ctxbar" aria-hidden="true">
+            <div class="fill" style="inset:2px calc(100% - 96%) 2px 2px"></div>
+            <div class="tick" style="left:49%" data-l="128k"></div>
+            <div class="tick" style="left:76%" data-l="200k"></div>
+          </div>
+          <div class="ctx-cap"><span>0</span><span>fp8 kv · verified to 262,144</span><span>262k</span></div>
+        </div>
+      </div>
+
+      <!-- CUDA graphs -->
+      <div class="card wide reveal">
+        <span class="tag">graphs</span>
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="5.5" cy="6" r="2.5"/><circle cx="18.5" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M7.8 7.2 10.5 16M16.2 7.2 13.5 16M8 6h8"/></svg></div>
+        <h3>One launch per token</h3>
+        <p>The whole decode step — attention, MoE, head, argmax — is captured once and replayed as a CUDA graph. Roughly a thousand kernel launches collapse into one.</p>
+        <div class="viz">
+          <div class="nodeviz" aria-hidden="true">
+            <span class="n">1,000+ launches</span><span class="arr">→</span><span class="n hot">1 replay</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Local -->
+      <div class="card wide reveal" style="--d:.08s">
+        <span class="tag">local-first</span>
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5 4.5 5.5v6c0 5 3.2 8.4 7.5 10 4.3-1.6 7.5-5 7.5-10v-6L12 2.5Z"/><path d="m9 11.6 2.2 2.2L15.4 9.6"/></svg></div>
+        <h3>Your machine. Your weights.</h3>
+        <ul class="checklist">
+          <li>No telemetry, no account, no API key</li>
+          <li>OpenAI-compatible endpoint out of the box</li>
+          <li>Single binary, no runtime dependencies</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= BENCHMARKS ================= -->
+<section id="benchmarks" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <span class="kicker">Benchmarks</span>
+      <h2 class="sec-title">Same model. Same prompts. Faster.</h2>
+      <p class="sec-sub">Crow CNQ4.5 against llama.cpp on identical hardware — greedy decoding, chat-templated ten-task suite, nothing cherry-picked.</p>
+    </div>
+
+    <div class="bench reveal">
+      <div class="bench-col">
+        <h4>Decode <span>tok/s · higher is better</span></h4>
+        <div class="brow crow">
+          <div class="btop"><span class="bname"><i></i>crow · CNQ4.5</span><span class="bval"><span data-count="63.2" data-decimals="1">0</span></span></div>
+          <div class="btrack"><div class="bfill" data-w="100"></div></div>
+          <div class="bgain">+59&thinsp;% vs reference</div>
+        </div>
+        <div class="brow ref">
+          <div class="btop"><span class="bname"><i></i>llama.cpp · IQ4_XS</span><span class="bval"><span data-count="39.8" data-decimals="1">0</span></span></div>
+          <div class="btrack"><div class="bfill" data-w="63"></div></div>
+        </div>
+      </div>
+      <div class="bench-col">
+        <h4>Prefill <span>tok/s · higher is better</span></h4>
+        <div class="brow crow">
+          <div class="btop"><span class="bname"><i></i>crow · CNQ4.5</span><span class="bval"><span data-count="1184" data-decimals="0">0</span></span></div>
+          <div class="btrack"><div class="bfill" data-w="100"></div></div>
+          <div class="bgain">+50&thinsp;% vs reference</div>
+        </div>
+        <div class="brow ref">
+          <div class="btop"><span class="bname"><i></i>llama.cpp · IQ4_XS</span><span class="bval"><span data-count="790" data-decimals="0">0</span></span></div>
+          <div class="btrack"><div class="bfill" data-w="67"></div></div>
+        </div>
+      </div>
+      <div class="bench-note">
+        <b>Setup</b> — Qwen3.8-Flash-Next (360B MoE) · single RTX 5090 · greedy · identical prompts, identical chat template · EOS-stop both arms · ten-task suite incl. 19k-token long-context read · reference: llama.cpp CUDA build.<br>
+        <b>Note</b> — design mockup; figures reflect current project targets.
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= ARCHITECTURE ================= -->
+<section id="architecture" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <span class="kicker">Architecture</span>
+      <h2 class="sec-title">A token's journey.</h2>
+    </div>
+    <div class="pipe reveal">
+      <div class="node"><div class="pn">01 · INPUT</div><div class="pt">Tokenize</div><div class="pd">native tokenizer, chat template applied</div></div>
+      <div class="link">→</div>
+      <div class="node"><div class="pn">02 · PREFILL</div><div class="pt">Chunked GEMM</div><div class="pd">tensor-core prefill, host-sync batching</div></div>
+      <div class="link">→</div>
+      <div class="node"><div class="pn">03 · ROUTE</div><div class="pt">48 routers</div><div class="pd">512 experts, top-k per layer</div></div>
+      <div class="link">→</div>
+      <div class="node"><div class="pn">04 · FETCH</div><div class="pt">Hot / cold</div><div class="pd">VRAM-resident or 25&thinsp;GB/s zero-copy stream</div></div>
+      <div class="link">→</div>
+      <div class="node"><div class="pn">05 · DECODE</div><div class="pt">Graph replay</div><div class="pd">one CUDA graph per token, FP8 KV</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= QUICKSTART ================= -->
+<section id="quickstart" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <span class="kicker">Quickstart</span>
+      <h2 class="sec-title">Three commands. Then it's yours.</h2>
+    </div>
+    <div class="code-window reveal">
+      <div class="code-tabs" role="tablist">
+        <button class="code-tab on" role="tab" data-pane="p-install">install</button>
+        <button class="code-tab" role="tab" data-pane="p-serve">serve</button>
+        <button class="code-tab" role="tab" data-pane="p-client">client</button>
+        <button class="code-copy" id="copyBtn" title="Copy to clipboard">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+          <span id="copyLbl">copy</span>
+        </button>
+      </div>
+      <div class="code-pane on" id="p-install"><span class="c"># Rust toolchain + CUDA 13 toolkit, that's it</span>
+$ git clone https://github.com/crow-nest/crow
+$ cd crow &amp;&amp; cargo build --release
+
+<span class="c"># 51 kernels compile for your GPU on first launch</span></div>
+      <div class="code-pane" id="p-serve"><span class="c"># CNQ4.5 container · 262k context · OpenAI-compatible</span>
+$ <span class="f">crow</span> serve Qwen3.8-Flash-Next.cnq \
+    <span class="n">--ctx</span> <span class="s">262144</span> <span class="n">--kv</span> <span class="s">fp8</span> <span class="n">--port</span> <span class="s">8080</span>
+
+<span class="k">✓</span> container loaded   <span class="s">32.4 GB VRAM</span> (hot · 160/layer)
+<span class="k">✓</span> listening          <span class="s">http://0.0.0.0:8080</span></div>
+      <div class="code-pane" id="p-client"><span class="k">from</span> openai <span class="k">import</span> OpenAI
+
+client = <span class="f">OpenAI</span>(base_url=<span class="s">"http://localhost:8080/v1"</span>, api_key=<span class="s">"crow"</span>)
+
+stream = client.chat.completions.<span class="f">create</span>(
+    model=<span class="s">"qwen3.8-flash-next"</span>,
+    messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: <span class="s">"Explain entropy like I'm five"</span>}],
+    stream=<span class="k">True</span>,
+)
+<span class="k">for</span> chunk <span class="k">in</span> stream:
+    <span class="f">print</span>(chunk.delta, end=<span class="s">""</span>)</div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= FOOTER ================= -->
+<footer>
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="#">
+          <svg viewBox="0 0 32 32" fill="none" aria-hidden="true">
+            <defs><linearGradient id="lg2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#F5B942"/><stop offset="1" stop-color="#FF6A3D"/></linearGradient></defs>
+            <path d="M16 2.5 28.5 9.7v12.6L16 29.5 3.5 22.3V9.7L16 2.5Z" fill="url(#lg2)"/>
+            <path d="M9.5 19.5c3.2.2 5.4-.8 6.8-2.4l6.2 2.6-4.4 1.9c-3.1 1.2-6.6.2-8.6-2.1Z" fill="#0B0C10"/>
+            <circle cx="20.6" cy="12.6" r="2" fill="#0B0C10"/>
+          </svg>
+          crow-nest
+        </a>
+        <p>A from-scratch inference engine for giant MoE models. Built in Rust and raw CUDA.</p>
+      </div>
+      <div class="foot-col">
+        <h5>Engine</h5>
+        <a href="#engine">CNQ4.5 format</a>
+        <a href="#engine">Kernels</a>
+        <a href="#architecture">Architecture</a>
+      </div>
+      <div class="foot-col">
+        <h5>Project</h5>
+        <a href="#benchmarks">Benchmarks</a>
+        <a href="#quickstart">Quickstart</a>
+        <a href="https://github.com/" target="_blank" rel="noopener">GitHub</a>
+      </div>
+      <div class="foot-col">
+        <h5>Specs</h5>
+        <a href="#">CNQ4.5 container spec</a>
+        <a href="#">Kernel reference</a>
+        <a href="#">Roadmap</a>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span>© 2026 crow-nest</span>
+      <span>rust · nvrtc · no frameworks</span>
+    </div>
+  </div>
+  <div class="foot-word" aria-hidden="true">crow-nest</div>
+</footer>
+
+<script>
+(function(){
+"use strict";
+var root=document.documentElement;
+var reduce=window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* ---------- theme ---------- */
+var metaTheme=document.querySelector('meta[name="theme-color"]');
+var themeBtn=document.getElementById("themeBtn");
+function applyTheme(t){
+  root.dataset.theme=t;
+  themeBtn.setAttribute("aria-pressed", t==="light");
+  if(metaTheme) metaTheme.content = t==="dark" ? "#07080B" : "#F7F6F2";
+}
+var saved=null;
+try{saved=localStorage.getItem("crow-theme")}catch(e){}
+applyTheme(saved || (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"));
+themeBtn.addEventListener("click",function(){
+  var next = root.dataset.theme==="dark" ? "light" : "dark";
+  try{localStorage.setItem("crow-theme",next)}catch(e){}
+  if(document.startViewTransition && !reduce){
+    document.startViewTransition(function(){applyTheme(next)});
+  }else{applyTheme(next)}
+});
+
+/* ---------- nav scroll ---------- */
+var nav=document.getElementById("nav");
+function onScroll(){nav.classList.toggle("scrolled", window.scrollY>8)}
+window.addEventListener("scroll",onScroll,{passive:true});onScroll();
+
+/* ---------- reveal ---------- */
+var io=new IntersectionObserver(function(es){
+  es.forEach(function(e){if(e.isIntersecting){e.target.classList.add("in");io.unobserve(e.target)}});
+},{threshold:.14});
+document.querySelectorAll(".reveal").forEach(function(el){io.observe(el)});
+
+/* ---------- count-up ---------- */
+function fmt(v,d){return v.toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d})}
+var cio=new IntersectionObserver(function(es){
+  es.forEach(function(e){
+    if(!e.isIntersecting)return;cio.unobserve(e.target);
+    var el=e.target,target=parseFloat(el.dataset.count),d=parseInt(el.dataset.decimals||"0",10);
+    if(reduce){el.textContent=fmt(target,d);return}
+    var t0=null,dur=1500;
+    function step(ts){
+      if(!t0)t0=ts;var p=Math.min((ts-t0)/dur,1);p=1-Math.pow(1-p,3);
+      el.textContent=fmt(target*p,d);
+      if(p<1)requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+},{threshold:.5});
+document.querySelectorAll("[data-count]").forEach(function(el){cio.observe(el)});
+
+/* ---------- bars ---------- */
+var bio=new IntersectionObserver(function(es){
+  es.forEach(function(e){
+    if(!e.isIntersecting)return;bio.unobserve(e.target);
+    var f=e.target;setTimeout(function(){f.style.width=f.dataset.w+"%"},reduce?0:150);
+  });
+},{threshold:.5});
+document.querySelectorAll(".fill[data-w],.bfill[data-w]").forEach(function(el){bio.observe(el)});
+
+/* ---------- card spotlight ---------- */
+document.querySelectorAll(".card").forEach(function(card){
+  card.addEventListener("pointermove",function(ev){
+    var r=card.getBoundingClientRect();
+    card.style.setProperty("--mx",(ev.clientX-r.left)+"px");
+    card.style.setProperty("--my",(ev.clientY-r.top)+"px");
+  });
+});
+
+/* ---------- expert grid flicker ---------- */
+var xg=document.getElementById("xgrid");
+if(xg){
+  var CELLS=96,HOT=18,cells=[];
+  for(var i=0;i<CELLS;i++){
+    var d=document.createElement("i");xg.appendChild(d);cells.push(d);
+  }
+  var hotIdx=[];
+  while(hotIdx.length<HOT){
+    var k=Math.floor(Math.random()*CELLS);
+    if(hotIdx.indexOf(k)===-1){hotIdx.push(k);cells[k].classList.add("hot")}
+  }
+  if(!reduce){
+    var coldN=document.getElementById("coldCount"),n=0;
+    setInterval(function(){
+      var k=Math.floor(Math.random()*CELLS);
+      if(hotIdx.indexOf(k)!==-1)return;
+      cells[k].classList.add("cold");n++;
+      if(coldN)coldN.textContent=n;
+      setTimeout(function(){cells[k].classList.remove("cold")},700);
+    },950);
+  }
+}
+
+/* ---------- terminal ---------- */
+var cmdText=document.getElementById("cmdText"),
+    cmdCaret=document.getElementById("cmdCaret"),
+    bootBlock=document.getElementById("bootBlock"),
+    genBlock=document.getElementById("genBlock"),
+    qText=document.getElementById("qText"),
+    genText=document.getElementById("genText"),
+    tpsVal=document.getElementById("tpsVal"),
+    tokVal=document.getElementById("tokVal");
+var CMD="crow serve Qwen3.8-Flash-Next.cnq --ctx 262144 --kv fp8";
+var PROMPT="explain entropy like I'm five";
+var ANSWER="Entropy is how many ways something can be shuffled. A tidy room has low entropy — one glance and you know everything. The universe is the messiest room there is: nobody can ever fully know it, and that's not a bug. It's the price of having interesting things to look at.";
+function sleep(ms){return new Promise(function(r){setTimeout(r,ms)})}
+function typeInto(el,text,speed){
+  return new Promise(function(res){
+    if(reduce){el.textContent=text;res();return}
+    var i=0;
+    (function tick(){
+      el.textContent=text.slice(0,++i);
+      if(i<text.length)setTimeout(tick,speed+Math.random()*speed);
+      else res();
+    })();
+  });
+}
+async function streamInto(el,text,onTok){
+  if(reduce){el.textContent=text;if(onTok)onTok(text.split(" ").length);return}
+  var words=text.split(" ");
+  for(var i=0;i<words.length;i++){
+    el.textContent+=(i?" ":"")+words[i];
+    if(onTok)onTok(1);
+    await sleep(34+Math.random()*70);
+  }
+}
+async function play(){
+  bootBlock.classList.add("t-hidden");genBlock.classList.add("t-hidden");
+  cmdText.textContent="";genText.textContent="";
+  await typeInto(cmdText,CMD,26);
+  await sleep(350);
+  cmdCaret.style.display="none";
+  bootBlock.classList.remove("t-hidden");
+  if(!reduce)await sleep(1400);else await sleep(400);
+  genBlock.classList.remove("t-hidden");
+  await typeInto(qText,PROMPT,34);
+  await sleep(420);
+  var toks=0,base=63.2;
+  var tpsTimer=setInterval(function(){
+    var v=base+(Math.random()*4-2);
+    tpsVal.textContent=v.toFixed(1);
+  },420);
+  if(reduce){tpsVal.textContent=base.toFixed(1)}
+  await streamInto(genText,ANSWER,function(n){
+    toks+=n;tokVal.textContent=toks;
+  });
+  clearInterval(tpsTimer);
+  await sleep(3400);
+  cmdCaret.style.display="";
+  play();
+}
+play();
+
+/* ---------- code tabs + copy ---------- */
+var copyTexts={
+  "p-install":"git clone https://github.com/crow-nest/crow\ncd crow && cargo build --release",
+  "p-serve":"crow serve Qwen3.8-Flash-Next.cnq --ctx 262144 --kv fp8 --port 8080",
+  "p-client":'from openai import OpenAI\nclient = OpenAI(base_url="http://localhost:8080/v1", api_key="crow")'
+};
+var currentPane="p-install";
+document.querySelectorAll(".code-tab").forEach(function(tab){
+  tab.addEventListener("click",function(){
+    document.querySelectorAll(".code-tab").forEach(function(t){t.classList.remove("on")});
+    document.querySelectorAll(".code-pane").forEach(function(p){p.classList.remove("on")});
+    tab.classList.add("on");
+    document.getElementById(tab.dataset.pane).classList.add("on");
+    currentPane=tab.dataset.pane;
+  });
+});
+var copyBtn=document.getElementById("copyBtn"),copyLbl=document.getElementById("copyLbl");
+copyBtn.addEventListener("click",function(){
+  var txt=copyTexts[currentPane]||"";
+  function done(){copyLbl.textContent="copied ✓";setTimeout(function(){copyLbl.textContent="copy"},1600)}
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(txt).then(done,function(){done()});
+  }else{done()}
+});
+})();
+</script>
+</body>
+</html>

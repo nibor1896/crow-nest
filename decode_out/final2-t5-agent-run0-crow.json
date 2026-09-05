@@ -1,0 +1,52 @@
+{
+  "answers": {
+    "t5-agent": {
+      "answer_ids": [
+        8160,
+        369,
+        279,
+        4581,
+        3108,
+        1500,
+        11,
+        321,
+        279,
+        30800,
+        13,
+        271,
+        271,
+        271,
+        271,
+        550,
+        248046
+      ],
+      "max_tokens": 1536
+    }
+  },
+  "crow_answers_text": {
+    "t5-agent": "Here is the exact command line, and the assumptions.\n\n\n\n\n\n\n\n##"
+  },
+  "measurements": [
+    {
+      "arm": "crow",
+      "decode_tok_s": 27.493125101481976,
+      "note": "prompt_tokens 7966; stopped_eos at 17",
+      "position_in_series": 0,
+      "prefill_tok_s": 487.13238818194327,
+      "prompt": "t5-agent",
+      "wall_s": 105.678696
+    }
+  ],
+  "meta": {
+    "arm": "crow",
+    "crow_container": "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq",
+    "execution": "arm-phased (exclusive resources; paired rotated order per arm, identical to the other arm's)",
+    "first_mover_rule": "crow",
+    "operating_point": "200k floor, -np 1, greedy, temperature 0",
+    "order": [
+      "t5-agent"
+    ],
+    "run_index": 0,
+    "warmup": "one cold prefill per phase start, discarded (spec 0.3)"
+  }
+}

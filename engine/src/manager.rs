@@ -1,0 +1,347 @@
+//! #9 — the three-state memory manager. OWNS every state allocation of the
+//! engine (spec 2.5): KV cache (12 full-attention layers), GDN recurrent state
+//! (36 layers, f32, fixed), QSA indexer key + pooled-block caches (per
+//! attention layer, full-length like the reference `StaticIndexedLayer` — the
+//! 2048 budget is the SELECTION budget, not the cache size; finding recorded
+//! from transformers 5.16.1 cache_utils `update_indexer`).
+//!
+//! Loader rule (spec 2.1, binding): N=160 is the TARGET; the loader verifies
+//! the full budget with MEASURED overheads at load time and auto-clamps N; it
+//! refuses configurations that fall below the 200k context floor — it never
+//! silently degrades context.
+
+use crate::cuda;
+use crate::geo::*;
+use cudarc::driver::sys::CUdeviceptr;
+
+pub struct StateSizes {
+    pub kv_bytes: u64,
+    pub qsa_keys_bytes: u64,
+    /// rows of the raw indexer-key ring per attention layer (CROW_QSA_FULL=1:
+    /// the full context, the pre-2026-09-05 layout)
+    pub qsa_ring_rows: usize,
+    pub qsa_pooled_bytes: u64,
+    pub gdn_s_bytes: u64,
+    pub gdn_conv_bytes: u64,
+    pub rope_bytes: u64,
+}
+
+impl StateSizes {
+    /// all byte counts derived from geometry + context (measured shapes)
+    pub fn plan(context: usize, kv: KvDtype, prompt_chunk: usize) -> StateSizes {
+        let bpv = kv.byte_per_value() as u64;
+        // raw keys are consumed by pool4_cache right after they are appended
+        // (the pooled per-block keys are the long-lived cache): a 4-aligned ring
+        // of chunk + 4 rows holds every row a chunk can still pool (up to 3 rows
+        // of the previous chunk's incomplete block) — measured 2026-09-05
+        let ring = if std::env::var("CROW_QSA_FULL").as_deref() == Ok("1") {
+            context
+        } else {
+            ((prompt_chunk + 4 + 3) / 4 * 4).min(context)
+        };
+        StateSizes {
+            kv_bytes: (ATTN_LAYERS * 2 * NKV * AHD * context) as u64 * bpv,
+            qsa_keys_bytes: (ATTN_LAYERS * ring * QSA_HIDD) as u64 * 4,
+            qsa_ring_rows: ring,
+            qsa_pooled_bytes: (ATTN_LAYERS * ((context + 3) / 4) * QSA_HIDD) as u64 * 4,
+            gdn_s_bytes: (GDN_LAYERS * GDN_VHEADS * GD * GD) as u64 * 4,
+            gdn_conv_bytes: (GDN_LAYERS * GDN_CONV * 3) as u64 * 4,
+            rope_bytes: (context * ROPE_PAIRS * 2) as u64 * 4,
+        }
+    }
+}
+
+pub struct ThreeStates {
+    pub context: usize,
+    pub kv: KvDtype,
+    pub kv_buf: CUdeviceptr,      // [12][2][nkv][t][256] — one accounting
+    pub qsa_keys: Vec<CUdeviceptr>, // [12][ring][128] f32 (row = pos % ring)
+    pub qsa_ring_rows: usize,
+    pub qsa_pooled: Vec<CUdeviceptr>, // [12][ceil(t/4)][128] f32
+    pub gdn_s: Vec<CUdeviceptr>,    // [36][48*128*128] f32
+    pub gdn_conv: Vec<CUdeviceptr>, // [36][10240*3] f32
+    pub cos: CUdeviceptr,
+    pub sin: CUdeviceptr,
+    pub sizes: StateSizes,
+    pub report: AllocReport,
+}
+
+#[derive(Default, Clone)]
+pub struct AllocReport {
+    pub lines: Vec<String>,
+    pub total_bytes: u64,
+    pub effective_n: usize,
+}
+
+impl ThreeStates {
+    /// verify plan + allocate. `pending_bytes` is the loader's measured
+    /// non-state footprint (dense weights + hot experts + PLE cache + graph
+    /// slack); the deficit clamps N, the context floor refuses configs.
+    pub unsafe fn allocate(
+        cfg: &Config,
+        pending_bytes: u64, // planned but NOT yet resident (dense already sits inside free0)
+        expert_bytes_per_n_unit: u64,
+        // host side: bytes per hot-set unit in the PINNED tier (record size of a
+        // low-bit tier, else the NVFP4 slab size) and whether the tier is FULL
+        // (every expert pinned: constant size, independent of N)
+        cold_bytes_per_n_unit: u64,
+        cold_fixed: bool,
+    ) -> (ThreeStates, AllocReport) {
+        assert!(
+            cfg.context >= CONTEXT_FLOOR,
+            "refusing config: context {} below the 200k floor (spec 0.2)",
+            cfg.context
+        );
+        let mut rep = AllocReport::default();
+        let total = cuda::total_vram_bytes();
+        let free0 = cuda::free_vram_bytes();
+        rep.lines.push(format!(
+            "VRAM total {:.2} GiB, free at start {:.2} GiB",
+            total as f64 / (1 << 30) as f64,
+            free0 as f64 / (1 << 30) as f64
+        ));
+
+        // auto-clamp N with measured numbers, never the context (spec 2.1).
+        // TWO-sided: VRAM lowers N, the HOST pinned budget RAISES it (fewer
+        // cold experts) — measured host ceiling ~48.5 GB on this machine.
+        let mut n = cfg.n_hot;
+        let states_bytes = |n: usize| {
+            let s = StateSizes::plan(cfg.context, cfg.kv, cfg.prompt_chunk);
+            s.kv_bytes + s.qsa_keys_bytes + s.qsa_pooled_bytes + s.gdn_s_bytes
+                + s.gdn_conv_bytes + s.rope_bytes
+        };
+        let mut sizes = StateSizes::plan(cfg.context, cfg.kv, cfg.prompt_chunk);
+        // Termination guard (2026-09-04): when VRAM pushes N down and the host
+        // budget pushes it up, no N is feasible. Without this the loop
+        // oscillated forever and grew `rep.lines` without bound -> the whole
+        // machine froze from RAM exhaustion (chunk 1024 on the M container).
+        let mut went_down = false;
+        let mut went_up = false;
+        let mut iters = 0u32;
+        let spare = adapt_spare();
+        loop {
+            let sum = states_bytes(n) + pending_bytes + n as u64 * expert_bytes_per_n_unit;
+            let cold = (if cold_fixed { E } else { E - n.min(E) + spare }) as u64 * cold_bytes_per_n_unit;
+            if sum + SAFETY < free0 && cold <= cfg.host_pinned_budget {
+                break;
+            }
+            if n == N_MIN {
+                break;
+            }
+            iters += 1;
+            if (went_down && went_up) || iters > 2 * E as u32 {
+                rep.lines.push(format!(
+                    "no feasible N: VRAM allows at most N={} while the host pinned budget needs more — refusing",
+                    n
+                ));
+                panic!(
+                    "refusing config: no hot-set size fits BOTH the VRAM budget (free {:.2} GiB) and the host pinned budget ({:.1} GiB) — shrink the chunk/scratch, the PLE cache, or the keep-set (spec 2.1)",
+                    free0 as f64 / (1u64 << 30) as f64,
+                    cfg.host_pinned_budget as f64 / (1u64 << 30) as f64
+                );
+            }
+            if sum + SAFETY >= free0 {
+                went_down = true;
+                n -= 1;
+                if n % 8 == 0 {
+                    rep.lines.push(format!(
+                        "VRAM budget over by {:.0} MB at N={} — clamping",
+                        (sum + SAFETY - free0) as f64 / (1 << 20) as f64,
+                        n
+                    ));
+                }
+            } else {
+                went_up = true;
+                n += 1;
+                if n % 8 == 0 {
+                    rep.lines.push(format!(
+                        "host pinned tier over by {:.0} MB at N={} — raising N",
+                        (cold - cfg.host_pinned_budget) as f64 / (1 << 20) as f64,
+                        n
+                    ));
+                }
+            }
+            if cfg_n_dbg() {
+                eprintln!("[clamp] n={n} vram_sum={:.0} MB cold={:.0} MB free0={:.0} MB",
+                    states_bytes(n) as f64 / (1 << 20) as f64,
+                    ((if cold_fixed { E } else { E - n.min(E) + spare }) as u64 * cold_bytes_per_n_unit) as f64 / (1 << 20) as f64,
+                    free0 as f64 / (1 << 20) as f64);
+            }
+        }
+        let cold_final = (if cold_fixed { E } else { E - n.min(E) + spare }) as u64 * cold_bytes_per_n_unit;
+        if cold_final > cfg.host_pinned_budget {
+            panic!(
+                "refusing config: hot set N={n} would pin {:.1} GiB cold > budget {:.1} GiB — no feasible N (spec 2.1)",
+                cold_final as f64 / (1 << 30) as f64,
+                cfg.host_pinned_budget as f64 / (1 << 30) as f64
+            );
+        }
+        if n < cfg.n_hot {
+            rep.lines.push(format!(
+                "loader auto-clamped hot set: N {} -> {} (measured budget, spec 2.6)",
+                cfg.n_hot, n
+            ));
+        }
+        if n == N_MIN {
+            let sum = sizes.kv_bytes
+                + pending_bytes
+                + N_MIN as u64 * expert_bytes_per_n_unit;
+            if sum + SAFETY > free0 {
+                panic!(
+                    "refusing config: even N={N_MIN} does not fit context {} states (need {:.2} GiB, free {:.2} GiB)",
+                    cfg.context,
+                    sum as f64 / (1 << 30) as f64,
+                    free0 as f64 / (1 << 30) as f64
+                );
+            }
+        }
+
+        // ---- allocate (the real allocations ARE the measurement) ----
+        let kv_buf = cuda::alloc_zeroed(sizes.kv_bytes as usize);
+        rep.lines.push(format!(
+            "KV        {:9.1} MB  (12 layers × 2 kv-heads × 256 × {context} × {})",
+            sizes.kv_bytes as f64 / (1 << 20) as f64,
+            cfg.kv.name(),
+            context = cfg.context
+        ));
+        let mut qsa_keys = Vec::with_capacity(ATTN_LAYERS);
+        for _ in 0..ATTN_LAYERS {
+            qsa_keys.push(cuda::alloc_zeroed((sizes.qsa_ring_rows * QSA_HIDD * 4) as usize));
+        }
+        rep.lines.push(format!(
+            "QSA keys  {:9.1} MB  (12 layers × {} × 128 f32 — raw-key ring, pooled cache stays full-length)",
+            sizes.qsa_keys_bytes as f64 / (1 << 20) as f64,
+            sizes.qsa_ring_rows
+        ));
+        let mut qsa_pooled = Vec::with_capacity(ATTN_LAYERS);
+        let cap_blocks = (cfg.context + 3) / 4;
+        for _ in 0..ATTN_LAYERS {
+            qsa_pooled.push(cuda::alloc_zeroed((cap_blocks * QSA_HIDD * 4) as usize));
+        }
+        rep.lines.push(format!(
+            "QSA pooled{:9.1} MB  (12 layers × {} blocks × 128 f32)",
+            sizes.qsa_pooled_bytes as f64 / (1 << 20) as f64,
+            cap_blocks
+        ));
+        let mut gdn_s = Vec::with_capacity(GDN_LAYERS);
+        for _ in 0..GDN_LAYERS {
+            gdn_s.push(cuda::alloc_zeroed((GDN_VHEADS * GD * GD * 4) as usize));
+        }
+        let mut gdn_conv = Vec::with_capacity(GDN_LAYERS);
+        for _ in 0..GDN_LAYERS {
+            gdn_conv.push(cuda::alloc_zeroed((GDN_CONV * 3 * 4) as usize));
+        }
+        rep.lines.push(format!(
+            "GDN state {:9.1} MB  (36 × S[48][128][128] + conv[10240][3], f32, fixed)",
+            (sizes.gdn_s_bytes + sizes.gdn_conv_bytes) as f64 / (1 << 20) as f64
+        ));
+        let mut cos_h = vec![0f32; cfg.context * ROPE_PAIRS];
+        let mut sin_h = vec![0f32; cfg.context * ROPE_PAIRS];
+        for t in 0..cfg.context {
+            for j in 0..ROPE_PAIRS {
+                let inv = 10_000_000f32.powf(-(2.0 * j as f32) / 64.0);
+                let f = t as f32 * inv;
+                cos_h[t * ROPE_PAIRS + j] = f.cos();
+                sin_h[t * ROPE_PAIRS + j] = f.sin();
+            }
+        }
+        let cos = cuda::to_f32_dev(&cos_h);
+        let sin = cuda::to_f32_dev(&sin_h);
+        drop(cos_h);
+        drop(sin_h);
+        rep.lines.push(format!(
+            "RoPE tbl  {:9.1} MB  ({} positions × 32 pairs × cos+sin)",
+            sizes.rope_bytes as f64 / (1 << 20) as f64,
+            cfg.context
+        ));
+
+        let free1 = cuda::free_vram_bytes();
+        let measured = free0 - free1;
+        rep.total_bytes = measured;
+        rep.effective_n = n;
+        rep.lines.push(format!(
+            "states+dense+hot measured in VRAM: {:.1} MiB (planned {:.1} MiB, N={n})",
+            measured as f64 / (1 << 20) as f64,
+            (sizes.kv_bytes
+                + sizes.qsa_keys_bytes
+                + sizes.qsa_pooled_bytes
+                + sizes.gdn_s_bytes
+                + sizes.gdn_conv_bytes
+                + sizes.rope_bytes
+                + pending_bytes
+                + n as u64 * expert_bytes_per_n_unit) as f64 / (1 << 20) as f64
+        ));
+
+        (
+            ThreeStates {
+                context: cfg.context,
+                kv: cfg.kv,
+                kv_buf,
+                qsa_keys,
+                qsa_ring_rows: sizes.qsa_ring_rows,
+                qsa_pooled,
+                gdn_s,
+                gdn_conv,
+                cos,
+                sin,
+                sizes,
+                report: rep.clone(),
+            },
+            rep,
+        )
+    }
+
+    pub unsafe fn kv_row_ptr(&self, layer: usize, is_k: bool, kvh: usize, slot: usize) -> u64 {
+        let b = (self.kv.byte_per_value()) as u64;
+        self.kv_buf as u64
+            + ((layer * 2 + if is_k { 0 } else { 1 }) * NKV * self.context
+                + kvh * self.context
+                + slot) as u64
+            * AHD as u64
+            * b
+    }
+
+    /// byte offset (NOT absolute pointer) of a kv row — kernels take the base
+    pub fn kv_row_offset(&self, layer: usize, is_k: bool, kvh: usize, slot: usize) -> u64 {
+        let b = (self.kv.byte_per_value()) as u64;
+        (((layer * 2 + if is_k { 0 } else { 1 }) * NKV * self.context
+            + kvh * self.context
+            + slot) * AHD) as u64
+            * b
+    }
+}
+
+pub const SAFETY: u64 = 512 << 20; // launch pools, scratch, telemetry slack
+pub const N_MIN: usize = 32;
+
+impl Drop for ThreeStates {
+    fn drop(&mut self) {
+        unsafe {
+            cuda::free_dev(&mut self.kv_buf);
+            for v in self.qsa_keys.iter_mut() { cuda::free_dev(v); }
+            for v in self.qsa_pooled.iter_mut() { cuda::free_dev(v); }
+            for v in self.gdn_s.iter_mut() { cuda::free_dev(v); }
+            for v in self.gdn_conv.iter_mut() { cuda::free_dev(v); }
+            cuda::free_dev(&mut self.cos);
+            cuda::free_dev(&mut self.sin);
+        }
+    }
+}
+
+fn cfg_n_dbg() -> bool {
+    std::env::var("ENGINE_DEBUG_SYNC").is_ok()
+}
+
+/// spare hot slots per layer for the stream-side trickle adaptation (A-P3c):
+/// CROW_ADAPT_STREAM=1 reserves one, CROW_ADAPT_SPARE=<n> overrides. The
+/// spares come out of the planned N (VRAM unchanged), so the pinned cold
+/// tier grows by the same number of experts per layer - planned here.
+pub fn adapt_spare() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        if let Some(n) = std::env::var("CROW_ADAPT_SPARE").ok().and_then(|v| v.parse::<usize>().ok()) {
+            return n;
+        }
+        if std::env::var("CROW_ADAPT_STREAM").as_deref() == Ok("1") { 1 } else { 0 }
+    })
+}

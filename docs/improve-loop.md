@@ -1,0 +1,61 @@
+# Improve-Loop crow-nest (kanonische Definition, 2026-09-03)
+
+**Ziel (robin):** maximale tok/s für prefill + decode bei minimalster Latenz und
+minimalster System-Auslastung — Qualität bleibt über llama.cpp-Niveau, das
+System wird nicht mit Last zugebombt. **Projektmethodik: besser als llama.cpp**
+(42 tok/s decode ist Unterkante, nicht Ziel).
+
+## Der Loop
+
+1. **Measure** — `tools/perf_loop.sh <label>`: build → layercheck-Gate (≤ 0,125)
+   → 12-Position-Argmax (≥ 7/12) → decode ms/Token → prefill-Rate (2100er
+   Prompt). Eine Zeile in `decode_out/perf_history.tsv`.
+2. **Review** — Gates grün? Wenn nein: Änderung zurückrollen, kein weiterer
+   Schritt auf kaputter Basis.
+3. **Research (zwei Beine, IMMER beide):**
+   - intern: Breakdown, welcher Kernel/Pfad jetzt die meiste Zeit frisst;
+   - extern: **SOTA-Check gegen die Regeln unten + Web-Recherche nur für den
+     konkreten Schritt** (llama.cpp / vLLM / TRT-LLM / FlashInfer / Colfax /
+     DeepGEMM — wie lösen die genau dieses Problem?).
+4. **Improve** — den nächsten Hebel umsetzen, hinter env-Flag (variabel
+   gehalten: alte Pfade bleiben als Fallback), Engine-Finetuning (Tile-/Chunk-
+   /Warp-Parameter) solange Gates grün.
+5. zurück zu 1. **Loop-Ende:** eine ganze Runde ohne messbaren Gewinn (< 5 %)
+   = Decke erreicht → finale Zahl an robin.
+
+## SOTA-Regeln (feste Checkliste vor JEDER Verbesserung — aus
+docs/sota-research-2026-09-03.md, mit Quellen dort)
+
+- [ ] **R1 Tensor-Cores:** Der Schritt trägt vom `mma.sync m16n8k64`-MMA
+  (tcgen05 existiert auf sm_120a nicht — m16n8k64 block-scaled ist das
+  Maximum der Hardware). Kein neuer Pfad als Skalar-Loop.
+- [ ] **R2 Launch-Zahl:** Wird die Launch-Count reduziert (5–20 µs/Launch auf
+  WDDM)? Zielrichtung: CUDA-Graphs (capture-once + Parameter-Patching) statt
+  nur je-Op-Fusion; statische Buffer halten (graph-kompatible Formen).
+- [ ] **R3 Quant-Fusion:** Aktivierungs-Quantisierung fusioniert in den
+  Vorgänger-Op (Norm/Activation gibt FP4 + Blockskalen direkt aus;
+  `QuantizedActivation`-Reuse statt separater Quant-Launch + HBM-Roundtrip).
+- [ ] **R4 Prefill als GEMM:** Prefill läuft als tiled GEMM-Pipeline (TMA,
+  Multi-Stage-Buffering, 8 MMA-Warps, 128er-Tiles — Colfax ~60 % FP4-Peak
+  als Referenz), nie als GEMV-Loop über Token.
+- [ ] **R5 MoE-Dispatch:** batch-1 → Gruppierung + Vektorpfad (top-10-GEMV);
+  batched → moe_align_block_size (sortieren + BLOCK_M padden). NIE dense-
+  override bei 512 Experten (0,18× bei batch-1, TRT-LLM gemessen).
+- [ ] **R6 Prefetch:** n-gram-/PLE-Lookups des nächsten Chunks werden
+  asynchron vor dem Chunk vorbereitet (Prefetch-Pipeline statt synchroner
+  Row-Fills).
+- [ ] **R7 Mess-Ehrlichkeit:** jede Zahl nennt Container, CROW_MMA, Sidecar-
+  Herkunft, Chunk-Größe, Budgets; llama-/SOTA-Zahlen werden nie mit Crow-
+  Zahlen in eine Tabelle relationalisiert (nur als separater Kontext).
+- [ ] **R8 Qualitätsgates:** layercheck ≤ 0,125 · Argmax ≥ 7/12 · Traces ohne
+  neue Degeneration · Rel-zahlen gegen Ceiling-Referenz ausgewiesen. Rot =
+  Stufe zurück, nie weiter.
+
+## Abarbeitungs-Reihenfolge (Stand 2026-09-03)
+
+1. Dense-GEMV-MMA (~16 Callsites) — 🔄 läuft
+2. Launch-Fusion + CUDA-Graphs-PoC (R2/R3 kombinieren) — Warteschlange
+3. Prefill-GEMM-Pipeline nach Colfax (R4) + Chunk/Sync/PLE-Batching — Queue
+4. MMA-Headroom (ld.128, 8 Warps, Experten-Gruppierung im Prefill) — Queue
+5. Sparse-Prefill (t7-Pfad: Indexer + Selektion über 13k Kontext) — Queue
+6. Sidecar-Re-Warm-up mit echtem Crow-Traffic + async n-gram-Prefetch (R6) — Queue

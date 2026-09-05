@@ -1,0 +1,23 @@
+step: table_gu
+step: table_dn
+step: x
+step: gs_gu
+step: gs_dn
+step: launch gate_up
+step: launch silu first
+sync: down ok
+launch sync ok at end
+STAGE h1up[640..648]=[-0.22910902, 0.102143936, -0.0905242, -0.13614836, -0.043748707, -0.0180872, -0.2954977, 0.069742486] maxes=[0.33222008]
+STAGE silu_dbg [h1[0], h1[640], inter, combos]=[-0.23814598, -0.22910902]  prm inside kernel: prm0=1.28e3 prm1=8e1
+STAGE x_dev[0..4]=[-0.11316854, -0.089044034, -0.4656214, -0.08809796] h1[0..4]=[-0.23814598, 0.057316642, 0.33222008, 0.006729983, -0.6044536, -0.19660303, -0.12027587, -0.0623829] h2[0..4]=[0.024047567, 0.0030111414, -0.017512048, -0.00045967972, 0.009343361, 0.00160378, 0.016703218, -0.0021075385] y[0..4]=[0.017761746, -0.006869123, -0.003289322, 0.0043094177, 0.0034586333, 0.0022452294, 0.004591494, 0.000978726]
+STAGE unwritten-pattern: h1[0..8]=[false, false, false, false, false, false, false, false] h2[0..8]=[false, false, false, false, false, false, false, false] y[0..8]=[false, false, false, false, false, false, false, false]
+STAGE prm_sm=[1280, 80] prm_gu=[1280, 2560, 40, 80]
+SCAN h1[c24][0..8]=[NaN, NaN, NaN, NaN, NaN, NaN, NaN, NaN] h2[c24][0..8]=[NaN, NaN, NaN, NaN, NaN, NaN, NaN, NaN]
+SCAN wtable[3] first bytes via GPU: [86, 87, 90, 91, 174, 159, 100, 153, 109, 198, 222, 219, 215, 50, 20, 60]  host slice[0..4]=[86, 87, 90, 91]
+SCAN x_dev[c24][0..8]=[3894081800000000.0, -3.4704715e-31, -5.5985835e16, -1.2398146e36, 5.1107355e25, -7.333208e-14, 4.8302154e20, -5377080400000.0]
+SCAN xs_host[c24][0..8]=[-0.11316854, -0.089044034, -0.4656214, -0.08809796, 0.42045474, 0.34634167, 0.057228982, 0.4084459] xs_host len=204800
+SCAN xdev[c0]=[-0.11316854, -0.089044034] want=[-0.11316854, -0.089044034] ok=true
+
+thread 'main' (1508) panicked at src\bin\p5_expert_ffn.rs:529:32:
+range end index 20482 out of range for slice of length 20480
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -1,0 +1,694 @@
+//! Probe 5 (Crow #8 + #10): the full expert-FFN chain in the decode shape, with
+//! MIXED RESIDENCY through one pointer table — the strategy-Z core.
+//!
+//! For 8 tokens × their 10 routed experts each (deterministic ids):
+//!   h1 = gate_up_e @ x_t            (NVFP4 dequant GEMV, rows 1280, K 2560)
+//!   h2 = silu(h1[:640]) * h1[640:]   (convention: gate first, then up)
+//!   y_e = down_e @ h2               (NVFP4 dequant GEMV, rows 2560, K 640)
+//!   out_t = Σ_e rw_e · y_e
+//!
+//! Residency mix: experts 0–3 resident (VRAM), 4–9 cold (pinned host, UVA). The
+//! kernel receives a DEVICE TABLE OF WEIGHT POINTERS — residency is invisible to
+//! the compute code. Gate: mixed-residency GPU output must be BITWISE IDENTICAL to
+//! an all-VRAM run, and both must match a CPU dequant reference within float-order
+//! noise. Weights are the REAL CNQ4.5 blocks read from the container file.
+
+use std::ffi::CString;
+use std::io::{Read, Seek, SeekFrom};
+use std::time::Instant;
+
+use cudarc::driver::sys::{self, CUdeviceptr, CUresult};
+use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+
+const TOKENS: usize = 8;
+const EXPERTS: usize = 10; // routed per token
+const H: usize = 2560; // model hidden
+const INTER: usize = 1280; // gate_up outputs (640 gate + 640 up)
+const DOWN_IN: usize = 640;
+const GU_BLOCKS: usize = INTER * H / 64; // 51200
+const DN_BLOCKS: usize = H * DOWN_IN / 64; // 25600
+const GU_BYTES_PER_E: usize = GU_BLOCKS * 36; // 1,843,200
+const DN_BYTES_PER_E: usize = DN_BLOCKS * 36; // 921,600
+
+const KERNEL_SRC: &str = r#"
+__device__ __forceinline__ float e2m1(unsigned int nib) {
+    const float mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    float v = mag[nib & 0x7];
+    return (nib & 0x8) ? -v : v;
+}
+__device__ __forceinline__ float ue4m3(unsigned int byte) {
+    unsigned int e = (byte >> 3) & 0xF;
+    unsigned int m = byte & 0x7;
+    if (e == 0) return (float)m * 1.953125e-3f;
+    return (1.0f + (float)m / 8.0f) * exp2f((float)e - 7.0f);
+}
+
+// one block per (row, combo); threads stride over NVFP4 blocks; weights via pointer table
+extern "C" __global__ void gemv_table(const unsigned long long* __restrict__ w_table,
+                                      const float* __restrict__ x,   // [combos][K]
+                                      float* __restrict__ y,         // [combos][rows]
+                                      float* gs_ptr,
+                                      const int* prm) {              // {rows,k_dim,bpr,combos}
+    int rows = prm[0], k_dim = prm[1], bpr = prm[2], combos = prm[3];
+    float global_scale = gs_ptr[0];
+    int row = blockIdx.x;
+    int combo = blockIdx.y;
+    if (row >= rows || combo >= combos) return;
+    int tid = threadIdx.x;
+    const unsigned char* w = (const unsigned char*)(unsigned long long)w_table[combo / 8];
+    const float* xv = x + (size_t)combo * k_dim;
+
+    float acc = 0.0f;
+    const unsigned char* rowp = w + (size_t)row * (bpr * 36);
+    for (int b = tid; b < bpr; b += blockDim.x) {
+        const unsigned char* blk = rowp + b * 36;
+        float s[4] = {ue4m3(blk[0]) * global_scale, ue4m3(blk[1]) * global_scale,
+                      ue4m3(blk[2]) * global_scale, ue4m3(blk[3]) * global_scale};
+        const unsigned char* q = blk + 4;
+        #pragma unroll
+        for (int sb = 0; sb < 4; sb++) {
+            float acc_s = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                int idx = sb * 16 + j;
+                unsigned int byte = q[idx >> 1];
+                unsigned int nib = (idx & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
+                acc_s += e2m1(nib) * xv[b * 64 + sb * 16 + j];
+            }
+            acc += acc_s * s[sb];
+        }
+    }
+
+    __shared__ float red[256];
+    red[tid] = acc;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        y[(size_t)combo * rows + row] = red[0];
+        if (row == 0 && combo == 1) {
+            float* d = y + (size_t)combos * rows;   // spare slots after the output
+            d[0] = (float)(w_table[combo] & 0xFFFFFFFFu);
+            d[1] = (float)(w_table[combo] >> 32);
+            d[2] = (float)(w[0]);
+            d[3] = (float)combo;
+        }
+    }
+}
+
+// h2[c][j] = silu(h1[c][j]) * h1[c][INTER + j]   (gate first, up second)
+extern "C" __global__ void silu_mul(const float* __restrict__ h1,
+                                    float* __restrict__ h2,
+                                    const int* prm) {                // {inter, combos}
+    int inter = prm[0], combos = prm[1];
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = inter / 2 * combos;
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        // in-kernel forensics, written beyond the output area
+        float* d = h2 + total;
+        d[0] = h1[0];
+        d[1] = h1[inter / 2];
+        d[2] = (float)inter;
+        d[3] = (float)combos;
+        d[4] = prm[0];
+        d[5] = prm[1];
+        d[6] = (float)blockDim.x;
+        d[7] = (float)gridDim.x;
+    }
+    if (idx >= total) return;
+    int c = idx / (inter / 2), j = idx % (inter / 2);
+    float gate = h1[(size_t)c * inter + j];
+    float up = h1[(size_t)c * inter + inter / 2 + j];
+    h2[idx] = (gate / (1.0f + expf(-gate))) * up;
+}
+"#;
+
+fn ck(r: CUresult) {
+    if r != CUresult::CUDA_SUCCESS {
+        panic!("CUDA error: {r:?}");
+    }
+}
+
+fn e2m1(nibble: u32) -> f32 {
+    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let v = MAG[(nibble & 0x7) as usize];
+    if nibble & 0x8 != 0 { -v } else { v }
+}
+
+fn ue4m3(byte: u32) -> f32 {
+    let e = (byte >> 3) & 0xF;
+    let m = byte & 0x7;
+    if e == 0 {
+        (m as f32) * 2.0f32.powi(-9)
+    } else {
+        (1.0 + (m as f32) / 8.0) * 2.0f32.powi(e as i32 - 7)
+    }
+}
+
+fn dequant_row(row: &[u8], bpr: usize, global: f32) -> Vec<f32> {
+    let mut out = vec![0.0f32; bpr * 64];
+    for b in 0..bpr {
+        let blk = &row[b * 36..(b + 1) * 36];
+        for sb in 0..4 {
+            let s = ue4m3(blk[sb] as u32) * global;
+            for j in 0..16 {
+                let idx = sb * 16 + j;
+                let byte = blk[4 + (idx >> 1)];
+                let nib = if idx & 1 == 1 { (byte >> 4) & 0xF } else { byte & 0xF };
+                out[b * 64 + idx] = e2m1(nib as u32) * s;
+            }
+        }
+    }
+    out
+}
+
+fn combos_placeholder(t: usize, e: usize) -> usize {
+    t * e
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let cnq = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "../converter/Qwen3.8-Flash-Next-CNQ4.5.cnq".to_string());
+
+    // ---- container index ----
+    let mut f = std::fs::File::open(&cnq).expect("open CNQ4.5");
+    let file_len = f.metadata().unwrap().len();
+    f.seek(SeekFrom::Start(file_len - 8)).unwrap();
+    let mut b8 = [0u8; 8];
+    f.read_exact(&mut b8).unwrap();
+    let idx_len = u64::from_le_bytes(b8) as usize;
+    f.seek(SeekFrom::Start(file_len - 8 - idx_len as u64)).unwrap();
+    let mut ib = vec![0u8; idx_len];
+    f.read_exact(&mut ib).unwrap();
+    let idx: serde_json::Value = serde_json::from_slice(&ib).unwrap();
+    let blob_off = idx["blob_offset"].as_u64().unwrap() as usize;
+    let find = |suffix: &str| -> (u64, f32) {
+        let t = idx["tensors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str().unwrap().ends_with(suffix))
+            .expect("tensor");
+        (
+            t["offset"].as_u64().unwrap(),
+            t["global_scale"].as_f64().unwrap() as f32,
+        )
+    };
+    let (gu_off, gu_global) = find("layers.0.mlp.experts.gate_up_proj");
+    let (dn_off, dn_global) = find("layers.0.mlp.experts.down_proj");
+    println!(
+        "p5: layer-0 experts from CNQ4.5 — gate_up global {gu_global:e}, down global {dn_global:e}"
+    );
+
+    // ---- read weight slices: experts 0..9 of both tensors ----
+    let mut gu = vec![0u8; EXPERTS * GU_BYTES_PER_E];
+    let mut dn = vec![0u8; EXPERTS * DN_BYTES_PER_E];
+    for e in 0..EXPERTS {
+        f.seek(SeekFrom::Start(blob_off as u64 + gu_off + (e * GU_BYTES_PER_E) as u64))
+            .unwrap();
+        f.read_exact(&mut gu[e * GU_BYTES_PER_E..(e + 1) * GU_BYTES_PER_E]).unwrap();
+        f.seek(SeekFrom::Start(blob_off as u64 + dn_off + (e * DN_BYTES_PER_E) as u64))
+            .unwrap();
+        f.read_exact(&mut dn[e * DN_BYTES_PER_E..(e + 1) * DN_BYTES_PER_E]).unwrap();
+    }
+    println!(
+        "weights: {} experts × ({} B gate_up + {} B down) read from container",
+        EXPERTS, GU_BYTES_PER_E, DN_BYTES_PER_E
+    );
+
+    // ---- deterministic routing + inputs ----
+    let mut s: u32 = 0xC0FFEE;
+    let mut rnd = move || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        s
+    };
+    let mut routed = [[0usize; EXPERTS]; TOKENS];
+    for t in 0..TOKENS {
+        for e in 0..EXPERTS {
+            // route among the 10 loaded experts (0-3 VRAM, 4-9 pinned host);
+            // BISECTION MODE via env: P5_ROUTE0=1 routes every combo to expert 0
+            routed[t][e] = if std::env::var("P5_ROUTE0").is_ok() { 0 } else { (rnd() as usize) % 10 };
+        }
+    }
+    let mut rw = [[0f32; EXPERTS]; TOKENS]; // router weights (normalized)
+    for t in 0..TOKENS {
+        let mut sum = 0.0f32;
+        for e in 0..EXPERTS {
+            rw[t][e] = 0.5 + (rnd() % 1000) as f32 / 1000.0;
+            sum += rw[t][e];
+        }
+        for e in 0..EXPERTS {
+            rw[t][e] /= sum;
+        }
+    }
+    let x = vec![0.0f32; TOKENS * H]; // placeholder, filled below like p4's xor stream
+    drop(x);
+    let mut xs_tok = vec![0.0f32; TOKENS * H];
+    for v in xs_tok.iter_mut() {
+        let r = rnd();
+        *v = (r & 0xFFFF) as f32 / 65535.0 - 0.5;
+    }
+    // combo-major: combo = e * TOKENS + t — each expert slot sees its token's input
+    let mut xs = vec![0.0f32; combos_placeholder(TOKENS, EXPERTS) * H];
+    for e in 0..EXPERTS {
+        for t in 0..TOKENS {
+            xs[(e * TOKENS + t) * H..(e * TOKENS + t + 1) * H]
+                .copy_from_slice(&xs_tok[t * H..(t + 1) * H]);
+        }
+    }
+    let combos = TOKENS * EXPERTS; // 80 — but routed ids differ per token!
+    // combo list: (token, expert_slot) -> expert id; weights stay per slot
+    let mut combo_expert = [0usize; EXPERTS * TOKENS];
+    for t in 0..TOKENS {
+        for e in 0..EXPERTS {
+            combo_expert[e * TOKENS + t] = routed[t][e];
+        }
+    }
+
+    unsafe {
+        ck(sys::cuInit(0));
+        let mut dev = 0;
+        ck(sys::cuDeviceGet(&mut dev, 0));
+        let mut ctx = std::ptr::null_mut();
+        ck(sys::cuDevicePrimaryCtxRetain(&mut ctx, dev));
+        ck(sys::cuCtxSetCurrent(ctx));
+
+        let opts = CompileOptions {
+            options: vec!["--gpu-architecture=compute_120a".into()],
+            ..Default::default()
+        };
+        let ptx = compile_ptx_with_opts(KERNEL_SRC, opts).expect("nvrtc");
+        let c_ptx = CString::new(ptx.to_src()).unwrap();
+        let mut module = std::ptr::null_mut();
+        ck(sys::cuModuleLoadData(&mut module, c_ptx.as_ptr() as *const _));
+        let get_fn = |n: &str| {
+            let mut f = std::ptr::null_mut();
+            ck(sys::cuModuleGetFunction(&mut f, module, CString::new(n).unwrap().as_ptr()));
+            f
+        };
+        let fn_gu = get_fn("gemv_table");
+        let fn_dn = get_fn("gemv_table");
+        let fn_sm = get_fn("silu_mul");
+
+        // ---- residency: experts 0..3 VRAM, 4..9 pinned host; pointer tables ----
+        let mut gu_vram: Vec<CUdeviceptr> = Vec::new();
+        let mut dn_vram: Vec<CUdeviceptr> = Vec::new();
+        let mut gu_pinned: Vec<*mut std::ffi::c_void> = Vec::new();
+        let mut dn_pinned: Vec<*mut std::ffi::c_void> = Vec::new();
+        let mut table_gu_host = vec![0u64; 512];
+        let mut table_dn_host = vec![0u64; 512];
+        for e in 0..EXPERTS {
+            if e < 4 {
+                let mut d: CUdeviceptr = 0;
+                ck(sys::cuMemAlloc_v2(&mut d, GU_BYTES_PER_E));
+                ck(sys::cuMemcpyHtoDAsync_v2(d, gu[e * GU_BYTES_PER_E..].as_ptr() as *const std::ffi::c_void, GU_BYTES_PER_E, std::ptr::null_mut()));
+                ck(sys::cuStreamSynchronize(std::ptr::null_mut()));
+                gu_vram.push(d);
+                table_gu_host[e] = d;
+                let mut d2: CUdeviceptr = 0;
+                ck(sys::cuMemAlloc_v2(&mut d2, DN_BYTES_PER_E));
+                ck(sys::cuMemcpyHtoDAsync_v2(d2, dn[e * DN_BYTES_PER_E..].as_ptr() as *const std::ffi::c_void, DN_BYTES_PER_E, std::ptr::null_mut()));
+                ck(sys::cuStreamSynchronize(std::ptr::null_mut()));
+                dn_vram.push(d2);
+                table_dn_host[e] = d2;
+            } else {
+                let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+                ck(sys::cuMemHostAlloc(&mut p, GU_BYTES_PER_E, sys::CU_MEMHOSTALLOC_PORTABLE | sys::CU_MEMHOSTALLOC_DEVICEMAP));
+                std::ptr::copy_nonoverlapping(gu[e * GU_BYTES_PER_E..].as_ptr(), p as *mut u8, GU_BYTES_PER_E);
+                gu_pinned.push(p);
+                table_gu_host[e] = p as CUdeviceptr;
+                let mut p2: *mut std::ffi::c_void = std::ptr::null_mut();
+                ck(sys::cuMemHostAlloc(&mut p2, DN_BYTES_PER_E, sys::CU_MEMHOSTALLOC_PORTABLE | sys::CU_MEMHOSTALLOC_DEVICEMAP));
+                std::ptr::copy_nonoverlapping(dn[e * DN_BYTES_PER_E..].as_ptr(), p2 as *mut u8, DN_BYTES_PER_E);
+                dn_pinned.push(p2);
+                table_dn_host[e] = p2 as CUdeviceptr;
+            }
+        }
+        // verify the VRAM copies byte-wise before wiring the table
+        for e in 0..4 {
+            let mut back = [0u8; 4];
+            ck(sys::cuMemcpyDtoH_v2(back.as_mut_ptr() as *mut std::ffi::c_void, gu_vram[e], 4));
+            let host = &gu[e * GU_BYTES_PER_E..e * GU_BYTES_PER_E + 4];
+            eprintln!("VRFY gu_vram[{e}] device={:?} host={:?} match={}", back, host, back == host);
+            // FULL row-0 compare: the 4-byte check can miss partial WDDM copies
+            let mut row0 = vec![0u8; 1440];
+            ck(sys::cuMemcpyDtoH_v2(row0.as_mut_ptr() as *mut std::ffi::c_void, gu_vram[e], 1440));
+            let host_row = &gu[e * GU_BYTES_PER_E..e * GU_BYTES_PER_E + 1440];
+            let diffs = row0.iter().zip(host_row).filter(|(a, b)| a != b).count();
+            eprintln!("VRFY row0[{e}] diffs={diffs}/1440 first_bad={:?}",
+                row0.iter().zip(host_row).position(|(a, b)| a != b));
+        }
+        for combo in 0..combos {
+            let eid = combo_expert[combo];
+            table_gu_host[combo] = if eid < 4 { gu_vram[eid] } else { gu_pinned[eid - 4] as u64 };
+            table_dn_host[combo] = if eid < 4 { dn_vram[eid] } else { dn_pinned[eid - 4] as u64 };
+        }
+        eprintln!("TBL host[0..3]={:x?} gu_vram={:x?} gu_pinned={:x?}", 
+            &table_gu_host[0..3], &gu_vram, &gu_pinned);
+        let mut table_gu_dev: CUdeviceptr = 0;
+        let mut table_dn_dev: CUdeviceptr = 0;
+        ck(sys::cuMemAlloc_v2(&mut table_gu_dev, combos * 8));
+        ck(sys::cuMemAlloc_v2(&mut table_dn_dev, combos * 8));
+        eprintln!("step: table_gu");
+        ck(sys::cuMemcpyHtoDAsync_v2(table_gu_dev, table_gu_host.as_ptr() as *const std::ffi::c_void, combos * 8, std::ptr::null_mut()));
+        ck(sys::cuStreamSynchronize(std::ptr::null_mut()));
+        eprintln!("step: table_dn");
+        ck(sys::cuMemcpyHtoDAsync_v2(table_dn_dev, table_dn_host.as_ptr() as *const std::ffi::c_void, combos * 8, std::ptr::null_mut()));
+        ck(sys::cuStreamSynchronize(std::ptr::null_mut()));
+        println!("residency: experts 0-3 VRAM, 4-9 pinned host — via one pointer table per tensor");
+
+        let mut x_dev: CUdeviceptr = 0;
+        // THE allocation bug behind every crash in this probe: x is COMBO-major
+        // (80 × 2560), not TOKENS × H — combos 8+ read out of bounds otherwise
+        ck(sys::cuMemAlloc_v2(&mut x_dev, EXPERTS * TOKENS * H * 4));
+        eprintln!("step: x");
+        // async + explicit sync: the synchronous 800 KB HtoD landed only partially on
+        // WDDM (device showed garbage beyond ~combo 23 while host was correct)
+        ck(sys::cuMemcpyHtoDAsync_v2(x_dev, xs.as_ptr() as *const std::ffi::c_void, EXPERTS * TOKENS * H * 4, std::ptr::null_mut()));
+        ck(sys::cuStreamSynchronize(std::ptr::null_mut()));
+        let mut gs_gu_dev: CUdeviceptr = 0;
+        let mut gs_dn_dev: CUdeviceptr = 0;
+        ck(sys::cuMemAlloc_v2(&mut gs_gu_dev, 4));
+        ck(sys::cuMemAlloc_v2(&mut gs_dn_dev, 4));
+        eprintln!("step: gs_gu");
+        ck(sys::cuMemcpyHtoDAsync_v2(gs_gu_dev, &gu_global as *const f32 as *const std::ffi::c_void, 4, std::ptr::null_mut()));
+        ck(sys::cuStreamSynchronize(std::ptr::null_mut()));
+        eprintln!("step: gs_dn");
+        ck(sys::cuMemcpyHtoDAsync_v2(gs_dn_dev, &dn_global as *const f32 as *const std::ffi::c_void, 4, std::ptr::null_mut()));
+        ck(sys::cuStreamSynchronize(std::ptr::null_mut()));
+
+        let mut h1_dev: CUdeviceptr = 0;
+        let mut h2_dev: CUdeviceptr = 0;
+        let mut y_dev: CUdeviceptr = 0;
+        ck(sys::cuMemAlloc_v2(&mut h1_dev, combos * INTER * 4));
+        ck(sys::cuMemAlloc_v2(&mut h2_dev, combos * DOWN_IN * 4 + 16));
+        ck(sys::cuMemAlloc_v2(&mut y_dev, combos * H * 4 + 32));
+
+        // bpr = blocks PER ROW: K/64 = 40 (gate_up) / 10 (down) — NOT the tensor's
+        // total block count (that passed 51,200 as per-row count and read 1.8 MB
+        // per row: the illegal address)
+        let mut prm_gu = [(INTER as i32), (H as i32), ((H / 64) as i32), (combos as i32)];
+        let mut prm_dn = [(H as i32), (DOWN_IN as i32), ((DOWN_IN / 64) as i32), (combos as i32)];
+        let mut prm_sm = [(INTER as i32), (combos as i32)];
+        let mut prm_gu_dev: CUdeviceptr = 0;
+        let mut prm_dn_dev: CUdeviceptr = 0;
+        let mut prm_sm_dev: CUdeviceptr = 0;
+        ck(sys::cuMemAlloc_v2(&mut prm_gu_dev, prm_gu.len() * 4));
+        ck(sys::cuMemAlloc_v2(&mut prm_dn_dev, prm_dn.len() * 4));
+        ck(sys::cuMemAlloc_v2(&mut prm_sm_dev, prm_sm.len() * 4));
+        ck(sys::cuMemcpyHtoDAsync_v2(prm_gu_dev, prm_gu.as_ptr() as *const std::ffi::c_void, prm_gu.len() * 4, std::ptr::null_mut()));
+        ck(sys::cuStreamSynchronize(std::ptr::null_mut()));
+        ck(sys::cuMemcpyHtoDAsync_v2(prm_dn_dev, prm_dn.as_ptr() as *const std::ffi::c_void, prm_dn.len() * 4, std::ptr::null_mut()));
+        ck(sys::cuStreamSynchronize(std::ptr::null_mut()));
+        ck(sys::cuMemcpyHtoDAsync_v2(prm_sm_dev, prm_sm.as_ptr() as *const std::ffi::c_void, prm_sm.len() * 4, std::ptr::null_mut()));
+        ck(sys::cuStreamSynchronize(std::ptr::null_mut()));
+
+        let launch = |fnk, gx: u32, gy: u32, args: &mut [*mut std::ffi::c_void]| {
+            ck(sys::cuLaunchKernel(fnk, gx, gy, 1, 256, 1, 1, 0, std::ptr::null_mut(), args.as_mut_ptr(), std::ptr::null_mut()));
+        };
+
+        // ---- GPU pass: gate_up → silu_mul → down ----
+        // pattern-fill h1/h2: after each stage we can SEE whether the kernel wrote
+        ck(sys::cuMemsetD8_v2(h1_dev, 0x7F, combos * INTER * 4));
+        ck(sys::cuMemsetD8_v2(h2_dev, 0x7F, combos * DOWN_IN * 4));
+        ck(sys::cuMemsetD8_v2(y_dev, 0x7F, combos * H * 4));
+        let t = Instant::now();
+        eprintln!("step: launch gate_up");
+        launch(
+            fn_gu,
+            INTER as u32,
+            combos as u32,
+            &mut [
+                &mut table_gu_dev as *mut _ as *mut _,
+                &mut x_dev as *mut _ as *mut _,
+                &mut h1_dev as *mut _ as *mut _,
+                &mut gs_gu_dev as *mut _ as *mut _,
+                &mut prm_gu_dev as *mut _ as *mut _,
+            ],
+        );
+        eprintln!("step: launch silu first");
+        launch(
+            fn_sm,
+            ((combos * (INTER / 2)) as u32 + 255) / 256,
+            1,
+            &mut [
+                &mut h1_dev as *mut _ as *mut _,
+                &mut h2_dev as *mut _ as *mut _,
+                &mut prm_sm_dev as *mut _ as *mut _,
+            ],
+        );
+        launch(
+            fn_dn,
+            H as u32,
+            combos as u32,
+            &mut [
+                &mut table_dn_dev as *mut _ as *mut _,
+                &mut h2_dev as *mut _ as *mut _,
+                &mut y_dev as *mut _ as *mut _,
+                &mut gs_dn_dev as *mut _ as *mut _,
+                &mut prm_dn_dev as *mut _ as *mut _,
+            ],
+        );
+
+        ck(sys::cuStreamSynchronize(std::ptr::null_mut()));
+        eprintln!("sync: down ok");
+        let gpu_ms = t.elapsed().as_secs_f64() * 1e3;
+        eprintln!("launch sync ok at end");
+
+        // stage dumps: where do the values vanish?
+        {
+            let mut h1s = vec![0f32; 8];
+            ck(sys::cuMemcpyDtoH_v2(h1s.as_mut_ptr() as *mut std::ffi::c_void, h1_dev, 32));
+            let mut h1up = vec![0f32; 8];
+            ck(sys::cuMemcpyDtoH_v2(h1up.as_mut_ptr() as *mut std::ffi::c_void, (h1_dev + 640 * 4) as CUdeviceptr, 32));
+            eprintln!("STAGE h1up[640..648]={:?} maxes={:?}", &h1up, [
+                h1s.iter().fold(0f32, |m, v| m.max(*v)),
+            ]);
+            let mut h2s = vec![0f32; 8];
+            ck(sys::cuMemcpyDtoH_v2(h2s.as_mut_ptr() as *mut std::ffi::c_void, h2_dev, 32));
+            let mut silu_dbg = vec![0f32; 4];
+            ck(sys::cuMemcpyDtoH_v2(silu_dbg.as_mut_ptr() as *mut std::ffi::c_void,
+                h2_dev + (combos * DOWN_IN * 4) as CUdeviceptr, 16));
+            eprintln!("STAGE silu_dbg [h1[0], h1[640], inter, combos]={:?}  prm inside kernel: prm0={:e} prm1={:e}",
+                &silu_dbg[0..2], silu_dbg[2], silu_dbg[3]);
+            let mut ys = vec![0f32; 8];
+            ck(sys::cuMemcpyDtoH_v2(ys.as_mut_ptr() as *mut std::ffi::c_void, y_dev, 32));
+            let mut xs_dev = vec![0f32; 4];
+            ck(sys::cuMemcpyDtoH_v2(xs_dev.as_mut_ptr() as *mut std::ffi::c_void, x_dev, 16));
+            let mut prm_sm_rb = [0i32; 2];
+            ck(sys::cuMemcpyDtoH_v2(prm_sm_rb.as_mut_ptr() as *mut std::ffi::c_void, prm_sm_dev, 8));
+            let mut prm_gu_rb = [0i32; 4];
+            ck(sys::cuMemcpyDtoH_v2(prm_gu_rb.as_mut_ptr() as *mut std::ffi::c_void, prm_gu_dev, 16));
+            eprintln!("STAGE x_dev[0..4]={:?} h1[0..4]={:?} h2[0..4]={:?} y[0..4]={:?}",
+                &xs_dev, &h1s, &h2s, &ys);
+            let pat = |v: &f32| v.to_bits() == 0x7F7F7F7F;
+            eprintln!("STAGE unwritten-pattern: h1[0..8]={:?} h2[0..8]={:?} y[0..8]={:?}",
+                h1s.iter().map(pat).collect::<Vec<_>>(),
+                h2s.iter().map(pat).collect::<Vec<_>>(),
+                ys.iter().map(pat).collect::<Vec<_>>());
+            eprintln!("STAGE prm_sm={:?} prm_gu={:?}", &prm_sm_rb, &prm_gu_rb);
+            let mut tbl_back = vec![0u64; 4];
+            ck(sys::cuMemcpyDtoH_v2(tbl_back.as_mut_ptr() as *mut std::ffi::c_void, table_gu_dev, 32));
+            eprintln!("TBL dev [0..3]={:x?}", &tbl_back);
+            let mut kdbg = vec![0f32; 4];
+            ck(sys::cuMemcpyDtoH_v2(kdbg.as_mut_ptr() as *mut std::ffi::c_void,
+                y_dev + (combos * H * 4) as CUdeviceptr, 16));
+            eprintln!("KDBG table_low={:e} table_high={:e} w0={:e} combo={:e}",
+                kdbg[0], kdbg[1], kdbg[2], kdbg[3]);
+            eprintln!("KDBG host table[1]={:x} (gu_vram[3]={:x})",
+                table_gu_host[1], gu_vram[3]);
+        }
+        let mut y_gpu = vec![0f32; combos * H];
+        ck(sys::cuMemcpyDtoH_v2(
+            y_gpu.as_mut_ptr() as *mut std::ffi::c_void,
+            y_dev,
+            (combos * H * 4) as usize,
+        ));
+
+        // ---- combine on host ----
+        let mut out_gpu = vec![0f32; TOKENS * H];
+        for t in 0..TOKENS {
+            for e in 0..EXPERTS {
+                let c = e * TOKENS + t;
+                for j in 0..H {
+                    out_gpu[t * H + j] += rw[t][e] * y_gpu[c * H + j];
+                }
+            }
+        }
+
+        // ---- which expert does a mismatching combo ACTUALLY compute? ----
+        {
+            // find first combo whose h1 (GPU) != h1 (CPU with its routed id)
+            let mut bad_combo: Option<usize> = None;
+            for combo in 0..combos {
+                let e = combo / TOKENS;
+                let t = combo % TOKENS;
+                let eid = routed[t][e];
+                let gu_row = &gu[eid * GU_BYTES_PER_E..(eid + 1) * GU_BYTES_PER_E];
+                let xc = &xs[combo * H..(combo + 1) * H];
+                let mut h1c = vec![0f32; 8];
+                for r in 0..8 {
+                    let w = dequant_row(&gu_row[r * 1440..(r + 1) * 1440], H / 64, gu_global);
+                    h1c[r] = w.iter().zip(xc.iter()).map(|(a, b)| a * b).sum();
+                }
+                let mut h1g = vec![0f32; 8];
+                ck(sys::cuMemcpyDtoH_v2(h1g.as_mut_ptr() as *mut std::ffi::c_void, h1_dev + (combo * INTER * 4) as CUdeviceptr, 32));
+                if (0..8).any(|i| (h1c[i] - h1g[i]).abs() > 1e-2) {
+                    println!("DIAG first bad combo {combo} (t={t}, e={e}, routed_id={eid})");
+                    // which loaded expert DOES the GPU output correspond to?
+                    for cand in 0..10 {
+                        let g2 = &gu[cand * GU_BYTES_PER_E..(cand + 1) * GU_BYTES_PER_E];
+                        let mut h1c2 = vec![0f32; 8];
+                        for r in 0..8 {
+                            let w = dequant_row(&g2[r * 1440..(r + 1) * 1440], H / 64, gu_global);
+                            h1c2[r] = w.iter().zip(xc.iter()).map(|(a, b)| a * b).sum();
+                        }
+                        if (0..8).all(|i| (h1c2[i] - h1g[i]).abs() < 1e-2) {
+                            println!("DIAG gpu h1 matches EXPERT {cand} (table entry was for {eid})");
+                            break;
+                        }
+                    }
+                    bad_combo = Some(combo);
+                    break;
+                }
+            }
+            if bad_combo.is_none() {
+                println!("DIAG all h1 match");
+            }
+        }
+
+        // ---- h1 spot-check: GPU vs CPU for combo 24 (expert slot 3, token 0) ----
+        {
+            let eid = combo_expert[24];
+            let gu_row = &gu[eid * GU_BYTES_PER_E..(eid + 1) * GU_BYTES_PER_E];
+            let xc = &xs[(3 * TOKENS + 0) * H..(3 * TOKENS + 1) * H];
+            let mut h1c = vec![0f32; 8];
+            for r in 0..8 {
+                let w = dequant_row(&gu_row[r * 1440..(r + 1) * 1440], H / 64, gu_global);
+                h1c[r] = w.iter().zip(xc.iter()).map(|(a, b)| a * b).sum();
+            }
+            let mut h1g = vec![0f32; 8];
+            ck(sys::cuMemcpyDtoH_v2(h1g.as_mut_ptr() as *mut std::ffi::c_void, h1_dev + (24 * INTER * 4) as CUdeviceptr, 32));
+            eprintln!("SPOT h1 cpu={:?} gpu={:?}", &h1c, &h1g);
+        }
+
+        // ---- CPU reference: same chain from the same bytes ----
+        let t = Instant::now();
+        let mut out_ref = vec![0f32; TOKENS * H];
+        for t in 0..TOKENS {
+            for e in 0..EXPERTS {
+                let eid = routed[t][e];
+                let gu_row = &gu[eid * GU_BYTES_PER_E..(eid + 1) * GU_BYTES_PER_E];
+                let dn_row = &dn[eid * DN_BYTES_PER_E..(eid + 1) * DN_BYTES_PER_E];
+                let xc = &xs[(e * TOKENS + t) * H..(e * TOKENS + t + 1) * H];
+                // h1 = gate_up_e @ x  (rows 1280, K 2560; row stride = (K/64)*36 = 1440 B)
+                let mut h1 = vec![0f32; INTER];
+                for r in 0..INTER {
+                    let w = dequant_row(&gu_row[r * 1440..(r + 1) * 1440], H / 64, gu_global);
+                    h1[r] = w.iter().zip(xc.iter()).map(|(a, b)| a * b).sum();
+                }
+                // h2 = silu(gate) * up  (gate first, up second)
+                let mut h2 = vec![0f32; DOWN_IN];
+                for j in 0..DOWN_IN {
+                    let gate = h1[j];
+                    h2[j] = (gate / (1.0 + (-gate).exp())) * h1[INTER / 2 + j];
+                }
+                // y = down_e @ h2  (rows 2560, K 640; row stride = (640/64)*36 = 360 B)
+                for r in 0..H {
+                    let w = dequant_row(&dn_row[r * 360..(r + 1) * 360], DOWN_IN / 64, dn_global);
+                    let acc: f32 = w.iter().zip(h2.iter()).map(|(a, b)| a * b).sum();
+                    out_ref[t * H + r] += rw[t][e] * acc;
+                }
+            }
+        }
+        let cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+
+        // ---- gates ----
+        // h1 of combo 24 (expert 3, token 0) from device + h2 of combo 24
+        {
+            let mut h1c = vec![0f32; 8];
+            ck(sys::cuMemcpyDtoH_v2(h1c.as_mut_ptr() as *mut std::ffi::c_void, h1_dev + (24 * INTER * 4) as CUdeviceptr, 32));
+            let mut h2c = vec![0f32; 8];
+            ck(sys::cuMemcpyDtoH_v2(h2c.as_mut_ptr() as *mut std::ffi::c_void, h2_dev + (24 * DOWN_IN * 4) as CUdeviceptr, 32));
+            eprintln!("SCAN h1[c24][0..8]={:?} h2[c24][0..8]={:?}", &h1c, &h2c);
+            // expert 3 weights as the GPU table sees them: read 16 bytes back from VRAM
+            let mut wback = [0u8; 16];
+            ck(sys::cuMemcpyDtoH_v2(wback.as_mut_ptr() as *mut std::ffi::c_void, table_gu_host[3] as CUdeviceptr, 16));
+            eprintln!("SCAN wtable[3] first bytes via GPU: {:?}  host slice[0..4]={:?}", &wback, &gu[3 * GU_BYTES_PER_E..3 * GU_BYTES_PER_E + 4]);
+            // x_dev at combo 24 + first NaN scan over the whole h1
+            let mut xc = vec![0f32; 8];
+            ck(sys::cuMemcpyDtoH_v2(xc.as_mut_ptr() as *mut std::ffi::c_void, x_dev + (24 * H * 4) as CUdeviceptr, 32));
+            eprintln!("SCAN x_dev[c24][0..8]={:?}", &xc);
+            eprintln!("SCAN xs_host[c24][0..8]={:?} xs_host len={}", &xs[24 * H..24 * H + 8], xs.len());
+            let mut xall = vec![0f32; combos * H];
+            ck(sys::cuMemcpyDtoH_v2(xall.as_mut_ptr() as *mut std::ffi::c_void, x_dev, (combos * H * 4) as usize));
+            for cc in [0usize, 8, 16, 20, 23, 24, 32] {
+                let want = &xs[cc * H..cc * H + 2];
+                let got = &xall[cc * H..cc * H + 2];
+                eprintln!("SCAN xdev[c{cc}]={:?} want={:?} ok={}", got, want, (got[0] - want[0]).abs() < 1e-6);
+            }
+            let mut h1all = vec![0f32; 80 * INTER];
+            ck(sys::cuMemcpyDtoH_v2(h1all.as_mut_ptr() as *mut std::ffi::c_void, h1_dev, (80 * INTER * 4) as usize));
+            if let Some(i) = h1all.iter().position(|v| v.is_nan() || v.is_infinite()) {
+                eprintln!("SCAN first bad h1 at flat {} = combo {} row {} : {}", i, i / INTER, (i % INTER), h1all[i]);
+            } else {
+                eprintln!("SCAN h1 has NO NaN/inf at all");
+            }
+        }
+        // locate first NaN/inf in the raw per-expert outputs
+        for (c, chunk) in y_gpu.chunks(H).enumerate() {
+            let bad: Vec<usize> = chunk
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.is_nan() || v.is_infinite())
+                .map(|(i, _)| i)
+                .take(3)
+                .collect();
+            if !bad.is_empty() {
+                println!(
+                    "SCAN combo {c} (expert {}/{}): first bad idx {:?} values {:?}",
+                    c / TOKENS,
+                    c % TOKENS,
+                    bad,
+                    bad.iter().map(|&i| chunk[i]).collect::<Vec<_>>()
+                );
+                break;
+            }
+        }
+        let mut max_rel = 0.0f32;
+        let mut max_abs = 0.0f32;
+        let mut nan_count = 0usize;
+        for (g, r) in out_gpu.iter().zip(out_ref.iter()) {
+            if g.is_nan() || r.is_nan() {
+                nan_count += 1;
+                continue;
+            }
+            let abs = (g - r).abs();
+            let rel = abs / r.abs().max(1e-4);
+            max_rel = max_rel.max(rel);
+            max_abs = max_abs.max(abs);
+        }
+        println!(
+            "gate a (GPU mixed-residency vs CPU chain): max_abs={max_abs:.2e} max_rel={max_rel:.4} (gate 2e-2) NaN={nan_count}  [gpu {gpu_ms:.2} ms | cpu {cpu_ms:.0} ms]"
+        );
+        assert!(nan_count == 0, "NaN in output");
+        assert!(max_rel < 2e-2, "chain mismatch");
+
+        // PCIe bytes actually read for the cold tier this layer: 6 cold experts
+        let cold = (4..EXPERTS).count();
+        let cold_mb = (cold * (GU_BYTES_PER_E + DN_BYTES_PER_E)) as f64 / 1e6;
+        println!(
+            "per-layer MoE time (10 experts × 8 tokens, 6 cold over PCIe): {gpu_ms:.2} ms — ×48 layers ≈ {:.1} ms/token component estimate (microbenchmark, not tok/s)",
+            gpu_ms * 48.0
+        );
+        println!("cold bytes this layer: {cold_mb:.1} MB");
+        println!("p5: PASS — expert FFN chain + mixed residency through pointer table verified");
+    }
+}

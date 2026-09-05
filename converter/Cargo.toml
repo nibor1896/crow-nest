@@ -1,0 +1,11 @@
+[package]
+name = "converter"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+debug = false

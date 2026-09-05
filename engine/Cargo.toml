@@ -1,0 +1,72 @@
+[package]
+name = "crow-nest-engine"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The engine. Kernel math lifted from probes p5–p16 (reference-verified there);
+# residency (#8), three-state manager (#9) and the end-to-end decode (#11) live here.
+
+[dependencies]
+serde_json = "1"
+cudarc = { version = "=0.19.9", features = ["cuda-13030", "dynamic-loading", "nvrtc"] }
+libloading = "0.8"
+
+[[bin]]
+name = "states"
+path = "src/bin/states.rs"
+
+[[bin]]
+name = "residency"
+path = "src/bin/residency.rs"
+
+[[bin]]
+name = "decode"
+path = "src/bin/decode.rs"
+
+[[bin]]
+name = "parity"
+path = "src/bin/parity.rs"
+
+[[bin]]
+name = "plecheck"
+path = "src/bin/plecheck.rs"
+
+[[bin]]
+name = "kcheck"
+path = "src/bin/kcheck.rs"
+
+[[bin]]
+name = "mma_probe"
+path = "src/bin/mma_probe.rs"
+
+[[bin]]
+name = "mma_gate"
+path = "src/bin/mma_gate.rs"
+
+[[bin]]
+name = "mma_probe2"
+path = "src/bin/mma_probe2.rs"
+[[bin]]
+name = "sf_scan"
+path = "src/bin/sf_scan.rs"
+
+[[bin]]
+name = "graph_probe"
+path = "src/bin/graph_probe.rs"
+
+[[bin]]
+name = "pcie_probe"
+path = "src/bin/pcie_probe.rs"
+
+[[bin]]
+name = "pin_probe"
+path = "src/bin/pin_probe.rs"
+
+[[bin]]
+name = "coldtier"
+path = "src/bin/coldtier.rs"
+
+[[bin]]
+name = "hybrid"
+path = "src/bin/hybrid.rs"

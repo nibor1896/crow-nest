@@ -1,0 +1,45 @@
+{
+  "answers": {
+    "t2-write": {
+      "answer_ids": [
+        71093,
+        10504,
+        198,
+        2621,
+        198,
+        198,
+        198,
+        198,
+        198,
+        248044
+      ],
+      "max_tokens": 1280
+    }
+  },
+  "crow_answers_text": {
+    "t2-write": "```cpp\nheader\n\n\n\n\n"
+  },
+  "measurements": [
+    {
+      "arm": "crow",
+      "decode_tok_s": 39.64163957821296,
+      "note": "prompt_tokens 235; stopped_eos at 10",
+      "position_in_series": 0,
+      "prefill_tok_s": 96.36452329003409,
+      "prompt": "t2-write",
+      "wall_s": 90.4371175
+    }
+  ],
+  "meta": {
+    "arm": "crow",
+    "crow_container": "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq",
+    "execution": "arm-phased (exclusive resources; paired rotated order per arm, identical to the other arm's)",
+    "first_mover_rule": "crow",
+    "operating_point": "200k floor, -np 1, greedy, temperature 0",
+    "order": [
+      "t2-write"
+    ],
+    "run_index": 0,
+    "warmup": "one cold prefill per phase start, discarded (spec 0.3)"
+  }
+}

@@ -1,0 +1,24 @@
+# weights and containers (hundreds of GB)
+models/
+converter/*.cnq
+converter/*.safetensors
+converter/*.hotsets.json
+# build trees
+engine/target/
+engine/target_new*/
+probes/target/
+handoff-bench/target/
+# python
+.venv-oracle/
+__pycache__/
+# measurement artefacts and dumps
+decode_out/*.f32
+decode_out/**/*.f32
+decode_out/oracle-t2w/**/gpu-logits.f32
+decode_out/oracle-t2w/**/ref-logits.f32
+oracle/golden/
+oracle/routing-selections.npz
+*.log
+*.err
+*.out
+engine/.engine.lock

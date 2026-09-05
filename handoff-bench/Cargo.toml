@@ -1,0 +1,18 @@
+[package]
+name = "handoff-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+busy_poll = []
+sched_spin = []
+stager_ctx = []
+no_pub_kernel = []
+no_wait_memop = []
+no_consumer = []
+stage_memcpy = []
+stage_h2d = []
+
+[dependencies]
+cudarc = { version = "=0.19.9", features = ["cuda-13030", "dynamic-loading", "nvrtc"] }
