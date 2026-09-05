@@ -10,6 +10,7 @@ engine/target_auto/
 engine/target_sb/
 engine/target_rel/
 engine/target_probe/
+engine/target_pol/
 probes/target/
 handoff-bench/target/
 # python

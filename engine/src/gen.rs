@@ -664,7 +664,7 @@ impl Engine {
 
         // ---- residency (#8) ----
         log("building residency (hot VRAM slabs + pinned cold tier) …");
-        let res = Residency::build(cnq, sec, st_res_n(&st_rep, cfg.n_hot), warmup_counts, sidecar_path, persist, cold_fixed, crate::manager::adapt_spare(), &mut |m| {
+        let res = Residency::build(cnq, sec, st_res_n(&st_rep, cfg.n_hot), warmup_counts, sidecar_path, persist, cold_fixed, cfg.adapt.spare, &mut |m| {
             log(&format!("  [residency] {m}"));
         });
         // ---- copy-engine prefetch ring (A-P3b) ----

@@ -118,7 +118,7 @@ impl ThreeStates {
         let mut went_down = false;
         let mut went_up = false;
         let mut iters = 0u32;
-        let spare = adapt_spare();
+        let spare = cfg.adapt.spare; // #17: from the policy in geo.rs, not the env
         loop {
             let sum = states_bytes(n) + pending_bytes + n as u64 * expert_bytes_per_n_unit;
             let cold = (if cold_fixed { E } else { E - n.min(E) + spare }) as u64 * cold_bytes_per_n_unit;
@@ -331,18 +331,4 @@ impl Drop for ThreeStates {
 
 fn cfg_n_dbg() -> bool {
     std::env::var("ENGINE_DEBUG_SYNC").is_ok()
-}
-
-/// spare hot slots per layer for the stream-side trickle adaptation (A-P3c):
-/// CROW_ADAPT_STREAM=1 reserves one, CROW_ADAPT_SPARE=<n> overrides. The
-/// spares come out of the planned N (VRAM unchanged), so the pinned cold
-/// tier grows by the same number of experts per layer - planned here.
-pub fn adapt_spare() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        if let Some(n) = std::env::var("CROW_ADAPT_SPARE").ok().and_then(|v| v.parse::<usize>().ok()) {
-            return n;
-        }
-        if std::env::var("CROW_ADAPT_STREAM").as_deref() == Ok("1") { 1 } else { 0 }
-    })
 }

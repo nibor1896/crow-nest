@@ -199,12 +199,12 @@ fn main() {
                 // CROW_ADAPT_EVERY=K: re-cut the hot set from the cumulative routing
                 // every K decode tokens (<= CROW_ADAPT_MAX swaps per layer, default 8);
                 // the swap time is charged to that token's latency (amortized cost)
-                let adapt_every: usize = std::env::var("CROW_ADAPT_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-                let adapt_max: usize = std::env::var("CROW_ADAPT_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+                // (#17: the knobs come from geo::apply_adapt_policy - env in manual
+                // mode, the long-context switch otherwise; see the [policy] line)
+                let crow_nest_engine::geo::Adapt { stream: adapt_stream, every: adapt_every, max: adapt_max, .. } = eng.cfg.adapt;
                 // CROW_ADAPT_STREAM=1: the same trickle, but the copies run on a
                 // side stream overlapping the next token (A-P3c); the tick's
                 // host bookkeeping is the only part still inside the token time
-                let adapt_stream = std::env::var("CROW_ADAPT_STREAM").as_deref() == Ok("1");
                 let mut trickle_swaps = 0usize;
                 let mut tick_us = 0u128;
                 for i in 1..gen {

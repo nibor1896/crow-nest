@@ -173,9 +173,9 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
         let prefill_s = t0.elapsed().as_secs_f64();
         // same decode-time adaptation knobs as `decode run` (#17/#21):
         // CROW_ADAPT_EVERY=K re-cuts the hot set every K tokens, <= CROW_ADAPT_MAX swaps/layer
-        let adapt_every: usize = std::env::var("CROW_ADAPT_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-        let adapt_max: usize = std::env::var("CROW_ADAPT_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
-        let adapt_stream = std::env::var("CROW_ADAPT_STREAM").as_deref() == Ok("1");
+        // (#17: from geo::apply_adapt_policy - env in manual mode, else the
+        // long-context switch: stream trickle 7 / 16 / 7 at chunk 2048 only)
+        let crow_nest_engine::geo::Adapt { stream: adapt_stream, every: adapt_every, max: adapt_max, .. } = eng.cfg.adapt;
         let mut trickle_swaps = 0usize;
         let c0 = eng.drain_counters();
         let (ple_r0, ple_m0) = (eng.ple.req, eng.ple.miss);

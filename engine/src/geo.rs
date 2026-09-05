@@ -76,6 +76,27 @@ pub struct Config {
     pub host_pinned_budget: u64,
     /// PLE layer on/off (bisector switch for the parity ladder)
     pub ple: bool,
+    /// decode-time hot-set adaptation (#17), set by `apply_adapt_policy`
+    pub adapt: Adapt,
+}
+
+/// Decode-time hot-set adaptation knobs (#17). `stream`: swaps run on a side
+/// stream overlapping the next token, with `spare` hot slots per layer taken
+/// out of the planned N; otherwise the swaps run on the compute stream inside
+/// the token. `every`: re-cut the hot set every K decode tokens (0 = never),
+/// at most `max` swaps per layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Adapt {
+    pub stream: bool,
+    pub spare: usize,
+    pub every: usize,
+    pub max: usize,
+}
+
+impl Default for Adapt {
+    fn default() -> Self {
+        Adapt { stream: false, spare: 0, every: 0, max: 8 }
+    }
 }
 
 impl Default for Config {
@@ -88,6 +109,7 @@ impl Default for Config {
             prompt_chunk: 512,
             host_pinned_budget: 46 << 30, // measured host ceiling ~48.5 GB, 2.5 GB margin
             ple: true,
+            adapt: Adapt::default(),
         }
     }
 }
@@ -127,4 +149,37 @@ pub fn apply_chunk_policy(cfg: &mut Config, n_prompt: usize) {
         let need = ((n_prompt + 511) / 512 * 512).max(512);
         cfg.prompt_chunk = need.min(cfg.prompt_chunk.max(2048));
     }
+    apply_adapt_policy(cfg);
+}
+
+/// Adaptation policy (#17, 2026-09-05). Measured on the ten-task series
+/// (final4 vs trk16): the side-stream trickle with 7 spares / every 16 / max 7
+/// gains 0.1 to 0.8 tok/s on every prompt that lands on chunk 2048 (N 147, the
+/// spares come out of a hot set that no longer covers the routing) and loses
+/// 0.2 to 1.0 tok/s on every prompt at chunk 512 (N 157 already covers it, the
+/// seven surrendered slots are pure cost). So the trickle is a long-context
+/// switch: with `CROW_ADAPT_STREAM` unset, chunk >= 2048 gets stream / 7 / 16 / 7
+/// regardless of `CROW_ADAPT_EVERY` / `CROW_ADAPT_MAX` (which keep describing
+/// the short-prompt form), a smaller chunk gets the compute-stream swaps from
+/// `CROW_ADAPT_EVERY` (default 0 = none) / `CROW_ADAPT_MAX` (default 8) with
+/// `CROW_ADAPT_SPARE` (default 0). `CROW_ADAPT_STREAM=1` / `=0` is the manual
+/// mode: every knob from its own variable, spare default 1 / 0, no policy.
+pub fn apply_adapt_policy(cfg: &mut Config) {
+    let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+    let (every, max, spare) = (num("CROW_ADAPT_EVERY"), num("CROW_ADAPT_MAX"), num("CROW_ADAPT_SPARE"));
+    let stream = std::env::var("CROW_ADAPT_STREAM").ok();
+    cfg.adapt = match stream.as_deref() {
+        Some("1") => Adapt { stream: true, spare: spare.unwrap_or(1), every: every.unwrap_or(0), max: max.unwrap_or(8) },
+        Some(_) => Adapt { stream: false, spare: spare.unwrap_or(0), every: every.unwrap_or(0), max: max.unwrap_or(8) },
+        None if cfg.prompt_chunk >= 2048 => Adapt { stream: true, spare: 7, every: 16, max: 7 },
+        None => Adapt { stream: false, spare: spare.unwrap_or(0), every: every.unwrap_or(0), max: max.unwrap_or(8) },
+    };
+    let a = cfg.adapt;
+    eprintln!(
+        "[policy] chunk {} -> {} ({}), {} spare hot slot(s), every {}, max {}/layer",
+        cfg.prompt_chunk,
+        if a.stream { "stream trickle" } else { "compute-stream swaps" },
+        if stream.is_some() { "manual CROW_ADAPT_STREAM" } else { "policy" },
+        a.spare, a.every, a.max
+    );
 }
