@@ -1131,8 +1131,10 @@ fn attn_split_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::O
 /// #10 step 3 (2026-09-06): CROW_ATTN_R=1 selects attn_sel_r (q in registers, weights normalised once, V loop
 /// unrolled x4; meant bit-identical, gate = parity); 8 / 9 are DIAGNOSTICS with wrong output (no K dot / no V loop).
 /// Unset = attn_sel, byte-identical to before.
-fn attn_r_mode() -> i32 { static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new(); *V.get_or_init(|| std::env::var("CROW_ATTN_R").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }
-fn attn_sel_name() -> &'static str { match attn_r_mode() { 1 => "attn_sel_r", 2 => "attn_sel_s", 3 => "attn_sel_s8", 4 => "attn_sel_s8l", 5 => "attn_sel_g", 8 => "attn_sel_d8", 9 => "attn_sel_d9", _ => "attn_sel" } }
+/// Default since 2026-09-06 late (#10, robin's call, gated by parity 8/512/1024 against the previous build and ten tasks):
+/// unset = attn_sel_s8l (shared-memory staging + e4m3 LUT, 5.5 ms per call); CROW_ATTN_R=0 = the previous attn_sel.
+fn attn_r_mode() -> i32 { static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new(); *V.get_or_init(|| std::env::var("CROW_ATTN_R").ok().and_then(|v| v.parse().ok()).unwrap_or(-1)) }
+fn attn_sel_name() -> &'static str { match attn_r_mode() { 0 => "attn_sel", 1 => "attn_sel_r", 2 => "attn_sel_s", 3 => "attn_sel_s8", 4 => "attn_sel_s8l", 5 => "attn_sel_g", 8 => "attn_sel_d8", 9 => "attn_sel_d9", _ => "attn_sel_s8l" } }
 /// (grid.x, block) of the selected attention kernel: one block per q head (NQ, AHD) or per KV head (NKV, 384).
 fn attn_sel_gx_bx() -> (u32, u32) { if attn_r_mode() == 5 { (NKV as u32, 384) } else { (NQ as u32, AHD as u32) } }
 /// #16 (2026-09-05): prompt attention in sub-batches of ATTN_SB tokens. The QSA

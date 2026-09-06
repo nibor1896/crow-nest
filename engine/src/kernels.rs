@@ -1249,6 +1249,7 @@ extern "C" __global__ void attn_sel(const float* __restrict__ q, const unsigned 
         __syncthreads();
     }
     mx = red[0];
+    __syncthreads(); // thread 0 writes red[0] = sum below: without this barrier a late reader takes that sum as mx
     float sum = 0.0f;
     for (int j = d; j < n; j += 256) { float e = expf(p[j] - mx); p[j] = e; sum += e; }
     red[d] = sum;
@@ -1328,6 +1329,7 @@ __device__ __forceinline__ void attn_sel_r_body(const float* __restrict__ q, con
         __syncthreads();
     }
     mx = red[0];
+    __syncthreads(); // thread 0 writes red[0] = sum below: without this barrier a late reader takes that sum as mx
     float sum = 0.0f;
     for (int j = d; j < n; j += 256) { float e = expf(p[j] - mx); p[j] = e; sum += e; }
     red[d] = sum;
@@ -2642,6 +2644,7 @@ extern "C" __global__ void attn_sel_split(const float* __restrict__ q, const uns
         __syncthreads();
     }
     mx = red[0];
+    __syncthreads(); // thread 0 writes red[0] = sum below: without this barrier a late reader takes that sum as mx
     float sum = 0.0f;
     for (int j = d; j < cnt; j += 256) { float e = expf(p[j] - mx); p[j] = e; sum += e; }
     red[d] = sum;
