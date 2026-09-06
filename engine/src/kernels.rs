@@ -1268,6 +1268,129 @@ extern "C" __global__ void attn_sel(const float* __restrict__ q, const unsigned 
     }
     out[((size_t)t * 24 + head) * 256 + d] = o;
 }
+// attn_sel_r (#10 step 3, 2026-09-06): attn_sel with q held in registers (8 floats per lane, same e order),
+// the softmax weights normalised once in shared memory (the same IEEE division per element as p[j] / sum inline)
+// and the V loop unrolled x4 with the loads hoisted; the accumulation order is unchanged. Each per-element op is
+// the same single-product chain as attn_sel, so nvcc contracts identically -> meant bit-identical (gate: parity).
+// R = 8 / 9 are DIAGNOSTICS (no K dot / no V loop, wrong output) that measure the two phases' floors.
+template <int R>
+__device__ __forceinline__ void attn_sel_r_body(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                                const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                                const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                                const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                                float* __restrict__ out) {
+    int head = blockIdx.x;
+    int t = blockIdx.y;
+    int d = threadIdx.x;
+    int kvh = head / 12;
+    int n = sel_n[t];
+    if (n < 0) n = 0;
+    const int sel_max = *sel_max_p;
+    if (n > sel_max) n = sel_max;
+    const int tmax = *tmax_p;
+    const int* list = sel + (size_t)t * sel_max;
+    const float* qt = q + ((size_t)t * 24 + head) * 256;
+    __shared__ float p[2051];
+    __shared__ float red[256];
+    const int mode = *mode_p;
+    const int esz = mode ? 2 : 1;
+    const size_t kvbase = (size_t)kvh * tmax;
+    int warp = d >> 5, lane = d & 31;
+    const float scale = 0.0625f; // 1/sqrt(256)
+    float qr[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) qr[k] = qt[lane + 32 * k];
+    if (R == 8) {
+        for (int j = d; j < n; j += 256) p[j] = (float)(j & 15) * 0.01f; // DIAGNOSTIC: no K dot
+    } else {
+        for (int j0 = 0; j0 < n; j0 += 8) {
+            int j = j0 + warp;
+            if (j < n) {
+                int tok = list[j];
+                if (tok < 0) tok = 0;
+                if (tok >= tmax) tok = tmax - 1;
+                const unsigned char* kp = kc + (kvbase + tok) * 256 * esz;
+                float acc = 0.0f;
+#pragma unroll
+                for (int k = 0; k < 8; k++) acc += qr[k] * kv_load(kp, lane + 32 * k, mode);
+                for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+                if (lane == 0) p[j] = acc * scale;
+            }
+        }
+    }
+    __syncthreads();
+    float mx = -3.0e38f;
+    for (int j = d; j < n; j += 256) mx = fmaxf(mx, p[j]);
+    red[d] = mx;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (d < st) red[d] = fmaxf(red[d], red[d + st]);
+        __syncthreads();
+    }
+    mx = red[0];
+    float sum = 0.0f;
+    for (int j = d; j < n; j += 256) { float e = expf(p[j] - mx); p[j] = e; sum += e; }
+    red[d] = sum;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (d < st) red[d] += red[d + st];
+        __syncthreads();
+    }
+    sum = red[0];
+    __syncthreads();
+    for (int j = d; j < n; j += 256) p[j] = p[j] / sum; // the same division attn_sel does inline
+    __syncthreads();
+    float o = 0.0f;
+    if (R == 9) {
+        o = sum; // DIAGNOSTIC: no V loop
+    } else {
+        const unsigned char* vb = vc + kvbase * 256 * esz;
+        int j = 0;
+        for (; j + 4 <= n; j += 4) {
+            int t0 = list[j], t1 = list[j + 1], t2 = list[j + 2], t3 = list[j + 3];
+            t0 = t0 < 0 ? 0 : (t0 >= tmax ? tmax - 1 : t0);
+            t1 = t1 < 0 ? 0 : (t1 >= tmax ? tmax - 1 : t1);
+            t2 = t2 < 0 ? 0 : (t2 >= tmax ? tmax - 1 : t2);
+            t3 = t3 < 0 ? 0 : (t3 >= tmax ? tmax - 1 : t3);
+            float v0 = kv_load(vb + (size_t)t0 * 256 * esz, d, mode);
+            float v1 = kv_load(vb + (size_t)t1 * 256 * esz, d, mode);
+            float v2 = kv_load(vb + (size_t)t2 * 256 * esz, d, mode);
+            float v3 = kv_load(vb + (size_t)t3 * 256 * esz, d, mode);
+            o += p[j] * v0;
+            o += p[j + 1] * v1;
+            o += p[j + 2] * v2;
+            o += p[j + 3] * v3;
+        }
+        for (; j < n; j++) {
+            int tok = list[j];
+            if (tok < 0) tok = 0;
+            if (tok >= tmax) tok = tmax - 1;
+            o += p[j] * kv_load(vb + (size_t)tok * 256 * esz, d, mode);
+        }
+    }
+    out[((size_t)t * 24 + head) * 256 + d] = o;
+}
+extern "C" __global__ void attn_sel_r(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                      const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                      const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                      const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                      float* __restrict__ out) {
+    attn_sel_r_body<1>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+}
+extern "C" __global__ void attn_sel_d8(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                       const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                       const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                       const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                       float* __restrict__ out) {
+    attn_sel_r_body<8>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+}
+extern "C" __global__ void attn_sel_d9(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                       const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                       const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                       const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                       float* __restrict__ out) {
+    attn_sel_r_body<9>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+}
 extern "C" __global__ void gate_mul(const float* __restrict__ core, const float* __restrict__ gate,
                                     float* __restrict__ out) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2712,7 +2835,7 @@ impl Kernels {
             "qsa_select", "qsa_select_fast", "router_top10", "gather_ple_fp4", "gate_dot", "gate_apply", "ple_conv",
             "ple_state_update", "ple_conv_step", "argmax_k", "sample_topk_part", "sample_k", "add_flat",
             "gemv_bf16_b", "gemv_bf16_w", "gemv_fp4_b1k", "gemm_fp4_dense", "gemm_bf16_dense", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
-            "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d",
+            "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "attn_sel_r", "attn_sel_d8", "attn_sel_d9",
         ];
         let mut map = HashMap::new();
         for n in names {
