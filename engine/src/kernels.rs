@@ -1391,6 +1391,286 @@ extern "C" __global__ void attn_sel_d9(const float* __restrict__ q, const unsign
                                        float* __restrict__ out) {
     attn_sel_r_body<9>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
 }
+// kv_ld: kv_load with an optional shared-memory e4m3 LUT (lut[b] = dec_e4m3(b): the same float, one load instead of
+// the branchy decode). LUT = 0 is kv_load itself.
+template <int LUT>
+__device__ __forceinline__ float kv_ld(const unsigned char* p, int i, int mode, const float* lut) {
+    if (LUT) { if (mode == 0) return lut[p[i]]; }
+    return kv_load(p, i, mode);
+}
+// attn_sel_s (#10 step 4, 2026-09-06): attn_sel_r with the K and V rows staged through shared memory. Per chunk of
+// CHB bytes (CHB / (256*esz) keys) all 256 threads fetch the rows with 16-byte loads into registers - the next chunk's
+// loads are in flight while the current chunk is computed - store them to shared memory, and the UNCHANGED per-key op
+// chain (acc += q*k over the same e order, the same warp reduction, the same IEEE division, o += w*v in list order)
+// runs from shared memory. Only the loads move; every fma chain and reduction order is that of attn_sel_r -> meant
+// bit-identical (gate: parity 8 + 512). Rows are 256*esz bytes at 256-byte-aligned offsets of one cuMemAlloc buffer,
+// so the uint4 loads are aligned. CHB 16384 = 64 keys (e4m3) / 32 (bf16) per chunk; 8192 = 32 / 16.
+template <int NV>
+__device__ __forceinline__ void attn_fetch(uint4* pre, const unsigned char* __restrict__ base, size_t kvbase, int rb,
+                                           int sh, const int* __restrict__ list, int j0, int n, int tmax, int d) {
+#pragma unroll
+    for (int i = 0; i < NV; i++) {
+        int idx = d + 256 * i;
+        int row = idx >> sh;
+        int col = idx & ((1 << sh) - 1);
+        int j = j0 + row;
+        if (j < n) {
+            int tok = list[j];
+            if (tok < 0) tok = 0;
+            if (tok >= tmax) tok = tmax - 1;
+            pre[i] = *(const uint4*)(base + (kvbase + (size_t)tok) * rb + (size_t)col * 16);
+        } else {
+            pre[i] = make_uint4(0u, 0u, 0u, 0u);
+        }
+    }
+}
+template <int NV>
+__device__ __forceinline__ void attn_store(const uint4* pre, unsigned char* kb, int d) {
+#pragma unroll
+    for (int i = 0; i < NV; i++) *(uint4*)(kb + (size_t)(d + 256 * i) * 16) = pre[i];
+}
+template <int CHB, int LUT>
+__device__ __forceinline__ void attn_sel_s_body(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                                const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                                const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                                const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                                float* __restrict__ out) {
+    int head = blockIdx.x;
+    int t = blockIdx.y;
+    int d = threadIdx.x;
+    int kvh = head / 12;
+    int n = sel_n[t];
+    if (n < 0) n = 0;
+    const int sel_max = *sel_max_p;
+    if (n > sel_max) n = sel_max;
+    const int tmax = *tmax_p;
+    const int* list = sel + (size_t)t * sel_max;
+    const float* qt = q + ((size_t)t * 24 + head) * 256;
+    __shared__ float p[2051];
+    __shared__ float red[256];
+    __shared__ __align__(16) unsigned char kb[CHB];
+    __shared__ float lut[256];
+    if (LUT) lut[threadIdx.x] = dec_e4m3((unsigned char)threadIdx.x); // read only after the first __syncthreads
+    const int mode = *mode_p;
+    const int esz = mode ? 2 : 1;
+    const int rb = 256 * esz;           // bytes per K/V row
+    const int sh = mode ? 5 : 4;        // log2(uint4 per row)
+    const int KB = CHB / rb;            // keys per chunk
+    constexpr int NV = CHB / 16 / 256;  // uint4 per thread per chunk
+    const size_t kvbase = (size_t)kvh * tmax;
+    int warp = d >> 5, lane = d & 31;
+    const float scale = 0.0625f; // 1/sqrt(256)
+    float qr[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) qr[k] = qt[lane + 32 * k];
+    uint4 pre[NV];
+    const int nch = (n + KB - 1) / KB;
+    // K phase: the scores, each key's dot from shared memory (same e order, same warp reduction as attn_sel_r)
+    if (nch > 0) attn_fetch<NV>(pre, kc, kvbase, rb, sh, list, 0, n, tmax, d);
+    for (int c = 0; c < nch; c++) {
+        const int j0 = c * KB;
+        attn_store<NV>(pre, kb, d);
+        __syncthreads();
+        if (c + 1 < nch) attn_fetch<NV>(pre, kc, kvbase, rb, sh, list, j0 + KB, n, tmax, d);
+        for (int jj = warp; jj < KB; jj += 8) {
+            int j = j0 + jj;
+            if (j < n) {
+                const unsigned char* kp = kb + jj * rb;
+                float acc = 0.0f;
+#pragma unroll
+                for (int k = 0; k < 8; k++) acc += qr[k] * kv_ld<LUT>(kp, lane + 32 * k, mode, lut);
+                for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+                if (lane == 0) p[j] = acc * scale;
+            }
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+    float mx = -3.0e38f;
+    for (int j = d; j < n; j += 256) mx = fmaxf(mx, p[j]);
+    red[d] = mx;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (d < st) red[d] = fmaxf(red[d], red[d + st]);
+        __syncthreads();
+    }
+    mx = red[0];
+    __syncthreads(); // thread 0 writes red[0] = sum below: without this barrier a late reader takes that sum as mx
+    float sum = 0.0f;
+    for (int j = d; j < n; j += 256) { float e = expf(p[j] - mx); p[j] = e; sum += e; }
+    red[d] = sum;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (d < st) red[d] += red[d + st];
+        __syncthreads();
+    }
+    sum = red[0];
+    __syncthreads();
+    for (int j = d; j < n; j += 256) p[j] = p[j] / sum; // the same division attn_sel does inline
+    __syncthreads();
+    // V phase: o accumulated in list order (the serial chain of attn_sel), the rows from shared memory
+    float o = 0.0f;
+    if (nch > 0) attn_fetch<NV>(pre, vc, kvbase, rb, sh, list, 0, n, tmax, d);
+    for (int c = 0; c < nch; c++) {
+        const int j0 = c * KB;
+        attn_store<NV>(pre, kb, d);
+        __syncthreads();
+        if (c + 1 < nch) attn_fetch<NV>(pre, vc, kvbase, rb, sh, list, j0 + KB, n, tmax, d);
+        const int jend = (j0 + KB < n) ? (j0 + KB) : n;
+        for (int j = j0; j < jend; j++) o += p[j] * kv_ld<LUT>(kb + (j - j0) * rb, d, mode, lut);
+        __syncthreads();
+    }
+    out[((size_t)t * 24 + head) * 256 + d] = o;
+}
+extern "C" __global__ void attn_sel_s(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                      const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                      const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                      const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                      float* __restrict__ out) {
+    attn_sel_s_body<16384, 0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+}
+extern "C" __global__ void attn_sel_s8(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                       const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                       const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                       const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                       float* __restrict__ out) {
+    attn_sel_s_body<8192, 0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+}
+extern "C" __global__ void attn_sel_s8l(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                        const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                        const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                        const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                        float* __restrict__ out) {
+    attn_sel_s_body<8192, 1>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+}
+// attn_sel_g (#10 step 5, 2026-09-06): ONE block per (KV head, query) computing the 12 q heads that share the K/V rows
+// (grid (2, Tq), 384 threads = 12 warps, warp h = head kvh*12+h). The K and V rows are staged in 4 KB chunks (16 keys
+// e4m3 / 8 keys bf16) through shared memory ONCE for the 12 heads, e4m3 decoded through the shared LUT. The softmax
+// weights are never stored (12 x 2051 floats would not fit): the scores are recomputed per pass from the staged K rows -
+// pass 1 the max (fmaxf is exact, order-free), pass 2 the sum in attn_sel's slot order (attn_sel's thread d summed the
+// keys j = d mod 256 in increasing j, then the 8-step tree red[d] += red[d+st]; here slot s = lane + 32*k lives in
+// register k of lane s & 31, and the same tree runs in registers and shuffles), pass 3 o += (e / sum) * v in list order.
+// Every per-element op is attn_sel's (same fma chains, same shuffle tree, same expf, same IEEE division) -> meant
+// bit-identical (gate: parity 8 + 512).
+__device__ __forceinline__ float g_score(const float* qr, const unsigned char* kp, int lane, int mode, const float* lut) {
+    float acc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 8; k++) acc += qr[k] * kv_ld<1>(kp, lane + 32 * k, mode, lut);
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    const float scale = 0.0625f; // 1/sqrt(256)
+    return __shfl_sync(0xffffffffu, acc * scale, 0);
+}
+__device__ __forceinline__ uint4 g_fetch(const unsigned char* __restrict__ base, size_t kvbase, int rb, int sh,
+                                         const int* __restrict__ list, int j0, int n, int tmax, int tid) {
+    int row = tid >> sh;
+    int col = tid & ((1 << sh) - 1);
+    int j = j0 + row;
+    if (j < n) {
+        int tok = list[j];
+        if (tok < 0) tok = 0;
+        if (tok >= tmax) tok = tmax - 1;
+        return *(const uint4*)(base + (kvbase + (size_t)tok) * rb + (size_t)col * 16);
+    }
+    return make_uint4(0u, 0u, 0u, 0u);
+}
+extern "C" __global__ void __launch_bounds__(384) attn_sel_g(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                      const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                      const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                      const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                      float* __restrict__ out) {
+    const int kvh = blockIdx.x;
+    const int t = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int head = kvh * 12 + warp;
+    int n = sel_n[t];
+    if (n < 0) n = 0;
+    const int sel_max = *sel_max_p;
+    if (n > sel_max) n = sel_max;
+    const int tmax = *tmax_p;
+    const int* list = sel + (size_t)t * sel_max;
+    const float* qt = q + ((size_t)t * 24 + head) * 256;
+    __shared__ float lut[256];
+    __shared__ __align__(16) unsigned char kb[4096];
+    __shared__ __align__(16) unsigned char vb[4096];
+    const int mode = *mode_p;
+    const int esz = mode ? 2 : 1;
+    const int rb = 256 * esz;      // bytes per K/V row
+    const int sh = mode ? 5 : 4;   // log2(uint4 per row)
+    const int KG = 4096 / rb;      // keys per chunk
+    const size_t kvbase = (size_t)kvh * tmax;
+    const bool ld = tid < 256;     // the 256 fetching threads (one uint4 each per chunk)
+    if (ld) lut[tid] = dec_e4m3((unsigned char)tid);
+    float qr[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) qr[k] = qt[lane + 32 * k];
+    const int nch = (n + KG - 1) / KG;
+    uint4 pk = make_uint4(0u, 0u, 0u, 0u), pv = make_uint4(0u, 0u, 0u, 0u);
+    // pass 1: the max of this head's scores
+    float mx = -3.0e38f;
+    if (nch > 0 && ld) pk = g_fetch(kc, kvbase, rb, sh, list, 0, n, tmax, tid);
+    for (int c = 0; c < nch; c++) {
+        const int j0 = c * KG;
+        if (ld) *(uint4*)(kb + (size_t)tid * 16) = pk;
+        __syncthreads();
+        if (c + 1 < nch && ld) pk = g_fetch(kc, kvbase, rb, sh, list, j0 + KG, n, tmax, tid);
+        const int jend = (j0 + KG < n) ? (j0 + KG) : n;
+        for (int j = j0; j < jend; j++) mx = fmaxf(mx, g_score(qr, kb + (j - j0) * rb, lane, mode, lut));
+        __syncthreads();
+    }
+    // pass 2: the sum, slot s = j mod 256 accumulated in increasing j (register s>>5 of lane s&31), then attn_sel's tree
+    float ps[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) ps[k] = 0.0f;
+    if (nch > 0 && ld) pk = g_fetch(kc, kvbase, rb, sh, list, 0, n, tmax, tid);
+    for (int c = 0; c < nch; c++) {
+        const int j0 = c * KG;
+        if (ld) *(uint4*)(kb + (size_t)tid * 16) = pk;
+        __syncthreads();
+        if (c + 1 < nch && ld) pk = g_fetch(kc, kvbase, rb, sh, list, j0 + KG, n, tmax, tid);
+        const int jend = (j0 + KG < n) ? (j0 + KG) : n;
+        for (int j = j0; j < jend; j++) {
+            float e = expf(g_score(qr, kb + (j - j0) * rb, lane, mode, lut) - mx);
+            const int slot = j & 255;
+            if ((slot & 31) == lane) {
+                const int k = slot >> 5;
+#pragma unroll
+                for (int kk = 0; kk < 8; kk++) if (kk == k) ps[kk] += e;
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int k = 0; k < 4; k++) ps[k] += ps[k + 4];   // st = 128
+    ps[0] += ps[2]; ps[1] += ps[3];                    // st = 64
+    ps[0] += ps[1];                                    // st = 32
+    for (int st = 16; st > 0; st >>= 1) {              // st = 16 .. 1 across lanes
+        float v = __shfl_down_sync(0xffffffffu, ps[0], st);
+        if (lane < st) ps[0] += v;
+    }
+    const float sum = __shfl_sync(0xffffffffu, ps[0], 0);
+    // pass 3: o += (e / sum) * v in list order, K and V chunks staged together
+    float o[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) o[k] = 0.0f;
+    if (nch > 0 && ld) { pk = g_fetch(kc, kvbase, rb, sh, list, 0, n, tmax, tid); pv = g_fetch(vc, kvbase, rb, sh, list, 0, n, tmax, tid); }
+    for (int c = 0; c < nch; c++) {
+        const int j0 = c * KG;
+        if (ld) { *(uint4*)(kb + (size_t)tid * 16) = pk; *(uint4*)(vb + (size_t)tid * 16) = pv; }
+        __syncthreads();
+        if (c + 1 < nch && ld) { pk = g_fetch(kc, kvbase, rb, sh, list, j0 + KG, n, tmax, tid); pv = g_fetch(vc, kvbase, rb, sh, list, j0 + KG, n, tmax, tid); }
+        const int jend = (j0 + KG < n) ? (j0 + KG) : n;
+        for (int j = j0; j < jend; j++) {
+            float w = expf(g_score(qr, kb + (j - j0) * rb, lane, mode, lut) - mx) / sum; // the same division attn_sel does
+            const unsigned char* vp = vb + (j - j0) * rb;
+#pragma unroll
+            for (int k = 0; k < 8; k++) o[k] += w * kv_ld<1>(vp, lane + 32 * k, mode, lut);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int k = 0; k < 8; k++) out[((size_t)t * 24 + head) * 256 + lane + 32 * k] = o[k];
+}
 extern "C" __global__ void gate_mul(const float* __restrict__ core, const float* __restrict__ gate,
                                     float* __restrict__ out) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2835,7 +3115,7 @@ impl Kernels {
             "qsa_select", "qsa_select_fast", "router_top10", "gather_ple_fp4", "gate_dot", "gate_apply", "ple_conv",
             "ple_state_update", "ple_conv_step", "argmax_k", "sample_topk_part", "sample_k", "add_flat",
             "gemv_bf16_b", "gemv_bf16_w", "gemv_fp4_b1k", "gemm_fp4_dense", "gemm_bf16_dense", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
-            "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "attn_sel_r", "attn_sel_d8", "attn_sel_d9",
+            "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "attn_sel_r", "attn_sel_d8", "attn_sel_d9", "attn_sel_s", "attn_sel_s8", "attn_sel_s8l", "attn_sel_g",
         ];
         let mut map = HashMap::new();
         for n in names {

@@ -1124,11 +1124,17 @@ fn qfuse_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLo
 /// QSA scores warp-per-block (both graph-static; cost no longer grows
 /// linearly with the context inside one block)
 fn attn_split_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| env_on("CROW_ATTN_SPLIT")) }
+/// #10 step 5 (2026-09-06): CROW_ATTN_R=4 selects attn_sel_s8l (attn_sel_s8 + shared e4m3 LUT), 5 selects attn_sel_g
+/// (one block per (KV head, query), 12 warps = the 12 q heads sharing the rows; grid (NKV, Tq), 384 threads).
+/// #10 step 4 (2026-09-06): CROW_ATTN_R=2 selects attn_sel_s (K/V rows staged through 16 KB shared memory per chunk,
+/// same op chain as attn_sel_r -> bit-identical by parity), 3 selects attn_sel_s8 (8 KB chunks, higher occupancy).
 /// #10 step 3 (2026-09-06): CROW_ATTN_R=1 selects attn_sel_r (q in registers, weights normalised once, V loop
 /// unrolled x4; meant bit-identical, gate = parity); 8 / 9 are DIAGNOSTICS with wrong output (no K dot / no V loop).
 /// Unset = attn_sel, byte-identical to before.
 fn attn_r_mode() -> i32 { static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new(); *V.get_or_init(|| std::env::var("CROW_ATTN_R").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }
-fn attn_sel_name() -> &'static str { match attn_r_mode() { 1 => "attn_sel_r", 8 => "attn_sel_d8", 9 => "attn_sel_d9", _ => "attn_sel" } }
+fn attn_sel_name() -> &'static str { match attn_r_mode() { 1 => "attn_sel_r", 2 => "attn_sel_s", 3 => "attn_sel_s8", 4 => "attn_sel_s8l", 5 => "attn_sel_g", 8 => "attn_sel_d8", 9 => "attn_sel_d9", _ => "attn_sel" } }
+/// (grid.x, block) of the selected attention kernel: one block per q head (NQ, AHD) or per KV head (NKV, 384).
+fn attn_sel_gx_bx() -> (u32, u32) { if attn_r_mode() == 5 { (NKV as u32, 384) } else { (NQ as u32, AHD as u32) } }
 /// #16 (2026-09-05): prompt attention in sub-batches of ATTN_SB tokens. The QSA
 /// score buffer [chunk][cap] f32 (256 KB per token, 512 MB at chunk 2048) shrinks
 /// to [ATTN_SB][cap]; scores / select / attn_sel take pointer offsets per
@@ -1676,7 +1682,7 @@ impl Engine {
                 s.scores as u64, p.ncb as u64 + (t0 * 4) as u64, sel_i, sel_n_i, p.k_top as u64,
                 p.cap as u64, p.n_selmax as u64, p.pos_row as u64 + (t0 * 4) as u64]);
             step!("launch #18");
-            launch_v(k.f(attn_sel_name()), NQ as u32, tb as u32, 1, AHD as u32, &[
+            launch_v(k.f(attn_sel_name()), attn_sel_gx_bx().0, tb as u32, 1, attn_sel_gx_bx().1, &[
                 s.aqr as u64 + (t0 * CORE * 4) as u64, kc, vc, sel_i, sel_n_i, p.tmax as u64, p.mode as u64,
                 p.n_selmax as u64, s.aout as u64 + (t0 * CORE * 4) as u64]);
         }
@@ -1808,7 +1814,7 @@ impl Engine {
             launch_v(k.f("attn_merge"), NQ as u32, 1, 1, AHD as u32, &[
                 s.part_o as u64, s.part_ml as u64, s.aout as u64, p.n_splits as u64]);
         } else {
-            launch_v(k.f(attn_sel_name()), NQ as u32, 1, 1, AHD as u32, &[
+            launch_v(k.f(attn_sel_name()), attn_sel_gx_bx().0, 1, 1, attn_sel_gx_bx().1, &[
                 s.aqr as u64, kc, vc, s.sel as u64, s.sel_n as u64, p.tmax as u64, p.mode as u64,
                 p.n_selmax as u64, s.aout as u64]);
         }
