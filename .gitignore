@@ -33,3 +33,4 @@ engine/.engine.lock
 # per-run scratch output of `decode run` (overwritten every run)
 engine/decode_out/run.json
 engine/target_attn/
+engine/target_gate/
