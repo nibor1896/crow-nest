@@ -29,33 +29,94 @@ pub struct Cnq {
     /// (~1 us on a hit instead of a seek+read syscall pair); CROW_MMAP=0 disables.
     pub map: usize,
     pub map_len: u64,
+    /// the CreateFileMappingW handle behind `map` (closed in Drop after the unmap)
+    pub map_handle: usize,
+    /// container path: Drop re-opens it unbuffered once to purge its cached pages
+    pub path: String,
+}
+
+/// drop the file's pages from the system cache: an open with
+/// FILE_FLAG_NO_BUFFERING while no cached handle exists makes NTFS purge the
+/// cache section (2026-09-06: the cache manager kept 3.3 GB of tier reads in
+/// the system cache working set until process exit, so a harness reload saw
+/// that much less "available" RAM and residency.rs refused to pin the tier)
+pub fn purge_cache(path: &str) {
+    // CROW_CNQ_PURGE=0 keeps the cache (control knob; the purge also cools the
+    // PLE rows the next process would have found in standby)
+    if std::env::var("CROW_CNQ_PURGE").as_deref() == Ok("0") {
+        return;
+    }
+    use std::os::windows::fs::OpenOptionsExt;
+    let _ = std::fs::OpenOptions::new().read(true).custom_flags(0x2000_0000 /* FILE_FLAG_NO_BUFFERING */).open(path);
+}
+
+type FnUnmapView = unsafe extern "system" fn(*const std::ffi::c_void) -> i32;
+type FnCloseHandle = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+
+impl Drop for Cnq {
+    /// unmap the view and close the mapping object: pages of the container
+    /// touched through the view live in this process's working set until the
+    /// unmap, and a harness that opens a Cnq per request otherwise carries
+    /// them into its next load (~4.5 GB less "available" RAM on the reload)
+    fn drop(&mut self) {
+        if self.map != 0 {
+        unsafe {
+            let Ok(lib) = libloading::Library::new("kernel32.dll") else { return };
+            if let Ok(unmap) = lib.get::<FnUnmapView>(b"UnmapViewOfFile\0") {
+                unmap(self.map as *const _);
+            }
+            if self.map_handle != 0 {
+                if let Ok(close) = lib.get::<FnCloseHandle>(b"CloseHandle\0") {
+                    close(self.map_handle as *mut _);
+                }
+            }
+        }
+        }
+        self.map = 0;
+        self.map_handle = 0;
+        // close the cached handle first (the field would drop after this body),
+        // then the unbuffered open purges the cache
+        if let Ok(nul) = std::fs::File::open("NUL") {
+            drop(std::mem::replace(&mut self.file, nul));
+            purge_cache(&self.path);
+        }
+    }
 }
 
 type FnCreateMapping = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, u32, u32, *const u16) -> *mut std::ffi::c_void;
 type FnMapView = unsafe extern "system" fn(*mut std::ffi::c_void, u32, u32, u32, usize) -> *mut std::ffi::c_void;
 
-/// map the file read-only (whole length); 0 on any failure
-fn map_file(f: &std::fs::File) -> usize {
+/// map the file read-only (whole length); (view, mapping handle), (0, 0) on any failure
+fn map_file(f: &std::fs::File) -> (usize, usize) {
     if std::env::var("CROW_MMAP").as_deref() == Ok("0") {
-        return 0;
+        return (0, 0);
     }
     use std::os::windows::io::AsRawHandle;
     unsafe {
-        let Ok(lib) = libloading::Library::new("kernel32.dll") else { return 0 };
-        let Ok(create) = lib.get::<FnCreateMapping>(b"CreateFileMappingW\0") else { return 0 };
-        let Ok(view) = lib.get::<FnMapView>(b"MapViewOfFile\0") else { return 0 };
+        let Ok(lib) = libloading::Library::new("kernel32.dll") else { return (0, 0) };
+        let Ok(create) = lib.get::<FnCreateMapping>(b"CreateFileMappingW\0") else { return (0, 0) };
+        let Ok(view) = lib.get::<FnMapView>(b"MapViewOfFile\0") else { return (0, 0) };
         let h = create(f.as_raw_handle() as *mut _, std::ptr::null_mut(), 2 /* PAGE_READONLY */, 0, 0, std::ptr::null());
-        if h.is_null() { return 0 }
+        if h.is_null() { return (0, 0) }
         let p = view(h, 4 /* FILE_MAP_READ */, 0, 0, 0);
-        // the mapping object handle can be closed once the view exists; we keep
-        // it for the process lifetime (leak is intentional, one object)
-        p as usize
+        // the mapping handle stays with the Cnq: Drop unmaps the view and closes it
+        (p as usize, h as usize)
     }
+}
+
+/// read-only open with FILE_FLAG_SEQUENTIAL_SCAN (cache pages are not retained)
+pub fn open_sequential(path: &str) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new().read(true).custom_flags(0x0800_0000 /* FILE_FLAG_SEQUENTIAL_SCAN */).open(path).unwrap()
 }
 
 impl Cnq {
     pub fn open(path: &str) -> Cnq {
-        let mut f = std::fs::File::open(path).unwrap();
+        // FILE_FLAG_SEQUENTIAL_SCAN: the cache manager drops container pages
+        // behind the read cursor instead of keeping them in the system cache
+        // working set (2026-09-06: 3.3 GB stayed "in use" after the engine
+        // drop until process exit, and the reload's RAM check refused the tier)
+        let mut f = open_sequential(path);
         let file_len = f.metadata().unwrap().len();
         f.seek(SeekFrom::Start(file_len - 8)).unwrap();
         let mut b8 = [0u8; 8];
@@ -82,11 +143,11 @@ impl Cnq {
             });
         }
         let map_len = file_len;
-        let map = map_file(&f);
+        let (map, map_handle) = map_file(&f);
         if map == 0 {
             eprintln!("[cnq] file mapping unavailable - seek/read fallback");
         }
-        Cnq { file: f, blob_offset, tensors, map, map_len }
+        Cnq { file: f, blob_offset, tensors, map, map_len, map_handle, path: path.to_string() }
     }
 
     /// absolute file offset of a tensor byte range (for prefetch touches)

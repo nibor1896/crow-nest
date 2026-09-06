@@ -165,6 +165,18 @@ fn main() {
                     ids.len() as f64 / prefill_s
                 );
 
+                // #20: CROW_SAMPLE=1 samples with the data-sheet profile (env-
+                // overridable) - on the device (sample_k behind argmax_k, captured
+                // with the graph, so it must be enabled before the warm-up step)
+                // unless CROW_SAMPLE_HOST=1 keeps the host path (logits readback)
+                let mut sampler = crow_nest_engine::sample::Sampler::from_env();
+                let sample_host = crow_nest_engine::sample::host_forced();
+                if let Some(s) = &sampler {
+                    println!("{}", s.describe());
+                    if !sample_host {
+                        eng.enable_dev_sampler(s);
+                    }
+                }
                 // warm-up step discarded (spec 0.3 measurement discipline)
                 let t0 = std::time::Instant::now();
                 next = eng.decode_step(&mut cnq, next as i64);
@@ -184,15 +196,15 @@ fn main() {
                 }
                 let mut lat = Vec::new();
                 let mut trace = vec![next];
-                // #20: CROW_SAMPLE=1 samples on the host from the logits row (data-sheet
-                // profile, env-overridable); CROW_STOP_EOS=1 ends the run at EOS
-                let mut sampler = crow_nest_engine::sample::Sampler::from_env();
-                if let Some(s) = &mut sampler {
-                    println!("{}", s.describe());
-                    let lg = crow_nest_engine::cuda::dtoh(eng.s.logits, V);
-                    next = s.sample(&lg);
-                    s.observe(next);
-                    trace[0] = next;
+                // host path: re-draw the warm-up token from its logits row;
+                // CROW_STOP_EOS=1 ends the run at EOS
+                if sample_host {
+                    if let Some(s) = &mut sampler {
+                        let lg = crow_nest_engine::cuda::dtoh(eng.s.logits, V);
+                        next = s.sample(&lg);
+                        s.observe(next);
+                        trace[0] = next;
+                    }
                 }
                 let stop_eos = crow_nest_engine::sample::stop_on_eos();
                 let mut stopped_eos = stop_eos && crow_nest_engine::sample::EOS_IDS.contains(&next);
@@ -219,10 +231,12 @@ fn main() {
                         break;
                     }
                     next = eng.decode_step(&mut cnq, next as i64);
-                    if let Some(s) = &mut sampler {
-                        let lg = crow_nest_engine::cuda::dtoh(eng.s.logits, V);
-                        next = s.sample(&lg);
-                        s.observe(next);
+                    if sample_host {
+                        if let Some(s) = &mut sampler {
+                            let lg = crow_nest_engine::cuda::dtoh(eng.s.logits, V);
+                            next = s.sample(&lg);
+                            s.observe(next);
+                        }
                     }
                     lat.push(t0.elapsed().as_secs_f64() * 1e3);
                     trace.push(next);

@@ -392,6 +392,22 @@ pub struct Engine {
     /// an exponentially decayed count of the selections since (CROW_ADAPT_WINDOW=1)
     pub adapt_base: Vec<u64>,
     pub adapt_ema: Vec<f64>,
+    /// #20: device-side sampler (CROW_SAMPLE=1 without CROW_SAMPLE_HOST=1) -
+    /// the sample_k node behind argmax_k; its state buffers live here
+    pub dev_sampler: Option<DevSampler>,
+}
+
+/// device state of the #20 sampler: presence mask [V] u8, xorshift64* state
+/// [1] u64, profile {temp, top_p, presence: f32, top_k: i32}; `in_graph` is
+/// set once the launch was captured into the decode graph
+pub struct DevSampler {
+    pub mask: Dev,
+    pub rng: Dev,
+    pub params: Dev,
+    /// v2: per-slice top-k candidates [SAMPLE_PARTS * SAMPLE_MAXK] f32 / i32
+    pub cand_v: Dev,
+    pub cand_i: Dev,
+    pub in_graph: std::cell::Cell<bool>,
 }
 
 /// side stream + events + the swaps in flight of the stream-side trickle
@@ -749,6 +765,7 @@ impl Engine {
                 trickle: None,
                 adapt_base: Vec::new(),
                 adapt_ema: Vec::new(),
+                dev_sampler: None,
                 cnq: std::ptr::null_mut(),
                 graph_exec: 0,
                 cap_stream: 0,
@@ -2782,6 +2799,11 @@ impl Engine {
         self.lm_head_row(0);
         launch_v(self.k.f("argmax_k"), 1, 1, 1, 1024, &[
             self.s.logits as u64, self.s.argmax as u64, self.p.n_vocab as u64]);
+        // #20: the device sampler overwrites the argmax slot with its draw
+        if let Some(ds) = &self.dev_sampler {
+            self.launch_sample(ds);
+            if capturing { ds.in_graph.set(true); }
+        }
         } // !replay
         if gdbg { eprintln!("[graph-dbg] Q: layer-loop fertig, capture status = {}", cuda::capture_status(self.cap_stream as cudarc::driver::sys::CUstream)); }
         if capturing {
@@ -2798,6 +2820,10 @@ impl Engine {
                 self.graph_exec as cudarc::driver::sys::CUgraphExec,
                 self.cap_stream as cudarc::driver::sys::CUstream,
             );
+            // #20: sampler enabled after the capture -> eager launch behind the replay
+            if let Some(ds) = &self.dev_sampler {
+                if !ds.in_graph.get() { self.launch_sample(ds); }
+            }
         }
         if prof {
             prof::add(&prof::HEAD, t_head.elapsed().as_micros() as u64);
@@ -2819,6 +2845,50 @@ impl Engine {
         }
         let tok = cuda::dtoh_i32(self.s.argmax, 1)[0] as usize;
         tok
+    }
+
+    /// #20: switch this answer to device-side sampling with the profile of `s`
+    /// (mask cleared, rng = the sampler's seeded state). Call after prefill and
+    /// before the first decode_step of the process so the node is captured with
+    /// the graph; enabled later it runs as an eager launch behind each replay.
+    pub unsafe fn enable_dev_sampler(&mut self, s: &crate::sample::Sampler) {
+        let ds = self.dev_sampler.get_or_insert_with(|| DevSampler {
+            mask: cuda::alloc_zeroed(V),
+            rng: cuda::alloc_zeroed(8),
+            params: cuda::alloc_zeroed(16),
+            cand_v: cuda::alloc_zeroed(64 * 64 * 4),
+            cand_i: cuda::alloc_zeroed(64 * 64 * 4),
+            in_graph: std::cell::Cell::new(false),
+        });
+        let zero = vec![0u8; V];
+        cuda::upload_into(ds.mask, &zero);
+        cuda::to_u64_into(ds.rng, &[s.rng.state()]);
+        let mut pb = [0u8; 16];
+        pb[0..4].copy_from_slice(&s.temperature.to_le_bytes());
+        pb[4..8].copy_from_slice(&s.top_p.to_le_bytes());
+        pb[8..12].copy_from_slice(&s.presence_penalty.to_le_bytes());
+        pb[12..16].copy_from_slice(&(s.top_k as i32).to_le_bytes());
+        cuda::upload_into(ds.params, &pb);
+        cuda::sync();
+    }
+
+    unsafe fn launch_sample(&self, ds: &DevSampler) {
+        // v2: 64 blocks pick their slice's top-k, one block merges and draws
+        launch_v(self.k.f("sample_topk_part"), 64, 1, 1, 256, &[
+            self.s.logits as u64, self.p.n_vocab as u64, ds.mask as u64, ds.params as u64,
+            ds.cand_v as u64, ds.cand_i as u64]);
+        launch_v(self.k.f("sample_k"), 1, 1, 1, 256, &[
+            ds.cand_v as u64, ds.cand_i as u64, self.s.argmax as u64, self.p.n_vocab as u64,
+            ds.mask as u64, ds.rng as u64, ds.params as u64]);
+    }
+
+    /// #20: draw a token from the logits row currently in `s.logits` (the last
+    /// prefill row) with the device sampler; eager launch + readback.
+    pub unsafe fn sample_last(&mut self) -> usize {
+        let ds = self.dev_sampler.as_ref().expect("sample_last: device sampler not enabled");
+        self.launch_sample(ds);
+        cuda::sync();
+        cuda::dtoh_i32(self.s.argmax, 1)[0] as usize
     }
 
     /// Prompt-adaptive residency (A-P3): re-cut every layer's hot set from the
@@ -3161,6 +3231,13 @@ impl Drop for Engine {
             }
             cuda::free_dev(&mut self.pf_ncombo);
             cuda::free_dev(&mut self.sel_counts);
+            if let Some(ds) = &mut self.dev_sampler {
+                cuda::free_dev(&mut ds.mask);
+                cuda::free_dev(&mut ds.rng);
+                cuda::free_dev(&mut ds.params);
+                cuda::free_dev(&mut ds.cand_v);
+                cuda::free_dev(&mut ds.cand_i);
+            }
             // the module last: every CUfunction in self.k points into it
             self.module.unload();
         }

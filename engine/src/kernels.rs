@@ -2519,6 +2519,175 @@ extern "C" __global__ void argmax_k(const float* __restrict__ logits, int* __res
     }
     if (threadIdx.x == 0) out[0] = ri[0];
 }
+// ---------------- head: device sampler (#20) ----------------
+// Bit-for-bit the host sampler of sample.rs: presence penalty on the raw
+// logits, top-k in (value desc, index asc) order, f32 (v-m)/temp cast to
+// double, exp / softmax / nucleus / draw in double, xorshift64* state in
+// `rng`. `params` = {temp, top_p, presence} f32 + top_k i32; `mask[v]` = 1
+// once v was sampled in this answer. Writes the token into out[0] (the
+// argmax slot), so the readback behind the graph is unchanged.
+// Two stages (v2): sample_topk_part - SAMPLE_PARTS blocks each pick the k
+// largest keys of their slice into cand; sample_k - one block runs the same
+// key-ordered rounds over the SAMPLE_PARTS*k candidates and draws. The union
+// of the slice top-ks contains the global top-k and the order is one total
+// order, so the draw equals the single-block v1 (1.8 ms/token on one SM).
+#define SAMPLE_MAXK 64
+#define SAMPLE_PARTS 64
+#define SAMPLE_THREADS 256
+
+__device__ __forceinline__ void sample_rounds(const float* __restrict__ vals, const int* __restrict__ idx, int n,
+                                              const unsigned char* __restrict__ mask, float pres, int k,
+                                              float* __restrict__ rb, int* __restrict__ ri,
+                                              float* __restrict__ cv, int* __restrict__ ci, int nthreads) {
+    // k rounds of "largest key below the previous pick" over (vals, idx); when
+    // idx == 0 the element index is its position and the mask penalty applies
+    __shared__ float pv;
+    __shared__ int pi;
+    const int tid = threadIdx.x;
+    if (tid == 0) { pv = __int_as_float(0x7f800000); pi = -1; }
+    __syncthreads();
+    for (int r = 0; r < k; r++) {
+        const float lim_v = pv;
+        const int lim_i = pi;
+        float best = -__int_as_float(0x7f800000);
+        int bi = 0x7fffffff;
+        for (int j = tid; j < n; j += nthreads) {
+            float v = vals[j];
+            int i;
+            if (idx == 0) { i = j; if (mask[i]) v -= pres; } else { i = idx[j]; }
+            if (v < lim_v || (v == lim_v && i > lim_i)) {
+                if (v > best || (v == best && i < bi)) { best = v; bi = i; }
+            }
+        }
+        rb[tid] = best;
+        ri[tid] = bi;
+        __syncthreads();
+        for (int st = nthreads >> 1; st > 0; st >>= 1) {
+            if (tid < st) {
+                const float ov = rb[tid + st];
+                const int oi = ri[tid + st];
+                if (ov > rb[tid] || (ov == rb[tid] && oi < ri[tid])) { rb[tid] = ov; ri[tid] = oi; }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) { cv[r] = rb[0]; ci[r] = ri[0]; pv = rb[0]; pi = ri[0]; }
+        __syncthreads();
+    }
+}
+
+// stage 1: block b owns logits [b*slice, min(n, (b+1)*slice)); writes k keys
+// (value with presence penalty, index) into cand_v/cand_i[b*k ..]
+extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_topk_part(
+        const float* __restrict__ logits, const int* __restrict__ n_p, const unsigned char* __restrict__ mask,
+        const float* __restrict__ params, float* __restrict__ cand_v, int* __restrict__ cand_i) {
+    const int n = *n_p;
+    const float pres = params[2];
+    int k = ((const int*)params)[3];
+    if (k < 1) k = 1;
+    if (k > SAMPLE_MAXK) k = SAMPLE_MAXK;
+    const int slice = (n + SAMPLE_PARTS - 1) / SAMPLE_PARTS;
+    const int lo = blockIdx.x * slice;
+    const int hi = min(n, lo + slice);
+    __shared__ float rb[SAMPLE_THREADS];
+    __shared__ int ri[SAMPLE_THREADS];
+    __shared__ float cv[SAMPLE_MAXK];
+    __shared__ int ci[SAMPLE_MAXK];
+    // rounds over the slice: the helper sees position j, we offset by lo
+    __shared__ float pv;
+    __shared__ int pi;
+    const int tid = threadIdx.x;
+    if (tid == 0) { pv = __int_as_float(0x7f800000); pi = -1; }
+    __syncthreads();
+    for (int r = 0; r < k; r++) {
+        const float lim_v = pv;
+        const int lim_i = pi;
+        float best = -__int_as_float(0x7f800000);
+        int bi = 0x7fffffff;
+        for (int i = lo + tid; i < hi; i += SAMPLE_THREADS) {
+            float v = logits[i];
+            if (mask[i]) v -= pres;
+            if (v < lim_v || (v == lim_v && i > lim_i)) {
+                if (v > best || (v == best && i < bi)) { best = v; bi = i; }
+            }
+        }
+        rb[tid] = best;
+        ri[tid] = bi;
+        __syncthreads();
+        for (int st = SAMPLE_THREADS >> 1; st > 0; st >>= 1) {
+            if (tid < st) {
+                const float ov = rb[tid + st];
+                const int oi = ri[tid + st];
+                if (ov > rb[tid] || (ov == rb[tid] && oi < ri[tid])) { rb[tid] = ov; ri[tid] = oi; }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) { cv[r] = rb[0]; ci[r] = ri[0]; pv = rb[0]; pi = ri[0]; }
+        __syncthreads();
+    }
+    if (tid < k) {
+        cand_v[blockIdx.x * k + tid] = cv[tid];
+        cand_i[blockIdx.x * k + tid] = ci[tid];
+    }
+}
+
+// stage 2: one block, the same rounds over the SAMPLE_PARTS*k candidates
+// (values already penalized), then the draw
+extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_k(
+        const float* __restrict__ cand_v, const int* __restrict__ cand_i, int* __restrict__ out,
+        const int* __restrict__ n_p, unsigned char* __restrict__ mask,
+        unsigned long long* __restrict__ rng, const float* __restrict__ params) {
+    const int n = *n_p;
+    const float temp = params[0], top_p = params[1];
+    int k = ((const int*)params)[3];
+    if (k < 1) k = 1;
+    if (k > n) k = n;
+    if (k > SAMPLE_MAXK) k = SAMPLE_MAXK;
+    const int nc = SAMPLE_PARTS * k;
+    __shared__ float rb[SAMPLE_THREADS];
+    __shared__ int ri[SAMPLE_THREADS];
+    __shared__ float cv[SAMPLE_MAXK];
+    __shared__ int ci[SAMPLE_MAXK];
+    sample_rounds(cand_v, cand_i, nc, mask, 0.0f, k, rb, ri, cv, ci, SAMPLE_THREADS);
+    if (threadIdx.x == 0) {
+        int tok;
+        if (temp <= 0.0f) {
+            tok = ci[0];
+        } else {
+            double pr[SAMPLE_MAXK];
+            const float m = cv[0];
+            double z = 0.0;
+            for (int i = 0; i < k; i++) {
+                const float a = (cv[i] - m) / temp;
+                pr[i] = exp((double)a);
+                z += pr[i];
+            }
+            for (int i = 0; i < k; i++) pr[i] /= z;
+            int keep = k;
+            double acc = 0.0;
+            for (int i = 0; i < k; i++) {
+                acc += pr[i];
+                if (acc >= (double)top_p) { keep = i + 1; break; }
+            }
+            double z2 = 0.0;
+            for (int i = 0; i < keep; i++) z2 += pr[i];
+            unsigned long long x = rng[0];
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            rng[0] = x;
+            const unsigned long long y = x * 0x2545F4914F6CDD1DULL;
+            const double rnd = ((double)(y >> 11) / 9007199254740992.0) * z2;
+            tok = ci[keep - 1];
+            acc = 0.0;
+            for (int i = 0; i < keep; i++) {
+                acc += pr[i];
+                if (rnd < acc) { tok = ci[i]; break; }
+            }
+        }
+        out[0] = tok;
+        mask[tok] = 1;
+    }
+}
 "#;
 
 use cudarc::driver::sys::CUfunction;
@@ -2539,7 +2708,7 @@ impl Kernels {
             "delta_rule_step", "delta_rule_persist_r", "delta_rule_step_r", "rmsnorm_gated", "split_qg", "rope", "rope_p", "stage_cold", "stage_cold_lb", "stage_tiles_lb", "swap_pairs", "expand_slab", "moe_count", "moe_plan", "moe_scatter", "stage_tiles", "gemm_fp4_tiles", "silu_tiles", "quant_tiles", "store_kv", "attn_sel",
             "gate_mul", "rms128", "rope64", "pool4_cache", "qk_k_append", "d2d_block", "qsa_scores",
             "qsa_select", "qsa_select_fast", "router_top10", "gather_ple_fp4", "gate_dot", "gate_apply", "ple_conv",
-            "ple_state_update", "ple_conv_step", "argmax_k", "add_flat",
+            "ple_state_update", "ple_conv_step", "argmax_k", "sample_topk_part", "sample_k", "add_flat",
             "gemv_bf16_b", "gemv_bf16_w", "gemv_fp4_b1k", "gemm_fp4_dense", "gemm_bf16_dense", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
             "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d",
         ];

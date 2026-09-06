@@ -8,6 +8,10 @@
 //!   CROW_SAMPLE=1  CROW_TEMP  CROW_TOP_P  CROW_TOP_K  CROW_PRESENCE  CROW_SEED
 //! Greedy stays the gate discipline: with CROW_SAMPLE unset nothing here runs
 //! and the traces are unchanged.
+//!
+//! Since the GPU sampler (kernels.rs `sample_k`) the draw runs on the device as
+//! the node behind `argmax_k`; this host code is its bit-for-bit reference and
+//! stays reachable with CROW_SAMPLE_HOST=1 (logits readback + host top-k).
 
 /// xorshift64* — seeded, dependency-free, good enough for token sampling.
 pub struct Rng(u64);
@@ -28,6 +32,16 @@ impl Rng {
     pub fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
+    /// raw state (uploaded to the device sampler, which advances it the same way)
+    pub fn state(&self) -> u64 {
+        self.0
+    }
+}
+
+/// CROW_SAMPLE_HOST=1: keep sampling on the host (reference path); otherwise
+/// CROW_SAMPLE=1 samples on the device
+pub fn host_forced() -> bool {
+    std::env::var("CROW_SAMPLE_HOST").as_deref() == Ok("1")
 }
 
 #[derive(Clone, Debug)]
@@ -70,7 +84,8 @@ impl Sampler {
     }
 
     pub fn describe(&self) -> String {
-        format!("sample: temp {} top_p {} top_k {} presence {} seed {}", self.temperature, self.top_p, self.top_k, self.presence_penalty, self.seed)
+        format!("sample: temp {} top_p {} top_k {} presence {} seed {} {}", self.temperature, self.top_p, self.top_k, self.presence_penalty, self.seed,
+            if host_forced() { "host" } else { "gpu" })
     }
 
     /// register a token that is part of the answer (for the presence penalty)

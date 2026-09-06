@@ -40,6 +40,13 @@ fn main() {
             let f_held = cuda::free_vram_bytes();
             let t1 = t0.elapsed().as_secs_f64();
             for h in held.drain(..) { cuda::ck(sys::cuMemFreeHost(h)); }
+            // PIN_LEAK_HOLD_S=<s>: stay alive after the free so an outside sampler can
+            // read what the process still holds host-side (2026-09-06 harness reload check)
+            if let Some(s) = std::env::var("PIN_LEAK_HOLD_S").ok().and_then(|v| v.parse::<u64>().ok()) {
+                println!("[pin_leak] cycle {c}: freed; free RAM now {:.2} GiB, holding {s} s", cuda::free_physical_ram() as f64 / (1u64 << 30) as f64);
+                std::thread::sleep(std::time::Duration::from_secs(s));
+                println!("[pin_leak] cycle {c}: after hold free RAM {:.2} GiB", cuda::free_physical_ram() as f64 / (1u64 << 30) as f64);
+            }
             let f_after = cuda::free_vram_bytes();
             println!("[pin_leak] cycle {c}: alloc {:.1} s; free VRAM while held {:.1} MB (delta {:+.1}), after free {:.1} MB (leak vs start {:+.1} MB)",
                 t1, f_held as f64 / 1e6, (f_held as f64 - f_start as f64) / 1e6, f_after as f64 / 1e6, (f_start as f64 - f_after as f64) / 1e6);

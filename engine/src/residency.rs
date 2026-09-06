@@ -280,7 +280,7 @@ impl Residency {
                 (Pinned::alloc((ncold as u64 * cold_gu_bytes) as usize),
                  Pinned::alloc((ncold as u64 * cold_dn_bytes) as usize))
             };
-            let mut tier_file = tier_path.as_ref().map(|p| std::fs::File::open(p).unwrap());
+            let mut tier_file = tier_path.as_ref().map(|p| crate::cnq::open_sequential(p)); // no cache retention (see cnq.rs)
             let mut idx = HashMap::with_capacity(ncold);
             let mut slot = 0usize;
             for id in 0..E as u32 {
