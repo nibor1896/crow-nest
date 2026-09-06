@@ -382,6 +382,11 @@ pub struct Engine {
     pub pf_ev_filled: [cudarc::driver::sys::CUevent; 2],
     pub pf_ev_done: [cudarc::driver::sys::CUevent; 2],
     pub pf_dma_live: std::cell::Cell<bool>,
+    /// CROW_PF_ASYNC: staging side stream + plan/filled/done events (two slot sets)
+    pub pa_stream: cudarc::driver::sys::CUstream,
+    pub pa_ev_plan: cudarc::driver::sys::CUevent,
+    pub pa_ev_filled: [cudarc::driver::sys::CUevent; 2],
+    pub pa_ev_done: [cudarc::driver::sys::CUevent; 2],
     /// CROW_ROUTE_DUMP=1 (non-graph decode): routed expert ids per token per
     /// layer, [token][layer][10] - measurement A-V3 (hot-set coverage study)
     pub route_log: Vec<Vec<[i32; 10]>>,
@@ -483,6 +488,16 @@ fn pf_gemm_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CROW_PF_GEMM").as_deref() != Ok("0"))
 }
+
+/// CROW_PF_ASYNC=1: the prefill staging copies (`stage_tiles`, SM reads over
+/// PCIe) run on a side stream into two slot sets (group parity), overlapping
+/// the previous group's tile GEMMs; costs one extra set of PF_TG staging slots
+/// (measured 2026-09-06: stage_tiles = 40 % of the prefill kernel time at 16k)
+pub fn pf_async_mode() -> i32 {
+    static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("CROW_PF_ASYNC").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+pub fn pf_async_on() -> bool { pf_async_mode() >= 1 }
 
 /// blocks per expert in the staging copies (CROW_STAGE_SPLIT, default 8; 16/32/64
 /// keep more PCIe requests in flight - measured 2026-09-04 with the WC tier)
@@ -618,7 +633,7 @@ impl Engine {
         let per_expert_unit = (slabs.gu_bytes + slabs.dn_bytes) * LAYERS as u64;
         let s = Scratch::alloc(cfg.prompt_chunk);
         // cold staging: decode-sized batches only (t*TOPK <= stage_max)
-        let stage_max = (2 * TOPK).max(pf_tg()); // 32 slots x 2.76 MB = 88 MB (default)
+        let stage_max = (2 * TOPK).max(pf_tg() * if pf_async_on() { 2 } else { 1 }); // 32 slots x 2.76 MB = 88 MB (default; x2 with CROW_PF_ASYNC)
         assert!(slabs.gu_bytes % (16 * stage_split() as u64) == 0 && slabs.dn_bytes % (16 * stage_split() as u64) == 0,
             "expert slab bytes must split into 16-byte units x STAGE_SPLIT");
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
@@ -639,10 +654,13 @@ impl Engine {
             n_tiles: cuda::alloc_zeroed(4),
             eptr: cuda::alloc_zeroed(max_tiles * 16),
             grp: cuda::to_i32_dev(&(0..PF_MAX_GROUPS as i32).collect::<Vec<_>>()),
-            tg: cuda::to_i32_dev(&[pf_tg() as i32]),
+            tg: cuda::to_i32_dev(&[pf_tg() as i32, if pf_async_on() { 2 } else { 1 }, pf_async_mode()]),
             max_tiles_p: cuda::to_i32_dev(&[max_tiles as i32]),
             max_tiles,
         };
+        if pf_async_on() {
+            log(&format!("prefill staging on a side stream (CROW_PF_ASYNC=1): 2 x {} slots", pf_tg()));
+        }
         let scratch_measured = cuda::total_vram_bytes() - cuda::free_vram_bytes() - dense_measured;
         log(&format!("scratch + staging resident: {:.0} MiB (chunk {})", scratch_measured as f64 / (1 << 20) as f64, cfg.prompt_chunk));
 
@@ -761,6 +779,10 @@ impl Engine {
                 pf_ev_filled: [cuda::event_create(), cuda::event_create()],
                 pf_ev_done: [cuda::event_create(), cuda::event_create()],
                 pf_dma_live: std::cell::Cell::new(false),
+                pa_stream: if pf_async_on() { cuda::stream_create_priority() } else { std::ptr::null_mut() },
+                pa_ev_plan: cuda::event_create(),
+                pa_ev_filled: [cuda::event_create(), cuda::event_create()],
+                pa_ev_done: [cuda::event_create(), cuda::event_create()],
                 route_log: Vec::new(),
                 trickle: None,
                 adapt_base: Vec::new(),
@@ -1919,12 +1941,51 @@ impl Engine {
             assert!(n_groups <= PF_MAX_GROUPS);
             let gs_gu = (self.res.gs_dev + (l * 8) as u64) as u64;
             let gs_dn = (self.res.gs_dev + (l * 8 + 4) as u64) as u64;
-            for gi in 0..n_groups {
+            let pa = pf_async_on();
+            let cs = cuda::cur_stream();
+            if pa {
+                // the plan (tiles/perm) is complete on the compute stream
+                cuda::event_record(self.pa_ev_plan, cs);
+                cuda::stream_wait_event(self.pa_stream, self.pa_ev_plan);
+            }
+            // CROW_PF_ASYNC=2: the copy engine stages the cold experts - the host
+            // reads the plan back once per layer (sync) and issues one memcpy per
+            // cold record ahead of the stage kernel on the side stream
+            let ce = pa && (pf_async_mode() == 2 || pf_async_mode() == 4) && self.res.lb.is_none();
+            let (tiles_h, hot_h) = if ce {
+                let nt = cuda::dtoh_i32(st.n_tiles, 1)[0] as usize;
+                let tl = cuda::dtoh_i32(st.tiles, nt * 4);
+                let mut hot = vec![false; E];
+                for &id in &self.res.sets[l] { if (id as usize) < E { hot[id as usize] = true; } }
+                (tl, hot)
+            } else { (Vec::new(), Vec::new()) };
+            // staging of one tile group (side stream + slot set gi%2 with CROW_PF_ASYNC)
+            let stage_group = |gi: usize| unsafe {
                 let grp = st.grp as u64 + (gi * 4) as u64;
                 let (pin_gu, pin_dn) = (self.res.cold_gu[l].dev as u64, self.res.cold_dn[l].dev as u64);
                 let (ring_gu, ring_dn) = if self.pf_dma_live.get() {
                     (self.pf_ring_gu[l % 2] as u64, self.pf_ring_dn[l % 2] as u64)
                 } else { (0u64, 0u64) };
+                if pa {
+                    // slot set gi%2 is free once group gi-2's GEMMs are done
+                    cuda::stream_wait_event(self.pa_stream, self.pa_ev_done[gi % 2]);
+                    cuda::set_stream(self.pa_stream as u64);
+                }
+                if ce {
+                    let t1 = ((gi + 1) * tg).min(tiles_h.len() / 4);
+                    for ti in gi * tg..t1 {
+                        let e = tiles_h[ti * 4] as usize;
+                        let w = tiles_h[ti * 4 + 3];
+                        if (w >> 16) & 1 == 1 && !hot_h[e] {
+                            let slot = ((w & 0xFFFF) as usize + (gi & 1) * tg) as u64;
+                            let rec = *self.res.cold_index[l].get(&(e as u32)).expect("cold expert without a pinned record") as u64;
+                            cuda::memcpy_async_on((st.gu as u64 + slot * self.res.gu_bytes) as cudarc::driver::sys::CUdeviceptr,
+                                self.res.cold_gu[l].dev + rec * self.res.gu_bytes, self.res.gu_bytes as usize, self.pa_stream);
+                            cuda::memcpy_async_on((st.dn as u64 + slot * self.res.dn_bytes) as cudarc::driver::sys::CUdeviceptr,
+                                self.res.cold_dn[l].dev + rec * self.res.dn_bytes, self.res.dn_bytes as usize, self.pa_stream);
+                        }
+                    }
+                }
                 if let Some(lb) = self.res.lb.as_ref() {
                     launch_v(k.f("stage_tiles_lb"), tg as u32, 2, stage_split(), 256, &[
                         st.tiles as u64, st.n_tiles as u64, grp, st.tg as u64, table, bitmap,
@@ -1936,6 +1997,27 @@ impl Engine {
                         st.gu as u64, st.dn as u64, st.eptr as u64, st.gu_b as u64, st.dn_b as u64,
                         pin_gu, pin_dn, ring_gu, ring_dn]);
                 }
+                if pa {
+                    cuda::event_record(self.pa_ev_filled[gi % 2], self.pa_stream);
+                    cuda::stream_query(self.pa_stream); // WDDM: submit the side-stream batch now
+                    cuda::set_stream(cs as u64);
+                }
+            };
+            if pa {
+                stage_group(0);
+            }
+            for gi in 0..n_groups {
+                let grp = st.grp as u64 + (gi * 4) as u64;
+                if pa {
+                    // pipelined host order: group gi+1's copy is issued before group gi's GEMMs
+                    if gi + 1 < n_groups {
+                        stage_group(gi + 1);
+                    }
+                    cuda::stream_wait_event(cs, self.pa_ev_filled[gi % 2]);
+                } else {
+                    stage_group(gi);
+                }
+                if pf_async_mode() != 4 { // DIAGNOSTIC (=4): copy-only floor, no tile GEMMs
                 launch_v(k.f("gemm_fp4_tiles"), ((2 * INTER) / 64) as u32, tg as u32, 1, mma_bx(), &[
                     st.tiles as u64, st.n_tiles as u64, grp, st.tg as u64, st.eptr as u64, p.zero as u64,
                     s.xq_gu as u64, st.perm as u64, s.h1 as u64, p.n2560 as u64, p.k_top10 as u64, gs_gu]);
@@ -1946,6 +2028,10 @@ impl Engine {
                 launch_v(k.f("gemm_fp4_tiles"), (H / 64) as u32, tg as u32, 1, mma_bx(), &[
                     st.tiles as u64, st.n_tiles as u64, grp, st.tg as u64, st.eptr as u64, p.one as u64,
                     s.xq_dn as u64, st.perm as u64, s.eo as u64, p.n640 as u64, p.one as u64, gs_dn]);
+                }
+                if pa {
+                    cuda::event_record(self.pa_ev_done[gi % 2], cs);
+                }
             }
             launch_v(k.f("acc_combo"), (H / 256) as u32, t as u32, 1, 256, &[
                 s.eo as u64, s.rwts as u64, s.moe_out as u64]);
@@ -3218,6 +3304,14 @@ impl Drop for Engine {
                 cuda::stream_destroy(tr.stream);
             }
             for e in self.pf_ev_filled.iter().chain(self.pf_ev_done.iter()) {
+                cuda::event_destroy(*e);
+            }
+            if !self.pa_stream.is_null() {
+                cuda::stream_sync(self.pa_stream);
+                cuda::stream_destroy(self.pa_stream);
+            }
+            cuda::event_destroy(self.pa_ev_plan);
+            for e in self.pa_ev_filled.iter().chain(self.pa_ev_done.iter()) {
                 cuda::event_destroy(*e);
             }
             for d in self.pf_ring_gu.iter_mut().chain(self.pf_ring_dn.iter_mut()) {

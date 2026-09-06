@@ -12,6 +12,7 @@ engine/target_rel/
 engine/target_probe/
 engine/target_smp/
 engine/target_pol/
+engine/target_pf/
 probes/target/
 handoff-bench/target/
 # python

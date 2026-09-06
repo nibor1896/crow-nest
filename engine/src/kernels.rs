@@ -1904,7 +1904,7 @@ extern "C" __global__ void stage_tiles(const int4* __restrict__ tiles, const int
     int4 tl = tiles[ti];
     int e = tl.x;
     int which = blockIdx.y;
-    int slot = tl.w & 0xFFFF;
+    int slot = (tl.w & 0xFFFF) + ((tg_p[1] > 1) ? ((*group_p) & 1) * (*tg_p) : 0); // CROW_PF_ASYNC: slot set per group parity
     bool first = (tl.w >> 16) & 1;
     bool cold = !((bitmap[e >> 5] >> (e & 31)) & 1u);
     size_t bytes = (size_t)(which ? *dn_bytes_p : *gu_bytes_p);
@@ -1914,6 +1914,7 @@ extern "C" __global__ void stage_tiles(const int4* __restrict__ tiles, const int
         eptr[ti * 2 + which] = cold ? (unsigned long long)dst : (unsigned long long)src;
     }
     if (!cold || !first) return;
+    if (tg_p[2] >= 2) return; // CROW_PF_ASYNC=2: the copy engine stages (host memcpys ahead on the side stream); =3 diagnostic, no copy
     // copy-engine prefetch (A-P3b): the layer's whole pinned cold slab was
     // DMA'd into a VRAM ring on a side stream; read the expert from there
     // (same offset) instead of pulling it over PCIe here
@@ -2358,7 +2359,7 @@ extern "C" __global__ void stage_tiles_lb(const int4* __restrict__ tiles, const 
     int4 tl = tiles[ti];
     int e = tl.x;
     int which = blockIdx.y;
-    int slot = tl.w & 0xFFFF;
+    int slot = (tl.w & 0xFFFF) + ((tg_p[1] > 1) ? ((*group_p) & 1) * (*tg_p) : 0); // CROW_PF_ASYNC: slot set per group parity
     bool first = (tl.w >> 16) & 1;
     bool cold = !((bitmap[e >> 5] >> (e & 31)) & 1u);
     size_t bytes = (size_t)(which ? *dn_bytes_p : *gu_bytes_p);
@@ -2368,6 +2369,7 @@ extern "C" __global__ void stage_tiles_lb(const int4* __restrict__ tiles, const 
         eptr[ti * 2 + which] = cold ? (unsigned long long)dst : (unsigned long long)src;
     }
     if (!cold || !first) return;
+    if (tg_p[2] >= 2) return; // CROW_PF_ASYNC=2: the copy engine stages (host memcpys ahead on the side stream); =3 diagnostic, no copy
     const unsigned char* ring = which ? ring_dn : ring_gu;
     if (ring) src = ring + (src - (which ? pin_dn : pin_gu));
     int bits = *bits_p;
