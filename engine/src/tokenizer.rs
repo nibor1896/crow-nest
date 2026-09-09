@@ -36,7 +36,7 @@
 //!
 //! - string: `startswith`, `endswith`, `strip`, `lstrip`, `rstrip`, `lower`, `upper`.
 //! - string: `replace`, `split`, `splitlines`.
-//! - mapping: `items`, `get`.
+//! - mapping: `items`, `get`; `get` on a NON mapping stays `UnknownMethod`, as in Python.
 //! - `content.startswith('<tool_response>')` in the Qwen3 template is why this exists.
 //! - Anything else stays `ErrorKind::UnknownMethod`, so a silent wrong render is impossible.
 //!
@@ -47,12 +47,23 @@
 //! - `tojson`, `items`, `default`, `trim`, `string`, `safe` (`builtins`, `json`).
 //! - `loop_controls` enabled to mirror `jinja2.ext.loopcontrols` (this template does not use it).
 //!
+//! Key order of every JSON object the template renders (`tools`, later `tool_call.arguments`):
+//!
+//! | crate | feature | without it |
+//! |---|---|---|
+//! | `serde_json` | `preserve_order` | `Map` is a `BTreeMap`, `py_json` walks it SORTED |
+//! | `minijinja` | `preserve_order` | the value map is a `BTreeMap`, sorted BEFORE `tojson` runs |
+//!
+//! - Python renders INSERTION order, so both features are needed for oracle identical ids.
+//! - Measured: without them `parameters` renders `additionalProperties, properties, required, type`.
+//! - `a_tools_render_is_byte_identical_to_the_oracle` is the test that pins this.
+//!
 //! Load cost:
 //!
 //! - `tokenizer.json` is 12.8 MB; `global()` loads it once per process (`OnceLock`).
 //! - The chat template is compiled once into the owned `Environment`.
 
-use minijinja::value::from_args;
+use minijinja::value::{from_args, ValueKind};
 use minijinja::{Environment, Error as JErr, ErrorKind as JErrKind, State, Value as JVal};
 use serde_json::Value;
 use std::sync::OnceLock;
@@ -77,6 +88,9 @@ pub struct ChatTokenizer {
 ///
 /// - item separator `", "`, key separator `": "` (Python defaults, NOT compact).
 /// - non ASCII stays raw (`ensure_ascii=False`).
+/// - control characters are escaped `\uXXXX`, as `json.dumps` does.
+/// - key order is INSERTION order, from `serde_json`'s `preserve_order` feature.
+/// - without that feature the `Map` is a `BTreeMap` and `tools` would render sorted.
 /// - minijinja's own `tojson` is compact, so it is replaced.
 fn py_json(v: &Value, out: &mut String) {
     match v {
@@ -183,7 +197,9 @@ fn py_method(state: &State, value: &JVal, method: &str, args: &[JVal]) -> Result
             let _: () = from_args(args)?;
             return state.apply_filter("items", &[value.clone()]);
         }
-        "get" => {
+        // Python: only a mapping has .get. On a string, a list or none this must be LOUD,
+        // otherwise a template that diverges from Python renders a plausible wrong string.
+        "get" if value.kind() == ValueKind::Map => {
             let (k, d): (JVal, Option<JVal>) = from_args(args)?;
             let hit = value.get_item(&k).ok().filter(|v| !v.is_undefined());
             return Ok(hit.unwrap_or_else(|| d.unwrap_or_else(|| JVal::from(()))));
@@ -386,6 +402,45 @@ mod tests {
         assert_eq!(s, "[]");
     }
 
+    /// Provenance of `PY_JSON`: run once on 2026-09-09 with
+    ///   `.venv-oracle/Scripts/python.exe` (CPython 3.13.3), `PYTHONIOENCODING=utf-8`,
+    ///   `json.dumps({"groesse": "Groesse in Zoll", "ctrl": "ab\nc",
+    ///                "zoll": 27.5, "n": [1, 2.0]}, ensure_ascii=False)`
+    ///   with the two `groesse` spelled with the real umlaut and sharp s.
+    /// Covers: non ASCII raw, a control character escaped, an escaped newline,
+    /// a float, and an int next to a float in one array.
+    #[test]
+    fn py_json_matches_python_json_dumps_ensure_ascii_false() {
+        const PY_JSON: &str = "{\"gr\u{f6}\u{df}e\": \"Gr\u{f6}\u{df}e in Zoll\", \
+                               \"ctrl\": \"a\\u001fb\\nc\", \"zoll\": 27.5, \"n\": [1, 2.0]}";
+        let v = serde_json::json!({
+            "gr\u{f6}\u{df}e": "Gr\u{f6}\u{df}e in Zoll",
+            "ctrl": "a\u{1f}b\nc",
+            "zoll": 27.5,
+            "n": [1, 2.0]
+        });
+        let mut s = String::new();
+        py_json(&v, &mut s);
+        assert_eq!(s, PY_JSON);
+    }
+
+    #[test]
+    fn get_on_a_non_mapping_is_an_unknown_method_not_an_answer() {
+        let render = |src: &str, ctx: JVal| -> Result<String, JErr> {
+            let env = build_env(src.to_string()).expect("template compiles");
+            env.get_template(TEMPLATE_NAME)?.render(ctx)
+        };
+        // a mapping answers .get, so the callback is reachable at all
+        let m = JVal::from_serialize(serde_json::json!({ "a": 1 }));
+        let ok = render("{{ m.get('a') }}|{{ m.get('zz', 'dflt') }}", minijinja::context! { m })
+            .expect("get on a mapping answers");
+        assert_eq!(ok, "1|dflt");
+        // a string does not; Python raises AttributeError, this raises UnknownMethod
+        let e = render("{{ s.get('a') }}", minijinja::context! { s => "text" })
+            .expect_err("get on a string is loud");
+        assert_eq!(e.kind(), JErrKind::UnknownMethod, "error was {e:#}");
+    }
+
     #[test]
     fn ascii_round_trips_through_encode_and_decode() {
         let t = tk();
@@ -460,6 +515,121 @@ mod tests {
         assert!(s.contains("<tools>"));
         assert!(s.contains("get_weather"));
         assert!(s.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    /// the tools case the reviewer asked for: `parameters` has four keys in NON alphabetical
+    /// order (`type`, `properties`, `required`, `additionalProperties`) and a non ASCII
+    /// description, so a sorted `Map` renders a different string and different ids.
+    fn oracle_tools() -> Value {
+        serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "get_monitor",
+                "description": "Monitordaten",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "zoll": { "type": "number", "description": "Gr\u{f6}\u{df}e in Zoll" },
+                        "marke": { "type": "string" },
+                        "aktiv": { "type": "boolean" },
+                        "id": { "type": "integer" }
+                    },
+                    "required": ["zoll", "marke"],
+                    "additionalProperties": false
+                }
+            }
+        }])
+    }
+
+    /// Provenance of `ORACLE_RENDER` and `ORACLE_IDS`: run once on 2026-09-09 with
+    ///   `.venv-oracle/Scripts/python.exe` (CPython 3.13.3), `PYTHONIOENCODING=utf-8`,
+    ///   transformers 5.16.1,
+    ///   `AutoTokenizer.from_pretrained("models/Qwen3.8-Flash-Next-original")`
+    ///   `.apply_chat_template([{"role":"user","content":"Wie gross ist der Monitor?"}],`
+    ///   `    tools=TOOLS, add_generation_prompt=True, tokenize=False, enable_thinking=False)`
+    ///   and the same call with `tokenize=True` for the 322 ids.
+    ///   `TOOLS` is `oracle_tools()` above, key for key in that order;
+    ///   the two `gross` in the message and in the description carry the real sharp s.
+    /// Without `serde_json`'s `preserve_order` the `parameters` object renders
+    ///   `additionalProperties, properties, required, type` and both assertions fail.
+    #[test]
+    fn a_tools_render_is_byte_identical_to_the_oracle() {
+        let t = tk();
+        const ORACLE_RENDER: &str = concat!(
+            "<|im_start|>system\n",
+            "# Tools\n",
+            "\n",
+            "You have access to the following functions:\n",
+            "\n",
+            "<tools>\n",
+            "{\"type\": \"function\", \"function\": {\"name\": \"get_monitor\", \"description\": \"Monitordaten\", \"parameters\": {\"type\": \"object\", \"properties\": {\"zoll\": {\"type\": \"number\", \"description\": \"Gr\u{f6}\u{df}e in Zoll\"}, \"marke\": {\"type\": \"string\"}, \"aktiv\": {\"type\": \"boolean\"}, \"id\": {\"type\": \"integer\"}}, \"required\": [\"zoll\", \"marke\"], \"additionalProperties\": false}}}\n",
+            "</tools>\n",
+            "\n",
+            "If you choose to call a function ONLY reply in the following format with NO suffix:\n",
+            "\n",
+            "<tool_call>\n",
+            "<function=example_function_name>\n",
+            "<parameter=example_parameter_1>\n",
+            "value_1\n",
+            "</parameter>\n",
+            "<parameter=example_parameter_2>\n",
+            "This is the value for the second parameter\n",
+            "that can span\n",
+            "multiple lines\n",
+            "</parameter>\n",
+            "</function>\n",
+            "</tool_call>\n",
+            "\n",
+            "<IMPORTANT>\n",
+            "Reminder:\n",
+            "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n",
+            "- Required parameters MUST be specified\n",
+            "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n",
+            "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n",
+            "</IMPORTANT><|im_end|>\n",
+            "<|im_start|>user\n",
+            "Wie gro\u{df} ist der Monitor?<|im_end|>\n",
+            "<|im_start|>assistant\n",
+            "<think>\n",
+            "\n",
+            "</think>\n",
+            "\n",
+        );
+        const ORACLE_IDS: [u32; 322] = [
+            248045, 8678, 198, 2, 13455, 271, 2523, 599, 2528, 310, 279, 2614, 5568, 25, 271, 27,
+            15449, 29, 198, 4754, 1267, 763, 328, 1628, 487, 328, 1628, 763, 5046, 591, 763, 328,
+            447, 38780, 487, 328, 4532, 763, 328, 10772, 275, 526, 13128, 487, 328, 13390, 763,
+            5046, 1267, 763, 328, 1640, 487, 328, 12811, 763, 5046, 89, 935, 763, 5046, 1267, 763,
+            328, 3946, 487, 328, 4532, 763, 328, 6262, 76239, 303, 195643, 13933, 328, 5437, 432,
+            763, 5046, 1267, 763, 328, 889, 13933, 328, 71106, 763, 5046, 1267, 763, 328, 5925,
+            13933, 328, 306, 763, 5046, 1267, 763, 328, 11326, 8934, 2069, 328, 6081, 763, 4241,
+            89, 935, 487, 328, 5437, 432, 7664, 328, 34325, 7654, 763, 867, 72964, 198, 510, 15449,
+            29, 271, 2592, 488, 4992, 310, 1562, 264, 709, 25835, 9559, 303, 279, 2614, 3443, 440,
+            5486, 19900, 25, 271, 248058, 198, 27, 1628, 28, 8422, 8901, 1224, 29, 198, 27, 15704,
+            28, 8422, 24109, 62, 16, 29, 198, 927, 62, 16, 198, 510, 15704, 29, 198, 27, 15704, 28,
+            8422, 24109, 62, 17, 29, 198, 1919, 369, 279, 869, 364, 279, 2018, 5555, 198, 8761,
+            628, 9111, 198, 34493, 4965, 198, 510, 15704, 29, 198, 510, 1628, 29, 198, 248059, 271,
+            27, 95328, 29, 198, 92065, 25, 198, 12, 5534, 6526, 26834, 1732, 279, 5024, 3443, 25,
+            449, 8906, 361, 1628, 28, 1076, 1419, 1628, 29, 2424, 1902, 381, 23283, 2785, 220,
+            248058, 248059, 11535, 9212, 198, 12, 12296, 4868, 26834, 381, 5024, 198, 12, 1394,
+            1189, 3300, 9801, 31626, 364, 678, 709, 1562, 303, 5629, 3992, 54588, 279, 709, 1562,
+            11, 694, 4045, 1238, 198, 12, 1368, 1017, 369, 874, 709, 1562, 2420, 11, 4087, 279,
+            3296, 1040, 4472, 440, 678, 1428, 6337, 321, 635, 524, 3184, 279, 1156, 883, 709, 6526,
+            198, 510, 95328, 29, 248046, 198, 248045, 846, 198, 63614, 64468, 5810, 2607, 22784,
+            30, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271,
+        ];
+        let tools = oracle_tools();
+        let msg = user_message("Wie gro\u{df} ist der Monitor?");
+        let s = t.render_chat(&msg, Some(&tools), true, false).expect("tools render");
+        assert_eq!(s, ORACLE_RENDER);
+        // the key order the reviewer measured, spelled out so a regression names itself
+        assert!(s.contains(
+            "{\"type\": \"object\", \"properties\": {\"zoll\": {\"type\": \"number\", \
+             \"description\": \"Gr\u{f6}\u{df}e in Zoll\"}"
+        ));
+        let ids = t.encode_chat(&msg, Some(&tools), true, false).expect("tools encode");
+        assert_eq!(ids.len(), ORACLE_IDS.len());
+        assert_eq!(ids, ORACLE_IDS.to_vec());
     }
 
     #[test]

@@ -77,6 +77,22 @@
 //! - Per task the id count goes to stderr, so the gate log carries the ten lengths.
 //! - The subcommand returns before `cuda::Ctx::init`, so no CUDA context and no `.engine.lock`.
 //! - No Python process is started; `crow_nest_engine::tokenizer` is the whole path.
+//!
+//! Exit codes of `serve tokenize`:
+//!
+//! | code | meaning |
+//! |---|---|
+//! | 0 | ids written (`--file`) or printed (`--text`) |
+//! | 2 | usage: bad, missing, doubled or conflicting arguments |
+//! | 3 | tokenizer load failed (`tokenizer.json` or `tokenizer_config.json`) |
+//! | 4 | IO or encode: prompt file unreadable, not JSON, wrong shape, encode failed, output unwritable |
+//!
+//! Start of `serve` (no subcommand):
+//!
+//! - The tokenizer is warmed up right after argument parsing, BEFORE `cuda::Ctx::init`.
+//! - A missing or broken tokenizer therefore fails in a second, not after the engine load.
+//! - Warm-up failure prints the error plus both paths and exits 3.
+//! - Warm-up success logs the two loaded paths, one stderr line each.
 
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::Engine;
@@ -210,8 +226,10 @@ fn parse_tokenize(rest: &[String]) -> Result<Tok, String> {
     }
 }
 
-/// - `{id: text}` and `[{"id": ..., "text": ...}]` both give the same ordered pairs
-/// - the order of the file is kept, so the gate log reads in file order
+/// - `{id: text}` and `[{"id": ..., "text": ...}]` both give the same pairs
+/// - array shape: the array order
+/// - object shape: the order the keys stand in the file (`serde_json` feature `preserve_order`)
+/// - without that feature the object shape would come back sorted by key
 fn prompts_from_json(v: &serde_json::Value) -> Result<Vec<(String, String)>, String> {
     if let Some(a) = v.as_array() {
         let mut out = Vec::with_capacity(a.len());
@@ -562,6 +580,23 @@ fn main() {
         }
     };
 
+    // #25 A3: warm up the tokenizer BEFORE the CUDA context and before Engine::load.
+    // A missing or broken tokenizer must fail in a second, not after the engine is pinned.
+    let (tok_path, tok_cfg) = crow_nest_engine::tokenizer::default_paths();
+    match crow_nest_engine::tokenizer::global() {
+        Ok(tk) => {
+            let (tp, cp) = tk.paths();
+            eprintln!("[serve] tokenizer {tp}");
+            eprintln!("[serve] chat template {cp}");
+        }
+        Err(e) => {
+            eprintln!("[serve] {e}");
+            eprintln!("[serve] tokenizer {tok_path}");
+            eprintln!("[serve] chat template {tok_cfg}");
+            std::process::exit(3);
+        }
+    }
+
     let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| DEFAULT_CNQ.into());
     let sidecar = std::env::var("CROW_HOTSETS").unwrap_or_else(|_| DEFAULT_HOTSETS.into());
     let mut cnq = Cnq::open(&cnq_path);
@@ -728,11 +763,19 @@ mod tests {
 
     #[test]
     fn both_prompt_file_shapes_give_the_same_pairs() {
-        // docs/ten-task-prompts-crowlab.json is {id: text}
+        // docs/ten-task-prompts-crowlab.json is {id: text}; with serde_json's preserve_order
+        // the object comes back in FILE order, not sorted by key (t2 stands first here)
         let obj = serde_json::json!({ "t2-write": "b", "t1-read": "a" });
         assert_eq!(
             prompts_from_json(&obj).unwrap(),
-            vec![("t1-read".to_string(), "a".to_string()), ("t2-write".to_string(), "b".to_string())]
+            vec![("t2-write".to_string(), "b".to_string()), ("t1-read".to_string(), "a".to_string())]
+        );
+        // the same shape parsed from bytes, so this pins the parser, not just the json! macro
+        let parsed: serde_json::Value =
+            serde_json::from_str(r#"{"t2-write": "b", "t1-read": "a"}"#).unwrap();
+        assert_eq!(
+            prompts_from_json(&parsed).unwrap(),
+            vec![("t2-write".to_string(), "b".to_string()), ("t1-read".to_string(), "a".to_string())]
         );
         // decode_out/ten-tasks.json is the parity harness array
         let arr = serde_json::json!([

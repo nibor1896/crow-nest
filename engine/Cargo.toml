@@ -8,12 +8,19 @@ publish = false
 # residency (#8), three-state manager (#9) and the end-to-end decode (#11) live here.
 
 [dependencies]
-serde_json = "1"
+# preserve_order (#25 A3 fix): serde_json's Map is a BTreeMap by default, so every JSON object
+# would render with SORTED keys while Python renders INSERTION order. The chat template puts
+# `tools` (and later `tool_call.arguments`) through `tojson`, so sorted keys give different ids
+# than the oracle. With this feature the Map is an IndexMap and key order is insertion order,
+# for every JSON this engine writes. No code in engine/src depends on sorted key order.
+serde_json = { version = "1", features = ["preserve_order"] }
 cudarc = { version = "=0.19.9", features = ["cuda-13030", "dynamic-loading", "nvrtc"] }
 libloading = "0.8"
 # A3 (#25): in-engine tokenizer and chat template, ids identical to tokenize_ids.py --chat
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
-minijinja = { version = "2.24.0", features = ["json", "loop_controls", "loader", "unicode"] }
+# preserve_order here too: minijinja's own value map is a BTreeMap by default, so the tools
+# object is already sorted BEFORE serde_json ever sees it again in the tojson filter.
+minijinja = { version = "2.24.0", features = ["json", "loop_controls", "loader", "unicode", "preserve_order"] }
 
 [[bin]]
 name = "states"
