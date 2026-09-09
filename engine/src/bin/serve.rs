@@ -119,7 +119,7 @@
 //! | field | A4 behaviour |
 //! |---|---|
 //! | `messages` | required, non empty array, every entry needs a string `role` |
-//! | `stream` | `true` streams; `false` or absent answers 501 (A5) |
+//! | `stream` | `true` streams; `false` or absent answers 501 (owner: a later task) |
 //! | `max_tokens` | default 1024, capped at 32768 |
 //! | `model` | echoed into every chunk, default `crow-nest` |
 //! | `chat_template_kwargs.enable_thinking` | template variable, default false |
@@ -186,6 +186,17 @@
 //!   `decode_step`; llama-server has the same offset and Crow's reader expects it.
 //! - Every rate is 0.0 when its ms is 0, negative or not finite; no NaN can reach the wire
 //!   (`serde_json` turns a non finite float into `null`).
+//!
+//! Two decode rates, on purpose (#27 doc):
+//!
+//! | place | formula | why |
+//! |---|---|---|
+//! | stderr `[chat] ... decode X ms, Y tok/s` | `(gen - 1) / decode_ms * 1000` | honest decode rate: `decode_ms` times the `decode_step` calls only, and the token `prefill` returned cost none of them |
+//! | wire `timings.predicted_per_second` | `gen / decode_ms * 1000` | llama-server convention: `predicted_n` counts the prefill token too, and Crow's reader expects that ratio |
+//!
+//! - Same `decode_ms` in both, different numerator; the wire number is the higher one.
+//! - The gap is one token, so it shrinks with the answer length (1 of 1024 = 0.1 %).
+//! - Do not "fix" one to match the other: the log would lie, or Crow's reader would.
 //!
 //! Incremental detokenization:
 //!
@@ -957,6 +968,12 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
         let _ = sse_send(stream, &sse_frame(&last)) && sse_send(stream, SSE_DONE);
     }
 
+    // #27 doc: the tok/s below is (gen - 1) / decode_ms, the wire's
+    // `timings.predicted_per_second` is gen / decode_ms. Both are correct for what they name:
+    // - `decode_ms` is the wall of the `decode_step` calls only (gen - 1 of them).
+    // - The log therefore divides by gen - 1: the honest decode rate, prefill token excluded.
+    // - The wire follows llama-server, where `predicted_n` counts the prefill token as well.
+    // - Making the two equal would either mislabel the log or break Crow's reader.
     eprintln!(
         "[chat] prompt {} tok, generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {content_chunks}, usage {}, timings {}{}",
         ids.len(),
