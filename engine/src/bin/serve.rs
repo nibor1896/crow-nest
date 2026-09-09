@@ -1,12 +1,13 @@
 //! #24 serve: the HTTP face of the engine (spec section 7).
 //!
-//! Endpoints (A2 skeleton, no chat endpoint yet):
+//! Endpoints:
 //!
 //! - `GET /health` answers `{"status":"ok"}`.
 //! - `GET /props` answers the operating point as a JSON document.
 //! - `/props` field names mirror llama-server, so Crow's readers work unchanged.
 //! - Crow readers served: `check_endpoint`, `fetch_n_ctx`, `fetch_model_name`.
 //! - Crow readers served: `refuse_images`, `server_model_path`.
+//! - `POST /v1/chat/completions` streams the answer as SSE (#26 A4).
 //! - Anything else answers 404 with a JSON body.
 //!
 //! Connection handling:
@@ -93,13 +94,64 @@
 //! - A missing or broken tokenizer therefore fails in a second, not after the engine load.
 //! - Warm-up failure prints the error plus both paths and exits 3.
 //! - Warm-up success logs the two loaded paths, one stderr line each.
+//!
+//! `POST /v1/chat/completions` (#26 A4), request body:
+//!
+//! | field | A4 behaviour |
+//! |---|---|
+//! | `messages` | required, non empty array, every entry needs a string `role` |
+//! | `stream` | `true` streams; `false` or absent answers 501 (A5) |
+//! | `max_tokens` | default 1024, capped at 32768 |
+//! | `model` | echoed into every chunk, default `crow-nest` |
+//! | `chat_template_kwargs.enable_thinking` | template variable, default false |
+//! | `temperature`, `top_p`, `min_p`, `top_k` | ACCEPTED AND IGNORED, A4 is greedy (A6 samples) |
+//! | `tools` | ACCEPTED AND IGNORED, the render carries `messages` only (A7) |
+//! | `stream_options`, `timings_per_token` | ACCEPTED AND IGNORED (A5 adds usage and timings) |
+//!
+//! Rendering and generation:
+//!
+//! - `tokenizer::render_chat(messages, None, add_generation_prompt=true, enable_thinking)`.
+//! - Greedy decode: `Engine::prefill` gives the first id, `Engine::decode_step` the rest.
+//! - Stops on `sample::EOS_IDS` (`finish_reason` `stop`) or at `max_tokens` (`length`).
+//! - `prompt + max_tokens` over `n_ctx` answers 413 before any GPU work.
+//!
+//! Stream shape (llama-server / OpenAI, `crow_core.py:4831-4877`):
+//!
+//! | order | line |
+//! |---|---|
+//! | 1 | `data: {... "choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}` |
+//! | 2..n | `data: {... "delta":{"content":"..."},"finish_reason":null}` |
+//! | n+1 | `data: {... "delta":{},"finish_reason":"stop"}` |
+//! | n+2 | `data: [DONE]` |
+//!
+//! - Headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: close`.
+//! - No `Content-Length` and no chunked framing: the body is close delimited.
+//! - Every frame is flushed on its own; one token can never wait for the next.
+//!
+//! Incremental detokenization:
+//!
+//! - The accumulated generated ids are decoded after every token.
+//! - Only the new byte suffix is sent, so the text arrives exactly once.
+//! - A tail that is not a whole character is HELD BACK, not sent.
+//! - The byte level decoder renders an incomplete UTF-8 sequence as U+FFFD.
+//! - No chunk therefore carries a replacement character from a split token.
+//! - Cost: one decode of the whole answer per token, microseconds against ms of GPU.
+//!
+//! One conversation at a time (M1):
+//!
+//! - `Engine::reset_to_zero` runs before every prefill, so request k equals a fresh process.
+//! - The reset field list and its evidence live in `engine/src/reset.rs`.
+//! - A write error aborts the generation loop; the next request resets the state anyway.
+//! - One stderr line per request: prompt tokens, generated tokens, prefill ms, decode ms.
+//! - One stderr line per request with the generated ids, for the A4 identity gate.
 
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::Engine;
 use crow_nest_engine::geo::{apply_adapt_policy, Config, CONTEXT_FLOOR};
+use crow_nest_engine::sample::EOS_IDS;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_PORT: u16 = 8099;
 const DEFAULT_CNQ: &str = "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq";
@@ -112,6 +164,14 @@ const IO_TIMEOUT_SECS: u64 = 10;
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// declared `Content-Length`, 16 MiB; over it the answer is 413
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// `max_tokens` when the request carries none
+const DEFAULT_MAX_TOKENS: usize = 1024;
+/// ceiling for `max_tokens`, so one request cannot hold the process forever
+const MAX_MAX_TOKENS: usize = 32768;
+/// the last line of every stream
+const SSE_DONE: &str = "data: [DONE]
+
+";
 
 // ---------------------------------------------------------------- pure parts
 
@@ -122,15 +182,18 @@ enum Route {
     Health,
     /// `GET /props`
     Props,
+    /// `POST /v1/chat/completions` (#26 A4)
+    Chat,
     /// everything else, a wrong method on a known path included
     NotFound,
 }
 
-/// the whole dispatch table of A2, pure so the test can drive it
+/// the whole dispatch table, pure so the test can drive it
 fn route(method: &str, path: &str) -> Route {
     match (method, path) {
         ("GET", "/health") => Route::Health,
         ("GET", "/props") => Route::Props,
+        ("POST", "/v1/chat/completions") => Route::Chat,
         _ => Route::NotFound,
     }
 }
@@ -390,13 +453,307 @@ fn props_json(model_path: &str, n_ctx: usize, prompt_chunk: usize) -> serde_json
 
 fn not_found_json(path: &str) -> serde_json::Value {
     serde_json::json!({
-        "error": { "code": 404, "message": format!("no route {path} (serve answers GET /health, GET /props)") }
+        "error": { "code": 404, "message": format!("no route {path} (serve answers GET /health, GET /props, POST /v1/chat/completions)") }
     })
 }
 
 /// flat error document for 400, 413, 431 and 501
 fn error_json(msg: &str) -> serde_json::Value {
     serde_json::json!({ "error": msg })
+}
+
+// --------------------------------------------- chat completions (#26 A4)
+
+/// the fields of a `POST /v1/chat/completions` body that A4 acts on
+#[derive(Debug, Clone, PartialEq)]
+struct ChatReq {
+    /// echoed into every chunk's `model`
+    model: String,
+    /// the OpenAI message array, handed to `render_chat` unchanged
+    messages: serde_json::Value,
+    /// `false` (or absent) answers 501 in A4
+    stream: bool,
+    /// generation budget, `DEFAULT_MAX_TOKENS` when absent
+    max_tokens: usize,
+    /// `chat_template_kwargs.enable_thinking`, a template variable
+    enable_thinking: bool,
+}
+
+/// - the request body, as Crow sends it (`crow_core.py:4672-4700`)
+/// - unknown fields are accepted and ignored, as llama-server does
+/// - `temperature`, `top_p`, `min_p`, `top_k`, `tools` fall under that rule in A4
+/// - `Err` carries the message for the 400 body
+fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
+    let doc: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("body is not JSON: {e}"))?;
+    let obj = doc
+        .as_object()
+        .ok_or_else(|| "body is not a JSON object".to_string())?;
+    let messages = obj
+        .get("messages")
+        .ok_or_else(|| "no messages in the body".to_string())?;
+    let arr = messages
+        .as_array()
+        .ok_or_else(|| "messages is not an array".to_string())?;
+    if arr.is_empty() {
+        return Err("messages is empty".to_string());
+    }
+    for (i, m) in arr.iter().enumerate() {
+        if !m.get("role").map(|r| r.is_string()).unwrap_or(false) {
+            return Err(format!("message {i} has no string role"));
+        }
+    }
+    let stream = match obj.get("stream") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| "stream is not a boolean".to_string())?,
+    };
+    let max_tokens = match obj.get("max_tokens") {
+        None | Some(serde_json::Value::Null) => DEFAULT_MAX_TOKENS,
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .ok_or_else(|| "max_tokens is not a positive integer".to_string())?;
+            if n == 0 {
+                return Err("max_tokens is 0".to_string());
+            }
+            (n as usize).min(MAX_MAX_TOKENS)
+        }
+    };
+    let enable_thinking = obj
+        .get("chat_template_kwargs")
+        .and_then(|k| k.get("enable_thinking"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let model = obj
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("crow-nest")
+        .to_string();
+    Ok(ChatReq { model, messages: messages.clone(), stream, max_tokens, enable_thinking })
+}
+
+/// one `chat.completion.chunk`, the only object shape this endpoint streams
+fn chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    delta: serde_json::Value,
+    finish: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": match finish {
+                Some(r) => serde_json::Value::String(r.to_string()),
+                None => serde_json::Value::Null,
+            },
+        }],
+    })
+}
+
+/// first chunk: the role, no content (`crow_core.py:4877` reads content only)
+fn chunk_role(id: &str, created: u64, model: &str) -> serde_json::Value {
+    chunk(id, created, model, serde_json::json!({ "role": "assistant" }), None)
+}
+
+/// a content delta chunk, one per emitted text piece
+fn chunk_content(id: &str, created: u64, model: &str, text: &str) -> serde_json::Value {
+    chunk(id, created, model, serde_json::json!({ "content": text }), None)
+}
+
+/// last chunk before `[DONE]`: empty delta, the finish reason
+fn chunk_finish(id: &str, created: u64, model: &str, reason: &str) -> serde_json::Value {
+    chunk(id, created, model, serde_json::json!({}), Some(reason))
+}
+
+/// one SSE event: `data: <compact json>` plus the blank line that ends it
+fn sse_frame(doc: &serde_json::Value) -> String {
+    format!("data: {doc}\n\n")
+}
+
+/// - `full` is `decode` over EVERY generated id so far
+/// - `emitted` is how many BYTES of `full` already left as content
+/// - `None` holds the delta back until the tail is a whole character
+/// - the byte level decoder renders an incomplete UTF-8 sequence as U+FFFD
+/// - so no chunk this returns ends in a replacement character
+fn next_delta(full: &str, emitted: usize) -> Option<&str> {
+    if full.len() <= emitted || !full.is_char_boundary(emitted) {
+        return None;
+    }
+    if full.ends_with(char::REPLACEMENT_CHARACTER) {
+        return None;
+    }
+    Some(&full[emitted..])
+}
+
+/// write one SSE frame and flush it; `false` means the client is gone
+fn sse_send(stream: &mut TcpStream, text: &str) -> bool {
+    match stream.write_all(text.as_bytes()).and_then(|_| stream.flush()) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[chat] write failed, aborting the generation: {e}");
+            false
+        }
+    }
+}
+
+/// a JSON response plus its status, so the caller can log one label
+fn respond_json(
+    stream: &mut TcpStream,
+    status: &'static str,
+    doc: &serde_json::Value,
+) -> &'static str {
+    if let Err(e) = respond(stream, status, &doc.to_string()) {
+        eprintln!("[serve] response write failed: {e}");
+    }
+    status
+}
+
+/// - `POST /v1/chat/completions`
+/// - every rejection happens BEFORE the first stream byte, as a JSON response
+/// - the return value is the status for the access log line
+fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static str {
+    let req = match parse_chat(body) {
+        Ok(r) => r,
+        Err(e) => return respond_json(stream, "400 Bad Request", &error_json(&e)),
+    };
+    if !req.stream {
+        return respond_json(
+            stream,
+            "501 Not Implemented",
+            &error_json("stream:false is not implemented yet (A5)"),
+        );
+    }
+    let tk = match crow_nest_engine::tokenizer::global() {
+        Ok(t) => t,
+        Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(e)),
+    };
+    // A4 ignores `tools`: the render carries the messages only
+    let ids = match tk.encode_chat(&req.messages, None, true, req.enable_thinking) {
+        Ok(v) => v,
+        Err(e) => return respond_json(stream, "400 Bad Request", &error_json(&e)),
+    };
+    if ids.is_empty() {
+        return respond_json(stream, "400 Bad Request", &error_json("the rendered prompt is empty"));
+    }
+    if ids.len() + req.max_tokens > srv.n_ctx {
+        let m = format!(
+            "prompt {} + max_tokens {} over n_ctx {}",
+            ids.len(),
+            req.max_tokens,
+            srv.n_ctx
+        );
+        return respond_json(stream, "413 Payload Too Large", &error_json(&m));
+    }
+    chat_stream(stream, srv, &req, &ids)
+}
+
+/// - prefill, then greedy decode, one flushed SSE frame per emitted delta
+/// - the engine is reset to position 0 first, so request k equals a fresh process
+/// - a write error breaks the loop; the engine stays dirty and the next reset cleans it
+fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]) -> &'static str {
+    let tk = match crow_nest_engine::tokenizer::global() {
+        Ok(t) => t,
+        Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(e)),
+    };
+    srv.seq += 1;
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let id = format!("chatcmpl-{created}-{}", srv.seq);
+    let model = req.model.clone();
+
+    const HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    if !sse_send(stream, HEAD) {
+        return "200 OK (client gone)";
+    }
+
+    let prompt: Vec<i64> = ids.iter().map(|&v| v as i64).collect();
+    let t_pre = Instant::now();
+    // unsafe: engine kernels; the CUDA context and engine/.engine.lock are this process's
+    let mut next = unsafe {
+        srv.eng.reset_to_zero();
+        srv.eng.prefill(srv.cnq, &prompt, None)
+    };
+    let prefill_ms = t_pre.elapsed().as_secs_f64() * 1e3;
+
+    let mut aborted = !sse_send(stream, &sse_frame(&chunk_role(&id, created, &model)));
+
+    let t_dec = Instant::now();
+    let mut out: Vec<u32> = Vec::with_capacity(req.max_tokens);
+    // bytes of the accumulated decode that already left as content
+    let mut emitted = 0usize;
+    let mut content_chunks = 0usize;
+    let mut finish = "length";
+    let mut decode_ms = 0.0f64;
+    if !aborted {
+        for i in 0..req.max_tokens {
+            if EOS_IDS.contains(&next) {
+                finish = "stop";
+                break;
+            }
+            out.push(next as u32);
+            let full = match tk.decode(&out) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[chat] detokenize failed: {e}");
+                    String::new()
+                }
+            };
+            if let Some(delta) = next_delta(&full, emitted) {
+                if !sse_send(stream, &sse_frame(&chunk_content(&id, created, &model, delta))) {
+                    aborted = true;
+                    break;
+                }
+                content_chunks += 1;
+                emitted = full.len();
+            }
+            // the budget is spent: no decode_step whose token nobody reads
+            if i + 1 == req.max_tokens {
+                break;
+            }
+            next = unsafe { srv.eng.decode_step(srv.cnq, next as i64) };
+        }
+        decode_ms = t_dec.elapsed().as_secs_f64() * 1e3;
+    }
+
+    // the tail the hold back kept (a never completed sequence, or a real U+FFFD)
+    if !aborted {
+        let full = tk.decode(&out).unwrap_or_default();
+        if full.len() > emitted && full.is_char_boundary(emitted) {
+            if sse_send(stream, &sse_frame(&chunk_content(&id, created, &model, &full[emitted..]))) {
+                content_chunks += 1;
+            } else {
+                aborted = true;
+            }
+        }
+    }
+    if !aborted {
+        let _ = sse_send(stream, &sse_frame(&chunk_finish(&id, created, &model, finish)))
+            && sse_send(stream, SSE_DONE);
+    }
+
+    let gen = out.len();
+    eprintln!(
+        "[chat] prompt {} tok, generated {gen} tok, prefill {prefill_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {content_chunks}{}",
+        ids.len(),
+        (gen.saturating_sub(1)) as f64 * 1000.0 / decode_ms.max(1e-9),
+        if aborted { ", client gone" } else { "" }
+    );
+    eprintln!("[chat] ids {out:?}");
+    if aborted {
+        "200 OK (client gone)"
+    } else {
+        "200 OK (text/event-stream)"
+    }
 }
 
 // ---------------------------------------------------------------- the socket
@@ -504,7 +861,23 @@ fn read_head(stream: &TcpStream) -> std::io::Result<Head> {
     read_head_from(&mut r)
 }
 
-fn serve_one(stream: &mut TcpStream, model_path: &str, n_ctx: usize, prompt_chunk: usize) {
+/// what a connection needs beyond the socket: the engine, its container, the static props
+struct Srv<'a> {
+    /// the one loaded engine of this process; every chat request resets it first
+    eng: &'a mut Engine,
+    /// the container handle `prefill` fills PLE rows from
+    cnq: &'a mut Cnq,
+    /// `/props` `model_path`
+    model_path: &'a str,
+    /// `/props` `n_ctx`, read back from the loaded states
+    n_ctx: usize,
+    /// `/props` `prompt_chunk`, pinned for the process
+    prompt_chunk: usize,
+    /// per process request counter, the tail of every chunk `id`
+    seq: u64,
+}
+
+fn serve_one(stream: &mut TcpStream, srv: &mut Srv) {
     let t = Duration::from_secs(IO_TIMEOUT_SECS);
     if let Err(e) = stream.set_read_timeout(Some(t)) {
         eprintln!("[serve] no read timeout on this connection, closing: {e}");
@@ -547,12 +920,23 @@ fn serve_one(stream: &mut TcpStream, model_path: &str, n_ctx: usize, prompt_chun
         ),
         Head::Req { method, target, body } => {
             let path = route_path(&target).to_string();
-            let (status, doc) = match route(&method, &path) {
-                Route::Health => ("200 OK", serde_json::json!({ "status": "ok" })),
-                Route::Props => ("200 OK", props_json(model_path, n_ctx, prompt_chunk)),
-                Route::NotFound => ("404 Not Found", not_found_json(&path)),
-            };
-            (format!("{method} {target} (body {} bytes)", body.len()), status, doc)
+            let label = format!("{method} {target} (body {} bytes)", body.len());
+            match route(&method, &path) {
+                // the chat route writes its own response: SSE, or a JSON error
+                Route::Chat => {
+                    let status = chat_route(stream, srv, &body);
+                    eprintln!("[serve] {label} -> {status}");
+                    let _ = stream.shutdown(Shutdown::Write);
+                    return;
+                }
+                Route::Health => (label, "200 OK", serde_json::json!({ "status": "ok" })),
+                Route::Props => (
+                    label,
+                    "200 OK",
+                    props_json(srv.model_path, srv.n_ctx, srv.prompt_chunk),
+                ),
+                Route::NotFound => (label, "404 Not Found", not_found_json(&path)),
+            }
         }
     };
 
@@ -614,6 +998,8 @@ fn main() {
     let (eng, _rep) = unsafe {
         Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| eprintln!("[load] {m}"))
     };
+    // `Cnq::open` handed the container to the loader; the engine keeps a raw
+    // pointer to it (`Engine::cnq`), and prefill needs it back as `&mut`
     let n_ctx = eng.st.context;
     let prompt_chunk = eng.cfg.prompt_chunk;
 
@@ -632,12 +1018,22 @@ fn main() {
     };
     eprintln!("[serve] listening on http://{addr} (blocking, one request at a time)");
 
+    let mut eng = eng;
+    let mut srv = Srv {
+        eng: &mut eng,
+        cnq: &mut cnq,
+        model_path: &cnq_path,
+        n_ctx,
+        prompt_chunk,
+        seq: 0,
+    };
     for conn in listener.incoming() {
         match conn {
-            Ok(mut s) => serve_one(&mut s, &cnq_path, n_ctx, prompt_chunk),
+            Ok(mut s) => serve_one(&mut s, &mut srv),
             Err(e) => eprintln!("[serve] accept failed: {e}"),
         }
     }
+    drop(srv);
     drop(eng);
 }
 
@@ -689,7 +1085,10 @@ mod tests {
         // non GET method, on a known path and on a future one
         assert_eq!(d("POST /health HTTP/1.1\r\n"), Route::NotFound);
         assert_eq!(d("HEAD /props HTTP/1.1\r\n"), Route::NotFound);
-        assert_eq!(d("POST /v1/chat/completions HTTP/1.1\r\n"), Route::NotFound);
+        assert_eq!(d("POST /v1/chat/completions HTTP/1.1\r\n"), Route::Chat);
+        assert_eq!(d("POST /v1/chat/completions?x=1 HTTP/1.1\r\n"), Route::Chat);
+        // the chat path answers POST only
+        assert_eq!(d("GET /v1/chat/completions HTTP/1.1\r\n"), Route::NotFound);
     }
 
     #[test]
@@ -803,6 +1202,151 @@ mod tests {
         assert_eq!(error_json("bad request")["error"], "bad request");
         assert_eq!(error_json("payload too large")["error"], "payload too large");
     }
+    // ------------------------------------------------ chat completions (#26 A4)
+
+    #[test]
+    fn chat_body_parses_messages_max_tokens_and_stream() {
+        // the body Crow sends (crow_core.py:4672-4700), trimmed to what A4 reads
+        let raw = br#"{"model":"crow-nest",
+            "messages":[{"role":"user","content":"Say the word ready."}],
+            "temperature":0,"top_p":0.95,"min_p":0.01,"stream":true,
+            "stream_options":{"include_usage":true},"timings_per_token":true,
+            "max_tokens":16}"#;
+        let r = parse_chat(raw).expect("the body parses");
+        assert_eq!(r.model, "crow-nest");
+        assert_eq!(r.max_tokens, 16);
+        assert!(r.stream);
+        assert!(!r.enable_thinking);
+        assert_eq!(r.messages[0]["content"], "Say the word ready.");
+
+        // defaults: no stream, no max_tokens, no model
+        let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+        assert_eq!(r.max_tokens, DEFAULT_MAX_TOKENS);
+        assert!(!r.stream);
+        assert_eq!(r.model, "crow-nest");
+
+        // the digest path sends chat_template_kwargs (crow_core.py:2969)
+        let r = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "chat_template_kwargs":{"enable_thinking":true}}"#,
+        )
+        .unwrap();
+        assert!(r.enable_thinking);
+
+        // max_tokens is capped, never trusted
+        let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":999999}"#)
+            .unwrap();
+        assert_eq!(r.max_tokens, MAX_MAX_TOKENS);
+
+        // tools and unknown sampler fields are accepted and ignored
+        let r = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "tools":[{"type":"function","function":{"name":"read"}}],"top_k":20}"#,
+        )
+        .unwrap();
+        assert_eq!(r.max_tokens, DEFAULT_MAX_TOKENS);
+
+        // rejections
+        assert!(parse_chat(b"not json").is_err());
+        assert!(parse_chat(b"[]").is_err());
+        assert!(parse_chat(br#"{"messages":[]}"#).is_err());
+        assert!(parse_chat(br#"{"model":"x"}"#).is_err());
+        assert!(parse_chat(br#"{"messages":"hi"}"#).is_err());
+        assert!(parse_chat(br#"{"messages":[{"content":"hi"}]}"#).is_err());
+        assert!(parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stream":"yes"}"#).is_err());
+        assert!(parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":0}"#).is_err());
+        assert!(parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":-1}"#).is_err());
+    }
+
+    #[test]
+    fn a_chunk_carries_exactly_what_crow_reads() {
+        // crow_core.py:4846 finish_reason, :4877 delta.content
+        let role = chunk_role("chatcmpl-1", 1_757_000_000, "crow-nest");
+        assert_eq!(role["object"], "chat.completion.chunk");
+        assert_eq!(role["id"], "chatcmpl-1");
+        assert_eq!(role["created"], 1_757_000_000u64);
+        assert_eq!(role["model"], "crow-nest");
+        assert_eq!(role["choices"][0]["index"], 0);
+        assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(role["choices"][0]["finish_reason"], serde_json::Value::Null);
+        assert!(role["choices"][0]["delta"].get("content").is_none());
+
+        let c = chunk_content("chatcmpl-1", 1, "crow-nest", " ready");
+        assert_eq!(c["choices"][0]["delta"]["content"], " ready");
+        assert_eq!(c["choices"][0]["finish_reason"], serde_json::Value::Null);
+
+        // the last chunk: empty delta, a finish reason, and only ONE of them exists
+        let f = chunk_finish("chatcmpl-1", 1, "crow-nest", "stop");
+        assert_eq!(f["choices"][0]["finish_reason"], "stop");
+        assert_eq!(f["choices"][0]["delta"], serde_json::json!({}));
+        assert_eq!(chunk_finish("i", 1, "m", "length")["choices"][0]["finish_reason"], "length");
+    }
+
+    #[test]
+    fn an_sse_frame_is_one_data_line_and_a_blank_line() {
+        let f = sse_frame(&chunk_content("id", 7, "m", "hi"));
+        assert!(f.starts_with("data: {"));
+        assert!(f.ends_with("\n\n"));
+        // exactly one event: one `data:` line, then the terminator
+        assert_eq!(f.matches("data: ").count(), 1);
+        assert_eq!(f.trim_end_matches('\n').matches('\n').count(), 0);
+        // a newline inside the content is escaped by the JSON writer, never raw
+        let f = sse_frame(&chunk_content("id", 7, "m", "a\nb"));
+        assert!(f.contains(r#""content":"a\nb""#));
+        assert_eq!(f.trim_end_matches('\n').matches('\n').count(), 0);
+        // the closing line of every stream
+        assert_eq!(SSE_DONE, "data: [DONE]\n\n");
+    }
+
+    #[test]
+    fn an_incomplete_utf8_tail_is_held_back() {
+        // "Gr" = 2 bytes, "u umlaut" = 2 bytes: a token split inside it decodes
+        // to a replacement character until the second byte arrives
+        assert_eq!(next_delta("Gr\u{FFFD}", 0), None);
+        assert_eq!(next_delta("Gr\u{00FC}", 0), Some("Gr\u{00FC}"));
+        // the next token continues the same string; only the new suffix goes out
+        assert_eq!(next_delta("Gr\u{00FC}\u{00DF}e", 4), Some("\u{00DF}e"));
+        // nothing new, nothing sent
+        assert_eq!(next_delta("Gr\u{00FC}", 4), None);
+        // never split a character, even if the caller asks for it
+        assert_eq!(next_delta("Gr\u{00FC}", 3), None);
+    }
+
+    #[test]
+    fn a_split_multibyte_token_never_reaches_a_chunk() {
+        // the real tokenizer, no GPU: an emoji is one 4 byte character whose
+        // byte level tokens can end mid sequence
+        // tests run from engine/, the model lives at the repository root
+        let t = "../models/Qwen3.8-Flash-Next-original/tokenizer.json";
+        let tk = crow_nest_engine::tokenizer::ChatTokenizer::load(
+            t,
+            &t.replace("tokenizer.json", "tokenizer_config.json"),
+        )
+        .expect("tokenizer loads");
+        let ids = tk.encode_raw("\u{1F985}\u{1F985}").expect("encode");
+        assert!(ids.len() >= 2, "the emoji pair must be more than one token: {ids:?}");
+        let mut emitted = 0usize;
+        let mut sent = String::new();
+        let mut held = 0usize;
+        for n in 1..=ids.len() {
+            let full = tk.decode(&ids[..n]).expect("decode");
+            match next_delta(&full, emitted) {
+                Some(d) => {
+                    assert!(
+                        !d.contains(char::REPLACEMENT_CHARACTER),
+                        "chunk {d:?} carries U+FFFD"
+                    );
+                    sent.push_str(d);
+                    emitted = full.len();
+                }
+                None => held += 1,
+            }
+        }
+        // at least one token was held back, and the text still arrived whole
+        assert!(held > 0, "no token was held back, the split was never exercised");
+        assert_eq!(sent, "\u{1F985}\u{1F985}");
+    }
+
     #[test]
     fn a_request_line_over_the_cap_stops_the_reader_at_the_cap() {
         let mut raw = b"GET /".to_vec();
