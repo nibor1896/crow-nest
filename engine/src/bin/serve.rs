@@ -3,23 +3,41 @@
 //! Endpoints (A2 skeleton, no chat endpoint yet):
 //!
 //! - `GET /health` answers `{"status":"ok"}`.
-//! - `GET /props` answers `model_path`, `model`, `n_ctx`,
-//!   `default_generation_settings.n_ctx`, `modalities.vision` (llama-server field
-//!   names, so Crow's `check_endpoint` / `fetch_n_ctx` / `fetch_model_name` /
-//!   `refuse_images` / `server_model_path` work unchanged).
+//! - `GET /props` answers the operating point as a JSON document.
+//! - `/props` field names mirror llama-server, so Crow's readers work unchanged.
+//! - Crow readers served: `check_endpoint`, `fetch_n_ctx`, `fetch_model_name`.
+//! - Crow readers served: `refuse_images`, `server_model_path`.
 //! - Anything else answers 404 with a JSON body.
+//!
+//! Connection handling:
+//!
+//! - Read and write timeout of 10 s on every accepted connection.
+//! - A timeout or read error logs one stderr line and closes that connection.
+//! - The accept loop continues after any single connection failed.
+//! - Head (request line plus headers) capped at 64 KiB total.
+//! - Over the head cap: 431 JSON, then close.
+//! - `Content-Length` is parsed case insensitively.
+//! - The body is read and discarded before the response is written.
+//! - Body capped at 16 MiB; over the cap: 413 JSON, then close.
+//! - A bodied POST to an unknown route therefore gets the 404 JSON, not a reset.
+//! - A garbage request line answers 400 JSON with `{"error":"bad request"}`.
+//! - A client that sent nothing is closed silently, without a response.
+//! - The write half is shut down after the response is flushed.
+//! - The parsed body is kept as `Vec<u8>` for A3 and A4; A2 routes ignore it.
 //!
 //! Operating point (M1 decisions, robin 2026-09-09):
 //!
-//! - Container default `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq`; `CROW_CNQ` overrides.
-//! - Hot sets default `decode_out/hotsets-M-longctx2100-n160.json`; `CROW_HOTSETS` overrides.
-//! - Prompt chunk pinned at 2048 for the whole process (the per prompt policy of
-//!   `geo::apply_chunk_policy` is NOT applied; this is `CROW_CHUNK=2048
-//!   CROW_CHUNK_AUTO=0` set programmatically before `Engine::load`).
+//! - Container default `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq`.
+//! - `CROW_CNQ` overrides the container path.
+//! - Hot sets default `decode_out/hotsets-M-longctx2100-n160.json`.
+//! - `CROW_HOTSETS` overrides the hot set sidecar.
+//! - Prompt chunk pinned at 2048 for the whole process.
+//! - The per prompt policy `geo::apply_chunk_policy` is NOT applied.
+//! - Same result as `CROW_CHUNK=2048 CROW_CHUNK_AUTO=0` before `Engine::load`.
 //! - Context `CONTEXT_FLOOR` (200,000), the operating point of `decode run`.
-//! - `n_ctx` is read back from the loaded states (`Engine::st.context`), never a constant.
-//! - Process wide defaults since d36353a need no env: `CROW_PF_ASYNC=2`, PF_TG 64,
-//!   PLE 128 MB, attention kernel attn_sel_s8l.
+//! - `n_ctx` is read back from the loaded states (`Engine::st.context`).
+//! - Process wide defaults since d36353a need no env variable.
+//! - Those defaults: `CROW_PF_ASYNC=2`, PF_TG 64, PLE 128 MB, attn_sel_s8l.
 //!
 //! Concurrency (constant 4: one binary, no runtime):
 //!
@@ -32,6 +50,11 @@
 //! - A second `serve` therefore exits non zero with the lock message.
 //! - The engine loads BEFORE the socket binds, so the lock speaks first.
 //!
+//! Unsafe surface:
+//!
+//! - `cuda::Ctx::init` and `Engine::load` are the only unsafe calls.
+//! - Argument parsing, the socket loop and the routes are safe code.
+//!
 //! Run:
 //!
 //! - `serve [--port <n>]` from the repository root (paths are repo relative).
@@ -40,16 +63,57 @@
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::Engine;
 use crow_nest_engine::geo::{apply_adapt_policy, Config, CONTEXT_FLOOR};
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::time::Duration;
 
 const DEFAULT_PORT: u16 = 8099;
 const DEFAULT_CNQ: &str = "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq";
 const DEFAULT_HOTSETS: &str = "decode_out/hotsets-M-longctx2100-n160.json";
 /// pinned for the process (M1): every request prefills at chunk 2048
 const SERVE_CHUNK: usize = 2048;
+/// read and write timeout per connection, so one stalled client cannot hold the loop
+const IO_TIMEOUT_SECS: u64 = 10;
+/// request line plus headers, 64 KiB total; over it the answer is 431
+const MAX_HEAD_BYTES: usize = 64 * 1024;
+/// declared `Content-Length`, 16 MiB; over it the answer is 413
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 // ---------------------------------------------------------------- pure parts
+
+/// the route a `(method, path)` pair dispatches to
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// `GET /health`
+    Health,
+    /// `GET /props`
+    Props,
+    /// everything else, a wrong method on a known path included
+    NotFound,
+}
+
+/// the whole dispatch table of A2, pure so the test can drive it
+fn route(method: &str, path: &str) -> Route {
+    match (method, path) {
+        ("GET", "/health") => Route::Health,
+        ("GET", "/props") => Route::Props,
+        _ => Route::NotFound,
+    }
+}
+
+/// what one connection sent, as far as the head reader could tell
+enum Head {
+    /// the client closed without sending a byte; no response is written
+    Empty,
+    /// there was a request line, but it is not HTTP; the answer is 400
+    Bad,
+    /// the head passed `MAX_HEAD_BYTES`; the answer is 431
+    HeadTooLarge,
+    /// the declared body passed `MAX_BODY_BYTES`; the answer is 413
+    BodyTooLarge(usize),
+    /// a well formed request; `body` is drained and kept for A3 and A4
+    Req { method: String, target: String, body: Vec<u8> },
+}
 
 /// `--port <n>` / `--port=<n>` out of the argument vector (argv[0] included).
 /// `Err` carries the message for the operator; missing flag = default port.
@@ -82,6 +146,16 @@ fn parse_request_line(line: &str) -> Option<(String, String)> {
         return None;
     }
     Some((method, target))
+}
+
+/// value of one header line when it carries `name`, matched case insensitively
+fn header_value<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let (k, v) = line.split_once(':')?;
+    if k.trim().eq_ignore_ascii_case(name) {
+        Some(v.trim())
+    } else {
+        None
+    }
 }
 
 /// request target without query string or fragment
@@ -119,6 +193,11 @@ fn not_found_json(path: &str) -> serde_json::Value {
     })
 }
 
+/// flat error document for 400, 413 and 431
+fn error_json(msg: &str) -> serde_json::Value {
+    serde_json::json!({ "error": msg })
+}
+
 // ---------------------------------------------------------------- the socket
 
 /// one response, HTTP/1.1 with Content-Length; the connection closes after it
@@ -132,44 +211,110 @@ fn respond(stream: &mut TcpStream, status: &str, body: &str) -> std::io::Result<
     stream.flush()
 }
 
-/// request line + headers; the headers are read to the blank line so the client
-/// never sees a reset before it finished writing
-fn read_head(stream: &TcpStream) -> std::io::Result<Option<(String, String)>> {
+/// Request line, headers and body of one connection.
+/// Headers are read up to the blank line, then the body is drained.
+/// Draining first is what lets a bodied POST see the 404 instead of a reset.
+fn read_head(stream: &TcpStream) -> std::io::Result<Head> {
     let mut r = BufReader::new(stream);
-    let mut first = String::new();
-    if r.read_line(&mut first)? == 0 {
-        return Ok(None);
+    let mut used = 0usize;
+
+    let mut first = Vec::new();
+    if r.read_until(b'\n', &mut first)? == 0 {
+        return Ok(Head::Empty);
     }
+    used += first.len();
+    if used > MAX_HEAD_BYTES {
+        return Ok(Head::HeadTooLarge);
+    }
+    let first = String::from_utf8_lossy(&first).into_owned();
+
+    let mut content_length = 0usize;
     loop {
-        let mut h = String::new();
-        if r.read_line(&mut h)? == 0 || h.trim().is_empty() {
+        let mut raw = Vec::new();
+        if r.read_until(b'\n', &mut raw)? == 0 {
             break;
         }
+        used += raw.len();
+        if used > MAX_HEAD_BYTES {
+            return Ok(Head::HeadTooLarge);
+        }
+        let line = String::from_utf8_lossy(&raw).into_owned();
+        if line.trim().is_empty() {
+            break;
+        }
+        if let Some(v) = header_value(&line, "content-length") {
+            content_length = v.parse::<usize>().unwrap_or(0);
+        }
     }
-    Ok(parse_request_line(&first))
+
+    if content_length > MAX_BODY_BYTES {
+        return Ok(Head::BodyTooLarge(content_length));
+    }
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        r.read_exact(&mut body)?;
+    }
+
+    match parse_request_line(&first) {
+        Some((method, target)) => Ok(Head::Req { method, target, body }),
+        None => Ok(Head::Bad),
+    }
 }
 
 fn serve_one(stream: &mut TcpStream, model_path: &str, n_ctx: usize, prompt_chunk: usize) {
+    let t = Duration::from_secs(IO_TIMEOUT_SECS);
+    if let Err(e) = stream.set_read_timeout(Some(t)) {
+        eprintln!("[serve] no read timeout on this connection, closing: {e}");
+        return;
+    }
+    if let Err(e) = stream.set_write_timeout(Some(t)) {
+        eprintln!("[serve] no write timeout on this connection, closing: {e}");
+        return;
+    }
+
     let head = match read_head(stream) {
-        Ok(Some(h)) => h,
-        Ok(None) => return,
+        Ok(h) => h,
         Err(e) => {
-            eprintln!("[serve] request read failed: {e}");
+            eprintln!("[serve] read failed or timed out after {IO_TIMEOUT_SECS}s, closing: {e}");
             return;
         }
     };
-    let (method, target) = head;
-    let path = route_path(&target).to_string();
-    let (status, body) = match (method.as_str(), path.as_str()) {
-        ("GET", "/health") => ("200 OK", serde_json::json!({ "status": "ok" })),
-        ("GET", "/props") => ("200 OK", props_json(model_path, n_ctx, prompt_chunk)),
-        _ => ("404 Not Found", not_found_json(&path)),
+
+    let (label, status, doc) = match head {
+        Head::Empty => return,
+        Head::Bad => (
+            "<no HTTP request line>".to_string(),
+            "400 Bad Request",
+            error_json("bad request"),
+        ),
+        Head::HeadTooLarge => (
+            format!("<head over {MAX_HEAD_BYTES} bytes>"),
+            "431 Request Header Fields Too Large",
+            error_json("request header fields too large"),
+        ),
+        Head::BodyTooLarge(n) => (
+            format!("<Content-Length {n} over {MAX_BODY_BYTES} bytes>"),
+            "413 Payload Too Large",
+            error_json("payload too large"),
+        ),
+        Head::Req { method, target, body } => {
+            let path = route_path(&target).to_string();
+            let (status, doc) = match route(&method, &path) {
+                Route::Health => ("200 OK", serde_json::json!({ "status": "ok" })),
+                Route::Props => ("200 OK", props_json(model_path, n_ctx, prompt_chunk)),
+                Route::NotFound => ("404 Not Found", not_found_json(&path)),
+            };
+            (format!("{method} {target} (body {} bytes)", body.len()), status, doc)
+        }
     };
-    let text = body.to_string();
-    eprintln!("[serve] {method} {target} -> {status}");
+
+    let text = doc.to_string();
+    eprintln!("[serve] {label} -> {status}");
     if let Err(e) = respond(stream, status, &text) {
         eprintln!("[serve] response write failed: {e}");
     }
+    // half close, so the client reads EOF instead of a reset
+    let _ = stream.shutdown(Shutdown::Write);
 }
 
 fn main() {
@@ -186,41 +331,44 @@ fn main() {
     let sidecar = std::env::var("CROW_HOTSETS").unwrap_or_else(|_| DEFAULT_HOTSETS.into());
     let mut cnq = Cnq::open(&cnq_path);
 
-    unsafe {
-        let _ctx = crow_nest_engine::cuda::Ctx::init();
-        let mut cfg = Config::default();
-        cfg.context = CONTEXT_FLOOR;
-        // M1: chunk pinned for the process, no per prompt policy
-        cfg.prompt_chunk = SERVE_CHUNK;
-        apply_adapt_policy(&mut cfg);
+    // unsafe: creates the CUDA context; it must outlive every device allocation
+    let _ctx = unsafe { crow_nest_engine::cuda::Ctx::init() };
 
-        // Engine::load takes engine/.engine.lock; a second serve dies here
-        let (eng, _rep) = Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| eprintln!("[load] {m}"));
-        let n_ctx = eng.st.context;
+    let mut cfg = Config::default();
+    cfg.context = CONTEXT_FLOOR;
+    // M1: chunk pinned for the process, no per prompt policy
+    cfg.prompt_chunk = SERVE_CHUNK;
+    apply_adapt_policy(&mut cfg);
 
-        eprintln!("[serve] container {cnq_path}");
-        eprintln!("[serve] hotsets {sidecar}");
-        eprintln!("[serve] n_ctx {n_ctx}");
-        eprintln!("[serve] prompt_chunk {}", eng.cfg.prompt_chunk);
+    // unsafe: pins device and host memory; takes engine/.engine.lock, a second serve dies here
+    let (eng, _rep) = unsafe {
+        Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| eprintln!("[load] {m}"))
+    };
+    let n_ctx = eng.st.context;
+    let prompt_chunk = eng.cfg.prompt_chunk;
 
-        let addr = format!("127.0.0.1:{port}");
-        let listener = match TcpListener::bind(&addr) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("[serve] cannot bind {addr}: {e}");
-                std::process::exit(3);
-            }
-        };
-        eprintln!("[serve] listening on http://{addr} (blocking, one request at a time)");
+    eprintln!("[serve] container {cnq_path}");
+    eprintln!("[serve] hotsets {sidecar}");
+    eprintln!("[serve] n_ctx {n_ctx}");
+    eprintln!("[serve] prompt_chunk {prompt_chunk}");
 
-        for conn in listener.incoming() {
-            match conn {
-                Ok(mut s) => serve_one(&mut s, &cnq_path, n_ctx, eng.cfg.prompt_chunk),
-                Err(e) => eprintln!("[serve] accept failed: {e}"),
-            }
+    let addr = format!("127.0.0.1:{port}");
+    let listener = match TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[serve] cannot bind {addr}: {e}");
+            std::process::exit(3);
         }
-        drop(eng);
+    };
+    eprintln!("[serve] listening on http://{addr} (blocking, one request at a time)");
+
+    for conn in listener.incoming() {
+        match conn {
+            Ok(mut s) => serve_one(&mut s, &cnq_path, n_ctx, prompt_chunk),
+            Err(e) => eprintln!("[serve] accept failed: {e}"),
+        }
     }
+    drop(eng);
 }
 
 #[cfg(test)]
@@ -251,6 +399,35 @@ mod tests {
         assert_eq!(route_path("/health/"), "/health");
         assert_eq!(route_path("/health#frag"), "/health");
         assert_eq!(route_path("/"), "/");
+    }
+
+    #[test]
+    fn dispatch_is_method_and_path() {
+        // the request line goes through the same two helpers serve_one uses
+        let d = |line: &str| {
+            let (m, t) = parse_request_line(line).expect("request line parses");
+            route(&m, route_path(&t))
+        };
+        assert_eq!(d("GET /health HTTP/1.1\r\n"), Route::Health);
+        assert_eq!(d("GET /health/ HTTP/1.1\r\n"), Route::Health);
+        assert_eq!(d("GET /props HTTP/1.1\r\n"), Route::Props);
+        assert_eq!(d("GET /props?x=1 HTTP/1.1\r\n"), Route::Props);
+        // unknown path
+        assert_eq!(d("GET /nope HTTP/1.1\r\n"), Route::NotFound);
+        assert_eq!(d("GET /v1/models HTTP/1.1\r\n"), Route::NotFound);
+        // non GET method, on a known path and on a future one
+        assert_eq!(d("POST /health HTTP/1.1\r\n"), Route::NotFound);
+        assert_eq!(d("HEAD /props HTTP/1.1\r\n"), Route::NotFound);
+        assert_eq!(d("POST /v1/chat/completions HTTP/1.1\r\n"), Route::NotFound);
+    }
+
+    #[test]
+    fn content_length_header_is_case_insensitive() {
+        assert_eq!(header_value("Content-Length: 7\r\n", "content-length"), Some("7"));
+        assert_eq!(header_value("content-length:7", "content-length"), Some("7"));
+        assert_eq!(header_value("CONTENT-LENGTH:  42  \r\n", "content-length"), Some("42"));
+        assert_eq!(header_value("Host: 127.0.0.1\r\n", "content-length"), None);
+        assert_eq!(header_value("no colon here", "content-length"), None);
     }
 
     #[test]
@@ -293,5 +470,11 @@ mod tests {
         let doc = not_found_json("/v1/models");
         assert_eq!(doc["error"]["code"], 404);
         assert!(doc["error"]["message"].as_str().unwrap().contains("/v1/models"));
+    }
+
+    #[test]
+    fn flat_error_documents_name_the_reason() {
+        assert_eq!(error_json("bad request")["error"], "bad request");
+        assert_eq!(error_json("payload too large")["error"], "payload too large");
     }
 }
