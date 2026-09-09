@@ -15,8 +15,11 @@
 //! - A timeout or read error logs one stderr line and closes that connection.
 //! - The accept loop continues after any single connection failed.
 //! - Head (request line plus headers) capped at 64 KiB total.
+//! - The reader itself is bounded, it never buffers past that cap.
 //! - Over the head cap: 431 JSON, then close.
 //! - `Content-Length` is parsed case insensitively.
+//! - A malformed or repeated `Content-Length` answers 400 JSON.
+//! - `Transfer-Encoding: chunked` answers 501 JSON, A3 may implement it.
 //! - The body is read and discarded before the response is written.
 //! - Body capped at 16 MiB; over the cap: 413 JSON, then close.
 //! - A bodied POST to an unknown route therefore gets the 404 JSON, not a reset.
@@ -102,6 +105,7 @@ fn route(method: &str, path: &str) -> Route {
 }
 
 /// what one connection sent, as far as the head reader could tell
+#[derive(Debug, PartialEq, Eq)]
 enum Head {
     /// the client closed without sending a byte; no response is written
     Empty,
@@ -111,12 +115,16 @@ enum Head {
     HeadTooLarge,
     /// the declared body passed `MAX_BODY_BYTES`; the answer is 413
     BodyTooLarge(usize),
+    /// the head asks for chunked transfer encoding; the answer is 501
+    Chunked,
     /// a well formed request; `body` is drained and kept for A3 and A4
     Req { method: String, target: String, body: Vec<u8> },
 }
 
-/// `--port <n>` / `--port=<n>` out of the argument vector (argv[0] included).
-/// `Err` carries the message for the operator; missing flag = default port.
+/// - `--port <n>` and `--port=<n>` out of the argument vector
+/// - argv[0] is skipped
+/// - no `--port` flag means the default port
+/// - `Err` carries the message for the operator
 fn parse_port(args: &[String]) -> Result<u16, String> {
     let mut i = 1;
     let mut port = DEFAULT_PORT;
@@ -193,7 +201,7 @@ fn not_found_json(path: &str) -> serde_json::Value {
     })
 }
 
-/// flat error document for 400, 413 and 431
+/// flat error document for 400, 413, 431 and 501
 fn error_json(msg: &str) -> serde_json::Value {
     serde_json::json!({ "error": msg })
 }
@@ -211,31 +219,49 @@ fn respond(stream: &mut TcpStream, status: &str, body: &str) -> std::io::Result<
     stream.flush()
 }
 
-/// Request line, headers and body of one connection.
-/// Headers are read up to the blank line, then the body is drained.
-/// Draining first is what lets a bodied POST see the 404 instead of a reset.
-fn read_head(stream: &TcpStream) -> std::io::Result<Head> {
-    let mut r = BufReader::new(stream);
+/// - reads one line into `buf`, at most `cap` bytes from `r`
+/// - the cap is what keeps an endless line from growing the buffer
+/// - returns the bytes taken; `buf` ends in a newline on a complete line
+fn read_line_capped<R: BufRead>(r: &mut R, cap: usize, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+    r.by_ref().take(cap as u64).read_until(b'\n', buf)
+}
+
+/// - request line, headers and body of one connection, over any `BufRead`
+/// - the read is bounded: never more than `MAX_HEAD_BYTES` are buffered
+/// - a head that spends the cap without a newline gives `Head::HeadTooLarge`
+/// - `Content-Length` must be one well formed value, else `Head::Bad`
+/// - `Transfer-Encoding: chunked` gives `Head::Chunked`
+/// - the body is drained after the blank line
+/// - draining first is what lets a bodied POST see the 404 instead of a reset
+fn read_head_from<R: BufRead>(r: &mut R) -> std::io::Result<Head> {
     let mut used = 0usize;
 
     let mut first = Vec::new();
-    if r.read_until(b'\n', &mut first)? == 0 {
+    let n = read_line_capped(r, MAX_HEAD_BYTES, &mut first)?;
+    if n == 0 {
         return Ok(Head::Empty);
     }
-    used += first.len();
-    if used > MAX_HEAD_BYTES {
+    used += n;
+    if !first.ends_with(b"\n") && used >= MAX_HEAD_BYTES {
         return Ok(Head::HeadTooLarge);
     }
     let first = String::from_utf8_lossy(&first).into_owned();
 
-    let mut content_length = 0usize;
+    let mut content_length: Option<usize> = None;
+    let mut bad_length = false;
+    let mut chunked = false;
     loop {
+        let budget = MAX_HEAD_BYTES - used;
+        if budget == 0 {
+            return Ok(Head::HeadTooLarge);
+        }
         let mut raw = Vec::new();
-        if r.read_until(b'\n', &mut raw)? == 0 {
+        let n = read_line_capped(r, budget, &mut raw)?;
+        if n == 0 {
             break;
         }
-        used += raw.len();
-        if used > MAX_HEAD_BYTES {
+        used += n;
+        if !raw.ends_with(b"\n") && used >= MAX_HEAD_BYTES {
             return Ok(Head::HeadTooLarge);
         }
         let line = String::from_utf8_lossy(&raw).into_owned();
@@ -243,10 +269,28 @@ fn read_head(stream: &TcpStream) -> std::io::Result<Head> {
             break;
         }
         if let Some(v) = header_value(&line, "content-length") {
-            content_length = v.parse::<usize>().unwrap_or(0);
+            match (content_length, v.parse::<usize>()) {
+                (None, Ok(len)) => content_length = Some(len),
+                // a second Content-Length, or one that does not parse, is a 400
+                _ => bad_length = true,
+            }
+        }
+        if let Some(v) = header_value(&line, "transfer-encoding") {
+            if v.split(',').any(|c| c.trim().eq_ignore_ascii_case("chunked")) {
+                chunked = true;
+            }
         }
     }
 
+    // chunked first: there is no declared length to trust or to drain
+    if chunked {
+        return Ok(Head::Chunked);
+    }
+    if bad_length {
+        return Ok(Head::Bad);
+    }
+
+    let content_length = content_length.unwrap_or(0);
     if content_length > MAX_BODY_BYTES {
         return Ok(Head::BodyTooLarge(content_length));
     }
@@ -259,6 +303,12 @@ fn read_head(stream: &TcpStream) -> std::io::Result<Head> {
         Some((method, target)) => Ok(Head::Req { method, target, body }),
         None => Ok(Head::Bad),
     }
+}
+
+/// - `read_head_from` over one connection, buffered
+fn read_head(stream: &TcpStream) -> std::io::Result<Head> {
+    let mut r = BufReader::new(stream);
+    read_head_from(&mut r)
 }
 
 fn serve_one(stream: &mut TcpStream, model_path: &str, n_ctx: usize, prompt_chunk: usize) {
@@ -296,6 +346,11 @@ fn serve_one(stream: &mut TcpStream, model_path: &str, n_ctx: usize, prompt_chun
             format!("<Content-Length {n} over {MAX_BODY_BYTES} bytes>"),
             "413 Payload Too Large",
             error_json("payload too large"),
+        ),
+        Head::Chunked => (
+            "<Transfer-Encoding: chunked>".to_string(),
+            "501 Not Implemented",
+            error_json("chunked transfer encoding not supported"),
         ),
         Head::Req { method, target, body } => {
             let path = route_path(&target).to_string();
@@ -374,6 +429,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn request_line_is_method_and_target() {
@@ -476,5 +532,90 @@ mod tests {
     fn flat_error_documents_name_the_reason() {
         assert_eq!(error_json("bad request")["error"], "bad request");
         assert_eq!(error_json("payload too large")["error"], "payload too large");
+    }
+    #[test]
+    fn a_request_line_over_the_cap_stops_the_reader_at_the_cap() {
+        let mut raw = b"GET /".to_vec();
+        raw.resize(70_000, b'a');
+        let mut c = Cursor::new(raw);
+        assert_eq!(read_head_from(&mut c).unwrap(), Head::HeadTooLarge);
+        // bounded: the cap was never passed, the 70,000 byte line was never buffered
+        assert!(c.position() <= MAX_HEAD_BYTES as u64);
+        assert_eq!(c.position(), MAX_HEAD_BYTES as u64);
+    }
+
+    #[test]
+    fn header_lines_over_the_cap_stop_the_reader_at_the_cap() {
+        let mut raw = b"GET /health HTTP/1.1\r\n".to_vec();
+        while raw.len() < MAX_HEAD_BYTES + 4096 {
+            raw.extend_from_slice(b"X-Pad: 0123456789012345678901234567890123456789\r\n");
+        }
+        raw.extend_from_slice(b"\r\n");
+        let mut c = Cursor::new(raw);
+        assert_eq!(read_head_from(&mut c).unwrap(), Head::HeadTooLarge);
+        assert!(c.position() <= MAX_HEAD_BYTES as u64);
+    }
+
+    #[test]
+    fn a_plain_get_parses_out_of_a_cursor() {
+        let mut c = Cursor::new(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n".to_vec());
+        assert_eq!(
+            read_head_from(&mut c).unwrap(),
+            Head::Req { method: "GET".into(), target: "/health".into(), body: Vec::new() }
+        );
+    }
+
+    #[test]
+    fn a_declared_body_is_read_whole() {
+        let mut c = Cursor::new(b"POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello".to_vec());
+        match read_head_from(&mut c).unwrap() {
+            Head::Req { method, target, body } => {
+                assert_eq!(method, "POST");
+                assert_eq!(target, "/x");
+                assert_eq!(body, b"hello".to_vec());
+            }
+            other => panic!("expected a request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_stream_gets_no_response() {
+        let mut c = Cursor::new(Vec::new());
+        assert_eq!(read_head_from(&mut c).unwrap(), Head::Empty);
+    }
+
+    #[test]
+    fn a_garbage_request_line_is_a_bad_request() {
+        let mut c = Cursor::new(b"NOT HTTP AT ALL\r\n\r\n".to_vec());
+        assert_eq!(read_head_from(&mut c).unwrap(), Head::Bad);
+    }
+
+    #[test]
+    fn a_malformed_content_length_is_a_bad_request() {
+        let mut c = Cursor::new(b"POST /x HTTP/1.1\r\nContent-Length: abc\r\n\r\n".to_vec());
+        assert_eq!(read_head_from(&mut c).unwrap(), Head::Bad);
+        let mut c = Cursor::new(b"POST /x HTTP/1.1\r\nContent-Length: -1\r\n\r\n".to_vec());
+        assert_eq!(read_head_from(&mut c).unwrap(), Head::Bad);
+    }
+
+    #[test]
+    fn a_repeated_content_length_is_a_bad_request() {
+        let raw = b"POST /x HTTP/1.1\r\nContent-Length: 5\r\ncontent-length: 5\r\n\r\nhello".to_vec();
+        let mut c = Cursor::new(raw);
+        assert_eq!(read_head_from(&mut c).unwrap(), Head::Bad);
+    }
+
+    #[test]
+    fn chunked_transfer_encoding_is_rejected() {
+        let raw = b"POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".to_vec();
+        let mut c = Cursor::new(raw);
+        assert_eq!(read_head_from(&mut c).unwrap(), Head::Chunked);
+        // case insensitive, and inside a coding list
+        let mut c = Cursor::new(b"POST /x HTTP/1.1\r\ntransfer-encoding: gzip, Chunked\r\n\r\n".to_vec());
+        assert_eq!(read_head_from(&mut c).unwrap(), Head::Chunked);
+        assert_eq!(
+            error_json("chunked transfer encoding not supported")["error"],
+            "chunked transfer encoding not supported"
+        );
     }
 }
