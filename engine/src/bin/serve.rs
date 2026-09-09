@@ -282,6 +282,11 @@
 //! | `timings` | `predicted_per_second` | float | `predicted_n / predicted_ms * 1000` |
 //! | `timings` | `predicted_per_token_ms` | float | `predicted_ms / predicted_n` |
 //! | `timings` | `cache_n` | int | ALWAYS 0 until the prefix cache (A9) |
+//! | `timings` | `crow_expert_selections` | u64 | see the A8 table below |
+//! | `timings` | `crow_expert_cold` | u64 | see the A8 table below |
+//! | `timings` | `crow_ple_rows` | u64 | see the A8 table below |
+//! | `timings` | `crow_ple_misses` | u64 | see the A8 table below |
+//! | `timings` | `crow_layers` | int | see the A8 table below |
 //!
 //! - `cached_tokens` and `cache_n` are PRESENT as 0, never missing: a missing
 //!   `cached_tokens` makes Crow fall back to `prompt_n` (`crow_core.py:14923`), which counts
@@ -304,6 +309,42 @@
 //! - The gap is one token, so it shrinks with the answer length (1 of 1024 = 0.1 %).
 //! - Do not "fix" one to match the other: the log would lie, or Crow's reader would.
 //!
+//! Engine counters in the `timings` block (#30 A8, the Crow #54 rule):
+//!
+//! | key | type | unit | meaning | reset | incremented by |
+//! |---|---|---|---|---|---|
+//! | `crow_expert_selections` | u64 | selections | routed expert selections, SUMMED over the 48 layers (10 per token per layer) | never, cumulative since process start | `kernels.rs:2181` `router_top10` `atomicAdd(&counters[0], 10ull)`, launched at `gen.rs:1866-1868` |
+//! | `crow_expert_cold` | u64 | selections | of those, the ones that hit a COLD (non resident) expert, summed over the 48 layers | never, cumulative since process start | `kernels.rs:2182` `router_top10` `atomicAdd(&counters[1], __popc(s_cold))`, same launch |
+//! | `crow_ple_rows` | u64 | rows | PLE embedding rows requested (#16 hit-rate denominator) | never, cumulative since process start | `gen.rs:1041` `self.req += ngids.len()` |
+//! | `crow_ple_misses` | u64 | rows | PLE rows that had to be filled from the container (row cache misses) | never, cumulative since process start | `gen.rs:1042` `self.miss += fill_rows.len()` |
+//! | `crow_layers` | int | layers | `geo::LAYERS` (48), the divisor for a per-layer figure | constant | not a counter |
+//!
+//! - CUMULATIVE means exactly what Crow #54 means: NO reset exists, not per request, not anywhere.
+//! - Request-local values are the DIFFERENCE of two consecutive blocks; the server never subtracts.
+//! - A per-request reset would put two readers at odds over one state and silently break that
+//!   difference, which is what Crow's tools are built on. That is why none is built in.
+//! - The read site is `chat_stream`, after the last `decode_step` and before the final chunk.
+//! - `Engine::drain_counters` (`gen.rs:3235`, `residency.rs:638`) is `cuda::dtoh_u64` of
+//!   48 x 2 u64 = 768 bytes. It READS; it does NOT zero the device block. "drain" is the
+//!   control-plane name, not a reset.
+//! - `Ple::req` and `Ple::miss` (`gen.rs:202-203`) are host u64 that only ever grow.
+//! - Cost per request: one 768 byte device to host copy, logged as `counter read X ms`.
+//! - The same five numbers go to stderr as `[chat] counters (cumulative, never reset): ...`.
+//! - They are written ONLY into `timings`, so they appear only when `timings_per_token` is true.
+//!   Without the flag the final chunk is still exactly the A4 chunk.
+//!
+//! Counters that exist in the engine and are NOT in the block (names are not invented):
+//!
+//! | counter | where | why not |
+//! |---|---|---|
+//! | `Engine::sel_counts` `[48][512]` u64 | `gen.rs:362`, same `router_top10` launch | per-expert warm-up bookkeeping, 24576 values; a block is not a histogram |
+//! | `Trickle::swaps` | `gen.rs:425` | `serve` calls neither `trickle_tick` nor `adapt_tick`, so it stays 0 and `self.trickle` stays `None` |
+//! | `Stage::n_tiles` | `gen.rs:445` | per launch value, ZEROED by `moe_plan` every layer; not cumulative |
+//!
+//! - There is NO cumulative staging counter (bytes staged, tiles staged) in the engine today.
+//! - `decode run` derives `cold experts/token` from two `drain_counters` blocks
+//!   (`bin/decode.rs:260-264`), the same difference this block hands to a client.
+//!
 //! Incremental detokenization:
 //!
 //! - The accumulated generated ids are decoded after every token.
@@ -324,7 +365,7 @@
 
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::{DevSampler, Engine};
-use crow_nest_engine::geo::{apply_adapt_policy, Config, CONTEXT_FLOOR};
+use crow_nest_engine::geo::{apply_adapt_policy, Config, CONTEXT_FLOOR, LAYERS};
 use crow_nest_engine::sample::{Sampler, EOS_IDS};
 use crow_nest_engine::toolcall::{Emit, ToolStream, TOOL_OPEN};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -840,6 +881,7 @@ fn sampler_from(req: &ChatReq) -> Option<Sampler> {
 /// - what one served request counted and how long each phase took
 /// - the only input of the `usage` and `timings` builders, so the test drives them directly
 /// - `prompt_ms` is the `Engine::prefill` wall, `predicted_ms` the decode loop wall
+/// - the four `*_total` fields are ENGINE counters, CUMULATIVE since process start (#30 A8)
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Timing {
     /// rendered prompt ids
@@ -850,6 +892,14 @@ struct Timing {
     prompt_ms: f64,
     /// wall from the first `decode_step` to the last, in ms
     predicted_ms: f64,
+    /// #30 A8: routed expert selections, summed over the 48 layers, cumulative
+    selections_total: u64,
+    /// #30 A8: selections that hit a COLD (non resident) expert, cumulative
+    cold_total: u64,
+    /// #30 A8: PLE embedding rows requested, cumulative
+    ple_rows_total: u64,
+    /// #30 A8: PLE rows filled from the container (row cache misses), cumulative
+    ple_miss_total: u64,
 }
 
 /// - tokens per second out of a count and a wall time in ms
@@ -891,6 +941,8 @@ fn usage_json(t: &Timing) -> serde_json::Value {
 
 /// - the llama.cpp `timings` object (`crow_core.py:4999-5018` reads six of these fields)
 /// - `cache_n` is an explicit 0: there is no prefix cache before A9
+/// - the `crow_` keys are the engine counters (#30 A8): u64, CUMULATIVE, never reset
+/// - the prefix keeps them out of llama-server's key space, so no reader collides
 fn timings_json(t: &Timing) -> serde_json::Value {
     serde_json::json!({
         "prompt_n": t.prompt_n,
@@ -902,6 +954,11 @@ fn timings_json(t: &Timing) -> serde_json::Value {
         "predicted_per_second": round3(per_second(t.predicted_n, t.predicted_ms)),
         "predicted_per_token_ms": round3(per_token_ms(t.predicted_n, t.predicted_ms)),
         "cache_n": 0,
+        "crow_expert_selections": t.selections_total,
+        "crow_expert_cold": t.cold_total,
+        "crow_ple_rows": t.ple_rows_total,
+        "crow_ple_misses": t.ple_miss_total,
+        "crow_layers": LAYERS,
     })
 }
 
@@ -1355,12 +1412,29 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
             ts.dropped()
         );
     }
+    // #30 A8: the engine counters, read AFTER the last decode step and BEFORE the final chunk.
+    // cumulative, never reset (Crow #54 rule); request-local = difference of two blocks.
+    // `Engine::drain_counters` is a plain `cuda::dtoh_u64` of 48 x 2 u64 (residency.rs:638-641):
+    // it READS the device block, it does not zero it. `Ple::req` / `Ple::miss` are host u64 that
+    // only ever grow (gen.rs:1041-1042). Nothing here writes device or host state.
+    let t_ctr = Instant::now();
+    let blocks = unsafe { srv.eng.drain_counters() };
+    let (selections_total, cold_total) = blocks
+        .iter()
+        .fold((0u64, 0u64), |a, c| (a.0 + c[0], a.1 + c[1]));
+    let (ple_rows_total, ple_miss_total) = (srv.eng.ple.req, srv.eng.ple.miss);
+    let counters_ms = t_ctr.elapsed().as_secs_f64() * 1e3;
+
     let gen = out.len();
     let timing = Timing {
         prompt_n: ids.len(),
         predicted_n: gen,
         prompt_ms: prefill_ms,
         predicted_ms: decode_ms,
+        selections_total,
+        cold_total,
+        ple_rows_total,
+        ple_miss_total,
     };
     if !aborted {
         let last = chunk_finish(
@@ -1390,6 +1464,12 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
         req.include_usage,
         req.timings_per_token,
         if aborted { ", client gone" } else { "" }
+    );
+    // #30 A8: the same numbers the `timings` block carries, cumulative since process start
+    eprintln!(
+        "[chat] counters (cumulative, never reset): expert selections {selections_total}, \
+         expert cold {cold_total}, ple rows {ple_rows_total}, ple misses {ple_miss_total}, \
+         layers {LAYERS}, counter read {counters_ms:.3} ms"
     );
     eprintln!("[chat] ids {out:?}");
     if aborted {
@@ -2083,8 +2163,16 @@ mod tests {
     }
 
     /// the numbers of one served request, so every A5 test speaks about the same turn
-    const T0: Timing =
-        Timing { prompt_n: 16_064, predicted_n: 8, prompt_ms: 24_500.0, predicted_ms: 320.0 };
+    const T0: Timing = Timing {
+        prompt_n: 16_064,
+        predicted_n: 8,
+        prompt_ms: 24_500.0,
+        predicted_ms: 320.0,
+        selections_total: 7_710_720,
+        cold_total: 2_534_400,
+        ple_rows_total: 160_640,
+        ple_miss_total: 12_811,
+    };
 
     #[test]
     fn without_the_two_flags_the_final_chunk_is_the_a4_chunk() {
@@ -2160,13 +2248,102 @@ mod tests {
         assert_eq!(round3(f64::NAN), 0.0);
         assert_eq!(round3(1.23456), 1.235);
         // a zero wall must still leave a NUMBER on the wire, serde turns NaN into null
-        let z = Timing { prompt_n: 0, predicted_n: 0, prompt_ms: 0.0, predicted_ms: 0.0 };
+        let z = Timing {
+            prompt_n: 0,
+            predicted_n: 0,
+            prompt_ms: 0.0,
+            predicted_ms: 0.0,
+            selections_total: 0,
+            cold_total: 0,
+            ple_rows_total: 0,
+            ple_miss_total: 0,
+        };
         let f = chunk_finish("id", 7, "m", "stop", &z, true, true);
         for k in ["prompt_ms", "prompt_per_second", "predicted_per_second", "predicted_per_token_ms"] {
             assert_eq!(f["timings"][k].as_f64(), Some(0.0), "{k} is {}", f["timings"][k]);
         }
         assert_eq!(f["usage"]["total_tokens"].as_u64(), Some(0));
         assert!(!f["timings"].to_string().contains("null"), "{}", f["timings"]);
+    }
+
+    /// #30 A8: the five keys, their exact names, and u64 (never a float)
+    #[test]
+    fn the_timings_block_carries_the_engine_counters_as_u64() {
+        let g = &chunk_finish("id", 7, "m", "stop", &T0, true, true)["timings"];
+        // the names are the contract: a renamed key silently breaks every difference reader
+        assert_eq!(g["crow_expert_selections"].as_u64(), Some(7_710_720));
+        assert_eq!(g["crow_expert_cold"].as_u64(), Some(2_534_400));
+        assert_eq!(g["crow_ple_rows"].as_u64(), Some(160_640));
+        assert_eq!(g["crow_ple_misses"].as_u64(), Some(12_811));
+        assert_eq!(g["crow_layers"].as_u64(), Some(LAYERS as u64));
+        // counts, not rates: a float here would round the atomicAdd totals away
+        for k in ["crow_expert_selections", "crow_expert_cold", "crow_ple_rows",
+                  "crow_ple_misses", "crow_layers"] {
+            assert!(g[k].is_u64(), "{k} is not a u64: {}", g[k]);
+            assert!(!g[k].is_f64(), "{k} came out as a float: {}", g[k]);
+        }
+        // the counters carry no llama-server key name, so no reader of the six A5 fields collides
+        for k in ["prompt_n", "prompt_ms", "prompt_per_second", "prompt_per_token_ms",
+                  "predicted_n", "predicted_ms", "predicted_per_second",
+                  "predicted_per_token_ms", "cache_n"] {
+            assert!(g[k].is_number(), "A5 key {k} moved: {}", g[k]);
+        }
+        // exactly fourteen keys: the nine of A5 plus the five of A8, nothing crept in
+        assert_eq!(g.as_object().unwrap().len(), 14, "{g}");
+    }
+
+    /// #30 A8: cumulative means the builder never subtracts and never resets
+    #[test]
+    fn the_counters_are_passed_through_unchanged_and_only_live_in_timings() {
+        // no flag at all: the counters are NOT on the chunk, the A4 shape is untouched
+        let f = chunk_finish("id", 7, "m", "stop", &T0, false, false);
+        assert!(!f.to_string().contains("crow_expert"), "{f}");
+        // include_usage alone: `usage` carries none of them either
+        let u = chunk_finish("id", 7, "m", "stop", &T0, true, false);
+        assert!(u.get("timings").is_none());
+        assert!(!u.to_string().contains("crow_"), "{u}");
+        // timings on: the value on the wire is the value the engine read, byte for byte
+        let g = &chunk_finish("id", 7, "m", "stop", &T0, false, true)["timings"];
+        assert_eq!(g["crow_expert_selections"].as_u64(), Some(T0.selections_total));
+        assert_eq!(g["crow_expert_cold"].as_u64(), Some(T0.cold_total));
+        assert_eq!(g["crow_ple_rows"].as_u64(), Some(T0.ple_rows_total));
+        assert_eq!(g["crow_ple_misses"].as_u64(), Some(T0.ple_miss_total));
+        // two consecutive blocks: the request-local value is their difference, computed by
+        // the READER. Same Timing twice = a difference of 0, never a reset to 0.
+        let mut t1 = T0;
+        t1.selections_total += 30_720;
+        t1.cold_total += 9_920;
+        let a = timings_json(&T0);
+        let b = timings_json(&t1);
+        assert_eq!(
+            b["crow_expert_selections"].as_u64().unwrap()
+                - a["crow_expert_selections"].as_u64().unwrap(),
+            30_720
+        );
+        assert_eq!(
+            b["crow_expert_cold"].as_u64().unwrap() - a["crow_expert_cold"].as_u64().unwrap(),
+            9_920
+        );
+        // a counter that did not move gives 0, which is a valid difference, not a missing key
+        assert_eq!(
+            b["crow_ple_rows"].as_u64().unwrap() - a["crow_ple_rows"].as_u64().unwrap(),
+            0
+        );
+        // 48 layers: the divisor a reader needs to turn selections into per-layer per-token
+        assert_eq!(b["crow_layers"].as_u64(), Some(48));
+    }
+
+    /// #30 A8: a u64 near the top of the range survives serde and the reader's parse
+    #[test]
+    fn a_large_counter_stays_exact_on_the_wire() {
+        let mut t = T0;
+        t.selections_total = u64::MAX;
+        t.ple_rows_total = 9_007_199_254_740_993; // 2^53 + 1, the first f64 cannot hold
+        let text = timings_json(&t).to_string();
+        let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back["crow_expert_selections"].as_u64(), Some(u64::MAX));
+        assert_eq!(back["crow_ple_rows"].as_u64(), Some(9_007_199_254_740_993));
+        assert!(text.contains("18446744073709551615"), "{text}");
     }
 
     #[test]
