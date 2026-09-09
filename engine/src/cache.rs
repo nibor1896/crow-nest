@@ -48,14 +48,11 @@
 //! | `Engine::history` | truncated to `S_pos` | PLE n-gram prefix reads `history` (`gen.rs:2467-2477`) |
 //! | `Engine::route_log` | cleared | grows per token under `CROW_ROUTE_DUMP` (`gen.rs:2894`) |
 //!
-//! Ordering, and why it is not negotiable (A4, `reset.rs` module doc):
+//! Ordering, and why it is not negotiable (A4, `reset.rs` module doc, "The active stream"):
 //!
-//! - `decode_step` creates the capture stream ONCE and leaves it active (`gen.rs:2740-2743`).
-//! - `prefill` uploads its per chunk scalars from TEMPORARIES (`gen.rs:2493-2510`).
-//! - `upload_into` skips its sync on any stream but the legacy one (`cuda.rs:381-386`).
-//! - Measured 2026-09-09: a second prefill behind a live capture stream read freed host
-//!   memory; same prompt, greedy, request 1 gave id 18622, request 2 gave id 17.
-//! - Therefore `rollback` drops the graph and the capture stream BEFORE the resumed prefill.
+//! - `rollback` calls `Engine::drop_decode_graph` BEFORE the resumed prefill, the same
+//!   teardown the cold path `reset_to_zero` runs, from the same single definition.
+//! - `reset.rs` holds the measurement and the reason; it is not restated here.
 //! - The first `decode_step` of the request re-creates and re-captures (`gen.rs:2740`, `gen.rs:2836`).
 //! - `prefill` zeroes S only when `self.pos == 0` (`gen.rs:2433`, `gen.rs:2495`), which is
 //!   exactly the cold start, so a restored `pos > 0` leaves the restored S alone.
@@ -393,19 +390,10 @@ impl PrefixCache {
         // whatever the last request left in flight must land before anything below
         cuda::sync();
 
-        // spec 7.2 remedy, measured in A4: the resumed prefill uploads its per chunk
-        // scalars from temporaries, and those uploads only sync on the legacy stream
-        if eng.graph_exec != 0 {
-            cuda::graph_exec_destroy(eng.graph_exec as sys::CUgraphExec);
-            eng.graph_exec = 0;
-        }
-        if eng.cap_stream != 0 {
-            cuda::set_stream(0);
-            cuda::stream_destroy(eng.cap_stream as sys::CUstream);
-            eng.cap_stream = 0;
-        } else {
-            cuda::set_stream(0);
-        }
+        // spec 7.2 remedy, measured in A4 and defined once in `reset.rs`: the resumed
+        // prefill uploads its per chunk scalars from temporaries, and those uploads only
+        // sync on the legacy stream. Must stay BEFORE the uploads and the prefill.
+        eng.drop_decode_graph();
 
         for (i, buf) in s.gdn_s.iter().enumerate() {
             cuda::to_f32_into(eng.st.gdn_s[i], buf);
@@ -430,8 +418,33 @@ impl PrefixCache {
 }
 
 #[cfg(test)]
+impl PrefixCache {
+    /// - a cache with host slots only, for the rules that need no CUDA
+    /// - `enabled == false` reproduces `CROW_PREFIX_CACHE=0`: no slot is allocated
+    fn for_shape(shape: Shape, enabled: bool) -> PrefixCache {
+        let slots = if enabled {
+            (0..SLOTS).map(|_| Snapshot::new(&shape)).collect()
+        } else {
+            Vec::new()
+        };
+        PrefixCache { enabled, shape, slots }
+    }
+
+    /// - name a slot's position and its prefill clean flag without a device copy
+    fn set_slot(&mut self, slot: usize, pos: usize, prefill_clean: bool) {
+        self.slots[slot].pos = Some(pos);
+        self.slots[slot].prefill_clean = prefill_clean;
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the shape of no real load: four f32 per QSA layer, so a slot costs nothing
+    fn tiny() -> Shape {
+        Shape { gdn_layers: 1, attn_layers: 1, qsa_ring_len: 4 }
+    }
 
     #[test]
     fn common_prefix_of_two_empty_lists_is_zero() {
@@ -593,5 +606,63 @@ mod tests {
     fn the_snapshot_size_at_chunk_512_is_the_other_spec_row() {
         let shape = Shape { gdn_layers: 36, attn_layers: 12, qsa_ring_len: 516 * 128 };
         assert_eq!(shape.snapshot_bytes(), 121_208_832);
+    }
+
+    /// `CROW_PREFIX_CACHE=0`: `decide` returns before it computes anything (`cache.rs:328`)
+    #[test]
+    fn a_disabled_cache_decides_cold_for_every_request() {
+        let c = PrefixCache::for_shape(tiny(), false);
+        assert!(!c.enabled());
+        let held: Vec<i64> = (0..100).collect();
+        let mut new = held.clone();
+        new.extend(200..210);
+        let d = c.decide(&held, &new);
+        assert_eq!(d, Decision { l: 0, reuse: None });
+        assert_eq!(d.cached_n(), 0);
+        // and no slot exists to be reported
+        assert!(c.positions().is_empty());
+        assert!(c.reuse_candidates().is_empty());
+    }
+
+    /// an enabled cache with two empty slots is a cold start, and says so in both lists
+    #[test]
+    fn a_fresh_cache_holds_no_position() {
+        let c = PrefixCache::for_shape(tiny(), true);
+        assert!(c.enabled());
+        assert_eq!(c.positions(), vec![None, None]);
+        assert_eq!(c.reuse_candidates(), vec![None, None]);
+        assert_eq!(c.decide(&[1, 2, 3], &[1, 2, 3, 4]).reuse, None);
+    }
+
+    /// `positions` reports every slot, `reuse_candidates` hides the ones that are not clean
+    #[test]
+    fn reuse_candidates_hides_the_slot_that_is_not_prefill_clean() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        c.set_slot(SLOT_PROMPT, 60, true);
+        c.set_slot(SLOT_ANSWER, 100, false);
+        assert_eq!(c.positions(), vec![Some(60), Some(100)]);
+        assert_eq!(c.reuse_candidates(), vec![Some(60), None]);
+        // so the decision lands on point 1 even though point 2 sits at L
+        let held: Vec<i64> = (0..100).collect();
+        let mut new = held.clone();
+        new.extend(200..210);
+        let d = c.decide(&held, &new);
+        assert_eq!(d.l, 100);
+        assert_eq!(d.reuse, Some((SLOT_PROMPT, 60)));
+        assert_eq!(d.cached_n(), 60);
+    }
+
+    /// `invalidate` is what a cold start runs: both slots forget position AND flag
+    #[test]
+    fn invalidate_clears_both_positions_and_both_flags() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        c.set_slot(SLOT_PROMPT, 60, true);
+        c.set_slot(SLOT_ANSWER, 100, true);
+        assert_eq!(c.reuse_candidates(), vec![Some(60), Some(100)]);
+        c.invalidate();
+        assert_eq!(c.positions(), vec![None, None]);
+        assert_eq!(c.reuse_candidates(), vec![None, None]);
+        // and a request that would have been warm is now cold
+        assert_eq!(c.decide(&(0..100).collect::<Vec<i64>>(), &(0..110).collect::<Vec<i64>>()).reuse, None);
     }
 }

@@ -196,7 +196,9 @@
 //! - `Engine::enable_dev_sampler` runs for EVERY sampled request, after `prefill`.
 //! - It uploads `Rng::new(seed)` and clears the presence mask, so request k starts cold.
 //! - Therefore request 1 of a fresh process and request 5 of a warm one draw the same ids.
-//! - `Engine::reset_to_zero` drops the decode graph, so the first `decode_step` re-captures.
+//! - The decode graph is dropped before the prefill of every request, cold by
+//!   `reset_to_zero` and warm by `PrefixCache::rollback`, both through
+//!   `Engine::drop_decode_graph`, so the first `decode_step` re-captures.
 //! - Arming BEFORE that first step is what puts the `sample_k` node INTO the new graph.
 //! - Armed after it, the sampler would run as an eager launch per replay: correct, slower.
 //!
@@ -380,9 +382,14 @@
 //!
 //! | line | carries |
 //! |---|---|
-//! | `[cache] WARM\|COLD L .., P .., snapshots [..], reusable [..], prefill n of m tok, rollback X ms` | the decision and the HtoD wall |
+//! | `[cache] WARM\|COLD L .., P .., snapshots [..], reusable [..], prefill n of m tok, reset X ms` | the decision and the HtoD wall |
 //! | `[cache] snapshot point 1 (after prompt) at pos .., DtoH X ms` | point 1 of spec 7.6 |
 //! | `[cache] snapshot point 2 (after answer) at pos .., DtoH X ms, slots [..]` | point 2 of spec 7.6 |
+//!
+//! - `reset X ms` is the ONE number the `[chat]` line also calls `reset`: the rollback of a
+//!   warm request or the `reset_to_zero` of a cold one, whichever ran.
+//! - With `CROW_PREFIX_CACHE=0` the first line prints `L n/a`, because `decide` returns
+//!   before it computes `L`, and the two snapshot lines are not printed at all.
 //!
 //! - One stderr line per request: prompt tokens (cached and prefilled), generated tokens,
 //!   prefill ms, decode ms.
@@ -1306,6 +1313,7 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
     // held conversation: prompt ids AND generated ids (`gen.rs:2698`, `gen.rs:2945`).
     let plan = srv.cache.decide(&srv.eng.history, &prompt);
     let held = srv.eng.history.len();
+    let cache_on = srv.cache.enabled();
     let snaps = srv.cache.positions();
     let reusable = srv.cache.reuse_candidates();
     // unsafe: engine kernels; the CUDA context and engine/.engine.lock are this process's
@@ -1326,10 +1334,13 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
     };
     let reset_ms = t_reset.elapsed().as_secs_f64() * 1e3;
     let prefilled = prompt.len() - cached_n;
+    // `reset_ms` is the ONE name for this number: the rollback of a warm request or the
+    // `reset_to_zero` of a cold one. The `[chat]` line below calls it `reset` as well.
+    // With the cache off `decide` returns before it computes `L`, so no number is claimed.
     eprintln!(
-        "[cache] {} L {} (held {}), P {cached_n}, snapshots {:?}, reusable {:?}, prefill {prefilled} of {} tok, rollback {reset_ms:.3} ms",
+        "[cache] {} L {} (held {}), P {cached_n}, snapshots {:?}, reusable {:?}, prefill {prefilled} of {} tok, reset {reset_ms:.3} ms",
         if plan.reuse.is_some() { "WARM" } else { "COLD" },
-        plan.l,
+        if cache_on { plan.l.to_string() } else { "n/a".to_string() },
         held,
         snaps,
         reusable,
@@ -1345,13 +1356,17 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
     // prefill clean: the prefill above started at 0 or at a prefill clean `P`, so every
     // KV and pooled QSA row below `pos` is a prefill row (`cache.rs`, the induction)
     let snap1_ms = unsafe { srv.cache.snapshot(srv.eng, SLOT_PROMPT, true) };
-    eprintln!(
-        "[cache] snapshot point 1 (after prompt) at pos {}, DtoH {snap1_ms:.3} ms",
-        srv.eng.pos
-    );
+    // a disabled cache copies nothing, so it reports nothing either
+    if cache_on {
+        eprintln!(
+            "[cache] snapshot point 1 (after prompt) at pos {}, DtoH {snap1_ms:.3} ms",
+            srv.eng.pos
+        );
+    }
 
     // #28 A6: arm or disarm the device sampler for THIS request. After `prefill` and before the
-    // first `decode_step`: `reset_to_zero` dropped the decode graph, so that step re-captures it
+    // first `decode_step`: the decode graph was dropped before that prefill, cold by
+    // `reset_to_zero` and warm by `PrefixCache::rollback`, so that step re-captures it
     // and the `sample_k` node goes in with it. `enable_dev_sampler` re-uploads `Rng::new(seed)`
     // and clears the presence mask on every call, which is the per request reseed (M1).
     let sampler = sampler_from(req);
@@ -1534,11 +1549,14 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
     // NOT prefill clean: `decode_step` wrote every row of the answer, and those rows are
     // not bit equal to the rows a prefill writes at the same positions (measured, `cache.rs`)
     let snap2_ms = unsafe { srv.cache.snapshot(srv.eng, SLOT_ANSWER, false) };
-    eprintln!(
-        "[cache] snapshot point 2 (after answer) at pos {}, DtoH {snap2_ms:.3} ms, slots {:?}",
-        srv.eng.pos,
-        srv.cache.positions()
-    );
+    // a disabled cache copies nothing, so it reports nothing either
+    if cache_on {
+        eprintln!(
+            "[cache] snapshot point 2 (after answer) at pos {}, DtoH {snap2_ms:.3} ms, slots {:?}",
+            srv.eng.pos,
+            srv.cache.positions()
+        );
+    }
 
     // #27 doc: the tok/s below is (gen - 1) / decode_ms, the wire's
     // `timings.predicted_per_second` is gen / decode_ms. Both are correct for what they name:

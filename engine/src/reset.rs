@@ -32,6 +32,9 @@
 //! - Measured: same prompt, greedy, request 1 gave id 18622, request 2 gave id 17.
 //! - Dropping the graph and the stream restores the legacy stream for the next `prefill`.
 //! - `decode_step` then re-creates the stream and re-captures (`gen.rs:2740`, `gen.rs:2836`).
+//! - `Engine::drop_decode_graph` below is the ONE definition of this teardown: the cold path
+//!   `reset_to_zero` and the #31 A9 warm path `cache::PrefixCache::rollback` both call it,
+//!   each BEFORE the prefill that follows.
 //! - Cost: one eager decode step plus one graph instantiate per request.
 //! - Not measured against keeping the graph: keeping it is what broke the ids.
 //! - A4 gate, 18 token prompt, 29 generated: decode 1170 to 1203 ms over four runs.
@@ -72,6 +75,30 @@ const GDN_CONV_STATE: usize = GDN_CONV * 3;
 const PLE_STATE: usize = GDN_CONV * 9;
 
 impl Engine {
+    /// - drops the captured decode graph and its capture stream, legacy stream made active
+    /// - the ONE definition of the A4 teardown (module doc, "The active stream"): the cold
+    ///   path `reset_to_zero` and the #31 A9 warm path `cache::PrefixCache::rollback` both
+    ///   call it, each BEFORE the prefill that follows
+    /// - callers sync themselves; this function neither syncs nor touches host state
+    ///
+    /// # Safety
+    ///
+    /// - a CUDA context must be current, as for every other engine call
+    /// - no kernel of this engine may be in flight on another thread
+    pub unsafe fn drop_decode_graph(&mut self) {
+        if self.graph_exec != 0 {
+            cuda::graph_exec_destroy(self.graph_exec as cudarc::driver::sys::CUgraphExec);
+            self.graph_exec = 0;
+        }
+        if self.cap_stream != 0 {
+            cuda::set_stream(0);
+            cuda::stream_destroy(self.cap_stream as cudarc::driver::sys::CUstream);
+            self.cap_stream = 0;
+        } else {
+            cuda::set_stream(0);
+        }
+    }
+
     /// - position, history, block cursor and both recurrent conv states back to load state
     /// - the decode graph and its capture stream are dropped, the legacy stream made active
     /// - the next `prefill` sees `pos == 0` and therefore zeroes the GDN state S itself
@@ -87,17 +114,7 @@ impl Engine {
 
         // spec 7.2: drop the captured decode graph and its stream, so the next
         // prefill runs on the legacy stream its temporaries-as-upload-source needs
-        if self.graph_exec != 0 {
-            cuda::graph_exec_destroy(self.graph_exec as cudarc::driver::sys::CUgraphExec);
-            self.graph_exec = 0;
-        }
-        if self.cap_stream != 0 {
-            cuda::set_stream(0);
-            cuda::stream_destroy(self.cap_stream as cudarc::driver::sys::CUstream);
-            self.cap_stream = 0;
-        } else {
-            cuda::set_stream(0);
-        }
+        self.drop_decode_graph();
 
         self.pos = 0;
         self.history.clear();
