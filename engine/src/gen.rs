@@ -2973,6 +2973,9 @@ impl Engine {
         pb[12..16].copy_from_slice(&(s.top_k as i32).to_le_bytes());
         cuda::upload_into(ds.params, &pb);
         cuda::sync();
+        // invariant: in_graph is true only while the CURRENT decode graph carries the
+        // sampler node; arming re-arms for the next capture, so clear it here
+        ds.in_graph.set(false);
     }
 
     unsafe fn launch_sample(&self, ds: &DevSampler) {
