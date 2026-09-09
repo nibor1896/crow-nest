@@ -62,6 +62,21 @@
 //!
 //! - `serve [--port <n>]` from the repository root (paths are repo relative).
 //! - Default port 8099, bind address 127.0.0.1.
+//!
+//! Subcommand `tokenize` (#25 A3, no engine, no GPU, no lock):
+//!
+//! | invocation | effect |
+//! |---|---|
+//! | `serve tokenize --chat --file <prompts.json> --out <ids.json>` | every prompt as one user message |
+//! | `serve tokenize --chat --text "<text>"` | one prompt, id list on stdout |
+//! | `serve tokenize --raw --text "<text>"` | `add_special_tokens=false`, id list on stdout |
+//!
+//! - `--chat` is `add_generation_prompt=true`, `enable_thinking=false`, as `tokenize_ids.py --chat`.
+//! - `<prompts.json>` is read as `{id: text}` or as `[{"id": ..., "text": ...}]`.
+//! - `<ids.json>` is written as `{task_id: [ids]}`.
+//! - Per task the id count goes to stderr, so the gate log carries the ten lengths.
+//! - The subcommand returns before `cuda::Ctx::init`, so no CUDA context and no `.engine.lock`.
+//! - No Python process is started; `crow_nest_engine::tokenizer` is the whole path.
 
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::Engine;
@@ -142,6 +157,166 @@ fn parse_port(args: &[String]) -> Result<u16, String> {
         i += 1;
     }
     Ok(port)
+}
+
+// ------------------------------------------------- tokenize subcommand (A3)
+
+/// what `serve tokenize ...` was asked to do
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Tok {
+    /// every prompt of `file` through the chat template, ids written to `out`
+    File { chat: bool, file: String, out: String },
+    /// one text, id list on stdout
+    Text { chat: bool, text: String },
+}
+
+/// - argument vector AFTER the `tokenize` word
+/// - exactly one of `--chat` and `--raw`
+/// - `--file` needs `--out`; `--file` and `--text` are exclusive
+fn parse_tokenize(rest: &[String]) -> Result<Tok, String> {
+    const USAGE: &str = "usage: serve tokenize (--chat|--raw) (--file <prompts.json> --out <ids.json> | --text <text>)";
+    let mut chat: Option<bool> = None;
+    let (mut file, mut out, mut text) = (None, None, None);
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        let slot: &mut Option<String> = match a {
+            "--chat" | "--raw" => {
+                if chat.replace(a == "--chat").is_some() {
+                    return Err(format!("mode given twice ({USAGE})"));
+                }
+                i += 1;
+                continue;
+            }
+            "--file" => &mut file,
+            "--out" => &mut out,
+            "--text" => &mut text,
+            other => return Err(format!("unknown argument {other:?} ({USAGE})")),
+        };
+        i += 1;
+        let v = rest.get(i).ok_or_else(|| format!("{a} needs a value ({USAGE})"))?;
+        if slot.replace(v.clone()).is_some() {
+            return Err(format!("{a} given twice ({USAGE})"));
+        }
+        i += 1;
+    }
+    let chat = chat.ok_or_else(|| format!("one of --chat and --raw is required ({USAGE})"))?;
+    match (file, out, text) {
+        (Some(_), _, Some(_)) => Err(format!("--file and --text are exclusive ({USAGE})")),
+        (Some(f), Some(o), None) => Ok(Tok::File { chat, file: f, out: o }),
+        (Some(_), None, None) => Err(format!("--file needs --out ({USAGE})")),
+        (None, _, Some(t)) => Ok(Tok::Text { chat, text: t }),
+        (None, _, None) => Err(format!("one of --file and --text is required ({USAGE})")),
+    }
+}
+
+/// - `{id: text}` and `[{"id": ..., "text": ...}]` both give the same ordered pairs
+/// - the order of the file is kept, so the gate log reads in file order
+fn prompts_from_json(v: &serde_json::Value) -> Result<Vec<(String, String)>, String> {
+    if let Some(a) = v.as_array() {
+        let mut out = Vec::with_capacity(a.len());
+        for (i, p) in a.iter().enumerate() {
+            let id = p["id"].as_str().ok_or_else(|| format!("entry {i} has no string id"))?;
+            let text = p["text"].as_str().ok_or_else(|| format!("entry {id} has no string text"))?;
+            out.push((id.to_string(), text.to_string()));
+        }
+        return Ok(out);
+    }
+    if let Some(m) = v.as_object() {
+        let mut out = Vec::with_capacity(m.len());
+        for (k, t) in m {
+            let text = t.as_str().ok_or_else(|| format!("entry {k} is not a string"))?;
+            out.push((k.clone(), text.to_string()));
+        }
+        return Ok(out);
+    }
+    Err("prompts file is neither an object nor an array".to_string())
+}
+
+/// `serve tokenize ...`, the gate arm; exit code is the return value
+fn tokenize_main(rest: &[String]) -> i32 {
+    let cmd = match parse_tokenize(rest) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[tokenize] {e}");
+            return 2;
+        }
+    };
+    let tk = match crow_nest_engine::tokenizer::global() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[tokenize] {e}");
+            return 3;
+        }
+    };
+    let (tp, cp) = tk.paths();
+    eprintln!("[tokenize] tokenizer {tp}");
+    eprintln!("[tokenize] chat template {cp}");
+
+    let ids_of = |chat: bool, text: &str| -> Result<Vec<u32>, String> {
+        if chat {
+            tk.encode_chat_user(text)
+        } else {
+            tk.encode_raw(text)
+        }
+    };
+
+    match cmd {
+        Tok::Text { chat, text } => match ids_of(chat, &text) {
+            Ok(ids) => {
+                println!("{}", serde_json::json!(ids));
+                eprintln!("[tokenize] {} tokens", ids.len());
+                0
+            }
+            Err(e) => {
+                eprintln!("[tokenize] {e}");
+                4
+            }
+        },
+        Tok::File { chat, file, out } => {
+            let raw = match std::fs::read(&file) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[tokenize] cannot read {file}: {e}");
+                    return 4;
+                }
+            };
+            let doc: serde_json::Value = match serde_json::from_slice(&raw) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("[tokenize] {file} is not JSON: {e}");
+                    return 4;
+                }
+            };
+            let prompts = match prompts_from_json(&doc) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[tokenize] {file}: {e}");
+                    return 4;
+                }
+            };
+            let mut map = serde_json::Map::new();
+            for (id, text) in &prompts {
+                match ids_of(chat, text) {
+                    Ok(ids) => {
+                        eprintln!("[tokenize] {id} chars {} tokens {}", text.chars().count(), ids.len());
+                        map.insert(id.clone(), serde_json::json!(ids));
+                    }
+                    Err(e) => {
+                        eprintln!("[tokenize] {id}: {e}");
+                        return 4;
+                    }
+                }
+            }
+            let text = serde_json::Value::Object(map).to_string();
+            if let Err(e) = std::fs::write(&out, text) {
+                eprintln!("[tokenize] cannot write {out}: {e}");
+                return 4;
+            }
+            eprintln!("[tokenize] {} prompts -> {out}", prompts.len());
+            0
+        }
+    }
 }
 
 /// method + request target of an HTTP request line, `None` when it is not one.
@@ -374,6 +549,11 @@ fn serve_one(stream: &mut TcpStream, model_path: &str, n_ctx: usize, prompt_chun
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // A3: the tokenize arm returns HERE, before the CUDA context and before Engine::load
+    // takes engine/.engine.lock; it never starts a Python process
+    if args.get(1).map(|s| s.as_str()) == Some("tokenize") {
+        std::process::exit(tokenize_main(&args[2..]));
+    }
     let port = match parse_port(&args) {
         Ok(p) => p,
         Err(e) => {
@@ -519,6 +699,53 @@ mod tests {
         assert!(parse_port(&v(&["serve", "--port"])).is_err());
         assert!(parse_port(&v(&["serve", "--port", "no"])).is_err());
         assert!(parse_port(&v(&["serve", "-p", "1"])).is_err());
+    }
+
+    #[test]
+    fn tokenize_arguments_parse_into_one_job() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_tokenize(&v(&["--chat", "--file", "p.json", "--out", "i.json"])),
+            Ok(Tok::File { chat: true, file: "p.json".into(), out: "i.json".into() })
+        );
+        assert_eq!(
+            parse_tokenize(&v(&["--raw", "--text", "hi"])),
+            Ok(Tok::Text { chat: false, text: "hi".into() })
+        );
+        assert_eq!(
+            parse_tokenize(&v(&["--chat", "--text", "hi"])),
+            Ok(Tok::Text { chat: true, text: "hi".into() })
+        );
+        // no mode, both modes, missing --out, both inputs, unknown flag, missing value
+        assert!(parse_tokenize(&v(&["--text", "hi"])).is_err());
+        assert!(parse_tokenize(&v(&["--chat", "--raw", "--text", "hi"])).is_err());
+        assert!(parse_tokenize(&v(&["--chat", "--file", "p.json"])).is_err());
+        assert!(parse_tokenize(&v(&["--chat", "--file", "p.json", "--text", "hi"])).is_err());
+        assert!(parse_tokenize(&v(&["--chat"])).is_err());
+        assert!(parse_tokenize(&v(&["--chat", "--text"])).is_err());
+        assert!(parse_tokenize(&v(&["--chat", "--nope", "x"])).is_err());
+    }
+
+    #[test]
+    fn both_prompt_file_shapes_give_the_same_pairs() {
+        // docs/ten-task-prompts-crowlab.json is {id: text}
+        let obj = serde_json::json!({ "t2-write": "b", "t1-read": "a" });
+        assert_eq!(
+            prompts_from_json(&obj).unwrap(),
+            vec![("t1-read".to_string(), "a".to_string()), ("t2-write".to_string(), "b".to_string())]
+        );
+        // decode_out/ten-tasks.json is the parity harness array
+        let arr = serde_json::json!([
+            { "id": "t1-read", "text": "a", "max_tokens": 1024 },
+            { "id": "t2-write", "text": "b", "max_tokens": 1280 }
+        ]);
+        assert_eq!(
+            prompts_from_json(&arr).unwrap(),
+            vec![("t1-read".to_string(), "a".to_string()), ("t2-write".to_string(), "b".to_string())]
+        );
+        assert!(prompts_from_json(&serde_json::json!([{ "text": "a" }])).is_err());
+        assert!(prompts_from_json(&serde_json::json!({ "t": 1 })).is_err());
+        assert!(prompts_from_json(&serde_json::json!("nope")).is_err());
     }
 
     #[test]

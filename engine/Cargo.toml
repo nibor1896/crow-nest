@@ -11,6 +11,9 @@ publish = false
 serde_json = "1"
 cudarc = { version = "=0.19.9", features = ["cuda-13030", "dynamic-loading", "nvrtc"] }
 libloading = "0.8"
+# A3 (#25): in-engine tokenizer and chat template, ids identical to tokenize_ids.py --chat
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
+minijinja = { version = "2.24.0", features = ["json", "loop_controls", "loader", "unicode"] }
 
 [[bin]]
 name = "states"

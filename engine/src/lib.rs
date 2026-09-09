@@ -10,3 +10,4 @@ pub mod manager;
 pub mod residency;
 pub mod gen;
 pub mod sample;
+pub mod tokenizer;
