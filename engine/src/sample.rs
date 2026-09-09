@@ -83,6 +83,24 @@ impl Sampler {
         })
     }
 
+    /// #28: a sampler with the data-sheet instruct profile and an explicit seed.
+    ///
+    /// - The server path builds one PER REQUEST, so a warm process draws what a cold one draws.
+    /// - Env is NOT read here; `from_env` stays the harness path and its override.
+    /// - The caller overwrites `temperature`, `top_p`, `top_k`, `presence_penalty` (all pub).
+    /// - `rng` starts at `Rng::new(seed)`, the state `enable_dev_sampler` uploads.
+    pub fn new(seed: u64) -> Self {
+        Sampler {
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: 20,
+            presence_penalty: 1.5,
+            seed,
+            rng: Rng::new(seed),
+            seen: Default::default(),
+        }
+    }
+
     pub fn describe(&self) -> String {
         format!("sample: temp {} top_p {} top_k {} presence {} seed {} {}", self.temperature, self.top_p, self.top_k, self.presence_penalty, self.seed,
             if host_forced() { "host" } else { "gpu" })

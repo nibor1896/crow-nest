@@ -123,7 +123,12 @@
 //! | `max_tokens` | default 1024, capped at 32768 |
 //! | `model` | echoed into every chunk, default `crow-nest` |
 //! | `chat_template_kwargs.enable_thinking` | template variable, default false |
-//! | `temperature`, `top_p`, `min_p`, `top_k` | ACCEPTED AND IGNORED, A4 is greedy (A6 samples) |
+//! | `temperature` | absent, `null` or `<= 0` is GREEDY (the A4 path); `> 0` samples (#28 A6) |
+//! | `top_p` | nucleus mass, default 0.8 (data sheet); read only when `temperature > 0` |
+//! | `top_k` | candidates kept, default 20 (data sheet); read only when `temperature > 0` |
+//! | `presence_penalty` | default 1.5 (data sheet); read only when `temperature > 0` |
+//! | `seed` | RNG seed of THIS request, default 0; a warm process draws what a cold one draws |
+//! | `min_p` | ACCEPTED AND IGNORED, the device sampler has no min_p (#28, open for robin) |
 //! | `tools` | ACCEPTED AND IGNORED, the render carries `messages` only (A7) |
 //! | `stream_options.include_usage` | `true` puts `usage` on the final chunk (#27 A5) |
 //! | `timings_per_token` | `true` puts `timings` on the final chunk (#27 A5) |
@@ -139,6 +144,47 @@
 //! - `prompt ids >= n_ctx` answers 413 before any GPU work.
 //! - Otherwise `max_tokens` is CLAMPED to `n_ctx - prompt ids` and to 32768.
 //! - A clamp logs one stderr line and the request is served, not refused.
+//!
+//! Sampling (#28 A6), what the server path does per request:
+//!
+//! | `temperature` | first id | rest of the ids | device sampler |
+//! |---|---|---|---|
+//! | absent, `null`, `<= 0` | `Engine::prefill` (argmax) | `Engine::decode_step` (argmax) | TAKEN OUT of the engine |
+//! | `> 0` | `Engine::sample_last` | `decode_step` behind the `sample_k` node | ARMED before the first step |
+//!
+//! - Greedy is the A4 path unchanged: same calls, same order, no sampler node in the graph.
+//! - `sample::EOS_IDS` stops BOTH modes; `CROW_STOP_EOS` is the harness opt-in and is NOT read here.
+//! - The sampler is built from the REQUEST, never from the environment.
+//! - `CROW_SAMPLE`, `CROW_TEMP`, `CROW_TOP_P`, `CROW_TOP_K`, `CROW_PRESENCE`, `CROW_SEED`
+//!   keep working for `decode` and `parity`; `serve` reads none of them.
+//! - `Sampler::new(seed)` carries the data-sheet defaults, the request overwrites what it sends.
+//! - Absent fields when `temperature > 0`: top_p 0.8, top_k 20, presence_penalty 1.5, seed 0.
+//!
+//! Per request reseed (M1, robin 2026-09-09):
+//!
+//! - `Engine::enable_dev_sampler` runs for EVERY sampled request, after `prefill`.
+//! - It uploads `Rng::new(seed)` and clears the presence mask, so request k starts cold.
+//! - Therefore request 1 of a fresh process and request 5 of a warm one draw the same ids.
+//! - `Engine::reset_to_zero` drops the decode graph, so the first `decode_step` re-captures.
+//! - Arming BEFORE that first step is what puts the `sample_k` node INTO the new graph.
+//! - Armed after it, the sampler would run as an eager launch per replay: correct, slower.
+//!
+//! Greedy after a sampled request (why the sampler is taken out, not left armed):
+//!
+//! - `decode_step` samples whenever `Engine::dev_sampler` is `Some` (`gen.rs:2905-2909`).
+//! - `reset_to_zero` does NOT clear that field (`reset.rs`, the "needs no reset" table).
+//! - So a greedy request after a sampled one would silently sample.
+//! - `Srv::parked_sampler` holds the `DevSampler` while a greedy request runs.
+//! - The next sampled request hands the same device buffers back, so nothing is reallocated.
+//!
+//! `min_p` (open decision for robin, #28):
+//!
+//! - Crow's operating point is temperature 1.0, top_p 0.95, min_p 0.01 (`crow_core.py`).
+//! - The device sampler (`kernels.rs sample_k`) implements top_k, top_p and presence only.
+//! - A6 does not touch kernels, so `min_p` is parsed, ignored, and logged once per request.
+//! - The log line names it: `min_p accepted and ignored (device sampler has no min_p; #28)`.
+//! - Consequence: an answer at Crow's operating point has NO min_p floor under the nucleus.
+//! - Options for robin: add min_p to `sample_k` (kernel change), or drop it from the profile.
 //!
 //! Stream shape (llama-server / OpenAI, `crow_core.py:4831-4877`):
 //!
@@ -217,9 +263,9 @@
 //! - One stderr line per request with the generated ids, for the A4 identity gate.
 
 use crow_nest_engine::cnq::Cnq;
-use crow_nest_engine::gen::Engine;
+use crow_nest_engine::gen::{DevSampler, Engine};
 use crow_nest_engine::geo::{apply_adapt_policy, Config, CONTEXT_FLOOR};
-use crow_nest_engine::sample::EOS_IDS;
+use crow_nest_engine::sample::{Sampler, EOS_IDS};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -239,6 +285,14 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_TOKENS: usize = 1024;
 /// ceiling for `max_tokens`, so one request cannot hold the process forever
 const MAX_MAX_TOKENS: usize = 32768;
+/// #28: `top_p` when a sampled request carries none (data sheet, `generation_config.json`)
+const DEFAULT_TOP_P: f32 = 0.8;
+/// #28: `top_k` when a sampled request carries none (data sheet)
+const DEFAULT_TOP_K: usize = 20;
+/// #28: `presence_penalty` when a sampled request carries none (data sheet)
+const DEFAULT_PRESENCE: f32 = 1.5;
+/// #28: RNG seed when the request carries none; fixed, so warm equals cold (M1)
+const DEFAULT_SEED: u64 = 0;
 /// the last line of every stream
 const SSE_DONE: &str = "data: [DONE]
 
@@ -552,11 +606,36 @@ struct ChatReq {
     include_usage: bool,
     /// `timings_per_token`: `timings` on the final chunk (#27 A5)
     timings_per_token: bool,
+    /// #28: `<= 0` (absent included) is greedy, `> 0` samples
+    temperature: f32,
+    /// #28: nucleus mass, `DEFAULT_TOP_P` when absent
+    top_p: f32,
+    /// #28: candidates kept, `DEFAULT_TOP_K` when absent
+    top_k: usize,
+    /// #28: presence penalty, `DEFAULT_PRESENCE` when absent
+    presence_penalty: f32,
+    /// #28: RNG seed of this request, `DEFAULT_SEED` when absent
+    seed: u64,
+    /// #28: parsed, ignored, logged; the device sampler has no min_p
+    min_p: f32,
+}
+
+/// - a number field of the sampling profile: absent or `null` gives `d`, a non number is a 400
+/// - `top_k` and `seed` have their own readers below, they are not floats
+fn num_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str, d: f32) -> Result<f32, String> {
+    match obj.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(d),
+        Some(v) => v
+            .as_f64()
+            .map(|x| x as f32)
+            .ok_or_else(|| format!("{key} is not a number")),
+    }
 }
 
 /// - the request body, as Crow sends it (`crow_core.py:4672-4700`)
 /// - unknown fields are accepted and ignored, as llama-server does
-/// - `temperature`, `top_p`, `min_p`, `top_k`, `tools` fall under that rule in A4
+/// - `tools` falls under that rule in A4; `min_p` under it in A6
+/// - the sampling fields (#28) are STRICT on type and lenient on absence
 /// - `Err` carries the message for the 400 body
 fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
     let doc: serde_json::Value =
@@ -617,6 +696,27 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         .get("timings_per_token")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // #28 A6: the sampling profile. Absent stays the data sheet, a wrong type is a 400 (the
+    // caller asked for a draw and must know it did not get the one it named).
+    let temperature = num_field(obj, "temperature", 0.0)?;
+    let top_p = num_field(obj, "top_p", DEFAULT_TOP_P)?;
+    let presence_penalty = num_field(obj, "presence_penalty", DEFAULT_PRESENCE)?;
+    let min_p = num_field(obj, "min_p", 0.0)?;
+    let top_k = match obj.get("top_k") {
+        None | Some(serde_json::Value::Null) => DEFAULT_TOP_K,
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| "top_k is not a non negative integer".to_string())? as usize,
+    };
+    // llama-server takes -1 as "pick a seed"; M1 wants determinism, so a negative seed is
+    // used as its unsigned bit pattern and nothing here ever draws a seed of its own
+    let seed = match obj.get("seed") {
+        None | Some(serde_json::Value::Null) => DEFAULT_SEED,
+        Some(v) => v
+            .as_u64()
+            .or_else(|| v.as_i64().map(|x| x as u64))
+            .ok_or_else(|| "seed is not an integer".to_string())?,
+    };
     Ok(ChatReq {
         model,
         messages: messages.clone(),
@@ -625,7 +725,28 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         enable_thinking,
         include_usage,
         timings_per_token,
+        temperature,
+        top_p,
+        top_k,
+        presence_penalty,
+        seed,
+        min_p,
     })
+}
+
+/// - the `Sampler` this request asks for, or `None` for the greedy A4 path
+/// - `None` is the whole greedy contract: no sampler is built, none is armed
+/// - every field the request left out comes from `Sampler::new` (data sheet)
+fn sampler_from(req: &ChatReq) -> Option<Sampler> {
+    if !(req.temperature > 0.0) {
+        return None;
+    }
+    let mut s = Sampler::new(req.seed);
+    s.temperature = req.temperature;
+    s.top_p = req.top_p;
+    s.top_k = req.top_k;
+    s.presence_penalty = req.presence_penalty;
+    Some(s)
 }
 
 /// - what one served request counted and how long each phase took
@@ -894,6 +1015,44 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
     let mut next = unsafe { srv.eng.prefill(srv.cnq, &prompt, None) };
     let prefill_ms = t_pre.elapsed().as_secs_f64() * 1e3;
 
+    // #28 A6: arm or disarm the device sampler for THIS request. After `prefill` and before the
+    // first `decode_step`: `reset_to_zero` dropped the decode graph, so that step re-captures it
+    // and the `sample_k` node goes in with it. `enable_dev_sampler` re-uploads `Rng::new(seed)`
+    // and clears the presence mask on every call, which is the per request reseed (M1).
+    let sampler = sampler_from(req);
+    match &sampler {
+        Some(s) => {
+            // the device buffers a greedy request parked come back here, nothing is reallocated
+            if srv.eng.dev_sampler.is_none() {
+                srv.eng.dev_sampler = srv.parked_sampler.take();
+            }
+            // unsafe: device uploads and one eager sampler launch, as parity.rs:182-195 does
+            unsafe {
+                srv.eng.enable_dev_sampler(s);
+                // the first id is drawn from the prefill's last logits row, not taken from argmax
+                next = srv.eng.sample_last();
+            }
+            eprintln!(
+                "[chat] sampling on the device: temperature {} top_p {} top_k {} presence_penalty {} seed {}",
+                s.temperature, s.top_p, s.top_k, s.presence_penalty, s.seed
+            );
+        }
+        None => {
+            // greedy is the A4 path: `decode_step` samples whenever `dev_sampler` is Some
+            // (gen.rs:2905-2909) and `reset_to_zero` does not clear it, so it is taken out here
+            if srv.eng.dev_sampler.is_some() {
+                srv.parked_sampler = srv.eng.dev_sampler.take();
+            }
+            eprintln!("[chat] greedy (temperature absent or <= 0)");
+        }
+    }
+    if req.min_p != 0.0 {
+        eprintln!(
+            "[chat] min_p {} accepted and ignored (device sampler has no min_p; #28)",
+            req.min_p
+        );
+    }
+
     let mut aborted = !sse_send(stream, &sse_frame(&chunk_role(&id, created, &model)));
 
     // #27 A5: the decode window opens at the FIRST `decode_step` and closes when the last one
@@ -1110,6 +1269,9 @@ struct Srv<'a> {
     prompt_chunk: usize,
     /// per process request counter, the tail of every chunk `id`
     seq: u64,
+    /// #28: the device sampler while a GREEDY request runs, so its node stays out of the
+    /// capture; the next sampled request takes it back and reuses the same device buffers
+    parked_sampler: Option<DevSampler>,
 }
 
 fn serve_one(stream: &mut TcpStream, srv: &mut Srv) {
@@ -1279,12 +1441,18 @@ fn main() {
         n_ctx,
         prompt_chunk,
         seq: 0,
+        parked_sampler: None,
     };
     for conn in listener.incoming() {
         match conn {
             Ok(mut s) => serve_one(&mut s, &mut srv),
             Err(e) => eprintln!("[serve] accept failed: {e}"),
         }
+    }
+    // #28: a parked device sampler goes back into the engine, so `Engine::drop` frees its
+    // buffers (the accept loop above only ends on a listener error)
+    if srv.eng.dev_sampler.is_none() {
+        srv.eng.dev_sampler = srv.parked_sampler.take();
     }
     drop(srv);
     drop(eng);
@@ -1491,7 +1659,7 @@ mod tests {
             .unwrap();
         assert_eq!(r.max_tokens, MAX_MAX_TOKENS);
 
-        // tools and unknown sampler fields are accepted and ignored
+        // tools are accepted and ignored; top_k is read since #28
         let r = parse_chat(
             br#"{"messages":[{"role":"user","content":"hi"}],
                  "tools":[{"type":"function","function":{"name":"read"}}],"top_k":20}"#,
@@ -1509,6 +1677,110 @@ mod tests {
         assert!(parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stream":"yes"}"#).is_err());
         assert!(parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":0}"#).is_err());
         assert!(parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":-1}"#).is_err());
+    }
+
+    // ------------------------------------------------------- sampling (#28 A6)
+
+    #[test]
+    fn the_sampling_fields_parse_with_the_data_sheet_defaults() {
+        // Crow's operating point, whole: every field present
+        let r = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "temperature":1.0,"top_p":0.95,"min_p":0.01,"top_k":40,
+                 "presence_penalty":0.5,"seed":7}"#,
+        )
+        .unwrap();
+        assert_eq!(r.temperature, 1.0);
+        assert_eq!(r.top_p, 0.95);
+        assert_eq!(r.min_p, 0.01);
+        assert_eq!(r.top_k, 40);
+        assert_eq!(r.presence_penalty, 0.5);
+        assert_eq!(r.seed, 7);
+
+        // nothing present: the data sheet, a fixed seed, and greedy
+        let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+        assert_eq!(r.temperature, 0.0);
+        assert_eq!(r.top_p, DEFAULT_TOP_P);
+        assert_eq!(r.top_k, DEFAULT_TOP_K);
+        assert_eq!(r.presence_penalty, DEFAULT_PRESENCE);
+        assert_eq!(r.seed, DEFAULT_SEED);
+        assert_eq!(r.min_p, 0.0);
+
+        // an explicit null is an absent field, not a 400
+        let r = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "temperature":null,"top_p":null,"top_k":null,"seed":null,"min_p":null}"#,
+        )
+        .unwrap();
+        assert_eq!(r.top_p, DEFAULT_TOP_P);
+        assert_eq!(r.top_k, DEFAULT_TOP_K);
+        assert_eq!(r.seed, DEFAULT_SEED);
+
+        // llama-server's "pick a seed" is taken as a value, never as a draw (M1: determinism)
+        let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"seed":-1}"#).unwrap();
+        assert_eq!(r.seed, u64::MAX);
+
+        // a wrong type is a 400: the caller named a profile it would not have got
+        let bad = [
+            &br#"{"messages":[{"role":"user","content":"hi"}],"temperature":"hot"}"#[..],
+            &br#"{"messages":[{"role":"user","content":"hi"}],"top_p":"wide"}"#[..],
+            &br#"{"messages":[{"role":"user","content":"hi"}],"top_k":"many"}"#[..],
+            &br#"{"messages":[{"role":"user","content":"hi"}],"top_k":-3}"#[..],
+            &br#"{"messages":[{"role":"user","content":"hi"}],"seed":"lucky"}"#[..],
+            &br#"{"messages":[{"role":"user","content":"hi"}],"min_p":"low"}"#[..],
+            &br#"{"messages":[{"role":"user","content":"hi"}],"presence_penalty":"some"}"#[..],
+        ];
+        for b in bad {
+            assert!(parse_chat(b).is_err(), "expected a 400 for {}", String::from_utf8_lossy(b));
+        }
+    }
+
+    #[test]
+    fn greedy_is_absent_zero_and_negative_temperature() {
+        let mk = |t: &str| {
+            let body = format!(
+                r#"{{"messages":[{{"role":"user","content":"hi"}}]{t}}}"#
+            );
+            parse_chat(body.as_bytes()).unwrap()
+        };
+        // greedy: the A4 path, no sampler is built at all
+        assert!(sampler_from(&mk("")).is_none());
+        assert!(sampler_from(&mk(r#","temperature":0"#)).is_none());
+        assert!(sampler_from(&mk(r#","temperature":0.0"#)).is_none());
+        assert!(sampler_from(&mk(r#","temperature":null"#)).is_none());
+        assert!(sampler_from(&mk(r#","temperature":-1.0"#)).is_none());
+        // greedy stays greedy even when the rest of the profile is sent
+        assert!(sampler_from(&mk(r#","temperature":0,"top_p":0.95,"min_p":0.01,"seed":7"#)).is_none());
+        // any positive temperature samples
+        assert!(sampler_from(&mk(r#","temperature":0.0001"#)).is_some());
+        assert!(sampler_from(&mk(r#","temperature":1.0"#)).is_some());
+    }
+
+    #[test]
+    fn the_sampler_carries_the_request_seed_and_the_data_sheet_rest() {
+        // only temperature and seed sent: everything else is the data sheet
+        let r = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],"temperature":1.0,"seed":7}"#,
+        )
+        .unwrap();
+        let s = sampler_from(&r).expect("temperature 1.0 samples");
+        assert_eq!(s.seed, 7);
+        assert_eq!(s.temperature, 1.0);
+        assert_eq!(s.top_p, DEFAULT_TOP_P);
+        assert_eq!(s.top_k, DEFAULT_TOP_K);
+        assert_eq!(s.presence_penalty, DEFAULT_PRESENCE);
+        // the RNG state is the seed's, so two requests with the same seed upload the same state
+        assert_eq!(s.rng.state(), Sampler::new(7).rng.state());
+        assert_ne!(s.rng.state(), Sampler::new(8).rng.state());
+
+        // what the request does send wins over the data sheet
+        let r = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "temperature":1.0,"top_p":0.95,"top_k":40,"presence_penalty":0.0,"seed":1}"#,
+        )
+        .unwrap();
+        let s = sampler_from(&r).unwrap();
+        assert_eq!((s.top_p, s.top_k, s.presence_penalty, s.seed), (0.95, 40, 0.0, 1));
     }
 
     #[test]
