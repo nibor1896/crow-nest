@@ -125,7 +125,11 @@
 //! | `chat_template_kwargs.enable_thinking` | template variable, default false |
 //! | `temperature`, `top_p`, `min_p`, `top_k` | ACCEPTED AND IGNORED, A4 is greedy (A6 samples) |
 //! | `tools` | ACCEPTED AND IGNORED, the render carries `messages` only (A7) |
-//! | `stream_options`, `timings_per_token` | ACCEPTED AND IGNORED (A5 adds usage and timings) |
+//! | `stream_options.include_usage` | `true` puts `usage` on the final chunk (#27 A5) |
+//! | `timings_per_token` | `true` puts `timings` on the final chunk (#27 A5) |
+//!
+//! - Both flags are read leniently: anything that is not JSON `true` counts as off.
+//! - Neither flag changes generation; they only add two objects to the last chunk.
 //!
 //! Rendering and generation:
 //!
@@ -142,12 +146,46 @@
 //! |---|---|
 //! | 1 | `data: {... "choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}` |
 //! | 2..n | `data: {... "delta":{"content":"..."},"finish_reason":null}` |
-//! | n+1 | `data: {... "delta":{},"finish_reason":"stop"}` |
+//! | n+1 | `data: {... "delta":{},"finish_reason":"stop"[, "usage":{...}][, "timings":{...}]}` |
 //! | n+2 | `data: [DONE]` |
 //!
 //! - Headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: close`.
 //! - No `Content-Length` and no chunked framing: the body is close delimited.
 //! - Every frame is flushed on its own; one token can never wait for the next.
+//!
+//! `usage` and `timings` on the final chunk (#27 A5):
+//!
+//! - Both ride on the SAME chunk that carries `finish_reason`, before `data: [DONE]`.
+//! - `usage` is written when `stream_options.include_usage` is `true`, else omitted.
+//! - `timings` is written when `timings_per_token` is `true`, else omitted.
+//! - Neither flag set: the final chunk is exactly the A4 chunk, byte for byte.
+//! - Field names and shape mirror llama-server, the server Crow was written against.
+//!
+//! | object | field | type | value |
+//! |---|---|---|---|
+//! | `usage` | `prompt_tokens` | int | rendered prompt ids |
+//! | `usage` | `completion_tokens` | int | generated ids |
+//! | `usage` | `total_tokens` | int | `prompt_tokens + completion_tokens` |
+//! | `usage` | `prompt_tokens_details.cached_tokens` | int | ALWAYS 0 until the prefix cache (A9) |
+//! | `timings` | `prompt_n` | int | rendered prompt ids |
+//! | `timings` | `prompt_ms` | float | wall of the `Engine::prefill` call |
+//! | `timings` | `prompt_per_second` | float | `prompt_n / prompt_ms * 1000` |
+//! | `timings` | `prompt_per_token_ms` | float | `prompt_ms / prompt_n` |
+//! | `timings` | `predicted_n` | int | generated ids |
+//! | `timings` | `predicted_ms` | float | wall of the decode loop, first `decode_step` to the last |
+//! | `timings` | `predicted_per_second` | float | `predicted_n / predicted_ms * 1000` |
+//! | `timings` | `predicted_per_token_ms` | float | `predicted_ms / predicted_n` |
+//! | `timings` | `cache_n` | int | ALWAYS 0 until the prefix cache (A9) |
+//!
+//! - `cached_tokens` and `cache_n` are PRESENT as 0, never missing: a missing
+//!   `cached_tokens` makes Crow fall back to `prompt_n` (`crow_core.py:14923`), which counts
+//!   something else.
+//! - `prompt_ms` excludes `Engine::reset_to_zero` and the tokenizer, so it is the same window
+//!   `decode run` prints as `prefill done in X s`.
+//! - `predicted_n` counts the token `prefill` returned, `predicted_ms` starts at the first
+//!   `decode_step`; llama-server has the same offset and Crow's reader expects it.
+//! - Every rate is 0.0 when its ms is 0, negative or not finite; no NaN can reach the wire
+//!   (`serde_json` turns a non finite float into `null`).
 //!
 //! Incremental detokenization:
 //!
@@ -499,6 +537,10 @@ struct ChatReq {
     max_tokens: usize,
     /// `chat_template_kwargs.enable_thinking`, a template variable
     enable_thinking: bool,
+    /// `stream_options.include_usage`: `usage` on the final chunk (#27 A5)
+    include_usage: bool,
+    /// `timings_per_token`: `timings` on the final chunk (#27 A5)
+    timings_per_token: bool,
 }
 
 /// - the request body, as Crow sends it (`crow_core.py:4672-4700`)
@@ -553,7 +595,94 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         .and_then(|v| v.as_str())
         .unwrap_or("crow-nest")
         .to_string();
-    Ok(ChatReq { model, messages: messages.clone(), stream, max_tokens, enable_thinking })
+    // #27 A5: lenient on purpose, a wrong type is "off", never a 400. Crow always sends both
+    // as `true` (`crow_core.py:4684-4688`); every other client just gets the A4 stream.
+    let include_usage = obj
+        .get("stream_options")
+        .and_then(|o| o.get("include_usage"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let timings_per_token = obj
+        .get("timings_per_token")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Ok(ChatReq {
+        model,
+        messages: messages.clone(),
+        stream,
+        max_tokens,
+        enable_thinking,
+        include_usage,
+        timings_per_token,
+    })
+}
+
+/// - what one served request counted and how long each phase took
+/// - the only input of the `usage` and `timings` builders, so the test drives them directly
+/// - `prompt_ms` is the `Engine::prefill` wall, `predicted_ms` the decode loop wall
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Timing {
+    /// rendered prompt ids
+    prompt_n: usize,
+    /// generated ids, the token `prefill` returned included
+    predicted_n: usize,
+    /// wall of the prefill call, in ms
+    prompt_ms: f64,
+    /// wall from the first `decode_step` to the last, in ms
+    predicted_ms: f64,
+}
+
+/// - tokens per second out of a count and a wall time in ms
+/// - 0.0 for a wall of 0, a negative wall or a non finite wall, so no NaN reaches the wire
+fn per_second(n: usize, ms: f64) -> f64 {
+    if !(ms > 0.0) || !ms.is_finite() {
+        return 0.0;
+    }
+    n as f64 * 1000.0 / ms
+}
+
+/// - ms per token out of a wall time in ms and a count
+/// - 0.0 for a count of 0 or a non finite wall, the mirror of `per_second`
+fn per_token_ms(n: usize, ms: f64) -> f64 {
+    if n == 0 || !ms.is_finite() {
+        return 0.0;
+    }
+    ms / n as f64
+}
+
+/// microsecond resolution, so the gate log carries a number a person can read
+fn round3(x: f64) -> f64 {
+    if !x.is_finite() {
+        return 0.0;
+    }
+    (x * 1e3).round() / 1e3
+}
+
+/// - the OpenAI `usage` object, as llama-server sends it
+/// - `cached_tokens` is an explicit 0: there is no prefix cache before A9
+fn usage_json(t: &Timing) -> serde_json::Value {
+    serde_json::json!({
+        "prompt_tokens": t.prompt_n,
+        "completion_tokens": t.predicted_n,
+        "total_tokens": t.prompt_n + t.predicted_n,
+        "prompt_tokens_details": { "cached_tokens": 0 },
+    })
+}
+
+/// - the llama.cpp `timings` object (`crow_core.py:4999-5018` reads six of these fields)
+/// - `cache_n` is an explicit 0: there is no prefix cache before A9
+fn timings_json(t: &Timing) -> serde_json::Value {
+    serde_json::json!({
+        "prompt_n": t.prompt_n,
+        "prompt_ms": round3(t.prompt_ms),
+        "prompt_per_second": round3(per_second(t.prompt_n, t.prompt_ms)),
+        "prompt_per_token_ms": round3(per_token_ms(t.prompt_n, t.prompt_ms)),
+        "predicted_n": t.predicted_n,
+        "predicted_ms": round3(t.predicted_ms),
+        "predicted_per_second": round3(per_second(t.predicted_n, t.predicted_ms)),
+        "predicted_per_token_ms": round3(per_token_ms(t.predicted_n, t.predicted_ms)),
+        "cache_n": 0,
+    })
 }
 
 /// one `chat.completion.chunk`, the only object shape this endpoint streams
@@ -590,9 +719,29 @@ fn chunk_content(id: &str, created: u64, model: &str, text: &str) -> serde_json:
     chunk(id, created, model, serde_json::json!({ "content": text }), None)
 }
 
-/// last chunk before `[DONE]`: empty delta, the finish reason
-fn chunk_finish(id: &str, created: u64, model: &str, reason: &str) -> serde_json::Value {
-    chunk(id, created, model, serde_json::json!({}), Some(reason))
+/// - last chunk before `[DONE]`: empty delta, the finish reason
+/// - `usage` rides along when `include_usage`, `timings` when `timings_per_token` (#27 A5)
+/// - neither flag: the object is exactly the A4 chunk, no empty placeholders
+/// - pure: the whole final chunk contract is one function the test can drive
+fn chunk_finish(
+    id: &str,
+    created: u64,
+    model: &str,
+    reason: &str,
+    t: &Timing,
+    include_usage: bool,
+    timings_per_token: bool,
+) -> serde_json::Value {
+    let mut doc = chunk(id, created, model, serde_json::json!({}), Some(reason));
+    if let Some(obj) = doc.as_object_mut() {
+        if include_usage {
+            obj.insert("usage".to_string(), usage_json(t));
+        }
+        if timings_per_token {
+            obj.insert("timings".to_string(), timings_json(t));
+        }
+    }
+    doc
 }
 
 /// one SSE event: `data: <compact json>` plus the blank line that ends it
@@ -724,17 +873,21 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
     }
 
     let prompt: Vec<i64> = ids.iter().map(|&v| v as i64).collect();
-    let t_pre = Instant::now();
     // unsafe: engine kernels; the CUDA context and engine/.engine.lock are this process's
-    let mut next = unsafe {
-        srv.eng.reset_to_zero();
-        srv.eng.prefill(srv.cnq, &prompt, None)
-    };
+    let t_reset = Instant::now();
+    unsafe { srv.eng.reset_to_zero() };
+    let reset_ms = t_reset.elapsed().as_secs_f64() * 1e3;
+    // #27 A5: the timed window is the prefill CALL alone, the same window `decode run` prints
+    // as `prefill done in X s`; the reset and the tokenizer are outside it
+    let t_pre = Instant::now();
+    let mut next = unsafe { srv.eng.prefill(srv.cnq, &prompt, None) };
     let prefill_ms = t_pre.elapsed().as_secs_f64() * 1e3;
 
     let mut aborted = !sse_send(stream, &sse_frame(&chunk_role(&id, created, &model)));
 
-    let t_dec = Instant::now();
+    // #27 A5: the decode window opens at the FIRST `decode_step` and closes when the last one
+    // returns, so the detokenize and the SSE write of token 1 are not counted as decode
+    let mut t_dec: Option<Instant> = None;
     let mut out: Vec<u32> = Vec::with_capacity(req.max_tokens);
     // bytes of the accumulated decode that already left as content
     let mut emitted = 0usize;
@@ -767,9 +920,10 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
             if i + 1 == req.max_tokens {
                 break;
             }
+            let t = *t_dec.get_or_insert_with(Instant::now);
             next = unsafe { srv.eng.decode_step(srv.cnq, next as i64) };
+            decode_ms = t.elapsed().as_secs_f64() * 1e3;
         }
-        decode_ms = t_dec.elapsed().as_secs_f64() * 1e3;
     }
 
     // the tail the hold back kept (a never completed sequence, or a real U+FFFD)
@@ -783,16 +937,33 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
             }
         }
     }
+    let gen = out.len();
+    let timing = Timing {
+        prompt_n: ids.len(),
+        predicted_n: gen,
+        prompt_ms: prefill_ms,
+        predicted_ms: decode_ms,
+    };
     if !aborted {
-        let _ = sse_send(stream, &sse_frame(&chunk_finish(&id, created, &model, finish)))
-            && sse_send(stream, SSE_DONE);
+        let last = chunk_finish(
+            &id,
+            created,
+            &model,
+            finish,
+            &timing,
+            req.include_usage,
+            req.timings_per_token,
+        );
+        let _ = sse_send(stream, &sse_frame(&last)) && sse_send(stream, SSE_DONE);
     }
 
-    let gen = out.len();
     eprintln!(
-        "[chat] prompt {} tok, generated {gen} tok, prefill {prefill_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {content_chunks}{}",
+        "[chat] prompt {} tok, generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {content_chunks}, usage {}, timings {}{}",
         ids.len(),
+        per_second(ids.len(), prefill_ms),
         (gen.saturating_sub(1)) as f64 * 1000.0 / decode_ms.max(1e-9),
+        req.include_usage,
+        req.timings_per_token,
         if aborted { ", client gone" } else { "" }
     );
     eprintln!("[chat] ids {out:?}");
@@ -1363,10 +1534,130 @@ mod tests {
         assert_eq!(c["choices"][0]["finish_reason"], serde_json::Value::Null);
 
         // the last chunk: empty delta, a finish reason, and only ONE of them exists
-        let f = chunk_finish("chatcmpl-1", 1, "crow-nest", "stop");
+        let t = T0;
+        let f = chunk_finish("chatcmpl-1", 1, "crow-nest", "stop", &t, false, false);
         assert_eq!(f["choices"][0]["finish_reason"], "stop");
         assert_eq!(f["choices"][0]["delta"], serde_json::json!({}));
-        assert_eq!(chunk_finish("i", 1, "m", "length")["choices"][0]["finish_reason"], "length");
+        assert_eq!(
+            chunk_finish("i", 1, "m", "length", &t, false, false)["choices"][0]["finish_reason"],
+            "length"
+        );
+    }
+
+    /// the numbers of one served request, so every A5 test speaks about the same turn
+    const T0: Timing =
+        Timing { prompt_n: 16_064, predicted_n: 8, prompt_ms: 24_500.0, predicted_ms: 320.0 };
+
+    #[test]
+    fn without_the_two_flags_the_final_chunk_is_the_a4_chunk() {
+        let f = chunk_finish("id", 7, "m", "stop", &T0, false, false);
+        assert!(f.get("usage").is_none());
+        assert!(f.get("timings").is_none());
+        // nothing else moved either: the object is exactly what A4 sent
+        assert_eq!(
+            f,
+            chunk("id", 7, "m", serde_json::json!({}), Some("stop")),
+        );
+        // one flag at a time carries one object at a time
+        let u = chunk_finish("id", 7, "m", "stop", &T0, true, false);
+        assert!(u.get("usage").is_some());
+        assert!(u.get("timings").is_none());
+        let t = chunk_finish("id", 7, "m", "stop", &T0, false, true);
+        assert!(t.get("usage").is_none());
+        assert!(t.get("timings").is_some());
+    }
+
+    #[test]
+    fn the_final_chunk_carries_the_eight_fields_crow_reads() {
+        // crow_core.py:4838-4845 (usage) and :4999-5018 (timings)
+        let f = chunk_finish("id", 7, "m", "stop", &T0, true, true);
+        // the finish reason did not move: Crow reads it off the SAME chunk
+        assert_eq!(f["choices"][0]["finish_reason"], "stop");
+
+        let u = &f["usage"];
+        assert_eq!(u["prompt_tokens"].as_u64(), Some(16_064));
+        assert_eq!(u["completion_tokens"].as_u64(), Some(8));
+        assert_eq!(u["total_tokens"].as_u64(), Some(16_072));
+        // the equality the gate checks, from the object itself, not from the inputs
+        assert_eq!(
+            u["total_tokens"].as_u64().unwrap(),
+            u["prompt_tokens"].as_u64().unwrap() + u["completion_tokens"].as_u64().unwrap()
+        );
+        // PRESENT as 0, never missing: a missing one makes Crow fall back to prompt_n
+        assert_eq!(u["prompt_tokens_details"]["cached_tokens"].as_i64(), Some(0));
+
+        let g = &f["timings"];
+        assert_eq!(g["prompt_n"].as_u64(), Some(16_064));
+        assert_eq!(g["predicted_n"].as_u64(), Some(8));
+        assert_eq!(g["cache_n"].as_i64(), Some(0));
+        // ms and rates are floats, counts are ints
+        for k in ["prompt_ms", "predicted_ms", "prompt_per_second", "predicted_per_second",
+                  "prompt_per_token_ms", "predicted_per_token_ms"] {
+            assert!(g[k].is_f64(), "{k} is not a float: {}", g[k]);
+        }
+        for k in ["prompt_n", "predicted_n", "cache_n"] {
+            assert!(g[k].is_i64() || g[k].is_u64(), "{k} is not an int: {}", g[k]);
+        }
+        assert_eq!(g["prompt_ms"].as_f64(), Some(24_500.0));
+        assert_eq!(g["predicted_ms"].as_f64(), Some(320.0));
+        assert_eq!(g["prompt_per_second"].as_f64(), Some(round3(16_064.0 * 1000.0 / 24_500.0)));
+        assert_eq!(g["predicted_per_second"].as_f64(), Some(25.0));
+        assert_eq!(g["predicted_per_token_ms"].as_f64(), Some(40.0));
+    }
+
+    #[test]
+    fn the_rates_are_n_over_ms_and_never_a_nan() {
+        assert_eq!(per_second(16_064, 24_500.0), 16_064.0 * 1000.0 / 24_500.0);
+        assert_eq!(per_second(8, 320.0), 25.0);
+        assert_eq!(per_token_ms(8, 320.0), 40.0);
+        assert_eq!(per_token_ms(16_064, 24_500.0), 24_500.0 / 16_064.0);
+        // the degenerate turns: an aborted request, a request that generated nothing
+        assert_eq!(per_second(0, 0.0), 0.0);
+        assert_eq!(per_second(8, 0.0), 0.0);
+        assert_eq!(per_second(8, -1.0), 0.0);
+        assert_eq!(per_second(8, f64::NAN), 0.0);
+        assert_eq!(per_second(8, f64::INFINITY), 0.0);
+        assert_eq!(per_token_ms(0, 320.0), 0.0);
+        assert_eq!(per_token_ms(8, f64::NAN), 0.0);
+        assert_eq!(round3(f64::NAN), 0.0);
+        assert_eq!(round3(1.23456), 1.235);
+        // a zero wall must still leave a NUMBER on the wire, serde turns NaN into null
+        let z = Timing { prompt_n: 0, predicted_n: 0, prompt_ms: 0.0, predicted_ms: 0.0 };
+        let f = chunk_finish("id", 7, "m", "stop", &z, true, true);
+        for k in ["prompt_ms", "prompt_per_second", "predicted_per_second", "predicted_per_token_ms"] {
+            assert_eq!(f["timings"][k].as_f64(), Some(0.0), "{k} is {}", f["timings"][k]);
+        }
+        assert_eq!(f["usage"]["total_tokens"].as_u64(), Some(0));
+        assert!(!f["timings"].to_string().contains("null"), "{}", f["timings"]);
+    }
+
+    #[test]
+    fn the_two_stream_flags_parse_out_of_the_body_crow_sends() {
+        // the body Crow builds (crow_core.py:4672-4700), trimmed to the A5 fields
+        let r = parse_chat(
+            br#"{"model":"crow-nest","messages":[{"role":"user","content":"hi"}],
+                 "stream":true,"stream_options":{"include_usage":true},"timings_per_token":true}"#,
+        )
+        .unwrap();
+        assert!(r.include_usage);
+        assert!(r.timings_per_token);
+
+        // absent means off, and that is the A4 stream
+        let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#).unwrap();
+        assert!(!r.include_usage);
+        assert!(!r.timings_per_token);
+
+        // explicit false, an empty stream_options, a null, a wrong type: all off, never a 400
+        for body in [
+            &br#"{"messages":[{"role":"user","content":"x"}],"stream_options":{"include_usage":false},"timings_per_token":false}"#[..],
+            &br#"{"messages":[{"role":"user","content":"x"}],"stream_options":{},"timings_per_token":null}"#[..],
+            &br#"{"messages":[{"role":"user","content":"x"}],"stream_options":null,"timings_per_token":"yes"}"#[..],
+            &br#"{"messages":[{"role":"user","content":"x"}],"stream_options":"nope","timings_per_token":1}"#[..],
+        ] {
+            let r = parse_chat(body).unwrap();
+            assert!(!r.include_usage, "include_usage true for {}", String::from_utf8_lossy(body));
+            assert!(!r.timings_per_token, "timings_per_token true for {}", String::from_utf8_lossy(body));
+        }
     }
 
     #[test]
