@@ -269,11 +269,11 @@
 //!
 //! | object | field | type | value |
 //! |---|---|---|---|
-//! | `usage` | `prompt_tokens` | int | rendered prompt ids |
+//! | `usage` | `prompt_tokens` | int | rendered prompt ids, the cached part included |
 //! | `usage` | `completion_tokens` | int | generated ids |
 //! | `usage` | `total_tokens` | int | `prompt_tokens + completion_tokens` |
-//! | `usage` | `prompt_tokens_details.cached_tokens` | int | ALWAYS 0 until the prefix cache (A9) |
-//! | `timings` | `prompt_n` | int | rendered prompt ids |
+//! | `usage` | `prompt_tokens_details.cached_tokens` | int | `P`, prompt ids reused from the prefix cache (#31 A9) |
+//! | `timings` | `prompt_n` | int | prompt ids actually PREFILLED, `prompt_tokens - cached_tokens` (#31 A9) |
 //! | `timings` | `prompt_ms` | float | wall of the `Engine::prefill` call |
 //! | `timings` | `prompt_per_second` | float | `prompt_n / prompt_ms * 1000` |
 //! | `timings` | `prompt_per_token_ms` | float | `prompt_ms / prompt_n` |
@@ -281,18 +281,23 @@
 //! | `timings` | `predicted_ms` | float | wall of the decode loop, first `decode_step` to the last |
 //! | `timings` | `predicted_per_second` | float | `predicted_n / predicted_ms * 1000` |
 //! | `timings` | `predicted_per_token_ms` | float | `predicted_ms / predicted_n` |
-//! | `timings` | `cache_n` | int | ALWAYS 0 until the prefix cache (A9) |
+//! | `timings` | `cache_n` | int | `P`, the same number as `cached_tokens` (#31 A9) |
 //! | `timings` | `crow_expert_selections` | u64 | see the A8 table below |
 //! | `timings` | `crow_expert_cold` | u64 | see the A8 table below |
 //! | `timings` | `crow_ple_rows` | u64 | see the A8 table below |
 //! | `timings` | `crow_ple_misses` | u64 | see the A8 table below |
 //! | `timings` | `crow_layers` | int | see the A8 table below |
 //!
-//! - `cached_tokens` and `cache_n` are PRESENT as 0, never missing: a missing
-//!   `cached_tokens` makes Crow fall back to `prompt_n` (`crow_core.py:14923`), which counts
-//!   something else.
-//! - `prompt_ms` excludes `Engine::reset_to_zero` and the tokenizer, so it is the same window
-//!   `decode run` prints as `prefill done in X s`.
+//! - `cached_tokens` and `cache_n` are always PRESENT as an integer, never missing: a
+//!   missing `cached_tokens` makes Crow fall back to `prompt_n` (`crow_core.py:14923`),
+//!   which counts something else.
+//! - A cold request has `cached_tokens` 0, and then every number is the A5 number.
+//! - `prompt_tokens` is the whole rendered prompt either way, so `total_tokens` still is
+//!   `prompt_tokens + completion_tokens` and Crow's context accounting is unchanged.
+//! - `prompt_ms` and `prompt_per_second` belong to `prompt_n`, the PREFILLED tokens: a warm
+//!   turn prefills few tokens, so a low `prompt_per_second` there is a small-batch effect.
+//! - `prompt_ms` excludes the rollback, `Engine::reset_to_zero`, the snapshots and the
+//!   tokenizer, so it is the same window `decode run` prints as `prefill done in X s`.
 //! - `predicted_n` counts the token `prefill` returned, `predicted_ms` starts at the first
 //!   `decode_step`; llama-server has the same offset and Crow's reader expects it.
 //! - Every rate is 0.0 when its ms is 0, negative or not finite; no NaN can reach the wire
@@ -355,14 +360,43 @@
 //! - Assumed of `decode`: prefix stability across one more id; a violation is lossy, never a panic.
 //! - Cost: one decode of the whole answer per token, microseconds against ms of GPU.
 //!
-//! One conversation at a time (M1):
+//! One conversation at a time (M1), with the prefix cache (#31 A9, spec section 7):
 //!
-//! - `Engine::reset_to_zero` runs before every prefill, so request k equals a fresh process.
-//! - The reset field list and its evidence live in `engine/src/reset.rs`.
-//! - A write error aborts the generation loop; the next request resets the state anyway.
-//! - One stderr line per request: prompt tokens, generated tokens, prefill ms, decode ms.
-//! - One stderr line per request with the generated ids, for the A4 identity gate.
+//! - ONE held conversation per process; a request that shares no prefix replaces it.
+//! - `L` = longest common id prefix of the request and `Engine::history`, ids only.
+//! - `P` = the newest snapshot position at or below `L`, and below the request length.
+//! - `P` found: `PrefixCache::rollback` restores the state, `prefill` gets `ids[P..]`.
+//! - No such snapshot: `Engine::reset_to_zero`, both slots dropped, the whole prompt prefilled.
+//! - Two snapshots per request, both unconditional (M1): after the prompt, after the answer.
+//! - Only the PROMPT snapshot is a reuse candidate (#31 A9 gate part 3, measured):
+//!   `decode_step` rows are not bit equal to prefill rows at the same positions, and
+//!   spec 7.5 says recompute where the correct state cannot be proven present.
+//! - What is copied, what is not, the induction and the evidence: `engine/src/cache.rs`.
+//! - The reset field list and its evidence: `engine/src/reset.rs`.
+//! - A write error aborts the generation loop; the next request rolls back or resets first.
+//! - `CROW_PREFIX_CACHE=0` allocates no slot and makes every request a cold start.
+//!
+//! Cache lines on stderr, one set per request (spec 7.9 asks for these numbers):
+//!
+//! | line | carries |
+//! |---|---|
+//! | `[cache] WARM\|COLD L .., P .., snapshots [..], reusable [..], prefill n of m tok, rollback X ms` | the decision and the HtoD wall |
+//! | `[cache] snapshot point 1 (after prompt) at pos .., DtoH X ms` | point 1 of spec 7.6 |
+//! | `[cache] snapshot point 2 (after answer) at pos .., DtoH X ms, slots [..]` | point 2 of spec 7.6 |
+//!
+//! - One stderr line per request: prompt tokens (cached and prefilled), generated tokens,
+//!   prefill ms, decode ms.
+//! - One stderr line per request with the generated ids, for the A4 and A9 identity gates.
+//! - The point 2 snapshot runs AFTER `data: [DONE]`, so no client waits for its copy.
+//!
+//! What the second turn of a real Crow conversation actually hits (#31 A9, measured):
+//!
+//! - The transcript is re-rendered through the chat template every turn.
+//! - The re-rendered assistant message need not reproduce the generated ids exactly.
+//! - The rollback lands on point 1 in either case, because point 2 is not a candidate.
+//! - That is the rule working, not a special case: the prompt prefill is still spared.
 
+use crow_nest_engine::cache::{PrefixCache, SLOT_ANSWER, SLOT_PROMPT};
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::{DevSampler, Engine};
 use crow_nest_engine::geo::{apply_adapt_policy, Config, CONTEXT_FLOOR, LAYERS};
@@ -884,8 +918,10 @@ fn sampler_from(req: &ChatReq) -> Option<Sampler> {
 /// - the four `*_total` fields are ENGINE counters, CUMULATIVE since process start (#30 A8)
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Timing {
-    /// rendered prompt ids
+    /// prompt ids actually PREFILLED this request, `rendered prompt - cached_n` (#31 A9)
     prompt_n: usize,
+    /// #31 A9: prompt ids reused from the held state, the reuse point `P` of spec 7.4
+    cached_n: usize,
     /// generated ids, the token `prefill` returned included
     predicted_n: usize,
     /// wall of the prefill call, in ms
@@ -929,18 +965,20 @@ fn round3(x: f64) -> f64 {
 }
 
 /// - the OpenAI `usage` object, as llama-server sends it
-/// - `cached_tokens` is an explicit 0: there is no prefix cache before A9
+/// - `prompt_tokens` is the WHOLE rendered prompt, the cached part included
+/// - `cached_tokens` is `P`, the tokens the prefix cache reused (#31 A9, spec 7.4)
+/// - a cold request carries `cached_n` 0, so this is the A5 object unchanged
 fn usage_json(t: &Timing) -> serde_json::Value {
     serde_json::json!({
-        "prompt_tokens": t.prompt_n,
+        "prompt_tokens": t.cached_n + t.prompt_n,
         "completion_tokens": t.predicted_n,
-        "total_tokens": t.prompt_n + t.predicted_n,
-        "prompt_tokens_details": { "cached_tokens": 0 },
+        "total_tokens": t.cached_n + t.prompt_n + t.predicted_n,
+        "prompt_tokens_details": { "cached_tokens": t.cached_n },
     })
 }
 
 /// - the llama.cpp `timings` object (`crow_core.py:4999-5018` reads six of these fields)
-/// - `cache_n` is an explicit 0: there is no prefix cache before A9
+/// - `prompt_n` is what was PREFILLED, `cache_n` what was reused from the cache (#31 A9)
 /// - the `crow_` keys are the engine counters (#30 A8): u64, CUMULATIVE, never reset
 /// - the prefix keeps them out of llama-server's key space, so no reader collides
 fn timings_json(t: &Timing) -> serde_json::Value {
@@ -953,7 +991,7 @@ fn timings_json(t: &Timing) -> serde_json::Value {
         "predicted_ms": round3(t.predicted_ms),
         "predicted_per_second": round3(per_second(t.predicted_n, t.predicted_ms)),
         "predicted_per_token_ms": round3(per_token_ms(t.predicted_n, t.predicted_ms)),
-        "cache_n": 0,
+        "cache_n": t.cached_n,
         "crow_expert_selections": t.selections_total,
         "crow_expert_cold": t.cold_total,
         "crow_ple_rows": t.ple_rows_total,
@@ -1241,8 +1279,10 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
 }
 
 /// - prefill, then greedy decode, one flushed SSE frame per emitted delta
-/// - the engine is reset to position 0 first, so request k equals a fresh process
-/// - a write error breaks the loop; the engine stays dirty and the next reset cleans it
+/// - #31 A9: the prefix cache decides FIRST (spec 7.4); a warm request rolls back to `P`
+///   and prefills `ids[P..]`, a cold one runs `reset_to_zero` and prefills everything
+/// - two snapshots per request, both unconditional (M1): after the prompt, after the answer
+/// - a write error breaks the loop; the next request rolls back or resets before any prefill
 fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]) -> &'static str {
     let tk = match crow_nest_engine::tokenizer::global() {
         Ok(t) => t,
@@ -1262,15 +1302,53 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
     }
 
     let prompt: Vec<i64> = ids.iter().map(|&v| v as i64).collect();
+    // #31 A9: the detection rule of spec 7.4, host side, IDS ONLY. `Engine::history` is the
+    // held conversation: prompt ids AND generated ids (`gen.rs:2698`, `gen.rs:2945`).
+    let plan = srv.cache.decide(&srv.eng.history, &prompt);
+    let held = srv.eng.history.len();
+    let snaps = srv.cache.positions();
+    let reusable = srv.cache.reuse_candidates();
     // unsafe: engine kernels; the CUDA context and engine/.engine.lock are this process's
     let t_reset = Instant::now();
-    unsafe { srv.eng.reset_to_zero() };
+    let cached_n = match plan.reuse {
+        // warm: restore the four recurrent buffers, put pos, done_blocks and history back
+        Some((slot, p)) => {
+            unsafe { srv.cache.rollback(srv.eng, slot) };
+            p
+        }
+        // cold: no snapshot at or below L, so the whole state goes back to 0 (A4). Both
+        // slots are dropped with it: their positions name a history this process discards.
+        None => {
+            unsafe { srv.eng.reset_to_zero() };
+            srv.cache.invalidate();
+            0
+        }
+    };
     let reset_ms = t_reset.elapsed().as_secs_f64() * 1e3;
+    let prefilled = prompt.len() - cached_n;
+    eprintln!(
+        "[cache] {} L {} (held {}), P {cached_n}, snapshots {:?}, reusable {:?}, prefill {prefilled} of {} tok, rollback {reset_ms:.3} ms",
+        if plan.reuse.is_some() { "WARM" } else { "COLD" },
+        plan.l,
+        held,
+        snaps,
+        reusable,
+        prompt.len()
+    );
     // #27 A5: the timed window is the prefill CALL alone, the same window `decode run` prints
-    // as `prefill done in X s`; the reset and the tokenizer are outside it
+    // as `prefill done in X s`; the rollback, the reset and the tokenizer are outside it
     let t_pre = Instant::now();
-    let mut next = unsafe { srv.eng.prefill(srv.cnq, &prompt, None) };
+    let mut next = unsafe { srv.eng.prefill(srv.cnq, &prompt[cached_n..], None) };
     let prefill_ms = t_pre.elapsed().as_secs_f64() * 1e3;
+    // #31 A9: spec 7.6 point 1, after the prefill of this turn's prompt, unconditional (M1).
+    // Before the first `decode_step`, so no capture stream is live and no graph exists yet.
+    // prefill clean: the prefill above started at 0 or at a prefill clean `P`, so every
+    // KV and pooled QSA row below `pos` is a prefill row (`cache.rs`, the induction)
+    let snap1_ms = unsafe { srv.cache.snapshot(srv.eng, SLOT_PROMPT, true) };
+    eprintln!(
+        "[cache] snapshot point 1 (after prompt) at pos {}, DtoH {snap1_ms:.3} ms",
+        srv.eng.pos
+    );
 
     // #28 A6: arm or disarm the device sampler for THIS request. After `prefill` and before the
     // first `decode_step`: `reset_to_zero` dropped the decode graph, so that step re-captures it
@@ -1427,7 +1505,8 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
 
     let gen = out.len();
     let timing = Timing {
-        prompt_n: ids.len(),
+        prompt_n: prefilled,
+        cached_n,
         predicted_n: gen,
         prompt_ms: prefill_ms,
         predicted_ms: decode_ms,
@@ -1449,6 +1528,18 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
         let _ = sse_send(stream, &sse_frame(&last)) && sse_send(stream, SSE_DONE);
     }
 
+    // #31 A9: spec 7.6 point 2, after the generated answer, unconditional (M1). It runs
+    // AFTER the last SSE frame, so no client waits for the copy. The LAST generated id is
+    // never fed back into the engine, so `pos` is prompt length + generated - 1.
+    // NOT prefill clean: `decode_step` wrote every row of the answer, and those rows are
+    // not bit equal to the rows a prefill writes at the same positions (measured, `cache.rs`)
+    let snap2_ms = unsafe { srv.cache.snapshot(srv.eng, SLOT_ANSWER, false) };
+    eprintln!(
+        "[cache] snapshot point 2 (after answer) at pos {}, DtoH {snap2_ms:.3} ms, slots {:?}",
+        srv.eng.pos,
+        srv.cache.positions()
+    );
+
     // #27 doc: the tok/s below is (gen - 1) / decode_ms, the wire's
     // `timings.predicted_per_second` is gen / decode_ms. Both are correct for what they name:
     // - `decode_ms` is the wall of the `decode_step` calls only (gen - 1 of them).
@@ -1456,9 +1547,9 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
     // - The wire follows llama-server, where `predicted_n` counts the prefill token as well.
     // - Making the two equal would either mislabel the log or break Crow's reader.
     eprintln!(
-        "[chat] prompt {} tok, generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {content_chunks}, tool chunks {tool_chunks}, tool calls {}, usage {}, timings {}{}",
+        "[chat] prompt {} tok ({cached_n} cached, {prefilled} prefilled), generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {content_chunks}, tool chunks {tool_chunks}, tool calls {}, usage {}, timings {}{}",
         ids.len(),
-        per_second(ids.len(), prefill_ms),
+        per_second(prefilled, prefill_ms),
         (gen.saturating_sub(1)) as f64 * 1000.0 / decode_ms.max(1e-9),
         ts.closed(),
         req.include_usage,
@@ -1601,6 +1692,8 @@ struct Srv<'a> {
     /// #28: the device sampler while a GREEDY request runs, so its node stays out of the
     /// capture; the next sampled request takes it back and reuses the same device buffers
     parked_sampler: Option<DevSampler>,
+    /// #31 A9: the ONE held conversation of this process and its two snapshots (spec 7.6)
+    cache: PrefixCache,
 }
 
 fn serve_one(stream: &mut TcpStream, srv: &mut Srv) {
@@ -1763,6 +1856,14 @@ fn main() {
     eprintln!("[serve] listening on http://{addr} (blocking, one request at a time)");
 
     let mut eng = eng;
+    // #31 A9: both snapshot slots are allocated here, once, from the loaded shape (spec 7.7)
+    let cache = PrefixCache::new(&eng);
+    eprintln!(
+        "[serve] prefix cache {}, {} B per snapshot, 2 snapshots, QSA ring rows {}",
+        if cache.enabled() { "on" } else { "off (CROW_PREFIX_CACHE=0)" },
+        cache.shape().snapshot_bytes(),
+        eng.st.qsa_ring_rows
+    );
     let mut srv = Srv {
         eng: &mut eng,
         cnq: &mut cnq,
@@ -1771,6 +1872,7 @@ fn main() {
         prompt_chunk,
         seq: 0,
         parked_sampler: None,
+        cache,
     };
     for conn in listener.incoming() {
         match conn {
@@ -2165,6 +2267,7 @@ mod tests {
     /// the numbers of one served request, so every A5 test speaks about the same turn
     const T0: Timing = Timing {
         prompt_n: 16_064,
+        cached_n: 0,
         predicted_n: 8,
         prompt_ms: 24_500.0,
         predicted_ms: 320.0,
@@ -2231,6 +2334,86 @@ mod tests {
         assert_eq!(g["predicted_per_token_ms"].as_f64(), Some(40.0));
     }
 
+    /// #31 A9: the SAME turn served warm. 16,064 prompt ids, 15,000 of them reused.
+    const T_WARM: Timing = Timing {
+        prompt_n: 1_064,
+        cached_n: 15_000,
+        predicted_n: 8,
+        prompt_ms: 1_700.0,
+        predicted_ms: 320.0,
+        selections_total: 7_710_720,
+        cold_total: 2_534_400,
+        ple_rows_total: 160_640,
+        ple_miss_total: 12_811,
+    };
+
+    /// #31 A9: `prompt_tokens` stays the WHOLE prompt, `cached_tokens` is P, `prompt_n` the rest
+    #[test]
+    fn a_warm_turn_splits_the_prompt_into_cached_and_prefilled() {
+        let f = chunk_finish("id", 7, "m", "stop", &T_WARM, true, true);
+        let u = &f["usage"];
+        // the same 16,064 token prompt as the cold turn: the client's accounting cannot move
+        assert_eq!(u["prompt_tokens"].as_u64(), Some(16_064));
+        assert_eq!(u["prompt_tokens"].as_u64(), usage_json(&T0)["prompt_tokens"].as_u64());
+        assert_eq!(u["prompt_tokens_details"]["cached_tokens"].as_u64(), Some(15_000));
+        assert_eq!(u["completion_tokens"].as_u64(), Some(8));
+        assert_eq!(u["total_tokens"].as_u64(), Some(16_072));
+        assert_eq!(
+            u["total_tokens"].as_u64().unwrap(),
+            u["prompt_tokens"].as_u64().unwrap() + u["completion_tokens"].as_u64().unwrap()
+        );
+        let g = &f["timings"];
+        // what was PREFILLED, not what was rendered: the A9 gate reads exactly this pair
+        assert_eq!(g["prompt_n"].as_u64(), Some(1_064));
+        assert_eq!(g["cache_n"].as_u64(), Some(15_000));
+        assert_eq!(
+            g["cache_n"].as_u64(),
+            u["prompt_tokens_details"]["cached_tokens"].as_u64()
+        );
+        assert_eq!(
+            g["prompt_n"].as_u64().unwrap() + g["cache_n"].as_u64().unwrap(),
+            u["prompt_tokens"].as_u64().unwrap()
+        );
+        // the gate thresholds, computed from the wire object alone
+        let p = u["prompt_tokens"].as_u64().unwrap() as f64;
+        assert!(u["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap() as f64 >= 0.93 * p);
+        assert!(g["prompt_n"].as_u64().unwrap() as f64 <= 0.07 * p);
+        // the rate belongs to the PREFILLED tokens, so it is 1064 over 1700 ms
+        assert_eq!(g["prompt_per_second"].as_f64(), Some(round3(1_064.0 * 1000.0 / 1_700.0)));
+        // nothing crept in and nothing left: still the nine A5 keys plus the five A8 ones
+        assert_eq!(g.as_object().unwrap().len(), 14, "{g}");
+    }
+
+    /// #31 A9: both keys are integers on every path; a missing one changes what Crow counts
+    #[test]
+    fn the_cache_fields_are_present_as_integers_warm_and_cold() {
+        for t in [&T0, &T_WARM] {
+            let f = chunk_finish("id", 7, "m", "stop", t, true, true);
+            let c = &f["usage"]["prompt_tokens_details"]["cached_tokens"];
+            let n = &f["timings"]["cache_n"];
+            assert!(c.is_u64() || c.is_i64(), "cached_tokens is not an int: {c}");
+            assert!(n.is_u64() || n.is_i64(), "cache_n is not an int: {n}");
+            assert!(!c.is_f64() && !n.is_f64(), "a float reached the wire: {c} {n}");
+            assert_eq!(c.as_u64(), Some(t.cached_n as u64));
+            assert_eq!(n.as_u64(), Some(t.cached_n as u64));
+        }
+    }
+
+    /// #31 A9: a cold turn is byte for byte the A5 object, so nothing regressed
+    #[test]
+    fn a_cold_turn_is_the_a5_usage_object_unchanged() {
+        let u = usage_json(&T0);
+        assert_eq!(
+            u,
+            serde_json::json!({
+                "prompt_tokens": 16_064,
+                "completion_tokens": 8,
+                "total_tokens": 16_072,
+                "prompt_tokens_details": { "cached_tokens": 0 },
+            })
+        );
+    }
+
     #[test]
     fn the_rates_are_n_over_ms_and_never_a_nan() {
         assert_eq!(per_second(16_064, 24_500.0), 16_064.0 * 1000.0 / 24_500.0);
@@ -2250,6 +2433,7 @@ mod tests {
         // a zero wall must still leave a NUMBER on the wire, serde turns NaN into null
         let z = Timing {
             prompt_n: 0,
+            cached_n: 0,
             predicted_n: 0,
             prompt_ms: 0.0,
             predicted_ms: 0.0,

@@ -4,7 +4,9 @@
 //!
 //! - One `serve` process answers more than one request, without a prefix cache.
 //! - After `reset_to_zero` the next `prefill` must equal a fresh process, id for id.
-//! - The prefix cache of spec 7.3 replaces this later; A4 keeps the whole state cold.
+//! - #31 A9 did NOT replace this: the prefix cache (`engine/src/cache.rs`) calls it as its
+//!   COLD path, whenever no snapshot sits at or below the longest common id prefix.
+//! - The warm path of A9 restores instead of zeroing, and keeps this file's stream ordering.
 //!
 //! What is reset, and why:
 //!
