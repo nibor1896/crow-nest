@@ -74,3 +74,7 @@ path = "src/bin/coldtier.rs"
 [[bin]]
 name = "hybrid"
 path = "src/bin/hybrid.rs"
+
+[[bin]]
+name = "serve"
+path = "src/bin/serve.rs"
