@@ -11,4 +11,7 @@ pub mod residency;
 pub mod gen;
 pub mod sample;
 pub mod tokenizer;
+// #29 A7 review: the tool-call parser of `bin/serve.rs`, extracted so it is unit tested
+// in the library and `serve.rs` keeps only the chunk builders and the call sites
+pub mod toolcall;
 pub mod reset;
