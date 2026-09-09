@@ -43,6 +43,25 @@
 //! - Process wide defaults since d36353a need no env variable.
 //! - Those defaults: `CROW_PF_ASYNC=2`, PF_TG 64, PLE 128 MB, attn_sel_s8l.
 //!
+//! Environment defaults set by `serve` itself (#26 review):
+//!
+//! | variable | behaviour |
+//! |---|---|
+//! | `CROW_GRAPH`, `CROW_MMA` | default 1 in serve (the gated configuration); env overrides |
+//!
+//! - Both are set in `main` BEFORE `cuda::Ctx::init` and before the first kernel call.
+//! - `gen.rs` reads each one once through a `OnceLock`, so the order is the whole contract.
+//! - Only an unset variable is set; an explicit `CROW_GRAPH=0` still turns graphs off.
+//! - One stderr line per variable carries the effective value.
+//!
+//! Hot set adaptation (#26 review):
+//!
+//! - `apply_adapt_policy` prints a `[policy] ... every N ...` line at start.
+//! - `serve` calls NEITHER `trickle_tick` NOR `adapt_tick`; `decode.rs:216-228` is the only caller.
+//! - The hot set therefore stays the loaded one for the whole process life.
+//! - One stderr line after the policy line says so, so the log cannot mislead.
+//! - Turning it on is an A6/A9 decision: greedy identity comes first.
+//!
 //! Concurrency (constant 4: one binary, no runtime):
 //!
 //! - `std::net::TcpListener`, blocking, one request at a time, no async stack.
@@ -113,7 +132,9 @@
 //! - `tokenizer::render_chat(messages, None, add_generation_prompt=true, enable_thinking)`.
 //! - Greedy decode: `Engine::prefill` gives the first id, `Engine::decode_step` the rest.
 //! - Stops on `sample::EOS_IDS` (`finish_reason` `stop`) or at `max_tokens` (`length`).
-//! - `prompt + max_tokens` over `n_ctx` answers 413 before any GPU work.
+//! - `prompt ids >= n_ctx` answers 413 before any GPU work.
+//! - Otherwise `max_tokens` is CLAMPED to `n_ctx - prompt ids` and to 32768.
+//! - A clamp logs one stderr line and the request is served, not refused.
 //!
 //! Stream shape (llama-server / OpenAI, `crow_core.py:4831-4877`):
 //!
@@ -135,6 +156,7 @@
 //! - A tail that is not a whole character is HELD BACK, not sent.
 //! - The byte level decoder renders an incomplete UTF-8 sequence as U+FFFD.
 //! - No chunk therefore carries a replacement character from a split token.
+//! - Assumed of `decode`: prefix stability across one more id; a violation is lossy, never a panic.
 //! - Cost: one decode of the whole answer per token, microseconds against ms of GPU.
 //!
 //! One conversation at a time (M1):
@@ -578,11 +600,26 @@ fn sse_frame(doc: &serde_json::Value) -> String {
     format!("data: {doc}\n\n")
 }
 
+/// - the generation budget one request may actually spend
+/// - `None` means the prompt alone does not fit `n_ctx`: the answer is 413
+/// - `Some(n)`: `max_tokens`, clamped to the free context and to `MAX_MAX_TOKENS`
+/// - a budget that does not fit is clamped, never refused (llama-server does the same)
+/// - pure: no engine, no socket, so the test drives the arithmetic directly
+fn clamped_max_tokens(prompt_ids: usize, max_tokens: usize, n_ctx: usize) -> Option<usize> {
+    if prompt_ids >= n_ctx {
+        return None;
+    }
+    Some(max_tokens.min(n_ctx - prompt_ids).min(MAX_MAX_TOKENS))
+}
+
 /// - `full` is `decode` over EVERY generated id so far
 /// - `emitted` is how many BYTES of `full` already left as content
 /// - `None` holds the delta back until the tail is a whole character
 /// - the byte level decoder renders an incomplete UTF-8 sequence as U+FFFD
 /// - so no chunk this returns ends in a replacement character
+/// - ASSUMED of `decode`: prefix stability, `decode(ids[..k])` is a byte prefix of `decode(ids[..k+1])`
+/// - a violation is LOSSY, never a panic: the changed bytes below `emitted` are never re-sent,
+///   and the `is_char_boundary` guard keeps the slice legal for any input
 fn next_delta(full: &str, emitted: usize) -> Option<&str> {
     if full.len() <= emitted || !full.is_char_boundary(emitted) {
         return None;
@@ -620,7 +657,7 @@ fn respond_json(
 /// - every rejection happens BEFORE the first stream byte, as a JSON response
 /// - the return value is the status for the access log line
 fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static str {
-    let req = match parse_chat(body) {
+    let mut req = match parse_chat(body) {
         Ok(r) => r,
         Err(e) => return respond_json(stream, "400 Bad Request", &error_json(&e)),
     };
@@ -643,14 +680,24 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
     if ids.is_empty() {
         return respond_json(stream, "400 Bad Request", &error_json("the rendered prompt is empty"));
     }
-    if ids.len() + req.max_tokens > srv.n_ctx {
-        let m = format!(
-            "prompt {} + max_tokens {} over n_ctx {}",
-            ids.len(),
+    // #26 review: the prompt alone is the only 413 case; a budget that does not fit is CLAMPED,
+    // not refused (the old combined check was dead, `max_tokens` is capped at 32768 first)
+    let budget = match clamped_max_tokens(ids.len(), req.max_tokens, srv.n_ctx) {
+        Some(n) => n,
+        None => {
+            let m = format!("prompt {} tokens over n_ctx {}", ids.len(), srv.n_ctx);
+            return respond_json(stream, "413 Payload Too Large", &error_json(&m));
+        }
+    };
+    if budget != req.max_tokens {
+        eprintln!(
+            "[chat] max_tokens {} clamped to {} (prompt {}, n_ctx {})",
             req.max_tokens,
+            budget,
+            ids.len(),
             srv.n_ctx
         );
-        return respond_json(stream, "413 Payload Too Large", &error_json(&m));
+        req.max_tokens = budget;
     }
     chat_stream(stream, srv, &req, &ids)
 }
@@ -981,6 +1028,19 @@ fn main() {
         }
     }
 
+    // #26 review: the gated configuration is CROW_GRAPH=1 and CROW_MMA=1 (every A2..A4 gate and
+    // the engine's ten-task gates ran with both on). gen.rs reads each one ONCE through a
+    // OnceLock (`mma_on` gen.rs:1075, `graph_on` gen.rs:1086, `dense_mma_on` gen.rs:1156), so
+    // setting them here, before cuda::Ctx::init and before any kernel call, is the whole switch.
+    // Only an UNSET variable is set, so an explicit value still overrides and diagnostics stay
+    // possible. serve is single threaded at this point: no other thread can read the environment.
+    for key in ["CROW_GRAPH", "CROW_MMA"] {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, "1");
+        }
+        eprintln!("[serve] {key}={}", std::env::var(key).unwrap_or_default());
+    }
+
     let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| DEFAULT_CNQ.into());
     let sidecar = std::env::var("CROW_HOTSETS").unwrap_or_else(|_| DEFAULT_HOTSETS.into());
     let mut cnq = Cnq::open(&cnq_path);
@@ -993,6 +1053,11 @@ fn main() {
     // M1: chunk pinned for the process, no per prompt policy
     cfg.prompt_chunk = SERVE_CHUNK;
     apply_adapt_policy(&mut cfg);
+    // #26 review: the "[policy] ... every N ..." line above comes from apply_adapt_policy, but
+    // serve calls neither trickle_tick nor adapt_tick (decode.rs:216-228 is the only caller)
+    eprintln!(
+        "[serve] hot-set adaptation is not ticked by serve in this build (greedy identity first; A6/A9 decide)"
+    );
 
     // unsafe: pins device and host memory; takes engine/.engine.lock, a second serve dies here
     let (eng, _rep) = unsafe {
@@ -1256,6 +1321,28 @@ mod tests {
         assert!(parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stream":"yes"}"#).is_err());
         assert!(parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":0}"#).is_err());
         assert!(parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":-1}"#).is_err());
+    }
+
+    #[test]
+    fn the_budget_is_clamped_to_the_free_context_and_413_only_without_one() {
+        // the normal case: the whole budget fits, nothing is touched
+        assert_eq!(clamped_max_tokens(18, 64, 200_000), Some(64));
+        // the prompt eats most of the context: the budget shrinks to what is left
+        assert_eq!(clamped_max_tokens(199_990, 64, 200_000), Some(10));
+        assert_eq!(clamped_max_tokens(1, 1024, 2), Some(1));
+        // the 32768 cap still binds when the free context is larger
+        assert_eq!(clamped_max_tokens(18, 999_999, 200_000), Some(MAX_MAX_TOKENS));
+        assert_eq!(clamped_max_tokens(18, MAX_MAX_TOKENS, 200_000), Some(MAX_MAX_TOKENS));
+        // exactly one token of room, and exactly none
+        assert_eq!(clamped_max_tokens(199_999, 64, 200_000), Some(1));
+        assert_eq!(clamped_max_tokens(200_000, 64, 200_000), None);
+        assert_eq!(clamped_max_tokens(200_001, 1, 200_000), None);
+        // the clamp is never 0 when it returns Some: a served request always has a budget
+        for prompt in [0usize, 1, 17, 199_999] {
+            let n = clamped_max_tokens(prompt, DEFAULT_MAX_TOKENS, 200_000).unwrap();
+            assert!(n >= 1, "prompt {prompt} got budget {n}");
+            assert!(prompt + n <= 200_000);
+        }
     }
 
     #[test]
