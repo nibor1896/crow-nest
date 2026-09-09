@@ -15,3 +15,5 @@ pub mod tokenizer;
 // in the library and `serve.rs` keeps only the chunk builders and the call sites
 pub mod toolcall;
 pub mod reset;
+// #31 A9: the prefix cache (spec section 7) - snapshot, rollback and the id prefix rule
+pub mod cache;
