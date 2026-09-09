@@ -397,8 +397,11 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 The Crow client sends the **whole chat history on every turn**. Without a prefix cache
 every turn pays the full prefill again — the plan's reference point is a **16k prefill =
-24.13 s wall (measured)**. The server ("serve") is a **blocking single-request binary**,
-**one engine process per machine** (robin's decisions, not reopened here).
+24.13 s wall (measured)**. Provenance: measured 2026-09-06 by chain F43 (t1-read 16,064
+tokens, chunk 2048; 24.19 s on 2026-09-09 by chain F49 on the installed build
+d211ab52ad2b); the logs live in the session scratchpad and the vault, not in this
+repository. The server ("serve") is a **blocking single-request binary**, **one engine
+process per machine** (robin's decisions, not reopened here).
 
 Decided before the plumbing: **which of the four engine states survives a request
 boundary, how a prefix divergence is detected, and what happens when one occurs.** The
@@ -434,12 +437,27 @@ Two structural facts decide everything else:
   Consequence: **a recurrent state cannot be rewound to an earlier position unless it was
   saved there.**
 
+**A third fact, and an untested assumption.** The decode CUDA graph is captured **once per
+process**: `let capturing = graph && self.graph_exec == 0` (`gen.rs:2833`), instantiated at
+`gen.rs:2913`, and every token after that replays the instantiated graph. A server
+therefore runs its **second** prefill against an already-instantiated decode graph — a
+state **no binary has reached yet**, because every binary today prefills exactly once. By
+design the graph is position-agnostic: it reads its position from device scalars that the
+per-token scalar upload refreshes before each replay, and `rope_p` deliberately takes
+`p.pos_base` as a device pointer rather than a host-computed table offset, because a host
+offset would be baked into the capture and replay the capture's token position forever
+(`gen.rs:1733-1735`). That is the intent recorded in the code, **not a measurement**:
+**A2 and A9 must verify it** — after a rollback and a second prefill, the replayed decode
+graph must still decode from the new position, and A9's bit-identity against a cold run is
+what would catch it if it does not. If it does not hold, the remedy is to drop
+`graph_exec` on rollback and recapture.
+
 ### 7.3 The four states
 
 | state | reusable across requests | prefix divergence detection | behaviour on divergence | cost of a cache miss at 16k |
 |---|---|---|---|---|
 | **KV cache** — 12 attention layers, `[12][2][2][context][256]`, FP8 E4M3 default (`geo.rs:23-25`, `manager.rs:43`, `manager.rs:200`) | **Yes, as it stands.** A row is addressed by the absolute slot `pos` and its RoPE was applied at that absolute position before the store, so rows `0..L` stay valid for any request whose ids agree on `0..L`. Nothing in the row depends on the request that wrote it. | Host-side only, from the id lists (7.4). The cache is never probed: there is no key in a KV row to compare against. | **Nothing is erased.** `pos` is set back to P. Rows `>= P` are stale but unreachable — the selector only scans blocks below `ncb = (pos+1)/4` (`gen.rs:2503-2506`, `gen.rs:2746`) — and the new suffix overwrites them as it is prefilled. | Full miss (P = 0) = one 16k prefill = **24.13 s wall** (measured, the plan's reference). A partial miss of n tokens is `n/16384 x 24.13 s` as a **linear estimate only** — unmeasured, and prefill is not linear in n: the chunk policy (`geo.rs:138-152`) and the one-cold-tier-pass-per-chunk cost (`gen.rs:2444-2448`) both bend it. |
-| **QSA indexer state** — raw-key **ring** `[12][ring][128]` f32 with `row = pos % ring`, `ring = ceil4(prompt_chunk + 4)` (`manager.rs:37-41`, `manager.rs:58`, `kernels.rs:1760-1770`), plus the **full-length pooled cache** `[12][ceil(context/4)][128]` f32 indexed by the absolute block `pos/4` (`manager.rs:46`, `manager.rs:60`, `kernels.rs:1747-1758`) | **Pooled cache: yes**, same argument as KV (absolute block index, RoPE at the absolute block position). **Ring: conditionally.** The ring is modular and holds only the last `ring` positions; its only reader is `pool4_cache`, which for a resume at P needs the `P mod 4` rows of the still-incomplete block. Those are live iff the held run advanced fewer than `ring - 3` positions past P. Made unconditional by snapshotting the ring (7.6) or by rounding P down to a multiple of 4. | Host-side only (7.4). | Set `done_blocks = P/4` and restore the ring from the snapshot. Pooled blocks `>= P/4` are stale but unreachable by the same `ncb` bound, and block `P/4` is re-pooled by the resumed prefill **before** any query scores it (pooling precedes scoring inside `attn_prompt`: `gen.rs:1647-1661` then `gen.rs:1680-1683`). | No separate cost. The ring and the pooled blocks of the diverged suffix are rebuilt inside the same prefill pass that rebuilds KV — they add no pass of their own. Their share of the 24.13 s is **unmeasured** (`CROW_KPROF=1` would produce a per-kernel breakdown; none is recorded). |
+| **QSA indexer state** — raw-key **ring** `[12][ring][128]` f32 with `row = pos % ring`, `ring = ceil4(prompt_chunk + 4)` (`manager.rs:37-41`, `manager.rs:58`, `kernels.rs:1759-1769`), plus the **full-length pooled cache** `[12][ceil(context/4)][128]` f32 indexed by the absolute block `pos/4` (`manager.rs:46`, `manager.rs:60`, `kernels.rs:1747-1758`) | **Pooled cache: yes**, same argument as KV (absolute block index, RoPE at the absolute block position). **Ring: conditionally.** The ring is modular and holds only the last `ring` positions; its only reader is `pool4_cache`, which for a resume at P needs the `P mod 4` rows of the still-incomplete block. Those are live iff the held run advanced fewer than `ring - 3` positions past P. Made unconditional by snapshotting the ring (7.6) or by rounding P down to a multiple of 4. | Host-side only (7.4). | Set `done_blocks = P/4` and restore the ring from the snapshot. Pooled blocks `>= P/4` are stale but unreachable by the same `ncb` bound, and block `P/4` is re-pooled by the resumed prefill **before** any query scores it (pooling precedes scoring inside `attn_prompt`: `gen.rs:1647-1661` then `gen.rs:1680-1683`). | No separate cost. The ring and the pooled blocks of the diverged suffix are rebuilt inside the same prefill pass that rebuilds KV — they add no pass of their own. Their share of the 24.13 s is **unmeasured** (`CROW_KPROF=1` would produce a per-kernel breakdown; none is recorded). |
 | **GDN recurrent state** — 36 layers, `S[48][128][128]` f32 + `conv[10240][3]` f32, **112.22 MiB**, fixed and context-independent (`geo.rs:24`, `geo.rs:12-15`, `manager.rs:47-48`, `manager.rs:226-237`) | **No — not as the engine stands.** The state holds no position; it is the fold of every token seen so far. After the held run reached L there is no `S` at any P < L anywhere in the process, and there is no reset path. It is reusable **exactly at P = L**, and for any P < L **only from a snapshot taken at P** (7.6). | Host-side only, and this is the point: the state itself **cannot be probed**. Nothing in `S` says which ids produced it. If the id comparison is wrong, nothing downstream notices. | Restore `S` and `conv` from the newest snapshot at a position `S_pos <= L`, then re-prefill from `S_pos`. With **no** snapshot at or below L, the only correct move is a **cold start** (`S_pos = 0`) — the KV and pooled rows that are still valid must be thrown away with it, because a KV prefix without the matching GDN state is precisely the silent-wrong-answer case. | **This is the state that sets the price.** The suffix to re-prefill starts at the last snapshot, not at the divergence point: extra cost = `(L - S_pos)` tokens of prefill on top of the diverged suffix. No snapshot at all = the full **24.13 s** at 16k. Its own share of a prefill is **unmeasured**. |
 | **PLE row cache** — hot rows of the 128 n-gram shards, `n_slots = cache_bytes / 112`, default 128 MB = **1,198,372 slots** (`geo.rs:72`, `geo.rs:108`, `gen.rs:899-902`) | **Yes, unconditionally.** It is **content-addressed**, not position-addressed: `slot = ngram_row_id % n_slots` with `slot_map[slot]` holding the id (`gen.rs:1013-1040`), and a slot's content is a verbatim copy of a container row. It carries no position and does not depend on which request filled it. | **Not needed.** Divergence cannot invalidate it: a slot either already holds the row a token asks for, or is refilled from the container. | **Nothing.** The cache survives every divergence, every request, and every rollback. Rows filled by a discarded prefix stay useful. | A PLE miss is a container row read, **not** a prefill — it never forces recomputation. Not measured in seconds anywhere in the repo; the measured quantity is the **miss rate** (#16, 2026-09-05: 128 MB costs +0.2 % misses against 1 GB and frees ~7 hot-set units, `geo.rs:108`). |
 
@@ -505,6 +523,11 @@ the PLE conv state, and the QSA raw-key ring** — plus the host-side triple
 `(pos, done_blocks, history[..pos])` that names the position it belongs to. The ring is in
 the snapshot so that the reuse point may be **any** position, not only a multiple of 4;
 without it, P must be rounded down to `4 * floor(P/4)` and the ring's live window checked.
+The `ring` here is the **raw-key ring** and has nothing to do with the QSA **selection
+budget**: the "budget 2,048 tokens" of §2.1 is `QSA_BLOCK_TOPK` 512 selected blocks x
+compression ratio 4 = 2,048 tokens a *query* may attend to (`geo.rs:41-42`), while the ring
+is a `ceil4(prompt_chunk + 4)`-row scratch buffer of raw indexer keys awaiting pooling. The
+two numbers are unrelated and only happen to sit close together at chunk 2048.
 
 **When to snapshot.** Two points per turn, both natural and both cheap relative to a
 prefill:
@@ -514,14 +537,23 @@ prefill:
 
 Point 2 is the one Crow normally hits: the next turn's ids extend the previous turn's
 transcript, so `L = ` the previous end and `P = L` — no rollback, no recompute, the new
-prompt suffix is simply prefilled onto the held state. Point 1 covers the common edit
-case (the user rewrites their last message: the ids diverge inside the last turn, and the
-rollback lands on the prompt snapshot instead of going cold).
+prompt suffix is simply prefilled onto the held state.
+
+Point 1 earns its keep in the **regenerate / edited-answer** case: the prompt's ids are
+unchanged and the divergence sits in the *answer*, so `L >= ` the end of that prompt, the
+point-1 snapshot is the newest one at or below `L`, and the rollback lands on it — **the
+prompt's prefill is spared** and only the answer is recomputed. Point 1 does *not* cover
+the edited-prompt case: if the user rewrites their last message, the common prefix ends at
+the **start** of that prompt, i.e. below the point-1 snapshot (which is taken at prompt
+*end*), so `P` is the previous turn's post-answer snapshot — still a warm resume, not a
+cold start. A cold start only happens when **no** snapshot at or below `L` exists at all;
+with any earlier snapshot held, the fallback is never cold. The rule is unchanged in both
+cases and needs no special-casing: `P = max { S_pos : S_pos <= L }`.
 
 **Rollback.** Restore the four buffers with host-to-device copies, set `pos = S_pos`,
 `done_blocks = S_pos / 4`, truncate `history` to `S_pos`, then call `prefill` with the new
 ids from `S_pos` on. Note that `prefill`'s `init` flag zeroes `S` only when `self.pos == 0`
-(`gen.rs:2426`), which is exactly the cold-start case — the restored path must leave it at
+(`gen.rs:2433`), which is exactly the cold-start case — the restored path must leave it at
 0, and the current signature already does the right thing once `pos` is set.
 
 **What must NOT be reused.** A snapshot from a different engine load. The chunk size fixes
@@ -541,7 +573,7 @@ snapshot_bytes =
   + ATTN_LAYERS * ring * QSA_HIDD * 4      (QSA ring)  = 12 * ring * 128 * 4
 ```
 
-with `ring = ceil4(prompt_chunk + 4)` (`manager.rs:37-41`):
+with `ring = ceil4(prompt_chunk + 4).min(context)` (`manager.rs:37-41`):
 
 | prompt_chunk | ring | QSA ring bytes | snapshot total |
 |---|---|---|---|
@@ -555,6 +587,14 @@ pinned tier (budgeted at 46 GiB against a measured ~48.5 GiB host ceiling, `geo.
 The **wall time of one snapshot copy is unmeasured** and is the first thing to measure in
 the plumbing task: 115.60 MiB down and up per rollback is small against 24.13 s, but it
 sits inside the request.
+
+**The formula holds for the default QSA layout only.** `CROW_QSA_FULL=1`
+(`manager.rs:37-41`) sets `ring = context` — the full-length raw-key layout from before
+2026-09-05 (`manager.rs:20-21`), which is still supported. The ring term is then
+`12 * 262,144 * 128 * 4 = 1,610,612,736 B` (about **1.5 GiB**) at the default context of
+262,144 (`geo.rs:105`), roughly **13x the whole snapshot**, and it would dominate every
+number in this section. `CROW_QSA_FULL=1` is therefore **out of scope for serve**: the
+server runs the default layout, and every size above assumes it.
 
 ### 7.8 What a cache miss actually costs
 
@@ -587,7 +627,10 @@ rebuilding the GDN fold, and no way to rebuild the GDN fold cheaply on its own. 
    clamped N (`manager.rs:31`, `manager.rs:108-170`). A server takes prompts of every
    length against one load, so it must pick **one** chunk for the process lifetime:
    chunk 2048 (the long-context operating point, N ~147, stream trickle) or chunk 512
-   (N ~157, better on short prompts) — `geo.rs:130-176`. Which one is the serve default?
+   (N ~157, better on short prompts) — `geo.rs:130-176`. Note that the source disagrees
+   with itself about the chunk-2048 hot set: `geo.rs:157` says **N 147**, `geo.rs:132`
+   says **140** for the same operating point. Neither is picked here — settling it is a
+   measurement, not a doc edit. Which one is the serve default?
 2. **How many conversations are held, and how many snapshots each?** At 115.60 MiB per
    snapshot and 2 per conversation, four held conversations is ~0.9 GiB of host RAM,
    against the 47 GiB `free_wait` threshold the chains already run into.
