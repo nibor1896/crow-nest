@@ -34,3 +34,4 @@ engine/.engine.lock
 engine/decode_out/run.json
 engine/target_attn/
 engine/target_gate/
+engine/target_gate2/

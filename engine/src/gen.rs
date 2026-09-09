@@ -450,8 +450,9 @@ pub struct Stage {
 }
 
 /// tiles (<= 8 tokens of one expert) per staged group: <= PF_TG distinct
-/// experts share the staging slots with the decode path (stage.max slots)
-pub const PF_TG: usize = 32;
+/// experts share the staging slots with the decode path (stage.max slots).
+/// Default 64 since 2026-09-09 (#10, robin's call, gated on ten tasks with CROW_PF_ASYNC=2; 32 before)
+pub const PF_TG: usize = 64;
 /// runtime tiles-per-group (CROW_PF_TG, default PF_TG): larger groups cut the
 /// 5-launch chain per group and raise the tile-GEMM grid; costs
 /// CROW_PF_TG x 2.76 MB of staging slots
@@ -492,10 +493,13 @@ fn pf_gemm_on() -> bool {
 /// CROW_PF_ASYNC=1: the prefill staging copies (`stage_tiles`, SM reads over
 /// PCIe) run on a side stream into two slot sets (group parity), overlapping
 /// the previous group's tile GEMMs; costs one extra set of PF_TG staging slots
-/// (measured 2026-09-06: stage_tiles = 40 % of the prefill kernel time at 16k)
+/// (measured 2026-09-06: stage_tiles = 40 % of the prefill kernel time at 16k).
+/// CROW_PF_ASYNC=2 (the copy engine stages, host memcpys ahead on the side stream) is the default since 2026-09-09
+/// (#10, robin's call, gated: parity 8/512/1024 + ten tasks ids == final4 without the env); CROW_PF_ASYNC=0 = the
+/// previous synchronous staging (one slot set).
 pub fn pf_async_mode() -> i32 {
     static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("CROW_PF_ASYNC").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    *V.get_or_init(|| std::env::var("CROW_PF_ASYNC").ok().and_then(|v| v.parse().ok()).unwrap_or(2))
 }
 pub fn pf_async_on() -> bool { pf_async_mode() >= 1 }
 
@@ -633,7 +637,7 @@ impl Engine {
         let per_expert_unit = (slabs.gu_bytes + slabs.dn_bytes) * LAYERS as u64;
         let s = Scratch::alloc(cfg.prompt_chunk);
         // cold staging: decode-sized batches only (t*TOPK <= stage_max)
-        let stage_max = (2 * TOPK).max(pf_tg() * if pf_async_on() { 2 } else { 1 }); // 32 slots x 2.76 MB = 88 MB (default; x2 with CROW_PF_ASYNC)
+        let stage_max = (2 * TOPK).max(pf_tg() * if pf_async_on() { 2 } else { 1 }); // 2 x 64 slots x 2.76 MB = 354 MB (default since 2026-09-09; CROW_PF_ASYNC=0 CROW_PF_TG=32 = 88 MB)
         assert!(slabs.gu_bytes % (16 * stage_split() as u64) == 0 && slabs.dn_bytes % (16 * stage_split() as u64) == 0,
             "expert slab bytes must split into 16-byte units x STAGE_SPLIT");
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
@@ -659,7 +663,7 @@ impl Engine {
             max_tiles,
         };
         if pf_async_on() {
-            log(&format!("prefill staging on a side stream (CROW_PF_ASYNC=1): 2 x {} slots", pf_tg()));
+            log(&format!("prefill staging on a side stream (CROW_PF_ASYNC={}): 2 x {} slots", pf_async_mode(), pf_tg()));
         }
         let scratch_measured = cuda::total_vram_bytes() - cuda::free_vram_bytes() - dense_measured;
         log(&format!("scratch + staging resident: {:.0} MiB (chunk {})", scratch_measured as f64 / (1 << 20) as f64, cfg.prompt_chunk));
