@@ -1,0 +1,208 @@
+# crow-nest CI, issue #50, parent #1
+#
+# READ THIS BEFORE TRUSTING A GREEN CHECK
+# - No job here runs on a GPU: windows-latest has no NVIDIA device and no CUDA toolkit.
+# - A green run is a statement about the build and the host-side tests only, never about decode correctness.
+# - Excluded on the runner: the 10 tests that load ../models/Qwen3.8-Flash-Next-original/tokenizer.json,
+#   because models/ is gitignored and a fresh clone has no weights (skip list in the test job).
+#
+# Why the engine builds without CUDA:
+# - No build.rs in engine/ or converter/.
+# - Kernels are compiled at runtime through cudarc::nvrtc::compile_ptx_with_opts (engine/src/cuda.rs:208).
+# - cudarc = "=0.19.9" with feature dynamic-loading (engine/Cargo.toml:17); cudarc documents
+#   dynamic-loading as loading CUDA at runtime, with no libraries needed at build time (cudarc README,
+#   section Configuring linking).
+# - Unmeasured: this repo has never built on a machine without CUDA. The local proof of 2026-09-11 ran on
+#   a host that has CUDA 13.3 installed. The first honest measurement is the first run of this workflow.
+#
+# Local proof, 2026-09-11, rustc 1.97.0 (2d8144b78 2026-07-07), x86_64-pc-windows-msvc:
+# - build engine exit 0, build converter exit 0
+# - test engine: lib 72 passed of 80 (8 filtered), bin serve 55 passed of 57 (2 filtered), other bins 0
+# - test converter: 7 passed of 7
+# - clippy -D warnings: engine exit 101 (1303 warnings), converter exit 101 (11 warnings)
+# - guards: check_env_docs.py exit 0, check_readme_dates.py exit 0
+#
+# Conventions:
+# - Actions pinned by major tag, never @main; the toolchain pinned to the version the repo was measured with.
+# - --target-dir target_ci everywhere, so the CI commands are byte for byte the ones proven locally;
+#   **/target*/ is gitignored, so nothing from a build can be committed by accident.
+# - Step logs (test and clippy output) are teed into target_ci/ for the same reason.
+
+name: ci
+
+on: [push, pull_request]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (no GPU)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      # Swatinem/rust-cache keys on the lockfiles and the toolchain by itself.
+      # Chosen over actions/cache because this repo has two crates and no workspace:
+      # engine/Cargo.lock and converter/Cargo.lock are separate, and the arrow form
+      # names the non-default target dir per crate.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            engine -> target_ci
+            converter -> target_ci
+      - name: toolchain in the summary
+        shell: bash
+        run: |
+          {
+            echo "### build"
+            echo ""
+            echo "- runner: windows-latest, no GPU"
+            echo "- $(cargo --version)"
+            echo "- $(rustc --version)"
+            echo "- target: $(rustc -vV | grep '^host:' | cut -d' ' -f2)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: engine build
+        working-directory: engine
+        shell: bash
+        run: cargo build --release --target-dir target_ci
+      - name: converter build
+        working-directory: converter
+        shell: bash
+        run: cargo build --release --target-dir target_ci
+
+  test:
+    name: test (host side only)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            engine -> target_ci
+            converter -> target_ci
+      # Skip list, measured 2026-09-11.
+      # Reason for all 10: they load ../models/Qwen3.8-Flash-Next-original/tokenizer.json
+      # (and its sibling tokenizer_config.json) with .expect("tokenizer loads").
+      # models/ is line 2 of .gitignore, so a fresh clone has no such file and every one of them panics.
+      # 8 in engine/src/tokenizer.rs, through the helper tk() at :382:
+      #   ascii_round_trips_through_encode_and_decode
+      #   utf8_round_trips_through_encode_and_decode
+      #   chat_render_ends_with_the_assistant_header_and_the_empty_think_block
+      #   enable_thinking_and_add_generation_prompt_are_template_variables
+      #   a_tools_render_does_not_fail
+      #   a_tools_render_is_byte_identical_to_the_oracle
+      #   an_empty_message_list_is_a_template_error_not_a_panic
+      #   the_stop_token_resolves
+      # 2 in engine/src/bin/serve.rs, loading the tokenizer inline at :3075 and :3246:
+      #   a_split_multibyte_token_never_reaches_a_chunk
+      #   a_history_with_a_tool_turn_renders_byte_identical_to_the_oracle
+      # Not skipped, checked 2026-09-11: engine/src/slot.rs the_load_id_separates_two_containers
+      # passes "converter/M.cnq" to load_id (engine/src/slot.rs:368), which hashes the string
+      # and opens no file.
+      # Expected denominators on the runner:
+      #   engine lib     72 of 80 ( 8 filtered)
+      #   engine serve   55 of 57 ( 2 filtered)
+      #   engine other bins 0 of 0
+      #   converter       7 of  7
+      - name: engine tests
+        working-directory: engine
+        shell: bash
+        run: |
+          mkdir -p target_ci
+          cargo test --release --target-dir target_ci -- \
+            --skip ascii_round_trips_through_encode_and_decode \
+            --skip utf8_round_trips_through_encode_and_decode \
+            --skip chat_render_ends_with_the_assistant_header_and_the_empty_think_block \
+            --skip enable_thinking_and_add_generation_prompt_are_template_variables \
+            --skip a_tools_render_does_not_fail \
+            --skip a_tools_render_is_byte_identical_to_the_oracle \
+            --skip an_empty_message_list_is_a_template_error_not_a_panic \
+            --skip the_stop_token_resolves \
+            --skip a_split_multibyte_token_never_reaches_a_chunk \
+            --skip a_history_with_a_tool_turn_renders_byte_identical_to_the_oracle \
+            2>&1 | tee target_ci/engine-tests.txt
+          {
+            echo "### test: engine"
+            echo ""
+            echo "- 10 tests skipped, no weights on the runner"
+            echo '```'
+            grep -E '^(     Running|   Doc-tests|test result:)' target_ci/engine-tests.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: converter tests
+        working-directory: converter
+        shell: bash
+        run: |
+          mkdir -p target_ci
+          cargo test --release --target-dir target_ci 2>&1 | tee target_ci/converter-tests.txt
+          {
+            echo "### test: converter"
+            echo ""
+            echo '```'
+            grep -E '^(     Running|   Doc-tests|test result:)' target_ci/converter-tests.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  clippy:
+    name: clippy (non-blocking, see count)
+    runs-on: windows-latest
+    # Non-blocking by decision of 2026-09-11: the measured count is 1314 warnings
+    # (engine 1303, converter 11), so -D warnings cannot gate anything yet.
+    # Flip continue-on-error to false once the count is 0. No source change in #50.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            engine -> target_ci
+            converter -> target_ci
+      # Local counts of 2026-09-11, dominant lints in the engine:
+      #   unnecessary_cast 1085, missing_safety_doc 87, manual_div_ceil 52,
+      #   manual_is_multiple_of 14, needless_range_loop 12, rest below 6 each.
+      - name: engine clippy
+        working-directory: engine
+        shell: bash
+        run: |
+          mkdir -p target_ci
+          cargo clippy --release --target-dir target_ci --all-targets 2>&1 | tee target_ci/clippy-engine.txt
+          total=$(grep -cE '^warning: ' target_ci/clippy-engine.txt || echo 0)
+          summ=$(grep -cE '^warning: .crow-nest-engine.' target_ci/clippy-engine.txt || echo 0)
+          echo "- engine clippy warnings: $((total - summ)) (local 2026-09-11: 1303)" >> "$GITHUB_STEP_SUMMARY"
+          cargo clippy --release --target-dir target_ci --all-targets -- -D warnings
+      - name: converter clippy
+        working-directory: converter
+        shell: bash
+        run: |
+          mkdir -p target_ci
+          cargo clippy --release --target-dir target_ci --all-targets 2>&1 | tee target_ci/clippy-converter.txt
+          total=$(grep -cE '^warning: ' target_ci/clippy-converter.txt || echo 0)
+          summ=$(grep -cE '^warning: .converter.' target_ci/clippy-converter.txt || echo 0)
+          echo "- converter clippy warnings: $((total - summ)) (local 2026-09-11: 11)" >> "$GITHUB_STEP_SUMMARY"
+          cargo clippy --release --target-dir target_ci --all-targets -- -D warnings
+
+  guards:
+    name: doc guards
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Both must exit 0. No third party package is needed; both scripts use the standard library.
+      - name: check_env_docs
+        shell: bash
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tools/check_env_docs.py
+      - name: check_readme_dates
+        shell: bash
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tools/check_readme_dates.py
