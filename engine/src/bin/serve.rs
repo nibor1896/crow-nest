@@ -87,6 +87,8 @@
 //! - Default port 8099, bind address 127.0.0.1.
 //! - Without `--slot-save-path` both `/slots/0` actions answer 400, as llama-server refuses them.
 //! - One stderr line at start says which directory is in use, or that none is.
+//! - `--slot-save-path` must name a directory that already exists; serve never creates one.
+//! - A typo exits 2 before the engine is loaded, so it costs a second, not a conversation.
 //!
 //! Subcommand `tokenize` (#25 A3, no engine, no GPU, no lock):
 //!
@@ -410,41 +412,26 @@
 //!
 //! The slot file across processes (#32 A10, `crow_core.py:2458`, `:2688`):
 //!
-//! | request | answer, and the ONE field Crow reads |
+//! | subject | the ONE place it is written down |
 //! |---|---|
-//! | `POST /slots/0?action=save`, body `{"filename": "<name>"}` | `{"id_slot":0,"filename":..,"n_saved":N,"n_written":B,"timings":{"save_ms":..}}` |
-//! | `POST /slots/0?action=restore`, same body | `{"id_slot":0,"filename":..,"n_restored":N,"n_read":B,"timings":{"restore_ms":..}}` |
-//! | `GET /slots` | `[{"id":0,"n_ctx":..,"n_prompt_tokens":N,"is_processing":false}]` |
+//! | the file layout, the payload order, every refusal, the save and restore ordering | `engine/src/slot.rs` module doc |
+//! | the three answer documents and their fields | `slots_json`, `slot_saved_json`, `slot_restored_json` below |
+//! | the `[slot]` stderr lines | the `eprintln!` calls in `slot_route` below |
+//!
+//! What only THIS file can say, because it is the wire and not the format:
 //!
 //! - Only `n_saved` and `n_restored` are contractual; Crow reads nothing else of these bodies.
 //! - `n_saved` and `n_restored` are the PREFILL CLEAN position, so `SLOT_PROMPT`, never the answer.
 //! - Crow withdraws the warm-cache claim when `n_restored` disagrees with the saved `n_saved`,
 //!   so equality of the two numbers is the contract, not the status code (`crow_core.py:2694`).
-//! - `n_prompt_tokens` is the same number, 0 while nothing is held.
+//! - `n_prompt_tokens` of `GET /slots` is the same number, 0 while nothing is held.
 //! - `GET /slots` is read by Crow's tools only (`tools/measure-slot-restart.ps1:87`,
 //!   `tools/probe-slot-persistence.py:152`), which take element 0 of the array.
-//!
-//! What the file holds, and what refuses it: `engine/src/slot.rs` (layout, checks, evidence).
-//!
-//! | part | what |
-//! |---|---|
-//! | header, 120 B | magic, format version, the whole load shape, `pos`, `done_blocks`, history length |
-//! | recurrent state | the `SLOT_PROMPT` snapshot of #31 A9: GDN S, GDN conv, PLE conv, QSA ring |
-//! | absolutely addressed state | KV rows `0..pos` of every attention layer, pooled QSA blocks `0..done_blocks` |
-//! | ids | `history[..pos]`, the list the A9 detection rule compares against |
-//!
 //! - A restore fills `SLOT_PROMPT`, clears `SLOT_ANSWER` and sets `pos`, `done_blocks`, `history`.
 //! - So the NEXT chat request is an ordinary A9 warm turn: `L >= pos`, `P = pos`, one rollback.
 //! - There is no second warm path; the tested one is the only one.
 //! - A refusal answers 4xx with a JSON error body and leaves the engine exactly as it was.
-//!
-//! Slot lines on stderr:
-//!
-//! | line | when |
-//! |---|---|
-//! | `[slot] save "<name>": n_saved N, B B, X ms -> <path>` | a save wrote the file |
-//! | `[slot] restore "<name>": n_restored N, B B, X ms <- <path>` | a restore read it |
-//! | `[slot] refused: <message>` | every 4xx, with the same message the body carries |
+//! - `--slot-save-path` must name an EXISTING directory; a typo refuses the BOOT, not the save.
 
 use crow_nest_engine::cache::{PrefixCache, SLOT_ANSWER, SLOT_PROMPT};
 use crow_nest_engine::cnq::Cnq;
@@ -582,6 +569,19 @@ fn parse_args(args: &[String]) -> Result<ServeArgs, String> {
 #[cfg(test)]
 fn parse_port(args: &[String]) -> Result<u16, String> {
     parse_args(args).map(|a| a.port)
+}
+
+/// - `--slot-save-path <dir>` must name an EXISTING directory, checked at boot (#32 review)
+/// - never created here: llama-server's convention is a directory the operator already made
+/// - `Err` carries the stderr line, so a typo costs a second, not a whole conversation
+fn check_slot_save_path(dir: &str) -> Result<(), String> {
+    if std::path::Path::new(dir).is_dir() {
+        return Ok(());
+    }
+    Err(format!(
+        "--slot-save-path {dir:?} is not a directory; create it first (llama-server takes an \
+         existing directory too, and this server never creates one)"
+    ))
 }
 
 // ------------------------------------------------- tokenize subcommand (A3)
@@ -854,7 +854,7 @@ fn slot_filename(body: &[u8]) -> Result<String, String> {
 
 fn not_found_json(path: &str) -> serde_json::Value {
     serde_json::json!({
-        "error": { "code": 404, "message": format!("no route {path} (serve answers GET /health, GET /props, POST /v1/chat/completions)") }
+        "error": { "code": 404, "message": format!("no route {path} (serve answers GET /health, GET /props, POST /v1/chat/completions, GET /slots, POST /slots/0)") }
     })
 }
 
@@ -2008,6 +2008,14 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // #32 review: a typo'd --slot-save-path used to be discovered at the FIRST save, after a
+    // whole conversation had been prefilled. It costs one stat call to find it here.
+    if let Some(d) = &cli.slot_save_path {
+        if let Err(e) = check_slot_save_path(d) {
+            eprintln!("[serve] {e}");
+            std::process::exit(2);
+        }
+    }
 
     // #25 A3: warm up the tokenizer BEFORE the CUDA context and before Engine::load.
     // A missing or broken tokenizer must fail in a second, not after the engine is pinned.
@@ -2280,6 +2288,21 @@ mod tests {
         let doc = not_found_json("/v1/models");
         assert_eq!(doc["error"]["code"], 404);
         assert!(doc["error"]["message"].as_str().unwrap().contains("/v1/models"));
+    }
+
+    /// review finding: the 404 body listed three of the five routes this server answers
+    #[test]
+    fn the_404_body_lists_every_route_this_server_answers() {
+        let msg = not_found_json("/v1/models")["error"]["message"].as_str().unwrap().to_string();
+        for route in [
+            "GET /health",
+            "GET /props",
+            "POST /v1/chat/completions",
+            "GET /slots",
+            "POST /slots/0",
+        ] {
+            assert!(msg.contains(route), "the 404 body does not name {route:?}: {msg}");
+        }
     }
 
     #[test]
@@ -3287,5 +3310,25 @@ mod tests {
         // a flag without its value is a usage error, not a silent default
         assert!(parse_args(&v(&["serve", "--slot-save-path"])).is_err());
         assert!(parse_args(&v(&["serve", "--slot-save-path="])).is_err());
+    }
+
+    /// review finding: a typo'd `--slot-save-path` must not be discovered at the first save
+    #[test]
+    fn a_slot_save_path_that_is_no_directory_is_refused_at_boot() {
+        // this source file exists and is NOT a directory
+        let file = format!("{}/src/bin/serve.rs", env!("CARGO_MANIFEST_DIR"));
+        let e = check_slot_save_path(&file).unwrap_err();
+        assert!(e.contains("not a directory"), "{e}");
+        // the message names the path the operator typed (debug quoted, so backslashes double)
+        assert!(e.contains("serve.rs"), "{e}");
+
+        let missing = format!("{}/no-such-slot-dir-4711", env!("CARGO_MANIFEST_DIR"));
+        let e = check_slot_save_path(&missing).unwrap_err();
+        assert!(e.contains("not a directory"), "{e}");
+        // the boot check never creates the directory
+        assert!(!std::path::Path::new(&missing).exists());
+
+        // an existing directory passes
+        assert_eq!(check_slot_save_path(env!("CARGO_MANIFEST_DIR")), Ok(()));
     }
 }

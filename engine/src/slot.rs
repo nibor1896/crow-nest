@@ -71,15 +71,32 @@
 //! | case | answer |
 //! |---|---|
 //! | no prefill clean position held (fresh process, cache off) | 409, `save` only |
-//! | no `--slot-save-path` | 400, nothing read, nothing written |
+//! | no `--slot-save-path`, or it is no directory | 400 on the request, refused at boot |
 //! | `filename` with a path separator, `..`, or a character outside `[A-Za-z0-9._-]` | 400 |
+//! | `filename` naming a Windows device (`NUL`, `CON`, `COM1`, `LPT1`, any extension) | 400 |
 //! | file absent or unreadable | 400 |
 //! | magic, format version or any shape field differs from this load | 400, engine untouched |
 //! | file length not exactly header + payload (truncated or padded) | 400, engine untouched |
 //! | `pos` 0, `pos > n_ctx`, or `history_len != pos` | 400, engine untouched |
+//! | `done_blocks != pos / 4` | 400, engine untouched |
+//! | header payload size over u64 | 400, engine untouched |
 //!
 //! - Every check runs BEFORE the first device upload, so a refusal cannot leave a half state.
-//! - The payload is read into host RAM in one call after the checks, so no partial commit exists.
+//! - The content checks are `Header::check_content`, pure, and unit tested branch by branch.
+//! - `done_blocks` is an UPLOAD LENGTH into `qsa_pooled`, which holds `ceil(n_ctx/4)` blocks
+//!   (`manager.rs:216-219`), so an unbounded value from a file would write past the buffer.
+//! - `payload_bytes` saturates instead of wrapping: a release build has no overflow checks,
+//!   and a wrapped size would name a SMALL payload for a file that asks for a huge upload.
+//! - The payload read is bounded by `take(payload + 1)`, so an oversized file is refused
+//!   after at most one byte over, never after being pulled into host RAM whole.
+//!
+//! Ordering, and what a failure in the middle can leave (`cuda::ck` ends the process):
+//!
+//! | step | order | why |
+//! |---|---|---|
+//! | save: write a sibling `.part-<pid>`, fsync, then `fs::rename` over the target | last | a full disk cannot truncate the previous good file |
+//! | save: `n_written` counted from the writes, then checked against the size on disk | last | the number on the wire is measured, not the header formula |
+//! | restore: `cache.set_prompt_slot` | AFTER every upload | a `ck` failure mid upload must not leave a cache claiming a position the device never got |
 //!
 //! What a restore then does, so the NEXT request takes the tested A9 warm path:
 //!
@@ -205,17 +222,30 @@ impl Header {
         Ok(h)
     }
 
-    /// bytes after the header, from the shape alone
-    pub fn payload_bytes(&self) -> u64 {
-        self.state_bytes
-            + self.kv_groups * self.pos * self.kv_row_bytes
-            + self.attn_layers * self.done_blocks * self.pooled_row_bytes
-            + self.history_len * 8
+    /// - bytes after the header, from the shape alone
+    /// - `None` when the header's own numbers do not fit a u64 (a hostile header)
+    pub fn payload_bytes_checked(&self) -> Option<u64> {
+        let kv = self.kv_groups.checked_mul(self.pos)?.checked_mul(self.kv_row_bytes)?;
+        let pooled =
+            self.attn_layers.checked_mul(self.done_blocks)?.checked_mul(self.pooled_row_bytes)?;
+        let ids = self.history_len.checked_mul(8)?;
+        self.state_bytes.checked_add(kv)?.checked_add(pooled)?.checked_add(ids)
     }
 
-    /// header plus payload, the exact length a good file has
+    /// - bytes after the header; saturates instead of wrapping, so a bad header can never
+    ///   name a SMALL payload by overflowing (release builds have no overflow checks)
+    pub fn payload_bytes(&self) -> u64 {
+        self.payload_bytes_checked().unwrap_or(u64::MAX)
+    }
+
+    /// header plus payload, the exact length a good file has; `None` on the same overflow
+    pub fn file_bytes_checked(&self) -> Option<u64> {
+        self.payload_bytes_checked()?.checked_add(HEADER_BYTES as u64)
+    }
+
+    /// header plus payload, the exact length a good file has; saturating, as `payload_bytes`
     pub fn file_bytes(&self) -> u64 {
-        HEADER_BYTES as u64 + self.payload_bytes()
+        self.file_bytes_checked().unwrap_or(u64::MAX)
     }
 
     /// - every field that describes the LOAD must agree; `pos` and its two friends may not
@@ -243,11 +273,68 @@ impl Header {
         }
         Ok(())
     }
+
+    /// - every CONTENT check a restore owes, pure so it runs without a device
+    /// - `self` is the file's header, `live` the geometry of this load
+    /// - run AFTER `shape_matches` and BEFORE the first byte is uploaded
+    ///
+    /// | case | why it is refused |
+    /// |---|---|
+    /// | `pos == 0` | there is nothing to restore |
+    /// | `pos > n_ctx` | the KV upload would run past the end of the KV buffer |
+    /// | `done_blocks != pos / 4` | it is an UPLOAD LENGTH for a buffer of `ceil(n_ctx/4)` blocks |
+    /// | `history_len != pos` | the id list would not describe the restored position |
+    /// | payload size over u64 | a hostile header must not name a small payload by wrapping |
+    pub fn check_content(&self, live: &Header) -> Result<(), String> {
+        if self.pos == 0 {
+            return Err("the file holds position 0, so there is nothing to restore".to_string());
+        }
+        if self.pos > live.n_ctx {
+            return Err(format!("file position {} over n_ctx {}", self.pos, live.n_ctx));
+        }
+        // gen.rs:1648 and gen.rs:2696 both set done_blocks = floor(pos / 4), so this is an
+        // equality, not a bound. It is the ONLY thing between a crafted header and a device
+        // write past `qsa_pooled`, which holds ceil(n_ctx / 4) blocks (manager.rs:216-219).
+        if self.done_blocks != self.pos / 4 {
+            return Err(format!(
+                "file done blocks {}, position {} needs exactly {} (floor of pos/4, gen.rs:1648)",
+                self.done_blocks,
+                self.pos,
+                self.pos / 4
+            ));
+        }
+        if self.history_len != self.pos {
+            return Err(format!(
+                "file history {} does not match position {}",
+                self.history_len, self.pos
+            ));
+        }
+        if self.file_bytes_checked().is_none() {
+            return Err("the header names a payload size that does not fit a u64".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// bytes a `filename` may consist of; everything else is refused
 fn plain_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-'
+}
+
+/// - `true` for `NUL`, `con.bin`, `COM1`, `lpt9.slot.bin` and every case of them
+/// - `NUL` opens the null device: a save would write NOTHING and still answer 200
+/// - Windows resolves a device name whatever the extension, so the BASE name decides
+fn reserved_device_name(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    match base.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        // COM0..COM9 and LPT0..LPT9, and nothing longer
+        _ => {
+            base.len() == 4
+                && (base.starts_with("COM") || base.starts_with("LPT"))
+                && base.as_bytes()[3].is_ascii_digit()
+        }
+    }
 }
 
 /// - a bare file name: no separator, no `..`, only `[A-Za-z0-9._-]`
@@ -266,6 +353,12 @@ pub fn sanitize_filename(name: &str) -> Result<&str, String> {
         return Err(format!(
             "filename {name:?} holds byte {b:#04x}; only [A-Za-z0-9._-] is allowed, so no path \
              separator and no directory can be named"
+        ));
+    }
+    if reserved_device_name(name) {
+        return Err(format!(
+            "filename {name:?} names a reserved Windows device (CON, PRN, AUX, NUL, COM0-9, \
+             LPT0-9, with or without an extension); it would open the device, not a file"
         ));
     }
     Ok(name)
@@ -289,7 +382,7 @@ pub fn load_id(model_path: &str, n_hot: usize) -> u64 {
 pub struct Saved {
     /// `n_saved` on the wire: the prefill clean position the file holds
     pub n_saved: usize,
-    /// `n_written` on the wire: header plus payload
+    /// `n_written` on the wire: the bytes the writer actually took, counted
     pub n_written: u64,
     /// wall of the whole save in ms
     pub ms: f64,
@@ -300,7 +393,7 @@ pub struct Saved {
 pub struct Restored {
     /// `n_restored` on the wire: the position now held, equal to the file's `pos`
     pub n_restored: usize,
-    /// `n_read` on the wire: header plus payload
+    /// `n_read` on the wire: the header plus the payload actually read, counted
     pub n_read: u64,
     /// wall of the whole restore in ms
     pub ms: f64,
@@ -352,6 +445,37 @@ unsafe fn dtoh_bytes(dst: &mut [u8], src: cuda::CUdeviceptr) {
     ));
 }
 
+/// - the sibling name a save writes before it renames over `path`
+/// - the pid keeps two serve processes on one directory out of each other's way
+fn temp_path(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let name = path.file_name().ok_or_else(|| format!("{path:?} names no file"))?;
+    let mut tmp = name.to_os_string();
+    tmp.push(format!(".part-{}", std::process::id()));
+    Ok(path.with_file_name(tmp))
+}
+
+/// removes the half written temp file when a save leaves early; `mem::forget` keeps it
+struct TempFile<'a>(&'a std::path::Path);
+
+impl Drop for TempFile<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
+/// - one write, and the byte count that follows from it
+/// - `n` is what the file HOLDS, not what the header formula predicts
+fn put(
+    w: &mut impl Write,
+    bytes: &[u8],
+    n: &mut u64,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    w.write_all(bytes).map_err(|e| format!("write to {path:?} failed: {e}"))?;
+    *n += bytes.len() as u64;
+    Ok(())
+}
+
 /// - write the held prefill clean state to `path` (see the module doc for the layout)
 /// - reads the device, never writes it; the engine state is not touched
 ///
@@ -392,12 +516,19 @@ pub unsafe fn save(
         return Err(format!("held state {state} B, the shape says {} B", h.state_bytes));
     }
 
-    let f = std::fs::File::create(path).map_err(|e| format!("cannot write {path:?}: {e}"))?;
+    // #32 review: the previous good file is not touched until the new one is whole. A
+    // disk-full or a device error used to leave a truncated file where a good one had been,
+    // and every later restore refused it. `fs::rename` is atomic on one volume, and the temp
+    // name is a sibling, so the rename never crosses a volume.
+    let tmp = temp_path(path)?;
+    let guard = TempFile(&tmp);
+    let f = std::fs::File::create(&tmp).map_err(|e| format!("cannot write {tmp:?}: {e}"))?;
     let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
-    let io = |e: std::io::Error| format!("write to {path:?} failed: {e}");
-    w.write_all(&h.encode()).map_err(io)?;
+    // MEASURED, never computed: what the writer actually took, byte for byte
+    let mut n_written: u64 = 0;
+    put(&mut w, &h.encode(), &mut n_written, &tmp)?;
     for block in blocks {
-        w.write_all(f32_bytes(block)).map_err(io)?;
+        put(&mut w, f32_bytes(block), &mut n_written, &tmp)?;
     }
 
     // whatever the last request left in flight must land before the copies read it
@@ -407,21 +538,33 @@ pub unsafe fn save(
         for is_k in [true, false] {
             for kvh in 0..NKV {
                 dtoh_bytes(&mut kv_row, eng.st.kv_row_ptr(layer, is_k, kvh, 0));
-                w.write_all(&kv_row).map_err(io)?;
+                put(&mut w, &kv_row, &mut n_written, &tmp)?;
             }
         }
     }
     let mut pooled = vec![0u8; done_blocks * h.pooled_row_bytes as usize];
     for layer in 0..h.attn_layers as usize {
         dtoh_bytes(&mut pooled, eng.st.qsa_pooled[layer]);
-        w.write_all(&pooled).map_err(io)?;
+        put(&mut w, &pooled, &mut n_written, &tmp)?;
     }
     for id in &eng.history[..pos] {
-        w.write_all(&id.to_le_bytes()).map_err(io)?;
+        put(&mut w, &id.to_le_bytes(), &mut n_written, &tmp)?;
     }
-    w.flush().map_err(io)?;
-    drop(w);
-    Ok(Saved { n_saved: pos, n_written: h.file_bytes(), ms: t0.elapsed().as_secs_f64() * 1e3 })
+    let f = w.into_inner().map_err(|e| format!("write to {tmp:?} failed: {e}"))?;
+    // flush AND fsync: a device error must surface here, before the rename, not after it
+    f.sync_all().map_err(|e| format!("flush of {tmp:?} failed: {e}"))?;
+    drop(f);
+    if n_written != h.file_bytes() {
+        return Err(format!("wrote {n_written} B, the header says {} B", h.file_bytes()));
+    }
+    // the writer is closed, so Windows lets the rename replace the previous good file
+    std::fs::rename(&tmp, path).map_err(|e| format!("cannot move {tmp:?} to {path:?}: {e}"))?;
+    std::mem::forget(guard);
+    let on_disk = std::fs::metadata(path).map_err(|e| format!("cannot stat {path:?}: {e}"))?.len();
+    if on_disk != n_written {
+        return Err(format!("{path:?} holds {on_disk} B, {n_written} B were written"));
+    }
+    Ok(Saved { n_saved: pos, n_written, ms: t0.elapsed().as_secs_f64() * 1e3 })
 }
 
 /// - load `path` into the engine and into the `SLOT_PROMPT` slot of `cache`
@@ -451,25 +594,20 @@ pub unsafe fn restore(
         .map_err(|e| format!("{path:?} is shorter than the {HEADER_BYTES} byte header: {e}"))?;
     let h = Header::decode(&head)?;
     h.shape_matches(&live)?;
-    if h.pos == 0 {
-        return Err("the file holds position 0, so there is nothing to restore".to_string());
-    }
-    if h.pos > live.n_ctx {
-        return Err(format!("file position {} over n_ctx {}", h.pos, live.n_ctx));
-    }
-    if h.history_len != h.pos {
+    h.check_content(&live)?;
+    let want = h.payload_bytes();
+    // #32 review: BOUNDED. A padded file is refused after payload + 1 bytes, so a 40 GB
+    // file cannot be pulled into host RAM before the size check gets to run.
+    let mut body = Vec::with_capacity(want as usize + 1);
+    std::io::Read::by_ref(&mut f)
+        .take(want + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| format!("read {path:?} failed: {e}"))?;
+    if body.len() as u64 != want {
+        let held = if body.len() as u64 > want { "more than" } else { "only" };
         return Err(format!(
-            "file history {} does not match position {}",
-            h.history_len, h.pos
-        ));
-    }
-    let mut body = Vec::new();
-    f.read_to_end(&mut body).map_err(|e| format!("read {path:?} failed: {e}"))?;
-    if body.len() as u64 != h.payload_bytes() {
-        return Err(format!(
-            "{path:?} holds {} payload bytes, the header asks for {}",
-            body.len(),
-            h.payload_bytes()
+            "{path:?} holds {held} {} payload bytes, the header asks for {want}",
+            body.len()
         ));
     }
     let state: u64 = cache.prompt_state_blocks().iter().map(|b| (b.len() * 4) as u64).sum();
@@ -488,7 +626,6 @@ pub unsafe fn restore(
         bytes_into_f32(&body[at..at + n], block);
         at += n;
     }
-    cache.set_prompt_slot(h.pos as usize, h.done_blocks as usize);
 
     let kv_bytes = h.pos as usize * h.kv_row_bytes as usize;
     for layer in 0..h.attn_layers as usize {
@@ -516,12 +653,17 @@ pub unsafe fn restore(
     eng.done_blocks = h.done_blocks as usize;
     eng.history = ids;
     eng.route_log.clear();
+    // #32 review: LAST. Every upload above is a `cuda::ck`, which ends the process on a
+    // device error (serve has no catch_unwind), so naming the slot before them could leave
+    // a cache that claims a position the device never received. It cannot now.
+    cache.set_prompt_slot(h.pos as usize, h.done_blocks as usize);
 
     // the uploads read `body`, which dies with this frame
     cuda::sync();
     Ok(Restored {
         n_restored: h.pos as usize,
-        n_read: h.file_bytes(),
+        // MEASURED: the header this reader consumed plus the payload it actually read
+        n_read: HEADER_BYTES as u64 + body.len() as u64,
         ms: t0.elapsed().as_secs_f64() * 1e3,
     })
 }
@@ -643,6 +785,89 @@ mod tests {
             bend(&mut h);
             let e = h.shape_matches(&live()).unwrap_err();
             assert!(e.contains(name), "field {name}: message was {e:?}");
+        }
+    }
+
+    #[test]
+    fn a_good_header_passes_the_content_checks() {
+        assert_eq!(live().check_content(&live()), Ok(()));
+        let mut h = live();
+        h.pos = 12;
+        h.done_blocks = 3;
+        h.history_len = 12;
+        assert_eq!(h.check_content(&live()), Ok(()));
+        // floor, not ceil: gen.rs:1647 sets new_done = (pos_base + t) / 4
+        h.pos = 13;
+        h.history_len = 13;
+        assert_eq!(h.check_content(&live()), Ok(()));
+    }
+
+    /// every content branch, one bend at a time, and the message names the field
+    #[test]
+    fn every_content_check_refuses_and_names_the_case() {
+        let cases: Vec<(&str, fn(&mut Header))> = vec![
+            ("position 0", |h| {
+                h.pos = 0;
+                h.done_blocks = 0;
+                h.history_len = 0;
+            }),
+            ("n_ctx", |h| {
+                h.pos = 200_001;
+                h.done_blocks = 50_000;
+                h.history_len = 200_001;
+            }),
+            ("done blocks", |h| h.done_blocks += 1),
+            ("done blocks", |h| h.done_blocks -= 1),
+            ("history", |h| h.history_len += 1),
+        ];
+        for (name, bend) in cases {
+            let mut h = live();
+            bend(&mut h);
+            let e = h.check_content(&live()).unwrap_err();
+            assert!(e.contains(name), "case {name}: message was {e:?}");
+        }
+    }
+
+    /// the review finding: `done_blocks` is a device upload length for a buffer sized
+    /// `ceil(n_ctx/4)` blocks, so a header naming more than `pos / 4` writes out of bounds
+    #[test]
+    fn a_done_blocks_count_that_would_overrun_the_pooled_buffer_is_refused() {
+        let mut h = live();
+        h.pos = 1;
+        h.history_len = 1;
+        h.done_blocks = 200_000;
+        let e = h.check_content(&live()).unwrap_err();
+        assert!(e.contains("done blocks"), "{e}");
+        // and the same header with a file of exactly the length it names is still refused
+        assert_eq!(h.payload_bytes_checked(), Some(h.payload_bytes()));
+    }
+
+    #[test]
+    fn a_payload_size_that_does_not_fit_a_u64_is_refused_not_wrapped() {
+        let mut h = live();
+        h.pos = u64::MAX / 8;
+        h.history_len = h.pos;
+        h.done_blocks = h.pos / 4;
+        assert_eq!(h.payload_bytes_checked(), None);
+        assert_eq!(h.file_bytes_checked(), None);
+        // the saturating views never name a SMALL payload for a hostile header
+        assert_eq!(h.payload_bytes(), u64::MAX);
+        assert_eq!(h.file_bytes(), u64::MAX);
+    }
+
+    /// `{"filename":"NUL"}` opened the null device, so a save wrote nothing and answered 200
+    #[test]
+    fn a_windows_reserved_device_name_is_refused() {
+        for bad in [
+            "NUL", "nul", "Nul", "CON", "con.bin", "PRN", "AUX", "COM1", "com9.bin", "LPT1",
+            "lpt9", "NUL.tmp", "aux.slot.bin",
+        ] {
+            let e = sanitize_filename(bad).unwrap_err();
+            assert!(e.contains("reserved"), "{bad:?}: {e}");
+        }
+        // names that only LOOK reserved stay allowed
+        for good in ["nulls.bin", "console.bin", "com.bin", "com10.bin", "lpt.bin", "auxiliary"] {
+            assert_eq!(sanitize_filename(good), Ok(good), "{good:?} was refused");
         }
     }
 
