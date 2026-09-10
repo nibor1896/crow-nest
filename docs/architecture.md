@@ -1162,6 +1162,8 @@ C:/x/y.md
 | `CROW_QSA_FULL=1` | out of scope | 7.7, the ring would dominate every size |
 | `CROW_COLD_TIER` low-bit tier | must stay off | 7.5 condition 2 |
 
+- Every `CROW_*` variable of the engine has one row in `docs/env.md`; `tools/check_env_docs.py` guards code against doc.
+
 - `stream: false` left this table with #39 (B3a): the probe-suite and Crow's rollover
   digest send no `stream` field, and both are served now. See 7.11.13.
 
