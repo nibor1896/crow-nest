@@ -75,9 +75,11 @@
 //! PLE conv      10240 * 9      * 4 =     368,640 B
 //! QSA ring 12 * 2052 * 128     * 4 =  12,607,488 B
 //! total per slot                   = 130,646,016 B = 124.60 MiB
-//! two slots                        = 261,292,032 B = 249.19 MiB
+//! process total (SLOTS = 1)        = 130,646,016 B = 124.60 MiB
 //! ```
 //!
+//! - M1 held two slots (261,292,032 B); M2 (robin, 2026-09-10, #36) dropped the
+//!   after-answer slot.
 //! - Pageable host RAM, allocated once at process start, reused per snapshot.
 //! - Not pinned (the pinned tier is budgeted at 46 GiB, `geo.rs:110`).
 //! - Not VRAM (the loader already clamps N against it, `manager.rs:122-170`).
