@@ -120,7 +120,10 @@
 //! - It is still TAKEN (M1: both snapshots unconditional) and it is still reported.
 //! - It is not offered to `reuse_slot`, so no request can roll back onto a decode row.
 //! - Cost of not using it: the previous answer is re-prefilled, 63 tokens at the A9
-//!   operating point, 0.03 s of the 22.9 s a cold turn pays.
+//!   operating point: snapshot point 2 at pos 16,127 minus the prefill clean `P` 16,064
+//!   (`decode_out/srv-a9.log:42-43`).
+//! - Those 63 sit inside a 95 token warm prefill of 404.3 ms at 234.95 tok/s
+//!   (`decode_out/srv-a9.log:29`). The answer's own share of those ms is NOT measured.
 //!
 //! The one exception to "in-process state, never a file" (#32 A10, spec 7.6):
 //!

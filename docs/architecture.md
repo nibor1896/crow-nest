@@ -425,7 +425,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 |---|---|---|
 | cold 16k prefill, turn 1, 16,064 ids | **21.6 to 22.0 s** | the same work the 24.13 s reference names, on the serve binary |
 | warm turn prefill, 95 of 16,159 ids | **404 ms** | 99.41 % of the prompt reused |
-| rollback into the last turn (HtoD) | **12 to 13 ms** | 7.9 acceptance point 3 |
+| rollback into the last turn (HtoD) | **11.98 to 13.12 ms** | 7.9 acceptance point 3 |
 
 - Rule: 24.13 s stays the plan's reference number, with the provenance above.
 - Rule: 21.6 to 22.0 s is the number of THIS build and is the one 7.8 costs are read against.
@@ -479,7 +479,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 **Fact 2: the recurrent states carry no position at all.**
 
 - `delta_rule_persist` (`kernels.rs:987-1012`) folds each token into `S` in place.
-- `delta_rule_step` (`kernels.rs:1025-1048`) folds each token into `S` in place.
+- `delta_rule_step` (`kernels.rs:1025-1045`) folds each token into `S` in place.
 - `conv_state_update` (`kernels.rs:920-928`) shifts a 3-wide window.
 - `conv_step` (`kernels.rs:1013-1024`) shifts a 3-wide window.
 - The `init` flag that zeroes `S` is set only for the first chunk of the first prefill
@@ -503,9 +503,9 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 | step | what the code does | evidence |
 |---|---|---|
 | 1 | `decode_step` creates the capture stream ONCE and leaves it ACTIVE | `gen.rs:2740-2743` |
-| 2 | `launch_v` and `upload_into` both read that active stream | `gen.rs:1194`, `cuda.rs:373` |
+| 2 | `launch_v` and `upload_into` both read that active stream | `gen.rs:1194`, `cuda.rs:377` (`cur_stream`) |
 | 3 | `upload_into` skips its sync on any stream but the legacy one | `cuda.rs:381-386` |
-| 4 | `prefill` uploads its per chunk scalars and the embedding block from TEMPORARIES | `gen.rs:2493-2510`, `gen.rs:2519` |
+| 4 | `prefill` uploads its per chunk scalars and the embedding block from TEMPORARIES | `gen.rs:2493-2510`, `gen.rs:2517-2526` |
 | 5 | so a second `prefill` posted async HtoD copies whose host source had already died | measured |
 | result | same prompt, greedy: request 1 gave id 18622, request 2 gave id 17 | `.superpowers/sdd/task-A4-report.md` |
 
@@ -513,7 +513,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 - `Engine::drop_decode_graph` (`engine/src/reset.rs`) destroys `graph_exec`, destroys
   `cap_stream` and puts the legacy stream (0) back, mirroring `impl Drop for Engine`
-  (`gen.rs:3307-3317`).
+  (`gen.rs:3309-3319`).
 - It is the ONE definition of that teardown.
 - The cold path `Engine::reset_to_zero` calls it before any prefill.
 - The warm path `PrefixCache::rollback` (`cache.rs:445`) calls it before any prefill.
@@ -523,7 +523,10 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - Rule: **the decode graph is dropped and recaptured per request.** It is not carried.
 - Cost: one eager decode step plus one graph instantiate per request.
 - Not measured against keeping the graph: keeping it is what broke the ids.
-- A4 gate, 18 token prompt, 29 generated: decode 1170 to 1203 ms over four runs.
+- A4 gate, 18 token prompt, 29 generated: decode **1154.2 to 1213.2 ms** over the seven
+  logged runs (`decode_out/srv-a4.stderr.log:199`, `:207`, `:215`,
+  `decode_out/srv-a4-fresh.stderr.log:143`, `:158`,
+  `decode_out/srv-a4-fix.stderr.log:146`, `:154`).
 
 ### 7.3 The four states
 
@@ -699,7 +702,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - The `ring` here is the **raw-key ring**.
 - It has nothing to do with the QSA **selection budget**.
 - The "budget 2,048 tokens" of section 2.1 is `QSA_BLOCK_TOPK` 512 selected blocks x
-  compression ratio 4 = 2,048 tokens a *query* may attend to (`geo.rs:41-42`).
+  compression ratio 4 = 2,048 tokens a *query* may attend to (`geo.rs:40-41`).
 - The ring is a `ceil4(prompt_chunk + 4)`-row scratch buffer of raw indexer keys awaiting
   pooling.
 - The two numbers are unrelated and only happen to sit close together at chunk 2048.
@@ -723,7 +726,12 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - Consequence: every turn re-prefills the previous answer.
 - Measured cost: **63 to 95 tokens** at the 16k operating point, still **99.41 % cached**
   (16,064 of 16,159), prefill **404 ms** (`decode_out/srv-a9.log`).
-- Measured cost in a cold turn's terms: 0.03 s of the 22.9 s the cold turn paid.
+- The 63 is the answer alone: snapshot point 2 at pos 16,127 minus the prefill clean `P`
+  16,064 (`decode_out/srv-a9.log:42-43`).
+- The 404 ms times all 95 re-prefilled tokens at 234.95 tok/s (`decode_out/srv-a9.log:29`);
+  the answer's own share of those ms is **unmeasured**.
+- For scale, the cold turn in the same log prefilled 16,064 ids in **21.63 s** of a
+  **24.33 s** wall (`decode_out/srv-a9.log:21`, `:24`).
 - The rollback lands on point 1 whether the divergence sits in the answer or not; that is
   the rule working, not a special case.
 - The re-rendered assistant message need not reproduce the generated ids exactly, which is a
@@ -773,7 +781,8 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - That is exactly the cold-start case.
 - Consequence: the restored path must leave it at 0.
 - The current signature already does the right thing once `pos` is set.
-- Measured HtoD: **12 to 13 ms** (A9, #31).
+- Measured HtoD: **11.98 to 13.12 ms** (A9, #31, `decode_out/srv-a9.log:43`, `:46`,
+  `:142`, `:145`).
 
 **What must NOT be reused:**
 
@@ -851,7 +860,7 @@ with `ring = ceil4(prompt_chunk + 4).min(context)` (`manager.rs:37-41`):
 | snapshot bytes at chunk 2048 | **130,646,016 B** | exactly the table row above |
 | DtoH per snapshot, warm | **14.5 ms** | steady state |
 | DtoH per snapshot, first request of a process | **35 to 64 ms** | first-touch of the host pages |
-| HtoD per rollback | **12 to 13 ms** | 7.9 acceptance point 1 and 3 |
+| HtoD per rollback | **11.98 to 13.12 ms** | 7.9 acceptance point 1 and 3 |
 
 **Where snapshots live:**
 
@@ -869,8 +878,8 @@ with `ring = ceil4(prompt_chunk + 4).min(context)` (`manager.rs:37-41`):
   which is still supported.
 - The ring term is then `12 * 262,144 * 128 * 4 = 1,610,612,736 B` (about **1.5 GiB**) at
   the default context of 262,144 (`geo.rs:105`).
-- That is roughly **13x the whole snapshot**, and it would dominate every number in this
-  section.
+- That is roughly **12.3x one snapshot** (1,610,612,736 / 130,646,016 B), and it would
+  dominate every number in this section.
 - Rule: `CROW_QSA_FULL=1` is therefore **out of scope for serve**.
 - Consequence: the server runs the default layout, and every size above assumes it.
 
@@ -900,7 +909,7 @@ Therefore:
 |---|---|---|---|---|
 | cold turn 1 | 16,064 | 0 | 16,064 | 21.6 to 22.0 s |
 | warm turn 2 | 16,159 | 16,064 (99.41 %) | 95 (0.59 %) | 404 ms |
-| rollback into the last turn | n/a | n/a | n/a | 12 to 13 ms HtoD |
+| rollback into the last turn | n/a | n/a | n/a | 11.98 to 13.12 ms HtoD |
 
 - `prompt_ms` on the wire is the `Engine::prefill` call only: it excludes the rollback, the
   reset, the snapshots and the tokenizer (`serve.rs` module doc).
@@ -916,9 +925,9 @@ Therefore:
 
 | # | measurement | result | source |
 |---|---|---|---|
-| 1 | snapshot copy time, DtoH and HtoD | DtoH 14.5 ms warm, 35 to 64 ms on the first request; HtoD 12 to 13 ms | `decode_out/srv-a9.log` |
+| 1 | snapshot copy time, DtoH and HtoD | DtoH 14.5 ms warm, 35 to 64 ms on the first request; HtoD 11.98 to 13.12 ms | `decode_out/srv-a9.log` |
 | 2 | warm-turn time for a 16k transcript whose next turn appends a short prompt | prefill 404 ms, 16,064 of 16,159 ids cached (99.41 %) | `decode_out/srv-a9.log` |
-| 3 | rollback time when the divergence lands inside the last turn | 12 to 13 ms, `L` 16,172, `P` 16,159 | `decode_out/srv-a9.log` |
+| 3 | rollback time when the divergence lands inside the last turn | 11.98 to 13.12 ms, `L` 16,172, `P` 16,159 | `decode_out/srv-a9.log` |
 
 - The A9 identity gate itself: part 1 cached 99.41 %, 2 of 2; part 2 identity 2 of 2, one
   sha over 5 runs; part 3 rollback PASS 2 of 2 (`decode_out/srv-a9.log`,
@@ -984,9 +993,9 @@ Therefore:
 | `top_k` | default 20 (data sheet), read only when `temperature > 0` | `serve.rs:465`, `serve.rs:1043` | not sent by Crow |
 | `presence_penalty` | default 1.5 (data sheet), read only when `temperature > 0` | `serve.rs:467`, `serve.rs:1043` | not sent by Crow |
 | `seed` | RNG seed of THIS request, default 0, reseeded per request (M1) | `serve.rs:469`, `serve.rs:1043` | not sent by Crow |
-| `min_p` | **ACCEPTED AND IGNORED**, one stderr line per request | `serve.rs:1043`, `serve.rs` module doc | `crow_core.py:4672-4700` (0.01 at Crow's operating point) |
-| `tools` | rendered as the template variable `tools` | `serve.rs:918`, `tokenizer::render_chat` | `crow_core.py:4672-4700`, `TOOLS` (31 declarations) |
-| `chat_template_kwargs.enable_thinking` | template variable, default false | `serve.rs:918` | `crow_core.py:2969` (digest path) |
+| `min_p` | **ACCEPTED AND IGNORED**, one stderr line per request | `serve.rs:1532` (the stderr line); `sampler_from` (`serve.rs:1043`) carries no `min_p`; `serve.rs` module doc | `crow_core.py:4672-4700` (0.01 at Crow's operating point) |
+| `tools` | rendered as the template variable `tools` | `serve.rs:918`, `tokenizer::render_chat` | `crow_core.py:4672-4700`, `TOOLS` (25 builtin at `crow_core.py:579-838`, frozen at `:846`, plus the `mcp.json` tools added at import, `:841`) |
+| `chat_template_kwargs.enable_thinking` | template variable, default false | `serve.rs:918` | `crow_core.py:2970` (digest path) |
 | `messages[].role = "tool"` | `content` rendered as `<tool_response>...</tool_response>` | `serve.rs:1284` (`normalize_messages`) | `crow_core.py` tool turns |
 | `messages[].tool_calls[].function.arguments` | a JSON STRING from Crow is parsed into the MAPPING the template needs | `serve.rs:1284` | `crow_core.py:3564` |
 | `tool_call_id` | carried, never read; this template pairs by order | `serve.rs:1284` | `crow_core.py` tool turns |
@@ -1012,14 +1021,14 @@ Therefore:
 | object | field | as built | crow-nest anchor | Crow reader |
 |---|---|---|---|---|
 | `usage` | `prompt_tokens` | rendered prompt ids, cached part included | `serve.rs:1111` (`usage_json`) | `crow_core.py:4831-4877` |
-| `usage` | `completion_tokens` | generated ids | `serve.rs:1111` | `crow_core.py:4831-4877` |
+| `usage` | `completion_tokens` | generated ids, **the prefill token included**: it is `t.predicted_n` itself (`serve.rs:1114`), the same value as `timings.predicted_n` | `serve.rs:1111` | `crow_core.py:4831-4877` |
 | `usage` | `total_tokens` | `prompt_tokens + completion_tokens` | `serve.rs:1111` | `crow_core.py:4831-4877` |
 | `usage` | `prompt_tokens_details.cached_tokens` | `P`, ALWAYS present as an integer | `serve.rs:1111` | `crow_core.py:4831-4877`, fallback at `:14923` |
 | `timings` | `prompt_n` | `prompt_tokens - cached_tokens`, the ids actually prefilled | `serve.rs:1124` (`timings_json`) | `crow_core.py:4999-5018` |
 | `timings` | `prompt_ms` | wall of the `Engine::prefill` call only | `serve.rs:1124` | `crow_core.py:4999-5018` |
 | `timings` | `prompt_per_second` | `prompt_n / prompt_ms * 1000` | `serve.rs:1083` (`per_second`) | `crow_core.py:4999-5018` |
 | `timings` | `prompt_per_token_ms` | `prompt_ms / prompt_n` | `serve.rs:1092` | no reader in Crow |
-| `timings` | `predicted_n` | generated ids, **the prefill token included** (llama-server convention) | `serve.rs:1124` | `crow_core.py:4999-5018` |
+| `timings` | `predicted_n` | generated ids, **the prefill token included** (llama-server convention); the same value as `usage.completion_tokens` (`serve.rs:1114`, `serve.rs:1130`) | `serve.rs:1124` | `crow_core.py:4999-5018` |
 | `timings` | `predicted_ms` | wall of the decode loop, first `decode_step` to the last | `serve.rs:1124` | `crow_core.py:4999-5018` |
 | `timings` | `predicted_per_second` | `predicted_n / predicted_ms * 1000` | `serve.rs:1083` | `crow_core.py:4999-5018` |
 | `timings` | `predicted_per_token_ms` | `predicted_ms / predicted_n` | `serve.rs:1092` | no reader in Crow |
@@ -1067,16 +1076,22 @@ C:/x/y.md
 ```
 
 - `<tool_call>` is added token 248058 and is matched by TOKEN ID; `</tool_call>` is 248059
-  and is matched by TEXT (`engine/src/toolcall.rs:264`).
+  and is matched by TEXT (the ids at `toolcall.rs:27`, the two constants at
+  `toolcall.rs:52-55`, the arming call `arm()` at `toolcall.rs:264`).
 - The OpenAI `arguments` object is BUILT from the parameter blocks by declared schema type
-  (`toolcall.rs:280`).
+  (`tool_param_types` at `toolcall.rs:141`, `value()` at `toolcall.rs:374`; the piece feed
+  that drives them is `feed()` at `toolcall.rs:280`).
 - EOS after `</function>` CLOSES the call: `finish_reason` `tool_calls`, trailing markup
   dropped and counted, never replayed as content (`toolcall.rs:293`).
 - Malformed markup (no `</function>`, no name): the RAW markup goes out as `delta.content`,
   `finish_reason` stays `stop` or `length`, `arguments` stays unterminated on purpose so
   Crow's `json.loads` fails rather than running half a command.
-- Measured: `crow_core.TOOLS` holds **31** declarations (the plan said seven), and the
-  rendered tools block is byte-identical to the Python oracle at **322 ids** (A3 #25, A7 #29).
+- `crow_core.TOOLS` is **25 builtin declarations** (`crow_core.py:579-838`, frozen as
+  `BUILTIN_TOOLS` at `:846`) plus whatever `mcp.json` adds at import (`:841`).
+- Measured on this machine on 2026-09-09: **31** declarations, 25 builtin plus 6 MCP
+  (`decode_out/srv-a7-tools.json`). The plan said seven.
+- The rendered tools block is byte-identical to the Python oracle at **322 ids**
+  (A3 #25, A7 #29).
 
 **7.11.7 `GET /slots` and `POST /slots/0`**
 
@@ -1158,7 +1173,7 @@ C:/x/y.md
 | # | item | state | source |
 |---|---|---|---|
 | 1 | `min_p` in the device sampler | accepted and ignored; kernel change or drop it from Crow's profile | #28 |
-| 2 | serve decode rate | serve reaches **18 to 23 tok/s** where `decode run` reaches **35.7 tok/s** on the same prompt; prefill is equal (662.33 vs 664.08 tok/s, -0.26 %); **cause unmeasured** | #35, `decode_out/srv-a5.log` |
+| 2 | serve decode rate | serve reaches **18 to 23 tok/s** across the A4 to A6 gates. The **35.7 tok/s** #35 compares against is `decode run` on the **t3-debug** prompt (3,769 prompt ids; the named file records `decode_tok_s` **36.19**, `decode_out/final4-t3-debug-run0-crow.json`, harness of 2026-09-05/06), NOT the 16k t1-read prompt: on that prompt the A5 `decode run` control measures **17.1 tok/s** (`decode_out/srv-a5-decoderun.log:154`). Prefill on the 16k prompt is equal, 662.33 (serve) vs 664.08 (`decode run`) tok/s, -0.26 % (`decode_out/srv-a5.log:144-145`). **Cause unmeasured**, and the two rates are not on one prompt | #35, `decode_out/final4-t3-debug-run0-crow.json`, `srv-a5.log`, `srv-a5-decoderun.log` |
 | 3 | the after-answer snapshot slot | keep (M1), drop, or reassign to the previous turn's after-prompt snapshot | #31, 7.6 |
 
 - Rule: none of the three is decided in this document.
