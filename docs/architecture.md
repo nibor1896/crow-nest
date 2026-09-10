@@ -1088,7 +1088,7 @@ C:/x/y.md
   Crow's `json.loads` fails rather than running half a command.
 - `crow_core.TOOLS` is **25 builtin declarations** (`crow_core.py:579-838`, frozen as
   `BUILTIN_TOOLS` at `:846`) plus whatever `mcp.json` adds at import (`:841`, grown at
-  `Crow/cli/crow_core.py:9053`, reset at `Crow/cli/crow_core.py:9154`).
+  `Crow/cli/crow_core.py:9159`, reset at `Crow/cli/crow_core.py:9154`).
 - Measured on this machine on 2026-09-09: **31** declarations, 25 builtin plus 6 MCP
   (`decode_out/srv-a7-tools.json`). The plan said seven.
 - The rendered tools block is byte-identical to the Python oracle at **322 ids**
