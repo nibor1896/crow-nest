@@ -69,7 +69,7 @@ ALLOW = [
     re.compile(r"\bCUDA \d+(?:\.\d+)*\b"),
     re.compile(r"\bRust \d+(?:\.\d+)*\b"),
     re.compile(r"\bports?\D{0,4}`?\d{4,5}`?"),               # port 8099
-    re.compile(r"`[^`\s]+`"),                                # identifier in backticks
+    re.compile(r"`(?=[^`\s]*[A-Za-z_/])[^`\s]+`"),           # identifier in backticks (a purely numeric span is not exempt)
     re.compile(
         r"\b(?:BF|FP|NVFP|IQ|INT|UINT)\d+(?:\.\d+)?\b"
         r"|\b[EeMm]\d+[Mm]\d+\b"

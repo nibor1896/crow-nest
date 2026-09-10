@@ -82,7 +82,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 | build of `serve` | 16.5 s from an empty target directory, measured 2026-09-11 |
 | load to `/health` ok | 82.6 s, measured 2026-09-11 |
 | chat answer | HTTP 200, `finish_reason` `stop`, content "Hello there, my dear friend.", measured 2026-09-11 |
-| ids of that answer | identical in 3 of 3 starts on 2026-09-11, greedy |
+| ids of that answer | identical in 3 of 3 answers over 2 starts on 2026-09-11 (5 requests: 3 HTTP 200, 2 malformed curl forms rejected), greedy |
 
 - The server binds `127.0.0.1` and defaults to port 8099 (`engine/src/bin/serve.rs:445`).
 - It must be started from the repository root: container and hot-set paths are repository relative.
@@ -106,11 +106,11 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 
 - The two arms run different weights: crow-nest CNQ4.5-M (NVFP4, 4.5 bpw); llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL (GGUF, 2.4 bpw). Every comparison names both.
 - A `serve` rate is not an engine rate: the difference is the missing hot-set tick (issue #37, measured 2026-09-10).
-- No tok/s number is quoted without an adjacent decode run in the same session (rule from issue #38, 2026-09-10).
+- No tok/s number is quoted without an adjacent decode run in the same session (rule from issue #38, 2026-09-10); the #38 row above is the serve-to-serve drift pair itself, not a rate claim.
 
 ### Targets
 
-- Targets are goals the engine aims at, never pass or fail gates (`docs/architecture.md:18-19`, `:58`).
+- Targets are goals the engine aims at, never pass or fail gates (`docs/architecture.md:18-19`, `:57-58`).
 
 | target | value | measurement point | set |
 |---|---|---|---|
