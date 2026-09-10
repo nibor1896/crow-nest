@@ -47,7 +47,9 @@ Helpers used by the read sites:
 | `num(k)` | `engine/src/geo.rs:168` | parse to `usize`, `None` when unset or unparsable |
 | `f(k, d)` / `u(k, d)` | `engine/src/sample.rs:73`, `:74` | parse to `f32` / `usize`, fall back to `d` |
 
-The `--diag` cargo feature alternative of the E5 gate was NOT taken. No engine change was made before the tag. The four diagnostic values stay reachable in the default binary and carry a warning row below.
+- Scope: `engine/src` and `converter/src` only; shell variables of Crow (for example `CROW_TAVILY_KEY`) have no engine read site and no row.
+- The `--diag` cargo feature alternative of the E5 gate was not taken; no engine change before the tag.
+- The four diagnostic values stay reachable in the default binary and carry a warning row (section Diagnostic values).
 
 ## Container and residency (13 rows)
 
@@ -174,7 +176,8 @@ The `--diag` cargo feature alternative of the E5 gate was NOT taken. No engine c
 
 ## Reference operating point
 
-Environment of B4 part 3 (the F49 chain), `decode_out/srv-b4.log:216`. Same block in `.superpowers/sdd/task-C1-brief.md:101-110`.
+- Environment of B4 part 3 (the F49 chain), `decode_out/srv-b4.log:216`
+- Same block in `.superpowers/sdd/task-C1-brief.md:101-110`
 
 ```
 CROW_CNQ=converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq
