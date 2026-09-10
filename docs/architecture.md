@@ -551,8 +551,8 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
   by `prefill`. That property is called **PREFILL CLEAN**.
 - Reason: 7.5 is binding, and a decode-written row cannot be PROVEN to be the row a cold run
   would have.
-- Consequence: the after-answer snapshot is taken (M1) and is never offered to `reuse_slot`
-  (`cache.rs:325`, `cache.rs:171`).
+- Consequence: the after-answer snapshot was never offered to `reuse_slot`, so M2b DROPPED
+  it (robin 2026-09-10, #36; `cache.rs:334`, `cache.rs:180`, 7.6).
 - Induction that point 1 is always prefill clean: a cold request prefills `0..prompt_len`; a
   warm request rolls back only to a prefill-clean `P` and prefills `P..prompt_len`, which
   REWRITES the re-rendered previous answer as prefill rows.
@@ -707,35 +707,40 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
   pooling.
 - The two numbers are unrelated and only happen to sit close together at chunk 2048.
 
-**When to snapshot. Two points per turn, both taken unconditionally (M1, robin 2026-09-09):**
+**When to snapshot. ONE point per turn, taken unconditionally (M2b, robin 2026-09-10, #36):**
 
 | slot | point | position | reuse candidate |
 |---|---|---|---|
-| `SLOT_PROMPT` (`cache.rs:147`) | after the prefill of this turn's prompt | rendered prompt length | **yes**, it is prefill clean (7.3) |
-| `SLOT_ANSWER` (`cache.rs:149`) | after the last `decode_step` of this turn | prompt length + generated - 1 | **no**, `decode_step` wrote its rows |
+| `SLOT_PROMPT` (`cache.rs:158`) | after the prefill of this turn's prompt | rendered prompt length | **yes**, it is prefill clean (7.3) |
 
+- `SLOTS = 1` (`cache.rs:160`): one slot per process, and it is the prompt slot.
 - The last generated id is never fed back, so it is not in `history` and not in `pos`.
 - ONE held conversation per process (M1): a request that shares no prefix replaces it.
-- The point 2 snapshot runs AFTER `data: [DONE]`, so no client waits for its copy.
+- The M1 after-answer point is gone from `chat_stream`; the block below says why.
 
-**Point 2 is NOT the reuse case. Corrected 2026-09-10 (A9, #31):**
+**The after-answer snapshot was never the reuse case, and is DROPPED (M2b, #36):**
 
-- The proposal said point 2 is the normal case and spares the answer's prefill.
-- Measured: point 2 is taken, reported and never consumed (`prefill_clean` guard,
-  `cache.rs:325`).
-- Consequence: every turn re-prefills the previous answer.
+- The proposal said it is the normal case and spares the answer's prefill.
+- Measured 2026-09-10 (A9, #31): it was taken, reported and never consumed
+  (`prefill_clean` guard, `cache.rs:334`).
+- Decision M2 option b (robin, 2026-09-10, #1 comment): drop it. Built in #36.
+- Unchanged by the drop: the reuse behaviour, the `[cache]` stderr lines, `GET /slots`,
+  the slot file format of 7.3 and `slot.rs`.
+- Gone with it, per process: **130,646,016 B = 124.60 MiB** of pageable host RAM and one
+  **14.5 ms** DtoH per request (**35 to 64 ms** on the first request of a process).
+- Consequence, before and after the drop alike: every turn re-prefills the previous answer.
 - Measured cost: **63 to 95 tokens** at the 16k operating point, still **99.41 % cached**
   (16,064 of 16,159), prefill **404 ms** (`decode_out/srv-a9.log`).
-- The 63 is the answer alone: snapshot point 2 at pos 16,127 minus the prefill clean `P`
-  16,064 (`decode_out/srv-a9.log:42-43`).
+- The 63 is the answer alone: the M1 after-answer position 16,127 minus the prefill clean
+  `P` 16,064 (`decode_out/srv-a9.log:42-43`).
 - The 404 ms times all 95 re-prefilled tokens at 234.95 tok/s (`decode_out/srv-a9.log:29`);
   the answer's own share of those ms is **unmeasured**.
 - For scale, the cold turn in the same log prefilled 16,064 ids in **21.63 s** of a
   **24.33 s** wall (`decode_out/srv-a9.log:21`, `:24`).
-- The rollback lands on point 1 whether the divergence sits in the answer or not; that is
-  the rule working, not a special case.
+- The rollback lands on the prompt snapshot whether the divergence sits in the answer or
+  not; that is the rule working, not a special case.
 - The re-rendered assistant message need not reproduce the generated ids exactly, which is a
-  second reason point 2 rarely matched anyway.
+  second reason the after-answer position rarely matched anyway.
 
 **Point 1 covers the regenerate / edited-answer case:**
 
@@ -752,21 +757,22 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - That is below the point-1 snapshot, which is taken at prompt *end*.
 - The proposal said: with any earlier snapshot held, the fallback is never cold.
 - Measured: **false for this implementation.** There is exactly ONE usable slot, the current
-  prompt end, because point 2 is not a candidate and only one conversation is held.
+  prompt end: one conversation is held, and since M2b (#36) there is one slot to hold it.
 - Consequence: an edit below that position is a **cold prefill**, 21.6 to 22.0 s at 16k.
 - The rule itself is unchanged and needs no special-casing:
   `P = max { prefill-clean S_pos : S_pos <= L }`.
 
-**OPEN DECISION FOR ROBIN AT M2 (not decided here):**
+**M2 DECISION (robin, 2026-09-10, #1 comment 5612308881): option b, built in #36.**
 
-| option | effect | cost |
-|---|---|---|
-| keep as built (M1) | point 2 is taken and never used | 124.60 MiB of host RAM and one DtoH of 14.5 ms per request, for nothing |
-| drop point 2 | one slot, same reuse behaviour | saves that RAM and that copy |
-| reassign slot 2 to the PREVIOUS turn's point 1 | two prefill-clean positions, an edited last prompt stays warm | same RAM, same copies, more bookkeeping |
+| option | effect | cost | decided |
+|---|---|---|---|
+| a: keep as built (M1) | the after-answer point is taken and never used | 124.60 MiB of host RAM and one DtoH of 14.5 ms per request, for nothing | no |
+| b: drop the after-answer point | one slot, same reuse behaviour | saves that RAM and that copy | **YES** |
+| c: reassign slot 2 to the PREVIOUS turn's after-prompt point | two prefill-clean positions, an edited last prompt stays warm | same RAM, same copies, more bookkeeping | no |
 
-- A third slot is the same question with one more buffer.
-- Source: A9 review, issue #31, and the plan's M2 list.
+- A third slot is the same question with one more buffer; not taken either.
+- Source: A9 review, issue #31, the plan's M2 list, and issue #36 for the build.
+- Gate of the build: `decode_out/srv-a9b.log` (7.12 row M2b).
 
 **Rollback (`PrefixCache::rollback`, `cache.rs:445`):**
 
@@ -799,7 +805,8 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
   (`crow_core.py:2458`, `:2688`).
 - Rule: because it IS a file, the file carries the whole load shape in its header, and a
   restore refuses any mismatch **before the first device write**.
-- Rule: only `SLOT_PROMPT` is ever written. It is the one prefill-clean position (7.3).
+- Rule: only `SLOT_PROMPT` is ever written. Since M2b (#36) it is the only slot, and it is
+  the one prefill-clean position (7.3).
 
 | header field | what it pins |
 |---|---|
@@ -822,7 +829,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - Payload order: `gdn_s`, `gdn_conv`, `ple_state`, `qsa_ring`, `kv` rows `0..pos`, pooled
   blocks `0..done_blocks`, `history[..pos]`.
 - Save is atomic: sibling `.part-<pid>`, fsync, `fs::rename` over the target.
-- Restore fills `SLOT_PROMPT`, CLEARS `SLOT_ANSWER`, sets `pos`, `done_blocks`, `history`.
+- Restore fills `SLOT_PROMPT` and sets `pos`, `done_blocks`, `history`.
 - Consequence: the next chat request is an ordinary warm turn of 7.4, `L >= pos`, `P = pos`.
 - Measured at 16k (A10, #32, `decode_out/srv-a10-fix.log`): file **352,843,384 B**,
   `n_saved` = `n_restored` = **16,064**, save **173 ms** (108 ms before the fsync was added),
@@ -848,12 +855,15 @@ with `ring = ceil4(prompt_chunk + 4).min(context)` (`manager.rs:37-41`):
 | 512 (default `Config`) | 516 | 3,170,304 B = 3.02 MiB | **121,208,832 B = 115.60 MiB** |
 | 2048 (the serve default, M1) | 2052 | 12,607,488 B = 12.02 MiB | **130,646,016 B = 124.60 MiB** |
 
-**Totals for two snapshots per held conversation (7.6):**
+**Totals per held conversation, ONE snapshot since M2b (robin 2026-09-10, #36):**
 
-- **231.19 MiB** at chunk 512.
-- **249.19 MiB** at chunk 2048 = 261,292,032 B, the serve default.
+| build | chunk 512 | chunk 2048 (the serve default) |
+|---|---|---|
+| M1, two snapshots | 231.19 MiB | 249.19 MiB = 261,292,032 B |
+| M2b, one snapshot | **115.60 MiB** | **124.60 MiB = 130,646,016 B** |
+| saved by M2b | 115.60 MiB | **124.60 MiB = 130,646,016 B** |
 
-**Confirmed against the build (A9, #31, `decode_out/srv-a9.log`, `cache.rs:226`):**
+**Confirmed against the build (A9, #31, `decode_out/srv-a9.log`, `cache.rs:235`):**
 
 | quantity | value | note |
 |---|---|---|
@@ -869,7 +879,7 @@ with `ring = ceil4(prompt_chunk + 4).min(context)` (`manager.rs:37-41`):
   (`manager.rs:122-170`).
 - Not the pinned tier: it is budgeted at 46 GiB against a measured ~48.5 GiB host ceiling
   (`geo.rs:110`).
-- Allocated once at process start and reused per snapshot (`cache.rs:297`).
+- Allocated once at process start and reused per snapshot (`cache.rs:306`, `cache.rs:310`).
 
 **The formula holds for the default QSA layout only.**
 
@@ -942,6 +952,9 @@ Therefore:
 | 3 | is the post-answer snapshot taken unconditionally | **yes**, both points unconditional | `cache.rs` module doc, 7.6 |
 | 4 | concurrency: queue or reject | **a second request waits** in the accept queue, no 503 | `serve.rs` module doc, blocking `TcpListener` |
 | 5 | sampling: out of scope, or reseed per request | **reseeded per request**; the A9 identity gate runs **greedy** | `Engine::enable_dev_sampler`, `serve.rs:1043` (`sampler_from`) |
+
+- Rows 2 and 3 are SUPERSEDED by M2 option b (robin 2026-09-10, #36): **ONE** snapshot per
+  process, **124.60 MiB** at chunk 2048, the after-answer point dropped. See 7.6 and 7.7.
 
 **Note carried from the proposal, still open as a measurement, not a doc edit:**
 
@@ -1175,9 +1188,9 @@ C:/x/y.md
 |---|---|---|---|
 | 1 | `min_p` in the device sampler | accepted and ignored; kernel change or drop it from Crow's profile | #28 |
 | 2 | serve decode rate | serve reaches **18 to 24 tok/s** across the A4 to A6 gates. The **35.7 tok/s** #35 compares against is `decode run` on the **t3-debug** prompt (3,769 prompt ids; the named file records `decode_tok_s` **36.19**, `decode_out/final4-t3-debug-run0-crow.json`, harness of 2026-09-05/06), NOT the 16k t1-read prompt: on that prompt the A5 `decode run` control measures 17.1 tok/s over one timed decode token (58.50 ms, `decode_out/srv-a5-decoderun.log:151-154`). Prefill on the 16k prompt is equal, 662.33 (serve) vs 664.08 (`decode run`) tok/s, -0.26 % (`decode_out/srv-a5.log:144-145`). **Cause unmeasured**, and the two rates are not on one prompt | #35, `decode_out/final4-t3-debug-run0-crow.json`, `srv-a5.log`, `srv-a5-decoderun.log` |
-| 3 | the after-answer snapshot slot | keep (M1), drop, or reassign to the previous turn's after-prompt snapshot | #31, 7.6 |
+| 3 | the after-answer snapshot slot | DECIDED 2026-09-10: option b, dropped; built in #36, gate `decode_out/srv-a9b.log` | #31, #36, 7.6 |
 
-- Rule: none of the three is decided in this document.
+- Rule: items 1 and 2 are not decided in this document; item 3 is, and 7.6 carries it.
 
 ### 7.12 The stage A gate table (what was measured, and where the artefact is)
 
@@ -1196,19 +1209,24 @@ C:/x/y.md
 | A9 | #31 | prefix cache: cached 99.41 %, warm ids bit-identical to cold 2 of 2, rollback 2 of 2, snapshot 130,646,016 B | `srv-a9.log`, `srv-a9-fix.log`, `srv-a9-control.log`, `srv-a9-chunkcut.log`, `srv-a9-probe.log` |
 | A10 | #32 | slot file save and restore across processes, 30 of 30 then 22 of 22, `n_saved` = `n_restored` = 16,064, six refusals 4xx with a working chat after | `srv-a10.log`, `srv-a10-fix.log`, `srv-a10-smoke.log` |
 | A11 | #33 | this section corrected, `cargo test` in engine and converter, parity 8 / 512 twice / 1024 against the installed build | `srv-a11.log` |
+| M2b | #36 | after-answer snapshot dropped: A9 gate re-run in full, cached 99.41 % 2 of 2, warm turn 2 ids `b6eaffb2` 2 of 2, rollback `addbbcb5` 2 of 2, every run equals the A9 reference 10 of 10, serve `PrivateMemorySize64` 139,309,056 B lower after turn 1, 0 point-2 snapshot lines, A10 restore into a fresh process 6 of 6 | `srv-a9b.log` |
 
 **The server-path unit tests the A11 gate names (existing since A2 to A9):**
 
 | category | test | file:line |
 |---|---|---|
-| request parsing | `the_two_stream_flags_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:2790` |
-| request parsing | `tools_and_tool_turns_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:2933` |
-| SSE framing | `an_sse_frame_is_one_data_line_and_a_blank_line` | `engine/src/bin/serve.rs:2819` |
-| prefix length determination | `common_prefix_stops_at_the_first_difference` | `engine/src/cache.rs:521` |
-| prefix length determination | `the_newest_snapshot_at_or_below_l_wins` | `engine/src/cache.rs:553` |
+| request parsing | `the_two_stream_flags_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:2781` |
+| request parsing | `tools_and_tool_turns_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:2924` |
+| SSE framing | `an_sse_frame_is_one_data_line_and_a_blank_line` | `engine/src/bin/serve.rs:2810` |
+| prefix length determination | `common_prefix_stops_at_the_first_difference` | `engine/src/cache.rs:526` |
+| prefix length determination | `the_newest_snapshot_at_or_below_l_wins` | `engine/src/cache.rs:558` |
+| one slot per process | `the_process_holds_one_slot_and_one_reuse_candidate` | `engine/src/cache.rs:732` |
 
 - Counts at commit 9054592: engine lib **79 of 79**, `bin/serve` **52 of 52**, every other
   binary 0 tests, doc-tests 0; converter **7 of 7**.
+- Counts after M2b (#36): engine lib **80 of 80** (the new one-slot test), `bin/serve`
+  **52 of 52**, every other binary 0 tests, doc-tests 0; converter untouched
+  (`decode_out/srv-a9b.log:473`, `:488`).
 - Commands: `cd engine && cargo test --release --target-dir target_srv`, and
   `cd converter && cargo test --release`.
 
