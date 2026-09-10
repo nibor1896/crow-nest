@@ -400,7 +400,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 | proposed | 2026-09-09, task A1, issue #23 |
 | approved | 2026-09-09 by robin, M1 decision comment on issue #1 |
 | corrected against the built server | 2026-09-10, task A11, issue #33 |
-| evidence for the corrections | closing comments of #24 to #32, reports `.superpowers/sdd/task-A2..A10-report.md`, gate logs `decode_out/srv-a*.log` |
+| evidence for the corrections | closing comments of #24 to #32, gate logs `decode_out/srv-a*.log` |
 | corrected rows | 7.2 graph assumption, 7.3 KV row claim, 7.6 point 2 and the never-cold claim, 7.7 to 7.9 numbers |
 | added after the build | 7.11 endpoint contract as built, 7.12 stage A gate table |
 | sections 0 to 6 | unchanged, approved 2026-09-02 |
@@ -498,7 +498,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - The proposal assumed that graph is position-agnostic, because `rope_p` takes
   `p.pos_base` as a device pointer rather than a host-computed table offset
   (`gen.rs:1733-1735`).
-- **Measured 2026-09-09 (A4, #26, `.superpowers/sdd/task-A4-report.md`, `reset.rs` module doc): the assumption does not hold.**
+- **Measured 2026-09-09 (A4, issue #26 (comment), `reset.rs` module doc): the assumption does not hold.**
 
 | step | what the code does | evidence |
 |---|---|---|
@@ -507,7 +507,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 | 3 | `upload_into` skips its sync on any stream but the legacy one | `cuda.rs:384-386` |
 | 4 | `prefill` uploads its per chunk scalars and the embedding block from TEMPORARIES | `gen.rs:2493-2510`, `gen.rs:2517-2526` |
 | 5 | so a second `prefill` posted async HtoD copies whose host source had already died | measured |
-| result | same prompt, greedy: request 1 gave id 18622, request 2 gave id 17 | `.superpowers/sdd/task-A4-report.md` |
+| result | same prompt, greedy: request 1 gave id 18622, request 2 gave id 17 | issue #26 (comment) |
 
 **The remedy, exactly the one this section named as the fallback:**
 
@@ -1003,7 +1003,7 @@ Therefore:
 | `max_tokens` | default 1024, capped at 32768, clamped to `n_ctx - prompt ids` | `serve.rs:1253` (`clamped_max_tokens`) | `crow_core.py:4672-4700` |
 | `temperature` | absent, `null` or `<= 0` is GREEDY; `> 0` samples | `serve.rs:1043` (`sampler_from`) | `crow_core.py:4672-4700` |
 | `top_p` | nucleus mass, default 0.8 (data sheet), read only when `temperature > 0` | `serve.rs:461`, `serve.rs:1043` | `crow_core.py:4672-4700` |
-| `top_k` | default 20 (data sheet), read only when `temperature > 0` | `serve.rs:463`, `serve.rs:1043` | not sent by Crow |
+| `top_k` | default 20 (data sheet), clamped to 64 by the device sampler (`SAMPLE_MAXK`, `engine/src/kernels.rs:2942`), read only when `temperature > 0` | `serve.rs:463`, `serve.rs:1043` | not sent by Crow |
 | `presence_penalty` | default 1.5 (data sheet), read only when `temperature > 0` | `serve.rs:465`, `serve.rs:1043` | not sent by Crow |
 | `seed` | RNG seed of THIS request, default 0, reseeded per request (M1) | `serve.rs:467`, `serve.rs:1043` | not sent by Crow |
 | `min_p` | **ACCEPTED AND IGNORED**, one stderr line per request | `serve.rs:1751` (the stderr line); `sampler_from` (`serve.rs:1043`) carries no `min_p`; `serve.rs` module doc | `crow_core.py:4672-4700` (0.01 at Crow's operating point) |
@@ -1286,6 +1286,9 @@ C:/x/y.md
 - Counts after M2b (#36): engine lib **80 of 80** (the new one-slot test), `bin/serve`
   **52 of 52**, every other binary 0 tests, doc-tests 0; converter untouched
   (`decode_out/srv-a9b.log:473`, `:488`).
+- CI (E7, #50, 2026-09-11) runs engine lib **72 of 80** and `bin/serve` **55 of 57** on the
+  windows-latest runner; the gap is 10 tokenizer tests that need `../models/`, not present on a
+  fresh clone. The full counts above hold locally, where the models directory exists.
 
 **The unit tests #39 added (`engine/src/bin/serve.rs`):**
 

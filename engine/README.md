@@ -81,7 +81,7 @@ serve [--port <n>] [--slot-save-path <dir>]
 | `max_tokens` | default `1024`, capped at `32768`, clamped to `n_ctx` minus prompt ids | `src/bin/serve.rs:130` |
 | `model` | echoed, default `crow-nest` | `src/bin/serve.rs:131` |
 | `temperature` | absent, `null` or at most zero is greedy; above zero samples | `src/bin/serve.rs:133` |
-| `top_p`, `top_k`, `presence_penalty`, `seed` | read only when `temperature` is above zero | `src/bin/serve.rs:134-137` |
+| `top_p`, `top_k`, `presence_penalty`, `seed` | read only when `temperature` is above zero; `top_k` clamped to `64` by the device sampler (`SAMPLE_MAXK`, `engine/src/kernels.rs:2942`) | `src/bin/serve.rs:134-137` |
 | `min_p` | accepted and ignored, the device sampler has none (issue #28) | `src/bin/serve.rs:138` |
 | `tools` | OpenAI function tools, rendered into the chat template | `src/bin/serve.rs:139` |
 | `stream_options.include_usage`, `timings_per_token` | add `usage` and `timings` to the final chunk | `src/bin/serve.rs:140-141` |

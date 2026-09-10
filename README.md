@@ -10,7 +10,7 @@
 ## What this is
 
 - An engine that loads one CNQ container and serves it over HTTP to one client.
-- The client is Crow (`C:\Users\robin\dev\Crow`), which talks to `serve` the way it talks to llama-server.
+- The client is the Crow repository (`nibor1896/Crow`), which talks to `serve` the way it talks to llama-server.
 - Three product binaries: `serve` (HTTP), `decode` (single run and parity dumps), `parity` (the standing ten-task harness).
 - Fourteen further binaries under `engine/src/bin` are probes and gates, not product surface (`engine/README.md`).
 - Non-goals from the decision record: no training, no multi-user, no multi-GPU, no arbitrary architectures, no GGUF input, no CPU-only mode.
@@ -93,10 +93,10 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 
 | metric | value | machine | date | source |
 |---|---|---|---|---|
-| ten-task quality, greedy, crow-nest | 2 Pass / 5 Partial / 3 Fail of 10 | RTX 5090 | 2026-09-10 | issue #11, `.superpowers/sdd/task-B4-report.md:314-316` |
-| ten-task quality, greedy, llama.cpp reference | 2 Pass / 6 Partial / 2 Fail of 10 | RTX 5090 | 2026-09-10 | issue #11, `.superpowers/sdd/task-B4-report.md:314-316` |
-| decode, engine arm, ten tasks | 35.5 to 46.8 tok/s (crow-nest) against 44.4 to 48.2 tok/s (llama.cpp) | RTX 5090 | 2026-09-10 | issue #11, `.superpowers/sdd/task-B4-report.md:317` |
-| prefill, engine arm, ten tasks | 110 to 706 tok/s (crow-nest) against 265 to 846 tok/s (llama.cpp) | RTX 5090 | 2026-09-10 | issue #11, `.superpowers/sdd/task-B4-report.md:318` |
+| ten-task quality, greedy, crow-nest | 2 Pass / 5 Partial / 3 Fail of 10 | RTX 5090 | 2026-09-10 | issue #11 (comment) |
+| ten-task quality, greedy, llama.cpp reference | 2 Pass / 6 Partial / 2 Fail of 10 | RTX 5090 | 2026-09-10 | `nibor1896/Crow` issue #192 (comment) |
+| decode, engine arm, ten tasks | 35.5 to 46.8 tok/s (crow-nest) against 44.4 to 48.2 tok/s (llama.cpp) | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
+| prefill, engine arm, ten tasks | 110 to 706 tok/s (crow-nest) against 265 to 846 tok/s (llama.cpp) | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
 | decode through `serve` | 22.42 tok/s where `decode run` reaches 38.31 tok/s on the same ids | RTX 5090 | 2026-09-10 | issue #37 |
 | run-to-run drift of a `serve` rate | 26 % (run 1 30.45, run 6 22.42 tok/s, identical ids) | RTX 5090 | 2026-09-10 | issue #38 |
 | cold prefill of a 16,064 id prompt on `serve` | 21.6 to 22.0 s | RTX 5090 | 2026-09-10 | `docs/architecture.md:426` |
@@ -149,6 +149,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 | ten-task quality | no degeneration, Pass at least the reference minus one, Fail at most the reference | `parity phase 0 <crow or llama> decode_out/ten-tasks.json <outprefix>` |
 | env documentation | code set equals doc set | `python tools/check_env_docs.py` |
 | README numbers | no number without a date, a unit or an identifier | `python tools/check_readme_dates.py` |
+| CI, GitHub Actions | four jobs on windows-latest: build, test, clippy (non-blocking), doc guards; engine tests 72 of 80 lib and 55 of 57 serve, 10 tokenizer tests skipped for want of `../models/`, measured 2026-09-11 | `.github/workflows/ci.yml` |
 
 ## License
 

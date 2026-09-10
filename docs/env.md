@@ -7,7 +7,7 @@
 | Variables in this table | 65 |
 | Distinct `CROW_[A-Z0-9_]+` tokens in the code | 65 in `engine/src`, 0 in `converter/src` |
 | Measured | 2026-09-10, task E5, issue #46, parent #1 |
-| Repository state | branch `release-v0.1`, HEAD `3cf2a76` |
+| Repository state | branch `release-v0.1`, HEAD `1d08bcb`, 2026-09-11 |
 | Guard | `tools/check_env_docs.py` (code list minus doc list must be empty, both ways) |
 | Rule | a variable not in this table does not exist |
 
@@ -66,7 +66,7 @@ Helpers used by the read sites:
 | `CROW_QSA_FULL` | `engine/src/manager.rs:37` | `1` sets `ring = context`; default `ceil4(prompt_chunk + 4)` capped by context | size of the raw indexer-key ring per attention layer | measurement | pre-2026-09-05 layout; `docs/architecture.md:1162` marks it out of scope for `serve` |
 | `CROW_KV` | `engine/src/bin/decode.rs:62` | `bf16`; default the container KV dtype | parity ladder switch for the KV cache dtype | measurement | read only in `bin/decode.rs`, not by `serve` |
 | `CROW_PLE` | `engine/src/bin/decode.rs:65` | `off`; default on | parity ladder switch that disables the PLE stage | measurement | read only in `bin/decode.rs`, not by `serve` |
-| `CROW_PLE_CACHE_MB` | `engine/src/gen.rs:626` | integer MiB; default `cfg.ple_cache_bytes` (128 MB in `serve`, `bin/serve.rs:47`) | size of the PLE hot-row cache | operating | VRAM diet knob, 2026-09-05; C1 allowlist keeps it unset (`.superpowers/sdd/task-C1-brief.md:104`) |
+| `CROW_PLE_CACHE_MB` | `engine/src/gen.rs:626` | integer MiB; default `cfg.ple_cache_bytes` (128 MB in `serve`, `bin/serve.rs:47`) | size of the PLE hot-row cache | operating | VRAM diet knob, 2026-09-05; C1 allowlist keeps it unset (issue #40 (comment)) |
 | `CROW_PLE_PREFETCH` | `engine/src/gen.rs:2463` | `0` disables; default on | warms the next chunk's PLE rows on a helper thread | operating | no-op without a file mapping (`CROW_MMAP=0`) |
 
 ## Prefill and chunking (9 rows)
@@ -125,7 +125,7 @@ Helpers used by the read sites:
 | `CROW_SAMPLE_HOST` | `engine/src/sample.rs:44` | `1` keeps the host path; default device sampler | logits readback plus host top-k instead of `sample_k` behind `argmax_k` | measurement | reference path per `sample.rs:14` |
 | `CROW_TEMP` | `engine/src/sample.rs:76` | float; default `0.7` | sampler temperature | measurement | data-sheet instruct profile; read only when `CROW_SAMPLE=1` |
 | `CROW_TOP_P` | `engine/src/sample.rs:77` | float; default `0.8` | nucleus threshold | measurement | read only when `CROW_SAMPLE=1` |
-| `CROW_TOP_K` | `engine/src/sample.rs:78` | integer; default `20` | top-k cut | measurement | read only when `CROW_SAMPLE=1` |
+| `CROW_TOP_K` | `engine/src/sample.rs:78` | integer; default `20`, clamped to 64 by the device sampler (`SAMPLE_MAXK`, `engine/src/kernels.rs:2942`) | top-k cut | measurement | read only when `CROW_SAMPLE=1` |
 | `CROW_PRESENCE` | `engine/src/sample.rs:79` | float; default `1.5` | presence penalty over the tokens of this answer | measurement | read only when `CROW_SAMPLE=1` |
 | `CROW_SEED` | `engine/src/sample.rs:80` | integer; default `0` | sampler seed, also the RNG start state (`sample.rs:81`) | measurement | `sample.rs:53`: the record names the seed, so a sampled answer is reproducible |
 | `CROW_STOP_EOS` | `engine/src/sample.rs:192` | `1` enables; default off | ends a harness run at EOS | measurement | `bin/serve.rs:194`: `sample::EOS_IDS` stops both server modes and this variable is NOT read there |
@@ -177,7 +177,7 @@ Helpers used by the read sites:
 ## Reference operating point
 
 - Environment of B4 part 3 (the F49 chain), `decode_out/srv-b4.log:216`
-- Same block in `.superpowers/sdd/task-C1-brief.md:101-110`
+- Same block, issue #40 (comment)
 
 ```
 CROW_CNQ=converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq

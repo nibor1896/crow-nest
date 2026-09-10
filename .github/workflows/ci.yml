@@ -8,7 +8,7 @@
 #
 # Why the engine builds without CUDA:
 # - No build.rs in engine/ or converter/.
-# - Kernels are compiled at runtime through cudarc::nvrtc::compile_ptx_with_opts (engine/src/cuda.rs:208).
+# - Kernels are compiled at runtime through cudarc::nvrtc::compile_ptx_with_opts (engine/src/cuda.rs:212).
 # - cudarc = "=0.19.9" with feature dynamic-loading (engine/Cargo.toml:17); cudarc documents
 #   dynamic-loading as loading CUDA at runtime, with no libraries needed at build time (cudarc README,
 #   section Configuring linking).

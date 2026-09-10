@@ -40,6 +40,7 @@
 
 - `#41` E1: measured that a 125.28 MB probe blob makes GitHub refuse the first push (GH001, limit 100.00 MB). (measured 2026-09-10)
 - `#46` E5: `docs/env.md` with a row per `CROW_*` name, guarded by `tools/check_env_docs.py`.
+- `#50` E7, 2026-09-11: `.github/workflows/ci.yml`, four jobs on windows-latest (build, test, clippy non-blocking at 1314 warnings, guards), engine tests 72 of 80 lib and 55 of 57 serve on the runner because 10 tokenizer tests need `../models/`, first run pending the first push.
 - `#47` E6: `README.md`, `engine/README.md`, `converter/README.md`, `LICENSE`, this file, and `tools/check_readme_dates.py`.
 
 #### Licensing
@@ -52,6 +53,7 @@
 - `#51` E8, 2026-09-11: `decode` and `parity` default to `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` and `decode_out/hotsets-M-longctx2100-n160.json`, the container and sidecar of `serve.rs:446-447`; five lines, `CROW_CNQ` and `CROW_HOTSETS` still override; closes `#48`.
 - `#42` E2, 2026-09-10: the history was rewritten with `git filter-repo` to drop the probe debug blobs. Every commit sha changed: `release-v0.1` head `4519f6f` became `aa6dd04`, `main` head `d36353a` became `e9e53cc`. Tracked bytes went from 253,232,175 to 38,397,227, blobs over 50 MB 0 after (before: one, the 125.28 MB blob of `#41`), `Co-Authored-By` trailers from 19 to 0. A pre-rewrite mirror was kept outside the repository.
 - `#43` E3, 2026-09-10: `converter/target` (103 files) and 216 of 235 `decode_out` records untracked; 19 gate inputs kept; tracked bytes 38,397,227 to 5,208,050.
+- `#43` E3, 2026-09-11: `decode_out/README.md` added; tracked `decode_out` files 19 to 20. The ten `final4-*-run0-crow.json` records stay because they are the greedy reference answers the identity gate (B4/C1/E3/E8) compares against, not raw run output.
 - `#45` E4, 2026-09-10: `.gitignore` ignores every build tree with `**/target*/` instead of listing them.
 - `#36` M2b, 2026-09-10: one snapshot slot per process; the after-answer snapshot was dropped because its rows are decode rows, not prefill rows.
 - `#10`, 2026-09-09: `CROW_PF_ASYNC=2` and `CROW_PF_TG=64` became engine defaults; `CROW_PF_ASYNC=0 CROW_PF_TG=32` restores the previous behaviour.
@@ -89,3 +91,4 @@
 - `parity.rs` pipes UTF-8 into the Python oracle without `PYTHONIOENCODING`, open as `#34`; the chains export it and are unaffected.
 - Engine logging is not started, open as `#13`; the architecture diagrams are stale, open as `#14`.
 - Ampere and Ada are not planned: the fallback stage was closed for want of a card, `#12`.
+- The clippy job renders red while non-blocking: 1314 warnings, 1085 `unnecessary_cast`, measured 2026-09-11 (`#50`).

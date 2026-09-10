@@ -55,7 +55,7 @@
 //! | `Engine::stage`, `pf_*`, `pa_*` | per launch MoE plan and prefetch ring, rebuilt per chunk |
 //! | `Engine::p` (`Params`) | every position dependent scalar is uploaded per chunk (`gen.rs:2494-2510`) and per step |
 //! | `Engine::dev_sampler` | A6 enables it per sampled request (`enable_dev_sampler`, `gen.rs:2957`) and PARKS it for a greedy request |
-//! | | parking moves the `DevSampler` out of the engine into `Srv::parked_sampler` (`serve.rs:1027`, `serve.rs:1044`, `serve.rs:1274`) |
+//! | | parking moves the `DevSampler` out of the engine into `Srv::parked_sampler` (`serve.rs:1729`, `serve.rs:1746`, `serve.rs:2349`) |
 //! | | deliberately not reset: the parking mechanism owns the field and reuses the same device buffers |
 //!
 //! Cost and ordering:

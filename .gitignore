@@ -30,6 +30,7 @@ decode_out/*
 !decode_out/hotsets-M-longctx2100-n160.json
 !decode_out/ten-tasks.json
 !decode_out/ten-tasks-authored-t7-t10.json
+!decode_out/README.md
 oracle/golden/
 oracle/routing-selections.npz
 *.log
