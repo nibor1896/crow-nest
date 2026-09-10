@@ -1906,14 +1906,23 @@ fn chat_generate(
     // - The log therefore divides by gen - 1: the honest decode rate, prefill token excluded.
     // - The wire follows llama-server, where `predicted_n` counts the prefill token as well.
     // - Making the two equal would either mislabel the log or break Crow's reader.
+    // #39 B3a fix round 1: `usage`/`timings` below are the EFFECTIVE flags, not the request's.
+    // `completion_json` puts both on the document unconditionally (`stream:false`), so the
+    // stream flags would under-report there; the stream path still logs the request flags,
+    // byte identical to before this fix.
+    let (log_usage, log_timings) = if req.stream {
+        (req.include_usage, req.timings_per_token)
+    } else {
+        (true, true)
+    };
     eprintln!(
         "[chat] prompt {} tok ({cached_n} cached, {prefilled} prefilled), generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {content_chunks}, tool chunks {tool_chunks}, tool calls {}, usage {}, timings {}{}",
         ids.len(),
         per_second(prefilled, prefill_ms),
         (gen.saturating_sub(1)) as f64 * 1000.0 / decode_ms.max(1e-9),
         ts.closed(),
-        req.include_usage,
-        req.timings_per_token,
+        log_usage,
+        log_timings,
         if aborted { ", client gone" } else { "" }
     );
     // #30 A8: the same numbers the `timings` block carries, cumulative since process start
