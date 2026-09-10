@@ -126,7 +126,7 @@
 //! | field | A4 behaviour |
 //! |---|---|
 //! | `messages` | required, non empty array, every entry needs a string `role` |
-//! | `stream` | `true` streams; `false` or absent answers 501 (owner: a later task) |
+//! | `stream` | `true` streams `chat.completion.chunk` frames; `false` or absent answers ONE `chat.completion` document (#39 B3a) |
 //! | `max_tokens` | default 1024, capped at 32768 |
 //! | `model` | echoed into every chunk, default `crow-nest` |
 //! | `chat_template_kwargs.enable_thinking` | template variable, default false |
@@ -1310,8 +1310,8 @@ fn normalize_messages(messages: &serde_json::Value) -> serde_json::Value {
 }
 
 /// write one SSE frame and flush it; `false` means the client is gone
-fn sse_send(stream: &mut TcpStream, text: &str) -> bool {
-    match stream.write_all(text.as_bytes()).and_then(|_| stream.flush()) {
+fn sse_send<W: Write>(w: &mut W, text: &str) -> bool {
+    match w.write_all(text.as_bytes()).and_then(|_| w.flush()) {
         Ok(()) => true,
         Err(e) => {
             eprintln!("[chat] write failed, aborting the generation: {e}");
@@ -1320,10 +1320,130 @@ fn sse_send(stream: &mut TcpStream, text: &str) -> bool {
     }
 }
 
-/// - #29 A7: one SSE frame per parser fragment, in order
+/// - #39 B3a: where the per token side effects of ONE generation go
+/// - the SSE writer is one implementation, the collector behind the non streaming document
+///   is the other; `chat_generate` stays the only generation loop in this file
+/// - every method returns `false` for "the client is gone, stop the loop"
+trait ChatSink {
+    /// before the first token: the role delta of the stream, nothing for a document
+    fn open(&mut self, id: &str, created: u64, model: &str) -> bool;
+    /// one parser fragment, in arrival order
+    fn on_emit(&mut self, id: &str, created: u64, model: &str, e: &Emit) -> bool;
+    /// after the last token: the final chunk plus `[DONE]`, nothing for a document
+    fn on_finish(
+        &mut self,
+        id: &str,
+        created: u64,
+        model: &str,
+        finish: &str,
+        t: &Timing,
+        include_usage: bool,
+        timings_per_token: bool,
+    ) -> bool;
+}
+
+/// the A4/A5 sink: one flushed SSE frame per piece, over any writer
+struct SseSink<W: Write> {
+    w: W,
+}
+
+impl<W: Write> SseSink<W> {
+    fn new(w: W) -> Self {
+        SseSink { w }
+    }
+}
+
+impl<W: Write> ChatSink for SseSink<W> {
+    fn open(&mut self, id: &str, created: u64, model: &str) -> bool {
+        sse_send(&mut self.w, &sse_frame(&chunk_role(id, created, model)))
+    }
+    fn on_emit(&mut self, id: &str, created: u64, model: &str, e: &Emit) -> bool {
+        let doc = match e {
+            Emit::Content(t) => chunk_content(id, created, model, t),
+            Emit::Call { index, id: call_id, name } => {
+                chunk_tool_open(id, created, model, *index, call_id, name)
+            }
+            Emit::Args { index, text } => chunk_tool_args(id, created, model, *index, text),
+        };
+        sse_send(&mut self.w, &sse_frame(&doc))
+    }
+    fn on_finish(
+        &mut self,
+        id: &str,
+        created: u64,
+        model: &str,
+        finish: &str,
+        t: &Timing,
+        include_usage: bool,
+        timings_per_token: bool,
+    ) -> bool {
+        let last = chunk_finish(id, created, model, finish, t, include_usage, timings_per_token);
+        sse_send(&mut self.w, &sse_frame(&last)) && sse_send(&mut self.w, SSE_DONE)
+    }
+}
+
+/// - #39 B3a: what the fragments of ONE tool call add up to
+/// - `arguments` is the concatenation of every `Emit::Args` of that index, a JSON text
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CallBuf {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// - #39 B3a: the sink of a `stream:false` request, the same deltas into strings
+/// - nothing is written to the socket here; the document leaves after the loop
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CollectSink {
+    /// every `Emit::Content` in order, the `message.content` of the document
+    content: String,
+    /// one entry per tool call index, in the order the parser opened them
+    calls: Vec<CallBuf>,
+}
+
+impl ChatSink for CollectSink {
+    fn open(&mut self, _id: &str, _created: u64, _model: &str) -> bool {
+        true
+    }
+    fn on_emit(&mut self, _id: &str, _created: u64, _model: &str, e: &Emit) -> bool {
+        match e {
+            Emit::Content(t) => self.content.push_str(t),
+            Emit::Call { index, id: call_id, name } => {
+                if *index == self.calls.len() {
+                    self.calls.push(CallBuf::default());
+                }
+                if let Some(c) = self.calls.get_mut(*index) {
+                    c.id = call_id.clone();
+                    c.name = name.clone();
+                }
+            }
+            Emit::Args { index, text } => {
+                if let Some(c) = self.calls.get_mut(*index) {
+                    c.arguments.push_str(text);
+                }
+            }
+        }
+        true
+    }
+    fn on_finish(
+        &mut self,
+        _id: &str,
+        _created: u64,
+        _model: &str,
+        _finish: &str,
+        _t: &Timing,
+        _include_usage: bool,
+        _timings_per_token: bool,
+    ) -> bool {
+        true
+    }
+}
+
+/// - #29 A7: one sink call per parser fragment, in order
+/// - the chunk counters of the `[chat]` line are counted HERE, so both sinks count alike
 /// - `false` means the client is gone and the generation loop must stop
 fn send_emits(
-    stream: &mut TcpStream,
+    sink: &mut dyn ChatSink,
     id: &str,
     created: u64,
     model: &str,
@@ -1332,25 +1452,66 @@ fn send_emits(
     tool_chunks: &mut usize,
 ) -> bool {
     for e in pieces {
-        let doc = match e {
-            Emit::Content(t) => {
-                *content_chunks += 1;
-                chunk_content(id, created, model, t)
-            }
-            Emit::Call { index, id: call_id, name } => {
-                *tool_chunks += 1;
-                chunk_tool_open(id, created, model, *index, call_id, name)
-            }
-            Emit::Args { index, text } => {
-                *tool_chunks += 1;
-                chunk_tool_args(id, created, model, *index, text)
-            }
-        };
-        if !sse_send(stream, &sse_frame(&doc)) {
+        match e {
+            Emit::Content(_) => *content_chunks += 1,
+            Emit::Call { .. } | Emit::Args { .. } => *tool_chunks += 1,
+        }
+        if !sink.on_emit(id, created, model, e) {
             return false;
         }
     }
     true
+}
+
+/// - #39 B3a: the ONE `chat.completion` document a `stream:false` request answers
+/// - `usage` and `timings` are `usage_json` and `timings_json`, the objects of the final
+///   stream chunk, and both are ALWAYS present: one document shape, and the probe-suite
+///   reads `usage.completion_tokens` (`probe-suite.py:681-683`) while sending neither
+///   `stream_options` nor `timings_per_token`
+/// - `content` is always a string, empty when the answer was a tool call alone
+/// - `tool_calls` appears only when the parser closed at least one call, in the OpenAI
+///   non streaming shape (`id`, `type`, `function`), `arguments` a JSON STRING
+/// - `reasoning_content` is NOT sent: the template renders `enable_thinking false`, so the
+///   think block is empty (`tokenizer.rs:18-19`)
+/// - pure: the whole document contract is one function the test drives directly
+fn completion_json(
+    id: &str,
+    created: u64,
+    model: &str,
+    content: &str,
+    calls: &[CallBuf],
+    finish: &str,
+    t: &Timing,
+) -> serde_json::Value {
+    let mut message = serde_json::json!({ "role": "assistant", "content": content });
+    if !calls.is_empty() {
+        let arr: Vec<serde_json::Value> = calls
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": { "name": c.name, "arguments": c.arguments },
+                })
+            })
+            .collect();
+        if let Some(obj) = message.as_object_mut() {
+            obj.insert("tool_calls".to_string(), serde_json::Value::Array(arr));
+        }
+    }
+    serde_json::json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish,
+        }],
+        "usage": usage_json(t),
+        "timings": timings_json(t),
+    })
 }
 
 /// a JSON response plus its status, so the caller can log one label
@@ -1373,13 +1534,6 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
         Ok(r) => r,
         Err(e) => return respond_json(stream, "400 Bad Request", &error_json(&e)),
     };
-    if !req.stream {
-        return respond_json(
-            stream,
-            "501 Not Implemented",
-            &error_json("stream:false is not implemented yet (A5)"),
-        );
-    }
     let tk = match crow_nest_engine::tokenizer::global() {
         Ok(t) => t,
         Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(e)),
@@ -1413,19 +1567,91 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
         );
         req.max_tokens = budget;
     }
-    chat_stream(stream, srv, &req, &ids)
+    if req.stream {
+        chat_stream(stream, srv, &req, &ids)
+    } else {
+        chat_document(stream, srv, &req, &ids)
+    }
 }
 
-/// - prefill, then greedy decode, one flushed SSE frame per emitted delta
-/// - #31 A9: the prefix cache decides FIRST (spec 7.4); a warm request rolls back to `P`
-///   and prefills `ids[P..]`, a cold one runs `reset_to_zero` and prefills everything
-/// - ONE snapshot per request, unconditional (M2b, #36): after the prompt
-/// - a write error breaks the loop; the next request rolls back or resets before any prefill
+/// - #39 B3a: `stream:true`, the A4/A5 wire, unchanged byte for byte: the SSE head, the
+///   role chunk, one flushed frame per emitted delta, the final chunk, `[DONE]`
+/// - the generation itself is `chat_generate`, the ONE loop both request forms run
 fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]) -> &'static str {
     let tk = match crow_nest_engine::tokenizer::global() {
         Ok(t) => t,
         Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(e)),
     };
+
+    const HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    if !sse_send(stream, HEAD) {
+        return "200 OK (client gone)";
+    }
+    let mut sink = SseSink::new(stream);
+    let out = chat_generate(srv, req, ids, tk, &mut sink);
+    if out.aborted {
+        "200 OK (client gone)"
+    } else {
+        "200 OK (text/event-stream)"
+    }
+}
+
+/// - #39 B3a: `stream:false`, or no `stream` field at all, the form the probe-suite
+///   (`probe-suite.py:624-639`) and Crow's rollover digest (`crow_core.py:2960-2990`) send
+/// - the SAME generation as the stream, collected instead of written, then ONE
+///   `chat.completion` document with `Content-Length` and `Connection: close`, like every
+///   other JSON route of this server
+/// - nothing reaches the socket before the document, so a mid generation failure is still
+///   a JSON answer, not a half written stream
+fn chat_document(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]) -> &'static str {
+    let tk = match crow_nest_engine::tokenizer::global() {
+        Ok(t) => t,
+        Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(e)),
+    };
+    let mut sink = CollectSink::default();
+    let out = chat_generate(srv, req, ids, tk, &mut sink);
+    let doc = completion_json(
+        &out.id,
+        out.created,
+        &req.model,
+        &sink.content,
+        &sink.calls,
+        out.finish,
+        &out.timing,
+    );
+    respond_json(stream, "200 OK", &doc)
+}
+
+/// - #39 B3a: what one shared generation produced, whatever its sink did with it
+/// - the sink holds the text; this holds what BOTH request forms still need afterwards
+struct GenOut {
+    /// the `chatcmpl-...` id of this request: every chunk's `id`, and the document's
+    id: String,
+    /// the unix second of this request, the `created` of both forms
+    created: u64,
+    /// `stop`, `length` or `tool_calls`
+    finish: &'static str,
+    /// the counts and walls behind `usage` and `timings`
+    timing: Timing,
+    /// a sink call refused: the client is gone and the loop stopped early
+    aborted: bool,
+}
+
+/// - #39 B3a: THE generation loop of this server, the only one. `stream:true` runs it with
+///   `SseSink`, `stream:false` with `CollectSink`; prefix cache, sampler, stop rules,
+///   tool-call parser, snapshot, counters and the three `[chat]` stderr lines are shared.
+/// - prefill, then decode, one sink call per emitted delta
+/// - #31 A9: the prefix cache decides FIRST (spec 7.4); a warm request rolls back to `P`
+///   and prefills `ids[P..]`, a cold one runs `reset_to_zero` and prefills everything
+/// - ONE snapshot per request, unconditional (M2b, #36): after the prompt
+/// - a sink refusal breaks the loop; the next request rolls back or resets before any prefill
+fn chat_generate(
+    srv: &mut Srv,
+    req: &ChatReq,
+    ids: &[u32],
+    tk: &'static crow_nest_engine::tokenizer::ChatTokenizer,
+    sink: &mut dyn ChatSink,
+) -> GenOut {
     srv.seq += 1;
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1433,11 +1659,6 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
         .unwrap_or(0);
     let id = format!("chatcmpl-{created}-{}", srv.seq);
     let model = req.model.clone();
-
-    const HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
-    if !sse_send(stream, HEAD) {
-        return "200 OK (client gone)";
-    }
 
     let prompt: Vec<i64> = ids.iter().map(|&v| v as i64).collect();
     // #31 A9: the detection rule of spec 7.4, host side, IDS ONLY. `Engine::history` is the
@@ -1540,10 +1761,10 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
     let tool_open = tk.token_id(TOOL_OPEN);
     let mut tool_chunks = 0usize;
 
-    let mut aborted = !sse_send(stream, &sse_frame(&chunk_role(&id, created, &model)));
+    let mut aborted = !sink.open(&id, created, &model);
 
     // #27 A5: the decode window opens at the FIRST `decode_step` and closes when the last one
-    // returns, so the detokenize and the SSE write of token 1 are not counted as decode
+    // returns, so the detokenize and the sink call of token 1 are not counted as decode
     let mut t_dec: Option<Instant> = None;
     let mut out: Vec<u32> = Vec::with_capacity(req.max_tokens);
     // bytes of the accumulated decode that already left as content
@@ -1573,7 +1794,7 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
                 emitted = full.len();
                 let pieces = ts.feed(delta);
                 if !send_emits(
-                    stream,
+                    sink,
                     &id,
                     created,
                     &model,
@@ -1607,7 +1828,7 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
         };
         malformed = ts.finish(&mut pieces);
         if !send_emits(
-            stream,
+            sink,
             &id,
             created,
             &model,
@@ -1662,7 +1883,7 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
         ple_miss_total,
     };
     if !aborted {
-        let last = chunk_finish(
+        let _ = sink.on_finish(
             &id,
             created,
             &model,
@@ -1671,7 +1892,6 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
             req.include_usage,
             req.timings_per_token,
         );
-        let _ = sse_send(stream, &sse_frame(&last)) && sse_send(stream, SSE_DONE);
     }
 
     // #36 M2b (robin 2026-09-10): the after-answer snapshot of M1 is GONE from here.
@@ -1703,10 +1923,12 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
          layers {LAYERS}, counter read {counters_ms:.3} ms"
     );
     eprintln!("[chat] ids {out:?}");
-    if aborted {
-        "200 OK (client gone)"
-    } else {
-        "200 OK (text/event-stream)"
+    GenOut {
+        id,
+        created,
+        finish,
+        timing,
+        aborted,
     }
 }
 
@@ -3321,5 +3543,216 @@ mod tests {
 
         // an existing directory passes
         assert_eq!(check_slot_save_path(env!("CARGO_MANIFEST_DIR")), Ok(()));
+    }
+
+    // ------------------------------------------- #39 B3a: the non streaming document
+
+    /// a `Timing` whose every field is a different number, so a document test can name it
+    fn b3a_timing() -> Timing {
+        Timing {
+            prompt_n: 7,
+            cached_n: 3,
+            predicted_n: 5,
+            prompt_ms: 20.0,
+            predicted_ms: 100.0,
+            selections_total: 11,
+            cold_total: 2,
+            ple_rows_total: 9,
+            ple_miss_total: 4,
+        }
+    }
+
+    #[test]
+    fn the_non_streaming_document_carries_every_field_the_probe_suite_reads() {
+        // probe-suite.py:677-683 reads choices[0].finish_reason, .message.content,
+        // .message.reasoning_content and usage.completion_tokens
+        let t = b3a_timing();
+        let d = completion_json("chatcmpl-1700-2", 1700, "crow", "hello", &[], "stop", &t);
+        assert_eq!(d["id"], "chatcmpl-1700-2");
+        assert_eq!(d["object"], "chat.completion");
+        assert_eq!(d["created"], 1700);
+        assert_eq!(d["model"], "crow");
+        let c = &d["choices"][0];
+        assert_eq!(c["index"], 0);
+        assert_eq!(c["message"]["role"], "assistant");
+        assert_eq!(c["message"]["content"], "hello");
+        assert_eq!(c["finish_reason"], "stop");
+        // ONE document shape: `usage` and `timings` are the objects of the final stream chunk,
+        // unconditionally, because the probe-suite sends no `stream_options` and still reads
+        // `usage.completion_tokens`
+        assert_eq!(d["usage"], usage_json(&t));
+        assert_eq!(d["timings"], timings_json(&t));
+        assert_eq!(d["usage"]["completion_tokens"], 5);
+        assert_eq!(d["usage"]["prompt_tokens"], 10);
+        assert_eq!(d["timings"]["cache_n"], 3);
+        // no tool call and no reasoning block on a plain answer
+        assert!(c["message"].get("tool_calls").is_none());
+        assert!(c["message"].get("reasoning_content").is_none());
+        // exactly the top level keys of the contract, in order (preserve_order is on)
+        let keys: Vec<&str> = d.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["id", "object", "created", "model", "choices", "usage", "timings"]
+        );
+        let ck: Vec<&str> = c.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(ck, vec!["index", "message", "finish_reason"]);
+        // `length` is the other reason gate part 1 accepts
+        let l = completion_json("x", 1, "crow", "hi", &[], "length", &t);
+        assert_eq!(l["choices"][0]["finish_reason"], "length");
+    }
+
+    #[test]
+    fn the_non_streaming_document_carries_the_tool_calls_the_parser_closed() {
+        // the A7 call, in the OpenAI non streaming shape: `id`, `type`, `function`
+        let t = b3a_timing();
+        let calls = vec![CallBuf {
+            id: "call_0".to_string(),
+            name: "read_file".to_string(),
+            arguments: "{\"path\":\"a.md\",\"start_line\":1}".to_string(),
+        }];
+        let d = completion_json("id1", 5, "crow", "", &calls, "tool_calls", &t);
+        let m = &d["choices"][0]["message"];
+        assert_eq!(m["role"], "assistant");
+        assert_eq!(m["content"], "");
+        assert_eq!(m["tool_calls"][0]["id"], "call_0");
+        assert_eq!(m["tool_calls"][0]["type"], "function");
+        assert_eq!(m["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(
+            m["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"a.md\",\"start_line\":1}"
+        );
+        assert_eq!(d["choices"][0]["finish_reason"], "tool_calls");
+        // `arguments` stays a JSON STRING, as OpenAI and llama-server send it
+        assert!(m["tool_calls"][0]["function"]["arguments"].is_string());
+    }
+
+    #[test]
+    fn the_collector_and_the_sse_sink_see_the_same_delta_sequence() {
+        let pieces = vec![
+            Emit::Content("Hi".to_string()),
+            Emit::Content(" there".to_string()),
+            Emit::Call {
+                index: 0,
+                id: "call_0".to_string(),
+                name: "read_file".to_string(),
+            },
+            Emit::Args {
+                index: 0,
+                text: "{\"path\":\"".to_string(),
+            },
+            Emit::Args {
+                index: 0,
+                text: "a.md\"}".to_string(),
+            },
+        ];
+        let mut buf: Vec<u8> = Vec::new();
+        let mut sse = SseSink::new(&mut buf);
+        let (mut sc, mut st) = (0usize, 0usize);
+        assert!(send_emits(&mut sse, "id1", 5, "crow", &pieces, &mut sc, &mut st));
+        let mut col = CollectSink::default();
+        let (mut cc, mut ct) = (0usize, 0usize);
+        assert!(send_emits(&mut col, "id1", 5, "crow", &pieces, &mut cc, &mut ct));
+        // the same loop counts the same chunks for both sinks
+        assert_eq!((sc, st), (cc, ct));
+        assert_eq!((sc, st), (2, 3));
+
+        // rebuild the answer out of the raw SSE frames the way Crow does, then compare
+        let text = String::from_utf8(buf).unwrap();
+        let mut content = String::new();
+        let mut calls: Vec<CallBuf> = Vec::new();
+        for frame in text.split("\n\n").filter(|f| !f.is_empty()) {
+            let d: serde_json::Value =
+                serde_json::from_str(frame.trim_start_matches("data: ")).unwrap();
+            let delta = &d["choices"][0]["delta"];
+            if let Some(s) = delta.get("content").and_then(|v| v.as_str()) {
+                content.push_str(s);
+            }
+            if let Some(tc) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                let i = tc[0]["index"].as_u64().unwrap() as usize;
+                if i == calls.len() {
+                    calls.push(CallBuf::default());
+                }
+                if let Some(v) = tc[0].get("id").and_then(|v| v.as_str()) {
+                    calls[i].id = v.to_string();
+                }
+                let f = &tc[0]["function"];
+                if let Some(v) = f.get("name").and_then(|v| v.as_str()) {
+                    calls[i].name = v.to_string();
+                }
+                if let Some(v) = f.get("arguments").and_then(|v| v.as_str()) {
+                    calls[i].arguments.push_str(v);
+                }
+            }
+        }
+        assert_eq!(content, col.content);
+        assert_eq!(calls, col.calls);
+        assert_eq!(col.content, "Hi there");
+        assert_eq!(col.calls.len(), 1);
+        assert_eq!(col.calls[0].name, "read_file");
+        assert_eq!(col.calls[0].arguments, "{\"path\":\"a.md\"}");
+    }
+
+    #[test]
+    fn the_two_callers_that_send_no_stream_field_parse_as_non_streaming() {
+        // probe-suite.py:624-630, verbatim shape: no `stream` key at all
+        let r = parse_chat(
+            br#"{"model":"crow","messages":[{"role":"user","content":"hi"}],
+                 "max_tokens":4096,"temperature":0.6,"seed":1234}"#,
+        )
+        .unwrap();
+        assert!(!r.stream);
+        assert_eq!(r.model, "crow");
+        assert_eq!(r.max_tokens, 4096);
+        assert_eq!(r.seed, 1234);
+        // crow_core.py:2960-2976, the rollover digest: no stream, enable_thinking false
+        let d = parse_chat(
+            br#"{"model":"crow","messages":[{"role":"user","content":"hi"}],
+                 "max_tokens":400,"chat_template_kwargs":{"enable_thinking":false}}"#,
+        )
+        .unwrap();
+        assert!(!d.stream);
+        assert!(!d.enable_thinking);
+        // an explicit false is the same request
+        let f = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],"stream":false}"#,
+        )
+        .unwrap();
+        assert!(!f.stream);
+    }
+
+    #[test]
+    fn the_collector_holds_one_buffer_per_tool_call_index() {
+        let mut col = CollectSink::default();
+        let (mut c, mut t) = (0usize, 0usize);
+        let pieces = vec![
+            Emit::Call {
+                index: 0,
+                id: "call_0".to_string(),
+                name: "a".to_string(),
+            },
+            Emit::Args {
+                index: 0,
+                text: "{}".to_string(),
+            },
+            Emit::Call {
+                index: 1,
+                id: "call_1".to_string(),
+                name: "b".to_string(),
+            },
+            Emit::Args {
+                index: 1,
+                text: "{\"x\":".to_string(),
+            },
+            Emit::Args {
+                index: 1,
+                text: "1}".to_string(),
+            },
+        ];
+        assert!(send_emits(&mut col, "i", 1, "m", &pieces, &mut c, &mut t));
+        assert_eq!(col.calls.len(), 2);
+        assert_eq!(col.calls[0].arguments, "{}");
+        assert_eq!(col.calls[1].name, "b");
+        assert_eq!(col.calls[1].arguments, "{\"x\":1}");
+        assert_eq!((c, t), (0, 5));
     }
 }
