@@ -17,3 +17,5 @@ pub mod toolcall;
 pub mod reset;
 // #31 A9: the prefix cache (spec section 7) - snapshot, rollback and the id prefix rule
 pub mod cache;
+// #32 A10: the slot file behind POST /slots/0?action=save|restore (spec section 7)
+pub mod slot;

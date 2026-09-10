@@ -122,11 +122,21 @@
 //! - Cost of not using it: the previous answer is re-prefilled, 63 tokens at the A9
 //!   operating point, 0.03 s of the 22.9 s a cold turn pays.
 //!
+//! The one exception to "in-process state, never a file" (#32 A10, spec 7.6):
+//!
+//! - `engine/src/slot.rs` writes the `SLOT_PROMPT` slot to a file and reads it back.
+//! - It is the deliberate exception, so the FILE carries the whole load shape.
+//! - A restore refuses any shape mismatch instead of loading state that is only shaped right.
+//! - Only `SLOT_PROMPT` is ever written: it is the one prefill clean position (see above).
+//! - A restore names it through `set_prompt_slot` and CLEARS `SLOT_ANSWER`, so the next
+//!   request lands on the ordinary warm path of this file, not on a second one.
+//!
 //! Off switch:
 //!
 //! | variable | effect |
 //! |---|---|
 //! | `CROW_PREFIX_CACHE=0` | no slots are allocated, every request is a cold start |
+//! | | `/slots/0` then refuses save and restore: there is no slot to write or fill |
 
 use crate::cuda;
 use crate::gen::Engine;
@@ -327,6 +337,57 @@ impl PrefixCache {
         }
         let l = common_prefix_len(history, ids);
         Decision { l, reuse: reuse_slot(&self.reuse_candidates(), l, ids.len()) }
+    }
+
+    /// - `Some((pos, done_blocks))` of the PROMPT slot while it is a reuse candidate
+    /// - `None` when it is empty; that slot is never anything but prefill clean
+    /// - #32 A10: this is the position a slot file holds, and `n_saved` on the wire
+    pub fn prompt_slot(&self) -> Option<(usize, usize)> {
+        let s = self.slots.get(SLOT_PROMPT)?;
+        if !s.prefill_clean {
+            return None;
+        }
+        s.pos.map(|p| (p, s.done_blocks))
+    }
+
+    /// - the four recurrent buffers of the PROMPT slot, in the ONE order a slot file uses
+    /// - empty when no slot is allocated (`CROW_PREFIX_CACHE=0`)
+    /// - #32 A10: `engine/src/slot.rs` is the only reader, and it writes them in this order
+    pub fn prompt_state_blocks(&self) -> Vec<&[f32]> {
+        let Some(s) = self.slots.get(SLOT_PROMPT) else { return Vec::new() };
+        let mut v: Vec<&[f32]> = Vec::with_capacity(2 * s.gdn_s.len() + s.qsa_ring.len() + 1);
+        v.extend(s.gdn_s.iter().map(|b| b.as_slice()));
+        v.extend(s.gdn_conv.iter().map(|b| b.as_slice()));
+        v.push(s.ple_state.as_slice());
+        v.extend(s.qsa_ring.iter().map(|b| b.as_slice()));
+        v
+    }
+
+    /// the same blocks, in the same order, to be filled from a slot file
+    pub fn prompt_state_blocks_mut(&mut self) -> Vec<&mut [f32]> {
+        let Some(s) = self.slots.get_mut(SLOT_PROMPT) else { return Vec::new() };
+        let Snapshot { gdn_s, gdn_conv, ple_state, qsa_ring, .. } = s;
+        let mut v: Vec<&mut [f32]> = Vec::with_capacity(2 * gdn_s.len() + qsa_ring.len() + 1);
+        v.extend(gdn_s.iter_mut().map(|b| b.as_mut_slice()));
+        v.extend(gdn_conv.iter_mut().map(|b| b.as_mut_slice()));
+        v.push(ple_state.as_mut_slice());
+        v.extend(qsa_ring.iter_mut().map(|b| b.as_mut_slice()));
+        v
+    }
+
+    /// - name the PROMPT slot after its buffers were filled from a slot file (#32 A10)
+    /// - prefill clean by construction: a slot file only ever holds a prefill clean position
+    /// - the ANSWER slot is CLEARED: nothing may claim a position this process never wrote
+    pub fn set_prompt_slot(&mut self, pos: usize, done_blocks: usize) {
+        if let Some(s) = self.slots.get_mut(SLOT_PROMPT) {
+            s.pos = Some(pos);
+            s.prefill_clean = true;
+            s.done_blocks = done_blocks;
+        }
+        if let Some(s) = self.slots.get_mut(SLOT_ANSWER) {
+            s.pos = None;
+            s.prefill_clean = false;
+        }
     }
 
     /// - both slots forget their position; the buffers stay allocated
