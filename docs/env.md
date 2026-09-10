@@ -66,7 +66,7 @@ Helpers used by the read sites:
 | `CROW_QSA_FULL` | `engine/src/manager.rs:37` | `1` sets `ring = context`; default `ceil4(prompt_chunk + 4)` capped by context | size of the raw indexer-key ring per attention layer | measurement | pre-2026-09-05 layout; `docs/architecture.md:1162` marks it out of scope for `serve` |
 | `CROW_KV` | `engine/src/bin/decode.rs:62` | `bf16`; default the container KV dtype | parity ladder switch for the KV cache dtype | measurement | read only in `bin/decode.rs`, not by `serve` |
 | `CROW_PLE` | `engine/src/bin/decode.rs:65` | `off`; default on | parity ladder switch that disables the PLE stage | measurement | read only in `bin/decode.rs`, not by `serve` |
-| `CROW_PLE_CACHE_MB` | `engine/src/gen.rs:626` | integer MiB; default `cfg.ple_cache_bytes` (128 MB in `serve`, `bin/serve.rs:47`) | size of the PLE hot-row cache | operating | VRAM diet knob, 2026-09-05; C1 allowlist keeps it unset (issue #40 (comment)) |
+| `CROW_PLE_CACHE_MB` | `engine/src/gen.rs:626` | integer MiB; default `cfg.ple_cache_bytes` (128 MB in `serve`, `bin/serve.rs:47`) | size of the PLE hot-row cache | operating | VRAM diet knob, 2026-09-05; C1 allowlist keeps it unset (issue #11, comment 5621121049, C1 result) |
 | `CROW_PLE_PREFETCH` | `engine/src/gen.rs:2463` | `0` disables; default on | warms the next chunk's PLE rows on a helper thread | operating | no-op without a file mapping (`CROW_MMAP=0`) |
 
 ## Prefill and chunking (9 rows)
@@ -177,7 +177,7 @@ Helpers used by the read sites:
 ## Reference operating point
 
 - Environment of B4 part 3 (the F49 chain), `decode_out/srv-b4.log:216`
-- Same block, issue #40 (comment)
+- Same names on issue #11: comments 5548346118, 5549858612, 5550904582 (F49 chains, with `CROW_PLE_CACHE_MB=512`) and 5621121049 (C1, without it)
 
 ```
 CROW_CNQ=converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq
