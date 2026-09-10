@@ -391,13 +391,25 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 ---
 
-## Section 7: server and prefix cache (PROPOSED 2026-09-09, awaiting robin's approval. Sections 0-6 unchanged)
+## Section 7: server and prefix cache (approved by robin 2026-09-09 at M1. Sections 0-6 unchanged)
+
+**Status of this section:**
+
+| item | value |
+|---|---|
+| proposed | 2026-09-09, task A1, issue #23 |
+| approved | 2026-09-09 by robin, M1 decision comment on issue #1 |
+| corrected against the built server | 2026-09-10, task A11, issue #33 |
+| evidence for the corrections | closing comments of #24 to #32, reports `.superpowers/sdd/task-A2..A10-report.md`, gate logs `decode_out/srv-a*.log` |
+| corrected rows | 7.2 graph assumption, 7.3 KV row claim, 7.6 point 2 and the never-cold claim, 7.7 to 7.9 numbers |
+| added after the build | 7.11 endpoint contract as built, 7.12 stage A gate table |
+| sections 0 to 6 | unchanged, approved 2026-09-02 |
 
 ### 7.1 What the server is, and the one question this section answers
 
 **Given:**
 
-- The Crow client sends the **whole chat history on every turn**.
+- The Crow client sends the **whole chat history on every turn** (`crow_core.py:4672-4700`).
 - Without a prefix cache every turn pays the full prefill again.
 - The plan's reference point is a **16k prefill = 24.13 s wall (measured)**.
 - Provenance: measured 2026-09-06 by chain F43 (t1-read 16,064 tokens, chunk 2048).
@@ -406,6 +418,18 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - The server ("serve") is a **blocking single-request binary** (robin's decision, not
   reopened here).
 - **One engine process per machine** (robin's decision, not reopened here).
+
+**Measured on the serve build of 2026-09-10 (A9, #31, `decode_out/srv-a9.log`):**
+
+| quantity | value | note |
+|---|---|---|
+| cold 16k prefill, turn 1, 16,064 ids | **21.6 to 22.0 s** | the same work the 24.13 s reference names, on the serve binary |
+| warm turn prefill, 95 of 16,159 ids | **404 ms** | 99.41 % of the prompt reused |
+| rollback into the last turn (HtoD) | **12 to 13 ms** | 7.9 acceptance point 3 |
+
+- Rule: 24.13 s stays the plan's reference number, with the provenance above.
+- Rule: 21.6 to 22.0 s is the number of THIS build and is the one 7.8 costs are read against.
+- Neither number is a correction of the other: different binary, same operating point.
 
 **Decided before the plumbing:**
 
@@ -430,11 +454,12 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
   (`gen.rs:774-776`).
 - From then on they only grow: in `prefill` (`gen.rs:2696-2698`) and in `decode_step`
   (`gen.rs:2944-2947`).
-- Every binary today builds a fresh `Engine` per process and runs exactly one prefill from
-  position 0 (`bin/decode.rs:78-83`, `bin/decode.rs:150-153`).
-- "Start over" is a process restart.
+- Every binary before serve built a fresh `Engine` per process and ran exactly one prefill
+  from position 0 (`bin/decode.rs:78-83`, `bin/decode.rs:150-153`).
+- "Start over" was a process restart.
 - A server has to introduce the concept of *setting the position back*.
-- That concept is what the rest of this section defines.
+- Built as `Engine::reset_to_zero` (`engine/src/reset.rs`, #26 A4) and, warm, as
+  `PrefixCache::rollback` (`engine/src/cache.rs:445`, #31 A9).
 
 **Two structural facts decide everything else.**
 
@@ -462,7 +487,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - Consequence: **a recurrent state cannot be rewound to an earlier position unless it was
   saved there.**
 
-**A third fact, and an untested assumption.**
+**A third fact, and the assumption A4 measured FALSE.**
 
 - The decode CUDA graph is captured **once per process**:
   `let capturing = graph && self.graph_exec == 0` (`gen.rs:2833`).
@@ -470,32 +495,76 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - Every token after that replays the instantiated graph.
 - A server therefore runs its **second** prefill against an already-instantiated decode
   graph.
-- That is a state **no binary has reached yet**, because every binary today prefills
-  exactly once.
-- By design the graph is position-agnostic: it reads its position from device scalars that
-  the per-token scalar upload refreshes before each replay.
-- `rope_p` deliberately takes `p.pos_base` as a device pointer rather than a host-computed
-  table offset (`gen.rs:1733-1735`).
-- Reason: a host offset would be baked into the capture and replay the capture's token
-  position forever (`gen.rs:1733-1735`).
-- That is the intent recorded in the code, **not a measurement**.
-- **A2 and A9 must verify it.**
+- The proposal assumed that graph is position-agnostic, because `rope_p` takes
+  `p.pos_base` as a device pointer rather than a host-computed table offset
+  (`gen.rs:1733-1735`).
+- **Measured 2026-09-09 (A4, #26, `.superpowers/sdd/task-A4-report.md`, `reset.rs` module doc): the assumption does not hold.**
 
-**Checks for A2 and A9:**
+| step | what the code does | evidence |
+|---|---|---|
+| 1 | `decode_step` creates the capture stream ONCE and leaves it ACTIVE | `gen.rs:2740-2743` |
+| 2 | `launch_v` and `upload_into` both read that active stream | `gen.rs:1194`, `cuda.rs:373` |
+| 3 | `upload_into` skips its sync on any stream but the legacy one | `cuda.rs:381-386` |
+| 4 | `prefill` uploads its per chunk scalars and the embedding block from TEMPORARIES | `gen.rs:2493-2510`, `gen.rs:2519` |
+| 5 | so a second `prefill` posted async HtoD copies whose host source had already died | measured |
+| result | same prompt, greedy: request 1 gave id 18622, request 2 gave id 17 | `.superpowers/sdd/task-A4-report.md` |
 
-1. After a rollback and a second prefill, the replayed decode graph must still decode from
-   the new position.
-2. A9's bit-identity against a cold run is what would catch it if it does not.
-3. If it does not hold, the remedy is to drop `graph_exec` on rollback and recapture.
+**The remedy, exactly the one this section named as the fallback:**
+
+- `Engine::drop_decode_graph` (`engine/src/reset.rs`) destroys `graph_exec`, destroys
+  `cap_stream` and puts the legacy stream (0) back, mirroring `impl Drop for Engine`
+  (`gen.rs:3307-3317`).
+- It is the ONE definition of that teardown.
+- The cold path `Engine::reset_to_zero` calls it before any prefill.
+- The warm path `PrefixCache::rollback` (`cache.rs:445`) calls it before any prefill.
+- `slot::restore` (`slot.rs:577`) calls it before its uploads.
+- `decode_step` then re-creates the stream and re-captures on the first step of the next
+  request (`gen.rs:2740`, `gen.rs:2836`).
+- Rule: **the decode graph is dropped and recaptured per request.** It is not carried.
+- Cost: one eager decode step plus one graph instantiate per request.
+- Not measured against keeping the graph: keeping it is what broke the ids.
+- A4 gate, 18 token prompt, 29 generated: decode 1170 to 1203 ms over four runs.
 
 ### 7.3 The four states
 
 | state | reusable across requests | prefix divergence detection | behaviour on divergence | cost of a cache miss at 16k |
 |---|---|---|---|---|
-| **KV cache**: 12 attention layers, `[12][2][2][context][256]`, FP8 E4M3 default (`geo.rs:23-25`, `manager.rs:43`, `manager.rs:200`) | **Yes, as it stands.** A row is addressed by the absolute slot `pos` and its RoPE was applied at that absolute position before the store, so rows `0..L` stay valid for any request whose ids agree on `0..L`. Nothing in the row depends on the request that wrote it. | Host-side only, from the id lists (7.4). The cache is never probed: there is no key in a KV row to compare against. | **Nothing is erased.** `pos` is set back to P. Rows `>= P` are stale but unreachable: the selector only scans blocks below `ncb = (pos+1)/4` (`gen.rs:2503-2506`, `gen.rs:2746`). The new suffix overwrites them as it is prefilled. | Full miss (P = 0) = one 16k prefill = **24.13 s wall** (measured, the plan's reference). A partial miss of n tokens is `n/16384 x 24.13 s` as a **linear estimate only** (unmeasured). Prefill is not linear in n: the chunk policy (`geo.rs:138-152`) and the one-cold-tier-pass-per-chunk cost (`gen.rs:2444-2448`) both bend it. |
-| **QSA indexer state**: raw-key **ring** `[12][ring][128]` f32 with `row = pos % ring`, `ring = min(ceil4(prompt_chunk + 4), context)` (`manager.rs:37-41`, `manager.rs:58`, `kernels.rs:1759-1769`). Plus the **full-length pooled cache** `[12][ceil(context/4)][128]` f32 indexed by the absolute block `pos/4` (`manager.rs:46`, `manager.rs:60`, `kernels.rs:1747-1758`) | **Pooled cache: yes**, same argument as KV (absolute block index, RoPE at the absolute block position). **Ring: conditionally.** The ring is modular and holds only the last `ring` positions. Its only reader is `pool4_cache`, which for a resume at P needs the `P mod 4` rows of the still-incomplete block. Those are live iff the held run advanced fewer than `ring - 3` positions past P. Made unconditional by snapshotting the ring (7.6) or by rounding P down to a multiple of 4. | Host-side only (7.4). | Set `done_blocks = P/4` and restore the ring from the snapshot. Pooled blocks `>= P/4` are stale but unreachable by the same `ncb` bound. Block `P/4` is re-pooled by the resumed prefill **before** any query scores it (pooling precedes scoring inside `attn_prompt`: `gen.rs:1647-1661` then `gen.rs:1680-1683`). | No separate cost. The ring and the pooled blocks of the diverged suffix are rebuilt inside the same prefill pass that rebuilds KV. They add no pass of their own. Their share of the 24.13 s is **unmeasured** (`CROW_KPROF=1` would produce a per-kernel breakdown; none is recorded). |
-| **GDN recurrent state**: 36 layers, `S[48][128][128]` f32 + `conv[10240][3]` f32, **112.22 MiB**, fixed and context-independent (`geo.rs:24`, `geo.rs:12-15`, `manager.rs:47-48`, `manager.rs:226-237`) | **No, not as the engine stands.** The state holds no position. It is the fold of every token seen so far. After the held run reached L there is no `S` at any P < L anywhere in the process, and there is no reset path. It is reusable **exactly at P = L**, and for any P < L **only from a snapshot taken at P** (7.6). | Host-side only, and this is the point: the state itself **cannot be probed**. Nothing in `S` says which ids produced it. If the id comparison is wrong, nothing downstream notices. | Restore `S` and `conv` from the newest snapshot at a position `S_pos <= L`, then re-prefill from `S_pos`. With **no** snapshot at or below L, the only correct move is a **cold start** (`S_pos = 0`): the KV and pooled rows that are still valid must be thrown away with it, because a KV prefix without the matching GDN state is precisely the silent-wrong-answer case. | **This is the state that sets the price.** The suffix to re-prefill starts at the last snapshot, not at the divergence point: extra cost = `(L - S_pos)` tokens of prefill on top of the diverged suffix. No snapshot at all = the full **24.13 s** at 16k. Its own share of a prefill is **unmeasured**. |
+| **KV cache**: 12 attention layers, `[12][2][2][context][256]`, FP8 E4M3 default (`geo.rs:23-25`, `manager.rs:43`, `manager.rs:200`) | **Yes, for rows PREFILL wrote.** A row is addressed by the absolute slot `pos` and its RoPE was applied at that absolute position before the store, so rows `0..L` stay valid for any request whose ids agree on `0..L`. **Corrected 2026-09-10 (A9, #31): a row DOES depend on the code path that wrote it.** `decode_step` rows are not bit-equal to `prefill` rows at the same position. A reuse point is valid only while every row below it was written by `prefill` (PREFILL CLEAN, `engine/src/cache.rs`). | Host-side only, from the id lists (7.4). The cache is never probed: there is no key in a KV row to compare against. **Plus the prefill-clean flag per slot**, which is state the server keeps, not something read out of a row. | **Nothing is erased.** `pos` is set back to P. Rows `>= P` are stale but unreachable: the selector only scans blocks below `ncb = (pos+1)/4` (`gen.rs:2503-2506`, `gen.rs:2746`). The new suffix overwrites them as it is prefilled. | Full miss (P = 0) = one 16k prefill = **21.6 to 22.0 s** on the serve build (A9, #31); **24.13 s** is the plan's reference on the installed decode build. A partial miss of n tokens is `n/16384 x` that as a **linear estimate only** (unmeasured). Prefill is not linear in n: the chunk policy (`geo.rs:138-152`) and the one-cold-tier-pass-per-chunk cost (`gen.rs:2444-2448`) both bend it. |
+| **QSA indexer state**: raw-key **ring** `[12][ring][128]` f32 with `row = pos % ring`, `ring = min(ceil4(prompt_chunk + 4), context)` (`manager.rs:37-41`, `manager.rs:58`, `kernels.rs:1759-1769`). Plus the **full-length pooled cache** `[12][ceil(context/4)][128]` f32 indexed by the absolute block `pos/4` (`manager.rs:46`, `manager.rs:60`, `kernels.rs:1747-1758`) | **Pooled cache: yes, under the same prefill-clean rule as KV** (A9, #31: a pooled block over decode-written rows is not bit-equal either). **Ring: conditionally.** The ring is modular and holds only the last `ring` positions. Its only reader is `pool4_cache`, which for a resume at P needs the `P mod 4` rows of the still-incomplete block. Those are live iff the held run advanced fewer than `ring - 3` positions past P. Made unconditional by snapshotting the ring (7.6) or by rounding P down to a multiple of 4. | Host-side only (7.4). | Set `done_blocks = P/4` and restore the ring from the snapshot. Pooled blocks `>= P/4` are stale but unreachable by the same `ncb` bound. Block `P/4` is re-pooled by the resumed prefill **before** any query scores it (pooling precedes scoring inside `attn_prompt`: `gen.rs:1647-1661` then `gen.rs:1680-1683`). | No separate cost. The ring and the pooled blocks of the diverged suffix are rebuilt inside the same prefill pass that rebuilds KV. They add no pass of their own. Their share of the prefill is **unmeasured** (`CROW_KPROF=1` would produce a per-kernel breakdown; none is recorded). |
+| **GDN recurrent state**: 36 layers, `S[48][128][128]` f32 + `conv[10240][3]` f32, **112.22 MiB**, fixed and context-independent (`geo.rs:24`, `geo.rs:12-15`, `manager.rs:47-48`, `manager.rs:226-237`) | **No, not without a snapshot.** The state holds no position. It is the fold of every token seen so far. After the held run reached L there is no `S` at any P < L anywhere in the process. It is reusable **exactly at P = L**, and for any P < L **only from a snapshot taken at P** (7.6). | Host-side only, and this is the point: the state itself **cannot be probed**. Nothing in `S` says which ids produced it. If the id comparison is wrong, nothing downstream notices. | Restore `S` and `conv` from the newest prefill-clean snapshot at a position `S_pos <= L`, then re-prefill from `S_pos`. With **no** such snapshot, the only correct move is a **cold start** (`S_pos = 0`): the KV and pooled rows that are still valid must be thrown away with it, because a KV prefix without the matching GDN state is precisely the silent-wrong-answer case. | **This is the state that sets the price.** The suffix to re-prefill starts at the last snapshot, not at the divergence point: extra cost = `(L - S_pos)` tokens of prefill on top of the diverged suffix. No snapshot at all = the full **21.6 to 22.0 s** at 16k on this build. Its own share of a prefill is **unmeasured**. |
 | **PLE row cache**: hot rows of the 128 n-gram shards, `n_slots = cache_bytes / 112`, default 128 MB = **1,198,372 slots** (`geo.rs:72`, `geo.rs:108`, `gen.rs:899-902`) | **Yes, unconditionally.** It is **content-addressed**, not position-addressed: `slot = ngram_row_id % n_slots` with `slot_map[slot]` holding the id (`gen.rs:1013-1040`), and a slot's content is a verbatim copy of a container row. It carries no position and does not depend on which request filled it. | **Not needed.** Divergence cannot invalidate it: a slot either already holds the row a token asks for, or is refilled from the container. | **Nothing.** The cache survives every divergence, every request, and every rollback. Rows filled by a discarded prefix stay useful. | A PLE miss is a container row read, **not** a prefill. It never forces recomputation. Not measured in seconds anywhere in the repo; the measured quantity is the **miss rate** (#16, 2026-09-05: 128 MB costs +0.2 % misses against 1 GB and frees ~7 hot-set units, `geo.rs:108`). |
+
+**The prefill-clean rule (A9, #31, measured 2026-09-10, binding):**
+
+| run | reuse point | rows below it written by | ids vs a fresh process |
+|---|---|---|---|
+| A9 gate part 2, turn 2 | 16127 (after the answer) | prefill AND `decode_step` | equal over 35 ids, 5 runs |
+| A9 gate part 3, turn 3 | 16159 (after a prompt) | prefill AND `decode_step` | DIFFERENT, first at generated id 43 |
+| A9 probe, turn 4 | 16064 (after a prompt) | prefill only | equal over 49 ids |
+| A9 control, turn 3 | none, cold, chunk cut changed | prefill only | equal, so the chunk cut is not the cause |
+
+- Evidence: `decode_out/srv-a9.log` and its appendix, `-control.log`, `-chunkcut.log`, `-probe.log`.
+- Rule: a snapshot is a reuse candidate only while every row below its position was written
+  by `prefill`. That property is called **PREFILL CLEAN**.
+- Reason: 7.5 is binding, and a decode-written row cannot be PROVEN to be the row a cold run
+  would have.
+- Consequence: the after-answer snapshot is taken (M1) and is never offered to `reuse_slot`
+  (`cache.rs:325`, `cache.rs:171`).
+- Induction that point 1 is always prefill clean: a cold request prefills `0..prompt_len`; a
+  warm request rolls back only to a prefill-clean `P` and prefills `P..prompt_len`, which
+  REWRITES the re-rendered previous answer as prefill rows.
+
+**KV and the snapshot, within a process and across a restart:**
+
+| scope | what carries KV | evidence |
+|---|---|---|
+| within one process | nothing: KV rows and pooled blocks stay in VRAM, absolutely addressed, and rows `>= P` are unreachable | 7.6, `cache.rs` module doc |
+| across a restart | the slot file: KV rows `0..pos` and pooled blocks `0..floor(pos/4)` | `engine/src/slot.rs` module doc, #32 A10 |
+
+- Rule: the pooled range is `floor(pos/4)`, not `ceil`.
+- Reason: block `ceil(pos/4)` is written only by `decode_step` at that position
+  (`gen.rs:1647`, `gen.rs:2696`), so a saved `ceil` block would be a decode row.
+- A restore refuses `done_blocks != pos / 4` before the first device upload (`slot.rs`).
 
 **A fifth state hides inside the fourth row.**
 
@@ -531,6 +600,19 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 > - The reuse point is `P = max { snapshot position S_pos : S_pos <= L }`.
 > - The tokens `P..` of the new request are prefilled.
 
+**As built (`engine/src/cache.rs`, #31 A9):**
+
+| symbol | implementation | anchor |
+|---|---|---|
+| `L` | `common_prefix_len(history, ids)` | `cache.rs:164` |
+| `P` | `reuse_slot(reuse_candidates, l, new_len)` | `cache.rs:171`, `cache.rs:325` |
+| candidates | only PREFILL CLEAN slots (7.3) | `cache.rs:325` |
+| extra guard | `S_pos < request length` | `cache.rs:171` |
+| decision | `PrefixCache::decide` | `cache.rs:334` |
+
+- Reason for the extra guard: `prefill` of an empty slice has no last position to return a
+  greedy id from. It is a guard, not a change of the rule.
+
 **Why ids and not text:**
 
 - Rule: comparing ids and not text is not a stylistic choice.
@@ -553,19 +635,25 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - The invariant is what makes every "behaviour on divergence" cell above conservative.
 - Rule: where the correct state cannot be proven present, the answer is *recompute*, never
   *carry on*.
+- Measured 2026-09-10: this rule is what removed the after-answer snapshot from the reuse
+  candidates (7.3, A9 #31).
 
 **Two conditions the invariant depends on, both outside the four states.**
 
-**Condition 1: greedy only, or a reseeded RNG.**
+**Condition 1: greedy only, or a reseeded RNG. BOTH hold as built (A6, #28).**
 
 - The device sampler's xorshift state (`DevSampler::rng`, `gen.rs:2955-2969`) advances per
   token.
 - It lives for the engine's lifetime.
-- Consequence: under sampling, a second request on a warm engine draws from a different
-  RNG position than a cold engine would.
-- Consequence: "bit-identical ids" is only a meaningful gate at greedy/argmax, or with the
-  sampler reseeded per request.
-- Rule: A9 must run greedy.
+- Consequence: under sampling, a second request on a warm engine would draw from a
+  different RNG position than a cold engine.
+- Built: `Engine::enable_dev_sampler` runs for EVERY sampled request and uploads
+  `Rng::new(seed)`, so request k starts cold (M1 decision, robin 2026-09-09).
+- Built: a greedy request PARKS the sampler in `Srv::parked_sampler`, so it cannot sample
+  silently (`serve.rs:1845` the field, `serve.rs:1527` park, `serve.rs:1510` hand back).
+- Measured: seed 7 warm equals seed 7 cold, 2 of 2; seed 8 differs; greedy between two
+  sampled requests still identical (`decode_out/srv-a6.log`, `decode_out/srv-a6-fix.log`).
+- Rule: A9 runs greedy (M1 decision).
 
 **Condition 2: residency stays numerically invisible.**
 
@@ -577,15 +665,18 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - The low-bit cold tier is lossy and would break bit-identity between two runs with
   different hot sets.
 - Rule: the server must not enable it while A9 is the gate.
+- As built: `serve` calls NEITHER `trickle_tick` NOR `adapt_tick` (`bin/decode.rs:216-228`
+  is the only caller), so the hot set stays the loaded one for the process life.
 
 ### 7.6 Snapshot and rollback (GDN, PLE conv, QSA ring)
 
 **What needs no snapshot:**
 
-- Rule: KV and the pooled QSA cache need **no** snapshot.
+- Rule: KV and the pooled QSA cache need **no** snapshot within a process.
 - Reason: they are absolutely addressed, append-only, and a stale row past `pos` is never
   read (7.3).
 - Consequence: only the states that fold history into a fixed-size buffer do.
+- Exception, across a restart: the slot file carries them (7.3 table, `slot.rs`).
 
 **Snapshot = a device-to-host copy of:**
 
@@ -607,58 +698,82 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 - The `ring` here is the **raw-key ring**.
 - It has nothing to do with the QSA **selection budget**.
-- The "budget 2,048 tokens" of §2.1 is `QSA_BLOCK_TOPK` 512 selected blocks x compression
-  ratio 4 = 2,048 tokens a *query* may attend to (`geo.rs:41-42`).
+- The "budget 2,048 tokens" of section 2.1 is `QSA_BLOCK_TOPK` 512 selected blocks x
+  compression ratio 4 = 2,048 tokens a *query* may attend to (`geo.rs:41-42`).
 - The ring is a `ceil4(prompt_chunk + 4)`-row scratch buffer of raw indexer keys awaiting
   pooling.
 - The two numbers are unrelated and only happen to sit close together at chunk 2048.
 
-**When to snapshot.** Two points per turn, both natural and both cheap relative to a
-prefill:
+**When to snapshot. Two points per turn, both taken unconditionally (M1, robin 2026-09-09):**
 
-1. after the prefill of a turn's prompt (`pos = prompt length`), and
-2. after that turn's generated answer (`pos = end of turn`).
+| slot | point | position | reuse candidate |
+|---|---|---|---|
+| `SLOT_PROMPT` (`cache.rs:147`) | after the prefill of this turn's prompt | rendered prompt length | **yes**, it is prefill clean (7.3) |
+| `SLOT_ANSWER` (`cache.rs:149`) | after the last `decode_step` of this turn | prompt length + generated - 1 | **no**, `decode_step` wrote its rows |
 
-**Point 2 is the normal case:**
+- The last generated id is never fed back, so it is not in `history` and not in `pos`.
+- ONE held conversation per process (M1): a request that shares no prefix replaces it.
+- The point 2 snapshot runs AFTER `data: [DONE]`, so no client waits for its copy.
 
-- Point 2 is the one Crow normally hits.
-- The next turn's ids extend the previous turn's transcript.
-- Consequence: `L = ` the previous end and `P = L`.
-- Consequence: no rollback, no recompute.
-- Consequence: the new prompt suffix is simply prefilled onto the held state.
+**Point 2 is NOT the reuse case. Corrected 2026-09-10 (A9, #31):**
 
-**Point 1 earns its keep in the regenerate / edited-answer case:**
+- The proposal said point 2 is the normal case and spares the answer's prefill.
+- Measured: point 2 is taken, reported and never consumed (`prefill_clean` guard,
+  `cache.rs:325`).
+- Consequence: every turn re-prefills the previous answer.
+- Measured cost: **63 to 95 tokens** at the 16k operating point, still **99.41 % cached**
+  (16,064 of 16,159), prefill **404 ms** (`decode_out/srv-a9.log`).
+- Measured cost in a cold turn's terms: 0.03 s of the 22.9 s the cold turn paid.
+- The rollback lands on point 1 whether the divergence sits in the answer or not; that is
+  the rule working, not a special case.
+- The re-rendered assistant message need not reproduce the generated ids exactly, which is a
+  second reason point 2 rarely matched anyway.
+
+**Point 1 covers the regenerate / edited-answer case:**
 
 - The prompt's ids are unchanged and the divergence sits in the *answer*.
 - Consequence: `L >= ` the end of that prompt.
-- Consequence: the point-1 snapshot is the newest one at or below `L`, and the rollback
-  lands on it.
+- Consequence: the point-1 snapshot is the newest candidate at or below `L`, and the
+  rollback lands on it.
 - Consequence: **the prompt's prefill is spared** and only the answer is recomputed.
 
-**Point 1 does not cover the edited-prompt case:**
+**Point 1 does not cover the edited-prompt case, and the fallback CAN be cold. Corrected 2026-09-10 (A9, #31):**
 
 - If the user rewrites their last message, the common prefix ends at the **start** of that
   prompt.
 - That is below the point-1 snapshot, which is taken at prompt *end*.
-- Consequence: `P` is the previous turn's post-answer snapshot, still a warm resume, not a
-  cold start.
-- A cold start only happens when **no** snapshot at or below `L` exists at all.
-- With any earlier snapshot held, the fallback is never cold.
-- The rule is unchanged in both cases and needs no special-casing:
-  `P = max { S_pos : S_pos <= L }`.
+- The proposal said: with any earlier snapshot held, the fallback is never cold.
+- Measured: **false for this implementation.** There is exactly ONE usable slot, the current
+  prompt end, because point 2 is not a candidate and only one conversation is held.
+- Consequence: an edit below that position is a **cold prefill**, 21.6 to 22.0 s at 16k.
+- The rule itself is unchanged and needs no special-casing:
+  `P = max { prefill-clean S_pos : S_pos <= L }`.
 
-**Rollback:**
+**OPEN DECISION FOR ROBIN AT M2 (not decided here):**
 
-1. Restore the four buffers with host-to-device copies.
-2. Set `pos = S_pos`.
-3. Set `done_blocks = S_pos / 4`.
-4. Truncate `history` to `S_pos`.
-5. Call `prefill` with the new ids from `S_pos` on.
+| option | effect | cost |
+|---|---|---|
+| keep as built (M1) | point 2 is taken and never used | 124.60 MiB of host RAM and one DtoH of 14.5 ms per request, for nothing |
+| drop point 2 | one slot, same reuse behaviour | saves that RAM and that copy |
+| reassign slot 2 to the PREVIOUS turn's point 1 | two prefill-clean positions, an edited last prompt stays warm | same RAM, same copies, more bookkeeping |
+
+- A third slot is the same question with one more buffer.
+- Source: A9 review, issue #31, and the plan's M2 list.
+
+**Rollback (`PrefixCache::rollback`, `cache.rs:445`):**
+
+1. `cuda::sync`, then `Engine::drop_decode_graph` (7.2, `reset.rs`).
+2. Restore the four buffers with host-to-device copies.
+3. Set `pos = S_pos`.
+4. Set `done_blocks = S_pos / 4`.
+5. Truncate `history` to `S_pos`, clear `route_log`.
+6. Call `prefill` with the new ids from `S_pos` on.
 
 - Note: `prefill`'s `init` flag zeroes `S` only when `self.pos == 0` (`gen.rs:2433`).
 - That is exactly the cold-start case.
 - Consequence: the restored path must leave it at 0.
 - The current signature already does the right thing once `pos` is set.
+- Measured HtoD: **12 to 13 ms** (A9, #31).
 
 **What must NOT be reused:**
 
@@ -667,6 +782,42 @@ prefill:
   (`manager.rs:31`, `manager.rs:108-170`).
 - Consequence: a snapshot's shape is only valid for the process that produced it.
 - Consequence: snapshots are in-process state, not a file format.
+
+**The ONE deliberate exception: the slot file (#32 A10, `engine/src/slot.rs`):**
+
+- Rule: `POST /slots/0?action=save|restore` writes the `SLOT_PROMPT` slot to a file and
+  reads it back, because Crow saves at exit and restores at the next start
+  (`crow_core.py:2458`, `:2688`).
+- Rule: because it IS a file, the file carries the whole load shape in its header, and a
+  restore refuses any mismatch **before the first device write**.
+- Rule: only `SLOT_PROMPT` is ever written. It is the one prefill-clean position (7.3).
+
+| header field | what it pins |
+|---|---|
+| `magic` `CROWSLT\x01` | the file kind |
+| `format_version` (1) | payload order and header layout |
+| `load_id` | fnv1a-64 of the container path mixed with `n_hot`; catches the obvious model swap, NOT a content hash |
+| `n_ctx` | the context of the load |
+| `prompt_chunk` | 2048 as pinned (M1) |
+| `qsa_ring_rows` | `ring`, which follows from the chunk |
+| `gdn_layers`, `attn_layers` | the geometry |
+| `kv_groups` (`attn_layers * 2 * NKV`) | the KV fan-out |
+| `kv_row_bytes` | `AHD * bytes per KV value`, so the KV dtype by size |
+| `pooled_row_bytes` (`QSA_HIDD * 4`) | the pooled block row |
+| `state_bytes` | `Shape::snapshot_bytes`, the four recurrent buffers |
+| `pos` | the saved prefill-clean position, and `n_saved` on the wire |
+| `done_blocks` | `pos / 4`, refused when it differs |
+| `history_len` | must equal `pos` |
+
+- Header size: 120 bytes, magic plus fourteen little-endian u64 (`slot.rs`).
+- Payload order: `gdn_s`, `gdn_conv`, `ple_state`, `qsa_ring`, `kv` rows `0..pos`, pooled
+  blocks `0..done_blocks`, `history[..pos]`.
+- Save is atomic: sibling `.part-<pid>`, fsync, `fs::rename` over the target.
+- Restore fills `SLOT_PROMPT`, CLEARS `SLOT_ANSWER`, sets `pos`, `done_blocks`, `history`.
+- Consequence: the next chat request is an ordinary warm turn of 7.4, `L >= pos`, `P = pos`.
+- Measured at 16k (A10, #32, `decode_out/srv-a10-fix.log`): file **352,843,384 B**,
+  `n_saved` = `n_restored` = **16,064**, save **173 ms** (108 ms before the fsync was added),
+  restore **137 ms** in the same process and **225 to 235 ms** into a fresh one.
 
 ### 7.7 Memory cost of a snapshot
 
@@ -686,12 +837,21 @@ with `ring = ceil4(prompt_chunk + 4).min(context)` (`manager.rs:37-41`):
 | prompt_chunk | ring | QSA ring bytes | snapshot total |
 |---|---|---|---|
 | 512 (default `Config`) | 516 | 3,170,304 B = 3.02 MiB | **121,208,832 B = 115.60 MiB** |
-| 2048 (long-prompt policy) | 2052 | 12,607,488 B = 12.02 MiB | **130,646,016 B = 124.60 MiB** |
+| 2048 (the serve default, M1) | 2052 | 12,607,488 B = 12.02 MiB | **130,646,016 B = 124.60 MiB** |
 
 **Totals for two snapshots per held conversation (7.6):**
 
 - **231.19 MiB** at chunk 512.
-- **249.19 MiB** at chunk 2048.
+- **249.19 MiB** at chunk 2048 = 261,292,032 B, the serve default.
+
+**Confirmed against the build (A9, #31, `decode_out/srv-a9.log`, `cache.rs:226`):**
+
+| quantity | value | note |
+|---|---|---|
+| snapshot bytes at chunk 2048 | **130,646,016 B** | exactly the table row above |
+| DtoH per snapshot, warm | **14.5 ms** | steady state |
+| DtoH per snapshot, first request of a process | **35 to 64 ms** | first-touch of the host pages |
+| HtoD per rollback | **12 to 13 ms** | 7.9 acceptance point 1 and 3 |
 
 **Where snapshots live:**
 
@@ -700,13 +860,7 @@ with `ring = ceil4(prompt_chunk + 4).min(context)` (`manager.rs:37-41`):
   (`manager.rs:122-170`).
 - Not the pinned tier: it is budgeted at 46 GiB against a measured ~48.5 GiB host ceiling
   (`geo.rs:110`).
-
-**Unmeasured:**
-
-- The **wall time of one snapshot copy is unmeasured**.
-- It is the first thing to measure in the plumbing task.
-- 115.60 MiB down and up per rollback is small against 24.13 s, but it sits inside the
-  request.
+- Allocated once at process start and reused per snapshot (`cache.rs:297`).
 
 **The formula holds for the default QSA layout only.**
 
@@ -722,8 +876,11 @@ with `ring = ceil4(prompt_chunk + 4).min(context)` (`manager.rs:37-41`):
 
 ### 7.8 What a cache miss actually costs
 
-- One number is measured and carries the section: **a full 16k prefill = 24.13 s wall**.
-- It is also the honest ceiling for every row of the table.
+- One number carries the section: **a full 16k prefill**.
+- Plan reference: **24.13 s wall** (chain F43, 2026-09-06; 24.19 s by chain F49 on the
+  installed build d211ab52ad2b).
+- This build: **21.6 to 22.0 s** (A9, #31, `decode_out/srv-a9.log`, cold turn 1, 16,064 ids).
+- It is also the honest ceiling for every row of the 7.3 table.
 - Reason: the four states are produced by **one interleaved 48-layer pass**.
 - Reason: there is no way to rebuild KV without also rebuilding the GDN fold.
 - Reason: there is no way to rebuild the GDN fold cheaply on its own.
@@ -737,42 +894,320 @@ Therefore:
 - the practical lever is **P**, and P is set by the GDN snapshot policy, not by KV. A
   design that caches KV and forgets GDN has a cache that is always cold.
 
+**What the built server actually pays per turn at 16k (A9, #31):**
+
+| turn | prompt ids | cached | prefilled | prefill wall |
+|---|---|---|---|---|
+| cold turn 1 | 16,064 | 0 | 16,064 | 21.6 to 22.0 s |
+| warm turn 2 | 16,159 | 16,064 (99.41 %) | 95 (0.59 %) | 404 ms |
+| rollback into the last turn | n/a | n/a | n/a | 12 to 13 ms HtoD |
+
+- `prompt_ms` on the wire is the `Engine::prefill` call only: it excludes the rollback, the
+  reset, the snapshots and the tokenizer (`serve.rs` module doc).
+- Consequence: a low `prompt_per_second` on a warm turn is a small-batch effect, not a
+  regression.
+
 ### 7.9 Acceptance
 
-- Section 7 approved by robin, as sections 0-6 were on 2026-09-02.
+- Section 7 approved by robin at M1 on 2026-09-09, as sections 0-6 were on 2026-09-02.
 - The A9 gate stands as written: **ids bit-identical to a cold run, twice**, greedy, with
   the default cold tier.
-- The first plumbing task measures, and records with its operating point:
-  1. snapshot copy time (DtoH and HtoD),
-  2. the warm-turn time for a 16k transcript whose next turn appends a short prompt,
-  3. the rollback time when the divergence lands inside the last turn.
+- The three measurements this section asked for, delivered by #31 A9:
 
-### 7.10 Open for robin (M1)
+| # | measurement | result | source |
+|---|---|---|---|
+| 1 | snapshot copy time, DtoH and HtoD | DtoH 14.5 ms warm, 35 to 64 ms on the first request; HtoD 12 to 13 ms | `decode_out/srv-a9.log` |
+| 2 | warm-turn time for a 16k transcript whose next turn appends a short prompt | prefill 404 ms, 16,064 of 16,159 ids cached (99.41 %) | `decode_out/srv-a9.log` |
+| 3 | rollback time when the divergence lands inside the last turn | 12 to 13 ms, `L` 16,172, `P` 16,159 | `decode_out/srv-a9.log` |
 
-1. **The prefill chunk must be pinned at load.**
-   - `apply_chunk_policy` runs *before* `Engine::load` and sizes the chunk from the one
-     prompt it is about to serve (`bin/decode.rs:147`).
-   - The chunk then fixes the QSA ring rows, the scratch, and the clamped N
-     (`manager.rs:31`, `manager.rs:108-170`).
-   - A server takes prompts of every length against one load, so it must pick **one** chunk
-     for the process lifetime.
-   - Candidate: chunk 2048 (the long-context operating point, N ~147, stream trickle),
-     `geo.rs:130-176`.
-   - Candidate: chunk 512 (N ~157, better on short prompts), `geo.rs:130-176`.
-   - Note: the source disagrees with itself about the chunk-2048 hot set.
-   - `geo.rs:157` says **N 147**; `geo.rs:132` says **140** for the same operating point.
-   - Neither is picked here: settling it is a measurement, not a doc edit.
-   - **Question: which one is the serve default?**
-2. **How many conversations are held, and how many snapshots each?**
-   - At 115.60 MiB per snapshot and 2 per conversation, four held conversations is ~0.9 GiB
-     of host RAM.
-   - That is against the 47 GiB `free_wait` threshold the chains already run into.
-3. **Is the post-answer snapshot (point 2 in 7.6) taken unconditionally**, i.e. does every
-   answer pay one DtoH of 115.60 MiB even when the conversation is never continued?
-4. **Concurrency.**
-   - Blocking single-request means a second request waits.
-   - Queue or reject?
-5. **Sampling.**
-   - A9 runs greedy (7.5).
-   - Is sampling out of scope for stage A, or does the server reseed `DevSampler::rng`
-     per request so a warm engine and a cold engine agree?
+- The A9 identity gate itself: part 1 cached 99.41 %, 2 of 2; part 2 identity 2 of 2, one
+  sha over 5 runs; part 3 rollback PASS 2 of 2 (`decode_out/srv-a9.log`,
+  `decode_out/srv-a9-fix.log`, same three shas).
+
+### 7.10 M1 decisions (answered by robin 2026-09-09, issue #1)
+
+| # | question of the proposal | decision | where it lives in the build |
+|---|---|---|---|
+| 1 | which prefill chunk is pinned for the process | **2048**, pinned at load; `geo::apply_chunk_policy` is NOT applied | `serve.rs:451` (`SERVE_CHUNK`), `serve.rs` module doc |
+| 2 | how many conversations are held, how many snapshots each | **ONE** conversation, **two** snapshots (249.19 MiB at chunk 2048) | `cache.rs:151` (`SLOTS`), `cache.rs` module doc |
+| 3 | is the post-answer snapshot taken unconditionally | **yes**, both points unconditional | `cache.rs` module doc, 7.6 |
+| 4 | concurrency: queue or reject | **a second request waits** in the accept queue, no 503 | `serve.rs` module doc, blocking `TcpListener` |
+| 5 | sampling: out of scope, or reseed per request | **reseeded per request**; the A9 identity gate runs **greedy** | `Engine::enable_dev_sampler`, `serve.rs:1043` (`sampler_from`) |
+
+**Note carried from the proposal, still open as a measurement, not a doc edit:**
+
+- `geo.rs:157` says hot set **N 147** for chunk 2048; `geo.rs:132` says **140** for the same
+  operating point.
+- The source disagrees with itself; settling it is a measurement.
+- The serve gates ran with the sidecar `decode_out/hotsets-M-longctx2100-n160.json`, so this
+  disagreement did not decide anything in stage A.
+
+### 7.11 The endpoint contract as built (stage A, #24 to #32)
+
+**Rule for this section: every row names the crow-nest anchor AND the `crow_core.py` reader.**
+
+- Crow's readers were read on 2026-09-09 from `C:\Users\robin\dev\Crow\cli\crow_core.py`
+  (worktrees under `.claude/worktrees/` excluded).
+- Line numbers are of that reading.
+
+**7.11.1 `GET /health`**
+
+| item | as built | crow-nest anchor | Crow reader |
+|---|---|---|---|
+| route | `GET /health`, query and trailing slash dropped | `serve.rs:497`, `serve.rs:772` | `crow_core.py:14801` (`health_url`) |
+| body | `{"status":"ok"}` | `serve.rs:1968` | `crow_core.py:14814` (`check_endpoint`) |
+
+**7.11.2 `GET /props`**
+
+| field | as built | crow-nest anchor | Crow reader |
+|---|---|---|---|
+| `model_path` | the container path of this load | `serve.rs:787` (`props_json`) | `crow_core.py:1408` (`server_model_path`) |
+| `model` | the container file stem, `.cnq` stripped | `serve.rs:780` (`model_name`) | `crow_core.py:14884` (`fetch_model_name`) |
+| `n_ctx` | `Engine::st.context`, read back from the load, 200,000 (`CONTEXT_FLOOR`) | `serve.rs:787` | `crow_core.py:14837` (`fetch_n_ctx`) |
+| `default_generation_settings.n_ctx` | the same number | `serve.rs:787` | `crow_core.py:14837` |
+| `modalities.vision` | `false` | `serve.rs:787` | `crow_core.py:1429` (`refuse_images`) |
+| `prompt_chunk` | 2048 (M1) | `serve.rs:787` | no reader in Crow, informational |
+| `build` | `crow-nest-engine 0.1.0` | `serve.rs:787` | no reader in Crow, informational |
+
+**7.11.3 `POST /v1/chat/completions`, request body**
+
+| field | as built | crow-nest anchor | Crow writer |
+|---|---|---|---|
+| `messages` | required, non empty, every entry needs a string `role` | `serve.rs:918` (`parse_chat`) | `crow_core.py:4672-4700` |
+| `model` | echoed into every chunk, default `crow-nest` | `serve.rs:918`, `serve.rs:1144` | `crow_core.py:4672-4700` |
+| `stream` | `true` streams; `false` or absent answers **501** | `serve.rs:918`, `serve.rs:1373` | `crow_core.py:4672-4700` (always `true`), `:2971` (digest path) |
+| `stream_options.include_usage` | `true` puts `usage` on the final chunk | `serve.rs:918`, `serve.rs:1222` | `crow_core.py:4672-4700` |
+| `timings_per_token` | `true` puts `timings` on the final chunk | `serve.rs:918`, `serve.rs:1222` | `crow_core.py:4672-4700` |
+| `max_tokens` | default 1024, capped at 32768, clamped to `n_ctx - prompt ids` | `serve.rs:1253` (`clamped_max_tokens`) | `crow_core.py:4672-4700` |
+| `temperature` | absent, `null` or `<= 0` is GREEDY; `> 0` samples | `serve.rs:1043` (`sampler_from`) | `crow_core.py:4672-4700` |
+| `top_p` | nucleus mass, default 0.8 (data sheet), read only when `temperature > 0` | `serve.rs:463`, `serve.rs:1043` | `crow_core.py:4672-4700` |
+| `top_k` | default 20 (data sheet), read only when `temperature > 0` | `serve.rs:465`, `serve.rs:1043` | not sent by Crow |
+| `presence_penalty` | default 1.5 (data sheet), read only when `temperature > 0` | `serve.rs:467`, `serve.rs:1043` | not sent by Crow |
+| `seed` | RNG seed of THIS request, default 0, reseeded per request (M1) | `serve.rs:469`, `serve.rs:1043` | not sent by Crow |
+| `min_p` | **ACCEPTED AND IGNORED**, one stderr line per request | `serve.rs:1043`, `serve.rs` module doc | `crow_core.py:4672-4700` (0.01 at Crow's operating point) |
+| `tools` | rendered as the template variable `tools` | `serve.rs:918`, `tokenizer::render_chat` | `crow_core.py:4672-4700`, `TOOLS` (31 declarations) |
+| `chat_template_kwargs.enable_thinking` | template variable, default false | `serve.rs:918` | `crow_core.py:2969` (digest path) |
+| `messages[].role = "tool"` | `content` rendered as `<tool_response>...</tool_response>` | `serve.rs:1284` (`normalize_messages`) | `crow_core.py` tool turns |
+| `messages[].tool_calls[].function.arguments` | a JSON STRING from Crow is parsed into the MAPPING the template needs | `serve.rs:1284` | `crow_core.py:3564` |
+| `tool_call_id` | carried, never read; this template pairs by order | `serve.rs:1284` | `crow_core.py` tool turns |
+
+**7.11.4 `POST /v1/chat/completions`, the stream**
+
+| order | line as built | crow-nest anchor | Crow reader |
+|---|---|---|---|
+| 1 | `delta:{"role":"assistant"}`, `finish_reason` null | `serve.rs:1168` (`chunk_role`) | `crow_core.py:4831-4877` |
+| 2..n | `delta:{"content":"..."}` , one per emitted piece | `serve.rs:1173` (`chunk_content`) | `crow_core.py:4831-4877` (`delta.content`) |
+| n+1 | `delta:{}` plus `finish_reason`, optionally `usage` and `timings` | `serve.rs:1222` (`chunk_finish`) | `crow_core.py:4831-4877`, `:4999-5018` |
+| n+2 | `data: [DONE]` | `serve.rs:471` (`SSE_DONE`) | `crow_core.py:4035` |
+| framing | `data: <compact json>` plus a blank line, one flush per frame | `serve.rs:1244` (`sse_frame`) | `crow_core.py:4831-4877` |
+| headers | `text/event-stream`, `no-cache`, `Connection: close`, no `Content-Length` | `serve.rs:1426` (`chat_stream`) | `crow_core.py:4821` (the train) |
+| `finish_reason` | `stop` (EOS), `length` (budget), `tool_calls` (a call was closed) | `serve.rs:1426` | `crow_core.py:4831-4877` |
+
+- One exception to "one token, one frame": a content token whose tail is a prefix of
+  `<tool_call>` is HELD until the next token resolves it (`engine/src/toolcall.rs`).
+- The concatenated content is the same either way; only the frame boundary moves.
+
+**7.11.5 `usage` and `timings` on the final chunk**
+
+| object | field | as built | crow-nest anchor | Crow reader |
+|---|---|---|---|---|
+| `usage` | `prompt_tokens` | rendered prompt ids, cached part included | `serve.rs:1111` (`usage_json`) | `crow_core.py:4831-4877` |
+| `usage` | `completion_tokens` | generated ids | `serve.rs:1111` | `crow_core.py:4831-4877` |
+| `usage` | `total_tokens` | `prompt_tokens + completion_tokens` | `serve.rs:1111` | `crow_core.py:4831-4877` |
+| `usage` | `prompt_tokens_details.cached_tokens` | `P`, ALWAYS present as an integer | `serve.rs:1111` | `crow_core.py:4831-4877`, fallback at `:14923` |
+| `timings` | `prompt_n` | `prompt_tokens - cached_tokens`, the ids actually prefilled | `serve.rs:1124` (`timings_json`) | `crow_core.py:4999-5018` |
+| `timings` | `prompt_ms` | wall of the `Engine::prefill` call only | `serve.rs:1124` | `crow_core.py:4999-5018` |
+| `timings` | `prompt_per_second` | `prompt_n / prompt_ms * 1000` | `serve.rs:1083` (`per_second`) | `crow_core.py:4999-5018` |
+| `timings` | `prompt_per_token_ms` | `prompt_ms / prompt_n` | `serve.rs:1092` | no reader in Crow |
+| `timings` | `predicted_n` | generated ids, **the prefill token included** (llama-server convention) | `serve.rs:1124` | `crow_core.py:4999-5018` |
+| `timings` | `predicted_ms` | wall of the decode loop, first `decode_step` to the last | `serve.rs:1124` | `crow_core.py:4999-5018` |
+| `timings` | `predicted_per_second` | `predicted_n / predicted_ms * 1000` | `serve.rs:1083` | `crow_core.py:4999-5018` |
+| `timings` | `predicted_per_token_ms` | `predicted_ms / predicted_n` | `serve.rs:1092` | no reader in Crow |
+| `timings` | `cache_n` | `P`, the same number as `cached_tokens` | `serve.rs:1124` | Crow's measuring tools |
+| `timings` | `crow_expert_selections` | u64, cumulative, `atomicAdd(&counters[0], 10ull)` per token per layer | `kernels.rs:2181`, launched `gen.rs:1866-1868` | Crow #54 rule, tools |
+| `timings` | `crow_expert_cold` | u64, cumulative, `atomicAdd(&counters[1], __popc(s_cold))` | `kernels.rs:2182` | Crow #54 rule, tools |
+| `timings` | `crow_ple_rows` | u64, cumulative, PLE rows requested | `gen.rs:1041` | Crow #54 rule, tools |
+| `timings` | `crow_ple_misses` | u64, cumulative, PLE rows filled from the container | `gen.rs:1042` | Crow #54 rule, tools |
+| `timings` | `crow_layers` | int, `geo::LAYERS` = 48, the divisor | `serve.rs:1124` | Crow #54 rule, tools |
+
+- Rule: the five `crow_*` counters are **cumulative per process and never reset**, in any
+  place, per request or otherwise (the Crow #54 rule).
+- Reason: a request-local value is the DIFFERENCE of two consecutive blocks; a reset would
+  break that for every reader at once.
+- They are read by `Engine::drain_counters` (`gen.rs:3235`, `residency.rs:638`), a
+  `dtoh_u64` of 48 x 2 u64 = 768 bytes; "drain" READS, it does not zero.
+- Measured cost of that read: **0.026 ms** per request (A8, #30, `decode_out/srv-a8.log`).
+- Two decode rates on purpose: stderr prints `(gen - 1) / decode_ms * 1000`, the wire prints
+  `gen / decode_ms * 1000`. Same `decode_ms`, different numerator, because `predicted_n`
+  counts the prefill token and Crow's reader expects that ratio.
+- Every rate is 0.0 when its ms is 0, negative or not finite; no NaN reaches the wire.
+
+**7.11.6 `tool_calls` on the wire (#29 A7)**
+
+| order | `delta` as built | crow-nest anchor | Crow reader |
+|---|---|---|---|
+| 1 | `{"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"...","arguments":""}}]}` | `serve.rs:1180` (`chunk_tool_open`) | `crow_core.py:4864-4877`, `:4869-4874` |
+| 2..n | `{"tool_calls":[{"index":0,"function":{"arguments":"<fragment>"}}]}` | `serve.rs:1202` (`chunk_tool_args`) | `crow_core.py:4864-4877` |
+| last | `{}` with `finish_reason":"tool_calls"` | `serve.rs:1222` | `crow_core.py:4831-4877` |
+
+- `id` and `name` ride on chunk 1 ONLY; Crow overwrites them only on a truthy value, so a
+  later chunk can never erase them.
+- The concatenation of every `arguments` fragment of one index is the arguments JSON text.
+- A second call gets `index` 1, a third `index` 2; each has its own `call_<index>`.
+- The model's markup is XML-like, NOT the JSON form:
+
+```text
+<tool_call>
+<function=read_file>
+<parameter=path>
+C:/x/y.md
+</parameter>
+</function>
+</tool_call>
+```
+
+- `<tool_call>` is added token 248058 and is matched by TOKEN ID; `</tool_call>` is 248059
+  and is matched by TEXT (`engine/src/toolcall.rs:264`).
+- The OpenAI `arguments` object is BUILT from the parameter blocks by declared schema type
+  (`toolcall.rs:280`).
+- EOS after `</function>` CLOSES the call: `finish_reason` `tool_calls`, trailing markup
+  dropped and counted, never replayed as content (`toolcall.rs:293`).
+- Malformed markup (no `</function>`, no name): the RAW markup goes out as `delta.content`,
+  `finish_reason` stays `stop` or `length`, `arguments` stays unterminated on purpose so
+  Crow's `json.loads` fails rather than running half a command.
+- Measured: `crow_core.TOOLS` holds **31** declarations (the plan said seven), and the
+  rendered tools block is byte-identical to the Python oracle at **322 ids** (A3 #25, A7 #29).
+
+**7.11.7 `GET /slots` and `POST /slots/0`**
+
+| item | as built | crow-nest anchor | Crow reader |
+|---|---|---|---|
+| `GET /slots` | `[{"id":0,"n_ctx":...,"n_prompt_tokens":...,"is_processing":false}]` | `serve.rs:812` (`slots_json`) | `tools/measure-slot-restart.ps1:87`, `tools/probe-slot-persistence.py:152` |
+| `n_prompt_tokens` | the held PREFILL CLEAN position, 0 while none is held | `serve.rs:812` | the same two tools, element 0 |
+| `POST /slots/0?action=save` | body `{"filename": "<bare name>"}` | `serve.rs:845` (`slot_filename`), `serve.rs:1855` (`slot_route`) | `crow_core.py:2458` |
+| save answer | `id_slot`, `filename`, **`n_saved`**, `n_written`, `timings.save_ms` | `serve.rs:822` (`slot_saved_json`) | `crow_core.py:2458` reads `n_saved` |
+| `POST /slots/0?action=restore` | body `{"filename": "<bare name>"}` | `serve.rs:845`, `serve.rs:1855` | `crow_core.py:2688` |
+| restore answer | `id_slot`, `filename`, **`n_restored`**, `n_read`, `timings.restore_ms` | `serve.rs:833` (`slot_restored_json`) | `crow_core.py:2688` reads `n_restored` |
+| the contract | `n_saved == n_restored`; Crow withdraws the warm-cache claim when they differ | `slot.rs`, `serve.rs` module doc | `crow_core.py:2694` |
+| `--slot-save-path <existing dir>` | required for both actions; a typo exits **2 at boot** | `serve.rs:577` (`check_slot_save_path`) | not read by Crow |
+| without `--slot-save-path` | both actions answer **400**, as llama-server refuses them | `serve.rs:1855` | not read by Crow |
+| `filename` | bare name only, allowlist `[A-Za-z0-9._-]`, Windows device names refused | `slot.rs:342` (`sanitize_filename`) | not read by Crow |
+
+- Only `n_saved` and `n_restored` are contractual; Crow reads nothing else of these bodies.
+- Both numbers are the PREFILL CLEAN position, so `SLOT_PROMPT`, never the answer.
+- Save is atomic (temp, fsync, rename); restore refuses every shape, content and size
+  mismatch BEFORE the first engine write (7.6, `slot.rs`).
+
+**7.11.8 Refusals and status codes**
+
+| case | answer | crow-nest anchor |
+|---|---|---|
+| unknown route, or a wrong method on a known path | 404 JSON naming every route this server answers | `serve.rs:855` (`not_found_json`), `serve.rs:495` (`route`) |
+| garbage request line | 400 JSON `{"error":"bad request"}` | `serve.rs:1751` (`read_head_from`) |
+| malformed or repeated `Content-Length` | 400 JSON | `serve.rs:1751` |
+| head (request line plus headers) over 64 KiB | 431 JSON, then close | `serve.rs:455`, `serve.rs:1751` |
+| body over 16 MiB | 413 JSON, then close | `serve.rs:457`, `serve.rs:1751` |
+| `Transfer-Encoding: chunked` | 501 JSON | `serve.rs:1751` |
+| `stream: false` or absent | 501 JSON | `serve.rs:1373` (`chat_route`) |
+| prompt ids `>= n_ctx` | 413 before any GPU work | `serve.rs:1253` (`clamped_max_tokens`) |
+| `/slots/0` save with no prefill-clean position held | 409 | `serve.rs:1855`, `slot.rs` |
+| `/slots/0` bad filename, missing file, shape or content mismatch | 400, engine untouched | `slot.rs:342`, `slot.rs:288` (`check_content`) |
+| a second `serve` process | non-zero exit on `engine/.engine.lock` | `serve.rs` module doc, `Engine::load` |
+| read or write timeout (10 s per connection) | one stderr line, that connection closed, accept loop continues | `serve.rs:453` |
+| a client that sent nothing | closed silently, no response | `serve.rs:1751` |
+
+- Measured (A2, #24): `engine/.engine.lock` is held for the process life and is **left
+  behind by a `Stop-Process` kill**; it must be removed by hand before the next engine run.
+
+**7.11.9 What is deliberately NOT built**
+
+| item | state | reason |
+|---|---|---|
+| `min_p` | parsed, ignored, logged once per request | the device sampler `sample_k` implements top_k, top_p and presence only; adding it is a kernel change. **Open for robin at M2** (#28) |
+| `stream: false` | 501 | no caller in Crow: `crow_core.py:4821` always streams |
+| `/tokenize` | not built | no caller in the client; the mentions in Crow's `CHANGELOG.md:1172`, `:1768` are measurement prose |
+| `/v1/models`, `/v1/messages` | not built | those are the REMOTE providers in Crow (`crow_core.py:13593`, `:13649`, `:13669`, `:3600-3610`), not the local server |
+| `/completion` | not built | appears only in Crow's log-parser test fixtures |
+| `/apply-template` | not built | only Crow's probes call it (`tools/probe_reasoning_levels.py:92`, `tools/check_chat_template.py:19`) |
+| `delta.reasoning_content` | never emitted | `enable_thinking` is false on this path; Crow reads the key if present (`crow_core.py:4831-4877`) |
+| hot-set adaptation in serve | never ticked | `serve` calls neither `trickle_tick` nor `adapt_tick`; `bin/decode.rs:216-228` is the only caller. One stderr line says so, so the `[policy]` line cannot mislead |
+| `CROW_QSA_FULL=1` | out of scope | 7.7, the ring would dominate every size |
+| `CROW_COLD_TIER` low-bit tier | must stay off | 7.5 condition 2 |
+
+**7.11.10 Two measured traps for a Crow-driven test (stage B)**
+
+| trap | evidence | consequence |
+|---|---|---|
+| Crow looks for the server binary at `<install>/bin/llama-server.exe` and builds a llama-server command line | `crow_core.py:1222`, `:1234` | Crow cannot BOOT crow-nest without a change to Crow; `--base-url` is enough for a test |
+| Crow's overbooking guard looks for processes `Name like 'llama-server%'` | `crow_core.py:1309` (`_PROCESS_QUERY`) | a running crow-nest server is INVISIBLE to it; no llama-server may run during stage B, and that is checked before every run, not assumed |
+
+**7.11.11 The tokenizer and the template behind every chat request (#25 A3)**
+
+| item | as built | evidence |
+|---|---|---|
+| tokenizer | in-engine (`crow_nest_engine::tokenizer`), no Python process is started | A3 #25 |
+| template | minijinja, the model's own `tokenizer_config.json` chat template | A3 #25 |
+| gate | ids identical to the Python oracle on **10 of 10** prompts, plus a 6 of 6 docs file | `decode_out/srv-a3-tok.log`, `srv-a3-rust-ids.json`, `srv-a3-oracle-ids.json` |
+| tools render | byte-identical to the oracle at **322 ids**, but ONLY with `preserve_order` on serde_json AND on minijinja | A3 #25 |
+| warm-up | the tokenizer loads right after argument parsing, BEFORE `cuda::Ctx::init`; failure exits 3 in a second | `serve.rs` module doc |
+| subcommand | `serve tokenize --chat\|--raw` runs without CUDA and without `engine/.engine.lock` | `serve.rs` module doc |
+| harness trap | the Python oracle decodes STDIN as cp1252 unless `PYTHONIOENCODING=utf-8` is set; 4 of 10 prompts are affected when it is bare | issue #34 |
+
+**7.11.12 Open items for M2 (not decided here)**
+
+| # | item | state | source |
+|---|---|---|---|
+| 1 | `min_p` in the device sampler | accepted and ignored; kernel change or drop it from Crow's profile | #28 |
+| 2 | serve decode rate | serve reaches **18 to 23 tok/s** where `decode run` reaches **35.7 tok/s** on the same prompt; prefill is equal (662.33 vs 664.08 tok/s, -0.26 %); **cause unmeasured** | #35, `decode_out/srv-a5.log` |
+| 3 | the after-answer snapshot slot | keep (M1), drop, or reassign to the previous turn's after-prompt snapshot | #31, 7.6 |
+
+- Rule: none of the three is decided in this document.
+
+### 7.12 The stage A gate table (what was measured, and where the artefact is)
+
+**Rule: a gate without a log artefact does not count.**
+
+| task | issue | what its gate measured | artefact under `decode_out/` |
+|---|---|---|---|
+| A1 | #23 | this section written, reviewed, approved | none (documentation) |
+| A2 | #24 | `/health` and `/props` through Crow's own readers 4 of 4, lock 1 of 1, 404/400/413/431/timeout | `srv-a2.log`, `srv-a2.stderr.log`, `srv-a2-fix.stderr.log` |
+| A3 | #25 | in-engine tokenizer vs the Python oracle, ids identical 10 of 10 prompts, tools block 322 ids byte-identical | `srv-a3-tok.log`, `srv-a3-rust-ids.json`, `srv-a3-oracle-ids.json` |
+| A4 | #26 | SSE stream through `crow_core.stream_reply`, two identical requests in one process give the fresh-process ids (4 of 4, t3-debug 2 of 2) | `srv-a4-gateA.log`, `srv-a4-gateB-procA.log`, `srv-a4-gateB-procB.log`, `srv-a4-fix.log`, `srv-a4-parity.log` |
+| A5 | #27 | the eight `usage` and `timings` fields, totals 16,072 = 16,064 + 8, control serve 662.33 vs `decode run` 664.08 tok/s | `srv-a5.log`, `srv-a5-decoderun.log` |
+| A6 | #28 | greedy identity 1 of 1, seed 7 warm equals cold 2 of 2, seed 8 differs, `finish_reason` 10 of 10 | `srv-a6.log`, `srv-a6-fix.log` |
+| A7 | #29 | a real tool call in 24 fragments with `finish_reason` `tool_calls`, control without tools `stop`, identity 64 of 64 | `srv-a7.log`, `srv-a7-fix.log` |
+| A8 | #30 | the five `crow_*` counters monotone 10 of 10, delta 2 to 3 = +22,560, fresh process starts at 0, read 0.026 ms | `srv-a8.log` |
+| A9 | #31 | prefix cache: cached 99.41 %, warm ids bit-identical to cold 2 of 2, rollback 2 of 2, snapshot 130,646,016 B | `srv-a9.log`, `srv-a9-fix.log`, `srv-a9-control.log`, `srv-a9-chunkcut.log`, `srv-a9-probe.log` |
+| A10 | #32 | slot file save and restore across processes, 30 of 30 then 22 of 22, `n_saved` = `n_restored` = 16,064, six refusals 4xx with a working chat after | `srv-a10.log`, `srv-a10-fix.log`, `srv-a10-smoke.log` |
+| A11 | #33 | this section corrected, `cargo test` in engine and converter, parity 8 / 512 twice / 1024 against the installed build | `srv-a11.log` |
+
+**The server-path unit tests the A11 gate names (existing since A2 to A9):**
+
+| category | test | file:line |
+|---|---|---|
+| request parsing | `the_two_stream_flags_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:2790` |
+| request parsing | `tools_and_tool_turns_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:2933` |
+| SSE framing | `an_sse_frame_is_one_data_line_and_a_blank_line` | `engine/src/bin/serve.rs:2819` |
+| prefix length determination | `common_prefix_stops_at_the_first_difference` | `engine/src/cache.rs:521` |
+| prefix length determination | `the_newest_snapshot_at_or_below_l_wins` | `engine/src/cache.rs:553` |
+
+- Counts at commit 9054592: engine lib **79 of 79**, `bin/serve` **52 of 52**, every other
+  binary 0 tests, doc-tests 0; converter **7 of 7**.
+- Commands: `cd engine && cargo test --release --target-dir target_srv`, and
+  `cd converter && cargo test --release`.
+
+**The parity rule after every rebuild (falls out of trap F44):**
+
+| rule | reason |
+|---|---|
+| a rebuild of the same source has a different sha and is therefore **ungated** | the sha is what a gate names, not the source |
+| parity runs **8, 512 and 1024** ids against the installed `engine/target/release/decode.exe` | three prompt lengths cross the chunk and selection regimes |
+| the **512 run twice**, and the two candidate runs compared against each other | one green run does not prove the absence of a race |
+| the candidate binary is built into its own target directory (`engine/target_srv/`) | never build under a running chain; `engine/target/release` is the reference and is not touched |
+| the comparison is `cmp` of `gpu-logits.f32`, byte for byte | rows are `ids + 4`: 12, 516, 1028 |
+| environment of both arms | `CROW_GRAPH=1`, `CROW_MMA=1`, `CROW_CNQ`, `CROW_HOTSETS` set, `CROW_ADAPT` unset |
+| a green identity gate is separate | greedy ids of a warm run against a cold run, twice |
+
+- Rule: the server work must not move the decode path, and "nothing in the kernels changed"
+  is not evidence of that.
+- Reason: the PLE bug of epic #1 stayed hidden for two days behind exactly that sentence.
