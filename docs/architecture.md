@@ -653,7 +653,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - Built: `Engine::enable_dev_sampler` runs for EVERY sampled request and uploads
   `Rng::new(seed)`, so request k starts cold (M1 decision, robin 2026-09-09).
 - Built: a greedy request PARKS the sampler in `Srv::parked_sampler`, so it cannot sample
-  silently (`serve.rs:1845` the field, `serve.rs:1527` park, `serve.rs:1510` hand back).
+  silently (`serve.rs:2065` the field, `serve.rs:1746` park, `serve.rs:1729` hand back).
 - Measured: seed 7 warm equals seed 7 cold, 2 of 2; seed 8 differs; greedy between two
   sampled requests still identical (`decode_out/srv-a6.log`, `decode_out/srv-a6-fix.log`).
 - Rule: A9 runs greedy (M1 decision).
@@ -947,7 +947,7 @@ Therefore:
 
 | # | question of the proposal | decision | where it lives in the build |
 |---|---|---|---|
-| 1 | which prefill chunk is pinned for the process | **2048**, pinned at load; `geo::apply_chunk_policy` is NOT applied | `serve.rs:451` (`SERVE_CHUNK`), `serve.rs` module doc |
+| 1 | which prefill chunk is pinned for the process | **2048**, pinned at load; `geo::apply_chunk_policy` is NOT applied | `serve.rs:449` (`SERVE_CHUNK`), `serve.rs` module doc |
 | 2 | how many conversations are held, how many snapshots each | **ONE** conversation, **two** snapshots (249.19 MiB at chunk 2048) | `cache.rs:162` (`SLOTS`), `cache.rs` module doc |
 | 3 | is the post-answer snapshot taken unconditionally | **yes**, both points unconditional | `cache.rs` module doc, 7.6 |
 | 4 | concurrency: queue or reject | **a second request waits** in the accept queue, no 503 | `serve.rs` module doc, blocking `TcpListener` |
@@ -976,8 +976,8 @@ Therefore:
 
 | item | as built | crow-nest anchor | Crow reader |
 |---|---|---|---|
-| route | `GET /health`, query and trailing slash dropped | `serve.rs:497`, `serve.rs:772` | `crow_core.py:14801` (`health_url`) |
-| body | `{"status":"ok"}` | `serve.rs:1968` | `crow_core.py:14814` (`check_endpoint`) |
+| route | `GET /health`, query and trailing slash dropped | `serve.rs:495`, `serve.rs:772` | `crow_core.py:14801` (`health_url`) |
+| body | `{"status":"ok"}` | `serve.rs:2188` | `crow_core.py:14814` (`check_endpoint`) |
 
 **7.11.2 `GET /props`**
 
@@ -1002,11 +1002,11 @@ Therefore:
 | `timings_per_token` | `true` puts `timings` on the final chunk | `serve.rs:918`, `serve.rs:1222` | `crow_core.py:4672-4700` |
 | `max_tokens` | default 1024, capped at 32768, clamped to `n_ctx - prompt ids` | `serve.rs:1253` (`clamped_max_tokens`) | `crow_core.py:4672-4700` |
 | `temperature` | absent, `null` or `<= 0` is GREEDY; `> 0` samples | `serve.rs:1043` (`sampler_from`) | `crow_core.py:4672-4700` |
-| `top_p` | nucleus mass, default 0.8 (data sheet), read only when `temperature > 0` | `serve.rs:463`, `serve.rs:1043` | `crow_core.py:4672-4700` |
-| `top_k` | default 20 (data sheet), read only when `temperature > 0` | `serve.rs:465`, `serve.rs:1043` | not sent by Crow |
-| `presence_penalty` | default 1.5 (data sheet), read only when `temperature > 0` | `serve.rs:467`, `serve.rs:1043` | not sent by Crow |
-| `seed` | RNG seed of THIS request, default 0, reseeded per request (M1) | `serve.rs:469`, `serve.rs:1043` | not sent by Crow |
-| `min_p` | **ACCEPTED AND IGNORED**, one stderr line per request | `serve.rs:1532` (the stderr line); `sampler_from` (`serve.rs:1043`) carries no `min_p`; `serve.rs` module doc | `crow_core.py:4672-4700` (0.01 at Crow's operating point) |
+| `top_p` | nucleus mass, default 0.8 (data sheet), read only when `temperature > 0` | `serve.rs:461`, `serve.rs:1043` | `crow_core.py:4672-4700` |
+| `top_k` | default 20 (data sheet), read only when `temperature > 0` | `serve.rs:463`, `serve.rs:1043` | not sent by Crow |
+| `presence_penalty` | default 1.5 (data sheet), read only when `temperature > 0` | `serve.rs:465`, `serve.rs:1043` | not sent by Crow |
+| `seed` | RNG seed of THIS request, default 0, reseeded per request (M1) | `serve.rs:467`, `serve.rs:1043` | not sent by Crow |
+| `min_p` | **ACCEPTED AND IGNORED**, one stderr line per request | `serve.rs:1751` (the stderr line); `sampler_from` (`serve.rs:1043`) carries no `min_p`; `serve.rs` module doc | `crow_core.py:4672-4700` (0.01 at Crow's operating point) |
 | `tools` | rendered as the template variable `tools` | `serve.rs:918`, `tokenizer::render_chat` | `crow_core.py:4672-4700`, `TOOLS` (25 builtin at `crow_core.py:579-838`, frozen at `:846`, plus the `mcp.json` tools added at import, `:841`) |
 | `chat_template_kwargs.enable_thinking` | template variable, default false | `serve.rs:918` | `crow_core.py:2970` (digest path) |
 | `messages[].role = "tool"` | `content` rendered as `<tool_response>...</tool_response>` | `serve.rs:1284` (`normalize_messages`) | `crow_core.py` tool turns |
@@ -1022,8 +1022,8 @@ Therefore:
 | n+1 | `delta:{}` plus `finish_reason`, optionally `usage` and `timings` | `serve.rs:1222` (`chunk_finish`) | `crow_core.py:4831-4877`, `:4999-5018` |
 | n+2 | `data: [DONE]` | `serve.rs:471` (`SSE_DONE`) | `crow_core.py:4035` |
 | framing | `data: <compact json>` plus a blank line, one flush per frame | `serve.rs:1244` (`sse_frame`) | `crow_core.py:4831-4877` |
-| headers | `text/event-stream`, `no-cache`, `Connection: close`, no `Content-Length` | `serve.rs:1426` (`chat_stream`) | `crow_core.py:4821` (the train) |
-| `finish_reason` | `stop` (EOS), `length` (budget), `tool_calls` (a call was closed) | `serve.rs:1426` | `crow_core.py:4831-4877` |
+| headers | `text/event-stream`, `no-cache`, `Connection: close`, no `Content-Length` | `serve.rs:1580` (`chat_stream`) | `crow_core.py:4821` (the train) |
+| `finish_reason` | `stop` (EOS), `length` (budget), `tool_calls` (a call was closed) | `serve.rs:1580` | `crow_core.py:4831-4877` |
 
 - One exception to "one token, one frame": a content token whose tail is a prefix of
   `<tool_call>` is HELD until the next token resolves it (`engine/src/toolcall.rs`).
@@ -1034,14 +1034,14 @@ Therefore:
 | object | field | as built | crow-nest anchor | Crow reader |
 |---|---|---|---|---|
 | `usage` | `prompt_tokens` | rendered prompt ids, cached part included | `serve.rs:1111` (`usage_json`) | `crow_core.py:4831-4877` |
-| `usage` | `completion_tokens` | generated ids, **the prefill token included**: it is `t.predicted_n` itself (`serve.rs:1114`), the same value as `timings.predicted_n` | `serve.rs:1111` | `crow_core.py:4831-4877` |
+| `usage` | `completion_tokens` | generated ids, **the prefill token included**: it is `t.predicted_n` itself (`serve.rs:1112`), the same value as `timings.predicted_n` | `serve.rs:1111` | `crow_core.py:4831-4877` |
 | `usage` | `total_tokens` | `prompt_tokens + completion_tokens` | `serve.rs:1111` | `crow_core.py:4831-4877` |
 | `usage` | `prompt_tokens_details.cached_tokens` | `P`, ALWAYS present as an integer | `serve.rs:1111` | `crow_core.py:4831-4877`, fallback at `:14923` |
 | `timings` | `prompt_n` | `prompt_tokens - cached_tokens`, the ids actually prefilled | `serve.rs:1124` (`timings_json`) | `crow_core.py:4999-5018` |
 | `timings` | `prompt_ms` | wall of the `Engine::prefill` call only | `serve.rs:1124` | `crow_core.py:4999-5018` |
 | `timings` | `prompt_per_second` | `prompt_n / prompt_ms * 1000` | `serve.rs:1083` (`per_second`) | `crow_core.py:4999-5018` |
 | `timings` | `prompt_per_token_ms` | `prompt_ms / prompt_n` | `serve.rs:1092` | no reader in Crow |
-| `timings` | `predicted_n` | generated ids, **the prefill token included** (llama-server convention); the same value as `usage.completion_tokens` (`serve.rs:1114`, `serve.rs:1130`) | `serve.rs:1124` | `crow_core.py:4999-5018` |
+| `timings` | `predicted_n` | generated ids, **the prefill token included** (llama-server convention); the same value as `usage.completion_tokens` (`serve.rs:1112`, `serve.rs:1128`) | `serve.rs:1124` | `crow_core.py:4999-5018` |
 | `timings` | `predicted_ms` | wall of the decode loop, first `decode_step` to the last | `serve.rs:1124` | `crow_core.py:4999-5018` |
 | `timings` | `predicted_per_second` | `predicted_n / predicted_ms * 1000` | `serve.rs:1083` | `crow_core.py:4999-5018` |
 | `timings` | `predicted_per_token_ms` | `predicted_ms / predicted_n` | `serve.rs:1092` | no reader in Crow |
@@ -1113,13 +1113,13 @@ C:/x/y.md
 |---|---|---|---|
 | `GET /slots` | `[{"id":0,"n_ctx":...,"n_prompt_tokens":...,"is_processing":false}]` | `serve.rs:812` (`slots_json`) | `tools/measure-slot-restart.ps1:87`, `tools/probe-slot-persistence.py:152` |
 | `n_prompt_tokens` | the held PREFILL CLEAN position, 0 while none is held | `serve.rs:812` | the same two tools, element 0 |
-| `POST /slots/0?action=save` | body `{"filename": "<bare name>"}` | `serve.rs:845` (`slot_filename`), `serve.rs:1855` (`slot_route`) | `crow_core.py:2458` |
+| `POST /slots/0?action=save` | body `{"filename": "<bare name>"}` | `serve.rs:845` (`slot_filename`), `serve.rs:2075` (`slot_route`) | `crow_core.py:2458` |
 | save answer | `id_slot`, `filename`, **`n_saved`**, `n_written`, `timings.save_ms` | `serve.rs:822` (`slot_saved_json`) | `crow_core.py:2458` reads `n_saved` |
-| `POST /slots/0?action=restore` | body `{"filename": "<bare name>"}` | `serve.rs:845`, `serve.rs:1855` | `crow_core.py:2688` |
+| `POST /slots/0?action=restore` | body `{"filename": "<bare name>"}` | `serve.rs:845`, `serve.rs:2075` | `crow_core.py:2688` |
 | restore answer | `id_slot`, `filename`, **`n_restored`**, `n_read`, `timings.restore_ms` | `serve.rs:833` (`slot_restored_json`) | `crow_core.py:2688` reads `n_restored` |
 | the contract | `n_saved == n_restored`; Crow withdraws the warm-cache claim when they differ | `slot.rs`, `serve.rs` module doc | `crow_core.py:2694` |
 | `--slot-save-path <existing dir>` | required for both actions; a typo exits **2 at boot** | `serve.rs:577` (`check_slot_save_path`) | not read by Crow |
-| without `--slot-save-path` | both actions answer **400**, as llama-server refuses them | `serve.rs:1855` | not read by Crow |
+| without `--slot-save-path` | both actions answer **400**, as llama-server refuses them | `serve.rs:2075` | not read by Crow |
 | `filename` | bare name only, allowlist `[A-Za-z0-9._-]`, Windows device names refused | `slot.rs:342` (`sanitize_filename`) | not read by Crow |
 
 - Only `n_saved` and `n_restored` are contractual; Crow reads nothing else of these bodies.
@@ -1132,18 +1132,18 @@ C:/x/y.md
 | case | answer | crow-nest anchor |
 |---|---|---|
 | unknown route, or a wrong method on a known path | 404 JSON naming every route this server answers | `serve.rs:855` (`not_found_json`), `serve.rs:495` (`route`) |
-| garbage request line | 400 JSON `{"error":"bad request"}` | `serve.rs:1751` (`read_head_from`) |
-| malformed or repeated `Content-Length` | 400 JSON | `serve.rs:1751` |
-| head (request line plus headers) over 64 KiB | 431 JSON, then close | `serve.rs:455`, `serve.rs:1751` |
-| body over 16 MiB | 413 JSON, then close | `serve.rs:457`, `serve.rs:1751` |
-| `Transfer-Encoding: chunked` | 501 JSON | `serve.rs:1751` |
+| garbage request line | 400 JSON `{"error":"bad request"}` | `serve.rs:1971` (`read_head_from`) |
+| malformed or repeated `Content-Length` | 400 JSON | `serve.rs:1971` |
+| head (request line plus headers) over 64 KiB | 431 JSON, then close | `serve.rs:453`, `serve.rs:1971` |
+| body over 16 MiB | 413 JSON, then close | `serve.rs:455`, `serve.rs:1971` |
+| `Transfer-Encoding: chunked` | 501 JSON | `serve.rs:1971` |
 | `stream: false` or absent | **200, one `chat.completion` document** (501 until #39) | `serve.rs:1570` (`chat_route` branch), `serve.rs:1606` (`chat_document`) |
 | prompt ids `>= n_ctx` | 413 before any GPU work | `serve.rs:1253` (`clamped_max_tokens`) |
-| `/slots/0` save with no prefill-clean position held | 409 | `serve.rs:1855`, `slot.rs` |
+| `/slots/0` save with no prefill-clean position held | 409 | `serve.rs:2075`, `slot.rs` |
 | `/slots/0` bad filename, missing file, shape or content mismatch | 400, engine untouched | `slot.rs:342`, `slot.rs:288` (`check_content`) |
 | a second `serve` process | non-zero exit on `engine/.engine.lock` | `serve.rs` module doc, `Engine::load` |
-| read or write timeout (10 s per connection) | one stderr line, that connection closed, accept loop continues | `serve.rs:453` |
-| a client that sent nothing | closed silently, no response | `serve.rs:1751` |
+| read or write timeout (10 s per connection) | one stderr line, that connection closed, accept loop continues | `serve.rs:451` |
+| a client that sent nothing | closed silently, no response | `serve.rs:1971` |
 
 - Measured (A2, #24): `engine/.engine.lock` is held for the process life and is **left
   behind by a `Stop-Process` kill**; it must be removed by hand before the next engine run.
@@ -1215,7 +1215,7 @@ C:/x/y.md
 | `choices[0].finish_reason` | `stop`, `length` or `tool_calls`, the stream's rules unchanged | `serve.rs:1648` | `probe-suite.py:678` |
 | `usage` | `usage_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1109` (`usage_json`), `serve.rs:1477` | `probe-suite.py:681-683` (`completion_tokens`) |
 | `timings` | `timings_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1122` (`timings_json`), `serve.rs:1477` | neither caller reads it |
-| headers | `application/json`, `Content-Length`, `Connection: close`, as on every other JSON route | `serve.rs:1606` (`chat_document`), `serve.rs:1938` (`respond`) | `urllib.request` in both callers |
+| headers | `application/json`, `Content-Length`, `Connection: close`, as on every other JSON route | `serve.rs:1606` (`chat_document`), `serve.rs:1947` (`respond`) | `urllib.request` in both callers |
 
 **The decisions #39 took, and why:**
 
@@ -1272,9 +1272,9 @@ C:/x/y.md
 
 | category | test | file:line |
 |---|---|---|
-| request parsing | `the_two_stream_flags_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:3003` |
-| request parsing | `tools_and_tool_turns_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:3146` |
-| SSE framing | `an_sse_frame_is_one_data_line_and_a_blank_line` | `engine/src/bin/serve.rs:3032` |
+| request parsing | `the_two_stream_flags_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:3012` |
+| request parsing | `tools_and_tool_turns_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:3155` |
+| SSE framing | `an_sse_frame_is_one_data_line_and_a_blank_line` | `engine/src/bin/serve.rs:3041` |
 | prefix length determination | `common_prefix_stops_at_the_first_difference` | `engine/src/cache.rs:526` |
 | prefix length determination | `the_newest_snapshot_at_or_below_l_wins` | `engine/src/cache.rs:558` |
 | one slot per process | `the_process_holds_one_slot_and_one_reuse_candidate` | `engine/src/cache.rs:732` |
@@ -1289,11 +1289,11 @@ C:/x/y.md
 
 | category | test | file:line |
 |---|---|---|
-| document builder | `the_non_streaming_document_carries_every_field_the_probe_suite_reads` | `engine/src/bin/serve.rs:3566` |
-| document builder | `the_non_streaming_document_carries_the_tool_calls_the_parser_closed` | `engine/src/bin/serve.rs:3605` |
-| sink equivalence | `the_collector_and_the_sse_sink_see_the_same_delta_sequence` | `engine/src/bin/serve.rs:3630` |
-| request parsing | `the_two_callers_that_send_no_stream_field_parse_as_non_streaming` | `engine/src/bin/serve.rs:3696` |
-| collector | `the_collector_holds_one_buffer_per_tool_call_index` | `engine/src/bin/serve.rs:3724` |
+| document builder | `the_non_streaming_document_carries_every_field_the_probe_suite_reads` | `engine/src/bin/serve.rs:3575` |
+| document builder | `the_non_streaming_document_carries_the_tool_calls_the_parser_closed` | `engine/src/bin/serve.rs:3614` |
+| sink equivalence | `the_collector_and_the_sse_sink_see_the_same_delta_sequence` | `engine/src/bin/serve.rs:3639` |
+| request parsing | `the_two_callers_that_send_no_stream_field_parse_as_non_streaming` | `engine/src/bin/serve.rs:3705` |
+| collector | `the_collector_holds_one_buffer_per_tool_call_index` | `engine/src/bin/serve.rs:3733` |
 
 - Counts after B3a (#39): engine lib **80 of 80**, `bin/serve` **57 of 57** (the five new
   tests above), every other binary 0 tests, doc-tests 0; converter untouched. The warning
