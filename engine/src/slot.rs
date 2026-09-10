@@ -104,7 +104,6 @@
 //! |---|---|
 //! | `cuda::sync`, `Engine::drop_decode_graph` | the A4 ordering, as `cache::PrefixCache::rollback` |
 //! | host slot `SLOT_PROMPT` filled, `prefill_clean = true` | the file becomes a reuse candidate |
-//! | host slot `SLOT_ANSWER` cleared | nothing claims a position this process never wrote |
 //! | KV rows and pooled blocks uploaded | the absolutely addressed part of the state |
 //! | `Engine::pos`, `done_blocks`, `history`, `route_log` | the host triple `rollback` also sets |
 //!

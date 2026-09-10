@@ -375,11 +375,11 @@
 //! - `L` = longest common id prefix of the request and `Engine::history`, ids only.
 //! - `P` = the newest snapshot position at or below `L`, and below the request length.
 //! - `P` found: `PrefixCache::rollback` restores the state, `prefill` gets `ids[P..]`.
-//! - No such snapshot: `Engine::reset_to_zero`, both slots dropped, the whole prompt prefilled.
-//! - Two snapshots per request, both unconditional (M1): after the prompt, after the answer.
-//! - Only the PROMPT snapshot is a reuse candidate (#31 A9 gate part 3, measured):
-//!   `decode_step` rows are not bit equal to prefill rows at the same positions, and
-//!   spec 7.5 says recompute where the correct state cannot be proven present.
+//! - No such snapshot: `Engine::reset_to_zero`, the slot dropped, the whole prompt prefilled.
+//! - ONE snapshot per request, unconditional (M2b, robin 2026-09-10, #36): after the prompt.
+//! - The after-answer snapshot of M1 is DROPPED: `decode_step` rows are not bit equal to
+//!   prefill rows at the same positions (#31 A9 gate part 3, measured), so it was never a
+//!   reuse candidate, and spec 7.5 says recompute where the state cannot be proven present.
 //! - What is copied, what is not, the induction and the evidence: `engine/src/cache.rs`.
 //! - The reset field list and its evidence: `engine/src/reset.rs`.
 //! - A write error aborts the generation loop; the next request rolls back or resets first.
@@ -391,23 +391,21 @@
 //! |---|---|
 //! | `[cache] WARM\|COLD L .., P .., snapshots [..], reusable [..], prefill n of m tok, reset X ms` | the decision and the HtoD wall |
 //! | `[cache] snapshot point 1 (after prompt) at pos .., DtoH X ms` | point 1 of spec 7.6 |
-//! | `[cache] snapshot point 2 (after answer) at pos .., DtoH X ms, slots [..]` | point 2 of spec 7.6 |
 //!
 //! - `reset X ms` is the ONE number the `[chat]` line also calls `reset`: the rollback of a
 //!   warm request or the `reset_to_zero` of a cold one, whichever ran.
 //! - With `CROW_PREFIX_CACHE=0` the first line prints `L n/a`, because `decide` returns
-//!   before it computes `L`, and the two snapshot lines are not printed at all.
+//!   before it computes `L`, and the snapshot line is not printed at all.
 //!
 //! - One stderr line per request: prompt tokens (cached and prefilled), generated tokens,
 //!   prefill ms, decode ms.
 //! - One stderr line per request with the generated ids, for the A4 and A9 identity gates.
-//! - The point 2 snapshot runs AFTER `data: [DONE]`, so no client waits for its copy.
 //!
 //! What the second turn of a real Crow conversation actually hits (#31 A9, measured):
 //!
 //! - The transcript is re-rendered through the chat template every turn.
 //! - The re-rendered assistant message need not reproduce the generated ids exactly.
-//! - The rollback lands on point 1 in either case, because point 2 is not a candidate.
+//! - The rollback lands on the prompt snapshot in either case; it is the only slot.
 //! - That is the rule working, not a special case: the prompt prefill is still spared.
 //!
 //! The slot file across processes (#32 A10, `crow_core.py:2458`, `:2688`):
@@ -427,13 +425,13 @@
 //! - `n_prompt_tokens` of `GET /slots` is the same number, 0 while nothing is held.
 //! - `GET /slots` is read by Crow's tools only (`tools/measure-slot-restart.ps1:87`,
 //!   `tools/probe-slot-persistence.py:152`), which take element 0 of the array.
-//! - A restore fills `SLOT_PROMPT`, clears `SLOT_ANSWER` and sets `pos`, `done_blocks`, `history`.
+//! - A restore fills `SLOT_PROMPT` and sets `pos`, `done_blocks`, `history`.
 //! - So the NEXT chat request is an ordinary A9 warm turn: `L >= pos`, `P = pos`, one rollback.
 //! - There is no second warm path; the tested one is the only one.
 //! - A refusal answers 4xx with a JSON error body and leaves the engine exactly as it was.
 //! - `--slot-save-path` must name an EXISTING directory; a typo refuses the BOOT, not the save.
 
-use crow_nest_engine::cache::{PrefixCache, SLOT_ANSWER, SLOT_PROMPT};
+use crow_nest_engine::cache::{PrefixCache, SLOTS, SLOT_PROMPT};
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::{DevSampler, Engine};
 use crow_nest_engine::geo::{apply_adapt_policy, Config, CONTEXT_FLOOR, LAYERS};
@@ -1421,7 +1419,7 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
 /// - prefill, then greedy decode, one flushed SSE frame per emitted delta
 /// - #31 A9: the prefix cache decides FIRST (spec 7.4); a warm request rolls back to `P`
 ///   and prefills `ids[P..]`, a cold one runs `reset_to_zero` and prefills everything
-/// - two snapshots per request, both unconditional (M1): after the prompt, after the answer
+/// - ONE snapshot per request, unconditional (M2b, #36): after the prompt
 /// - a write error breaks the loop; the next request rolls back or resets before any prefill
 fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]) -> &'static str {
     let tk = match crow_nest_engine::tokenizer::global() {
@@ -1457,8 +1455,8 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
             unsafe { srv.cache.rollback(srv.eng, slot) };
             p
         }
-        // cold: no snapshot at or below L, so the whole state goes back to 0 (A4). Both
-        // slots are dropped with it: their positions name a history this process discards.
+        // cold: no snapshot at or below L, so the whole state goes back to 0 (A4). The
+        // slot is dropped with it: its position names a history this process discards.
         None => {
             unsafe { srv.eng.reset_to_zero() };
             srv.cache.invalidate();
@@ -1676,20 +1674,11 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
         let _ = sse_send(stream, &sse_frame(&last)) && sse_send(stream, SSE_DONE);
     }
 
-    // #31 A9: spec 7.6 point 2, after the generated answer, unconditional (M1). It runs
-    // AFTER the last SSE frame, so no client waits for the copy. The LAST generated id is
-    // never fed back into the engine, so `pos` is prompt length + generated - 1.
-    // NOT prefill clean: `decode_step` wrote every row of the answer, and those rows are
-    // not bit equal to the rows a prefill writes at the same positions (measured, `cache.rs`)
-    let snap2_ms = unsafe { srv.cache.snapshot(srv.eng, SLOT_ANSWER, false) };
-    // a disabled cache copies nothing, so it reports nothing either
-    if cache_on {
-        eprintln!(
-            "[cache] snapshot point 2 (after answer) at pos {}, DtoH {snap2_ms:.3} ms, slots {:?}",
-            srv.eng.pos,
-            srv.cache.positions()
-        );
-    }
+    // #36 M2b (robin 2026-09-10): the after-answer snapshot of M1 is GONE from here.
+    // `decode_step` wrote every row of the answer, those rows are not bit equal to the
+    // prefill rows at the same positions (#31 A9), so that slot was taken on every request
+    // and consumed on none. Dropping it saves 130,646,016 B of pageable host RAM per
+    // process and one 14.5 ms DtoH per request. The reuse behaviour is unchanged.
 
     // #27 doc: the tok/s below is (gen - 1) / decode_ms, the wire's
     // `timings.predicted_per_second` is gen / decode_ms. Both are correct for what they name:
@@ -1843,7 +1832,7 @@ struct Srv<'a> {
     /// #28: the device sampler while a GREEDY request runs, so its node stays out of the
     /// capture; the next sampled request takes it back and reuses the same device buffers
     parked_sampler: Option<DevSampler>,
-    /// #31 A9: the ONE held conversation of this process and its two snapshots (spec 7.6)
+    /// #31 A9: the ONE held conversation of this process and its ONE snapshot (M2b, #36)
     cache: PrefixCache,
     /// #32 A10: `--slot-save-path <dir>`; `None` makes `/slots/0` refuse both actions
     slot_save_path: Option<String>,
@@ -2096,12 +2085,14 @@ fn main() {
     eprintln!("[serve] listening on http://{addr} (blocking, one request at a time)");
 
     let mut eng = eng;
-    // #31 A9: both snapshot slots are allocated here, once, from the loaded shape (spec 7.7)
+    // #31 A9: the snapshot slot is allocated here, once, from the loaded shape (spec 7.7).
+    // #36 M2b: SLOTS is 1, and the line below reads it instead of naming a count of its own.
     let cache = PrefixCache::new(&eng);
     eprintln!(
-        "[serve] prefix cache {}, {} B per snapshot, 2 snapshots, QSA ring rows {}",
+        "[serve] prefix cache {}, {} B per snapshot, {} snapshot(s), QSA ring rows {}",
         if cache.enabled() { "on" } else { "off (CROW_PREFIX_CACHE=0)" },
         cache.shape().snapshot_bytes(),
+        SLOTS,
         eng.st.qsa_ring_rows
     );
     let mut srv = Srv {

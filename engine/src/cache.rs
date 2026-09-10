@@ -13,7 +13,7 @@
 //! |---|---|
 //! | `L` | longest common prefix length of the request ids and `Engine::history` |
 //! | `P` | `max { S_pos : S_pos <= L and S_pos < request length }` over the held snapshots |
-//! | cold | no such `S_pos` exists; `Engine::reset_to_zero` runs and both slots are dropped |
+//! | cold | no such `S_pos` exists; `Engine::reset_to_zero` runs and the slot is dropped |
 //!
 //! - Only a PREFILL CLEAN snapshot is a reuse candidate; see the section below.
 //!
@@ -57,13 +57,13 @@
 //! - `prefill` zeroes S only when `self.pos == 0` (`gen.rs:2433`, `gen.rs:2495`), which is
 //!   exactly the cold start, so a restored `pos > 0` leaves the restored S alone.
 //!
-//! When a snapshot is taken (M1, robin 2026-09-09: BOTH unconditional):
+//! When a snapshot is taken (M2b, robin 2026-09-10, #36: ONE slot, unconditional):
 //!
 //! | slot | point | position |
 //! |---|---|---|
 //! | `SLOT_PROMPT` | after the prefill of this turn's prompt | rendered prompt length |
-//! | `SLOT_ANSWER` | after the last `decode_step` of this turn | prompt length + generated - 1 |
 //!
+//! - The after-answer snapshot of M1 (spec 7.6 point 2) is DROPPED, see the section below.
 //! - The last generated id is never fed back, so it is not in `history` and not in `pos`.
 //! - ONE held conversation per process (M1): a request that shares no prefix replaces it.
 //!
@@ -114,14 +114,22 @@
 //!   REWRITTEN by prefill; the `decode_step` rows at them are gone.
 //! - Therefore rows `0..prompt_len` are prefill rows whenever point 1 is taken.
 //!
-//! Why the point 2 snapshot is NOT prefill clean:
+//! Why the after-answer snapshot was DROPPED (M2b, robin 2026-09-10, #36):
 //!
-//! - It is taken after the answer, and `decode_step` wrote every row of that answer.
-//! - It is still TAKEN (M1: both snapshots unconditional) and it is still reported.
-//! - It is not offered to `reuse_slot`, so no request can roll back onto a decode row.
-//! - Cost of not using it: the previous answer is re-prefilled, 63 tokens at the A9
-//!   operating point: snapshot point 2 at pos 16,127 minus the prefill clean `P` 16,064
-//!   (`decode_out/srv-a9.log:42-43`).
+//! - It was taken after the answer, and `decode_step` wrote every row of that answer.
+//! - Those rows are never bit equal to the prefill rows at the same positions (#31 A9).
+//! - So it was never offered to `reuse_slot`: taken on every request, consumed on none.
+//! - Measured price of holding it (#31 A9, spec 7.7):
+//!
+//! | quantity | value |
+//! |---|---|
+//! | pageable host RAM per process | 130,646,016 B = 124.60 MiB |
+//! | DtoH per request, warm | 14.5 ms |
+//! | DtoH on the first request of a process | 35 to 64 ms |
+//!
+//! - Unchanged by the drop: the previous answer is re-prefilled, 63 tokens at the A9
+//!   operating point (pos 16,127 minus the prefill clean `P` 16,064,
+//!   `decode_out/srv-a9.log:42-43`).
 //! - Those 63 sit inside a 95 token warm prefill of 404.3 ms at 234.95 tok/s
 //!   (`decode_out/srv-a9.log:29`). The answer's own share of those ms is NOT measured.
 //!
@@ -130,9 +138,9 @@
 //! - `engine/src/slot.rs` writes the `SLOT_PROMPT` slot to a file and reads it back.
 //! - It is the deliberate exception, so the FILE carries the whole load shape.
 //! - A restore refuses any shape mismatch instead of loading state that is only shaped right.
-//! - Only `SLOT_PROMPT` is ever written: it is the one prefill clean position (see above).
-//! - A restore names it through `set_prompt_slot` and CLEARS `SLOT_ANSWER`, so the next
-//!   request lands on the ordinary warm path of this file, not on a second one.
+//! - Only `SLOT_PROMPT` is ever written: it is the one slot, and it is prefill clean.
+//! - A restore names it through `set_prompt_slot`, so the next request lands on the
+//!   ordinary warm path of this file, not on a second one.
 //!
 //! Off switch:
 //!
@@ -148,10 +156,8 @@ use cudarc::driver::sys;
 
 /// slot of the snapshot taken after the prompt prefill (spec 7.6, point 1)
 pub const SLOT_PROMPT: usize = 0;
-/// slot of the snapshot taken after the generated answer (spec 7.6, point 2)
-pub const SLOT_ANSWER: usize = 1;
-/// slots held per conversation
-pub const SLOTS: usize = 2;
+/// slots held per conversation (M2b, #36: the after-answer slot was dropped)
+pub const SLOTS: usize = 1;
 
 /// f32 slots of one GDN layer's recurrent state S, `[48][128][128]` (`manager.rs:60`)
 const GDN_S_STATE: usize = GDN_VHEADS * GD * GD;
@@ -286,7 +292,7 @@ unsafe fn dtoh_into(dst: &mut [f32], src: cuda::CUdeviceptr) {
 
 // ----------------------------------------------------------------- the cache
 
-/// the ONE held conversation of this process (M1), with its two snapshots
+/// the ONE held conversation of this process (M1), with its ONE snapshot (M2b, #36)
 pub struct PrefixCache {
     /// `CROW_PREFIX_CACHE=0` turns every request into a cold start
     enabled: bool,
@@ -295,7 +301,7 @@ pub struct PrefixCache {
 }
 
 impl PrefixCache {
-    /// - allocates both slots up front when the cache is on (spec 7.7)
+    /// - allocates the one slot up front when the cache is on (spec 7.7)
     /// - reads the shape off the loaded states, so it can never outlive its load
     pub fn new(eng: &Engine) -> PrefixCache {
         let enabled = std::env::var("CROW_PREFIX_CACHE").as_deref() != Ok("0");
@@ -380,20 +386,16 @@ impl PrefixCache {
 
     /// - name the PROMPT slot after its buffers were filled from a slot file (#32 A10)
     /// - prefill clean by construction: a slot file only ever holds a prefill clean position
-    /// - the ANSWER slot is CLEARED: nothing may claim a position this process never wrote
+    /// - it is the ONLY slot (M2b, #36): no second slot can claim an unwritten position
     pub fn set_prompt_slot(&mut self, pos: usize, done_blocks: usize) {
         if let Some(s) = self.slots.get_mut(SLOT_PROMPT) {
             s.pos = Some(pos);
             s.prefill_clean = true;
             s.done_blocks = done_blocks;
         }
-        if let Some(s) = self.slots.get_mut(SLOT_ANSWER) {
-            s.pos = None;
-            s.prefill_clean = false;
-        }
     }
 
-    /// - both slots forget their position; the buffers stay allocated
+    /// - the slot forgets its position; the buffers stay allocated
     /// - called with every cold start, so no slot can name a discarded history
     pub fn invalidate(&mut self) {
         for s in self.slots.iter_mut() {
@@ -688,44 +690,63 @@ mod tests {
         assert!(c.reuse_candidates().is_empty());
     }
 
-    /// an enabled cache with two empty slots is a cold start, and says so in both lists
+    /// an enabled cache with its one slot empty is a cold start, and says so in both lists
     #[test]
     fn a_fresh_cache_holds_no_position() {
         let c = PrefixCache::for_shape(tiny(), true);
         assert!(c.enabled());
-        assert_eq!(c.positions(), vec![None, None]);
-        assert_eq!(c.reuse_candidates(), vec![None, None]);
+        assert_eq!(c.positions(), vec![None]);
+        assert_eq!(c.reuse_candidates(), vec![None]);
         assert_eq!(c.decide(&[1, 2, 3], &[1, 2, 3, 4]).reuse, None);
     }
 
-    /// `positions` reports every slot, `reuse_candidates` hides the ones that are not clean
+    /// `positions` reports the slot, `reuse_candidates` hides it when it is not clean
     #[test]
     fn reuse_candidates_hides_the_slot_that_is_not_prefill_clean() {
-        let mut c = PrefixCache::for_shape(tiny(), true);
-        c.set_slot(SLOT_PROMPT, 60, true);
-        c.set_slot(SLOT_ANSWER, 100, false);
-        assert_eq!(c.positions(), vec![Some(60), Some(100)]);
-        assert_eq!(c.reuse_candidates(), vec![Some(60), None]);
-        // so the decision lands on point 1 even though point 2 sits at L
         let held: Vec<i64> = (0..100).collect();
         let mut new = held.clone();
         new.extend(200..210);
+        // prefill clean: reported in both lists, and the decision rolls back onto it
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        c.set_slot(SLOT_PROMPT, 60, true);
+        assert_eq!(c.positions(), vec![Some(60)]);
+        assert_eq!(c.reuse_candidates(), vec![Some(60)]);
         let d = c.decide(&held, &new);
         assert_eq!(d.l, 100);
         assert_eq!(d.reuse, Some((SLOT_PROMPT, 60)));
         assert_eq!(d.cached_n(), 60);
+        // NOT prefill clean: `positions` still reports it, `reuse_candidates` hides it,
+        // and with no second slot to fall back on the request is cold
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        c.set_slot(SLOT_PROMPT, 60, false);
+        assert_eq!(c.positions(), vec![Some(60)]);
+        assert_eq!(c.reuse_candidates(), vec![None]);
+        let d = c.decide(&held, &new);
+        assert_eq!(d.l, 100);
+        assert_eq!(d.reuse, None);
+        assert_eq!(d.cached_n(), 0);
     }
 
-    /// `invalidate` is what a cold start runs: both slots forget position AND flag
+    /// #36 M2b (robin 2026-09-10, option b): ONE slot per process, the prompt slot
     #[test]
-    fn invalidate_clears_both_positions_and_both_flags() {
+    fn the_process_holds_one_slot_and_one_reuse_candidate() {
+        assert_eq!(SLOTS, 1);
         let mut c = PrefixCache::for_shape(tiny(), true);
         c.set_slot(SLOT_PROMPT, 60, true);
-        c.set_slot(SLOT_ANSWER, 100, true);
-        assert_eq!(c.reuse_candidates(), vec![Some(60), Some(100)]);
+        assert_eq!(c.positions(), vec![Some(60)]);
+        assert_eq!(c.reuse_candidates(), vec![Some(60)]);
+        assert_eq!(c.reuse_candidates().iter().filter(|p| p.is_some()).count(), 1);
+    }
+
+    /// `invalidate` is what a cold start runs: the slot forgets position AND flag
+    #[test]
+    fn invalidate_clears_the_position_and_the_flag() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        c.set_slot(SLOT_PROMPT, 60, true);
+        assert_eq!(c.reuse_candidates(), vec![Some(60)]);
         c.invalidate();
-        assert_eq!(c.positions(), vec![None, None]);
-        assert_eq!(c.reuse_candidates(), vec![None, None]);
+        assert_eq!(c.positions(), vec![None]);
+        assert_eq!(c.reuse_candidates(), vec![None]);
         // and a request that would have been warm is now cold
         assert_eq!(c.decide(&(0..100).collect::<Vec<i64>>(), &(0..110).collect::<Vec<i64>>()).reuse, None);
     }
