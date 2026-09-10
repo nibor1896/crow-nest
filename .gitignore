@@ -23,6 +23,27 @@ decode_out/*.f32
 decode_out/**/*.f32
 decode_out/oracle-t2w/**/gpu-logits.f32
 decode_out/oracle-t2w/**/ref-logits.f32
+# measurement runs are never committed (E3, #43); only the gate inputs below stay tracked
+decode_out/*
+!decode_out/final4-t1-read-run0-crow.json
+!decode_out/final4-t1b-read-lang-run0-crow.json
+!decode_out/final4-t2-write-run0-crow.json
+!decode_out/final4-t2b-write-refactor-run0-crow.json
+!decode_out/final4-t3-debug-run0-crow.json
+!decode_out/final4-t3b-debug-syn-run0-crow.json
+!decode_out/final4-t4-prose-run0-crow.json
+!decode_out/final4-t5-agent-run0-crow.json
+!decode_out/final4-t6-reason-run0-crow.json
+!decode_out/final4-t6b-reason-multi-run0-crow.json
+!decode_out/demo-ids.json
+!decode_out/real64-ids.json
+!decode_out/real512-ids.json
+!decode_out/t3-debug-1024-ids.json
+!decode_out/tentasks-all-ids.json
+!decode_out/parity-ids.json
+!decode_out/hotsets-M-longctx2100-n160.json
+!decode_out/ten-tasks.json
+!decode_out/ten-tasks-authored-t7-t10.json
 oracle/golden/
 oracle/routing-selections.npz
 *.log
