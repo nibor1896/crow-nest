@@ -459,7 +459,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - "Start over" was a process restart.
 - A server has to introduce the concept of *setting the position back*.
 - Built as `Engine::reset_to_zero` (`engine/src/reset.rs`, #26 A4) and, warm, as
-  `PrefixCache::rollback` (`engine/src/cache.rs:450`, #31 A9).
+  `PrefixCache::rollback` (`engine/src/cache.rs:452`, #31 A9).
 
 **Two structural facts decide everything else.**
 
@@ -516,7 +516,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
   (`gen.rs:3309-3319`).
 - It is the ONE definition of that teardown.
 - The cold path `Engine::reset_to_zero` calls it before any prefill.
-- The warm path `PrefixCache::rollback` (`cache.rs:450`) calls it before any prefill.
+- The warm path `PrefixCache::rollback` (`cache.rs:452`) calls it before any prefill.
 - `slot::restore` (`slot.rs:577`) calls it before its uploads.
 - `decode_step` then re-creates the stream and re-captures on the first step of the next
   request (`gen.rs:2740`, `gen.rs:2836`).
@@ -552,7 +552,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - Reason: 7.5 is binding, and a decode-written row cannot be PROVEN to be the row a cold run
   would have.
 - Consequence: the after-answer snapshot was never offered to `reuse_slot`, so M2b DROPPED
-  it (robin 2026-09-10, #36; `cache.rs:334`, `cache.rs:180`, 7.6).
+  it (robin 2026-09-10, #36; `cache.rs:336`, `cache.rs:182`, 7.6).
 - Induction that point 1 is always prefill clean: a cold request prefills `0..prompt_len`; a
   warm request rolls back only to a prefill-clean `P` and prefills `P..prompt_len`, which
   REWRITES the re-rendered previous answer as prefill rows.
@@ -607,11 +607,11 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 | symbol | implementation | anchor |
 |---|---|---|
-| `L` | `common_prefix_len(history, ids)` | `cache.rs:173` |
-| `P` | `reuse_slot(reuse_candidates, l, new_len)` | `cache.rs:180`, `cache.rs:334` |
-| candidates | only PREFILL CLEAN slots (7.3) | `cache.rs:334` |
-| extra guard | `S_pos < request length` | `cache.rs:180` |
-| decision | `PrefixCache::decide` | `cache.rs:343` |
+| `L` | `common_prefix_len(history, ids)` | `cache.rs:175` |
+| `P` | `reuse_slot(reuse_candidates, l, new_len)` | `cache.rs:182`, `cache.rs:336` |
+| candidates | only PREFILL CLEAN slots (7.3) | `cache.rs:336` |
+| extra guard | `S_pos < request length` | `cache.rs:182` |
+| decision | `PrefixCache::decide` | `cache.rs:345` |
 
 - Reason for the extra guard: `prefill` of an empty slice has no last position to return a
   greedy id from. It is a guard, not a change of the rule.
@@ -713,7 +713,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 |---|---|---|---|
 | `SLOT_PROMPT` (`cache.rs:158`) | after the prefill of this turn's prompt | rendered prompt length | **yes**, it is prefill clean (7.3) |
 
-- `SLOTS = 1` (`cache.rs:160`): one slot per process, and it is the prompt slot.
+- `SLOTS = 1` (`cache.rs:162`): one slot per process, and it is the prompt slot.
 - The last generated id is never fed back, so it is not in `history` and not in `pos`.
 - ONE held conversation per process (M1): a request that shares no prefix replaces it.
 - The M1 after-answer point is gone from `chat_stream`; the block below says why.
@@ -722,7 +722,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 - The proposal said it is the normal case and spares the answer's prefill.
 - Measured 2026-09-10 (A9, #31): it was taken, reported and never consumed
-  (`prefill_clean` guard, `cache.rs:334`).
+  (`prefill_clean` guard, `cache.rs:336`).
 - Decision M2 option b (robin, 2026-09-10, #1 comment): drop it. Built in #36.
 - Unchanged by the drop: the reuse behaviour, the `[cache]` stderr lines, `GET /slots`,
   the slot file format of 7.3 and `slot.rs`.
@@ -774,7 +774,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - Source: A9 review, issue #31, the plan's M2 list, and issue #36 for the build.
 - Gate of the build: `decode_out/srv-a9b.log` (7.12 row M2b).
 
-**Rollback (`PrefixCache::rollback`, `cache.rs:450`):**
+**Rollback (`PrefixCache::rollback`, `cache.rs:452`):**
 
 1. `cuda::sync`, then `Engine::drop_decode_graph` (7.2, `reset.rs`).
 2. Restore the four buffers with host-to-device copies.
@@ -948,7 +948,7 @@ Therefore:
 | # | question of the proposal | decision | where it lives in the build |
 |---|---|---|---|
 | 1 | which prefill chunk is pinned for the process | **2048**, pinned at load; `geo::apply_chunk_policy` is NOT applied | `serve.rs:451` (`SERVE_CHUNK`), `serve.rs` module doc |
-| 2 | how many conversations are held, how many snapshots each | **ONE** conversation, **two** snapshots (249.19 MiB at chunk 2048) | `cache.rs:160` (`SLOTS`), `cache.rs` module doc |
+| 2 | how many conversations are held, how many snapshots each | **ONE** conversation, **two** snapshots (249.19 MiB at chunk 2048) | `cache.rs:162` (`SLOTS`), `cache.rs` module doc |
 | 3 | is the post-answer snapshot taken unconditionally | **yes**, both points unconditional | `cache.rs` module doc, 7.6 |
 | 4 | concurrency: queue or reject | **a second request waits** in the accept queue, no 503 | `serve.rs` module doc, blocking `TcpListener` |
 | 5 | sampling: out of scope, or reseed per request | **reseeded per request**; the A9 identity gate runs **greedy** | `Engine::enable_dev_sampler`, `serve.rs:1043` (`sampler_from`) |
