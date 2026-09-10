@@ -49,6 +49,7 @@
 
 ### Changed
 
+- `#51` E8, 2026-09-11: `decode` and `parity` default to `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` and `decode_out/hotsets-M-longctx2100-n160.json`, the container and sidecar of `serve.rs:446-447`; five lines, `CROW_CNQ` and `CROW_HOTSETS` still override; closes `#48`.
 - `#42` E2, 2026-09-10: the history was rewritten with `git filter-repo` to drop the probe debug blobs. Every commit sha changed: `release-v0.1` head `4519f6f` became `aa6dd04`, `main` head `d36353a` became `e9e53cc`. Tracked bytes went from 253,232,175 to 38,397,227, blobs over 50 MB 0 after (before: one, the 125.28 MB blob of `#41`), `Co-Authored-By` trailers from 19 to 0. A pre-rewrite mirror was kept outside the repository.
 - `#43` E3, 2026-09-10: `converter/target` (103 files) and 216 of 235 `decode_out` records untracked; 19 gate inputs kept; tracked bytes 38,397,227 to 5,208,050.
 - `#45` E4, 2026-09-10: `.gitignore` ignores every build tree with `**/target*/` instead of listing them.
@@ -83,7 +84,7 @@
 - A `serve` tok/s number drifts with run position on one machine, open as `#38`; no `serve` number enters the spec before it is re-measured.
 - The ten-task quality gate is not met on greedy, and sampling meets it on 1 of 6 seeds, open as `#11` and `#44`.
 - `min_p` is parsed and ignored: the device sampler implements top_k, top_p and presence only; decision M2 in `#28` (closed 2026-09-09), no tracking issue.
-- `parity.rs` defaults to another container and sidecar than `serve.rs:446-447`, so the harness defaults no longer match the server (found 2026-09-10 in stage B, `#48`).
+- Closed by `#51` on 2026-09-11: `decode.rs:40`, `decode.rs:45`, `parity.rs:151`, `parity.rs:156` and `parity.rs:341` now name the same container and sidecar as `serve.rs:446-447` (found 2026-09-10 in stage B, `#48`).
 - A ragged hot-set sidecar makes `residency.rs:413` assert, so the container sidecars cannot be used unchanged (found 2026-09-10 in stage B, `#49`).
 - `parity.rs` pipes UTF-8 into the Python oracle without `PYTHONIOENCODING`, open as `#34`; the chains export it and are unaffected.
 - Engine logging is not started, open as `#13`; the architecture diagrams are stale, open as `#14`.

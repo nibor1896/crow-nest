@@ -37,10 +37,12 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
-    let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| "../converter/Qwen3.8-Flash-Next-CNQ4.5.cnq".into());
-    // CROW_HOTSETS=<path> overrides the hot-set sidecar next to the container
+    let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| "../converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq".into());
+    // CROW_CNQ and CROW_HOTSETS override container and hot-set sidecar
     // (e.g. a sidecar warmed on real traffic via `decode warmup`)
-    let sidecar = std::env::var("CROW_HOTSETS").unwrap_or_else(|_| format!("{cnq_path}.hotsets.json"));
+    // defaults (#48): the production -M container and the id-sorted rectangular
+    // sidecar serve.rs loads, both relative to engine/, the cwd of `decode`
+    let sidecar = std::env::var("CROW_HOTSETS").unwrap_or_else(|_| "../decode_out/hotsets-M-longctx2100-n160.json".into());
     let mut cnq = Cnq::open(&cnq_path);
 
     unsafe {

@@ -148,10 +148,12 @@ fn llama_complete(url: &str, text: &str, max_tokens: usize) -> (f64, f64, String
 const EOS_STOP: [i64; 2] = [248046, 248044];
 
 fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) {    let cnq_path = std::env::var("CROW_CNQ")
-        .unwrap_or_else(|_| "converter/Qwen3.8-Flash-Next-CNQ4.5-KHC.cnq".into());
+        .unwrap_or_else(|_| "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq".into());
     // same production switches as `decode run` (2026-09-04): sidecar override,
     // prefill chunk, prompt-adaptive hot set after the prefill (charged to prefill)
-    let sidecar = std::env::var("CROW_HOTSETS").unwrap_or_else(|_| format!("{cnq_path}.hotsets.json"));
+    // defaults (#48): the production -M container and the id-sorted rectangular
+    // sidecar serve.rs loads, both relative to the repo root (see the header at :44)
+    let sidecar = std::env::var("CROW_HOTSETS").unwrap_or_else(|_| "decode_out/hotsets-M-longctx2100-n160.json".into());
     let mut cnq = crow_nest_engine::cnq::Cnq::open(&cnq_path);
     unsafe {
         let _ctx = crow_nest_engine::cuda::Ctx::init();
@@ -336,7 +338,7 @@ fn main() {
                 "order": prompts.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
                 "warmup": "one cold prefill per phase start, discarded (spec 0.3)",
                 "operating_point": "200k floor, -np 1, greedy, temperature 0",
-                "crow_container": std::env::var("CROW_CNQ").unwrap_or_else(|_| "converter/Qwen3.8-Flash-Next-CNQ4.5-KHC.cnq".into()),
+                "crow_container": std::env::var("CROW_CNQ").unwrap_or_else(|_| "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq".into()),
             })];
             let out = format!("decode_out/{prefix}-run{run_index}-{arm}.json");
             let mut answers = serde_json::Map::new();
