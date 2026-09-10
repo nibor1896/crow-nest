@@ -3,26 +3,12 @@ models/
 converter/*.cnq
 converter/*.safetensors
 converter/*.hotsets.json
-# build trees
-engine/target/
-engine/target_new*/
-engine/target_auto/
-engine/target_sb/
-engine/target_rel/
-engine/target_probe/
-engine/target_smp/
-engine/target_pol/
-engine/target_pf/
-probes/target/
-handoff-bench/target/
+# build trees (every Cargo target directory, present and future)
+**/target*/
 # python
 .venv-oracle/
 __pycache__/
 # measurement artefacts and dumps
-decode_out/*.f32
-decode_out/**/*.f32
-decode_out/oracle-t2w/**/gpu-logits.f32
-decode_out/oracle-t2w/**/ref-logits.f32
 # measurement runs are never committed (E3, #43); only the gate inputs below stay tracked
 decode_out/*
 !decode_out/final4-t1-read-run0-crow.json
@@ -53,7 +39,4 @@ engine/.engine.lock
 
 # per-run scratch output of `decode run` (overwritten every run)
 engine/decode_out/run.json
-engine/target_attn/
-engine/target_gate/
-engine/target_gate2/
 .superpowers/
