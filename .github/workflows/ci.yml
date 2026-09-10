@@ -160,6 +160,8 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-on-failure: true
+        with:
           workspaces: |
             engine -> target_ci
             converter -> target_ci
@@ -172,8 +174,8 @@ jobs:
         run: |
           mkdir -p target_ci
           cargo clippy --release --target-dir target_ci --all-targets 2>&1 | tee target_ci/clippy-engine.txt
-          total=$(grep -cE '^warning: ' target_ci/clippy-engine.txt || echo 0)
-          summ=$(grep -cE '^warning: .crow-nest-engine.' target_ci/clippy-engine.txt || echo 0)
+          total=$(grep -cE '^warning: ' target_ci/clippy-engine.txt || :)
+          summ=$(grep -cE '^warning: .crow-nest-engine.' target_ci/clippy-engine.txt || :); total=${total:-0}; summ=${summ:-0}
           echo "- engine clippy warnings: $((total - summ)) (local 2026-09-11: 1303)" >> "$GITHUB_STEP_SUMMARY"
           cargo clippy --release --target-dir target_ci --all-targets -- -D warnings
       - name: converter clippy
@@ -182,8 +184,8 @@ jobs:
         run: |
           mkdir -p target_ci
           cargo clippy --release --target-dir target_ci --all-targets 2>&1 | tee target_ci/clippy-converter.txt
-          total=$(grep -cE '^warning: ' target_ci/clippy-converter.txt || echo 0)
-          summ=$(grep -cE '^warning: .converter.' target_ci/clippy-converter.txt || echo 0)
+          total=$(grep -cE '^warning: ' target_ci/clippy-converter.txt || :)
+          summ=$(grep -cE '^warning: .converter.' target_ci/clippy-converter.txt || :); total=${total:-0}; summ=${summ:-0}
           echo "- converter clippy warnings: $((total - summ)) (local 2026-09-11: 11)" >> "$GITHUB_STEP_SUMMARY"
           cargo clippy --release --target-dir target_ci --all-targets -- -D warnings
 
