@@ -997,7 +997,7 @@ Therefore:
 |---|---|---|---|
 | `messages` | required, non empty, every entry needs a string `role` | `serve.rs:918` (`parse_chat`) | `crow_core.py:4672-4700` |
 | `model` | echoed into every chunk, default `crow-nest` | `serve.rs:918`, `serve.rs:1144` | `crow_core.py:4672-4700` |
-| `stream` | `true` streams; `false` or absent answers **501** | `serve.rs:918`, `serve.rs:1373` | `crow_core.py:4672-4700` (always `true`), `:2971` (digest path) |
+| `stream` | `true` streams `chat.completion.chunk` frames; `false` or absent answers ONE `chat.completion` document (#39 B3a, 7.11.13) | `serve.rs:918`, `serve.rs:1570` | `crow_core.py:4672-4700` (always `true`), `:2971` (digest path, no `stream` field) |
 | `stream_options.include_usage` | `true` puts `usage` on the final chunk | `serve.rs:918`, `serve.rs:1222` | `crow_core.py:4672-4700` |
 | `timings_per_token` | `true` puts `timings` on the final chunk | `serve.rs:918`, `serve.rs:1222` | `crow_core.py:4672-4700` |
 | `max_tokens` | default 1024, capped at 32768, clamped to `n_ctx - prompt ids` | `serve.rs:1253` (`clamped_max_tokens`) | `crow_core.py:4672-4700` |
@@ -1137,7 +1137,7 @@ C:/x/y.md
 | head (request line plus headers) over 64 KiB | 431 JSON, then close | `serve.rs:455`, `serve.rs:1751` |
 | body over 16 MiB | 413 JSON, then close | `serve.rs:457`, `serve.rs:1751` |
 | `Transfer-Encoding: chunked` | 501 JSON | `serve.rs:1751` |
-| `stream: false` or absent | 501 JSON | `serve.rs:1373` (`chat_route`) |
+| `stream: false` or absent | **200, one `chat.completion` document** (501 until #39) | `serve.rs:1570` (`chat_route` branch), `serve.rs:1606` (`chat_document`) |
 | prompt ids `>= n_ctx` | 413 before any GPU work | `serve.rs:1253` (`clamped_max_tokens`) |
 | `/slots/0` save with no prefill-clean position held | 409 | `serve.rs:1855`, `slot.rs` |
 | `/slots/0` bad filename, missing file, shape or content mismatch | 400, engine untouched | `slot.rs:342`, `slot.rs:288` (`check_content`) |
@@ -1153,7 +1153,6 @@ C:/x/y.md
 | item | state | reason |
 |---|---|---|
 | `min_p` | parsed, ignored, logged once per request | the device sampler `sample_k` implements top_k, top_p and presence only; adding it is a kernel change. **Open for robin at M2** (#28) |
-| `stream: false` | 501 | no caller in Crow: `crow_core.py:4821` always streams |
 | `/tokenize` | not built | no caller in the client; the mentions in Crow's `CHANGELOG.md:1172`, `:1768` are measurement prose |
 | `/v1/models`, `/v1/messages` | not built | those are the REMOTE providers in Crow (`crow_core.py:13593`, `:13649`, `:13669`, `:3600-3610`), not the local server |
 | `/completion` | not built | appears only in Crow's log-parser test fixtures |
@@ -1162,6 +1161,9 @@ C:/x/y.md
 | hot-set adaptation in serve | never ticked | `serve` calls neither `trickle_tick` nor `adapt_tick`; `bin/decode.rs:216-228` is the only caller. One stderr line says so, so the `[policy]` line cannot mislead |
 | `CROW_QSA_FULL=1` | out of scope | 7.7, the ring would dominate every size |
 | `CROW_COLD_TIER` low-bit tier | must stay off | 7.5 condition 2 |
+
+- `stream: false` left this table with #39 (B3a): the probe-suite and Crow's rollover
+  digest send no `stream` field, and both are served now. See 7.11.13.
 
 **7.11.10 Two measured traps for a Crow-driven test (stage B)**
 
@@ -1192,6 +1194,60 @@ C:/x/y.md
 
 - Rule: items 1 and 2 are not decided in this document; item 3 is, and 7.6 carries it.
 
+**7.11.13 `POST /v1/chat/completions`, the non-streaming document (#39 B3a)**
+
+- Sent to every caller that omits `stream`, or sets it to `false`.
+- Two such callers exist in Crow: the probe-suite (`tools/probe-suite.py:604-639`, `ask_model`)
+  and the rollover digest (`cli/crow_core.py:2960-2990`).
+- Until #39 both got a 501; that is why `stream: false` left the 7.11.9 table.
+
+| field | as built | crow-nest anchor | reader |
+|---|---|---|---|
+| `id` | `chatcmpl-<created>-<seq>`, the same form the stream uses | `serve.rs:1477` (`completion_json`), `serve.rs:1648` (`chat_generate`) | not read by either caller |
+| `object` | `chat.completion` | `serve.rs:1477` | not read by either caller |
+| `created` | unix seconds of this request | `serve.rs:1477` | not read by either caller |
+| `model` | echoed from the request, default `crow-nest` | `serve.rs:1477` | not read by either caller |
+| `choices[0].index` | `0`, one choice per request | `serve.rs:1477` | not read by either caller |
+| `choices[0].message.role` | `assistant` | `serve.rs:1477` | not read by either caller |
+| `choices[0].message.content` | ALWAYS a string: every content delta of the stream, concatenated; empty when a tool call was the whole answer | `serve.rs:1397` (`CollectSink`), `serve.rs:1477` | `probe-suite.py:679`, `crow_core.py:2984` |
+| `choices[0].message.tool_calls` | present ONLY when the parser closed a call: `[{id, type "function", function{name, arguments}}]`, `arguments` a JSON STRING | `serve.rs:1388` (`CallBuf`), `serve.rs:1477` | neither caller reads it |
+| `choices[0].message.reasoning_content` | NEVER present, as on the stream (`enable_thinking` is false, `tokenizer.rs:18-19`) | `serve.rs:1477` | `probe-suite.py:680` reads it when present |
+| `choices[0].finish_reason` | `stop`, `length` or `tool_calls`, the stream's rules unchanged | `serve.rs:1648` | `probe-suite.py:678` |
+| `usage` | `usage_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1109` (`usage_json`), `serve.rs:1477` | `probe-suite.py:681-683` (`completion_tokens`) |
+| `timings` | `timings_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1122` (`timings_json`), `serve.rs:1477` | neither caller reads it |
+| headers | `application/json`, `Content-Length`, `Connection: close`, as on every other JSON route | `serve.rs:1606` (`chat_document`), `serve.rs:1938` (`respond`) | `urllib.request` in both callers |
+
+**The decisions #39 took, and why:**
+
+| decision | choice | reason |
+|---|---|---|
+| `usage` and `timings` on the document | ALWAYS, neither flag consulted | ONE document shape; the probe-suite reads `usage.completion_tokens` while sending neither `stream_options` nor `timings_per_token`; llama-server also carries `timings` on the non-streaming document |
+| `stream_options` on a non-streaming request | accepted, ignored | it names a stream that does not exist |
+| `message.content` when a tool call is the whole answer | the empty STRING, never `null` | both readers use `or ""`, so either works; a string keeps one type on the wire |
+| `tool_calls[]` entry shape | OpenAI non-streaming: `id`, `type`, `function`, no `index` | `index` is a stream reassembly field, meaningless on a document |
+| the generation | ONE loop, two sinks | a second loop would let the two request forms drift apart |
+
+**The sink split (the refactor #39 made, `serve.rs`):**
+
+| element | where it lives | shared by both request forms |
+|---|---|---|
+| prefix cache decide, rollback or reset, snapshot point 1 | `chat_generate` (`serve.rs:1648`) | yes |
+| prefill, device sampler arm or park, decode loop, stop rules | `chat_generate` | yes |
+| detokenizer and the hold back of an incomplete character | `chat_generate`, `next_delta` (`serve.rs:1266`) | yes |
+| tool-call parser `ToolStream` and the `finish_reason` rules | `chat_generate` | yes |
+| engine counters and the `Timing` block | `chat_generate` | yes |
+| the three `[chat]` stderr lines, `[chat] ids` included | `chat_generate` | yes |
+| the per delta side effect | `ChatSink::on_emit` (`serve.rs:1327`) | no, this is the split |
+| the wire form | `SseSink` writes frames (`serve.rs:1346`), `CollectSink` fills two strings (`serve.rs:1397`) | no |
+| the route switch | `chat_route` (`serve.rs:1532`), branch at `serve.rs:1570` | no |
+
+- `chat_stream` (`serve.rs:1580`) writes the SSE head, then runs `chat_generate` with `SseSink`.
+- `chat_document` (`serve.rs:1606`) runs `chat_generate` with `CollectSink`, then answers
+  `completion_json`.
+- Wire proof of the refactor: the raw SSE bytes of one streaming request are identical
+  before and after, `id`, `created` and the wall-clock `timings` numbers excepted
+  (`decode_out/srv-b3a.log`, WIRE DIFF).
+
 ### 7.12 The stage A gate table (what was measured, and where the artefact is)
 
 **Rule: a gate without a log artefact does not count.**
@@ -1210,14 +1266,15 @@ C:/x/y.md
 | A10 | #32 | slot file save and restore across processes, 30 of 30 then 22 of 22, `n_saved` = `n_restored` = 16,064, six refusals 4xx with a working chat after | `srv-a10.log`, `srv-a10-fix.log`, `srv-a10-smoke.log` |
 | A11 | #33 | this section corrected, `cargo test` in engine and converter, parity 8 / 512 twice / 1024 against the installed build | `srv-a11.log` |
 | M2b | #36 | after-answer snapshot dropped: A9 gate re-run in full, cached 99.41 % 2 of 2, warm turn 2 ids `b6eaffb2` 2 of 2, rollback `addbbcb5` 2 of 2, every run equals the A9 reference 10 of 10, serve `PrivateMemorySize64` 139,309,056 B lower after turn 1, 0 point-2 snapshot lines, A10 restore into a fresh process 6 of 6 | `srv-a9b.log` |
+| B3a | #39 | `stream:false` answers ONE `chat.completion` document: probe-suite request form 15 of 15 field checks, greedy identity stream vs document 2 of 2 on a one token answer and 2 of 2 on a longer one, Crow digest form 200 with content, the A7 tool call equal in `function.name` and `arguments` with `finish_reason` `tool_calls`, A9 gate part 2 warm turn 2 `b6eaffb2` 1 of 1 at 99.41 % cached, the raw SSE bytes of one streaming request identical before and after the refactor 1 of 1 | `srv-b3a.log` |
 
 **The server-path unit tests the A11 gate names (existing since A2 to A9):**
 
 | category | test | file:line |
 |---|---|---|
-| request parsing | `the_two_stream_flags_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:2781` |
-| request parsing | `tools_and_tool_turns_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:2924` |
-| SSE framing | `an_sse_frame_is_one_data_line_and_a_blank_line` | `engine/src/bin/serve.rs:2810` |
+| request parsing | `the_two_stream_flags_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:3003` |
+| request parsing | `tools_and_tool_turns_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:3146` |
+| SSE framing | `an_sse_frame_is_one_data_line_and_a_blank_line` | `engine/src/bin/serve.rs:3032` |
 | prefix length determination | `common_prefix_stops_at_the_first_difference` | `engine/src/cache.rs:526` |
 | prefix length determination | `the_newest_snapshot_at_or_below_l_wins` | `engine/src/cache.rs:558` |
 | one slot per process | `the_process_holds_one_slot_and_one_reuse_candidate` | `engine/src/cache.rs:732` |
@@ -1227,6 +1284,21 @@ C:/x/y.md
 - Counts after M2b (#36): engine lib **80 of 80** (the new one-slot test), `bin/serve`
   **52 of 52**, every other binary 0 tests, doc-tests 0; converter untouched
   (`decode_out/srv-a9b.log:473`, `:488`).
+
+**The unit tests #39 added (`engine/src/bin/serve.rs`):**
+
+| category | test | file:line |
+|---|---|---|
+| document builder | `the_non_streaming_document_carries_every_field_the_probe_suite_reads` | `engine/src/bin/serve.rs:3566` |
+| document builder | `the_non_streaming_document_carries_the_tool_calls_the_parser_closed` | `engine/src/bin/serve.rs:3605` |
+| sink equivalence | `the_collector_and_the_sse_sink_see_the_same_delta_sequence` | `engine/src/bin/serve.rs:3630` |
+| request parsing | `the_two_callers_that_send_no_stream_field_parse_as_non_streaming` | `engine/src/bin/serve.rs:3696` |
+| collector | `the_collector_holds_one_buffer_per_tool_call_index` | `engine/src/bin/serve.rs:3724` |
+
+- Counts after B3a (#39): engine lib **80 of 80**, `bin/serve` **57 of 57** (the five new
+  tests above), every other binary 0 tests, doc-tests 0; converter untouched. The warning
+  set is byte-identical to the adb34b6 baseline `decode_out/srv-m2b-orch-tests.txt`
+  (`decode_out/srv-b3a-tests.txt`).
 - Commands: `cd engine && cargo test --release --target-dir target_srv`, and
   `cd converter && cargo test --release`.
 
