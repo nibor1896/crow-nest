@@ -504,7 +504,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 |---|---|---|
 | 1 | `decode_step` creates the capture stream ONCE and leaves it ACTIVE | `gen.rs:2740-2743` |
 | 2 | `launch_v` and `upload_into` both read that active stream | `gen.rs:1194`, `cuda.rs:377` (`cur_stream`) |
-| 3 | `upload_into` skips its sync on any stream but the legacy one | `cuda.rs:381-386` |
+| 3 | `upload_into` skips its sync on any stream but the legacy one | `cuda.rs:384-386` |
 | 4 | `prefill` uploads its per chunk scalars and the embedding block from TEMPORARIES | `gen.rs:2493-2510`, `gen.rs:2517-2526` |
 | 5 | so a second `prefill` posted async HtoD copies whose host source had already died | measured |
 | result | same prompt, greedy: request 1 gave id 18622, request 2 gave id 17 | `.superpowers/sdd/task-A4-report.md` |
@@ -1087,7 +1087,8 @@ C:/x/y.md
   `finish_reason` stays `stop` or `length`, `arguments` stays unterminated on purpose so
   Crow's `json.loads` fails rather than running half a command.
 - `crow_core.TOOLS` is **25 builtin declarations** (`crow_core.py:579-838`, frozen as
-  `BUILTIN_TOOLS` at `:846`) plus whatever `mcp.json` adds at import (`:841`).
+  `BUILTIN_TOOLS` at `:846`) plus whatever `mcp.json` adds at import (`:841`, grown at
+  `Crow/cli/crow_core.py:9053`, reset at `Crow/cli/crow_core.py:9154`).
 - Measured on this machine on 2026-09-09: **31** declarations, 25 builtin plus 6 MCP
   (`decode_out/srv-a7-tools.json`). The plan said seven.
 - The rendered tools block is byte-identical to the Python oracle at **322 ids**
@@ -1173,7 +1174,7 @@ C:/x/y.md
 | # | item | state | source |
 |---|---|---|---|
 | 1 | `min_p` in the device sampler | accepted and ignored; kernel change or drop it from Crow's profile | #28 |
-| 2 | serve decode rate | serve reaches **18 to 23 tok/s** across the A4 to A6 gates. The **35.7 tok/s** #35 compares against is `decode run` on the **t3-debug** prompt (3,769 prompt ids; the named file records `decode_tok_s` **36.19**, `decode_out/final4-t3-debug-run0-crow.json`, harness of 2026-09-05/06), NOT the 16k t1-read prompt: on that prompt the A5 `decode run` control measures **17.1 tok/s** (`decode_out/srv-a5-decoderun.log:154`). Prefill on the 16k prompt is equal, 662.33 (serve) vs 664.08 (`decode run`) tok/s, -0.26 % (`decode_out/srv-a5.log:144-145`). **Cause unmeasured**, and the two rates are not on one prompt | #35, `decode_out/final4-t3-debug-run0-crow.json`, `srv-a5.log`, `srv-a5-decoderun.log` |
+| 2 | serve decode rate | serve reaches **18 to 24 tok/s** across the A4 to A6 gates. The **35.7 tok/s** #35 compares against is `decode run` on the **t3-debug** prompt (3,769 prompt ids; the named file records `decode_tok_s` **36.19**, `decode_out/final4-t3-debug-run0-crow.json`, harness of 2026-09-05/06), NOT the 16k t1-read prompt: on that prompt the A5 `decode run` control measures 17.1 tok/s over one timed decode token (58.50 ms, `decode_out/srv-a5-decoderun.log:151-154`). Prefill on the 16k prompt is equal, 662.33 (serve) vs 664.08 (`decode run`) tok/s, -0.26 % (`decode_out/srv-a5.log:144-145`). **Cause unmeasured**, and the two rates are not on one prompt | #35, `decode_out/final4-t3-debug-run0-crow.json`, `srv-a5.log`, `srv-a5-decoderun.log` |
 | 3 | the after-answer snapshot slot | keep (M1), drop, or reassign to the previous turn's after-prompt snapshot | #31, 7.6 |
 
 - Rule: none of the three is decided in this document.
