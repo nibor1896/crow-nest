@@ -8,6 +8,9 @@
 //! - Crow readers served: `check_endpoint`, `fetch_n_ctx`, `fetch_model_name`.
 //! - Crow readers served: `refuse_images`, `server_model_path`.
 //! - `POST /v1/chat/completions` streams the answer as SSE (#26 A4).
+//! - `GET /slots` answers the one slot of this process as an array of one (#32 A10).
+//! - `POST /slots/0?action=save|restore` writes or reads the slot file (#32 A10).
+//! - Crow readers served: `save_session` reads `n_saved`, `load_session` reads `n_restored`.
 //! - Anything else answers 404 with a JSON body.
 //!
 //! Connection handling:
@@ -80,8 +83,10 @@
 //!
 //! Run:
 //!
-//! - `serve [--port <n>]` from the repository root (paths are repo relative).
+//! - `serve [--port <n>] [--slot-save-path <dir>]` from the repository root (repo relative paths).
 //! - Default port 8099, bind address 127.0.0.1.
+//! - Without `--slot-save-path` both `/slots/0` actions answer 400, as llama-server refuses them.
+//! - One stderr line at start says which directory is in use, or that none is.
 //!
 //! Subcommand `tokenize` (#25 A3, no engine, no GPU, no lock):
 //!
@@ -402,12 +407,51 @@
 //! - The re-rendered assistant message need not reproduce the generated ids exactly.
 //! - The rollback lands on point 1 in either case, because point 2 is not a candidate.
 //! - That is the rule working, not a special case: the prompt prefill is still spared.
+//!
+//! The slot file across processes (#32 A10, `crow_core.py:2458`, `:2688`):
+//!
+//! | request | answer, and the ONE field Crow reads |
+//! |---|---|
+//! | `POST /slots/0?action=save`, body `{"filename": "<name>"}` | `{"id_slot":0,"filename":..,"n_saved":N,"n_written":B,"timings":{"save_ms":..}}` |
+//! | `POST /slots/0?action=restore`, same body | `{"id_slot":0,"filename":..,"n_restored":N,"n_read":B,"timings":{"restore_ms":..}}` |
+//! | `GET /slots` | `[{"id":0,"n_ctx":..,"n_prompt_tokens":N,"is_processing":false}]` |
+//!
+//! - Only `n_saved` and `n_restored` are contractual; Crow reads nothing else of these bodies.
+//! - `n_saved` and `n_restored` are the PREFILL CLEAN position, so `SLOT_PROMPT`, never the answer.
+//! - Crow withdraws the warm-cache claim when `n_restored` disagrees with the saved `n_saved`,
+//!   so equality of the two numbers is the contract, not the status code (`crow_core.py:2694`).
+//! - `n_prompt_tokens` is the same number, 0 while nothing is held.
+//! - `GET /slots` is read by Crow's tools only (`tools/measure-slot-restart.ps1:87`,
+//!   `tools/probe-slot-persistence.py:152`), which take element 0 of the array.
+//!
+//! What the file holds, and what refuses it: `engine/src/slot.rs` (layout, checks, evidence).
+//!
+//! | part | what |
+//! |---|---|
+//! | header, 120 B | magic, format version, the whole load shape, `pos`, `done_blocks`, history length |
+//! | recurrent state | the `SLOT_PROMPT` snapshot of #31 A9: GDN S, GDN conv, PLE conv, QSA ring |
+//! | absolutely addressed state | KV rows `0..pos` of every attention layer, pooled QSA blocks `0..done_blocks` |
+//! | ids | `history[..pos]`, the list the A9 detection rule compares against |
+//!
+//! - A restore fills `SLOT_PROMPT`, clears `SLOT_ANSWER` and sets `pos`, `done_blocks`, `history`.
+//! - So the NEXT chat request is an ordinary A9 warm turn: `L >= pos`, `P = pos`, one rollback.
+//! - There is no second warm path; the tested one is the only one.
+//! - A refusal answers 4xx with a JSON error body and leaves the engine exactly as it was.
+//!
+//! Slot lines on stderr:
+//!
+//! | line | when |
+//! |---|---|
+//! | `[slot] save "<name>": n_saved N, B B, X ms -> <path>` | a save wrote the file |
+//! | `[slot] restore "<name>": n_restored N, B B, X ms <- <path>` | a restore read it |
+//! | `[slot] refused: <message>` | every 4xx, with the same message the body carries |
 
 use crow_nest_engine::cache::{PrefixCache, SLOT_ANSWER, SLOT_PROMPT};
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::{DevSampler, Engine};
 use crow_nest_engine::geo::{apply_adapt_policy, Config, CONTEXT_FLOOR, LAYERS};
 use crow_nest_engine::sample::{Sampler, EOS_IDS};
+use crow_nest_engine::slot;
 use crow_nest_engine::toolcall::{Emit, ToolStream, TOOL_OPEN};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -452,6 +496,10 @@ enum Route {
     Props,
     /// `POST /v1/chat/completions` (#26 A4)
     Chat,
+    /// `GET /slots` (#32 A10), the one slot of this process as an array of one
+    Slots,
+    /// `POST /slots/0?action=save|restore` (#32 A10)
+    Slot0,
     /// everything else, a wrong method on a known path included
     NotFound,
 }
@@ -462,6 +510,8 @@ fn route(method: &str, path: &str) -> Route {
         ("GET", "/health") => Route::Health,
         ("GET", "/props") => Route::Props,
         ("POST", "/v1/chat/completions") => Route::Chat,
+        ("GET", "/slots") => Route::Slots,
+        ("POST", "/slots/0") => Route::Slot0,
         _ => Route::NotFound,
     }
 }
@@ -483,27 +533,55 @@ enum Head {
     Req { method: String, target: String, body: Vec<u8> },
 }
 
-/// - `--port <n>` and `--port=<n>` out of the argument vector
-/// - argv[0] is skipped
-/// - no `--port` flag means the default port
+/// what the command line of a `serve` run says
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServeArgs {
+    /// `--port <n>`, default `DEFAULT_PORT`
+    port: u16,
+    /// #32 A10: `--slot-save-path <dir>`; without it `/slots/0` refuses both actions
+    slot_save_path: Option<String>,
+}
+
+/// - the whole command line of a `serve` run (no subcommand), argv[0] skipped
+/// - `--flag <value>` and `--flag=<value>` are the same thing
+/// - an unknown flag, a missing value and an empty value are usage errors, never a default
 /// - `Err` carries the message for the operator
-fn parse_port(args: &[String]) -> Result<u16, String> {
+fn parse_args(args: &[String]) -> Result<ServeArgs, String> {
+    const USAGE: &str = "usage: serve [--port <n>] [--slot-save-path <dir>]";
     let mut i = 1;
-    let mut port = DEFAULT_PORT;
+    let mut out = ServeArgs { port: DEFAULT_PORT, slot_save_path: None };
     while i < args.len() {
         let a = args[i].as_str();
-        let val = if a == "--port" {
-            i += 1;
-            args.get(i).cloned().ok_or_else(|| "--port needs a number".to_string())?
-        } else if let Some(v) = a.strip_prefix("--port=") {
-            v.to_string()
-        } else {
-            return Err(format!("unknown argument {a:?} (usage: serve [--port <n>])"));
+        let (flag, inline) = match a.split_once('=') {
+            Some((f, v)) => (f, Some(v.to_string())),
+            None => (a, None),
         };
-        port = val.parse::<u16>().map_err(|_| format!("bad port {val:?}"))?;
+        let val = match inline {
+            Some(v) => v,
+            None => {
+                i += 1;
+                args.get(i).cloned().ok_or_else(|| format!("{flag} needs a value ({USAGE})"))?
+            }
+        };
+        match flag {
+            "--port" => out.port = val.parse::<u16>().map_err(|_| format!("bad port {val:?}"))?,
+            "--slot-save-path" => {
+                if val.is_empty() {
+                    return Err(format!("--slot-save-path needs a directory ({USAGE})"));
+                }
+                out.slot_save_path = Some(val);
+            }
+            _ => return Err(format!("unknown argument {a:?} ({USAGE})")),
+        }
         i += 1;
     }
-    Ok(port)
+    Ok(out)
+}
+
+/// - the port half of `parse_args`, the view the #26 A4 argument test drives
+#[cfg(test)]
+fn parse_port(args: &[String]) -> Result<u16, String> {
+    parse_args(args).map(|a| a.port)
 }
 
 // ------------------------------------------------- tokenize subcommand (A3)
@@ -717,6 +795,61 @@ fn props_json(model_path: &str, n_ctx: usize, prompt_chunk: usize) -> serde_json
         "prompt_chunk": prompt_chunk,
         "build": "crow-nest-engine 0.1.0",
     })
+}
+
+/// - value of one query parameter of a request target, `None` when it is absent
+/// - #32 A10: Crow names the action in the query (`crow_core.py:2458`), not in the body
+/// - no percent decoding: `save` and `restore` are the only values this server reads
+fn query_param<'a>(target: &'a str, key: &str) -> Option<&'a str> {
+    let q = &target[target.find('?')? + 1..];
+    let q = &q[..q.find('#').unwrap_or(q.len())];
+    q.split('&').find_map(|pair| pair.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// - `GET /slots` (#32 A10), the shape Crow's measuring tools read
+/// - one element, because this process holds ONE conversation (M1)
+/// - `n_prompt_tokens` is the held PREFILL CLEAN position, 0 when none is held
+fn slots_json(n_ctx: usize, n_prompt_tokens: usize) -> serde_json::Value {
+    serde_json::json!([{
+        "id": 0,
+        "n_ctx": n_ctx,
+        "n_prompt_tokens": n_prompt_tokens,
+        "is_processing": false,
+    }])
+}
+
+/// the answer of `POST /slots/0?action=save`; only `n_saved` is contractual
+fn slot_saved_json(filename: &str, s: &crow_nest_engine::slot::Saved) -> serde_json::Value {
+    serde_json::json!({
+        "id_slot": 0,
+        "filename": filename,
+        "n_saved": s.n_saved,
+        "n_written": s.n_written,
+        "timings": { "save_ms": s.ms },
+    })
+}
+
+/// the answer of `POST /slots/0?action=restore`; only `n_restored` is contractual
+fn slot_restored_json(filename: &str, r: &crow_nest_engine::slot::Restored) -> serde_json::Value {
+    serde_json::json!({
+        "id_slot": 0,
+        "filename": filename,
+        "n_restored": r.n_restored,
+        "n_read": r.n_read,
+        "timings": { "restore_ms": r.ms },
+    })
+}
+
+/// - the `filename` of a `/slots/0` body, sanitized to a bare file name
+/// - `Err` carries the message the 400 body shows
+fn slot_filename(body: &[u8]) -> Result<String, String> {
+    let doc: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| format!("the /slots/0 body is not a JSON object: {e}"))?;
+    let name = doc
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "the /slots/0 body needs a string \"filename\"".to_string())?;
+    slot::sanitize_filename(name).map(|s| s.to_string())
 }
 
 fn not_found_json(path: &str) -> serde_json::Value {
@@ -1712,6 +1845,72 @@ struct Srv<'a> {
     parked_sampler: Option<DevSampler>,
     /// #31 A9: the ONE held conversation of this process and its two snapshots (spec 7.6)
     cache: PrefixCache,
+    /// #32 A10: `--slot-save-path <dir>`; `None` makes `/slots/0` refuse both actions
+    slot_save_path: Option<String>,
+}
+
+/// - `POST /slots/0?action=save|restore` (#32 A10)
+/// - every refusal is a 4xx with a JSON error body and leaves the engine untouched
+/// - the return value is the status and the document `serve_one` writes
+fn slot_route(srv: &mut Srv, target: &str, body: &[u8]) -> (&'static str, serde_json::Value) {
+    let refuse = |msg: String| {
+        eprintln!("[slot] refused: {msg}");
+        ("400 Bad Request", error_json(&msg))
+    };
+    let Some(action) = query_param(target, "action") else {
+        return refuse("no action in the query string (save or restore)".to_string());
+    };
+    let name = match slot_filename(body) {
+        Ok(n) => n,
+        Err(e) => return refuse(e),
+    };
+    let Some(dir) = srv.slot_save_path.clone() else {
+        return refuse("this server was started without --slot-save-path".to_string());
+    };
+    let path = std::path::Path::new(&dir).join(&name);
+    match action {
+        "save" => {
+            // 409, and the ONE case that earns it: the request is well formed and the
+            // process simply holds no prefill clean position yet. The status belongs
+            // here, at the HTTP layer, so `slot::save` can stay a plain Result<_, String>.
+            if srv.cache.prompt_slot().is_none() {
+                let m = "no prefill clean state is held; run one chat request first".to_string();
+                eprintln!("[slot] refused: {m}");
+                return ("409 Conflict", error_json(&m));
+            }
+            // unsafe: device to host copies only; the engine state is not written
+            match unsafe { slot::save(srv.eng, &srv.cache, srv.model_path, &path) } {
+                Ok(s) => {
+                    eprintln!(
+                        "[slot] save {name:?}: n_saved {}, {} B, {:.1} ms -> {}",
+                        s.n_saved,
+                        s.n_written,
+                        s.ms,
+                        path.display()
+                    );
+                    ("200 OK", slot_saved_json(&name, &s))
+                }
+                Err(e) => refuse(e),
+            }
+        }
+        // unsafe: host to device uploads plus the A4 graph teardown, as PrefixCache::rollback
+        "restore" => {
+            match unsafe { slot::restore(srv.eng, &mut srv.cache, srv.model_path, &path) } {
+                Ok(r) => {
+                    eprintln!(
+                        "[slot] restore {name:?}: n_restored {}, {} B, {:.1} ms <- {}",
+                        r.n_restored,
+                        r.n_read,
+                        r.ms,
+                        path.display()
+                    );
+                    ("200 OK", slot_restored_json(&name, &r))
+                }
+                Err(e) => refuse(e),
+            }
+        }
+        other => refuse(format!("unknown action {other:?} (save or restore)")),
+    }
 }
 
 fn serve_one(stream: &mut TcpStream, srv: &mut Srv) {
@@ -1772,6 +1971,15 @@ fn serve_one(stream: &mut TcpStream, srv: &mut Srv) {
                     "200 OK",
                     props_json(srv.model_path, srv.n_ctx, srv.prompt_chunk),
                 ),
+                Route::Slots => (
+                    label,
+                    "200 OK",
+                    slots_json(srv.n_ctx, srv.cache.prompt_slot().map(|(p, _)| p).unwrap_or(0)),
+                ),
+                Route::Slot0 => {
+                    let (status, doc) = slot_route(srv, &target, &body);
+                    (label, status, doc)
+                }
                 Route::NotFound => (label, "404 Not Found", not_found_json(&path)),
             }
         }
@@ -1793,8 +2001,8 @@ fn main() {
     if args.get(1).map(|s| s.as_str()) == Some("tokenize") {
         std::process::exit(tokenize_main(&args[2..]));
     }
-    let port = match parse_port(&args) {
-        Ok(p) => p,
+    let cli = match parse_args(&args) {
+        Ok(a) => a,
         Err(e) => {
             eprintln!("[serve] {e}");
             std::process::exit(2);
@@ -1863,7 +2071,13 @@ fn main() {
     eprintln!("[serve] n_ctx {n_ctx}");
     eprintln!("[serve] prompt_chunk {prompt_chunk}");
 
-    let addr = format!("127.0.0.1:{port}");
+    // #32 A10: without --slot-save-path, POST /slots/0 refuses save and restore
+    match &cli.slot_save_path {
+        Some(d) => eprintln!("[serve] slot save path {d}"),
+        None => eprintln!("[serve] no --slot-save-path, so POST /slots/0 refuses save and restore"),
+    }
+
+    let addr = format!("127.0.0.1:{}", cli.port);
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,
         Err(e) => {
@@ -1891,6 +2105,7 @@ fn main() {
         seq: 0,
         parked_sampler: None,
         cache,
+        slot_save_path: cli.slot_save_path.clone(),
     };
     for conn in listener.incoming() {
         match conn {
@@ -2953,5 +3168,124 @@ mod tests {
             error_json("chunked transfer encoding not supported")["error"],
             "chunked transfer encoding not supported"
         );
+    }
+    // ------------------------------------------------- #32 A10, /slots and /slots/0
+
+    #[test]
+    fn the_slot_routes_dispatch_on_method_and_path() {
+        let d = |line: &str| {
+            let (m, t) = parse_request_line(line).expect("request line parses");
+            route(&m, route_path(&t))
+        };
+        assert_eq!(d("GET /slots HTTP/1.1
+"), Route::Slots);
+        assert_eq!(d("GET /slots/ HTTP/1.1
+"), Route::Slots);
+        assert_eq!(d("POST /slots/0?action=save HTTP/1.1
+"), Route::Slot0);
+        assert_eq!(d("POST /slots/0?action=restore HTTP/1.1
+"), Route::Slot0);
+        // the methods are not interchangeable, and no other slot id exists
+        assert_eq!(d("POST /slots HTTP/1.1
+"), Route::NotFound);
+        assert_eq!(d("GET /slots/0 HTTP/1.1
+"), Route::NotFound);
+        assert_eq!(d("POST /slots/1?action=save HTTP/1.1
+"), Route::NotFound);
+    }
+
+    #[test]
+    fn the_action_is_read_out_of_the_query_string() {
+        assert_eq!(query_param("/slots/0?action=save", "action"), Some("save"));
+        assert_eq!(query_param("/slots/0?action=restore", "action"), Some("restore"));
+        // more than one parameter, in either order, and a fragment after it
+        assert_eq!(query_param("/slots/0?id=0&action=save", "action"), Some("save"));
+        assert_eq!(query_param("/slots/0?action=save&id=0", "action"), Some("save"));
+        assert_eq!(query_param("/slots/0?action=save#x", "action"), Some("save"));
+        // absent, empty and a prefix that only looks like the key
+        assert_eq!(query_param("/slots/0", "action"), None);
+        assert_eq!(query_param("/slots/0?", "action"), None);
+        assert_eq!(query_param("/slots/0?actionx=save", "action"), None);
+        assert_eq!(query_param("/slots/0?xaction=save", "action"), None);
+        assert_eq!(query_param("/slots/0?action=", "action"), Some(""));
+    }
+
+    /// `tools/measure-slot-restart.ps1:87` and `tools/probe-slot-persistence.py:152` read
+    /// element 0 of this array and take `n_prompt_tokens` out of it
+    #[test]
+    fn the_slots_document_is_an_array_of_exactly_one_slot() {
+        let doc = slots_json(200_000, 16_064);
+        let arr = doc.as_array().expect("an array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], 0);
+        assert_eq!(arr[0]["n_ctx"], 200_000);
+        assert_eq!(arr[0]["n_prompt_tokens"], 16_064);
+        assert_eq!(arr[0]["is_processing"], serde_json::Value::Bool(false));
+        // an empty slot says 0, it does not omit the key
+        let empty = slots_json(200_000, 0);
+        assert_eq!(empty[0]["n_prompt_tokens"], 0);
+    }
+
+    /// `crow_core.py:2458` reads `n_saved` and nothing else
+    #[test]
+    fn a_save_answer_carries_n_saved_as_an_integer() {
+        let s = crow_nest_engine::slot::Saved { n_saved: 16_064, n_written: 352_861_048, ms: 1234.5 };
+        let doc = slot_saved_json("crow-slot.bin", &s);
+        assert_eq!(doc["id_slot"], 0);
+        assert_eq!(doc["filename"], "crow-slot.bin");
+        assert_eq!(doc["n_saved"].as_u64(), Some(16_064));
+        assert!(doc["n_saved"].is_u64(), "n_saved must be an integer, not a float");
+        assert_eq!(doc["n_written"].as_u64(), Some(352_861_048));
+        assert_eq!(doc["timings"]["save_ms"].as_f64(), Some(1234.5));
+    }
+
+    /// `crow_core.py:2688` reads `n_restored` and compares it with the saved `n_saved`
+    #[test]
+    fn a_restore_answer_carries_n_restored_as_an_integer() {
+        let r = crow_nest_engine::slot::Restored { n_restored: 16_064, n_read: 352_861_048, ms: 987.6 };
+        let doc = slot_restored_json("crow-slot.bin", &r);
+        assert_eq!(doc["id_slot"], 0);
+        assert_eq!(doc["filename"], "crow-slot.bin");
+        assert_eq!(doc["n_restored"].as_u64(), Some(16_064));
+        assert!(doc["n_restored"].is_u64(), "n_restored must be an integer, not a float");
+        assert_eq!(doc["n_read"].as_u64(), Some(352_861_048));
+        assert_eq!(doc["timings"]["restore_ms"].as_f64(), Some(987.6));
+    }
+
+    #[test]
+    fn the_filename_is_read_from_the_body_and_sanitized() {
+        assert_eq!(slot_filename(br#"{"filename":"crow-session.bin"}"#), Ok("crow-session.bin".to_string()));
+        // a path separator never becomes a path (crow-nest owns the directory, not the client)
+        assert!(slot_filename(br#"{"filename":"../x.bin"}"#).is_err());
+        assert!(slot_filename(br#"{"filename":"a/b.bin"}"#).is_err());
+        assert!(slot_filename(br#"{"filename":"a\b.bin"}"#).is_err());
+        // absent, wrong type, empty and a body that is not JSON at all
+        assert!(slot_filename(br#"{}"#).is_err());
+        assert!(slot_filename(br#"{"filename":7}"#).is_err());
+        assert!(slot_filename(br#"{"filename":""}"#).is_err());
+        assert!(slot_filename(b"not json").is_err());
+        assert!(slot_filename(b"").is_err());
+    }
+
+    #[test]
+    fn the_slot_directory_comes_from_the_command_line() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_args(&v(&["serve"])).map(|a| a.slot_save_path), Ok(None));
+        assert_eq!(
+            parse_args(&v(&["serve", "--slot-save-path", "decode_out"])).map(|a| a.slot_save_path),
+            Ok(Some("decode_out".to_string()))
+        );
+        assert_eq!(
+            parse_args(&v(&["serve", "--slot-save-path=decode_out"])).map(|a| a.slot_save_path),
+            Ok(Some("decode_out".to_string()))
+        );
+        // both flags together, in either order, and the port still parses
+        let a = parse_args(&v(&["serve", "--port", "8099", "--slot-save-path", "d"])).unwrap();
+        assert_eq!((a.port, a.slot_save_path), (8099, Some("d".to_string())));
+        let b = parse_args(&v(&["serve", "--slot-save-path", "d", "--port=1234"])).unwrap();
+        assert_eq!((b.port, b.slot_save_path), (1234, Some("d".to_string())));
+        // a flag without its value is a usage error, not a silent default
+        assert!(parse_args(&v(&["serve", "--slot-save-path"])).is_err());
+        assert!(parse_args(&v(&["serve", "--slot-save-path="])).is_err());
     }
 }
