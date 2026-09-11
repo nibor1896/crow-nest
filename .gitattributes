@@ -1,0 +1,3 @@
+# F1 (#57): the checksum file and its log stay LF on every checkout, sha256sum -c reads them byte for byte
+SHA256SUMS text eol=lf
+SHA256SUMS.log text eol=lf
