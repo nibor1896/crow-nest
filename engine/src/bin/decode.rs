@@ -221,6 +221,7 @@ fn main() {
                 // host bookkeeping is the only part still inside the token time
                 let mut trickle_swaps = 0usize;
                 let mut tick_us = 0u128;
+                crow_nest_engine::gen::stage_dma_reset();
                 for i in 1..gen {
                     let t0 = std::time::Instant::now();
                     if adapt_stream && adapt_every > 0 {
@@ -273,6 +274,7 @@ fn main() {
                 println!("cold experts per timed decode token: {:.1} of {:.0} selections -> {:.0} MB/token zero-copy",
                     cold as f64 / gen_timed, sel as f64 / gen_timed,
                     cold as f64 / gen_timed * (eng.res.gu_bytes + eng.res.dn_bytes) as f64 / 1e6);
+                crow_nest_engine::gen::stage_dma_report(gen_timed as u64);
             if std::env::var("CROW_PROFILE").is_ok() {
                 crow_nest_engine::gen::prof::kprof_report(gen as u64);
                 crow_nest_engine::gen::prof::report();

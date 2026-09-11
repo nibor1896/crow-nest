@@ -435,6 +435,8 @@ pub struct Stage {
     pub gu_b: Dev,    // i32 gu_bytes
     pub dn_b: Dev,    // i32 dn_bytes
     pub max: usize,   // combos with a staging slot
+    // CROW_STAGE_DMA scratch: [max] u64 gu ptrs | [max] u64 dn ptrs | [..] u32 cold mask
+    pub dma: Option<cuda::Pinned>,
     // ---- prefill grouped-GEMM plan (CROW_PF_GEMM) ----
     pub counts: Dev,   // [512] u32 (zeroed by moe_plan)
     pub offsets: Dev,  // [513] i32
@@ -515,6 +517,17 @@ pub fn stage_split() -> u32 {
 fn stage_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CROW_STAGE").as_deref() != Ok("0"))
+}
+
+/// CROW_STAGE_DMA (default off, measurement, #19b): the cold combos of a layer are
+/// staged by the COPY ENGINE (one cuMemcpyDtoDAsync per cold combo and matrix from the
+/// mapped host pointer, pcie_probe variant f = 55.0 GB/s) instead of the stage_cold
+/// kernel (31.5 GB/s SM-read ceiling). The routed pointers are known on the HOST only
+/// after router_top10 of that layer, so the path needs the decode graph off:
+/// graph_on() forces CROW_GRAPH off when this switch is on.
+pub fn stage_dma_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CROW_STAGE_DMA").as_deref() == Ok("1"))
 }
 
 pub struct LoadReport {
@@ -650,6 +663,7 @@ impl Engine {
             gu_b: cuda::to_i32_dev(&[slabs.gu_bytes as i32]),
             dn_b: cuda::to_i32_dev(&[slabs.dn_bytes as i32]),
             max: stage_max,
+            dma: if stage_dma_on() { Some(cuda::Pinned::alloc(stage_max * 16 + 256)) } else { None },
             counts: cuda::alloc_zeroed(E * 4),
             offsets: cuda::alloc_zeroed((E + 1) * 4),
             cursor: cuda::alloc_zeroed(E * 4),
@@ -1085,7 +1099,14 @@ fn swap_bundle_on() -> bool {
 }
 fn graph_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CROW_GRAPH").as_deref() == Ok("1"))
+    *ON.get_or_init(|| {
+        let on = std::env::var("CROW_GRAPH").as_deref() == Ok("1");
+        if on && stage_dma_on() {
+            println!("[stage] CROW_STAGE_DMA=1: decode graph disabled, host-issued staging");
+            return false;
+        }
+        on
+    })
 }
 
 /// dense-GEMV MMA switch: follows CROW_MMA unless CROW_MMA_DENSE=0 (A/B knob
@@ -1845,7 +1866,92 @@ impl Engine {
     }
 }
 
+/// CROW_STAGE_DMA counters (cumulative, reset by stage_dma_reset before the timed window)
+static DMA_SYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DMA_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DMA_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// host nanoseconds inside the per-layer read-back (DtoH issue plus the one sync)
+static DMA_NS_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// host nanoseconds inside the per-layer copy issue loop plus the pointer-table HtoD
+static DMA_NS_ISSUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn stage_dma_reset() {
+    use std::sync::atomic::Ordering;
+    DMA_SYNCS.store(0, Ordering::Relaxed);
+    DMA_COPIES.store(0, Ordering::Relaxed);
+    DMA_BYTES.store(0, Ordering::Relaxed);
+    DMA_NS_READ.store(0, Ordering::Relaxed);
+    DMA_NS_ISSUE.store(0, Ordering::Relaxed);
+}
+
+/// one line with the host cost of the DMA staging path; silent when it never ran
+pub fn stage_dma_report(tokens: u64) {
+    use std::sync::atomic::Ordering;
+    let sy = DMA_SYNCS.load(Ordering::Relaxed);
+    if sy == 0 { return; }
+    let co = DMA_COPIES.load(Ordering::Relaxed);
+    let by = DMA_BYTES.load(Ordering::Relaxed);
+    let rd = DMA_NS_READ.load(Ordering::Relaxed);
+    let is = DMA_NS_ISSUE.load(Ordering::Relaxed);
+    let d = tokens.max(1) as f64;
+    println!("stage dma per timed decode token: {:.1} host syncs, {:.1} copy-engine copies, {:.0} MB, read-back+sync {:.3} ms, issue {:.3} ms",
+        sy as f64 / d, co as f64 / d, by as f64 / 1e6 / d, rd as f64 / 1e6 / d, is as f64 / 1e6 / d);
+}
+
 impl Engine {
+    /// CROW_STAGE_DMA: host-issued cold staging through the copy engine.
+    /// Same shape as the PREFILL staging of CROW_PF_ASYNC=2 (`moe_run`, the `ce` branch:
+    /// host read-back of the device plan, then one copy-engine memcpy per cold record
+    /// into the staging slots), reduced to the decode case: the plan of a decode layer is
+    /// the cold mask plus the two routed pointer tables of `router_top10`, and the copies
+    /// go on the COMPUTE stream, so no `pa_ev_filled`/`pa_ev_done` event pair is needed.
+    /// Per layer: one async DtoH of the cold mask and both routed pointer tables,
+    /// exactly ONE host sync, one cuMemcpyDtoDAsync per cold combo and matrix
+    /// (mapped host pointer -> staging slot, pcie_probe variant f), then one HtoD
+    /// of the rewritten pointer tables. Hot combos keep their VRAM slab pointer.
+    /// Byte-for-byte the same slots and the same pointers as the stage_cold kernel.
+    unsafe fn stage_cold_dma(&self, t: usize) {
+        use std::sync::atomic::Ordering;
+        let s = &self.s;
+        let st = &self.stage;
+        let pin = st.dma.as_ref().expect("CROW_STAGE_DMA needs the pinned staging scratch");
+        let n = t * TOPK;
+        let (gu_b, dn_b) = (self.res.gu_bytes as usize, self.res.dn_bytes as usize);
+        let h = pin.host as *mut u8;
+        let h_gu = h as *mut u64;
+        let h_dn = h.add(st.max * 8) as *mut u64;
+        let h_cold = h.add(st.max * 16) as *mut u32;
+        // one DtoH batch on the compute stream, then exactly one host sync per layer
+        let t_read = std::time::Instant::now();
+        cuda::memcpy_async(h_gu as Dev, s.gu_ptrs, n * 8);
+        cuda::memcpy_async(h_dn as Dev, s.dn_ptrs, n * 8);
+        cuda::memcpy_async(h_cold as Dev, s.cold, t * 4);
+        cuda::sync();
+        DMA_SYNCS.fetch_add(1, Ordering::Relaxed);
+        DMA_NS_READ.fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let t_issue = std::time::Instant::now();
+        // the copies go on the COMPUTE stream in issue order: the routed GEMVs of
+        // this layer are issued after them, so no event and no second stream is
+        // needed (a side stream would need one event per layer for the same order)
+        let (mut copies, mut bytes) = (0u64, 0u64);
+        for c in 0..n {
+            if (*h_cold.add(c / TOPK) >> (c % TOPK)) & 1 == 0 { continue; }
+            let (dgu, ddn) = (st.gu + (c * gu_b) as Dev, st.dn + (c * dn_b) as Dev);
+            cuda::d2d_async(dgu, *h_gu.add(c), gu_b);
+            cuda::d2d_async(ddn, *h_dn.add(c), dn_b);
+            *h_gu.add(c) = dgu;
+            *h_dn.add(c) = ddn;
+            copies += 2;
+            bytes += (gu_b + dn_b) as u64;
+        }
+        DMA_COPIES.fetch_add(copies, Ordering::Relaxed);
+        DMA_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        // the rewritten tables land after the copies, before the GEMVs (stream order)
+        cuda::memcpy_async(st.sgu, h_gu as Dev, n * 8);
+        cuda::memcpy_async(st.sdn, h_dn as Dev, n * 8);
+        DMA_NS_ISSUE.fetch_add(t_issue.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
     unsafe fn moe_run(&self, l: usize, mixed_m: Dev, t: usize) -> Dev {
         let k = &self.k;
         let p = &self.p;
@@ -1873,7 +1979,9 @@ impl Engine {
         assert!(staged || lb.is_none() || (mma_on() && pf_gemm_on()),
             "low-bit cold tier needs a staging path (decode: t*TOPK <= stage.max; prefill: CROW_PF_GEMM)");
         let (gu_ptrs, dn_ptrs) = if staged {
-            if let Some(lb) = lb {
+            if stage_dma_on() && lb.is_none() {
+                self.stage_cold_dma(t);
+            } else if let Some(lb) = lb {
                 launch_v(k.f("stage_cold_lb"), (t * TOPK) as u32, 2, stage_split(), 256, &[
                     s.gu_ptrs as u64, s.dn_ptrs as u64, s.cold as u64,
                     self.stage.gu as u64, self.stage.dn as u64,
