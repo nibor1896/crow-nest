@@ -4,10 +4,10 @@
 
 | Item | Value |
 |---|---|
-| Variables in this table | 65 |
-| Distinct `CROW_[A-Z0-9_]+` tokens in the code | 65 in `engine/src`, 0 in `converter/src` |
+| Variables in this table | 66 |
+| Distinct `CROW_[A-Z0-9_]+` tokens in the code | 66 in `engine/src`, 0 in `converter/src` |
 | Measured | 2026-09-10, task E5, issue #46, parent #1 |
-| Repository state | branch `release-v0.1`, HEAD `1d08bcb`, 2026-09-11 |
+| Repository state | branch `release-v0.1`, HEAD `c185fb3` plus the `#34`, `#52` and `#53` commits, 2026-09-11 |
 | Guard | `tools/check_env_docs.py` (code list minus doc list must be empty, both ways) |
 | Rule | a variable not in this table does not exist |
 
@@ -55,8 +55,9 @@ Helpers used by the read sites:
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
-| `CROW_CNQ` | `engine/src/bin/decode.rs:40` | path; default `../converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` in `decode`, `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` in `parity`, `DEFAULT_CNQ` in `serve` (`bin/serve.rs:2270`, constant at `bin/serve.rs:446`) | selects the container file | operating | also read at `bin/parity.rs:150`, `bin/parity.rs:341`, `bin/residency.rs:45`, `bin/sf_scan.rs:7`; `decode`, `parity` and `serve` share the `-M` default since `#51` (2026-09-11); the two generator bins keep `../converter/Qwen3.8-Flash-Next-CNQ4.5.cnq`; chain value `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` |
-| `CROW_HOTSETS` | `engine/src/bin/decode.rs:45` | path; default `../decode_out/hotsets-M-longctx2100-n160.json` in `decode`, `decode_out/hotsets-M-longctx2100-n160.json` in `parity`, `DEFAULT_HOTSETS` in `serve` (`bin/serve.rs:2271`, constant at `bin/serve.rs:447`) | overrides the hot set sidecar | operating | also `bin/parity.rs:156`; the default is a literal since `#51` (2026-09-11), no longer `<cnq>.hotsets.json`, because the sidecar next to the `-M` container is ragged (`#49`); chain value `decode_out/hotsets-M-longctx2100-n160.json` |
+| `CROW_CNQ` | `engine/src/bin/decode.rs:40` | path; default `../converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` in `decode`, `residency` and `sf_scan`, `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` in `parity`, `DEFAULT_CNQ` in `serve` (`bin/serve.rs:2320`, constant at `bin/serve.rs:454`) | selects the container file | operating | also read at `bin/parity.rs:158`, `bin/parity.rs:371`, `bin/residency.rs:46`, `bin/sf_scan.rs:9`; all five default sites name `-M`, `decode`, `parity` and `serve` since `#51`, the two generator bins since `#52` (2026-09-11); `bin/plecheck.rs:5` and `bin/states.rs:45` hard-code the old container and read no variable; chain value `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` |
+| `CROW_HOTSETS` | `engine/src/bin/decode.rs:45` | path; default `../decode_out/hotsets-M-longctx2100-n160.json` in `decode`, `decode_out/hotsets-M-longctx2100-n160.json` in `parity`, `DEFAULT_HOTSETS` in `serve` (`bin/serve.rs:2321`, constant at `bin/serve.rs:455`) | overrides the hot set sidecar | operating | also `bin/parity.rs:164`; `residency` reads `CROW_HOTSETS_OUT` instead, because its sidecar path is an output (`#52`); the default is a literal since `#51` (2026-09-11), no longer `<cnq>.hotsets.json`, because the sidecar next to the `-M` container is ragged (`#49`); chain value `decode_out/hotsets-M-longctx2100-n160.json` |
+| `CROW_HOTSETS_OUT` | `engine/src/bin/residency.rs:50` | path; default `../decode_out/residency-warmup.hotsets.json` | names the sidecar file the `residency` warm-up WRITES, and reloads from on the next start | measurement | `#52` (2026-09-11): never `<container>.hotsets.json`, because the ragged sidecar of `#49` lives there and must stay byte-unchanged; read by `bin/residency.rs` only, `decode`, `parity` and `serve` read `CROW_HOTSETS` |
 | `CROW_COLD_TIER` | `engine/src/residency.rs:231` | path to `<cnq>.cold<bits>.bin`; default unset (exact NVFP4 tier) | installs the low-bit cold tier built by `bin/coldtier.rs` | operating | record sizes read from the header at `gen.rs:685`; `docs/architecture.md:1163` keeps it off for `serve` (7.5 condition 2) |
 | `CROW_COLD_FULL` | `engine/src/gen.rs:692` | `1`, `0`; default: full tier when `E * unit <= cfg.host_pinned_budget` | forces the full tier (every expert pinned) or cold-only | operating | full tier is what enables the prompt-adaptive hot set |
 | `CROW_RAM_MARGIN_GB` | `engine/src/residency.rs:249` | integer GiB; default `3` | free physical RAM that must remain after pinning the cold tier | operating | below the margin `residency.rs:255` panics before anything is pinned |
@@ -107,11 +108,11 @@ Helpers used by the read sites:
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
-| `CROW_ADAPT` | `engine/src/bin/decode.rs:94` | `1` enables; default off | re-cuts the hot set once after prefill | measurement | also `bin/decode.rs:155`, `bin/parity.rs:168`; harness only, `serve` never calls `adapt_tick` (#37, `docs/architecture.md:1181`); the gate chains set `=1` |
+| `CROW_ADAPT` | `engine/src/bin/decode.rs:94` | `1` enables; default off | re-cuts the hot set once after prefill | measurement | also `bin/decode.rs:155`, `bin/parity.rs:178`; harness only, `serve` never calls `adapt_tick` (#37, `docs/architecture.md:1181`); the gate chains set `=1` |
 | `CROW_ADAPT_DECAY` | `engine/src/gen.rs:3051` | float; default `0.5` | decay of the selection window used by the adaptation tick | measurement and `serve` | also `gen.rs:3072`; read only when `CROW_ADAPT_WINDOW=1`, which `serve` now sets itself, so this path is the `serve` default since #37 fix round 1 |
 | `CROW_ADAPT_EVERY` | `engine/src/geo.rs:169` | integer; default `0` = no tick | re-cut interval in decode tokens | measurement | overridden by the long-context policy when `CROW_ADAPT_STREAM` is unset and chunk >= 2048 (`geo.rs:174`) |
 | `CROW_ADAPT_MAX` | `engine/src/geo.rs:169` | integer; default `8` | maximum swaps per layer per tick | measurement | same policy override as `CROW_ADAPT_EVERY` |
-| `CROW_ADAPT_MAX0` | `engine/src/bin/decode.rs:96` | integer; default `0` = unbounded | caps the post-prefill swaps per layer (#21) | measurement | also `bin/decode.rs:158`, `bin/parity.rs:169` |
+| `CROW_ADAPT_MAX0` | `engine/src/bin/decode.rs:96` | integer; default `0` = unbounded | caps the post-prefill swaps per layer (#21) | measurement | also `bin/decode.rs:158`, `bin/parity.rs:179` |
 | `CROW_ADAPT_SPARE` | `engine/src/geo.rs:169` | integer; default `0`, or `1` with `CROW_ADAPT_STREAM=1` | spare hot slots held for the trickle | measurement | policy value is `7` at chunk >= 2048 (`geo.rs:174`) |
 | `CROW_ADAPT_STREAM` | `engine/src/geo.rs:170` | `1` manual stream trickle, `0` manual compute-stream swaps; default: policy by chunk | selects the adaptation mode and switches every knob to manual | measurement | #17, 2026-09-05, measured on the ten-task series: trickle gains 0.1 to 0.8 tok/s at chunk 2048 and loses 0.2 to 1.0 tok/s at chunk 512 (`geo.rs:154-159`); `gen.rs:3129` asserts spare slots exist |
 | `CROW_ADAPT_WINDOW` | `engine/src/gen.rs:3048` | `1` enables; default off in the library, `1` in `serve` (`bin/serve.rs:2313`) | ranks by a decayed count of selections since the last tick | measurement and `serve` (`serve` sets it to `1` when unset) | also `gen.rs:3066`; `gen.rs:3043`: swaps are the same exact three-way exchange, numerics untouched; #37 made `serve` tick the trickle, and its fix round 1 made `serve` set this variable when unset, so an explicit `CROW_ADAPT_WINDOW=0` still restores the CUMULATIVE ranking; read per tick, not through a `OnceLock` |
@@ -196,7 +197,7 @@ CROW_SAMPLE CROW_SAMPLE_HOST CROW_TEMP CROW_TOP_P CROW_TOP_K CROW_PRESENCE CROW_
 CROW_PF_ASYNC CROW_PF_TG CROW_STAGE_SPLIT CROW_CNQ_PURGE CROW_KPROF CROW_PROFILE
 ```
 
-- `CROW_SAMPLE` unset means greedy argmax (`bin/parity.rs:184`, `sample.rs:70`).
+- `CROW_SAMPLE` unset means greedy argmax (`bin/parity.rs:194`, `sample.rs:70`), and the record header of `parity` says so since `#53` (`bin/parity.rs:287`).
 - The C1 seed series adds `CROW_SAMPLE=1` and `CROW_SEED=2|3|4` to the same block.
 - The chain sets `CROW_ADAPT=1`, `CROW_CHUNK_AUTO=1` and `CROW_ADAPT_WINDOW=1`; all three are off by default in the library. This is a deliberate deviation, not a documentation error.
 - `CROW_ADAPT_WINDOW=1` is no longer a deviation for `serve`: `serve` sets it itself when it is unset (#37 fix round 1).

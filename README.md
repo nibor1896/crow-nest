@@ -155,6 +155,8 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 | layercheck | `max_abs` at or below 0.125 on the layer 0 golden (gate hard since 2026-09-04) | `decode layercheck` |
 | ten-task quality | no degeneration, Pass at least the reference minus one, Fail at most the reference | `parity phase 0 <crow or llama> decode_out/ten-tasks.json <outprefix>` |
 | env documentation | code set equals doc set | `python tools/check_env_docs.py` |
+| oracle transport | the harness sets `PYTHONIOENCODING=utf-8` and `PYTHONUTF8=1` on the Python oracle process, not the shell, since 2026-09-11 (issue #34) | `parity phase 0 crow decode_out/c1-tasks/t4-prose.json <prefix>` in a shell without both variables |
+| record header | a `parity` record names the sampler that produced it: greedy says greedy, a sampled run carries the profile and the seed, since 2026-09-11 (issue #53) | `meta.operating_point` of the written record |
 | README numbers | no number without a date, a unit or an identifier | `python tools/check_readme_dates.py` |
 | CI, GitHub Actions | four jobs on windows-latest: build, test, clippy (non-blocking), doc guards; engine tests 72 of 80 lib and 55 of 57 serve, 10 tokenizer tests skipped for want of `../models/`, measured 2026-09-11 | `.github/workflows/ci.yml` |
 
