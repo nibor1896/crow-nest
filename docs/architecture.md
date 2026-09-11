@@ -259,32 +259,47 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
   the primary path (kept behind the ring interface for tier transitions).
 - Policy is still per layer, chosen at load, fixed per session.
 - **Decode staging as built (`CROW_STAGE`, default on)**: after `router_top10` the
-  `stage_cold` kernel pulls every COLD combo of the layer into a VRAM staging slot with
-  coalesced 16-byte loads and rewrites the combo pointer tables; hot combos keep their
-  slab pointer. Measured 2026-09-11 (#19a): 10.248 ms/token, 33.0 GB/s at 338 MB/token.
+  staging kernel pulls every COLD combo of the layer into a VRAM staging slot and
+  rewrites the combo pointer tables; hot combos keep their slab pointer. The kernel is
+  `stage_cold_ca` since #19e (2026-09-12); `CROW_STAGE_KERNEL=1` restores `stage_cold`,
+  which reads with coalesced 16-byte loads and measured 10.248 ms/token at 33.0 GB/s over
+  338 MB/token on 2026-09-11 (#19a).
 - **`CROW_STAGE_DMA=1` (measurement only, #19b, default off)**: the same staging done by
   the COPY ENGINE, one `cuMemcpyDtoDAsync` per cold combo and matrix issued from the host
   from the mapped pinned pointer. The routed pointers exist on the host only after
   `router_top10` of that layer, so the switch forces the decode graph off and costs one
   host sync per layer. Not an operating default.
-- **`CROW_STAGE_KERNEL=2` (measurement only, #19d, default unset)**: the same staging
-  done by `stage_cold_ca` (`kernels.rs:2263`), a PERSISTENT grid of `CROW_STAGE_BLOCKS`
-  x 256 threads (default 40) launched from `gen.rs:2027`. Work item = (matrix, combo);
-  the owning block `item % gridDim.x` rewrites the pointer table entry, and the 4 KB
-  tiles of a cold item are split over all blocks, each tile read with
-  `cp.async.cg.shared.global` 16 B per thread into a two-deep shared double buffer and
-  stored coalesced to VRAM. Same inputs plus the combo count `t * TOPK` by value, same
-  outputs, still inside the decode graph.
+- **`stage_cold_ca` (the DEFAULT since #19e, 2026-09-12; `CROW_STAGE_KERNEL=1` falls
+  back)**: the same staging done by `stage_cold_ca` (`kernels.rs:2263`), a PERSISTENT
+  grid of `CROW_STAGE_BLOCKS` x 256 threads (default 40) launched from `gen.rs:2051`.
+  Work item = (matrix, combo); the owning block `item % gridDim.x` rewrites the pointer
+  table entry, and the 4 KB tiles of a cold item are split over all blocks, each tile
+  read with `cp.async.cg.shared.global` 16 B per thread into a two-deep shared double
+  buffer and stored coalesced to VRAM. Same inputs plus the combo count `t * TOPK` by
+  value, same outputs, still inside the decode graph.
 - **Requirement of `stage_cold_ca`**: both staged slab byte counts must be exact
-  multiples of 4096, because the kernel carries no tail tile. `gen.rs:2024` asserts it
-  at the launch site and the panic message names `CROW_STAGE_KERNEL` as the switch to
-  unset. This container: `gate_up` 1843200 B = 450 tiles, `down` 921600 B = 225 tiles.
+  multiples of 4096, because the kernel carries no tail tile. `gen.rs:683` asserts it at
+  load and `gen.rs:2048` again at the launch site; both panic messages name
+  `CROW_STAGE_KERNEL=1` as the fallback. This container: `gate_up` 1843200 B = 450 tiles,
+  `down` 921600 B = 225 tiles.
+- **Boot line**: every engine process prints one `[stage]` line naming the kernel it will
+  run, its grid and the slab byte counts (`gen.rs:697` for `stage_cold_ca`, `gen.rs:700`
+  for `stage_cold`), so every log says which kernel produced it.
 
 | Switch | Kernel | Grid | Read shape | Mode |
 |---|---|---|---|---|
-| unset (default) | `stage_cold` | `t * TOPK` x 2 x `CROW_STAGE_SPLIT`, 256 threads | 4 x 16 B `uint4` loads in flight per thread | operating |
-| `CROW_STAGE_KERNEL=2` | `stage_cold_ca` | `CROW_STAGE_BLOCKS` x 1 x 1, 256 threads | `cp.async.cg.shared.global` 16 B per thread into 4 KB shared tiles, 2-deep, slab bytes must be 4 KB multiples | measurement |
+| unset (default) | `stage_cold_ca` | `CROW_STAGE_BLOCKS` x 1 x 1, 256 threads | `cp.async.cg.shared.global` 16 B per thread into 4 KB shared tiles, 2-deep, slab bytes must be 4 KB multiples | operating |
+| `CROW_STAGE_KERNEL=1` | `stage_cold` | `t * TOPK` x 2 x `CROW_STAGE_SPLIT`, 256 threads | 4 x 16 B `uint4` loads in flight per thread | operating fallback |
 | `CROW_STAGE_DMA=1` | none, copy engine | host-issued `cuMemcpyDtoDAsync` per cold combo | copy engine, decode graph off | measurement |
+
+- The decode operating point that decided the default: #19e, 2026-09-12.
+- The two arms run different weights: crow-nest CNQ4.5-M (NVFP4, 4.5 bpw); llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL (GGUF, 2.4 bpw).
+- A tok/s figure is quoted only next to its adjacent arm in the same chain (#38).
+
+| shape metric | crow-nest, default `stage_cold_ca` | crow-nest, `CROW_STAGE_KERNEL=1` | llama.cpp | machine | date | source |
+|---|---|---|---|---|---|---|
+| decode, t1-read 16,064 ids, 255 timed steps | 26.46 ms per token = 37.8 tok/s | 29.68 ms per token = 33.7 tok/s | 22.27 ms per token = 44.9 tok/s | RTX 5090 | 2026-09-11 | `decode_out/srv-19d.log`, `decode_out/srv-59b.log` |
+| staging row of that step, nsys, 338 MB per token | 7.07 ms per token at 47.78 GB/s | 10.42 ms per token at 32.45 GB/s | n/a | RTX 5090 | 2026-09-11 | `decode_out/srv-19d.log` |
 
 ### 3.5 PLE in the loop
 
@@ -1319,6 +1334,7 @@ C:/x/y.md
 | B4 | #11, Crow #192 | ten tasks arm-phased greedy, crow ids == final4 10 of 10, quality result per engine in the "decided" table below (this section), one reader Rev3 | `srv-b4.log`, the ten `final4-*-run0-crow.json` |
 | C1 | #40 | sampling seeds 3 and 4, gate 0 seed 2 ids == smpv2 1,536 tokens, smp3 0/6/4, smp4 2/6/2 by the C1 reader | `srv-c1.log` (untracked since E3, named on #40) |
 | C2 | #44 | sampling seeds 5 and 6 plus one reader over six series, 60 answers, gate met in 1 of 6 seeds (smpv1 1/6/3, smpv2 1/6/3, smp3 0/6/4, smp4 1/7/2, smp5 0/7/3, smp6 1/5/4), 4 / 37 / 19 of 60, degeneration 0 of 60, reviewer re-judged 60 of 60 with 55 agreeing | `srv-c2.log`, `srv-c2-reader.log`, `srv-c2-review.log` (untracked since E3, named on #44) |
+| 19e | #19 | the decode staging kernel default flipped to `stage_cold_ca`: parity 7 of 7 forms byte-identical against `d211ab52ad2b` including the fallback `CROW_STAGE_KERNEL=1`, ten-task greedy ids == `final4` 10 of 10, A9 parts 1 to 3 PASS with reference shas 10 of 10, A10 smoke 6 of 6, three adjacent pairs 26.42 against 29.68 ms per token (mean, RTX 5090, 2026-09-12), ids sha `5098f885ab3a` in 7 of 7 runs | `srv-19e.log` |
 
 **The ten-task gate on the server path, decided (C2, robin 2026-09-11, #55):**
 
