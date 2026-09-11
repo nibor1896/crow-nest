@@ -107,6 +107,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 - The two arms run different weights: crow-nest CNQ4.5-M (NVFP4, 4.5 bpw); llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL (GGUF, 2.4 bpw). Every comparison names both.
 - A `serve` rate is not an engine rate: the difference is the missing hot-set tick (issue #37, measured 2026-09-10).
 - No tok/s number is quoted without an adjacent decode run in the same session (rule from issue #38, 2026-09-10); the #38 row above is the serve-to-serve drift pair itself, not a rate claim.
+- The sampler default is decided (issue #55, 2026-09-11): the request decides, no `temperature` is greedy, `temperature > 0` samples with the data-sheet defaults (`engine/src/bin/serve.rs:1041`); the six-seed and the greedy rows above are the measured basis.
 
 ### Targets
 
