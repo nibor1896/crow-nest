@@ -43,3 +43,5 @@ engine/.engine.lock
 # per-run scratch output of `decode run` (overwritten every run)
 engine/decode_out/run.json
 .superpowers/
+# the upload package is hard links to the 105 GB quant payload, never committed (F3, #58)
+hf-package/
