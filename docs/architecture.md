@@ -18,6 +18,11 @@ aims at and the harness reports against — the record's discipline stands: a mi
 measured result that re-cuts a stage (timebox guard), never a project failure. No goal
 is a pass/fail gate.
 
+- Amended 2026-09-11 (robin, chat, recorded on issue #1): an end state below llama.cpp on this
+  machine is not acceptable; the performance stage (#37, #38, a per-token kernel profile against
+  llama.cpp, #19, #10) runs before the quant upload (F4 to F6), and the comparison is quoted on one
+  prompt with both quantizations named (CNQ4.5-M 4.5 bpw against UD-Q2_K_XL 2.4 bpw).
+
 ### 0.2 Context
 
 - **Floor 200,000 tokens** — every shipped configuration must hold ≥ 200k; the engine
