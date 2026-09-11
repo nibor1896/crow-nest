@@ -45,9 +45,14 @@ fn tokenize(text: &str) -> Vec<i64> {
     // --chat: the crow arm receives the SAME token stream as the llama.cpp arm
     // (chat template, thinking disabled) — parity-gate fairness, fable gate 2026-09-03
     let py = ".venv-oracle/Scripts/python.exe";
+    // #34: the harness sets the oracle transport itself, not the shell.
+    // Python 3.13 on Windows decodes STDIN as cp1252 without it; measured
+    // 2026-09-09 on t4-prose: 9,522 ids bare against 9,398 ids with UTF-8.
     let mut child = Command::new(py)
         .arg("tools/tokenize_ids.py")
         .arg("--chat")
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -65,9 +70,12 @@ fn detokenize_all(map: &serde_json::Map<String, serde_json::Value>) -> serde_jso
     let tmp = "decode_out/_detok_in.json";
     std::fs::write(tmp, inp).unwrap();
     let py = ".venv-oracle/Scripts/python.exe";
+    // #34: same UTF-8 transport as `tokenize`, set on the process, not the shell
     let out = std::process::Command::new(py)
         .arg("tools/detokenize_ids.py")
         .arg(tmp)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
         .output()
         .expect("detokenize_ids.py (oracle venv) failed");
     assert!(out.status.success(), "detok stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -264,6 +272,28 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
     }
 }
 
+/// #53: the record header names the sampler that produced the answer.
+///
+/// | case | `operating_point` |
+/// |---|---|
+/// | `CROW_SAMPLE` unset | `200k floor, -np 1, greedy, temperature 0` |
+/// | `CROW_SAMPLE=1` | `200k floor, -np 1, sample: temp <t> top_p <p> top_k <k> presence <pr> seed <s>` |
+///
+/// - Source is `sample::Sampler::from_env`, the call `crow_complete` already makes
+///   for `measurements[].note` (`sample.rs:69`).
+/// - The note keeps the `gpu` or `host` suffix of `Sampler::describe`; the header
+///   names the profile and the seed only.
+/// - Before #53 both record sites stamped `greedy` on sampled runs too.
+fn operating_point() -> String {
+    match crow_nest_engine::sample::Sampler::from_env() {
+        None => "200k floor, -np 1, greedy, temperature 0".to_string(),
+        Some(s) => format!(
+            "200k floor, -np 1, sample: temp {} top_p {} top_k {} presence {} seed {}",
+            s.temperature, s.top_p, s.top_k, s.presence_penalty, s.seed
+        ),
+    }
+}
+
 fn rotate(prompts_all: &[Prompt], run_index: usize) -> (Vec<Prompt>, &'static str, &'static str) {
     let n = prompts_all.len();
     let shift = (run_index * 3) % n; // coprime-ish stride; reverse on odd runs
@@ -337,7 +367,7 @@ fn main() {
                 "first_mover_rule": first,
                 "order": prompts.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
                 "warmup": "one cold prefill per phase start, discarded (spec 0.3)",
-                "operating_point": "200k floor, -np 1, greedy, temperature 0",
+                "operating_point": operating_point(),
                 "crow_container": std::env::var("CROW_CNQ").unwrap_or_else(|_| "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq".into()),
             })];
             let out = format!("decode_out/{prefix}-run{run_index}-{arm}.json");
@@ -425,7 +455,7 @@ fn main() {
                         "prompt": p.id, "engine": which, "position_in_series": i,
                         "prefill_tok_s": pre, "decode_tok_s": dec, "wall_s": wall,
                         "note": note,
-                        "operating_point": "200k floor, -np 1, greedy",
+                        "operating_point": operating_point(),
                     }));
                     println!("{:>5} {:6} pre {pre:8.1} tok/s  dec {dec:8.1} tok/s", p.id, which);
                 }

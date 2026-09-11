@@ -1745,7 +1745,7 @@ fn chat_generate(
             if srv.eng.dev_sampler.is_none() {
                 srv.eng.dev_sampler = srv.parked_sampler.take();
             }
-            // unsafe: device uploads and one eager sampler launch, as parity.rs:182-195 does
+            // unsafe: device uploads and one eager sampler launch, as parity.rs:194-205 does
             unsafe {
                 srv.eng.enable_dev_sampler(s);
                 // the first id is drawn from the prefill's last logits row, not taken from argmax
