@@ -674,11 +674,13 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
   different hot sets.
 - Rule: the server must not enable it while A9 is the gate.
 - As built (#37): `serve` TICKS the stream trickle once per `decode_step`
-  (`bin/serve.rs:1833-1838`), the mirror of `bin/decode.rs:224-231`.
+  (`bin/serve.rs:1841-1843`), the mirror of `bin/decode.rs:224-231`.
 - Condition 2 is what allows it: the tick moves where an expert is read from, not what.
 - `adapt_tick`, the post-prefill re-cut of `CROW_ADAPT=1`, is still never called by `serve`.
+- The tick also runs for sampled requests, not only greedy: intended, harmless for identity
+  since logits are untouched, not measured (every #37 chain ran greedy).
 - The two preconditions `trickle_tick` asserts are read once at start
-  (`bin/serve.rs:1643-1648`), so a `CROW_COLD_TIER` process logs a line instead of panicking.
+  (`bin/serve.rs:1653-1655`), so a `CROW_COLD_TIER` process logs a line instead of panicking.
 - Fix round 1 of #37: `serve` sets `CROW_ADAPT_WINDOW=1` when it is unset, next to `CROW_GRAPH`
   and `CROW_MMA` (`bin/serve.rs:2313`), so the tick ranks swaps by the decayed selections since
   the last tick instead of the prefill-dominated cumulative count.
@@ -1174,9 +1176,9 @@ C:/x/y.md
 | `/completion` | not built | appears only in Crow's log-parser test fixtures |
 | `/apply-template` | not built | only Crow's probes call it (`tools/probe_reasoning_levels.py:92`, `tools/check_chat_template.py:19`) |
 | `delta.reasoning_content` | never emitted | `enable_thinking` is false on this path; Crow reads the key if present (`crow_core.py:4831-4877`) |
-| stream trickle in serve | ticked once per `decode_step` (#37) | `bin/serve.rs:1833-1838`, the mirror of `bin/decode.rs:224-231`; drained after the last step; one `[serve]` line at start says whether this process ticks, and the `[chat]` line carries `crow_trickle_swaps` per request |
+| stream trickle in serve | ticked once per `decode_step` (#37) | `bin/serve.rs:1841-1843`, the mirror of `bin/decode.rs:224-231`; drained after the last step; one `[serve]` line at start says whether this process ticks, and the `[chat]` line carries `crow_trickle_swaps` per request |
 | the trickle's ranking signal in serve | `CROW_ADAPT_WINDOW=1` by default (#37 fix round 1) | `bin/serve.rs:2313` sets it when unset, the same loop as `CROW_GRAPH` and `CROW_MMA`; an explicit `CROW_ADAPT_WINDOW=0` restores the cumulative ranking |
-| `adapt_tick` in serve | never called | the post-prefill re-cut of `CROW_ADAPT=1` stays a harness path; `bin/decode.rs:150-157` is the only caller |
+| `adapt_tick` in serve | never called | the post-prefill re-cut of `CROW_ADAPT=1` stays a harness path; callers are `bin/decode.rs:230` and `bin/parity.rs:208` |
 | `CROW_QSA_FULL=1` | out of scope | 7.7, the ring would dominate every size |
 | `CROW_COLD_TIER` low-bit tier | must stay off | 7.5 condition 2 |
 

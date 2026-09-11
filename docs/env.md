@@ -107,7 +107,7 @@ Helpers used by the read sites:
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
-| `CROW_ADAPT` | `engine/src/bin/decode.rs:94` | `1` enables; default off | re-cuts the hot set once after prefill | measurement | also `bin/decode.rs:155`, `bin/parity.rs:168`; harness only, `serve` never calls `adapt_tick` (#37, `docs/architecture.md:1174`); the gate chains set `=1` |
+| `CROW_ADAPT` | `engine/src/bin/decode.rs:94` | `1` enables; default off | re-cuts the hot set once after prefill | measurement | also `bin/decode.rs:155`, `bin/parity.rs:168`; harness only, `serve` never calls `adapt_tick` (#37, `docs/architecture.md:1181`); the gate chains set `=1` |
 | `CROW_ADAPT_DECAY` | `engine/src/gen.rs:3051` | float; default `0.5` | decay of the selection window used by the adaptation tick | measurement and `serve` | also `gen.rs:3072`; read only when `CROW_ADAPT_WINDOW=1`, which `serve` now sets itself, so this path is the `serve` default since #37 fix round 1 |
 | `CROW_ADAPT_EVERY` | `engine/src/geo.rs:169` | integer; default `0` = no tick | re-cut interval in decode tokens | measurement | overridden by the long-context policy when `CROW_ADAPT_STREAM` is unset and chunk >= 2048 (`geo.rs:174`) |
 | `CROW_ADAPT_MAX` | `engine/src/geo.rs:169` | integer; default `8` | maximum swaps per layer per tick | measurement | same policy override as `CROW_ADAPT_EVERY` |
