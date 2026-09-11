@@ -530,6 +530,24 @@ pub fn stage_dma_on() -> bool {
     *ON.get_or_init(|| std::env::var("CROW_STAGE_DMA").as_deref() == Ok("1"))
 }
 
+/// CROW_STAGE_KERNEL (default unset = today's stage_cold, byte for byte; `2` selects
+/// stage_cold_ca, the #19d persistent cp.async.cg 4 KB tile copy). 19c measured the
+/// cp.async.cg shape at 52.9 GB/s against 34.1 GB/s for the stage_cold shape in the
+/// same process (decode_out/srv-19c.log:73 and :162). The variant is a pure copy, so
+/// both settings must be byte-identical in parity.
+pub fn stage_kernel_ca() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CROW_STAGE_KERNEL").as_deref() == Ok("2"))
+}
+
+/// CROW_STAGE_BLOCKS (default 40, accepted 8 to 512, other values fall back): the
+/// persistent grid of stage_cold_ca. 19c: fewer blocks are faster, 40 x 256 was the
+/// best row (52.9 GB/s), 20 x 256 gave 52.6 and 160 x 256 gave 52.4.
+pub fn stage_blocks() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("CROW_STAGE_BLOCKS").ok().and_then(|v| v.parse().ok()).filter(|&g| (8..=512).contains(&g)).unwrap_or(40))
+}
+
 pub struct LoadReport {
     pub dense_bytes: u64,
     pub residency_report: Vec<String>,
@@ -653,6 +671,11 @@ impl Engine {
         let stage_max = (2 * TOPK).max(pf_tg() * if pf_async_on() { 2 } else { 1 }); // 2 x 64 slots x 2.76 MB = 354 MB (default since 2026-09-09; CROW_PF_ASYNC=0 CROW_PF_TG=32 = 88 MB)
         assert!(slabs.gu_bytes % (16 * stage_split() as u64) == 0 && slabs.dn_bytes % (16 * stage_split() as u64) == 0,
             "expert slab bytes must split into 16-byte units x STAGE_SPLIT");
+        if stage_kernel_ca() {
+            // #19d: one line so a log proves which staging kernel the process took
+            println!("[stage] CROW_STAGE_KERNEL=2: stage_cold_ca, {} blocks x 256 threads, 4096 B tiles (gate_up {} B = {} tiles, down {} B = {} tiles)",
+                stage_blocks(), slabs.gu_bytes, slabs.gu_bytes.div_ceil(4096), slabs.dn_bytes, slabs.dn_bytes.div_ceil(4096));
+        }
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
         let max_tiles = cfg.prompt_chunk * TOPK / 8 + E + 1;
         let stage = Stage {
@@ -1987,6 +2010,15 @@ impl Engine {
                     self.stage.gu as u64, self.stage.dn as u64,
                     self.stage.sgu as u64, self.stage.sdn as u64,
                     self.stage.gu_b as u64, self.stage.dn_b as u64, lb.bits_dev as u64, lb.lut_dev as u64]);
+            } else if stage_kernel_ca() {
+                // #19d: persistent cp.async.cg 4 KB tile copy, grid CROW_STAGE_BLOCKS
+                // x 1 x 1; the extra p.t argument carries the combo count that the
+                // persistent grid cannot read from gridDim.x
+                launch_v(k.f("stage_cold_ca"), stage_blocks(), 1, 1, 256, &[
+                    s.gu_ptrs as u64, s.dn_ptrs as u64, s.cold as u64,
+                    self.stage.gu as u64, self.stage.dn as u64,
+                    self.stage.sgu as u64, self.stage.sdn as u64,
+                    self.stage.gu_b as u64, self.stage.dn_b as u64, p.t as u64]);
             } else {
                 launch_v(k.f("stage_cold"), (t * TOPK) as u32, 2, stage_split(), 256, &[
                     s.gu_ptrs as u64, s.dn_ptrs as u64, s.cold as u64,

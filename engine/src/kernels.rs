@@ -2229,6 +2229,96 @@ extern "C" __global__ void stage_cold(const unsigned long long* __restrict__ gu_
     for (; i < per; i += blockDim.x) d4[i] = s4[i];
 }
 
+// ------------- #19d: persistent cp.async.cg staging (CROW_STAGE_KERNEL=2) -------------
+// Same nine inputs and the same two outputs as stage_cold, plus the device token
+// count t_p: a persistent grid cannot read the combo count from gridDim.x.
+// 19c measured a device-issued read of pinned host memory at 52.9 GB/s through
+// cp.async.cg.shared.global into 4 KB shared tiles on 40 x 256 blocks, against
+// 34.1 GB/s for the stage_cold shape in the same process.
+// Grid: G x 1 x 1 (CROW_STAGE_BLOCKS, default 40), block 256, one launch per layer.
+// Work item = (which, combo) over t * TOPK combos and both matrices:
+//   - the pointer-table entry of an item is written by the single owning block
+//     (item % gridDim.x), thread 0, so every combo is owned by exactly one block
+//     per matrix and every entry is written before the kernel ends, hence before
+//     any GEMV of the layer reads the tables;
+//   - the TILES of a cold item are split over ALL blocks (block b takes tile b,
+//     b + G, b + 2G, ...), because a decode layer has 2.55 cold combos of 10 on
+//     average: one item per block would leave 35 of 40 blocks idle and the bytes
+//     in flight would follow the cold count instead of G.
+// Static partition, no atomics, no shared counters, so the kernel is
+// graph-capturable and deterministic.
+// Tile 4096 B = 256 threads x 16 B. Tail rule: the last tile of a matrix carries
+// bytes - base bytes and only the threads with 16 * threadIdx.x below that
+// remainder copy; bytes stays a multiple of 16 by the host assert, so no sub-16
+// tail exists. Both staged matrices are exact multiples of 4096 today
+// (gate_up 1843200 = 450 x 4096, down 921600 = 225 x 4096), so the short tile
+// never runs in this container.
+// Double buffer: two 4 KB shared tiles; the loads of the next tile are committed
+// before cp.async.wait_group 1 releases the current tile for the 16 B stores.
+extern "C" __global__ void stage_cold_ca(const unsigned long long* __restrict__ gu_ptrs,
+                                         const unsigned long long* __restrict__ dn_ptrs,
+                                         const unsigned int* __restrict__ cold_mask,
+                                         unsigned char* __restrict__ stage_gu,
+                                         unsigned char* __restrict__ stage_dn,
+                                         unsigned long long* __restrict__ sgu_ptrs,
+                                         unsigned long long* __restrict__ sdn_ptrs,
+                                         const int* __restrict__ gu_bytes_p,
+                                         const int* __restrict__ dn_bytes_p,
+                                         const int* __restrict__ t_p) {
+    __shared__ uint4 smem[2][256];             // 2 x 4096 B double buffer
+    const int n_combo = (*t_p) * 10;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int G = gridDim.x;
+    const size_t soff = (size_t)tid << 4;      // byte offset of this thread in a tile
+    for (int which = 0; which < 2; ++which) {
+        const size_t bytes = (size_t)(which ? *dn_bytes_p : *gu_bytes_p);
+        const size_t ntile = (bytes + 4095) >> 12;
+        for (int combo = 0; combo < n_combo; ++combo) {
+            int tk = combo / 10, j = combo % 10;
+            bool cold = (cold_mask[tk] >> j) & 1u;
+            const unsigned char* src = (const unsigned char*)(which ? dn_ptrs[combo] : gu_ptrs[combo]);
+            unsigned char* dst = (which ? stage_dn : stage_gu) + (size_t)combo * bytes;
+            if (tid == 0 && (unsigned int)(which * n_combo + combo) % G == blockIdx.x) {
+                unsigned long long p = cold ? (unsigned long long)dst : (unsigned long long)src;
+                if (which) sdn_ptrs[combo] = p; else sgu_ptrs[combo] = p;
+            }
+            if (!cold) continue;
+            size_t idx = blockIdx.x;
+            if (idx >= ntile) continue;
+            int buf = 0;
+            size_t base = idx << 12;
+            size_t cur = (bytes - base) < 4096 ? (bytes - base) : 4096;
+            if (soff < cur) {
+                unsigned int sa = (unsigned int)__cvta_generic_to_shared(&smem[0][tid]);
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa), "l"(src + base + soff) : "memory");
+            }
+            asm volatile("cp.async.commit_group;" ::: "memory");
+            for (;;) {
+                size_t nidx = idx + G;
+                size_t nbase = nidx << 12;
+                size_t ncur = 0;
+                if (nidx < ntile) {
+                    ncur = (bytes - nbase) < 4096 ? (bytes - nbase) : 4096;
+                    if (soff < ncur) {
+                        unsigned int sa = (unsigned int)__cvta_generic_to_shared(&smem[buf ^ 1][tid]);
+                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa), "l"(src + nbase + soff) : "memory");
+                    }
+                    asm volatile("cp.async.commit_group;" ::: "memory");
+                    asm volatile("cp.async.wait_group 1;" ::: "memory");
+                } else {
+                    asm volatile("cp.async.wait_group 0;" ::: "memory");
+                }
+                __syncthreads();
+                if (soff < cur) *(uint4*)(dst + base + soff) = smem[buf][tid];
+                if (nidx >= ntile) break;
+                __syncthreads();
+                idx = nidx; base = nbase; cur = ncur; buf ^= 1;
+            }
+            __syncthreads();
+        }
+    }
+}
+
 // ---------------- prefill MoE: expert-grouped GEMM (CROW_PF_GEMM) ----------------
 // The per-combo GEMV read every routed expert once PER TOKEN (t=512: 5120
 // expert reads of 2.76 MB, most of them cold over PCIe). The grouped path
@@ -3113,7 +3203,7 @@ impl Kernels {
             "sigmoid_el", "sig2_div4", "mix_streams", "inject_residual", "silu_mul640",
             "silu_mul_combo", "acc_scale", "acc_combo", "gate_shared", "conv_silu", "transpose_rt",
             "conv_state_update", "split_qkv", "l2norm_repeat", "beta_g", "delta_rule_persist", "conv_step",
-            "delta_rule_step", "delta_rule_persist_r", "delta_rule_step_r", "rmsnorm_gated", "split_qg", "rope", "rope_p", "stage_cold", "stage_cold_lb", "stage_tiles_lb", "swap_pairs", "expand_slab", "moe_count", "moe_plan", "moe_scatter", "stage_tiles", "gemm_fp4_tiles", "silu_tiles", "quant_tiles", "store_kv", "attn_sel",
+            "delta_rule_step", "delta_rule_persist_r", "delta_rule_step_r", "rmsnorm_gated", "split_qg", "rope", "rope_p", "stage_cold", "stage_cold_ca", "stage_cold_lb", "stage_tiles_lb", "swap_pairs", "expand_slab", "moe_count", "moe_plan", "moe_scatter", "stage_tiles", "gemm_fp4_tiles", "silu_tiles", "quant_tiles", "store_kv", "attn_sel",
             "gate_mul", "rms128", "rope64", "pool4_cache", "qk_k_append", "d2d_block", "qsa_scores",
             "qsa_select", "qsa_select_fast", "router_top10", "gather_ple_fp4", "gate_dot", "gate_apply", "ple_conv",
             "ple_state_update", "ple_conv_step", "argmax_k", "sample_topk_part", "sample_k", "add_flat",

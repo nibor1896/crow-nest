@@ -70,7 +70,7 @@ Helpers used by the read sites:
 | `CROW_PLE_CACHE_MB` | `engine/src/gen.rs:639` | integer MiB; default `cfg.ple_cache_bytes` (128 MB in `serve`, `bin/serve.rs:47`) | size of the PLE hot-row cache | operating | VRAM diet knob, 2026-09-05; C1 allowlist keeps it unset (issue #11, comment 5621121049, C1 result) |
 | `CROW_PLE_PREFETCH` | `engine/src/gen.rs:2571` | `0` disables; default on | warms the next chunk's PLE rows on a helper thread | operating | no-op without a file mapping (`CROW_MMAP=0`) |
 
-## Prefill and chunking (10 rows)
+## Prefill and chunking (12 rows)
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
@@ -84,6 +84,8 @@ Helpers used by the read sites:
 | `CROW_STAGE` | `engine/src/gen.rs:519` | `0` selects direct zero-copy; default on | stages cold experts into VRAM with coalesced PCIe reads before the routed GEMVs | operating | decode path only (`t * TOPK <= stage.max`) |
 | `CROW_STAGE_SPLIT` | `engine/src/gen.rs:512` | `1`, `2`, `4`, `8`, `16`, `32`, `64`; other values fall back; default `8` | blocks per expert in the staging copies | measurement | measured 2026-09-04 with the WC tier: 16/32/64 keep more PCIe requests in flight |
 | `CROW_STAGE_DMA` | `engine/src/gen.rs:530` | `1` enables; default off | stages the cold combos of a layer with one `cuMemcpyDtoDAsync` per combo and matrix (copy engine, mapped host pointer) instead of the `stage_cold` kernel; forces `CROW_GRAPH` off | measurement | #19b, 2026-09-11; the routed pointers are known on the host only after `router_top10`, so the decode graph cannot hold the copies; one host sync per layer |
+| `CROW_STAGE_KERNEL` | `engine/src/gen.rs:538` | `2` selects `stage_cold_ca`; any other value or unset keeps `stage_cold` | shape of the decode staging copy: `stage_cold_ca` is a persistent grid that pulls each cold combo through `cp.async.cg.shared.global` into 4 KB shared tiles and stores them coalesced to VRAM | measurement | #19d, 2026-09-11; same signature plus `p.t`, same outputs, inside the decode graph; 19c measured the shape at 52.9 GB/s against 34.1 GB/s for the `stage_cold` shape |
+| `CROW_STAGE_BLOCKS` | `engine/src/gen.rs:546` | integer, accepted `8` to `512`, other values fall back; default `40` | blocks of the persistent `stage_cold_ca` grid (block 256) | measurement | #19d, 2026-09-11; read only when `CROW_STAGE_KERNEL=2`; 19c: fewer blocks are faster, 40 x 256 was the best probe row |
 
 ## Attention and kernels (15 rows)
 
