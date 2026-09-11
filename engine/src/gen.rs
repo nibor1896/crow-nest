@@ -434,6 +434,8 @@ pub struct Stage {
     pub sdn: Dev,
     pub gu_b: Dev,    // i32 gu_bytes
     pub dn_b: Dev,    // i32 dn_bytes
+    pub gu_bytes: u64, // host copy of the same two counts (#19d fix I3 assert)
+    pub dn_bytes: u64,
     pub max: usize,   // combos with a staging slot
     // CROW_STAGE_DMA scratch: [max] u64 gu ptrs | [max] u64 dn ptrs | [..] u32 cold mask
     pub dma: Option<cuda::Pinned>,
@@ -672,9 +674,10 @@ impl Engine {
         assert!(slabs.gu_bytes % (16 * stage_split() as u64) == 0 && slabs.dn_bytes % (16 * stage_split() as u64) == 0,
             "expert slab bytes must split into 16-byte units x STAGE_SPLIT");
         if stage_kernel_ca() {
-            // #19d: one line so a log proves which staging kernel the process took
-            println!("[stage] CROW_STAGE_KERNEL=2: stage_cold_ca, {} blocks x 256 threads, 4096 B tiles (gate_up {} B = {} tiles, down {} B = {} tiles)",
-                stage_blocks(), slabs.gu_bytes, slabs.gu_bytes.div_ceil(4096), slabs.dn_bytes, slabs.dn_bytes.div_ceil(4096));
+            // #19d: one line so a log proves the switch was READ; CROW_STAGE_DMA and
+            // the low-bit tier still take precedence at the launch site (fix M1)
+            println!("[stage] CROW_STAGE_KERNEL=2 requested: stage_cold_ca, {} blocks x 256 threads, 4096 B tiles (gate_up {} B = {} tiles, down {} B = {} tiles)",
+                stage_blocks(), slabs.gu_bytes, slabs.gu_bytes / 4096, slabs.dn_bytes, slabs.dn_bytes / 4096);
         }
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
         let max_tiles = cfg.prompt_chunk * TOPK / 8 + E + 1;
@@ -685,6 +688,8 @@ impl Engine {
             sdn: cuda::alloc_zeroed(stage_max * 8),
             gu_b: cuda::to_i32_dev(&[slabs.gu_bytes as i32]),
             dn_b: cuda::to_i32_dev(&[slabs.dn_bytes as i32]),
+            gu_bytes: slabs.gu_bytes,
+            dn_bytes: slabs.dn_bytes,
             max: stage_max,
             dma: if stage_dma_on() { Some(cuda::Pinned::alloc(stage_max * 16 + 256)) } else { None },
             counts: cuda::alloc_zeroed(E * 4),
@@ -2012,13 +2017,18 @@ impl Engine {
                     self.stage.gu_b as u64, self.stage.dn_b as u64, lb.bits_dev as u64, lb.lut_dev as u64]);
             } else if stage_kernel_ca() {
                 // #19d: persistent cp.async.cg 4 KB tile copy, grid CROW_STAGE_BLOCKS
-                // x 1 x 1; the extra p.t argument carries the combo count that the
-                // persistent grid cannot read from gridDim.x
+                // x 1 x 1; the tenth argument is the combo count BY VALUE, the very
+                // `t * TOPK` that `staged` bounds-checked against stage.max above, so
+                // the device item count and the host bound cannot disagree (fix I2)
+                // fix I3: the kernel has no tail tile, so both counts must be 4 KB
+                assert!(self.stage.gu_bytes % 4096 == 0 && self.stage.dn_bytes % 4096 == 0,
+                    "stage_cold_ca needs both staged byte counts to be multiples of 4096 (gate_up {} B, down {} B); unset CROW_STAGE_KERNEL to fall back to stage_cold",
+                    self.stage.gu_bytes, self.stage.dn_bytes);
                 launch_v(k.f("stage_cold_ca"), stage_blocks(), 1, 1, 256, &[
                     s.gu_ptrs as u64, s.dn_ptrs as u64, s.cold as u64,
                     self.stage.gu as u64, self.stage.dn as u64,
                     self.stage.sgu as u64, self.stage.sdn as u64,
-                    self.stage.gu_b as u64, self.stage.dn_b as u64, p.t as u64]);
+                    self.stage.gu_b as u64, self.stage.dn_b as u64, (t * TOPK) as u64]);
             } else {
                 launch_v(k.f("stage_cold"), (t * TOPK) as u32, 2, stage_split(), 256, &[
                     s.gu_ptrs as u64, s.dn_ptrs as u64, s.cold as u64,

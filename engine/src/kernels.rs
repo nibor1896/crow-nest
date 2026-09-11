@@ -2230,8 +2230,11 @@ extern "C" __global__ void stage_cold(const unsigned long long* __restrict__ gu_
 }
 
 // ------------- #19d: persistent cp.async.cg staging (CROW_STAGE_KERNEL=2) -------------
-// Same nine inputs and the same two outputs as stage_cold, plus the device token
-// count t_p: a persistent grid cannot read the combo count from gridDim.x.
+// Same nine inputs and the same two outputs as stage_cold, plus the combo count
+// n_combo_arg BY VALUE: a persistent grid cannot read it from gridDim.x, and the
+// host passes the very t * TOPK that it bounds-checked against stage.max at the
+// launch site (gen.rs), so the device item count and the host bound can never
+// disagree and no device scalar has to be refreshed for this kernel (fix I2).
 // 19c measured a device-issued read of pinned host memory at 52.9 GB/s through
 // cp.async.cg.shared.global into 4 KB shared tiles on 40 x 256 blocks, against
 // 34.1 GB/s for the stage_cold shape in the same process.
@@ -2247,12 +2250,14 @@ extern "C" __global__ void stage_cold(const unsigned long long* __restrict__ gu_
 //     in flight would follow the cold count instead of G.
 // Static partition, no atomics, no shared counters, so the kernel is
 // graph-capturable and deterministic.
-// Tile 4096 B = 256 threads x 16 B. Tail rule: the last tile of a matrix carries
-// bytes - base bytes and only the threads with 16 * threadIdx.x below that
-// remainder copy; bytes stays a multiple of 16 by the host assert, so no sub-16
-// tail exists. Both staged matrices are exact multiples of 4096 today
-// (gate_up 1843200 = 450 x 4096, down 921600 = 225 x 4096), so the short tile
-// never runs in this container.
+// Tile 4096 B = 256 threads x 16 B. REQUIREMENT: both staged byte counts are
+// exact multiples of 4096, asserted host-side at the launch site (gen.rs); a
+// container whose slabs are not 4 KB multiples must unset CROW_STAGE_KERNEL and
+// run stage_cold. The tail-tile branch of the first 19d draft was removed in fix
+// round 1: it was unreachable here and therefore never executed (fix I3).
+// This container: gate_up 1843200 = 450 x 4096, down 921600 = 225 x 4096.
+// blockDim.x MUST be 256: the shared tile is 256 x 16 B and every thread owns
+// smem[buf][threadIdx.x]; the single launch site hardcodes 256.
 // Double buffer: two 4 KB shared tiles; the loads of the next tile are committed
 // before cp.async.wait_group 1 releases the current tile for the 16 B stores.
 extern "C" __global__ void stage_cold_ca(const unsigned long long* __restrict__ gu_ptrs,
@@ -2264,15 +2269,15 @@ extern "C" __global__ void stage_cold_ca(const unsigned long long* __restrict__ 
                                          unsigned long long* __restrict__ sdn_ptrs,
                                          const int* __restrict__ gu_bytes_p,
                                          const int* __restrict__ dn_bytes_p,
-                                         const int* __restrict__ t_p) {
+                                         const unsigned long long n_combo_arg) {
     __shared__ uint4 smem[2][256];             // 2 x 4096 B double buffer
-    const int n_combo = (*t_p) * 10;
+    const int n_combo = (int)n_combo_arg;
     const unsigned int tid = threadIdx.x;
     const unsigned int G = gridDim.x;
     const size_t soff = (size_t)tid << 4;      // byte offset of this thread in a tile
     for (int which = 0; which < 2; ++which) {
         const size_t bytes = (size_t)(which ? *dn_bytes_p : *gu_bytes_p);
-        const size_t ntile = (bytes + 4095) >> 12;
+        const size_t ntile = bytes >> 12;      // host asserts bytes % 4096 == 0
         for (int combo = 0; combo < n_combo; ++combo) {
             int tk = combo / 10, j = combo % 10;
             bool cold = (cold_mask[tk] >> j) & 1u;
@@ -2287,8 +2292,7 @@ extern "C" __global__ void stage_cold_ca(const unsigned long long* __restrict__ 
             if (idx >= ntile) continue;
             int buf = 0;
             size_t base = idx << 12;
-            size_t cur = (bytes - base) < 4096 ? (bytes - base) : 4096;
-            if (soff < cur) {
+            {
                 unsigned int sa = (unsigned int)__cvta_generic_to_shared(&smem[0][tid]);
                 asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa), "l"(src + base + soff) : "memory");
             }
@@ -2296,23 +2300,19 @@ extern "C" __global__ void stage_cold_ca(const unsigned long long* __restrict__ 
             for (;;) {
                 size_t nidx = idx + G;
                 size_t nbase = nidx << 12;
-                size_t ncur = 0;
                 if (nidx < ntile) {
-                    ncur = (bytes - nbase) < 4096 ? (bytes - nbase) : 4096;
-                    if (soff < ncur) {
-                        unsigned int sa = (unsigned int)__cvta_generic_to_shared(&smem[buf ^ 1][tid]);
-                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa), "l"(src + nbase + soff) : "memory");
-                    }
+                    unsigned int sa = (unsigned int)__cvta_generic_to_shared(&smem[buf ^ 1][tid]);
+                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa), "l"(src + nbase + soff) : "memory");
                     asm volatile("cp.async.commit_group;" ::: "memory");
                     asm volatile("cp.async.wait_group 1;" ::: "memory");
                 } else {
                     asm volatile("cp.async.wait_group 0;" ::: "memory");
                 }
                 __syncthreads();
-                if (soff < cur) *(uint4*)(dst + base + soff) = smem[buf][tid];
+                *(uint4*)(dst + base + soff) = smem[buf][tid];
                 if (nidx >= ntile) break;
                 __syncthreads();
-                idx = nidx; base = nbase; cur = ncur; buf ^= 1;
+                idx = nidx; base = nbase; buf ^= 1;
             }
             __syncthreads();
         }

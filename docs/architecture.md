@@ -268,17 +268,22 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
   `router_top10` of that layer, so the switch forces the decode graph off and costs one
   host sync per layer. Not an operating default.
 - **`CROW_STAGE_KERNEL=2` (measurement only, #19d, default unset)**: the same staging
-  done by `stage_cold_ca` (`kernels.rs:2258`), a PERSISTENT grid of `CROW_STAGE_BLOCKS`
-  x 256 threads (default 40) launched from `gen.rs:2017`. Work item = (matrix, combo);
+  done by `stage_cold_ca` (`kernels.rs:2263`), a PERSISTENT grid of `CROW_STAGE_BLOCKS`
+  x 256 threads (default 40) launched from `gen.rs:2027`. Work item = (matrix, combo);
   the owning block `item % gridDim.x` rewrites the pointer table entry, and the 4 KB
   tiles of a cold item are split over all blocks, each tile read with
   `cp.async.cg.shared.global` 16 B per thread into a two-deep shared double buffer and
-  stored coalesced to VRAM. Same inputs, same outputs, still inside the decode graph.
+  stored coalesced to VRAM. Same inputs plus the combo count `t * TOPK` by value, same
+  outputs, still inside the decode graph.
+- **Requirement of `stage_cold_ca`**: both staged slab byte counts must be exact
+  multiples of 4096, because the kernel carries no tail tile. `gen.rs:2024` asserts it
+  at the launch site and the panic message names `CROW_STAGE_KERNEL` as the switch to
+  unset. This container: `gate_up` 1843200 B = 450 tiles, `down` 921600 B = 225 tiles.
 
 | Switch | Kernel | Grid | Read shape | Mode |
 |---|---|---|---|---|
 | unset (default) | `stage_cold` | `t * TOPK` x 2 x `CROW_STAGE_SPLIT`, 256 threads | 4 x 16 B `uint4` loads in flight per thread | operating |
-| `CROW_STAGE_KERNEL=2` | `stage_cold_ca` | `CROW_STAGE_BLOCKS` x 1 x 1, 256 threads | `cp.async.cg.shared.global` 16 B per thread into 4 KB shared tiles, 2-deep | measurement |
+| `CROW_STAGE_KERNEL=2` | `stage_cold_ca` | `CROW_STAGE_BLOCKS` x 1 x 1, 256 threads | `cp.async.cg.shared.global` 16 B per thread into 4 KB shared tiles, 2-deep, slab bytes must be 4 KB multiples | measurement |
 | `CROW_STAGE_DMA=1` | none, copy engine | host-issued `cuMemcpyDtoDAsync` per cold combo | copy engine, decode graph off | measurement |
 
 ### 3.5 PLE in the loop
