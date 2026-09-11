@@ -107,14 +107,14 @@ Helpers used by the read sites:
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
-| `CROW_ADAPT` | `engine/src/bin/decode.rs:94` | `1` enables; default off | re-cuts the hot set once after prefill | measurement | also `bin/decode.rs:155`, `bin/parity.rs:168`; harness only, `serve` never ticks adaptation (`docs/architecture.md:1161`); the gate chains set `=1` |
-| `CROW_ADAPT_DECAY` | `engine/src/gen.rs:3051` | float; default `0.5` | decay of the selection window used by the adaptation tick | measurement | also `gen.rs:3072`; read only when `CROW_ADAPT_WINDOW=1` |
+| `CROW_ADAPT` | `engine/src/bin/decode.rs:94` | `1` enables; default off | re-cuts the hot set once after prefill | measurement | also `bin/decode.rs:155`, `bin/parity.rs:168`; harness only, `serve` never calls `adapt_tick` (#37, `docs/architecture.md:1174`); the gate chains set `=1` |
+| `CROW_ADAPT_DECAY` | `engine/src/gen.rs:3051` | float; default `0.5` | decay of the selection window used by the adaptation tick | measurement and `serve` | also `gen.rs:3072`; read only when `CROW_ADAPT_WINDOW=1`; #37 made `serve` tick the trickle, so `serve` reaches this path too |
 | `CROW_ADAPT_EVERY` | `engine/src/geo.rs:169` | integer; default `0` = no tick | re-cut interval in decode tokens | measurement | overridden by the long-context policy when `CROW_ADAPT_STREAM` is unset and chunk >= 2048 (`geo.rs:174`) |
 | `CROW_ADAPT_MAX` | `engine/src/geo.rs:169` | integer; default `8` | maximum swaps per layer per tick | measurement | same policy override as `CROW_ADAPT_EVERY` |
 | `CROW_ADAPT_MAX0` | `engine/src/bin/decode.rs:96` | integer; default `0` = unbounded | caps the post-prefill swaps per layer (#21) | measurement | also `bin/decode.rs:158`, `bin/parity.rs:169` |
 | `CROW_ADAPT_SPARE` | `engine/src/geo.rs:169` | integer; default `0`, or `1` with `CROW_ADAPT_STREAM=1` | spare hot slots held for the trickle | measurement | policy value is `7` at chunk >= 2048 (`geo.rs:174`) |
 | `CROW_ADAPT_STREAM` | `engine/src/geo.rs:170` | `1` manual stream trickle, `0` manual compute-stream swaps; default: policy by chunk | selects the adaptation mode and switches every knob to manual | measurement | #17, 2026-09-05, measured on the ten-task series: trickle gains 0.1 to 0.8 tok/s at chunk 2048 and loses 0.2 to 1.0 tok/s at chunk 512 (`geo.rs:154-159`); `gen.rs:3129` asserts spare slots exist |
-| `CROW_ADAPT_WINDOW` | `engine/src/gen.rs:3048` | `1` enables; default off (cumulative re-cut) | ranks by a decayed count of selections since the last tick | measurement | also `gen.rs:3066`; `gen.rs:3043`: swaps are the same exact three-way exchange, numerics untouched |
+| `CROW_ADAPT_WINDOW` | `engine/src/gen.rs:3048` | `1` enables; default off (cumulative re-cut) | ranks by a decayed count of selections since the last tick | measurement and `serve` | also `gen.rs:3066`; `gen.rs:3043`: swaps are the same exact three-way exchange, numerics untouched; #37 made `serve` tick the trickle, so an unset value gives `serve` the CUMULATIVE ranking while the `decode run` gate chains set `=1`; measured 2026-09-11, `=1` moves `serve` from 26.6 to 32.3 tok/s on t1-read and from 212.9 to 140.0 cold experts per token, same 255 ids |
 | `CROW_SWAP_BUNDLE` | `engine/src/gen.rs:1084` | `1` enables; default off | exchanges all pairs of a tick in one launch per layer (#17) | measurement | comment site `gen.rs:3087` |
 
 ## Sampler (8 rows)

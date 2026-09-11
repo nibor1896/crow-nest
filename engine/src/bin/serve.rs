@@ -57,13 +57,16 @@
 //! - Only an unset variable is set; an explicit `CROW_GRAPH=0` still turns graphs off.
 //! - One stderr line per variable carries the effective value.
 //!
-//! Hot set adaptation (#26 review):
+//! Hot set adaptation (#26 review, #37):
 //!
 //! - `apply_adapt_policy` prints a `[policy] ... every N ...` line at start.
-//! - `serve` calls NEITHER `trickle_tick` NOR `adapt_tick`; `decode.rs:216-228` is the only caller.
-//! - The hot set therefore stays the loaded one for the whole process life.
-//! - One stderr line after the policy line says so, so the log cannot mislead.
-//! - Turning it on is an A6/A9 decision: greedy identity comes first.
+//! - #37: `serve` ticks the STREAM TRICKLE once per `decode_step`, the mirror of `decode.rs:224-231`.
+//! - `adapt_tick` (the post-prefill re-cut of `CROW_ADAPT=1`) is still NOT called by `serve`.
+//! - The tick runs only when the policy asked for the stream trickle with `every > 0`.
+//! - Two `trickle_tick` preconditions (`gen.rs:3128-3129`) are checked ONCE at start, not per token.
+//! - One stderr line after the policy line says whether this process ticks and why.
+//! - Per request the swaps go to the `[chat]` line as `crow_trickle_swaps`; the wire is untouched.
+//! - The trickle is drained after the last `decode_step`, so no copy crosses a request boundary.
 //!
 //! Concurrency (constant 4: one binary, no runtime):
 //!
@@ -352,7 +355,7 @@
 //! | counter | where | why not |
 //! |---|---|---|
 //! | `Engine::sel_counts` `[48][512]` u64 | `gen.rs:362`, same `router_top10` launch | per-expert warm-up bookkeeping, 24576 values; a block is not a histogram |
-//! | `Trickle::swaps` | `gen.rs:425` | `serve` calls neither `trickle_tick` nor `adapt_tick`, so it stays 0 and `self.trickle` stays `None` |
+//! | `Trickle::swaps` | `gen.rs:425` | cumulative over the process; #37 logs the REQUEST-LOCAL count as `crow_trickle_swaps` on the `[chat]` line instead |
 //! | `Stage::n_tiles` | `gen.rs:445` | per launch value, ZEROED by `moe_plan` every layer; not cumulative |
 //!
 //! - There is NO cumulative staging counter (bytes staged, tiles staged) in the engine today.
@@ -434,7 +437,7 @@
 use crow_nest_engine::cache::{PrefixCache, SLOTS, SLOT_PROMPT};
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::{DevSampler, Engine};
-use crow_nest_engine::geo::{apply_adapt_policy, Config, CONTEXT_FLOOR, LAYERS};
+use crow_nest_engine::geo::{apply_adapt_policy, Adapt, Config, CONTEXT_FLOOR, LAYERS};
 use crow_nest_engine::sample::{Sampler, EOS_IDS};
 use crow_nest_engine::slot;
 use crow_nest_engine::toolcall::{Emit, ToolStream, TOOL_OPEN};
@@ -1637,6 +1640,15 @@ struct GenOut {
     aborted: bool,
 }
 
+/// - #37: the two preconditions `Engine::trickle_tick` ASSERTS (`gen.rs:3128-3129`)
+/// - exact NVFP4 tier only: a `CROW_COLD_TIER` process has no three-way exchange
+/// - spare hot slots must exist (`stride > n`), or there is nothing to copy into
+/// - read once at start and once per request, never inside the token loop
+/// - a misconfigured process therefore logs one line instead of panicking mid request
+fn trickle_ready(eng: &Engine) -> bool {
+    eng.res.lb.is_none() && eng.res.stride > eng.res.n
+}
+
 /// - #39 B3a: THE generation loop of this server, the only one. `stream:true` runs it with
 ///   `SseSink`, `stream:false` with `CollectSink`; prefix cache, sampler, stop rules,
 ///   tool-call parser, snapshot, counters and the three `[chat]` stderr lines are shared.
@@ -1772,6 +1784,14 @@ fn chat_generate(
     let mut content_chunks = 0usize;
     let mut finish = "length";
     let mut decode_ms = 0.0f64;
+    // #37: the stream trickle, one tick per `decode_step`, the mirror of `decode.rs:224-231`.
+    // `cfg.adapt` is what `apply_adapt_policy` (geo.rs:167-176) gave this process: with
+    // `CROW_ADAPT_STREAM` unset and chunk 2048 that is stream / 7 spare / every 16 / max 7.
+    // `decode.rs` ticks for `i in 1..gen`, that is before every `decode_step` EXCEPT the
+    // first; loop index `i` here names the same token, so the guard is the same `i > 0`.
+    let Adapt { stream: adapt_stream, every: adapt_every, max: adapt_max, .. } = srv.eng.cfg.adapt;
+    let tick_trickle = adapt_stream && adapt_every > 0 && trickle_ready(srv.eng);
+    let mut trickle_swaps = 0usize;
     if !aborted {
         for i in 0..req.max_tokens {
             if EOS_IDS.contains(&next) {
@@ -1810,10 +1830,29 @@ fn chat_generate(
             if i + 1 == req.max_tokens {
                 break;
             }
+            // #37: the tick sits INSIDE the decode window, as it does in `decode.rs`, so
+            // `predicted_ms` carries the host bookkeeping of the trickle it pays for.
+            // unsafe: side-stream copies plus hot-set table flips (`gen.rs:3127-3197`)
+            if tick_trickle && i > 0 {
+                trickle_swaps += unsafe { srv.eng.trickle_tick(i % adapt_every == 0, adapt_max) };
+            }
             let t = *t_dec.get_or_insert_with(Instant::now);
             next = unsafe { srv.eng.decode_step(srv.cnq, next as i64) };
             decode_ms = t.elapsed().as_secs_f64() * 1e3;
         }
+    }
+
+    // #37: finish the trickle of THIS request, as `decode.rs:253` does after its loop.
+    // Outside the decode window on purpose: `decode run` does not charge the drain to a
+    // token either. No copy is left in flight, so the next request prefills on a settled
+    // hot set and the A9 warm turn sees the residency the `[chat]` line reported.
+    // unsafe: two empty ticks plus a stream sync (`gen.rs:3202-3216`)
+    if tick_trickle {
+        let drained = unsafe { srv.eng.trickle_drain() };
+        eprintln!(
+            "[chat] trickle {trickle_swaps} swaps started this request (every {adapt_every}, \
+             max {adapt_max}/layer, {drained} since process start)"
+        );
     }
 
     // the tail the hold back kept (a never completed sequence, or a real U+FFFD), plus the
@@ -1916,7 +1955,7 @@ fn chat_generate(
         (true, true)
     };
     eprintln!(
-        "[chat] prompt {} tok ({cached_n} cached, {prefilled} prefilled), generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {content_chunks}, tool chunks {tool_chunks}, tool calls {}, usage {}, timings {}{}",
+        "[chat] prompt {} tok ({cached_n} cached, {prefilled} prefilled), generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {content_chunks}, tool chunks {tool_chunks}, tool calls {}, usage {}, timings {}, crow_trickle_swaps {trickle_swaps}{}",
         ids.len(),
         per_second(prefilled, prefill_ms),
         (gen.saturating_sub(1)) as f64 * 1000.0 / decode_ms.max(1e-9),
@@ -2279,11 +2318,6 @@ fn main() {
     // M1: chunk pinned for the process, no per prompt policy
     cfg.prompt_chunk = SERVE_CHUNK;
     apply_adapt_policy(&mut cfg);
-    // #26 review: the "[policy] ... every N ..." line above comes from apply_adapt_policy, but
-    // serve calls neither trickle_tick nor adapt_tick (decode.rs:216-228 is the only caller)
-    eprintln!(
-        "[serve] hot-set adaptation is not ticked by serve in this build (greedy identity first; A6/A9 decide)"
-    );
 
     // unsafe: pins device and host memory; takes engine/.engine.lock, a second serve dies here
     let (eng, _rep) = unsafe {
@@ -2298,6 +2332,26 @@ fn main() {
     eprintln!("[serve] hotsets {sidecar}");
     eprintln!("[serve] n_ctx {n_ctx}");
     eprintln!("[serve] prompt_chunk {prompt_chunk}");
+
+    // #37: the "[policy] ..." line above is what apply_adapt_policy CHOSE; this line is what
+    // serve DOES with it. The stream trickle is ticked once per decode_step, the mirror of
+    // decode.rs:224-231. adapt_tick, the post-prefill re-cut of CROW_ADAPT=1, stays uncalled.
+    let ad = eng.cfg.adapt;
+    if ad.stream && ad.every > 0 && trickle_ready(&eng) {
+        eprintln!(
+            "[serve] #37 stream trickle ticked once per decode_step: every {}, max {}/layer, {} spare hot slot(s)",
+            ad.every, ad.max, ad.spare
+        );
+    } else {
+        eprintln!(
+            "[serve] #37 stream trickle NOT ticked: stream {}, every {}, spare slots {}, exact NVFP4 tier {}",
+            ad.stream,
+            ad.every,
+            eng.res.stride.saturating_sub(eng.res.n),
+            eng.res.lb.is_none()
+        );
+    }
+    eprintln!("[serve] adapt_tick (the CROW_ADAPT=1 hot-set re-cut) is never called by serve");
 
     // #32 A10: without --slot-save-path, POST /slots/0 refuses save and restore
     match &cli.slot_save_path {

@@ -50,6 +50,7 @@
 
 ### Changed
 
+- `#37`, 2026-09-11: `serve` ticks the stream trickle once per `decode_step`, the mirror of `bin/decode.rs:224-231`; `adapt_tick` stays uncalled, the trickle is drained after the last step, the request-local swap count goes to the `[chat]` stderr line as `crow_trickle_swaps`, and the wire `timings` block is unchanged. Measured in two six-run chains on the same day, serve and `decode run` D1 alternating: 23.13 to 25.57 tok/s before against 26.43 to 26.77 after, `decode run` 32.82 to 34.50 in both; the 255 generated ids are identical in all 12 runs.
 - `#55` C2, 2026-09-11: the `serve` sampler default is confirmed as built (`#28`): a request without `temperature` is greedy, `temperature > 0` samples with the data-sheet defaults; the ten-task gate under sampling is met in 1 of 6 seeds (`#44`), under greedy 0 of 1 (`#11`); no code change.
 - `#51` E8, 2026-09-11: `decode` and `parity` default to `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` and `decode_out/hotsets-M-longctx2100-n160.json`, the container and sidecar of `serve.rs:446-447`; five lines, `CROW_CNQ` and `CROW_HOTSETS` still override; closes `#48`.
 - `#42` E2, 2026-09-10: the history was rewritten with `git filter-repo` to drop the probe debug blobs. Every commit sha changed: `release-v0.1` head `4519f6f` became `aa6dd04`, `main` head `d36353a` became `e9e53cc`. Tracked bytes went from 253,232,175 to 38,397,227, blobs over 50 MB 0 after (before: one, the 125.28 MB blob of `#41`), `Co-Authored-By` trailers from 19 to 0. A pre-rewrite mirror was kept outside the repository.
@@ -68,7 +69,10 @@
 | ten-task quality, greedy | crow-nest 2 Pass / 5 Partial / 3 Fail, llama.cpp 2 / 6 / 2, of 10 each | 2026-09-10 | #11 |
 | decode, engine arm | crow-nest 35.5 to 46.8 tok/s, llama.cpp 44.4 to 48.2 tok/s | 2026-09-10 | #11 |
 | prefill, engine arm | crow-nest 110 to 706 tok/s, llama.cpp 265 to 846 tok/s | 2026-09-10 | #11 |
-| decode through `serve` | 22.42 tok/s against 38.31 tok/s for `decode run` on the same ids | 2026-09-10 | #37 |
+| decode through `serve`, before the hot-set tick | 23.13 to 25.57 tok/s against 33.06 to 34.50 for `decode run`, three adjacent pairs | 2026-09-11 | #37 |
+| decode through `serve`, with the hot-set tick | 26.43 to 26.77 tok/s against 32.82 to 32.98 for `decode run`, three adjacent pairs | 2026-09-11 | #37 |
+| cold experts per timed token on `serve` | 292.1 before the tick, 212.9 with it, 140.0 with it plus `CROW_ADAPT_WINDOW=1`, against 137.3 for `decode run` D1 | 2026-09-11 | #37 |
+| decode through `serve` with `CROW_ADAPT_WINDOW=1` | 32.20 to 32.33 tok/s against 32.78 to 32.88 for `decode run`, two adjacent pairs | 2026-09-11 | #37 |
 | run-to-run drift of a `serve` rate | 26 %, run 1 30.45 against run 6 22.42 tok/s | 2026-09-10 | #38 |
 | cold prefill of 16,064 ids on `serve` | 21.6 to 22.0 s | 2026-09-10 | #31 |
 | warm turn through the prefix cache | 404 ms for 95 of 16,159 ids, 99.41 % reused | 2026-09-10 | #31 |
@@ -83,7 +87,7 @@
 
 - Windows only; the Linux environment is unverified and stays open as `#15`.
 - Prefill is below its target; the remaining gap is exposed cold-tier copy plus dense GEMM, open as `#10`.
-- A `serve` rate is below the `decode run` rate on the same ids because `serve` never ticks the hot set, open as `#37`.
+- A `serve` rate is still below the `decode run` rate on the same ids, open as `#37`. The tick is built (2026-09-11): the mean delta to the adjacent `decode run` D1 moved from -28.55 % to -19.17 % over three pairs each. The rest is the ranking signal the tick plans with, `serve` 212.9 cold experts per token against 137.3 for `decode run` D1; `CROW_ADAPT_WINDOW=1` on the same binary gives -1.66 % and -1.78 % over two adjacent pairs, and whether `serve` should default to it is open.
 - A `serve` tok/s number drifts with run position on one machine, open as `#38`; no `serve` number enters the spec before it is re-measured.
 - The ten-task quality gate is not met on greedy, and sampling meets it on 1 of 6 seeds, open as `#11` and `#44`; decision on the default recorded in `#55`.
 - `min_p` is parsed and ignored: the device sampler implements top_k, top_p and presence only; decision M2 in `#28` (closed 2026-09-09), no tracking issue.
