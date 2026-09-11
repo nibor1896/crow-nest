@@ -42,8 +42,13 @@ fn main() {
     let warm_tokens: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(384);
     let n_requested: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(160);
 
-    let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| "../converter/Qwen3.8-Flash-Next-CNQ4.5.cnq".into());
-    let sidecar = format!("{cnq_path}.hotsets.json");
+    // #52: the generator defaults to the production -M container, like `decode` and `parity` (#51)
+    let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| "../converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq".into());
+    // #52: the warm-up WRITES this path, so it must never be `<container>.hotsets.json`:
+    // the ragged sidecar of #49 lives there and stays byte-unchanged.
+    // CROW_HOTSETS_OUT overrides; the default is under decode_out, next to the gate inputs.
+    let sidecar = std::env::var("CROW_HOTSETS_OUT")
+        .unwrap_or_else(|_| "../decode_out/residency-warmup.hotsets.json".into());
     let mut cnq = Cnq::open(&cnq_path);
 
     unsafe {

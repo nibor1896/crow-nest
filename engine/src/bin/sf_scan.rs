@@ -4,7 +4,9 @@ use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::geo::*;
 
 fn main() {
-    let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| "../converter/Qwen3.8-Flash-Next-CNQ4.5.cnq".into());
+    // #52: the probe defaults to the production -M container, like `decode` and `parity` (#51);
+    // read only, no sidecar is written here
+    let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| "../converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq".into());
     let mut cnq = Cnq::open(&cnq_path);
     let sec = "text";
     let layers: Vec<usize> = std::env::args()
