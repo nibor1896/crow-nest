@@ -4,10 +4,10 @@
 
 | Item | Value |
 |---|---|
-| Variables in this table | 66 |
-| Distinct `CROW_[A-Z0-9_]+` tokens in the code | 66 in `engine/src`, 0 in `converter/src` |
+| Variables in this table | 67 |
+| Distinct `CROW_[A-Z0-9_]+` tokens in the code | 67 in `engine/src`, 0 in `converter/src` |
 | Measured | 2026-09-10, task E5, issue #46, parent #1 |
-| Repository state | branch `release-v0.1`, HEAD `c185fb3` plus the `#34`, `#52` and `#53` commits, 2026-09-11 |
+| Repository state | branch `release-v0.1`, HEAD `486a0c0` plus the `#19b` commit, 2026-09-11 |
 | Guard | `tools/check_env_docs.py` (code list minus doc list must be empty, both ways) |
 | Rule | a variable not in this table does not exist |
 
@@ -59,7 +59,7 @@ Helpers used by the read sites:
 | `CROW_HOTSETS` | `engine/src/bin/decode.rs:45` | path; default `../decode_out/hotsets-M-longctx2100-n160.json` in `decode`, `decode_out/hotsets-M-longctx2100-n160.json` in `parity`, `DEFAULT_HOTSETS` in `serve` (`bin/serve.rs:2321`, constant at `bin/serve.rs:455`) | overrides the hot set sidecar | operating | also `bin/parity.rs:164`; `residency` reads `CROW_HOTSETS_OUT` instead, because its sidecar path is an output (`#52`); the default is a literal since `#51` (2026-09-11), no longer `<cnq>.hotsets.json`, because the sidecar next to the `-M` container is ragged (`#49`); chain value `decode_out/hotsets-M-longctx2100-n160.json` |
 | `CROW_HOTSETS_OUT` | `engine/src/bin/residency.rs:50` | path; default `../decode_out/residency-warmup.hotsets.json` | names the sidecar file the `residency` warm-up WRITES, and reloads from on the next start | measurement | `#52` (2026-09-11): never `<container>.hotsets.json`, because the ragged sidecar of `#49` lives there and must stay byte-unchanged; read by `bin/residency.rs` only, `decode`, `parity` and `serve` read `CROW_HOTSETS` |
 | `CROW_COLD_TIER` | `engine/src/residency.rs:231` | path to `<cnq>.cold<bits>.bin`; default unset (exact NVFP4 tier) | installs the low-bit cold tier built by `bin/coldtier.rs` | operating | record sizes read from the header at `gen.rs:685`; `docs/architecture.md:1163` keeps it off for `serve` (7.5 condition 2) |
-| `CROW_COLD_FULL` | `engine/src/gen.rs:692` | `1`, `0`; default: full tier when `E * unit <= cfg.host_pinned_budget` | forces the full tier (every expert pinned) or cold-only | operating | full tier is what enables the prompt-adaptive hot set |
+| `CROW_COLD_FULL` | `engine/src/gen.rs:706` | `1`, `0`; default: full tier when `E * unit <= cfg.host_pinned_budget` | forces the full tier (every expert pinned) or cold-only | operating | full tier is what enables the prompt-adaptive hot set |
 | `CROW_RAM_MARGIN_GB` | `engine/src/residency.rs:249` | integer GiB; default `3` | free physical RAM that must remain after pinning the cold tier | operating | below the margin `residency.rs:255` panics before anything is pinned |
 | `CROW_PINNED_WC` | `engine/src/residency.rs:275` | `0` restores cacheable pinned memory; default write-combined | allocation type of the pinned cold slabs | operating | measured 2026-09-04 (`pcie_probe`): WC 47.6 GB/s vs cacheable 24 GB/s |
 | `CROW_MMAP` | `engine/src/cnq.rs:91` | `0` disables; default on | maps the container read-only, row reads become page-cache memcpys | operating | doc comment `cnq.rs:29`: about 1 us on a hit instead of a seek plus read pair |
@@ -67,56 +67,57 @@ Helpers used by the read sites:
 | `CROW_QSA_FULL` | `engine/src/manager.rs:37` | `1` sets `ring = context`; default `ceil4(prompt_chunk + 4)` capped by context | size of the raw indexer-key ring per attention layer | measurement | pre-2026-09-05 layout; `docs/architecture.md:1162` marks it out of scope for `serve` |
 | `CROW_KV` | `engine/src/bin/decode.rs:62` | `bf16`; default the container KV dtype | parity ladder switch for the KV cache dtype | measurement | read only in `bin/decode.rs`, not by `serve` |
 | `CROW_PLE` | `engine/src/bin/decode.rs:65` | `off`; default on | parity ladder switch that disables the PLE stage | measurement | read only in `bin/decode.rs`, not by `serve` |
-| `CROW_PLE_CACHE_MB` | `engine/src/gen.rs:626` | integer MiB; default `cfg.ple_cache_bytes` (128 MB in `serve`, `bin/serve.rs:47`) | size of the PLE hot-row cache | operating | VRAM diet knob, 2026-09-05; C1 allowlist keeps it unset (issue #11, comment 5621121049, C1 result) |
-| `CROW_PLE_PREFETCH` | `engine/src/gen.rs:2463` | `0` disables; default on | warms the next chunk's PLE rows on a helper thread | operating | no-op without a file mapping (`CROW_MMAP=0`) |
+| `CROW_PLE_CACHE_MB` | `engine/src/gen.rs:639` | integer MiB; default `cfg.ple_cache_bytes` (128 MB in `serve`, `bin/serve.rs:47`) | size of the PLE hot-row cache | operating | VRAM diet knob, 2026-09-05; C1 allowlist keeps it unset (issue #11, comment 5621121049, C1 result) |
+| `CROW_PLE_PREFETCH` | `engine/src/gen.rs:2571` | `0` disables; default on | warms the next chunk's PLE rows on a helper thread | operating | no-op without a file mapping (`CROW_MMAP=0`) |
 
-## Prefill and chunking (9 rows)
+## Prefill and chunking (10 rows)
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
 | `CROW_CHUNK` | `engine/src/geo.rs:139` | integer tokens; default: policy by prompt length | authoritative prefill chunk size | operating | also `bin/decode.rs:58`, `bin/decode.rs:387`; `serve` pins 2048 for the process and does not call the policy (`bin/serve.rs:41-43`) |
 | `CROW_CHUNK_AUTO` | `engine/src/geo.rs:143` | `1`, `0`; default `1` when `CROW_CHUNK` is unset, `0` when it is set | applies the length policy on top of an explicit chunk, cap `max(CROW_CHUNK, 2048)` | operating | default since 2026-09-05; gated per `geo.rs:136-137`: chunk 1024 and 2048 deterministic since #22 |
-| `CROW_CHUNK_BALANCE` | `engine/src/gen.rs:2448` | `1` enables; default off | cuts the prompt into equal chunks instead of full chunks plus a tail | measurement | measured 2026-09-04: 3 x 700 gives 382 tok/s and loses to 1024+1024+52 at 414 tok/s; opt-in only |
-| `CROW_PF_ASYNC` | `engine/src/gen.rs:502` | `0`, `1`, `2`, `3`, `4`; default `2` | staging path of the prefill cold experts | operating | default since 2026-09-09 (#10, robin's call), gated: parity 8/512/1024 plus ten tasks ids equal to final4 without the env; values `3` and `4` are diagnostics, see the warning table |
-| `CROW_PF_DMA` | `engine/src/gen.rs:485` | `1` enables; default off | copy-engine prefetch ring of one layer's cold slab during prefill | measurement | measured 2026-09-04: with the exact NVFP4 tier the ring makes the plan infeasible; `gen.rs:713` disables it for the run when the ring does not fit |
-| `CROW_PF_GEMM` | `engine/src/gen.rs:490` | `0` disables; default on | expert-grouped tile GEMM for prefill-sized MoE batches | operating | `gen.rs:1874`: a low-bit cold tier needs this staging path |
-| `CROW_PF_TG` | `engine/src/gen.rs:462` | integer, clamped to `[8, 512]`; default `PF_TG` = 64 | tiles per staged group | operating | default 64 since 2026-09-09 (#10, gated on ten tasks with `CROW_PF_ASYNC=2`; 32 before); costs `CROW_PF_TG` x 2.76 MB of staging slots |
-| `CROW_STAGE` | `engine/src/gen.rs:517` | `0` selects direct zero-copy; default on | stages cold experts into VRAM with coalesced PCIe reads before the routed GEMVs | operating | decode path only (`t * TOPK <= stage.max`) |
-| `CROW_STAGE_SPLIT` | `engine/src/gen.rs:510` | `1`, `2`, `4`, `8`, `16`, `32`, `64`; other values fall back; default `8` | blocks per expert in the staging copies | measurement | measured 2026-09-04 with the WC tier: 16/32/64 keep more PCIe requests in flight |
+| `CROW_CHUNK_BALANCE` | `engine/src/gen.rs:2556` | `1` enables; default off | cuts the prompt into equal chunks instead of full chunks plus a tail | measurement | measured 2026-09-04: 3 x 700 gives 382 tok/s and loses to 1024+1024+52 at 414 tok/s; opt-in only |
+| `CROW_PF_ASYNC` | `engine/src/gen.rs:504` | `0`, `1`, `2`, `3`, `4`; default `2` | staging path of the prefill cold experts | operating | default since 2026-09-09 (#10, robin's call), gated: parity 8/512/1024 plus ten tasks ids equal to final4 without the env; values `3` and `4` are diagnostics, see the warning table |
+| `CROW_PF_DMA` | `engine/src/gen.rs:487` | `1` enables; default off | copy-engine prefetch ring of one layer's cold slab during prefill | measurement | measured 2026-09-04: with the exact NVFP4 tier the ring makes the plan infeasible; `gen.rs:713` disables it for the run when the ring does not fit |
+| `CROW_PF_GEMM` | `engine/src/gen.rs:492` | `0` disables; default on | expert-grouped tile GEMM for prefill-sized MoE batches | operating | `gen.rs:1874`: a low-bit cold tier needs this staging path |
+| `CROW_PF_TG` | `engine/src/gen.rs:464` | integer, clamped to `[8, 512]`; default `PF_TG` = 64 | tiles per staged group | operating | default 64 since 2026-09-09 (#10, gated on ten tasks with `CROW_PF_ASYNC=2`; 32 before); costs `CROW_PF_TG` x 2.76 MB of staging slots |
+| `CROW_STAGE` | `engine/src/gen.rs:519` | `0` selects direct zero-copy; default on | stages cold experts into VRAM with coalesced PCIe reads before the routed GEMVs | operating | decode path only (`t * TOPK <= stage.max`) |
+| `CROW_STAGE_SPLIT` | `engine/src/gen.rs:512` | `1`, `2`, `4`, `8`, `16`, `32`, `64`; other values fall back; default `8` | blocks per expert in the staging copies | measurement | measured 2026-09-04 with the WC tier: 16/32/64 keep more PCIe requests in flight |
+| `CROW_STAGE_DMA` | `engine/src/gen.rs:530` | `1` enables; default off | stages the cold combos of a layer with one `cuMemcpyDtoDAsync` per combo and matrix (copy engine, mapped host pointer) instead of the `stage_cold` kernel; forces `CROW_GRAPH` off | measurement | #19b, 2026-09-11; the routed pointers are known on the host only after `router_top10`, so the decode graph cannot hold the copies; one host sync per layer |
 
 ## Attention and kernels (15 rows)
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
-| `CROW_ATTN_R` | `engine/src/gen.rs:1140` | `0`, `1`, `2`, `3`, `4`, `5`, `8`, `9`; default unset = `attn_sel_s8l` | selects the decode attention kernel (`gen.rs:1141`) | operating | default since 2026-09-06 late (#10, robin's call), gated by parity 8/512/1024 against the previous build plus ten tasks; `8` and `9` are diagnostics, see the warning table |
-| `CROW_ATTN_SB` | `engine/src/gen.rs:1151` | `0` restores the full-chunk buffer; default on (`ATTN_SB` = 512) | prompt attention in sub-batches of 512 tokens | operating | #16, 2026-09-05: shrinks the QSA score buffer from 512 MB at chunk 2048; bit-identical by construction |
-| `CROW_ATTN_SPLIT` | `engine/src/gen.rs:1130` | `0` disables; default on | decode attention as 8 partials plus merge, QSA scores warp per block | operating | both forms are graph-static |
+| `CROW_ATTN_R` | `engine/src/gen.rs:1161` | `0`, `1`, `2`, `3`, `4`, `5`, `8`, `9`; default unset = `attn_sel_s8l` | selects the decode attention kernel (`gen.rs:1141`) | operating | default since 2026-09-06 late (#10, robin's call), gated by parity 8/512/1024 against the previous build plus ten tasks; `8` and `9` are diagnostics, see the warning table |
+| `CROW_ATTN_SB` | `engine/src/gen.rs:1172` | `0` restores the full-chunk buffer; default on (`ATTN_SB` = 512) | prompt attention in sub-batches of 512 tokens | operating | #16, 2026-09-05: shrinks the QSA score buffer from 512 MB at chunk 2048; bit-identical by construction |
+| `CROW_ATTN_SPLIT` | `engine/src/gen.rs:1151` | `0` disables; default on | decode attention as 8 partials plus merge, QSA scores warp per block | operating | both forms are graph-static |
 | `CROW_BF16_GEMM` | `engine/src/gen.rs:120` | `0` selects the warp GEMV; default on | 8-token bf16 tile GEMM for prefill-sized batches | operating | applies only to `PW::Bf16` weights at `t >= 8` |
-| `CROW_BF16_W` | `engine/src/gen.rs:1121` | `0` selects `gemv_bf16_b` / `gemv_bf16`; default on | selects `gemv_bf16_w` (8 rows per block) for bf16 GEMVs and the LM head | operating | step-2 kernel switch; LM head site `gen.rs:2300` |
-| `CROW_DENSE_GEMM` | `engine/src/gen.rs:1097` | `0` selects the per-token MMA GEMV; default on | 8-token tile GEMM for dense FP4 projections at `t >= 8` | operating | reached only when `CROW_MMA=1` (`launch_mma_d`) |
-| `CROW_GDN_REG` | `engine/src/gen.rs:473` | `0` off, `p` prefill scan only, `s` decode step only, anything else both; default both | register delta-rule scan instead of the global-memory scan | operating | `0` is the bit-identical fallback per `gen.rs:468` |
-| `CROW_GRAPH` | `engine/src/gen.rs:1088` | `1` enables; default off in the library, `1` in `serve` (`bin/serve.rs:2313`) | captures the per-token kernel sequence once and replays it | operating | fable gate 2026-09-03 (WDDM launch overhead); `serve` sets it only when unset, so `CROW_GRAPH=0` still wins |
-| `CROW_INJ_1K` | `engine/src/gen.rs:1122` | `0` selects `gemv_fp4_b`; default on (`gemv_fp4_b1k`, 1024 threads) | kernel of the block-inject GEMV | operating | `gen.rs:1421-1424`: the MMA tile is about 10x slower here, documented skip |
-| `CROW_MMA` | `engine/src/gen.rs:1077` | `1` enables; default off in the library, `1` in `serve` (`bin/serve.rs:2313`) | tensor-core FP4 paths for routed and dense GEMVs | operating | read once through a `OnceLock`, so `serve` must set it before `cuda::Ctx::init` (`bin/serve.rs:2301-2312`) |
-| `CROW_MMA_DENSE` | `engine/src/gen.rs:1157` | `0` disables; default follows `CROW_MMA` | dense-GEMV MMA switch, routed MoE MMA stays on | measurement | A/B knob for the dense #10 paths |
-| `CROW_MMA_KS` | `engine/src/gen.rs:1112` | `1` to `4`; other values fall back; default `4` | MMA k-split factor, block = `128 * KS` threads | operating | `KS=1` is the original single-slice kernel, bit-identical (`gen.rs:1108`) |
-| `CROW_QFUSE` | `engine/src/gen.rs:1126` | `0` disables; default on | producers emit the NVFP4 activation cascade, no separate `quant_x_fp4` launch | operating | bit-identical per `gen.rs:1125` |
-| `CROW_QSA_FAST` | `engine/src/gen.rs:1120` | `0` selects `qsa_select`; default on (`qsa_select_fast`) | dense-regime shortcut in the QSA selector | operating | kernel sites `gen.rs:1687`, `gen.rs:1813`; comment `kernels.rs:1956` |
-| `CROW_ROUTER_GEMM` | `engine/src/gen.rs:1857` | `1` enables; default off | bf16 tensor-core GEMM on the exact bf16 router twin at `t >= 8` | measurement | `gen.rs:1858-1859`: summation order differs from `gemv_b`, not bit-identical, env-gated until validated |
+| `CROW_BF16_W` | `engine/src/gen.rs:1142` | `0` selects `gemv_bf16_b` / `gemv_bf16`; default on | selects `gemv_bf16_w` (8 rows per block) for bf16 GEMVs and the LM head | operating | step-2 kernel switch; LM head site `gen.rs:2300` |
+| `CROW_DENSE_GEMM` | `engine/src/gen.rs:1118` | `0` selects the per-token MMA GEMV; default on | 8-token tile GEMM for dense FP4 projections at `t >= 8` | operating | reached only when `CROW_MMA=1` (`launch_mma_d`) |
+| `CROW_GDN_REG` | `engine/src/gen.rs:475` | `0` off, `p` prefill scan only, `s` decode step only, anything else both; default both | register delta-rule scan instead of the global-memory scan | operating | `0` is the bit-identical fallback per `gen.rs:468` |
+| `CROW_GRAPH` | `engine/src/gen.rs:1103` | `1` enables; default off in the library, `1` in `serve` (`bin/serve.rs:2313`) | captures the per-token kernel sequence once and replays it | operating | fable gate 2026-09-03 (WDDM launch overhead); `serve` sets it only when unset, so `CROW_GRAPH=0` still wins |
+| `CROW_INJ_1K` | `engine/src/gen.rs:1143` | `0` selects `gemv_fp4_b`; default on (`gemv_fp4_b1k`, 1024 threads) | kernel of the block-inject GEMV | operating | `gen.rs:1421-1424`: the MMA tile is about 10x slower here, documented skip |
+| `CROW_MMA` | `engine/src/gen.rs:1091` | `1` enables; default off in the library, `1` in `serve` (`bin/serve.rs:2313`) | tensor-core FP4 paths for routed and dense GEMVs | operating | read once through a `OnceLock`, so `serve` must set it before `cuda::Ctx::init` (`bin/serve.rs:2301-2312`) |
+| `CROW_MMA_DENSE` | `engine/src/gen.rs:1178` | `0` disables; default follows `CROW_MMA` | dense-GEMV MMA switch, routed MoE MMA stays on | measurement | A/B knob for the dense #10 paths |
+| `CROW_MMA_KS` | `engine/src/gen.rs:1133` | `1` to `4`; other values fall back; default `4` | MMA k-split factor, block = `128 * KS` threads | operating | `KS=1` is the original single-slice kernel, bit-identical (`gen.rs:1108`) |
+| `CROW_QFUSE` | `engine/src/gen.rs:1147` | `0` disables; default on | producers emit the NVFP4 activation cascade, no separate `quant_x_fp4` launch | operating | bit-identical per `gen.rs:1125` |
+| `CROW_QSA_FAST` | `engine/src/gen.rs:1141` | `0` selects `qsa_select`; default on (`qsa_select_fast`) | dense-regime shortcut in the QSA selector | operating | kernel sites `gen.rs:1687`, `gen.rs:1813`; comment `kernels.rs:1956` |
+| `CROW_ROUTER_GEMM` | `engine/src/gen.rs:1963` | `1` enables; default off | bf16 tensor-core GEMM on the exact bf16 router twin at `t >= 8` | measurement | `gen.rs:1858-1859`: summation order differs from `gemv_b`, not bit-identical, env-gated until validated |
 
 ## Adaptation and hot set (9 rows)
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
 | `CROW_ADAPT` | `engine/src/bin/decode.rs:94` | `1` enables; default off | re-cuts the hot set once after prefill | measurement | also `bin/decode.rs:155`, `bin/parity.rs:178`; harness only, `serve` never calls `adapt_tick` (#37, `docs/architecture.md:1181`); the gate chains set `=1` |
-| `CROW_ADAPT_DECAY` | `engine/src/gen.rs:3051` | float; default `0.5` | decay of the selection window used by the adaptation tick | measurement and `serve` | also `gen.rs:3072`; read only when `CROW_ADAPT_WINDOW=1`, which `serve` now sets itself, so this path is the `serve` default since #37 fix round 1 |
+| `CROW_ADAPT_DECAY` | `engine/src/gen.rs:3159` | float; default `0.5` | decay of the selection window used by the adaptation tick | measurement and `serve` | also `gen.rs:3072`; read only when `CROW_ADAPT_WINDOW=1`, which `serve` now sets itself, so this path is the `serve` default since #37 fix round 1 |
 | `CROW_ADAPT_EVERY` | `engine/src/geo.rs:169` | integer; default `0` = no tick | re-cut interval in decode tokens | measurement | overridden by the long-context policy when `CROW_ADAPT_STREAM` is unset and chunk >= 2048 (`geo.rs:174`) |
 | `CROW_ADAPT_MAX` | `engine/src/geo.rs:169` | integer; default `8` | maximum swaps per layer per tick | measurement | same policy override as `CROW_ADAPT_EVERY` |
 | `CROW_ADAPT_MAX0` | `engine/src/bin/decode.rs:96` | integer; default `0` = unbounded | caps the post-prefill swaps per layer (#21) | measurement | also `bin/decode.rs:158`, `bin/parity.rs:179` |
 | `CROW_ADAPT_SPARE` | `engine/src/geo.rs:169` | integer; default `0`, or `1` with `CROW_ADAPT_STREAM=1` | spare hot slots held for the trickle | measurement | policy value is `7` at chunk >= 2048 (`geo.rs:174`) |
 | `CROW_ADAPT_STREAM` | `engine/src/geo.rs:170` | `1` manual stream trickle, `0` manual compute-stream swaps; default: policy by chunk | selects the adaptation mode and switches every knob to manual | measurement | #17, 2026-09-05, measured on the ten-task series: trickle gains 0.1 to 0.8 tok/s at chunk 2048 and loses 0.2 to 1.0 tok/s at chunk 512 (`geo.rs:154-159`); `gen.rs:3129` asserts spare slots exist |
-| `CROW_ADAPT_WINDOW` | `engine/src/gen.rs:3048` | `1` enables; default off in the library, `1` in `serve` (`bin/serve.rs:2313`) | ranks by a decayed count of selections since the last tick | measurement and `serve` (`serve` sets it to `1` when unset) | also `gen.rs:3066`; `gen.rs:3043`: swaps are the same exact three-way exchange, numerics untouched; #37 made `serve` tick the trickle, and its fix round 1 made `serve` set this variable when unset, so an explicit `CROW_ADAPT_WINDOW=0` still restores the CUMULATIVE ranking; read per tick, not through a `OnceLock` |
-| `CROW_SWAP_BUNDLE` | `engine/src/gen.rs:1084` | `1` enables; default off | exchanges all pairs of a tick in one launch per layer (#17) | measurement | comment site `gen.rs:3087` |
+| `CROW_ADAPT_WINDOW` | `engine/src/gen.rs:3156` | `1` enables; default off in the library, `1` in `serve` (`bin/serve.rs:2313`) | ranks by a decayed count of selections since the last tick | measurement and `serve` (`serve` sets it to `1` when unset) | also `gen.rs:3066`; `gen.rs:3043`: swaps are the same exact three-way exchange, numerics untouched; #37 made `serve` tick the trickle, and its fix round 1 made `serve` set this variable when unset, so an explicit `CROW_ADAPT_WINDOW=0` still restores the CUMULATIVE ranking; read per tick, not through a `OnceLock` |
+| `CROW_SWAP_BUNDLE` | `engine/src/gen.rs:1098` | `1` enables; default off | exchanges all pairs of a tick in one launch per layer (#17) | measurement | comment site `gen.rs:3087` |
 
 ## Sampler (8 rows)
 
@@ -150,16 +151,16 @@ Helpers used by the read sites:
 |---|---|---|---|---|---|
 | `CROW_PROFILE` | `engine/src/gen.rs:56` | any value; default off | per-section CPU microseconds, printed as ms per step | measurement | also `bin/decode.rs:274`; report format at `gen.rs:52` |
 | `CROW_KPROF` | `engine/src/kernels.rs:3146` | any value; default off | per-kernel GPU time, sync before and after each launch | measurement | the number is kernel time plus one launch latency (`kernels.rs:3138-3140`); referenced by `docs/architecture.md:536`, `:911` |
-| `CROW_DUMP_H` | `engine/src/gen.rs:2143` | directory path; default off | writes `.f32` stage dumps for the determinism bisect | diagnostic | also `gen.rs:2155`, `gen.rs:2199`, `gen.rs:2572`, `gen.rs:2658`, `gen.rs:2687`; forces `cuda::sync()` at every dump point, so timings taken with it are not serving numbers |
+| `CROW_DUMP_H` | `engine/src/gen.rs:2251` | directory path; default off | writes `.f32` stage dumps for the determinism bisect | diagnostic | also `gen.rs:2155`, `gen.rs:2199`, `gen.rs:2572`, `gen.rs:2658`, `gen.rs:2687`; forces `cuda::sync()` at every dump point, so timings taken with it are not serving numbers |
 | `CROW_DROP_DBG` | `engine/src/cuda.rs:260` | `1` enables; default off | prints free VRAM and live allocation counts at named points | diagnostic | #18 leak hunt |
-| `CROW_GRAPH_DBG` | `engine/src/gen.rs:2752` | any value; default off | prints graph capture progress markers | diagnostic | effective only while `CROW_GRAPH=1`; markers at `gen.rs:2814` to `gen.rs:2939` |
-| `CROW_ROUTE_DUMP` | `engine/src/gen.rs:2753` | any value; default off | logs the routed expert ids per token per layer into `Engine::route_log` | diagnostic | non-graph decode only; `bin/decode.rs:313` sets it for `routestats` together with `CROW_GRAPH=0`; the log grows per token and never shrinks (`reset.rs:20`, `cache.rs:49`) |
+| `CROW_GRAPH_DBG` | `engine/src/gen.rs:2860` | any value; default off | prints graph capture progress markers | diagnostic | effective only while `CROW_GRAPH=1`; markers at `gen.rs:2814` to `gen.rs:2939` |
+| `CROW_ROUTE_DUMP` | `engine/src/gen.rs:2861` | any value; default off | logs the routed expert ids per token per layer into `Engine::route_log` | diagnostic | non-graph decode only; `bin/decode.rs:313` sets it for `routestats` together with `CROW_GRAPH=0`; the log grows per token and never shrinks (`reset.rs:20`, `cache.rs:49`) |
 
 ## Tooling and process (2 rows)
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
-| `CROW_LOCK` | `engine/src/gen.rs:3260` | `0` disables, any other non-empty value is a path; default `engine/.engine.lock` | one engine per machine, refuses the start before anything is pinned | operating | 2026-09-05: two engines pin 2 x 45 GiB and froze the 64 GB host twice on 2026-09-04 (`gen.rs:3253-3255`); refusal text `gen.rs:3282` |
+| `CROW_LOCK` | `engine/src/gen.rs:3368` | `0` disables, any other non-empty value is a path; default `engine/.engine.lock` | one engine per machine, refuses the start before anything is pinned | operating | 2026-09-05: two engines pin 2 x 45 GiB and froze the 64 GB host twice on 2026-09-04 (`gen.rs:3253-3255`); refusal text `gen.rs:3282` |
 | `CROW_PARITY_PREFILL` | `engine/src/bin/decode.rs:71` | integer, clamped to `[1, ids.len()]`; default `ids.len()` | prefills only `ids[..n]` and feeds the rest teacher-forced | measurement | #11, 2026-09-05: decode-path rows against prefill-path rows under the same context |
 
 ## Diagnostic values with wrong output by design
@@ -194,7 +195,7 @@ Unset in that chain, listed so the absence is on the record:
 ```
 CROW_PLE_CACHE_MB CROW_ADAPT_STREAM CROW_ADAPT_SPARE
 CROW_SAMPLE CROW_SAMPLE_HOST CROW_TEMP CROW_TOP_P CROW_TOP_K CROW_PRESENCE CROW_SEED
-CROW_PF_ASYNC CROW_PF_TG CROW_STAGE_SPLIT CROW_CNQ_PURGE CROW_KPROF CROW_PROFILE
+CROW_PF_ASYNC CROW_PF_TG CROW_STAGE_SPLIT CROW_STAGE_DMA CROW_CNQ_PURGE CROW_KPROF CROW_PROFILE
 ```
 
 - `CROW_SAMPLE` unset means greedy argmax (`bin/parity.rs:194`, `sample.rs:70`), and the record header of `parity` says so since `#53` (`bin/parity.rs:287`).

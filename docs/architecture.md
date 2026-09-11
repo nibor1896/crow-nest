@@ -258,6 +258,15 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
   Variant B (CPU compute) stays reserved; variant A (stream-weights) is retired from
   the primary path (kept behind the ring interface for tier transitions).
 - Policy is still per layer, chosen at load, fixed per session.
+- **Decode staging as built (`CROW_STAGE`, default on)**: after `router_top10` the
+  `stage_cold` kernel pulls every COLD combo of the layer into a VRAM staging slot with
+  coalesced 16-byte loads and rewrites the combo pointer tables; hot combos keep their
+  slab pointer. Measured 2026-09-11 (#19a): 10.248 ms/token, 33.0 GB/s at 338 MB/token.
+- **`CROW_STAGE_DMA=1` (measurement only, #19b, default off)**: the same staging done by
+  the COPY ENGINE, one `cuMemcpyDtoDAsync` per cold combo and matrix issued from the host
+  from the mapped pinned pointer. The routed pointers exist on the host only after
+  `router_top10` of that layer, so the switch forces the decode graph off and costs one
+  host sync per layer. Not an operating default.
 
 ### 3.5 PLE in the loop
 
