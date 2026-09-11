@@ -171,7 +171,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 
 | item | value |
 |---|---|
-| version | v0.1.0, unreleased; the tag follows the release stage |
+| version | v0.1.0, tagged 2026-09-11 on `592d05d` (`git ls-remote --tags origin`); the perf stage after the tag (issue #1, 2026-09-11) is unreleased work on `release-v0.1` |
 | history | one branch `release-v0.1`, pushed to `origin` (`github.com/nibor1896/crow-nest`, private) with tag `v0.1.0` = `592d05d`, 2026-09-11 |
 | scope | one model, one GPU, one client, Windows |
 | open, throughput | prefill gap to the target, issue #10 |
