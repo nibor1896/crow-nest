@@ -465,9 +465,9 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 - The engine has **no reset path**.
 - `Engine::pos`, `Engine::history` and `Engine::done_blocks` are initialised once at load
-  (`gen.rs:774-776`).
-- From then on they only grow: in `prefill` (`gen.rs:2696-2698`) and in `decode_step`
-  (`gen.rs:2944-2947`).
+  (`gen.rs:788-790`).
+- From then on they only grow: in `prefill` (`gen.rs:2804-2806`) and in `decode_step`
+  (`gen.rs:3052-3055`).
 - Every binary before serve built a fresh `Engine` per process and ran exactly one prefill
   from position 0 (`bin/decode.rs:78-83`, `bin/decode.rs:150-153`).
 - "Start over" was a process restart.
@@ -481,10 +481,10 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 - RoPE is applied from the `[context][32]` cos/sin tables at the absolute position before
   the KV store (`manager.rs:238-249`).
-- RoPE for prefill: `gen.rs:1587-1588`.
-- RoPE for decode: `gen.rs:1741-1744`.
+- RoPE for prefill: `gen.rs:1608-1609`.
+- RoPE for decode: `gen.rs:1762-1765`.
 - The KV row address is `slot = pos` (`manager.rs:305-311`, `kernels.rs:1190-1207`).
-- The pooled QSA block index is `pos / 4` (`gen.rs:1647-1661`).
+- The pooled QSA block index is `pos / 4` (`gen.rs:1668-1682`).
 - Consequence: a cached state is reusable **as a prefix only**.
 - Consequence: a fragment cannot be reused at a different offset.
 - Consequence: there is no block-reuse / paged-attention story here without recomputing
@@ -497,29 +497,29 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - `conv_state_update` (`kernels.rs:920-928`) shifts a 3-wide window.
 - `conv_step` (`kernels.rs:1013-1024`) shifts a 3-wide window.
 - The `init` flag that zeroes `S` is set only for the first chunk of the first prefill
-  (`gen.rs:2433`, `gen.rs:2583`).
+  (`gen.rs:2541`, `gen.rs:2691`).
 - Consequence: **a recurrent state cannot be rewound to an earlier position unless it was
   saved there.**
 
 **A third fact, and the assumption A4 measured FALSE.**
 
 - The decode CUDA graph is captured **once per process**:
-  `let capturing = graph && self.graph_exec == 0` (`gen.rs:2833`).
-- It is instantiated at `gen.rs:2913`.
+  `let capturing = graph && self.graph_exec == 0` (`gen.rs:2941`).
+- It is instantiated at `gen.rs:3021`.
 - Every token after that replays the instantiated graph.
 - A server therefore runs its **second** prefill against an already-instantiated decode
   graph.
 - The proposal assumed that graph is position-agnostic, because `rope_p` takes
   `p.pos_base` as a device pointer rather than a host-computed table offset
-  (`gen.rs:1733-1735`).
+  (`gen.rs:1754-1756`).
 - **Measured 2026-09-09 (A4, issue #26 (comment), `reset.rs` module doc): the assumption does not hold.**
 
 | step | what the code does | evidence |
 |---|---|---|
-| 1 | `decode_step` creates the capture stream ONCE and leaves it ACTIVE | `gen.rs:2740-2743` |
-| 2 | `launch_v` and `upload_into` both read that active stream | `gen.rs:1194`, `cuda.rs:377` (`cur_stream`) |
+| 1 | `decode_step` creates the capture stream ONCE and leaves it ACTIVE | `gen.rs:2848-2851` |
+| 2 | `launch_v` and `upload_into` both read that active stream | `gen.rs:1215`, `cuda.rs:377` (`cur_stream`) |
 | 3 | `upload_into` skips its sync on any stream but the legacy one | `cuda.rs:384-386` |
-| 4 | `prefill` uploads its per chunk scalars and the embedding block from TEMPORARIES | `gen.rs:2493-2510`, `gen.rs:2517-2526` |
+| 4 | `prefill` uploads its per chunk scalars and the embedding block from TEMPORARIES | `gen.rs:2601-2618`, `gen.rs:2625-2634` |
 | 5 | so a second `prefill` posted async HtoD copies whose host source had already died | measured |
 | result | same prompt, greedy: request 1 gave id 18622, request 2 gave id 17 | issue #26 (comment) |
 
@@ -527,13 +527,13 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 - `Engine::drop_decode_graph` (`engine/src/reset.rs`) destroys `graph_exec`, destroys
   `cap_stream` and puts the legacy stream (0) back, mirroring `impl Drop for Engine`
-  (`gen.rs:3309-3319`).
+  (`gen.rs:3417-3427`).
 - It is the ONE definition of that teardown.
 - The cold path `Engine::reset_to_zero` calls it before any prefill.
 - The warm path `PrefixCache::rollback` (`cache.rs:452`) calls it before any prefill.
 - `slot::restore` (`slot.rs:577`) calls it before its uploads.
 - `decode_step` then re-creates the stream and re-captures on the first step of the next
-  request (`gen.rs:2740`, `gen.rs:2836`).
+  request (`gen.rs:2848`, `gen.rs:2944`).
 - Rule: **the decode graph is dropped and recaptured per request.** It is not carried.
 - Cost: one eager decode step plus one graph instantiate per request.
 - Not measured against keeping the graph: keeping it is what broke the ids.
@@ -546,10 +546,10 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 | state | reusable across requests | prefix divergence detection | behaviour on divergence | cost of a cache miss at 16k |
 |---|---|---|---|---|
-| **KV cache**: 12 attention layers, `[12][2][2][context][256]`, FP8 E4M3 default (`geo.rs:23-25`, `manager.rs:43`, `manager.rs:200`) | **Yes, for rows PREFILL wrote.** A row is addressed by the absolute slot `pos` and its RoPE was applied at that absolute position before the store, so rows `0..L` stay valid for any request whose ids agree on `0..L`. **Corrected 2026-09-10 (A9, #31): a row DOES depend on the code path that wrote it.** `decode_step` rows are not bit-equal to `prefill` rows at the same position. A reuse point is valid only while every row below it was written by `prefill` (PREFILL CLEAN, `engine/src/cache.rs`). | Host-side only, from the id lists (7.4). The cache is never probed: there is no key in a KV row to compare against. **Plus the prefill-clean flag per slot**, which is state the server keeps, not something read out of a row. | **Nothing is erased.** `pos` is set back to P. Rows `>= P` are stale but unreachable: the selector only scans blocks below `ncb = (pos+1)/4` (`gen.rs:2503-2506`, `gen.rs:2746`). The new suffix overwrites them as it is prefilled. | Full miss (P = 0) = one 16k prefill = **21.6 to 22.0 s** on the serve build (A9, #31); **24.13 s** is the plan's reference on the installed decode build. A partial miss of n tokens is `n/16384 x` that as a **linear estimate only** (unmeasured). Prefill is not linear in n: the chunk policy (`geo.rs:138-152`) and the one-cold-tier-pass-per-chunk cost (`gen.rs:2444-2448`) both bend it. |
-| **QSA indexer state**: raw-key **ring** `[12][ring][128]` f32 with `row = pos % ring`, `ring = min(ceil4(prompt_chunk + 4), context)` (`manager.rs:37-41`, `manager.rs:58`, `kernels.rs:1759-1769`). Plus the **full-length pooled cache** `[12][ceil(context/4)][128]` f32 indexed by the absolute block `pos/4` (`manager.rs:46`, `manager.rs:60`, `kernels.rs:1747-1758`) | **Pooled cache: yes, under the same prefill-clean rule as KV** (A9, #31: a pooled block over decode-written rows is not bit-equal either). **Ring: conditionally.** The ring is modular and holds only the last `ring` positions. Its only reader is `pool4_cache`, which for a resume at P needs the `P mod 4` rows of the still-incomplete block. Those are live iff the held run advanced fewer than `ring - 3` positions past P. Made unconditional by snapshotting the ring (7.6) or by rounding P down to a multiple of 4. | Host-side only (7.4). | Set `done_blocks = P/4` and restore the ring from the snapshot. Pooled blocks `>= P/4` are stale but unreachable by the same `ncb` bound. Block `P/4` is re-pooled by the resumed prefill **before** any query scores it (pooling precedes scoring inside `attn_prompt`: `gen.rs:1647-1661` then `gen.rs:1680-1683`). | No separate cost. The ring and the pooled blocks of the diverged suffix are rebuilt inside the same prefill pass that rebuilds KV. They add no pass of their own. Their share of the prefill is **unmeasured** (`CROW_KPROF=1` would produce a per-kernel breakdown; none is recorded). |
+| **KV cache**: 12 attention layers, `[12][2][2][context][256]`, FP8 E4M3 default (`geo.rs:23-25`, `manager.rs:43`, `manager.rs:200`) | **Yes, for rows PREFILL wrote.** A row is addressed by the absolute slot `pos` and its RoPE was applied at that absolute position before the store, so rows `0..L` stay valid for any request whose ids agree on `0..L`. **Corrected 2026-09-10 (A9, #31): a row DOES depend on the code path that wrote it.** `decode_step` rows are not bit-equal to `prefill` rows at the same position. A reuse point is valid only while every row below it was written by `prefill` (PREFILL CLEAN, `engine/src/cache.rs`). | Host-side only, from the id lists (7.4). The cache is never probed: there is no key in a KV row to compare against. **Plus the prefill-clean flag per slot**, which is state the server keeps, not something read out of a row. | **Nothing is erased.** `pos` is set back to P. Rows `>= P` are stale but unreachable: the selector only scans blocks below `ncb = (pos+1)/4` (`gen.rs:2611-2614`, `gen.rs:2854`). The new suffix overwrites them as it is prefilled. | Full miss (P = 0) = one 16k prefill = **21.6 to 22.0 s** on the serve build (A9, #31); **24.13 s** is the plan's reference on the installed decode build. A partial miss of n tokens is `n/16384 x` that as a **linear estimate only** (unmeasured). Prefill is not linear in n: the chunk policy (`geo.rs:138-152`) and the one-cold-tier-pass-per-chunk cost (`gen.rs:2552-2556`) both bend it. |
+| **QSA indexer state**: raw-key **ring** `[12][ring][128]` f32 with `row = pos % ring`, `ring = min(ceil4(prompt_chunk + 4), context)` (`manager.rs:37-41`, `manager.rs:58`, `kernels.rs:1759-1769`). Plus the **full-length pooled cache** `[12][ceil(context/4)][128]` f32 indexed by the absolute block `pos/4` (`manager.rs:46`, `manager.rs:60`, `kernels.rs:1747-1758`) | **Pooled cache: yes, under the same prefill-clean rule as KV** (A9, #31: a pooled block over decode-written rows is not bit-equal either). **Ring: conditionally.** The ring is modular and holds only the last `ring` positions. Its only reader is `pool4_cache`, which for a resume at P needs the `P mod 4` rows of the still-incomplete block. Those are live iff the held run advanced fewer than `ring - 3` positions past P. Made unconditional by snapshotting the ring (7.6) or by rounding P down to a multiple of 4. | Host-side only (7.4). | Set `done_blocks = P/4` and restore the ring from the snapshot. Pooled blocks `>= P/4` are stale but unreachable by the same `ncb` bound. Block `P/4` is re-pooled by the resumed prefill **before** any query scores it (pooling precedes scoring inside `attn_prompt`: `gen.rs:1668-1682` then `gen.rs:1701-1704`). | No separate cost. The ring and the pooled blocks of the diverged suffix are rebuilt inside the same prefill pass that rebuilds KV. They add no pass of their own. Their share of the prefill is **unmeasured** (`CROW_KPROF=1` would produce a per-kernel breakdown; none is recorded). |
 | **GDN recurrent state**: 36 layers, `S[48][128][128]` f32 + `conv[10240][3]` f32, **112.22 MiB**, fixed and context-independent (`geo.rs:24`, `geo.rs:12-15`, `manager.rs:47-48`, `manager.rs:226-237`) | **No, not without a snapshot.** The state holds no position. It is the fold of every token seen so far. After the held run reached L there is no `S` at any P < L anywhere in the process. It is reusable **exactly at P = L**, and for any P < L **only from a snapshot taken at P** (7.6). | Host-side only, and this is the point: the state itself **cannot be probed**. Nothing in `S` says which ids produced it. If the id comparison is wrong, nothing downstream notices. | Restore `S` and `conv` from the newest prefill-clean snapshot at a position `S_pos <= L`, then re-prefill from `S_pos`. With **no** such snapshot, the only correct move is a **cold start** (`S_pos = 0`): the KV and pooled rows that are still valid must be thrown away with it, because a KV prefix without the matching GDN state is precisely the silent-wrong-answer case. | **This is the state that sets the price.** The suffix to re-prefill starts at the last snapshot, not at the divergence point: extra cost = `(L - S_pos)` tokens of prefill on top of the diverged suffix. No snapshot at all = the full **21.6 to 22.0 s** at 16k on this build. Its own share of a prefill is **unmeasured**. |
-| **PLE row cache**: hot rows of the 128 n-gram shards, `n_slots = cache_bytes / 112`, default 128 MB = **1,198,372 slots** (`geo.rs:72`, `geo.rs:108`, `gen.rs:899-902`) | **Yes, unconditionally.** It is **content-addressed**, not position-addressed: `slot = ngram_row_id % n_slots` with `slot_map[slot]` holding the id (`gen.rs:1013-1040`), and a slot's content is a verbatim copy of a container row. It carries no position and does not depend on which request filled it. | **Not needed.** Divergence cannot invalidate it: a slot either already holds the row a token asks for, or is refilled from the container. | **Nothing.** The cache survives every divergence, every request, and every rollback. Rows filled by a discarded prefix stay useful. | A PLE miss is a container row read, **not** a prefill. It never forces recomputation. Not measured in seconds anywhere in the repo; the measured quantity is the **miss rate** (#16, 2026-09-05: 128 MB costs +0.2 % misses against 1 GB and frees ~7 hot-set units, `geo.rs:108`). |
+| **PLE row cache**: hot rows of the 128 n-gram shards, `n_slots = cache_bytes / 112`, default 128 MB = **1,198,372 slots** (`geo.rs:72`, `geo.rs:108`, `gen.rs:913-916`) | **Yes, unconditionally.** It is **content-addressed**, not position-addressed: `slot = ngram_row_id % n_slots` with `slot_map[slot]` holding the id (`gen.rs:1027-1054`), and a slot's content is a verbatim copy of a container row. It carries no position and does not depend on which request filled it. | **Not needed.** Divergence cannot invalidate it: a slot either already holds the row a token asks for, or is refilled from the container. | **Nothing.** The cache survives every divergence, every request, and every rollback. Rows filled by a discarded prefix stay useful. | A PLE miss is a container row read, **not** a prefill. It never forces recomputation. Not measured in seconds anywhere in the repo; the measured quantity is the **miss rate** (#16, 2026-09-05: 128 MB costs +0.2 % misses against 1 GB and frees ~7 hot-set units, `geo.rs:108`). |
 
 **The prefill-clean rule (A9, #31, measured 2026-09-10, binding):**
 
@@ -580,20 +580,20 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 - Rule: the pooled range is `floor(pos/4)`, not `ceil`.
 - Reason: block `ceil(pos/4)` is written only by `decode_step` at that position
-  (`gen.rs:1647`, `gen.rs:2696`), so a saved `ceil` block would be a decode row.
+  (`gen.rs:1668`, `gen.rs:2804`), so a saved `ceil` block would be a decode row.
 - A restore refuses `done_blocks != pos / 4` before the first device upload (`slot.rs`).
 
 **A fifth state hides inside the fourth row.**
 
 - "PLE" in the plan means the *row cache*.
 - The PLE layer also owns a **recurrent conv state** `Ple::state`, `[10240][9]` f32 =
-  368,640 B (`gen.rs:902`).
+  368,640 B (`gen.rs:916`).
 - The conv is dilated (`src = t + k*3 - 9`, `kernels.rs:2839-2856`), so it needs nine
   history rows.
 - `ple_state_update` (`kernels.rs:2857-2867`) refreshes it per prefill chunk.
 - `ple_conv_step` (`kernels.rs:2868-2879`) shifts it per decode token.
 - It behaves exactly like the GDN conv window and **must be snapshotted with it**.
-- The #11 finding of 2026-09-05 (`gen.rs:2268-2273`) records what a wrong row in this path
+- The #11 finding of 2026-09-05 (`gen.rs:2376-2381`) records what a wrong row in this path
   costs.
 - Recorded: decode rows drifted 5-15 logit units from the prefill rows over the same
   context.
@@ -605,7 +605,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 - Per cached conversation, the exact id sequence the engine consumed.
 - That is `Engine::history` (`gen.rs:359`).
-- It is appended in prefill (`gen.rs:2698`) and in decode (`gen.rs:2945`).
+- It is appended in prefill (`gen.rs:2806`) and in decode (`gen.rs:3053`).
 - Consequence: it covers prompt tokens **and** generated tokens.
 - Consequence: it is exactly the transcript Crow will resend.
 
@@ -659,7 +659,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 **Condition 1: greedy only, or a reseeded RNG. BOTH hold as built (A6, #28).**
 
-- The device sampler's xorshift state (`DevSampler::rng`, `gen.rs:2955-2969`) advances per
+- The device sampler's xorshift state (`DevSampler::rng`, `gen.rs:3063-3077`) advances per
   token.
 - It lives for the engine's lifetime.
 - Consequence: under sampling, a second request on a warm engine would draw from a
@@ -807,7 +807,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 5. Truncate `history` to `S_pos`, clear `route_log`.
 6. Call `prefill` with the new ids from `S_pos` on.
 
-- Note: `prefill`'s `init` flag zeroes `S` only when `self.pos == 0` (`gen.rs:2433`).
+- Note: `prefill`'s `init` flag zeroes `S` only when `self.pos == 0` (`gen.rs:2541`).
 - That is exactly the cold-start case.
 - Consequence: the restored path must leave it at 0.
 - The current signature already does the right thing once `pos` is set.
@@ -1073,17 +1073,17 @@ Therefore:
 | `timings` | `predicted_per_second` | `predicted_n / predicted_ms * 1000` | `serve.rs:1083` | `crow_core.py:4999-5018` |
 | `timings` | `predicted_per_token_ms` | `predicted_ms / predicted_n` | `serve.rs:1092` | no reader in Crow |
 | `timings` | `cache_n` | `P`, the same number as `cached_tokens` | `serve.rs:1124` | Crow's measuring tools |
-| `timings` | `crow_expert_selections` | u64, cumulative, `atomicAdd(&counters[0], 10ull)` per token per layer | `kernels.rs:2181`, launched `gen.rs:1866-1868` | Crow #54 rule, tools |
+| `timings` | `crow_expert_selections` | u64, cumulative, `atomicAdd(&counters[0], 10ull)` per token per layer | `kernels.rs:2181`, launched `gen.rs:1972-1974` | Crow #54 rule, tools |
 | `timings` | `crow_expert_cold` | u64, cumulative, `atomicAdd(&counters[1], __popc(s_cold))` | `kernels.rs:2182` | Crow #54 rule, tools |
-| `timings` | `crow_ple_rows` | u64, cumulative, PLE rows requested | `gen.rs:1041` | Crow #54 rule, tools |
-| `timings` | `crow_ple_misses` | u64, cumulative, PLE rows filled from the container | `gen.rs:1042` | Crow #54 rule, tools |
+| `timings` | `crow_ple_rows` | u64, cumulative, PLE rows requested | `gen.rs:1055` | Crow #54 rule, tools |
+| `timings` | `crow_ple_misses` | u64, cumulative, PLE rows filled from the container | `gen.rs:1056` | Crow #54 rule, tools |
 | `timings` | `crow_layers` | int, `geo::LAYERS` = 48, the divisor | `serve.rs:1124` | Crow #54 rule, tools |
 
 - Rule: the five `crow_*` counters are **cumulative per process and never reset**, in any
   place, per request or otherwise (the Crow #54 rule).
 - Reason: a request-local value is the DIFFERENCE of two consecutive blocks; a reset would
   break that for every reader at once.
-- They are read by `Engine::drain_counters` (`gen.rs:3235`, `residency.rs:638`), a
+- They are read by `Engine::drain_counters` (`gen.rs:3343`, `residency.rs:638`), a
   `dtoh_u64` of 48 x 2 u64 = 768 bytes; "drain" READS, it does not zero.
 - Measured cost of that read: **0.026 ms** per request (A8, #30, `decode_out/srv-a8.log`).
 - Two decode rates on purpose: stderr prints `(gen - 1) / decode_ms * 1000`, the wire prints
