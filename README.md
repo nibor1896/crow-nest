@@ -91,22 +91,23 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 
 ## What is measured
 
-| metric | value | machine | date | source |
-|---|---|---|---|---|
-| ten-task quality, greedy, crow-nest | 2 Pass / 5 Partial / 3 Fail of 10 | RTX 5090 | 2026-09-10 | issue #11 (comment) |
-| ten-task quality, greedy, llama.cpp reference | 2 Pass / 6 Partial / 2 Fail of 10 | RTX 5090 | 2026-09-10 | `nibor1896/Crow` issue #192 (comment) |
-| decode, engine arm, ten tasks | 35.5 to 46.8 tok/s (crow-nest) against 44.4 to 48.2 tok/s (llama.cpp) | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
-| prefill, engine arm, ten tasks | 110 to 706 tok/s (crow-nest) against 265 to 846 tok/s (llama.cpp) | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
-| decode through `serve`, before the hot-set tick | 23.13 to 25.57 tok/s against 33.06 to 34.50 tok/s for `decode run`, three adjacent pairs | RTX 5090 | 2026-09-11 | issue #37 |
-| decode through `serve`, with the hot-set tick | 26.43 to 26.77 tok/s against 32.82 to 32.98 tok/s for `decode run`, three adjacent pairs | RTX 5090 | 2026-09-11 | issue #37 |
-| decode through `serve`, tick plus the `CROW_ADAPT_WINDOW` default | 31.97 to 32.32 tok/s against 32.71 to 33.09 tok/s for `decode run`, three adjacent pairs | RTX 5090 | 2026-09-11 | issue #37 |
-| run-to-run drift of a `serve` rate | 26 % (run 1 30.45, run 6 22.42 tok/s, identical ids) | RTX 5090 | 2026-09-10 | issue #38 |
-| cold prefill of a 16,064 id prompt on `serve` | 21.6 to 22.0 s | RTX 5090 | 2026-09-10 | `docs/architecture.md:426` |
-| warm turn after the prefix cache | 404 ms for 95 of 16,159 ids, 99.41 % of the prompt reused | RTX 5090 | 2026-09-10 | issue #31, `docs/architecture.md:427` |
-| ten-task quality, sampled, six seeds | gate met in 1 of 6 seeds; 4 Pass / 37 Partial / 19 Fail of 60 answers | RTX 5090 | 2026-09-10 | issue #44 |
-| parity, 8 and 512 logit rows | byte-identical against the installed build `d211ab52ad2b` | RTX 5090 | 2026-09-10 | issue #43 |
-
 - The two arms run different weights: crow-nest CNQ4.5-M (NVFP4, 4.5 bpw); llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL (GGUF, 2.4 bpw). Every comparison names both.
+
+| metric | crow-nest | llama.cpp | delta | machine | date | source |
+|---|---|---|---|---|---|---|
+| ten-task quality, greedy | 2 Pass / 5 Partial / 3 Fail of 10 | 2 Pass / 6 Partial / 2 Fail of 10 | n/a | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
+| decode, engine arm, ten tasks | 35.5 to 46.8 tok/s | 44.4 to 48.2 tok/s | n/a | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
+| prefill, engine arm, ten tasks | 110 to 706 tok/s | 265 to 846 tok/s | n/a | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
+| decode through `serve`, before the hot-set tick | 23.13 to 25.57 tok/s against 33.06 to 34.50 tok/s for `decode run`, three adjacent pairs | n/a | n/a | RTX 5090 | 2026-09-11 | issue #37 |
+| decode through `serve`, with the hot-set tick | 26.43 to 26.77 tok/s against 32.82 to 32.98 tok/s for `decode run`, three adjacent pairs | n/a | n/a | RTX 5090 | 2026-09-11 | issue #37 |
+| decode through `serve`, tick plus the `CROW_ADAPT_WINDOW` default | 31.97 to 32.32 tok/s against 32.71 to 33.09 tok/s for `decode run`, three adjacent pairs | n/a | n/a | RTX 5090 | 2026-09-11 | issue #37 |
+| run-to-run drift of a `serve` rate | 26 % (run 1 30.45, run 6 22.42 tok/s, identical ids) | n/a | n/a | RTX 5090 | 2026-09-10 | issue #38 |
+| cold prefill of a 16,064 id prompt on `serve` | 21.6 to 22.0 s | n/a | n/a | RTX 5090 | 2026-09-10 | `docs/architecture.md:426` |
+| warm turn after the prefix cache | 404 ms for 95 of 16,159 ids, 99.41 % of the prompt reused | n/a | n/a | RTX 5090 | 2026-09-10 | issue #31, `docs/architecture.md:427` |
+| ten-task quality, sampled, six seeds | gate met in 1 of 6 seeds; 4 Pass / 37 Partial / 19 Fail of 60 answers | n/a | n/a | RTX 5090 | 2026-09-10 | issue #44 |
+| parity, 8 and 512 logit rows | byte-identical against the installed build `d211ab52ad2b` | n/a | n/a | RTX 5090 | 2026-09-10 | issue #43 |
+
+- Delta is n/a on every row: each value above is a range or a Pass/Partial/Fail distribution, not a single point number with a sourced ratio, so no ratio is computed here.
 - A `serve` rate is still not an engine rate: `serve` ticks the stream trickle since 2026-09-11 (issue #37), and the two rows above are the same six-run form before and after that change.
 - The tick's ranking signal is `CROW_ADAPT_WINDOW`, and `serve` sets it to `1` when unset since 2026-09-11 (issue #37, `engine/src/bin/serve.rs:2313`); `CROW_ADAPT_WINDOW=0` restores the cumulative ranking.
 - With that default the gap to the adjacent `decode run` is -3.39 %, -1.87 % and -2.03 % over three pairs, and `serve` moves 140.0 cold experts per token against 137.3 (issue #37, measured 2026-09-11).
@@ -171,7 +172,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 | item | value |
 |---|---|
 | version | v0.1.0, unreleased; the tag follows the release stage |
-| history | one branch `release-v0.1`, never pushed as of 2026-09-11 |
+| history | one branch `release-v0.1`, pushed to `origin` (`github.com/nibor1896/crow-nest`, private) with tag `v0.1.0` = `592d05d`, 2026-09-11 |
 | scope | one model, one GPU, one client, Windows |
 | open, throughput | prefill gap to the target, issue #10 |
 | `serve` rate | within 5 % of the adjacent `decode run` since 2026-09-11, three pairs, issue #37 |

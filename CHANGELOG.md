@@ -65,23 +65,27 @@
 
 ### Measured
 
-| what | value | date | issue |
-|---|---|---|---|
-| ten-task quality, greedy | crow-nest 2 Pass / 5 Partial / 3 Fail, llama.cpp 2 / 6 / 2, of 10 each | 2026-09-10 | #11 |
-| decode, engine arm | crow-nest 35.5 to 46.8 tok/s, llama.cpp 44.4 to 48.2 tok/s | 2026-09-10 | #11 |
-| prefill, engine arm | crow-nest 110 to 706 tok/s, llama.cpp 265 to 846 tok/s | 2026-09-10 | #11 |
-| decode through `serve`, before the hot-set tick | 23.13 to 25.57 tok/s against 33.06 to 34.50 for `decode run`, three adjacent pairs | 2026-09-11 | #37 |
-| decode through `serve`, with the hot-set tick | 26.43 to 26.77 tok/s against 32.82 to 32.98 for `decode run`, three adjacent pairs | 2026-09-11 | #37 |
-| cold experts per timed token on `serve` | 292.1 before the tick, 212.9 with it, 140.0 with it plus `CROW_ADAPT_WINDOW=1`, against 137.3 for `decode run` D1 | 2026-09-11 | #37 |
-| decode through `serve` with `CROW_ADAPT_WINDOW=1` | 32.20 to 32.33 tok/s against 32.78 to 32.88 for `decode run`, two adjacent pairs | 2026-09-11 | #37 |
-| decode through `serve`, tick plus the `CROW_ADAPT_WINDOW` default | 31.97 to 32.32 tok/s against 32.71 to 33.09 for `decode run`, three adjacent pairs at -3.39, -1.87 and -2.03 % | 2026-09-11 | #37 |
-| run-to-run drift of a `serve` rate | 26 %, run 1 30.45 against run 6 22.42 tok/s | 2026-09-10 | #38 |
-| cold prefill of 16,064 ids on `serve` | 21.6 to 22.0 s | 2026-09-10 | #31 |
-| warm turn through the prefix cache | 404 ms for 95 of 16,159 ids, 99.41 % reused | 2026-09-10 | #31 |
-| slot save and restore at 16k | `n_saved` = `n_restored` = 16064, file 353 MB | 2026-09-10 | #32 |
-| ten-task quality, sampled | gate met in 1 of 6 seeds, 4 Pass / 37 Partial / 19 Fail of 60 | 2026-09-10 | #44 |
-| parity, 8 and 512 rows | byte-identical against the installed build `d211ab52ad2b` | 2026-09-10 | #43 |
-| start commands of `README.md` | 2 of 2 shells, `/health` ok and one chat answer with HTTP 200 | 2026-09-11 | #47 |
+- The two arms run different weights: crow-nest CNQ4.5-M (NVFP4, 4.5 bpw); llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL (GGUF, 2.4 bpw). Every comparison names both.
+
+| what | crow-nest | llama.cpp | delta | date | issue |
+|---|---|---|---|---|---|
+| ten-task quality, greedy | 2 Pass / 5 Partial / 3 Fail of 10 | 2 Pass / 6 Partial / 2 Fail of 10 | n/a | 2026-09-10 | #11 |
+| decode, engine arm | 35.5 to 46.8 tok/s | 44.4 to 48.2 tok/s | n/a | 2026-09-10 | #11 |
+| prefill, engine arm | 110 to 706 tok/s | 265 to 846 tok/s | n/a | 2026-09-10 | #11 |
+| decode through `serve`, before the hot-set tick | 23.13 to 25.57 tok/s against 33.06 to 34.50 for `decode run`, three adjacent pairs | n/a | n/a | 2026-09-11 | #37 |
+| decode through `serve`, with the hot-set tick | 26.43 to 26.77 tok/s against 32.82 to 32.98 for `decode run`, three adjacent pairs | n/a | n/a | 2026-09-11 | #37 |
+| cold experts per timed token on `serve` | 292.1 before the tick, 212.9 with it, 140.0 with it plus `CROW_ADAPT_WINDOW=1`, against 137.3 for `decode run` D1 | n/a | n/a | 2026-09-11 | #37 |
+| decode through `serve` with `CROW_ADAPT_WINDOW=1` | 32.20 to 32.33 tok/s against 32.78 to 32.88 for `decode run`, two adjacent pairs | n/a | n/a | 2026-09-11 | #37 |
+| decode through `serve`, tick plus the `CROW_ADAPT_WINDOW` default | 31.97 to 32.32 tok/s against 32.71 to 33.09 for `decode run`, three adjacent pairs at -3.39, -1.87 and -2.03 % | n/a | n/a | 2026-09-11 | #37 |
+| run-to-run drift of a `serve` rate | 26 %, run 1 30.45 against run 6 22.42 tok/s | n/a | n/a | 2026-09-10 | #38 |
+| cold prefill of 16,064 ids on `serve` | 21.6 to 22.0 s | n/a | n/a | 2026-09-10 | #31 |
+| warm turn through the prefix cache | 404 ms for 95 of 16,159 ids, 99.41 % reused | n/a | n/a | 2026-09-10 | #31 |
+| slot save and restore at 16k | `n_saved` = `n_restored` = 16064, file 353 MB | n/a | n/a | 2026-09-10 | #32 |
+| ten-task quality, sampled | gate met in 1 of 6 seeds, 4 Pass / 37 Partial / 19 Fail of 60 | n/a | n/a | 2026-09-10 | #44 |
+| parity, 8 and 512 rows | byte-identical against the installed build `d211ab52ad2b` | n/a | n/a | 2026-09-10 | #43 |
+| start commands of `README.md` | 2 of 2 shells, `/health` ok and one chat answer with HTTP 200 | n/a | n/a | 2026-09-11 | #47 |
+
+- Delta is n/a on every row: each value above is a range or a Pass/Partial/Fail distribution, not a single point number with a sourced ratio, so no ratio is computed here.
 
 - Targets stay targets: decode at least 42 tok/s, prefill at least 972 tok/s, context floor 200,000 tokens. None of them is a pass or fail gate (`docs/architecture.md:18-19`).
 
