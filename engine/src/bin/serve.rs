@@ -46,14 +46,16 @@
 //! - Process wide defaults since d36353a need no env variable.
 //! - Those defaults: `CROW_PF_ASYNC=2`, PF_TG 64, PLE 128 MB, attn_sel_s8l.
 //!
-//! Environment defaults set by `serve` itself (#26 review):
+//! Environment defaults set by `serve` itself (#26 review, #37 fix round 1):
 //!
 //! | variable | behaviour |
 //! |---|---|
 //! | `CROW_GRAPH`, `CROW_MMA` | default 1 in serve (the gated configuration); env overrides |
+//! | `CROW_ADAPT_WINDOW` | default 1 in serve (the trickle's ranking signal); env overrides |
 //!
-//! - Both are set in `main` BEFORE `cuda::Ctx::init` and before the first kernel call.
-//! - `gen.rs` reads each one once through a `OnceLock`, so the order is the whole contract.
+//! - All three are set in `main` BEFORE `cuda::Ctx::init` and before the first kernel call.
+//! - `gen.rs` reads graph and mma once through a `OnceLock`, so the order is the whole contract.
+//! - `CROW_ADAPT_WINDOW` is read per tick (`gen.rs:3048`, `gen.rs:3066`), always after this point.
 //! - Only an unset variable is set; an explicit `CROW_GRAPH=0` still turns graphs off.
 //! - One stderr line per variable carries the effective value.
 //!
@@ -63,6 +65,9 @@
 //! - #37: `serve` ticks the STREAM TRICKLE once per `decode_step`, the mirror of `decode.rs:224-231`.
 //! - `adapt_tick` (the post-prefill re-cut of `CROW_ADAPT=1`) is still NOT called by `serve`.
 //! - The tick runs only when the policy asked for the stream trickle with `every > 0`.
+//! - #37 fix round 1: `serve` sets `CROW_ADAPT_WINDOW=1` when unset, so the tick ranks swaps
+//!   by the decayed selections since the last tick, not by the prefill-dominated cumulative count.
+//! - The three variables `serve` sets when unset: `CROW_GRAPH`, `CROW_MMA`, `CROW_ADAPT_WINDOW`.
 //! - Two `trickle_tick` preconditions (`gen.rs:3128-3129`) are checked ONCE at start, not per token.
 //! - One stderr line after the policy line says whether this process ticks and why.
 //! - Per request the swaps go to the `[chat]` line as `crow_trickle_swaps`; the wire is untouched.
@@ -2299,7 +2304,13 @@ fn main() {
     // setting them here, before cuda::Ctx::init and before any kernel call, is the whole switch.
     // Only an UNSET variable is set, so an explicit value still overrides and diagnostics stay
     // possible. serve is single threaded at this point: no other thread can read the environment.
-    for key in ["CROW_GRAPH", "CROW_MMA"] {
+    //
+    // #37 fix round 1: CROW_ADAPT_WINDOW joins them. It is NOT a OnceLock read; gen.rs reads it
+    // per tick (`window_counts` gen.rs:3048, `adapt_tick` gen.rs:3066), both of which can only
+    // run inside a request, long after this point. Unset it ranks the trickle's swaps by
+    // `drain_sel_counts`, the count CUMULATIVE since process start, which a 16,064 token prefill
+    // dominates; the measured cost was -19.2 % against the adjacent `decode run` D1 (#37 block B).
+    for key in ["CROW_GRAPH", "CROW_MMA", "CROW_ADAPT_WINDOW"] {
         if std::env::var_os(key).is_none() {
             std::env::set_var(key, "1");
         }

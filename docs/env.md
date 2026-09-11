@@ -94,9 +94,9 @@ Helpers used by the read sites:
 | `CROW_BF16_W` | `engine/src/gen.rs:1121` | `0` selects `gemv_bf16_b` / `gemv_bf16`; default on | selects `gemv_bf16_w` (8 rows per block) for bf16 GEMVs and the LM head | operating | step-2 kernel switch; LM head site `gen.rs:2300` |
 | `CROW_DENSE_GEMM` | `engine/src/gen.rs:1097` | `0` selects the per-token MMA GEMV; default on | 8-token tile GEMM for dense FP4 projections at `t >= 8` | operating | reached only when `CROW_MMA=1` (`launch_mma_d`) |
 | `CROW_GDN_REG` | `engine/src/gen.rs:473` | `0` off, `p` prefill scan only, `s` decode step only, anything else both; default both | register delta-rule scan instead of the global-memory scan | operating | `0` is the bit-identical fallback per `gen.rs:468` |
-| `CROW_GRAPH` | `engine/src/gen.rs:1088` | `1` enables; default off in the library, `1` in `serve` (`bin/serve.rs:2263`) | captures the per-token kernel sequence once and replays it | operating | fable gate 2026-09-03 (WDDM launch overhead); `serve` sets it only when unset, so `CROW_GRAPH=0` still wins |
+| `CROW_GRAPH` | `engine/src/gen.rs:1088` | `1` enables; default off in the library, `1` in `serve` (`bin/serve.rs:2313`) | captures the per-token kernel sequence once and replays it | operating | fable gate 2026-09-03 (WDDM launch overhead); `serve` sets it only when unset, so `CROW_GRAPH=0` still wins |
 | `CROW_INJ_1K` | `engine/src/gen.rs:1122` | `0` selects `gemv_fp4_b`; default on (`gemv_fp4_b1k`, 1024 threads) | kernel of the block-inject GEMV | operating | `gen.rs:1421-1424`: the MMA tile is about 10x slower here, documented skip |
-| `CROW_MMA` | `engine/src/gen.rs:1077` | `1` enables; default off in the library, `1` in `serve` (`bin/serve.rs:2263`) | tensor-core FP4 paths for routed and dense GEMVs | operating | read once through a `OnceLock`, so `serve` must set it before `cuda::Ctx::init` (`bin/serve.rs:2257-2260`) |
+| `CROW_MMA` | `engine/src/gen.rs:1077` | `1` enables; default off in the library, `1` in `serve` (`bin/serve.rs:2313`) | tensor-core FP4 paths for routed and dense GEMVs | operating | read once through a `OnceLock`, so `serve` must set it before `cuda::Ctx::init` (`bin/serve.rs:2301-2312`) |
 | `CROW_MMA_DENSE` | `engine/src/gen.rs:1157` | `0` disables; default follows `CROW_MMA` | dense-GEMV MMA switch, routed MoE MMA stays on | measurement | A/B knob for the dense #10 paths |
 | `CROW_MMA_KS` | `engine/src/gen.rs:1112` | `1` to `4`; other values fall back; default `4` | MMA k-split factor, block = `128 * KS` threads | operating | `KS=1` is the original single-slice kernel, bit-identical (`gen.rs:1108`) |
 | `CROW_QFUSE` | `engine/src/gen.rs:1126` | `0` disables; default on | producers emit the NVFP4 activation cascade, no separate `quant_x_fp4` launch | operating | bit-identical per `gen.rs:1125` |
@@ -108,13 +108,13 @@ Helpers used by the read sites:
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
 | `CROW_ADAPT` | `engine/src/bin/decode.rs:94` | `1` enables; default off | re-cuts the hot set once after prefill | measurement | also `bin/decode.rs:155`, `bin/parity.rs:168`; harness only, `serve` never calls `adapt_tick` (#37, `docs/architecture.md:1174`); the gate chains set `=1` |
-| `CROW_ADAPT_DECAY` | `engine/src/gen.rs:3051` | float; default `0.5` | decay of the selection window used by the adaptation tick | measurement and `serve` | also `gen.rs:3072`; read only when `CROW_ADAPT_WINDOW=1`; #37 made `serve` tick the trickle, so `serve` reaches this path too |
+| `CROW_ADAPT_DECAY` | `engine/src/gen.rs:3051` | float; default `0.5` | decay of the selection window used by the adaptation tick | measurement and `serve` | also `gen.rs:3072`; read only when `CROW_ADAPT_WINDOW=1`, which `serve` now sets itself, so this path is the `serve` default since #37 fix round 1 |
 | `CROW_ADAPT_EVERY` | `engine/src/geo.rs:169` | integer; default `0` = no tick | re-cut interval in decode tokens | measurement | overridden by the long-context policy when `CROW_ADAPT_STREAM` is unset and chunk >= 2048 (`geo.rs:174`) |
 | `CROW_ADAPT_MAX` | `engine/src/geo.rs:169` | integer; default `8` | maximum swaps per layer per tick | measurement | same policy override as `CROW_ADAPT_EVERY` |
 | `CROW_ADAPT_MAX0` | `engine/src/bin/decode.rs:96` | integer; default `0` = unbounded | caps the post-prefill swaps per layer (#21) | measurement | also `bin/decode.rs:158`, `bin/parity.rs:169` |
 | `CROW_ADAPT_SPARE` | `engine/src/geo.rs:169` | integer; default `0`, or `1` with `CROW_ADAPT_STREAM=1` | spare hot slots held for the trickle | measurement | policy value is `7` at chunk >= 2048 (`geo.rs:174`) |
 | `CROW_ADAPT_STREAM` | `engine/src/geo.rs:170` | `1` manual stream trickle, `0` manual compute-stream swaps; default: policy by chunk | selects the adaptation mode and switches every knob to manual | measurement | #17, 2026-09-05, measured on the ten-task series: trickle gains 0.1 to 0.8 tok/s at chunk 2048 and loses 0.2 to 1.0 tok/s at chunk 512 (`geo.rs:154-159`); `gen.rs:3129` asserts spare slots exist |
-| `CROW_ADAPT_WINDOW` | `engine/src/gen.rs:3048` | `1` enables; default off (cumulative re-cut) | ranks by a decayed count of selections since the last tick | measurement and `serve` | also `gen.rs:3066`; `gen.rs:3043`: swaps are the same exact three-way exchange, numerics untouched; #37 made `serve` tick the trickle, so an unset value gives `serve` the CUMULATIVE ranking while the `decode run` gate chains set `=1`; measured 2026-09-11, `=1` moves `serve` from 26.6 to 32.3 tok/s on t1-read and from 212.9 to 140.0 cold experts per token, same 255 ids |
+| `CROW_ADAPT_WINDOW` | `engine/src/gen.rs:3048` | `1` enables; default off in the library, `1` in `serve` (`bin/serve.rs:2313`) | ranks by a decayed count of selections since the last tick | measurement and `serve` (`serve` sets it to `1` when unset) | also `gen.rs:3066`; `gen.rs:3043`: swaps are the same exact three-way exchange, numerics untouched; #37 made `serve` tick the trickle, and its fix round 1 made `serve` set this variable when unset, so an explicit `CROW_ADAPT_WINDOW=0` still restores the CUMULATIVE ranking; read per tick, not through a `OnceLock` |
 | `CROW_SWAP_BUNDLE` | `engine/src/gen.rs:1084` | `1` enables; default off | exchanges all pairs of a tick in one launch per layer (#17) | measurement | comment site `gen.rs:3087` |
 
 ## Sampler (8 rows)
@@ -198,8 +198,9 @@ CROW_PF_ASYNC CROW_PF_TG CROW_STAGE_SPLIT CROW_CNQ_PURGE CROW_KPROF CROW_PROFILE
 
 - `CROW_SAMPLE` unset means greedy argmax (`bin/parity.rs:184`, `sample.rs:70`).
 - The C1 seed series adds `CROW_SAMPLE=1` and `CROW_SEED=2|3|4` to the same block.
-- The chain sets `CROW_ADAPT=1`, `CROW_CHUNK_AUTO=1` and `CROW_ADAPT_WINDOW=1`; all three are off by default in the code. This is a deliberate deviation, not a documentation error.
-- The chain sets `CROW_GRAPH=1` and `CROW_MMA=1` explicitly; `serve` sets the same two itself when they are unset (`bin/serve.rs:2263`).
+- The chain sets `CROW_ADAPT=1`, `CROW_CHUNK_AUTO=1` and `CROW_ADAPT_WINDOW=1`; all three are off by default in the library. This is a deliberate deviation, not a documentation error.
+- `CROW_ADAPT_WINDOW=1` is no longer a deviation for `serve`: `serve` sets it itself when it is unset (#37 fix round 1).
+- The chain sets `CROW_GRAPH=1` and `CROW_MMA=1` explicitly; `serve` sets those two and `CROW_ADAPT_WINDOW` itself when they are unset (`bin/serve.rs:2313`).
 - The chain leaves `CROW_PF_ASYNC` unset, so the default `2` is in force.
 
 ## Checking this file

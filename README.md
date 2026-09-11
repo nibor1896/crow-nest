@@ -99,6 +99,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 | prefill, engine arm, ten tasks | 110 to 706 tok/s (crow-nest) against 265 to 846 tok/s (llama.cpp) | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
 | decode through `serve`, before the hot-set tick | 23.13 to 25.57 tok/s against 33.06 to 34.50 tok/s for `decode run`, three adjacent pairs | RTX 5090 | 2026-09-11 | issue #37 |
 | decode through `serve`, with the hot-set tick | 26.43 to 26.77 tok/s against 32.82 to 32.98 tok/s for `decode run`, three adjacent pairs | RTX 5090 | 2026-09-11 | issue #37 |
+| decode through `serve`, tick plus the `CROW_ADAPT_WINDOW` default | 31.97 to 32.32 tok/s against 32.71 to 33.09 tok/s for `decode run`, three adjacent pairs | RTX 5090 | 2026-09-11 | issue #37 |
 | run-to-run drift of a `serve` rate | 26 % (run 1 30.45, run 6 22.42 tok/s, identical ids) | RTX 5090 | 2026-09-10 | issue #38 |
 | cold prefill of a 16,064 id prompt on `serve` | 21.6 to 22.0 s | RTX 5090 | 2026-09-10 | `docs/architecture.md:426` |
 | warm turn after the prefix cache | 404 ms for 95 of 16,159 ids, 99.41 % of the prompt reused | RTX 5090 | 2026-09-10 | issue #31, `docs/architecture.md:427` |
@@ -107,8 +108,9 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 
 - The two arms run different weights: crow-nest CNQ4.5-M (NVFP4, 4.5 bpw); llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL (GGUF, 2.4 bpw). Every comparison names both.
 - A `serve` rate is still not an engine rate: `serve` ticks the stream trickle since 2026-09-11 (issue #37), and the two rows above are the same six-run form before and after that change.
-- The remaining gap is the tick's ranking signal, not the tick: `serve` moves 212.9 cold experts per token where `decode run` moves 137.3 (issue #37, measured 2026-09-11).
-- With `CROW_ADAPT_WINDOW=1` the same `serve` binary reaches 32.20 to 32.33 tok/s against 32.78 to 32.88 for `decode run`, two adjacent pairs, same 255 ids (issue #37, measured 2026-09-11); making that a `serve` default is not decided.
+- The tick's ranking signal is `CROW_ADAPT_WINDOW`, and `serve` sets it to `1` when unset since 2026-09-11 (issue #37, `engine/src/bin/serve.rs:2313`); `CROW_ADAPT_WINDOW=0` restores the cumulative ranking.
+- With that default the gap to the adjacent `decode run` is -3.39 %, -1.87 % and -2.03 % over three pairs, and `serve` moves 140.0 cold experts per token against 137.3 (issue #37, measured 2026-09-11).
+- Identity holds across all three chains: 18 of 18 runs produce the same 255 ids (issue #37, measured 2026-09-11).
 - No tok/s number is quoted without an adjacent decode run in the same session (rule from issue #38, 2026-09-10); the #38 row above is the serve-to-serve drift pair itself, not a rate claim.
 - The sampler default is decided (issue #55, 2026-09-11): the request decides, no `temperature` is greedy, `temperature > 0` samples with the data-sheet defaults (`engine/src/bin/serve.rs:1041`); the six-seed and the greedy rows above are the measured basis.
 
@@ -172,7 +174,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 | history | one branch `release-v0.1`, never pushed as of 2026-09-11 |
 | scope | one model, one GPU, one client, Windows |
 | open, throughput | prefill gap to the target, issue #10 |
-| open, `serve` rate | hot-set tick built, its ranking signal still open, issue #37 |
+| `serve` rate | within 5 % of the adjacent `decode run` since 2026-09-11, three pairs, issue #37 |
 | open, measurement discipline | run-position drift of a `serve` rate, issue #38 |
 | open, platform | Linux environment unverified, issue #15 |
 | open, logging | engine logging stage not started, issue #13 |
