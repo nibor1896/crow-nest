@@ -50,7 +50,7 @@
 //! | `ThreeStates::qsa_pooled` | block `b` is written before it is scored; `ncb` caps the scan at `(pos+1)/4` |
 //! | `Ple` row cache (`cache`, `gs`, `gs_host`, `slot_map`, `batch_tag`, `batch`) | content addressed by n-gram id; a hit is byte identical to a fill |
 //! | `Ple::req`, `Ple::miss` | hit rate counters, read by no kernel |
-//! | `Engine::sel_counts`, `adapt_base`, `adapt_ema` | `serve` never calls `adapt_tick` or `trickle_tick`; the hot set is the loaded one |
+//! | `Engine::sel_counts`, `adapt_base`, `adapt_ema` | since #37 (`d1a93e0`, `cf24171`) `serve` calls `trickle_tick` once per decode step and sets `CROW_ADAPT_WINDOW=1` when unset; `adapt_tick` is called by `bin/decode.rs:230` and `bin/parity.rs:216` only |
 //! | `Engine::scalar_stage`, `embed_buf`, `sb_pack` | per step staging, overwritten before every replay |
 //! | `Engine::stage`, `pf_*`, `pa_*` | per launch MoE plan and prefetch ring, rebuilt per chunk |
 //! | `Engine::p` (`Params`) | every position dependent scalar is uploaded per chunk (`gen.rs:2494-2510`) and per step |
