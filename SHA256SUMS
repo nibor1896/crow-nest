@@ -1,0 +1,3 @@
+7c058e555667b1c3d8f7d804d4a3393ba3664161dd307305718d85e4f33646b7  converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq
+af85905fbf46c12fa9528d22f2932b8785c55731a8c8fb013b2e91eecc6f0692  converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq.sidecar.jsonl
+4a408907d553518ee4421e59eae09e243db82ac0cd677557596dfdbaa4b099dc  decode_out/hotsets-M-longctx2100-n160.json

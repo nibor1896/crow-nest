@@ -36,6 +36,8 @@ oracle/routing-selections.npz
 *.log
 *.err
 *.out
+# the release checksum log is evidence for the quant package, not a measurement artefact (F1, #57)
+!/SHA256SUMS.log
 engine/.engine.lock
 
 # per-run scratch output of `decode run` (overwritten every run)

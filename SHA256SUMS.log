@@ -1,0 +1,102 @@
+# SHA256SUMS.log
+
+- task: F1, issue crow-nest #57, parent #1
+- branch: release-v0.1
+- tool: sha256sum (GNU coreutils) 8.32
+- runs: container read twice in full, plus one verify read
+
+## Machine block: before
+
+```
+utc: 2026-09-11T08:17:59Z
+epoch_s: 1789114679
+engine_processes: 0 of 4 names matched
+ram_total_kib: 66458328
+ram_free_kib: 56072824
+disk_c_free_bytes: 217710034944
+engine_lock: absent
+```
+
+## Input sizes (stat -c %s)
+
+| file | bytes |
+|---|---|
+| `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq.sidecar.jsonl` | 436716 |
+| `decode_out/hotsets-M-longctx2100-n160.json` | 83705 |
+| `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` | 104727179972 |
+
+## Runs
+
+| run | file | bytes | sha256 | wall_s | MB_per_s | start_epoch_s | end_epoch_s |
+|---|---|---|---|---|---|---|---|
+| 1 | `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq.sidecar.jsonl` | 436716 | `af85905fbf46c12fa9528d22f2932b8785c55731a8c8fb013b2e91eecc6f0692` | 0 | 0.4 | 1789114680 | 1789114680 |
+| 1 | `decode_out/hotsets-M-longctx2100-n160.json` | 83705 | `4a408907d553518ee4421e59eae09e243db82ac0cd677557596dfdbaa4b099dc` | 0 | 0.1 | 1789114680 | 1789114680 |
+| 1 | `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` | 104727179972 | `7c058e555667b1c3d8f7d804d4a3393ba3664161dd307305718d85e4f33646b7` | 197 | 531.6 | 1789114680 | 1789114877 |
+| 2 | `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` | 104727179972 | `7c058e555667b1c3d8f7d804d4a3393ba3664161dd307305718d85e4f33646b7` | 195 | 537.1 | 1789114877 | 1789115072 |
+
+## Compare
+
+```
+CONTAINER SHA256 RUNS AGREE: 2 of 2
+```
+
+## SHA256SUMS written
+
+```
+7c058e555667b1c3d8f7d804d4a3393ba3664161dd307305718d85e4f33646b7  converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq
+af85905fbf46c12fa9528d22f2932b8785c55731a8c8fb013b2e91eecc6f0692  converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq.sidecar.jsonl
+4a408907d553518ee4421e59eae09e243db82ac0cd677557596dfdbaa4b099dc  decode_out/hotsets-M-longctx2100-n160.json
+```
+
+- lines: 3 of 3 expected
+- cr_bytes: 0 of 0 expected (carriage returns counted with `tr -dc` and again with `grep -c -P`)
+- lf_bytes: 3 of 3 expected
+- bom: none, the first 3 bytes are `37 63 30`, the ASCII `7c0`; a BOM would read `ef bb bf`
+- note: the chain printed its own CR check as `3 of 0`, a false alarm
+- note: that check built an empty pattern, and an empty pattern matches every line, so it counted lines not carriage returns
+- note: the file is LF only, confirmed by `od -c` on the tail and by both re-counts above
+
+## Verify (sha256sum -c SHA256SUMS, third full container read)
+
+```
+converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq: OK
+converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq.sidecar.jsonl: OK
+decode_out/hotsets-M-longctx2100-n160.json: OK
+```
+
+- verify_exit_code: 0 of 0 expected
+- verify_ok_lines: 3 of 3 expected
+- verify_wall_s: 195
+
+## Cache note
+
+| quantity | value | source |
+|---|---|---|
+| container size | 104727179972 bytes, 97.53 GiB | SHA256SUMS.log input sizes |
+| free RAM at start | 56072824 KiB, 53.48 GiB | SHA256SUMS.log machine block before |
+| shortfall against free RAM | 44.06 GiB | container size minus free RAM |
+| run 1 container wall | 197 s | SHA256SUMS.log runs row 3 |
+| run 2 container wall | 195 s | SHA256SUMS.log runs row 4 |
+| verify container wall | 195 s | SHA256SUMS.log verify_wall_s |
+| run 2 minus run 1 | -2 s, 1.0 percent of run 1 | the two run rows |
+
+- claim: run 2 was not served from the OS page cache
+- evidence: the container exceeds free RAM by 44.06 GiB, so a full cache hit cannot happen
+- evidence: run 2 is 1.0 percent faster than run 1, not far below it
+- evidence: the third read in the verify step lands at the same wall of 195 s
+- conclusion: all three reads went to disk at about 531 MB/s to 537 MB/s
+- unmeasured: the share of the file that a partial page cache may have served in any single run
+
+## Machine block: after
+
+```
+utc: 2026-09-11T08:27:47Z
+epoch_s: 1789115267
+engine_processes: 0 of 4 names matched
+ram_total_kib: 66458328
+ram_free_kib: 56619548
+disk_c_free_bytes: 217713909760
+engine_lock: absent
+```
+
+DONE
