@@ -532,19 +532,23 @@ pub fn stage_dma_on() -> bool {
     *ON.get_or_init(|| std::env::var("CROW_STAGE_DMA").as_deref() == Ok("1"))
 }
 
-/// CROW_STAGE_KERNEL (default unset = today's stage_cold, byte for byte; `2` selects
-/// stage_cold_ca, the #19d persistent cp.async.cg 4 KB tile copy). 19c measured the
-/// cp.async.cg shape at 52.9 GB/s against 34.1 GB/s for the stage_cold shape in the
-/// same process (decode_out/srv-19c.log:73 and :162). The variant is a pure copy, so
-/// both settings must be byte-identical in parity.
+/// CROW_STAGE_KERNEL (default 2 = stage_cold_ca, the #19d persistent cp.async.cg 4 KB
+/// tile copy; `1` selects the old stage_cold, kept as the fallback; any other value
+/// and unset take the default). DEFAULT SINCE #19e, 2026-09-12: stage_cold_ca ran the
+/// #59 profile arm at 26.46 ms per decode token against 29.68 for stage_cold, a gain
+/// of 3.22 ms per token at 19.5 x the baseline spread (decode_out/srv-19d.log, RTX
+/// 5090, 2026-09-11). The variant is a pure copy, so both settings must be
+/// byte-identical in parity.
 pub fn stage_kernel_ca() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CROW_STAGE_KERNEL").as_deref() == Ok("2"))
+    *ON.get_or_init(|| std::env::var("CROW_STAGE_KERNEL").as_deref() != Ok("1"))
 }
 
 /// CROW_STAGE_BLOCKS (default 40, accepted 8 to 512, other values fall back): the
-/// persistent grid of stage_cold_ca. 19c: fewer blocks are faster, 40 x 256 was the
-/// best row (52.9 GB/s), 20 x 256 gave 52.6 and 160 x 256 gave 52.4.
+/// persistent grid of stage_cold_ca, read whenever that kernel runs, which is the
+/// default since #19e. 19c: fewer blocks are faster, 40 x 256 was the best row
+/// (52.9 GB/s), 20 x 256 gave 52.6 and 160 x 256 gave 52.4. 19d measured 40 and 80
+/// tied inside their own spreads and 20 worse by 0.1532 ms per token.
 pub fn stage_blocks() -> u32 {
     static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("CROW_STAGE_BLOCKS").ok().and_then(|v| v.parse().ok()).filter(|&g| (8..=512).contains(&g)).unwrap_or(40))
@@ -671,13 +675,31 @@ impl Engine {
         let s = Scratch::alloc(cfg.prompt_chunk);
         // cold staging: decode-sized batches only (t*TOPK <= stage_max)
         let stage_max = (2 * TOPK).max(pf_tg() * if pf_async_on() { 2 } else { 1 }); // 2 x 64 slots x 2.76 MB = 354 MB (default since 2026-09-09; CROW_PF_ASYNC=0 CROW_PF_TG=32 = 88 MB)
-        assert!(slabs.gu_bytes % (16 * stage_split() as u64) == 0 && slabs.dn_bytes % (16 * stage_split() as u64) == 0,
-            "expert slab bytes must split into 16-byte units x STAGE_SPLIT");
+        // #19e fix C4 of 19d: CROW_STAGE_SPLIT shapes the stage_cold grid only, so its
+        // assert gates the kernel 1 fallback only. Kernel 2, the default, carries no
+        // tail tile and needs 4 KB multiples instead, asserted here at load and again
+        // at the launch site.
         if stage_kernel_ca() {
-            // #19d: one line so a log proves the switch was READ; CROW_STAGE_DMA and
-            // the low-bit tier still take precedence at the launch site (fix M1)
-            println!("[stage] CROW_STAGE_KERNEL=2 requested: stage_cold_ca, {} blocks x 256 threads, 4096 B tiles (gate_up {} B = {} tiles, down {} B = {} tiles)",
-                stage_blocks(), slabs.gu_bytes, slabs.gu_bytes / 4096, slabs.dn_bytes, slabs.dn_bytes / 4096);
+            assert!(slabs.gu_bytes % 4096 == 0 && slabs.dn_bytes % 4096 == 0,
+                "stage_cold_ca needs both expert slab byte counts to be multiples of 4096 (gate_up {} B, down {} B); CROW_STAGE_KERNEL=1 falls back to stage_cold",
+                slabs.gu_bytes, slabs.dn_bytes);
+        } else {
+            assert!(slabs.gu_bytes % (16 * stage_split() as u64) == 0 && slabs.dn_bytes % (16 * stage_split() as u64) == 0,
+                "expert slab bytes must split into 16-byte units x STAGE_SPLIT");
+        }
+        // #19e, 2026-09-12: ONE line per engine process names the staging kernel that
+        // will run, so every future log says which kernel produced it. It sits in the
+        // [load] block and not next to the [policy] line of geo::apply_adapt_policy,
+        // because decode parity and parity.exe never call that function and would
+        // therefore print no such line at all. CROW_STAGE_DMA and the low-bit tier
+        // still take precedence at the launch site (moe_run).
+        let sk = std::env::var("CROW_STAGE_KERNEL").unwrap_or_else(|_| "unset".to_string());
+        if stage_kernel_ca() {
+            println!("[stage] kernel stage_cold_ca, CROW_STAGE_KERNEL {} (default 2), {} blocks x 256 threads, 4096 B tiles (gate_up {} B = {} tiles, down {} B = {} tiles)",
+                sk, stage_blocks(), slabs.gu_bytes, slabs.gu_bytes / 4096, slabs.dn_bytes, slabs.dn_bytes / 4096);
+        } else {
+            println!("[stage] kernel stage_cold, CROW_STAGE_KERNEL {}, grid t * TOPK x 2 x {} (CROW_STAGE_SPLIT) x 256 threads (gate_up {} B, down {} B)",
+                sk, stage_split(), slabs.gu_bytes, slabs.dn_bytes);
         }
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
         let max_tiles = cfg.prompt_chunk * TOPK / 8 + E + 1;
@@ -2020,9 +2042,11 @@ impl Engine {
                 // x 1 x 1; the tenth argument is the combo count BY VALUE, the very
                 // `t * TOPK` that `staged` bounds-checked against stage.max above, so
                 // the device item count and the host bound cannot disagree (fix I2)
+                // #19e: this is the DEFAULT branch since 2026-09-12; CROW_STAGE_KERNEL=1
+                // takes the stage_cold branch below
                 // fix I3: the kernel has no tail tile, so both counts must be 4 KB
                 assert!(self.stage.gu_bytes % 4096 == 0 && self.stage.dn_bytes % 4096 == 0,
-                    "stage_cold_ca needs both staged byte counts to be multiples of 4096 (gate_up {} B, down {} B); unset CROW_STAGE_KERNEL to fall back to stage_cold",
+                    "stage_cold_ca needs both staged byte counts to be multiples of 4096 (gate_up {} B, down {} B); CROW_STAGE_KERNEL=1 falls back to stage_cold",
                     self.stage.gu_bytes, self.stage.dn_bytes);
                 launch_v(k.f("stage_cold_ca"), stage_blocks(), 1, 1, 256, &[
                     s.gu_ptrs as u64, s.dn_ptrs as u64, s.cold as u64,
