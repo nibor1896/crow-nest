@@ -3451,6 +3451,10 @@ impl Drop for Engine {
                       &mut st.n_tiles, &mut st.eptr, &mut st.grp, &mut st.tg, &mut st.max_tiles_p] {
                 cuda::free_dev(d);
             }
+            // #18: the pinned DMA scratch of CROW_STAGE_DMA belongs to the same rule
+            if let Some(d) = st.dma.as_mut() {
+                d.free();
+            }
             cuda::free_dev(&mut self.pf_ncombo);
             cuda::free_dev(&mut self.sel_counts);
             if let Some(ds) = &mut self.dev_sampler {
