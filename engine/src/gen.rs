@@ -3142,6 +3142,8 @@ impl Engine {
         // this token (graph replay, capture, or the eager kernels above) and
         // before the end-of-step sync, so they overlap the replay instead of
         // blocking it. No-op under CROW_TRICKLE_DEFER=0: nothing is parked.
+        // Under CROW_PROFILE=1 the host time of this issue (about 0.24 ms per
+        // token, 63c review I2) lands in the HEAD bucket, not in TAIL.
         self.trickle_drain_after_launch();
         if prof {
             prof::add(&prof::HEAD, t_head.elapsed().as_micros() as u64);
