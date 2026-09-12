@@ -50,6 +50,14 @@
 
 ### Changed
 
+- `#61` 61d, 2026-09-13: the decode attention runs 32 splits by default
+  - selection: `CROW_ATTN_SPLITS` unset or any value but `4`, `8`, `16` runs the `ATTN_SPLITS` const, now 32; `CROW_ATTN_SPLITS=8` restores the configuration of record before the flip (`gen.rs:1280`, read site `gen.rs:1301`, boot line `gen.rs:742`)
+  - boot line: every engine process prints one `[attn]` line naming the split count it runs, next to the `[qsa]` line
+  - measured 2026-09-13, RTX 5090, t1-read 16,064 ids, 255 timed decode steps, one fresh process per run, three adjacent pairs: crow-nest 23.23 / 22.63 / 22.71 ms per token with the new default against 24.11 / 24.14 / 24.15 with `CROW_ATTN_SPLITS=8`, means 22.8545 against 24.1325 ms per token = 43.8 against 41.4 tok/s, 1.278 ms per token gained = 5.3 percent at 32.3 fallback spread windows, B ids `5098f885ab3a` 3 of 3, N ids `c65969f7793a` 3 of 3, the 61a/61c S32 value (`decode_out/srv-61d.log`)
+  - llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL on the same machine, 2026-09-11: 22.27 ms per token = 44.9 tok/s (`decode_out/srv-59b.log`); the engine gap fell from 1.67 to 0.58 ms per token
+  - gates: parity 8 of 8 FORCED-8 forms byte-identical against the installed build `d211ab52ad2b` with the 61b sha256 values of record, so the flip is the const plus the boot line and nothing else; the new-default splits 32 stream is recorded fresh, PX long form sha256 of record `43de2126b85c03f21565a619425b14dec99dbebde70856ac3172a5c3a30f62bb` (pxn1 and pxn2 byte-identical), the ids change of record against the splits 8 `f217e1c55926`; ten-task 10 of 10 recorded with per-task shas as the new baseline of record under the documented ids-change rule (0 of 10 still equal `final4`); A9B GATE PASS with in-chain new-default reference shas; A10 smoke 6 of 6
+  - quality verdict of record: the ten-task quality bar is NOT held at splits 32, judged 0 Pass / 7 Partial / 3 Fail against the crow record 2 / 5 / 3 at splits 8 and the llama reference 2 / 6 / 2, no degeneration mode, one greedy sample per task (`.superpowers/sdd/task-61d-quality-report.md`); the flip rests on robin's performance-over-ids ruling of 2026-09-12, `CROW_ATTN_SPLITS=8` restores the record stream
+  - the prefill split-count form is untouched: a different split count lives in the decode attention only
 - `#61` 61b, 2026-09-12: the decode QSA top-k runs as `qsa_select_par` by default
   - selection: `CROW_QSA_PAR` unset or any value but `0` runs `qsa_select_par_h` over `CROW_QSA_PAR_BLOCKS` = 32 blocks plus one `qsa_select_par_e` emit block, same list in the same order; `CROW_QSA_PAR=0` restores the `qsa_select_fast` single-block fallback (`gen.rs:1302`, boot line `gen.rs:731`)
   - boot line: every engine process prints one `[qsa]` line naming the selection it runs, next to the `[stage]` and `[trickle]` lines
