@@ -732,7 +732,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 | switch | issue point of the side-stream copies | mode |
 |---|---|---|
-| unset (default) | inside `trickle_tick`, BEFORE the token's graph launch (`gen.rs:3355-3365`) | operating |
+| unset (default) | inside `trickle_tick`, BEFORE the token's graph launch (`gen.rs:3398-3408`) | operating |
 | `CROW_TRICKLE_DEFER=1` | inside `decode_step`, AFTER the graph launch and before the end-of-step sync (`gen.rs:3131`, `Engine::trickle_drain_after_launch` at `gen.rs:3435`) | measurement |
 
 - 63a measured the default form: 2.5968 ms per token of copies, class b (before the graph) 19,364 of 19,364, class a 0.
