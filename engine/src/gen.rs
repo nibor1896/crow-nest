@@ -337,8 +337,9 @@ pub struct Scratch {
     pub ple_out: Dev,  // [C][10240]
     pub ple_slots: Dev, // [C][16] i32
     // head
-    pub part_o: Dev,   // [24][ATTN_SPLITS][256] decode attention partials
-    pub part_ml: Dev,  // [24][ATTN_SPLITS][2]
+    pub part_o: Dev,   // [24][ATTN_SPLITS_MAX][256] decode attention partials
+    pub part_ml: Dev,  // [24][ATTN_SPLITS_MAX][2]
+    pub qsa_h1: Dev,   // #61a [QSA_PAR_BINS] u32, the CROW_QSA_PAR key histogram
     pub logits: Dev,   // [C][V]
     pub argmax: Dev,   // [1] i32
     pub mixed_final: Dev, // [C][2560]
@@ -1258,7 +1259,40 @@ pub const ATTN_SB: usize = 512;
 fn attn_sb_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| env_on("CROW_ATTN_SB")) }
 fn attn_sb(chunk: usize) -> usize { if attn_sb_on() { chunk.min(ATTN_SB).max(1) } else { chunk.max(1) } }
 pub const ATTN_SPLITS: usize = 8;
+/// #61a: the partial buffers are sized for the largest allowed split count,
+/// so CROW_ATTN_SPLITS can be raised at runtime without a reallocation.
+pub const ATTN_SPLITS_MAX: usize = 32;
 pub const QSA_PAR_BLOCKS: u32 = 512;
+/// #61a: bin count of the qsa_select_par round A histogram (12 top key bits);
+/// must match QSA_PAR_BINS in kernels.rs.
+pub const QSA_PAR_BINS: usize = 4096;
+/// #61a CROW_ATTN_SPLITS (default 8, allowed 4 8 16 32, anything else falls
+/// back to 8): the split count of the decode attention (grid.z of
+/// attn_sel_split, the device scalar p.n_splits read by attn_merge).
+/// MEASUREMENT ONLY: a different split count changes the merge order of the
+/// flash-decoding partials, so the last bits of the logits may move.
+pub fn attn_splits() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("CROW_ATTN_SPLITS").ok().and_then(|v| v.parse().ok())
+        .filter(|s| matches!(s, 4 | 8 | 16 | 32)).unwrap_or(ATTN_SPLITS))
+}
+/// #61a CROW_QSA_PAR (default off, `1` selects it): the decode QSA top-k runs
+/// as qsa_select_par_h (G blocks, 12-bit histogram) plus qsa_select_par_e
+/// (one block of 1024, threshold refine and ascending emit) instead of
+/// qsa_select_fast on one block. Same selection list in the same order:
+/// bit-identical by parity.
+fn qsa_par_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CROW_QSA_PAR").as_deref() == Ok("1"))
+}
+/// #61a CROW_QSA_PAR_BLOCKS (default 32, clamped to 4 .. 256): the block count
+/// of qsa_select_par_h. The histogram is order free, so the count never moves
+/// a bit of the selection list.
+fn qsa_par_blocks() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("CROW_QSA_PAR_BLOCKS").ok().and_then(|v| v.parse().ok())
+        .unwrap_or(32u32).clamp(4, 256))
+}
 
 fn dense_mma_on() -> bool {
     mma_on() && std::env::var("CROW_MMA_DENSE").as_deref() != Ok("0")
@@ -1387,7 +1421,7 @@ impl Params {
             nr4: cuda::to_i32_dev(&[HCN as i32]),
             nr48: cuda::to_i32_dev(&[GDN_VHEADS as i32]),
             nr512: cuda::to_i32_dev(&[KV_ROWS as i32]),
-            n_splits: cuda::to_i32_dev(&[ATTN_SPLITS as i32]),
+            n_splits: cuda::to_i32_dev(&[attn_splits() as i32]),
         }
     }
 }
@@ -1477,8 +1511,9 @@ impl Scratch {
             ple_gn: d(c * HCT),
             ple_out: d(c * HCT),
             ple_slots: db(c * PLE_NHEADS * 4),
-            part_o: d(NQ * ATTN_SPLITS * AHD),
-            part_ml: d(NQ * ATTN_SPLITS * 2),
+            part_o: d(NQ * ATTN_SPLITS_MAX * AHD),  // #61a: sized for CROW_ATTN_SPLITS=32
+            part_ml: d(NQ * ATTN_SPLITS_MAX * 2),   // #61a: sized for CROW_ATTN_SPLITS=32
+            qsa_h1: db(QSA_PAR_BINS * 4),           // #61a: CROW_QSA_PAR histogram, zero between calls
             logits: d(V), // one row: lm_head_row always writes the base row (was c*V = 508 MB at C=512)
             argmax: db(4),
             mixed_final: d(c * H),
@@ -1917,11 +1952,20 @@ impl Engine {
             launch_v(k.f("qsa_scores"), 1, 1, 1, QSA_HD as u32, &[
                 s.q_rot as u64, pooled, s.scores as u64, p.cap as u64, p.pos_base as u64]);
         }
+        if qsa_par_on() {
+            // #61a: two launches, the histogram over G blocks then one emit block
+            launch_v(k.f("qsa_select_par_h"), qsa_par_blocks(), 1, 1, 256, &[
+                s.scores as u64, p.ncb1 as u64, s.qsa_h1 as u64, p.k_top as u64, p.cap as u64]);
+            launch_v(k.f("qsa_select_par_e"), 1, 1, 1, 1024, &[
+                s.scores as u64, p.ncb1 as u64, s.sel as u64, s.sel_n as u64, p.k_top as u64,
+                p.cap as u64, p.n_selmax as u64, p.pos_row1 as u64, s.qsa_h1 as u64]);
+        } else {
         launch_v(k.f(if qsa_fast_on() { "qsa_select_fast" } else { "qsa_select" }), 1, 1, 1, 256, &[
             s.scores as u64, p.ncb1 as u64, s.sel as u64, s.sel_n as u64, p.k_top as u64,
             p.cap as u64, p.n_selmax as u64, p.pos_row1 as u64]);
+        }
         if attn_split_on() {
-            launch_v(k.f("attn_sel_split"), NQ as u32, 1, ATTN_SPLITS as u32, AHD as u32, &[
+            launch_v(k.f("attn_sel_split"), NQ as u32, 1, attn_splits() as u32, AHD as u32, &[
                 s.aqr as u64, kc, vc, s.sel as u64, s.sel_n as u64, p.tmax as u64, p.mode as u64,
                 p.n_selmax as u64, s.part_o as u64, s.part_ml as u64]);
             launch_v(k.f("attn_merge"), NQ as u32, 1, 1, AHD as u32, &[
@@ -3739,6 +3783,7 @@ impl Drop for Scratch {
             for f in [&mut self.h,
                       &mut self.part_o, // #18: the two attention-split partials were never freed
                       &mut self.part_ml,
+                      &mut self.qsa_h1, // #61a: the CROW_QSA_PAR histogram
                       &mut self.emb,
                       &mut self.mixed,
                       &mut self.low,

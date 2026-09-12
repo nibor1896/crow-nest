@@ -2100,6 +2100,180 @@ extern "C" __global__ void qsa_select_fast(const float* __restrict__ scores, con
     }
 }
 
+
+// ---------------- qsa_select_par (CROW_QSA_PAR, default off) ----------------
+// Same exact top-k selection as qsa_select_fast, spread over many blocks.
+// Two launches per call:
+//   qsa_select_par_h  grid (G, nq) x 256   12-bit histogram of the ordered keys
+//                                          into h1[4096] (global, zero on entry)
+//   qsa_select_par_e  grid (nq) x 1024     threshold refine (10 + 10 bits),
+//                                          tie fill by lowest index, ascending
+//                                          emit, and it zeroes h1 for the next call
+// Output rule reproduced byte for byte from qsa_select_fast:
+//   thr      = the K-th largest ordered key (radix digits, any digit widths)
+//   above    = count of keys strictly greater than thr
+//   fill     = K - above
+//   selected = {i : key_i > thr} plus the first `fill` indices with key_i == thr
+//   list     = for every selected block i ascending: 4i, 4i+1, 4i+2, 4i+3
+//              then the tail tokens 4*ncb .. pos ascending
+//   sel_n    = 4 * total + tail, total = above + min(eq_total, fill)
+// The dense regime (K >= ncb) takes the same shortcut: the list is 0 .. pos.
+#define QSA_PAR_BINS 4096
+// suffix threshold search over nb bins of shared `sh` with 1024 threads.
+// Writes the digit B and cum = sum over bins above B, matching the downward
+// scan of qsa_select: the first b from the top whose inclusive suffix reaches
+// `need`. nb must be a multiple of 1024.
+// inclusive prefix sum over exactly 1024 threads (32 warp scans plus one warp
+// scan of the warp totals): two barriers, against 20 for a shared-memory scan.
+// *s_tot takes the total. tmp holds 32 words and must not be reused before the
+// next barrier.
+__device__ __forceinline__ unsigned int qsa_par_scan(unsigned int v, unsigned int* tmp,
+                                                     unsigned int* s_tot) {
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    unsigned int x = v;
+    #pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        unsigned int y = __shfl_up_sync(0xffffffffu, x, d);
+        if (lane >= d) x += y;
+    }
+    if (lane == 31) tmp[warp] = x;
+    __syncthreads();
+    if (warp == 0) {
+        unsigned int w = tmp[lane];
+        #pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            unsigned int y = __shfl_up_sync(0xffffffffu, w, d);
+            if (lane >= d) w += y;
+        }
+        tmp[lane] = w;
+        if (lane == 31) *s_tot = w;
+    }
+    __syncthreads();
+    if (warp > 0) x += tmp[warp - 1];
+    return x;
+}
+__device__ __forceinline__ void qsa_par_thr(unsigned int* sh, int nb, unsigned int need,
+                                            unsigned int* tmp, unsigned int* s_tot,
+                                            unsigned int* s_b, unsigned int* s_cum) {
+    int tid = threadIdx.x;
+    int per = nb >> 10;
+    unsigned int v = 0;
+    for (int j = 0; j < per; j++) v += sh[tid * per + j];
+    unsigned int pfx = qsa_par_scan(v, tmp, s_tot);
+    unsigned int cum0 = *s_tot - pfx; // bins above this chunk
+    if (cum0 < need && cum0 + v >= need) {
+        unsigned int cum = cum0;
+        int B = tid * per;
+        for (int b = tid * per + per - 1; b >= tid * per; b--) {
+            unsigned int c = sh[b];
+            if (cum + c >= need) { B = b; break; }
+            cum += c;
+        }
+        *s_b = (unsigned int)B;
+        *s_cum = cum;
+    }
+    __syncthreads();
+}
+extern "C" __global__ void qsa_select_par_h(const float* __restrict__ scores, const int* __restrict__ ncb_p,
+                                            unsigned int* __restrict__ h1,
+                                            const int* __restrict__ k_p, const int* __restrict__ cap_p) {
+    int qi = blockIdx.y;
+    int ncb = ncb_p[qi];
+    int K = *k_p;
+    if (K >= ncb) return; // dense regime: the emit kernel writes 0..pos, h1 stays zero
+    const float* row = scores + (size_t)qi * *cap_p;
+    unsigned int* hq = h1 + (size_t)qi * QSA_PAR_BINS;
+    __shared__ unsigned int sh[QSA_PAR_BINS];
+    for (int b = threadIdx.x; b < QSA_PAR_BINS; b += blockDim.x) sh[b] = 0u;
+    __syncthreads();
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < ncb; i += gridDim.x * blockDim.x)
+        atomicAdd(&sh[ordkey(row[i]) >> 20], 1u);
+    __syncthreads();
+    for (int b = threadIdx.x; b < QSA_PAR_BINS; b += blockDim.x)
+        if (sh[b]) atomicAdd(&hq[b], sh[b]);
+}
+extern "C" __global__ void qsa_select_par_e(const float* __restrict__ scores, const int* __restrict__ ncb_p,
+                                            int* __restrict__ sel_list, int* __restrict__ sel_n,
+                                            const int* __restrict__ k_p, const int* __restrict__ cap_p,
+                                            const int* __restrict__ sel_max_p, const int* __restrict__ pos_p,
+                                            unsigned int* __restrict__ h1) {
+    int qi = blockIdx.x;
+    int ncb = ncb_p[qi];
+    int K = *k_p;
+    int tid = threadIdx.x; // blockDim.x == 1024
+    int smax = *sel_max_p;
+    if (K >= ncb) {
+        int pos = pos_p[qi];
+        for (int i = tid; i <= pos; i += blockDim.x) sel_list[qi * smax + i] = i;
+        if (tid == 0) sel_n[qi] = pos + 1;
+        return;
+    }
+    const float* row = scores + (size_t)qi * *cap_p;
+    unsigned int* hq = h1 + (size_t)qi * QSA_PAR_BINS;
+    __shared__ unsigned int sh[QSA_PAR_BINS];
+    __shared__ unsigned int tmp[32];
+    __shared__ unsigned int s_b, s_cum, s_tot, s_gt, s_eq;
+    // round A: the 12 top bits, histogram built by qsa_select_par_h
+    for (int b = tid; b < QSA_PAR_BINS; b += blockDim.x) sh[b] = hq[b];
+    __syncthreads();
+    qsa_par_thr(sh, QSA_PAR_BINS, (unsigned int)K, tmp, &s_tot, &s_b, &s_cum);
+    unsigned int pref = s_b;
+    unsigned int above = s_cum;
+    for (int b = tid; b < QSA_PAR_BINS; b += blockDim.x) hq[b] = 0u; // zero for the next call
+    // rounds B: 10 bits each over the surviving prefix
+    for (int r = 0; r < 2; r++) {
+        int shift = 10 - 10 * r;
+        __syncthreads();
+        sh[tid] = 0u;
+        __syncthreads();
+        for (int i = tid; i < ncb; i += blockDim.x) {
+            unsigned int key = ordkey(row[i]);
+            if ((key >> (shift + 10)) == pref) atomicAdd(&sh[(key >> shift) & 0x3FFu], 1u);
+        }
+        __syncthreads();
+        qsa_par_thr(sh, 1024, (unsigned int)K - above, tmp, &s_tot, &s_b, &s_cum);
+        above += s_cum;
+        pref = (pref << 10) | s_b;
+    }
+    unsigned int thr = pref;
+    // one contiguous chunk per thread: ascending index order is the emit order
+    int per = (ncb + 1023) >> 10;
+    int lo = tid * per;
+    int hi = min(ncb, lo + per);
+    unsigned int gt = 0u, eq = 0u;
+    for (int i = lo; i < hi; i++) {
+        unsigned int key = ordkey(row[i]);
+        if (key > thr) gt++;
+        else if (key == thr) eq++;
+    }
+    unsigned int gt_before = qsa_par_scan(gt, tmp, &s_gt) - gt;
+    __syncthreads(); // tmp is reused by the second scan
+    unsigned int eq_before = qsa_par_scan(eq, tmp, &s_eq) - eq;
+    unsigned int gt_total = s_gt;
+    unsigned int eq_total = s_eq;
+    unsigned int fill = (gt_total < (unsigned int)K) ? ((unsigned int)K - gt_total) : 0u;
+    unsigned int total = gt_total + ((eq_total < fill) ? eq_total : fill);
+    unsigned int g = gt_before, e = eq_before;
+    for (int i = lo; i < hi; i++) {
+        unsigned int key = ordkey(row[i]);
+        unsigned int r = 0u;
+        bool sel = false;
+        if (key > thr) { r = g + ((e < fill) ? e : fill); sel = true; g++; }
+        else if (key == thr) { if (e < fill) { r = g + e; sel = true; } e++; }
+        if (sel) {
+            int slot = qi * smax + (int)(r * 4u);
+            for (int c = 0; c < 4; c++) sel_list[slot + c] = i * 4 + c;
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int pos = pos_p[qi];
+        int tailn = (pos + 1) - 4 * ncb;
+        int base = 4 * (int)total;
+        for (int c = 0; c < tailn; c++) sel_list[qi * smax + base + c] = 4 * ncb + c;
+        sel_n[qi] = base + tailn;
+    }
+}
 // ---------------- router (softmax + top-10 + residency + pointers) ----------------
 // grid (T), block 512. Emits per token: ids[10], normalized weights[10],
 // separate gate_up / down weight pointer pairs (VRAM or pinned UVA — residency
@@ -3205,7 +3379,7 @@ impl Kernels {
             "conv_state_update", "split_qkv", "l2norm_repeat", "beta_g", "delta_rule_persist", "conv_step",
             "delta_rule_step", "delta_rule_persist_r", "delta_rule_step_r", "rmsnorm_gated", "split_qg", "rope", "rope_p", "stage_cold", "stage_cold_ca", "stage_cold_lb", "stage_tiles_lb", "swap_pairs", "expand_slab", "moe_count", "moe_plan", "moe_scatter", "stage_tiles", "gemm_fp4_tiles", "silu_tiles", "quant_tiles", "store_kv", "attn_sel",
             "gate_mul", "rms128", "rope64", "pool4_cache", "qk_k_append", "d2d_block", "qsa_scores",
-            "qsa_select", "qsa_select_fast", "router_top10", "gather_ple_fp4", "gate_dot", "gate_apply", "ple_conv",
+            "qsa_select", "qsa_select_fast", "qsa_select_par_h", "qsa_select_par_e", "router_top10", "gather_ple_fp4", "gate_dot", "gate_apply", "ple_conv",
             "ple_state_update", "ple_conv_step", "argmax_k", "sample_topk_part", "sample_k", "add_flat",
             "gemv_bf16_b", "gemv_bf16_w", "gemv_fp4_b1k", "gemm_fp4_dense", "gemm_bf16_dense", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
             "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "attn_sel_r", "attn_sel_d8", "attn_sel_d9", "attn_sel_s", "attn_sel_s8", "attn_sel_s8l", "attn_sel_g",

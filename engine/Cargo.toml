@@ -66,6 +66,10 @@ name = "graph_probe"
 path = "src/bin/graph_probe.rs"
 
 [[bin]]
+name = "qsa_probe"
+path = "src/bin/qsa_probe.rs"
+
+[[bin]]
 name = "pcie_probe"
 path = "src/bin/pcie_probe.rs"
 
