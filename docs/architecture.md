@@ -292,14 +292,17 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 | `CROW_STAGE_KERNEL=1` | `stage_cold` | `t * TOPK` x 2 x `CROW_STAGE_SPLIT`, 256 threads | 4 x 16 B `uint4` loads in flight per thread | operating fallback |
 | `CROW_STAGE_DMA=1` | none, copy engine | host-issued `cuMemcpyDtoDAsync` per cold combo | copy engine, decode graph off | measurement |
 
-- The decode operating point that decided the default: #19e, 2026-09-12.
+- The decode operating point that decided the staging default: #19e, 2026-09-12.
+- The decode operating point that decided the trickle issue default: #63c, 2026-09-12.
+- Every row of this table is one adjacent pair of one chain; the two crow-nest columns are the two arms of that pair.
 - The two arms run different weights: crow-nest CNQ4.5-M (NVFP4, 4.5 bpw); llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL (GGUF, 2.4 bpw).
 - A tok/s figure is quoted only next to its adjacent arm in the same chain (#38).
 
-| shape metric | crow-nest, default `stage_cold_ca` | crow-nest, `CROW_STAGE_KERNEL=1` | llama.cpp | machine | date | source |
+| shape metric | crow-nest, engine default | crow-nest, the named fallback | llama.cpp | machine | date | source |
 |---|---|---|---|---|---|---|
-| decode, t1-read 16,064 ids, 255 timed steps | 26.46 ms per token = 37.8 tok/s | 29.68 ms per token = 33.7 tok/s | 22.27 ms per token = 44.9 tok/s | RTX 5090 | 2026-09-11 | `decode_out/srv-19d.log`, `decode_out/srv-59b.log` |
-| staging row of that step, nsys, 338 MB per token | 7.07 ms per token at 47.78 GB/s | 10.42 ms per token at 32.45 GB/s | n/a | RTX 5090 | 2026-09-11 | `decode_out/srv-19d.log` |
+| decode, t1-read 16,064 ids, 255 timed steps, the #63c trickle pair | 24.78 ms per token = 40.3 tok/s | 26.41 ms per token = 37.9 tok/s with `CROW_TRICKLE_DEFER=0` | 22.27 ms per token = 44.9 tok/s | RTX 5090 | crow-nest 2026-09-12, llama.cpp 2026-09-11 | `decode_out/srv-63c.log`, `decode_out/srv-59b.log` |
+| decode, same shape, the #19e staging pair, both arms on the eager trickle of that day | 26.46 ms per token = 37.8 tok/s | 29.68 ms per token = 33.7 tok/s with `CROW_STAGE_KERNEL=1` | 22.27 ms per token = 44.9 tok/s | RTX 5090 | 2026-09-11 | `decode_out/srv-19d.log`, `decode_out/srv-59b.log` |
+| staging row of that step, nsys, 338 MB per token | 7.07 ms per token at 47.78 GB/s | 10.42 ms per token at 32.45 GB/s with `CROW_STAGE_KERNEL=1` | n/a | RTX 5090 | 2026-09-11 | `decode_out/srv-19d.log` |
 
 ### 3.5 PLE in the loop
 
@@ -728,14 +731,16 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
   the last tick instead of the prefill-dominated cumulative count.
 - Condition 2 covers that too: the ranking signal picks WHICH expert moves, not what is read.
 
-**Where the trickle's copies are issued (#63b, 2026-09-12).**
+**Where the trickle's copies are issued (#63b, default flipped by #63c, 2026-09-12).**
 
-| switch | issue point of the side-stream copies | mode |
+| `CROW_TRICKLE_DEFER` | issue point of the side-stream copies | mode |
 |---|---|---|
-| unset (default) | inside `trickle_tick`, BEFORE the token's graph launch (`gen.rs:3398-3408`) | operating |
-| `CROW_TRICKLE_DEFER=1` | inside `decode_step`, AFTER the graph launch and before the end-of-step sync (`gen.rs:3131`, `Engine::trickle_drain_after_launch` at `gen.rs:3435`) | measurement |
+| unset or any value but `0` (default) | inside `decode_step`, AFTER the graph launch and before the end-of-step sync (`gen.rs:3145`, `Engine::trickle_drain_after_launch` at `gen.rs:3449`) | operating |
+| `0` | inside `trickle_tick`, BEFORE the token's graph launch (`gen.rs:3412-3422`) | operating fallback |
 
-- 63a measured the default form: 2.5968 ms per token of copies, class b (before the graph) 19,364 of 19,364, class a 0.
+- Every engine process prints one `[trickle]` boot line naming the order it runs (`gen.rs:721`), next to the `[stage]` line.
+- 63a measured the eager form: 2.5968 ms per token of copies, class b (before the graph) 19,364 of 19,364, class a 0.
+- 63b measured the deferred form: 3.2123 ms per token of copies, class a 83.96 % of the copy ms, 0.5131 ms per token still exposed.
 - The switch moves only the HOST issue order; `event_record(ev_commit)` and the table flip stay before the launch.
 - Condition 2 covers the switch: it changes WHEN an expert moves, not what is read.
 
@@ -1346,6 +1351,7 @@ C:/x/y.md
 | C1 | #40 | sampling seeds 3 and 4, gate 0 seed 2 ids == smpv2 1,536 tokens, smp3 0/6/4, smp4 2/6/2 by the C1 reader | `srv-c1.log` (untracked since E3, named on #40) |
 | C2 | #44 | sampling seeds 5 and 6 plus one reader over six series, 60 answers, gate met in 1 of 6 seeds (smpv1 1/6/3, smpv2 1/6/3, smp3 0/6/4, smp4 1/7/2, smp5 0/7/3, smp6 1/5/4), 4 / 37 / 19 of 60, degeneration 0 of 60, reviewer re-judged 60 of 60 with 55 agreeing | `srv-c2.log`, `srv-c2-reader.log`, `srv-c2-review.log` (untracked since E3, named on #44) |
 | 19e | #19 | the decode staging kernel default flipped to `stage_cold_ca`: parity 7 of 7 forms byte-identical against `d211ab52ad2b` including the fallback `CROW_STAGE_KERNEL=1`, ten-task greedy ids == `final4` 10 of 10, A9 parts 1 to 3 PASS with reference shas 10 of 10, A10 smoke 6 of 6, three adjacent pairs 26.42 against 29.68 ms per token (mean, RTX 5090, 2026-09-12), ids sha `5098f885ab3a` in 7 of 7 runs | `srv-19e.log` |
+| 63c | #63 | the trickle issue point default flipped to deferred: parity 7 of 7 forms byte-identical against `d211ab52ad2b` including the fallback `CROW_TRICKLE_DEFER=0`, ten-task greedy ids == `final4` 10 of 10, A9 parts 1 to 3 PASS with reference shas 10 of 10, A10 smoke 6 of 6, three adjacent pairs 24.78 against 26.41 ms per token (mean, RTX 5090, 2026-09-12), ids sha `5098f885ab3a` in 7 of 7 runs | `srv-63c.log` |
 
 **The ten-task gate on the server path, decided (C2, robin 2026-09-11, #55):**
 

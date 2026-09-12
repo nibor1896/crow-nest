@@ -50,6 +50,17 @@
 
 ### Changed
 
+- `#63` 63c, 2026-09-12: the stream trickle's copies are issued AFTER the graph launch by default
+  - selection: `CROW_TRICKLE_DEFER` unset or any value but `0` parks the side-stream copies in `trickle_tick` and issues them in `decode_step` right after the launch (`gen.rs:1223`, drain site `gen.rs:3145`, `Engine::trickle_drain_after_launch` at `gen.rs:3449`)
+  - fallback: `CROW_TRICKLE_DEFER=0` restores the previous order, the issue inside `trickle_tick` before the launch (`gen.rs:3412-3422`)
+  - boot line: every engine process prints one `[trickle]` line naming the order it runs (`gen.rs:721`), next to the `[stage]` line
+  - scope: the copies move in host issue order only; the table flip and `event_record(ev_commit)` stay before the launch, so both settings are byte-identical in parity
+  - measured 2026-09-12, RTX 5090, t1-read 16,064 ids, 255 timed decode steps, one fresh process per run, three adjacent pairs: crow-nest 24.78 / 24.79 / 24.78 ms per token with the new default against 26.35 / 26.45 / 26.43 with `CROW_TRICKLE_DEFER=0`, means 24.78 against 26.41 ms per token = 40.35 against 37.87 tok/s, 1.63 ms per token gained at 16.0 baseline spread windows (`decode_out/srv-63c.log`)
+  - llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL on the same machine, 2026-09-11: 22.27 ms per token = 44.9 tok/s (`decode_out/srv-59b.log`)
+  - nsys class table of the deferred order, 2026-09-12: 83.96 % of the copy ms falls inside a graph span, exposed copy time 0.51 ms per token (`decode_out/srv-63b-crow-ND.sqlite`)
+  - nsys class table of the eager order, 2026-09-11: 0.00 % inside a graph span, exposed copy time 2.60 ms per token (`decode_out/srv-19d-crow-NK.sqlite`)
+  - gates: parity 7 of 7 forms byte-identical against the installed build `d211ab52ad2b`, ten-task greedy ids equal `final4` 10 of 10, A9 parts 1 to 3 PASS with reference shas 10 of 10, A10 smoke 6 of 6, ids sha `5098f885ab3a` in 7 of 7 pair runs
+
 - `#19` 19e, 2026-09-12: `stage_cold_ca` is the default decode staging kernel
   - selection: `CROW_STAGE_KERNEL` unset or any value but `1` selects it (`gen.rs:542`), `CROW_STAGE_BLOCKS` default `40`
   - fallback: `CROW_STAGE_KERNEL=1` restores `stage_cold` and keeps `CROW_STAGE_SPLIT` meaningful, the new kernel ignores it
