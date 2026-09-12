@@ -393,9 +393,9 @@ pub struct Engine {
     /// stream-side trickle adaptation (A-P3c, CROW_ADAPT_STREAM=1): created
     /// on first use by `trickle_tick`
     pub trickle: Option<Trickle>,
-    /// #63b (`CROW_TRICKLE_DEFER=1`): the copies `trickle_tick` parked so
-    /// `decode_step` can issue them AFTER the graph launch; `None` when the
-    /// switch is off, so the default path is the one of record byte for byte
+    /// #63b (the deferred order, default since #63c): the copies `trickle_tick`
+    /// parked so `decode_step` can issue them AFTER the graph launch; always
+    /// `None` under `CROW_TRICKLE_DEFER=0`, the eager fallback
     pub trickle_pend: Option<TrickleBatch>,
     /// decode-window adaptation (#17): routing counts at the last adaptation and
     /// an exponentially decayed count of the selections since (CROW_ADAPT_WINDOW=1)
@@ -429,8 +429,8 @@ pub struct Trickle {
     pub swaps: usize,
 }
 
-/// #63b: the side-stream copies of ONE tick, parked by `trickle_tick` under
-/// `CROW_TRICKLE_DEFER=1` and issued by `Engine::trickle_drain_after_launch`.
+/// #63b: the side-stream copies of ONE tick, parked by `trickle_tick` unless
+/// `CROW_TRICKLE_DEFER=0`, issued by `Engine::trickle_drain_after_launch`.
 pub struct TrickleBatch {
     pub to_b: Vec<PendingSwap>,          // phase B: evicted hot slot -> pinned slot
     pub new_a: Vec<(usize, usize, u32)>, // phase A: (layer, evict slot, incoming id)
@@ -713,6 +713,14 @@ impl Engine {
             println!("[stage] kernel stage_cold, CROW_STAGE_KERNEL {}, grid t * TOPK x 2 x {} (CROW_STAGE_SPLIT) x 256 threads (gate_up {} B, down {} B)",
                 sk, stage_split(), slabs.gu_bytes, slabs.dn_bytes);
         }
+        // #63c, 2026-09-12: ONE line per engine process names the trickle issue
+        // point, next to the [stage] line and for the same reason: every future
+        // log says which order produced it. It sits in the [load] block, so the
+        // parity gate prints it too (decode parity never calls apply_adapt_policy).
+        let td = std::env::var("CROW_TRICKLE_DEFER").unwrap_or_else(|_| "unset".to_string());
+        println!("[trickle] copies issued {}, CROW_TRICKLE_DEFER {} (unset or any value but 0 defers)",
+            if trickle_defer_on() { "AFTER the graph launch, in decode_step (deferred, default)" }
+            else { "BEFORE the launch, in trickle_tick (eager fallback)" }, td);
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
         let max_tiles = cfg.prompt_chunk * TOPK / 8 + E + 1;
         let stage = Stage {
@@ -1201,14 +1209,20 @@ pub fn mma_bx() -> u32 {
 fn env_on(name: &str) -> bool {
     std::env::var(name).as_deref() != Ok("0")
 }
-/// #63b (measurement, default off): `CROW_TRICKLE_DEFER=1` parks the stream
-/// trickle's copies in `trickle_tick` and issues them in `decode_step` right
-/// after the graph launch, so they overlap the replay instead of blocking it
-/// (63a: one async copy engine, the burst holds it, and the graph launch is
+/// CROW_TRICKLE_DEFER (default 1 = deferred; `0` selects the eager order, kept
+/// as the fallback; any other value and unset take the default): the stream
+/// trickle's copies are parked in `trickle_tick` and issued in `decode_step`
+/// right after the graph launch, so they overlap the replay instead of blocking
+/// it (63a: one async copy engine, the burst holds it, and the graph launch is
 /// stream ordered behind the scalar refreshes that queue on that engine).
+/// DEFAULT SINCE #63c, 2026-09-12: the deferred order ran the #59 profile arm at
+/// 24.80 ms per decode token against 26.42 for the eager order, a gain of 1.62
+/// ms per token at 16.4 x the baseline spread (decode_out/srv-63b.log, RTX 5090,
+/// 2026-09-12). The switch moves the HOST issue order only, so both settings
+/// must be byte-identical in parity.
 fn trickle_defer_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CROW_TRICKLE_DEFER").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("CROW_TRICKLE_DEFER").as_deref() != Ok("0"))
 }
 fn qsa_fast_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| env_on("CROW_QSA_FAST")) }
 fn bf16_w_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| env_on("CROW_BF16_W")) }
@@ -3127,7 +3141,7 @@ impl Engine {
         // #63b: the parked trickle copies go out HERE, after the launch of
         // this token (graph replay, capture, or the eager kernels above) and
         // before the end-of-step sync, so they overlap the replay instead of
-        // blocking it. No-op unless CROW_TRICKLE_DEFER=1 parked a batch.
+        // blocking it. No-op under CROW_TRICKLE_DEFER=0: nothing is parked.
         self.trickle_drain_after_launch();
         if prof {
             prof::add(&prof::HEAD, t_head.elapsed().as_micros() as u64);
@@ -3415,11 +3429,11 @@ impl Engine {
         }
     }
 
-    /// #63b (`CROW_TRICKLE_DEFER=1`): issue the batch `trickle_tick` parked,
+    /// #63b (the deferred order, default since #63c): issue the parked batch,
     /// on the side stream, AFTER the graph launch of the same token, so the
     /// copies overlap the replay instead of holding the one async copy engine
     /// while the graph launch waits behind the scalar refreshes (63a F5).
-    /// No-op when the switch is off: nothing is ever parked.
+    /// No-op under `CROW_TRICKLE_DEFER=0`: nothing is ever parked.
     ///
     /// Safety, unchanged from the eager form (63a review, CUDA stream order
     /// follows ENQUEUE order per stream, not host wall clock):
