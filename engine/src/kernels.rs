@@ -2101,7 +2101,7 @@ extern "C" __global__ void qsa_select_fast(const float* __restrict__ scores, con
 }
 
 
-// ---------------- qsa_select_par (CROW_QSA_PAR, default off) ----------------
+// ------------- qsa_select_par (CROW_QSA_PAR default since 61b, 0 = fallback) -------------
 // Same exact top-k selection as qsa_select_fast, spread over many blocks.
 // Two launches per call:
 //   qsa_select_par_h  grid (G, nq) x 256   12-bit histogram of the ordered keys

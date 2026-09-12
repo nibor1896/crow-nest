@@ -722,6 +722,18 @@ impl Engine {
         println!("[trickle] copies issued {}, CROW_TRICKLE_DEFER {} (unset or any value but 0 defers)",
             if trickle_defer_on() { "AFTER the graph launch, in decode_step (deferred, default)" }
             else { "BEFORE the launch, in trickle_tick (eager fallback)" }, td);
+        // #61b, 2026-09-12: ONE line per engine process names the decode QSA
+        // selection form, next to the [stage] and [trickle] lines and for the
+        // same reason: every future log says which selection produced it. It
+        // sits in the [load] block, so the parity gate prints it too.
+        let qp = std::env::var("CROW_QSA_PAR").unwrap_or_else(|_| "unset".to_string());
+        if qsa_par_on() {
+            println!("[qsa] decode selection qsa_select_par (default), G={}, CROW_QSA_PAR {} (0 = qsa_select_fast fallback)",
+                qsa_par_blocks(), qp);
+        } else {
+            println!("[qsa] decode selection qsa_select_fast (fallback, G unused), CROW_QSA_PAR {} (0 = qsa_select_fast fallback)",
+                qp);
+        }
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
         let max_tiles = cfg.prompt_chunk * TOPK / 8 + E + 1;
         let stage = Stage {
@@ -1276,14 +1288,20 @@ pub fn attn_splits() -> usize {
     *V.get_or_init(|| std::env::var("CROW_ATTN_SPLITS").ok().and_then(|v| v.parse().ok())
         .filter(|s| matches!(s, 4 | 8 | 16 | 32)).unwrap_or(ATTN_SPLITS))
 }
-/// #61a CROW_QSA_PAR (default off, `1` selects it): the decode QSA top-k runs
-/// as qsa_select_par_h (G blocks, 12-bit histogram) plus qsa_select_par_e
-/// (one block of 1024, threshold refine and ascending emit) instead of
-/// qsa_select_fast on one block. Same selection list in the same order:
-/// bit-identical by parity.
+/// #61a CROW_QSA_PAR. DEFAULT ON since #61b (2026-09-12): unset or any value
+/// but 0 runs the decode QSA top-k as qsa_select_par_h (G blocks, 12-bit
+/// histogram) plus qsa_select_par_e (one block of 1024, threshold refine and
+/// ascending emit); `0` selects the qsa_select_fast single-block form, kept
+/// as the fallback. Same selection list in the same order.
+/// DEFAULT BASIS: the selection row falls from 1.1101 to 0.0927 ms per token
+/// and the profile arm from 24.7985 to 23.8740 ms per token (-3.73 %), ids
+/// identical (decode_out/srv-61a.log, RTX 5090, 2026-09-12).
+/// COVERAGE (61a review): the radix path is proven by the qsa_probe unit gate
+/// and the 16,320 chain identity, NOT by parity; every parity form is prefill
+/// only or inside the dense shortcut.
 fn qsa_par_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CROW_QSA_PAR").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("CROW_QSA_PAR").as_deref() != Ok("0"))
 }
 /// #61a CROW_QSA_PAR_BLOCKS (default 32, clamped to 4 .. 256): the block count
 /// of qsa_select_par_h. The histogram is order free, so the count never moves
@@ -1292,6 +1310,30 @@ fn qsa_par_blocks() -> u32 {
     static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("CROW_QSA_PAR_BLOCKS").ok().and_then(|v| v.parse().ok())
         .unwrap_or(32u32).clamp(4, 256))
+}
+
+/// #61b (61a review, Codequalitaet): block size of the qsa_select_par_e emit
+/// kernel, named once and shared by BOTH launch sites (the decode graph below
+/// and qsa_probe). The kernel is written for exactly 32 warps: qsa_par_scan
+/// scans a tmp[32] array (one entry per warp) and the round B histograms index
+/// sh[tid] under tid < 1024, so any other block size reads stale shared memory
+/// or deadlocks the barriers. This is a launch CONTRACT, not a tuneable.
+pub const QSA_PAR_E_THREADS: u32 = 1024;
+
+/// #61b: the ONLY launcher of qsa_select_par_e, so the 32-warp contract of
+/// QSA_PAR_E_THREADS holds for every caller by construction:
+/// grid (nq, 1, 1) x QSA_PAR_E_THREADS. Host-side check only; no GPU sync is
+/// spent on it.
+pub unsafe fn launch_qsa_par_e(
+    f: cudarc::driver::sys::CUfunction,
+    nq: u32,
+    vals: &[u64],
+) {
+    assert!(
+        QSA_PAR_E_THREADS == 1024 && QSA_PAR_E_THREADS % 32 == 0,
+        "qsa_select_par_e is written for exactly 1024 threads = 32 warps (qsa_par_scan tmp[32])"
+    );
+    launch_v(f, nq, 1, 1, QSA_PAR_E_THREADS, vals);
 }
 
 fn dense_mma_on() -> bool {
@@ -1953,10 +1995,20 @@ impl Engine {
                 s.q_rot as u64, pooled, s.scores as u64, p.cap as u64, p.pos_base as u64]);
         }
         if qsa_par_on() {
-            // #61a: two launches, the histogram over G blocks then one emit block
+            // #61b: the parallel selection is the DEFAULT; CROW_QSA_PAR=0 takes
+            // the qsa_select_fast fallback below. Two launches, the histogram
+            // over G blocks then one emit block.
+            // h1 PAIRING INVARIANT (61a review, Codequalitaet): s.qsa_h1 is
+            // alloc-zeroed (db = alloc_zeroed), launch 1 (par_h) only adds
+            // into it, launch 2 (par_e) re-zeroes it after consuming, and the
+            // dense branch (K >= ncb) returns from both kernels without
+            // touching it, so the buffer is zero at every launch 1 entry. The
+            // two launches must stay paired and ordered and nothing else may
+            // write s.qsa_h1 (qsa_probe re-checks the zero after every row);
+            // no GPU sync is spent on this host-side invariant.
             launch_v(k.f("qsa_select_par_h"), qsa_par_blocks(), 1, 1, 256, &[
                 s.scores as u64, p.ncb1 as u64, s.qsa_h1 as u64, p.k_top as u64, p.cap as u64]);
-            launch_v(k.f("qsa_select_par_e"), 1, 1, 1, 1024, &[
+            launch_qsa_par_e(k.f("qsa_select_par_e"), 1, &[
                 s.scores as u64, p.ncb1 as u64, s.sel as u64, s.sel_n as u64, p.k_top as u64,
                 p.cap as u64, p.n_selmax as u64, p.pos_row1 as u64, s.qsa_h1 as u64]);
         } else {
