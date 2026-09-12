@@ -728,6 +728,17 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
   the last tick instead of the prefill-dominated cumulative count.
 - Condition 2 covers that too: the ranking signal picks WHICH expert moves, not what is read.
 
+**Where the trickle's copies are issued (#63b, 2026-09-12).**
+
+| switch | issue point of the side-stream copies | mode |
+|---|---|---|
+| unset (default) | inside `trickle_tick`, BEFORE the token's graph launch (`gen.rs:3355-3365`) | operating |
+| `CROW_TRICKLE_DEFER=1` | inside `decode_step`, AFTER the graph launch and before the end-of-step sync (`gen.rs:3131`, `Engine::trickle_drain_after_launch` at `gen.rs:3435`) | measurement |
+
+- 63a measured the default form: 2.5968 ms per token of copies, class b (before the graph) 19,364 of 19,364, class a 0.
+- The switch moves only the HOST issue order; `event_record(ev_commit)` and the table flip stay before the launch.
+- Condition 2 covers the switch: it changes WHEN an expert moves, not what is read.
+
 ### 7.6 Snapshot and rollback (GDN, PLE conv, QSA ring)
 
 **What needs no snapshot:**
