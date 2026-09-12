@@ -350,6 +350,23 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
    custom kernel family; reading templates: mistral.rs `qwen3_next.rs`, the transformers
    reference (oracle-side). SSM state f32.
 
+**Decode attention path, per layer (12 attention layers):**
+
+| Step | Kernel | Grid x block | Switch | Mode |
+|---|---|---|---|---|
+| QSA scores | `qsa_scores_par` | `QSA_PAR_BLOCKS` x 1 x 1, 128 | `CROW_ATTN_SPLIT` unset = on | operating |
+| QSA top-k, one block | `qsa_select_fast` (`kernels.rs:1957`) | 1 x 1 x 1, 256 | default | operating |
+| QSA top-k, many blocks | `qsa_select_par_h` (`kernels.rs:2177`) then `qsa_select_par_e` (`kernels.rs:2195`) | `CROW_QSA_PAR_BLOCKS` x 1 x 1, 256 then 1 x 1 x 1, 1024 | `CROW_QSA_PAR=1` | operating |
+| attention over the selected list | `attn_sel_split` (`kernels.rs:2691`) | `NQ` x 1 x `CROW_ATTN_SPLITS`, `AHD` | `CROW_ATTN_SPLIT` unset = on | operating |
+| merge of the partials | `attn_merge` | `NQ` x 1 x 1, `AHD` | reads the device scalar `p.n_splits` | operating |
+
+- Both top-k forms return the same selection list in the same order: selected blocks ascending, 4 tokens each, then the tail tokens ascending.
+- `sel_n` = 4 x selected blocks plus the tail; the attention kernel sums in list order, so the order is part of the numerics.
+- The parallel form splits the work as histogram (many blocks, 12 top key bits) plus one emit block (threshold refine 10 plus 10 bits, tie fill by lowest index, ascending emit); 2 launches per layer against 1.
+- `CROW_QSA_PAR` is the decode path only: the prefill selection at `gen.rs:1829` keeps `qsa_select_fast` on `tb` blocks, one block per query.
+- `CROW_ATTN_SPLITS` (4, 8, 16, 32; default 8) is MEASUREMENT ONLY: the split count changes the merge order of the flash-decoding partials, so the last bits of the logits may move.
+- The partial buffers `part_o` and `part_ml` are sized for 32 splits (`gen.rs:1514-1515`), VRAM plus 0.55 MB against the old size.
+
 ### 4.3 Kernel hygiene
 
 - Thin kernels (constant 4): one module per family, NVRTC-compiled at load, shared

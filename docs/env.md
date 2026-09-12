@@ -4,10 +4,10 @@
 
 | Item | Value |
 |---|---|
-| Variables in this table | 67 |
-| Distinct `CROW_[A-Z0-9_]+` tokens in the code | 67 in `engine/src`, 0 in `converter/src` |
+| Variables in this table | 73 |
+| Distinct `CROW_[A-Z0-9_]+` tokens in the code | 73 in `engine/src`, 0 in `converter/src` |
 | Measured | 2026-09-10, task E5, issue #46, parent #1 |
-| Repository state | branch `release-v0.1`, HEAD `486a0c0` plus the `#19b` commits including fix round 1, 2026-09-11 |
+| Repository state | branch `release-v0.1`, HEAD `98d5312` plus the `#61a` commit, 2026-09-12 |
 | Guard | `tools/check_env_docs.py` (code list minus doc list must be empty, both ways) |
 | Rule | a variable not in this table does not exist |
 
@@ -94,6 +94,7 @@ Helpers used by the read sites:
 | `CROW_ATTN_R` | `engine/src/gen.rs:1161` | `0`, `1`, `2`, `3`, `4`, `5`, `8`, `9`; default unset = `attn_sel_s8l` | selects the decode attention kernel (`gen.rs:1162`) | operating | default since 2026-09-06 late (#10, robin's call), gated by parity 8/512/1024 against the previous build plus ten tasks; `8` and `9` are diagnostics, see the warning table |
 | `CROW_ATTN_SB` | `engine/src/gen.rs:1172` | `0` restores the full-chunk buffer; default on (`ATTN_SB` = 512) | prompt attention in sub-batches of 512 tokens | operating | #16, 2026-09-05: shrinks the QSA score buffer from 512 MB at chunk 2048; bit-identical by construction |
 | `CROW_ATTN_SPLIT` | `engine/src/gen.rs:1151` | `0` disables; default on | decode attention as 8 partials plus merge, QSA scores warp per block | operating | both forms are graph-static |
+| `CROW_ATTN_SPLITS` | `engine/src/gen.rs:1274` | `4`, `8`, `16`, `32`; anything else and unset take 8 (`ATTN_SPLITS`) | split count of the decode attention: `grid.z` of `attn_sel_split` (`gen.rs:1968`) and the device scalar `p.n_splits` read by `attn_merge` (`gen.rs:1424`) | measurement | #61a, 2026-09-12: a different split count changes the merge order of the flash-decoding partials, so the last bits of the logits may move; the partial buffers are sized for `ATTN_SPLITS_MAX` = 32 (`gen.rs:1514-1515`, VRAM plus 0.55 MB); the value is read once and the decode graph captures it |
 | `CROW_BF16_GEMM` | `engine/src/gen.rs:120` | `0` selects the warp GEMV; default on | 8-token bf16 tile GEMM for prefill-sized batches | operating | applies only to `PW::Bf16` weights at `t >= 8` |
 | `CROW_BF16_W` | `engine/src/gen.rs:1142` | `0` selects `gemv_bf16_b` / `gemv_bf16`; default on | selects `gemv_bf16_w` (8 rows per block) for bf16 GEMVs and the LM head | operating | step-2 kernel switch; LM head site `gen.rs:2408` |
 | `CROW_DENSE_GEMM` | `engine/src/gen.rs:1118` | `0` selects the per-token MMA GEMV; default on | 8-token tile GEMM for dense FP4 projections at `t >= 8` | operating | reached only when `CROW_MMA=1` (`launch_mma_d`) |
@@ -105,6 +106,8 @@ Helpers used by the read sites:
 | `CROW_MMA_KS` | `engine/src/gen.rs:1133` | `1` to `4`; other values fall back; default `4` | MMA k-split factor, block = `128 * KS` threads | operating | `KS=1` is the original single-slice kernel, bit-identical (`gen.rs:1129`) |
 | `CROW_QFUSE` | `engine/src/gen.rs:1147` | `0` disables; default on | producers emit the NVFP4 activation cascade, no separate `quant_x_fp4` launch | operating | bit-identical per `gen.rs:1146` |
 | `CROW_QSA_FAST` | `engine/src/gen.rs:1141` | `0` selects `qsa_select`; default on (`qsa_select_fast`) | dense-regime shortcut in the QSA selector | operating | kernel sites `gen.rs:1708`, `gen.rs:1834`; comment `kernels.rs:1956` |
+| `CROW_QSA_PAR` | `engine/src/gen.rs:1284` | `1` selects it; unset and any other value keep `qsa_select_fast` | decode QSA top-k as `qsa_select_par_h` (G blocks, 12-bit histogram, `kernels.rs:2177`) plus `qsa_select_par_e` (one block of 1024 threads, threshold refine and ascending emit, `kernels.rs:2195`) instead of `qsa_select_fast` on one block (`gen.rs:1957-1961`) | operating | #61a, 2026-09-12: same selection list in the same order, bit-identical by parity; decode path only, the prefill launch at `gen.rs:1829` keeps `qsa_select_fast` |
+| `CROW_QSA_PAR_BLOCKS` | `engine/src/gen.rs:1291` | integer, default 32, clamped to 4 .. 256 | block count of `qsa_select_par_h` | operating | #61a, 2026-09-12: the histogram is order free, so the count never moves a bit of the selection list |
 | `CROW_ROUTER_GEMM` | `engine/src/gen.rs:1963` | `1` enables; default off | bf16 tensor-core GEMM on the exact bf16 router twin at `t >= 8` | measurement | `gen.rs:1964-1965`: summation order differs from `gemv_b`, not bit-identical, env-gated until validated |
 
 ## Adaptation and hot set (9 rows)
