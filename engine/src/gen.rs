@@ -393,6 +393,10 @@ pub struct Engine {
     /// stream-side trickle adaptation (A-P3c, CROW_ADAPT_STREAM=1): created
     /// on first use by `trickle_tick`
     pub trickle: Option<Trickle>,
+    /// #63b (`CROW_TRICKLE_DEFER=1`): the copies `trickle_tick` parked so
+    /// `decode_step` can issue them AFTER the graph launch; `None` when the
+    /// switch is off, so the default path is the one of record byte for byte
+    pub trickle_pend: Option<TrickleBatch>,
     /// decode-window adaptation (#17): routing counts at the last adaptation and
     /// an exponentially decayed count of the selections since (CROW_ADAPT_WINDOW=1)
     pub adapt_base: Vec<u64>,
@@ -423,6 +427,13 @@ pub struct Trickle {
     pub in_a: Vec<PendingSwap>, // phase A issued, commit A pending
     pub in_b: Vec<PendingSwap>, // phase B issued, commit B pending
     pub swaps: usize,
+}
+
+/// #63b: the side-stream copies of ONE tick, parked by `trickle_tick` under
+/// `CROW_TRICKLE_DEFER=1` and issued by `Engine::trickle_drain_after_launch`.
+pub struct TrickleBatch {
+    pub to_b: Vec<PendingSwap>,          // phase B: evicted hot slot -> pinned slot
+    pub new_a: Vec<(usize, usize, u32)>, // phase A: (layer, evict slot, incoming id)
 }
 
 /// VRAM staging slots for cold routed experts + the rewritten combo
@@ -854,6 +865,7 @@ impl Engine {
                 pa_ev_done: [cuda::event_create(), cuda::event_create()],
                 route_log: Vec::new(),
                 trickle: None,
+                trickle_pend: None,
                 adapt_base: Vec::new(),
                 adapt_ema: Vec::new(),
                 dev_sampler: None,
@@ -1188,6 +1200,15 @@ pub fn mma_bx() -> u32 {
 /// step-2 kernel switches (default on; =0 selects the previous kernel)
 fn env_on(name: &str) -> bool {
     std::env::var(name).as_deref() != Ok("0")
+}
+/// #63b (measurement, default off): `CROW_TRICKLE_DEFER=1` parks the stream
+/// trickle's copies in `trickle_tick` and issues them in `decode_step` right
+/// after the graph launch, so they overlap the replay instead of blocking it
+/// (63a: one async copy engine, the burst holds it, and the graph launch is
+/// stream ordered behind the scalar refreshes that queue on that engine).
+fn trickle_defer_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CROW_TRICKLE_DEFER").as_deref() == Ok("1"))
 }
 fn qsa_fast_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| env_on("CROW_QSA_FAST")) }
 fn bf16_w_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| env_on("CROW_BF16_W")) }
@@ -3103,6 +3124,11 @@ impl Engine {
                 if !ds.in_graph.get() { self.launch_sample(ds); }
             }
         }
+        // #63b: the parked trickle copies go out HERE, after the launch of
+        // this token (graph replay, capture, or the eager kernels above) and
+        // before the end-of-step sync, so they overlap the replay instead of
+        // blocking it. No-op unless CROW_TRICKLE_DEFER=1 parked a batch.
+        self.trickle_drain_after_launch();
         if prof {
             prof::add(&prof::HEAD, t_head.elapsed().as_micros() as u64);
         }
@@ -3302,6 +3328,12 @@ impl Engine {
     pub unsafe fn trickle_tick(&mut self, plan: bool, max_per_layer: usize) -> usize {
         assert!(self.res.lb.is_none(), "stream trickle: exact NVFP4 tier only");
         assert!(self.res.stride > self.res.n, "stream trickle needs CROW_ADAPT_STREAM=1 (spare hot slots)");
+        // #63b: a tick whose `decode_step` never ran (EOS stop in
+        // `bin/decode.rs:233`) leaves a parked batch; issue it FIRST, so this
+        // tick's wait on `ev_side` and its commits see the copies they need.
+        if self.trickle_pend.is_some() {
+            self.trickle_drain_after_launch();
+        }
         let cap = cuda::cur_stream();
         let mut tr = self.trickle.take().unwrap_or_else(|| Trickle {
             stream: cuda::stream_create_non_blocking(),
@@ -3352,6 +3384,17 @@ impl Engine {
             // side stream waits for the flips (and thus for every graph that
             // could still read the slots about to be overwritten)
             cuda::event_record(tr.ev_commit, cap);
+            if trickle_defer_on() {
+                // #63b: park phase B and phase A; `decode_step` issues them
+                // behind its graph launch. `ev_commit` is already recorded on
+                // the compute stream, so the side stream's queue order is the
+                // same as below: wait ev_commit, phase B, phase A, ev_side.
+                let started = new_a.len();
+                tr.swaps += started;
+                self.trickle = Some(tr);
+                self.trickle_pend = Some(TrickleBatch { to_b, new_a });
+                return started;
+            }
             cuda::stream_wait_event(tr.stream, tr.ev_commit);
             for p in &to_b {
                 self.res.swap_stream_b(p, tr.stream);
@@ -3372,9 +3415,48 @@ impl Engine {
         }
     }
 
+    /// #63b (`CROW_TRICKLE_DEFER=1`): issue the batch `trickle_tick` parked,
+    /// on the side stream, AFTER the graph launch of the same token, so the
+    /// copies overlap the replay instead of holding the one async copy engine
+    /// while the graph launch waits behind the scalar refreshes (63a F5).
+    /// No-op when the switch is off: nothing is ever parked.
+    ///
+    /// Safety, unchanged from the eager form (63a review, CUDA stream order
+    /// follows ENQUEUE order per stream, not host wall clock):
+    /// - the table flip happened before `ev_commit`, which the side stream
+    ///   waits for here, so no graph reads a slot being overwritten
+    /// - phase A writes only spare slots, which no table points at
+    /// - phase B reads the evicted hot slot, which stays readable until
+    ///   commit B at the next tick, and writes the pinned slot the incoming
+    ///   expert vacated, which no table points at since commit A
+    /// - the compute stream still waits `ev_side` at the next tick before the
+    ///   commits and the flush, and `ev_side` is recorded here, strictly
+    ///   before `decode_step` returns and before the next tick runs
+    pub unsafe fn trickle_drain_after_launch(&mut self) {
+        let b = match self.trickle_pend.take() {
+            Some(b) => b,
+            None => return,
+        };
+        let mut tr = self.trickle.take().expect("parked trickle batch without a trickle");
+        cuda::stream_wait_event(tr.stream, tr.ev_commit);
+        for p in &b.to_b {
+            self.res.swap_stream_b(p, tr.stream);
+        }
+        tr.in_b = b.to_b;
+        for (l, slot, new_id) in b.new_a {
+            let p = self.res.swap_stream_a(l, slot, new_id, tr.stream);
+            tr.in_a.push(p);
+        }
+        cuda::event_record(tr.ev_side, tr.stream);
+        self.trickle = Some(tr);
+    }
+
     /// finish the stream-side trickle: commit everything in flight (two more
     /// ticks without new plans) and drain the side stream
     pub unsafe fn trickle_drain(&mut self) -> usize {
+        // #63b: a parked batch is still in flight for this purpose; issue it
+        // before the emptiness test below, and after each of the two ticks.
+        self.trickle_drain_after_launch();
         let mut total = 0;
         if let Some(tr) = &self.trickle {
             total = tr.swaps;
@@ -3385,7 +3467,9 @@ impl Engine {
             return 0;
         }
         self.trickle_tick(false, 0);
+        self.trickle_drain_after_launch();
         self.trickle_tick(false, 0);
+        self.trickle_drain_after_launch();
         if let Some(tr) = &self.trickle {
             assert!(tr.in_a.is_empty() && tr.in_b.is_empty());
             cuda::stream_sync(tr.stream);
