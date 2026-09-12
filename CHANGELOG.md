@@ -50,6 +50,14 @@
 
 ### Changed
 
+- `#61` 61b, 2026-09-12: the decode QSA top-k runs as `qsa_select_par` by default
+  - selection: `CROW_QSA_PAR` unset or any value but `0` runs `qsa_select_par_h` over `CROW_QSA_PAR_BLOCKS` = 32 blocks plus one `qsa_select_par_e` emit block, same list in the same order; `CROW_QSA_PAR=0` restores the `qsa_select_fast` single-block fallback (`gen.rs:1302`, boot line `gen.rs:731`)
+  - boot line: every engine process prints one `[qsa]` line naming the selection it runs, next to the `[stage]` and `[trickle]` lines
+  - measured 2026-09-12, RTX 5090, t1-read 16,064 ids, 255 timed decode steps, one fresh process per run, three adjacent pairs: crow-nest 23.94 / 23.93 / 23.95 ms per token with the new default against 24.84 / 24.89 / 24.88 with `CROW_QSA_PAR=0`, means 23.94 against 24.87 ms per token = 41.8 against 40.2 tok/s, 0.93 ms per token gained at 19.2 baseline spread windows, ids `5098f885ab3a` in 6 of 6 counted runs (`decode_out/srv-61b.log`)
+  - llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL on the same machine, 2026-09-11: 22.27 ms per token = 44.9 tok/s (`decode_out/srv-59b.log`)
+  - gates: parity 8 of 8 forms byte-identical against the installed build `d211ab52ad2b`, including the new PX form, teacher forced over the 16,064 id t1-read prompt so the radix path runs at logit level, sha256 of record `f217e1c55926bca26ae32867a62eebf3ab796e05f689469b70032ee1e1acd695`; ten-task greedy ids equal `final4` 10 of 10; A9 parts 1 to 3 PASS with reference shas 10 of 10; A10 smoke 6 of 6
+  - review fixes in the same engine commit: the emit block's 1024 thread contract is a named constant asserted in the only launcher, the h1 pairing invariant is written at the launch site, `qsa_probe` covers 4928 rows with the production cap 2051
+  - `CROW_ATTN_SPLITS` stays 8 and measurement only: 16 and 32 change the generated ids, robin decides; `attn_sel_split` at 2.44 ms per token stays the open row of #61
 - `#63` 63c, 2026-09-12: the stream trickle's copies are issued AFTER the graph launch by default
   - selection: `CROW_TRICKLE_DEFER` unset or any value but `0` parks the side-stream copies in `trickle_tick` and issues them in `decode_step` right after the launch (`gen.rs:1223`, drain site `gen.rs:3145`, `Engine::trickle_drain_after_launch` at `gen.rs:3449`)
   - fallback: `CROW_TRICKLE_DEFER=0` restores the previous order, the issue inside `trickle_tick` before the launch (`gen.rs:3412-3422`)

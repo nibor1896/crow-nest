@@ -294,13 +294,15 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 
 - The decode operating point that decided the staging default: #19e, 2026-09-12.
 - The decode operating point that decided the trickle issue default: #63c, 2026-09-12.
+- The decode operating point that decided the QSA selection default: #61b, 2026-09-12.
 - Every row of this table is one adjacent pair of one chain; the two crow-nest columns are the two arms of that pair.
 - The two arms run different weights: crow-nest CNQ4.5-M (NVFP4, 4.5 bpw); llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL (GGUF, 2.4 bpw).
 - A tok/s figure is quoted only next to its adjacent arm in the same chain (#38).
 
 | shape metric | crow-nest, engine default | crow-nest, the named fallback | llama.cpp | machine | date | source |
 |---|---|---|---|---|---|---|
-| decode, t1-read 16,064 ids, 255 timed steps, the #63c trickle pair | 24.78 ms per token = 40.3 tok/s | 26.41 ms per token = 37.9 tok/s with `CROW_TRICKLE_DEFER=0` | 22.27 ms per token = 44.9 tok/s | RTX 5090 | crow-nest 2026-09-12, llama.cpp 2026-09-11 | `decode_out/srv-63c.log`, `decode_out/srv-59b.log` |
+| decode, t1-read 16,064 ids, 255 timed steps, the #61b QSA selection pair | 23.94 ms per token = 41.8 tok/s | 24.87 ms per token = 40.2 tok/s with `CROW_QSA_PAR=0` | 22.27 ms per token = 44.9 tok/s | RTX 5090 | crow-nest 2026-09-12, llama.cpp 2026-09-11 | `decode_out/srv-61b.log`, `decode_out/srv-59b.log` |
+| decode, t1-read 16,064 ids, 255 timed steps, the #63c trickle pair (the engine default before #61b) | 24.78 ms per token = 40.3 tok/s | 26.41 ms per token = 37.9 tok/s with `CROW_TRICKLE_DEFER=0` | 22.27 ms per token = 44.9 tok/s | RTX 5090 | crow-nest 2026-09-12, llama.cpp 2026-09-11 | `decode_out/srv-63c.log`, `decode_out/srv-59b.log` |
 | decode, same shape, the #19d staging pair (K40 against B, `task-19d-report.md`), both arms on the eager trickle of that day | 26.46 ms per token = 37.8 tok/s | 29.68 ms per token = 33.7 tok/s with `CROW_STAGE_KERNEL=1` | 22.27 ms per token = 44.9 tok/s | RTX 5090 | 2026-09-11 | `decode_out/srv-19d.log`, `decode_out/srv-59b.log` |
 | staging row of that step, nsys, 338 MB per token | 7.07 ms per token at 47.78 GB/s | 10.42 ms per token at 32.45 GB/s with `CROW_STAGE_KERNEL=1` | n/a | RTX 5090 | 2026-09-11 | `decode_out/srv-19d.log` |
 
@@ -355,16 +357,17 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 | Step | Kernel | Grid x block | Switch | Mode |
 |---|---|---|---|---|
 | QSA scores | `qsa_scores_par` | `QSA_PAR_BLOCKS` x 1 x 1, 128 | `CROW_ATTN_SPLIT` unset = on | operating |
-| QSA top-k, one block | `qsa_select_fast` (`kernels.rs:1957`) | 1 x 1 x 1, 256 | default | operating |
-| QSA top-k, many blocks | `qsa_select_par_h` (`kernels.rs:2177`) then `qsa_select_par_e` (`kernels.rs:2195`) | `CROW_QSA_PAR_BLOCKS` x 1 x 1, 256 then 1 x 1 x 1, 1024 | `CROW_QSA_PAR=1` | operating |
+| QSA top-k, one block | `qsa_select_fast` (`kernels.rs:1957`) | 1 x 1 x 1, 256 | `CROW_QSA_PAR=0`, the fallback since #61b | operating |
+| QSA top-k, many blocks | `qsa_select_par_h` (`kernels.rs:2177`) then `qsa_select_par_e` (`kernels.rs:2195`) | `CROW_QSA_PAR_BLOCKS` x 1 x 1, 256 then 1 x 1 x 1, 1024 | `CROW_QSA_PAR` unset = on, the default since #61b; `0` = the fallback | operating |
 | attention over the selected list | `attn_sel_split` (`kernels.rs:2691`) | `NQ` x 1 x `CROW_ATTN_SPLITS`, `AHD` | `CROW_ATTN_SPLIT` unset = on | operating |
 | merge of the partials | `attn_merge` | `NQ` x 1 x 1, `AHD` | reads the device scalar `p.n_splits` | operating |
 
 - Both top-k forms return the same selection list in the same order: selected blocks ascending, 4 tokens each, then the tail tokens ascending.
 - `sel_n` = 4 x selected blocks plus the tail; the attention kernel sums in list order, so the order is part of the numerics.
 - The parallel form splits the work as histogram (many blocks, 12 top key bits) plus one emit block (threshold refine 10 plus 10 bits, tie fill by lowest index, ascending emit); 2 launches per layer against 1.
-- `CROW_QSA_PAR` is the decode path only: the prefill selection at `gen.rs:1829` keeps `qsa_select_fast` on `tb` blocks, one block per query.
-- `CROW_ATTN_SPLITS` (4, 8, 16, 32; default 8) is MEASUREMENT ONLY: the split count changes the merge order of the flash-decoding partials, so the last bits of the logits may move.
+- `CROW_QSA_PAR` is the decode path only: the prefill selection at `gen.rs:1871` keeps `qsa_select_fast` on `tb` blocks, one block per query.
+- `CROW_QSA_PAR` default since #61b (2026-09-12): the adjacent pair measured 23.9411 against 24.8735 ms per decode token with `0` (-3.75 percent, ids identical), and parity runs 8 of 8 forms including the teacher-forced 16,064 id PX form over the radix path (`decode_out/srv-61b.log`, RTX 5090); every process names its selection in one `[qsa]` boot line.
+- `CROW_ATTN_SPLITS` (4, 8, 16, 32; default 8) is MEASUREMENT ONLY: the split count changes the merge order of the flash-decoding partials, so the last bits of the logits may move; 16 and 32 change the generated ids on t1-read (first differing index 45 and 48 of 256, `decode_out/srv-61a.log`), robin decides, and the row stays open with `attn_sel_split` at 2.44 ms per token.
 - The partial buffers `part_o` and `part_ml` are sized for 32 splits (`gen.rs:1514-1515`), VRAM plus 0.55 MB against the old size.
 
 ### 4.3 Kernel hygiene
