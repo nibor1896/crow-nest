@@ -690,8 +690,9 @@ impl Engine {
         // #19e, 2026-09-12: ONE line per engine process names the staging kernel that
         // will run, so every future log says which kernel produced it. It sits in the
         // [load] block and not next to the [policy] line of geo::apply_adapt_policy,
-        // because decode parity and parity.exe never call that function and would
-        // therefore print no such line at all. CROW_STAGE_DMA and the low-bit tier
+        // because decode parity (decode.rs, the parity gate) never calls that function
+        // and would print no such line at all (parity.exe does, through apply_chunk_policy).
+        // CROW_STAGE_DMA and the low-bit tier
         // still take precedence at the launch site (moe_run).
         let sk = std::env::var("CROW_STAGE_KERNEL").unwrap_or_else(|_| "unset".to_string());
         if stage_kernel_ca() {

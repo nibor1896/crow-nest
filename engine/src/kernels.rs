@@ -2252,8 +2252,8 @@ extern "C" __global__ void stage_cold(const unsigned long long* __restrict__ gu_
 // graph-capturable and deterministic.
 // Tile 4096 B = 256 threads x 16 B. REQUIREMENT: both staged byte counts are
 // exact multiples of 4096, asserted host-side at the launch site (gen.rs); a
-// container whose slabs are not 4 KB multiples must unset CROW_STAGE_KERNEL and
-// run stage_cold. The tail-tile branch of the first 19d draft was removed in fix
+// container whose slabs are not 4 KB multiples must set CROW_STAGE_KERNEL=1 and
+// run stage_cold (19e made kernel 2 the default). The tail-tile branch of the first 19d draft was removed in fix
 // round 1: it was unreachable here and therefore never executed (fix I3).
 // This container: gate_up 1843200 = 450 x 4096, down 921600 = 225 x 4096.
 // blockDim.x MUST be 256: the shared tile is 256 x 16 B and every thread owns
