@@ -746,17 +746,18 @@ impl Engine {
         // reason: every future log says which projection launch produced it.
         // It sits in the [load] block, so the parity gate prints it too.
         let gfi = std::env::var("CROW_GDN_FUSE_IN").unwrap_or_else(|_| "unset".to_string());
-        println!("[gdn] decode input projections {}, CROW_GDN_FUSE_IN {} (1 = one grouped GEMV per layer, qkv+z+b+a)",
-            if gdn_fuse_in_on() { "grouped (62b, one launch)" } else { "per-slab (default, four launches)" }, gfi);
+        println!("[gdn] decode input projections {}, CROW_GDN_FUSE_IN {} (0 = per-slab fallback of record, four launches)",
+            if gdn_fuse_in_on() { "grouped (default since 19g, one launch)" } else { "per-slab (fallback of record, four launches)" }, gfi);
         // #19f, 2026-09-13: ONE line per engine process names the hyper-
         // connection decode chain form, next to the [gdn] line and for the
         // same reason: every future log says which hc chain produced it.
-        // CROW_QFUSE is the SAME switch as the NVFP4 cascade above: exact
-        // "1" additionally opts into the 19f fusion (bit-identical, so the
-        // ids and logits cannot move; only the launch shape does).
+        // CROW_QFUSE is the SAME switch as the NVFP4 cascade above: default
+        // on since 19g (unset = cascade on + chain fused); the value "0"
+        // turns BOTH off (the unfused fallback of record; bit-identical, so
+        // the ids and logits cannot move; only the launch shape does).
         let hcf = std::env::var("CROW_QFUSE").unwrap_or_else(|_| "unset".to_string());
-        println!("[hc] hyper-connection decode chain {}, CROW_QFUSE {} (1 = 19f fused epilogues + merged inject)",
-            if hc_fuse_on() { "fused (19f, 4 launches per hc block)" } else { "unfused (default, 8 launches)" }, hcf);
+        println!("[hc] hyper-connection decode chain {}, CROW_QFUSE {} (0 = unfused fallback of record, 8 launches)",
+            if hc_fuse_on() { "fused (default since 19g, 4 launches per hc block)" } else { "unfused (fallback of record, 8 launches)" }, hcf);
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
         let max_tiles = cfg.prompt_chunk * TOPK / 8 + E + 1;
         let stage = Stage {
@@ -1267,22 +1268,31 @@ fn inj_1k_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceL
 /// CROW_QFUSE (default on): producers emit the NVFP4 activation cascade
 /// themselves (no separate quant_x_fp4 launch). Bit-identical.
 fn qfuse_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| env_on("CROW_QFUSE")) }
-/// CROW_QFUSE=1 (19f, EXACT "1" only; unset keeps the of-record chain):
-/// the hc_run decode chain fuses silu_div4 / sigmoid_el / sig2_div4 into the
-/// neighbouring GEMV epilogues and merges the 4-row inject GEMV
-/// (gemv_fp4_b1k) into the down GEMV launch (hc_down_inj, the b1k 1024-slot
-/// reduce emulated bit for bit on 256 threads; gemv_bf16_ws stores the
-/// sigmoid with the up row). NOTE the documented overload: CROW_QFUSE above
-/// already gates the NVFP4 cascade (default on); here the value "1"
-/// ADDITIONALLY opts into the 19f launch fusion, so unset keeps the unfused
-/// 8-launch chain bit for bit. t < 8 only: the prefill gemm_bf16_dense path
-/// keeps the separate launches, so prefill rows are untouched by construction.
+/// CROW_QFUSE hc-fusion meaning, DEFAULT ON SINCE #19g, 2026-09-13 (unset
+/// and any value but `0` run the fusion; `0` selects the unfused 8-launch
+/// fallback of record): the hc_run decode chain fuses silu_div4 / sigmoid_el
+/// / sig2_div4 into the neighbouring GEMV epilogues and merges the 4-row
+/// inject GEMV (gemv_fp4_b1k) into the down GEMV launch (hc_down_inj, the
+/// b1k 1024-slot reduce emulated bit for bit on 256 threads; gemv_bf16_ws
+/// stores the sigmoid with the up row). NOTE the documented overload:
+/// CROW_QFUSE above already gates the NVFP4 cascade (default on); the two
+/// meanings now share ONE fallback value, so unset means cascade ON + chain
+/// FUSED and `0` means both OFF (the pre-19f default path; cascade on +
+/// unfused is no longer reachable, documented debt). Bit-identical by
+/// construction and by measurement (19f P8FUSE/PXFUSE, 62b P8FUSE/PXFUSE),
+/// so only the launch shape moves. t < 8 only: the prefill gemm_bf16_dense
+/// path keeps the separate launches, so prefill rows are untouched by
+/// construction. DEFAULT BASIS (#19g): the 19f pairs (-0.9806 ms per token,
+/// 3 of 3 pairs, decode_out/srv-19f.log) plus the combined 19g parity pass
+/// over both levers at once (decode_out/srv-19g.log).
 fn hc_fuse_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CROW_QFUSE").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("CROW_QFUSE").as_deref() != Ok("0"))
 }
-/// #62b CROW_GDN_FUSE_IN (default OFF = the four per-slab gemv_fp4_mma_d
-/// launches of record): one grouped dense-FP4 GEMV per GDN decode layer
+/// #62b CROW_GDN_FUSE_IN, DEFAULT ON SINCE #19g, 2026-09-13 (unset and any
+/// value but `0` run the grouped form; `0` selects the four per-slab
+/// gemv_fp4_mma_d launches, the fallback of record): one grouped dense-FP4
+/// GEMV per GDN decode layer
 /// covers the four input projections (qkv 10240 + z 6144 + b 48 + a 48 rows,
 /// all k 2560, one shared quantized row xq_m) in a single launch
 /// (kernels::gemv_fp4_mma_g). Per-slab global scales are KEPT (per-group gs,
@@ -1292,9 +1302,13 @@ fn hc_fuse_on() -> bool {
 /// a, 7.60 us each for 0.069 MB) plus two kernel start tails per layer (62a
 /// lever 1, estimate 0.45 to 0.60 ms per token over 36 layers). Capture time
 /// only: the decode graph records the branch once per process.
+/// DEFAULT BASIS (#19g): the 62b clean pairs (-0.33 ms per token in both
+/// clean pairs, N spread 17x tighter than B, decode_out/srv-62b.log) plus
+/// the combined 19g parity pass over both levers at once
+/// (decode_out/srv-19g.log).
 fn gdn_fuse_in_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CROW_GDN_FUSE_IN").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("CROW_GDN_FUSE_IN").as_deref() != Ok("0"))
 }
 /// CROW_ATTN_SPLIT (default on): decode attention as S=8 partials + merge,
 /// QSA scores warp-per-block (both graph-static; cost no longer grows
@@ -1649,7 +1663,8 @@ impl Engine {
         let p = &self.p;
         let s = &self.s;
         launch_v(k.f("rms_group"), 4, t as u32, 1, 256, &[x as u64, w.norm as u64, s.normed as u64]);
-        // #19f (CROW_QFUSE=1, exact "1"): decode regime (t < 8) fuses the
+        // #19f, default on since 19g (CROW_QFUSE != "0"): decode regime
+        // (t < 8) fuses the
         // elementwise hc chain into the GEMV epilogues - hc_down_inj carries
         // down + silu_div4 + the 4-row inject GEMV + sig2_div4 in ONE launch
         // (the b1k 1024-slot reduce emulated bit for bit on 256 threads) and
@@ -2689,7 +2704,7 @@ impl Engine {
         let s = &self.s;
         launch_v(k.f("rms_group"), 4, rows as u32, 1, 256, &[
             s.h as u64, self.w.mx_norm as u64, s.normed as u64]);
-        // #19f: the same CROW_QFUSE=1 epilogue fusion as hc_run. The mixer
+        // #19f: the same CROW_QFUSE epilogue fusion as hc_run. The mixer
         // has no inject rows, so the hc_down_inj grid carries no inj blocks
         // and the fp4 params stay undereferenced (0 dummies).
         let fuse = hc_fuse_on() && bf16_w_on() && rows < 8
