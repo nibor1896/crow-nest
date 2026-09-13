@@ -748,6 +748,15 @@ impl Engine {
         let gfi = std::env::var("CROW_GDN_FUSE_IN").unwrap_or_else(|_| "unset".to_string());
         println!("[gdn] decode input projections {}, CROW_GDN_FUSE_IN {} (1 = one grouped GEMV per layer, qkv+z+b+a)",
             if gdn_fuse_in_on() { "grouped (62b, one launch)" } else { "per-slab (default, four launches)" }, gfi);
+        // #19f, 2026-09-13: ONE line per engine process names the hyper-
+        // connection decode chain form, next to the [gdn] line and for the
+        // same reason: every future log says which hc chain produced it.
+        // CROW_QFUSE is the SAME switch as the NVFP4 cascade above: exact
+        // "1" additionally opts into the 19f fusion (bit-identical, so the
+        // ids and logits cannot move; only the launch shape does).
+        let hcf = std::env::var("CROW_QFUSE").unwrap_or_else(|_| "unset".to_string());
+        println!("[hc] hyper-connection decode chain {}, CROW_QFUSE {} (1 = 19f fused epilogues + merged inject)",
+            if hc_fuse_on() { "fused (19f, 4 launches per hc block)" } else { "unfused (default, 8 launches)" }, hcf);
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
         let max_tiles = cfg.prompt_chunk * TOPK / 8 + E + 1;
         let stage = Stage {
@@ -1258,6 +1267,20 @@ fn inj_1k_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceL
 /// CROW_QFUSE (default on): producers emit the NVFP4 activation cascade
 /// themselves (no separate quant_x_fp4 launch). Bit-identical.
 fn qfuse_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| env_on("CROW_QFUSE")) }
+/// CROW_QFUSE=1 (19f, EXACT "1" only; unset keeps the of-record chain):
+/// the hc_run decode chain fuses silu_div4 / sigmoid_el / sig2_div4 into the
+/// neighbouring GEMV epilogues and merges the 4-row inject GEMV
+/// (gemv_fp4_b1k) into the down GEMV launch (hc_down_inj, the b1k 1024-slot
+/// reduce emulated bit for bit on 256 threads; gemv_bf16_ws stores the
+/// sigmoid with the up row). NOTE the documented overload: CROW_QFUSE above
+/// already gates the NVFP4 cascade (default on); here the value "1"
+/// ADDITIONALLY opts into the 19f launch fusion, so unset keeps the unfused
+/// 8-launch chain bit for bit. t < 8 only: the prefill gemm_bf16_dense path
+/// keeps the separate launches, so prefill rows are untouched by construction.
+fn hc_fuse_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CROW_QFUSE").as_deref() == Ok("1"))
+}
 /// #62b CROW_GDN_FUSE_IN (default OFF = the four per-slab gemv_fp4_mma_d
 /// launches of record): one grouped dense-FP4 GEMV per GDN decode layer
 /// covers the four input projections (qkv 10240 + z 6144 + b 48 + a 48 rows,
@@ -1626,12 +1649,33 @@ impl Engine {
         let p = &self.p;
         let s = &self.s;
         launch_v(k.f("rms_group"), 4, t as u32, 1, 256, &[x as u64, w.norm as u64, s.normed as u64]);
-        w.down.launch_gemv(k, LOWRANK, p.n320 as u64, t, p.t as u64, s.normed as u64, s.low as u64, p.n10240 as u64);
-        launch_v(k.f("silu_div4"), ((t * LOWRANK + 255) / 256) as u32, 1, 1, 256, &[
-            s.low as u64, s.sil as u64, p.nt_low as u64]);
-        w.up.launch_gemv(k, HCT, p.n10240 as u64, t, p.t as u64, s.sil as u64, s.mixw as u64, p.n320 as u64);
-        launch_v(k.f("sigmoid_el"), ((t * HCT + 255) / 256) as u32, 1, 1, 256, &[
-            s.mixw as u64, p.nt_hct as u64]);
+        // #19f (CROW_QFUSE=1, exact "1"): decode regime (t < 8) fuses the
+        // elementwise hc chain into the GEMV epilogues - hc_down_inj carries
+        // down + silu_div4 + the 4-row inject GEMV + sig2_div4 in ONE launch
+        // (the b1k 1024-slot reduce emulated bit for bit on 256 threads) and
+        // gemv_bf16_ws stores the sigmoid_el epilogue with the up row.
+        // Bit-identity by construction: every epilogue is elementwise on the
+        // finished accumulator and the merged grid keeps each row's dot
+        // product unchanged. t >= 8 (prefill gemm_bf16_dense) keeps the
+        // separate launches verbatim.
+        let fuse = hc_fuse_on() && bf16_w_on() && inj_1k_on() && t < 8
+            && matches!(&w.down, PW::Bf16(_)) && matches!(&w.up, PW::Bf16(_));
+        if fuse {
+            let PW::Bf16(dw) = &w.down else { unreachable!() };
+            let PW::Bf16(uw) = &w.up else { unreachable!() };
+            launch_v(k.f("hc_down_inj"), ((LOWRANK + 7) / 8 + HCN) as u32, t as u32, 1, 256, &[
+                *dw as u64, s.normed as u64, s.sil as u64,
+                w.inj.w as u64, w.inj.gs as u64, injw as u64, p.n10240 as u64, p.n320 as u64]);
+            launch_v(k.f("gemv_bf16_ws"), ((HCT + 7) / 8) as u32, t as u32, 1, 256, &[
+                *uw as u64, s.sil as u64, s.mixw as u64, p.n320 as u64, p.n10240 as u64]);
+        } else {
+            w.down.launch_gemv(k, LOWRANK, p.n320 as u64, t, p.t as u64, s.normed as u64, s.low as u64, p.n10240 as u64);
+            launch_v(k.f("silu_div4"), ((t * LOWRANK + 255) / 256) as u32, 1, 1, 256, &[
+                s.low as u64, s.sil as u64, p.nt_low as u64]);
+            w.up.launch_gemv(k, HCT, p.n10240 as u64, t, p.t as u64, s.sil as u64, s.mixw as u64, p.n320 as u64);
+            launch_v(k.f("sigmoid_el"), ((t * HCT + 255) / 256) as u32, 1, 1, 256, &[
+                s.mixw as u64, p.nt_hct as u64]);
+        }
         if qfuse_on() && xq != 0 {
             launch_v(k.f("mix_streams_q"), 10, t as u32, 1, 256, &[
                 s.mixw as u64, s.normed as u64, mixed as u64, xq as u64]);
@@ -1639,6 +1683,9 @@ impl Engine {
             launch_v(k.f("mix_streams"), 10, t as u32, 1, 256, &[
                 s.mixw as u64, s.normed as u64, mixed as u64]);
         }
+        // unfused chain: the inject GEMV + sig2_div4 stay their own launches
+        // (the fused branch above already wrote injw).
+        if !fuse {
         // block-inject stays on the naive GEMV by measurement (mma_gate dense):
         // rows=4 saturates the naive kernel (4×256 threads) while the MMA tile
         // is a single active warp on one SM — mma_d is ~10x SLOWER at t=1 and
@@ -1652,6 +1699,7 @@ impl Engine {
         }
         launch_v(k.f("sig2_div4"), ((t * HCN + 255) / 256) as u32, 1, 1, 256, &[
             s.injr as u64, injw as u64, p.nt_hc as u64]);
+        }
     }
 
     unsafe fn gdn_prompt(&self, l: usize, mixed: Dev, t: usize, _first: bool) -> Dev {
@@ -2641,12 +2689,26 @@ impl Engine {
         let s = &self.s;
         launch_v(k.f("rms_group"), 4, rows as u32, 1, 256, &[
             s.h as u64, self.w.mx_norm as u64, s.normed as u64]);
-        self.w.mx_down.launch_gemv(k, LOWRANK, p.n320 as u64, rows, p.t as u64, s.normed as u64, s.low as u64, p.n10240 as u64);
-        launch_v(k.f("silu_div4"), ((rows * LOWRANK + 255) / 256) as u32, 1, 1, 256, &[
-            s.low as u64, s.sil as u64, p.nt_low as u64]);
-        self.w.mx_up.launch_gemv(k, HCT, p.n10240 as u64, rows, p.t as u64, s.sil as u64, s.mixw as u64, p.n320 as u64);
-        launch_v(k.f("sigmoid_el"), ((rows * HCT + 255) / 256) as u32, 1, 1, 256, &[
-            s.mixw as u64, p.nt_hct as u64]);
+        // #19f: the same CROW_QFUSE=1 epilogue fusion as hc_run. The mixer
+        // has no inject rows, so the hc_down_inj grid carries no inj blocks
+        // and the fp4 params stay undereferenced (0 dummies).
+        let fuse = hc_fuse_on() && bf16_w_on() && rows < 8
+            && matches!(&self.w.mx_down, PW::Bf16(_)) && matches!(&self.w.mx_up, PW::Bf16(_));
+        if fuse {
+            let PW::Bf16(dw) = &self.w.mx_down else { unreachable!() };
+            let PW::Bf16(uw) = &self.w.mx_up else { unreachable!() };
+            launch_v(k.f("hc_down_inj"), ((LOWRANK + 7) / 8) as u32, rows as u32, 1, 256, &[
+                *dw as u64, s.normed as u64, s.sil as u64, 0, 0, 0, p.n10240 as u64, p.n320 as u64]);
+            launch_v(k.f("gemv_bf16_ws"), ((HCT + 7) / 8) as u32, rows as u32, 1, 256, &[
+                *uw as u64, s.sil as u64, s.mixw as u64, p.n320 as u64, p.n10240 as u64]);
+        } else {
+            self.w.mx_down.launch_gemv(k, LOWRANK, p.n320 as u64, rows, p.t as u64, s.normed as u64, s.low as u64, p.n10240 as u64);
+            launch_v(k.f("silu_div4"), ((rows * LOWRANK + 255) / 256) as u32, 1, 1, 256, &[
+                s.low as u64, s.sil as u64, p.nt_low as u64]);
+            self.w.mx_up.launch_gemv(k, HCT, p.n10240 as u64, rows, p.t as u64, s.sil as u64, s.mixw as u64, p.n320 as u64);
+            launch_v(k.f("sigmoid_el"), ((rows * HCT + 255) / 256) as u32, 1, 1, 256, &[
+                s.mixw as u64, p.nt_hct as u64]);
+        }
         launch_v(k.f("mix_streams"), 10, rows as u32, 1, 256, &[
             s.mixw as u64, s.normed as u64, s.mixed_final as u64]);
     }

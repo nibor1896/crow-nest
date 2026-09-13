@@ -849,6 +849,127 @@ extern "C" __global__ void gemv_fp4_b1k(const unsigned char* __restrict__ w, con
     if (threadIdx.x == 0) y[(size_t)t * gridDim.x + row] = red[0];
 }
 
+// ---------------- 19f (CROW_QFUSE=1): fused hc_run decode launches ----------------
+// ONE launch replaces the hc_run down GEMV + silu_div4 + inject GEMV +
+// sig2_div4 (decode, t < 8): grid ((rows + 7) / 8 + 4, T), block 256.
+//  - blocks [0, (rows + 7) / 8): the gemv_bf16_w warp-per-row body VERBATIM
+//    (same lane split, same k walk => the bit-identical accumulator), with
+//    the silu_div4 epilogue folded in: v = acc * 0.25f, v / (1 + expf(-v)),
+//    elementwise on the finished accumulator. Writes sil[t][row] only (the
+//    s.low write is dead in the fused chain).
+//  - the last 4 blocks: the gemv_fp4_b1k row math with its 1024-slot red[]
+//    tree EMULATED on 256 threads: the k-block loop keeps the 1024 stride,
+//    so threads 0..159 fill red[d] exactly like the 1024-wide launch (the
+//    rest contribute +0.0), the three extra slots are explicit zeros, and
+//    the binary tree runs two slots per thread with the same pairing and one
+//    __syncthreads per level, so every FP32 add is the one gemv_fp4_b1k makes,
+//    so the reduce is bit-identical by construction. The sig2_div4 epilogue
+//    folds in: 2 / (1 + expf(-red[0] * 0.25f)).
+// Both sides read x = s.normed (the hc down/inj k_dim = 10240); rows_p is
+// the bf16 row count (320). A launch with grid.x == (rows + 7) / 8 (the
+// head_run mixer) has no inj blocks and never dereferences the fp4 params.
+extern "C" __global__ void hc_down_inj(const unsigned short* __restrict__ w,
+                                       const float* __restrict__ x, float* __restrict__ sil,
+                                       const unsigned char* __restrict__ wfp4,
+                                       const float* __restrict__ gs_ptr, float* __restrict__ injw,
+                                       const int* __restrict__ k_dim_p, const int* __restrict__ rows_p) {
+    int k_dim = *k_dim_p;
+    int rows = *rows_p;
+    int bb = (rows + 7) >> 3;
+    int t = blockIdx.y;
+    if (blockIdx.x < bb) {
+        int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+        int row = blockIdx.x * 8 + warp;
+        if (row >= rows) return;
+        const unsigned short* wp = w + (size_t)row * k_dim;
+        const float* xp = x + (size_t)t * k_dim;
+        float acc = 0.0f;
+        for (int i = lane * 8; i < k_dim; i += 256) {
+            uint4 v = *(const uint4*)(wp + i);
+            unsigned int u[4] = {v.x, v.y, v.z, v.w};
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float lo = __uint_as_float(u[j] << 16);
+                float hi = __uint_as_float(u[j] & 0xFFFF0000u);
+                acc += lo * xp[i + 2 * j] + hi * xp[i + 2 * j + 1];
+            }
+        }
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+        if (lane == 0) {
+            float v4 = acc * 0.25f;                  // silu_div4 epilogue
+            sil[(size_t)t * rows + row] = v4 / (1.0f + expf(-v4));
+        }
+    } else {
+        int row = blockIdx.x - bb;                   // 0..3, the inject rows
+        int bpr = k_dim >> 6;
+        const unsigned char* rowp = wfp4 + (size_t)row * bpr * 36;
+        const float* xp = x + (size_t)t * k_dim;
+        float gs = gs_ptr[0];
+        float acc = 0.0f;
+        for (int b = threadIdx.x; b < bpr; b += 1024) {   // 1024: the b1k stride
+            const unsigned char* blk = rowp + b * 36;
+            #pragma unroll
+            for (int sb = 0; sb < 4; sb++) {
+                float s = ue4m3(blk[sb]) * gs;
+                float part = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    int idx = sb * 16 + j;
+                    unsigned int byte = blk[4 + (idx >> 1)];
+                    unsigned int nib = (idx & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
+                    part += e2m1(nib) * xp[b * 64 + sb * 16 + j];
+                }
+                acc += part * s;
+            }
+        }
+        __shared__ float red[1024];
+        red[threadIdx.x] = acc;
+        red[threadIdx.x + 256] = 0.0f;
+        red[threadIdx.x + 512] = 0.0f;
+        red[threadIdx.x + 768] = 0.0f;
+        __syncthreads();
+        for (int st = 512; st > 0; st >>= 1) {       // the b1k tree, 2 slots/thread
+            if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+            if (threadIdx.x + 256 < st) red[threadIdx.x + 256] += red[threadIdx.x + 256 + st];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            float v = red[0];                        // sig2_div4 epilogue
+            injw[(size_t)t * 4 + row] = 2.0f / (1.0f + expf(-v * 0.25f));
+        }
+    }
+}
+
+// 19f: gemv_bf16_w with the sigmoid_el epilogue folded in (CROW_QFUSE=1 hc
+// chain): the standalone sigmoid_el reads the finished accumulator back and
+// writes 1 / (1 + expf(-x)) elementwise, so applying it at the lane-0 store
+// is bit-identical. Body otherwise verbatim gemv_bf16_w.
+extern "C" __global__ void gemv_bf16_ws(const unsigned short* __restrict__ w, const float* __restrict__ x,
+                                        float* __restrict__ y, const int* __restrict__ k_dim_p,
+                                        const int* __restrict__ rows_p) {
+    int k_dim = *k_dim_p;
+    int rows = *rows_p;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int row = blockIdx.x * 8 + warp;
+    int t = blockIdx.y;
+    if (row >= rows) return;
+    const unsigned short* wp = w + (size_t)row * k_dim;
+    const float* xp = x + (size_t)t * k_dim;
+    float acc = 0.0f;
+    for (int i = lane * 8; i < k_dim; i += 256) {
+        uint4 v = *(const uint4*)(wp + i);
+        unsigned int u[4] = {v.x, v.y, v.z, v.w};
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float lo = __uint_as_float(u[j] << 16);
+            float hi = __uint_as_float(u[j] & 0xFFFF0000u);
+            acc += lo * xp[i + 2 * j] + hi * xp[i + 2 * j + 1];
+        }
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) y[(size_t)t * rows + row] = 1.0f / (1.0f + expf(-acc));
+}
+
 extern "C" __global__ void dequant_fp4_flat(const unsigned char* __restrict__ w,
                                             const float* __restrict__ gs_ptr, float* __restrict__ out,
                                             const int* __restrict__ n_p) {
@@ -3475,7 +3596,8 @@ impl Kernels {
             "gate_mul", "rms128", "rope64", "pool4_cache", "qk_k_append", "d2d_block", "qsa_scores",
             "qsa_select", "qsa_select_fast", "qsa_select_par_h", "qsa_select_par_e", "router_top10", "gather_ple_fp4", "gate_dot", "gate_apply", "ple_conv",
             "ple_state_update", "ple_conv_step", "argmax_k", "sample_topk_part", "sample_k", "add_flat",
-            "gemv_bf16_b", "gemv_bf16_w", "gemv_fp4_b1k", "gemm_fp4_dense", "gemm_bf16_dense", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
+            "gemv_bf16_b", "gemv_bf16_w", "gemv_fp4_b1k", "hc_down_inj", "gemv_bf16_ws",
+            "gemm_fp4_dense", "gemm_bf16_dense", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
             "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "gemv_fp4_mma_g", "attn_sel_r", "attn_sel_d8", "attn_sel_d9", "attn_sel_s", "attn_sel_s8", "attn_sel_s8l", "attn_sel_g",
         ];
         let mut map = HashMap::new();
