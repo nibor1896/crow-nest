@@ -369,6 +369,28 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
      plus the 16,056-row PXBOTH form byte-identical with the 61b sha256 values of
      record, the double-fallback 8 rows identical, ten tasks 10 of 10 equal BOTH
      splits-8 records (`decode_out/srv-19g.log`).
+   - shared-expert decode chain, fused behind the SAME `CROW_QFUSE` value `1`
+     since #19h (2026-09-13; EXACT `1` only, unset keeps the default of record:
+     hc chain FUSED + shared chain unfused, `0` stays all off): the SIX launches
+     of the shared chain (gate|up `gemv_fp4_mma_d` x2, `silu_mul640_q`, down
+     `gemv_fp4_mma_d`, the `sgv` `gemv_b`, `gate_shared`) run as THREE:
+     `sh_gate_up_q` (both gate|up GEMVs in one launch, the mma_d body twice
+     verbatim over the gate and up slabs, the `silu_mul640_q` math warp-wide on
+     the finished accumulator pairs, writes `sh2` + `xq_s`, `kernels.rs:3047`),
+     the hoisted `gemv_b` (`sgv`, reads `mixed_m` only, data-safe) and
+     `gemv_fp4_mma_dg` (down GEMV + the `gate_shared` epilogue at the store:
+     `moe_out = sigmoid(sgv) * down` ASSIGN, still the FIRST writer of `moe_out`,
+     `kernels.rs:3143`). Launch site `gen.rs:2359` behind `sh_fuse_on()`
+     (`gen.rs:1327`), decode `t < 8` and the mma/dense path only: prefill
+     (`gemm_fp4_dense`) and the `gemv_fp4_bs` fallback keep the separate launches
+     verbatim; the `[hc]` boot line names the shared state too (`gen.rs:759`).
+     Bit identity: epilogue folding only (every op elementwise, or warp-wide with
+     the standalone 16-consecutive-j quant layout, on a finished accumulator;
+     each k walk in the separate-launch order; the merged grid keeps every row's
+     dot product) and measured: parity 12 of 12 (OFF 8 rows = the 19g-committed
+     binary, ON = OFF, the P8FUSE form with BOTH dumps at `b7f6419203b4`), ten
+     tasks 10 of 10, pairs -0.2286 ms per token in 3 of 3
+     (`decode_out/srv-19h.log`).
 3. **Router**: BF16 GEMM 2560 × 512 (kept BF16 per section 1).
 4. **Attention** (12 layers): 24 heads × head_dim 256, GQA 2 KV heads, partial rotary
    0.25, mrope interleaved [11,11,10] — compute stays BF16/FP8 (flash-attention style);
