@@ -741,6 +741,13 @@ impl Engine {
         let asplits = std::env::var("CROW_ATTN_SPLITS").unwrap_or_else(|_| "unset".to_string());
         println!("[attn] decode attention splits {} (default since 61d), CROW_ATTN_SPLITS {} (8 = previous default, knob 4/8/16/32)",
             attn_splits(), asplits);
+        // #62b, 2026-09-12: ONE line per engine process names the GDN decode
+        // input-projection form, next to the [attn] line and for the same
+        // reason: every future log says which projection launch produced it.
+        // It sits in the [load] block, so the parity gate prints it too.
+        let gfi = std::env::var("CROW_GDN_FUSE_IN").unwrap_or_else(|_| "unset".to_string());
+        println!("[gdn] decode input projections {}, CROW_GDN_FUSE_IN {} (1 = one grouped GEMV per layer, qkv+z+b+a)",
+            if gdn_fuse_in_on() { "grouped (62b, one launch)" } else { "per-slab (default, four launches)" }, gfi);
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
         let max_tiles = cfg.prompt_chunk * TOPK / 8 + E + 1;
         let stage = Stage {
@@ -1251,6 +1258,21 @@ fn inj_1k_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceL
 /// CROW_QFUSE (default on): producers emit the NVFP4 activation cascade
 /// themselves (no separate quant_x_fp4 launch). Bit-identical.
 fn qfuse_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| env_on("CROW_QFUSE")) }
+/// #62b CROW_GDN_FUSE_IN (default OFF = the four per-slab gemv_fp4_mma_d
+/// launches of record): one grouped dense-FP4 GEMV per GDN decode layer
+/// covers the four input projections (qkv 10240 + z 6144 + b 48 + a 48 rows,
+/// all k 2560, one shared quantized row xq_m) in a single launch
+/// (kernels::gemv_fp4_mma_g). Per-slab global scales are KEPT (per-group gs,
+/// a single-gs fusion would not be bit exact, 62a report C5) and the per-row
+/// op order is unchanged, so the outputs are bit-identical by construction
+/// (the KS=1 contract class). The win is the two gx=1 latency posts (b and
+/// a, 7.60 us each for 0.069 MB) plus two kernel start tails per layer (62a
+/// lever 1, estimate 0.45 to 0.60 ms per token over 36 layers). Capture time
+/// only: the decode graph records the branch once per process.
+fn gdn_fuse_in_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CROW_GDN_FUSE_IN").as_deref() == Ok("1"))
+}
 /// CROW_ATTN_SPLIT (default on): decode attention as S=8 partials + merge,
 /// QSA scores warp-per-block (both graph-static; cost no longer grows
 /// linearly with the context inside one block)
@@ -1712,18 +1734,31 @@ launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
         if dense_mma_on() {
             if !qfuse_on() { launch_v(k.f("quant_x_fp4"), 1, 1, 1, 128, &[
                 mixed as u64, s.xq_m as u64, p.n2560 as u64, p.one as u64, p.n2560 as u64]); }
-            launch_v(k.f("gemv_fp4_mma_d"), (GDN_CONV / 64) as u32, 1, 1, mma_bx(), &[
-                qkv.w as u64, s.xq_m as u64, qkv.gs as u64, s.mq as u64,
-                p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
-            launch_v(k.f("gemv_fp4_mma_d"), (GDN_VAL / 64) as u32, 1, 1, mma_bx(), &[
-                z.w as u64, s.xq_m as u64, z.gs as u64, s.gz as u64,
-                p.n2560 as u64, p.n6144 as u64, p.n6144 as u64]);
-            launch_v(k.f("gemv_fp4_mma_d"), 1, 1, 1, mma_bx(), &[
-                b.w as u64, s.xq_m as u64, b.gs as u64, s.gb as u64,
-                p.n2560 as u64, p.nr48 as u64, p.nr48 as u64]);
-            launch_v(k.f("gemv_fp4_mma_d"), 1, 1, 1, mma_bx(), &[
-                a.w as u64, s.xq_m as u64, a.gs as u64, s.ga as u64,
-                p.n2560 as u64, p.nr48 as u64, p.nr48 as u64]);
+            if gdn_fuse_in_on() {
+                // #62b lever 1: the four input projections in ONE grouped
+                // launch (qkv 10240 + z 6144 + b 48 + a 48 rows, all k 2560
+                // over the shared xq_m row); per-slab gs kept, per-row math =
+                // gemv_fp4_mma_d bit for bit (62a report lever 1).
+                launch_v(k.f("gemv_fp4_mma_g"), ((GDN_CONV + GDN_VAL + 2 * GDN_VHEADS + 63) / 64) as u32, 1, 1, mma_bx(), &[
+                    qkv.w as u64, z.w as u64, b.w as u64, a.w as u64,
+                    qkv.gs as u64, z.gs as u64, b.gs as u64, a.gs as u64,
+                    s.mq as u64, s.gz as u64, s.gb as u64, s.ga as u64,
+                    p.n10240 as u64, p.n6144 as u64, p.nr48 as u64, p.nr48 as u64,
+                    s.xq_m as u64, p.n2560 as u64]);
+            } else {
+                launch_v(k.f("gemv_fp4_mma_d"), (GDN_CONV / 64) as u32, 1, 1, mma_bx(), &[
+                    qkv.w as u64, s.xq_m as u64, qkv.gs as u64, s.mq as u64,
+                    p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
+                launch_v(k.f("gemv_fp4_mma_d"), (GDN_VAL / 64) as u32, 1, 1, mma_bx(), &[
+                    z.w as u64, s.xq_m as u64, z.gs as u64, s.gz as u64,
+                    p.n2560 as u64, p.n6144 as u64, p.n6144 as u64]);
+                launch_v(k.f("gemv_fp4_mma_d"), 1, 1, 1, mma_bx(), &[
+                    b.w as u64, s.xq_m as u64, b.gs as u64, s.gb as u64,
+                    p.n2560 as u64, p.nr48 as u64, p.nr48 as u64]);
+                launch_v(k.f("gemv_fp4_mma_d"), 1, 1, 1, mma_bx(), &[
+                    a.w as u64, s.xq_m as u64, a.gs as u64, s.ga as u64,
+                    p.n2560 as u64, p.nr48 as u64, p.nr48 as u64]);
+            }
         } else {
             launch_v(k.f("gemv_fp4"), GDN_CONV as u32, 1, 1, 256, &[
                 qkv.w as u64, mixed as u64, qkv.gs as u64, s.mq as u64, p.n2560 as u64]);
