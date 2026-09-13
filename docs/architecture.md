@@ -345,6 +345,24 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
    the graph.
 2. **Dense paths**: hidden 2560 ↔ residual stream 10240 (hyper-connections), attention
    QKVO, GDN projections (`in_proj_qkvz`, `out_proj`), `conv1d`, PLE gather + conv.
+   - hyper-connection decode chain, opt-in fused since #19f (2026-09-13): `CROW_QFUSE=1`
+     replaces the eight launches of one hc block (`rms_group`, down `gemv_bf16_w`,
+     `silu_div4`, up `gemv_bf16_w`, `sigmoid_el`, `mix_streams_q`, `gemv_fp4_b1k`,
+     `sig2_div4`) with FOUR: `rms_group`, `hc_down_inj` (down GEMV + `silu_div4` + the
+     4-row inject GEMV + `sig2_div4` in one launch — the `gemv_fp4_b1k` 1024-slot reduce
+     emulated bit for bit on 256 threads, 44 blocks x T), `gemv_bf16_ws` (up GEMV storing
+     the `sigmoid_el` epilogue) and `mix_streams_q`; `head_run` fuses the same epilogues
+     (no inject rows). Launch sites `gen.rs:1661` / `gen.rs:2695` behind `hc_fuse_on()`,
+     decode `t < 8` only — prefill keeps the `gemm_bf16_dense` path verbatim; one `[hc]`
+     boot line names the form (`gen.rs:758`); unset keeps the default of record. The
+     variable is shared with the NVFP4 cascade switch (documented debt, `docs/env.md`).
+   - bit identity: by construction (every epilogue is elementwise on the finished
+     accumulator, the merged grid keeps each row's dot product unchanged) and measured:
+     with the switch ON the P8FUSE (504 teacher-forced rows) and PXFUSE (16,056 rows)
+     forms are byte-identical to the reference `d211ab52ad2b`, the six switch-OFF parity
+     gates reproduce the 61b sha256 values of record (which is simultaneously the
+     #61e-revert proof), and the ten-task default configuration holds 10 of 10
+     (`decode_out/srv-19f.log`).
 3. **Router**: BF16 GEMM 2560 × 512 (kept BF16 per section 1).
 4. **Attention** (12 layers): 24 heads × head_dim 256, GQA 2 KV heads, partial rotary
    0.25, mrope interleaved [11,11,10] — compute stays BF16/FP8 (flash-attention style);
