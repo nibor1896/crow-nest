@@ -297,12 +297,14 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 - The decode operating point that decided the QSA selection default: #61b, 2026-09-12.
 - The decode operating point that decided the split-count flip: #61d, 2026-09-13, ROLLED BACK by #61e the same day under the improvement-loop quality rule (the ten-task quality bar was not held at 32); #61b is again the split-count default of record.
 - The decode operating point that decided the combined fusion default: #19g, 2026-09-13 (the #19f hc-chain fusion and the #62b grouped GDN input projections both default).
+- The decode operating point that decided the all-fused default: #19i, 2026-09-13 (the #19h shared-expert fusion joins the same default predicate; the confirmation form is W + 3N, no adjacent B arm post-flip).
 - Every row of this table is one adjacent pair of one chain; the two crow-nest columns are the two arms of that pair.
 - The two arms run different weights: crow-nest CNQ4.5-M (NVFP4, 4.5 bpw); llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL (GGUF, 2.4 bpw).
 - A tok/s figure is quoted only next to its adjacent arm in the same chain (#38).
 
 | shape metric | crow-nest, engine default | crow-nest, the named fallback | llama.cpp | machine | date | source |
 |---|---|---|---|---|---|---|
+| decode, t1-read 16,064 ids, 255 timed steps, the #19i all-fused default confirmation: hc chain FUSED + shared chain FUSED + grouped GDN + cascade, all default with no env (W + 3N form, NO adjacent B arm post-flip: `CROW_QFUSE=0` would also disable the NVFP4 cascade) | 22.43 ms per token = 44.6 tok/s | 22.80 ms per token = 43.9 tok/s, the previous default (the #19g combined default; the lever's own adjacent-pair reading is the #19h one, -0.2286 ms = -1.00 percent in 3 of 3 pairs) | 22.27 ms per token = 44.9 tok/s | RTX 5090 | crow-nest 2026-09-13, llama.cpp 2026-09-11 | `decode_out/srv-19i.log`, `decode_out/srv-59b.log` |
 | decode, t1-read 16,064 ids, 255 timed steps, the #19/#62 combined default pair (#19g): hc chain fused + GDN input projections grouped, both default with no env | 22.80 ms per token = 43.9 tok/s | 23.94 ms per token = 41.8 tok/s, the previous default (61b arm of record; the same-chain double fallback `CROW_QFUSE=0 CROW_GDN_FUSE_IN=0` measured 26.86 ms = 37.2 tok/s, but that arm also runs the NVFP4 cascade in its separate-launch form — the documented `CROW_QFUSE` overload makes it an artifact, not the previous default) | 22.27 ms per token = 44.9 tok/s | RTX 5090 | crow-nest 2026-09-13, llama.cpp 2026-09-11 | `decode_out/srv-19g.log`, `decode_out/srv-59b.log` |
 | decode, t1-read 16,064 ids, 255 timed steps, the #61d split-count pair (the flip ROLLED BACK by #61e after the quality verdict; measurement of record for the knob) | 22.85 ms per token = 43.8 tok/s | 24.13 ms per token = 41.4 tok/s with `CROW_ATTN_SPLITS=8` | 22.27 ms per token = 44.9 tok/s | RTX 5090 | crow-nest 2026-09-13, llama.cpp 2026-09-11 | `decode_out/srv-61d.log`, `decode_out/srv-59b.log` |
 | decode, t1-read 16,064 ids, 255 timed steps, the #61b QSA selection pair (the engine default of record from #61b until #19g; the QSA and split parts of it are unchanged) | 23.94 ms per token = 41.8 tok/s | 24.87 ms per token = 40.2 tok/s with `CROW_QSA_PAR=0` | 22.27 ms per token = 44.9 tok/s | RTX 5090 | crow-nest 2026-09-12, llama.cpp 2026-09-11 | `decode_out/srv-61b.log`, `decode_out/srv-59b.log` |
@@ -369,9 +371,10 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
      plus the 16,056-row PXBOTH form byte-identical with the 61b sha256 values of
      record, the double-fallback 8 rows identical, ten tasks 10 of 10 equal BOTH
      splits-8 records (`decode_out/srv-19g.log`).
-   - shared-expert decode chain, fused behind the SAME `CROW_QFUSE` value `1`
-     since #19h (2026-09-13; EXACT `1` only, unset keeps the default of record:
-     hc chain FUSED + shared chain unfused, `0` stays all off): the SIX launches
+   - shared-expert decode chain, fused by DEFAULT since #19i (2026-09-13; the
+     #19h fusion behind the SAME `CROW_QFUSE`: unset or any value but `0` =
+     hc chain FUSED + shared chain FUSED + cascade, `1` kept accepted and
+     redundant, `0` stays all off): the SIX launches
      of the shared chain (gate|up `gemv_fp4_mma_d` x2, `silu_mul640_q`, down
      `gemv_fp4_mma_d`, the `sgv` `gemv_b`, `gate_shared`) run as THREE:
      `sh_gate_up_q` (both gate|up GEMVs in one launch, the mma_d body twice
@@ -390,7 +393,14 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
      dot product) and measured: parity 12 of 12 (OFF 8 rows = the 19g-committed
      binary, ON = OFF, the P8FUSE form with BOTH dumps at `b7f6419203b4`), ten
      tasks 10 of 10, pairs -0.2286 ms per token in 3 of 3
-     (`decode_out/srv-19h.log`).
+     (`decode_out/srv-19h.log`). The #19i default verification (repair HEAD
+     `be7bb60`, build `5c7919276203`): the trimmed 19g battery with NO env —
+     8 / 512 x3 / 1024 / P8 forms, 20 of 20 subchecks GREEN byte-identical to
+     `d211ab52ad2b` at the 61b sha256 values of record, the `0` fallback 8 rows
+     `bceba6ff7724` — ten tasks 10 of 10, pairs (the coordinator-approved
+     W + 3N form, no adjacent B arm post-flip) ids `5098f885ab3a` 4 of 4, the
+     all-fused default 22.4266 ms per token = 44.6 tok/s, hard gate < 22.6999
+     met (`decode_out/srv-19i.log`).
 3. **Router**: BF16 GEMM 2560 × 512 (kept BF16 per section 1).
 4. **Attention** (12 layers): 24 heads × head_dim 256, GQA 2 KV heads, partial rotary
    0.25, mrope interleaved [11,11,10] — compute stays BF16/FP8 (flash-attention style);
