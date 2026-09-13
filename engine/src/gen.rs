@@ -739,7 +739,7 @@ impl Engine {
         // reason: every future log says which split count produced it. It
         // sits in the [load] block, so the parity gate prints it too.
         let asplits = std::env::var("CROW_ATTN_SPLITS").unwrap_or_else(|_| "unset".to_string());
-        println!("[attn] decode attention splits {} (default since 61d), CROW_ATTN_SPLITS {} (8 = previous default, knob 4/8/16/32)",
+        println!("[attn] decode attention splits {} (default 8, restored by 61e), CROW_ATTN_SPLITS {} (32 = rolled back, knob 4/8/16/32)",
             attn_splits(), asplits);
         // #62b, 2026-09-12: ONE line per engine process names the GDN decode
         // input-projection form, next to the [attn] line and for the same
@@ -1299,7 +1299,7 @@ fn attn_sel_gx_bx() -> (u32, u32) { if attn_r_mode() == 5 { (NKV as u32, 384) } 
 pub const ATTN_SB: usize = 512;
 fn attn_sb_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| env_on("CROW_ATTN_SB")) }
 fn attn_sb(chunk: usize) -> usize { if attn_sb_on() { chunk.min(ATTN_SB).max(1) } else { chunk.max(1) } }
-pub const ATTN_SPLITS: usize = 32;
+pub const ATTN_SPLITS: usize = 8;
 /// #61a: the partial buffers are sized for the largest allowed split count,
 /// so CROW_ATTN_SPLITS can be raised at runtime without a reallocation.
 pub const ATTN_SPLITS_MAX: usize = 32;
@@ -1312,14 +1312,14 @@ pub const QSA_PAR_BINS: usize = 4096;
 /// attn_sel_split, the device scalar p.n_splits read by attn_merge).
 /// A different split count changes the merge order of the flash-decoding
 /// partials, so the last bits of the logits may move.
-/// DEFAULT 32 since #61d (2026-09-12, robin's ruling: performance over ids).
-/// DEFAULT BASIS: the 61c split sweep (decode_out/srv-61c.log, RTX 5090,
-/// 2026-09-12), arm means B=8 24.8433 / S16 23.8484 / S32 23.4001 ms per
-/// token, ordering 32 < 16 < 8 in every dataset, clean late adjacent runs
-/// B3 24.01 vs S32b 22.50 (-1.51 ms); 61a corrected gains S16 1.109 /
-/// S32 1.686. IDS: 16 and 32 move the greedy ids at index 45 and 48 of 256
-/// on t1-read, accepted by the ruling; `CROW_ATTN_SPLITS=8` is the fallback
-/// of record (the 61b configuration).
+/// DEFAULT 8, RESTORED by #61e (2026-09-13): the 61d flip to 32 was rolled
+/// back by the improvement loop rule (quality gate red = roll the step
+/// back): the ten-task bar at 32 read 0 pass / 7 partial / 3 fail against
+/// the record 2/5/3 and the llama reference 2/6/2 (task-61d-quality-report,
+/// one greedy sample). The 61d experiment stays of record: 61c sweep and
+/// 61d pairs measured 32 at 22.8545 against 24.1325 ms per token with
+/// CROW_ATTN_SPLITS=8 (-5.3 percent, ids c65969f7793a vs 5098f885ab3a);
+/// the knob stays measurement only, robin's ids ruling remains recorded.
 pub fn attn_splits() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("CROW_ATTN_SPLITS").ok().and_then(|v| v.parse().ok())
