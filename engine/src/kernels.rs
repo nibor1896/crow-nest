@@ -634,6 +634,174 @@ extern "C" __global__ void gemv_fp4_mma_g(const unsigned char* __restrict__ w0,
     }
 }
 
+// 32-rows-per-block twin of gemv_fp4_mma_d (#62d lever 2): the GDN decode
+// launches (the per-slab qkv/z fallback and the out projection) run
+// ceil(rows/32) blocks instead of rows/64, so a block holds TWO 16-row
+// groups instead of four and the grid doubles (160 -> 320, 96 -> 192,
+// 40 -> 80). PER-ROW MATH IS BIT-IDENTICAL to the 64-row kernel: the k
+// split stays CROW_MMA_KS slices (ks_n = blockDim >> 6, block 64*KS =
+// gen::mma_bx32(); default KS 4 -> 256 threads), the bpr loop bounds, the
+// mma order, the residual levels and the FIXED smem slice reduce order are
+// the gemv_fp4_mma_d forms verbatim; only the warp map moves (rg = warp & 1,
+// ks = warp >> 1, w0 = blockIdx.x*32 + rg*16). The non-GDN users of
+// gemv_fp4_mma_d (attention, qsa, shared expert, PLE) keep the 64-row
+// geometry, so the pairs measure the GDN lever only.
+extern "C" __global__ void gemv_fp4_mma_d32(const unsigned char* __restrict__ w,
+                                           const unsigned char* __restrict__ xq,
+                                           const float* __restrict__ gs_ptr,
+                                           float* __restrict__ y,
+                                           const int* __restrict__ k_dim_p,
+                                           const int* __restrict__ rows_p,
+                                           const int* __restrict__ y_stride_p) {
+    int k_dim = *k_dim_p;
+    int bpr = k_dim >> 6;
+    int rows = *rows_p;
+    int ys = *y_stride_p;
+    int tok = blockIdx.y;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int ks_n = blockDim.x >> 6;
+    int rg = warp & 1, ks = warp >> 1;
+    int g = lane >> 2, lt = lane & 3;
+    int w0 = (blockIdx.x << 5) + (rg << 4);
+    bool active = w0 < rows;   // whole-warp guard; no early return (smem barrier below)
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+    int r0 = w0 + g, r1 = w0 + g + 8;
+    if (active) {
+        const unsigned char* xa = xq + (size_t)tok * bpr * 108;
+        const unsigned char* rowg = w + (size_t)min(r0, rows - 1) * bpr * 36;
+        const unsigned char* rowg8 = w + (size_t)min(r1, rows - 1) * bpr * 36;
+        const unsigned char* sfrow = (lt & 1) ? rowg8 : rowg;
+        int bpb = (bpr + ks_n - 1) / ks_n;
+        int b_lo = ks * bpb, b_hi = min(bpr, b_lo + bpb);
+        for (int b = b_lo; b < b_hi; b++) {
+            const unsigned char* blk = rowg + b * 36;
+            const unsigned char* blk8 = rowg8 + b * 36;
+            const unsigned char* ab = xa + b * 36;
+            unsigned int sa = sfrow[b * 36 + 0] | (unsigned int)sfrow[b * 36 + 1] << 8
+                            | (unsigned int)sfrow[b * 36 + 2] << 16 | (unsigned int)sfrow[b * 36 + 3] << 24;
+            unsigned int a0 = *(const unsigned int*)(blk + 4 + 4 * lt);
+            unsigned int a1 = *(const unsigned int*)(blk8 + 4 + 4 * lt);
+            unsigned int a2 = *(const unsigned int*)(blk + 20 + 4 * lt);
+            unsigned int a3 = *(const unsigned int*)(blk8 + 20 + 4 * lt);
+            unsigned int sb = ab[0] | (unsigned int)ab[1] << 8
+                            | (unsigned int)ab[2] << 16 | (unsigned int)ab[3] << 24;
+            unsigned int b0 = *(const unsigned int*)(ab + 4 + 4 * lt);
+            unsigned int b1 = *(const unsigned int*)(ab + 20 + 4 * lt);
+            mma_fp4_16n8k64(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, sa, sb);
+            #pragma unroll
+            for (int lv = 1; lv < 3; lv++) {
+                const unsigned char* ab2 = ab + lv * bpr * 36; // residual level
+                unsigned int sb2 = ab2[0] | (unsigned int)ab2[1] << 8
+                                 | (unsigned int)ab2[2] << 16 | (unsigned int)ab2[3] << 24;
+                unsigned int c0 = *(const unsigned int*)(ab2 + 4 + 4 * lt);
+                unsigned int c1 = *(const unsigned int*)(ab2 + 20 + 4 * lt);
+                mma_fp4_16n8k64(d0, d1, d2, d3, a0, a1, a2, a3, c0, c1, sa, sb2);
+            }
+        }
+    }
+    __shared__ float red[4][2][64];
+    if (lt == 0) { red[ks][0][(rg << 4) + g] = d0; red[ks][1][(rg << 4) + g] = d2; }
+    __syncthreads();
+    float gs = gs_ptr[0];
+    if (ks == 0 && lt == 0 && active) {
+        float s0 = 0.0f, s2 = 0.0f;
+        for (int i = 0; i < ks_n; i++) { s0 += red[i][0][(rg << 4) + g]; s2 += red[i][1][(rg << 4) + g]; }
+        if (r0 < rows) y[(size_t)tok * ys + r0] = s0 * gs;
+        if (r1 < rows) y[(size_t)tok * ys + r1] = s2 * gs;
+    }
+}
+
+// 32-rows-per-block twin of gemv_fp4_mma_g (#62d lever 2): the grouped GDN
+// input-projection launch runs ceil(16480/32) = 515 blocks instead of 258
+// (16480 = 32*515 exactly, so every block is full; the whole-warp guard
+// stays for generality). The per-warp group selection by the warp's own
+// 16-row concat-space base is unchanged, so the two row groups of a block
+// may sit in different groups exactly as in the 64-row form (the 48-row b
+// and a slabs never aligned to blocks). Per-row math BIT-IDENTICAL: same
+// k split (ks_n = blockDim >> 6), same fixed smem reduce, same per-group gs
+// at the store. grid (ceil(total_rows/32), T), block 64*KS (mma_bx32()).
+extern "C" __global__ void gemv_fp4_mma_g32(const unsigned char* __restrict__ w0,
+                                           const unsigned char* __restrict__ w1,
+                                           const unsigned char* __restrict__ w2,
+                                           const unsigned char* __restrict__ w3,
+                                           const float* __restrict__ gs0,
+                                           const float* __restrict__ gs1,
+                                           const float* __restrict__ gs2,
+                                           const float* __restrict__ gs3,
+                                           float* __restrict__ y0,
+                                           float* __restrict__ y1,
+                                           float* __restrict__ y2,
+                                           float* __restrict__ y3,
+                                           const int* __restrict__ nr0_p,
+                                           const int* __restrict__ nr1_p,
+                                           const int* __restrict__ nr2_p,
+                                           const int* __restrict__ nr3_p,
+                                           const unsigned char* __restrict__ xq,
+                                           const int* __restrict__ k_dim_p) {
+    int k_dim = *k_dim_p;
+    int bpr = k_dim >> 6;
+    int nr0 = *nr0_p, nr1 = *nr1_p, nr2 = *nr2_p, nr3 = *nr3_p;
+    int s1 = nr0, s2 = s1 + nr1, s3 = s2 + nr2, total = s3 + nr3;
+    int tok = blockIdx.y;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int ks_n = blockDim.x >> 6;
+    int rg = warp & 1, ks = warp >> 1;
+    int g = lane >> 2, lt = lane & 3;
+    int wr = (blockIdx.x << 5) + (rg << 4);   // this warp's 16-row base, concat row space
+    const unsigned char* w; const float* gsp; float* y; int gstart, grows;
+    if (wr < s1)      { w = w0; gsp = gs0; y = y0; gstart = 0;  grows = nr0; }
+    else if (wr < s2) { w = w1; gsp = gs1; y = y1; gstart = s1; grows = nr1; }
+    else if (wr < s3) { w = w2; gsp = gs2; y = y2; gstart = s2; grows = nr2; }
+    else              { w = w3; gsp = gs3; y = y3; gstart = s3; grows = nr3; }
+    int lr = wr - gstart;     // row base inside the group
+    bool active = wr < total; // whole-warp guard; no early return (smem barrier below)
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+    int r0 = lr + g, r1 = lr + g + 8;
+    if (active) {
+        const unsigned char* xa = xq + (size_t)tok * bpr * 108;
+        const unsigned char* rowg = w + (size_t)min(r0, grows - 1) * bpr * 36;
+        const unsigned char* rowg8 = w + (size_t)min(r1, grows - 1) * bpr * 36;
+        const unsigned char* sfrow = (lt & 1) ? rowg8 : rowg;
+        int bpb = (bpr + ks_n - 1) / ks_n;
+        int b_lo = ks * bpb, b_hi = min(bpr, b_lo + bpb);
+        for (int b = b_lo; b < b_hi; b++) {
+            const unsigned char* blk = rowg + b * 36;
+            const unsigned char* blk8 = rowg8 + b * 36;
+            const unsigned char* ab = xa + b * 36;
+            unsigned int sa = sfrow[b * 36 + 0] | (unsigned int)sfrow[b * 36 + 1] << 8
+                            | (unsigned int)sfrow[b * 36 + 2] << 16 | (unsigned int)sfrow[b * 36 + 3] << 24;
+            unsigned int a0 = *(const unsigned int*)(blk + 4 + 4 * lt);
+            unsigned int a1 = *(const unsigned int*)(blk8 + 4 + 4 * lt);
+            unsigned int a2 = *(const unsigned int*)(blk + 20 + 4 * lt);
+            unsigned int a3 = *(const unsigned int*)(blk8 + 20 + 4 * lt);
+            unsigned int sb = ab[0] | (unsigned int)ab[1] << 8
+                            | (unsigned int)ab[2] << 16 | (unsigned int)ab[3] << 24;
+            unsigned int b0 = *(const unsigned int*)(ab + 4 + 4 * lt);
+            unsigned int b1 = *(const unsigned int*)(ab + 20 + 4 * lt);
+            mma_fp4_16n8k64(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, sa, sb);
+            #pragma unroll
+            for (int lv = 1; lv < 3; lv++) {
+                const unsigned char* ab2 = ab + lv * bpr * 36; // residual level
+                unsigned int sb2 = ab2[0] | (unsigned int)ab2[1] << 8
+                                 | (unsigned int)ab2[2] << 16 | (unsigned int)ab2[3] << 24;
+                unsigned int c0 = *(const unsigned int*)(ab2 + 4 + 4 * lt);
+                unsigned int c1 = *(const unsigned int*)(ab2 + 20 + 4 * lt);
+                mma_fp4_16n8k64(d0, d1, d2, d3, a0, a1, a2, a3, c0, c1, sa, sb2);
+            }
+        }
+    }
+    __shared__ float red[4][2][64];
+    if (lt == 0) { red[ks][0][(rg << 4) + g] = d0; red[ks][1][(rg << 4) + g] = d2; }
+    __syncthreads();
+    if (ks == 0 && lt == 0 && active) {
+        float gs = gsp[0];
+        float s0 = 0.0f, s2 = 0.0f;
+        for (int i = 0; i < ks_n; i++) { s0 += red[i][0][(rg << 4) + g]; s2 += red[i][1][(rg << 4) + g]; }
+        if (r0 < grows) y[(size_t)tok * grows + r0] = s0 * gs;
+        if (r1 < grows) y[(size_t)tok * grows + r1] = s2 * gs;
+    }
+}
+
 // same as gemv_fp4_b but with an EXPLICIT y row stride — used for the shared
 // expert's gate|up pair writing into ONE [t][1280] buffer (p13 layout, the
 // contract silu_mul640 reads). The plain gemv_fp4_b keeps the [t][rows]
@@ -3780,7 +3948,7 @@ impl Kernels {
             "ple_state_update", "ple_conv_step", "argmax_k", "sample_topk_part", "sample_k", "add_flat",
             "gemv_bf16_b", "gemv_bf16_w", "gemv_fp4_b1k", "hc_down_inj", "gemv_bf16_ws",
             "gemm_fp4_dense", "gemm_bf16_dense", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
-            "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "gemv_fp4_mma_dg", "sh_gate_up_q", "gemv_fp4_mma_g", "attn_sel_r", "attn_sel_d8", "attn_sel_d9", "attn_sel_s", "attn_sel_s8", "attn_sel_s8l", "attn_sel_g",
+            "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "gemv_fp4_mma_dg", "sh_gate_up_q", "gemv_fp4_mma_g", "gemv_fp4_mma_d32", "gemv_fp4_mma_g32", "attn_sel_r", "attn_sel_d8", "attn_sel_d9", "attn_sel_s", "attn_sel_s8", "attn_sel_s8l", "attn_sel_g",
         ];
         let mut map = HashMap::new();
         for n in names {
