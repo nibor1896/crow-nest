@@ -296,14 +296,16 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 - The decode operating point that decided the trickle issue default: #63c, 2026-09-12.
 - The decode operating point that decided the QSA selection default: #61b, 2026-09-12.
 - The decode operating point that decided the split-count flip: #61d, 2026-09-13, ROLLED BACK by #61e the same day under the improvement-loop quality rule (the ten-task quality bar was not held at 32); #61b is again the split-count default of record.
+- The decode operating point that decided the combined fusion default: #19g, 2026-09-13 (the #19f hc-chain fusion and the #62b grouped GDN input projections both default).
 - Every row of this table is one adjacent pair of one chain; the two crow-nest columns are the two arms of that pair.
 - The two arms run different weights: crow-nest CNQ4.5-M (NVFP4, 4.5 bpw); llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL (GGUF, 2.4 bpw).
 - A tok/s figure is quoted only next to its adjacent arm in the same chain (#38).
 
 | shape metric | crow-nest, engine default | crow-nest, the named fallback | llama.cpp | machine | date | source |
 |---|---|---|---|---|---|---|
+| decode, t1-read 16,064 ids, 255 timed steps, the #19/#62 combined default pair (#19g): hc chain fused + GDN input projections grouped, both default with no env | 22.80 ms per token = 43.9 tok/s | 23.94 ms per token = 41.8 tok/s, the previous default (61b arm of record; the same-chain double fallback `CROW_QFUSE=0 CROW_GDN_FUSE_IN=0` measured 26.86 ms = 37.2 tok/s, but that arm also runs the NVFP4 cascade in its separate-launch form — the documented `CROW_QFUSE` overload makes it an artifact, not the previous default) | 22.27 ms per token = 44.9 tok/s | RTX 5090 | crow-nest 2026-09-13, llama.cpp 2026-09-11 | `decode_out/srv-19g.log`, `decode_out/srv-59b.log` |
 | decode, t1-read 16,064 ids, 255 timed steps, the #61d split-count pair (the flip ROLLED BACK by #61e after the quality verdict; measurement of record for the knob) | 22.85 ms per token = 43.8 tok/s | 24.13 ms per token = 41.4 tok/s with `CROW_ATTN_SPLITS=8` | 22.27 ms per token = 44.9 tok/s | RTX 5090 | crow-nest 2026-09-13, llama.cpp 2026-09-11 | `decode_out/srv-61d.log`, `decode_out/srv-59b.log` |
-| decode, t1-read 16,064 ids, 255 timed steps, the #61b QSA selection pair (the engine default of record again since #61e) | 23.94 ms per token = 41.8 tok/s | 24.87 ms per token = 40.2 tok/s with `CROW_QSA_PAR=0` | 22.27 ms per token = 44.9 tok/s | RTX 5090 | crow-nest 2026-09-12, llama.cpp 2026-09-11 | `decode_out/srv-61b.log`, `decode_out/srv-59b.log` |
+| decode, t1-read 16,064 ids, 255 timed steps, the #61b QSA selection pair (the engine default of record from #61b until #19g; the QSA and split parts of it are unchanged) | 23.94 ms per token = 41.8 tok/s | 24.87 ms per token = 40.2 tok/s with `CROW_QSA_PAR=0` | 22.27 ms per token = 44.9 tok/s | RTX 5090 | crow-nest 2026-09-12, llama.cpp 2026-09-11 | `decode_out/srv-61b.log`, `decode_out/srv-59b.log` |
 | decode, t1-read 16,064 ids, 255 timed steps, the #63c trickle pair (the engine default before #61b) | 24.78 ms per token = 40.3 tok/s | 26.41 ms per token = 37.9 tok/s with `CROW_TRICKLE_DEFER=0` | 22.27 ms per token = 44.9 tok/s | RTX 5090 | crow-nest 2026-09-12, llama.cpp 2026-09-11 | `decode_out/srv-63c.log`, `decode_out/srv-59b.log` |
 | decode, same shape, the #19d staging pair (K40 against B, `task-19d-report.md`), both arms on the eager trickle of that day | 26.46 ms per token = 37.8 tok/s | 29.68 ms per token = 33.7 tok/s with `CROW_STAGE_KERNEL=1` | 22.27 ms per token = 44.9 tok/s | RTX 5090 | 2026-09-11 | `decode_out/srv-19d.log`, `decode_out/srv-59b.log` |
 | staging row of that step, nsys, 338 MB per token | 7.07 ms per token at 47.78 GB/s | 10.42 ms per token at 32.45 GB/s with `CROW_STAGE_KERNEL=1` | n/a | RTX 5090 | 2026-09-11 | `decode_out/srv-19d.log` |
@@ -345,24 +347,28 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
    the graph.
 2. **Dense paths**: hidden 2560 ↔ residual stream 10240 (hyper-connections), attention
    QKVO, GDN projections (`in_proj_qkvz`, `out_proj`), `conv1d`, PLE gather + conv.
-   - hyper-connection decode chain, opt-in fused since #19f (2026-09-13): `CROW_QFUSE=1`
-     replaces the eight launches of one hc block (`rms_group`, down `gemv_bf16_w`,
+   - hyper-connection decode chain, DEFAULT fused since #19g (2026-09-13; the 19f
+     fusion of 2026-09-13 behind the flip): with `CROW_QFUSE` unset the eight launches
+     of one hc block (`rms_group`, down `gemv_bf16_w`,
      `silu_div4`, up `gemv_bf16_w`, `sigmoid_el`, `mix_streams_q`, `gemv_fp4_b1k`,
-     `sig2_div4`) with FOUR: `rms_group`, `hc_down_inj` (down GEMV + `silu_div4` + the
+     `sig2_div4`) run as FOUR: `rms_group`, `hc_down_inj` (down GEMV + `silu_div4` + the
      4-row inject GEMV + `sig2_div4` in one launch — the `gemv_fp4_b1k` 1024-slot reduce
      emulated bit for bit on 256 threads, 44 blocks x T), `gemv_bf16_ws` (up GEMV storing
      the `sigmoid_el` epilogue) and `mix_streams_q`; `head_run` fuses the same epilogues
-     (no inject rows). Launch sites `gen.rs:1661` / `gen.rs:2695` behind `hc_fuse_on()`,
+     (no inject rows). Launch sites `gen.rs:1676` / `gen.rs:2710` behind `hc_fuse_on()`,
      decode `t < 8` only — prefill keeps the `gemm_bf16_dense` path verbatim; one `[hc]`
-     boot line names the form (`gen.rs:758`); unset keeps the default of record. The
-     variable is shared with the NVFP4 cascade switch (documented debt, `docs/env.md`).
+     boot line names the form (`gen.rs:759`). `CROW_QFUSE=0` selects the unfused 8-launch
+     fallback of record (and takes the NVFP4 cascade to its separate-launch path — the
+     documented overload of `docs/env.md`; cascade on + unfused is no longer reachable).
    - bit identity: by construction (every epilogue is elementwise on the finished
      accumulator, the merged grid keeps each row's dot product unchanged) and measured:
-     with the switch ON the P8FUSE (504 teacher-forced rows) and PXFUSE (16,056 rows)
-     forms are byte-identical to the reference `d211ab52ad2b`, the six switch-OFF parity
-     gates reproduce the 61b sha256 values of record (which is simultaneously the
-     #61e-revert proof), and the ten-task default configuration holds 10 of 10
-     (`decode_out/srv-19f.log`).
+     the 19f switch-ON P8FUSE (504 teacher-forced rows) and PXFUSE (16,056 rows) forms
+     are byte-identical to the reference `d211ab52ad2b` and the 19f switch-OFF gates
+     reproduced the 61b sha256 values of record (`decode_out/srv-19f.log`); the #19g
+     COMBINED default pass ran BOTH fused levers at once with no env — six short forms
+     plus the 16,056-row PXBOTH form byte-identical with the 61b sha256 values of
+     record, the double-fallback 8 rows identical, ten tasks 10 of 10 equal BOTH
+     splits-8 records (`decode_out/srv-19g.log`).
 3. **Router**: BF16 GEMM 2560 × 512 (kept BF16 per section 1).
 4. **Attention** (12 layers): 24 heads × head_dim 256, GQA 2 KV heads, partial rotary
    0.25, mrope interleaved [11,11,10] — compute stays BF16/FP8 (flash-attention style);
@@ -371,20 +377,25 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 5. **GDN** (36 layers): gated delta-net with sigmoid output gate — recurrent/chunked
    custom kernel family; reading templates: mistral.rs `qwen3_next.rs`, the transformers
    reference (oracle-side). SSM state f32.
-   - decode input projections, opt-in grouped since #62b (2026-09-13): `CROW_GDN_FUSE_IN=1`
-     replaces the four per-slab `gemv_fp4_mma_d` launches of the decode step (qkv 10240 +
-     z 6144 + b 48 + a 48 rows, all k 2560, one shared quantized row) with ONE grouped
+   - decode input projections, DEFAULT grouped since #19g (2026-09-13; the 62b grouped
+     form of 2026-09-13 behind the flip): with `CROW_GDN_FUSE_IN` unset the decode step
+     runs the four input projections (qkv 10240 +
+     z 6144 + b 48 + a 48 rows, all k 2560, one shared quantized row) as ONE grouped
      `gemv_fp4_mma_g` launch (`kernels.rs:555`, 258 blocks, per-slab global scales kept,
-     launch site `gen.rs:1737` behind `gdn_fuse_in_on()`, capture-time only, one `[gdn]`
-     boot line names the form); unset keeps the default of record.
-   - bit identity proven at logit level, not only by construction: with the switch ON the
-     P8FUSE (504 rows) and PXFUSE (16,056 rows) teacher-forced decode forms are
-     byte-identical to the four-launch path, switch-OFF parity is 8 of 8 against the
-     pre-switch binary `d211ab52ad2b`, and the ten-task splits-32 baseline holds 10 of 10
-     (`decode_out/srv-62b.log`, RTX 5090); adjacent pairs put the grouped form at
-     -0.33 ms per token in the two clean pairs of three (arm means 22.1704 vs 22.2627,
-     mean -0.0923 ms, the third pair reversed by a 0.7 ms B outlier against an N spread
-     17x tighter), opt-in, any default flip is robin's call.
+     launch site `gen.rs:1805` behind `gdn_fuse_in_on()`, capture-time only, one `[gdn]`
+     boot line names the form); `CROW_GDN_FUSE_IN=0` selects the four per-slab
+     `gemv_fp4_mma_d` launches, the fallback of record.
+   - bit identity proven at logit level, not only by construction: the 62b switch-ON
+     P8FUSE (504 rows) and PXFUSE (16,056 rows) teacher-forced decode forms were
+     byte-identical to the four-launch path and the 62b switch-OFF parity was 8 of 8
+     against the pre-switch binary `d211ab52ad2b` (`decode_out/srv-62b.log`, RTX 5090);
+     the #19g COMBINED default pass ran BOTH fused levers at once with no env — six
+     short forms plus the 16,056-row PXBOTH form byte-identical with the 61b sha256
+     values of record, the double-fallback 8 rows identical, ten tasks 10 of 10 equal
+     BOTH splits-8 records (`decode_out/srv-19g.log`); the 62b opt-in pairs put the
+     grouped form at -0.33 ms per token in the two clean pairs of three (arm means
+     22.1704 vs 22.2627, the third pair reversed by a 0.7 ms B outlier against an N
+     spread 17x tighter).
 
 **Decode attention path, per layer (12 attention layers):**
 
