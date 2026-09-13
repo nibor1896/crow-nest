@@ -4,8 +4,8 @@
 
 | Item | Value |
 |---|---|
-| Variables in this table | 73 |
-| Distinct `CROW_[A-Z0-9_]+` tokens in the code | 73 in `engine/src`, 0 in `converter/src` |
+| Variables in this table | 74 |
+| Distinct `CROW_[A-Z0-9_]+` tokens in the code | 74 in `engine/src`, 0 in `converter/src` |
 | Measured | 2026-09-10, task E5, issue #46, parent #1 |
 | Repository state | branch `release-v0.1`, HEAD `0d1cc0d` plus the `#61d` commit, 2026-09-13 |
 | Guard | `tools/check_env_docs.py` (code list minus doc list must be empty, both ways) |
@@ -87,7 +87,7 @@ Helpers used by the read sites:
 | `CROW_STAGE_KERNEL` | `engine/src/gen.rs:542` | `1` selects the old `stage_cold`; unset or any other value selects `stage_cold_ca`; default `2` | shape of the decode staging copy: `stage_cold_ca` is a persistent grid that pulls each cold combo through `cp.async.cg.shared.global` into 4 KB shared tiles and stores them coalesced to VRAM; the kernel has NO tail tile, so it requires both staged slab byte counts to be exact multiples of 4096, asserted at load (`engine/src/gen.rs:683`) and again at the launch site (`engine/src/gen.rs:2048`), both panic messages naming this switch | operating | default `2` since 2026-09-12 (#19e); measured 2026-09-11 on the #59 profile arm (t1-read 16,064 ids, 255 timed steps, RTX 5090): 26.46 ms per decode token against 29.68 for `stage_cold`, staging row 7.07 ms at 47.78 GB/s against 10.42 ms at 32.45 GB/s (`decode_out/srv-19d.log`); every engine process names its kernel in one `[stage]` line (`engine/src/gen.rs:697`) |
 | `CROW_STAGE_BLOCKS` | `engine/src/gen.rs:552` | integer, accepted `8` to `512`, other values fall back; default `40` | blocks of the persistent `stage_cold_ca` grid (block 256) | operating | default `40` since 2026-09-12 (#19e), read whenever `stage_cold_ca` runs, which is every run without `CROW_STAGE_KERNEL=1`; 19d measured 2026-09-11: 40 and 80 tied inside their own spreads, 20 worse by 0.1532 ms per decode token |
 
-## Attention and kernels (15 rows)
+## Attention and kernels (16 rows)
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
@@ -99,6 +99,7 @@ Helpers used by the read sites:
 | `CROW_BF16_W` | `engine/src/gen.rs:1142` | `0` selects `gemv_bf16_b` / `gemv_bf16`; default on | selects `gemv_bf16_w` (8 rows per block) for bf16 GEMVs and the LM head | operating | step-2 kernel switch; LM head site `gen.rs:2408` |
 | `CROW_DENSE_GEMM` | `engine/src/gen.rs:1118` | `0` selects the per-token MMA GEMV; default on | 8-token tile GEMM for dense FP4 projections at `t >= 8` | operating | reached only when `CROW_MMA=1` (`launch_mma_d`) |
 | `CROW_GDN_REG` | `engine/src/gen.rs:475` | `0` off, `p` prefill scan only, `s` decode step only, anything else both; default both | register delta-rule scan instead of the global-memory scan | operating | `0` is the bit-identical fallback per `gen.rs:470` |
+| `CROW_GDN_FUSE_IN` | `engine/src/gen.rs:1274` | `1` selects the grouped form; unset or any other value keeps the four per-slab launches; default OFF, opt-in (no flip decided) | GDN decode input projections as ONE `gemv_fp4_mma_g` launch (`kernels.rs:555`, registered `kernels.rs:3479`): the qkv 10240 + z 6144 + b 48 + a 48 rows of `gdn_step` in one grouped launch, 258 blocks x `mma_bx()`, one shared quantized row `xq_m`, per-slab global scales KEPT, launch site `gen.rs:1737` behind `gdn_fuse_in_on()` (else the four `gemv_fp4_mma_d` launches of record); capture-time only, the decode graph records the branch once per process, `CROW_GRAPH=0` takes the same branch per launch; one `[gdn]` boot line per process names the form it runs (`gen.rs:749`) | measurement | #62B, 2026-09-13, OPT-IN: bit identity proven at logit level, P8FUSE (504 teacher-forced rows) and PXFUSE (16,056 rows) byte-identical with the switch ON against fresh reference runs, switch-OFF parity 8 of 8 against `d211ab52ad2b`, ten-task splits-32 baseline 10 of 10 equal (`decode_out/srv-62b.log`, RTX 5090); adjacent pairs (t1-read 16,064 ids, 255 timed steps, ids `c65969f7793a` in 7 of 7 runs): N 22.1704 vs B 22.2627 ms per token, mean -0.0923 ms = -0.41 percent, the two clean pairs -0.33 ms against a B spread of 0.7544 ms (the B3 outlier) and an N spread of 0.0437 ms, below the 62a estimate of 0.45 to 0.60 ms because graph replay already hides part of the gx=1 launch tail; any default flip is robin's call |
 | `CROW_GRAPH` | `engine/src/gen.rs:1103` | `1` enables; default off in the library, `1` in `serve` (`bin/serve.rs:2313`) | captures the per-token kernel sequence once and replays it | operating | fable gate 2026-09-03 (WDDM launch overhead); `serve` sets it only when unset, so `CROW_GRAPH=0` still wins |
 | `CROW_INJ_1K` | `engine/src/gen.rs:1143` | `0` selects `gemv_fp4_b`; default on (`gemv_fp4_b1k`, 1024 threads) | kernel of the block-inject GEMV | operating | `gen.rs:1442-1445`: the MMA tile is about 10x slower here, documented skip |
 | `CROW_MMA` | `engine/src/gen.rs:1091` | `1` enables; default off in the library, `1` in `serve` (`bin/serve.rs:2313`) | tensor-core FP4 paths for routed and dense GEMVs | operating | read once through a `OnceLock`, so `serve` must set it before `cuda::Ctx::init` (`bin/serve.rs:2301-2312`) |

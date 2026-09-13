@@ -353,6 +353,20 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 5. **GDN** (36 layers): gated delta-net with sigmoid output gate — recurrent/chunked
    custom kernel family; reading templates: mistral.rs `qwen3_next.rs`, the transformers
    reference (oracle-side). SSM state f32.
+   - decode input projections, opt-in grouped since #62b (2026-09-13): `CROW_GDN_FUSE_IN=1`
+     replaces the four per-slab `gemv_fp4_mma_d` launches of the decode step (qkv 10240 +
+     z 6144 + b 48 + a 48 rows, all k 2560, one shared quantized row) with ONE grouped
+     `gemv_fp4_mma_g` launch (`kernels.rs:555`, 258 blocks, per-slab global scales kept,
+     launch site `gen.rs:1737` behind `gdn_fuse_in_on()`, capture-time only, one `[gdn]`
+     boot line names the form); unset keeps the default of record.
+   - bit identity proven at logit level, not only by construction: with the switch ON the
+     P8FUSE (504 rows) and PXFUSE (16,056 rows) teacher-forced decode forms are
+     byte-identical to the four-launch path, switch-OFF parity is 8 of 8 against the
+     pre-switch binary `d211ab52ad2b`, and the ten-task splits-32 baseline holds 10 of 10
+     (`decode_out/srv-62b.log`, RTX 5090); adjacent pairs put the grouped form at
+     -0.33 ms per token in the two clean pairs of three (arm means 22.1704 vs 22.2627,
+     mean -0.0923 ms, the third pair reversed by a 0.7 ms B outlier against an N spread
+     17x tighter), opt-in, any default flip is robin's call.
 
 **Decode attention path, per layer (12 attention layers):**
 
