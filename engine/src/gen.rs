@@ -758,7 +758,7 @@ impl Engine {
         let hcf = std::env::var("CROW_QFUSE").unwrap_or_else(|_| "unset".to_string());
         println!("[hc] hyper-connection decode chain {}, shared-expert chain {}, CROW_QFUSE {} (1 = 19f fused hc + 19h fused shared, 0 = all off)",
             if hc_fuse_on() { "fused (default since 19g, 4 launches per hc block)" } else { "unfused (fallback of record, 8 launches)" },
-            if sh_fuse_on() { "fused (19h, 3 launches)" } else { "unfused (default of record, 6 launches)" }, hcf);
+            if sh_fuse_on() { "fused (19h, 3 launches)" } else { "unfused (0 = fallback, 6 launches)" }, hcf);
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
         let max_tiles = cfg.prompt_chunk * TOPK / 8 + E + 1;
         let stage = Stage {
@@ -1243,6 +1243,19 @@ pub fn mma_bx() -> u32 {
     })
 }
 
+/// #62d 32-row GDN GEMV twin block size (`gemv_fp4_mma_d32` / `_g32`):
+/// 64 * KS threads = 2 row groups of 16 rows x KS k slices (mma_bx() =
+/// 128 * KS = 4 row groups x KS). The KS machinery is SHARED (CROW_MMA_KS,
+/// default 4 -> 256 threads) and the default stays 4: the k split and its
+/// fixed smem reduce order are parity critical (62a report lever 2), only
+/// the row groups per block halve and the grid doubles.
+pub fn mma_bx32() -> u32 {
+    static KS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    64 * *KS.get_or_init(|| {
+        std::env::var("CROW_MMA_KS").ok().and_then(|v| v.parse().ok()).filter(|&k| (1..=4).contains(&k)).unwrap_or(4)
+    })
+}
+
 /// step-2 kernel switches (default on; =0 selects the previous kernel)
 fn env_on(name: &str) -> bool {
     std::env::var(name).as_deref() != Ok("0")
@@ -1326,7 +1339,7 @@ fn gdn_fuse_in_on() -> bool {
 /// gemv_fp4_bs fallback keep the separate launches verbatim.
 fn sh_fuse_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CROW_QFUSE").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("CROW_QFUSE").as_deref() != Ok("0"))
 }
 
 /// CROW_ATTN_SPLIT (default on): decode attention as S=8 partials + merge,
@@ -1821,17 +1834,17 @@ launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
                 // launch (qkv 10240 + z 6144 + b 48 + a 48 rows, all k 2560
                 // over the shared xq_m row); per-slab gs kept, per-row math =
                 // gemv_fp4_mma_d bit for bit (62a report lever 1).
-                launch_v(k.f("gemv_fp4_mma_g"), ((GDN_CONV + GDN_VAL + 2 * GDN_VHEADS + 63) / 64) as u32, 1, 1, mma_bx(), &[
+                launch_v(k.f("gemv_fp4_mma_g32"), ((GDN_CONV + GDN_VAL + 2 * GDN_VHEADS + 31) / 32) as u32, 1, 1, mma_bx32(), &[
                     qkv.w as u64, z.w as u64, b.w as u64, a.w as u64,
                     qkv.gs as u64, z.gs as u64, b.gs as u64, a.gs as u64,
                     s.mq as u64, s.gz as u64, s.gb as u64, s.ga as u64,
                     p.n10240 as u64, p.n6144 as u64, p.nr48 as u64, p.nr48 as u64,
                     s.xq_m as u64, p.n2560 as u64]);
             } else {
-                launch_v(k.f("gemv_fp4_mma_d"), (GDN_CONV / 64) as u32, 1, 1, mma_bx(), &[
+                launch_v(k.f("gemv_fp4_mma_d32"), ((GDN_CONV + 31) / 32) as u32, 1, 1, mma_bx32(), &[
                     qkv.w as u64, s.xq_m as u64, qkv.gs as u64, s.mq as u64,
                     p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
-                launch_v(k.f("gemv_fp4_mma_d"), (GDN_VAL / 64) as u32, 1, 1, mma_bx(), &[
+                launch_v(k.f("gemv_fp4_mma_d32"), ((GDN_VAL + 31) / 32) as u32, 1, 1, mma_bx32(), &[
                     z.w as u64, s.xq_m as u64, z.gs as u64, s.gz as u64,
                     p.n2560 as u64, p.n6144 as u64, p.n6144 as u64]);
                 launch_v(k.f("gemv_fp4_mma_d"), 1, 1, 1, mma_bx(), &[
@@ -1871,7 +1884,7 @@ launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
         if dense_mma_on() {
             if !qfuse_on() { launch_v(k.f("quant_x_fp4"), 1, 1, 1, 128, &[
                 s.gnorm as u64, s.xq_v as u64, p.n6144 as u64, p.one as u64, p.n6144 as u64]); }
-            launch_v(k.f("gemv_fp4_mma_d"), (H / 64) as u32, 1, 1, mma_bx(), &[
+            launch_v(k.f("gemv_fp4_mma_d32"), ((H + 31) / 32) as u32, 1, 1, mma_bx32(), &[
                 out.w as u64, s.xq_v as u64, out.gs as u64, s.gout as u64,
                 p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
         } else {
