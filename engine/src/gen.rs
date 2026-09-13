@@ -344,6 +344,14 @@ pub struct Scratch {
     pub argmax: Dev,   // [1] i32
     pub mixed_final: Dev, // [C][2560]
     pub scratch_gn: Dev, // elementwise n scratch
+    // #10b (2026-09-13): the two diet regions. The fields above point INTO
+    // these two allocations (the persist region, the union region); like
+    // every scratch field they live for the whole process (Engine::drop
+    // frees none of them), the pair is bookkeeping for the boot log.
+    pub persist_region: Dev,
+    pub union_region: Dev,
+    pub persist_bytes: usize,
+    pub union_bytes: usize,
 }
 
 pub struct Engine {
@@ -789,6 +797,11 @@ impl Engine {
         }
         let scratch_measured = cuda::total_vram_bytes() - cuda::free_vram_bytes() - dense_measured;
         log(&format!("scratch + staging resident: {:.0} MiB (chunk {})", scratch_measured as f64 / (1 << 20) as f64, cfg.prompt_chunk));
+        // #10b: ONE line per process names the diet regions, so every future
+        // log says which scratch layout produced it (next to the measured
+        // total above, the union is the largest of the five phase sets).
+        log(&format!("[diet] scratch persist region {:.0} MiB + union region {:.0} MiB (largest of the hc/attn/gdn/ple/moe phase sets), CROW_CHUNK {}",
+            s.persist_bytes as f64 / (1 << 20) as f64, s.union_bytes as f64 / (1 << 20) as f64, cfg.prompt_chunk));
 
         // ---- budget verify + states (#9) ----
         // dense + PLE row cache + scratch + staging are all resident already
@@ -1562,97 +1575,192 @@ impl Params {
 }
 
 impl Scratch {
+    /// #10b (2026-09-13): per-chunk scratch diet. Every per-chunk buffer was
+    /// audited and classified by liveness (the full table lives in
+    /// task-10b-report.md); the layout becomes two regions instead of one
+    /// allocation per buffer:
+    /// - PERSIST: live across the layer body: the residual stream h, the
+    ///   mid residual x1, the two HC mix outputs mixed/mixed_m, moe_out,
+    ///   the two quantized HC inputs xq_m/xq_gu (written by hc_run, read by
+    ///   the sub body / moe_run), xq_v (both sub paths quantize into it),
+    ///   injr/injw (consumed by both inject_residual calls), mixed_final
+    ///   (the head input).
+    /// - UNION: five phase sets that never overlap on the compute stream,
+    ///   one region sized to the largest set:
+    ///   - hc temps (normed mixw low sil): live inside hc_run and head_run
+    ///   - attention temps: live inside attn_prompt/attn_step only
+    ///   - GDN temps: live inside gdn_prompt/gdn_step only
+    ///   - PLE temps: live inside ple_run/ple_step_kernels only, at the top
+    ///     of the PLE_LAYER body before that layer's first hc_run
+    ///   - MoE temps: live inside moe_run only, after the sub output was
+    ///     consumed by inject_residual
+    /// A layer body orders hc -> sub -> inject -> hc -> moe -> inject on one
+    /// stream, the head runs after the last moe, and the PLE run sits
+    /// between two layer bodies, so a set's last read precedes the next
+    /// set's first write. The decode step keeps the same order per layer
+    /// and the captured decode graph bakes the same static pointers.
+    /// Bit identity: no kernel, no launch shape and no size changes, only
+    /// overlapping 256 B aligned base addresses; the grids do NOT re-shape,
+    /// and the #10b parity forms prove the identity anyway.
+    /// Effect: per-token scratch drops from 1.23 MiB to about 0.42 MiB,
+    /// which lifts the F52 planner wall at chunk 4096 without touching the
+    /// 46.5 GiB host pinned budget (robin's standing no) and funds the
+    /// second chunk's activation scratch for the two-chunk wavefront.
     pub unsafe fn alloc(chunk: usize) -> Scratch {
         let c = chunk;
         let cap_blocks = 65536usize; // pooled/score cap at the 262k ceiling
-        let d = |n: usize| cuda::alloc_zeroed(n * 4);
-        let db = |n: usize| cuda::alloc_zeroed(n);
+        // (name, bytes) sets; the byte counts are EXACTLY the old per-buffer
+        // d()/db() calls (d = n*4 for the f32/i32 buffers, db = n for the
+        // byte buffers), so every buffer keeps its old shape.
+        let persist_set: &[(&str, usize)] = &[
+            ("h", 4 * c * HCT),
+            ("x1", 4 * c * HCT),
+            ("mixed", 4 * c * H),
+            ("mixed_m", 4 * c * H),
+            ("moe_out", 4 * c * H),
+            ("xq_m", c * 3 * (H / 64) * 36),
+            ("xq_gu", c * 3 * (H / 64) * 36),
+            ("xq_v", c * 3 * (GDN_VAL / 64) * 36),
+            ("injr", 4 * c * HCN),
+            ("injw", 4 * c * HCN),
+            ("mixed_final", 4 * c * H),
+        ];
+        let hc_set: &[(&str, usize)] = &[
+            ("normed", 4 * c * HCT),
+            ("mixw", 4 * c * HCT),
+            ("low", 4 * c * LOWRANK),
+            ("sil", 4 * c * LOWRANK),
+        ];
+        let attn_set: &[(&str, usize)] = &[
+            ("qg", 4 * c * Q_ROWS),
+            ("aq", 4 * c * CORE),
+            ("agate", 4 * c * CORE),
+            ("aqn", 4 * c * CORE),
+            ("aqr", 4 * c * CORE),
+            ("ak", 4 * c * KV_ROWS),
+            ("akn", 4 * c * KV_ROWS),
+            ("akr", 4 * c * KV_ROWS),
+            ("av", 4 * c * KV_ROWS),
+            ("aout", 4 * c * CORE),
+            ("agated", 4 * c * CORE),
+            ("ay", 4 * c * H),
+            ("qk", 4 * c * QSA_QK_ROWS),
+            ("q_nrm", 4 * c * QSA_HEADS * QSA_HD),
+            ("q_rot", 4 * c * QSA_HEADS * QSA_HD),
+            ("sel", c * QSA_SEL_MAX * 4),
+            ("sel_n", c * 4),
+        ];
+        let gdn_set: &[(&str, usize)] = &[
+            ("mq", 4 * c * GDN_CONV),
+            ("mq_t", 4 * GDN_CONV * c),
+            ("cout_t", 4 * GDN_CONV * c),
+            ("gq", 4 * c * GDN_KEY),
+            ("gk", 4 * c * GDN_KEY),
+            ("gv", 4 * c * GDN_VAL),
+            ("gz", 4 * c * GDN_VAL),
+            ("gb", 4 * c * GDN_VHEADS),
+            ("ga", 4 * c * GDN_VHEADS),
+            ("gbeta", 4 * c * GDN_VHEADS),
+            ("gg", 4 * c * GDN_VHEADS),
+            ("gqr", 4 * c * GDN_VAL),
+            ("gkr", 4 * c * GDN_VAL),
+            ("gcore", 4 * c * GDN_VAL),
+            ("gnorm", 4 * c * GDN_VAL),
+            ("gout", 4 * c * H),
+        ];
+        let ple_set: &[(&str, usize)] = &[
+            ("emb", 4 * c * PLE_EMBED),
+            ("ple_key", 4 * c * HCT),
+            ("ple_kn", 4 * c * HCT),
+            ("ple_val", 4 * c * PLE_EMBED),
+            ("ple_qn", 4 * c * HCT),
+            ("ple_gate", 4 * c * HCN),
+            ("ple_gs", 4 * c * HCN),
+            ("ple_gated", 4 * c * HCT),
+            ("ple_gn", 4 * c * HCT),
+            ("ple_out", 4 * c * HCT),
+            ("ple_slots", c * PLE_NHEADS * 4),
+            ("xq_e", c * 3 * (H / 64) * 36),
+        ];
+        let moe_set: &[(&str, usize)] = &[
+            ("h1", 4 * c * TOPK * 2 * INTER),
+            ("h2", 4 * c * TOPK * INTER),
+            ("eo", 4 * c * TOPK * H),
+            ("xq_dn", c * TOPK * 3 * (INTER / 64) * 36),
+            ("xq_s", c * 3 * (INTER / 64) * 36),
+            ("sh12", 4 * c * 2 * INTER),
+            ("sh2", 4 * c * INTER),
+            ("sdown", 4 * c * H),
+            ("sgv", 4 * c),
+            ("rlog", 4 * c * E),
+            ("rids", c * TOPK * 4),
+            ("rwts", 4 * c * TOPK),
+            ("gu_ptrs", c * TOPK * 8),
+            ("dn_ptrs", c * TOPK * 8),
+            ("cold", c * 4),
+        ];
+        let region_bytes = |set: &[(&str, usize)]| -> usize {
+            set.iter().map(|&(_, n)| (n + 255) & !255).sum()
+        };
+        let union_bytes = [hc_set, attn_set, gdn_set, ple_set, moe_set]
+            .iter().map(|&set| region_bytes(set)).max().unwrap();
+        let persist_bytes = region_bytes(persist_set);
+        // lay one set out from base at 256 B alignment, return the pointers
+        let alloc_set = |base: Dev, set: &[(&str, usize)]| -> Vec<Dev> {
+            let mut off = 0usize;
+            set.iter().map(|&(_, n)| {
+                let p = base + off as Dev;
+                off += (n + 255) & !255;
+                p
+            }).collect()
+        };
+        let persist_region = cuda::alloc_zeroed(persist_bytes);
+        let union_region = cuda::alloc_zeroed(union_bytes);
+        let pe = alloc_set(persist_region, persist_set);
+        let hc = alloc_set(union_region, hc_set);
+        let at = alloc_set(union_region, attn_set);
+        let gd = alloc_set(union_region, gdn_set);
+        let pl = alloc_set(union_region, ple_set);
+        let mo = alloc_set(union_region, moe_set);
         Scratch {
-            h: d(c * HCT),
-            emb: d(c * PLE_EMBED),
-            mixed: d(c * H),
-            low: d(c * LOWRANK),
-            sil: d(c * LOWRANK),
-            mixw: d(c * HCT),
-            normed: d(c * HCT),
-            injr: d(c * HCN),
-            injw: d(c * HCN),
-            x1: d(c * HCT),
-            mixed_m: d(c * H),
-            moe_out: d(c * H),
-            h1: d(c * TOPK * 2 * INTER),
-            h2: d(c * TOPK * INTER),
-            eo: d(c * TOPK * H),
-            xq_gu: db(c * 3 * (H / 64) * 36),
-            xq_dn: db(c * TOPK * 3 * (INTER / 64) * 36),
-            xq_m: db(c * 3 * (H / 64) * 36),
-            xq_v: db(c * 3 * (GDN_VAL / 64) * 36),
-            xq_s: db(c * 3 * (INTER / 64) * 36),
-            xq_e: db(c * 3 * (H / 64) * 36),
-            sdown: d(c * H),
-            sh12: d(c * 2 * INTER),
-            sh2: d(c * INTER),
-            sgv: d(c),
-            rlog: d(c * E),
-            rids: db(c * TOPK * 4),
-            rwts: d(c * TOPK),
-            gu_ptrs: db(c * TOPK * 8),
-            dn_ptrs: db(c * TOPK * 8),
-            cold: db(c * 4),
-            mq: d(c * GDN_CONV),
-            mq_t: d(GDN_CONV * c),
-            cout_t: d(GDN_CONV * c),
-            gq: d(c * GDN_KEY),
-            gk: d(c * GDN_KEY),
-            gv: d(c * GDN_VAL),
-            gz: d(c * GDN_VAL),
-            gb: d(c * GDN_VHEADS),
-            ga: d(c * GDN_VHEADS),
-            gbeta: d(c * GDN_VHEADS),
-            gg: d(c * GDN_VHEADS),
-            gqr: d(c * GDN_VAL),
-            gkr: d(c * GDN_VAL),
-            gcore: d(c * GDN_VAL),
-            gnorm: d(c * GDN_VAL),
-            gout: d(c * H),
-            qg: d(c * Q_ROWS),
-            aq: d(c * CORE),
-            agate: d(c * CORE),
-            aqn: d(c * CORE),
-            aqr: d(c * CORE),
-            ak: d(c * KV_ROWS),
-            akn: d(c * KV_ROWS),
-            akr: d(c * KV_ROWS),
-            av: d(c * KV_ROWS),
-            aout: d(c * CORE),
-            agated: d(c * CORE),
-            ay: d(c * H),
-            qk: d(c * QSA_QK_ROWS),
-            q_nrm: d(c * QSA_HEADS * QSA_HD),
-            q_rot: d(c * QSA_HEADS * QSA_HD),
-            pool_raw: d(cap_blocks * QSA_HID),
-            pool_nrm: d(cap_blocks * QSA_HID),
-            pool_rot: d(cap_blocks * QSA_HID),
-            scores: d(attn_sb(c) * cap_blocks), // #16: [ATTN_SB][cap] when sub-batched
-            sel: db(c * QSA_SEL_MAX * 4),
-            sel_n: db(c * 4),
-            ple_key: d(c * HCT),
-            ple_kn: d(c * HCT),
-            ple_val: d(c * PLE_EMBED),
-            ple_qn: d(c * HCT),
-            ple_gate: d(c * HCN),
-            ple_gs: d(c * HCN),
-            ple_gated: d(c * HCT),
-            ple_gn: d(c * HCT),
-            ple_out: d(c * HCT),
-            ple_slots: db(c * PLE_NHEADS * 4),
-            part_o: d(NQ * ATTN_SPLITS_MAX * AHD),  // #61a: sized for CROW_ATTN_SPLITS=32
-            part_ml: d(NQ * ATTN_SPLITS_MAX * 2),   // #61a: sized for CROW_ATTN_SPLITS=32
-            qsa_h1: db(QSA_PAR_BINS * 4),           // #61a: CROW_QSA_PAR histogram, zero between calls
-            logits: d(V), // one row: lm_head_row always writes the base row (was c*V = 508 MB at C=512)
-            argmax: db(4),
-            mixed_final: d(c * H),
-            scratch_gn: d(1),
+            // persist
+            h: pe[0], x1: pe[1], mixed: pe[2], mixed_m: pe[3], moe_out: pe[4],
+            xq_m: pe[5], xq_gu: pe[6], xq_v: pe[7], injr: pe[8], injw: pe[9],
+            mixed_final: pe[10],
+            // hc/head temps (union)
+            normed: hc[0], mixw: hc[1], low: hc[2], sil: hc[3],
+            // attention temps (union)
+            qg: at[0], aq: at[1], agate: at[2], aqn: at[3], aqr: at[4],
+            ak: at[5], akn: at[6], akr: at[7], av: at[8], aout: at[9],
+            agated: at[10], ay: at[11], qk: at[12], q_nrm: at[13], q_rot: at[14],
+            sel: at[15], sel_n: at[16],
+            // gdn temps (union)
+            mq: gd[0], mq_t: gd[1], cout_t: gd[2], gq: gd[3], gk: gd[4],
+            gv: gd[5], gz: gd[6], gb: gd[7], ga: gd[8], gbeta: gd[9], gg: gd[10],
+            gqr: gd[11], gkr: gd[12], gcore: gd[13], gnorm: gd[14], gout: gd[15],
+            // ple temps (union)
+            emb: pl[0], ple_key: pl[1], ple_kn: pl[2], ple_val: pl[3], ple_qn: pl[4],
+            ple_gate: pl[5], ple_gs: pl[6], ple_gated: pl[7], ple_gn: pl[8],
+            ple_out: pl[9], ple_slots: pl[10], xq_e: pl[11],
+            // moe temps (union)
+            h1: mo[0], h2: mo[1], eo: mo[2], xq_dn: mo[3], xq_s: mo[4],
+            sh12: mo[5], sh2: mo[6], sdown: mo[7], sgv: mo[8], rlog: mo[9],
+            rids: mo[10], rwts: mo[11], gu_ptrs: mo[12], dn_ptrs: mo[13], cold: mo[14],
+            // fixed size, never chunk scaled (the #16 caps)
+            pool_raw: cuda::alloc_zeroed(cap_blocks * QSA_HID),
+            pool_nrm: cuda::alloc_zeroed(cap_blocks * QSA_HID),
+            pool_rot: cuda::alloc_zeroed(cap_blocks * QSA_HID),
+            scores: cuda::alloc_zeroed(attn_sb(c) * cap_blocks * 4),
+            part_o: cuda::alloc_zeroed(NQ * ATTN_SPLITS_MAX * AHD * 4),
+            part_ml: cuda::alloc_zeroed(NQ * ATTN_SPLITS_MAX * 2 * 4),
+            qsa_h1: cuda::alloc_zeroed(QSA_PAR_BINS * 4),
+            logits: cuda::alloc_zeroed(V * 4),
+            argmax: cuda::alloc_zeroed(4),
+            scratch_gn: cuda::alloc_zeroed(4),
+            persist_region,
+            union_region,
+            persist_bytes,
+            union_bytes,
         }
     }
 }
@@ -4017,90 +4125,21 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         unsafe { cuda::drop_dbg("before Scratch"); }
         unsafe {
-            for f in [&mut self.h,
+            // #10b: the fields point INTO the two diet regions, so the drop
+            // frees the two region bases and not the interior pointers (the
+            // per-field walk here freed interior addresses and failed with
+            // CUDA_ERROR_INVALID_VALUE, caught by the #10b smoke).
+            cuda::free_dev(&mut self.persist_region);
+            cuda::free_dev(&mut self.union_region);
+            for f in [&mut self.pool_raw,
+                      &mut self.pool_nrm,
+                      &mut self.pool_rot, // the fixed pools keep their own allocations
                       &mut self.part_o, // #18: the two attention-split partials were never freed
                       &mut self.part_ml,
                       &mut self.qsa_h1, // #61a: the CROW_QSA_PAR histogram
-                      &mut self.emb,
-                      &mut self.mixed,
-                      &mut self.low,
-                      &mut self.sil,
-                      &mut self.mixw,
-                      &mut self.normed,
-                      &mut self.injr,
-                      &mut self.injw,
-                      &mut self.x1,
-                      &mut self.mixed_m,
-                      &mut self.moe_out,
-                      &mut self.h1,
-                      &mut self.h2,
-                      &mut self.eo,
-                      &mut self.xq_gu,
-                      &mut self.xq_dn,
-                      &mut self.xq_m,
-                      &mut self.xq_v,
-                      &mut self.xq_s,
-                      &mut self.xq_e,
-                      &mut self.sdown,
-                      &mut self.sh12,
-                      &mut self.sh2,
-                      &mut self.sgv,
-                      &mut self.rlog,
-                      &mut self.rids,
-                      &mut self.rwts,
-                      &mut self.gu_ptrs,
-                      &mut self.dn_ptrs,
-                      &mut self.cold,
-                      &mut self.mq,
-                      &mut self.mq_t,
-                      &mut self.cout_t,
-                      &mut self.gq,
-                      &mut self.gk,
-                      &mut self.gv,
-                      &mut self.gz,
-                      &mut self.gb,
-                      &mut self.ga,
-                      &mut self.gbeta,
-                      &mut self.gg,
-                      &mut self.gqr,
-                      &mut self.gkr,
-                      &mut self.gcore,
-                      &mut self.gnorm,
-                      &mut self.gout,
-                      &mut self.qg,
-                      &mut self.aq,
-                      &mut self.agate,
-                      &mut self.aqn,
-                      &mut self.aqr,
-                      &mut self.ak,
-                      &mut self.akn,
-                      &mut self.akr,
-                      &mut self.av,
-                      &mut self.aout,
-                      &mut self.agated,
-                      &mut self.ay,
-                      &mut self.qk,
-                      &mut self.q_nrm,
-                      &mut self.q_rot,
-                      &mut self.pool_raw,
-                      &mut self.pool_nrm,
-                      &mut self.pool_rot,
                       &mut self.scores,
-                      &mut self.sel,
-                      &mut self.sel_n,
-                      &mut self.ple_key,
-                      &mut self.ple_kn,
-                      &mut self.ple_val,
-                      &mut self.ple_qn,
-                      &mut self.ple_gate,
-                      &mut self.ple_gs,
-                      &mut self.ple_gated,
-                      &mut self.ple_gn,
-                      &mut self.ple_out,
-                      &mut self.ple_slots,
                       &mut self.logits,
                       &mut self.argmax,
-                      &mut self.mixed_final,
                       &mut self.scratch_gn] {
                 cuda::free_dev(f);
             }

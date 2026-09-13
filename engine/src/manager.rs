@@ -14,6 +14,18 @@ use crate::cuda;
 use crate::geo::*;
 use cudarc::driver::sys::CUdeviceptr;
 
+/// The planner refusal text (spec 2.1) as a pure function, factored by #10b
+/// (2026-09-13) so the refusal path carries a panic-message test that needs
+/// no GPU and no container. The text is byte-identical to the inline panic
+/// it replaces.
+pub fn planner_refusal_msg(free0: u64, host_pinned_budget: u64) -> String {
+    format!(
+        "refusing config: no hot-set size fits BOTH the VRAM budget (free {:.2} GiB) and the host pinned budget ({:.1} GiB) — shrink the chunk/scratch, the PLE cache, or the keep-set (spec 2.1)",
+        free0 as f64 / (1u64 << 30) as f64,
+        host_pinned_budget as f64 / (1u64 << 30) as f64
+    )
+}
+
 pub struct StateSizes {
     pub kv_bytes: u64,
     pub qsa_keys_bytes: u64,
@@ -134,11 +146,8 @@ impl ThreeStates {
                     "no feasible N: VRAM allows at most N={} while the host pinned budget needs more — refusing",
                     n
                 ));
-                panic!(
-                    "refusing config: no hot-set size fits BOTH the VRAM budget (free {:.2} GiB) and the host pinned budget ({:.1} GiB) — shrink the chunk/scratch, the PLE cache, or the keep-set (spec 2.1)",
-                    free0 as f64 / (1u64 << 30) as f64,
-                    cfg.host_pinned_budget as f64 / (1u64 << 30) as f64
-                );
+                // #10b: the message moved into planner_refusal_msg (tested)
+                panic!("{}", planner_refusal_msg(free0, cfg.host_pinned_budget));
             }
             if sum + SAFETY >= free0 {
                 went_down = true;
@@ -331,4 +340,29 @@ impl Drop for ThreeStates {
 
 fn cfg_n_dbg() -> bool {
     std::env::var("ENGINE_DEBUG_SYNC").is_ok()
+}
+
+#[cfg(test)]
+mod tests_10b {
+    use super::planner_refusal_msg;
+
+    /// #10b gate 5: the planner refusal path keeps its panic-message text
+    /// (manager.rs:137 of the F52 record), asserted without a GPU.
+    #[test]
+    fn planner_refusal_message_names_both_budgets_and_the_escape_hatch() {
+        let m = planner_refusal_msg(20 * (1u64 << 30), 46 * (1u64 << 30));
+        assert!(
+            m.starts_with("refusing config: no hot-set size fits BOTH the VRAM budget"),
+            "message must name the VRAM budget first, got: {m}"
+        );
+        assert!(m.contains("free 20.00 GiB"), "free GiB formatting moved: {m}");
+        assert!(
+            m.contains("the host pinned budget (46.0 GiB)"),
+            "pinned budget formatting moved: {m}"
+        );
+        assert!(
+            m.contains("shrink the chunk/scratch, the PLE cache, or the keep-set (spec 2.1)"),
+            "escape-hatch clause moved: {m}"
+        );
+    }
 }

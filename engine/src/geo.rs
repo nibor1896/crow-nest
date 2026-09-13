@@ -128,13 +128,17 @@ pub fn attn_index(layer: usize) -> usize {
 }
 
 /// Prefill chunk policy (#16). `CROW_CHUNK=<n>` is authoritative; without it the
-/// chunk follows the prompt length (rounded up to 512, at most 2048), so a short
-/// prompt keeps the chunk-512 scratch and its larger hot set (N 157 vs 140 at
-/// chunk 2048) and a long prompt takes the fewest PCIe passes over the cold tier.
+/// chunk follows the prompt length (rounded up to 512, at most 4096), so a short
+/// prompt keeps the chunk-512 scratch and its larger hot set and a long prompt
+/// takes the fewest PCIe passes over the cold tier. Cap 4096 since #10b
+/// (2026-09-13): the per-chunk scratch diet cut the per-token scratch from
+/// 1.23 MiB to about 0.42 MiB, so chunk 4096 passes the VRAM planner with the
+/// hot set at the pinned-budget side (the cap was 2048 before, N 140 at 2048).
 /// `CROW_CHUNK_AUTO=1` applies the policy on top of an explicit `CROW_CHUNK`
-/// (cap = max(CROW_CHUNK, 2048)); `CROW_CHUNK_AUTO=0` disables it.
+/// (cap = max(CROW_CHUNK, 4096)); `CROW_CHUNK_AUTO=0` disables it.
 /// Default since 2026-09-05 (auto on; opt-in before). Gated: chunk 1024 and 2048
-/// deterministic since #22, long-prompt references = ten-task series final4.
+/// deterministic since #22, chunk 4096 gated by #10b (F47 env-vs-env parity,
+/// the 16k parity form, ten-task final4 identity, the F49 prefill pairs).
 pub fn apply_chunk_policy(cfg: &mut Config, n_prompt: usize) {
     let explicit = std::env::var("CROW_CHUNK").ok().and_then(|v| v.parse::<usize>().ok());
     if let Some(c) = explicit {
@@ -147,7 +151,7 @@ pub fn apply_chunk_policy(cfg: &mut Config, n_prompt: usize) {
     };
     if auto {
         let need = ((n_prompt + 511) / 512 * 512).max(512);
-        cfg.prompt_chunk = need.min(cfg.prompt_chunk.max(2048));
+        cfg.prompt_chunk = need.min(cfg.prompt_chunk.max(4096)); // #10b: cap 2048 to 4096, the scratch diet lifted the F52 wall
     }
     apply_adapt_policy(cfg);
 }
