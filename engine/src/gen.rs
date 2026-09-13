@@ -118,8 +118,7 @@ impl PW {
                 *w as u64, x, *gs as u64, y, k_dim]),
             // prefill-sized batches: 8-token bf16 tile GEMM (CROW_BF16_GEMM=0 -> warp GEMV)
             PW::Bf16(w) if t >= 8 && std::env::var("CROW_BF16_GEMM").as_deref() != Ok("0") => {
-                launch_v(k.f("gemm_bf16_dense"), ((rows + 63) / 64) as u32, ((t + 7) / 8) as u32, 1, 128, &[
-                    *w as u64, x, y, k_dim, rows_p, t_p])
+                launch_bf16_dense(k, *w, x, y, k_dim, rows, rows_p, t, t_p)
             }
             PW::Bf16(w) => if bf16_w_on() {
                 launch_v(k.f("gemv_bf16_w"), ((rows + 7) / 8) as u32, t as u32, 1, 256, &[*w as u64, x, y, k_dim, rows_p])
@@ -514,6 +513,17 @@ fn pf_gemm_on() -> bool {
     *ON.get_or_init(|| std::env::var("CROW_PF_GEMM").as_deref() != Ok("0"))
 }
 
+/// CROW_PF_GEMM_B (#10c, exact `1` enables; default off): the prefill dense
+/// GEMM variant B, 32-token tiles + 16-byte vectorised weight fragments
+/// (`gemm_fp4_dense_b` / `gemm_bf16_dense_b`, selected inside `launch_mma_d`
+/// and `launch_bf16_dense`). Unset or any other value runs the 8-token tile
+/// forms of record bit for bit. DISTINCT from `CROW_PF_GEMM` (the grouped MoE
+/// tile path); deliberately not overloaded (lesson 11).
+fn pf_gemm_b_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CROW_PF_GEMM_B").as_deref() == Ok("1"))
+}
+
 /// CROW_PF_ASYNC=1: the prefill staging copies (`stage_tiles`, SM reads over
 /// PCIe) run on a side stream into two slot sets (group parity), overlapping
 /// the previous group's tile GEMMs; costs one extra set of PF_TG staging slots
@@ -767,6 +777,13 @@ impl Engine {
         println!("[hc] hyper-connection decode chain {}, shared-expert chain {}, CROW_QFUSE {} (1 = 19f fused hc + 19h fused shared, 0 = all off)",
             if hc_fuse_on() { "fused (default since 19g, 4 launches per hc block)" } else { "unfused (fallback of record, 8 launches)" },
             if sh_fuse_on() { "fused (19h, 3 launches)" } else { "unfused (0 = fallback, 6 launches)" }, hcf);
+        // #10c, 2026-09-14: ONE line per engine process names the prefill
+        // dense GEMM form, next to the [hc] line and for the same reason:
+        // every future log says which dense form produced it. It sits in the
+        // [load] block, so the parity gate prints it too.
+        let pgb = std::env::var("CROW_PF_GEMM_B").unwrap_or_else(|_| "unset".to_string());
+        println!("[pf-gemm-b] prefill dense GEMM {}, CROW_PF_GEMM_B {} (exact 1 = variant B 32-token tiles, unset or other = the 8-token form of record)",
+            if pf_gemm_b_on() { "variant B (gemm_fp4_dense_b / gemm_bf16_dense_b)" } else { "8-token tiles (of record)" }, pgb);
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
         let max_tiles = cfg.prompt_chunk * TOPK / 8 + E + 1;
         let stage = Stage {
@@ -1240,9 +1257,30 @@ pub unsafe fn launch_mma_d(k: &Kernels, gx: u32, t: usize, t_p: u64, args: &[u64
     if t >= 8 && std::env::var("CROW_DENSE_GEMM").as_deref() != Ok("0") {
         let mut a: Vec<u64> = args.to_vec();
         a.push(t_p);
-        launch_v(k.f("gemm_fp4_dense"), gx, ((t + 7) / 8) as u32, 1, mma_bx(), &a);
+        if pf_gemm_b_on() {
+            // #10c variant B: 32-token tiles, one 16-byte vectorised weight
+            // fragment set serves four n-tiles; per-token math identical to
+            // the 8-token form (same k order, levels, KS reduce).
+            launch_v(k.f("gemm_fp4_dense_b"), gx, ((t + 31) / 32) as u32, 1, mma_bx(), &a);
+        } else {
+            launch_v(k.f("gemm_fp4_dense"), gx, ((t + 7) / 8) as u32, 1, mma_bx(), &a);
+        }
     } else {
         launch_v(k.f("gemv_fp4_mma_d"), gx, t as u32, 1, mma_bx(), args);
+    }
+}
+
+/// The prefill bf16 tile GEMM launch, ONE place for both call sites
+/// (`PW::launch_gemv` and the `CROW_ROUTER_GEMM` router site): the 8-token
+/// form of record, or the #10c 32-token variant B behind `CROW_PF_GEMM_B`
+/// (exact 1), selected HERE and nowhere else (no scattering).
+unsafe fn launch_bf16_dense(k: &Kernels, w: u64, x: u64, y: u64, k_dim: u64, rows: usize, rows_p: u64, t: usize, t_p: u64) {
+    if pf_gemm_b_on() {
+        launch_v(k.f("gemm_bf16_dense_b"), ((rows + 63) / 64) as u32, ((t + 31) / 32) as u32, 1, 128, &[
+            w, x, y, k_dim, rows_p, t_p])
+    } else {
+        launch_v(k.f("gemm_bf16_dense"), ((rows + 63) / 64) as u32, ((t + 7) / 8) as u32, 1, 128, &[
+            w, x, y, k_dim, rows_p, t_p])
     }
 }
 
@@ -2397,9 +2435,9 @@ impl Engine {
 
         if t >= 8 && std::env::var("CROW_ROUTER_GEMM").as_deref() == Ok("1") {
             // bf16 tensor-core GEMM on the exact bf16 twin (summation order differs
-            // from gemv_b -> not bit-identical; env-gated until validated)
-            launch_v(k.f("gemm_bf16_dense"), ((E + 63) / 64) as u32, ((t + 7) / 8) as u32, 1, 128, &[
-                m.router_bf as u64, mixed_m as u64, s.rlog as u64, p.n2560 as u64, p.nr512 as u64, p.t as u64]);
+            // from gemv_b -> not bit-identical, env-gated until validated); the
+            // #10c variant B selection lives in the ONE bf16 dense launch helper
+            launch_bf16_dense(k, m.router_bf as u64, mixed_m as u64, s.rlog as u64, p.n2560 as u64, E, p.nr512 as u64, t, p.t as u64);
         } else {
             launch_v(k.f("gemv_b"), E as u32, t as u32, 1, 256, &[
                 m.router as u64, mixed_m as u64, s.rlog as u64, p.n2560 as u64]);

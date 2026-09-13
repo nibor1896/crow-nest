@@ -540,6 +540,145 @@ extern "C" __global__ void gemm_fp4_dense(const unsigned char* __restrict__ w,
     }
 }
 
+// per-lane pick: word i (0..11) of a 48-byte window held as three uint4
+__device__ __forceinline__ unsigned int wpick3(uint4 a, uint4 b, uint4 c, int i) {
+    if (i < 4) { return (i == 0) ? a.x : (i == 1) ? a.y : (i == 2) ? a.z : a.w; }
+    if (i < 8) { i -= 4; return (i == 0) ? b.x : (i == 1) ? b.y : (i == 2) ? b.z : b.w; }
+    i -= 8; return (i == 0) ? c.x : (i == 1) ? c.y : (i == 2) ? c.z : c.w;
+}
+
+// Dense FP4 GEMM variant B (#10c, CROW_PF_GEMM_B exact 1): the 8-token
+// gemm_fp4_dense form with the token tile widened 8 -> 32 (grid y = ceil(t/32))
+// and the weight fragments loaded as 16-byte vectors. BIT-IDENTITY CONTRACT
+// (the 8-token form's: "per-token math identical to gemv_fp4_mma_d, same k
+// order, levels, KS reduce"): mma_fp4_16n8k64 is n8, so a 32-token tile is
+// FOUR independent n-tiles per warp with four accumulator sets; tile j's mma
+// at (block b, level lv) consumes EXACTLY the operand words the 8-token form's
+// block (blockIdx.y = j) loaded: the same A words (the weight fragments load
+// ONCE per b and serve all four tiles), the same B words (token 8j+g's
+// quantized row), the same block scales, accumulated in the same order
+// (b ascending over the same KS-split range, levels 0,1,2 per block), reduced
+// through the same red[ks][rg][lane][4] smem form per tile in the same fixed
+// slice order. 16-BYTE LOADS: the 36 B block layout puts block b at byte
+// 36b = 16*(b/4) + 4*(b&3) inside the row, so a block is only 4B aligned;
+// the vector path therefore loads the ALIGNED 48-byte window that contains
+// the block (base = blk - 4*(b&3), three uint4) and picks the exact 4-byte
+// fragment words out of the window (little-endian, so the packed scale word
+// equals the old byte assembly). The window stays inside the row slab: it
+// ends past the block only into the SAME row's next block, and the LAST
+// block b = bpr-1 sits at line offset 12 (bpr % 4 == 0), where the window
+// ends EXACTLY at the slab end. Requires bpr % 4 == 0 AND w 16B aligned;
+// the scalar fallback keeps the 4-byte loads verbatim otherwise (no model
+// k_dim hits it: every dense site is a multiple of 2560).
+extern "C" __global__ void gemm_fp4_dense_b(const unsigned char* __restrict__ w,
+                                            const unsigned char* __restrict__ xq,
+                                            const float* __restrict__ gs_ptr,
+                                            float* __restrict__ y,
+                                            const int* __restrict__ k_dim_p,
+                                            const int* __restrict__ rows_p,
+                                            const int* __restrict__ y_stride_p,
+                                            const int* __restrict__ t_p) {
+    int k_dim = *k_dim_p;
+    int bpr = k_dim >> 6;
+    int rows = *rows_p;
+    int ys = *y_stride_p;
+    int tt = *t_p;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int ks_n = blockDim.x >> 7;
+    int rg = warp & 3, ks = warp >> 2;
+    int g = lane >> 2, lt = lane & 3;
+    int w0 = (blockIdx.x << 6) + (rg << 4);
+    bool active = w0 < rows;
+    int tokg0 = blockIdx.y * 32;
+    int r0 = w0 + g, r1 = w0 + g + 8;
+    float d[4][4]; // [n-tile j][d0..d3]
+    #pragma unroll
+    for (int j = 0; j < 4; j++) { d[j][0] = 0.0f; d[j][1] = 0.0f; d[j][2] = 0.0f; d[j][3] = 0.0f; }
+    if (active) {
+        const unsigned char* rowg = w + (size_t)min(r0, rows - 1) * bpr * 36;
+        const unsigned char* rowg8 = w + (size_t)min(r1, rows - 1) * bpr * 36;
+        int bpb = (bpr + ks_n - 1) / ks_n;
+        int b_lo = ks * bpb, b_hi = min(bpr, b_lo + bpb);
+        bool va = ((bpr & 3) == 0) && ((((unsigned long long)w) & 15ull) == 0ull); // aligned-window guard
+        for (int b = b_lo; b < b_hi; b++) {
+            const unsigned char* blk = rowg + b * 36;
+            const unsigned char* blk8 = rowg8 + b * 36;
+            unsigned int a0, a1, a2, a3, sa;
+            if (va) {
+                // the block sits at line offset 4*(b&3); the aligned 48-byte
+                // window at blk - 4*(b&3) contains it (see the header comment)
+                int q = (int)(b & 3);
+                const unsigned char* wb = blk - q * 4;
+                const unsigned char* wb8 = blk8 - q * 4;
+                uint4 v0 = *(const uint4*)(wb);
+                uint4 v1 = *(const uint4*)(wb + 16);
+                uint4 v2 = *(const uint4*)(wb + 32);
+                uint4 u0 = *(const uint4*)(wb8);
+                uint4 u1 = *(const uint4*)(wb8 + 16);
+                uint4 u2 = *(const uint4*)(wb8 + 32);
+                // window words: scale at q, frag k at q + 1 + k
+                sa = (lt & 1) ? wpick3(u0, u1, u2, q) : wpick3(v0, v1, v2, q);
+                int i1 = q + 1 + lt; // fragment lt
+                int i5 = q + 5 + lt; // fragment lt + 4
+                a0 = wpick3(v0, v1, v2, i1);
+                a2 = wpick3(v0, v1, v2, i5);
+                a1 = wpick3(u0, u1, u2, i1);
+                a3 = wpick3(u0, u1, u2, i5);
+            } else {
+                const unsigned char* sfrow = (lt & 1) ? blk8 : blk;
+                a0 = *(const unsigned int*)(blk + 4 + 4 * lt);
+                a1 = *(const unsigned int*)(blk8 + 4 + 4 * lt);
+                a2 = *(const unsigned int*)(blk + 20 + 4 * lt);
+                a3 = *(const unsigned int*)(blk8 + 20 + 4 * lt);
+                sa = sfrow[0] | (unsigned int)sfrow[1] << 8
+                   | (unsigned int)sfrow[2] << 16 | (unsigned int)sfrow[3] << 24;
+            }
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                int tok_g = tokg0 + 8 * j + g;
+                const unsigned char* ab = xq + (size_t)min(tok_g, tt - 1) * bpr * 108 + b * 36;
+                unsigned int sb = *(const unsigned int*)(ab);
+                unsigned int b0 = *(const unsigned int*)(ab + 4 + 4 * lt);
+                unsigned int b1 = *(const unsigned int*)(ab + 20 + 4 * lt);
+                mma_fp4_16n8k64(d[j][0], d[j][1], d[j][2], d[j][3], a0, a1, a2, a3, b0, b1, sa, sb);
+                #pragma unroll
+                for (int lv = 1; lv < 3; lv++) {
+                    const unsigned char* ab2 = ab + lv * bpr * 36;
+                    unsigned int sb2 = *(const unsigned int*)(ab2);
+                    unsigned int c0 = *(const unsigned int*)(ab2 + 4 + 4 * lt);
+                    unsigned int c1 = *(const unsigned int*)(ab2 + 20 + 4 * lt);
+                    mma_fp4_16n8k64(d[j][0], d[j][1], d[j][2], d[j][3], a0, a1, a2, a3, c0, c1, sa, sb2);
+                }
+            }
+        }
+    }
+    __shared__ float red[4][4][32][4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        red[ks][rg][lane][0] = d[j][0]; red[ks][rg][lane][1] = d[j][1];
+        red[ks][rg][lane][2] = d[j][2]; red[ks][rg][lane][3] = d[j][3];
+        __syncthreads();
+        if (ks == 0 && active) {
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            for (int i = 0; i < ks_n; i++) {
+                s0 += red[i][rg][lane][0]; s1 += red[i][rg][lane][1];
+                s2 += red[i][rg][lane][2]; s3 += red[i][rg][lane][3];
+            }
+            float gs = gs_ptr[0];
+            int n0 = tokg0 + 8 * j + 2 * lt, n1 = n0 + 1;
+            if (n0 < tt) {
+                if (r0 < rows) y[(size_t)n0 * ys + r0] = s0 * gs;
+                if (r1 < rows) y[(size_t)n0 * ys + r1] = s2 * gs;
+            }
+            if (n1 < tt) {
+                if (r0 < rows) y[(size_t)n1 * ys + r0] = s1 * gs;
+                if (r1 < rows) y[(size_t)n1 * ys + r1] = s3 * gs;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // Grouped dense FP4 GEMV (#62b lever 1): the four GDN decode input projections
 // (qkv 10240 + z 6144 + b 48 + a 48 rows, all k 2560) in ONE launch over ONE
 // shared quantized activation row. Four (w, gs, y, rows) groups; blockIdx.x
@@ -974,6 +1113,86 @@ extern "C" __global__ void gemm_bf16_dense(const unsigned short* __restrict__ w,
     if (n1 < tt) {
         if (r0 < rows) y[(size_t)n1 * rows + r0] = d1;
         if (r1 < rows) y[(size_t)n1 * rows + r1] = d3;
+    }
+}
+
+// Dense bf16 GEMM variant B (#10c, CROW_PF_GEMM_B exact 1): the 8-token
+// gemm_bf16_dense form with the token tile widened 8 -> 32 (grid y =
+// ceil(t/32)) and the weight words loaded as 16-byte vectors. BIT-IDENTITY
+// CONTRACT: mma_bf16_16n8k16 is k16 n8, so a 32-token tile is four
+// independent n-tiles per warp with four accumulator sets; tile j's mma at
+// k step kk consumes EXACTLY the operand words the 8-token form's block
+// (blockIdx.y = j) loaded: the same A words (the weight uint4 pair loads
+// once per kk and serves all four tiles; word t of the lo vector is a0,
+// word t of the hi vector is a2, per row exactly the four 4-byte loads of
+// the 8-token form) and the same per-token B words. The per-token f32-to-bf16 conversion and the
+// per-token residual second mma stay per token, per tile, in the same kk
+// ascending order with the main mma before the residual mma (the 8-token
+// form's exact sequence). Requires k_dim % 8 == 0 for the uint4 alignment of
+// wr = w + row*k_dim (every dense bf16 site is 2560 or 12288); the scalar
+// fallback keeps the 4-byte loads verbatim otherwise.
+extern "C" __global__ void gemm_bf16_dense_b(const unsigned short* __restrict__ w, const float* __restrict__ x,
+                                             float* __restrict__ y, const int* __restrict__ k_dim_p,
+                                             const int* __restrict__ rows_p, const int* __restrict__ t_p) {
+    int k_dim = *k_dim_p;
+    int rows = *rows_p;
+    int tt = *t_p;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int g = lane >> 2, t = lane & 3;
+    int w0 = (blockIdx.x << 6) + (warp << 4);
+    if (w0 >= rows) return;
+    int r0 = w0 + g, r1 = w0 + g + 8;
+    const unsigned short* wr0 = w + (size_t)min(r0, rows - 1) * k_dim;
+    const unsigned short* wr1 = w + (size_t)min(r1, rows - 1) * k_dim;
+    int tokg0 = blockIdx.y * 32;
+    bool va = ((k_dim & 7) == 0) && ((((unsigned long long)w) & 15ull) == 0ull); // aligned-window guard
+    float d[4][4]; // [n-tile j][d0..d3]
+    #pragma unroll
+    for (int j = 0; j < 4; j++) { d[j][0] = 0.0f; d[j][1] = 0.0f; d[j][2] = 0.0f; d[j][3] = 0.0f; }
+    for (int kk = 0; kk < k_dim; kk += 16) {
+        unsigned int a0, a1, a2, a3;
+        if (va) {
+            uint4 vlo0 = *(const uint4*)(wr0 + kk);
+            uint4 vlo1 = *(const uint4*)(wr0 + kk + 8);
+            uint4 vhi0 = *(const uint4*)(wr1 + kk);
+            uint4 vhi1 = *(const uint4*)(wr1 + kk + 8);
+            a0 = (t == 0) ? vlo0.x : (t == 1) ? vlo0.y : (t == 2) ? vlo0.z : vlo0.w;
+            a1 = (t == 0) ? vhi0.x : (t == 1) ? vhi0.y : (t == 2) ? vhi0.z : vhi0.w;
+            a2 = (t == 0) ? vlo1.x : (t == 1) ? vlo1.y : (t == 2) ? vlo1.z : vlo1.w;
+            a3 = (t == 0) ? vhi1.x : (t == 1) ? vhi1.y : (t == 2) ? vhi1.z : vhi1.w;
+        } else {
+            a0 = *(const unsigned int*)(wr0 + kk + 2 * t);
+            a1 = *(const unsigned int*)(wr1 + kk + 2 * t);
+            a2 = *(const unsigned int*)(wr0 + kk + 2 * t + 8);
+            a3 = *(const unsigned int*)(wr1 + kk + 2 * t + 8);
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int tok = tokg0 + 8 * j + g;
+            const float* xp = x + (size_t)min(tok, tt - 1) * k_dim;
+            float x0 = xp[kk + 2 * t], x1 = xp[kk + 2 * t + 1];
+            float x2 = xp[kk + 2 * t + 8], x3 = xp[kk + 2 * t + 9];
+            unsigned short h0 = f32_bf16_bits(x0), h1 = f32_bf16_bits(x1), h2 = f32_bf16_bits(x2), h3 = f32_bf16_bits(x3);
+            unsigned int b0 = (unsigned int)h0 | ((unsigned int)h1 << 16);
+            unsigned int b1 = (unsigned int)h2 | ((unsigned int)h3 << 16);
+            mma_bf16_16n8k16(d[j][0], d[j][1], d[j][2], d[j][3], a0, a1, a2, a3, b0, b1);
+            // residual (lo) pass: what bf16 rounding of the activation dropped
+            unsigned int l0 = bf16_pair_hi(x0 - bf16_bits_f32(h0), x1 - bf16_bits_f32(h1));
+            unsigned int l1 = bf16_pair_hi(x2 - bf16_bits_f32(h2), x3 - bf16_bits_f32(h3));
+            mma_bf16_16n8k16(d[j][0], d[j][1], d[j][2], d[j][3], a0, a1, a2, a3, l0, l1);
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        int n0 = tokg0 + 8 * j + 2 * t, n1 = n0 + 1;
+        if (n0 < tt) {
+            if (r0 < rows) y[(size_t)n0 * rows + r0] = d[j][0];
+            if (r1 < rows) y[(size_t)n0 * rows + r1] = d[j][2];
+        }
+        if (n1 < tt) {
+            if (r0 < rows) y[(size_t)n1 * rows + r0] = d[j][1];
+            if (r1 < rows) y[(size_t)n1 * rows + r1] = d[j][3];
+        }
     }
 }
 
@@ -3947,7 +4166,7 @@ impl Kernels {
             "qsa_select", "qsa_select_fast", "qsa_select_par_h", "qsa_select_par_e", "router_top10", "gather_ple_fp4", "gate_dot", "gate_apply", "ple_conv",
             "ple_state_update", "ple_conv_step", "argmax_k", "sample_topk_part", "sample_k", "add_flat",
             "gemv_bf16_b", "gemv_bf16_w", "gemv_fp4_b1k", "hc_down_inj", "gemv_bf16_ws",
-            "gemm_fp4_dense", "gemm_bf16_dense", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
+            "gemm_fp4_dense", "gemm_bf16_dense", "gemm_fp4_dense_b", "gemm_bf16_dense_b", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
             "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "gemv_fp4_mma_dg", "sh_gate_up_q", "gemv_fp4_mma_g", "gemv_fp4_mma_d32", "gemv_fp4_mma_g32", "attn_sel_r", "attn_sel_d8", "attn_sel_d9", "attn_sel_s", "attn_sel_s8", "attn_sel_s8l", "attn_sel_g",
         ];
         let mut map = HashMap::new();
