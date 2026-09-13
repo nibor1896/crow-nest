@@ -50,7 +50,13 @@
 
 ### Changed
 
-- `#61` 61d, 2026-09-13: the decode attention runs 32 splits by default
+- `#61` 61e, 2026-09-13: the split-count default rolls back to 8, the #61d flip is withdrawn
+  - selection: `CROW_ATTN_SPLITS` unset or any value but `4`, `8`, `16`, `32` runs the `ATTN_SPLITS` const, back to 8; `CROW_ATTN_SPLITS=32` reproduces the 61d experiment (`gen.rs:1302`, env read `gen.rs:1323-1327`, boot line `gen.rs:741`, engine commit `fdc00c4`)
+  - reason of record: the #61d ten-task quality verdict - 0 Pass / 7 Partial / 3 Fail at 32 against the crow record 2 / 5 / 3 at 8 and the llama reference 2 / 6 / 2 (`.superpowers/sdd/task-61d-quality-report.md`); the improvement-loop quality rule outranks the performance-over-ids ruling of 2026-09-12, which stays recorded
+  - the 61d measurement stays the measurement of record for the knob: 22.8545 against 24.1325 ms per token = 43.8 against 41.4 tok/s = -1.278 ms = -5.3 percent at 32.3 x the fallback spread, B ids `5098f885ab3a` 3 of 3, N ids `c65969f7793a` 3 of 3 (`decode_out/srv-61d.log`); `16` and `32` stay measurement only, the splits-8 stream of record is again final4-identical
+  - boot line: every engine process prints one `[attn]` line naming the split count it runs and the restored default ("default 8, restored by 61e"), with 32 marked as the rolled-back experiment
+  - tests on the 61e build, 2026-09-13: lib 80/80, serve 57/57, `qsa_probe` 4928 rows / 0 differences (`decode_out/srv-61e.log`); the NO-env revert proof (parity forms reproducing the 61b sha256 values of record) rides the next engine chain per orchestrator directive
+- `#61` 61d, 2026-09-13: the decode attention runs 32 splits by default (ROLLED BACK by #61e the same day, see above; the measured numbers stand)
   - selection: `CROW_ATTN_SPLITS` unset or any value but `4`, `8`, `16` runs the `ATTN_SPLITS` const, now 32; `CROW_ATTN_SPLITS=8` restores the configuration of record before the flip (`gen.rs:1280`, read site `gen.rs:1301`, boot line `gen.rs:742`)
   - boot line: every engine process prints one `[attn]` line naming the split count it runs, next to the `[qsa]` line
   - measured 2026-09-13, RTX 5090, t1-read 16,064 ids, 255 timed decode steps, one fresh process per run, three adjacent pairs: crow-nest 23.23 / 22.63 / 22.71 ms per token with the new default against 24.11 / 24.14 / 24.15 with `CROW_ATTN_SPLITS=8`, means 22.8545 against 24.1325 ms per token = 43.8 against 41.4 tok/s, 1.278 ms per token gained = 5.3 percent at 32.3 fallback spread windows, B ids `5098f885ab3a` 3 of 3, N ids `c65969f7793a` 3 of 3, the 61a/61c S32 value (`decode_out/srv-61d.log`)
