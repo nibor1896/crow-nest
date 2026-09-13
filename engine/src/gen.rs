@@ -756,8 +756,9 @@ impl Engine {
         // turns BOTH off (the unfused fallback of record; bit-identical, so
         // the ids and logits cannot move; only the launch shape does).
         let hcf = std::env::var("CROW_QFUSE").unwrap_or_else(|_| "unset".to_string());
-        println!("[hc] hyper-connection decode chain {}, CROW_QFUSE {} (0 = unfused fallback of record, 8 launches)",
-            if hc_fuse_on() { "fused (default since 19g, 4 launches per hc block)" } else { "unfused (fallback of record, 8 launches)" }, hcf);
+        println!("[hc] hyper-connection decode chain {}, shared-expert chain {}, CROW_QFUSE {} (1 = 19f fused hc + 19h fused shared, 0 = all off)",
+            if hc_fuse_on() { "fused (default since 19g, 4 launches per hc block)" } else { "unfused (fallback of record, 8 launches)" },
+            if sh_fuse_on() { "fused (19h, 3 launches)" } else { "unfused (default of record, 6 launches)" }, hcf);
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
         let max_tiles = cfg.prompt_chunk * TOPK / 8 + E + 1;
         let stage = Stage {
@@ -1310,6 +1311,24 @@ fn gdn_fuse_in_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CROW_GDN_FUSE_IN").as_deref() != Ok("0"))
 }
+
+/// CROW_QFUSE=1 (19h, EXACT "1" only; unset keeps the default of record):
+/// the shared-expert decode chain fuses the two gate|up gemv_fp4_mma_d
+/// launches into ONE (sh_gate_up_q, the silu_mul640_q math as epilogue on
+/// the two finished accumulators, writes sh2 + xq_s; the sh12 write is dead)
+/// and the down gemv_fp4_mma_d gains the gate_shared epilogue at the store
+/// (gemv_fp4_mma_dg: moe_out = sigmoid(sgv) * down, ASSIGN, still the FIRST
+/// writer of moe_out); the sgv gemv_b hoists before the down launch (reads
+/// mixed_m only, data-safe). SAME switch and SAME exact-"1" rule as the 19f
+/// hc fusion (documented overload, coordinator ruling 2026-09-13: no new
+/// env name, check_env_docs 74 = 74). 6 -> 3 launches per layer, decode
+/// t < 8 and the mma/dense path only: prefill (gemm_fp4_dense) and the
+/// gemv_fp4_bs fallback keep the separate launches verbatim.
+fn sh_fuse_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CROW_QFUSE").as_deref() == Ok("1"))
+}
+
 /// CROW_ATTN_SPLIT (default on): decode attention as S=8 partials + merge,
 /// QSA scores warp-per-block (both graph-static; cost no longer grows
 /// linearly with the context inside one block)
@@ -2322,41 +2341,80 @@ impl Engine {
         // shared expert — gate|up into ONE [t][1280] buffer (p13 layout, the
         // contract silu_mul640 reads); explicit stride, never the grid
         let dense = dense_mma_on();
+        // #19h (CROW_QFUSE=1, exact "1"): decode regime (t < 8) fuses the
+        // shared-expert chain: the two gate|up gemv_fp4_mma_d launches become
+        // ONE launch (sh_gate_up_q) with the silu_mul640_q math as epilogue on
+        // the two finished accumulators (writes s.sh2 + s.xq_s only; the sh12
+        // write is dead), and the down gemv_fp4_mma_d gains the gate_shared
+        // epilogue at the store (gemv_fp4_mma_dg: moe_out = sigmoid(sgv) *
+        // down, ASSIGN, still the FIRST writer of moe_out - no memset). The
+        // sgv GEMV (gemv_b, reads mixed_m only) hoists BEFORE the down launch
+        // so the epilogue can read it; data-safe, the graph records the order.
+        // Bit-identity by construction: every epilogue is elementwise (or
+        // warp-wide with the standalone layout) on the finished accumulator,
+        // each k walk keeps the separate-launch order, the merged grid keeps
+        // every row's dot product unchanged. t >= 8 (prefill gemm_fp4_dense)
+        // and the gemv_fp4_bs non-mma fallback keep the separate launches
+        // verbatim.
+        let sh_fuse = sh_fuse_on() && mma && dense && t < 8;
         if dense {
-            launch_mma_d(k, (INTER / 64) as u32, t, p.t as u64, &[
-                m.sg.w as u64, s.xq_gu as u64, m.sg.gs as u64, s.sh12 as u64,
-                p.n2560 as u64, p.n640 as u64, p.n1280 as u64]);
-            launch_mma_d(k, (INTER / 64) as u32, t, p.t as u64, &[
-                m.su.w as u64, s.xq_gu as u64, m.su.gs as u64, (s.sh12 + (INTER * 4) as u64),
-                p.n2560 as u64, p.n640 as u64, p.n1280 as u64]);
+            if sh_fuse {
+                launch_v(k.f("sh_gate_up_q"), (INTER / 64) as u32, t as u32, 1, mma_bx(), &[
+                    m.sg.w as u64, m.su.w as u64, s.xq_gu as u64, m.sg.gs as u64,
+                    m.su.gs as u64, s.sh2 as u64, s.xq_s as u64, p.n2560 as u64, p.n640 as u64]);
+            } else {
+                launch_mma_d(k, (INTER / 64) as u32, t, p.t as u64, &[
+                    m.sg.w as u64, s.xq_gu as u64, m.sg.gs as u64, s.sh12 as u64,
+                    p.n2560 as u64, p.n640 as u64, p.n1280 as u64]);
+                launch_mma_d(k, (INTER / 64) as u32, t, p.t as u64, &[
+                    m.su.w as u64, s.xq_gu as u64, m.su.gs as u64, (s.sh12 + (INTER * 4) as u64),
+                    p.n2560 as u64, p.n640 as u64, p.n1280 as u64]);
+            }
         } else {
             launch_v(k.f("gemv_fp4_bs"), INTER as u32, t as u32, 1, 256, &[
                 m.sg.w as u64, mixed_m as u64, m.sg.gs as u64, s.sh12 as u64, p.n2560 as u64, p.n1280 as u64]);
             launch_v(k.f("gemv_fp4_bs"), INTER as u32, t as u32, 1, 256, &[
                 m.su.w as u64, mixed_m as u64, m.su.gs as u64, (s.sh12 + (INTER * 4) as u64), p.n2560 as u64, p.n1280 as u64]);
         }
-        if qfuse_on() {
-            launch_v(k.f("silu_mul640_q"), 3, t as u32, 1, 256, &[s.sh12 as u64, s.sh2 as u64, s.xq_s as u64]);
-        } else {
-            launch_v(k.f("silu_mul640"), 3, t as u32, 1, 256, &[s.sh12 as u64, s.sh2 as u64]);
+        if !sh_fuse {
+            if qfuse_on() {
+                launch_v(k.f("silu_mul640_q"), 3, t as u32, 1, 256, &[s.sh12 as u64, s.sh2 as u64, s.xq_s as u64]);
+            } else {
+                launch_v(k.f("silu_mul640"), 3, t as u32, 1, 256, &[s.sh12 as u64, s.sh2 as u64]);
+            }
         }
         if dense {
-            if !qfuse_on() { launch_v(k.f("quant_x_fp4"), t as u32, 1, 1, 128, &[
-                s.sh2 as u64, s.xq_s as u64, p.n640 as u64, p.one as u64, p.n640 as u64]); }
-            launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
-                m.sdn.w as u64, s.xq_s as u64, m.sdn.gs as u64, s.sdown as u64,
-                p.n640 as u64, p.n2560 as u64, p.n2560 as u64]);
+            if sh_fuse {
+                // the sgv GEMV hoisted before the down launch (reads mixed_m
+                // only, so the hoist crosses no dependency)
+                launch_v(k.f("gemv_b"), 1, t as u32, 1, 256, &[
+                    m.sgate as u64, mixed_m as u64, s.sgv as u64, p.n2560 as u64]);
+                // down GEMV + gate_shared epilogue in ONE launch: moe_out =
+                // sigmoid(sgv[t]) * down, ASSIGN, first writer (no memset:
+                // the cuMemsetD8 history above applies unchanged)
+                launch_v(k.f("gemv_fp4_mma_dg"), (H / 64) as u32, t as u32, 1, mma_bx(), &[
+                    m.sdn.w as u64, s.xq_s as u64, m.sdn.gs as u64, s.sgv as u64,
+                    s.moe_out as u64, p.n640 as u64, p.n2560 as u64, p.n2560 as u64]);
+            } else {
+                if !qfuse_on() { launch_v(k.f("quant_x_fp4"), t as u32, 1, 1, 128, &[
+                    s.sh2 as u64, s.xq_s as u64, p.n640 as u64, p.one as u64, p.n640 as u64]); }
+                launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
+                    m.sdn.w as u64, s.xq_s as u64, m.sdn.gs as u64, s.sdown as u64,
+                    p.n640 as u64, p.n2560 as u64, p.n2560 as u64]);
+            }
         } else {
             launch_v(k.f("gemv_fp4_b"), H as u32, t as u32, 1, 256, &[
                 m.sdn.w as u64, s.sh2 as u64, m.sdn.gs as u64, s.sdown as u64, p.n640 as u64]);
         }
-        launch_v(k.f("gemv_b"), 1, t as u32, 1, 256, &[
-            m.sgate as u64, mixed_m as u64, s.sgv as u64, p.n2560 as u64]);
-        // moe_out is ASSIGNED by gate_shared (first writer) - no memset: the
-        // synchronous cuMemsetD8 ran on the legacy stream and was never part
-        // of a captured graph (replay would accumulate across layers)
-        launch_v(k.f("gate_shared"), 10, t as u32, 1, 256, &[
-            s.sdown as u64, s.sgv as u64, s.moe_out as u64]);
+        if !sh_fuse {
+            launch_v(k.f("gemv_b"), 1, t as u32, 1, 256, &[
+                m.sgate as u64, mixed_m as u64, s.sgv as u64, p.n2560 as u64]);
+            // moe_out is ASSIGNED by gate_shared (first writer) - no memset: the
+            // synchronous cuMemsetD8 ran on the legacy stream and was never part
+            // of a captured graph (replay would accumulate across layers)
+            launch_v(k.f("gate_shared"), 10, t as u32, 1, 256, &[
+                s.sdown as u64, s.sgv as u64, s.moe_out as u64]);
+        }
 
         // routed experts through the residency pointer tables (zero-copy cold)
         // gs_dev is [LAYERS][2] f32 — per-tensor global scales differ per layer

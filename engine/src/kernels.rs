@@ -3025,6 +3025,188 @@ extern "C" __global__ void silu_mul640_q(const float* __restrict__ h1, float* __
     unsigned char* row = xq + (size_t)t * bpr * 108;
     qf_store(v, row, bpr, j);
 }
+// ---------------- 19h (CROW_QFUSE=1): fused shared-expert decode launches ----------------
+// ONE launch replaces the TWO shared-expert gate|up gemv_fp4_mma_d launches AND
+// the silu_mul640_q launch (decode, t < 8): grid (10, T) = (INTER/64, T), block
+// mma_bx(), i.e. the exact gemv_fp4_mma_d shape the separate launches use.
+//  - pass 0 / pass 1: the gemv_fp4_mma_d body VERBATIM over the gate slab (sg.w)
+//    and the up slab (su.w) against the SAME xq_gu row: same lane split, same
+//    k-block walk per ks slice, same red[4][2][64] ks-split reduce, so every mma
+//    and FP32 add is one the separate launches makes (they differ only in the
+//    weight pointer, gs and the store address). The two finished f32 accumulator
+//    values (s0 * gs) are exchanged through smem, which is exact.
+//  - the silu_mul640_q math folds in warp-wide on the FINISHED pairs:
+//    v = (gate / (1 + expf(-gate))) * up, written to sh2[t][j] and quantized
+//    with qf_store (bpr = 10) exactly like silu_mul640_q. The epilogue keeps
+//    j = tile + rg*32 + lane (ks == 0, rg in {0,1}: exactly 2 warps x 32 lanes
+//    = the 64-row tile), so within a warp the low 4 lane bits equal j & 15 and
+//    quant16_store's shuffle groups (partners j^1/2/4/8 inside the same
+//    16-wide sub-block) see exactly the layout the standalone launch has.
+//    The sh12 write is dead in the fused chain and is skipped (the 19f
+//    dead-write pattern).
+extern "C" __global__ void sh_gate_up_q(const unsigned char* __restrict__ wg,
+                                        const unsigned char* __restrict__ wu,
+                                        const unsigned char* __restrict__ xq,
+                                        const float* __restrict__ gsg_ptr,
+                                        const float* __restrict__ gsu_ptr,
+                                        float* __restrict__ h2,
+                                        unsigned char* __restrict__ xq_s,
+                                        const int* __restrict__ k_dim_p,
+                                        const int* __restrict__ rows_p) {
+    int k_dim = *k_dim_p;
+    int bpr = k_dim >> 6;
+    int rows = *rows_p;
+    int tok = blockIdx.y;
+    int tile = blockIdx.x << 6;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int ks_n = blockDim.x >> 7;
+    int rg = warp & 3, ks = warp >> 2;
+    int g = lane >> 2, lt = lane & 3;
+    int w0 = tile + (rg << 4);
+    bool active = w0 < rows;   // whole-warp guard; no early return (smem barrier below)
+    int r0 = w0 + g, r1 = w0 + g + 8;
+    __shared__ float red[4][2][64];
+    __shared__ float sg_sh[64], su_sh[64];
+    float sg0 = 0.0f, sg2 = 0.0f, su0 = 0.0f, su2 = 0.0f;
+    for (int pass = 0; pass < 2; pass++) {
+        const unsigned char* w = (pass == 0) ? wg : wu;
+        float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+        if (active) {
+            const unsigned char* xa = xq + (size_t)tok * bpr * 108;
+            const unsigned char* rowg = w + (size_t)min(r0, rows - 1) * bpr * 36;
+            const unsigned char* rowg8 = w + (size_t)min(r1, rows - 1) * bpr * 36;
+            const unsigned char* sfrow = (lt & 1) ? rowg8 : rowg;
+            int bpb = (bpr + ks_n - 1) / ks_n;
+            int b_lo = ks * bpb, b_hi = min(bpr, b_lo + bpb);
+            for (int b = b_lo; b < b_hi; b++) {
+                const unsigned char* blk = rowg + b * 36;
+                const unsigned char* blk8 = rowg8 + b * 36;
+                const unsigned char* ab = xa + b * 36;
+                unsigned int sa = sfrow[b * 36 + 0] | (unsigned int)sfrow[b * 36 + 1] << 8
+                                | (unsigned int)sfrow[b * 36 + 2] << 16 | (unsigned int)sfrow[b * 36 + 3] << 24;
+                unsigned int a0 = *(const unsigned int*)(blk + 4 + 4 * lt);
+                unsigned int a1 = *(const unsigned int*)(blk8 + 4 + 4 * lt);
+                unsigned int a2 = *(const unsigned int*)(blk + 20 + 4 * lt);
+                unsigned int a3 = *(const unsigned int*)(blk8 + 20 + 4 * lt);
+                unsigned int sb = ab[0] | (unsigned int)ab[1] << 8
+                                | (unsigned int)ab[2] << 16 | (unsigned int)ab[3] << 24;
+                unsigned int b0 = *(const unsigned int*)(ab + 4 + 4 * lt);
+                unsigned int b1 = *(const unsigned int*)(ab + 20 + 4 * lt);
+                mma_fp4_16n8k64(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, sa, sb);
+                #pragma unroll
+                for (int lv = 1; lv < 3; lv++) {
+                    const unsigned char* ab2 = ab + lv * bpr * 36; // residual level
+                    unsigned int sb2 = ab2[0] | (unsigned int)ab2[1] << 8
+                                     | (unsigned int)ab2[2] << 16 | (unsigned int)ab2[3] << 24;
+                    unsigned int c0 = *(const unsigned int*)(ab2 + 4 + 4 * lt);
+                    unsigned int c1 = *(const unsigned int*)(ab2 + 20 + 4 * lt);
+                    mma_fp4_16n8k64(d0, d1, d2, d3, a0, a1, a2, a3, c0, c1, sa, sb2);
+                }
+            }
+        }
+        if (lt == 0) { red[ks][0][(rg << 4) + g] = d0; red[ks][1][(rg << 4) + g] = d2; }
+        __syncthreads();
+        if (ks == 0 && lt == 0 && active) {
+            float s0 = 0.0f, s2 = 0.0f;
+            for (int i = 0; i < ks_n; i++) { s0 += red[i][0][(rg << 4) + g]; s2 += red[i][1][(rg << 4) + g]; }
+            float gs = ((pass == 0) ? gsg_ptr : gsu_ptr)[0];
+            if (pass == 0) { sg0 = s0 * gs; sg2 = s2 * gs; }
+            else           { su0 = s0 * gs; su2 = s2 * gs; }
+        }
+        __syncthreads(); // the red slots are rewritten by the next pass
+    }
+    if (ks == 0 && lt == 0 && active) {
+        sg_sh[r0 - tile] = sg0; sg_sh[r1 - tile] = sg2;
+        su_sh[r0 - tile] = su0; su_sh[r1 - tile] = su2;
+    }
+    __syncthreads();
+    if (ks == 0 && rg < 2) {
+        int j = tile + (rg << 5) + lane;
+        if (j < rows) {
+            float gate = sg_sh[j - tile];
+            float v = (gate / (1.0f + expf(-gate))) * su_sh[j - tile];
+            h2[(size_t)tok * 640 + j] = v;
+            const int bprq = 10;
+            unsigned char* row = xq_s + (size_t)tok * bprq * 108;
+            qf_store(v, row, bprq, j);
+        }
+    }
+}
+
+// 19h: gemv_fp4_mma_d with the gate_shared epilogue folded in (CROW_QFUSE=1
+// shared-expert chain, the down projection): gate_shared reads the finished
+// down accumulator back and ASSIGNS (1 / (1 + expf(-sgv[t]))) * s[t][c] into
+// moe_out as its FIRST WRITER (no memset, graph-capturable), so folding it
+// into the store is bit-identical: the stored f32 (s0 * gs) is exactly what
+// gate_shared re-reads, and the expression order is kept. y = moe_out; the
+// s.sdown write is dead in the fused chain and is skipped.
+extern "C" __global__ void gemv_fp4_mma_dg(const unsigned char* __restrict__ w,
+                                           const unsigned char* __restrict__ xq,
+                                           const float* __restrict__ gs_ptr,
+                                           const float* __restrict__ sgv,
+                                           float* __restrict__ y,
+                                           const int* __restrict__ k_dim_p,
+                                           const int* __restrict__ rows_p,
+                                           const int* __restrict__ y_stride_p) {
+    int k_dim = *k_dim_p;
+    int bpr = k_dim >> 6;
+    int rows = *rows_p;
+    int ys = *y_stride_p;
+    int tok = blockIdx.y;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int ks_n = blockDim.x >> 7;
+    int rg = warp & 3, ks = warp >> 2;
+    int g = lane >> 2, lt = lane & 3;
+    int w0 = (blockIdx.x << 6) + (rg << 4);
+    bool active = w0 < rows;   // whole-warp guard; no early return (smem barrier below)
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+    int r0 = w0 + g, r1 = w0 + g + 8;
+    if (active) {
+        const unsigned char* xa = xq + (size_t)tok * bpr * 108;
+        const unsigned char* rowg = w + (size_t)min(r0, rows - 1) * bpr * 36;
+        const unsigned char* rowg8 = w + (size_t)min(r1, rows - 1) * bpr * 36;
+        const unsigned char* sfrow = (lt & 1) ? rowg8 : rowg;
+        int bpb = (bpr + ks_n - 1) / ks_n;
+        int b_lo = ks * bpb, b_hi = min(bpr, b_lo + bpb);
+        for (int b = b_lo; b < b_hi; b++) {
+            const unsigned char* blk = rowg + b * 36;
+            const unsigned char* blk8 = rowg8 + b * 36;
+            const unsigned char* ab = xa + b * 36;
+            unsigned int sa = sfrow[b * 36 + 0] | (unsigned int)sfrow[b * 36 + 1] << 8
+                            | (unsigned int)sfrow[b * 36 + 2] << 16 | (unsigned int)sfrow[b * 36 + 3] << 24;
+            unsigned int a0 = *(const unsigned int*)(blk + 4 + 4 * lt);
+            unsigned int a1 = *(const unsigned int*)(blk8 + 4 + 4 * lt);
+            unsigned int a2 = *(const unsigned int*)(blk + 20 + 4 * lt);
+            unsigned int a3 = *(const unsigned int*)(blk8 + 20 + 4 * lt);
+            unsigned int sb = ab[0] | (unsigned int)ab[1] << 8
+                            | (unsigned int)ab[2] << 16 | (unsigned int)ab[3] << 24;
+            unsigned int b0 = *(const unsigned int*)(ab + 4 + 4 * lt);
+            unsigned int b1 = *(const unsigned int*)(ab + 20 + 4 * lt);
+            mma_fp4_16n8k64(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, sa, sb);
+            #pragma unroll
+            for (int lv = 1; lv < 3; lv++) {
+                const unsigned char* ab2 = ab + lv * bpr * 36; // residual level
+                unsigned int sb2 = ab2[0] | (unsigned int)ab2[1] << 8
+                                 | (unsigned int)ab2[2] << 16 | (unsigned int)ab2[3] << 24;
+                unsigned int c0 = *(const unsigned int*)(ab2 + 4 + 4 * lt);
+                unsigned int c1 = *(const unsigned int*)(ab2 + 20 + 4 * lt);
+                mma_fp4_16n8k64(d0, d1, d2, d3, a0, a1, a2, a3, c0, c1, sa, sb2);
+            }
+        }
+    }
+    __shared__ float red[4][2][64];
+    if (lt == 0) { red[ks][0][(rg << 4) + g] = d0; red[ks][1][(rg << 4) + g] = d2; }
+    __syncthreads();
+    float gs = gs_ptr[0];
+    if (ks == 0 && lt == 0 && active) {
+        float s0 = 0.0f, s2 = 0.0f;
+        for (int i = 0; i < ks_n; i++) { s0 += red[i][0][(rg << 4) + g]; s2 += red[i][1][(rg << 4) + g]; }
+        float sig = 1.0f / (1.0f + expf(-sgv[tok]));   // gate_shared epilogue, ASSIGN
+        if (r0 < rows) y[(size_t)tok * ys + r0] = sig * (s0 * gs);
+        if (r1 < rows) y[(size_t)tok * ys + r1] = sig * (s2 * gs);
+    }
+}
+
 extern "C" __global__ void silu_mul_combo_q(const float* __restrict__ h1, float* __restrict__ h2,
                                             const int* __restrict__ n640_p, unsigned char* __restrict__ xq) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -3598,7 +3780,7 @@ impl Kernels {
             "ple_state_update", "ple_conv_step", "argmax_k", "sample_topk_part", "sample_k", "add_flat",
             "gemv_bf16_b", "gemv_bf16_w", "gemv_fp4_b1k", "hc_down_inj", "gemv_bf16_ws",
             "gemm_fp4_dense", "gemm_bf16_dense", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
-            "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "gemv_fp4_mma_g", "attn_sel_r", "attn_sel_d8", "attn_sel_d9", "attn_sel_s", "attn_sel_s8", "attn_sel_s8l", "attn_sel_g",
+            "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "gemv_fp4_mma_dg", "sh_gate_up_q", "gemv_fp4_mma_g", "attn_sel_r", "attn_sel_d8", "attn_sel_d9", "attn_sel_s", "attn_sel_s8", "attn_sel_s8l", "attn_sel_g",
         ];
         let mut map = HashMap::new();
         for n in names {
