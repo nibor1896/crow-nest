@@ -140,11 +140,12 @@ Helpers used by the read sites:
 | `CROW_SEED` | `engine/src/sample.rs:80` | integer; default `0` | sampler seed, also the RNG start state (`sample.rs:81`) | measurement | `sample.rs:53`: the record names the seed, so a sampled answer is reproducible |
 | `CROW_STOP_EOS` | `engine/src/sample.rs:192` | `1` enables; default off | ends a harness run at EOS | measurement | `bin/serve.rs:194`: `sample::EOS_IDS` stops both server modes and this variable is NOT read there |
 
-## Server (1 row)
+## Server (2 rows)
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
 | `CROW_PREFIX_CACHE` | `engine/src/cache.rs:309` | `0` disables; default on | allocates the one held-conversation slot (M1, spec 7.7) | operating | `0` makes every request a cold start and prints `L n/a` (`bin/serve.rs:386`, `bin/serve.rs:397`, `bin/serve.rs:2324`); error texts at `slot.rs:493`, `slot.rs:585` |
+| `CROW_VIT` | `engine/src/vit.rs` (`vit_on`, read by the load at `engine/src/gen.rs` and by serve) | `0` = the text-only placeholder of record (no vit load, `/props` `modalities.vision` false, image requests ride the single `image_pad` token); unset or any other value = the visual tower loads and image requests are served (default ON, the flip of the #VIT gates) | loads the container's `vit` section beside the text sections (27 vision blocks + patch embed + merger, 112 NVFP4 + 221 bf16 tensors, about 1.3 GiB with the cap-sized scratch); serve then answers Crow's image wire (`image_url` data-URL blocks, crow_core.py `image_part`): decode, smart_resize, the f32 tower, the embedding splice at the expanded `image_pad` rows and the interleaved-mrope span tables; `/props` reports `vision` per the switch so Crow's `refuse_images` (crow_core.py:1429) sends or refuses; one `[vit]` boot line per process names mode + switch + cap | operating | #VIT, 2026-09-14: text parity with the tower LOADED (no env) byte-identical to `d211ab52ad2b` at the 61b sha256 values of record (8 `bceba6ff7724`, 512 `14c8628acbec` x2, 1024 `b2e87b2bf99a`, PX `f217e1c55926` under the > 26 GiB VRAM headroom gate) AND with `CROW_VIT=0`; ten tasks 10 of 10 vs final4; ViT parity vs the f32 container-dequant oracle (identical weights both sides, math-precision band) max_abs 3.4e-06 at cos 1.000000 on the smoke image; end-to-end image-prompt oracle in `oracle/ref_image_prompt_logits.py`; image caps: 16384 patches = 4096 visual tokens per image, smart_resize factor 32, min 65536 / max 16777216 px (bigger requests answer 400); `decode_out/srv-vit.log`, RTX 5090 |
 
 ## Tokenizer (2 rows)
 
@@ -153,7 +154,7 @@ Helpers used by the read sites:
 | `CROW_TOKENIZER` | `engine/src/tokenizer.rs:359` | path; default `DEFAULT_TOKENIZER` = `models/Qwen3.8-Flash-Next-original/tokenizer.json` | HF tokenizer file, repository relative | operating | table at `tokenizer.rs:13` |
 | `CROW_TOKENIZER_CONFIG` | `engine/src/tokenizer.rs:360` | path; default the sibling `tokenizer_config.json` of the tokenizer | source of the `chat_template` field | operating | table at `tokenizer.rs:14` |
 
-## Dumps and profiling (6 rows)
+## Dumps and profiling (8 rows)
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
@@ -162,6 +163,8 @@ Helpers used by the read sites:
 | `CROW_DUMP_H` | `engine/src/gen.rs:2251` | directory path; default off | writes `.f32` stage dumps for the determinism bisect | diagnostic | also `gen.rs:2263`, `gen.rs:2307`, `gen.rs:2680`, `gen.rs:2766`, `gen.rs:2795`; forces `cuda::sync()` at every dump point, so timings taken with it are not serving numbers |
 | `CROW_DROP_DBG` | `engine/src/cuda.rs:260` | `1` enables; default off | prints free VRAM and live allocation counts at named points | diagnostic | #18 leak hunt |
 | `CROW_GRAPH_DBG` | `engine/src/gen.rs:2860` | any value; default off | prints graph capture progress markers | diagnostic | effective only while `CROW_GRAPH=1`; markers at `gen.rs:2922` to `gen.rs:3047` |
+| `CROW_VIT_DUMP` | `engine/src/vit.rs` (`Vit::build_plan`), `engine/src/bin/serve.rs` (`chat_generate`) | directory path; default off | per image request writes the oracle inputs: per-image `imgN.patches.f32` / `imgN.pe-w.f32` / `imgN.meta.json`, the tower output `vit-embeds.f32`, `vit-gen-sequence.json` (expanded ids, visual map, grids, generated ids) and `gpu-logits.f32` (one f32 row per prompt position) | diagnostic | #VIT oracle compare path (`oracle/ref_vit_golden.py`, `oracle/ref_image_prompt_logits.py`); forces `cuda::sync()` at the dump points, so timings taken with it are not serving numbers |
+| `CROW_VIT_TRACE` | `engine/src/vit.rs` | any value; default off | `[vit-trace]` progress lines during the vit load and, with `CROW_VIT_DUMP` set, the tower stage dumps (`stage-pe`, `stage-block0`, `stage-b0-*`, `stage-cs`/`stage-sn`) for the stage-by-stage oracle bisect (`oracle/ref_vit_stages.py`) | diagnostic | #VIT bisect harness; every dump point forces `cuda::sync()` |
 | `CROW_ROUTE_DUMP` | `engine/src/gen.rs:2861` | any value; default off | logs the routed expert ids per token per layer into `Engine::route_log` | diagnostic | non-graph decode only; `bin/decode.rs:313` sets it for `routestats` together with `CROW_GRAPH=0`; the log grows per token and never shrinks (`reset.rs:20`, `cache.rs:49`) |
 
 ## Tooling and process (2 rows)

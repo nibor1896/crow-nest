@@ -3,7 +3,7 @@
 | item | value |
 |---|---|
 | product | inference engine for one model on one GPU, own quantization, own container, thin CUDA kernels in Rust |
-| model | Qwen3.8-Flash-Next as CNQ4.5-M (NVFP4, 4.5 bpw), converted from the original safetensors |
+| model | Qwen3.8-Flash-Next as CNQ4.5-M (NVFP4, 4.5 bpw), converted from the original safetensors; the container carries the visual tower (`vit` section) and serve answers image requests (`CROW_VIT`, default on) |
 | platform | Windows, NVIDIA Blackwell (`sm_120`), CUDA only |
 | license | code Apache-2.0 (`LICENSE`); the model files carry the Qwen Community License 1.0 |
 
@@ -12,6 +12,7 @@
 - An engine that loads one CNQ container and serves it over HTTP to one client.
 - The client is the Crow repository (`nibor1896/Crow`), which talks to `serve` the way it talks to llama-server.
 - Three product binaries: `serve` (HTTP), `decode` (single run and parity dumps), `parity` (the standing ten-task harness).
+- The engine sees (#VIT, 2026-09-14): Crow's `/image`, drag-and-drop and `read_image` work against `serve` — the container's visual tower loads by default, the f32 tower matches the oracle at cos 1.000000, and the text path stays byte-identical (`decode_out/srv-vit.log`).
 - Fourteen further binaries under `engine/src/bin` are probes and gates, not product surface (`engine/README.md`).
 - Non-goals from the decision record: no training, no multi-user, no multi-GPU, no arbitrary architectures, no GGUF input, no CPU-only mode.
 

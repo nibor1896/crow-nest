@@ -1166,7 +1166,7 @@ Therefore:
 | `model` | the container file stem, `.cnq` stripped | `serve.rs:780` (`model_name`) | `crow_core.py:14884` (`fetch_model_name`) |
 | `n_ctx` | `Engine::st.context`, read back from the load, 200,000 (`CONTEXT_FLOOR`) | `serve.rs:787` | `crow_core.py:14837` (`fetch_n_ctx`) |
 | `default_generation_settings.n_ctx` | the same number | `serve.rs:787` | `crow_core.py:14837` |
-| `modalities.vision` | `false` | `serve.rs:787` | `crow_core.py:1429` (`refuse_images`) |
+| `modalities.vision` | `true` when the vit tower is loaded (`CROW_VIT` unset, the default), `false` with `CROW_VIT=0` (#VIT, 2026-09-14) | `serve.rs` (`props_json`) | `crow_core.py:1429` (`refuse_images`) |
 | `prompt_chunk` | 2048 (M1) | `serve.rs:787` | no reader in Crow, informational |
 | `build` | `crow-nest-engine 0.1.0` | `serve.rs:787` | no reader in Crow, informational |
 
@@ -1523,3 +1523,12 @@ C:/x/y.md
 - Rule: the server work must not move the decode path, and "nothing in the kernels changed"
   is not evidence of that.
 - Reason: the PLE bug of epic #1 stayed hidden for two days behind exactly that sentence.
+
+
+### 7.13 The image path (#VIT, 2026-09-14)
+
+- The container's `vit` section (27 vision blocks x 12 tensors + patch embed + learned position table + merger; 112 NVFP4 + 221 bf16 keeps) loads beside the text sections when `CROW_VIT` is unset (default ON); `CROW_VIT=0` is the text-only placeholder of record. Weights resident at load; the cap-sized scratch (about 640 MiB at 16,384 patches = 4,096 visual tokens) allocates lazily on the first image request, so text-only boots keep the full planner budget.
+- Serve accepts Crow's image wire exactly (`image_url` data-URL blocks, `crow_core.py image_part`), decodes the five client formats (the `image` crate, decode features), preprocesses per the HF fast processor (smart_resize factor 32, min 65,536 / max 16,777,216 px, antialiased bicubic, 0.5/0.5 normalize, spatial-merge-block patch order), and runs the tower in f32 on the NVFP4 weights (`engine/src/vit.rs`).
+- The visual embeddings splice into the text stream at the expanded `<|image_pad|>` rows (host-side, pre-upload), and the rope kernels read a per-request INTERLEAVED-mrope cos/sin span table (section [11, 11, 10], partial rotary 0.25, theta 1e7 — the `get_rope_index` positions) instead of the load-time table while an image conversation is live. All physical indexing (KV rows, QSA rings, pooled blocks) stays sequential; only the table content changes.
+- Measured (RTX 5090, 2026-09-14, `decode_out/srv-vit.log`): ViT embeddings vs the f32 container-dequant oracle max_abs 3.43e-06 at cos 1.000000; text parity with the tower loaded AND with `CROW_VIT=0` byte-identical to `d211ab52ad2b` at the 61b sha256 values of record including the PX teacher-forced 16,064-row form `f217e1c55926` under the > 26 GiB VRAM headroom gate (23 of 23 subchecks); ten tasks 10 of 10 identical to final4; image-prompt pairs (text-only 26-token prompt vs the 224-token image prompt, fresh process per run): text prefill 406.1 ms vs 1,626.2 ms, pair delta mean +1,220.1 ms, plus the vision window of 35.3 s per request (`[vit-chat]`) — the tower GEMVs run the text-style per-token shape and are the known optimization lever.
+- The oracle chain lives in `oracle/` (`cnq_weights.py`, `ref_vit_golden.py`, `ref_vit_stages.py`, `ref_image_prompt_logits.py`): f32 references over the SAME container-dequantized weights (orchestrator ruling 2026-09-14 — the band is math precision only). The llama.cpp mmproj comparison was deferred to the B-series (orchestrator ruling).
