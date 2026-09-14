@@ -1497,7 +1497,7 @@ fn attn_sel_gx_bx() -> (u32, u32) { if attn_r_mode() == 5 { (NKV as u32, 384) } 
 /// full-chunk buffer (one sub-batch).
 pub const ATTN_SB: usize = 512;
 fn attn_sb_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| env_on("CROW_ATTN_SB")) }
-fn attn_sb(chunk: usize) -> usize { if attn_sb_on() { chunk.min(ATTN_SB).max(1) } else { chunk.max(1) } }
+fn attn_sb(chunk: usize) -> usize { if attn_sb_on() { chunk.clamp(1, ATTN_SB) } else { chunk.max(1) } }
 pub const ATTN_SPLITS: usize = 8;
 /// #61a: the partial buffers are sized for the largest allowed split count,
 /// so CROW_ATTN_SPLITS can be raised at runtime without a reallocation.
