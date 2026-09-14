@@ -57,12 +57,15 @@
 //! - `prefill` zeroes S only when `self.pos == 0` (`gen.rs:2433`, `gen.rs:2495`), which is
 //!   exactly the cold start, so a restored `pos > 0` leaves the restored S alone.
 //!
-//! When a snapshot is taken (M2b, robin 2026-09-10, #36: ONE slot, unconditional):
+//! When a snapshot is taken (M2b, robin 2026-09-10, #36: after the prompt, unconditional):
 //!
 //! | slot | point | position |
 //! |---|---|---|
-//! | `SLOT_PROMPT` | after the prefill of this turn's prompt | rendered prompt length |
+//! | `SLOT_PROMPT` (slot 0) | after the prefill of this turn's prompt | rendered prompt length |
+//! | slots 1..`SLOTS` | the previous turns' prompts, aged by `rotate_right` | their rendered lengths |
 //!
+//! - Holding the last few prompt snapshots is what turns a history edit that diverges
+//!   below the newest position from a full cold prefill into a rollback to the previous turn.
 //! - The after-answer snapshot of M1 (spec 7.6 point 2) is DROPPED, see the section below.
 //! - The last generated id is never fed back, so it is not in `history` and not in `pos`.
 //! - ONE held conversation per process (M1): a request that shares no prefix replaces it.
@@ -75,11 +78,12 @@
 //! PLE conv      10240 * 9      * 4 =     368,640 B
 //! QSA ring 12 * 2052 * 128     * 4 =  12,607,488 B
 //! total per slot                   = 130,646,016 B = 124.60 MiB
-//! process total (SLOTS = 1)        = 130,646,016 B = 124.60 MiB
+//! process total (SLOTS = 3)        = 391,938,048 B = 373.80 MiB
 //! ```
 //!
 //! - M1 held two slots (261,292,032 B); M2 (robin, 2026-09-10, #36) dropped the
-//!   after-answer slot.
+//!   after-answer slot; M3 keeps `SLOTS` prompt snapshots (newest in slot 0) so a
+//!   history edit that diverges below the newest still rolls back to an older turn.
 //! - Pageable host RAM, allocated once at process start, reused per snapshot.
 //! - Not pinned (the pinned tier is budgeted at 46 GiB, `geo.rs:110`).
 //! - Not VRAM (the loader already clamps N against it, `manager.rs:122-170`).
@@ -158,8 +162,11 @@ use cudarc::driver::sys;
 
 /// slot of the snapshot taken after the prompt prefill (spec 7.6, point 1)
 pub const SLOT_PROMPT: usize = 0;
-/// slots held per conversation (M2b, #36: the after-answer slot was dropped)
-pub const SLOTS: usize = 1;
+/// prompt snapshots held per conversation, newest in slot 0, older behind it. Keeping
+/// the last few turn prompts lets a history edit that diverges below the newest
+/// position roll back to an older prefill clean point (partial reuse) instead of
+/// paying the whole prefill the way a single snapshot does.
+pub const SLOTS: usize = 3;
 
 /// f32 slots of one GDN layer's recurrent state S, `[48][128][128]` (`manager.rs:60`)
 const GDN_S_STATE: usize = GDN_VHEADS * GD * GD;
@@ -406,9 +413,13 @@ impl PrefixCache {
         }
     }
 
-    /// - copy the four recurrent buffers device to host into `slot`
+    /// - copy the four recurrent buffers device to host into `SLOT_PROMPT` (slot 0)
     /// - `prefill_clean` says whether every row below `Engine::pos` is a prefill row;
     ///   `false` keeps the slot out of `reuse_candidates` (see the module doc)
+    /// - BEFORE the copy the held slots age by one (`rotate_right`): the oldest moves into
+    ///   slot 0 and is the one this snapshot overwrites in place, so no buffer is reallocated.
+    ///   A history edit that diverges below the newest position then still finds the previous
+    ///   turn's snapshot further down (partial reuse, llama.cpp's behaviour).
     /// - returns the wall of the copy in ms (spec 7.9 asks for it)
     /// - a disabled cache does nothing and returns 0.0
     ///
@@ -416,14 +427,15 @@ impl PrefixCache {
     ///
     /// - a CUDA context must be current, as for every other engine call
     /// - no kernel of this engine may be in flight on another thread
-    pub unsafe fn snapshot(&mut self, eng: &Engine, slot: usize, prefill_clean: bool) -> f64 {
-        if !self.enabled || slot >= self.slots.len() {
+    pub unsafe fn snapshot(&mut self, eng: &Engine, prefill_clean: bool) -> f64 {
+        if !self.enabled || self.slots.is_empty() {
             return 0.0;
         }
         let t0 = std::time::Instant::now();
         // whatever the last launch left in flight must land before the copy reads it
         cuda::sync();
-        let s = &mut self.slots[slot];
+        self.slots.rotate_right(1);
+        let s = &mut self.slots[SLOT_PROMPT];
         for (i, buf) in s.gdn_s.iter_mut().enumerate() {
             dtoh_into(buf, eng.st.gdn_s[i]);
         }
@@ -697,8 +709,8 @@ mod tests {
     fn a_fresh_cache_holds_no_position() {
         let c = PrefixCache::for_shape(tiny(), true);
         assert!(c.enabled());
-        assert_eq!(c.positions(), vec![None]);
-        assert_eq!(c.reuse_candidates(), vec![None]);
+        assert_eq!(c.positions(), vec![None, None, None]);
+        assert_eq!(c.reuse_candidates(), vec![None, None, None]);
         assert_eq!(c.decide(&[1, 2, 3], &[1, 2, 3, 4]).reuse, None);
     }
 
@@ -711,45 +723,64 @@ mod tests {
         // prefill clean: reported in both lists, and the decision rolls back onto it
         let mut c = PrefixCache::for_shape(tiny(), true);
         c.set_slot(SLOT_PROMPT, 60, true);
-        assert_eq!(c.positions(), vec![Some(60)]);
-        assert_eq!(c.reuse_candidates(), vec![Some(60)]);
+        assert_eq!(c.positions(), vec![Some(60), None, None]);
+        assert_eq!(c.reuse_candidates(), vec![Some(60), None, None]);
         let d = c.decide(&held, &new);
         assert_eq!(d.l, 100);
         assert_eq!(d.reuse, Some((SLOT_PROMPT, 60)));
         assert_eq!(d.cached_n(), 60);
         // NOT prefill clean: `positions` still reports it, `reuse_candidates` hides it,
-        // and with no second slot to fall back on the request is cold
+        // and with only empty slots left to fall back on the request is cold
         let mut c = PrefixCache::for_shape(tiny(), true);
         c.set_slot(SLOT_PROMPT, 60, false);
-        assert_eq!(c.positions(), vec![Some(60)]);
-        assert_eq!(c.reuse_candidates(), vec![None]);
+        assert_eq!(c.positions(), vec![Some(60), None, None]);
+        assert_eq!(c.reuse_candidates(), vec![None, None, None]);
         let d = c.decide(&held, &new);
         assert_eq!(d.l, 100);
         assert_eq!(d.reuse, None);
         assert_eq!(d.cached_n(), 0);
     }
 
-    /// #36 M2b (robin 2026-09-10, option b): ONE slot per process, the prompt slot
+    /// M2b (one slot, #36) + M3: SLOTS prompt snapshots per process, newest in slot 0, so
+    /// a history edit that diverges below the newest position still finds the previous turn's
     #[test]
-    fn the_process_holds_one_slot_and_one_reuse_candidate() {
-        assert_eq!(SLOTS, 1);
+    fn the_process_holds_three_prompt_slots() {
+        assert_eq!(SLOTS, 3);
         let mut c = PrefixCache::for_shape(tiny(), true);
         c.set_slot(SLOT_PROMPT, 60, true);
-        assert_eq!(c.positions(), vec![Some(60)]);
-        assert_eq!(c.reuse_candidates(), vec![Some(60)]);
+        assert_eq!(c.positions(), vec![Some(60), None, None]);
+        assert_eq!(c.reuse_candidates(), vec![Some(60), None, None]);
         assert_eq!(c.reuse_candidates().iter().filter(|p| p.is_some()).count(), 1);
     }
 
-    /// `invalidate` is what a cold start runs: the slot forgets position AND flag
+    /// the edit case from the live serve log: three held prompts (newest 87746, previous
+    /// 86359, older 86254), the edit diverges at 87389, so the newest is out of reach and
+    /// the previous turn is reused instead of resetting to a full cold prefill
+    #[test]
+    fn an_edit_below_the_newest_snapshot_reuses_the_previous_turn() {
+        assert_eq!(
+            reuse_slot(&[Some(87_746), Some(86_359), Some(86_254)], 87_389, 87_510),
+            Some((1, 86_359))
+        );
+    }
+
+    /// `invalidate` is what a cold start runs: every slot forgets position AND flag
     #[test]
     fn invalidate_clears_the_position_and_the_flag() {
         let mut c = PrefixCache::for_shape(tiny(), true);
         c.set_slot(SLOT_PROMPT, 60, true);
-        assert_eq!(c.reuse_candidates(), vec![Some(60)]);
+        assert_eq!(c.reuse_candidates(), vec![Some(60), None, None]);
         c.invalidate();
-        assert_eq!(c.positions(), vec![None]);
-        assert_eq!(c.reuse_candidates(), vec![None]);
+        assert_eq!(c.positions(), vec![None, None, None]);
+        assert_eq!(c.reuse_candidates(), vec![None, None, None]);
         // and a request that would have been warm is now cold
-        assert_eq!(c.decide(&(0..100).collect::<Vec<i64>>(), &(0..110).collect::<Vec<i64>>()).reuse, None);
+        assert_eq!(
+            c.decide(
+                &(0..100).collect::<Vec<i64>>(),
+                &(0..110).collect::<Vec<i64>>()
+            )
+            .reuse,
+            None
+        );
     }
 }

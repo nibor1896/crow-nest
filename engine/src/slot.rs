@@ -616,6 +616,10 @@ pub unsafe fn restore(
 
     // from here the engine is written; every refusal above left it untouched
     cuda::sync();
+    // a restore REPLACES the held conversation: the other snapshots now name a different
+    // history and must not stay reuse candidates (they were only valid for the state the
+    // file overwrites).
+    cache.invalidate();
     // the A4 ordering, exactly as `cache::PrefixCache::rollback`: the uploads below and the
     // prefill of the next request need the legacy stream (`reset.rs`, "The active stream")
     eng.drop_decode_graph();

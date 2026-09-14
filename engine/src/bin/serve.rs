@@ -439,7 +439,7 @@
 //! - A refusal answers 4xx with a JSON error body and leaves the engine exactly as it was.
 //! - `--slot-save-path` must name an EXISTING directory; a typo refuses the BOOT, not the save.
 
-use crow_nest_engine::cache::{PrefixCache, SLOTS, SLOT_PROMPT};
+use crow_nest_engine::cache::{PrefixCache, SLOTS};
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::{DevSampler, Engine};
 use crow_nest_engine::geo::{apply_adapt_policy, Adapt, Config, CONTEXT_FLOOR, LAYERS};
@@ -1846,7 +1846,7 @@ fn chat_generate(
     // Before the first `decode_step`, so no capture stream is live and no graph exists yet.
     // prefill clean: the prefill above started at 0 or at a prefill clean `P`, so every
     // KV and pooled QSA row below `pos` is a prefill row (`cache.rs`, the induction)
-    let snap1_ms = unsafe { srv.cache.snapshot(srv.eng, SLOT_PROMPT, true) };
+    let snap1_ms = unsafe { srv.cache.snapshot(srv.eng, true) };
     // a disabled cache copies nothing, so it reports nothing either
     if cache_on {
         eprintln!(

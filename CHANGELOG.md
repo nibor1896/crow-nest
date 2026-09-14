@@ -182,6 +182,10 @@
 - Ampere and Ada are not planned: the fallback stage was closed for want of a card, `#12`.
 - The clippy job renders red while non-blocking: 1314 warnings, 1085 `unnecessary_cast`, measured 2026-09-11 (`#50`).
 
+## 2026-09-14 — v0.2.1: the prefix cache survives a history edit
+
+- **M3 multi-snapshot cache (#36 follow-up)**: `SLOTS` 1 -> 3 — the engine holds the last three turn-prompt snapshots (newest in slot 0, older aged by `rotate_right`) instead of one, so a history edit that diverges below the newest position rolls back to the previous turn's snapshot (partial reuse at the deepest common prefix `L`) instead of collapsing into a full cold prefill. The live `serve` log (2026-09-14) showed the exact collapse: an edit that dropped a 1024-token `finish=length` answer forced `COLD L 87389, prefill 87510 of 87510 tok` = 215 s, while the 28 turns around it reused warm. Save/restore stays on slot 0 (slot file byte-compatible with v0.2.0); `slot.rs::restore` invalidates the older slots first. Tests: lib 82/82 (new `an_edit_below_the_newest_snapshot_reuses_the_previous_turn` pins the log's edit case), serve 60/60. Cost: +260 MiB pageable host RAM (3 x 130 MiB), no VRAM change.
+
 ## 2026-09-14 — v0.2.0: the decode line is crossed, and the engine sees
 
 - **62e**: the GDN big-slab GEMV geometry (32 rows per block) — decode **22.1761 ms = 45.1 tok/s** vs llama.cpp 22.27 = 44.9 on the same model, quant and machine (RTX 5090), greedy ids bit-identical (`5098f885ab3a`, 7/7). The first engine default under the llama.cpp row.
