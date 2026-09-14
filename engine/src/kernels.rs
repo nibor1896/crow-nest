@@ -4358,6 +4358,104 @@ extern "C" __global__ void vit_attn(const float* __restrict__ qkv, float* __rest
     }
 }
 
+// Tiled f32-activation NVFP4 GEMM for the vision tower (#VIT hotfix):
+// y[t][rows] = W x^T with RAW f32 activations (the text dense GEMMs consume
+// the quantized cascade, which would move the tower off the ~3e-6 oracle
+// band). One block = 64 rows x 32 tokens; k walked in 64-value tiles; the
+// tile's weight values (e2m1 magnitudes, NO scale) and the activation tile
+// are staged in smem, so weight and activation reads amortize over 32 tokens
+// and 64 rows instead of the per-(row, token) GEMV re-reads.
+// Per output element the product tree is EXACTLY gemv_fp4_vit's: sub-blocks
+// ascending, part = sum_j e2m1 * x (j ascending), acc += part * scale, one
+// acc — bit-identical results, hundreds of times fewer instructions.
+// Requires rows % 64 == 0 and k_dim % 16 == 0 (every vision linear shape).
+extern "C" __global__ void gemm_fp4_f32x(const unsigned char* __restrict__ w,
+                                         const float* __restrict__ x,
+                                         const float* __restrict__ gs_ptr,
+                                         float* __restrict__ y,
+                                         const int* __restrict__ k_dim_p,
+                                         const int* __restrict__ rows_p,
+                                         const int* __restrict__ t_p) {
+    int k_dim = *k_dim_p;
+    int rows = *rows_p;
+    int t = *t_p;
+    int bpr = k_dim >> 4;                 // 16-value sub-blocks per row
+    int r0 = blockIdx.x * 64;
+    int t0 = blockIdx.y * 32;
+    int ti = threadIdx.x;
+    __shared__ float wv[64][64];          // tile weight values (e2m1, unscaled)
+    __shared__ float xs[32][64];          // tile activations
+    __shared__ float sc[64][4];           // per-row sub-block scales
+    float acc[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) acc[i] = 0.0f;
+    int rl = ti >> 2;                     // row within the block (0..63)
+    int tg = ti & 3;                      // token octant (0..3)
+    float gs = gs_ptr[0];
+    for (int kt = 0; kt < k_dim; kt += 64) {
+        int lim = k_dim - kt; if (lim > 64) lim = 64;
+        // decode 64 rows x lim values (unscaled e2m1)
+        for (int i = ti; i < 64 * 64; i += 256) {
+            int rr = i >> 6, vv = i & 63;
+            float outv = 0.0f;
+            if (vv < lim) {
+                int G = (r0 + rr) * bpr + (kt >> 4) + (vv >> 4);
+                const unsigned char* blk = w + (size_t)(G >> 2) * 36;
+                int sb = G & 3;
+                int idx = sb * 16 + (vv & 15);
+                unsigned int byte = blk[4 + (idx >> 1)];
+                unsigned int nib = (idx & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
+                outv = e2m1(nib);
+            }
+            wv[rr][vv] = outv;
+        }
+        // 64 rows x 4 sub-block scales
+        for (int i = ti; i < 64 * 4; i += 256) {
+            int rr = i >> 2, sb = i & 3;
+            float s = 0.0f;
+            if (kt + sb * 16 < k_dim) {
+                int G = (r0 + rr) * bpr + (kt >> 4) + sb;
+                const unsigned char* blk = w + (size_t)(G >> 2) * 36;
+                s = ue4m3(blk[G & 3]) * gs;
+            }
+            sc[rr][sb] = s;
+        }
+        // 32 tokens x lim activations
+        for (int i = ti; i < 32 * 64; i += 256) {
+            int tt = i >> 6, vv = i & 63;
+            float xv = 0.0f;
+            if (t0 + tt < t && vv < lim) xv = x[(size_t)(t0 + tt) * k_dim + kt + vv];
+            xs[tt][vv] = xv;
+        }
+        __syncthreads();
+        // 8 (row, token) pairs per thread, the gemv_fp4_vit product tree
+        for (int j = 0; j < 8; j++) {
+            int tok = tg * 8 + j;
+            if (t0 + tok >= t) continue;
+            float a = 0.0f;
+            for (int sb = 0; sb < 4; sb++) {
+                if (kt + sb * 16 >= k_dim) break;
+                int n = k_dim - kt - sb * 16; if (n > 16) n = 16;
+                const float* wr = wv[rl] + sb * 16;
+                const float* xr = xs[tok] + sb * 16;
+                float part = 0.0f;
+                #pragma unroll
+                for (int jj = 0; jj < 16; jj++) {
+                    if (jj >= n) break;
+                    part += wr[jj] * xr[jj];
+                }
+                a += part * sc[rl][sb];
+            }
+            acc[j] += a;
+        }
+        __syncthreads();
+    }
+    for (int j = 0; j < 8; j++) {
+        int tok = t0 + tg * 8 + j;
+        if (tok < t) y[(size_t)tok * rows + r0 + rl] = acc[j];
+    }
+}
+
 // exact-erf GELU (the merger activation): 0.5*x*(1+erff(x/sqrt(2)))
 extern "C" __global__ void gelu_erf(float* __restrict__ x, const int* __restrict__ n_p) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4398,7 +4496,7 @@ impl Kernels {
             "gemv_bf16_b", "gemv_bf16_w", "gemv_fp4_b1k", "hc_down_inj", "gemv_bf16_ws",
             "gemm_fp4_dense", "gemm_bf16_dense", "gemm_fp4_dense_b", "gemm_bf16_dense_b", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
             "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "gemv_fp4_mma_dg", "sh_gate_up_q", "gemv_fp4_mma_g", "gemv_fp4_mma_d32", "gemv_fp4_mma_g32", "attn_sel_r", "attn_sel_d8", "attn_sel_d9", "attn_sel_s", "attn_sel_s8", "attn_sel_s8l", "attn_sel_g",
-            "gemv_fp4_vit", "vit_ln", "vit_add_bias", "vit_pe_add", "vit_rope", "vit_attn", "gelu_erf", "gelu_tanh",
+            "gemv_fp4_vit", "gemm_fp4_f32x", "vit_ln", "vit_add_bias", "vit_pe_add", "vit_rope", "vit_attn", "gelu_erf", "gelu_tanh",
         ];
         let mut map = HashMap::new();
         for n in names {

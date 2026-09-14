@@ -453,8 +453,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_PORT: u16 = 8099;
 const DEFAULT_CNQ: &str = "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq";
 const DEFAULT_HOTSETS: &str = "decode_out/hotsets-M-longctx2100-n160.json";
-/// pinned for the process (M1): every request prefills at chunk 2048
-const SERVE_CHUNK: usize = 2048;
+/// pinned for the process (M1): every request prefills at chunk 4096 (the
+/// #10b stage-1 diet lifted the planner wall; 2048 halved the serve prefill)
+const SERVE_CHUNK: usize = 4096;
 /// read and write timeout per connection, so one stalled client cannot hold the loop
 const IO_TIMEOUT_SECS: u64 = 10;
 /// request line plus headers, 64 KiB total; over it the answer is 431
@@ -1630,6 +1631,7 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
     // CROW_VIT=0 the engine holds no tower and the request falls through as
     // the placeholder of record (the single image_pad rides as a token).
     let ids: Vec<u32> = if !req.images.is_empty() && srv.eng.vit.is_some() {
+        eprintln!("[vit-chat] {} image(s) in request, decoding data URLs ...", req.images.len());
         let mut bytes = Vec::with_capacity(req.images.len());
         for (i, url) in req.images.iter().enumerate() {
             match decode_data_url(url) {

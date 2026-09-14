@@ -181,3 +181,11 @@
 - Engine logging is not started, open as `#13`; the architecture diagrams are stale, open as `#14`.
 - Ampere and Ada are not planned: the fallback stage was closed for want of a card, `#12`.
 - The clippy job renders red while non-blocking: 1314 warnings, 1085 `unnecessary_cast`, measured 2026-09-11 (`#50`).
+
+## 2026-09-14 — v0.2.0: the decode line is crossed, and the engine sees
+
+- **62e**: the GDN big-slab GEMV geometry (32 rows per block) — decode **22.1761 ms = 45.1 tok/s** vs llama.cpp 22.27 = 44.9 on the same model, quant and machine (RTX 5090), greedy ids bit-identical (`5098f885ab3a`, 7/7). The first engine default under the llama.cpp row.
+- **10b stage 1**: the per-chunk scratch diet + chunk cap 4096 — prefill 22.359 -> **20.828 s = 771.3 tok/s** (F49 pairs, 3/3). Stage 2 (the two-chunk wavefront `CROW_PF_WAVE`) is parked: correct-wave parity was byte-identical incl. the PX form, but the TG sweep measured the WDDM cross-chunk edge cost at **+40.8 to +45.5 percent SLOWER than legacy** — the lever needs a pipeline redesign, not a bugfix (parks: `decode_out/10b-wip3.patch`).
+- **10c**: the dense GEMM variant B behind `CROW_PF_GEMM_B=1` — **bit-identical** (29/29 gates incl. the PX teacher-forced form), KPROF dense group 2.00x, prefill **18.437 s = 871.3 tok/s** opt-in (-11 percent, 2 clean pairs + documented outlier).
+- **10d**: the router GEMM verdict — probe GREEN (max-rel 3.777e-3, top-10 expert sets identical 2048/2048) but the ten-task quality gate read **0/7/3 vs the record 2/5/3** -> NOT landed, per the loop rule; the `router_probe` harness ships as the measurement tool.
+- **#VIT (#66)**: the engine image path — Crow's vision on the CNQ container's own `vit` section (332+ tensors, NVFP4): oracle parity max_abs 3.43e-06 / cos 1.000000, text parity 23/23 byte-identical, ten-task untouched. Interactive-test hotfix batch the same day (no gate chains yet, robin-tested): the tiled `gemm_fp4_f32x` projections, a per-process image-embedding cache (a re-sent history image costs a hash hit, not a tower run), the patch cap 4096 with downscale instead of a 400 refusal, serve chunk 2048 -> 4096, and log lines from request arrival. Open on the reset list: multi-image order verification (A/B), attention tiling, the planner RAM auto-fit, stop/gone-client propagation.

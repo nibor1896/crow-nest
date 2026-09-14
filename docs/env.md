@@ -74,7 +74,7 @@ Helpers used by the read sites:
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
-| `CROW_CHUNK` | `engine/src/geo.rs:139` | integer tokens; default: policy by prompt length | authoritative prefill chunk size | operating | also `bin/decode.rs:58`, `bin/decode.rs:387`; `serve` pins 2048 for the process and does not call the policy (`bin/serve.rs:41-43`) |
+| `CROW_CHUNK` | `engine/src/geo.rs:139` | integer tokens; default: policy by prompt length | authoritative prefill chunk size | operating | also `bin/decode.rs:58`, `bin/decode.rs:387`; `serve` pins 4096 for the process and does not call the policy (`bin/serve.rs:457`, SERVE_CHUNK; was 2048 before 2026-09-14, the #10b stage-1 diet lifted the planner wall) |
 | `CROW_CHUNK_AUTO` | `engine/src/geo.rs:143` | `1`, `0`; default `1` when `CROW_CHUNK` is unset, `0` when it is set | applies the length policy on top of an explicit chunk, cap `max(CROW_CHUNK, 2048)` | operating | default since 2026-09-05; gated per `geo.rs:136-137`: chunk 1024 and 2048 deterministic since #22 |
 | `CROW_CHUNK_BALANCE` | `engine/src/gen.rs:2556` | `1` enables; default off | cuts the prompt into equal chunks instead of full chunks plus a tail | measurement | measured 2026-09-04: 3 x 700 gives 382 tok/s and loses to 1024+1024+52 at 414 tok/s; opt-in only |
 | `CROW_PF_ASYNC` | `engine/src/gen.rs:504` | `0`, `1`, `2`, `3`, `4`; default `2` | staging path of the prefill cold experts | operating | default since 2026-09-09 (#10, robin's call), gated: parity 8/512/1024 plus ten tasks ids equal to final4 without the env; values `3` and `4` are diagnostics, see the warning table |

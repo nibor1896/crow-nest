@@ -52,8 +52,10 @@ pub const VIT_MERGE: usize = 2;
 pub const VIT_SIDE: usize = 48; // sqrt(num_position_embeddings)
 pub const VIT_IN: usize = 3 * VIT_TPATCH * VIT_PATCH * VIT_PATCH; // 1536 conv row
 pub const VIT_QKV: usize = 3 * VIT_HIDDEN; // 3456
-/// hard patch cap per image (16384 patches = 4096 visual tokens)
-pub const VIT_MAX_PATCHES: usize = 16384;
+/// hard patch cap per image (4096 patches = 1024 visual tokens; every
+/// production VLM bounds image resolution - at 16384 the patch attention
+/// alone costs hours, and no chat question needs more than this grid)
+pub const VIT_MAX_PATCHES: usize = 4096;
 
 /// min_pixels / max_pixels of the preprocessor config (size shortest/longest_edge)
 const MIN_PIXELS: u64 = 65536;
@@ -167,6 +169,10 @@ impl VitW {
 pub struct Vit {
     pub w: VitW,
     pub cap: usize,
+    /// #VIT cache: image-bytes hash -> (grid, n_visual, tower embeddings on
+    /// the host). A conversation that re-sends its whole history (Crow does,
+    /// base64 and all) pays for each picture ONCE per process, not per turn.
+    image_cache: std::collections::HashMap<u64, ((usize, usize, usize), usize, Vec<f32>)>,
     x: Dev,        // [cap][1152] residual stream
     normed: Dev,   // [cap][1152] ln output / gemv scratch
     qkv: Dev,      // [cap][3456]
@@ -229,6 +235,7 @@ impl Vit {
             sn: 0,
             s: Vec::new(),
             scratch: false,
+            image_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -271,10 +278,13 @@ impl Vit {
             cap as f64 * 41_024.0 / (1 << 20) as f64, cap);
     }
 
-    /// one NVFP4 linear: y[t][rows] = w x^T (bias via `bias` by the caller)
-    unsafe fn gemv(&self, k: &Kernels, f: &Fp4, rows: usize, kd: usize, t: usize, x: Dev, y: Dev) {
-        launch_v(k.f("gemv_fp4_vit"), rows as u32, t as u32, 1, 256, &[
-            f.w, x, f.gs, y, self.s[kd]]);
+    /// one NVFP4 linear: y[t][rows] = w x^T with RAW f32 activations, via the
+    /// tiled `gemm_fp4_f32x` (bit-identical product tree to gemv_fp4_vit,
+    /// reads amortized over 32 tokens x 64 rows). rows_p/kd name SCALAR slots
+    /// holding the row and k_dim counts (values reuse the k_dim/bias slots).
+    unsafe fn gemv(&self, k: &Kernels, f: &Fp4, rows: usize, kd: usize, rows_p: usize, t: usize, x: Dev, y: Dev) {
+        launch_v(k.f("gemm_fp4_f32x"), ((rows + 63) / 64) as u32, ((t + 31) / 32) as u32, 1, 256, &[
+            f.w, x, f.gs, y, self.s[kd], self.s[rows_p], self.s[S_N]]);
     }
 
     /// out[t][stride] rows get +bias[0..cols]; stride == cols for every vision
@@ -318,7 +328,7 @@ impl Vit {
 
         // patch embed: the Conv3d as GEMV 1536 → 1152, then bias, then the
         // bilinear-interpolated learned position embed
-        self.gemv(k, &self.w.patch_proj, VIT_HIDDEN, S_KD1536, n, self.patches, self.x);
+        self.gemv(k, &self.w.patch_proj, VIT_HIDDEN, S_KD1536, S_KD1152, n, self.patches, self.x);
         self.bias(k, self.w.patch_bias, S_STRIDE1152, n, self.x);
         launch_v(k.f("vit_pe_add"), n as u32, 1, 1, 256, &[
             self.x, self.w.pos_embed, self.pe_idx, self.pe_w, self.s[S_N]]);
@@ -343,7 +353,7 @@ impl Vit {
                 let xv = cuda::dtoh(self.normed, n * VIT_HIDDEN);
                 f32_file(&format!("{dumpdir}/stage-b0-n1.f32"), &xv);
             }
-            self.gemv(k, &b.qkv, VIT_QKV, S_KD1152, n, self.normed, self.qkv);
+            self.gemv(k, &b.qkv, VIT_QKV, S_KD1152, S_BIAS3456, n, self.normed, self.qkv);
             self.bias(k, b.qkv_b, S_BIAS3456, n, self.qkv);
             if trace && bi == 0 {
                 cuda::sync();
@@ -366,7 +376,7 @@ impl Vit {
                 f32_file(&format!("{dumpdir}/stage-b0-attn.f32"), &xv);
             }
             // proj + residual
-            self.gemv(k, &b.proj, VIT_HIDDEN, S_KD1152, n, self.attn, self.normed);
+            self.gemv(k, &b.proj, VIT_HIDDEN, S_KD1152, S_STRIDE1152, n, self.attn, self.normed);
             self.bias(k, b.proj_b, S_STRIDE1152, n, self.normed);
             launch_v(k.f("add_flat"), ((n * VIT_HIDDEN + 255) / 256) as u32, 1, 1, 256, &[
                 self.normed, self.x, self.s[S_NP]]);
@@ -377,7 +387,7 @@ impl Vit {
             }
             // MLP: fc1 → gelu tanh → fc2 → residual
             self.ln(k, b.n2w, b.n2b, n, self.x, self.normed);
-            self.gemv(k, &b.fc1, VIT_INTER, S_KD1152, n, self.normed, self.mlp);
+            self.gemv(k, &b.fc1, VIT_INTER, S_KD1152, S_BIAS4304, n, self.normed, self.mlp);
             self.bias(k, b.fc1_b, S_BIAS4304, n, self.mlp);
             launch_v(k.f("gelu_tanh"), ((n * VIT_INTER + 255) / 256) as u32, 1, 1, 256, &[
                 self.mlp, self.s[S_NMLP]]);
@@ -387,7 +397,7 @@ impl Vit {
                 let xv = cuda::dtoh(self.mlp, n * VIT_INTER);
                 f32_file(&format!("{dumpdir}/stage-b0-gelu.f32"), &xv);
             }
-            self.gemv(k, &b.fc2, VIT_HIDDEN, S_KD4304, n, self.mlp, self.normed);
+            self.gemv(k, &b.fc2, VIT_HIDDEN, S_KD4304, S_STRIDE1152, n, self.mlp, self.normed);
             self.bias(k, b.fc2_b, S_STRIDE1152, n, self.normed);
             launch_v(k.f("add_flat"), ((n * VIT_HIDDEN + 255) / 256) as u32, 1, 1, 256, &[
                 self.normed, self.x, self.s[S_NP]]);
@@ -403,11 +413,11 @@ impl Vit {
         // merger: LN(1152) over patches → the [nv][4608] view is contiguous →
         // fc1 → exact-erf GELU → fc2 → the [nv][2560] visual embeddings
         self.ln(k, self.w.m_norm_w, self.w.m_norm_b, n, self.x, self.normed);
-        self.gemv(k, &self.w.m_fc1, VIT_MERGED, S_KD4608, nv, self.normed, self.m1);
+        self.gemv(k, &self.w.m_fc1, VIT_MERGED, S_KD4608, S_BIAS4608, nv, self.normed, self.m1);
         self.bias(k, self.w.m_fc1_b, S_BIAS4608, nv, self.m1);
         launch_v(k.f("gelu_erf"), ((nv * VIT_MERGED + 255) / 256) as u32, 1, 1, 256, &[
             self.m1, self.s[S_NMERGE]]);
-        self.gemv(k, &self.w.m_fc2, H, S_KD4608, nv, self.m1, self.out);
+        self.gemv(k, &self.w.m_fc2, H, S_KD4608, S_BIAS2560, nv, self.m1, self.out);
         self.bias(k, self.w.m_fc2_b, S_BIAS2560, nv, self.out);
         self.out
     }
@@ -566,7 +576,7 @@ pub fn decode_rgb(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
 pub fn prep_image(bytes: &[u8]) -> Result<ImagePrep, String> {
     let (rgb, w0, h0) = decode_rgb(bytes)?;
     let (rh, rw) = smart_resize(h0 as u64, w0 as u64)?;
-    let (rh, rw) = (rh as usize, rw as usize);
+    let (mut rh, mut rw) = (rh as usize, rw as usize);
     let (w0, h0) = (w0 as usize, h0 as usize);
 
     // to f32 0..255, channel planes [3][h0][w0] for the separable resize
@@ -576,15 +586,25 @@ pub fn prep_image(bytes: &[u8]) -> Result<ImagePrep, String> {
             planes[c * h0 * w0 + i] = px[c] as f32;
         }
     }
+    // #VIT cap: an image over the patch budget is DOWNSCALED further, never
+    // refused - a screenshot must reach the model at the resolution a chat
+    // needs, the same clamp every production VLM applies. Dims stay
+    // FACTOR-multiples so the patch grid keeps its merge alignment.
+    const FACTOR: usize = VIT_PATCH * VIT_MERGE;
+    while (rh / VIT_PATCH) * (rw / VIT_PATCH) > VIT_MAX_PATCHES {
+        let beta = ((rh * rw) as f64 / (VIT_MAX_PATCHES * VIT_PATCH * VIT_PATCH) as f64).sqrt() * 1.06;
+        let nh = (((rh as f64 / beta) / FACTOR as f64).floor() as usize).max(1) * FACTOR;
+        let nw = (((rw as f64 / beta) / FACTOR as f64).floor() as usize).max(1) * FACTOR;
+        if nh >= rh && nw >= rw {
+            break; // degenerate: cannot shrink further, accept as is
+        }
+        rh = nh;
+        rw = nw;
+    }
     let hp = rh / VIT_PATCH;
     let wp = rw / VIT_PATCH;
     let n_patches = hp * wp;
     let n_visual = hp * wp / (VIT_MERGE * VIT_MERGE);
-    if n_patches > VIT_MAX_PATCHES {
-        return Err(format!(
-            "image too large: {rh}x{rw} after resize = {n_patches} patches (cap {} patches = {} visual tokens)",
-            VIT_MAX_PATCHES, VIT_MAX_PATCHES / 4));
-    }
 
     // resize: horizontal pass then vertical pass per channel
     let mut resized = Vec::with_capacity(3 * rh * rw);
@@ -830,13 +850,51 @@ impl Vit {
         ids: &[u32],
         images: &[Vec<u8>],
     ) -> Result<VisionPlan, String> {
-        let mut preps = Vec::with_capacity(images.len());
+        // #VIT cache: the tower output depends on the image BYTES only, so
+        // every image runs decode + preprocess + tower at most once per
+        // process; re-sent history images are a hash lookup and a clone.
+        let mut infos: Vec<((usize, usize, usize), usize)> = Vec::with_capacity(images.len());
+        let mut all_rows: Vec<Vec<f32>> = Vec::with_capacity(images.len());
+        let dump = std::env::var("CROW_VIT_DUMP").ok();
+        if let Some(dir) = &dump {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut misses = 0usize;
         for (i, bytes) in images.iter().enumerate() {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            let key = hasher.finish();
+            if let Some((grid, n_visual, rows)) = self.image_cache.get(&key) {
+                eprintln!("[vit-cache] image {i}: HIT grid {grid:?}, {n_visual} visual tokens");
+                infos.push((*grid, *n_visual));
+                all_rows.push(rows.clone());
+                continue;
+            }
             let p = prep_image(bytes)
                 .map_err(|e| format!("image {i}: {e}"))?;
-            preps.push(p);
+            let out = self.run(k, &p.patches, &p.pe_idx, &p.pe_w, &p.cs, &p.sn, p.n_patches);
+            let rows = cuda::dtoh(out, p.n_visual * H);
+            if let Some(dir) = &dump {
+                f32_file(&format!("{dir}/img{i}.patches.f32"), &p.patches);
+                f32_file(&format!("{dir}/img{i}.pe-w.f32"), &p.pe_w);
+                let meta = serde_json::json!({
+                    "grid": p.grid, "n_patches": p.n_patches,
+                    "resized": p.resized, "n_visual": p.n_visual,
+                });
+                let _ = std::fs::write(format!("{dir}/img{i}.meta.json"), meta.to_string());
+            }
+            infos.push((p.grid, p.n_visual));
+            all_rows.push(rows.clone());
+            self.image_cache.insert(key, (p.grid, p.n_visual, rows));
+            misses += 1;
         }
-        let counts: Vec<usize> = preps.iter().map(|p| p.n_visual).collect();
+        eprintln!(
+            "[vit-cache] {} image(s): {} through the tower, {} cached",
+            images.len(), misses, images.len() - misses
+        );
+        let counts: Vec<usize> = infos.iter().map(|(_, n)| *n).collect();
         let expanded = expand_ids(ids, &counts)?;
         // walk the expanded ids, mark the image rows
         let mut types = vec![0u8; expanded.len()];
@@ -849,26 +907,11 @@ impl Vit {
                 flat += 1;
             }
         }
-        let (_pos, delta) = mrope_positions(&types, &preps.iter().map(|p| p.grid).collect::<Vec<_>>());
-        // run the tower per image, concatenate the embeddings
-        let dump = std::env::var("CROW_VIT_DUMP").ok();
-        if let Some(dir) = &dump {
-            let _ = std::fs::create_dir_all(dir);
-        }
+        let (_pos, delta) = mrope_positions(&types, &infos.iter().map(|(g, _)| *g).collect::<Vec<_>>());
+        // concatenate the per-image tower outputs (image order preserved)
         let mut embeds_host = Vec::new();
-        for (i, p) in preps.iter().enumerate() {
-            let out = self.run(k, &p.patches, &p.pe_idx, &p.pe_w, &p.cs, &p.sn, p.n_patches);
-            let mut rows = cuda::dtoh(out, p.n_visual * H);
-            if let Some(dir) = &dump {
-                f32_file(&format!("{dir}/img{i}.patches.f32"), &p.patches);
-                f32_file(&format!("{dir}/img{i}.pe-w.f32"), &p.pe_w);
-                let meta = serde_json::json!({
-                    "grid": p.grid, "n_patches": p.n_patches,
-                    "resized": p.resized, "n_visual": p.n_visual,
-                });
-                let _ = std::fs::write(format!("{dir}/img{i}.meta.json"), meta.to_string());
-            }
-            embeds_host.append(&mut rows);
+        for r in &all_rows {
+            embeds_host.extend_from_slice(r);
         }
         cuda::sync();
         if let Some(dir) = &dump {
@@ -881,7 +924,7 @@ impl Vit {
             embeds_host,
             map,
             types,
-            grids: preps.iter().map(|p| p.grid).collect(),
+            grids: infos.iter().map(|(g, _)| *g).collect(),
             n_visual: flat as usize,
             delta,
         })
