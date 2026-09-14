@@ -789,15 +789,17 @@ fn model_name(model_path: &str) -> String {
     base.strip_suffix(".cnq").unwrap_or(base).to_string()
 }
 
-/// the `/props` document; `n_ctx` comes from the loaded engine, not a constant
-fn props_json(model_path: &str, n_ctx: usize, prompt_chunk: usize) -> serde_json::Value {
+/// the `/props` document; `n_ctx` comes from the loaded engine, not a constant.
+/// #VIT: `modalities.vision` reports the switch, so Crow's `refuse_images`
+/// (crow_core.py:1429) sends or refuses for real — `true` with the tower
+/// loaded (CROW_VIT unset/1), `false` with CROW_VIT=0 (BLIND_SERVER_HINT).
+fn props_json(model_path: &str, n_ctx: usize, prompt_chunk: usize, vision: bool) -> serde_json::Value {
     serde_json::json!({
         "model_path": model_path,
         "model": model_name(model_path),
         "n_ctx": n_ctx,
         "default_generation_settings": { "n_ctx": n_ctx },
-        // crow-nest is text only; Crow's refuse_images answers BLIND_SERVER_HINT
-        "modalities": { "vision": false },
+        "modalities": { "vision": vision },
         "prompt_chunk": prompt_chunk,
         "build": "crow-nest-engine 0.1.0",
     })
@@ -902,6 +904,10 @@ struct ChatReq {
     seed: u64,
     /// #28: parsed, ignored, logged; the device sampler has no min_p
     min_p: f32,
+    /// #VIT: the `image_url` data URLs of the content blocks, in message order.
+    /// This is the exact wire form Crow sends (crow_core.py `image_part`):
+    /// `{"type":"image_url","image_url":{"url":"data:<mime>;base64,..."}}`.
+    images: Vec<String>,
 }
 
 /// - a number field of the sampling profile: absent or `null` gives `d`, a non number is a 400
@@ -939,6 +945,27 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
     for (i, m) in arr.iter().enumerate() {
         if !m.get("role").map(|r| r.is_string()).unwrap_or(false) {
             return Err(format!("message {i} has no string role"));
+        }
+    }
+    // #VIT: collect the image content blocks in message order. The template
+    // renders each of them as `<|vision_start|><|image_pad|><|vision_end|>`,
+    // so the rendered ids carry the pads in exactly this order.
+    let mut images = Vec::new();
+    for (i, m) in arr.iter().enumerate() {
+        if let Some(items) = m.get("content").and_then(|c| c.as_array()) {
+            for item in items {
+                let is_img = item.get("type").and_then(|t| t.as_str()) == Some("image_url")
+                    || item.get("image_url").is_some();
+                if !is_img {
+                    continue;
+                }
+                let url = item
+                    .get("image_url")
+                    .and_then(|u| u.get("url"))
+                    .and_then(|u| u.as_str())
+                    .ok_or_else(|| format!("message {i} carries an image_url block without image_url.url"))?;
+                images.push(url.to_string());
+            }
         }
     }
     // #29 A7: `tools` is a template variable now. Absent and `null` render the A4 prompt;
@@ -1040,7 +1067,49 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         presence_penalty,
         seed,
         min_p,
+        images,
     })
+}
+
+/// - decode one `data:<mime>;base64,<payload>` URL into (mime, bytes)
+/// - Crow sends exactly this shape (crow_core.py `image_part`); anything else is a 400
+fn decode_data_url(url: &str) -> Result<(&str, Vec<u8>), String> {
+    let rest = url
+        .strip_prefix("data:")
+        .ok_or_else(|| "image_url.url is not a data: URL (Crow sends data URLs only)".to_string())?;
+    let (mime, payload) = rest
+        .split_once(";base64,")
+        .ok_or_else(|| "image_url.url carries no ;base64, payload".to_string())?;
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut table = [255u8; 256];
+    for (i, &c) in B64.iter().enumerate() {
+        table[c as usize] = i as u8;
+    }
+    let mut out = Vec::with_capacity(payload.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut nbits = 0u32;
+    for ch in payload.bytes() {
+        match ch {
+            b'\r' | b'\n' | b' ' => continue,
+            b'=' => break,
+            _ => {
+                let v = table[ch as usize];
+                if v == 255 {
+                    return Err("image_url.url payload is not valid base64".into());
+                }
+                acc = (acc << 6) | v as u32;
+                nbits += 6;
+                if nbits >= 8 {
+                    nbits -= 8;
+                    out.push((acc >> nbits) as u8);
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err("image_url.url payload decodes to zero bytes".into());
+    }
+    Ok((mime, out))
 }
 
 /// - the `Sampler` this request asks for, or `None` for the greedy A4 path
@@ -1556,6 +1625,38 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
     if ids.is_empty() {
         return respond_json(stream, "400 Bad Request", &error_json("the rendered prompt is empty"));
     }
+    // #VIT: run the visual tower for the request's images, expand every
+    // image_pad into its visual tokens, arm the mrope span tables. With
+    // CROW_VIT=0 the engine holds no tower and the request falls through as
+    // the placeholder of record (the single image_pad rides as a token).
+    let ids: Vec<u32> = if !req.images.is_empty() && srv.eng.vit.is_some() {
+        let mut bytes = Vec::with_capacity(req.images.len());
+        for (i, url) in req.images.iter().enumerate() {
+            match decode_data_url(url) {
+                Ok((_mime, raw)) => bytes.push(raw),
+                Err(e) => return respond_json(stream, "400 Bad Request", &error_json(&format!("image {i}: {e}"))),
+            }
+        }
+        let vit_t0 = std::time::Instant::now();
+        let plan = match unsafe { srv.eng.vit.as_mut().unwrap().build_plan(&srv.eng.k, &ids, &bytes) } {
+            Ok(p) => p,
+            Err(e) => return respond_json(stream, "400 Bad Request", &error_json(&e)),
+        };
+        let vit_ms = vit_t0.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "[vit-chat] {} image(s), {} visual token(s), grids {:?}, mrope delta {}, vision {} ms (decode + preprocess + tower)",
+            req.images.len(),
+            plan.n_visual,
+            plan.grids,
+            plan.delta,
+            vit_ms
+        );
+        let expanded = plan.ids.clone();
+        unsafe { srv.eng.begin_vision(plan, expanded.len() + req.max_tokens) };
+        expanded
+    } else {
+        ids
+    };
     // #26 review: the prompt alone is the only 413 case; a budget that does not fit is CLAMPED,
     // not refused (the old combined check was dead, `max_tokens` is capped at 32768 first)
     let budget = match clamped_max_tokens(ids.len(), req.max_tokens, srv.n_ctx) {
@@ -1678,6 +1779,11 @@ fn chat_generate(
     let model = req.model.clone();
 
     let prompt: Vec<i64> = ids.iter().map(|&v| v as i64).collect();
+    // #VIT: a text-only request never runs behind stale mrope tables — a 413
+    // or an error after the plan armed them leaves them set, so clear here.
+    if req.images.is_empty() {
+        srv.eng.end_vision();
+    }
     // #31 A9: the detection rule of spec 7.4, host side, IDS ONLY. `Engine::history` is the
     // held conversation: prompt ids AND generated ids (`gen.rs:2698`, `gen.rs:2945`).
     let plan = srv.cache.decide(&srv.eng.history, &prompt);
@@ -1716,10 +1822,22 @@ fn chat_generate(
         prompt.len()
     );
     // #27 A5: the timed window is the prefill CALL alone, the same window `decode run` prints
-    // as `prefill done in X s`; the rollback, the reset and the tokenizer are outside it
+    // as `prefill done in X s`; the rollback, the reset and the tokenizer are outside it.
+    // #VIT: under CROW_VIT_DUMP=dir the prefill also collects every prompt logit
+    // row (the oracle compare path) and the patch inputs are written before it.
+    let dump_dir = std::env::var("CROW_VIT_DUMP").ok().filter(|_| !req.images.is_empty());
+    let mut collect = dump_dir.as_ref().map(|_| Vec::new());
     let t_pre = Instant::now();
-    let mut next = unsafe { srv.eng.prefill(srv.cnq, &prompt[cached_n..], None) };
+    let mut next = unsafe {
+        match collect.as_mut() {
+            Some(c) => srv.eng.prefill(srv.cnq, &prompt[cached_n..], Some(c)),
+            None => srv.eng.prefill(srv.cnq, &prompt[cached_n..], None),
+        }
+    };
     let prefill_ms = t_pre.elapsed().as_secs_f64() * 1e3;
+    if let Some(dir) = dump_dir.as_ref() {
+        unsafe { write_vit_dump(srv, dir, &prompt, collect.as_deref(), prefill_ms) };
+    }
     // #31 A9: spec 7.6 point 1, after the prefill of this turn's prompt, unconditional (M1).
     // Before the first `decode_step`, so no capture stream is live and no graph exists yet.
     // prefill clean: the prefill above started at 0 or at a prefill clean `P`, so every
@@ -1976,12 +2094,78 @@ fn chat_generate(
          layers {LAYERS}, counter read {counters_ms:.3} ms"
     );
     eprintln!("[chat] ids {out:?}");
+    // #VIT: the image request is done — back to the load-time rope tables.
+    // The next request re-arms them from its own plan. The dump gains the
+    // generated ids, so the oracle can compare its own greedy continuation.
+    if let Some(dir) = dump_dir.as_ref() {
+        let seq_path = format!("{dir}/vit-gen-sequence.json");
+        if let Ok(mut doc) = std::fs::read_to_string(&seq_path) {
+            if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&doc) {
+                v["generated"] = serde_json::json!(out);
+                doc = v.to_string();
+                let _ = std::fs::write(&seq_path, doc);
+            }
+        }
+    }
+    srv.eng.end_vision();
     GenOut {
         id,
         created,
         finish,
         timing,
         aborted,
+    }
+}
+
+/// #VIT: the `CROW_VIT_DUMP=<dir>` artifacts of one image request, the input of
+/// both oracle comparisons:
+/// - `vit-gen-sequence.json`: the exact prompt ids (expanded), the cached
+///   prefix offset, the grids, the visual-row map and the mrope delta
+/// - `gpu-logits.f32`: one f32 [V] row per processed prompt position
+/// The per-image patch inputs and the tower outputs are written by
+/// `Vit::build_plan` under the same variable.
+unsafe fn write_vit_dump(
+    srv: &Srv,
+    dir: &str,
+    prompt: &[i64],
+    collect: Option<&[Vec<f32>]>,
+    prefill_ms: f64,
+) {
+    let _ = std::fs::create_dir_all(dir);
+    let (map, grids, delta, n_visual) = match srv.eng.vit_plan.as_ref() {
+        Some(p) => (p.map.clone(), p.grids.clone(), p.delta, p.n_visual),
+        None => (Vec::new(), Vec::new(), 0i64, 0usize),
+    };
+    let rows = collect.map(|c| c.len()).unwrap_or(0);
+    let seq = serde_json::json!({
+        "rows": rows,
+        "prompt_len": prompt.len(),
+        "cached_n": prompt.len() - rows,
+        "ids": prompt,
+        "visual_map": map,
+        "grids": grids,
+        "n_visual": n_visual,
+        "prefill_ms": prefill_ms,
+    });
+    let _ = std::fs::write(format!("{dir}/vit-gen-sequence.json"), seq.to_string());
+    if let Some(c) = collect {
+        let mut flat = Vec::with_capacity(c.len() * crow_nest_engine::geo::V);
+        for row in c {
+            flat.extend_from_slice(row);
+        }
+        f32_to_file(&format!("{dir}/gpu-logits.f32"), &flat);
+    }
+}
+
+/// raw f32 little-endian file write, failures logged not raised
+fn f32_to_file(path: &str, v: &[f32]) {
+    match std::fs::File::create(path) {
+        Ok(mut f) => {
+            use std::io::Write;
+            let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+            let _ = f.write_all(bytes);
+        }
+        Err(e) => eprintln!("[vit-dump] write {path} failed: {e}"),
     }
 }
 
@@ -2233,7 +2417,7 @@ fn serve_one(stream: &mut TcpStream, srv: &mut Srv) {
                 Route::Props => (
                     label,
                     "200 OK",
-                    props_json(srv.model_path, srv.n_ctx, srv.prompt_chunk),
+                    props_json(srv.model_path, srv.n_ctx, srv.prompt_chunk, srv.eng.vit.is_some()),
                 ),
                 Route::Slots => (
                     label,
@@ -2482,7 +2666,7 @@ mod tests {
 
     #[test]
     fn props_carries_the_fields_crow_reads() {
-        let doc = props_json("converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq", 200_000, 2048);
+        let doc = props_json("converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq", 200_000, 2048, false);
         // server_model_path (crow_core.py:1408)
         assert_eq!(doc["model_path"], "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq");
         // fetch_model_name (crow_core.py:14884)
@@ -2495,6 +2679,64 @@ mod tests {
         // refuse_images (crow_core.py:1429): false = BLIND_SERVER_HINT, not an error
         assert_eq!(doc["modalities"]["vision"], serde_json::Value::Bool(false));
         assert_eq!(doc["prompt_chunk"], 2048);
+        // #VIT: with the tower loaded the same document reports vision, so
+        // Crow's refuse_images lets /image and read_image through
+        let doc = props_json("converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq", 200_000, 2048, true);
+        assert_eq!(doc["modalities"]["vision"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn image_blocks_are_collected_in_message_order() {
+        // exactly the Crow wire form (crow_core.py user_content + image_part)
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what is in this picture?"},
+                    {"type": "image_url",
+                     "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+                    {"type": "text", "text": "and this one?"},
+                    {"type": "image_url",
+                     "image_url": {"url": "data:image/jpeg;base64,d29ybGQ="}}
+                ]}
+            ]
+        });
+        let req = parse_chat(body.to_string().as_bytes()).unwrap();
+        assert_eq!(req.images.len(), 2);
+        assert!(req.images[0].starts_with("data:image/png;base64,"));
+        assert!(req.images[1].starts_with("data:image/jpeg;base64,"));
+        // a plain string content carries no images (the bare-string contract)
+        let plain = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+        assert!(plain.images.is_empty());
+    }
+
+    #[test]
+    fn data_urls_decode_to_the_original_bytes() {
+        // "hello world", encoded and split across padding
+        let (mime, raw) = decode_data_url("data:image/png;base64,aGVsbG8gd29ybGQ=").unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(raw, b"hello world");
+        assert!(decode_data_url("https://x/y.png").is_err());
+        assert!(decode_data_url("data:image/png;base64,!!!!").is_err());
+        assert!(decode_data_url("data:image/png;base64,").is_err());
+    }
+
+    #[test]
+    fn smart_resize_follows_the_hf_rules() {
+        // exact HF smart_resize cases (factor 32, min 65536, max 16777216)
+        use crow_nest_engine::vit as vv;
+        let r = |h: u64, w: u64| vv::smart_resize_for_test(h, w).unwrap();
+        // round to the factor, inside the window: untouched grid
+        assert_eq!(r(448, 448), (448, 448));
+        assert_eq!(r(384, 512), (384, 512));
+        // 383x511 rounds DOWN half... 383/32 = 11.97 -> 12*32 = 384; 511/32 = 15.97 -> 16*32 = 512
+        assert_eq!(r(383, 511), (384, 512));
+        // banker's rounding: 496/32 = 15.5 exactly -> rounds to 16 (even)
+        assert_eq!(r(496, 448), (512, 448));
+        // upscale to min_pixels: 160x224 = 35840 < 65536 -> beta = sqrt(65536/35840)
+        let (h, w) = r(160, 224);
+        assert!(h * w >= 65536 && h % 32 == 0 && w % 32 == 0);
+        // small images below the factor are refused
+        assert!(vv::smart_resize_for_test(16, 1024).is_err());
     }
 
     #[test]

@@ -19,3 +19,6 @@ pub mod reset;
 pub mod cache;
 // #32 A10: the slot file behind POST /slots/0?action=save|restore (spec section 7)
 pub mod slot;
+// #VIT: the visual tower (the container "vit" section), Crow image decoding and
+// preprocessing, the interleaved-mrope tables and the prefill splice plan
+pub mod vit;

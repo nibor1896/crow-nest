@@ -412,6 +412,61 @@ pub struct Engine {
     /// #20: device-side sampler (CROW_SAMPLE=1 without CROW_SAMPLE_HOST=1) -
     /// the sample_k node behind argmax_k; its state buffers live here
     pub dev_sampler: Option<DevSampler>,
+    /// #VIT: the visual tower, loaded only when CROW_VIT is not "0"
+    pub vit: Option<crate::vit::Vit>,
+    /// #VIT: the per-request vision plan (embeddings + id map + mrope delta),
+    /// set by serve before prefill, taken after it (the decode keeps only the
+    /// mrope tables and the delta)
+    pub vit_plan: Option<crate::vit::VisionPlan>,
+    /// #VIT: the per-request interleaved-mrope span tables (0 rows allocated =
+    /// use the load-time st.cos/st.sin, the text-only case)
+    pub mrope_cos: Dev,
+    pub mrope_sin: Dev,
+    /// allocated span of the mrope tables (0 = none allocated)
+    pub mrope_rows: usize,
+    /// true while an image request drives the rope kernels
+    pub mrope_active: bool,
+}
+
+impl Engine {
+    /// the cos/sin table the rope kernels read: the load-time table, or the
+    /// per-request mrope span table while an image conversation is live
+    pub fn cos_tbl(&self) -> Dev {
+        if self.mrope_active { self.mrope_cos } else { self.st.cos }
+    }
+    pub fn sin_tbl(&self) -> Dev {
+        if self.mrope_active { self.mrope_sin } else { self.st.sin }
+    }
+
+    /// #VIT: arm an image request — upload the mrope span tables (reusing the
+    /// process-lifetime buffers, growing on demand), take the plan. The tables
+    /// cover the prompt rows AND the decode rows (span = seq + max_new).
+    pub unsafe fn begin_vision(&mut self, plan: crate::vit::VisionPlan, span: usize) {
+        let seq = plan.types.len();
+        let (pos, _delta) = crate::vit::mrope_positions(&plan.types, &plan.grids);
+        let (cos, sin) = crate::vit::mrope_tables(&pos, seq, span, plan.delta);
+        assert_eq!(cos.len(), span * ROPE_PAIRS);
+        if span > self.mrope_rows {
+            if self.mrope_rows > 0 {
+                cuda::free_dev(&mut self.mrope_cos);
+                cuda::free_dev(&mut self.mrope_sin);
+            }
+            self.mrope_cos = cuda::alloc_zeroed(span * ROPE_PAIRS * 4);
+            self.mrope_sin = cuda::alloc_zeroed(span * ROPE_PAIRS * 4);
+            self.mrope_rows = span;
+        }
+        cuda::to_f32_into(self.mrope_cos, &cos);
+        cuda::to_f32_into(self.mrope_sin, &sin);
+        self.mrope_active = true;
+        self.vit_plan = Some(plan);
+    }
+
+    /// #VIT: end the image request — back to the load-time tables. The plan
+    /// (and its embedding buffer) drops here.
+    pub fn end_vision(&mut self) {
+        self.vit_plan = None;
+        self.mrope_active = false;
+    }
 }
 
 /// device state of the #20 sampler: presence mask [V] u8, xorshift64* state
@@ -696,6 +751,24 @@ impl Engine {
         let ple_cache_bytes = ple.n_slots as u64 * (108 + 4);
         log("PLE done — budget verify next");
 
+        // ---- #VIT: the visual tower, BEFORE the budget verify (the planner
+        // must see the true free VRAM). CROW_VIT=0 skips the load entirely —
+        // the text-only placeholder of record. The [vit] boot line appears
+        // exactly once per process, naming mode + switch + cap. ----
+        let vit = if crate::vit::vit_on() {
+            log("loading the vit section (27 vision blocks + patch embed + merger) …");
+            let before = cuda::total_vram_bytes() - cuda::free_vram_bytes();
+            let vt = crate::vit::Vit::new(cnq);
+            let vit_bytes = cuda::total_vram_bytes() - cuda::free_vram_bytes() - before;
+            println!("[vit] visual tower loaded: mode nvfp4 (f32 tower math), CROW_VIT {} (0 = the text-only placeholder), cap {} patches = {} visual tokens per image, vit weights {:.0} MiB (scratch lazy, allocated on the first image request)",
+                std::env::var("CROW_VIT").unwrap_or_else(|_| "unset".to_string()),
+                vt.cap, vt.cap / 4, vit_bytes as f64 / (1 << 20) as f64);
+            Some(vt)
+        } else {
+            println!("[vit] visual tower NOT loaded, CROW_VIT 0 (the text-only placeholder of record, /props vision false)");
+            None
+        };
+
         // ---- scratch + staging BEFORE the budget: the planner measures free VRAM,
         // so everything chunk-sized must already be resident (C=512 scratch is
         // ~0.7 GB; an unplanned allocation past the card limit gets paged by
@@ -945,6 +1018,12 @@ impl Engine {
                 adapt_base: Vec::new(),
                 adapt_ema: Vec::new(),
                 dev_sampler: None,
+                vit: vit,
+                vit_plan: None,
+                mrope_cos: 0,
+                mrope_sin: 0,
+                mrope_rows: 0,
+                mrope_active: false,
                 cnq: std::ptr::null_mut(),
                 graph_exec: 0,
                 cap_stream: 0,
@@ -2059,8 +2138,8 @@ impl Engine {
             panic!("layer {l} is not attention");
         };
         let (kc, vc, keys, pooled) = self.layer_cache_ptrs(l);
-        let cos = self.st.cos as u64 + (pos_base * ROPE_PAIRS * 4) as u64;
-        let sin = self.st.sin as u64 + (pos_base * ROPE_PAIRS * 4) as u64;
+        let cos = self.cos_tbl() as u64 + (pos_base * ROPE_PAIRS * 4) as u64;
+        let sin = self.sin_tbl() as u64 + (pos_base * ROPE_PAIRS * 4) as u64;
 
         q.launch_gemv(k, Q_ROWS, p.n12288 as u64, t, p.t as u64, mixed as u64, s.qg as u64, p.n2560 as u64);
         step!("launch #1");
@@ -2113,7 +2192,7 @@ impl Engine {
             s.qk as u64, *iqln as u64, s.q_nrm as u64, p.q_heads4 as u64, p.qk_stride as u64]);
         step!("launch #11");
         launch_v(k.f("rope64"), QSA_HEADS as u32, t as u32, 1, QSA_HD as u32, &[
-            s.q_nrm as u64, self.st.cos as u64, self.st.sin as u64, s.q_rot as u64,
+            s.q_nrm as u64, self.cos_tbl() as u64, self.sin_tbl() as u64, s.q_rot as u64,
             p.q_heads4 as u64, p.pos_mul1 as u64, p.stride512 as u64, p.pos_base as u64]);
         step!("launch #12");
         launch_v(k.f("qk_k_append"), ((t * QSA_HD + 255) / 256) as u32, 1, 1, 256, &[
@@ -2131,7 +2210,7 @@ impl Engine {
                 s.pool_raw as u64, *ikln as u64, s.pool_nrm as u64, p.q_heads1 as u64, p.stride128 as u64]);
         step!("launch #15");
             launch_v(k.f("rope64"), 1, n_new as u32, 1, QSA_HD as u32, &[
-                s.pool_nrm as u64, self.st.cos as u64, self.st.sin as u64,
+                s.pool_nrm as u64, self.cos_tbl() as u64, self.sin_tbl() as u64,
                 pooled + (self.done_blocks * QSA_HD * 4) as u64,
                 p.q_heads1 as u64, p.pos_mul4 as u64, p.stride128 as u64, p.pos_base_b4 as u64]);
         step!("launch #16");
@@ -2208,7 +2287,7 @@ impl Engine {
         // rope reads its table row from the DEVICE scalar p.pos_base (refreshed
         // per token) - a host-computed pointer offset would be baked into a
         // captured graph and replay the capture token position forever
-        let (cos, sin) = (self.st.cos as u64, self.st.sin as u64);
+        let (cos, sin) = (self.cos_tbl() as u64, self.sin_tbl() as u64);
 
         q.launch_gemv1(k, Q_ROWS, p.n12288 as u64, mixed as u64, s.qg as u64, p.n2560 as u64);
         launch_v(k.f("split_qg"), NQ as u32, 1, 1, AHD as u32, &[s.qg as u64, s.aq as u64, s.agate as u64]);
@@ -2241,7 +2320,7 @@ impl Engine {
         launch_v(k.f("rms128"), QSA_HEADS as u32, 1, 1, QSA_HD as u32, &[
             s.qk as u64, *iqln as u64, s.q_nrm as u64, p.q_heads4 as u64, p.qk_stride as u64]);
         launch_v(k.f("rope64"), QSA_HEADS as u32, 1, 1, QSA_HD as u32, &[
-            s.q_nrm as u64, self.st.cos as u64, self.st.sin as u64, s.q_rot as u64,
+            s.q_nrm as u64, self.cos_tbl() as u64, self.sin_tbl() as u64, s.q_rot as u64,
             p.q_heads4 as u64, p.pos_mul1 as u64, p.stride512 as u64, p.pos_base as u64]);
         launch_v(k.f("qk_k_append"), 1, 1, 1, QSA_HD as u32, &[
             s.qk as u64, keys, p.pos_base as u64, p.one as u64, p.keys_ring as u64]);
@@ -2261,7 +2340,7 @@ impl Engine {
             launch_v(k.f("rms128"), 1, nn1, 1, QSA_HD as u32, &[
                 s.pool_raw as u64, *ikln as u64, s.pool_nrm as u64, p.q_heads1 as u64, p.stride128 as u64]);
             launch_v(k.f("rope64"), 1, nn1, 1, QSA_HD as u32, &[
-                s.pool_nrm as u64, self.st.cos as u64, self.st.sin as u64, s.pool_nrm as u64,
+                s.pool_nrm as u64, self.cos_tbl() as u64, self.sin_tbl() as u64, s.pool_nrm as u64,
                 p.q_heads1 as u64, p.pos_mul4 as u64, p.stride128 as u64, p.pos_base_b4 as u64]);
             launch_v(k.f("d2d_block"), 1, 1, 1, 128, &[
                 pooled as u64, s.pool_nrm as u64, p.block_base as u64, p.n128 as u64]);
@@ -2274,7 +2353,7 @@ impl Engine {
             launch_v(k.f("rms128"), 1, 1, 1, QSA_HD as u32, &[
                 s.pool_raw as u64, *ikln as u64, s.pool_nrm as u64, p.q_heads1 as u64, p.stride128 as u64]);
             launch_v(k.f("rope64"), 1, 1, 1, QSA_HD as u32, &[
-                s.pool_nrm as u64, self.st.cos as u64, self.st.sin as u64,
+                s.pool_nrm as u64, self.cos_tbl() as u64, self.sin_tbl() as u64,
                 pooled + (bb * QSA_HD * 4) as u64,
                 p.q_heads1 as u64, p.pos_mul4 as u64, p.stride128 as u64, p.pos_base_b4 as u64]);
         }
@@ -3163,13 +3242,31 @@ impl Engine {
             cuda::to_i32_into(p.nt_combo, &[((t * TOPK * INTER) as i32)]);
             cuda::to_i32_into(self.pf_ncombo, &[(t * TOPK) as i32]);
 
-            // embeddings → [t][10240] (each token row replicated over 4 HC streams)
+            // embeddings → [t][10240] (each token row replicated over 4 HC streams).
+            // #VIT: image rows take their visual embedding instead of the
+            // (never-read) image_pad embed row — the oracle splices
+            // inputs_embeds[mask] = image_features at exactly these rows.
+            let plan_rows = self.vit_plan.as_ref().map(|pl| pl.map.len()).unwrap_or(0);
             let mut h_host = vec![0f32; t * HCT];
             for (i, &id) in chunk.iter().enumerate() {
-                let row = &self.w.embed_host[id as usize * H..(id as usize + 1) * H];
-                for g in 0..HCN {
-                    for (dst, &b) in h_host[i * HCT + g * H..i * HCT + (g + 1) * H].iter_mut().zip(row) {
-                        *dst = f32::from_bits((b as u32) << 16);
+                let prompt_row = pos_base + i;
+                let vit_row = if prompt_row < plan_rows {
+                    self.vit_plan.as_ref().unwrap().map[prompt_row]
+                } else {
+                    -1
+                };
+                if vit_row >= 0 {
+                    let emb = self.vit_plan.as_ref().unwrap().embeds_host.as_slice();
+                    let row = &emb[vit_row as usize * H..(vit_row as usize + 1) * H];
+                    for g in 0..HCN {
+                        h_host[i * HCT + g * H..i * HCT + (g + 1) * H].copy_from_slice(row);
+                    }
+                } else {
+                    let row = &self.w.embed_host[id as usize * H..(id as usize + 1) * H];
+                    for g in 0..HCN {
+                        for (dst, &b) in h_host[i * HCT + g * H..i * HCT + (g + 1) * H].iter_mut().zip(row) {
+                            *dst = f32::from_bits((b as u32) << 16);
+                        }
                     }
                 }
             }
@@ -4064,6 +4161,17 @@ impl Drop for Engine {
             }
             cuda::free_dev(&mut self.pf_ncombo);
             cuda::free_dev(&mut self.sel_counts);
+            // #VIT: the visual tower, the per-request plan and the mrope tables
+            self.end_vision();
+            if self.mrope_rows > 0 {
+                cuda::free_dev(&mut self.mrope_cos);
+                cuda::free_dev(&mut self.mrope_sin);
+                self.mrope_rows = 0;
+            }
+            if let Some(v) = &mut self.vit {
+                v.free();
+            }
+            self.vit = None;
             if let Some(ds) = &mut self.dev_sampler {
                 cuda::free_dev(&mut ds.mask);
                 cuda::free_dev(&mut ds.rng);

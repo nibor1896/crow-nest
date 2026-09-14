@@ -21,6 +21,11 @@ tokenizers = { version = "0.23.2", default-features = false, features = ["onig"]
 # preserve_order here too: minijinja's own value map is a BTreeMap by default, so the tools
 # object is already sorted BEFORE serde_json ever sees it again in the tojson filter.
 minijinja = { version = "2.24.0", features = ["json", "loop_controls", "loader", "unicode", "preserve_order"] }
+# #VIT: image DECODE only, exactly the five formats Crow's client sends
+# (crow_core.py IMAGE_TYPES: png, jpeg, gif, webp, bmp). No encode features,
+# no rayon, no other format backends; resize/preprocess is hand-rolled in
+# vit.rs to match the HF bicubic (Keys a=-0.75, antialiased) the oracle uses.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 [[bin]]
 name = "states"

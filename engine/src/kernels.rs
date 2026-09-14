@@ -4144,6 +4144,236 @@ extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_k(
         mask[tok] = 1;
     }
 }
+
+// ===================== ViT (the #VIT visual tower kernels) =====================
+// Reference: transformers 5.16.1 models/qwen4_exp/modeling_qwen4_exp.py
+// (Qwen4ExpVisionModel). All math f32; the NVFP4 GEMV below keeps the exact
+// gemv_fp4_b op order (16-wide sub-blocks ascending, part * scale, one acc).
+//
+// The vision MLP fc2 has k_dim 4304, which is a multiple of 16 but not of 64,
+// so rows do not start on 36-byte block boundaries and the gemv_fp4_b row
+// pointer does not apply. gemv_fp4_vit addresses at 16-value sub-block
+// granularity (every vit k_dim is a multiple of 16): for row r sub-block b
+// the global sub-block is G = r*(k_dim/16) + b, its 64-value block is G>>2,
+// its scale byte sits at block*36 + (G&3), and its values at block*36 +
+// 4 + (((G&3)*16 + j)>>1) (low nibble even idx, high odd — the layout of
+// record per cnq::dequant_block / gemv_fp4_b). Per sub-block:
+// part = sum_j e2m1 * x then acc += part * scale, sub-blocks ascending — the
+// identical FP sequence gemv_fp4_b produces on a 64-multiple k_dim.
+extern "C" __global__ void gemv_fp4_vit(const unsigned char* __restrict__ w, const float* __restrict__ x,
+                                        const float* __restrict__ gs_ptr, float* __restrict__ y,
+                                        const int* __restrict__ k_dim_p) {
+    int k_dim = *k_dim_p;
+    int bpr = k_dim >> 4;                     // 16-value sub-blocks per row
+    int row = blockIdx.x;
+    int t = blockIdx.y;
+    const float* xp = x + (size_t)t * k_dim;
+    float gs = gs_ptr[0];
+    int g0 = row * bpr;                       // global sub-block of this row's start
+    float acc = 0.0f;
+    for (int b = threadIdx.x; b < bpr; b += blockDim.x) {
+        int G = g0 + b;
+        const unsigned char* blk = w + (size_t)(G >> 2) * 36;
+        int sb = G & 3;
+        float s = ue4m3(blk[sb]) * gs;
+        float part = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            int idx = sb * 16 + j;
+            unsigned int byte = blk[4 + (idx >> 1)];
+            unsigned int nib = (idx & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
+            part += e2m1(nib) * xp[b * 16 + j];
+        }
+        acc += part * s;
+    }
+    __shared__ float red[256];
+    red[threadIdx.x] = acc;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) y[(size_t)t * gridDim.x + row] = red[0];
+}
+
+// LayerNorm (weight + bias, eps 1e-6, biased variance) over `cols` — the
+// vision norm1/norm2 (1152) and the merger norm (1152). torch.nn.LayerNorm
+// semantics: (x - mean) * rsqrt(var + eps) * w + b.
+extern "C" __global__ void vit_ln(const float* __restrict__ x, const float* __restrict__ w,
+                                  const float* __restrict__ b, float* __restrict__ out,
+                                  const int* __restrict__ cols_p) {
+    int cols = *cols_p;
+    int row = blockIdx.x;
+    int t = threadIdx.x;
+    __shared__ float red[256];
+    const float* xp = x + (size_t)row * cols;
+    float s = 0.0f, ss = 0.0f;
+    for (int d = t; d < cols; d += 256) {
+        float v = xp[d];
+        s += v;
+        ss += v * v;
+    }
+    red[t] = s;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (t < st) red[t] += red[t + st];
+        __syncthreads();
+    }
+    float mean = red[0] / cols;
+    __syncthreads();
+    red[t] = ss;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (t < st) red[t] += red[t + st];
+        __syncthreads();
+    }
+    float var = red[0] / cols - mean * mean;
+    float r = rsqrtf(var + 1e-6f);
+    for (int d = t; d < cols; d += 256) {
+        out[(size_t)row * cols + d] = (xp[d] - mean) * r * w[d] + b[d];
+    }
+}
+
+// out[row * stride + d] += bias[d] — the every-linear bias of the vision tower.
+extern "C" __global__ void vit_add_bias(float* __restrict__ out, const float* __restrict__ bias,
+                                        const int* __restrict__ stride_p, const int* __restrict__ cols_p) {
+    int cols = *cols_p;
+    int row = blockIdx.x;
+    int stride = *stride_p;
+    float* op = out + (size_t)row * stride;
+    for (int d = threadIdx.x; d < cols; d += 256) op[d] += bias[d];
+}
+
+// x[i][1152] += sum of 4 bilinear taps into the learned 48x48 position table
+// (align_corners=True): idx[i*4+k] = h_tap*48 + w_tap, wts[i*4+k] the outer
+// product weights — the host precomputes both in the oracle's tap order.
+extern "C" __global__ void vit_pe_add(float* __restrict__ x, const float* __restrict__ pos,
+                                      const int* __restrict__ idx, const float* __restrict__ wts,
+                                      const int* __restrict__ n_p) {
+    int i = blockIdx.x;
+    if (i >= *n_p) return;
+    int d = threadIdx.x;
+    for (int dd = d; dd < 1152; dd += 256) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            acc += pos[(size_t)idx[i * 4 + k] * 1152 + dd] * wts[i * 4 + k];
+        }
+        x[(size_t)i * 1152 + dd] += acc;
+    }
+}
+
+// Vision rotary on the fused qkv buffer, in place: q at cols [0,1152), k at
+// [1152,2304), head h dims [h*72, h*72+72), rotary pairs (d, d+36) for d<36
+// with per-token cos/sin [t][36] (host-built from the (h,w) position ids).
+extern "C" __global__ void vit_rope(float* __restrict__ qkv, const float* __restrict__ cos_,
+                                    const float* __restrict__ sin_) {
+    int t = blockIdx.y;
+    int h = blockIdx.x;
+    int d = threadIdx.x;
+    if (d >= 36) return;
+    float c = cos_[t * 36 + d];
+    float s = sin_[t * 36 + d];
+    float* qp = qkv + (size_t)t * 3456 + h * 72 + d;
+    float* kp = qkv + (size_t)t * 3456 + 1152 + h * 72 + d;
+    float a = qp[0], b = qp[36];
+    qp[0] = a * c - b * s;
+    qp[36] = b * c + a * s;
+    a = kp[0];
+    b = kp[36];
+    kp[0] = a * c - b * s;
+    kp[36] = b * c + a * s;
+}
+
+// Non-causal single-image attention, one query row per block, online softmax
+// (flash row form): grid (n, 16 heads), block 256. scale = 1/sqrt(72), head
+// dim 72, q/k/v read straight from the fused [n][3456] qkv buffer thirds.
+extern "C" __global__ void vit_attn(const float* __restrict__ qkv, float* __restrict__ out,
+                                    const int* __restrict__ n_p) {
+    int n = *n_p;
+    int qi = blockIdx.x;
+    int h = blockIdx.y;
+    int t = threadIdx.x;
+    const float* qp = qkv + (size_t)qi * 3456 + h * 72;
+    __shared__ float qs[72];
+    __shared__ float red[256];   // per-tile scores, then the sum partials
+    __shared__ float ps[256];    // the tile's probabilities, kept for the V walk
+    if (t < 72) qs[t] = qp[t];
+    __syncthreads();
+    float acc[72];
+    #pragma unroll
+    for (int d = 0; d < 72; d++) acc[d] = 0.0f;
+    float m = -__int_as_float(0x7f800000), l = 0.0f;
+    const float SCALE = 0.11785113019775793f;   // 1/sqrt(72)
+    for (int kt = 0; kt < n; kt += 256) {
+        int j = kt + t;
+        float s = -__int_as_float(0x7f800000);
+        if (j < n) {
+            const float* kp = qkv + (size_t)j * 3456 + 1152 + h * 72;
+            float dot = 0.0f;
+            #pragma unroll 8
+            for (int d = 0; d < 72; d++) dot += qs[d] * kp[d];
+            s = dot * SCALE;
+        }
+        red[t] = s;
+        __syncthreads();
+        for (int st = 128; st > 0; st >>= 1) {
+            if (t < st) red[t] = fmaxf(red[t], red[t + st]);
+            __syncthreads();
+        }
+        float mn = red[0];
+        __syncthreads();
+        float mn_new = fmaxf(m, mn);
+        float p = (j < n) ? expf(s - mn_new) : 0.0f;
+        red[t] = p;
+        ps[t] = p;
+        __syncthreads();
+        for (int st = 128; st > 0; st >>= 1) {
+            if (t < st) red[t] += red[t + st];
+            __syncthreads();
+        }
+        float ln = red[0];
+        __syncthreads();
+        float r = expf(m - mn_new);
+        l = l * r + ln;
+        #pragma unroll
+        for (int d = 0; d < 72; d++) acc[d] *= r;
+        m = mn_new;
+        // EVERY thread t < 72 walks the WHOLE tile's probabilities — output
+        // dim t accumulates p_j * v_j[t] over ALL keys, not one key per tile
+        if (t < 72) {
+            int lim = (n - kt) < 256 ? (n - kt) : 256;
+            for (int jj = 0; jj < lim; jj++) {
+                const float* vp = qkv + (size_t)(kt + jj) * 3456 + 2304 + h * 72;
+                #pragma unroll
+                for (int d = 0; d < 72; d++) acc[d] += ps[jj] * vp[d];
+            }
+        }
+        __syncthreads();
+    }
+    if (t < 72) {
+        float* op = out + ((size_t)qi * 16 + h) * 72;
+        #pragma unroll
+        for (int d = 0; d < 72; d++) op[d] = acc[d] / l;
+    }
+}
+
+// exact-erf GELU (the merger activation): 0.5*x*(1+erff(x/sqrt(2)))
+extern "C" __global__ void gelu_erf(float* __restrict__ x, const int* __restrict__ n_p) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= *n_p) return;
+    float v = x[i];
+    x[i] = 0.5f * v * (1.0f + erff(v * 0.70710678118654752440f));
+}
+
+// tanh-approx GELU (the vision MLP activation, config hidden_act
+// gelu_pytorch_tanh): 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))
+extern "C" __global__ void gelu_tanh(float* __restrict__ x, const int* __restrict__ n_p) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= *n_p) return;
+    float v = x[i];
+    x[i] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+}
 "#;
 
 use cudarc::driver::sys::CUfunction;
@@ -4168,6 +4398,7 @@ impl Kernels {
             "gemv_bf16_b", "gemv_bf16_w", "gemv_fp4_b1k", "hc_down_inj", "gemv_bf16_ws",
             "gemm_fp4_dense", "gemm_bf16_dense", "gemm_fp4_dense_b", "gemm_bf16_dense_b", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
             "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "gemv_fp4_mma_dg", "sh_gate_up_q", "gemv_fp4_mma_g", "gemv_fp4_mma_d32", "gemv_fp4_mma_g32", "attn_sel_r", "attn_sel_d8", "attn_sel_d9", "attn_sel_s", "attn_sel_s8", "attn_sel_s8l", "attn_sel_g",
+            "gemv_fp4_vit", "vit_ln", "vit_add_bias", "vit_pe_add", "vit_rope", "vit_attn", "gelu_erf", "gelu_tanh",
         ];
         let mut map = HashMap::new();
         for n in names {
