@@ -229,6 +229,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 | README numbers | no number without a date, a unit or an identifier | `python tools/check_readme_dates.py` |
 | CI, GitHub Actions | four jobs on ubuntu-latest: build, test, clippy (non-blocking), doc guards. The runner moved from windows-latest with the Linux port on 2026-09-17; the counts of record are still the local Windows proof of 2026-09-11 (engine tests 72 of 80 lib and 55 of 57 serve, 10 tokenizer tests skipped for want of `../models/`), because no run of this workflow is recorded in this repository yet | `.github/workflows/ci.yml` |
 | Linux parity gate | the three parity forms, `decode run 32`, tests, clippy and both doc guards against the Linux values of record; GREEN or RED per item, non-zero exit on any RED; all green at commit 0cf1de5 on 2026-09-17 | `tools/gate-linux.sh` |
+| tool-call session, against a running `serve` | a Crow-shaped tool loop: the engine's own streamed `tool_calls` are fed back as the history, verbatim, so a turn that poisons the history shows up as the 400 it caused; exit non-zero when any round is refused (TASK J, 2026-09-17) | `tools/replay-toolcalls.py --poison --refusals` |
 
 ## License
 

@@ -35,13 +35,32 @@
 //! |---|---|---|
 //! | `Text` | the rest is content, or dropped and counted when a call already ran | `false` |
 //! | `Tail`, after `</function>` | the call is CLOSED, the trailing markup is dropped and counted | `false` |
-//! | any other | MALFORMED: the raw markup of the call in flight goes out as content | `true` |
+//! | any other | MALFORMED: the `arguments` object is closed and marked, the raw markup of the call in flight goes out as content | `true` |
 //!
 //! - `Tail` means the call is COMPLETE: `</function>` already emitted the closing `}`.
 //! - So the client gets a parseable call, `finish_reason` `tool_calls`, and NOT the raw markup.
 //! - One stderr line names it: `tool call closed at EOS without </tool_call>`.
-//! - Only a truncated call (no `</function>`) is malformed, and its `arguments` stay
-//!   unterminated on purpose: `json.loads` must fail rather than parse half a command.
+//! - Only a truncated call (no `</function>`) is malformed.
+//!
+//! The `arguments` invariant (TASK J, 2026-09-17):
+//!
+//! - For EVERY index this parser names, the concatenation of its `Emit::Args` fragments is a
+//!   PARSEABLE JSON OBJECT. There is no input that makes it anything else.
+//! - A complete call closes with `}` (or `{}` when it carried no parameter), as before.
+//! - An ABANDONED call (truncated at `max_tokens`, or markup this parser gives up on) closes
+//!   through `close_args_truncated`: the value in flight is closed the way `</parameter>`
+//!   would have closed it, then `,"_truncated":true}` (or `{"_truncated":true}`) goes out.
+//! - Why it matters: Crow concatenates the fragments into a STRING and stores that string in
+//!   its history verbatim (`crow_core.py:5068`, `:3756-3761`), then re-sends the whole history
+//!   every turn (`:3783-3785`, `:4866`). The chat template iterates `arguments|items`, which
+//!   needs a mapping, so ONE unterminated call used to kill every later turn of that session
+//!   with a 400, and Crow has no way to drop the message again (`:13485-13487`).
+//! - Why the marker instead of a bare `}`: `{"path":"C:/x/y.m"}` parses, so a client would
+//!   run half a command. `_truncated` is declared by no tool, so the call fails as an
+//!   argument error instead. The old contract bought the same safety by leaving the JSON
+//!   broken; that is what poisoned the history.
+//! - `finish_reason` is unchanged: a malformed call keeps `stop` or `length`, never
+//!   `tool_calls`, and the raw markup still goes out as content before the first call.
 //!
 //! Byte accounting:
 //!
@@ -86,6 +105,9 @@ const PARAM_OPEN: &str = "<parameter=";
 const PARAM_CLOSE: &str = "</parameter>";
 /// a function name longer than this is markup that never closed, not a name
 const MAX_TOOL_NAME: usize = 128;
+/// TASK J: the key a TRUNCATED call's `arguments` object carries, and the only key in it
+/// that no tool declares; `pub` because `bin/serve.rs` names it in its contract table test
+pub const TRUNCATED_KEY: &str = "_truncated";
 
 /// what the parser wants the stream writer to send next
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +231,7 @@ fn tool_param_types(
 /// | value text of any other type | buffered, one fragment at `</parameter>` |
 /// | `</parameter>` of a string | `"` |
 /// | `</function>` or `</tool_call>` | `}`, or `{}` when the call carried no parameter |
+/// | the call is ABANDONED (TASK J) | the value in flight is closed, then `,"_truncated":true}` (or `{"_truncated":true}`) |
 ///
 /// - The concatenation of every fragment of one index is exactly the arguments JSON text.
 /// - `id` and `name` ride on the FIRST fragment only; no later fragment carries either key.
@@ -329,6 +352,9 @@ impl ToolStream {
             eprintln!("[toolcall] tool call closed at EOS without </tool_call>");
             return false;
         }
+        // TASK J: the fragments already on the wire are closed into a JSON object and
+        // marked, so Crow's stored history renders and the half call is not runnable
+        self.close_args_truncated(out);
         self.flush_raw(out);
         self.state = TState::Text;
         true
@@ -445,6 +471,33 @@ impl ToolStream {
         self.open_brace = false;
     }
 
+    /// - TASK J: the call in flight is ABANDONED (truncated at `max_tokens`, or markup this
+    ///   parser cannot read), and its `arguments` fragments are already on the wire
+    /// - those fragments are a PREFIX of a JSON object, so this closes the object
+    /// - the value in flight is closed the way `</parameter>` would have closed it, then
+    ///   `TRUNCATED_KEY` is added and the object is closed
+    /// - the invariant it buys: the concatenation of every `Emit::Args` of one index is a
+    ///   PARSEABLE JSON OBJECT, always, so a client that stores it and sends it back cannot
+    ///   poison its own history (the chat template iterates `arguments|items`)
+    /// - the marker is what keeps a truncated call from being RUN as if it were complete:
+    ///   no tool declares `_truncated`, so a caller that passes the object on gets an
+    ///   argument error, not half a command
+    fn close_args_truncated(&mut self, out: &mut Vec<Emit>) {
+        if !self.named {
+            return;
+        }
+        if self.state == TState::ParamValue {
+            self.close_param(out);
+        }
+        let frag = if self.open_brace {
+            format!(",{}:true}}", json_str(TRUNCATED_KEY))
+        } else {
+            format!("{{{}:true}}", json_str(TRUNCATED_KEY))
+        };
+        out.push(Emit::Args { index: self.index, text: frag });
+        self.open_brace = false;
+    }
+
     /// `</tool_call>`: the call is complete, the next one gets the next index
     fn close_call(&mut self) {
         if self.named {
@@ -483,6 +536,8 @@ impl ToolStream {
     }
 
     fn give_up(&mut self, out: &mut Vec<Emit>) {
+        // TASK J: whatever went out for this index stays a parseable JSON object
+        self.close_args_truncated(out);
         self.flush_raw(out);
         // an abandoned call keeps its index: a later call must not land in the same slot
         if self.named {
@@ -880,8 +935,89 @@ mod tests {
         assert!(bad, "an unclosed call is malformed");
         assert_eq!(closed, 0);
         assert_eq!(content_of(&es), cut_off, "the raw markup is what the client sees");
-        // the half built arguments stay unterminated on purpose: json.loads must fail
-        assert!(serde_json::from_str::<serde_json::Value>(&args_of(&es, 0)).is_err());
+        // TASK J: the half built arguments are CLOSED into a JSON object and marked. They
+        // used to stay unterminated on purpose, and that unterminated string is what Crow
+        // stored and re-sent until the chat template refused the whole session with a 400.
+        let v: serde_json::Value =
+            serde_json::from_str(&args_of(&es, 0)).expect("a truncated call still parses");
+        assert!(v.is_object(), "{v}");
+        assert_eq!(v[TRUNCATED_KEY], true, "the truncation is named: {v}");
+        // the bytes the model did produce are still there, so the log shows what was asked
+        assert_eq!(v["path"], "C:/x/y.md");
+    }
+
+    /// TASK J, the invariant that keeps a session alive: whatever the parser is fed, every
+    /// index it NAMED leaves a parseable JSON OBJECT behind. The corpus is every byte prefix
+    /// of a real call plus the give-up shapes, at four piece sizes.
+    #[test]
+    fn every_abandoned_call_leaves_a_parseable_arguments_object() {
+        let tools = a7_tools_fixture();
+        let long_name = "x".repeat(MAX_TOOL_NAME + 8);
+        let corpus = [
+            A7_CALL.to_string(),
+            // the give-up shapes: a parameter name that never closes, after a complete one
+            format!("<tool_call>\n<function=read_file>\n<parameter=path>\na.md\n</parameter>\n<parameter={long_name}"),
+            // `</tool_call>` before `<function=`
+            "<tool_call>\nplain text</tool_call>".to_string(),
+            // a function name that never closes
+            format!("<tool_call>\n<function={long_name}"),
+            // a value that is not JSON, of a parameter that is not declared
+            "<tool_call>\n<function=f>\n<parameter=n>\nnot json".to_string(),
+        ];
+        for markup in &corpus {
+            for end in 1..=markup.len() {
+                if !markup.is_char_boundary(end) {
+                    continue;
+                }
+                for n in [1usize, 3, 7, 4096] {
+                    let (es, _, _) = drive(Some(&tools), 2, &cut(&markup[..end], n));
+                    let named: Vec<usize> = es
+                        .iter()
+                        .filter_map(|e| match e {
+                            Emit::Call { index, .. } => Some(*index),
+                            _ => None,
+                        })
+                        .collect();
+                    for i in named {
+                        let args = args_of(&es, i);
+                        let v = serde_json::from_str::<serde_json::Value>(&args).unwrap_or_else(
+                            |e| panic!("prefix {end} split {n} index {i}: {args:?} does not parse: {e}"),
+                        );
+                        assert!(v.is_object(), "prefix {end} split {n} index {i}: {args:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// TASK J: the give-up path closes the arguments it had already opened, and the call
+    /// that follows it lands in its own index with its own complete object.
+    #[test]
+    fn a_parameter_name_that_never_completes_closes_what_it_opened() {
+        let long_name = "y".repeat(MAX_TOOL_NAME + 1);
+        let markup = format!(
+            "<tool_call>\n<function=f>\n<parameter=a>\n1\n</parameter>\n<parameter={long_name}>\n2\n</parameter>\n</function>\n</tool_call>"
+        );
+        let (es, _, _) = drive(None, 1, &[markup.as_str()]);
+        let v: serde_json::Value =
+            serde_json::from_str(&args_of(&es, 0)).expect("the abandoned call parses");
+        assert_eq!(v["a"], 1);
+        assert_eq!(v[TRUNCATED_KEY], true);
+    }
+
+    /// TASK J: a call the parser named but that ended before its first parameter gets an
+    /// object too, not the empty string the open chunk started with.
+    #[test]
+    fn a_call_truncated_before_its_first_parameter_gets_a_marked_object() {
+        let tools = a7_tools_fixture();
+        for markup in ["<tool_call>\n<function=read_file>", "<tool_call>\n<function=read_file>\n<parameter=path"] {
+            let (es, bad, _) = drive(Some(&tools), 1, &cut(markup, 2));
+            assert!(bad, "{markup:?} is malformed");
+            let args = args_of(&es, 0);
+            assert_eq!(args, "{\"_truncated\":true}", "{markup:?}");
+            let v: serde_json::Value = serde_json::from_str(&args).expect("parses");
+            assert_eq!(v[TRUNCATED_KEY], true);
+        }
     }
 
     #[test]

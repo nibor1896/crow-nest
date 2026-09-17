@@ -1207,7 +1207,8 @@ Therefore:
 | `tools` | rendered as the template variable `tools` | `serve.rs:918`, `tokenizer::render_chat` | `crow_core.py:4672-4700`, `TOOLS` (25 builtin at `crow_core.py:579-838`, frozen at `:846`, plus the `mcp.json` tools added at import, `:841`) |
 | `chat_template_kwargs.enable_thinking` | template variable, default false | `serve.rs:918` | `crow_core.py:2970` (digest path) |
 | `messages[].role = "tool"` | `content` rendered as `<tool_response>...</tool_response>` | `serve.rs:1284` (`normalize_messages`) | `crow_core.py` tool turns |
-| `messages[].tool_calls[].function.arguments` | a JSON STRING from Crow is parsed into the MAPPING the template needs | `serve.rs:1284` | `crow_core.py:3564` |
+| `messages[].tool_calls[].function.arguments` | a JSON STRING from Crow is parsed into the MAPPING the template needs; **nothing that is not a mapping reaches the template** (7.11.14) | `serve.rs:1443` (`normalize_messages`) | `crow_core.py:5068`, stored `:3756-3761`, re-sent `:3783-3785` |
+| every other `messages[]` shape | checked BEFORE the render; a refusal names the message index and the field (7.11.14) | `serve.rs:1518` (`check_messages`) | — |
 | `tool_call_id` | carried, never read; this template pairs by order | `serve.rs:1284` | `crow_core.py` tool turns |
 
 **7.11.4 `POST /v1/chat/completions`, the stream**
@@ -1293,9 +1294,15 @@ C:/x/y.md
   that drives them is `feed()` at `toolcall.rs:280`).
 - EOS after `</function>` CLOSES the call: `finish_reason` `tool_calls`, trailing markup
   dropped and counted, never replayed as content (`toolcall.rs:293`).
-- Malformed markup (no `</function>`, no name): the RAW markup goes out as `delta.content`,
-  `finish_reason` stays `stop` or `length`, `arguments` stays unterminated on purpose so
-  Crow's `json.loads` fails rather than running half a command.
+- Malformed markup (no `</function>`, no name): the RAW markup goes out as `delta.content`
+  and `finish_reason` stays `stop` or `length`.
+- **TASK J (2026-09-17)**: such a call CLOSES its `arguments` object and marks it
+  `"_truncated": true` (`toolcall.rs:485`, `close_args_truncated`). The concatenation of the
+  `Emit::Args` fragments of every index the parser NAMED is therefore a parseable JSON object
+  for every input there is. It used to be left unterminated so Crow's `json.loads` would fail;
+  that unterminated string is what Crow stored and re-sent until the session died (7.11.14).
+  The marker keeps the safety the old contract bought: no tool declares `_truncated`, so half
+  a command is not runnable.
 - `crow_core.TOOLS` is **25 builtin declarations** (`crow_core.py:579-838`, frozen as
   `BUILTIN_TOOLS` at `:846`) plus whatever `mcp.json` adds at import (`:841`, grown at
   `Crow/cli/crow_core.py:9159`, reset at `Crow/cli/crow_core.py:9154`).
@@ -1448,6 +1455,103 @@ C:/x/y.md
 - Wire proof of the refactor: the raw SSE bytes of one streaming request are identical
   before and after, `id`, `created` and the wall-clock `timings` numbers excepted
   (`decode_out/srv-b3a.log`, WIRE DIFF).
+
+**7.11.14 The `arguments` contract, both ends (TASK J, 2026-09-17)**
+
+The bug, as robin hit it live: a Crow goal-mode session of 79 tool rounds, then EVERY
+`POST /v1/chat/completions` answered
+
+```text
+400 {"error":"chat template render failed: invalid operation: cannot convert value into pairs (in chat:136)"}
+```
+
+with the request body growing by about 350 bytes per turn (358,654 -> 386,444 B). Line 136 of
+`models/Qwen3.8-Flash-Next-original/chat_template.jinja` is
+`{%- for args_name, args_value in tool_call.arguments|items %}`, and `|items` needs a mapping.
+
+Why one bad turn killed the whole session (the three facts together, none of them enough alone):
+
+| fact | where |
+|---|---|
+| the engine could emit an `arguments` text that is not a JSON object - a call truncated at `max_tokens` left the fragments unterminated ON PURPOSE | `toolcall.rs`, the old `finish` / `give_up` |
+| Crow concatenates the fragments into a STRING, never parses it, stores it verbatim and re-sends the WHOLE history every turn | `crow_core.py:5068`, `:3756-3761`, `:3783-3785`, `:4866` |
+| a 400 ends the turn and Crow has no way to drop or repair a stored message (`Conversation` is append-only) | `crow_core.py:13485-13487`, `:3592-3607` |
+
+Reproduced without robin on 2026-09-17 with `tools/replay-toolcalls.py`, which is the Crow
+reader and the Crow history builder in 200 lines. Against the pre-fix binary, with round 0 at
+the budget that cuts the call in half (`max_tokens` 44 on this machine):
+
+```text
+round 0: 200, finish=length, 1 call(s), arguments=NOT JSON '{"path":"'
+round 1: HTTP 400, body 657 B -> ... cannot convert value into pairs (in chat:136)
+round 2: HTTP 400, body 741 B -> ... (in chat:136)
+round 3: HTTP 400, body 823 B -> ... (in chat:136)
+```
+
+Against the fixed binary, same budget: `round 0 ... arguments=object, _truncated
+'{"path":"","_truncated":true}'` and rounds 1 to 3 all 200. Logs in `decode_out/taskj/`.
+
+**The fix, end 1 - the engine cannot produce it** (`toolcall.rs:485`, `:110`):
+
+| the call | the `arguments` fragments add up to |
+|---|---|
+| complete, with parameters | `{"p":...}` - unchanged, byte for byte |
+| complete, no parameter | `{}` - unchanged |
+| ABANDONED (truncated at `max_tokens`, or markup the parser gives up on) | the value in flight is closed as `</parameter>` would have closed it, then `,"_truncated":true}` - or `{"_truncated":true}` when no parameter had opened |
+
+- Why the marker and not a bare `}`: `{"path":"C:/x/y.m"}` parses, and Crow RUNS an accumulated
+  call whatever the `finish_reason` was (`crow_core.py:13509-13523`), so a bare close would run
+  half a command. No tool declares `_truncated`, and `run_tool` dispatches with `impl(**args)`
+  and catches `TypeError` as a RESULT (`crow_core.py:12807-12809`), so the truncated call comes
+  back to the model as `error: wrong arguments for <tool>: ... unexpected keyword argument
+  '_truncated'` - which is the same refusal the old unterminated JSON bought, with a message
+  that says what happened and without a history the template cannot render.
+
+**The fix, end 2 - nothing that is not a mapping reaches `|items`** (`serve.rs:1443`):
+
+| `arguments` as it arrives | what the render sees | why |
+|---|---|---|
+| an object | unchanged | the template's own form |
+| a string that parses to an object | that object | Crow's form, the A7 path, bytes unchanged |
+| the EMPTY string | unchanged | the template's own `arguments != ''` guard skips it; it is what the engine's open chunk sends for a call with no fragments |
+| any other string (truncated JSON, prose, a Python repr, a JSON array / number / bool / string) | `{"_raw": "<the string, verbatim>"}` | the model must still SEE what the previous turn asked for; `{}` would rewrite history silently, and the leading underscore says it is not a declared parameter |
+| JSON `null` | `{}` | null means there are no arguments; a `_raw` of `"null"` would invent content that was never sent |
+| any other value (array, number, bool) | `{"_raw": "<its compact JSON>"}` | as the string row |
+
+**The diagnostic** (`serve.rs:1622` `message_digest`, `serve.rs:1664` `log_messages_400`): the
+live log had only `400 Bad Request` and nothing else, which is why this took a session to find.
+Now every rewrite writes `[chat] normalised: message <i> tool_call <j> function.arguments is
+<kind> the template cannot iterate, rendered as ...: <first 200 bytes>`, and every messages 400
+writes the reason plus one line per message with its role, its content kind and, per tool call,
+the name and the first 200 bytes of `arguments`.
+
+**The neighbouring hazards, each measured against this template** (`serve.rs:1518`
+`check_messages`, run on the NORMALIZED messages before the render; a shape that renders is
+never refused, so no request that worked before is refused now):
+
+| shape | template | answer |
+|---|---|---|
+| `content` a string, `null`, absent, or a list of text / `image_url` parts | renders | served (the tool-result-with-an-image list of `crow_core.py:13739-13741` included) |
+| `content` an object, a number or a boolean | `raise_exception` at `chat:39` | 400 naming the message index |
+| a `content` list part that is not an object, or carries no `text` / `image` / `image_url` / `video` | containment error at `chat:8`, or `raise_exception` at `chat:33` | 400 naming the message index and the part index |
+| `tool_calls` absent or `null` | the `if` is falsy | served |
+| `tool_calls` not an array | SILENTLY DROPPED (`is iterable and is not mapping`) | 400: a dropped call is a history that no longer says what happened |
+| a `tool_calls` entry that is not an object, or whose `function` is not an object | `+` on undefined at `chat:128` | 400 naming the message and the entry |
+| `function.name` not a string | `+` on undefined / none / number at `chat:128-133` | 400 naming the message and the entry |
+| `reasoning_content` of any type | a non-string is ignored (`chat:112`) | served; Crow re-sends it on every turn (`crow_core.py:3754-3755`) |
+| a role other than system / user / assistant / tool, or a system message that is not first | `raise_exception` at `chat:160` / `chat:106` | 400 naming the message index |
+
+- Six tests pin it: `toolcall.rs` `every_abandoned_call_leaves_a_parseable_arguments_object`
+  (every byte prefix of a real call and of four give-up shapes, at four piece sizes),
+  `a_parameter_name_that_never_completes_closes_what_it_opened`,
+  `a_call_truncated_before_its_first_parameter_gets_a_marked_object`; `bin/serve.rs`
+  `no_arguments_shape_reaches_the_template_as_a_non_mapping` (which also asserts the OLD 400
+  text on the un-normalized form, against the real template),
+  `a_rewrite_note_names_the_message_the_call_and_the_first_200_bytes`,
+  `every_neighbouring_template_hazard_renders_or_is_named`.
+- The A7 oracle fixture tests are untouched and still byte-identical
+  (`a_history_with_a_tool_turn_renders_byte_identical_to_the_oracle`): the happy path did not
+  move.
 
 ### 7.12 The stage A gate table (what was measured, and where the artefact is)
 

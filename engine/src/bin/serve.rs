@@ -159,11 +159,45 @@
 //! | `role: "assistant"` | `tool_calls[].function.name`, `.arguments` | rendered as the markup below |
 //!
 //! - `tool_call_id` is CARRIED and never read: this template pairs by order, not by id.
-//! - Crow sends `arguments` as a JSON STRING (`crow_core.py:3564`); the template needs a MAPPING.
+//! - Crow sends `arguments` as a JSON STRING (`crow_core.py:5068`); the template needs a MAPPING.
 //! - Measured 2026-09-09 against the Python oracle: the string form raises
 //!   `TypeError: Can only get item pairs from a mapping`, so it is not a render at all.
 //! - `normalize_messages` therefore parses the string into the object it encodes.
-//! - A string that is not a JSON object is left alone, so the render fails loudly with a 400.
+//!
+//! What reaches `tool_call.arguments|items` (`chat_template.jinja:136`), TASK J 2026-09-17:
+//!
+//! | `arguments` as it arrives | what the render sees | note |
+//! |---|---|---|
+//! | an object | unchanged | the template's own form |
+//! | a string that parses to an object | that object | Crow's form, the A7 path, bytes unchanged |
+//! | the EMPTY string | unchanged | the template's `arguments != ''` guard skips it |
+//! | any other string | `{"_raw": "<the string, verbatim>"}` | the model still sees what the turn asked for |
+//! | JSON `null` | `{}` | null means there are no arguments |
+//! | any other value | `{"_raw": "<its compact JSON>"}` | same reason as the string row |
+//!
+//! - NOTHING that is not a mapping reaches that line any more. Before TASK J a string that
+//!   was not a JSON object was left alone and the render failed with a 400 - and because
+//!   Crow stores the assistant turn verbatim (`crow_core.py:3756-3761`), re-sends the whole
+//!   history every turn (`:3783-3785`, `:4866`) and cannot drop a message (`:13485-13487`),
+//!   that one 400 repeated for every later turn of the session. Measured live on 2026-09-17:
+//!   a tool call truncated at `max_tokens` left `{"path":"` in the history and the next three
+//!   turns all answered `400 chat template render failed: invalid operation: cannot convert
+//!   value into pairs (in chat:136)` (`tools/replay-toolcalls.py`, `decode_out/taskj/`).
+//! - The engine end is `toolcall.rs`: an abandoned call now closes its own `arguments` object
+//!   and marks it `_truncated`, so the engine cannot produce that string in the first place.
+//! - Every rewrite writes one `[chat] normalised: message <i> tool_call <j> ...` stderr line
+//!   with the first 200 bytes of the offending value.
+//!
+//! Messages a 400 names (TASK J): `check_messages` runs on the normalized messages before the
+//! render, and every refusal body names the MESSAGE INDEX and the FIELD - the bare
+//! `chat template render failed: ... (in chat:NNN)` did not. The table of what renders and
+//! what is refused is on `check_messages`; the shapes covered are a `content` that is not a
+//! string, a list of parts or null, a `tool_calls` that is not an array, a tool call whose
+//! `function` or `function.name` is wrong, a role the template does not render and a system
+//! message that is not first. `reasoning_content` of any type renders (`chat:112` ignores a
+//! non-string). Both the check and a render that still fails log `message_digest`: one stderr
+//! line per message with its role, its content kind and every tool call's name and the first
+//! 200 bytes of its `arguments`.
 //!
 //! The markup THIS model uses for a tool call (chat template, measured, not assumed):
 //!
@@ -271,8 +305,11 @@
 //! - That case never replays the raw markup as content: the client gets the call, once.
 //! - Malformed markup (no `</function>`, no name): the RAW markup goes out as `delta.content`,
 //!   `finish_reason` stays `stop` or `length`, one stderr line names it, nothing panics.
-//! - A malformed call leaves its `arguments` unterminated on purpose: Crow's `json.loads`
-//!   then fails and the tool is not run, which is the safe end of a truncated call.
+//! - TASK J: a malformed or truncated call CLOSES its `arguments` object and marks it
+//!   `{"..., "_truncated":true}`, so the concatenation of the fragments of every index is
+//!   always a parseable JSON object. It used to be left unterminated so `json.loads` would
+//!   fail; that string is what Crow stored and re-sent until the session died. The marker
+//!   keeps the safety: no tool declares `_truncated`, so half a command is not runnable.
 //! - The parser itself lives in `crow_nest_engine::toolcall` (#29 review); this file keeps
 //!   the chunk builders (`chunk_tool_open`, `chunk_tool_args`) and the call sites.
 //!
@@ -1348,40 +1385,287 @@ fn next_delta(full: &str, emitted: usize) -> Option<&str> {
     Some(&full[emitted..])
 }
 
-/// - #29 A7: Crow sends `tool_calls[].function.arguments` as a JSON STRING (`crow_core.py:3564`)
-/// - the chat template iterates it with `|items`, which needs a MAPPING
+/// TASK J: the key a non-mapping `arguments` is carried into the render under
+const RAW_KEY: &str = "_raw";
+
+/// - the JSON kind of a value, for a refusal or a log line that names a field
+fn kind_of(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// - the first 200 bytes of a value, on a char boundary, for the diagnostic lines
+/// - a string is shown as its own text, anything else as its compact JSON
+fn head200(v: &serde_json::Value) -> String {
+    let s = match v.as_str() {
+        Some(s) => s.to_string(),
+        None => v.to_string(),
+    };
+    let mut n = s.len().min(200);
+    while n > 0 && !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    if n == s.len() {
+        s
+    } else {
+        format!("{}... ({} B total)", &s[..n], s.len())
+    }
+}
+
+/// - #29 A7: Crow sends `tool_calls[].function.arguments` as a JSON STRING (`crow_core.py:5068`,
+///   stored verbatim at `:3756-3761`, re-sent whole every turn at `:3783-3785`, `:4866`)
+/// - the chat template iterates it with `|items` (`chat_template.jinja:136`), which needs a MAPPING
 /// - measured 2026-09-09: the Python oracle raises `TypeError: Can only get item pairs from a
-///   mapping` on the string form, so the object form is the only one that renders at all
-/// - this converts the string to the object it encodes and leaves everything else untouched
-/// - a string that is not a JSON object stays as it is, so the render fails loudly (400)
-fn normalize_messages(messages: &serde_json::Value) -> serde_json::Value {
+///   mapping` on the string form; minijinja raises `cannot convert value into pairs (in chat:136)`
+/// - TASK J (2026-09-17): NOTHING that is not a mapping reaches that line any more. One
+///   unterminated `arguments` string used to kill every later turn of a session: Crow stores it,
+///   re-sends it, gets a 400, and has no way to drop the message again (`crow_core.py:13485-13487`)
+///
+/// | `arguments` as it arrives | what the render sees | why |
+/// |---|---|---|
+/// | an object | unchanged | the template's own form |
+/// | a string that parses to an object | that object | Crow's form, the A7 path, bytes unchanged |
+/// | the EMPTY string | unchanged | the template's `arguments != ''` guard skips it; it is what the engine's open chunk sends for a call with no fragments |
+/// | any other string (truncated JSON, prose, a JSON array / number / bool / string) | `{"_raw": "<the string, verbatim>"}` | the model must still SEE what the previous turn asked for; `{}` would rewrite history silently, and the leading underscore says it is not a declared parameter |
+/// | JSON `null` | `{}` | null means there are no arguments; a `_raw` of `"null"` would invent content that was never sent |
+/// | any other value (array, number, bool) | `{"_raw": "<its compact JSON>"}` | same reason as the string row |
+///
+/// - Every rewrite returns a note naming the message index, the tool_call index and the first
+///   200 bytes of the offending value; `chat_route` puts each on one stderr line.
+/// - `function` may be absent: the template then reads `name` / `arguments` off the call itself
+///   (`tool_call.function is defined`), and so does this.
+fn normalize_messages(messages: &serde_json::Value) -> (serde_json::Value, Vec<String>) {
     let mut doc = messages.clone();
+    let mut notes = Vec::new();
     let arr = match doc.as_array_mut() {
         Some(a) => a,
-        None => return doc,
+        None => return (doc, notes),
     };
-    for m in arr.iter_mut() {
+    for (mi, m) in arr.iter_mut().enumerate() {
         let calls = match m.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
             Some(c) => c,
             None => continue,
         };
-        for c in calls.iter_mut() {
-            let args = match c.get_mut("function").and_then(|f| f.get_mut("arguments")) {
+        for (ci, call) in calls.iter_mut().enumerate() {
+            // the template uses `tool_call.function` when it is defined, else the call itself
+            let target = if call.get("function").is_some() {
+                call.get_mut("function")
+            } else {
+                Some(call)
+            };
+            let args = match target.and_then(|t| t.get_mut("arguments")) {
                 Some(a) => a,
                 None => continue,
             };
-            let parsed = match args.as_str() {
-                Some(s) => serde_json::from_str::<serde_json::Value>(s).ok(),
-                None => None,
-            };
-            if let Some(v) = parsed {
+            // the two forms that already render, in the order they arrive: the object the
+            // template wants, and the empty string its own guard skips
+            if args.is_object() || args.as_str() == Some("") {
+                continue;
+            }
+            if let Some(v) = args.as_str().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()) {
                 if v.is_object() {
                     *args = v;
+                    continue;
                 }
+            }
+            let (fixed, how) = if args.is_null() {
+                (serde_json::json!({}), "{}".to_string())
+            } else {
+                let raw = match args.as_str() {
+                    Some(s) => s.to_string(),
+                    None => args.to_string(),
+                };
+                (serde_json::json!({ RAW_KEY: raw }), format!("{{\"{RAW_KEY}\": ...}}"))
+            };
+            notes.push(format!(
+                "message {mi} tool_call {ci} function.arguments is {} the template cannot \
+                 iterate, rendered as {how}: {}",
+                kind_of(args),
+                head200(args)
+            ));
+            *args = fixed;
+        }
+    }
+    (doc, notes)
+}
+
+/// - TASK J: the message shapes THIS chat template cannot render, named by index and field
+/// - run on the NORMALIZED messages, so `arguments` is already a mapping the template can iterate
+/// - every rule was MEASURED against `models/Qwen3.8-Flash-Next-original/chat_template.jinja`;
+///   a shape that renders is never refused here, so no request that worked before is refused now
+/// - `Err` is the 400 body: it names the message index and the field, which the bare
+///   `chat template render failed: ... (in chat:NNN)` did not
+///
+/// | shape | template | answer |
+/// |---|---|---|
+/// | a role other than system / user / assistant / tool | `raise_exception` at `chat:160` | 400, names the index and the role |
+/// | a system message that is not first | `raise_exception` at `chat:106` | 400, names the index |
+/// | `content` an object, a number or a boolean | `raise_exception` at `chat:39` | 400, names the index |
+/// | `content` a list part that is not an object | containment check or `chat:33` | 400, names the index and the part |
+/// | `content` a list part with no `text`, `image`, `image_url` or `video` | `raise_exception` at `chat:33` | 400, names the index and the part |
+/// | `content` a STRING, `null`, absent, or a list of text / image_url parts | renders | served |
+/// | `tool_calls` absent or `null` | the `if` is falsy | served |
+/// | `tool_calls` not an array | SILENTLY DROPPED (`is iterable and is not mapping`) | 400: a dropped call is a history that no longer says what happened |
+/// | a `tool_calls` entry that is not an object, or whose `function` is not an object | `+` on undefined at `chat:128` | 400, names the index and the entry |
+/// | `function.name` not a string | `+` on undefined / none / number at `chat:128-133` | 400, names the index and the entry |
+/// | `reasoning_content` of any type | a non-string is ignored (`chat:112`) | served |
+fn check_messages(messages: &serde_json::Value) -> Result<(), String> {
+    let arr = match messages.as_array() {
+        Some(a) => a,
+        None => return Ok(()),
+    };
+    for (i, m) in arr.iter().enumerate() {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        if !matches!(role, "system" | "user" | "assistant" | "tool") {
+            return Err(format!(
+                "message {i} has role {role:?}; the template renders only system, user, assistant and tool"
+            ));
+        }
+        if role == "system" && i > 0 {
+            return Err(format!(
+                "message {i} is a system message; the template requires the system message first"
+            ));
+        }
+        check_content(i, m.get("content"))?;
+        match m.get("tool_calls") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Array(cs)) => {
+                for (j, c) in cs.iter().enumerate() {
+                    check_tool_call(i, j, c)?;
+                }
+            }
+            Some(other) => {
+                return Err(format!(
+                    "message {i} tool_calls is {}, the template needs an array",
+                    kind_of(other)
+                ))
             }
         }
     }
-    doc
+    Ok(())
+}
+
+/// the `content` rules of the table on `check_messages`, for one message
+fn check_content(i: usize, content: Option<&serde_json::Value>) -> Result<(), String> {
+    let parts = match content {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::String(_)) => return Ok(()),
+        Some(serde_json::Value::Array(a)) => a,
+        Some(other) => {
+            return Err(format!(
+                "message {i} content is {}, the template renders a string, a list of parts or null",
+                kind_of(other)
+            ))
+        }
+    };
+    for (j, part) in parts.iter().enumerate() {
+        let obj = match part.as_object() {
+            Some(o) => o,
+            None => {
+                return Err(format!(
+                    "message {i} content part {j} is {}, the template renders text and image_url blocks only",
+                    kind_of(part)
+                ))
+            }
+        };
+        let ty = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let known = obj.contains_key("text")
+            || obj.contains_key("image")
+            || obj.contains_key("image_url")
+            || obj.contains_key("video")
+            || ty == "image"
+            || ty == "video";
+        if !known {
+            return Err(format!(
+                "message {i} content part {j} is neither a text nor an image_url block: {}",
+                head200(part)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// the `tool_calls` entry rules of the table on `check_messages`, for one entry
+fn check_tool_call(i: usize, j: usize, call: &serde_json::Value) -> Result<(), String> {
+    if !call.is_object() {
+        return Err(format!("message {i} tool_call {j} is {}, not an object", kind_of(call)));
+    }
+    let target = match call.get("function") {
+        None => call,
+        Some(f) if f.is_object() => f,
+        Some(other) => {
+            return Err(format!(
+                "message {i} tool_call {j} function is {}, not an object",
+                kind_of(other)
+            ))
+        }
+    };
+    match target.get("name") {
+        Some(serde_json::Value::String(_)) => Ok(()),
+        other => Err(format!(
+            "message {i} tool_call {j} has no string function.name (it is {}); the template \
+             renders `<function=` + the name",
+            other.map(kind_of).unwrap_or("absent")
+        )),
+    }
+}
+
+/// - TASK J: one line per message for the stderr dump that goes with every messages 400
+/// - names the index, the role, the content kind and, per tool call, the name and the first
+///   200 bytes of `arguments`, so a 400 is diagnosable from the log alone
+/// - the RAW messages go in here, not the normalized ones: the log has to show what arrived
+fn message_digest(messages: &serde_json::Value) -> Vec<String> {
+    let arr = match messages.as_array() {
+        Some(a) => a,
+        None => return vec![format!("messages is {}", kind_of(messages))],
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, m) in arr.iter().enumerate() {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("<no role>");
+        let content = match m.get("content") {
+            None => "absent".to_string(),
+            Some(serde_json::Value::String(s)) => format!("string({} B)", s.len()),
+            Some(serde_json::Value::Array(a)) => format!("list({} part(s))", a.len()),
+            Some(other) => kind_of(other).to_string(),
+        };
+        let mut line = format!("message {i} role={role} content={content}");
+        match m.get("tool_calls") {
+            None => {}
+            Some(serde_json::Value::Array(cs)) => {
+                line.push_str(&format!(" tool_calls={}", cs.len()));
+                for (j, c) in cs.iter().enumerate() {
+                    let t = match c.get("function") {
+                        Some(f) if f.is_object() => f,
+                        _ => c,
+                    };
+                    let name = t.get("name").map(head200).unwrap_or_else(|| "<absent>".to_string());
+                    let args = t.get("arguments");
+                    line.push_str(&format!(
+                        " [{j} name={name:?} arguments={} {:?}]",
+                        args.map(kind_of).unwrap_or("absent"),
+                        args.map(head200).unwrap_or_default()
+                    ));
+                }
+            }
+            Some(other) => line.push_str(&format!(" tool_calls={} (not an array)", kind_of(other))),
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// - TASK J: the one place a messages 400 is logged, so both refusal paths log alike
+/// - the reason first, then `message_digest` of the RAW messages, one line each
+fn log_messages_400(reason: &str, raw: &serde_json::Value) {
+    eprintln!("[chat] 400 {reason}");
+    for l in message_digest(raw) {
+        eprintln!("[chat]   {l}");
+    }
 }
 
 /// write one SSE frame and flush it; `false` means the client is gone
@@ -1581,10 +1865,25 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
     };
     // #29 A7: `tools` is rendered, and an assistant turn's `arguments` string is turned into
     // the object the template's `|items` needs. Both are the request as Crow sends it.
-    let msgs = normalize_messages(&req.messages);
+    // TASK J: `normalize_messages` now leaves NO non-mapping for that `|items`, and every
+    // rewrite it made goes to stderr; `check_messages` refuses what the template cannot
+    // render with a message that names the index and the field, before any render.
+    let (msgs, notes) = normalize_messages(&req.messages);
+    for n in &notes {
+        eprintln!("[chat] normalised: {n}");
+    }
+    if let Err(e) = check_messages(&msgs) {
+        log_messages_400(&e, &req.messages);
+        return respond_json(stream, "400 Bad Request", &error_json(&e));
+    }
     let ids = match tk.encode_chat(&msgs, req.tools.as_ref(), true, req.enable_thinking) {
         Ok(v) => v,
-        Err(e) => return respond_json(stream, "400 Bad Request", &error_json(&e)),
+        Err(e) => {
+            // a render that still fails is a shape `check_messages` does not know: the dump
+            // is what turns the next one into a fix instead of another bisect
+            log_messages_400(&e, &req.messages);
+            return respond_json(stream, "400 Bad Request", &error_json(&e));
+        }
     };
     if ids.is_empty() {
         return respond_json(stream, "400 Bad Request", &error_json("the rendered prompt is empty"));
@@ -3401,24 +3700,178 @@ mod tests {
             ]},
             {"role": "tool", "tool_call_id": "call_0", "content": "# Title"}
         ]);
-        let n = normalize_messages(&msgs);
+        let (n, notes) = normalize_messages(&msgs);
         assert_eq!(n[1]["tool_calls"][0]["function"]["arguments"], serde_json::json!({"path": "a.md"}));
+        assert!(notes.is_empty(), "the A7 path is not a rewrite: {notes:?}");
         // everything else is untouched, byte for byte
         assert_eq!(n[0], msgs[0]);
         assert_eq!(n[2], msgs[2]);
         assert_eq!(n[1]["tool_calls"][0]["id"], "call_0");
 
-        // an object stays an object, and a string that is not a JSON object stays a string,
-        // so the render fails loudly instead of inventing arguments
-        let already = serde_json::json!([{"role": "assistant", "tool_calls": [
-            {"function": {"name": "f", "arguments": {"a": 1}}}]}]);
-        assert_eq!(normalize_messages(&already), already);
-        let junk = serde_json::json!([{"role": "assistant", "tool_calls": [
-            {"function": {"name": "f", "arguments": "not json"}}]}]);
-        assert_eq!(normalize_messages(&junk), junk);
-        let scalar = serde_json::json!([{"role": "assistant", "tool_calls": [
-            {"function": {"name": "f", "arguments": "3"}}]}]);
-        assert_eq!(normalize_messages(&scalar), scalar);
+        // an object stays an object, and so does the empty string: the template's own
+        // `arguments != ''` guard skips that one, and it is what the engine's open chunk sends
+        for same in [
+            serde_json::json!([{"role": "assistant", "tool_calls": [
+                {"function": {"name": "f", "arguments": {"a": 1}}}]}]),
+            serde_json::json!([{"role": "assistant", "tool_calls": [
+                {"function": {"name": "f", "arguments": ""}}]}]),
+            serde_json::json!([{"role": "assistant", "tool_calls": [
+                {"function": {"name": "f"}}]}]),
+        ] {
+            let (n, notes) = normalize_messages(&same);
+            assert_eq!(n, same, "rewritten: {same}");
+            assert!(notes.is_empty(), "{notes:?}");
+        }
+    }
+
+    /// TASK J: the shape that killed robin's session. Every `arguments` value that is not a
+    /// mapping becomes one, the note names the message and the tool_call index, and the
+    /// value the model sent is still in the render.
+    #[test]
+    fn no_arguments_shape_reaches_the_template_as_a_non_mapping() {
+        // the truncated call the engine used to emit, and every other shape Crow can store:
+        // `crow_core.py:5068` concatenates the fragments into a string and never parses it
+        let shapes: Vec<(serde_json::Value, serde_json::Value)> = vec![
+            // (as it arrives, what the render must see)
+            (serde_json::json!("{\"path\": \"C:/x/y.m"), serde_json::json!({RAW_KEY: "{\"path\": \"C:/x/y.m"})),
+            (serde_json::json!("not json"), serde_json::json!({RAW_KEY: "not json"})),
+            (serde_json::json!("{'path': 'a.md'}"), serde_json::json!({RAW_KEY: "{'path': 'a.md'}"})),
+            (serde_json::json!("[1, 2]"), serde_json::json!({RAW_KEY: "[1, 2]"})),
+            (serde_json::json!("3"), serde_json::json!({RAW_KEY: "3"})),
+            (serde_json::json!("null"), serde_json::json!({RAW_KEY: "null"})),
+            (serde_json::json!("\"{\\\"path\\\": \\\"a.md\\\"}\""), serde_json::json!({RAW_KEY: "\"{\\\"path\\\": \\\"a.md\\\"}\""})),
+            (serde_json::json!(null), serde_json::json!({})),
+            (serde_json::json!([1, 2]), serde_json::json!({RAW_KEY: "[1,2]"})),
+            (serde_json::json!(7), serde_json::json!({RAW_KEY: "7"})),
+            (serde_json::json!(true), serde_json::json!({RAW_KEY: "true"})),
+        ];
+        let tk = tk();
+        let tools = crow_nest_engine::toolcall::a7_tools_fixture();
+        for (arrived, wanted) in shapes {
+            let msgs = serde_json::json!([
+                {"role": "user", "content": "Read a.md"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call_0", "type": "function",
+                     "function": {"name": "read_file", "arguments": arrived}}]},
+                {"role": "tool", "tool_call_id": "call_0", "content": "# Title"}
+            ]);
+            // before the fix this was the 400 of record, at chat:136
+            let raw = tk.render_chat(&msgs, Some(&tools), true, false);
+            if arrived.as_str() == Some("") {
+                assert!(raw.is_ok());
+            } else {
+                let e = raw.expect_err("the un-normalized form must not render");
+                assert!(e.contains("cannot convert value into pairs (in chat:136)"), "{e}");
+            }
+            let (n, notes) = normalize_messages(&msgs);
+            assert_eq!(n[1]["tool_calls"][0]["function"]["arguments"], wanted, "arrived {arrived}");
+            assert_eq!(notes.len(), 1, "one note per rewrite: {notes:?}");
+            assert!(notes[0].starts_with("message 1 tool_call 0 function.arguments is"), "{}", notes[0]);
+            assert!(check_messages(&n).is_ok(), "arrived {arrived}");
+            let s = tk
+                .render_chat(&n, Some(&tools), true, false)
+                .unwrap_or_else(|e| panic!("arrived {arrived} still does not render: {e}"));
+            // the model still sees what the previous turn asked for
+            if let Some(raw_text) = wanted.get(RAW_KEY).and_then(|v| v.as_str()) {
+                assert!(s.contains(&format!("<parameter={RAW_KEY}>")), "{s}");
+                assert!(s.contains(raw_text), "the value the turn sent is gone: {s}");
+            }
+        }
+    }
+
+    /// TASK J: the note a rewrite writes to stderr names the message, the tool_call and the
+    /// first 200 bytes of the value, so the log alone says which history entry was broken.
+    #[test]
+    fn a_rewrite_note_names_the_message_the_call_and_the_first_200_bytes() {
+        let long = "x".repeat(500);
+        let msgs = serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "a", "arguments": "{\"p\": 1}"}},
+                {"function": {"name": "b", "arguments": long}}]},
+        ]);
+        let (_, notes) = normalize_messages(&msgs);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let n = &notes[0];
+        assert!(n.starts_with("message 1 tool_call 1 function.arguments is a string"), "{n}");
+        assert!(n.contains("(500 B total)"), "{n}");
+        assert!(n.contains(&"x".repeat(200)), "{n}");
+        assert!(!n.contains(&"x".repeat(201)), "the log line is capped at 200 bytes: {n}");
+        // the digest carries the same locator, one line per message
+        let d = message_digest(&msgs);
+        assert_eq!(d.len(), 2);
+        assert!(d[0].starts_with("message 0 role=user content=string(2 B)"), "{}", d[0]);
+        assert!(d[1].contains("tool_calls=2"), "{}", d[1]);
+        assert!(d[1].contains("[1 name=\"b\" arguments=a string"), "{}", d[1]);
+    }
+
+    /// TASK J: the neighbouring hazards of `chat:136`. Each one either RENDERS or is refused
+    /// by `check_messages` with a 400 that names the message index and the field - never the
+    /// bare `chat template render failed` the log could not act on.
+    #[test]
+    fn every_neighbouring_template_hazard_renders_or_is_named() {
+        let tk = tk();
+        let tools = crow_nest_engine::toolcall::a7_tools_fixture();
+        let call = serde_json::json!({"function": {"name": "f", "arguments": {"a": 1}}});
+        // renders: the shapes Crow really sends (`crow_core.py:3555-3566`, `:13739-13741`,
+        // `:3754-3755`) plus the ones the template guards itself
+        let renders: Vec<(&str, serde_json::Value)> = vec![
+            ("a text-only content list", serde_json::json!([{"role": "user", "content": [{"type": "text", "text": "hi"}]}])),
+            ("a text plus image_url list", serde_json::json!([{"role": "user", "content": [
+                {"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}])),
+            ("an empty content list", serde_json::json!([{"role": "user", "content": []}])),
+            ("a null content", serde_json::json!([{"role": "user", "content": null}])),
+            ("an absent content", serde_json::json!([{"role": "user"}])),
+            ("a tool result carrying an image", serde_json::json!([{"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "x", "tool_calls": [call.clone()]},
+                {"role": "tool", "content": [{"type": "text", "text": "r"}, {"type": "image_url", "image_url": {"url": "u"}}]}])),
+            ("a null tool result", serde_json::json!([{"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "x", "tool_calls": [call.clone()]},
+                {"role": "tool", "content": null}])),
+            ("reasoning_content, a string", serde_json::json!([{"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "x", "reasoning_content": "thought"}])),
+            ("reasoning_content, not a string", serde_json::json!([{"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "x", "reasoning_content": {"a": 1}}])),
+            ("a null tool_calls", serde_json::json!([{"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "x", "tool_calls": null}])),
+            ("an empty tool_calls", serde_json::json!([{"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "x", "tool_calls": []}])),
+            ("a call with no function key", serde_json::json!([{"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [{"name": "f", "arguments": {"a": 1}}]},
+                {"role": "tool", "content": "r"}])),
+        ];
+        for (label, msgs) in renders {
+            let (n, _) = normalize_messages(&msgs);
+            check_messages(&n).unwrap_or_else(|e| panic!("{label} must render, refused: {e}"));
+            tk.render_chat(&n, Some(&tools), true, false)
+                .unwrap_or_else(|e| panic!("{label} must render: {e}"));
+        }
+        // refused, each with the index and the field in the body
+        let refused: Vec<(serde_json::Value, &str)> = vec![
+            (serde_json::json!([{"role": "user", "content": {"text": "hi"}}]), "message 0 content is an object"),
+            (serde_json::json!([{"role": "user", "content": 5}]), "message 0 content is a number"),
+            (serde_json::json!([{"role": "user", "content": ["hi"]}]), "message 0 content part 0 is a string"),
+            (serde_json::json!([{"role": "user", "content": [null]}]), "message 0 content part 0 is null"),
+            (serde_json::json!([{"role": "user", "content": [{"type": "text"}]}]), "message 0 content part 0 is neither a text nor an image_url block"),
+            (serde_json::json!([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x", "tool_calls": "abc"}]), "message 1 tool_calls is a string"),
+            (serde_json::json!([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x", "tool_calls": {"a": 1}}]), "message 1 tool_calls is an object"),
+            (serde_json::json!([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x", "tool_calls": [5]}]), "message 1 tool_call 0 is a number, not an object"),
+            (serde_json::json!([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x", "tool_calls": [{"function": "f"}]}]), "message 1 tool_call 0 function is a string, not an object"),
+            (serde_json::json!([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x", "tool_calls": [{"function": null}]}]), "message 1 tool_call 0 function is null, not an object"),
+            (serde_json::json!([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x", "tool_calls": [{"function": {"arguments": {}}}]}]), "message 1 tool_call 0 has no string function.name"),
+            (serde_json::json!([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x", "tool_calls": [{"function": {"name": 5}}]}]), "message 1 tool_call 0 has no string function.name"),
+            (serde_json::json!([{"role": "user", "content": "hi"}, {"role": "weird", "content": "x"}]), "message 1 has role \"weird\""),
+            (serde_json::json!([{"role": "user", "content": "hi"}, {"role": "system", "content": "x"}]), "message 1 is a system message"),
+        ];
+        for (msgs, wanted) in refused {
+            let (n, _) = normalize_messages(&msgs);
+            let e = check_messages(&n).expect_err(&format!("{msgs} was served"));
+            assert!(e.contains(wanted), "body {e:?} does not name {wanted:?}");
+            // and the template agrees: it could not have rendered it either
+            assert!(tk.render_chat(&n, Some(&tools), true, false).is_err()
+                    || msgs[1].get("tool_calls").map(|t| !t.is_array()).unwrap_or(false),
+                    "refused a shape the template renders: {msgs}");
+        }
     }
 
     /// Provenance of `ORACLE_RENDER`: run once on 2026-09-09 with
@@ -3508,7 +3961,7 @@ mod tests {
         ]);
         let tools = crow_nest_engine::toolcall::a7_tools_fixture();
         let s = tk
-            .render_chat(&normalize_messages(&msgs), Some(&tools), true, false)
+            .render_chat(&normalize_messages(&msgs).0, Some(&tools), true, false)
             .expect("the tool history renders");
         assert_eq!(s, ORACLE_RENDER);
         // without the conversion the template cannot iterate the arguments at all
