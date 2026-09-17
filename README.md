@@ -169,7 +169,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 |---|---|
 | `engine/` | the engine crate, the CUDA kernels and the 17 binaries counted 2026-09-11 (`engine/README.md`) |
 | `converter/` | the streaming safetensors to CNQ quantizer (`converter/README.md`) |
-| `docs/` | `architecture.md` (the spec, sections 0 to 7), `system-landscape.md`, `env.md`, the ten-task material |
+| `docs/` | `architecture.md` (the spec, sections 0 to 7), `system-landscape.md`, `env.md`, `cuda-rust-evaluation.md` (the CUDA Rust / cuTile evaluation and its pilot, 2026-09-17), the ten-task material |
 | `tools/` | Python guards and harness helpers, no GPU needed |
 | `decode_out/` | gate inputs only; measurement records are ignored (`.gitignore`) |
 | `oracle/` | the layer-wise reference against the unquantized originals |

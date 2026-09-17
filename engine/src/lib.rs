@@ -27,3 +27,8 @@ pub mod slot;
 // #VIT: the visual tower (the container "vit" section), Crow image decoding and
 // preprocessing, the interleaved-mrope tables and the prefill splice plan
 pub mod vit;
+// TASK D (2026-09-17): the cuTile Rust pilot, behind the default-off `cutile-pilot`
+// feature. An evaluation artefact for docs/cuda-rust-evaluation.md, not a production
+// path; nothing in the engine calls it.
+#[cfg(feature = "cutile-pilot")]
+pub mod cutile_pilot;

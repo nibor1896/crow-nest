@@ -470,6 +470,8 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 
 - Thin kernels (constant 4): one module per family, NVRTC-compiled at load, shared
   block-scaled-MMA core.
+- The alternative was weighed and declined on 2026-09-17: `cuda-rust-evaluation.md` measures
+  NVIDIA's two CUDA Rust tracks against these families, with one cuTile pilot kernel.
 - Numerics gate in this order: kernel vs probe CPU reference → layer vs oracle (#6).
 - No tok/s anywhere in kernel code or comments — measurement goes through the harness.
 
