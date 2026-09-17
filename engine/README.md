@@ -4,12 +4,14 @@
 |---|---|
 | crate | `crow_nest_engine`, Rust, thin CUDA kernels through NVRTC and cudarc |
 | target | NVIDIA Blackwell, `compute_120a` (plain `sm_120` is rejected by ptxas) |
-| spec | `../docs/architecture.md`, sections 0 to 7 |
+| platform | Linux and Windows; the Linux port landed 2026-09-17 (issue #15) and the Windows path is byte-for-byte the old code under `#[cfg(windows)]` |
+| spec | `../docs/architecture.md`, sections 0 to 8 (section 8 is the code map) |
 | environment variables | `../docs/env.md`, one row per `CROW_*` name with its `file:line` |
 
 ## Binaries
 
-- One row per `[[bin]]` entry in `Cargo.toml`.
+- One row per `[[bin]]` entry in `Cargo.toml`. Eighteen entries, counted 2026-09-17.
+- The product binaries are named `serve`, `decode` and `parity` on Linux and `serve.exe`, `decode.exe` and `parity.exe` on Windows; every command below prints the Linux name.
 
 | binary | purpose | kind |
 |---|---|---|
@@ -23,8 +25,10 @@
 | `mma_probe` | scale-fragment layout pin for `mma.sync ... mxf4nvf4.block_scale` | probe |
 | `mma_gate` | gate for the FP4 tensor-core path against the reference GEMV | probe |
 | `mma_probe2` | ue4m3 scale-byte edge decode on the MMA hardware | probe |
+| `qsa_probe` | the parallel QSA selection against the single-block form, row by row | probe |
+| `router_probe` | the `CROW_ROUTER_GEMM` and `CROW_PF_GEMM_B` router forms against the reference | probe |
 | `sf_scan` | scan container expert scale bytes for the NaN encoding `0x7F` | probe |
-| `graph_probe` | CUDA-graph node cost on this machine (WDDM) | probe |
+| `graph_probe` | CUDA-graph node cost on this machine (measured on Windows/WDDM; not re-run on Linux) | probe |
 | `pcie_probe` | cold-expert staging bandwidth over PCIe | probe |
 | `pin_probe` | what limits pinned host allocation | probe |
 | `pin_leak` | device memory per pinned host allocation (issue #18) | probe |
@@ -37,6 +41,8 @@
 cd engine
 cargo build --release --bin serve
 ```
+
+- The same command builds on both platforms. Stable Rust; `libc 0.2` is the only dependency the Linux port added (issue #15, 2026-09-17). Nothing links CUDA at build time (`cudarc` `dynamic-loading`).
 
 ### Target directory rule, for every build next to a measurement chain
 
@@ -53,41 +59,48 @@ serve [--port <n>] [--slot-save-path <dir>]
 ```
 
 - Start it from the repository root: container and hot-set paths are repository relative.
-- Default port 8099, bind address `127.0.0.1` (`src/bin/serve.rs:445`).
-- Container default `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` (`src/bin/serve.rs:446`), `CROW_CNQ` overrides it.
-- Hot-set default `decode_out/hotsets-M-longctx2100-n160.json` (`src/bin/serve.rs:447`), `CROW_HOTSETS` overrides it.
-- Prompt chunk pinned at `2048` for the whole process (`src/bin/serve.rs:448-449`).
+- On Linux, start it through `../tools/serve-linux.sh`: it puts the process in a transient scope (`systemd-run --user --scope --slice=session.slice`, `MemorySwapMax=0`, `MemoryHigh=MemTotal-8G`, `MemoryMax=MemTotal-6G`) and sets `LD_LIBRARY_PATH` from `CUDA_LIB` (default `~/.local/share/crow/cuda/lib`, never the `lib/stubs` sibling).
+- Default port 8099, bind address `127.0.0.1` (`src/bin/serve.rs:491`, `src/bin/serve.rs:2983`).
+- Container default `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` (`src/geo.rs:75`), `CROW_CNQ` overrides it.
+- Hot-set default `decode_out/hotsets-M-longctx2100-n160.json` (`src/geo.rs:76`), `CROW_HOTSETS` overrides it.
+- Prompt chunk pinned at `2048` for the whole process, derived from `geo::TRICKLE_CHUNK_THRESHOLD` (`src/bin/serve.rs:497`, `src/geo.rs:57`).
 - Blocking, one request at a time, no async runtime; a second connection waits in the accept queue.
-- One engine per machine: `Engine::load` takes `engine/.engine.lock` before anything is pinned.
+- One engine per machine: `Engine::load` takes `engine/.engine.lock` before anything is pinned. On Linux the host-memory budget is derived at boot as `min(46 GiB cap, free_for_pin - CROW_RAM_MARGIN_GB)` and a second live CUDA process (detected by a foreign holder of `/dev/nvidia-uvm`) drops that basis to `MemAvailable` (`src/manager.rs:55`, issue #15).
 - `--slot-save-path` must name a directory that already exists; a typo exits 2 before the engine loads.
+- The planner reserves the vision path's VRAM before it chooses N: `[budget] vit reserve 277.3 MB (tower scratch 228.5 + mrope span 48.8)` at `n_ctx` 200,000, measured 2026-09-17 (`src/vit.rs:108`, `CROW_VIT_RESERVE_MB`). No per-request VRAM is allocated for images.
 
 ### Endpoints
 
 | method and path | answer | anchor |
 |---|---|---|
-| `GET /health` | `{"status":"ok"}` | `src/bin/serve.rs:495` |
-| `GET /props` | the operating point as a JSON document, field names mirror llama-server | `src/bin/serve.rs:496` |
-| `POST /v1/chat/completions` | SSE `chat.completion.chunk` frames, or one `chat.completion` document when `stream` is `false` | `src/bin/serve.rs:497` |
-| `GET /slots` | the one slot of this process as an array of one | `src/bin/serve.rs:498` |
-| `POST /slots/0?action=save\|restore` | writes or reads the slot file; `400` without `--slot-save-path` | `src/bin/serve.rs:499` |
-| anything else | `404` with a JSON body | `src/bin/serve.rs:855` |
+| `GET /health` | `{"status":"ok"}` | `src/bin/serve.rs:543` |
+| `GET /props` | the operating point as a JSON document, field names mirror llama-server | `src/bin/serve.rs:544` |
+| `POST /v1/chat/completions` | SSE `chat.completion.chunk` frames, or one `chat.completion` document when `stream` is `false` | `src/bin/serve.rs:545` |
+| `GET /slots` | the one slot of this process as an array of one | `src/bin/serve.rs:546` |
+| `POST /slots/0?action=save\|restore` | writes or reads the slot file; `400` without `--slot-save-path` | `src/bin/serve.rs:547` |
+| anything else | `404` with a JSON body | `src/bin/serve.rs:905` |
 
 ### Request fields read by `POST /v1/chat/completions`
 
+- The body is parsed by `parse_chat` (`src/bin/serve.rs:1033`); unknown fields are accepted and ignored, as llama-server does.
+
 | field | behaviour | anchor |
 |---|---|---|
-| `messages` | required, non-empty array, every entry needs a string `role` | `src/bin/serve.rs:128` |
-| `stream` | `true` streams frames, `false` or absent answers one document | `src/bin/serve.rs:129` |
-| `max_tokens` | default `1024`, capped at `32768`, clamped to `n_ctx` minus prompt ids | `src/bin/serve.rs:130` |
-| `model` | echoed, default `crow-nest` | `src/bin/serve.rs:131` |
-| `temperature` | absent, `null` or at most zero is greedy; above zero samples | `src/bin/serve.rs:133` |
-| `top_p`, `top_k`, `presence_penalty`, `seed` | read only when `temperature` is above zero; `top_k` clamped to `64` by the device sampler (`SAMPLE_MAXK`, `engine/src/kernels.rs:2942`) | `src/bin/serve.rs:134-137` |
-| `min_p` | accepted and ignored, the device sampler has none (issue #28) | `src/bin/serve.rs:138` |
-| `tools` | OpenAI function tools, rendered into the chat template | `src/bin/serve.rs:139` |
-| `stream_options.include_usage`, `timings_per_token` | add `usage` and `timings` to the final chunk | `src/bin/serve.rs:140-141` |
+| `messages` | required, non-empty array, every entry needs a string `role` | `src/bin/serve.rs:977` |
+| `content` parts | a string, `null`, or a list of `text` and `image_url` blocks; an `image_url` block without `image_url.url` is a `400` that names the message index | `src/bin/serve.rs:997-1006` |
+| `stream` | `true` streams frames, `false` or absent answers one document | `src/bin/serve.rs:1035` |
+| `max_tokens` | default `1024`, capped at `32768`, clamped to `n_ctx` minus prompt ids | `src/bin/serve.rs:1041` |
+| `model` | echoed, default `crow-nest` | `src/bin/serve.rs:1058` |
+| `stream_options.include_usage`, `timings_per_token` | add `usage` and `timings` to the final chunk | `src/bin/serve.rs:1065-1071` |
+| `temperature` | absent, `null` or at most zero is greedy; above zero samples | `src/bin/serve.rs:1076` |
+| `top_p`, `top_k`, `presence_penalty`, `seed` | read only when `temperature` is above zero; `top_k` clamped to `64` by the device sampler (`SAMPLE_MAXK`, `src/kernels.rs:3994`) | `src/bin/serve.rs:1077-1088` |
+| `min_p` | accepted and ignored, the device sampler has none (issue #28) | `src/bin/serve.rs:1079` |
+| `tools` | OpenAI function tools, rendered into the chat template | `src/bin/serve.rs:1013` |
 
-- `serve` reads none of the `CROW_SAMPLE`, `CROW_TEMP`, `CROW_TOP_P`, `CROW_TOP_K`, `CROW_PRESENCE`, `CROW_SEED` variables; the sampler comes from the request (`src/bin/serve.rs:196-197`).
+- `serve` reads none of the `CROW_SAMPLE`, `CROW_TEMP`, `CROW_TOP_P`, `CROW_TOP_K`, `CROW_PRESENCE`, `CROW_SEED` variables; the sampler comes from the request.
 - Those variables keep working for `decode` and `parity`.
+- A message shape the chat template cannot render is refused BEFORE the render with a body that names the message index and the field (`check_messages` `src/bin/serve.rs:1564`, `check_content` `:1601`, `check_tool_call` `:1640`); a `function.arguments` that is not a mapping is rewritten instead of refused (`normalize_messages` `src/bin/serve.rs:1481`): a string that parses to an object becomes that object, `null` becomes `{}`, anything else becomes `{"_raw": "<verbatim>"}`. Every rewrite logs one `[chat] normalised` line (TASK J, 2026-09-17).
+- A CUDA allocation refused inside a request raises `cuda::AllocFailed`, which `guarded` (`src/bin/serve.rs:2678`) catches: it frees what was taken, resets the engine and answers `503` with a body naming the allocation, its byte count and the free VRAM. It is the only `503` this server answers; any other panic still ends the process (TASK K, 2026-09-17).
 
 ### Subcommand `serve tokenize`
 
@@ -97,7 +110,7 @@ serve tokenize --chat --text "<text>"
 serve tokenize --raw  --text "<text>"
 ```
 
-- No CUDA context, no `.engine.lock`, no GPU (`src/bin/serve.rs:93`, `:108`).
+- No CUDA context, no `.engine.lock`, no GPU (`src/bin/serve.rs:710`, dispatched at `:2870`).
 - Exit codes: 0 written or printed, 2 usage, 3 tokenizer load failed, 4 IO or encode.
 
 ## decode
@@ -126,7 +139,9 @@ parity <phase> <run_index> <crow|llama> <prompts.json> [llama-url] [outprefix]
 
 ## Parity gate
 
-1. Build the candidate into its own target directory, then record `sha1sum` of both `decode.exe` binaries.
+- On Linux the whole gate is one script: `../tools/gate-linux.sh [outdir]` from the repository root. It runs the three parity forms, `decode run` over 32 ids, `cargo test --release`, clippy and the doc guards against the values of record, prints GREEN or RED per item and exits non-zero on any RED. Nine items; all nine green at commit `8ff2055` on 2026-09-17. Every expected value carries its provenance in the script header. The steps below are the same gate by hand, and the form Windows uses.
+
+1. Build the candidate into its own target directory, then record `sha1sum` of both `decode` binaries (`decode.exe` on Windows).
 2. Export the operating point, with `CROW_ADAPT`, `CROW_SAMPLE`, `CROW_CHUNK` and `CROW_CHUNK_AUTO` unset:
 
 ```
@@ -146,22 +161,25 @@ decode parity decode_out/real512-ids.json <dir>
 4. Compare with `cmp -s <ref>/gpu-logits.f32 <new>/gpu-logits.f32`; every pair must be byte-identical, and the `real512` form runs twice because an eight-token test alone hid a barrier race until 2026-09-04.
 5. Delete the output directories afterwards; one `real512` pair is 512,532,480 B per side.
 
-| id file | logit rows | verdict of record | date |
-|---|---|---|---|
-| `decode_out/parity-ids.json` | 12 | identical against `d211ab52ad2b` | 2026-09-10 |
-| `decode_out/real512-ids.json` | 516 | identical against `d211ab52ad2b` | 2026-09-10 |
-| `decode_out/t3-debug-1024-ids.json` | 1028 | identical against `d211ab52ad2b` (issue #33) | 2026-09-10 |
+| id file | logit rows | Windows verdict of record | Linux value of record | date |
+|---|---|---|---|---|
+| `decode_out/parity-ids.json` | 12 | identical against `d211ab52ad2b` | `bceba6ff772431de…a122a2`, 11,919,360 B, byte-identical to Windows | Windows 2026-09-10, Linux 2026-09-17 |
+| `decode_out/real512-ids.json` | 516 | identical against `d211ab52ad2b` | `8387234709271515…`, 512,532,480 B | Windows 2026-09-10, Linux 2026-09-17 |
+| `decode_out/real512-ids.json`, teacher-forced | 516 | not a Windows form | `3bb3e69edf90…`, 512,532,480 B, run with `CROW_GRAPH=0 CROW_PARITY_PREFILL=8` | Linux 2026-09-17 |
+| `decode_out/t3-debug-1024-ids.json` | 1028 | identical against `d211ab52ad2b` (issue #33) | `117dd8d9d8dc…`, 1,021,091,840 B, at 740 tok/s cold | Windows 2026-09-10, Linux 2026-09-17 |
 
-- The third row is the largest chunk form in production; it has been a gate since 2026-09-05 (issue #22).
-- It is run with `CROW_CHUNK=1024` set, twice, the same way.
-- Reference build of record: `d211ab52ad2b` (issue #43).
+- The 1024-row form is the largest chunk form in production; it has been a gate since 2026-09-05 (issue #22).
+- It is run with `CROW_CHUNK=1024` set, twice, the same way. It is NOT in `gate-linux.sh`, because it costs a full long-prompt run.
+- Reference build of record on Windows: `d211ab52ad2b` (issue #43). The Linux values come from commit `9f12429` (8, 512, P8) and 2026-09-17 (1024); the 512-row and 1024-row bytes differ between the platforms because the NVRTC and driver JIT differ, not because of the port (`../docs/architecture.md` section 8.7).
+- The teacher-forced form puts the DECODE path under the parity contract, which the other three do not.
 
 ## Machine rules
 
-- One engine process per machine, never two GPU jobs.
+- One engine process per machine, never two GPU jobs. On Linux the engine enforces it: `.engine.lock`, plus the `/dev/nvidia-uvm` scan that drops the pinned budget when another CUDA process is alive.
 - Stop a run by PID, never by process name: a name filter matches the shell that started it.
-- Wait for more than 50.5 GiB free host RAM before a load (rule since 2026-09-10, issue #38).
-- A tok/s number is only quoted next to a decode run from the same session (issue #38).
+- On Windows, wait for more than 50.5 GiB free host RAM before a load (rule since 2026-09-10, issue #38). On Linux that manual rule is replaced by the derived budget of issue #15: `free_for_pin` is `MemTotal` minus what cannot be reclaimed, not `MemAvailable`, because about 45 GiB sits in the driver's pinned-page pool after an exit and is served straight back to the next allocation (measured 2026-09-17: 60.76 GiB free for pinning against `MemAvailable` 10.89 GiB).
+- Keep the container off a compressed mount. The PLE section is read as 108-byte rows at random offsets on the critical path of every token; on btrfs set `chattr +m` BEFORE the file is written and check with `filefrag -v <container> | grep -c encoded` (0 is what you want), because `chattr +m` plus a defragment on an already compressed file is a no-op (measured 2026-09-17).
+- A tok/s number is only quoted next to a decode run from the same session (issue #38). On Linux a throughput number also needs a defined page-cache state: the exit purge cools the container, so a cold-form reading belongs to the previous process unless a purging run precedes it (measured 2026-09-17).
 
 ## Tests
 
@@ -169,3 +187,13 @@ decode parity decode_out/real512-ids.json <dir>
 cd engine
 cargo test --release
 ```
+
+- 165 passed, 0 failed on 2026-09-17 (98 lib + 67 serve), and `cargo clippy --release --all-targets` reports 1,422 warnings, counted as `grep -cE '^warning: '`. Both counts are enforced by `../tools/gate-linux.sh`.
+- The ten tokenizer tests need `../models/` and are skipped without it.
+
+```
+python3 ../tools/check_env_docs.py
+python3 ../tools/check_readme_dates.py
+```
+
+- The two doc guards need no GPU and no model: `check_env_docs` reads `code 82, doc 82` and exits 0, `check_readme_dates` reports 0 offenders, both on 2026-09-17.

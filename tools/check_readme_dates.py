@@ -23,6 +23,8 @@ Exempt digit runs (they are identifiers, not measurements)
   It is code, the same way a fenced block is code.
 - a data type or format name: ``BF16``, ``FP8``, ``NVFP4``, ``E2M1``, ``ue4m3``,
   ``f32``, ``CNQ4.5``, ``Q2_K_XL``.
+- a shields.io badge line (``<a href=...><img src="https://img.shields.io/...``): its
+  digits are versions, names and colours, never a measurement.
 
 Deviation from the E6 brief (2026-09-11)
 ----------------------------------------
@@ -52,6 +54,7 @@ REPO = Path(__file__).resolve().parent.parent
 DEFAULT_FILES = ["README.md", "engine/README.md", "converter/README.md"]
 
 FENCE_RE = re.compile(r"^\s*```")
+BADGE_RE = re.compile(r"^\s*<a href=.*img\.shields\.io/")
 DATE_RE = re.compile(r"20\d\d-\d\d-\d\d")
 RUN_RE = re.compile(r"\d{2,}")
 
@@ -97,6 +100,9 @@ def scan(path):
             code += 1
             continue
         if not RUN_RE.search(raw):
+            continue
+        if BADGE_RE.match(raw):
+            exempt += 1
             continue
         if DATE_RE.search(raw):
             dated += 1

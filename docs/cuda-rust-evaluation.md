@@ -216,6 +216,8 @@ reports 0 offenders. The release binaries are **not** byte-identical to `7ddd296
 and therefore its symbol mangling. The parity bytes are what the contract is about, and they
 did not move.
 
+Every count in this document is the count at `0667e0b`, the commit it was written in. They moved later the same day and the moves are not this document's subject: `cargo test --release` went 144 → 147 (TASK H) → 153 (TASK J) → **165** (TASK K, 98 lib + 67 serve), so the feature-on arm is **166**; `tools/check_env_docs.py` reads **82 = 82** at `487128d` instead of 80 = 80. Clippy is unchanged at **1422** at `487128d`, and the 8-row parity value of record is unchanged (`bceba6ff772431de…a122a2`, 11,919,360 B). Nothing in the pilot measurements above was re-run.
+
 ## 6 — Recommendation
 
 **Do not port anything to cuTile now.** NVIDIA says neither track is production-ready, the pilot

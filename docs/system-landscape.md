@@ -37,8 +37,9 @@ section 0.
 
 ## Second machine — the Linux box (added 2026-09-17, issue #15)
 
-The Linux port, the host-memory fix and the three refactor cuts of branch `linux-refactor` were
-all built and measured here. Every Linux number in this repository names this box.
+The Linux port, the host-memory fix, the three refactor cuts, the two prefill floors and the
+three live-session fixes of 2026-09-17 (branch `main`, `9f12429` to `487128d`) were all built and
+measured here. Every Linux number in this repository names this box.
 
 | component | value |
 |---|---|
@@ -51,9 +52,10 @@ all built and measured here. Every Linux number in this repository names this bo
 | userspace OOM | `systemd-oomd` active, watching `app.slice` on memory PRESSURE |
 | CUDA | runtime 13.3.1 unpacked at `~/.local/share/crow/cuda` (`lib` on `LD_LIBRARY_PATH`, never `lib/stubs`); NVRTC 13.3.33, ptxas V13.3.73, cuBLAS 13.6 |
 | Rust | rustc 1.98.1 (2026-09-01) from rustup stable, the Linux toolchain of record |
+| container storage | btrfs; the `-M` container lives on a NOCOMPRESS path — `chattr +m` set BEFORE the file is written, verified with `filefrag -v <container> \| grep -c encoded` = 0 encoded extents, 2,817 extents total, sha256 unchanged by the rewrite |
 
 Read on 2026-09-17 from `/proc/meminfo`, `/proc/sys/vm/swappiness`, `zramctl`, `uname -r`,
-`nvidia-smi`, `ptxas --version` and `rustc --version` on this machine.
+`nvidia-smi`, `ptxas --version`, `rustc --version`, `filefrag` and `lsattr` on this machine.
 
 ### The two facts that shaped the code
 
@@ -111,5 +113,9 @@ Read on 2026-09-17 from `/proc/meminfo`, `/proc/sys/vm/swappiness`, `zramctl`, `
   `tools/gate-linux.sh`), not a probe.
 - `docs/measurement-handoff.md` still owes its Linux retest: the job-ring round-trip numbers
   there are WDDM numbers and no Linux figure replaces them.
+- The parity battery reads ALL GREEN at `8ff2055` with `cargo test` at 165 and clippy at 1,422
+  (2026-09-17). The ten-task gate has no Linux value of record: today's run is 1 of 10
+  byte-identical to the Windows `final4` records and 9 flip on near-ties, and the run that would
+  close it needs a reboot (`decode_out/final/GATES.md` section 6).
 - Any second machine/OS is appended with its own probe evidence before its first
   measurement is quoted.

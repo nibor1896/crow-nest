@@ -6,6 +6,7 @@
 | quantization | NVFP4 per ggml geometry, round to nearest, calibration free |
 | what it never does | hold the model in RAM, judge its own output, or read a GGUF |
 | spec | `../docs/architecture.md` section 1, approved 2026-09-02 |
+| platform | Linux and Windows; the crate is pure Rust with no CUDA and no platform code, and it was untouched by the Linux port of 2026-09-17 (issue #15) |
 | module comment of record | `src/main.rs:1-59` |
 
 ## Usage
@@ -77,7 +78,7 @@ converter [--scales ceil|mse] <model-dir | file.safetensors> <out.cnq>
 - Computed during quantization by dequantizing in place, so it costs no second pass.
 - It is gate 0 of the measurement ladder.
 - Exit code 1 on any bound violation, in the mode that has a bound.
-- The converter never judges its own output beyond that bound; FP8-KV and PLE-NVFP4 quality are oracle comparisons (`../docs/architecture.md:340-342`).
+- The converter never judges its own output beyond that bound; FP8-KV and PLE-NVFP4 quality are oracle comparisons (`../docs/architecture.md:119-120`, and section 5 for the gates).
 
 ## Scale policy `--scales`
 
@@ -106,3 +107,5 @@ converter [--scales ceil|mse] <model-dir | file.safetensors> <out.cnq>
 cd converter
 cargo test --release
 ```
+
+- Seven `#[test]` functions in `src/main.rs`, counted 2026-09-17. They are not part of the engine's count: `cd engine && cargo test --release` reads 165 passed, 0 failed on the same day and covers `crow_nest_engine` and `bin/serve` only.

@@ -96,7 +96,7 @@ pub const fn mrope_bytes(context: usize) -> usize {
 /// Before this the vision path allocated everything lazily "on the first image
 /// request so text-only boots keep the full planner budget" (#VIT): the planner
 /// maximised the hot set against the free VRAM and an image request then had to
-/// find its scratch, its mrope tables and its splice buffer in whatever the
+/// find its scratch and its mrope tables in whatever the
 /// 512 MiB `manager::SAFETY` slack had left. On robin's 2026-09-17 serve session
 /// it did not, and `cuda::ck` turned the refusal into a process panic that took
 /// the rest of the session with it. The three numbers are named here, added to

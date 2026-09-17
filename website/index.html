@@ -520,11 +520,11 @@ footer{border-top:1px solid var(--border);padding:70px 0 0;overflow:hidden}
       <div class="term-body">
         <div class="tline"><span class="t-prompt">$ </span><span id="cmdText"></span><span class="caret" id="cmdCaret"></span></div>
         <div id="bootBlock" class="t-hidden">
-          <div class="tline t-ok">container loaded        104.7 GB → 32.4 GB VRAM <span class="t-dim">(hot · 160 experts/layer)</span></div>
-          <div class="tline t-ok">kernels compiled        51 NVRTC modules <span class="t-dim">(m16n8k64 FP4 MMA)</span></div>
+          <div class="tline t-ok">container loaded        104.7 GB → 31.2 GiB VRAM <span class="t-dim">(hot · 155 experts/layer)</span></div>
+          <div class="tline t-ok">kernels compiled        110 kernels, 1 NVRTC module <span class="t-dim">(m16n8k64 FP4 MMA)</span></div>
           <div class="tline t-ok">kv cache                FP8 · 262,144 tokens reserved</div>
           <div class="tline t-ok">cuda graph captured     1 replay per token <span class="t-dim">(was ~1,000 launches)</span></div>
-          <div class="tline t-listen">listening               http://0.0.0.0:8080 <span class="t-dim">(OpenAI-compatible)</span></div>
+          <div class="tline t-listen">listening               http://127.0.0.1:8099 <span class="t-dim">(OpenAI-compatible)</span></div>
         </div>
         <div id="genBlock" class="t-hidden">
           <div class="tline"><span class="t-prompt">&gt; </span><span class="t-out" id="qText"></span></div>
@@ -579,7 +579,7 @@ footer{border-top:1px solid var(--border);padding:70px 0 0;overflow:hidden}
         <span class="tag">sm_120a</span>
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4 14h6l-1 8 9-12h-6l1-8Z"/></svg></div>
         <h3>Tensor cores all the way down</h3>
-        <p>Every dense and routed GEMV runs m16n8k64 FP4 MMA — 51 kernels NVRTC-compiled at load, tuned to your GPU, with the naive path kept as fallback.</p>
+        <p>Every dense and routed GEMV runs m16n8k64 FP4 MMA — 110 kernels NVRTC-compiled at load out of one module, tuned to your GPU, with the naive path kept as fallback.</p>
         <div class="viz">
           <div class="hbar"><span>naive</span><div class="track"><div class="fill" data-w="100"></div></div><span class="val">0.653&thinsp;ms</span></div>
           <div class="hbar hot"><span>mma</span><div class="track"><div class="fill" data-w="9"></div></div><span class="val">0.060&thinsp;ms</span></div>
@@ -592,13 +592,13 @@ footer{border-top:1px solid var(--border);padding:70px 0 0;overflow:hidden}
         <span class="tag">residency</span>
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5"/><path d="M17.2 13.8v6.4M14 17h6.4"/></svg></div>
         <h3>The right experts, always hot</h3>
-        <p>A traffic-trained hot-set pins 160 of 512 experts per layer in VRAM. Everything else streams zero-copy from pinned memory at ~25&thinsp;GB/s — the router never waits.</p>
+        <p>A traffic-trained hot-set pins 155 of 512 experts per layer in VRAM. Everything else streams zero-copy from pinned memory at ~25&thinsp;GB/s — the router never waits.</p>
         <div class="viz">
           <div class="xgrid" id="xgrid" aria-hidden="true"></div>
           <div class="xgrid-cap">
-            <span><span class="dotk" style="background:var(--a1)"></span>hot <b>160/512</b></span>
+            <span><span class="dotk" style="background:var(--a1)"></span>hot <b>155/512</b></span>
             <span><span class="dotk" style="background:var(--data)"></span>streamed <b id="coldCount">0</b></span>
-            <span style="margin-left:auto">96&thinsp;% coverage</span>
+            <span style="margin-left:auto">91.6&thinsp;% coverage</span>
           </div>
         </div>
       </div>
@@ -640,7 +640,7 @@ footer{border-top:1px solid var(--border);padding:70px 0 0;overflow:hidden}
         <ul class="checklist">
           <li>No telemetry, no account, no API key</li>
           <li>OpenAI-compatible endpoint out of the box</li>
-          <li>Single binary, no runtime dependencies</li>
+          <li>Linux and Windows, Blackwell only; the CUDA runtime is the one dependency</li>
         </ul>
       </div>
     </div>
@@ -660,30 +660,30 @@ footer{border-top:1px solid var(--border);padding:70px 0 0;overflow:hidden}
       <div class="bench-col">
         <h4>Decode <span>tok/s · higher is better</span></h4>
         <div class="brow crow">
-          <div class="btop"><span class="bname"><i></i>crow · CNQ4.5</span><span class="bval"><span data-count="63.2" data-decimals="1">0</span></span></div>
+          <div class="btop"><span class="bname"><i></i>crow · CNQ4.5</span><span class="bval"><span data-count="36.8" data-decimals="1">0</span></span></div>
           <div class="btrack"><div class="bfill" data-w="100"></div></div>
-          <div class="bgain">+59&thinsp;% vs reference</div>
+          <div class="bgain">0.90&thinsp;× the reference</div>
         </div>
         <div class="brow ref">
-          <div class="btop"><span class="bname"><i></i>llama.cpp · IQ4_XS</span><span class="bval"><span data-count="39.8" data-decimals="1">0</span></span></div>
+          <div class="btop"><span class="bname"><i></i>llama.cpp · Q2_K_XL</span><span class="bval"><span data-count="41.0" data-decimals="1">0</span></span></div>
           <div class="btrack"><div class="bfill" data-w="63"></div></div>
         </div>
       </div>
       <div class="bench-col">
         <h4>Prefill <span>tok/s · higher is better</span></h4>
         <div class="brow crow">
-          <div class="btop"><span class="bname"><i></i>crow · CNQ4.5</span><span class="bval"><span data-count="1184" data-decimals="0">0</span></span></div>
+          <div class="btop"><span class="bname"><i></i>crow · CNQ4.5</span><span class="bval"><span data-count="968" data-decimals="0">0</span></span></div>
           <div class="btrack"><div class="bfill" data-w="100"></div></div>
-          <div class="bgain">+50&thinsp;% vs reference</div>
+          <div class="bgain">1.05&thinsp;× the reference</div>
         </div>
         <div class="brow ref">
-          <div class="btop"><span class="bname"><i></i>llama.cpp · IQ4_XS</span><span class="bval"><span data-count="790" data-decimals="0">0</span></span></div>
+          <div class="btop"><span class="bname"><i></i>llama.cpp · Q2_K_XL</span><span class="bval"><span data-count="922.5" data-decimals="1">0</span></span></div>
           <div class="btrack"><div class="bfill" data-w="67"></div></div>
         </div>
       </div>
       <div class="bench-note">
-        <b>Setup</b> — Qwen3.8-Flash-Next (360B MoE) · single RTX 5090 · greedy · identical prompts, identical chat template · EOS-stop both arms · ten-task suite incl. 19k-token long-context read · reference: llama.cpp CUDA build.<br>
-        <b>Note</b> — design mockup; figures reflect current project targets.
+        <b>Setup</b> — Qwen3.8-Flash-Next (360B MoE) · single RTX 5090 · greedy · identical prompts, identical chat template · EOS-stop both arms · the 16,064-id long-context read · reference: llama.cpp CUDA build.<br>
+        <b>Note</b> — design mockup. crow-nest figures are the Linux values of record of 2026-09-17 (RTX 5090, Arch Linux): decode 36.8 tok/s and prefill 968 tok/s on the 16,064-id t1-read prompt. The llama.cpp figures are Windows measurements of 2026-09-11 with GGUF Q2_K_XL at 2.4 bpw against CNQ4.5 at 4.5 bpw, and the two arms have never been run adjacent on the Linux box.
       </div>
     </div>
   </div>
@@ -727,20 +727,19 @@ footer{border-top:1px solid var(--border);padding:70px 0 0;overflow:hidden}
           <span id="copyLbl">copy</span>
         </button>
       </div>
-      <div class="code-pane on" id="p-install"><span class="c"># Rust toolchain + CUDA 13 toolkit, that's it</span>
-$ git clone https://github.com/crow-nest/crow
-$ cd crow &amp;&amp; cargo build --release
+      <div class="code-pane on" id="p-install"><span class="c"># Rust toolchain + CUDA 13.3 toolkit, that's it</span>
+$ git clone https://github.com/nibor1896/crow-nest
+$ cd crow-nest/engine &amp;&amp; cargo build --release --bin serve
 
-<span class="c"># 51 kernels compile for your GPU on first launch</span></div>
+<span class="c"># 110 kernels compile for your GPU on first launch</span></div>
       <div class="code-pane" id="p-serve"><span class="c"># CNQ4.5 container · 262k context · OpenAI-compatible</span>
-$ <span class="f">crow</span> serve Qwen3.8-Flash-Next.cnq \
-    <span class="n">--ctx</span> <span class="s">262144</span> <span class="n">--kv</span> <span class="s">fp8</span> <span class="n">--port</span> <span class="s">8080</span>
+$ <span class="f">tools/serve-linux.sh</span> <span class="n">--port</span> <span class="s">8099</span>
 
-<span class="k">✓</span> container loaded   <span class="s">32.4 GB VRAM</span> (hot · 160/layer)
-<span class="k">✓</span> listening          <span class="s">http://0.0.0.0:8080</span></div>
+<span class="k">✓</span> container loaded   <span class="s">31.2 GiB VRAM</span> (hot · 155/layer)
+<span class="k">✓</span> listening          <span class="s">http://127.0.0.1:8099</span></div>
       <div class="code-pane" id="p-client"><span class="k">from</span> openai <span class="k">import</span> OpenAI
 
-client = <span class="f">OpenAI</span>(base_url=<span class="s">"http://localhost:8080/v1"</span>, api_key=<span class="s">"crow"</span>)
+client = <span class="f">OpenAI</span>(base_url=<span class="s">"http://127.0.0.1:8099/v1"</span>, api_key=<span class="s">"crow"</span>)
 
 stream = client.chat.completions.<span class="f">create</span>(
     model=<span class="s">"qwen3.8-flash-next"</span>,
@@ -871,7 +870,7 @@ document.querySelectorAll(".card").forEach(function(card){
 /* ---------- expert grid flicker ---------- */
 var xg=document.getElementById("xgrid");
 if(xg){
-  var CELLS=96,HOT=18,cells=[];
+  var CELLS=96,HOT=29,cells=[];
   for(var i=0;i<CELLS;i++){
     var d=document.createElement("i");xg.appendChild(d);cells.push(d);
   }
@@ -901,7 +900,7 @@ var cmdText=document.getElementById("cmdText"),
     genText=document.getElementById("genText"),
     tpsVal=document.getElementById("tpsVal"),
     tokVal=document.getElementById("tokVal");
-var CMD="crow serve Qwen3.8-Flash-Next.cnq --ctx 262144 --kv fp8";
+var CMD="tools/serve-linux.sh --port 8099";
 var PROMPT="explain entropy like I'm five";
 var ANSWER="Entropy is how many ways something can be shuffled. A tidy room has low entropy — one glance and you know everything. The universe is the messiest room there is: nobody can ever fully know it, and that's not a bug. It's the price of having interesting things to look at.";
 function sleep(ms){return new Promise(function(r){setTimeout(r,ms)})}
@@ -936,7 +935,7 @@ async function play(){
   genBlock.classList.remove("t-hidden");
   await typeInto(qText,PROMPT,34);
   await sleep(420);
-  var toks=0,base=63.2;
+  var toks=0,base=36.8;
   var tpsTimer=setInterval(function(){
     var v=base+(Math.random()*4-2);
     tpsVal.textContent=v.toFixed(1);
@@ -954,9 +953,9 @@ play();
 
 /* ---------- code tabs + copy ---------- */
 var copyTexts={
-  "p-install":"git clone https://github.com/crow-nest/crow\ncd crow && cargo build --release",
-  "p-serve":"crow serve Qwen3.8-Flash-Next.cnq --ctx 262144 --kv fp8 --port 8080",
-  "p-client":'from openai import OpenAI\nclient = OpenAI(base_url="http://localhost:8080/v1", api_key="crow")'
+  "p-install":"git clone https://github.com/nibor1896/crow-nest\ncd crow-nest/engine && cargo build --release --bin serve",
+  "p-serve":"tools/serve-linux.sh --port 8099",
+  "p-client":'from openai import OpenAI\nclient = OpenAI(base_url="http://127.0.0.1:8099/v1", api_key="crow")'
 };
 var currentPane="p-install";
 document.querySelectorAll(".code-tab").forEach(function(tab){

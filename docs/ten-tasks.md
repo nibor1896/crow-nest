@@ -37,8 +37,10 @@ Measurement discipline (robin, 2026-09-03 — binding for the run harness):
 
 Rules:
 - Greedy/temperature 0 on both engines (determinism over realism for the gate).
-- Prompts live in `parity-prompts.json`; expected-answer notes in
-  `parity-expected.md` (the ten-task record keeps both engines' raw answers).
+- Prompts live in `decode_out/ten-tasks.json`; expected-answer notes in
+  `docs/ten-task-expected.md` (the ten-task record keeps both engines' raw answers). The
+  `parity-prompts.json` / `parity-expected.md` names this line carried until 2026-09-17 never
+  existed in the tree.
 - A task PASSES if crow-nest's answer is materially correct AND consistent
   with the llama.cpp answer where both should agree (facts, code semantics);
   wording may differ.

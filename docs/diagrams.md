@@ -3,7 +3,8 @@
 Living renderings of the approved spec (`architecture.md`, sections 1 to 8). A diagram
 contradicting the spec is a bug in the diagram. Owner: issue #14. Updated with every
 stage acceptance. Diagrams 1 to 6 are current as of 2026-09-12, commit 885bb27 (the #61b
-docs commit); diagram 7 as of 2026-09-17, commit 0cf1de5 (the refactor branch).
+docs commit), re-read against the tree on 2026-09-17; diagram 7 was added on 2026-09-17 in
+commit c1a68cd and re-verified at 487128d, branch `main`.
 
 ## 1 · System overview, from originals to served tokens
 
@@ -157,8 +158,11 @@ graph LR
   cache --> cuda & gen & geo; reset --> cuda & gen & geo; slot --> cache & cuda & gen & geo
 ```
 
-Status: the `use crate::` edges of `engine/src` at commit 0cf1de5, 2026-09-17, regenerated from
-the tree; acyclic since bb9d2ca broke `gen <-> residency` and `gen <-> vit`. Not drawn: the
+Status: the `use crate::` edges of `engine/src` at commit 487128d, 2026-09-17, regenerated from
+the tree; acyclic since bb9d2ca broke `gen <-> residency` and `gen <-> vit`. The six engine
+commits after c1a68cd (f8f75c0, 1032bc5, 4004e66, e2b9845, 8ff2055, 487128d) changed `serve.rs`,
+`cnq.rs`, `cuda.rs`, `gen.rs`, `geo.rs`, `toolcall.rs`, `vit.rs` and `cache.rs` without moving a
+single module edge. Not drawn: the
 feature-gated `cutile_pilot.rs` (`cuda`, `kernels`; nothing calls it), and the one edge no import
 graph shows — `impl Drop for Engine` in `gen.rs` calls `Engine::drop_decode_graph`, an inherent
 method defined in `reset.rs`. Module by module: `architecture.md` section 8.
@@ -170,3 +174,4 @@ method defined in `reset.rs`. Module by module: `architecture.md` section 8.
 - 2026-09-05: decode path redrawn after #11 — the PLE step now sits at the top of layer 1 (it ran before layer 0 in `decode_step` until 2026-09-05 07:00, which is what degenerated the answers); sampler and EOS stop (#20) added as the opt-in tail; PLE cache default 128 MB (#16). Section 3 stays the 2026-09-02 estimate with the PLE slice corrected; the measured load line on 2026-09-05 read "VRAM used 31.21 GiB (dense 7.02 GiB + hot experts 160 × 48 × 2.64 MB + states)".
 - 2026-09-12: post #61b pass. Decode path redrawn for the three default flips: the staging kernel `stage_cold_ca` (#19e, engine commit e256004), the deferred trickle (#63c, engine commit 095a1c8) and the parallel QSA selection `qsa_select_par` with the `CROW_QSA_PAR=0` fallback plus the `CROW_ATTN_SPLITS` measurement knob (61a and 61b, engine commit 9696b13). The resident-or-cold decision at the GEMMs is gone: the staging kernel hands the GEMMs VRAM pointers in every case, so zero-copy direct read survives only behind `CROW_STAGE=0`. New section 4, the residency picture (hot set VRAM, pinned cold tier, zero-copy read), and new section 5, the serve picture (endpoints, prefix cache A9, slot save and restore A10). The system overview server box now names the endpoints. Pie and converter unchanged; every diagram carries a status line.
 - 2026-09-17: new section 7, the module dependency graph of the engine crate, after the three refactor cuts of branch `linux-refactor` (74c79f2, bb9d2ca, 7ddd296). It is the first diagram in this file that renders the CODE rather than the spec, and it is generated from the `use crate::` edges, so a module move that is not reflected here is a stale diagram. Both module cycles the pre-refactor tree carried (`gen <-> residency`, `gen <-> vit`) are gone: `launch_v`/`launch_sync` moved into `kernels.rs` and the tensor loaders plus `Fp4` into the new `weights.rs`, and `boot.rs` (the shared container/context/config front door) joined the second layer. Diagrams 1 to 6 were re-read against the tree on 2026-09-17 and none of them contradicts it: the decode path, the residency picture, the serve picture and the converter pipeline are unchanged by a refactor that moved no launch, no kernel and no byte of `KERNEL_SRC`.
+- 2026-09-17 (later, `487128d`): the graph re-generated after the six engine commits that followed `c1a68cd` and found unchanged; the status lines carry `487128d` and branch `main`. Diagrams 1 to 6 keep their 2026-09-12 Windows numbers, which are dated and machine-named; the Linux values of record that now sit beside them are in `README.md` and `CHANGELOG.md` (16k prefill 968 / 964 tok/s, decode 27.19 ms = 36.8 tok/s, the six-turn serve replay at 228.3 ms of prefill and 247.4 ms to first token, the 1024-row parity form at 740 tok/s). Not redrawn: the image path of `8ff2055` and `487128d` (the planner's vit reserve, the named 503, and the removal of the per-request splice buffer), which belongs in the serve picture of section 5 and is written in `architecture.md` 7.13.

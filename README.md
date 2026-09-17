@@ -1,5 +1,15 @@
 # crow-nest
 
+<a href="https://github.com/nibor1896/crow-nest/releases"><img src="https://img.shields.io/github/v/release/nibor1896/crow-nest?style=flat-square&logo=github&logoColor=ffffff&labelColor=000000" alt="release"></a>
+<a href="https://github.com/nibor1896/crow-nest/actions"><img src="https://img.shields.io/github/actions/workflow/status/nibor1896/crow-nest/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=ffffff&labelColor=000000" alt="ci"></a>
+<a href="engine/"><img src="https://img.shields.io/badge/Rust-1.98-555555?style=flat-square&logo=rust&logoColor=ffffff&labelColor=000000" alt="rust"></a>
+<a href="docs/architecture.md"><img src="https://img.shields.io/badge/CUDA-13.3%20%C2%B7%20Blackwell%20sm__120-555555?style=flat-square&logo=nvidia&logoColor=76B900&labelColor=000000" alt="cuda"></a>
+<a href="README.md#run-on-linux-from-the-repository-root"><img src="https://img.shields.io/badge/Linux-x86__64-555555?style=flat-square&logo=linux&logoColor=ffffff&labelColor=000000" alt="linux"></a>
+<a href="README.md"><img src="https://img.shields.io/badge/Windows-x64-555555?style=flat-square&labelColor=000000" alt="windows"></a>
+<a href="https://huggingface.co/nibor1896/Qwen3.8-Flash-Next-CNQ4.5-M"><img src="https://img.shields.io/badge/model-Qwen3.8--Flash--Next--CNQ4.5--M-555555?style=flat-square&logo=huggingface&logoColor=FFD21E&labelColor=000000" alt="model on hugging face"></a>
+<a href="https://github.com/nibor1896/Crow"><img src="https://img.shields.io/badge/client-Crow-555555?style=flat-square&logo=github&logoColor=ffffff&labelColor=000000" alt="crow"></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-555555?style=flat-square&labelColor=000000" alt="license"></a>
+
 | item | value |
 |---|---|
 | product | inference engine for one model on one GPU, own quantization, own container, thin CUDA kernels in Rust |
@@ -13,7 +23,7 @@
 - The client is the Crow repository (`nibor1896/Crow`), which talks to `serve` the way it talks to llama-server.
 - Three product binaries: `serve` (HTTP), `decode` (single run and parity dumps), `parity` (the standing ten-task harness).
 - The engine sees (#VIT, 2026-09-14): Crow's `/image`, drag-and-drop and `read_image` work against `serve` — the container's visual tower loads by default, the f32 tower matches the oracle at cos 1.000000, and the text path stays byte-identical (`decode_out/srv-vit.log`).
-- Fourteen further binaries under `engine/src/bin` are probes and gates, not product surface (`engine/README.md`).
+- Sixteen further binaries under `engine/src/bin` are probes and gates, not product surface (counted 2026-09-17, `engine/README.md`).
 - Non-goals from the decision record: no training, no multi-user, no multi-GPU, no arbitrary architectures, no GGUF input, no CPU-only mode.
 
 ## Platform
@@ -95,7 +105,7 @@ tools/gate-linux.sh
 - It runs the three parity forms, the short generated-id run, the tests, clippy and the two doc
   guards against the Linux values of record, prints GREEN or RED per item and exits non-zero on
   any RED. Every expected value carries its provenance in the script header.
-- All nine items green at commit 0cf1de5 on 2026-09-17 (`decode_out/final/GATES.md` section 2).
+- All nine items green at commit 8ff2055 on 2026-09-17, with `cargo test` at 165 (`decode_out/final/GATES.md` section 2); the `487128d` follow-up re-ran build, tests and both doc guards.
 - Engine runs are sequential on purpose: the RAM gate refuses a second engine while the first
   one holds the pinned tier.
 
@@ -136,7 +146,8 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 - The server binds `127.0.0.1` and defaults to port 8099 (`engine/src/bin/serve.rs:454`).
 - It must be started from the repository root: container and hot-set paths are repository relative.
 - One engine per machine: `Engine::load` takes `engine/.engine.lock`, a second `serve` exits non zero.
-- It is blocking: one request at a time, a second connection waits in the accept queue, no `503`.
+- It is blocking: one request at a time, a second connection waits in the accept queue. The one `503` it answers is a CUDA allocation refused inside a request: the body names the allocation, its byte count and the free VRAM, the request is dropped and the engine stays up (measured 2026-09-17, issue-less, commit 8ff2055).
+- The planner reserves the vision path's VRAM at boot — `[budget] vit reserve 277.3 MB (tower scratch 228.5 + mrope span 48.8)` at `n_ctx` 200,000, measured 2026-09-17 — so an image request allocates no per-request VRAM at all and the image count per request is bounded by the context, not by VRAM.
 
 ## What is measured
 
@@ -147,8 +158,12 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 | ten-task quality, greedy | 2 Pass / 5 Partial / 3 Fail of 10 | 2 Pass / 6 Partial / 2 Fail of 10 | n/a | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
 | decode, engine arm, ten tasks | 35.5 to 46.8 tok/s | 44.4 to 48.2 tok/s | n/a | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
 | prefill, engine arm, ten tasks | 110 to 706 tok/s | 265 to 846 tok/s | n/a | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
-| prefill on Linux, t1-read 16,064 ids, `decode run` at 128 tokens, two runs with identical id traces | 25.38 s = 633 tok/s and 25.44 s = 631 tok/s | n/a | n/a | RTX 5090, Arch Linux | 2026-09-17 | `decode_out/final/GATES.md` item 9, commit 0667e0b |
-| decode on Linux, the same two runs, context 16,192 | 36.8 and 36.9 tok/s (mean 27.17 and 27.12 ms per token) | n/a | n/a | RTX 5090, Arch Linux | 2026-09-17 | `decode_out/final/GATES.md` item 9, commit 0667e0b |
+| prefill on Linux, the value of record, t1-read 16,064 ids, `decode run` at 128 tokens, two runs with identical id traces | 16.60 s = 968 tok/s and 16.66 s = 964 tok/s | n/a | n/a | RTX 5090, Arch Linux | 2026-09-17 | commit 1032bc5 (the PLE prefill floor); unchanged at 4004e66 (16.49 and 16.50 s) |
+| decode on Linux, the same two runs, context 16,192 | 36.8 and 36.7 tok/s (mean 27.19 and 27.22 ms per token) | n/a | n/a | RTX 5090, Arch Linux | 2026-09-17 | commit 1032bc5; 4004e66 reads 27.09 ms = 36.9 tok/s on the same prompt |
+| cold prefill on Linux, the 1024-row parity form, page cache cold | 740 tok/s (739.6 and 740.6 at 1032bc5, 740.2 and 742.8 at 4004e66, 740.9 at 8ff2055), sha256 `117dd8d9d8dc` and 1,021,091,840 B on every run | n/a | n/a | RTX 5090, Arch Linux | 2026-09-17 | commits 1032bc5, 4004e66, 8ff2055 |
+| warm short turn through `serve` on Linux, the six-turn replay (3,296-token cached prefix, 39 to 101 new ids per turn, greedy, `CROW_CHUNK=2048`), mean over turns 1 to 6 | prefill 228.3 ms, time to first token 247.4 ms | n/a | n/a | RTX 5090, Arch Linux | 2026-09-17 | commit 4004e66 (267.1 and 296.2 ms at 1032bc5) |
+| prefill on Linux, the same prompt and form BEFORE the PLE prefill floor, kept as history | 25.38 s = 633 tok/s and 25.44 s = 631 tok/s | n/a | n/a | RTX 5090, Arch Linux | 2026-09-17 | `decode_out/final/GATES.md` item 9, commit 0667e0b |
+| decode on Linux, those same two runs, context 16,192, kept as history | 36.8 and 36.9 tok/s (mean 27.17 and 27.12 ms per token) | n/a | n/a | RTX 5090, Arch Linux | 2026-09-17 | `decode_out/final/GATES.md` item 9, commit 0667e0b |
 | decode on Windows, the same prompt, the `final4` t1-read record (its harness counts the first token in, so the two readings are within noise of each other) | 36.80 tok/s, prefill 492.15 tok/s | n/a | n/a | RTX 5090, Windows | 2026-09-05 | `decode_out/final4-t1-read-run0-crow.json`, commit ce65176 |
 | load on Linux, the 8-row parity form, before and after the ordered cold-tier sweep of issue #15 | 44 s to 25 s | n/a | n/a | RTX 5090, Arch Linux | 2026-09-17 | commit 0c9feb5; the 1024-row form read 71 s on the pre-fix build against 23 s on HEAD, `decode_out/final/GATES.md` section 4 |
 | prefill, t1-read 16,064 ids, the #10c dense variant B pair (opt-in `CROW_PF_GEMM_B=1`, no default flip; W + 3 adjacent pairs, the two clean pairs -2.270 and -2.330 s = -11.0 and -11.2 percent; the default-of-record B plateau 20.723 / 20.728 s, B1 18.491 s a documented whole-run outlier) | 18.44 s = 871 tok/s with the switch on | 20.73 s = 775 tok/s, the default of record (switch off) | -2.30 s = -11.1 percent mean of the two clean pairs | RTX 5090 | 2026-09-14 | issue #10, `decode_out/srv-10c.log` |
@@ -187,6 +202,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 ### Targets
 
 - Targets are goals the engine aims at, never pass or fail gates (`docs/architecture.md:18-19`, `:57-58`).
+- Measured against the prefill target on Linux, 2026-09-17: 968 tok/s on the 16,064 id t1-read form (`decode run`, commit 1032bc5). The target names the 32k operating point, which has no Linux reading, so this is not the target met.
 
 | target | value | measurement point | set |
 |---|---|---|---|
@@ -199,9 +215,9 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 
 | path | content |
 |---|---|
-| `engine/` | the engine crate, the CUDA kernels and the 17 binaries counted 2026-09-11 (`engine/README.md`) |
+| `engine/` | the engine crate, the CUDA kernels and the 19 binaries counted 2026-09-17 (`engine/README.md`) |
 | `converter/` | the streaming safetensors to CNQ quantizer (`converter/README.md`) |
-| `docs/` | `architecture.md` (the spec, sections 0 to 7), `system-landscape.md`, `env.md`, `cuda-rust-evaluation.md` (the CUDA Rust / cuTile evaluation and its pilot, 2026-09-17), the ten-task material |
+| `docs/` | `architecture.md` (the spec, sections 0 to 8, the code map added 2026-09-17), `system-landscape.md`, `env.md`, `cuda-rust-evaluation.md` (the CUDA Rust / cuTile evaluation and its pilot, 2026-09-17), the ten-task material |
 | `tools/` | Python guards and harness helpers, no GPU needed |
 | `decode_out/` | gate inputs only; measurement records are ignored (`.gitignore`) |
 | `oracle/` | the layer-wise reference against the unquantized originals |
@@ -228,7 +244,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 | record header | a `parity` record names the sampler that produced it: greedy says greedy, a sampled run carries the profile and the seed, since 2026-09-11 (issue #53) | `meta.operating_point` of the written record |
 | README numbers | no number without a date, a unit or an identifier | `python tools/check_readme_dates.py` |
 | CI, GitHub Actions | four jobs on ubuntu-latest: build, test, clippy (non-blocking), doc guards. The runner moved from windows-latest with the Linux port on 2026-09-17; the counts of record are still the local Windows proof of 2026-09-11 (engine tests 72 of 80 lib and 55 of 57 serve, 10 tokenizer tests skipped for want of `../models/`), because no run of this workflow is recorded in this repository yet | `.github/workflows/ci.yml` |
-| Linux parity gate | the three parity forms, `decode run 32`, tests, clippy and both doc guards against the Linux values of record; GREEN or RED per item, non-zero exit on any RED; all green at commit 0cf1de5 on 2026-09-17 | `tools/gate-linux.sh` |
+| Linux parity gate | the three parity forms, `decode run 32`, tests, clippy and both doc guards against the Linux values of record; GREEN or RED per item, non-zero exit on any RED; all nine items green at commit 8ff2055 on 2026-09-17 (tests 165, clippy 1422) | `tools/gate-linux.sh` |
 | tool-call session, against a running `serve` | a Crow-shaped tool loop: the engine's own streamed `tool_calls` are fed back as the history, verbatim, so a turn that poisons the history shows up as the 400 it caused; exit non-zero when any round is refused (TASK J, 2026-09-17) | `tools/replay-toolcalls.py --poison --refusals` |
 
 ## License
@@ -244,11 +260,14 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 
 | item | value |
 |---|---|
-| version | v0.1.0, tagged 2026-09-11 on `592d05d` (`git ls-remote --tags origin`); the perf stage after the tag (issue #1, 2026-09-11) is unreleased work on `release-v0.1` |
-| history | one branch `release-v0.1`, pushed to `origin` (`github.com/nibor1896/crow-nest`, private) with tag `v0.1.0` = `592d05d`, 2026-09-11 |
+| version | v0.3.0, this release, on `487128d`, 2026-09-17. The tags before it: `v0.1.0` = `592d05d` (2026-09-11), `v0.2.0` = `42e2b67` and `v0.2.1` = `61b8dc6` (both 2026-09-14). The crate version field in `engine/Cargo.toml` stays `0.1.0` and has never been bumped: `CHANGELOG.md` is the release record, not the manifest |
+| history | branch `main`, pushed to `origin` (`github.com/nibor1896/crow-nest`, private); the day's fourteen commits `9f12429` to `487128d` all landed 2026-09-17. `release-v0.1` and `linux-refactor` stay on the remote as history |
 | scope | one model, one GPU, one client; Linux and Windows |
-| open, throughput | prefill gap to the target, issue #10 |
+| open, throughput | prefill gap to the target, issue #10. What remains of a warm turn is PCIe staging of the cold experts the chunk routes to: 9,431 MB and 192.8 ms of a 256.4 ms chunk, measured 2026-09-17 |
 | `serve` rate | within 5 % of the adjacent `decode run` since 2026-09-11, three pairs, issue #37 |
 | open, measurement discipline | run-position drift of a `serve` rate, issue #38 |
 | platform, issue #15 | the port, the host-memory fix and the Linux values of record landed 2026-09-17; what is still owed is one reference ten-task run on the pre-refactor build after a reboot (`decode_out/final/GATES.md` section 6) |
+| open, the `</think>` filter | `serve` renders with `enable_thinking false` and has no reasoning parser, so a stray `</think>` is streamed as content and the client re-sends it in the history every turn, issue #67 (2026-09-17) |
+| open, long-context goal mode | a 273-turn goal-mode session at 178,779 of 200,000 tokens degenerates: the tag on 67 turns, then the model echoes the client's goal nudge, then a single repeated token; the engine errored on none of its 318 completions, issue #68 (2026-09-17), artefacts under `decode_out/sessions/2026-09-17-goalmode/` |
+| open, measurement | the job-ring round trip of `docs/measurement-handoff.md` is still a WDDM number and owes its Linux retest (2026-09-17) |
 | open, logging | engine logging stage not started, issue #13 |

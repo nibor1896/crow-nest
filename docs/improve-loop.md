@@ -30,7 +30,8 @@ docs/sota-research-2026-09-03.md, mit Quellen dort)
   (tcgen05 existiert auf sm_120a nicht — m16n8k64 block-scaled ist das
   Maximum der Hardware). Kein neuer Pfad als Skalar-Loop.
 - [ ] **R2 Launch-Zahl:** Wird die Launch-Count reduziert (5–20 µs/Launch auf
-  WDDM)? Zielrichtung: CUDA-Graphs (capture-once + Parameter-Patching) statt
+  WDDM; auf Linux nicht nachgemessen, `docs/measurement-handoff.md` schuldet
+  den Retest)? Zielrichtung: CUDA-Graphs (capture-once + Parameter-Patching) statt
   nur je-Op-Fusion; statische Buffer halten (graph-kompatible Formen).
 - [ ] **R3 Quant-Fusion:** Aktivierungs-Quantisierung fusioniert in den
   Vorgänger-Op (Norm/Activation gibt FP4 + Blockskalen direkt aus;
@@ -65,8 +66,9 @@ docs/sota-research-2026-09-03.md, mit Quellen dort)
 The loop above is the performance loop and is unchanged. What changed on 2026-09-17 is where
 step 2 (**Review — Gates grün?**) gets its answer on Linux: `tools/gate-linux.sh [outdir]`,
 from the repository root, runs the parity forms 8 / 512 / P8 teacher-forced, the short
-generated-id run, `cargo test --release`, clippy and the two doc guards against the Linux
-values of record, prints GREEN or RED per item and exits non-zero on any RED.
+generated-id run, `cargo test --release`, clippy and the doc guards against the Linux
+values of record, prints GREEN or RED per item and exits non-zero on any RED. Nine items;
+all nine green at commit `8ff2055` on 2026-09-17.
 
 - Scope: it is an identity gate, not a performance gate. It answers "do the bytes still match",
   which is the precondition of step 2; it measures no tok/s and replaces no `perf_loop.sh` run.
@@ -75,6 +77,11 @@ values of record, prints GREEN or RED per item and exits non-zero on any RED.
   record. They are hard-coded with their provenance; a value there moves only when a new
   reference run establishes a new record, and the commit that moves it says so. R8 applies
   unchanged: RED = eine Stufe zurück.
+- The host-side counts the script enforces are `TESTS=165` (98 lib + 67 serve) and
+  `CLIPPY=1422` (the `--all-targets` form, counted as `grep -cE '^warning: '`), both at
+  2026-09-17. The guard loop names three scripts — `check_env_docs` (exit 0, `code 82, doc 82`),
+  `check_readme_dates` (0 offenders) and `check_model_card_dates`, which is not in this tree and
+  reports "not in this tree - skipped" as green.
 - The 1024-row form is a Linux value of record too (`117dd8d9d8dc…`, established 2026-09-17) but
   is NOT in the script: it costs a full long-prompt run. Run it by hand before a change that
   touches the chunk regimes (`docs/architecture.md` 8.7).

@@ -150,7 +150,7 @@ configurations that fall below the 200k context floor, never silently degrades c
 
 The clamp is **two-sided**: VRAM lowers N, the host pinned budget raises it (fewer cold
 experts to pin). That budget is not a constant — it is derived at boot as
-`min(46 GiB cap, free_for_pin - CROW_RAM_MARGIN_GB)` and capped at the 46 GiB of `geo.rs:110`
+`min(46 GiB cap, free_for_pin - CROW_RAM_MARGIN_GB)` and capped at the 46 GiB of `geo.rs:42`
 (`manager::derive_host_pinned_budget`, issue #15, 2026-09-17). `free_for_pin` counts the
 NVIDIA driver's pinned-page pool as free, because it is reclaimable and the next
 `cuMemHostAlloc` is served out of it — but only while THIS is the only CUDA process. When
@@ -166,7 +166,7 @@ image path allocates inside a request — the cap-sized tower scratch and the in
 span tables, 277.3 MB together at `n_ctx` 200,000 — is
 added to the planner's `pending` bytes, so N is chosen with it and an image request can never find
 the card full. It is named on its own `[budget]` line and costs N 157 -> 155 at the serve operating
-point (7.13 has the three numbers and the measurement). `CROW_VIT=0` reserves nothing.
+point (7.13 has the two numbers and the measurement). `CROW_VIT=0` reserves nothing.
 
 ### 2.2 Expert residency (per layer, data-driven)
 
@@ -320,6 +320,7 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 - The decode operating point that decided the all-fused default: #19i, 2026-09-13 (the #19h shared-expert fusion joins the same default predicate; the confirmation form is W + 3N, no adjacent B arm post-flip).
 - The decode operating point that crossed the llama.cpp line: #62e, 2026-09-13 (the resumed #62d lever, 62a lever 2, the 32-rows-per-block GDN slab geometry, joins the default set with no new env; the no-env N mean 22.1761 ms per token = 45.1 tok/s is the first engine default under the 22.27 llama.cpp row).
 - The prefill operating point that opened the compute levers: #10c, 2026-09-14 (the dense GEMM variant B, F50's named next dense form, lands as OPT-IN `CROW_PF_GEMM_B`, no default flip; the clean pairs measured -2.27 and -2.33 s = -11 percent on t1-read 16k, and the llama 922.5 tok/s prefill row stays open: 18.44 s = 871 tok/s is 1.03 s short of it and 0.51 s above the 17.93 s no-copy floor band of F50).
+- The Linux prefill of record crosses that row, on the same prompt and a different machine: the 16,064-id t1-read form (`decode run … 128`, `CROW_CHUNK` unset so the policy picks 2048, context fill 16,192, crow-nest CNQ4.5-M NVFP4 4.5 bpw) reads **16.60 s = 968 tok/s and 16.66 s = 964 tok/s** on 2026-09-17, RTX 5090 / Arch Linux, commit `1032bc5`, against **598 / 601 tok/s** on the same two runs of the preceding build — an interleaved A/B in one session, two runs per arm, identical id traces (`CHANGELOG.md` 2026-09-17, the PLE prefill floor). It is NOT a row of the table above and does not close the 922.5 row: the llama.cpp arm of record (17.41 s = 922.5 tok/s, 2026-09-11) is a WINDOWS measurement with GGUF Q2_K_XL at 2.4 bpw, and no llama.cpp arm has been run adjacent to it on this machine. Section 8.7 holds the Linux values of record.
 - Every row of this table is one adjacent pair of one chain; the two crow-nest columns are the two arms of that pair.
 - The two arms run different weights: crow-nest CNQ4.5-M (NVFP4, 4.5 bpw); llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL (GGUF, 2.4 bpw).
 - A tok/s figure is quoted only next to its adjacent arm in the same chain (#38).
@@ -381,9 +382,9 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
      4-row inject GEMV + `sig2_div4` in one launch — the `gemv_fp4_b1k` 1024-slot reduce
      emulated bit for bit on 256 threads, 44 blocks x T), `gemv_bf16_ws` (up GEMV storing
      the `sigmoid_el` epilogue) and `mix_streams_q`; `head_run` fuses the same epilogues
-     (no inject rows). Launch sites `gen.rs:1676` / `gen.rs:2710` behind `hc_fuse_on()`,
+     (no inject rows). Launch sites `gen.rs:1928` / `gen.rs:2988` behind `hc_fuse_on()`,
      decode `t < 8` only — prefill keeps the `gemm_bf16_dense` path verbatim; one `[hc]`
-     boot line names the form (`gen.rs:759`). `CROW_QFUSE=0` selects the unfused 8-launch
+     boot line names the form (`gen.rs:911`). `CROW_QFUSE=0` selects the unfused 8-launch
      fallback of record (and takes the NVFP4 cascade to its separate-launch path — the
      documented overload of `docs/env.md`; cascade on + unfused is no longer reachable).
    - bit identity: by construction (every epilogue is elementwise on the finished
@@ -403,14 +404,14 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
      `gemv_fp4_mma_d`, the `sgv` `gemv_b`, `gate_shared`) run as THREE:
      `sh_gate_up_q` (both gate|up GEMVs in one launch, the mma_d body twice
      verbatim over the gate and up slabs, the `silu_mul640_q` math warp-wide on
-     the finished accumulator pairs, writes `sh2` + `xq_s`, `kernels.rs:3047`),
+     the finished accumulator pairs, writes `sh2` + `xq_s`, `kernels.rs:3438`),
      the hoisted `gemv_b` (`sgv`, reads `mixed_m` only, data-safe) and
      `gemv_fp4_mma_dg` (down GEMV + the `gate_shared` epilogue at the store:
      `moe_out = sigmoid(sgv) * down` ASSIGN, still the FIRST writer of `moe_out`,
-     `kernels.rs:3143`). Launch site `gen.rs:2359` behind `sh_fuse_on()`
-     (`gen.rs:1327`), decode `t < 8` and the mma/dense path only: prefill
+     `kernels.rs:3534`). Launch site `gen.rs:2579` behind `sh_fuse_on()`
+     (`gen.rs:1511`), decode `t < 8` and the mma/dense path only: prefill
      (`gemm_fp4_dense`) and the `gemv_fp4_bs` fallback keep the separate launches
-     verbatim; the `[hc]` boot line names the shared state too (`gen.rs:759`).
+     verbatim; the `[hc]` boot line names the shared state too (`gen.rs:911`).
      Bit identity: epilogue folding only (every op elementwise, or warp-wide with
      the standalone 16-consecutive-j quant layout, on a finished accumulator;
      each k walk in the separate-launch order; the merged grid keeps every row's
@@ -437,11 +438,11 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
      form of 2026-09-13 behind the flip): with `CROW_GDN_FUSE_IN` unset the decode step
      runs the four input projections (qkv 10240 +
      z 6144 + b 48 + a 48 rows, all k 2560, one shared quantized row) as ONE grouped
-     `gemv_fp4_mma_g` launch (`kernels.rs:555`, 258 blocks, per-slab global scales kept,
-     launch site `gen.rs:1805` behind `gdn_fuse_in_on()`, capture-time only, one `[gdn]`
+     `gemv_fp4_mma_g` launch (`kernels.rs:698`, 258 blocks, per-slab global scales kept,
+     launch site `gen.rs:2049` behind `gdn_fuse_in_on()`, capture-time only, one `[gdn]`
      boot line names the form); `CROW_GDN_FUSE_IN=0` selects the four per-slab
      `gemv_fp4_mma_d` launches, the fallback of record.
-   - 32 rows per block at the three BIG projection launches, DEFAULT since #62e (2026-09-13; the resumed #62d lever, 62a lever 2): the grouped input launch runs `gemv_fp4_mma_g32` at ceil(16480/32) = 515 blocks (from 258 at 64 rows, site `gen.rs:1945`), the per-slab fallback (`CROW_GDN_FUSE_IN=0`) runs `gemv_fp4_mma_d32` at qkv 320 + z 192 (from 160 + 96, `gen.rs:1952`/`:1955`), and the out projection in gdn_step runs `gemv_fp4_mma_d32` at ceil(2560/32) = 80 (from 40, `gen.rs:1995`); the two 32-row twins (`kernels.rs:649`, `kernels.rs:723`) keep the KS machinery verbatim (`CROW_MMA_KS` stays 4, block 64*KS = `mma_bx32()` = 2 row groups x 4 k slices, warp map rg = warp & 1 / ks = warp >> 1), so per-row arithmetic is bit-identical and the sha256 values of record hold on every form (`decode_out/srv-62e.log`: 8 rows `bceba6ff7724`, 512 `14c8628acbec` x3, 1024 `b2e87b2bf99a`, P8/P8FUSE `b7f6419203b4`, PXFUSE 16,056 rows `f217e1c55926` at 15,960,023,040 bytes, plus the `CROW_GDN_FUSE_IN=0` arm); the non-GDN `gemv_fp4_mma_d` users (attention, qsa, shared expert, PLE) keep the 64-row geometry, so the pairs measure the GDN lever only.
+   - 32 rows per block at the three BIG projection launches, DEFAULT since #62e (2026-09-13; the resumed #62d lever, 62a lever 2): the grouped input launch runs `gemv_fp4_mma_g32` at ceil(16480/32) = 515 blocks (from 258 at 64 rows, site `gen.rs:2054`), the per-slab fallback (`CROW_GDN_FUSE_IN=0`) runs `gemv_fp4_mma_d32` at qkv 320 + z 192 (from 160 + 96, `gen.rs:1952`/`:1955`), and the out projection in gdn_step runs `gemv_fp4_mma_d32` at ceil(2560/32) = 80 (from 40, `gen.rs:1995`); the two 32-row twins (`kernels.rs:649`, `kernels.rs:723`) keep the KS machinery verbatim (`CROW_MMA_KS` stays 4, block 64*KS = `mma_bx32()` = 2 row groups x 4 k slices, warp map rg = warp & 1 / ks = warp >> 1), so per-row arithmetic is bit-identical and the sha256 values of record hold on every form (`decode_out/srv-62e.log`: 8 rows `bceba6ff7724`, 512 `14c8628acbec` x3, 1024 `b2e87b2bf99a`, P8/P8FUSE `b7f6419203b4`, PXFUSE 16,056 rows `f217e1c55926` at 15,960,023,040 bytes, plus the `CROW_GDN_FUSE_IN=0` arm); the non-GDN `gemv_fp4_mma_d` users (attention, qsa, shared expert, PLE) keep the 64-row geometry, so the pairs measure the GDN lever only.
    - bit identity proven at logit level, not only by construction: the 62b switch-ON
      P8FUSE (504 rows) and PXFUSE (16,056 rows) teacher-forced decode forms were
      byte-identical to the four-launch path and the 62b switch-OFF parity was 8 of 8
@@ -459,26 +460,30 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 | Step | Kernel | Grid x block | Switch | Mode |
 |---|---|---|---|---|
 | QSA scores | `qsa_scores_par` | `QSA_SCORES_BLOCKS` x 1 x 1, 128 | `CROW_ATTN_SPLIT` unset = on | operating |
-| QSA top-k, one block | `qsa_select_fast` (`kernels.rs:1957`) | 1 x 1 x 1, 256 | `CROW_QSA_PAR=0`, the fallback since #61b | operating |
-| QSA top-k, many blocks | `qsa_select_par_h` (`kernels.rs:2177`) then `qsa_select_par_e` (`kernels.rs:2195`) | `CROW_QSA_PAR_BLOCKS` x 1 x 1, 256 then 1 x 1 x 1, 1024 | `CROW_QSA_PAR` unset = on, the default since #61b; `0` = the fallback | operating |
-| attention over the selected list | `attn_sel_split` (`kernels.rs:2691`) | `NQ` x 1 x `CROW_ATTN_SPLITS`, `AHD` | `CROW_ATTN_SPLIT` unset = on | operating |
+| QSA top-k, one block | `qsa_select_fast` (`kernels.rs:2563`) | 1 x 1 x 1, 256 | `CROW_QSA_PAR=0`, the fallback since #61b | operating |
+| QSA top-k, many blocks | `qsa_select_par_h` (`kernels.rs:2783`) then `qsa_select_par_e` (`kernels.rs:2801`) | `CROW_QSA_PAR_BLOCKS` x 1 x 1, 256 then 1 x 1 x 1, 1024 | `CROW_QSA_PAR` unset = on, the default since #61b; `0` = the fallback | operating |
+| attention over the selected list | `attn_sel_split` (`kernels.rs:3653`) | `NQ` x 1 x `CROW_ATTN_SPLITS`, `AHD` | `CROW_ATTN_SPLIT` unset = on | operating |
 | merge of the partials | `attn_merge` | `NQ` x 1 x 1, `AHD` | reads the device scalar `p.n_splits` | operating |
 
 - Both top-k forms return the same selection list in the same order: selected blocks ascending, 4 tokens each, then the tail tokens ascending.
 - `sel_n` = 4 x selected blocks plus the tail; the attention kernel sums in list order, so the order is part of the numerics.
 - The parallel form splits the work as histogram (many blocks, 12 top key bits) plus one emit block (threshold refine 10 plus 10 bits, tie fill by lowest index, ascending emit); 2 launches per layer against 1.
-- `CROW_QSA_PAR` is the decode path only: the prefill selection at `gen.rs:1871` keeps `qsa_select_fast` on `tb` blocks, one block per query.
+- `CROW_QSA_PAR` is the decode path only: the prefill selection at `gen.rs:2231` keeps `qsa_select_fast` on `tb` blocks, one block per query.
 - `CROW_QSA_PAR` default since #61b (2026-09-12): the adjacent pair measured 23.9411 against 24.8735 ms per decode token with `0` (-3.75 percent, ids identical), and parity runs 8 of 8 forms including the teacher-forced 16,064 id PX form over the radix path (`decode_out/srv-61b.log`, RTX 5090); every process names its selection in one `[qsa]` boot line.
 - `CROW_ATTN_SPLITS` (4, 8, 16, 32) default 8 again since #61e (2026-09-13): the #61d flip to 32 (robin's performance-over-ids ruling of 2026-09-12, kept of record) was ROLLED BACK one day later under the improvement-loop quality rule - the ten-task quality bar is NOT held at 32, judged 0 Pass / 7 Partial / 3 Fail against the crow record 2 / 5 / 3 at 8 and the llama reference 2 / 6 / 2 (`.superpowers/sdd/task-61d-quality-report.md`); the 61d adjacent pair stays the measurement of record for the knob: 22.8545 against 24.1325 ms per decode token with `8` (-5.3 percent, 32.3 x the fallback spread), B ids `5098f885ab3a` 3 of 3, N ids `c65969f7793a` 3 of 3 (the 61a/61c S32 value); the rollback is the const back to 8 plus its `[attn]` boot line and nothing else (engine commit `fdc00c4`, `decode_out/srv-61d.log`, RTX 5090).
 - The split count still changes the merge order of the flash-decoding partials, so the last bits of the logits move: the generated ids change (first differing index 45 and 48 of 256 on t1-read, `decode_out/srv-61a.log`), so `16` and `32` stay MEASUREMENT ONLY under the quality verdict, and the splits-8 stream of record is again final4-identical (the 61d per-task baseline `decode_out/t61d-run0-crow.json` is superseded); the `attn_sel_split` row (2.44 ms per token, nsys `decode_out/srv-61a.log`) stays the open optimization row of #61.
-- The partial buffers `part_o` and `part_ml` are sized for 32 splits (`gen.rs:1571-1572`), VRAM plus 0.55 MB against the old size.
+- The partial buffers `part_o` and `part_ml` are sized for 32 splits (`gen.rs:1879-1880`), VRAM plus 0.55 MB against the old size.
 
 ### 4.3 Kernel hygiene
 
-- Thin kernels (constant 4): one module per family, NVRTC-compiled at load, shared
-  block-scaled-MMA core.
-- The alternative was weighed and declined on 2026-09-17: `cuda-rust-evaluation.md` measures
-  NVIDIA's two CUDA Rust tracks against these families, with one cuTile pilot kernel.
+- Thin kernels (constant 4): ONE NVRTC module for all families, compiled once per process at
+  load from the frozen `KERNEL_SRC` (`gen.rs:1033`), with 110 launched kernels resolved out of it
+  (`kernels.rs:4508-4527`; the frozen source defines 116 `__global__`s, six of which have no launch
+  site left). Shared block-scaled-MMA core.
+- The alternative was weighed and declined on 2026-09-17: `docs/cuda-rust-evaluation.md` measures
+  NVIDIA's two CUDA Rust tracks against these families, with one cuTile pilot kernel. The pilot is
+  in the tree as `engine/src/cutile_pilot.rs` behind the default-off `cutile-pilot` feature
+  (`engine/Cargo.toml`); nothing in the engine calls it.
 - Numerics gate in this order: kernel vs probe CPU reference → layer vs oracle (#6).
 - No tok/s anywhere in kernel code or comments — measurement goes through the harness.
 
@@ -491,8 +496,10 @@ timebox (created with spec section 6). Until then the engine runs Blackwell-only
 ### 4.5 Acceptance
 
 - All families pass numerics (probe reference, then oracle per layer) on this machine.
-- `compute_120a` load verified on Windows (probe chain); Linux verification is part of
-  the fallback stage's environment work, before any Linux number is quoted.
+- `compute_120a` load verified on Windows (probe chain) and on Linux since 2026-09-17 (issue #15):
+  Linux is a platform of record, its four parity values are in section 8.7, and `tools/gate-linux.sh`
+  is the standing gate. A Linux number is quoted like any other: with its date, its machine and its
+  artefact.
 
 ---
 
@@ -844,7 +851,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
   different hot sets.
 - Rule: the server must not enable it while A9 is the gate.
 - As built (#37): `serve` TICKS the stream trickle once per `decode_step`
-  (`bin/serve.rs:1841-1843`), the mirror of `bin/decode.rs:224-231`.
+  (`bin/serve.rs:2332`), the mirror of `bin/decode.rs:224-231`.
 - Condition 2 is what allows it: the tick moves where an expert is read from, not what.
 - `adapt_tick`, the post-prefill re-cut of `CROW_ADAPT=1`, is still never called by `serve`.
 - The tick also runs for sampled requests, not only greedy: intended, harmless for identity
@@ -852,7 +859,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - The two preconditions `trickle_tick` asserts are read once at start
   (`bin/serve.rs:1653-1655`), so a `CROW_COLD_TIER` process logs a line instead of panicking.
 - Fix round 1 of #37: `serve` sets `CROW_ADAPT_WINDOW=1` when it is unset, next to `CROW_GRAPH`
-  and `CROW_MMA` (`bin/serve.rs:2313`), so the tick ranks swaps by the decayed selections since
+  and `CROW_MMA` (`bin/serve.rs:2930`), so the tick ranks swaps by the decayed selections since
   the last tick instead of the prefill-dominated cumulative count.
 - Condition 2 covers that too: the ranking signal picks WHICH expert moves, not what is read.
 
@@ -1152,7 +1159,7 @@ Therefore:
 | 2 | how many conversations are held, how many snapshots each | **ONE** conversation, **two** snapshots (249.19 MiB at chunk 2048) | `cache.rs:162` (`SLOTS`), `cache.rs` module doc |
 | 3 | is the post-answer snapshot taken unconditionally | **yes**, both points unconditional | `cache.rs` module doc, 7.6 |
 | 4 | concurrency: queue or reject | **a second request waits** in the accept queue, no 503 | `serve.rs` module doc, blocking `TcpListener` |
-| 5 | sampling: out of scope, or reseed per request | **reseeded per request**; the A9 identity gate runs **greedy** | `Engine::enable_dev_sampler`, `serve.rs:1043` (`sampler_from`) |
+| 5 | sampling: out of scope, or reseed per request | **reseeded per request**; the A9 identity gate runs **greedy** | `Engine::enable_dev_sampler`, `serve.rs:1158` (`sampler_from`) |
 
 - Rows 2 and 3 are SUPERSEDED by M2 option b (robin 2026-09-10, #36): **ONE** snapshot per
   process, **124.60 MiB** at chunk 2048, the after-answer point dropped. See 7.6 and 7.7.
@@ -1180,55 +1187,55 @@ Therefore:
 
 | item | as built | crow-nest anchor | Crow reader |
 |---|---|---|---|
-| route | `GET /health`, query and trailing slash dropped | `serve.rs:495`, `serve.rs:772` | `crow_core.py:14801` (`health_url`) |
-| body | `{"status":"ok"}` | `serve.rs:2188` | `crow_core.py:14814` (`check_endpoint`) |
+| route | `GET /health`, query and trailing slash dropped | `serve.rs:541`, `serve.rs:772` | `crow_core.py:14801` (`health_url`) |
+| body | `{"status":"ok"}` | `serve.rs:2836` | `crow_core.py:14814` (`check_endpoint`) |
 
 **7.11.2 `GET /props`**
 
 | field | as built | crow-nest anchor | Crow reader |
 |---|---|---|---|
-| `model_path` | the container path of this load | `serve.rs:787` (`props_json`) | `crow_core.py:1408` (`server_model_path`) |
-| `model` | the container file stem, `.cnq` stripped | `serve.rs:780` (`model_name`) | `crow_core.py:14884` (`fetch_model_name`) |
-| `n_ctx` | `Engine::st.context`, read back from the load, 200,000 (`CONTEXT_FLOOR`) | `serve.rs:787` | `crow_core.py:14837` (`fetch_n_ctx`) |
-| `default_generation_settings.n_ctx` | the same number | `serve.rs:787` | `crow_core.py:14837` |
+| `model_path` | the container path of this load | `serve.rs:836` (`props_json`) | `crow_core.py:1408` (`server_model_path`) |
+| `model` | the container file stem, `.cnq` stripped | `serve.rs:826` (`model_name`) | `crow_core.py:14884` (`fetch_model_name`) |
+| `n_ctx` | `Engine::st.context`, read back from the load, 200,000 (`CONTEXT_FLOOR`) | `serve.rs:836` | `crow_core.py:14837` (`fetch_n_ctx`) |
+| `default_generation_settings.n_ctx` | the same number | `serve.rs:836` | `crow_core.py:14837` |
 | `modalities.vision` | `true` when the vit tower is loaded (`CROW_VIT` unset, the default), `false` with `CROW_VIT=0` (#VIT, 2026-09-14) | `serve.rs` (`props_json`) | `crow_core.py:1429` (`refuse_images`) |
-| `prompt_chunk` | 2048 (M1) | `serve.rs:787` | no reader in Crow, informational |
-| `build` | `crow-nest-engine 0.1.0` | `serve.rs:787` | no reader in Crow, informational |
+| `prompt_chunk` | 2048 (M1) | `serve.rs:836` | no reader in Crow, informational |
+| `build` | `crow-nest-engine 0.1.0` | `serve.rs:836` | no reader in Crow, informational |
 
 **7.11.3 `POST /v1/chat/completions`, request body**
 
 | field | as built | crow-nest anchor | Crow writer |
 |---|---|---|---|
-| `messages` | required, non empty, every entry needs a string `role` | `serve.rs:918` (`parse_chat`) | `crow_core.py:4672-4700` |
-| `model` | echoed into every chunk, default `crow-nest` | `serve.rs:918`, `serve.rs:1144` | `crow_core.py:4672-4700` |
-| `stream` | `true` streams `chat.completion.chunk` frames; `false` or absent answers ONE `chat.completion` document (#39 B3a, 7.11.13) | `serve.rs:918`, `serve.rs:1570` | `crow_core.py:4672-4700` (always `true`), `:2971` (digest path, no `stream` field) |
-| `stream_options.include_usage` | `true` puts `usage` on the final chunk | `serve.rs:918`, `serve.rs:1222` | `crow_core.py:4672-4700` |
-| `timings_per_token` | `true` puts `timings` on the final chunk | `serve.rs:918`, `serve.rs:1222` | `crow_core.py:4672-4700` |
-| `max_tokens` | default 1024, capped at 32768, clamped to `n_ctx - prompt ids` | `serve.rs:1253` (`clamped_max_tokens`) | `crow_core.py:4672-4700` |
-| `temperature` | absent, `null` or `<= 0` is GREEDY; `> 0` samples | `serve.rs:1043` (`sampler_from`) | `crow_core.py:4672-4700` |
-| `top_p` | nucleus mass, default 0.8 (data sheet), read only when `temperature > 0` | `serve.rs:461`, `serve.rs:1043` | `crow_core.py:4672-4700` |
-| `top_k` | default 20 (data sheet), clamped to 64 by the device sampler (`SAMPLE_MAXK`, `engine/src/kernels.rs:2942`), read only when `temperature > 0` | `serve.rs:463`, `serve.rs:1043` | not sent by Crow |
-| `presence_penalty` | default 1.5 (data sheet), read only when `temperature > 0` | `serve.rs:465`, `serve.rs:1043` | not sent by Crow |
-| `seed` | RNG seed of THIS request, default 0, reseeded per request (M1) | `serve.rs:467`, `serve.rs:1043` | not sent by Crow |
-| `min_p` | **ACCEPTED AND IGNORED**, one stderr line per request | `serve.rs:1751` (the stderr line); `sampler_from` (`serve.rs:1043`) carries no `min_p`; `serve.rs` module doc | `crow_core.py:4672-4700` (0.01 at Crow's operating point) |
-| `tools` | rendered as the template variable `tools` | `serve.rs:918`, `tokenizer::render_chat` | `crow_core.py:4672-4700`, `TOOLS` (25 builtin at `crow_core.py:579-838`, frozen at `:846`, plus the `mcp.json` tools added at import, `:841`) |
-| `chat_template_kwargs.enable_thinking` | template variable, default false | `serve.rs:918` | `crow_core.py:2970` (digest path) |
-| `messages[].role = "tool"` | `content` rendered as `<tool_response>...</tool_response>` | `serve.rs:1284` (`normalize_messages`) | `crow_core.py` tool turns |
-| `messages[].tool_calls[].function.arguments` | a JSON STRING from Crow is parsed into the MAPPING the template needs; **nothing that is not a mapping reaches the template** (7.11.14) | `serve.rs:1443` (`normalize_messages`) | `crow_core.py:5068`, stored `:3756-3761`, re-sent `:3783-3785` |
-| every other `messages[]` shape | checked BEFORE the render; a refusal names the message index and the field (7.11.14) | `serve.rs:1518` (`check_messages`) | — |
-| `tool_call_id` | carried, never read; this template pairs by order | `serve.rs:1284` | `crow_core.py` tool turns |
+| `messages` | required, non empty, every entry needs a string `role` | `serve.rs:970` (`parse_chat`) | `crow_core.py:4672-4700` |
+| `model` | echoed into every chunk, default `crow-nest` | `serve.rs:970`, `serve.rs:1281` | `crow_core.py:4672-4700` |
+| `stream` | `true` streams `chat.completion.chunk` frames; `false` or absent answers ONE `chat.completion` document (#39 B3a, 7.11.13) | `serve.rs:970`, `serve.rs:2062` | `crow_core.py:4672-4700` (always `true`), `:2971` (digest path, no `stream` field) |
+| `stream_options.include_usage` | `true` puts `usage` on the final chunk | `serve.rs:970`, `serve.rs:1340` | `crow_core.py:4672-4700` |
+| `timings_per_token` | `true` puts `timings` on the final chunk | `serve.rs:970`, `serve.rs:1340` | `crow_core.py:4672-4700` |
+| `max_tokens` | default 1024, capped at 32768, clamped to `n_ctx - prompt ids` | `serve.rs:1363` (`clamped_max_tokens`) | `crow_core.py:4672-4700` |
+| `temperature` | absent, `null` or `<= 0` is GREEDY; `> 0` samples | `serve.rs:1158` (`sampler_from`) | `crow_core.py:4672-4700` |
+| `top_p` | nucleus mass, default 0.8 (data sheet), read only when `temperature > 0` | `serve.rs:509`, `serve.rs:1158` | `crow_core.py:4672-4700` |
+| `top_k` | default 20 (data sheet), clamped to 64 by the device sampler (`SAMPLE_MAXK`, `engine/src/kernels.rs:3994`), read only when `temperature > 0` | `serve.rs:511`, `serve.rs:1158` | not sent by Crow |
+| `presence_penalty` | default 1.5 (data sheet), read only when `temperature > 0` | `serve.rs:513`, `serve.rs:1158` | not sent by Crow |
+| `seed` | RNG seed of THIS request, default 0, reseeded per request (M1) | `serve.rs:515`, `serve.rs:1158` | not sent by Crow |
+| `min_p` | **ACCEPTED AND IGNORED**, one stderr line per request | `serve.rs:2262` (the stderr line); `sampler_from` (`serve.rs:1158`) carries no `min_p`; `serve.rs` module doc | `crow_core.py:4672-4700` (0.01 at Crow's operating point) |
+| `tools` | rendered as the template variable `tools` | `serve.rs:970`, `tokenizer::render_chat` | `crow_core.py:4672-4700`, `TOOLS` (25 builtin at `crow_core.py:579-838`, frozen at `:846`, plus the `mcp.json` tools added at import, `:841`) |
+| `chat_template_kwargs.enable_thinking` | template variable, default false | `serve.rs:970` | `crow_core.py:2970` (digest path) |
+| `messages[].role = "tool"` | `content` rendered as `<tool_response>...</tool_response>` | `serve.rs:1481` (`normalize_messages`) | `crow_core.py` tool turns |
+| `messages[].tool_calls[].function.arguments` | a JSON STRING from Crow is parsed into the MAPPING the template needs; **nothing that is not a mapping reaches the template** (7.11.14) | `serve.rs:1481` (`normalize_messages`) | `crow_core.py:5068`, stored `:3756-3761`, re-sent `:3783-3785` |
+| every other `messages[]` shape | checked BEFORE the render; a refusal names the message index and the field (7.11.14) | `serve.rs:1564` (`check_messages`) | — |
+| `tool_call_id` | carried, never read; this template pairs by order | `serve.rs:1481` | `crow_core.py` tool turns |
 
 **7.11.4 `POST /v1/chat/completions`, the stream**
 
 | order | line as built | crow-nest anchor | Crow reader |
 |---|---|---|---|
-| 1 | `delta:{"role":"assistant"}`, `finish_reason` null | `serve.rs:1168` (`chunk_role`) | `crow_core.py:4831-4877` |
-| 2..n | `delta:{"content":"..."}` , one per emitted piece | `serve.rs:1173` (`chunk_content`) | `crow_core.py:4831-4877` (`delta.content`) |
-| n+1 | `delta:{}` plus `finish_reason`, optionally `usage` and `timings` | `serve.rs:1222` (`chunk_finish`) | `crow_core.py:4831-4877`, `:4999-5018` |
-| n+2 | `data: [DONE]` | `serve.rs:471` (`SSE_DONE`) | `crow_core.py:4035` |
-| framing | `data: <compact json>` plus a blank line, one flush per frame | `serve.rs:1244` (`sse_frame`) | `crow_core.py:4831-4877` |
-| headers | `text/event-stream`, `no-cache`, `Connection: close`, no `Content-Length` | `serve.rs:1580` (`chat_stream`) | `crow_core.py:4821` (the train) |
-| `finish_reason` | `stop` (EOS), `length` (budget), `tool_calls` (a call was closed) | `serve.rs:1580` | `crow_core.py:4831-4877` |
+| 1 | `delta:{"role":"assistant"}`, `finish_reason` null | `serve.rs:1299` (`chunk_role`) | `crow_core.py:4831-4877` |
+| 2..n | `delta:{"content":"..."}` , one per emitted piece | `serve.rs:1304` (`chunk_content`) | `crow_core.py:4831-4877` (`delta.content`) |
+| n+1 | `delta:{}` plus `finish_reason`, optionally `usage` and `timings` | `serve.rs:1340` (`chunk_finish`) | `crow_core.py:4831-4877`, `:4999-5018` |
+| n+2 | `data: [DONE]` | `serve.rs:517` (`SSE_DONE`) | `crow_core.py:4035` |
+| framing | `data: <compact json>` plus a blank line, one flush per frame | `serve.rs:1354` (`sse_frame`) | `crow_core.py:4831-4877` |
+| headers | `text/event-stream`, `no-cache`, `Connection: close`, no `Content-Length` | `serve.rs:2072` (`chat_stream`) | `crow_core.py:4821` (the train) |
+| `finish_reason` | `stop` (EOS), `length` (budget), `tool_calls` (a call was closed) | `serve.rs:2072` | `crow_core.py:4831-4877` |
 
 - One exception to "one token, one frame": a content token whose tail is a prefix of
   `<tool_call>` is HELD until the next token resolves it (`engine/src/toolcall.rs`).
@@ -1238,30 +1245,30 @@ Therefore:
 
 | object | field | as built | crow-nest anchor | Crow reader |
 |---|---|---|---|---|
-| `usage` | `prompt_tokens` | rendered prompt ids, cached part included | `serve.rs:1111` (`usage_json`) | `crow_core.py:4831-4877` |
-| `usage` | `completion_tokens` | generated ids, **the prefill token included**: it is `t.predicted_n` itself (`serve.rs:1112`), the same value as `timings.predicted_n` | `serve.rs:1111` | `crow_core.py:4831-4877` |
-| `usage` | `total_tokens` | `prompt_tokens + completion_tokens` | `serve.rs:1111` | `crow_core.py:4831-4877` |
-| `usage` | `prompt_tokens_details.cached_tokens` | `P`, ALWAYS present as an integer | `serve.rs:1111` | `crow_core.py:4831-4877`, fallback at `:14923` |
-| `timings` | `prompt_n` | `prompt_tokens - cached_tokens`, the ids actually prefilled | `serve.rs:1124` (`timings_json`) | `crow_core.py:4999-5018` |
-| `timings` | `prompt_ms` | wall of the `Engine::prefill` call only | `serve.rs:1124` | `crow_core.py:4999-5018` |
-| `timings` | `prompt_per_second` | `prompt_n / prompt_ms * 1000` | `serve.rs:1083` (`per_second`) | `crow_core.py:4999-5018` |
-| `timings` | `prompt_per_token_ms` | `prompt_ms / prompt_n` | `serve.rs:1092` | no reader in Crow |
-| `timings` | `predicted_n` | generated ids, **the prefill token included** (llama-server convention); the same value as `usage.completion_tokens` (`serve.rs:1112`, `serve.rs:1128`) | `serve.rs:1124` | `crow_core.py:4999-5018` |
-| `timings` | `predicted_ms` | wall of the decode loop, first `decode_step` to the last | `serve.rs:1124` | `crow_core.py:4999-5018` |
-| `timings` | `predicted_per_second` | `predicted_n / predicted_ms * 1000` | `serve.rs:1083` | `crow_core.py:4999-5018` |
-| `timings` | `predicted_per_token_ms` | `predicted_ms / predicted_n` | `serve.rs:1092` | no reader in Crow |
-| `timings` | `cache_n` | `P`, the same number as `cached_tokens` | `serve.rs:1124` | Crow's measuring tools |
-| `timings` | `crow_expert_selections` | u64, cumulative, `atomicAdd(&counters[0], 10ull)` per token per layer | `kernels.rs:2181`, launched `gen.rs:1972-1974` | Crow #54 rule, tools |
-| `timings` | `crow_expert_cold` | u64, cumulative, `atomicAdd(&counters[1], __popc(s_cold))` | `kernels.rs:2182` | Crow #54 rule, tools |
-| `timings` | `crow_ple_rows` | u64, cumulative, PLE rows requested | `gen.rs:1055` | Crow #54 rule, tools |
-| `timings` | `crow_ple_misses` | u64, cumulative, PLE rows filled from the container | `gen.rs:1056` | Crow #54 rule, tools |
-| `timings` | `crow_layers` | int, `geo::LAYERS` = 48, the divisor | `serve.rs:1124` | Crow #54 rule, tools |
+| `usage` | `prompt_tokens` | rendered prompt ids, cached part included | `serve.rs:1226` (`usage_json`) | `crow_core.py:4831-4877` |
+| `usage` | `completion_tokens` | generated ids, **the prefill token included**: it is `t.predicted_n` itself (`serve.rs:1112`), the same value as `timings.predicted_n` | `serve.rs:1226` | `crow_core.py:4831-4877` |
+| `usage` | `total_tokens` | `prompt_tokens + completion_tokens` | `serve.rs:1226` | `crow_core.py:4831-4877` |
+| `usage` | `prompt_tokens_details.cached_tokens` | `P`, ALWAYS present as an integer | `serve.rs:1226` | `crow_core.py:4831-4877`, fallback at `:14923` |
+| `timings` | `prompt_n` | `prompt_tokens - cached_tokens`, the ids actually prefilled | `serve.rs:1239` (`timings_json`) | `crow_core.py:4999-5018` |
+| `timings` | `prompt_ms` | wall of the `Engine::prefill` call only | `serve.rs:1239` | `crow_core.py:4999-5018` |
+| `timings` | `prompt_per_second` | `prompt_n / prompt_ms * 1000` | `serve.rs:1198` (`per_second`) | `crow_core.py:4999-5018` |
+| `timings` | `prompt_per_token_ms` | `prompt_ms / prompt_n` | `serve.rs:1207` | no reader in Crow |
+| `timings` | `predicted_n` | generated ids, **the prefill token included** (llama-server convention); the same value as `usage.completion_tokens` (`serve.rs:1112`, `serve.rs:1128`) | `serve.rs:1239` | `crow_core.py:4999-5018` |
+| `timings` | `predicted_ms` | wall of the decode loop, first `decode_step` to the last | `serve.rs:1239` | `crow_core.py:4999-5018` |
+| `timings` | `predicted_per_second` | `predicted_n / predicted_ms * 1000` | `serve.rs:1198` | `crow_core.py:4999-5018` |
+| `timings` | `predicted_per_token_ms` | `predicted_ms / predicted_n` | `serve.rs:1207` | no reader in Crow |
+| `timings` | `cache_n` | `P`, the same number as `cached_tokens` | `serve.rs:1239` | Crow's measuring tools |
+| `timings` | `crow_expert_selections` | u64, cumulative, `atomicAdd(&counters[0], 10ull)` per token per layer | `kernels.rs:2961`, launched `gen.rs:2511` | Crow #54 rule, tools |
+| `timings` | `crow_expert_cold` | u64, cumulative, `atomicAdd(&counters[1], __popc(s_cold))` | `kernels.rs:2962` | Crow #54 rule, tools |
+| `timings` | `crow_ple_rows` | u64, cumulative, PLE rows requested | `gen.rs:1287` | Crow #54 rule, tools |
+| `timings` | `crow_ple_misses` | u64, cumulative, PLE rows filled from the container | `gen.rs:1288` | Crow #54 rule, tools |
+| `timings` | `crow_layers` | int, `geo::LAYERS` = 48, the divisor | `serve.rs:1239` | Crow #54 rule, tools |
 
 - Rule: the five `crow_*` counters are **cumulative per process and never reset**, in any
   place, per request or otherwise (the Crow #54 rule).
 - Reason: a request-local value is the DIFFERENCE of two consecutive blocks; a reset would
   break that for every reader at once.
-- They are read by `Engine::drain_counters` (`gen.rs:3343`, `residency.rs:638`), a
+- They are read by `Engine::drain_counters` (`gen.rs:3978`, `residency.rs:662`), a
   `dtoh_u64` of 48 x 2 u64 = 768 bytes; "drain" READS, it does not zero.
 - Measured cost of that read: **0.026 ms** per request (A8, #30, `decode_out/srv-a8.log`).
 - Two decode rates on purpose: stderr prints `(gen - 1) / decode_ms * 1000`, the wire prints
@@ -1273,9 +1280,9 @@ Therefore:
 
 | order | `delta` as built | crow-nest anchor | Crow reader |
 |---|---|---|---|
-| 1 | `{"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"...","arguments":""}}]}` | `serve.rs:1180` (`chunk_tool_open`) | `crow_core.py:4864-4877`, `:4869-4874` |
-| 2..n | `{"tool_calls":[{"index":0,"function":{"arguments":"<fragment>"}}]}` | `serve.rs:1202` (`chunk_tool_args`) | `crow_core.py:4864-4877` |
-| last | `{}` with `finish_reason":"tool_calls"` | `serve.rs:1222` | `crow_core.py:4831-4877` |
+| 1 | `{"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"...","arguments":""}}]}` | `serve.rs:1311` (`chunk_tool_open`) | `crow_core.py:4864-4877`, `:4869-4874` |
+| 2..n | `{"tool_calls":[{"index":0,"function":{"arguments":"<fragment>"}}]}` | `serve.rs:1326` (`chunk_tool_args`) | `crow_core.py:4864-4877` |
+| last | `{}` with `finish_reason":"tool_calls"` | `serve.rs:1340` | `crow_core.py:4831-4877` |
 
 - `id` and `name` ride on chunk 1 ONLY; Crow overwrites them only on a truthy value, so a
   later chunk can never erase them.
@@ -1295,12 +1302,12 @@ C:/x/y.md
 
 - `<tool_call>` is added token 248058 and is matched by TOKEN ID; `</tool_call>` is 248059
   and is matched by TEXT (the ids at `toolcall.rs:27`, the two constants at
-  `toolcall.rs:52-55`, the arming call `arm()` at `toolcall.rs:264`).
+  `toolcall.rs:71` and `toolcall.rs:96`, the arming call `arm()` at `toolcall.rs:310`).
 - The OpenAI `arguments` object is BUILT from the parameter blocks by declared schema type
-  (`tool_param_types` at `toolcall.rs:141`, `value()` at `toolcall.rs:374`; the piece feed
-  that drives them is `feed()` at `toolcall.rs:280`).
+  (`tool_param_types` at `toolcall.rs:186`, `value()` at `toolcall.rs:423`; the piece feed
+  that drives them is `feed()` at `toolcall.rs:326`).
 - EOS after `</function>` CLOSES the call: `finish_reason` `tool_calls`, trailing markup
-  dropped and counted, never replayed as content (`toolcall.rs:293`).
+  dropped and counted, never replayed as content (`toolcall.rs:339`).
 - Malformed markup (no `</function>`, no name): the RAW markup goes out as `delta.content`
   and `finish_reason` stays `stop` or `length`.
 - **TASK J (2026-09-17)**: such a call CLOSES its `arguments` object and marks it
@@ -1322,15 +1329,15 @@ C:/x/y.md
 
 | item | as built | crow-nest anchor | Crow reader |
 |---|---|---|---|
-| `GET /slots` | `[{"id":0,"n_ctx":...,"n_prompt_tokens":...,"is_processing":false}]` | `serve.rs:812` (`slots_json`) | `tools/measure-slot-restart.ps1:87`, `tools/probe-slot-persistence.py:152` |
-| `n_prompt_tokens` | the held PREFILL CLEAN position, 0 while none is held | `serve.rs:812` | the same two tools, element 0 |
-| `POST /slots/0?action=save` | body `{"filename": "<bare name>"}` | `serve.rs:845` (`slot_filename`), `serve.rs:2075` (`slot_route`) | `crow_core.py:2458` |
-| save answer | `id_slot`, `filename`, **`n_saved`**, `n_written`, `timings.save_ms` | `serve.rs:822` (`slot_saved_json`) | `crow_core.py:2458` reads `n_saved` |
-| `POST /slots/0?action=restore` | body `{"filename": "<bare name>"}` | `serve.rs:845`, `serve.rs:2075` | `crow_core.py:2688` |
-| restore answer | `id_slot`, `filename`, **`n_restored`**, `n_read`, `timings.restore_ms` | `serve.rs:833` (`slot_restored_json`) | `crow_core.py:2688` reads `n_restored` |
+| `GET /slots` | `[{"id":0,"n_ctx":...,"n_prompt_tokens":...,"is_processing":false}]` | `serve.rs:860` (`slots_json`) | `tools/measure-slot-restart.ps1:87`, `tools/probe-slot-persistence.py:152` |
+| `n_prompt_tokens` | the held PREFILL CLEAN position, 0 while none is held | `serve.rs:860` | the same two tools, element 0 |
+| `POST /slots/0?action=save` | body `{"filename": "<bare name>"}` | `serve.rs:893` (`slot_filename`), `serve.rs:2723` (`slot_route`) | `crow_core.py:2458` |
+| save answer | `id_slot`, `filename`, **`n_saved`**, `n_written`, `timings.save_ms` | `serve.rs:870` (`slot_saved_json`) | `crow_core.py:2458` reads `n_saved` |
+| `POST /slots/0?action=restore` | body `{"filename": "<bare name>"}` | `serve.rs:893`, `serve.rs:2723` | `crow_core.py:2688` |
+| restore answer | `id_slot`, `filename`, **`n_restored`**, `n_read`, `timings.restore_ms` | `serve.rs:881` (`slot_restored_json`) | `crow_core.py:2688` reads `n_restored` |
 | the contract | `n_saved == n_restored`; Crow withdraws the warm-cache claim when they differ | `slot.rs`, `serve.rs` module doc | `crow_core.py:2694` |
-| `--slot-save-path <existing dir>` | required for both actions; a typo exits **2 at boot** | `serve.rs:577` (`check_slot_save_path`) | not read by Crow |
-| without `--slot-save-path` | both actions answer **400**, as llama-server refuses them | `serve.rs:2075` | not read by Crow |
+| `--slot-save-path <existing dir>` | required for both actions; a typo exits **2 at boot** | `serve.rs:623` (`check_slot_save_path`) | not read by Crow |
+| without `--slot-save-path` | both actions answer **400**, as llama-server refuses them | `serve.rs:2723` | not read by Crow |
 | `filename` | bare name only, allowlist `[A-Za-z0-9._-]`, Windows device names refused | `slot.rs:342` (`sanitize_filename`) | not read by Crow |
 
 - Only `n_saved` and `n_restored` are contractual; Crow reads nothing else of these bodies.
@@ -1342,19 +1349,23 @@ C:/x/y.md
 
 | case | answer | crow-nest anchor |
 |---|---|---|
-| unknown route, or a wrong method on a known path | 404 JSON naming every route this server answers | `serve.rs:855` (`not_found_json`), `serve.rs:495` (`route`) |
-| garbage request line | 400 JSON `{"error":"bad request"}` | `serve.rs:1971` (`read_head_from`) |
-| malformed or repeated `Content-Length` | 400 JSON | `serve.rs:1971` |
-| head (request line plus headers) over 64 KiB | 431 JSON, then close | `serve.rs:453`, `serve.rs:1971` |
-| body over 16 MiB | 413 JSON, then close | `serve.rs:455`, `serve.rs:1971` |
-| `Transfer-Encoding: chunked` | 501 JSON | `serve.rs:1971` |
-| `stream: false` or absent | **200, one `chat.completion` document** (501 until #39) | `serve.rs:1570` (`chat_route` branch), `serve.rs:1606` (`chat_document`) |
-| prompt ids `>= n_ctx` | 413 before any GPU work | `serve.rs:1253` (`clamped_max_tokens`) |
-| `/slots/0` save with no prefill-clean position held | 409 | `serve.rs:2075`, `slot.rs` |
+| unknown route, or a wrong method on a known path | 404 JSON naming every route this server answers | `serve.rs:903` (`not_found_json`), `serve.rs:541` (`route`) |
+| garbage request line | 400 JSON `{"error":"bad request"}` | `serve.rs:2563` (`read_head_from`) |
+| malformed or repeated `Content-Length` | 400 JSON | `serve.rs:2563` |
+| head (request line plus headers) over 64 KiB | 431 JSON, then close | `serve.rs:501`, `serve.rs:2563` |
+| body over 16 MiB | 413 JSON, then close | `serve.rs:503`, `serve.rs:2563` |
+| `Transfer-Encoding: chunked` | 501 JSON | `serve.rs:2563` |
+| `stream: false` or absent | **200, one `chat.completion` document** (501 until #39) | `serve.rs:2062` (`chat_route` branch), `serve.rs:2099` (`chat_document`) |
+| prompt ids `>= n_ctx` | 413 before any GPU work | `serve.rs:1363` (`clamped_max_tokens`) |
+| `/slots/0` save with no prefill-clean position held | 409 | `serve.rs:2723`, `slot.rs` |
 | `/slots/0` bad filename, missing file, shape or content mismatch | 400, engine untouched | `slot.rs:342`, `slot.rs:288` (`check_content`) |
 | a second `serve` process | non-zero exit on `engine/.engine.lock` | `serve.rs` module doc, `Engine::load` |
-| read or write timeout (10 s per connection) | one stderr line, that connection closed, accept loop continues | `serve.rs:451` |
-| a client that sent nothing | closed silently, no response | `serve.rs:1971` |
+| read or write timeout (10 s per connection) | one stderr line, that connection closed, accept loop continues | `serve.rs:499` |
+| a client that sent nothing | closed silently, no response | `serve.rs:2563` (`read_head_from`) |
+| a `messages` shape the chat template cannot render (content that is not string/list/null, a part that is not text or `image_url`, `tool_calls` not an array, a call or `function` that is not an object, a non-string `function.name`, an unknown role, a system message that is not first) | 400 JSON naming the message index and the field, BEFORE the render | `serve.rs:1564` (`check_messages`), `:1601` (`check_content`), `:1640` (`check_tool_call`) |
+| an `image_url` block without `image_url.url` | 400 JSON naming the message index | `serve.rs:1006` |
+| an image over `VIT_MAX_PATCHES` | 413 JSON | `vit.rs` module doc |
+| a CUDA allocation refused INSIDE a request (tower scratch, mrope tables, a state buffer) | **503 JSON naming the allocation, its byte count and the free VRAM**; the request is dropped, the engine is reset and stays up. An SSE error frame instead when the head is already out. The only 503 this server answers; any other panic still ends the process (TASK K, 2026-09-17) | `serve.rs:2678` (`guarded`), `:2684` (`cuda::RequestScope`), `:2691` (`AllocFailed` downcast), `:2716` |
 
 - Measured (A2, #24): `engine/.engine.lock` is held for the process life and is **left
   behind by a `Stop-Process` kill**; it must be removed by hand before the next engine run.
@@ -1369,8 +1380,8 @@ C:/x/y.md
 | `/completion` | not built | appears only in Crow's log-parser test fixtures |
 | `/apply-template` | not built | only Crow's probes call it (`tools/probe_reasoning_levels.py:92`, `tools/check_chat_template.py:19`) |
 | `delta.reasoning_content` | never emitted | `enable_thinking` is false on this path; Crow reads the key if present (`crow_core.py:4831-4877`) |
-| stream trickle in serve | ticked once per `decode_step` (#37) | `bin/serve.rs:1841-1843`, the mirror of `bin/decode.rs:224-231`; drained after the last step; one `[serve]` line at start says whether this process ticks, and the `[chat]` line carries `crow_trickle_swaps` per request |
-| the trickle's ranking signal in serve | `CROW_ADAPT_WINDOW=1` by default (#37 fix round 1) | `bin/serve.rs:2313` sets it when unset, the same loop as `CROW_GRAPH` and `CROW_MMA`; an explicit `CROW_ADAPT_WINDOW=0` restores the cumulative ranking |
+| stream trickle in serve | ticked once per `decode_step` (#37) | `bin/serve.rs:2332`, the mirror of `bin/decode.rs:224-231`; drained after the last step; one `[serve]` line at start says whether this process ticks, and the `[chat]` line carries `crow_trickle_swaps` per request |
+| the trickle's ranking signal in serve | `CROW_ADAPT_WINDOW=1` by default (#37 fix round 1) | `bin/serve.rs:2930` sets it when unset, the same loop as `CROW_GRAPH` and `CROW_MMA`; an explicit `CROW_ADAPT_WINDOW=0` restores the cumulative ranking |
 | `adapt_tick` in serve | never called | the post-prefill re-cut of `CROW_ADAPT=1` stays a harness path; callers are `bin/decode.rs:230` and `bin/parity.rs:216` |
 | `CROW_QSA_FULL=1` | out of scope | 7.7, the ring would dominate every size |
 | `CROW_COLD_TIER` low-bit tier | must stay off | 7.5 condition 2 |
@@ -1430,7 +1441,7 @@ C:/x/y.md
 | `choices[0].finish_reason` | `stop`, `length` or `tool_calls`, the stream's rules unchanged | `serve.rs:1648` | `probe-suite.py:678` |
 | `usage` | `usage_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1109` (`usage_json`), `serve.rs:1477` | `probe-suite.py:681-683` (`completion_tokens`) |
 | `timings` | `timings_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1122` (`timings_json`), `serve.rs:1477` | neither caller reads it |
-| headers | `application/json`, `Content-Length`, `Connection: close`, as on every other JSON route | `serve.rs:1606` (`chat_document`), `serve.rs:1947` (`respond`) | `urllib.request` in both callers |
+| headers | `application/json`, `Content-Length`, `Connection: close`, as on every other JSON route | `serve.rs:2099` (`chat_document`), `serve.rs:1947` (`respond`) | `urllib.request` in both callers |
 
 **The decisions #39 took, and why:**
 
@@ -1454,10 +1465,10 @@ C:/x/y.md
 | the three `[chat]` stderr lines, `[chat] ids` included | `chat_generate` | yes |
 | the per delta side effect | `ChatSink::on_emit` (`serve.rs:1327`) | no, this is the split |
 | the wire form | `SseSink` writes frames (`serve.rs:1346`), `CollectSink` fills two strings (`serve.rs:1397`) | no |
-| the route switch | `chat_route` (`serve.rs:1532`), branch at `serve.rs:1570` | no |
+| the route switch | `chat_route` (`serve.rs:1532`), branch at `serve.rs:2062` | no |
 
-- `chat_stream` (`serve.rs:1580`) writes the SSE head, then runs `chat_generate` with `SseSink`.
-- `chat_document` (`serve.rs:1606`) runs `chat_generate` with `CollectSink`, then answers
+- `chat_stream` (`serve.rs:2072`) writes the SSE head, then runs `chat_generate` with `SseSink`.
+- `chat_document` (`serve.rs:2099`) runs `chat_generate` with `CollectSink`, then answers
   `completion_json`.
 - Wire proof of the refactor: the raw SSE bytes of one streaming request are identical
   before and after, `id`, `created` and the wall-clock `timings` numbers excepted
@@ -1514,7 +1525,7 @@ Against the fixed binary, same budget: `round 0 ... arguments=object, _truncated
   '_truncated'` - which is the same refusal the old unterminated JSON bought, with a message
   that says what happened and without a history the template cannot render.
 
-**The fix, end 2 - nothing that is not a mapping reaches `|items`** (`serve.rs:1443`):
+**The fix, end 2 - nothing that is not a mapping reaches `|items`** (`serve.rs:1481`):
 
 | `arguments` as it arrives | what the render sees | why |
 |---|---|---|
@@ -1525,14 +1536,14 @@ Against the fixed binary, same budget: `round 0 ... arguments=object, _truncated
 | JSON `null` | `{}` | null means there are no arguments; a `_raw` of `"null"` would invent content that was never sent |
 | any other value (array, number, bool) | `{"_raw": "<its compact JSON>"}` | as the string row |
 
-**The diagnostic** (`serve.rs:1622` `message_digest`, `serve.rs:1664` `log_messages_400`): the
+**The diagnostic** (`serve.rs:1668` `message_digest`, `serve.rs:1710` `log_messages_400`): the
 live log had only `400 Bad Request` and nothing else, which is why this took a session to find.
 Now every rewrite writes `[chat] normalised: message <i> tool_call <j> function.arguments is
 <kind> the template cannot iterate, rendered as ...: <first 200 bytes>`, and every messages 400
 writes the reason plus one line per message with its role, its content kind and, per tool call,
 the name and the first 200 bytes of `arguments`.
 
-**The neighbouring hazards, each measured against this template** (`serve.rs:1518`
+**The neighbouring hazards, each measured against this template** (`serve.rs:1564`
 `check_messages`, run on the NORMALIZED messages before the render; a shape that renders is
 never refused, so no request that worked before is refused now):
 
@@ -1640,9 +1651,9 @@ CHECKED where it is produced and DIAGNOSABLE where it is consumed:
 | sampled result | gate met in 1 of 6 seeds, 4 Pass / 37 Partial / 19 Fail of 60, degeneration 0 of 60 (`decode_out/srv-c2-reader.log:301-312`, #44) |
 | greedy result | gate met in 0 of 1 arms, 2 Pass / 5 Partial / 3 Fail of 10 (#11, Crow #192) |
 | reference llama.cpp | 2 Pass / 6 Partial / 2 Fail of 10 on UD-Q2_K_XL greedy, gate met (#11, Crow #192) |
-| decision | the default stays as built (#28 A6), the request decides: `sampler_from` at `engine/src/bin/serve.rs:1041` |
-| request without `temperature` | greedy, the A4 path; `null` or `<= 0` is the same path (`engine/src/bin/serve.rs:133`) |
-| request with `temperature > 0` | samples; absent fields take the data sheet `top_p` 0.8, `top_k` 20, `presence_penalty` 1.5, `seed` 0 reseeded per request (`engine/src/bin/serve.rs:134-137`) |
+| decision | the default stays as built (#28 A6), the request decides: `sampler_from` at `engine/src/bin/serve.rs:1158` |
+| request without `temperature` | greedy, the A4 path; `null` or `<= 0` is the same path (`engine/src/bin/serve.rs:1158`, `sampler_from`) |
+| request with `temperature > 0` | samples; absent fields take the data sheet `top_p` 0.8, `top_k` 20, `presence_penalty` 1.5, `seed` 0 reseeded per request (`engine/src/bin/serve.rs:509-515`) |
 | what a Crow turn gets | sampled at `temperature` 1.0, `top_p` 0.95, `min_p` 0.01 accepted and ignored (`Crow cli/crow_core.py:472`, #28) |
 | unmeasured | the ten-task gate at Crow's own profile (temperature 1.0, top_p 0.95); the six series ran temp 0.7, top_p 0.8, top_k 20, presence 1.5 (`engine/src/sample.rs:76-81`) |
 | t2b-write-refactor | Fail under greedy after 21 ids (#11), Partial on 6 of 6 sampled seeds (`decode_out/srv-c2-reader.log:214`, #44) |
@@ -1651,12 +1662,12 @@ CHECKED where it is produced and DIAGNOSABLE where it is consumed:
 
 | category | test | file:line |
 |---|---|---|
-| request parsing | `the_two_stream_flags_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:3012` |
-| request parsing | `tools_and_tool_turns_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:3155` |
-| SSE framing | `an_sse_frame_is_one_data_line_and_a_blank_line` | `engine/src/bin/serve.rs:3041` |
-| prefix length determination | `common_prefix_stops_at_the_first_difference` | `engine/src/cache.rs:526` |
-| prefix length determination | `the_newest_snapshot_at_or_below_l_wins` | `engine/src/cache.rs:558` |
-| one slot per process | `the_process_holds_one_slot_and_one_reuse_candidate` | `engine/src/cache.rs:732` |
+| request parsing | `the_two_stream_flags_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:3734` |
+| request parsing | `tools_and_tool_turns_parse_out_of_the_body_crow_sends` | `engine/src/bin/serve.rs:3852` |
+| SSE framing | `an_sse_frame_is_one_data_line_and_a_blank_line` | `engine/src/bin/serve.rs:3763` |
+| prefix length determination | `common_prefix_stops_at_the_first_difference` | `engine/src/cache.rs:558` |
+| prefix length determination | `the_newest_snapshot_at_or_below_l_wins` | `engine/src/cache.rs:590` |
+| one slot per process | `the_process_holds_one_slot_and_one_reuse_candidate` — REMOVED with M3, which made `SLOTS = 3` (`cache.rs:169`); no such test exists at `487128d` | — |
 
 - Counts at commit 9054592: engine lib **79 of 79**, `bin/serve` **52 of 52**, every other
   binary 0 tests, doc-tests 0; converter **7 of 7**.
@@ -1664,23 +1675,34 @@ CHECKED where it is produced and DIAGNOSABLE where it is consumed:
   **52 of 52**, every other binary 0 tests, doc-tests 0; converter untouched
   (`decode_out/srv-a9b.log:473`, `:488`).
 - CI (E7, #50, 2026-09-11) runs engine lib **72 of 80** and `bin/serve` **55 of 57** on the
-  windows-latest runner; the gap is 10 tokenizer tests that need `../models/`, not present on a
+  windows-latest runner (the runner moved to ubuntu-latest with the Linux port on 2026-09-17 and no
+  run of that workflow is recorded in this repository yet, so these are still the counts of record
+  for CI while the local counts are the 98 / 67 above); the gap is 10 tokenizer tests that need `../models/`, not present on a
   fresh clone. The full counts above hold locally, where the models directory exists.
 
 **The unit tests #39 added (`engine/src/bin/serve.rs`):**
 
 | category | test | file:line |
 |---|---|---|
-| document builder | `the_non_streaming_document_carries_every_field_the_probe_suite_reads` | `engine/src/bin/serve.rs:3575` |
-| document builder | `the_non_streaming_document_carries_the_tool_calls_the_parser_closed` | `engine/src/bin/serve.rs:3614` |
-| sink equivalence | `the_collector_and_the_sse_sink_see_the_same_delta_sequence` | `engine/src/bin/serve.rs:3639` |
-| request parsing | `the_two_callers_that_send_no_stream_field_parse_as_non_streaming` | `engine/src/bin/serve.rs:3705` |
-| collector | `the_collector_holds_one_buffer_per_tool_call_index` | `engine/src/bin/serve.rs:3733` |
+| document builder | `the_non_streaming_document_carries_every_field_the_probe_suite_reads` | `engine/src/bin/serve.rs:4435` |
+| document builder | `the_non_streaming_document_carries_the_tool_calls_the_parser_closed` | `engine/src/bin/serve.rs:4474` |
+| sink equivalence | `the_collector_and_the_sse_sink_see_the_same_delta_sequence` | `engine/src/bin/serve.rs:4499` |
+| request parsing | `the_two_callers_that_send_no_stream_field_parse_as_non_streaming` | `engine/src/bin/serve.rs:4565` |
+| collector | `the_collector_holds_one_buffer_per_tool_call_index` | `engine/src/bin/serve.rs:4593` |
 
 - Counts after B3a (#39): engine lib **80 of 80**, `bin/serve` **57 of 57** (the five new
   tests above), every other binary 0 tests, doc-tests 0; converter untouched. The warning
   set is byte-identical to the adb34b6 baseline `decode_out/srv-m2b-orch-tests.txt`
   (`decode_out/srv-b3a-tests.txt`).
+- Counts at `487128d` (2026-09-17): engine lib **98 of 98**, `bin/serve` **67 of 67**, total
+  **165 passed, 0 failed**. The series over the day: 142 (`74c79f2`) → 144 (`bb9d2ca`, `7ddd296`,
+  `0667e0b`) → 147 (`1032bc5`, the three `cnq::tests::page_runs_*`) → 153 (`e2b9845`, the six of the
+  `arguments` contract) → 165 (`8ff2055`, twelve more: `toolcall::arguments_contract`,
+  `cuda::alloc_failure`, `vit::reserve`, four in `bin/serve.rs`). Converter untouched at 7 tests.
+  The warning set is no longer the adb34b6 baseline: clippy went 1494 → 1480 → 1426 → **1422**
+  over the three refactor cuts and has not moved since (`tools/gate-linux.sh`).
+- The `file:line` anchors in the two test tables above are the positions at the commit that added
+  each test; `bin/serve.rs` grew by 1,238 lines on 2026-09-17, so they are read by name, not by line.
 - Commands: `cd engine && cargo test --release --target-dir target_srv`, and
   `cd converter && cargo test --release`.
 
@@ -1703,7 +1725,7 @@ CHECKED where it is produced and DIAGNOSABLE where it is consumed:
 
 ### 7.13 The image path (#VIT, 2026-09-14)
 
-- The container's `vit` section (27 vision blocks x 12 tensors + patch embed + learned position table + merger; 112 NVFP4 + 221 bf16 keeps) loads beside the text sections when `CROW_VIT` is unset (default ON); `CROW_VIT=0` is the text-only placeholder of record. Weights resident at load; the cap-sized scratch (about 640 MiB at 16,384 patches = 4,096 visual tokens) allocates lazily on the first image request, so text-only boots keep the full planner budget.
+- The container's `vit` section (27 vision blocks x 12 tensors + patch embed + learned position table + merger; 112 NVFP4 + 221 bf16 keeps) loads beside the text sections when `CROW_VIT` is unset (default ON); `CROW_VIT=0` is the text-only placeholder of record. Weights resident at load; the cap-sized scratch (228.5 MiB at 16,384 patches = 4,096 visual tokens, `vit::scratch_bytes()` = 239,599,616 B, pinned by the test at `vit.rs:1084`) allocates lazily on the first image request, so text-only boots keep the full planner budget.
 - Serve accepts Crow's image wire exactly (`image_url` data-URL blocks, `crow_core.py image_part`), decodes the five client formats (the `image` crate, decode features), preprocesses per the HF fast processor (smart_resize factor 32, min 65,536 / max 16,777,216 px, antialiased bicubic, 0.5/0.5 normalize, spatial-merge-block patch order), and runs the tower in f32 on the NVFP4 weights (`engine/src/vit.rs`).
 - The visual embeddings splice into the text stream at the expanded `<|image_pad|>` rows (host-side, pre-upload), and the rope kernels read a per-request INTERLEAVED-mrope cos/sin span table (section [11, 11, 10], partial rotary 0.25, theta 1e7 — the `get_rope_index` positions) instead of the load-time table while an image conversation is live. All physical indexing (KV rows, QSA rings, pooled blocks) stays sequential; only the table content changes.
 - Measured (RTX 5090, 2026-09-14, `decode_out/srv-vit.log`): ViT embeddings vs the f32 container-dequant oracle max_abs 3.43e-06 at cos 1.000000; text parity with the tower loaded AND with `CROW_VIT=0` byte-identical to `d211ab52ad2b` at the 61b sha256 values of record including the PX teacher-forced 16,064-row form `f217e1c55926` under the > 26 GiB VRAM headroom gate (23 of 23 subchecks); ten tasks 10 of 10 identical to final4; image-prompt pairs (text-only 26-token prompt vs the 224-token image prompt, fresh process per run): text prefill 406.1 ms vs 1,626.2 ms, pair delta mean +1,220.1 ms, plus the vision window of 35.3 s per request (`[vit-chat]`) — the tower GEMVs run the text-style per-token shape and are the known optimization lever.
@@ -1752,7 +1774,7 @@ The per-request spliced embedding buffer (`sum(n_visual)` x 2560 f32, `build_pla
 **The no-panic rule (binding).** A CUDA allocation that fails inside a REQUEST answers the request;
 it does not end the process.
 
-- Every `cuMemAlloc_v2` of the engine goes through `cuda::try_alloc_zeroed(what, bytes)`, which names
+- Every `cuMemAlloc_v2` on a REQUEST path goes through `cuda::try_alloc_zeroed(what, bytes)`, which names
   the allocation. The failure line and the response body both carry the name, the byte count and the
   free VRAM: `CUDA error: CUDA_ERROR_OUT_OF_MEMORY allocating the vit block MLP scratch
   (70516736 B = 67.2 MiB); free VRAM 76.6 MiB`.
@@ -1761,7 +1783,7 @@ it does not end the process.
   **503** with the message, puts the engine back (`end_vision`, `PrefixCache::invalidate`,
   `reset_to_zero`) and keeps serving. Anything else that panics is re-raised unchanged — a bug is
   still a crash.
-- Every allocation site frees what it already took before it raises: `ensure_scratch` takes its 28
+- Every allocation site frees what it already took before it raises: `ensure_scratch` takes its twelve buffers plus sixteen scalar slots, 28 allocations in all, as its 28
   buffers as a group and frees the ones it holds (`[vit] scratch allocation refused after N
   buffer(s) - they were freed, the tower stays unarmed`), `begin_vision` frees the cos table if the
   sin table is refused; the plan itself holds no device memory.
@@ -1940,7 +1962,7 @@ KV budget; N=155 with 7 slots surrendered to the trickle), or a cold tier that i
 
 Sections 0 to 7 say what the engine must do. This section says how the crate is put together,
 so a reader who opens `engine/src` knows which file to open and what it may reach for. It was
-read from the tree at `0cf1de5` on branch `linux-refactor`, after the three refactor cuts
+read from the tree at `487128d` on branch `main`, after the three refactor cuts
 (`74c79f2`, `bb9d2ca`, `7ddd296`); the graph below was regenerated from the `use crate::`
 edges of the current tree, not copied from an earlier note.
 
@@ -1983,7 +2005,8 @@ graph LR
 and module load, device alloc/copy/free, the active-stream register, the CUDA-Graphs entry
 points loaded by hand out of `nvcuda.dll` / `libcuda.so.1` (cudarc 0.19.9 binds them for CUDA
 11.4–11.8 only), pinned host memory (`Pinned`), and the host-RAM reading the pinned budget is
-derived from (`free_physical_ram_parts` → `HostRam`, `other_cuda_fd`). Surface: 60 `pub fn`
+derived from (`free_physical_ram_parts` → `HostRam`, `other_cuda_fd`), and the request-scoped
+allocation contract of TASK K (`try_alloc_zeroed`, `AllocFailed`, `RequestScope`). Surface: 69 `pub fn`
 plus `Ctx`, `Module`, `Pinned`, `HostRam`. Depends on nothing in the crate and may never
 depend on anything: it is the bottom. Every `#[cfg(windows)]` / `#[cfg(unix)]` split in the
 crate lives here except three: `cnq.rs`'s container mapping, `gen.rs`'s `pid_alive`, and the
@@ -1995,14 +2018,14 @@ FP4/FP8 host twins (`e2m1`, `ue4m3`, `dequant_block`), the scale search the two 
 builders share (`bin/coldtier`, `bin/hybrid`), the Linux page-cache discipline (`fadvise_consumed`,
 `fadvise_flush`, `purge_cache`'s kept range) and, since TASK H, the row fetch: `page_runs`,
 `warm_mode`, the process's one reader pool and the `Send` handle `Cnq::warm` hands out (7.14).
-Surface: 22 `pub fn` plus `Cnq`, `TensorInfo`, `Warm`, `WarmMode`. Depends on nothing in the
+Surface: 25 `pub fn` plus `Cnq`, `TensorInfo`, `Warm`, `WarmMode`. Depends on nothing in the
 crate. It may not learn about geometry: what a tensor MEANS is `geo`'s and `gen`'s business — the
 row fetch takes byte offsets and a row length and knows nothing about n-grams.
 
 **`geo.rs`** — the model geometry and the runtime `Config`: the probe-pinned constants and
 their derivation chain, `KvDtype`, `Adapt` with `knobs()`, the two policy functions
 (`apply_chunk_policy`, `apply_adapt_policy`) and `env_parse::<T>`. Surface: 10 `pub fn`, 3
-types, 50 `pub const`. Depends on nothing. It is the one place a number that two modules must
+types, 51 `pub const`. Depends on nothing. It is the one place a number that two modules must
 agree on is allowed to live (8.6).
 
 **`tokenizer.rs`** — the in-engine HF tokenizer and the minijinja chat template, producing ids
@@ -2057,12 +2080,13 @@ Surface: 17 `pub fn` plus `Residency`, `PendingSwap`, `LowBit`, `ExpertSlabs`. D
 **`vit.rs`** — the #VIT visual tower: `VitW::load` / `Vit::new` (27 blocks from the container's
 `vit` section), the lazy cap-sized scratch, `Vit::run`, image decode and the hand-rolled HF
 preprocessing (`decode_rgb`, `prep_image`, smart_resize), `expand_ids`, `mrope_positions`,
-`mrope_tables`, the bounded image-embedding LRU and `build_plan` → `VisionPlan`. Surface: 13
-`pub fn` plus `VitW`, `Vit`, `VitBlockW`, `ImagePrep`, `VisionPlan`, `Grid`, 15 `pub const`.
+`mrope_tables`, the bounded image-embedding LRU, `build_plan` → `VisionPlan`, and the planner's
+reserve (`reserve_bytes`, `reserve_line`, `CROW_VIT_RESERVE_MB`). Surface: 17
+`pub fn` plus `VitW`, `Vit`, `VitBlockW`, `ImagePrep`, `VisionPlan`, `Grid`, 16 `pub const`.
 Depends on `cnq`, `cuda`, `geo`, `kernels`, `weights`. It may not depend on `gen`: `gen` calls
 IT, through `Engine::build_vision_plan` and `begin_vision`.
 
-**`gen.rs`** — the engine proper, and still the largest module (4,182 lines at `0cf1de5`): the
+**`gen.rs`** — the engine proper (4,240 lines at `487128d`; `kernels.rs` at 4,645 lines is the larger file, because it carries `KERNEL_SRC`): the
 weight structs, the device scalar block (`Params`) and scratch, `Engine` itself (8.3), the boot
 (`Engine::load`), every layer primitive (`hc_run`, `gdn_prompt` / `gdn_step`, `attn_prompt` /
 `attn_step`, `moe_run`, `ple_run`, `head_run`, `lm_head_row`), the two hot paths `prefill` and
@@ -2073,7 +2097,9 @@ it.
 
 **`cache.rs`** — the #31 A9 prefix cache: the ids-only prefix rule (`common_prefix_len`,
 `reuse_slot`, `decide`), the snapshot shape, and the two state transfers `snapshot` (DtoH) and
-`rollback` (HtoD), over `SLOTS = 3` snapshots since #36. Surface: 18 `pub fn` plus
+`rollback` (HtoD), over `SLOTS = 3` snapshots: #36 (M2b) cut it to one slot, M3 made it three
+(`cache.rs:762`). `faulted` (`cache.rs:279`) writes one volatile store per 4 KiB at boot so the
+slot's pages exist before a request asks for a snapshot. Surface: 18 `pub fn` plus
 `PrefixCache`, `Decision`, `Shape`. Depends on `cuda`, `gen`, `geo`.
 
 **`reset.rs`** — the teardown and the zero state, as two inherent `Engine` methods:
@@ -2087,7 +2113,7 @@ the shape and content compatibility checks, `kv_row_order` (the one iterator bot
 `Restored`. Depends on `cache`, `cuda`, `gen`, `geo`. Top of the graph; nothing depends on it
 but `bin/serve`.
 
-### 8.3 The `Engine` API surface (`7ddd296`)
+### 8.3 The `Engine` API surface (`7ddd296`, re-counted at `487128d`)
 
 Before `7ddd296`, `Engine` had 43 `pub` fields and no private ones, so there was no statement
 anywhere about what was API. It now has 42 fields, in three groups, and the bins are separate
@@ -2097,7 +2123,7 @@ crates, which makes `pub(crate)` a hard wall rather than a hint:
 |---|---|---|
 | `pub` | 1 | `cfg` — the operating point. The honest API: `serve` reads `cfg.prompt_chunk` and `cfg.adapt`, `decode` and `parity` set the chunk before the load |
 | `pub(crate)` | 8 | `st`, `ple`, `pos`, `history`, `done_blocks`, `graph_exec`, `cap_stream`, `route_log` — reached by `cache.rs`, `slot.rs` and `reset.rs`, by no bin |
-| private | 33 | everything else, including the one field that was dead (`cnq: *mut Cnq`, null at construction and never read; `pub` had hidden the lint) |
+| private | 33 | everything else. The 43rd field of the old struct was dead and is gone (`cnq: *mut Cnq`, null at construction and never read; `pub` had hidden the lint), which is where 43 became 42 |
 
 Fifteen named methods carry what the bins used to take from the fields:
 
@@ -2133,6 +2159,9 @@ not line numbers — the files move.
 5. `cfg.prompt_chunk = SERVE_CHUNK` (= `geo::TRICKLE_CHUNK_THRESHOLD`), `geo::apply_adapt_policy`
    (the `[policy]` line).
 6. `Engine::load`, in this order:
+   0. the `CROW_KPROF` x `CROW_GRAPH=1` refusal (`gen.rs:717-720`, since 2026-09-17): a sync inside
+      an open decode-graph capture is `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`, so the pair is
+      refused before anything is allocated, with one message naming both switches and the escape.
    1. `engine_lock_acquire` — `engine/.engine.lock`, `pid_alive` via `/proc/<pid>` on unix and
       `tasklist` on Windows; a second engine on the machine dies here.
    2. `manager::derive_host_pinned_budget` — the `[budget]` line, before anything is pinned (8.8).
@@ -2143,9 +2172,12 @@ not line numbers — the files move.
    5. `vit::vit_on` → `vit::Vit::new`, the `[vit]` line; weights resident, scratch lazy.
    6. `residency::expert_slab_info`, then `Scratch::alloc(cfg.prompt_chunk)` — scratch must be
       resident before the planner measures free VRAM.
-   7. the `[stage]` / `[trickle]` / `[qsa]` / `[attn]` / `[gdn]` / `[hc]` provenance lines and
-      the `Stage` device allocations.
+   7. the `[stage]` / `[trickle]` / `[qsa]` / `[attn]` / `[gdn]` / `[hc]` / `[pf-gemm-b]` provenance
+      lines and the `Stage` device allocations.
    8. `ThreeStates::allocate` — the two-sided clamp loop, then KV, QSA, GDN and rope allocation.
+      The planner's `pending` bytes are `LAUNCH_SLACK + ring_reserve + vit_reserve` (`gen.rs:976-977`):
+      `vit::reserve_bytes(cfg.context)` enters here, with its own `[budget]` line, so the image path
+      is subtracted BEFORE N is chosen (7.13, TASK K).
    9. `Residency::build` — hot set, the RAM gate, the VRAM hot slabs, the pinned cold tier, one
       ascending sweep per expert tensor, the slot tables.
    10. the prefetch ring and its non-blocking stream.
@@ -2161,13 +2193,19 @@ only loads the sidecar it wrote.
 ### 8.5 The request path
 
 1. `serve_one` → `read_head` → `parse_request_line` → `route_path` → `route`; `Route::Chat` →
-   `chat_route`.
+   `guarded(chat_route)` (`serve.rs:2678`, armed at `serve.rs:2831`). `guarded` arms a
+   `cuda::RequestScope` and catches exactly `cuda::AllocFailed`: it frees what was taken, calls
+   `end_vision`, invalidates the cache, resets the engine and answers 503 (or an SSE error frame if
+   the head is already out). Any other panic still ends the process.
 2. `parse_chat` (messages, tools, sampling parameters, `image_url` blocks) → `normalize_messages`
    → `tk.encode_chat` (minijinja render + HF encode).
 3. Image branch when the request carries images and the tower is loaded:
-   `Engine::build_vision_plan` (hash lookup in the bounded LRU, else `prep_image` → `Vit::run`),
-   then `Engine::begin_vision`, which builds the interleaved-mrope tables for the request.
-4. `clamped_max_tokens`, then `chat_stream` (SSE) or `chat_document` (one JSON document) —
+   `Engine::build_vision_plan` (hash lookup in the bounded LRU, else `prep_image` → `Vit::run`).
+   The plan holds HOST rows only; no device memory.
+4. `clamped_max_tokens`, then `Engine::begin_vision`, which builds the interleaved-mrope tables for
+   the request. Since TASK K (2026-09-17) the clamp runs BEFORE `begin_vision`, not after, so the
+   span is at most `n_ctx`: a request refused with 413 used to have allocated its tables already.
+   Then `chat_stream` (SSE) or `chat_document` (one JSON document) —
    both call the same `chat_generate`.
 5. `chat_generate`: `Engine::end_vision` when the request has no images;
    `PrefixCache::decide(eng.history(), &prompt)` — the ids-only prefix rule; WARM →
@@ -2239,8 +2277,12 @@ memory-bounded scope, one engine at a time.
   `CROW_PINNED_WC=0`, `CROW_PF_ASYNC=0` and `CROW_GRAPH=0`, which exonerates the port surface.
   Over a 1024-token generation the same drift does flip near-ties (`GATES.md` section 3).
 - **The gate**: `tools/gate-linux.sh [outdir]` from the repo root runs the three parity forms,
-  `decode run 32`, `cargo test`, clippy and the two doc guards against the first three values
-  above, prints GREEN/RED per item and exits non-zero on any RED. The 1024-row form is not in
+  `decode run 32`, `cargo test`, clippy and the doc guards against the first three values
+  above, prints GREEN/RED per item and exits non-zero on any RED. Nine items; all nine green at
+  commit `8ff2055` on 2026-09-17. The two host-side values it pins are `TESTS=165`
+  (98 lib + 67 serve) and `CLIPPY=1422` (the `--all-targets` form, counted as
+  `grep -cE '^warning: '`), plus `check_env_docs` exit 0 (`code 82, doc 82`) and
+  `check_readme_dates` 0 offenders. The 1024-row form is not in
   the script — it costs a full long-prompt run and is checked by hand. Every expected value is hard-coded with its
   provenance in the script header. It is not a tuning knob: a value there is changed only when a
   new reference run establishes a new record, and the commit that does it says so.
