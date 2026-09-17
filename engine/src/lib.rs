@@ -1,6 +1,57 @@
 //! crow-nest engine — residency scheduler (#8), three-state manager (#9),
 //! end-to-end production decode (#11). Kernel math is the probe-verified set
 //! (probes p5–p16); see probes/p5_STATUS.md for the evidence chain.
+//!
+//! # The module map (2026-09-17)
+//!
+//! Six layers, no cycles: a module may use the layers above it and never the
+//! ones below. The same graph is drawn in `docs/diagrams.md` (diagram 7) and
+//! explained module by module in `docs/architecture.md` section 8.
+//!
+//! L0 — leaves, no in-crate dependency:
+//!
+//! - [`cuda`]: the CUDA driver-API facade — context, NVRTC compile, module load,
+//!   device alloc/copy/free, streams and graphs, pinned host memory, and the
+//!   `/proc/meminfo` reading the pinned budget is derived from.
+//! - [`cnq`]: the CNQ container reader — trailer index, whole-file mapping, every
+//!   weight read, the FP4/FP8 host twins, and the `fadvise` purge that keeps the
+//!   load from leaving a page-cache trail.
+//! - [`geo`]: model geometry and `Config` — the constants every other module
+//!   derives from, the chunk and adapt policies, `env_parse`.
+//! - [`tokenizer`]: the in-engine HF tokenizer and chat template (`bin/serve` only).
+//! - [`toolcall`]: the streaming `<tool_call>` parser (`bin/serve` only).
+//!
+//! L1 — on the leaves:
+//!
+//! - [`kernels`] → cuda: `KERNEL_SRC` (the frozen CUDA source), the kernel table,
+//!   `launch_v` / `launch_sync` and the per-kernel profile; `define_u32` reads the
+//!   four `#define`s the Rust twins are asserted against at every load.
+//! - [`manager`] → cuda, geo: the three-state allocator and the two-sided planner
+//!   clamp; `derive_host_pinned_budget` and the RAM margin.
+//! - [`sample`] → geo: the host sampler reference, the sampler profile, `EOS_IDS`.
+//! - [`weights`] → cnq, cuda: the container tensor → device loaders and the NVFP4
+//!   pair `Fp4` (no launch policy).
+//! - [`boot`] → cnq, cuda, geo: `open_model` — container, CUDA context and the
+//!   starting `Config`, in the order the engine-loading bins need them.
+//!
+//! L2 and above:
+//!
+//! - [`residency`] → cnq, cuda, geo, kernels, manager: the hot expert set in VRAM,
+//!   the pinned cold tier, the swaps and the three-phase stream trickle.
+//! - [`vit`] → cnq, cuda, geo, kernels, weights: the visual tower, image
+//!   preprocessing, the interleaved-mrope tables and the prefill splice plan.
+//! - [`gen`] → cnq, cuda, geo, kernels, manager, residency, sample, vit, weights:
+//!   `Engine` — the boot (`Engine::load`), every layer primitive, `prefill` and
+//!   `decode_step`, the device sampler, adaptation and the trickle.
+//! - [`cache`] → cuda, gen, geo: the prefix cache (spec section 7).
+//! - [`reset`] → cuda, gen, geo: the teardown and the zero state, as inherent
+//!   `impl Engine` methods — the only foreign `impl` on `Engine` in the crate, and
+//!   the reason `impl Drop for Engine` in `gen` can call `drop_decode_graph`
+//!   without a `use` edge that any import graph would show.
+//! - [`slot`] → cache, cuda, gen, geo: the slot file behind `POST /slots/0`.
+//!
+//! The bins (`engine/src/bin`) are separate crates: `pub(crate)` is a hard wall to
+//! them, so `Engine`'s API surface is what they can reach (architecture 8.3).
 
 pub mod cuda;
 pub mod cnq;

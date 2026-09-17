@@ -67,3 +67,17 @@ ships it H2D on a dedicated copy stream; the GPU gates the consumer on a 64-bit
   per-layer granularity. This feeds the scheduler design (#8) directly: batch handoffs,
   double-buffer, and measure HGS. The parity harness (#6) will quantify all of it
   against llama.cpp on the same stack.
+
+## Status (2026-09-17)
+
+Everything above is the Windows/WDDM measurement of 2026-09-02 and stands as written. The
+Linux retest that point 3 and point 4 call for has NOT been run: `handoff-bench/` was never
+built on Linux, so there is still no Linux number for the job-ring round trip, and the
+`completion_memop` path is still parked behind its feature flag.
+
+The engine itself does have Linux numbers since 2026-09-17 (issue #15) — the parity values of
+record, the throughput readings and the host-memory figures in `CHANGELOG.md` and
+`docs/architecture.md` section 8.7, gated by `tools/gate-linux.sh`. Those are engine
+measurements on the box of `docs/system-landscape.md`, second environment block. They say
+nothing about this benchmark: the rule "no Linux number before the Linux retest" on this page
+is about the ring round trip measured here, and it is still open.

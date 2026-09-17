@@ -4,7 +4,7 @@
 |---|---|
 | product | inference engine for one model on one GPU, own quantization, own container, thin CUDA kernels in Rust |
 | model | Qwen3.8-Flash-Next as CNQ4.5-M (NVFP4, 4.5 bpw), converted from the original safetensors; the container carries the visual tower (`vit` section) and serve answers image requests (`CROW_VIT`, default on) |
-| platform | Windows, NVIDIA Blackwell (`sm_120`), CUDA only |
+| platform | Linux and Windows, NVIDIA Blackwell (`sm_120`), CUDA only |
 | license | code Apache-2.0 (`LICENSE`); the model files carry the Qwen Community License 1.0 |
 
 ## What this is
@@ -18,24 +18,24 @@
 
 ## Platform
 
-- v0.1.0 is Windows only.
-- CUDA on Windows, MSVC toolchain, PowerShell measurement chains.
+- Linux and Windows. The Linux port landed on 2026-09-17 (issue #15) and is measured: library and every binary build, `cargo test --release` green, and the 8-row parity form byte-identical to the Windows reference.
+- CUDA on Linux (stable Rust from rustup, the `libc` crate, the CUDA runtime directory on `LD_LIBRARY_PATH`, bash measurement chains) and CUDA on Windows (MSVC toolchain, PowerShell measurement chains).
 - The FP4 path needs the arch-specific target `compute_120a`; plain `sm_120` is rejected by ptxas (`docs/system-landscape.md:29-30`).
 - Blackwell only: the Ampere and Ada fallback stage is not planned (issue #12).
-- Linux is unverified and is issue #15; no Linux number is quoted anywhere in this repository.
+- The numeric contract is per platform, because the NVRTC and the driver JIT differ (Windows NVRTC 13.3.73 with driver 616.56, Linux NVRTC 13.3.33 with driver 610.57, both measured 2026-09-17): the 8-row parity form is byte-identical on both, and the 512-row and 1024-row forms have their own Linux values of record. The drift never flipped an argmax on the 512-row form; over a long generation it does (`docs/architecture.md` section 8.7).
 
 ## Requirements
 
 | item | value | source |
 |---|---|---|
 | GPU | NVIDIA GeForce RTX 5090, `sm_120`, 170 SMs (measured 2026-09-02), 32,607 MiB VRAM | `docs/system-landscape.md:12` |
-| host RAM | 64 GB; a chain waits for more than 50.5 GiB free before it starts an engine (rule since 2026-09-10, issue #38) | `docs/system-landscape.md:14` |
-| OS | Windows | `docs/system-landscape.md:15` |
-| CUDA toolkit | CUDA 13.3 (nvcc, NVRTC, ptxas); `nvrtc64_133_0.dll` needs the toolkit bin directory on `PATH` | `docs/system-landscape.md:22` |
-| Rust | Rust 1.97.0, cargo 1.97.0 | `docs/system-landscape.md:23` |
+| host RAM | 64 GB on the Windows box; a chain waits for more than 50.5 GiB free before it starts an engine (rule since 2026-09-10, issue #38). 62.17 GiB on the Linux box, where the pinned budget is derived at boot instead of gated against a fixed figure (issue #15, 2026-09-17) | `docs/system-landscape.md:14` |
+| OS | Windows, or Linux since 2026-09-17 (measured on Arch Linux, kernel 7.2.3-arch1-3) | `docs/system-landscape.md:15`, second environment block |
+| CUDA toolkit | CUDA 13.3 (nvcc, NVRTC, ptxas); on Windows `nvrtc64_133_0.dll` needs the toolkit bin directory on `PATH`, on Linux the runtime directory needs to be on `LD_LIBRARY_PATH` (never the `lib/stubs` sibling) | `docs/system-landscape.md:22` |
+| Rust | Rust 1.97.0, cargo 1.97.0 on the Windows box; rustc 1.98.1 from rustup stable on the Linux box | `docs/system-landscape.md:23` |
 | cudarc | 0.19.9, features `cuda-13030`, `dynamic-loading`, `nvrtc` | `docs/system-landscape.md:24` |
-| container | `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq`, 104,727,179,972 B, not in the repository, produced by `converter` | `engine/src/bin/serve.rs:446` |
-| hot set | `decode_out/hotsets-M-longctx2100-n160.json`, tracked in the repository | `engine/src/bin/serve.rs:447` |
+| container | `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq`, 104,727,179,972 B, not in the repository, produced by `converter` | `engine/src/geo.rs:71` |
+| hot set | `decode_out/hotsets-M-longctx2100-n160.json`, tracked in the repository | `engine/src/geo.rs:72` |
 
 ## Start
 
@@ -46,7 +46,9 @@ cd engine
 cargo build --release --bin serve
 ```
 
-### Run, from the repository root
+- The same command builds on Linux, on stable Rust from rustup; the only platform dependency the port added is the `libc` crate (issue #15, 2026-09-17). Nothing links CUDA at build time (`cudarc` `dynamic-loading`), so a machine without a toolkit still builds.
+
+### Run on Windows, from the repository root
 
 ```
 engine/target/release/serve.exe --port 8099
@@ -55,7 +57,12 @@ engine/target/release/serve.exe --port 8099
 ### Run on Linux, from the repository root
 
 ```
+# through the launcher: it sets LD_LIBRARY_PATH from CUDA_LIB and bounds the memory itself
 tools/serve-linux.sh --port 8099
+
+# directly, without the scope: the CUDA runtime has to be on LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$HOME/.local/share/crow/cuda/lib
+engine/target/release/serve --port 8099
 ```
 
 - The cold expert tier is pinned host memory: unevictable, unswappable, and on this box most
@@ -72,10 +79,24 @@ tools/serve-linux.sh --port 8099
   passed through. `docs/env.md` has the host-memory rows the launcher bounds:
   `CROW_RAM_MARGIN_GB`, `CROW_PINNED_BUDGET_GB`.
 
+### Check the branch on Linux, from the repository root
+
+```
+tools/gate-linux.sh
+```
+
+- It runs the three parity forms, the short generated-id run, the tests, clippy and the two doc
+  guards against the Linux values of record, prints GREEN or RED per item and exits non-zero on
+  any RED. Every expected value carries its provenance in the script header.
+- All nine items green at commit 0cf1de5 on 2026-09-17 (`decode_out/final/GATES.md` section 2).
+- Engine runs are sequential on purpose: the RAM gate refuses a second engine while the first
+  one holds the pinned tier.
+
 ### Check the endpoint after the load
 
 ```
-curl.exe -s http://127.0.0.1:8099/health
+curl -s http://127.0.0.1:8099/health        # Linux
+curl.exe -s http://127.0.0.1:8099/health    # Windows
 {"status":"ok"}
 ```
 
@@ -105,7 +126,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 | chat answer | HTTP 200, `finish_reason` `stop`, content "Hello there, my dear friend.", measured 2026-09-11 |
 | ids of that answer | identical in 3 of 3 answers over 2 starts on 2026-09-11 (5 requests: 3 HTTP 200, 2 malformed curl forms rejected), greedy |
 
-- The server binds `127.0.0.1` and defaults to port 8099 (`engine/src/bin/serve.rs:445`).
+- The server binds `127.0.0.1` and defaults to port 8099 (`engine/src/bin/serve.rs:454`).
 - It must be started from the repository root: container and hot-set paths are repository relative.
 - One engine per machine: `Engine::load` takes `engine/.engine.lock`, a second `serve` exits non zero.
 - It is blocking: one request at a time, a second connection waits in the accept queue, no `503`.
@@ -119,6 +140,10 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 | ten-task quality, greedy | 2 Pass / 5 Partial / 3 Fail of 10 | 2 Pass / 6 Partial / 2 Fail of 10 | n/a | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
 | decode, engine arm, ten tasks | 35.5 to 46.8 tok/s | 44.4 to 48.2 tok/s | n/a | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
 | prefill, engine arm, ten tasks | 110 to 706 tok/s | 265 to 846 tok/s | n/a | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
+| prefill on Linux, t1-read 16,064 ids, `decode run` at 128 tokens, two runs with identical id traces | 25.38 s = 633 tok/s and 25.44 s = 631 tok/s | n/a | n/a | RTX 5090, Arch Linux | 2026-09-17 | `decode_out/final/GATES.md` item 9, commit 0667e0b |
+| decode on Linux, the same two runs, context 16,192 | 36.8 and 36.9 tok/s (mean 27.17 and 27.12 ms per token) | n/a | n/a | RTX 5090, Arch Linux | 2026-09-17 | `decode_out/final/GATES.md` item 9, commit 0667e0b |
+| decode on Windows, the same prompt, the `final4` t1-read record (its harness counts the first token in, so the two readings are within noise of each other) | 36.80 tok/s, prefill 492.15 tok/s | n/a | n/a | RTX 5090, Windows | 2026-09-05 | `decode_out/final4-t1-read-run0-crow.json`, commit ce65176 |
+| load on Linux, the 8-row parity form, before and after the ordered cold-tier sweep of issue #15 | 44 s to 25 s | n/a | n/a | RTX 5090, Arch Linux | 2026-09-17 | commit 0c9feb5; the 1024-row form read 71 s on the pre-fix build against 23 s on HEAD, `decode_out/final/GATES.md` section 4 |
 | prefill, t1-read 16,064 ids, the #10c dense variant B pair (opt-in `CROW_PF_GEMM_B=1`, no default flip; W + 3 adjacent pairs, the two clean pairs -2.270 and -2.330 s = -11.0 and -11.2 percent; the default-of-record B plateau 20.723 / 20.728 s, B1 18.491 s a documented whole-run outlier) | 18.44 s = 871 tok/s with the switch on | 20.73 s = 775 tok/s, the default of record (switch off) | -2.30 s = -11.1 percent mean of the two clean pairs | RTX 5090 | 2026-09-14 | issue #10, `decode_out/srv-10c.log` |
 | decode through `serve`, before the hot-set tick | 23.13 to 25.57 tok/s against 33.06 to 34.50 tok/s for `decode run`, three adjacent pairs | n/a | n/a | RTX 5090 | 2026-09-11 | issue #37 |
 | decode through `serve`, with the hot-set tick | 26.43 to 26.77 tok/s against 32.82 to 32.98 tok/s for `decode run`, three adjacent pairs | n/a | n/a | RTX 5090 | 2026-09-11 | issue #37 |
@@ -195,7 +220,8 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 | oracle transport | the harness sets `PYTHONIOENCODING=utf-8` and `PYTHONUTF8=1` on the Python oracle process, not the shell, since 2026-09-11 (issue #34) | `parity phase 0 crow decode_out/c1-tasks/t4-prose.json <prefix>` in a shell without both variables |
 | record header | a `parity` record names the sampler that produced it: greedy says greedy, a sampled run carries the profile and the seed, since 2026-09-11 (issue #53) | `meta.operating_point` of the written record |
 | README numbers | no number without a date, a unit or an identifier | `python tools/check_readme_dates.py` |
-| CI, GitHub Actions | four jobs on windows-latest: build, test, clippy (non-blocking), doc guards; engine tests 72 of 80 lib and 55 of 57 serve, 10 tokenizer tests skipped for want of `../models/`, measured 2026-09-11 | `.github/workflows/ci.yml` |
+| CI, GitHub Actions | four jobs on ubuntu-latest: build, test, clippy (non-blocking), doc guards. The runner moved from windows-latest with the Linux port on 2026-09-17; the counts of record are still the local Windows proof of 2026-09-11 (engine tests 72 of 80 lib and 55 of 57 serve, 10 tokenizer tests skipped for want of `../models/`), because no run of this workflow is recorded in this repository yet | `.github/workflows/ci.yml` |
+| Linux parity gate | the three parity forms, `decode run 32`, tests, clippy and both doc guards against the Linux values of record; GREEN or RED per item, non-zero exit on any RED; all green at commit 0cf1de5 on 2026-09-17 | `tools/gate-linux.sh` |
 
 ## License
 
@@ -212,9 +238,9 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 |---|---|
 | version | v0.1.0, tagged 2026-09-11 on `592d05d` (`git ls-remote --tags origin`); the perf stage after the tag (issue #1, 2026-09-11) is unreleased work on `release-v0.1` |
 | history | one branch `release-v0.1`, pushed to `origin` (`github.com/nibor1896/crow-nest`, private) with tag `v0.1.0` = `592d05d`, 2026-09-11 |
-| scope | one model, one GPU, one client, Windows |
+| scope | one model, one GPU, one client; Linux and Windows |
 | open, throughput | prefill gap to the target, issue #10 |
 | `serve` rate | within 5 % of the adjacent `decode run` since 2026-09-11, three pairs, issue #37 |
 | open, measurement discipline | run-position drift of a `serve` rate, issue #38 |
-| open, platform | Linux environment unverified, issue #15 |
+| platform, issue #15 | the port, the host-memory fix and the Linux values of record landed 2026-09-17; what is still owed is one reference ten-task run on the pre-refactor build after a reboot (`decode_out/final/GATES.md` section 6) |
 | open, logging | engine logging stage not started, issue #13 |

@@ -1,8 +1,9 @@
 # crow-nest architecture diagrams
 
-Living renderings of the approved spec (`architecture.md`, sections 1 to 7). A diagram
+Living renderings of the approved spec (`architecture.md`, sections 1 to 8). A diagram
 contradicting the spec is a bug in the diagram. Owner: issue #14. Updated with every
-stage acceptance. Current as of 2026-09-12, commit 885bb27 (the #61b docs commit).
+stage acceptance. Diagrams 1 to 6 are current as of 2026-09-12, commit 885bb27 (the #61b
+docs commit); diagram 7 as of 2026-09-17, commit 0cf1de5 (the refactor branch).
 
 ## 1 · System overview, from originals to served tokens
 
@@ -143,9 +144,29 @@ flowchart LR
 Status: unchanged since the first cut of 2026-09-02 (#2); no converter stage has landed
 since, verified 2026-09-12.
 
+## 7 · Module dependency graph of the engine crate (2026-09-17)
+
+```mermaid
+graph LR
+  subgraph L0[leaves]; cuda[cuda.rs]; cnq[cnq.rs]; geo[geo.rs]; tokenizer[tokenizer.rs]; toolcall[toolcall.rs]; end
+  subgraph L1[on the leaves]; kernels[kernels.rs: kernel table + launch_v + kprof]; manager[manager.rs]; sample[sample.rs]; weights[weights.rs: tensor loaders + Fp4]; boot[boot.rs]; end
+  residency[residency.rs]; vit[vit.rs]; gen[gen.rs]; cache[cache.rs]; reset[reset.rs]; slot[slot.rs]
+  kernels --> cuda; manager --> cuda & geo; sample --> geo; weights --> cnq & cuda; boot --> cnq & cuda & geo
+  residency --> cnq & cuda & geo & kernels & manager; vit --> cnq & cuda & geo & kernels & weights
+  gen --> cnq & cuda & geo & kernels & manager & residency & sample & vit & weights
+  cache --> cuda & gen & geo; reset --> cuda & gen & geo; slot --> cache & cuda & gen & geo
+```
+
+Status: the `use crate::` edges of `engine/src` at commit 0cf1de5, 2026-09-17, regenerated from
+the tree; acyclic since bb9d2ca broke `gen <-> residency` and `gen <-> vit`. Not drawn: the
+feature-gated `cutile_pilot.rs` (`cuda`, `kernels`; nothing calls it), and the one edge no import
+graph shows — `impl Drop for Engine` in `gen.rs` calls `Engine::drop_decode_graph`, an inherent
+method defined in `reset.rs`. Module by module: `architecture.md` section 8.
+
 ## Changelog
 
 - 2026-09-02: first cut — rendered from approved spec sections 1–6 + decisions (#2). Stage-1 converter reflects the implemented converter; runtime boxes are the spec's design, not yet code.
 - 2026-09-02 (later): cold path amended to zero-copy direct read (spec 3.4 amended after the #8 pre-study) — ring/stager moved off the decode critical path to control plane.
 - 2026-09-05: decode path redrawn after #11 — the PLE step now sits at the top of layer 1 (it ran before layer 0 in `decode_step` until 2026-09-05 07:00, which is what degenerated the answers); sampler and EOS stop (#20) added as the opt-in tail; PLE cache default 128 MB (#16). Section 3 stays the 2026-09-02 estimate with the PLE slice corrected; the measured load line on 2026-09-05 read "VRAM used 31.21 GiB (dense 7.02 GiB + hot experts 160 × 48 × 2.64 MB + states)".
 - 2026-09-12: post #61b pass. Decode path redrawn for the three default flips: the staging kernel `stage_cold_ca` (#19e, engine commit e256004), the deferred trickle (#63c, engine commit 095a1c8) and the parallel QSA selection `qsa_select_par` with the `CROW_QSA_PAR=0` fallback plus the `CROW_ATTN_SPLITS` measurement knob (61a and 61b, engine commit 9696b13). The resident-or-cold decision at the GEMMs is gone: the staging kernel hands the GEMMs VRAM pointers in every case, so zero-copy direct read survives only behind `CROW_STAGE=0`. New section 4, the residency picture (hot set VRAM, pinned cold tier, zero-copy read), and new section 5, the serve picture (endpoints, prefix cache A9, slot save and restore A10). The system overview server box now names the endpoints. Pie and converter unchanged; every diagram carries a status line.
+- 2026-09-17: new section 7, the module dependency graph of the engine crate, after the three refactor cuts of branch `linux-refactor` (74c79f2, bb9d2ca, 7ddd296). It is the first diagram in this file that renders the CODE rather than the spec, and it is generated from the `use crate::` edges, so a module move that is not reflected here is a stale diagram. Both module cycles the pre-refactor tree carried (`gen <-> residency`, `gen <-> vit`) are gone: `launch_v`/`launch_sync` moved into `kernels.rs` and the tensor loaders plus `Fp4` into the new `weights.rs`, and `boot.rs` (the shared container/context/config front door) joined the second layer. Diagrams 1 to 6 were re-read against the tree on 2026-09-17 and none of them contradicts it: the decode path, the residency picture, the serve picture and the converter pipeline are unchanged by a refactor that moved no launch, no kernel and no byte of `KERNEL_SRC`.

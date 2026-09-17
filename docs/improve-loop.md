@@ -59,3 +59,27 @@ docs/sota-research-2026-09-03.md, mit Quellen dort)
 4. MMA-Headroom (ld.128, 8 Warps, Experten-Gruppierung im Prefill) — Queue
 5. Sparse-Prefill (t7-Pfad: Indexer + Selektion über 13k Kontext) — Queue
 6. Sidecar-Re-Warm-up mit echtem Crow-Traffic + async n-gram-Prefetch (R6) — Queue
+
+## Der Linux-Gate (Ergänzung 2026-09-17, issue #15)
+
+The loop above is the performance loop and is unchanged. What changed on 2026-09-17 is where
+step 2 (**Review — Gates grün?**) gets its answer on Linux: `tools/gate-linux.sh [outdir]`,
+from the repository root, runs the parity forms 8 / 512 / P8 teacher-forced, the short
+generated-id run, `cargo test --release`, clippy and the two doc guards against the Linux
+values of record, prints GREEN or RED per item and exits non-zero on any RED.
+
+- Scope: it is an identity gate, not a performance gate. It answers "do the bytes still match",
+  which is the precondition of step 2; it measures no tok/s and replaces no `perf_loop.sh` run.
+- The values the script checks are `bceba6ff7724…` (8 rows, identical to the Windows reference),
+  `8387234709271515…` (512 rows) and `3bb3e69edf90…` (P8 teacher-forced), plus the 32 ids of
+  record. They are hard-coded with their provenance; a value there moves only when a new
+  reference run establishes a new record, and the commit that moves it says so. R8 applies
+  unchanged: RED = eine Stufe zurück.
+- The 1024-row form is a Linux value of record too (`117dd8d9d8dc…`, established 2026-09-17) but
+  is NOT in the script: it costs a full long-prompt run. Run it by hand before a change that
+  touches the chunk regimes (`docs/architecture.md` 8.7).
+- The Linux and Windows values differ on the 512-row and 1024-row forms because the NVRTC and
+  driver JIT differ — measured, documented, and not a lever (`docs/architecture.md` 8.7).
+- Machine and method for every Linux number: the second environment block of
+  `docs/system-landscape.md`, one engine at a time, inside the memory-bounded scope of
+  `tools/serve-linux.sh` (the RAM gate refuses a second engine while the first holds the tier).

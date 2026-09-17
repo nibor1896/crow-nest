@@ -1550,3 +1550,357 @@ C:/x/y.md
 - The visual embeddings splice into the text stream at the expanded `<|image_pad|>` rows (host-side, pre-upload), and the rope kernels read a per-request INTERLEAVED-mrope cos/sin span table (section [11, 11, 10], partial rotary 0.25, theta 1e7 — the `get_rope_index` positions) instead of the load-time table while an image conversation is live. All physical indexing (KV rows, QSA rings, pooled blocks) stays sequential; only the table content changes.
 - Measured (RTX 5090, 2026-09-14, `decode_out/srv-vit.log`): ViT embeddings vs the f32 container-dequant oracle max_abs 3.43e-06 at cos 1.000000; text parity with the tower loaded AND with `CROW_VIT=0` byte-identical to `d211ab52ad2b` at the 61b sha256 values of record including the PX teacher-forced 16,064-row form `f217e1c55926` under the > 26 GiB VRAM headroom gate (23 of 23 subchecks); ten tasks 10 of 10 identical to final4; image-prompt pairs (text-only 26-token prompt vs the 224-token image prompt, fresh process per run): text prefill 406.1 ms vs 1,626.2 ms, pair delta mean +1,220.1 ms, plus the vision window of 35.3 s per request (`[vit-chat]`) — the tower GEMVs run the text-style per-token shape and are the known optimization lever.
 - The oracle chain lives in `oracle/` (`cnq_weights.py`, `ref_vit_golden.py`, `ref_vit_stages.py`, `ref_image_prompt_logits.py`): f32 references over the SAME container-dequantized weights (orchestrator ruling 2026-09-14 — the band is math precision only). The llama.cpp mmproj comparison was deferred to the B-series (orchestrator ruling).
+
+## Section 8 — the code map (2026-09-17)
+
+Sections 0 to 7 say what the engine must do. This section says how the crate is put together,
+so a reader who opens `engine/src` knows which file to open and what it may reach for. It was
+read from the tree at `0cf1de5` on branch `linux-refactor`, after the three refactor cuts
+(`74c79f2`, `bb9d2ca`, `7ddd296`); the graph below was regenerated from the `use crate::`
+edges of the current tree, not copied from an earlier note.
+
+Nothing in this section is a proposal. Where a number appears it carries its date, its machine
+and its artefact, like every other number in this document.
+
+### 8.1 The module graph
+
+```mermaid
+graph LR
+  subgraph L0[leaves]; cuda[cuda.rs]; cnq[cnq.rs]; geo[geo.rs]; tokenizer[tokenizer.rs]; toolcall[toolcall.rs]; end
+  subgraph L1[on the leaves]; kernels[kernels.rs: kernel table + launch_v + kprof]; manager[manager.rs]; sample[sample.rs]; weights[weights.rs: tensor loaders + Fp4]; boot[boot.rs]; end
+  residency[residency.rs]; vit[vit.rs]; gen[gen.rs]; cache[cache.rs]; reset[reset.rs]; slot[slot.rs]
+  kernels --> cuda; manager --> cuda & geo; sample --> geo; weights --> cnq & cuda; boot --> cnq & cuda & geo
+  residency --> cnq & cuda & geo & kernels & manager; vit --> cnq & cuda & geo & kernels & weights
+  gen --> cnq & cuda & geo & kernels & manager & residency & sample & vit & weights
+  cache --> cuda & gen & geo; reset --> cuda & gen & geo; slot --> cache & cuda & gen & geo
+```
+
+- The graph is acyclic. It was not before `bb9d2ca`: `gen <-> residency` and `gen <-> vit` were
+  two-way, because `residency` and `vit` reached back into `gen` for `launch_v` and for the
+  NVFP4 loaders. `launch_v`/`launch_sync` moved to `kernels.rs` beside the kernel table, the
+  loaders and `Fp4` into the new `weights.rs`; both back edges are gone and no re-export was
+  left behind.
+- `tokenizer.rs` and `toolcall.rs` have no in-crate dependency at all and no in-crate
+  dependent: they are used by `bin/serve` only.
+- The feature-gated `cutile_pilot.rs` (`--features cutile-pilot`, default off) depends on
+  `cuda` and `kernels` and is drawn nowhere, because nothing in the engine calls it
+  (`docs/cuda-rust-evaluation.md`).
+- **The one edge a use-graph cannot show**: `impl Drop for Engine` lives in `gen.rs` and calls
+  `Engine::drop_decode_graph`, which is defined in `reset.rs` as an inherent method on a
+  foreign type of that module. The call needs no `use`, so `gen` appears not to depend on
+  `reset` while the teardown order of every engine in the process runs through it. `reset.rs`
+  is the only foreign `impl Engine` in the crate; `cache.rs` and `slot.rs` call `Engine`
+  methods and touch its `pub(crate)` fields, but define none.
+
+### 8.2 The modules
+
+**`cuda.rs`** — the CUDA driver-API facade for the whole crate: `Ctx::init`, NVRTC `compile`
+and module load, device alloc/copy/free, the active-stream register, the CUDA-Graphs entry
+points loaded by hand out of `nvcuda.dll` / `libcuda.so.1` (cudarc 0.19.9 binds them for CUDA
+11.4–11.8 only), pinned host memory (`Pinned`), and the host-RAM reading the pinned budget is
+derived from (`free_physical_ram_parts` → `HostRam`, `other_cuda_fd`). Surface: 60 `pub fn`
+plus `Ctx`, `Module`, `Pinned`, `HostRam`. Depends on nothing in the crate and may never
+depend on anything: it is the bottom. Every `#[cfg(windows)]` / `#[cfg(unix)]` split in the
+crate lives here except three: `cnq.rs`'s container mapping, `gen.rs`'s `pid_alive`, and the
+oracle python path in `bin/parity.rs`.
+
+**`cnq.rs`** — the CNQ container reader: magic, trailer index, the whole-file read-only
+mapping, `read_bytes` / `read_range` behind which every weight read in the engine happens, the
+FP4/FP8 host twins (`e2m1`, `ue4m3`, `dequant_block`), the scale search the two low-bit tier
+builders share (`bin/coldtier`, `bin/hybrid`), and the Linux page-cache discipline (`fadvise_consumed`,
+`fadvise_flush`). Surface: 19 `pub fn` plus `Cnq`, `TensorInfo`. Depends on nothing in the
+crate. It may not learn about geometry: what a tensor MEANS is `geo`'s and `gen`'s business.
+
+**`geo.rs`** — the model geometry and the runtime `Config`: the probe-pinned constants and
+their derivation chain, `KvDtype`, `Adapt` with `knobs()`, the two policy functions
+(`apply_chunk_policy`, `apply_adapt_policy`) and `env_parse::<T>`. Surface: 10 `pub fn`, 3
+types, 50 `pub const`. Depends on nothing. It is the one place a number that two modules must
+agree on is allowed to live (8.6).
+
+**`tokenizer.rs`** — the in-engine HF tokenizer and the minijinja chat template, producing ids
+identical to `tools/tokenize_ids.py --chat`; process-wide `OnceLock` instance. Surface: 12
+`pub fn` plus `ChatTokenizer`. Leaf, used by `bin/serve` only.
+
+**`toolcall.rs`** — the streaming `<tool_call>` parser extracted from `serve.rs` (#29 A7) so it
+is unit-tested in the library. Surface: 7 `pub fn` plus `ToolStream`, `Emit`. Leaf, used by
+`bin/serve` only.
+
+**`kernels.rs`** — `KERNEL_SRC`, the frozen CUDA source (lines 15 to 4479 of the file; the
+Rust host shell around it is the remaining ~180), the kernel table (`Kernels::new`, `f`), the
+two launch shims every kernel goes through (`launch_v`, `launch_sync`), the per-kernel profile
+(`kprof_init`, `kprof_add`, `kprof_report`, `CROW_KPROF`), and `define_u32`, which parses a
+`#define` out of the frozen source so the Rust twin can be asserted against it. Depends on
+`cuda` only. It may not depend on `gen`: that was the cycle `bb9d2ca` broke. `KERNEL_SRC` is
+byte-frozen — a refactor may not touch one character of it.
+
+**`manager.rs`** — the three-state memory manager: `StateSizes::plan` derives every state byte
+count from `geo` and the context, `ThreeStates::allocate` is the planner with the two-sided
+clamp loop (VRAM lowers N, the host pinned budget raises it), `derive_host_pinned_budget` and
+`ram_margin_bytes` are the host-memory half of that loop (8.8), and `kv_row_ptr` is the KV
+addressing. Surface: 6 `pub fn` plus `StateSizes`, `ThreeStates`, `AllocReport`, the consts
+`SAFETY` and `N_MIN`. Depends on `cuda` and `geo`; it may not know about the container or the
+kernels.
+
+**`sample.rs`** — the host-side sampling reference and the sampler profile: `Rng` (the xorshift
+whose state the device sampler continues), `Sampler::from_env` / `describe` / `sample`,
+`argmax`, `EOS_IDS` and `stop_on_eos`. Surface: 14 `pub fn` plus `Rng`, `Sampler`. Depends on
+`geo` (for `PLE_EOS`, 8.6) and nothing else.
+
+**`weights.rs`** — the container tensor → device loaders and the NVFP4 pair: `Fp4`,
+`load_bf16_twin`, `load_f32`, `load_fp4`, `dequant_fp4_dev`, `load_small_f32`. 64 lines, five
+`pub fn`. Depends on `cnq` and `cuda`. It holds no launch policy on purpose — `PW` and the
+policy-carrying loaders stayed in `gen`, so this module can be what `gen` and `vit` both use
+without either reaching into the other.
+
+**`boot.rs`** — one front door for the bins that load an engine: `open_model(cnq_default,
+sidecar_default)` reads `CROW_CNQ` / `CROW_HOTSETS`, opens the container, creates the CUDA
+primary context and returns the starting `Config` at `CONTEXT_FLOOR`. 28 lines, one `pub unsafe
+fn`. Depends on `cnq`, `cuda`, `geo`. The returned tuple order IS the drop order — the order
+`decode`, `parity` and `serve` each wrote by hand before `7ddd296`.
+
+**`residency.rs`** — the #8 residency scheduler: `Residency::build` picks the hot set, checks
+free physical RAM, allocates the hot expert slabs in VRAM and the pinned cold tier, streams
+every expert tensor into them in ONE ascending sweep (8.8), and builds the slot tables; at run
+time it serves the swaps (`plan_swaps`, `swap_in`, `swap_in_bundled`) and the three-phase
+stream trickle (`swap_stream_a` / `swap_commit_a` / `swap_stream_b` / `swap_commit_b`).
+Surface: 17 `pub fn` plus `Residency`, `PendingSwap`, `LowBit`, `ExpertSlabs`. Depends on
+`cnq`, `cuda`, `geo`, `kernels`, `manager`. It may not depend on `gen` any more.
+
+**`vit.rs`** — the #VIT visual tower: `VitW::load` / `Vit::new` (27 blocks from the container's
+`vit` section), the lazy cap-sized scratch, `Vit::run`, image decode and the hand-rolled HF
+preprocessing (`decode_rgb`, `prep_image`, smart_resize), `expand_ids`, `mrope_positions`,
+`mrope_tables`, the bounded image-embedding LRU and `build_plan` → `VisionPlan`. Surface: 13
+`pub fn` plus `VitW`, `Vit`, `VitBlockW`, `ImagePrep`, `VisionPlan`, `Grid`, 15 `pub const`.
+Depends on `cnq`, `cuda`, `geo`, `kernels`, `weights`. It may not depend on `gen`: `gen` calls
+IT, through `Engine::build_vision_plan` and `begin_vision`.
+
+**`gen.rs`** — the engine proper, and still the largest module (4,182 lines at `0cf1de5`): the
+weight structs, the device scalar block (`Params`) and scratch, `Engine` itself (8.3), the boot
+(`Engine::load`), every layer primitive (`hc_run`, `gdn_prompt` / `gdn_step`, `attn_prompt` /
+`attn_step`, `moe_run`, `ple_run`, `head_run`, `lm_head_row`), the two hot paths `prefill` and
+`decode_step`, the device sampler, the hot-set adaptation and the stream trickle, the engine
+file lock, and five `Drop` impls. Depends on everything below it: `cnq`, `cuda`, `geo`,
+`kernels`, `manager`, `residency`, `sample`, `vit`, `weights`. Nothing in L0/L1 may depend on
+it.
+
+**`cache.rs`** — the #31 A9 prefix cache: the ids-only prefix rule (`common_prefix_len`,
+`reuse_slot`, `decide`), the snapshot shape, and the two state transfers `snapshot` (DtoH) and
+`rollback` (HtoD), over `SLOTS = 3` snapshots since #36. Surface: 18 `pub fn` plus
+`PrefixCache`, `Decision`, `Shape`. Depends on `cuda`, `gen`, `geo`.
+
+**`reset.rs`** — the teardown and the zero state, as two inherent `Engine` methods:
+`drop_decode_graph` (destroys the captured graph and the capture stream, makes the legacy
+stream active) and `reset_to_zero` (zeroes the GDN conv and S states and the PLE conv state,
+`pos = 0`, history cleared). 134 lines. Depends on `cuda`, `gen`, `geo`. See the caveat in 8.1.
+
+**`slot.rs`** — the #32 A10 slot file behind `POST /slots/0?action=save|restore`: the header,
+the shape and content compatibility checks, `kv_row_order` (the one iterator both `save` and
+`restore` walk) and the two operations. Surface: 13 `pub fn` plus `Header`, `Saved`,
+`Restored`. Depends on `cache`, `cuda`, `gen`, `geo`. Top of the graph; nothing depends on it
+but `bin/serve`.
+
+### 8.3 The `Engine` API surface (`7ddd296`)
+
+Before `7ddd296`, `Engine` had 43 `pub` fields and no private ones, so there was no statement
+anywhere about what was API. It now has 42 fields, in three groups, and the bins are separate
+crates, which makes `pub(crate)` a hard wall rather than a hint:
+
+| group | count | what |
+|---|---|---|
+| `pub` | 1 | `cfg` — the operating point. The honest API: `serve` reads `cfg.prompt_chunk` and `cfg.adapt`, `decode` and `parity` set the chunk before the load |
+| `pub(crate)` | 8 | `st`, `ple`, `pos`, `history`, `done_blocks`, `graph_exec`, `cap_stream`, `route_log` — reached by `cache.rs`, `slot.rs` and `reset.rs`, by no bin |
+| private | 33 | everything else, including the one field that was dead (`cnq: *mut Cnq`, null at construction and never read; `pub` had hidden the lint) |
+
+Fifteen named methods carry what the bins used to take from the fields:
+
+```
+residency()   weights()   logits()   ple()   pos()   history()   route_log()
+n_ctx()       qsa_ring_rows()
+has_vision()  vision_plan()  build_vision_plan()
+arm_sampler() park_sampler() unpark_sampler()
+```
+
+The rest of `Engine`'s public API is the work itself: `load`, `prefill`, `decode_step`,
+`enable_dev_sampler`, `sample_last`, `adapt_after_prefill`, `adapt_hot_set`, `adapt_tick`,
+`window_counts`, `trickle_tick`, `trickle_drain_after_launch`, `trickle_drain`,
+`drain_counters`, `drain_sel_counts`, `begin_vision` / `end_vision`, `cos_tbl` / `sin_tbl`, the
+two debug entries `run_layer0_with_stage_dumps` and `run_attn_subblock`, and, from `reset.rs`,
+`drop_decode_graph` and `reset_to_zero`.
+
+### 8.4 The boot path
+
+`serve`, `decode` and `parity` boot the same way; `serve` is written out here. Function names,
+not line numbers — the files move.
+
+1. `main` (`bin/serve.rs`): the `tokenize` subcommand short-circuits before CUDA and before the
+   lock (`tokenize_main`), then `parse_args` and `check_slot_save_path` (one `stat`, so a bad
+   `--slot-save-path` fails now and not at the first save).
+2. `tokenizer::default_paths` → `tokenizer::global` (`OnceLock`, `ChatTokenizer::load`) — the
+   tokenizer and chat template load BEFORE any CUDA call.
+3. `CROW_GRAPH`, `CROW_MMA`, `CROW_ADAPT_WINDOW` forced to `1` if unset, single-threaded,
+   before the context exists; one `[serve]` line each.
+4. `boot::open_model(DEFAULT_CNQ, DEFAULT_HOTSETS)` → `Cnq::open` (trailer index, whole-file
+   mapping), `cuda::Ctx::init`, `Config` at `CONTEXT_FLOOR`. The binding order is the drop
+   order.
+5. `cfg.prompt_chunk = SERVE_CHUNK` (= `geo::TRICKLE_CHUNK_THRESHOLD`), `geo::apply_adapt_policy`
+   (the `[policy]` line).
+6. `Engine::load`, in this order:
+   1. `engine_lock_acquire` — `engine/.engine.lock`, `pid_alive` via `/proc/<pid>` on unix and
+      `tasklist` on Windows; a second engine on the machine dies here.
+   2. `manager::derive_host_pinned_budget` — the `[budget]` line, before anything is pinned (8.8).
+   3. embeddings and `lm_head`, then the 48 dense layer bundles through `weights::load_f32` /
+      `load_fp4` / `load_bf16_twin` / `dequant_fp4_dev` / `load_small_f32` and `gen`'s own
+      `load_pw` (it carries a launch policy, so it stayed).
+   4. `Ple::load` (`CROW_PLE_CACHE_MB` or `cfg.ple_cache_bytes`).
+   5. `vit::vit_on` → `vit::Vit::new`, the `[vit]` line; weights resident, scratch lazy.
+   6. `residency::expert_slab_info`, then `Scratch::alloc(cfg.prompt_chunk)` — scratch must be
+      resident before the planner measures free VRAM.
+   7. the `[stage]` / `[trickle]` / `[qsa]` / `[attn]` / `[gdn]` / `[hc]` provenance lines and
+      the `Stage` device allocations.
+   8. `ThreeStates::allocate` — the two-sided clamp loop, then KV, QSA, GDN and rope allocation.
+   9. `Residency::build` — hot set, the RAM gate, the VRAM hot slabs, the pinned cold tier, one
+      ascending sweep per expert tensor, the slot tables.
+   10. the prefetch ring and its non-blocking stream.
+   11. `kernels::kprof_init`, `cuda::compile(KERNEL_SRC)` (NVRTC, `--gpu-architecture=compute_120a`),
+       `Kernels::new`, `assert_kernel_defines` (8.6), `Params::setup`.
+7. `PrefixCache::new` — the three snapshot slots, the `[serve] prefix cache` line.
+8. `TcpListener::bind("127.0.0.1:<port>")`, then `serve_one` per connection, blocking, one
+   request at a time.
+
+There is no warm-up forward pass. The hot-set warm-up is offline (`decode warmup`), and `serve`
+only loads the sidecar it wrote.
+
+### 8.5 The request path
+
+1. `serve_one` → `read_head` → `parse_request_line` → `route_path` → `route`; `Route::Chat` →
+   `chat_route`.
+2. `parse_chat` (messages, tools, sampling parameters, `image_url` blocks) → `normalize_messages`
+   → `tk.encode_chat` (minijinja render + HF encode).
+3. Image branch when the request carries images and the tower is loaded:
+   `Engine::build_vision_plan` (hash lookup in the bounded LRU, else `prep_image` → `Vit::run`),
+   then `Engine::begin_vision`, which builds the interleaved-mrope tables for the request.
+4. `clamped_max_tokens`, then `chat_stream` (SSE) or `chat_document` (one JSON document) —
+   both call the same `chat_generate`.
+5. `chat_generate`: `Engine::end_vision` when the request has no images;
+   `PrefixCache::decide(eng.history(), &prompt)` — the ids-only prefix rule; WARM →
+   `PrefixCache::rollback` (which calls `drop_decode_graph`), COLD → `Engine::reset_to_zero` +
+   `PrefixCache::invalidate`; the `[cache] WARM/COLD` line.
+6. `Engine::prefill(cnq, &prompt[cached_n..], collect)` — the chunk loop, the PLE row prefetch on
+   a helper thread, the per-chunk scalar upload (`upload_chunk_scalars`), the embedding rows plus
+   the visual splice, the cold-tier prefetch, then per layer `ple_run` at `PLE_LAYER`, `hc_run`,
+   `gdn_prompt` / `attn_prompt`, `inject_residual`, `hc_run`, `moe_run`, `inject_residual`, and
+   finally `head_run` / `lm_head_row` / `argmax_k` for the first id.
+7. `PrefixCache::snapshot(eng, true)` — DtoH of the recurrent blocks into slot 0.
+8. The sampler prologue: `Engine::unpark_sampler` + `Engine::arm_sampler(s)` for a sampled
+   request, `Engine::park_sampler` for a greedy one.
+9. `ToolStream::new(req.tools)`, `sink.open(&cx)` — SSE head and role chunk.
+10. The decode loop, per token: EOS check against `sample::EOS_IDS`, `ts.arm` when the id is the
+    tool-open token, `tk.decode` of the whole output, `next_delta` → `ts.feed` → `send_emits`,
+    `Engine::trickle_tick` when the trickle is armed, then `Engine::decode_step` — one CUDA graph
+    replay, the scalar refresh from pinned staging, and one blocking D2H for the id.
+11. `Engine::trickle_drain` after the loop, the tail detokenize, `ts.finish`, the final chunk with
+    `usage` and `timings`, `[DONE]`.
+
+### 8.6 The sources of truth
+
+A number that two places must agree on is written once, and the second place derives it or is
+asserted against it.
+
+- **`geo.rs`** holds the geometry and the operating constants. `HOST_PINNED_CAP = 46 << 30` is
+  the CAP on the pinned cold tier, not the budget (8.8). `CHUNK_ROUND = 512` is the
+  `Config::default` chunk and the rounding step; `CHUNK_CAP = 4096` is the ceiling of the auto
+  policy; `TRICKLE_CHUNK_THRESHOLD = 2048` is the chunk at which the default adapt policy arms
+  the stream trickle AND the chunk `serve` pins — `bin/serve.rs::SERVE_CHUNK` derives from it,
+  which is the lesson of `42e2b67` written into the code. `MIB` / `GIB` replace 54 inline
+  divisors, `DEFAULT_CNQ` / `DEFAULT_HOTSETS` / `from_engine_dir` replace 12 path literals.
+- **The four kernel `#define`s** are read out of the frozen `KERNEL_SRC` by
+  `kernels::define_u32` and compared with their Rust twins by `gen::assert_kernel_defines()`,
+  once per `Engine::load`: `QSA_PAR_BINS`, `SAMPLE_MAXK`, `SAMPLE_PARTS`, `SAMPLE_THREADS`. The
+  sampler's `cand_v` / `cand_i` allocation and both sampler launches read the Rust twins, so a
+  divergence panics at load instead of producing wrong logits.
+- **The ViT chain** derives instead of repeating: `VIT_HEAD_DIM = VIT_HIDDEN / VIT_HEADS`,
+  `VIT_ROT = VIT_HEAD_DIM / 2`, `VIT_MERGED = 4 * VIT_HIDDEN`, `VIT_IN = 3 * VIT_TPATCH *
+  VIT_PATCH * VIT_PATCH`, `VIT_QKV = 3 * VIT_HIDDEN`. Eleven literals in `vit.rs` became
+  derivations of `VIT_IN` / `VIT_HIDDEN` / `VIT_INTER` / `VIT_MERGED` / `VIT_QKV` / `geo::H` in
+  `74c79f2`; no value changed.
+- **`sample::EOS_IDS`** is `[248046, geo::PLE_EOS as usize]`: the PLE shard reader's end marker
+  and the sampler's stop id are the same token, written once. `parity`'s own `EOS_STOP` copy is
+  gone.
+- **The engine's own geometry twins** in `geo.rs` — `GDN_KEY = GDN_KHEADS * GD`,
+  `PLE_NHEADS = PLE_CTX * PLE_HEADS_PER_NGRAM`, `QSA_SEL_MAX` — are derivations, not documented
+  literals, since `bb9d2ca`.
+
+### 8.7 The numeric contract on Linux
+
+The contract for every commit on this branch is byte-identical logits, and the values of record
+are per platform. All four were measured on the Linux box of `docs/system-landscape.md` (RTX
+5090, driver 610.57.04, CUDA 13.3.1, NVRTC 13.3.33, rustc 1.98.1, Arch Linux), inside the
+memory-bounded scope, one engine at a time.
+
+| form | value of record | established | note |
+|---|---|---|---|
+| parity 8 rows | `bceba6ff7724…`, 11,919,360 B | `9f12429`, 2026-09-17 | identical to the WINDOWS reference `decode_out/parity-62d-ref8` — the one form that survives the toolchain drift |
+| parity 512 rows | `8387234709271515…`, 512,532,480 B | `9f12429`, 2026-09-17 | a Linux value; the Windows bytes differ |
+| P8 teacher-forced | `3bb3e69edf90…`, 512,532,480 B | `9f12429`, 2026-09-17 | prefill 8 ids, the other 504 through `decode_step`: it puts the DECODE path under the contract |
+| parity 1024 rows | `117dd8d9d8dc…`, 1,021,091,840 B | 2026-09-17, on the `9f12429` build first | the Windows value is `b2e87b2bf99a…`; `decode_out/final/GATES.md` item 4 |
+
+- **Why 512 and 1024 differ between the platforms**: the NVRTC and driver JIT differ (Windows
+  NVRTC 13.3.73 + driver 616.56, Linux NVRTC 13.3.33 + driver 610.57). At `9f12429` the 512-row
+  form was bit-identical for rows 0–22 and drifted from row 23 with max |d| 7.0, while the ids
+  stayed identical in all 517 positions; the drift was deterministic across `CROW_MMAP=0`,
+  `CROW_PINNED_WC=0`, `CROW_PF_ASYNC=0` and `CROW_GRAPH=0`, which exonerates the port surface.
+  Over a 1024-token generation the same drift does flip near-ties (`GATES.md` section 3).
+- **The gate**: `tools/gate-linux.sh [outdir]` from the repo root runs the three parity forms,
+  `decode run 32`, `cargo test`, clippy and the two doc guards against the first three values
+  above, prints GREEN/RED per item and exits non-zero on any RED. The 1024-row form is not in
+  the script — it costs a full long-prompt run and is checked by hand. Every expected value is hard-coded with its
+  provenance in the script header. It is not a tuning knob: a value there is changed only when a
+  new reference run establishes a new record, and the commit that does it says so.
+- **The full battery** behind those values — eleven items, the ten-task gate, the throughput
+  readings and what could not be run — is `decode_out/final/GATES.md` (gitignored; the summary
+  is in `CHANGELOG.md`, 2026-09-17).
+
+### 8.8 The host-memory model as built
+
+Section 2.1 carries the budget rule and 7.7 the snapshot placement; this is the shape of the
+mechanism in one place, without repeating them.
+
+1. **The budget is derived, not assumed.** `manager::derive_host_pinned_budget(cap, log)` takes
+   `min(geo::HOST_PINNED_CAP, free_for_pin - CROW_RAM_MARGIN_GB)` and is called from
+   `Engine::load` before the planner, so every bin gets it. One `[budget]` boot line names the
+   value and its basis. `CROW_PINNED_BUDGET_GB` holds it fixed for a measurement.
+2. **`free_for_pin` is not `MemAvailable` on Linux.** `cuda::free_physical_ram_parts` returns
+   `HostRam { free_for_pin, mem_available, other_cuda }`, with
+   `free_for_pin = MemTotal - (AnonPages + Shmem + SUnreclaim + KernelStack + PageTables +
+   Percpu)` — what cannot be reclaimed, subtracted from the total. `Unevictable` and `Mlocked`
+   are deliberately not subtracted: they already sit inside `AnonPages` / `Shmem`. The reason is
+   the NVIDIA driver's pinned-page pool: after an engine exits, ~45 GiB stays in it, in no
+   `/proc/meminfo` class, invisible to `MemAvailable`, yet reclaimable and served straight back
+   to the next `cuMemHostAlloc`. Measured 2026-09-17 with the pool present: free for pinning
+   60.76 GiB against `MemAvailable` 10.89 GiB (the `0c9feb5` reading; section 2.1 quotes a
+   second reading of the same day, 60.78 against 12.44 GiB — the pool is stable across readings,
+   `MemAvailable` is not, which is the point).
+3. **The `/dev/nvidia-uvm` rule.** That pool is only ours to count while no other CUDA process
+   is alive. `cuda::other_cuda_fd` scans `/proc/<pid>/fd` (readable entries only) for
+   `/dev/nvidia-uvm*` held by another process — the node every CUDA context opens and no
+   graphics client does. `/dev/nvidia0` and `/dev/nvidiactl` are the WRONG test: measured
+   2026-09-17, the compositor, quickshell, Xwayland and GTK hold them permanently and own no
+   pinned pool, and testing for those refused the engine's own operating point. When a second
+   CUDA process is found the budget falls back to `MemAvailable` and the `[budget]` line says
+   so — measured with a second engine alive (`CROW_LOCK=0`): budget 6.18 GiB from
+   `MemAvailable` 9.18 GiB, a refusal instead of a second 45 GiB pin.
+4. **The load leaves no page-cache trail.** The cold tier and the hot slabs are filled by ONE
+   ascending sweep per expert tensor instead of two passes over disjoint id sets — same bytes
+   into the same destinations, but the tensor is read whole and in order — and
+   `Cnq::fadvise_consumed` drops the pages behind the cursor in 64 MiB batches for every section
+   but `ple` (`CROW_CNQ_PURGE=0` disables it). The order is what closed it: the naive per-range
+   `DONTNEED` only got the page cache from 33 to 17.8 GiB, because the readahead window sailed
+   over every skipped hot expert. Measured 2026-09-17 on the 8-row form: max `Cached`
+   33.04 → 5.14 GiB, min `MemFree` 1.15 → 7.70 GiB, load 44 → 25 s, bytes `bceba6ff7724` on
+   both arms.
+5. **The launcher's scope is where the rest is bounded.** `tools/serve-linux.sh` starts `serve`
+   in `systemd-run --user --scope --slice=session.slice` with `MemorySwapMax=0`,
+   `MemoryHigh=MemTotal-8G`, `MemoryMax=MemTotal-6G`, computed from `/proc/meminfo`. The scope
+   is a property of the launcher, not of the engine: the engine never raises its own limits, and
+   a run outside the scope is a run without that floor. `session.slice` is deliberate —
+   `systemd-oomd` watches `app.slice` on this machine.

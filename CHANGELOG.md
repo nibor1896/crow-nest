@@ -1,8 +1,95 @@
 # Changelog
 
-- Format: one section per version, subsections Added, Changed, Measured, Known limitations.
-- Every item names its issue number in `crow-nest`.
+- Format: one section per version, subsections Added, Changed, Fixed (since 2026-09-17), Measured, Known limitations.
+- Every item names its issue number in `crow-nest`, or the commit it landed in when the work had no issue.
 - Every number names its date; the machine is `docs/system-landscape.md` unless another one is named.
+
+## 2026-09-17 — v0.3.0: Linux, the host-memory fix, and the refactor
+
+- Branch `linux-refactor`, seven commits `9f12429` to `0cf1de5`, all on one day.
+- The machine is the second environment block of `docs/system-landscape.md` (RTX 5090, driver 610.57.04, Arch Linux 7.2.3-arch1-3, 62.17 GiB RAM, CUDA 13.3.1, NVRTC 13.3.33, rustc 1.98.1) unless a row names Windows. Every engine run is inside the memory-bounded scope, one engine at a time.
+- The crate version field stays `0.1.0`, as it did for v0.2.0 and v0.2.1: this file is the release record, `engine/Cargo.toml` has never been bumped.
+- The numeric contract held across all seven commits: `KERNEL_SRC` byte-identical, no launch geometry, k-order, reduce order or `CROW_*` semantics changed.
+
+### Added
+
+- `#15` the Linux port (`9f12429`): `cnq.rs` maps the container with `mmap(PROT_READ, MAP_SHARED)` on unix and keeps the Windows ordering in `Drop`; `posix_fadvise(DONTNEED)` replaces the `FILE_FLAG_NO_BUFFERING` purge and `POSIX_FADV_SEQUENTIAL` the sequential-scan hint; `cuda.rs` loads the graph API from `libcuda.so.1` instead of `nvcuda.dll`; `gen.rs` reads `/proc/<pid>` for `pid_alive`; `hybrid.rs` uses `FileExt::write_at`; `parity.rs` picks the oracle venv python per OS; `libc 0.2` is the one dependency the port added. The Windows path is byte-for-byte the old code under `#[cfg(windows)]`.
+- `tools/serve-linux.sh` (`0c9feb5`): the memory-bounded launcher — `systemd-run --user --scope --slice=session.slice`, `MemorySwapMax=0`, `MemoryHigh=MemTotal-8G`, `MemoryMax=MemTotal-6G` computed from `/proc/meminfo`, `CUDA_LIB` for `LD_LIBRARY_PATH`, every `CROW_*` and argument passed through. The same shape Crow uses for `llama-server` on Linux.
+- `tools/gate-linux.sh` (`0cf1de5`): the Linux parity gate in one script — parity 8 / 512 / P8 teacher-forced, `decode run` over 32 ids, `cargo test`, clippy and both doc guards, against the values of record, GREEN or RED per item, non-zero exit on any RED. Every expected value carries its provenance in the header.
+- `engine/src/boot.rs` (`7ddd296`): `open_model(cnq_default, sidecar_default)` — container, CUDA context and starting `Config` for `decode`, `parity` and `serve`. The returned order IS the drop order, which is what the three bins wrote by hand.
+- `engine/src/weights.rs` (`bb9d2ca`): `Fp4` and the six tensor loaders, so `gen` and `vit` share them without reaching into each other.
+- Fifteen named `Engine` methods for the bins (`7ddd296`): `residency`, `weights`, `logits`, `ple`, `pos`, `history`, `route_log`, `n_ctx`, `qsa_ring_rows`, `has_vision`, `vision_plan`, `build_vision_plan`, `arm_sampler`, `park_sampler`, `unpark_sampler`.
+- `gen::assert_kernel_defines()` with `kernels::define_u32` (`74c79f2`): `QSA_PAR_BINS`, `SAMPLE_MAXK`, `SAMPLE_PARTS`, `SAMPLE_THREADS` are parsed out of the frozen `KERNEL_SRC` and compared with their Rust twins once per `Engine::load`.
+- `docs/cuda-rust-evaluation.md` and `engine/src/cutile_pilot.rs` behind the default-off `cutile-pilot` feature (`0667e0b`), an evaluation artefact that nothing in the engine calls.
+- `docs/architecture.md` section 8 (the code map: module graph, module by module, the `Engine` API surface, the boot and request paths, the sources of truth, the numeric contract on Linux, the host-memory model), `docs/diagrams.md` diagram 7 (the module graph), the module map at the top of `engine/src/lib.rs`, and the Linux environment block in `docs/system-landscape.md`.
+- `docs/env.md` rows `CROW_PINNED_BUDGET_GB` and `CROW_VIT_CACHE_MB` (`0c9feb5`); the table is 80 rows against 80 names in the code.
+
+### Changed
+
+- **The pinned budget is derived, not assumed** (`0c9feb5`): `manager::derive_host_pinned_budget(cap, log) = min(46 GiB cap, free_for_pin - CROW_RAM_MARGIN_GB)`, applied in `Engine::load` before the planner, with one `[budget]` boot line naming the value and its basis. `geo::HOST_PINNED_CAP` is the CAP now, not the budget; a smaller host is an input to the two-sided planner loop, not a refusal.
+- **`free_for_pin` is not `MemAvailable` on Linux** (`0c9feb5`): `cuda::free_physical_ram_parts` returns `MemTotal - (AnonPages + Shmem + SUnreclaim + KernelStack + PageTables + Percpu)`, because the NVIDIA driver's pinned-page pool sits in no `/proc/meminfo` class after an exit yet is reclaimable and is served straight back to the next `cuMemHostAlloc`. Live reading with the pool present, 2026-09-17: free for pinning 60.76 GiB against `MemAvailable` 10.89 GiB.
+- **The two-engines safeguard** (`bb9d2ca`, follow-up to `0c9feb5`): `cuda::other_cuda_fd` scans `/proc/<pid>/fd` for another process holding `/dev/nvidia-uvm`; when it finds one the budget falls back to `MemAvailable` and the boot line says so. `/dev/nvidia0` and `/dev/nvidiactl` are the wrong test — measured 2026-09-17, Hyprland, quickshell, Xwayland and GTK hold them permanently and own no pinned pool, and testing for those refused the engine's own operating point. Measured alone: budget 46.00 GiB, free for pinning 60.69 GiB; with a second engine alive (`CROW_LOCK=0`): budget 6.18 GiB from `MemAvailable` 9.18 GiB — a refusal instead of a second 45 GiB pin.
+- **The load leaves no page-cache trail** (`0c9feb5`): the cold-tier fill and the hot-slab staging are ONE ascending sweep per expert tensor (same bytes, same destinations) and `Cnq::fadvise_consumed` drops the pages behind the cursor in 64 MiB batches for every section but `ple` (`CROW_CNQ_PURGE=0` disables it). The order is what closed it: the naive per-range `DONTNEED` only got the page cache from 33 to 17.8 GiB, because the readahead window sailed over every skipped hot expert.
+- **`slot::restore` streams** the payload through one reusable buffer instead of a 2.70 GiB `read_to_end`, with the length checked against the size on disk first; **`Vit::image_cache` is bounded** (LRU, `CROW_VIT_CACHE_MB`, default 256 MiB, previously unbounded); **`vit::prep_image` builds one channel plane at a time** (12 → 4 bytes per source pixel; patches and `cs` hashes identical on a 97x61 PNG). All `0c9feb5`.
+- **Refactor cut 1** (`74c79f2`), the risk-free duplication and the dependent constants: `cuda.rs` `vram_info` / `to_dev` / `dtoh_t` / `Pinned::alloc_flags` / `write_le<T>` for the ten hand-rolled LE dumps; `cnq.rs` `read_at` behind `read_bytes` / `read_range`, `mag_index`, `best_scale_and_codes`; `residency.rs` `fill_layer_table` and `cold_ptrs` at all six sites; `gen.rs` `mma_ks`, `with_nblk`, `decay_window`, the five `Drop` preambles; `vit.rs` `trace_dump` for the seven trace blocks; `sample.rs` `Rng::from_state` shared by the three probes. Constants: `SAMPLE_*` drive the sampler allocation and both launches, the eleven ViT literals derive from five roots, `geo::CHUNK_ROUND` / `CHUNK_CAP` / `TRICKLE_CHUNK_THRESHOLD` (with `bin/serve.rs::SERVE_CHUNK` deriving from the threshold, `42e2b67`'s lesson in the code), `sample::EOS_IDS` from `geo::PLE_EOS`, `geo::DEFAULT_CNQ` / `DEFAULT_HOTSETS` for twelve path literals, `geo::MIB` / `GIB` for 54 inline divisors. `engine/src` 24,707 → 24,641 lines, code 15,439 → 15,234 (−205), clippy 1494 → 1480; bytes identical.
+- **Refactor cut 2** (`bb9d2ca`), dead code out and both module cycles broken: `launch_v` + `launch_sync` and the per-kernel profile moved into `kernels.rs` beside the kernel table, the loaders and `Fp4` into the new `weights.rs`; `gen <-> residency` and `gen <-> vit` are gone and the crate is six clean layers, with no re-export left behind and no launch argument, grid, block, stream or order changed. Removed: `run_single_layer`, `LoadReport`, `manager::kv_row_offset`, `gen::gdn_reg_on`, `tokenizer::decode_with_specials`, `coldtier::e2m1_mag`, `bin/residency::totals`, `mma_probe`'s dead E2M1 table, `residency::SIDECAR_SUFFIX`, three dead `let _ =`, six written-never-read fields, and six kernel registrations never launched (`gemv_f32`, `dequant_fp4_flat`, `bf16_to_f32`, `acc_scale`, `gemv_fp4_mma_g`, `gemv_fp4_vit` — host table only; `KERNEL_SRC` byte-identical and the CUDA source stays). `engine/src` 24,641 → 24,595 (code −110 net of +135 new safeguard and test code), clippy 1480 → 1426, build warnings 16 → 1, `#[allow(dead_code)]` 2 → 1.
+- **Refactor cut 3** (`7ddd296`), the `Engine` API surface: 43 `pub` fields and no private ones became `cfg` `pub`, 8 `pub(crate)` (`st`, `ple`, `pos`, `history`, `done_blocks`, `graph_exec`, `cap_stream`, `route_log`) and 33 private, plus the fifteen methods above; one of the old `pub` fields was dead (`cnq: *mut Cnq`, null at construction, never read — `pub` had hidden the lint). The R3 band: the sixteen env reads inside the 48-layer loop are five `OnceLock`s, `env_flag!` collapses twelve four-line bodies, `geo::env_parse<T>` serves the eighteen number parses with every filter and clamp kept at the site, and `Engine::upload_chunk_scalars` parameterizes the three per-chunk scalar blocks without ever uploading a superset. Host code +7 net (96 removed, 103 added), clippy 1426 → 1422.
+- Docs: `docs/env.md` names `env_flag!` / `env_parse` instead of the deleted helpers, `CROW_DUMP_H` points at `gen::dump_h()`, the `CROW_CNQ` / `CROW_HOTSETS` read sites point at `boot::open_model`, and the stale `CROW_CHUNK` note that said `serve` pins 4096 is corrected (it pins 2048, and `SERVE_CHUNK` derives from `geo::TRICKLE_CHUNK_THRESHOLD`). `README.md` and `docs/system-landscape.md` carry the platform truth; `.github/workflows/ci.yml` runs its four jobs on ubuntu-latest.
+
+### Fixed
+
+- `#15` **the engine refused every second start on Linux**: the `MemAvailable`-based RAM gate could not see the driver's pinned-page pool, so a second boot read ~9 GiB free against a 43.51 GiB tier. With the derived budget, HEAD booted eight times in a row in that state, including two back-to-back boots whose second ran at `MemAvailable` 9.30 GiB (`0c9feb5`, `bb9d2ca`; gate battery item 11).
+- `#15` **the Windows boot of 2026-09-14 died in the same gate** ("refusing to pin 44.62 GiB with only 46.47 GiB physical RAM free", `decode_out/hotfix-serve.log`). That gate is now the backstop behind a budget that is derived from the host it runs on.
+- Three Windows runtime dependencies that compiled on Linux and then misbehaved silently (`9f12429`): `nvcuda.dll` for the graph API (`serve` forces `CROW_GRAPH=1` and panicked), `kernel32.dll` `GlobalMemoryStatusEx` returning 0 (which silently disabled the pinned-RAM guard), and `tasklist` returning `Err` → `true` (a stale `.engine.lock` panicked every start).
+- `engine/src/cuda.rs` is LF with `\0` escapes instead of CRLF with eight raw NUL bytes (`9f12429`): plain `grep` treated it as binary and skipped it, which hid it from every refactor sweep.
+- The boot line under-reported ViT scratch by 68 MiB: the hand-computed 41,024 bytes per patch is replaced by the allocator's own count of 58,496 B over the twelve allocations (`74c79f2`).
+- One blocking D2H per decode token instead of two: the redundant `_prof_tok` `dtoh_i32` is gone, ids and logits proven unchanged (`bb9d2ca`).
+- `ThreeStates::allocate` plans the state sizes once instead of on every clamp iteration — same value, about 1,000 fewer `getenv` calls per boot (`bb9d2ca`).
+
+### Measured
+
+The final battery ran 2026-09-17, 12:11–12:52 local, HEAD `0667e0b` against the reference build `9f12429` (the last commit before the fix and the three cuts), full record in `decode_out/final/GATES.md`.
+
+| gate | expected | got | verdict |
+|---|---|---|---|
+| parity 8 rows | `bceba6ff7724…`, 11,919,360 B | identical | GREEN |
+| parity 512 rows | `8387234709271515…`, 512,532,480 B | identical | GREEN |
+| P8 teacher-forced | `3bb3e69edf90…`, 512,532,480 B | identical | GREEN |
+| parity 1024 rows | no Linux value existed | reference first: `117dd8d9d8dc…`, 1,021,091,840 B, then HEAD byte-identical twice | GREEN, new Linux value of record |
+| cross form `CROW_CHUNK=2048` on the 512 form | the 512 value | identical | GREEN |
+| `decode run` over 32 ids | the 32 ids of record | 32 of 32 | GREEN |
+| ten-task gate at ids level against the `final4` WINDOWS record | — | 1 of 10 byte-identical, 9 flip on a near-tie | see the note below |
+| serve smoke | the responses of record, slot `2b7d129afdc4…` | identical modulo id, created and timings; slot 131,820,320 B | GREEN |
+| throughput | no regression | GREEN on HEAD, the reference arm partly blocked | GREEN / open |
+| tests, clippy, doc guards | 144 / 1422 / exit 0 | 144 passed 0 failed, 1422, `code 80, doc 80`, 0 offenders | GREEN |
+| two back-to-back boots, no reclaim | both boot and match | both `bceba6ff7724…`, the second at `MemAvailable` 9.30 GiB | GREEN |
+
+Ten of the eleven items are green. The ten-task item is the toolchain, not the refactor, and the evidence is quantitative: HEAD's logits are bit-identical to the `9f12429` reference on every form both builds can run (1024 rows measured on both today; 8, 512 and P8 at the reference's own values of record), greedy ids are a pure function of those logits, the `final4` records are a WINDOWS record, and each flip is a near-tie two orders of magnitude inside the documented platform drift — teacher-forced probes score the exact flip position at **0.0371** logits for t2-write (`264` at 20.383991 against the record's `1407` at 20.346920) and **0.0758** for t3b-debug-syn (`31626` at 19.788471 against `33041` at 19.712648), against a measured Windows-vs-Linux drift of up to 7.0. `t6b-reason-multi` reproduces the Windows record over 1,024 ids and 2,006 characters byte for byte, which no broken prompt, tokenizer, template or harness could do. What would close it formally is a ten-task run on the `9f12429` build; it is blocked (below), and the exact command is `GATES.md` section 6.
+
+Host memory, 2026-09-17, 1 s poll during the tier fill, same binary with `CROW_CNQ_PURGE` as the A/B switch, both arms `bceba6ff7724`:
+
+| quantity | before | after |
+|---|---|---|
+| min `MemFree` during the load | 1.15 GiB | 7.70 GiB |
+| max `Cached` during the load | 33.04 GiB | 5.14 GiB |
+| 8-row load | 44 s | 25 s |
+| second start in the same state | refused by the RAM gate | boots, `[budget]` reads free for pinning 59.31 GiB against `MemAvailable` 9.25 GiB |
+
+Throughput, HEAD `0667e0b`, `decode run … 128` on `decode_out/srv-a5-t1read-ids.json` (16,064 ids), twice, identical id traces: prefill 25.38 s = **633 tok/s** and 25.44 s = **631 tok/s**; decode mean 27.17 ms = **36.8 tok/s** and 27.12 ms = **36.9 tok/s** at context 16,192. The Windows `final4` t1-read record reads 36.80 tok/s decode on the same prompt (2026-09-05; its harness counts the first token in, so the two are within noise of each other).
+
+The refactor series, all on 2026-09-17: clippy 1494 → 1480 → 1426 → **1422** warnings (the `--all-targets` form), `engine/src` 24,707 → 24,641 → 24,595 lines with cut 3 at +7 host lines net, build warnings 16 → 1, `cargo test --release` 142 → **144** passed 0 failed (84 lib + 60 serve).
+
+The CUDA Rust evaluation (`docs/cuda-rust-evaluation.md`, `0667e0b`): `gelu_tanh` ported to cuTile 0.3.1 and run against the production NVRTC kernel over 1,048,576 f32 with the sixteen edge patterns — **1,047,516 values bit-equal (99.899 %)**, 1,060 differ, max 33,135 ulp in the cancelling negative tail at max abs 2.38e-7, and against an f64 reference neither form is more accurate (16,570 against 16,565 ulp): the two `tanh` implementations simply round differently, so only maps of exact IEEE operations could move with an identity claim. Steady-state cost is the same (2.76 µs per launch either way), but the cuTile first launch costs 82.4 ms through the `tileiras` subprocess and the feature-on build costs +63 % wall and +71 crates. Recommendation: port nothing now.
+
+### Known limitations
+
+- **The ten-task gate has no Linux value of record.** Today's run is the first one, and `final4` cannot be reproduced at ids level on this toolchain for long generations. The closer is one `9f12429` ten-task run after a reboot (`decode_out/final/GATES.md` section 6). It could not be run on the day: after any engine exit about 45 GiB stays in the driver's pinned pool, invisible to `MemAvailable`, so the pre-fix build's own RAM gate refused every start but one — which is the `#15` failure reproduced on the pre-fix build, and the reason the reference serve smoke and the reference throughput arm are also missing.
+- **One throughput reading is confounded and is reported, not fixed**: on the 1024-row parity form HEAD measured 97.7 / 98.0 tok/s prefill against the reference's 266.7. That form is the only one in the battery that allocates about 2 GB of extra HOST memory, the single reference run happened on a clean machine (`MemAvailable` 49.6 GiB, ~33 GiB of reclaimable page cache from the pre-fix load) and every HEAD run happened at `MemAvailable` ~10 GiB with no page cache to give back. The product paths show no regression: HEAD reproduces the cut-3 build of the same day on the 512 form (prefill 275.2 against 278.8 tok/s, decode steps 18.9 / 15.3 / 15.6 / 15.5 ms against 18.9 / 15.3 / 15.5 / 15.5) and on `decode run 32` (39.7 against 40.1 tok/s), and the 16k form reads 633 tok/s prefill and 36.8 tok/s decode. A clean re-measurement needs one reboot pair.
+- **The Windows and Linux values of record differ on the 512-row and 1024-row forms** and will keep differing until the toolchains match: Windows NVRTC 13.3.73 with driver 616.56 against Linux NVRTC 13.3.33 with driver 610.57. The 8-row form is identical on both. This is a property of the JIT, not of the engine (`9f12429` proved it over four configurations), and `docs/architecture.md` section 8.7 holds the four values.
+- **Clippy is still red while non-blocking**: 1,422 warnings at HEAD, down from 1,494 at the start of the branch and measured in the `--all-targets` form the series was counted with.
+- **No run of the CI workflow is recorded in this repository**: the four jobs moved to ubuntu-latest with the port, and the counts quoted in `README.md` are still the local Windows proof of 2026-09-11.
+- The hardware probes of 2026-09-01/02 were never re-run on Linux, and `docs/measurement-handoff.md` still owes its Linux retest of the job-ring round trip; its numbers are WDDM numbers.
+- Everything open before this release stays open: prefill against its target (`#10`), the run-position drift of a `serve` rate (`#38`), engine logging (`#13`), Ampere and Ada (`#12`), and the ten-task quality gate itself (`#11`, `#44`).
 
 ## v0.1.0 (unreleased, tag follows E9)
 

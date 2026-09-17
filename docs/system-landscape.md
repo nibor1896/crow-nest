@@ -12,7 +12,7 @@ section 0.
 | GPU | NVIDIA GeForce RTX 5090 — sm_120 (compute capability 12.0), 170 SMs, 32,607 MiB VRAM |
 | driver | 616.56 (KMD), UMD CUDA 13.4 |
 | host RAM | 64 GB, dual-channel desktop platform |
-| OS | Windows (Linux is a target system per constant 1 — not yet exercised by any probe) |
+| OS | Windows — this is the Windows box; the Linux box has its own block below (2026-09-17) |
 | storage | NVMe (carries the PLE window and the cold-expert tier, decision 2026-09-02) |
 
 ## Toolchain (verified by the probes, 2026-09-01)
@@ -34,6 +34,52 @@ section 0.
   16-wide k-sub-block i; a/b/D fragment geometry as in RESULTS.md.
 - cudarc chain works on Windows end to end: context, memcpy, NVRTC compile, module load,
   launch, verified result.
+
+## Second machine — the Linux box (added 2026-09-17, issue #15)
+
+The Linux port, the host-memory fix and the three refactor cuts of branch `linux-refactor` were
+all built and measured here. Every Linux number in this repository names this box.
+
+| component | value |
+|---|---|
+| GPU | NVIDIA GeForce RTX 5090 — `sm_120`, 32,607 MiB VRAM |
+| driver | 610.57.04 |
+| CPU | Intel Core Ultra 9 285K |
+| host RAM | 62.17 GiB (`MemTotal` 65,188,584 kB) |
+| swap | zram, zstd, 62.2 GiB backing, with `vm.swappiness=150` (the Arch/omarchy default) |
+| OS | Arch Linux, kernel 7.2.3-arch1-3 |
+| userspace OOM | `systemd-oomd` active, watching `app.slice` on memory PRESSURE |
+| CUDA | runtime 13.3.1 unpacked at `~/.local/share/crow/cuda` (`lib` on `LD_LIBRARY_PATH`, never `lib/stubs`); NVRTC 13.3.33, ptxas V13.3.73, cuBLAS 13.6 |
+| Rust | rustc 1.98.1 (2026-09-01) from rustup stable, the Linux toolchain of record |
+
+Read on 2026-09-17 from `/proc/meminfo`, `/proc/sys/vm/swappiness`, `zramctl`, `uname -r`,
+`nvidia-smi`, `ptxas --version` and `rustc --version` on this machine.
+
+### The two facts that shaped the code
+
+1. **The driver's pinned-page pool survives the process and is invisible to `MemAvailable`.**
+   After any engine exits, about 45 GiB stays in the NVIDIA driver's pinned-page pool. It sits
+   in no `/proc/meminfo` class, so `MemAvailable` cannot see it, yet it is reclaimable under
+   pressure and the next `cuMemHostAlloc` is served straight out of it. A `MemAvailable`-based
+   RAM gate therefore refused every second engine start. `cuda::free_physical_ram_parts` counts
+   what cannot be reclaimed instead — `MemTotal - (AnonPages + Shmem + SUnreclaim + KernelStack
+   + PageTables + Percpu)`. Measured 2026-09-17 with the pool present: free for pinning
+   60.76 GiB against `MemAvailable` 10.89 GiB (`0c9feb5`).
+2. **The desktop compositor holds `/dev/nvidia0`, which is why `/dev/nvidia-uvm` is the
+   CUDA-process test.** That pool is only ours to count while no other CUDA process is alive, so
+   the engine scans `/proc/<pid>/fd` for another process holding the device node. Measured
+   2026-09-17: Hyprland, quickshell, Xwayland and every GTK/GL client hold `/dev/nvidia0`,
+   `/dev/nvidiactl` and `/dev/nvidia-modeset` permanently and own no pinned pool — testing for
+   those refused the engine's own operating point. `/dev/nvidia-uvm` is opened by every CUDA
+   context and by no graphics client, so that is the node the check reads (`bb9d2ca`).
+
+- Consequence for every measurement on this box: engine runs go through
+  `tools/serve-linux.sh` or the same `systemd-run --user --scope --slice=session.slice`
+  form (`MemorySwapMax=0`, `MemoryHigh=MemTotal-8G`, `MemoryMax=MemTotal-6G`), one engine at a
+  time, because the RAM gate refuses a second engine while the first holds the pinned tier.
+- The Windows-vs-Linux logit drift (Windows NVRTC 13.3.73 + driver 616.56 against Linux NVRTC
+  13.3.33 + driver 610.57) is the toolchain, not the port: `docs/architecture.md` section 8.7
+  carries the four values of record and the evidence.
 
 ## Model (research strands 2026-09-01, revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`)
 
@@ -59,7 +105,11 @@ section 0.
 
 ## Open on this page
 
-- Linux environment: unverified (both probes ran on Windows); entries land here when a
-  Linux probe runs.
+- The Linux box is above since 2026-09-17; the probes of 2026-09-01/02 were never re-run there,
+  so the fragment-layout and handoff findings on this page remain Windows measurements. The
+  engine's own Linux evidence is the parity battery (`docs/architecture.md` section 8.7,
+  `tools/gate-linux.sh`), not a probe.
+- `docs/measurement-handoff.md` still owes its Linux retest: the job-ring round-trip numbers
+  there are WDDM numbers and no Linux figure replaces them.
 - Any second machine/OS is appended with its own probe evidence before its first
   measurement is quoted.
