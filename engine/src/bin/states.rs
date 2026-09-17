@@ -14,21 +14,19 @@ use crow_nest_engine::manager::{ThreeStates, StateSizes};
 
 fn plan_table(context: usize, kv: KvDtype, expert_per_unit: u64, dense_hot: u64, n: usize) {
     let s = StateSizes::plan(context, kv, 512);
-    let gi = (1 << 30) as f64;
-    let mi = (1 << 20) as f64;
     println!("--- plan: context {context}, KV {}, N={n} ---", kv.name());
-    println!("KV cache      {:>10.1} MiB", s.kv_bytes as f64 / mi);
-    println!("QSA keys      {:>10.1} MiB", s.qsa_keys_bytes as f64 / mi);
-    println!("QSA pooled    {:>10.1} MiB", s.qsa_pooled_bytes as f64 / mi);
-    println!("GDN state     {:>10.1} MiB", (s.gdn_s_bytes + s.gdn_conv_bytes) as f64 / mi);
-    println!("RoPE tables   {:>10.1} MiB", s.rope_bytes as f64 / mi);
-    println!("dense (index) {:>10.1} MiB", dense_hot as f64 / mi);
+    println!("KV cache      {:>10.1} MiB", s.kv_bytes as f64 / MIB);
+    println!("QSA keys      {:>10.1} MiB", s.qsa_keys_bytes as f64 / MIB);
+    println!("QSA pooled    {:>10.1} MiB", s.qsa_pooled_bytes as f64 / MIB);
+    println!("GDN state     {:>10.1} MiB", (s.gdn_s_bytes + s.gdn_conv_bytes) as f64 / MIB);
+    println!("RoPE tables   {:>10.1} MiB", s.rope_bytes as f64 / MIB);
+    println!("dense (index) {:>10.1} MiB", dense_hot as f64 / MIB);
     println!(
         "hot experts   {:>10.1} MiB  ({} x {} layers x {:.2} MiB)",
-        n as f64 * expert_per_unit as f64 / mi,
+        n as f64 * expert_per_unit as f64 / MIB,
         n,
         LAYERS,
-        expert_per_unit as f64 / LAYERS as f64 / mi
+        expert_per_unit as f64 / LAYERS as f64 / MIB
     );
     let total = s.kv_bytes
         + s.qsa_keys_bytes
@@ -38,7 +36,7 @@ fn plan_table(context: usize, kv: KvDtype, expert_per_unit: u64, dense_hot: u64,
         + s.rope_bytes
         + dense_hot
         + n as u64 * expert_per_unit;
-    println!("TOTAL         {:>10.2} GiB  of 32.00 GiB VRAM", total as f64 / gi);
+    println!("TOTAL         {:>10.2} GiB  of 32.00 GiB VRAM", total as f64 / GIB);
 }
 
 fn main() {
@@ -49,9 +47,9 @@ fn main() {
     let expert_per_unit = (slabs.gu_bytes + slabs.dn_bytes) * LAYERS as u64;
     println!(
         "expert slab: gate_up {:.2} MiB + down {:.2} MiB = {:.2} MiB per expert per layer (gs {:.3}/{:.3})",
-        slabs.gu_bytes as f64 / (1 << 20) as f64,
-        slabs.dn_bytes as f64 / (1 << 20) as f64,
-        (slabs.gu_bytes + slabs.dn_bytes) as f64 / (1 << 20) as f64,
+        slabs.gu_bytes as f64 / MIB,
+        slabs.dn_bytes as f64 / MIB,
+        (slabs.gu_bytes + slabs.dn_bytes) as f64 / MIB,
         slabs.gu_gs,
         slabs.dn_gs
     );
@@ -67,7 +65,7 @@ fn main() {
     }
     println!(
         "dense (index): {:.1} MiB non-expert, non-embedding (lm_head BF16 included)",
-        dense_bytes as f64 / (1 << 20) as f64
+        dense_bytes as f64 / MIB
     );
 
     plan_table(262_144, KvDtype::Fp8E4m3, expert_per_unit, dense_bytes, 160);

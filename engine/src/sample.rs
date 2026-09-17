@@ -20,6 +20,11 @@ impl Rng {
     pub fn new(seed: u64) -> Self {
         Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0xD1B5_4A32_D192_ED03) | 1)
     }
+    /// the raw state used AS IS — no `new` mixing. The probes seed with a
+    /// literal state so their inputs are the same bytes on every machine.
+    pub fn from_state(state: u64) -> Self {
+        Rng(state)
+    }
     pub fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
@@ -27,6 +32,10 @@ impl Rng {
         x ^= x >> 27;
         self.0 = x;
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+    /// uniform in [0, 1), f32 — the probe draw (24 mantissa bits)
+    pub fn f01(&mut self) -> f32 {
+        ((self.next_u64() >> 40) as f32) / (1u32 << 24) as f32
     }
     /// uniform in [0, 1)
     pub fn next_f64(&mut self) -> f64 {
@@ -185,8 +194,13 @@ pub fn argmax(logits: &[f32]) -> usize {
     best
 }
 
-/// EOS ids of the checkpoint (generation_config): <|im_end|> and <|endoftext|>
-pub const EOS_IDS: [usize; 2] = [248046, 248044];
+/// EOS ids of the checkpoint (generation_config): `<|im_end|>` and
+/// `<|endoftext|>`. The second one is `geo::PLE_EOS` - the PLE shard reader's
+/// end marker and the sampler's stop id are the SAME token, written once.
+pub const EOS_IDS: [usize; 2] = [248046, crate::geo::PLE_EOS as usize];
+
+/// the same two ids as i64, for the callers that compare a signed id
+pub const EOS_IDS_I64: [i64; 2] = [EOS_IDS[0] as i64, EOS_IDS[1] as i64];
 
 pub fn stop_on_eos() -> bool {
     std::env::var("CROW_STOP_EOS").as_deref() == Ok("1")

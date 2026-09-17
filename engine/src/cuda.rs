@@ -273,19 +273,17 @@ pub unsafe fn drop_dbg(tag: &str) {
     }
 }
 
-pub unsafe fn free_vram_bytes() -> u64 {
+/// one `cuMemGetInfo_v2` -> (free, total) device bytes; the two named readers below derive
+pub unsafe fn vram_info() -> (u64, u64) {
     let mut free: usize = 0;
     let mut total: usize = 0;
     ck(sys::cuMemGetInfo_v2(&mut free, &mut total));
-    free as u64
+    (free as u64, total as u64)
 }
 
-pub unsafe fn total_vram_bytes() -> u64 {
-    let mut free: usize = 0;
-    let mut total: usize = 0;
-    ck(sys::cuMemGetInfo_v2(&mut free, &mut total));
-    total as u64
-}
+pub unsafe fn free_vram_bytes() -> u64 { vram_info().0 }
+
+pub unsafe fn total_vram_bytes() -> u64 { vram_info().1 }
 
 pub struct Module(pub CUmodule);
 
@@ -364,17 +362,18 @@ pub unsafe fn upload_dev(v: &[u8]) -> CUdeviceptr {
     d
 }
 
-pub unsafe fn to_f32_dev(v: &[f32]) -> CUdeviceptr {
-    upload_dev(std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4))
+/// upload a host slice into a fresh device buffer of exactly `size_of_val(v)` bytes.
+/// The three typed names below stay: the element type is what fixes the byte count,
+/// so spelling it at the call site is load-bearing, not decoration.
+pub unsafe fn to_dev<T: Copy>(v: &[T]) -> CUdeviceptr {
+    upload_dev(std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)))
 }
 
-pub unsafe fn to_i32_dev(v: &[i32]) -> CUdeviceptr {
-    upload_dev(std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4))
-}
+pub unsafe fn to_f32_dev(v: &[f32]) -> CUdeviceptr { to_dev(v) }
 
-pub unsafe fn to_u64_dev(v: &[u64]) -> CUdeviceptr {
-    upload_dev(std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8))
-}
+pub unsafe fn to_i32_dev(v: &[i32]) -> CUdeviceptr { to_dev(v) }
+
+pub unsafe fn to_u64_dev(v: &[u64]) -> CUdeviceptr { to_dev(v) }
 
 /// overwrite the first `v.len()` bytes of an existing device buffer.
 /// Legacy stream (0): async + explicit sync (the WDDM rule for one-shot
@@ -393,67 +392,44 @@ pub unsafe fn upload_into(dst: CUdeviceptr, v: &[u8]) {
     }
 }
 
-pub unsafe fn to_f32_into(dst: CUdeviceptr, v: &[f32]) {
+/// `upload_into` for a typed host slice (same stream rule as `upload_into`)
+pub unsafe fn into_dev<T: Copy>(dst: CUdeviceptr, v: &[T]) {
     upload_into(
         dst,
-        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4),
+        std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)),
     );
 }
 
-pub unsafe fn to_i32_into(dst: CUdeviceptr, v: &[i32]) {
-    upload_into(
-        dst,
-        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4),
-    );
-}
+pub unsafe fn to_f32_into(dst: CUdeviceptr, v: &[f32]) { into_dev(dst, v) }
 
-pub unsafe fn to_u64_into(dst: CUdeviceptr, v: &[u64]) {
-    upload_into(
-        dst,
-        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8),
-    );
-}
+pub unsafe fn to_i32_into(dst: CUdeviceptr, v: &[i32]) { into_dev(dst, v) }
 
-pub unsafe fn dtoh(src: CUdeviceptr, n_f32: usize) -> Vec<f32> {
-    let mut out = vec![0f32; n_f32];
+pub unsafe fn to_u64_into(dst: CUdeviceptr, v: &[u64]) { into_dev(dst, v) }
+
+/// blocking D2H of `n` elements. `cuMemcpyDtoH_v2` on the legacy stream is itself
+/// a sync point, so only `dtoh_u32` adds an explicit stream sync (see below).
+pub unsafe fn dtoh_t<T: Copy + Default>(src: CUdeviceptr, n: usize) -> Vec<T> {
+    let mut out = vec![T::default(); n];
     ck(sys::cuMemcpyDtoH_v2(
         out.as_mut_ptr() as *mut std::ffi::c_void,
         src,
-        n_f32 * 4,
+        std::mem::size_of_val(&out[..]),
     ));
     out
 }
 
-pub unsafe fn dtoh_i32(src: CUdeviceptr, n: usize) -> Vec<i32> {
-    let mut out = vec![0i32; n];
-    ck(sys::cuMemcpyDtoH_v2(
-        out.as_mut_ptr() as *mut std::ffi::c_void,
-        src,
-        n * 4,
-    ));
-    out
-}
+pub unsafe fn dtoh(src: CUdeviceptr, n_f32: usize) -> Vec<f32> { dtoh_t(src, n_f32) }
 
+pub unsafe fn dtoh_i32(src: CUdeviceptr, n: usize) -> Vec<i32> { dtoh_t(src, n) }
+
+/// DIFFERS from the other three on purpose: the u32 readers (route log, block
+/// counts) run while the ACTIVE stream may still be in flight, so sync it first.
 pub unsafe fn dtoh_u32(src: CUdeviceptr, n: usize) -> Vec<u32> {
-    let mut out = vec![0u32; n];
     ck(sys::cuStreamSynchronize(cur_stream()));
-    ck(sys::cuMemcpyDtoH_v2(
-        out.as_mut_ptr() as *mut std::ffi::c_void,
-        src,
-        n * 4,
-    ));
-    out
+    dtoh_t(src, n)
 }
 
-pub unsafe fn dtoh_u64(src: CUdeviceptr, n: usize) -> Vec<u64> {
-    let mut out = vec![0u64; n];
-    ck(sys::cuMemcpyDtoH_v2(
-        out.as_mut_ptr() as *mut std::ffi::c_void,
-        src,
-        n * 8,
-    ));
-    out
-}
+pub unsafe fn dtoh_u64(src: CUdeviceptr, n: usize) -> Vec<u64> { dtoh_t(src, n) }
 
 /// async launch WITHOUT sync — the decode hot path batches submissions
 pub unsafe fn launch_async(
@@ -592,17 +568,18 @@ pub struct Pinned {
 }
 
 impl Pinned {
-    /// mapped pinned allocation; the returned `dev` pointer is what kernels read
-    pub unsafe fn alloc(bytes: usize) -> Pinned {
+    /// the one `cuMemHostAlloc`; `alloc` and `alloc_wc` differ only by the flag word
+    unsafe fn alloc_flags(bytes: usize, flags: u32) -> Pinned {
         let mut host: *mut std::ffi::c_void = std::ptr::null_mut();
-        ck(sys::cuMemHostAlloc(
-            &mut host,
-            bytes,
-            sys::CU_MEMHOSTALLOC_PORTABLE | sys::CU_MEMHOSTALLOC_DEVICEMAP,
-        ));
+        ck(sys::cuMemHostAlloc(&mut host, bytes, flags));
         let mut dev: CUdeviceptr = 0;
         ck(sys::cuMemHostGetDevicePointer_v2(&mut dev, host, 0));
         Pinned { host, dev, bytes }
+    }
+
+    /// mapped pinned allocation; the returned `dev` pointer is what kernels read
+    pub unsafe fn alloc(bytes: usize) -> Pinned {
+        Pinned::alloc_flags(bytes, sys::CU_MEMHOSTALLOC_PORTABLE | sys::CU_MEMHOSTALLOC_DEVICEMAP)
     }
 
     pub unsafe fn write_bytes(&mut self, offset: usize, v: &[u8]) {
@@ -620,15 +597,10 @@ impl Pinned {
 
     /// write combined variant for host->device flag buffers (p9 lesson)
     pub unsafe fn alloc_wc(bytes: usize) -> Pinned {
-        let mut host: *mut std::ffi::c_void = std::ptr::null_mut();
-        ck(sys::cuMemHostAlloc(
-            &mut host,
+        Pinned::alloc_flags(
             bytes,
             sys::CU_MEMHOSTALLOC_PORTABLE | sys::CU_MEMHOSTALLOC_DEVICEMAP | sys::CU_MEMHOSTALLOC_WRITECOMBINED,
-        ));
-        let mut dev: CUdeviceptr = 0;
-        ck(sys::cuMemHostGetDevicePointer_v2(&mut dev, host, 0));
-        Pinned { host, dev, bytes }
+        )
     }
 }
 
@@ -637,3 +609,17 @@ impl Pinned {
 unsafe impl Send for Pinned {}
 unsafe impl Send for Module {}
 unsafe impl Send for Ctx {}
+
+// ---------- raw little-endian dumps (CROW_DUMP_H / CROW_VIT_DUMP) ----------
+
+// The dump files are the host's own byte image; on a big-endian host that would
+// stop being the little-endian format the readers (tools/*.py, cmp) expect.
+const _: () = assert!(cfg!(target_endian = "little"), "dump files are little-endian");
+
+/// write a POD slice (f32 / i32 / u64 ...) to `path` as raw little-endian bytes.
+/// The one dump writer: 10 hand-rolled `to_le_bytes` loops used to spell this out.
+pub fn write_le<T: Copy>(path: &str, v: &[T]) -> std::io::Result<()> {
+    use std::io::Write;
+    let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) };
+    std::fs::File::create(path)?.write_all(bytes)
+}

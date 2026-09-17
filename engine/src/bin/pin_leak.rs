@@ -6,6 +6,7 @@
 //! touch=1 writes one byte per 4 KiB page from the host (the engine fills the
 //! tier at load, so the pages are resident in production).
 use crow_nest_engine::cuda;
+use crow_nest_engine::geo::{GIB, MIB};
 use cudarc::driver::sys;
 
 fn main() {
@@ -15,13 +16,13 @@ fn main() {
     let slabs: usize = a.get(3).and_then(|v| v.parse().ok()).unwrap_or(96);
     let wc = a.get(4).map(|v| v != "0").unwrap_or(true);
     let touch = a.get(5).map(|v| v == "1").unwrap_or(false);
-    let per = ((total_gib * (1u64 << 30) as f64) as usize / slabs) & !0xfff;
+    let per = ((total_gib * GIB) as usize / slabs) & !0xfff;
     unsafe {
         let _ctx = cuda::Ctx::init();
         let flags = sys::CU_MEMHOSTALLOC_PORTABLE | sys::CU_MEMHOSTALLOC_DEVICEMAP | if wc { sys::CU_MEMHOSTALLOC_WRITECOMBINED } else { 0 };
         let f_start = cuda::free_vram_bytes();
         println!("[pin_leak] {slabs} x {:.1} MiB = {:.2} GiB, wc={wc} touch={touch}; free VRAM at start {:.1} MB, free RAM {:.1} GiB",
-            per as f64 / (1 << 20) as f64, (per * slabs) as f64 / (1u64 << 30) as f64, f_start as f64 / 1e6, cuda::free_physical_ram() as f64 / (1u64 << 30) as f64);
+            per as f64 / MIB, (per * slabs) as f64 / GIB, f_start as f64 / 1e6, cuda::free_physical_ram() as f64 / GIB);
         for c in 0..cycles {
             let t0 = std::time::Instant::now();
             let mut held = Vec::with_capacity(slabs);
@@ -43,9 +44,9 @@ fn main() {
             // PIN_LEAK_HOLD_S=<s>: stay alive after the free so an outside sampler can
             // read what the process still holds host-side (2026-09-06 harness reload check)
             if let Some(s) = std::env::var("PIN_LEAK_HOLD_S").ok().and_then(|v| v.parse::<u64>().ok()) {
-                println!("[pin_leak] cycle {c}: freed; free RAM now {:.2} GiB, holding {s} s", cuda::free_physical_ram() as f64 / (1u64 << 30) as f64);
+                println!("[pin_leak] cycle {c}: freed; free RAM now {:.2} GiB, holding {s} s", cuda::free_physical_ram() as f64 / GIB);
                 std::thread::sleep(std::time::Duration::from_secs(s));
-                println!("[pin_leak] cycle {c}: after hold free RAM {:.2} GiB", cuda::free_physical_ram() as f64 / (1u64 << 30) as f64);
+                println!("[pin_leak] cycle {c}: after hold free RAM {:.2} GiB", cuda::free_physical_ram() as f64 / GIB);
             }
             let f_after = cuda::free_vram_bytes();
             println!("[pin_leak] cycle {c}: alloc {:.1} s; free VRAM while held {:.1} MB (delta {:+.1}), after free {:.1} MB (leak vs start {:+.1} MB)",

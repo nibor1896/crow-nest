@@ -51,6 +51,29 @@
 
 /// `<tool_call>`, added token id 248058 of this model, `special: false`
 pub const TOOL_OPEN: &str = "<tool_call>";
+
+/// The declaration shape Crow's `_fn` builds (`crow_core.py:569-574`): two
+/// parameters of two different declared types, so both value paths are
+/// exercised. `pub` and outside `cfg(test)` because `bin/serve.rs`'s oracle
+/// render was captured from THIS json - a second copy over there could drift
+/// from the captured bytes and nothing would catch it.
+pub fn a7_tools_fixture() -> serde_json::Value {
+        serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a UTF-8 text file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Path to the file." },
+                        "start_line": { "type": "integer", "description": "First line, 1-based." }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }])
+}
 /// `</tool_call>`, added token id 248059 of this model, `special: false`
 const TOOL_CLOSE: &str = "</tool_call>";
 /// opens the function block; NOT an added token, it arrives as ordinary pieces
@@ -640,26 +663,6 @@ impl ToolStream {
 mod tests {
     use super::*;
 
-    /// the declaration shape Crow's `_fn` builds (`crow_core.py:569-574`), two parameters
-    /// of two different declared types so both value paths are exercised
-    fn a7_tools() -> serde_json::Value {
-        serde_json::json!([{
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "Read a UTF-8 text file.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string", "description": "Path to the file." },
-                        "start_line": { "type": "integer", "description": "First line, 1-based." }
-                    },
-                    "required": ["path"]
-                }
-            }
-        }])
-    }
-
     /// - the parser over a sequence of text pieces, with `arms` `<tool_call>` ids seen
     /// - returns the fragments, whether the end was malformed, and the completed calls
     fn drive(
@@ -725,7 +728,7 @@ mod tests {
 
     #[test]
     fn one_tool_call_becomes_a_name_and_argument_fragments_that_concatenate() {
-        let tools = a7_tools();
+        let tools = a7_tools_fixture();
         let (es, bad, closed) = drive(Some(&tools), 1, &[A7_CALL]);
         assert!(!bad, "a complete call is not malformed");
         assert_eq!(closed, 1);
@@ -752,7 +755,7 @@ mod tests {
 
     #[test]
     fn the_same_call_split_byte_by_byte_gives_the_same_fragments() {
-        let tools = a7_tools();
+        let tools = a7_tools_fixture();
         let whole = args_of(&drive(Some(&tools), 1, &[A7_CALL]).0, 0);
         for n in [1usize, 2, 3, 5, 7, 11, 13] {
             let pieces = cut(A7_CALL, n);
@@ -767,7 +770,7 @@ mod tests {
 
     #[test]
     fn text_before_the_first_call_is_content_and_after_it_is_dropped() {
-        let tools = a7_tools();
+        let tools = a7_tools_fixture();
         let (es, _, closed) = drive(
             Some(&tools),
             1,
@@ -780,18 +783,21 @@ mod tests {
         assert!(matches!(es[1], Emit::Call { .. }), "{es:?}");
     }
 
-    #[test]
-    fn braces_quotes_and_newlines_inside_a_value_survive_as_json() {
-        let tools = serde_json::json!([{
+    /// one `run_command` declaration; the caller supplies the `properties`,
+    /// so the only difference between the tests using it is one line
+    fn run_command_tools(props: serde_json::Value) -> serde_json::Value {
+        serde_json::json!([{
             "type": "function",
             "function": {
                 "name": "run_command",
-                "parameters": {
-                    "type": "object",
-                    "properties": { "command": { "type": "string" } }
-                }
+                "parameters": { "type": "object", "properties": props }
             }
-        }]);
+        }])
+    }
+
+    #[test]
+    fn braces_quotes_and_newlines_inside_a_value_survive_as_json() {
+        let tools = run_command_tools(serde_json::json!({ "command": { "type": "string" } }));
         // a value with nested braces, a quote, a backslash and two real newlines
         let value = "python -c \"print({'a': {'b': 1}})\"\nC:\\tmp\\x\nend";
         let markup = format!(
@@ -842,7 +848,7 @@ mod tests {
 
     #[test]
     fn two_calls_get_index_zero_and_one_with_their_own_ids() {
-        let tools = a7_tools();
+        let tools = a7_tools_fixture();
         let two = format!("{A7_CALL}\n{A7_CALL}");
         let (es, bad, closed) = drive(Some(&tools), 2, &cut(&two, 6));
         assert!(!bad);
@@ -866,7 +872,7 @@ mod tests {
 
     #[test]
     fn a_call_that_never_closes_goes_out_as_content_and_is_malformed() {
-        let tools = a7_tools();
+        let tools = a7_tools_fixture();
         let cut_off = "<tool_call>\n<function=read_file>\n<parameter=path>\nC:/x/y.md";
         let (es, bad, closed) = drive(Some(&tools), 1, &cut(cut_off, 5));
         assert!(bad, "an unclosed call is malformed");
@@ -888,7 +894,7 @@ mod tests {
 
     #[test]
     fn only_the_tool_call_token_id_opens_a_call() {
-        let tools = a7_tools();
+        let tools = a7_tools_fixture();
         // the same bytes, but the decode loop never saw token 248058: it stays content
         let (es, bad, closed) = drive(Some(&tools), 0, &cut(A7_CALL, 4));
         assert!(!bad, "unarmed markup is ordinary text, not a broken call");
@@ -901,7 +907,7 @@ mod tests {
     /// `crow_core.py:4864-4877` does, give the call the model meant
     #[test]
     fn crows_reassembly_of_the_fragments_gives_one_complete_call() {
-        let tools = a7_tools();
+        let tools = a7_tools_fixture();
         let (es, _, _) = drive(Some(&tools), 1, &cut(A7_CALL, 3));
         // the reader: id and name only on a truthy value, arguments concatenated per index
         let mut id = String::new();
@@ -938,7 +944,7 @@ mod tests {
     /// The call is COMPLETE, so the client must get the call and NOT its raw markup as well.
     #[test]
     fn end_of_stream_after_function_close_still_closes_the_call() {
-        let tools = a7_tools();
+        let tools = a7_tools_fixture();
         let head = A7_CALL
             .strip_suffix("\n</tool_call>")
             .expect("A7_CALL ends with the close");
@@ -974,16 +980,7 @@ mod tests {
     /// piece at most and then lets it through
     #[test]
     fn a_less_than_inside_a_value_survives() {
-        let tools = serde_json::json!([{
-            "type": "function",
-            "function": {
-                "name": "run_command",
-                "parameters": {
-                    "type": "object",
-                    "properties": { "command": { "type": "string" }, "note": {} }
-                }
-            }
-        }]);
+        let tools = run_command_tools(serde_json::json!({ "command": { "type": "string" }, "note": {} }));
         for value in ["a < b", "x<y>z", "a<b</c>d", "<parameter=", "</param"] {
             let markup = format!(
                 "<tool_call>\n<function=run_command>\n<parameter=command>\n{value}\n\

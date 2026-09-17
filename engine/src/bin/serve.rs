@@ -442,7 +442,7 @@
 use crow_nest_engine::cache::{PrefixCache, SLOTS};
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::{DevSampler, Engine};
-use crow_nest_engine::geo::{apply_adapt_policy, Adapt, Config, CONTEXT_FLOOR, LAYERS};
+use crow_nest_engine::geo::{apply_adapt_policy, Adapt, Config, CONTEXT_FLOOR, DEFAULT_CNQ, DEFAULT_HOTSETS, LAYERS, TRICKLE_CHUNK_THRESHOLD};
 use crow_nest_engine::sample::{Sampler, EOS_IDS};
 use crow_nest_engine::slot;
 use crow_nest_engine::toolcall::{Emit, ToolStream, TOOL_OPEN};
@@ -451,13 +451,12 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_PORT: u16 = 8099;
-const DEFAULT_CNQ: &str = "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq";
-const DEFAULT_HOTSETS: &str = "decode_out/hotsets-M-longctx2100-n160.json";
 /// pinned for the process (M1): every request prefills at chunk 2048. The
 /// 4096 experiment of 2026-09-14 collapsed the live serve prefill (~100 tok/s)
 /// - the trickle/adapt policy is tuned for 2048 and no serve-form measurement
-/// backed the raise; reverted same day.
-const SERVE_CHUNK: usize = 2048;
+/// backed the raise; reverted same day. It DERIVES from the policy threshold
+/// it is tuned against: serve's chunk is what arms the stream trickle.
+const SERVE_CHUNK: usize = TRICKLE_CHUNK_THRESHOLD;
 /// read and write timeout per connection, so one stalled client cannot hold the loop
 const IO_TIMEOUT_SECS: u64 = 10;
 /// request line plus headers, 64 KiB total; over it the answer is 431
@@ -2157,19 +2156,7 @@ unsafe fn write_vit_dump(
         for row in c {
             flat.extend_from_slice(row);
         }
-        f32_to_file(&format!("{dir}/gpu-logits.f32"), &flat);
-    }
-}
-
-/// raw f32 little-endian file write, failures logged not raised
-fn f32_to_file(path: &str, v: &[f32]) {
-    match std::fs::File::create(path) {
-        Ok(mut f) => {
-            use std::io::Write;
-            let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
-            let _ = f.write_all(bytes);
-        }
-        Err(e) => eprintln!("[vit-dump] write {path} failed: {e}"),
+        crow_nest_engine::vit::f32_file(&format!("{dir}/gpu-logits.f32"), &flat);
     }
 }
 
@@ -2670,9 +2657,9 @@ mod tests {
 
     #[test]
     fn props_carries_the_fields_crow_reads() {
-        let doc = props_json("converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq", 200_000, 2048, false);
+        let doc = props_json(DEFAULT_CNQ, 200_000, 2048, false);
         // server_model_path (crow_core.py:1408)
-        assert_eq!(doc["model_path"], "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq");
+        assert_eq!(doc["model_path"], DEFAULT_CNQ);
         // fetch_model_name (crow_core.py:14884)
         assert_eq!(doc["model"], "Qwen3.8-Flash-Next-CNQ4.5-M");
         assert!(doc["model"].as_str().unwrap().contains("Flash-Next"));
@@ -2685,7 +2672,7 @@ mod tests {
         assert_eq!(doc["prompt_chunk"], 2048);
         // #VIT: with the tower loaded the same document reports vision, so
         // Crow's refuse_images lets /image and read_image through
-        let doc = props_json("converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq", 200_000, 2048, true);
+        let doc = props_json(DEFAULT_CNQ, 200_000, 2048, true);
         assert_eq!(doc["modalities"]["vision"], serde_json::Value::Bool(true));
     }
 
@@ -2745,7 +2732,7 @@ mod tests {
 
     #[test]
     fn model_name_is_the_container_stem() {
-        assert_eq!(model_name("converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq"), "Qwen3.8-Flash-Next-CNQ4.5-M");
+        assert_eq!(model_name(DEFAULT_CNQ), "Qwen3.8-Flash-Next-CNQ4.5-M");
         assert_eq!(model_name("C:\\x\\converter\\Qwen3.8-Flash-Next-CNQ4.5-M.cnq"), "Qwen3.8-Flash-Next-CNQ4.5-M");
         assert_eq!(model_name("plain"), "plain");
     }
@@ -3124,17 +3111,7 @@ mod tests {
     }
 
     /// #31 A9: the SAME turn served warm. 16,064 prompt ids, 15,000 of them reused.
-    const T_WARM: Timing = Timing {
-        prompt_n: 1_064,
-        cached_n: 15_000,
-        predicted_n: 8,
-        prompt_ms: 1_700.0,
-        predicted_ms: 320.0,
-        selections_total: 7_710_720,
-        cold_total: 2_534_400,
-        ple_rows_total: 160_640,
-        ple_miss_total: 12_811,
-    };
+    const T_WARM: Timing = Timing { prompt_n: 1_064, cached_n: 15_000, prompt_ms: 1_700.0, ..T0 };
 
     /// #31 A9: `prompt_tokens` stays the WHOLE prompt, `cached_tokens` is P, `prompt_n` the rest
     #[test]
@@ -3383,12 +3360,7 @@ mod tests {
         // the real tokenizer, no GPU: an emoji is one 4 byte character whose
         // byte level tokens can end mid sequence
         // tests run from engine/, the model lives at the repository root
-        let t = "../models/Qwen3.8-Flash-Next-original/tokenizer.json";
-        let tk = crow_nest_engine::tokenizer::ChatTokenizer::load(
-            t,
-            &t.replace("tokenizer.json", "tokenizer_config.json"),
-        )
-        .expect("tokenizer loads");
+        let tk = tk();
         let ids = tk.encode_raw("\u{1F985}\u{1F985}").expect("encode");
         assert!(ids.len() >= 2, "the emoji pair must be more than one token: {ids:?}");
         let mut emitted = 0usize;
@@ -3414,26 +3386,6 @@ mod tests {
     }
 
     // ------------------------------------------------ tool calls (#29 A7)
-
-    /// the declaration shape Crow's `_fn` builds (`crow_core.py:569-574`), two parameters
-    /// of two different declared types so both value paths are exercised
-    fn a7_tools() -> serde_json::Value {
-        serde_json::json!([{
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "Read a UTF-8 text file.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string", "description": "Path to the file." },
-                        "start_line": { "type": "integer", "description": "First line, 1-based." }
-                    },
-                    "required": ["path"]
-                }
-            }
-        }])
-    }
 
     #[test]
     fn a_tool_chunk_carries_exactly_what_crow_reassembles() {
@@ -3546,7 +3498,7 @@ mod tests {
     ///   `AutoTokenizer.from_pretrained("models/Qwen3.8-Flash-Next-original")`
     ///   `.apply_chat_template(HIST, tools=TOOLS, add_generation_prompt=True,`
     ///   `    tokenize=False, enable_thinking=False)`
-    ///   with `TOOLS` = `a7_tools()` and `HIST` the three messages below, the assistant
+    ///   with `TOOLS` = `crow_nest_engine::toolcall::a7_tools_fixture()` and `HIST` the three messages below, the assistant
     ///   turn carrying `arguments` as the OBJECT `{"path": "a.md", "start_line": 1}`.
     /// Measured in the same run: the same call with `arguments` as the STRING
     ///   `"{\"path\": \"a.md\", \"start_line\": 1}"` raises
@@ -3554,12 +3506,7 @@ mod tests {
     ///   iterates `tool_call.arguments|items`. That is why `normalize_messages` exists.
     #[test]
     fn a_history_with_a_tool_turn_renders_byte_identical_to_the_oracle() {
-        let t = "../models/Qwen3.8-Flash-Next-original/tokenizer.json";
-        let tk = crow_nest_engine::tokenizer::ChatTokenizer::load(
-            t,
-            &t.replace("tokenizer.json", "tokenizer_config.json"),
-        )
-        .expect("tokenizer loads");
+        let tk = tk();
         const ORACLE_RENDER: &str = concat!(
             "<|im_start|>system\n",
             "# Tools\n",
@@ -3630,7 +3577,7 @@ mod tests {
             }]},
             {"role": "tool", "tool_call_id": "call_0", "content": "# Title\nbody"}
         ]);
-        let tools = a7_tools();
+        let tools = crow_nest_engine::toolcall::a7_tools_fixture();
         let s = tk
             .render_chat(&normalize_messages(&msgs), Some(&tools), true, false)
             .expect("the tool history renders");
@@ -3868,6 +3815,16 @@ mod tests {
     // ------------------------------------------- #39 B3a: the non streaming document
 
     /// a `Timing` whose every field is a different number, so a document test can name it
+    /// tests run from engine/, the model lives at the repository root
+    fn tk() -> crow_nest_engine::tokenizer::ChatTokenizer {
+        let t = format!("../{}", crow_nest_engine::tokenizer::DEFAULT_TOKENIZER);
+        crow_nest_engine::tokenizer::ChatTokenizer::load(
+            &t,
+            &crow_nest_engine::tokenizer::sibling_config(&t),
+        )
+        .expect("tokenizer loads")
+    }
+
     fn b3a_timing() -> Timing {
         Timing {
             prompt_n: 7,

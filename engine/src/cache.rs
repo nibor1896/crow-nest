@@ -85,7 +85,7 @@
 //!   after-answer slot; M3 keeps `SLOTS` prompt snapshots (newest in slot 0) so a
 //!   history edit that diverges below the newest still rolls back to an older turn.
 //! - Pageable host RAM, allocated once at process start, reused per snapshot.
-//! - Not pinned (the pinned tier is budgeted at 46 GiB, `geo.rs:110`).
+//! - Not pinned (the pinned tier is capped by `geo::HOST_PINNED_CAP` and derived at boot).
 //! - Not VRAM (the loader already clamps N against it, `manager.rs:122-170`).
 //! - Snapshots are in-process state, never a file: the shape is only valid for the load
 //!   that produced it (spec 7.6, `manager.rs:31`).

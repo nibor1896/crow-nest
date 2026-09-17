@@ -247,40 +247,32 @@ impl Cnq {
         }
     }
 
-    pub fn read_bytes(&mut self, t: &TensorInfo) -> Vec<u8> {
-        let off = self.blob_offset + t.offset;
-        let len = Self::byte_len(t) as usize;
+    /// The one container read: `len` bytes at absolute container offset `off`.
+    /// The mapping fast path is taken ONLY for `ple` (the one section designed
+    /// to live in the page cache); every other section goes through seek+read
+    /// and hands its pages straight back via `fadvise_consumed`, so the model
+    /// is never held twice during the load.
+    fn read_at(&mut self, section: &str, off: u64, len: usize) -> Vec<u8> {
         let mut raw = vec![0u8; len];
-        if self.map != 0 && t.section == "ple" && off + len as u64 <= self.map_len {
+        if self.map != 0 && section == "ple" && off + len as u64 <= self.map_len {
             unsafe { std::ptr::copy_nonoverlapping((self.map as *const u8).add(off as usize), raw.as_mut_ptr(), len) };
             return raw;
         }
         self.file.seek(SeekFrom::Start(off)).unwrap();
-        self.read_exact_into(&mut raw);
-        if t.section != "ple" {
+        self.file.read_exact(&mut raw).unwrap();
+        if section != "ple" {
             self.fadvise_consumed(off, len);
         }
         raw
+    }
+
+    pub fn read_bytes(&mut self, t: &TensorInfo) -> Vec<u8> {
+        self.read_at(&t.section, self.blob_offset + t.offset, Self::byte_len(t) as usize)
     }
 
     /// read a byte range of a tensor (row-aligned reads for expert slabs, PLE rows)
     pub fn read_range(&mut self, t: &TensorInfo, rel_off: u64, len: usize) -> Vec<u8> {
-        let off = self.blob_offset + t.offset + rel_off;
-        let mut raw = vec![0u8; len];
-        if self.map != 0 && t.section == "ple" && off + len as u64 <= self.map_len {
-            unsafe { std::ptr::copy_nonoverlapping((self.map as *const u8).add(off as usize), raw.as_mut_ptr(), len) };
-            return raw;
-        }
-        self.file.seek(SeekFrom::Start(off)).unwrap();
-        self.read_exact_into(&mut raw);
-        if t.section != "ple" {
-            self.fadvise_consumed(off, len);
-        }
-        raw
-    }
-
-    fn read_exact_into(&mut self, buf: &mut [u8]) {
-        self.file.read_exact(buf).unwrap();
+        self.read_at(&t.section, self.blob_offset + t.offset + rel_off, len)
     }
 
     /// Drop the page-cache pages of a range this loader has consumed.
@@ -363,6 +355,46 @@ pub fn e2m1(nibble: u32) -> f32 {
     const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
     let v = MAG[(nibble & 0x7) as usize];
     if nibble & 0x8 != 0 { -v } else { v }
+}
+
+/// magnitude index of an E2M1 level - the inverse of `e2m1`'s table, and the
+/// only place either direction of that table is written down.
+pub fn mag_index(m: f32) -> u32 {
+    for (i, v) in [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0].iter().enumerate() {
+        if (*v - m).abs() < 1e-6 {
+            return i as u32;
+        }
+    }
+    panic!("codebook magnitude {m} is not an e2m1 level");
+}
+
+/// Requantise ONE 16-value NVFP4 sub-block against the codebook `cb_val`:
+/// search the +/-4 neighbourhood of the original UE4M3 scale byte `orig` and
+/// return the (sse, scale byte, 16 codebook indices) with the smallest sum of
+/// squared error. The search order - `d` ascending, strict `<` on both the
+/// per-value error and the sse - decides ties and IS the container's bit
+/// contract, so the offline builders (`coldtier`, `hybrid`) share this copy.
+pub fn best_scale_and_codes(vals: &[f32], orig: i32, gs: f32, cb_val: &[f32]) -> (f64, u32, [u32; 16]) {
+    let mut best = (f64::INFINITY, orig as u32, [0u32; 16]);
+    for d in -4i32..=4 {
+        let byte = orig + d;
+        if byte < 1 || byte > 0x7E { continue; }
+        let s = ue4m3(byte as u32) * gs;
+        let mut sse = 0f64;
+        let mut cd = [0u32; 16];
+        for (j, &v) in vals.iter().enumerate() {
+            let mut bk = 0usize;
+            let mut be = f32::INFINITY;
+            for (k, &c) in cb_val.iter().enumerate() {
+                let err = (v - c * s).abs();
+                if err < be { be = err; bk = k; }
+            }
+            cd[j] = bk as u32;
+            sse += (be as f64) * (be as f64);
+        }
+        if sse < best.0 { best = (sse, byte as u32, cd); }
+    }
+    best
 }
 
 pub fn ue4m3(byte: u32) -> f32 {

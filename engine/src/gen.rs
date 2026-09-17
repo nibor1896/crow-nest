@@ -764,8 +764,8 @@ impl Engine {
             let vt = crate::vit::Vit::new(cnq);
             let vit_bytes = cuda::total_vram_bytes() - cuda::free_vram_bytes() - before;
             println!("[vit] visual tower loaded: mode nvfp4 (f32 tower math), CROW_VIT {} (0 = the text-only placeholder), cap {} patches = {} visual tokens per image, vit weights {:.0} MiB (scratch lazy, allocated on the first image request)",
-                std::env::var("CROW_VIT").unwrap_or_else(|_| "unset".to_string()),
-                vt.cap, vt.cap / 4, vit_bytes as f64 / (1 << 20) as f64);
+                env_or_unset("CROW_VIT"),
+                vt.cap, vt.cap / 4, vit_bytes as f64 / MIB);
             Some(vt)
         } else {
             println!("[vit] visual tower NOT loaded, CROW_VIT 0 (the text-only placeholder of record, /props vision false)");
@@ -800,7 +800,7 @@ impl Engine {
         // and would print no such line at all (parity.exe does, through apply_chunk_policy).
         // CROW_STAGE_DMA and the low-bit tier
         // still take precedence at the launch site (moe_run).
-        let sk = std::env::var("CROW_STAGE_KERNEL").unwrap_or_else(|_| "unset".to_string());
+        let sk = env_or_unset("CROW_STAGE_KERNEL");
         if stage_kernel_ca() {
             println!("[stage] kernel stage_cold_ca, CROW_STAGE_KERNEL {} (default 2), {} blocks x 256 threads, 4096 B tiles (gate_up {} B = {} tiles, down {} B = {} tiles)",
                 sk, stage_blocks(), slabs.gu_bytes, slabs.gu_bytes / 4096, slabs.dn_bytes, slabs.dn_bytes / 4096);
@@ -812,7 +812,7 @@ impl Engine {
         // point, next to the [stage] line and for the same reason: every future
         // log says which order produced it. It sits in the [load] block, so the
         // parity gate prints it too (decode parity never calls apply_adapt_policy).
-        let td = std::env::var("CROW_TRICKLE_DEFER").unwrap_or_else(|_| "unset".to_string());
+        let td = env_or_unset("CROW_TRICKLE_DEFER");
         println!("[trickle] copies issued {}, CROW_TRICKLE_DEFER {} (unset or any value but 0 defers)",
             if trickle_defer_on() { "AFTER the graph launch, in decode_step (deferred, default)" }
             else { "BEFORE the launch, in trickle_tick (eager fallback)" }, td);
@@ -820,10 +820,10 @@ impl Engine {
         // selection form, next to the [stage] and [trickle] lines and for the
         // same reason: every future log says which selection produced it. It
         // sits in the [load] block, so the parity gate prints it too.
-        let qp = std::env::var("CROW_QSA_PAR").unwrap_or_else(|_| "unset".to_string());
+        let qp = env_or_unset("CROW_QSA_PAR");
         if qsa_par_on() {
             println!("[qsa] decode selection qsa_select_par (default), G={}, CROW_QSA_PAR {} (0 = qsa_select_fast fallback)",
-                qsa_par_blocks(), qp);
+                qsa_select_blocks(), qp);
         } else {
             println!("[qsa] decode selection qsa_select_fast (fallback, G unused), CROW_QSA_PAR {} (0 = qsa_select_fast fallback)",
                 qp);
@@ -832,14 +832,14 @@ impl Engine {
         // attention split count, next to the [qsa] line and for the same
         // reason: every future log says which split count produced it. It
         // sits in the [load] block, so the parity gate prints it too.
-        let asplits = std::env::var("CROW_ATTN_SPLITS").unwrap_or_else(|_| "unset".to_string());
+        let asplits = env_or_unset("CROW_ATTN_SPLITS");
         println!("[attn] decode attention splits {} (default 8, restored by 61e), CROW_ATTN_SPLITS {} (32 = rolled back, knob 4/8/16/32)",
             attn_splits(), asplits);
         // #62b, 2026-09-12: ONE line per engine process names the GDN decode
         // input-projection form, next to the [attn] line and for the same
         // reason: every future log says which projection launch produced it.
         // It sits in the [load] block, so the parity gate prints it too.
-        let gfi = std::env::var("CROW_GDN_FUSE_IN").unwrap_or_else(|_| "unset".to_string());
+        let gfi = env_or_unset("CROW_GDN_FUSE_IN");
         println!("[gdn] decode input projections {}, CROW_GDN_FUSE_IN {} (0 = per-slab fallback of record, four launches)",
             if gdn_fuse_in_on() { "grouped (default since 19g, one launch)" } else { "per-slab (fallback of record, four launches)" }, gfi);
         // #19f, 2026-09-13: ONE line per engine process names the hyper-
@@ -849,7 +849,7 @@ impl Engine {
         // on since 19g (unset = cascade on + chain fused); the value "0"
         // turns BOTH off (the unfused fallback of record; bit-identical, so
         // the ids and logits cannot move; only the launch shape does).
-        let hcf = std::env::var("CROW_QFUSE").unwrap_or_else(|_| "unset".to_string());
+        let hcf = env_or_unset("CROW_QFUSE");
         println!("[hc] hyper-connection decode chain {}, shared-expert chain {}, CROW_QFUSE {} (1 = 19f fused hc + 19h fused shared, 0 = all off)",
             if hc_fuse_on() { "fused (default since 19g, 4 launches per hc block)" } else { "unfused (fallback of record, 8 launches)" },
             if sh_fuse_on() { "fused (19h, 3 launches)" } else { "unfused (0 = fallback, 6 launches)" }, hcf);
@@ -857,7 +857,7 @@ impl Engine {
         // dense GEMM form, next to the [hc] line and for the same reason:
         // every future log says which dense form produced it. It sits in the
         // [load] block, so the parity gate prints it too.
-        let pgb = std::env::var("CROW_PF_GEMM_B").unwrap_or_else(|_| "unset".to_string());
+        let pgb = env_or_unset("CROW_PF_GEMM_B");
         println!("[pf-gemm-b] prefill dense GEMM {}, CROW_PF_GEMM_B {} (exact 1 = variant B 32-token tiles, unset or other = the 8-token form of record)",
             if pf_gemm_b_on() { "variant B (gemm_fp4_dense_b / gemm_bf16_dense_b)" } else { "8-token tiles (of record)" }, pgb);
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
@@ -889,12 +889,12 @@ impl Engine {
             log(&format!("prefill staging on a side stream (CROW_PF_ASYNC={}): 2 x {} slots", pf_async_mode(), pf_tg()));
         }
         let scratch_measured = cuda::total_vram_bytes() - cuda::free_vram_bytes() - dense_measured;
-        log(&format!("scratch + staging resident: {:.0} MiB (chunk {})", scratch_measured as f64 / (1 << 20) as f64, cfg.prompt_chunk));
+        log(&format!("scratch + staging resident: {:.0} MiB (chunk {})", scratch_measured as f64 / MIB, cfg.prompt_chunk));
         // #10b: ONE line per process names the diet regions, so every future
         // log says which scratch layout produced it (next to the measured
         // total above, the union is the largest of the five phase sets).
         log(&format!("[diet] scratch persist region {:.0} MiB + union region {:.0} MiB (largest of the hc/attn/gdn/ple/moe phase sets), CROW_CHUNK {}",
-            s.persist_bytes as f64 / (1 << 20) as f64, s.union_bytes as f64 / (1 << 20) as f64, cfg.prompt_chunk));
+            s.persist_bytes as f64 / MIB, s.union_bytes as f64 / MIB, cfg.prompt_chunk));
 
         // ---- budget verify + states (#9) ----
         // dense + PLE row cache + scratch + staging are all resident already
@@ -907,7 +907,11 @@ impl Engine {
         let ring_reserve = if pf_dma_on() && mma_on() && pf_gemm_on() {
             2 * (E - cfg.n_hot.saturating_sub(24).min(E)) as u64 * (slabs.gu_bytes + slabs.dn_bytes)
         } else { 0 };
-        let pending = (128u64 << 20) + ring_reserve;
+        // VRAM the planner must leave free for launch/param plumbing. Sibling
+        // of `manager::SAFETY` (512 MiB), which covers the clamp loop's own
+        // pools + scratch + telemetry: two reserves, two sums, two numbers.
+        const LAUNCH_SLACK: u64 = 128 << 20;
+        let pending = LAUNCH_SLACK + ring_reserve;
         // pinned-side sizing follows the cold tier actually used (record size
         // of a low-bit tier, full tier = constant; see residency::build)
         let (cold_unit, cold_fixed) = match std::env::var("CROW_COLD_TIER").ok() {
@@ -939,11 +943,11 @@ impl Engine {
             let need_dn = res.cold_dn.iter().map(|p| p.bytes as u64).max().unwrap_or(0);
             if 2 * (need_gu + need_dn) > ring_reserve {
                 log(&format!("prefetch ring needs {:.0} MiB but only {:.0} MiB were planned (N clamped below n_hot-24) - CROW_PF_DMA disabled for this run",
-                    2.0 * (need_gu + need_dn) as f64 / (1 << 20) as f64, ring_reserve as f64 / (1 << 20) as f64));
+                    2.0 * (need_gu + need_dn) as f64 / MIB, ring_reserve as f64 / MIB));
                 ([0, 0], [0, 0], std::ptr::null_mut())
             } else {
                 log(&format!("prefetch ring: 2 x ({:.0} + {:.0}) MiB VRAM, copy engine on a side stream",
-                    need_gu as f64 / (1 << 20) as f64, need_dn as f64 / (1 << 20) as f64));
+                    need_gu as f64 / MIB, need_dn as f64 / MIB));
                 ([cuda::alloc_zeroed(need_gu as usize), cuda::alloc_zeroed(need_gu as usize)],
                  [cuda::alloc_zeroed(need_dn as usize), cuda::alloc_zeroed(need_dn as usize)],
                  cuda::stream_create_non_blocking())
@@ -954,6 +958,7 @@ impl Engine {
         crate::kernels::kprof_init();
         let module = cuda::compile(&crate::kernels::KERNEL_SRC);
         let k = Kernels::new(&module);
+        assert_kernel_defines();
         let p = Params::setup(&cfg, &st);
         let sel_counts = cuda::alloc_zeroed(LAYERS * E * 8);
         let w = Weights {
@@ -973,10 +978,10 @@ impl Engine {
         log(&format!(
             "load done in {:.0} s — VRAM used {:.2} GiB (dense {:.2} GiB + hot experts {} × 48 × {:.2} MB + states)",
             t0.elapsed().as_secs_f64(),
-            dense_after as f64 / (1 << 30) as f64,
-            dense_measured as f64 / (1 << 30) as f64,
+            dense_after as f64 / GIB,
+            dense_measured as f64 / GIB,
             res.n,
-            (res.gu_bytes + res.dn_bytes) as f64 / (1 << 20) as f64
+            (res.gu_bytes + res.dn_bytes) as f64 / MIB
         ));
 
         let report = LoadReport {
@@ -1082,16 +1087,22 @@ pub unsafe fn load_pw(cnq: &mut Cnq, name: &str, sec: &str) -> PW {
     }
 }
 
-pub unsafe fn dequant_fp4_dev(cnq: &mut Cnq, name: &str, sec: &str, n: usize) -> Dev {
-    let t = cnq.find(name, sec).clone();
-    let raw = cnq.read_bytes(&t);
+/// NVFP4 -> host f32: the 36-byte-block walk, block order preserved.
+/// `n` is the value count; the tail beyond `raw.len()/36*64` stays zero.
+fn dequant_fp4_host(raw: &[u8], gs: f32, n: usize) -> Vec<f32> {
     let mut out = vec![0f32; n];
     let mut blk = [0f32; 64];
     for (b, chunk) in raw.chunks_exact(36).enumerate() {
-        cnq::dequant_block(chunk, t.global_scale, &mut blk);
+        cnq::dequant_block(chunk, gs, &mut blk);
         out[b * 64..(b + 1) * 64].copy_from_slice(&blk);
     }
-    cuda::to_f32_dev(&out)
+    out
+}
+
+pub unsafe fn dequant_fp4_dev(cnq: &mut Cnq, name: &str, sec: &str, n: usize) -> Dev {
+    let t = cnq.find(name, sec).clone();
+    let raw = cnq.read_bytes(&t);
+    cuda::to_f32_dev(&dequant_fp4_host(&raw, t.global_scale, n))
 }
 
 /// tiny tensors (A_log, dt_bias): any dtype → host f32 → device
@@ -1101,15 +1112,7 @@ pub unsafe fn load_small_f32(cnq: &mut Cnq, name: &str, sec: &str, n: usize) -> 
     let v: Vec<f32> = match t.dtype.as_str() {
         "bf16" => cnq::bf16_bytes_to_f32(&raw),
         "i64" => panic!("{name}: i64 unexpected here"),
-        _ => {
-            let mut out = vec![0f32; n];
-            let mut blk = [0f32; 64];
-            for (b, chunk) in raw.chunks_exact(36).enumerate() {
-                cnq::dequant_block(chunk, t.global_scale, &mut blk);
-                out[b * 64..(b + 1) * 64].copy_from_slice(&blk);
-            }
-            out
-        }
+        _ => dequant_fp4_host(&raw, t.global_scale, n),
     };
     assert_eq!(v.len(), n, "{name}: size mismatch");
     cuda::to_f32_dev(&v)
@@ -1366,15 +1369,21 @@ unsafe fn launch_bf16_dense(k: &Kernels, w: u64, x: u64, y: u64, k_dim: u64, row
     }
 }
 
-/// MMA k-split factor (CROW_MMA_KS, default 4): block = 128 * KS threads;
-/// KS warps-groups split the k-blocks and reduce deterministically in smem.
-/// KS=1 is the original single-slice kernel (bit-identical).
-pub fn mma_bx() -> u32 {
+/// CROW_MMA_KS (default 4, clamped 1..=4): the k-split factor BOTH mma block
+/// sizes are built from. One `OnceLock` for one env key - `mma_bx` and
+/// `mma_bx32` used to read it through a static each, so a typo in one of the
+/// two key strings could have silently desynchronised the grids.
+pub fn mma_ks() -> u32 {
     static KS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    128 * *KS.get_or_init(|| {
+    *KS.get_or_init(|| {
         std::env::var("CROW_MMA_KS").ok().and_then(|v| v.parse().ok()).filter(|&k| (1..=4).contains(&k)).unwrap_or(4)
     })
 }
+
+/// MMA k-split factor (CROW_MMA_KS, default 4): block = 128 * KS threads;
+/// KS warps-groups split the k-blocks and reduce deterministically in smem.
+/// KS=1 is the original single-slice kernel (bit-identical).
+pub fn mma_bx() -> u32 { 128 * mma_ks() }
 
 /// #62d 32-row GDN GEMV twin block size (`gemv_fp4_mma_d32` / `_g32`):
 /// 64 * KS threads = 2 row groups of 16 rows x KS k slices (mma_bx() =
@@ -1382,16 +1391,31 @@ pub fn mma_bx() -> u32 {
 /// default 4 -> 256 threads) and the default stays 4: the k split and its
 /// fixed smem reduce order are parity critical (62a report lever 2), only
 /// the row groups per block halve and the grid doubles.
-pub fn mma_bx32() -> u32 {
-    static KS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    64 * *KS.get_or_init(|| {
-        std::env::var("CROW_MMA_KS").ok().and_then(|v| v.parse().ok()).filter(|&k| (1..=4).contains(&k)).unwrap_or(4)
-    })
-}
+pub fn mma_bx32() -> u32 { 64 * mma_ks() }
 
 /// step-2 kernel switches (default on; =0 selects the previous kernel)
 fn env_on(name: &str) -> bool {
     std::env::var(name).as_deref() != Ok("0")
+}
+
+/// The `expand_slab` block-count scalars, alive for exactly one adaptation
+/// pass: allocate, run the pass, sync, free. Both ticks bracket their swap
+/// loop with this, and a missing `free` here leaks 2 device allocs per token.
+unsafe fn with_nblk<R>(f: impl FnOnce(Dev, Dev) -> R) -> R {
+    let nblk_gu = cuda::to_i32_dev(&[((2 * INTER * H) / 64) as i32]);
+    let nblk_dn = cuda::to_i32_dev(&[((H * INTER) / 64) as i32]);
+    let r = f(nblk_gu, nblk_dn);
+    cuda::sync();
+    let (mut a, mut b) = (nblk_gu, nblk_dn);
+    cuda::free_dev(&mut a);
+    cuda::free_dev(&mut b);
+    r
+}
+
+/// boot-log helper: a switch's raw value, or the literal `unset`. Every
+/// `[load]` line that names a CROW_* switch reports it through this.
+fn env_or_unset(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| "unset".to_string())
 }
 /// CROW_TRICKLE_DEFER (default 1 = deferred; `0` selects the eager order, kept
 /// as the fallback; any other value and unset take the default): the stream
@@ -1505,9 +1529,13 @@ pub const ATTN_SPLITS: usize = 8;
 /// #61a: the partial buffers are sized for the largest allowed split count,
 /// so CROW_ATTN_SPLITS can be raised at runtime without a reallocation.
 pub const ATTN_SPLITS_MAX: usize = 32;
-pub const QSA_PAR_BLOCKS: u32 = 512;
-/// #61a: bin count of the qsa_select_par round A histogram (12 top key bits);
-/// must match QSA_PAR_BINS in kernels.rs.
+/// #61a: grid of `qsa_scores_par` (the SCORES kernel). Unrelated to
+/// `qsa_select_blocks()` below, which sizes the histogram kernel - they used
+/// to be `QSA_PAR_BLOCKS` and `qsa_par_blocks()`, one letter apart.
+pub const QSA_SCORES_BLOCKS: u32 = 512;
+/// #61a: bin count of the qsa_select_par round A histogram (12 top key bits).
+/// Twin of `#define QSA_PAR_BINS` in the frozen `KERNEL_SRC`; the match is
+/// asserted at boot by `assert_kernel_defines()`.
 pub const QSA_PAR_BINS: usize = 4096;
 /// #61a CROW_ATTN_SPLITS (allowed 4 8 16 32, anything else falls back to the
 /// const): the split count of the decode attention (grid.z of
@@ -1545,7 +1573,7 @@ fn qsa_par_on() -> bool {
 /// #61a CROW_QSA_PAR_BLOCKS (default 32, clamped to 4 .. 256): the block count
 /// of qsa_select_par_h. The histogram is order free, so the count never moves
 /// a bit of the selection list.
-fn qsa_par_blocks() -> u32 {
+fn qsa_select_blocks() -> u32 {
     static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("CROW_QSA_PAR_BLOCKS").ok().and_then(|v| v.parse().ok())
         .unwrap_or(32u32).clamp(4, 256))
@@ -1558,6 +1586,29 @@ fn qsa_par_blocks() -> u32 {
 /// sh[tid] under tid < 1024, so any other block size reads stale shared memory
 /// or deadlocks the barriers. This is a launch CONTRACT, not a tuneable.
 pub const QSA_PAR_E_THREADS: u32 = 1024;
+
+/// #20 device sampler: the three `#define`s of the `sample_topk_part` /
+/// `sample_k` pair in `KERNEL_SRC` (:3990-3992). Launch CONTRACT, not
+/// tuneables - the candidate buffers are [PARTS][MAXK] and the two kernels
+/// index them with those exact bounds. `assert_kernel_defines()` checks all
+/// four Rust twins against the frozen source at boot.
+pub const SAMPLE_MAXK: usize = 64;
+pub const SAMPLE_PARTS: u32 = 64;
+pub const SAMPLE_THREADS: u32 = 256;
+
+/// Every Rust twin of a `KERNEL_SRC` `#define`, checked against the source
+/// itself. Called once per `Engine::load`, right after the module compiles.
+pub fn assert_kernel_defines() {
+    for (name, rust) in [
+        ("QSA_PAR_BINS", QSA_PAR_BINS as u32),
+        ("SAMPLE_MAXK", SAMPLE_MAXK as u32),
+        ("SAMPLE_PARTS", SAMPLE_PARTS),
+        ("SAMPLE_THREADS", SAMPLE_THREADS),
+    ] {
+        let cuda = crate::kernels::define_u32(name);
+        assert_eq!(cuda, rust, "{name}: KERNEL_SRC says {cuda}, the Rust twin says {rust}");
+    }
+}
 
 /// #61b: the ONLY launcher of qsa_select_par_e, so the 32-warp contract of
 /// QSA_PAR_E_THREADS holds for every caller by construction:
@@ -2361,7 +2412,7 @@ impl Engine {
                 p.q_heads1 as u64, p.pos_mul4 as u64, p.stride128 as u64, p.pos_base_b4 as u64]);
         }
         if attn_split_on() {
-            launch_v(k.f("qsa_scores_par"), QSA_PAR_BLOCKS, 1, 1, 128, &[
+            launch_v(k.f("qsa_scores_par"), QSA_SCORES_BLOCKS, 1, 1, 128, &[
                 s.q_rot as u64, pooled, s.scores as u64, p.cap as u64, p.pos_base as u64]);
         } else {
             launch_v(k.f("qsa_scores"), 1, 1, 1, QSA_HD as u32, &[
@@ -2379,7 +2430,7 @@ impl Engine {
             // two launches must stay paired and ordered and nothing else may
             // write s.qsa_h1 (qsa_probe re-checks the zero after every row);
             // no GPU sync is spent on this host-side invariant.
-            launch_v(k.f("qsa_select_par_h"), qsa_par_blocks(), 1, 1, 256, &[
+            launch_v(k.f("qsa_select_par_h"), qsa_select_blocks(), 1, 1, 256, &[
                 s.scores as u64, p.ncb1 as u64, s.qsa_h1 as u64, p.k_top as u64, p.cap as u64]);
             launch_qsa_par_e(k.f("qsa_select_par_e"), 1, &[
                 s.scores as u64, p.ncb1 as u64, s.sel as u64, s.sel_n as u64, p.k_top as u64,
@@ -2861,9 +2912,7 @@ impl Engine {
             if let Ok(dir) = std::env::var("CROW_DUMP_H") {
                 cuda::sync();
                 let dump = |tag: &str, v: Vec<f32>| {
-                    let mut b = Vec::with_capacity(v.len() * 4);
-                    for x in &v { b.extend_from_slice(&x.to_le_bytes()); }
-                    std::fs::write(format!("{dir}/ple-{tag}.f32"), b).unwrap();
+                    cuda::write_le(&format!("{dir}/ple-{tag}.f32"), &v).unwrap();
                 };
                 dump("h-before-qn", cuda::dtoh(s.h, t * HCT));
                 dump("norm-query-w", cuda::dtoh(pl.norm_query, HCT));
@@ -2873,9 +2922,7 @@ impl Engine {
             if let Ok(dir) = std::env::var("CROW_DUMP_H") {
                 cuda::sync();
                 let v = cuda::dtoh(s.ple_qn, t * HCT);
-                let mut b = Vec::with_capacity(v.len() * 4);
-                for x in &v { b.extend_from_slice(&x.to_le_bytes()); }
-                std::fs::write(format!("{dir}/ple-qn-immediate.f32"), b).unwrap();
+                cuda::write_le(&format!("{dir}/ple-qn-immediate.f32"), &v).unwrap();
             }
         if dbg { cuda::sync(); eprintln!("[ple] step 15"); }
             launch_v(k.f("gate_dot"), 4, t as u32, 1, 256, &[
@@ -2917,9 +2964,7 @@ impl Engine {
             if let Ok(dir) = std::env::var("CROW_DUMP_H") {
                 cuda::sync();
                 let dump = |tag: &str, v: Vec<f32>| {
-                    let mut b = Vec::with_capacity(v.len() * 4);
-                    for x in &v { b.extend_from_slice(&x.to_le_bytes()); }
-                    std::fs::write(format!("{dir}/ple-{tag}.f32"), b).unwrap();
+                    cuda::write_le(&format!("{dir}/ple-{tag}.f32"), &v).unwrap();
                 };
                 dump("emb", cuda::dtoh(s.emb, t * PLE_EMBED));
                 dump("key", cuda::dtoh(s.ple_key, t * HCT));
@@ -3060,9 +3105,7 @@ impl Engine {
         cuda::to_i32_into(self.p.nt_combo, &[((t * TOPK * INTER) as i32)]);
         cuda::to_i32_into(self.pf_ncombo, &[(t * TOPK) as i32]);
         let dump = |dir: &str, tag: &str, v: &[f32]| {
-            let mut b = Vec::with_capacity(v.len() * 4);
-            for x in v { b.extend_from_slice(&x.to_le_bytes()); }
-            std::fs::write(format!("{dir}/gpu-{tag}.f32"), b).unwrap();
+            cuda::write_le(&format!("{dir}/gpu-{tag}.f32"), v).unwrap();
         };
         self.hc_run(&self.w.hc[l], self.s.h, t, self.s.mixed, self.s.injw);
         cuda::sync();
@@ -3322,9 +3365,7 @@ impl Engine {
                     if l == 0 { if let Ok(dir) = std::env::var("CROW_DUMP_H") {
                         cuda::sync();
                         let v = cuda::dtoh(ptr, n);
-                        let mut b = Vec::with_capacity(v.len() * 4);
-                        for x in &v { b.extend_from_slice(&x.to_le_bytes()); }
-                        std::fs::write(format!("{dir}/l0-{tag}.f32"), b).unwrap();
+                        cuda::write_le(&format!("{dir}/l0-{tag}.f32"), &v).unwrap();
                     } }
                 };
                 dump0("mixed", mixed, t * H);
@@ -3409,9 +3450,7 @@ impl Engine {
                     // grouped-GEMM plan of layer 0: perm [t*10] i32, tiles [n_tiles] int4, rids [t*10]
                     cuda::sync();
                     let wr = |tag: &str, v: Vec<i32>| {
-                        let mut b = Vec::with_capacity(v.len() * 4);
-                        for x in &v { b.extend_from_slice(&x.to_le_bytes()); }
-                        std::fs::write(format!("{dir}/l0-{tag}.i32"), b).unwrap();
+                        cuda::write_le(&format!("{dir}/l0-{tag}.i32"), &v).unwrap();
                     };
                     let nt = cuda::dtoh_i32(self.stage.n_tiles, 1)[0] as usize;
                     wr("moe-perm", cuda::dtoh_i32(self.stage.perm, t * TOPK));
@@ -3437,9 +3476,7 @@ impl Engine {
                 if let Ok(dir) = std::env::var("CROW_DUMP_H") {
                     cuda::sync();
                     let v = cuda::dtoh(self.s.h, t * HCT);
-                    let mut b = Vec::with_capacity(v.len() * 4);
-                    for x in &v { b.extend_from_slice(&x.to_le_bytes()); }
-                    std::fs::write(format!("{dir}/h-chunk{start}-layer{l:02}.f32"), b).unwrap();
+                    cuda::write_le(&format!("{dir}/h-chunk{start}-layer{l:02}.f32"), &v).unwrap();
                 }
             }
             self.pf_dma_live.set(false);
@@ -3716,8 +3753,8 @@ impl Engine {
             mask: cuda::alloc_zeroed(V),
             rng: cuda::alloc_zeroed(8),
             params: cuda::alloc_zeroed(16),
-            cand_v: cuda::alloc_zeroed(64 * 64 * 4),
-            cand_i: cuda::alloc_zeroed(64 * 64 * 4),
+            cand_v: cuda::alloc_zeroed(SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
+            cand_i: cuda::alloc_zeroed(SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
             in_graph: std::cell::Cell::new(false),
         });
         let zero = vec![0u8; V];
@@ -3737,10 +3774,10 @@ impl Engine {
 
     unsafe fn launch_sample(&self, ds: &DevSampler) {
         // v2: 64 blocks pick their slice's top-k, one block merges and draws
-        launch_v(self.k.f("sample_topk_part"), 64, 1, 1, 256, &[
+        launch_v(self.k.f("sample_topk_part"), SAMPLE_PARTS, 1, 1, SAMPLE_THREADS, &[
             self.s.logits as u64, self.p.n_vocab as u64, ds.mask as u64, ds.params as u64,
             ds.cand_v as u64, ds.cand_i as u64]);
-        launch_v(self.k.f("sample_k"), 1, 1, 1, 256, &[
+        launch_v(self.k.f("sample_k"), 1, 1, 1, SAMPLE_THREADS, &[
             ds.cand_v as u64, ds.cand_i as u64, self.s.argmax as u64, self.p.n_vocab as u64,
             ds.mask as u64, ds.rng as u64, ds.params as u64]);
     }
@@ -3771,25 +3808,21 @@ impl Engine {
         let counts = self.drain_sel_counts();
         self.adapt_base = counts.concat();
         self.adapt_ema = vec![0.0; LAYERS * E];
-        let nblk_gu = cuda::to_i32_dev(&[((2 * INTER * H) / 64) as i32]);
-        let nblk_dn = cuda::to_i32_dev(&[((H * INTER) / 64) as i32]);
-        let mut total = 0usize;
-        let none = std::collections::HashSet::new();
-        for l in 0..LAYERS {
-            let plan = self.res.plan_swaps(l, &counts[l], max_swaps, &none);
-            for &(slot, evict, new_id) in &plan {
-                self.res.swap_in(&self.k, l, slot, evict, new_id, nblk_gu, nblk_dn);
-                total += 1;
+        with_nblk(|nblk_gu, nblk_dn| {
+            let mut total = 0usize;
+            let none = std::collections::HashSet::new();
+            for l in 0..LAYERS {
+                let plan = self.res.plan_swaps(l, &counts[l], max_swaps, &none);
+                for &(slot, evict, new_id) in &plan {
+                    self.res.swap_in(&self.k, l, slot, evict, new_id, nblk_gu, nblk_dn);
+                    total += 1;
+                }
+                if !plan.is_empty() {
+                    self.res.flush_layer_tables(l);
+                }
             }
-            if !plan.is_empty() {
-                self.res.flush_layer_tables(l);
-            }
-        }
-        cuda::sync();
-        let (mut a, mut b) = (nblk_gu, nblk_dn);
-        cuda::free_dev(&mut a);
-        cuda::free_dev(&mut b);
-        total
+            total
+        })
     }
 
     /// Decode-time adaptation tick (#17). Default: the cumulative re-cut
@@ -3805,6 +3838,15 @@ impl Engine {
         if std::env::var("CROW_ADAPT_WINDOW").as_deref() != Ok("1") {
             return None;
         }
+        self.decay_window();
+        Some((0..LAYERS).map(|l| self.window_layer(l)).collect())
+    }
+
+    /// Fold the selections SINCE the last tick into the per-expert EMA
+    /// (decay CROW_ADAPT_DECAY, default 0.5) and re-base. The drain, the
+    /// `saturating_sub` and the accumulate order are the window's definition -
+    /// `window_counts` and `adapt_tick` share this one copy of it.
+    unsafe fn decay_window(&mut self) {
         let decay: f64 = std::env::var("CROW_ADAPT_DECAY").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5);
         let now = self.drain_sel_counts().concat();
         if self.adapt_base.len() != now.len() {
@@ -3816,7 +3858,11 @@ impl Engine {
             self.adapt_ema[i] = self.adapt_ema[i] * decay + d;
         }
         self.adapt_base = now;
-        Some((0..LAYERS).map(|l| self.adapt_ema[l * E..(l + 1) * E].iter().map(|v| (v * 1024.0) as u64).collect()).collect())
+    }
+
+    /// `plan_swaps` ranks by u64 counts: layer `l`'s decayed window, x1024
+    fn window_layer(&self, l: usize) -> Vec<u64> {
+        self.adapt_ema[l * E..(l + 1) * E].iter().map(|v| (v * 1024.0) as u64).collect()
     }
 
     pub unsafe fn adapt_tick(&mut self, max_swaps: usize) -> usize {
@@ -3826,51 +3872,36 @@ impl Engine {
         if self.res.lb.is_some() && !self.res.full {
             return 0;
         }
-        let decay: f64 = std::env::var("CROW_ADAPT_DECAY").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5);
-        let now = self.drain_sel_counts().concat();
-        if self.adapt_base.len() != now.len() {
-            self.adapt_base = now.clone();
-            self.adapt_ema = vec![0.0; now.len()];
-        }
-        for i in 0..now.len() {
-            let d = now[i].saturating_sub(self.adapt_base[i]) as f64;
-            self.adapt_ema[i] = self.adapt_ema[i] * decay + d;
-        }
-        self.adapt_base = now;
-        let nblk_gu = cuda::to_i32_dev(&[((2 * INTER * H) / 64) as i32]);
-        let nblk_dn = cuda::to_i32_dev(&[((H * INTER) / 64) as i32]);
-        let mut total = 0usize;
-        let none = std::collections::HashSet::new();
-        // #17: CROW_SWAP_BUNDLE=1 exchanges all pairs of the tick in one launch per
-        // size class (48 layers x <= max_swaps pairs) instead of 6 memcpys per swap
-        let bundle = swap_bundle_on() && self.res.lb.is_none();
-        let (mut gu_pairs, mut dn_pairs) = (Vec::new(), Vec::new());
-        let mut touched: Vec<usize> = Vec::new();
-        for l in 0..LAYERS {
-            // plan_swaps ranks by u64 counts: scale the decayed window by 1024
-            let c: Vec<u64> = self.adapt_ema[l * E..(l + 1) * E].iter().map(|v| (v * 1024.0) as u64).collect();
-            let plan = self.res.plan_swaps(l, &c, max_swaps, &none);
-            for &(slot, evict, new_id) in &plan {
-                if bundle {
-                    self.res.swap_in_bundled(l, slot, evict, new_id, &mut gu_pairs, &mut dn_pairs);
-                } else {
-                    self.res.swap_in(&self.k, l, slot, evict, new_id, nblk_gu, nblk_dn);
+        self.decay_window();
+        with_nblk(|nblk_gu, nblk_dn| {
+            let mut total = 0usize;
+            let none = std::collections::HashSet::new();
+            // #17: CROW_SWAP_BUNDLE=1 exchanges all pairs of the tick in one launch per
+            // size class (48 layers x <= max_swaps pairs) instead of 6 memcpys per swap
+            let bundle = swap_bundle_on() && self.res.lb.is_none();
+            let (mut gu_pairs, mut dn_pairs) = (Vec::new(), Vec::new());
+            let mut touched: Vec<usize> = Vec::new();
+            for l in 0..LAYERS {
+                let c = self.window_layer(l);
+                let plan = self.res.plan_swaps(l, &c, max_swaps, &none);
+                for &(slot, evict, new_id) in &plan {
+                    if bundle {
+                        self.res.swap_in_bundled(l, slot, evict, new_id, &mut gu_pairs, &mut dn_pairs);
+                    } else {
+                        self.res.swap_in(&self.k, l, slot, evict, new_id, nblk_gu, nblk_dn);
+                    }
+                    total += 1;
                 }
-                total += 1;
+                if !plan.is_empty() {
+                    if bundle { touched.push(l); } else { self.res.flush_layer_tables(l); }
+                }
             }
-            if !plan.is_empty() {
-                if bundle { touched.push(l); } else { self.res.flush_layer_tables(l); }
+            if bundle {
+                self.res.swap_pairs_launch(&self.k, &gu_pairs, &dn_pairs);
+                for &l in &touched { self.res.flush_layer_tables(l); }
             }
-        }
-        if bundle {
-            self.res.swap_pairs_launch(&self.k, &gu_pairs, &dn_pairs);
-            for &l in &touched { self.res.flush_layer_tables(l); }
-        }
-        cuda::sync();
-        let (mut a, mut b) = (nblk_gu, nblk_dn);
-        cuda::free_dev(&mut a);
-        cuda::free_dev(&mut b);
-        total
+            total
+        })
     }
 
     /// Stream-side trickle (A-P3c): one tick per token boundary, BEFORE the
@@ -4123,13 +4154,13 @@ fn engine_lock_release() {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        unsafe { cuda::drop_dbg("before Engine"); }
         // #18 (2026-09-05): everything the field Drops do not cover — the graph
         // exec and capture stream, the staging slots and grouped-GEMM plan, the
         // prefetch rings and events, the routing counters, the trickle stream.
         // The planner of the next load in the same process reads cuMemGetInfo;
         // ~400 MB of slack decided between "fits" and "refuses".
         unsafe {
+            cuda::drop_dbg("before Engine");
             cuda::sync();
             if self.graph_exec != 0 {
                 cuda::graph_exec_destroy(self.graph_exec as cudarc::driver::sys::CUgraphExec);
@@ -4199,8 +4230,8 @@ impl Drop for Engine {
 
 impl Drop for Weights {
     fn drop(&mut self) {
-        unsafe { cuda::drop_dbg("before Weights"); }
         unsafe {
+            cuda::drop_dbg("before Weights");
             cuda::free_dev(&mut self.lm_head);
             cuda::free_dev(&mut self.mx_norm);
             free_pw(&mut self.mx_down);
@@ -4253,8 +4284,8 @@ impl Drop for Weights {
 
 impl Drop for Ple {
     fn drop(&mut self) {
-        unsafe { cuda::drop_dbg("before Ple"); }
         unsafe {
+            cuda::drop_dbg("before Ple");
             for f in [&mut self.key.w, &mut self.key.gs, &mut self.value.w, &mut self.value.gs] {
                 cuda::free_dev(f);
             }
@@ -4271,8 +4302,8 @@ impl Drop for Ple {
 
 impl Drop for Params {
     fn drop(&mut self) {
-        unsafe { cuda::drop_dbg("before Params"); }
         unsafe {
+            cuda::drop_dbg("before Params");
             for f in [&mut self.n320, &mut self.n2560, &mut self.n640, &mut self.n6144, &mut self.n10240,
                       &mut self.n2048, &mut self.n12288, &mut self.n_conv_deq, &mut self.n_selmax,
                       &mut self.k_top, &mut self.cap, &mut self.tmax, &mut self.mode, &mut self.t,
@@ -4293,8 +4324,8 @@ impl Drop for Params {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        unsafe { cuda::drop_dbg("before Scratch"); }
         unsafe {
+            cuda::drop_dbg("before Scratch");
             // #10b: the fields point INTO the two diet regions, so the drop
             // frees the two region bases and not the interior pointers (the
             // per-field walk here freed interior addresses and failed with

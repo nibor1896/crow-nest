@@ -25,24 +25,16 @@ fn read_ids(path: &str) -> Vec<i64> {
         .collect()
 }
 
-fn write_f32(path: &str, v: &[f32]) {
-    let mut b = Vec::with_capacity(v.len() * 4);
-    for x in v {
-        b.extend_from_slice(&x.to_le_bytes());
-    }
-    std::fs::write(path, b).unwrap();
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
-    let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| "../converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq".into());
+    let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| from_engine_dir(DEFAULT_CNQ));
     // CROW_CNQ and CROW_HOTSETS override container and hot-set sidecar
     // (e.g. a sidecar warmed on real traffic via `decode warmup`)
     // defaults (#48): the production -M container and the id-sorted rectangular
     // sidecar serve.rs loads, both relative to engine/, the cwd of `decode`
-    let sidecar = std::env::var("CROW_HOTSETS").unwrap_or_else(|_| "../decode_out/hotsets-M-longctx2100-n160.json".into());
+    let sidecar = std::env::var("CROW_HOTSETS").unwrap_or_else(|_| from_engine_dir(DEFAULT_HOTSETS));
     let mut cnq = Cnq::open(&cnq_path);
 
     unsafe {
@@ -124,7 +116,7 @@ fn main() {
                         }
                     }
                 }
-                write_f32(&format!("{out}/gpu-logits.f32"), &logits.concat());
+                crow_nest_engine::cuda::write_le(&format!("{out}/gpu-logits.f32"), &logits.concat()).unwrap();
                 serde_json::to_writer(
                     std::fs::File::create(format!("{out}/gen-sequence.json")).unwrap(),
                     &serde_json::json!({

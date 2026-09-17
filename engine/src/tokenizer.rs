@@ -237,7 +237,7 @@ fn build_env(template: String) -> Result<Environment<'static>, String> {
 // ------------------------------------------------------------- construction
 
 /// sibling `tokenizer_config.json` of a `tokenizer.json` path
-fn sibling_config(tokenizer_path: &str) -> String {
+pub fn sibling_config(tokenizer_path: &str) -> String {
     let p = tokenizer_path.replace('\\', "/");
     match p.rfind('/') {
         Some(i) => format!("{}/tokenizer_config.json", &p[..i]),
@@ -381,8 +381,8 @@ mod tests {
 
     fn tk() -> ChatTokenizer {
         // tests run from engine/, the model lives at the repository root
-        let t = "../models/Qwen3.8-Flash-Next-original/tokenizer.json";
-        ChatTokenizer::load(t, &sibling_config(t)).expect("tokenizer loads")
+        let t = format!("../{DEFAULT_TOKENIZER}");
+        ChatTokenizer::load(&t, &sibling_config(&t)).expect("tokenizer loads")
     }
 
     #[test]

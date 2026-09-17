@@ -34,7 +34,7 @@
 use crate::cuda::{self, CUdeviceptr as Dev};
 use crate::gen::{launch_v, Fp4};
 use crate::kernels::Kernels;
-use crate::{cnq::Cnq, geo::H};
+use crate::{cnq::Cnq, geo::{H, MIB}};
 
 /// the `<|image_pad|>` token (tokenizer_config.json added_tokens_decoder)
 pub const IMAGE_PAD: i64 = 248056;
@@ -197,18 +197,18 @@ pub struct Vit {
     scratch: bool,
 }
 
-const S_KD1536: usize = 0;
-const S_KD1152: usize = 1;
-const S_KD4304: usize = 2;
-const S_KD4608: usize = 3;
-const S_COLS1152: usize = 4;
+const S_KD_IN: usize = 0;
+const S_KD_HIDDEN: usize = 1;
+const S_KD_INTER: usize = 2;
+const S_KD_MERGED: usize = 3;
+const S_COLS_HIDDEN: usize = 4;
 const S_N: usize = 5;
 const S_NV: usize = 6;
-const S_STRIDE1152: usize = 7;
-const S_BIAS3456: usize = 8;  // stride 3456, cols 3456 (one pair packed [s,c])
-const S_BIAS4304: usize = 9;
-const S_BIAS4608: usize = 10;
-const S_BIAS2560: usize = 11;
+const S_STRIDE_HIDDEN: usize = 7;
+const S_BIAS_QKV: usize = 8;  // stride 3456, cols 3456 (one pair packed [s,c])
+const S_BIAS_INTER: usize = 9;
+const S_BIAS_MERGED: usize = 10;
+const S_BIAS_H: usize = 11;
 const S_COLS_STRIDE: usize = 12; // [cols, stride] pair for vit_add_bias, refreshed per site
 const S_NP: usize = 13;          // n * 1152, the add_flat residual count (refreshed per image)
 const S_NMLP: usize = 14;        // n * 4304, the block MLP gelu count
@@ -254,36 +254,42 @@ impl Vit {
             return;
         }
         let cap = self.cap;
-        let f32n = |n: usize| cuda::alloc_zeroed(n * 4);
+        // every scratch buffer is n four-byte elements: the allocator counts
+        // what it actually handed out and the boot line prints THAT. It used
+        // to print `cap * 41_024`, a hand-summed bytes-per-patch literal that
+        // no longer matched the twelve allocations below - and could not have
+        // been noticed, because nothing derives from it.
+        let mut bytes = 0usize;
+        let mut alloc4 = |n: usize| { bytes += n * 4; cuda::alloc_zeroed(n * 4) };
         let scalars: Vec<i32> = vec![
-            1536, 1152, 4304, 4608, 1152, // S_KD1536..S_COLS1152
+            VIT_IN as i32, VIT_HIDDEN as i32, VIT_INTER as i32, VIT_MERGED as i32, VIT_HIDDEN as i32,
             0, 0,                          // S_N, S_NV (refreshed per image)
-            0, 0, 0, 0, 0,                 // S_STRIDE1152 + S_BIAS*
+            0, 0, 0, 0, 0,                 // S_STRIDE_HIDDEN + S_BIAS*
             0,                             // S_COLS_STRIDE (unused)
             0, 0, 0,                       // S_NP, S_NMLP, S_NMERGE
         ];
         self.s = scalars.iter().map(|v| cuda::to_i32_dev(&[*v])).collect();
-        self.x = f32n(cap * VIT_HIDDEN);
-        self.normed = f32n(cap * VIT_HIDDEN);
-        self.qkv = f32n(cap * VIT_QKV);
-        self.attn = f32n(cap * VIT_HIDDEN);
-        self.mlp = f32n(cap * VIT_INTER);
-        self.m1 = f32n(cap / 4 * VIT_MERGED);
-        self.out = f32n(cap / 4 * H);
-        self.patches = f32n(cap * VIT_IN);
-        self.pe_idx = cuda::alloc_zeroed(cap * 4 * 4);
-        self.pe_w = f32n(cap * 4);
-        self.cs = f32n(cap * VIT_ROT);
-        self.sn = f32n(cap * VIT_ROT);
-        cuda::to_i32_into(self.s[S_STRIDE1152], &[1152]);
-        cuda::to_i32_into(self.s[S_BIAS3456], &[3456]);
-        cuda::to_i32_into(self.s[S_BIAS4304], &[4304]);
-        cuda::to_i32_into(self.s[S_BIAS4608], &[4608]);
-        cuda::to_i32_into(self.s[S_BIAS2560], &[2560]);
+        self.x = alloc4(cap * VIT_HIDDEN);
+        self.normed = alloc4(cap * VIT_HIDDEN);
+        self.qkv = alloc4(cap * VIT_QKV);
+        self.attn = alloc4(cap * VIT_HIDDEN);
+        self.mlp = alloc4(cap * VIT_INTER);
+        self.m1 = alloc4(cap / 4 * VIT_MERGED);
+        self.out = alloc4(cap / 4 * H);
+        self.patches = alloc4(cap * VIT_IN);
+        self.pe_idx = alloc4(cap * 4);
+        self.pe_w = alloc4(cap * 4);
+        self.cs = alloc4(cap * VIT_ROT);
+        self.sn = alloc4(cap * VIT_ROT);
+        cuda::to_i32_into(self.s[S_STRIDE_HIDDEN], &[VIT_HIDDEN as i32]);
+        cuda::to_i32_into(self.s[S_BIAS_QKV], &[VIT_QKV as i32]);
+        cuda::to_i32_into(self.s[S_BIAS_INTER], &[VIT_INTER as i32]);
+        cuda::to_i32_into(self.s[S_BIAS_MERGED], &[VIT_MERGED as i32]);
+        cuda::to_i32_into(self.s[S_BIAS_H], &[H as i32]);
         cuda::sync();
         self.scratch = true;
         eprintln!("[vit] scratch allocated on the first image request ({:.0} MiB at cap {} patches)",
-            cap as f64 * 41_024.0 / (1 << 20) as f64, cap);
+            bytes as f64 / MIB, cap);
     }
 
     /// one NVFP4 linear: y[t][rows] = w x^T with RAW f32 activations, via the
@@ -302,8 +308,17 @@ impl Vit {
             y, bias, self.s[sp], self.s[sp]]);
     }
 
+    /// CROW_VIT_TRACE stage dump: sync, one D2H, one `stage-<tag>.f32` in
+    /// CROW_VIT_DUMP. The seven trace points in `run` all had this body inline.
+    unsafe fn trace_dump(&self, on: bool, tag: &str, buf: Dev, n: usize) {
+        if !on { return; }
+        cuda::sync();
+        let dir = std::env::var("CROW_VIT_DUMP").unwrap_or_default();
+        f32_file(&format!("{dir}/stage-{tag}.f32"), &cuda::dtoh(buf, n));
+    }
+
     unsafe fn ln(&self, k: &Kernels, w: Dev, b: Dev, t: usize, x: Dev, out: Dev) {
-        launch_v(k.f("vit_ln"), t as u32, 1, 1, 256, &[x, w, b, out, self.s[S_COLS1152]]);
+        launch_v(k.f("vit_ln"), t as u32, 1, 1, 256, &[x, w, b, out, self.s[S_COLS_HIDDEN]]);
     }
 
     /// the full tower. `patches_host` [n][1536] normalized patch rows in
@@ -336,17 +351,15 @@ impl Vit {
 
         // patch embed: the Conv3d as GEMV 1536 → 1152, then bias, then the
         // bilinear-interpolated learned position embed
-        self.gemv(k, &self.w.patch_proj, VIT_HIDDEN, S_KD1536, S_KD1152, n, self.patches, self.x);
-        self.bias(k, self.w.patch_bias, S_STRIDE1152, n, self.x);
+        self.gemv(k, &self.w.patch_proj, VIT_HIDDEN, S_KD_IN, S_KD_HIDDEN, n, self.patches, self.x);
+        self.bias(k, self.w.patch_bias, S_STRIDE_HIDDEN, n, self.x);
         launch_v(k.f("vit_pe_add"), n as u32, 1, 1, 256, &[
             self.x, self.w.pos_embed, self.pe_idx, self.pe_w, self.s[S_N]]);
         // stage dumps for the oracle bisect (CROW_VIT_TRACE=1)
         let trace = std::env::var("CROW_VIT_TRACE").is_ok();
         if trace {
-            cuda::sync();
+            self.trace_dump(true, "pe", self.x, n * VIT_HIDDEN);
             let dumpdir = std::env::var("CROW_VIT_DUMP").unwrap_or_default();
-            let xv = cuda::dtoh(self.x, n * VIT_HIDDEN);
-            f32_file(&format!("{dumpdir}/stage-pe.f32"), &xv);
             f32_file(&format!("{dumpdir}/stage-cs.f32"), cs_host);
             f32_file(&format!("{dumpdir}/stage-sn.f32"), sn_host);
             eprintln!("[vit-trace] dumped stage-pe + cs/sn");
@@ -355,78 +368,48 @@ impl Vit {
         for (bi, b) in self.w.blocks.iter().enumerate() {
             // norm1 → fused qkv (+ bias), rotary in place on the q and k thirds
             self.ln(k, b.n1w, b.n1b, n, self.x, self.normed);
-            let dumpdir = std::env::var("CROW_VIT_DUMP").unwrap_or_default();
-            if trace && bi == 0 {
-                cuda::sync();
-                let xv = cuda::dtoh(self.normed, n * VIT_HIDDEN);
-                f32_file(&format!("{dumpdir}/stage-b0-n1.f32"), &xv);
-            }
-            self.gemv(k, &b.qkv, VIT_QKV, S_KD1152, S_BIAS3456, n, self.normed, self.qkv);
-            self.bias(k, b.qkv_b, S_BIAS3456, n, self.qkv);
-            if trace && bi == 0 {
-                cuda::sync();
-                let xv = cuda::dtoh(self.qkv, n * VIT_QKV);
-                f32_file(&format!("{dumpdir}/stage-b0-qkv.f32"), &xv);
-            }
+            let b0 = trace && bi == 0;
+            self.trace_dump(b0, "b0-n1", self.normed, n * VIT_HIDDEN);
+            self.gemv(k, &b.qkv, VIT_QKV, S_KD_HIDDEN, S_BIAS_QKV, n, self.normed, self.qkv);
+            self.bias(k, b.qkv_b, S_BIAS_QKV, n, self.qkv);
+            self.trace_dump(b0, "b0-qkv", self.qkv, n * VIT_QKV);
             launch_v(k.f("vit_rope"), VIT_HEADS as u32, n as u32, 1, 64, &[
                 self.qkv, self.cs, self.sn]);
-            if trace && bi == 0 {
-                cuda::sync();
-                let xv = cuda::dtoh(self.qkv, n * VIT_QKV);
-                f32_file(&format!("{dumpdir}/stage-b0-qkv-rope.f32"), &xv);
-            }
+            self.trace_dump(b0, "b0-qkv-rope", self.qkv, n * VIT_QKV);
             // non-causal attention over the whole image, one query row per block
             launch_v(k.f("vit_attn"), n as u32, VIT_HEADS as u32, 1, 256, &[
                 self.qkv, self.attn, self.s[S_N]]);
-            if trace && bi == 0 {
-                cuda::sync();
-                let xv = cuda::dtoh(self.attn, n * VIT_HIDDEN);
-                f32_file(&format!("{dumpdir}/stage-b0-attn.f32"), &xv);
-            }
+            self.trace_dump(b0, "b0-attn", self.attn, n * VIT_HIDDEN);
             // proj + residual
-            self.gemv(k, &b.proj, VIT_HIDDEN, S_KD1152, S_STRIDE1152, n, self.attn, self.normed);
-            self.bias(k, b.proj_b, S_STRIDE1152, n, self.normed);
+            self.gemv(k, &b.proj, VIT_HIDDEN, S_KD_HIDDEN, S_STRIDE_HIDDEN, n, self.attn, self.normed);
+            self.bias(k, b.proj_b, S_STRIDE_HIDDEN, n, self.normed);
             launch_v(k.f("add_flat"), ((n * VIT_HIDDEN + 255) / 256) as u32, 1, 1, 256, &[
                 self.normed, self.x, self.s[S_NP]]);
-            if trace && bi == 0 {
-                cuda::sync();
-                let xv = cuda::dtoh(self.x, n * VIT_HIDDEN);
-                f32_file(&format!("{dumpdir}/stage-b0-res.f32"), &xv);
-            }
+            self.trace_dump(b0, "b0-res", self.x, n * VIT_HIDDEN);
             // MLP: fc1 → gelu tanh → fc2 → residual
             self.ln(k, b.n2w, b.n2b, n, self.x, self.normed);
-            self.gemv(k, &b.fc1, VIT_INTER, S_KD1152, S_BIAS4304, n, self.normed, self.mlp);
-            self.bias(k, b.fc1_b, S_BIAS4304, n, self.mlp);
+            self.gemv(k, &b.fc1, VIT_INTER, S_KD_HIDDEN, S_BIAS_INTER, n, self.normed, self.mlp);
+            self.bias(k, b.fc1_b, S_BIAS_INTER, n, self.mlp);
             launch_v(k.f("gelu_tanh"), ((n * VIT_INTER + 255) / 256) as u32, 1, 1, 256, &[
                 self.mlp, self.s[S_NMLP]]);
-            if trace && bi == 0 {
-                cuda::sync();
-                let dumpdir = std::env::var("CROW_VIT_DUMP").unwrap_or_default();
-                let xv = cuda::dtoh(self.mlp, n * VIT_INTER);
-                f32_file(&format!("{dumpdir}/stage-b0-gelu.f32"), &xv);
-            }
-            self.gemv(k, &b.fc2, VIT_HIDDEN, S_KD4304, S_STRIDE1152, n, self.mlp, self.normed);
-            self.bias(k, b.fc2_b, S_STRIDE1152, n, self.normed);
+            self.trace_dump(b0, "b0-gelu", self.mlp, n * VIT_INTER);
+            self.gemv(k, &b.fc2, VIT_HIDDEN, S_KD_INTER, S_STRIDE_HIDDEN, n, self.mlp, self.normed);
+            self.bias(k, b.fc2_b, S_STRIDE_HIDDEN, n, self.normed);
             launch_v(k.f("add_flat"), ((n * VIT_HIDDEN + 255) / 256) as u32, 1, 1, 256, &[
                 self.normed, self.x, self.s[S_NP]]);
-            if trace && bi == 0 {
-                cuda::sync();
-                let dumpdir = std::env::var("CROW_VIT_DUMP").unwrap_or_default();
-                let xv = cuda::dtoh(self.x, n * VIT_HIDDEN);
-                f32_file(&format!("{dumpdir}/stage-block0.f32"), &xv);
-                eprintln!("[vit-trace] dumped stage-block0");
-            }
+            self.trace_dump(b0, "block0", self.x, n * VIT_HIDDEN);
+            if b0 { eprintln!("[vit-trace] dumped stage-block0"); }
         }
 
         // merger: LN(1152) over patches → the [nv][4608] view is contiguous →
         // fc1 → exact-erf GELU → fc2 → the [nv][2560] visual embeddings
         self.ln(k, self.w.m_norm_w, self.w.m_norm_b, n, self.x, self.normed);
-        self.gemv(k, &self.w.m_fc1, VIT_MERGED, S_KD4608, S_BIAS4608, nv, self.normed, self.m1);
-        self.bias(k, self.w.m_fc1_b, S_BIAS4608, nv, self.m1);
+        self.gemv(k, &self.w.m_fc1, VIT_MERGED, S_KD_MERGED, S_BIAS_MERGED, nv, self.normed, self.m1);
+        self.bias(k, self.w.m_fc1_b, S_BIAS_MERGED, nv, self.m1);
         launch_v(k.f("gelu_erf"), ((nv * VIT_MERGED + 255) / 256) as u32, 1, 1, 256, &[
             self.m1, self.s[S_NMERGE]]);
-        self.gemv(k, &self.w.m_fc2, H, S_KD4608, S_BIAS2560, nv, self.m1, self.out);
-        self.bias(k, self.w.m_fc2_b, S_BIAS2560, nv, self.out);
+        self.gemv(k, &self.w.m_fc2, H, S_KD_MERGED, S_BIAS_H, nv, self.m1, self.out);
+        self.bias(k, self.w.m_fc2_b, S_BIAS_H, nv, self.out);
         self.out
     }
 
@@ -936,7 +919,7 @@ impl Vit {
         eprintln!(
             "[vit-cache] {} image(s): {} through the tower, {} cached; cache {} entries, {:.1} MiB of {} MiB",
             images.len(), misses, images.len() - misses,
-            self.image_cache.len(), self.image_cache_bytes as f64 / (1 << 20) as f64,
+            self.image_cache.len(), self.image_cache_bytes as f64 / MIB,
             vit_cache_bytes() >> 20
         );
         let counts: Vec<usize> = infos.iter().map(|(_, n)| *n).collect();
@@ -976,15 +959,11 @@ impl Vit {
     }
 }
 
-/// raw f32 little-endian file write, failures logged not raised
-fn f32_file(path: &str, v: &[f32]) {
-    use std::io::Write;
-    match std::fs::File::create(path) {
-        Ok(mut f) => {
-            let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
-            let _ = f.write_all(bytes);
-        }
-        Err(e) => eprintln!("[vit-dump] write {path} failed: {e}"),
+/// raw f32 little-endian file write, failures logged not raised.
+/// `pub` because serve's `/v1` logits dump writes the same file the same way.
+pub fn f32_file(path: &str, v: &[f32]) {
+    if let Err(e) = cuda::write_le(path, v) {
+        eprintln!("[vit-dump] write {path} failed: {e}");
     }
 }
 

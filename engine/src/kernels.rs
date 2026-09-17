@@ -4477,6 +4477,22 @@ extern "C" __global__ void gelu_tanh(float* __restrict__ x, const int* __restric
 use cudarc::driver::sys::CUfunction;
 use std::collections::HashMap;
 
+/// Read `#define <name> <integer>` out of the FROZEN `KERNEL_SRC`.
+/// The CUDA source cannot change, so the Rust twins of its four `#define`s
+/// (`QSA_PAR_BINS`, `SAMPLE_MAXK`, `SAMPLE_PARTS`, `SAMPLE_THREADS`) are
+/// checked against it at boot instead of being trusted to a comment.
+pub fn define_u32(name: &str) -> u32 {
+    let pat = format!("#define {name} ");
+    let i = KERNEL_SRC
+        .find(&pat)
+        .unwrap_or_else(|| panic!("{name}: no such #define in KERNEL_SRC"));
+    let rest = &KERNEL_SRC[i + pat.len()..];
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end]
+        .parse()
+        .unwrap_or_else(|_| panic!("{name}: #define is not a plain integer"))
+}
+
 pub struct Kernels {
     map: HashMap<&'static str, CUfunction>,
 }

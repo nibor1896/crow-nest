@@ -95,11 +95,6 @@ fn pack_nib(nibs: &[u32]) -> u32 {
     nibs.iter().enumerate().map(|(i, &n)| n << (4 * i)).sum()
 }
 
-fn to_u32_dev(v: &[u32]) -> cuda::CUdeviceptr {
-    unsafe {
-        cuda::upload_dev(std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4))
-    }
-}
 
 fn main() {
     unsafe {
@@ -118,13 +113,13 @@ fn main() {
                 *reg = pack_nib(&[2, 2, 2, 2, 2, 2, 2, 2]);
             }
         }
-        let a_dev = to_u32_dev(&a_frag);
-        let b_dev = to_u32_dev(&b_frag);
+        let a_dev = cuda::to_dev(&a_frag);
+        let b_dev = cuda::to_dev(&b_frag);
         let n_warps = 32usize;
 
         let run = |sfa: &[u32; 32], sfb: &[u32; 32]| -> Vec<f32> {
-            let sfa_dev = to_u32_dev(sfa);
-            let sfb_dev = to_u32_dev(sfb);
+            let sfa_dev = cuda::to_dev(sfa);
+            let sfb_dev = cuda::to_dev(sfb);
             let out = cuda::alloc_zeroed(n_warps * 128 * 4);
             // every kernel arg is a device address — the driver reads the VALUES
             // from these host slots (gen.rs launch_v pattern)

@@ -31,26 +31,12 @@
 //!
 //! usage: router_probe
 use crow_nest_engine::cuda;
+use crow_nest_engine::sample::Rng;
 use crow_nest_engine::gen::launch_v;
 
-/// deterministic xorshift64*: the same inputs on every machine and every run
-struct Rng(u64);
-impl Rng {
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    fn f01(&mut self) -> f32 {
-        ((self.next_u64() >> 40) as f32) / (1u32 << 24) as f32
-    }
-    /// uniform in [-a, a]
-    fn uni(&mut self, a: f32) -> f32 {
-        (self.f01() * 2.0 - 1.0) * a
-    }
+/// uniform in [-a, a] over the shared deterministic xorshift64* stream
+fn uni(rng: &mut Rng, a: f32) -> f32 {
+    (rng.f01() * 2.0 - 1.0) * a
 }
 
 /// top-10 indices by (value desc, index asc); ties are measure zero on
@@ -135,9 +121,9 @@ fn main() {
         // block 128), and the production int args via device buffers
         // (scalar args travel as device pointers on this raw-launch path)
         for &t in [2048usize, 8usize].iter() {
-            let mut rng = Rng(0x10d_5eED_2026_0914);
+            let mut rng = Rng::from_state(0x10d_5eED_2026_0914);
             // activations: post-norm f32 hidden states are O(1); uniform [-2, 2]
-            let x: Vec<f32> = (0..t * K).map(|_| rng.uni(2.0)).collect();
+            let x: Vec<f32> = (0..t * K).map(|_| uni(&mut rng, 2.0)).collect();
             // weights: uniform [-0.1, 0.1] then quantized to EXACT bf16 values
             // (truncate, re-widen): the engine invariant this probe depends on
             // is that the f32 router (load_f32 of the BF16 keep) and the bf16
@@ -146,7 +132,7 @@ fn main() {
             // order plus the dense form's hi+lo activation representation
             let w: Vec<f32> = (0..ROWS * K)
                 .map(|_| {
-                    let v: f32 = rng.uni(0.1);
+                    let v: f32 = uni(&mut rng, 0.1);
                     f32::from_bits(v.to_bits() & 0xFFFF_0000)
                 })
                 .collect();

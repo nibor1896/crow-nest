@@ -22,22 +22,8 @@
 use crow_nest_engine::cuda;
 use crow_nest_engine::gen::{launch_qsa_par_e, launch_v, QSA_PAR_BINS};
 use crow_nest_engine::geo::QSA_SEL_MAX;
-
 /// deterministic xorshift64*: the same rows on every machine and every run
-struct Rng(u64);
-impl Rng {
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    fn f01(&mut self) -> f32 {
-        ((self.next_u64() >> 40) as f32) / (1u32 << 24) as f32
-    }
-}
+use crow_nest_engine::sample::Rng;
 
 /// score distributions: the narrow ones are the hard cases for a radix top-k
 /// (every key shares the top digits), the tie ones exercise the lowest-index
@@ -155,7 +141,7 @@ fn main() {
             .unwrap_or(0);
 
         let mut host = vec![0f32; NQ_MAX * CAP_MAX];
-        let mut rng = Rng(0x1234_5678_9abc_def1);
+        let mut rng = Rng::from_state(0x1234_5678_9abc_def1);
         let mut rows = 0usize;
         let mut diffs = 0usize;
         let mut first_diff: Option<String> = None;

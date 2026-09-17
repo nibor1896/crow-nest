@@ -34,9 +34,6 @@ fn pack_nib(nibs: &[u32]) -> u32 {
     nibs.iter().enumerate().map(|(i, &n)| n << (4 * i)).sum()
 }
 
-fn to_u32_dev(v: &[u32]) -> cuda::CUdeviceptr {
-    unsafe { cuda::upload_dev(std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)) }
-}
 
 fn main() {
     unsafe {
@@ -54,8 +51,8 @@ fn main() {
                 *reg = pack_nib(&[2, 2, 2, 2, 2, 2, 2, 2]);
             }
         }
-        let a_dev = to_u32_dev(&a_frag);
-        let b_dev = to_u32_dev(&b_frag);
+        let a_dev = cuda::to_dev(&a_frag);
+        let b_dev = cuda::to_dev(&b_frag);
 
         // all-0x38 (1.0) fragments; sf bytes: sfa byte0 = candidate, rest 1.0;
         // sfb all 1.0 -> D[0][0] = 16 * (1.0) * dec(candidate byte0) * ... =
@@ -64,8 +61,8 @@ fn main() {
             let mut sfa = [0x38383838u32; 32]; // all bytes 1.0
             sfa[0] = 0x38383800 | cand; // byte0 = candidate, bytes1-3 = 1.0
             let sfb = [0x38383838u32; 32];
-            let sfa_dev = to_u32_dev(&sfa);
-            let sfb_dev = to_u32_dev(&sfb);
+            let sfa_dev = cuda::to_dev(&sfa);
+            let sfb_dev = cuda::to_dev(&sfb);
             let out = cuda::alloc_zeroed(128 * 4);
             let vals: [u64; 5] = [a_dev as u64, b_dev as u64, sfa_dev as u64, sfb_dev as u64, out as u64];
             let mut ptrs: Vec<*mut std::ffi::c_void> = vals

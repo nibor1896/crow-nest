@@ -22,21 +22,12 @@ use crow_nest_engine::geo::*;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 fn e2m1_mag(n: u32) -> f32 {
-    [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0][(n & 7) as usize]
+    cnq::e2m1(n & 7)
 }
 
 /// nibble of a signed e2m1 level given its magnitude index
 fn nib(mag_idx: u32, neg: bool) -> u32 {
     mag_idx | if neg { 8 } else { 0 }
-}
-
-fn mag_index(m: f32) -> u32 {
-    for (i, v) in [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0].iter().enumerate() {
-        if (*v - m).abs() < 1e-6 {
-            return i as u32;
-        }
-    }
-    panic!("codebook magnitude {m} is not an e2m1 level");
 }
 
 fn main() {
@@ -64,8 +55,8 @@ fn main() {
     // codebook: codes 0..n/2-1 = +levels ascending, n/2..n-1 = -levels ascending
     let mut cb_val: Vec<f32> = Vec::new();
     let mut cb_nib: Vec<u32> = Vec::new();
-    for &m in &levels { cb_val.push(m); cb_nib.push(nib(mag_index(m), false)); }
-    for &m in &levels { cb_val.push(-m); cb_nib.push(nib(mag_index(m), true)); }
+    for &m in &levels { cb_val.push(m); cb_nib.push(nib(cnq::mag_index(m), false)); }
+    for &m in &levels { cb_val.push(-m); cb_nib.push(nib(cnq::mag_index(m), true)); }
     let rec_bytes = 4 + 8 * bits as usize;
 
     let cnq_idx = Cnq::open(&cnq_path);
@@ -109,26 +100,7 @@ fn main() {
                     let mut codes = [0u32; 64];
                     for sb in 0..4 {
                         let vals = &blk[sb * 16..(sb + 1) * 16];
-                        let orig = src[sb] as i32;
-                        let mut best = (f64::INFINITY, orig as u32, [0u32; 16]);
-                        for d in -4i32..=4 {
-                            let byte = orig + d;
-                            if byte < 1 || byte > 0x7E { continue; }
-                            let s = cnq::ue4m3(byte as u32) * gs;
-                            let mut sse = 0f64;
-                            let mut cd = [0u32; 16];
-                            for (j, &v) in vals.iter().enumerate() {
-                                let mut bk = 0usize;
-                                let mut be = f32::INFINITY;
-                                for (k, &c) in cb_val.iter().enumerate() {
-                                    let err = (v - c * s).abs();
-                                    if err < be { be = err; bk = k; }
-                                }
-                                cd[j] = bk as u32;
-                                sse += (be as f64) * (be as f64);
-                            }
-                            if sse < best.0 { best = (sse, byte as u32, cd); }
-                        }
+                        let best = cnq::best_scale_and_codes(vals, src[sb] as i32, gs, &cb_val);
                         dst[sb] = best.1 as u8;
                         codes[sb * 16..(sb + 1) * 16].copy_from_slice(&best.2);
                         sse_new += best.0;

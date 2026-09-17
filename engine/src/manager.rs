@@ -21,8 +21,8 @@ use cudarc::driver::sys::CUdeviceptr;
 pub fn planner_refusal_msg(free0: u64, host_pinned_budget: u64) -> String {
     format!(
         "refusing config: no hot-set size fits BOTH the VRAM budget (free {:.2} GiB) and the host pinned budget ({:.1} GiB) — shrink the chunk/scratch, the PLE cache, or the keep-set (spec 2.1)",
-        free0 as f64 / (1u64 << 30) as f64,
-        host_pinned_budget as f64 / (1u64 << 30) as f64
+        free0 as f64 / GIB,
+        host_pinned_budget as f64 / GIB
     )
 }
 
@@ -53,7 +53,7 @@ pub fn ram_margin_bytes() -> u64 {
 /// `CROW_PINNED_BUDGET_GB` pins the budget for a measurement and skips the
 /// derivation entirely.
 pub fn derive_host_pinned_budget(cap: u64, log: &mut dyn FnMut(&str)) -> u64 {
-    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let gib = |b: u64| b as f64 / GIB;
     let (free_for_pin, mem_available) = cuda::free_physical_ram_parts();
     let margin = ram_margin_bytes();
     let (budget, basis) = match std::env::var("CROW_PINNED_BUDGET_GB").ok().and_then(|v| v.parse::<u64>().ok()) {
@@ -100,13 +100,13 @@ impl StateSizes {
         let ring = if std::env::var("CROW_QSA_FULL").as_deref() == Ok("1") {
             context
         } else {
-            ((prompt_chunk + 4 + 3) / 4 * 4).min(context)
+            ((prompt_chunk + QSA_COMPRESS + QSA_COMPRESS - 1) / QSA_COMPRESS * QSA_COMPRESS).min(context)
         };
         StateSizes {
             kv_bytes: (ATTN_LAYERS * 2 * NKV * AHD * context) as u64 * bpv,
             qsa_keys_bytes: (ATTN_LAYERS * ring * QSA_HIDD) as u64 * 4,
             qsa_ring_rows: ring,
-            qsa_pooled_bytes: (ATTN_LAYERS * ((context + 3) / 4) * QSA_HIDD) as u64 * 4,
+            qsa_pooled_bytes: (ATTN_LAYERS * ((context + QSA_COMPRESS - 1) / QSA_COMPRESS) * QSA_HIDD) as u64 * 4,
             gdn_s_bytes: (GDN_LAYERS * GDN_VHEADS * GD * GD) as u64 * 4,
             gdn_conv_bytes: (GDN_LAYERS * GDN_CONV * 3) as u64 * 4,
             rope_bytes: (context * ROPE_PAIRS * 2) as u64 * 4,
@@ -160,8 +160,8 @@ impl ThreeStates {
         let free0 = cuda::free_vram_bytes();
         rep.lines.push(format!(
             "VRAM total {:.2} GiB, free at start {:.2} GiB",
-            total as f64 / (1 << 30) as f64,
-            free0 as f64 / (1 << 30) as f64
+            total as f64 / GIB,
+            free0 as f64 / GIB
         ));
 
         // auto-clamp N with measured numbers, never the context (spec 2.1).
@@ -206,7 +206,7 @@ impl ThreeStates {
                 if n % 8 == 0 {
                     rep.lines.push(format!(
                         "VRAM budget over by {:.0} MB at N={} — clamping",
-                        (sum + SAFETY - free0) as f64 / (1 << 20) as f64,
+                        (sum + SAFETY - free0) as f64 / MIB,
                         n
                     ));
                 }
@@ -216,24 +216,24 @@ impl ThreeStates {
                 if n % 8 == 0 {
                     rep.lines.push(format!(
                         "host pinned tier over by {:.0} MB at N={} — raising N",
-                        (cold - cfg.host_pinned_budget) as f64 / (1 << 20) as f64,
+                        (cold - cfg.host_pinned_budget) as f64 / MIB,
                         n
                     ));
                 }
             }
             if cfg_n_dbg() {
                 eprintln!("[clamp] n={n} vram_sum={:.0} MB cold={:.0} MB free0={:.0} MB",
-                    states_bytes(n) as f64 / (1 << 20) as f64,
-                    ((if cold_fixed { E } else { E - n.min(E) + spare }) as u64 * cold_bytes_per_n_unit) as f64 / (1 << 20) as f64,
-                    free0 as f64 / (1 << 20) as f64);
+                    states_bytes(n) as f64 / MIB,
+                    ((if cold_fixed { E } else { E - n.min(E) + spare }) as u64 * cold_bytes_per_n_unit) as f64 / MIB,
+                    free0 as f64 / MIB);
             }
         }
         let cold_final = (if cold_fixed { E } else { E - n.min(E) + spare }) as u64 * cold_bytes_per_n_unit;
         if cold_final > cfg.host_pinned_budget {
             panic!(
                 "refusing config: hot set N={n} would pin {:.1} GiB cold > budget {:.1} GiB — no feasible N (spec 2.1)",
-                cold_final as f64 / (1 << 30) as f64,
-                cfg.host_pinned_budget as f64 / (1 << 30) as f64
+                cold_final as f64 / GIB,
+                cfg.host_pinned_budget as f64 / GIB
             );
         }
         if n < cfg.n_hot {
@@ -250,8 +250,8 @@ impl ThreeStates {
                 panic!(
                     "refusing config: even N={N_MIN} does not fit context {} states (need {:.2} GiB, free {:.2} GiB)",
                     cfg.context,
-                    sum as f64 / (1 << 30) as f64,
-                    free0 as f64 / (1 << 30) as f64
+                    sum as f64 / GIB,
+                    free0 as f64 / GIB
                 );
             }
         }
@@ -260,7 +260,7 @@ impl ThreeStates {
         let kv_buf = cuda::alloc_zeroed(sizes.kv_bytes as usize);
         rep.lines.push(format!(
             "KV        {:9.1} MB  (12 layers × 2 kv-heads × 256 × {context} × {})",
-            sizes.kv_bytes as f64 / (1 << 20) as f64,
+            sizes.kv_bytes as f64 / MIB,
             cfg.kv.name(),
             context = cfg.context
         ));
@@ -270,7 +270,7 @@ impl ThreeStates {
         }
         rep.lines.push(format!(
             "QSA keys  {:9.1} MB  (12 layers × {} × 128 f32 — raw-key ring, pooled cache stays full-length)",
-            sizes.qsa_keys_bytes as f64 / (1 << 20) as f64,
+            sizes.qsa_keys_bytes as f64 / MIB,
             sizes.qsa_ring_rows
         ));
         let mut qsa_pooled = Vec::with_capacity(ATTN_LAYERS);
@@ -280,7 +280,7 @@ impl ThreeStates {
         }
         rep.lines.push(format!(
             "QSA pooled{:9.1} MB  (12 layers × {} blocks × 128 f32)",
-            sizes.qsa_pooled_bytes as f64 / (1 << 20) as f64,
+            sizes.qsa_pooled_bytes as f64 / MIB,
             cap_blocks
         ));
         let mut gdn_s = Vec::with_capacity(GDN_LAYERS);
@@ -293,7 +293,7 @@ impl ThreeStates {
         }
         rep.lines.push(format!(
             "GDN state {:9.1} MB  (36 × S[48][128][128] + conv[10240][3], f32, fixed)",
-            (sizes.gdn_s_bytes + sizes.gdn_conv_bytes) as f64 / (1 << 20) as f64
+            (sizes.gdn_s_bytes + sizes.gdn_conv_bytes) as f64 / MIB
         ));
         let mut cos_h = vec![0f32; cfg.context * ROPE_PAIRS];
         let mut sin_h = vec![0f32; cfg.context * ROPE_PAIRS];
@@ -311,7 +311,7 @@ impl ThreeStates {
         drop(sin_h);
         rep.lines.push(format!(
             "RoPE tbl  {:9.1} MB  ({} positions × 32 pairs × cos+sin)",
-            sizes.rope_bytes as f64 / (1 << 20) as f64,
+            sizes.rope_bytes as f64 / MIB,
             cfg.context
         ));
 
@@ -321,7 +321,7 @@ impl ThreeStates {
         rep.effective_n = n;
         rep.lines.push(format!(
             "states+dense+hot measured in VRAM: {:.1} MiB (planned {:.1} MiB, N={n})",
-            measured as f64 / (1 << 20) as f64,
+            measured as f64 / MIB,
             (sizes.kv_bytes
                 + sizes.qsa_keys_bytes
                 + sizes.qsa_pooled_bytes
@@ -329,7 +329,7 @@ impl ThreeStates {
                 + sizes.gdn_conv_bytes
                 + sizes.rope_bytes
                 + pending_bytes
-                + n as u64 * expert_bytes_per_n_unit) as f64 / (1 << 20) as f64
+                + n as u64 * expert_bytes_per_n_unit) as f64 / MIB
         ));
 
         (

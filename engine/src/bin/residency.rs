@@ -43,7 +43,7 @@ fn main() {
     let n_requested: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(160);
 
     // #52: the generator defaults to the production -M container, like `decode` and `parity` (#51)
-    let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| "../converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq".into());
+    let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| from_engine_dir(DEFAULT_CNQ));
     // #52: the warm-up WRITES this path, so it must never be `<container>.hotsets.json`:
     // the ragged sidecar of #49 lives there and stays byte-unchanged.
     // CROW_HOTSETS_OUT overrides; the default is under decode_out, next to the gate inputs.
@@ -104,7 +104,7 @@ fn main() {
             "residency ready: N={} ({}) — pinned cold tier {:.2} GiB",
             eng.res.n,
             eng.res.source,
-            eng.res.pinned_bytes() as f64 / (1 << 30) as f64
+            eng.res.pinned_bytes() as f64 / GIB
         );
 
         // ---- held-out measurement pass ----
@@ -131,7 +131,7 @@ fn main() {
             let sel: u64 = c.iter().zip(prev.iter()).map(|(x, p)| x[0] - p[0]).sum();
             let cold: u64 = c.iter().zip(prev.iter()).map(|(x, p)| x[1] - p[1]).sum();
             let layers_cold = c.iter().zip(prev.iter()).filter(|(x, p)| x[1] > p[1]).count();
-            let bytes = cold as f64 * (eng.res.gu_bytes + eng.res.dn_bytes) as f64 / (1 << 20) as f64;
+            let bytes = cold as f64 * (eng.res.gu_bytes + eng.res.dn_bytes) as f64 / MIB;
             println!(
                 "decode {i}: {dt:7.2} ms  selections {sel:3}  cold {cold:3}  cold-bytes {bytes:6.1} MB  layers fully resident {}/{}",
                 LAYERS - layers_cold,
@@ -141,7 +141,7 @@ fn main() {
             cum.1 += cold;
             prev = c;
         }
-        let bytes = cum.1 as f64 * (eng.res.gu_bytes + eng.res.dn_bytes) as f64 / (1 << 20) as f64;
+        let bytes = cum.1 as f64 * (eng.res.gu_bytes + eng.res.dn_bytes) as f64 / MIB;
         println!(
             "\ntoken means: selections {:.0}  cold {:.1}  cold-bytes/token ~{:.1} MB (zero-copy, spec 3.4)",
             cum.0 as f64 / steps as f64,

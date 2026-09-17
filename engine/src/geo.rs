@@ -33,6 +33,50 @@ pub const PLE_EMB_DIM: usize = 160;
 pub const PLE_EMBED: usize = PLE_NHEADS * PLE_EMB_DIM; // 2560
 pub const PLE_ROWS_PER_SHARD: i64 = 2_500_012;
 pub const PLE_EOS: i64 = 248044;
+/// CAP on the pinned cold tier, and the ONE place to lower it for a smaller
+/// host. Measured host ceiling ~48.5 GB with ~2.5 GB of margin - only their
+/// DIFFERENCE is a number this code can hold, so it is written as one
+/// constant. The operating value is DERIVED from the running host at boot by
+/// `manager::derive_host_pinned_budget`, which takes the smaller of this cap
+/// and `free_for_pin - CROW_RAM_MARGIN_GB`.
+pub const HOST_PINNED_CAP: u64 = 46 << 30;
+
+// ---- the prompt-chunk family (see `apply_chunk_policy`) ----
+
+/// prompt chunks are rounded UP to a multiple of this and never fall below it;
+/// it is also the `Config::default` chunk (the decode/parity operating point)
+pub const CHUNK_ROUND: usize = 512;
+/// #10b: the auto policy never raises the chunk above this (the scratch diet
+/// lifted the F52 wall from 2048 to 4096)
+pub const CHUNK_CAP: usize = 4096;
+/// At or above this chunk the default adapt policy arms the STREAM trickle -
+/// and it is exactly the chunk `serve` pins (`bin/serve.rs::SERVE_CHUNK`
+/// derives from it). That is not a coincidence: serve's chunk choice is what
+/// arms the trickle, and the 4096 experiment of 2026-09-14 collapsed the live
+/// serve prefill because the trickle/adapt policy is tuned for THIS number.
+pub const TRICKLE_CHUNK_THRESHOLD: usize = 2048;
+
+// ---- units and default artefact paths ----
+
+/// f64 divisors for the byte-size log lines. `(1u64 << 20) as f64` is EXACT in
+/// f64, so every number printed through these is bit-identical to the inline
+/// `/ (1 << 20) as f64` form that used to be written out at 54 sites.
+pub const MIB: f64 = (1u64 << 20) as f64;
+pub const GIB: f64 = (1u64 << 30) as f64;
+
+/// The container and hot-set sidecar of record, RELATIVE TO THE REPO ROOT.
+/// `serve` and `parity` run from there and use them as written; the bins that
+/// run from `engine/` wrap them in `from_engine_dir`. Nine sites used to spell
+/// these two strings out across two CWD conventions.
+pub const DEFAULT_CNQ: &str = "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq";
+pub const DEFAULT_HOTSETS: &str = "decode_out/hotsets-M-longctx2100-n160.json";
+
+/// a repo-root-relative path as seen from `engine/` (where `cargo run`,
+/// `cargo test` and the probe bins start)
+pub fn from_engine_dir(p: &str) -> String {
+    format!("../{p}")
+}
+
 pub const QSA_HEADS: usize = 4;
 pub const QSA_KVHEADS: usize = 1;
 pub const QSA_HD: usize = 128;
@@ -109,8 +153,8 @@ impl Default for Config {
             n_hot: 160,
             kv: KvDtype::Fp8E4m3,
             ple_cache_bytes: 128 << 20, // #16: measured 2026-09-05, +0.2 % misses vs 1 GB, ~7 units freed
-            prompt_chunk: 512,
-            host_pinned_budget: 46 << 30, // CAP: measured host ceiling ~48.5 GB, 2.5 GB margin; the boot derives the rest
+            prompt_chunk: CHUNK_ROUND,
+            host_pinned_budget: HOST_PINNED_CAP,
             ple: true,
             adapt: Adapt::default(),
         }
@@ -153,8 +197,8 @@ pub fn apply_chunk_policy(cfg: &mut Config, n_prompt: usize) {
         _ => explicit.is_none(),
     };
     if auto {
-        let need = ((n_prompt + 511) / 512 * 512).max(512);
-        cfg.prompt_chunk = need.min(cfg.prompt_chunk.max(4096)); // #10b: cap 2048 to 4096, the scratch diet lifted the F52 wall
+        let need = ((n_prompt + CHUNK_ROUND - 1) / CHUNK_ROUND * CHUNK_ROUND).max(CHUNK_ROUND);
+        cfg.prompt_chunk = need.min(cfg.prompt_chunk.max(CHUNK_CAP));
     }
     apply_adapt_policy(cfg);
 }
@@ -178,7 +222,7 @@ pub fn apply_adapt_policy(cfg: &mut Config) {
     cfg.adapt = match stream.as_deref() {
         Some("1") => Adapt { stream: true, spare: spare.unwrap_or(1), every: every.unwrap_or(0), max: max.unwrap_or(8) },
         Some(_) => Adapt { stream: false, spare: spare.unwrap_or(0), every: every.unwrap_or(0), max: max.unwrap_or(8) },
-        None if cfg.prompt_chunk >= 2048 => Adapt { stream: true, spare: 7, every: 16, max: 7 },
+        None if cfg.prompt_chunk >= TRICKLE_CHUNK_THRESHOLD => Adapt { stream: true, spare: 7, every: 16, max: 7 },
         None => Adapt { stream: false, spare: spare.unwrap_or(0), every: every.unwrap_or(0), max: max.unwrap_or(8) },
     };
     let a = cfg.adapt;

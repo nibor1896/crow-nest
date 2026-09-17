@@ -16,7 +16,7 @@
 //! p5-verified chain over per-combo device pointer tables.
 
 use crate::cuda::{self, Pinned};
-use crate::geo::{E, LAYERS};
+use crate::geo::{E, GIB, LAYERS, MIB};
 use crate::cnq::Cnq;
 use cudarc::driver::sys::CUdeviceptr;
 use std::collections::HashMap;
@@ -164,8 +164,8 @@ impl Residency {
         }
         progress(&format!(
             "expert slabs per layer: gate_up {:.2} MB + down {:.2} MB per expert ({} experts, {} layers)",
-            slabs.gu_bytes as f64 / (1 << 20) as f64,
-            slabs.dn_bytes as f64 / (1 << 20) as f64,
+            slabs.gu_bytes as f64 / MIB,
+            slabs.dn_bytes as f64 / MIB,
             E,
             LAYERS
         ));
@@ -255,12 +255,12 @@ impl Residency {
         let margin = crate::manager::ram_margin_bytes();
         progress(&format!(
             "pinned cold tier {:.2} GiB vs free physical RAM {:.2} GiB (margin {:.0} GiB)",
-            cold_total as f64 / (1u64 << 30) as f64, free_phys as f64 / (1u64 << 30) as f64, margin as f64 / (1u64 << 30) as f64
+            cold_total as f64 / GIB, free_phys as f64 / GIB, margin as f64 / GIB
         ));
         if free_phys > 0 && cold_total + margin > free_phys {
             panic!(
                 "refusing to pin {:.2} GiB with only {:.2} GiB physical RAM free (margin {:.0} GiB): raise N (free VRAM), shrink the keep-set, or set CROW_RAM_MARGIN_GB",
-                cold_total as f64 / (1u64 << 30) as f64, free_phys as f64 / (1u64 << 30) as f64, margin as f64 / (1u64 << 30) as f64
+                cold_total as f64 / GIB, free_phys as f64 / GIB, margin as f64 / GIB
             );
         }
         // ---- VRAM hot slabs + pinned cold slabs ----
@@ -370,7 +370,7 @@ impl Residency {
                     if done % 128 == 0 {
                         progress(&format!(
                             "  layer {l}: cold experts {done}/{ncold} pinned ({:.0} MB)",
-                            (done as u64 * (slabs.gu_bytes + slabs.dn_bytes)) as f64 / (1 << 20) as f64
+                            (done as u64 * (slabs.gu_bytes + slabs.dn_bytes)) as f64 / MIB
                         ));
                     }
                 }
@@ -478,11 +478,9 @@ impl Residency {
     pub fn swap_in_bundled(&mut self, l: usize, slot: usize, evict: u32, new_id: u32,
                            gu_pairs: &mut Vec<(u64, u64)>, dn_pairs: &mut Vec<(u64, u64)>) {
         assert!(self.lb.is_none(), "swap_in_bundled: exact NVFP4 tier only");
-        let dst_gu = self.hot_gu as u64 + ((l * self.stride + slot) as u64) * self.gu_bytes;
-        let dst_dn = self.hot_dn as u64 + ((l * self.stride + slot) as u64) * self.dn_bytes;
+        let (dst_gu, dst_dn) = self.hot_ptrs(l, slot);
         let cs = self.cold_index[l].remove(&new_id).expect("incoming expert must be cold");
-        let src_gu = self.cold_gu[l].dev as u64 + cs as u64 * self.gu_bytes;
-        let src_dn = self.cold_dn[l].dev as u64 + cs as u64 * self.dn_bytes;
+        let (src_gu, src_dn) = self.cold_ptrs(l, cs);
         gu_pairs.push((dst_gu, src_gu));
         dn_pairs.push((dst_dn, src_dn));
         self.cold_index[l].insert(evict, cs);
@@ -514,16 +512,14 @@ impl Residency {
     /// Requires the full low-bit tier (every expert pinned). Stream-ordered.
     pub unsafe fn swap_in(&mut self, k: &crate::kernels::Kernels, l: usize, slot: usize, evict: u32, new_id: u32,
                           nblk_gu: CUdeviceptr, nblk_dn: CUdeviceptr) {
-        let dst_gu = self.hot_gu as u64 + ((l * self.stride + slot) as u64) * self.gu_bytes;
-        let dst_dn = self.hot_dn as u64 + ((l * self.stride + slot) as u64) * self.dn_bytes;
+        let (dst_gu, dst_dn) = self.hot_ptrs(l, slot);
         if self.lb.is_none() {
             // exact NVFP4 tier (cold-only pinned): three-way exchange through the
             // VRAM bounce slot — the incoming expert's pinned slot receives the
             // evicted expert's exact bytes, so host RAM never grows and every
             // expert stays reachable. Stream-ordered copies (UVA).
             let cs = self.cold_index[l].remove(&new_id).expect("incoming expert must be cold");
-            let src_gu = self.cold_gu[l].dev as u64 + cs as u64 * self.gu_bytes;
-            let src_dn = self.cold_dn[l].dev as u64 + cs as u64 * self.dn_bytes;
+            let (src_gu, src_dn) = self.cold_ptrs(l, cs);
             cuda::memcpy_async(self.bounce_gu, src_gu, self.gu_bytes as usize);
             cuda::memcpy_async(self.bounce_dn, src_dn, self.dn_bytes as usize);
             cuda::memcpy_async(src_gu, dst_gu, self.gu_bytes as usize);
@@ -543,23 +539,31 @@ impl Residency {
         self.sets[l][slot] = new_id;
     }
 
-    /// Rebuild one layer's pointer table (512 x 2 u64) and hot bitmap from the
-    /// host bookkeeping and upload them once — called after a layer's swaps
-    /// (two small HtoD copies per layer instead of four syncs per swap).
-    pub unsafe fn flush_layer_tables(&self, l: usize) {
+    /// Build layer `l`'s pointer table (512 x 2 u64) and its 16-word hot
+    /// bitmap from the host bookkeeping: every expert's cold record first,
+    /// then the hot residents written over the top. The ONE place that order
+    /// lives - both flushes fill their buffer through it.
+    fn fill_layer_table(&self, l: usize, tbl: &mut [u64], words: &mut [u32]) {
         let (cgu, cdn) = match &self.lb { Some(lb) => (lb.gu_rec, lb.dn_rec), None => (self.gu_bytes, self.dn_bytes) };
-        let mut tbl = vec![0u64; E * 2];
-        let mut words = [0u32; 16];
         for (&id, &cs) in &self.cold_index[l] {
             tbl[id as usize * 2] = self.cold_gu[l].dev as u64 + cs as u64 * cgu;
             tbl[id as usize * 2 + 1] = self.cold_dn[l].dev as u64 + cs as u64 * cdn;
         }
         for (slot, &id) in self.sets[l].iter().enumerate() {
             if id == EMPTY { continue; }
-            tbl[id as usize * 2] = self.hot_gu as u64 + ((l * self.stride + slot) as u64) * self.gu_bytes;
-            tbl[id as usize * 2 + 1] = self.hot_dn as u64 + ((l * self.stride + slot) as u64) * self.dn_bytes;
+            let (gu, dn) = self.hot_ptrs(l, slot);
+            tbl[id as usize * 2] = gu;
+            tbl[id as usize * 2 + 1] = dn;
             words[(id >> 5) as usize] |= 1u32 << (id & 31);
         }
+    }
+
+    /// one layer's table + bitmap, uploaded once — called after a layer's
+    /// swaps (two small HtoD copies per layer instead of four syncs per swap)
+    pub unsafe fn flush_layer_tables(&self, l: usize) {
+        let mut tbl = vec![0u64; E * 2];
+        let mut words = [0u32; 16];
+        self.fill_layer_table(l, &mut tbl, &mut words);
         cuda::to_u64_into(self.tables + (l * E * 2 * 8) as u64, &tbl);
         upload_u32(self.bitmaps + (l * 16 * 4) as u64, &words);
     }
@@ -568,22 +572,10 @@ impl Residency {
     /// bookkeeping and upload them in two copies (the trickle tick touches
     /// up to 48 layers per token; 96 small uploads cost ~2 ms of host time)
     pub unsafe fn flush_all_tables(&self) {
-        let (cgu, cdn) = match &self.lb { Some(lb) => (lb.gu_rec, lb.dn_rec), None => (self.gu_bytes, self.dn_bytes) };
         let mut tbl = vec![0u64; LAYERS * E * 2];
         let mut words = vec![0u32; LAYERS * 16];
         for l in 0..LAYERS {
-            let t = &mut tbl[l * E * 2..(l + 1) * E * 2];
-            let w = &mut words[l * 16..(l + 1) * 16];
-            for (&id, &cs) in &self.cold_index[l] {
-                t[id as usize * 2] = self.cold_gu[l].dev as u64 + cs as u64 * cgu;
-                t[id as usize * 2 + 1] = self.cold_dn[l].dev as u64 + cs as u64 * cdn;
-            }
-            for (slot, &id) in self.sets[l].iter().enumerate() {
-                if id == EMPTY { continue; }
-                t[id as usize * 2] = self.hot_gu as u64 + ((l * self.stride + slot) as u64) * self.gu_bytes;
-                t[id as usize * 2 + 1] = self.hot_dn as u64 + ((l * self.stride + slot) as u64) * self.dn_bytes;
-                w[(id >> 5) as usize] |= 1u32 << (id & 31);
-            }
+            self.fill_layer_table(l, &mut tbl[l * E * 2..(l + 1) * E * 2], &mut words[l * 16..(l + 1) * 16]);
         }
         cuda::to_u64_into(self.tables, &tbl);
         upload_u32(self.bitmaps, &words);
@@ -593,6 +585,14 @@ impl Residency {
     fn hot_ptrs(&self, l: usize, slot: usize) -> (u64, u64) {
         (self.hot_gu as u64 + ((l * self.stride + slot) as u64) * self.gu_bytes,
          self.hot_dn as u64 + ((l * self.stride + slot) as u64) * self.dn_bytes)
+    }
+
+    /// UVA pointers of cold slot `cs` of layer `l` on the EXACT NVFP4 tier
+    /// (record stride == slab size). The low-bit tier strides by `lb.gu_rec`
+    /// / `lb.dn_rec` instead and computes its own - see `swap_in`.
+    fn cold_ptrs(&self, l: usize, cs: usize) -> (u64, u64) {
+        (self.cold_gu[l].dev as u64 + cs as u64 * self.gu_bytes,
+         self.cold_dn[l].dev as u64 + cs as u64 * self.dn_bytes)
     }
 
     /// rank layer `l` by the cumulative routing counts `c`: up to `k` (0 = all)
@@ -631,8 +631,7 @@ impl Residency {
         let cs = *self.cold_index[l].get(&new_id).expect("incoming expert must be cold");
         let evict = self.sets[l][evict_slot];
         assert!(evict != EMPTY, "stream trickle: evicting an empty slot");
-        let src_gu = self.cold_gu[l].dev as u64 + cs as u64 * self.gu_bytes;
-        let src_dn = self.cold_dn[l].dev as u64 + cs as u64 * self.dn_bytes;
+        let (src_gu, src_dn) = self.cold_ptrs(l, cs);
         let (dst_gu, dst_dn) = self.hot_ptrs(l, spare);
         cuda::memcpy_async_on(dst_gu, src_gu, self.gu_bytes as usize, s);
         cuda::memcpy_async_on(dst_dn, src_dn, self.dn_bytes as usize, s);
@@ -652,8 +651,7 @@ impl Residency {
     /// commit A; the hot slot is only READ concurrently)
     pub unsafe fn swap_stream_b(&self, p: &PendingSwap, s: cudarc::driver::sys::CUstream) {
         let (src_gu, src_dn) = self.hot_ptrs(p.l, p.evict_slot);
-        let dst_gu = self.cold_gu[p.l].dev as u64 + p.cs as u64 * self.gu_bytes;
-        let dst_dn = self.cold_dn[p.l].dev as u64 + p.cs as u64 * self.dn_bytes;
+        let (dst_gu, dst_dn) = self.cold_ptrs(p.l, p.cs);
         cuda::memcpy_async_on(dst_gu, src_gu, self.gu_bytes as usize, s);
         cuda::memcpy_async_on(dst_dn, src_dn, self.dn_bytes as usize, s);
     }

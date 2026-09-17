@@ -15,28 +15,14 @@
 //! mma_probe differential lane map (sf_a: lane L -> row (L>>2)+8*(L&3), t<2;
 //! sf_b: lane L -> col L>>2, t==0).
 
+use crow_nest_engine::cnq;
 use crow_nest_engine::cuda::{self, CUdeviceptr, Pinned};
 use crow_nest_engine::gen::{launch_sync, launch_v};
 use crow_nest_engine::geo::*;
+use crow_nest_engine::sample::Rng;
 use crow_nest_engine::kernels::Kernels;
 
 // ---------------- Rust twins of the device math ----------------
-
-fn dec_e2m1(n: u32) -> f32 {
-    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let v = MAG[(n & 7) as usize];
-    if n & 8 != 0 { -v } else { v }
-}
-
-fn dec_ue4m3(b: u32) -> f32 {
-    let e = (b >> 3) & 0xF;
-    let m = b & 7;
-    if e == 0 {
-        (m as f32) * 1.953125e-3
-    } else {
-        (1.0 + (m as f32) / 8.0) * (2.0f32).powi(e as i32 - 7)
-    }
-}
 
 fn q_e2m1(v: f32) -> u32 {
     let s = if v < 0.0 { 8u32 } else { 0 };
@@ -74,7 +60,7 @@ fn dequant_slab(w: &[u8], rows: usize, k_dim: usize, gs: f32) -> Vec<f32> {
                 let byte = blk[4 + (idx >> 1)] as u32;
                 let nib = if idx & 1 == 1 { byte >> 4 } else { byte & 0xF };
                 out[r * k_dim + b * 64 + idx] =
-                    dec_e2m1(nib) * dec_ue4m3(blk[idx >> 4] as u32) * gs;
+                    cnq::e2m1(nib) * cnq::ue4m3(blk[idx >> 4] as u32) * gs;
             }
         }
     }
@@ -95,16 +81,16 @@ fn quant_row(x: &[f32], k_dim: usize) -> Vec<u8> {
                 let base = lv * bpr * 36 + b * 36;
                 let amax = src.iter().fold(0f32, |a, &v| a.max(v.abs()));
                 let sc = enc_ue4m3_up(amax / 6.0f32);
-                let inv = 1.0f32 / dec_ue4m3(sc as u32);
-                let scf = dec_ue4m3(sc as u32);
+                let inv = 1.0f32 / cnq::ue4m3(sc as u32);
+                let scf = cnq::ue4m3(sc as u32);
                 out[base + s] = sc;
                 let mut r = [0f32; 16];
                 for j in 0..8usize {
                     let n0 = q_e2m1(src[2 * j] * inv);
                     let n1 = q_e2m1(src[2 * j + 1] * inv);
                     out[base + 4 + s * 8 + j] = (n0 | (n1 << 4)) as u8;
-                    r[2 * j] = src[2 * j] - dec_e2m1(n0) * scf;
-                    r[2 * j + 1] = src[2 * j + 1] - dec_e2m1(n1) * scf;
+                    r[2 * j] = src[2 * j] - cnq::e2m1(n0) * scf;
+                    r[2 * j + 1] = src[2 * j + 1] - cnq::e2m1(n1) * scf;
                 }
                 src = r.to_vec();
             }
@@ -133,7 +119,7 @@ fn dequant_quant_row(q: &[u8], k_dim: usize) -> Vec<f32> {
         for idx in 0..64usize {
             let byte = blk[4 + (idx >> 1)] as u32;
             let nib = if idx & 1 == 1 { byte >> 4 } else { byte & 0xF };
-            out[b * 64 + idx] = dec_e2m1(nib) * dec_ue4m3(blk[idx >> 4] as u32);
+            out[b * 64 + idx] = cnq::e2m1(nib) * cnq::ue4m3(blk[idx >> 4] as u32);
         }
     }
     out
@@ -145,24 +131,16 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 // ---------------- random data ----------------
 
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545F4914F6CDD1D)
-    }
-    fn f32(&mut self) -> f32 {
-        (self.next() >> 40) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
-    }
-    fn gauss(&mut self) -> f32 {
-        let u1 = ((self.next() >> 11) as f64 + 1.0) / (1u64 << 53) as f64;
-        let u2 = (self.next() >> 11) as f64 / (1u64 << 53) as f64;
-        ((-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()) as f32
-    }
+/// symmetric uniform in [-1, 1) over the shared xorshift64* stream
+fn sym(rng: &mut Rng) -> f32 {
+    rng.f01() * 2.0 - 1.0
+}
+
+/// Box-Muller normal over the same stream
+fn gauss(rng: &mut Rng) -> f32 {
+    let u1 = ((rng.next_u64() >> 11) as f64 + 1.0) / (1u64 << 53) as f64;
+    let u2 = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+    ((-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()) as f32
 }
 
 fn rand_slab(rng: &mut Rng, rows: usize, k_dim: usize) -> Vec<u8> {
@@ -170,17 +148,17 @@ fn rand_slab(rng: &mut Rng, rows: usize, k_dim: usize) -> Vec<u8> {
     let mut v = vec![0u8; rows * bpr * 36];
     for b in v.chunks_exact_mut(36) {
         for s in 0..4usize {
-            b[s] = 0x28 + (rng.next() % 0x21) as u8; // scales ~0.13..4.8
+            b[s] = 0x28 + (rng.next_u64() % 0x21) as u8; // scales ~0.13..4.8
         }
         for j in 0..32usize {
-            b[4 + j] = (rng.next() % 256) as u8;
+            b[4 + j] = (rng.next_u64() % 256) as u8;
         }
     }
     v
 }
 
 fn rand_rows(rng: &mut Rng, rows: usize, k_dim: usize) -> Vec<f32> {
-    (0..rows * k_dim).map(|_| rng.gauss() * 1.5).collect()
+    (0..rows * k_dim).map(|_| gauss(rng) * 1.5).collect()
 }
 
 // ---------------- stats ----------------
@@ -264,7 +242,7 @@ unsafe fn gate_stage(k: &Kernels, n2560: CUdeviceptr, n640: CUdeviceptr, n64: CU
 
     println!("=== MMA gate stage 1: dyadic single-tile transport (expect EXACT 0) ===");
     {
-        let mut rng = Rng(0xDA1A);
+        let mut rng = Rng::from_state(0xDA1A);
         let (rows, k_dim) = (64usize, 64usize); // ONE m16n8k64 tile per warp
         let mut w = vec![0u8; rows * 36];
         for b in w.chunks_exact_mut(36) {
@@ -272,8 +250,8 @@ unsafe fn gate_stage(k: &Kernels, n2560: CUdeviceptr, n640: CUdeviceptr, n64: CU
                 *sb = [0x30, 0x38, 0x40, 0x38][s]; // 0.5 / 1 / 2 / 1
             }
             for j in 0..32usize {
-                let lo = (((rng.next() & 1) << 3) | 2) as u8; // +/- 1.0
-                let hi = (((rng.next() & 1) << 3) | 1) as u8; // +/- 0.5
+                let lo = (((rng.next_u64() & 1) << 3) | 2) as u8; // +/- 1.0
+                let hi = (((rng.next_u64() & 1) << 3) | 1) as u8; // +/- 0.5
                 b[4 + j] = lo | (hi << 4);
             }
         }
@@ -311,7 +289,7 @@ unsafe fn gate_stage(k: &Kernels, n2560: CUdeviceptr, n640: CUdeviceptr, n64: CU
     println!("=== MMA gate stage 2: random numerics vs naive ptrb + CPU references ===");
     for &(name, rows, k_dim, x_div) in &[("gate_up", 2 * INTER, H, TOPK), ("down", H, INTER, 1usize)] {
         println!("--- shape {name} [{rows},{k_dim}] ---");
-        let mut rng = Rng(if rows == 2 * INTER { 0x6A7E1 } else { 0x6A7E2 });
+        let mut rng = Rng::from_state(if rows == 2 * INTER { 0x6A7E1 } else { 0x6A7E2 });
         let bpr = k_dim / 64;
         let n_combos = 12usize; // >= 8 required
         let n_tokens = (n_combos + x_div - 1) / x_div;
@@ -327,7 +305,7 @@ unsafe fn gate_stage(k: &Kernels, n2560: CUdeviceptr, n640: CUdeviceptr, n64: CU
         let mut table: Vec<u64> = slab_devs.iter().map(|&d| d as u64).collect();
         table.push(pinned.dev as u64);
 
-        let gs = 0.25f32 + 0.5 * rng.f32().abs();
+        let gs = 0.25f32 + 0.5 * sym(&mut rng).abs();
         let x_rows = if x_div > 1 { n_tokens } else { n_combos };
         let x: Vec<f32> = rand_rows(&mut rng, x_rows, k_dim);
 
@@ -404,7 +382,7 @@ unsafe fn gate_stage(k: &Kernels, n2560: CUdeviceptr, n640: CUdeviceptr, n64: CU
 unsafe fn bench_stage(k: &Kernels, n2560: CUdeviceptr, n640: CUdeviceptr, one: CUdeviceptr, k_top10: CUdeviceptr) {
     for &(label, t) in &[("t=1 decode", 1usize), ("t=2048 prefill chunk", 2048usize)] {
         println!("=== MMA bench: routed MoE GEMVs per layer, {label} ===");
-        let mut rng = Rng(0xBEEF + t as u64);
+        let mut rng = Rng::from_state(0xBEEF + t as u64);
         let combos = t * TOPK;
         let tokens = t;
         let bpr_gu = H / 64; // 40 (k=2560)
@@ -504,11 +482,11 @@ unsafe fn dense_gate_stage(k: &Kernels) -> bool {
     ];
     for &(name, rows, k_dim, tokens) in shapes {
         println!("--- shape {name} ---");
-        let mut rng = Rng(0xD00D + rows as u64 * 131 + k_dim as u64);
+        let mut rng = Rng::from_state(0xD00D + rows as u64 * 131 + k_dim as u64);
         let bpr = k_dim / 64;
         let w = rand_slab(&mut rng, rows, k_dim);
         let x = rand_rows(&mut rng, tokens, k_dim);
-        let gs = 0.25f32 + 0.5 * rng.f32().abs();
+        let gs = 0.25f32 + 0.5 * sym(&mut rng).abs();
 
         let w_dev = cuda::upload_dev(&w);
         let x_dev = cuda::to_f32_dev(&x);
@@ -554,13 +532,13 @@ unsafe fn dense_gate_stage(k: &Kernels) -> bool {
 
     println!("--- sh12 stride layout: sg/su [640,2560] into ONE [t][1280] buffer, t=2 ---");
     {
-        let mut rng = Rng(0x5E12);
+        let mut rng = Rng::from_state(0x5E12);
         let (rows, k_dim, tokens) = (INTER, H, 2);
         let bpr = k_dim / 64;
         let wsg = rand_slab(&mut rng, rows, k_dim);
         let wsu = rand_slab(&mut rng, rows, k_dim);
         let x = rand_rows(&mut rng, tokens, k_dim);
-        let gs = 0.25f32 + 0.5 * rng.f32().abs();
+        let gs = 0.25f32 + 0.5 * sym(&mut rng).abs();
 
         let wsg_dev = cuda::upload_dev(&wsg);
         let wsu_dev = cuda::upload_dev(&wsu);
@@ -670,7 +648,7 @@ unsafe fn dense_bench_stage(k: &Kernels) {
         }
         println!("=== MMA-d bench: dense GEMV groups per layer, {label} ===");
         check("pre", &watch);
-        let mut rng = Rng(0xD00B + t as u64);
+        let mut rng = Rng::from_state(0xD00B + t as u64);
         let gs_dev = cuda::to_f32_dev(&[0.5f32]);
         let time = |f: &dyn Fn()| -> f64 {
             for _ in 0..3 { f(); }

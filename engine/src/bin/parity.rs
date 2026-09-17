@@ -28,6 +28,7 @@
 //!     -ub 4096 -ctk q8_0 -ctv q8_0 -ncmoe 40 --fit off --load-mode none
 //!     -np 1 --jinja
 
+use crow_nest_engine::geo::{DEFAULT_CNQ, DEFAULT_HOTSETS};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -159,15 +160,14 @@ fn llama_complete(url: &str, text: &str, max_tokens: usize) -> (f64, f64, String
 // 248044 = bos/pad/eos). Symmetry with the llama arm: the server stops on
 // EOS, so the crow arm must too — otherwise every correct short answer is
 // scored as degeneration (fable gate 2026-09-03). Raw traces stay recorded.
-const EOS_STOP: [i64; 2] = [248046, 248044];
 
 fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) {    let cnq_path = std::env::var("CROW_CNQ")
-        .unwrap_or_else(|_| "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq".into());
+        .unwrap_or_else(|_| DEFAULT_CNQ.into());
     // same production switches as `decode run` (2026-09-04): sidecar override,
     // prefill chunk, prompt-adaptive hot set after the prefill (charged to prefill)
     // defaults (#48): the production -M container and the id-sorted rectangular
     // sidecar serve.rs loads, both relative to the repo root (see the header at :44)
-    let sidecar = std::env::var("CROW_HOTSETS").unwrap_or_else(|_| "decode_out/hotsets-M-longctx2100-n160.json".into());
+    let sidecar = std::env::var("CROW_HOTSETS").unwrap_or_else(|_| DEFAULT_HOTSETS.into());
     let mut cnq = crow_nest_engine::cnq::Cnq::open(&cnq_path);
     unsafe {
         let _ctx = crow_nest_engine::cuda::Ctx::init();
@@ -211,7 +211,7 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
             }
         }
         let mut answer: Vec<i64> = vec![next as i64];
-        let mut stopped_eos = EOS_STOP.contains(&(next as i64));
+        let mut stopped_eos = crow_nest_engine::sample::EOS_IDS_I64.contains(&(next as i64));
         let t1 = Instant::now();
         let mut steps = 1usize;
         while answer.len() < max_tokens && !stopped_eos {
@@ -231,7 +231,7 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
             }
             answer.push(next as i64);
             steps += 1;
-            if EOS_STOP.contains(&(next as i64)) {
+            if crow_nest_engine::sample::EOS_IDS_I64.contains(&(next as i64)) {
                 stopped_eos = true;
             }
             if steps % 10 == 0 || answer.len() >= max_tokens || stopped_eos {
@@ -374,7 +374,7 @@ fn main() {
                 "order": prompts.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
                 "warmup": "one cold prefill per phase start, discarded (spec 0.3)",
                 "operating_point": operating_point(),
-                "crow_container": std::env::var("CROW_CNQ").unwrap_or_else(|_| "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq".into()),
+                "crow_container": std::env::var("CROW_CNQ").unwrap_or_else(|_| DEFAULT_CNQ.into()),
             })];
             let out = format!("decode_out/{prefix}-run{run_index}-{arm}.json");
             let mut answers = serde_json::Map::new();

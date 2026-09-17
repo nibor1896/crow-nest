@@ -444,7 +444,7 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 
 | Step | Kernel | Grid x block | Switch | Mode |
 |---|---|---|---|---|
-| QSA scores | `qsa_scores_par` | `QSA_PAR_BLOCKS` x 1 x 1, 128 | `CROW_ATTN_SPLIT` unset = on | operating |
+| QSA scores | `qsa_scores_par` | `QSA_SCORES_BLOCKS` x 1 x 1, 128 | `CROW_ATTN_SPLIT` unset = on | operating |
 | QSA top-k, one block | `qsa_select_fast` (`kernels.rs:1957`) | 1 x 1 x 1, 256 | `CROW_QSA_PAR=0`, the fallback since #61b | operating |
 | QSA top-k, many blocks | `qsa_select_par_h` (`kernels.rs:2177`) then `qsa_select_par_e` (`kernels.rs:2195`) | `CROW_QSA_PAR_BLOCKS` x 1 x 1, 256 then 1 x 1 x 1, 1024 | `CROW_QSA_PAR` unset = on, the default since #61b; `0` = the fallback | operating |
 | attention over the selected list | `attn_sel_split` (`kernels.rs:2691`) | `NQ` x 1 x `CROW_ATTN_SPLITS`, `AHD` | `CROW_ATTN_SPLIT` unset = on | operating |
