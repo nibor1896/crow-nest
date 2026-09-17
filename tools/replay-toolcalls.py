@@ -22,6 +22,13 @@ unterminated `arguments` string in the history and every later round answers
 (in chat:136)"}`. After it, `arguments` is always a parseable JSON object (a truncated one
 carries `"_truncated": true`) and the session runs.
 
+`--write-file` (TASK K) runs the same loop with a `write_file` tool whose `content` parameter
+carries a multi-line HTML body - quotes, backslashes, tabs and a `<script>` block - which is the
+shape that produced robin's 3,112-byte `arguments` string the template could not iterate. Every
+round prints how the accumulated `arguments` reads back and, when it is not JSON, the decoder's
+own error text plus the offending byte window; the raw string is written to
+`--dump-dir` so the next case is diagnosable.
+
 `--poison` splices a HANDCRAFTED broken turn into the history after round 0 - the exact shape
 the live 400 carried, `arguments` left at `{"path":"/etc/host` - so the second end of the fix
 (`serve::normalize_messages`) is exercised even on a build whose model finishes every call.
@@ -32,6 +39,7 @@ Exit 0 when every round answered 200, 1 when any round was refused, 2 on a usage
 """
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -52,6 +60,37 @@ TOOLS = [{
     },
 }]
 
+WRITE_TOOLS = [{
+    "type": "function",
+    "function": {
+        "name": "write_file",
+        "description": "Write a UTF-8 text file, creating parent directories.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute path of the file."},
+                "content": {"type": "string", "description": "The whole file content."},
+            },
+            "required": ["path", "content"],
+        },
+    },
+}]
+
+# TASK K: every prompt asks for a body that carries the characters JSON has to escape -
+# double quotes, backslashes, tabs, newlines - inside one `content` parameter.
+WRITE_PROMPTS = [
+    'Write the file /tmp/crow-readme-sheet.html. It must be a complete HTML5 document with '
+    '<!doctype html>, <html lang="en" data-theme="dark">, a <head> with <meta charset="utf-8"> '
+    'and a <title>, a <style> block, a <script> block containing the regular expression '
+    '/a\\b"c/g and a console.log with a tab escape, and a <body> with one <p>. Use the '
+    'write_file tool.',
+    'Write /tmp/crow-notes.md: a markdown note with a fenced code block containing a Windows '
+    'path C:\\Users\\robin\\a.txt, a quoted string "hello", and a tab-indented line. '
+    'Use the write_file tool.',
+    'Write /tmp/crow-config.json: a JSON config with a "path" key holding an escaped Windows '
+    'path and a "note" key holding a sentence with a quoted word. Use the write_file tool.',
+]
+
 PROMPTS = [
     "Read the file /etc/hostname, lines from 1, and tell me what is in it.",
     "Now read /etc/os-release from line 1 and name the distribution.",
@@ -61,14 +100,14 @@ PROMPTS = [
 ]
 
 
-def stream_round(base, messages, max_tokens):
+def stream_round(base, messages, max_tokens, tools=None):
     """one POST /v1/chat/completions, the reader of crow_core.py:5040-5127.
 
     returns (finish_reason, content, [{id, name, arguments}]) or raises HTTPError."""
     body = {
         "model": "crow-nest",
         "messages": messages,
-        "tools": TOOLS,
+        "tools": tools if tools is not None else TOOLS,
         "stream": True,
         "stream_options": {"include_usage": True},
         "timings_per_token": True,
@@ -115,8 +154,13 @@ def call_state(call):
     """how one accumulated call reads back: `crow_core.py:12798-12803` is the same test."""
     try:
         args = json.loads(call["arguments"] or "{}")
-    except json.JSONDecodeError:
-        return "NOT JSON"
+    except json.JSONDecodeError as exc:
+        # TASK K: the decoder's own text and the byte window it stopped in - without them a
+        # failure of this kind is a `_raw` line and nothing else
+        raw = call["arguments"]
+        lo = max(0, exc.pos - 60)
+        return (f"NOT JSON [{exc.msg} at byte {exc.pos} of {len(raw)}] "
+                f"...{raw[lo:exc.pos + 60]!r}...")
     if not isinstance(args, dict):
         return type(args).__name__
     return "object, _truncated" if args.get("_truncated") else "object"
@@ -185,6 +229,10 @@ def main():
     ap.add_argument("--probe-step", type=int, default=2)
     ap.add_argument("--poison", action="store_true",
                     help="splice the handcrafted unterminated tool call into the history")
+    ap.add_argument("--write-file", action="store_true",
+                    help="TASK K: run the loop with the write_file tool and HTML content")
+    ap.add_argument("--dump-dir", default=None,
+                    help="write every accumulated arguments string to this directory")
     ap.add_argument("--refusals", action="store_true",
                     help="also send four unrenderable shapes and print the 400 bodies")
     a = ap.parse_args()
@@ -193,7 +241,15 @@ def main():
         return 2
     base = f"http://127.0.0.1:{a.port}"
 
+    tools = WRITE_TOOLS if a.write_file else TOOLS
+    prompts = WRITE_PROMPTS if a.write_file else PROMPTS
+    if a.dump_dir:
+        os.makedirs(a.dump_dir, exist_ok=True)
+
     first = a.first_max_tokens
+    if first <= 0 and a.write_file:
+        # TASK K: the write_file loop is not about truncation - every round gets the full budget
+        first = a.max_tokens
     if first <= 0:
         first = find_truncating_budget(base, PROMPTS[0], a.probe_from, a.probe_to, a.probe_step)
         if first is None:
@@ -204,12 +260,13 @@ def main():
 
     messages = []
     refused = 0
+    broken = 0
     for rnd in range(a.rounds):
-        messages.append({"role": "user", "content": PROMPTS[rnd % len(PROMPTS)]})
+        messages.append({"role": "user", "content": prompts[rnd % len(prompts)]})
         budget = first if rnd == 0 else a.max_tokens
         size = len(json.dumps({"messages": messages}).encode())
         try:
-            finish, content, calls = stream_round(base, messages, budget)
+            finish, content, calls = stream_round(base, messages, budget, tools)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:500]       # crow_core.py:4182
             print(f"round {rnd}: HTTP {exc.code}, body {size} B -> {detail}")
@@ -217,6 +274,12 @@ def main():
             continue                                                   # crow_core.py:13485-13487
         note = [f"call {i} {c['name']!r} arguments={call_state(c)} {c['arguments'][:120]!r}"
                 for i, c in enumerate(calls)]
+        for i, c in enumerate(calls):
+            if a.dump_dir:
+                with open(os.path.join(a.dump_dir, f"round{rnd}-call{i}.args"), "w") as fh:
+                    fh.write(c["arguments"])
+            if call_state(c).startswith("NOT JSON"):
+                broken += 1
         print(f"round {rnd}: 200, body {size} B, finish={finish}, "
               f"content {len(content)} B, {len(calls)} call(s)")
         for n in note:
@@ -247,12 +310,13 @@ def main():
                              "content": "error: arguments were not valid JSON"})
             print(f"          spliced the poisoned turn: arguments={poison!r}")
 
-    print(f"replay-toolcalls.py: {a.rounds} round(s), {refused} refused")
+    print(f"replay-toolcalls.py: {a.rounds} round(s), {refused} refused, "
+          f"{broken} call(s) whose arguments were not a JSON object")
     if a.refusals:
         refused_ok = refusals(base)
         if refused_ok != 0:
             return refused_ok
-    return 1 if refused else 0
+    return 1 if (refused or broken) else 0
 
 
 if __name__ == "__main__":

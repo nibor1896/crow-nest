@@ -67,6 +67,84 @@ pub fn vit_on() -> bool {
     std::env::var("CROW_VIT").as_deref() != Ok("0")
 }
 
+/// visual tokens one image can produce at the patch cap (4096 / 2 / 2)
+pub const VIT_MAX_VISUAL: usize = VIT_MAX_PATCHES / (VIT_MERGE * VIT_MERGE);
+
+/// Images one REQUEST's spliced embedding buffer is reserved for (TASK K). The
+/// buffer is `sum(n_visual) * 2560` f32, allocated per request in `build_plan`;
+/// at the per-image cap that is 10 MiB each. Crow re-sends the whole image
+/// history every turn, so the number is not 1 - four is the measured shape of a
+/// goal-mode session (robin's failing request carried two) and the reserve is a
+/// VRAM cost, not a limit: a request with more images still runs when the card
+/// has the room, and answers 503 naming the buffer when it does not.
+pub const VIT_SPLICE_IMAGES: usize = 4;
+
+/// bytes of the cap-sized tower scratch — the twelve buffers `ensure_scratch`
+/// takes, counted from the same geometry the allocator uses
+pub const fn scratch_bytes() -> usize {
+    let elems = VIT_MAX_PATCHES * VIT_HIDDEN * 3   // x, normed, attn
+        + VIT_MAX_PATCHES * VIT_QKV
+        + VIT_MAX_PATCHES * VIT_INTER
+        + VIT_MAX_PATCHES / 4 * VIT_MERGED
+        + VIT_MAX_PATCHES / 4 * H
+        + VIT_MAX_PATCHES * VIT_IN
+        + VIT_MAX_PATCHES * 8                      // pe_idx + pe_w
+        + VIT_MAX_PATCHES * VIT_ROT * 2;           // cs + sn
+    elems * 4
+}
+
+/// bytes of the per-request spliced embedding buffer the reserve covers
+pub const fn splice_bytes() -> usize {
+    VIT_SPLICE_IMAGES * VIT_MAX_VISUAL * H * 4
+}
+
+/// bytes of the interleaved-mrope span tables at their widest: the whole
+/// context, cos and sin, exactly the shape `Engine::begin_vision` allocates
+pub const fn mrope_bytes(context: usize) -> usize {
+    context * crate::geo::ROPE_PAIRS * 2 * 4
+}
+
+/// The VRAM the PLANNER sets aside for the image path when the tower is loaded
+/// (TASK K, 2026-09-17).
+///
+/// Before this the vision path allocated everything lazily "on the first image
+/// request so text-only boots keep the full planner budget" (#VIT): the planner
+/// maximised the hot set against the free VRAM and an image request then had to
+/// find its scratch, its mrope tables and its splice buffer in whatever the
+/// 512 MiB `manager::SAFETY` slack had left. On robin's 2026-09-17 serve session
+/// it did not, and `cuda::ck` turned the refusal into a process panic that took
+/// the rest of the session with it. The three numbers are named here, added to
+/// the planner's `pending` bytes, and printed on the `[budget]` boot line.
+///
+/// `CROW_VIT_RESERVE_MB` replaces the derived value (0 = no reserve, the
+/// pre-TASK-K behaviour, for a measurement that wants the old N back).
+/// `CROW_VIT=0` never calls this at all.
+pub fn reserve_bytes(context: usize) -> u64 {
+    if let Some(mb) = crate::geo::env_parse::<u64>("CROW_VIT_RESERVE_MB") {
+        return mb << 20;
+    }
+    (scratch_bytes() + splice_bytes() + mrope_bytes(context)) as u64
+}
+
+/// the `[budget]` line's own words for what `reserve_bytes` covers; with
+/// `CROW_VIT_RESERVE_MB` set it names the override AND what the derived value
+/// would have been, so a log that shows a bigger N still says what paid for it
+pub fn reserve_line(context: usize) -> String {
+    let mib = |b: usize| b as f64 / MIB;
+    let derived = (scratch_bytes() + splice_bytes() + mrope_bytes(context)) as f64 / MIB;
+    let basis = match crate::geo::env_parse::<u64>("CROW_VIT_RESERVE_MB") {
+        Some(_) => format!("CROW_VIT_RESERVE_MB, derived would be {derived:.1} MB"),
+        None => format!(
+            "tower scratch {:.1} + splice {} x {:.1} + mrope span {:.1}",
+            mib(scratch_bytes()),
+            VIT_SPLICE_IMAGES,
+            mib(VIT_MAX_VISUAL * H * 4),
+            mib(mrope_bytes(context))
+        ),
+    };
+    format!("vit reserve {:9.1} MB  ({basis}, CROW_VIT on)", reserve_bytes(context) as f64 / MIB)
+}
+
 // ---------------------------------------------------------------------------
 // weights
 // ---------------------------------------------------------------------------
@@ -249,19 +327,46 @@ impl Vit {
     }
 
     /// one-time scratch allocation, called on the first image request; the
-    /// scalar slots are sized here and refreshed per image by `run`
+    /// scalar slots are sized here and refreshed per image by `run`.
+    ///
+    /// TASK K: every allocation here is FALLIBLE and named. The twelve buffers
+    /// plus sixteen scalars are taken as a group, and a refusal in the middle
+    /// frees the ones already taken before it raises - `scratch` stays false, no
+    /// pointer is left dangling in `self`, and the engine is exactly as it was.
+    /// Inside a request scope the raise is an `AllocFailed` payload, so `serve`
+    /// answers 503 instead of the process dying (the planner's `vit::reserve_bytes`
+    /// is what makes the refusal not happen in the first place).
     unsafe fn ensure_scratch(&mut self) {
         if self.scratch {
             return;
         }
         let cap = self.cap;
+        // taken in order, freed in reverse if the card refuses one of them
+        let mut taken: Vec<Dev> = Vec::with_capacity(28);
+        let alloc_or_unwind = |what: &str, bytes: usize, taken: &mut Vec<Dev>| -> Dev {
+            match cuda::try_alloc_zeroed(what, bytes) {
+                Ok(d) => {
+                    taken.push(d);
+                    d
+                }
+                Err(e) => {
+                    for d in taken.iter_mut() {
+                        cuda::free_dev(d);
+                    }
+                    eprintln!(
+                        "[vit] scratch allocation refused after {} buffer(s) - they were freed, the tower stays unarmed",
+                        taken.len()
+                    );
+                    e.raise()
+                }
+            }
+        };
         // every scratch buffer is n four-byte elements: the allocator counts
         // what it actually handed out and the boot line prints THAT. It used
         // to print `cap * 41_024`, a hand-summed bytes-per-patch literal that
         // no longer matched the twelve allocations below - and could not have
         // been noticed, because nothing derives from it.
         let mut bytes = 0usize;
-        let mut alloc4 = |n: usize| { bytes += n * 4; cuda::alloc_zeroed(n * 4) };
         let scalars: Vec<i32> = vec![
             VIT_IN as i32, VIT_HIDDEN as i32, VIT_INTER as i32, VIT_MERGED as i32, VIT_HIDDEN as i32,
             0, 0,                          // S_N, S_NV (refreshed per image)
@@ -269,19 +374,32 @@ impl Vit {
             0,                             // S_RESERVED_12
             0, 0, 0,                       // S_NP, S_NMLP, S_NMERGE
         ];
-        self.s = scalars.iter().map(|v| cuda::to_i32_dev(&[*v])).collect();
-        self.x = alloc4(cap * VIT_HIDDEN);
-        self.normed = alloc4(cap * VIT_HIDDEN);
-        self.qkv = alloc4(cap * VIT_QKV);
-        self.attn = alloc4(cap * VIT_HIDDEN);
-        self.mlp = alloc4(cap * VIT_INTER);
-        self.m1 = alloc4(cap / 4 * VIT_MERGED);
-        self.out = alloc4(cap / 4 * H);
-        self.patches = alloc4(cap * VIT_IN);
-        self.pe_idx = alloc4(cap * 4);
-        self.pe_w = alloc4(cap * 4);
-        self.cs = alloc4(cap * VIT_ROT);
-        self.sn = alloc4(cap * VIT_ROT);
+        let mut s = Vec::with_capacity(scalars.len());
+        for v in &scalars {
+            let d = alloc_or_unwind("the vit scalar slots", 4, &mut taken);
+            // `into_dev_legacy`, not `to_i32_into`: this is the copy `to_i32_dev` made
+            // before TASK K named the allocation - legacy stream plus its own sync, so
+            // the slot is written the same way whatever stream the last request left active
+            cuda::into_dev_legacy(d, &[*v]);
+            s.push(d);
+        }
+        self.s = s;
+        let mut alloc4 = |what: &str, n: usize, taken: &mut Vec<Dev>| {
+            bytes += n * 4;
+            alloc_or_unwind(what, n * 4, taken)
+        };
+        self.x = alloc4("the vit residual stream", cap * VIT_HIDDEN, &mut taken);
+        self.normed = alloc4("the vit norm scratch", cap * VIT_HIDDEN, &mut taken);
+        self.qkv = alloc4("the vit qkv scratch", cap * VIT_QKV, &mut taken);
+        self.attn = alloc4("the vit attention output", cap * VIT_HIDDEN, &mut taken);
+        self.mlp = alloc4("the vit block MLP scratch", cap * VIT_INTER, &mut taken);
+        self.m1 = alloc4("the vit merger fc1 output", cap / 4 * VIT_MERGED, &mut taken);
+        self.out = alloc4("the vit visual embeddings", cap / 4 * H, &mut taken);
+        self.patches = alloc4("the vit patch input", cap * VIT_IN, &mut taken);
+        self.pe_idx = alloc4("the vit position taps", cap * 4, &mut taken);
+        self.pe_w = alloc4("the vit position tap weights", cap * 4, &mut taken);
+        self.cs = alloc4("the vit rope cos", cap * VIT_ROT, &mut taken);
+        self.sn = alloc4("the vit rope sin", cap * VIT_ROT, &mut taken);
         cuda::to_i32_into(self.s[S_STRIDE_HIDDEN], &[VIT_HIDDEN as i32]);
         cuda::to_i32_into(self.s[S_BIAS_QKV], &[VIT_QKV as i32]);
         cuda::to_i32_into(self.s[S_BIAS_INTER], &[VIT_INTER as i32]);
@@ -289,7 +407,8 @@ impl Vit {
         cuda::to_i32_into(self.s[S_BIAS_H], &[H as i32]);
         cuda::sync();
         self.scratch = true;
-        eprintln!("[vit] scratch allocated on the first image request ({:.0} MiB at cap {} patches)",
+        debug_assert_eq!(bytes, scratch_bytes(), "scratch_bytes() and ensure_scratch disagree");
+        eprintln!("[vit] scratch allocated on the first image request ({:.0} MiB at cap {} patches, inside the planner's vit reserve)",
             bytes as f64 / MIB, cap);
     }
 
@@ -943,7 +1062,14 @@ impl Vit {
         if let Some(dir) = &dump {
             f32_file(&format!("{dir}/vit-embeds.f32"), &embeds_host);
         }
-        let embeds = cuda::to_f32_dev(&embeds_host);
+        // TASK K: the per-request splice buffer, the LAST device allocation of an
+        // all-cached image request - and the one robin's 2026-09-17 session died
+        // on (2 images, 1,660 visual tokens, 17,000,000 B). Named, so the failure
+        // line and the 503 body say which buffer the card refused.
+        let embeds = cuda::to_dev_named(
+            &format!("the spliced visual embeddings of {} image(s) ({flat} visual tokens x {H} f32)", images.len()),
+            &embeds_host,
+        );
         Ok(VisionPlan {
             ids: expanded,
             embeds,
@@ -970,5 +1096,46 @@ impl Drop for VisionPlan {
         if self.embeds != 0 {
             unsafe { cuda::free_dev(&mut self.embeds) };
         }
+    }
+}
+
+#[cfg(test)]
+mod reserve {
+    //! TASK K: the numbers the planner subtracts before it chooses N. They are pure
+    //! geometry, so they are asserted without a GPU and without a container; the
+    //! `debug_assert_eq!` at the end of `ensure_scratch` is what keeps `scratch_bytes`
+    //! tied to the twelve allocations it counts.
+    use super::*;
+
+    #[test]
+    fn the_scratch_is_the_twelve_buffers_the_allocator_takes() {
+        // x + normed + attn: 3 x 4096 x 1152, qkv 4096 x 3456, mlp 4096 x 4304,
+        // m1 1024 x 4608, out 1024 x 2560, patches 4096 x 1536, pe_idx + pe_w 2 x 16384,
+        // cs + sn 2 x 4096 x 36 - all f32
+        assert_eq!(scratch_bytes(), 239_599_616);
+        assert_eq!(VIT_MAX_VISUAL, 1024);
+        assert_eq!(splice_bytes(), 41_943_040); // 4 images x 1024 x 2560 f32
+    }
+
+    /// the span tables are `n_ctx` rows since serve clamps the budget before arming them
+    #[test]
+    fn the_mrope_span_is_the_whole_context_cos_and_sin() {
+        assert_eq!(mrope_bytes(200_000), 51_200_000);
+        assert_eq!(mrope_bytes(262_144), 67_108_864);
+    }
+
+    #[test]
+    fn the_reserve_is_the_sum_and_the_budget_line_names_its_parts() {
+        let ctx = 200_000;
+        assert_eq!(
+            reserve_bytes(ctx),
+            (scratch_bytes() + splice_bytes() + mrope_bytes(ctx)) as u64
+        );
+        let line = reserve_line(ctx);
+        assert!(line.starts_with("vit reserve"), "the [budget] label moved: {line}");
+        assert!(line.contains("317.3 MB"), "the reserve total moved: {line}");
+        assert!(line.contains("tower scratch 228.5"), "the scratch part moved: {line}");
+        assert!(line.contains("splice 4 x 10.0"), "the splice part moved: {line}");
+        assert!(line.contains("mrope span 48.8"), "the mrope part moved: {line}");
     }
 }

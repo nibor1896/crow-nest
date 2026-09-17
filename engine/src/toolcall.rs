@@ -1137,3 +1137,149 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod arguments_contract {
+    //! TASK K: the `arguments` invariant of e2b9845 (module header, "The `arguments`
+    //! invariant") is not argued here, it is SWEPT. robin's 2026-09-17 session carried a
+    //! 3,112-byte `arguments` string with a multi-line HTML `content` parameter that
+    //! `serde_json` refused, and the question was whether THIS parser can produce such a
+    //! string. These two tests answer it: over ten hand-written hazards and four thousand
+    //! random markups built from the marker fragments, quotes, backslashes, control
+    //! characters and non-BMP scalars a `content` value can carry, at eight piece sizes
+    //! and with the parameter types declared AND undeclared, every index the parser names
+    //! concatenates to a parseable JSON OBJECT. Not one input produced anything else.
+    use super::*;
+
+    /// drive the parser over `markup` in `piece`-byte slices (on char boundaries), with one
+    /// `arm()` per `<tool_call>` in it, and return the per-index `Args` concatenation
+    fn run_case(tools: Option<&serde_json::Value>, markup: &str, piece: usize) -> Vec<String> {
+        let mut ts = ToolStream::new(tools);
+        let mut out = Vec::new();
+        for _ in 0..markup.matches(TOOL_OPEN).count() {
+            ts.arm();
+        }
+        let b = markup.as_bytes();
+        let mut i = 0usize;
+        while i < b.len() {
+            let mut j = (i + piece).min(b.len());
+            while !markup.is_char_boundary(j) {
+                j += 1;
+            }
+            out.extend(ts.feed(&markup[i..j]));
+            i = j;
+        }
+        ts.finish(&mut out);
+        let mut args: Vec<String> = Vec::new();
+        for e in &out {
+            if let Emit::Args { index, text } = e {
+                while args.len() <= *index {
+                    args.push(String::new());
+                }
+                args[*index].push_str(text);
+            }
+        }
+        args
+    }
+
+    /// the `write_file` shape of robin's session: `path` plus a `content` parameter
+    /// declared as a string
+    fn write_file_tools() -> serde_json::Value {
+        serde_json::json!([{ "type": "function", "function": {
+            "name": "write_file",
+            "parameters": {"type": "object", "properties": {
+                "path": {"type": "string"}, "content": {"type": "string"}, "n": {"type": "integer"}}},
+        }}])
+    }
+
+    fn check(name: &str, args: &[String], bad: &mut usize, ctx: &str) {
+        for (i, a) in args.iter().enumerate() {
+            match serde_json::from_str::<serde_json::Value>(a) {
+                Ok(serde_json::Value::Object(_)) => {}
+                other => {
+                    *bad += 1;
+                    if *bad < 6 {
+                        eprintln!("{name}: call {i} is not a JSON object ({ctx}): {other:?}\n  args {a:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// the hazards a `write_file` call with an HTML body actually carries
+    #[test]
+    fn an_html_content_parameter_always_concatenates_to_an_object() {
+        let tools = write_file_tools();
+        let html = "<!doctype html>\n<html lang=\"en\" data-theme=\"dark\">\n<head>\n<meta charset=\"utf-8\">\n<title>C\\rowsheet</title>\n<style>\n  .a { content: \"\\201C\"; }\n\ttab\tindented\n</style>\n<script>\nconst re = /a\\\\b\"c/g;\nif (a < b && c > d) { console.log(\"x\\ty\"); }\n</script>\n</head>\n<body>\n<p>\u{e9}moji \u{1f426}\u{200d}\u{2b1b} and \u{1d54f} and \u{7f} and \u{b} vertical tab</p>\n</body>\n</html>\n";
+        let cases: Vec<(&str, String)> = vec![
+            ("plain html", format!("<tool_call>\n<function=write_file>\n<parameter=path>\n/home/x/a.html\n</parameter>\n<parameter=content>\n{html}</parameter>\n</function>\n</tool_call>")),
+            ("content holds </parameter>", "<tool_call>\n<function=write_file>\n<parameter=path>\n/home/x/a.html\n</parameter>\n<parameter=content>\n<p>see </parameter> inside</p>\n</parameter>\n</function>\n</tool_call>".to_string()),
+            ("content holds <parameter=", "<tool_call>\n<function=write_file>\n<parameter=path>\n/x\n</parameter>\n<parameter=content>\n<parameter=evil>text\n</parameter>\n</function>\n</tool_call>".to_string()),
+            ("undeclared tool", format!("<tool_call>\n<function=unknown_tool>\n<parameter=content>\n{html}</parameter>\n</function>\n</tool_call>")),
+            ("weird parameter name", "<tool_call>\n<function=write_file>\n<parameter=a\"b\\c\td>\nv\n</parameter>\n</function>\n</tool_call>".to_string()),
+            ("empty value", "<tool_call>\n<function=write_file>\n<parameter=content>\n</parameter>\n</function>\n</tool_call>".to_string()),
+            ("crlf value", "<tool_call>\n<function=write_file>\n<parameter=content>\r\nline1\r\nline2\r\n</parameter>\n</function>\n</tool_call>".to_string()),
+            ("value ends with a backslash", "<tool_call>\n<function=write_file>\n<parameter=content>\nends with \\\n</parameter>\n</function>\n</tool_call>".to_string()),
+            ("no separator newline", "<tool_call>\n<function=write_file>\n<parameter=content>x\ny\n</parameter>\n</function>\n</tool_call>".to_string()),
+            ("cut in the middle of the html", format!("<tool_call>\n<function=write_file>\n<parameter=path>\n/x\n</parameter>\n<parameter=content>\n{}", &html[..60])),
+        ];
+        let mut bad = 0;
+        for (name, markup) in &cases {
+            for piece in [1usize, 2, 3, 5, 7, 13, 64, 100_000] {
+                for t in [Some(&tools), None] {
+                    let args = run_case(t, markup, piece);
+                    check(name, &args, &mut bad, &format!("piece {piece}, tools {}", t.is_some()));
+                }
+            }
+        }
+        assert_eq!(bad, 0, "{bad} arguments strings did not parse as an object");
+    }
+
+    fn lcg(st: &mut u64) -> u64 {
+        *st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *st >> 33
+    }
+
+    /// four thousand random markups over the alphabet that can break JSON escaping or the
+    /// marker scan, each at four piece sizes with and without declared types
+    #[test]
+    fn random_parameter_values_always_concatenate_to_an_object() {
+        let tools = write_file_tools();
+        let atoms: Vec<&str> = vec![
+            "<", ">", "/", "parameter", "function", "tool_call", "=", "<parameter=", "</parameter>",
+            "</function>", "</tool_call>", "<tool_call>", "\\", "\"", "\n", "\r", "\t", "\u{b}", "\u{0}",
+            "\u{7f}", "\u{1b}", "a", " ", "\u{e9}", "\u{1f426}", "\u{2028}", "</", "<!", "-->",
+            "{", "}", "[", "]", ":", ",", "0", "true", "null", "\u{fffd}",
+        ];
+        let mut st: u64 = 0x5eed_1234_9abc_def0;
+        let mut bad = 0usize;
+        for case in 0..4000u32 {
+            let nparam = 1 + (lcg(&mut st) % 3) as usize;
+            let mut markup = String::from("<tool_call>\n<function=write_file>\n");
+            for pi in 0..nparam {
+                let pname = ["path", "content", "n", "weird name", "a\"b"][(lcg(&mut st) % 5) as usize];
+                markup.push_str(&format!("<parameter={pname}>\n"));
+                let n = (lcg(&mut st) % 24) as usize;
+                for _ in 0..n {
+                    markup.push_str(atoms[(lcg(&mut st) % atoms.len() as u64) as usize]);
+                }
+                if !lcg(&mut st).is_multiple_of(8) || pi + 1 < nparam {
+                    markup.push_str("\n</parameter>\n");
+                }
+            }
+            if !lcg(&mut st).is_multiple_of(6) {
+                markup.push_str("</function>\n");
+            }
+            if !lcg(&mut st).is_multiple_of(6) {
+                markup.push_str("</tool_call>");
+            }
+            for piece in [1usize, 3, 17, 100_000] {
+                for t in [Some(&tools), None] {
+                    let args = run_case(t, &markup, piece);
+                    check("random", &args, &mut bad, &format!("case {case}, piece {piece}, markup {markup:?}"));
+                }
+            }
+        }
+        assert_eq!(bad, 0, "{bad} random arguments strings did not parse as an object");
+    }
+}

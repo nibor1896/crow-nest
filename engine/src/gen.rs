@@ -471,12 +471,26 @@ impl Engine {
         let (cos, sin) = crate::vit::mrope_tables(&pos, seq, span, plan.delta);
         assert_eq!(cos.len(), span * ROPE_PAIRS);
         if span > self.mrope_rows {
+            // TASK K: the old tables go first (the new pair is what the request
+            // needs), and a refusal on either half leaves NO half-armed state:
+            // both pointers are 0 and `mrope_rows` is 0, so the next request
+            // allocates from scratch. The bytes are inside `vit::reserve_bytes`,
+            // which the planner subtracted before it chose N.
             if self.mrope_rows > 0 {
                 cuda::free_dev(&mut self.mrope_cos);
                 cuda::free_dev(&mut self.mrope_sin);
+                self.mrope_rows = 0;
             }
-            self.mrope_cos = cuda::alloc_zeroed(span * ROPE_PAIRS * 4);
-            self.mrope_sin = cuda::alloc_zeroed(span * ROPE_PAIRS * 4);
+            let bytes = span * ROPE_PAIRS * 4;
+            let what = format!("the interleaved-mrope span tables ({span} rows x {ROPE_PAIRS} pairs f32)");
+            self.mrope_cos = cuda::alloc_named(&what, bytes);
+            match cuda::try_alloc_zeroed(&what, bytes) {
+                Ok(d) => self.mrope_sin = d,
+                Err(e) => {
+                    cuda::free_dev(&mut self.mrope_cos);
+                    e.raise()
+                }
+            }
             self.mrope_rows = span;
         }
         cuda::to_f32_into(self.mrope_cos, &cos);
@@ -953,7 +967,14 @@ impl Engine {
         // of `manager::SAFETY` (512 MiB), which covers the clamp loop's own
         // pools + scratch + telemetry: two reserves, two sums, two numbers.
         const LAUNCH_SLACK: u64 = 128 << 20;
-        let pending = LAUNCH_SLACK + ring_reserve;
+        // + TASK K: the image path's VRAM, when the tower is loaded. Everything
+        // the #VIT path takes lazily inside a request (the cap-sized tower
+        // scratch, the per-request splice buffer, the interleaved-mrope span
+        // tables) is planned HERE, so N is chosen with it and the first image
+        // request cannot find the card full. CROW_VIT=0 reserves nothing and
+        // keeps the full budget, exactly as before.
+        let vit_reserve = if vit.is_some() { crate::vit::reserve_bytes(cfg.context) } else { 0 };
+        let pending = LAUNCH_SLACK + ring_reserve + vit_reserve;
         // pinned-side sizing follows the cold tier actually used (record size
         // of a low-bit tier, full tier = constant; see residency::build)
         let (cold_unit, cold_fixed) = match std::env::var("CROW_COLD_TIER").ok() {
@@ -973,6 +994,17 @@ impl Engine {
         for l in &st_rep.lines {
             log(&format!("  [budget] {l}"));
         }
+        // TASK K: the reserve is named on its own [budget] line, next to the states
+        // it was weighed against, so every future boot log says what the image path
+        // was given and what N it cost.
+        log(&format!(
+            "  [budget] {}",
+            if vit.is_some() {
+                crate::vit::reserve_line(cfg.context)
+            } else {
+                "vit reserve       0.0 MB  (CROW_VIT 0, the tower is not loaded)".to_string()
+            }
+        ));
 
         // ---- residency (#8) ----
         log("building residency (hot VRAM slabs + pinned cold tier) …");

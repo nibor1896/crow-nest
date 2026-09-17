@@ -161,6 +161,13 @@ is the right node: every CUDA context opens it and no graphics client does — m
 2026-09-17, the compositor and every GL app hold `/dev/nvidiactl` and `/dev/nvidia0` while
 owning no pinned pool, and testing for THOSE refused the engine's own operating point. The planner refuses only when no N satisfies both sides (`planner_refusal_msg`).
 
+The clamp also carries a **vision reserve** (TASK K, 2026-09-17): with `CROW_VIT` on, the VRAM the
+image path allocates inside a request — the cap-sized tower scratch, the per-request spliced
+embedding buffer and the interleaved-mrope span tables, 317.3 MB together at `n_ctx` 200,000 — is
+added to the planner's `pending` bytes, so N is chosen with it and an image request can never find
+the card full. It is named on its own `[budget]` line and costs N 157 -> 155 at the serve operating
+point (7.13 has the three numbers and the measurement). `CROW_VIT=0` reserves nothing.
+
 ### 2.2 Expert residency (per layer, data-driven)
 
 - Residency sets are **per-layer top-N by selection frequency** — per-layer ranking, not
@@ -1553,6 +1560,53 @@ never refused, so no request that worked before is refused now):
   (`a_history_with_a_tool_turn_renders_byte_identical_to_the_oracle`): the happy path did not
   move.
 
+**7.11.15 The second `arguments` case, and what it was not (TASK K, 2026-09-17)**
+
+The same live log carried a second `[chat] normalised` line — 3,112 bytes of `write_file`
+arguments with a multi-line HTML `content` parameter, `{"path":"/home/.../crow-readme-sheet.html",
+"content":"<!doctype html>\n<html lang=\"en\" data-theme=\"dark\">..."` — that `serde_json`
+refused, so the turn rendered as `{"_raw": ...}`. The visible prefix is CORRECTLY escaped (the log
+prints the string's own text, so `\n` and `\"` in it are the two-character escapes, not a Debug
+rendering), and the call was not engine-truncated (7.11.14 would have closed it with
+`,"_truncated":true`). So the question was whether `ToolStream` can emit such a string at all.
+
+It cannot, and that is now swept rather than argued
+(`toolcall.rs` `mod arguments_contract`):
+
+- `an_html_content_parameter_always_concatenates_to_an_object`: ten hazards — a full HTML5
+  document with quotes, backslashes, tabs, a `<script>` block, a non-BMP emoji, U+007F and a
+  vertical tab; a value that itself contains `</parameter>`; a value containing `<parameter=`;
+  the tool undeclared; a parameter name carrying a quote, a backslash and a tab; an empty value;
+  CRLF; a value ending in a backslash; no separator newline; a cut in the middle of the HTML —
+  each at eight piece sizes with the types declared AND undeclared.
+- `random_parameter_values_always_concatenate_to_an_object`: 4,000 random markups over the marker
+  fragments, quotes, backslashes, control characters, `U+2028`, `U+FFFD` and non-BMP scalars, at
+  four piece sizes, with and without declared types.
+- End to end through the real model and the real server: `tools/replay-toolcalls.py --write-file`
+  drives three rounds of a `write_file` tool whose `content` is an HTML document, a markdown note
+  with a Windows path, and a JSON config with escaped quotes. All three rounds answered 200 with
+  `arguments=object` (`decode_out/taskk/write-after.txt`, the strings in
+  `decode_out/taskk/args-after/`).
+
+Every index this parser names concatenates to a parseable JSON object, for every input — the
+invariant of 7.11.14, now with a sweep behind it. What TASK K added is that the contract is
+CHECKED where it is produced and DIAGNOSABLE where it is consumed:
+
+- `serve.rs` accumulates the `Emit::Args` fragments per call index exactly as Crow does
+  (`accumulate_args`, `crow_core.py:5069`) and parses each one after the flush. A violation is one
+  loud line — `[chat] BUG: the arguments of tool call N are not a JSON object - serde_json: ...` —
+  at the moment it is produced, instead of a `{"_raw": ...}` two turns later in someone else's
+  history. A stream cannot be repaired; the `stream:false` document can, and is
+  (`args_object_or_raw`): an arguments string that is not an object leaves as
+  `{"_raw": "<verbatim>"}`, the same shape `normalize_messages` uses on the way in.
+- The `[chat] normalised` line now carries `serde_json`'s own message AND the byte window it
+  stopped in: `... is a string the template cannot iterate; serde_json: EOF while parsing a string
+  at line 1 column 3112 (byte 3112 of 3112: "...<title>C" <HERE> ""), rendered as {"_raw": ...}`.
+  The shape that window will show for a string cut mid-value is the signature of a TRUNCATION, not
+  of an escaping defect: proper escaping up to a cut, no closing brace and no `_truncated` marker.
+  The engine cannot produce it; a client that slices a stored `arguments` string by byte count, or
+  that keeps what it accumulated after a stream it abandoned, can.
+
 ### 7.12 The stage A gate table (what was measured, and where the artefact is)
 
 **Rule: a gate without a log artefact does not count.**
@@ -1653,6 +1707,70 @@ never refused, so no request that worked before is refused now):
 - Serve accepts Crow's image wire exactly (`image_url` data-URL blocks, `crow_core.py image_part`), decodes the five client formats (the `image` crate, decode features), preprocesses per the HF fast processor (smart_resize factor 32, min 65,536 / max 16,777,216 px, antialiased bicubic, 0.5/0.5 normalize, spatial-merge-block patch order), and runs the tower in f32 on the NVFP4 weights (`engine/src/vit.rs`).
 - The visual embeddings splice into the text stream at the expanded `<|image_pad|>` rows (host-side, pre-upload), and the rope kernels read a per-request INTERLEAVED-mrope cos/sin span table (section [11, 11, 10], partial rotary 0.25, theta 1e7 — the `get_rope_index` positions) instead of the load-time table while an image conversation is live. All physical indexing (KV rows, QSA rings, pooled blocks) stays sequential; only the table content changes.
 - Measured (RTX 5090, 2026-09-14, `decode_out/srv-vit.log`): ViT embeddings vs the f32 container-dequant oracle max_abs 3.43e-06 at cos 1.000000; text parity with the tower loaded AND with `CROW_VIT=0` byte-identical to `d211ab52ad2b` at the 61b sha256 values of record including the PX teacher-forced 16,064-row form `f217e1c55926` under the > 26 GiB VRAM headroom gate (23 of 23 subchecks); ten tasks 10 of 10 identical to final4; image-prompt pairs (text-only 26-token prompt vs the 224-token image prompt, fresh process per run): text prefill 406.1 ms vs 1,626.2 ms, pair delta mean +1,220.1 ms, plus the vision window of 35.3 s per request (`[vit-chat]`) — the tower GEMVs run the text-style per-token shape and are the known optimization lever.
+**The VRAM reserve, and why the lazy allocation needed one (TASK K, 2026-09-17).** The first bullet's
+"allocates lazily on the first image request, so text-only boots keep the full planner budget" was
+half a design: the budget was kept, but nothing ever gave the image path its VRAM back. The planner
+maximises the hot set against the free VRAM at boot (section 2.1), leaves `manager::SAFETY` = 512 MiB
+plus `LAUNCH_SLACK` = 128 MiB of planned slack, and the NVRTC module load takes about 220 MB of that
+after the planner has run — so an image request had to find its whole working set in roughly 400 MiB
+that nothing had promised it. Robin's 2026-09-17 goal-mode session did not, and the engine died:
+
+```
+[vit-chat] 2 image(s) in request, decoding data URLs ...
+[vit-cache] image 0: HIT grid (1, 40, 76), 760 visual tokens
+[vit-cache] image 1: HIT grid (1, 60, 60), 900 visual tokens
+[vit-cache] 2 image(s): 0 through the tower, 2 cached; cache 2 entries, 16.2 MiB of 256 MiB
+thread 'main' panicked at src/cuda.rs:252:5: CUDA error: CUDA_ERROR_OUT_OF_MEMORY
+```
+
+Both images were cache HITS, so `Vit::run` — and with it `ensure_scratch` — never ran; the only
+device allocation left between that last line and the panic is the per-request spliced embedding
+buffer, `sum(n_visual) * 2560` f32 = 1,660 x 2560 x 4 = **17,000,000 B (16.21 MiB)**. Crow then got
+`Connection refused` for the rest of the session.
+
+Three allocations live inside a request, and all three are now PLANNED (`vit::reserve_bytes`, added
+to the planner's `pending` bytes in `Engine::load` when `CROW_VIT` is on):
+
+| allocation | where | bytes at the default operating point |
+|---|---|---|
+| the cap-sized tower scratch (12 buffers + 16 scalar slots) | `vit::ensure_scratch`, first image request | 239,599,616 = 228.5 MiB |
+| the per-request spliced embedding buffer | `vit::build_plan`, every image request | `VIT_SPLICE_IMAGES` (4) x 1024 x 2560 f32 = 40.0 MiB |
+| the interleaved-mrope span tables | `Engine::begin_vision`, grown on demand | `n_ctx` x 32 x cos+sin x 4 = 48.8 MiB at 200,000 |
+| **reserve** | one `[budget]` line names it | **317.3 MB** |
+
+- The span tables are exactly `n_ctx` rows because `chat_route` now clamps the generation budget
+  BEFORE it arms them (it used to arm them with the raw `max_tokens` and clamp afterwards, so a
+  request that the next line refused with 413 had already allocated its tables). The table content
+  of a served request is unchanged: only rows past the budget disappear, and no kernel read those.
+- `CROW_VIT=0` reserves nothing and keeps the full budget, as before. `CROW_VIT_RESERVE_MB` pins the
+  number, `0` restores the pre-TASK-K planner for a measurement.
+- Cost, measured on two boots of the same binary with the same free-at-start (22.86 GiB, `n_ctx`
+  200,000, chunk 2048): **N 157 -> 155**, VRAM used 30.83 -> 30.58 GiB. N is not part of the numeric
+  contract; the ids are, and the parity forms run `decode`, which has no vision.
+
+**The no-panic rule (binding).** A CUDA allocation that fails inside a REQUEST answers the request;
+it does not end the process.
+
+- Every `cuMemAlloc_v2` of the engine goes through `cuda::try_alloc_zeroed(what, bytes)`, which names
+  the allocation. The failure line and the response body both carry the name, the byte count and the
+  free VRAM: `CUDA error: CUDA_ERROR_OUT_OF_MEMORY allocating the vit block MLP scratch
+  (70516736 B = 67.2 MiB); free VRAM 76.6 MiB`.
+- `serve` wraps the chat route in `guarded`, which arms a `cuda::RequestScope`. Inside it a refusal
+  raises `cuda::AllocFailed` as the panic PAYLOAD; `guarded` catches exactly that payload, answers
+  **503** with the message, puts the engine back (`end_vision`, `PrefixCache::invalidate`,
+  `reset_to_zero`) and keeps serving. Anything else that panics is re-raised unchanged — a bug is
+  still a crash.
+- Every allocation site frees what it already took before it raises: `ensure_scratch` takes its 28
+  buffers as a group and frees the ones it holds (`[vit] scratch allocation refused after N
+  buffer(s) - they were freed, the tower stays unarmed`), `begin_vision` frees the cos table if the
+  sin table is refused, and the plan's splice buffer drops in the unwind.
+- If the SSE head is already on the wire the 503 cannot be a status any more, so it rides an error
+  frame followed by `[DONE]`. The image path runs before the head, so the normal case is a clean
+  JSON 503.
+- Reproduced both ways with a second CUDA process holding the card down to ~50 MiB free
+  (`scratchpad/taskk/ballast.py`): `e2b9845` panics at `cuda.rs:252` and `/health` is DEAD; this
+  build answers two 503s in a row naming `the vit block MLP scratch` and `/health` is ALIVE.
+
 - The oracle chain lives in `oracle/` (`cnq_weights.py`, `ref_vit_golden.py`, `ref_vit_stages.py`, `ref_image_prompt_logits.py`): f32 references over the SAME container-dequantized weights (orchestrator ruling 2026-09-14 — the band is math precision only). The llama.cpp mmproj comparison was deferred to the B-series (orchestrator ruling).
 
 ### 7.14 The PLE row path, and what a warm turn actually pays (TASK H, 2026-09-17)

@@ -1400,6 +1400,44 @@ fn kind_of(v: &serde_json::Value) -> &'static str {
     }
 }
 
+/// - TASK K: the bytes AROUND the place `serde_json` gave up, so the `[chat]
+///   normalised` line carries the defect itself and not only its coordinates
+/// - `serde_json::Error` gives a 1-based line and column; this walks the string
+///   once to turn that pair into a byte index, then shows 60 bytes either side
+///   with a `<HERE>` marker, on char boundaries
+/// - an error with no position (line 0) adds nothing
+fn error_window(s: &str, e: &serde_json::Error) -> String {
+    let (line, col) = (e.line(), e.column());
+    if line == 0 {
+        return String::new();
+    }
+    let mut at = 0usize;
+    let mut l = 1usize;
+    for (i, c) in s.char_indices() {
+        if l == line {
+            at = i + col.saturating_sub(1).min(s.len() - i);
+            break;
+        }
+        if c == '\n' {
+            l += 1;
+            at = i + c.len_utf8();
+        }
+    }
+    let mut at = at.min(s.len());
+    while at > 0 && !s.is_char_boundary(at) {
+        at -= 1;
+    }
+    let mut lo = at.saturating_sub(60);
+    while lo > 0 && !s.is_char_boundary(lo) {
+        lo -= 1;
+    }
+    let mut hi = (at + 60).min(s.len());
+    while hi < s.len() && !s.is_char_boundary(hi) {
+        hi += 1;
+    }
+    format!(" (byte {at} of {}: {:?} <HERE> {:?})", s.len(), &s[lo..at], &s[at..hi])
+}
+
 /// - the first 200 bytes of a value, on a char boundary, for the diagnostic lines
 /// - a string is shown as its own text, anything else as its compact JSON
 fn head200(v: &serde_json::Value) -> String {
@@ -1468,10 +1506,18 @@ fn normalize_messages(messages: &serde_json::Value) -> (serde_json::Value, Vec<S
             if args.is_object() || args.as_str() == Some("") {
                 continue;
             }
-            if let Some(v) = args.as_str().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()) {
-                if v.is_object() {
-                    *args = v;
-                    continue;
+            // TASK K: WHY the string is not a mapping is the one thing the old note
+            // did not say. `serde_json`'s own message plus the byte window it stopped
+            // in turns the next case into a fix instead of another bisect.
+            let mut why = String::new();
+            if let Some(s) = args.as_str() {
+                match serde_json::from_str::<serde_json::Value>(s) {
+                    Ok(v) if v.is_object() => {
+                        *args = v;
+                        continue;
+                    }
+                    Ok(v) => why = format!("; it parses, as {}", kind_of(&v)),
+                    Err(e) => why = format!("; serde_json: {e}{}", error_window(s, &e)),
                 }
             }
             let (fixed, how) = if args.is_null() {
@@ -1485,7 +1531,7 @@ fn normalize_messages(messages: &serde_json::Value) -> (serde_json::Value, Vec<S
             };
             notes.push(format!(
                 "message {mi} tool_call {ci} function.arguments is {} the template cannot \
-                 iterate, rendered as {how}: {}",
+                 iterate{why}, rendered as {how}: {}",
                 kind_of(args),
                 head200(args)
             ));
@@ -1771,6 +1817,20 @@ impl ChatSink for CollectSink {
 /// - #29 A7: one sink call per parser fragment, in order
 /// - the chunk counters of the `[chat]` line are counted HERE, so both sinks count alike
 /// - `false` means the client is gone and the generation loop must stop
+/// - TASK K: the `Emit::Args` fragments of one request, concatenated per call index
+/// - the same accumulation Crow does (`crow_core.py:5069`), so what is checked here is
+///   exactly what the client will store and re-send
+fn accumulate_args(pieces: &[Emit], acc: &mut Vec<String>) {
+    for e in pieces {
+        if let Emit::Args { index, text } = e {
+            while acc.len() <= *index {
+                acc.push(String::new());
+            }
+            acc[*index].push_str(text);
+        }
+    }
+}
+
 fn send_emits(
     sink: &mut dyn ChatSink,
     c: &ChunkCtx,
@@ -1813,10 +1873,22 @@ fn completion_json(
         let arr: Vec<serde_json::Value> = calls
             .iter()
             .map(|c| {
+                // TASK K: the producer end of the `arguments` contract. The parser's
+                // invariant says this string is a JSON object for every input, and
+                // `toolcall::tests` proves it over every markup shape and every piece
+                // split; this is the last line of defence for the one form the engine
+                // can still repair before it leaves - the `stream:false` document.
+                // A string that is not an object is replaced by `{"_raw": ...}`, the
+                // same shape `normalize_messages` uses on the way back in, so a client
+                // that stores and re-sends the turn cannot poison its own history.
+                let (arguments, note) = args_object_or_raw(&c.arguments);
+                if let Some(n) = note {
+                    eprintln!("[chat] tool_call {} arguments repaired before the document: {n}", c.id);
+                }
                 serde_json::json!({
                     "id": c.id,
                     "type": "function",
-                    "function": { "name": c.name, "arguments": c.arguments },
+                    "function": { "name": c.name, "arguments": arguments },
                 })
             })
             .collect();
@@ -1837,6 +1909,35 @@ fn completion_json(
         "usage": usage_json(t),
         "timings": timings_json(t),
     })
+}
+
+/// - TASK K: the `arguments` string of one finished call, checked at the SOURCE
+/// - `Ok` shape (a JSON object): returned verbatim, no note — the byte-identical path
+/// - anything else: `{"_raw": "<verbatim>"}` plus a note that carries `serde_json`'s
+///   own message and the byte window it stopped in
+/// - the empty string is what a call with no `arguments` fragment carries and is
+///   left alone: `""` is the form llama-server and OpenAI send and the template's
+///   own guard skips it
+/// - pure, so the test drives it without a socket or an engine
+fn args_object_or_raw(args: &str) -> (String, Option<String>) {
+    if args.is_empty() {
+        return (args.to_string(), None);
+    }
+    match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(serde_json::Value::Object(_)) => (args.to_string(), None),
+        Ok(v) => (
+            serde_json::json!({ RAW_KEY: args }).to_string(),
+            Some(format!("it parses, as {}, not an object: {}", kind_of(&v), head200(&serde_json::json!(args)))),
+        ),
+        Err(e) => (
+            serde_json::json!({ RAW_KEY: args }).to_string(),
+            Some(format!(
+                "serde_json: {e}{}: {}",
+                error_window(args, &e),
+                head200(&serde_json::json!(args))
+            )),
+        ),
+    }
 }
 
 /// a JSON response plus its status, so the caller can log one label
@@ -1892,7 +1993,7 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
     // image_pad into its visual tokens, arm the mrope span tables. With
     // CROW_VIT=0 the engine holds no tower and the request falls through as
     // the placeholder of record (the single image_pad rides as a token).
-    let ids: Vec<u32> = if !req.images.is_empty() && srv.eng.has_vision() {
+    let (ids, vision_plan): (Vec<u32>, Option<crow_nest_engine::vit::VisionPlan>) = if !req.images.is_empty() && srv.eng.has_vision() {
         eprintln!("[vit-chat] {} image(s) in request, decoding data URLs ...", req.images.len());
         let mut bytes = Vec::with_capacity(req.images.len());
         for (i, url) in req.images.iter().enumerate() {
@@ -1907,22 +2008,37 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
             Err(e) => return respond_json(stream, "400 Bad Request", &error_json(&e)),
         };
         let vit_ms = vit_t0.elapsed().as_secs_f64() * 1e3;
+        // TASK K: free VRAM and the engine's live allocation count ride this line.
+        // The 2026-09-17 panic was an out-of-memory in exactly this window and the
+        // log said nothing about how much room the card still had; a session that
+        // walks this number down is now visible turn by turn.
+        let (live_n, live_b) = crow_nest_engine::cuda::live_dev();
         eprintln!(
-            "[vit-chat] {} image(s), {} visual token(s), grids {:?}, mrope delta {}, vision {} ms (decode + preprocess + tower)",
+            "[vit-chat] {} image(s), {} visual token(s), grids {:?}, mrope delta {}, vision {} ms (decode + preprocess + tower), free VRAM {:.1} MiB, engine live allocs {live_n} = {:.1} MiB",
             req.images.len(),
             plan.n_visual,
             plan.grids,
             plan.delta,
-            vit_ms
+            vit_ms,
+            unsafe { crow_nest_engine::cuda::free_vram_bytes() } as f64 / (1u64 << 20) as f64,
+            live_b as f64 / (1u64 << 20) as f64
         );
         let expanded = plan.ids.clone();
-        unsafe { srv.eng.begin_vision(plan, expanded.len() + req.max_tokens) };
-        expanded
+        (expanded, Some(plan))
     } else {
-        ids
+        (ids, None)
     };
     // #26 review: the prompt alone is the only 413 case; a budget that does not fit is CLAMPED,
     // not refused (the old combined check was dead, `max_tokens` is capped at 32768 first)
+    //
+    // TASK K: this now runs BEFORE `begin_vision`, not after. The mrope span tables are
+    // `span = prompt + budget` rows, and with the RAW `max_tokens` that span was bounded
+    // only by the 32,768 cap and by whatever prompt length the body carried - a request
+    // that the next line refuses with 413 still allocated its tables first. With the
+    // clamped budget the span is at most `n_ctx`, which is exactly what
+    // `vit::reserve_bytes` sets aside, and a refused request allocates nothing (the plan
+    // drops here and frees its splice buffer). The table CONTENT of a served request is
+    // unchanged: only rows past the budget disappear, and no kernel ever read those.
     let budget = match clamped_max_tokens(ids.len(), req.max_tokens, srv.n_ctx) {
         Some(n) => n,
         None => {
@@ -1939,6 +2055,9 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
             srv.n_ctx
         );
         req.max_tokens = budget;
+    }
+    if let Some(plan) = vision_plan {
+        unsafe { srv.eng.begin_vision(plan, ids.len() + req.max_tokens) };
     }
     if req.stream {
         chat_stream(stream, srv, &req, &ids)
@@ -1960,6 +2079,7 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
     if !sse_send(stream, HEAD) {
         return "200 OK (client gone)";
     }
+    srv.stream_head_sent = true;
     let mut sink = SseSink::new(stream);
     let out = chat_generate(srv, req, ids, tk, &mut sink);
     if out.aborted {
@@ -2162,6 +2282,9 @@ fn chat_generate(
     let mut emitted = 0usize;
     let mut content_chunks = 0usize;
     let mut finish = "length";
+    // TASK K: what each call's `arguments` fragments add up to, per index, so the
+    // contract can be checked where it is produced (see the loop after the flush)
+    let mut args_acc: Vec<String> = Vec::new();
     let mut decode_ms = 0.0f64;
     // #37: the stream trickle, one tick per `decode_step`, the mirror of `decode.rs:224-231`.
     // `cfg.adapt` is what `apply_adapt_policy` (geo.rs:167-176) gave this process: with
@@ -2192,6 +2315,7 @@ fn chat_generate(
             if let Some(delta) = next_delta(&full, emitted) {
                 emitted = full.len();
                 let pieces = ts.feed(delta);
+                accumulate_args(&pieces, &mut args_acc);
                 if !send_emits(sink, &cx, &pieces, &mut content_chunks, &mut tool_chunks) {
                     aborted = true;
                     break;
@@ -2237,8 +2361,20 @@ fn chat_generate(
             Vec::new()
         };
         malformed = ts.finish(&mut pieces);
+        accumulate_args(&pieces, &mut args_acc);
         if !send_emits(sink, &cx, &pieces, &mut content_chunks, &mut tool_chunks) {
             aborted = true;
+        }
+    }
+    // TASK K: the invariant, checked where it is PRODUCED. `toolcall` guarantees that the
+    // concatenation of one call's `Emit::Args` is a parseable JSON object for every input
+    // (`toolcall::tests`, every markup shape at every piece size), and this says so out loud
+    // for the request that just ran. A stream cannot be repaired - the fragments are already
+    // on the wire - so a violation is a named, loud line with `serde_json`'s own message and
+    // the byte window, instead of a `{"_raw": ...}` two turns later in someone else's history.
+    for (i, a) in args_acc.iter().enumerate() {
+        if let (_, Some(note)) = args_object_or_raw(a) {
+            eprintln!("[chat] BUG: the arguments of tool call {i} are not a JSON object - {note}");
         }
     }
     // #29 A7: a closed call answers `tool_calls`; a malformed one keeps `stop` / `length`.
@@ -2523,6 +2659,62 @@ struct Srv<'a> {
     cache: PrefixCache,
     /// #32 A10: `--slot-save-path <dir>`; `None` makes `/slots/0` refuse both actions
     slot_save_path: Option<String>,
+    /// TASK K: true once the SSE head of the request in flight left the socket.
+    /// A CUDA allocation failure after that cannot be answered with an HTTP
+    /// status any more, so `guarded` sends an SSE error frame instead.
+    stream_head_sent: bool,
+}
+
+/// - TASK K: one request may not take the server down with it
+/// - a CUDA allocation that fails anywhere inside a request (the image path, the
+///   mrope tables, a state buffer) raises `cuda::AllocFailed` instead of the bare
+///   panic of record, because the `RequestScope` below is armed; this catches
+///   exactly that payload, frees nothing itself (every allocation site frees what
+///   it took before it raises, and every RAII buffer drops in the unwind), puts
+///   the engine back to its zero state and answers 503 with a body that NAMES the
+///   allocation and its byte count
+/// - anything else that panics is re-raised unchanged: a bug is still a crash,
+///   and only the out-of-VRAM case is a served error
+fn guarded<F>(stream: &mut TcpStream, srv: &mut Srv, f: F) -> &'static str
+where
+    F: FnOnce(&mut TcpStream, &mut Srv) -> &'static str,
+{
+    srv.stream_head_sent = false;
+    let caught = {
+        let _scope = crow_nest_engine::cuda::RequestScope::new();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(stream, srv)))
+    };
+    let payload = match caught {
+        Ok(status) => return status,
+        Err(p) => p,
+    };
+    let failed = match payload.downcast::<crow_nest_engine::cuda::AllocFailed>() {
+        Ok(af) => *af,
+        Err(p) => std::panic::resume_unwind(p),
+    };
+    eprintln!(
+        "[serve] the request was dropped: {} - the engine stays up, the next request is served",
+        failed.message()
+    );
+    // back to a state the NEXT request can prefill from: no armed vision plan, no
+    // held conversation, no captured decode graph.
+    srv.eng.end_vision();
+    srv.cache.invalidate();
+    unsafe { srv.eng.reset_to_zero() };
+    let body = error_json(&format!(
+        "{}. The request was dropped and the engine is up; retry with fewer or smaller images, \
+         a shorter prompt, or restart with a larger CROW_VIT_RESERVE_MB",
+        failed.message()
+    ));
+    if srv.stream_head_sent {
+        // the 200 head is already on the wire: the only thing the client can still
+        // read is a frame, so the error rides one and the stream ends properly
+        let _ = sse_send(stream, &sse_frame(&serde_json::json!({ "error": body["error"] })));
+        let _ = sse_send(stream, SSE_DONE);
+        "503 (as an SSE error frame, the head was already sent)"
+    } else {
+        respond_json(stream, "503 Service Unavailable", &body)
+    }
 }
 
 /// - `POST /slots/0?action=save|restore` (#32 A10)
@@ -2636,7 +2828,7 @@ fn serve_one(stream: &mut TcpStream, srv: &mut Srv) {
             match route(&method, &path) {
                 // the chat route writes its own response: SSE, or a JSON error
                 Route::Chat => {
-                    let status = chat_route(stream, srv, &body);
+                    let status = guarded(stream, srv, |stream, srv| chat_route(stream, srv, &body));
                     eprintln!("[serve] {label} -> {status}");
                     let _ = stream.shutdown(Shutdown::Write);
                     return;
@@ -2677,6 +2869,19 @@ fn main() {
     if args.get(1).map(|s| s.as_str()) == Some("tokenize") {
         std::process::exit(tokenize_main(&args[2..]));
     }
+    // TASK K: an out-of-VRAM inside a request raises `cuda::AllocFailed`, which `guarded`
+    // catches and answers with a 503. Its payload is not a string, so the DEFAULT hook
+    // prints `panicked at ...: Box<dyn Any>` on the way past - a line that says nothing and
+    // reads like a crash in a log where the server is fine. `AllocFailed::raise` has already
+    // printed the `[alloc]` line with the name, the byte count and the free VRAM, so this
+    // hook drops that one payload and leaves every other panic exactly as it was.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if info.payload().downcast_ref::<crow_nest_engine::cuda::AllocFailed>().is_some() {
+            return;
+        }
+        previous_hook(info);
+    }));
     let cli = match parse_args(&args) {
         Ok(a) => a,
         Err(e) => {
@@ -2806,6 +3011,7 @@ fn main() {
         parked_sampler: None,
         cache,
         slot_save_path: cli.slot_save_path.clone(),
+        stream_head_sent: false,
     };
     for conn in listener.incoming() {
         match conn {
@@ -3797,6 +4003,10 @@ mod tests {
         assert!(n.contains("(500 B total)"), "{n}");
         assert!(n.contains(&"x".repeat(200)), "{n}");
         assert!(!n.contains(&"x".repeat(201)), "the log line is capped at 200 bytes: {n}");
+        // TASK K: and WHY it is not a mapping - serde_json's own message plus the byte
+        // window it stopped in, which is what robin's 3,112-byte case did not carry
+        assert!(n.contains("serde_json:"), "the decoder's message is missing: {n}");
+        assert!(n.contains("<HERE>"), "the byte window is missing: {n}");
         // the digest carries the same locator, one line per message
         let d = message_digest(&msgs);
         assert_eq!(d.len(), 2);
@@ -4413,5 +4623,82 @@ mod tests {
         assert_eq!(col.calls[1].name, "b");
         assert_eq!(col.calls[1].arguments, "{\"x\":1}");
         assert_eq!((c, t), (0, 5));
+    }
+
+    // ---- TASK K: the producer end of the `arguments` contract, and the diagnostics ----
+
+    /// the shape the parser always produces passes through byte for byte
+    #[test]
+    fn a_json_object_argument_string_is_left_alone() {
+        for good in [
+            r#"{}"#,
+            r#"{"path":"/etc/hostname"}"#,
+            r#"{"path":"/x","content":"<!doctype html>\n<p class=\"a\">\u0009</p>"}"#,
+            r#"{"path":"/etc/host","_truncated":true}"#,
+            "",
+        ] {
+            let (out, note) = args_object_or_raw(good);
+            assert_eq!(out, good, "a valid arguments string was rewritten: {good}");
+            assert!(note.is_none(), "a valid arguments string produced a note: {note:?}");
+        }
+    }
+
+    /// anything else becomes `{"_raw": ...}` and the note carries serde_json's own words
+    /// plus the byte window - the two things robin's 2026-09-17 line did not have
+    #[test]
+    fn a_broken_argument_string_becomes_raw_and_the_note_names_the_defect() {
+        // the history entry of record, cut in the middle of a value
+        let (out, note) = args_object_or_raw(r#"{"path":"/etc/host"#);
+        let doc: serde_json::Value = serde_json::from_str(&out).expect("the repair is JSON");
+        assert_eq!(doc[RAW_KEY], r#"{"path":"/etc/host"#);
+        let note = note.expect("a broken string must produce a note");
+        assert!(note.contains("serde_json:"), "the decoder's message is missing: {note}");
+        assert!(note.contains("EOF while parsing"), "the decoder's reason is missing: {note}");
+        assert!(note.contains("<HERE>"), "the byte window is missing: {note}");
+
+        // the same shape with an HTML content parameter, cut mid-escape
+        let cut = r#"{"path":"/home/x/sheet.html","content":"<!doctype html>\n<html lang=\"en\">\"#;
+        let (_, note) = args_object_or_raw(cut);
+        let note = note.expect("a cut escape must produce a note");
+        assert!(note.contains(&format!("of {}", cut.len())), "the window must name the total length: {note}");
+        assert!(note.contains("<HERE>"), "the window must mark the cut: {note}");
+
+        // a string that parses but is not a mapping: the template cannot iterate it either
+        let (out, note) = args_object_or_raw("[1,2]");
+        let doc: serde_json::Value = serde_json::from_str(&out).expect("the repair is JSON");
+        assert_eq!(doc[RAW_KEY], "[1,2]");
+        assert!(note.expect("a note").contains("it parses, as an array"));
+    }
+
+    /// the window is a byte range around the failure, always on char boundaries
+    #[test]
+    fn the_error_window_points_at_the_failing_byte() {
+        let s = "{\"a\":\"\u{e9}\u{1f426}\", \"b\" 1}";
+        let e = serde_json::from_str::<serde_json::Value>(s).expect_err("this is not JSON");
+        let w = error_window(s, &e);
+        assert!(w.contains("<HERE>"), "no marker: {w}");
+        assert!(w.contains(&format!("of {}", s.len())), "no total length: {w}");
+        // the marked byte is where serde stopped: the window's left half ends with what
+        // came before it, so the defect itself is the first thing after `<HERE>`
+        assert!(w.contains(r#"<HERE> "1}""#), "the window must start at the offending byte: {w}");
+    }
+
+    /// the accumulator is Crow's own: one string per call index, in fragment order
+    #[test]
+    fn the_arguments_accumulator_is_per_call_index() {
+        let mut acc = Vec::new();
+        accumulate_args(&[
+            Emit::Call { index: 0, id: "call_0".into(), name: "a".into() },
+            Emit::Args { index: 0, text: "{\"p\":".into() },
+            Emit::Content("ignored".into()),
+        ], &mut acc);
+        accumulate_args(&[
+            Emit::Args { index: 1, text: "{\"q\":2}".into() },
+            Emit::Args { index: 0, text: "1}".into() },
+        ], &mut acc);
+        assert_eq!(acc, vec!["{\"p\":1}".to_string(), "{\"q\":2}".to_string()]);
+        for a in &acc {
+            assert!(serde_json::from_str::<serde_json::Value>(a).unwrap().is_object());
+        }
     }
 }

@@ -252,6 +252,118 @@ fn ck_call(call: &str, r: CUresult) {
     panic!("CUDA error: {r:?}");
 }
 
+// ---------- named device allocations, and the failure a request survives (TASK K) ----------
+
+/// A device allocation that failed, named. Before TASK K every `cuMemAlloc_v2`
+/// went through the bare `ck` above, so an out-of-memory anywhere in the engine
+/// printed `CUDA error: CUDA_ERROR_OUT_OF_MEMORY` and nothing else - robin's
+/// 2026-09-17 serve log has exactly that line and no way to tell WHICH buffer
+/// the card refused. This carries the name, the byte count and the free VRAM at
+/// the moment of the refusal, and it is also the panic PAYLOAD a request scope
+/// raises, so `serve` can answer 503 instead of dying.
+#[derive(Debug, Clone)]
+pub struct AllocFailed {
+    /// what the engine was allocating, in the words of the call site
+    pub what: String,
+    pub bytes: usize,
+    /// free VRAM, read right after the refusal
+    pub free: u64,
+    pub result: String,
+}
+
+impl AllocFailed {
+    /// the one line both the panic and the 503 body carry
+    pub fn message(&self) -> String {
+        format!(
+            "CUDA error: {} allocating {} ({} B = {:.1} MiB); free VRAM {:.1} MiB",
+            self.result,
+            self.what,
+            self.bytes,
+            self.bytes as f64 / (1u64 << 20) as f64,
+            self.free as f64 / (1u64 << 20) as f64
+        )
+    }
+    /// end the call the way an allocation failure always ended it - but inside a
+    /// request scope the payload is THIS value, so the caller can answer instead
+    /// of the process dying
+    pub fn raise(self) -> ! {
+        let msg = self.message();
+        eprintln!("[alloc] {msg}");
+        if in_request() && !std::thread::panicking() {
+            std::panic::panic_any(self);
+        }
+        panic!("{msg}");
+    }
+}
+
+thread_local! {
+    /// set while a request is being served: an allocation failure then panics with
+    /// an `AllocFailed` payload instead of the bare string, and `serve` catches it
+    static IN_REQUEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// true while a `RequestScope` is alive on this thread
+pub fn in_request() -> bool {
+    IN_REQUEST.with(|c| c.get())
+}
+
+/// RAII: an allocation failure inside this scope is a typed panic, not a bare one
+pub struct RequestScope(bool);
+
+impl RequestScope {
+    pub fn new() -> RequestScope {
+        RequestScope(IN_REQUEST.with(|c| c.replace(true)))
+    }
+}
+
+impl Default for RequestScope {
+    fn default() -> Self {
+        RequestScope::new()
+    }
+}
+
+impl Drop for RequestScope {
+    fn drop(&mut self) {
+        IN_REQUEST.with(|c| c.set(self.0));
+    }
+}
+
+/// - the fallible device allocation: `Ok` is a zeroed buffer, `Err` names what failed
+/// - every caller that can free what it already took uses THIS one, so a refusal
+///   in the middle of a group of allocations leaves no orphan behind
+///
+/// # Safety
+///
+/// - a CUDA context must be current, as for every other call in this module
+pub unsafe fn try_alloc_zeroed(what: &str, bytes: usize) -> Result<CUdeviceptr, AllocFailed> {
+    assert!(bytes > 0, "alloc of 0 bytes ({what})");
+    let mut d: CUdeviceptr = 0;
+    let r = sys::cuMemAlloc_v2(&mut d, bytes);
+    if r != CUresult::CUDA_SUCCESS {
+        return Err(AllocFailed {
+            what: what.to_string(),
+            bytes,
+            free: free_vram_bytes(),
+            result: format!("{r:?}"),
+        });
+    }
+    ck(sys::cuMemsetD8_v2(d, 0, bytes));
+    live_allocs().lock().unwrap().insert(d, bytes);
+    Ok(d)
+}
+
+/// `try_alloc_zeroed` that ends the call on failure, with the name in the message
+///
+/// # Safety
+///
+/// - a CUDA context must be current, as for every other call in this module
+pub unsafe fn alloc_named(what: &str, bytes: usize) -> CUdeviceptr {
+    match try_alloc_zeroed(what, bytes) {
+        Ok(d) => d,
+        Err(e) => e.raise(),
+    }
+}
+
 pub struct Ctx {
     pub ctx: *mut cudarc::driver::sys::CUctx_st,
     pub dev: std::os::raw::c_int,
@@ -356,13 +468,11 @@ pub fn live_dev_top(n: usize) -> Vec<usize> {
     v
 }
 
+/// the unnamed device allocation of record: `alloc_named` under the generic
+/// name, so even a call site that names nothing prints its byte count and the
+/// free VRAM when the card refuses (TASK K)
 pub unsafe fn alloc_zeroed(bytes: usize) -> CUdeviceptr {
-    assert!(bytes > 0, "alloc of 0 bytes");
-    let mut d: CUdeviceptr = 0;
-    ck(sys::cuMemAlloc_v2(&mut d, bytes));
-    ck(sys::cuMemsetD8_v2(d, 0, bytes));
-    live_allocs().lock().unwrap().insert(d, bytes);
-    d
+    alloc_named("an engine buffer", bytes)
 }
 
 pub unsafe fn free_dev(d: &mut CUdeviceptr) {
@@ -374,7 +484,16 @@ pub unsafe fn free_dev(d: &mut CUdeviceptr) {
 }
 
 pub unsafe fn upload_dev(v: &[u8]) -> CUdeviceptr {
-    let d = alloc_zeroed(v.len());
+    upload_dev_named("an engine buffer", v)
+}
+
+/// `upload_dev` whose allocation carries a name into the failure line (TASK K)
+///
+/// # Safety
+///
+/// - a CUDA context must be current, as for every other call in this module
+pub unsafe fn upload_dev_named(what: &str, v: &[u8]) -> CUdeviceptr {
+    let d = alloc_named(what, v.len());
     ck(sys::cuMemcpyHtoDAsync_v2(
         d,
         v.as_ptr() as *const std::ffi::c_void,
@@ -390,6 +509,34 @@ pub unsafe fn upload_dev(v: &[u8]) -> CUdeviceptr {
 /// so spelling it at the call site is load-bearing, not decoration.
 pub unsafe fn to_dev<T: Copy>(v: &[T]) -> CUdeviceptr {
     upload_dev(std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)))
+}
+
+/// - TASK K: the `to_dev` COPY without its allocation - the one-shot form, async on the
+///   LEGACY stream plus the explicit `cuStreamSynchronize(0)`, never `cur_stream`
+/// - it exists so a call site that needs a NAMED allocation can still write the buffer
+///   exactly as `to_dev` would have written it; `into_dev` is the other form (current
+///   stream, no sync while a graph stream is active) and the two are not interchangeable
+///
+/// # Safety
+///
+/// - a CUDA context must be current, as for every other call in this module
+pub unsafe fn into_dev_legacy<T: Copy>(dst: CUdeviceptr, v: &[T]) {
+    ck(sys::cuMemcpyHtoDAsync_v2(
+        dst,
+        v.as_ptr() as *const std::ffi::c_void,
+        std::mem::size_of_val(v),
+        std::ptr::null_mut(),
+    ));
+    ck(sys::cuStreamSynchronize(std::ptr::null_mut()));
+}
+
+/// `to_dev` whose allocation carries a name into the failure line (TASK K)
+///
+/// # Safety
+///
+/// - a CUDA context must be current, as for every other call in this module
+pub unsafe fn to_dev_named<T: Copy>(what: &str, v: &[T]) -> CUdeviceptr {
+    upload_dev_named(what, std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)))
 }
 
 pub unsafe fn to_f32_dev(v: &[f32]) -> CUdeviceptr { to_dev(v) }
@@ -735,5 +882,76 @@ mod tests {
         for r in [mine, uvm, gfx] {
             let _ = std::fs::remove_dir_all(r);
         }
+    }
+}
+
+#[cfg(test)]
+mod alloc_failure {
+    //! TASK K: the failure path of a device allocation, without a GPU. The failure itself
+    //! is INJECTED (an `AllocFailed` built by hand, exactly as `try_alloc_zeroed` builds
+    //! it), so the two things `serve` depends on are asserted here and not only in the
+    //! reproduction: the message names the allocation and its byte count, and inside a
+    //! request scope the panic carries the value as its payload instead of a bare string.
+    use super::*;
+
+    fn failure() -> AllocFailed {
+        AllocFailed {
+            what: "the vit block MLP scratch".to_string(),
+            bytes: 70_516_736,
+            free: 80_314_368,
+            result: "CUDA_ERROR_OUT_OF_MEMORY".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_message_names_the_allocation_its_bytes_and_the_free_vram() {
+        let m = failure().message();
+        assert!(m.contains("CUDA_ERROR_OUT_OF_MEMORY"), "the CUDA result moved: {m}");
+        assert!(m.contains("the vit block MLP scratch"), "the name moved: {m}");
+        assert!(m.contains("70516736 B = 67.2 MiB"), "the byte count moved: {m}");
+        assert!(m.contains("free VRAM 76.6 MiB"), "the free VRAM moved: {m}");
+    }
+
+    /// inside a scope the payload is the value, so `serve` can answer 503; outside it the
+    /// panic is the bare message of record and the process still dies
+    #[test]
+    fn a_request_scope_turns_the_panic_into_a_payload_serve_can_answer() {
+        assert!(!in_request(), "no scope is open at the start of the test");
+        let caught = std::panic::catch_unwind(|| {
+            let _scope = RequestScope::new();
+            assert!(in_request(), "the scope is open inside it");
+            failure().raise()
+        });
+        let payload = caught.expect_err("raise() always ends the call");
+        let got = payload
+            .downcast_ref::<AllocFailed>()
+            .expect("inside a request scope the payload IS the AllocFailed");
+        assert_eq!(got.bytes, 70_516_736);
+        assert_eq!(got.what, "the vit block MLP scratch");
+        assert!(!in_request(), "the scope closed on the way out of the unwind");
+
+        let caught = std::panic::catch_unwind(|| failure().raise());
+        let payload = caught.expect_err("raise() always ends the call");
+        assert!(
+            payload.downcast_ref::<AllocFailed>().is_none(),
+            "outside a scope the panic keeps the bare string of record"
+        );
+        assert!(
+            payload.downcast_ref::<String>().is_some_and(|s| s.contains("the vit block MLP scratch")),
+            "the bare panic still names the allocation"
+        );
+    }
+
+    /// nested scopes restore, not clear: a slot route inside a chat route keeps the outer one
+    #[test]
+    fn request_scopes_nest() {
+        let outer = RequestScope::new();
+        {
+            let _inner = RequestScope::new();
+            assert!(in_request());
+        }
+        assert!(in_request(), "the inner scope restored the outer one, it did not clear it");
+        drop(outer);
+        assert!(!in_request());
     }
 }
