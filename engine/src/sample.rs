@@ -79,8 +79,8 @@ impl Sampler {
         if std::env::var("CROW_SAMPLE").as_deref() != Ok("1") {
             return None;
         }
-        let f = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        let u = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let f = |k: &str, d: f32| crate::geo::env_parse::<f32>(k).unwrap_or(d);
+        let u = |k: &str, d: usize| crate::geo::env_parse::<usize>(k).unwrap_or(d);
         Some(Sampler {
             temperature: f("CROW_TEMP", 0.7),
             top_p: f("CROW_TOP_P", 0.8),

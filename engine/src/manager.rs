@@ -30,7 +30,7 @@ pub fn planner_refusal_msg(free0: u64, host_pinned_budget: u64) -> String {
 /// (`CROW_RAM_MARGIN_GB`, default 3 GiB). One number for both readers: the
 /// budget derived below and the pre-pin gate in `residency::build`.
 pub fn ram_margin_bytes() -> u64 {
-    std::env::var("CROW_RAM_MARGIN_GB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(3) << 30
+    env_parse::<u64>("CROW_RAM_MARGIN_GB").unwrap_or(3) << 30
 }
 
 /// The host pinned budget, DERIVED at boot instead of assumed (issue #15).
@@ -57,7 +57,7 @@ pub fn derive_host_pinned_budget(cap: u64, log: &mut dyn FnMut(&str)) -> u64 {
     let ram = cuda::free_physical_ram_parts();
     let (free_for_pin, mem_available) = (ram.free_for_pin, ram.mem_available);
     let margin = ram_margin_bytes();
-    let (budget, basis) = match std::env::var("CROW_PINNED_BUDGET_GB").ok().and_then(|v| v.parse::<u64>().ok()) {
+    let (budget, basis) = match env_parse::<u64>("CROW_PINNED_BUDGET_GB") {
         Some(g) => (g << 30, "CROW_PINNED_BUDGET_GB".to_string()),
         // free_for_pin == 0 means the query failed: keep the configured cap,
         // the pre-pin gate in residency::build is then the only guard left

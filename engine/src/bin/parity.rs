@@ -155,18 +155,14 @@ fn llama_complete(url: &str, text: &str, max_tokens: usize) -> (f64, f64, String
 // EOS, so the crow arm must too — otherwise every correct short answer is
 // scored as degeneration (fable gate 2026-09-03). Raw traces stay recorded.
 
-fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) {    let cnq_path = std::env::var("CROW_CNQ")
-        .unwrap_or_else(|_| DEFAULT_CNQ.into());
-    // same production switches as `decode run` (2026-09-04): sidecar override,
+fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) {    // same production switches as `decode run` (2026-09-04): sidecar override,
     // prefill chunk, prompt-adaptive hot set after the prefill (charged to prefill)
     // defaults (#48): the production -M container and the id-sorted rectangular
     // sidecar serve.rs loads, both relative to the repo root (see the header at :44)
-    let sidecar = std::env::var("CROW_HOTSETS").unwrap_or_else(|_| DEFAULT_HOTSETS.into());
-    let mut cnq = crow_nest_engine::cnq::Cnq::open(&cnq_path);
+    let (mut cnq, _ctx, mut cfg, _cnq_path, sidecar) = unsafe {
+        crow_nest_engine::boot::open_model(DEFAULT_CNQ.into(), DEFAULT_HOTSETS.into())
+    };
     unsafe {
-        let _ctx = crow_nest_engine::cuda::Ctx::init();
-        let mut cfg = crow_nest_engine::geo::Config::default();
-        cfg.context = crow_nest_engine::geo::CONTEXT_FLOOR;
         let ids = tokenize(text);
         // #16: CROW_CHUNK explicit, else auto by prompt length (geo.rs)
         crow_nest_engine::geo::apply_chunk_policy(&mut cfg, ids.len());
@@ -183,10 +179,10 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
         // CROW_ADAPT_EVERY=K re-cuts the hot set every K tokens, <= CROW_ADAPT_MAX swaps/layer
         // (#17: from geo::apply_adapt_policy - env in manual mode, else the
         // long-context switch: stream trickle 7 / 16 / 7 at chunk 2048 only)
-        let crow_nest_engine::geo::Adapt { stream: adapt_stream, every: adapt_every, max: adapt_max, .. } = eng.cfg.adapt;
+        let (adapt_stream, adapt_every, adapt_max) = eng.cfg.adapt.knobs();
         let mut trickle_swaps = 0usize;
         let c0 = eng.drain_counters();
-        let (ple_r0, ple_m0) = (eng.ple.req, eng.ple.miss);
+        let (ple_r0, ple_m0) = (eng.ple().req, eng.ple().miss);
         // #20: CROW_SAMPLE=1 -> sampling with the data-sheet profile: on the device
         // (sample_k behind argmax_k) unless CROW_SAMPLE_HOST=1 keeps the host path
         let mut sampler = crow_nest_engine::sample::Sampler::from_env();
@@ -194,12 +190,11 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
         if let Some(s) = &mut sampler {
             eprintln!("[{}]", s.describe());
             if sample_host {
-                let lg = crow_nest_engine::cuda::dtoh(eng.s.logits, crow_nest_engine::geo::V);
+                let lg = crow_nest_engine::cuda::dtoh(eng.logits(), crow_nest_engine::geo::V);
                 next = s.sample(&lg);
                 s.observe(next);
             } else {
-                eng.enable_dev_sampler(s);
-                next = eng.sample_last();
+                next = eng.arm_sampler(s);
             }
         }
         let mut answer: Vec<i64> = vec![next as i64];
@@ -216,7 +211,7 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
             next = eng.decode_step(&mut cnq, next as i64);
             if sample_host {
                 if let Some(s) = &mut sampler {
-                    let lg = crow_nest_engine::cuda::dtoh(eng.s.logits, crow_nest_engine::geo::V);
+                    let lg = crow_nest_engine::cuda::dtoh(eng.logits(), crow_nest_engine::geo::V);
                     next = s.sample(&lg);
                     s.observe(next);
                 }
@@ -246,9 +241,9 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
                 c.iter().zip(c0.iter()).map(|(x, b)| x[1] - b[1]).sum(),
             );
             let n = (steps as f64 - 1.0).max(1.0);
-            let (r, m) = (eng.ple.req - ple_r0, eng.ple.miss - ple_m0);
+            let (r, m) = (eng.ple().req - ple_r0, eng.ple().miss - ple_m0);
             eprintln!("[decode-stats] {} tokens: cold experts/token {:.1} of {:.0}, {:.0} MB/token zero-copy; ple misses/token {:.2} of {:.1}; trickle swaps {} (every {}, max {}/layer)",
-                steps - 1, cold as f64 / n, sel as f64 / n, cold as f64 / n * (eng.res.gu_bytes + eng.res.dn_bytes) as f64 / 1e6,
+                steps - 1, cold as f64 / n, sel as f64 / n, cold as f64 / n * (eng.residency().gu_bytes + eng.residency().dn_bytes) as f64 / 1e6,
                 m as f64 / n, r as f64 / n, trickle_swaps, adapt_every, adapt_max);
         }
         (

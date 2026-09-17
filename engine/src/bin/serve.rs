@@ -440,9 +440,10 @@
 //! - `--slot-save-path` must name an EXISTING directory; a typo refuses the BOOT, not the save.
 
 use crow_nest_engine::cache::{PrefixCache, SLOTS};
+use crow_nest_engine::boot;
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::{DevSampler, Engine};
-use crow_nest_engine::geo::{apply_adapt_policy, Adapt, Config, CONTEXT_FLOOR, DEFAULT_CNQ, DEFAULT_HOTSETS, LAYERS, TRICKLE_CHUNK_THRESHOLD};
+use crow_nest_engine::geo::{apply_adapt_policy, DEFAULT_CNQ, DEFAULT_HOTSETS, LAYERS, TRICKLE_CHUNK_THRESHOLD};
 use crow_nest_engine::sample::{Sampler, EOS_IDS};
 use crow_nest_engine::slot;
 use crow_nest_engine::toolcall::{Emit, ToolStream, TOOL_OPEN};
@@ -1592,7 +1593,7 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
     // image_pad into its visual tokens, arm the mrope span tables. With
     // CROW_VIT=0 the engine holds no tower and the request falls through as
     // the placeholder of record (the single image_pad rides as a token).
-    let ids: Vec<u32> = if !req.images.is_empty() && srv.eng.vit.is_some() {
+    let ids: Vec<u32> = if !req.images.is_empty() && srv.eng.has_vision() {
         eprintln!("[vit-chat] {} image(s) in request, decoding data URLs ...", req.images.len());
         let mut bytes = Vec::with_capacity(req.images.len());
         for (i, url) in req.images.iter().enumerate() {
@@ -1602,7 +1603,7 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
             }
         }
         let vit_t0 = std::time::Instant::now();
-        let plan = match unsafe { srv.eng.vit.as_mut().unwrap().build_plan(&srv.eng.k, &ids, &bytes) } {
+        let plan = match unsafe { srv.eng.build_vision_plan(&ids, &bytes) } {
             Ok(p) => p,
             Err(e) => return respond_json(stream, "400 Bad Request", &error_json(&e)),
         };
@@ -1714,7 +1715,7 @@ struct GenOut {
 /// - read once at start and once per request, never inside the token loop
 /// - a misconfigured process therefore logs one line instead of panicking mid request
 fn trickle_ready(eng: &Engine) -> bool {
-    eng.res.lb.is_none() && eng.res.stride > eng.res.n
+    eng.residency().lb.is_none() && eng.residency().stride > eng.residency().n
 }
 
 /// - #39 B3a: THE generation loop of this server, the only one. `stream:true` runs it with
@@ -1748,8 +1749,8 @@ fn chat_generate(
     }
     // #31 A9: the detection rule of spec 7.4, host side, IDS ONLY. `Engine::history` is the
     // held conversation: prompt ids AND generated ids (`gen.rs:2698`, `gen.rs:2945`).
-    let plan = srv.cache.decide(&srv.eng.history, &prompt);
-    let held = srv.eng.history.len();
+    let plan = srv.cache.decide(srv.eng.history(), &prompt);
+    let held = srv.eng.history().len();
     let cache_on = srv.cache.enabled();
     let snaps = srv.cache.positions();
     let reusable = srv.cache.reuse_candidates();
@@ -1809,7 +1810,7 @@ fn chat_generate(
     if cache_on {
         eprintln!(
             "[cache] snapshot point 1 (after prompt) at pos {}, DtoH {snap1_ms:.3} ms",
-            srv.eng.pos
+            srv.eng.pos()
         );
     }
 
@@ -1822,15 +1823,9 @@ fn chat_generate(
     match &sampler {
         Some(s) => {
             // the device buffers a greedy request parked come back here, nothing is reallocated
-            if srv.eng.dev_sampler.is_none() {
-                srv.eng.dev_sampler = srv.parked_sampler.take();
-            }
-            // unsafe: device uploads and one eager sampler launch, as parity.rs:194-205 does
-            unsafe {
-                srv.eng.enable_dev_sampler(s);
-                // the first id is drawn from the prefill's last logits row, not taken from argmax
-                next = srv.eng.sample_last();
-            }
+            srv.eng.unpark_sampler(&mut srv.parked_sampler);
+            // unsafe: device uploads and one eager sampler launch, as parity does
+            next = unsafe { srv.eng.arm_sampler(s) };
             eprintln!(
                 "[chat] sampling on the device: temperature {} top_p {} top_k {} presence_penalty {} seed {}",
                 s.temperature, s.top_p, s.top_k, s.presence_penalty, s.seed
@@ -1839,9 +1834,7 @@ fn chat_generate(
         None => {
             // greedy is the A4 path: `decode_step` samples whenever `dev_sampler` is Some
             // (gen.rs:2905-2909) and `reset_to_zero` does not clear it, so it is taken out here
-            if srv.eng.dev_sampler.is_some() {
-                srv.parked_sampler = srv.eng.dev_sampler.take();
-            }
+            srv.eng.park_sampler(&mut srv.parked_sampler);
             eprintln!("[chat] greedy (temperature absent or <= 0)");
         }
     }
@@ -1876,7 +1869,7 @@ fn chat_generate(
     // `CROW_ADAPT_STREAM` unset and chunk 2048 that is stream / 7 spare / every 16 / max 7.
     // `decode.rs` ticks for `i in 1..gen`, that is before every `decode_step` EXCEPT the
     // first; loop index `i` here names the same token, so the guard is the same `i > 0`.
-    let Adapt { stream: adapt_stream, every: adapt_every, max: adapt_max, .. } = srv.eng.cfg.adapt;
+    let (adapt_stream, adapt_every, adapt_max) = srv.eng.cfg.adapt.knobs();
     let tick_trickle = adapt_stream && adapt_every > 0 && trickle_ready(srv.eng);
     let mut trickle_swaps = 0usize;
     if !aborted {
@@ -1977,7 +1970,7 @@ fn chat_generate(
     let (selections_total, cold_total) = blocks
         .iter()
         .fold((0u64, 0u64), |a, c| (a.0 + c[0], a.1 + c[1]));
-    let (ple_rows_total, ple_miss_total) = (srv.eng.ple.req, srv.eng.ple.miss);
+    let (ple_rows_total, ple_miss_total) = (srv.eng.ple().req, srv.eng.ple().miss);
     let counters_ms = t_ctr.elapsed().as_secs_f64() * 1e3;
 
     let gen = out.len();
@@ -2080,7 +2073,7 @@ unsafe fn write_vit_dump(
     prefill_ms: f64,
 ) {
     let _ = std::fs::create_dir_all(dir);
-    let (map, grids, _delta, n_visual) = match srv.eng.vit_plan.as_ref() {
+    let (map, grids, _delta, n_visual) = match srv.eng.vision_plan() {
         Some(p) => (p.map.clone(), p.grids.clone(), p.delta, p.n_visual),
         None => (Vec::new(), Vec::new(), 0i64, 0usize),
     };
@@ -2353,7 +2346,7 @@ fn serve_one(stream: &mut TcpStream, srv: &mut Srv) {
                 Route::Props => (
                     label,
                     "200 OK",
-                    props_json(srv.model_path, srv.n_ctx, srv.prompt_chunk, srv.eng.vit.is_some()),
+                    props_json(srv.model_path, srv.n_ctx, srv.prompt_chunk, srv.eng.has_vision()),
                 ),
                 Route::Slots => (
                     label,
@@ -2437,15 +2430,10 @@ fn main() {
         eprintln!("[serve] {key}={}", std::env::var(key).unwrap_or_default());
     }
 
-    let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| DEFAULT_CNQ.into());
-    let sidecar = std::env::var("CROW_HOTSETS").unwrap_or_else(|_| DEFAULT_HOTSETS.into());
-    let mut cnq = Cnq::open(&cnq_path);
-
     // unsafe: creates the CUDA context; it must outlive every device allocation
-    let _ctx = unsafe { crow_nest_engine::cuda::Ctx::init() };
-
-    let mut cfg = Config::default();
-    cfg.context = CONTEXT_FLOOR;
+    let (mut cnq, _ctx, mut cfg, cnq_path, sidecar) = unsafe {
+        boot::open_model(DEFAULT_CNQ.into(), DEFAULT_HOTSETS.into())
+    };
     // M1: chunk pinned for the process, no per prompt policy
     cfg.prompt_chunk = SERVE_CHUNK;
     apply_adapt_policy(&mut cfg);
@@ -2454,9 +2442,7 @@ fn main() {
     let eng = unsafe {
         Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| eprintln!("[load] {m}"))
     };
-    // `Cnq::open` handed the container to the loader; the engine keeps a raw
-    // pointer to it (`Engine::cnq`), and prefill needs it back as `&mut`
-    let n_ctx = eng.st.context;
+    let n_ctx = eng.n_ctx();
     let prompt_chunk = eng.cfg.prompt_chunk;
 
     eprintln!("[serve] container {cnq_path}");
@@ -2478,8 +2464,8 @@ fn main() {
             "[serve] #37 stream trickle NOT ticked: stream {}, every {}, spare slots {}, exact NVFP4 tier {}",
             ad.stream,
             ad.every,
-            eng.res.stride.saturating_sub(eng.res.n),
-            eng.res.lb.is_none()
+            eng.residency().stride.saturating_sub(eng.residency().n),
+            eng.residency().lb.is_none()
         );
     }
     eprintln!("[serve] adapt_tick (the CROW_ADAPT=1 hot-set re-cut) is never called by serve");
@@ -2509,7 +2495,7 @@ fn main() {
         if cache.enabled() { "on" } else { "off (CROW_PREFIX_CACHE=0)" },
         cache.shape().snapshot_bytes(),
         SLOTS,
-        eng.st.qsa_ring_rows
+        eng.qsa_ring_rows()
     );
     let mut srv = Srv {
         eng: &mut eng,
@@ -2530,9 +2516,7 @@ fn main() {
     }
     // #28: a parked device sampler goes back into the engine, so `Engine::drop` frees its
     // buffers (the accept loop above only ends on a listener error)
-    if srv.eng.dev_sampler.is_none() {
-        srv.eng.dev_sampler = srv.parked_sampler.take();
-    }
+    srv.eng.unpark_sampler(&mut srv.parked_sampler);
     drop(srv);
     drop(eng);
 }

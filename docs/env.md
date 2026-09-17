@@ -43,9 +43,9 @@ Helpers used by the read sites:
 
 | Helper | Site | Semantics |
 |---|---|---|
-| `env_on(name)` | `engine/src/gen.rs:1138` | true unless the value is exactly `0`; default on |
-| `num(k)` | `engine/src/geo.rs:168` | parse to `usize`, `None` when unset or unparsable |
-| `f(k, d)` / `u(k, d)` | `engine/src/sample.rs:73`, `:74` | parse to `f32` / `usize`, fall back to `d` |
+| `env_flag!(k, on)` / `exact1` / `not1` / `present` | `engine/src/gen.rs:579` | one `OnceLock<bool>` body per switch: `!= Ok("0")` (default on), `== Ok("1")` (opt-in), `!= Ok("1")`, `is_ok()` (presence); read once per process |
+| `env_parse::<T>(k)` | `engine/src/geo.rs:185` | parse to `T`, `None` when unset or unparsable; every filter, clamp and default stays at the call site |
+| `f(k, d)` / `u(k, d)` | `engine/src/sample.rs:82`, `:83` | `env_parse` to `f32` / `usize`, fall back to `d` |
 
 - Scope: `engine/src` and `converter/src` only; shell variables of Crow (for example `CROW_TAVILY_KEY`) have no engine read site and no row.
 - The `--diag` cargo feature alternative of the E5 gate was not taken; no engine change before the tag.
@@ -162,7 +162,7 @@ Helpers used by the read sites:
 |---|---|---|---|---|---|
 | `CROW_PROFILE` | `engine/src/gen.rs:56` | any value; default off | per-section CPU microseconds, printed as ms per step | measurement | also `bin/decode.rs:274`; report format at `gen.rs:52` |
 | `CROW_KPROF` | `engine/src/kernels.rs:3146` | any value; default off | per-kernel GPU time, sync before and after each launch | measurement | the number is kernel time plus one launch latency (`kernels.rs:3138-3140`); referenced by `docs/architecture.md:536`, `:911` |
-| `CROW_DUMP_H` | `engine/src/gen.rs:2251` | directory path; default off | writes `.f32` stage dumps for the determinism bisect | diagnostic | also `gen.rs:2263`, `gen.rs:2307`, `gen.rs:2680`, `gen.rs:2766`, `gen.rs:2795`; forces `cuda::sync()` at every dump point, so timings taken with it are not serving numbers |
+| `CROW_DUMP_H` | `engine/src/gen.rs:607` (`gen::dump_h()`) | directory path; default off | writes `.f32` stage dumps for the determinism bisect | diagnostic | all six dump sites call `dump_h()`, which reads the variable once per process (the sites sit inside the 48-layer loop); forces `cuda::sync()` at every dump point, so timings taken with it are not serving numbers |
 | `CROW_DROP_DBG` | `engine/src/cuda.rs:260` | `1` enables; default off | prints free VRAM and live allocation counts at named points | diagnostic | #18 leak hunt |
 | `CROW_GRAPH_DBG` | `engine/src/gen.rs:2860` | any value; default off | prints graph capture progress markers | diagnostic | effective only while `CROW_GRAPH=1`; markers at `gen.rs:2922` to `gen.rs:3047` |
 | `CROW_VIT_DUMP` | `engine/src/vit.rs` (`Vit::build_plan`), `engine/src/bin/serve.rs` (`chat_generate`) | directory path; default off | per image request writes the oracle inputs: per-image `imgN.patches.f32` / `imgN.pe-w.f32` / `imgN.meta.json`, the tower output `vit-embeds.f32`, `vit-gen-sequence.json` (expanded ids, visual map, grids, generated ids) and `gpu-logits.f32` (one f32 row per prompt position) | diagnostic | #VIT oracle compare path (`oracle/ref_vit_golden.py`, `oracle/ref_image_prompt_logits.py`); forces `cuda::sync()` at the dump points, so timings taken with it are not serving numbers |

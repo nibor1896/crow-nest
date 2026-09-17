@@ -835,7 +835,7 @@ pub fn mrope_tables(pos: &[[i64; 3]], seq: usize, span: usize, delta: i64) -> (V
 fn vit_cache_bytes() -> usize {
     static MB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MB.get_or_init(|| {
-        std::env::var("CROW_VIT_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256)
+        crate::geo::env_parse::<usize>("CROW_VIT_CACHE_MB").unwrap_or(256)
     }) << 20
 }
 

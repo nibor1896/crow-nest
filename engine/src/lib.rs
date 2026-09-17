@@ -12,6 +12,8 @@ pub mod residency;
 // what `gen` and `vit` both need, so neither has to reach into the other
 pub mod weights;
 pub mod gen;
+// the boot sequence the engine-loading bins share: container, CUDA context, config
+pub mod boot;
 pub mod sample;
 pub mod tokenizer;
 // #29 A7 review: the tool-call parser of `bin/serve.rs`, extracted so it is unit tested

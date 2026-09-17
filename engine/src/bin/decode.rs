@@ -11,7 +11,7 @@
 //! Token ids come from tools/tokenize.py (oracle venv, transformers 5.16.1
 //! tokenizer — the same tokenization the reference side uses).
 
-use crow_nest_engine::cnq::Cnq;
+use crow_nest_engine::boot;
 use crow_nest_engine::geo::*;
 use crow_nest_engine::gen::{Engine, PW, SubW};
 
@@ -29,27 +29,24 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
-    let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| from_engine_dir(DEFAULT_CNQ));
     // CROW_CNQ and CROW_HOTSETS override container and hot-set sidecar
     // (e.g. a sidecar warmed on real traffic via `decode warmup`)
     // defaults (#48): the production -M container and the id-sorted rectangular
     // sidecar serve.rs loads, both relative to engine/, the cwd of `decode`
-    let sidecar = std::env::var("CROW_HOTSETS").unwrap_or_else(|_| from_engine_dir(DEFAULT_HOTSETS));
-    let mut cnq = Cnq::open(&cnq_path);
+    let (mut cnq, _ctx, mut cfg, _cnq_path, sidecar) = unsafe {
+        boot::open_model(from_engine_dir(DEFAULT_CNQ), from_engine_dir(DEFAULT_HOTSETS))
+    };
 
     unsafe {
-        let _ctx = crow_nest_engine::cuda::Ctx::init();
-        let mut cfg = Config::default();
         match mode {
             "parity" => {
                 let ids_path = args[2].clone();
                 let out = args[3].clone();
                 let ids = read_ids(&ids_path);
                 // parity runs short — chunk = whole prompt, dense QSA regime
-                cfg.context = CONTEXT_FLOOR;
                 cfg.prompt_chunk = ids.len().max(1);
                 // CROW_CHUNK: scratch/chunk size override (determinism bisect: C=8 vs 512)
-                if let Some(c) = std::env::var("CROW_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()) {
+                if let Some(c) = env_parse::<usize>("CROW_CHUNK") {
                     cfg.prompt_chunk = c.max(ids.len());
                 }
                 // parity ladder switches (bisect FP4 / FP8-KV / PLE)
@@ -62,8 +59,7 @@ fn main() {
                 // CROW_PARITY_PREFILL=<n> (#11, 2026-09-05): prefill only ids[..n] and feed
                 // ids[n..] teacher-forced through decode_step (one logits row per step) —
                 // decode-path rows against prefill-path rows under the same context
-                let tf_split: usize = std::env::var("CROW_PARITY_PREFILL").ok()
-                    .and_then(|v| v.parse().ok()).unwrap_or(ids.len()).clamp(1, ids.len());
+                let tf_split: usize = env_parse("CROW_PARITY_PREFILL").unwrap_or(ids.len()).clamp(1, ids.len());
                 if tf_split < ids.len() {
                     cfg.prompt_chunk = tf_split;
                 }
@@ -79,7 +75,7 @@ fn main() {
                 let mut tf_trace: Vec<usize> = vec![tok];
                 for &fed in &ids[tf_split..] {
                     tok = eng.decode_step(&mut cnq, fed);
-                    logits.push(crow_nest_engine::cuda::dtoh(eng.s.logits, V));
+                    logits.push(crow_nest_engine::cuda::dtoh(eng.logits(), V));
                     tf_trace.push(tok);
                 }
                 if tf_split < ids.len() {
@@ -94,13 +90,13 @@ fn main() {
                 let mut next = tok;
                 for _ in 0..4 {
                     all_ids.push(next as i64);
-                    let pos = eng.pos;
+                    let pos = eng.pos();
                     let t0 = std::time::Instant::now();
                     next = eng.decode_step(&mut cnq, next as i64);
                     println!("  decode pos {pos} → {next} ({:.1} ms)", t0.elapsed().as_secs_f64() * 1e3);
                     // recompute logits row for this position (decode wrote row 0)
                     // — captured via head_run inside decode_step; read it back:
-                    let lg = crow_nest_engine::cuda::dtoh(eng.s.logits, V);
+                    let lg = crow_nest_engine::cuda::dtoh(eng.logits(), V);
                     logits.push(lg);
                 }
                 all_ids.push(next as i64);
@@ -133,7 +129,6 @@ fn main() {
                 let ids_path = args[2].clone();
                 let gen: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(32);
                 let ids = read_ids(&ids_path);
-                cfg.context = CONTEXT_FLOOR;
                 // #16: CROW_CHUNK explicit, else auto by prompt length (geo.rs)
                 crow_nest_engine::geo::apply_chunk_policy(&mut cfg, ids.len());
                 std::fs::create_dir_all("decode_out").unwrap();
@@ -174,9 +169,9 @@ fn main() {
                 // counter baseline AFTER prefill + warm-up: cold/token below is per
                 // timed decode token (the counters are cumulative since load)
                 let c0 = eng.drain_counters();
-                let (ple_r0, ple_m0) = (eng.ple.req, eng.ple.miss);
+                let (ple_r0, ple_m0) = (eng.ple().req, eng.ple().miss);
                 println!("ple rows during prefill+warm-up: {} requested, {} misses ({:.1} %), cache slots {}",
-                    ple_r0, ple_m0, 100.0 * ple_m0 as f64 / ple_r0.max(1) as f64, eng.ple.n_slots);
+                    ple_r0, ple_m0, 100.0 * ple_m0 as f64 / ple_r0.max(1) as f64, eng.ple().n_slots);
                 {
                     let (s0, k0): (u64, u64) = (c0.iter().map(|x| x[0]).sum(), c0.iter().map(|x| x[1]).sum());
                     println!("cold experts during prefill+warm-up: {:.1} per token of {:.0} selections ({} tokens)",
@@ -188,7 +183,7 @@ fn main() {
                 // CROW_STOP_EOS=1 ends the run at EOS
                 if sample_host {
                     if let Some(s) = &mut sampler {
-                        let lg = crow_nest_engine::cuda::dtoh(eng.s.logits, V);
+                        let lg = crow_nest_engine::cuda::dtoh(eng.logits(), V);
                         next = s.sample(&lg);
                         s.observe(next);
                         trace[0] = next;
@@ -201,7 +196,7 @@ fn main() {
                 // the swap time is charged to that token's latency (amortized cost)
                 // (#17: the knobs come from geo::apply_adapt_policy - env in manual
                 // mode, the long-context switch otherwise; see the [policy] line)
-                let crow_nest_engine::geo::Adapt { stream: adapt_stream, every: adapt_every, max: adapt_max, .. } = eng.cfg.adapt;
+                let (adapt_stream, adapt_every, adapt_max) = eng.cfg.adapt.knobs();
                 // CROW_ADAPT_STREAM=1: the same trickle, but the copies run on a
                 // side stream overlapping the next token (A-P3c); the tick's
                 // host bookkeeping is the only part still inside the token time
@@ -222,7 +217,7 @@ fn main() {
                     next = eng.decode_step(&mut cnq, next as i64);
                     if sample_host {
                         if let Some(s) = &mut sampler {
-                            let lg = crow_nest_engine::cuda::dtoh(eng.s.logits, V);
+                            let lg = crow_nest_engine::cuda::dtoh(eng.logits(), V);
                             next = s.sample(&lg);
                             s.observe(next);
                         }
@@ -253,13 +248,13 @@ fn main() {
                 );
                 let gen_timed = (gen - 1).max(1) as f64;
                 {
-                    let (r, m) = (eng.ple.req - ple_r0, eng.ple.miss - ple_m0);
+                    let (r, m) = (eng.ple().req - ple_r0, eng.ple().miss - ple_m0);
                     println!("ple rows per timed decode token: {:.1} requested, {:.2} misses ({:.1} %)",
                         r as f64 / gen_timed, m as f64 / gen_timed, 100.0 * m as f64 / r.max(1) as f64);
                 }
                 println!("cold experts per timed decode token: {:.1} of {:.0} selections -> {:.0} MB/token zero-copy",
                     cold as f64 / gen_timed, sel as f64 / gen_timed,
-                    cold as f64 / gen_timed * (eng.res.gu_bytes + eng.res.dn_bytes) as f64 / 1e6);
+                    cold as f64 / gen_timed * (eng.residency().gu_bytes + eng.residency().dn_bytes) as f64 / 1e6);
                 crow_nest_engine::gen::stage_dma_report(gen_timed as u64);
             if std::env::var("CROW_PROFILE").is_ok() {
                 crow_nest_engine::kernels::kprof_report(gen as u64);
@@ -268,7 +263,7 @@ fn main() {
                 println!(
                     "decode: mean {mean:.2} ms  p50 {p50:.2} ms  ({:.1} tok/s)  context {}  cold experts/token {:.1}",
                     1000.0 / mean,
-                    eng.pos,
+                    eng.pos(),
                     cold as f64 / (gen as f64)
                 );
                 println!("trace: {trace:?}");
@@ -280,12 +275,12 @@ fn main() {
                         "prefill_tok_s": ids.len() as f64 / prefill_s,
                         "warmup_ms": warm, "mean_ms": mean, "p50_ms": p50,
                         "tok_s": 1000.0 / mean,
-                        "context": eng.pos,
+                        "context": eng.pos(),
                         "sel_per_tok": sel as f64 / gen as f64,
                         "cold_per_tok": cold as f64 / gen as f64,
                         "trace": trace,
                         "kv": cfg.kv.name(),
-                        "n_hot": eng.res.n,
+                        "n_hot": eng.residency().n,
                     }),
                 )
                 .unwrap();
@@ -299,7 +294,6 @@ fn main() {
                 let out = args[3].clone();
                 let gen: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(64);
                 let ids = read_ids(&ids_path);
-                cfg.context = CONTEXT_FLOOR;
                 std::env::set_var("CROW_ROUTE_DUMP", "1");
                 std::env::set_var("CROW_GRAPH", "0");
                 let mut eng =
@@ -313,12 +307,12 @@ fn main() {
                     next = eng.decode_step(&mut cnq, next as i64);
                     trace.push(next as i64);
                 }
-                let routes: Vec<Vec<[i32; 10]>> = eng.route_log.clone();
+                let routes: Vec<Vec<[i32; 10]>> = eng.route_log().to_vec();
                 serde_json::to_writer(
                     std::fs::File::create(&out).unwrap(),
                     &serde_json::json!({
-                        "prompt_tokens": ids.len(), "gen": gen, "n_hot": eng.res.n,
-                        "hot_sets": eng.res.sets,
+                        "prompt_tokens": ids.len(), "gen": gen, "n_hot": eng.residency().n,
+                        "hot_sets": eng.residency().sets,
                         "prefill_counts": pre_counts,
                         "decode_routes": routes,
                         "trace": trace,
@@ -336,7 +330,6 @@ fn main() {
                 let n: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(160);
                 assert!(!std::path::Path::new(&out).exists(), "warmup: {out} exists - refusing to overwrite");
                 let ids = read_ids(&ids_path);
-                cfg.context = CONTEXT_FLOOR;
                 cfg.n_hot = n;
                 let even: [[u64; E]; LAYERS] = [[1u64; E]; LAYERS];
                 let mut eng =
@@ -373,8 +366,7 @@ fn main() {
                 // #18: load, drop, load again in ONE process; report cuMemGetInfo
                 // before/after each cycle (acceptance: delta < 64 MB, second load succeeds)
                 let n: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(2);
-                cfg.context = CONTEXT_FLOOR;
-                if let Some(c) = std::env::var("CROW_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()) {
+                if let Some(c) = env_parse::<usize>("CROW_CHUNK") {
                     cfg.prompt_chunk = c.max(1);
                 }
                 let f0 = crow_nest_engine::cuda::free_vram_bytes();
@@ -399,7 +391,6 @@ fn main() {
                 // layer-0 assembly check vs the p10 golden: load engine, feed
                 // oracle/golden/layer0-input.f32, run layer 0, compare to
                 // oracle/golden/layer0-golden-output.f32
-                cfg.context = CONTEXT_FLOOR;
                 let mut eng =
                     Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
                 let inp = std::fs::read("../oracle/golden/layer0-input.f32").unwrap();
@@ -428,7 +419,6 @@ fn main() {
                 // compare the [8][2560] o_proj output to layer3-attn-output.f32.
                 // Reference marks (p16, all-proj FP4 vs this golden): rel_L2
                 // 0.165, max_abs 0.582 — the "expected bad" FP4 attention delta.
-                cfg.context = CONTEXT_FLOOR;
                 let mut eng =
                     Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
                 let to_f32 = |b: &[u8]| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>();
@@ -439,7 +429,7 @@ fn main() {
                 assert_eq!(gold.len(), t * H * 4, "golden output shape [8][2560] f32");
                 let x = to_f32(&inp);
                 let g = to_f32(&gold);
-                match &eng.w.sub[3] {
+                match &eng.weights().sub[3] {
                     SubW::Attn { q, k, .. } => {
                         let d = |p: &PW| match p { PW::Fp4(..) => "fp4", PW::Bf16(_) => "bf16" };
                         println!("layercheck3: layer-3 q/k projection dtype = {}/{}", d(q), d(k));

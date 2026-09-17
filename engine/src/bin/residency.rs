@@ -98,9 +98,9 @@ fn main() {
             Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| eprintln!("[load] {m}"));
         println!(
             "residency ready: N={} ({}) — pinned cold tier {:.2} GiB",
-            eng.res.n,
-            eng.res.source,
-            eng.res.pinned_bytes() as f64 / GIB
+            eng.residency().n,
+            eng.residency().source,
+            eng.residency().pinned_bytes() as f64 / GIB
         );
 
         // ---- held-out measurement pass ----
@@ -127,7 +127,7 @@ fn main() {
             let sel: u64 = c.iter().zip(prev.iter()).map(|(x, p)| x[0] - p[0]).sum();
             let cold: u64 = c.iter().zip(prev.iter()).map(|(x, p)| x[1] - p[1]).sum();
             let layers_cold = c.iter().zip(prev.iter()).filter(|(x, p)| x[1] > p[1]).count();
-            let bytes = cold as f64 * (eng.res.gu_bytes + eng.res.dn_bytes) as f64 / MIB;
+            let bytes = cold as f64 * (eng.residency().gu_bytes + eng.residency().dn_bytes) as f64 / MIB;
             println!(
                 "decode {i}: {dt:7.2} ms  selections {sel:3}  cold {cold:3}  cold-bytes {bytes:6.1} MB  layers fully resident {}/{}",
                 LAYERS - layers_cold,
@@ -137,7 +137,7 @@ fn main() {
             cum.1 += cold;
             prev = c;
         }
-        let bytes = cum.1 as f64 * (eng.res.gu_bytes + eng.res.dn_bytes) as f64 / MIB;
+        let bytes = cum.1 as f64 * (eng.residency().gu_bytes + eng.residency().dn_bytes) as f64 / MIB;
         println!(
             "\ntoken means: selections {:.0}  cold {:.1}  cold-bytes/token ~{:.1} MB (zero-copy, spec 3.4)",
             cum.0 as f64 / steps as f64,
@@ -150,7 +150,7 @@ fn main() {
         let total: u64 = counts.iter().flatten().sum();
         let hot: u64 = counts
             .iter()
-            .zip(eng.res.sets.iter())
+            .zip(eng.residency().sets.iter())
             .map(|(c, set)| set.iter().map(|&id| c[id as usize]).sum::<u64>())
             .sum();
         println!(

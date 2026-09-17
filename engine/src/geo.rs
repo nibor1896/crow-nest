@@ -140,6 +140,13 @@ pub struct Adapt {
     pub max: usize,
 }
 
+impl Adapt {
+    /// the three knobs every decode loop binds, in the order it binds them
+    pub fn knobs(&self) -> (bool, usize, usize) {
+        (self.stream, self.every, self.max)
+    }
+}
+
 impl Default for Adapt {
     fn default() -> Self {
         Adapt { stream: false, spare: 0, every: 0, max: 8 }
@@ -174,6 +181,11 @@ pub fn attn_index(layer: usize) -> usize {
     layer / 4
 }
 
+/// one definition of "a number read from the environment"; every filter, clamp and default stays at the call site
+pub fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
+    std::env::var(key).ok().and_then(|v| v.parse().ok())
+}
+
 /// Prefill chunk policy (#16). `CROW_CHUNK=<n>` is authoritative; without it the
 /// chunk follows the prompt length (rounded up to 512, at most 4096), so a short
 /// prompt keeps the chunk-512 scratch and its larger hot set and a long prompt
@@ -187,7 +199,7 @@ pub fn attn_index(layer: usize) -> usize {
 /// deterministic since #22, chunk 4096 gated by #10b (F47 env-vs-env parity,
 /// the 16k parity form, ten-task final4 identity, the F49 prefill pairs).
 pub fn apply_chunk_policy(cfg: &mut Config, n_prompt: usize) {
-    let explicit = std::env::var("CROW_CHUNK").ok().and_then(|v| v.parse::<usize>().ok());
+    let explicit = env_parse::<usize>("CROW_CHUNK");
     if let Some(c) = explicit {
         cfg.prompt_chunk = c.max(1);
     }
@@ -216,7 +228,7 @@ pub fn apply_chunk_policy(cfg: &mut Config, n_prompt: usize) {
 /// `CROW_ADAPT_SPARE` (default 0). `CROW_ADAPT_STREAM=1` / `=0` is the manual
 /// mode: every knob from its own variable, spare default 1 / 0, no policy.
 pub fn apply_adapt_policy(cfg: &mut Config) {
-    let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+    let num = env_parse::<usize>;
     let (every, max, spare) = (num("CROW_ADAPT_EVERY"), num("CROW_ADAPT_MAX"), num("CROW_ADAPT_SPARE"));
     let stream = std::env::var("CROW_ADAPT_STREAM").ok();
     cfg.adapt = match stream.as_deref() {
