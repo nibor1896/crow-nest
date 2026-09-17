@@ -4076,12 +4076,20 @@ fn engine_lock_path() -> Option<std::path::PathBuf> {
     }
 }
 
+#[cfg(windows)]
 fn pid_alive(pid: u32) -> bool {
     // tasklist prints the image line only for a live PID (Windows; no ptrace here)
     match std::process::Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH"]).output() {
         Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&format!(" {pid} ")),
         Err(_) => true, // cannot tell: stay on the safe side
     }
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // /proc/<pid> exists exactly while the process does (a zombie still has it,
+    // and a zombie still holds nothing pinned - same "safe side" as above)
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
 fn engine_lock_acquire() {

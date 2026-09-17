@@ -16,6 +16,9 @@ publish = false
 serde_json = { version = "1", features = ["preserve_order"] }
 cudarc = { version = "=0.19.9", features = ["cuda-13030", "dynamic-loading", "nvrtc"] }
 libloading = "0.8"
+# the unix half of the cnq.rs container reader: mmap/munmap + posix_fadvise
+# (the windows half stays on kernel32 through libloading)
+libc = "0.2"
 # A3 (#25): in-engine tokenizer and chat template, ids identical to tokenize_ids.py --chat
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 # preserve_order here too: minijinja's own value map is a BTreeMap by default, so the tools

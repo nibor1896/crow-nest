@@ -1,7 +1,7 @@
 # crow-nest CI, issue #50, parent #1
 #
 # READ THIS BEFORE TRUSTING A GREEN CHECK
-# - No job here runs on a GPU: windows-latest has no NVIDIA device and no CUDA toolkit.
+# - No job here runs on a GPU: ubuntu-latest has no NVIDIA device and no CUDA toolkit.
 # - A green run is a statement about the build and the host-side tests only, never about decode correctness.
 # - Excluded on the runner: the 10 tests that load ../models/Qwen3.8-Flash-Next-original/tokenizer.json,
 #   because models/ is gitignored and a fresh clone has no weights (skip list in the test job).
@@ -14,6 +14,9 @@
 #   section Configuring linking).
 # - Unmeasured: this repo has never built on a machine without CUDA. The local proof of 2026-09-11 ran on
 #   a host that has CUDA 13.3 installed. The first honest measurement is the first run of this workflow.
+#
+# The runner moved from windows-latest to ubuntu-latest with the Linux port (2026-09-17): the step
+# bodies were already `shell: bash` and needed no change, only the four `runs-on:` values.
 #
 # Local proof, 2026-09-11, rustc 1.97.0 (2d8144b78 2026-07-07), x86_64-pc-windows-msvc:
 # - build engine exit 0, build converter exit 0
@@ -39,7 +42,7 @@ concurrency:
 jobs:
   build:
     name: build (no GPU)
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -58,7 +61,7 @@ jobs:
           {
             echo "### build"
             echo ""
-            echo "- runner: windows-latest, no GPU"
+            echo "- runner: ubuntu-latest, no GPU"
             echo "- $(cargo --version)"
             echo "- $(rustc --version)"
             echo "- target: $(rustc -vV | grep '^host:' | cut -d' ' -f2)"
@@ -74,7 +77,7 @@ jobs:
 
   test:
     name: test (host side only)
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -148,7 +151,7 @@ jobs:
 
   clippy:
     name: clippy (non-blocking, see count)
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     # Non-blocking by decision of 2026-09-11: the measured count is 1314 warnings
     # (engine 1303, converter 11), so -D warnings cannot gate anything yet.
     # Flip continue-on-error to false once the count is 0. No source change in #50.
@@ -190,7 +193,7 @@ jobs:
 
   guards:
     name: doc guards
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -24,12 +24,14 @@ pub struct Cnq {
     pub file: std::fs::File,
     pub blob_offset: u64,
     pub tensors: Vec<TensorInfo>,
-    /// read-only view of the whole container (kernel32 file mapping, 0 = not
-    /// mapped -> seek/read fallback). Row reads become page-cache memcpys
-    /// (~1 us on a hit instead of a seek+read syscall pair); CROW_MMAP=0 disables.
+    /// read-only view of the whole container (windows: a kernel32 file mapping,
+    /// unix: mmap; 0 = not mapped -> seek/read fallback). Row reads become
+    /// page-cache memcpys (~1 us on a hit instead of a seek+read syscall pair);
+    /// CROW_MMAP=0 disables.
     pub map: usize,
     pub map_len: u64,
-    /// the CreateFileMappingW handle behind `map` (closed in Drop after the unmap)
+    /// the CreateFileMappingW handle behind `map` (closed in Drop after the
+    /// unmap); always 0 on unix, where munmap takes `map_len` instead
     pub map_handle: usize,
     /// container path: Drop re-opens it unbuffered once to purge its cached pages
     pub path: String,
@@ -46,11 +48,34 @@ pub fn purge_cache(path: &str) {
     if std::env::var("CROW_CNQ_PURGE").as_deref() == Ok("0") {
         return;
     }
-    use std::os::windows::fs::OpenOptionsExt;
-    let _ = std::fs::OpenOptions::new().read(true).custom_flags(0x2000_0000 /* FILE_FLAG_NO_BUFFERING */).open(path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _ = std::fs::OpenOptions::new().read(true).custom_flags(0x2000_0000 /* FILE_FLAG_NO_BUFFERING */).open(path);
+    }
+    // unix twin: POSIX_FADV_DONTNEED over the whole file (len 0 = to EOF) drops
+    // its clean page-cache pages. It only evicts unmapped, unreferenced pages,
+    // so the Drop order below - unmap, close the handle, then purge - is what
+    // makes them droppable here too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Ok(f) = std::fs::File::open(path) {
+            unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        }
+    }
 }
 
+/// the process's null device: Drop parks `Cnq.file` on it to close the container
+/// handle before the purge
+#[cfg(windows)]
+const NULL_DEVICE: &str = "NUL";
+#[cfg(unix)]
+const NULL_DEVICE: &str = "/dev/null";
+
+#[cfg(windows)]
 type FnUnmapView = unsafe extern "system" fn(*const std::ffi::c_void) -> i32;
+#[cfg(windows)]
 type FnCloseHandle = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
 
 impl Drop for Cnq {
@@ -60,6 +85,7 @@ impl Drop for Cnq {
     /// them into its next load (~4.5 GB less "available" RAM on the reload)
     fn drop(&mut self) {
         if self.map != 0 {
+        #[cfg(windows)]
         unsafe {
             let Ok(lib) = libloading::Library::new("kernel32.dll") else { return };
             if let Ok(unmap) = lib.get::<FnUnmapView>(b"UnmapViewOfFile\0") {
@@ -71,22 +97,30 @@ impl Drop for Cnq {
                 }
             }
         }
+        // unix: one munmap of the whole mapping, no handle to close after it
+        #[cfg(unix)]
+        unsafe {
+            libc::munmap(self.map as *mut libc::c_void, self.map_len as usize);
+        }
         }
         self.map = 0;
         self.map_handle = 0;
         // close the cached handle first (the field would drop after this body),
-        // then the unbuffered open purges the cache
-        if let Ok(nul) = std::fs::File::open("NUL") {
+        // then the unbuffered open / fadvise purges the cache
+        if let Ok(nul) = std::fs::File::open(NULL_DEVICE) {
             drop(std::mem::replace(&mut self.file, nul));
             purge_cache(&self.path);
         }
     }
 }
 
+#[cfg(windows)]
 type FnCreateMapping = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, u32, u32, *const u16) -> *mut std::ffi::c_void;
+#[cfg(windows)]
 type FnMapView = unsafe extern "system" fn(*mut std::ffi::c_void, u32, u32, u32, usize) -> *mut std::ffi::c_void;
 
 /// map the file read-only (whole length); (view, mapping handle), (0, 0) on any failure
+#[cfg(windows)]
 fn map_file(f: &std::fs::File) -> (usize, usize) {
     if std::env::var("CROW_MMAP").as_deref() == Ok("0") {
         return (0, 0);
@@ -104,10 +138,44 @@ fn map_file(f: &std::fs::File) -> (usize, usize) {
     }
 }
 
+/// map the file read-only (whole length); (view, 0), (0, 0) on any failure.
+/// MAP_SHARED is the twin of the windows PAGE_READONLY section; for a PROT_READ
+/// mapping the delivered bytes are the same either way. There is no mapping
+/// handle on unix - Drop munmaps `map_len` bytes, which `Cnq::open` sets to the
+/// same file length this maps.
+#[cfg(unix)]
+fn map_file(f: &std::fs::File) -> (usize, usize) {
+    if std::env::var("CROW_MMAP").as_deref() == Ok("0") {
+        return (0, 0);
+    }
+    use std::os::unix::io::AsRawFd;
+    let Ok(md) = f.metadata() else { return (0, 0) };
+    let len = md.len() as usize;
+    if len == 0 { return (0, 0) } // mmap(len = 0) is EINVAL, as CreateFileMapping of an empty file fails
+    unsafe {
+        let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0);
+        if p == libc::MAP_FAILED { return (0, 0) }
+        (p as usize, 0)
+    }
+}
+
 /// read-only open with FILE_FLAG_SEQUENTIAL_SCAN (cache pages are not retained)
+#[cfg(windows)]
 pub fn open_sequential(path: &str) -> std::fs::File {
     use std::os::windows::fs::OpenOptionsExt;
     std::fs::OpenOptions::new().read(true).custom_flags(0x0800_0000 /* FILE_FLAG_SEQUENTIAL_SCAN */).open(path).unwrap()
+}
+
+/// read-only open with POSIX_FADV_SEQUENTIAL (len 0 = whole file). That is the
+/// readahead half of FILE_FLAG_SEQUENTIAL_SCAN; linux does not drop pages behind
+/// the cursor for this hint, so the retention half comes from the DONTNEED purge
+/// in `purge_cache`.
+#[cfg(unix)]
+pub fn open_sequential(path: &str) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::open(path).unwrap();
+    unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
+    f
 }
 
 impl Cnq {

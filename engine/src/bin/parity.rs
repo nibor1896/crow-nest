@@ -44,7 +44,10 @@ fn tokenize(text: &str) -> Vec<i64> {
     // long prompts go through STDIN — the Windows command line caps at ~32k chars
     // --chat: the crow arm receives the SAME token stream as the llama.cpp arm
     // (chat template, thinking disabled) — parity-gate fairness, fable gate 2026-09-03
+    #[cfg(windows)]
     let py = ".venv-oracle/Scripts/python.exe";
+    #[cfg(unix)]
+    let py = ".venv-oracle/bin/python";
     // #34: the harness sets the oracle transport itself, not the shell.
     // Python 3.13 on Windows decodes STDIN as cp1252 without it; measured
     // 2026-09-09 on t4-prose: 9,522 ids bare against 9,398 ids with UTF-8.
@@ -69,7 +72,10 @@ fn detokenize_all(map: &serde_json::Map<String, serde_json::Value>) -> serde_jso
     let inp = serde_json::json!(map).to_string();
     let tmp = "decode_out/_detok_in.json";
     std::fs::write(tmp, inp).unwrap();
+    #[cfg(windows)]
     let py = ".venv-oracle/Scripts/python.exe";
+    #[cfg(unix)]
+    let py = ".venv-oracle/bin/python";
     // #34: same UTF-8 transport as `tokenize`, set on the process, not the shell
     let out = std::process::Command::new(py)
         .arg("tools/detokenize_ids.py")

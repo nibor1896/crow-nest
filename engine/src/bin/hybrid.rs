@@ -17,7 +17,10 @@
 use crow_nest_engine::cnq::{self, Cnq};
 use crow_nest_engine::geo::*;
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(windows)]
 use std::os::windows::fs::FileExt;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 
 fn mag_index(m: f32) -> u32 {
     for (i, v) in [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0].iter().enumerate() {
@@ -189,6 +192,11 @@ fn main() {
                         n_vals += 16;
                     }
                 }
+                // pwrite / no file cursor on unix; `fo` is shared by the worker
+                // threads, so the offset must not come from a seek
+                #[cfg(unix)]
+                fo.write_at(&out, off + (e as usize * per_expert) as u64).unwrap();
+                #[cfg(windows)]
                 fo.seek_write(&out, off + (e as usize * per_expert) as u64).unwrap();
             }
             n_patched += 1;

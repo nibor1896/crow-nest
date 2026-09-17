@@ -147,6 +147,7 @@ version = "0.1.0"
 dependencies = [
  "cudarc",
  "image",
+ "libc",
  "libloading 0.8.9",
  "minijinja",
  "serde_json",
