@@ -70,15 +70,6 @@ pub fn vit_on() -> bool {
 /// visual tokens one image can produce at the patch cap (4096 / 2 / 2)
 pub const VIT_MAX_VISUAL: usize = VIT_MAX_PATCHES / (VIT_MERGE * VIT_MERGE);
 
-/// Images one REQUEST's spliced embedding buffer is reserved for (TASK K). The
-/// buffer is `sum(n_visual) * 2560` f32, allocated per request in `build_plan`;
-/// at the per-image cap that is 10 MiB each. Crow re-sends the whole image
-/// history every turn, so the number is not 1 - four is the measured shape of a
-/// goal-mode session (robin's failing request carried two) and the reserve is a
-/// VRAM cost, not a limit: a request with more images still runs when the card
-/// has the room, and answers 503 naming the buffer when it does not.
-pub const VIT_SPLICE_IMAGES: usize = 4;
-
 /// bytes of the cap-sized tower scratch — the twelve buffers `ensure_scratch`
 /// takes, counted from the same geometry the allocator uses
 pub const fn scratch_bytes() -> usize {
@@ -91,11 +82,6 @@ pub const fn scratch_bytes() -> usize {
         + VIT_MAX_PATCHES * 8                      // pe_idx + pe_w
         + VIT_MAX_PATCHES * VIT_ROT * 2;           // cs + sn
     elems * 4
-}
-
-/// bytes of the per-request spliced embedding buffer the reserve covers
-pub const fn splice_bytes() -> usize {
-    VIT_SPLICE_IMAGES * VIT_MAX_VISUAL * H * 4
 }
 
 /// bytes of the interleaved-mrope span tables at their widest: the whole
@@ -123,7 +109,7 @@ pub fn reserve_bytes(context: usize) -> u64 {
     if let Some(mb) = crate::geo::env_parse::<u64>("CROW_VIT_RESERVE_MB") {
         return mb << 20;
     }
-    (scratch_bytes() + splice_bytes() + mrope_bytes(context)) as u64
+    (scratch_bytes() + mrope_bytes(context)) as u64
 }
 
 /// the `[budget]` line's own words for what `reserve_bytes` covers; with
@@ -131,14 +117,12 @@ pub fn reserve_bytes(context: usize) -> u64 {
 /// would have been, so a log that shows a bigger N still says what paid for it
 pub fn reserve_line(context: usize) -> String {
     let mib = |b: usize| b as f64 / MIB;
-    let derived = (scratch_bytes() + splice_bytes() + mrope_bytes(context)) as f64 / MIB;
+    let derived = (scratch_bytes() + mrope_bytes(context)) as f64 / MIB;
     let basis = match crate::geo::env_parse::<u64>("CROW_VIT_RESERVE_MB") {
         Some(_) => format!("CROW_VIT_RESERVE_MB, derived would be {derived:.1} MB"),
         None => format!(
-            "tower scratch {:.1} + splice {} x {:.1} + mrope span {:.1}",
+            "tower scratch {:.1} + mrope span {:.1}",
             mib(scratch_bytes()),
-            VIT_SPLICE_IMAGES,
-            mib(VIT_MAX_VISUAL * H * 4),
             mib(mrope_bytes(context))
         ),
     };
@@ -834,10 +818,11 @@ pub type Grid = (usize, usize, usize);
 pub struct VisionPlan {
     /// the expanded prompt ids (every IMAGE_PAD replaced by its visual tokens)
     pub ids: Vec<u32>,
-    /// device [n_visual][2560] f32 — the merged embeddings of ALL images,
-    /// concatenated in message order
-    pub embeds: Dev,
-    /// the same rows on the host (dumps)
+    /// [n_visual][2560] f32 on the HOST — the merged embeddings of ALL images,
+    /// concatenated in message order. The prefill splices from here row by row
+    /// into the chunk's embedding upload, so no per-request device buffer exists
+    /// (the one there was, sum(n_visual) x 2560 f32, was never read and was what
+    /// a 12-image history request of 2026-09-17 could not allocate).
     pub embeds_host: Vec<f32>,
     /// per final-sequence row: flat visual embedding index, or -1 for text
     pub map: Vec<i32>,
@@ -1062,17 +1047,8 @@ impl Vit {
         if let Some(dir) = &dump {
             f32_file(&format!("{dir}/vit-embeds.f32"), &embeds_host);
         }
-        // TASK K: the per-request splice buffer, the LAST device allocation of an
-        // all-cached image request - and the one robin's 2026-09-17 session died
-        // on (2 images, 1,660 visual tokens, 17,000,000 B). Named, so the failure
-        // line and the 503 body say which buffer the card refused.
-        let embeds = cuda::to_dev_named(
-            &format!("the spliced visual embeddings of {} image(s) ({flat} visual tokens x {H} f32)", images.len()),
-            &embeds_host,
-        );
         Ok(VisionPlan {
             ids: expanded,
-            embeds,
             embeds_host,
             map,
             types,
@@ -1091,13 +1067,6 @@ pub fn f32_file(path: &str, v: &[f32]) {
     }
 }
 
-impl Drop for VisionPlan {
-    fn drop(&mut self) {
-        if self.embeds != 0 {
-            unsafe { cuda::free_dev(&mut self.embeds) };
-        }
-    }
-}
 
 #[cfg(test)]
 mod reserve {
@@ -1114,7 +1083,6 @@ mod reserve {
         // cs + sn 2 x 4096 x 36 - all f32
         assert_eq!(scratch_bytes(), 239_599_616);
         assert_eq!(VIT_MAX_VISUAL, 1024);
-        assert_eq!(splice_bytes(), 41_943_040); // 4 images x 1024 x 2560 f32
     }
 
     /// the span tables are `n_ctx` rows since serve clamps the budget before arming them
@@ -1129,13 +1097,12 @@ mod reserve {
         let ctx = 200_000;
         assert_eq!(
             reserve_bytes(ctx),
-            (scratch_bytes() + splice_bytes() + mrope_bytes(ctx)) as u64
+            (scratch_bytes() + mrope_bytes(ctx)) as u64
         );
         let line = reserve_line(ctx);
         assert!(line.starts_with("vit reserve"), "the [budget] label moved: {line}");
-        assert!(line.contains("317.3 MB"), "the reserve total moved: {line}");
+        assert!(line.contains("277.3 MB"), "the reserve total moved: {line}");
         assert!(line.contains("tower scratch 228.5"), "the scratch part moved: {line}");
-        assert!(line.contains("splice 4 x 10.0"), "the splice part moved: {line}");
         assert!(line.contains("mrope span 48.8"), "the mrope part moved: {line}");
     }
 }

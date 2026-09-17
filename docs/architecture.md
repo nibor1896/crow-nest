@@ -162,8 +162,8 @@ is the right node: every CUDA context opens it and no graphics client does — m
 owning no pinned pool, and testing for THOSE refused the engine's own operating point. The planner refuses only when no N satisfies both sides (`planner_refusal_msg`).
 
 The clamp also carries a **vision reserve** (TASK K, 2026-09-17): with `CROW_VIT` on, the VRAM the
-image path allocates inside a request — the cap-sized tower scratch, the per-request spliced
-embedding buffer and the interleaved-mrope span tables, 317.3 MB together at `n_ctx` 200,000 — is
+image path allocates inside a request — the cap-sized tower scratch and the interleaved-mrope
+span tables, 277.3 MB together at `n_ctx` 200,000 — is
 added to the planner's `pending` bytes, so N is chosen with it and an image request can never find
 the card full. It is named on its own `[budget]` line and costs N 157 -> 155 at the serve operating
 point (7.13 has the three numbers and the measurement). `CROW_VIT=0` reserves nothing.
@@ -1728,15 +1728,16 @@ device allocation left between that last line and the panic is the per-request s
 buffer, `sum(n_visual) * 2560` f32 = 1,660 x 2560 x 4 = **17,000,000 B (16.21 MiB)**. Crow then got
 `Connection refused` for the rest of the session.
 
-Three allocations live inside a request, and all three are now PLANNED (`vit::reserve_bytes`, added
+Two allocations live inside a request, and both are now PLANNED (`vit::reserve_bytes`, added
 to the planner's `pending` bytes in `Engine::load` when `CROW_VIT` is on):
 
 | allocation | where | bytes at the default operating point |
 |---|---|---|
 | the cap-sized tower scratch (12 buffers + 16 scalar slots) | `vit::ensure_scratch`, first image request | 239,599,616 = 228.5 MiB |
-| the per-request spliced embedding buffer | `vit::build_plan`, every image request | `VIT_SPLICE_IMAGES` (4) x 1024 x 2560 f32 = 40.0 MiB |
 | the interleaved-mrope span tables | `Engine::begin_vision`, grown on demand | `n_ctx` x 32 x cos+sin x 4 = 48.8 MiB at 200,000 |
-| **reserve** | one `[budget]` line names it | **317.3 MB** |
+| **reserve** | one `[budget]` line names it | **277.3 MB** |
+
+The per-request spliced embedding buffer (`sum(n_visual)` x 2560 f32, `build_plan`) is gone (2026-09-17, the same day): the prefill splices from the plan's HOST copy row by row into the chunk's embedding upload, so the device copy was never read - and it was the allocation a 12-image history request (9,939 visual tokens, 97.1 MiB) could not get inside the 4-image reserve. No per-request VRAM is allocated for images now; the image count per request is bounded by the context, not by VRAM.
 
 - The span tables are exactly `n_ctx` rows because `chat_route` now clamps the generation budget
   BEFORE it arms them (it used to arm them with the raw `max_tokens` and clamp afterwards, so a
@@ -1763,7 +1764,7 @@ it does not end the process.
 - Every allocation site frees what it already took before it raises: `ensure_scratch` takes its 28
   buffers as a group and frees the ones it holds (`[vit] scratch allocation refused after N
   buffer(s) - they were freed, the tower stays unarmed`), `begin_vision` frees the cos table if the
-  sin table is refused, and the plan's splice buffer drops in the unwind.
+  sin table is refused; the plan itself holds no device memory.
 - If the SSE head is already on the wire the 503 cannot be a status any more, so it rides an error
   frame followed by `[DONE]`. The image path runs before the head, so the normal case is a clean
   JSON 503.
