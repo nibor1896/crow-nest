@@ -1256,6 +1256,20 @@ impl Ple {
         self.miss += fill_rows.len() as u64;
         if !fill_rows.is_empty() {
             let rows_per_shard = PLE_ROWS_PER_SHARD;
+            // TASK H: every miss's container address is known HERE, before the
+            // first of them is read. Fetch the whole set at once (CROW_PLE_FETCH)
+            // instead of paying one read latency per row - a 1024-token chunk
+            // misses ~10k rows, and serialized that is the whole prefill.
+            if fill_rows.len() > 1 {
+                let offs: Vec<u64> = fill_rows
+                    .iter()
+                    .map(|&(_, id)| {
+                        let (t, _) = &self.shards[(id / rows_per_shard) as usize];
+                        cnq.abs_offset(t, (id % rows_per_shard) as u64 * 108)
+                    })
+                    .collect();
+                cnq.warm().rows(&offs, 108);
+            }
             // group by shard for sequential reads
             let mut by_shard: HashMap<i64, Vec<(usize, i64)>> = HashMap::new();
             for &(slot, id) in &fill_rows {
@@ -3096,9 +3110,10 @@ impl Engine {
             if let Some(h) = prefetch.take() {
                 let _ = h.join();
             }
-            // prefetch the NEXT chunk's PLE rows on a helper thread (page-cache
-            // warm-up through the file mapping; no-op without a mapping)
-            if cnq.map != 0 && self.cfg.ple && start + t < ids.len() && std::env::var("CROW_PLE_PREFETCH").as_deref() != Ok("0") {
+            // prefetch the NEXT chunk's PLE rows on a helper thread, so their
+            // reads overlap THIS chunk's compute (TASK H: the batch itself is
+            // `Cnq::warm`, and it no longer needs the file mapping)
+            if self.cfg.ple && start + t < ids.len() && std::env::var("CROW_PLE_PREFETCH").as_deref() != Ok("0") {
                 let nt = (ids.len() - start - t).min(self.cfg.prompt_chunk);
                 let next = &ids[start + t..start + t + nt];
                 let pre: Vec<i64> = {
@@ -3111,21 +3126,11 @@ impl Engine {
                     v
                 };
                 let offsets = self.ple.row_offsets(cnq, &pre, next);
-                let base = cnq.map;
-                let len = cnq.map_len;
-                prefetch = Some(std::thread::spawn(move || {
-                    let mut sink = 0u8;
-                    for off in offsets {
-                        if off + 108 <= len {
-                            // touch first and last byte of the row (rows may straddle a page)
-                            unsafe {
-                                sink ^= std::ptr::read_volatile((base as *const u8).add(off as usize));
-                                sink ^= std::ptr::read_volatile((base as *const u8).add(off as usize + 107));
-                            }
-                        }
-                    }
-                    std::hint::black_box(sink);
-                }));
+                let warm = cnq.warm();
+                // TASK H: the same batched fetch `ensure_rows` uses, but queued
+                // behind every urgent batch - this thread runs WHILE the current
+                // chunk computes and must never delay the rows it waits on.
+                prefetch = Some(std::thread::spawn(move || warm.rows_ahead(&offsets, 108)));
             }
             // per-chunk scalar refresh (device buffers, one sync each — chunk level)
             self.upload_chunk_scalars(t, pos_base, first && start == 0, ScalarSet::Full);

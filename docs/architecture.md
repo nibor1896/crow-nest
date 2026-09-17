@@ -1551,6 +1551,85 @@ C:/x/y.md
 - Measured (RTX 5090, 2026-09-14, `decode_out/srv-vit.log`): ViT embeddings vs the f32 container-dequant oracle max_abs 3.43e-06 at cos 1.000000; text parity with the tower loaded AND with `CROW_VIT=0` byte-identical to `d211ab52ad2b` at the 61b sha256 values of record including the PX teacher-forced 16,064-row form `f217e1c55926` under the > 26 GiB VRAM headroom gate (23 of 23 subchecks); ten tasks 10 of 10 identical to final4; image-prompt pairs (text-only 26-token prompt vs the 224-token image prompt, fresh process per run): text prefill 406.1 ms vs 1,626.2 ms, pair delta mean +1,220.1 ms, plus the vision window of 35.3 s per request (`[vit-chat]`) — the tower GEMVs run the text-style per-token shape and are the known optimization lever.
 - The oracle chain lives in `oracle/` (`cnq_weights.py`, `ref_vit_golden.py`, `ref_vit_stages.py`, `ref_image_prompt_logits.py`): f32 references over the SAME container-dequantized weights (orchestrator ruling 2026-09-14 — the band is math precision only). The llama.cpp mmproj comparison was deferred to the B-series (orchestrator ruling).
 
+### 7.14 The PLE row path, and what a warm turn actually pays (TASK H, 2026-09-17)
+
+Section 2.4 designed the PLE as an NVMe-mmap window with a VRAM hot-row cache and said the read
+amplification would be measured, never assumed. This is that measurement, on Linux, and it moved
+two things: the row read is no longer a mapping fault, and a chunk's misses are no longer read one
+at a time. It also names the cost that the PLE was being blamed for and is not.
+
+**1. The row read.** `Ple::ensure_rows` reads every miss with `Cnq::read_range`, one 108 B row at a
+time, at addresses scattered over the 26.8 GiB `ple` section. Through the mapping that is one page
+fault per row, and a COLD fault of that mapping cost **~1.09 ms** against **~0.20 ms** for a
+`pread` of the same row — 0.094 ms of which is the device. Measured on the 1024-token form, chunk
+1024, 10,192 row misses of 16,400 rows on every arm, identical bytes on every arm:
+
+| arm | prefill | PLE host time per decode step | decode step |
+|---|---|---|---|
+| `f8f75c0`, mapping, page cache cold | 11.14 s, 92 tok/s | 27.07 ms | 54.56 ms, 18.3 tok/s |
+| `f8f75c0`, mapping, the `ple` pages warm | 1.41 s, 728 tok/s | 0.08 ms | 26.46 ms, 37.8 tok/s |
+| `f8f75c0` with `CROW_MMAP=0` (`pread`), cold | 2.04 s, 502 tok/s | 1.49 ms | 27.52 ms, 36.3 tok/s |
+| this build (`pread` + batch), cold | 1.39 s, 735 tok/s | 0.53 ms | 26.62 ms, 37.6 tok/s |
+| this build, the `ple` pages warm | 1.36 s, 753 tok/s | — | — |
+
+Read the second row first: with the section's pages in the page cache the OLD binary is already
+fast, so `f8f75c0` was never slow at reading PLE rows — it was slow at MISSING them. (The warm arm
+has to be built deliberately: the pages were left behind by a run of the fixed build, because
+`f8f75c0`'s own exit purge takes them away. An earlier attempt at this row — two runs with
+`CROW_CNQ_PURGE=0` — read 10.66 s and looked like proof that the page cache does not matter; it was
+not, because `CROW_CNQ_PURGE=0` also switches off `fadvise_consumed`, so the 100 GB load flooded the
+page cache and evicted the 40 MB of PLE pages before the prefill asked for them.) What the mapping
+costs is the COLD fault: it faults with the file's readahead state, and `Cnq::open` sets
+`POSIX_FADV_SEQUENTIAL` on that descriptor, which doubles the window — a quarter megabyte read per
+108-byte row. The same comparison outside the engine, on the same file in the same memory cgroup:
+0.193 ms per row fault with the SEQUENTIAL hint, 0.142 ms without it, against 0.094 ms for a
+`pread`. `Cnq::read_at` therefore reads `ple` with `pread` on unix. Windows keeps the mapping: the
+measurement is a Linux one.
+
+**2. The batch.** Every row address a chunk needs is a pure function of its ids, known before the
+forward pass, so the misses are issued together (`Cnq::warm`, `CROW_PLE_FETCH`, default 16 reader
+threads) and `read_range` then finds them in the page cache. Device floor at 4 KiB: 10,607 IOPS on
+one thread, 201,305 at 16, 280,198 at 32, 251,588 at 64, 209,652 at 128. On the 1024-token form,
+cold, prefill wall / PLE host time per decode step: no batch 2.05 s / 1.54 ms, 8 threads 1.44 s /
+0.63, 16 threads 1.39 s / 0.53, 32 threads 1.37 s / 0.45, `madvise(MADV_WILLNEED)` 1.38 s / 0.31
+(three runs each for the last three; the prefill figure repeats to within 0.02 s, the per-step
+figure is four decode steps and scatters over 0.21 to 0.56 ms). 16 is the default: inside the
+spread of 32, and unlike `madv` it needs no mapping and reads the bytes instead of hinting at them. The prefill's existing next-chunk prefetch thread
+(`CROW_PLE_PREFETCH`) issues the same batch, queued behind every urgent one — a prefetch of 10k
+pages one chunk ahead must not stand in front of the 2k pages the current chunk is blocked on.
+
+**3. What a warm serve turn pays, and it is not the PLE.** Replayed in robin's shape (a 3,296-token
+cached prefix, then six turns of 39 to 101 new ids, greedy, `CROW_CHUNK=2048`, so one chunk per
+turn), `f8f75c0` spends 251.5 to 319.8 ms of prefill per turn (mean 277.6 and 276.2 over two runs) and the
+fixed build 241.4 to 311.1 ms (mean 267.5 and 267.2). The per-turn prefill does not follow the PLE miss count at all:
+the turn with 1,218 misses is the FASTEST (241.6 ms) and the turn with 128 misses the slowest
+(311.0 ms). A least-squares read of prefill against new ids gives **~225 ms of fixed cost per
+prefill call plus ~0.43 ms per token**, and a 64-token cold prefill measures 0.27 s on its own.
+That floor is the per-chunk pass over the cold expert tier (`Engine::prefill`: "every chunk costs
+one full PCIe pass over the cold tier"), not the PLE.
+
+Therefore, as of this section:
+
+- the PLE row path costs about 0.5 ms per decode step and is no longer the reason a 1024-token
+  chunk takes 11 s: **the fixed build COLD (735 tok/s) is the old build WARM (728 tok/s)**, so what
+  the fix removed is the entire cold-start penalty, not a warm-path inefficiency;
+- the two halves of that penalty are separable and both were paid: the fault itself (mapping 1.09 ms
+  against `pread` 0.20 ms, cold) and the serialization (`CROW_PLE_FETCH=0`, `pread`, no batch:
+  2.05 s against 1.39 s);
+- the remaining per-turn prefill floor of a multi-turn session is the cold-tier pass, and it is
+  where the next measurement belongs — not in the PLE;
+- **the container should not live on a compressed mount, but that is not what this was.** The `-M`
+  container sat on btrfs `compress=zstd:3` with 27,665 of its 31,146 extents compressed, and every
+  random 4 KiB read of a compressed extent decompresses the whole extent. It was rewritten
+  uncompressed for this task (`chattr +m` plus `btrfs filesystem defragment` was a NO-OP — 27,659
+  extents still encoded; only a full rewrite cleared it: 0 encoded extents, 2,817 extents, sha256
+  unchanged). The honest result of that rewrite on the 1024-token cold form with the `f8f75c0`
+  binary is **nothing**: 95.7 / 93.4 tok/s compressed (TASK G, `f8f75c0`) against 92 tok/s
+  uncompressed, because the mapping fault dominated both. The recommendation stands for what comes
+  AFTER the fix — the device read is now on the critical path, where a decompression per 4 KiB
+  would be — but it is a recommendation, not a measured delta, and this build has no measurement of
+  the fixed engine on a compressed container.
+
 ## Section 8 — the code map (2026-09-17)
 
 Sections 0 to 7 say what the engine must do. This section says how the crate is put together,
@@ -1607,9 +1686,12 @@ oracle python path in `bin/parity.rs`.
 **`cnq.rs`** — the CNQ container reader: magic, trailer index, the whole-file read-only
 mapping, `read_bytes` / `read_range` behind which every weight read in the engine happens, the
 FP4/FP8 host twins (`e2m1`, `ue4m3`, `dequant_block`), the scale search the two low-bit tier
-builders share (`bin/coldtier`, `bin/hybrid`), and the Linux page-cache discipline (`fadvise_consumed`,
-`fadvise_flush`). Surface: 19 `pub fn` plus `Cnq`, `TensorInfo`. Depends on nothing in the
-crate. It may not learn about geometry: what a tensor MEANS is `geo`'s and `gen`'s business.
+builders share (`bin/coldtier`, `bin/hybrid`), the Linux page-cache discipline (`fadvise_consumed`,
+`fadvise_flush`, `purge_cache`'s kept range) and, since TASK H, the row fetch: `page_runs`,
+`warm_mode`, the process's one reader pool and the `Send` handle `Cnq::warm` hands out (7.14).
+Surface: 22 `pub fn` plus `Cnq`, `TensorInfo`, `Warm`, `WarmMode`. Depends on nothing in the
+crate. It may not learn about geometry: what a tensor MEANS is `geo`'s and `gen`'s business — the
+row fetch takes byte offsets and a row length and knows nothing about n-grams.
 
 **`geo.rs`** — the model geometry and the runtime `Config`: the probe-pinned constants and
 their derivation chain, `KvDtype`, `Adapt` with `knobs()`, the two policy functions
@@ -1898,7 +1980,17 @@ mechanism in one place, without repeating them.
    over every skipped hot expert. Measured 2026-09-17 on the 8-row form: max `Cached`
    33.04 → 5.14 GiB, min `MemFree` 1.15 → 7.70 GiB, load 44 → 25 s, bytes `bceba6ff7724` on
    both arms.
-5. **The launcher's scope is where the rest is bounded.** `tools/serve-linux.sh` starts `serve`
+5. **The exit purge steps over the `ple` section (TASK H, 2026-09-17).** `Cnq::drop` still hands
+   the container's pages back on the way out, but on unix it now issues two `DONTNEED` calls around
+   the `ple` byte range instead of one over the whole file, so the rows the NEXT process wants are
+   the one thing it leaves warm. The range is read from the container index at `open` (the 128 shard
+   tables are contiguous: `[3_240_788_100, 32_040_949_636)`, 26.82 GiB on the `-M` container), and
+   `(0, 0)` — a container with no `ple` section — purges everything as before. It costs the next
+   process nothing: page cache is not part of `free_for_pin` (point 2) and is reclaimable, which is
+   exactly why the reclaim-aware Linux figure of `0c9feb5` replaced `MemAvailable`. Windows keeps
+   the whole-file purge, because there the reason was the standby list counting against the next
+   load's available RAM. `CROW_CNQ_PURGE=0` still means no purge at all.
+6. **The launcher's scope is where the rest is bounded.** `tools/serve-linux.sh` starts `serve`
    in `systemd-run --user --scope --slice=session.slice` with `MemorySwapMax=0`,
    `MemoryHigh=MemTotal-8G`, `MemoryMax=MemTotal-6G`, computed from `/proc/meminfo`. The scope
    is a property of the launcher, not of the engine: the engine never raises its own limits, and

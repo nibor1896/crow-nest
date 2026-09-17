@@ -23,9 +23,11 @@
 #                              bb9d2ca, 7ddd296.
 #   run 32    the 32 ids       commit bb9d2ca ("the 32 generated ids identical to the 74c79f2
 #                              binary") and 7ddd296 ("decode run 32 ids identical").
-#   tests 144 / clippy 1422    commit 7ddd296 and 0667e0b (144 = 84 lib + 60 serve; clippy is the
-#                              --all-targets form counted as grep -cE '^warning: ', the form the
-#                              1494 -> 1480 -> 1426 -> 1422 series on this branch was counted with).
+#   tests 147 / clippy 1422    commit 7ddd296 and 0667e0b gave 144 = 84 lib + 60 serve; TASK H
+#                              (2026-09-17) added the three `cnq::tests::page_runs_*` unit tests of
+#                              the PLE row fetch, so 147 = 87 lib + 60 serve. Clippy is unchanged at
+#                              1422: it is the --all-targets form counted as grep -cE '^warning: ',
+#                              the form the 1494 -> 1480 -> 1426 -> 1422 series was counted with.
 #
 # Environment: CROW_CNQ / CROW_HOTSETS / CROW_GRAPH / CROW_MMA are set here exactly as the runs of
 # record had them; CUDA_LIB names the CUDA runtime directory (default ~/.local/share/crow/cuda/lib).
@@ -47,7 +49,7 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="144"
+TESTS="147"
 CLIPPY="1422"
 
 red=0
@@ -64,7 +66,10 @@ cd "$root"
 precheck() {
     local used procs
     used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
-    procs=$(pgrep -a 'serve|decode|llama' | tr '\n' ' ')
+    # -x: match the process NAME exactly. Without it the pattern matched the
+    # comm of an unrelated `tmux: server` and refused every engine item
+    # (2026-09-17, TASK H) - the gate then printed RED for a machine that was idle.
+    procs=$(pgrep -a -x 'serve|decode|parity|llama.*' | tr '\n' ' ')
     if [ "${used:-9999}" -ge 2000 ]; then echo "  precheck: GPU holds ${used} MiB - refusing to run" >&2; return 1; fi
     if [ -n "$procs" ]; then echo "  precheck: an engine is alive ($procs) - refusing to run" >&2; return 1; fi
     return 0

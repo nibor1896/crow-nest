@@ -25,9 +25,11 @@ pub struct Cnq {
     pub blob_offset: u64,
     pub tensors: Vec<TensorInfo>,
     /// read-only view of the whole container (windows: a kernel32 file mapping,
-    /// unix: mmap; 0 = not mapped -> seek/read fallback). Row reads become
-    /// page-cache memcpys (~1 us on a hit instead of a seek+read syscall pair);
-    /// CROW_MMAP=0 disables.
+    /// unix: mmap; 0 = not mapped -> seek/read fallback). On WINDOWS this is the
+    /// PLE row read path and a row read is a page-cache memcpy (~1 us on a hit
+    /// instead of a seek+read syscall pair). On LINUX no read takes it since
+    /// TASK H (see `read_at`); what is left of it there is
+    /// `CROW_PLE_FETCH=madv`. CROW_MMAP=0 disables.
     pub map: usize,
     pub map_len: u64,
     /// the CreateFileMappingW handle behind `map` (closed in Drop after the
@@ -38,6 +40,11 @@ pub struct Cnq {
     /// the pending DONTNEED window of `fadvise_consumed`: [lo, hi) of container
     /// bytes already read and no longer needed in the page cache
     fadv: (u64, u64),
+    /// [lo, hi) of the `ple` section in container bytes — the one range `Drop`
+    /// leaves in the page cache for the next process (TASK H, 2026-09-17).
+    /// (0, 0) when the container carries no `ple` section, and then `Drop`
+    /// purges the whole file exactly as it did before.
+    ple_range: (u64, u64),
 }
 
 /// pending bytes that make `Cnq::fadvise_consumed` issue its DONTNEED call.
@@ -45,31 +52,358 @@ pub struct Cnq {
 /// smaller only raises the syscall count, larger only delays the reclaim.
 const FADV_BATCH: u64 = 64 << 20;
 
+// ---------------------------------------------------------------------------
+// the row fetch (TASK H, 2026-09-17): a chunk's PLE row misses as ONE batch of
+// concurrent reads instead of one blocking read per row.
+//
+// Every row address a prefill chunk (or a decode token) needs is a pure
+// function of its ids, so the whole set is known before the forward pass. Read
+// one at a time the set costs `misses x latency`; issued together it costs
+// `misses / queue_depth x latency`. Measured on this NVMe, 2000 random 4 KiB
+// reads over the 26.8 GiB `ple` section: 10,607 IOPS on one thread (0.094 ms
+// each), 201,305 at 16 threads (0.005 ms), 280,198 at 32 (0.004 ms), and it
+// falls back to ~210,000 at 128. Nothing here changes which bytes the engine
+// reads - only how long `Cnq::read_range` waits for them.
+// ---------------------------------------------------------------------------
+
+/// page granularity of every container read the kernel serves
+const PAGE: u64 = 4096;
+
+/// longest byte run one worker claims in one read. A coalesced run longer than
+/// this is split, so a chunk's pages spread over the pool instead of piling up
+/// behind one thread.
+const WARM_RUN_MAX: u64 = 64 << 10;
+
+/// worker count of the row-fetch pool when `CROW_PLE_FETCH` names none
+const WARM_THREADS: usize = 16;
+
+/// How `Warm::rows` turns a set of row offsets into I/O — `CROW_PLE_FETCH`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WarmMode {
+    /// the pre-TASK-H path: touch every row through the mapping, on this
+    /// thread, in the order given (`CROW_PLE_FETCH=0`)
+    Serial,
+    /// `n` worker threads, each reading whole pages (default, `n` = 16)
+    Threads(usize),
+    /// one `madvise(MADV_WILLNEED)` per coalesced run and no workers
+    /// (`CROW_PLE_FETCH=madv`)
+    Willneed,
+}
+
+/// read once — the env is fixed per process
+pub fn warm_mode() -> WarmMode {
+    static M: std::sync::OnceLock<WarmMode> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("CROW_PLE_FETCH").as_deref() {
+        Ok("0") => WarmMode::Serial,
+        Ok("madv") => WarmMode::Willneed,
+        Ok(v) => WarmMode::Threads(v.parse::<usize>().ok().filter(|n| *n > 0).unwrap_or(WARM_THREADS)),
+        Err(_) => WarmMode::Threads(WARM_THREADS),
+    })
+}
+
+/// The pages a set of `row_len`-byte rows occupies, as sorted, deduplicated,
+/// coalesced byte runs of at most `WARM_RUN_MAX`, clamped to `file_len`.
+///
+/// Deduplication is the point as much as the sort: a 4 KiB page holds ~37 PLE
+/// rows, so a chunk's misses land on far fewer pages than it has rows.
+pub fn page_runs(offsets: &[u64], row_len: usize, file_len: u64) -> Vec<(u64, u32)> {
+    let mut pages: Vec<u64> = Vec::with_capacity(offsets.len());
+    for &off in offsets {
+        let end = (off + row_len as u64).min(file_len);
+        let mut p = off / PAGE * PAGE;
+        while p < end {
+            pages.push(p);
+            p += PAGE;
+        }
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    let mut runs: Vec<(u64, u32)> = Vec::new();
+    for p in pages {
+        match runs.last_mut() {
+            Some(run) if run.0 + run.1 as u64 == p && (run.1 as u64) < WARM_RUN_MAX => run.1 += PAGE as u32,
+            _ => runs.push((p, PAGE as u32)),
+        }
+    }
+    if let Some(run) = runs.last_mut() {
+        if run.0 + run.1 as u64 > file_len {
+            run.1 = (file_len - run.0) as u32;
+        }
+    }
+    runs
+}
+
+/// one worker's claim on a batch: `runs[lo..hi]`
+#[cfg(unix)]
+struct WarmJob {
+    batch: std::sync::Arc<WarmBatch>,
+    lo: usize,
+    hi: usize,
+}
+
+/// one caller's set of runs, and the count it waits on
+#[cfg(unix)]
+struct WarmBatch {
+    runs: Vec<(u64, u32)>,
+    left: std::sync::Mutex<usize>,
+    done: std::sync::Condvar,
+}
+
+/// The pool behind `WarmMode::Threads`. One per process and per container: the
+/// workers outlive every `Cnq`, so a handle costs nothing to clone and a
+/// teardown never waits on a read in flight.
+#[cfg(unix)]
+struct WarmPool {
+    /// a second read-only descriptor on the container. It carries
+    /// POSIX_FADV_RANDOM on purpose: `Cnq::open`'s descriptor carries
+    /// POSIX_FADV_SEQUENTIAL for the load sweep, which DOUBLES the readahead
+    /// window around every 4 KiB row page (measured: 0.193 ms against 0.141 ms
+    /// per row fault on the same file).
+    file: std::fs::File,
+    /// urgent queue (the forward pass is waiting) and the background queue (the
+    /// next chunk's rows). Workers drain `now` first, or a prefetch of 10k
+    /// pages issued one chunk ahead would stand in front of the 2k pages the
+    /// current chunk is blocked on.
+    now: std::sync::Mutex<(std::collections::VecDeque<WarmJob>, std::collections::VecDeque<WarmJob>)>,
+    cv: std::sync::Condvar,
+    /// how many workers actually started (see `start`)
+    threads: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(unix)]
+impl WarmPool {
+    fn start(path: &str, threads: usize) -> Option<std::sync::Arc<WarmPool>> {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::File::open(path).ok()?;
+        unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+        let pool = std::sync::Arc::new(WarmPool {
+            file,
+            now: std::sync::Mutex::new((std::collections::VecDeque::new(), std::collections::VecDeque::new())),
+            cv: std::sync::Condvar::new(),
+            threads: threads.into(),
+        });
+        // A worker that starts and one that does not are both fine; a worker
+        // that starts while the caller gives up is NOT, because it would wait on
+        // a queue nobody feeds. So count what started and keep it.
+        let mut started = 0usize;
+        for _ in 0..threads {
+            let p = std::sync::Arc::clone(&pool);
+            if std::thread::Builder::new().name("cnq-rowfetch".into()).spawn(move || p.work()).is_ok() {
+                started += 1;
+            }
+        }
+        if started == 0 {
+            return None;
+        }
+        pool.threads.store(started, std::sync::atomic::Ordering::Relaxed);
+        Some(pool)
+    }
+
+    /// a lock that survives a panicking caller: a poisoned queue would turn a
+    /// row fetch into an abort, and the teardown rule of `f8f75c0` is that no
+    /// cleanup path aborts
+    fn lock(&self) -> std::sync::MutexGuard<'_, (std::collections::VecDeque<WarmJob>, std::collections::VecDeque<WarmJob>)> {
+        self.now.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn work(self: std::sync::Arc<WarmPool>) {
+        use std::os::unix::io::AsRawFd;
+        let fd = self.file.as_raw_fd();
+        let mut buf = vec![0u8; WARM_RUN_MAX as usize];
+        loop {
+            let job = {
+                let mut q = self.lock();
+                loop {
+                    if let Some(j) = q.0.pop_front().or_else(|| q.1.pop_front()) {
+                        break j;
+                    }
+                    q = self.cv.wait(q).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            for &(off, len) in &job.batch.runs[job.lo..job.hi] {
+                // the bytes go nowhere: this reads the pages INTO the page
+                // cache, and `Cnq::read_range` then reads the row from there
+                unsafe {
+                    libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, len as usize, off as libc::off_t);
+                }
+            }
+            let mut left = job.batch.left.lock().unwrap_or_else(|e| e.into_inner());
+            *left -= job.hi - job.lo;
+            if *left == 0 {
+                job.batch.done.notify_all();
+            }
+        }
+    }
+
+    /// queue `runs` and return when every one of them has been read
+    fn submit(&self, runs: Vec<(u64, u32)>, urgent: bool) {
+        let n = runs.len();
+        if n == 0 {
+            return;
+        }
+        // enough jobs to keep every worker busy, without one lock round per run
+        let per = n.div_ceil(self.threads.load(std::sync::atomic::Ordering::Relaxed) * 2).clamp(1, 32);
+        let batch = std::sync::Arc::new(WarmBatch {
+            runs,
+            left: std::sync::Mutex::new(n),
+            done: std::sync::Condvar::new(),
+        });
+        {
+            let mut q = self.lock();
+            let mut lo = 0usize;
+            while lo < n {
+                let hi = (lo + per).min(n);
+                let job = WarmJob { batch: std::sync::Arc::clone(&batch), lo, hi };
+                if urgent { q.0.push_back(job) } else { q.1.push_back(job) }
+                lo = hi;
+            }
+        }
+        self.cv.notify_all();
+        let mut left = batch.left.lock().unwrap_or_else(|e| e.into_inner());
+        while *left > 0 {
+            left = batch.done.wait(left).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// the process's one pool, started on the first batch that asks for it
+#[cfg(unix)]
+fn warm_pool(path: &str, threads: usize) -> Option<&'static std::sync::Arc<WarmPool>> {
+    static POOL: std::sync::OnceLock<Option<(String, std::sync::Arc<WarmPool>)>> = std::sync::OnceLock::new();
+    match POOL.get_or_init(|| WarmPool::start(path, threads).map(|p| (path.to_string(), p))) {
+        Some((p, pool)) if p == path => Some(pool),
+        _ => None,
+    }
+}
+
+/// A `Send` handle to a container's row fetch, from `Cnq::warm`.
+#[derive(Clone)]
+pub struct Warm {
+    path: std::sync::Arc<str>,
+    map: usize,
+    map_len: u64,
+}
+
+impl Warm {
+    /// Make the pages of `offsets` (each `row_len` bytes long) readable, and
+    /// return when they are. The rows themselves are still read by
+    /// `Cnq::read_range`, byte for byte as before.
+    pub fn rows(&self, offsets: &[u64], row_len: usize) {
+        if offsets.is_empty() {
+            return;
+        }
+        #[cfg(unix)]
+        match warm_mode() {
+            WarmMode::Threads(n) => {
+                if let Some(pool) = warm_pool(&self.path, n) {
+                    pool.submit(page_runs(offsets, row_len, self.map_len), true);
+                }
+            }
+            WarmMode::Willneed => {
+                if self.map != 0 {
+                    for (off, len) in page_runs(offsets, row_len, self.map_len) {
+                        unsafe {
+                            libc::madvise((self.map + off as usize) as *mut libc::c_void, len as usize, libc::MADV_WILLNEED);
+                        }
+                    }
+                }
+            }
+            // CROW_PLE_FETCH=0: no batch. `Cnq::read_range` then reads each row
+            // on its own, one latency at a time — the arm the batch is measured
+            // against.
+            WarmMode::Serial => {}
+        }
+        #[cfg(windows)]
+        {
+            // the mapping IS the row read path on windows, so the fetch is the
+            // touch; the reader pool and `path` behind it are unix-only
+            let _ = &self.path;
+            self.touch(offsets, row_len);
+        }
+    }
+
+    /// The same set, queued BEHIND every urgent one: the prefill's prefetch
+    /// thread warms the next chunk while the current chunk is computing, and
+    /// must never delay the rows that chunk is blocked on.
+    pub fn rows_ahead(&self, offsets: &[u64], row_len: usize) {
+        #[cfg(unix)]
+        if let WarmMode::Threads(n) = warm_mode() {
+            if !offsets.is_empty() {
+                if let Some(pool) = warm_pool(&self.path, n) {
+                    pool.submit(page_runs(offsets, row_len, self.map_len), false);
+                    return;
+                }
+            }
+        }
+        self.rows(offsets, row_len);
+    }
+
+    /// windows: read the first and last byte of every row through the mapping,
+    /// on this thread, one fault at a time — there the mapping IS the row read
+    /// path, and the Linux measurement that replaced it does not apply. No-op
+    /// without a mapping (`CROW_MMAP=0`).
+    #[cfg(windows)]
+    fn touch(&self, offsets: &[u64], row_len: usize) {
+        if self.map == 0 || row_len == 0 {
+            return;
+        }
+        let mut sink = 0u8;
+        for &off in offsets {
+            if off + row_len as u64 <= self.map_len {
+                unsafe {
+                    sink ^= std::ptr::read_volatile((self.map as *const u8).add(off as usize));
+                    sink ^= std::ptr::read_volatile((self.map as *const u8).add(off as usize + row_len - 1));
+                }
+            }
+        }
+        std::hint::black_box(sink);
+    }
+}
+
 /// drop the file's pages from the system cache: an open with
 /// FILE_FLAG_NO_BUFFERING while no cached handle exists makes NTFS purge the
 /// cache section (2026-09-06: the cache manager kept 3.3 GB of tier reads in
 /// the system cache working set until process exit, so a harness reload saw
 /// that much less "available" RAM and residency.rs refused to pin the tier)
-pub fn purge_cache(path: &str) {
-    // CROW_CNQ_PURGE=0 keeps the cache (control knob; the purge also cools the
-    // PLE rows the next process would have found in standby)
+///
+/// `keep` is the one byte range the purge steps over: the `ple` section, whose
+/// rows are the only bytes a NEXT process wants to find warm (TASK H fix A,
+/// 2026-09-17). `(0, 0)` purges the whole file, which is what every caller
+/// outside `Cnq::drop` gets and what windows does in either case — there the
+/// reason for the purge is the standby list counting against the next load's
+/// available RAM, which the reclaim-aware Linux RAM gate (`0c9feb5`) does not
+/// need. On Linux the kept pages cost the next process nothing: page cache is
+/// not part of `free_for_pin` (architecture 8.8) and is reclaimable.
+pub fn purge_cache(path: &str, keep: (u64, u64)) {
+    // CROW_CNQ_PURGE=0 keeps the cache (control knob, unchanged: no purge at all)
     if std::env::var("CROW_CNQ_PURGE").as_deref() == Ok("0") {
         return;
     }
     #[cfg(windows)]
     {
+        let _ = keep;
         use std::os::windows::fs::OpenOptionsExt;
         let _ = std::fs::OpenOptions::new().read(true).custom_flags(0x2000_0000 /* FILE_FLAG_NO_BUFFERING */).open(path);
     }
-    // unix twin: POSIX_FADV_DONTNEED over the whole file (len 0 = to EOF) drops
-    // its clean page-cache pages. It only evicts unmapped, unreferenced pages,
-    // so the Drop order below - unmap, close the handle, then purge - is what
+    // unix twin: POSIX_FADV_DONTNEED over the file (len 0 = to EOF) drops its
+    // clean page-cache pages. It only evicts unmapped, unreferenced pages, so
+    // the Drop order below - unmap, close the handle, then purge - is what
     // makes them droppable here too.
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
         if let Ok(f) = std::fs::File::open(path) {
-            unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+            let fd = f.as_raw_fd();
+            let dontneed = |lo: u64, len: u64| unsafe {
+                libc::posix_fadvise(fd, lo as libc::off_t, len as libc::off_t, libc::POSIX_FADV_DONTNEED)
+            };
+            let (lo, hi) = keep;
+            if hi > lo {
+                dontneed(0, lo);
+                dontneed(hi, 0); // len 0 = to EOF
+            } else {
+                dontneed(0, 0);
+            }
         }
     }
 }
@@ -118,7 +452,7 @@ impl Drop for Cnq {
         // then the unbuffered open / fadvise purges the cache
         if let Ok(nul) = std::fs::File::open(NULL_DEVICE) {
             drop(std::mem::replace(&mut self.file, nul));
-            purge_cache(&self.path);
+            purge_cache(&self.path, self.ple_range);
         }
     }
 }
@@ -224,7 +558,32 @@ impl Cnq {
         if map == 0 {
             eprintln!("[cnq] file mapping unavailable - seek/read fallback");
         }
-        Cnq { file: f, blob_offset, tensors, map, map_len, map_handle, path: path.to_string(), fadv: (0, 0) }
+        // the `ple` section as one byte range: the 128 shard tables are laid out
+        // contiguously by the converter (verified 2026-09-17 on the -M container:
+        // [3_240_788_100, 32_040_949_636), 26.82 GiB, and the only non-ple tensors
+        // inside it are three tables of a few KB). Drop keeps this range warm.
+        let mut ple_range = (u64::MAX, 0u64);
+        for t in &tensors {
+            if t.section == "ple" {
+                let lo = blob_offset + t.offset;
+                ple_range = (ple_range.0.min(lo), ple_range.1.max(lo + Self::byte_len(t)));
+            }
+        }
+        if ple_range.0 > ple_range.1 {
+            ple_range = (0, 0);
+        }
+        Cnq { file: f, blob_offset, tensors, map, map_len, map_handle, path: path.to_string(), fadv: (0, 0), ple_range }
+    }
+
+    /// the `ple` section as one `[lo, hi)` byte range of the container, or
+    /// `(0, 0)` when there is none
+    pub fn ple_range(&self) -> (u64, u64) { self.ple_range }
+
+    /// A `Send` handle to this container's row fetch (`CROW_PLE_FETCH`): the
+    /// prefill's prefetch thread holds one while the engine goes on using the
+    /// `Cnq` it came from.
+    pub fn warm(&self) -> Warm {
+        Warm { path: std::sync::Arc::from(self.path.as_str()), map: self.map, map_len: self.map_len }
     }
 
     /// absolute file offset of a tensor byte range (for prefetch touches)
@@ -248,12 +607,35 @@ impl Cnq {
     }
 
     /// The one container read: `len` bytes at absolute container offset `off`.
-    /// The mapping fast path is taken ONLY for `ple` (the one section designed
-    /// to live in the page cache); every other section goes through seek+read
-    /// and hands its pages straight back via `fadvise_consumed`, so the model
-    /// is never held twice during the load.
+    /// Every section but `ple` goes through seek+read and hands its pages
+    /// straight back via `fadvise_consumed`, so the model is never held twice
+    /// during the load.
+    ///
+    /// `ple` is the section read one 108 B row at a time, at random offsets, on
+    /// the critical path of every token, and it is read with `pread` on unix —
+    /// NOT through the mapping. What the mapping costs is the COLD fault: it
+    /// runs the FILE's readahead state, and `Cnq::open` sets
+    /// POSIX_FADV_SEQUENTIAL on that descriptor, which doubles the window — a
+    /// quarter megabyte read per 108-byte row. Measured 2026-09-17 (TASK H),
+    /// 1024-token prefill, 10,192 row misses of 16,400 rows, identical bytes on
+    /// every arm: cold through the mapping 11.14 s (92 tok/s) and 27.07 ms of
+    /// PLE host time per decode step, cold with `pread` 2.04 s (502 tok/s) and
+    /// 1.49 ms — 1.09 ms against 0.20 ms per row, 0.094 ms of which is the
+    /// device. Warm the mapping is free (0.08 ms/step, 1.41 s prefill on the
+    /// unchanged binary), so this is a cold-start cost, and the batch in
+    /// `Warm::rows` is what makes the cold start cheap.
+    ///
+    /// Windows keeps the mapping: the measurement above is a Linux one and the
+    /// mapping is why the row read is a page-cache memcpy there.
     fn read_at(&mut self, section: &str, off: u64, len: usize) -> Vec<u8> {
         let mut raw = vec![0u8; len];
+        #[cfg(unix)]
+        if section == "ple" {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(&mut raw, off).unwrap();
+            return raw;
+        }
+        #[cfg(windows)]
         if self.map != 0 && section == "ple" && off + len as u64 <= self.map_len {
             unsafe { std::ptr::copy_nonoverlapping((self.map as *const u8).add(off as usize), raw.as_mut_ptr(), len) };
             return raw;
@@ -486,4 +868,45 @@ pub fn e4m3_to_f32(b: u8) -> f32 {
         (1.0 + m / 8.0) * 2.0f32.powi(e - 7)
     };
     if s { -v } else { v }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{page_runs, PAGE, WARM_RUN_MAX};
+
+    /// 37 PLE rows share one 4 KiB page, and a chunk's misses arrive in id
+    /// order, not in offset order: the fetch has to sort and deduplicate or it
+    /// reads the same page dozens of times.
+    #[test]
+    fn page_runs_sorts_dedups_and_coalesces() {
+        let base = 10 * PAGE;
+        // out of order, three of them on the same page, one page further on
+        let offsets = [base + 20000, base + 3000, base + 12, base + 3000, base + 5000, base + 108];
+        let runs = page_runs(&offsets, 108, 1 << 30);
+        // pages base and base+PAGE coalesce; base+4*PAGE (20000 / 4096 = 4) is
+        // its own run
+        assert_eq!(runs, vec![(base, 2 * PAGE as u32), (base + 4 * PAGE, PAGE as u32)]);
+    }
+
+    /// a row that straddles a page boundary needs both pages
+    #[test]
+    fn page_runs_covers_a_straddling_row() {
+        let runs = page_runs(&[PAGE - 8], 108, 1 << 30);
+        assert_eq!(runs, vec![(0, 2 * PAGE as u32)]);
+    }
+
+    /// one contiguous stretch is split at WARM_RUN_MAX so it spreads over the
+    /// pool instead of piling up behind one thread, and the last run never
+    /// reaches past the end of the container
+    #[test]
+    fn page_runs_splits_and_clamps() {
+        let n = (WARM_RUN_MAX / PAGE) as usize + 2;
+        let offsets: Vec<u64> = (0..n as u64).map(|i| i * PAGE).collect();
+        let file_len = (n as u64 - 1) * PAGE + 100;
+        let runs = page_runs(&offsets, 108, file_len);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0], (0, WARM_RUN_MAX as u32));
+        assert_eq!(runs[1].0, WARM_RUN_MAX);
+        assert_eq!(runs[1].0 + runs[1].1 as u64, file_len);
+    }
 }

@@ -78,6 +78,13 @@ engine/target/release/serve --port 8099
   the `lib/stubs` sibling); every `CROW_*` variable of the caller and every argument are
   passed through. `docs/env.md` has the host-memory rows the launcher bounds:
   `CROW_RAM_MARGIN_GB`, `CROW_PINNED_BUDGET_GB`.
+- **Keep the container off a compressed mount** (2026-09-17). The PLE section is read as 108-byte
+  rows at random offsets, on the critical path of every token, so a filesystem that decompresses a
+  whole extent per 4 KiB read is the wrong home for it. On btrfs, check with
+  `filefrag -v <container> | grep -c encoded` (0 is what you want) and give the file `chattr +m`
+  BEFORE it is written — `chattr +m` plus `btrfs filesystem defragment` on an already compressed
+  file is a no-op, only a full rewrite clears the extents. Same rule for a `compress-force` mount
+  or a compressed ZFS dataset.
 
 ### Check the branch on Linux, from the repository root
 
