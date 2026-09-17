@@ -87,8 +87,9 @@
 //!   (`manager.rs:216-219`), so an unbounded value from a file would write past the buffer.
 //! - `payload_bytes` saturates instead of wrapping: a release build has no overflow checks,
 //!   and a wrapped size would name a SMALL payload for a file that asks for a huge upload.
-//! - The payload read is bounded by `take(payload + 1)`, so an oversized file is refused
-//!   after at most one byte over, never after being pulled into host RAM whole.
+//! - The payload length is checked against the size on disk before the first read, so an
+//!   oversized file is refused without a byte of it entering host RAM, and the payload is
+//!   then STREAMED into the destinations through one reusable buffer, never held whole.
 //!
 //! Ordering, and what a failure in the middle can leave (`cuda::ck` ends the process):
 //!
@@ -595,18 +596,17 @@ pub unsafe fn restore(
     h.shape_matches(&live)?;
     h.check_content(&live)?;
     let want = h.payload_bytes();
-    // #32 review: BOUNDED. A padded file is refused after payload + 1 bytes, so a 40 GB
-    // file cannot be pulled into host RAM before the size check gets to run.
-    let mut body = Vec::with_capacity(want as usize + 1);
-    std::io::Read::by_ref(&mut f)
-        .take(want + 1)
-        .read_to_end(&mut body)
-        .map_err(|e| format!("read {path:?} failed: {e}"))?;
-    if body.len() as u64 != want {
-        let held = if body.len() as u64 > want { "more than" } else { "only" };
+    // #32 review: BOUNDED, and STREAMED since the Linux port (issue #15). The length
+    // on disk is the whole check, so a padded or truncated file is refused here, before
+    // the first upload, and the payload never needs to live in host RAM at once: a
+    // full-context restore used to be one 2.70 GiB anonymous allocation on top of the
+    // 47.7 GiB steady state, the worst instantaneous host-RAM event in the engine.
+    let on_disk = std::fs::metadata(path).map_err(|e| format!("cannot stat {path:?}: {e}"))?.len();
+    let held_bytes = on_disk.saturating_sub(HEADER_BYTES as u64);
+    if held_bytes != want {
+        let held = if held_bytes > want { "more than" } else { "only" };
         return Err(format!(
-            "{path:?} holds {held} {} payload bytes, the header asks for {want}",
-            body.len()
+            "{path:?} holds {held} {held_bytes} payload bytes, the header asks for {want}"
         ));
     }
     let state: u64 = cache.prompt_state_blocks().iter().map(|b| (b.len() * 4) as u64).sum();
@@ -623,35 +623,41 @@ pub unsafe fn restore(
     // the A4 ordering, exactly as `cache::PrefixCache::rollback`: the uploads below and the
     // prefill of the next request need the legacy stream (`reset.rs`, "The active stream")
     eng.drop_decode_graph();
-    let mut at = 0usize;
+    // one reusable buffer, sized by the largest single consumer (a KV row group at
+    // full context, about 51 MB), instead of the whole payload
+    let mut buf: Vec<u8> = Vec::new();
+    let mut n_payload: u64 = 0;
+    let fill = |f: &mut std::fs::File, buf: &mut Vec<u8>, n: usize, n_payload: &mut u64| -> Result<(), String> {
+        buf.resize(n, 0);
+        f.read_exact(buf).map_err(|e| format!("read {path:?} failed: {e}"))?;
+        *n_payload += n as u64;
+        Ok(())
+    };
     for block in cache.prompt_state_blocks_mut() {
         let n = block.len() * 4;
-        bytes_into_f32(&body[at..at + n], block);
-        at += n;
+        fill(&mut f, &mut buf, n, &mut n_payload)?;
+        bytes_into_f32(&buf, block);
     }
 
     let kv_bytes = h.pos as usize * h.kv_row_bytes as usize;
     for layer in 0..h.attn_layers as usize {
         for is_k in [true, false] {
             for kvh in 0..NKV {
-                cuda::upload_into(
-                    eng.st.kv_row_ptr(layer, is_k, kvh, 0),
-                    &body[at..at + kv_bytes],
-                );
-                at += kv_bytes;
+                fill(&mut f, &mut buf, kv_bytes, &mut n_payload)?;
+                cuda::upload_into(eng.st.kv_row_ptr(layer, is_k, kvh, 0), &buf);
             }
         }
     }
     let pooled_bytes = h.done_blocks as usize * h.pooled_row_bytes as usize;
     for layer in 0..h.attn_layers as usize {
-        cuda::upload_into(eng.st.qsa_pooled[layer], &body[at..at + pooled_bytes]);
-        at += pooled_bytes;
+        fill(&mut f, &mut buf, pooled_bytes, &mut n_payload)?;
+        cuda::upload_into(eng.st.qsa_pooled[layer], &buf);
     }
-    let mut ids = Vec::with_capacity(h.history_len as usize);
-    for _ in 0..h.history_len as usize {
-        ids.push(i64::from_le_bytes(body[at..at + 8].try_into().unwrap()));
-        at += 8;
-    }
+    fill(&mut f, &mut buf, h.history_len as usize * 8, &mut n_payload)?;
+    let ids: Vec<i64> = buf
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
     eng.pos = h.pos as usize;
     eng.done_blocks = h.done_blocks as usize;
     eng.history = ids;
@@ -661,12 +667,12 @@ pub unsafe fn restore(
     // a cache that claims a position the device never received. It cannot now.
     cache.set_prompt_slot(h.pos as usize, h.done_blocks as usize);
 
-    // the uploads read `body`, which dies with this frame
+    // the uploads read `buf`, which dies with this frame
     cuda::sync();
     Ok(Restored {
         n_restored: h.pos as usize,
         // MEASURED: the header this reader consumed plus the payload it actually read
-        n_read: HEADER_BYTES as u64 + body.len() as u64,
+        n_read: HEADER_BYTES as u64 + n_payload,
         ms: t0.elapsed().as_secs_f64() * 1e3,
     })
 }

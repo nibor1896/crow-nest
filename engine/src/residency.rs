@@ -245,8 +245,14 @@ impl Residency {
         let cold_total: u64 = (0..LAYERS)
             .map(|l| (if full_tier { E } else { E - sets[l].len() }) as u64 * (cold_gu_bytes + cold_dn_bytes))
             .sum();
+        // free_phys is the RAM that can be PINNED, not MemAvailable: the driver's
+        // pinned-page pool and the page cache are both reclaimable and both
+        // invisible to MemAvailable (cuda::free_physical_ram_parts). The planner
+        // already sized the tier against `budget = min(cap, free_phys - margin)`
+        // (manager::derive_host_pinned_budget), so this is the backstop for the
+        // RAM that other processes took between the two readings.
         let free_phys = cuda::free_physical_ram();
-        let margin: u64 = std::env::var("CROW_RAM_MARGIN_GB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(3) << 30;
+        let margin = crate::manager::ram_margin_bytes();
         progress(&format!(
             "pinned cold tier {:.2} GiB vs free physical RAM {:.2} GiB (margin {:.0} GiB)",
             cold_total as f64 / (1u64 << 30) as f64, free_phys as f64 / (1u64 << 30) as f64, margin as f64 / (1u64 << 30) as f64
@@ -265,6 +271,8 @@ impl Residency {
         let mut cold_gu = Vec::with_capacity(LAYERS);
         let mut cold_dn = Vec::with_capacity(LAYERS);
         let mut cold_index = Vec::with_capacity(LAYERS);
+        // hot experts: container -> staging -> VRAM slab (async + sync, WDDM rule)
+        let mut stage = vec![0u8; slabs.gu_bytes.max(slabs.dn_bytes) as usize];
         for l in 0..LAYERS {
             let ncold = if full_tier { E } else { E - sets[l].len() };
             // write-combined pinned memory: the host only WRITES the cold tier (at
@@ -296,10 +304,14 @@ impl Residency {
             let dt = cnq.find(&dname, section).clone();
             let mut done = 0usize;
             let mut clamped = 0u64;
-            for (&id, &cs) in idx.iter() {
-                if let (Some(tf), Some((h, _))) = (tier_file.as_mut(), &lb_hdr) {
-                    use std::io::{Read, Seek, SeekFrom};
-                    let layer_bytes = h["layer_bytes"].as_u64().unwrap();
+            // the low-bit cold tier lives in its own file: fill the pinned slabs from
+            // it here, and let the container sweep below serve the hot slabs only
+            if let (Some(tf), Some((h, _))) = (tier_file.as_mut(), &lb_hdr) {
+                use std::io::{Read, Seek, SeekFrom};
+                let layer_bytes = h["layer_bytes"].as_u64().unwrap();
+                let mut order: Vec<(u32, usize)> = idx.iter().map(|(&id, &cs)| (id, cs)).collect();
+                order.sort_unstable();
+                for &(id, cs) in &order {
                     let base = l as u64 * layer_bytes + id as u64 * (cold_gu_bytes + cold_dn_bytes);
                     let mut raw = vec![0u8; cold_gu_bytes as usize];
                     tf.seek(SeekFrom::Start(base)).unwrap();
@@ -310,53 +322,73 @@ impl Residency {
                     tf.read_exact(&mut raw).unwrap();
                     pd.write_bytes((cs as u64 * cold_dn_bytes) as usize, &raw);
                     done += 1;
+                }
+            }
+            // ONE ascending sweep per expert tensor over every id: a hot id goes to
+            // its VRAM slot, a cold id to its pinned slot. Same bytes into the same
+            // destinations as the two separate passes this replaces - what changes is
+            // that the tensor is now read WHOLE and IN ORDER, which is what lets
+            // `cnq::fadvise_consumed` drop every byte behind the cursor. Skipping the
+            // hot ids left their pages stranded: the kernel's readahead window sails
+            // over a 1.76 MB gap, and nothing ever dropped what it pulled in (measured
+            // 2026-09-17: the page cache still held 14 GiB at the end of the fill).
+            let mut hot_slot = vec![usize::MAX; E];
+            for (slot, &id) in sets[l].iter().enumerate() {
+                hot_slot[id as usize] = slot;
+            }
+            let cold_here = lb_hdr.is_none(); // else the tier file above filled `pg`/`pd`
+            for id in 0..E as u32 {
+                let slot = hot_slot[id as usize];
+                let cs = if cold_here { idx.get(&id).copied() } else { None };
+                if slot == usize::MAX && cs.is_none() {
                     continue;
                 }
-                let off = id as u64 * slabs.gu_bytes;
-                let mut raw = cnq.read_range(&gt, off, slabs.gu_bytes as usize);
-                clamped += sanitize_sf_slab(&mut raw);
-                pg.write_bytes((cs as u64 * slabs.gu_bytes) as usize, &raw);
+                let mut raw = cnq.read_range(&gt, id as u64 * slabs.gu_bytes, slabs.gu_bytes as usize);
+                let n = sanitize_sf_slab(&mut raw);
+                if let Some(cs) = cs {
+                    clamped += n;
+                    pg.write_bytes((cs as u64 * slabs.gu_bytes) as usize, &raw);
+                }
+                if slot != usize::MAX {
+                    stage[..raw.len()].copy_from_slice(&raw);
+                    let dst = hot_gu as u64 + ((l * n_slots + slot) as u64) * slabs.gu_bytes;
+                    cuda::upload_into(dst, &stage[..raw.len()]);
+                }
+            }
+            for id in 0..E as u32 {
+                let slot = hot_slot[id as usize];
+                let cs = if cold_here { idx.get(&id).copied() } else { None };
+                if slot == usize::MAX && cs.is_none() {
+                    continue;
+                }
                 let mut raw = cnq.read_range(&dt, id as u64 * slabs.dn_bytes, slabs.dn_bytes as usize);
-                clamped += sanitize_sf_slab(&mut raw);
-                pd.write_bytes((cs as u64 * slabs.dn_bytes) as usize, &raw);
-                done += 1;
-                if done % 128 == 0 {
-                    progress(&format!(
-                        "  layer {l}: cold experts {done}/{ncold} pinned ({:.0} MB)",
-                        (done as u64 * (slabs.gu_bytes + slabs.dn_bytes)) as f64 / (1 << 20) as f64
-                    ));
+                let n = sanitize_sf_slab(&mut raw);
+                if let Some(cs) = cs {
+                    clamped += n;
+                    pd.write_bytes((cs as u64 * slabs.dn_bytes) as usize, &raw);
+                    done += 1;
+                    if done % 128 == 0 {
+                        progress(&format!(
+                            "  layer {l}: cold experts {done}/{ncold} pinned ({:.0} MB)",
+                            (done as u64 * (slabs.gu_bytes + slabs.dn_bytes)) as f64 / (1 << 20) as f64
+                        ));
+                    }
+                }
+                if slot != usize::MAX {
+                    stage[..raw.len()].copy_from_slice(&raw);
+                    let dst = hot_dn as u64 + ((l * n_slots + slot) as u64) * slabs.dn_bytes;
+                    cuda::upload_into(dst, &stage[..raw.len()]);
                 }
             }
             if clamped > 0 {
                 progress(&format!("  layer {l}: clamped {clamped} scale bytes 0x7F->0x7E (hardware NaN encoding)"));
             }
-            cold_gu.push(pg);
-            cold_dn.push(pd);
-            cold_index.push(idx);
-        }
-
-        // hot experts: container → staging → VRAM slab (async + sync, WDDM rule)
-        let mut stage = vec![0u8; slabs.gu_bytes.max(slabs.dn_bytes) as usize];
-        for l in 0..LAYERS {
-            let gname = format!("model.language_model.layers.{l}.mlp.experts.gate_up_proj");
-            let dname = format!("model.language_model.layers.{l}.mlp.experts.down_proj");
-            let gt = cnq.find(&gname, section).clone();
-            let dt = cnq.find(&dname, section).clone();
-            for (slot, &id) in sets[l].iter().enumerate() {
-                let mut raw = cnq.read_range(&gt, id as u64 * slabs.gu_bytes, slabs.gu_bytes as usize);
-                sanitize_sf_slab(&mut raw);
-                stage[..raw.len()].copy_from_slice(&raw);
-                let dst = hot_gu as u64 + ((l * n_slots + slot) as u64) * slabs.gu_bytes;
-                cuda::upload_into(dst, &stage[..raw.len()]);
-                let mut raw = cnq.read_range(&dt, id as u64 * slabs.dn_bytes, slabs.dn_bytes as usize);
-                sanitize_sf_slab(&mut raw);
-                stage[..raw.len()].copy_from_slice(&raw);
-                let dst = hot_dn as u64 + ((l * n_slots + slot) as u64) * slabs.dn_bytes;
-                cuda::upload_into(dst, &stage[..raw.len()]);
-            }
             if l % 8 == 0 {
                 progress(&format!("  layer {l}: hot set on VRAM"));
             }
+            cold_gu.push(pg);
+            cold_dn.push(pd);
+            cold_index.push(idx);
         }
         drop(stage);
 

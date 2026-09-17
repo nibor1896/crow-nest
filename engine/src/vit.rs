@@ -173,6 +173,12 @@ pub struct Vit {
     /// the host). A conversation that re-sends its whole history (Crow does,
     /// base64 and all) pays for each picture ONCE per process, not per turn.
     image_cache: std::collections::HashMap<u64, ((usize, usize, usize), usize, Vec<f32>)>,
+    /// cache keys, least recently used first: the cache is per PROCESS and a
+    /// serve runs for days, so it is bounded by bytes (`CROW_VIT_CACHE_MB`)
+    /// and evicted LRU. Unbounded it grew by up to 10 MiB per distinct image,
+    /// forever (about 1 GiB per 100 screenshots).
+    image_lru: Vec<u64>,
+    image_cache_bytes: usize,
     x: Dev,        // [cap][1152] residual stream
     normed: Dev,   // [cap][1152] ln output / gemv scratch
     qkv: Dev,      // [cap][3456]
@@ -236,6 +242,8 @@ impl Vit {
             s: Vec::new(),
             scratch: false,
             image_cache: std::collections::HashMap::new(),
+            image_lru: Vec::new(),
+            image_cache_bytes: 0,
         }
     }
 
@@ -579,13 +587,6 @@ pub fn prep_image(bytes: &[u8]) -> Result<ImagePrep, String> {
     let (mut rh, mut rw) = (rh as usize, rw as usize);
     let (w0, h0) = (w0 as usize, h0 as usize);
 
-    // to f32 0..255, channel planes [3][h0][w0] for the separable resize
-    let mut planes = vec![0f32; 3 * h0 * w0];
-    for (i, px) in rgb.chunks_exact(3).enumerate() {
-        for c in 0..3 {
-            planes[c * h0 * w0 + i] = px[c] as f32;
-        }
-    }
     // #VIT cap: an image over the patch budget is DOWNSCALED further, never
     // refused - a screenshot must reach the model at the resolution a chat
     // needs, the same clamp every production VLM applies. Dims stay
@@ -606,17 +607,25 @@ pub fn prep_image(bytes: &[u8]) -> Result<ImagePrep, String> {
     let n_patches = hp * wp;
     let n_visual = hp * wp / (VIT_MERGE * VIT_MERGE);
 
-    // resize: horizontal pass then vertical pass per channel
+    // resize: horizontal pass then vertical pass per channel. ONE channel plane
+    // at a time: the f32 copy of the decoded raster is 4x its bytes, and holding
+    // all three reached about 2 GiB of host RAM from a single 16 MiB PNG (the
+    // decoder's own cap is 512 MiB). `plane` carries exactly the bytes the
+    // [3][h0][w0] slice carried, so the tower sees the same input.
     let mut resized = Vec::with_capacity(3 * rh * rw);
+    let mut plane = vec![0f32; h0 * w0];
     for c in 0..3 {
-        let p = &planes[c * h0 * w0..(c + 1) * h0 * w0];
-        let hor = resize_axis(p, h0, w0, rw);           // [h0][rw]
+        for (i, px) in rgb.chunks_exact(3).enumerate() {
+            plane[i] = px[c] as f32;                    // to f32 0..255
+        }
+        let hor = resize_axis(&plane, h0, w0, rw);      // [h0][rw]
         let ver_src = transpose(&hor, h0, rw);          // [rw][h0]
         let ver = resize_axis(&ver_src, rw, h0, rh);    // [rw][rh]
         let out = transpose(&ver, rw, rh);              // [rh][rw]
         resized.extend_from_slice(&out);
     }
-    drop(planes);
+    drop(plane);
+    drop(rgb);
     // torchvision rounds the interpolated values back to the u8 grid before
     // rescale/normalize (the fast processor resizes the uint8 tensor)
     for v in resized.iter_mut() {
@@ -840,7 +849,39 @@ pub fn mrope_tables(pos: &[[i64; 3]], seq: usize, span: usize, delta: i64) -> (V
     (cos, sin)
 }
 
+/// byte ceiling of the per-process image-embedding cache (`CROW_VIT_CACHE_MB`,
+/// default 256 MiB = about 25 full-size images at 10 MiB each)
+fn vit_cache_bytes() -> usize {
+    static MB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("CROW_VIT_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256)
+    }) << 20
+}
+
 impl Vit {
+    /// insert one tower output, then evict least-recently-used entries until the
+    /// cache is back under `vit_cache_bytes()`. An entry larger than the whole
+    /// ceiling is not cached at all (it would evict everything and then itself).
+    fn cache_insert(&mut self, key: u64, grid: (usize, usize, usize), n_visual: usize, rows: Vec<f32>) {
+        let bytes = rows.len() * 4;
+        let ceiling = vit_cache_bytes();
+        if bytes > ceiling {
+            return;
+        }
+        if let Some((_, _, old)) = self.image_cache.insert(key, (grid, n_visual, rows)) {
+            self.image_cache_bytes -= old.len() * 4;
+            self.image_lru.retain(|&k| k != key);
+        }
+        self.image_cache_bytes += bytes;
+        self.image_lru.push(key);
+        while self.image_cache_bytes > ceiling && !self.image_lru.is_empty() {
+            let oldest = self.image_lru.remove(0);
+            if let Some((_, _, old)) = self.image_cache.remove(&oldest) {
+                self.image_cache_bytes -= old.len() * 4;
+            }
+        }
+    }
+
     /// decode + preprocess + run every image, expand the ids, and assemble the
     /// plan the prefill splice and the decode mrope need. `ids` are the
     /// RENDERED prompt ids (one IMAGE_PAD per image, message order).
@@ -870,6 +911,8 @@ impl Vit {
                 eprintln!("[vit-cache] image {i}: HIT grid {grid:?}, {n_visual} visual tokens");
                 infos.push((*grid, *n_visual));
                 all_rows.push(rows.clone());
+                self.image_lru.retain(|&k| k != key);
+                self.image_lru.push(key);
                 continue;
             }
             let p = prep_image(bytes)
@@ -887,12 +930,14 @@ impl Vit {
             }
             infos.push((p.grid, p.n_visual));
             all_rows.push(rows.clone());
-            self.image_cache.insert(key, (p.grid, p.n_visual, rows));
+            self.cache_insert(key, p.grid, p.n_visual, rows);
             misses += 1;
         }
         eprintln!(
-            "[vit-cache] {} image(s): {} through the tower, {} cached",
-            images.len(), misses, images.len() - misses
+            "[vit-cache] {} image(s): {} through the tower, {} cached; cache {} entries, {:.1} MiB of {} MiB",
+            images.len(), misses, images.len() - misses,
+            self.image_cache.len(), self.image_cache_bytes as f64 / (1 << 20) as f64,
+            vit_cache_bytes() >> 20
         );
         let counts: Vec<usize> = infos.iter().map(|(_, n)| *n).collect();
         let expanded = expand_ids(ids, &counts)?;

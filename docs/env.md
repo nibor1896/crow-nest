@@ -4,9 +4,9 @@
 
 | Item | Value |
 |---|---|
-| Variables in this table | 74 |
-| Distinct `CROW_[A-Z0-9_]+` tokens in the code | 74 in `engine/src`, 0 in `converter/src` |
-| Measured | 2026-09-10, task E5, issue #46, parent #1 |
+| Variables in this table | 80 |
+| Distinct `CROW_[A-Z0-9_]+` tokens in the code | 80 in `engine/src`, 0 in `converter/src` |
+| Measured | 2026-09-10, task E5, issue #46, parent #1; re-counted 2026-09-17 with the two host-memory rows of #15 |
 | Repository state | branch `release-v0.1`, HEAD `0d1cc0d` plus the `#61d` commit, 2026-09-13 |
 | Guard | `tools/check_env_docs.py` (code list minus doc list must be empty, both ways) |
 | Rule | a variable not in this table does not exist |
@@ -51,7 +51,7 @@ Helpers used by the read sites:
 - The `--diag` cargo feature alternative of the E5 gate was not taken; no engine change before the tag.
 - The four diagnostic values stay reachable in the default binary and carry a warning row (section Diagnostic values).
 
-## Container and residency (13 rows)
+## Container and residency (14 rows)
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
@@ -60,10 +60,11 @@ Helpers used by the read sites:
 | `CROW_HOTSETS_OUT` | `engine/src/bin/residency.rs:50` | path; default `../decode_out/residency-warmup.hotsets.json` | names the sidecar file the `residency` warm-up WRITES, and reloads from on the next start | measurement | `#52` (2026-09-11): never `<container>.hotsets.json`, because the ragged sidecar of `#49` lives there and must stay byte-unchanged; read by `bin/residency.rs` only, `decode`, `parity` and `serve` read `CROW_HOTSETS` |
 | `CROW_COLD_TIER` | `engine/src/residency.rs:231` | path to `<cnq>.cold<bits>.bin`; default unset (exact NVFP4 tier) | installs the low-bit cold tier built by `bin/coldtier.rs` | operating | record sizes read from the header at `gen.rs:699`; `docs/architecture.md:1163` keeps it off for `serve` (7.5 condition 2) |
 | `CROW_COLD_FULL` | `engine/src/gen.rs:706` | `1`, `0`; default: full tier when `E * unit <= cfg.host_pinned_budget` | forces the full tier (every expert pinned) or cold-only | operating | full tier is what enables the prompt-adaptive hot set |
-| `CROW_RAM_MARGIN_GB` | `engine/src/residency.rs:249` | integer GiB; default `3` | free physical RAM that must remain after pinning the cold tier | operating | below the margin `residency.rs:255` panics before anything is pinned |
+| `CROW_RAM_MARGIN_GB` | `engine/src/manager.rs` (`ram_margin_bytes`, read by `manager::derive_host_pinned_budget` and by the gate in `engine/src/residency.rs`) | integer GiB; default `3` | free physical RAM that must remain after pinning the cold tier | operating | two readers since the Linux port (#15, 2026-09-17): it sets the boot-derived budget `min(cap, free_for_pin - margin)` AND the pre-pin gate that panics before anything is pinned. `free_for_pin` is NOT `MemAvailable` on Linux: `cuda::free_physical_ram_parts` subtracts only what cannot be reclaimed (`AnonPages`, `Shmem`, `SUnreclaim`, `KernelStack`, `PageTables`, `Percpu`) from `MemTotal`, because the NVIDIA driver's pinned-page pool and the page cache are both reclaimable and both invisible to `MemAvailable` - measured 2026-09-17 with the pool present: free for pinning 60.78 GiB against `MemAvailable` 12.44 GiB, and the old `MemAvailable` reading refused every second start. The boot line names both numbers. Run `serve` through `tools/serve-linux.sh` so the cgroup bounds what this margin cannot |
+| `CROW_PINNED_BUDGET_GB` | `engine/src/manager.rs` (`derive_host_pinned_budget`) | integer GiB; default: derived at boot as `min(46 GiB cap, free_for_pin - CROW_RAM_MARGIN_GB)` | pins the host budget for the cold tier and skips the derivation | measurement | #15, 2026-09-17. The 46 GiB cap is `Config::host_pinned_budget` (`geo.rs:110`), the measured ceiling of the 64 GB machine the default was written on. A smaller budget is not a refusal: the two-sided loop in `manager::ThreeStates::allocate` RAISES N (more experts hot in VRAM, fewer pinned) until the cold tier fits, and refuses only when no N satisfies both sides (`planner_refusal_msg`). One `[budget]` boot line names the value, its basis, free for pinning and `MemAvailable`. Not read by `serve` as an operating switch; it exists to hold the budget fixed across a measurement |
 | `CROW_PINNED_WC` | `engine/src/residency.rs:275` | `0` restores cacheable pinned memory; default write-combined | allocation type of the pinned cold slabs | operating | measured 2026-09-04 (`pcie_probe`): WC 47.6 GB/s vs cacheable 24 GB/s |
 | `CROW_MMAP` | `engine/src/cnq.rs:91` | `0` disables; default on | maps the container read-only, row reads become page-cache memcpys | operating | doc comment `cnq.rs:29`: about 1 us on a hit instead of a seek plus read pair |
-| `CROW_CNQ_PURGE` | `engine/src/cnq.rs:46` | `0` keeps the cache; default purge | on drop, re-opens the container unbuffered to purge its cached pages | operating | rationale `cnq.rs:38-42`, 2026-09-06: 3.3 GB of tier reads stayed in the system cache and `residency.rs` then refused to pin |
+| `CROW_CNQ_PURGE` | `engine/src/cnq.rs` (`purge_cache` and `Cnq::fadvise_consumed`) | `0` keeps the cache; default purge | drops the container's cached pages: incrementally behind the read cursor during the load, and once over the whole file on drop | operating | rationale `cnq.rs`, 2026-09-06: 3.3 GB of tier reads stayed in the system cache and `residency.rs` then refused to pin. Since #15 (2026-09-17) the same switch gates the per-range `posix_fadvise(POSIX_FADV_DONTNEED)` of the loader: measured on the 8-row form, `CROW_CNQ_PURGE=0` peaks at 12.67 GiB page cache with `MemFree` down to 1.18 GiB, the default at 5.14 GiB with `MemFree` no lower than 7.70 GiB, and both produce sha256 `bceba6ff7724` |
 | `CROW_QSA_FULL` | `engine/src/manager.rs:37` | `1` sets `ring = context`; default `ceil4(prompt_chunk + 4)` capped by context | size of the raw indexer-key ring per attention layer | measurement | pre-2026-09-05 layout; `docs/architecture.md:1162` marks it out of scope for `serve` |
 | `CROW_KV` | `engine/src/bin/decode.rs:62` | `bf16`; default the container KV dtype | parity ladder switch for the KV cache dtype | measurement | read only in `bin/decode.rs`, not by `serve` |
 | `CROW_PLE` | `engine/src/bin/decode.rs:65` | `off`; default on | parity ladder switch that disables the PLE stage | measurement | read only in `bin/decode.rs`, not by `serve` |
@@ -140,12 +141,13 @@ Helpers used by the read sites:
 | `CROW_SEED` | `engine/src/sample.rs:80` | integer; default `0` | sampler seed, also the RNG start state (`sample.rs:81`) | measurement | `sample.rs:53`: the record names the seed, so a sampled answer is reproducible |
 | `CROW_STOP_EOS` | `engine/src/sample.rs:192` | `1` enables; default off | ends a harness run at EOS | measurement | `bin/serve.rs:194`: `sample::EOS_IDS` stops both server modes and this variable is NOT read there |
 
-## Server (2 rows)
+## Server (3 rows)
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
 | `CROW_PREFIX_CACHE` | `engine/src/cache.rs:309` | `0` disables; default on | allocates the one held-conversation slot (M1, spec 7.7) | operating | `0` makes every request a cold start and prints `L n/a` (`bin/serve.rs:386`, `bin/serve.rs:397`, `bin/serve.rs:2324`); error texts at `slot.rs:493`, `slot.rs:585` |
 | `CROW_VIT` | `engine/src/vit.rs` (`vit_on`, read by the load at `engine/src/gen.rs` and by serve) | `0` = the text-only placeholder of record (no vit load, `/props` `modalities.vision` false, image requests ride the single `image_pad` token); unset or any other value = the visual tower loads and image requests are served (default ON, the flip of the #VIT gates) | loads the container's `vit` section beside the text sections (27 vision blocks + patch embed + merger, 112 NVFP4 + 221 bf16 tensors, about 1.3 GiB with the cap-sized scratch); serve then answers Crow's image wire (`image_url` data-URL blocks, crow_core.py `image_part`): decode, smart_resize, the f32 tower, the embedding splice at the expanded `image_pad` rows and the interleaved-mrope span tables; `/props` reports `vision` per the switch so Crow's `refuse_images` (crow_core.py:1429) sends or refuses; one `[vit]` boot line per process names mode + switch + cap | operating | #VIT, 2026-09-14: text parity with the tower LOADED (no env) byte-identical to `d211ab52ad2b` at the 61b sha256 values of record (8 `bceba6ff7724`, 512 `14c8628acbec` x2, 1024 `b2e87b2bf99a`, PX `f217e1c55926` under the > 26 GiB VRAM headroom gate) AND with `CROW_VIT=0`; ten tasks 10 of 10 vs final4; ViT parity vs the f32 container-dequant oracle (identical weights both sides, math-precision band) max_abs 3.4e-06 at cos 1.000000 on the smoke image; end-to-end image-prompt oracle in `oracle/ref_image_prompt_logits.py`; image caps: 16384 patches = 4096 visual tokens per image, smart_resize factor 32, min 65536 / max 16777216 px (bigger requests answer 400); `decode_out/srv-vit.log`, RTX 5090 |
+| `CROW_VIT_CACHE_MB` | `engine/src/vit.rs` (`vit_cache_bytes`) | integer MiB; default `256` | byte ceiling of the per-process image-embedding cache (LRU) | operating | #15, 2026-09-17. The cache keys on the image BYTES, so a conversation that re-sends its whole picture history pays for each one once per process (#VIT, 2026-09-14) - but it had no bound, no eviction and no `clear()`, and one entry is up to `n_visual * 2560 * 4` = 10 MiB, so a long serve session grew by about 1 GiB per 100 distinct images. `0` caches nothing. The `[vit-cache]` line per request names entries, bytes held and the ceiling |
 
 ## Tokenizer (2 rows)
 

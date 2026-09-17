@@ -652,7 +652,7 @@ impl Engine {
     /// `warmup_counts` feeds warm-up promotion when no sidecar exists yet.
     pub unsafe fn load(
         cnq: &mut Cnq,
-        cfg: Config,
+        mut cfg: Config,
         warmup_counts: Option<&[[u64; E]; LAYERS]>,
         sidecar_path: &str,
         persist: bool,
@@ -661,6 +661,9 @@ impl Engine {
         let sec = "text";
         let t0 = std::time::Instant::now();
         engine_lock_acquire();
+        // the pinned budget is a property of THIS host, measured here, not the
+        // 46 GiB of the machine the default was written on (manager.rs)
+        cfg.host_pinned_budget = crate::manager::derive_host_pinned_budget(cfg.host_pinned_budget, log);
 
         // ---- head + dense (residents before the budget verify) ----
         log("loading embeddings (BF16 keep → host f32) …");

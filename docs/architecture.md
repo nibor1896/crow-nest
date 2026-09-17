@@ -148,6 +148,12 @@ Loader rule (binding): N=160 is the **target**; the loader verifies the full bud
 measured overheads at load time and auto-clamps N if the sum exceeds VRAM — it refuses
 configurations that fall below the 200k context floor, never silently degrades context.
 
+The clamp is **two-sided**: VRAM lowers N, the host pinned budget raises it (fewer cold
+experts to pin). That budget is not a constant — it is derived at boot as
+`min(46 GiB cap, free_for_pin - CROW_RAM_MARGIN_GB)` and capped at the 46 GiB of `geo.rs:110`
+(`manager::derive_host_pinned_budget`, issue #15, 2026-09-17). The planner refuses only when
+no N satisfies both sides (`planner_refusal_msg`).
+
 ### 2.2 Expert residency (per layer, data-driven)
 
 - Residency sets are **per-layer top-N by selection frequency** — per-layer ranking, not
@@ -1053,8 +1059,11 @@ with `ring = ceil4(prompt_chunk + 4).min(context)` (`manager.rs:37-41`):
 - Rule: snapshots belong in **pageable host RAM**.
 - Not VRAM: VRAM is already the binding budget, and the loader clamps N against it
   (`manager.rs:122-170`).
-- Not the pinned tier: it is budgeted at 46 GiB against a measured ~48.5 GiB host ceiling
-  (`geo.rs:110`).
+- Not the pinned tier: its budget is DERIVED at boot and capped at 46 GiB. The cap is
+  `geo.rs:110`, the measured ~48.5 GiB host ceiling of the 64 GB machine the default was
+  written on; the boot takes the smaller of that cap and `free_for_pin - CROW_RAM_MARGIN_GB`
+  measured on the running host (`manager::derive_host_pinned_budget`, issue #15). A smaller
+  budget raises N through the two-sided planner loop instead of refusing.
 - Allocated once at process start and reused per snapshot (`cache.rs:306`, `cache.rs:310`).
 
 **The formula holds for the default QSA layout only.**

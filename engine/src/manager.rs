@@ -26,6 +26,57 @@ pub fn planner_refusal_msg(free0: u64, host_pinned_budget: u64) -> String {
     )
 }
 
+/// physical RAM that must stay free after the cold tier is pinned
+/// (`CROW_RAM_MARGIN_GB`, default 3 GiB). One number for both readers: the
+/// budget derived below and the pre-pin gate in `residency::build`.
+pub fn ram_margin_bytes() -> u64 {
+    std::env::var("CROW_RAM_MARGIN_GB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(3) << 30
+}
+
+/// The host pinned budget, DERIVED at boot instead of assumed (issue #15).
+///
+/// `cap` is the configured ceiling (`Config::host_pinned_budget`, 46 GiB by
+/// default - the measured ceiling of the 64 GB machine this engine grew up on).
+/// The budget is the smaller of that cap and what this host can really give,
+/// `free_for_pin - margin`, where `free_for_pin` is the reclaimable-aware
+/// figure of `cuda::free_physical_ram_parts` (NOT `MemAvailable`).
+///
+/// A small budget is not a refusal. It is an input to the two-sided loop in
+/// `ThreeStates::allocate`, which RAISES N - more experts hot in VRAM, fewer
+/// pinned - until the cold tier fits, and refuses only when no N satisfies both
+/// sides (`planner_refusal_msg`). Before this, a host with less free RAM than
+/// the hard-coded 46 GiB pinned whatever the cap allowed and then died in the
+/// gate at `residency::build` (the Windows boot of 2026-09-14,
+/// `decode_out/hotfix-serve.log`: "refusing to pin 44.62 GiB with only
+/// 46.47 GiB physical RAM free").
+///
+/// `CROW_PINNED_BUDGET_GB` pins the budget for a measurement and skips the
+/// derivation entirely.
+pub fn derive_host_pinned_budget(cap: u64, log: &mut dyn FnMut(&str)) -> u64 {
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let (free_for_pin, mem_available) = cuda::free_physical_ram_parts();
+    let margin = ram_margin_bytes();
+    let (budget, basis) = match std::env::var("CROW_PINNED_BUDGET_GB").ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(g) => (g << 30, "CROW_PINNED_BUDGET_GB".to_string()),
+        // free_for_pin == 0 means the query failed: keep the configured cap,
+        // the pre-pin gate in residency::build is then the only guard left
+        None if free_for_pin == 0 => (cap, "configured cap, free RAM unknown".to_string()),
+        None => {
+            let room = free_for_pin.saturating_sub(margin);
+            if room < cap {
+                (room, format!("free for pinning {:.2} GiB - margin {:.0} GiB", gib(free_for_pin), gib(margin)))
+            } else {
+                (cap, "configured cap".to_string())
+            }
+        }
+    };
+    log(&format!(
+        "[budget] host pinned budget {:.2} GiB ({basis}); free for pinning {:.2} GiB, MemAvailable {:.2} GiB, cap {:.2} GiB",
+        gib(budget), gib(free_for_pin), gib(mem_available), gib(cap)
+    ));
+    budget
+}
+
 pub struct StateSizes {
     pub kv_bytes: u64,
     pub qsa_keys_bytes: u64,

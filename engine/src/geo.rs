@@ -72,7 +72,10 @@ pub struct Config {
     pub ple_cache_bytes: u64, // hot-row cache, default 128 MB (#16, 2026-09-05; was 1 GB)
     pub prompt_chunk: usize,  // prefill chunk size (correctness stage: 256..512)
     /// pinned-host budget for the cold tier (spec 3.4: ~43-47 GB of 64 GB);
-    /// the loader RAISES N if the cold tier would exceed this
+    /// the loader RAISES N if the cold tier would exceed this. The value here is
+    /// the CAP: `Engine::load` replaces it with
+    /// `manager::derive_host_pinned_budget`, which takes the smaller of this cap
+    /// and the measured `free_for_pin - CROW_RAM_MARGIN_GB` of the running host.
     pub host_pinned_budget: u64,
     /// PLE layer on/off (bisector switch for the parity ladder)
     pub ple: bool,
@@ -107,7 +110,7 @@ impl Default for Config {
             kv: KvDtype::Fp8E4m3,
             ple_cache_bytes: 128 << 20, // #16: measured 2026-09-05, +0.2 % misses vs 1 GB, ~7 units freed
             prompt_chunk: 512,
-            host_pinned_budget: 46 << 30, // measured host ceiling ~48.5 GB, 2.5 GB margin
+            host_pinned_budget: 46 << 30, // CAP: measured host ceiling ~48.5 GB, 2.5 GB margin; the boot derives the rest
             ple: true,
             adapt: Adapt::default(),
         }

@@ -35,7 +35,15 @@ pub struct Cnq {
     pub map_handle: usize,
     /// container path: Drop re-opens it unbuffered once to purge its cached pages
     pub path: String,
+    /// the pending DONTNEED window of `fadvise_consumed`: [lo, hi) of container
+    /// bytes already read and no longer needed in the page cache
+    fadv: (u64, u64),
 }
+
+/// pending bytes that make `Cnq::fadvise_consumed` issue its DONTNEED call.
+/// 64 MiB is one syscall per 36 expert slabs on the sequential cold-tier fill;
+/// smaller only raises the syscall count, larger only delays the reclaim.
+const FADV_BATCH: u64 = 64 << 20;
 
 /// drop the file's pages from the system cache: an open with
 /// FILE_FLAG_NO_BUFFERING while no cached handle exists makes NTFS purge the
@@ -105,6 +113,7 @@ impl Drop for Cnq {
         }
         self.map = 0;
         self.map_handle = 0;
+        self.fadvise_flush();
         // close the cached handle first (the field would drop after this body),
         // then the unbuffered open / fadvise purges the cache
         if let Ok(nul) = std::fs::File::open(NULL_DEVICE) {
@@ -215,7 +224,7 @@ impl Cnq {
         if map == 0 {
             eprintln!("[cnq] file mapping unavailable - seek/read fallback");
         }
-        Cnq { file: f, blob_offset, tensors, map, map_len, map_handle, path: path.to_string() }
+        Cnq { file: f, blob_offset, tensors, map, map_len, map_handle, path: path.to_string(), fadv: (0, 0) }
     }
 
     /// absolute file offset of a tensor byte range (for prefetch touches)
@@ -248,6 +257,9 @@ impl Cnq {
         }
         self.file.seek(SeekFrom::Start(off)).unwrap();
         self.read_exact_into(&mut raw);
+        if t.section != "ple" {
+            self.fadvise_consumed(off, len);
+        }
         raw
     }
 
@@ -261,11 +273,64 @@ impl Cnq {
         }
         self.file.seek(SeekFrom::Start(off)).unwrap();
         self.read_exact_into(&mut raw);
+        if t.section != "ple" {
+            self.fadvise_consumed(off, len);
+        }
         raw
     }
 
     fn read_exact_into(&mut self, buf: &mut [u8]) {
         self.file.read_exact(buf).unwrap();
+    }
+
+    /// Drop the page-cache pages of a range this loader has consumed.
+    ///
+    /// The cold tier and the hot slabs are read once, memcpy'd into pinned or
+    /// device memory, and never read again - but the kernel keeps every byte in
+    /// the page cache, so the model is held TWICE during the load (measured
+    /// 2026-09-17: the page cache grew to 33 GiB while `MemFree` fell to
+    /// 1.15 GiB, and that sustained reclaim pressure is what systemd-oomd kills
+    /// on). `FILE_FLAG_SEQUENTIAL_SCAN` does this on windows; linux needs the
+    /// call. The `ple` section is exempt - it is designed to live in page cache.
+    ///
+    /// Ranges are coalesced while they stay contiguous and flushed at
+    /// `FADV_BATCH`, so a sequential fill pays one syscall per 64 MiB and a
+    /// random one pays one per read. Only pages inside a range already read are
+    /// ever dropped, so no readahead is thrown away and no byte is re-read.
+    fn fadvise_consumed(&mut self, off: u64, len: usize) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if len == 0 || !*ON.get_or_init(|| std::env::var("CROW_CNQ_PURGE").as_deref() != Ok("0")) {
+            return;
+        }
+        let end = off + len as u64;
+        let (lo, hi) = self.fadv;
+        if hi == off && hi > lo {
+            self.fadv = (lo, end);
+        } else {
+            self.fadvise_flush();
+            self.fadv = (off, end);
+        }
+        if self.fadv.1 - self.fadv.0 >= FADV_BATCH {
+            self.fadvise_flush();
+        }
+    }
+
+    /// issue the pending DONTNEED window, if any
+    fn fadvise_flush(&mut self) {
+        let (lo, hi) = std::mem::replace(&mut self.fadv, (0, 0));
+        if hi <= lo {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::posix_fadvise(self.file.as_raw_fd(), lo as libc::off_t,
+                    (hi - lo) as libc::off_t, libc::POSIX_FADV_DONTNEED);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (lo, hi); // windows: FILE_FLAG_SEQUENTIAL_SCAN already does this
     }
 
     pub fn read_f32(&mut self, name: &str, section: &str) -> Vec<f32> {

@@ -496,7 +496,7 @@ pub unsafe fn sync() {
 /// query fails. Pinned allocations cannot be paged, so the loader refuses to
 /// pin more than what is physically free minus a margin (2026-09-04 freeze).
 #[cfg(windows)]
-pub fn free_physical_ram() -> u64 {
+pub fn free_physical_ram_parts() -> (u64, u64) {
     #[repr(C)]
     struct MemStatusEx {
         length: u32,
@@ -511,32 +511,76 @@ pub fn free_physical_ram() -> u64 {
     }
     type FnGms = unsafe extern "system" fn(*mut MemStatusEx) -> i32;
     unsafe {
-        let Ok(lib) = libloading::Library::new("kernel32.dll") else { return 0 };
-        let Ok(f) = lib.get::<FnGms>(b"GlobalMemoryStatusEx\0") else { return 0 };
+        let Ok(lib) = libloading::Library::new("kernel32.dll") else { return (0, 0) };
+        let Ok(f) = lib.get::<FnGms>(b"GlobalMemoryStatusEx\0") else { return (0, 0) };
         let mut st = MemStatusEx {
             length: std::mem::size_of::<MemStatusEx>() as u32,
             memory_load: 0, total_phys: 0, avail_phys: 0, total_page: 0,
             avail_page: 0, total_virtual: 0, avail_virtual: 0, avail_ext_virtual: 0,
         };
-        if f(&mut st) == 0 { return 0 }
-        st.avail_phys
+        if f(&mut st) == 0 { return (0, 0) }
+        // one number on windows: avail_phys already excludes what cannot be paged
+        (st.avail_phys, st.avail_phys)
     }
 }
 
-/// unix twin: MemAvailable from /proc/meminfo (kB), the kernel's own estimate of
-/// what a new allocation can get without swapping - the counterpart of
-/// avail_phys. MemFree alone would ignore the reclaimable page cache and refuse
-/// a cold tier that fits; 0 if /proc is not there.
+/// unix twin. Returns `(free_for_pin, mem_available)`; `(0, 0)` without /proc.
+///
+/// `MemAvailable` is the WRONG input for the pinned tier on this host, low by
+/// tens of GiB, for two reasons (both measured 2026-09-17, issue #15):
+///
+/// - The NVIDIA driver keeps its pinned-page pool after a process exits (about
+///   45 GiB after one engine run). Those pages belong to no process and land in
+///   no /proc/meminfo class, so `MemAvailable` does not see them - yet the next
+///   `cuMemHostAlloc` is served out of that pool, and the pool is handed back
+///   under pressure (`pin_leak` took 8 GiB of WC pinned memory with `MemFree`
+///   unmoved; a cgroup-capped balloon pushed the whole pool back). Without this
+///   every second engine start refused with "only 10.26 GiB physical RAM free".
+/// - The page cache is reclaimable by definition, and the cold-tier fill is
+///   what fills it.
+///
+/// So `free_for_pin` counts what canNOT be reclaimed and subtracts it from
+/// `MemTotal` (all /proc/meminfo field names, kB):
+///
+/// ```text
+/// free_for_pin = MemTotal
+///              - AnonPages   process anonymous memory (swap is not counted on)
+///              - Shmem       tmpfs + shared anon, incl. ShmemHugePages
+///              - SUnreclaim  kernel slab no shrinker can free
+///              - KernelStack - PageTables - Percpu
+/// ```
+///
+/// `Unevictable` and `Mlocked` are deliberately NOT subtracted: an mlocked page
+/// is an anonymous or a shmem page, so it is already inside `AnonPages` /
+/// `Shmem` and subtracting it again would double count (ramfs is the only
+/// unevictable class outside both, and there is none on this host).
+/// `MemFree`, `Buffers`, `Cached` and `SReclaimable` are reclaimable and stay
+/// counted as free. A field the kernel does not expose counts as 0, so the
+/// estimate errs LARGE; the `CROW_RAM_MARGIN_GB` margin, the 46 GiB budget cap
+/// and the pre-pin gate in `residency::build` are what bound it.
 #[cfg(unix)]
-pub fn free_physical_ram() -> u64 {
-    let Ok(txt) = std::fs::read_to_string("/proc/meminfo") else { return 0 };
-    for line in txt.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let Some(kb) = rest.split_whitespace().next() else { return 0 };
-            return kb.parse::<u64>().unwrap_or(0) * 1024;
+pub fn free_physical_ram_parts() -> (u64, u64) {
+    let Ok(txt) = std::fs::read_to_string("/proc/meminfo") else { return (0, 0) };
+    let f = |name: &str| -> u64 {
+        for line in txt.lines() {
+            if let Some(rest) = line.strip_prefix(name) {
+                if rest.starts_with(':') {
+                    return rest[1..].split_whitespace().next()
+                        .and_then(|kb| kb.parse::<u64>().ok()).unwrap_or(0) * 1024;
+                }
+            }
         }
-    }
-    0
+        0
+    };
+    let total = f("MemTotal");
+    let unreclaimable = f("AnonPages") + f("Shmem") + f("SUnreclaim")
+        + f("KernelStack") + f("PageTables") + f("Percpu");
+    (total.saturating_sub(unreclaimable), f("MemAvailable"))
+}
+
+/// the RAM the cold tier may be pinned into (see `free_physical_ram_parts`)
+pub fn free_physical_ram() -> u64 {
+    free_physical_ram_parts().0
 }
 
 // ---------- pinned host memory (zero-copy cold tier, probe 3/4/5 pattern) ----------

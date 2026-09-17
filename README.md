@@ -52,6 +52,26 @@ cargo build --release --bin serve
 engine/target/release/serve.exe --port 8099
 ```
 
+### Run on Linux, from the repository root
+
+```
+tools/serve-linux.sh --port 8099
+```
+
+- The cold expert tier is pinned host memory: unevictable, unswappable, and on this box most
+  of the machine. The kernel's only reclaim target left is the page cache, and `systemd-oomd`
+  fires on memory pressure rather than on exhaustion, so a machine-wide spike takes the
+  desktop down with the engine (issue #15).
+- The launcher puts `serve` in a transient scope (`systemd-run --user --scope
+  --slice=session.slice -p MemorySwapMax=0 -p MemoryHigh=<MemTotal-8G> -p
+  MemoryMax=<MemTotal-6G>`), computing the limits from `/proc/meminfo` `MemTotal`, so the
+  pressure is bounded to one cgroup and the desktop keeps a floor. It is the same shape Crow
+  uses for `llama-server` on Linux.
+- `CUDA_LIB` names the CUDA runtime directory (default `~/.local/share/crow/cuda/lib`, never
+  the `lib/stubs` sibling); every `CROW_*` variable of the caller and every argument are
+  passed through. `docs/env.md` has the host-memory rows the launcher bounds:
+  `CROW_RAM_MARGIN_GB`, `CROW_PINNED_BUDGET_GB`.
+
 ### Check the endpoint after the load
 
 ```
