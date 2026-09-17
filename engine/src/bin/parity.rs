@@ -178,7 +178,7 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
         // same decode-time adaptation knobs as `decode run` (#17/#21):
         // CROW_ADAPT_EVERY=K re-cuts the hot set every K tokens, <= CROW_ADAPT_MAX swaps/layer
         // (#17: from geo::apply_adapt_policy - env in manual mode, else the
-        // long-context switch: stream trickle 7 / 16 / 7 at chunk 2048 only)
+        // long-context switch: stream trickle 7 / 8 / 7 at chunk 2048 only)
         let (adapt_stream, adapt_every, adapt_max) = eng.cfg.adapt.knobs();
         let mut trickle_swaps = 0usize;
         let c0 = eng.drain_counters();

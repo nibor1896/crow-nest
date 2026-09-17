@@ -1630,6 +1630,89 @@ Therefore, as of this section:
   would be — but it is a recommendation, not a measured delta, and this build has no measurement of
   the fixed engine on a compressed container.
 
+**4. Where the milliseconds of a warm turn go, and what the floor is (TASK I, 2026-09-17).** Part 3
+above left the warm-turn floor as "~225 ms fixed per prefill call plus ~0.43 ms per token". It is
+not a fixed cost, and the linear fit hid what it is: **a chunk stages every cold expert its tokens
+route to, once per layer, over PCIe, and that byte count barely follows the token count.** Measured
+with CUDA events around the four spans of every prefill chunk and a byte counter on the staging
+copies of `moe_run` (the `CROW_PF_ASYNC=2` copy-engine branch), on the same 6-turn replay, warm turn
+1 (42 new ids on a 3,296-token prefix), `1032bc5` against this build:
+
+| span | what runs in it | before | after |
+|---|---|---|---|
+| rollback (`[cache] reset`) | 130.6 MB HtoD, pageable | 9.5 ms | 9.6 ms |
+| prefill, pre-MoE | HC x2, GDN/attention, PLE, the two residual injects, 48 layers | 55.2 ms | 54.8 ms |
+| prefill, router + plan | router GEMV, `router_top10`, `moe_count` / `moe_plan` / `moe_scatter` | 7.0 ms | 7.0 ms |
+| prefill, MoE group loop | the staging copies and the tile GEMMs they feed | 205.8 ms (10,122 MB at 49.2 GB/s) | 192.8 ms (9,431 MB at 48.9 GB/s) |
+| prefill, head | mixer, `lm_head`, `argmax` | 1.4 ms | 1.4 ms |
+| snapshot (`[cache] snapshot point 1`) | 130.6 MB DtoH, pageable | 45.5 ms (8.8 once the pages exist) | 8.8 ms |
+| **time to first token** | the sum, which is what the caller waits | **324.1 ms** | **271.8 ms** |
+
+The four prefill spans are CUDA-event spans from the instrumented arms (a temporary build, stripped
+before the gates; it costs nothing — the same replay reads 267.7 ms of mean warm prefill with it and
+267.1 without). The other three rows and the total are the paired cold-state runs of the clean
+binaries. The two prefill readings agree: 55.2 + 7.0 + 205.8 + 1.4 = 269.4 against 269.1 ms measured
+before, 54.8 + 7.0 + 192.8 + 1.4 = 256.0 against 252.9 after, the 2.3 ms difference being the empty
+tile groups the "after" instrumented arm still launched (it carries the tick change, not the group
+bound — the two changes were measured on separate arms so that neither hides the other).
+
+Read the group-loop row first: **10.1 GB over PCIe for 42 new tokens**, 3,661 expert copies of
+2.76 MB (1,843,200 B gate_up + 921,600 B down), 76 cold experts per layer of the 144 distinct
+experts those 420 combos route to, at 48 to 49 GB/s against the 55 GB/s of `pcie_probe` variant f.
+Three quarters of a warm turn is that transfer, and the rest of the turn is small next to it. The
+byte count is a property of the ROUTING, not of `t`: over the six turns of the replay it reads
+10,122 / 11,504 / 9,704 / 8,737 / 8,247 / 7,462 MB for 42 / 66 / 62 / 39 / 101 / 85 new ids — the
+101-token turn moves 19 % FEWER bytes than the 42-token one. That is why prefill looked like a fixed
+cost per call: a chunk of 40 tokens already touches most of the cold experts a chunk of 100 would.
+
+What is therefore NOT the cost, each measured rather than assumed:
+
+- the decode graph, rebuilt on every request by design (`reset.rs`, the A4 teardown): **1.4 ms** of
+  `EndCapture` + `Instantiate` plus 0.55 ms of eager issue, and the first `decode_step` of a request
+  is 20 to 31 ms against a 17 to 25 ms steady step. Not worth caching across requests;
+- the stream trickle: it ticks inside the decode loop and its copies are parked behind the graph
+  launch (`#63b`), so no swap is on the prefill's critical path. It is not a cost at all — it is the
+  one thing that makes the next turn cheaper (below);
+- the PLE, after TASK H: **6 to 9 ms** of host time per warm turn, inside the pre-MoE span;
+- the host: 0.2 ms of embedding assembly, 8 ms of copy issue, 10 ms of group-loop launch issue, all
+  of it behind a device that is 180 ms busy;
+- the empty tile groups: the host used to run the group loop over the worst case a host that has not
+  seen the plan must assume (`E + t * TOPK / 8` tiles = 9 groups of 64 for a 42-token chunk), while
+  the plan holds 144 tiles = 3 groups. The six empty groups per layer launched five kernels each
+  that every block exited on `ti >= n_tiles`, and made the two streams wait on each other's events
+  for nothing: **2.3 ms** per turn, now not launched (`gen.rs`, the `ce` branch reads the plan
+  anyway, so the loop bound is the real tile count).
+
+What moved the number is the **hot set**, through the tick interval of the stream trickle. Each
+expert the hot set does not hold is 2.76 MB over PCIe for every layer that routes to it, every turn,
+for as long as the conversation stays on the same material — and #17 cut the tick at one per 16
+decode tokens on single-prompt evidence, where the hot set has exactly one prefill to be wrong
+about. At one tick per 8 the hot set converges to the conversation in half the tokens:
+
+| trickle | staged cold bytes, turn 1 -> turn 6 | prefill ms (mean, turns 1-6) | decode ms (6 turns) | swaps |
+|---|---|---|---|---|
+| every 16 (#17) | 10,122 -> 7,462 MB | 267.7 | 5,219 | 4,030 |
+| every 8 (this build) | 9,431 -> 6,301 MB | 231.3 | 5,033 | 9,160 |
+| every 4 | 8,098 -> 5,980 MB | 209.3 | 5,128 | 16,134 |
+| no trickle (`CROW_ADAPT_STREAM=0`) | 9,790 -> 12,809 MB | 312.5 | 6,056 | 0 |
+
+The ids of all four arms are identical turn for turn: a swap moves bytes between residency tiers and
+never changes a number, which is what makes this a free lever. `every 4` is measured and not taken:
+it buys 22 ms more of prefill for twice the swap traffic again, a total turn time inside 0.6 % of
+`every 8`, and a `CROW_ADAPT_DECAY` window four decode tokens long to rank a 512-expert layer with.
+The last row is the control: without adaptation the staged bytes GROW over the session, because the
+sidecar hot set was cut on another workload.
+
+The floor that remains is the first row of the same arithmetic: **a turn must move the cold experts
+its new tokens route to and the hot set does not hold, once per layer, and the PCIe link does that
+at about 49 GB/s.** Nothing in the loop is compute-bound, the copy engine is inside 12 % of what
+`pcie_probe` measures for it, and the 55 ms of pre-MoE compute per turn is time the copy engine
+cannot use because the routing of layer `l` is not known until layer `l` has run. The levers left
+are all "fewer bytes": a hot set that matches the session (the trickle, above — `every 4` shows it
+is not exhausted), more VRAM for the hot set (the planner already maximizes N against a 262k-context
+KV budget; N=155 with 7 slots surrendered to the trickle), or a cold tier that is smaller per expert
+(a low-bit tier, which is not bit-identical and therefore not this).
+
 ## Section 8 — the code map (2026-09-17)
 
 Sections 0 to 7 say what the engine must do. This section says how the crate is put together,

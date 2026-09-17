@@ -1866,7 +1866,7 @@ fn chat_generate(
     let mut decode_ms = 0.0f64;
     // #37: the stream trickle, one tick per `decode_step`, the mirror of `decode.rs:224-231`.
     // `cfg.adapt` is what `apply_adapt_policy` (geo.rs:167-176) gave this process: with
-    // `CROW_ADAPT_STREAM` unset and chunk 2048 that is stream / 7 spare / every 16 / max 7.
+    // `CROW_ADAPT_STREAM` unset and chunk 2048 that is stream / 7 spare / every 8 / max 7.
     // `decode.rs` ticks for `i in 1..gen`, that is before every `decode_step` EXCEPT the
     // first; loop index `i` here names the same token, so the guard is the same `i > 0`.
     let (adapt_stream, adapt_every, adapt_max) = srv.eng.cfg.adapt.knobs();

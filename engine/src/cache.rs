@@ -267,6 +267,24 @@ struct Snapshot {
     qsa_ring: Vec<Vec<f32>>,
 }
 
+/// - `vec![0f32; n]`, with every page of it faulted in before it is returned
+/// - TASK I: `vec![0f32; n]` is a `calloc`, so its pages are the shared zero page
+///   until something WRITES them. The first `snapshot` into a fresh slot therefore
+///   paid one minor fault per 4 KiB inside the request: measured on the 130 MB slot
+///   of a 262k-context load, 45.5 / 43.7 / 38.4 ms for the first three snapshots of
+///   a process against 8.8 ms once the pages are there. The slots are allocated at
+///   boot, where no request is waiting, so the faults belong here.
+/// - the store is `write_volatile` because the value written is the value already
+///   there, and nothing else may read it: a plain store would be dead code
+fn faulted(n: usize) -> Vec<f32> {
+    let mut v = vec![0f32; n];
+    // one store per 4 KiB page = one f32 every 1024
+    for i in (0..n).step_by(1024) {
+        unsafe { std::ptr::write_volatile(v.as_mut_ptr().add(i), 0f32) };
+    }
+    v
+}
+
 impl Snapshot {
     /// allocate once; every later snapshot writes into these buffers
     fn new(shape: &Shape) -> Snapshot {
@@ -274,11 +292,11 @@ impl Snapshot {
             pos: None,
             prefill_clean: false,
             done_blocks: 0,
-            gdn_s: (0..shape.gdn_layers).map(|_| vec![0f32; GDN_S_STATE]).collect(),
-            gdn_conv: (0..shape.gdn_layers).map(|_| vec![0f32; GDN_CONV_STATE]).collect(),
-            ple_state: vec![0f32; PLE_STATE],
+            gdn_s: (0..shape.gdn_layers).map(|_| faulted(GDN_S_STATE)).collect(),
+            gdn_conv: (0..shape.gdn_layers).map(|_| faulted(GDN_CONV_STATE)).collect(),
+            ple_state: faulted(PLE_STATE),
             qsa_ring: (0..shape.attn_layers)
-                .map(|_| vec![0f32; shape.qsa_ring_len])
+                .map(|_| faulted(shape.qsa_ring_len))
                 .collect(),
         }
     }

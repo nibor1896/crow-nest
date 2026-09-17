@@ -55,6 +55,10 @@ pub const CHUNK_CAP: usize = 4096;
 /// arms the trickle, and the 4096 experiment of 2026-09-14 collapsed the live
 /// serve prefill because the trickle/adapt policy is tuned for THIS number.
 pub const TRICKLE_CHUNK_THRESHOLD: usize = 2048;
+/// Decode tokens between two trickle ticks in the long-context policy (TASK I,
+/// 2026-09-17: 8, was 16 since #17 — the table in `apply_adapt_policy` says what
+/// each value measured on the multi-turn serve shape and on the 16k single prompt).
+pub const TRICKLE_EVERY: usize = 8;
 
 // ---- units and default artefact paths ----
 
@@ -221,12 +225,36 @@ pub fn apply_chunk_policy(cfg: &mut Config, n_prompt: usize) {
 /// spares come out of a hot set that no longer covers the routing) and loses
 /// 0.2 to 1.0 tok/s on every prompt at chunk 512 (N 157 already covers it, the
 /// seven surrendered slots are pure cost). So the trickle is a long-context
-/// switch: with `CROW_ADAPT_STREAM` unset, chunk >= 2048 gets stream / 7 / 16 / 7
+/// switch: with `CROW_ADAPT_STREAM` unset, chunk >= 2048 gets stream / 7 / 8 / 7
 /// regardless of `CROW_ADAPT_EVERY` / `CROW_ADAPT_MAX` (which keep describing
 /// the short-prompt form), a smaller chunk gets the compute-stream swaps from
 /// `CROW_ADAPT_EVERY` (default 0 = none) / `CROW_ADAPT_MAX` (default 8) with
 /// `CROW_ADAPT_SPARE` (default 0). `CROW_ADAPT_STREAM=1` / `=0` is the manual
 /// mode: every knob from its own variable, spare default 1 / 0, no policy.
+///
+/// TASK I, 2026-09-17: the tick interval is 8, not the 16 of #17. #17 measured
+/// ONE prompt per process, where the hot set has one prefill to be wrong about;
+/// a chat session prefills a new turn against the same document again and again,
+/// and every expert the hot set does not hold is 2.76 MB over PCIe per turn per
+/// layer that holds it. On robin's 6-turn replay (3,296-token prefix, turns of
+/// 39 to 101 new ids, `CROW_CHUNK=2048`) the staged cold bytes per warm turn and
+/// the prefill wall read, mean over turns 1-6:
+///
+/// | every | cold bytes staged, turn 1 -> turn 6 | prefill ms | decode ms (6 turns) | swaps |
+/// |---|---|---|---|---|
+/// | 16 (#17) | 10.1 GB -> 7.9 GB | 267.7 | 5216 | 4,030 |
+/// | 8 (this) | 9.4 GB -> 6.3 GB | 231.3 | 5033 | 9,160 |
+/// | 4 | 8.1 GB -> 6.0 GB | 209.3 | 5128 | 16,134 |
+///
+/// and the ids of all three arms are identical, turn for turn (a swap moves
+/// bytes between tiers, it never changes a number). 8 is the value taken: it
+/// wins on both shapes measured (the replay above and `decode run` on the 16k
+/// t1-read prompt: 26.89 / 26.89 ms per decode token at 16 against 26.76 / 26.68
+/// at 8, cold experts per token 230.9 -> 216.5). 4 buys another 22 ms of prefill
+/// but doubles the swap traffic again for a total turn time inside 0.6 % of 8,
+/// and it ranks the hot set on a `CROW_ADAPT_DECAY` window of four decode tokens.
+/// Both stay reachable through the manual mode (`CROW_ADAPT_STREAM=1` plus
+/// `CROW_ADAPT_EVERY`).
 pub fn apply_adapt_policy(cfg: &mut Config) {
     let num = env_parse::<usize>;
     let (every, max, spare) = (num("CROW_ADAPT_EVERY"), num("CROW_ADAPT_MAX"), num("CROW_ADAPT_SPARE"));
@@ -234,7 +262,7 @@ pub fn apply_adapt_policy(cfg: &mut Config) {
     cfg.adapt = match stream.as_deref() {
         Some("1") => Adapt { stream: true, spare: spare.unwrap_or(1), every: every.unwrap_or(0), max: max.unwrap_or(8) },
         Some(_) => Adapt { stream: false, spare: spare.unwrap_or(0), every: every.unwrap_or(0), max: max.unwrap_or(8) },
-        None if cfg.prompt_chunk >= TRICKLE_CHUNK_THRESHOLD => Adapt { stream: true, spare: 7, every: 16, max: 7 },
+        None if cfg.prompt_chunk >= TRICKLE_CHUNK_THRESHOLD => Adapt { stream: true, spare: 7, every: TRICKLE_EVERY, max: 7 },
         None => Adapt { stream: false, spare: spare.unwrap_or(0), every: every.unwrap_or(0), max: max.unwrap_or(8) },
     };
     let a = cfg.adapt;

@@ -2640,6 +2640,16 @@ impl Engine {
                 for &id in &self.res.sets[l] { if (id as usize) < E { hot[id as usize] = true; } }
                 (tl, hot)
             } else { (Vec::new(), Vec::new()) };
+            // TASK I: the loop bound above is the WORST CASE a host that has not seen
+            // the plan must assume (`E + t * TOPK / 8`: every expert routed, every tile
+            // full). With `ce` the plan is already on the host, so the loop runs over the
+            // groups that HOLD tiles: a 42-token serve turn plans 144 tiles per layer =
+            // 3 groups of 64, not 9, and the six empty ones launched five kernels each
+            // whose every block exits on `ti >= n_tiles` (`kernels.rs`, the four tile
+            // kernels + `stage_tiles`) and made the compute and staging streams wait on
+            // each other's events for nothing. Nothing that ran is dropped, so the bytes
+            // are identical by construction; the non-`ce` modes keep the bound.
+            let n_groups = if ce { ((tiles_h.len() / 4).div_ceil(tg)).max(1) } else { n_groups };
             // staging of one tile group (side stream + slot set gi%2 with CROW_PF_ASYNC)
             let stage_group = |gi: usize| unsafe {
                 let grp = st.grp as u64 + (gi * 4) as u64;
