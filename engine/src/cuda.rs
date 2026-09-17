@@ -223,10 +223,33 @@ pub unsafe fn compile(src: &str) -> Module {
     Module(m)
 }
 
+/// The one CUDA result check. It PANICS, except while a panic is already
+/// unwinding: a second panic raised inside a `Drop` during cleanup is not a
+/// panic, it is an immediate `abort` plus a full core dump ("panic in a
+/// destructor during cleanup"). Measured 2026-09-17: a `CROW_KPROF=1` run under
+/// `CROW_GRAPH=1` died in the first captured decode token with
+/// `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`, and the `Engine` / `ThreeStates`
+/// teardown that followed turned that ordinary panic into SIGABRT and 958 MB of
+/// core (`d2f069b` incident 2). While `std::thread::panicking()` is on the only
+/// code that runs IS the teardown, and a CUDA call that fails there is not
+/// recoverable and never worth losing the original panic over - so it is logged
+/// and the unwind continues to an ordinary panic exit. Nothing changes on any
+/// normal path: the same call, the same check, the same panic.
 pub fn ck(r: CUresult) {
-    if r != CUresult::CUDA_SUCCESS {
-        panic!("CUDA error: {r:?}");
+    ck_call("a CUDA call", r);
+}
+
+/// `ck` that names the call in the teardown line; the two frees use it, because
+/// "which free failed" is the one thing that line has to say.
+fn ck_call(call: &str, r: CUresult) {
+    if r == CUresult::CUDA_SUCCESS {
+        return;
     }
+    if std::thread::panicking() {
+        eprintln!("[drop] {call}: CUDA error: {r:?} - ignored, the unwind continues");
+        return;
+    }
+    panic!("CUDA error: {r:?}");
 }
 
 pub struct Ctx {
@@ -344,7 +367,7 @@ pub unsafe fn alloc_zeroed(bytes: usize) -> CUdeviceptr {
 
 pub unsafe fn free_dev(d: &mut CUdeviceptr) {
     if *d != 0 {
-        ck(sys::cuMemFree_v2(*d));
+        ck_call("cuMemFree_v2", sys::cuMemFree_v2(*d));
         live_allocs().lock().unwrap().remove(&(*d as u64));
         *d = 0;
     }
@@ -639,9 +662,11 @@ impl Pinned {
         std::ptr::copy_nonoverlapping(v.as_ptr(), (self.host as *mut u8).add(offset), v.len());
     }
 
+    /// the pinned twin of `free_dev`: the same `cuMemFreeHost`, and the same
+    /// teardown rule (`ck_call` - logged instead of aborting a live unwind)
     pub unsafe fn free(&mut self) {
         if !self.host.is_null() {
-            ck(sys::cuMemFreeHost(self.host));
+            ck_call("cuMemFreeHost", sys::cuMemFreeHost(self.host));
             self.host = std::ptr::null_mut();
             self.dev = 0;
         }

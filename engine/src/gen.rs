@@ -692,6 +692,17 @@ impl Engine {
         persist: bool,
         log: &mut dyn FnMut(&str),
     ) -> Engine {
+        // CROW_KPROF syncs the stream before AND after every launch; inside an
+        // open decode-graph capture a sync is CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED,
+        // so the pair used to die on the first captured decode token and then abort
+        // the process in a destructor (2026-09-17, `d2f069b` incident 2). Both
+        // switches are readable before anything is allocated, so the refusal costs
+        // milliseconds instead of a 24 s load and a gigabyte of core. No new switch:
+        // CROW_GRAPH=0 is the escape, and CROW_STAGE_DMA=1 already forces it off
+        // through graph_on().
+        if std::env::var("CROW_KPROF").is_ok() && graph_on() {
+            panic!("refusing CROW_KPROF with CROW_GRAPH=1: the per-kernel profile syncs the stream before and after every launch, and a sync inside the open decode-graph capture is CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED — the run would die on the first captured decode token. Re-run the measurement with CROW_GRAPH=0, or unset CROW_KPROF");
+        }
         let sec = "text";
         let t0 = std::time::Instant::now();
         engine_lock_acquire();
