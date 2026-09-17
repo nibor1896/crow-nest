@@ -32,7 +32,7 @@ fn main() {
         let bytes = cuda::alloc_zeroed(n);
         let back = cuda::alloc_zeroed(n * 4);
         let n_dev = cuda::to_i32_dev(&[n as i32]);
-        crow_nest_engine::gen::launch_sync(k.f("cast_e4m3_flat"), ((n as u32) + 255) / 256, 1, 1, 256, &[
+        crow_nest_engine::kernels::launch_sync(k.f("cast_e4m3_flat"), ((n as u32) + 255) / 256, 1, 1, 256, &[
             x as u64, bytes as u64, n_dev as u64]);
         let host_bytes = {
             let mut v = vec![0u8; n];
@@ -40,7 +40,7 @@ fn main() {
                 v.as_mut_ptr() as *mut std::ffi::c_void, bytes, n));
             v
         };
-        crow_nest_engine::gen::launch_sync(k.f("dec_e4m3_flat"), ((n as u32) + 255) / 256, 1, 1, 256, &[
+        crow_nest_engine::kernels::launch_sync(k.f("dec_e4m3_flat"), ((n as u32) + 255) / 256, 1, 1, 256, &[
             bytes as u64, back as u64, n_dev as u64]);
         let host_back = cuda::dtoh(back, n);
 

@@ -68,7 +68,7 @@ fn main() {
                     cfg.prompt_chunk = tf_split;
                 }
                 std::fs::create_dir_all(&out).unwrap();
-                let (mut eng, _rep) =
+                let mut eng =
                     Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
                 println!("decode/parity: {} prompt tokens ({} prefilled, {} teacher-forced), collecting all logits …",
                     ids.len(), tf_split, ids.len() - tf_split);
@@ -85,10 +85,7 @@ fn main() {
                 if tf_split < ids.len() {
                     println!("teacher-forced decode: {} steps, engine greedy trace {:?}", ids.len() - tf_split, tf_trace);
                 }
-                if std::env::var("CROW_ADAPT").as_deref() == Ok("1") {
-                    // CROW_ADAPT_MAX0=<n>: cap the post-prefill swaps per layer (#21); 0 = unbounded
-                    let cap0: usize = std::env::var("CROW_ADAPT_MAX0").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-                    let sw = eng.adapt_hot_set(cap0);
+                if let Some((sw, _)) = eng.adapt_after_prefill() {
                     println!("adapt: {sw} hot-slot swaps");
                 }
 
@@ -140,17 +137,14 @@ fn main() {
                 // #16: CROW_CHUNK explicit, else auto by prompt length (geo.rs)
                 crow_nest_engine::geo::apply_chunk_policy(&mut cfg, ids.len());
                 std::fs::create_dir_all("decode_out").unwrap();
-                let (mut eng, _rep) =
+                let mut eng =
                     Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
                 println!("decode/run: {} prompt tokens → {gen} steps", ids.len());
                 let t0 = std::time::Instant::now();
                 let mut next = eng.prefill(&mut cnq, &ids, None);
                 let prefill_s = t0.elapsed().as_secs_f64();
-                if std::env::var("CROW_ADAPT").as_deref() == Ok("1") {
-                    let ta = std::time::Instant::now();
-                    // CROW_ADAPT_MAX0=<n>: cap the post-prefill swaps per layer (#21); 0 = unbounded
-                    let cap0: usize = std::env::var("CROW_ADAPT_MAX0").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-                    let sw = eng.adapt_hot_set(cap0);
+                let ta = std::time::Instant::now();
+                if let Some((sw, _)) = eng.adapt_after_prefill() {
                     println!("adapt: {sw} hot-slot swaps from the prompt routing in {:.2} s", ta.elapsed().as_secs_f64());
                 }
                 println!(
@@ -268,7 +262,7 @@ fn main() {
                     cold as f64 / gen_timed * (eng.res.gu_bytes + eng.res.dn_bytes) as f64 / 1e6);
                 crow_nest_engine::gen::stage_dma_report(gen_timed as u64);
             if std::env::var("CROW_PROFILE").is_ok() {
-                crow_nest_engine::gen::prof::kprof_report(gen as u64);
+                crow_nest_engine::kernels::kprof_report(gen as u64);
                 crow_nest_engine::gen::prof::report();
             }
                 println!(
@@ -308,7 +302,7 @@ fn main() {
                 cfg.context = CONTEXT_FLOOR;
                 std::env::set_var("CROW_ROUTE_DUMP", "1");
                 std::env::set_var("CROW_GRAPH", "0");
-                let (mut eng, _rep) =
+                let mut eng =
                     Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
                 let t0 = std::time::Instant::now();
                 let mut next = eng.prefill(&mut cnq, &ids, None);
@@ -345,7 +339,7 @@ fn main() {
                 cfg.context = CONTEXT_FLOOR;
                 cfg.n_hot = n;
                 let even: [[u64; E]; LAYERS] = [[1u64; E]; LAYERS];
-                let (mut eng, _rep) =
+                let mut eng =
                     Engine::load(&mut cnq, cfg, Some(&even), &out, false, &mut |m| println!("[load] {m}"));
                 println!("warmup: prefill over {} real tokens (chunk {}) …", ids.len(), cfg.prompt_chunk);
                 let t0 = std::time::Instant::now();
@@ -386,7 +380,7 @@ fn main() {
                 let f0 = crow_nest_engine::cuda::free_vram_bytes();
                 println!("reloadcheck: free VRAM before any load {:.1} MB", f0 as f64 / 1e6);
                 for i in 0..n {
-                    let (mut eng, _rep) =
+                    let mut eng =
                         Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |_| {});
                     let ids = [760i64, 3841, 13477, 37550, 33075, 888, 279, 15217];
                     let mut next = eng.prefill(&mut cnq, &ids, None);
@@ -406,7 +400,7 @@ fn main() {
                 // oracle/golden/layer0-input.f32, run layer 0, compare to
                 // oracle/golden/layer0-golden-output.f32
                 cfg.context = CONTEXT_FLOOR;
-                let (mut eng, _rep) =
+                let mut eng =
                     Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
                 let inp = std::fs::read("../oracle/golden/layer0-input.f32").unwrap();
                 let gold = std::fs::read("../oracle/golden/layer0-golden-output.f32").unwrap();
@@ -435,7 +429,7 @@ fn main() {
                 // Reference marks (p16, all-proj FP4 vs this golden): rel_L2
                 // 0.165, max_abs 0.582 — the "expected bad" FP4 attention delta.
                 cfg.context = CONTEXT_FLOOR;
-                let (mut eng, _rep) =
+                let mut eng =
                     Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
                 let to_f32 = |b: &[u8]| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>();
                 let inp = std::fs::read("../oracle/golden/layer3-attn-input.f32").unwrap();

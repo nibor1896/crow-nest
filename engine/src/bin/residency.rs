@@ -33,10 +33,6 @@ fn demo_tokenize(text: &str, max_tokens: usize) -> Vec<i64> {
     out
 }
 
-fn totals(c: &[[u64; 2]]) -> (u64, u64) {
-    (c.iter().map(|x| x[0]).sum(), c.iter().map(|x| x[1]).sum())
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let warm_tokens: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(384);
@@ -62,7 +58,7 @@ fn main() {
         } else {
             println!("residency: warm-up phase on {warm_tokens} demo tokens …");
             let even: [[u64; E]; LAYERS] = [[1u64; E]; LAYERS];
-            let (mut eng0, _) = Engine::load(&mut cnq, cfg, Some(&even), &sidecar, false, &mut |m| {
+            let mut eng0 = Engine::load(&mut cnq, cfg, Some(&even), &sidecar, false, &mut |m| {
                 eprintln!("[load0] {m}");
             });
             let warm_ids = demo_tokenize(WARMUP, warm_tokens);
@@ -98,7 +94,7 @@ fn main() {
             drop(eng0);
         }
 
-        let (mut eng, _rep) =
+        let mut eng =
             Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| eprintln!("[load] {m}"));
         println!(
             "residency ready: N={} ({}) — pinned cold tier {:.2} GiB",

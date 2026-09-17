@@ -94,8 +94,6 @@ pub struct ExpertSlabs {
     pub dn_bytes: u64,
     pub gu_gs: f32,
     pub dn_gs: f32,
-    pub gu_tensor: String,
-    pub dn_tensor: String,
 }
 
 pub fn expert_slab_info(cnq: &Cnq, layer: usize, section: &str) -> ExpertSlabs {
@@ -106,12 +104,8 @@ pub fn expert_slab_info(cnq: &Cnq, layer: usize, section: &str) -> ExpertSlabs {
         dn_bytes: Cnq::byte_len(dn) / E as u64,
         gu_gs: gu.global_scale,
         dn_gs: dn.global_scale,
-        gu_tensor: gu.name.clone(),
-        dn_tensor: dn.name.clone(),
     }
 }
-
-pub const SIDECAR_SUFFIX: &str = ".hotsets.json";
 
 /// Clamp ue4m3 scale byte 0x7F (the E4M3 NaN encoding) to 0x7E (448, the
 /// hardware-representable max) in a raw expert slab. The container format's
@@ -498,7 +492,7 @@ impl Residency {
             let mut db = cuda::to_u64_dev(&b);
             let mut nb = cuda::to_i32_dev(&[bytes as i32]);
             let split: u32 = 8;
-            crate::gen::launch_v(k.f("swap_pairs"), pairs.len() as u32, split, 1, 256, &[da, db, nb]);
+            crate::kernels::launch_v(k.f("swap_pairs"), pairs.len() as u32, split, 1, 256, &[da, db, nb]);
             cuda::sync();
             cuda::free_dev(&mut da);
             cuda::free_dev(&mut db);
@@ -534,8 +528,8 @@ impl Residency {
         let cs = *self.cold_index[l].get(&new_id).expect("full tier: every expert has a record");
         let rec_gu = self.cold_gu[l].dev as u64 + cs as u64 * lb.gu_rec;
         let rec_dn = self.cold_dn[l].dev as u64 + cs as u64 * lb.dn_rec;
-        crate::gen::launch_v(k.f("expand_slab"), 200, 1, 1, 256, &[rec_gu, dst_gu, nblk_gu as u64, lb.bits_dev as u64, lb.lut_dev as u64]);
-        crate::gen::launch_v(k.f("expand_slab"), 100, 1, 1, 256, &[rec_dn, dst_dn, nblk_dn as u64, lb.bits_dev as u64, lb.lut_dev as u64]);
+        crate::kernels::launch_v(k.f("expand_slab"), 200, 1, 1, 256, &[rec_gu, dst_gu, nblk_gu as u64, lb.bits_dev as u64, lb.lut_dev as u64]);
+        crate::kernels::launch_v(k.f("expand_slab"), 100, 1, 1, 256, &[rec_dn, dst_dn, nblk_dn as u64, lb.bits_dev as u64, lb.lut_dev as u64]);
         self.sets[l][slot] = new_id;
     }
 

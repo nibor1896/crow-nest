@@ -23,7 +23,7 @@
 //! error text as "not available", never skipped. Group filter on argv:
 //! `pcie_probe base i j k l x m` (no argument runs every group).
 use crow_nest_engine::cuda::{self, Pinned};
-use crow_nest_engine::gen::launch_v;
+use crow_nest_engine::kernels::launch_v;
 use cudarc::driver::sys;
 
 const SRC: &str = r#"

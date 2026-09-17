@@ -51,14 +51,6 @@ extern "C" __global__ void mma_sf_probe(const unsigned int* a_frag,
 }
 "#;
 
-const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-
-#[allow(dead_code)]
-fn dec_e2m1(n: u32) -> f32 {
-    let v = E2M1[(n & 7) as usize];
-    if n & 8 != 0 { -v } else { v }
-}
-
 #[allow(dead_code)]
 fn dec_ue4m3(b: u32) -> f32 {
     let e = (b >> 3) & 0xF;

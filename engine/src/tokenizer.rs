@@ -335,13 +335,6 @@ impl ChatTokenizer {
             .map_err(|e| format!("decode failed: {e}"))
     }
 
-    /// `tok.decode(ids, skip_special_tokens=False)`, for stop token inspection
-    pub fn decode_with_specials(&self, ids: &[u32]) -> Result<String, String> {
-        self.tok
-            .decode(ids, false)
-            .map_err(|e| format!("decode failed: {e}"))
-    }
-
     /// id of a special token, e.g. `<|im_end|>` as the stop token for A4
     pub fn token_id(&self, token: &str) -> Option<u32> {
         self.tok.token_to_id(token)

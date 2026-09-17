@@ -32,7 +32,7 @@
 //! usage: router_probe
 use crow_nest_engine::cuda;
 use crow_nest_engine::sample::Rng;
-use crow_nest_engine::gen::launch_v;
+use crow_nest_engine::kernels::launch_v;
 
 /// uniform in [-a, a] over the shared deterministic xorshift64* stream
 fn uni(rng: &mut Rng, a: f32) -> f32 {
@@ -49,7 +49,7 @@ fn top10(v: &[f32]) -> Vec<usize> {
     idx
 }
 
-fn probe_one(label: &str, t: usize, rows: usize, k: usize, r: &[f32], c: &[f32]) -> bool {
+fn probe_one(label: &str, t: usize, rows: usize, r: &[f32], c: &[f32]) -> bool {
     let mut max_abs: f32 = 0.0;
     let mut raw_rel: f32 = 0.0;
     let mut mask_rel: f32 = 0.0;
@@ -192,8 +192,8 @@ fn main() {
                 );
             }
 
-            ok &= probe_one("gemm_bf16_dense (8-token tiles)", t, ROWS, K, &r, &g8);
-            ok &= probe_one("gemm_bf16_dense_b (32-token tiles)", t, ROWS, K, &r, &g32);
+            ok &= probe_one("gemm_bf16_dense (8-token tiles)", t, ROWS, &r, &g8);
+            ok &= probe_one("gemm_bf16_dense_b (32-token tiles)", t, ROWS, &r, &g32);
 
             cuda::free_dev(&mut { d_w });
             cuda::free_dev(&mut { d_wb });

@@ -54,7 +54,8 @@ pub fn ram_margin_bytes() -> u64 {
 /// derivation entirely.
 pub fn derive_host_pinned_budget(cap: u64, log: &mut dyn FnMut(&str)) -> u64 {
     let gib = |b: u64| b as f64 / GIB;
-    let (free_for_pin, mem_available) = cuda::free_physical_ram_parts();
+    let ram = cuda::free_physical_ram_parts();
+    let (free_for_pin, mem_available) = (ram.free_for_pin, ram.mem_available);
     let margin = ram_margin_bytes();
     let (budget, basis) = match std::env::var("CROW_PINNED_BUDGET_GB").ok().and_then(|v| v.parse::<u64>().ok()) {
         Some(g) => (g << 30, "CROW_PINNED_BUDGET_GB".to_string()),
@@ -70,8 +71,11 @@ pub fn derive_host_pinned_budget(cap: u64, log: &mut dyn FnMut(&str)) -> u64 {
             }
         }
     };
+    // #15 follow-up: the driver's pinned pool counts as free only while we are the
+    // only CUDA process; with another one alive the figure IS MemAvailable
+    let basis_ram = if ram.other_cuda { " (another CUDA process is alive: using MemAvailable)" } else { "" };
     log(&format!(
-        "[budget] host pinned budget {:.2} GiB ({basis}); free for pinning {:.2} GiB, MemAvailable {:.2} GiB, cap {:.2} GiB",
+        "[budget] host pinned budget {:.2} GiB ({basis}); free for pinning {:.2} GiB{basis_ram}, MemAvailable {:.2} GiB, cap {:.2} GiB",
         gib(budget), gib(free_for_pin), gib(mem_available), gib(cap)
     ));
     budget
@@ -168,12 +172,10 @@ impl ThreeStates {
         // TWO-sided: VRAM lowers N, the HOST pinned budget RAISES it (fewer
         // cold experts) — measured host ceiling ~48.5 GB on this machine.
         let mut n = cfg.n_hot;
-        let states_bytes = |n: usize| {
-            let s = StateSizes::plan(cfg.context, cfg.kv, cfg.prompt_chunk);
-            s.kv_bytes + s.qsa_keys_bytes + s.qsa_pooled_bytes + s.gdn_s_bytes
-                + s.gdn_conv_bytes + s.rope_bytes
-        };
-        let mut sizes = StateSizes::plan(cfg.context, cfg.kv, cfg.prompt_chunk);
+        let sizes = StateSizes::plan(cfg.context, cfg.kv, cfg.prompt_chunk);
+        // the state bytes do not depend on N (the hot-expert count): one plan for the whole clamp loop
+        let states_bytes = sizes.kv_bytes + sizes.qsa_keys_bytes + sizes.qsa_pooled_bytes
+            + sizes.gdn_s_bytes + sizes.gdn_conv_bytes + sizes.rope_bytes;
         // Termination guard (2026-09-04): when VRAM pushes N down and the host
         // budget pushes it up, no N is feasible. Without this the loop
         // oscillated forever and grew `rep.lines` without bound -> the whole
@@ -183,7 +185,7 @@ impl ThreeStates {
         let mut iters = 0u32;
         let spare = cfg.adapt.spare; // #17: from the policy in geo.rs, not the env
         loop {
-            let sum = states_bytes(n) + pending_bytes + n as u64 * expert_bytes_per_n_unit;
+            let sum = states_bytes + pending_bytes + n as u64 * expert_bytes_per_n_unit;
             let cold = (if cold_fixed { E } else { E - n.min(E) + spare }) as u64 * cold_bytes_per_n_unit;
             if sum + SAFETY < free0 && cold <= cfg.host_pinned_budget {
                 break;
@@ -223,7 +225,7 @@ impl ThreeStates {
             }
             if cfg_n_dbg() {
                 eprintln!("[clamp] n={n} vram_sum={:.0} MB cold={:.0} MB free0={:.0} MB",
-                    states_bytes(n) as f64 / MIB,
+                    states_bytes as f64 / MIB,
                     ((if cold_fixed { E } else { E - n.min(E) + spare }) as u64 * cold_bytes_per_n_unit) as f64 / MIB,
                     free0 as f64 / MIB);
             }
@@ -358,15 +360,6 @@ impl ThreeStates {
                 + kvh * self.context
                 + slot) as u64
             * AHD as u64
-            * b
-    }
-
-    /// byte offset (NOT absolute pointer) of a kv row — kernels take the base
-    pub fn kv_row_offset(&self, layer: usize, is_k: bool, kvh: usize, slot: usize) -> u64 {
-        let b = (self.kv.byte_per_value()) as u64;
-        (((layer * 2 + if is_k { 0 } else { 1 }) * NKV * self.context
-            + kvh * self.context
-            + slot) * AHD) as u64
             * b
     }
 }

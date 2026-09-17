@@ -21,10 +21,6 @@ use crow_nest_engine::cnq::{self, Cnq};
 use crow_nest_engine::geo::*;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-fn e2m1_mag(n: u32) -> f32 {
-    cnq::e2m1(n & 7)
-}
-
 /// nibble of a signed e2m1 level given its magnitude index
 fn nib(mag_idx: u32, neg: bool) -> u32 {
     mag_idx | if neg { 8 } else { 0 }

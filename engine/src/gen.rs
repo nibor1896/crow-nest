@@ -10,10 +10,11 @@
 
 use crate::cuda::{self, CUdeviceptr as Dev};
 use crate::geo::*;
-use crate::kernels::Kernels;
+use crate::kernels::{launch_v, Kernels};
+use crate::weights::{dequant_fp4_dev, load_bf16_twin, load_f32, load_fp4, load_small_f32, Fp4};
 use crate::manager::ThreeStates;
 use crate::residency::{Residency, PendingSwap};
-use crate::cnq::{self, Cnq};
+use crate::cnq::Cnq;
 use std::collections::HashMap;
 
 /// live per-section profile (env CROW_PROFILE=1): CPU-side microseconds per
@@ -55,34 +56,9 @@ pub mod prof {
     pub fn on() -> bool {
         std::env::var("CROW_PROFILE").is_ok()
     }
-    // ---- per-kernel profile (CROW_KPROF=1) ----
-    pub static KPROF: std::sync::Mutex<Option<std::collections::HashMap<String, (u64, u64)>>> =
-        std::sync::Mutex::new(None);
-    pub fn kprof_add(name: String, us: u64) {
-        let mut g = KPROF.lock().unwrap();
-        let m = g.get_or_insert_with(std::collections::HashMap::new);
-        let e = m.entry(name).or_insert((0, 0));
-        e.0 += 1;
-        e.1 += us;
-    }
-    /// per-kernel table (sorted by total time), normalized per `steps`
-    pub fn kprof_report(steps: u64) {
-        let g = KPROF.lock().unwrap();
-        let Some(m) = g.as_ref() else { return };
-        let mut rows: Vec<(&String, &(u64, u64))> = m.iter().collect();
-        rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
-        let total: u64 = rows.iter().map(|r| r.1 .1).sum();
-        let st = steps.max(1) as f64;
-        eprintln!("[kprof] kernel time incl. one launch latency each, over {steps} steps (total {:.1} ms/step)", total as f64 / 1000.0 / st);
-        eprintln!("[kprof] {:<22} {:>9} {:>11} {:>9} {:>6}", "kernel", "calls/step", "ms/step", "us/call", "share");
-        for (n, (c, us)) in rows {
-            eprintln!("[kprof] {:<22} {:>9.1} {:>11.3} {:>9.1} {:>5.1}%", n, *c as f64 / st, *us as f64 / 1000.0 / st, *us as f64 / *c as f64, 100.0 * *us as f64 / total as f64);
-        }
-    }
 }
 
 pub struct Weights {
-    pub layer_sec: String,
     // head
     pub embed_host: Vec<u16>, // [V][H] BF16 bits (keep; rows widen to f32 at gather - halves the host RAM vs f32)
     pub lm_head: Dev,         // BF16 raw [V][2560]
@@ -94,12 +70,6 @@ pub struct Weights {
     pub hc2: Vec<HcW>,
     pub sub: Vec<SubW>,
     pub moe: Vec<MoeW>,
-}
-
-#[derive(Clone, Copy)]
-pub struct Fp4 {
-    pub w: Dev,
-    pub gs: Dev,
 }
 
 /// Projection weight: NVFP4 (dequant on the fly) or BF16 keep (exact bit
@@ -366,7 +336,6 @@ pub struct Engine {
     pub pos: usize,
     pub history: Vec<i64>,
     pub done_blocks: usize,
-    pub p_n: usize,
     pub sel_counts: Dev, // [48][512] u64 per-expert routing counts
     pub cnq: *mut Cnq,   // container handle for PLE row fills (loader thread)
     // ---- CUDA Graphs (CROW_GRAPH=1) ----
@@ -550,7 +519,6 @@ fn gdn_reg_mode() -> u8 {
     static V: OnceLock<u8> = OnceLock::new();
     *V.get_or_init(|| match std::env::var("CROW_GDN_REG").as_deref() { Ok("0") => 0, Ok("p") => 1, Ok("s") => 2, _ => 3 })
 }
-fn gdn_reg_on() -> bool { gdn_reg_mode() != 0 }
 
 /// CROW_PF_DMA=0 disables the copy-engine prefetch of the cold tier during
 /// prefill (a 2-slot VRAM ring of one layer's pinned cold slab; costs
@@ -639,14 +607,6 @@ pub fn stage_blocks() -> u32 {
     *V.get_or_init(|| std::env::var("CROW_STAGE_BLOCKS").ok().and_then(|v| v.parse().ok()).filter(|&g| (8..=512).contains(&g)).unwrap_or(40))
 }
 
-pub struct LoadReport {
-    pub dense_bytes: u64,
-    pub residency_report: Vec<String>,
-    pub states_report: Vec<String>,
-    pub lm_head_bytes: u64,
-    pub ple_cache_bytes: u64,
-}
-
 impl Engine {
     /// Full load: dense weights → states (with N clamp) → residency → scratch.
     /// `warmup_counts` feeds warm-up promotion when no sidecar exists yet.
@@ -657,7 +617,7 @@ impl Engine {
         sidecar_path: &str,
         persist: bool,
         log: &mut dyn FnMut(&str),
-    ) -> (Engine, LoadReport) {
+    ) -> Engine {
         let sec = "text";
         let t0 = std::time::Instant::now();
         engine_lock_acquire();
@@ -676,7 +636,6 @@ impl Engine {
         let lm_t = cnq.find("lm_head.weight", sec).clone();
         let lm_raw = cnq.read_bytes(&lm_t);
         let lm_head = cuda::upload_dev(&lm_raw);
-        let lm_head_bytes = lm_raw.len() as u64;
         drop(lm_raw);
 
         let mx_norm = load_f32(cnq, "model.language_model.hyper_connection_mixer.hc_norm.weight", sec);
@@ -751,7 +710,6 @@ impl Engine {
         let ple_bytes = std::env::var("CROW_PLE_CACHE_MB").ok().and_then(|v| v.parse::<u64>().ok())
             .map(|mb| mb << 20).unwrap_or(cfg.ple_cache_bytes);
         let ple = Ple::load(cnq, ple_bytes);
-        let ple_cache_bytes = ple.n_slots as u64 * (108 + 4);
         log("PLE done — budget verify next");
 
         // ---- #VIT: the visual tower, BEFORE the budget verify (the planner
@@ -901,7 +859,6 @@ impl Engine {
         // (free0 excludes them); pending = launch/param slack only. The old
         // planner double-counted the 1 GiB PLE cache here while the ~0.9 GB
         // scratch went unplanned.
-        let _ = ple_cache_bytes;
         // + the prefetch ring (2 x one layer's cold slab; sized for N down to
         //   n_hot-24, verified after the residency build)
         let ring_reserve = if pf_dma_on() && mma_on() && pf_gemm_on() {
@@ -962,7 +919,6 @@ impl Engine {
         let p = Params::setup(&cfg, &st);
         let sel_counts = cuda::alloc_zeroed(LAYERS * E * 8);
         let w = Weights {
-            layer_sec: sec.to_string(),
             embed_host,
             lm_head,
             mx_norm,
@@ -984,63 +940,51 @@ impl Engine {
             (res.gu_bytes + res.dn_bytes) as f64 / MIB
         ));
 
-        let report = LoadReport {
-            dense_bytes: dense_measured,
-            residency_report: vec![format!("n={} source={}", res.n, res.source)],
-            states_report: st_rep.lines,
-            lm_head_bytes,
-            ple_cache_bytes,
-        };
-
-        (
-            Engine {
-                k,
-                module,
-                st,
-                res,
-                w,
-                ple,
-                p,
-                s,
-                p_n: cfg.prompt_chunk,
-                cfg,
-                pos: 0,
-                history: Vec::new(),
-                done_blocks: 0,
-                sel_counts,
-                stage,
-                pf_ncombo: cuda::to_i32_dev(&[TOPK as i32]),
-                pf_ring_gu: ring_gu,
-                pf_ring_dn: ring_dn,
-                pf_stream,
-                pf_ev_filled: [cuda::event_create(), cuda::event_create()],
-                pf_ev_done: [cuda::event_create(), cuda::event_create()],
-                pf_dma_live: std::cell::Cell::new(false),
-                pa_stream: if pf_async_on() { cuda::stream_create_priority() } else { std::ptr::null_mut() },
-                pa_ev_plan: cuda::event_create(),
-                pa_ev_filled: [cuda::event_create(), cuda::event_create()],
-                pa_ev_done: [cuda::event_create(), cuda::event_create()],
-                route_log: Vec::new(),
-                trickle: None,
-                trickle_pend: None,
-                adapt_base: Vec::new(),
-                adapt_ema: Vec::new(),
-                dev_sampler: None,
-                vit: vit,
-                vit_plan: None,
-                mrope_cos: 0,
-                mrope_sin: 0,
-                mrope_rows: 0,
-                mrope_active: false,
-                cnq: std::ptr::null_mut(),
-                graph_exec: 0,
-                cap_stream: 0,
-                scalar_stage: unsafe { cuda::Pinned::alloc(16 * 4) },
-                embed_buf: vec![0f32; HCT],
-                sb_pack: Box::new([0i32; 2]),
-            },
-            report,
-        )
+        Engine {
+            k,
+            module,
+            st,
+            res,
+            w,
+            ple,
+            p,
+            s,
+            cfg,
+            pos: 0,
+            history: Vec::new(),
+            done_blocks: 0,
+            sel_counts,
+            stage,
+            pf_ncombo: cuda::to_i32_dev(&[TOPK as i32]),
+            pf_ring_gu: ring_gu,
+            pf_ring_dn: ring_dn,
+            pf_stream,
+            pf_ev_filled: [cuda::event_create(), cuda::event_create()],
+            pf_ev_done: [cuda::event_create(), cuda::event_create()],
+            pf_dma_live: std::cell::Cell::new(false),
+            pa_stream: if pf_async_on() { cuda::stream_create_priority() } else { std::ptr::null_mut() },
+            pa_ev_plan: cuda::event_create(),
+            pa_ev_filled: [cuda::event_create(), cuda::event_create()],
+            pa_ev_done: [cuda::event_create(), cuda::event_create()],
+            route_log: Vec::new(),
+            trickle: None,
+            trickle_pend: None,
+            adapt_base: Vec::new(),
+            adapt_ema: Vec::new(),
+            dev_sampler: None,
+            vit: vit,
+            vit_plan: None,
+            mrope_cos: 0,
+            mrope_sin: 0,
+            mrope_rows: 0,
+            mrope_active: false,
+            cnq: std::ptr::null_mut(),
+            graph_exec: 0,
+            cap_stream: 0,
+            scalar_stage: unsafe { cuda::Pinned::alloc(16 * 4) },
+            embed_buf: vec![0f32; HCT],
+            sb_pack: Box::new([0i32; 2]),
+        }
     }
 }
 
@@ -1052,29 +996,8 @@ fn st_res_n(rep: &crate::manager::AllocReport, target: usize) -> usize {
     }
 }
 
-// ---------------- tensor loaders ----------------
-
-/// bf16 device copy of a BF16-keep tensor (exact: the keep is bf16)
-pub unsafe fn load_bf16_twin(cnq: &mut Cnq, name: &str, sec: &str) -> Dev {
-    let v = cnq.read_f32(name, sec);
-    let b: Vec<u16> = v.iter().map(|x| (x.to_bits() >> 16) as u16).collect();
-    cuda::upload_dev(std::slice::from_raw_parts(b.as_ptr() as *const u8, b.len() * 2))
-}
-
-pub unsafe fn load_f32(cnq: &mut Cnq, name: &str, sec: &str) -> Dev {
-    let v = cnq.read_f32(name, sec);
-    cuda::to_f32_dev(&v)
-}
-
-pub unsafe fn load_fp4(cnq: &mut Cnq, name: &str, sec: &str) -> Fp4 {
-    let t = cnq.find(name, sec).clone();
-    assert_ne!(t.dtype, "bf16", "{name}: expected NVFP4");
-    let raw = cnq.read_bytes(&t);
-    let w = cuda::upload_dev(&raw);
-    let gs = cuda::to_f32_dev(&[t.global_scale]);
-    Fp4 { w, gs }
-}
-
+// the one loader that stays here: PW carries a launch policy (env switches,
+// tile forms), not just bytes - see weights.rs for the rest
 /// dtype-agnostic loader: nvfp4 → FP4 GEMV, bf16 keep → BF16 GEMV
 pub unsafe fn load_pw(cnq: &mut Cnq, name: &str, sec: &str) -> PW {
     let t = cnq.find(name, sec).clone();
@@ -1085,37 +1008,6 @@ pub unsafe fn load_pw(cnq: &mut Cnq, name: &str, sec: &str) -> PW {
         let Fp4 { w, gs } = load_fp4(cnq, name, sec);
         PW::Fp4(w, gs)
     }
-}
-
-/// NVFP4 -> host f32: the 36-byte-block walk, block order preserved.
-/// `n` is the value count; the tail beyond `raw.len()/36*64` stays zero.
-fn dequant_fp4_host(raw: &[u8], gs: f32, n: usize) -> Vec<f32> {
-    let mut out = vec![0f32; n];
-    let mut blk = [0f32; 64];
-    for (b, chunk) in raw.chunks_exact(36).enumerate() {
-        cnq::dequant_block(chunk, gs, &mut blk);
-        out[b * 64..(b + 1) * 64].copy_from_slice(&blk);
-    }
-    out
-}
-
-pub unsafe fn dequant_fp4_dev(cnq: &mut Cnq, name: &str, sec: &str, n: usize) -> Dev {
-    let t = cnq.find(name, sec).clone();
-    let raw = cnq.read_bytes(&t);
-    cuda::to_f32_dev(&dequant_fp4_host(&raw, t.global_scale, n))
-}
-
-/// tiny tensors (A_log, dt_bias): any dtype → host f32 → device
-pub unsafe fn load_small_f32(cnq: &mut Cnq, name: &str, sec: &str, n: usize) -> Dev {
-    let t = cnq.find(name, sec).clone();
-    let raw = cnq.read_bytes(&t);
-    let v: Vec<f32> = match t.dtype.as_str() {
-        "bf16" => cnq::bf16_bytes_to_f32(&raw),
-        "i64" => panic!("{name}: i64 unexpected here"),
-        _ => dequant_fp4_host(&raw, t.global_scale, n),
-    };
-    assert_eq!(v.len(), n, "{name}: size mismatch");
-    cuda::to_f32_dev(&v)
 }
 
 impl Ple {
@@ -1331,6 +1223,18 @@ fn graph_on() -> bool {
         }
         on
     })
+}
+
+/// The NVFP4 activation cascade that feeds every MMA GEMV: `gx` row sets,
+/// 128 threads, args `[src, dst, n, 1, stride]` - the one spelling of all 13 sites.
+unsafe fn quant_x_now(k: &Kernels, p: &Params, gx: u32, src: u64, dst: u64, n_p: u64, stride_p: u64) {
+    launch_v(k.f("quant_x_fp4"), gx, 1, 1, 128, &[src, dst, n_p, p.one as u64, stride_p]);
+}
+/// the same launch, skipped when the producers already emit the cascade (CROW_QFUSE)
+unsafe fn quant_x_if_unfused(k: &Kernels, p: &Params, gx: u32, src: u64, dst: u64, n_p: u64, stride_p: u64) {
+    if !qfuse_on() {
+        quant_x_now(k, p, gx, src, dst, n_p, stride_p);
+    }
 }
 
 /// dense-GEMV MMA switch: follows CROW_MMA unless CROW_MMA_DENSE=0 (A/B knob
@@ -1630,73 +1534,6 @@ fn dense_mma_on() -> bool {
     mma_on() && std::env::var("CROW_MMA_DENSE").as_deref() != Ok("0")
 }
 
-/// every kernel arg is a device address (scalars live in device buffers — the
-/// p5 rule), so the arg list is just u64 values.
-pub unsafe fn launch_sync(
-    f: cudarc::driver::sys::CUfunction,
-    gx: u32,
-    gy: u32,
-    gz: u32,
-    bx: u32,
-    vals: &[u64],
-) {
-    launch_v(f, gx, gy, gz, bx, vals);
-    cuda::sync();
-}
-
-pub unsafe fn launch_v(
-    f: cudarc::driver::sys::CUfunction,
-    gx: u32,
-    gy: u32,
-    gz: u32,
-    bx: u32,
-    vals: &[u64],
-) {
-    use cudarc::driver::sys;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    static DBG: AtomicBool = AtomicBool::new(false);
-    static INIT: AtomicBool = AtomicBool::new(false);
-    static LAUNCH_N: AtomicU64 = AtomicU64::new(0);
-    if !INIT.swap(true, Ordering::Relaxed) {
-        DBG.store(std::env::var("ENGINE_DEBUG_SYNC").is_ok(), Ordering::Relaxed);
-    }
-    let mut ptrs: Vec<*mut std::ffi::c_void> = vals
-        .iter()
-        .map(|v| v as *const u64 as *mut std::ffi::c_void)
-        .collect();
-    let stream = cuda::cur_stream();
-    let kprof = crate::kernels::KPROF_ON.load(Ordering::Relaxed);
-    if kprof {
-        cuda::sync();
-    }
-    let t_k = std::time::Instant::now();
-    let r = sys::cuLaunchKernel(
-        f, gx, gy, gz, bx, 1, 1, 0,
-        stream,
-        ptrs.as_mut_ptr(),
-        std::ptr::null_mut(),
-    );
-    if kprof {
-        cuda::sync();
-        prof::kprof_add(format!("{}[{}x{}]", crate::kernels::last_name(), gx, gy), t_k.elapsed().as_micros() as u64);
-    }
-    if std::env::var("ENGINE_DEBUG_LAUNCH").is_ok() {
-        eprintln!("[launch] stream={:p} gx={gx} gy={gy} r={:?}", stream as *mut std::ffi::c_void, r);
-    }
-    cuda::ck(r);
-    if DBG.load(Ordering::Relaxed) {
-        let n = LAUNCH_N.fetch_add(1, Ordering::Relaxed);
-        if std::env::var("ENGINE_DEBUG_TRACE").as_deref() == Ok("1") {
-            eprintln!(
-                "[launch {n}] go gx={gx} gy={gy} gz={gz} bx={bx} a0={:x} a1={:x} a2={:x}",
-                vals.get(0).copied().unwrap_or(0),
-                vals.get(1).copied().unwrap_or(0),
-                vals.get(2).copied().unwrap_or(0)
-            );
-        }
-        cuda::sync();
-    }
-}
 
 impl Params {
     pub unsafe fn setup(cfg: &Config, _st: &ThreeStates) -> Params {
@@ -2038,8 +1875,7 @@ impl Engine {
         };
         if dense_mma_on() {
             // one quantized `mixed` row set serves qkv/z/b/a (all k=2560)
-            if !qfuse_on() { launch_v(k.f("quant_x_fp4"), t as u32, 1, 1, 128, &[
-                mixed as u64, s.xq_m as u64, p.n2560 as u64, p.one as u64, p.n2560 as u64]); }
+            quant_x_if_unfused(k, p, t as u32, mixed as u64, s.xq_m as u64, p.n2560 as u64, p.n2560 as u64);
             launch_mma_d(k, (GDN_CONV / 64) as u32, t, p.t as u64, &[
                 qkv.w as u64, s.xq_m as u64, qkv.gs as u64, s.mq as u64,
                 p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
@@ -2085,8 +1921,7 @@ launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
                 s.gcore as u64, s.gz as u64, *norm as u64, s.gnorm as u64]);
         }
         if dense_mma_on() {
-            if !qfuse_on() { launch_v(k.f("quant_x_fp4"), t as u32, 1, 1, 128, &[
-                s.gnorm as u64, s.xq_v as u64, p.n6144 as u64, p.one as u64, p.n6144 as u64]); }
+            quant_x_if_unfused(k, p, t as u32, s.gnorm as u64, s.xq_v as u64, p.n6144 as u64, p.n6144 as u64);
             launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
                 out.w as u64, s.xq_v as u64, out.gs as u64, s.gout as u64,
                 p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
@@ -2106,8 +1941,7 @@ launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
             panic!("layer {l} is not GDN");
         };
         if dense_mma_on() {
-            if !qfuse_on() { launch_v(k.f("quant_x_fp4"), 1, 1, 1, 128, &[
-                mixed as u64, s.xq_m as u64, p.n2560 as u64, p.one as u64, p.n2560 as u64]); }
+            quant_x_if_unfused(k, p, 1, mixed as u64, s.xq_m as u64, p.n2560 as u64, p.n2560 as u64);
             if gdn_fuse_in_on() {
                 // #62b lever 1: the four input projections in ONE grouped
                 // launch (qkv 10240 + z 6144 + b 48 + a 48 rows, all k 2560
@@ -2161,8 +1995,7 @@ launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
                 s.gcore as u64, s.gz as u64, *norm as u64, s.gnorm as u64]);
         }
         if dense_mma_on() {
-            if !qfuse_on() { launch_v(k.f("quant_x_fp4"), 1, 1, 1, 128, &[
-                s.gnorm as u64, s.xq_v as u64, p.n6144 as u64, p.one as u64, p.n6144 as u64]); }
+            quant_x_if_unfused(k, p, 1, s.gnorm as u64, s.xq_v as u64, p.n6144 as u64, p.n6144 as u64);
             launch_v(k.f("gemv_fp4_mma_d32"), ((H + 31) / 32) as u32, 1, 1, mma_bx32(), &[
                 out.w as u64, s.xq_v as u64, out.gs as u64, s.gout as u64,
                 p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
@@ -2218,8 +2051,7 @@ impl Engine {
         step!("launch #7");
         if dense_mma_on() {
             // one quantized `mixed` row set serves v + indexer qk (both k=2560)
-            if !qfuse_on() { launch_v(k.f("quant_x_fp4"), t as u32, 1, 1, 128, &[
-                mixed as u64, s.xq_m as u64, p.n2560 as u64, p.one as u64, p.n2560 as u64]); }
+            quant_x_if_unfused(k, p, t as u32, mixed as u64, s.xq_m as u64, p.n2560 as u64, p.n2560 as u64);
             launch_mma_d(k, (KV_ROWS / 64) as u32, t, p.t as u64, &[
                 v.w as u64, s.xq_m as u64, v.gs as u64, s.av as u64,
                 p.n2560 as u64, p.nr512 as u64, p.nr512 as u64]);
@@ -2317,8 +2149,7 @@ impl Engine {
         }
         step!("launch #20");
         if dense_mma_on() {
-            if !qfuse_on() { launch_v(k.f("quant_x_fp4"), t as u32, 1, 1, 128, &[
-                s.agated as u64, s.xq_v as u64, p.n6144 as u64, p.one as u64, p.n6144 as u64]); }
+            quant_x_if_unfused(k, p, t as u32, s.agated as u64, s.xq_v as u64, p.n6144 as u64, p.n6144 as u64);
             launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
                 o.w as u64, s.xq_v as u64, o.gs as u64, s.ay as u64,
                 p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
@@ -2351,8 +2182,7 @@ impl Engine {
         launch_v(k.f("rmsnorm_1pw"), NKV as u32, 1, 1, AHD as u32, &[s.ak as u64, *kn as u64, s.akn as u64]);
         launch_v(k.f("rope_p"), NKV as u32, 1, 1, AHD as u32, &[s.akn as u64, cos, sin, s.akr as u64, p.pos_base as u64]);
         if dense_mma_on() {
-            if !qfuse_on() { launch_v(k.f("quant_x_fp4"), 1, 1, 1, 128, &[
-                mixed as u64, s.xq_m as u64, p.n2560 as u64, p.one as u64, p.n2560 as u64]); }
+            quant_x_if_unfused(k, p, 1, mixed as u64, s.xq_m as u64, p.n2560 as u64, p.n2560 as u64);
             launch_v(k.f("gemv_fp4_mma_d"), (KV_ROWS / 64) as u32, 1, 1, mma_bx(), &[
                 v.w as u64, s.xq_m as u64, v.gs as u64, s.av as u64,
                 p.n2560 as u64, p.nr512 as u64, p.nr512 as u64]);
@@ -2459,8 +2289,7 @@ impl Engine {
                 s.aout as u64, s.agate as u64, s.agated as u64]);
         }
         if dense_mma_on() {
-            if !qfuse_on() { launch_v(k.f("quant_x_fp4"), 1, 1, 1, 128, &[
-                s.agated as u64, s.xq_v as u64, p.n6144 as u64, p.one as u64, p.n6144 as u64]); }
+            quant_x_if_unfused(k, p, 1, s.agated as u64, s.xq_v as u64, p.n6144 as u64, p.n6144 as u64);
             launch_v(k.f("gemv_fp4_mma_d"), (H / 64) as u32, 1, 1, mma_bx(), &[
                 o.w as u64, s.xq_v as u64, o.gs as u64, s.ay as u64,
                 p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
@@ -2584,15 +2413,18 @@ impl Engine {
         let staged = stage_on() && t * TOPK <= self.stage.max;
         assert!(staged || lb.is_none() || (mma_on() && pf_gemm_on()),
             "low-bit cold tier needs a staging path (decode: t*TOPK <= stage.max; prefill: CROW_PF_GEMM)");
+        // the 9 staging arguments every stage_cold* form takes, in kernel order,
+        // plus the two slots the variants append (lb tables / the combo count)
+        let mut sc = [s.gu_ptrs as u64, s.dn_ptrs as u64, s.cold as u64,
+            self.stage.gu as u64, self.stage.dn as u64, self.stage.sgu as u64,
+            self.stage.sdn as u64, self.stage.gu_b as u64, self.stage.dn_b as u64, 0, 0];
         let (gu_ptrs, dn_ptrs) = if staged {
             if stage_dma_on() && lb.is_none() {
                 self.stage_cold_dma(t);
             } else if let Some(lb) = lb {
-                launch_v(k.f("stage_cold_lb"), (t * TOPK) as u32, 2, stage_split(), 256, &[
-                    s.gu_ptrs as u64, s.dn_ptrs as u64, s.cold as u64,
-                    self.stage.gu as u64, self.stage.dn as u64,
-                    self.stage.sgu as u64, self.stage.sdn as u64,
-                    self.stage.gu_b as u64, self.stage.dn_b as u64, lb.bits_dev as u64, lb.lut_dev as u64]);
+                sc[9] = lb.bits_dev as u64;
+                sc[10] = lb.lut_dev as u64;
+                launch_v(k.f("stage_cold_lb"), (t * TOPK) as u32, 2, stage_split(), 256, &sc[..11]);
             } else if stage_kernel_ca() {
                 // #19d: persistent cp.async.cg 4 KB tile copy, grid CROW_STAGE_BLOCKS
                 // x 1 x 1; the tenth argument is the combo count BY VALUE, the very
@@ -2604,17 +2436,10 @@ impl Engine {
                 assert!(self.stage.gu_bytes % 4096 == 0 && self.stage.dn_bytes % 4096 == 0,
                     "stage_cold_ca needs both staged byte counts to be multiples of 4096 (gate_up {} B, down {} B); CROW_STAGE_KERNEL=1 falls back to stage_cold",
                     self.stage.gu_bytes, self.stage.dn_bytes);
-                launch_v(k.f("stage_cold_ca"), stage_blocks(), 1, 1, 256, &[
-                    s.gu_ptrs as u64, s.dn_ptrs as u64, s.cold as u64,
-                    self.stage.gu as u64, self.stage.dn as u64,
-                    self.stage.sgu as u64, self.stage.sdn as u64,
-                    self.stage.gu_b as u64, self.stage.dn_b as u64, (t * TOPK) as u64]);
+                sc[9] = (t * TOPK) as u64;
+                launch_v(k.f("stage_cold_ca"), stage_blocks(), 1, 1, 256, &sc[..10]);
             } else {
-                launch_v(k.f("stage_cold"), (t * TOPK) as u32, 2, stage_split(), 256, &[
-                    s.gu_ptrs as u64, s.dn_ptrs as u64, s.cold as u64,
-                    self.stage.gu as u64, self.stage.dn as u64,
-                    self.stage.sgu as u64, self.stage.sdn as u64,
-                    self.stage.gu_b as u64, self.stage.dn_b as u64]);
+                launch_v(k.f("stage_cold"), (t * TOPK) as u32, 2, stage_split(), 256, &sc[..9]);
             }
             (self.stage.sgu as u64, self.stage.sdn as u64)
         } else {
@@ -2627,8 +2452,7 @@ impl Engine {
         if mma {
             // quantize mixed_m ONCE — the quantized rows feed the shared expert
             // gate|up AND all TOPK routed gate_up combos of a token
-            if !qfuse_on() { launch_v(k.f("quant_x_fp4"), t as u32, 1, 1, 128, &[
-                mixed_m as u64, s.xq_gu as u64, p.n2560 as u64, p.one as u64, p.n2560 as u64]); }
+            quant_x_if_unfused(k, p, t as u32, mixed_m as u64, s.xq_gu as u64, p.n2560 as u64, p.n2560 as u64);
         }
         // shared expert — gate|up into ONE [t][1280] buffer (p13 layout, the
         // contract silu_mul640 reads); explicit stride, never the grid
@@ -2688,8 +2512,7 @@ impl Engine {
                     m.sdn.w as u64, s.xq_s as u64, m.sdn.gs as u64, s.sgv as u64,
                     s.moe_out as u64, p.n640 as u64, p.n2560 as u64, p.n2560 as u64]);
             } else {
-                if !qfuse_on() { launch_v(k.f("quant_x_fp4"), t as u32, 1, 1, 128, &[
-                    s.sh2 as u64, s.xq_s as u64, p.n640 as u64, p.one as u64, p.n640 as u64]); }
+                quant_x_if_unfused(k, p, t as u32, s.sh2 as u64, s.xq_s as u64, p.n640 as u64, p.n640 as u64);
                 launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
                     m.sdn.w as u64, s.xq_s as u64, m.sdn.gs as u64, s.sdown as u64,
                     p.n640 as u64, p.n2560 as u64, p.n2560 as u64]);
@@ -2842,8 +2665,7 @@ impl Engine {
         }
         if mma {
             // h2 is per-combo ([t*TOPK][640]) — quantize per combo row
-            if !qfuse_on() { launch_v(k.f("quant_x_fp4"), (t * TOPK) as u32, 1, 1, 128, &[
-                s.h2 as u64, s.xq_dn as u64, p.n640 as u64, p.one as u64, p.n640 as u64]); }
+            quant_x_if_unfused(k, p, (t * TOPK) as u32, s.h2 as u64, s.xq_dn as u64, p.n640 as u64, p.n640 as u64);
             launch_v(k.f("gemv_fp4_mma"), (H / 64) as u32, (t * TOPK) as u32, 1, mma_bx(), &[
                 dn_ptrs, s.xq_dn as u64, (self.res.gs_dev + (l * 8 + 4) as u64) as u64,
                 s.eo as u64, p.n640 as u64, p.one as u64]);
@@ -2887,8 +2709,7 @@ impl Engine {
                 pl.cache as u64, pl.gs as u64, s.ple_slots as u64, s.emb as u64]);
         if dbg { cuda::sync(); eprintln!("[ple] step 11"); }
             if dense_mma_on() {
-                launch_v(k.f("quant_x_fp4"), t as u32, 1, 1, 128, &[
-                    s.emb as u64, s.xq_e as u64, p.n2560 as u64, p.one as u64, p.n2560 as u64]);
+                quant_x_now(k, p, t as u32, s.emb as u64, s.xq_e as u64, p.n2560 as u64, p.n2560 as u64);
                 launch_mma_d(k, (HCT / 64) as u32, t, p.t as u64, &[
                     pl.key.w as u64, s.xq_e as u64, pl.key.gs as u64, s.ple_key as u64,
                     p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
@@ -2995,8 +2816,7 @@ impl Engine {
         if dbg { cuda::sync(); eprintln!("[ple] step 1"); }
             if dense_mma_on() {
                 // one quantized embed row set serves key + value (both k=2560)
-                launch_v(k.f("quant_x_fp4"), t as u32, 1, 1, 128, &[
-                    s.emb as u64, s.xq_e as u64, p.n2560 as u64, p.one as u64, p.n2560 as u64]);
+                quant_x_now(k, p, t as u32, s.emb as u64, s.xq_e as u64, p.n2560 as u64, p.n2560 as u64);
                 launch_mma_d(k, (HCT / 64) as u32, t, p.t as u64, &[
                     pl.key.w as u64, s.xq_e as u64, pl.key.gs as u64, s.ple_key as u64,
                     p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
@@ -3136,42 +2956,6 @@ impl Engine {
         cuda::dtoh(self.s.h, t * HCT)
     }
 
-    /// DEBUG/parity helper: run ONE decoder layer's full chain (hc → sub →
-    /// inject → hc2 → moe → inject) on the given [T][HCT] host stream.
-    pub unsafe fn run_single_layer(&mut self, l: usize, h_host: &[f32], t: usize, pos_base: usize, first: bool) -> Vec<f32> {
-        cuda::to_f32_into(self.s.h, h_host);
-        cuda::to_i32_into(self.p.t, &[t as i32]);
-        cuda::to_i32_into(self.p.init, &[if first { 1 } else { 0 }]);
-        cuda::to_i32_into(self.p.pos_base, &[pos_base as i32]);
-        cuda::to_i32_into(self.p.pos_base_b4, &[((pos_base / 4)) as i32]);
-        cuda::to_i32_into(self.p.slot_base, &[pos_base as i32]);
-        let ncb: Vec<i32> = (0..t)
-            .map(|i| ((pos_base + i + 1) / 4).min((self.st.context + 3) / 4) as i32)
-            .collect();
-        cuda::to_i32_into(self.p.ncb, &ncb);
-        let posrows: Vec<i32> = (0..t).map(|i| (pos_base + i) as i32).collect();
-        cuda::to_i32_into(self.p.pos_row, &posrows);
-        cuda::to_i32_into(self.p.nt_low, &[((t * LOWRANK) as i32)]);
-        cuda::to_i32_into(self.p.nt_hct, &[((t * HCT) as i32)]);
-        cuda::to_i32_into(self.p.nt_hc, &[((t * HCN) as i32)]);
-        cuda::to_i32_into(self.p.nt_combo, &[((t * TOPK * INTER) as i32)]);
-        cuda::to_i32_into(self.pf_ncombo, &[(t * TOPK) as i32]);
-
-        self.hc_run(&self.w.hc[l], self.s.h, t, self.s.mixed, self.s.injw);
-        let sub = match &self.w.sub[l] {
-            SubW::Gdn { .. } => self.gdn_prompt(l, self.s.mixed, t, first),
-            SubW::Attn { .. } => self.attn_prompt(l, self.s.mixed, t, pos_base),
-        };
-        launch_v(self.k.f("inject_residual"), 4, (t * 10) as u32, 1, 256, &[
-            self.s.h as u64, sub as u64, self.s.injw as u64, self.s.x1 as u64]);
-        self.hc_run(&self.w.hc2[l], self.s.x1, t, self.s.mixed_m, self.s.injw);
-        let moe = self.moe_run(l, self.s.mixed_m, t);
-        launch_v(self.k.f("inject_residual"), 4, (t * 10) as u32, 1, 256, &[
-            self.s.x1 as u64, moe as u64, self.s.injw as u64, self.s.h as u64]);
-        cuda::sync();
-        cuda::dtoh(self.s.h, t * HCT)
-    }
-
     /// DEBUG/layercheck helper: run ONLY the attention sub-block of layer `l`
     /// (q/k/v GEMVs → split → q_norm/k_norm → rotary → KV store → QSA select →
     /// attention → sigmoid gate → o_proj) on a host [T][H] `mixed` input,
@@ -3238,11 +3022,9 @@ impl Engine {
             if cnq.map != 0 && self.cfg.ple && start + t < ids.len() && std::env::var("CROW_PLE_PREFETCH").as_deref() != Ok("0") {
                 let nt = (ids.len() - start - t).min(self.cfg.prompt_chunk);
                 let next = &ids[start + t..start + t + nt];
-                let hist_end = pos_base + t; // position after this chunk
                 let pre: Vec<i64> = {
                     let mut v: Vec<i64> = Vec::new();
                     let full: Vec<i64> = self.history.iter().copied().chain(chunk.iter().copied()).collect();
-                    let _ = hist_end;
                     for k in 0..2 {
                         let idx = full.len() as i64 - 2 + k;
                         v.push(if idx >= 0 { full[idx as usize] } else { PLE_EOS });
@@ -3353,7 +3135,7 @@ impl Engine {
                         eprintln!("[nanwatch] layer 1 AFTER PLE: nan={nn} inf={ni}");
                     }
                 }
-                let (mut mixed, mut injw) = (self.s.mixed, self.s.injw);
+                let (mixed, injw) = (self.s.mixed, self.s.injw);
                 self.hc_run(&self.w.hc[l], self.s.h, t, mixed, injw);
                 let dbg = std::env::var("ENGINE_DEBUG_SYNC").is_ok();
                 if dbg {
@@ -3729,7 +3511,9 @@ impl Engine {
         if gdbg { eprintln!("[graph-dbg] T1: vor sync"); }
         cuda::sync();
         if gdbg { eprintln!("[graph-dbg] T2: sync ok"); }
-        let _prof_tok = cuda::dtoh_i32(self.s.argmax, 1)[0] as usize;
+        // the ONE argmax readback of the step - inside the TAIL bucket, which is
+        // "end-of-token sync + argmax readback"
+        let tok = cuda::dtoh_i32(self.s.argmax, 1)[0] as usize;
         if gdbg { eprintln!("[graph-dbg] T3: dtoh ok"); }
         if prof {
             prof::add(&prof::TAIL, t_tail.elapsed().as_micros() as u64);
@@ -3740,7 +3524,6 @@ impl Engine {
         if complete {
             self.done_blocks = (pos + 1) / 4;
         }
-        let tok = cuda::dtoh_i32(self.s.argmax, 1)[0] as usize;
         tok
     }
 
@@ -3789,6 +3572,17 @@ impl Engine {
         self.launch_sample(ds);
         cuda::sync();
         cuda::dtoh_i32(self.s.argmax, 1)[0] as usize
+    }
+
+    /// The post-prefill re-cut as the three bins arm it: CROW_ADAPT=1 runs it,
+    /// CROW_ADAPT_MAX0 caps the swaps per layer (0 = unbounded). `None` = not armed;
+    /// `Some((swaps, cap))` lets each caller word its own line.
+    pub unsafe fn adapt_after_prefill(&mut self) -> Option<(usize, usize)> {
+        if std::env::var("CROW_ADAPT").as_deref() != Ok("1") {
+            return None;
+        }
+        let cap0: usize = std::env::var("CROW_ADAPT_MAX0").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        Some((self.adapt_hot_set(cap0), cap0))
     }
 
     /// Prompt-adaptive residency (A-P3): re-cut every layer's hot set from the
@@ -4044,14 +3838,10 @@ impl Engine {
         // #63b: a parked batch is still in flight for this purpose; issue it
         // before the emptiness test below, and after each of the two ticks.
         self.trickle_drain_after_launch();
-        let mut total = 0;
-        if let Some(tr) = &self.trickle {
-            total = tr.swaps;
-            if tr.in_a.is_empty() && tr.in_b.is_empty() {
-                return total;
-            }
-        } else {
-            return 0;
+        let Some(tr) = &self.trickle else { return 0 };
+        let total = tr.swaps;
+        if tr.in_a.is_empty() && tr.in_b.is_empty() {
+            return total;
         }
         self.trickle_tick(false, 0);
         self.trickle_drain_after_launch();
@@ -4162,15 +3952,9 @@ impl Drop for Engine {
         unsafe {
             cuda::drop_dbg("before Engine");
             cuda::sync();
-            if self.graph_exec != 0 {
-                cuda::graph_exec_destroy(self.graph_exec as cudarc::driver::sys::CUgraphExec);
-                self.graph_exec = 0;
-            }
-            if self.cap_stream != 0 {
-                cuda::set_stream(0);
-                cuda::stream_destroy(self.cap_stream as cudarc::driver::sys::CUstream);
-                self.cap_stream = 0;
-            }
+            // the graph + capture stream teardown of record (reset.rs); its
+            // else-arm also makes the legacy stream active when none was captured
+            self.drop_decode_graph();
             if let Some(tr) = self.trickle.take() {
                 cuda::stream_sync(tr.stream);
                 cuda::event_destroy(tr.ev_side);

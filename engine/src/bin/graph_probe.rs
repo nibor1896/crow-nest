@@ -3,7 +3,7 @@
 //! kernels, replays it R times, reports us per node; also the eager launch
 //! cost for comparison. No model, no large allocations.
 use crow_nest_engine::cuda;
-use crow_nest_engine::gen::launch_v;
+use crow_nest_engine::kernels::launch_v;
 
 const SRC: &str = r#"
 extern "C" __global__ void nop_k(float* p) {

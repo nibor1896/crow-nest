@@ -7,6 +7,10 @@
 //!   - list-based sparse attention over selected cache rows.
 //! Rules held: scalar args via device buffers, full-flat guards, block-stride
 //! loops over full rows, explicit stride params for slices of strided matrices.
+//!
+//! The host side of this file is the kernel table (`Kernels::f`), the ONE
+//! `cuLaunchKernel` shim every launch goes through (`launch_v`) and the
+//! per-kernel profile that shim feeds.
 
 pub const KERNEL_SRC: &str = r#"
 // ---------------- decode helpers (p2/p10-verified) ----------------
@@ -4474,6 +4478,7 @@ extern "C" __global__ void gelu_tanh(float* __restrict__ x, const int* __restric
 }
 "#;
 
+use crate::cuda;
 use cudarc::driver::sys::CUfunction;
 use std::collections::HashMap;
 
@@ -4498,12 +4503,14 @@ pub struct Kernels {
 }
 
 impl Kernels {
+    /// Every kernel the host LAUNCHES, resolved once. The frozen KERNEL_SRC defines
+    /// more (six of them have no launch site left); this list is the launched set.
     pub unsafe fn new(module: &crate::cuda::Module) -> Kernels {
         let names: &[&'static str] = &[
-            "gemv_f32", "gemv_b", "gemv_fp4", "gemv_fp4_b", "gemv_fp4_bs", "gemv_fp4_ptrb", "gemv_bf16",
-            "dequant_fp4_flat", "bf16_to_f32", "rms_group", "rmsnorm_1pw", "silu_div4",
+            "gemv_b", "gemv_fp4", "gemv_fp4_b", "gemv_fp4_bs", "gemv_fp4_ptrb", "gemv_bf16",
+            "rms_group", "rmsnorm_1pw", "silu_div4",
             "sigmoid_el", "sig2_div4", "mix_streams", "inject_residual", "silu_mul640",
-            "silu_mul_combo", "acc_scale", "acc_combo", "gate_shared", "conv_silu", "transpose_rt",
+            "silu_mul_combo", "acc_combo", "gate_shared", "conv_silu", "transpose_rt",
             "conv_state_update", "split_qkv", "l2norm_repeat", "beta_g", "delta_rule_persist", "conv_step",
             "delta_rule_step", "delta_rule_persist_r", "delta_rule_step_r", "rmsnorm_gated", "split_qg", "rope", "rope_p", "stage_cold", "stage_cold_ca", "stage_cold_lb", "stage_tiles_lb", "swap_pairs", "expand_slab", "moe_count", "moe_plan", "moe_scatter", "stage_tiles", "gemm_fp4_tiles", "silu_tiles", "quant_tiles", "store_kv", "attn_sel",
             "gate_mul", "rms128", "rope64", "pool4_cache", "qk_k_append", "d2d_block", "qsa_scores",
@@ -4511,8 +4518,8 @@ impl Kernels {
             "ple_state_update", "ple_conv_step", "argmax_k", "sample_topk_part", "sample_k", "add_flat",
             "gemv_bf16_b", "gemv_bf16_w", "gemv_fp4_b1k", "hc_down_inj", "gemv_bf16_ws",
             "gemm_fp4_dense", "gemm_bf16_dense", "gemm_fp4_dense_b", "gemm_bf16_dense_b", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
-            "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "gemv_fp4_mma_dg", "sh_gate_up_q", "gemv_fp4_mma_g", "gemv_fp4_mma_d32", "gemv_fp4_mma_g32", "attn_sel_r", "attn_sel_d8", "attn_sel_d9", "attn_sel_s", "attn_sel_s8", "attn_sel_s8l", "attn_sel_g",
-            "gemv_fp4_vit", "gemm_fp4_f32x", "vit_ln", "vit_add_bias", "vit_pe_add", "vit_rope", "vit_attn", "gelu_erf", "gelu_tanh",
+            "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "gemv_fp4_mma_dg", "sh_gate_up_q", "gemv_fp4_mma_d32", "gemv_fp4_mma_g32", "attn_sel_r", "attn_sel_d8", "attn_sel_d9", "attn_sel_s", "attn_sel_s8", "attn_sel_s8l", "attn_sel_g",
+            "gemm_fp4_f32x", "vit_ln", "vit_add_bias", "vit_pe_add", "vit_rope", "vit_attn", "gelu_erf", "gelu_tanh",
         ];
         let mut map = HashMap::new();
         for n in names {
@@ -4531,7 +4538,7 @@ impl Kernels {
 
 /// CROW_KPROF=1: per-kernel GPU-time profile (sync before/after each launch,
 /// so the number is kernel time + one launch latency). `f()` records the
-/// name of the kernel about to be launched; gen::launch_v attributes the time.
+/// name of the kernel about to be launched; `launch_v` below attributes the time.
 pub static KPROF_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 thread_local! {
     pub static LAST_NAME: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
@@ -4542,4 +4549,97 @@ pub fn kprof_init() {
 pub fn last_name() -> String {
     LAST_NAME.with(|c| c.borrow().clone())
 
+}
+
+// ---- per-kernel profile (CROW_KPROF=1) ----
+pub static KPROF: std::sync::Mutex<Option<std::collections::HashMap<String, (u64, u64)>>> =
+    std::sync::Mutex::new(None);
+pub fn kprof_add(name: String, us: u64) {
+    let mut g = KPROF.lock().unwrap();
+    let m = g.get_or_insert_with(std::collections::HashMap::new);
+    let e = m.entry(name).or_insert((0, 0));
+    e.0 += 1;
+    e.1 += us;
+}
+/// per-kernel table (sorted by total time), normalized per `steps`
+pub fn kprof_report(steps: u64) {
+    let g = KPROF.lock().unwrap();
+    let Some(m) = g.as_ref() else { return };
+    let mut rows: Vec<(&String, &(u64, u64))> = m.iter().collect();
+    rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    let total: u64 = rows.iter().map(|r| r.1 .1).sum();
+    let st = steps.max(1) as f64;
+    eprintln!("[kprof] kernel time incl. one launch latency each, over {steps} steps (total {:.1} ms/step)", total as f64 / 1000.0 / st);
+    eprintln!("[kprof] {:<22} {:>9} {:>11} {:>9} {:>6}", "kernel", "calls/step", "ms/step", "us/call", "share");
+    for (n, (c, us)) in rows {
+        eprintln!("[kprof] {:<22} {:>9.1} {:>11.3} {:>9.1} {:>5.1}%", n, *c as f64 / st, *us as f64 / 1000.0 / st, *us as f64 / *c as f64, 100.0 * *us as f64 / total as f64);
+    }
+}
+
+/// every kernel arg is a device address (scalars live in device buffers — the
+/// p5 rule), so the arg list is just u64 values.
+pub unsafe fn launch_sync(
+    f: cudarc::driver::sys::CUfunction,
+    gx: u32,
+    gy: u32,
+    gz: u32,
+    bx: u32,
+    vals: &[u64],
+) {
+    launch_v(f, gx, gy, gz, bx, vals);
+    cuda::sync();
+}
+
+pub unsafe fn launch_v(
+    f: cudarc::driver::sys::CUfunction,
+    gx: u32,
+    gy: u32,
+    gz: u32,
+    bx: u32,
+    vals: &[u64],
+) {
+    use cudarc::driver::sys;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static DBG: AtomicBool = AtomicBool::new(false);
+    static INIT: AtomicBool = AtomicBool::new(false);
+    static LAUNCH_N: AtomicU64 = AtomicU64::new(0);
+    if !INIT.swap(true, Ordering::Relaxed) {
+        DBG.store(std::env::var("ENGINE_DEBUG_SYNC").is_ok(), Ordering::Relaxed);
+    }
+    let mut ptrs: Vec<*mut std::ffi::c_void> = vals
+        .iter()
+        .map(|v| v as *const u64 as *mut std::ffi::c_void)
+        .collect();
+    let stream = cuda::cur_stream();
+    let kprof = KPROF_ON.load(Ordering::Relaxed);
+    if kprof {
+        cuda::sync();
+    }
+    let t_k = std::time::Instant::now();
+    let r = sys::cuLaunchKernel(
+        f, gx, gy, gz, bx, 1, 1, 0,
+        stream,
+        ptrs.as_mut_ptr(),
+        std::ptr::null_mut(),
+    );
+    if kprof {
+        cuda::sync();
+        kprof_add(format!("{}[{}x{}]", last_name(), gx, gy), t_k.elapsed().as_micros() as u64);
+    }
+    if std::env::var("ENGINE_DEBUG_LAUNCH").is_ok() {
+        eprintln!("[launch] stream={:p} gx={gx} gy={gy} r={:?}", stream as *mut std::ffi::c_void, r);
+    }
+    cuda::ck(r);
+    if DBG.load(Ordering::Relaxed) {
+        let n = LAUNCH_N.fetch_add(1, Ordering::Relaxed);
+        if std::env::var("ENGINE_DEBUG_TRACE").as_deref() == Ok("1") {
+            eprintln!(
+                "[launch {n}] go gx={gx} gy={gy} gz={gz} bx={bx} a0={:x} a1={:x} a2={:x}",
+                vals.get(0).copied().unwrap_or(0),
+                vals.get(1).copied().unwrap_or(0),
+                vals.get(2).copied().unwrap_or(0)
+            );
+        }
+        cuda::sync();
+    }
 }

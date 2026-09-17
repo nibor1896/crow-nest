@@ -151,8 +151,15 @@ configurations that fall below the 200k context floor, never silently degrades c
 The clamp is **two-sided**: VRAM lowers N, the host pinned budget raises it (fewer cold
 experts to pin). That budget is not a constant — it is derived at boot as
 `min(46 GiB cap, free_for_pin - CROW_RAM_MARGIN_GB)` and capped at the 46 GiB of `geo.rs:110`
-(`manager::derive_host_pinned_budget`, issue #15, 2026-09-17). The planner refuses only when
-no N satisfies both sides (`planner_refusal_msg`).
+(`manager::derive_host_pinned_budget`, issue #15, 2026-09-17). `free_for_pin` counts the
+NVIDIA driver's pinned-page pool as free, because it is reclaimable and the next
+`cuMemHostAlloc` is served out of it — but only while THIS is the only CUDA process. When
+`cuda::other_cuda_fd` finds another process holding `/dev/nvidia-uvm` open (a `/proc/<pid>/fd`
+scan, readable entries only), the pool may be that process's, so the budget falls back to the
+conservative `MemAvailable` and the `[budget]` boot line names that basis. `/dev/nvidia-uvm`
+is the right node: every CUDA context opens it and no graphics client does — measured
+2026-09-17, the compositor and every GL app hold `/dev/nvidiactl` and `/dev/nvidia0` while
+owning no pinned pool, and testing for THOSE refused the engine's own operating point. The planner refuses only when no N satisfies both sides (`planner_refusal_msg`).
 
 ### 2.2 Expert residency (per layer, data-driven)
 
@@ -662,7 +669,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 | step | what the code does | evidence |
 |---|---|---|
 | 1 | `decode_step` creates the capture stream ONCE and leaves it ACTIVE | `gen.rs:2848-2851` |
-| 2 | `launch_v` and `upload_into` both read that active stream | `gen.rs:1215`, `cuda.rs:377` (`cur_stream`) |
+| 2 | `launch_v` and `upload_into` both read that active stream | `kernels.rs` (`launch_v`), `cuda.rs` (`cur_stream`) |
 | 3 | `upload_into` skips its sync on any stream but the legacy one | `cuda.rs:384-386` |
 | 4 | `prefill` uploads its per chunk scalars and the embedding block from TEMPORARIES | `gen.rs:2601-2618`, `gen.rs:2625-2634` |
 | 5 | so a second `prefill` posted async HtoD copies whose host source had already died | measured |
@@ -671,8 +678,8 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 **The remedy, exactly the one this section named as the fallback:**
 
 - `Engine::drop_decode_graph` (`engine/src/reset.rs`) destroys `graph_exec`, destroys
-  `cap_stream` and puts the legacy stream (0) back, mirroring `impl Drop for Engine`
-  (`gen.rs:3417-3427`).
+  `cap_stream` and puts the legacy stream (0) back; `impl Drop for Engine` (`gen.rs`) calls
+  THIS function, so there is one teardown, not two spellings of it.
 - It is the ONE definition of that teardown.
 - The cold path `Engine::reset_to_zero` calls it before any prefill.
 - The warm path `PrefixCache::rollback` (`cache.rs:452`) calls it before any prefill.

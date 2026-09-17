@@ -17,10 +17,9 @@
 
 use crow_nest_engine::cnq;
 use crow_nest_engine::cuda::{self, CUdeviceptr, Pinned};
-use crow_nest_engine::gen::{launch_sync, launch_v};
 use crow_nest_engine::geo::*;
 use crow_nest_engine::sample::Rng;
-use crow_nest_engine::kernels::Kernels;
+use crow_nest_engine::kernels::{launch_sync, launch_v, Kernels};
 
 // ---------------- Rust twins of the device math ----------------
 
@@ -623,7 +622,6 @@ unsafe fn dense_bench_stage(k: &Kernels) {
     let n10240 = cuda::to_i32_dev(&[HCT as i32]);
     let n48 = cuda::to_i32_dev(&[GDN_VHEADS as i32]);
     let n512 = cuda::to_i32_dev(&[KV_ROWS as i32]);
-    let gs_dev = cuda::to_f32_dev(&[0.5f32]);
     // persistent-param integrity watch (corruption hunter)
     let empty: Vec<(&str, CUdeviceptr, i32)> = vec![];
     let watch: Vec<(&str, CUdeviceptr, i32)> = if std::env::var("GATE_WATCH").as_deref() == Ok("1") {

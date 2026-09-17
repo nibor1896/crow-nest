@@ -143,12 +143,6 @@ fn llama_complete(url: &str, text: &str, max_tokens: usize) -> (f64, f64, String
     });
     let msg = &v["choices"][0]["message"];
     let content = msg["content"].as_str().unwrap_or("").to_string();
-    let reasoning = msg["reasoning_content"].as_str().unwrap_or("");
-    let note = if reasoning.is_empty() {
-        format!("answer_chars {}", content.len())
-    } else {
-        format!("answer_chars {} + reasoning_chars {}", content.len(), reasoning.len())
-    };
     // llama-server appends its timings block to OpenAI-format responses too
     let timings = &v["timings"];
     let pre = timings["prompt_per_second"].as_f64().unwrap_or(0.0);
@@ -176,14 +170,12 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
         let ids = tokenize(text);
         // #16: CROW_CHUNK explicit, else auto by prompt length (geo.rs)
         crow_nest_engine::geo::apply_chunk_policy(&mut cfg, ids.len());
-        let (mut eng, _) = crow_nest_engine::gen::Engine::load(
+        let mut eng = crow_nest_engine::gen::Engine::load(
             &mut cnq, cfg, None, &sidecar, false, &mut |_| {},
         );
         let t0 = Instant::now();
         let mut next = eng.prefill(&mut cnq, &ids, None);
-        if std::env::var("CROW_ADAPT").as_deref() == Ok("1") {
-            let cap0: usize = std::env::var("CROW_ADAPT_MAX0").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-            let sw = eng.adapt_hot_set(cap0);
+        if let Some((sw, cap0)) = eng.adapt_after_prefill() {
             eprintln!("[adapt] {sw} hot-slot swaps from the prompt routing (cap {cap0}/layer, 0 = unbounded)");
         }
         let prefill_s = t0.elapsed().as_secs_f64();
@@ -450,7 +442,7 @@ fn main() {
                 let interleave = if (i + run_index) % 2 == 0 { (first, second) } else { (second, first) };
                 for which in [interleave.0, interleave.1] {
                     let t0 = Instant::now();
-                    let (pre, dec, note, ids) = if which == "crow" {
+                    let (pre, dec, note, _ids) = if which == "crow" {
                         crow_complete(&p.text, p.max_tokens)
                     } else {
                         let (pre, dec, content) = llama_complete(&url, &p.text, p.max_tokens);

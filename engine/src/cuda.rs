@@ -468,11 +468,22 @@ pub unsafe fn sync() {
     ck(sys::cuStreamSynchronize(s as CUstream));
 }
 
+/// the host RAM picture the pinned-tier budget is derived from
+pub struct HostRam {
+    /// bytes a `cuMemHostAlloc` may take (see the unix derivation below)
+    pub free_for_pin: u64,
+    /// the kernel's own conservative figure (`MemAvailable`)
+    pub mem_available: u64,
+    /// another live CUDA process holds the driver's pinned pool, so that pool
+    /// is not ours to count and `free_for_pin` IS `mem_available`
+    pub other_cuda: bool,
+}
+
 /// free physical host RAM in bytes (kernel32 GlobalMemoryStatusEx); 0 if the
 /// query fails. Pinned allocations cannot be paged, so the loader refuses to
 /// pin more than what is physically free minus a margin (2026-09-04 freeze).
 #[cfg(windows)]
-pub fn free_physical_ram_parts() -> (u64, u64) {
+pub fn free_physical_ram_parts() -> HostRam {
     #[repr(C)]
     struct MemStatusEx {
         length: u32,
@@ -487,20 +498,21 @@ pub fn free_physical_ram_parts() -> (u64, u64) {
     }
     type FnGms = unsafe extern "system" fn(*mut MemStatusEx) -> i32;
     unsafe {
-        let Ok(lib) = libloading::Library::new("kernel32.dll") else { return (0, 0) };
-        let Ok(f) = lib.get::<FnGms>(b"GlobalMemoryStatusEx\0") else { return (0, 0) };
+        let none = HostRam { free_for_pin: 0, mem_available: 0, other_cuda: false };
+        let Ok(lib) = libloading::Library::new("kernel32.dll") else { return none };
+        let Ok(f) = lib.get::<FnGms>(b"GlobalMemoryStatusEx\0") else { return none };
         let mut st = MemStatusEx {
             length: std::mem::size_of::<MemStatusEx>() as u32,
             memory_load: 0, total_phys: 0, avail_phys: 0, total_page: 0,
             avail_page: 0, total_virtual: 0, avail_virtual: 0, avail_ext_virtual: 0,
         };
-        if f(&mut st) == 0 { return (0, 0) }
+        if f(&mut st) == 0 { return none }
         // one number on windows: avail_phys already excludes what cannot be paged
-        (st.avail_phys, st.avail_phys)
+        HostRam { free_for_pin: st.avail_phys, mem_available: st.avail_phys, other_cuda: false }
     }
 }
 
-/// unix twin. Returns `(free_for_pin, mem_available)`; `(0, 0)` without /proc.
+/// unix twin; all zero without /proc.
 ///
 /// `MemAvailable` is the WRONG input for the pinned tier on this host, low by
 /// tens of GiB, for two reasons (both measured 2026-09-17, issue #15):
@@ -534,9 +546,16 @@ pub fn free_physical_ram_parts() -> (u64, u64) {
 /// counted as free. A field the kernel does not expose counts as 0, so the
 /// estimate errs LARGE; the `CROW_RAM_MARGIN_GB` margin, the 46 GiB budget cap
 /// and the pre-pin gate in `residency::build` are what bound it.
+///
+/// One caveat the pool itself carries: it is only OURS to count while no other
+/// CUDA process is alive. A second process may own those pinned pages, and
+/// taking them for free would overcommit the host. So when `other_cuda_fd`
+/// finds another process holding an NVIDIA device node, the conservative
+/// `MemAvailable` is the answer and the boot line says so.
 #[cfg(unix)]
-pub fn free_physical_ram_parts() -> (u64, u64) {
-    let Ok(txt) = std::fs::read_to_string("/proc/meminfo") else { return (0, 0) };
+pub fn free_physical_ram_parts() -> HostRam {
+    let none = HostRam { free_for_pin: 0, mem_available: 0, other_cuda: false };
+    let Ok(txt) = std::fs::read_to_string("/proc/meminfo") else { return none };
     let f = |name: &str| -> u64 {
         for line in txt.lines() {
             if let Some(rest) = line.strip_prefix(name) {
@@ -551,12 +570,45 @@ pub fn free_physical_ram_parts() -> (u64, u64) {
     let total = f("MemTotal");
     let unreclaimable = f("AnonPages") + f("Shmem") + f("SUnreclaim")
         + f("KernelStack") + f("PageTables") + f("Percpu");
-    (total.saturating_sub(unreclaimable), f("MemAvailable"))
+    let mem_available = f("MemAvailable");
+    let other_cuda = other_cuda_fd(std::path::Path::new("/proc"), std::process::id());
+    let free_for_pin = if other_cuda { mem_available } else { total.saturating_sub(unreclaimable) };
+    HostRam { free_for_pin, mem_available, other_cuda }
+}
+
+/// Is another CUDA process alive? `/proc/<pid>/fd` of every process but
+/// `self_pid`, readable ones only (a process we may not read cannot be
+/// inspected - EACCES is skipped, not an answer).
+///
+/// The node to look for is `/dev/nvidia-uvm`: every CUDA context opens it, and
+/// no graphics client does. `/dev/nvidiactl` and `/dev/nvidia<N>` would be the
+/// wrong test - MEASURED 2026-09-17 on this box, the compositor, Xwayland and
+/// every GL app hold those two (and `/dev/nvidia-modeset`) while owning no
+/// pinned pool at all, and taking them for CUDA refused the engine's own
+/// operating point ("host pinned budget 7.8 GiB").
+#[cfg(unix)]
+pub fn other_cuda_fd(proc_root: &std::path::Path, self_pid: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir(proc_root) else { return false };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        if pid == self_pid {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(e.path().join("fd")) else { continue };
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else { continue };
+            if target.to_str().is_some_and(|t| t.starts_with("/dev/nvidia-uvm")) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// the RAM the cold tier may be pinned into (see `free_physical_ram_parts`)
 pub fn free_physical_ram() -> u64 {
-    free_physical_ram_parts().0
+    free_physical_ram_parts().free_for_pin
 }
 
 // ---------- pinned host memory (zero-copy cold tier, probe 3/4/5 pattern) ----------
@@ -622,4 +674,41 @@ pub fn write_le<T: Copy>(path: &str, v: &[T]) -> std::io::Result<()> {
     use std::io::Write;
     let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) };
     std::fs::File::create(path)?.write_all(bytes)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::other_cuda_fd;
+    use std::os::unix::fs::symlink;
+
+    /// a fake /proc: `<pid>/fd/<n>` symlinks, exactly what the scan reads
+    fn fake_proc(tag: &str, fds: &[(u32, &str)]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("crow-proc-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (i, (pid, target)) in fds.iter().enumerate() {
+            let dir = root.join(pid.to_string()).join("fd");
+            std::fs::create_dir_all(&dir).unwrap();
+            symlink(target, dir.join(i.to_string())).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn other_cuda_fd_is_uvm_only_and_never_self() {
+        // our own CUDA fds never count
+        let mine = fake_proc("self", &[(4242, "/dev/nvidia-uvm"), (4242, "/dev/nvidiactl")]);
+        assert!(!other_cuda_fd(&mine, 4242));
+        // the same tree read as somebody else: pid 4242 IS another CUDA process
+        assert!(other_cuda_fd(&mine, 1));
+        let uvm = fake_proc("uvm", &[(7, "/dev/nvidia-uvm-tools"), (8, "/dev/null")]);
+        assert!(other_cuda_fd(&uvm, 4242));
+        // the desktop: compositor / Xwayland / GL apps hold these and own no pinned pool
+        let gfx = fake_proc("gfx", &[(7, "/dev/nvidiactl"), (8, "/dev/nvidia0"), (9, "/dev/nvidia-modeset")]);
+        assert!(!other_cuda_fd(&gfx, 4242));
+        // unreadable / absent trees are skipped, never an answer
+        assert!(!other_cuda_fd(std::path::Path::new("/nonexistent-proc"), 1));
+        for r in [mine, uvm, gfx] {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
 }

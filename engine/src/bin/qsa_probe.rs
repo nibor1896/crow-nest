@@ -20,7 +20,8 @@
 //!
 //! usage: qsa_probe [--rows N] [--bench]
 use crow_nest_engine::cuda;
-use crow_nest_engine::gen::{launch_qsa_par_e, launch_v, QSA_PAR_BINS};
+use crow_nest_engine::gen::{launch_qsa_par_e, QSA_PAR_BINS};
+use crow_nest_engine::kernels::launch_v;
 use crow_nest_engine::geo::QSA_SEL_MAX;
 /// deterministic xorshift64*: the same rows on every machine and every run
 use crow_nest_engine::sample::Rng;

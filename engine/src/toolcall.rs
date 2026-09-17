@@ -460,6 +460,28 @@ impl ToolStream {
     }
 
     /// the call in flight is markup this parser cannot read: back to content
+    /// Both `<function=NAME>` and `<parameter=NAME>` read the same way: the text
+    /// up to the next `>`, trimmed and length-capped. `Ok(None)` = need more input,
+    /// `Err(())` = malformed, give up.
+    fn read_name_to_gt(&mut self) -> Result<Option<String>, ()> {
+        match self.buf.find('>') {
+            Some(at) => {
+                let s = self.eat(at + 1);
+                let name = s[..at].trim().to_string();
+                if name.is_empty() || name.len() > MAX_TOOL_NAME {
+                    return Err(());
+                }
+                Ok(Some(name))
+            }
+            None => {
+                if self.buf.len() > MAX_TOOL_NAME {
+                    return Err(());
+                }
+                Ok(None)
+            }
+        }
+    }
+
     fn give_up(&mut self, out: &mut Vec<Emit>) {
         self.flush_raw(out);
         // an abandoned call keeps its index: a later call must not land in the same slot
@@ -523,33 +545,23 @@ impl ToolStream {
                         }
                     }
                 }
-                TState::FuncName => {
-                    match self.buf.find('>') {
-                        Some(at) => {
-                            let s = self.eat(at + 1);
-                            let name = s[..at].trim().to_string();
-                            if name.is_empty() || name.len() > MAX_TOOL_NAME {
-                                self.give_up(out);
-                                continue;
-                            }
-                            self.name = name.clone();
-                            self.named = true;
-                            out.push(Emit::Call {
-                                index: self.index,
-                                id: format!("call_{}", self.index),
-                                name,
-                            });
-                            self.state = TState::Body;
-                        }
-                        None => {
-                            if self.buf.len() > MAX_TOOL_NAME {
-                                self.give_up(out);
-                                continue;
-                            }
-                            return;
-                        }
+                TState::FuncName => match self.read_name_to_gt() {
+                    Ok(Some(name)) => {
+                        self.name = name.clone();
+                        self.named = true;
+                        out.push(Emit::Call {
+                            index: self.index,
+                            id: format!("call_{}", self.index),
+                            name,
+                        });
+                        self.state = TState::Body;
                     }
-                }
+                    Ok(None) => return,
+                    Err(()) => {
+                        self.give_up(out);
+                        continue;
+                    }
+                },
                 TState::Body => {
                     let (hit, safe) =
                         find_marker(&self.buf, &[PARAM_OPEN, FUNCTION_CLOSE, TOOL_CLOSE]);
@@ -578,28 +590,18 @@ impl ToolStream {
                         }
                     }
                 }
-                TState::ParamName => {
-                    match self.buf.find('>') {
-                        Some(at) => {
-                            let s = self.eat(at + 1);
-                            let p = s[..at].trim().to_string();
-                            if p.is_empty() || p.len() > MAX_TOOL_NAME {
-                                self.give_up(out);
-                                continue;
-                            }
-                            self.pname = p;
-                            self.open_param(out);
-                            self.state = TState::ParamValue;
-                        }
-                        None => {
-                            if self.buf.len() > MAX_TOOL_NAME {
-                                self.give_up(out);
-                                continue;
-                            }
-                            return;
-                        }
+                TState::ParamName => match self.read_name_to_gt() {
+                    Ok(Some(p)) => {
+                        self.pname = p;
+                        self.open_param(out);
+                        self.state = TState::ParamValue;
                     }
-                }
+                    Ok(None) => return,
+                    Err(()) => {
+                        self.give_up(out);
+                        continue;
+                    }
+                },
                 TState::ParamValue => {
                     if self.skip_nl {
                         if self.buf.starts_with('\n') {

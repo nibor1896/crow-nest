@@ -1217,19 +1217,35 @@ fn timings_json(t: &Timing) -> serde_json::Value {
     })
 }
 
-/// one `chat.completion.chunk`, the only object shape this endpoint streams
-fn chunk(
-    id: &str,
+/// the three fields EVERY chunk and the document of one response repeat
+#[derive(Clone, Copy)]
+struct ChunkCtx<'a> {
+    id: &'a str,
     created: u64,
-    model: &str,
-    delta: serde_json::Value,
-    finish: Option<&str>,
-) -> serde_json::Value {
+    model: &'a str,
+}
+
+impl<'a> ChunkCtx<'a> {
+    fn new(id: &'a str, created: u64, model: &'a str) -> ChunkCtx<'a> {
+        ChunkCtx { id, created, model }
+    }
+}
+
+/// what the LAST chunk needs beyond the ChunkCtx (#27 A5: usage / timings are flags)
+struct FinishArgs<'a> {
+    finish: &'a str,
+    t: &'a Timing,
+    include_usage: bool,
+    timings_per_token: bool,
+}
+
+/// one `chat.completion.chunk`, the only object shape this endpoint streams
+fn chunk(c: &ChunkCtx, delta: serde_json::Value, finish: Option<&str>) -> serde_json::Value {
     serde_json::json!({
-        "id": id,
+        "id": c.id,
         "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
+        "created": c.created,
+        "model": c.model,
         "choices": [{
             "index": 0,
             "delta": delta,
@@ -1242,26 +1258,19 @@ fn chunk(
 }
 
 /// first chunk: the role, no content (`crow_core.py:4877` reads content only)
-fn chunk_role(id: &str, created: u64, model: &str) -> serde_json::Value {
-    chunk(id, created, model, serde_json::json!({ "role": "assistant" }), None)
+fn chunk_role(c: &ChunkCtx) -> serde_json::Value {
+    chunk(c, serde_json::json!({ "role": "assistant" }), None)
 }
 
 /// a content delta chunk, one per emitted text piece
-fn chunk_content(id: &str, created: u64, model: &str, text: &str) -> serde_json::Value {
-    chunk(id, created, model, serde_json::json!({ "content": text }), None)
+fn chunk_content(c: &ChunkCtx, text: &str) -> serde_json::Value {
+    chunk(c, serde_json::json!({ "content": text }), None)
 }
 
 /// - #29 A7: the FIRST fragment of one tool call, the only one carrying `id` and `name`
 /// - `arguments` is the empty string here, as llama-server and OpenAI send it
 /// - Crow keeps `id` and `name` because it tests them for truth (`crow_core.py:4869-4874`)
-fn chunk_tool_open(
-    id: &str,
-    created: u64,
-    model: &str,
-    index: usize,
-    call_id: &str,
-    name: &str,
-) -> serde_json::Value {
+fn chunk_tool_open(c: &ChunkCtx, index: usize, call_id: &str, name: &str) -> serde_json::Value {
     let delta = serde_json::json!({
         "tool_calls": [{
             "index": index,
@@ -1270,48 +1279,34 @@ fn chunk_tool_open(
             "function": { "name": name, "arguments": "" },
         }],
     });
-    chunk(id, created, model, delta, None)
+    chunk(c, delta, None)
 }
 
 /// - #29 A7: one `arguments` fragment of the call at `index`
 /// - NO `id` and NO `name`: an empty string here would erase what the open chunk said
 /// - the concatenation of every fragment of one index is the arguments JSON object text
-fn chunk_tool_args(
-    id: &str,
-    created: u64,
-    model: &str,
-    index: usize,
-    args: &str,
-) -> serde_json::Value {
+fn chunk_tool_args(c: &ChunkCtx, index: usize, args: &str) -> serde_json::Value {
     let delta = serde_json::json!({
         "tool_calls": [{
             "index": index,
             "function": { "arguments": args },
         }],
     });
-    chunk(id, created, model, delta, None)
+    chunk(c, delta, None)
 }
 
 /// - last chunk before `[DONE]`: empty delta, the finish reason
 /// - `usage` rides along when `include_usage`, `timings` when `timings_per_token` (#27 A5)
 /// - neither flag: the object is exactly the A4 chunk, no empty placeholders
 /// - pure: the whole final chunk contract is one function the test can drive
-fn chunk_finish(
-    id: &str,
-    created: u64,
-    model: &str,
-    reason: &str,
-    t: &Timing,
-    include_usage: bool,
-    timings_per_token: bool,
-) -> serde_json::Value {
-    let mut doc = chunk(id, created, model, serde_json::json!({}), Some(reason));
+fn chunk_finish(c: &ChunkCtx, a: &FinishArgs) -> serde_json::Value {
+    let mut doc = chunk(c, serde_json::json!({}), Some(a.finish));
     if let Some(obj) = doc.as_object_mut() {
-        if include_usage {
-            obj.insert("usage".to_string(), usage_json(t));
+        if a.include_usage {
+            obj.insert("usage".to_string(), usage_json(a.t));
         }
-        if timings_per_token {
-            obj.insert("timings".to_string(), timings_json(t));
+        if a.timings_per_token {
+            obj.insert("timings".to_string(), timings_json(a.t));
         }
     }
     doc
@@ -1405,20 +1400,11 @@ fn sse_send<W: Write>(w: &mut W, text: &str) -> bool {
 /// - every method returns `false` for "the client is gone, stop the loop"
 trait ChatSink {
     /// before the first token: the role delta of the stream, nothing for a document
-    fn open(&mut self, id: &str, created: u64, model: &str) -> bool;
+    fn open(&mut self, c: &ChunkCtx) -> bool;
     /// one parser fragment, in arrival order
-    fn on_emit(&mut self, id: &str, created: u64, model: &str, e: &Emit) -> bool;
+    fn on_emit(&mut self, c: &ChunkCtx, e: &Emit) -> bool;
     /// after the last token: the final chunk plus `[DONE]`, nothing for a document
-    fn on_finish(
-        &mut self,
-        id: &str,
-        created: u64,
-        model: &str,
-        finish: &str,
-        t: &Timing,
-        include_usage: bool,
-        timings_per_token: bool,
-    ) -> bool;
+    fn on_finish(&mut self, c: &ChunkCtx, a: &FinishArgs) -> bool;
 }
 
 /// the A4/A5 sink: one flushed SSE frame per piece, over any writer
@@ -1433,31 +1419,19 @@ impl<W: Write> SseSink<W> {
 }
 
 impl<W: Write> ChatSink for SseSink<W> {
-    fn open(&mut self, id: &str, created: u64, model: &str) -> bool {
-        sse_send(&mut self.w, &sse_frame(&chunk_role(id, created, model)))
+    fn open(&mut self, c: &ChunkCtx) -> bool {
+        sse_send(&mut self.w, &sse_frame(&chunk_role(c)))
     }
-    fn on_emit(&mut self, id: &str, created: u64, model: &str, e: &Emit) -> bool {
+    fn on_emit(&mut self, c: &ChunkCtx, e: &Emit) -> bool {
         let doc = match e {
-            Emit::Content(t) => chunk_content(id, created, model, t),
-            Emit::Call { index, id: call_id, name } => {
-                chunk_tool_open(id, created, model, *index, call_id, name)
-            }
-            Emit::Args { index, text } => chunk_tool_args(id, created, model, *index, text),
+            Emit::Content(t) => chunk_content(c, t),
+            Emit::Call { index, id: call_id, name } => chunk_tool_open(c, *index, call_id, name),
+            Emit::Args { index, text } => chunk_tool_args(c, *index, text),
         };
         sse_send(&mut self.w, &sse_frame(&doc))
     }
-    fn on_finish(
-        &mut self,
-        id: &str,
-        created: u64,
-        model: &str,
-        finish: &str,
-        t: &Timing,
-        include_usage: bool,
-        timings_per_token: bool,
-    ) -> bool {
-        let last = chunk_finish(id, created, model, finish, t, include_usage, timings_per_token);
-        sse_send(&mut self.w, &sse_frame(&last)) && sse_send(&mut self.w, SSE_DONE)
+    fn on_finish(&mut self, c: &ChunkCtx, a: &FinishArgs) -> bool {
+        sse_send(&mut self.w, &sse_frame(&chunk_finish(c, a))) && sse_send(&mut self.w, SSE_DONE)
     }
 }
 
@@ -1481,10 +1455,10 @@ struct CollectSink {
 }
 
 impl ChatSink for CollectSink {
-    fn open(&mut self, _id: &str, _created: u64, _model: &str) -> bool {
+    fn open(&mut self, _c: &ChunkCtx) -> bool {
         true
     }
-    fn on_emit(&mut self, _id: &str, _created: u64, _model: &str, e: &Emit) -> bool {
+    fn on_emit(&mut self, _c: &ChunkCtx, e: &Emit) -> bool {
         match e {
             Emit::Content(t) => self.content.push_str(t),
             Emit::Call { index, id: call_id, name } => {
@@ -1504,16 +1478,7 @@ impl ChatSink for CollectSink {
         }
         true
     }
-    fn on_finish(
-        &mut self,
-        _id: &str,
-        _created: u64,
-        _model: &str,
-        _finish: &str,
-        _t: &Timing,
-        _include_usage: bool,
-        _timings_per_token: bool,
-    ) -> bool {
+    fn on_finish(&mut self, _c: &ChunkCtx, _a: &FinishArgs) -> bool {
         true
     }
 }
@@ -1523,9 +1488,7 @@ impl ChatSink for CollectSink {
 /// - `false` means the client is gone and the generation loop must stop
 fn send_emits(
     sink: &mut dyn ChatSink,
-    id: &str,
-    created: u64,
-    model: &str,
+    c: &ChunkCtx,
     pieces: &[Emit],
     content_chunks: &mut usize,
     tool_chunks: &mut usize,
@@ -1535,7 +1498,7 @@ fn send_emits(
             Emit::Content(_) => *content_chunks += 1,
             Emit::Call { .. } | Emit::Args { .. } => *tool_chunks += 1,
         }
-        if !sink.on_emit(id, created, model, e) {
+        if !sink.on_emit(c, e) {
             return false;
         }
     }
@@ -1554,9 +1517,7 @@ fn send_emits(
 ///   think block is empty (`tokenizer.rs:18-19`)
 /// - pure: the whole document contract is one function the test drives directly
 fn completion_json(
-    id: &str,
-    created: u64,
-    model: &str,
+    c: &ChunkCtx,
     content: &str,
     calls: &[CallBuf],
     finish: &str,
@@ -1579,10 +1540,10 @@ fn completion_json(
         }
     }
     serde_json::json!({
-        "id": id,
+        "id": c.id,
         "object": "chat.completion",
-        "created": created,
-        "model": model,
+        "created": c.created,
+        "model": c.model,
         "choices": [{
             "index": 0,
             "message": message,
@@ -1723,9 +1684,7 @@ fn chat_document(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u3
     let mut sink = CollectSink::default();
     let out = chat_generate(srv, req, ids, tk, &mut sink);
     let doc = completion_json(
-        &out.id,
-        out.created,
-        &req.model,
+        &ChunkCtx::new(&out.id, out.created, &req.model),
         &sink.content,
         &sink.calls,
         out.finish,
@@ -1899,7 +1858,9 @@ fn chat_generate(
     let tool_open = tk.token_id(TOOL_OPEN);
     let mut tool_chunks = 0usize;
 
-    let mut aborted = !sink.open(&id, created, &model);
+    // the id/created/model triple of this response, once
+    let cx = ChunkCtx::new(&id, created, &model);
+    let mut aborted = !sink.open(&cx);
 
     // #27 A5: the decode window opens at the FIRST `decode_step` and closes when the last one
     // returns, so the detokenize and the sink call of token 1 are not counted as decode
@@ -1939,15 +1900,7 @@ fn chat_generate(
             if let Some(delta) = next_delta(&full, emitted) {
                 emitted = full.len();
                 let pieces = ts.feed(delta);
-                if !send_emits(
-                    sink,
-                    &id,
-                    created,
-                    &model,
-                    &pieces,
-                    &mut content_chunks,
-                    &mut tool_chunks,
-                ) {
+                if !send_emits(sink, &cx, &pieces, &mut content_chunks, &mut tool_chunks) {
                     aborted = true;
                     break;
                 }
@@ -1992,15 +1945,7 @@ fn chat_generate(
             Vec::new()
         };
         malformed = ts.finish(&mut pieces);
-        if !send_emits(
-            sink,
-            &id,
-            created,
-            &model,
-            &pieces,
-            &mut content_chunks,
-            &mut tool_chunks,
-        ) {
+        if !send_emits(sink, &cx, &pieces, &mut content_chunks, &mut tool_chunks) {
             aborted = true;
         }
     }
@@ -2049,13 +1994,13 @@ fn chat_generate(
     };
     if !aborted {
         let _ = sink.on_finish(
-            &id,
-            created,
-            &model,
-            finish,
-            &timing,
-            req.include_usage,
-            req.timings_per_token,
+            &cx,
+            &FinishArgs {
+                finish,
+                t: &timing,
+                include_usage: req.include_usage,
+                timings_per_token: req.timings_per_token,
+            },
         );
     }
 
@@ -2135,7 +2080,7 @@ unsafe fn write_vit_dump(
     prefill_ms: f64,
 ) {
     let _ = std::fs::create_dir_all(dir);
-    let (map, grids, delta, n_visual) = match srv.eng.vit_plan.as_ref() {
+    let (map, grids, _delta, n_visual) = match srv.eng.vit_plan.as_ref() {
         Some(p) => (p.map.clone(), p.grids.clone(), p.delta, p.n_visual),
         None => (Vec::new(), Vec::new(), 0i64, 0usize),
     };
@@ -2506,7 +2451,7 @@ fn main() {
     apply_adapt_policy(&mut cfg);
 
     // unsafe: pins device and host memory; takes engine/.engine.lock, a second serve dies here
-    let (eng, _rep) = unsafe {
+    let eng = unsafe {
         Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| eprintln!("[load] {m}"))
     };
     // `Cnq::open` handed the container to the loader; the engine keeps a raw
@@ -3015,7 +2960,7 @@ mod tests {
     #[test]
     fn a_chunk_carries_exactly_what_crow_reads() {
         // crow_core.py:4846 finish_reason, :4877 delta.content
-        let role = chunk_role("chatcmpl-1", 1_757_000_000, "crow-nest");
+        let role = chunk_role(&ChunkCtx::new("chatcmpl-1", 1_757_000_000, "crow-nest"));
         assert_eq!(role["object"], "chat.completion.chunk");
         assert_eq!(role["id"], "chatcmpl-1");
         assert_eq!(role["created"], 1_757_000_000u64);
@@ -3025,17 +2970,17 @@ mod tests {
         assert_eq!(role["choices"][0]["finish_reason"], serde_json::Value::Null);
         assert!(role["choices"][0]["delta"].get("content").is_none());
 
-        let c = chunk_content("chatcmpl-1", 1, "crow-nest", " ready");
+        let c = chunk_content(&ChunkCtx::new("chatcmpl-1", 1, "crow-nest"), " ready");
         assert_eq!(c["choices"][0]["delta"]["content"], " ready");
         assert_eq!(c["choices"][0]["finish_reason"], serde_json::Value::Null);
 
         // the last chunk: empty delta, a finish reason, and only ONE of them exists
         let t = T0;
-        let f = chunk_finish("chatcmpl-1", 1, "crow-nest", "stop", &t, false, false);
+        let f = chunk_finish(&ChunkCtx::new("chatcmpl-1", 1, "crow-nest"), &FinishArgs { finish: "stop", t: &t, include_usage: false, timings_per_token: false });
         assert_eq!(f["choices"][0]["finish_reason"], "stop");
         assert_eq!(f["choices"][0]["delta"], serde_json::json!({}));
         assert_eq!(
-            chunk_finish("i", 1, "m", "length", &t, false, false)["choices"][0]["finish_reason"],
+            chunk_finish(&ChunkCtx::new("i", 1, "m"), &FinishArgs { finish: "length", t: &t, include_usage: false, timings_per_token: false })["choices"][0]["finish_reason"],
             "length"
         );
     }
@@ -3055,19 +3000,19 @@ mod tests {
 
     #[test]
     fn without_the_two_flags_the_final_chunk_is_the_a4_chunk() {
-        let f = chunk_finish("id", 7, "m", "stop", &T0, false, false);
+        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: false });
         assert!(f.get("usage").is_none());
         assert!(f.get("timings").is_none());
         // nothing else moved either: the object is exactly what A4 sent
         assert_eq!(
             f,
-            chunk("id", 7, "m", serde_json::json!({}), Some("stop")),
+            chunk(&ChunkCtx::new("id", 7, "m"), serde_json::json!({}), Some("stop")),
         );
         // one flag at a time carries one object at a time
-        let u = chunk_finish("id", 7, "m", "stop", &T0, true, false);
+        let u = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: false });
         assert!(u.get("usage").is_some());
         assert!(u.get("timings").is_none());
-        let t = chunk_finish("id", 7, "m", "stop", &T0, false, true);
+        let t = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: true });
         assert!(t.get("usage").is_none());
         assert!(t.get("timings").is_some());
     }
@@ -3075,7 +3020,7 @@ mod tests {
     #[test]
     fn the_final_chunk_carries_the_eight_fields_crow_reads() {
         // crow_core.py:4838-4845 (usage) and :4999-5018 (timings)
-        let f = chunk_finish("id", 7, "m", "stop", &T0, true, true);
+        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: true });
         // the finish reason did not move: Crow reads it off the SAME chunk
         assert_eq!(f["choices"][0]["finish_reason"], "stop");
 
@@ -3116,7 +3061,7 @@ mod tests {
     /// #31 A9: `prompt_tokens` stays the WHOLE prompt, `cached_tokens` is P, `prompt_n` the rest
     #[test]
     fn a_warm_turn_splits_the_prompt_into_cached_and_prefilled() {
-        let f = chunk_finish("id", 7, "m", "stop", &T_WARM, true, true);
+        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T_WARM, include_usage: true, timings_per_token: true });
         let u = &f["usage"];
         // the same 16,064 token prompt as the cold turn: the client's accounting cannot move
         assert_eq!(u["prompt_tokens"].as_u64(), Some(16_064));
@@ -3154,7 +3099,7 @@ mod tests {
     #[test]
     fn the_cache_fields_are_present_as_integers_warm_and_cold() {
         for t in [&T0, &T_WARM] {
-            let f = chunk_finish("id", 7, "m", "stop", t, true, true);
+            let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &t, include_usage: true, timings_per_token: true });
             let c = &f["usage"]["prompt_tokens_details"]["cached_tokens"];
             let n = &f["timings"]["cache_n"];
             assert!(c.is_u64() || c.is_i64(), "cached_tokens is not an int: {c}");
@@ -3208,7 +3153,7 @@ mod tests {
             ple_rows_total: 0,
             ple_miss_total: 0,
         };
-        let f = chunk_finish("id", 7, "m", "stop", &z, true, true);
+        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &z, include_usage: true, timings_per_token: true });
         for k in ["prompt_ms", "prompt_per_second", "predicted_per_second", "predicted_per_token_ms"] {
             assert_eq!(f["timings"][k].as_f64(), Some(0.0), "{k} is {}", f["timings"][k]);
         }
@@ -3219,7 +3164,7 @@ mod tests {
     /// #30 A8: the five keys, their exact names, and u64 (never a float)
     #[test]
     fn the_timings_block_carries_the_engine_counters_as_u64() {
-        let g = &chunk_finish("id", 7, "m", "stop", &T0, true, true)["timings"];
+        let g = &chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: true })["timings"];
         // the names are the contract: a renamed key silently breaks every difference reader
         assert_eq!(g["crow_expert_selections"].as_u64(), Some(7_710_720));
         assert_eq!(g["crow_expert_cold"].as_u64(), Some(2_534_400));
@@ -3246,14 +3191,14 @@ mod tests {
     #[test]
     fn the_counters_are_passed_through_unchanged_and_only_live_in_timings() {
         // no flag at all: the counters are NOT on the chunk, the A4 shape is untouched
-        let f = chunk_finish("id", 7, "m", "stop", &T0, false, false);
+        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: false });
         assert!(!f.to_string().contains("crow_expert"), "{f}");
         // include_usage alone: `usage` carries none of them either
-        let u = chunk_finish("id", 7, "m", "stop", &T0, true, false);
+        let u = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: false });
         assert!(u.get("timings").is_none());
         assert!(!u.to_string().contains("crow_"), "{u}");
         // timings on: the value on the wire is the value the engine read, byte for byte
-        let g = &chunk_finish("id", 7, "m", "stop", &T0, false, true)["timings"];
+        let g = &chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: true })["timings"];
         assert_eq!(g["crow_expert_selections"].as_u64(), Some(T0.selections_total));
         assert_eq!(g["crow_expert_cold"].as_u64(), Some(T0.cold_total));
         assert_eq!(g["crow_ple_rows"].as_u64(), Some(T0.ple_rows_total));
@@ -3327,14 +3272,14 @@ mod tests {
 
     #[test]
     fn an_sse_frame_is_one_data_line_and_a_blank_line() {
-        let f = sse_frame(&chunk_content("id", 7, "m", "hi"));
+        let f = sse_frame(&chunk_content(&ChunkCtx::new("id", 7, "m"), "hi"));
         assert!(f.starts_with("data: {"));
         assert!(f.ends_with("\n\n"));
         // exactly one event: one `data:` line, then the terminator
         assert_eq!(f.matches("data: ").count(), 1);
         assert_eq!(f.trim_end_matches('\n').matches('\n').count(), 0);
         // a newline inside the content is escaped by the JSON writer, never raw
-        let f = sse_frame(&chunk_content("id", 7, "m", "a\nb"));
+        let f = sse_frame(&chunk_content(&ChunkCtx::new("id", 7, "m"), "a\nb"));
         assert!(f.contains(r#""content":"a\nb""#));
         assert_eq!(f.trim_end_matches('\n').matches('\n').count(), 0);
         // the closing line of every stream
@@ -3389,7 +3334,7 @@ mod tests {
 
     #[test]
     fn a_tool_chunk_carries_exactly_what_crow_reassembles() {
-        let open = chunk_tool_open("chatcmpl-1", 7, "crow-nest", 0, "call_0", "read_file");
+        let open = chunk_tool_open(&ChunkCtx::new("chatcmpl-1", 7, "crow-nest"), 0, "call_0", "read_file");
         let c = &open["choices"][0];
         assert_eq!(c["index"], 0);
         assert_eq!(c["finish_reason"], serde_json::Value::Null);
@@ -3400,7 +3345,7 @@ mod tests {
         assert_eq!(call["function"]["name"], "read_file");
         assert_eq!(call["function"]["arguments"], "");
 
-        let frag = chunk_tool_args("chatcmpl-1", 7, "crow-nest", 0, "{\"path\":\"");
+        let frag = chunk_tool_args(&ChunkCtx::new("chatcmpl-1", 7, "crow-nest"), 0, "{\"path\":\"");
         let call = &frag["choices"][0]["delta"]["tool_calls"][0];
         assert_eq!(call["index"], 0);
         assert_eq!(call["function"]["arguments"], "{\"path\":\"");
@@ -3844,7 +3789,7 @@ mod tests {
         // probe-suite.py:677-683 reads choices[0].finish_reason, .message.content,
         // .message.reasoning_content and usage.completion_tokens
         let t = b3a_timing();
-        let d = completion_json("chatcmpl-1700-2", 1700, "crow", "hello", &[], "stop", &t);
+        let d = completion_json(&ChunkCtx::new("chatcmpl-1700-2", 1700, "crow"), "hello", &[], "stop", &t);
         assert_eq!(d["id"], "chatcmpl-1700-2");
         assert_eq!(d["object"], "chat.completion");
         assert_eq!(d["created"], 1700);
@@ -3874,7 +3819,7 @@ mod tests {
         let ck: Vec<&str> = c.as_object().unwrap().keys().map(|s| s.as_str()).collect();
         assert_eq!(ck, vec!["index", "message", "finish_reason"]);
         // `length` is the other reason gate part 1 accepts
-        let l = completion_json("x", 1, "crow", "hi", &[], "length", &t);
+        let l = completion_json(&ChunkCtx::new("x", 1, "crow"), "hi", &[], "length", &t);
         assert_eq!(l["choices"][0]["finish_reason"], "length");
     }
 
@@ -3887,7 +3832,7 @@ mod tests {
             name: "read_file".to_string(),
             arguments: "{\"path\":\"a.md\",\"start_line\":1}".to_string(),
         }];
-        let d = completion_json("id1", 5, "crow", "", &calls, "tool_calls", &t);
+        let d = completion_json(&ChunkCtx::new("id1", 5, "crow"), "", &calls, "tool_calls", &t);
         let m = &d["choices"][0]["message"];
         assert_eq!(m["role"], "assistant");
         assert_eq!(m["content"], "");
@@ -3925,10 +3870,10 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         let mut sse = SseSink::new(&mut buf);
         let (mut sc, mut st) = (0usize, 0usize);
-        assert!(send_emits(&mut sse, "id1", 5, "crow", &pieces, &mut sc, &mut st));
+        assert!(send_emits(&mut sse, &ChunkCtx::new("id1", 5, "crow"), &pieces, &mut sc, &mut st));
         let mut col = CollectSink::default();
         let (mut cc, mut ct) = (0usize, 0usize);
-        assert!(send_emits(&mut col, "id1", 5, "crow", &pieces, &mut cc, &mut ct));
+        assert!(send_emits(&mut col, &ChunkCtx::new("id1", 5, "crow"), &pieces, &mut cc, &mut ct));
         // the same loop counts the same chunks for both sinks
         assert_eq!((sc, st), (cc, ct));
         assert_eq!((sc, st), (2, 3));
@@ -4025,7 +3970,7 @@ mod tests {
                 text: "1}".to_string(),
             },
         ];
-        assert!(send_emits(&mut col, "i", 1, "m", &pieces, &mut c, &mut t));
+        assert!(send_emits(&mut col, &ChunkCtx::new("i", 1, "m"), &pieces, &mut c, &mut t));
         assert_eq!(col.calls.len(), 2);
         assert_eq!(col.calls[0].arguments, "{}");
         assert_eq!(col.calls[1].name, "b");

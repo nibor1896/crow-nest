@@ -32,8 +32,8 @@
 //! llama-server `--image-max-tokens` default), larger requests answer 400.
 
 use crate::cuda::{self, CUdeviceptr as Dev};
-use crate::gen::{launch_v, Fp4};
-use crate::kernels::Kernels;
+use crate::weights::{dequant_fp4_dev, load_fp4, Fp4};
+use crate::kernels::{launch_v, Kernels};
 use crate::{cnq::Cnq, geo::{H, MIB}};
 
 /// the `<|image_pad|>` token (tokenizer_config.json added_tokens_decoder)
@@ -41,8 +41,8 @@ pub const IMAGE_PAD: i64 = 248056;
 
 pub const VIT_HIDDEN: usize = 1152;
 pub const VIT_HEADS: usize = 16;
-pub const VIT_HEAD_DIM: usize = 72; // hidden / heads
-pub const VIT_ROT: usize = 36; // head_dim / 2
+pub const VIT_HEAD_DIM: usize = VIT_HIDDEN / VIT_HEADS; // 72
+pub const VIT_ROT: usize = VIT_HEAD_DIM / 2; // 36
 pub const VIT_BLOCKS: usize = 27;
 pub const VIT_INTER: usize = 4304;
 pub const VIT_MERGED: usize = 4 * VIT_HIDDEN; // 4608 merger input row
@@ -110,7 +110,7 @@ unsafe fn load_f32_small(cnq: &mut Cnq, name: &str) -> Dev {
 unsafe fn load_f4(cnq: &mut Cnq, name: &str) -> Fp4 {
     let t = cnq.find(name, "vit").clone();
     assert_eq!(t.dtype, "nvfp4", "{name}: the vit section of record is NVFP4, got {}", t.dtype);
-    crate::gen::load_fp4(cnq, name, "vit")
+    load_fp4(cnq, name, "vit")
 }
 
 impl VitW {
@@ -121,7 +121,7 @@ impl VitW {
         let patch_proj = load_f4(cnq, "model.visual.patch_embed.proj.weight");
         let patch_bias = load_f32_small(cnq, "model.visual.patch_embed.proj.bias");
         say!("pos_embed");
-        let pos_embed = crate::gen::dequant_fp4_dev(
+        let pos_embed = dequant_fp4_dev(
             cnq, "model.visual.pos_embed.weight", "vit", VIT_SIDE * VIT_SIDE * VIT_HIDDEN);
         say!("pos_embed ok");
         let mut blocks = Vec::with_capacity(VIT_BLOCKS);
@@ -209,7 +209,8 @@ const S_BIAS_QKV: usize = 8;  // stride 3456, cols 3456 (one pair packed [s,c])
 const S_BIAS_INTER: usize = 9;
 const S_BIAS_MERGED: usize = 10;
 const S_BIAS_H: usize = 11;
-const S_COLS_STRIDE: usize = 12; // [cols, stride] pair for vit_add_bias, refreshed per site
+const S_RESERVED_12: usize = 12; // reserved slot; every S_* index is a kernel argument position - never renumber
+const _: () = assert!(S_RESERVED_12 + 1 == S_NP);
 const S_NP: usize = 13;          // n * 1152, the add_flat residual count (refreshed per image)
 const S_NMLP: usize = 14;        // n * 4304, the block MLP gelu count
 const S_NMERGE: usize = 15;      // nv * 4608, the merger gelu count
@@ -265,7 +266,7 @@ impl Vit {
             VIT_IN as i32, VIT_HIDDEN as i32, VIT_INTER as i32, VIT_MERGED as i32, VIT_HIDDEN as i32,
             0, 0,                          // S_N, S_NV (refreshed per image)
             0, 0, 0, 0, 0,                 // S_STRIDE_HIDDEN + S_BIAS*
-            0,                             // S_COLS_STRIDE (unused)
+            0,                             // S_RESERVED_12
             0, 0, 0,                       // S_NP, S_NMLP, S_NMERGE
         ];
         self.s = scalars.iter().map(|v| cuda::to_i32_dev(&[*v])).collect();
@@ -734,12 +735,10 @@ pub struct VisionPlan {
 pub fn expand_ids(ids: &[u32], counts: &[usize]) -> Result<Vec<u32>, String> {
     let mut out = Vec::with_capacity(ids.len() + counts.iter().sum::<usize>());
     let mut it = counts.iter();
-    let mut remaining = 0usize;
     for &id in ids {
         if id as i64 == IMAGE_PAD {
             let c = it.next().ok_or("more image_pad tokens than images")?;
-            remaining = *c;
-            out.extend(std::iter::repeat(id).take(remaining));
+            out.extend(std::iter::repeat(id).take(*c));
         } else {
             out.push(id);
         }
@@ -804,8 +803,7 @@ pub fn mrope_positions(types: &[u8], grids: &[Grid]) -> (Vec<[i64; 3]>, i64) {
 /// axes at `row + delta`. The f32 expressions are byte-for-byte the ones in
 /// `manager.rs` so a text-only span reproduces the load-time table bit for bit.
 pub fn mrope_tables(pos: &[[i64; 3]], seq: usize, span: usize, delta: i64) -> (Vec<f32>, Vec<f32>) {
-    const SECTION: [usize; 3] = [11, 11, 10];
-    let _ = SECTION; // documented: T keeps every slot not taken by H (11) / W (10)
+    // mrope section sizes [T, H, W] = [11, 11, 10]: T keeps every slot not taken by H / W
     let mut cos = vec![0f32; span * 32];
     let mut sin = vec![0f32; span * 32];
     for row in 0..span {

@@ -8,6 +8,9 @@ pub mod geo;
 pub mod kernels;
 pub mod manager;
 pub mod residency;
+// the container tensor -> device loaders and the NVFP4 pair (no launch policy):
+// what `gen` and `vit` both need, so neither has to reach into the other
+pub mod weights;
 pub mod gen;
 pub mod sample;
 pub mod tokenizer;

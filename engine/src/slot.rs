@@ -437,6 +437,16 @@ fn bytes_into_f32(src: &[u8], dst: &mut [f32]) {
 /// # Safety
 ///
 /// - a CUDA context must be current and `src` must hold at least `dst.len()` bytes
+/// The KV row groups in file order - layer, then K before V, then kv head:
+/// this sequence IS the payload layout, so save and restore both walk it here.
+fn kv_row_order(attn_layers: usize) -> impl Iterator<Item = (usize, bool, usize)> {
+    (0..attn_layers).flat_map(|layer| {
+        [true, false]
+            .into_iter()
+            .flat_map(move |is_k| (0..NKV).map(move |kvh| (layer, is_k, kvh)))
+    })
+}
+
 unsafe fn dtoh_bytes(dst: &mut [u8], src: cuda::CUdeviceptr) {
     cuda::ck(sys::cuMemcpyDtoH_v2(
         dst.as_mut_ptr() as *mut std::ffi::c_void,
@@ -534,13 +544,9 @@ pub unsafe fn save(
     // whatever the last request left in flight must land before the copies read it
     cuda::sync();
     let mut kv_row = vec![0u8; pos * h.kv_row_bytes as usize];
-    for layer in 0..h.attn_layers as usize {
-        for is_k in [true, false] {
-            for kvh in 0..NKV {
-                dtoh_bytes(&mut kv_row, eng.st.kv_row_ptr(layer, is_k, kvh, 0));
-                put(&mut w, &kv_row, &mut n_written, &tmp)?;
-            }
-        }
+    for (layer, is_k, kvh) in kv_row_order(h.attn_layers as usize) {
+        dtoh_bytes(&mut kv_row, eng.st.kv_row_ptr(layer, is_k, kvh, 0));
+        put(&mut w, &kv_row, &mut n_written, &tmp)?;
     }
     let mut pooled = vec![0u8; done_blocks * h.pooled_row_bytes as usize];
     for layer in 0..h.attn_layers as usize {
@@ -640,13 +646,9 @@ pub unsafe fn restore(
     }
 
     let kv_bytes = h.pos as usize * h.kv_row_bytes as usize;
-    for layer in 0..h.attn_layers as usize {
-        for is_k in [true, false] {
-            for kvh in 0..NKV {
-                fill(&mut f, &mut buf, kv_bytes, &mut n_payload)?;
-                cuda::upload_into(eng.st.kv_row_ptr(layer, is_k, kvh, 0), &buf);
-            }
-        }
+    for (layer, is_k, kvh) in kv_row_order(h.attn_layers as usize) {
+        fill(&mut f, &mut buf, kv_bytes, &mut n_payload)?;
+        cuda::upload_into(eng.st.kv_row_ptr(layer, is_k, kvh, 0), &buf);
     }
     let pooled_bytes = h.done_blocks as usize * h.pooled_row_bytes as usize;
     for layer in 0..h.attn_layers as usize {
@@ -680,6 +682,24 @@ pub unsafe fn restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the file layout: kv_groups groups, layer-major, K before V, kv head ascending.
+    /// A save and the restore that reads it back walk this same sequence, so a
+    /// reordering here would silently transpose every restored KV row.
+    #[test]
+    fn kv_row_order_is_the_file_layout() {
+        let h = live();
+        let got: Vec<(usize, bool, usize)> = kv_row_order(h.attn_layers as usize).collect();
+        assert_eq!(got.len() as u64, h.kv_groups, "one group per (layer, k/v, kv head)");
+        assert_eq!(&got[..4], &[(0, true, 0), (0, true, 1), (0, false, 0), (0, false, 1)]);
+        let last = h.attn_layers as usize - 1;
+        assert_eq!(got[got.len() - 1], (last, false, NKV - 1));
+        // and the payload the header sizes is exactly what that walk writes
+        assert_eq!(
+            got.len() as u64 * h.pos * h.kv_row_bytes,
+            h.kv_groups * h.pos * h.kv_row_bytes
+        );
+    }
 
     /// the shape of the gate's operating point: chunk 2048, ring 2052, FP8 KV
     fn live() -> Header {
