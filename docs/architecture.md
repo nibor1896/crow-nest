@@ -63,6 +63,30 @@ Interleaved A/B in the same session, one variable at a time, resolution stated,
 environment per `docs/system-landscape.md`. Performance is a measurement, not a
 condition.
 
+**The three consequence rules of #38, as robin decided them on 2026-09-18** (the Linux chains
+that answered the issue are in `docs/measurement-coverage.md`; the form is `tools/drift-chain.sh`):
+
+1. **The host-RAM gate before an engine start is per OS.** *Windows: the 50.5 GiB gate* — a chain
+   waits for more than 50.5 GiB free host RAM before it loads the engine (rule since 2026-09-10).
+   *Linux: the derived budget, read off the `[budget]` boot line* — that gate does not apply and
+   stays replaced by the pinned budget the engine derives at boot (8.8 point 2, issue #15); a
+   `MemAvailable` reading of it would have refused all twelve engine starts of the #38 chains.
+2. **A `serve` tok/s is quoted only next to an adjacent `decode run` measured in the same chain**
+   (2026-09-10, kept on Linux too). The reason since 2026-09-18 is no longer the run-position
+   drift — that is absent on the Linux box, 0.56 % over eight counted serve runs — but the
+   operating point: the two arms are not the same one. `serve` pins prompt chunk 2048, gets
+   N = 149 hot experts per layer and ticks the stream trickle on every decode step; `decode run`
+   lets the policy pick 4096, gets N = 142 and does not tick. A lone serve rate therefore invites
+   a comparison the configuration does not support, and the adjacent `decode run` is the anchor.
+3. **A `serve` decode number enters THIS document, on Linux, only in the drift-chain form.** The
+   2026-09-10 bar ("no serve decode number enters `docs/architecture.md`") is RELAXED for a rate
+   that carries all of: at least 3 counted serve runs inside one chain, one fresh process per run,
+   the generated-ids sha256 identical across those runs, an adjacent `decode run` arm in the SAME
+   chain, and the figure quoted as its arm mean with its max-over-min spread beside that decode
+   arm's mean and spread, naming the chain's log. A serve number without that form is refused
+   here, whatever it measures. On Windows the bar stays as written until the M2a form is rerun
+   on that box.
+
 ---
 
 ## Section 1 — model format and streaming converter (APPROVED by robin 2026-09-02: BF16 keep-set as proposed; 551 GB free NVMe confirmed)
@@ -345,7 +369,7 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 - The Linux prefill of record crosses that row, on the same prompt and a different machine: the 16,064-id t1-read form (`decode run … 128`, `CROW_CHUNK` unset so the policy picks 2048, context fill 16,192, crow-nest CNQ4.5-M NVFP4 4.5 bpw) reads **16.60 s = 968 tok/s and 16.66 s = 964 tok/s** on 2026-09-17, RTX 5090 / Arch Linux, commit `1032bc5`, against **598 / 601 tok/s** on the same two runs of the preceding build — an interleaved A/B in one session, two runs per arm, identical id traces (`CHANGELOG.md` 2026-09-17, the PLE prefill floor). It is NOT a row of the table above and does not close the 922.5 row: the llama.cpp arm of record (17.41 s = 922.5 tok/s, 2026-09-11) is a WINDOWS measurement with GGUF Q2_K_XL at 2.4 bpw, and no llama.cpp arm has been run adjacent to it on this machine. Section 8.7 holds the Linux values of record.
 - Every row of this table is one adjacent pair of one chain; the two crow-nest columns are the two arms of that pair.
 - The two arms run different weights: crow-nest CNQ4.5-M (NVFP4, 4.5 bpw); llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL (GGUF, 2.4 bpw).
-- A tok/s figure is quoted only next to its adjacent arm in the same chain (#38).
+- A tok/s figure is quoted only next to its adjacent arm in the same chain (#38, 0.5 rule 2). For a `serve` rate that rule is about the operating point since 2026-09-18 and not about the drift: `serve` (N 149, chunk 2048, trickle ticking) and `decode run` (N 142, chunk 4096, no tick) are different arms, so the adjacent `decode run` is what anchors the serve number.
 
 | shape metric | crow-nest, engine default | crow-nest, the named fallback | llama.cpp | machine | date | source |
 |---|---|---|---|---|---|---|
@@ -768,14 +792,35 @@ S-arm request — one fresh process per run, stopped by pid, `decode_out/61g/*-s
 | default (`CROW_ATTN_LUT` unset) | **4,783.711 ms**, 18.686 ms per token | **53.31** (`routing`), 53.515 (response) | `e7c17e064ea2` |
 | `CROW_ATTN_LUT=0` | **5,112.712 ms**, 19.972 ms per token | **49.88** (`routing`), 50.071 (response) | `e7c17e064ea2` |
 
-The #38 chain's serve figure of record is 49.82 tok/s at 5,115 ms predicted and ids `e7c17e064ea2`
-(2026-09-18, four runs, `docs/measurement-coverage.md`). The `CROW_ATTN_LUT=0` arm lands on it —
-49.88 tok/s at 5,112.7 ms, inside the 1.0056 within-arm spread that chain measured — and the flipped
-default keeps the same 256 generated ids while taking **-329.0 ms = -6.44 percent** off the request's
-decode, which is the 6.28 percent of the `decode run` pairs seen through the server. The rate is read
-off the `routing` line, which carries it unrounded over the 255 timed steps; the response's own
+Those two rows are ONE run each: they are the lever's own A/B through the server, not a rate of
+record. The `CROW_ATTN_LUT=0` row lands on the pre-flip serve figure of the #38 chain of the same
+morning (49.82 tok/s at 5,118 ms predicted, four runs, `docs/measurement-coverage.md`) — 49.88 tok/s
+at 5,112.7 ms, inside the 1.0056 within-arm spread that chain measured — and the flipped default
+keeps the same 256 generated ids while taking **-329.0 ms = -6.44 percent** off the request's decode,
+which is the 6.28 percent of the `decode run` pairs seen through the server. The rate is read off the
+`routing` line, which carries it unrounded over the 255 timed steps; the response's own
 `timings.predicted_per_second` divides by 256 and reads 53.515 against 50.071. Both runs prefilled
 the same 16,064 ids at 874 and 875 tok/s and drained the same 4,494,905 cold selections.
+
+**The serve figure of record at this default, in the form rule 3 of section 0.5 requires** (issue
+#38, the rule robin relaxed to on 2026-09-18; `tools/drift-chain.sh c3-sdsd-61g SDSDSDSD` at HEAD
+`6c87054`, RTX 5090 / Arch Linux, 2026-09-18, one fresh process per run, `CROW_ATTN_LUT`,
+`CROW_STAGE_PAR` and `CROW_GDN_SPLIT_Z` all unset, `decode_out/38/c3-sdsd-61g/chain.log` table at
+`:53`, spreads at `:72`):
+
+| arm of the chain | counted runs | tok/s per run | arm mean | within-arm spread, max over min | generated ids sha256 |
+|---|---|---|---|---|---|
+| `serve`, positions 1, 3, 5, 7 | 4 | 53.282 / 53.412 / 53.209 / 53.375 | **53.32 tok/s** (4,782.499 ms predicted) | **1.0038** | `e7c17e064ea2`, 4 of 4 |
+| `decode run`, positions 2, 4, 6, 8 — the adjacent arm | 4 | 42.583 / 42.542 / 42.581 / 42.544 | **42.56 tok/s** (23.4950 ms per token) | **1.0010** | `56305eee11d6`, 4 of 4 |
+
+`serve[1:] == decode[:255]` is TRUE, so the two arms walk the same greedy trajectory and the spreads
+are spreads of timing, not of work: serve drained 4,494,905 cold of 7,833,120 selections with
+261,104 PLE rows and 8,911 trickle swaps in all four runs, `decode run` 210.4 cold experts per timed
+decode token in all four. The gap between the two means is the arm difference of rule 2 — serve
+N = 149 and chunk 2048 with the trickle ticking, `decode run` N = 142 and chunk 4096 without it —
+and not a finding. The `decode run` arm reproduces the #61g confirmation mean above (23.4950 against
+23.5193 ms per token, 0.10 percent) at the same ids, which is what puts the serve number on this
+operating point. A `serve` rate that does not carry this form does not enter this document.
 
 **The gate at the new default.** `tools/gate-linux.sh decode_out/gate61g` is ALL GREEN nine of nine
 with `CROW_ATTN_LUT` unset —

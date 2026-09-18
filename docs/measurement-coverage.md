@@ -225,7 +225,7 @@ lines, carrying the boot JSON line, the `[budget]` lines and the `routing` JSON 
 The stdout of the two chain processes is `decode_out/38/c1-sdsd.out` and
 `decode_out/38/c2-ssss.out`.
 
-### Consequence rules — recommendation, robin decides
+### Consequence rules — the recommendation of the morning (robin decided them the same day; the decisions are the section below)
 
 1. **"Chains that load the engine wait for more than 50.5 GiB free": keep it replaced on
    Linux.** The derived budget of `#15`/v0.3.0 is the gate here and it held twelve times; the
@@ -248,3 +248,110 @@ The stdout of the two chain processes is `decode_out/38/c1-sdsd.out` and
    lifted.
 4. **New, if the drift is ever quoted again: it is answered per machine.** This section bounds
    one box, one GPU, one day, one prompt shape and one HEAD. It bounds no other.
+
+
+## 2026-09-18, later the same day — robin's decision on the three rules, and the chain rerun at the new default (issue #38)
+
+Robin read the recommendation above and took all three, with one of them changed from the shape it
+had at 04:00. The rule texts below are the ones of record; they are written the same way in
+`docs/architecture.md` 0.5, `engine/README.md` "Machine rules" and `README.md`.
+
+1. **The host-RAM gate before an engine start is per OS.** *Windows: the 50.5 GiB gate* — a chain
+   waits for more than 50.5 GiB free host RAM before it loads the engine (rule since 2026-09-10).
+   *Linux: the derived budget, read off the `[budget]` boot line* — the 50.5 GiB gate does not
+   apply here and stays replaced by the pinned budget the engine derives at boot
+   (`docs/architecture.md` 8.8 point 2, issue #15). Nothing in the code changes: the twenty
+   engine starts of the three chains of this day all passed on the derived budget, and a
+   `MemAvailable` reading of the Windows gate would have refused every one of them.
+2. **A `serve` tok/s is quoted only next to an adjacent `decode run` measured in the same
+   chain** — KEPT, on Linux too, with a NEW reason. It is no longer the drift, which is absent
+   on this box (0.56 % over the eight counted serve runs of the morning, 0.38 % over the four
+   below). It is the operating point: the two arms are not the same one. `serve` pins
+   `prompt_chunk` 2048, gets N = 149 hot experts per layer and ticks the stream trickle on every
+   decode step (8,911 swaps per request); `decode run` lets the policy pick 4096, gets N = 142
+   and does not tick. A lone serve rate therefore invites a comparison the configuration does not
+   support, and the adjacent `decode run` is the anchor. `tools/drift-chain.sh` makes that
+   adjacent run one character of the order string.
+3. **"No serve decode number enters `docs/architecture.md`" — RELAXED on Linux, to the
+   drift-chain form.** A serve rate may enter that document when it carries all of: at least
+   3 counted serve runs inside one chain, one fresh process per run, the generated-ids sha256
+   identical across those runs, an adjacent `decode run` arm in the SAME chain, and the figure
+   quoted as its arm mean with its max-over-min spread beside that decode arm's mean and spread,
+   naming the chain's log (38a rules 4, 7 and 12). A serve number without that form is refused.
+   On Windows the bar stays as written until the M2a form is rerun there.
+
+**The number that satisfies rule 3, at the CURRENT default.** The 49.82 / 1.0056 of the morning
+was measured at the pre-`#61g` default; `CROW_ATTN_LUT` became the default at HEAD `6c87054`
+later the same day (issue #61, 61g), which moves both arms. So the chain was rerun in the same
+`S D S D S D S D` form at that HEAD, `CROW_STAGE_PAR`, `CROW_GDN_SPLIT_Z` and `CROW_ATTN_LUT` all
+unset — the new default — 2026-09-18 09:58–10:05 UTC,
+`decode_out/38/c3-sdsd-61g/chain.log` (81 lines, table at `:53`, spreads at `:72`, the cross-arm
+check at `:80`), stdout `decode_out/38/c3-sdsd-61g.out`.
+
+| run | arm | tok/s | predicted_ms | mean ms per token | cold/token processed | cold selections, this request | PLE rows / fills | free-for-pin GiB | sm MHz before the load | generated ids sha256 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | S | 53.282 | 4785.844 | 18.768 | 275.42 | 4,494,905 of 7,833,120 | 261,104 / 107,227 | 60.22 | 360 | `e7c17e064ea2…` |
+| 2 | D | 42.583 | 5988.369 | 23.4838 | ~283.44 | ~4,625,751 of 7,833,600 | 261,120 / 107,179 | 60.20 | 2,917 | `56305eee11d6…` |
+| 3 | S | 53.412 | 4774.224 | 18.722 | 275.42 | 4,494,905 of 7,833,120 | 261,104 / 107,227 | 60.21 | 2,872 | `e7c17e064ea2…` |
+| 4 | D | 42.542 | 5994.145 | 23.5065 | ~283.44 | ~4,625,751 of 7,833,600 | 261,120 / 107,179 | 60.21 | 2,062 | `56305eee11d6…` |
+| 5 | S | 53.209 | 4792.393 | 18.794 | 275.42 | 4,494,905 of 7,833,120 | 261,104 / 107,227 | 60.21 | 2,902 | `e7c17e064ea2…` |
+| 6 | D | 42.581 | 5988.591 | 23.4847 | ~283.44 | ~4,625,751 of 7,833,600 | 261,120 / 107,179 | 60.20 | 2,902 | `56305eee11d6…` |
+| 7 | S | 53.375 | 4777.537 | 18.735 | 275.42 | 4,494,905 of 7,833,120 | 261,104 / 107,227 | 60.20 | 2,685 | `e7c17e064ea2…` |
+| 8 | D | 42.544 | 5993.756 | 23.5049 | ~283.44 | ~4,625,751 of 7,833,600 | 261,120 / 107,179 | 60.21 | 2,505 | `56305eee11d6…` |
+
+### Within-arm spread, max over min (chain 3, the same form as the two above)
+
+| chain | arm | runs | positions | min tok/s | max tok/s | mean tok/s | spread | run 1 against its arm mean |
+|---|---|---|---|---|---|---|---|---|
+| 3 | serve, `stream:false`, 255 timed steps | 4 | 1, 3, 5, 7 | 53.209 | 53.412 | **53.3195** | **1.00382** | −0.070 % |
+| 3 | `decode run` D1 | 4 | 2, 4, 6, 8 | 42.542 | 42.583 | **42.5623** | **1.00096** | +0.049 % |
+
+The `predicted_ms` spreads are the same figures on the wall clock: serve 1.00381 (mean 4,782.499 ms)
+and `decode run` 1.00096 (mean 5,991.215 ms). The `decode run` arm's mean ms per token is 23.4950
+with p50 22.778 to 22.884, which reproduces the `#61g` confirmation runs of the same day (N mean
+23.5193 ms, `docs/architecture.md` 4.6.1) to 0.10 %. Neither arm is monotonic in run index: the
+serve deltas are +0.130, −0.203, +0.166 tok/s and the `decode run` deltas −0.041, +0.039, −0.037.
+
+### What chain 3 adds
+
+- **The drift is still absent at the new default, and now at a smaller spread than the morning
+  chain's.** Serve 1.00382 over 4 counted runs against 1.0056 at 04:12, `decode run` 1.00096
+  against 1.0012. That is 69x under the 26.4 % of `decode_out/srv-m2a.log:824` (2026-09-10,
+  Windows) and 27x under the widest `#37` chain (1.105, 2026-09-11).
+- **The work is the same work, digit for digit, as the morning chain's.** Serve: 4,494,905 cold of
+  7,833,120 expert selections, 261,104 PLE rows, 107,227 fills, 8,911 trickle swaps in 4 of 4
+  runs, N = 149, `prompt_chunk` 2048, 48.17 GB pinned. `decode run`: 210.4 cold experts per timed
+  decode token, N = 142, chunk 4096, 49.10 GB pinned, context 16,320. The ids are the shas of
+  record in 4 of 4 runs per arm and `serve[1:] == decode[:255]` is TRUE, so `#61g` moved the rate
+  and not one generated id through either arm.
+- **What the flip is worth at the operating point, on both arms of one chain.** Against the
+  04:12 chain at the pre-flip default: serve 53.3195 against 49.8215 tok/s = **+7.02 %**
+  (4,782.499 against 5,118.296 ms predicted, −335.8 ms = −6.56 %) and `decode run` 42.5623
+  against 39.8304 = **+6.86 %** (5,991.215 against 6,402.149 ms, −410.9 ms = −6.42 %). Those two
+  chains are 6 hours apart on one box at one machine state, which rule 11 of the 38a discipline
+  calls a cross-chain comparison; the lever's own adjacent-pair reading stays the 61f one
+  (−6.28 %, `docs/architecture.md` 4.6.1).
+- **Prefill is untouched by the flip and just as stable.** serve 18.411 to 18.423 s = 871.9 to
+  872.5 tok/s over its 4 runs (874 to 883 at 04:12), `decode run` 16.25 to 16.27 s = 987.1 to
+  988.6 tok/s over its 4 (16.13 to 16.22 s = 991 to 996 at 04:12).
+- **The machine blocks say what the morning's said.** Eight starts, free for pinning 60.20 to
+  60.22 GiB at the pre-start block and 60.10 to 60.17 GiB on the engine's own `[budget]` line,
+  the derived pinned budget 46.00 GiB at all eight and the guard never fired; `MemAvailable`
+  9.39 to 9.64 GiB — the figure the Windows gate would have read, and refused all eight on;
+  `Cached` 3.13 to 4.95 GiB; the GPU 630 MiB (the desktop alone), sm clock 360 MHz at the first
+  start and 2,062 to 2,917 MHz at the other seven, 35.9 to 112.4 W, 33 to 54 °C, and both rates
+  held inside 0.4 % through all of it.
+
+### The figure of record entered into `docs/architecture.md`
+
+Under rule 3 the serve number that enters section 4.6.1, next to its adjacent arm, is:
+
+> **`serve` 53.32 tok/s, mean of 4 counted runs, within-arm spread 1.0038**, next to the adjacent
+> **`decode run` arm's 42.56 tok/s mean, spread 1.0010**, one fresh process per run, generated ids
+> `e7c17e064ea2` 4 of 4 and `56305eee11d6` 4 of 4, t1-read 16,064 ids, 256 generated tokens,
+> 255 timed steps, HEAD `6c87054`, RTX 5090 / Arch Linux, 2026-09-18,
+> `decode_out/38/c3-sdsd-61g/chain.log`.
+
+It replaces the single serve reading of the `#61g` flip (53.31 tok/s, one run) as the serve figure
+of record; that one-run pair stays in 4.6.1 as the lever's own `CROW_ATTN_LUT` A/B, which is what
+it measures. Artefacts as for the two chains above, 296 KiB, all gitignored.

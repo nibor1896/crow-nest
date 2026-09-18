@@ -16,7 +16,9 @@
   HEAD, `5a58e0b`), `#13` (engine logging: `tracing`, rotation, the routing line and the
   operating-point report, `788fb64`) and `#38` (the run-position drift of a `serve` rate: the
   Linux chain that answers it, `tools/drift-chain.sh` and the record in
-  `docs/measurement-coverage.md`, `77c4d40` — no engine code), `#61` (the decode kernel
+  `docs/measurement-coverage.md`, `77c4d40`, and later the same day robin's decision on the
+  issue's three consequence rules with the chain rerun at the new default — no engine code
+  in either), `#61` (the decode kernel
   decomposition at the Linux operating point, the `CROW_ATTN_LUT` lever it named, and the flip of
   that lever to the DEFAULT later the same day, 61g) and
   `#62` (the GDN row taken apart per kernel, 2026-09-18 — no engine code) and `#19` (the
@@ -656,6 +658,56 @@
   `tools/gate-linux.sh` carries the new count with its provenance.
 
 ### Changed
+
+- **The three consequence rules of `#38` are decided, and the serve rate of record enters the
+  spec** (`#38`, robin 2026-09-18, after the Linux chains of that morning; docs only, no engine
+  code, so no gate run is owed). The issue had carried three rules since 2026-09-10, all of them
+  written when a `serve` rate on the Windows box drifted 26.4 % with run position.
+
+  **1. The host-RAM gate is per OS.** *Windows*: the 50.5 GiB gate stands (wait for more than
+  50.5 GiB free host RAM before a load, rule since 2026-09-10). *Linux*: it does not apply and
+  stays REPLACED by the pinned budget the engine derives at boot and prints on its `[budget]`
+  line (`#15`, v0.3.0, `docs/architecture.md` 8.8 point 2). Nothing in the code moves; what
+  changed is that no document now implies the 50.5 GiB figure gates a Linux run. The twenty
+  engine starts of this day's three chains all passed on the derived budget at 46.00 GiB, and a
+  `MemAvailable` reading of the Windows gate would have refused every one of them (9.4 to
+  11.6 GiB available against 60.2 GiB free for pinning).
+
+  **2. "A `serve` tok/s is quoted only next to an adjacent `decode run` measured in the same
+  chain" is KEPT, on Linux too, with a new reason.** Not the drift — that is absent on this box —
+  but the operating point: `serve` pins prompt chunk 2048, gets N = 149 hot experts per layer and
+  ticks the stream trickle every decode step, `decode run` lets the policy pick 4096, gets N = 142
+  and does not tick, so a lone serve rate invites a comparison the configuration does not support.
+  The reason is written where the rule is stated: `docs/architecture.md` 0.5 and 3.4,
+  `engine/README.md` "Machine rules", `README.md`.
+
+  **3. "No serve decode number enters `docs/architecture.md`" is RELAXED on Linux to the
+  drift-chain form.** A serve rate may enter when it carries all of: at least 3 counted serve runs
+  in one chain, one fresh process per run, the generated-ids sha256 identical across them, an
+  adjacent `decode run` arm in the SAME chain, and the figure quoted as its arm mean with its
+  max-over-min spread beside that decode arm's mean and spread, naming the chain log. A number
+  without that form is refused, which is why the rule text in `docs/architecture.md` 0.5 names the
+  form. Windows keeps the bar until the M2a form is rerun there.
+
+  **The number that satisfies rule 3 at the CURRENT default** (the morning's 49.82 / 1.0056 was
+  measured before the `#61g` `CROW_ATTN_LUT` flip, which moves both arms). `tools/drift-chain.sh
+  c3-sdsd-61g SDSDSDSD` at HEAD `6c87054`, RTX 5090 / Arch Linux, 2026-09-18, one fresh process per
+  run, `CROW_ATTN_LUT`, `CROW_STAGE_PAR` and `CROW_GDN_SPLIT_Z` unset,
+  `decode_out/38/c3-sdsd-61g/chain.log`: **`serve` 53.32 tok/s mean over 4 counted runs (53.282 /
+  53.412 / 53.209 / 53.375), within-arm spread 1.0038**, next to the adjacent **`decode run` arm's
+  42.56 tok/s mean (42.583 / 42.542 / 42.581 / 42.544), spread 1.0010** — generated ids
+  `e7c17e064ea2` 4 of 4 and `56305eee11d6` 4 of 4, `serve[1:] == decode[:255]` TRUE, serve counters
+  4,494,905 cold of 7,833,120 selections and 261,104 PLE rows identical in all four runs. The drift
+  is absent at the new default too, and tighter than in the morning chain (1.0038 against 1.0056;
+  the `decode run` arm 1.0010 against 1.0012). The `decode run` arm's 23.4950 ms per token
+  reproduces the `#61g` confirmation mean (23.5193) to 0.10 %, which is what puts the serve number
+  on the operating point of record; against the morning chain at the pre-flip default both arms
+  move by the flip, serve +7.02 % and `decode run` +6.86 %, a cross-chain reading under rule 11 of
+  the 38a discipline and not the lever's own pair (−6.28 %, 61f). The record with both tables, the
+  eight machine blocks and the rule texts is `docs/measurement-coverage.md`; the figure of record
+  and the form that admits it are `docs/architecture.md` 4.6.1 and 0.5, and it replaces the
+  single-run 53.31 reading the `#61g` commit had put there, which stays as the lever's own serve
+  A/B.
 
 - **`CROW_ATTN_LUT` is the DEFAULT — the split decode attention kernel reads its e4m3 KV bytes out
   of the shared table** (`#61`, 61g, 2026-09-18, robin's call after the 61f numbers). `attn_lut_on()`
