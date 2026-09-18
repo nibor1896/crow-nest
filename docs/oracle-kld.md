@@ -273,6 +273,16 @@ token the f32 model wanted.
 | `llama` | -5.72 ± 1.37 % | 26.5 % | 4.7 % | **-10.07 ± 1.01 %** | **32.5 %** | **7.1 %** |
 | `llama-cached` | -5.96 ± 1.37 % | 28.5 % | 5.0 % | -9.35 ± 0.97 % | 31.5 % | 6.4 % |
 
+Two things in this table are worth naming rather than smoothing over. `orig` is the best arm
+on mean KLD on the 607-row set and the WORST crow arm on `dp` there (-7.66 against `none`'s
+-6.91), while on the 298-row set it is the best on both. The two quantities weigh rows
+differently — `dp` is one token's probability and is dominated by rows where the reference was
+already sure, `KLD` is the whole distribution and is dominated by rows where an arm is badly
+wrong — and both differences here are inside the noise floor of section 6 anyway. What is NOT
+inside it is the `llama` row on the 607-row set: -10.07 ± 1.01 % against every crow arm's -6.6
+to -7.7, and 32.5 % of rows losing more than ten points of the reference's top-1 mass against
+25.7 to 28.7 %.
+
 ### 5.4 Paired, per row
 
 Two means 0.02 apart on 298 noisy rows are unreadable side by side. The same rows subtracted
