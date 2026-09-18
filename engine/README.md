@@ -138,6 +138,7 @@ parity <phase> <run_index> <crow|llama> <prompts.json> [llama-url] [outprefix]
 ```
 
 - `run` is interleaved and needs both engines resident at once.
+- Both python children of the oracle venv (`tools/tokenize_ids.py --chat` per task, `tools/detokenize_ids.py` per phase) go through one bounded retry since issue #65 (2026-09-18): three attempts with a 2 s and then a 5 s pause, so a single child that dies costs the TASK a second attempt instead of costing the ten-task phase a re-run (~15 min). It stays fail-closed — after the third attempt the phase fails and records nothing for that task — and a retry that succeeded lands in the record as `oracle_retries` on that task's row, with the attempt count, the exit code and the captured stderr. The diagnosis leads with the EXIT CODE, because the three occurrences of #65 had an empty stderr and the old call site printed stderr only (`../docs/architecture.md` 8.9).
 - `phase` runs one arm over the full rotated order; that is the form this machine uses, because of its RAM and VRAM budget.
 - Example of record: `parity phase 0 crow decode_out/ten-tasks.json e3`.
 
@@ -192,7 +193,7 @@ cd engine
 cargo test --release
 ```
 
-- 183 passed, 0 failed on 2026-09-18 (103 lib + 78 serve + 2 parity; 165 on 2026-09-17, plus the six of issue #67, the three of issue #68, the three of issue #49, the two of issue #60 and the four of issue #54), and `cargo clippy --release --all-targets` reports 1,422 warnings, counted as `grep -cE '^warning: '`. Both counts are enforced by `../tools/gate-linux.sh`.
+- 187 passed, 0 failed on 2026-09-18 (103 lib + 78 serve + 6 parity; 165 on 2026-09-17, plus the six of issue #67, the three of issue #68, the three of issue #49, the two of issue #60, the four of issue #54 and the four of issue #65), and `cargo clippy --release --all-targets` reports 1,422 warnings, counted as `grep -cE '^warning: '`. Both counts are enforced by `../tools/gate-linux.sh`.
 - The ten tokenizer tests need `../models/` and are skipped without it.
 
 ```

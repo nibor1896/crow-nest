@@ -6,15 +6,93 @@
 
 ## v0.3.1 (unreleased) — the reasoning filter, and what the 170k session really was
 
-- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Five issues so far: `#67` (the
+- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Six issues so far: `#67` (the
   reasoning filter, `667b68b`), the engine side of `#68` (the long-context measurement, `f14e557`),
   `#49` (the ragged hot-set sidecar, `0adbe6a`), `#60` (the `parity` record header per arm, and
-  the last two bins that hard-coded the pre-`#51` container, `784bd64`) and `#54` (the gone-client
-  probe of the `stream:false` path, this commit). The machine is the
+  the last two bins that hard-coded the pre-`#51` container, `784bd64`), `#54` (the gone-client
+  probe of the `stream:false` path, `20bc121`) and `#65` (the bounded retry around the harness's
+  oracle python children, this commit). The machine is the
   second environment block of `docs/system-landscape.md` unless a row names another one.
 - The crate version field stays `0.1.0`, as it has for every release: this file is the record.
 
 ### Fixed
+
+- **The ten-task harness lost a whole phase to one python child that died with an EMPTY stderr**
+  (`#65`, three occurrences — chains 19f and 19g on 2026-09-13 and the 62b pairs preflight, fixed
+  2026-09-18). `tools/tokenize_ids.py --chat` runs once per task for the crow arm's token stream;
+  at task 5 of ten it exited non-zero with nothing on stderr, the fail-closed assert stopped the
+  phase, and every retry on the identical binaries and the identical frozen prompt ran green. No
+  wrong data was ever recorded — the cost was a full re-run, about 15 min.
+
+  **The root cause, as far as the record can carry it: environmental, and the harness is what made
+  it unpinnable.** The call site was `assert!(out.status.success(), "tokenize stderr: {}", ..)` —
+  the child's stderr and nothing else. No exit status, no stdout length, no size of what had been
+  sent, no name of the task. An empty stderr is not a Python error: a Python error writes its
+  traceback to that pipe. An empty stderr with a non-zero status is a process that died WITHOUT
+  running Python's own error path, and the name of that death is the exit code, which is the one
+  thing the harness threw away. Every cause inside the harness is excluded with code evidence
+  (architecture 8.9 carries the table): the prompt goes through STDIN and not through `argv`, so
+  the 32,767-char `CreateProcess` cap is not reachable; `wait_with_output` drains both output pipes
+  while it waits and drops the parent's stdin before it reads, so neither a full pipe nor a missing
+  EOF is possible — and both of those would HANG, while all three failures were a fast non-zero
+  EXIT; there is no timeout and no `kill` anywhere on the path; stderr has exactly one reader; the
+  UTF-8 transport has been set on the process since `#34` and an encoding mismatch moves the ID
+  COUNT, not the exit status. What is left is a child that started, exited and said nothing, which
+  on Windows means `STATUS_DLL_INIT_FAILED` (`0xC0000142`), `STATUS_ACCESS_VIOLATION`,
+  `STATUS_NO_MEMORY` / `STATUS_COMMITMENT_LIMIT` or an outside kill — all environmental, all of
+  them named only by the exit code, and all of them likelier in the window the child was spawned
+  in: between the previous task's container purge (a 104 GB whole-file standby purge on Windows)
+  and the release of its ~44.6 GB pinned tier, and the next task's `Cnq::open` + `Ctx::init`.
+  Starting a load in that window is what `engine/README.md`'s Windows 50.5 GiB rule is about
+  (`#38`); starting an interpreter that imports `transformers` in it is the same bet. That it was
+  task 5 on all three chains and never task 1 fits pressure that accumulates over a phase.
+  **WHICH of those it was is not recoverable from what was recorded**, and that is now the one
+  thing the guard below fixes for good.
+
+  **The guard: a bounded retry per CALL, not per phase.** Both oracle children go through
+  `oracle_child` — three attempts, 2 s and then 5 s between them (seconds, because a host resource
+  that is being reclaimed needs wall-clock time; 7 s worst case against the ~15 min a lost phase
+  costs). The phase retries the single task and goes on, and is never restarted. It stays
+  fail-closed: after the third attempt the harness panics with the whole table of attempts and
+  records nothing for that task, and each failed attempt is printed the moment it happens because
+  the process may not live to write the record. A retry that succeeded lands in the run record as
+  `oracle_retries` on that task's measurement row (`oracle_retries_warmup` / `oracle_retries_detok`
+  in the meta block) with the task, the child, the attempt, the bytes sent, the milliseconds and
+  the diagnosis — and those keys appear ONLY when something was retried, so a clean phase writes
+  exactly the record it wrote before. The diagnosis leads with the exit code and names it where
+  the name is the whole message (`exit_code_name`: the four NTSTATUS values above plus CPython's
+  silent `120`), and an empty stderr is called empty in those words.
+
+  **Three real defects fixed with it.** The write to the child's stdin is no longer `unwrap`ed: the
+  CHILD knows why its read end went away, so the error is kept, the child is waited for anyway and
+  its own stderr and exit code are reported with it — before, a child that died early was reported
+  as a bare `Broken pipe` and its reason was discarded. A partial write now fails the attempt even
+  behind a zero exit, a zero exit with an EMPTY stdout fails, and `tokenize` refuses an empty id
+  list: a child that read a truncated stdin must not be recorded as a measurement of a prompt that
+  was never sent. And `crow_complete` tokenizes BEFORE `open_model` instead of between it and
+  `Engine::load`, which takes the python child out of the worst host-memory window of the process —
+  numerically inert, since `tokenize` runs no kernel, reads no config, and the chunk policy still
+  sees the same `ids.len()` before the load.
+
+  **Live on Linux, 2026-09-18.** The oracle venv rebuilt at transformers 5.16.1 and checked against
+  the in-engine tokenizer over the ten frozen prompts: **10 of 10 identical id streams**, with
+  t4-prose at 9,398 ids — the `#34` value of record, which is what says the venv is the oracle and
+  not a lookalike. Then the accident itself, with a stub interpreter that dies the #65 death
+  (non-zero exit, nothing on stderr, after reading its whole stdin) on the phase's SECOND tokenize
+  call: `[oracle] tokenize_ids.py --chat: attempt 1 of 3 FAILED after 4 ms — exit code 1
+  (0x00000001); 0 B on stdout; stderr EMPTY …`, then `attempt 2 of 3 succeeded (1140 B on stdout)`,
+  the task ran at `prompt_tokens 220` — the oracle's own count — and the phase exited 0 with the
+  failed attempt in its record. The same phase run clean writes a record with no oracle keys at
+  all and the same eight answer ids, `[1919, 3377, 7225, 34579, 1064, 2020, 18959, 364]`
+  (`decode_out/gate65/`).
+
+  Tests 183 -> 187, all four in `bin/parity.rs`: the pure verdict table of `child_verdict` (the #65
+  shape, the Windows exit codes whose name is the whole message, the zero exit with nothing on
+  stdout, a child that DID reach Python's error path, and the unix signal arm), and three against a
+  real `/bin/sh` child — one that fails once with an empty stderr and is retried, one that fails
+  every attempt and still fails the task, and a 60,290-byte payload that reaches the child whole
+  through STDIN. No oracle venv, no llama-server and no GPU. Not covered: a child that HANGS
+  instead of exiting still hangs the phase, which no occurrence has ever done.
 
 - **A `stream:false` request whose client disconnected held the one slot for its whole
   `max_tokens` budget** (`#54`, found 2026-09-11 in the whole-branch review before v0.1.0, fixed

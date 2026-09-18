@@ -76,7 +76,20 @@
 #                              shapes (live, `shutdown(Write)`, closed - the last two are the
 #                              same wire event, which is the whole reason the baseline exists)
 #                              and the no-socket `CollectSink` that never stops a loop - so
-#                              183 = 103 lib + 78 serve + 2 parity.
+#                              183 = 103 lib + 78 serve + 2 parity. #65 (2026-09-18) added
+#                              four more in `bin/parity.rs` for the bounded retry around the
+#                              two oracle python children: the pure verdict table of
+#                              `child_verdict` (the #65 shape itself - a non-zero exit with
+#                              an EMPTY stderr - plus the Windows exit codes whose name is
+#                              the whole message and the zero exit with nothing on stdout),
+#                              and three against a REAL `/bin/sh` stub child, which needs no
+#                              oracle venv and no GPU: a child that fails ONCE with an empty
+#                              stderr is retried and the task goes on with the failed
+#                              attempt in the record, a child that fails EVERY attempt still
+#                              fails the task (fail-closed), and a 60,290-byte payload - the
+#                              longest of the ten frozen prompts - reaches the child whole
+#                              through STDIN and never through the command line - so
+#                              187 = 103 lib + 78 serve + 6 parity.
 #                              Clippy is unchanged at
 #                              1422: it is the --all-targets form counted as grep -cE '^warning: ',
 #                              the form the 1494 -> 1480 -> 1426 -> 1422 series was counted with.
@@ -101,7 +114,7 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="183"
+TESTS="187"
 CLIPPY="1422"
 
 red=0

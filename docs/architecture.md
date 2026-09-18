@@ -1929,7 +1929,7 @@ either. The one thing a probe cannot do is separate the two meanings of a FIN by
 - CI (E7, #50, 2026-09-11) runs engine lib **72 of 80** and `bin/serve` **55 of 57** on the
   windows-latest runner (the runner moved to ubuntu-latest with the Linux port on 2026-09-17 and no
   run of that workflow is recorded in this repository yet, so these are still the counts of record
-  for CI while the local counts are the 103 lib / 78 serve / 2 parity of 2026-09-18 above); the gap is 10 tokenizer tests that need `../models/`, not present on a
+  for CI while the local counts are the 103 lib / 78 serve / 6 parity of 2026-09-18 above); the gap is 10 tokenizer tests that need `../models/`, not present on a
   fresh clone. The full counts above hold locally, where the models directory exists.
 
 **The unit tests #39 added (`engine/src/bin/serve.rs`):**
@@ -2210,7 +2210,7 @@ is not exhausted), more VRAM for the hot set (the planner already maximizes N ag
 KV budget; N=155 with 7 slots surrendered to the trickle), or a cold tier that is smaller per expert
 (a low-bit tier, which is not bit-identical and therefore not this).
 
-## Section 8 — the code map (2026-09-17)
+## Section 8 — the code map (2026-09-17, 8.9 added 2026-09-18)
 
 Sections 0 to 7 say what the engine must do. This section says how the crate is put together,
 so a reader who opens `engine/src` knows which file to open and what it may reach for. It was
@@ -2534,8 +2534,8 @@ memory-bounded scope, one engine at a time.
 - **The gate**: `tools/gate-linux.sh [outdir]` from the repo root runs the three parity forms,
   `decode run 32`, `cargo test`, clippy and the doc guards against the first three values
   above, prints GREEN/RED per item and exits non-zero on any RED. Nine items; all nine green at
-  commit `8ff2055` on 2026-09-17. The two host-side values it pins are `TESTS=183`
-  (103 lib + 78 serve + 2 parity, 2026-09-18) and `CLIPPY=1422` (the `--all-targets` form,
+  commit `8ff2055` on 2026-09-17. The two host-side values it pins are `TESTS=187`
+  (103 lib + 78 serve + 6 parity, 2026-09-18) and `CLIPPY=1422` (the `--all-targets` form,
   counted as `grep -cE '^warning: '`), plus `check_env_docs` exit 0 (`code 82, doc 82`) and
   `check_readme_dates` 0 offenders. The 1024-row form is not in
   the script — it costs a full long-prompt run and is checked by hand. Every expected value is hard-coded with its
@@ -2599,3 +2599,103 @@ mechanism in one place, without repeating them.
    is a property of the launcher, not of the engine: the engine never raises its own limits, and
    a run outside the scope is a run without that floor. `session.slice` is deliberate —
    `systemd-oomd` watches `app.slice` on this machine.
+
+### 8.9 The oracle children of the `parity` harness (#65, 2026-09-18)
+
+The ten-task harness spawns two python children out of the oracle venv: `tools/tokenize_ids.py
+--chat` once per task (the crow arm's token stream, `bin/parity.rs::tokenize`) and
+`tools/detokenize_ids.py` once per phase (`detokenize_all`). Three times — chain 19f and chain 19g
+on 2026-09-13, once more in the 62b pairs preflight — the tokenize child died mid-phase with a
+NON-ZERO exit and an EMPTY stderr, the fail-closed assert stopped the phase, and every retry on
+the identical binaries and the identical frozen prompt ran green. The cost was a full ten-task
+re-run, about 15 min.
+
+**What the call site recorded, and why that was the whole problem.** It was
+`assert!(out.status.success(), "tokenize stderr: {}", ..)`: the child's stderr, and nothing else.
+No exit status, no stdout length, no size of what had been sent, no name of the task. An empty
+stderr is not a Python error — a Python error writes its traceback to that pipe, as the missing
+`jinja2` of a fresh venv does. An empty stderr with a non-zero status is a process that died
+WITHOUT running Python's own error path, and the name of that death is the exit code, which is
+the one thing the harness threw away. So the three reports had nothing to work with, and the
+first half of the fix is that the exit code now leads the diagnosis (`child_verdict`,
+`exit_code_name`).
+
+**What the code can be cleared of, by construction.** Read off this tree at `20bc121`, before
+anything was changed:
+
+| candidate | why it is not this |
+|---|---|
+| the prompt through `argv`, against the 32,767-char `CreateProcess` cap | the prompt has gone through STDIN since 2026-09-03 (`tokenize_ids.py:25`); the argv of the call is `tools/tokenize_ids.py --chat`, 32 chars, whatever the prompt is. Two of the ten prompts (t1-read 60,290 chars, t1b-read-lang 53,889) would exceed the cap and neither is the task that failed |
+| a stdout or stderr pipe filling and stalling the child | `wait_with_output` drains BOTH pipes while it waits; neither can fill |
+| stdin never closed, so the child's read-to-EOF never ends | `wait_with_output` drops the parent's stdin before it reads. A child stuck on its own `sys.stdin.read()` would HANG; all three failures were a fast non-zero EXIT |
+| a timeout or a kill from the parent | there is none on this path — no `wait_timeout`, no `kill`, no deadline anywhere in `bin/parity.rs` |
+| the stderr being consumed somewhere else | stderr is `Stdio::piped()` and `wait_with_output` is its only reader |
+| the console encoding | `PYTHONIOENCODING=utf-8` / `PYTHONUTF8=1` are set on the process, not inherited from the shell, since `#34`. An encoding mismatch changes the ID COUNT — 9,522 against 9,398 on t4-prose, measured 2026-09-09 — it does not make a child exit non-zero |
+| inherited handles | Rust's `Stdio::piped` ends are not inheritable, and the parent's copies of the child's ends are closed at spawn |
+| the prompt, or the tokenizer state | the ten prompts are frozen and every retry on the identical input was green, three times |
+
+**What is left, and the window it sits in.** A child that started, exited non-zero and wrote
+nothing to stderr, on Windows, is one of: `STATUS_DLL_INIT_FAILED` (`0xC0000142` — the loader
+could not initialise a DLL of the venv, before any Python ran), `STATUS_ACCESS_VIOLATION`
+(`0xC0000005` — a native crash in an extension module, no traceback), `STATUS_NO_MEMORY` /
+`STATUS_COMMITMENT_LIMIT`, or an outside kill (AV, a management agent). All of them are
+environmental, all of them say their name only in the exit code, and all of them are made more
+likely by the window the child was spawned in: BETWEEN the previous task's `Cnq::drop` — on
+Windows a whole-file purge of the standby pages of a 104 GB container (8.8 point 5) — and the
+release of its ~44.6 GB pinned tier, and the `Cnq::open` + `Ctx::init` of the next one. Starting
+a load in that window is what `engine/README.md`'s Windows rule is about (wait for 50.5 GiB of
+free host RAM, `#38`, 2026-09-10), and starting a python interpreter that imports `transformers`
+in it is the same bet. That it was task 5 of ten on all three chains, and never task 1, fits a
+pressure that accumulates over a phase; it is consistent with the disk churn the 19f report
+suspected (concern C3) and it does not distinguish between these candidates.
+
+So: **every cause inside the harness is excluded with code evidence, and the residual is
+environmental. WHICH environmental failure it was is not recoverable from what was recorded** —
+that is the honest verdict, and the guard below is what makes the next occurrence name itself in
+one line instead of costing a chain.
+
+**The guard.** All four oracle calls of a phase go through `oracle_child(program, args,
+stdin_bytes, what, backoff_ms)`:
+
+1. **Bounded retry, per CALL, not per phase.** Three attempts, `ORACLE_BACKOFF_MS = [2000, 5000]`
+   between them — seconds and not milliseconds because a host resource that is being reclaimed
+   needs wall-clock time. Worst case 7 s of waiting against the ~15 min a lost phase costs. The
+   ten-task phase now retries the single task and goes on; it is never restarted.
+2. **Still fail-closed.** When all three attempts fail the harness panics with the whole table of
+   attempts, so nothing is recorded for the task it was on. Each failed attempt is ALSO printed
+   the moment it happens, because the process may not live to write the record.
+3. **The record names the retry.** A failed attempt that a later one made good lands in the run
+   record as `oracle_retries` on that task's measurement row (`oracle_retries_warmup` /
+   `oracle_retries_detok` in the meta block), with the task, the child, the attempt, the bytes
+   sent, the milliseconds and the diagnosis. The keys appear ONLY when something was retried, so
+   a clean phase writes exactly the record it wrote before the guard existed.
+4. **The diagnosis leads with the exit code** and names it where the name is the whole message
+   (`exit_code_name`: the four NTSTATUS values above, plus CPython's silent `120`). An empty
+   stderr is said to be empty, in those words.
+5. **A short write can never be accepted.** The write to the child's stdin is no longer
+   `unwrap`ed — the CHILD knows why its read end went away, so the error is kept, the child is
+   waited for anyway and its own stderr and exit code are reported with it; and a partial write
+   fails the attempt even behind a zero exit. A zero exit with an EMPTY stdout fails too, and
+   `tokenize` refuses an empty id list: a child that read a truncated stdin must not be recorded
+   as a measurement of a prompt that was never sent.
+6. **The child is spawned BEFORE `open_model`.** `crow_complete` tokenizes first and maps the
+   container and creates the CUDA context after. Numerically inert — `tokenize` runs no kernel
+   and reads no config, and the chunk policy still sees the same `ids.len()` before
+   `Engine::load` — but it takes the python child out of the worst host-memory window of the
+   process, which is the window above.
+
+**Measured on this Linux box, 2026-09-18.** The oracle venv rebuilt at transformers 5.16.1 and
+run against the in-engine tokenizer over the ten frozen prompts: **10 of 10 identical**, and
+t4-prose reads 9,398 ids, the `#34` value of record, which is what says the venv is the oracle
+and not a lookalike. The retry live, with a stub interpreter that dies the #65 death — non-zero
+exit, nothing on stderr, after it has read its whole stdin — on the SECOND of the phase's
+tokenize calls: `[oracle] tokenize_ids.py --chat: attempt 1 of 3 FAILED after 4 ms — exit code 1
+(0x00000001); 0 B on stdout; stderr EMPTY …`, `attempt 2 of 3 succeeded (1140 B on stdout)`, the
+task ran at `prompt_tokens 220` — the oracle's own count for that prompt — and the phase exited
+0 with the failed attempt in its record (`decode_out/gate65/`). Four unit tests pin it with no
+venv, no llama-server and no GPU: the verdict table, and three against a real `/bin/sh` child
+(fails once and is retried, fails every attempt and still fails the task, and a 60,290-byte
+payload that arrives whole through stdin).
+
+**Not covered.** A child that HANGS instead of exiting still hangs the phase: `wait_with_output`
+has no deadline and a timeout needs a waiting thread. No occurrence has had that shape.

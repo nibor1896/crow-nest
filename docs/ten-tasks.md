@@ -49,6 +49,16 @@ Rules:
   per run (spec §0.5).
 - Misses are measured results: a failed task re-cuts the suspect stage
   (quant: CNQ4.5-C lever for attention — p16 finding; kernel: numerics gate).
+- **A dead oracle child costs the TASK, not the phase** (issue #65, 2026-09-18). The two
+  python children of the oracle venv — `tools/tokenize_ids.py --chat` per task and
+  `tools/detokenize_ids.py` per phase — get three attempts with a 2 s and then a 5 s pause,
+  because three times (chains 19f and 19g, 2026-09-13, and the 62b pairs preflight) one
+  tokenize child died at task 5 with a non-zero exit and an EMPTY stderr and every retry on
+  the identical input was green. It stays fail-closed: after the third attempt the phase
+  fails and records nothing for that task. A retry that succeeded is part of the run record
+  (`oracle_retries` on that task's row, with the exit code and the captured stderr), so a
+  number measured after a retry is never quoted as if nothing had happened
+  (`docs/architecture.md` 8.9).
 
 Provenance: t1–t6 = crow-lab 2026-09-01 task series (robin's Crow workload
 sample); t7–t10 added 2026-09-03 to cover long-context reading and
