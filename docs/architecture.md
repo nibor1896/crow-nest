@@ -899,8 +899,223 @@ grouped launch is 27 % slower per byte than qkv and z as two separate launches (
 **Nothing in this section flips a default and no engine code changed for it.** `tools/gate-linux.sh`
 is ALL GREEN at this commit (`decode_out/gate62`).
 
+### 4.8 The cold-expert staging row: 11.7 ms per decode token, and all but 0.3 of it is the PCIe link (#19, 2026-09-18)
 
----
+`stage_cold_ca` is **rank 1 of the whole decode step** in the 4.6 table — 11.468 ms per decode token
+over 48 calls, 38.2 % of what the profiler attributes. This is that row taken apart: how many cold
+experts, how many bytes, at what rate, and what a launch costs before the first byte. The issue body
+of #19 describes it (2026-09-04, Windows, context 528) as "`stage_cold` 8.1 ms for about 108 cold
+experts, 169 us per layer launch, **latency bound at 2 to 3 cold experts per layer**". At this
+operating point that reading is dead: the per-launch term is 2 to 4 % of the row and everything else
+is bytes over a link that is already running at 99 % of what this machine can reach.
+
+**Machine and form.** RTX 5090 / Arch Linux (the second environment block of
+`docs/system-landscape.md`), HEAD `cb1895a`, 2026-09-18,
+`decode run decode_out/srv-a5-t1read-ids.json 256` on the t1-read prompt of record (16,064 ids,
+greedy, 256 generated tokens, 255 timed steps, context 16,320), inside the bounded scope
+`tools/drift-chain.sh` runs its D arm in. Logs: `decode_out/19/`. The flag-free control at HEAD reads
+**25.32 ms per decode token = 39.5 tok/s at the ids sha256 `56305eee11d6`**
+(`decode_out/19/ctl-g1-256.log`), the value the #38 chain's D arm, #61 and #62 all carry.
+
+**Method, and why this row needs no prefill differencing.** `CROW_KPROF=1 CROW_PROFILE=1
+CROW_GRAPH=0`, as in 4.6 and 4.7. Unlike every other row in that table, `stage_cold_ca` is launched
+**only in decode steps**: the staging branch is taken when `t * TOPK <= stage.max` (`gen.rs`, 128
+slots) and a prefill chunk is 4,096 tokens = 40,960 combos, so prefill runs the grouped tile path
+instead. `calls/step` reads exactly **48.0** in every run — one per MoE layer, nothing else — so the
+`CROW_KPROF` row IS the per-decode-token cost and the 4.6 differencing is unnecessary here. The 5.0 us
+per-launch floor the profiler adds is subtracted where the text says "floor-removed". Two runs of the
+same arm reproduce **244.7 us/call to four digits**.
+
+**What one launch moves.** One cold expert is `gate_up [1280 x 2560]` + `down [2560 x 640]` =
+4,915,200 NVFP4 elements at 4.5 bpw = 1,843,200 + 921,600 = **2,764,800 B = 2.765 MB** — the
+`expert_bytes` field of the boot JSON line, and the two slab sizes the `[stage]` boot line prints.
+
+| item | value at the operating point |
+|---|---|
+| calls per decode token | 48.0, one per MoE layer |
+| cold experts per timed decode token | **212.6 of 480 selections** (hot set N = 142 logical of 149 slots) |
+| cold experts per layer per launch | 4.43 |
+| bytes per cold expert | 2,764,800 B |
+| bytes per decode token over PCIe | **587.8 MB** |
+| `stage_cold_ca` per decode token | **11.746 ms** (`CROW_KPROF`), 11.506 floor-removed |
+| achieved rate | 50.0 GB/s raw, **51.1 GB/s** floor-removed |
+
+**The latency term, fitted: `a + b x experts` per layer.** The cold count per token is not a knob, but
+it is a known function of the run length — the stream trickle moves experts into the hot set as the
+generation proceeds, so a `gen` 8 run stages 6.4 cold experts per layer and a `gen` 256 run 4.4. Six
+runs of the identical prompt at `gen` 8 / 16 / 32 / 64 / 128 / 256 therefore sweep the per-launch
+expert count with everything else fixed (`decode_out/19/kp-*.log`). The counters cover the timed steps
+only and `CROW_KPROF` normalizes over all steps including the warm-up, so the warm-up step's own cold
+count `c0` is the third parameter of the fit:
+
+| `gen` | cold experts per layer per launch | us/call measured | `4.74 + 54.07 x` | delta |
+|---|---|---|---|---|
+| 8 | 6.377 | 349.5 | 349.6 | +0.02 % |
+| 16 | 5.693 | 312.7 | 312.5 | -0.05 % |
+| 32 | 5.133 | 282.2 | 282.3 | +0.02 % |
+| 64 | 5.276 | 290.0 | 290.0 | -0.00 % |
+| 128 | 4.733 | 260.5 | 260.6 | +0.05 % |
+| 256 | 4.436 | 244.7 | 244.6 | -0.04 % |
+
+**rms 0.100 us = 0.04 %**, at `c0` = 290.5 (between the 269.8 of the `gen` 8 run and the 308.3 mean of
+its timed steps — a physically right warm-up value, not a free-floating fudge). Pinning `c0` at 308.3
+instead gives `10.50 + 52.83 x` at rms 0.29 us, which is the honest error band on the two terms:
+
+- **`a` = 4.7 to 10.5 us per launch**, and the profiler's own floor is 5.0 us of that, so the kernel's
+  fixed cost is **0 to 5.5 us** — over 48 launches, **0.00 to 0.26 ms per decode token, 0 to 2 %** of
+  the row.
+- **`b` = 52.8 to 54.1 us per cold expert** = **51.1 to 52.4 GB/s** for 2.765 MB.
+
+What a launch costs by cold count, from the fit: **0 experts 4.7 us, 1 → 59, 2 → 113, 4 → 221, 8 →
+437 us.** The 2026-09-04 reading — 169 us per layer, latency bound at 2 to 3 experts — measured a
+platform where one expert cost about 60 us of bytes and the launch cost a comparable amount; here the
+launch is under 5 % of a single expert's transfer.
+
+**Out-of-sample check.** `CROW_CHUNK=2048` makes the loader plan the prefill scratch and the QSA ring
+the way `serve` does, which frees the VRAM for 7 more hot slots per layer: N = 149 of 156 slots, the
+`serve` figure of record (#38), and the cold count falls to 202.4 per token. The fit, with no
+refitting, predicts **234.0 us/call**; the run measures **234.0** (`decode_out/19/kp-c2048.log`), with
+the ids sha256 unchanged. A different hot set, a different chunk policy, four digits.
+
+**The ceiling of this box, measured the same morning** (`engine/src/bin/pcie_probe.rs`, 1 GiB per row,
+5 reps, two runs, every row byte-checked against the pinned source; `decode_out/19/pcie-*.log`). The
+19b/19c probe tables were Windows; these are the **Linux** numbers of record, RTX 5090 on PCIe 5.0
+x16 (`pcie.link.gen.current` 5, width 16 — 63 GB/s raw):
+
+| variant | GB/s (median of 5, both runs) |
+|---|---|
+| **x-k) `cp.async.cg` 4 KB tiles, 40 x 256 — the exact shape `stage_cold_ca` runs** | **51.6** |
+| k) `cp.async.cg` 4 KB / 16 KB / 32 KB tiles, 160 to 640 blocks | 50.0 to 50.9 |
+| l) TMA bulk 16 / 32 / 48 KB, 20 to 320 blocks | 50.1 to 50.9 |
+| i-a) `ld.global.v8.b32`, 40 to 320 blocks | 50.1 to 50.9 |
+| a) the plain 16 B kernel copy, 160 x 256 | 50.6 to 50.7 |
+| g) the same kernel from WRITE-COMBINED pinned memory | 50.3 |
+| d) two streams, m) two and four streams | 50.1 to 51.5 aggregate — no gain |
+| e) `cuMemcpyHtoDAsync` pinned to VRAM, f) `cuMemcpyDtoDAsync` from the mapped host pointer | **54.5 / 54.6** (copy engine) |
+| c) kernel VRAM to VRAM | 746.5 |
+| h) host `memcpy` pinned to heap, one thread | 7.5 |
+
+So the device-issued ceiling of this machine is **51.6 GB/s** and the copy engine's is **54.6**. The
+staging kernel's fitted rate is **51.1 to 52.4 GB/s = 99 to 101 % of the device-issued ceiling**. The
+floors that follow, for the 587.8 MB a decode token stages:
+
+| bound, for the 587.8 MB a decode token stages | ms per decode token |
+|---|---|
+| measured, `CROW_KPROF` raw | 11.746 |
+| measured, launch floor removed | 11.506 |
+| the fit's bytes term alone, `b x 212.6` | 11.50 |
+| **at the best device-issued rate this box reaches, 51.6 GB/s** | **11.39** |
+| at the copy engine's 54.6 GB/s (unreachable in the graph, see below) | 10.77 |
+| at the PCIe 5.0 x16 raw 63 GB/s | 9.34 |
+
+**Three independent ways the kernel shape does not matter.** Each of these is one `CROW_KPROF` run at
+`gen` 256 with the same 211.8 cold experts per token, against the 244.7 us/call of the default:
+
+| arm | us/call | reading |
+|---|---|---|
+| `CROW_STAGE_BLOCKS` 8 / 20 / 40 / 80 / 160 / 320 | 258.1 / **240.7** / 244.7 / 245.0 / 245.2 / 244.9 | flat to 1.8 % over a 16 x block range; only 8 blocks (2,048 threads) falls off, by 5.5 % |
+| `CROW_STAGE_KERNEL=1` — the pre-#19e `stage_cold`, a completely different read shape (grid `t*TOPK` x 2 x 8, four 16 B `uint4` loads in flight per thread) | **244.7** | the same number to four digits. On Windows (#19d, 2026-09-11) the same comparison read 10.42 against 7.07 ms per token, **1.47 x** |
+| `CROW_PINNED_WC=0` — cacheable pinned instead of write-combined | 244.5 | no difference; the 47.6-against-24 GB/s figure in `residency.rs` is a 2026-09-04 Windows measurement of the OLD kernel and does not describe this path on Linux (`pcie_probe` agrees: g) 50.3 against b) 50.2 to 50.6) |
+
+The #19d/#19e lever — the reason `stage_cold_ca` is the default at all — **buys nothing on this box**.
+Both kernels sit on the link. That is what "bandwidth bound" means when it is true.
+
+#### The verdict, and what it rules out
+
+**Bandwidth bound, at the link, with under 3 % of headroom.** Of the 11.746 ms the row costs per
+decode token the fit puts **11.50 ms in bytes** (587.8 MB at 51.1 GB/s) and **0.23 ms in launches**
+(48 x 4.74 us, itself inside the profiler's own 5.0 us floor); the same bytes at the fastest rate any
+of the 35 probe variants reaches on this machine would be 11.39 ms, so the whole distance between
+what runs today and a perfect copy is **0.34 ms per decode token, 2.9 %**. It is not
+latency bound (the per-launch term is at most 2 % and most of that is the profiler's own floor), not
+occupancy bound (flat from 20 to 320 blocks), not per-expert-chain bound (the fit is linear in the
+expert count to 0.04 %, so there is no fixed cost per cold item that the tile loop does not already
+overlap), and not a property of the read instruction (`cp.async.cg`, TMA bulk, `ld.global.v8.b32` and
+plain 16 B loads are within 3 % of each other in the probe, and the two production kernels are within
+0.0 %).
+
+What that rules out, in order of how much was hoped for it:
+
+1. **A faster staging kernel.** There is at most 0.15 ms per decode token between the measured rate
+   and the best rate any of the 35 probe variants reaches. 19c's 4.23 ms estimate was a Windows number
+   against a Windows baseline.
+2. **The copy engine** (54.6 GB/s, 6 % more). 19b measured this end to end in 2026-09-11: the routed
+   pointers exist on the host only after `router_top10` of that layer, so a host-issued
+   `cuMemcpyDtoDAsync` forces the decode graph off, and the graph is worth 6.03 ms per token. It loses
+   by 6.49 ms to win 0.78. Unchanged by this pass.
+3. **Fewer launches.** The 48 launches cannot become one: layer L+1's routing needs layer L's output,
+   which is the whole reason this engine has a cold path at all. And at 4.7 to 10.5 us each there is
+   nothing to win — 0.26 ms if they were free.
+4. **Fewer bytes** is the only lever that moves 1 ms or more, and it is #8's territory, not this
+   issue's. Measured here in passing: `CROW_CHUNK=2048` buys 5 to 7 hot slots per layer and takes the
+   staging row from **11.746 to 11.234 ms** (`CROW_KPROF`, N 149 of 156 slots, 202.4 cold experts per
+   token) and the wall from **25.30 to 25.06 ms** per token (graph on, N 147 of 154 slots, 204.3
+   cold), at the identical ids sha256 — about **-0.07 ms of staging per hot expert per layer**, which
+   is the exchange rate the hot-set policy trades VRAM in. (The 147 against 149 between those two runs
+   is the planner measuring free VRAM at load, which the desktop moves by a few MiB between starts,
+   not the switch.) **Why `decode run` sits at N 142 where `serve` sits at 149**: the chunk policy.
+   `decode run` picks chunk 4,096 for a 16k prompt and `serve` picks 2,048, and the bigger chunk's
+   scratch plus a QSA ring of 4,100 rows instead of 2,052 is exactly the VRAM the loader then cannot
+   give the hot set — `[budget]` clamps 160 to 149 slots instead of 160 to 156, and the stream trickle
+   holds 7 of them spare in both cases.
+5. **Overlap** — the one thing left. The internal leg below measures the window it has.
+
+#### The internal leg — what `stage_cold_ca` does per expert, and what can run beside it
+
+`stage_cold_ca` (`kernels.rs`, launched at `gen.rs` inside the decode graph) is a **persistent grid of
+`CROW_STAGE_BLOCKS` x 256** (default 40 blocks = 10,240 threads on a 170-SM card). A work item is a
+(matrix, combo) pair over the layer's `t * TOPK` = 10 combos; the owning block `item % gridDim.x`
+rewrites that combo's pointer-table entry, and the **4 KB tiles of a cold item are split over all
+blocks** (block b takes tiles b, b+G, b+2G, ...), each tile one `cp.async.cg.shared.global` of 16 B
+per thread into a two-deep shared double buffer, then coalesced 16 B stores to the VRAM staging slot.
+Static partition, no atomics, graph-capturable. `gate_up` is 450 tiles and `down` 225, so at 40 blocks
+a block moves 11.25 and 5.6 tiles per cold expert.
+
+The consequence for the decode step is not the kernel's internals but its **shape**: 40 blocks is
+0.24 blocks per SM. For the 11.7 ms this row costs, **130 of the 170 SMs have no block on them at
+all**, and the 40 that do are waiting on PCIe. The `[profile]` host row of the same `CROW_KPROF` runs reads
+`moe` 17.02 ms per step — and 11.7 of that is this one kernel.
+
+Inside one layer the order is `gemv_b` (router logits) -> `router_top10` -> **`stage_cold_ca`** ->
+the shared-expert chain -> the routed GEMVs -> `acc_combo`. Of those, exactly one block reads no
+staged byte: the **shared expert** (`sh_gate_up_q` 20.0 us/call, the `sgv` `gemv_b[1x1]` 8.8, the fused
+down `gemv_fp4_mma_dg` 8.1 — 36.9 us/call under `CROW_KPROF`, **about 22 us per layer = 1.05 ms per
+decode token** once the 5.0 us floor is taken off each launch). It reads `mixed_m` and the dense
+shared-expert weights, which are resident. Everything else in the layer either produces the routing
+(before) or consumes the staged pointers (after). **1.05 ms per decode token is therefore the exact
+size of the overlap window**, and 4.8.1 takes 0.88 of it.
+
+#### The external leg — what the other engines do with CPU-resident MoE experts (source read 2026-09-18)
+
+- **llama.cpp does not stream expert weights over PCIe at all.** `-ot` / `--override-tensor`,
+  `-cmoe` / `--cpu-moe` and `-ncmoe` / `--n-cpu-moe` (`common/arg.cpp`, read at
+  `~/.local/share/crow/src/llama.cpp`) set a tensor's **buffer type** to the CPU backend; ggml's
+  scheduler then splits the graph and runs those matmuls **on the CPU**. The weights never cross the
+  bus — only the activations do, a few KB per layer. There is no expert-cache or weight-prefetch path
+  in `ggml-cuda` (the one `prefetch` in `mmvq.cu` is for bias and scales inside a kernel). The
+  `--moe-stream` expert cache with a host-RAM L2 tier that exists in `crow`'s own llama.cpp patch set
+  (`~/Projects/crow/patches/moe-stream-on-b10269.patch`) is exactly the shape of crow-nest's residency
+  model, and it is a patch, not upstream.
+- **What that trades.** The CPU path is bounded by host DRAM bandwidth and CPU FLOPs instead of PCIe:
+  at batch 1 it reads the same expert bytes out of DRAM, computes 2 x 2.5 MFLOP per expert on cores,
+  and returns 2,560 floats. crow-nest's zero-copy path reads the same bytes over a 51 GB/s link and
+  computes on 170 SMs. The two are the same order on this machine — `pcie_probe` h) reads 7.5 GB/s for
+  a single-threaded host `memcpy` here, so a CPU expert path needs most of the cores busy to beat
+  51 GB/s, and it costs them. The decisive difference is elsewhere: **llama.cpp's arm of record is
+  2.4 bpw** (`UD-Q2_K_XL`) against crow's 4.5, so the same 212.6 cold experts are 313 MB per token for
+  it and 588 MB for crow. At crow's own measured 51.6 GB/s the 2.4 bpw bytes would be **6.07 ms per
+  decode token instead of 11.35** — the single biggest term in this row is the weight format, exactly
+  as #62 found for the GDN row.
+- **From the literature, not re-read at source in this pass. PowerInfer's** answer is prediction: keep the neurons/experts that are hot for the *current
+  activation* on the GPU and compute the cold remainder on the CPU, with a predictor per layer.
+  crow-nest's hot set is the same idea measured offline instead of predicted online, and #8 owns it.
+  **ktransformers** likewise keeps the MoE experts on the CPU (AMX/llamafile kernels) and the dense
+  path on the GPU. **Fiddler** explicitly compares the two and picks CPU compute over PCIe transfer
+  whenever the expert's bytes cost more to move than to compute on the host.
+- **Nobody streams 588 MB per token over PCIe at decode.** That number, not the kernel, is what this
+  row is. The engines that hold CPU-resident experts pay host DRAM bandwidth for them; crow-nest pays
+  PCIe and keeps the GPU's compute. At 4.5 bpw and N 142 the bill is 11.4 ms per token, which is 45 %
+  of the step — and it is the price of the residency model, not a kernel that is doing it wrong.
 
 ## Section 5 — correctness: oracle, parity gates, ten-task gate (APPROVED by robin 2026-09-02)
 

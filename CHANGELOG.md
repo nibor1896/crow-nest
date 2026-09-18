@@ -18,7 +18,8 @@
   Linux chain that answers it, `tools/drift-chain.sh` and the record in
   `docs/measurement-coverage.md`, `77c4d40` — no engine code), `#61` (the decode kernel
   decomposition at the Linux operating point, and the opt-in `CROW_ATTN_LUT` lever it named) and
-  `#62` (the GDN row taken apart per kernel, 2026-09-18 — no engine code).
+  `#62` (the GDN row taken apart per kernel, 2026-09-18 — no engine code) and `#19` (the
+  cold-expert staging row taken apart, and the opt-in `CROW_STAGE_PAR` lever it named, 2026-09-18).
   The machine is the second environment block of `docs/system-landscape.md` unless a row names another one.
 - The crate version field stays `0.1.0`, as it has for every release: this file is the record.
 
@@ -566,6 +567,75 @@
   (`#28` A6 decided them) and nothing on the wire moves.
 
 ### Measured
+
+- **The cold-expert staging row is the PCIe link, not the kernel and not the launches**
+  (`#19`, 2026-09-18, RTX 5090 / Arch Linux, HEAD `cb1895a`, `decode run` on t1-read, 16,064 ids,
+  greedy, 256 tokens / 255 timed steps, context 16,320; logs `decode_out/19/`, record
+  `docs/architecture.md` 4.8). `stage_cold_ca` is rank 1 of the whole decode step in the `#61`
+  table — 11.468 ms per decode token, 38.2 percent of what the profiler attributes. This is that row
+  taken apart. The flag-free control at HEAD reads **25.32 ms per decode token = 39.5 tok/s at ids
+  sha256 `56305eee11d6`**. The row needs no prefill differencing: the staging branch is taken only
+  when `t * TOPK <= stage.max`, so `calls/step` reads exactly 48.0 — one per MoE layer, nothing from
+  the 16,064-token prefill — and two runs of the same arm reproduce **244.7 us/call to four digits**.
+
+  **The bytes.** One cold expert is `gate_up [1280 x 2560]` + `down [2560 x 640]` at 4.5 bpw =
+  1,843,200 + 921,600 = **2,764,800 B**. At the operating point the engine's own counter reads
+  **212.6 cold experts of 480 selections per timed decode token = 587.8 MB over PCIe per token**,
+  4.43 per layer per launch, and the row costs **11.746 ms** (11.506 floor-removed) = **50.0 GB/s
+  raw, 51.1 GB/s floor-removed**.
+
+  **The latency term, fitted.** The stream trickle makes the cold count a known function of run
+  length, so six runs of the identical prompt at `gen` 8 / 16 / 32 / 64 / 128 / 256 sweep the
+  per-launch expert count with everything else fixed. `a + b x experts` per layer fits all six to
+  **rms 0.100 us = 0.04 percent**: `a` = **4.74 us per launch** (the profiler's own floor is 5.0 us
+  of that, so the kernel's fixed cost is 0 to 5.5 us = **0.00 to 0.26 ms per decode token**) and
+  `b` = **54.07 us per cold expert = 51.1 GB/s**. A launch costs 4.7 us at 0 cold experts, 59 at 1,
+  113 at 2, 221 at 4, 437 at 8. Out of sample: `CROW_CHUNK=2048` (N 149 of 156 slots, the `serve`
+  figure) drops the cold count to 202.4 per token, the fit predicts **234.0 us/call** with no
+  refitting and the run measures **234.0**, ids unchanged.
+
+  **The ceiling of this box, measured the same morning** (`pcie_probe`, 1 GiB per row, 5 reps, two
+  runs, every row byte-checked; the 19b/19c tables were Windows, these are the LINUX values of
+  record on PCIe 5.0 x16): best DEVICE-ISSUED **51.6 GB/s** (`cp.async.cg` 4 KB tiles at 40 x 256 —
+  the exact shape `stage_cold_ca` runs), every other device-issued form 50.1 to 50.9 (TMA bulk,
+  `ld.global.v8.b32`, plain 16 B loads, write-combined or cacheable alike), copy engine **54.6**,
+  VRAM to VRAM 746.5, host `memcpy` one thread 7.5, two and four streams no gain. **The staging
+  kernel runs at 99 percent of the device-issued ceiling**; the same bytes at that ceiling would be
+  11.39 ms against the 11.50 measured, so the whole distance to a perfect copy is **0.34 ms per
+  decode token = 2.9 percent**.
+
+  **Three independent ways the kernel shape does not matter**, each one `CROW_KPROF` arm at the same
+  211.8 cold experts per token against the default's 244.7 us/call: `CROW_STAGE_BLOCKS` 8 / 20 / 40 /
+  80 / 160 / 320 reads 258.1 / **240.7** / 244.7 / 245.0 / 245.2 / 244.9 — flat to 1.8 percent over a
+  16 x block range; `CROW_STAGE_KERNEL=1`, the pre-`#19e` `stage_cold` with a completely different
+  read shape, reads **244.7, the same number to four digits** (on Windows the same comparison was
+  1.47 x, `#19d`) — **the `#19d`/`#19e` lever, which is why `stage_cold_ca` is the default at all,
+  buys nothing on this box**; and `CROW_PINNED_WC=0` reads 244.5, so the 47.6-against-24 GB/s
+  write-combined figure in `residency.rs` is a 2026-09-04 Windows measurement of the old kernel and
+  does not describe this path on Linux.
+
+  **Verdict: bandwidth bound.** Not latency bound (the issue body's "latency bound at 2 to 3 cold
+  experts per layer" was a 2026-09-04 Windows reading at context 528; here the launch term is at most
+  2 percent of the row), not occupancy bound, not per-expert-chain bound (linear in the expert count
+  to 0.04 percent), not a property of the read instruction. What that rules out: a faster staging
+  kernel (0.15 ms left in it), the copy engine (6 percent faster but `#19b` measured it losing 6.49 ms
+  to the decode graph to win 0.78), and fewer launches (48 cannot become 1 — layer L+1's routing needs
+  layer L's output — and they cost 0.23 ms in total). What is left is **fewer bytes**, which is `#8`'s
+  territory (`CROW_CHUNK=2048` buys 5 to 7 hot slots per layer and -0.51 ms of staging, and the reason
+  `decode run` sits at N 142 where `serve` sits at 149 is the chunk policy: 4,096 against 2,048, whose
+  scratch plus a 4,100-row QSA ring is exactly the VRAM the loader then cannot give the hot set), and
+  **overlap**, which is the `CROW_STAGE_PAR` lever above.
+
+  **The external leg** (source read 2026-09-18): llama.cpp does not stream expert weights over PCIe
+  at all — `-ot` / `--cpu-moe` / `--n-cpu-moe` set a tensor's BUFFER TYPE to the CPU backend and
+  ggml's scheduler runs those matmuls on the CPU, so only activations cross the bus, and there is no
+  expert cache or weight prefetch anywhere in `ggml-cuda`. The `--moe-stream` VRAM expert cache with
+  a host-RAM L2 tier is a `crow` patch, not upstream, and it is the shape of crow-nest's residency
+  model. ktransformers and Fiddler make the same CPU-compute trade; PowerInfer predicts the hot set
+  online where crow-nest measures it offline (`#8`). Nobody streams 588 MB per token over PCIe at
+  decode — and the single biggest term in that number is the weight format: llama.cpp's arm of record
+  is 2.4 bpw against crow's 4.5, so the same 212.6 cold experts are 313 MB for it and 588 MB for
+  crow, 6.07 ms against 11.39 at this machine's own measured rate.
 
 - **The GDN row taken apart per kernel, and what the +1.64 ms of this issue actually is**
   (`#62`, 2026-09-18, RTX 5090 / Arch Linux, HEAD `156e2fe`, `decode run` on t1-read, 16,064 ids,
