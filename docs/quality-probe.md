@@ -238,11 +238,25 @@ It CANNOT decide:
 - **the quality of a thinking answer.** `--reasoning-effort` is wired on both doors and unit
   tested, and it has NOT been run against either server; the baseline above is thinking off.
 - **how far this quant is from the original.** The literature's reading of a quant is
-  reference-based: mean KL divergence and top-1 agreement against the BF16 model, teacher-forced
-  on chat and agentic text (arXiv 2407.09141, llama.cpp discussion 4110), and the
-  greedy-continuation agreement over 32 tokens Unsloth publishes. All three need the BF16
-  originals, which are not on this machine. That is a later step of this series and nothing in
-  this document is a substitute for it.
+  reference-based: mean KL divergence and top-1 agreement against the unquantized model,
+  teacher-forced on chat and agentic text (arXiv 2407.09141, llama.cpp discussion 4110), and the
+  greedy-continuation agreement over 32 tokens Unsloth publishes. This probe computes none of
+  them; it reads answers, not distributions.
+
+  **That step is taken, and it did not need the originals.** `docs/oracle-kld.md` (issue #78,
+  2026-09-19) is the reference-based reading, against the f32 transformers oracle of 2026-09-05
+  that survives on the Windows tree - 298 and 607 teacher-forced rows of English code text - with
+  BOTH engines on the same rows. Two things there speak back to this document. The first: the
+  arms that carry the answer-quality gap here are NOT the arms that carry the distance there -
+  the BF16 dense path of #77 cuts the mean KL divergence by 24 % on 607 rows while it moved this
+  probe's German long-prose rate by 1.79 per 1000. The second, and it is the one to read twice:
+  **on that metric the Unsloth GGUF is not closer to the f32 model than CNQ4.5-M** - 0.557
+  against 0.461 mean KLD and 79.6 % against 82.4 % top-1 agreement on the 607-row set - while on
+  THIS page it writes half the German non-words. Both are measurements. Neither explains the
+  other, and `docs/oracle-kld.md` 7.2 is where that is spelled out.
+
+  Still missing: the greedy-continuation agreement, and any reference-based reading of German,
+  of long context or of the sparse attention regime.
 
 ## 9. Where the records are
 
