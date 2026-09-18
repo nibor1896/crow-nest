@@ -98,13 +98,13 @@ tools/quality-probe.py --rescore A1-crow      # metrics recomputed from the stor
 `--rescore` exists because the generations are the expensive half and they are kept verbatim:
 a metric corrected afterwards does not cost a re-run, and every arm can be brought to the same
 scorer, which is what makes two arms comparable at all. All four runs below were GENERATED at
-commit `c1cf95c` and SCORED by the scorer of record at commit `cefd891`; each `run.json` names
+commit `c1cf95c` and SCORED by the scorer of record at commit `2bc92f2`; each `run.json` names
 both.
 
 ## 5. The baseline, 2026-09-18
 
 Measured 2026-09-18 on RTX 5090 / Arch Linux, generated at repo commit `c1cf95c` and scored
-at `cefd891`, prompt set version 1, 36 generations per run (12 prompts x 3 seeds), thinking
+at `2bc92f2`, prompt set version 1, 36 generations per run (12 prompts x 3 seeds), thinking
 off, one engine on the card at a time.
 
 | | A1 `serve`, CNQ4.5-M | B1 llama-server, UD-Q2_K_XL |

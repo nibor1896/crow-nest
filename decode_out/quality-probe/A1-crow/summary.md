@@ -1,6 +1,7 @@
 # quality probe - A1-crow
 
-- date 2026-09-18, repo commit `c1cf95c`, prompt set version 1
+- date 2026-09-18, generated at repo commit `c1cf95c`, prompt set version 1
+- scored at commit `2bc92f2` on 2026-09-18 (`--rescore`, from the stored texts)
 - endpoint `http://127.0.0.1:8099`, engine `crow`, model `Qwen3.8-Flash-Next-CNQ4.5-M`
 - row temperature 1.0, top_p 0.95, top_k 20, presence_penalty 0.0, min_p 0.0, max_tokens 2600
 - thinking: absent (crow); seeds [1201, 1202, 1203]; 36 generations, 0 failed, 699 s wall
