@@ -556,7 +556,7 @@ impl Cnq {
         let map_len = file_len;
         let (map, map_handle) = map_file(&f);
         if map == 0 {
-            eprintln!("[cnq] file mapping unavailable - seek/read fallback");
+            tracing::warn!(target: "cnq", "[cnq] file mapping unavailable - seek/read fallback");
         }
         // the `ple` section as one byte range: the 128 shard tables are laid out
         // contiguously by the converter (verified 2026-09-17 on the -M container:

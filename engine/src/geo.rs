@@ -266,7 +266,7 @@ pub fn apply_adapt_policy(cfg: &mut Config) {
         None => Adapt { stream: false, spare: spare.unwrap_or(0), every: every.unwrap_or(0), max: max.unwrap_or(8) },
     };
     let a = cfg.adapt;
-    eprintln!(
+    tracing::info!(target: "policy",
         "[policy] chunk {} -> {} ({}), {} spare hot slot(s), every {}, max {}/layer",
         cfg.prompt_chunk,
         if a.stream { "stream trickle" } else { "compute-stream swaps" },

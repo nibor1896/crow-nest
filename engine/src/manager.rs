@@ -224,7 +224,7 @@ impl ThreeStates {
                 }
             }
             if cfg_n_dbg() {
-                eprintln!("[clamp] n={n} vram_sum={:.0} MB cold={:.0} MB free0={:.0} MB",
+                tracing::info!(target: "manager", "[clamp] n={n} vram_sum={:.0} MB cold={:.0} MB free0={:.0} MB",
                     states_bytes as f64 / MIB,
                     ((if cold_fixed { E } else { E - n.min(E) + spare }) as u64 * cold_bytes_per_n_unit) as f64 / MIB,
                     free0 as f64 / MIB);

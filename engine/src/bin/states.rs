@@ -40,6 +40,11 @@ fn plan_table(context: usize, kv: KvDtype, expert_per_unit: u64, dense_hot: u64,
 }
 
 fn main() {
+    // #13: the logging subscriber of this process. Every library line this bin
+    // triggers (`[prefill]`, `[load]`, `[budget]`, `[ple]`, ...) is a `tracing`
+    // event now, so without this call they go nowhere. The guard drains the two
+    // writer threads when `main` returns; an `exit` below calls `shutdown` first.
+    let _log = crow_nest_engine::log::init();
     // #60 (2026-09-18): the demo defaults to the production -M container, like
     // `decode` and `parity` (#51) and the two generator bins (#52), and reads
     // CROW_CNQ like they do. It used to hard-code the pre-#51 container, so the
@@ -106,6 +111,7 @@ fn main() {
         match r {
             Ok(_) => {
                 eprintln!("states: FAIL — 150k context was not refused");
+                crow_nest_engine::log::shutdown();
                 std::process::exit(1);
             }
             Err(_) => println!("refused as required (spec 0.2 floor)"),

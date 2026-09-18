@@ -566,6 +566,11 @@ fn load_prompts(path: &str) -> Vec<Prompt> {
 }
 
 fn main() {
+    // #13: the logging subscriber of this process. Every library line this bin
+    // triggers (`[prefill]`, `[load]`, `[budget]`, `[ple]`, ...) is a `tracing`
+    // event now, so without this call they go nowhere. The guard drains the two
+    // writer threads when `main` returns; an `exit` below calls `shutdown` first.
+    let _log = crow_nest_engine::log::init();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         println!("usage: parity <run> <prompts.json> [llama-url]\n       parity <phase> <run_index> <crow|llama> <prompts.json> [llama-url] [outprefix]\n  run   = interleaved (needs both engines co-resident)\n  phase = one arm over the full rotated order (RAM/VRAM discipline on this machine)");

@@ -463,7 +463,7 @@
 //! |---|---|
 //! | the file layout, the payload order, every refusal, the save and restore ordering | `engine/src/slot.rs` module doc |
 //! | the three answer documents and their fields | `slots_json`, `slot_saved_json`, `slot_restored_json` below |
-//! | the `[slot]` stderr lines | the `eprintln!` calls in `slot_route` below |
+//! | the `[slot]` stderr lines | the `tracing` events on target `slot` in `slot_route` below (#13: `eprintln!` until 2026-09-18, same text) |
 //!
 //! What only THIS file can say, because it is the wire and not the format:
 //!
@@ -747,20 +747,20 @@ fn tokenize_main(rest: &[String]) -> i32 {
     let cmd = match parse_tokenize(rest) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[tokenize] {e}");
+            tracing::error!(target: "tokenize", "[tokenize] {e}");
             return 2;
         }
     };
     let tk = match crow_nest_engine::tokenizer::global() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("[tokenize] {e}");
+            tracing::error!(target: "tokenize", "[tokenize] {e}");
             return 3;
         }
     };
     let (tp, cp) = tk.paths();
-    eprintln!("[tokenize] tokenizer {tp}");
-    eprintln!("[tokenize] chat template {cp}");
+    tracing::info!(target: "tokenize", "[tokenize] tokenizer {tp}");
+    tracing::info!(target: "tokenize", "[tokenize] chat template {cp}");
 
     let ids_of = |chat: bool, text: &str| -> Result<Vec<u32>, String> {
         if chat {
@@ -774,11 +774,11 @@ fn tokenize_main(rest: &[String]) -> i32 {
         Tok::Text { chat, text } => match ids_of(chat, &text) {
             Ok(ids) => {
                 println!("{}", serde_json::json!(ids));
-                eprintln!("[tokenize] {} tokens", ids.len());
+                tracing::info!(target: "tokenize", "[tokenize] {} tokens", ids.len());
                 0
             }
             Err(e) => {
-                eprintln!("[tokenize] {e}");
+                tracing::error!(target: "tokenize", "[tokenize] {e}");
                 4
             }
         },
@@ -786,21 +786,21 @@ fn tokenize_main(rest: &[String]) -> i32 {
             let raw = match std::fs::read(&file) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("[tokenize] cannot read {file}: {e}");
+                    tracing::error!(target: "tokenize", "[tokenize] cannot read {file}: {e}");
                     return 4;
                 }
             };
             let doc: serde_json::Value = match serde_json::from_slice(&raw) {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("[tokenize] {file} is not JSON: {e}");
+                    tracing::error!(target: "tokenize", "[tokenize] {file} is not JSON: {e}");
                     return 4;
                 }
             };
             let prompts = match prompts_from_json(&doc) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("[tokenize] {file}: {e}");
+                    tracing::error!(target: "tokenize", "[tokenize] {file}: {e}");
                     return 4;
                 }
             };
@@ -808,21 +808,21 @@ fn tokenize_main(rest: &[String]) -> i32 {
             for (id, text) in &prompts {
                 match ids_of(chat, text) {
                     Ok(ids) => {
-                        eprintln!("[tokenize] {id} chars {} tokens {}", text.chars().count(), ids.len());
+                        tracing::info!(target: "tokenize", "[tokenize] {id} chars {} tokens {}", text.chars().count(), ids.len());
                         map.insert(id.clone(), serde_json::json!(ids));
                     }
                     Err(e) => {
-                        eprintln!("[tokenize] {id}: {e}");
+                        tracing::error!(target: "tokenize", "[tokenize] {id}: {e}");
                         return 4;
                     }
                 }
             }
             let text = serde_json::Value::Object(map).to_string();
             if let Err(e) = std::fs::write(&out, text) {
-                eprintln!("[tokenize] cannot write {out}: {e}");
+                tracing::error!(target: "tokenize", "[tokenize] cannot write {out}: {e}");
                 return 4;
             }
-            eprintln!("[tokenize] {} prompts -> {out}", prompts.len());
+            tracing::info!(target: "tokenize", "[tokenize] {} prompts -> {out}", prompts.len());
             0
         }
     }
@@ -2008,9 +2008,9 @@ fn message_digest(messages: &serde_json::Value) -> Vec<String> {
 /// - TASK J: the one place a messages 400 is logged, so both refusal paths log alike
 /// - the reason first, then `message_digest` of the RAW messages, one line each
 fn log_messages_400(reason: &str, raw: &serde_json::Value) {
-    eprintln!("[chat] 400 {reason}");
+    tracing::warn!(target: "chat", "[chat] 400 {reason}");
     for l in message_digest(raw) {
-        eprintln!("[chat]   {l}");
+        tracing::warn!(target: "chat", "[chat]   {l}");
     }
 }
 
@@ -2019,7 +2019,7 @@ fn sse_send<W: Write>(w: &mut W, text: &str) -> bool {
     match w.write_all(text.as_bytes()).and_then(|_| w.flush()) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("[chat] write failed, aborting the generation: {e}");
+            tracing::warn!(target: "chat", "[chat] write failed, aborting the generation: {e}");
             false
         }
     }
@@ -2156,7 +2156,7 @@ impl ClientProbe {
     fn new(fd: Option<i32>) -> Self {
         let base_eof = matches!(fd.map(poll_peer), Some(Peer::Eof));
         if base_eof {
-            eprintln!(
+            tracing::info!(target: "chat",
                 "[chat] the client had already closed its write side when this request started \
                  (POLLRDHUP at the first probe): a client that finished SENDING, not one that \
                  left - the document is generated and answered as before (#54)"
@@ -2297,7 +2297,7 @@ impl ChatSink for CollectSink {
         match self.probe.gone(step) {
             None => true,
             Some(why) => {
-                eprintln!(
+                tracing::info!(target: "chat",
                     "[chat] the client is gone at step {step}: {why} - ending the generation, \
                      the slot is free for the next request (#54)"
                 );
@@ -2424,7 +2424,7 @@ fn completion_json(
                 // that stores and re-sends the turn cannot poison its own history.
                 let (arguments, note) = args_object_or_raw(&c.arguments);
                 if let Some(n) = note {
-                    eprintln!("[chat] tool_call {} arguments repaired before the document: {n}", c.id);
+                    tracing::info!(target: "chat", "[chat] tool_call {} arguments repaired before the document: {n}", c.id);
                 }
                 serde_json::json!({
                     "id": c.id,
@@ -2488,7 +2488,7 @@ fn respond_json(
     doc: &serde_json::Value,
 ) -> &'static str {
     if let Err(e) = respond(stream, status, &doc.to_string()) {
-        eprintln!("[serve] response write failed: {e}");
+        tracing::warn!(target: "serve", "[serve] response write failed: {e}");
     }
     status
 }
@@ -2512,7 +2512,7 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
     // render with a message that names the index and the field, before any render.
     let (msgs, notes) = normalize_messages(&req.messages);
     for n in &notes {
-        eprintln!("[chat] normalised: {n}");
+        tracing::info!(target: "chat", "[chat] normalised: {n}");
     }
     if let Err(e) = check_messages(&msgs) {
         log_messages_400(&e, &req.messages);
@@ -2535,7 +2535,7 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
     // CROW_VIT=0 the engine holds no tower and the request falls through as
     // the placeholder of record (the single image_pad rides as a token).
     let (ids, vision_plan): (Vec<u32>, Option<crow_nest_engine::vit::VisionPlan>) = if !req.images.is_empty() && srv.eng.has_vision() {
-        eprintln!("[vit-chat] {} image(s) in request, decoding data URLs ...", req.images.len());
+        tracing::info!(target: "vit", "[vit-chat] {} image(s) in request, decoding data URLs ...", req.images.len());
         let mut bytes = Vec::with_capacity(req.images.len());
         for (i, url) in req.images.iter().enumerate() {
             match decode_data_url(url) {
@@ -2554,7 +2554,7 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
         // log said nothing about how much room the card still had; a session that
         // walks this number down is now visible turn by turn.
         let (live_n, live_b) = crow_nest_engine::cuda::live_dev();
-        eprintln!(
+        tracing::info!(target: "vit",
             "[vit-chat] {} image(s), {} visual token(s), grids {:?}, mrope delta {}, vision {} ms (decode + preprocess + tower), free VRAM {:.1} MiB, engine live allocs {live_n} = {:.1} MiB",
             req.images.len(),
             plan.n_visual,
@@ -2588,7 +2588,7 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
         }
     };
     if budget != req.max_tokens {
-        eprintln!(
+        tracing::info!(target: "chat",
             "[chat] max_tokens {} clamped to {} (prompt {}, n_ctx {})",
             req.max_tokens,
             budget,
@@ -2752,7 +2752,7 @@ fn chat_generate(
     // `reset_ms` is the ONE name for this number: the rollback of a warm request or the
     // `reset_to_zero` of a cold one. The `[chat]` line below calls it `reset` as well.
     // With the cache off `decide` returns before it computes `L`, so no number is claimed.
-    eprintln!(
+    tracing::info!(target: "cache",
         "[cache] {} L {} (held {}), P {cached_n}, snapshots {:?}, reusable {:?}, prefill {prefilled} of {} tok, reset {reset_ms:.3} ms",
         if plan.reuse.is_some() { "WARM" } else { "COLD" },
         if cache_on { plan.l.to_string() } else { "n/a".to_string() },
@@ -2785,7 +2785,7 @@ fn chat_generate(
     let snap1_ms = unsafe { srv.cache.snapshot(srv.eng, true) };
     // a disabled cache copies nothing, so it reports nothing either
     if cache_on {
-        eprintln!(
+        tracing::info!(target: "cache",
             "[cache] snapshot point 1 (after prompt) at pos {}, DtoH {snap1_ms:.3} ms",
             srv.eng.pos()
         );
@@ -2806,7 +2806,7 @@ fn chat_generate(
             // #68: every value says where it came from. `temperature` is the only one that is
             // always the request's own - without it this branch is not taken at all.
             let sent = req.sampling_sent;
-            eprintln!(
+            tracing::info!(target: "chat",
                 "[chat] sampling on the device: temperature {} (request) top_p {} ({}) top_k {} ({}) presence_penalty {} ({}) seed {} ({})",
                 s.temperature,
                 s.top_p, SamplingSent::tag(sent.top_p),
@@ -2817,7 +2817,7 @@ fn chat_generate(
             // the penalty set of THIS request: `arm_sampler` clears the device mask and reloads
             // `Rng::new(seed)`, so no token of the prompt and no token of an earlier turn is in
             // it, whatever the prefix cache reused (7.11.17)
-            eprintln!(
+            tracing::info!(target: "chat",
                 "[chat] presence penalty set: cleared for this request, generated tokens only (#68)"
             );
         }
@@ -2825,11 +2825,11 @@ fn chat_generate(
             // greedy is the A4 path: `decode_step` samples whenever `dev_sampler` is Some
             // (gen.rs:2905-2909) and `reset_to_zero` does not clear it, so it is taken out here
             srv.eng.park_sampler(&mut srv.parked_sampler);
-            eprintln!("[chat] greedy (temperature absent or <= 0)");
+            tracing::info!(target: "chat", "[chat] greedy (temperature absent or <= 0)");
         }
     }
     if req.min_p != 0.0 {
-        eprintln!(
+        tracing::info!(target: "chat",
             "[chat] min_p {} accepted and ignored (device sampler has no min_p; #28)",
             req.min_p
         );
@@ -2882,7 +2882,7 @@ fn chat_generate(
             let full = match tk.decode(&out) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("[chat] detokenize failed: {e}");
+                    tracing::warn!(target: "chat", "[chat] detokenize failed: {e}");
                     String::new()
                 }
             };
@@ -2927,7 +2927,7 @@ fn chat_generate(
     // unsafe: two empty ticks plus a stream sync (`gen.rs:3202-3216`)
     if tick_trickle {
         let drained = unsafe { srv.eng.trickle_drain() };
-        eprintln!(
+        tracing::info!(target: "chat",
             "[chat] trickle {trickle_swaps} swaps started this request (every {adapt_every}, \
              max {adapt_max}/layer, {drained} since process start)"
         );
@@ -2958,7 +2958,7 @@ fn chat_generate(
         }
     }
     if think.stripped() > 0 {
-        eprintln!(
+        tracing::info!(target: "chat",
             "[chat] reasoning filter: {} <think>/</think> tag(s) stripped from the content \
              (#67); the generated ids are untouched",
             think.stripped()
@@ -2972,14 +2972,14 @@ fn chat_generate(
     // the byte window, instead of a `{"_raw": ...}` two turns later in someone else's history.
     for (i, a) in args_acc.iter().enumerate() {
         if let (_, Some(note)) = args_object_or_raw(a) {
-            eprintln!("[chat] BUG: the arguments of tool call {i} are not a JSON object - {note}");
+            tracing::error!(target: "chat", "[chat] BUG: the arguments of tool call {i} are not a JSON object - {note}");
         }
     }
     // #29 A7: a closed call answers `tool_calls`; a malformed one keeps `stop` / `length`.
     // `ToolStream::finish` closes a call whose `</function>` arrived, so EOS in the tail is
     // a complete call, not a malformed one (#29 review).
     if malformed {
-        eprintln!(
+        tracing::warn!(target: "chat",
             "[chat] MALFORMED tool call: no </function> or no name before the end; \
              the raw markup went out as content, finish stays {finish}"
         );
@@ -2987,7 +2987,7 @@ fn chat_generate(
         finish = "tool_calls";
     }
     if ts.dropped() > 0 {
-        eprintln!(
+        tracing::info!(target: "chat",
             "[chat] {} byte(s) dropped after the first tool call started: text the template \
              forbids, or markup after the last `</function>`",
             ts.dropped()
@@ -3051,7 +3051,7 @@ fn chat_generate(
     } else {
         (true, true)
     };
-    eprintln!(
+    tracing::info!(target: "chat",
         "[chat] prompt {} tok ({cached_n} cached, {prefilled} prefilled), generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {}, reasoning chunks {}, tool chunks {}, think tags stripped {}, tool calls {}, usage {}, timings {}, crow_trickle_swaps {trickle_swaps}{}",
         ids.len(),
         per_second(prefilled, prefill_ms),
@@ -3066,12 +3066,52 @@ fn chat_generate(
         if aborted { ", client gone" } else { "" }
     );
     // #30 A8: the same numbers the `timings` block carries, cumulative since process start
-    eprintln!(
+    tracing::info!(target: "chat",
         "[chat] counters (cumulative, never reset): expert selections {selections_total}, \
          expert cold {cold_total}, ple rows {ple_rows_total}, ple misses {ple_miss_total}, \
          layers {LAYERS}, counter read {counters_ms:.3} ms"
     );
-    eprintln!("[chat] ids {out:?}");
+    // #13: ONE structured routing line per request, target `routing`, at INFO.
+    // Same source as the `timings` block and the two lines above - the counters
+    // are cumulative, so the request-local numbers are the difference against
+    // the block the previous request left in `srv.prev_counters`.
+    let prev = std::mem::replace(&mut srv.prev_counters, blocks.clone());
+    let (mut d_sel, mut d_cold, mut layers_cold) = (0u64, 0u64, 0usize);
+    for (l, c) in blocks.iter().enumerate() {
+        let b = prev.get(l).copied().unwrap_or([0, 0]);
+        d_sel += c[0].saturating_sub(b[0]);
+        let dc = c[1].saturating_sub(b[1]);
+        d_cold += dc;
+        if dc > 0 {
+            layers_cold += 1;
+        }
+    }
+    let d_rows = ple_rows_total.saturating_sub(srv.prev_ple.0);
+    let d_fills = ple_miss_total.saturating_sub(srv.prev_ple.1);
+    srv.prev_ple = (ple_rows_total, ple_miss_total);
+    let expert_bytes = srv.eng.residency().gu_bytes + srv.eng.residency().dn_bytes;
+    crow_nest_engine::log::routing(&crow_nest_engine::log::Routing {
+        seq: srv.seq,
+        route: if req.stream { "chat_stream" } else { "chat_document" }.to_string(),
+        finish: finish.to_string(),
+        prompt_n: ids.len(),
+        cached_n,
+        predicted_n: gen,
+        prompt_ms: prefill_ms,
+        predicted_ms: decode_ms,
+        tok_s: (gen.saturating_sub(1)) as f64 * 1000.0 / decode_ms.max(1e-9),
+        selections: d_sel,
+        cold: d_cold,
+        layers_cold,
+        bytes_streamed: d_cold * expert_bytes,
+        ple_rows: d_rows,
+        ple_fills: d_fills,
+        trickle_swaps,
+        counters_ms,
+    });
+    // #13: the full id list of every answer is DEBUG now (`CROW_LOG=info,chat=debug`).
+    // At INFO it made a redirected stderr and the log file grow with every answer.
+    tracing::debug!(target: "chat", "[chat] ids {out:?}");
     // #VIT: the image request is done — back to the load-time rope tables.
     // The next request re-arms them from its own plan. The dump gains the
     // generated ids, so the oracle can compare its own greedy continuation.
@@ -3265,6 +3305,12 @@ struct Srv<'a> {
     /// A CUDA allocation failure after that cannot be answered with an HTTP
     /// status any more, so `guarded` sends an SSE error frame instead.
     stream_head_sent: bool,
+    /// #13: the device counter block (`[48][2]` selections/cold) and the two PLE
+    /// counters as the PREVIOUS request left them. Every counter in this engine is
+    /// cumulative and never reset (the Crow #54 rule), so the routing line of one
+    /// request is the difference of two blocks - held here, never on the device.
+    prev_counters: Vec<[u64; 2]>,
+    prev_ple: (u64, u64),
 }
 
 /// - TASK K: one request may not take the server down with it
@@ -3294,7 +3340,7 @@ where
         Ok(af) => *af,
         Err(p) => std::panic::resume_unwind(p),
     };
-    eprintln!(
+    tracing::info!(target: "serve",
         "[serve] the request was dropped: {} - the engine stays up, the next request is served",
         failed.message()
     );
@@ -3324,7 +3370,7 @@ where
 /// - the return value is the status and the document `serve_one` writes
 fn slot_route(srv: &mut Srv, target: &str, body: &[u8]) -> (&'static str, serde_json::Value) {
     let refuse = |msg: String| {
-        eprintln!("[slot] refused: {msg}");
+        tracing::warn!(target: "slot", "[slot] refused: {msg}");
         ("400 Bad Request", error_json(&msg))
     };
     let Some(action) = query_param(target, "action") else {
@@ -3345,13 +3391,13 @@ fn slot_route(srv: &mut Srv, target: &str, body: &[u8]) -> (&'static str, serde_
             // here, at the HTTP layer, so `slot::save` can stay a plain Result<_, String>.
             if srv.cache.prompt_slot().is_none() {
                 let m = "no prefill clean state is held; run one chat request first".to_string();
-                eprintln!("[slot] refused: {m}");
+                tracing::warn!(target: "slot", "[slot] refused: {m}");
                 return ("409 Conflict", error_json(&m));
             }
             // unsafe: device to host copies only; the engine state is not written
             match unsafe { slot::save(srv.eng, &srv.cache, srv.model_path, &path) } {
                 Ok(s) => {
-                    eprintln!(
+                    tracing::info!(target: "slot",
                         "[slot] save {name:?}: n_saved {}, {} B, {:.1} ms -> {}",
                         s.n_saved,
                         s.n_written,
@@ -3367,7 +3413,7 @@ fn slot_route(srv: &mut Srv, target: &str, body: &[u8]) -> (&'static str, serde_
         "restore" => {
             match unsafe { slot::restore(srv.eng, &mut srv.cache, srv.model_path, &path) } {
                 Ok(r) => {
-                    eprintln!(
+                    tracing::info!(target: "slot",
                         "[slot] restore {name:?}: n_restored {}, {} B, {:.1} ms <- {}",
                         r.n_restored,
                         r.n_read,
@@ -3386,18 +3432,18 @@ fn slot_route(srv: &mut Srv, target: &str, body: &[u8]) -> (&'static str, serde_
 fn serve_one(stream: &mut TcpStream, srv: &mut Srv) {
     let t = Duration::from_secs(IO_TIMEOUT_SECS);
     if let Err(e) = stream.set_read_timeout(Some(t)) {
-        eprintln!("[serve] no read timeout on this connection, closing: {e}");
+        tracing::warn!(target: "serve", "[serve] no read timeout on this connection, closing: {e}");
         return;
     }
     if let Err(e) = stream.set_write_timeout(Some(t)) {
-        eprintln!("[serve] no write timeout on this connection, closing: {e}");
+        tracing::warn!(target: "serve", "[serve] no write timeout on this connection, closing: {e}");
         return;
     }
 
     let head = match read_head(stream) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("[serve] read failed or timed out after {IO_TIMEOUT_SECS}s, closing: {e}");
+            tracing::warn!(target: "serve", "[serve] read failed or timed out after {IO_TIMEOUT_SECS}s, closing: {e}");
             return;
         }
     };
@@ -3431,7 +3477,7 @@ fn serve_one(stream: &mut TcpStream, srv: &mut Srv) {
                 // the chat route writes its own response: SSE, or a JSON error
                 Route::Chat => {
                     let status = guarded(stream, srv, |stream, srv| chat_route(stream, srv, &body));
-                    eprintln!("[serve] {label} -> {status}");
+                    tracing::info!(target: "serve", "[serve] {label} -> {status}");
                     let _ = stream.shutdown(Shutdown::Write);
                     return;
                 }
@@ -3456,20 +3502,28 @@ fn serve_one(stream: &mut TcpStream, srv: &mut Srv) {
     };
 
     let text = doc.to_string();
-    eprintln!("[serve] {label} -> {status}");
+    tracing::info!(target: "serve", "[serve] {label} -> {status}");
     if let Err(e) = respond(stream, status, &text) {
-        eprintln!("[serve] response write failed: {e}");
+        tracing::warn!(target: "serve", "[serve] response write failed: {e}");
     }
     // half close, so the client reads EOF instead of a reset
     let _ = stream.shutdown(Shutdown::Write);
 }
 
 fn main() {
+    // #13: the subscriber, before the first line this process says. The guard keeps
+    // the two writer threads alive for the whole process and drains them when `main`
+    // returns; every `std::process::exit` below calls `log::shutdown()` first, because
+    // `exit` runs no destructor and a lost `[serve] cannot bind ...` is the one line
+    // an operator needs.
+    let _log = crow_nest_engine::log::init();
     let args: Vec<String> = std::env::args().collect();
     // A3: the tokenize arm returns HERE, before the CUDA context and before Engine::load
     // takes engine/.engine.lock; it never starts a Python process
     if args.get(1).map(|s| s.as_str()) == Some("tokenize") {
-        std::process::exit(tokenize_main(&args[2..]));
+        let rc = tokenize_main(&args[2..]);
+        crow_nest_engine::log::shutdown();
+        std::process::exit(rc);
     }
     // TASK K: an out-of-VRAM inside a request raises `cuda::AllocFailed`, which `guarded`
     // catches and answers with a 503. Its payload is not a string, so the DEFAULT hook
@@ -3487,7 +3541,8 @@ fn main() {
     let cli = match parse_args(&args) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("[serve] {e}");
+            tracing::error!(target: "serve", "[serve] {e}");
+            crow_nest_engine::log::shutdown();
             std::process::exit(2);
         }
     };
@@ -3495,7 +3550,8 @@ fn main() {
     // whole conversation had been prefilled. It costs one stat call to find it here.
     if let Some(d) = &cli.slot_save_path {
         if let Err(e) = check_slot_save_path(d) {
-            eprintln!("[serve] {e}");
+            tracing::error!(target: "serve", "[serve] {e}");
+            crow_nest_engine::log::shutdown();
             std::process::exit(2);
         }
     }
@@ -3506,13 +3562,14 @@ fn main() {
     match crow_nest_engine::tokenizer::global() {
         Ok(tk) => {
             let (tp, cp) = tk.paths();
-            eprintln!("[serve] tokenizer {tp}");
-            eprintln!("[serve] chat template {cp}");
+            tracing::info!(target: "serve", "[serve] tokenizer {tp}");
+            tracing::info!(target: "serve", "[serve] chat template {cp}");
         }
         Err(e) => {
-            eprintln!("[serve] {e}");
-            eprintln!("[serve] tokenizer {tok_path}");
-            eprintln!("[serve] chat template {tok_cfg}");
+            tracing::error!(target: "serve", "[serve] {e}");
+            tracing::info!(target: "serve", "[serve] tokenizer {tok_path}");
+            tracing::info!(target: "serve", "[serve] chat template {tok_cfg}");
+            crow_nest_engine::log::shutdown();
             std::process::exit(3);
         }
     }
@@ -3533,7 +3590,7 @@ fn main() {
         if std::env::var_os(key).is_none() {
             std::env::set_var(key, "1");
         }
-        eprintln!("[serve] {key}={}", std::env::var(key).unwrap_or_default());
+        tracing::info!(target: "serve", "[serve] {key}={}", std::env::var(key).unwrap_or_default());
     }
 
     // unsafe: creates the CUDA context; it must outlive every device allocation
@@ -3546,27 +3603,27 @@ fn main() {
 
     // unsafe: pins device and host memory; takes engine/.engine.lock, a second serve dies here
     let eng = unsafe {
-        Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| eprintln!("[load] {m}"))
+        Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| tracing::info!(target: "load", "[load] {m}"))
     };
     let n_ctx = eng.n_ctx();
     let prompt_chunk = eng.cfg.prompt_chunk;
 
-    eprintln!("[serve] container {cnq_path}");
-    eprintln!("[serve] hotsets {sidecar}");
-    eprintln!("[serve] n_ctx {n_ctx}");
-    eprintln!("[serve] prompt_chunk {prompt_chunk}");
+    tracing::info!(target: "serve", "[serve] container {cnq_path}");
+    tracing::info!(target: "serve", "[serve] hotsets {sidecar}");
+    tracing::info!(target: "serve", "[serve] n_ctx {n_ctx}");
+    tracing::info!(target: "serve", "[serve] prompt_chunk {prompt_chunk}");
 
     // #37: the "[policy] ..." line above is what apply_adapt_policy CHOSE; this line is what
     // serve DOES with it. The stream trickle is ticked once per decode_step, the mirror of
     // decode.rs:224-231. adapt_tick, the post-prefill re-cut of CROW_ADAPT=1, stays uncalled.
     let ad = eng.cfg.adapt;
     if ad.stream && ad.every > 0 && trickle_ready(&eng) {
-        eprintln!(
+        tracing::info!(target: "serve",
             "[serve] #37 stream trickle ticked once per decode_step: every {}, max {}/layer, {} spare hot slot(s)",
             ad.every, ad.max, ad.spare
         );
     } else {
-        eprintln!(
+        tracing::info!(target: "serve",
             "[serve] #37 stream trickle NOT ticked: stream {}, every {}, spare slots {}, exact NVFP4 tier {}",
             ad.stream,
             ad.every,
@@ -3574,35 +3631,56 @@ fn main() {
             eng.residency().lb.is_none()
         );
     }
-    eprintln!("[serve] adapt_tick (the CROW_ADAPT=1 hot-set re-cut) is never called by serve");
+    tracing::info!(target: "serve", "[serve] adapt_tick (the CROW_ADAPT=1 hot-set re-cut) is never called by serve");
 
     // #32 A10: without --slot-save-path, POST /slots/0 refuses save and restore
     match &cli.slot_save_path {
-        Some(d) => eprintln!("[serve] slot save path {d}"),
-        None => eprintln!("[serve] no --slot-save-path, so POST /slots/0 refuses save and restore"),
+        Some(d) => tracing::info!(target: "serve", "[serve] slot save path {d}"),
+        None => tracing::info!(target: "serve", "[serve] no --slot-save-path, so POST /slots/0 refuses save and restore"),
     }
 
     let addr = format!("127.0.0.1:{}", cli.port);
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[serve] cannot bind {addr}: {e}");
+            tracing::error!(target: "serve", "[serve] cannot bind {addr}: {e}");
+            crow_nest_engine::log::shutdown();
             std::process::exit(3);
         }
     };
-    eprintln!("[serve] listening on http://{addr} (blocking, one request at a time)");
+    tracing::info!(target: "serve", "[serve] listening on http://{addr} (blocking, one request at a time)");
 
     let mut eng = eng;
     // #31 A9: the snapshot slot is allocated here, once, from the loaded shape (spec 7.7).
     // #36 M2b: SLOTS is 1, and the line below reads it instead of naming a count of its own.
     let cache = PrefixCache::new(&eng);
-    eprintln!(
+    tracing::info!(target: "serve",
         "[serve] prefix cache {}, {} B per snapshot, {} snapshot(s), QSA ring rows {}",
         if cache.enabled() { "on" } else { "off (CROW_PREFIX_CACHE=0)" },
         cache.shape().snapshot_bytes(),
         SLOTS,
         eng.qsa_ring_rows()
     );
+    // #13: the boot report as ONE structured line, target `boot`, at INFO, in
+    // addition to the eight human lines above - the operating point every later
+    // number references (context, N residency, KV dtype, kernel path, cold-path
+    // policy per layer). It is emitted LAST of the boot lines, because
+    // `PrefixCache::new` is the last fact it carries.
+    let cold_policy = if ad.stream && ad.every > 0 && trickle_ready(&eng) {
+        format!(
+            "zero-copy read from the pinned tier; stream trickle every {} decode token(s), max {}/layer, {} spare hot slot(s)",
+            ad.every, ad.max, ad.spare
+        )
+    } else {
+        "zero-copy read from the pinned tier; no trickle, no re-cut (serve never calls adapt_tick)".to_string()
+    };
+    crow_nest_engine::log::boot(&eng.boot_point(
+        "serve",
+        &cnq_path,
+        &sidecar,
+        &cold_policy,
+        cache.enabled(),
+    ));
     let mut srv = Srv {
         eng: &mut eng,
         cnq: &mut cnq,
@@ -3614,11 +3692,13 @@ fn main() {
         cache,
         slot_save_path: cli.slot_save_path.clone(),
         stream_head_sent: false,
+        prev_counters: Vec::new(),
+        prev_ple: (0, 0),
     };
     for conn in listener.incoming() {
         match conn {
             Ok(mut s) => serve_one(&mut s, &mut srv),
-            Err(e) => eprintln!("[serve] accept failed: {e}"),
+            Err(e) => tracing::warn!(target: "serve", "[serve] accept failed: {e}"),
         }
     }
     // #28: a parked device sampler goes back into the engine, so `Engine::drop` frees its

@@ -6,14 +6,15 @@
 
 ## v0.3.1 (unreleased) — the reasoning filter, and what the 170k session really was
 
-- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Eight issues so far: `#67` (the
+- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Nine issues so far: `#67` (the
   reasoning filter, `667b68b`), the engine side of `#68` (the long-context measurement, `f14e557`),
   `#49` (the ragged hot-set sidecar, `0adbe6a`), `#60` (the `parity` record header per arm, and
   the last two bins that hard-coded the pre-`#51` container, `784bd64`), `#54` (the gone-client
   probe of the `stream:false` path, `20bc121`), `#65` (the bounded retry around the harness's
   oracle python children, `6b5025e`), `#64` (F5, the quant package's own self-test and the
-  model card that carries its numbers, `cea9406`) and `#14` (the living diagrams brought back to
-  HEAD, this commit). The machine is the
+  model card that carries its numbers, `cea9406`), `#14` (the living diagrams brought back to
+  HEAD, `5a58e0b`) and `#13` (engine logging: `tracing`, rotation, the routing line and the
+  operating-point report, this commit). The machine is the
   second environment block of `docs/system-landscape.md` unless a row names another one.
 - The crate version field stays `0.1.0`, as it has for every release: this file is the record.
 
@@ -267,6 +268,94 @@
   rows (`check_env_docs` exit 0, 82 = 82).
 
 ### Added
+
+- **Engine logging: `tracing` as the single facade, a rotating gzipping file, one routing line per
+  request and the operating point as one JSON line** (`#13`, 2026-09-18). Before this commit every
+  line the engine said was an `eprintln!` — 153 sites in `engine/src`, always on, never levelled,
+  never in a file, synchronous on the calling thread — and `[chat] ids [...]` printed the full id
+  list of every answer, so a redirected `serve` stderr grew without bound. All seven requirements
+  of the ticket are met; `docs/architecture.md` section 9 is the record.
+
+  **The rule that shaped it: the stderr lines are an interface.** `tools/replay-toolcalls.py`
+  matches `[chat] prompt ` and `[chat] the client is gone at step`, `docs/long-context-goalmode.md`
+  counts `[chat] normalised` and `[chat] ids` lines, and every chain log in this repository is read
+  by someone who knows those prefixes. So the conversion is mechanical and text-preserving: each
+  site is now a `tracing` event with a per-component target (23 of them, from the bracket prefix
+  the message already carried) and the SAME format string byte for byte — verified site by site
+  against `5a58e0b`, 152 of the 153 matched in source order, levels 119 `info` / 18 `warn` /
+  14 `error` / 1 `debug`; the one left alone is a test helper inside `#[cfg(test)]`, where no
+  subscriber is installed and an event would swallow a failing test's diagnosis — and the mirror is
+  formatted **message only** — no timestamp, no level, no target. Measured: a `decode run 32` at
+  the default level writes the stderr of `5a58e0b` with exactly two lines added (the `[log]` line
+  that names the file, and the boot report), and nothing else but the run-to-run values. The file
+  is the machine form, `<ISO-8601 UTC>  <LEVEL> <target>: <message>`.
+
+  **Never in the hot path, and the pair that proves it.** Both sinks sit behind
+  `tracing_appender::non_blocking` — one worker thread each, `lossy(true)`, 131,072 lines buffered
+  — so a call site never waits on a write and never waits on a full queue. Rotation, gzip and prune
+  run on that worker. Five `decode run 64` runs in the gate's own environment, `decode`'s own
+  `mean` over the 63 timed steps: **25.08 / 24.99 ms at `info`** (the new per-token event filtered
+  out), **24.98 / 24.98 ms at `info,decode=trace`** (64 lines emitted), **25.00 ms on a build where
+  that same line is a raw synchronous `eprintln!`** — all five inside a 0.10 ms band, which is the
+  spread of the two readings of the SAME configuration, and 0.4 % of a token against the
+  13.6–22 ms/token budget. TRACE measured 0.055 ms FASTER than INFO. The per-call truth, where it
+  is measurable (100,000 calls, three runs, no GPU): a synchronous `writeln!` to a file
+  **333–354 ns**, an enabled `tracing` event through the non-blocking rotating file
+  **347–373 ns**, a **disabled** event — what `gen::decode_step` pays on every operator run —
+  **0.6 ns**, one 40-millionth of a 24 ms token. The 64 generated ids are bit-identical in all five
+  runs and their first 32 are the 32 ids of record.
+
+  **Rotation.** `log::RotatingFile`, about 200 lines in this tree instead of a crate, because the
+  maintained ones each pay more than they give: `rolling-file` and `tracing-rolling-file` roll by
+  size but never compress and never prune by count, `file-rotate` does all three but brings
+  `chrono` for its timestamp suffixes — and the suffix here is nine lines of Hinnant's
+  `civil_from_days`, which the UTC day boundary needs anyway. Size limit (`CROW_LOG_ROTATE_MB`,
+  default 64, decimals accepted), the day boundary, retention N (`CROW_LOG_KEEP`, default 8) and
+  gzip on every rotated file, through `flate2`, which costs **zero** new crates: `image`'s `png`
+  feature already pulls it. Proven live at a 1,048 B limit with `CROW_LOG_KEEP=3`: six rotations,
+  the newest three kept as real gzips, contiguous and in ascending time order with the live file.
+  **That proof found a bug and closed it**: the first form of the archive name added the collision
+  counter only when two rotations fell inside one second, and `-` (0x2D) sorts before `.` (0x2E),
+  so `…-033802-1.log.gz` sorted BEFORE `…-033802.log.gz` and the prune — which sorts by name —
+  deleted the second archive of a second instead of the oldest; scanning for the first FREE number
+  then reused a number the prune had just released and handed the newest archive the oldest name.
+  The counter is always present and zero padded now, and monotone inside a second; two unit tests
+  pin it.
+
+  **Level routing without a rebuild.** `CROW_LOG` is `RUST_LOG` syntax through
+  `tracing-subscriber`'s `EnvFilter`, default `info` for operators. `info,chat=debug` brings back
+  the full `[chat] ids` list (DEBUG since this commit), `info,decode=trace` turns on the per-token
+  decode forensics, `info,routing=debug` adds one line per prefill chunk. A string this build
+  cannot parse installs the default and says so on a WARN line that names it — an operating switch
+  with a typo may never silence a running server.
+
+  **Machine telemetry next to the human lines.** One `routing` line per request, as JSON, drained
+  from the counters that already existed and had no drain: the `[48][2]` device block of expert
+  selections and cold selections, `Ple::req`/`Ple::miss`, and the trickle's swap count. Every
+  counter in this engine is cumulative and never reset, so `Srv` holds the block the previous
+  request left and the line is the difference — the first request-local numbers this server has
+  logged: `selections`, `cold`, `hit_rate`, `layers_cold`, `bytes_streamed`, `ple_rows`,
+  `ple_fills`, `ple_miss_rate`, `trickle_swaps`, `counters_ms`, beside the id counts and the
+  milliseconds the `timings` block carries. One requirement of the ticket's list is **reported as
+  absent instead of invented**: there is no ring round-trip counter in this tree to drain.
+
+  **The operating point as ONE line.** `Engine::boot_point` + `log::boot`, target `boot`, at INFO,
+  in addition to the eight human boot lines `serve` already printed: container, hot sets and their
+  source, `n_ctx`, prompt chunk, N residency and the stride, KV dtype, kernel path, the cold tier
+  and its policy with `hot_per_layer` for all 48 layers, QSA ring rows, PLE cache bytes, vision and
+  prefix cache. `serve` and `decode run` emit it.
+
+  **Windows and Linux, one code path.** `log::log_dir_from` takes the OS as an argument, so the
+  Windows rule (`%LOCALAPPDATA%\crow\logs`) is unit tested on Linux and the Linux rule
+  (`$XDG_STATE_HOME/crow/logs`, else `~/.local/state/crow/logs`) on Windows. `flate2`'s pure-Rust
+  backend needs no C toolchain on either. No Windows process has written a rotating log yet, which
+  section 9.6 says out loud.
+
+  Ten unit tests in `log.rs` (200 = 113 lib + 78 serve + 6 parity + 3 decode), four new `CROW_LOG*`
+  rows in `docs/env.md` (86 = 86), 16 new crates in `engine/Cargo.lock` — eight of them from
+  `tracing-appender`, whose `rolling` module is deliberately unused — and clippy **1,421**, one
+  FEWER than the 1,422 of record: `redundant reference in eprintln! argument` at `gen.rs:2890` is
+  gone because that line is a `tracing` event now, and nothing new warns.
 
 - **`docs/diagrams.md` diagram 8, the verification picture** (`#14`, 2026-09-18). The gates had no
   diagram at all, while three commits of this release built around them: `tools/gate-linux.sh`

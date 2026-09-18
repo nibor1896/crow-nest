@@ -4,6 +4,11 @@ use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::geo::*;
 
 fn main() {
+    // #13: the logging subscriber of this process. Every library line this bin
+    // triggers (`[prefill]`, `[load]`, `[budget]`, `[ple]`, ...) is a `tracing`
+    // event now, so without this call they go nowhere. The guard drains the two
+    // writer threads when `main` returns; an `exit` below calls `shutdown` first.
+    let _log = crow_nest_engine::log::init();
     // #52: the probe defaults to the production -M container, like `decode` and `parity` (#51);
     // read only, no sidecar is written here
     let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| from_engine_dir(DEFAULT_CNQ));

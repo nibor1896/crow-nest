@@ -27,9 +27,15 @@ fn nib(mag_idx: u32, neg: bool) -> u32 {
 }
 
 fn main() {
+    // #13: the logging subscriber of this process. Every library line this bin
+    // triggers (`[prefill]`, `[load]`, `[budget]`, `[ple]`, ...) is a `tracing`
+    // event now, so without this call they go nowhere. The guard drains the two
+    // writer threads when `main` returns; an `exit` below calls `shutdown` first.
+    let _log = crow_nest_engine::log::init();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("usage: coldtier <cnq> <out.bin> [--bits 2|3] [--levels 1,3] [--threads N]");
+        crow_nest_engine::log::shutdown();
         std::process::exit(2);
     }
     let cnq_path = args[1].clone();

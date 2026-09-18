@@ -4569,10 +4569,10 @@ pub fn kprof_report(steps: u64) {
     rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
     let total: u64 = rows.iter().map(|r| r.1 .1).sum();
     let st = steps.max(1) as f64;
-    eprintln!("[kprof] kernel time incl. one launch latency each, over {steps} steps (total {:.1} ms/step)", total as f64 / 1000.0 / st);
-    eprintln!("[kprof] {:<22} {:>9} {:>11} {:>9} {:>6}", "kernel", "calls/step", "ms/step", "us/call", "share");
+    tracing::info!(target: "kprof", "[kprof] kernel time incl. one launch latency each, over {steps} steps (total {:.1} ms/step)", total as f64 / 1000.0 / st);
+    tracing::info!(target: "kprof", "[kprof] {:<22} {:>9} {:>11} {:>9} {:>6}", "kernel", "calls/step", "ms/step", "us/call", "share");
     for (n, (c, us)) in rows {
-        eprintln!("[kprof] {:<22} {:>9.1} {:>11.3} {:>9.1} {:>5.1}%", n, *c as f64 / st, *us as f64 / 1000.0 / st, *us as f64 / *c as f64, 100.0 * *us as f64 / total as f64);
+        tracing::info!(target: "kprof", "[kprof] {:<22} {:>9.1} {:>11.3} {:>9.1} {:>5.1}%", n, *c as f64 / st, *us as f64 / 1000.0 / st, *us as f64 / *c as f64, 100.0 * *us as f64 / total as f64);
     }
 }
 
@@ -4627,13 +4627,13 @@ pub unsafe fn launch_v(
         kprof_add(format!("{}[{}x{}]", last_name(), gx, gy), t_k.elapsed().as_micros() as u64);
     }
     if std::env::var("ENGINE_DEBUG_LAUNCH").is_ok() {
-        eprintln!("[launch] stream={:p} gx={gx} gy={gy} r={:?}", stream as *mut std::ffi::c_void, r);
+        tracing::info!(target: "kernels", "[launch] stream={:p} gx={gx} gy={gy} r={:?}", stream as *mut std::ffi::c_void, r);
     }
     cuda::ck(r);
     if DBG.load(Ordering::Relaxed) {
         let n = LAUNCH_N.fetch_add(1, Ordering::Relaxed);
         if std::env::var("ENGINE_DEBUG_TRACE").as_deref() == Ok("1") {
-            eprintln!(
+            tracing::info!(target: "kernels",
                 "[launch {n}] go gx={gx} gy={gy} gz={gz} bx={bx} a0={:x} a1={:x} a2={:x}",
                 vals.get(0).copied().unwrap_or(0),
                 vals.get(1).copied().unwrap_or(0),

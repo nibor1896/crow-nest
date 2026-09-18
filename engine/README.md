@@ -5,8 +5,9 @@
 | crate | `crow_nest_engine`, Rust, thin CUDA kernels through NVRTC and cudarc |
 | target | NVIDIA Blackwell, `compute_120a` (plain `sm_120` is rejected by ptxas) |
 | platform | Linux and Windows; the Linux port landed 2026-09-17 (issue #15) and the Windows path is byte-for-byte the old code under `#[cfg(windows)]` |
-| spec | `../docs/architecture.md`, sections 0 to 8 (section 8 is the code map) |
+| spec | `../docs/architecture.md`, sections 0 to 9 (8 is the code map, 9 is logging) |
 | environment variables | `../docs/env.md`, one row per `CROW_*` name with its `file:line` |
+| logs | `tracing`, one rotating gzipped file plus the stderr mirror; `CROW_LOG` sets the level per component without a rebuild (issue #13, 2026-09-18; spec 9) |
 
 ## Binaries
 
@@ -180,6 +181,29 @@ decode parity decode_out/real512-ids.json <dir>
 - Reference build of record on Windows: `d211ab52ad2b` (issue #43). The Linux values come from commit `9f12429` (8, 512, P8) and 2026-09-17 (1024); the 512-row and 1024-row bytes differ between the platforms because the NVRTC and driver JIT differ, not because of the port (`../docs/architecture.md` section 8.7).
 - The teacher-forced form puts the DECODE path under the parity contract, which the other three do not.
 
+## Logs
+
+- Every line the engine says is a `tracing` event with a per-component target (issue #13,
+  2026-09-18). Two sinks, both behind a non-blocking writer thread: `engine.log` in
+  `$XDG_STATE_HOME/crow/logs` (Linux default; `%LOCALAPPDATA%\crow\logs` on Windows) with the
+  machine form `<ISO-8601-UTC>  <LEVEL> <target>: <message>` (2026-09-18), and the stderr mirror,
+  which prints the MESSAGE ONLY and is therefore byte-identical to the `eprintln!` lines every
+  tool and chain log of this repository was written against.
+- `CROW_LOG` is `RUST_LOG` syntax, default `info`. `CROW_LOG=info,chat=debug` brings back the full
+  `[chat] ids [...]` list of every answer (DEBUG since #13, because at INFO it made a redirected
+  log grow without bound); `CROW_LOG=info,decode=trace` turns on the per-token decode forensics of
+  `gen::decode_step`; `CROW_LOG=info,routing=debug` adds one line per prefill chunk. A filter this
+  build cannot parse installs the default and says so — it never silences the process.
+- `CROW_LOG_DIR`, `CROW_LOG_ROTATE_MB` and `CROW_LOG_KEEP` are the file knobs (defaults `64` MiB,
+  decimals accepted, and `8` kept archives, both since 2026-09-18); the file also rotates on the
+  UTC day boundary and every rotated file is gzipped. All four rows are in `../docs/env.md`.
+- Two structured JSON lines sit next to the human ones: one `boot` line per process with the
+  operating point (context, N residency, KV dtype, kernel path, cold-path policy per layer) and
+  one `routing` line per request with the counters — expert selections and how many were cold, the
+  residency hit rate, layers with cold work, bytes streamed, PLE rows and fills, trickle swaps.
+- Nothing here is on the numeric path: the gate's `sha256` values and its ids of record are the
+  same at `info` and at `trace` (measured 2026-09-18 over five decode runs, spec 9.4).
+
 ## Machine rules
 
 - One engine process per machine, never two GPU jobs. On Linux the engine enforces it: `.engine.lock`, plus the `/dev/nvidia-uvm` scan that drops the pinned budget when another CUDA process is alive.
@@ -195,7 +219,7 @@ cd engine
 cargo test --release
 ```
 
-- 187 passed, 0 failed on 2026-09-18 (103 lib + 78 serve + 6 parity; 165 on 2026-09-17, plus the six of issue #67, the three of issue #68, the three of issue #49, the two of issue #60, the four of issue #54 and the four of issue #65), and `cargo clippy --release --all-targets` reports 1,422 warnings, counted as `grep -cE '^warning: '`. Both counts are enforced by `../tools/gate-linux.sh`.
+- 200 passed, 0 failed on 2026-09-18 (113 lib + 78 serve + 6 parity + 3 decode; 165 on 2026-09-17, plus the six of issue #67, the three of issue #68, the three of issue #49, the two of issue #60, the four of issue #54, the four of issue #65, the three of issue #64 and the ten of issue #13), and `cargo clippy --release --all-targets` reports 1,421 warnings, counted as `grep -cE '^warning: '` — one FEWER than the 1,422 of record, because the `redundant reference in eprintln! argument` warning at `gen.rs:2890` no longer exists: that line is a `tracing` event now (issue #13, 2026-09-18). The 154 converted sites and the new `log.rs` add no warning of their own. Both counts are enforced by `../tools/gate-linux.sh`.
 - The ten tokenizer tests need `../models/` and are skipped without it.
 
 ```
@@ -203,4 +227,4 @@ python3 ../tools/check_env_docs.py
 python3 ../tools/check_readme_dates.py
 ```
 
-- The two doc guards need no GPU and no model: `check_env_docs` reads `code 82, doc 82` and exits 0, `check_readme_dates` reports 0 offenders, both on 2026-09-17.
+- The two doc guards need no GPU and no model: `check_env_docs` reads `code 86, doc 86` and exits 0 (82 = 82 before the four `CROW_LOG*` rows of issue #13, 2026-09-18), `check_readme_dates` reports 0 offenders.

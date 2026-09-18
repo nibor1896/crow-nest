@@ -178,7 +178,7 @@ unsafe fn load_f4(cnq: &mut Cnq, name: &str) -> Fp4 {
 impl VitW {
     pub unsafe fn load(cnq: &mut Cnq) -> VitW {
         let trace = std::env::var("CROW_VIT_TRACE").is_ok();
-        macro_rules! say { ($m:expr) => { if trace { eprintln!("[vit-trace] {}", $m); } } }
+        macro_rules! say { ($m:expr) => { if trace { tracing::info!(target: "vit", "[vit-trace] {}", $m); } } }
         say!("patch_embed");
         let patch_proj = load_f4(cnq, "model.visual.patch_embed.proj.weight");
         let patch_bias = load_f32_small(cnq, "model.visual.patch_embed.proj.bias");
@@ -337,7 +337,7 @@ impl Vit {
                     for d in taken.iter_mut() {
                         cuda::free_dev(d);
                     }
-                    eprintln!(
+                    tracing::info!(target: "vit",
                         "[vit] scratch allocation refused after {} buffer(s) - they were freed, the tower stays unarmed",
                         taken.len()
                     );
@@ -392,7 +392,7 @@ impl Vit {
         cuda::sync();
         self.scratch = true;
         debug_assert_eq!(bytes, scratch_bytes(), "scratch_bytes() and ensure_scratch disagree");
-        eprintln!("[vit] scratch allocated on the first image request ({:.0} MiB at cap {} patches, inside the planner's vit reserve)",
+        tracing::info!(target: "vit", "[vit] scratch allocated on the first image request ({:.0} MiB at cap {} patches, inside the planner's vit reserve)",
             bytes as f64 / MIB, cap);
     }
 
@@ -466,7 +466,7 @@ impl Vit {
             let dumpdir = std::env::var("CROW_VIT_DUMP").unwrap_or_default();
             f32_file(&format!("{dumpdir}/stage-cs.f32"), cs_host);
             f32_file(&format!("{dumpdir}/stage-sn.f32"), sn_host);
-            eprintln!("[vit-trace] dumped stage-pe + cs/sn");
+            tracing::info!(target: "vit", "[vit-trace] dumped stage-pe + cs/sn");
         }
 
         for (bi, b) in self.w.blocks.iter().enumerate() {
@@ -502,7 +502,7 @@ impl Vit {
             launch_v(k.f("add_flat"), ((n * VIT_HIDDEN + 255) / 256) as u32, 1, 1, 256, &[
                 self.normed, self.x, self.s[S_NP]]);
             self.trace_dump(b0, "block0", self.x, n * VIT_HIDDEN);
-            if b0 { eprintln!("[vit-trace] dumped stage-block0"); }
+            if b0 { tracing::info!(target: "vit", "[vit-trace] dumped stage-block0"); }
         }
 
         // merger: LN(1152) over patches → the [nv][4608] view is contiguous →
@@ -993,7 +993,7 @@ impl Vit {
             bytes.hash(&mut hasher);
             let key = hasher.finish();
             if let Some((grid, n_visual, rows)) = self.image_cache.get(&key) {
-                eprintln!("[vit-cache] image {i}: HIT grid {grid:?}, {n_visual} visual tokens");
+                tracing::info!(target: "vit", "[vit-cache] image {i}: HIT grid {grid:?}, {n_visual} visual tokens");
                 infos.push((*grid, *n_visual));
                 all_rows.push(rows.clone());
                 self.image_lru.retain(|&k| k != key);
@@ -1018,7 +1018,7 @@ impl Vit {
             self.cache_insert(key, p.grid, p.n_visual, rows);
             misses += 1;
         }
-        eprintln!(
+        tracing::info!(target: "vit",
             "[vit-cache] {} image(s): {} through the tower, {} cached; cache {} entries, {:.1} MiB of {} MiB",
             images.len(), misses, images.len() - misses,
             self.image_cache.len(), self.image_cache_bytes as f64 / MIB,
@@ -1063,7 +1063,7 @@ impl Vit {
 /// `pub` because serve's `/v1` logits dump writes the same file the same way.
 pub fn f32_file(path: &str, v: &[f32]) {
     if let Err(e) = cuda::write_le(path, v) {
-        eprintln!("[vit-dump] write {path} failed: {e}");
+        tracing::warn!(target: "vit", "[vit-dump] write {path} failed: {e}");
     }
 }
 

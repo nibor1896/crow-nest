@@ -34,6 +34,11 @@ fn demo_tokenize(text: &str, max_tokens: usize) -> Vec<i64> {
 }
 
 fn main() {
+    // #13: the logging subscriber of this process. Every library line this bin
+    // triggers (`[prefill]`, `[load]`, `[budget]`, `[ple]`, ...) is a `tracing`
+    // event now, so without this call they go nowhere. The guard drains the two
+    // writer threads when `main` returns; an `exit` below calls `shutdown` first.
+    let _log = crow_nest_engine::log::init();
     let args: Vec<String> = std::env::args().collect();
     let warm_tokens: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(384);
     let n_requested: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(160);

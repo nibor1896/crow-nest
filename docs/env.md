@@ -4,10 +4,10 @@
 
 | Item | Value |
 |---|---|
-| Variables in this table | 82 |
-| Distinct `CROW_[A-Z0-9_]+` tokens in the code | 82 in `engine/src`, 0 in `converter/src` |
-| Measured | 2026-09-10, task E5, issue #46, parent #1; re-counted 2026-09-17 with the two host-memory rows of #15, the `CROW_PLE_FETCH` row of TASK H and the `CROW_VIT_RESERVE_MB` row of TASK K |
-| Repository state | branch `main`, HEAD `487128d`, 2026-09-17; every `Read at` line number in this file was re-read off that tree |
+| Variables in this table | 86 |
+| Distinct `CROW_[A-Z0-9_]+` tokens in the code | 86 in `engine/src`, 0 in `converter/src` |
+| Measured | 2026-09-10, task E5, issue #46, parent #1; re-counted 2026-09-17 with the two host-memory rows of #15, the `CROW_PLE_FETCH` row of TASK H and the `CROW_VIT_RESERVE_MB` row of TASK K; re-counted 2026-09-18 with the four logging rows of #13 (82 -> 86) |
+| Repository state | branch `main`, HEAD `487128d`, 2026-09-17; every `Read at` line number in this file was re-read off that tree. The four `CROW_LOG*` rows were read off `5a58e0b` + #13, 2026-09-18 |
 | Guard | `tools/check_env_docs.py` (code list minus doc list must be empty, both ways) |
 | Rule | a variable not in this table does not exist |
 
@@ -177,6 +177,21 @@ Helpers used by the read sites:
 |---|---|---|---|---|---|
 | `CROW_LOCK` | `engine/src/gen.rs:4003` | `0` disables, any other non-empty value is a path; default `engine/.engine.lock` | one engine per machine, refuses the start before anything is pinned | operating | 2026-09-05: two engines pin 2 x 45 GiB and froze the 64 GB host twice on 2026-09-04 (`gen.rs:3361-3363`); refusal text `gen.rs:3390` |
 | `CROW_PARITY_PREFILL` | `engine/src/bin/decode.rs:62` | integer, clamped to `[1, ids.len()]`; default `ids.len()` | prefills only `ids[..n]` and feeds the rest teacher-forced | measurement | #11, 2026-09-05: decode-path rows against prefill-path rows under the same context |
+
+## Logging (4 rows)
+
+All four are read ONCE per process in `log::cfg_from_env`, before the first line the process says
+(`bin/serve.rs` and every other bin call `log::init()` as the first statement of `main`). Nothing
+here is on the numeric path: no kernel, no launch geometry and no id depends on any of them, and
+the four sha256 values of `tools/gate-linux.sh` are identical with the logging at `info` and at
+`trace` (#13, 2026-09-18).
+
+| Name | Read at | Values / default | Effect | Mode | Notes |
+|---|---|---|---|---|---|
+| `CROW_LOG` | `engine/src/log.rs:238` (`log::cfg_from_env` -> `log::filter_spec`) | a `RUST_LOG`-style filter, e.g. `info`, `warn`, `info,chat=debug`, `info,routing=debug`, `info,decode=trace`; default `info` (`log::DEFAULT_FILTER`) | the level per target for BOTH sinks, without a rebuild: the rotating file and the stderr mirror | operating | #13, 2026-09-18. The targets are the per-component names of the module doc (`serve`, `chat`, `prefill`, `decode`, `adapt`, `ple`, `residency`, `load`, `budget`, `slot`, `vit`, `kprof`, `boot`, `routing`, ...). A value this build cannot parse does NOT silence the process: the default is installed and one `[log]` WARN line names the string and the parse error (`log::filter_spec`, unit tested). `info` is what an operator runs; `decode=trace` is the per-token decode forensics of `gen::decode_step` and is measured at 0.6 ns/call when it is OFF and at no measurable per-token cost when it is ON (architecture 9.4) |
+| `CROW_LOG_DIR` | `engine/src/log.rs:239` (`log::cfg_from_env`; the default is `log::default_log_dir`) | a directory; default per OS: `$XDG_STATE_HOME/crow/logs`, else `$HOME/.local/state/crow/logs` on Linux, `%LOCALAPPDATA%\crow\logs` (else `%USERPROFILE%\AppData\Local\crow\logs`) on Windows, and the system temp directory when neither variable is set | where `engine.log` and the gzipped `engine-YYYYMMDD-HHMMSS.log.gz` archives live; the directory is created | operating | #13, 2026-09-18. One code path for both platforms: `log::log_dir_from` takes the four variables and a `windows: bool` as arguments, so the Windows rule is unit tested on Linux and the reverse. A directory that cannot be created is not fatal - one `[log]` WARN line names it and the process runs with the stderr mirror alone |
+| `CROW_LOG_ROTATE_MB` | `engine/src/log.rs:246` (`log::cfg_from_env` -> `log::rotate_bytes`) | MiB, decimals accepted; default `64` (`log::DEFAULT_ROTATE_MIB`), floor 1,024 B, ceiling 4 GiB. Only a POSITIVE FINITE number is a limit; `0`, a negative value, `nan` and anything unparsable take the default | the size at which `engine.log` is retired, gzipped and replaced. The file also rotates on the UTC day boundary, which needs no variable | operating | #13, 2026-09-18. `0.001` is 1,048 B and is how the forced-rotation proof of the acceptance was produced (architecture 9.4): `decode run 32` at `decode=trace` rotated 6 times and kept the newest 3, contiguous with the live file. Rotation, gzip and prune all run on the `non_blocking` worker thread, never on the thread that emitted the line |
+| `CROW_LOG_KEEP` | `engine/src/log.rs:247` (`log::cfg_from_env` -> `log::keep_count`) | integer; default `8` (`log::DEFAULT_KEEP`), clamped to `[1, 10000]` - `0` kept files is not a retention policy | how many `engine-*.log.gz` survive a rotation; the oldest go | operating | #13, 2026-09-18. The names sort chronologically, so the prune needs no filesystem timestamp and gives the same answer on both platforms. At the default 64 MiB x 8 the engine's own logs are bounded by about 512 MiB of plain text before compression |
 
 ## Diagnostic values with wrong output by design
 

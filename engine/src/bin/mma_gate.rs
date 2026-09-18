@@ -202,6 +202,11 @@ unsafe fn dtoh_bytes(src: CUdeviceptr, n: usize) -> Vec<u8> {
 }
 
 fn main() {
+    // #13: the logging subscriber of this process. Every library line this bin
+    // triggers (`[prefill]`, `[load]`, `[budget]`, `[ple]`, ...) is a `tracing`
+    // event now, so without this call they go nowhere. The guard drains the two
+    // writer threads when `main` returns; an `exit` below calls `shutdown` first.
+    let _log = crow_nest_engine::log::init();
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("gate");
     unsafe {
@@ -218,6 +223,7 @@ fn main() {
         if mode == "gate" || mode == "all" {
             let ok = gate_stage(&k, n2560, n640, n64, one, k_top10);
             if !ok {
+                crow_nest_engine::log::shutdown();
                 std::process::exit(1);
             }
         }
@@ -227,6 +233,7 @@ fn main() {
         if mode == "dense" || mode == "alld" {
             let ok = dense_gate_stage(&k);
             if !ok {
+                crow_nest_engine::log::shutdown();
                 std::process::exit(1);
             }
         }

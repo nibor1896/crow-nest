@@ -13,7 +13,7 @@ use crate::geo::*;
 use crate::kernels::{launch_v, Kernels};
 use crate::weights::{dequant_fp4_dev, load_bf16_twin, load_f32, load_fp4, load_small_f32, Fp4};
 use crate::manager::ThreeStates;
-use crate::residency::{Residency, PendingSwap};
+use crate::residency::{Residency, PendingSwap, EMPTY};
 use crate::cnq::Cnq;
 use std::collections::HashMap;
 
@@ -48,7 +48,7 @@ pub mod prof {
         let steps = STEPS.swap(0, Ordering::Relaxed).max(1);
         let ms = |c: &AtomicU64| c.swap(0, Ordering::Relaxed) as f64 / 1000.0 / steps as f64;
         let launches = LAUNCHES.swap(0, Ordering::Relaxed) as f64 / steps as f64;
-        eprintln!(
+        tracing::info!(target: "profile",
             "[profile] ms/step over {steps} steps — scalar(sync) {:.2} | embed {:.2} | ple {:.2} | hc {:.2} | gdn {:.2} | attn {:.2} | moe {:.2} | head {:.2} | tail(sync+dtoh) {:.2} | launches/step {:.0}",
             ms(&SCALAR), ms(&EMBED), ms(&PLE), ms(&HC), ms(&SUB_GDN), ms(&SUB_ATTN), ms(&MOE), ms(&HEAD), ms(&TAIL), launches
         );
@@ -417,6 +417,65 @@ impl Engine {
     pub fn n_ctx(&self) -> usize { self.st.context }
     /// rows of the QSA raw-key ring
     pub fn qsa_ring_rows(&self) -> usize { self.st.qsa_ring_rows }
+    /// #13: the operating point of this process, for the ONE structured boot
+    /// line (`log::boot`). Reporting only — it reads the loaded state and the
+    /// three kernel switches and writes nothing.
+    pub fn boot_point<'a>(
+        &'a self,
+        bin: &'a str,
+        container: &'a str,
+        hotsets: &'a str,
+        cold_policy: &'a str,
+        prefix_cache: bool,
+    ) -> crate::log::BootPoint<'a> {
+        let r = &self.res;
+        crate::log::BootPoint {
+            bin,
+            container,
+            hotsets,
+            hotset_source: &r.source,
+            n_ctx: self.st.context,
+            prompt_chunk: self.cfg.prompt_chunk,
+            residency_n: r.n,
+            residency_stride: r.stride,
+            experts: E,
+            // the cold-path policy PER LAYER: layer `l` reads `E - hot[l]` of its
+            // experts from the tier, and `hot[l]` is the occupied hot slots
+            hot_per_layer: r
+                .sets
+                .iter()
+                .map(|s| s.iter().filter(|id| **id != EMPTY).count())
+                .collect(),
+            kv_dtype: match self.cfg.kv {
+                crate::geo::KvDtype::Fp8E4m3 => "fp8_e4m3",
+                crate::geo::KvDtype::Bf16 => "bf16",
+            },
+            kernel_path: match (mma_on(), dense_mma_on(), graph_on()) {
+                (true, true, true) => "moe mma + dense mma, cuda graph",
+                (true, true, false) => "moe mma + dense mma, no graph",
+                (true, false, true) => "moe mma, dense scalar, cuda graph",
+                (true, false, false) => "moe mma, dense scalar, no graph",
+                (false, _, true) => "scalar, cuda graph",
+                (false, _, false) => "scalar, no graph",
+            },
+            cold_tier: match &r.lb {
+                None => "nvfp4 exact, pinned host",
+                Some(lb) => match lb.bits {
+                    2 => "low-bit 2, pinned host",
+                    3 => "low-bit 3, pinned host",
+                    _ => "low-bit, pinned host",
+                },
+            },
+            expert_bytes: r.gu_bytes + r.dn_bytes,
+            pinned_bytes: r.pinned_bytes(),
+            cold_policy,
+            layers: LAYERS,
+            qsa_ring_rows: self.st.qsa_ring_rows,
+            ple_cache_bytes: self.cfg.ple_cache_bytes,
+            vit: self.vit.is_some(),
+            prefix_cache,
+        }
+    }
     /// #VIT: true when the visual tower is loaded (CROW_VIT is not "0")
     pub fn has_vision(&self) -> bool { self.vit.is_some() }
     /// #VIT: the plan `begin_vision` armed, until `end_vision` drops it
@@ -2121,7 +2180,7 @@ impl Engine {
             ($m:expr) => {{
                 if dbg {
                     cuda::sync();
-                    eprintln!("[attn {}] {}", l, $m);
+                    tracing::info!(target: "attn", "[attn {}] {}", l, $m);
                 }
             }};
         }
@@ -2241,7 +2300,7 @@ impl Engine {
             cuda::sync();
             let sn = cuda::dtoh_i32(s.sel_n, t.min(8));
             let sl = cuda::dtoh_i32(s.sel, 12);
-            eprintln!("[attn {l}] sel_n[0..{}]={:?} sel[0..12]={:?}", sn.len(), sn, sl);
+            tracing::info!(target: "attn", "[attn {l}] sel_n[0..{}]={:?} sel[0..12]={:?}", sn.len(), sn, sl);
         }
         step!("launch #19");        step!("launch #19");
         if qfuse_on() {
@@ -2798,20 +2857,20 @@ impl Engine {
         let p = &self.p;
         let s = &self.s;
         let dbg = dbg_step();
-        if dbg { eprintln!("[ple] enter"); }
+        if dbg { tracing::info!(target: "ple", "[ple] enter"); }
         let pl = &mut self.ple;
         // p15 semantics: the returned rows cover prefix+chunk; keep only the
         // chunk's rows (the prefix rows are history, already processed)
         let all_ngids = pl.ngram_ids(prefix, chunk_ids);
         let skip = prefix.len();
         let ngids = all_ngids[skip..].to_vec();
-        if dbg { eprintln!("[ple] ngids {}x{}", ngids.len(), ngids.first().map(|r| r.len()).unwrap_or(0)); }
+        if dbg { tracing::info!(target: "ple", "[ple] ngids {}x{}", ngids.len(), ngids.first().map(|r| r.len()).unwrap_or(0)); }
         let flat: Vec<i64> = ngids.concat();
-        if dbg { eprintln!("[ple] flat {} rows", flat.len()); }
+        if dbg { tracing::info!(target: "ple", "[ple] flat {} rows", flat.len()); }
         let slots = { pl.ensure_rows(cnq, &flat) };
-        if dbg { eprintln!("[ple] ensured {} slots", slots.len()); }
+        if dbg { tracing::info!(target: "ple", "[ple] ensured {} slots", slots.len()); }
         cuda::to_i32_into(s.ple_slots, &slots.iter().map(|&v| v as i32).collect::<Vec<_>>());
-        if dbg { eprintln!("[ple] slots uploaded"); }
+        if dbg { tracing::info!(target: "ple", "[ple] slots uploaded"); }
 
         if is_step {
             // #11 (2026-09-05): the step's kernels run inside the layer loop at
@@ -2821,7 +2880,7 @@ impl Engine {
         } else {
             launch_v(k.f("gather_ple_fp4"), PLE_NHEADS as u32, t as u32, 1, PLE_EMB_DIM as u32, &[
                 pl.cache as u64, pl.gs as u64, s.ple_slots as u64, s.emb as u64]);
-        if dbg { cuda::sync(); eprintln!("[ple] step 11"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 11"); }
             if dense_mma_on() {
                 quant_x_now(k, p, t as u32, s.emb as u64, s.xq_e as u64, p.n2560 as u64, p.n2560 as u64);
                 launch_mma_d(k, (HCT / 64) as u32, t, p.t as u64, &[
@@ -2831,10 +2890,10 @@ impl Engine {
                 launch_v(k.f("gemv_fp4_b"), HCT as u32, t as u32, 1, 256, &[
                     pl.key.w as u64, s.emb as u64, pl.key.gs as u64, s.ple_key as u64, p.n2560 as u64]);
             }
-        if dbg { cuda::sync(); eprintln!("[ple] step 12"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 12"); }
             launch_v(k.f("rms_group"), 4, t as u32, 1, 256, &[
                 s.ple_key as u64, pl.norm_key as u64, s.ple_kn as u64]);
-        if dbg { cuda::sync(); eprintln!("[ple] step 13"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 13"); }
             if dense_mma_on() {
                 launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
                     pl.value.w as u64, s.xq_e as u64, pl.value.gs as u64, s.ple_val as u64,
@@ -2843,7 +2902,7 @@ impl Engine {
                 launch_v(k.f("gemv_fp4_b"), H as u32, t as u32, 1, 256, &[
                     pl.value.w as u64, s.emb as u64, pl.value.gs as u64, s.ple_val as u64, p.n2560 as u64]);
             }
-        if dbg { cuda::sync(); eprintln!("[ple] step 14"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 14"); }
             if let Some(dir) = dump_h() {
                 cuda::sync();
                 let dump = |tag: &str, v: Vec<f32>| {
@@ -2859,16 +2918,16 @@ impl Engine {
                 let v = cuda::dtoh(s.ple_qn, t * HCT);
                 cuda::write_le(&format!("{dir}/ple-qn-immediate.f32"), &v).unwrap();
             }
-        if dbg { cuda::sync(); eprintln!("[ple] step 15"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 15"); }
             launch_v(k.f("gate_dot"), 4, t as u32, 1, 256, &[
                 s.ple_kn as u64, s.ple_qn as u64, s.ple_gate as u64]);
-        if dbg { cuda::sync(); eprintln!("[ple] step 16"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 16"); }
             launch_v(k.f("gate_apply"), 4, t as u32, 1, 256, &[
                 s.ple_gate as u64, s.ple_val as u64, s.ple_gs as u64, s.ple_gated as u64]);
-        if dbg { cuda::sync(); eprintln!("[ple] step 17"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 17"); }
             launch_v(k.f("rms_group"), 4, t as u32, 1, 256, &[
                 s.ple_gated as u64, pl.norm_conv as u64, s.ple_gn as u64]);
-        if dbg { cuda::sync(); eprintln!("[ple] step 18"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 18"); }
             launch_v(k.f("ple_conv"), GDN_CONV as u32, 1, 1, 256, &[
                 s.ple_gn as u64, pl.conv as u64, s.ple_gated as u64, s.ple_out as u64,
                 p.t as u64, pl.state as u64]);
@@ -2885,17 +2944,17 @@ impl Engine {
                 let lo = r * HCT;
                 rows.push(cnt(&po[lo..lo + HCT]));
             }
-            eprintln!("[ple dbg] nan emb={} key_n={} gated={} gn={} out={} out_rows={:?} slots0={:?}",
+            tracing::info!(target: "ple", "[ple dbg] nan emb={} key_n={} gated={} gn={} out={} out_rows={:?} slots0={:?}",
                 cnt(&emb), cnt(&kn), cnt(&gd), cnt(&gn), cnt(&po), rows,
                 &cuda::dtoh_i32(s.ple_slots, 16));
         }
-        if dbg { cuda::sync(); eprintln!("[ple] step 19"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 19"); }
             launch_v(k.f("ple_state_update"), (GDN_CONV as u32 + 255) / 256, 1, 1, 256, &[
                 s.ple_gn as u64, pl.state as u64, p.t as u64]);
-        if dbg { cuda::sync(); eprintln!("[ple] step 20"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 20"); }
             launch_v(k.f("add_flat"), ((t * HCT + 255) / 256) as u32, 1, 1, 256, &[
                 s.ple_out as u64, s.h as u64, p.nt_hct as u64]);
-        if dbg { cuda::sync(); eprintln!("[ple] step 21"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 21"); }
             if let Some(dir) = dump_h() {
                 cuda::sync();
                 let dump = |tag: &str, v: Vec<f32>| {
@@ -2927,7 +2986,7 @@ impl Engine {
         let dbg = dbg_step();
             launch_v(k.f("gather_ple_fp4"), PLE_NHEADS as u32, 1, 1, PLE_EMB_DIM as u32, &[
                 pl.cache as u64, pl.gs as u64, s.ple_slots as u64, s.emb as u64]);
-        if dbg { cuda::sync(); eprintln!("[ple] step 1"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 1"); }
             if dense_mma_on() {
                 // one quantized embed row set serves key + value (both k=2560)
                 quant_x_now(k, p, t as u32, s.emb as u64, s.xq_e as u64, p.n2560 as u64, p.n2560 as u64);
@@ -2938,10 +2997,10 @@ impl Engine {
                 launch_v(k.f("gemv_fp4"), HCT as u32, 1, 1, 256, &[
                     pl.key.w as u64, s.emb as u64, pl.key.gs as u64, s.ple_key as u64, p.n2560 as u64]);
             }
-        if dbg { cuda::sync(); eprintln!("[ple] step 2"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 2"); }
             launch_v(k.f("rms_group"), 4, 1, 1, 256, &[
                 s.ple_key as u64, pl.norm_key as u64, s.ple_kn as u64]);
-        if dbg { cuda::sync(); eprintln!("[ple] step 3"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 3"); }
             if dense_mma_on() {
                 launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
                     pl.value.w as u64, s.xq_e as u64, pl.value.gs as u64, s.ple_val as u64,
@@ -2950,19 +3009,19 @@ impl Engine {
                 launch_v(k.f("gemv_fp4"), H as u32, 1, 1, 256, &[
                     pl.value.w as u64, s.emb as u64, pl.value.gs as u64, s.ple_val as u64, p.n2560 as u64]);
             }
-        if dbg { cuda::sync(); eprintln!("[ple] step 4"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 4"); }
             launch_v(k.f("rms_group"), 4, 1, 1, 256, &[
                 s.h as u64, pl.norm_query as u64, s.ple_qn as u64]);
-        if dbg { cuda::sync(); eprintln!("[ple] step 5"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 5"); }
             launch_v(k.f("gate_dot"), 4, 1, 1, 256, &[
                 s.ple_kn as u64, s.ple_qn as u64, s.ple_gate as u64]);
-        if dbg { cuda::sync(); eprintln!("[ple] step 6"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 6"); }
             launch_v(k.f("gate_apply"), 4, 1, 1, 256, &[
                 s.ple_gate as u64, s.ple_val as u64, s.ple_gs as u64, s.ple_gated as u64]);
-        if dbg { cuda::sync(); eprintln!("[ple] step 7"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 7"); }
             launch_v(k.f("rms_group"), 4, 1, 1, 256, &[
                 s.ple_gated as u64, pl.norm_conv as u64, s.ple_gn as u64]);
-        if dbg { cuda::sync(); eprintln!("[ple] step 8"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 8"); }
             // #11 (2026-09-05): the step passed s.h as gated_row, so the token got
             // h + (h + silu(conv)) = 2h + silu(conv) instead of h + gated + silu(conv)
             // (prefill's ple_conv uses ple_gated). Decode rows drifted 5-15 logit
@@ -2970,10 +3029,10 @@ impl Engine {
             // paths agreed within 1.8. gated_row is the gated value row, as in prefill.
             launch_v(k.f("ple_conv_step"), (GDN_CONV as u32 + 255) / 256, 1, 1, 256, &[
                 s.ple_gn as u64, s.ple_gated as u64, pl.conv as u64, pl.state as u64, s.ple_out as u64]);
-        if dbg { cuda::sync(); eprintln!("[ple] step 9"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 9"); }
             launch_v(k.f("add_flat"), (HCT as u32 + 255) / 256, 1, 1, 256, &[
                 s.ple_out as u64, s.h as u64, p.nt_hct1 as u64]);
-        if dbg { cuda::sync(); eprintln!("[ple] step 10"); }
+        if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 10"); }
     }
 
     unsafe fn head_run(&self, rows: usize) {
@@ -3130,7 +3189,7 @@ impl Engine {
         // START of prefill, not only after the task completes)
         let pre_total = ids.len();
         let pre_t0 = std::time::Instant::now();
-        eprintln!("[prefill] START: {pre_total} tokens, chunk {}", self.cfg.prompt_chunk);
+        tracing::info!(target: "prefill", "[prefill] START: {pre_total} tokens, chunk {}", self.cfg.prompt_chunk);
         let mut prefetch: Option<std::thread::JoinHandle<()>> = None;
         // balanced chunks: 2100 tokens at chunk 1024 become 2 x 1050 instead of
         // 1024 + 1024 + 52 - every chunk costs one full PCIe pass over the cold
@@ -3223,7 +3282,7 @@ impl Engine {
                     let ni = hst.iter().filter(|x| x.is_infinite()).count();
                     let nn = hst.iter().filter(|x| x.is_nan()).count();
                     let mx = hst.iter().filter(|x| x.is_finite()).fold(0f32, |a, &b| a.max(b.abs()));
-                    eprintln!("[nanwatch] layer {l} ENTRY: nan={nn} inf={ni} max_abs={mx:.3e}");
+                    tracing::info!(target: "nanwatch", "[nanwatch] layer {l} ENTRY: nan={nn} inf={ni} max_abs={mx:.3e}");
                 }
                 if l == PLE_LAYER && self.cfg.ple {
                     // reference: hidden += ple(hidden, input_ids) at the TOP
@@ -3239,14 +3298,14 @@ impl Engine {
                         let hst = cuda::dtoh(self.s.h, t * HCT);
                         let nn = hst.iter().filter(|x| x.is_nan()).count();
                         let ni = hst.iter().filter(|x| x.is_infinite()).count();
-                        eprintln!("[nanwatch] layer 1 AFTER PLE: nan={nn} inf={ni}");
+                        tracing::info!(target: "nanwatch", "[nanwatch] layer 1 AFTER PLE: nan={nn} inf={ni}");
                     }
                 }
                 let (mixed, injw) = (self.s.mixed, self.s.injw);
                 self.hc_run(&self.w.hc[l], self.s.h, t, mixed, injw);
                 let dbg = dbg_sync();
                 if dbg {
-                    eprintln!("[prefill layer {l}] enter");
+                    tracing::info!(target: "prefill", "[prefill layer {l}] enter");
                 }
                 let nan_watch = dbg_nan();
                 // CROW_DUMP_H: layer-0 stage dumps (determinism bisect)
@@ -3274,7 +3333,7 @@ impl Engine {
                 dump0("gdn-norm", self.s.gnorm, t * GDN_VAL);
                 if dbg {
                     cuda::sync();
-                    eprintln!("[prefill layer {l}] done");
+                    tracing::info!(target: "prefill", "[prefill layer {l}] done");
                 }
                 if nan_watch {
                     cuda::sync();
@@ -3298,9 +3357,9 @@ impl Engine {
                         let rest = first_nan % HCT;
                         let stream = rest / H;
                         let irow = first_inf / HCT;
-                        eprintln!("[nanwatch] after layer {l}: nan={nn} inf={ni} max_abs={mx:.3e} first_nan idx={first_nan} (row {row}, stream {stream}) first_inf row {irow}");
+                        tracing::info!(target: "nanwatch", "[nanwatch] after layer {l}: nan={nn} inf={ni} max_abs={mx:.3e} first_nan idx={first_nan} (row {row}, stream {stream}) first_inf row {irow}");
                     } else {
-                        eprintln!("[nanwatch] after layer {l}: nan=0 inf=0 max_abs={mx:.3e}");
+                        tracing::info!(target: "nanwatch", "[nanwatch] after layer {l}: nan=0 inf=0 max_abs={mx:.3e}");
                     }
                 }
                 // x1 = h + sub ⊗ injw
@@ -3310,7 +3369,7 @@ impl Engine {
                     cuda::sync();
                     let v = cuda::dtoh(self.s.x1, t * HCT);
                     let rowmax = |r: usize, w: usize| v[r * w..(r + 1) * w].iter().fold(0f32, |a, &b| a.max(b.abs()));
-                    eprintln!("[nanwatch] l0 x1: nan={} inf={} rowmax4={:.3e} rowmax7={:.3e}",
+                    tracing::info!(target: "nanwatch", "[nanwatch] l0 x1: nan={} inf={} rowmax4={:.3e} rowmax7={:.3e}",
                         v.iter().filter(|x| x.is_nan()).count(),
                         v.iter().filter(|x| x.is_infinite()).count(),
                         rowmax(4, HCT), rowmax(7, HCT));
@@ -3320,7 +3379,7 @@ impl Engine {
                     cuda::sync();
                     let v = cuda::dtoh(self.s.mixed_m, t * H);
                     let rowmax = |r: usize| v[r * H..(r + 1) * H].iter().fold(0f32, |a, &b| a.max(b.abs()));
-                    eprintln!("[nanwatch] l0 mixed_m: nan={} inf={} max0={:.3e} max4={:.3e} max7={:.3e}",
+                    tracing::info!(target: "nanwatch", "[nanwatch] l0 mixed_m: nan={} inf={} max0={:.3e} max4={:.3e} max7={:.3e}",
                         v.iter().filter(|x| x.is_nan()).count(),
                         v.iter().filter(|x| x.is_infinite()).count(),
                         rowmax(0), rowmax(4), rowmax(7));
@@ -3355,7 +3414,7 @@ impl Engine {
                 if nan_watch && l == 0 {
                     cuda::sync();
                     let v = cuda::dtoh(self.s.moe_out, t * H);
-                    eprintln!("[nanwatch] l0 moe_out: nan={} inf={}",
+                    tracing::info!(target: "nanwatch", "[nanwatch] l0 moe_out: nan={} inf={}",
                         v.iter().filter(|x| x.is_nan()).count(),
                         v.iter().filter(|x| x.is_infinite()).count());
                 }
@@ -3375,11 +3434,28 @@ impl Engine {
             start += t;
             let done = start;
             let el = pre_t0.elapsed().as_secs_f64().max(1e-9);
-            eprintln!(
+            tracing::info!(target: "prefill",
                 "[prefill] {done}/{pre_total} tok — {:.1} tok/s ({:.0} s)",
                 done as f64 / el,
                 el
             );
+            // #13: the same routing line per prefill CHUNK, at DEBUG
+            // (`CROW_LOG=info,routing=debug`). `route` says `prefill_chunk`
+            // because this shape carries only what is free here: the id counts,
+            // the wall and the two PLE counters, which are host `u64`. The
+            // per-layer selection/cold block is NOT drained per chunk - that
+            // `dtoh_u64` would land inside the prefill window it is measuring,
+            // so those fields stay 0 and the per-REQUEST line carries them.
+            crate::log::routing_chunk(&crate::log::Routing {
+                route: "prefill_chunk".to_string(),
+                prompt_n: pre_total,
+                predicted_n: done,
+                prompt_ms: el * 1e3,
+                tok_s: done as f64 / el,
+                ple_rows: self.ple.req,
+                ple_fills: self.ple.miss,
+                ..Default::default()
+            });
 
             // head: mixer + lm_head (+ optional logits collection, + argmax last)
             self.head_run(t);
@@ -3487,7 +3563,7 @@ impl Engine {
             prof::add(&prof::EMBED, t_emb.elapsed().as_micros() as u64);
         }
 
-        if gdbg { eprintln!("[graph-dbg] M: vor PLE"); }
+        if gdbg { tracing::info!(target: "cuda", "[graph-dbg] M: vor PLE"); }
         // PLE host prep (the one host touch per token, spec 3.5); the kernels
         // run at PLE_LAYER inside the layer loop (#11, 2026-09-05)
         if self.cfg.ple {
@@ -3503,15 +3579,15 @@ impl Engine {
             }
         }
 
-        if gdbg { eprintln!("[graph-dbg] N: nach PLE"); }
+        if gdbg { tracing::info!(target: "cuda", "[graph-dbg] N: nach PLE"); }
         // graph mode captures this kernel sequence once (stream capture —
         // the debug syncs above must stay off here) and replays it below
         let capturing = graph && self.graph_exec == 0;
         let replay = graph && self.graph_exec != 0;
         if capturing {
-            if gdbg { eprintln!("[graph-dbg] O: begin_capture"); }
+            if gdbg { tracing::info!(target: "cuda", "[graph-dbg] O: begin_capture"); }
             cuda::begin_capture(self.cap_stream as cudarc::driver::sys::CUstream);
-            if gdbg { eprintln!("[graph-dbg] P: capture status = {}", cuda::capture_status(self.cap_stream as cudarc::driver::sys::CUstream)); }
+            if gdbg { tracing::info!(target: "cuda", "[graph-dbg] P: capture status = {}", cuda::capture_status(self.cap_stream as cudarc::driver::sys::CUstream)); }
         }
         // ENGINE_DEBUG_NAN inserts syncs — incompatible with stream capture
         let nan_watch = !graph && dbg_nan();
@@ -3535,7 +3611,7 @@ impl Engine {
             if nan_watch && l >= 11 && l <= 31 {
                 cuda::sync();
                 let v = cuda::dtoh(self.s.mixed, H);
-                eprintln!("[nanwatch-decode] l{l} mixed: nan={} inf={}",
+                tracing::info!(target: "nanwatch", "[nanwatch-decode] l{l} mixed: nan={} inf={}",
                     v.iter().filter(|x| x.is_nan()).count(),
                     v.iter().filter(|x| x.is_infinite()).count());
             }
@@ -3584,10 +3660,10 @@ impl Engine {
             if capturing { ds.in_graph.set(true); }
         }
         } // !replay
-        if gdbg { eprintln!("[graph-dbg] Q: layer-loop fertig, capture status = {}", cuda::capture_status(self.cap_stream as cudarc::driver::sys::CUstream)); }
+        if gdbg { tracing::info!(target: "cuda", "[graph-dbg] Q: layer-loop fertig, capture status = {}", cuda::capture_status(self.cap_stream as cudarc::driver::sys::CUstream)); }
         if capturing {
             self.graph_exec = cuda::end_capture_instantiate(self.cap_stream as cudarc::driver::sys::CUstream) as u64;
-            if gdbg { eprintln!("[graph-dbg] R: instantiated"); }
+            if gdbg { tracing::info!(target: "cuda", "[graph-dbg] R: instantiated"); }
             // execute what was just captured — during capture the launches are
             // recorded, not run, so token 1 would otherwise produce nothing
             cuda::launch_graph(
@@ -3615,13 +3691,13 @@ impl Engine {
             prof::add(&prof::HEAD, t_head.elapsed().as_micros() as u64);
         }
         let t_tail = std::time::Instant::now();
-        if gdbg { eprintln!("[graph-dbg] T1: vor sync"); }
+        if gdbg { tracing::info!(target: "cuda", "[graph-dbg] T1: vor sync"); }
         cuda::sync();
-        if gdbg { eprintln!("[graph-dbg] T2: sync ok"); }
+        if gdbg { tracing::info!(target: "cuda", "[graph-dbg] T2: sync ok"); }
         // the ONE argmax readback of the step - inside the TAIL bucket, which is
         // "end-of-token sync + argmax readback"
         let tok = cuda::dtoh_i32(self.s.argmax, 1)[0] as usize;
-        if gdbg { eprintln!("[graph-dbg] T3: dtoh ok"); }
+        if gdbg { tracing::info!(target: "cuda", "[graph-dbg] T3: dtoh ok"); }
         if prof {
             prof::add(&prof::TAIL, t_tail.elapsed().as_micros() as u64);
         }
@@ -3631,6 +3707,22 @@ impl Engine {
         if complete {
             self.done_blocks = (pos + 1) / 4;
         }
+        // #13: the decode-path forensics of requirement 4, TRACE only
+        // (`CROW_LOG=info,decode=trace` asks for it; an operator never sees it).
+        // This is the ONE event this engine emits from inside the per-token loop,
+        // and at INFO it costs a relaxed atomic load plus a compare in tracing's
+        // static callsite cache - `t0.elapsed()` and every other argument here is
+        // evaluated only when the event is ENABLED, because the macro checks
+        // interest first. Measured both ways in docs/architecture.md section 9.
+        tracing::trace!(
+            target: "decode",
+            "[dec] pos {pos} in {id} -> out {tok}, graph {}, captured {}, ple rows {} misses {}, step {:.3} ms",
+            graph as u8,
+            capturing as u8,
+            self.ple.req,
+            self.ple.miss,
+            t0.elapsed().as_secs_f64() * 1e3
+        );
         tok
     }
 
@@ -3700,7 +3792,7 @@ impl Engine {
     /// prefill and decode (never inside the captured graph).
     pub unsafe fn adapt_hot_set(&mut self, max_swaps: usize) -> usize {
         if self.res.lb.is_some() && !self.res.full {
-            eprintln!("[adapt] cold-only low-bit tier: hot experts have no record to fall back to - no adaptation");
+            tracing::warn!(target: "adapt", "[adapt] cold-only low-bit tier: hot experts have no record to fall back to - no adaptation");
             return 0;
         }
         if let Some(tr) = &self.trickle {

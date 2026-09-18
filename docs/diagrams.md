@@ -1,6 +1,6 @@
 # crow-nest architecture diagrams
 
-Living renderings of the approved spec (`architecture.md`, sections 1 to 8). A diagram
+Living renderings of the approved spec (`architecture.md`, sections 1 to 9). A diagram
 contradicting the spec is a bug in the diagram. Owner: issue #14. Updated with every stage
 acceptance. Diagrams 1 to 5 and the new diagram 8 render the tree at commit `cea9406`,
 2026-09-18, branch `main` — the pass over v0.3.0 (`9f12429`..`487128d`) and the seven v0.3.1
@@ -236,16 +236,24 @@ hot-set sidecar of diagram 4, and 2.2 refuses it by name. Spec: 1.2, 1.3, 1.5.
 
 ```mermaid
 graph LR
-  subgraph L0[leaves]; cuda[cuda.rs]; cnq[cnq.rs]; geo[geo.rs]; tokenizer[tokenizer.rs]; toolcall[toolcall.rs]; end
+  subgraph L0[leaves]; log["log.rs: tracing facade + EnvFilter\nRotatingFile (size + day + keep N + gzip)\nboot line, routing line"]; cuda[cuda.rs]; cnq[cnq.rs]; geo[geo.rs]; tokenizer[tokenizer.rs]; toolcall[toolcall.rs]; end
   subgraph L1[on the leaves]; kernels[kernels.rs: kernel table + launch_v + kprof]; manager[manager.rs]; sample[sample.rs]; weights[weights.rs: tensor loaders + Fp4]; boot[boot.rs]; end
   residency[residency.rs]; vit[vit.rs]; gen[gen.rs]; cache[cache.rs]; reset[reset.rs]; slot[slot.rs]
   kernels --> cuda; manager --> cuda & geo; sample --> geo; weights --> cnq & cuda; boot --> cnq & cuda & geo
   residency --> cnq & cuda & geo & kernels & manager; vit --> cnq & cuda & geo & kernels & weights
   gen --> cnq & cuda & geo & kernels & manager & residency & sample & vit & weights
   cache --> cuda & gen & geo; reset --> cuda & gen & geo; slot --> cache & cuda & gen & geo
+  gen -. "tracing event, no use edge" .-> log
 ```
 
-Status: unchanged. The `use crate::` edges of `engine/src` were regenerated from the tree at
+Status: **one box added, `log.rs` (#13, 2026-09-18).** It is an L0 leaf — it uses no module of
+this crate — and it is the module every other one reaches, because 152 of the 153 `eprintln!` sites
+of `engine/src` are `tracing` events now. Only ONE dotted edge is drawn (`gen` → `log`) and it is
+dotted on purpose: a `tracing::info!` call travels through the crate-global subscriber, not
+through a `use`, so twelve solid arrows into one leaf would say something the import graph does
+not say and would make the picture unreadable. Same class of invisible edge as the
+`gen` → `reset` one named below. `log.rs` has its own spec section, 9. Otherwise unchanged: the
+`use crate::` edges of `engine/src` were regenerated from the tree at
 `cea9406`, 2026-09-18, and are edge for edge the graph added at `c1a68cd` and re-verified at
 `487128d`: acyclic since `bb9d2ca` broke `gen <-> residency` and `gen <-> vit`, with
 `weights.rs` and `boot.rs` in the second layer. The seven commits after `487128d` touched two
@@ -267,9 +275,9 @@ flowchart TB
         P512["parity 512 rows · 8387234709271515…"]
         PTF["P8 teacher-forced · 3bb3e69edf90…\nprefill 8 ids, the other 504 through decode_step"]
         D32["decode run over 32 ids"]
-        TST["cargo test --release · TESTS 190\n103 lib + 78 serve + 6 parity + 3 decode"]
-        CLP["clippy --all-targets · CLIPPY 1422"]
-        G1["check_env_docs · code 82, doc 82"]
+        TST["cargo test --release · TESTS 200\n113 lib + 78 serve + 6 parity + 3 decode"]
+        CLP["clippy --all-targets · CLIPPY 1421"]
+        G1["check_env_docs · code 86, doc 86"]
         G2["check_readme_dates · 0 offenders"]
         G3["check_model_card_dates · 0 offenders,\nrunning since 2026-09-18 (it was never committed before)"]
     end
@@ -322,6 +330,7 @@ Spec: 5.1, 5.2, 5.3, 7.11.16 to 7.11.18, 8.7, 8.9, 8.10.
 - 2026-09-12: post #61b pass. Decode path redrawn for the three default flips: the staging kernel `stage_cold_ca` (#19e, engine commit e256004), the deferred trickle (#63c, engine commit 095a1c8) and the parallel QSA selection `qsa_select_par` with the `CROW_QSA_PAR=0` fallback plus the `CROW_ATTN_SPLITS` measurement knob (61a and 61b, engine commit 9696b13). The resident-or-cold decision at the GEMMs is gone: the staging kernel hands the GEMMs VRAM pointers in every case, so zero-copy direct read survives only behind `CROW_STAGE=0`. New section 4, the residency picture (hot set VRAM, pinned cold tier, zero-copy read), and new section 5, the serve picture (endpoints, prefix cache A9, slot save and restore A10). The system overview server box now names the endpoints. Pie and converter unchanged; every diagram carries a status line.
 - 2026-09-17: new section 7, the module dependency graph of the engine crate, after the three refactor cuts of branch `linux-refactor` (74c79f2, bb9d2ca, 7ddd296). It is the first diagram in this file that renders the CODE rather than the spec, and it is generated from the `use crate::` edges, so a module move that is not reflected here is a stale diagram. Both module cycles the pre-refactor tree carried (`gen <-> residency`, `gen <-> vit`) are gone: `launch_v`/`launch_sync` moved into `kernels.rs` and the tensor loaders plus `Fp4` into the new `weights.rs`, and `boot.rs` (the shared container/context/config front door) joined the second layer. Diagrams 1 to 6 were re-read against the tree on 2026-09-17 and none of them contradicts it: the decode path, the residency picture, the serve picture and the converter pipeline are unchanged by a refactor that moved no launch, no kernel and no byte of `KERNEL_SRC`.
 - 2026-09-17 (later, `487128d`): the graph re-generated after the six engine commits that followed `c1a68cd` and found unchanged; the status lines carry `487128d` and branch `main`. Diagrams 1 to 6 keep their 2026-09-12 Windows numbers, which are dated and machine-named; the Linux values of record that now sit beside them are in `README.md` and `CHANGELOG.md` (16k prefill 968 / 964 tok/s, decode 27.19 ms = 36.8 tok/s, the six-turn serve replay at 228.3 ms of prefill and 247.4 ms to first token, the 1024-row parity form at 740 tok/s). Not redrawn: the image path of `8ff2055` and `487128d` (the planner's vit reserve, the named 503, and the removal of the per-request splice buffer), which belongs in the serve picture of section 5 and is written in `architecture.md` 7.13.
+- 2026-09-18, after `#13` (engine logging): **diagram 7 gained a box**, `log.rs`, the new L0 leaf that every module reaches through the subscriber instead of through a `use` — drawn as one dotted edge from `gen` with the reason in the status line, and specified in `architecture.md` section 9. **Diagram 8** carries the two host-side values the gate pins, so its boxes moved with them: `TESTS 200` (113 lib + 78 serve + 6 parity + 3 decode), `CLIPPY 1421` and `check_env_docs · code 86, doc 86`. No other diagram changed: logging adds no stage to the decode path, no slice to the VRAM pie and no step to the request path, and the two structured lines it adds (`boot`, `routing`) are outputs of boxes that are already drawn. Diagrams 7 and 8 were both render-checked locally with `@mermaid-js/mermaid-cli` 11.17.0.
 - 2026-09-18, the #14 audit of v0.3.0 and v0.3.1 (`cea9406`): the eight commits that landed since the 2026-09-12 pass were read against every diagram, and the one debt the entry above names is paid. Per diagram:
   - **1, system overview: redrawn.** The loader box says the host pinned budget is DERIVED and the vision reserve is subtracted before N is chosen (2.1, 8.8 point 1, 7.13); the engine box says Linux since 2026-09-17 (#15) and the bounded launcher `tools/serve-linux.sh` is drawn as what wraps the process (8.8 point 6); the quant package and the travelling `selftest/` golden set are new boxes (8.10), and the harness box names the retried oracle children (8.9).
   - **2, decode path: redrawn, two boxes.** The PLE prep names the batched `cnq::Warm` row fetch instead of one mapping fault per row (7.14 parts 1 and 2, `1032bc5`), and the trickle box names the 8-token re-cut that replaced #17's 16 (7.14 part 4, `4004e66`). The sampler box gained the penalty scope measured for `#68` — the tokens this answer generated, never the prompt, cleared per request (7.11.17, `f14e557`). The three defaults of #19e, #63c and #61a/#61b are untouched, so the rest of the path is the 885bb27 drawing.

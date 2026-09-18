@@ -2,6 +2,11 @@
 use crow_nest_engine::geo::{from_engine_dir, DEFAULT_CNQ};
 
 fn main() {
+    // #13: the logging subscriber of this process. Every library line this bin
+    // triggers (`[prefill]`, `[load]`, `[budget]`, `[ple]`, ...) is a `tracing`
+    // event now, so without this call they go nowhere. The guard drains the two
+    // writer threads when `main` returns; an `exit` below calls `shutdown` first.
+    let _log = crow_nest_engine::log::init();
     let t0 = std::time::Instant::now();
     let step = |m: &str| eprintln!("[+{:.2}s] {m}", t0.elapsed().as_secs_f64());
     // #60 (2026-09-18): the repro defaults to the production -M container, like

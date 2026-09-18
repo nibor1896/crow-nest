@@ -1951,8 +1951,10 @@ either. The one thing a probe cannot do is separate the two meanings of a FIN by
   `0667e0b`) → 147 (`1032bc5`, the three `cnq::tests::page_runs_*`) → 153 (`e2b9845`, the six of the
   `arguments` contract) → 165 (`8ff2055`, twelve more: `toolcall::arguments_contract`,
   `cuda::alloc_failure`, `vit::reserve`, four in `bin/serve.rs`). Converter untouched at 7 tests.
-  The warning set is no longer the adb34b6 baseline: clippy went 1494 → 1480 → 1426 → **1422**
-  over the three refactor cuts and has not moved since (`tools/gate-linux.sh`).
+  The warning set is no longer the adb34b6 baseline: clippy went 1494 → 1480 → 1426 → 1422
+  over the three refactor cuts, and → **1421** on 2026-09-18 with `#13`, which removed the one
+  `redundant reference in eprintln! argument` at `gen.rs:2890` by making that line a `tracing`
+  event (`tools/gate-linux.sh`).
 - The `file:line` anchors in the two test tables above are the positions at the commit that added
   each test; `bin/serve.rs` grew by 1,238 lines on 2026-09-17, so they are read by name, not by line.
 - Commands: `cd engine && cargo test --release --target-dir target_srv`, and
@@ -2210,7 +2212,7 @@ is not exhausted), more VRAM for the hot set (the planner already maximizes N ag
 KV budget; N=155 with 7 slots surrendered to the trickle), or a cold tier that is smaller per expert
 (a low-bit tier, which is not bit-identical and therefore not this).
 
-## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18)
+## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13)
 
 Sections 0 to 7 say what the engine must do. This section says how the crate is put together,
 so a reader who opens `engine/src` knows which file to open and what it may reach for. It was
@@ -2225,7 +2227,7 @@ and its artefact, like every other number in this document.
 
 ```mermaid
 graph LR
-  subgraph L0[leaves]; cuda[cuda.rs]; cnq[cnq.rs]; geo[geo.rs]; tokenizer[tokenizer.rs]; toolcall[toolcall.rs]; end
+  subgraph L0[leaves]; log[log.rs: tracing + rotation + boot/routing lines]; cuda[cuda.rs]; cnq[cnq.rs]; geo[geo.rs]; tokenizer[tokenizer.rs]; toolcall[toolcall.rs]; end
   subgraph L1[on the leaves]; kernels[kernels.rs: kernel table + launch_v + kprof]; manager[manager.rs]; sample[sample.rs]; weights[weights.rs: tensor loaders + Fp4]; boot[boot.rs]; end
   residency[residency.rs]; vit[vit.rs]; gen[gen.rs]; cache[cache.rs]; reset[reset.rs]; slot[slot.rs]
   kernels --> cuda; manager --> cuda & geo; sample --> geo; weights --> cnq & cuda; boot --> cnq & cuda & geo
@@ -2239,6 +2241,12 @@ graph LR
   NVFP4 loaders. `launch_v`/`launch_sync` moved to `kernels.rs` beside the kernel table, the
   loaders and `Fp4` into the new `weights.rs`; both back edges are gone and no re-export was
   left behind.
+- `log.rs` (#13, 2026-09-18) is an L0 leaf — it uses no module of this crate — and it is the
+  one module every other module depends on: every line the engine says is a `tracing` event on
+  it now. The graph above draws no edge INTO it, because a `tracing::info!` call reaches it
+  through the crate-global subscriber and not through a `use`: the same shape as the `reset.rs`
+  edge below, and the reason the picture stays readable with 12 modules pointing at one leaf.
+  `log.rs` itself has its own section, 9.
 - `tokenizer.rs` and `toolcall.rs` have no in-crate dependency at all and no in-crate
   dependent: they are used by `bin/serve` only.
 - The feature-gated `cutile_pilot.rs` (`--features cutile-pilot`, default off) depends on
@@ -2534,9 +2542,9 @@ memory-bounded scope, one engine at a time.
 - **The gate**: `tools/gate-linux.sh [outdir]` from the repo root runs the three parity forms,
   `decode run 32`, `cargo test`, clippy and the doc guards against the first three values
   above, prints GREEN/RED per item and exits non-zero on any RED. Nine items; all nine green at
-  commit `8ff2055` on 2026-09-17. The two host-side values it pins are `TESTS=190`
-  (103 lib + 78 serve + 6 parity + 3 decode, 2026-09-18) and `CLIPPY=1422` (the `--all-targets`
-  form, counted as `grep -cE '^warning: '`), plus `check_env_docs` exit 0 (`code 82, doc 82`),
+  commit `8ff2055` on 2026-09-17. The two host-side values it pins are `TESTS=200`
+  (113 lib + 78 serve + 6 parity + 3 decode, 2026-09-18) and `CLIPPY=1421` (the `--all-targets`
+  form, counted as `grep -cE '^warning: '`), plus `check_env_docs` exit 0 (`code 86, doc 86`),
   `check_readme_dates` 0 offenders and, since 2026-09-18, `check_model_card_dates` 0 offenders —
   that third guard was written in F4 and never committed, so every run before that date printed
   it as "not in this tree - skipped" (8.10). The 1024-row form is not in
@@ -2768,3 +2776,192 @@ container `decode layercheck3` returns an ALL-ZERO `o_proj` output — `max_abs`
 `rel_L2` 1.0000 and `corr` 0.00000, NaN 0, measured 2026-09-18. That debug path is stale and
 would gate nothing about the quant; the production attention path is under the parity contract
 instead, where the logits are byte-identical. It owes its own issue.
+
+## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
+
+Logging is cross-cutting: it touches every stage ticket, so it has its own section instead of a
+paragraph inside section 8. Everything below was read off the tree of this commit and measured on
+the machine of the second environment block of `docs/system-landscape.md` (RTX 5090 / Arch Linux /
+driver 610.57.04 / CUDA 13.3.1 / NVRTC 13.3.33).
+
+### 9.1 What it replaced, and the one rule that shaped the design
+
+Before this commit every line the engine said was an `eprintln!`: **153 sites** in `engine/src`
+— 72 in `bin/serve.rs`, 52 in `gen.rs`, 11 in `cuda.rs`, 8 in `vit.rs`, 5 in `kernels.rs`, 2 in
+`toolcall.rs`, one each in `manager.rs`, `geo.rs` and `cnq.rs`. Always on, never levelled, never in
+a file, and synchronous on the calling thread. **152 of the 153** are `tracing` events now, with
+the message text byte-identical and in the same source order — verified site by site against
+`5a58e0b` — at 119 `info`, 18 `warn`, 14 `error` and 1 `debug` (the `[chat] ids` line). The one
+left alone is a test helper inside `#[cfg(test)]` in `toolcall.rs`: no test installs a subscriber,
+so an event there would swallow the diagnosis of a failing test instead of printing it. The bins
+`decode`, `parity` and the sixteen probe bins keep their own `println!` harness output untouched —
+they only call `log::init()` so the library's events have somewhere to go. A redirected `serve`
+stderr grew without bound, because `[chat] ids [...]` printed the full id list of every answer.
+
+**The rule that shaped everything: the stderr lines are an interface.** `tools/replay-toolcalls.py`
+matches `[chat] prompt ` and `[chat] the client is gone at step`, `docs/long-context-goalmode.md`
+counts `[chat] normalised` and `[chat] ids` lines, and every chain log of this repository is read
+by a human who knows those prefixes. So the conversion is **mechanical and text-preserving**: each
+site became a `tracing` event with a per-component target and the SAME format string, byte for
+byte, and the stderr mirror is formatted **message only** — no timestamp, no level, no target. A
+default-level `decode run 32` writes the stderr of `5a58e0b` with exactly two lines added (the
+`[log]` line that says where the file is, and the boot report). Measured: `diff` of
+`decode_out/gate65/run32.log` against `decode_out/gate13/r1-run32.log` shows those two added lines
+and nothing else but the run-to-run values (host RAM, pointers, milliseconds).
+
+The file is the machine form: `2026-09-18T03:34:32.218Z  INFO prefill: [prefill] START: 8 tokens, chunk 512`.
+
+### 9.2 The design
+
+| piece | choice | why |
+|---|---|---|
+| facade | `tracing` 0.1, one **target** per component | swappable subscriber; `CROW_LOG=info,chat=debug` is a per-component switch |
+| filter | `tracing-subscriber`'s `EnvFilter`, `CROW_LOG`, default `info` | `RUST_LOG` syntax without a rebuild; a string it cannot parse installs the default and says so instead of silencing the process |
+| non-blocking | `tracing_appender::non_blocking`, one worker per sink, `lossy(true)`, 131,072 lines buffered | the call site never waits on a write and never waits on a full queue; the `rolling` module of that crate is NOT used (it rolls by time only, never by size, never compressed) |
+| rotation | `log::RotatingFile`, ~200 lines in this tree | size limit **and** UTC day boundary **and** retention N **and** gzip, which no maintained crate gives together: `rolling-file` / `tracing-rolling-file` roll by size but never compress and never prune by count, `file-rotate` does all three but brings `chrono` for its timestamp suffixes. The suffix here is nine lines of Hinnant's `civil_from_days`, which the day boundary needs anyway |
+| gzip | `flate2` | **zero new crates**: `image`'s `png` feature already pulls `flate2`, `miniz_oxide`, `crc32fast` and `adler2`. Pure Rust, no C toolchain, the same code path on Windows and Linux |
+| per-OS paths | `log::log_dir_from(windows, LOCALAPPDATA, USERPROFILE, XDG_STATE_HOME, HOME, temp)` | ONE code path, the OS as an argument, so the Windows rule is unit tested on Linux and the reverse. Linux `$XDG_STATE_HOME/crow/logs` else `~/.local/state/crow/logs`; Windows `%LOCALAPPDATA%\crow\logs` |
+
+New crates in `engine/Cargo.lock`: 16 — `tracing`, `tracing-core`, `tracing-attributes`,
+`tracing-subscriber`, `matchers`, `sharded-slab`, `thread_local`, `tracing-appender`,
+`crossbeam-channel`, `symlink`, `time`, `time-core`, `time-macros`, `deranged`, `num-conv`,
+`powerfmt`. Eight of those sixteen come from `tracing-appender`; they are build-time cost only
+(`time` is used by its unused `rolling` module) and the ticket names the crate for the
+non-blocking writer. `flate2` and the `env-filter` feature's `regex-automata` cost nothing at all:
+both were already in the tree.
+
+`log.rs` is an L0 leaf with no in-crate dependency, and the one module every other module reaches
+(8.1). The 23 targets are listed in the module doc of `engine/src/log.rs`; the spec's names map to
+them as `scheduler`/`stager` → `residency` + `adapt`, `ring`/`kv` → `prefill` + `decode`,
+`loader` → `load` + `budget`, and `converter` is a separate crate with no engine log site.
+
+**Levels.** Everything that printed unconditionally before prints unconditionally now, so the
+default `info` is the behaviour of record. Failure lines became `warn!` / `error!` — the bind
+failure, the write failures, the I/O timeouts, the 400 detail, the `[chat] BUG:` line, the
+`[alloc]` refusal, the tokenizer and slot refusals — which changes the FILE (it carries the level)
+and not one byte of stderr. Two things moved down: `[chat] ids [...]` to DEBUG, because at INFO it
+made a redirected log grow with every answer, and the new per-token decode forensics to TRACE.
+
+**Process exit.** `WorkerGuard` drains its queue when it drops, so `main` binds the guard
+(`let _log = crow_nest_engine::log::init();`, the first statement of every one of the 19 bins).
+`std::process::exit` runs no destructor, so every `exit` site calls `log::shutdown()` first — a
+lost `[serve] cannot bind 127.0.0.1:8099` is the one line an operator needs.
+
+### 9.3 The two structured lines
+
+**The boot report, one JSON line, target `boot`, at INFO**, in addition to the eight human lines
+`serve` already printed. `Engine::boot_point` builds it from the loaded state; `serve` and
+`decode run` emit it. It carries the operating point the ticket asks for and the cold-path policy
+**per layer**:
+
+```
+{"ts":"2026-09-18T03:34:32.218Z","event":"operating_point","bin":"decode run","container":"converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq","hotsets":"decode_out/hotsets-M-longctx2100-n160.json","hotset_source":"sidecar","n_ctx":200000,"prompt_chunk":512,"layers":48,"experts_per_layer":512,"residency_n":160,"residency_stride":160,"kv_dtype":"fp8_e4m3","kernel_path":"moe mma + dense mma, cuda graph","cold_path":{"tier":"nvfp4 exact, pinned host","policy":"...","expert_bytes":2764800,"pinned_bytes":46714060800,"hot_per_layer":[160, ... 48 entries]},"qsa_ring_rows":516,"ple_cache_bytes":134217728,"vit":true,"prefix_cache":false}
+```
+
+**The routing line, one JSON line per request, target `routing`, at INFO.** It is the drain the
+counters never had: `residency::counters` (the `[48][2]` device block of selections and cold
+selections, read by `Engine::drain_counters`), `Ple::req`/`Ple::miss` and the trickle's swap count.
+Every counter in this engine is cumulative and never reset, so `Srv` now holds the block the
+PREVIOUS request left and the line is the difference — the first request-local numbers this server
+has ever logged. Fields: `seq`, `route`, `finish`, `prompt_n`, `cached_n`, `predicted_n`,
+`prompt_ms`, `predicted_ms`, `tok_s`, `selections`, `cold`, `hit_rate` (= 1 − cold/selections, the
+residency hit rate), `layers_cold` (how many of the 48 layers had cold work at all),
+`bytes_streamed` (= cold × (`gu_bytes` + `dn_bytes`)), `ple_rows`, `ple_fills`, `ple_miss_rate`,
+`trickle_swaps`, `counters_ms`. The same shape is emitted per prefill CHUNK at DEBUG with
+`route: "prefill_chunk"`, carrying only what is free there — the device block is deliberately NOT
+drained per chunk, because that `dtoh_u64` would land inside the window it is measuring.
+
+**What the spec's list does not get.** Requirement 5 also names *ring round-trip times*. There is
+no ring round-trip counter in this tree to drain: the QSA ring is a device-side flag poll and the
+handoff has never been instrumented as a counter (`handoff-bench/` measured it out of process).
+The routing line reports what exists and invents nothing.
+
+### 9.4 The measurements
+
+All five decode runs: `decode run decode_out/parity-ids.json 64`, the gate's own environment
+(`CROW_CNQ` `-M`, `CROW_HOTSETS` the n160 sidecar, `CROW_GRAPH=1`, `CROW_MMA=1`), inside the same
+`systemd-run --user --scope` cgroup the gate uses, sequential, one engine at a time. `decode`'s own
+`mean` / `p50` over the 63 timed steps is the reading. Artefacts in `decode_out/gate13/`.
+
+| # | build | level | `[dec]` lines emitted | mean ms/token | p50 ms/token |
+|---|---|---|---|---|---|
+| r2 | after | `info` (event filtered out) | 0 | 25.08 | 25.40 |
+| r6 | after | `info` | 0 | 24.99 | 25.27 |
+| r3 | after | `info,decode=trace` | 64 | 24.98 | 25.14 |
+| r7 | after | `info,decode=trace` | 64 | 24.98 | 25.35 |
+| r5 | **before**: the same line as a raw synchronous `eprintln!` | `info` | 64 | 25.00 | 25.36 |
+
+- **All five readings lie in a 0.10 ms band (24.98–25.08).** The INFO pair alone spans 0.09 ms, so
+  the band IS the reading's own resolution on this host. Against the 13.6–22 ms/token budget of
+  section 0.3 that is 0.4 % of a token, and the differences between the three configurations are
+  smaller than the difference between the two readings of the SAME configuration.
+- **INFO against TRACE**: 25.035 mean of the two INFO runs against 24.98 mean of the two TRACE
+  runs — TRACE measured 0.055 ms **faster**, which is the honest way of saying: no added per-token
+  latency beyond the stated resolution. 64 lines per run left the loop without the loop waiting
+  for one of them.
+- **The before/after pair for today's `eprintln!`**: 25.00 against 25.035 — 0.035 ms apart, inside
+  the band. End to end, a synchronous stderr line per token was already invisible; what the pair
+  proves is that replacing it changed nothing measurable.
+- **The per-call truth, where it IS measurable** (`log::tests::what_one_line_costs_at_the_call_site`,
+  no GPU, no model, 100,000 calls each, three runs, the same 91-byte line):
+  **a synchronous `writeln!` to a real file 333–354 ns/call**, an **ENABLED** `tracing` event
+  through the non-blocking rotating file **347–373 ns/call** (the write itself happens on the
+  worker thread), a **DISABLED** event — `trace!` under the `info` filter, which is what
+  `decode_step` pays on every operator run — **0.6 ns/call**. 336 ns is 1/71,000 of a 24 ms token;
+  0.6 ns is 1/40,000,000. That is why the end-to-end table cannot see any of it. The helpers are
+  `#[inline(never)]` on purpose: in a plain loop the optimiser hoists the callsite-interest load
+  out and the disabled event measures 0.2 ns, which is not what the real loop pays.
+- **The ids are bit-identical in all five runs**, 64 of 64, and their first 32 are the 32 ids of
+  record of `tools/gate-linux.sh`. Logging is off the numeric path by construction and this is the
+  evidence.
+
+**Rotation, forced live** (`decode run 32` at `CROW_LOG=info,decode=trace`,
+`CROW_LOG_ROTATE_MB=0.001` → a 1,048 B limit, `CROW_LOG_KEEP=3`;
+`decode_out/gate13/logs-rot/`, log `r4b-rotate.log`):
+
+- **6 rotations** (the archives are numbered `-000` to `-005`), **3 kept** — `engine-20260918-034159-003.log.gz`,
+  `-004`, `-005` at 293 / 294 / 283 B — plus the live `engine.log` at 797 B. The three oldest were
+  pruned, which is the retention working and not merely the count matching.
+- Each archive **is** a gzip: `zcat` gives the lines back, and the kept archives read in name order
+  followed by the live file are **contiguous and in ascending time order** — `[dec] pos 13` to
+  `pos 39` with no hole, while the stderr mirror of the same run carries all 32 `[dec]` lines
+  (`pos 8` to `pos 39`). The window the file kept is exactly what `CROW_LOG_KEEP=3` means.
+- **One bug this proof found and closed.** The first form of the archive name added the collision
+  counter only when two rotations fell inside the same second (`…-033802.log`, then
+  `…-033802-1.log`). `-` is 0x2D and `.` is 0x2E, so `-1` sorted BEFORE the unsuffixed name of its
+  own second, and the retention prune — which sorts by name — deleted the SECOND archive of a
+  second instead of the oldest. The first live run showed it as a 450 ms hole in the middle of the
+  three kept files. Worse, scanning for the first FREE number reused a number the prune had just
+  released, so the newest archive could be handed the oldest name. The counter is now always there
+  and zero padded (`-000`), and it is monotone inside a second instead of scanned. Both are pinned
+  by unit tests (`the_rotation_decision_fires_on_size_and_on_the_day_boundary` asserts the name
+  ORDER; `a_tiny_limit_rotates_gzips_and_keeps_exactly_n_files` asserts the kept files are
+  contiguous, end at the last line written, and start after line 0).
+
+### 9.5 The unit tests (10, in `engine/src/log.rs`, no GPU and no model)
+
+| test | what it pins |
+|---|---|
+| `the_filter_rule_defaults_to_info_and_never_silences_a_typo` | unset / empty / whitespace is `info`; `info,routing=debug` and `info,decode=trace` pass through; a string `EnvFilter` refuses falls back to `info` WITH a note that names it |
+| `the_rotation_knobs_are_clamped_to_values_a_writer_can_honour` | `CROW_LOG_ROTATE_MB` decimals, the 1 KiB floor and the 4 GiB ceiling, `0`/negative/`nan`/`inf` taking the default; `CROW_LOG_KEEP` 0 → 1 |
+| `the_default_log_directory_follows_the_convention_of_each_os` | both OS rules and both fallbacks, on whichever host runs the suite |
+| `the_calendar_is_the_gregorian_one` | `civil_from_days` at the epoch, before it, on a leap day and on 2026-09-18; the `stamp` and `iso8601` renderings |
+| `the_rotation_decision_fires_on_size_and_on_the_day_boundary` | size, the day boundary, the empty file that never rotates, and the NAME ORDER of the collision counter |
+| `a_tiny_limit_rotates_gzips_and_keeps_exactly_n_files` | a real temp dir at a 1 KiB limit: k of N kept, no plain rotated file left, a real gzip whose lines come back uncut, and the kept window contiguous |
+| `a_restart_appends_to_the_live_file_and_keeps_its_length` | a second process appends and inherits the length, so a restart does not start a fresh 64 MiB |
+| `the_boot_line_is_one_valid_json_line_with_the_operating_point` | ONE line, valid JSON, `n_ctx` / `residency_n` / `kv_dtype` / `kernel_path` / `cold_path.tier` and 48 `hot_per_layer` entries |
+| `the_routing_line_carries_every_counter_of_one_request` | ONE line, valid JSON, every field present, `bytes_streamed` and both derived rates computed, and the empty request that is not a miss |
+| `what_one_line_costs_at_the_call_site` | the three costs of 9.4, with loose ceilings as a regression guard against a call site that starts BLOCKING |
+
+### 9.6 What this section does not claim
+
+- **Lossy by design.** Both sinks drop rather than block when their 131,072-line queue is full.
+  At INFO a request writes about ten lines, so a drop needs a sustained rate four orders of
+  magnitude above that; at TRACE it is possible and TRACE is forensics. Nothing in `tools/` has
+  ever been fed a dropped line, and a drop is reported by the worker.
+- **The stderr mirror cannot be switched off.** No fifth `CROW_*` name was added for it: the
+  mirror is the interface of record and `CROW_LOG` already sets its level.
+- **Windows is unrun.** The code path is identical — one `RotatingFile`, `flate2`'s pure-Rust
+  backend, `log_dir_from` with `windows: true` — and both directory rules are unit tested here, but
+  no Windows process has written a rotating log yet. That is the same standing gap as the rest of
+  the Linux/Windows parity work (#15).

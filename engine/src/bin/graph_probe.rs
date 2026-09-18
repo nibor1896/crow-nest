@@ -17,6 +17,11 @@ extern "C" __global__ void small_k(float* p) {
 "#;
 
 fn main() {
+    // #13: the logging subscriber of this process. Every library line this bin
+    // triggers (`[prefill]`, `[load]`, `[budget]`, `[ple]`, ...) is a `tracing`
+    // event now, so without this call they go nowhere. The guard drains the two
+    // writer threads when `main` returns; an `exit` below calls `shutdown` first.
+    let _log = crow_nest_engine::log::init();
     unsafe {
         let _ctx = cuda::Ctx::init();
         let module = cuda::compile(SRC);

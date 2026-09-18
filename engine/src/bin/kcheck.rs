@@ -6,6 +6,11 @@ use crow_nest_engine::cuda;
 use crow_nest_engine::kernels::Kernels;
 
 fn main() {
+    // #13: the logging subscriber of this process. Every library line this bin
+    // triggers (`[prefill]`, `[load]`, `[budget]`, `[ple]`, ...) is a `tracing`
+    // event now, so without this call they go nowhere. The guard drains the two
+    // writer threads when `main` returns; an `exit` below calls `shutdown` first.
+    let _log = crow_nest_engine::log::init();
     unsafe {
         let _ctx = cuda::Ctx::init();
         let module = cuda::compile(crow_nest_engine::kernels::KERNEL_SRC);
@@ -86,6 +91,7 @@ fn main() {
             println!("kcheck: OK");
         } else {
             println!("kcheck: FAIL");
+            crow_nest_engine::log::shutdown();
             std::process::exit(1);
         }
     }

@@ -102,9 +102,42 @@
 #                              the shape the manifest declares - so
 #                              190 = 103 lib + 78 serve + 6 parity + 3 decode. All three
 #                              run without a GPU and without a package.
-#                              Clippy is unchanged at
-#                              1422: it is the --all-targets form counted as grep -cE '^warning: ',
-#                              the form the 1494 -> 1480 -> 1426 -> 1422 series was counted with.
+#                              #13 (2026-09-18) added ten in the new `log.rs`, all of them
+#                              without a GPU, a model or an installed subscriber: the
+#                              `CROW_LOG` filter rule (unset is INFO, a per-target string
+#                              passes through, a string EnvFilter refuses falls back WITH a
+#                              note instead of silencing the process), the two rotation
+#                              knobs with their clamps, both per-OS default log directories
+#                              (`log_dir_from` takes the OS as an argument, so the Windows
+#                              rule is tested on Linux), the Gregorian calendar the archive
+#                              names and the file timestamps are built from, the rotation
+#                              DECISION (size, the UTC day boundary, the empty file that
+#                              never rotates, and the NAME ORDER of the collision counter -
+#                              the bug the live proof found: `-1` sorted before the
+#                              unsuffixed name of its own second and the prune deleted the
+#                              wrong archive), the writer itself against a real temp
+#                              directory at a 1 KiB limit (k of N kept, no plain rotated
+#                              file left behind, a real gzip whose lines come back uncut,
+#                              and the kept window contiguous with the live file), the
+#                              restart that appends to `engine.log` instead of starting a
+#                              fresh 64 MiB, the boot report as ONE valid JSON line with
+#                              48 `hot_per_layer` entries, the routing line's fields and its
+#                              two derived rates, and the call-site cost of one line the
+#                              three ways this engine can pay for it (a synchronous
+#                              `writeln!` 333-354 ns, an ENABLED tracing event through the
+#                              non-blocking rotating file 347-373 ns, a DISABLED one 0.6 ns;
+#                              loose ceilings, as a regression guard against a call site
+#                              that starts BLOCKING) - so
+#                              200 = 113 lib + 78 serve + 6 parity + 3 decode.
+#   clippy 1421                #13 (2026-09-18) LOWERED the count of record by one, and by
+#                              exactly one: `warning: redundant reference in `eprintln!`
+#                              argument` at `gen.rs:2890` is gone because that line is a
+#                              `tracing` event now. The other 153 converted sites and the
+#                              whole of `log.rs` add no warning, and neither do the 16 new
+#                              crates (clippy lints this package only). It is the
+#                              --all-targets form counted as grep -cE '^warning: ', the form
+#                              the 1494 -> 1480 -> 1426 -> 1422 -> 1421 series was counted
+#                              with.
 #
 # Environment: CROW_CNQ / CROW_HOTSETS / CROW_GRAPH / CROW_MMA are set here exactly as the runs of
 # record had them; CUDA_LIB names the CUDA runtime directory (default ~/.local/share/crow/cuda/lib).
@@ -126,8 +159,8 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="190"
-CLIPPY="1422"
+TESTS="200"
+CLIPPY="1421"
 
 red=0
 green() { printf 'GREEN  %-28s %s\n' "$1" "${2:-}"; }

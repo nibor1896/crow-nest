@@ -2,14 +2,21 @@
 //! end-to-end production decode (#11). Kernel math is the probe-verified set
 //! (probes p5–p16); see probes/p5_STATUS.md for the evidence chain.
 //!
-//! # The module map (2026-09-17)
+//! # The module map (2026-09-17, `log` added 2026-09-18 with #13)
 //!
 //! Six layers, no cycles: a module may use the layers above it and never the
 //! ones below. The same graph is drawn in `docs/diagrams.md` (diagram 7) and
-//! explained module by module in `docs/architecture.md` section 8.
+//! explained module by module in `docs/architecture.md` section 8; the logging
+//! module has its own section 9.
 //!
 //! L0 — leaves, no in-crate dependency:
 //!
+//! - [`log`]: the logging facade (#13) — `tracing` with one target per component,
+//!   the rotating gzipping file writer, the stderr mirror whose lines are the
+//!   `eprintln!` lines of record byte for byte, the `CROW_LOG` filter, the boot
+//!   report as one JSON line and the per-request routing line. It is a leaf, and
+//!   it is the one module EVERY other module depends on: every line the engine
+//!   says goes through it.
 //! - [`cuda`]: the CUDA driver-API facade — context, NVRTC compile, module load,
 //!   device alloc/copy/free, streams and graphs, pinned host memory, and the
 //!   `/proc/meminfo` reading the pinned budget is derived from.
@@ -53,6 +60,10 @@
 //! The bins (`engine/src/bin`) are separate crates: `pub(crate)` is a hard wall to
 //! them, so `Engine`'s API surface is what they can reach (architecture 8.3).
 
+// #13: the logging facade - `tracing`, the rotating file, the stderr mirror the
+// tools parse, the boot line and the per-request routing line. L0: it depends on
+// no other module of this crate, and every other module depends on it.
+pub mod log;
 pub mod cuda;
 pub mod cnq;
 pub mod geo;

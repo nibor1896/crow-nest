@@ -365,6 +365,11 @@ struct Cand {
 }
 
 fn main() {
+    // #13: the logging subscriber of this process. Every library line this bin
+    // triggers (`[prefill]`, `[load]`, `[budget]`, `[ple]`, ...) is a `tracing`
+    // event now, so without this call they go nowhere. The guard drains the two
+    // writer threads when `main` returns; an `exit` below calls `shutdown` first.
+    let _log = crow_nest_engine::log::init();
     unsafe {
         let argv: Vec<String> = std::env::args().skip(1).collect();
         let want = |g: &str| argv.is_empty() || argv.iter().any(|a| a == g);
@@ -734,6 +739,7 @@ fn main() {
         if !remaining.is_empty() {
             println!("[pcie] POISONED context, remaining groups need a second invocation: {}", remaining.join(" "));
             pinned.free();
+            crow_nest_engine::log::shutdown();
             std::process::exit(3);
         }
         println!("[pcie] done, context alive: {}", ctx_alive());

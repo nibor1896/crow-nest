@@ -30,6 +30,11 @@ fn read_ids(path: &str) -> Vec<i64> {
 }
 
 fn main() {
+    // #13: the logging subscriber of this process. Every library line this bin
+    // triggers (`[prefill]`, `[load]`, `[budget]`, `[ple]`, ...) is a `tracing`
+    // event now, so without this call they go nowhere. The guard drains the two
+    // writer threads when `main` returns; an `exit` below calls `shutdown` first.
+    let _log = crow_nest_engine::log::init();
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
@@ -143,6 +148,18 @@ fn main() {
                 let mut eng =
                     Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
                 println!("decode/run: {} prompt tokens → {gen} steps", ids.len());
+                // #13: the operating point as ONE structured line on target `boot`
+                // (stderr + the log file), so every number this run prints has the
+                // configuration it was measured under written down next to it. It
+                // goes to STDERR through the subscriber; decode's own harness output
+                // on stdout is untouched.
+                crow_nest_engine::log::boot(&eng.boot_point(
+                    "decode run",
+                    &cnq_path,
+                    &sidecar,
+                    "zero-copy read from the pinned tier; the trickle policy of the [policy] line",
+                    false,
+                ));
                 let t0 = std::time::Instant::now();
                 let mut next = eng.prefill(&mut cnq, &ids, None);
                 let prefill_s = t0.elapsed().as_secs_f64();
@@ -622,6 +639,7 @@ fn main() {
     // one. `exit` runs no destructor, so the container's exit purge is skipped on a
     // failing self-test; that costs reclaimable page cache and no correctness.
     if selftest_failed {
+        crow_nest_engine::log::shutdown();
         std::process::exit(1);
     }
 }

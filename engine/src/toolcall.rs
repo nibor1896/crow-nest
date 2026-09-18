@@ -349,7 +349,7 @@ impl ToolStream {
             self.dropped += self.raw.len().saturating_sub(self.tail_from) + self.buf.len();
             self.buf.clear();
             self.close_call();
-            eprintln!("[toolcall] tool call closed at EOS without </tool_call>");
+            tracing::warn!(target: "toolcall", "[toolcall] tool call closed at EOS without </tool_call>");
             return false;
         }
         // TASK J: the fragments already on the wire are closed into a JSON object and
@@ -1199,6 +1199,10 @@ mod arguments_contract {
                 other => {
                     *bad += 1;
                     if *bad < 6 {
+                        // #13 left this ONE site an `eprintln!`: it is a test helper
+                        // inside `#[cfg(test)]`, no test installs a subscriber, and a
+                        // `tracing` event here would swallow the diagnosis of a failing
+                        // test instead of printing it.
                         eprintln!("{name}: call {i} is not a JSON object ({ctx}): {other:?}\n  args {a:?}");
                     }
                 }

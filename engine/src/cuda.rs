@@ -59,7 +59,7 @@ pub unsafe fn stream_create_non_blocking() -> CUstream {
     let f: FnStreamCreate = graph_sym(b"cuStreamCreate\0");
     let mut s: CUstream = std::ptr::null_mut();
     let r = f(&mut s, 1); // CU_STREAM_NON_BLOCKING = 0x1
-    eprintln!("[graph] cuStreamCreate -> {r:?}, handle {:p}", s);
+    tracing::info!(target: "cuda", "[graph] cuStreamCreate -> {r:?}, handle {:p}", s);
     ck(r);
     s
 }
@@ -78,7 +78,7 @@ pub unsafe fn capture_status(s: CUstream) -> u32 {
     let mut st: u32 = 99;
     let r = f(s, &mut st);
     if r != sys::CUresult::CUDA_SUCCESS {
-        eprintln!("[graph] cuStreamIsCapturing -> {r:?}");
+        tracing::info!(target: "cuda", "[graph] cuStreamIsCapturing -> {r:?}");
     }
     st
 }
@@ -89,13 +89,13 @@ pub unsafe fn end_capture_instantiate(s: CUstream) -> sys::CUgraphExec {
     let f_inst: FnInstantiate = graph_sym(b"cuGraphInstantiateWithFlags\0");
     let mut graph: sys::CUgraph = std::ptr::null_mut();
     let r_end = f_end(s, &mut graph);
-    eprintln!("[graph] EndCapture -> {r_end:?} graph={:p}", graph);
+    tracing::info!(target: "cuda", "[graph] EndCapture -> {r_end:?} graph={:p}", graph);
     if r_end != sys::CUresult::CUDA_SUCCESS {
         panic!("EndCapture failed: {r_end:?}");
     }
     let mut exec: sys::CUgraphExec = std::ptr::null_mut();
     let r_inst = f_inst(&mut exec, graph, 0);
-    eprintln!("[graph] Instantiate -> {r_inst:?} exec={:p}", exec);
+    tracing::info!(target: "cuda", "[graph] Instantiate -> {r_inst:?} exec={:p}", exec);
     if r_inst != sys::CUresult::CUDA_SUCCESS {
         panic!("Instantiate failed: {r_inst:?}");
     }
@@ -105,7 +105,7 @@ pub unsafe fn end_capture_instantiate(s: CUstream) -> sys::CUgraphExec {
     let f_destroy: FnGraphDestroy = graph_sym(b"cuGraphDestroy\0");
     let r_del = f_destroy(graph);
     if r_del != sys::CUresult::CUDA_SUCCESS {
-        eprintln!("[graph] cuGraphDestroy -> {r_del:?}");
+        tracing::info!(target: "cuda", "[graph] cuGraphDestroy -> {r_del:?}");
     }
     exec
 }
@@ -148,7 +148,7 @@ pub unsafe fn upload_from_pinned(dst: CUdeviceptr, host: *const std::ffi::c_void
     let s = cur_stream();
     let r = sys::cuMemcpyHtoDAsync_v2(dst, host, bytes, s);
     if r != sys::CUresult::CUDA_SUCCESS {
-        eprintln!("[graph-dbg] HtoD dst={:p} host={:p} bytes={} stream={:p} -> {:?}",
+        tracing::info!(target: "cuda", "[graph-dbg] HtoD dst={:p} host={:p} bytes={} stream={:p} -> {:?}",
             dst as *const std::ffi::c_void, host, bytes, s, r);
     }
     ck(r);
@@ -200,7 +200,7 @@ pub unsafe fn stream_create_priority() -> CUstream {
     ck(sys::cuCtxGetStreamPriorityRange(&mut least, &mut greatest));
     let mut s: CUstream = std::ptr::null_mut();
     ck(sys::cuStreamCreateWithPriority(&mut s, 1, greatest)); // CU_STREAM_NON_BLOCKING
-    eprintln!("[stream] priority side stream {:p} (priority range {least}..{greatest})", s);
+    tracing::info!(target: "cuda", "[stream] priority side stream {:p} (priority range {least}..{greatest})", s);
     s
 }
 
@@ -246,7 +246,7 @@ fn ck_call(call: &str, r: CUresult) {
         return;
     }
     if std::thread::panicking() {
-        eprintln!("[drop] {call}: CUDA error: {r:?} - ignored, the unwind continues");
+        tracing::warn!(target: "cuda", "[drop] {call}: CUDA error: {r:?} - ignored, the unwind continues");
         return;
     }
     panic!("CUDA error: {r:?}");
@@ -288,7 +288,7 @@ impl AllocFailed {
     /// of the process dying
     pub fn raise(self) -> ! {
         let msg = self.message();
-        eprintln!("[alloc] {msg}");
+        tracing::error!(target: "cuda", "[alloc] {msg}");
         if in_request() && !std::thread::panicking() {
             std::panic::panic_any(self);
         }
@@ -401,9 +401,9 @@ impl Drop for Ctx {
 pub unsafe fn drop_dbg(tag: &str) {
     if std::env::var("CROW_DROP_DBG").as_deref() == Ok("1") {
         let (n, bytes) = live_dev();
-        eprintln!("[drop-dbg] {tag}: free VRAM {:.1} MB, engine live allocs {n} = {:.1} MB", free_vram_bytes() as f64 / 1e6, bytes as f64 / 1e6);
+        tracing::info!(target: "cuda", "[drop-dbg] {tag}: free VRAM {:.1} MB, engine live allocs {n} = {:.1} MB", free_vram_bytes() as f64 / 1e6, bytes as f64 / 1e6);
         if n > 0 && n <= 64 {
-            eprintln!("[drop-dbg]   surviving sizes (bytes, largest first): {:?}", live_dev_top(64));
+            tracing::info!(target: "cuda", "[drop-dbg]   surviving sizes (bytes, largest first): {:?}", live_dev_top(64));
         }
     }
 }

@@ -10,6 +10,11 @@ use crow_nest_engine::geo::{GIB, MIB};
 use cudarc::driver::sys;
 
 fn main() {
+    // #13: the logging subscriber of this process. Every library line this bin
+    // triggers (`[prefill]`, `[load]`, `[budget]`, `[ple]`, ...) is a `tracing`
+    // event now, so without this call they go nowhere. The guard drains the two
+    // writer threads when `main` returns; an `exit` below calls `shutdown` first.
+    let _log = crow_nest_engine::log::init();
     let a: Vec<String> = std::env::args().collect();
     let cycles: usize = a.get(1).and_then(|v| v.parse().ok()).unwrap_or(3);
     let total_gib: f64 = a.get(2).and_then(|v| v.parse().ok()).unwrap_or(44.0);

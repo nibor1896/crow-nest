@@ -77,11 +77,13 @@ all nine green at commit `8ff2055` on 2026-09-17.
   record. They are hard-coded with their provenance; a value there moves only when a new
   reference run establishes a new record, and the commit that moves it says so. R8 applies
   unchanged: RED = eine Stufe zurück.
-- The host-side counts the script enforces are `TESTS=187` (103 lib + 78 serve + 6 parity,
-  2026-09-18) and `CLIPPY=1422` (the `--all-targets` form, counted as
-  `grep -cE '^warning: '`, unchanged since 2026-09-17). The guard loop names three scripts — `check_env_docs` (exit 0, `code 82, doc 82`),
-  `check_readme_dates` (0 offenders) and `check_model_card_dates`, which is not in this tree and
-  reports "not in this tree - skipped" as green.
+- The host-side counts the script enforces are `TESTS=200` (113 lib + 78 serve + 6 parity +
+  3 decode, 2026-09-18) and `CLIPPY=1421` (the `--all-targets` form, counted as
+  `grep -cE '^warning: '`; 1422 until `#13` on 2026-09-18 turned the one
+  `redundant reference in eprintln! argument` site into a `tracing` event). The guard loop names
+  three scripts — `check_env_docs` (exit 0, `code 86, doc 86`),
+  `check_readme_dates` (0 offenders) and `check_model_card_dates` (0 offenders, in this tree and
+  running since 2026-09-18).
 - The 1024-row form is a Linux value of record too (`117dd8d9d8dc…`, established 2026-09-17) but
   is NOT in the script: it costs a full long-prompt run. Run it by hand before a change that
   touches the chunk regimes (`docs/architecture.md` 8.7).
