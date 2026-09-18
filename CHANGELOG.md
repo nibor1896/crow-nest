@@ -17,7 +17,8 @@
   operating-point report, `788fb64`) and `#38` (the run-position drift of a `serve` rate: the
   Linux chain that answers it, `tools/drift-chain.sh` and the record in
   `docs/measurement-coverage.md`, `77c4d40` — no engine code), `#61` (the decode kernel
-  decomposition at the Linux operating point, and the opt-in `CROW_ATTN_LUT` lever it named) and
+  decomposition at the Linux operating point, the `CROW_ATTN_LUT` lever it named, and the flip of
+  that lever to the DEFAULT later the same day, 61g) and
   `#62` (the GDN row taken apart per kernel, 2026-09-18 — no engine code) and `#19` (the
   cold-expert staging row taken apart, and the opt-in `CROW_STAGE_PAR` lever it named, 2026-09-18)
   and `#69` (the layer-3 sub-block check that F5 found returning zeros, repaired and added to the
@@ -399,7 +400,8 @@
   `KERNEL_SRC` is unchanged. Default NOT flipped; the record is `docs/architecture.md` 4.8.1.
 
 - **`CROW_ATTN_LUT` — the decode attention kernel reads its e4m3 KV bytes out of a table**
-  (`#61`, 2026-09-18, DEFAULT OFF, opt-in). `CROW_ATTN_LUT=1` launches `attn_sel_split_l` instead
+  (`#61`, 2026-09-18, opt-in when it landed, THE DEFAULT since 61g the same day).
+  `CROW_ATTN_LUT=1` launches `attn_sel_split_l` instead
   of `attn_sel_split`: the same kernel, one template on `LUT`, the KV byte taken through
   `kv_ld<LUT>` and, at `LUT = 1`, out of a shared 256-entry table filled once per block with
   `dec_e4m3(b)` for every byte. It is the change `attn_sel_s8l` has carried against `attn_sel_s8`
@@ -427,8 +429,9 @@
   `extern "C"` wrappers, so the module now defines 117 `__global__`s and the host resolves 111
   (was 116 / 110). The OFF path is unchanged where it counts — the same binary with the flag unset
   reproduces 206.4 us per call and the ids of record, and `tools/gate-linux.sh` is ALL GREEN with
-  the flag OFF. The default is NOT flipped: robin decides. One `[attn]` boot line per process names
-  the kernel it runs. `docs/architecture.md` 4.6.1, `docs/env.md` row (86 -> 87).
+  the flag OFF. The default was NOT flipped in this commit: robin decides — and robin decided the
+  same day, so this lever is the DEFAULT since 61g (see **Changed** below). One `[attn]` boot line
+  per process names the kernel it runs. `docs/architecture.md` 4.6.1, `docs/env.md` row (86 -> 87).
 
 - **Engine logging: `tracing` as the single facade, a rotating gzipping file, one routing line per
   request and the operating point as one JSON line** (`#13`, 2026-09-18). Before this commit every
@@ -653,6 +656,37 @@
   `tools/gate-linux.sh` carries the new count with its provenance.
 
 ### Changed
+
+- **`CROW_ATTN_LUT` is the DEFAULT — the split decode attention kernel reads its e4m3 KV bytes out
+  of the shared table** (`#61`, 61g, 2026-09-18, robin's call after the 61f numbers). `attn_lut_on()`
+  goes from the 61f opt-in `== Ok("1")` to the house `!= Ok("0")` pattern (`gen.rs:1707`): unset or
+  any value but `0` launches `attn_sel_split_l`, and `CROW_ATTN_LUT=0` is the fallback of record that
+  launches the pre-61f `attn_sel_split`. The `[attn]` boot line names the default. `gen.rs` only — no
+  kernel changed, so `KERNEL_SRC` is unchanged (117 `__global__`s / 111 launched).
+
+  **Why it needs no quality gate**: the lever is bit-identical BY CONSTRUCTION (the table holds
+  `dec_e4m3(b)` for every byte, so the fma chains, the `e` order, the shuffle tree, the `expf`, the
+  IEEE divide and the `j` order are those of `attn_sel_split`) and was measured so in 61f on all
+  three parity forms and on the sparse `decode run` ids. This commit re-proves it AT THE NEW DEFAULT:
+  `tools/gate-linux.sh decode_out/gate61g` is ALL GREEN nine of nine with NO env — parity 8
+  `bceba6ff7724`, 512 `838723470927`, P8 teacher-forced `3bb3e69edf90`, the 32 `decode run` ids of
+  record, `cargo test --release` 202 / 0, clippy 1421 and the three doc guards — and the three parity
+  forms run once more with `CROW_ATTN_LUT=0` reproduce the same three values.
+
+  **Measured** (RTX 5090 / Arch Linux, 2026-09-18, t1-read 16,064 ids, 256 tokens, 255 timed steps,
+  one fresh process per run, `CROW_STAGE_PAR` and `CROW_GDN_SPLIT_Z` unset, `decode_out/61g/`). The
+  W + 3N form a flip takes, with no adjacent B arm because the no-env arm now IS the lever: W 23.5697,
+  N1 23.5571, N2 23.4800, N3 23.5207, **N mean 23.5193 ms per decode token = 42.52 tok/s** at a
+  0.0771 ms spread, against the one `CROW_ATTN_LUT=0` fallback run at **25.2044 = 39.68 tok/s** — the
+  25.2 to 25.3 ms arm the flip left behind, the same one #19, #61 and #71 measured on this machine
+  today. The ids sha256 is `56305eee11d6` in **5 of 5** runs: the flip moved the rate and not one
+  generated id. Through `serve`, which is what Crow sees (one POST `/v1/chat/completions`, the
+  t1-read prompt, `max_tokens` 256, greedy, `stream` false, one fresh process per arm), the default
+  reads **4,783.7 ms predicted = 53.31 tok/s** against the `=0` arm's **5,112.7 ms = 49.88 tok/s**,
+  **-329.0 ms = -6.44 percent**, at identical generated ids `e7c17e064ea2` — and that `=0` arm lands
+  on the #38 serve figure of record (49.82 tok/s at 5,115 ms). The lever's own adjacent-pair reading
+  stays the 61f one (25.2638 -> 23.6772, -1.5866 ms = **-6.28 percent**, 3 of 3 pairs); it is not
+  re-run here. `docs/architecture.md` 4.6.1 carries the flip, `docs/env.md` the row.
 
 - **The living diagrams are current again** (`#14`, 2026-09-18): the eight commits that landed
   after the 2026-09-12 pass — v0.3.0 (`9f12429`..`487128d`) and the seven v0.3.1 commits — were

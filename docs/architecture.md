@@ -493,9 +493,9 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 - `CROW_QSA_PAR` is the decode path only: the prefill selection at `gen.rs:2231` keeps `qsa_select_fast` on `tb` blocks, one block per query.
 - `CROW_QSA_PAR` default since #61b (2026-09-12): the adjacent pair measured 23.9411 against 24.8735 ms per decode token with `0` (-3.75 percent, ids identical), and parity runs 8 of 8 forms including the teacher-forced 16,064 id PX form over the radix path (`decode_out/srv-61b.log`, RTX 5090); every process names its selection in one `[qsa]` boot line.
 - `CROW_ATTN_SPLITS` (4, 8, 16, 32) default 8 again since #61e (2026-09-13): the #61d flip to 32 (robin's performance-over-ids ruling of 2026-09-12, kept of record) was ROLLED BACK one day later under the improvement-loop quality rule - the ten-task quality bar is NOT held at 32, judged 0 Pass / 7 Partial / 3 Fail against the crow record 2 / 5 / 3 at 8 and the llama reference 2 / 6 / 2 (`.superpowers/sdd/task-61d-quality-report.md`); the 61d adjacent pair stays the measurement of record for the knob: 22.8545 against 24.1325 ms per decode token with `8` (-5.3 percent, 32.3 x the fallback spread), B ids `5098f885ab3a` 3 of 3, N ids `c65969f7793a` 3 of 3 (the 61a/61c S32 value); the rollback is the const back to 8 plus its `[attn]` boot line and nothing else (engine commit `fdc00c4`, `decode_out/srv-61d.log`, RTX 5090).
-- The split count still changes the merge order of the flash-decoding partials, so the last bits of the logits move: the generated ids change (first differing index 45 and 48 of 256 on t1-read, `decode_out/srv-61a.log`), so `16` and `32` stay MEASUREMENT ONLY under the quality verdict, and the splits-8 stream of record is again final4-identical (the 61d per-task baseline `decode_out/t61d-run0-crow.json` is superseded); the `attn_sel_split` row (2.44 ms per token, nsys `decode_out/srv-61a.log`) was the open optimization row of #61 and is re-measured and answered in **section 4.6** (2026-09-18): it is 2.420 ms per token still, its cost is the per-block e4m3 byte decode and not the split count, and the opt-in `CROW_ATTN_LUT` (4.6.1) takes it to 0.779 without moving a bit.
+- The split count still changes the merge order of the flash-decoding partials, so the last bits of the logits move: the generated ids change (first differing index 45 and 48 of 256 on t1-read, `decode_out/srv-61a.log`), so `16` and `32` stay MEASUREMENT ONLY under the quality verdict, and the splits-8 stream of record is again final4-identical (the 61d per-task baseline `decode_out/t61d-run0-crow.json` is superseded); the `attn_sel_split` row (2.44 ms per token, nsys `decode_out/srv-61a.log`) was the open optimization row of #61 and is re-measured and answered in **section 4.6** (2026-09-18): it is 2.420 ms per token still, its cost is the per-block e4m3 byte decode and not the split count, and `CROW_ATTN_LUT` (4.6.1, the DEFAULT since #61g, 2026-09-18) takes it to 0.779 without moving a bit.
 - The partial buffers `part_o` and `part_ml` are sized for 32 splits (`gen.rs:1879-1880`), VRAM plus 0.55 MB against the old size.
-- `CROW_ATTN_LUT=1` (#61f, 2026-09-18, DEFAULT OFF) swaps the launch for `attn_sel_split_l`, the same kernel with the e4m3 KV bytes read through a shared 256-entry table; section 4.6.1 carries the measurement and the identity proof.
+- `CROW_ATTN_LUT` (#61f, 2026-09-18; DEFAULT ON since #61g the same day) puts the decode attention launch on `attn_sel_split_l`, the same kernel with the e4m3 KV bytes read through a shared 256-entry table; `CROW_ATTN_LUT=0` is the fallback of record and takes `attn_sel_split` back. Section 4.6.1 carries the measurement, the identity proof and the flip.
 
 ### 4.3 Kernel hygiene
 
@@ -689,11 +689,12 @@ one CTA per GQA group (llama.cpp `ncols2 = 8`, FlashInfer `bdy = GROUP_SIZE`) an
 vectorised KV loads — remain open, and both change the reduction order or the lane mapping, so both
 need the ten-task quality gate, not only parity.
 
-#### 4.6.1 `CROW_ATTN_LUT` — the e4m3 table in the split attention kernel (#61f, opt-in)
+#### 4.6.1 `CROW_ATTN_LUT` — the e4m3 table in the split attention kernel (#61f, the DEFAULT since #61g)
 
-`CROW_ATTN_LUT=1` launches `attn_sel_split_l` instead of `attn_sel_split` (`gen.rs:2455`, kernel
-`kernels.rs:3660`). It is the same kernel: one template on `LUT`, the KV byte read through
-`kv_ld<LUT>` (`kernels.rs:2005`) instead of `kv_load`, and with `LUT = 1` a shared 256-entry table
+`attn_sel_split_l` IS the decode attention kernel since #61g (2026-09-18); `CROW_ATTN_LUT=0` launches
+the pre-61f `attn_sel_split` instead (`gen.rs:2544`, kernel `kernels.rs:3660`). It is the same
+kernel: one template on `LUT`, the KV byte read through `kv_ld<LUT>` (`kernels.rs:2005`) instead
+of `kv_load`, and with `LUT = 1` a shared 256-entry table
 filled once per block with `dec_e4m3(b)` for every byte. **Bit-identical by construction** — the
 table holds the same float for the same byte, and the fma chains, the `e` order, the shuffle tree,
 the `expf`, the IEEE divide and the `j` order are untouched; it is the change `attn_sel_s8l` has
@@ -730,9 +731,59 @@ Those three forms run in the dense selection regime; the sparse regime (2,050 of
 selected) is covered by the 4 LUT-on `decode run` 256 runs above, all at the ids sha of record.
 `tools/gate-linux.sh` is ALL GREEN with the flag OFF at the same commit (`decode_out/gate61`).
 
-**Not flipped.** The default stays `attn_sel_split`; the flag is opt-in and robin decides. Nothing
-here needs the ten-task gate — the lever is byte-identical, which is the whole point of choosing it
-over the two byte-level levers named at the end of 4.6, both of which move the reduction order.
+**Flipped — #61g, 2026-09-18.** Robin's call after the numbers above: `attn_lut_on()` takes the
+house `!= Ok("0")` pattern (`gen.rs:1707`), so unset or any value but `0` runs `attn_sel_split_l`
+and `CROW_ATTN_LUT=0` is the fallback of record that runs the pre-61f `attn_sel_split`; the `[attn]`
+boot line names the default. Nothing here needs the ten-task gate — the lever is byte-identical,
+which is the whole point of choosing it over the two byte-level levers named at the end of 4.6,
+both of which move the reduction order.
+
+**The confirmation runs** (the W + 3N form a flip takes, RTX 5090 / Arch Linux, 2026-09-18, one
+fresh process per run, `decode run` on t1-read 16,064 ids, 256 tokens, 255 timed steps,
+`CROW_STAGE_PAR` and `CROW_GDN_SPLIT_Z` unset, `decode_out/61g/`). There is no adjacent B arm: the
+no-env arm now IS the lever, and the one `CROW_ATTN_LUT=0` run is what reproduces the arm the flip
+left behind.
+
+| run | mean ms/token | tok/s | ids sha256 |
+|---|---|---|---|
+| W (discarded) | 23.5697 | 42.43 | `56305eee11d6` |
+| N1 | 23.5571 | 42.45 | `56305eee11d6` |
+| N2 | 23.4800 | 42.59 | `56305eee11d6` |
+| N3 | 23.5207 | 42.52 | `56305eee11d6` |
+| **N mean** | **23.5193** | **42.52** | `56305eee11d6` |
+| `CROW_ATTN_LUT=0` fallback | 25.2044 | 39.68 | `56305eee11d6` |
+
+N spread 0.0771 ms (1.0033); the fallback reproduces the pre-flip 25.2 to 25.3 ms arm of the 61f
+pairs and of #71, and the ids sha256 is the `56305eee11d6` of record in **5 of 5** runs, so the
+flip moved the rate and not one generated id. The lever's own adjacent-pair reading stays the 61f
+one above (25.2638 -> 23.6772, -1.5866 ms = -6.28 %, 3 of 3 pairs); these four runs are the
+operating point the default now ships at, not a second pair.
+
+**Through `serve`, which is what Crow sees** (one POST `/v1/chat/completions`, the t1-read prompt
+rendered by serve itself, `max_tokens` 256, `temperature` 0, `stream` false — the `tools/drift-chain.sh`
+S-arm request — one fresh process per run, stopped by pid, `decode_out/61g/*-serve.log`):
+
+| serve arm | `timings.predicted_ms` (and `predicted_per_token_ms`) | tok/s | generated ids sha256 |
+|---|---|---|---|
+| default (`CROW_ATTN_LUT` unset) | **4,783.711 ms**, 18.686 ms per token | **53.31** (`routing`), 53.515 (response) | `e7c17e064ea2` |
+| `CROW_ATTN_LUT=0` | **5,112.712 ms**, 19.972 ms per token | **49.88** (`routing`), 50.071 (response) | `e7c17e064ea2` |
+
+The #38 chain's serve figure of record is 49.82 tok/s at 5,115 ms predicted and ids `e7c17e064ea2`
+(2026-09-18, four runs, `docs/measurement-coverage.md`). The `CROW_ATTN_LUT=0` arm lands on it —
+49.88 tok/s at 5,112.7 ms, inside the 1.0056 within-arm spread that chain measured — and the flipped
+default keeps the same 256 generated ids while taking **-329.0 ms = -6.44 percent** off the request's
+decode, which is the 6.28 percent of the `decode run` pairs seen through the server. The rate is read
+off the `routing` line, which carries it unrounded over the 255 timed steps; the response's own
+`timings.predicted_per_second` divides by 256 and reads 53.515 against 50.071. Both runs prefilled
+the same 16,064 ids at 874 and 875 tok/s and drained the same 4,494,905 cold selections.
+
+**The gate at the new default.** `tools/gate-linux.sh decode_out/gate61g` is ALL GREEN nine of nine
+with `CROW_ATTN_LUT` unset —
+parity 8 `bceba6ff7724`, 512 `838723470927`, P8 teacher-forced `3bb3e69edf90`, the 32 `decode run`
+ids of record, `cargo test --release` 202 / 0, clippy 1421 and the three doc guards — which is the
+proof that the numeric contract did not move with the flip. The three parity forms were run once
+more with `CROW_ATTN_LUT=0` and reproduce the same three values, so the fallback is still the
+fallback of record.
 
 ### 4.7 The GDN row, per kernel (#62, 2026-09-18)
 
@@ -938,7 +989,9 @@ decode regime is covered by the generated ids: `decode run` on t1-read carries t
 **Measured** (RTX 5090 / Arch Linux, 2026-09-18, `decode run decode_out/srv-a5-t1read-ids.json 256`
 — 16,064 ids, greedy, 255 timed steps, context 16,320 — one fresh process per run inside the
 bounded scope, W + 3 adjacent pairs, `CROW_ATTN_LUT` and `CROW_STAGE_PAR` unset in BOTH arms so B
-is the operating point of record, `decode_out/71/pair-*.log`):
+was the operating point of record ON THAT DAY — `CROW_ATTN_LUT` became the default a few hours
+later, #61g in 4.6.1, which moves both arms of this pair down by the same lever,
+`decode_out/71/pair-*.log`):
 
 | pair | B, `CROW_GDN_SPLIT_Z` unset | N, `CROW_GDN_SPLIT_Z=1` | delta ms | percent |
 |---|---|---|---|---|

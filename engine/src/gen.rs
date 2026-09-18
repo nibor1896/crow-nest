@@ -973,9 +973,9 @@ impl Engine {
         // reason: every future log says which split count produced it. It
         // sits in the [load] block, so the parity gate prints it too.
         let asplits = env_or_unset("CROW_ATTN_SPLITS");
-        println!("[attn] decode attention splits {} (default 8, restored by 61e), CROW_ATTN_SPLITS {} (32 = rolled back, knob 4/8/16/32), kernel {}, CROW_ATTN_LUT {} (#61f, default off, 1 = the e4m3-LUT twin)",
+        println!("[attn] decode attention splits {} (default 8, restored by 61e), CROW_ATTN_SPLITS {} (32 = rolled back, knob 4/8/16/32), kernel {}, CROW_ATTN_LUT {} (#61g, DEFAULT ON since 2026-09-18, 0 = attn_sel_split, the pre-61f kernel of record)",
             attn_splits(), asplits,
-            if attn_lut_on() { "attn_sel_split_l" } else { "attn_sel_split" },
+            if attn_lut_on() { "attn_sel_split_l (default, the e4m3-LUT twin)" } else { "attn_sel_split (fallback of record, CROW_ATTN_LUT=0)" },
             env_or_unset("CROW_ATTN_LUT"));
         // #62b, 2026-09-12: ONE line per engine process names the GDN decode
         // input-projection form, next to the [attn] line and for the same
@@ -1680,8 +1680,10 @@ pub fn attn_splits() -> usize {
     *V.get_or_init(|| env_parse("CROW_ATTN_SPLITS")
         .filter(|s| matches!(s, 4 | 8 | 16 | 32)).unwrap_or(ATTN_SPLITS))
 }
-/// #61f CROW_ATTN_LUT (2026-09-18, DEFAULT OFF): `1` runs `attn_sel_split_l`
-/// instead of `attn_sel_split` - the same kernel with the e4m3 KV bytes decoded
+/// #61f/#61g CROW_ATTN_LUT (2026-09-18, DEFAULT ON since #61g): unset or any
+/// value but `0` runs `attn_sel_split_l`; `0` is the fallback of record and
+/// restores the pre-61f kernel `attn_sel_split`.
+/// The LUT form is the same kernel with the e4m3 KV bytes decoded
 /// through a shared 256-entry table (`kv_ld<1>`) instead of the branchy
 /// `dec_e4m3` (two `ldexpf` plus a divide per BYTE), the change `attn_sel_s8l`
 /// already carries against `attn_sel_s8` since #10. Only the load moves: the
@@ -1698,7 +1700,11 @@ pub fn attn_splits() -> usize {
 /// serial chain. With the table the term falls 0.776 -> 0.219 us; the pairs
 /// read -1.5866 ms per decode token (-6.28 %), ids identical 7 of 7.
 /// Decode only: the prefill attention already runs the LUT form (attn_sel_s8l).
-fn attn_lut_on() -> bool { env_flag!("CROW_ATTN_LUT", exact1) }
+/// FLIPPED by #61g (2026-09-18, robin's call after the 61f numbers): the lever is
+/// byte-identical BY CONSTRUCTION and measured so on all three parity forms and on
+/// the sparse `decode run` ids, so the flip owes no quality gate - the house
+/// `!= Ok("0")` pattern, and `CROW_ATTN_LUT=0` keeps the old kernel reachable.
+fn attn_lut_on() -> bool { env_flag!("CROW_ATTN_LUT", on) }
 /// #61a CROW_QSA_PAR. DEFAULT ON since #61b (2026-09-12): unset or any value
 /// but 0 runs the decode QSA top-k as qsa_select_par_h (G blocks, 12-bit
 /// histogram) plus qsa_select_par_e (one block of 1024, threshold refine and
@@ -2532,8 +2538,9 @@ impl Engine {
             p.cap as u64, p.n_selmax as u64, p.pos_row1 as u64]);
         }
         if attn_split_on() {
-            // #61f: CROW_ATTN_LUT=1 takes the e4m3-LUT twin; the block is AHD = 256
-            // threads in both forms, which is what fills the 256-entry table
+            // #61g: the e4m3-LUT twin is the DEFAULT; CROW_ATTN_LUT=0 takes the
+            // pre-61f kernel. The block is AHD = 256 threads in both forms, which
+            // is what fills the 256-entry table
             launch_v(k.f(if attn_lut_on() { "attn_sel_split_l" } else { "attn_sel_split" }),
                 NQ as u32, 1, attn_splits() as u32, AHD as u32, &[
                 s.aqr as u64, kc, vc, s.sel as u64, s.sel_n as u64, p.tmax as u64, p.mode as u64,
