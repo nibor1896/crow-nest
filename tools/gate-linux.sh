@@ -171,6 +171,16 @@
 #                              headroom floor (256 MiB) with the issue's own 35.7 MiB as
 #                              the SHORT case. So 212 = 119 lib + 82 serve + 6 parity + 5 decode.
 #   tests 212 -> 217           the toolcall array/object JSON repair (robin's live session 2026-09-18, no issue): five lib tests. 217 = 124 lib + 82 serve + 6 parity + 5 decode.
+#   tests 217 -> 221           #73 (2026-09-18) adds FOUR library tests in `vit.rs`, all pure host
+#                              arithmetic with no GPU and no CUDA: the channel-major patch row
+#                              with its duplicated temporal frame, the solid-colour row in R G B
+#                              order (the assertion `red -> Black` would have failed FIRST if the
+#                              cause had been the channels), the align-corners bilinear taps of
+#                              the learned position table in h0w0 order, and the rotary vector's
+#                              first half as the patch ROW - each against hand-computed values. The bug itself was a missing stream sync, not a layout
+#                              error - these pin the layout the symptom IMITATED, so the
+#                              suspect it looked like stays cleared. 221 = 128 lib + 82 serve
+#                              + 6 parity + 5 decode.
 #   clippy 1421                #13 (2026-09-18) LOWERED the count of record by one, and by
 #                              exactly one: `warning: redundant reference in `eprintln!`
 #                              argument` at `gen.rs:2890` is gone because that line is a

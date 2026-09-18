@@ -660,9 +660,9 @@ footer{border-top:1px solid var(--border);padding:70px 0 0;overflow:hidden}
       <div class="bench-col">
         <h4>Decode <span>tok/s · higher is better</span></h4>
         <div class="brow crow">
-          <div class="btop"><span class="bname"><i></i>crow · CNQ4.5</span><span class="bval"><span data-count="36.8" data-decimals="1">0</span></span></div>
+          <div class="btop"><span class="bname"><i></i>crow · CNQ4.5</span><span class="bval"><span data-count="42.5" data-decimals="1">0</span></span></div>
           <div class="btrack"><div class="bfill" data-w="100"></div></div>
-          <div class="bgain">0.90&thinsp;× the reference</div>
+          <div class="bgain">1.04&thinsp;× the reference</div>
         </div>
         <div class="brow ref">
           <div class="btop"><span class="bname"><i></i>llama.cpp · Q2_K_XL</span><span class="bval"><span data-count="41.0" data-decimals="1">0</span></span></div>
@@ -683,7 +683,7 @@ footer{border-top:1px solid var(--border);padding:70px 0 0;overflow:hidden}
       </div>
       <div class="bench-note">
         <b>Setup</b> — Qwen3.8-Flash-Next (360B MoE) · single RTX 5090 · greedy · identical prompts, identical chat template · EOS-stop both arms · the 16,064-id long-context read · reference: llama.cpp CUDA build.<br>
-        <b>Note</b> — design mockup. crow-nest figures are the Linux values of record of 2026-09-17 (RTX 5090, Arch Linux): decode 36.8 tok/s and prefill 968 tok/s on the 16,064-id t1-read prompt. The llama.cpp figures are Windows measurements of 2026-09-11 with GGUF Q2_K_XL at 2.4 bpw against CNQ4.5 at 4.5 bpw, and the two arms have never been run adjacent on the Linux box.
+        <b>Note</b> — design mockup. crow-nest figures are the Linux values of record (RTX 5090, Arch Linux): decode 42.5 tok/s at the engine default of 2026-09-18 (23.52 ms per token, 255 timed steps) and prefill 968 tok/s of 2026-09-17, both on the 16,064-id t1-read prompt. The llama.cpp figures are Windows measurements of 2026-09-11 with GGUF Q2_K_XL at 2.4 bpw against CNQ4.5 at 4.5 bpw, and the two arms have never been run adjacent on the Linux box.
       </div>
     </div>
   </div>
@@ -935,7 +935,7 @@ async function play(){
   genBlock.classList.remove("t-hidden");
   await typeInto(qText,PROMPT,34);
   await sleep(420);
-  var toks=0,base=36.8;
+  var toks=0,base=42.5;
   var tpsTimer=setInterval(function(){
     var v=base+(Math.random()*4-2);
     tpsVal.textContent=v.toFixed(1);

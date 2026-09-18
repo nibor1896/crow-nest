@@ -4,45 +4,24 @@
 - Every item names its issue number in `crow-nest`, or the commit it landed in when the work had no issue.
 - Every number names its date; the machine is `docs/system-landscape.md` unless another one is named.
 
-## v0.3.1 (unreleased) — the reasoning filter, and what the 170k session really was
+## 2026-09-18 — v0.3.1: the decode step taken apart, the engine's voice, the 170k session, and the two image bugs
 
-- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Sixteen issues so far: `#67` (the
-  reasoning filter, `667b68b`), the engine side of `#68` (the long-context measurement, `f14e557`, and robin's decision of
-  the same day: the cross-turn repeat counter as observability plus the de-duplicated replay
-  that answers its open question 1),
-  `#49` (the ragged hot-set sidecar, `0adbe6a`), `#60` (the `parity` record header per arm, and
-  the last two bins that hard-coded the pre-`#51` container, `784bd64`), `#54` (the gone-client
-  probe of the `stream:false` path, `20bc121`), `#65` (the bounded retry around the harness's
-  oracle python children, `6b5025e`), `#64` (F5, the quant package's own self-test and the
-  model card that carries its numbers, `cea9406`), `#14` (the living diagrams brought back to
-  HEAD, `5a58e0b`), `#13` (engine logging: `tracing`, rotation, the routing line and the
-  operating-point report, `788fb64`) and `#38` (the run-position drift of a `serve` rate: the
-  Linux chain that answers it, `tools/drift-chain.sh` and the record in
-  `docs/measurement-coverage.md`, `77c4d40`, and later the same day robin's decision on the
-  issue's three consequence rules with the chain rerun at the new default — no engine code
-  in either), `#61` (the decode kernel
-  decomposition at the Linux operating point, the `CROW_ATTN_LUT` lever it named, and the flip of
-  that lever to the DEFAULT later the same day, 61g) and
-  `#62` (the GDN row taken apart per kernel, 2026-09-18 — no engine code) and `#19` (the
-  cold-expert staging row taken apart, and the opt-in `CROW_STAGE_PAR` lever it named, 2026-09-18)
-  and `#69` (the layer-3 sub-block check that F5 found returning zeros, repaired and added to the
-  package self-test, 2026-09-18) and `#10` (the router GEMM second probe, and the ten-task quality
-  reference it re-based, 2026-09-18 — no engine code) and `#71` (`#62` lever 1: the z slab out of
-  the grouped GDN input launch, and the opt-in `CROW_GDN_SPLIT_Z` it rides on, 2026-09-18) and
-  `#72` (the vit reserve held at boot instead of planned, and the post-plan ledger, 2026-09-18).
-  The machine is the second environment block of `docs/system-landscape.md` unless a row names another one.
-- The crate version field stays `0.1.0`, as it has for every release: this file is the record.
+- Branch `main` at `8bad310`; twenty-six commits `667b68b` to `8bad310`, all on one day. The day in order: the reasoning filter (`667b68b`), the sampler-and-tag verdict of the 170k session (`f14e557`), the ragged hot-set sidecar (`0adbe6a`), the per-arm `parity` record header (`784bd64`), the gone-client probe of the `stream:false` path (`20bc121`), the bounded retry around the harness's oracle children (`6b5025e`), the package self-test and the tracked model card (`cea9406`), the living diagrams (`5a58e0b`), engine logging (`788fb64`), the Linux drift chain (`77c4d40`), the decode kernel decomposition and the `CROW_ATTN_LUT` lever it named (`15876e6`, `156e2fe`), the GDN row per kernel (`cb1895a`), the cold-expert staging row and the `CROW_STAGE_PAR` lever it named (`ef50a3b`, `cf988f5`), the layer-3 sub-block repair and the package's second check (`3feec4d`), the router GEMM second probe (`47db87c`), `CROW_GDN_SPLIT_Z` (`8fce410`), the `CROW_ATTN_LUT` default (`6c87054`), robin's decision on the three consequence rules of `#38` (`e8ff590`), the cross-turn repeat counter (`b70310a`), the de-duplicated replay (`3116493`), and four things out of robin's live sessions of that afternoon: the vit reserve held at boot (`74970b5`), the tool-call argument repair (`cf6a135`), the lag-by-one image path (`bc9cd9b`) and the `max_tokens` default (`8bad310`).
+- Nine issues closed on the day: `#67` (the reasoning filter), `#49` (the ragged hot-set sidecar), `#60` (the `parity` record header per arm), `#54` (the gone-client probe), `#64` (F5, the package self-test and the model card), `#69` (the all-zero `layercheck3`), `#71` (`#62` lever 1), `#72` (the vit reserve) and `#73` (the lag-by-one visual path). Nine were left open with a comment instead, because what landed under them is a measurement or a decision and not the ticket's own ask: `#68` (the engine side of the long-context degeneration is measured; the model-against-quant question is not), `#65` (the retry guards the harness; WHICH death the child died is not recoverable from what was recorded), `#13` (logging is in; no Windows process has written a rotating log yet), `#38` (the three consequence rules are decided on Linux; the Windows M2a form is not rerun), `#61`, `#62` and `#19` (each row is decomposed and each named one lever that is in the tree; the levers they did not take are written down with their numbers), `#10` (the second probe is measured, still opt-in, not landed) and `#14` (the diagrams render `8bad310`, and the duty stands).
+- The machine is the second environment block of `docs/system-landscape.md` (RTX 5090, driver 610.57.04, Arch Linux 7.2.3-arch1-3, 62.17 GiB RAM, CUDA 13.3.1, NVRTC 13.3.33, rustc 1.98.1) unless a row names another one. Every engine run is inside the memory-bounded scope, one engine at a time.
+- The crate version field stays `0.1.0`, as it did for v0.2.0, v0.2.1 and v0.3.0: this file is the release record, `engine/Cargo.toml` has never been bumped.
+- The numeric contract held across all twenty-six commits, and the one time `KERNEL_SRC` changed it moved no value. It changed ONCE, in `156e2fe` (`#61`): `attn_sel_split` became `attn_sel_split_body<LUT>` behind two `extern "C"` wrappers, so the module gained one kernel, `attn_sel_split_l`, and defines 117 `__global__`s now, of which the host resolves 111 (was 116 / 110). Every other commit of the day left `KERNEL_SRC` byte-identical, and no launch geometry, k-order, reduce order or `CROW_*` semantics changed anywhere. The Linux values of record are unchanged: `bceba6ff7724…` (8 rows, = Windows), `8387234709271515…` (512 rows) and `3bb3e69edf90…` (P8 teacher-forced, the form that puts the DECODE path under the contract). The default flipped in `6c87054` (`#61g`) is byte-identical by construction — the shared table holds the same float for the same byte, and the fma chains, the `e` order, the shuffle tree, the `expf`, the IEEE divide and the `j` order are those of the `LUT = 0` instantiation — and all three forms reproduce with the lever on and with `CROW_ATTN_LUT=0`.
 
 ### Fixed
 
-- **`serve` default `max_tokens` 1024 -> 8192** (no issue - robin's session 2026-09-18 13:49): Crow sends no `max_tokens` on the local path, and at 1024 a `write_file` carrying a whole SVG ended in `finish length` before the model had written its `path` parameter, so the file was never written. The 32768 cap and the `n_ctx` clamp are unchanged (`serve.rs` `DEFAULT_MAX_TOKENS`).
+- **A `write_file` carrying a whole file ran out of budget before it had written its `path`, because the default `max_tokens` was 1024** (`8bad310`, no issue — robin's live session 2026-09-18 13:49). Crow sends no `max_tokens` on the local path, so every request of that session ran on the server's default, and a tool call whose `content` parameter IS a file is thousands of tokens long: the answer ended in `finish length` in the middle of the `content` string, the `path` parameter came after it in the model's own order and was therefore never written, and the client had a truncated call it could not execute — no file, no error the model could see. The default is `8192` now (`DEFAULT_MAX_TOKENS`, `serve.rs:539`), which covers a whole-file write at this model's token rate and still leaves the 200,000-token context to the prompt. Nothing else about the budget moved: the `32768` cap and the `clamped_max_tokens` clamp to `n_ctx` minus the prompt ids (`serve.rs:1452`) are the ones of record, and a request that sends its own `max_tokens` is unchanged on the wire and in the ids.
 
-- **Every image but the first of a process was read as the PREVIOUS image: the visual path was lag-by-one** (`#73`, found by robin 2026-09-18, fixed the same day). `Vit::run` launches the whole tower asynchronously on `cuda::cur_stream()` and returned with that work still in flight; `build_plan`'s only reader of the result is the blocking `cuMemcpyDtoH_v2` in `cuda::dtoh`, which runs on the LEGACY null stream and therefore does not order against a non-blocking one (`dtoh_u32` already syncs first for exactly this reason — `dtoh` does not, and the vit was the caller that forgot). The copy took whatever `self.out`, the one scratch buffer every image shares, still held: the previous image's embeddings — complete, plausible and one request stale. Those rows were then cached under the NEW image's hash, so the misread was pinned per image and the same red answered the same wrong colour every time. It reads as a fixed colour permutation (red→Black, green→Red, blue→Green) and is really a shift by one request; shapes moved the same way (a circle read as the bar before it). The first image of a process was always CORRECT, which is why the `#VIT` smoke parity was green — it only ever ran one image per process. `Vit::run` now synchronizes the stream it launched on before it hands the buffer back. Text ids are untouched (`decode run 32` ids of record `56305eee11d6`, unchanged). The probe set that found it is `tools/vit-colorprobe.py`, `tools/vit-lag.py` and `tools/vit-imgprobe.py`; four new host-side tests in `vit.rs` pin the patch/channel/merge-block/pos-tap/rotary layout against hand-computed values, so the suspect this bug imitated stays cleared (gate `TESTS` 217 → 221).
+- **Every image but the first of a process was read as the PREVIOUS image: the visual path was lag-by-one** (`#73`, `bc9cd9b`, found by robin 2026-09-18, fixed the same day). `Vit::run` launches the whole tower asynchronously on `cuda::cur_stream()` and returned with that work still in flight; `build_plan`'s only reader of the result is the blocking `cuMemcpyDtoH_v2` in `cuda::dtoh`, which runs on the LEGACY null stream and therefore does not order against a non-blocking one (`dtoh_u32` already syncs first for exactly this reason — `dtoh` does not, and the vit was the caller that forgot). The copy took whatever `self.out`, the one scratch buffer every image shares, still held: the previous image's embeddings — complete, plausible and one request stale. Those rows were then cached under the NEW image's hash, so the misread was pinned per image and the same red answered the same wrong colour every time. It reads as a fixed colour permutation (red→Black, green→Red, blue→Green) and is really a shift by one request; shapes moved the same way (a circle read as the bar before it). The first image of a process was always CORRECT, which is why the `#VIT` smoke parity was green — it only ever ran one image per process. `Vit::run` now synchronizes the stream it launched on before it hands the buffer back. Text ids are untouched (`decode run 32` ids of record `56305eee11d6`, unchanged). The probe set that found it is `tools/vit-colorprobe.py`, `tools/vit-lag.py` and `tools/vit-imgprobe.py`; four new host-side tests in `vit.rs` pin the layout this bug IMITATED, each against hand-computed values and with no GPU: the channel-major patch row with its duplicated temporal frame, the solid-colour row in R G B order (the assertion `red → Black` would have failed first if the channels had been the cause), the align-corners bilinear taps of the learned position table in h0w0 order, and the rotary vector's first half as the patch ROW — so the suspect stays cleared (gate `TESTS` 217 → 221).
 
-- **A declared `array` or `object` parameter that the model wrote with one JSON slip went out as a JSON STRING, and Crow iterated the string character by character** (no issue - robin's live session 2026-09-18, fixed the same day): `toolcall.rs` `close_param` now tries one minimal repair pass on such a value (a stray quote before a key, a trailing comma, `'` for `"`), keeps the result only when it parses AND is of the declared kind, and when it cannot, still sends the string but never silently - one `warn` on the `toolcall` target names the parameter, the declared type, the serde error and the byte.
+- **A declared `array` or `object` parameter that the model wrote with ONE JSON slip went out as a JSON STRING, and Crow iterated the string character by character** (`cf6a135`, no issue — robin's live session 2026-09-18, fixed the same day). The live shape was a `goal_set` call whose `steps` array carried a single stray quote before one key: the value did not parse, the old `close_param` fell back to sending the text as a string, and the client, which iterates what a declared array gives it, read **852 one-character goal steps**. The declaration is the contract, so `toolcall.rs` `close_param` now runs one minimal repair pass over such a value (`repair_json`: a stray quote before a key, a trailing comma before `]` or `}`, and `'` for `"` only when the text holds no `"` at all) and keeps the result ONLY when it parses AND is of the declared kind — a repaired object never lands where an array was declared. When no repair holds, the string fallback stands exactly as before, but never silently: one `warn` on the `toolcall` target names the parameter, the declared type, the serde error and the byte, and says in those words that the client is being handed a string where an array or an object was promised. A value that already parses takes no repair path at all, so the bytes of a healthy call are untouched. Five library tests pin it, including the live markup at five stream cut points (gate `TESTS` 212 → 217).
 
 - **The vit reserve was planned but never HELD, and the first image request of a session found
-  35.7 MiB free** (`#72`, seen by robin 2026-09-18, fixed the same day). Since `8ff2055` the
+  35.7 MiB free** (`#72`, `74970b5`, seen by robin 2026-09-18, fixed the same day). Since `8ff2055` the
   planner set 277.3 MB aside for the image path (tower scratch 228.5 + mrope span 48.8) before it
   chose N — and then nothing allocated it: the scratch was "lazy, allocated on the first image
   request". Between `[serve] listening` and robin's seventh round the free VRAM the reserve was
@@ -387,7 +366,7 @@
 ### Added
 
 - **`CROW_GDN_SPLIT_Z` — the z slab leaves the grouped GDN input launch and runs beside it**
-  (`#71`, `#62` lever 1, 2026-09-18, DEFAULT OFF, opt-in). `CROW_GDN_SPLIT_Z=1` keeps the grouping
+  (`#71`, `8fce410`, `#62` lever 1, 2026-09-18, DEFAULT OFF, opt-in). `CROW_GDN_SPLIT_Z=1` keeps the grouping
   for qkv + b + a — `gemv_fp4_mma_g32[323x1]` over 10240 + 48 + 48 = 10336 rows, the kernel's
   fourth slab slot given ZERO rows through the device scalar `p.zero`, so no warp ever maps into
   it and its pointers are never read — and launches z's 6144 rows through the
@@ -419,7 +398,7 @@
   NOT flipped; the record is `docs/architecture.md` 4.7, `docs/env.md` row (88 -> 89).
 
 - **`CROW_STAGE_PAR` — the cold-expert staging copy runs beside the shared expert instead of in
-  front of it** (`#19`, 2026-09-18, DEFAULT OFF, opt-in). `CROW_STAGE_PAR=1` issues `stage_cold_ca`
+  front of it** (`#19`, `cf988f5`, 2026-09-18, DEFAULT OFF, opt-in). `CROW_STAGE_PAR=1` issues `stage_cold_ca`
   on a side stream and joins the compute stream again immediately before the routed gate|up GEMV,
   the first reader of the combo pointers the staging kernel rewrites: `cuEventRecord` on the compute
   stream, `cuStreamWaitEvent` on the side stream, the launch, and the pair back. Inside the decode
@@ -475,16 +454,16 @@
   `CROW_KPROF=1` the row itself reads 206.4 us per attention layer against 64.9 — 2.477 to 0.779 ms
   per decode token, **-3.18 x** — and the `[profile]` attention bucket 5.07 to 3.35 ms per step.
 
-  `KERNEL_SRC` CHANGED in this commit: `attn_sel_split` became `attn_sel_split_body<LUT>` plus two
+  `KERNEL_SRC` CHANGED in `156e2fe`: `attn_sel_split` became `attn_sel_split_body<LUT>` plus two
   `extern "C"` wrappers, so the module now defines 117 `__global__`s and the host resolves 111
   (was 116 / 110). The OFF path is unchanged where it counts — the same binary with the flag unset
   reproduces 206.4 us per call and the ids of record, and `tools/gate-linux.sh` is ALL GREEN with
-  the flag OFF. The default was NOT flipped in this commit: robin decides — and robin decided the
+  the flag OFF. The default was NOT flipped in `156e2fe`: robin decides — and robin decided the
   same day, so this lever is the DEFAULT since 61g (see **Changed** below). One `[attn]` boot line
   per process names the kernel it runs. `docs/architecture.md` 4.6.1, `docs/env.md` row (86 -> 87).
 
 - **Engine logging: `tracing` as the single facade, a rotating gzipping file, one routing line per
-  request and the operating point as one JSON line** (`#13`, 2026-09-18). Before this commit every
+  request and the operating point as one JSON line** (`#13`, `788fb64`, 2026-09-18). Before `788fb64` every
   line the engine said was an `eprintln!` — 153 sites in `engine/src`, always on, never levelled,
   never in a file, synchronous on the calling thread — and `[chat] ids [...]` printed the full id
   list of every answer, so a redirected `serve` stderr grew without bound. All seven requirements
@@ -538,7 +517,7 @@
 
   **Level routing without a rebuild.** `CROW_LOG` is `RUST_LOG` syntax through
   `tracing-subscriber`'s `EnvFilter`, default `info` for operators. `info,chat=debug` brings back
-  the full `[chat] ids` list (DEBUG since this commit), `info,decode=trace` turns on the per-token
+  the full `[chat] ids` list (DEBUG since `788fb64`), `info,decode=trace` turns on the per-token
   decode forensics, `info,routing=debug` adds one line per prefill chunk. A string this build
   cannot parse installs the default and says so on a WARN line that names it — an operating switch
   with a typo may never silence a running server.
@@ -739,7 +718,7 @@
 ### Changed
 
 - **The three consequence rules of `#38` are decided, and the serve rate of record enters the
-  spec** (`#38`, robin 2026-09-18, after the Linux chains of that morning; docs only, no engine
+  spec** (`#38`, `e8ff590`, robin 2026-09-18, after the Linux chains of that morning; docs only, no engine
   code, so no gate run is owed). The issue had carried three rules since 2026-09-10, all of them
   written when a `serve` rate on the Windows box drifted 26.4 % with run position.
 
@@ -860,8 +839,8 @@
 ### Measured
 
 - **The router GEMM second probe: RED greedy on the degeneration clause, GREEN sampled — and the
-  reference the first verdict used does not exist on this platform** (`#10` 10e, 2026-09-18, RTX 5090 / Arch Linux,
-  HEAD `3feec4d`, chain `decode_out/10e/srv-10e.log`, record `docs/architecture.md` 5.4).
+  reference the first verdict used does not exist on this platform** (`#10` 10e, `47db87c`, 2026-09-18, RTX 5090 / Arch Linux,
+  measured at HEAD `3feec4d`, chain `decode_out/10e/srv-10e.log`, record `docs/architecture.md` 5.4).
   `CROW_ROUTER_GEMM=1` was stood down on 2026-09-14 (10d, Windows) because the ten-task quality
   gate read 0 Pass / 7 Partial / 3 Fail against the series record of 2 / 5 / 3 — the improve-loop
   RED line is a pass count below reference minus one. robin commissioned the second probe.
@@ -944,7 +923,7 @@
   answers and cost the same two Passes with no code change at all.
 
 - **The cold-expert staging row is the PCIe link, not the kernel and not the launches**
-  (`#19`, 2026-09-18, RTX 5090 / Arch Linux, HEAD `cb1895a`, `decode run` on t1-read, 16,064 ids,
+  (`#19`, `ef50a3b`, 2026-09-18, RTX 5090 / Arch Linux, measured at HEAD `cb1895a`, `decode run` on t1-read, 16,064 ids,
   greedy, 256 tokens / 255 timed steps, context 16,320; logs `decode_out/19/`, record
   `docs/architecture.md` 4.8). `stage_cold_ca` is rank 1 of the whole decode step in the `#61`
   table — 11.468 ms per decode token, 38.2 percent of what the profiler attributes. This is that row
@@ -1013,7 +992,7 @@
   crow, 6.07 ms against 11.39 at this machine's own measured rate.
 
 - **The GDN row taken apart per kernel, and what the +1.64 ms of this issue actually is**
-  (`#62`, 2026-09-18, RTX 5090 / Arch Linux, HEAD `156e2fe`, `decode run` on t1-read, 16,064 ids,
+  (`#62`, `cb1895a`, 2026-09-18, RTX 5090 / Arch Linux, measured at HEAD `156e2fe`, `decode run` on t1-read, 16,064 ids,
   greedy, 256 tokens / 255 timed steps, context 16,320; logs `decode_out/62/`, record
   `docs/architecture.md` 4.7). The `#62e` re-decomposition that "stays open" is this. Same method as
   `#61` above — `CROW_KPROF=1 CROW_PROFILE=1 CROW_GRAPH=0`, prefill removed by differencing `gen`
@@ -1071,7 +1050,7 @@
   ALL GREEN.
 
 - **The decode kernel decomposition at the Linux operating point — the attention row of `#61`
-  re-measured after the levers, and the GDN row of `#62` with it** (`#61`, 2026-09-18, RTX 5090 /
+  re-measured after the levers, and the GDN row of `#62` with it** (`#61`, `15876e6`, 2026-09-18, RTX 5090 /
   Arch Linux, `decode run` on t1-read, 16,064 ids, greedy, 256 tokens / 255 timed steps, context
   16,320; logs `decode_out/61/`). The pre-lever table of `#59` (Windows, nsys, 2026-09-11) was the
   state of record and nsys is not installed on this box, so the pass ran the engine's own
@@ -1106,7 +1085,7 @@
   `gemv_fp4_mma_d32` 0.841, `gemv_bf16_w[31040x1]` 0.762. The full 15-row table and both row
   breakdowns are `docs/architecture.md` 4.6, for `#62` and `#19` to reuse.
 
-- **Why `attn_sel_split` costs what it costs, and what it is NOT** (`#61`, 2026-09-18). Sweeping
+- **Why `attn_sel_split` costs what it costs, and what it is NOT** (`#61`, `15876e6`, 2026-09-18). Sweeping
   `CROW_ATTN_SPLITS` (4 / 8 / 16 / 32 = 96 / 192 / 384 / 768 blocks on 170 SMs) reads
   **406.4 / 206.7 / 108.6 / 59.7 us** per attention layer, and the fit `8.6 us + 0.776 us x
   ceil(sel_n/S)` holds to better than 1.2 percent at every point — **flat in the block count** from
@@ -1134,7 +1113,7 @@
   (one CTA per GQA group, 16-byte vectorised KV loads) both move the reduction order or the lane
   mapping, so both would need the ten-task quality gate, not only parity. They stay open on `#61`.
 
-- `tools/gate-linux.sh` ALL GREEN at this commit — 8 rows `bceba6ff7724…`, 512 rows
+- `tools/gate-linux.sh` ALL GREEN at `667b68b` — 8 rows `bceba6ff7724…`, 512 rows
   `8387234709271515…`, P8 teacher-forced `3bb3e69edf90…` and the 32 ids of record all unchanged,
   which is what "the filter is off the numeric path" means in bytes. `cargo test --release` 171
   passed, 0 failed; clippy unchanged at **1,422**; `check_env_docs` exit 0 (82 = 82);
@@ -1225,12 +1204,12 @@
   before the load read 360 MHz at the first start of each chain and 1,260 to 2,917 MHz at the
   other ten, power 35.6 to 112.4 W, temperature 31 to 53 °C, and both arms held inside 0.6 %
   through all of it. Nothing here concludes anything about the Windows M2a outlier, which needs
-  the same form rerun on that box. The `#38` consequence rules are untouched by this commit and a
+  the same form rerun on that box. The `#38` consequence rules are untouched by `77c4d40` and a
   recommendation on each of them is in the record; no `serve` number entered
   `docs/architecture.md`.
 
 - **The de-duplicated replay: the 105 identical nudges are NOT what flips the model** (`#68`,
-  2026-09-18, RTX 5090, `main` at `b70310a`, greedy, 3 answered turns per point, images stripped;
+  `3116493`, 2026-09-18, RTX 5090, measured on `main` at `b70310a`, greedy, 3 answered turns per point, images stripped;
   `tools/replay-session.py --dedup-nudges`, record in `docs/long-context-goalmode.md` §8,
   artefacts `decode_out/68b/`). The flag collapses consecutive byte-identical USER turns of the
   stored session and leaves every assistant turn and tool result where it was: 574 messages → 475,
@@ -1260,6 +1239,13 @@
   byte-identical to round 1 (`Let me look at the actual rendered picture …` plus the same
   `read_image` call), and the `[chat]` line said `repeat run 2` for it — the shape no single
   request can see, seen.
+- **The host-side gate items at the release commit** (`8bad310`, 2026-09-18, no GPU needed):
+  `cargo test --release` reads **221 passed, 0 failed** (128 lib + 82 serve + 6 parity + 5 decode),
+  which is the count `tools/gate-linux.sh` pins as `TESTS`, and the three doc guards exit 0 —
+  `check_env_docs` 89 = 89, `check_readme_dates` 0 offenders, `check_model_card_dates` 0 offenders.
+  The four byte values of record were last reproduced on the GPU at `bc9cd9b` (`#73`), whose
+  `decode run 32` ids are the `56305eee11d6` of record; `8bad310` moves one default constant and
+  touches no kernel, no launch and no id.
 
 ### Known limitations
 
@@ -1282,9 +1268,29 @@
   has never been compared against a higher-bit container or against llama.cpp above 16k of context.
 - There is no numeric (logit) statement above 1,024 rows: the parity forms are 8, 512, P8 and 1,024
   rows, and `tools/longctx-gate.py` scores ANSWERS, not bytes. A quality gate is not a parity gate.
-- The engine offers a client no cross-turn repetition signal (`#68`, 2026-09-18). Whether it should
-  — a repeated-answer counter on the `[chat]` line, or a deliberately chosen `repeat_penalty` — is
-  a feature decision for robin, not a bug fix, and it would be the first knob outside the card row.
+- The cross-turn repeat counter of `b70310a` (`#68`, 2026-09-18) is observability and nothing else,
+  by robin's decision: it WARNs at three identical answers in a row and changes no sampling value,
+  no status code and no byte on the wire, so a client that loops still loops. Its state is a ring of
+  the last 8 answer hashes held per PROCESS — `serve` holds one conversation and the wire carries no
+  session id — so a restart loses it, and a second client's answers would share the same ring. A
+  `repeat_penalty` knob is still not offered and would be the first sampling knob outside the card
+  row.
+- Two of the three decode levers of the day stay DEFAULT OFF and robin has not been asked to flip
+  them: `CROW_STAGE_PAR` (`#19`, `cf988f5`, −3.47 %) and `CROW_GDN_SPLIT_Z` (`#71`, `8fce410`,
+  −0.74 %). Both were measured before `CROW_ATTN_LUT` became the default, so both numbers sit on the
+  25.2 ms control and not on the 23.5 ms one, and no chain has run the two of them together or
+  either of them on top of the `#61g` default.
+- The image path has no gate. `tools/gate-linux.sh` runs no image at all, and the `#VIT` smoke
+  parity of 2026-09-14 only ever ran ONE image per process, which is why `#73` — every image but
+  the first of a process read as the previous one — stood for four days with a green parity behind
+  it. What guards it now is the three probes `tools/vit-colorprobe.py`, `vit-lag.py` and
+  `vit-imgprobe.py`, run by hand, plus the host-side layout tests in `vit.rs`; a colour or shape
+  claim about this path needs one of the probes, not a single-image oracle run.
+- Nothing in this release was RUN on Windows. The rotating log file, the `#61g` default, the two
+  opt-in levers, the held vit reserve, the drift chain and the package self-test were all measured
+  on the Linux box; the Windows code paths compile under `#[cfg(windows)]` and are unchanged where
+  they were not touched, but no Windows process has written a rotating log (`docs/architecture.md`
+  9.6) and the `#38` M2a form has not been rerun there.
 - The `#68` replay is text-only: the 17 `image_url` parts of the live history (~11k visual tokens,
   874 to 1,000 each) are dropped by default, so the image path at 178k context stays unmeasured.
 

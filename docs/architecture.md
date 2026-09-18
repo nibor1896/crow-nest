@@ -3085,6 +3085,12 @@ then a fresh prompt; `decode_out/68b/serve-part1-proof.log`):
   over the three refactor cuts, and → **1421** on 2026-09-18 with `#13`, which removed the one
   `redundant reference in eprintln! argument` at `gen.rs:2890` by making that line a `tracing`
   event (`tools/gate-linux.sh`).
+- Counts at `8bad310` (v0.3.1, 2026-09-18): engine lib **128 of 128**, `bin/serve` **82 of 82**,
+  `bin/parity` **6**, `bin/decode` **5**, total **221 passed, 0 failed**, every one of them without
+  a GPU and without the container. The rise from the 165 of `487128d` is the twenty-six commits of
+  that day, and `tools/gate-linux.sh` carries the issue and the reason of every step in its header.
+  Clippy is **1421** over the same tree, one lower than the 1422 of `487128d` and for the one named
+  reason above.
 - The `file:line` anchors in the two test tables above are the positions at the commit that added
   each test; `bin/serve.rs` grew by 1,238 lines on 2026-09-17, so they are read by name, not by line.
 - Commands: `cd engine && cargo test --release --target-dir target_srv`, and
@@ -3136,8 +3142,9 @@ device allocation left between that last line and the panic is the per-request s
 buffer, `sum(n_visual) * 2560` f32 = 1,660 x 2560 x 4 = **17,000,000 B (16.21 MiB)**. Crow then got
 `Connection refused` for the rest of the session.
 
-Two allocations live inside a request, and both are now PLANNED (`vit::reserve_bytes`, added
-to the planner's `pending` bytes in `Engine::load` when `CROW_VIT` is on):
+Two allocations live inside a request, and both are PLANNED since TASK K (`vit::reserve_bytes`,
+added to the planner's `pending` bytes in `Engine::load` when `CROW_VIT` is on) and HELD since
+`#72` (`74970b5`, 2026-09-18 — see the three paragraphs after the table):
 
 | allocation | where | bytes at the default operating point |
 |---|---|---|
@@ -3152,7 +3159,37 @@ The per-request spliced embedding buffer (`sum(n_visual)` x 2560 f32, `build_pla
   request that the next line refused with 413 had already allocated its tables). The table content
   of a served request is unchanged: only rows past the budget disappear, and no kernel read those.
 - `CROW_VIT=0` reserves nothing and keeps the full budget, as before. `CROW_VIT_RESERVE_MB` pins the
-  number, `0` restores the pre-TASK-K planner for a measurement.
+  number, `0` restores the pre-TASK-K planner for a measurement and, since `#72`, also turns the
+  hold off.
+
+**The reserve is an allocation, not an intention (`#72`, `74970b5`, 2026-09-18).** Planning it was
+half the job: the scratch stayed "lazy, allocated on the first image request", so everything the
+engine took AFTER the plan — the NVRTC module, the decode graph, the driver pools, the device
+sampler — spent the slack the reserve was supposed to name, and robin's first image request of
+2026-09-18 found **35.7 MiB free** and got the named 503 of the rule below
+(`[vit] scratch allocation refused after 23 buffer(s)`). `Engine::load` now calls
+`vit::arm_scratch` right after the tower weights and takes the two interleaved-mrope span tables at
+`n_ctx` in the same place — BEFORE the budget verify, so `free0` excludes them exactly as it
+excludes the dense weights and `pending` carries only what is LEFT of the reserve, which at the
+derived value is nothing. The device sampler's five buffers (0.27 MB, the last thing the engine
+took after the plan) are held beside them and handed to `enable_dev_sampler` on demand.
+`begin_vision` and `ensure_scratch` keep their lazy paths as the fallback.
+
+**The post-plan ledger.** One `[budget]` line lists every allocation that used to happen after N
+was chosen, with its side of the bus: `post-plan allocations held at boot: vit tower scratch
+228.5 MB + vit mrope span 48.8 MB + device sampler 0.3 MB = 277.6 MB VRAM; host RAM only (never on
+the card): vit image cache 256.0 MB`, followed by `free VRAM after load 0.54 GiB >= floor 0.25 GiB`
+(`manager::POST_PLAN_FLOOR`, what the decode graph and the driver pools still have to fit in). The
+prefix-cache snapshots (3 x 124.6 MiB) were the issue's prime suspect and they are **host RAM**, not
+VRAM — `Vec<f32>` per `cache.rs`'s memory section — so they stay out of the VRAM total; subtracting
+them would have cost about 150 hot experts for nothing.
+
+**Live at the full operating point** (`n_ctx` 200,000, prefix cache on, 3 snapshots, 2026-09-18):
+`N 160 → 155` and `148 of 155` as before the change — the reserve moved from `pending` to resident,
+so the plan is the same — free VRAM 551 MiB after load, then three text requests, one image request
+and a four-image request, all 200, with no `[vit] scratch allocated` line at any of them (the tower
+armed from the held scratch), free VRAM 544.1 MiB at both image requests and `engine live allocs`
+unchanged at 2243. That is what "an image request allocates no VRAM at all" means in numbers.
 - Cost, measured on two boots of the same binary with the same free-at-start (22.86 GiB, `n_ctx`
   200,000, chunk 2048): **N 157 -> 155**, VRAM used 30.83 -> 30.58 GiB. N is not part of the numeric
   contract; the ids are, and the parity forms run `decode`, which has no vision.
@@ -3344,13 +3381,15 @@ is not exhausted), more VRAM for the hot set (the planner already maximizes N ag
 KV budget; N=155 with 7 slots surrendered to the trickle), or a cold tier that is smaller per expert
 (a low-bit tier, which is not bit-identical and therefore not this).
 
-## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13)
+## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18)
 
 Sections 0 to 7 say what the engine must do. This section says how the crate is put together,
 so a reader who opens `engine/src` knows which file to open and what it may reach for. It was
 read from the tree at `487128d` on branch `main`, after the three refactor cuts
 (`74c79f2`, `bb9d2ca`, `7ddd296`); the graph below was regenerated from the `use crate::`
-edges of the current tree, not copied from an earlier note.
+edges of the current tree, not copied from an earlier note. It was read again at `8bad310`
+(v0.3.1, 2026-09-18): the twenty-six commits of that day add one module, `log.rs` (8.1, section 9),
+and move no module edge, so the graph and the layering below are the ones of record.
 
 Nothing in this section is a proposal. Where a number appears it carries its date, its machine
 and its artefact, like every other number in this document.
@@ -3674,9 +3713,14 @@ memory-bounded scope, one engine at a time.
 - **The gate**: `tools/gate-linux.sh [outdir]` from the repo root runs the three parity forms,
   `decode run 32`, `cargo test`, clippy and the doc guards against the first three values
   above, prints GREEN/RED per item and exits non-zero on any RED. Nine items; all nine green at
-  commit `8ff2055` on 2026-09-17. The two host-side values it pins are `TESTS=200`
-  (113 lib + 78 serve + 6 parity + 3 decode, 2026-09-18) and `CLIPPY=1421` (the `--all-targets`
-  form, counted as `grep -cE '^warning: '`), plus `check_env_docs` exit 0 (`code 86, doc 86`),
+  commit `8ff2055` on 2026-09-17, and green at eight commits of 2026-09-18 — `decode_out/gate13-final`,
+  `gate61`, `gate61g`, `gate62`, `gate69`, `gate68b`, `gate71` and the `#73` run at `bc9cd9b`, the
+  last GPU run of the release. The two host-side values it pins are `TESTS=221`
+  (128 lib + 82 serve + 6 parity + 5 decode at `8bad310`, 2026-09-18; it was 165 at the close of
+  2026-09-17 and every step of the day's rise to 221 carries its issue and its reason in the
+  script header) and `CLIPPY=1421` (the `--all-targets`
+  form, counted as `grep -cE '^warning: '`), plus `check_env_docs` exit 0 (`code 89, doc 89`,
+  2026-09-18),
   `check_readme_dates` 0 offenders and, since 2026-09-18, `check_model_card_dates` 0 offenders —
   that third guard was written in F4 and never committed, so every run before that date printed
   it as "not in this tree - skipped" (8.10). The 1024-row form is not in
@@ -4119,6 +4163,10 @@ All five decode runs: `decode run decode_out/parity-ids.json 64`, the gate's own
 | `the_boot_line_is_one_valid_json_line_with_the_operating_point` | ONE line, valid JSON, `n_ctx` / `residency_n` / `kv_dtype` / `kernel_path` / `cold_path.tier` and 48 `hot_per_layer` entries |
 | `the_routing_line_carries_every_counter_of_one_request` | ONE line, valid JSON, every field present, `bytes_streamed` and both derived rates computed, and the empty request that is not a miss |
 | `what_one_line_costs_at_the_call_site` | the three costs of 9.4, with loose ceilings as a regression guard against a call site that starts BLOCKING |
+
+- The suite these ten joined reads **221 passed, 0 failed** at `8bad310` (v0.3.1, 2026-09-18;
+  128 lib + 82 serve + 6 parity + 5 decode) with clippy at **1421**, and both counts are what
+  `tools/gate-linux.sh` pins (8.7).
 
 ### 9.6 What this section does not claim
 

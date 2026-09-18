@@ -32,7 +32,7 @@ Qwen3.8-Flash-Next quantized to CNQ4.5-M: one NVFP4 container at 4.5 bpw with a 
 | container | one file, `Qwen3.8-Flash-Next-CNQ4.5-M.cnq`, 104,727,179,972 B (about 105 GB) |
 | engine | crow-nest, `https://github.com/nibor1896/crow-nest`: own HTTP server, own container format, no GGUF, no transformers |
 | vision | the container carries the FULL vision tower, same quant policy as the text tower (see Vision) |
-| platform | Linux and Windows (crow-nest v0.3.0), CUDA, NVIDIA Blackwell (`sm_120`); every measured number on this card comes from one RTX 5090 |
+| platform | Linux and Windows (crow-nest v0.3.1, 2026-09-18), CUDA, NVIDIA Blackwell (`sm_120`); every measured number on this card comes from one RTX 5090 |
 | licence | model weights: Qwen Community License 1.0 (see License); engine and converter code: Apache-2.0 |
 
 ## Files
@@ -150,12 +150,13 @@ wrote converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq: 1658 tensors (843 nvfp4, 815 bf
 
 <!-- NUMBERS-OF-RECORD refresh before upload -->
 
-Current numbers: crow-nest v0.3.0, one RTX 5090, Arch Linux, driver 610.57.04, CUDA 13.3.1, this container. llama.cpp runs the same model as `Qwen3.8-Flash-Next-UD-Q2_K_XL` (GGUF, 2.4 bpw, 73 GB); its latest numbers are Crow's Linux placement and the paired Windows prefill (17.41 s = 922.5 tok/s, 2026-09-11; no Linux prefill number exists for it).
+Current numbers: crow-nest v0.3.1 (2026-09-18), one RTX 5090, Arch Linux, driver 610.57.04, CUDA 13.3.1, this container. llama.cpp runs the same model as `Qwen3.8-Flash-Next-UD-Q2_K_XL` (GGUF, 2.4 bpw, 73 GB); its latest numbers are Crow's Linux placement and the paired Windows prefill (17.41 s = 922.5 tok/s, 2026-09-11; no Linux prefill number exists for it).
 
 | metric | crow-nest CNQ4.5-M | llama.cpp UD-Q2_K_XL | form | source |
 |---|---|---|---|---|
 | prefill, 16,064 id prompt, cold | **968 / 964 tok/s** | 922.5 tok/s (Windows) | completed-prompt average, two runs | engine commit 1032bc5, 2026-09-17; engine issue #10 |
-| decode at 16k context | **36.8 tok/s** (27.19 / 27.22 ms per token) | 41.8 tok/s (Linux, `--load-mode mmap`, `-ncmoe 31 -t 24`, short prompts; 36.7 with `--load-mode none`) | 128 steps after the prompt above vs Crow's placement measurement in the window; not a pair | engine commit 1032bc5, 2026-09-17; `nibor1896/Crow` `docs/user-guide/linux.md`, which carries no date in this repository |
+| decode at 16k context | **42.5 tok/s** (23.52 ms per token) | 44.9 tok/s (Windows pair of 2026-09-11, 22.27 ms per token) | 255 timed steps after the prompt above, at the engine default of 2026-09-18 | engine commit `6c87054`, engine issue #61 (61g), 2026-09-18 |
+| decode at 16k context, the reading before the attention lever of 2026-09-18 | **36.8 tok/s** (27.19 / 27.22 ms per token) | 41.8 tok/s (Linux, `--load-mode mmap`, `-ncmoe 31 -t 24`, short prompts; 36.7 with `--load-mode none`) | 128 steps after the prompt above vs Crow's placement measurement in the window; not a pair | engine commit 1032bc5, 2026-09-17; `nibor1896/Crow` `docs/user-guide/linux.md`, which carries no date in this repository |
 | prefill, 1024 id prompt, cold | **740 tok/s** | n/a | `decode parity`, two runs (92 tok/s before the same-day PLE fix) | engine commit 1032bc5, 2026-09-17 |
 | warm short turns through `serve` | **228 ms prefill, 247 ms to the first token** | n/a | 3,296 id cached prefix, 39 to 101 new ids, mean of six turns, two runs | engine commit 4004e66, 2026-09-17 |
 | first token after a restart, 3,928 id prompt in Crow | 819 tok/s prefill | n/a | robin's live session, one reading | engine issue #68 artefacts, 2026-09-17 |
@@ -163,7 +164,7 @@ Current numbers: crow-nest v0.3.0, one RTX 5090, Arch Linux, driver 610.57.04, C
 <!-- end of the numbers of record -->
 
 - crow-nest moves about 1.9x the expert bytes per token of the 2.4 bpw GGUF.
-- The 972 tok/s prefill and 42 tok/s decode figures of the engine's decision record are targets (spec section 0.1, approved 2026-09-02); prefill is above that target on Linux since v0.3.0, decode at 16k context is below it.
+- The 972 tok/s prefill and 42 tok/s decode figures of the engine's decision record are targets (spec section 0.1, approved 2026-09-02); prefill is above that target on Linux since v0.3.0, and decode at 16k context reads above it since 2026-09-18 — but the decode target names a session filled to the 200,000 token floor, which has no Linux reading, so neither row is the target met.
 - Earlier numbers (Windows, v0.2.0) are in the engine's `CHANGELOG.md` and its v0.2.0 release notes.
 
 ## Quality, the ten-task gate

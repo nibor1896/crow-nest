@@ -77,8 +77,9 @@ all nine green at commit `8ff2055` on 2026-09-17.
   record. They are hard-coded with their provenance; a value there moves only when a new
   reference run establishes a new record, and the commit that moves it says so. R8 applies
   unchanged: RED = eine Stufe zurück.
-- The host-side counts the script enforces are `TESTS=202` (113 lib + 78 serve + 6 parity +
-  5 decode since the two `bin/decode.rs` tests of `#69`, 2026-09-18) and `CLIPPY=1421` (the
+- The host-side counts the script enforces are `TESTS=221` (128 lib + 82 serve + 6 parity +
+  5 decode at `8bad310`, v0.3.1, 2026-09-18; every step of that day's rise from 165 carries its
+  issue and its reason in the script header) and `CLIPPY=1421` (the
   `--all-targets` form, counted as
   `grep -cE '^warning: '`; 1422 until `#13` on 2026-09-18 turned the one
   `redundant reference in eprintln! argument` site into a `tracing` event). The guard loop names

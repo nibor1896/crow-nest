@@ -2,11 +2,13 @@
 
 Living renderings of the approved spec (`architecture.md`, sections 1 to 9). A diagram
 contradicting the spec is a bug in the diagram. Owner: issue #14. Updated with every stage
-acceptance. Diagrams 1 to 5 and the new diagram 8 render the tree at commit `cea9406`,
-2026-09-18, branch `main` — the pass over v0.3.0 (`9f12429`..`487128d`) and the seven v0.3.1
-commits; diagram 6 (the converter) and diagram 7 (the module graph) were re-read against the
-same tree and are unchanged, and each says why. Every box names the section of
-`architecture.md` it renders.
+acceptance. All eight render the tree at `8bad310` (v0.3.1), 2026-09-18, branch `main`, and
+each says what it was read against: diagrams 1 to 5 and the new diagram 8 were redrawn during
+the day's `cea9406` pass over v0.3.0 (`9f12429`..`487128d`) and the first seven v0.3.1 commits,
+and 2, 3, 5 and 8 moved again at the release pass for the commits that followed
+(`6c87054`, `74970b5`, `b70310a`, `cf6a135`, `bc9cd9b`); diagram 6 (the converter) and diagram 7
+(the module graph) were re-read against the same tree and are unchanged, and each says why.
+Every box names the section of `architecture.md` it renders.
 
 ## 1 · System overview, from originals to served tokens
 
@@ -57,7 +59,7 @@ flowchart TB
     QSC --> SEL{"QSA top-k, same list in the same order either way"}
     SEL -->|"default, CROW_QSA_PAR unset (#61b)"| PARS["qsa_select_par_h, CROW_QSA_PAR_BLOCKS=32 blocks, 12-bit histogram\nthen qsa_select_par_e, one block, 1024 threads\nthreshold refine · ascending emit"]
     SEL -->|"fallback, CROW_QSA_PAR=0"| FAST["qsa_select_fast on one block\nthe prefill selection keeps this form"]
-    PARS --> ATT["attn_sel_split over the selected list\ngrid NQ × 1 × CROW_ATTN_SPLITS=8\nthe splits knob 4/8/16/32 is measurement only (#61a)"]
+    PARS --> ATT["attn_sel_split_l over the selected list, default since #61g\ngrid NQ × 1 × CROW_ATTN_SPLITS=8\nthe e4m3 KV bytes come out of a 256-entry shared table\nCROW_ATTN_LUT=0 is the pre-#61f attn_sel_split, bit-identical\nthe splits knob 4/8/16/32 is measurement only (#61a)"]
     FAST --> ATT
     ATT --> MERG["attn_merge reads the device scalar n_splits"] --> HC
     STAGER["stager (control plane only):\nresidency swaps · NVMe tier · telemetry"] -.off the critical path.-> GEMM
@@ -66,9 +68,14 @@ flowchart TB
     ARG --> TOK
 ```
 
-Status: renders `cea9406`, 2026-09-18. The three defaults of 885bb27 are untouched —
+Status: renders `8bad310`, 2026-09-18. The three defaults of 885bb27 are untouched —
 `stage_cold_ca` (#19e), the deferred trickle (#63c), `qsa_select_par` with the
-`CROW_QSA_PAR=0` fallback and `attn_sel_split` at 8 splits (#61a, #61b). Two boxes moved in
+`CROW_QSA_PAR=0` fallback and 8 splits (#61a, #61b) — and one default moved on 2026-09-18:
+the split decode attention kernel is `attn_sel_split_l` since `#61g` (`6c87054`), which reads
+its e4m3 KV bytes out of a shared 256-entry table and is bit-identical to the
+`CROW_ATTN_LUT=0` fallback by construction. The two levers the same day added are NOT drawn,
+because both are DEFAULT OFF: `CROW_STAGE_PAR` (`#19`) would fork `stage_cold_ca` onto a side
+stream and `CROW_GDN_SPLIT_Z` (`#71`) would split the grouped GDN input launch. Two boxes moved in
 v0.3.0: the PLE row misses of a step are now one batched `pread` fetch on the reader pool
 instead of one mapping fault per row (7.14 parts 1 and 2), and the adaptation behind the
 trickle ticks every 8 decode tokens instead of 16 (7.14 part 4, `docs/env.md`
@@ -76,8 +83,9 @@ trickle ticks every 8 decode tokens instead of 16 (7.14 part 4, `docs/env.md`
 set is the tokens this answer generated and never the prompt, so it is drawn inside the step and
 not over the history. Windows operating point of record, 2026-09-12: 23.94 ms per token =
 41.8 tok/s against 24.87 with the fallback (`decode_out/srv-61b.log`, architecture 3.4); the
-Linux figure of record is 27.19 ms = 36.8 tok/s (`CHANGELOG.md`, 2026-09-17). Spec: 3.4, 3.5,
-4.2, 7.14, 7.11.17.
+Linux figure of record is 23.52 ms = 42.5 tok/s at the `#61g` default (`CHANGELOG.md`,
+2026-09-18; it was 27.19 ms = 36.8 tok/s on 2026-09-17, before that flip). Spec: 3.4, 3.5,
+4.2, 4.6, 7.14, 7.11.17.
 
 ## 3 · VRAM layout at the default operating point (262k ctx, FP8-KV)
 
@@ -89,19 +97,26 @@ pie showData title 32 GiB budget
     "PLE hot-row cache (128 MB default since 2026-09-05)" : 0.13
     "GDN + QSA state" : 0.3
     "activations + graph pools" : 1.8
-    "vision reserve, planned before N is chosen (277.3 MB)" : 0.28
+    "vision reserve + device sampler, HELD at boot since #72 (277.6 MB)" : 0.28
     "headroom" : 1.72
 ```
 
-Status: the section 2.1 estimate of 2026-09-02 with the PLE slice corrected 2026-09-05 (#16),
-plus the one slice v0.3.0 added: the vision reserve of TASK K (2.1 last paragraph, 7.13) —
-the cap-sized tower scratch (228.5 MiB) and the interleaved-mrope span tables (48.8 MiB at
-`n_ctx` 200,000), 277.3 MB together, added to the planner's `pending` bytes so an image request
-can never find the card full. It comes out of the headroom slice, which is what it was living
-in. Measured cost at the serve operating point (2026-09-17, same free-at-start 22.86 GiB,
-`n_ctx` 200,000, chunk 2048): N 157 → 155, VRAM used 30.83 → 30.58 GiB; `CROW_VIT=0` reserves
-nothing. The measured load line of 2026-09-05 read VRAM used 31.21 GiB. The HOST side of the
-same planner loop — the derived pinned budget — is diagram 4. Spec: 2.1, 2.5, 7.13, 8.4 step 8.
+Status: renders `8bad310`, 2026-09-18 — the section 2.1 estimate of 2026-09-02 with the PLE
+slice corrected 2026-09-05 (#16), plus the one slice v0.3.0 added: the vision reserve of TASK K
+(2.1 last paragraph, 7.13) — the cap-sized tower scratch (228.5 MiB) and the interleaved-mrope
+span tables (48.8 MiB at `n_ctx` 200,000), 277.3 MB together, so an image request can never find
+the card full. It comes out of the headroom slice, which is what it was living in. **The slice is
+an allocation since `#72` (`74970b5`, 2026-09-18), not a plan**: until that commit the reserve
+only lowered N and the scratch stayed lazy, so everything taken AFTER the plan spent the slack
+and the first image request of a session found 35.7 MiB free. `Engine::load` holds the scratch,
+the two span tables and the device sampler's five buffers (0.27 MB, which is why the slice reads
+277.6 MB now) before the budget verify, and a `[budget]` ledger names every one of them against a
+0.25 GiB floor. Measured cost at the serve operating point (2026-09-17, same free-at-start
+22.86 GiB, `n_ctx` 200,000, chunk 2048): N 157 → 155, VRAM used 30.83 → 30.58 GiB; holding it
+moved N by nothing (2026-09-18, N 155 and 148 of 155 before and after, free VRAM 551 MiB after
+load); `CROW_VIT=0` reserves nothing. The measured load line of 2026-09-05 read VRAM used
+31.21 GiB. The HOST side of the same planner loop — the derived pinned budget — is diagram 4.
+Spec: 2.1, 2.5, 7.13, 8.4 step 8.
 
 ## 4 · Residency and load: derived budget, pinned cold tier, page-cache discipline
 
@@ -176,7 +191,7 @@ flowchart TB
     GUARD --> PARSE
     CHK -->|"any other shape"| R400["400 JSON naming the message index and the field"]
     ENC --> IMG["image branch, when the request carries images and the tower is loaded\nbuild_vision_plan: LRU hit, else prep_image → Vit::run\nthe plan holds HOST rows only (7.13)"]
-    IMG --> CLAMP["clamped_max_tokens FIRST, then begin_vision\nso the interleaved-mrope span tables are at most n_ctx rows"]
+    IMG --> CLAMP["clamped_max_tokens FIRST, then begin_vision\nso the interleaved-mrope span tables are at most n_ctx rows\ndefault 8192 since 8bad310, cap 32768"]
     CLAMP --> LCP{"longest common id prefix L\nof the request ids vs the held history\nids only, never text (#31 A9)"}
     LCP --> P["reuse point P: the largest snapshot position at or below L\nwhose rows are all PREFILL CLEAN\nnothing is erased: pos moves back to P,\nrows at or above P are stale but unreachable"]
     P --> ROLL["rollback: GDN state, conv state and QSA ring restored\nfrom the snapshot at P; P = 0 is the cold start,\none 16k prefill of 21.6 to 22.0 s"]
@@ -185,7 +200,7 @@ flowchart TB
     S2 --> ARM["the sampler prologue: arm_sampler for a sampled request,\npark_sampler for a greedy one\ntwo [chat] lines name the SOURCE of every sampling value\n(request or data sheet) and the penalty scope:\ncleared for this request, generated tokens only (7.11.17)"]
     ARM --> DEC["decode_step loop, the diagram above"]
     subgraph outbound["on the way out (7.11.13, 7.11.16, 7.11.18)"]
-        TS["ToolStream: the tool-open token arms the parser;\nEmit::Args fragments are never rewritten;\na malformed call carries its raw markup as content"]
+        TS["ToolStream: the tool-open token arms the parser;\nEmit::Args fragments are never rewritten, with ONE exception since cf6a135:\na declared array or object that failed to parse gets one minimal repair pass\nand is kept only if it then parses AS THAT TYPE, else the string goes out with a warn;\na malformed call carries its raw markup as content"]
         TF["ThinkFilter on Emit::Content only\nLead: a block the model opens is owned\nInside: its text leaves as delta.reasoning_content\nBody: a stray closing tag is DROPPED, a held prefix flushes at the end\nso no byte of an answer is lost, on either request form"]
         SINK{"ChatSink, the one split between the two request forms"}
         TS --> TF --> SINK
@@ -193,6 +208,7 @@ flowchart TB
     DEC --> TS
     SINK -->|"SseSink"| WIRE["streamed chunks, usage and timings on the final chunk\ncached_tokens = P, always present\nstill_there = the failed flush of the first frame"]
     SINK -->|"CollectSink"| DOCU["one chat.completion document: content, tool_calls\nand reasoning_content only when something was stripped\nusage and timings ALWAYS present"]
+    SINK -.->|"when the answer is complete, either form"| REP["the cross-turn repeat counter (#68, 7.11.19)\nFNV-1a over the GENERATED ids into a ring of the last 8 answers\nrepeat_of · repeat_run · single_token on the routing line,\nthe [chat] line only when they are not the healthy values\nWARN at three identical answers in a row: no 4xx, no brake,\nthe sampler and the wire untouched. Per PROCESS, by design"]
     DOCU --> PROBE{"CollectSink::still_there(step), every step (PROBE_EVERY = 1)\npoll(POLLRDHUP), timeout 0, nothing on the wire\nagainst the BASELINE probe taken when the sink was built"}
     PROBE -->|"EOF already there: a client that half-closed"| DOCU2["it gets its whole document"]
     PROBE -->|"EOF appears later: gone"| STOPG["the generation ENDS, the slot is free;\nfinish_reason unchanged, status 200 OK (client gone)"]
@@ -200,7 +216,7 @@ flowchart TB
     SLOT -.->|"restore into a fresh process"| ROLL
 ```
 
-Status: renders `cea9406`, 2026-09-18. The reuse chain and the slot file are the 2026-09-12
+Status: renders `8bad310`, 2026-09-18. The reuse chain and the slot file are the 2026-09-12
 picture (A9 #31, A10 #32, the dropped after-answer snapshot M2b #36, the stream false document
 #39 B3a); the warm turn at 16k reused 99.41 percent of the prompt in 404 ms (README measured
 table, #31). Added since: the `guarded` / `RequestScope` 503 and the clamp-before-`begin_vision`
@@ -208,8 +224,13 @@ order (7.11.8 last row, 7.13, TASK K), the normaliser's two jobs (7.11.14 for `a
 7.11.16 end 2 for a stored reasoning tag, `667b68b`), `check_messages` as the 400 before the
 render (7.11.8), the `ThinkFilter` between the tool parser and the sink (7.11.16 end 1,
 `667b68b`), the sink split with `CollectSink`'s `ClientProbe` (7.11.13, 7.11.18, `20bc121`) and
-the sampling-provenance lines (7.11.17, `f14e557`). Spec: 7.3 to 7.8 for the reuse chain, 7.11.3
-to 7.11.8, 7.11.13, 7.11.16 to 7.11.18, 7.13, 8.5.
+the sampling-provenance lines (7.11.17, `f14e557`). Added at the release pass, for the three
+commits of that afternoon: the cross-turn repeat counter as a dotted box off the sink
+(7.11.19, `b70310a`) — it reads the answer and changes nothing, which is why it hangs off the
+path instead of sitting in it; the one exception the tool stream now makes to "fragments are
+never rewritten" (`cf6a135`); and `clamped_max_tokens`, whose default is 8192 since `8bad310`
+and no longer 1024. Spec: 7.3 to 7.8 for the reuse chain, 7.11.3
+to 7.11.8, 7.11.13, 7.11.16 to 7.11.19, 7.13, 8.5.
 
 ## 6 · Converter pipeline (stage 1 = RTN, calibration-free)
 
@@ -254,7 +275,8 @@ through a `use`, so twelve solid arrows into one leaf would say something the im
 not say and would make the picture unreadable. Same class of invisible edge as the
 `gen` → `reset` one named below. `log.rs` has its own spec section, 9. Otherwise unchanged: the
 `use crate::` edges of `engine/src` were regenerated from the tree at
-`cea9406`, 2026-09-18, and are edge for edge the graph added at `c1a68cd` and re-verified at
+`cea9406`, 2026-09-18, and again at `8bad310` (v0.3.1) at the release pass, and are edge for edge
+the graph added at `c1a68cd` and re-verified at
 `487128d`: acyclic since `bb9d2ca` broke `gen <-> residency` and `gen <-> vit`, with
 `weights.rs` and `boot.rs` in the second layer. The seven commits after `487128d` touched two
 library files — `sample.rs` (`f14e557`, the two penalty-scope tests) and `residency.rs`
@@ -275,9 +297,9 @@ flowchart TB
         P512["parity 512 rows · 8387234709271515…"]
         PTF["P8 teacher-forced · 3bb3e69edf90…\nprefill 8 ids, the other 504 through decode_step"]
         D32["decode run over 32 ids"]
-        TST["cargo test --release · TESTS 200\n113 lib + 78 serve + 6 parity + 3 decode"]
+        TST["cargo test --release · TESTS 221\n128 lib + 82 serve + 6 parity + 5 decode"]
         CLP["clippy --all-targets · CLIPPY 1421"]
-        G1["check_env_docs · code 86, doc 86"]
+        G1["check_env_docs · code 89, doc 89"]
         G2["check_readme_dates · 0 offenders"]
         G3["check_model_card_dates · 0 offenders,\nrunning since 2026-09-18 (it was never committed before)"]
     end
@@ -314,7 +336,8 @@ flowchart TB
     rep --> LIVE["the live shapes: a filtered content path, a freed slot,\nand a degeneration that is context length, not the sampler"]
 ```
 
-Status: new on 2026-09-18, renders `cea9406`. It draws what section 5.2 asks for and what
+Status: new on 2026-09-18, renders `8bad310` — its two host-side boxes carry the values the
+script pins at the release commit (`TESTS=221`, `check_env_docs` 89 = 89). It draws what section 5.2 asks for and what
 v0.3.0 and v0.3.1 built around it: the nine-item Linux gate and the two host-side values it
 pins (8.7), the package self-test with its `models/` control and its sha256 (8.10, `#64`), the
 bounded retry around the harness's two oracle children (8.9, `#65`), and the three replay
@@ -340,3 +363,4 @@ Spec: 5.1, 5.2, 5.3, 7.11.16 to 7.11.18, 8.7, 8.9, 8.10.
   - **6, converter: unchanged.** No converter stage has landed since 2026-09-02; `converter/src` was not touched in v0.3.0 or v0.3.1, and the two container facts that did move (the exit purge's `ple` range, the row fetch) are reader-side. The status line now says which sidecar this one is, because diagram 4 draws the other.
   - **7, module graph: unchanged, re-generated.** The `use crate::` edges of `engine/src` at `cea9406` are edge for edge those of `487128d`: only `sample.rs` and `residency.rs` were touched in the library, and every other v0.3.1 change landed in a bin, which this graph does not draw. The status line now names those bins so the next reader does not look for `ThinkFilter` in a module.
   - **8, gates, guards and the self-test: NEW.** The verification side had no picture at all, and three commits of v0.3.1 built one: `tools/gate-linux.sh`'s nine items and the two host-side values they pin (8.7), `decode selftest` with `tools/selftest.sh`, the `test ! -d models` refusal and the sha256 of the shipped golden (8.10, `#64`), `oracle_child`'s bounded retry with the exit code leading the diagnosis (8.9, `#65`), and the three replay commands that reproduce `#67`, `#54` and `#68` (7.11.16, 7.11.18, 7.11.17). The 1024-row parity form is drawn outside the script, where 8.7 puts it.
+- 2026-09-18, the v0.3.1 release pass (`8bad310`): the seventeen commits that landed after the `#13` pass (`788fb64`) were read against all eight pictures, and four moved. **2, decode path:** the split decode attention kernel is `attn_sel_split_l` since `#61g` (`6c87054`) and the box says so, with `CROW_ATTN_LUT=0` named as the bit-identical fallback; the Linux figure in the status line is 23.52 ms = 42.5 tok/s now, and the two levers of the same day (`CROW_STAGE_PAR` `#19`, `CROW_GDN_SPLIT_Z` `#71`) are deliberately NOT drawn, because both are DEFAULT OFF and a picture of a default is a picture of what runs. **3, VRAM pie:** the vision slice is HELD at boot since `#72` (`74970b5`) and reads 277.6 MB, the device sampler's five buffers included, against a `[budget]` ledger and a 0.25 GiB free-VRAM floor — the slice was planned-only before, which is exactly what let the first image request of a session find 35.7 MiB free. **5, request path:** the cross-turn repeat counter of `#68` (`b70310a`) hangs off the sink as a dotted box, because it reads the answer and changes nothing; `ToolStream` names the one exception it now makes to "fragments are never rewritten" (`cf6a135`); and the clamp box carries the 8192 default of `8bad310`. **8, gates:** `TESTS 221` and `check_env_docs` 89 = 89, the values the script pins at this commit. Diagrams 1, 4, 6 and 7 were re-read and are unchanged. The module graph in particular: the whole `crate::` edge set of `engine/src` at `8bad310` is the one of `788fb64`, with exactly one addition, `manager → gen::sampler_bytes` inside `#[cfg(test)] mod tests_72` — test code, not a layering edge, and the picture draws the layering. Everything the seventeen commits added to the library landed inside modules that were already drawn (`vit::arm_scratch`, `manager::PostPlan`, `toolcall::repair_json`, `gen`'s two levers), and the rest landed in the bins, which this graph does not draw. All eight were rendered locally with `@mermaid-js/mermaid-cli` 11.17.0 before the release commit (#14).
