@@ -2286,7 +2286,9 @@ Therefore:
 | `seed` | RNG seed of THIS request, default 0, reseeded per request (M1) | `serve.rs:515`, `serve.rs:1158` | not sent by Crow |
 | `min_p` | **ACCEPTED AND IGNORED**, one stderr line per request | `serve.rs:2262` (the stderr line); `sampler_from` (`serve.rs:1158`) carries no `min_p`; `serve.rs` module doc | `crow_core.py:4672-4700` (0.01 at Crow's operating point) |
 | `tools` | rendered as the template variable `tools` | `serve.rs:970`, `tokenizer::render_chat` | `crow_core.py:4672-4700`, `TOOLS` (25 builtin at `crow_core.py:579-838`, frozen at `:846`, plus the `mcp.json` tools added at import, `:841`) |
-| `chat_template_kwargs.enable_thinking` | template variable, default false | `serve.rs:970` | `crow_core.py:2970` (digest path) |
+| `chat_template_kwargs.enable_thinking` | template variable, default false; an EXPLICIT `false` beats a named level (7.11.20) | `serve.rs` (`parse_chat`) | `crow_core.py:2970` (digest path) |
+| `reasoning_effort` | **read since #74 (2026-09-18)**, top level and in `chat_template_kwargs`, top level first. `none` and an absent field render the prompt of record; `low` and `medium` pass through; `high` and `xhigh` both render `xhigh`; anything else is a 400 naming the five words (7.11.20) | `serve.rs` (`map_reasoning_effort`, `parse_chat`) | `crow_core.py:5017` (`stream_reply`, top level, since Crow #176) |
+| `chat_template_kwargs.reasoning_effort` | the second door of the same field, read when the top-level one is absent | `serve.rs` (`parse_chat`) | not sent by Crow — it sends the top-level field |
 | `messages[].role = "tool"` | `content` rendered as `<tool_response>...</tool_response>` | `serve.rs:1481` (`normalize_messages`) | `crow_core.py` tool turns |
 | `messages[].tool_calls[].function.arguments` | a JSON STRING from Crow is parsed into the MAPPING the template needs; **nothing that is not a mapping reaches the template** (7.11.14) | `serve.rs:1481` (`normalize_messages`) | `crow_core.py:5068`, stored `:3756-3761`, re-sent `:3783-3785` |
 | `messages[].content` of an `assistant` turn | a leading `<think>...</think>` block and a TRAILING `</think>` are stripped before the render; every other shape is left byte-identical (7.11.16) | `normalize_messages`, `strip_stored_think` | `crow_core.py:3754-3761`, re-sent `:3783-3785` |
@@ -2300,7 +2302,7 @@ Therefore:
 |---|---|---|---|
 | 1 | `delta:{"role":"assistant"}`, `finish_reason` null | `serve.rs:1299` (`chunk_role`) | `crow_core.py:4831-4877` |
 | 2..n | `delta:{"content":"..."}` , one per emitted piece | `serve.rs:1304` (`chunk_content`) | `crow_core.py:4831-4877` (`delta.content`) |
-| 2..n | `delta:{"reasoning_content":"..."}`, only when the reasoning filter took a `<think>` block out of the content (7.11.16); never an empty frame | `chunk_reasoning` | `crow_core.py:5045` (`reasoning_delta`), shown behind `--show-reasoning`, stored at `:3755` |
+| 2..n | `delta:{"reasoning_content":"..."}` — the whole reasoning of a THINKING request (#74, 7.11.20), or the `<think>` block a non-thinking model opened by itself (7.11.16); never an empty frame | `chunk_reasoning` | `crow_core.py:5045` (`reasoning_delta`), shown behind `--show-reasoning`, stored at `:3755` |
 | n+1 | `delta:{}` plus `finish_reason`, optionally `usage` and `timings` | `serve.rs:1340` (`chunk_finish`) | `crow_core.py:4831-4877`, `:4999-5018` |
 | n+2 | `data: [DONE]` | `serve.rs:517` (`SSE_DONE`) | `crow_core.py:4035` |
 | framing | `data: <compact json>` plus a blank line, one flush per frame | `serve.rs:1354` (`sse_frame`) | `crow_core.py:4831-4877` |
@@ -2449,7 +2451,7 @@ C:/x/y.md
 | `/v1/models`, `/v1/messages` | not built | those are the REMOTE providers in Crow (`crow_core.py:13593`, `:13649`, `:13669`, `:3600-3610`), not the local server |
 | `/completion` | not built | appears only in Crow's log-parser test fixtures |
 | `/apply-template` | not built | only Crow's probes call it (`tools/probe_reasoning_levels.py:92`, `tools/check_chat_template.py:19`) |
-| `delta.reasoning_content` | **emitted since #67 (2026-09-18)**, and only then: when the model opens a `<think>` block of its own, its text leaves as `reasoning_content` instead of `content` (7.11.16) | `enable_thinking` is false on this path, so the block is rare; Crow reads, shows, stores and re-sends the key (`crow_core.py:5045`, `:3755`) and this template renders it into the assistant turn's think block |
+| `delta.reasoning_content` | **emitted since #67 (2026-09-18)**: the `<think>` block the model opens of its own leaves as `reasoning_content` instead of `content` (7.11.16). Since **#74** (same day) it is also the ordinary output of a request that asked to think (7.11.20) | the default is still `enable_thinking` false, so an unasked block is rare; Crow reads, shows, stores and re-sends the key (`crow_core.py:5045`, `:3755`) and this template renders it into the assistant turn's think block |
 | stream trickle in serve | ticked once per `decode_step` (#37) | `bin/serve.rs:2332`, the mirror of `bin/decode.rs:224-231`; drained after the last step; one `[serve]` line at start says whether this process ticks, and the `[chat]` line carries `crow_trickle_swaps` per request |
 | the trickle's ranking signal in serve | `CROW_ADAPT_WINDOW=1` by default (#37 fix round 1) | `bin/serve.rs:2930` sets it when unset, the same loop as `CROW_GRAPH` and `CROW_MMA`; an explicit `CROW_ADAPT_WINDOW=0` restores the cumulative ranking |
 | `adapt_tick` in serve | never called | the post-prefill re-cut of `CROW_ADAPT=1` stays a harness path; callers are `bin/decode.rs:230` and `bin/parity.rs:216` |
@@ -2474,6 +2476,7 @@ C:/x/y.md
 |---|---|---|
 | tokenizer | in-engine (`crow_nest_engine::tokenizer`), no Python process is started | A3 #25 |
 | template | minijinja, the model's own `tokenizer_config.json` chat template | A3 #25 |
+| template variables | `messages`, `tools`, `documents`, `add_generation_prompt`, `enable_thinking`, and since #74 `reasoning_effort` — all of them variables, never string surgery | `tokenizer.rs` (`render_chat_effort`) |
 | gate | ids identical to the Python oracle on **10 of 10** prompts, plus a 6 of 6 docs file | `decode_out/srv-a3-tok.log`, `srv-a3-rust-ids.json`, `srv-a3-oracle-ids.json` |
 | tools render | byte-identical to the oracle at **322 ids**, but ONLY with `preserve_order` on serde_json AND on minijinja | A3 #25 |
 | warm-up | the tokenizer loads right after argument parsing, BEFORE `cuda::Ctx::init`; failure exits 3 in a second | `serve.rs` module doc |
@@ -2507,7 +2510,7 @@ C:/x/y.md
 | `choices[0].message.role` | `assistant` | `serve.rs:1477` | not read by either caller |
 | `choices[0].message.content` | ALWAYS a string: every content delta of the stream, concatenated; empty when a tool call was the whole answer | `serve.rs:1397` (`CollectSink`), `serve.rs:1477` | `probe-suite.py:679`, `crow_core.py:2984` |
 | `choices[0].message.tool_calls` | present ONLY when the parser closed a call: `[{id, type "function", function{name, arguments}}]`, `arguments` a JSON STRING | `serve.rs:1388` (`CallBuf`), `serve.rs:1477` | neither caller reads it |
-| `choices[0].message.reasoning_content` | present ONLY when the reasoning filter stripped a `<think>` block the model opened itself (#67, 7.11.16); absent otherwise, as before | `completion_json` | `probe-suite.py:680` reads it when present |
+| `choices[0].message.reasoning_content` | present when the reasoning filter has reasoning to give: a block the model opened itself (#67, 7.11.16) or the whole thought of a request that asked to think (#74, 7.11.20); absent otherwise, as before | `completion_json` | `probe-suite.py:680` reads it when present |
 | `choices[0].finish_reason` | `stop`, `length` or `tool_calls`, the stream's rules unchanged | `serve.rs:1648` | `probe-suite.py:678` |
 | `usage` | `usage_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1109` (`usage_json`), `serve.rs:1477` | `probe-suite.py:681-683` (`completion_tokens`) |
 | `timings` | `timings_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1122` (`timings_json`), `serve.rs:1477` | neither caller reads it |
@@ -2793,6 +2796,11 @@ repair a stored message (`:13485-13487`), so the engine repairs it on the way in
 switch that lets the tag back onto the wire would only be a way to reproduce the bug. `docs/env.md`
 stays at 82 rows.
 
+**The other end of the same filter (#74, same day).** Everything above is the filter of a request
+that did NOT ask to think: it starts in `Lead` and owns a block only if the model opens one. A
+request that asks to think gets a prompt that has already opened the block, so its filter starts
+`Inside` — see 7.11.20.
+
 **The replay.** `tools/replay-toolcalls.py --think` is the live shape in one command: a ~3 KB code
 paste in the first user turn, then three ordinary turns, the whole history re-sent every turn the
 way Crow does it, and no `tools` at all — the tags are a content-path bug. Every round must answer
@@ -2999,6 +3007,112 @@ then a fresh prompt; `decode_out/68b/serve-part1-proof.log`):
   `the_repeat_ring_sees_the_generated_ids_and_only_the_last_eight`,
   `a_single_token_answer_is_one_id_the_model_ended_itself`,
   `the_loop_warning_and_the_chat_line_suffix_fire_at_three` (`bin/serve.rs`).
+
+**7.11.20 Thinking, and the three reasons it never ran (#74, 2026-09-18)**
+
+Measured before the fix: **758 of 758** `[chat]` lines of `~/.local/state/crow/logs/engine.log`
+read `reasoning chunks 0`. This engine had never thought in a live Crow session, and three
+independent things had to be true for that.
+
+**1. The field was never read.** `serve` read `chat_template_kwargs.enable_thinking` and nothing
+else. Crow sends the TOP-LEVEL `reasoning_effort` (since its #176, `crow_core.py:5017`), which is
+the door llama-server owns: `none` sets `enable_thinking = false` and drops the key, any other
+value goes into the template kwargs. `serve` ignored it, so every Crow turn rendered
+`enable_thinking false` and the prompt carried the CLOSED empty think block.
+
+**2. The two vocabularies are not the same one.** Crow's ladder for these weights on llama-server
+is `none / low / medium / high`; this model's own template
+(`models/Qwen3.8-Flash-Next-original/chat_template.jinja:46-53`) accepts `xhigh`, `medium`, `low`,
+defaults to `xhigh` and RAISES on anything else. So a mapping had to be chosen and written down:
+
+| sent | template `reasoning_effort` | `enable_thinking` | why this and not something else |
+|---|---|---|---|
+| absent | **undefined** | false | the prompt of record, byte for byte: every parity value, every gate value and every warm prefix of a running session |
+| `none` | undefined | false | the meaning llama-server gives the top-level field (`server-common.cpp:1323`), which renders exactly the row above |
+| `low` | `low` | true | the template's own word |
+| `medium` | `medium` | true | the template's own word |
+| `high` | **`xhigh`** | true | this template has no `high`. On the unsloth template that serves the SAME weights under llama-server, `high` renders byte-identically to the unset key — and the unset key is `xhigh` (Crow's manifest, `flash-next-q2-k-xl` `reasoning_groups` `["off", "high"]`, measured 2026-08-30, Crow #160). `high -> xhigh` is therefore the step llama-server already gives the word, not a promotion to a dearer one |
+| `xhigh` | `xhigh` | true | the template's own top word, reachable under its own name |
+| anything else | — | — | **400**, naming the five words. `max`, `minimal` and an explicit `off` are fatal on llama-server too, so a silent downgrade would hide a client bug the reference engine reports |
+
+- `none` cannot be passed to the template as a VALUE: `reasoning_effort|default('xhigh')` keeps a
+  defined `none`, and the template's own `not in ('xhigh', 'medium', 'low')` then raises. Undefined
+  is the only spelling of "the client did not choose".
+- Matching is exact and lower case, as llama-server matches it. `High` is a 400.
+- Both doors are read, top level first, because that is the order llama-server resolves them in.
+  An explicit `chat_template_kwargs.enable_thinking: false` still wins over a named level: it is
+  the direct template variable, and the digest path of `crow_core.py:2970` must not move.
+- `reasoning_effort` is a real template VARIABLE (`tokenizer::render_chat_effort`), defined only
+  for a request that thinks. `render_chat` is the same call with `None`, so every existing call
+  site and every oracle test renders the bytes it rendered before #74.
+
+**3. The reasoning filter started in the wrong state.** `ThinkFilter` (#67, 7.11.16) starts in
+`Lead` and waits for the model to open `<think>` itself. With thinking on the generation prompt
+already ENDS in `<think>\n` (`chat_template.jinja:167`), so the model is inside the block at its
+first token and opens nothing. A filter in `Lead` would have streamed the whole thought as
+`content` and then dropped the model's own `</think>` as a stray — the answer would carry the
+reasoning, Crow would store it verbatim and re-send it every turn, which is the same wound #67
+was cut for, one field over. `ThinkFilter::for_request(enable_thinking)` starts the filter where
+the PROMPT put it. Both request forms are the same filter with a different sink, so `stream:false`
+carries it as `message.reasoning_content` unchanged.
+
+**The budget.** `max_tokens` (default 8192, cap 32768) covers thinking plus answer. A request that
+runs out mid-thought is an ordinary `finish length`: the reasoning leaves as `reasoning_content`,
+`content` is the empty string, and a tag the filter was still holding back leaves as reasoning
+text — nothing half-open ever reaches the wire.
+
+**The history.** Nothing had to change. The template's assistant branch renders
+`'<think>\n' + reasoning_content|trim + '\n</think>\n\n' + content` (7.11.16), which is the field
+the stream now fills; `strip_stored_think` still repairs a `content` that carries a tag. A
+multi-turn conversation therefore renders prior reasoning in the template's own block and the
+answer beside it.
+
+**What the log says.** One line per request, in the provenance shape #68 gave the sampling line:
+
+```text
+[chat] thinking on (request): reasoning_effort xhigh, asked as "high"; the generation prompt ends in <think> and the reasoning filter starts Inside (#74)
+[chat] thinking off (data sheet); the generation prompt carries the closed empty think block, the render of record (#74)
+```
+
+- `(request)` means the body named a door, `(data sheet)` means this file decided.
+- The word the client SENT is quoted when it is not the word the template got — `high -> xhigh`
+  is the one place the two vocabularies differ, and a line that hid it would make a step look
+  like a step it is not.
+- The request summary line carries `thinking <word>` beside `reasoning chunks`; the field sits
+  AFTER `finish`, so `tools/drift-chain.sh`'s reader is untouched.
+- A thinking request owes one `</think>` — its own block's close — so the `[chat] reasoning
+  filter` line says so instead of reporting a stray.
+
+**No env switch, no new default.** Thinking is opt-in per request. `docs/env.md` is unchanged, no
+sampling default moved, and a request that names neither door renders the ids of record — which
+is what `tools/gate-linux.sh` ALL GREEN proves for this commit.
+
+**Measured live, 2026-09-18**, `serve` on 8099 through `tools/serve-linux.sh`, requests through
+Crow's own `crow_core.stream_reply` at this model's operating point (`temperature` 1.0, `top_p`
+0.95, `min_p` 0.01), plus a raw `stream:false` probe for the levels.
+
+| what | measured |
+|---|---|
+| the levels, same four messages | `off` 61 prompt tok, `none` 61, `medium` 59, `low` 85, `high` 97, `xhigh` 97 |
+| which of them are ONE prompt | `off` = `none` and `high` = `xhigh`: same `prompt_tokens` AND the same 48 greedy tokens, character for character. `low` and `medium` are their own. Four distinct prompts for six words |
+| `medium` is the CHEAPEST step, not the middle one | it renders no reasoning sentence at all, so its prompt is 2 tokens SHORTER than the non-thinking one (which carries the closed empty think block) |
+| the kwargs door | `enable_thinking: true` renders 97 tok — the template's own `xhigh` default; `chat_template_kwargs.reasoning_effort: "medium"` renders 59; `enable_thinking: false` renders 61 |
+| the refusals | `max`, `minimal`, `off`, `High` and `""` all answer 400 with the five words in the body; none of them reaches the GPU |
+| one prompt, both arms (a shop-arithmetic puzzle with a rounding trap) | thinking OFF: prompt 102 tok, 640 generated, 54.2 tok/s, 12.2 s, 0 reasoning chunks. Thinking `high`: prompt 138 tok, 765 generated, 57.3 tok/s, 13.8 s, 721 reasoning chunks and 38 content chunks |
+| was the thinking answer better | **yes, n = 1.** The non-thinking answer opened with the wrong total (`**42 euros, 6 notebooks**`) and then argued with itself inside the visible answer (`totaling €48? Wait, let me re-read carefully`). The thinking answer was `48, 6 — 9 pens cost 21 euros; 5 notebooks require 3 two-pack purchases costing 27 euros`, which is right, and the working stayed in `reasoning_content` |
+| `none` against the absent field | byte-identical end to end: 102 prompt tok, 640 generated tok and the same answer text as the arm that sent nothing |
+| the wire | `<think>` and `</think>` appear in NO delta of any turn — content or reasoning — in any of the runs; the reasoning arrived as `reasoning_content` and the answer as `content`, in that order (`rrrr…cccc`) |
+| a multi-turn conversation, thinking on, whole history re-sent | three turns, 3 assistant turns carrying `reasoning_content`, prefix reuse 71 then 1,093 cached ids, and the third turn correctly repeated the list the first one gave |
+| an image turn with thinking on | 1 image, 64 visual tokens, `[vit-chat] … vision 186.6 ms`, 91 reasoning chunks, answer `Blue` |
+| the image regression set | `tools/vit-colorprobe.py` 10 of 10 rows as expected, unchanged by this commit |
+| a tool round with thinking on | `finish tool_calls`, 20 reasoning chunks then 13 tool chunks, `read_file` closed; the turn after the tool result answered from the file |
+| a big `write_file` | thinking OFF: `finish tool_calls`, 418 generated, one call with 1,751 bytes of arguments that parse. Thinking `high` on the SAME task: `finish length` at the 8,192 budget with **8,192 reasoning chunks and no call at all** — 29,771 characters of thought and nothing left for the answer |
+
+- That last row is the cap case, and it ends CLEANLY: `content chunks 0`, `think tags stripped 0`,
+  nothing half-open on the wire, `finish length`. It is also a real warning about `xhigh` on a
+  long tool call at this budget. `reasoning_budget_tokens`, which llama-server has and Crow sends
+  for the GGUF twin, is NOT implemented here; a client that wants `high` on a file-writing turn
+  has to raise `max_tokens` instead. Not in scope for #74.
 
 ### 7.12 The stage A gate table (what was measured, and where the artefact is)
 

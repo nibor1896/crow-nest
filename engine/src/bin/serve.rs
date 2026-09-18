@@ -142,6 +142,7 @@
 //! | `max_tokens` | default 8192 (1024 until 2026-09-18), capped at 32768 |
 //! | `model` | echoed into every chunk, default `crow-nest` |
 //! | `chat_template_kwargs.enable_thinking` | template variable, default false |
+//! | `reasoning_effort` | #74: top level OR `chat_template_kwargs`; `none` and an absent field are the render of record, `low` / `medium` pass through, `high` and `xhigh` both render `xhigh`, anything else is a 400 |
 //! | `temperature` | absent, `null` or `<= 0` is GREEDY (the A4 path); `> 0` samples (#28 A6) |
 //! | `top_p` | nucleus mass, default 0.8 (data sheet); read only when `temperature > 0` |
 //! | `top_k` | candidates kept, default 20 (data sheet); read only when `temperature > 0` |
@@ -222,7 +223,12 @@
 //!
 //! Rendering and generation:
 //!
-//! - `tokenizer::render_chat(messages, tools, add_generation_prompt=true, enable_thinking)`.
+//! - `tokenizer::render_chat_effort(messages, tools, add_generation_prompt=true,
+//!   enable_thinking, reasoning_effort)` - four template variables, no string surgery.
+//! - #74: `reasoning_effort` is DEFINED only for a request that thinks, so a request that
+//!   names no level renders the ids of record and every parity and gate value stands.
+//! - #74: with thinking on the generation prompt ends in `<think>\n`, so `ThinkFilter` starts
+//!   `Inside` for that request - otherwise the reasoning would leave as `content`.
 //! - Greedy decode: `Engine::prefill` gives the first id, `Engine::decode_step` the rest.
 //! - Stops on `sample::EOS_IDS` (`finish_reason` `stop`) or at `max_tokens` (`length`).
 //! - `prompt ids >= n_ctx` answers 413 before any GPU work.
@@ -992,8 +998,18 @@ struct ChatReq {
     stream: bool,
     /// generation budget, `DEFAULT_MAX_TOKENS` when absent
     max_tokens: usize,
-    /// `chat_template_kwargs.enable_thinking`, a template variable
+    /// the RESOLVED thinking switch, a template variable (#74: `reasoning_effort` resolves it
+    /// too, `chat_template_kwargs.enable_thinking` is still the direct door)
     enable_thinking: bool,
+    /// #74: the word THIS template gets as `reasoning_effort`, `None` leaves the variable
+    /// undefined; never `Some` while `enable_thinking` is false, so a non-thinking request
+    /// renders the bytes it rendered before #74
+    reasoning_effort: Option<&'static str>,
+    /// #74: the word the BODY carried, for the `[chat]` line; `None` when it named none
+    reasoning_asked: Option<String>,
+    /// #74: the body named `chat_template_kwargs.enable_thinking`; read by the `[chat]` line
+    /// only, so the `(request)` tag is true for the second door as well
+    kwargs_thinking_sent: bool,
     /// `stream_options.include_usage`: `usage` on the final chunk (#27 A5)
     include_usage: bool,
     /// `timings_per_token`: `timings` on the final chunk (#27 A5)
@@ -1028,6 +1044,85 @@ fn num_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str, d: f32
             .as_f64()
             .map(|x| x as f32)
             .ok_or_else(|| format!("{key} is not a number")),
+    }
+}
+
+/// #74: the words a client may name, in the order the 400 body lists them
+const REASONING_WORDS: &str = "none, low, medium, high, xhigh";
+
+/// - #74: the wire word a client sends -> the word THIS model's template accepts.
+/// - The two vocabularies are not the same one and never were. Crow's ladder for these
+///   weights on llama-server is `none / low / medium / high` (its manifest entry
+///   `flash-next-q2-k-xl`, measured #160), and this template
+///   (`models/Qwen3.8-Flash-Next-original/chat_template.jinja:46-53`) accepts
+///   `xhigh`, `medium`, `low`, defaults to `xhigh` and RAISES on anything else.
+///
+/// | sent | template `reasoning_effort` | `enable_thinking` | why this and not something else |
+/// |---|---|---|---|
+/// | absent | undefined | false, the default of record | the prompt of every parity value, byte for byte |
+/// | `none` | undefined | false | the meaning llama-server gives the TOP-LEVEL field: `none` sets `enable_thinking = false` and DROPS the key (`server-common.cpp:1323`), which is exactly the render above |
+/// | `low` | `low` | true | the template's own word |
+/// | `medium` | `medium` | true | the template's own word |
+/// | `high` | `xhigh` | true | this template has no `high`. On the unsloth template that serves the SAME weights under llama-server, `high` renders byte-identically to the unset key, and the unset key is `xhigh` (Crow's manifest, `flash-next-q2-k-xl` `reasoning_groups` `["off", "high"]`, measured 2026-08-30 #160). So `high -> xhigh` is the step llama-server already gives the word, not a promotion to a dearer one |
+/// | `xhigh` | `xhigh` | true | the template's own top word, reachable under its own name |
+/// | anything else | - | - | 400, naming the five words. `max`, `minimal` and an explicit `off` are fatal on llama-server too (#160), so a silent downgrade would hide a client bug that the reference engine reports |
+///
+/// - `Ok(None)` is `none`: thinking OFF, and no variable, which is the record render.
+/// - Matching is exact and lower case, as llama-server matches it; `High` is a 400.
+fn map_reasoning_effort(word: &str) -> Result<Option<&'static str>, String> {
+    match word {
+        "none" => Ok(None),
+        "low" => Ok(Some("low")),
+        "medium" => Ok(Some("medium")),
+        "high" | "xhigh" => Ok(Some("xhigh")),
+        other => Err(format!(
+            "reasoning_effort \"{other}\" is not one of {REASONING_WORDS} (this model's \
+             template accepts xhigh, medium and low; high is its xhigh and none turns \
+             thinking off)"
+        )),
+    }
+}
+
+/// - #74: the ONE word the request `[chat]` line carries for this request's thinking, and the
+///   same word Crow's manifest calls the step: `off`, or the template word that was rendered.
+/// - `off` is not a level, it is the absence of one - the prompt then carries the CLOSED empty
+///   think block and nothing the model writes is reasoning.
+/// - thinking through the kwargs door alone leaves the variable undefined and the template
+///   takes its own default, which is `xhigh`; the word is the same either way, and which door
+///   asked for it is what the line below says.
+fn thinking_tag(req: &ChatReq) -> &'static str {
+    match (req.enable_thinking, req.reasoning_effort) {
+        (false, _) => "off",
+        (true, Some(w)) => w,
+        (true, None) => "xhigh",
+    }
+}
+
+/// - #74: the provenance line of thinking, in the shape the sampling line of #68 established:
+///   the VALUE, then `(request)` or `(data sheet)` for where it came from.
+/// - `(request)` means the body named a door - the top-level `reasoning_effort`, or
+///   `chat_template_kwargs`; `(data sheet)` means it named neither and this file decided.
+/// - The word the client SENT is quoted when it is not the word the template got, because
+///   `high -> xhigh` is the one place the two vocabularies differ and a line that hid it would
+///   make a step look like a step it is not.
+/// - pure: the test drives it on parsed bodies, no engine and no socket.
+fn thinking_line(req: &ChatReq) -> String {
+    let tag = SamplingSent::tag(req.reasoning_asked.is_some() || req.kwargs_thinking_sent);
+    let asked = match req.reasoning_asked.as_deref() {
+        Some(w) if Some(w) != req.reasoning_effort => format!(", asked as \"{w}\""),
+        _ => String::new(),
+    };
+    if req.enable_thinking {
+        format!(
+            "[chat] thinking on ({tag}): reasoning_effort {}{asked}; the generation prompt \
+             ends in <think> and the reasoning filter starts Inside (#74)",
+            thinking_tag(req)
+        )
+    } else {
+        format!(
+            "[chat] thinking off ({tag}){asked}; the generation prompt carries the closed \
+             empty think block, the render of record (#74)"
+        )
     }
 }
 
@@ -1119,11 +1214,45 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
             (n as usize).min(MAX_MAX_TOKENS)
         }
     };
-    let enable_thinking = obj
-        .get("chat_template_kwargs")
+    // #74: the two doors, and which one wins. `chat_template_kwargs.enable_thinking` is the
+    // direct template variable and was the only one `serve` read until today; the TOP-LEVEL
+    // `reasoning_effort` is the door llama-server owns and the one Crow has sent since its
+    // #176. Both are read here, the top-level field first, because that is the order
+    // llama-server resolves them in: it writes its value INTO the kwargs.
+    let kwargs = obj.get("chat_template_kwargs");
+    let kw_thinking = kwargs
         .and_then(|k| k.get("enable_thinking"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        .and_then(|v| v.as_bool());
+    let asked = match obj.get("reasoning_effort") {
+        None | Some(serde_json::Value::Null) => kwargs
+            .and_then(|k| k.get("reasoning_effort"))
+            .filter(|v| !v.is_null()),
+        Some(v) => Some(v),
+    };
+    let reasoning_asked = match asked {
+        None => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or_else(|| format!("reasoning_effort is not a string (one of {REASONING_WORDS})"))?
+                .to_string(),
+        ),
+    };
+    // a word the engine does not have is a 400 BEFORE any GPU work, never a silent downgrade
+    let mapped = match reasoning_asked.as_deref() {
+        Some(w) => Some(map_reasoning_effort(w)?),
+        None => None,
+    };
+    // `enable_thinking` stays the last word when the body spells it out: that is what
+    // llama-server does with the pair (it sets the kwarg and never overwrites an explicit
+    // false), and it keeps the digest path of `crow_core.py:2970` exactly as it was.
+    let (enable_thinking, reasoning_effort) = match mapped {
+        None => (kw_thinking.unwrap_or(false), None),
+        Some(None) => (false, None),
+        Some(word) => (kw_thinking.unwrap_or(true), word),
+    };
+    // a request that does not think never carries the variable, so its prompt is the prompt
+    // of record whatever word the body named
+    let reasoning_effort = if enable_thinking { reasoning_effort } else { None };
     let model = obj
         .get("model")
         .and_then(|v| v.as_str())
@@ -1177,6 +1306,9 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         stream,
         max_tokens,
         enable_thinking,
+        reasoning_effort,
+        reasoning_asked,
+        kwargs_thinking_sent: kw_thinking.is_some(),
         include_usage,
         timings_per_token,
         temperature,
@@ -1540,6 +1672,27 @@ struct ThinkFilter {
 impl ThinkFilter {
     fn new() -> Self {
         ThinkFilter::default()
+    }
+
+    /// - #74: the filter of a THINKING request, and the whole reason `Lead` was not enough.
+    /// - With `enable_thinking` true the generation prompt already ENDS in `<think>\n`
+    ///   (`chat_template.jinja:167`), so the model is inside the block at its first token and
+    ///   will never open one. A filter that started in `Lead` would stream the reasoning as
+    ///   `content` and then DROP the model's own `</think>` as a stray - the answer would
+    ///   carry the thinking, and Crow would store it and re-send it every turn (7.11.16).
+    /// - It starts where the PROMPT put it, so the first `</think>` closes the block, the
+    ///   `\n\n` after it is trimmed, and the answer starts at the first real character.
+    fn inside() -> Self {
+        ThinkFilter { state: Think::Inside, ..ThinkFilter::default() }
+    }
+
+    /// the filter THIS request needs: `enable_thinking` decides where the text starts
+    fn for_request(enable_thinking: bool) -> Self {
+        if enable_thinking {
+            ThinkFilter::inside()
+        } else {
+            ThinkFilter::new()
+        }
     }
 
     /// how many `<think>` / `</think>` tags this filter kept off the wire
@@ -2548,7 +2701,16 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
         log_messages_400(&e, &req.messages);
         return respond_json(stream, "400 Bad Request", &error_json(&e));
     }
-    let ids = match tk.encode_chat(&msgs, req.tools.as_ref(), true, req.enable_thinking) {
+    // #74: `reasoning_effort` rides as the fourth template variable. It is `None` for every
+    // request that does not think, so the ids of a request that names neither door are the
+    // ids of record.
+    let ids = match tk.encode_chat_effort(
+        &msgs,
+        req.tools.as_ref(),
+        true,
+        req.enable_thinking,
+        req.reasoning_effort,
+    ) {
         Ok(v) => v,
         Err(e) => {
             // a render that still fails is a shape `check_messages` does not know: the dump
@@ -2864,6 +3026,9 @@ fn chat_generate(
             req.min_p
         );
     }
+    // #74: one line per request that says whether it thought, at which level, and whether the
+    // value came from the body - the same provenance shape the two sampling lines above carry
+    tracing::info!(target: "chat", "{}", thinking_line(req));
 
     // #29 A7: the tool-call parser of THIS request. `tool_open` is the id the decode loop
     // arms it with; without that id the literal text `<tool_call>` stays content.
@@ -2872,7 +3037,7 @@ fn chat_generate(
     // #67: the reasoning filter of THIS request. It sees `Emit::Content` only, it holds a
     // partial `</think` back across deltas, and it never touches an id: the loop below
     // samples and pushes the same ids it pushed before this filter existed.
-    let mut think = ThinkFilter::new();
+    let mut think = ThinkFilter::for_request(req.enable_thinking);
     let mut counts = Chunks::default();
 
     // the id/created/model triple of this response, once
@@ -2990,8 +3155,15 @@ fn chat_generate(
     if think.stripped() > 0 {
         tracing::info!(target: "chat",
             "[chat] reasoning filter: {} <think>/</think> tag(s) stripped from the content \
-             (#67); the generated ids are untouched",
-            think.stripped()
+             (#67); the generated ids are untouched{}",
+            think.stripped(),
+            // #74: a thinking request OWES one of them - the close of the block its prompt
+            // opened. A non-thinking request owes none, and every one is the stray of #67.
+            if req.enable_thinking {
+                ", and this request was thinking, so one of them is its own </think>"
+            } else {
+                ""
+            }
         );
     }
     // TASK K: the invariant, checked where it is PRODUCED. `toolcall` guarantees that the
@@ -3090,12 +3262,13 @@ fn chat_generate(
         (true, true)
     };
     tracing::info!(target: "chat",
-        "[chat] prompt {} tok ({cached_n} cached, {prefilled} prefilled), generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {}, reasoning chunks {}, tool chunks {}, think tags stripped {}, tool calls {}, usage {}, timings {}, crow_trickle_swaps {trickle_swaps}{}{}",
+        "[chat] prompt {} tok ({cached_n} cached, {prefilled} prefilled), generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {}, reasoning chunks {}, thinking {}, tool chunks {}, think tags stripped {}, tool calls {}, usage {}, timings {}, crow_trickle_swaps {trickle_swaps}{}{}",
         ids.len(),
         per_second(prefilled, prefill_ms),
         (gen.saturating_sub(1)) as f64 * 1000.0 / decode_ms.max(1e-9),
         counts.content,
         counts.reasoning,
+        thinking_tag(req),
         counts.tool,
         think.stripped(),
         ts.closed(),
@@ -5174,10 +5347,16 @@ mod tests {
     /// and return the concatenated `(content, reasoning, tags stripped)` of each run once -
     /// every split must give the same answer, which is the whole point of the hold back
     fn filtered(text: &str) -> (String, String, usize) {
+        filtered_from(false, text)
+    }
+
+    /// #74: the same sweep with the start state of a request that DOES think - the prompt
+    /// opened the block, so the filter starts `Inside` and nothing will open one
+    fn filtered_from(enable_thinking: bool, text: &str) -> (String, String, usize) {
         let chars: Vec<char> = text.chars().collect();
         let mut first: Option<(String, String, usize)> = None;
         for step in 1..=chars.len().max(1) {
-            let mut f = ThinkFilter::new();
+            let mut f = ThinkFilter::for_request(enable_thinking);
             let (mut content, mut reasoning) = (String::new(), String::new());
             for piece in chars.chunks(step) {
                 let piece: String = piece.iter().collect();
@@ -5406,6 +5585,297 @@ mod tests {
             {"role": "assistant", "content": "there"}
         ]);
         assert_eq!(normalize_messages(&clean), (clean.clone(), Vec::new()));
+    }
+
+    // ---- #74: thinking, the two doors, the mapping and the filter's start (2026-09-18) ----
+
+    /// The whole wire contract of `reasoning_effort` on one screen: which door was read,
+    /// what the template gets, what stays off, and which word is a 400. Every row of the
+    /// table on `map_reasoning_effort` is here.
+    #[test]
+    fn the_two_doors_of_reasoning_effort_resolve_to_the_mapping_of_record() {
+        let body = |extra: &str| -> Vec<u8> {
+            format!("{{\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]{extra}}}")
+                .into_bytes()
+        };
+        // what the client sent -> (enable_thinking, the template word)
+        let rows: [(&str, bool, Option<&str>); 12] = [
+            // nothing at all: the default of record, both doors silent
+            ("", false, None),
+            // the TOP-LEVEL door, the one Crow has used since its #176
+            (",\"reasoning_effort\":\"none\"", false, None),
+            (",\"reasoning_effort\":\"low\"", true, Some("low")),
+            (",\"reasoning_effort\":\"medium\"", true, Some("medium")),
+            (",\"reasoning_effort\":\"high\"", true, Some("xhigh")),
+            (",\"reasoning_effort\":\"xhigh\"", true, Some("xhigh")),
+            // an explicit null is an absent field, as everywhere else in this parser
+            (",\"reasoning_effort\":null", false, None),
+            // the KWARGS door, the one this file has always read
+            (",\"chat_template_kwargs\":{\"enable_thinking\":true}", true, None),
+            (",\"chat_template_kwargs\":{\"enable_thinking\":false}", false, None),
+            (",\"chat_template_kwargs\":{\"reasoning_effort\":\"medium\"}", true, Some("medium")),
+            // both doors: the top-level one is read first, as llama-server reads it
+            (
+                ",\"reasoning_effort\":\"low\",\"chat_template_kwargs\":{\"reasoning_effort\":\"medium\"}",
+                true,
+                Some("low"),
+            ),
+            // an explicit `enable_thinking: false` still wins - it is the direct variable,
+            // and llama-server's own `none` is the only thing that overrules a level
+            (
+                ",\"reasoning_effort\":\"high\",\"chat_template_kwargs\":{\"enable_thinking\":false}",
+                false,
+                None,
+            ),
+        ];
+        for (extra, thinking, effort) in rows {
+            let r = parse_chat(&body(extra)).unwrap_or_else(|e| panic!("{extra:?}: {e}"));
+            assert_eq!(r.enable_thinking, thinking, "enable_thinking for {extra:?}");
+            assert_eq!(r.reasoning_effort, effort, "reasoning_effort for {extra:?}");
+            // the variable is NEVER defined while thinking is off, so a non-thinking
+            // request renders the prompt of record whatever word it named
+            assert!(thinking || r.reasoning_effort.is_none(), "{extra:?}");
+        }
+        // a word this engine does not have is a 400 that NAMES the five, before any GPU work
+        for bad in ["max", "minimal", "off", "High", "XHIGH", "", "none ", "xhigh2"] {
+            let raw = body(&format!(",\"reasoning_effort\":\"{bad}\""));
+            let e = parse_chat(&raw).expect_err("{bad} must be a 400");
+            assert!(e.starts_with("reasoning_effort "), "{bad}: {e}");
+            assert!(e.contains(REASONING_WORDS), "{bad}: {e}");
+        }
+        // a non-string is a 400 too, with the same list
+        let e = parse_chat(&body(",\"reasoning_effort\":3")).expect_err("a number is a 400");
+        assert!(e.contains(REASONING_WORDS), "{e}");
+        // the mapping itself, word for word
+        assert_eq!(map_reasoning_effort("none"), Ok(None));
+        assert_eq!(map_reasoning_effort("low"), Ok(Some("low")));
+        assert_eq!(map_reasoning_effort("medium"), Ok(Some("medium")));
+        assert_eq!(map_reasoning_effort("high"), Ok(Some("xhigh")));
+        assert_eq!(map_reasoning_effort("xhigh"), Ok(Some("xhigh")));
+    }
+
+    /// The line the whole issue rests on: a request that names NEITHER door renders the ids
+    /// of record, byte for byte. Every parity value, every gate value and every prefix-cache
+    /// hit of a running session depend on this, so it is asserted against the frozen oracle
+    /// ids and not against a second call.
+    #[test]
+    fn a_request_that_names_no_level_renders_the_ids_of_record() {
+        let tk = tk();
+        let msgs = crow_nest_engine::tokenizer::user_message("Hello");
+        // the oracle of `tokenizer.rs`: transformers 5.16.1, enable_thinking=False
+        const ORACLE: [u32; 13] =
+            [248045, 846, 198, 9419, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271];
+        let plain = parse_chat(br#"{"messages":[{"role":"user","content":"Hello"}]}"#).unwrap();
+        let ids = tk
+            .encode_chat_effort(&msgs, None, true, plain.enable_thinking, plain.reasoning_effort)
+            .unwrap();
+        assert_eq!(ids, ORACLE.to_vec());
+        // `none` is the same prompt: that is what makes it the word for "do not think"
+        let none = parse_chat(
+            br#"{"messages":[{"role":"user","content":"Hello"}],"reasoning_effort":"none"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            tk.encode_chat_effort(&msgs, None, true, none.enable_thinking, none.reasoning_effort)
+                .unwrap(),
+            ORACLE.to_vec()
+        );
+        // a level does move the prompt, and it ends INSIDE the block, not after a closed one
+        for (word, len_differs) in [("low", true), ("medium", true), ("high", true)] {
+            let raw = format!(
+                "{{\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}],\"reasoning_effort\":\"{word}\"}}"
+            );
+            let r = parse_chat(raw.as_bytes()).unwrap();
+            let s = tk
+                .render_chat_effort(&msgs, None, true, r.enable_thinking, r.reasoning_effort)
+                .unwrap();
+            assert!(s.ends_with("<|im_start|>assistant\n<think>\n"), "{word}: {s}");
+            assert!(!s.contains("</think>"), "{word}: {s}");
+            let ids = tk
+                .encode_chat_effort(&msgs, None, true, r.enable_thinking, r.reasoning_effort)
+                .unwrap();
+            assert_eq!(ids != ORACLE.to_vec(), len_differs, "{word}");
+        }
+    }
+
+    /// The `[chat]` line has to say whether the request thought, at which level, and whether
+    /// the body asked for it - the provenance shape #68 gave the sampling line.
+    #[test]
+    fn the_chat_line_says_whether_the_request_thought_and_who_asked() {
+        let parse = |extra: &str| -> ChatReq {
+            let raw =
+                format!("{{\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]{extra}}}");
+            parse_chat(raw.as_bytes()).unwrap()
+        };
+        // nothing asked: off, and this file decided it
+        let d = parse("");
+        assert_eq!(thinking_tag(&d), "off");
+        assert!(thinking_line(&d).starts_with("[chat] thinking off (data sheet);"), "{}", thinking_line(&d));
+        // `none`: still off, but the CLIENT chose it
+        let n = parse(",\"reasoning_effort\":\"none\"");
+        assert_eq!(thinking_tag(&n), "off");
+        let l = thinking_line(&n);
+        assert!(l.starts_with("[chat] thinking off (request)"), "{l}");
+        assert!(l.contains("asked as \"none\""), "{l}");
+        // `high`: on, and the line says BOTH words, because they are not the same word
+        let h = parse(",\"reasoning_effort\":\"high\"");
+        assert_eq!(thinking_tag(&h), "xhigh");
+        let l = thinking_line(&h);
+        assert!(l.starts_with("[chat] thinking on (request): reasoning_effort xhigh, asked as \"high\""), "{l}");
+        assert!(l.contains("the reasoning filter starts Inside"), "{l}");
+        // a word the template owns is not repeated back
+        let m = parse(",\"reasoning_effort\":\"medium\"");
+        assert_eq!(thinking_tag(&m), "medium");
+        assert!(!thinking_line(&m).contains("asked as"), "{}", thinking_line(&m));
+        // the kwargs door alone: on, from the request, and the template's own default
+        let k = parse(",\"chat_template_kwargs\":{\"enable_thinking\":true}");
+        assert_eq!(thinking_tag(&k), "xhigh");
+        assert!(thinking_line(&k).starts_with("[chat] thinking on (request): reasoning_effort xhigh;"), "{}", thinking_line(&k));
+        assert_eq!(SamplingSent::tag(true), "request");
+    }
+
+    /// #74's half of the reasoning filter: with thinking on, the PROMPT opened the block, so
+    /// the filter starts `Inside`. Started in `Lead` the reasoning would go out as `content`
+    /// and the model's own `</think>` would be dropped as a stray - the answer would carry the
+    /// thinking, and Crow would store and re-send it every turn (7.11.16).
+    #[test]
+    fn a_thinking_stream_starts_inside_the_block_the_prompt_opened() {
+        // what a thinking generation really looks like: no opening tag, it is in the prompt
+        let text = "The user asks for a colour.
+Red is #FF0000.
+</think>
+
+The hex is #FF0000.";
+        let (content, reasoning, stripped) = filtered_from(true, text);
+        assert_eq!(content, "The hex is #FF0000.");
+        assert_eq!(reasoning, "The user asks for a colour.
+Red is #FF0000.
+");
+        assert_eq!(stripped, 1);
+        assert!(!content.contains(THINK_OPEN) && !content.contains(THINK_CLOSE));
+        assert!(!reasoning.contains(THINK_CLOSE));
+        // the SAME bytes through the filter of a non-thinking request: this is the bug
+        let (bad_content, bad_reasoning, _) = filtered_from(false, text);
+        assert!(bad_content.starts_with("The user asks for a colour."), "{bad_content}");
+        assert_eq!(bad_reasoning, "");
+        // a second `</think>` later in the answer is still the stray of #67
+        let (content, _, stripped) = filtered_from(true, "t
+</think>
+
+A</think>B");
+        assert_eq!(content, "AB");
+        assert_eq!(stripped, 2);
+        // a `<think>` INSIDE the reasoning is ordinary reasoning text, not a second block
+        let (content, reasoning, stripped) =
+            filtered_from(true, "I will write <think> here
+</think>
+
+Done.");
+        assert_eq!(content, "Done.");
+        assert_eq!(reasoning, "I will write <think> here
+");
+        assert_eq!(stripped, 1);
+    }
+
+    /// `max_tokens` covers thinking PLUS answer, so a budget that runs out mid-thought is an
+    /// ordinary `finish length` - and nothing half-open may reach the wire. Both request
+    /// forms, because the document is the same filter with a different sink.
+    #[test]
+    fn a_thinking_request_that_hits_the_cap_ends_without_a_half_open_tag() {
+        // the block never closed: every byte is reasoning, the answer is empty
+        let (content, reasoning, stripped) = filtered_from(true, "still weighing the two option");
+        assert_eq!(content, "");
+        assert_eq!(reasoning, "still weighing the two option");
+        assert_eq!(stripped, 0);
+        // the budget ended INSIDE a tag the filter was holding back: it is text, and it
+        // leaves as reasoning, so no byte is lost and no tag is invented
+        let (content, reasoning, stripped) = filtered_from(true, "nearly done
+</thin");
+        assert_eq!(content, "");
+        assert_eq!(reasoning, "nearly done
+</thin");
+        assert_eq!(stripped, 0);
+        // the `stream:false` document of that same request: reasoning in its own field,
+        // `content` an empty string, `finish_reason` length
+        let t = b3a_timing();
+        let d = completion_json(
+            &ChunkCtx::new("chatcmpl-74", 74, "crow-nest"),
+            "",
+            &reasoning,
+            &[],
+            "length",
+            &t,
+        );
+        let m = &d["choices"][0]["message"];
+        assert_eq!(m["content"], "");
+        assert_eq!(m["reasoning_content"], "nearly done
+</thin");
+        assert_eq!(d["choices"][0]["finish_reason"], "length");
+        assert!(!d.to_string().contains("</think>"));
+        // and the ordinary thinking document: answer in `content`, thought beside it
+        let d = completion_json(
+            &ChunkCtx::new("chatcmpl-74", 74, "crow-nest"),
+            "The hex is #FF0000.",
+            "Red is #FF0000.
+",
+            &[],
+            "stop",
+            &t,
+        );
+        let m = &d["choices"][0]["message"];
+        assert_eq!(m["content"], "The hex is #FF0000.");
+        assert_eq!(m["reasoning_content"], "Red is #FF0000.
+");
+    }
+
+    /// The history side, through the REAL template: a stored assistant turn carrying
+    /// `reasoning_content` renders into the template's OWN think block, and the next
+    /// generation prompt still ends where the filter expects it to.
+    #[test]
+    fn a_history_with_reasoning_content_renders_into_the_templates_own_think_block() {
+        let tk = tk();
+        let msgs = serde_json::json!([
+            {"role": "user", "content": "What colour?"},
+            {"role": "assistant", "content": "Red is #FF0000.",
+             "reasoning_content": "The user asks for a colour."},
+            {"role": "user", "content": "And blue?"}
+        ]);
+        let (n, notes) = normalize_messages(&msgs);
+        // nothing to repair: `reasoning_content` is the template's own field (7.11.16)
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(n, msgs);
+        let s = tk.render_chat_effort(&n, None, true, true, Some("xhigh")).unwrap();
+        assert!(
+            s.contains("<|im_start|>assistant
+<think>
+The user asks for a colour.
+</think>
+
+Red is #FF0000.<|im_end|>"),
+            "{s}"
+        );
+        // the stored thought is NOT repeated into the answer, and the answer is not in the block
+        assert_eq!(s.matches("The user asks for a colour.").count(), 1, "{s}");
+        // the generation prompt still opens the block the filter starts inside
+        assert!(s.ends_with("<|im_start|>assistant
+<think>
+"), "{s}");
+        assert!(s.contains("Reasoning effort is set to xhigh."), "{s}");
+        // the same history without thinking renders the closed empty block, as it always did
+        let off = tk.render_chat(&n, None, true, false).unwrap();
+        assert!(off.ends_with("<|im_start|>assistant
+<think>
+
+</think>
+
+"), "{off}");
+        assert!(!off.contains("Reasoning effort is set to"), "{off}");
+        // and the assistant turn of the history keeps its own think block either way
+        assert!(off.contains("<think>
+The user asks for a colour.
+</think>
+
+Red is #FF0000."), "{off}");
     }
 
     #[test]

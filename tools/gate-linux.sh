@@ -181,6 +181,22 @@
 #                              error - these pin the layout the symptom IMITATED, so the
 #                              suspect it looked like stays cleared. 221 = 128 lib + 82 serve
 #                              + 6 parity + 5 decode.
+#   tests 221 -> 228           #74 (2026-09-18) adds ONE library test in `tokenizer.rs` and SIX in
+#                              `bin/serve.rs` for the thinking path, all pure - the template and
+#                              the tokenizer, no GPU and no model. `tokenizer.rs`: the third
+#                              template variable, with UNDEFINED as the render of record (the
+#                              template's own `xhigh` default), `low` and `medium` as their own
+#                              renders, the words THIS template does not have (`high`, `none`,
+#                              `max`) raising, and thinking OFF rendering the same bytes for
+#                              every word. `bin/serve.rs`: the twelve-row resolution table of
+#                              the two doors plus the eight refusals, the ids of record for a
+#                              request that names no level (against the frozen oracle ids, not
+#                              against a second call), the `[chat]` provenance line, the filter
+#                              starting `Inside` for a thinking request (with the same bytes
+#                              through a `Lead` filter as the negative control - that is the
+#                              bug), the budget that runs out mid-thought in both request
+#                              forms, and a stored `reasoning_content` through the REAL
+#                              template. So 228 = 129 lib + 88 serve + 6 parity + 5 decode.
 #   clippy 1421                #13 (2026-09-18) LOWERED the count of record by one, and by
 #                              exactly one: `warning: redundant reference in `eprintln!`
 #                              argument` at `gen.rs:2890` is gone because that line is a
@@ -211,7 +227,7 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="221"
+TESTS="228"
 CLIPPY="1421"
 
 red=0

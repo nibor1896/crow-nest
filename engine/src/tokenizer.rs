@@ -18,6 +18,11 @@
 //! - `apply_chat_template(messages, add_generation_prompt=True, tokenize=True, enable_thinking=False)`.
 //! - `add_generation_prompt` and `enable_thinking` are TEMPLATE VARIABLES, not string surgery.
 //! - `tools` and `documents` are passed as template variables too (`none` when absent).
+//! - #74: `reasoning_effort` is a template variable as well, and it is DEFINED only when the
+//!   request named a level. Left UNDEFINED the template takes its own default (`xhigh` here),
+//!   which is what every render before #74 got - `none` is not a value this variable can carry,
+//!   because `reasoning_effort|default('xhigh')` would keep a `none` and the template's own
+//!   `not in ('xhigh', 'medium', 'low')` would then raise.
 //! - `apply_chat_template` tokenizes the rendered string with `add_special_tokens=False`.
 //! - Raw mode: `tok(text, add_special_tokens=False)["input_ids"]`.
 //!
@@ -286,12 +291,33 @@ impl ChatTokenizer {
     /// - `tools` is passed through as the template variable `tools` (`none` when `None`)
     /// - `add_generation_prompt` and `enable_thinking` are template variables
     /// - `documents` is `none`, as `render_jinja_template` passes it
+    /// - the render of record: no `reasoning_effort` variable, so the template's own default
+    ///   applies and the bytes are the bytes every parity and gate value was measured on
     pub fn render_chat(
         &self,
         messages: &Value,
         tools: Option<&Value>,
         add_generation_prompt: bool,
         enable_thinking: bool,
+    ) -> Result<String, String> {
+        self.render_chat_effort(messages, tools, add_generation_prompt, enable_thinking, None)
+    }
+
+    /// - #74: the same render with the template variable `reasoning_effort` DEFINED.
+    /// - `None` leaves it UNDEFINED, which is the render of record above: a defined `none`
+    ///   would survive `|default('xhigh')` and raise on the template's own level check.
+    /// - `Some(word)` must be a word THIS template accepts (`xhigh`, `medium`, `low`); the
+    ///   mapping from what a client may send lives in `bin/serve.rs` (`map_reasoning_effort`),
+    ///   because it is a wire contract and not a tokenizer one.
+    /// - the variable is read by the template ONLY inside `enable_thinking is undefined or
+    ///   is true`, so it cannot move a byte of a request that does not think.
+    pub fn render_chat_effort(
+        &self,
+        messages: &Value,
+        tools: Option<&Value>,
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+        reasoning_effort: Option<&str>,
     ) -> Result<String, String> {
         let tmpl = self
             .env
@@ -306,6 +332,10 @@ impl ChatTokenizer {
             documents => JVal::from(()),
             add_generation_prompt => add_generation_prompt,
             enable_thinking => enable_thinking,
+            reasoning_effort => match reasoning_effort {
+                Some(e) => JVal::from(e),
+                None => JVal::UNDEFINED,
+            },
         };
         tmpl.render(ctx)
             .map_err(|e| format!("chat template render failed: {e:#}"))
@@ -319,7 +349,25 @@ impl ChatTokenizer {
         add_generation_prompt: bool,
         enable_thinking: bool,
     ) -> Result<Vec<u32>, String> {
-        let s = self.render_chat(messages, tools, add_generation_prompt, enable_thinking)?;
+        self.encode_chat_effort(messages, tools, add_generation_prompt, enable_thinking, None)
+    }
+
+    /// #74: `render_chat_effort` then the same encode; the server's product path
+    pub fn encode_chat_effort(
+        &self,
+        messages: &Value,
+        tools: Option<&Value>,
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+        reasoning_effort: Option<&str>,
+    ) -> Result<Vec<u32>, String> {
+        let s = self.render_chat_effort(
+            messages,
+            tools,
+            add_generation_prompt,
+            enable_thinking,
+            reasoning_effort,
+        )?;
         self.encode_raw(&s)
     }
 
@@ -488,6 +536,50 @@ mod tests {
         // no generation prompt: the render stops after the user turn
         let off = t.render_chat(&m, None, false, false).unwrap();
         assert_eq!(off, "<|im_start|>user\nHello<|im_end|>\n");
+    }
+
+    /// #74: the third template variable. UNDEFINED is the render of record - the template's
+    /// own `reasoning_effort|default('xhigh')` then picks `xhigh`, which is what every render
+    /// before #74 got; a DEFINED word renders that word's instruction instead. The two words
+    /// this template does not have (`high`, `none`) are mapped away in `bin/serve.rs` and
+    /// would raise here, which is asserted so the mapping cannot quietly stop being needed.
+    #[test]
+    fn reasoning_effort_is_a_template_variable_and_undefined_is_the_default() {
+        let t = tk();
+        let m = user_message("Hello");
+        const XHIGH: &str = "Reasoning effort is set to xhigh.";
+        const LOW: &str = "Reasoning effort is set to low.";
+        // thinking on, nothing named: the template's own default, and the SAME bytes as
+        // the `render_chat` of record
+        let dflt = t.render_chat(&m, None, true, true).unwrap();
+        assert_eq!(dflt, t.render_chat_effort(&m, None, true, true, None).unwrap());
+        assert!(dflt.contains(XHIGH), "{dflt}");
+        // `xhigh` named explicitly renders exactly what the absent variable renders
+        assert_eq!(dflt, t.render_chat_effort(&m, None, true, true, Some("xhigh")).unwrap());
+        // the two steps below it are their own renders
+        let low = t.render_chat_effort(&m, None, true, true, Some("low")).unwrap();
+        assert!(low.contains(LOW) && !low.contains(XHIGH), "{low}");
+        let med = t.render_chat_effort(&m, None, true, true, Some("medium")).unwrap();
+        // medium writes no reasoning sentence at all, which is why it is the cheapest step
+        assert!(!med.contains("Reasoning effort is set to"), "{med}");
+        assert_ne!(low, med);
+        assert_ne!(dflt, med);
+        // every one of them still opens the block the generation continues in
+        for s in [&dflt, &low, &med] {
+            assert!(s.ends_with("<|im_start|>assistant\n<think>\n"), "{s}");
+        }
+        // words THIS template does not have raise, which is what the wire mapping is for
+        for bad in ["high", "none", "max"] {
+            let e = t
+                .render_chat_effort(&m, None, true, true, Some(bad))
+                .expect_err("the template refuses {bad}");
+            assert!(e.contains("Unexpected reasoning effort"), "{bad}: {e}");
+        }
+        // thinking OFF reads the variable on no branch, so a named level moves no byte
+        let off = t.render_chat(&m, None, true, false).unwrap();
+        for w in [None, Some("low"), Some("xhigh"), Some("max")] {
+            assert_eq!(off, t.render_chat_effort(&m, None, true, false, w).unwrap(), "{w:?}");
+        }
     }
 
     #[test]
