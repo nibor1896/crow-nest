@@ -62,7 +62,15 @@ pub struct Sampler {
     /// CROW_SEED as given (the record names it, so a sampled answer is reproducible)
     pub seed: u64,
     pub rng: Rng,
-    /// tokens generated so far in this answer (presence penalty applies to them)
+    /// tokens generated so far in THIS answer - the whole presence-penalty set (#68).
+    ///
+    /// Scope, pinned by `the_penalty_set_is_this_answers_tokens_only` below and by the device
+    /// twin (`gen::enable_dev_sampler` uploads a zeroed mask per request, `kernels.rs sample_k`
+    /// sets `mask[tok] = 1` for the token it just drew): the PROMPT is never in it, an earlier
+    /// turn of the same session is never in it, and there is no last-n window. That is the
+    /// semantics the model card's `presence_penalty` is written in (HF / vLLM, the penalty over
+    /// the tokens generated in this response), not llama.cpp's windowed `repeat_penalty` over
+    /// prompt plus generation.
     seen: std::collections::HashSet<usize>,
 }
 
@@ -228,6 +236,41 @@ mod tests {
         s.observe(1);
         assert_eq!(s.sample(&[2.0, 3.0, 1.0]), 0);
     }
+    /// #68: presence, not frequency - a token that was drawn twice is penalized ONCE.
+    ///
+    /// The two readings differ by more than a constant: with logits [0.0, 2.0] and a penalty of
+    /// 1.5, presence leaves token 1 at 0.5 and it still wins; frequency would take 3.0 off it
+    /// and token 0 would win. The device twin stores the set as a `u8` mask, which cannot count.
+    #[test]
+    fn the_presence_penalty_is_applied_once_per_distinct_token() {
+        let mut s = Sampler { temperature: 0.0, top_p: 1.0, top_k: 3, presence_penalty: 1.5, seed: 0, rng: Rng::new(1), seen: Default::default() };
+        s.observe(1);
+        s.observe(1);
+        s.observe(1);
+        assert_eq!(s.sample(&[0.0, 2.0]), 1);
+    }
+
+    /// #68: the set is this answer's own tokens - nothing else is in it.
+    ///
+    /// A fresh sampler penalizes nothing, however large the penalty is, and `Sampler::new` is
+    /// what the server builds per request (`bin/serve.rs` `sampler_from`), so a 300-turn session
+    /// on a warm process starts every turn with an empty set. Only `observe` fills it.
+    #[test]
+    fn the_penalty_set_is_this_answers_tokens_only() {
+        let logits = [3.0f32, 1.0, 2.0];
+        let mut fresh = Sampler::new(0);
+        fresh.temperature = 0.0;
+        fresh.presence_penalty = 100.0;
+        assert_eq!(fresh.sample(&logits), 0, "a fresh sampler penalizes nothing");
+        fresh.observe(0);
+        assert_eq!(fresh.sample(&logits), 2, "only an observed token is penalized");
+        // a second request builds a second sampler: the set of the first one is gone
+        let mut next = Sampler::new(0);
+        next.temperature = 0.0;
+        next.presence_penalty = 100.0;
+        assert_eq!(next.sample(&logits), 0);
+    }
+
     #[test]
     fn seeded_is_reproducible() {
         let logits: Vec<f32> = (0..50).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();

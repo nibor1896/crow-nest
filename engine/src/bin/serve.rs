@@ -513,6 +513,30 @@ const DEFAULT_TOP_K: usize = 20;
 const DEFAULT_PRESENCE: f32 = 1.5;
 /// #28: RNG seed when the request carries none; fixed, so warm equals cold (M1)
 const DEFAULT_SEED: u64 = 0;
+
+/// #68: which sampling fields the REQUEST carried, so the `[chat]` line can say per value
+/// whether it came from the client or from the data sheet `serve` fills in.
+///
+/// Why it exists: the live goal-mode session of `#68` was read off that line as "Crow sent
+/// `presence_penalty 1.5`", and Crow has no such field at all - its wire list is
+/// `SAMPLING_FIELDS = ("temperature", "top_p", "min_p", "top_k")` (`crow_core.py:716`,
+/// build of 2026-09-16) and 1.5 is `DEFAULT_PRESENCE` here. A line that cannot be read
+/// that way costs four words; a wrong attribution cost an issue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SamplingSent {
+    top_p: bool,
+    top_k: bool,
+    presence_penalty: bool,
+    seed: bool,
+}
+
+impl SamplingSent {
+    /// what the `[chat]` line writes behind one value
+    fn tag(sent: bool) -> &'static str {
+        if sent { "request" } else { "data sheet" }
+    }
+}
+
 /// the last line of every stream
 const SSE_DONE: &str = "data: [DONE]
 
@@ -942,6 +966,9 @@ struct ChatReq {
     presence_penalty: f32,
     /// #28: RNG seed of this request, `DEFAULT_SEED` when absent
     seed: u64,
+    /// #68: which of `top_p`, `top_k`, `presence_penalty`, `seed` the body carried; read by
+    /// the `[chat]` line only, never by the sampler
+    sampling_sent: SamplingSent,
     /// #28: parsed, ignored, logged; the device sampler has no min_p
     min_p: f32,
     /// #VIT: the `image_url` data URLs of the content blocks, in message order.
@@ -1092,6 +1119,15 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
             .or_else(|| v.as_i64().map(|x| x as u64))
             .ok_or_else(|| "seed is not an integer".to_string())?,
     };
+    // #68: a field counts as SENT when the body carries it as a non-null value - the same
+    // condition every reader above treats as "absent", so the tag cannot disagree with the value
+    let sent = |k: &str| !matches!(obj.get(k), None | Some(serde_json::Value::Null));
+    let sampling_sent = SamplingSent {
+        top_p: sent("top_p"),
+        top_k: sent("top_k"),
+        presence_penalty: sent("presence_penalty"),
+        seed: sent("seed"),
+    };
     Ok(ChatReq {
         model,
         messages: messages.clone(),
@@ -1106,6 +1142,7 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         top_k,
         presence_penalty,
         seed,
+        sampling_sent,
         min_p,
         images,
     })
@@ -2556,9 +2593,22 @@ fn chat_generate(
             srv.eng.unpark_sampler(&mut srv.parked_sampler);
             // unsafe: device uploads and one eager sampler launch, as parity does
             next = unsafe { srv.eng.arm_sampler(s) };
+            // #68: every value says where it came from. `temperature` is the only one that is
+            // always the request's own - without it this branch is not taken at all.
+            let sent = req.sampling_sent;
             eprintln!(
-                "[chat] sampling on the device: temperature {} top_p {} top_k {} presence_penalty {} seed {}",
-                s.temperature, s.top_p, s.top_k, s.presence_penalty, s.seed
+                "[chat] sampling on the device: temperature {} (request) top_p {} ({}) top_k {} ({}) presence_penalty {} ({}) seed {} ({})",
+                s.temperature,
+                s.top_p, SamplingSent::tag(sent.top_p),
+                s.top_k, SamplingSent::tag(sent.top_k),
+                s.presence_penalty, SamplingSent::tag(sent.presence_penalty),
+                s.seed, SamplingSent::tag(sent.seed)
+            );
+            // the penalty set of THIS request: `arm_sampler` clears the device mask and reloads
+            // `Rng::new(seed)`, so no token of the prompt and no token of an earlier turn is in
+            // it, whatever the prefix cache reused (7.11.17)
+            eprintln!(
+                "[chat] presence penalty set: cleared for this request, generated tokens only (#68)"
             );
         }
         None => {
@@ -3707,6 +3757,50 @@ mod tests {
         for b in bad {
             assert!(parse_chat(b).is_err(), "expected a 400 for {}", String::from_utf8_lossy(b));
         }
+    }
+
+    // #68 (2026-09-18): the `[chat]` line has to say per value whether the client named it.
+    // The live goal-mode session was read as "Crow sent presence_penalty 1.5"; Crow's wire list
+    // is `("temperature", "top_p", "min_p", "top_k")` (`crow_core.py:716`) and 1.5 is
+    // `DEFAULT_PRESENCE`, so the request that produced the degeneration carried the model card's
+    // THINKING temperature row and got the NON-thinking penalty from this file.
+    #[test]
+    fn the_sampling_line_says_which_values_the_request_carried() {
+        // what Crow really sends: temperature, top_p, min_p - and nothing else
+        let crow = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "temperature":1.0,"top_p":0.95,"min_p":0.01}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            crow.sampling_sent,
+            SamplingSent { top_p: true, top_k: false, presence_penalty: false, seed: false }
+        );
+        // the values behind the two flags that are false are this file's, not the client's
+        assert_eq!(crow.presence_penalty, DEFAULT_PRESENCE);
+        assert_eq!(crow.seed, DEFAULT_SEED);
+        assert_eq!(crow.top_k, DEFAULT_TOP_K);
+
+        // a body that names every field
+        let full = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "temperature":0.7,"top_p":0.8,"top_k":20,"presence_penalty":1.5,"seed":3}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            full.sampling_sent,
+            SamplingSent { top_p: true, top_k: true, presence_penalty: true, seed: true }
+        );
+
+        // an explicit null is an absent field here too, so the tag never contradicts the value
+        let nulls = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "temperature":1.0,"top_p":null,"top_k":null,"presence_penalty":null,"seed":null}"#,
+        )
+        .unwrap();
+        assert_eq!(nulls.sampling_sent, SamplingSent::default());
+        assert_eq!(SamplingSent::tag(true), "request");
+        assert_eq!(SamplingSent::tag(false), "data sheet");
     }
 
     #[test]

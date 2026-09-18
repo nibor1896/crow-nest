@@ -4,10 +4,12 @@
 - Every item names its issue number in `crow-nest`, or the commit it landed in when the work had no issue.
 - Every number names its date; the machine is `docs/system-landscape.md` unless another one is named.
 
-## v0.3.1 (unreleased) — the reasoning filter
+## v0.3.1 (unreleased) — the reasoning filter, and what the 170k session really was
 
-- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). The machine is the second
-  environment block of `docs/system-landscape.md` unless a row names another one.
+- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Two issues so far: `#67` (the
+  reasoning filter, `667b68b`) and the engine side of `#68` (the long-context measurement, this
+  commit). The machine is the second environment block of `docs/system-landscape.md` unless a row
+  names another one.
 - The crate version field stays `0.1.0`, as it has for every release: this file is the record.
 
 ### Fixed
@@ -72,6 +74,50 @@
   point of the live line, the leading think block, the tool-call fragments the filter must not
   touch, what the real template does with a stored `</think>`, and the normaliser's table.
   `tools/gate-linux.sh` carries the new count with its provenance.
+- `tools/replay-session.py` (`#68`, 2026-09-18): robin's stored goal-mode session replayed against
+  a running `serve` at a chosen context size and with a chosen sampling row. It cuts the
+  574-message conversation of `decode_out/sessions/2026-09-17-goalmode/` after a USER turn, sends
+  it whole the way Crow does (`crow_core.py:3783-3785`), renders `tools` from Crow's own
+  25-function `TOOLS` constant (exec-extracted out of `crow_core.py`, 14,541 B of JSON), feeds the
+  engine's own `tool_calls` back with the live session's own tool results, and re-sends the goal
+  nudge as the next user turn — the shape 105 of the 114 live user turns had. Per round it records
+  prompt tokens (cached / prefilled), the generated text, an echo verdict (32-character shingle
+  overlap with the nudge plus the live marker string), a degeneration verdict in BOTH live forms
+  (one unit repeated inside an answer, and an answer of at most two tokens) and both rates out of
+  `timings`. Three rows are built in: `greedy`, `card` (0.7 / 0.8 / 20 / 1.5) and `crow`
+  (1.0 / 0.95 / 20 / 1.5, seed 0).
+- `tools/longctx-gate.py` (`#68`, 2026-09-18): the long-context quality gate the ten-task gate
+  never had — one agentic session shape (a synthetic `libghost` crate read file by file through
+  `read_file` tool calls, generated from the file index alone so it is byte-stable and cannot
+  drift with the tree), then five probe turns on the same session, greedy, scored the way
+  `docs/ten-tasks.md` scores: three constants planted at ~5 %, ~50 % and ~95 % depth (value plus
+  the file that declares it), the three-value arithmetic across those depths
+  (`5137 + 9281 − 4409 = 10009`), and the one function whose body contradicts its own doc comment.
+  Degeneration is a Fail on its own (`docs/ten-task-expected.md` §1). Recorded expectation, so it
+  can become a standing gate: **>= 4 of 5 Pass and 0 degenerate**.
+- `docs/long-context-goalmode.md` (`#68`, 2026-09-18): the measurement record of the replay, the
+  penalty scope, the quality gate, the cause separation and the open questions.
+- Three tests (`cargo test --release` 171 → **174**, 100 lib + 74 serve): `sample.rs`
+  `the_presence_penalty_is_applied_once_per_distinct_token` (presence and frequency pick DIFFERENT
+  tokens on the test's logits, so it cannot pass under a count-scaled penalty) and
+  `the_penalty_set_is_this_answers_tokens_only` (a fresh `Sampler` penalizes nothing, and
+  `Sampler::new` is what the server builds per request), plus `bin/serve.rs`
+  `the_sampling_line_says_which_values_the_request_carried` (`#68`, 2026-09-18).
+  `tools/gate-linux.sh` carries the new count with its provenance.
+
+### Changed
+
+- The `[chat] sampling on the device` line names the SOURCE of every value (`#68`, 2026-09-18):
+  `temperature 1 (request) top_p 0.95 (request) top_k 20 (data sheet) presence_penalty 1.5 (data
+  sheet) seed 0 (data sheet)`, and a second line says what the penalty applies over
+  (`cleared for this request, generated tokens only`). Why: the live `#68` line was read as
+  "sampling as sent by Crow", and Crow never sent three of those five values — its wire list is
+  `SAMPLING_FIELDS = ("temperature", "top_p", "min_p", "top_k")` (`crow_core.py:716`, build of
+  2026-09-16) and the string `presence_penalty` does not occur in its source at all, so 1.5 was
+  `DEFAULT_PRESENCE` of `bin/serve.rs`. `ChatReq::sampling_sent` (four bools) carries it, a field
+  counts as sent when the body has it as a non-null value — the same condition every reader uses
+  for "absent" — and the sampler never sees the struct. The defaults themselves do not change
+  (`#28` A6 decided them) and nothing on the wire moves.
 
 ### Measured
 
@@ -82,6 +128,63 @@
   `check_readme_dates` 0 offenders. Measured 2026-09-18.
 - `tools/replay-toolcalls.py --think` against this build: 4 rounds, all 200, **0** rounds with a
   reasoning tag in the streamed content. Measured 2026-09-18.
+- `tools/gate-linux.sh` ALL GREEN again at the `#68` commit (2026-09-18) — the same four byte
+  values of record, `cargo test --release` **174** passed / 0 failed (100 lib + 74 serve), clippy
+  **1,422**, `check_env_docs` exit 0 (82 = 82), `check_readme_dates` 0 offenders. The `#68` change
+  is one log line and three tests: nothing it does can reach `decode_step`, the sampler or the id
+  vector, and the gate is what says so in bytes.
+- **The `presence_penalty` scope of `#68`: measured, and there is nothing to fix** (2026-09-18).
+  The penalty set is the tokens THIS request generated and nothing else — `enable_dev_sampler`
+  (`gen.rs:3641`) uploads a zeroed `mask[V]` and `kernels.rs sample_k` sets `mask[tok] = 1` for the
+  token it just drew, so the prompt is never in it, there is no last-n window, a token drawn ten
+  times is penalized once (the mask is a `u8` and cannot count), and `arm_sampler` runs for EVERY
+  sampled request, so turn 300 of a prefix-cached session starts with an empty set. That is the
+  HF/vLLM semantics the card's `presence_penalty` is written in (`probes/p5_STATUS.md:539-545`);
+  llama.cpp's windowed `repeat_penalty` is a different knob and the engine implements none.
+  Greedy arms no sampler at all, which is why the parity ids cannot move under any of this.
+  Consequence recorded with it: `presence_penalty` cannot brake a loop that spans TURNS — the live
+  late answers are ONE token long and the set is empty when that token is drawn.
+- **The `#68` session replayed through `serve`, `tools/replay-session.py`** (2026-09-18, the whole
+  record with every answer is `docs/long-context-goalmode.md`). The stored 574-message history,
+  images stripped, renders as **168,928** prompt ids against the live 178,779:
+
+  | context | sampling row | echo of the nudge | single-token answer |
+  |---|---|---|---|
+  | 120,924 | greedy | 0 of 3 | 0 of 3 |
+  | 120,924 | card 0.7 / 0.8 / 20 / 1.5 | 0 of 3 | 0 of 3 |
+  | 120,924 | Crow 1.0 / 0.95 / 20 / 1.5 seed 0 | 0 of 3 | 0 of 3 |
+  | 168,928 | Crow 1.0 / 0.95 / 20 / 1.5 seed 0 | **1 of 3**, round 0 verbatim | **2 of 3** (`3`, `finish stop`) |
+  | 168,928 | **greedy** | 0 of 3 | **3 of 3** (`3`, 0.54 s per turn) |
+
+  So **both late stages of `#68` reproduce with the `#67` tags gone, and greedy is the worst arm**:
+  the degeneration is neither the reasoning tag nor the sampler. The greedy onset on this history
+  is between **153,755** (healthy: 270 tokens and a `run_command` call) and **163,401** (one token
+  `3`); the live session with its 17 images held to prompt 172,599. Prefill 834 to 923 tok/s cold
+  at these sizes, decode 37 to 48 tok/s at 124k to 169k of context.
+- **The long-context quality gate, `tools/longctx-gate.py`, greedy** (2026-09-18): **5 of 5 Pass,
+  0 degenerate at 104,433** prompt ids (98 files of material) and **4 of 5 Pass, 0 degenerate at
+  178,553** ids (167 files, 669 history messages) — the first quality reading this engine has above
+  16k of context. Decode 35.7 to 42.2 tok/s at 104k and 37.5 to 40.9 tok/s at 178.5k; prefill 894
+  to 908 tok/s cold. The one Fail is the shape such a gate exists for: at 178,553 ids the answer
+  names the right function, the right operator and the right reasoning but puts it in `f166.rs`
+  where the material has `f116.rs` — two digits transposed.
+- **What that means for `#68`** (2026-09-18): a CLEAN agentic history of 178,553 ids, which is the
+  live session's own context size, does NOT degenerate, while robin's history degenerates from
+  about 163k on under greedy. Length is the enabling condition; the content of those tokens — 300
+  churning turns, 105 byte-identical nudges, contradictory half-finished tool output — is the cause.
+  The engine's decode at 178k is not broken.
+- The `#67` filter caught a LIVE tag during the `#68` replay (2026-09-18): on 32 of the 33 requests
+  of that session the `[chat]` line reads `think tags stripped 0`, and on the 33rd (the card row at
+  120,924 ids, a 404-token answer) the model emitted a `</think>` itself mid-answer and the filter
+  removed it — `reasoning chunks 0`, one loud `[chat] reasoning filter` line, the generated ids
+  untouched. The normaliser meanwhile strips exactly **67** stored tags per full-history request,
+  which is the ticket's own count of tagged assistant turns.
+- **Stage 3 of `#68` re-read off the artefact** (2026-09-18): **48 of the 293 answers** of the live
+  session are the single token `3` (id 18) with `finish stop`, the first at prompt 172,599
+  (`serve.log:6139`), 48 of the last 56 answers; 59 answers are at most 3 ids, and 9 of the 273
+  assistant turns repeat the nudge text. The "digit written non-stop" of the report is the client
+  concatenating 48 one-token answers, not one runaway generation — every request is correct on its
+  own, which is why loop detection belongs to the client.
 
 ### Known limitations
 
@@ -93,8 +196,21 @@
 - A `<think>` block the model opens and never closes ends the turn as `reasoning_content` with an
   empty `content`. On a stream that decision cannot be taken back — the reasoning deltas are
   already on the wire — and with `enable_thinking false` the block should not be opened at all.
-- `#68` (the 300-turn degeneration at 178k context) is untouched by this and stays open: the tag
-  was its first stage, not its only one.
+- `#68` (the 300-turn degeneration at 178k context): the tag was its first stage, not its only one.
+  The engine side is measured now (`docs/long-context-goalmode.md`) and what is left is not a
+  `serve` bug — the open items below.
+- The onset of the long-context degeneration is bracketed, not curved (`#68`, 2026-09-18): healthy
+  at 153,755 prompt ids, degenerate at 163,401, under greedy on one history. A proper curve (every
+  10k from 120k to 180k, three turns per point) is about 40 minutes of GPU and was not run.
+- Nothing separates "this model at 170k" from "this quant at 170k" (`#68`, 2026-09-18): CNQ4.5-M
+  has never been compared against a higher-bit container or against llama.cpp above 16k of context.
+- There is no numeric (logit) statement above 1,024 rows: the parity forms are 8, 512, P8 and 1,024
+  rows, and `tools/longctx-gate.py` scores ANSWERS, not bytes. A quality gate is not a parity gate.
+- The engine offers a client no cross-turn repetition signal (`#68`, 2026-09-18). Whether it should
+  — a repeated-answer counter on the `[chat]` line, or a deliberately chosen `repeat_penalty` — is
+  a feature decision for robin, not a bug fix, and it would be the first knob outside the card row.
+- The `#68` replay is text-only: the 17 `image_url` parts of the live history (~11k visual tokens,
+  874 to 1,000 each) are dropped by default, so the image path at 178k context stays unmeasured.
 
 ## 2026-09-17 — v0.3.0: Linux, the host-memory fix, the refactor, and the two prefill floors
 

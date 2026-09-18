@@ -1215,7 +1215,7 @@ Therefore:
 | `temperature` | absent, `null` or `<= 0` is GREEDY; `> 0` samples | `serve.rs:1158` (`sampler_from`) | `crow_core.py:4672-4700` |
 | `top_p` | nucleus mass, default 0.8 (data sheet), read only when `temperature > 0` | `serve.rs:509`, `serve.rs:1158` | `crow_core.py:4672-4700` |
 | `top_k` | default 20 (data sheet), clamped to 64 by the device sampler (`SAMPLE_MAXK`, `engine/src/kernels.rs:3994`), read only when `temperature > 0` | `serve.rs:511`, `serve.rs:1158` | not sent by Crow |
-| `presence_penalty` | default 1.5 (data sheet), read only when `temperature > 0` | `serve.rs:513`, `serve.rs:1158` | not sent by Crow |
+| `presence_penalty` | default 1.5 (data sheet), read only when `temperature > 0` | `serve.rs:513`, `serve.rs:1158` | **never sent by Crow** — the string does not occur in `crow_core.py` (measured 2026-09-18, #68, 7.11.17); the 1.5 of the live `[chat]` line is this default |
 | `seed` | RNG seed of THIS request, default 0, reseeded per request (M1) | `serve.rs:515`, `serve.rs:1158` | not sent by Crow |
 | `min_p` | **ACCEPTED AND IGNORED**, one stderr line per request | `serve.rs:2262` (the stderr line); `sampler_from` (`serve.rs:1158`) carries no `min_p`; `serve.rs` module doc | `crow_core.py:4672-4700` (0.01 at Crow's operating point) |
 | `tools` | rendered as the template variable `tools` | `serve.rs:970`, `tokenizer::render_chat` | `crow_core.py:4672-4700`, `TOOLS` (25 builtin at `crow_core.py:579-838`, frozen at `:846`, plus the `mcp.json` tools added at import, `:841`) |
@@ -1729,6 +1729,58 @@ paste in the first user turn, then three ordinary turns, the whole history re-se
 way Crow does it, and no `tools` at all — the tags are a content-path bug. Every round must answer
 200 with no `<think>` and no `</think>` anywhere in its streamed content.
 
+**7.11.17 The penalty scope, and who sent which sampling value (#68, 2026-09-18)**
+
+`#68` asked whether `presence_penalty 1.5` on the device sampler behaves as the reference at 170k
+of context — "the penalty set is the whole context or the generated tokens?" — because a wrong
+scope at long context can push a model into a digit loop. Measured against the code and against
+the card row this project recorded (`probes/p5_STATUS.md:539-545`, robin's check): **the scope is
+right, there was nothing to fix.**
+
+| question | as built | evidence |
+|---|---|---|
+| the penalty set | the tokens THIS request generated, and nothing else | `gen.rs:3641` `enable_dev_sampler` uploads a zeroed `mask[V]`; `kernels.rs sample_k` sets `mask[tok] = 1` for the token it just drew |
+| the prompt | never in it. The mask is zeroed after `prefill`, before the first `decode_step`; the first token comes from the prefill's last logits row with an empty mask | `gen.rs:443` (`arm_sampler` = `enable_dev_sampler` + `sample_last`) |
+| a last-n window | none, and none is wanted: the card knob is the HF/vLLM `presence_penalty`, not llama.cpp's windowed `repeat_penalty` over prompt plus generation | `sample.rs:1-14`, `probes/p5_STATUS.md:539-545` |
+| presence or frequency | presence: the set is a `u8` mask and cannot count, so a token drawn ten times is penalized once | `kernels.rs` `mask[tok] = 1`, host twin `sample.rs` `seen` |
+| across the turns of a prefix-cached session | reset per request. `arm_sampler` runs for EVERY sampled request, whatever the prefix cache reused, so turn 300 starts with an empty set and `Rng::new(seed)` | `bin/serve.rs:2550-2562` |
+| a greedy request | no penalty at all — the sampler is parked out of the engine and the head ends in `argmax_k`. This is why the parity ids cannot move under any of this | `bin/serve.rs:2567`, `gen.rs:448` |
+
+- Pinned by `sample.rs::the_presence_penalty_is_applied_once_per_distinct_token` (presence and
+  frequency pick DIFFERENT tokens on the test's logits, so the test cannot pass under a
+  count-scaled penalty) and `sample.rs::the_penalty_set_is_this_answers_tokens_only`.
+- Consequence, recorded because `#68` needs it: `presence_penalty` cannot brake a loop that spans
+  TURNS. The live session's late answers are one token long, and the set is empty when that token
+  is drawn, so no penalty value would have changed them.
+
+**Who sent which sampling value.** The live `[chat]` line read
+`temperature 1 top_p 0.95 top_k 20 presence_penalty 1.5 seed 0` and `#68` quoted it as "sampling as
+sent by Crow". Crow's wire list is `SAMPLING_FIELDS = ("temperature", "top_p", "min_p", "top_k")`
+(`crow_core.py:716`, build of 2026-09-16) and the string `presence_penalty` does not occur in its
+source at all: `top_k`, `presence_penalty` and `seed` were `DEFAULT_TOP_K`, `DEFAULT_PRESENCE` and
+`DEFAULT_SEED` of this file. Since `#68` the line says so per value, and one more line names the
+scope:
+
+```text
+[chat] sampling on the device: temperature 1 (request) top_p 0.95 (request) top_k 20 (data sheet) presence_penalty 1.5 (data sheet) seed 0 (data sheet)
+[chat] presence penalty set: cleared for this request, generated tokens only (#68)
+```
+
+- `ChatReq::sampling_sent` (`SamplingSent`, four bools) carries it; a field counts as sent when the
+  body has it as a non-null value, the same condition every reader uses for "absent", so the tag
+  can never disagree with the value. Read by the log line only — the sampler never sees it.
+- Pinned by `bin/serve.rs::the_sampling_line_says_which_values_the_request_carried`.
+- The defaults themselves do NOT change (`#28` A6 decided them): the data sheet's non-thinking row
+  stays what an absent field gets.
+
+**What the long-context replay found** (the whole record is `docs/long-context-goalmode.md`): with
+the `#67` filter active and every stored tag stripped, robin's session replayed at **168,928**
+tokens reproduces both late stages — the nudge echoed verbatim, then single-token `3` answers with
+`finish stop` — under Crow's row AND under **greedy**, while the same history at **120,924** tokens
+answers normally under greedy, the card row and Crow's row alike. The sampler is therefore not the
+cause of the degeneration, and neither is `#67`; the trigger is context length on this model and
+quant. `tools/replay-session.py` and `tools/longctx-gate.py` are the two commands that reproduce it.
+
 ### 7.12 The stage A gate table (what was measured, and where the artefact is)
 
 **Rule: a gate without a log artefact does not count.**
@@ -1765,7 +1817,7 @@ way Crow does it, and no `tools` at all — the tags are a content-path bug. Eve
 | decision | the default stays as built (#28 A6), the request decides: `sampler_from` at `engine/src/bin/serve.rs:1158` |
 | request without `temperature` | greedy, the A4 path; `null` or `<= 0` is the same path (`engine/src/bin/serve.rs:1158`, `sampler_from`) |
 | request with `temperature > 0` | samples; absent fields take the data sheet `top_p` 0.8, `top_k` 20, `presence_penalty` 1.5, `seed` 0 reseeded per request (`engine/src/bin/serve.rs:509-515`) |
-| what a Crow turn gets | sampled at `temperature` 1.0, `top_p` 0.95, `min_p` 0.01 accepted and ignored (`Crow cli/crow_core.py:472`, #28) |
+| what a Crow turn gets | sampled at `temperature` 1.0, `top_p` 0.95, `min_p` 0.01 accepted and ignored (`Crow cli/crow_core.py:472`, #28); `top_k` 20, `presence_penalty` 1.5 and `seed` 0 come from THIS file's defaults, not from Crow (measured 2026-09-18, #68, 7.11.17) |
 | unmeasured | the ten-task gate at Crow's own profile (temperature 1.0, top_p 0.95); the six series ran temp 0.7, top_p 0.8, top_k 20, presence 1.5 (`engine/src/sample.rs:76-81`) |
 | t2b-write-refactor | Fail under greedy after 21 ids (#11), Partial on 6 of 6 sampled seeds (`decode_out/srv-c2-reader.log:214`, #44) |
 
