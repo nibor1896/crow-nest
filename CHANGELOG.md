@@ -6,13 +6,14 @@
 
 ## v0.3.1 (unreleased) — the reasoning filter, and what the 170k session really was
 
-- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Seven issues so far: `#67` (the
+- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Eight issues so far: `#67` (the
   reasoning filter, `667b68b`), the engine side of `#68` (the long-context measurement, `f14e557`),
   `#49` (the ragged hot-set sidecar, `0adbe6a`), `#60` (the `parity` record header per arm, and
   the last two bins that hard-coded the pre-`#51` container, `784bd64`), `#54` (the gone-client
   probe of the `stream:false` path, `20bc121`), `#65` (the bounded retry around the harness's
-  oracle python children, `6b5025e`) and `#64` (F5, the quant package's own self-test and the
-  model card that carries its numbers, this commit). The machine is the
+  oracle python children, `6b5025e`), `#64` (F5, the quant package's own self-test and the
+  model card that carries its numbers, `cea9406`) and `#14` (the living diagrams brought back to
+  HEAD, this commit). The machine is the
   second environment block of `docs/system-landscape.md` unless a row names another one.
 - The crate version field stays `0.1.0`, as it has for every release: this file is the record.
 
@@ -267,6 +268,17 @@
 
 ### Added
 
+- **`docs/diagrams.md` diagram 8, the verification picture** (`#14`, 2026-09-18). The gates had no
+  diagram at all, while three commits of this release built around them: `tools/gate-linux.sh`
+  with its nine items and the two host-side values they pin (`TESTS` 190, `CLIPPY` 1422,
+  architecture 8.7), `decode selftest` behind `tools/selftest.sh` with the `test ! -d models`
+  refusal and the sha256 of the shipped golden (8.10, `#64`), `oracle_child`'s three attempts with
+  the exit code leading the diagnosis (8.9, `#65`), and the three replay commands that reproduce
+  the live bugs of `#67`, `#54` and `#68` (`tools/replay-toolcalls.py --think` / `--gone-client`,
+  `tools/replay-session.py`, `tools/longctx-gate.py`; 7.11.16 to 7.11.18). The 1024-row parity
+  form is drawn outside the script, where 8.7 puts it. Mermaid only, render-checked with
+  `@mermaid-js/mermaid-cli` 11.17.0 like the other seven.
+
 - **The quant package verifies itself, with no originals anywhere near it** (`#64`, F5,
   2026-09-18). Until now the only numeric gates on the container were the layer-wise oracle,
   which needs `models/` and a torch environment, and the parity forms, which need this
@@ -389,6 +401,32 @@
   `tools/gate-linux.sh` carries the new count with its provenance.
 
 ### Changed
+
+- **The living diagrams are current again** (`#14`, 2026-09-18): the eight commits that landed
+  after the 2026-09-12 pass — v0.3.0 (`9f12429`..`487128d`) and the seven v0.3.1 commits — were
+  audited against every diagram in `docs/diagrams.md`, and five were redrawn. **1, system
+  overview**: the loader box says the host pinned budget is derived and the vision reserve is
+  subtracted before N is chosen, the engine box says Linux since 2026-09-17 (`#15`), and the quant
+  package with its travelling `selftest/` golden and the bounded launcher are new boxes (2.1, 7.13,
+  8.8, 8.10). **2, decode path**: the PLE prep names the batched `cnq::Warm` row fetch instead of
+  one mapping fault per row and the trickle box the 8-token re-cut that replaced `#17`'s 16 (7.14),
+  and the sampler box carries the `#68` penalty scope (7.11.17); the three defaults of `#19e`,
+  `#63c` and `#61a`/`#61b` are untouched. **3, VRAM pie**: the 277.3 MB vision reserve is a planned
+  slice now, out of the headroom it used to live in (2.1, 7.13). **4, residency**, renamed
+  "Residency and load": the derived budget with its `/dev/nvidia-uvm` fallback, the two-sided clamp
+  with the reserve in `pending`, the one ascending sweep with `fadvise_consumed`, the `ple`-sparing
+  exit purge, the per-row sidecar rule of `#49` and the PLE row path with `page_runs` and the
+  16-thread reader pool (2.2, 7.14, 8.4, 8.8). **5, serve**, now the whole request path: the
+  normaliser's two jobs, `check_messages` before the render, the `ThinkFilter` and its three states,
+  the sink split with `CollectSink`'s `ClientProbe(POLLRDHUP)` and its baseline, the two
+  sampling-provenance lines, and `guarded` answering a request-scoped allocation failure with a
+  named 503 (7.11.13 to 7.11.18, 7.13, 8.5). Unchanged, with the reason in their status lines: **6,
+  the converter** (no converter stage since 2026-09-02; the container facts that moved are
+  reader-side) and **7, the module graph** (the `use crate::` edges at `cea9406` are edge for edge
+  those of `487128d` — only `sample.rs` and `residency.rs` were touched in the library and
+  everything else landed in a bin, which that graph does not draw). Every box cites the section it
+  renders, each diagram carries the commit it renders, and all eight were rendered locally with
+  `@mermaid-js/mermaid-cli` 11.17.0 before the commit.
 
 - The `[chat] sampling on the device` line names the SOURCE of every value (`#68`, 2026-09-18):
   `temperature 1 (request) top_p 0.95 (request) top_k 20 (data sheet) presence_penalty 1.5 (data
