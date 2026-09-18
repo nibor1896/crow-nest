@@ -385,6 +385,12 @@ pub struct Engine {
     /// #20: device-side sampler (CROW_SAMPLE=1 without CROW_SAMPLE_HOST=1) -
     /// the sample_k node behind argmax_k; its state buffers live here
     dev_sampler: Option<DevSampler>,
+    /// #72: the sampler's buffers, allocated at BOOT and parked here until the
+    /// first sampled request takes them. `Some` = nobody has armed the sampler
+    /// yet; it never goes back in here, because from the first arm on the
+    /// buffers live in `dev_sampler` (or in serve's parked slot, #28).
+    /// `dev_sampler` stays `None` at boot: `decode_step` samples iff it is `Some`.
+    dev_sampler_hold: Option<DevSampler>,
     /// #VIT: the visual tower, loaded only when CROW_VIT is not "0"
     vit: Option<crate::vit::Vit>,
     /// #VIT: the per-request vision plan (embeddings + id map + mrope delta),
@@ -895,19 +901,57 @@ impl Engine {
         // must see the true free VRAM). CROW_VIT=0 skips the load entirely —
         // the text-only placeholder of record. The [vit] boot line appears
         // exactly once per process, naming mode + switch + cap. ----
+        // #72: the reserve is HELD here, not noted. `hold` is off only with
+        // CROW_VIT_RESERVE_MB=0, the documented escape hatch back to the lazy
+        // pre-#72 behaviour (and the old N) for a measurement.
+        let vit_hold = crate::vit::reserve_bytes(cfg.context) > 0;
+        let mut vit_scratch_held = 0u64;
         let vit = if crate::vit::vit_on() {
             log("loading the vit section (27 vision blocks + patch embed + merger) …");
             let before = cuda::total_vram_bytes() - cuda::free_vram_bytes();
-            let vt = crate::vit::Vit::new(cnq);
+            let mut vt = crate::vit::Vit::new(cnq);
             let vit_bytes = cuda::total_vram_bytes() - cuda::free_vram_bytes() - before;
-            println!("[vit] visual tower loaded: mode nvfp4 (f32 tower math), CROW_VIT {} (0 = the text-only placeholder), cap {} patches = {} visual tokens per image, vit weights {:.0} MiB (scratch lazy, allocated on the first image request)",
+            if vit_hold {
+                vt.arm_scratch();
+                vit_scratch_held = crate::vit::scratch_bytes() as u64;
+            }
+            println!("[vit] visual tower loaded: mode nvfp4 (f32 tower math), CROW_VIT {} (0 = the text-only placeholder), cap {} patches = {} visual tokens per image, vit weights {:.0} MiB ({})",
                 env_or_unset("CROW_VIT"),
-                vt.cap, vt.cap / 4, vit_bytes as f64 / MIB);
+                vt.cap, vt.cap / 4, vit_bytes as f64 / MIB,
+                if vit_hold {
+                    format!("scratch held at boot, {:.1} MiB at the patch cap", vit_scratch_held as f64 / MIB)
+                } else {
+                    "scratch lazy, allocated on the first image request (CROW_VIT_RESERVE_MB=0)".to_string()
+                });
             Some(vt)
         } else {
             println!("[vit] visual tower NOT loaded, CROW_VIT 0 (the text-only placeholder of record, /props vision false)");
             None
         };
+        // #72: the interleaved-mrope span tables, at the widest span serve can
+        // ask for (it clamps the budget to n_ctx BEFORE begin_vision, 7.13), so
+        // `begin_vision` never allocates inside a request again. Same rule as the
+        // scratch: taken while the card is empty, counted by the planner as resident.
+        let (mrope_cos, mrope_sin, mrope_rows) = if vit.is_some() && vit_hold {
+            let bytes = cfg.context * ROPE_PAIRS * 4;
+            let what = format!("the interleaved-mrope span tables ({} rows x {ROPE_PAIRS} pairs f32, held at boot)", cfg.context);
+            (cuda::alloc_named(&what, bytes), cuda::alloc_named(&what, bytes), cfg.context)
+        } else {
+            (0, 0, 0)
+        };
+        let vit_mrope_held = if mrope_rows > 0 { crate::vit::mrope_bytes(cfg.context) as u64 } else { 0 };
+        // #72: the device sampler's five buffers (mask [V] u8, rng, params, the two
+        // candidate slices). 0.27 MB, but it was the last VRAM the engine took after
+        // the plan: allocated on the first SAMPLED request, which in a Crow session is
+        // the first request. Held here, handed to `enable_dev_sampler` on demand.
+        let dev_sampler_hold = Some(DevSampler {
+            mask: cuda::alloc_named("the sampler presence mask", V),
+            rng: cuda::alloc_named("the sampler rng state", 8),
+            params: cuda::alloc_named("the sampler profile", 16),
+            cand_v: cuda::alloc_named("the sampler candidate values", SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
+            cand_i: cuda::alloc_named("the sampler candidate ids", SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
+            in_graph: std::cell::Cell::new(false),
+        });
 
         // ---- scratch + staging BEFORE the budget: the planner measures free VRAM,
         // so everything chunk-sized must already be resident (C=512 scratch is
@@ -1063,7 +1107,12 @@ impl Engine {
         // tables) is planned HERE, so N is chosen with it and the first image
         // request cannot find the card full. CROW_VIT=0 reserves nothing and
         // keeps the full budget, exactly as before.
-        let vit_reserve = if vit.is_some() { crate::vit::reserve_bytes(cfg.context) } else { 0 };
+        // #72: what is already HELD is inside free0 (like the dense weights); the
+        // planner only has to set aside what is left of the reserve.
+        let vit_held = vit_scratch_held + vit_mrope_held;
+        let vit_reserve = if vit.is_some() {
+            crate::vit::reserve_bytes(cfg.context).saturating_sub(vit_held)
+        } else { 0 };
         let pending = LAUNCH_SLACK + ring_reserve + vit_reserve;
         // pinned-side sizing follows the cold tier actually used (record size
         // of a low-bit tier, full tier = constant; see residency::build)
@@ -1090,7 +1139,7 @@ impl Engine {
         log(&format!(
             "  [budget] {}",
             if vit.is_some() {
-                crate::vit::reserve_line(cfg.context)
+                crate::vit::reserve_line(cfg.context, vit_held)
             } else {
                 "vit reserve       0.0 MB  (CROW_VIT 0, the tower is not loaded)".to_string()
             }
@@ -1136,6 +1185,34 @@ impl Engine {
             sub,
             moe,
         };
+
+        // ---- #72: the post-plan ledger ----
+        // Everything the engine used to allocate AFTER the planner had chosen N is
+        // listed here with its bytes and its side of the bus, and the VRAM half of
+        // it is already resident by the time this line is printed. The prefix-cache
+        // snapshots - the biggest post-plan allocation of the process, 3 x 124.6 MiB -
+        // are HOST RAM (`cache.rs` module doc, `Vec<f32>`), so they are named on
+        // serve's own line and never cost the card a byte.
+        let mut post = crate::manager::PostPlan::new();
+        if vit.is_some() {
+            if vit_scratch_held > 0 {
+                post.vram("vit tower scratch", vit_scratch_held);
+            }
+            if vit_mrope_held > 0 {
+                post.vram("vit mrope span", vit_mrope_held);
+            }
+            post.host("vit image cache (CROW_VIT_CACHE_MB, LRU)", crate::vit::image_cache_budget_bytes());
+        }
+        post.vram("device sampler", sampler_bytes());
+        log(&format!("  [budget] {}", post.line()));
+        let free_after = cuda::free_vram_bytes();
+        let hl = crate::manager::headroom_line(free_after, crate::manager::POST_PLAN_FLOOR);
+        if free_after >= crate::manager::POST_PLAN_FLOOR {
+            log(&format!("  [budget] {hl}"));
+        } else {
+            tracing::error!(target: "load", "[load]   [budget] {hl}");
+            log(&format!("  [budget] {hl}"));
+        }
 
         let dense_after = cuda::total_vram_bytes() - cuda::free_vram_bytes();
         log(&format!(
@@ -1184,11 +1261,12 @@ impl Engine {
             adapt_base: Vec::new(),
             adapt_ema: Vec::new(),
             dev_sampler: None,
+            dev_sampler_hold,
             vit: vit,
             vit_plan: None,
-            mrope_cos: 0,
-            mrope_sin: 0,
-            mrope_rows: 0,
+            mrope_cos,
+            mrope_sin,
+            mrope_rows,
             mrope_active: false,
             graph_exec: 0,
             cap_stream: 0,
@@ -1739,6 +1817,13 @@ pub const QSA_PAR_E_THREADS: u32 = 1024;
 /// tuneables - the candidate buffers are [PARTS][MAXK] and the two kernels
 /// index them with those exact bounds. `assert_kernel_defines()` checks all
 /// four Rust twins against the frozen source at boot.
+/// #72: the device sampler's five buffers, as `enable_dev_sampler` takes them
+/// (mask [V] u8, rng u64, params 16 B, two [SAMPLE_PARTS * SAMPLE_MAXK] slices).
+/// Held at boot since #72, and named on the `[budget]` post-plan line.
+pub const fn sampler_bytes() -> u64 {
+    (V + 8 + 16 + 2 * SAMPLE_PARTS as usize * SAMPLE_MAXK * 4) as u64
+}
+
 pub const SAMPLE_MAXK: usize = 64;
 pub const SAMPLE_PARTS: u32 = 64;
 pub const SAMPLE_THREADS: u32 = 256;
@@ -3892,14 +3977,21 @@ impl Engine {
     /// before the first decode_step of the process so the node is captured with
     /// the graph; enabled later it runs as an eager launch behind each replay.
     pub unsafe fn enable_dev_sampler(&mut self, s: &crate::sample::Sampler) {
-        let ds = self.dev_sampler.get_or_insert_with(|| DevSampler {
-            mask: cuda::alloc_zeroed(V),
-            rng: cuda::alloc_zeroed(8),
-            params: cuda::alloc_zeroed(16),
-            cand_v: cuda::alloc_zeroed(SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
-            cand_i: cuda::alloc_zeroed(SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
-            in_graph: std::cell::Cell::new(false),
-        });
+        if self.dev_sampler.is_none() {
+            // #72: the buffers come from the boot hold; the fallback allocates, for
+            // a bin that built its Engine before the hold existed. Either way they
+            // are zeroed, and the three uploads below are what makes them the
+            // request's sampler - the path is byte-identical to the pre-#72 one.
+            self.dev_sampler = Some(self.dev_sampler_hold.take().unwrap_or_else(|| DevSampler {
+                mask: cuda::alloc_zeroed(V),
+                rng: cuda::alloc_zeroed(8),
+                params: cuda::alloc_zeroed(16),
+                cand_v: cuda::alloc_zeroed(SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
+                cand_i: cuda::alloc_zeroed(SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
+                in_graph: std::cell::Cell::new(false),
+            }));
+        }
+        let ds = self.dev_sampler.as_ref().expect("enable_dev_sampler: just armed");
         let zero = vec![0u8; V];
         cuda::upload_into(ds.mask, &zero);
         cuda::to_u64_into(ds.rng, &[s.rng.state()]);
@@ -4366,7 +4458,7 @@ impl Drop for Engine {
                 v.free();
             }
             self.vit = None;
-            if let Some(ds) = &mut self.dev_sampler {
+            for ds in [self.dev_sampler.as_mut(), self.dev_sampler_hold.as_mut()].into_iter().flatten() {
                 cuda::free_dev(&mut ds.mask);
                 cuda::free_dev(&mut ds.rng);
                 cuda::free_dev(&mut ds.params);

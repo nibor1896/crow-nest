@@ -70,6 +70,10 @@ pub fn vit_on() -> bool {
 /// visual tokens one image can produce at the patch cap (4096 / 2 / 2)
 pub const VIT_MAX_VISUAL: usize = VIT_MAX_PATCHES / (VIT_MERGE * VIT_MERGE);
 
+/// device buffers `ensure_scratch` takes (the 16 i32 scalar slots are counted
+/// apart: 64 B in total, inside the same group unwind)
+pub const VIT_SCRATCH_BUFFERS: usize = 12;
+
 /// bytes of the cap-sized tower scratch — the twelve buffers `ensure_scratch`
 /// takes, counted from the same geometry the allocator uses
 pub const fn scratch_bytes() -> usize {
@@ -115,7 +119,7 @@ pub fn reserve_bytes(context: usize) -> u64 {
 /// the `[budget]` line's own words for what `reserve_bytes` covers; with
 /// `CROW_VIT_RESERVE_MB` set it names the override AND what the derived value
 /// would have been, so a log that shows a bigger N still says what paid for it
-pub fn reserve_line(context: usize) -> String {
+pub fn reserve_line(context: usize, held: u64) -> String {
     let mib = |b: usize| b as f64 / MIB;
     let derived = (scratch_bytes() + mrope_bytes(context)) as f64 / MIB;
     let basis = match crate::geo::env_parse::<u64>("CROW_VIT_RESERVE_MB") {
@@ -126,7 +130,22 @@ pub fn reserve_line(context: usize) -> String {
             mib(mrope_bytes(context))
         ),
     };
-    format!("vit reserve {:9.1} MB  ({basis}, CROW_VIT on)", reserve_bytes(context) as f64 / MIB)
+    // #72: what the planner still has to SET ASIDE, now that the tower scratch and
+    // the mrope span are taken at boot. With the derived reserve the two are the
+    // same number and nothing is pending; a bigger CROW_VIT_RESERVE_MB pads the
+    // plan by the difference, a smaller one is already covered by what is held.
+    let pending = reserve_bytes(context).saturating_sub(held);
+    let state = if held == 0 {
+        "lazy, allocated on the first image request".to_string()
+    } else if pending == 0 {
+        format!("{:.1} MB HELD at boot, nothing left pending", held as f64 / MIB)
+    } else {
+        format!("{:.1} MB HELD at boot, {:.1} MB pending", held as f64 / MIB, pending as f64 / MIB)
+    };
+    format!(
+        "vit reserve {:9.1} MB  ({basis}, CROW_VIT on) — {state}",
+        reserve_bytes(context) as f64 / MIB
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +274,8 @@ pub struct Vit {
     sn: Dev,       // [cap][36] rope sin
     /// device i32 scalars, indexed by the S_* consts
     s: Vec<Dev>,
-    /// the scratch is allocated (lazily, on the first image request)
+    /// the scratch is allocated (#72: at boot when the reserve is held, else
+    /// lazily on the first image request)
     scratch: bool,
 }
 
@@ -278,13 +298,15 @@ const S_NMLP: usize = 14;        // n * 4304, the block MLP gelu count
 const S_NMERGE: usize = 15;      // nv * 4608, the merger gelu count
 
 impl Vit {
-    /// weights + cap-sized scratch, all resident BEFORE the budget planner runs
-    /// weights resident BEFORE the budget planner (they are part of the model);
-    /// the cap-sized SCRATCH is allocated LAZILY on the first image request
-    /// (ensure_scratch) so text-only boots keep the full planner budget — the
-    /// F49 ten-task operating point refused with the scratch resident (found
-    /// 2026-09-14, the TEN phase in `decode_out/srv-vit.log`). One-time,
-    /// before the request's text prefill, then resident for the process life.
+    /// weights resident BEFORE the budget planner (they are part of the model).
+    ///
+    /// The cap-sized SCRATCH was allocated LAZILY on the first image request
+    /// until #72 (2026-09-18): text-only boots kept the full planner budget,
+    /// but the planner's `reserve_bytes` was then only a note - the 512 MiB
+    /// `manager::SAFETY` slack it lived in was spent by the driver's own
+    /// post-plan allocations, and robin's first image request found 35.7 MiB
+    /// free. `Engine::load` now calls `arm_scratch` right after this, so the
+    /// reserve is held; the lazy path stays as the fallback (`CROW_VIT_RESERVE_MB=0`).
     pub unsafe fn new(cnq: &mut Cnq) -> Vit {
         let w = VitW::load(cnq);
         Vit {
@@ -321,6 +343,25 @@ impl Vit {
     /// answers 503 instead of the process dying (the planner's `vit::reserve_bytes`
     /// is what makes the refusal not happen in the first place).
     unsafe fn ensure_scratch(&mut self) {
+        self.ensure_scratch_named("allocated on the first image request (the boot hold is off)");
+    }
+
+    /// #72: the same allocation, taken AT BOOT while the card is empty, so the
+    /// planner's `reserve_bytes` is a HELD allocation and not a note. Called
+    /// from `Engine::load` right after the tower weights, before the budget
+    /// verify - `free0` then already excludes it, exactly like the dense
+    /// weights, and nothing allocated after the plan (the decode graph, the
+    /// driver's launch pools) can take the image path's bytes any more.
+    ///
+    /// # Safety
+    ///
+    /// - a CUDA context must be current, as for every other tower call
+    pub unsafe fn arm_scratch(&mut self) {
+        self.ensure_scratch_named("held at boot (#72: the vit reserve is a real allocation)");
+    }
+
+    /// `how` is what the one log line says about WHEN this happened
+    unsafe fn ensure_scratch_named(&mut self, how: &str) {
         if self.scratch {
             return;
         }
@@ -392,8 +433,8 @@ impl Vit {
         cuda::sync();
         self.scratch = true;
         debug_assert_eq!(bytes, scratch_bytes(), "scratch_bytes() and ensure_scratch disagree");
-        tracing::info!(target: "vit", "[vit] scratch allocated on the first image request ({:.0} MiB at cap {} patches, inside the planner's vit reserve)",
-            bytes as f64 / MIB, cap);
+        tracing::info!(target: "vit", "[vit] tower scratch {how}: {:.1} MiB at cap {} patches ({} buffers + {} scalars)",
+            bytes as f64 / MIB, cap, VIT_SCRATCH_BUFFERS, scalars.len());
     }
 
     /// one NVFP4 linear: y[t][rows] = w x^T with RAW f32 activations, via the
@@ -934,6 +975,13 @@ pub fn mrope_tables(pos: &[[i64; 3]], seq: usize, span: usize, delta: i64) -> (V
     (cos, sin)
 }
 
+/// #72: the image cache's ceiling for the `[budget]` post-plan line. HOST RAM -
+/// the entries are `Vec<f32>` tower outputs, never device memory - so it is
+/// listed on the host half of that line and costs the card nothing.
+pub fn image_cache_budget_bytes() -> u64 {
+    vit_cache_bytes() as u64
+}
+
 /// byte ceiling of the per-process image-embedding cache (`CROW_VIT_CACHE_MB`,
 /// default 256 MiB = about 25 full-size images at 10 MiB each)
 fn vit_cache_bytes() -> usize {
@@ -1099,10 +1147,55 @@ mod reserve {
             reserve_bytes(ctx),
             (scratch_bytes() + mrope_bytes(ctx)) as u64
         );
-        let line = reserve_line(ctx);
+        let line = reserve_line(ctx, 0);
         assert!(line.starts_with("vit reserve"), "the [budget] label moved: {line}");
         assert!(line.contains("277.3 MB"), "the reserve total moved: {line}");
         assert!(line.contains("tower scratch 228.5"), "the scratch part moved: {line}");
         assert!(line.contains("mrope span 48.8"), "the mrope part moved: {line}");
+    }
+
+    /// #72 gate 1: the derived reserve is EXACTLY what `Engine::load` holds at
+    /// boot - the twelve scratch buffers at the patch cap plus the two span
+    /// tables at `n_ctx`. If the two ever drift apart the planner is back to
+    /// promising VRAM nobody took.
+    #[test]
+    fn the_held_bytes_are_the_whole_derived_reserve_and_nothing_stays_pending() {
+        for ctx in [200_000usize, 262_144] {
+            let held = (scratch_bytes() + mrope_bytes(ctx)) as u64;
+            assert_eq!(held, reserve_bytes(ctx), "ctx {ctx}: the hold is not the reserve");
+            assert_eq!(reserve_bytes(ctx).saturating_sub(held), 0, "ctx {ctx}: bytes left pending");
+        }
+        // the twelve buffers, each counted from the geometry ensure_scratch uses
+        let cap = VIT_MAX_PATCHES;
+        let buffers: [usize; VIT_SCRATCH_BUFFERS] = [
+            cap * VIT_HIDDEN,      // x
+            cap * VIT_HIDDEN,      // normed
+            cap * VIT_QKV,         // qkv
+            cap * VIT_HIDDEN,      // attn
+            cap * VIT_INTER,       // mlp
+            cap / 4 * VIT_MERGED,  // m1
+            cap / 4 * H,           // out
+            cap * VIT_IN,          // patches
+            cap * 4,               // pe_idx
+            cap * 4,               // pe_w
+            cap * VIT_ROT,         // cs
+            cap * VIT_ROT,         // sn
+        ];
+        assert_eq!(buffers.iter().sum::<usize>() * 4, scratch_bytes());
+    }
+
+    /// #72 gate 2: the `[budget]` line says HELD once the loader holds it, and
+    /// still says lazy when `CROW_VIT_RESERVE_MB=0` turns the hold off.
+    #[test]
+    fn the_budget_line_says_whether_the_reserve_is_held_or_only_planned() {
+        let ctx = 200_000;
+        let held = reserve_line(ctx, reserve_bytes(ctx));
+        assert!(held.contains("HELD at boot"), "the held wording moved: {held}");
+        assert!(held.contains("nothing left pending"), "the pending clause moved: {held}");
+        let lazy = reserve_line(ctx, 0);
+        assert!(lazy.contains("lazy, allocated on the first image request"), "the lazy wording moved: {lazy}");
+        // a bigger override pads the plan by the difference, and says so
+        let part = reserve_line(ctx, scratch_bytes() as u64);
+        assert!(part.contains("48.8 MB pending"), "the partial-hold wording moved: {part}");
     }
 }

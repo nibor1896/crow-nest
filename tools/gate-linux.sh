@@ -156,6 +156,20 @@
 #                              keeps `replay-toolcalls.py`, `drift-chain.sh` and this script
 #                              reading the line of record - so
 #                              206 = 113 lib + 82 serve + 6 parity + 5 decode.
+#   tests 206 -> 212           #72 (2026-09-18) adds SIX library tests for the planning
+#                              arithmetic the fix rests on, all pure and GPU-free: in
+#                              `vit.rs`, that the derived reserve IS what `Engine::load`
+#                              holds at boot (the twelve scratch buffers at the 4096-patch
+#                              cap plus the two mrope span tables at n_ctx, nothing left
+#                              pending) and that the `[budget]` line says HELD, lazy or
+#                              partly pending; in `manager.rs`, the post-plan ledger - its
+#                              VRAM total (277.6 MB = the 277.3 MB reserve + the 0.27 MB
+#                              device sampler), the empty case, and the one that pays for
+#                              the whole issue: the prefix-cache snapshots (3 x 124.6 MiB)
+#                              are HOST RAM and must stay OUT of the VRAM total, or the
+#                              planner would drop ~150 hot experts for nothing - plus the
+#                              headroom floor (256 MiB) with the issue's own 35.7 MiB as
+#                              the SHORT case. So 212 = 119 lib + 82 serve + 6 parity + 5 decode.
 #   clippy 1421                #13 (2026-09-18) LOWERED the count of record by one, and by
 #                              exactly one: `warning: redundant reference in `eprintln!`
 #                              argument` at `gen.rs:2890` is gone because that line is a
@@ -186,7 +200,7 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="206"
+TESTS="212"
 CLIPPY="1421"
 
 red=0

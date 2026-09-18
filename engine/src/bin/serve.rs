@@ -3808,7 +3808,7 @@ fn main() {
     // #36 M2b: SLOTS is 1, and the line below reads it instead of naming a count of its own.
     let cache = PrefixCache::new(&eng);
     tracing::info!(target: "serve",
-        "[serve] prefix cache {}, {} B per snapshot, {} snapshot(s), QSA ring rows {}",
+        "[serve] prefix cache {}, {} B per snapshot, {} snapshot(s) in HOST RAM (#72: never VRAM, see cache.rs), QSA ring rows {}",
         if cache.enabled() { "on" } else { "off (CROW_PREFIX_CACHE=0)" },
         cache.shape().snapshot_bytes(),
         SLOTS,

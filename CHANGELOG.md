@@ -28,11 +28,51 @@
   and `#69` (the layer-3 sub-block check that F5 found returning zeros, repaired and added to the
   package self-test, 2026-09-18) and `#10` (the router GEMM second probe, and the ten-task quality
   reference it re-based, 2026-09-18 — no engine code) and `#71` (`#62` lever 1: the z slab out of
-  the grouped GDN input launch, and the opt-in `CROW_GDN_SPLIT_Z` it rides on, 2026-09-18).
+  the grouped GDN input launch, and the opt-in `CROW_GDN_SPLIT_Z` it rides on, 2026-09-18) and
+  `#72` (the vit reserve held at boot instead of planned, and the post-plan ledger, 2026-09-18).
   The machine is the second environment block of `docs/system-landscape.md` unless a row names another one.
 - The crate version field stays `0.1.0`, as it has for every release: this file is the record.
 
 ### Fixed
+
+- **The vit reserve was planned but never HELD, and the first image request of a session found
+  35.7 MiB free** (`#72`, seen by robin 2026-09-18, fixed the same day). Since `8ff2055` the
+  planner set 277.3 MB aside for the image path (tower scratch 228.5 + mrope span 48.8) before it
+  chose N — and then nothing allocated it: the scratch was "lazy, allocated on the first image
+  request". Between `[serve] listening` and robin's seventh round the free VRAM the reserve was
+  supposed to name (30.52 of 31.37 GiB used, ~0.85 GiB slack) was spent by the allocations that
+  happen AFTER the plan, and the tower answered a named 503:
+  `[vit] scratch allocation refused after 23 buffer(s)`, `CUDA_ERROR_OUT_OF_MEMORY allocating the
+  vit patch input (24.0 MiB); free VRAM 35.7 MiB`. The engine stayed up (`8ff2055`'s path worked),
+  but `README.md`'s "an image request allocates no per-request VRAM at all" only holds if the
+  reserve is real.
+
+  **The reserve is now an allocation.** `Engine::load` calls `vit::arm_scratch` right after the
+  tower weights and takes the two interleaved-mrope span tables at `n_ctx` in the same place —
+  before the budget verify, so `free0` excludes them exactly as it excludes the dense weights, and
+  `pending` carries only what is LEFT of the reserve (nothing, at the derived value). The device
+  sampler's five buffers (0.27 MB, the last thing the engine took after the plan) are held beside
+  them and handed to `enable_dev_sampler` on demand. `begin_vision` and `ensure_scratch` keep
+  their lazy paths as the fallback; `CROW_VIT_RESERVE_MB=0` is still the way back to the
+  pre-`8ff2055` behaviour and now also turns the hold off.
+
+  **The post-plan ledger, and the one number the issue got wrong.** A new `[budget]` line lists
+  every allocation that used to happen after N was chosen, with its side of the bus:
+  `post-plan allocations held at boot: vit tower scratch 228.5 MB + vit mrope span 48.8 MB +
+  device sampler 0.3 MB = 277.6 MB VRAM; host RAM only (never on the card): vit image cache 256.0 MB`,
+  followed by `free VRAM after load 0.54 GiB >= floor 0.25 GiB` (`manager::POST_PLAN_FLOOR`, what
+  the decode graph and the driver pools still have to fit in). The prefix-cache snapshots
+  (3 x 124.6 MiB) were the issue's prime suspect and they are **host RAM**, not VRAM — `Vec<f32>`
+  per `cache.rs`'s memory section — so they stay out of the VRAM total; subtracting them would
+  have cost about 150 hot experts for nothing. Serve's boot line says so now.
+
+  Live, at the full operating point (`n_ctx` 200,000, prefix cache on, 3 snapshots, 2026-09-18):
+  `N 160 -> 155` and `148 of 155` as before the change (the reserve moved from `pending` to
+  resident, so the plan is the same), free VRAM after load 551 MiB, three text requests then one
+  image request then a four-image request, all 200, no `[vit] scratch allocated` line at any of
+  them (the tower armed from the held scratch) and free VRAM 544.1 MiB at both image requests with
+  `engine live allocs` unchanged at 2243 — an image request allocates no VRAM at all. Tests
+  206 -> 212 (six pure planning-arithmetic tests), clippy 1421.
 
 - **`decode layercheck3` returned an ALL-ZERO `o_proj` and it read as a measurement** (`#69`,
   found by F5 on 2026-09-18, fixed the same day). On the `-M` container the layer-3
