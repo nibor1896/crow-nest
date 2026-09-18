@@ -771,6 +771,16 @@ pub struct Routing {
     pub trickle_swaps: usize,
     /// what reading the device counter block cost
     pub counters_ms: f64,
+    /// #68 (2026-09-18): the cross-turn repeat counter of THIS answer, as `serve` keeps
+    /// it (`RepeatRing`, `bin/serve.rs`). `repeat_of` is how many answers back the most
+    /// recent identical answer is, 0 = none in the ring; `repeat_run` is how many
+    /// identical answers in a row ended with this one, 1 = none; `single_token` is true
+    /// when the answer is exactly one generated id and the model ended it itself. Pure
+    /// observability: nothing here is read by the sampler or by any decision. A
+    /// `prefill_chunk` line has no answer, so all three stay at their default.
+    pub repeat_of: usize,
+    pub repeat_run: usize,
+    pub single_token: bool,
 }
 
 impl Routing {
@@ -819,6 +829,9 @@ pub fn routing_json(r: &Routing) -> String {
         "ple_miss_rate": round(r.ple_miss_rate()),
         "trickle_swaps": r.trickle_swaps,
         "counters_ms": round(r.counters_ms),
+        "repeat_of": r.repeat_of,
+        "repeat_run": r.repeat_run,
+        "single_token": r.single_token,
     });
     v.to_string()
 }
@@ -1201,6 +1214,9 @@ mod tests {
             ple_fills: 41,
             trickle_swaps: 56,
             counters_ms: 0.312,
+            repeat_of: 2,
+            repeat_run: 3,
+            single_token: true,
         };
         let line = routing_json(&r);
         assert!(!line.contains('\n'), "one line per request");
@@ -1208,9 +1224,18 @@ mod tests {
         for k in [
             "ts", "seq", "prompt_n", "cached_n", "predicted_n", "tok_s", "cold", "hit_rate",
             "layers_cold", "bytes_streamed", "ple_rows", "ple_fills", "trickle_swaps",
+            // #68: the three cross-turn fields a log reader plots per request
+            "repeat_of", "repeat_run", "single_token",
         ] {
             assert!(!v[k].is_null(), "the routing line has no {k}");
         }
+        assert_eq!(v["repeat_of"], 2);
+        assert_eq!(v["repeat_run"], 3);
+        assert_eq!(v["single_token"], true);
+        // a line that carries no answer (the prefill chunk) says so with the defaults
+        assert_eq!(serde_json::from_str::<serde_json::Value>(
+            &routing_json(&Routing::default()))
+            .expect("valid JSON")["repeat_run"], 0);
         assert_eq!(v["bytes_streamed"], 3_623_878_656u64);
         assert_eq!(v["hit_rate"], 0.9, "1 - 3072/30720");
         assert_eq!(v["ple_miss_rate"], 0.005);

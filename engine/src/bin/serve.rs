@@ -396,6 +396,32 @@
 //! - They are written ONLY into `timings`, so they appear only when `timings_per_token` is true.
 //!   Without the flag the final chunk is still exactly the A4 chunk.
 //!
+//! The cross-turn repeat counter (#68, 2026-09-18), pure observability:
+//!
+//! | name | meaning | where |
+//! |---|---|---|
+//! | `repeat_of` | how many answers back the most recent IDENTICAL answer of this process is; 0 = none in the ring | `routing` line only |
+//! | `repeat_run` | how many identical answers in a row ended with this one; 1 = none | `routing` line, and `, repeat run N` on the `[chat]` line when N > 1 |
+//! | `single_token` | the answer is exactly ONE generated id and the model ended it itself (`finish stop`) | `routing` line, and `, single-token answer` on the `[chat]` line when true |
+//!
+//! - The state is a ring of the last `REPEAT_RING` = 8 answer HASHES (`RepeatRing`), FNV-1a
+//!   over the GENERATED IDS - what the model produced, not what the detokenizer made of it.
+//! - `repeat_run` is not capped by the ring: the live `#68` session's 48 identical answers
+//!   would be reported as 48. The ring bounds `repeat_of` only.
+//! - At `LOOP_WARN_AT` = 3 one WARN line goes to target `chat`
+//!   (`the client is looping: N identical answers in a row`), also for three consecutive
+//!   single-token answers. It is a line and nothing else: no 4xx, no brake, no sampling
+//!   change, no wire field. Loop detection across turns belongs to the client; this server
+//!   only says what it sees, because nothing INSIDE one request can see it
+//!   (`docs/long-context-goalmode.md` 3.3: each of those 48 requests was correct on its own).
+//! - Always on, no env flag: it costs one hash pass over at most `max_tokens` ids per
+//!   request, after the last `decode_step`, and eight `u64` of state.
+//! - SCOPE: per PROCESS, not per session. `serve` holds one conversation and there is no
+//!   session id on the wire; and a COLD prefill is NOT a new conversation - an identical
+//!   re-send is cold by construction (its snapshot sits at its own prompt length, spec 7.4),
+//!   which is exactly the case this counter exists to see. So the ring lives as long as the
+//!   process does and a restart is what clears it.
+//!
 //! Counters that exist in the engine and are NOT in the block (names are not invented):
 //!
 //! | counter | where | why not |
@@ -3007,6 +3033,14 @@ fn chat_generate(
     let counters_ms = t_ctr.elapsed().as_secs_f64() * 1e3;
 
     let gen = out.len();
+    // #68: the cross-turn repeat counter, after the last decode step and off the numeric
+    // path. `finish` is final here (`tool_calls` is decided above), and `out` holds exactly
+    // the ids this request generated - EOS is never pushed, so a one-id answer that stopped
+    // by itself is the live single-token shape.
+    let rep = srv.repeats.observe(&out, single_token_answer(gen, finish));
+    if let Some(w) = loop_warning(&rep) {
+        tracing::warn!(target: "chat", "{w}");
+    }
     let timing = Timing {
         prompt_n: prefilled,
         cached_n,
@@ -3052,7 +3086,7 @@ fn chat_generate(
         (true, true)
     };
     tracing::info!(target: "chat",
-        "[chat] prompt {} tok ({cached_n} cached, {prefilled} prefilled), generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {}, reasoning chunks {}, tool chunks {}, think tags stripped {}, tool calls {}, usage {}, timings {}, crow_trickle_swaps {trickle_swaps}{}",
+        "[chat] prompt {} tok ({cached_n} cached, {prefilled} prefilled), generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {}, reasoning chunks {}, tool chunks {}, think tags stripped {}, tool calls {}, usage {}, timings {}, crow_trickle_swaps {trickle_swaps}{}{}",
         ids.len(),
         per_second(prefilled, prefill_ms),
         (gen.saturating_sub(1)) as f64 * 1000.0 / decode_ms.max(1e-9),
@@ -3063,7 +3097,8 @@ fn chat_generate(
         ts.closed(),
         log_usage,
         log_timings,
-        if aborted { ", client gone" } else { "" }
+        if aborted { ", client gone" } else { "" },
+        repeat_note(&rep)
     );
     // #30 A8: the same numbers the `timings` block carries, cumulative since process start
     tracing::info!(target: "chat",
@@ -3108,6 +3143,9 @@ fn chat_generate(
         ple_fills: d_fills,
         trickle_swaps,
         counters_ms,
+        repeat_of: rep.repeat_of,
+        repeat_run: rep.repeat_run,
+        single_token: rep.single_token,
     });
     // #13: the full id list of every answer is DEBUG now (`CROW_LOG=info,chat=debug`).
     // At INFO it made a redirected stderr and the log file grow with every answer.
@@ -3280,6 +3318,118 @@ fn read_head(stream: &TcpStream) -> std::io::Result<Head> {
     read_head_from(&mut r)
 }
 
+/// #68 (2026-09-18): how many answer hashes the cross-turn counter keeps. Eight is what a
+/// human reads a `[chat]` line against; the RUN is counted separately and is not capped by it.
+const REPEAT_RING: usize = 8;
+/// #68: the WARN threshold, a constant and deliberately not an env knob. Three identical
+/// answers in a row is the live shape (48 of them at the end of the goal-mode session), two
+/// is a client that asked the same thing twice.
+const LOOP_WARN_AT: usize = 3;
+
+/// #68: what the cross-turn counter says about ONE completed answer. Pure data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct RepeatStats {
+    /// how many answers back the most recent identical answer is; 0 = none in the ring
+    repeat_of: usize,
+    /// how many identical answers in a row ended with this one; 1 = none
+    repeat_run: usize,
+    /// exactly one generated id, and the model ended the answer itself
+    single_token: bool,
+    /// how many single-token answers in a row ended with this one; 0 = this one is not one
+    single_run: usize,
+}
+
+/// #68: the last [`REPEAT_RING`] answers of THIS PROCESS, as hashes of their generated ids.
+///
+/// Why the ids and not the text: they are what the model produced, they are what the
+/// `[chat] ids` line prints, and two answers with the same ids are the same answer whatever
+/// the detokenizer, the tool-call parser or the reasoning filter make of them downstream.
+///
+/// Why per process: `serve` holds ONE conversation (`PrefixCache`, #31 A9) and the wire
+/// carries no session id, so there is nothing else to key on - and a cold prefill is not a
+/// new conversation, since an identical re-send is cold by construction (spec 7.4).
+///
+/// It is read by the log and by nothing else. No sampler, no finish reason, no status code
+/// and no wire field depends on any of it.
+#[derive(Default)]
+struct RepeatRing {
+    /// the hashes of the last [`REPEAT_RING`] answers, oldest first
+    seen: std::collections::VecDeque<u64>,
+    /// the previous answer's hash, and the run of identical answers that ended with it
+    last: Option<u64>,
+    run: usize,
+    /// single-token answers in a row
+    single_run: usize,
+}
+
+/// #68: FNV-1a 64 over the generated ids. Not a cryptographic hash and it does not need to
+/// be: a collision costs one wrong `repeat run` on a log line and nothing else.
+fn answer_hash(ids: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for id in ids {
+        for b in id.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+impl RepeatRing {
+    /// One completed answer in, its counters out. Pure apart from the ring it advances.
+    fn observe(&mut self, ids: &[u32], single_token: bool) -> RepeatStats {
+        let h = answer_hash(ids);
+        // the newest entry is the LAST one, so the distance counts from the back
+        let repeat_of = self.seen.iter().rev().position(|&p| p == h).map_or(0, |i| i + 1);
+        let repeat_run = if self.last == Some(h) { self.run + 1 } else { 1 };
+        self.single_run = if single_token { self.single_run + 1 } else { 0 };
+        self.last = Some(h);
+        self.run = repeat_run;
+        if self.seen.len() == REPEAT_RING {
+            self.seen.pop_front();
+        }
+        self.seen.push_back(h);
+        RepeatStats { repeat_of, repeat_run, single_token, single_run: self.single_run }
+    }
+}
+
+/// #68: true when the answer is exactly one generated id AND the model ended it itself.
+/// A one-token answer that ran into the client's own `max_tokens` budget is `finish length`
+/// and says nothing about the model, so it is not the live shape and is not counted as one.
+fn single_token_answer(gen: usize, finish: &str) -> bool {
+    gen == 1 && finish == "stop"
+}
+
+/// #68: what the `[chat]` summary line appends for this answer. EMPTY for a healthy one, so
+/// a healthy session's line is byte-identical to the line every tool of this repo greps.
+fn repeat_note(rep: &RepeatStats) -> String {
+    let mut s = String::new();
+    if rep.repeat_run > 1 {
+        s.push_str(&format!(", repeat run {}", rep.repeat_run));
+    }
+    if rep.single_token {
+        s.push_str(", single-token answer");
+    }
+    s
+}
+
+/// #68: the ONE WARN a request may owe, or `None`. Pure, so the threshold is a test and not
+/// a guess. Never two lines: a run of identical single-token answers is already reported as
+/// the run of identical answers that it is.
+fn loop_warning(rep: &RepeatStats) -> Option<String> {
+    let what = if rep.repeat_run >= LOOP_WARN_AT {
+        format!("{} identical answers in a row", rep.repeat_run)
+    } else if rep.single_run >= LOOP_WARN_AT {
+        format!("{} single-token answers in a row", rep.single_run)
+    } else {
+        return None;
+    };
+    Some(format!(
+        "[chat] the client is looping: {what} (#68) - an observation, nothing about this \
+         generation was changed: no brake, no refusal, the sampler is untouched"
+    ))
+}
+
 /// what a connection needs beyond the socket: the engine, its container, the static props
 struct Srv<'a> {
     /// the one loaded engine of this process; every chat request resets it first
@@ -3311,6 +3461,9 @@ struct Srv<'a> {
     /// request is the difference of two blocks - held here, never on the device.
     prev_counters: Vec<[u64; 2]>,
     prev_ple: (u64, u64),
+    /// #68: the cross-turn repeat counter's ring, per process (see the module doc). The one
+    /// piece of state this server keeps about what the MODEL said, and only the log reads it.
+    repeats: RepeatRing,
 }
 
 /// - TASK K: one request may not take the server down with it
@@ -3694,6 +3847,7 @@ fn main() {
         stream_head_sent: false,
         prev_counters: Vec::new(),
         prev_ple: (0, 0),
+        repeats: RepeatRing::default(),
     };
     for conn in listener.incoming() {
         match conn {
@@ -4100,6 +4254,111 @@ mod tests {
         assert_eq!(nulls.sampling_sent, SamplingSent::default());
         assert_eq!(SamplingSent::tag(true), "request");
         assert_eq!(SamplingSent::tag(false), "data sheet");
+    }
+
+    // #68 (2026-09-18): the cross-turn repeat counter. Four tests, all pure - the ring is
+    // host state and the whole point of it is that nothing on the numeric path can see it.
+    // The shape they pin is the live one: `docs/long-context-goalmode.md` 3.3, 48 of the 293
+    // answers of robin's goal-mode session were the single id 18 (`3`) with `finish stop`.
+
+    #[test]
+    fn the_repeat_ring_counts_the_run_and_the_distance_back() {
+        let mut r = RepeatRing::default();
+        // a fresh ring repeats nothing
+        let a1 = r.observe(&[1, 2, 3], false);
+        assert_eq!((a1.repeat_of, a1.repeat_run), (0, 1));
+        // the same answer again: one back, a run of two
+        let a2 = r.observe(&[1, 2, 3], false);
+        assert_eq!((a2.repeat_of, a2.repeat_run), (1, 2));
+        let a3 = r.observe(&[1, 2, 3], false);
+        assert_eq!((a3.repeat_of, a3.repeat_run), (1, 3));
+        // a different answer breaks the RUN but is still a first sighting
+        let b = r.observe(&[9], false);
+        assert_eq!((b.repeat_of, b.repeat_run), (0, 1));
+        // the old answer comes back: seen two answers back, but the RUN starts over at 1,
+        // because a run is CONSECUTIVE and the run of three ended when `b` arrived
+        let a4 = r.observe(&[1, 2, 3], false);
+        assert_eq!((a4.repeat_of, a4.repeat_run), (2, 1));
+        // the run is not capped by the ring: 48 identical answers report 48
+        let mut long = RepeatRing::default();
+        let mut last = RepeatStats::default();
+        for _ in 0..48 {
+            last = long.observe(&[18], false);
+        }
+        assert_eq!(last.repeat_run, 48);
+        assert_eq!(last.repeat_of, 1);
+    }
+
+    #[test]
+    fn the_repeat_ring_sees_the_generated_ids_and_only_the_last_eight() {
+        // the ids are what is hashed: order matters, length matters, the text does not exist
+        assert_ne!(answer_hash(&[1, 2]), answer_hash(&[2, 1]));
+        assert_ne!(answer_hash(&[1, 2]), answer_hash(&[1, 2, 2]));
+        assert_eq!(answer_hash(&[7, 8, 9]), answer_hash(&[7, 8, 9]));
+        // an answer older than REPEAT_RING is out of the ring and reports no repeat
+        let mut r = RepeatRing::default();
+        r.observe(&[42], false);
+        for i in 0..REPEAT_RING as u32 {
+            r.observe(&[100 + i], false);
+        }
+        assert_eq!(r.observe(&[42], false).repeat_of, 0, "8 answers back is out of the ring");
+        // one inside the window is still seen
+        let mut r2 = RepeatRing::default();
+        r2.observe(&[42], false);
+        for i in 0..(REPEAT_RING as u32 - 1) {
+            r2.observe(&[100 + i], false);
+        }
+        assert_eq!(r2.observe(&[42], false).repeat_of, REPEAT_RING);
+    }
+
+    #[test]
+    fn a_single_token_answer_is_one_id_the_model_ended_itself() {
+        // the live shape: one id, EOS
+        assert!(single_token_answer(1, "stop"));
+        // the client's own budget is not the model stopping
+        assert!(!single_token_answer(1, "length"));
+        // and neither is a one-id answer that opened a tool call
+        assert!(!single_token_answer(1, "tool_calls"));
+        assert!(!single_token_answer(0, "stop"));
+        assert!(!single_token_answer(2, "stop"));
+        // the streak counts consecutive ones and is cleared by any other answer
+        let mut r = RepeatRing::default();
+        assert_eq!(r.observe(&[18], true).single_run, 1);
+        assert_eq!(r.observe(&[19], true).single_run, 2);
+        let back = r.observe(&[1, 2, 3], false);
+        assert_eq!(back.single_run, 0);
+        assert!(!back.single_token);
+        assert_eq!(r.observe(&[18], true).single_run, 1);
+    }
+
+    #[test]
+    fn the_loop_warning_and_the_chat_line_suffix_fire_at_three() {
+        let mk = |repeat_run, single_token, single_run| RepeatStats {
+            repeat_of: usize::from(repeat_run > 1),
+            repeat_run,
+            single_token,
+            single_run,
+        };
+        // a healthy answer adds NOTHING to the `[chat]` line and owes no WARN: the line every
+        // tool of this repo greps is byte-identical to the line of record
+        let healthy = mk(1, false, 0);
+        assert_eq!(repeat_note(&healthy), "");
+        assert!(loop_warning(&healthy).is_none());
+        // two in a row is visible but not yet a loop
+        assert_eq!(repeat_note(&mk(2, false, 0)), ", repeat run 2");
+        assert!(loop_warning(&mk(2, false, 0)).is_none());
+        // three is the threshold, and the line names the count
+        let w = loop_warning(&mk(LOOP_WARN_AT, false, 0)).expect("a WARN at three");
+        assert!(w.contains("the client is looping: 3 identical answers in a row"), "{w}");
+        assert!(!w.contains('\n'), "one line");
+        // three single-token answers that are NOT identical warn on their own
+        let w2 = loop_warning(&mk(1, true, 3)).expect("a WARN at three single-token answers");
+        assert!(w2.contains("3 single-token answers in a row"), "{w2}");
+        // both at once is still ONE line, and it is the identical-answers one
+        let w3 = loop_warning(&mk(4, true, 4)).expect("a WARN");
+        assert!(w3.contains("4 identical answers in a row"), "{w3}");
+        assert_eq!(repeat_note(&mk(4, true, 4)), ", repeat run 4, single-token answer");
+        assert_eq!(repeat_note(&mk(1, true, 1)), ", single-token answer");
     }
 
     #[test]

@@ -2927,6 +2927,79 @@ either. The one thing a probe cannot do is separate the two meanings of a FIN by
 - Streaming identity: the same greedy prompt answers with the same 355 bytes,
   `sha256 39cbf9a3fd5d2d61...`, on both builds.
 
+**7.11.19 The cross-turn repeat counter (#68, 2026-09-18)**
+
+Open question 4 of `docs/long-context-goalmode.md` asked whether the engine owes the client a
+brake. robin's decision: **observability, not a brake.** Nothing inside one request can see the
+live stage-3 shape — 48 of the 293 answers of the goal-mode session were the single id 18 (`3`)
+with `finish stop`, and *every one of those requests was correct on its own*. What no request can
+see, the PROCESS can, because `serve` is stateful per process: one client, one held conversation,
+one prefix cache. So it counts, says what it sees, and changes nothing.
+
+| field | meaning | where |
+|---|---|---|
+| `repeat_of` | how many answers back the most recent IDENTICAL answer of this process is; `0` = none within the ring | the `routing` JSON line, every request |
+| `repeat_run` | how many identical answers in a row ended with this one; `1` = none | the `routing` line, and `, repeat run N` on the `[chat]` summary line when `N > 1` |
+| `single_token` | the answer is exactly ONE generated id and the model ended it itself (`finish stop`) | the `routing` line, and `, single-token answer` on the `[chat]` line when true |
+
+- **What is hashed: the generated ids.** FNV-1a 64 over `out`, the id list the `[chat] ids` line
+  prints — what the model produced, before the detokenizer, the tool-call parser or the `#67`
+  reasoning filter touch it. Two answers with the same ids are the same answer whatever those
+  make of it downstream. A collision costs one wrong number on a log line and nothing else.
+- **The ring is eight deep** (`REPEAT_RING`), which bounds `repeat_of` only. `repeat_run` is
+  counted separately and is NOT capped: the live session's 48 identical answers would read 48.
+- **`single_token` needs the model to have stopped.** A one-id answer that ran into the client's
+  own `max_tokens 1` budget is `finish length` and says nothing about the model, so it is not
+  counted (`single_token_answer`, pinned by a test). One single-token answer is a reading, not a
+  verdict — `Paris` is a perfectly good one-token answer. The live shape is the RUN of them.
+- **The WARN**: at `LOOP_WARN_AT = 3` one line at WARN on target `chat`,
+  `[chat] the client is looping: N identical answers in a row (#68) - an observation, nothing
+  about this generation was changed: no brake, no refusal, the sampler is untouched`. Three
+  consecutive single-token answers that are NOT identical get the same line in their own words.
+  Never two lines per request; a run of identical single-token answers is reported as the run of
+  identical answers that it is.
+- **No env flag and no wire field.** The threshold is a constant, the counter is always on, and
+  `finish_reason`, the status code, the chunks, the `usage`/`timings` blocks and the generated
+  ids are all exactly what they were. It runs after the last `decode_step`: one hash pass over at
+  most `max_tokens` ids, eight `u64` of state, off the numeric path by construction.
+- **A healthy answer adds NOTHING to the `[chat]` line**, which is what keeps
+  `tools/replay-toolcalls.py`, `tools/drift-chain.sh`'s parser and `tools/gate-linux.sh` reading
+  the line of record.
+
+**Scope: per process, and deliberately not per "session".** `serve` holds ONE conversation
+(7.4, #31 A9) and the wire carries no session id, so there is nothing else to key on. A cold
+prefill would be the wrong key: an identical re-send is cold BY CONSTRUCTION — the snapshot sits
+at that prompt's own length, so the reuse rule needs `S_pos < len` and finds `P = 0` — and an
+identical re-send is exactly the case this counter exists to see. The ring therefore lives as
+long as the process does, and a restart is what clears it.
+
+**Live at this commit** (`serve` on 8099, four identical greedy requests, then `max_tokens 1`,
+then a fresh prompt; `decode_out/68b/serve-part1-proof.log`):
+
+```text
+[chat] prompt 21 tok ..., generated 1 tok, ..., finish stop, ..., crow_trickle_swaps 0, single-token answer
+[chat] prompt 21 tok ..., finish stop, ..., crow_trickle_swaps 0, repeat run 2, single-token answer
+[chat] the client is looping: 3 identical answers in a row (#68) - an observation, ...
+[chat] prompt 21 tok ..., finish stop, ..., crow_trickle_swaps 0, repeat run 3, single-token answer
+[chat] the client is looping: 4 identical answers in a row (#68) - an observation, ...
+[chat] prompt 21 tok ..., finish stop, ..., crow_trickle_swaps 0, repeat run 4, single-token answer
+[chat] prompt 20 tok ..., generated 1 tok, ..., finish length, ..., crow_trickle_swaps 0
+[chat] prompt 18 tok ..., generated 21 tok, ..., finish stop, ..., crow_trickle_swaps 672
+```
+
+- The four `Paris` answers are one id each and identical, so they carry both marks; the WARN
+  fires on the third and again on the fourth. Three identical 21-token answers in the same run
+  read `repeat run 3` with no `single-token answer`.
+- The `max_tokens 1` line is the rule working: one generated id, `finish length`, no mark.
+- The last line is a fresh answer and is byte-identical in shape to the line of record.
+- The `routing` line of the answer that came BACK after one different answer reads
+  `"repeat_of":2,"repeat_run":1,"single_token":false` — the `[chat]` line says nothing (the run
+  is broken) and the log reader can still plot the distance. Unit tests:
+  `the_repeat_ring_counts_the_run_and_the_distance_back`,
+  `the_repeat_ring_sees_the_generated_ids_and_only_the_last_eight`,
+  `a_single_token_answer_is_one_id_the_model_ended_itself`,
+  `the_loop_warning_and_the_chat_line_suffix_fire_at_three` (`bin/serve.rs`).
+
 ### 7.12 The stage A gate table (what was measured, and where the artefact is)
 
 **Rule: a gate without a log artefact does not count.**
@@ -3956,9 +4029,12 @@ has ever logged. Fields: `seq`, `route`, `finish`, `prompt_n`, `cached_n`, `pred
 `prompt_ms`, `predicted_ms`, `tok_s`, `selections`, `cold`, `hit_rate` (= 1 − cold/selections, the
 residency hit rate), `layers_cold` (how many of the 48 layers had cold work at all),
 `bytes_streamed` (= cold × (`gu_bytes` + `dn_bytes`)), `ple_rows`, `ple_fills`, `ple_miss_rate`,
-`trickle_swaps`, `counters_ms`. The same shape is emitted per prefill CHUNK at DEBUG with
+`trickle_swaps`, `counters_ms`, and since `#68` (2026-09-18) the three fields of the cross-turn
+repeat counter — `repeat_of`, `repeat_run` and `single_token` (7.11.19), on EVERY request, so a
+log reader can plot a client's loop without grepping prose. The same shape is emitted per prefill CHUNK at DEBUG with
 `route: "prefill_chunk"`, carrying only what is free there — the device block is deliberately NOT
-drained per chunk, because that `dtoh_u64` would land inside the window it is measuring.
+drained per chunk, because that `dtoh_u64` would land inside the window it is measuring; a chunk
+line carries no answer either, so its three `#68` fields stay at their default (`0`, `0`, false).
 
 **What the spec's list does not get.** Requirement 5 also names *ring round-trip times*. There is
 no ring round-trip counter in this tree to drain: the QSA ring is a device-side flag poll and the

@@ -141,6 +141,21 @@
 #                              which is how a dead debug path read as a measurement for
 #                              sixteen days - so 202 = 113 lib + 78 serve + 6 parity +
 #                              5 decode.
+#                              #68 (2026-09-18) added four in `bin/serve.rs` for the
+#                              cross-turn repeat counter, all pure host logic with no GPU
+#                              and no model: the ring's run and its distance back (a run is
+#                              CONSECUTIVE, so an answer that returns after another one
+#                              starts its run over, and the run itself is NOT capped by the
+#                              ring - the live session's 48 identical answers report 48),
+#                              the hash over the GENERATED IDS (order and length matter,
+#                              and an answer older than the eight-deep ring is out of it),
+#                              the single-token rule (one id AND `finish stop`; the client's
+#                              own `max_tokens 1` budget is `length` and says nothing about
+#                              the model), and the WARN threshold plus the `[chat]` suffix -
+#                              a healthy answer adds NOTHING to that line, which is what
+#                              keeps `replay-toolcalls.py`, `drift-chain.sh` and this script
+#                              reading the line of record - so
+#                              206 = 113 lib + 82 serve + 6 parity + 5 decode.
 #   clippy 1421                #13 (2026-09-18) LOWERED the count of record by one, and by
 #                              exactly one: `warning: redundant reference in `eprintln!`
 #                              argument` at `gen.rs:2890` is gone because that line is a
@@ -171,7 +186,7 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="202"
+TESTS="206"
 CLIPPY="1421"
 
 red=0

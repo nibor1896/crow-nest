@@ -7,7 +7,9 @@
 ## v0.3.1 (unreleased) — the reasoning filter, and what the 170k session really was
 
 - Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Sixteen issues so far: `#67` (the
-  reasoning filter, `667b68b`), the engine side of `#68` (the long-context measurement, `f14e557`),
+  reasoning filter, `667b68b`), the engine side of `#68` (the long-context measurement, `f14e557`, and robin's decision of
+  the same day: the cross-turn repeat counter as observability plus the de-duplicated replay
+  that answers its open question 1),
   `#49` (the ragged hot-set sidecar, `0adbe6a`), `#60` (the `parity` record header per arm, and
   the last two bins that hard-coded the pre-`#51` container, `784bd64`), `#54` (the gone-client
   probe of the `stream:false` path, `20bc121`), `#65` (the bounded retry around the harness's
@@ -649,6 +651,34 @@
   can become a standing gate: **>= 4 of 5 Pass and 0 degenerate**.
 - `docs/long-context-goalmode.md` (`#68`, 2026-09-18): the measurement record of the replay, the
   penalty scope, the quality gate, the cause separation and the open questions.
+- **A cross-turn repeat counter on the `[chat]` and `routing` lines** (`#68`, robin's decision of
+  2026-09-18 on open question 4 of `docs/long-context-goalmode.md`): pure observability, no
+  sampling change and no new knob. `serve` keeps a ring of the last 8 answer HASHES per process
+  (FNV-1a over the GENERATED IDS — what the model produced, before the detokenizer, the tool-call
+  parser or the `#67` filter) and reports per completed request `repeat_of` (how many answers back
+  the most recent identical answer is, 0 = none in the ring), `repeat_run` (identical answers in a
+  row, 1 = none, NOT capped by the ring) and `single_token` (exactly one generated id and the model
+  ended the answer itself — a one-id answer that hit the client's own `max_tokens` budget is
+  `finish length` and does not count). All three are fields of the `routing` JSON line on every
+  request; the `[chat]` summary line gains `, repeat run N` only when N > 1 and
+  `, single-token answer` only when true, so a healthy session's line is byte-identical to the line
+  `tools/replay-toolcalls.py`, `tools/drift-chain.sh` and `tools/gate-linux.sh` grep. At three
+  identical answers in a row — or three single-token ones — ONE WARN line on target `chat` says
+  `the client is looping: N identical answers in a row (#68)` and nothing else happens: no 4xx, no
+  brake, no sampling change, the wire untouched. Why it is not a brake: nothing INSIDE one request
+  can see the live stage-3 shape — 48 of the 293 answers of the goal-mode session were the single
+  id 18 (`3`) with `finish stop` and every one of those requests was correct on its own — but the
+  PROCESS can, because `serve` is stateful (one client, one held conversation). SCOPE is per
+  process on purpose: there is no session id on the wire and an identical re-send is a COLD prefill
+  by construction, which is exactly the case the counter exists to see. Documented in
+  `docs/architecture.md` 7.11.19 and 9.3, `engine/README.md`.
+- Four tests (`cargo test --release` 202 → **206**, 113 lib + 82 serve + 6 parity + 5 decode), all
+  pure host logic in `bin/serve.rs` (`#68`, 2026-09-18): the ring's run and its distance back (a
+  run is CONSECUTIVE, and it is not capped by the ring — 48 identical answers report 48), the hash
+  over the generated ids (order and length matter, an answer older than the eight-deep ring is out
+  of it), the single-token rule (one id AND `finish stop`), and the WARN threshold plus the
+  `[chat]` suffix (a healthy answer adds nothing to that line).
+  `tools/gate-linux.sh` carries the new count with its provenance.
 - Three tests (`cargo test --release` 171 → **174**, 100 lib + 74 serve): `sample.rs`
   `the_presence_penalty_is_applied_once_per_distinct_token` (presence and frequency pick DIFFERENT
   tokens on the test's logits, so it cannot pass under a count-scaled penalty) and
