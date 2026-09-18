@@ -6,13 +6,54 @@
 
 ## v0.3.1 (unreleased) — the reasoning filter, and what the 170k session really was
 
-- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Two issues so far: `#67` (the
-  reasoning filter, `667b68b`) and the engine side of `#68` (the long-context measurement, this
-  commit). The machine is the second environment block of `docs/system-landscape.md` unless a row
-  names another one.
+- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Three issues so far: `#67` (the
+  reasoning filter, `667b68b`), the engine side of `#68` (the long-context measurement, `f14e557`)
+  and `#49` (the ragged hot-set sidecar, this commit). The machine is the second environment block
+  of `docs/system-landscape.md` unless a row names another one.
 - The crate version field stays `0.1.0`, as it has for every release: this file is the record.
 
 ### Fixed
+
+- **A ragged hot-set sidecar asserted instead of naming the row it could not read** (`#49`,
+  found 2026-09-10 in stage B, fixed 2026-09-18). Rows of unequal length in the file
+  `CROW_HOTSETS` names survived the load and died two hundred lines further down in
+  `residency.rs` at `assert_eq!(s.len(), n)` with `47 != 155` — no file, no row, no length — and
+  whether they died at all depended on ROW 0: the loader read the sidecar's N as `sets[0].len()`
+  and adapted every row only when that one number differed from the config N. So the same ragged
+  file aborted the process at one N and loaded at another.
+
+  **Padded, not refused, and the rule is per row now.** `residency::sidecar_sets` (new, pure,
+  unit tested) parses the file and applies the loader's own adapt rule to EVERY row: a short row
+  is padded with the lowest unused expert ids, a long one is truncated, and each adapted row is
+  named with its own length (`row 3 has 47 ids: padded with the 113 lowest unused expert ids`).
+  Padding is what a short row can mean here: the planner gives every layer the same N hot slots
+  whatever the file says, so a short row does not describe a smaller layer, it leaves slots the
+  run has already paid for unspecified — and on the default tier residency is numerically
+  invisible (7.5 condition 2, the pointer table decides only WHERE an expert is read from), so
+  filling them is a placement choice and not a numeric one. Leaving them EMPTY would strand that
+  VRAM and put `spare_free` out of step with the occupied slots; a row LONGER than the stride
+  would hand the stream trickle a slot that holds a live expert. The padding is deterministic and
+  is appended after the file's own ids, so the sidecar's frequency order stays first and one
+  sidecar at one N always yields one hot set — which is what the lossy `CROW_COLD_TIER` tier
+  needs, where the hot set IS numeric.
+
+  **Refused by name, because no padding gives them a meaning**: a file that is not one JSON object
+  with a `sets` array of 48 rows, an entry that is not an expert id, an id outside `0..512`, and
+  an id named twice in one row (a duplicate would leave that layer's cold tier, sized
+  `E - sets[l].len()`, one slot short of the ids indexed into it). The ticket's own example lands
+  there: the converter writes no hot-set file at all — `converter/*.cnq.sidecar.jsonl` is the
+  per-tensor quantization report, one JSON object per LINE — so `CROW_HOTSETS` pointed at it now
+  answers `not one JSON object (trailing characters at line 2 column 1); a hot-set sidecar is one
+  JSON object with a "sets" array of 48 rows of expert ids` instead of dying in an `unwrap`. The
+  ragged file of the finding was the engine's OWN pre-`#52` warm-up output at
+  `<container>.hotsets.json` (gitignored, and absent on this machine since `#52` moved that path
+  to `CROW_HOTSETS_OUT`).
+
+  Tests 174 -> 177, all three in `residency.rs`: the ragged file with row 0 exactly at N (the case
+  the old loader could not see), the single-N file that keeps its one adapted line, and the
+  refusals including the converter's JSONL. Parity is untouched: the id-sorted
+  `decode_out/hotsets-M-longctx2100-n160.json` is 48 rows of 160 and takes the same path it did
+  before.
 
 - **`serve` streamed the model's `</think>` as content, and the client re-sent it every turn**
   (`#67`, opened 2026-09-17 against `487128d`, fixed 2026-09-18). `serve` renders the chat
@@ -546,7 +587,7 @@ The Linux values of record at `487128d`, the contract for every later commit: pa
 - The ten-task quality gate is not met on greedy, and sampling meets it on 1 of 6 seeds, open as `#11` and `#44`; decision on the default recorded in `#55`.
 - `min_p` is parsed and ignored: the device sampler implements top_k, top_p and presence only; decision M2 in `#28` (closed 2026-09-09), no tracking issue.
 - Closed by `#51` on 2026-09-11: `decode.rs:40`, `decode.rs:45`, `parity.rs:159`, `parity.rs:164` and `parity.rs:371` now name the same container and sidecar as `serve.rs:454-455` (found 2026-09-10 in stage B, `#48`).
-- A ragged hot-set sidecar makes `residency.rs:413` assert, so the container sidecars cannot be used unchanged (found 2026-09-10 in stage B, `#49`).
+- Closed by `#49` on 2026-09-18: a ragged sidecar is adapted row by row and every adapted row is named (`residency::sidecar_sets`), and a file that is not a hot set at all — the converter's per-tensor `*.cnq.sidecar.jsonl` among them — is refused by name instead of asserting (found 2026-09-10 in stage B, `#49`).
 - Closed by `#34` on 2026-09-11: `parity.rs:54-55` and `parity.rs:77-78` set `PYTHONIOENCODING=utf-8` and `PYTHONUTF8=1` on the oracle process itself, so a bare invocation tokenizes the same ids as a chain (found 2026-09-09 in stage A, `#25`).
 - Closed by `#53` on 2026-09-11: a `parity` record header names the sampler that produced it, so the six C2 sampling series no longer read as greedy (found 2026-09-11 in the whole-branch review, first noted in `#40`).
 - Closed by `#52` on 2026-09-11: `residency.rs:46` and `sf_scan.rs:9` name the `-M` container, and the `residency` warm-up sidecar moved to `CROW_HOTSETS_OUT` (found 2026-09-11 in the E8 follow-up, `#51`).

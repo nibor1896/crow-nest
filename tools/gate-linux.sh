@@ -53,7 +53,15 @@
 #                              penalizes nothing, which is what the server builds per request),
 #                              plus `bin/serve.rs`
 #                              `the_sampling_line_says_which_values_the_request_carried` - so
-#                              174 = 100 lib + 74 serve.
+#                              174 = 100 lib + 74 serve. #49 (2026-09-18) added three in
+#                              `residency.rs` for the hot-set sidecar loader: the RAGGED file
+#                              (rows of unequal length, row 0 exactly at N - the case the old
+#                              loader could not see) adapted row by row with every adapted row
+#                              named, the single-N file that keeps its one adapted line, and the
+#                              refusals of a file that is not a hot set at all (the converter's
+#                              per-tensor `*.cnq.sidecar.jsonl`, a missing `sets`, 47 rows, an id
+#                              outside 0..512, an id twice in one row) - so 177 = 103 lib +
+#                              74 serve.
 #                              Clippy is unchanged at
 #                              1422: it is the --all-targets form counted as grep -cE '^warning: ',
 #                              the form the 1494 -> 1480 -> 1426 -> 1422 series was counted with.
@@ -78,7 +86,7 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="174"
+TESTS="177"
 CLIPPY="1422"
 
 red=0

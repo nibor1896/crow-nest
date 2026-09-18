@@ -175,6 +175,16 @@ point (7.13 has the two numbers and the measurement). `CROW_VIT=0` reserves noth
 - Warm-up: first runs accumulate per-layer selection counts (every routed choice counts,
   hit or miss — the print_locality discipline), promote the top-N per layer, and persist
   the sets in a sidecar next to the model file; refreshable by config or command.
+- Sidecar contract (`residency::sidecar_sets`, `#49`, 2026-09-18): the file is ONE JSON object
+  with a `sets` array of 48 rows of expert ids. Row lengths are adapted to the run's N **per
+  row** — a short row is padded with the lowest unused ids, a long one is truncated, and every
+  adapted row is logged with its own length. Padding is legitimate because the planner gives
+  every layer the same N hot slots whatever the file says and residency is numerically invisible
+  on the default tier (7.5 condition 2); it is deterministic, so one file at one N is one hot
+  set. What no padding can mean is REFUSED by name: not one JSON object, not 48 rows, an entry
+  that is not an expert id, an id outside `0..512`, an id twice in one row. The converter writes
+  no hot-set file — `converter/*.cnq.sidecar.jsonl` is the per-tensor quantization report, one
+  JSON object per line — and is refused here by name.
 - Routing-gated skip: a layer whose 10 routed experts are all resident has **no cold
   job at all** — the handoff count responds to this, measured per token (#7 acceptance).
 
@@ -846,7 +856,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - Consequence: hot-set adaptation between requests changes *where* an expert is read from,
   not *what* is read (`residency.rs:1-16`).
 - This holds for the default tier only.
-- `CROW_COLD_TIER` (`residency.rs:231`) installs a **low-bit** cold tier.
+- `CROW_COLD_TIER` (`residency.rs:206`) installs a **low-bit** cold tier.
 - The low-bit cold tier is lossy and would break bit-identity between two runs with
   different hot sets.
 - Rule: the server must not enable it while A9 is the gate.
@@ -1271,7 +1281,7 @@ Therefore:
   place, per request or otherwise (the Crow #54 rule).
 - Reason: a request-local value is the DIFFERENCE of two consecutive blocks; a reset would
   break that for every reader at once.
-- They are read by `Engine::drain_counters` (`gen.rs:3978`, `residency.rs:662`), a
+- They are read by `Engine::drain_counters` (`gen.rs:3978`, `residency.rs:645`), a
   `dtoh_u64` of 48 x 2 u64 = 768 bytes; "drain" READS, it does not zero.
 - Measured cost of that read: **0.026 ms** per request (A8, #30, `decode_out/srv-a8.log`).
 - Two decode rates on purpose: stderr prints `(gen - 1) / decode_ms * 1000`, the wire prints
@@ -2236,9 +2246,12 @@ fn`. Depends on `cnq`, `cuda`, `geo`. The returned tuple order IS the drop order
 free physical RAM, allocates the hot expert slabs in VRAM and the pinned cold tier, streams
 every expert tensor into them in ONE ascending sweep (8.8), and builds the slot tables; at run
 time it serves the swaps (`plan_swaps`, `swap_in`, `swap_in_bundled`) and the three-phase
-stream trickle (`swap_stream_a` / `swap_commit_a` / `swap_stream_b` / `swap_commit_b`).
-Surface: 17 `pub fn` plus `Residency`, `PendingSwap`, `LowBit`, `ExpertSlabs`. Depends on
-`cnq`, `cuda`, `geo`, `kernels`, `manager`. It may not depend on `gen` any more.
+stream trickle (`swap_stream_a` / `swap_commit_a` / `swap_stream_b` / `swap_commit_b`). The
+sidecar side is two pure functions around the JSON: `persist_sidecar` writes it and
+`sidecar_sets` reads it — the parse, the per-row length rule and every refusal of `#49`, unit
+tested without a GPU. Surface: 18 `pub fn` plus `Residency`, `PendingSwap`, `LowBit`,
+`ExpertSlabs`. Depends on `cnq`, `cuda`, `geo`, `kernels`, `manager`. It may not depend on `gen`
+any more.
 
 **`vit.rs`** — the #VIT visual tower: `VitW::load` / `Vit::new` (27 blocks from the container's
 `vit` section), the lazy cap-sized scratch, `Vit::run`, image decode and the hand-rolled HF

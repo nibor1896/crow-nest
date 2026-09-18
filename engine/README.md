@@ -62,7 +62,7 @@ serve [--port <n>] [--slot-save-path <dir>]
 - On Linux, start it through `../tools/serve-linux.sh`: it puts the process in a transient scope (`systemd-run --user --scope --slice=session.slice`, `MemorySwapMax=0`, `MemoryHigh=MemTotal-8G`, `MemoryMax=MemTotal-6G`) and sets `LD_LIBRARY_PATH` from `CUDA_LIB` (default `~/.local/share/crow/cuda/lib`, never the `lib/stubs` sibling).
 - Default port 8099, bind address `127.0.0.1` (`src/bin/serve.rs:491`, `src/bin/serve.rs:2983`).
 - Container default `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` (`src/geo.rs:75`), `CROW_CNQ` overrides it.
-- Hot-set default `decode_out/hotsets-M-longctx2100-n160.json` (`src/geo.rs:76`), `CROW_HOTSETS` overrides it.
+- Hot-set default `decode_out/hotsets-M-longctx2100-n160.json` (`src/geo.rs:76`), `CROW_HOTSETS` overrides it. The file is one JSON object with a `sets` array of 48 rows of expert ids; a row that is not as long as the run's N is padded or truncated and named in the load log, and a file that is not a hot set is refused by name (`src/residency.rs` `sidecar_sets`, issue #49, 2026-09-18).
 - Prompt chunk pinned at `2048` for the whole process, derived from `geo::TRICKLE_CHUNK_THRESHOLD` (`src/bin/serve.rs:497`, `src/geo.rs:57`).
 - Blocking, one request at a time, no async runtime; a second connection waits in the accept queue.
 - One engine per machine: `Engine::load` takes `engine/.engine.lock` before anything is pinned. On Linux the host-memory budget is derived at boot as `min(46 GiB cap, free_for_pin - CROW_RAM_MARGIN_GB)` and a second live CUDA process (detected by a foreign holder of `/dev/nvidia-uvm`) drops that basis to `MemAvailable` (`src/manager.rs:55`, issue #15).
@@ -190,7 +190,7 @@ cd engine
 cargo test --release
 ```
 
-- 174 passed, 0 failed on 2026-09-18 (100 lib + 74 serve; 165 on 2026-09-17, plus the six of issue #67 and the three of issue #68), and `cargo clippy --release --all-targets` reports 1,422 warnings, counted as `grep -cE '^warning: '`. Both counts are enforced by `../tools/gate-linux.sh`.
+- 177 passed, 0 failed on 2026-09-18 (103 lib + 74 serve; 165 on 2026-09-17, plus the six of issue #67, the three of issue #68 and the three of issue #49), and `cargo clippy --release --all-targets` reports 1,422 warnings, counted as `grep -cE '^warning: '`. Both counts are enforced by `../tools/gate-linux.sh`.
 - The ten tokenizer tests need `../models/` and are skipped without it.
 
 ```

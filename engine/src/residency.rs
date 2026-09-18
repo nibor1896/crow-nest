@@ -165,34 +165,15 @@ impl Residency {
         ));
 
         // ---- sets: sidecar or warm-up ----
+        // the parse, the per-row length rule (#49) and every refusal live in
+        // `sidecar_sets` below, which is a pure function and unit tested
         let (sets, source) = if std::path::Path::new(sidecar_path).exists() {
-            let txt = std::fs::read_to_string(sidecar_path).unwrap();
-            let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
-            let mut sets: Vec<Vec<u32>> = v["sets"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|a| a.as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect())
-                .collect();
-            assert_eq!(sets.len(), LAYERS);
-            // config N may differ from the sidecar N (two-sided budget clamp):
-            // adapt deterministically — truncate, or extend with the lowest
-            // unused ids (frequency order is not recoverable from the sidecar)
-            let sn = sets[0].len();
-            if sn != n {
-                for s in sets.iter_mut() {
-                    s.truncate(n);
-                    if s.len() < n {
-                        let mut extra = (0..E as u32).filter(|id| !s.contains(id)).collect::<Vec<_>>();
-                        extra.truncate(n - s.len());
-                        s.extend(extra);
-                        // no sort: sidecar order stays frequency-first so a
-                        // later truncate still keeps the hottest experts
-                    }
-                }
-                progress(&format!(
-                    "sidecar N={sn} adapted to config N={n} (deterministic truncate/extend)"
-                ));
+            let txt = std::fs::read_to_string(sidecar_path)
+                .unwrap_or_else(|e| panic!("hot-set sidecar {sidecar_path}: {e}"));
+            let (sets, notes) = sidecar_sets(&txt, n)
+                .unwrap_or_else(|e| panic!("hot-set sidecar {sidecar_path}: {e}"));
+            for m in &notes {
+                progress(m);
             }
             progress(&format!("hot sets loaded from sidecar {sidecar_path}"));
             (sets, "sidecar".to_string())
@@ -435,8 +416,10 @@ impl Residency {
         // spare slots: unoccupied, marked EMPTY in the slot map
         let mut sets = sets;
         let mut spare_free = Vec::with_capacity(LAYERS);
-        for s in sets.iter_mut() {
-            assert_eq!(s.len(), n);
+        for (l, s) in sets.iter_mut().enumerate() {
+            // an internal invariant since #49: a sidecar row is normalized to
+            // exactly `n` by `sidecar_sets`, a warm-up row is a top-n of E
+            assert_eq!(s.len(), n, "layer {l} hot set holds {} ids, not N={n}", s.len());
             s.resize(n_slots, EMPTY);
             spare_free.push((n..n_slots).collect::<Vec<usize>>());
         }
@@ -687,6 +670,125 @@ fn upload_u32(dst: CUdeviceptr, v: &[u32]) {
     }
 }
 
+/// The `sets` of a hot-set sidecar, parsed and normalized to `LAYERS` rows of
+/// exactly `n` expert ids, plus the lines the loader logs about what it did;
+/// `Err(msg)` names a file that cannot be read as a hot set at all.
+///
+/// `#49` (found 2026-09-10, fixed 2026-09-18): a RAGGED sidecar - rows of
+/// unequal length, which is what the pre-`#52` warm-up left next to the
+/// container - survived the load here and died two hundred lines later in
+/// `assert_eq!(s.len(), n)` with `47 != 155`, naming neither the file, nor the
+/// row, nor its length. Worse, whether it died at all depended on ROW 0: the
+/// old code took the sidecar's N from `sets[0].len()` and adapted every row
+/// only when that one differed from the config N.
+///
+/// The rule now is that same adapt rule applied to EVERY row on its own: a
+/// short row is PADDED with the lowest unused expert ids, a long one is
+/// TRUNCATED, and each adapted row is named with its own length.
+///
+/// Why padding is the meaning, and not a refusal: the planner gives every
+/// layer the same `n` hot slots whatever the file says, so a short row does
+/// not describe a smaller layer - it leaves slots the run has already paid for
+/// unspecified. Filling them is a placement choice and not a numeric one,
+/// because residency is numerically invisible on the default tier (an expert's
+/// sanitized bytes are identical in a VRAM slot and in the pinned cold tier;
+/// the pointer table only decides which of the two the kernel reads -
+/// architecture 7.5 condition 2). Leaving them EMPTY instead would strand that
+/// VRAM and put `spare_free` out of step with the occupied slots, and a row
+/// LONGER than the stride would hand the stream trickle a slot that holds a
+/// live expert. The padding is deterministic - the lowest unused ids in
+/// ascending order, appended AFTER the file's own ids, so the sidecar's
+/// frequency order stays first and a later truncate still keeps the hottest
+/// experts - so one sidecar at one N always yields one hot set, which is what
+/// the lossy `CROW_COLD_TIER` tier needs, where the hot set IS numeric.
+///
+/// REFUSED by name, because no padding gives it a meaning: a file that is not
+/// one JSON object with a `sets` array of `LAYERS` rows (the converter's
+/// `*.cnq.sidecar.jsonl` is a per-tensor quantization report with one JSON
+/// object per LINE, not a hot set, and lands here), an entry that is not an
+/// expert id, an id outside `0..E`, and an id named twice in one row - a
+/// duplicate would leave the layer's cold tier, sized `E - sets[l].len()`, one
+/// slot short of the ids indexed into it, and the fill would die in
+/// `Pinned::write_bytes`'s own bounds assert instead.
+pub fn sidecar_sets(txt: &str, n: usize) -> Result<(Vec<Vec<u32>>, Vec<String>), String> {
+    if n == 0 || n > E {
+        return Err(format!("N={n} is not a hot-set size (1..={E} experts per layer)"));
+    }
+    let v: serde_json::Value = serde_json::from_str(txt).map_err(|e| {
+        format!("not one JSON object ({e}); a hot-set sidecar is one JSON object with a \"sets\" array of {LAYERS} rows of expert ids")
+    })?;
+    let rows = v.get("sets").and_then(|s| s.as_array()).ok_or_else(|| {
+        format!("no \"sets\" array; a hot-set sidecar is one JSON object with a \"sets\" array of {LAYERS} rows of expert ids")
+    })?;
+    if rows.len() != LAYERS {
+        return Err(format!("\"sets\" has {} rows, the model has {LAYERS} layers", rows.len()));
+    }
+    let mut sets: Vec<Vec<u32>> = Vec::with_capacity(LAYERS);
+    for (l, r) in rows.iter().enumerate() {
+        let a = r.as_array().ok_or_else(|| format!("row {l} is not an array of expert ids"))?;
+        let mut row: Vec<u32> = Vec::with_capacity(a.len());
+        for (i, x) in a.iter().enumerate() {
+            let id = x.as_u64().ok_or_else(|| format!("row {l} entry {i} is not an expert id: {x}"))?;
+            if id >= E as u64 {
+                return Err(format!("row {l} entry {i} names expert {id}, outside 0..{E}"));
+            }
+            let id = id as u32;
+            if row.contains(&id) {
+                return Err(format!("row {l} names expert {id} twice (entry {i}): a hot set is a set"));
+            }
+            row.push(id);
+        }
+        sets.push(row);
+    }
+    // ---- the length rule (#49): per row, never from row 0 ----
+    let lens: Vec<usize> = sets.iter().map(|s| s.len()).collect();
+    let (lo, hi) = (*lens.iter().min().unwrap(), *lens.iter().max().unwrap());
+    let mut notes = Vec::new();
+    if lo == hi && lo != n {
+        // one N for the whole file: the two-sided budget clamp moved N between
+        // the warm-up that wrote it and this run - one line, as before #49
+        notes.push(format!("sidecar N={lo} adapted to config N={n} (deterministic truncate/extend)"));
+    } else if lo != hi {
+        notes.push(format!(
+            "ragged sidecar (#49): the {LAYERS} rows are {lo}..{hi} ids long, not all N={n} - every row is adapted on its own"
+        ));
+    }
+    let mut named = 0usize;
+    let mut unnamed = 0usize;
+    for (l, s) in sets.iter_mut().enumerate() {
+        let had = s.len();
+        if had == n {
+            continue;
+        }
+        s.truncate(n);
+        if s.len() < n {
+            let mut extra = (0..E as u32).filter(|id| !s.contains(id)).collect::<Vec<_>>();
+            extra.truncate(n - s.len());
+            s.extend(extra);
+        }
+        if lo == hi {
+            continue; // already said once, above
+        }
+        // name the row and its length - the message #49 asked for. The first
+        // eight say it in full; a file where every row is ragged gets a count
+        // instead of 48 boot-log lines.
+        if named < 8 {
+            named += 1;
+            notes.push(if had > n {
+                format!("  row {l} has {had} ids: truncated to the first {n} (the file's own order)")
+            } else {
+                format!("  row {l} has {had} ids: padded with the {} lowest unused expert ids", n - had)
+            });
+        } else {
+            unnamed += 1;
+        }
+    }
+    if unnamed > 0 {
+        notes.push(format!("  ... and {unnamed} further rows adapted the same way"));
+    }
+    Ok((sets, notes))
+}
+
 pub fn persist_sidecar(
     path: &str,
     n: usize,
@@ -720,5 +822,104 @@ impl Drop for Residency {
             for p in self.cold_gu.iter_mut() { p.free(); }
             for p in self.cold_dn.iter_mut() { p.free(); }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `lens` for a file whose rows are all `k` long
+    fn uniform(k: usize, rows: usize) -> Vec<usize> {
+        std::iter::repeat_n(k, rows).collect()
+    }
+
+    /// a sidecar in the shape the loader writes, with `lens` per row
+    fn sidecar(lens: &[usize]) -> String {
+        let sets: Vec<Vec<u32>> = lens.iter().map(|&k| (0..k as u32).map(|i| (i * 3 + 7) % E as u32).collect()).collect();
+        // the ids above are distinct for every k used here (k <= 170, stride 3
+        // against 512), which is what a real row is
+        serde_json::json!({ "version": 1, "n_per_layer": lens[0], "sets": sets }).to_string()
+    }
+
+    /// `#49`: rows of unequal length are adapted row by row and every adapted
+    /// row is NAMED with its own length - the old loader asserted `47 != 155`
+    /// two hundred lines further down, and only when row 0 happened to be N.
+    #[test]
+    fn a_ragged_sidecar_is_padded_row_by_row_and_names_every_row() {
+        let n = 160;
+        let mut lens = uniform(n, LAYERS);
+        lens[0] = n; // row 0 is exactly N: the case the old code could not see
+        lens[3] = 47; // the length of the finding
+        lens[12] = 0;
+        lens[17] = 170; // longer than N
+        let (sets, notes) = sidecar_sets(&sidecar(&lens), n).expect("a ragged sidecar loads");
+        assert_eq!(sets.len(), LAYERS);
+        for (l, s) in sets.iter().enumerate() {
+            assert_eq!(s.len(), n, "row {l}");
+            let mut u = s.clone();
+            u.sort_unstable();
+            u.dedup();
+            assert_eq!(u.len(), n, "row {l} holds an expert twice");
+            assert!(u.iter().all(|&id| id < E as u32), "row {l} holds an id outside 0..{E}");
+        }
+        let all = notes.join("\n");
+        assert!(all.contains("ragged sidecar (#49)"), "{all}");
+        assert!(all.contains("0..170 ids long"), "{all}");
+        assert!(all.contains("row 3 has 47 ids: padded with the 113 lowest unused expert ids"), "{all}");
+        assert!(all.contains("row 12 has 0 ids: padded with the 160 lowest unused expert ids"), "{all}");
+        assert!(all.contains("row 17 has 170 ids: truncated to the first 160"), "{all}");
+        // the file's own ids come first, the padding after (frequency order)
+        assert_eq!(&sets[3][..47], &sidecar_sets(&sidecar(&uniform(47, LAYERS)), 47).unwrap().0[3][..]);
+    }
+
+    /// one N for the whole file is the pre-#49 case and keeps its one line
+    #[test]
+    fn a_sidecar_cut_at_another_n_keeps_its_single_adapted_line() {
+        let (sets, notes) = sidecar_sets(&sidecar(&uniform(160, LAYERS)), 155).unwrap();
+        assert!(sets.iter().all(|s| s.len() == 155));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0], "sidecar N=160 adapted to config N=155 (deterministic truncate/extend)");
+        let (sets, notes) = sidecar_sets(&sidecar(&uniform(160, LAYERS)), 160).unwrap();
+        assert!(sets.iter().all(|s| s.len() == 160));
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// a file that is not a hot set is refused with a message that names what
+    /// it is - `CROW_HOTSETS` pointed at the converter's per-tensor sidecar
+    /// (one JSON object per LINE) is the case from the ticket
+    #[test]
+    fn a_file_that_is_not_a_hot_set_is_refused_by_name() {
+        let jsonl = "{\"dtype\":\"bf16\",\"n\":10240,\"name\":\"a.weight\",\"section\":\"text\"}\n\
+                     {\"dtype\":\"nvfp4\",\"n\":3276800,\"name\":\"b.weight\",\"section\":\"text\"}\n";
+        let e = sidecar_sets(jsonl, 160).unwrap_err();
+        assert_eq!(
+            e,
+            "not one JSON object (trailing characters at line 2 column 1); a hot-set sidecar is \
+             one JSON object with a \"sets\" array of 48 rows of expert ids"
+        );
+
+        let e = sidecar_sets("{\"version\":1}", 160).unwrap_err();
+        assert!(e.starts_with("no \"sets\" array"), "{e}");
+
+        let e = sidecar_sets(&sidecar(&uniform(160, LAYERS - 1)), 160).unwrap_err();
+        assert_eq!(e, "\"sets\" has 47 rows, the model has 48 layers");
+
+        let mut v: serde_json::Value = serde_json::from_str(&sidecar(&uniform(4, LAYERS))).unwrap();
+        v["sets"][5][2] = serde_json::json!(E);
+        let e = sidecar_sets(&v.to_string(), 4).unwrap_err();
+        assert_eq!(e, format!("row 5 entry 2 names expert {E}, outside 0..{E}"));
+
+        v["sets"][5][2] = v["sets"][5][0].clone();
+        let e = sidecar_sets(&v.to_string(), 4).unwrap_err();
+        assert_eq!(e, "row 5 names expert 7 twice (entry 2): a hot set is a set");
+
+        v["sets"][5][2] = serde_json::json!("7");
+        let e = sidecar_sets(&v.to_string(), 4).unwrap_err();
+        assert_eq!(e, "row 5 entry 2 is not an expert id: \"7\"");
+
+        v["sets"][5] = serde_json::json!(160);
+        let e = sidecar_sets(&v.to_string(), 4).unwrap_err();
+        assert_eq!(e, "row 5 is not an array of expert ids");
     }
 }
