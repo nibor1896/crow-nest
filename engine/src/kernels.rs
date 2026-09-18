@@ -1027,6 +1027,32 @@ extern "C" __global__ void gemv_bf16_b(const unsigned short* __restrict__ w, con
     if (threadIdx.x == 0) y[(size_t)t * gridDim.x + row] = red[0];
 }
 
+// #77: gemv_bf16_b with an EXPLICIT y row stride — the BF16 twin of gemv_fp4_bs, for the
+// shared expert's gate|up pair writing into ONE [t][1280] buffer (the layout silu_mul640
+// reads) when the dense overlay shadows those two tensors. Body verbatim gemv_bf16_b; only
+// the store address differs, exactly as gemv_fp4_bs differs from gemv_fp4_b.
+extern "C" __global__ void gemv_bf16_bs(const unsigned short* __restrict__ w, const float* __restrict__ x,
+                                        float* __restrict__ y, const int* __restrict__ k_dim_p,
+                                        const int* __restrict__ y_stride_p) {
+    int k_dim = *k_dim_p;
+    int ys = *y_stride_p;
+    int row = blockIdx.x;
+    int t = blockIdx.y;
+    const unsigned short* wp = w + (size_t)row * k_dim;
+    const float* xp = x + (size_t)t * k_dim;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < k_dim; i += blockDim.x)
+        acc += __int_as_float(((unsigned int)wp[i]) << 16) * xp[i];
+    __shared__ float redbs[256];
+    redbs[threadIdx.x] = acc;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) redbs[threadIdx.x] += redbs[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) y[(size_t)t * ys + row] = redbs[0];
+}
+
 // BF16-weight GEMV, one WARP per row, 16-byte vector loads (8 bf16 per lane
 // per step; k_dim % 8 == 0 for every keep shape: 320 / 2560 / 10240). Replaces
 // the block-per-row 2-byte-load kernels for the BF16 keeps (HC down/up, q/k,
@@ -4544,7 +4570,7 @@ impl Kernels {
             "gate_mul", "rms128", "rope64", "pool4_cache", "qk_k_append", "d2d_block", "qsa_scores",
             "qsa_select", "qsa_select_fast", "qsa_select_par_h", "qsa_select_par_e", "router_top10", "gather_ple_fp4", "gate_dot", "gate_apply", "ple_conv",
             "ple_state_update", "ple_conv_step", "argmax_k", "sample_topk_part", "sample_k", "add_flat",
-            "gemv_bf16_b", "gemv_bf16_w", "gemv_fp4_b1k", "hc_down_inj", "gemv_bf16_ws",
+            "gemv_bf16_b", "gemv_bf16_w", "gemv_fp4_b1k", "hc_down_inj", "gemv_bf16_ws", "gemv_bf16_bs",
             "gemm_fp4_dense", "gemm_bf16_dense", "gemm_fp4_dense_b", "gemm_bf16_dense_b", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_sel_split_l", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
             "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "gemv_fp4_mma_dg", "sh_gate_up_q", "gemv_fp4_mma_d32", "gemv_fp4_mma_g32", "attn_sel_r", "attn_sel_d8", "attn_sel_d9", "attn_sel_s", "attn_sel_s8", "attn_sel_s8l", "attn_sel_g",
             "gemm_fp4_f32x", "vit_ln", "vit_add_bias", "vit_pe_add", "vit_rope", "vit_attn", "gelu_erf", "gelu_tanh",

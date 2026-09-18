@@ -197,7 +197,34 @@
 #                              bug), the budget that runs out mid-thought in both request
 #                              forms, and a stored `reasoning_content` through the REAL
 #                              template. So 228 = 129 lib + 88 serve + 6 parity + 5 decode.
-#   clippy 1421                #13 (2026-09-18) LOWERED the count of record by one, and by
+#   tests 228 -> 231           #77 (2026-09-18) adds THREE library tests in `cnq.rs` for the
+#                              dense-BF16 overlay, all pure host logic with no GPU, no
+#                              container and no overlay file: the KIND rule `--kinds` and the
+#                              boot log count by (it has to be the twin of the converter's, or
+#                              an ablation would select nothing and read as "the originals
+#                              change nothing"), the TABLE OF REFUSALS `Cnq::attach_overlay`
+#                              applies before a single byte is loaded - the accepting case
+#                              first, then a missing `overlay` block, a different base name, a
+#                              different base byte count, no tensors, a dtype that is not
+#                              bf16, a name the base does not carry, the same name in another
+#                              SECTION, a different value count and a different shape - and
+#                              `byte_len` on a shadowed tensor (2 B per value against 36 B per
+#                              64: the 16 / 4.5 the residency planner has to see). So
+#                              231 = 132 lib + 88 serve + 6 parity + 5 decode.
+#   clippy 1421 -> 1458        #77 RAISED the count by 37, and every one of them is the
+#                              --all-targets noise this tree already carries in bulk: +29
+#                              `casting to the same type is unnecessary (u64 -> u64)` from the
+#                              launch arguments the seventeen dense kinds now pass through
+#                              their `PW::or_bf16*` wrappers (`Dev` IS `u64`; the call lines
+#                              themselves were written without the casts, which is why it is
+#                              29 and not 140), +3 `unsafe function's docs are missing a
+#                              # Safety section` for those three wrappers, +2 `manually
+#                              reimplementing div_ceil` and +1 `this function has too many
+#                              arguments (8/7)` for `or_bf16_s`, plus 2 in the neighbouring
+#                              rewritten blocks. No new lint KIND appears and no warning was
+#                              removed. Counted the same way as the 1494 -> 1480 -> 1426 ->
+#                              1422 -> 1421 series: grep -cE '^warning: ' on --all-targets.
+#   clippy 1421 (history)      #13 (2026-09-18) LOWERED the count of record by one, and by
 #                              exactly one: `warning: redundant reference in `eprintln!`
 #                              argument` at `gen.rs:2890` is gone because that line is a
 #                              `tracing` event now. The other 153 converted sites and the
@@ -227,8 +254,8 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="228"
-CLIPPY="1421"
+TESTS="231"
+CLIPPY="1458"
 
 red=0
 green() { printf 'GREEN  %-28s %s\n' "$1" "${2:-}"; }

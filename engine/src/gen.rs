@@ -108,35 +108,105 @@ impl PW {
             },
         }
     }
+
+    /// The NVFP4 block pointer and the per-tensor global scale, for the FUSED and GROUPED
+    /// kernels that take them as raw arguments. Every such call site stands behind an
+    /// `is_bf16()` guard (#77), so the panic is a contract check, not a reachable path.
+    pub fn w(&self) -> Dev {
+        match self {
+            PW::Fp4(w, _) => *w,
+            PW::Bf16(_) => panic!("a fused NVFP4 kernel was handed a bf16 weight (#77 overlay guard missing)"),
+        }
+    }
+    pub fn gs(&self) -> Dev {
+        match self {
+            PW::Fp4(_, gs) => *gs,
+            PW::Bf16(_) => panic!("a fused NVFP4 kernel was handed a bf16 weight (#77 overlay guard missing)"),
+        }
+    }
+
+    /// #77: is this weight a BF16 tensor - i.e. shadowed by the dense overlay?
+    ///
+    /// The predicate every FUSED or GROUPED FP4 launch is guarded with. Those kernels read
+    /// NVFP4 blocks and the quantized activation row; a BF16 tensor has neither, so the group
+    /// falls apart into its per-slab launches and each slab takes the kernel its dtype needs.
+    /// Without an overlay this is `false` everywhere and not one branch moves.
+    pub fn is_bf16(&self) -> bool { matches!(self, PW::Bf16(_)) }
+
+    /// #77: the call site's own FP4 launch, or - when the dense overlay shadows this tensor -
+    /// the BF16 GEMV over `t` tokens off the f32 activation `x`.
+    ///
+    /// `fp4` is the launch the site always had, moved verbatim into a closure so the default
+    /// path is byte-identical by construction. The BF16 alternative is `gemv_bf16_w` /
+    /// `gemm_bf16_dense` - the kernels `q_proj`, `k_proj` and the hyper-connection low-rank
+    /// have used since the 2026-09-03 keep-set amendment, on the SAME f32 activation the naive
+    /// FP4 GEMV reads. It is UNFUSED and slower; #77 buys correctness, not speed.
+    pub unsafe fn or_bf16(
+        &self, k: &Kernels, rows: usize, rows_p: u64, t: usize, t_p: u64, x: u64, y: u64, k_dim: u64,
+        fp4: impl FnOnce(Dev, Dev),
+    ) {
+        match self {
+            PW::Fp4(w, gs) => fp4(*w, *gs),
+            PW::Bf16(_) => self.launch_gemv(k, rows, rows_p, t, t_p, x, y, k_dim),
+        }
+    }
+
+    /// the decode twin of `or_bf16` (t = 1)
+    pub unsafe fn or_bf16_1(
+        &self, k: &Kernels, rows: usize, rows_p: u64, x: u64, y: u64, k_dim: u64, fp4: impl FnOnce(Dev, Dev),
+    ) {
+        match self {
+            PW::Fp4(w, gs) => fp4(*w, *gs),
+            PW::Bf16(_) => self.launch_gemv1(k, rows, rows_p, x, y, k_dim),
+        }
+    }
+
+    /// `or_bf16` with an EXPLICIT y row stride: the shared expert's gate|up pair writes into
+    /// one `[t][1280]` buffer (`gemv_fp4_bs` / `gemv_bf16_bs`), every other site is compact.
+    pub unsafe fn or_bf16_s(
+        &self, k: &Kernels, rows: usize, rows_p: u64, t: usize, t_p: u64, x: u64, y: u64, k_dim: u64, y_stride: u64,
+        fp4: impl FnOnce(Dev, Dev),
+    ) {
+        match self {
+            PW::Fp4(w, gs) => fp4(*w, *gs),
+            PW::Bf16(w) => {
+                let _ = (rows_p, t_p);
+                launch_v(k.f("gemv_bf16_bs"), rows as u32, t as u32, 1, 256, &[*w as u64, x, y, k_dim, y_stride])
+            }
+        }
+    }
 }
 
 pub struct HcW {
     pub norm: Dev, // f32 [4][2560] (keep)
     pub down: PW,  // [320][10240] — BF16 keep since the 2026-09-03 amendment
     pub up: PW,    // [10240][320] — BF16 keep
-    pub inj: Fp4,  // [4][10240]
+    pub inj: PW,   // [4][10240] — NVFP4, or bf16 under the #77 dense overlay
 }
 
 pub enum SubW {
     Gdn {
-        qkv: Fp4,      // [10240][2560]
-        conv: Dev,     // f32 [10240][4] (dequant at load)
-        z: Fp4,        // [6144][2560]
-        b: Fp4,        // [48][2560]
-        a: Fp4,        // [48][2560]
+        // the five projections are NVFP4 in the shipped container and bf16 when the #77
+        // dense overlay shadows them; `conv` is f32 on the card either way (it is widened
+        // or dequantized at load, so its kernel never saw the difference)
+        qkv: PW,       // [10240][2560]
+        conv: Dev,     // f32 [10240][4] (dequant/widen at load)
+        z: PW,         // [6144][2560]
+        b: PW,         // [48][2560]
+        a: PW,         // [48][2560]
         alog: Dev,     // f32 [48]
         dt: Dev,       // f32 [48]
         norm: Dev,     // f32 [128]
-        out: Fp4,      // [2560][6144]
+        out: PW,       // [2560][6144]
     },
     Attn {
         q: PW,         // [12288][2560] — BF16 keep (2026-09-03 amendment)
         k: PW,         // [512][2560] — BF16 keep
-        v: Fp4,        // [512][2560]
-        o: Fp4,        // [2560][6144]
+        v: PW,         // [512][2560]
+        o: PW,         // [2560][6144]
         qn: Dev,       // f32 [256]
         kn: Dev,       // f32 [256]
-        iqk: Fp4,      // [640][2560] QSA indexer
+        iqk: PW,       // [640][2560] QSA indexer
         iqln: Dev,     // f32 [128]
         ikln: Dev,     // f32 [128]
     },
@@ -145,15 +215,15 @@ pub enum SubW {
 pub struct MoeW {
     pub router: Dev,  // f32 [512][2560] (BF16 keep, dequant at load)
     pub router_bf: Dev, // bf16 [512][2560] twin for gemm_bf16_dense (prefill, CROW_ROUTER_GEMM=1)
-    pub sg: Fp4,
-    pub su: Fp4,
-    pub sdn: Fp4,
+    pub sg: PW,
+    pub su: PW,
+    pub sdn: PW,
     pub sgate: Dev, // f32 [1][2560]
 }
 
 pub struct Ple {
-    pub key: Fp4,     // [10240][2560]
-    pub value: Fp4,   // [2560][2560]
+    pub key: PW,      // [10240][2560]
+    pub value: PW,    // [2560][2560]
     pub norm_key: Dev,
     pub norm_query: Dev,
     pub norm_conv: Dev,
@@ -837,39 +907,39 @@ impl Engine {
                 norm: load_f32(cnq, &pfx("attn_hyper_connection.hc_norm.weight"), sec),
                 down: load_pw(cnq, &pfx("attn_hyper_connection.input_mix_weight_down.weight"), sec),
                 up: load_pw(cnq, &pfx("attn_hyper_connection.input_mix_weight_up.weight"), sec),
-                inj: load_fp4(cnq, &pfx("attn_hyper_connection.block_inject_weight.weight"), sec),
+                inj: load_pw(cnq, &pfx("attn_hyper_connection.block_inject_weight.weight"), sec),
             });
             if is_attn(l) {
                 sub.push(SubW::Attn {
                     q: load_pw(cnq, &pfx("self_attn.q_proj.weight"), sec),
                     k: load_pw(cnq, &pfx("self_attn.k_proj.weight"), sec),
-                    v: load_fp4(cnq, &pfx("self_attn.v_proj.weight"), sec),
-                    o: load_fp4(cnq, &pfx("self_attn.o_proj.weight"), sec),
+                    v: load_pw(cnq, &pfx("self_attn.v_proj.weight"), sec),
+                    o: load_pw(cnq, &pfx("self_attn.o_proj.weight"), sec),
                     qn: load_f32(cnq, &pfx("self_attn.q_norm.weight"), sec),
                     kn: load_f32(cnq, &pfx("self_attn.k_norm.weight"), sec),
-                    iqk: load_fp4(cnq, &pfx("self_attn.indexer.index_qk_proj.weight"), sec),
+                    iqk: load_pw(cnq, &pfx("self_attn.indexer.index_qk_proj.weight"), sec),
                     iqln: load_f32(cnq, &pfx("self_attn.indexer.q_layernorm.weight"), sec),
                     ikln: load_f32(cnq, &pfx("self_attn.indexer.k_layernorm.weight"), sec),
                 });
             } else {
                 sub.push(SubW::Gdn {
-                    qkv: load_fp4(cnq, &pfx("linear_attn.in_proj_qkv.weight"), sec),
+                    qkv: load_pw(cnq, &pfx("linear_attn.in_proj_qkv.weight"), sec),
                     conv: dequant_fp4_dev(cnq, &pfx("linear_attn.conv1d.weight"), sec, GDN_CONV * 4),
-                    z: load_fp4(cnq, &pfx("linear_attn.in_proj_z.weight"), sec),
-                    b: load_fp4(cnq, &pfx("linear_attn.in_proj_b.weight"), sec),
-                    a: load_fp4(cnq, &pfx("linear_attn.in_proj_a.weight"), sec),
+                    z: load_pw(cnq, &pfx("linear_attn.in_proj_z.weight"), sec),
+                    b: load_pw(cnq, &pfx("linear_attn.in_proj_b.weight"), sec),
+                    a: load_pw(cnq, &pfx("linear_attn.in_proj_a.weight"), sec),
                     alog: load_small_f32(cnq, &pfx("linear_attn.A_log"), sec, 48),
                     dt: load_small_f32(cnq, &pfx("linear_attn.dt_bias"), sec, 48),
                     norm: load_f32(cnq, &pfx("linear_attn.norm.weight"), sec),
-                    out: load_fp4(cnq, &pfx("linear_attn.out_proj.weight"), sec),
+                    out: load_pw(cnq, &pfx("linear_attn.out_proj.weight"), sec),
                 });
             }
             moe.push(MoeW {
                 router: load_f32(cnq, &pfx("mlp.gate.weight"), sec),
                 router_bf: load_bf16_twin(cnq, &pfx("mlp.gate.weight"), sec),
-                sg: load_fp4(cnq, &pfx("mlp.shared_expert.gate_proj.weight"), sec),
-                su: load_fp4(cnq, &pfx("mlp.shared_expert.up_proj.weight"), sec),
-                sdn: load_fp4(cnq, &pfx("mlp.shared_expert.down_proj.weight"), sec),
+                sg: load_pw(cnq, &pfx("mlp.shared_expert.gate_proj.weight"), sec),
+                su: load_pw(cnq, &pfx("mlp.shared_expert.up_proj.weight"), sec),
+                sdn: load_pw(cnq, &pfx("mlp.shared_expert.down_proj.weight"), sec),
                 sgate: load_f32(cnq, &pfx("mlp.shared_expert_gate.weight"), sec),
             });
             if l % 12 == 0 {
@@ -884,7 +954,7 @@ impl Engine {
                 norm: load_f32(cnq, &pfx("mlp_hyper_connection.hc_norm.weight"), sec),
                 down: load_pw(cnq, &pfx("mlp_hyper_connection.input_mix_weight_down.weight"), sec),
                 up: load_pw(cnq, &pfx("mlp_hyper_connection.input_mix_weight_up.weight"), sec),
-                inj: load_fp4(cnq, &pfx("mlp_hyper_connection.block_inject_weight.weight"), sec),
+                inj: load_pw(cnq, &pfx("mlp_hyper_connection.block_inject_weight.weight"), sec),
             });
         }
         let dense_measured = cuda::total_vram_bytes() - cuda::free_vram_bytes();
@@ -1305,8 +1375,8 @@ impl Ple {
         // only the 128 big shard tables carry the `ple` section tag
         let sec = "text";
         let P = |s: &str| format!("model.language_model.layers.1.ple.{s}");
-        let key = load_fp4(cnq, &P("key_proj.weight"), sec);
-        let value = load_fp4(cnq, &P("value_proj.weight"), sec);
+        let key = load_pw(cnq, &P("key_proj.weight"), sec);
+        let value = load_pw(cnq, &P("value_proj.weight"), sec);
         let norm_key = load_f32(cnq, &P("norm_key.weight"), sec);
         let norm_query = load_f32(cnq, &P("norm_query.weight"), sec);
         let norm_conv = load_f32(cnq, &P("norm_conv.weight"), sec);
@@ -2149,14 +2219,17 @@ impl Engine {
         // finished accumulator and the merged grid keeps each row's dot
         // product unchanged. t >= 8 (prefill gemm_bf16_dense) keeps the
         // separate launches verbatim.
+        // #77: hc_down_inj carries the 4-row inject GEMV as an NVFP4 body, so the fusion
+        // needs the inject tensor to BE NVFP4. Under the dense overlay it is bf16 and the
+        // chain falls back to its unfused launches, where the inject takes the BF16 GEMV.
         let fuse = hc_fuse_on() && bf16_w_on() && inj_1k_on() && t < 8
-            && matches!(&w.down, PW::Bf16(_)) && matches!(&w.up, PW::Bf16(_));
+            && matches!(&w.down, PW::Bf16(_)) && matches!(&w.up, PW::Bf16(_)) && !w.inj.is_bf16();
         if fuse {
             let PW::Bf16(dw) = &w.down else { unreachable!() };
             let PW::Bf16(uw) = &w.up else { unreachable!() };
             launch_v(k.f("hc_down_inj"), ((LOWRANK + 7) / 8 + HCN) as u32, t as u32, 1, 256, &[
                 *dw as u64, s.normed as u64, s.sil as u64,
-                w.inj.w as u64, w.inj.gs as u64, injw as u64, p.n10240 as u64, p.n320 as u64]);
+                w.inj.w() as u64, w.inj.gs() as u64, injw as u64, p.n10240 as u64, p.n320 as u64]);
             launch_v(k.f("gemv_bf16_ws"), ((HCT + 7) / 8) as u32, t as u32, 1, 256, &[
                 *uw as u64, s.sil as u64, s.mixw as u64, p.n320 as u64, p.n10240 as u64]);
         } else {
@@ -2181,13 +2254,15 @@ impl Engine {
         // rows=4 saturates the naive kernel (4×256 threads) while the MMA tile
         // is a single active warp on one SM — mma_d is ~10x SLOWER at t=1 and
         // still behind at t=512. Documented skip, quality/perf over uniformity.
+        w.inj.or_bf16(k, HCN, p.nr4, t, p.t, s.normed, s.injr, p.n10240, |iw, igs| {
         if inj_1k_on() {
             launch_v(k.f("gemv_fp4_b1k"), HCN as u32, t as u32, 1, 1024, &[
-                w.inj.w as u64, s.normed as u64, w.inj.gs as u64, s.injr as u64, p.n10240 as u64]);
+                iw as u64, s.normed as u64, igs as u64, s.injr as u64, p.n10240 as u64]);
         } else {
             launch_v(k.f("gemv_fp4_b"), HCN as u32, t as u32, 1, 256, &[
-                w.inj.w as u64, s.normed as u64, w.inj.gs as u64, s.injr as u64, p.n10240 as u64]);
+                iw as u64, s.normed as u64, igs as u64, s.injr as u64, p.n10240 as u64]);
         }
+        });
         launch_v(k.f("sig2_div4"), ((t * HCN + 255) / 256) as u32, 1, 1, 256, &[
             s.injr as u64, injw as u64, p.nt_hc as u64]);
         }
@@ -2201,31 +2276,52 @@ impl Engine {
         let SubW::Gdn { qkv, conv, z, b, a, alog, dt, norm, out } = &self.w.sub[l] else {
             panic!("layer {l} is not GDN");
         };
-        if dense_mma_on() {
-            // one quantized `mixed` row set serves qkv/z/b/a (all k=2560)
+        let mma = dense_mma_on();
+        if mma {
+            // one quantized `mixed` row set serves qkv/z/b/a (all k=2560). #77: a slab the
+            // dense overlay shadows reads the f32 `mixed` row instead and ignores the cascade.
             quant_x_if_unfused(k, p, t as u32, mixed as u64, s.xq_m as u64, p.n2560 as u64, p.n2560 as u64);
-            launch_mma_d(k, (GDN_CONV / 64) as u32, t, p.t as u64, &[
-                qkv.w as u64, s.xq_m as u64, qkv.gs as u64, s.mq as u64,
-                p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
-            launch_mma_d(k, (GDN_VAL / 64) as u32, t, p.t as u64, &[
-                z.w as u64, s.xq_m as u64, z.gs as u64, s.gz as u64,
-                p.n2560 as u64, p.n6144 as u64, p.n6144 as u64]);
-            launch_mma_d(k, 1, t, p.t as u64, &[
-                b.w as u64, s.xq_m as u64, b.gs as u64, s.gb as u64,
-                p.n2560 as u64, p.nr48 as u64, p.nr48 as u64]);
-            launch_mma_d(k, 1, t, p.t as u64, &[
-                a.w as u64, s.xq_m as u64, a.gs as u64, s.ga as u64,
-                p.n2560 as u64, p.nr48 as u64, p.nr48 as u64]);
-        } else {
-            launch_v(k.f("gemv_fp4_b"), GDN_CONV as u32, t as u32, 1, 256, &[
-                qkv.w as u64, mixed as u64, qkv.gs as u64, s.mq as u64, p.n2560 as u64]);
-            launch_v(k.f("gemv_fp4_b"), GDN_VAL as u32, t as u32, 1, 256, &[
-                z.w as u64, mixed as u64, z.gs as u64, s.gz as u64, p.n2560 as u64]);
-            launch_v(k.f("gemv_fp4_b"), 48, t as u32, 1, 256, &[
-                b.w as u64, mixed as u64, b.gs as u64, s.gb as u64, p.n2560 as u64]);
-            launch_v(k.f("gemv_fp4_b"), 48, t as u32, 1, 256, &[
-                a.w as u64, mixed as u64, a.gs as u64, s.ga as u64, p.n2560 as u64]);
         }
+        qkv.or_bf16(k, GDN_CONV, p.n10240, t, p.t, mixed, s.mq, p.n2560, |w, gs| {
+            if mma {
+            launch_mma_d(k, (GDN_CONV / 64) as u32, t, p.t as u64, &[
+                w as u64, s.xq_m as u64, gs as u64, s.mq as u64,
+                p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
+            } else {
+            launch_v(k.f("gemv_fp4_b"), GDN_CONV as u32, t as u32, 1, 256, &[
+                w as u64, mixed as u64, gs as u64, s.mq as u64, p.n2560 as u64]);
+            }
+        });
+        z.or_bf16(k, GDN_VAL, p.n6144, t, p.t, mixed, s.gz, p.n2560, |w, gs| {
+            if mma {
+            launch_mma_d(k, (GDN_VAL / 64) as u32, t, p.t as u64, &[
+                w as u64, s.xq_m as u64, gs as u64, s.gz as u64,
+                p.n2560 as u64, p.n6144 as u64, p.n6144 as u64]);
+            } else {
+            launch_v(k.f("gemv_fp4_b"), GDN_VAL as u32, t as u32, 1, 256, &[
+                w as u64, mixed as u64, gs as u64, s.gz as u64, p.n2560 as u64]);
+            }
+        });
+        b.or_bf16(k, GDN_VHEADS, p.nr48, t, p.t, mixed, s.gb, p.n2560, |w, gs| {
+            if mma {
+            launch_mma_d(k, 1, t, p.t as u64, &[
+                w as u64, s.xq_m as u64, gs as u64, s.gb as u64,
+                p.n2560 as u64, p.nr48 as u64, p.nr48 as u64]);
+            } else {
+            launch_v(k.f("gemv_fp4_b"), 48, t as u32, 1, 256, &[
+                w as u64, mixed as u64, gs as u64, s.gb as u64, p.n2560 as u64]);
+            }
+        });
+        a.or_bf16(k, GDN_VHEADS, p.nr48, t, p.t, mixed, s.ga, p.n2560, |w, gs| {
+            if mma {
+            launch_mma_d(k, 1, t, p.t as u64, &[
+                w as u64, s.xq_m as u64, gs as u64, s.ga as u64,
+                p.n2560 as u64, p.nr48 as u64, p.nr48 as u64]);
+            } else {
+            launch_v(k.f("gemv_fp4_b"), 48, t as u32, 1, 256, &[
+                w as u64, mixed as u64, gs as u64, s.ga as u64, p.n2560 as u64]);
+            }
+        });
         launch_v(k.f("transpose_rt"), GDN_CONV as u32, 1, 1, 256, &[
             s.mq as u64, s.mq_t as u64, p.t as u64, p.n10240 as u64]);
         launch_v(k.f("conv_silu"), GDN_CONV as u32, 1, 1, 256, &[
@@ -2248,15 +2344,19 @@ launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
             launch_v(k.f("rmsnorm_gated"), 48, t as u32, 1, 128, &[
                 s.gcore as u64, s.gz as u64, *norm as u64, s.gnorm as u64]);
         }
-        if dense_mma_on() {
+        if mma {
             quant_x_if_unfused(k, p, t as u32, s.gnorm as u64, s.xq_v as u64, p.n6144 as u64, p.n6144 as u64);
-            launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
-                out.w as u64, s.xq_v as u64, out.gs as u64, s.gout as u64,
-                p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
-        } else {
-            launch_v(k.f("gemv_fp4_b"), H as u32, t as u32, 1, 256, &[
-                out.w as u64, s.gnorm as u64, out.gs as u64, s.gout as u64, p.n6144 as u64]);
         }
+        out.or_bf16(k, H, p.n2560, t, p.t, s.gnorm, s.gout, p.n6144, |w, gs| {
+            if mma {
+            launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
+                w as u64, s.xq_v as u64, gs as u64, s.gout as u64,
+                p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
+            } else {
+            launch_v(k.f("gemv_fp4_b"), H as u32, t as u32, 1, 256, &[
+                w as u64, s.gnorm as u64, gs as u64, s.gout as u64, p.n6144 as u64]);
+            }
+        });
         s.gout
     }
 
@@ -2268,8 +2368,16 @@ launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
         let SubW::Gdn { qkv, conv, z, b, a, alog, dt, norm, out } = &self.w.sub[l] else {
             panic!("layer {l} is not GDN");
         };
-        if dense_mma_on() {
+        // #77: the grouped input launch reads FOUR NVFP4 slabs through one quantized row,
+        // so it may only run while all four ARE NVFP4. One slab shadowed by the dense
+        // overlay breaks the group open into the per-slab fallback of record, where each
+        // slab takes the kernel its own dtype needs. `in_fp4` is false only with an overlay.
+        let in_fp4 = !qkv.is_bf16() && !z.is_bf16() && !b.is_bf16() && !a.is_bf16();
+        let mma = dense_mma_on();
+        if mma {
             quant_x_if_unfused(k, p, 1, mixed as u64, s.xq_m as u64, p.n2560 as u64, p.n2560 as u64);
+        }
+        if mma && in_fp4 {
             if gdn_fuse_in_on() && gdn_split_z_on() {
                 // #71 (62 lever 1): the grouping stays for qkv + b + a
                 // (10240 + 48 + 48 = 10336 rows, ceil(/32) = 323 blocks) and
@@ -2286,13 +2394,13 @@ launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
                 // warnings the neighbouring launches do emit and these do not,
                 // which is how the gate's CLIPPY stays at its 1421 of record.)
                 launch_v(k.f("gemv_fp4_mma_g32"), (GDN_CONV + 2 * GDN_VHEADS).div_ceil(32) as u32, 1, 1, mma_bx32(), &[
-                    qkv.w, b.w, a.w, a.w,
-                    qkv.gs, b.gs, a.gs, a.gs,
+                    qkv.w(), b.w(), a.w(), a.w(),
+                    qkv.gs(), b.gs(), a.gs(), a.gs(),
                     s.mq, s.gb, s.ga, s.ga,
                     p.n10240, p.nr48, p.nr48, p.zero,
                     s.xq_m, p.n2560]);
                 launch_v(k.f("gemv_fp4_mma_d32"), GDN_VAL.div_ceil(32) as u32, 1, 1, mma_bx32(), &[
-                    z.w, s.xq_m, z.gs, s.gz,
+                    z.w(), s.xq_m, z.gs(), s.gz,
                     p.n2560, p.n6144, p.n6144]);
             } else if gdn_fuse_in_on() {
                 // #62b lever 1: the four input projections in ONE grouped
@@ -2300,34 +2408,68 @@ launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
                 // over the shared xq_m row); per-slab gs kept, per-row math =
                 // gemv_fp4_mma_d bit for bit (62a report lever 1).
                 launch_v(k.f("gemv_fp4_mma_g32"), ((GDN_CONV + GDN_VAL + 2 * GDN_VHEADS + 31) / 32) as u32, 1, 1, mma_bx32(), &[
-                    qkv.w as u64, z.w as u64, b.w as u64, a.w as u64,
-                    qkv.gs as u64, z.gs as u64, b.gs as u64, a.gs as u64,
+                    qkv.w() as u64, z.w() as u64, b.w() as u64, a.w() as u64,
+                    qkv.gs() as u64, z.gs() as u64, b.gs() as u64, a.gs() as u64,
                     s.mq as u64, s.gz as u64, s.gb as u64, s.ga as u64,
                     p.n10240 as u64, p.n6144 as u64, p.nr48 as u64, p.nr48 as u64,
                     s.xq_m as u64, p.n2560 as u64]);
             } else {
                 launch_v(k.f("gemv_fp4_mma_d32"), ((GDN_CONV + 31) / 32) as u32, 1, 1, mma_bx32(), &[
-                    qkv.w as u64, s.xq_m as u64, qkv.gs as u64, s.mq as u64,
+                    qkv.w() as u64, s.xq_m as u64, qkv.gs() as u64, s.mq as u64,
                     p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
                 launch_v(k.f("gemv_fp4_mma_d32"), ((GDN_VAL + 31) / 32) as u32, 1, 1, mma_bx32(), &[
-                    z.w as u64, s.xq_m as u64, z.gs as u64, s.gz as u64,
+                    z.w() as u64, s.xq_m as u64, z.gs() as u64, s.gz as u64,
                     p.n2560 as u64, p.n6144 as u64, p.n6144 as u64]);
                 launch_v(k.f("gemv_fp4_mma_d"), 1, 1, 1, mma_bx(), &[
-                    b.w as u64, s.xq_m as u64, b.gs as u64, s.gb as u64,
+                    b.w() as u64, s.xq_m as u64, b.gs() as u64, s.gb as u64,
                     p.n2560 as u64, p.nr48 as u64, p.nr48 as u64]);
                 launch_v(k.f("gemv_fp4_mma_d"), 1, 1, 1, mma_bx(), &[
-                    a.w as u64, s.xq_m as u64, a.gs as u64, s.ga as u64,
+                    a.w() as u64, s.xq_m as u64, a.gs() as u64, s.ga as u64,
                     p.n2560 as u64, p.nr48 as u64, p.nr48 as u64]);
             }
         } else {
-            launch_v(k.f("gemv_fp4"), GDN_CONV as u32, 1, 1, 256, &[
-                qkv.w as u64, mixed as u64, qkv.gs as u64, s.mq as u64, p.n2560 as u64]);
-            launch_v(k.f("gemv_fp4"), GDN_VAL as u32, 1, 1, 256, &[
-                z.w as u64, mixed as u64, z.gs as u64, s.gz as u64, p.n2560 as u64]);
-            launch_v(k.f("gemv_fp4"), 48, 1, 1, 256, &[
-                b.w as u64, mixed as u64, b.gs as u64, s.gb as u64, p.n2560 as u64]);
-            launch_v(k.f("gemv_fp4"), 48, 1, 1, 256, &[
-                a.w as u64, mixed as u64, a.gs as u64, s.ga as u64, p.n2560 as u64]);
+            // per-slab: the FP4 fallback of record for an NVFP4 slab, the BF16 warp GEMV
+            // off the f32 `mixed` row for one the overlay shadows (#77)
+            qkv.or_bf16_1(k, GDN_CONV, p.n10240, mixed, s.mq, p.n2560, |w, gs| {
+                if mma {
+                    launch_v(k.f("gemv_fp4_mma_d32"), ((GDN_CONV + 31) / 32) as u32, 1, 1, mma_bx32(), &[
+                        w as u64, s.xq_m as u64, gs as u64, s.mq as u64,
+                        p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
+                } else {
+                    launch_v(k.f("gemv_fp4"), GDN_CONV as u32, 1, 1, 256, &[
+                        w as u64, mixed as u64, gs as u64, s.mq as u64, p.n2560 as u64]);
+                }
+            });
+            z.or_bf16_1(k, GDN_VAL, p.n6144, mixed, s.gz, p.n2560, |w, gs| {
+                if mma {
+                    launch_v(k.f("gemv_fp4_mma_d32"), ((GDN_VAL + 31) / 32) as u32, 1, 1, mma_bx32(), &[
+                        w as u64, s.xq_m as u64, gs as u64, s.gz as u64,
+                        p.n2560 as u64, p.n6144 as u64, p.n6144 as u64]);
+                } else {
+                    launch_v(k.f("gemv_fp4"), GDN_VAL as u32, 1, 1, 256, &[
+                        w as u64, mixed as u64, gs as u64, s.gz as u64, p.n2560 as u64]);
+                }
+            });
+            b.or_bf16_1(k, GDN_VHEADS, p.nr48, mixed, s.gb, p.n2560, |w, gs| {
+                if mma {
+                    launch_v(k.f("gemv_fp4_mma_d"), 1, 1, 1, mma_bx(), &[
+                        w as u64, s.xq_m as u64, gs as u64, s.gb as u64,
+                        p.n2560 as u64, p.nr48 as u64, p.nr48 as u64]);
+                } else {
+                    launch_v(k.f("gemv_fp4"), 48, 1, 1, 256, &[
+                        w as u64, mixed as u64, gs as u64, s.gb as u64, p.n2560 as u64]);
+                }
+            });
+            a.or_bf16_1(k, GDN_VHEADS, p.nr48, mixed, s.ga, p.n2560, |w, gs| {
+                if mma {
+                    launch_v(k.f("gemv_fp4_mma_d"), 1, 1, 1, mma_bx(), &[
+                        w as u64, s.xq_m as u64, gs as u64, s.ga as u64,
+                        p.n2560 as u64, p.nr48 as u64, p.nr48 as u64]);
+                } else {
+                    launch_v(k.f("gemv_fp4"), 48, 1, 1, 256, &[
+                        w as u64, mixed as u64, gs as u64, s.ga as u64, p.n2560 as u64]);
+                }
+            });
         }
         launch_v(k.f("conv_step"), (GDN_CONV as u32 + 255) / 256, 1, 1, 256, &[
             s.mq as u64, *conv as u64, self.st.gdn_conv[gi] as u64, s.cout_t as u64]);
@@ -2346,15 +2488,19 @@ launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
             launch_v(k.f("rmsnorm_gated"), 48, 1, 1, 128, &[
                 s.gcore as u64, s.gz as u64, *norm as u64, s.gnorm as u64]);
         }
-        if dense_mma_on() {
+        if mma {
             quant_x_if_unfused(k, p, 1, s.gnorm as u64, s.xq_v as u64, p.n6144 as u64, p.n6144 as u64);
-            launch_v(k.f("gemv_fp4_mma_d32"), ((H + 31) / 32) as u32, 1, 1, mma_bx32(), &[
-                out.w as u64, s.xq_v as u64, out.gs as u64, s.gout as u64,
-                p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
-        } else {
-            launch_v(k.f("gemv_fp4"), H as u32, 1, 1, 256, &[
-                out.w as u64, s.gnorm as u64, out.gs as u64, s.gout as u64, p.n6144 as u64]);
         }
+        out.or_bf16_1(k, H, p.n2560, s.gnorm, s.gout, p.n6144, |w, gs| {
+            if mma {
+            launch_v(k.f("gemv_fp4_mma_d32"), ((H + 31) / 32) as u32, 1, 1, mma_bx32(), &[
+                w as u64, s.xq_v as u64, gs as u64, s.gout as u64,
+                p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
+            } else {
+            launch_v(k.f("gemv_fp4"), H as u32, 1, 1, 256, &[
+                w as u64, s.gnorm as u64, gs as u64, s.gout as u64, p.n6144 as u64]);
+            }
+        });
         s.gout
     }
 }
@@ -2401,30 +2547,37 @@ impl Engine {
         launch_v(k.f("rope"), NKV as u32, t as u32, 1, AHD as u32, &[
             s.akn as u64, cos, sin, s.akr as u64]);
         step!("launch #7");
-        if dense_mma_on() {
+        let mma = dense_mma_on();
+        if mma {
             // one quantized `mixed` row set serves v + indexer qk (both k=2560)
             quant_x_if_unfused(k, p, t as u32, mixed as u64, s.xq_m as u64, p.n2560 as u64, p.n2560 as u64);
-            launch_mma_d(k, (KV_ROWS / 64) as u32, t, p.t as u64, &[
-                v.w as u64, s.xq_m as u64, v.gs as u64, s.av as u64,
-                p.n2560 as u64, p.nr512 as u64, p.nr512 as u64]);
-        } else {
-            launch_v(k.f("gemv_fp4_b"), KV_ROWS as u32, t as u32, 1, 256, &[
-                v.w as u64, mixed as u64, v.gs as u64, s.av as u64, p.n2560 as u64]);
         }
+        v.or_bf16(k, KV_ROWS, p.nr512, t, p.t, mixed, s.av, p.n2560, |w, gs| {
+            if mma {
+            launch_mma_d(k, (KV_ROWS / 64) as u32, t, p.t as u64, &[
+                w as u64, s.xq_m as u64, gs as u64, s.av as u64,
+                p.n2560 as u64, p.nr512 as u64, p.nr512 as u64]);
+            } else {
+            launch_v(k.f("gemv_fp4_b"), KV_ROWS as u32, t as u32, 1, 256, &[
+                w as u64, mixed as u64, gs as u64, s.av as u64, p.n2560 as u64]);
+            }
+        });
         step!("launch #8");
         launch_v(k.f("store_kv"), 4, t as u32, 1, AHD as u32, &[
             s.akr as u64, s.av as u64, kc, vc, p.pos_base as u64, p.tmax as u64, p.mode as u64]);
         step!("launch #9");
 
         // ---- QSA indexer (raw keys append + block pooling + scores + select) ----
-        if dense_mma_on() {
+        iqk.or_bf16(k, QSA_QK_ROWS, p.n640, t, p.t, mixed, s.qk, p.n2560, |w, gs| {
+            if mma {
             launch_mma_d(k, (QSA_QK_ROWS / 64) as u32, t, p.t as u64, &[
-                iqk.w as u64, s.xq_m as u64, iqk.gs as u64, s.qk as u64,
+                w as u64, s.xq_m as u64, gs as u64, s.qk as u64,
                 p.n2560 as u64, p.n640 as u64, p.n640 as u64]);
-        } else {
+            } else {
             launch_v(k.f("gemv_fp4_b"), QSA_QK_ROWS as u32, t as u32, 1, 256, &[
-                iqk.w as u64, mixed as u64, iqk.gs as u64, s.qk as u64, p.n2560 as u64]);
-        }
+                w as u64, mixed as u64, gs as u64, s.qk as u64, p.n2560 as u64]);
+            }
+        });
         step!("launch #10");
         launch_v(k.f("rms128"), QSA_HEADS as u32, t as u32, 1, QSA_HD as u32, &[
             s.qk as u64, *iqln as u64, s.q_nrm as u64, p.q_heads4 as u64, p.qk_stride as u64]);
@@ -2500,15 +2653,19 @@ impl Engine {
                 s.aout as u64, s.agate as u64, s.agated as u64]);
         }
         step!("launch #20");
-        if dense_mma_on() {
+        if mma {
             quant_x_if_unfused(k, p, t as u32, s.agated as u64, s.xq_v as u64, p.n6144 as u64, p.n6144 as u64);
-            launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
-                o.w as u64, s.xq_v as u64, o.gs as u64, s.ay as u64,
-                p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
-        } else {
-            launch_v(k.f("gemv_fp4_b"), H as u32, t as u32, 1, 256, &[
-                o.w as u64, s.agated as u64, o.gs as u64, s.ay as u64, p.n6144 as u64]);
         }
+        o.or_bf16(k, H, p.n2560, t, p.t, s.agated, s.ay, p.n6144, |w, gs| {
+            if mma {
+            launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
+                w as u64, s.xq_v as u64, gs as u64, s.ay as u64,
+                p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
+            } else {
+            launch_v(k.f("gemv_fp4_b"), H as u32, t as u32, 1, 256, &[
+                w as u64, s.agated as u64, gs as u64, s.ay as u64, p.n6144 as u64]);
+            }
+        });
         step!("launch #21");
         s.ay
     }
@@ -2533,26 +2690,33 @@ impl Engine {
         kk.launch_gemv1(k, KV_ROWS, p.nr512 as u64, mixed as u64, s.ak as u64, p.n2560 as u64);
         launch_v(k.f("rmsnorm_1pw"), NKV as u32, 1, 1, AHD as u32, &[s.ak as u64, *kn as u64, s.akn as u64]);
         launch_v(k.f("rope_p"), NKV as u32, 1, 1, AHD as u32, &[s.akn as u64, cos, sin, s.akr as u64, p.pos_base as u64]);
-        if dense_mma_on() {
+        let mma = dense_mma_on();
+        if mma {
             quant_x_if_unfused(k, p, 1, mixed as u64, s.xq_m as u64, p.n2560 as u64, p.n2560 as u64);
-            launch_v(k.f("gemv_fp4_mma_d"), (KV_ROWS / 64) as u32, 1, 1, mma_bx(), &[
-                v.w as u64, s.xq_m as u64, v.gs as u64, s.av as u64,
-                p.n2560 as u64, p.nr512 as u64, p.nr512 as u64]);
-        } else {
-            launch_v(k.f("gemv_fp4"), KV_ROWS as u32, 1, 1, 256, &[
-                v.w as u64, mixed as u64, v.gs as u64, s.av as u64, p.n2560 as u64]);
         }
+        v.or_bf16_1(k, KV_ROWS, p.nr512, mixed, s.av, p.n2560, |w, gs| {
+            if mma {
+            launch_v(k.f("gemv_fp4_mma_d"), (KV_ROWS / 64) as u32, 1, 1, mma_bx(), &[
+                w as u64, s.xq_m as u64, gs as u64, s.av as u64,
+                p.n2560 as u64, p.nr512 as u64, p.nr512 as u64]);
+            } else {
+            launch_v(k.f("gemv_fp4"), KV_ROWS as u32, 1, 1, 256, &[
+                w as u64, mixed as u64, gs as u64, s.av as u64, p.n2560 as u64]);
+            }
+        });
         launch_v(k.f("store_kv"), 4, 1, 1, AHD as u32, &[
             s.akr as u64, s.av as u64, kc, vc, p.slot1 as u64, p.tmax as u64, p.mode as u64]);
 
-        if dense_mma_on() {
+        iqk.or_bf16_1(k, QSA_QK_ROWS, p.n640, mixed, s.qk, p.n2560, |w, gs| {
+            if mma {
             launch_v(k.f("gemv_fp4_mma_d"), (QSA_QK_ROWS / 64) as u32, 1, 1, mma_bx(), &[
-                iqk.w as u64, s.xq_m as u64, iqk.gs as u64, s.qk as u64,
+                w as u64, s.xq_m as u64, gs as u64, s.qk as u64,
                 p.n2560 as u64, p.n640 as u64, p.n640 as u64]);
-        } else {
+            } else {
             launch_v(k.f("gemv_fp4"), QSA_QK_ROWS as u32, 1, 1, 256, &[
-                iqk.w as u64, mixed as u64, iqk.gs as u64, s.qk as u64, p.n2560 as u64]);
-        }
+                w as u64, mixed as u64, gs as u64, s.qk as u64, p.n2560 as u64]);
+            }
+        });
         launch_v(k.f("rms128"), QSA_HEADS as u32, 1, 1, QSA_HD as u32, &[
             s.qk as u64, *iqln as u64, s.q_nrm as u64, p.q_heads4 as u64, p.qk_stride as u64]);
         launch_v(k.f("rope64"), QSA_HEADS as u32, 1, 1, QSA_HD as u32, &[
@@ -2644,15 +2808,19 @@ impl Engine {
             launch_v(k.f("gate_mul"), (CORE as u32 + 255) / 256, 1, 1, 256, &[
                 s.aout as u64, s.agate as u64, s.agated as u64]);
         }
-        if dense_mma_on() {
+        if mma {
             quant_x_if_unfused(k, p, 1, s.agated as u64, s.xq_v as u64, p.n6144 as u64, p.n6144 as u64);
-            launch_v(k.f("gemv_fp4_mma_d"), (H / 64) as u32, 1, 1, mma_bx(), &[
-                o.w as u64, s.xq_v as u64, o.gs as u64, s.ay as u64,
-                p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
-        } else {
-            launch_v(k.f("gemv_fp4"), H as u32, 1, 1, 256, &[
-                o.w as u64, s.agated as u64, o.gs as u64, s.ay as u64, p.n6144 as u64]);
         }
+        o.or_bf16_1(k, H, p.n2560, s.agated, s.ay, p.n6144, |w, gs| {
+            if mma {
+            launch_v(k.f("gemv_fp4_mma_d"), (H / 64) as u32, 1, 1, mma_bx(), &[
+                w as u64, s.xq_v as u64, gs as u64, s.ay as u64,
+                p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
+            } else {
+            launch_v(k.f("gemv_fp4"), H as u32, 1, 1, 256, &[
+                w as u64, s.agated as u64, gs as u64, s.ay as u64, p.n6144 as u64]);
+            }
+        });
         s.ay
     }
 }
@@ -2850,25 +3018,36 @@ impl Engine {
         // every row's dot product unchanged. t >= 8 (prefill gemm_fp4_dense)
         // and the gemv_fp4_bs non-mma fallback keep the separate launches
         // verbatim.
-        let sh_fuse = sh_fuse_on() && mma && dense && t < 8;
-        if dense {
-            if sh_fuse {
-                launch_v(k.f("sh_gate_up_q"), (INTER / 64) as u32, t as u32, 1, mma_bx(), &[
-                    m.sg.w as u64, m.su.w as u64, s.xq_gu as u64, m.sg.gs as u64,
-                    m.su.gs as u64, s.sh2 as u64, s.xq_s as u64, p.n2560 as u64, p.n640 as u64]);
-            } else {
-                launch_mma_d(k, (INTER / 64) as u32, t, p.t as u64, &[
-                    m.sg.w as u64, s.xq_gu as u64, m.sg.gs as u64, s.sh12 as u64,
-                    p.n2560 as u64, p.n640 as u64, p.n1280 as u64]);
-                launch_mma_d(k, (INTER / 64) as u32, t, p.t as u64, &[
-                    m.su.w as u64, s.xq_gu as u64, m.su.gs as u64, (s.sh12 + (INTER * 4) as u64),
-                    p.n2560 as u64, p.n640 as u64, p.n1280 as u64]);
-            }
+        // #77: the 19h fusion reads three NVFP4 slabs and the quantized rows; under the
+        // dense overlay those tensors are bf16 and the chain falls back to its separate
+        // launches, gate|up through the strided BF16 GEMV into the same [t][1280] buffer.
+        let sh_fuse = sh_fuse_on() && mma && dense && t < 8
+            && !m.sg.is_bf16() && !m.su.is_bf16() && !m.sdn.is_bf16();
+        if sh_fuse {
+            launch_v(k.f("sh_gate_up_q"), (INTER / 64) as u32, t as u32, 1, mma_bx(), &[
+                m.sg.w() as u64, m.su.w() as u64, s.xq_gu as u64, m.sg.gs() as u64,
+                m.su.gs() as u64, s.sh2 as u64, s.xq_s as u64, p.n2560 as u64, p.n640 as u64]);
         } else {
-            launch_v(k.f("gemv_fp4_bs"), INTER as u32, t as u32, 1, 256, &[
-                m.sg.w as u64, mixed_m as u64, m.sg.gs as u64, s.sh12 as u64, p.n2560 as u64, p.n1280 as u64]);
-            launch_v(k.f("gemv_fp4_bs"), INTER as u32, t as u32, 1, 256, &[
-                m.su.w as u64, mixed_m as u64, m.su.gs as u64, (s.sh12 + (INTER * 4) as u64), p.n2560 as u64, p.n1280 as u64]);
+            m.sg.or_bf16_s(k, INTER, p.n640, t, p.t, mixed_m, s.sh12, p.n2560, p.n1280, |w, gs| {
+                if dense {
+                launch_mma_d(k, (INTER / 64) as u32, t, p.t as u64, &[
+                    w as u64, s.xq_gu as u64, gs as u64, s.sh12 as u64,
+                    p.n2560 as u64, p.n640 as u64, p.n1280 as u64]);
+                } else {
+                launch_v(k.f("gemv_fp4_bs"), INTER as u32, t as u32, 1, 256, &[
+                    w as u64, mixed_m as u64, gs as u64, s.sh12 as u64, p.n2560 as u64, p.n1280 as u64]);
+                }
+            });
+            m.su.or_bf16_s(k, INTER, p.n640, t, p.t, mixed_m, s.sh12 + (INTER * 4) as u64, p.n2560, p.n1280, |w, gs| {
+                if dense {
+                launch_mma_d(k, (INTER / 64) as u32, t, p.t as u64, &[
+                    w as u64, s.xq_gu as u64, gs as u64, (s.sh12 + (INTER * 4) as u64),
+                    p.n2560 as u64, p.n640 as u64, p.n1280 as u64]);
+                } else {
+                launch_v(k.f("gemv_fp4_bs"), INTER as u32, t as u32, 1, 256, &[
+                    w as u64, mixed_m as u64, gs as u64, (s.sh12 + (INTER * 4) as u64), p.n2560 as u64, p.n1280 as u64]);
+                }
+            });
         }
         if !sh_fuse {
             if qfuse_on() {
@@ -2877,27 +3056,31 @@ impl Engine {
                 launch_v(k.f("silu_mul640"), 3, t as u32, 1, 256, &[s.sh12 as u64, s.sh2 as u64]);
             }
         }
-        if dense {
-            if sh_fuse {
-                // the sgv GEMV hoisted before the down launch (reads mixed_m
-                // only, so the hoist crosses no dependency)
-                launch_v(k.f("gemv_b"), 1, t as u32, 1, 256, &[
-                    m.sgate as u64, mixed_m as u64, s.sgv as u64, p.n2560 as u64]);
-                // down GEMV + gate_shared epilogue in ONE launch: moe_out =
-                // sigmoid(sgv[t]) * down, ASSIGN, first writer (no memset:
-                // the cuMemsetD8 history above applies unchanged)
-                launch_v(k.f("gemv_fp4_mma_dg"), (H / 64) as u32, t as u32, 1, mma_bx(), &[
-                    m.sdn.w as u64, s.xq_s as u64, m.sdn.gs as u64, s.sgv as u64,
-                    s.moe_out as u64, p.n640 as u64, p.n2560 as u64, p.n2560 as u64]);
-            } else {
-                quant_x_if_unfused(k, p, t as u32, s.sh2 as u64, s.xq_s as u64, p.n640 as u64, p.n640 as u64);
-                launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
-                    m.sdn.w as u64, s.xq_s as u64, m.sdn.gs as u64, s.sdown as u64,
-                    p.n640 as u64, p.n2560 as u64, p.n2560 as u64]);
-            }
+        if sh_fuse {
+            // the sgv GEMV hoisted before the down launch (reads mixed_m
+            // only, so the hoist crosses no dependency)
+            launch_v(k.f("gemv_b"), 1, t as u32, 1, 256, &[
+                m.sgate as u64, mixed_m as u64, s.sgv as u64, p.n2560 as u64]);
+            // down GEMV + gate_shared epilogue in ONE launch: moe_out =
+            // sigmoid(sgv[t]) * down, ASSIGN, first writer (no memset:
+            // the cuMemsetD8 history above applies unchanged)
+            launch_v(k.f("gemv_fp4_mma_dg"), (H / 64) as u32, t as u32, 1, mma_bx(), &[
+                m.sdn.w() as u64, s.xq_s as u64, m.sdn.gs() as u64, s.sgv as u64,
+                s.moe_out as u64, p.n640 as u64, p.n2560 as u64, p.n2560 as u64]);
         } else {
-            launch_v(k.f("gemv_fp4_b"), H as u32, t as u32, 1, 256, &[
-                m.sdn.w as u64, s.sh2 as u64, m.sdn.gs as u64, s.sdown as u64, p.n640 as u64]);
+            if dense && !m.sdn.is_bf16() {
+                quant_x_if_unfused(k, p, t as u32, s.sh2 as u64, s.xq_s as u64, p.n640 as u64, p.n640 as u64);
+            }
+            m.sdn.or_bf16(k, H, p.n2560, t, p.t, s.sh2, s.sdown, p.n640, |w, gs| {
+                if dense {
+                launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
+                    w as u64, s.xq_s as u64, gs as u64, s.sdown as u64,
+                    p.n640 as u64, p.n2560 as u64, p.n2560 as u64]);
+                } else {
+                launch_v(k.f("gemv_fp4_b"), H as u32, t as u32, 1, 256, &[
+                    w as u64, s.sh2 as u64, gs as u64, s.sdown as u64, p.n640 as u64]);
+                }
+            });
         }
         if !sh_fuse {
             launch_v(k.f("gemv_b"), 1, t as u32, 1, 256, &[
@@ -3103,27 +3286,34 @@ impl Engine {
             launch_v(k.f("gather_ple_fp4"), PLE_NHEADS as u32, t as u32, 1, PLE_EMB_DIM as u32, &[
                 pl.cache as u64, pl.gs as u64, s.ple_slots as u64, s.emb as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 11"); }
-            if dense_mma_on() {
+            let mma = dense_mma_on();
+            if mma {
                 quant_x_now(k, p, t as u32, s.emb as u64, s.xq_e as u64, p.n2560 as u64, p.n2560 as u64);
-                launch_mma_d(k, (HCT / 64) as u32, t, p.t as u64, &[
-                    pl.key.w as u64, s.xq_e as u64, pl.key.gs as u64, s.ple_key as u64,
-                    p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
-            } else {
-                launch_v(k.f("gemv_fp4_b"), HCT as u32, t as u32, 1, 256, &[
-                    pl.key.w as u64, s.emb as u64, pl.key.gs as u64, s.ple_key as u64, p.n2560 as u64]);
             }
+            pl.key.or_bf16(k, HCT, p.n10240, t, p.t, s.emb, s.ple_key, p.n2560, |w, gs| {
+                if mma {
+                launch_mma_d(k, (HCT / 64) as u32, t, p.t as u64, &[
+                    w as u64, s.xq_e as u64, gs as u64, s.ple_key as u64,
+                    p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
+                } else {
+                launch_v(k.f("gemv_fp4_b"), HCT as u32, t as u32, 1, 256, &[
+                    w as u64, s.emb as u64, gs as u64, s.ple_key as u64, p.n2560 as u64]);
+                }
+            });
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 12"); }
             launch_v(k.f("rms_group"), 4, t as u32, 1, 256, &[
                 s.ple_key as u64, pl.norm_key as u64, s.ple_kn as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 13"); }
-            if dense_mma_on() {
+            pl.value.or_bf16(k, H, p.n2560, t, p.t, s.emb, s.ple_val, p.n2560, |w, gs| {
+                if mma {
                 launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
-                    pl.value.w as u64, s.xq_e as u64, pl.value.gs as u64, s.ple_val as u64,
+                    w as u64, s.xq_e as u64, gs as u64, s.ple_val as u64,
                     p.n2560 as u64, p.n2560 as u64, p.n2560 as u64]);
-            } else {
+                } else {
                 launch_v(k.f("gemv_fp4_b"), H as u32, t as u32, 1, 256, &[
-                    pl.value.w as u64, s.emb as u64, pl.value.gs as u64, s.ple_val as u64, p.n2560 as u64]);
-            }
+                    w as u64, s.emb as u64, gs as u64, s.ple_val as u64, p.n2560 as u64]);
+                }
+            });
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 14"); }
             if let Some(dir) = dump_h() {
                 cuda::sync();
@@ -3209,28 +3399,35 @@ impl Engine {
             launch_v(k.f("gather_ple_fp4"), PLE_NHEADS as u32, 1, 1, PLE_EMB_DIM as u32, &[
                 pl.cache as u64, pl.gs as u64, s.ple_slots as u64, s.emb as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 1"); }
-            if dense_mma_on() {
+            let mma = dense_mma_on();
+            if mma {
                 // one quantized embed row set serves key + value (both k=2560)
                 quant_x_now(k, p, t as u32, s.emb as u64, s.xq_e as u64, p.n2560 as u64, p.n2560 as u64);
-                launch_mma_d(k, (HCT / 64) as u32, t, p.t as u64, &[
-                    pl.key.w as u64, s.xq_e as u64, pl.key.gs as u64, s.ple_key as u64,
-                    p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
-            } else {
-                launch_v(k.f("gemv_fp4"), HCT as u32, 1, 1, 256, &[
-                    pl.key.w as u64, s.emb as u64, pl.key.gs as u64, s.ple_key as u64, p.n2560 as u64]);
             }
+            pl.key.or_bf16_1(k, HCT, p.n10240, s.emb, s.ple_key, p.n2560, |w, gs| {
+                if mma {
+                launch_mma_d(k, (HCT / 64) as u32, t, p.t as u64, &[
+                    w as u64, s.xq_e as u64, gs as u64, s.ple_key as u64,
+                    p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
+                } else {
+                launch_v(k.f("gemv_fp4"), HCT as u32, 1, 1, 256, &[
+                    w as u64, s.emb as u64, gs as u64, s.ple_key as u64, p.n2560 as u64]);
+                }
+            });
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 2"); }
             launch_v(k.f("rms_group"), 4, 1, 1, 256, &[
                 s.ple_key as u64, pl.norm_key as u64, s.ple_kn as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 3"); }
-            if dense_mma_on() {
+            pl.value.or_bf16_1(k, H, p.n2560, s.emb, s.ple_val, p.n2560, |w, gs| {
+                if mma {
                 launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
-                    pl.value.w as u64, s.xq_e as u64, pl.value.gs as u64, s.ple_val as u64,
+                    w as u64, s.xq_e as u64, gs as u64, s.ple_val as u64,
                     p.n2560 as u64, p.n2560 as u64, p.n2560 as u64]);
-            } else {
+                } else {
                 launch_v(k.f("gemv_fp4"), H as u32, 1, 1, 256, &[
-                    pl.value.w as u64, s.emb as u64, pl.value.gs as u64, s.ple_val as u64, p.n2560 as u64]);
-            }
+                    w as u64, s.emb as u64, gs as u64, s.ple_val as u64, p.n2560 as u64]);
+                }
+            });
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 4"); }
             launch_v(k.f("rms_group"), 4, 1, 1, 256, &[
                 s.h as u64, pl.norm_query as u64, s.ple_qn as u64]);
@@ -4484,15 +4681,13 @@ impl Drop for Weights {
                 cuda::free_dev(&mut h.norm);
                 free_pw(&mut h.down);
                 free_pw(&mut h.up);
-                for f in [&mut h.inj.w, &mut h.inj.gs] {
-                    cuda::free_dev(f);
-                }
+                free_pw(&mut h.inj);
             }
             for s in self.sub.iter_mut() {
                 match s {
                     SubW::Gdn { qkv, conv, z, b, a, alog, dt, norm, out } => {
-                        for f in [&mut qkv.w, &mut qkv.gs, &mut z.w, &mut z.gs, &mut b.w, &mut b.gs, &mut a.w, &mut a.gs, &mut out.w, &mut out.gs] {
-                            cuda::free_dev(f);
+                        for w in [qkv, z, b, a, out] {
+                            free_pw(w);
                         }
                         cuda::free_dev(conv);
                         cuda::free_dev(alog);
@@ -4502,8 +4697,8 @@ impl Drop for Weights {
                     SubW::Attn { q, k, v, o, qn, kn, iqk, iqln, ikln } => {
                         free_pw(q);
                         free_pw(k);
-                        for f in [&mut v.w, &mut v.gs, &mut o.w, &mut o.gs, &mut iqk.w, &mut iqk.gs] {
-                            cuda::free_dev(f);
+                        for w in [v, o, iqk] {
+                            free_pw(w);
                         }
                         cuda::free_dev(qn);
                         cuda::free_dev(kn);
@@ -4518,8 +4713,8 @@ impl Drop for Weights {
                 // freed - the engine-side part of the 214 MB per reload (2026-09-05)
                 cuda::free_dev(&mut m.router_bf);
                 cuda::free_dev(&mut m.sgate);
-                for f in [&mut m.sg.w, &mut m.sg.gs, &mut m.su.w, &mut m.su.gs, &mut m.sdn.w, &mut m.sdn.gs] {
-                    cuda::free_dev(f);
+                for w in [&mut m.sg, &mut m.su, &mut m.sdn] {
+                    free_pw(w);
                 }
             }
         }
@@ -4530,8 +4725,8 @@ impl Drop for Ple {
     fn drop(&mut self) {
         unsafe {
             cuda::drop_dbg("before Ple");
-            for f in [&mut self.key.w, &mut self.key.gs, &mut self.value.w, &mut self.value.gs] {
-                cuda::free_dev(f);
+            for w in [&mut self.key, &mut self.value] {
+                free_pw(w);
             }
             cuda::free_dev(&mut self.norm_key);
             cuda::free_dev(&mut self.norm_query);

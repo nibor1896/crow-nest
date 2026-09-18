@@ -18,6 +18,9 @@ pub struct TensorInfo {
     pub n_values: u64,
     pub global_scale: f32,
     pub shape: Vec<u64>,
+    /// #77: this tensor's bytes live in the OVERLAY container, not in the base one.
+    /// `read_bytes` / `read_range` switch file on it and nothing else has to know.
+    pub overlay: bool,
 }
 
 pub struct Cnq {
@@ -45,6 +48,9 @@ pub struct Cnq {
     /// (0, 0) when the container carries no `ple` section, and then `Drop`
     /// purges the whole file exactly as it did before.
     ple_range: (u64, u64),
+    /// #77: the dense-BF16 overlay, when `CROW_CNQ_OVERLAY` named one. `None` is
+    /// today's behaviour exactly - `find` never looks, `read_bytes` never switches.
+    pub ov: Option<Overlay>,
 }
 
 /// pending bytes that make `Cnq::fadvise_consumed` issue its DONTNEED call.
@@ -521,7 +527,187 @@ pub fn open_sequential(path: &str) -> std::fs::File {
     f
 }
 
+/// The `tensors` array of a CNQ1 index trailer, as `TensorInfo`. One parse for the base
+/// container and for the #77 overlay - the overlay IS a CNQ1 container, so it must be read
+/// by the same code or the two could drift apart.
+pub fn parse_tensor_index(index: &serde_json::Value, overlay: bool) -> Vec<TensorInfo> {
+    let mut tensors = Vec::new();
+    for t in index["tensors"].as_array().into_iter().flatten() {
+        tensors.push(TensorInfo {
+            name: t["name"].as_str().unwrap().to_string(),
+            section: t["section"].as_str().unwrap().to_string(),
+            dtype: t["dtype"].as_str().unwrap().to_string(),
+            offset: t["offset"].as_u64().unwrap(),
+            n_values: t["n_values"].as_u64().unwrap(),
+            global_scale: t["global_scale"].as_f64().unwrap_or(1.0) as f32,
+            shape: t["shape"].as_array().map(|a| a.iter().map(|v| v.as_u64().unwrap()).collect()).unwrap_or_default(),
+            overlay,
+        });
+    }
+    tensors
+}
+
+/// #77: the dense-BF16 overlay opened beside the base container. A tensor named here shadows
+/// the base tensor of the same name and section; nothing else about the base changes, and
+/// without `CROW_CNQ_OVERLAY` this is `None` and not one byte of behaviour moves.
+pub struct Overlay {
+    pub path: String,
+    pub file: std::fs::File,
+    pub blob_offset: u64,
+    pub tensors: Vec<TensorInfo>,
+    /// the `overlay` block of the index trailer: base name and size, source, kinds, date
+    pub header: serde_json::Value,
+}
+
+/// What `Cnq::attach_overlay` found, for the boot log: the shadowed tensors per kind and the
+/// bytes they will hold on the card.
+pub struct OverlayReport {
+    pub path: String,
+    pub source: String,
+    pub built: String,
+    pub tensors: usize,
+    pub values: u64,
+    pub bytes: u64,
+    /// (kind, tensors, values), kind-sorted
+    pub per_kind: Vec<(String, usize, u64)>,
+}
+
+/// The KIND of a dense tensor: the name without the `…layers.<N>.` prefix and without
+/// `.weight`. The twin of `dense_overlay::kind_of` in the converter (#77).
+pub fn kind_of(name: &str) -> String {
+    let mut s = name;
+    if let Some(rest) = s.strip_prefix("model.language_model.layers.") {
+        if let Some(dot) = rest.find('.') {
+            if rest[..dot].bytes().all(|b| b.is_ascii_digit()) {
+                s = &rest[dot + 1..];
+            }
+        }
+    }
+    s.strip_suffix(".weight").unwrap_or(s).to_string()
+}
+
+/// Every way an overlay can fail to belong to this base container, as ONE named error each.
+/// The point of the list is that none of them may reach a kernel: a shape that does not match
+/// would be a silent wrong-size GEMV, an unknown name a weight nobody ever reads.
+pub fn overlay_refusal(
+    ov_index: &serde_json::Value,
+    ov_tensors: &[TensorInfo],
+    base_name: &str,
+    base_bytes: u64,
+    base: &[TensorInfo],
+) -> Option<String> {
+    let h = &ov_index["overlay"];
+    if !h.is_object() {
+        return Some("the index trailer carries no `overlay` block - this is not an overlay container".into());
+    }
+    let want_name = h["base_name"].as_str().unwrap_or("");
+    if want_name != base_name {
+        return Some(format!("built over base `{want_name}`, but this engine opened `{base_name}`"));
+    }
+    let want_bytes = h["base_bytes"].as_u64().unwrap_or(0);
+    if want_bytes != base_bytes {
+        return Some(format!(
+            "built over a base of {want_bytes} B, but `{base_name}` is {base_bytes} B - the base container changed"
+        ));
+    }
+    if ov_tensors.is_empty() {
+        return Some("carries no tensors".into());
+    }
+    for t in ov_tensors {
+        if t.dtype != "bf16" {
+            return Some(format!("{}: dtype {} - a dense overlay stores bf16 only", t.name, t.dtype));
+        }
+        let Some(b) = base.iter().find(|b| b.name == t.name && b.section == t.section) else {
+            return Some(format!("{} [{}]: not in the base container", t.name, t.section));
+        };
+        if b.n_values != t.n_values {
+            return Some(format!(
+                "{}: {} values in the overlay, {} in the base container",
+                t.name, t.n_values, b.n_values
+            ));
+        }
+        if !t.shape.is_empty() && !b.shape.is_empty() && t.shape != b.shape {
+            return Some(format!("{}: shape {:?} in the overlay, {:?} in the base container", t.name, t.shape, b.shape));
+        }
+    }
+    None
+}
+
 impl Cnq {
+    /// Open an overlay container beside this one and let its tensors shadow the base tensors
+    /// of the same name and section (#77, `CROW_CNQ_OVERLAY`). Returns the refusal as an
+    /// `Err(String)` - the caller names it at boot, so no mismatch can reach a kernel.
+    pub fn attach_overlay(&mut self, path: &str) -> Result<OverlayReport, String> {
+        let mut f = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        let file_len = f.metadata().map_err(|e| format!("{path}: {e}"))?.len();
+        if file_len < 20 {
+            return Err(format!("{path}: {file_len} B is too small to be a CNQ1 container"));
+        }
+        let mut magic = [0u8; 4];
+        f.read_exact(&mut magic).map_err(|e| format!("{path}: {e}"))?;
+        if &magic != b"CNQ1" {
+            return Err(format!("{path}: magic is {magic:?}, not CNQ1"));
+        }
+        f.seek(SeekFrom::Start(file_len - 8)).map_err(|e| format!("{path}: {e}"))?;
+        let mut b8 = [0u8; 8];
+        f.read_exact(&mut b8).map_err(|e| format!("{path}: {e}"))?;
+        let idx_len = u64::from_le_bytes(b8);
+        if idx_len == 0 || idx_len + 8 > file_len {
+            return Err(format!("{path}: index length {idx_len} does not fit a {file_len} B file"));
+        }
+        f.seek(SeekFrom::Start(file_len - 8 - idx_len)).map_err(|e| format!("{path}: {e}"))?;
+        let mut ib = vec![0u8; idx_len as usize];
+        f.read_exact(&mut ib).map_err(|e| format!("{path}: {e}"))?;
+        let index: serde_json::Value = serde_json::from_slice(&ib).map_err(|e| format!("{path}: index json: {e}"))?;
+        let blob_offset = index["blob_offset"].as_u64().unwrap_or(12);
+        let tensors = parse_tensor_index(&index, true);
+        let base_name = std::path::Path::new(&self.path)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if let Some(why) = overlay_refusal(&index, &tensors, &base_name, self.map_len, &self.tensors) {
+            return Err(format!("{path}: {why}"));
+        }
+        // the payload has to be inside the file, or a read would run off the end
+        for t in &tensors {
+            let end = blob_offset + t.offset + Self::byte_len(t);
+            if end > file_len - 8 - idx_len {
+                return Err(format!("{path}: {} runs to byte {end}, past the payload", t.name));
+            }
+        }
+        let mut per_kind: std::collections::BTreeMap<String, (usize, u64)> = std::collections::BTreeMap::new();
+        let mut values = 0u64;
+        let mut bytes = 0u64;
+        for t in &tensors {
+            let e = per_kind.entry(kind_of(&t.name)).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += t.n_values;
+            values += t.n_values;
+            bytes += Self::byte_len(t);
+        }
+        let report = OverlayReport {
+            path: path.to_string(),
+            source: index["overlay"]["source"].as_str().unwrap_or("?").to_string(),
+            built: index["overlay"]["built"].as_str().unwrap_or("?").to_string(),
+            tensors: tensors.len(),
+            values,
+            bytes,
+            per_kind: per_kind.into_iter().map(|(k, (c, n))| (k, c, n)).collect(),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
+        }
+        self.ov = Some(Overlay { path: path.to_string(), file: f, blob_offset, tensors, header: index["overlay"].clone() });
+        Ok(report)
+    }
+
+    /// the overlay's own tensor list, or an empty slice when none is attached
+    pub fn overlay_tensors(&self) -> &[TensorInfo] {
+        self.ov.as_ref().map(|o| o.tensors.as_slice()).unwrap_or(&[])
+    }
+
     pub fn open(path: &str) -> Cnq {
         // FILE_FLAG_SEQUENTIAL_SCAN: the cache manager drops container pages
         // behind the read cursor instead of keeping them in the system cache
@@ -538,21 +724,7 @@ impl Cnq {
         f.read_exact(&mut ib).unwrap();
         let index: serde_json::Value = serde_json::from_slice(&ib).unwrap();
         let blob_offset = index["blob_offset"].as_u64().unwrap();
-        let mut tensors = Vec::new();
-        for t in index["tensors"].as_array().unwrap() {
-            tensors.push(TensorInfo {
-                name: t["name"].as_str().unwrap().to_string(),
-                section: t["section"].as_str().unwrap().to_string(),
-                dtype: t["dtype"].as_str().unwrap().to_string(),
-                offset: t["offset"].as_u64().unwrap(),
-                n_values: t["n_values"].as_u64().unwrap(),
-                global_scale: t["global_scale"].as_f64().unwrap_or(1.0) as f32,
-                shape: t["shape"]
-                    .as_array()
-                    .map(|a| a.iter().map(|v| v.as_u64().unwrap()).collect())
-                    .unwrap_or_default(),
-            });
-        }
+        let tensors = parse_tensor_index(&index, false);
         let map_len = file_len;
         let (map, map_handle) = map_file(&f);
         if map == 0 {
@@ -572,7 +744,7 @@ impl Cnq {
         if ple_range.0 > ple_range.1 {
             ple_range = (0, 0);
         }
-        Cnq { file: f, blob_offset, tensors, map, map_len, map_handle, path: path.to_string(), fadv: (0, 0), ple_range }
+        Cnq { file: f, blob_offset, tensors, map, map_len, map_handle, path: path.to_string(), fadv: (0, 0), ple_range, ov: None }
     }
 
     /// the `ple` section as one `[lo, hi)` byte range of the container, or
@@ -586,12 +758,30 @@ impl Cnq {
         Warm { path: std::sync::Arc::from(self.path.as_str()), map: self.map, map_len: self.map_len }
     }
 
-    /// absolute file offset of a tensor byte range (for prefetch touches)
+    /// absolute file offset of a tensor byte range (for prefetch touches). Base container
+    /// only: the prefetch is the PLE row path and #77 never shadows a `ple`-section table.
     pub fn abs_offset(&self, t: &TensorInfo, rel_off: u64) -> u64 {
+        debug_assert!(!t.overlay, "{}: abs_offset is a base-container offset", t.name);
         self.blob_offset + t.offset + rel_off
     }
 
+    /// The tensor of record for `(name, section)`. #77: an attached overlay is asked FIRST,
+    /// so a tensor it carries shadows the base one for every reader in the engine - there is
+    /// no second lookup anywhere and no loader has to know an overlay exists.
     pub fn find(&self, name: &str, section: &str) -> &TensorInfo {
+        if let Some(ov) = &self.ov {
+            if let Some(t) = ov.tensors.iter().find(|t| t.name == name && t.section == section) {
+                return t;
+            }
+        }
+        self.tensors
+            .iter()
+            .find(|t| t.name == name && t.section == section)
+            .unwrap_or_else(|| panic!("tensor not found: {name} [{section}]"))
+    }
+
+    /// the BASE tensor, even when the overlay shadows it (the boot log's before/after)
+    pub fn find_base(&self, name: &str, section: &str) -> &TensorInfo {
         self.tensors
             .iter()
             .find(|t| t.name == name && t.section == section)
@@ -649,12 +839,39 @@ impl Cnq {
     }
 
     pub fn read_bytes(&mut self, t: &TensorInfo) -> Vec<u8> {
+        if t.overlay {
+            return self.read_overlay(t.offset, Self::byte_len(t) as usize);
+        }
         self.read_at(&t.section, self.blob_offset + t.offset, Self::byte_len(t) as usize)
     }
 
     /// read a byte range of a tensor (row-aligned reads for expert slabs, PLE rows)
     pub fn read_range(&mut self, t: &TensorInfo, rel_off: u64, len: usize) -> Vec<u8> {
+        if t.overlay {
+            return self.read_overlay(t.offset + rel_off, len);
+        }
         self.read_at(&t.section, self.blob_offset + t.offset + rel_off, len)
+    }
+
+    /// #77: the one read that goes to the overlay file. `rel_off` is relative to the
+    /// overlay's blob start. Every byte is read once at load and never again, so the pages
+    /// are handed straight back - the same DONTNEED discipline `fadvise_consumed` keeps for
+    /// the base container, and for the same reason: 5.2 GB held twice during the load is
+    /// exactly the reclaim pressure issue #15 was about.
+    fn read_overlay(&mut self, rel_off: u64, len: usize) -> Vec<u8> {
+        let ov = self.ov.as_mut().expect("overlay tensor without an attached overlay");
+        let off = ov.blob_offset + rel_off;
+        let mut raw = vec![0u8; len];
+        ov.file.seek(SeekFrom::Start(off)).unwrap();
+        ov.file.read_exact(&mut raw).unwrap();
+        #[cfg(unix)]
+        if std::env::var("CROW_CNQ_PURGE").as_deref() != Ok("0") {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::posix_fadvise(ov.file.as_raw_fd(), off as libc::off_t, len as libc::off_t, libc::POSIX_FADV_DONTNEED);
+            }
+        }
+        raw
     }
 
     /// Drop the page-cache pages of a range this loader has consumed.
@@ -872,7 +1089,7 @@ pub fn e4m3_to_f32(b: u8) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{page_runs, PAGE, WARM_RUN_MAX};
+    use super::{kind_of, overlay_refusal, page_runs, TensorInfo, PAGE, WARM_RUN_MAX};
 
     /// 37 PLE rows share one 4 KiB page, and a chunk's misses arrive in id
     /// order, not in offset order: the fetch has to sort and deduplicate or it
@@ -908,5 +1125,98 @@ mod tests {
         assert_eq!(runs[0], (0, WARM_RUN_MAX as u32));
         assert_eq!(runs[1].0, WARM_RUN_MAX);
         assert_eq!(runs[1].0 + runs[1].1 as u64, file_len);
+    }
+    // ---- #77: the dense-BF16 overlay, all of it host logic with no GPU and no container ----
+
+    fn ti(name: &str, section: &str, dtype: &str, n: u64, shape: &[u64], overlay: bool) -> TensorInfo {
+        TensorInfo {
+            name: name.into(),
+            section: section.into(),
+            dtype: dtype.into(),
+            offset: 0,
+            n_values: n,
+            global_scale: 1.0,
+            shape: shape.to_vec(),
+            overlay,
+        }
+    }
+
+    fn head(base_name: &str, base_bytes: u64) -> serde_json::Value {
+        serde_json::json!({ "overlay": { "base_name": base_name, "base_bytes": base_bytes } })
+    }
+
+    /// The kind is what `--kinds` names and what the boot log counts per line. It has to be
+    /// the SAME rule the converter applies, or an ablation would select nothing and read as
+    /// "the originals change nothing".
+    #[test]
+    fn the_overlay_kind_is_the_name_without_the_layer_prefix_and_the_weight_suffix() {
+        assert_eq!(kind_of("model.language_model.layers.7.linear_attn.in_proj_qkv.weight"), "linear_attn.in_proj_qkv");
+        assert_eq!(kind_of("model.language_model.layers.0.self_attn.indexer.index_qk_proj.weight"), "self_attn.indexer.index_qk_proj");
+        assert_eq!(kind_of("model.language_model.layers.1.ple.key_proj.weight"), "ple.key_proj");
+        assert_eq!(kind_of("model.language_model.layers.47.mlp_hyper_connection.block_inject_weight.weight"), "mlp_hyper_connection.block_inject_weight");
+        // not a per-layer name: nothing is stripped but the suffix
+        assert_eq!(kind_of("model.language_model.layers.x.foo.weight"), "model.language_model.layers.x.foo");
+    }
+
+    /// An overlay that matches its base is accepted, and every way it can FAIL to match is
+    /// one named refusal. This is the list that keeps a mismatch out of a kernel: a wrong
+    /// shape would be a silently wrong-size GEMV, an unknown name a weight nobody reads.
+    #[test]
+    fn an_overlay_that_does_not_belong_to_this_base_is_refused_by_name() {
+        let base = vec![
+            ti("a.weight", "text", "nvfp4", 128, &[2, 64], false),
+            ti("b.weight", "text", "nvfp4", 64, &[1, 64], false),
+        ];
+        let ov = vec![ti("a.weight", "text", "bf16", 128, &[2, 64], true)];
+        // the accepting case first, so the refusals below are not vacuous
+        assert!(overlay_refusal(&head("base.cnq", 999), &ov, "base.cnq", 999, &base).is_none());
+
+        let no_block = serde_json::json!({ "format": "crow-nest-quant" });
+        let m = overlay_refusal(&no_block, &ov, "base.cnq", 999, &base).unwrap();
+        assert!(m.contains("no `overlay` block"), "{m}");
+
+        let m = overlay_refusal(&head("other.cnq", 999), &ov, "base.cnq", 999, &base).unwrap();
+        assert!(m.contains("other.cnq") && m.contains("base.cnq"), "{m}");
+
+        let m = overlay_refusal(&head("base.cnq", 1000), &ov, "base.cnq", 999, &base).unwrap();
+        assert!(m.contains("the base container changed"), "{m}");
+
+        let m = overlay_refusal(&head("base.cnq", 999), &[], "base.cnq", 999, &base).unwrap();
+        assert!(m.contains("no tensors"), "{m}");
+
+        let wrong_dtype = vec![ti("a.weight", "text", "nvfp4", 128, &[2, 64], true)];
+        let m = overlay_refusal(&head("base.cnq", 999), &wrong_dtype, "base.cnq", 999, &base).unwrap();
+        assert!(m.contains("bf16 only"), "{m}");
+
+        let unknown = vec![ti("zzz.weight", "text", "bf16", 128, &[2, 64], true)];
+        let m = overlay_refusal(&head("base.cnq", 999), &unknown, "base.cnq", 999, &base).unwrap();
+        assert!(m.contains("not in the base container"), "{m}");
+
+        // the same name in a DIFFERENT section is a different tensor (mtp carries its own
+        // layers.0 copy - the reason every reader filters by section)
+        let wrong_section = vec![ti("a.weight", "mtp", "bf16", 128, &[2, 64], true)];
+        let m = overlay_refusal(&head("base.cnq", 999), &wrong_section, "base.cnq", 999, &base).unwrap();
+        assert!(m.contains("not in the base container"), "{m}");
+
+        let wrong_n = vec![ti("a.weight", "text", "bf16", 64, &[1, 64], true)];
+        let m = overlay_refusal(&head("base.cnq", 999), &wrong_n, "base.cnq", 999, &base).unwrap();
+        assert!(m.contains("64 values in the overlay, 128 in the base container"), "{m}");
+
+        let wrong_shape = vec![ti("a.weight", "text", "bf16", 128, &[64, 2], true)];
+        let m = overlay_refusal(&head("base.cnq", 999), &wrong_shape, "base.cnq", 999, &base).unwrap();
+        assert!(m.contains("shape"), "{m}");
+    }
+
+    /// The overlay is bf16, the base is nvfp4, and `byte_len` is what every read length and
+    /// the VRAM figure are derived from. 2 B per value against 36 B per 64 - the +3.7 GB the
+    /// residency planner has to see.
+    #[test]
+    fn a_shadowed_tensor_is_two_bytes_per_value_where_the_base_is_four_and_a_half_bits() {
+        let base = ti("a.weight", "text", "nvfp4", 64 * 100, &[100, 64], false);
+        let ov = ti("a.weight", "text", "bf16", 64 * 100, &[100, 64], true);
+        assert_eq!(super::Cnq::byte_len(&base), 100 * 36);
+        assert_eq!(super::Cnq::byte_len(&ov), 64 * 100 * 2);
+        // 3.555x the bytes, which is 16 / 4.5
+        assert_eq!(super::Cnq::byte_len(&ov) * 45, super::Cnq::byte_len(&base) * 160);
     }
 }

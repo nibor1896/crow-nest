@@ -21,7 +21,36 @@ pub unsafe fn open_model(
 ) -> (Cnq, cuda::Ctx, Config, String, String) {
     let cnq_path = std::env::var("CROW_CNQ").unwrap_or(cnq_default);
     let sidecar = std::env::var("CROW_HOTSETS").unwrap_or(sidecar_default);
-    let cnq = Cnq::open(&cnq_path);
+    let mut cnq = Cnq::open(&cnq_path);
+    // #77 CROW_CNQ_OVERLAY: a second CNQ1 container opened BESIDE the base one, holding the
+    // dense text tensors as bf16. A tensor it names shadows the base tensor of the same name
+    // and section for every reader in the engine. Unset - the default - attaches nothing and
+    // the engine is byte-identical to a build without this block. One door for all three
+    // bins: `decode`, `parity` and `serve` all come through here.
+    if let Ok(ov_path) = std::env::var("CROW_CNQ_OVERLAY") {
+        if !ov_path.is_empty() {
+            match cnq.attach_overlay(&ov_path) {
+                Ok(r) => {
+                    println!(
+                        "[overlay] {} — {} tensors shadowed, {} values, {:.2} GB bf16 (base {:.2} GB nvfp4), source {}, built {}",
+                        r.path,
+                        r.tensors,
+                        r.values,
+                        r.bytes as f64 / 1e9,
+                        (r.values as f64 * 4.5 / 8.0) / 1e9,
+                        r.source,
+                        r.built
+                    );
+                    for (kind, count, values) in &r.per_kind {
+                        println!("[overlay]   {count:>3} x {kind}  ({values} values)");
+                    }
+                }
+                // loud and named, at the front door: a mismatch that reached a kernel would
+                // be a wrong-size GEMV nobody could read out of a logit dump
+                Err(why) => panic!("[overlay] refused: {why}"),
+            }
+        }
+    }
     let ctx = cuda::Ctx::init();
     let cfg = Config { context: CONTEXT_FLOOR, ..Config::default() };
     (cnq, ctx, cfg, cnq_path, sidecar)

@@ -44,10 +44,16 @@ fn dequant_fp4_host(raw: &[u8], gs: f32, n: usize) -> Vec<f32> {
     out
 }
 
+/// f32 device copy of a weight the kernels read as f32 whatever the file holds (the two
+/// conv1d kinds). #77: a `bf16` tensor - a dense overlay shadowing the base NVFP4 one - is
+/// widened instead of dequantized, which is the WHOLE change those two kinds need: the kernel
+/// that consumes them (`conv_silu` / `ple_conv`) always read f32 and never saw the quant.
 pub unsafe fn dequant_fp4_dev(cnq: &mut Cnq, name: &str, sec: &str, n: usize) -> Dev {
     let t = cnq.find(name, sec).clone();
     let raw = cnq.read_bytes(&t);
-    cuda::to_f32_dev(&dequant_fp4_host(&raw, t.global_scale, n))
+    let v = if t.dtype == "bf16" { cnq::bf16_bytes_to_f32(&raw) } else { dequant_fp4_host(&raw, t.global_scale, n) };
+    assert_eq!(v.len(), n, "{name}: {} values, expected {n}", v.len());
+    cuda::to_f32_dev(&v)
 }
 
 /// tiny tensors (A_log, dt_bias): any dtype → host f32 → device
