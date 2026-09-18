@@ -67,6 +67,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 
+mod dense_overlay;
 mod requant_check;
 
 const E2M1_GRID: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
@@ -500,7 +501,7 @@ fn quantize_nvfp4(values: &[f32], mode: ScalesMode) -> (Vec<u8>, f32, QuantStats
     (out, global, stats, sse_ceil)
 }
 
-const HELP: &str = "usage: converter [--scales ceil|mse] <model-dir | file.safetensors> <out.cnq>\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)";
+const HELP: &str = "usage: converter [--scales ceil|mse] <model-dir | file.safetensors> <out.cnq>\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)";
 
 fn main() {
     // #76: the additive read-only subcommand is taken off the front before the conversion
@@ -533,6 +534,16 @@ fn main() {
             }
         }
         std::process::exit(requant_check::run(&all[at + 1..], mode, explicit));
+    }
+    // #77: the same rule for the overlay builder — it is taken off the front, it writes a NEW
+    // file and it never reaches the conversion path below. Without the word `dense-overlay`
+    // nothing about this binary changed.
+    if let Some(at) = all.iter().position(|a| a == "dense-overlay") {
+        if at != 0 {
+            eprintln!("unexpected argument {} before dense-overlay\n{}", all[0], dense_overlay::HELP);
+            std::process::exit(2);
+        }
+        std::process::exit(dense_overlay::run(&all[1..]));
     }
 
     let mut positional: Vec<String> = Vec::new();
