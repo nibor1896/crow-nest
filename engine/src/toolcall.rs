@@ -151,6 +151,128 @@ fn json_escape(s: &str) -> String {
     q[1..q.len() - 1].to_string()
 }
 
+/// - the byte offset in `t` that a `serde_json` error points at, from its 1-based line and
+///   column, so the warning names a position in the value and not in a line of it
+fn err_byte(t: &str, err: &serde_json::Error) -> usize {
+    let (line, col) = (err.line(), err.column());
+    if line == 0 {
+        return 0;
+    }
+    let mut at = 0usize;
+    for (i, l) in t.split_inclusive('\n').enumerate() {
+        if i + 1 == line {
+            return at + col.min(l.len());
+        }
+        at += l.len();
+    }
+    t.len()
+}
+
+/// - ONE minimal repair pass over a value the model meant as JSON and got one slip wrong;
+///   `close_param` runs it only when the declaration promised an `array` or an `object`
+/// - (a) a stray quote before a key: `, " "status":` -> `, "status":`, `{` the same way
+/// - (b) a trailing comma before `]` or `}`
+/// - (c) `'` as the string quote, and only when the text holds no `"` at all
+/// - hand-written on the bytes on purpose: `regex` is not a dependency of this crate, and
+///   this fix adds none
+/// - `None` when nothing changed. The caller RE-PARSES the result and keeps it only when it
+///   parses AND is of the declared kind, so a wrong repair cannot reach the client.
+fn repair_json(t: &str) -> Option<String> {
+    let r = repair_single_quotes(&repair_trailing_comma(&repair_stray_key_quote(t)));
+    if r == t {
+        None
+    } else {
+        Some(r)
+    }
+}
+
+/// past the ASCII whitespace at `i`
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// - at `j`, just past a `,` or a `{`: `\s*"\s*"(\w+)"\s*:`
+/// - `Some((key, end))` with `end` the byte past the `:`
+fn stray_key_at(b: &[u8], j: usize) -> Option<(String, usize)> {
+    let mut i = skip_ws(b, j);
+    if *b.get(i)? != b'"' {
+        return None;
+    }
+    i = skip_ws(b, i + 1);
+    if *b.get(i)? != b'"' {
+        return None;
+    }
+    i += 1;
+    let start = i;
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    let key = std::str::from_utf8(&b[start..i]).ok()?.to_string();
+    if *b.get(i)? != b'"' {
+        return None;
+    }
+    i = skip_ws(b, i + 1);
+    if *b.get(i)? != b':' {
+        return None;
+    }
+    Some((key, i + 1))
+}
+
+/// repair (a): `,\s*"\s*"(\w+)"\s*:` -> `, "$1":` and `{\s*"\s*"(\w+)"\s*:` -> `{"$1":`
+fn repair_stray_key_quote(t: &str) -> String {
+    let b = t.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b',' || b[i] == b'{' {
+            if let Some((key, end)) = stray_key_at(b, i + 1) {
+                out.extend_from_slice(if b[i] == b',' { b", \"" } else { b"{\"" });
+                out.extend_from_slice(key.as_bytes());
+                out.extend_from_slice(b"\":");
+                i = end;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    // every byte is either copied verbatim or an ASCII one this function wrote
+    String::from_utf8(out).unwrap_or_else(|_| t.to_string())
+}
+
+/// repair (b): a trailing comma before `]` or `}`; the whitespace and the bracket stay
+fn repair_trailing_comma(t: &str) -> String {
+    let b = t.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b',' {
+            let j = skip_ws(b, i + 1);
+            if j < b.len() && (b[j] == b']' || b[j] == b'}') {
+                i += 1;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| t.to_string())
+}
+
+/// repair (c): `'` as the string quote, and ONLY when the text holds no `"` anywhere
+fn repair_single_quotes(t: &str) -> String {
+    if t.contains('"') || !t.contains('\'') {
+        return t.to_string();
+    }
+    t.replace('\'', "\"")
+}
+
 /// - `Some((at, i))`: `markers[i]` starts at byte `at` of `buf`
 /// - `None`: no marker is complete; the returned length is what can never be part of one
 /// - the returned length is a char boundary, because every marker is ASCII
@@ -269,6 +391,10 @@ pub struct ToolStream {
     open_brace: bool,
     /// the current value streams as a JSON string
     vstring: bool,
+    /// the DECLARED type of the parameter in flight, `None` when the tool or the parameter
+    /// is not declared; `close_param` needs it to know that an `array` or an `object` was
+    /// PROMISED, which is what makes a repair pass worth trying at all
+    vtype: Option<String>,
     /// the current value of a non string parameter
     vbuf: String,
     /// the value region has not yet dropped the newline after `<parameter=P>`
@@ -297,6 +423,7 @@ impl ToolStream {
             pname: String::new(),
             open_brace: false,
             vstring: false,
+            vtype: None,
             vbuf: String::new(),
             skip_nl: false,
             held_nl: false,
@@ -404,6 +531,7 @@ impl ToolStream {
             .and_then(|m| m.get(&self.pname))
             .map(|s| s.as_str());
         self.vstring = ty == Some("string");
+        self.vtype = ty.map(|s| s.to_string());
         self.vbuf.clear();
         self.skip_nl = true;
         self.held_nl = false;
@@ -453,12 +581,54 @@ impl ToolStream {
             let t = v.trim();
             let text = match serde_json::from_str::<serde_json::Value>(t) {
                 Ok(_) if !t.is_empty() => t.to_string(),
+                Err(e) if !t.is_empty() => self.recover(t, &v, &e),
                 _ => json_str(&v),
             };
             out.push(Emit::Args { index: self.index, text });
         }
         self.skip_nl = false;
         self.held_nl = false;
+    }
+
+    /// - the buffered value did NOT parse: `t` is its trimmed text, `v` the raw one
+    /// - when the declaration promised an `array` or an `object`, one minimal repair pass
+    ///   (`repair_json`) runs, and its result is kept only when it parses AND is of the
+    ///   declared kind - a repaired object never lands where an array was declared
+    /// - otherwise the old fallback stands: the raw text as a JSON STRING. That fallback is
+    ///   what sent one of robin's `goal_set` arrays as a string on 2026-09-18, and Crow
+    ///   iterated the string: 852 one-character goal steps. So it is never SILENT again -
+    ///   whenever a type was declared, one `warn` on the `toolcall` target names the
+    ///   parameter, that declared type, the serde error and the byte it failed at.
+    /// - an UNDECLARED parameter warns for neither outcome: no type was promised, the raw
+    ///   text is all there is, and the string is the documented heuristic, not a slip
+    fn recover(&self, t: &str, v: &str, err: &serde_json::Error) -> String {
+        let declared = self.vtype.as_deref();
+        let at = err_byte(t, err);
+        if matches!(declared, Some("array") | Some("object")) {
+            if let Some(r) = repair_json(t) {
+                let ok = match serde_json::from_str::<serde_json::Value>(&r) {
+                    Ok(p) if declared == Some("array") => p.is_array(),
+                    Ok(p) => p.is_object(),
+                    Err(_) => false,
+                };
+                if ok {
+                    tracing::warn!(
+                        target: "toolcall",
+                        "[toolcall] parameter {:?} of {:?}, declared {}, did not parse: {} (byte {}); repaired and sent as JSON",
+                        self.pname, self.name, declared.unwrap_or("?"), err, at
+                    );
+                    return r;
+                }
+            }
+        }
+        if let Some(d) = declared {
+            tracing::warn!(
+                target: "toolcall",
+                "[toolcall] parameter {:?} of {:?}, declared {}, did not parse: {} (byte {}); NOT repairable, sent as a JSON STRING - the client sees a string where {} was declared",
+                self.pname, self.name, d, err, at, d
+            );
+        }
+        json_str(v)
     }
 
     /// `}` closes the arguments object; a call without a parameter gets `{}`
@@ -888,6 +1058,135 @@ mod tests {
         assert_eq!(v["flag"], true);
         assert_eq!(v["obj"], serde_json::json!({"a": [1, 2]}));
         assert_eq!(v["s"], "not json");
+    }
+
+    /// robin's live session 2026-09-18: Crow declares `goal_set` with `steps` an ARRAY
+    /// (of declared string items - the model wrote objects, which changes nothing here),
+    /// plus one declared `object` and one declared `string` parameter, so all three
+    /// close_param paths hang off one fixture
+    fn goal_set_tools() -> serde_json::Value {
+        serde_json::json!([{ "type": "function", "function": {
+            "name": "goal_set",
+            "parameters": {"type": "object", "properties": {
+                "steps": {"type": "array", "items": {"type": "string"}},
+                "meta": {"type": "object"},
+                "note": {"type": "string"}}},
+        }}])
+    }
+
+    /// one `goal_set` call carrying one parameter, its value verbatim
+    fn goal_set_markup(pname: &str, value: &str) -> String {
+        format!(
+            "<tool_call>\n<function=goal_set>\n<parameter={pname}>\n{value}\n\
+             </parameter>\n</function>\n</tool_call>"
+        )
+    }
+
+    /// the live bug: the model wrote the array, with ONE stray quote before a key. The
+    /// value used to go out as a JSON STRING and Crow iterated the string character by
+    /// character - 852 one-character goal steps. It is repaired and stays an array now.
+    #[test]
+    fn a_declared_array_written_with_a_stray_quote_before_a_key_is_repaired() {
+        let tools = goal_set_tools();
+        let value = "[{\"item\": \"read the ticket\", \"status\": \"done\"}, \
+                     {\"item\": \"write the patch\", \" \"status\": \"end\"}]";
+        assert!(
+            serde_json::from_str::<serde_json::Value>(value).is_err(),
+            "the slip is real, the raw value must not parse"
+        );
+        let markup = goal_set_markup("steps", value);
+        for n in [1usize, 3, 7, 64, 100_000] {
+            let (es, bad, closed) = drive(Some(&tools), 1, &cut(&markup, n));
+            assert!(!bad, "split {n}");
+            assert_eq!(closed, 1, "split {n}");
+            let args = args_of(&es, 0);
+            let v: serde_json::Value = serde_json::from_str(&args).expect("arguments parse");
+            let steps = v["steps"].as_array().unwrap_or_else(|| {
+                panic!("split {n}: steps is not an array: {}", v["steps"])
+            });
+            assert_eq!(steps.len(), 2, "split {n}: {steps:?}");
+            assert_eq!(steps[0]["status"], "done", "split {n}");
+            assert_eq!(steps[1]["item"], "write the patch", "split {n}");
+            assert_eq!(steps[1]["status"], "end", "split {n}");
+        }
+    }
+
+    /// repair (b), the other slip this model makes on an array it wrote itself
+    #[test]
+    fn a_declared_array_with_a_trailing_comma_is_repaired() {
+        let tools = goal_set_tools();
+        let value = "[\"read the ticket\", \"write the patch\", ]";
+        let markup = goal_set_markup("steps", value);
+        for n in [1usize, 5, 100_000] {
+            let (es, bad, closed) = drive(Some(&tools), 1, &cut(&markup, n));
+            assert!(!bad, "split {n}");
+            assert_eq!(closed, 1, "split {n}");
+            let v: serde_json::Value =
+                serde_json::from_str(&args_of(&es, 0)).expect("arguments parse");
+            assert_eq!(
+                v["steps"],
+                serde_json::json!(["read the ticket", "write the patch"]),
+                "split {n}"
+            );
+        }
+    }
+
+    /// repair (c), and the declared `object` kind: `'` for `"`, and only when the value
+    /// holds no `"` at all
+    #[test]
+    fn a_declared_object_written_with_single_quotes_is_repaired() {
+        let tools = goal_set_tools();
+        let value = "{'mode': 'fast', 'depth': 2}";
+        let markup = goal_set_markup("meta", value);
+        for n in [1usize, 4, 100_000] {
+            let (es, bad, closed) = drive(Some(&tools), 1, &cut(&markup, n));
+            assert!(!bad, "split {n}");
+            assert_eq!(closed, 1, "split {n}");
+            let v: serde_json::Value =
+                serde_json::from_str(&args_of(&es, 0)).expect("arguments parse");
+            assert_eq!(
+                v["meta"],
+                serde_json::json!({"mode": "fast", "depth": 2}),
+                "split {n}"
+            );
+        }
+    }
+
+    /// the DOCUMENTED fallback, unchanged: a value no repair reaches is still sent as a
+    /// JSON string, so the `arguments` object still parses. The difference is that the
+    /// fallback is no longer silent - it warns on the `toolcall` target.
+    #[test]
+    fn a_declared_array_that_no_repair_reaches_still_becomes_a_string() {
+        let tools = goal_set_tools();
+        let value = "[{\"item\": \"read the ticket\"}, oops]";
+        let markup = goal_set_markup("steps", value);
+        for n in [1usize, 6, 100_000] {
+            let (es, bad, closed) = drive(Some(&tools), 1, &cut(&markup, n));
+            assert!(!bad, "split {n}");
+            assert_eq!(closed, 1, "split {n}");
+            let args = args_of(&es, 0);
+            let v: serde_json::Value = serde_json::from_str(&args).expect("arguments parse");
+            assert_eq!(v["steps"], value, "split {n}: {args}");
+        }
+    }
+
+    /// a declared `string` parameter is not touched by any of this: the same slipped text
+    /// under `note` comes out byte for byte the way it did before the repair existed
+    #[test]
+    fn a_declared_string_parameter_is_untouched_by_the_repair() {
+        let tools = goal_set_tools();
+        let value = "[{\"item\": \"write the patch\", \" \"status\": \"end\"}]";
+        let markup = goal_set_markup("note", value);
+        let want = format!("{{\"note\":{}}}", json_str(value));
+        for n in [1usize, 3, 9, 100_000] {
+            let (es, bad, closed) = drive(Some(&tools), 1, &cut(&markup, n));
+            assert!(!bad, "split {n}");
+            assert_eq!(closed, 1, "split {n}");
+            assert_eq!(args_of(&es, 0), want, "split {n}");
+            let v: serde_json::Value =
+                serde_json::from_str(&args_of(&es, 0)).expect("arguments parse");
+            assert_eq!(v["note"], value, "split {n}");
+        }
     }
 
     #[test]

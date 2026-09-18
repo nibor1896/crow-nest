@@ -35,6 +35,8 @@
 
 ### Fixed
 
+- **A declared `array` or `object` parameter that the model wrote with one JSON slip went out as a JSON STRING, and Crow iterated the string character by character** (no issue - robin's live session 2026-09-18, fixed the same day): `toolcall.rs` `close_param` now tries one minimal repair pass on such a value (a stray quote before a key, a trailing comma, `'` for `"`), keeps the result only when it parses AND is of the declared kind, and when it cannot, still sends the string but never silently - one `warn` on the `toolcall` target names the parameter, the declared type, the serde error and the byte.
+
 - **The vit reserve was planned but never HELD, and the first image request of a session found
   35.7 MiB free** (`#72`, seen by robin 2026-09-18, fixed the same day). Since `8ff2055` the
   planner set 277.3 MB aside for the image path (tower scratch 228.5 + mrope span 48.8) before it

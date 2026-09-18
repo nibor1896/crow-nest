@@ -170,6 +170,7 @@
 #                              planner would drop ~150 hot experts for nothing - plus the
 #                              headroom floor (256 MiB) with the issue's own 35.7 MiB as
 #                              the SHORT case. So 212 = 119 lib + 82 serve + 6 parity + 5 decode.
+#   tests 212 -> 217           the toolcall array/object JSON repair (robin's live session 2026-09-18, no issue): five lib tests. 217 = 124 lib + 82 serve + 6 parity + 5 decode.
 #   clippy 1421                #13 (2026-09-18) LOWERED the count of record by one, and by
 #                              exactly one: `warning: redundant reference in `eprintln!`
 #                              argument` at `gen.rs:2890` is gone because that line is a
@@ -200,7 +201,7 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="212"
+TESTS="217"
 CLIPPY="1421"
 
 red=0
