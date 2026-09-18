@@ -798,8 +798,11 @@ def summary_md(header, records):
     L = []
     L.append(f"# quality probe - {header['label']}")
     L.append("")
-    L.append(f"- date {header['date']}, repo commit `{header['repo_commit']}`, "
+    L.append(f"- date {header['date']}, generated at repo commit `{header['repo_commit']}`, "
              f"prompt set version {header['prompt_set_version']}")
+    if header.get("rescored"):
+        L.append(f"- scored at commit `{header['rescored'].get('repo_commit')}` "
+                 f"on {header['rescored'].get('date')} (`--rescore`, from the stored texts)")
     L.append(f"- endpoint `{header['base_url']}`, engine `{header['engine']}`, "
              f"model `{props_model(header['props'])}`")
     L.append(f"- row temperature {ROW['temperature']}, top_p {ROW['top_p']}, top_k {ROW['top_k']}, "
