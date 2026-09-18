@@ -6,15 +6,17 @@
 
 ## v0.3.1 (unreleased) — the reasoning filter, and what the 170k session really was
 
-- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Nine issues so far: `#67` (the
+- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Ten issues so far: `#67` (the
   reasoning filter, `667b68b`), the engine side of `#68` (the long-context measurement, `f14e557`),
   `#49` (the ragged hot-set sidecar, `0adbe6a`), `#60` (the `parity` record header per arm, and
   the last two bins that hard-coded the pre-`#51` container, `784bd64`), `#54` (the gone-client
   probe of the `stream:false` path, `20bc121`), `#65` (the bounded retry around the harness's
   oracle python children, `6b5025e`), `#64` (F5, the quant package's own self-test and the
   model card that carries its numbers, `cea9406`), `#14` (the living diagrams brought back to
-  HEAD, `5a58e0b`) and `#13` (engine logging: `tracing`, rotation, the routing line and the
-  operating-point report, this commit). The machine is the
+  HEAD, `5a58e0b`), `#13` (engine logging: `tracing`, rotation, the routing line and the
+  operating-point report, `788fb64`) and `#38` (the run-position drift of a `serve` rate: the
+  Linux chain that answers it, `tools/drift-chain.sh` and the record in
+  `docs/measurement-coverage.md`, this commit — no engine code). The machine is the
   second environment block of `docs/system-landscape.md` unless a row names another one.
 - The crate version field stays `0.1.0`, as it has for every release: this file is the record.
 
@@ -595,6 +597,36 @@
   assistant turns repeat the nudge text. The "digit written non-stop" of the report is the client
   concatenating 48 one-token answers, not one runaway generation — every request is correct on its
   own, which is why loop detection belongs to the client.
+
+- **`#38`, the run-position drift of a `serve` rate: measured on Linux, and it is ABSENT here**
+  (2026-09-18, HEAD `788fb64`, no engine change; full record with both tables, the twelve machine
+  blocks and the log paths in `docs/measurement-coverage.md`). Two chains through the new
+  `tools/drift-chain.sh`, one fresh process per run, the t1-read prompt of record (16,064 ids,
+  greedy, `max_tokens` 256, 255 timed steps), no warmup discarded because the question IS whether
+  run 1 differs from run 4. Chain 1 alternates the arms S D S D S D S D, chain 2 is the four
+  consecutive fresh serve loads the issue asked for. Within-arm spread, max over min: **serve
+  1.0056** (49.636 / 49.891 / 49.845 / 49.914 tok/s, mean 49.8215) and **`decode run` 1.0012**
+  (39.861 / 39.824 / 39.813 / 39.823, mean 39.8304) in chain 1, **serve 1.0009** (49.851 to
+  49.896, mean 49.8635) in chain 2 — against the 26.4 % of `decode_out/srv-m2a.log:824` on the
+  Windows box (2026-09-10) and the 1.105 largest spread of the four `#37` chains (2026-09-11).
+  Neither arm is monotonic in run index; chain 1's first serve run is its SLOWEST by 0.372 % (the
+  direction M2a had backwards) and chain 2 does not reproduce even that (run 1 is 0.015 % off its
+  mean). The generated ids are one sha256 per arm across every run
+  (`e7c17e064ea2…` serve 8 of 8, `56305eee11d6…` `decode run` 4 of 4, and
+  `serve[1:] == decode[:255]`), and the engine counters are identical to the digit inside each
+  arm — serve 4,494,905 cold of **7,833,120** expert selections, **261,104** PLE rows and 107,227
+  fills per request in 8 of 8 runs. Those two counts are the M2a serve figures to the digit
+  (issue `#38` table); only the cold share differs, −3.5 %, because the hot set is not the same
+  one (N 149 with the `#37` trickle tick). So the cold-bytes hypothesis of the issue cannot be
+  tested here — there is no drift left to scale with copy volume — and what the chain bounds
+  instead is the converse: **with the copy volume held exactly fixed, run position buys at most
+  0.56 % on this box.** Against a clock explanation, harder than `#37` could put it: the sm clock
+  before the load read 360 MHz at the first start of each chain and 1,260 to 2,917 MHz at the
+  other ten, power 35.6 to 112.4 W, temperature 31 to 53 °C, and both arms held inside 0.6 %
+  through all of it. Nothing here concludes anything about the Windows M2a outlier, which needs
+  the same form rerun on that box. The `#38` consequence rules are untouched by this commit and a
+  recommendation on each of them is in the record; no `serve` number entered
+  `docs/architecture.md`.
 
 ### Known limitations
 
