@@ -217,10 +217,11 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 |---|---|
 | `engine/` | the engine crate, the CUDA kernels and the 19 binaries counted 2026-09-17 (`engine/README.md`) |
 | `converter/` | the streaming safetensors to CNQ quantizer (`converter/README.md`) |
-| `docs/` | `architecture.md` (the spec, sections 0 to 8, the code map added 2026-09-17), `system-landscape.md`, `env.md`, `cuda-rust-evaluation.md` (the CUDA Rust / cuTile evaluation and its pilot, 2026-09-17), the ten-task material |
+| `docs/` | `architecture.md` (the spec, sections 0 to 8, the code map added 2026-09-17, the package self-test 8.10 added 2026-09-18), `model-card.md` (the Hugging Face model card of record, tracked here since 2026-09-18 and uploaded verbatim as that repo's `README.md`), `system-landscape.md`, `env.md`, `cuda-rust-evaluation.md` (the CUDA Rust / cuTile evaluation and its pilot, 2026-09-17), the ten-task material |
 | `tools/` | Python guards and harness helpers, no GPU needed |
 | `decode_out/` | gate inputs only; measurement records are ignored (`.gitignore`) |
-| `oracle/` | the layer-wise reference against the unquantized originals |
+| `oracle/` | the layer-wise reference against the unquantized originals; its output (`oracle/golden/`) is ignored |
+| `selftest/` | the package self-test's golden set, tracked: two `f32` arrays of 327,680 B each and the manifest that gates them (F5, issue #64, 2026-09-18). These are the files the quant package ships beside the container, and `tools/selftest.sh` is what runs them |
 | `probes/` | the hardware probes the plan stands on |
 | `models/`, `converter/*.cnq` | model weights and containers, ignored, never committed |
 
@@ -237,14 +238,16 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 |---|---|---|
 | parity, short and long form | every logit row byte-identical against the reference build, run twice, last green 2026-09-10 | `engine/README.md`, section "Parity gate" |
 | parity, 1024 rows | the largest chunk form in production is the one gated (since 2026-09-05, issue #22) | `CROW_CHUNK=1024 decode parity decode_out/t3-debug-1024-ids.json <dir>` |
-| layercheck | `max_abs` at or below 0.125 on the layer 0 golden (gate hard since 2026-09-04) | `decode layercheck` |
+| layercheck | `max_abs` at or below 0.125 on the layer 0 golden (gate hard since 2026-09-04); the Linux reading is 9.184837e-2 on the `-M` container, 2026-09-18 | `decode layercheck` |
+| package self-test, no originals | the same golden and the same 0.125 bound, from a package directory that holds no `models/` — the check a downloader can run. `ALL GREEN` from a hard-linked package copy outside the repository on 2026-09-18 at `max_abs` 9.184837e-2, `rel_L2` 1.3671e-2, NaN 0; the `test ! -d models` control refused the same copy the moment a `models/` directory existed, before the engine was started (issue #64) | `tools/selftest.sh <package-dir>` |
 | ten-task quality | no degeneration, Pass at least the reference minus one, Fail at most the reference | `parity phase 0 <crow or llama> decode_out/ten-tasks.json <outprefix>` |
 | env documentation | code set equals doc set | `python tools/check_env_docs.py` |
 | oracle transport | the harness sets `PYTHONIOENCODING=utf-8` and `PYTHONUTF8=1` on the Python oracle process, not the shell, since 2026-09-11 (issue #34) | `parity phase 0 crow decode_out/c1-tasks/t4-prose.json <prefix>` in a shell without both variables |
 | record header | a `parity` record names the sampler that produced it: greedy says greedy, a sampled run carries the profile and the seed, since 2026-09-11 (issue #53) | `meta.operating_point` of the written record |
 | README numbers | no number without a date, a unit or an identifier | `python tools/check_readme_dates.py` |
+| model card numbers | the same rule on the Hugging Face card, with the YAML frontmatter skipped: 83 number lines, 49 dated, 34 exempt, 0 offenders on 2026-09-18, negative control exits 1. The guard was written in F4 and never committed, so every Linux gate run printed it as skipped until 2026-09-18 | `python tools/check_model_card_dates.py` |
 | CI, GitHub Actions | four jobs on ubuntu-latest: build, test, clippy (non-blocking), doc guards. The runner moved from windows-latest with the Linux port on 2026-09-17; the counts of record are still the local Windows proof of 2026-09-11 (engine tests 72 of 80 lib and 55 of 57 serve, 10 tokenizer tests skipped for want of `../models/`), because no run of this workflow is recorded in this repository yet | `.github/workflows/ci.yml` |
-| Linux parity gate | the three parity forms, `decode run 32`, tests, clippy and both doc guards against the Linux values of record; GREEN or RED per item, non-zero exit on any RED; all nine items green at commit 8ff2055 on 2026-09-17 (tests 165, clippy 1422) | `tools/gate-linux.sh` |
+| Linux parity gate | the three parity forms, `decode run 32`, tests, clippy and the three doc guards against the Linux values of record; GREEN or RED per item, non-zero exit on any RED; all nine items green at commit 8ff2055 on 2026-09-17 (tests 165, clippy 1422) and again on 2026-09-18 with tests 190 and the model-card guard running for the first time | `tools/gate-linux.sh` |
 | tool-call session, against a running `serve` | a Crow-shaped tool loop: the engine's own streamed `tool_calls` are fed back as the history, verbatim, so a turn that poisons the history shows up as the 400 it caused; exit non-zero when any round is refused (TASK J, 2026-09-17) | `tools/replay-toolcalls.py --poison --refusals` |
 
 ## License

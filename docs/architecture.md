@@ -2210,7 +2210,7 @@ is not exhausted), more VRAM for the hot set (the planner already maximizes N ag
 KV budget; N=155 with 7 slots surrendered to the trickle), or a cold tier that is smaller per expert
 (a low-bit tier, which is not bit-identical and therefore not this).
 
-## Section 8 — the code map (2026-09-17, 8.9 added 2026-09-18)
+## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18)
 
 Sections 0 to 7 say what the engine must do. This section says how the crate is put together,
 so a reader who opens `engine/src` knows which file to open and what it may reach for. It was
@@ -2534,10 +2534,12 @@ memory-bounded scope, one engine at a time.
 - **The gate**: `tools/gate-linux.sh [outdir]` from the repo root runs the three parity forms,
   `decode run 32`, `cargo test`, clippy and the doc guards against the first three values
   above, prints GREEN/RED per item and exits non-zero on any RED. Nine items; all nine green at
-  commit `8ff2055` on 2026-09-17. The two host-side values it pins are `TESTS=187`
-  (103 lib + 78 serve + 6 parity, 2026-09-18) and `CLIPPY=1422` (the `--all-targets` form,
-  counted as `grep -cE '^warning: '`), plus `check_env_docs` exit 0 (`code 82, doc 82`) and
-  `check_readme_dates` 0 offenders. The 1024-row form is not in
+  commit `8ff2055` on 2026-09-17. The two host-side values it pins are `TESTS=190`
+  (103 lib + 78 serve + 6 parity + 3 decode, 2026-09-18) and `CLIPPY=1422` (the `--all-targets`
+  form, counted as `grep -cE '^warning: '`), plus `check_env_docs` exit 0 (`code 82, doc 82`),
+  `check_readme_dates` 0 offenders and, since 2026-09-18, `check_model_card_dates` 0 offenders —
+  that third guard was written in F4 and never committed, so every run before that date printed
+  it as "not in this tree - skipped" (8.10). The 1024-row form is not in
   the script — it costs a full long-prompt run and is checked by hand. Every expected value is hard-coded with its
   provenance in the script header. It is not a tuning knob: a value there is changed only when a
   new reference run establishes a new record, and the commit that does it says so.
@@ -2699,3 +2701,70 @@ payload that arrives whole through stdin).
 
 **Not covered.** A child that HANGS instead of exiting still hangs the phase: `wait_with_output`
 has no deadline and a timeout needs a waiting thread. No occurrence has had that shape.
+
+### 8.10 The package self-test (F5, issue #64, 2026-09-18)
+
+Sections 5 and 8.7 gate the engine against its own references: the layer-wise oracle needs
+`models/` and a torch environment, and the parity forms need the reference dumps of this
+repository. **Neither can be run by somebody who downloaded the container.** 8.10 is the gate
+that can.
+
+**What travels.** `selftest/` is tracked and ships with the quant package:
+`layer0-input.f32` and `layer0-golden-output.f32` (327,680 B each, `[8][10240]` f32
+little-endian, no header) plus `manifest.json` — 658,998 B in total, 0.63 MiB against a 105 GB
+container. The two arrays are the p10 layer-0 golden the oracle produced from the UNQUANTIZED
+originals on 2026-09-02 (transformers 5.16.1, torch 2.13.0+cpu, f32, `model.language_model.
+layers.0.*` 24 of 24 tensors suffix-matched). They were copied byte-identically out of the
+Windows working tree, because `oracle/golden/` is gitignored and the originals' safetensors do
+not exist on this Linux box (`models/Qwen3.8-Flash-Next-original` holds the config and the
+tokenizer, 23 MB, and no weights): the goldens could be SHIPPED here but not re-derived here,
+and their sha256 in `SHA256SUMS` plus `SHA256SUMS.log` is what carries that.
+
+**What runs.** `decode selftest [<golden_dir>]` (`bin/decode.rs`). The manifest names a list of
+checks — layer, kind, `[T][width]` shapes, the file names and `max_abs_gate` per check — and the
+mode loads the engine ONCE, runs each check's sub-block on the golden input and prints one
+`max_abs` / `rel_L2` / NaN line per layer plus `PASS n of n checks`. Its EXIT CODE is the
+verdict, the only mode of that bin where that is true. Two `kind`s are implemented:
+`decoder_layer` (layer 0 through `Engine::run_layer0_with_stage_dumps`, the same call
+`layercheck` makes) and `attn_subblock`. Every field of a check is required — a manifest that
+left `max_abs_gate` out would otherwise read as a gate of 0 — and a golden whose byte length
+does not match its declared shape is refused BEFORE the compare, because a truncated download
+read as a measurement would report a delta against the wrong rows. Three unit tests in
+`bin/decode.rs` pin the manifest contract, the inclusive bound with the NaN rule (`f32::max`
+drops a NaN operand, so only the count sees one) and the length refusal, with no GPU and no
+package.
+
+**The positive control.** `tools/selftest.sh [package-dir] [--with-originals] [--full]` is the
+wrapper, and `test ! -d models` in the package directory is the control the ticket names. It is
+a REFUSAL, not a warning: with a `models/` directory present and no `--with-originals`, the
+script exits 1 and the engine is never started, because a run in a tree that holds the originals
+cannot be presented as a run without them whatever its numbers say. The script's other two items
+are the golden set's own sha256 (`grep ' selftest/' SHA256SUMS | sha256sum -c -`, which costs no
+read of the container; `--full` checks every line and does) and the engine. The engine itself
+prints one line naming the package's `models/` path and whether it existed, so a log is
+self-describing; it tests the GOLDEN DIRECTORY's parent and not the process's cwd.
+
+**Measured 2026-09-18** (RTX 5090 / Arch Linux / driver 610.57.04 / CUDA 13.3.1 / NVRTC 13.3.33,
+inside the memory-bounded scope, one engine at a time):
+
+| arm | package directory | `models/` | result |
+|---|---|---|---|
+| the gate of record, for comparison | the repository, from `engine/` | present | `decode layercheck` `max_abs` **9.184837e-2**, NaN 0 — the first Linux reading of this gate |
+| with the originals | the repository | present, `--with-originals` | ALL GREEN, `max_abs` **9.184837e-2**, `rel_L2` 1.3671e-2, NaN 0, 24.2 s |
+| WITHOUT the originals | `/home/nibor1896/pkgtest-f5`, hard links to the container, the sidecar, the hot sets and the golden set, outside the repository | absent | ALL GREEN, `max_abs` **9.184837e-2**, `rel_L2` 1.3671e-2, NaN 0, 32.0 s |
+| the control | the same copy plus an empty `models/` | present | RED, exit 1, refused before the engine was started |
+
+- The two arms agree to all six digits, and both agree with `decode layercheck` against
+  `oracle/golden/`: the shipped copy is the golden of record and not a lookalike. `max_abs` is
+  73.5 percent of the 0.125 bound, which has been the hard gate since 2026-09-04.
+- The whole cost is one container load (23 s of the 32.0 s) — the layer itself is 8 tokens.
+
+**What it does not cover, and one finding.** One layer on one 8-token input. It catches a
+container that was corrupted, truncated, converted with the wrong scales or loaded by a broken
+build; it is not the numeric contract of 8.7. `oracle/golden/` also holds a layer-3
+full-attention sub-block golden (the p7 chain), and it is deliberately NOT shipped: on the `-M`
+container `decode layercheck3` returns an ALL-ZERO `o_proj` output — `max_abs` 5.2512 and
+`mean_abs` 0.5188, which are exactly `max|golden|` and `mean|golden|` of that file, at
+`rel_L2` 1.0000 and `corr` 0.00000, NaN 0, measured 2026-09-18. That debug path is stale and
+would gate nothing about the quant; the production attention path is under the parity contract
+instead, where the logits are byte-identical. It owes its own issue.

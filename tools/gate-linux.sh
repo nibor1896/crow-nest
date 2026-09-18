@@ -89,7 +89,19 @@
 #                              fails the task (fail-closed), and a 60,290-byte payload - the
 #                              longest of the ten frozen prompts - reaches the child whole
 #                              through STDIN and never through the command line - so
-#                              187 = 103 lib + 78 serve + 6 parity.
+#                              187 = 103 lib + 78 serve + 6 parity. #64 (2026-09-18) added
+#                              the first three tests `bin/decode.rs` has ever had, for the
+#                              pure half of the new `decode selftest` mode (F5, the quant
+#                              package's own self-test) - the manifest contract with its
+#                              four named refusals (not JSON, no `checks`, empty `checks`,
+#                              a check without `max_abs_gate`, which a default would read
+#                              as a gate of 0), the INCLUSIVE 0.125 bound together with
+#                              the NaN rule (`f32::max` drops a NaN operand, so a NaN
+#                              output leaves max_abs small and only the count sees it) and
+#                              the refusal of a golden whose byte length does not match
+#                              the shape the manifest declares - so
+#                              190 = 103 lib + 78 serve + 6 parity + 3 decode. All three
+#                              run without a GPU and without a package.
 #                              Clippy is unchanged at
 #                              1422: it is the --all-targets form counted as grep -cE '^warning: ',
 #                              the form the 1494 -> 1480 -> 1426 -> 1422 series was counted with.
@@ -114,7 +126,7 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="187"
+TESTS="190"
 CLIPPY="1422"
 
 red=0

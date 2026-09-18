@@ -6,12 +6,13 @@
 
 ## v0.3.1 (unreleased) — the reasoning filter, and what the 170k session really was
 
-- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Six issues so far: `#67` (the
+- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Seven issues so far: `#67` (the
   reasoning filter, `667b68b`), the engine side of `#68` (the long-context measurement, `f14e557`),
   `#49` (the ragged hot-set sidecar, `0adbe6a`), `#60` (the `parity` record header per arm, and
   the last two bins that hard-coded the pre-`#51` container, `784bd64`), `#54` (the gone-client
-  probe of the `stream:false` path, `20bc121`) and `#65` (the bounded retry around the harness's
-  oracle python children, this commit). The machine is the
+  probe of the `stream:false` path, `20bc121`), `#65` (the bounded retry around the harness's
+  oracle python children, `6b5025e`) and `#64` (F5, the quant package's own self-test and the
+  model card that carries its numbers, this commit). The machine is the
   second environment block of `docs/system-landscape.md` unless a row names another one.
 - The crate version field stays `0.1.0`, as it has for every release: this file is the record.
 
@@ -265,6 +266,80 @@
   rows (`check_env_docs` exit 0, 82 = 82).
 
 ### Added
+
+- **The quant package verifies itself, with no originals anywhere near it** (`#64`, F5,
+  2026-09-18). Until now the only numeric gates on the container were the layer-wise oracle,
+  which needs `models/` and a torch environment, and the parity forms, which need this
+  repository's reference dumps — so a downloader had no check at all beyond `sha256sum`. The
+  package now ships `selftest/`: `layer0-input.f32` and `layer0-golden-output.f32` (327,680 B
+  each, `[8][10240]` f32 little-endian) plus `manifest.json`, **658,998 B = 0.63 MiB** beside a
+  105 GB container, against the issue's 100 MB bound. The two arrays are the p10 layer-0 golden
+  the oracle produced from the UNQUANTIZED originals on 2026-09-02 (transformers 5.16.1, torch
+  2.13.0+cpu, f32, 24 of 24 layer-`0` tensors suffix-matched), copied byte-identically out of the
+  Windows working tree with their sha256 in `SHA256SUMS` and a dated block in `SHA256SUMS.log`:
+  `oracle/golden/` is gitignored and never was in the repository, and the originals' safetensors
+  do not exist on this Linux box (`models/Qwen3.8-Flash-Next-original` holds the config and the
+  tokenizer, 23 MB, no weights), so the goldens could be shipped here and not re-derived here.
+  That is stated rather than smoothed over.
+
+  **New `decode selftest [<golden_dir>]`** (`bin/decode.rs`): the golden directory is an argument
+  and both model paths come from `CROW_CNQ` / `CROW_HOTSETS`, so the mode runs from any working
+  directory and reads no `oracle/golden/`, no `models/` and no python. The manifest names a list
+  of checks with their layer, shapes and `max_abs_gate`; the mode loads the engine once, prints
+  one `max_abs` / `rel_L2` / NaN line per layer and `PASS n of n checks`, and its EXIT CODE is
+  the verdict — the only mode of that bin where that is true. Every manifest field is required (a
+  missing `max_abs_gate` would otherwise read as a gate of 0) and a golden whose byte length does
+  not match its declared shape is refused BEFORE the compare, because a truncated download read
+  as a measurement reports a delta against the wrong rows. **New `tools/selftest.sh`** runs three
+  items, GREEN/RED each: the `test ! -d models` control, the golden set's own sha256 (`grep
+  ' selftest/' SHA256SUMS | sha256sum -c -`, no read of the container; `--full` reads it) and the
+  engine. The control is a REFUSAL and not a warning — with a `models/` directory present and no
+  `--with-originals` the script exits 1 and the engine is never started, because a run in a tree
+  that holds the originals cannot be presented as a run without them whatever its numbers say.
+
+  **Measured 2026-09-18**, RTX 5090 / Arch Linux / driver 610.57.04 / CUDA 13.3.1 / NVRTC
+  13.3.33, inside the memory-bounded scope, one engine at a time. `decode layercheck` against
+  `oracle/golden/` reads `max_abs` **9.184837e-2**, NaN 0 — the first Linux reading of the gate
+  that has been hard at 0.125 since 2026-09-04. The self-test reproduces it to all six digits in
+  both arms: from the repository with `--with-originals`, ALL GREEN at `max_abs` 9.184837e-2,
+  `rel_L2` 1.3671e-2, NaN 0, 24.2 s; and from `/home/nibor1896/pkgtest-f5`, a hard-linked package
+  copy OUTSIDE the repository with no `models/`, ALL GREEN at the same numbers, 32.0 s of which
+  the container load is 23 s. The control fired on that same copy the moment an empty `models/`
+  existed: RED, exit 1, engine not started. `max_abs` is 73.5 percent of the bound. Three unit
+  tests pin the pure half with no GPU and no package (the manifest contract and its four named
+  refusals, the inclusive bound with the NaN rule — `f32::max` drops a NaN operand, so only the
+  count sees one — and the length refusal), so `tools/gate-linux.sh` `TESTS` goes **187 → 190**
+  (103 lib + 78 serve + 6 parity + 3 decode), clippy unchanged at 1422.
+
+  **Not shipped, and a finding.** `oracle/golden/` also holds a layer-3 full-attention sub-block
+  golden (the p7 chain). It is deliberately not a check: on the `-M` container `decode
+  layercheck3` returns an ALL-ZERO `o_proj` output — `max_abs` 5.2512 and `mean_abs` 0.5188,
+  which are exactly `max|golden|` and `mean|golden|` of that file, at `rel_L2` 1.0000 and `corr`
+  0.00000, NaN 0, measured 2026-09-18. The debug path is stale and would gate nothing about the
+  quant, and the production attention path is under the parity contract instead, where the logits
+  are byte-identical. It owes its own issue.
+
+- **The model card is tracked, and its dates are back** (`#64`, 2026-09-18). `docs/model-card.md`
+  is the Hugging Face card of record and the byte source of that repository's `README.md`; it
+  used to live only in `hf-package/README.md`, which `.gitignore` ignores (F3, `#58`). Its
+  Self-test section was a `<!-- SELFTEST: F5 pending -->` placeholder and now carries the
+  procedure, the gate, the numbers above, the control and what the check does NOT cover, plus
+  three rows in the Files table and a second verify command for the golden set alone. Two
+  defects found on the way. **`tools/check_model_card_dates.py` was never committed**: written in
+  F4, referenced by `tools/gate-linux.sh` and named in a dozen commit messages, it existed only
+  as an untracked file in the Windows tree, so every Linux gate run printed it as "not in this
+  tree - skipped". It is tracked now and it checks the tracked card. **And the card on the Hub
+  had every date stripped out of it.** The copy fetched from the Hub on 2026-09-18 carries 0
+  dated lines against the Windows copy's 37, and the strip was mechanical rather than an edit —
+  it left "Spec section 1 of the engine, approved ." and turned the upstream `lastModified`
+  `2026-08-27T05:03:36Z` into `T05:03:36Z`. Under the record rule (spec section 0.5) that made 25
+  lines offenders, which is precisely the failure the guard exists to catch and could not,
+  because it was not in the tree. Every date is restored from the Windows copy of record or from
+  this repository (the measured rows carry the date of the commit they cite, 2026-09-17), five
+  lines the F4 run never saw are dated for the first time (the Vision section, added 2026-09-14),
+  and the stale "until it lands" row about the image path is replaced by what landed. The guard
+  now reads **83 number lines, 49 dated, 34 exempt, 0 offenders**, and its negative control exits
+  1.
 
 - `delta.reasoning_content` on the stream and `message.reasoning_content` on the non-streaming
   document (`#67`, 2026-09-18), present only when the filter stripped a block the model opened

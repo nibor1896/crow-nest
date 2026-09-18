@@ -100,3 +100,87 @@ engine_lock: absent
 ```
 
 DONE
+
+# 2026-09-18 — the self-test golden set joins the package (F5, issue #64, parent #1)
+
+- task: F5, issue crow-nest #64, parent #1
+- branch: main
+- machine: RTX 5090 / Arch Linux (the second environment block of `docs/system-landscape.md`)
+- tool: sha256sum (GNU coreutils) 9.8
+- what changed: three lines added to `SHA256SUMS`, the container's three lines untouched and re-verified
+- runs: each new file read twice, then one `sha256sum -c` over all six lines
+
+## Machine block: before
+
+```
+utc: 2026-09-18T02:44:07Z
+epoch_s: 1789699447
+engine_processes: 0 of 4 names matched
+ram_total_kib: 65188592
+ram_free_kib: 5339036
+disk_home_free_bytes: 54031843328
+engine_lock: absent
+```
+
+## Input sizes (stat -c %s)
+
+| file | bytes |
+|---|---|
+| `selftest/layer0-input.f32` | 327680 |
+| `selftest/layer0-golden-output.f32` | 327680 |
+| `selftest/manifest.json` | 3638 |
+
+- total 658998 bytes, 0.63 MiB — the issue's bound for the golden set is 100 MB
+- the two `f32` arrays are the oracle's p10 layer-0 golden of 2026-09-02, copied byte-identically out of the Windows working tree (`oracle/golden/` is gitignored, so they were never in the repository); no byte of them was produced on this machine
+
+## Runs
+
+| run | file | bytes | sha256 |
+|---|---|---|---|
+| 1 | `selftest/layer0-golden-output.f32` | 327680 | `e98292a0413d7aaf6825ab23e80cfae52f2424b5524f835624e9d76e90d7c705` |
+| 1 | `selftest/layer0-input.f32` | 327680 | `65907fe567547704dd644eea9212c4c71b0b02f2fd954f23ecd28c7f5804d974` |
+| 1 | `selftest/manifest.json` | 3638 | `9fb2d5d5b270d1976c17da5b63b4edae226a348611e6b651f4c8a8a732f13388` |
+| 2 | `selftest/layer0-golden-output.f32` | 327680 | `e98292a0413d7aaf6825ab23e80cfae52f2424b5524f835624e9d76e90d7c705` |
+| 2 | `selftest/layer0-input.f32` | 327680 | `65907fe567547704dd644eea9212c4c71b0b02f2fd954f23ecd28c7f5804d974` |
+| 2 | `selftest/manifest.json` | 3638 | `9fb2d5d5b270d1976c17da5b63b4edae226a348611e6b651f4c8a8a732f13388` |
+
+## Compare
+
+```
+GOLDEN SHA256 RUNS AGREE: 3 of 3
+```
+
+## SHA256SUMS written
+
+```
+7c058e555667b1c3d8f7d804d4a3393ba3664161dd307305718d85e4f33646b7  converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq
+af85905fbf46c12fa9528d22f2932b8785c55731a8c8fb013b2e91eecc6f0692  converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq.sidecar.jsonl
+4a408907d553518ee4421e59eae09e243db82ac0cd677557596dfdbaa4b099dc  decode_out/hotsets-M-longctx2100-n160.json
+e98292a0413d7aaf6825ab23e80cfae52f2424b5524f835624e9d76e90d7c705  selftest/layer0-golden-output.f32
+65907fe567547704dd644eea9212c4c71b0b02f2fd954f23ecd28c7f5804d974  selftest/layer0-input.f32
+9fb2d5d5b270d1976c17da5b63b4edae226a348611e6b651f4c8a8a732f13388  selftest/manifest.json
+```
+
+- lines: 6 of 6 expected
+- cr_bytes: 0 of 0 expected (`tr -dc '\r'`)
+- lf_bytes: 6 of 6 expected
+- bom: none, the first 3 bytes are `37 63 30`, the ASCII `7c0`
+- the three `selftest/` lines are byte-identical to the three `selftest/` lines of the PACKAGE's own flat `SHA256SUMS`, because the path is `selftest/…` in both; `tools/selftest.sh` greps exactly those lines, so one command verifies the golden set in the repository and in a download
+
+## Verify (sha256sum -c SHA256SUMS, one read of all six files)
+
+```
+converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq: OK
+converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq.sidecar.jsonl: OK
+decode_out/hotsets-M-longctx2100-n160.json: OK
+selftest/layer0-golden-output.f32: OK
+selftest/layer0-input.f32: OK
+selftest/manifest.json: OK
+```
+
+- verify_exit_code: 0 of 0 expected
+- verify_ok_lines: 6 of 6 expected
+- verify_wall_s: 38
+- NOT a cold read, and not comparable to the 195 s of 2026-09-11: three engine loads of the same container had run minutes earlier, so part of the file came from the page cache. The container's sha256 is unchanged since F1 (two full cold reads on 2026-09-11 and one verify) and this reading adds agreement, not a bandwidth number.
+
+DONE

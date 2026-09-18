@@ -124,11 +124,13 @@ decode parity <ids.json> <out_dir>
 decode run <ids.json> <gen> <out_dir>
 decode longctx <prompt_ids> <fill> <gen>
 decode layercheck
+decode selftest [<golden_dir>]
 ```
 
 - `decode parity` dumps every position's logits as `<out_dir>/gpu-logits.f32` plus a greedy trace.
 - `decode run` prefills and then takes `<gen>` decode steps with per-step timing; this is the engine side of the standing series.
-- `decode layercheck` compares layer 0 against the golden.
+- `decode layercheck` compares layer 0 against the golden in `../oracle/golden/` and must be run from `engine/`, because both paths are relative to that directory (`tools/perf_loop.sh` is the form of record).
+- `decode selftest` is the same comparison against the golden set the QUANT PACKAGE ships (F5, issue #64, 2026-09-18): the directory is an argument and both model paths come from `CROW_CNQ` / `CROW_HOTSETS`, so the mode runs from any working directory and reads no `oracle/golden/`, no `models/` and no oracle venv. `<golden_dir>/manifest.json` names the checks, their shapes and their gates; the mode prints one `max_abs` line per layer, then `PASS n of n checks`, and its EXIT CODE is the verdict (0 or 1) — the only mode of this bin whose exit code says anything. The golden set of record is `../selftest/`, and one line per run names whether a `models/` directory sat beside it. `../tools/selftest.sh` is the wrapper that adds the `test ! -d models` control and the `sha256sum -c` of the golden set; the Linux reading on the `-M` container is `max_abs` 9.184837e-2 against the 0.125 gate, 2026-09-18.
 
 ## parity
 

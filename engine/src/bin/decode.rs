@@ -7,6 +7,10 @@
 //!       trace + per-step timing (the standing-series engine side).
 //!   decode longctx <prompt_ids> <fill> <gen> — QSA sparse regime: fill the
 //!       context past the 2048 budget with real prefill, then decode steps.
+//!   decode selftest [<golden_dir>]       — the PACKAGE self-test (F5, #64): the
+//!       engine's layer outputs against the goldens shipped with the package,
+//!       max_abs per layer against the gate, exit 0 or 1. No `models/`, no
+//!       oracle venv. `tools/selftest.sh` is the wrapper around it.
 //!
 //! Token ids come from tools/tokenize.py (oracle venv, transformers 5.16.1
 //! tokenizer — the same tokenization the reference side uses).
@@ -33,9 +37,13 @@ fn main() {
     // (e.g. a sidecar warmed on real traffic via `decode warmup`)
     // defaults (#48): the production -M container and the id-sorted rectangular
     // sidecar serve.rs loads, both relative to engine/, the cwd of `decode`
-    let (mut cnq, _ctx, mut cfg, _cnq_path, sidecar) = unsafe {
+    let (mut cnq, _ctx, mut cfg, cnq_path, sidecar) = unsafe {
         boot::open_model(from_engine_dir(DEFAULT_CNQ), from_engine_dir(DEFAULT_HOTSETS))
     };
+
+    // `selftest` is the one mode whose EXIT CODE is the gate; the flag carries it
+    // out of the match (see the arm).
+    let mut selftest_failed = false;
 
     unsafe {
         match mode {
@@ -506,9 +514,307 @@ fn main() {
                     "layercheck3 stepwise: max_abs={s_max:.4} rel_L2={s_rel:.4} NaN={s_nan} (batched==stepped pin, p11/p12 pattern)"
                 );
             }
+            "selftest" => {
+                // F5 (#64, 2026-09-18): the PACKAGE self-test. The engine runs on the
+                // package alone — the container `CROW_CNQ` names, the hot-set manifest
+                // `CROW_HOTSETS` names, and the golden set shipped beside them — and each
+                // check's max_abs goes against its gate (0.125 for layer 0, the gate of
+                // record since 2026-09-04). The goldens were produced ONCE from the
+                // UNQUANTIZED originals by `oracle/`, so this run needs no `models/`, no
+                // oracle venv and no torch: a downloader verifies the quant with the
+                // engine alone, which is the whole point of the mode.
+                // `tools/selftest.sh` is the wrapper: it carries the `test ! -d models`
+                // control and the `sha256sum -c` of the golden set, and reads this exit code.
+                let dir = args.get(2).cloned().unwrap_or_else(|| from_engine_dir("selftest"));
+                let mpath = format!("{dir}/manifest.json");
+                let text = std::fs::read_to_string(&mpath)
+                    .unwrap_or_else(|e| panic!("selftest: cannot read {mpath}: {e}"));
+                let checks =
+                    parse_manifest(&text).unwrap_or_else(|e| panic!("selftest: {mpath}: {e}"));
+                let formed = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|v| v["formed"].as_str().map(str::to_string))
+                    .unwrap_or_else(|| "unstated".to_string());
+                println!("selftest: crow-nest package self-test (F5, issue #64)");
+                println!("selftest: container  {cnq_path}");
+                println!("selftest: hot sets   {sidecar}");
+                println!(
+                    "selftest: golden     {dir}  ({} check{}, manifest formed {formed})",
+                    checks.len(),
+                    if checks.len() == 1 { "" } else { "s" }
+                );
+                // the engine cannot read the originals in this mode — it opens the
+                // container, the sidecar and the files the manifest names, and nothing
+                // else — but the line says out loud whether they were even there, so a
+                // log is self-describing. The REFUSAL lives in `tools/selftest.sh`.
+                // The directory tested is the PACKAGE's, the golden directory's parent,
+                // and not the process's cwd: `models/` beside some caller's working
+                // directory says nothing about the package under test.
+                let originals = std::path::Path::new(&dir)
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("models");
+                println!(
+                    "selftest: originals  {} — {}",
+                    originals.display(),
+                    if originals.is_dir() {
+                        "PRESENT, so this run does not count as a run without the originals"
+                    } else {
+                        "absent, so the goldens are the only reference this run can read"
+                    }
+                );
+                // the layer-0 helper dumps its stages; they are debug output, not part of
+                // the package, so they go to a scratch directory outside it
+                let dumps = std::env::temp_dir().join("crow-selftest-stage");
+                let dumps = dumps.to_string_lossy().into_owned();
+                let mut eng =
+                    Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                let mut pass = 0usize;
+                for c in &checks {
+                    let x = read_f32_exact(&format!("{dir}/{}", c.input), c.t, c.input_width)
+                        .unwrap_or_else(|e| panic!("selftest: {e}"));
+                    let g = read_f32_exact(&format!("{dir}/{}", c.golden), c.t, c.golden_width)
+                        .unwrap_or_else(|e| panic!("selftest: {e}"));
+                    let out = match c.kind.as_str() {
+                        // the golden input is ALREADY the [T][HCT] hyper-connection stream
+                        // (p10 fed it as x0), which is why the width is HCT and not H
+                        "decoder_layer" => {
+                            assert_eq!(c.layer, 0, "selftest: `decoder_layer` runs layer 0 only, `{}` names layer {}", c.name, c.layer);
+                            assert_eq!(c.input_width, HCT, "selftest: `{}` input width {} is not HCT {HCT}", c.name, c.input_width);
+                            eng.run_layer0_with_stage_dumps(&x, c.t, &dumps)
+                        }
+                        "attn_subblock" => {
+                            assert_eq!(c.input_width, H, "selftest: `{}` input width {} is not H {H}", c.name, c.input_width);
+                            eng.run_attn_subblock(c.layer, &x, c.t, 0)
+                        }
+                        other => panic!("selftest: unknown check kind `{other}` in {mpath}"),
+                    };
+                    assert_eq!(
+                        out.len(), g.len(),
+                        "selftest: `{}` produced {} values, the golden holds {}",
+                        c.name, out.len(), g.len()
+                    );
+                    let (max_abs, rel, nan) = compare_golden(&out, &g);
+                    let ok = check_passes(max_abs, nan, c.gate);
+                    if ok {
+                        pass += 1;
+                    }
+                    println!(
+                        "selftest: layer {:>2} {:<14} max_abs {max_abs:.6e}  rel_L2 {rel:.4e}  NaN {nan}  gate {:.3}  {}",
+                        c.layer, c.kind, c.gate, if ok { "PASS" } else { "FAIL" }
+                    );
+                }
+                let n = checks.len();
+                selftest_failed = pass != n;
+                println!(
+                    "selftest: {} {pass} of {n} checks",
+                    if selftest_failed { "FAIL" } else { "PASS" }
+                );
+            }
             _ => {
-                println!("usage: decode parity <ids.json> <out> | decode run <ids.json> <gen> | decode layercheck | decode layercheck3");
+                println!("usage: decode parity <ids.json> <out> | decode run <ids.json> <gen> | decode layercheck | decode layercheck3 | decode selftest [<golden_dir>]");
             }
         }
+    }
+
+    // the self-test's verdict IS its exit code, and nothing else on this path writes
+    // one. `exit` runs no destructor, so the container's exit purge is skipped on a
+    // failing self-test; that costs reclaimable page cache and no correctness.
+    if selftest_failed {
+        std::process::exit(1);
+    }
+}
+
+// ---- the package self-test (F5, issue #64, 2026-09-18) ------------------------------------
+//
+// The four functions below are the whole pure half of `decode selftest`: the manifest
+// contract, the golden length check, the compare and the verdict. They take no device
+// and no file system (`read_f32_exact` aside, which is one `fs::read` around
+// `decode_f32_exact`), so the refusals are testable without a GPU and without a package.
+
+/// one row of `<golden_dir>/manifest.json` `checks[]`
+#[derive(Debug, Clone, PartialEq)]
+struct Check {
+    name: String,
+    layer: usize,
+    kind: String,
+    t: usize,
+    input: String,
+    input_width: usize,
+    golden: String,
+    golden_width: usize,
+    gate: f32,
+}
+
+/// the `checks[]` of a self-test manifest, or `Err(<what is wrong, by index and key>)`.
+/// Every field is required: a manifest that leaves the gate out would otherwise be read
+/// as a gate of 0, and a self-test that cannot say what it checks is not evidence.
+fn parse_manifest(text: &str) -> Result<Vec<Check>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
+    let rows = v["checks"]
+        .as_array()
+        .ok_or_else(|| "no `checks` array".to_string())?;
+    if rows.is_empty() {
+        return Err("`checks` is empty".to_string());
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        let s = |k: &str| {
+            r[k].as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("checks[{i}]: no string `{k}`"))
+        };
+        let u = |k: &str| {
+            r[k].as_u64()
+                .map(|x| x as usize)
+                .ok_or_else(|| format!("checks[{i}]: no unsigned `{k}`"))
+        };
+        out.push(Check {
+            name: s("name")?,
+            layer: u("layer")?,
+            kind: s("kind")?,
+            t: u("t")?,
+            input: s("input")?,
+            input_width: u("input_width")?,
+            golden: s("golden")?,
+            golden_width: u("golden_width")?,
+            gate: r["max_abs_gate"]
+                .as_f64()
+                .ok_or_else(|| format!("checks[{i}]: no number `max_abs_gate`"))?
+                as f32,
+        });
+    }
+    Ok(out)
+}
+
+/// `[T][width]` little-endian f32, or `Err`. A truncated or padded golden is refused
+/// BEFORE the compare: read as a measurement it would report a delta against the wrong
+/// rows, and the manifest's shape is the only thing that can catch it.
+fn decode_f32_exact(bytes: &[u8], t: usize, width: usize) -> Result<Vec<f32>, String> {
+    let want = t * width * 4;
+    if bytes.len() != want {
+        return Err(format!(
+            "{} B on disk, the manifest says [{t}][{width}] f32 = {want} B",
+            bytes.len()
+        ));
+    }
+    // `as_chunks` and not `chunks_exact(4)`: the length is already pinned above, and
+    // this is the form clippy asks for at a constant chunk size (the two older
+    // `to_f32` closures in `layercheck`/`layercheck3` carry that warning; a new one
+    // may not be added).
+    Ok(bytes.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect())
+}
+
+fn read_f32_exact(path: &str, t: usize, width: usize) -> Result<Vec<f32>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    decode_f32_exact(&bytes, t, width).map_err(|e| format!("{path}: {e}"))
+}
+
+/// `(max_abs, rel_L2, NaN count)` of an engine output against its golden — the same
+/// three numbers `layercheck` and `layercheck3` print.
+fn compare_golden(out: &[f32], gold: &[f32]) -> (f32, f64, usize) {
+    let mut max_abs = 0f32;
+    let mut nan = 0usize;
+    let (mut se, mut sg) = (0f64, 0f64);
+    for (&o, &g) in out.iter().zip(gold.iter()) {
+        if o.is_nan() {
+            nan += 1;
+        }
+        max_abs = max_abs.max((o - g).abs());
+        let e = o as f64 - g as f64;
+        se += e * e;
+        sg += g as f64 * g as f64;
+    }
+    (max_abs, se.sqrt() / sg.sqrt().max(1e-30), nan)
+}
+
+/// The verdict of one check. The gate is INCLUSIVE — `max_abs <= 0.125` is the gate of
+/// record since 2026-09-04, and the measured 0.125 of the p10 golden is a PASS by
+/// construction — and one NaN fails whatever the delta says: `f32::max` drops a NaN
+/// operand, so a NaN output can leave `max_abs` small and only the count sees it.
+fn check_passes(max_abs: f32, nan: usize, gate: f32) -> bool {
+    nan == 0 && max_abs.is_finite() && max_abs <= gate
+}
+
+#[cfg(test)]
+mod selftest_contract {
+    use super::*;
+
+    const TWO_CHECKS: &str = r#"{
+      "formed": "2026-09-18",
+      "checks": [
+        {"name": "layer0", "layer": 0, "kind": "decoder_layer", "t": 8,
+         "input": "layer0-input.f32", "input_width": 10240,
+         "golden": "layer0-golden-output.f32", "golden_width": 10240,
+         "max_abs_gate": 0.125},
+        {"name": "layer3-attn", "layer": 3, "kind": "attn_subblock", "t": 8,
+         "input": "layer3-attn-input.f32", "input_width": 2560,
+         "golden": "layer3-attn-output.f32", "golden_width": 2560,
+         "max_abs_gate": 0.125}
+      ]
+    }"#;
+
+    #[test]
+    fn a_manifest_parses_into_its_checks_and_every_broken_one_is_named() {
+        let checks = parse_manifest(TWO_CHECKS).expect("the fixture parses");
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].name, "layer0");
+        assert_eq!(checks[0].kind, "decoder_layer");
+        assert_eq!((checks[0].t, checks[0].input_width), (8, 10240));
+        assert_eq!(checks[0].gate, 0.125);
+        assert_eq!((checks[1].layer, checks[1].golden_width), (3, 2560));
+
+        // the four refusals, each naming what is wrong: a self-test that cannot say
+        // what it checks is not evidence, so none of these may fall through as a
+        // default (a missing `max_abs_gate` read as 0.0 would fail every check, a
+        // missing `t` read as 0 would pass every check on zero elements)
+        assert!(parse_manifest("{").unwrap_err().contains("not JSON"));
+        assert!(parse_manifest("{}").unwrap_err().contains("no `checks` array"));
+        assert!(parse_manifest(r#"{"checks": []}"#)
+            .unwrap_err()
+            .contains("`checks` is empty"));
+        let no_gate = TWO_CHECKS.replace("\"max_abs_gate\": 0.125", "\"gate\": 0.125");
+        assert_eq!(
+            parse_manifest(&no_gate).unwrap_err(),
+            "checks[0]: no number `max_abs_gate`"
+        );
+    }
+
+    #[test]
+    fn the_gate_is_inclusive_and_one_nan_fails_whatever_the_delta_is() {
+        // the gate of record is `<=`, and the p10 golden's measured 0.125 sits ON it
+        assert!(check_passes(0.125, 0, 0.125));
+        assert!(check_passes(0.091_848_37, 0, 0.125));
+        assert!(!check_passes(0.125_000_01, 0, 0.125));
+
+        // `f32::max` returns the non-NaN operand, so a NaN never reaches `max_abs`:
+        // without the count a NaN output would pass with a small delta
+        let gold = [1.0f32, 2.0, 3.0];
+        let with_nan = [1.0f32, f32::NAN, 3.0];
+        let (max_abs, _, nan) = compare_golden(&with_nan, &gold);
+        assert_eq!(nan, 1);
+        assert_eq!(max_abs, 0.0, "the NaN is invisible to max_abs, by design");
+        assert!(!check_passes(max_abs, nan, 0.125));
+
+        // and the numbers themselves, on a hand-checkable vector
+        let (max_abs, rel, nan) = compare_golden(&[1.0f32, 2.5, 3.0], &gold);
+        assert_eq!((max_abs, nan), (0.5, 0));
+        assert!((rel - 0.5 / 14f64.sqrt()).abs() < 1e-12, "rel_L2 = |e|/|g|");
+    }
+
+    #[test]
+    fn a_golden_of_the_wrong_length_is_refused_before_the_compare() {
+        let whole = vec![0u8; 8 * 4 * 4];
+        assert_eq!(decode_f32_exact(&whole, 8, 4).unwrap().len(), 32);
+        // one f32 short — the shape the manifest declares is the only thing that can
+        // see a truncated download
+        let short = vec![0u8; 8 * 4 * 4 - 4];
+        let err = decode_f32_exact(&short, 8, 4).unwrap_err();
+        assert!(err.contains("124 B on disk"), "{err}");
+        assert!(err.contains("[8][4] f32 = 128 B"), "{err}");
+        // a file that is not a multiple of 4 bytes at all
+        assert!(decode_f32_exact(&[0u8; 3], 8, 4).is_err());
     }
 }
