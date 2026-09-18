@@ -6,7 +6,7 @@
 
 ## v0.3.1 (unreleased) — the reasoning filter, and what the 170k session really was
 
-- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Eleven issues so far: `#67` (the
+- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Twelve issues so far: `#67` (the
   reasoning filter, `667b68b`), the engine side of `#68` (the long-context measurement, `f14e557`),
   `#49` (the ragged hot-set sidecar, `0adbe6a`), `#60` (the `parity` record header per arm, and
   the last two bins that hard-coded the pre-`#51` container, `784bd64`), `#54` (the gone-client
@@ -16,8 +16,9 @@
   HEAD, `5a58e0b`), `#13` (engine logging: `tracing`, rotation, the routing line and the
   operating-point report, `788fb64`) and `#38` (the run-position drift of a `serve` rate: the
   Linux chain that answers it, `tools/drift-chain.sh` and the record in
-  `docs/measurement-coverage.md`, `77c4d40` — no engine code) and `#61` (the decode kernel
-  decomposition at the Linux operating point, and the opt-in `CROW_ATTN_LUT` lever it named).
+  `docs/measurement-coverage.md`, `77c4d40` — no engine code), `#61` (the decode kernel
+  decomposition at the Linux operating point, and the opt-in `CROW_ATTN_LUT` lever it named) and
+  `#62` (the GDN row taken apart per kernel, 2026-09-18 — no engine code).
   The machine is the second environment block of `docs/system-landscape.md` unless a row names another one.
 - The crate version field stays `0.1.0`, as it has for every release: this file is the record.
 
@@ -565,6 +566,64 @@
   (`#28` A6 decided them) and nothing on the wire moves.
 
 ### Measured
+
+- **The GDN row taken apart per kernel, and what the +1.64 ms of this issue actually is**
+  (`#62`, 2026-09-18, RTX 5090 / Arch Linux, HEAD `156e2fe`, `decode run` on t1-read, 16,064 ids,
+  greedy, 256 tokens / 255 timed steps, context 16,320; logs `decode_out/62/`, record
+  `docs/architecture.md` 4.7). The `#62e` re-decomposition that "stays open" is this. Same method as
+  `#61` above — `CROW_KPROF=1 CROW_PROFILE=1 CROW_GRAPH=0`, prefill removed by differencing `gen`
+  256 against `gen` 8 over the 248 extra decode steps, a 5.0 us per-launch floor subtracted. The
+  flag-free control at HEAD reads **25.3066 ms per decode token = 39.52 tok/s at ids sha256
+  `56305eee11d6`**, the value of record; all four `gen` 256 runs carry it, including the
+  `CROW_GDN_FUSE_IN=0` arm, which is the first time the per-slab fallback has reproduced the ids in
+  the SPARSE decode regime (`#62b` proved it at the parity forms only).
+
+  **Seven launches per GDN layer per decode token, 252 per token** — the issue's own first step,
+  answered. The row is 1.954 ms floor-removed (3.214 raw) against 2.280 in `#59`:
+  `gemv_fp4_mma_g32` (the grouped input projection) **1.000**, `gemv_fp4_mma_d32` (out) **0.658**,
+  `delta_rule_step_r` 0.148, `l2norm_repeat` 0.059, `rmsnorm_gated_q` 0.044, `conv_step` 0.028,
+  `beta_g` 0.017. **85 % of the row is the two projection launches**; all five recurrent-step
+  kernels together are 0.296 ms, and `delta_rule_step_r` is already at 1,527 GB/s = **85 % of this
+  card's peak** on the 6.29 MB of state it rewrites per layer. The five projections measured
+  separately (`CROW_GDN_FUSE_IN=0`): qkv 320 blocks **1,180 GB/s**, z 192 blocks **948**, b and a
+  one block each (7.06 us for 0.069 MB, pure latency), out 80 blocks **483**; grouping the four
+  inputs is worth **-0.294 ms** per decode token (per-slab 1.294 against the grouped 1.000),
+  `#62b`'s lever measured a third way.
+
+  **The headline comparison of this issue was never like for like.** At batch 1 the GDN projections
+  read every weight byte exactly once: 1.1728 GB per decode token at CNQ4.5-M's 4.5 bpw, whose hard
+  floor at 1,792 GB/s is **0.6545 ms**. The llama.cpp arm of record is `UD-Q2_K_XL` GGUF at **2.4
+  bpw** (`docs/architecture.md` 0.3) = 0.6255 GB per decode token. Reading llama's 0.642 ms against
+  CROW's bytes would need **1,827 GB/s = 102 % of this card's peak**, which is impossible; against
+  its own bytes it is 974 GB/s = 54 % of peak, where crow's projections run at 707 = 39.5 %. Of the
+  1.312 ms that still separates the rows, **0.774 (59 %) is the weight format**, 0.296 (23 %) is
+  crow's five recurrent launches and 0.242 (18 %) is projection efficiency — and the `#62a` mapping
+  caveat still runs the same way, so 0.642 probably understates llama's true GDN cost.
+
+  **The launch count is not the lever and crow is already ahead on it.** llama.cpp's Qwen3-Next
+  linear-attention layer (`src/models/qwen3next.cpp`, read at source 2026-09-18) is 13 graph nodes —
+  THREE input-projection `mul_mat`s (`wqkv`, `wqkv_gate`, `ssm_beta_alpha`) against crow's one
+  grouped launch, plus `ssm_conv`, `silu`, two l2 norms, `sigmoid`, `softplus`, `mul`, the fused
+  `ggml_gated_delta_net`, `build_norm_gated` and the `ssm_out` `mul_mat` — 13 kernels or more before
+  ggml's elementwise fusion, against crow's 7.
+
+  **The lever this pass built, measured and did NOT land.** `gemv_fp4_mma_d16` — one 16-row group
+  per block instead of two, so the out projection (the one GDN launch that leaves 90 of 170 SMs
+  idle) runs 160 blocks of `32*KS` threads instead of 80 of `64*KS`, per-row arithmetic bit-identical
+  by construction. It doubles the BLOCK count and keeps the WARP count at 640, and the row does not
+  move: **19.00 us per call against 18.27, 466 GB/s against 484**, ids `56305eee11d6` and the
+  `run 32` ids of record in both arms on the same binary. Throughput on this kernel body rises with
+  total warps and is flat in the block count (640 warps 484 GB/s, 1536 948, 2560 1,180) — the same
+  shape `#61` found for `attn_sel_split` from 96 to 768 blocks. **It is not in the tree**: it would
+  add a kernel to `KERNEL_SRC` and an env row and buy nothing. At `CROW_MMA_KS` = 4 a 2560-row slab's
+  warp count is pinned at 640 by the row geometry, and the only bit-identical way to raise it — more
+  k slices — moves the fixed ascending smem reduce. The three levers the decomposition names instead,
+  with their numbers, are in `docs/architecture.md` 4.7; the largest is splitting the grouped input
+  launch into qkv+b+a (323 blocks) plus the existing z `d32[192x1]`, about **-0.21 ms per decode
+  token**, no new kernel needed.
+
+  No engine code changed in this pass and no default moved. `tools/gate-linux.sh decode_out/gate62`
+  ALL GREEN.
 
 - **The decode kernel decomposition at the Linux operating point — the attention row of `#61`
   re-measured after the levers, and the GDN row of `#62` with it** (`#61`, 2026-09-18, RTX 5090 /

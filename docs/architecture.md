@@ -574,8 +574,8 @@ which is what separates a decode launch from the prefill launch of the same kern
 The whole move since #59 is the #61b selection lever: `attn_sel_split` itself is unchanged to 0.8 %,
 and the two nsys/kprof methods agree on it to within that. The row is -1.07 ms per token = -23 %.
 
-**The GDN row — the 36 GDN layers, per decode token** (this is #62's row; the nsys re-decomposition
-#62e left open).
+**The GDN row — the 36 GDN layers, per decode token** (this is #62's row; the re-decomposition
+#62e left open is **section 4.7**, 2026-09-18, which takes this row apart per kernel).
 
 | kernel | calls/token | ms/token (`CROW_KPROF`) | us/call | ms/token, launch floor removed |
 |---|---|---|---|---|
@@ -721,6 +721,184 @@ selected) is covered by the 4 LUT-on `decode run` 256 runs above, all at the ids
 **Not flipped.** The default stays `attn_sel_split`; the flag is opt-in and robin decides. Nothing
 here needs the ten-task gate — the lever is byte-identical, which is the whole point of choosing it
 over the two byte-level levers named at the end of 4.6, both of which move the reduction order.
+
+### 4.7 The GDN row, per kernel (#62, 2026-09-18)
+
+Section 4.6 measured the GDN row as one number (1.954 ms per decode token against 2.280 in #59).
+This is that row taken apart per kernel, the re-decomposition #62e left open, and the answer to the
+issue's own first step — **count the launches per GDN layer per token**.
+
+**Machine and form.** RTX 5090 / Arch Linux (the second environment block of
+`docs/system-landscape.md`), HEAD `156e2fe`, 2026-09-18, `decode run decode_out/srv-a5-t1read-ids.json 256`
+on the t1-read prompt of record (16,064 ids, greedy, 256 generated tokens, 255 timed steps, context
+16,320), inside the bounded scope `tools/drift-chain.sh` runs its D arm in. The 4.6 method exactly:
+`CROW_KPROF=1 CROW_PROFILE=1 CROW_GRAPH=0`, prefill removed by differencing `gen` 256 against
+`gen` 8 over the 248 extra decode steps, and a 5.0 us per-launch floor subtracted in the last column.
+Logs: `decode_out/62/`. The flag-free control at HEAD reads **25.3066 ms per decode token =
+39.52 tok/s at the ids sha256 `56305eee11d6`** (`decode_out/62/ctl-g1-256.log`), the value the #38
+chain's D arm and the #61 pass carry, so this sits on the operating point of record. All four
+`gen` 256 runs below carry that sha — including the `CROW_GDN_FUSE_IN=0` arm, which is the first time
+the per-slab fallback has been shown to reproduce the ids in the SPARSE decode regime (#62b proved it
+at the parity forms only).
+
+**Seven launches per GDN layer per decode token, 252 per token.**
+
+| kernel | launches per layer | calls/token | ms/token (`CROW_KPROF`) | us/call | ms/token, floor removed | share of the row |
+|---|---|---|---|---|---|---|
+| `gemv_fp4_mma_g32[515x1]` — the grouped input projection (qkv 10240 + z 6144 + b 48 + a 48, k 2560) | 1 | 36.0 | 1.180 | 32.8 | **1.000** | 51.2 % |
+| `gemv_fp4_mma_d32[80x1]` — the out projection (2560 rows, k 6144) | 1 | 36.0 | 0.838 | 23.3 | **0.658** | 33.7 % |
+| `delta_rule_step_r[48x1]` — the recurrent state step | 1 | 36.0 | 0.328 | 9.1 | 0.148 | 7.6 % |
+| `l2norm_repeat[48x1]` — q/k l2 norm | 1 | 36.0 | 0.239 | 6.6 | 0.059 | 3.0 % |
+| `rmsnorm_gated_q[48x1]` — gated rms norm + the out-projection quant epilogue | 1 | 36.0 | 0.224 | 6.2 | 0.044 | 2.3 % |
+| `conv_step[40x1]` — the causal conv1d (width 3) + silu | 1 | 36.0 | 0.208 | 5.8 | 0.028 | 1.4 % |
+| `beta_g[1x1]` — beta/gate scalars | 1 | 36.0 | 0.197 | 5.5 | 0.017 | 0.9 % |
+| **GDN row** | **7** | **252.0** | **3.214** | | **1.954** | 100 % |
+
+| item | #59 (Windows, nsys, 2026-09-11) | this pass (Linux, `CROW_KPROF`, 2026-09-18) | llama.cpp (#59) |
+|---|---|---|---|
+| GDN layers, ms per decode token | 2.280 | **1.954** (3.214 with the launch floor) | 0.642 |
+| launches per layer per token | 10 | **7** | more than 7 — see the external leg |
+| the two projection launches | 1.874 over 5 launches | **1.658** over 2 | — |
+| the five recurrent-step kernels | 0.406 | 0.296 | — |
+| ratio to llama.cpp | 3.6 x | **3.0 x** | 1 |
+
+The row reproduces #61's 1.954 to 0.2 % on a different binary, and the whole-step `CROW_KPROF` total
+is 30.07 ms per token, so GDN is 10.7 % of what the profiler attributes and rank 4 and 9 of the
+15-row table in 4.6.
+
+**The five projections, measured separately** (`CROW_GDN_FUSE_IN=0`, `decode_out/62/kp-f0-*.log` —
+the fallback of record, 10 launches per layer). The slab bytes are the NVFP4 container's 36 B per
+64 elements (4.5 bpw), which is what the kernel actually reads:
+
+| slab | rows x k | blocks x threads | blocks per SM (170) | warps | MB per layer | us/call, floor removed | GB/s | % of 1,792 GB/s |
+|---|---|---|---|---|---|---|---|---|
+| qkv | 10240 x 2560 | 320 x 256 | 1.88 | 2560 | 14.746 | 12.50 | **1,180** | 65.8 |
+| z | 6144 x 2560 | 192 x 256 | 1.13 | 1536 | 8.847 | 9.33 | **948** | 52.9 |
+| b | 48 x 2560 | 1 x 512 | 0.01 | 16 | 0.069 | 7.06 | 10 | 0.5 |
+| a | 48 x 2560 | 1 x 512 | 0.01 | 16 | 0.069 | 7.06 | 10 | 0.5 |
+| out | 2560 x 6144 | 80 x 256 | 0.47 | 640 | 8.847 | 18.33 | **483** | 27.0 |
+| the grouped launch that replaces the first four (`gemv_fp4_mma_g32`) | 16480 x 2560 | 515 x 256 | 3.03 | 4120 | 23.731 | 27.78 | 854 | 47.7 |
+
+(`mma_bx32()` = 64 x `CROW_MMA_KS` = 256 threads for the 32-row forms, `mma_bx()` = 128 x KS = 512
+for the 64-row `gemv_fp4_mma_d` the two tiny slabs still use.)
+
+The four input rows and the out row come from the `CROW_GDN_FUSE_IN=0` arm, the grouped row from the
+default arm of the same morning; the two arms read the out projection at 18.33 and 18.27 us, which is
+the run-to-run agreement of the method. **Grouping the four input projections is worth -0.294 ms per
+decode token** floor-removed (per-slab 0.450 + 0.336 + 0.508 = 1.294 against the grouped 1.000): the
+grouped launch is 27 % slower per byte than qkv and z as two separate launches (27.78 us against
+12.50 + 9.33 = 21.83 for the same bytes), and it still wins, because the two 48-row slabs cost
+7.06 us each as launches of their own for 0.069 MB. That is #62b's lever measured a third way.
+
+#### The internal leg — where the 1.954 ms is, and what it is not
+
+- **Launch count is not the lever, and crow is already ahead on it.** Seven launches per GDN layer
+  per decode token, 252 per token; the fallback of record is 10 and #62b plus #19g already removed
+  three. The five recurrent-step kernels together are **0.296 ms = 15.1 %** of the row, and
+  `delta_rule_step_r` is half of that; the other four are 0.148 ms per decode token over 144
+  launches. Fusing all five into one — llama.cpp's `ggml_gated_delta_net` shape — cannot win more
+  than about 0.15 ms even if the fused kernel were free.
+- **Bytes requested = bytes unique.** At batch 1 the GDN projections read every weight byte exactly
+  once per decode token: 32.579 MB per layer, **1.1728 GB per decode token** over 36 layers. There is
+  no re-read term at all, unlike attention's 12.0 x (4.6). At this card's 1,792 GB/s that is a HARD
+  FLOOR of **0.6545 ms per decode token** on the projections alone, and the measured 1.658 ms over
+  them is **707 GB/s = 39.5 % of peak**. Adding the recurrent state traffic below (226.5 MB per
+  decode token = 0.126 ms at peak) the whole GDN row's bandwidth floor is **0.781 ms**, so the
+  measured 1.954 is **2.5 x its own floor**.
+- **No per-element decode chain — the 4.6.1 method has no target here.** The GDN projections decode
+  FP4 in HARDWARE: `mma_fp4_16n8k64` is the block-scaled `mma.sync m16n8k64`, the nibbles and the
+  4-byte per-block scale go straight to the tensor core, so there is no software `dec_e4m3`-style
+  chain anywhere on this path and no shared table to give it. The only software transcendentals in
+  the GDN row are `beta_g`'s `expf`/`logf` (48 elements per layer) and `conv_step`'s sigmoid (10,240),
+  together 0.045 ms per decode token = 2.3 % of the row. `CROW_ATTN_LUT` was the right lever for
+  attention precisely because `attn_sel_split` decoded 512 e4m3 bytes per selected token in software;
+  GDN never does.
+- **`delta_rule_step_r` is already at the roofline.** It reads and writes the whole 48 x 128 x 128 f32
+  state: 6.291 MB per layer per decode token in 4.12 us floor-removed = **1,527 GB/s = 85 % of peak**,
+  226 MB per decode token over the 36 layers. Nothing is available there.
+- **The out projection is the one GDN launch that does not fill the card — and the block count is
+  NOT how to fix it.** 80 blocks x 256 threads is 0.47 blocks per SM on 170 SMs and 640 warps, where
+  qkv has 2560. Among the three `gemv_fp4_mma_d32` launches the throughput rises with the TOTAL WARP
+  count and not with the block count: 640 warps -> 484 GB/s, 1536 -> 948, 2560 -> 1,180. The lever
+  this pass built and measured — `gemv_fp4_mma_d16`, one 16-row group per block instead of two, so
+  the out projection runs 160 blocks of `32*KS` threads instead of 80 of `64*KS`, per-row arithmetic
+  bit-identical by construction — **doubles the block count and keeps the warp count at 640, and the
+  row does not move: 19.00 us per call against 18.27, 466 GB/s against 484** (`decode_out/62/kp2-*.log`,
+  same binary both arms, ids `56305eee11d6` in both, `run 32` reproducing the 32 ids of record in
+  both). It is flat in the block count from 0.47 waves to 0.94, which is the same shape #61 found for
+  `attn_sel_split` from 96 to 768 blocks. **The lever is therefore NOT in the tree** — it adds a
+  kernel to `KERNEL_SRC` and an env row and buys nothing. At `CROW_MMA_KS` = 4 the warp count of a
+  2560-row slab is pinned at 640 by the row geometry, and the only bit-identical way to raise it,
+  more k slices, moves the fixed ascending smem reduce and therefore the bits.
+
+#### The external leg — llama.cpp's gated delta net, read at source 2026-09-18
+
+- **The graph.** `src/models/qwen3next.cpp` builds a linear-attention layer as 13 graph nodes:
+  THREE input-projection `mul_mat`s (`wqkv` for q|k|v, `wqkv_gate` for z, `ssm_beta_alpha` for beta
+  and alpha) where crow has ONE grouped launch, then `ggml_ssm_conv`, `ggml_silu`, two
+  `build_gdn_l2_norm`, `ggml_sigmoid` on beta, `ggml_softplus` on alpha, `ggml_mul` against `ssm_a`,
+  `build_recurrent_attn`, `build_norm_gated` (rms_norm + silu + mul) and the `ssm_out` `mul_mat`.
+  Before ggml's elementwise fusion that is 13 kernels or more per layer against crow's 7. **The
+  launch count — the issue's first step — is not where llama.cpp's advantage is.**
+- **What it does fuse that crow does not.** `ggml/src/ggml-cuda/gated_delta_net.cu` runs
+  `gated_delta_net_cuda<S_v, KDA, keep_rs_t>` at `grid_dims(H, n_seqs, ceil(S_v/num_warps))`,
+  `block_dims(min(warp_size, S_v), num_warps)` with `num_warps` = 4, and does the state decay
+  `S = g*S + k*delta`, the `kv` reduce, `delta = (v - kv)*beta`, the state update and the output
+  reduce in ONE kernel; crow's `beta_g` + `l2norm_repeat` + `delta_rule_step_r` are three launches.
+  Ceiling on that, measured above: about 0.076 ms per decode token.
+- **The bytes, which is where the headline gap actually lives.** The llama.cpp arm of record is
+  `Qwen3.8-Flash-Next-UD-Q2_K_XL`, GGUF, **2.4 bpw** container average (section 0.3); crow is
+  CNQ4.5-M, NVFP4, **4.5 bpw**. The GDN projections are 57,917,440 parameters per layer and
+  2,085,027,840 over the 36 layers, so per decode token they are **1.1728 GB for crow and 0.6255 GB
+  for llama.cpp at that average**. Reading the #59 llama row of 0.642 ms against CROW's parameter
+  bytes would require **1,827 GB/s = 102 % of this card's peak**, which is impossible — so the
+  2.280-against-0.642 headline of this issue was never measuring the same bytes. Against the 2.4 bpw
+  bytes, 0.642 ms is 974 GB/s = 54 % of peak, a perfectly ordinary number; crow's projections run at
+  707 GB/s = 39.5 %. The PER-TENSOR mix of a UD quant is not in the record and 62a saw `Q6_K` matvecs
+  in that csv, so the GDN slabs may sit above the 2.4 average — which only makes 0.642 ms cover less
+  of them, never more, and pushes the same way as the mapping caveat below.
+- **The remaining 1.312 ms, split three ways** (crow 1.954 against llama 0.642):
+
+  | term | ms per decode token | share |
+  |---|---|---|
+  | weight format — the same projections at 4.5 bpw instead of 2.4, at crow's own 707 GB/s | 0.774 | 59 % |
+  | crow's five recurrent-step launches (llama fuses most of them) | 0.296 | 23 % |
+  | projection efficiency — 707 GB/s against 974 on the same bytes | 0.242 | 18 % |
+
+  The format term is not a kernel lever at all: it is the price of 4.5 bpw against 2.4, a quality
+  decision, and it is the majority of what is left. On top of that the 62a caveat still stands and
+  runs the same way — only 36 of llama's 62 `mul_mat_vec_q<Q6_K>` instances mapped to `ssm_out`, so
+  0.642 probably UNDERSTATES llama's true GDN cost and the real gap is smaller than 1.312.
+- The two levers other engines hold that crow does not are the ones #61 already named for attention
+  and they apply here too: 16-byte vectorised weight loads, and more work in flight per warp. Neither
+  is a launch-count change.
+
+#### What to do next, with the numbers that name it
+
+1. **Split the grouped input launch in two, 3 slabs + 1** — the largest bit-identical lever the
+   decomposition names. `gemv_fp4_mma_g32` at 515 blocks reads 854 GB/s; the same bytes as
+   `qkv[320]` + `z[192]` read 1,180 and 948 (12.50 + 9.33 = 21.83 us against 27.78). Running
+   qkv + b + a as one grouped launch (323 blocks — the two tiny slabs stay inside a big launch and
+   never pay their own 7.06 us again) and z as the existing `gemv_fp4_mma_d32[192x1]` is
+   **-5.95 us per layer = about -0.21 ms per decode token**, at the cost of one extra launch per
+   layer. It needs no new kernel: `gemv_fp4_mma_g32` already takes four slabs and four row counts,
+   so it needs one device `0` scalar for the unused fourth. Bit-identical by exactly #62b's argument
+   — each row keeps its k split, its op order, its fixed smem reduce and its per-slab `gs`; only
+   which warp computes it moves.
+2. **16-byte vectorised weight loads in the mma GEMV body.** The kernel reads the 36-byte fp4 block
+   as 4-byte loads per lane; staging a warp's 8 rows x 36 B through shared memory with `uint4` loads
+   and feeding the mma fragments out of smem raises the bytes in flight per warp without touching the
+   arithmetic. It is the only route to more parallelism on the out projection, whose warp count is
+   pinned at 640 by the row geometry. Bigger job than 1, same identity class if the fragment values
+   are unchanged.
+3. **Fuse `beta_g` + `l2norm_repeat` into `delta_rule_step_r`** (llama.cpp's `ggml_gated_delta_net`
+   shape). Ceiling 0.076 ms per decode token, on the kernel with the documented contraction trap
+   (`kernels.rs:1690`, the `__fmul_rn`/`__fmaf_rn` intrinsics that stop nvcc contracting the step).
+   Lowest value, highest risk — last, if ever.
+
+**Nothing in this section flips a default and no engine code changed for it.** `tools/gate-linux.sh`
+is ALL GREEN at this commit (`decode_out/gate62`).
+
 
 ---
 
