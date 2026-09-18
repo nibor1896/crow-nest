@@ -31,6 +31,16 @@ decode_out/*
 !decode_out/ten-tasks.json
 !decode_out/ten-tasks-authored-t7-t10.json
 !decode_out/README.md
+# the #75 quality-probe baselines are the evidence the requant series is measured against,
+# not a throwaway run: four runs, 1.4 MB of records and summaries (2026-09-18). The server
+# logs beside them stay out through the *.log rule below.
+!decode_out/quality-probe/
+decode_out/quality-probe/*
+!decode_out/quality-probe/*/
+decode_out/quality-probe/*/*
+!decode_out/quality-probe/*/records.jsonl
+!decode_out/quality-probe/*/run.json
+!decode_out/quality-probe/*/summary.md
 oracle/golden/
 oracle/routing-selections.npz
 *.log

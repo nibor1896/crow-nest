@@ -1,0 +1,200 @@
+{
+  "label": "A3-crow",
+  "date": "2026-09-18",
+  "started": "2026-09-18T21:04:21",
+  "wall_s": 665.4,
+  "repo_commit": "c1cf95c",
+  "prompt_set_version": "1",
+  "prompt_ids": [
+    "de-prose-plakat",
+    "de-prose-speicher",
+    "de-prose-buchbinderei",
+    "de-prose-wasserwerk",
+    "en-prose-foundry",
+    "en-prose-archive",
+    "lit-farbpalette",
+    "lit-releasenote",
+    "json-tensorplan",
+    "json-schritte",
+    "de-agent-umzug",
+    "de-agent-fehlersuche"
+  ],
+  "seeds": [
+    4401,
+    4402,
+    4403
+  ],
+  "base_url": "http://127.0.0.1:8099",
+  "engine": "crow",
+  "props": {
+    "model_path": "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq",
+    "model": "Qwen3.8-Flash-Next-CNQ4.5-M",
+    "n_ctx": 200000,
+    "default_generation_settings": {
+      "n_ctx": 200000
+    },
+    "modalities": {
+      "vision": true
+    },
+    "prompt_chunk": 2048,
+    "build": "crow-nest-engine 0.1.0"
+  },
+  "row": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "presence_penalty": 0.0,
+    "min_p": 0.0,
+    "max_tokens": 2600
+  },
+  "reasoning_effort": "absent (crow)",
+  "hunspell": "@(#) International Ispell Version 3.2.06 (but really Hunspell 1.7.3)",
+  "dictionaries": {
+    "de": {
+      "stem": "/home/nibor1896/.cache/crow-nest/dict/de_DE_frami",
+      "files": {
+        "de_DE_frami.aff": {
+          "url": "https://raw.githubusercontent.com/LibreOffice/dictionaries/master/de/de_DE_frami.aff",
+          "sha256": "646bf3333ac69c23e9d794533ee5241d6f755c359e8fe10a648f87613743d594",
+          "bytes": 19067
+        },
+        "de_DE_frami.dic": {
+          "url": "https://raw.githubusercontent.com/LibreOffice/dictionaries/master/de/de_DE_frami.dic",
+          "sha256": "4ca3c958b0e5545910999bc246f668840bf8ede3df8e5e6790d05edd5a586c38",
+          "bytes": 4356903
+        }
+      }
+    },
+    "en": {
+      "stem": "/home/nibor1896/.cache/crow-nest/dict/en_US",
+      "files": {
+        "en_US.aff": {
+          "url": "https://raw.githubusercontent.com/LibreOffice/dictionaries/master/en/en_US.aff",
+          "sha256": "e746c882dd6f303c2c46e7452804b9201115a6942cfeb15f18f8edf774d2e24e",
+          "bytes": 3205
+        },
+        "en_US.dic": {
+          "url": "https://raw.githubusercontent.com/LibreOffice/dictionaries/master/en/en_US.dic",
+          "sha256": "f0b1a234bd178bdd01875b2a392a9647f888b8fe879f79c52aae62c2759b3647",
+          "bytes": 551762
+        }
+      }
+    }
+  },
+  "failures": 0,
+  "aggregate": {
+    "generations": 36,
+    "scored": 36,
+    "nonword_de": {
+      "per_generation": {
+        "n": 21,
+        "mean": 24.583374804480485,
+        "min": 9.32642487046632,
+        "max": 72.53886010362694,
+        "sd": 14.456650204201761
+      },
+      "per_generation_excl_loanwords": {
+        "n": 21,
+        "mean": 18.3470244635595,
+        "min": 9.32642487046632,
+        "max": 38.96103896103896,
+        "sd": 7.579024558003534
+      },
+      "pooled_rate_per_1000": 21.492030310948525,
+      "pooled_rate_per_1000_excl_loanwords": 16.788607264175596,
+      "checked_words": 15308,
+      "flagged_occurrences": 329,
+      "loanword_occurrences": 72
+    },
+    "nonword_en": {
+      "per_generation": {
+        "n": 9,
+        "mean": 9.828246593881609,
+        "min": 0.0,
+        "max": 18.720748829953198,
+        "sd": 5.928728217831596
+      },
+      "per_generation_excl_loanwords": {
+        "n": 9,
+        "mean": 9.481566059993588,
+        "min": 0.0,
+        "max": 15.600624024960998,
+        "sd": 5.412492550830964
+      },
+      "pooled_rate_per_1000": 10.481023830538394,
+      "pooled_rate_per_1000_excl_loanwords": 10.03971756398941,
+      "checked_words": 9064,
+      "flagged_occurrences": 95,
+      "loanword_occurrences": 4
+    },
+    "literal": {
+      "generations": 9,
+      "literals_share": {
+        "n": 9,
+        "mean": 0.8984126984126983,
+        "min": 0.5714285714285714,
+        "max": 1.0,
+        "sd": 0.1629517964977969
+      },
+      "occurrence_share": {
+        "n": 9,
+        "mean": 0.9593444018731376,
+        "min": 0.7931034482758621,
+        "max": 1.0,
+        "sd": 0.07221344206221539
+      },
+      "near_miss_kinds": 3
+    },
+    "json": {
+      "generations": 6,
+      "parsed": 6,
+      "valid_document": 4,
+      "shape_ok": 4,
+      "bare": 4
+    },
+    "repetition": {
+      "distinct_word_ratio": {
+        "n": 36,
+        "mean": 0.5237936175712238,
+        "min": 0.4,
+        "max": 0.8051948051948052,
+        "sd": 0.0779853065785088
+      },
+      "longest_repeat_count": {
+        "n": 36,
+        "mean": 1.8611111111111112,
+        "min": 1.0,
+        "max": 5.0,
+        "sd": 1.0731203574563766
+      },
+      "max_repeat_count": 5
+    },
+    "foreign": {
+      "generations": 24,
+      "with_foreign_chars": 0,
+      "foreign_chars": 0,
+      "greek_chars": 0
+    },
+    "length": {
+      "words": {
+        "n": 36,
+        "mean": 685.3333333333334,
+        "min": 25.0,
+        "max": 1548.0,
+        "sd": 459.66117956599294
+      },
+      "finish_length": 0,
+      "wall_s": {
+        "n": 36,
+        "mean": 18.44036111111111,
+        "min": 3.388,
+        "max": 31.367,
+        "sd": 8.918561748727932
+      }
+    }
+  },
+  "rescored": {
+    "date": "2026-09-18",
+    "repo_commit": "cefd891"
+  }
+}
