@@ -120,6 +120,18 @@ class Literals(unittest.TestCase):
         miss = [m for m in r["near_misses"] if m["seen"] == "#DFFFE0"]
         self.assertEqual((miss[0]["distance"], miss[0]["case_only"]), (1, False))
 
+    def test_a_leading_slash_belongs_to_the_path_and_invents_no_near_miss(self):
+        lits = [{"text": "/srv/plakat/vorlage.svg", "min": 1}]
+        r = qp.literal_report("Die Vorlage liegt unter /srv/plakat/vorlage.svg.", lits)
+        self.assertEqual(r["per_literal"][0]["exact"], 1)
+        self.assertEqual(r["near_misses"], [])
+
+    def test_the_same_path_without_its_leading_slash_IS_a_near_miss(self):
+        lits = [{"text": "/srv/plakat/vorlage.svg", "min": 1}]
+        r = qp.literal_report("Die Vorlage liegt unter srv/plakat/vorlage.svg.", lits)
+        self.assertEqual(r["per_literal"][0]["exact"], 0)
+        self.assertEqual(r["near_misses"][0]["seen"], "srv/plakat/vorlage.svg")
+
     def test_trailing_punctuation_does_not_invent_a_near_miss(self):
         r = qp.literal_report("Die Farbe #D7FFE0, dann #D7FFE0.", self.LITS)
         self.assertEqual(r["per_literal"][0]["exact"], 2)
@@ -207,6 +219,34 @@ class Shape(unittest.TestCase):
         self.assertEqual(len(qp.check_shape("3", "integer_or_null")), 1)
 
 
+class JsonValidity(unittest.TestCase):
+    """The scorer's reading of "valid JSON", which is the whole answer and not a fragment."""
+
+    PROMPT = {"id": "x", "lang": "en", "metrics": ["json"],
+              "json_shape": {"type": "object", "required": {"a": "integer"}}}
+
+    def test_a_bare_document_of_the_right_shape_is_valid_and_ok(self):
+        m = qp.score('{"a": 1}', self.PROMPT, Path("/nonexistent"))["json"]
+        self.assertEqual((m["valid_document"], m["shape_ok"], m["how"]), (True, True, "bare"))
+
+    def test_a_fenced_document_still_counts_as_the_whole_answer(self):
+        m = qp.score('```json\n{"a": 1}\n```', self.PROMPT, Path("/nonexistent"))["json"]
+        self.assertEqual((m["valid_document"], m["shape_ok"]), (True, True))
+
+    def test_a_broken_document_whose_fragment_parses_is_NOT_valid(self):
+        # the shape of the real failure: one stray comma, and the only thing that still
+        # parses is an inner object
+        broken = '{"a": 1, "b": [\n{"i": 0},\n{"i": 1,\n,\n"j": 2}\n]}'
+        m = qp.score(broken, self.PROMPT, Path("/nonexistent"))["json"]
+        self.assertEqual(m["how"], "embedded")
+        self.assertFalse(m["valid_document"])
+        self.assertFalse(m["shape_ok"])
+
+    def test_prose_is_neither_valid_nor_parsed(self):
+        m = qp.score("There is no JSON here.", self.PROMPT, Path("/nonexistent"))["json"]
+        self.assertEqual((m["parsed"], m["valid_document"], m["shape_ok"]), (False, False, False))
+
+
 class Repetition(unittest.TestCase):
     def test_an_ordinary_sentence_repeats_nothing(self):
         r = qp.repetition("das Plakat ist grün und das Papier ist rau".split())
@@ -290,6 +330,36 @@ class HunspellContract(unittest.TestCase):
         self.assertEqual(qp.hunspell_flag([], "stem", "/nonexistent-binary"), set())
 
 
+class NonwordReport(unittest.TestCase):
+    """The loanword split, against the REAL dictionaries when they are on this machine."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dict_dir = qp.DEFAULT_DICT_DIR
+        if not (cls.dict_dir / "de_DE_frami.dic").exists():
+            raise unittest.SkipTest("no dictionaries in %s" % cls.dict_dir)
+
+    def test_a_german_misspelling_is_flagged_and_is_not_a_loanword(self):
+        r = qp.nonword_report("Der Betrachers sieht das Plakat.", "de", self.dict_dir)
+        self.assertEqual([f["word"] for f in r["flagged"]], ["Betrachers"])
+        self.assertFalse(r["flagged"][0]["loanword"])
+        self.assertEqual(r["loanword_occurrences"], 0)
+
+    def test_an_english_loanword_in_german_prose_is_flagged_and_marked(self):
+        r = qp.nonword_report("Der Thread wartet auf einen Timeout.", "de", self.dict_dir)
+        words = {f["word"]: f["loanword"] for f in r["flagged"]}
+        self.assertTrue(words.get("Thread"))
+        self.assertTrue(words.get("Timeout"))
+        self.assertEqual(r["rate_per_1000_excl_loanwords"], 0.0)
+        self.assertGreater(r["rate_per_1000"], 0.0)
+
+    def test_clean_german_prose_has_rate_zero(self):
+        r = qp.nonword_report("Das Haus ist schön und die Straße ist breit.", "de",
+                              self.dict_dir)
+        self.assertEqual(r["flagged"], [])
+        self.assertEqual(r["rate_per_1000"], 0.0)
+
+
 class Aggregate(unittest.TestCase):
     def test_a_mean_is_reported_with_its_spread(self):
         sp = qp._spread([1.0, 3.0, 5.0])
@@ -302,16 +372,19 @@ class Aggregate(unittest.TestCase):
         recs = [
             {"lang": "de", "finish_reason": "stop", "wall_s": 1.0, "metrics": {
                 "nonword": {"lang": "de", "checked_words": 100, "flagged_occurrences": 1,
-                            "rate_per_1000": 10.0},
+                            "loanword_occurrences": 0, "rate_per_1000": 10.0,
+                            "rate_per_1000_excl_loanwords": 10.0},
                 "length": {"words": 100}}},
             {"lang": "de", "finish_reason": "stop", "wall_s": 1.0, "metrics": {
                 "nonword": {"lang": "de", "checked_words": 900, "flagged_occurrences": 9,
-                            "rate_per_1000": 10.0},
+                            "loanword_occurrences": 9, "rate_per_1000": 10.0,
+                            "rate_per_1000_excl_loanwords": 0.0},
                 "length": {"words": 900}}},
         ]
         agg = qp.aggregate(recs)
         self.assertEqual(agg["nonword_de"]["checked_words"], 1000)
         self.assertEqual(agg["nonword_de"]["pooled_rate_per_1000"], 10.0)
+        self.assertEqual(agg["nonword_de"]["pooled_rate_per_1000_excl_loanwords"], 1.0)
         self.assertEqual(agg["nonword_de"]["per_generation"]["n"], 2)
 
 

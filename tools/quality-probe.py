@@ -176,7 +176,7 @@ def edit_distance(a, b, cap=None):
     return prev[-1]
 
 
-CANDIDATE_RE = re.compile(r"[#0-9A-Za-z][0-9A-Za-z._:/\\-]*")
+CANDIDATE_RE = re.compile(r"[#/0-9A-Za-z][0-9A-Za-z._:/\\-]*")
 
 
 def literal_report(text, literals):
@@ -445,11 +445,23 @@ def hunspell_flag(words, dict_stem, binary="hunspell"):
 
 
 def nonword_report(text, lang, dict_dir, binary="hunspell"):
-    """Non-word rate per 1000 checked words, plus every flagged word and its context."""
+    """Non-word rate per 1000 checked words, plus every flagged word and its context.
+
+    A word flagged in the answer's language is ALSO looked up in the other language's
+    dictionary. "Timeout", "Thread" and "Burst" in a German technical text are loanwords,
+    not misspellings, and they are the one false-positive class that can be separated
+    mechanically - so the report carries the rate both ways and the summary says which is
+    which. Compounds and proper names cannot be separated this way and stay in the count;
+    what they cost is measured by hand and written down in `docs/quality-probe.md`.
+    """
     words = checkable_words(text)
     stem = dict_dir / DICTS[lang]["stem"]
     flagged = hunspell_flag(words, stem, binary)
+    other = "en" if lang == "de" else "de"
+    loanwords = flagged - hunspell_flag(sorted(flagged), dict_dir / DICTS[other]["stem"], binary) \
+        if flagged else set()
     occurrences = [w for w in words if w in flagged]
+    native = [w for w in occurrences if w not in loanwords]
     counts = {}
     for w in occurrences:
         counts[w] = counts.get(w, 0) + 1
@@ -459,8 +471,12 @@ def nonword_report(text, lang, dict_dir, binary="hunspell"):
         "checked_words": len(words),
         "flagged_occurrences": len(occurrences),
         "flagged_unique": len(flagged),
+        "loanword_occurrences": len(occurrences) - len(native),
+        "loanword_unique": len(loanwords),
         "rate_per_1000": (1000.0 * len(occurrences) / len(words)) if words else None,
-        "flagged": [{"word": w, "count": counts[w]} for w in ordered],
+        "rate_per_1000_excl_loanwords": (1000.0 * len(native) / len(words)) if words else None,
+        "flagged": [{"word": w, "count": counts[w], "loanword": w in loanwords}
+                    for w in ordered],
         "contexts": word_contexts(text, ordered[:12]),
     }
 
@@ -500,6 +516,16 @@ def http_json(url, body=None, timeout=900):
                                  headers={"Content-Type": "application/json"} if data else {})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+def props_model(props):
+    """The model name of the arm. `serve` names it; llama-server only has its file."""
+    name = props.get("model")
+    if name:
+        return name
+    path = props.get("model_alias") or props.get("model_path") or ""
+    base = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return base or None
 
 
 def detect_engine(props):
@@ -545,6 +571,9 @@ def score(text, prompt, dict_dir, binary="hunspell"):
         metrics["json"] = {
             "parsed": value is not None,
             "how": how,
+            # VALIDITY is the whole answer parsing, not a fragment dug out of it: `embedded`
+            # is what a broken document also produces, and it must not read as valid JSON
+            "valid_document": how in ("bare", "fenced"),
             "shape_ok": (problems == []) if problems is not None else False,
             "problems": problems if problems is not None else ["did not parse"],
         }
@@ -605,7 +634,7 @@ def run(args):
                     fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
                     fh.flush()
                     records.append(rec)
-                    print(f"  {prompt['id']} seed {seed}: FAILED {err}", file=sys.stderr)
+                    print(f"  {prompt['id']} seed {seed}: FAILED {err}", file=sys.stderr, flush=True)
                     continue
                 choice = (resp.get("choices") or [{}])[0]
                 msg = choice.get("message") or {}
@@ -617,7 +646,7 @@ def run(args):
                     "seed": seed,
                     "label": args.label,
                     "engine": engine,
-                    "model": props.get("model"),
+                    "model": props_model(props),
                     "model_path": props.get("model_path"),
                     "sampling": body,
                     "finish_reason": choice.get("finish_reason"),
@@ -643,7 +672,7 @@ def run(args):
                 if js:
                     note += f" json {'ok' if js['shape_ok'] else 'BAD'}"
                 print(f"  {prompt['id']} seed {seed}: {rec['metrics']['length']['words']} words, "
-                      f"{wall:.1f} s, {rec['finish_reason']}, {note}")
+                      f"{wall:.1f} s, {rec['finish_reason']}, {note}", flush=True)
 
     header = {
         "label": args.label,
@@ -702,18 +731,24 @@ def aggregate(records):
     ok = [r for r in records if "metrics" in r]
     out = {"generations": len(records), "scored": len(ok)}
     for lang in ("de", "en"):
-        rates, words, flags = [], 0, 0
+        rates, native_rates, words, flags, loans = [], [], 0, 0, 0
         for r in ok:
             nw = r["metrics"].get("nonword")
             if nw and nw["lang"] == lang and nw["rate_per_1000"] is not None:
                 rates.append(nw["rate_per_1000"])
+                if nw.get("rate_per_1000_excl_loanwords") is not None:
+                    native_rates.append(nw["rate_per_1000_excl_loanwords"])
                 words += nw["checked_words"]
                 flags += nw["flagged_occurrences"]
+                loans += nw.get("loanword_occurrences", 0)
         out[f"nonword_{lang}"] = {
             "per_generation": _spread(rates),
+            "per_generation_excl_loanwords": _spread(native_rates),
             "pooled_rate_per_1000": (1000.0 * flags / words) if words else None,
+            "pooled_rate_per_1000_excl_loanwords": (1000.0 * (flags - loans) / words) if words else None,
             "checked_words": words,
             "flagged_occurrences": flags,
+            "loanword_occurrences": loans,
         }
     lit = [r["metrics"]["literal"] for r in ok if "literal" in r["metrics"]]
     out["literal"] = {
@@ -726,6 +761,7 @@ def aggregate(records):
     out["json"] = {
         "generations": len(js),
         "parsed": sum(1 for m in js if m["parsed"]),
+        "valid_document": sum(1 for m in js if m.get("valid_document")),
         "shape_ok": sum(1 for m in js if m["shape_ok"]),
         "bare": sum(1 for m in js if m["how"] == "bare"),
     }
@@ -765,7 +801,7 @@ def summary_md(header, records):
     L.append(f"- date {header['date']}, repo commit `{header['repo_commit']}`, "
              f"prompt set version {header['prompt_set_version']}")
     L.append(f"- endpoint `{header['base_url']}`, engine `{header['engine']}`, "
-             f"model `{header['props'].get('model')}`")
+             f"model `{props_model(header['props'])}`")
     L.append(f"- row temperature {ROW['temperature']}, top_p {ROW['top_p']}, top_k {ROW['top_k']}, "
              f"presence_penalty {ROW['presence_penalty']}, min_p {ROW['min_p']}, "
              f"max_tokens {header['row']['max_tokens']}")
@@ -778,17 +814,23 @@ def summary_md(header, records):
     L.append("| metric | value |")
     L.append("|---|---|")
     L.append(f"| non-word rate DE per 1000 words, per generation | {_fmt(agg['nonword_de']['per_generation'])} |")
+    L.append(f"| non-word rate DE, loanwords the EN dictionary knows removed | "
+             f"{_fmt(agg['nonword_de'].get('per_generation_excl_loanwords'))} |")
     L.append(f"| non-word rate DE, pooled over {agg['nonword_de']['checked_words']} words | "
              f"{agg['nonword_de']['pooled_rate_per_1000']:.2f} |"
              if agg["nonword_de"]["pooled_rate_per_1000"] is not None else "| non-word rate DE pooled | n/a |")
     L.append(f"| non-word rate EN per 1000 words, per generation | {_fmt(agg['nonword_en']['per_generation'])} |")
+    L.append(f"| non-word rate EN, loanwords the DE dictionary knows removed | "
+             f"{_fmt(agg['nonword_en'].get('per_generation_excl_loanwords'))} |")
     L.append(f"| non-word rate EN, pooled over {agg['nonword_en']['checked_words']} words | "
              f"{agg['nonword_en']['pooled_rate_per_1000']:.2f} |"
              if agg["nonword_en"]["pooled_rate_per_1000"] is not None else "| non-word rate EN pooled | n/a |")
     L.append(f"| exact literals reproduced (share of literals) | {_fmt(agg['literal']['literals_share'], 3)} |")
     L.append(f"| exact literals reproduced (share of demanded occurrences) | {_fmt(agg['literal']['occurrence_share'], 3)} |")
     L.append(f"| near-miss literal kinds seen | {agg['literal']['near_miss_kinds']} |")
-    L.append(f"| JSON parsed / shape ok | {agg['json']['parsed']} / {agg['json']['shape_ok']} of {agg['json']['generations']} |")
+    L.append(f"| JSON: whole answer a valid document / shape ok | "
+             f"{agg['json'].get('valid_document', '?')} / {agg['json']['shape_ok']} "
+             f"of {agg['json']['generations']} |")
     L.append(f"| distinct-word ratio | {_fmt(agg['repetition']['distinct_word_ratio'], 3)} |")
     L.append(f"| longest immediate repeat run | {_fmt(agg['repetition']['longest_repeat_count'], 1)}, max {agg['repetition']['max_repeat_count']} |")
     L.append(f"| generations with foreign-script characters | {agg['foreign']['with_foreign_chars']} of {agg['foreign']['generations']} ({agg['foreign']['foreign_chars']} chars) |")
@@ -815,7 +857,9 @@ def summary_md(header, records):
             rate=f"{nw['rate_per_1000']:.2f}" if nw and nw["rate_per_1000"] is not None else "-",
             flag=f"{nw['flagged_occurrences']}/{nw['checked_words']}" if nw else "-",
             lit=f"{lit['literals_ok']}/{lit['literals_total']} ({lit['occurrence_share']:.2f})" if lit else "-",
-            js=("ok" if js["shape_ok"] else ("parse-only" if js["parsed"] else "no")) if js else "-",
+            js=("ok" if js["shape_ok"] else
+                ("shape" if js.get("valid_document") else
+                 ("fragment" if js["parsed"] else "no"))) if js else "-",
             rep=f"{rep['longest_repeat_count']}x{rep['longest_repeat_n']}" if rep else "-",
             frn=frn["foreign_chars"] if frn else "-"))
     L.append("")
@@ -826,18 +870,20 @@ def summary_md(header, records):
         nw = r["metrics"].get("nonword")
         if not nw:
             continue
+        loan = {f["word"] for f in nw["flagged"] if f.get("loanword")}
         for c in nw["contexts"]:
             key = (r["lang"], c["word"])
             if key in seen:
                 continue
-            seen[key] = (r["prompt_id"], r["seed"], c["context"])
+            seen[key] = (r["prompt_id"], r["seed"], c["context"],
+                         "loanword" if c["word"] in loan else "")
     if not seen:
         L.append("None.")
     else:
-        L.append("| lang | word | prompt | seed | context |")
-        L.append("|---|---|---|---|---|")
-        for (lang, word), (pid, seed, ctx) in sorted(seen.items()):
-            L.append(f"| {lang} | `{word}` | {pid} | {seed} | {ctx.replace('|', ' ')} |")
+        L.append("| lang | word | note | prompt | seed | context |")
+        L.append("|---|---|---|---|---|---|")
+        for (lang, word), (pid, seed, ctx, note) in sorted(seen.items()):
+            L.append(f"| {lang} | `{word}` | {note} | {pid} | {seed} | {ctx.replace('|', ' ')} |")
     L.append("")
     L.append("## near-miss literals")
     L.append("")
@@ -859,6 +905,34 @@ def summary_md(header, records):
     return "\n".join(L) + "\n"
 
 
+# -------------------------------------------------------------------- rescore
+
+def rescore(label, dict_dir, binary="hunspell"):
+    """Recompute every metric of a stored run from its texts - no server, no GPU.
+
+    The generations are the expensive part and they are kept verbatim in `records.jsonl`,
+    so a metric that is corrected afterwards does not cost a re-run - and every arm can be
+    brought to the SAME scorer, which is what makes two arms comparable at all.
+    """
+    header, recs = load_label(label)
+    by_id = {p["id"]: p for p in json.loads(PROMPTS.read_text(encoding="utf-8"))["prompts"]}
+    for r in recs:
+        if "content" not in r:
+            continue
+        r["metrics"] = score(r["content"], by_id[r["prompt_id"]], Path(dict_dir), binary)
+    d = OUT_ROOT / label
+    with (d / "records.jsonl").open("w", encoding="utf-8") as fh:
+        for r in recs:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    header["aggregate"] = aggregate(recs)
+    header["rescored"] = {"date": time.strftime("%Y-%m-%d"), "repo_commit": git_commit()}
+    (d / "run.json").write_text(json.dumps(header, ensure_ascii=False, indent=2) + "\n",
+                                encoding="utf-8")
+    (d / "summary.md").write_text(summary_md(header, recs), encoding="utf-8")
+    print(f"quality-probe: rescored {len(recs)} records of {label}")
+    return 0
+
+
 # -------------------------------------------------------------------- compare
 
 def load_label(label):
@@ -877,9 +951,9 @@ def compare(label_a, label_b, out=None):
     L = []
     L.append(f"# quality probe - {label_a} against {label_b}")
     L.append("")
-    L.append(f"- A `{label_a}`: engine `{ha['engine']}`, model `{ha['props'].get('model')}`, "
+    L.append(f"- A `{label_a}`: engine `{ha['engine']}`, model `{props_model(ha['props'])}`, "
              f"{ha['date']}, commit `{ha['repo_commit']}`")
-    L.append(f"- B `{label_b}`: engine `{hb['engine']}`, model `{hb['props'].get('model')}`, "
+    L.append(f"- B `{label_b}`: engine `{hb['engine']}`, model `{props_model(hb['props'])}`, "
              f"{hb['date']}, commit `{hb['repo_commit']}`")
     L.append(f"- {len(keys)} generation pairs matched by (prompt, seed)")
     L.append("")
@@ -895,8 +969,14 @@ def compare(label_a, label_b, out=None):
 
     row("non-word rate DE per 1000 (pooled)", aa["nonword_de"]["pooled_rate_per_1000"],
         ab["nonword_de"]["pooled_rate_per_1000"])
+    row("non-word rate DE per 1000 (pooled, loanwords removed)",
+        aa["nonword_de"].get("pooled_rate_per_1000_excl_loanwords"),
+        ab["nonword_de"].get("pooled_rate_per_1000_excl_loanwords"))
     row("non-word rate EN per 1000 (pooled)", aa["nonword_en"]["pooled_rate_per_1000"],
         ab["nonword_en"]["pooled_rate_per_1000"])
+    row("non-word rate EN per 1000 (pooled, loanwords removed)",
+        aa["nonword_en"].get("pooled_rate_per_1000_excl_loanwords"),
+        ab["nonword_en"].get("pooled_rate_per_1000_excl_loanwords"))
     row("literal occurrence share", (aa["literal"]["occurrence_share"] or {}).get("mean"),
         (ab["literal"]["occurrence_share"] or {}).get("mean"), 3)
     row("distinct-word ratio", (aa["repetition"]["distinct_word_ratio"] or {}).get("mean"),
@@ -951,11 +1031,17 @@ def main(argv):
     ap.add_argument("--no-fetch-dicts", action="store_true")
     ap.add_argument("--hunspell", default="hunspell")
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"))
+    ap.add_argument("--rescore", metavar="LABEL",
+                    help="recompute the metrics of a stored run from its texts")
     ap.add_argument("--out", help="with --compare: also write the table to this file")
     args = ap.parse_args(argv[1:])
 
     if args.compare:
         return compare(args.compare[0], args.compare[1], args.out)
+    if args.rescore:
+        if shutil.which(args.hunspell) is None:
+            raise SystemExit(f"quality-probe: {args.hunspell} is not on PATH")
+        return rescore(args.rescore, args.dict_dir, args.hunspell)
     if not args.label:
         ap.error("--label is required for a run")
     if shutil.which(args.hunspell) is None:
