@@ -56,9 +56,18 @@
 //!   [end-8-index_len..end-8)  index JSON (UTF-8)
 //!   [end-8..end)              u64 LE index_len
 //! Tensor offsets in the index are relative to blob start (12).
+//!
+//! Subcommand `requant-check` (#76, 2026-09-18) — ADDITIVE and read-only. It takes the BF16
+//! originals of the dense text path, fetched back by `tools/fetch-dense-originals.py`, runs
+//! them through the SAME `quantize_nvfp4` above and compares the blocks and the global scale
+//! with what a container already stores. The conversion path below is untouched by it: a
+//! run without the word `requant-check` parses, reads and writes exactly what it did before.
+//! See `src/requant_check.rs` and `docs/dense-originals.md`.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
+
+mod requant_check;
 
 const E2M1_GRID: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
 const E2M1_MID: [f32; 7] = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0];
@@ -491,9 +500,41 @@ fn quantize_nvfp4(values: &[f32], mode: ScalesMode) -> (Vec<u8>, f32, QuantStats
     (out, global, stats, sse_ceil)
 }
 
-const HELP: &str = "usage: converter [--scales ceil|mse] <model-dir | file.safetensors> <out.cnq>\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report";
+const HELP: &str = "usage: converter [--scales ceil|mse] <model-dir | file.safetensors> <out.cnq>\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)";
 
 fn main() {
+    // #76: the additive read-only subcommand is taken off the front before the conversion
+    // path sees anything. Without the word `requant-check` nothing below this block changes.
+    let all: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(at) = all.iter().position(|a| a == "requant-check") {
+        let mut mode = ScalesMode::Ceil;
+        let mut explicit = false;
+        let mut before = all[..at].iter();
+        while let Some(a) = before.next() {
+            match a.as_str() {
+                "--scales" => match before.next().map(|s| s.as_str()) {
+                    Some("ceil") => {
+                        mode = ScalesMode::Ceil;
+                        explicit = true;
+                    }
+                    Some("mse") => {
+                        mode = ScalesMode::Mse;
+                        explicit = true;
+                    }
+                    other => {
+                        eprintln!("--scales needs `ceil` or `mse`, got {other:?}\n{HELP}");
+                        std::process::exit(2);
+                    }
+                },
+                other => {
+                    eprintln!("unexpected argument {other} before requant-check\n{}", requant_check::HELP);
+                    std::process::exit(2);
+                }
+            }
+        }
+        std::process::exit(requant_check::run(&all[at + 1..], mode, explicit));
+    }
+
     let mut positional: Vec<String> = Vec::new();
     let mut mode = ScalesMode::Ceil;
     let mut argv = std::env::args().skip(1);

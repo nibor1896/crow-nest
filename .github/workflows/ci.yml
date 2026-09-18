@@ -109,7 +109,10 @@ jobs:
       #   engine lib     72 of 80 ( 8 filtered)
       #   engine serve   55 of 57 ( 2 filtered)
       #   engine other bins 0 of 0
-      #   converter       7 of  7
+      #   converter      12 of 12   (7 of 2026-09-11 plus the five of #76, 2026-09-18:
+      #                              the four in `requant_check.rs` that pin the block
+      #                              comparison and the selection rule, and the one that
+      #                              pins the f32 global scale through the index JSON)
       - name: engine tests
         working-directory: engine
         shell: bash
@@ -170,6 +173,9 @@ jobs:
       # Local counts of 2026-09-11, dominant lints in the engine:
       #   unnecessary_cast 1085, missing_safety_doc 87, manual_div_ceil 52,
       #   manual_is_multiple_of 14, needless_range_loop 12, rest below 6 each.
+      # The converter measured 13 on this machine on 2026-09-18, against the 11 noted above
+      # for 2026-09-11; where those two come from was not investigated. #76 added NONE of
+      # them: `src/requant_check.rs` produces no clippy warning.
       - name: engine clippy
         working-directory: engine
         shell: bash

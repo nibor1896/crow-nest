@@ -7,19 +7,22 @@
 | what it never does | hold the model in RAM, judge its own output, or read a GGUF |
 | spec | `../docs/architecture.md` section 1, approved 2026-09-02 |
 | platform | Linux and Windows; the crate is pure Rust with no CUDA and no platform code, and it was untouched by the Linux port of 2026-09-17 (issue #15) |
-| module comment of record | `src/main.rs:1-59` |
+| module comment of record | `src/main.rs:1-65` |
 
 ## Usage
 
 ```
-converter [--scales ceil|mse] <model-dir | file.safetensors> <out.cnq>
+usage: converter [--scales ceil|mse] <model-dir | file.safetensors> <out.cnq>
   --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)
   --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report
+       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>
+  re-quantizes fetched originals and compares them with the container's own bytes (#76)
 ```
 
-- The usage text above is the `HELP` constant verbatim (`src/main.rs:494`).
+- The usage text above is the `HELP` constant verbatim (`src/main.rs:503`).
 - Input is a directory with `model.safetensors.index.json`, or a single `.safetensors` file.
 - Two positional arguments are required; anything else exits 2.
+- `requant-check` is the read-only subcommand of issue #76; it is described below.
 
 ## Container layout
 
@@ -101,6 +104,20 @@ converter [--scales ceil|mse] <model-dir | file.safetensors> <out.cnq>
 - The GLOBAL tensor scale stays max-based in BOTH modes, so ladder utilization is unchanged; only the sub-block scale choice differs (`src/main.rs:47-48`).
 - Cost of `mse`: about two to three times the per-value quantization work of `ceil` (`src/main.rs:49-50`).
 
+## `requant-check` — the proof of the fetched originals (issue #76)
+
+```
+converter requant-check <dense.safetensors> <container.cnq> [--threads N] [--limit N]
+```
+
+- Added 2026-09-18 as an ADDITIVE read-only subcommand. It writes nothing, and a run without the word `requant-check` parses, reads and writes exactly what it did before: the conversion path is untouched (`src/main.rs:60-65`).
+- It reads a safetensors file of ORIGINAL tensors — the one `../tools/fetch-dense-originals.py` fetches back by HTTP range — runs every tensor through the same `quantize_nvfp4` the conversion runs, and compares the produced NVFP4 blocks and the `f32` global scale against what the container stores under that name.
+- The comparison is on bytes: per tensor it reports how many `36` B blocks differ, the first one that does, and whether its four scale bytes or its packed nibbles are what disagree. The global scale is compared on its bits.
+- Scale mode: `mse` by default, because that is the mode `Qwen3.8-Flash-Next-CNQ4.5-M.cnq` was built with (`../docs/model-card.md`, Provenance). `--scales ceil` before the subcommand overrides it.
+- It derives the tensor list a second time, from the container's own index (`section` `text`, `dtype` `nvfp4`, name without `.mlp.experts.`), and refuses if the fetched file is missing one of them. The fetch tool derives the same list from the sidecar — two independent derivations of one list.
+- Exit code: `0` only if every tensor is identical including its global scale, `1` otherwise, `2` on a malformed argument or an unreadable file.
+- What it proves and what it does not: see `../docs/dense-originals.md`.
+
 ## Tests
 
 ```
@@ -108,4 +125,5 @@ cd converter
 cargo test --release
 ```
 
-- Seven `#[test]` functions in `src/main.rs`, counted 2026-09-17. They are not part of the engine's count: `cd engine && cargo test --release` reads 165 passed, 0 failed on the same day and covers `crow_nest_engine` and `bin/serve` only.
+- Seven `#[test]` functions in `src/main.rs`, counted 2026-09-17, plus five in `src/requant_check.rs` added on 2026-09-18 (issue #76), so `cargo test --release` in this crate reads 12 passed, 0 failed on 2026-09-18.
+- They are not part of the engine's count: `cd engine && cargo test --release` reads 165 passed, 0 failed on 2026-09-17 and covers `crow_nest_engine` and `bin/serve` only. `tools/gate-linux.sh` pins THAT count, not this one, so a test added here moves no gate value.
