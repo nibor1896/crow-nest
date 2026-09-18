@@ -1,0 +1,161 @@
+{
+  "_what": "The fixed prompt set of tools/quality-probe.py. Versioned here so a run taken today and a run taken after a quant change ask the SAME questions.",
+  "_why_fixed": "The probe is reference-free: it compares two engines to each other, never an answer to a gold answer. That only works while the questions do not move. A prompt edited between two runs makes the two runs incomparable, so this file is evidence and changes with a version bump, never silently.",
+  "_why_these": "robin's symptom is German misspelling and dialect-like non-words that grow with answer length ('Erschd kuck ich mir alles an', 'Kunstgewerkds', 'Jahrundert'), and a hex code that comes back one digit wrong. The set is built around exactly that: four long German prose tasks that force 800 to 1200 words of continuous specialist text with no list to hide in, two English ones as the language control, two tasks that must repeat literals given in the prompt, two that must return strict JSON, and two short German plans that are the agentic shape without tools.",
+  "version": "1",
+  "created": "2026-09-18",
+  "prompts": [
+    {
+      "id": "de-prose-plakat",
+      "lang": "de",
+      "kind": "prose",
+      "metrics": ["nonword", "repetition", "foreign", "length"],
+      "system": "Du bist ein Fachautor. Du schreibst durchgehende Prosa in korrektem Hochdeutsch.",
+      "user": "Schreibe einen zusammenhängenden Fachtext von etwa 900 bis 1100 Wörtern über die Gestaltung eines Ausstellungsplakats für eine kunstgewerbliche Sammlung des 19. Jahrhunderts. Behandle die Bildauswahl, die Typografie, das Verhältnis von Fläche und Schrift, die Farbwahl im Druck und die Frage, wie ein Plakat aus der Entfernung und aus der Nähe gelesen wird. Schreibe durchgehende Prosa in ganzen Sätzen. Verwende keine Aufzählungen, keine Stichpunkte, keine Überschriften und keine Zwischentitel."
+    },
+    {
+      "id": "de-prose-speicher",
+      "lang": "de",
+      "kind": "prose",
+      "metrics": ["nonword", "repetition", "foreign", "length"],
+      "system": "Du bist ein Fachautor. Du schreibst durchgehende Prosa in korrektem Hochdeutsch.",
+      "user": "Schreibe einen zusammenhängenden Fachtext von etwa 900 bis 1100 Wörtern über die Speicherhierarchie moderner Grafikprozessoren. Erkläre, warum die Bandbreite zwischen Hauptspeicher und Beschleuniger heute die eigentliche Schranke ist, wie Zwischenspeicher diese Schranke verschieben, was dabei an Latenz entsteht und welche Rolle die Größe einer Arbeitsmenge spielt. Schreibe durchgehende Prosa in ganzen Sätzen. Verwende keine Aufzählungen, keine Stichpunkte, keine Überschriften und keinen Programmcode."
+    },
+    {
+      "id": "de-prose-buchbinderei",
+      "lang": "de",
+      "kind": "prose",
+      "metrics": ["nonword", "repetition", "foreign", "length"],
+      "system": "Du bist ein Fachautor. Du schreibst durchgehende Prosa in korrektem Hochdeutsch.",
+      "user": "Schreibe einen zusammenhängenden Fachtext von etwa 900 bis 1100 Wörtern über die Geschichte der Buchbinderei zwischen 1850 und 1930. Behandle den Übergang von der Handarbeit zur Maschine, die Werkstoffe, die Ausbildung der Buchbinder, den Einfluss der Verlage auf den Einband und die Frage, was dabei an Handwerk verloren ging und was gewonnen wurde. Schreibe durchgehende Prosa in ganzen Sätzen. Verwende keine Aufzählungen, keine Stichpunkte und keine Überschriften."
+    },
+    {
+      "id": "de-prose-wasserwerk",
+      "lang": "de",
+      "kind": "prose",
+      "metrics": ["nonword", "repetition", "foreign", "length"],
+      "system": "Du bist ein Fachautor. Du schreibst durchgehende Prosa in korrektem Hochdeutsch.",
+      "user": "Schreibe einen zusammenhängenden Fachtext von etwa 900 bis 1100 Wörtern über die Trinkwasserversorgung einer mittelgroßen Stadt. Behandle die Gewinnung, die Aufbereitung, das Leitungsnetz, den Druck im Netz, die Überwachung der Wasserqualität und die Instandhaltung alter Leitungen. Erkläre auch, woran ein Netz altert und wie eine Stadt das bemerkt. Schreibe durchgehende Prosa in ganzen Sätzen. Verwende keine Aufzählungen, keine Stichpunkte und keine Überschriften."
+    },
+    {
+      "id": "en-prose-foundry",
+      "lang": "en",
+      "kind": "prose",
+      "metrics": ["nonword", "repetition", "foreign", "length"],
+      "system": "You are a technical writer. You write continuous prose in correct English.",
+      "user": "Write a continuous specialist text of roughly 900 to 1100 words about the work of a small iron foundry in the early twentieth century. Cover the pattern shop, the moulding sand, the cupola furnace, the pouring floor, the cleaning of the casting and the inspection that decided whether a piece was sound. Write continuous prose in full sentences. Use no bullet points, no numbered lists and no headings."
+    },
+    {
+      "id": "en-prose-archive",
+      "lang": "en",
+      "kind": "prose",
+      "metrics": ["nonword", "repetition", "foreign", "length"],
+      "system": "You are a technical writer. You write continuous prose in correct English.",
+      "user": "Write a continuous specialist text of roughly 900 to 1100 words about how a municipal archive keeps paper records readable for two hundred years. Cover the building and its climate, the enemies of paper, the choice of boxes and folders, the finding aid that makes a holding usable, the decision of what not to keep and the slow work of repair. Write continuous prose in full sentences. Use no bullet points, no numbered lists and no headings."
+    },
+    {
+      "id": "lit-farbpalette",
+      "lang": "de",
+      "kind": "literal",
+      "metrics": ["literal", "nonword", "repetition", "length"],
+      "system": "Du bist ein Fachautor. Du gibst Bezeichner exakt so wieder, wie sie dir genannt wurden.",
+      "user": "Für ein Ausstellungsplakat sind vier Farben festgelegt: #D7FFE0 (Hintergrund), #050505 (Schrift), #1B3A5F (Rahmen) und #FFB347 (Akzent). Die Vorlage liegt unter /srv/plakat/2026/vorlage-v3.2.1.svg und trägt die Fassung v3.2.1, die Auflage beträgt 4800 Stück.\n\nSchreibe einen zusammenhängenden Text von etwa 500 bis 700 Wörtern, in dem du erklärst, wie diese vier Farben zusammenwirken, wofür jede eingesetzt wird und worauf beim Druck zu achten ist. Nenne jeden der vier Hexcodes mindestens fünfmal und jedes Mal exakt in der Schreibweise, die oben steht, Großbuchstaben inbegriffen. Nenne den Dateipfad mindestens dreimal exakt, die Fassung v3.2.1 mindestens dreimal exakt und die Zahl 4800 mindestens dreimal. Schreibe durchgehende Prosa, keine Aufzählungen und keine Tabelle.",
+      "literals": [
+        {"text": "#D7FFE0", "min": 5},
+        {"text": "#050505", "min": 5},
+        {"text": "#1B3A5F", "min": 5},
+        {"text": "#FFB347", "min": 5},
+        {"text": "/srv/plakat/2026/vorlage-v3.2.1.svg", "min": 3},
+        {"text": "v3.2.1", "min": 3},
+        {"text": "4800", "min": 3}
+      ]
+    },
+    {
+      "id": "lit-releasenote",
+      "lang": "en",
+      "kind": "literal",
+      "metrics": ["literal", "nonword", "repetition", "length"],
+      "system": "You are a technical writer. You reproduce identifiers exactly as they were given to you.",
+      "user": "Write a release note of roughly 500 to 700 words for the build described below. Write continuous prose in full sentences, no bullet points and no table.\n\nThe release is CNQ4.5-M, build 0xB7A31F, tag release-2026-09-18a. The container it writes is models/flash-next/CNQ4.5-M-00002-of-00003.cnq and the tensor that changed is ssm_conv1d_alpha. The container holds 248320 rows.\n\nName the build 0xB7A31F at least four times, the tag release-2026-09-18a at least four times, the container path models/flash-next/CNQ4.5-M-00002-of-00003.cnq at least three times, the tensor name ssm_conv1d_alpha at least four times and the row count 248320 at least three times, each time exactly as written above, character for character.",
+      "literals": [
+        {"text": "0xB7A31F", "min": 4},
+        {"text": "release-2026-09-18a", "min": 4},
+        {"text": "models/flash-next/CNQ4.5-M-00002-of-00003.cnq", "min": 3},
+        {"text": "ssm_conv1d_alpha", "min": 4},
+        {"text": "248320", "min": 3}
+      ]
+    },
+    {
+      "id": "json-tensorplan",
+      "lang": "en",
+      "kind": "json",
+      "metrics": ["json", "literal", "repetition", "length"],
+      "system": "You answer with one JSON document and nothing else. No prose, no code fence, no explanation.",
+      "user": "Return one JSON object, and nothing besides it, with exactly these keys:\n\"quant\" (string), \"build\" (string), \"rows\" (integer), \"strict\" (boolean), \"layers\" (an array of exactly 6 objects, each with the keys \"index\" (integer), \"tensor\" (string) and \"bits\" (number)).\n\nUse \"quant\": \"CNQ4.5-M\", \"build\": \"0xB7A31F\", \"rows\": 248320, \"strict\": true. For the six layers use the indices 0, 4, 8, 12, 16 and 20, the tensor names ssm_alpha, ssm_beta, ssm_conv1d, ssm_out, hc_inject and indexer, and the bit widths 32, 32, 16, 6.5, 32 and 16 in that order.",
+      "literals": [
+        {"text": "CNQ4.5-M", "min": 1},
+        {"text": "0xB7A31F", "min": 1},
+        {"text": "248320", "min": 1},
+        {"text": "ssm_conv1d", "min": 1},
+        {"text": "hc_inject", "min": 1}
+      ],
+      "json_shape": {
+        "type": "object",
+        "required": {
+          "quant": "string",
+          "build": "string",
+          "rows": "integer",
+          "strict": "boolean",
+          "layers": {
+            "type": "array",
+            "length": 6,
+            "items": {
+              "type": "object",
+              "required": {"index": "integer", "tensor": "string", "bits": "number"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "json-schritte",
+      "lang": "de",
+      "kind": "json",
+      "metrics": ["json", "repetition", "length"],
+      "system": "Du antwortest mit genau einem JSON-Dokument und sonst nichts. Keine Prosa, kein Codeblock, keine Erklärung.",
+      "user": "Gib genau ein JSON-Objekt zurück, und sonst nichts, mit genau diesen Schlüsseln:\n\"vorhaben\" (Zeichenkette), \"dauer_tage\" (ganze Zahl), \"fertig\" (Wahrheitswert), \"schritte\" (eine Liste aus genau 8 Objekten mit den Schlüsseln \"nummer\" (ganze Zahl), \"titel\" (Zeichenkette), \"stunden\" (Zahl) und \"blockiert_von\" (ganze Zahl oder null)).\n\nDas Vorhaben ist der Umzug eines Archivs in ein neues Magazin. Die acht Schritte sollen die Arbeit in einer sinnvollen Reihenfolge beschreiben, nummeriert von 1 bis 8, und \"blockiert_von\" nennt die Nummer des Schrittes, der vorher fertig sein muss, oder null.",
+      "json_shape": {
+        "type": "object",
+        "required": {
+          "vorhaben": "string",
+          "dauer_tage": "integer",
+          "fertig": "boolean",
+          "schritte": {
+            "type": "array",
+            "length": 8,
+            "items": {
+              "type": "object",
+              "required": {"nummer": "integer", "titel": "string", "stunden": "number", "blockiert_von": "integer_or_null"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "de-agent-umzug",
+      "lang": "de",
+      "kind": "agentic",
+      "metrics": ["nonword", "repetition", "foreign", "length"],
+      "system": "Du bist ein Assistent, der Arbeit plant. Du hast keine Werkzeuge; du schreibst den Plan auf.",
+      "user": "Ein Archiv zieht in ein neues Magazin um. Schreibe einen Plan in nummerierten Schritten, höchstens zehn Schritte, jeder Schritt ein bis zwei vollständige deutsche Sätze. Sage bei jedem Schritt, woran man erkennt, dass er fertig ist. Keine Einleitung und kein Schlusswort, nur die nummerierten Schritte."
+    },
+    {
+      "id": "de-agent-fehlersuche",
+      "lang": "de",
+      "kind": "agentic",
+      "metrics": ["nonword", "repetition", "foreign", "length"],
+      "system": "Du bist ein Assistent, der Arbeit plant. Du hast keine Werkzeuge; du schreibst den Plan auf.",
+      "user": "Ein Dienst auf einem Linux-Rechner beantwortet seit heute Morgen jede zweite Anfrage nicht mehr. Schreibe einen Plan zur Fehlersuche in nummerierten Schritten, höchstens zehn Schritte, jeder Schritt ein bis zwei vollständige deutsche Sätze. Sage bei jedem Schritt, welche Beobachtung ihn bestätigt oder widerlegt. Keine Einleitung und kein Schlusswort, nur die nummerierten Schritte."
+    }
+  ]
+}
