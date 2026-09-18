@@ -6,7 +6,7 @@
 
 ## v0.3.1 (unreleased) — the reasoning filter, and what the 170k session really was
 
-- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Fourteen issues so far: `#67` (the
+- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Fifteen issues so far: `#67` (the
   reasoning filter, `667b68b`), the engine side of `#68` (the long-context measurement, `f14e557`),
   `#49` (the ragged hot-set sidecar, `0adbe6a`), `#60` (the `parity` record header per arm, and
   the last two bins that hard-coded the pre-`#51` container, `784bd64`), `#54` (the gone-client
@@ -21,7 +21,8 @@
   `#62` (the GDN row taken apart per kernel, 2026-09-18 — no engine code) and `#19` (the
   cold-expert staging row taken apart, and the opt-in `CROW_STAGE_PAR` lever it named, 2026-09-18)
   and `#69` (the layer-3 sub-block check that F5 found returning zeros, repaired and added to the
-  package self-test, 2026-09-18).
+  package self-test, 2026-09-18) and `#10` (the router GEMM second probe, and the ten-task quality
+  reference it re-based, 2026-09-18 — no engine code).
   The machine is the second environment block of `docs/system-landscape.md` unless a row names another one.
 - The crate version field stays `0.1.0`, as it has for every release: this file is the record.
 
@@ -659,6 +660,90 @@
   (`#28` A6 decided them) and nothing on the wire moves.
 
 ### Measured
+
+- **The router GEMM second probe: RED greedy on the degeneration clause, GREEN sampled — and the
+  reference the first verdict used does not exist on this platform** (`#10` 10e, 2026-09-18, RTX 5090 / Arch Linux,
+  HEAD `3feec4d`, chain `decode_out/10e/srv-10e.log`, record `docs/architecture.md` 5.4).
+  `CROW_ROUTER_GEMM=1` was stood down on 2026-09-14 (10d, Windows) because the ten-task quality
+  gate read 0 Pass / 7 Partial / 3 Fail against the series record of 2 / 5 / 3 — the improve-loop
+  RED line is a pass count below reference minus one. robin commissioned the second probe.
+  **No engine source change, and no default flipped**; the switch stays opt-in with default off,
+  and the numeric contract of `docs/architecture.md` 8.7 moves whenever it is on.
+
+  **What "a second sample" can be.** Greedy is a pure function of the logits, so a repeat greedy
+  run is the same sample — and both repeats prove it: the control and the switch each reproduce
+  **byte-identically, 10 of 10**, ids and text, degeneration included. The second samples that do
+  exist are the Linux arm itself (this toolchain re-rolls the stream on its own, so the Linux ON
+  arm is an independent realization with its own control in the same chain, which 10d never had)
+  and a sampled draw at the data-sheet non-thinking profile with one seed on both arms.
+
+  **The control is a Linux value of record, and it is not `final4`.** The no-env arm is
+  byte-identical, ids and text, on all ten tasks to `decode_out/final/ten-run0-crow.json`
+  (2026-09-17, `0667e0b`) across nine commits and two tokenizer paths — and it differs from the
+  WINDOWS `final4` record on **nine of ten tasks with no flag set at all** (first differing index
+  5 to 138; only `t6b-reason-multi` reproduces it, over 1024 ids and 2006 characters). Judged with
+  the 10d rubric the Linux default reads **0 Pass / 5 Partial / 5 Fail**. A judging control holds:
+  re-judging the two tasks the record scores Pass, from the tracked `final4` texts, returns Pass on
+  both, so the 0 is the answers and not the judge. The 10d pass clause never discriminated the
+  lever.
+
+  **The lever's own greedy arm reads 1 Pass / 5 Partial / 4 Fail** — strictly better than its
+  control on counts, with the only Pass either greedy arm produced (`t4-prose`, which names the
+  constant-slot-cost assumption and quotes the text's own driver-spill warning) and three upgrades
+  against one downgrade. The gate is RED on the degeneration clause alone: `t5-agent` runs its whole
+  1536-token budget as a repetition loop (106 repeats, 901 backticked items) and never reaches the
+  assumptions list. It is not a new failure mode — all six measured arms write the same sentence
+  with the same false premise, five emit "etc." and finish, this one has no exit token.
+
+  **And the sampled pair is GREEN**: at the data-sheet non-thinking profile with one seed on both
+  arms the control reads 0 / 7 / 3 and the switch **1 / 6 / 3**, no degeneration in either, every
+  clause of the line held. The same default engine reads 0 / 5 / 5 greedy and 0 / 7 / 3 sampled, so
+  the operating point alone moves the counts by two steps; and 6 of 10 task verdicts move across six
+  equally defensible arms of the same engine. C1 is answered in the affirmative — a second sample
+  did land differently, and it landed green.
+
+  **And the house had already measured this instrument's noise.** `#40` / `#44` (section 7.12 rows
+  C1 and C2, robin-decided 2026-09-11 in `#55`) ran the ten tasks over six sampling seeds of the
+  UNCHANGED default, 60 answers, one reader plus a reviewer: smpv1 1/6/3, smpv2 1/6/3, smp3 0/6/4,
+  smp4 1/7/2, smp5 **0/7/3**, smp6 1/5/4 — Pass ranges 0 to 2 and Fail 2 to 4 with nothing changed
+  but the seed. **10d's ON arm read 0 / 7 / 3, to the digit the line the unchanged default produced
+  on seed 5**; this chain's sampled control reads the same line, its sampled ON arm reads 1 / 6 / 3
+  (smpv1 and smpv2) and its greedy ON arm 1 / 5 / 4. Every judged arm of this lever, on both
+  platforms, falls inside the spread a seed change alone already produces.
+
+  **The prefill the 10a plan estimated at 0.8-1.0 s is measured at -1.750 s** (t1-read 16,064 ids,
+  F49 form, W + 3 adjacent pairs: B 16.184 s = 993 tok/s against N 14.434 s = 1113 tok/s,
+  **-10.81 %**, 3 of 3 pairs, within-arm spreads 0.052 / 0.041 s), and **-0.225 s = -10.88 %** on
+  the 2,100-token standing prompt, 3 of 3 pairs, spreads 0.001 / 0.002 s. Ids stable within each
+  arm, hot set identical in both.
+
+  **C3 has a number.** With `CROW_DUMP_H` on the 2,100-token prompt (one chunk; layer 0, the only
+  layer whose router input is still bit-identical between the arms — checked): the real masked
+  max-rel is **1.094e-5** against the synthetic probe's 3.777e-3, i.e. the probe was pessimistic by
+  **345x** (the same probe binary re-run here reproduces the Windows numbers to every digit, so the
+  gap is the activation distribution, not the toolchain). Real top-10 boundary margins are indeed
+  tight — **1171 of 2100 tokens (55.8 %) sit inside the synthetic error band** — but only **10 of
+  2100 (0.48 %)** are within reach of this switch's actual error, and the top-10 sets and their
+  order are **identical on 2100 of 2100**. What propagates is the continuous channel: the softmax
+  weights over the unchanged top-10 still move by up to 3.755e-6.
+
+  **The numeric contract moves, measured**: with the switch OFF all three parity forms are GREEN
+  IDENTICAL at the `docs/architecture.md` 8.7 values (8 rows `bceba6ff7724`, 512 `838723470927`,
+  P8 teacher-forced `3bb3e69edf90`), and with it ON all three differ. Row-wise, a 1.2e-4
+  perturbation of the layer-0 router logits comes out of 48 layers as max `|d|` 27.5 on the 8-row
+  form (argmax differs on 3 of 12 rows) and 8.33 on the 512-row form (**41 of 516 rows, 7.9 %**) —
+  larger than the Windows-to-Linux drift, which reads 7.0 with the ids identical in all 517
+  positions.
+
+  One standing cost belongs on the record: **`MoeW::router_bf` is loaded unconditionally**
+  (`gen.rs:863`), 512 x 2560 x 2 B x 48 layers = **120 MiB of VRAM resident for a switch that is off
+  by default**, on top of the 240 MiB of the f32 router the default path uses.
+
+  **Recommendation (robin decides): keep the switch opt-in, do not remove it and do not make it
+  default.** What this chain establishes is that the ten-task gate, at one greedy sample per task,
+  cannot decide a numeric-drift lever: it turns a continuous 1e-4-class logit perturbation into a
+  coin flip on a handful of near-ties, and the Windows-to-Linux toolchain change moved nine of ten
+  answers and cost the same two Passes with no code change at all.
 
 - **The cold-expert staging row is the PCIe link, not the kernel and not the launches**
   (`#19`, 2026-09-18, RTX 5090 / Arch Linux, HEAD `cb1895a`, `decode run` on t1-read, 16,064 ids,

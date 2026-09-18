@@ -1225,6 +1225,220 @@ Numbers only through the harness; no foreign tok/s transferred onto this machine
 claim has an object (a file, a run, a commit); provenance is recorded like the 972 note
 in section 0.3.
 
+### 5.4 The router GEMM second probe, and what the ten-task gate can and cannot decide (#10 10e, 2026-09-18)
+
+`CROW_ROUTER_GEMM=1` (`engine/src/gen.rs:2614`, the bf16 tensor-core GEMM on the exact bf16 router
+twin at `t >= 8`, launched through `launch_bf16_dense` `gen.rs:1480`) was stood down on 2026-09-14
+(#10 10d, Windows) because the ten-task quality gate read **0 Pass / 7 Partial / 3 Fail** against
+the series record of **2 / 5 / 3** — below the improve-loop line of reference minus one. The 10d
+report left three things open: the verdict rested on ONE greedy sample per task (C1), real routing
+margins were never measured (C3), and the 0.8–1.0 s prefill estimate was never measured at all.
+robin commissioned the second probe on 2026-09-18. It ran on the Linux box, one engine at a time,
+**with no engine source change**; chain `decode_out/10e/srv-10e.log` at HEAD `3feec4d`, binaries
+`decode` `b5a46e10ee84` / `parity` `8172e1159a66`.
+
+**Greedy is deterministic, so a repeat greedy run is the same sample, not a second one** — and both
+repeats confirm it: the control and the switch each reproduce **byte-identically, 10 of 10**, ids
+and text, degeneration included. A second sample therefore had to come from somewhere else, and two
+places were used: this platform re-rolls the ten-task stream on its own, so the Linux ON arm is an
+independent realization of the lever with its own control in the same chain (which 10d never had);
+and a sampled draw at the data-sheet non-thinking profile with one seed on both arms.
+
+#### The reference the 10d verdict was scored against is not reproducible on this platform
+
+The no-env control arm is **byte-identical, ids and text, on all ten tasks** to
+`decode_out/final/ten-run0-crow.json` (2026-09-17, commit `0667e0b`) — across nine commits and two
+tokenizer paths. It is a Linux value of record. It is **not** `final4`: nine of the ten answers
+differ from that Windows record **with no flag set at all** (first differing index 5 to 138; only
+`t6b-reason-multi` reproduces it, over 1024 ids and 2006 characters). The cause is the measured
+Windows-vs-Linux logit drift of section 8.7, which flips near-ties over a 1024-token generation at
+margins of 0.0371 and 0.0758.
+
+Judged against `docs/ten-task-expected.md` with the 10d rubric, the lever now has six arms:
+
+| arm | platform | operating point | switch | Pass / Partial / Fail | degeneration |
+|---|---|---|---|---|---|
+| `final4`, the series record | Windows | greedy | off | **2 / 5 / 3** | none |
+| 10d ON | Windows | greedy | on | 0 / 7 / 3 | none |
+| 10e `a1` = `a2` | Linux | greedy | off | **0 / 5 / 5** | none |
+| 10e `b1` = `b2` | Linux | greedy | **on** | **1 / 5 / 4** | t5-agent repetition loop |
+| 10e `as` | Linux | sampled | off | **0 / 7 / 3** | none |
+| 10e `bs` | Linux | sampled | **on** | **1 / 6 / 3** | none |
+
+**The pass column is 2 in exactly one of the four, and that one is the Windows default** — the arm
+the 10d RED line was measured against. Two arms with no flag set read 0. A judging control was run
+and holds: re-judging the two tasks the record scores Pass, from the tracked `final4` texts,
+returns Pass on both (t1-read says outright that the shown code "does not contain the final copy
+into the backend buffer"; t4-prose names the ceiling and the driver spill), so the 0 is a property
+of the answers and not of the judge. The 10d pass clause therefore never discriminated this lever.
+
+#### What the ON arm did, and where the gate actually fires
+
+All ten answers move against the control, first differing index 0 to 172. On counts the ON arm is strictly
+better than its own control — **1 Pass / 5 Partial / 4 Fail against 0 / 5 / 5** — with three
+upgrades against one downgrade: `t3-debug` retracts the `Get-Content` misreading the control commits
+to and draws the `Snap-In` conclusion with the single-line-versus-line-621 argument, `t3b-debug-syn`
+delivers 5 of the 6 required parts against the control's 3, and `t4-prose` becomes the only Pass
+either greedy arm produced (it names the constant-slot-cost assumption, quotes the text's own
+driver-spill warning and keeps every number traceable, where the control names none of it).
+`t5-agent` moves DOWN into degeneration: it runs its full 1536-token budget as a repetition loop
+(106 repeats, 901 backticked items in one sentence) and never reaches the assumptions list.
+
+**The degeneration is a re-rolled near-tie, not a failure mode the lever introduces.** All six
+arms write the same sentence with the same false premise ("the transcript uses non-standard CMake
+syntax like `CMakeLists.txt`, `add_subdirectory`, `set_property`, `add_compile_options`…"); five
+emit "etc." and finish the answer, and this one has no exit token.
+
+Per task, across the six arms — the same engine, the same prompts, six defensible numeric states:
+
+| task | `final4` Win off | 10d Win ON | 10e Lin greedy off | 10e Lin greedy ON | 10e Lin sampled off | 10e Lin sampled ON | stable? |
+|---|---|---|---|---|---|---|---|
+| t1-read | **Pass** | Fail | Fail | Fail | Fail | Fail | no |
+| t2-write | Partial | Partial | Partial | Partial | Partial | Partial | **yes** |
+| t3-debug | Partial | Partial | **Fail** | Partial | Partial | Partial | no |
+| t4-prose | **Pass** | Partial | Partial | **Pass** | Partial | **Pass** | no |
+| t5-agent | Partial | Partial | Partial | **Fail** | Partial | Partial | no |
+| t6-reason | Fail | Fail | Fail | Fail | Fail | Fail | **yes** |
+| t1b-read-lang | Partial | Partial | Partial | Partial | Partial | Partial | **yes** |
+| t3b-debug-syn | Partial | Partial | **Fail** | Partial | Partial | Partial | no |
+| t2b-write-refactor | **Fail** | Partial | Partial | Partial | Partial | Partial | no |
+| t6b-reason-multi | Fail | Fail | Fail | Fail | Fail | Fail | **yes** |
+| | 2 / 5 / 3 | 0 / 7 / 3 | 0 / 5 / 5 | 1 / 5 / 4 | 0 / 7 / 3 | 1 / 6 / 3 | **4 of 10 stable** |
+
+**Only four of the ten tasks hold their verdict across all six arms.** Of the six that move, the
+odd one out is the plain Windows default three times, the Linux greedy default twice, and the
+switched Linux arm once — and `t4-prose` is Pass in three of the six, including both switched arms.
+
+| clause (`docs/improve-loop.md` R8) | bar (reference = the control of this chain) | greedy ON | sampled ON |
+|---|---|---|---|
+| no new degeneration | Rev3 | one repetition loop — **NO** | none — yes |
+| pass at least reference minus one | >= -1 | 1 — yes | 1 — yes |
+| fail at most reference | greedy <= 5, sampled <= 3 | 4 — yes | 3 — yes |
+
+So the greedy form is RED on one clause only. **And the sampled pair is GREEN.** At the data-sheet
+non-thinking operating point (`CROW_SAMPLE=1 CROW_SEED=20260918`, both arms, same seed) the control
+reads 0 / 7 / 3 and the switch 1 / 6 / 3, with no degeneration in either — every clause holds. The
+same default engine reads 0 / 5 / 5 greedy and 0 / 7 / 3 sampled, so the operating point alone moves
+the counts by two steps, as much as any lever in this series has. In BOTH operating points the
+switch arm carries one more Pass than its own control.
+
+The switch is **not landed** and stays opt-in, default off; no default was flipped in this chain,
+and the landing rule needs byte-identical parity, which this switch cannot give.
+
+#### The house already measured this instrument's noise, and 10d's verdict sits inside it
+
+`#40` / `#44` (the C1 and C2 rows of section 7.12, robin-decided 2026-09-11 in `#55`) ran the ten
+tasks over **six sampling seeds of the unchanged default engine**, 60 answers, one reader, with a
+reviewer re-judging all 60:
+
+| seed series | smpv1 | smpv2 | smp3 | smp4 | smp5 | smp6 |
+|---|---|---|---|---|---|---|
+| Pass / Partial / Fail | 1 / 6 / 3 | 1 / 6 / 3 | 0 / 6 / 4 | 1 / 7 / 2 | **0 / 7 / 3** | 1 / 5 / 4 |
+
+**Pass ranges 0 to 2 and Fail 2 to 4 with nothing changed but the seed** (4 / 37 / 19 of 60,
+degeneration 0 of 60). Against that established band:
+
+- **10d's ON arm read 0 / 7 / 3 — to the digit, the line the unchanged default produced on seed 5.**
+- this chain's sampled control reads 0 / 7 / 3, the same line again;
+- this chain's sampled ON arm reads 1 / 6 / 3, the line `smpv1` and `smpv2` produced;
+- this chain's greedy ON arm reads 1 / 5 / 4, inside the same band.
+
+Every judged arm of this lever, on both platforms, falls inside the spread the default engine
+already produces from a seed change alone. That is the sharpest statement this chain can make about
+what the ten-task gate can and cannot attribute at one sample per task, and it was measurable from
+the project's own records before 10d ran.
+
+#### The prefill the 10a estimate owed
+
+F49 form, W + 3 adjacent pairs, one fresh process per run, `decode run <ids> 32`; B is the no-env
+default, N is `CROW_ROUTER_GEMM=1`.
+
+| prompt | B (default) | N (switch on) | delta | pairs favouring N |
+|---|---|---|---|---|
+| `longctx_ids.json`, 2,100 ids | **2.065 s = 1017 tok/s** (spread 0.001 s) | **1.840 s = 1141 tok/s** (spread 0.002 s) | **-0.225 s = -10.88 %** | 3 of 3 |
+| t1-read, 16,064 ids | **16.184 s = 993 tok/s** (spread 0.052 s) | **14.434 s = 1113 tok/s** (spread 0.041 s) | **-1.750 s = -10.81 %** | 3 of 3 |
+
+Ids are stable inside each arm across all four runs of that arm and differ between the arms (from
+index 0 on the 2,100-token prompt, index 10 on t1-read); the hot set is identical in both arms
+(147 and 142). **The 10a plan estimated 0.8-1.0 s for this lever on t1-read 16k; it measures
+-1.750 s, between 1.75x and 2.19x that band**, and the two prompt sizes agree on the relative
+figure to 0.07 percentage points. The ten-task arms replicate the same effect ten more ways
+(+11.5 to +13.2 % on every prompt above ~3.7k tokens, +1.9 to +3.9 % below 600, against a worst
+within-arm spread of 1.74 %).
+
+#### C3: the routing margin on real tokens
+
+The engine's committed `CROW_DUMP_H` sites write layer 0's router logits and the router INPUT per
+prefill chunk. The 2,100-token prompt of record prefills as ONE chunk (`[policy] chunk 2560`), and
+layer 0 is the only layer where the two arms still share a **bit-identical** router input — checked,
+and it is — so the delta there is the kernel and nothing else.
+
+| quantity | synthetic (10d probe) | **real (10e)** |
+|---|---|---|
+| max_abs over all router logits | 1.059e-4 | **1.211e-4** |
+| masked max-rel (`ref` >= 1e-3 rowmax) | 3.777e-3 | **1.094e-5** |
+| top-10 expert SETS that differ | 0 of 2048 | **0 of 2100** |
+| top-10 ORDER that differs | — | **0 of 2100** |
+
+The same `router_probe` binary re-run on this box reproduces the Windows synthetic numbers to every
+digit, so that 345x gap is the activation distribution, not the toolchain: uniform random logits are
+cancellation-dominated, real router logits are not.
+
+The margin itself, per token, under the `gemv_b` form of record: min 3.05e-5, p1 3.94e-4, p5
+2.97e-3, p25 1.48e-2, median 3.70e-2, max 5.19e-1. And the counts C3 asked for:
+
+| tokens whose top-10 boundary margin is within… | count |
+|---|---|
+| 2x the MEASURED per-token perturbation of this switch | **10 of 2100 (0.48 %)** |
+| the 10d synthetic masked max-rel (3.777e-3) x rowmax | **1171 of 2100 (55.76 %)** |
+
+**C3 was right that real margins are tight — 56 % of real tokens sit inside the band the synthetic
+probe reported — and wrong about the consequence, because the switch's real error is 345x smaller
+than that band.** Only 0.48 % of tokens could flip at all, and none do. What propagates instead is
+continuous: with every top-10 set and order identical, the softmax weights over those ten experts
+still move by up to 3.755e-6 (2.30e-5 relative), and those weights multiply the expert outputs into
+the residual stream.
+
+#### The numeric contract
+
+| form | switch OFF | switch ON |
+|---|---|---|
+| parity 8 rows | GREEN IDENTICAL `bceba6ff7724`, 11,919,360 B | DIFFERS `4b09df9e7720` |
+| parity 512 rows | GREEN IDENTICAL `838723470927`, 512,532,480 B | DIFFERS `205e6e9e3963` |
+| P8 teacher-forced | GREEN IDENTICAL `3bb3e69edf90`, 512,532,480 B | DIFFERS `4e4081b8fb29` |
+
+The default path is proven untouched by this chain (3 of 3 at the section 8.7 values, plus
+`decode run 32` reproducing the 32 ids of record), and the switch is **not** bit-identical —
+measured, not assumed, which is why a landing was unreachable whatever the quality gate said.
+
+How far it moves (`decode parity` teacher-forces every row from the same ids, so this is pure
+numerics): on the 8-row form every row differs, max `|d|` 27.5 against a logit scale of 31.3, and
+the greedy argmax differs on 3 of 12 rows; on the 512-row form every row differs, max `|d|` 8.33,
+argmax differs on **41 of 516 rows (7.9 %)**. So a 1.2e-4 perturbation of the layer-0 router logits
+comes out of 48 layers as a max `|d|` of 8 to 27 and flips about 8 % of greedy argmaxes — that, and
+not a mis-routed expert, is the mechanism behind the ten-task stream shift. For comparison the
+Windows-to-Linux drift reads max `|d|` 7.0 on the same form with the ids identical in all 517
+positions: this lever's perturbation is the larger of the two.
+
+#### What this says about the gate, and what the switch costs while it waits
+
+The ten-task gate, at one greedy sample per task, is a sharp instrument for bit-identity
+regressions and a blunt one for numeric-drift levers: the same lever reads RED greedy and GREEN
+sampled, six of ten task verdicts move across six equally defensible arms of the same engine, and
+the plain Windows-to-Linux toolchain change moved nine of ten answers and cost two Passes with no
+code change at all. Before this switch — or any successor that moves the numerics — can be argued
+into the default set, the gate needs an instrument that survives a re-roll: more than one sample
+per task, scored over the set. That is robin's call.
+
+One cost belongs on the record with it: **`MoeW::router_bf` is loaded unconditionally**
+(`gen.rs:863`, `load_bf16_twin` in `weights.rs:15`), 512 x 2560 x 2 B per layer x 48 layers =
+**120 MiB of VRAM resident for a switch that is off by default**, on top of the 240 MiB the f32
+router the default path uses. The recommendation of this chain is to **keep the switch opt-in** —
+it is the largest unlanded prefill lever measured on this box and the quality evidence does not
+support removing it — but if it is removed, the twin has to go with it to free anything, and the
+middle path is to make the twin lazy so the default gets its 120 MiB back while the lever stays
+measurable.
+
 ---
 
 ## Section 6 — stages and timeboxes (APPROVED by robin 2026-09-02 — boxes are guards, not deadlines)
