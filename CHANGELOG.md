@@ -639,7 +639,10 @@
   overlap with the nudge plus the live marker string), a degeneration verdict in BOTH live forms
   (one unit repeated inside an answer, and an answer of at most two tokens) and both rates out of
   `timings`. Three rows are built in: `greedy`, `card` (0.7 / 0.8 / 20 / 1.5) and `crow`
-  (1.0 / 0.95 / 20 / 1.5, seed 0).
+  (1.0 / 0.95 / 20 / 1.5, seed 0). Since the same day it also has `--dedup-nudges`: consecutive
+  byte-identical USER turns of the stored history are collapsed (574 messages -> 475, 114 user
+  turns -> 15, 105 goal nudges -> 6) while every assistant turn and tool result stays where it
+  was, which is the arm that answers open question 1 (Measured, below).
 - `tools/longctx-gate.py` (`#68`, 2026-09-18): the long-context quality gate the ten-task gate
   never had — one agentic session shape (a synthetic `libghost` crate read file by file through
   `read_file` tool calls, generated from the file index alone so it is byte-stable and cannot
@@ -1180,6 +1183,38 @@
   recommendation on each of them is in the record; no `serve` number entered
   `docs/architecture.md`.
 
+- **The de-duplicated replay: the 105 identical nudges are NOT what flips the model** (`#68`,
+  2026-09-18, RTX 5090, `main` at `b70310a`, greedy, 3 answered turns per point, images stripped;
+  `tools/replay-session.py --dedup-nudges`, record in `docs/long-context-goalmode.md` §8,
+  artefacts `decode_out/68b/`). The flag collapses consecutive byte-identical USER turns of the
+  stored session and leaves every assistant turn and tool result where it was: 574 messages → 475,
+  114 user turns → 15, 105 goal nudges → 6.
+
+  | run | history | ids | user turns (nudges) | echo | single-token | decode tok/s |
+  |---|---|---|---|---|---|---|
+  | F | cut 483, de-duplicated | 158,717 | 14 (6) | 0 of 3 | 0 of 3 | 40.7 / 49.3 / 53.8 |
+  | G | cut 573, de-duplicated (the whole session) | 160,589 | 16 (7) | 0 of 3 | 0 of 3 | 46.7 / 37.2 / 38.1 |
+  | H | cut 413, nudges KEPT — length-matched control | 158,639 | 39 (33, 30 byte-identical) | 0 of 3 | 0 of 3 | 44.0 / 43.9 / 49.6 |
+  | E (cited) | cut 573, nudges kept | 168,928 | 114 (105) | 0 of 3 | **3 of 3** | 44.5 / 42.7 / 43.0 |
+
+  **At matched length the repetition makes no difference**: H (158,639 ids, 30 byte-identical
+  nudges) and F (158,717 ids, the repeats collapsed) are 78 ids apart and both answer three sound,
+  on-task turns with a tool call each. What the 105 nudges really contribute is LENGTH — about 84
+  ids each, 8,339 over the session, 4 % of the 200,000 budget — and removing them moves the full
+  history from 168,928 ids, where it degenerates on 3 of 3 turns (run E), to 160,589, where it
+  degenerates on none. The de-duplicated arm can never be tested at 163k because that is the whole
+  of it. **The flip band with the nudges kept narrows to 158,639 healthy → 163,401 degenerate**
+  (it was 153,755 → 163,401). §4's finding stands: a clean 178,553-id agentic history degenerates
+  on nothing, so it is the CONTENT of robin's tokens — 300 turns of churn and contradictory
+  half-finished tool output — and not the repeated sentence. E is cited rather than re-run because
+  the decode path has not moved: `tools/gate-linux.sh decode_out/gate68b` at `b70310a` is ALL GREEN
+  at the same four byte values of record (parity 8 `bceba6ff7724`, 512 `838723470927`, P8
+  `3bb3e69edf90`, the 32 ids), and the new counter is a log line that touches no id.
+- The `#68` repeat counter's first sighting on real material (2026-09-18): round 2 of run F is
+  byte-identical to round 1 (`Let me look at the actual rendered picture …` plus the same
+  `read_image` call), and the `[chat]` line said `repeat run 2` for it — the shape no single
+  request can see, seen.
+
 ### Known limitations
 
 - The filter owns a **leading** `<think>` block and **every bare** `</think>`; a `<think>` that
@@ -1194,7 +1229,8 @@
   The engine side is measured now (`docs/long-context-goalmode.md`) and what is left is not a
   `serve` bug — the open items below.
 - The onset of the long-context degeneration is bracketed, not curved (`#68`, 2026-09-18): healthy
-  at 153,755 prompt ids, degenerate at 163,401, under greedy on one history. A proper curve (every
+  at **158,639** prompt ids (section 8's length-matched control of the same day narrowed it from
+  153,755), degenerate at 163,401, under greedy on one history. A proper curve (every
   10k from 120k to 180k, three turns per point) is about 40 minutes of GPU and was not run.
 - Nothing separates "this model at 170k" from "this quant at 170k" (`#68`, 2026-09-18): CNQ4.5-M
   has never been compared against a higher-bit container or against llama.cpp above 16k of context.

@@ -257,15 +257,23 @@ themselves rewritten for a 100k context with recorded expectations — a series,
    all — so it is not length alone. The candidates the artefact offers are the 105 byte-identical
    nudges, the contradictory tool output of 300 churning turns, and the 17 images; none of them is
    isolated here. The cheap next measurement is the same replay with the nudges de-duplicated.
+   **Answered for the nudges on 2026-09-18, section 8: they are NOT it.** At the same length a
+   history with 30 byte-identical nudges and one with them collapsed both answer three sound turns;
+   what the 105 repeats really contribute is 8,339 ids of LENGTH, and removing them drops the full
+   session from 168,928 (degenerate, 3 of 3) to 160,589 (healthy). The band with the nudges kept
+   narrows to 158,639 healthy → 163,401 degenerate. The churn and the images are still open.
 2. **Is it the quant?** CNQ4.5-M at 4.5 bpw has never been compared against a higher-bit container
    or against llama.cpp at 100k+ context. The ten-task gate runs at 16k. Nothing here separates
    "this model at 170k" from "this quant at 170k".
 3. **Is the QSA regime at long context numerically clean?** The parity gate proves bytes at 8, 512
    and 1024 rows; there is no parity form at 100k+ and no oracle to compare one against. A quality
    gate is not a numeric gate — §4 measures answers, not logits.
-4. **Does the engine owe the client a brake?** A cross-turn repetition signal (e.g. "this answer
-   is the k-th identical answer of this session" in the `[chat]` line, or a documented
-   `repeat_penalty` knob) is a deliberate feature decision for robin, not a bug fix.
+4. ~~**Does the engine owe the client a brake?**~~ **Decided 2026-09-18 (robin): a signal, not a
+   brake.** `serve` counts identical and single-token answers across the turns of its process and
+   says so on the `[chat]` line and in the `routing` JSON line, with one WARN at three in a row;
+   no sampling change, no refusal, no new knob. Built the same day, `docs/architecture.md`
+   7.11.19. A `repeat_penalty` is still not in this engine and is still not in the card's
+   contract.
 5. **The image path at long context** is unmeasured here: the replay is text-only, and the live
    session carried 17 images (~11k visual tokens) in every late request.
 
@@ -287,6 +295,15 @@ for t in 130000 140000 150000 160000; do
   tools/replay-session.py --target-tokens $t --row greedy --turns 2 --out decode_out/68/onset-$t.json
 done
 
+# the de-duplicated replay of section 8 (#68 open question 1), greedy, 3 answered turns each
+tools/replay-session.py --cut-index 483 --row greedy --turns 3 --dedup-nudges \
+    --out decode_out/68b/dedup-483.json
+tools/replay-session.py --cut-index 573 --row greedy --turns 3 --dedup-nudges \
+    --out decode_out/68b/dedup-573.json
+# and the LENGTH-MATCHED control with the nudges KEPT, at the same id count as the run above
+tools/replay-session.py --cut-index 413 --row greedy --turns 3 \
+    --out decode_out/68b/keep-413.json
+
 # the quality gate at both sizes (exit 0 = >= 4 of 5 Pass and 0 degenerate)
 tools/longctx-gate.py --target-tokens 100000 --out decode_out/68/longctx-100k.json
 tools/longctx-gate.py --target-tokens 170000 --out decode_out/68/longctx-170k.json
@@ -302,3 +319,94 @@ tools/gate-linux.sh decode_out/gate-68
 - The whole series above is about 35 minutes of GPU time. The 2 hours the first plan feared came
   from assuming the live per-turn rate (138 to 266 tok/s on 100-to-300-token prefills) applies to a
   120k prefill; it does not — that rate is the small-batch floor of a warm turn, not the cold rate.
+
+## 8. The de-duplicated replay — what the 105 nudges are worth (2026-09-18)
+
+Open question 1 of section 6, measured the same day on robin's instruction. The question: of the
+three candidates the artefact offers for "what in the history flips it" — the 105 byte-identical
+goal nudges, the churn of 300 turns, the 17 images — is it the NUDGES? The cheap separation is the
+same replay with the repeats taken out, which `tools/replay-session.py --dedup-nudges` now does.
+
+### 8.1 What the flag removes, and what it deliberately leaves
+
+The stored session has **114 user turns of 9 distinct texts**, of which **105 are goal-mode
+nudges**: `[Goal mode. 3 of 5 steps done. Next is step 4: ...]` **102 times byte for byte**, plus
+`2 of 5` twice and `1 of 5` once. The flag drops every user turn whose text is byte-identical to
+the PREVIOUS user turn — consecutive over the USER subsequence, so the assistant turns and tool
+results between two nudges are untouched. The runs it collapses are 2, 3, 27, 60 and 12 turns long.
+
+| | stored | de-duplicated |
+|---|---|---|
+| messages | 574 | 475 |
+| user turns | 114 | **15** |
+| goal-mode nudges | 105 | **6** |
+| assistant turns / tool results / system | 273 / 186 / 1 | 273 / 186 / 1, unchanged |
+
+- The cut is taken on the STORED indices first and the de-duplication is applied to that prefix, so
+  `--cut-index 483` still names the message it names. At every cut inside a run the flag takes the
+  cut point's own nudge with the rest, so ONE copy is appended back and the request still ends on
+  the user turn the model has to answer (16 user turns sent for the full history, 14 at cut 483).
+- The per-round probe is unchanged from runs A to E: after each answered round the replay appends
+  the model's turn, its tool results and ONE nudge. The flag de-duplicates the STORED conversation,
+  not the probe.
+- **A dropped nudge is worth about 84 ids**, measured twice on this artefact: the full history goes
+  168,928 → **160,589** (99 turns dropped, 8,339 ids) and the `483` cut goes 163,401 → **158,717**
+  (56 turns dropped, 4,684 ids). That number is why a length-matched control had to be run: taking
+  the repetition out takes 5 % of the LENGTH out with it.
+
+### 8.2 The runs (greedy, 3 answered turns each, images stripped, `main` at `b70310a`)
+
+| run | history | ids rendered | user turns sent (goal nudges) | echo of the nudge | single-token answer | decode tok/s |
+|---|---|---|---|---|---|---|
+| **F** | cut 483, **de-duplicated** | **158,717** | 14 (6) | 0 of 3 | 0 of 3 | 40.7 / 49.3 / 53.8 |
+| **G** | cut 573, **de-duplicated** — the whole session | **160,589** | 16 (7) | 0 of 3 | 0 of 3 | 46.7 / 37.2 / 38.1 |
+| **H** | cut 413, nudges **KEPT** — the length-matched control | **158,639** | 39 (33, of them 30 byte-identical) | 0 of 3 | 0 of 3 | 44.0 / 43.9 / 49.6 |
+| E (cited, §3.1) | cut 573, nudges kept | 168,928 | 114 (105) | 0 of 3 | **3 of 3** (`3`, 0.54 s per turn) | 44.5 / 42.7 / 43.0 |
+
+The answers, first sentence of each round (full text in `decode_out/68b/*.json`):
+
+| run | round 0 | round 1 | round 2 |
+|---|---|---|---|
+| F | `I'll stop the repetition and actually finish this. …` + `run_command` (116 tok) | `Let me look at the actual rendered picture — read it back as an image:` + `read_image` (63) | the same 63 tokens again — byte-identical, and the new counter says so: `repeat run 2` |
+| G | `This is the full-page capture of the actual README page … the ink reads as *white* rather than Ghost Green.` + `run_command` (225 tok) | `The recolor ran (rc=0) and the file is **1` (15 tok, `finish stop`) | `Let me look at the image to confirm the ink is now Ghost Green:` (15 tok) |
+| H | `The file **is** present (362885 bytes) — the earlier "No such file" was a transient cwd issue …` + `run_command` (155 tok) | `… I have a clean, unambiguous fact: **_out_viz.png = 1280 × 2120** …` + `read_image` (140) | `This is the ground truth and it's decisive: the page is **light ground + dark ink** …` + `run_command` (256) |
+
+- **E is cited, not re-run.** It was measured at `667b68b` plus the `#68` working tree, and the
+  decode path has not moved since: `tools/gate-linux.sh decode_out/gate68b` at `b70310a` — the
+  commit these three runs ran on — is ALL GREEN at the same four byte values of record (parity 8
+  `bceba6ff7724`, 512 `838723470927`, P8 `3bb3e69edf90` and the 32 ids), and the `#67` and `#68`
+  commits are both in this tree. The `#68` counter of `7.11.19` is a log line and touches no id.
+- H is 78 ids away from F. That is the closest length match the stored cut points allow, and it is
+  the whole point of the row: 30 byte-identical nudges against essentially none, at the same length.
+
+### 8.3 The answer to open question 1
+
+**The 105 identical nudges are not what flips the model.** At matched length the history that keeps
+them answers exactly as well as the one that does not: **158,639 ids with 33 nudges (30 of them
+byte-identical) and 158,717 ids with the repeats collapsed both give three sound, on-task turns
+with a tool call each, no echo and no single-token answer.** Repetition is not the trigger.
+
+**What the nudges really contribute is LENGTH.** 99 re-sends of the same 324 characters are 8,339
+ids — 5 % of this session's context and 4 % of the 200,000 budget — and removing them moves the
+full session from 168,928 ids, where it degenerates on 3 of 3 turns (run E), to 160,589, where it
+does not degenerate at all (run G). The de-duplicated history is HEALTHY everywhere it can reach,
+and it can never reach 163k: 160,589 is the whole of it.
+
+**So the flip band narrows, and it stays a length band.** With the nudges kept it is now
+**healthy at 158,639 → degenerate at 163,401** (it was 153,755 → 163,401 before today). Section 4's
+finding stands unchanged and is now sharper: a CLEAN agentic history of 178,553 ids does not
+degenerate at all, robin's history degenerates between 158.6k and 163.4k, and what separates the
+two is the CONTENT of those tokens — 300 turns of churn and contradictory half-finished tool
+output — not the fact that 105 of the user turns were the same sentence.
+
+**What this does not say.** It does not clear the churn or the images; it removes one of the three
+candidates. The de-duplicated arm cannot be tested above 160,589 ids because the session does not
+contain that many tokens once the repeats are gone, so "a de-duplicated history at 163k" is
+unmeasurable on this artefact — it would need a different session. And the reading is three turns
+per point, greedy, one machine, one quant: the same arms as sections 3 and 4, with the same
+limits.
+
+**One thing the client should still take from it.** 8,339 ids of the context window went into
+re-sending a sentence the model already had 99 times. That is not what broke the session, but it
+is 5 % of the budget spent on nothing, and it is what carried this history over the band where it
+does break.

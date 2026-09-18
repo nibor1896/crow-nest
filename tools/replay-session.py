@@ -33,6 +33,32 @@ The three sampling rows (`--row`):
 | `card` | 0.7 | 0.8 | 20 | 1.5 | 0 | the model card's NON-thinking row (= the engine's defaults) |
 | `crow` | 1.0 | 0.95 | 20 | 1.5 | 0 | what Crow sent live (thinking-row temperature, non-thinking penalty) |
 
+De-duplicated nudges (`--dedup-nudges`, #68 open question 1, 2026-09-18):
+
+The stored history has **114 user turns of 9 distinct texts**, and **105 of them are goal-mode
+nudges**: `[Goal mode. 3 of 5 steps done. Next is step 4: ...]` 102 times byte for byte, plus
+`2 of 5` twice and `1 of 5` once. The flag collapses CONSECUTIVE identical user turns - a user
+message whose text is byte-identical to the previous USER message (assistant and tool messages in
+between are kept, so the churn is untouched) is dropped. That keeps the first nudge after any
+different user message and drops the byte-identical repeats that only re-nudge; the runs it
+collapses are 2, 3, 27, 60 and 12 turns long.
+
+- **99 of the 114 user turns go, 15 remain** (6 of them goal nudges), and the stored message list
+  goes 574 -> 475. Nothing else is touched: all 273 assistant turns, all 186 tool results and the
+  system turn stay exactly where they were, so the ONLY variable this flag moves is the repetition.
+- The cut is taken on the STORED indices first and the de-duplication is applied to that prefix, so
+  `--cut-index 483` still names the message it names. When the de-duplication removes the cut
+  point's own nudge (it does, at every cut inside a run), ONE copy of it is appended back, so the
+  request still ends on the user turn the model has to answer.
+- Rendered length (this machine, 2026-09-18, images stripped, greedy, the server's own
+  `prompt_tokens`): the full de-duplicated history is **160,589 ids** against 168,928 with the
+  nudges kept, and the `--cut-index 483` point is **158,717** against 163,401 - about 84 ids per
+  dropped nudge. 16 user turns are sent for the full history and 14 at cut 483 (the re-appended
+  copy included). `docs/long-context-goalmode.md` section 8 has the runs and the answer.
+- The per-round probe is unchanged: after each answered round the replay appends the model's turn,
+  its tool results and ONE nudge, exactly as in runs A to E. The flag de-duplicates the STORED
+  conversation, not the probe.
+
 Images: every `image_url` part of the stored history is dropped by default (`--images strip`),
 so the replay is text-only and one cold prefill does not also pay 17 tower passes. The record
 names the token difference this makes; `--images keep` sends them.
@@ -148,6 +174,34 @@ def build_prefix(messages, target, cut_index, ratio):
     if best is None:
         raise SystemExit("replay-session.py: no user turn under the target")
     return messages[:best + 1], best
+
+
+def user_text(msg):
+    """the text of one message, the way the render sees it (a list content is joined)"""
+    c = msg.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "".join(p.get("text", "") for p in c if p.get("type") == "text")
+    return ""
+
+
+def dedup_user_turns(messages):
+    """#68: drop every user turn that is byte-identical to the PREVIOUS user turn.
+
+    Consecutive is meant over the USER subsequence: the assistant turns and tool results between
+    two nudges are kept, so the session's churn, its half-finished tool output and its length
+    profile are the only things left that could flip the model. Returns (messages, dropped)."""
+    out, prev, dropped = [], None, 0
+    for m in messages:
+        if m.get("role") == "user":
+            t = user_text(m)
+            if t == prev:
+                dropped += 1
+                continue
+            prev = t
+        out.append(m)
+    return out, dropped
 
 
 def last_tool_results(messages):
@@ -284,6 +338,9 @@ def main():
     ap.add_argument("--turns", type=int, default=3)
     ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--images", choices=("strip", "keep"), default="strip")
+    ap.add_argument("--dedup-nudges", action="store_true",
+                    help="collapse consecutive identical user turns of the STORED history "
+                         "(#68: 105 goal nudges -> 6, 114 user turns -> 15)")
     ap.add_argument("--timeout", type=int, default=3600)
     ap.add_argument("--tools-from", default=CROW_CORE)
     ap.add_argument("--out", default=None, help="write the record as JSON here")
@@ -300,7 +357,19 @@ def main():
     prefix, cut = build_prefix(messages, a.target_tokens, a.cut_index, a.ratio)
     nudge = prefix[-1].get("content")
     if not isinstance(nudge, str):
-        nudge = ""
+        nudge = user_text(prefix[-1])
+    dropped = 0
+    if a.dedup_nudges:
+        before = len(prefix)
+        prefix, dropped = dedup_user_turns(prefix)
+        # the cut point's own nudge is the last of a run at every cut inside one, so the
+        # de-duplication takes it with the rest; ONE copy goes back, because the request has
+        # to end on the user turn the model answers
+        if prefix[-1].get("role") != "user":
+            prefix = prefix + [{"role": "user", "content": nudge}]
+        print(f"replay-session.py: --dedup-nudges dropped {dropped} of the {before} messages "
+              f"({sum(1 for m in prefix if m.get('role') == 'user')} user turns left of "
+              f"{sum(1 for m in messages[:cut + 1] if m.get('role') == 'user')})")
     tools, provenance = crow_tools(a.tools_from)
     if tools is None:
         names = sorted({(tc.get("function") or {}).get("name", "")
@@ -311,6 +380,8 @@ def main():
     base = f"http://127.0.0.1:{a.port}"
     row = ROWS[a.row]
     record = {"session": a.session, "images": a.images, "cut_index": cut,
+              "dedup_nudges": bool(a.dedup_nudges), "user_turns_dropped": dropped,
+              "user_turns_sent": sum(1 for m in prefix if m.get("role") == "user"),
               "cut_role": prefix[-1].get("role"), "messages_sent": len(prefix),
               "row": a.row, "sampling": {"temperature": row[0], "top_p": row[1], "top_k": row[2],
                                          "presence_penalty": row[3], "seed": row[4]},
