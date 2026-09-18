@@ -139,7 +139,7 @@
 //! |---|---|
 //! | `messages` | required, non empty array, every entry needs a string `role` |
 //! | `stream` | `true` streams `chat.completion.chunk` frames; `false` or absent answers ONE `chat.completion` document (#39 B3a) |
-//! | `max_tokens` | default 1024, capped at 32768 |
+//! | `max_tokens` | default 8192 (1024 until 2026-09-18), capped at 32768 |
 //! | `model` | echoed into every chunk, default `crow-nest` |
 //! | `chat_template_kwargs.enable_thinking` | template variable, default false |
 //! | `temperature` | absent, `null` or `<= 0` is GREEDY (the A4 path); `> 0` samples (#28 A6) |
@@ -532,7 +532,11 @@ const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// declared `Content-Length`, 16 MiB; over it the answer is 413
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// `max_tokens` when the request carries none
-const DEFAULT_MAX_TOKENS: usize = 1024;
+// 8192 since 2026-09-18: Crow sends no max_tokens on the local path, and at 1024 a
+// write_file that carries a whole SVG ends in `finish length` before the model has
+// written the `path` parameter (robin's session, 13:49 UTC). An agentic client needs
+// room for one file per call; the 32768 cap and the n_ctx clamp are unchanged.
+const DEFAULT_MAX_TOKENS: usize = 8192;
 /// ceiling for `max_tokens`, so one request cannot hold the process forever
 const MAX_MAX_TOKENS: usize = 32768;
 /// #28: `top_p` when a sampled request carries none (data sheet, `generation_config.json`)
