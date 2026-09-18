@@ -23,7 +23,7 @@
 #                              bb9d2ca, 7ddd296.
 #   run 32    the 32 ids       commit bb9d2ca ("the 32 generated ids identical to the 74c79f2
 #                              binary") and 7ddd296 ("decode run 32 ids identical").
-#   tests 165 / clippy 1422    commit 7ddd296 and 0667e0b gave 144 = 84 lib + 60 serve; TASK H
+#   tests 171 / clippy 1422    commit 7ddd296 and 0667e0b gave 144 = 84 lib + 60 serve; TASK H
 #                              (2026-09-17) added the three `cnq::tests::page_runs_*` unit tests of
 #                              the PLE row fetch, so 147 = 87 lib + 60 serve. TASK J (2026-09-17)
 #                              added six tests of the tool-call `arguments` contract - three in
@@ -39,6 +39,12 @@
 #                              [budget] line that names them) and four in `bin/serve.rs` (the
 #                              producer-end repair, the broken-string note, the serde byte window
 #                              and the per-index accumulator) - so 165 = 98 lib + 67 serve.
+#                              #67 (2026-09-18) added six in `bin/serve.rs` for the reasoning
+#                              filter - the passthrough of a stream without a tag, the stray
+#                              closing tag at every split point, the leading think block, the
+#                              tool-call fragments the filter must not touch, what the REAL
+#                              template does with a stored `</think>` and what the normaliser
+#                              makes of it - so 171 = 98 lib + 73 serve.
 #                              Clippy is unchanged at
 #                              1422: it is the --all-targets form counted as grep -cE '^warning: ',
 #                              the form the 1494 -> 1480 -> 1426 -> 1422 series was counted with.
@@ -63,7 +69,7 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="165"
+TESTS="171"
 CLIPPY="1422"
 
 red=0

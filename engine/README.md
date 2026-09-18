@@ -100,6 +100,7 @@ serve [--port <n>] [--slot-save-path <dir>]
 - `serve` reads none of the `CROW_SAMPLE`, `CROW_TEMP`, `CROW_TOP_P`, `CROW_TOP_K`, `CROW_PRESENCE`, `CROW_SEED` variables; the sampler comes from the request.
 - Those variables keep working for `decode` and `parity`.
 - A message shape the chat template cannot render is refused BEFORE the render with a body that names the message index and the field (`check_messages` `src/bin/serve.rs:1564`, `check_content` `:1601`, `check_tool_call` `:1640`); a `function.arguments` that is not a mapping is rewritten instead of refused (`normalize_messages` `src/bin/serve.rs:1481`): a string that parses to an object becomes that object, `null` becomes `{}`, anything else becomes `{"_raw": "<verbatim>"}`. Every rewrite logs one `[chat] normalised` line (TASK J, 2026-09-17).
+- No `<think>` or `</think>` ever leaves as `content` (issue #67, 2026-09-18): a leading `<think>...</think>` block goes out as `reasoning_content` instead and every bare `</think>` is dropped, on the stream and on the document alike (`ThinkFilter`, `send_emits`); a tag split across deltas is held back until it resolves. The same two shapes are stripped off a STORED assistant `content` before the render (`strip_stored_think` in `normalize_messages`), so a client that already stored one cannot poison its next turns. It changes what is streamed, never what is sampled: the generated ids are untouched.
 - A CUDA allocation refused inside a request raises `cuda::AllocFailed`, which `guarded` (`src/bin/serve.rs:2678`) catches: it frees what was taken, resets the engine and answers `503` with a body naming the allocation, its byte count and the free VRAM. It is the only `503` this server answers; any other panic still ends the process (TASK K, 2026-09-17).
 
 ### Subcommand `serve tokenize`
@@ -188,7 +189,7 @@ cd engine
 cargo test --release
 ```
 
-- 165 passed, 0 failed on 2026-09-17 (98 lib + 67 serve), and `cargo clippy --release --all-targets` reports 1,422 warnings, counted as `grep -cE '^warning: '`. Both counts are enforced by `../tools/gate-linux.sh`.
+- 171 passed, 0 failed on 2026-09-18 (98 lib + 73 serve; 165 on 2026-09-17 plus the six of issue #67), and `cargo clippy --release --all-targets` reports 1,422 warnings, counted as `grep -cE '^warning: '`. Both counts are enforced by `../tools/gate-linux.sh`.
 - The ten tokenizer tests need `../models/` and are skipped without it.
 
 ```

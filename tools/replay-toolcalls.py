@@ -35,6 +35,14 @@ the live 400 carried, `arguments` left at `{"path":"/etc/host` - so the second e
 `--refusals` sends four message shapes the template cannot render and prints the 400 bodies;
 each one must name the message index and the field.
 
+`--think` (#67) is the shape robin hit live: a ~3 KB code paste in the first user turn, then
+three ordinary turns, with the whole history re-sent every turn the way Crow does it. Before
+the fix the model answers the paste with a stray `</think>`, the client stores it, the chat
+template renders it VERBATIM inside the assistant turn's own think block, and every later turn
+ends with the tag. This mode asserts that NO streamed `content` of any round carries `</think>`
+or `<think>`, and it prints what each round's `reasoning_content` carried, if anything. It
+sends no `tools`: the tags are a content-path bug, not a tool-call one.
+
 Exit 0 when every round answered 200, 1 when any round was refused, 2 on a usage error.
 """
 import argparse
@@ -91,6 +99,33 @@ WRITE_PROMPTS = [
     'path and a "note" key holding a sentence with a quoted word. Use the write_file tool.',
 ]
 
+# #67: the trigger of record - a large code block pasted into the chat, right before the
+# first stray `</think>` of robin's session. ~3 KB, the shape a `run_command` heredoc comes
+# back as: long, dense, full of braces and quotes, and nothing to do with reasoning.
+_STAGE = """fn stage_%d(rows: &mut [f32], scale: f32, bias: f32) -> f32 {
+    let mut acc = 0.0f32;
+    for (j, r) in rows.iter_mut().enumerate() {
+        let w = if j %% 3 == 0 { scale } else { scale * 0.5 };
+        *r = r.mul_add(w, bias);
+        acc += *r;
+    }
+    acc / (rows.len() as f32).max(1.0)
+}"""
+
+CODE_PASTE = (
+    "Here is the module I am working on. Read it, then answer my questions.\n\n```rust\n"
+    + "\n\n".join(_STAGE % i for i in range(10))
+    + "\n```\n\nWhat does stage_7 do differently from stage_8?"
+)
+
+# #67: the paste, then three ordinary turns - the shape that degraded live
+THINK_PROMPTS = [
+    CODE_PASTE,
+    "Now name the one line that decides the weight w.",
+    "And what happens when rows is empty?",
+    "Summarise all three answers in one sentence.",
+]
+
 PROMPTS = [
     "Read the file /etc/hostname, lines from 1, and tell me what is in it.",
     "Now read /etc/os-release from line 1 and name the distribution.",
@@ -121,6 +156,7 @@ def stream_round(base, messages, max_tokens, tools=None):
     )
     calls = {}
     content = ""
+    reasoning = ""
     finish = None
     with urllib.request.urlopen(req, timeout=1800) as r:
         for line in r:
@@ -135,6 +171,8 @@ def stream_round(base, messages, max_tokens, tools=None):
             delta = choice.get("delta") or {}
             if delta.get("content"):
                 content += delta["content"]
+            if delta.get("reasoning_content"):                         # crow_core.py:5045
+                reasoning += delta["reasoning_content"]
             for call in delta.get("tool_calls") or []:                 # crow_core.py:5060
                 idx = call.get("index", 0)
                 slot = calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
@@ -147,7 +185,7 @@ def stream_round(base, messages, max_tokens, tools=None):
                     slot["arguments"] += fn["arguments"]               # crow_core.py:5069
             if choice.get("finish_reason"):
                 finish = choice["finish_reason"]
-    return finish, content, [calls[i] for i in sorted(calls)]
+    return finish, content, [calls[i] for i in sorted(calls)], reasoning
 
 
 def call_state(call):
@@ -172,7 +210,7 @@ def find_truncating_budget(base, prompt, lo, hi, step):
     Every probe sends the ONE user turn and nothing else, so no probe can poison the replay."""
     for budget in range(lo, hi + 1, step):
         try:
-            finish, _, calls = stream_round(base, [{"role": "user", "content": prompt}], budget)
+            finish, _, calls, _r = stream_round(base, [{"role": "user", "content": prompt}], budget)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:500]
             print(f"probe max_tokens={budget}: HTTP {exc.code} -> {detail}")
@@ -217,6 +255,45 @@ def refusals(base):
     return 1 if bad else 0
 
 
+def think_round(base, max_tokens, rounds):
+    """#67: the ~3 KB code paste, then three turns, history re-sent whole every turn.
+
+    No `tools` and no truncation: this is the CONTENT path. A round is bad when its streamed
+    content carries `<think>` or `</think>` - which is what the client would store and re-send,
+    and what the chat template then renders verbatim inside the assistant turn's own think
+    block. Returns the number of bad rounds (0 is what the fix must produce)."""
+    messages = []
+    bad = 0
+    for rnd in range(rounds):
+        prompt = THINK_PROMPTS[rnd % len(THINK_PROMPTS)]
+        messages.append({"role": "user", "content": prompt})
+        size = len(json.dumps({"messages": messages}).encode())
+        try:
+            finish, content, _calls, reasoning = stream_round(
+                base, messages, max_tokens, tools=[])
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:500]
+            print(f"think round {rnd}: HTTP {exc.code}, body {size} B -> {detail}")
+            return rounds - rnd
+        tags = [t for t in ("</think>", "<think>") if t in content]
+        if tags:
+            bad += 1
+        print(f"think round {rnd}: 200, prompt {len(prompt)} B, body {size} B, "
+              f"finish={finish}, content {len(content)} B, reasoning {len(reasoning)} B, "
+              f"tags in content {tags if tags else 'none'}")
+        print(f"          content tail {content[-90:]!r}")
+        if reasoning:
+            print(f"          reasoning head {reasoning[:90]!r}")
+        # the history exactly as Crow stores it (`crow_core.py:3754-3761`): the turn verbatim,
+        # `reasoning_content` alongside it when the stream carried one
+        turn = {"role": "assistant", "content": content}
+        if reasoning:
+            turn["reasoning_content"] = reasoning
+        messages.append(turn)
+    print(f"replay-toolcalls.py: {rounds} think round(s), {bad} with a reasoning tag in content")
+    return bad
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8099)
@@ -233,6 +310,8 @@ def main():
                     help="TASK K: run the loop with the write_file tool and HTML content")
     ap.add_argument("--dump-dir", default=None,
                     help="write every accumulated arguments string to this directory")
+    ap.add_argument("--think", action="store_true",
+                    help="#67: a ~3 KB code paste then three turns; no </think> in any content")
     ap.add_argument("--refusals", action="store_true",
                     help="also send four unrenderable shapes and print the 400 bodies")
     a = ap.parse_args()
@@ -240,6 +319,13 @@ def main():
         print("replay-toolcalls.py: --rounds must be at least 1", file=sys.stderr)
         return 2
     base = f"http://127.0.0.1:{a.port}"
+
+    if a.think:
+        # #67: its own loop - no tools, no truncating budget, the content path alone. The stray
+        # tag appears at the END of a turn, so a turn has to be allowed to finish: the tool
+        # loop's default of 96 would cut most answers off before the interesting byte.
+        budget = a.max_tokens if a.max_tokens != 96 else 384
+        return 1 if think_round(base, budget, a.rounds) else 0
 
     tools = WRITE_TOOLS if a.write_file else TOOLS
     prompts = WRITE_PROMPTS if a.write_file else PROMPTS
@@ -266,7 +352,7 @@ def main():
         budget = first if rnd == 0 else a.max_tokens
         size = len(json.dumps({"messages": messages}).encode())
         try:
-            finish, content, calls = stream_round(base, messages, budget, tools)
+            finish, content, calls, _r = stream_round(base, messages, budget, tools)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:500]       # crow_core.py:4182
             print(f"round {rnd}: HTTP {exc.code}, body {size} B -> {detail}")

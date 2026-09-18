@@ -267,7 +267,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 | `serve` rate | within 5 % of the adjacent `decode run` since 2026-09-11, three pairs, issue #37 |
 | open, measurement discipline | run-position drift of a `serve` rate, issue #38 |
 | platform, issue #15 | the port, the host-memory fix and the Linux values of record landed 2026-09-17; what is still owed is one reference ten-task run on the pre-refactor build after a reboot (`decode_out/final/GATES.md` section 6) |
-| open, the `</think>` filter | `serve` renders with `enable_thinking false` and has no reasoning parser, so a stray `</think>` is streamed as content and the client re-sends it in the history every turn, issue #67 (2026-09-17) |
+| closed, the `</think>` filter | issue #67, fixed 2026-09-18: `serve` strips a leading `<think>...</think>` block and every bare `</think>` from the streamed content (the block leaves as `reasoning_content`), and the normaliser strips a stored one out of the history before the render; the generated ids are untouched |
 | open, long-context goal mode | a 273-turn goal-mode session at 178,779 of 200,000 tokens degenerates: the tag on 67 turns, then the model echoes the client's goal nudge, then a single repeated token; the engine errored on none of its 318 completions, issue #68 (2026-09-17), artefacts under `decode_out/sessions/2026-09-17-goalmode/` |
 | open, measurement | the job-ring round trip of `docs/measurement-handoff.md` is still a WDDM number and owes its Linux retest (2026-09-17) |
 | open, logging | engine logging stage not started, issue #13 |

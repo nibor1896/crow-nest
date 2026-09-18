@@ -1222,6 +1222,8 @@ Therefore:
 | `chat_template_kwargs.enable_thinking` | template variable, default false | `serve.rs:970` | `crow_core.py:2970` (digest path) |
 | `messages[].role = "tool"` | `content` rendered as `<tool_response>...</tool_response>` | `serve.rs:1481` (`normalize_messages`) | `crow_core.py` tool turns |
 | `messages[].tool_calls[].function.arguments` | a JSON STRING from Crow is parsed into the MAPPING the template needs; **nothing that is not a mapping reaches the template** (7.11.14) | `serve.rs:1481` (`normalize_messages`) | `crow_core.py:5068`, stored `:3756-3761`, re-sent `:3783-3785` |
+| `messages[].content` of an `assistant` turn | a leading `<think>...</think>` block and a TRAILING `</think>` are stripped before the render; every other shape is left byte-identical (7.11.16) | `normalize_messages`, `strip_stored_think` | `crow_core.py:3754-3761`, re-sent `:3783-3785` |
+| `messages[].reasoning_content` | passed through untouched; the template renders a STRING one into the assistant turn's think block, ignores any other type (`chat:112`) | `normalize_messages` | `crow_core.py:3755` (stored when the stream carried one) |
 | every other `messages[]` shape | checked BEFORE the render; a refusal names the message index and the field (7.11.14) | `serve.rs:1564` (`check_messages`) | — |
 | `tool_call_id` | carried, never read; this template pairs by order | `serve.rs:1481` | `crow_core.py` tool turns |
 
@@ -1231,6 +1233,7 @@ Therefore:
 |---|---|---|---|
 | 1 | `delta:{"role":"assistant"}`, `finish_reason` null | `serve.rs:1299` (`chunk_role`) | `crow_core.py:4831-4877` |
 | 2..n | `delta:{"content":"..."}` , one per emitted piece | `serve.rs:1304` (`chunk_content`) | `crow_core.py:4831-4877` (`delta.content`) |
+| 2..n | `delta:{"reasoning_content":"..."}`, only when the reasoning filter took a `<think>` block out of the content (7.11.16); never an empty frame | `chunk_reasoning` | `crow_core.py:5045` (`reasoning_delta`), shown behind `--show-reasoning`, stored at `:3755` |
 | n+1 | `delta:{}` plus `finish_reason`, optionally `usage` and `timings` | `serve.rs:1340` (`chunk_finish`) | `crow_core.py:4831-4877`, `:4999-5018` |
 | n+2 | `data: [DONE]` | `serve.rs:517` (`SSE_DONE`) | `crow_core.py:4035` |
 | framing | `data: <compact json>` plus a blank line, one flush per frame | `serve.rs:1354` (`sse_frame`) | `crow_core.py:4831-4877` |
@@ -1379,7 +1382,7 @@ C:/x/y.md
 | `/v1/models`, `/v1/messages` | not built | those are the REMOTE providers in Crow (`crow_core.py:13593`, `:13649`, `:13669`, `:3600-3610`), not the local server |
 | `/completion` | not built | appears only in Crow's log-parser test fixtures |
 | `/apply-template` | not built | only Crow's probes call it (`tools/probe_reasoning_levels.py:92`, `tools/check_chat_template.py:19`) |
-| `delta.reasoning_content` | never emitted | `enable_thinking` is false on this path; Crow reads the key if present (`crow_core.py:4831-4877`) |
+| `delta.reasoning_content` | **emitted since #67 (2026-09-18)**, and only then: when the model opens a `<think>` block of its own, its text leaves as `reasoning_content` instead of `content` (7.11.16) | `enable_thinking` is false on this path, so the block is rare; Crow reads, shows, stores and re-sends the key (`crow_core.py:5045`, `:3755`) and this template renders it into the assistant turn's think block |
 | stream trickle in serve | ticked once per `decode_step` (#37) | `bin/serve.rs:2332`, the mirror of `bin/decode.rs:224-231`; drained after the last step; one `[serve]` line at start says whether this process ticks, and the `[chat]` line carries `crow_trickle_swaps` per request |
 | the trickle's ranking signal in serve | `CROW_ADAPT_WINDOW=1` by default (#37 fix round 1) | `bin/serve.rs:2930` sets it when unset, the same loop as `CROW_GRAPH` and `CROW_MMA`; an explicit `CROW_ADAPT_WINDOW=0` restores the cumulative ranking |
 | `adapt_tick` in serve | never called | the post-prefill re-cut of `CROW_ADAPT=1` stays a harness path; callers are `bin/decode.rs:230` and `bin/parity.rs:216` |
@@ -1437,7 +1440,7 @@ C:/x/y.md
 | `choices[0].message.role` | `assistant` | `serve.rs:1477` | not read by either caller |
 | `choices[0].message.content` | ALWAYS a string: every content delta of the stream, concatenated; empty when a tool call was the whole answer | `serve.rs:1397` (`CollectSink`), `serve.rs:1477` | `probe-suite.py:679`, `crow_core.py:2984` |
 | `choices[0].message.tool_calls` | present ONLY when the parser closed a call: `[{id, type "function", function{name, arguments}}]`, `arguments` a JSON STRING | `serve.rs:1388` (`CallBuf`), `serve.rs:1477` | neither caller reads it |
-| `choices[0].message.reasoning_content` | NEVER present, as on the stream (`enable_thinking` is false, `tokenizer.rs:18-19`) | `serve.rs:1477` | `probe-suite.py:680` reads it when present |
+| `choices[0].message.reasoning_content` | present ONLY when the reasoning filter stripped a `<think>` block the model opened itself (#67, 7.11.16); absent otherwise, as before | `completion_json` | `probe-suite.py:680` reads it when present |
 | `choices[0].finish_reason` | `stop`, `length` or `tool_calls`, the stream's rules unchanged | `serve.rs:1648` | `probe-suite.py:678` |
 | `usage` | `usage_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1109` (`usage_json`), `serve.rs:1477` | `probe-suite.py:681-683` (`completion_tokens`) |
 | `timings` | `timings_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1122` (`timings_json`), `serve.rs:1477` | neither caller reads it |
@@ -1617,6 +1620,114 @@ CHECKED where it is produced and DIAGNOSABLE where it is consumed:
   of an escaping defect: proper escaping up to a cut, no closing brace and no `_truncated` marker.
   The engine cannot produce it; a client that slices a stored `arguments` string by byte count, or
   that keeps what it accumulated after a stream it abandoned, can.
+
+**7.11.16 The reasoning filter, both ends, and what the template really does (#67, 2026-09-18)**
+
+The bug, as robin hit it live (2026-09-17, Crow 2.2.1 against `serve` at `487128d`, goal mode):
+after Crow pasted a large block of code into the chat, **every following assistant turn ended
+with a literal `</think>` line** in the visible content. Context 118k to 126k of 200,000, 88 tool
+calls in the session. On the 40-minute session of `#68` the tag is on **67 of 273** assistant
+turns.
+
+**What the template actually does with a stored `</think>` — measured, and it is NOT what the
+issue assumed.** The issue expected the HF history rule `content.split('</think>')[-1]`, which
+would make a stored turn that ENDS with the tag render as an EMPTY assistant turn. This model's
+template (`models/Qwen3.8-Flash-Next-original/tokenizer_config.json`, field `chat_template`) has
+no such rule. Its assistant branch is
+
+```jinja
+    {%- elif message.role == "assistant" %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- endif %}
+        {%- set reasoning_content = reasoning_content|trim %}
+        {%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}
+            {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+```
+
+- Prior reasoning comes from the separate `reasoning_content` field, not from `content`.
+- `content` is `render_content(message.content, true)|trim` — **verbatim**, tag and all.
+- `serve` sets no `preserve_thinking`, so the first branch is the one that runs, always.
+
+So the text is never lost. What happens instead is worse to diagnose and exactly as bad to live
+with: the stored turn is rendered INSIDE the template's own think block, and the assistant turn
+the model reads back carries **two** closing tags —
+
+```text
+<|im_start|>assistant
+<think>
+
+</think>
+
+Let me test the screenshot at width 1280:
+</think><|im_end|>
+```
+
+— which is the shape the model then imitates, every turn, for the rest of the session. Pinned by
+`bin/serve.rs::a_history_whose_last_assistant_turn_ends_with_the_tag_keeps_its_text`, which
+renders that history through the REAL template and asserts both: the text survives (the
+`split()` claim is refuted) and the turn carries three `</think>` where a clean one carries two.
+
+**End 1 — the generation path cannot emit the tag** (`bin/serve.rs`, `ThinkFilter`,
+`send_emits`, `chunk_reasoning`). This is what llama.cpp's chat parser does under
+`reasoning_format`, and `serve` had none:
+
+| state | `<think>` | `</think>` | anything else |
+|---|---|---|---|
+| `Lead` — only whitespace emitted so far | opens the block; the whitespace before it is dropped | dropped with the whitespace before it | whitespace is HELD, the first real character flushes it and opens `Body` |
+| `Inside` — the block the model opened | ordinary reasoning text | closes the block, back to `Lead`, so the `\n\n` after it is trimmed | goes out as `delta.reasoning_content` |
+| `Body` — the answer is running | ordinary content (only a LEADING block is owned) | **DROPPED**, the stray of this issue | goes out as `delta.content` |
+
+- **Token boundaries.** The tag is ordinary text (it is not an added token like `<tool_call>`)
+  and arrives across several deltas. A tail that is a PREFIX of a candidate tag is HELD until
+  the next piece resolves it; a prefix that never completes leaves as content at `flush()`, so
+  no byte of an answer is ever lost to the filter. `a_stray_closing_tag_never_reaches_the_content_at_any_split`
+  drives every split point of the live line, and `filtered()` asserts that every piece size
+  gives the same answer.
+- **Where it sits.** Between the tool-call parser and the sink, on `Emit::Content` alone. An
+  `Emit::Args` fragment is never rewritten, so the `arguments` contract of 7.11.14 stays bytes.
+  The malformed-tool-call path carries its raw markup as `Emit::Content`, so that path is
+  filtered too: the tag leaves as content on NO path.
+- **Both request forms.** `SseSink` writes a `reasoning_content` frame, `CollectSink` fills a
+  second string and `completion_json` carries it as `message.reasoning_content` — present only
+  when something was stripped (7.11.13).
+- **OFF the numeric path, by construction.** The filter reads the DECODED text and writes to the
+  sink. Nothing it does feeds back into `decode_step`, the sampler or `out`, so the generated
+  ids, the `[chat] ids` line and every gate value are untouched. That is what `tools/gate-linux.sh`
+  ALL GREEN proves for this commit.
+- One `[chat]` line per request that stripped anything, and the request line carries
+  `content chunks`, `reasoning chunks`, `tool chunks` and `think tags stripped`.
+
+**End 2 — a history that is already poisoned cannot poison the next turn**
+(`normalize_messages`, `strip_stored_think`). Crow stores the turn verbatim and re-sends the
+whole history every turn (`crow_core.py:3754-3761`, `:3783-3785`), and it has no way to drop or
+repair a stored message (`:13485-13487`), so the engine repairs it on the way in:
+
+| stored assistant `content` | what the render sees | why |
+|---|---|---|
+| no tag | unchanged, byte for byte | the A7 oracle renders are untouched, and so is every request that worked before |
+| ends with `</think>` (whitespace after it allowed) | the tag and the whitespace around it go, the text stays | the shape a pre-fix stream left in the client |
+| starts with `<think>...</think>` | the whole block goes, the answer after it stays | the template puts its own think block around this one |
+| a `</think>` in the MIDDLE, or a `<think>` that never closes | unchanged | it can be quoted text, and neither shape nests |
+| `reasoning_content` | never touched, any type | it is the template's own field for prior reasoning, and it is where the stream now puts it |
+
+- Every strip writes one `[chat] normalised` line naming the message index and the first 200
+  bytes, the same diagnostic 7.11.14 built.
+- Pinned by `the_normaliser_strips_only_the_two_shapes_that_nest` (the table above, plus the
+  role and field rules) and by the template test named further up.
+
+**No env switch.** The project keeps flags for perf levers; this is a correctness fix, and a
+switch that lets the tag back onto the wire would only be a way to reproduce the bug. `docs/env.md`
+stays at 82 rows.
+
+**The replay.** `tools/replay-toolcalls.py --think` is the live shape in one command: a ~3 KB code
+paste in the first user turn, then three ordinary turns, the whole history re-sent every turn the
+way Crow does it, and no `tools` at all — the tags are a content-path bug. Every round must answer
+200 with no `<think>` and no `</think>` anywhere in its streamed content.
 
 ### 7.12 The stage A gate table (what was measured, and where the artefact is)
 

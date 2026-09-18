@@ -4,6 +4,98 @@
 - Every item names its issue number in `crow-nest`, or the commit it landed in when the work had no issue.
 - Every number names its date; the machine is `docs/system-landscape.md` unless another one is named.
 
+## v0.3.1 (unreleased) — the reasoning filter
+
+- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). The machine is the second
+  environment block of `docs/system-landscape.md` unless a row names another one.
+- The crate version field stays `0.1.0`, as it has for every release: this file is the record.
+
+### Fixed
+
+- **`serve` streamed the model's `</think>` as content, and the client re-sent it every turn**
+  (`#67`, opened 2026-09-17 against `487128d`, fixed 2026-09-18). `serve` renders the chat
+  template with `enable_thinking false` and had no reasoning parser at all: whatever the model
+  emitted left as `delta.content`, llama.cpp's chat parser strips exactly this. Crow stores the
+  turn verbatim and re-sends the whole history every turn (`crow_core.py:3754-3761`,
+  `:3783-3785`), so one stray tag was re-fed on every later turn and the model imitated it —
+  seen live from about 118k of 200k context on, right after a large code paste, and on **67 of
+  273** assistant turns of the `#68` session.
+
+  **What the template does with a stored `</think>` — measured, and the issue's assumption is
+  REFUTED.** `#67` expected the HF history rule `content.split('</think>')[-1]`, under which a
+  stored turn that ENDS with the tag would render as an EMPTY assistant turn and the session
+  would lose its own answers silently. This model's template has no such rule: prior reasoning
+  comes from the separate `reasoning_content` field, and `content` is rendered **verbatim**
+  (`|trim` only) inside the template's own `<think>\n\n</think>\n\n` header. So no text is ever
+  lost — instead the assistant turn the model reads back carries **two** closing tags, and that
+  nested shape is what it imitates. Pinned by
+  `a_history_whose_last_assistant_turn_ends_with_the_tag_keeps_its_text`, which renders the
+  history through the real template and asserts both halves.
+
+  **End 1, the generation path** (`bin/serve.rs` `ThinkFilter`, `send_emits`, `chunk_reasoning`):
+  a leading `<think>...</think>` block leaves as `delta.reasoning_content` and every bare
+  `</think>` is dropped; neither tag can leave as `content` on any path, the malformed-tool-call
+  path included. The tag is ordinary text, not an added token, so it arrives across several
+  deltas: a tail that is a prefix of a candidate tag is held back until the next piece resolves
+  it, and a prefix that never completes leaves as content at the flush, so no byte of an answer
+  is lost. It sits between the tool-call parser and the sink and touches `Emit::Content` only,
+  so the `arguments` contract of 7.11.14 stays byte-identical. `stream:false` carries the same
+  text as `message.reasoning_content`.
+
+  **End 2, the history** (`normalize_messages`, `strip_stored_think`): a stored assistant
+  `content` that begins with a `<think>...</think>` block, or ends with `</think>`, is stripped
+  before the render, so a client that already stored one cannot poison its next turns; a
+  `</think>` in the middle, a `<think>` that never closes, any non-assistant role and
+  `reasoning_content` itself are left byte-identical. Every strip logs one `[chat] normalised`
+  line.
+
+  **OFF the numeric path, by construction**: the filter reads the decoded text and writes to the
+  sink, nothing it does reaches `decode_step`, the sampler or the id vector. No env switch — the
+  project keeps flags for perf levers and this is a correctness fix, so `docs/env.md` stays at 82
+  rows (`check_env_docs` exit 0, 82 = 82).
+
+### Added
+
+- `delta.reasoning_content` on the stream and `message.reasoning_content` on the non-streaming
+  document (`#67`, 2026-09-18), present only when the filter stripped a block the model opened
+  itself. Both were listed as "never emitted" until now; Crow reads the key
+  (`crow_core.py:5045`), shows it behind `--show-reasoning`, stores it (`:3755`) and re-sends it,
+  and this template renders a stored one into the assistant turn's think block — so the round
+  trip is the template's own form and not a second copy of the answer.
+- `tools/replay-toolcalls.py --think` (`#67`, 2026-09-18): the live shape in one command — a
+  ~3 KB code paste in the first user turn, then three ordinary turns, the whole history re-sent
+  every turn the way Crow does it, no `tools` at all. Every round must answer 200 with no
+  `<think>` and no `</think>` anywhere in its streamed content; the reader also accumulates
+  `reasoning_content` and stores it on the turn, as Crow does.
+- Six tests in `bin/serve.rs` (`cargo test --release` 165 → **171**, 98 lib + 73 serve): the
+  byte-identical passthrough of a stream without a tag, the stray closing tag at EVERY split
+  point of the live line, the leading think block, the tool-call fragments the filter must not
+  touch, what the real template does with a stored `</think>`, and the normaliser's table.
+  `tools/gate-linux.sh` carries the new count with its provenance.
+
+### Measured
+
+- `tools/gate-linux.sh` ALL GREEN at this commit — 8 rows `bceba6ff7724…`, 512 rows
+  `8387234709271515…`, P8 teacher-forced `3bb3e69edf90…` and the 32 ids of record all unchanged,
+  which is what "the filter is off the numeric path" means in bytes. `cargo test --release` 171
+  passed, 0 failed; clippy unchanged at **1,422**; `check_env_docs` exit 0 (82 = 82);
+  `check_readme_dates` 0 offenders. Measured 2026-09-18.
+- `tools/replay-toolcalls.py --think` against this build: 4 rounds, all 200, **0** rounds with a
+  reasoning tag in the streamed content. Measured 2026-09-18.
+
+### Known limitations
+
+- The filter owns a **leading** `<think>` block and **every bare** `</think>`; a `<think>` that
+  the model opens in the MIDDLE of an answer is left in the content as ordinary text, because at
+  that point the answer has started and the tag can be text the user asked about. If a live
+  session ever shows that shape it is a one-line change to the state table
+  (`docs/architecture.md` 7.11.16), not a redesign.
+- A `<think>` block the model opens and never closes ends the turn as `reasoning_content` with an
+  empty `content`. On a stream that decision cannot be taken back — the reasoning deltas are
+  already on the wire — and with `enable_thinking false` the block should not be opened at all.
+- `#68` (the 300-turn degeneration at 178k context) is untouched by this and stays open: the tag
+  was its first stage, not its only one.
+
 ## 2026-09-17 — v0.3.0: Linux, the host-memory fix, the refactor, and the two prefill floors
 
 - Branch `main` at `487128d`; fourteen commits `9f12429` to `487128d`, all on one day. The day in order: the Linux port (`9f12429`), the host-memory fix (`0c9feb5`), three refactor cuts (`74c79f2`, `bb9d2ca`, `7ddd296`), the CUDA Rust evaluation (`0667e0b`), the Linux gate script and the code map (`0cf1de5`, `c1a68cd`), the page-cache finding and two hardenings (`f8f75c0`), the PLE prefill floor (`1032bc5`), the per-turn prefill floor (`4004e66`), and three bugs out of robin's live sessions: the tool-call session poison (`e2b9845`), the image-request panic and its VRAM reserve (`8ff2055`), the removed splice buffer (`487128d`).
@@ -153,7 +245,7 @@ The Linux values of record at `487128d`, the contract for every later commit: pa
 - **No run of the CI workflow is recorded in this repository**: the four jobs moved to ubuntu-latest with the port, and the counts quoted in `README.md` are still the local Windows proof of 2026-09-11.
 - The hardware probes of 2026-09-01/02 were never re-run on Linux, and `docs/measurement-handoff.md` still owes its Linux retest of the job-ring round trip; its numbers are WDDM numbers.
 - **The btrfs compression finding was real about the filesystem and empty about the number.** The container sat on `compress=zstd:3` with 27,665 of 31,146 extents compressed, and `chattr +m` plus `btrfs filesystem defragment` is a NO-OP on an already compressed file (27,659 extents still encoded); only a full rewrite cleared it (0 encoded extents, 2,817 extents, sha256 unchanged). On the 1024-token cold form with the `f8f75c0` binary that rewrite changed nothing — 95.7 / 93.4 tok/s compressed against 92 tok/s uncompressed — because the mapping fault dominated both. Keeping the container off a compressed mount is a rule for the FIXED engine, where the device read is on the critical path, and it is not backed by a before/after of that engine on a compressed container.
-- **`serve` has no reasoning filter, and one stray `</think>` poisons the client's history** (`#67`, opened 2026-09-17 against `487128d`). `serve` renders the chat template with `enable_thinking false` and streams whatever the model emits as `content`; llama.cpp's chat parser strips `<think>…</think>` and a bare `</think>` before the client sees it, ours does not. Crow stores the turn verbatim and re-sends the whole history, so one tag is re-fed every turn; and the model's own template cuts prior assistant turns at `content.split('</think>')[-1]`, so a stored turn that ENDS with the tag renders as an EMPTY assistant turn on the next request. Seen from about 118k of 200k context on, after a large code paste. Not started.
+- **`serve` has no reasoning filter, and one stray `</think>` poisons the client's history** (`#67`, opened 2026-09-17 against `487128d`). `serve` renders the chat template with `enable_thinking false` and streams whatever the model emits as `content`; llama.cpp's chat parser strips `<think>…</think>` and a bare `</think>` before the client sees it, ours does not. Crow stores the turn verbatim and re-sends the whole history, so one tag is re-fed every turn; and the model's own template cuts prior assistant turns at `content.split('</think>')[-1]`, so a stored turn that ENDS with the tag renders as an EMPTY assistant turn on the next request. Seen from about 118k of 200k context on, after a large code paste. **FIXED 2026-09-18, and the template claim in this item is REFUTED**: this model's template renders a stored `content` verbatim inside its own think block instead of splitting on the tag, so the turn is not emptied - it carries two closing tags, which is what the model imitates. See the v0.3.1 section above.
 - **A long goal-mode session at 170k+ context degenerates** (`#68`, opened 2026-09-17 against `487128d`). One 40-minute goal: 574 messages, 273 assistant turns, 186 tool calls, the last prompt 178,779 of 200,000 tokens. Three stages: the `</think>` tag on 67 of the 273 turns (`#67`), then the model echoing the client's goal nudge verbatim (105 of the 114 user turns ARE that nudge; 9 assistant turns repeat its text at 65 to 76 tokens each), then a single repeated digit token. The engine errored on none of it — 318 completions, all 200 after the `487128d` fix, 17 images in the last request with 16 cache hits — and at 178k context the `[chat]` lines read prefill of 114 to 333 new tokens at 138 to 266 tok/s, reset 12 to 14 ms, decode 24.0 to 28.5 tok/s. What is the engine's, what is Crow's and what is the model's is to be measured, not assumed; the artefacts are secured under `decode_out/sessions/2026-09-17-goalmode/` (`serve.log`, 7,976 lines; `crow-session/session.json`, 574 messages; `crow-log/`; `booted.json`). Not started.
 - Everything open before this release stays open: prefill against its target (`#10`), the run-position drift of a `serve` rate (`#38`), engine logging (`#13`), Ampere and Ada (`#12`), and the ten-task quality gate itself (`#11`, `#44`).
 

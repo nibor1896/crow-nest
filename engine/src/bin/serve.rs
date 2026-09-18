@@ -1305,6 +1305,16 @@ fn chunk_content(c: &ChunkCtx, text: &str) -> serde_json::Value {
     chunk(c, serde_json::json!({ "content": text }), None)
 }
 
+/// - #67: one `delta.reasoning_content` piece, the text of a `<think>` block the model
+///   opened itself. Crow reads this key (`crow_core.py:5045`), shows it behind
+///   `--show-reasoning` and stores it as `message.reasoning_content` (`:3755`) - which is
+///   the field THIS template renders inside the assistant turn's think block, so the round
+///   trip is the template's own form and not a second copy of the answer.
+/// - Absent from every stream that stripped nothing: no empty frame is ever sent.
+fn chunk_reasoning(c: &ChunkCtx, text: &str) -> serde_json::Value {
+    chunk(c, serde_json::json!({ "reasoning_content": text }), None)
+}
+
 /// - #29 A7: the FIRST fragment of one tool call, the only one carrying `id` and `name`
 /// - `arguments` is the empty string here, as llama-server and OpenAI send it
 /// - Crow keeps `id` and `name` because it tests them for truth (`crow_core.py:4869-4874`)
@@ -1383,6 +1393,213 @@ fn next_delta(full: &str, emitted: usize) -> Option<&str> {
         return None;
     }
     Some(&full[emitted..])
+}
+
+/// #67: `<think>`, the tag the model opens a reasoning block with. Ordinary TEXT, not an
+/// added token, so it arrives split across decode steps like any other markup.
+const THINK_OPEN: &str = "<think>";
+/// #67: `</think>`. The prompt already carries a CLOSED empty block (`enable_thinking` is
+/// false, `tokenizer.rs:18-19`), so every one of these in the generation is a stray.
+const THINK_CLOSE: &str = "</think>";
+
+/// #67: what one fed piece splits into - `delta.content` and `delta.reasoning_content`
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Split {
+    content: String,
+    reasoning: String,
+}
+
+/// #67: where the filter stands in the text of ONE generation
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Think {
+    /// nothing but whitespace has been emitted as content yet: a `<think>` HERE opens a block
+    #[default]
+    Lead,
+    /// inside a block the model opened itself: the text is `reasoning_content`, never content
+    Inside,
+    /// content is flowing: `<think>` is ordinary text, `</think>` is a stray and is dropped
+    Body,
+}
+
+/// - #67: the reasoning filter of the generation path, the one llama.cpp's chat parser is
+///   (`reasoning_format`): a leading `<think>...</think>` block becomes `reasoning_content`
+///   and a bare `</think>` is DROPPED, so neither tag ever leaves as `content`.
+/// - Why it has to exist: the model emits a stray `</think>` after a long paste, Crow stores
+///   the turn verbatim and re-sends the whole history every turn (`crow_core.py:3756-3761`,
+///   `:3783-3785`), and THIS template renders a stored `content` verbatim inside the assistant
+///   turn's own think block (7.11.16) - so one stray tag teaches the model to emit one, every
+///   turn, for the rest of the session.
+/// - It is OFF the numeric path: it changes what is STREAMED, never what is sampled. The
+///   generated ids, the `[chat] ids` line and every gate value are untouched by construction -
+///   nothing here feeds back into `decode_step`.
+///
+/// | state | `<think>` | `</think>` | anything else |
+/// |---|---|---|---|
+/// | `Lead` (only whitespace emitted so far) | opens the block, the whitespace before it is dropped | dropped, the whitespace before it is dropped | whitespace is HELD, the first real character flushes it and opens `Body` |
+/// | `Inside` | ordinary reasoning text | closes the block, back to `Lead` so the `\n\n` after it is trimmed | `reasoning_content` |
+/// | `Body` | ordinary content (a leading block is the only one this filter owns) | DROPPED, the stray of #67 | `content` |
+///
+/// - Token boundaries: a tag arrives across several deltas, so a tail that is a PREFIX of a
+///   candidate tag is held back until the next piece resolves it (`held`). A prefix that never
+///   completes leaves as content at `flush()`, so no byte is ever lost.
+/// - `<` that opens no candidate is emitted immediately; only a real prefix is held.
+/// - pure: no engine, no socket, so the tests drive it at every split point directly.
+#[derive(Debug, Clone, Default)]
+struct ThinkFilter {
+    /// the state above; `Lead` at the first byte of every generation
+    state: Think,
+    /// a tail that is a proper prefix of a candidate tag, waiting for the next piece
+    held: String,
+    /// whitespace seen in `Lead`, flushed by the first real character
+    lead: String,
+    /// that whitespace follows a tag this filter dropped, so it is dropped with it
+    drop_lead: bool,
+    /// how many tags were stripped, for the one `[chat]` line
+    stripped: usize,
+}
+
+impl ThinkFilter {
+    fn new() -> Self {
+        ThinkFilter::default()
+    }
+
+    /// how many `<think>` / `</think>` tags this filter kept off the wire
+    fn stripped(&self) -> usize {
+        self.stripped
+    }
+
+    /// the tags that mean something in the CURRENT state; both start with `<`
+    fn candidates(&self) -> &'static [&'static str] {
+        match self.state {
+            Think::Lead => &[THINK_OPEN, THINK_CLOSE],
+            Think::Inside | Think::Body => &[THINK_CLOSE],
+        }
+    }
+
+    /// one decoded piece in, its content and reasoning halves out
+    fn push(&mut self, piece: &str) -> Split {
+        let mut out = Split::default();
+        let mut buf = std::mem::take(&mut self.held);
+        buf.push_str(piece);
+        let mut i = 0usize;
+        while i < buf.len() {
+            if buf.as_bytes()[i] == b'<' {
+                let rest = &buf[i..];
+                let mut hit: Option<&'static str> = None;
+                let mut partial = false;
+                for tag in self.candidates() {
+                    if rest.len() >= tag.len() {
+                        if rest.starts_with(tag) {
+                            hit = Some(tag);
+                            break;
+                        }
+                    } else if tag.starts_with(rest) {
+                        partial = true;
+                    }
+                }
+                if let Some(tag) = hit {
+                    self.take_tag(tag);
+                    i += tag.len();
+                    continue;
+                }
+                if partial {
+                    // the piece ends inside a candidate tag: hold it, the next one decides
+                    self.held.push_str(rest);
+                    return out;
+                }
+            }
+            let ch = match buf[i..].chars().next() {
+                Some(c) => c,
+                None => break,
+            };
+            let n = ch.len_utf8();
+            self.take_char(ch, &buf[i..i + n], &mut out);
+            i += n;
+        }
+        out
+    }
+
+    /// end of generation: a held prefix never completed, so it is text after all
+    fn flush(&mut self) -> Split {
+        let mut out = Split::default();
+        let held = std::mem::take(&mut self.held);
+        for ch in held.chars() {
+            let mut b = [0u8; 4];
+            let s = ch.encode_utf8(&mut b).to_string();
+            self.take_char(ch, &s, &mut out);
+        }
+        if !self.lead.is_empty() && !self.drop_lead {
+            out.content.push_str(&self.lead);
+        }
+        self.lead.clear();
+        out
+    }
+
+    /// a complete tag: it never reaches the wire, it only moves the state
+    fn take_tag(&mut self, tag: &str) {
+        self.stripped += 1;
+        self.lead.clear();
+        if tag == THINK_OPEN {
+            // reachable in `Lead` only: the block the model opened itself
+            self.state = Think::Inside;
+        } else {
+            // `</think>`: the close of that block, or the stray this filter exists for.
+            // `Body` stays `Body` - the answer has started, whitespace is content.
+            if self.state != Think::Body {
+                self.state = Think::Lead;
+            }
+            self.drop_lead = true;
+        }
+    }
+
+    /// one ordinary character, into the half the state names
+    fn take_char(&mut self, ch: char, s: &str, out: &mut Split) {
+        match self.state {
+            Think::Inside => out.reasoning.push_str(s),
+            Think::Lead => {
+                if ch.is_whitespace() {
+                    self.lead.push_str(s);
+                } else {
+                    if !self.drop_lead {
+                        out.content.push_str(&self.lead);
+                    }
+                    self.lead.clear();
+                    self.drop_lead = false;
+                    out.content.push_str(s);
+                    self.state = Think::Body;
+                }
+            }
+            Think::Body => out.content.push_str(s),
+        }
+    }
+}
+
+/// - #67: the SAME two tags, stripped off a STORED assistant `content` on the way IN
+/// - `Some(clean)` when something was stripped, `None` when the string is left alone: a
+///   history without a tag must render byte-identical to what it rendered before this fix
+/// - a leading `<think>...</think>` block (and the whitespace around it) goes, because the
+///   template puts the stored content INSIDE its own think block and a nested pair is what
+///   the model imitates; a TRAILING `</think>` goes, because that is the shape Crow stored
+/// - what is NOT touched: a `</think>` in the middle of a turn (it can be quoted text), a
+///   `<think>` that never closes, and `reasoning_content` - the template's own field for this
+fn strip_stored_think(content: &str) -> Option<String> {
+    let mut s = content;
+    let mut changed = false;
+    if let Some(rest) = s.trim_start().strip_prefix(THINK_OPEN) {
+        if let Some(i) = rest.find(THINK_CLOSE) {
+            s = rest[i + THINK_CLOSE.len()..].trim_start();
+            changed = true;
+        }
+    }
+    while let Some(head) = s.trim_end().strip_suffix(THINK_CLOSE) {
+        s = head.trim_end();
+        changed = true;
+    }
+    if changed {
+        Some(s.to_string())
+    } else {
+        None
+    }
 }
 
 /// TASK J: the key a non-mapping `arguments` is carried into the render under
@@ -1478,6 +1695,24 @@ fn head200(v: &serde_json::Value) -> String {
 ///   200 bytes of the offending value; `chat_route` puts each on one stderr line.
 /// - `function` may be absent: the template then reads `name` / `arguments` off the call itself
 ///   (`tool_call.function is defined`), and so does this.
+///
+/// - #67 (2026-09-18): the SECOND end of the reasoning filter, the same idea one field over.
+///   A stored assistant `content` that carries `<think>` / `</think>` is stripped by
+///   `strip_stored_think` BEFORE the render. Measured against this template, not assumed:
+///   the assistant branch renders `'<think>\n' + reasoning_content|trim + '\n</think>\n\n' +
+///   content` (`chat_template.jinja`, the `preserve_thinking` branch), so a stored `</think>`
+///   does NOT cut the turn - it is rendered VERBATIM inside the template's own think block,
+///   and the turn the model reads back carries two closing tags. That nested pair is what it
+///   imitates. The client cannot repair its own history (`crow_core.py:13485-13487`), so the
+///   engine repairs it on the way in.
+///
+/// | stored assistant `content` | what the render sees | why |
+/// |---|---|---|
+/// | no tag | unchanged, byte for byte | the A7 oracle renders are untouched |
+/// | ends with `</think>` (whitespace allowed after it) | the tag and the whitespace around it go, the text stays | the shape Crow stored from a pre-fix stream |
+/// | starts with `<think>...</think>` | the whole block goes, the answer after it stays | the template puts its own think block around this; a nested pair is what the model imitates |
+/// | a `</think>` in the MIDDLE, or a `<think>` that never closes | unchanged | it can be quoted text, and neither shape nests |
+/// | `reasoning_content` | never touched | it is the template's own field for prior reasoning, and this is where the stream now puts it |
 fn normalize_messages(messages: &serde_json::Value) -> (serde_json::Value, Vec<String>) {
     let mut doc = messages.clone();
     let mut notes = Vec::new();
@@ -1486,6 +1721,22 @@ fn normalize_messages(messages: &serde_json::Value) -> (serde_json::Value, Vec<S
         None => return (doc, notes),
     };
     for (mi, m) in arr.iter_mut().enumerate() {
+        // #67: the stored assistant turn, before anything else looks at it
+        if m.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            if let Some(c) = m.get_mut("content") {
+                let stripped = c.as_str().and_then(strip_stored_think);
+                if let Some(clean) = stripped {
+                    notes.push(format!(
+                        "message {mi} assistant content carried a <think>/</think> tag this \
+                         template renders verbatim inside its own think block (#67); stripped \
+                         to {} B: {}",
+                        clean.len(),
+                        head200(c)
+                    ));
+                    *c = serde_json::Value::String(clean);
+                }
+            }
+        }
         let calls = match m.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
             Some(c) => c,
             None => continue,
@@ -1734,6 +1985,8 @@ trait ChatSink {
     fn open(&mut self, c: &ChunkCtx) -> bool;
     /// one parser fragment, in arrival order
     fn on_emit(&mut self, c: &ChunkCtx, e: &Emit) -> bool;
+    /// #67: one `reasoning_content` piece the think filter took out of the content
+    fn on_reasoning(&mut self, c: &ChunkCtx, text: &str) -> bool;
     /// after the last token: the final chunk plus `[DONE]`, nothing for a document
     fn on_finish(&mut self, c: &ChunkCtx, a: &FinishArgs) -> bool;
 }
@@ -1761,6 +2014,9 @@ impl<W: Write> ChatSink for SseSink<W> {
         };
         sse_send(&mut self.w, &sse_frame(&doc))
     }
+    fn on_reasoning(&mut self, c: &ChunkCtx, text: &str) -> bool {
+        sse_send(&mut self.w, &sse_frame(&chunk_reasoning(c, text)))
+    }
     fn on_finish(&mut self, c: &ChunkCtx, a: &FinishArgs) -> bool {
         sse_send(&mut self.w, &sse_frame(&chunk_finish(c, a))) && sse_send(&mut self.w, SSE_DONE)
     }
@@ -1781,6 +2037,8 @@ struct CallBuf {
 struct CollectSink {
     /// every `Emit::Content` in order, the `message.content` of the document
     content: String,
+    /// #67: every reasoning piece in order, the `message.reasoning_content` of the document
+    reasoning: String,
     /// one entry per tool call index, in the order the parser opened them
     calls: Vec<CallBuf>,
 }
@@ -1809,6 +2067,10 @@ impl ChatSink for CollectSink {
         }
         true
     }
+    fn on_reasoning(&mut self, _c: &ChunkCtx, text: &str) -> bool {
+        self.reasoning.push_str(text);
+        true
+    }
     fn on_finish(&mut self, _c: &ChunkCtx, _a: &FinishArgs) -> bool {
         true
     }
@@ -1831,23 +2093,63 @@ fn accumulate_args(pieces: &[Emit], acc: &mut Vec<String>) {
     }
 }
 
+/// - #67: the reasoning filter runs HERE, between the tool-call parser and the sink, on
+///   `Emit::Content` alone. Arguments fragments are never touched: a `</think>` inside a
+///   tool parameter value is that value's business, and the `arguments` contract of 7.11.14
+///   must stay byte-identical.
+/// - The malformed-tool-call path carries its raw markup as `Emit::Content`, so it is
+///   filtered like any other content - the tag never leaves as content on any path.
+/// - A piece that is entirely held back or entirely stripped sends NO frame, and is counted
+///   in neither column: the counters name frames written, which is what they always named.
 fn send_emits(
     sink: &mut dyn ChatSink,
     c: &ChunkCtx,
     pieces: &[Emit],
-    content_chunks: &mut usize,
-    tool_chunks: &mut usize,
+    think: &mut ThinkFilter,
+    counts: &mut Chunks,
 ) -> bool {
     for e in pieces {
         match e {
-            Emit::Content(_) => *content_chunks += 1,
-            Emit::Call { .. } | Emit::Args { .. } => *tool_chunks += 1,
+            Emit::Content(t) => {
+                let split = think.push(t);
+                if !send_split(sink, c, &split, counts) {
+                    return false;
+                }
+            }
+            Emit::Call { .. } | Emit::Args { .. } => {
+                counts.tool += 1;
+                if !sink.on_emit(c, e) {
+                    return false;
+                }
+            }
         }
-        if !sink.on_emit(c, e) {
+    }
+    true
+}
+
+/// #67: the two halves of one filtered piece, in wire order: reasoning first, then content
+fn send_split(sink: &mut dyn ChatSink, c: &ChunkCtx, split: &Split, counts: &mut Chunks) -> bool {
+    if !split.reasoning.is_empty() {
+        counts.reasoning += 1;
+        if !sink.on_reasoning(c, &split.reasoning) {
+            return false;
+        }
+    }
+    if !split.content.is_empty() {
+        counts.content += 1;
+        if !sink.on_emit(c, &Emit::Content(split.content.clone())) {
             return false;
         }
     }
     true
+}
+
+/// the frames one generation wrote, per kind; the `[chat]` line prints all three
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Chunks {
+    content: usize,
+    reasoning: usize,
+    tool: usize,
 }
 
 /// - #39 B3a: the ONE `chat.completion` document a `stream:false` request answers
@@ -1858,17 +2160,25 @@ fn send_emits(
 /// - `content` is always a string, empty when the answer was a tool call alone
 /// - `tool_calls` appears only when the parser closed at least one call, in the OpenAI
 ///   non streaming shape (`id`, `type`, `function`), `arguments` a JSON STRING
-/// - `reasoning_content` is NOT sent: the template renders `enable_thinking false`, so the
-///   think block is empty (`tokenizer.rs:18-19`)
+/// - #67: `reasoning_content` is present ONLY when the think filter stripped a block the
+///   model opened itself. The template renders `enable_thinking false`, so that is rare and
+///   the ordinary document is the document it always was, field for field
+///   (`probe-suite.py:680` reads the key when it is there)
 /// - pure: the whole document contract is one function the test drives directly
 fn completion_json(
     c: &ChunkCtx,
     content: &str,
+    reasoning: &str,
     calls: &[CallBuf],
     finish: &str,
     t: &Timing,
 ) -> serde_json::Value {
     let mut message = serde_json::json!({ "role": "assistant", "content": content });
+    if !reasoning.is_empty() {
+        if let Some(obj) = message.as_object_mut() {
+            obj.insert("reasoning_content".to_string(), serde_json::json!(reasoning));
+        }
+    }
     if !calls.is_empty() {
         let arr: Vec<serde_json::Value> = calls
             .iter()
@@ -2106,6 +2416,7 @@ fn chat_document(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u3
     let doc = completion_json(
         &ChunkCtx::new(&out.id, out.created, &req.model),
         &sink.content,
+        &sink.reasoning,
         &sink.calls,
         out.finish,
         &out.timing,
@@ -2268,7 +2579,11 @@ fn chat_generate(
     // arms it with; without that id the literal text `<tool_call>` stays content.
     let mut ts = ToolStream::new(req.tools.as_ref());
     let tool_open = tk.token_id(TOOL_OPEN);
-    let mut tool_chunks = 0usize;
+    // #67: the reasoning filter of THIS request. It sees `Emit::Content` only, it holds a
+    // partial `</think` back across deltas, and it never touches an id: the loop below
+    // samples and pushes the same ids it pushed before this filter existed.
+    let mut think = ThinkFilter::new();
+    let mut counts = Chunks::default();
 
     // the id/created/model triple of this response, once
     let cx = ChunkCtx::new(&id, created, &model);
@@ -2280,7 +2595,6 @@ fn chat_generate(
     let mut out: Vec<u32> = Vec::with_capacity(req.max_tokens);
     // bytes of the accumulated decode that already left as content
     let mut emitted = 0usize;
-    let mut content_chunks = 0usize;
     let mut finish = "length";
     // TASK K: what each call's `arguments` fragments add up to, per index, so the
     // contract can be checked where it is produced (see the loop after the flush)
@@ -2316,7 +2630,7 @@ fn chat_generate(
                 emitted = full.len();
                 let pieces = ts.feed(delta);
                 accumulate_args(&pieces, &mut args_acc);
-                if !send_emits(sink, &cx, &pieces, &mut content_chunks, &mut tool_chunks) {
+                if !send_emits(sink, &cx, &pieces, &mut think, &mut counts) {
                     aborted = true;
                     break;
                 }
@@ -2362,9 +2676,24 @@ fn chat_generate(
         };
         malformed = ts.finish(&mut pieces);
         accumulate_args(&pieces, &mut args_acc);
-        if !send_emits(sink, &cx, &pieces, &mut content_chunks, &mut tool_chunks) {
+        if !send_emits(sink, &cx, &pieces, &mut think, &mut counts) {
             aborted = true;
         }
+    }
+    // #67: what the filter is still holding back. A prefix of `</think` that never completed
+    // is TEXT, and it leaves here, so no byte of the answer is lost to the filter.
+    if !aborted {
+        let tail = think.flush();
+        if !send_split(sink, &cx, &tail, &mut counts) {
+            aborted = true;
+        }
+    }
+    if think.stripped() > 0 {
+        eprintln!(
+            "[chat] reasoning filter: {} <think>/</think> tag(s) stripped from the content \
+             (#67); the generated ids are untouched",
+            think.stripped()
+        );
     }
     // TASK K: the invariant, checked where it is PRODUCED. `toolcall` guarantees that the
     // concatenation of one call's `Emit::Args` is a parseable JSON object for every input
@@ -2454,10 +2783,14 @@ fn chat_generate(
         (true, true)
     };
     eprintln!(
-        "[chat] prompt {} tok ({cached_n} cached, {prefilled} prefilled), generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {content_chunks}, tool chunks {tool_chunks}, tool calls {}, usage {}, timings {}, crow_trickle_swaps {trickle_swaps}{}",
+        "[chat] prompt {} tok ({cached_n} cached, {prefilled} prefilled), generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {}, reasoning chunks {}, tool chunks {}, think tags stripped {}, tool calls {}, usage {}, timings {}, crow_trickle_swaps {trickle_swaps}{}",
         ids.len(),
         per_second(prefilled, prefill_ms),
         (gen.saturating_sub(1)) as f64 * 1000.0 / decode_ms.max(1e-9),
+        counts.content,
+        counts.reasoning,
+        counts.tool,
+        think.stripped(),
         ts.closed(),
         log_usage,
         log_timings,
@@ -4179,6 +4512,246 @@ mod tests {
         assert!(raw.is_err(), "the string form must not render silently: {raw:?}");
     }
 
+    // ---- #67: the reasoning filter, both ends (2026-09-18) ----
+
+    /// feed `text` through the filter at EVERY piece size from 1 to its length, plus whole,
+    /// and return the concatenated `(content, reasoning, tags stripped)` of each run once -
+    /// every split must give the same answer, which is the whole point of the hold back
+    fn filtered(text: &str) -> (String, String, usize) {
+        let chars: Vec<char> = text.chars().collect();
+        let mut first: Option<(String, String, usize)> = None;
+        for step in 1..=chars.len().max(1) {
+            let mut f = ThinkFilter::new();
+            let (mut content, mut reasoning) = (String::new(), String::new());
+            for piece in chars.chunks(step) {
+                let piece: String = piece.iter().collect();
+                let out = f.push(&piece);
+                content.push_str(&out.content);
+                reasoning.push_str(&out.reasoning);
+            }
+            let tail = f.flush();
+            content.push_str(&tail.content);
+            reasoning.push_str(&tail.reasoning);
+            let got = (content, reasoning, f.stripped());
+            match &first {
+                None => first = Some(got),
+                Some(want) => assert_eq!(&got, want, "piece size {step} differs on {text:?}"),
+            }
+        }
+        first.unwrap_or_default()
+    }
+
+    /// no tag at all: every byte comes back, in order, whatever the deltas were
+    #[test]
+    fn a_stream_without_a_reasoning_tag_is_a_byte_identical_passthrough() {
+        for text in [
+            "Hello.",
+            "Let me test Chromium full-page screenshot of a tiny local page first.",
+            // the characters that make the scanner look twice, and never a tag
+            "a < b and c <= d",
+            "<thinker>, <thin, <, <<, </thin, </thinking>",
+            // leading and trailing whitespace of an untouched answer survives
+            "\n\n  indented\n",
+            "if (a<b) { return \"<think\"; }",
+            // non ASCII around the scanner's `<` fast path
+            "Gr\u{fc}\u{df}e \u{1f985} < \u{e4}\u{f6}\u{fc}",
+        ] {
+            let (content, reasoning, stripped) = filtered(text);
+            assert_eq!(content, text, "content changed for {text:?}");
+            assert_eq!(reasoning, "", "reasoning invented for {text:?}");
+            assert_eq!(stripped, 0, "a tag was counted in {text:?}");
+        }
+    }
+
+    /// the shape of #67: the stray closing tag at the very end of a turn, and the tag
+    /// arriving across several deltas - `filtered` drives every split point of both
+    #[test]
+    fn a_stray_closing_tag_never_reaches_the_content_at_any_split() {
+        // robin's line of record, tag and all
+        let (content, reasoning, stripped) = filtered(
+            "Let me test Chromium full-page screenshot of a tiny local page first:\n</think>",
+        );
+        assert_eq!(
+            content,
+            "Let me test Chromium full-page screenshot of a tiny local page first:\n"
+        );
+        assert_eq!(reasoning, "");
+        assert_eq!(stripped, 1);
+        assert!(!content.contains(THINK_CLOSE));
+        // mid-answer, and twice
+        let (content, _, stripped) = filtered("a</think>b</think>c");
+        assert_eq!(content, "abc");
+        assert_eq!(stripped, 2);
+        // the whole answer IS the tag
+        assert_eq!(filtered("</think>"), (String::new(), String::new(), 1));
+        // a prefix that never completes is TEXT, not a tag: no byte is lost to the filter
+        assert_eq!(filtered("done</think").0, "done</think");
+        assert_eq!(filtered("done</think").2, 0);
+        assert_eq!(filtered("done<").0, "done<");
+    }
+
+    /// a block the model opened itself becomes `reasoning_content`, never `content`
+    #[test]
+    fn a_leading_think_block_is_reasoning_content_and_never_content() {
+        let (content, reasoning, stripped) =
+            filtered("<think>\nfirst I check the path\n</think>\n\nThe file is empty.");
+        assert_eq!(content, "The file is empty.");
+        assert_eq!(reasoning, "\nfirst I check the path\n");
+        assert_eq!(stripped, 2);
+        // whitespace before the block goes with it, and so does the `\n\n` after it
+        assert_eq!(filtered("\n<think>x</think>\n\nA").0, "A");
+        // a block that never closes stays reasoning: the model opened it, nothing closed it
+        let (content, reasoning, _) = filtered("<think>still thinking");
+        assert_eq!(content, "");
+        assert_eq!(reasoning, "still thinking");
+        // `<think>` in the MIDDLE of an answer is ordinary text; only a leading block is owned
+        assert_eq!(filtered("see <think> below").0, "see <think> below");
+    }
+
+    /// the filter sits on `Emit::Content` alone: an `arguments` fragment is never rewritten
+    #[test]
+    fn the_filter_leaves_every_tool_call_fragment_alone() {
+        let pieces = vec![
+            Emit::Content("答え</think>".to_string()),
+            Emit::Call {
+                index: 0,
+                id: "call_0".to_string(),
+                name: "write_file".to_string(),
+            },
+            // a value that CONTAINS the tag: the arguments contract of 7.11.14 is bytes
+            Emit::Args {
+                index: 0,
+                text: "{\"content\":\"</think>\"}".to_string(),
+            },
+        ];
+        let mut col = CollectSink::default();
+        let mut think = ThinkFilter::new();
+        let mut counts = Chunks::default();
+        assert!(send_emits(&mut col, &ChunkCtx::new("i", 1, "m"), &pieces, &mut think, &mut counts));
+        assert_eq!(col.content, "答え");
+        assert_eq!(col.calls[0].arguments, "{\"content\":\"</think>\"}");
+        assert_eq!(think.stripped(), 1);
+        assert_eq!((counts.content, counts.reasoning, counts.tool), (1, 0, 2));
+        // and the reasoning half reaches both sinks as its own frame
+        let mut buf: Vec<u8> = Vec::new();
+        let mut sse = SseSink::new(&mut buf);
+        let mut f2 = ThinkFilter::new();
+        let mut c2 = Chunks::default();
+        assert!(send_emits(
+            &mut sse,
+            &ChunkCtx::new("i", 1, "m"),
+            &[Emit::Content("<think>why</think>then".to_string())],
+            &mut f2,
+            &mut c2
+        ));
+        let text = String::from_utf8(buf).expect("utf8 frames");
+        assert!(text.contains(r#""reasoning_content":"why""#), "{text}");
+        assert!(text.contains(r#""content":"then""#), "{text}");
+        assert!(!text.contains(THINK_CLOSE), "{text}");
+        assert_eq!((c2.content, c2.reasoning), (1, 1));
+    }
+
+    /// - #67 second end, against the REAL template: what it actually does with a stored
+    ///   `</think>`, and what the normaliser makes of it
+    /// - the issue expected `content.split('</think>')[-1]` (the turn would render EMPTY).
+    ///   This template has no such rule: it renders `reasoning_content` into its own think
+    ///   block and the stored `content` VERBATIM after it, so the text is never lost and the
+    ///   turn carries TWO closing tags - which is the shape the model imitates.
+    #[test]
+    fn a_history_whose_last_assistant_turn_ends_with_the_tag_keeps_its_text() {
+        let tk = tk();
+        let answer = "Let me test the screenshot at width 1280:\n</think>";
+        let msgs = serde_json::json!([
+            {"role": "user", "content": "Take a screenshot."},
+            {"role": "assistant", "content": answer},
+            {"role": "user", "content": "And now?"}
+        ]);
+        // 1) the template does NOT cut the turn at the tag - the text is all there
+        let raw = tk.render_chat(&msgs, None, true, false).expect("the raw history renders");
+        assert!(raw.contains("Let me test the screenshot at width 1280:"), "{raw}");
+        // 2) and the assistant turn carries the stray INSIDE the template's own block
+        const POISONED: &str = concat!(
+            "<|im_start|>assistant\n",
+            "<think>\n",
+            "\n",
+            "</think>\n",
+            "\n",
+            "Let me test the screenshot at width 1280:\n",
+            "</think><|im_end|>\n",
+        );
+        assert!(raw.contains(POISONED), "{raw}");
+        assert_eq!(raw.matches(THINK_CLOSE).count(), 3, "{raw}");
+        // 3) after the normaliser: the text is kept, the stray is gone, and the only closing
+        //    tags left are the template's own two (the stored turn's, and the header's)
+        let (clean, notes) = normalize_messages(&msgs);
+        let s = tk.render_chat(&clean, None, true, false).expect("the clean history renders");
+        assert!(s.contains("Let me test the screenshot at width 1280:"), "{s}");
+        assert!(s.contains(concat!(
+            "<|im_start|>assistant\n",
+            "<think>\n",
+            "\n",
+            "</think>\n",
+            "\n",
+            "Let me test the screenshot at width 1280:<|im_end|>\n",
+        )), "{s}");
+        assert_eq!(s.matches(THINK_CLOSE).count(), 2, "{s}");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("message 1 assistant content carried a <think>"), "{notes:?}");
+        // the ids of the clean history are the ids of the same history written by hand
+        let hand = serde_json::json!([
+            {"role": "user", "content": "Take a screenshot."},
+            {"role": "assistant", "content": "Let me test the screenshot at width 1280:"},
+            {"role": "user", "content": "And now?"}
+        ]);
+        assert_eq!(
+            tk.encode_chat(&clean, None, true, false).expect("clean ids"),
+            tk.encode_chat(&hand, None, true, false).expect("hand ids")
+        );
+    }
+
+    /// the normaliser strips the two shapes that NEST and leaves every other one alone
+    #[test]
+    fn the_normaliser_strips_only_the_two_shapes_that_nest() {
+        // stripped
+        assert_eq!(strip_stored_think("answer\n</think>").as_deref(), Some("answer"));
+        assert_eq!(strip_stored_think("answer</think>\n\n").as_deref(), Some("answer"));
+        assert_eq!(strip_stored_think("</think>").as_deref(), Some(""));
+        assert_eq!(strip_stored_think("a</think>\n</think>").as_deref(), Some("a"));
+        assert_eq!(
+            strip_stored_think("<think>\nplan\n</think>\n\nanswer").as_deref(),
+            Some("answer")
+        );
+        assert_eq!(strip_stored_think("<think>plan</think>done</think>").as_deref(), Some("done"));
+        // left alone, byte for byte: `None` is the contract, not an equal string
+        for untouched in [
+            "",
+            "a plain answer",
+            "the tag </think> in the middle of a sentence",
+            "<think> that never closes",
+            "</think> at the start, text after it",
+        ] {
+            assert_eq!(strip_stored_think(untouched), None, "{untouched:?} was rewritten");
+        }
+        // only the assistant role, only a string content, and `reasoning_content` untouched
+        let msgs = serde_json::json!([
+            {"role": "user", "content": "keep </think> here"},
+            {"role": "assistant", "content": "kept\n</think>", "reasoning_content": "r</think>"},
+            {"role": "tool", "tool_call_id": "call_0", "content": "result </think>"}
+        ]);
+        let (out, notes) = normalize_messages(&msgs);
+        assert_eq!(out[0]["content"], "keep </think> here");
+        assert_eq!(out[1]["content"], "kept");
+        assert_eq!(out[1]["reasoning_content"], "r</think>");
+        assert_eq!(out[2]["content"], "result </think>");
+        assert_eq!(notes.len(), 1);
+        // a history without the tag comes back identical, object for object
+        let clean = serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "there"}
+        ]);
+        assert_eq!(normalize_messages(&clean), (clean.clone(), Vec::new()));
+    }
+
     #[test]
     fn a_request_line_over_the_cap_stops_the_reader_at_the_cap() {
         let mut raw = b"GET /".to_vec();
@@ -4436,7 +5009,7 @@ mod tests {
         // probe-suite.py:677-683 reads choices[0].finish_reason, .message.content,
         // .message.reasoning_content and usage.completion_tokens
         let t = b3a_timing();
-        let d = completion_json(&ChunkCtx::new("chatcmpl-1700-2", 1700, "crow"), "hello", &[], "stop", &t);
+        let d = completion_json(&ChunkCtx::new("chatcmpl-1700-2", 1700, "crow"), "hello", "", &[], "stop", &t);
         assert_eq!(d["id"], "chatcmpl-1700-2");
         assert_eq!(d["object"], "chat.completion");
         assert_eq!(d["created"], 1700);
@@ -4466,7 +5039,7 @@ mod tests {
         let ck: Vec<&str> = c.as_object().unwrap().keys().map(|s| s.as_str()).collect();
         assert_eq!(ck, vec!["index", "message", "finish_reason"]);
         // `length` is the other reason gate part 1 accepts
-        let l = completion_json(&ChunkCtx::new("x", 1, "crow"), "hi", &[], "length", &t);
+        let l = completion_json(&ChunkCtx::new("x", 1, "crow"), "hi", "", &[], "length", &t);
         assert_eq!(l["choices"][0]["finish_reason"], "length");
     }
 
@@ -4479,7 +5052,7 @@ mod tests {
             name: "read_file".to_string(),
             arguments: "{\"path\":\"a.md\",\"start_line\":1}".to_string(),
         }];
-        let d = completion_json(&ChunkCtx::new("id1", 5, "crow"), "", &calls, "tool_calls", &t);
+        let d = completion_json(&ChunkCtx::new("id1", 5, "crow"), "", "", &calls, "tool_calls", &t);
         let m = &d["choices"][0]["message"];
         assert_eq!(m["role"], "assistant");
         assert_eq!(m["content"], "");
@@ -4516,14 +5089,14 @@ mod tests {
         ];
         let mut buf: Vec<u8> = Vec::new();
         let mut sse = SseSink::new(&mut buf);
-        let (mut sc, mut st) = (0usize, 0usize);
-        assert!(send_emits(&mut sse, &ChunkCtx::new("id1", 5, "crow"), &pieces, &mut sc, &mut st));
+        let (mut sf, mut cf) = (ThinkFilter::new(), ThinkFilter::new());
+        let (mut sc, mut cc) = (Chunks::default(), Chunks::default());
+        assert!(send_emits(&mut sse, &ChunkCtx::new("id1", 5, "crow"), &pieces, &mut sf, &mut sc));
         let mut col = CollectSink::default();
-        let (mut cc, mut ct) = (0usize, 0usize);
-        assert!(send_emits(&mut col, &ChunkCtx::new("id1", 5, "crow"), &pieces, &mut cc, &mut ct));
+        assert!(send_emits(&mut col, &ChunkCtx::new("id1", 5, "crow"), &pieces, &mut cf, &mut cc));
         // the same loop counts the same chunks for both sinks
-        assert_eq!((sc, st), (cc, ct));
-        assert_eq!((sc, st), (2, 3));
+        assert_eq!(sc, cc);
+        assert_eq!((sc.content, sc.reasoning, sc.tool), (2, 0, 3));
 
         // rebuild the answer out of the raw SSE frames the way Crow does, then compare
         let text = String::from_utf8(buf).unwrap();
@@ -4592,7 +5165,8 @@ mod tests {
     #[test]
     fn the_collector_holds_one_buffer_per_tool_call_index() {
         let mut col = CollectSink::default();
-        let (mut c, mut t) = (0usize, 0usize);
+        let mut think = ThinkFilter::new();
+        let mut counts = Chunks::default();
         let pieces = vec![
             Emit::Call {
                 index: 0,
@@ -4617,12 +5191,12 @@ mod tests {
                 text: "1}".to_string(),
             },
         ];
-        assert!(send_emits(&mut col, &ChunkCtx::new("i", 1, "m"), &pieces, &mut c, &mut t));
+        assert!(send_emits(&mut col, &ChunkCtx::new("i", 1, "m"), &pieces, &mut think, &mut counts));
         assert_eq!(col.calls.len(), 2);
         assert_eq!(col.calls[0].arguments, "{}");
         assert_eq!(col.calls[1].name, "b");
         assert_eq!(col.calls[1].arguments, "{\"x\":1}");
-        assert_eq!((c, t), (0, 5));
+        assert_eq!((counts.content, counts.reasoning, counts.tool), (0, 0, 5));
     }
 
     // ---- TASK K: the producer end of the `arguments` contract, and the diagnostics ----
