@@ -555,6 +555,20 @@ impl Vit {
             self.m1, self.s[S_NMERGE]]);
         self.gemv(k, &self.w.m_fc2, H, S_KD_MERGED, S_BIAS_H, nv, self.m1, self.out);
         self.bias(k, self.w.m_fc2_b, S_BIAS_H, nv, self.out);
+        // #73: the tower is ASYNC. Every launch above went to `cuda::cur_stream()`,
+        // and the only reader of `self.out` is the blocking `cuMemcpyDtoH_v2` in
+        // `build_plan`, which runs on the LEGACY null stream. A non-blocking
+        // stream does not order against the null stream, so that D2H copied
+        // whatever `self.out` still held - the PREVIOUS image's embeddings,
+        // complete and plausible, one request stale. The whole visual path was
+        // therefore lag-by-one: the FIRST image of a process read correctly (no
+        // decode had run, so the active stream was still the legacy one), and
+        // every image after it answered for its predecessor. That is what made
+        // the #VIT smoke parity green - it only ever ran one image per process.
+        // `sync()` synchronizes the stream the launches above actually used, so
+        // it is correct whichever stream is active; it is the one point where
+        // the tower has to meet the host, and it costs one image's latency.
+        cuda::sync();
         self.out
     }
 
@@ -1197,5 +1211,175 @@ mod reserve {
         // a bigger override pads the plan by the difference, and says so
         let part = reserve_line(ctx, scratch_bytes() as u64);
         assert!(part.contains("48.8 MB pending"), "the partial-hold wording moved: {part}");
+    }
+}
+
+#[cfg(test)]
+mod layout {
+    //! #73: the patch layout `prep_image` hands the tower, pinned against values
+    //! computed by hand from the reference formulas. No GPU, no container.
+    //!
+    //! #73 itself was NOT a layout bug - it was the missing stream sync in
+    //! `Vit::run`, which let the host read the previous image's embeddings back.
+    //! But the deterministic colour permutation it produced (red reads as Black,
+    //! green as Red) is exactly the signature a channel swap or a patch-order
+    //! transpose would leave, and suspect 2 of the issue cost the longest to
+    //! clear. These tests hold it cleared: a `plane[i] = px[c]` that picked BGR,
+    //! a `((c * T + t) * P + ty) * P + tx` with two axes exchanged, a merge-block
+    //! `seq` that walked columns before rows, an `align_corners` tap, or an h/w
+    //! swap in the rotary would each move a literal below.
+
+    use super::*;
+
+    /// encode an RGB8 raster as a PNG, which is what `prep_image` takes
+    fn png(w: u32, h: u32, px: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8> {
+        use image::ImageEncoder;
+        let mut raw = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                raw.extend_from_slice(&px(x, y));
+            }
+        }
+        let mut out = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut out)
+            .write_image(&raw, w, h, image::ExtendedColorType::Rgb8)
+            .expect("png encode");
+        out
+    }
+
+    /// `((c * VIT_TPATCH + t) * VIT_PATCH + ty) * VIT_PATCH + tx`, written out
+    /// here so the test does not borrow the expression it is checking
+    fn at(c: usize, t: usize, ty: usize, tx: usize) -> usize {
+        c * 512 + t * 256 + ty * 16 + tx
+    }
+
+    fn close(got: f32, want: f32, what: &str) {
+        assert!((got - want).abs() < 1e-6, "{what}: got {got}, want {want}");
+    }
+
+    /// A 256x256 image is a FACTOR multiple already, so `smart_resize` keeps it
+    /// and the bicubic pass is the identity (scale 1, taps 1/0/0) - every value
+    /// below is therefore a pixel of the source, normalized, and nothing depends
+    /// on the resampler. Pixel (x, y) carries its own coordinates: R = x, G = y,
+    /// B = 7, so a swapped channel or a transposed patch axis reads as a
+    /// different NUMBER, not as a different shade.
+    #[test]
+    fn the_patch_rows_are_channel_major_with_the_temporal_frame_duplicated() {
+        let p = prep_image(&png(256, 256, |x, y| [x as u8, y as u8, 7])).expect("prep");
+        assert_eq!(p.grid, (1, 16, 16));
+        assert_eq!(p.resized, (256, 256));
+        assert_eq!(p.n_patches, 256);
+        assert_eq!(p.n_visual, 64);
+        assert_eq!(p.patches.len(), 256 * VIT_IN);
+
+        // ---- seq 0 = block (0,0), in-block (0,0) = patch (row 0, col 0) ----
+        let r0 = &p.patches[0..VIT_IN];
+        // R plane carries x, G carries y, B is the constant 7
+        close(r0[at(0, 0, 3, 5)], 5.0 / 127.5 - 1.0, "R at (tx 5, ty 3)");
+        close(r0[at(1, 0, 3, 5)], 3.0 / 127.5 - 1.0, "G at (tx 5, ty 3)");
+        close(r0[at(2, 0, 3, 5)], 7.0 / 127.5 - 1.0, "B at (tx 5, ty 3)");
+        // the temporal patch is the SAME frame twice
+        close(r0[at(0, 1, 3, 5)], r0[at(0, 0, 3, 5)], "R frame 1 duplicates frame 0");
+        close(r0[at(2, 1, 3, 5)], r0[at(2, 0, 3, 5)], "B frame 1 duplicates frame 0");
+        // the literals themselves, so a changed normalize is caught too
+        close(r0[at(0, 0, 3, 5)], -0.960_784_3, "R literal");
+        close(r0[at(1, 0, 3, 5)], -0.976_470_6, "G literal");
+        close(r0[at(2, 0, 3, 5)], -0.945_098_04, "B literal");
+
+        // ---- the merge block walks in-row before in-column, rows before blocks ----
+        // seq 1 = in-block (iy 0, ix 1) = patch (row 0, col 1), pixels x 16..31
+        let r1 = &p.patches[VIT_IN..2 * VIT_IN];
+        close(r1[at(0, 0, 0, 0)], 16.0 / 127.5 - 1.0, "seq 1 is the RIGHT neighbour (R = x = 16)");
+        close(r1[at(1, 0, 0, 0)], -1.0, "seq 1 stays on row 0 (G = y = 0)");
+        // seq 2 = in-block (iy 1, ix 0) = patch (row 1, col 0), pixels y 16..31
+        let r2 = &p.patches[2 * VIT_IN..3 * VIT_IN];
+        close(r2[at(0, 0, 0, 0)], -1.0, "seq 2 stays on col 0 (R = x = 0)");
+        close(r2[at(1, 0, 0, 0)], 16.0 / 127.5 - 1.0, "seq 2 is the patch BELOW (G = y = 16)");
+        // seq 4 = the next BLOCK along the row = patch (row 0, col 2), pixels x 32..47
+        let r4 = &p.patches[4 * VIT_IN..5 * VIT_IN];
+        close(r4[at(0, 0, 0, 0)], 32.0 / 127.5 - 1.0, "seq 4 is the next block right (R = x = 32)");
+        close(r4[at(1, 0, 0, 0)], -1.0, "seq 4 stays on block row 0 (G = y = 0)");
+        // seq 32 = block row 1 (8 blocks of 4 per row) = patch (row 2, col 0)
+        let r32 = &p.patches[32 * VIT_IN..33 * VIT_IN];
+        close(r32[at(0, 0, 0, 0)], -1.0, "seq 32 stays on col 0 (R = x = 0)");
+        close(r32[at(1, 0, 0, 0)], 32.0 / 127.5 - 1.0, "seq 32 is block row 1 (G = y = 32)");
+    }
+
+    /// The colour check the end-to-end probe makes, one step earlier: a solid
+    /// image must give 256 identical rows whose three 512-value halves are the
+    /// normalized R, G and B of that colour, in THAT order. This is the assertion
+    /// `red -> Black` would have failed first if the cause had been the channels.
+    #[test]
+    fn a_solid_colour_fills_every_patch_row_with_that_colour_in_rgb_order() {
+        let (r, g, b) = (230u8, 20u8, 20u8);
+        let p = prep_image(&png(256, 256, |_, _| [r, g, b])).expect("prep");
+        let (nr, ng, nb) = (
+            r as f32 / 127.5 - 1.0,
+            g as f32 / 127.5 - 1.0,
+            b as f32 / 127.5 - 1.0,
+        );
+        close(nr, 0.803_921_6, "the red literal");
+        close(ng, -0.843_137_25, "the green literal");
+        for seq in [0usize, 1, 7, 128, 255] {
+            let row = &p.patches[seq * VIT_IN..(seq + 1) * VIT_IN];
+            // the three 512-value halves, in the order the conv row expects them
+            for (name, want, half) in [
+                ("R", nr, &row[0..512]),
+                ("G", ng, &row[512..1024]),
+                ("B", nb, &row[1024..1536]),
+            ] {
+                for (i, &v) in half.iter().enumerate() {
+                    close(v, want, &format!("seq {seq} {name} slot {i}"));
+                }
+            }
+        }
+    }
+
+    /// The learned 48x48 position table is resampled with align_corners=True:
+    /// src = p * (side - 1) / (grid - 1), taps floor/floor+1, weights (1-d, d),
+    /// emitted (h0w0, h0w1, h1w0, h1w1). Patch (row 1, col 0) of a 16x16 grid
+    /// lands at 1 * 47 / 15 = 3.1333, so it splits 0.8667 / 0.1333 over rows 3
+    /// and 4 of the table and sits whole on column 0.
+    #[test]
+    fn the_position_table_taps_are_align_corners_bilinear_in_h0w0_order() {
+        let p = prep_image(&png(256, 256, |_, _| [9, 9, 9])).expect("prep");
+        // seq 0 = patch (0, 0): the exact corner, all weight on the first tap
+        assert_eq!(&p.pe_idx[0..4], &[0, 1, 48, 49], "seq 0 taps");
+        close(p.pe_w[0], 1.0, "seq 0 w00");
+        close(p.pe_w[1], 0.0, "seq 0 w01");
+        close(p.pe_w[2], 0.0, "seq 0 w10");
+        close(p.pe_w[3], 0.0, "seq 0 w11");
+        // seq 2 = patch (1, 0): split over table rows 3 and 4, column 0
+        assert_eq!(&p.pe_idx[8..12], &[144, 145, 192, 193], "seq 2 taps");
+        close(p.pe_w[8], 0.866_666_7, "seq 2 w00");
+        close(p.pe_w[9], 0.0, "seq 2 w01");
+        close(p.pe_w[10], 0.133_333_3, "seq 2 w10");
+        close(p.pe_w[11], 0.0, "seq 2 w11");
+        // the four weights of any patch are a partition of one
+        for seq in [0usize, 2, 5, 100, 255] {
+            let s: f32 = p.pe_w[seq * 4..seq * 4 + 4].iter().sum();
+            close(s, 1.0, &format!("seq {seq} weights sum"));
+        }
+    }
+
+    /// The rotary vector is [h * inv_0 .. h * inv_17, w * inv_0 .. w * inv_17]:
+    /// the FIRST half is the patch row, the second the patch column, and
+    /// inv_freq[0] is 1. An h/w swap moves cos(1) and cos(2) past each other.
+    #[test]
+    fn the_rotary_half_is_the_patch_row_and_the_second_half_the_patch_column() {
+        let p = prep_image(&png(256, 256, |_, _| [9, 9, 9])).expect("prep");
+        let half = VIT_ROT / 2; // 18
+        // seq 2 = patch (row 1, col 0)
+        close(p.cs[2 * VIT_ROT], 1f32.cos(), "seq 2 h slot 0 = cos(1)");
+        close(p.sn[2 * VIT_ROT], 1f32.sin(), "seq 2 h slot 0 = sin(1)");
+        close(p.cs[2 * VIT_ROT + half], 1.0, "seq 2 w slot 0 = cos(0)");
+        close(p.sn[2 * VIT_ROT + half], 0.0, "seq 2 w slot 0 = sin(0)");
+        close(p.cs[2 * VIT_ROT], 0.540_302_3, "cos(1) literal");
+        close(p.sn[2 * VIT_ROT], 0.841_471, "sin(1) literal");
+        // seq 4 = patch (row 0, col 2): the mirror image of the above
+        close(p.cs[4 * VIT_ROT], 1.0, "seq 4 h slot 0 = cos(0)");
+        close(p.cs[4 * VIT_ROT + half], 2f32.cos(), "seq 4 w slot 0 = cos(2)");
+        close(p.sn[4 * VIT_ROT + half], 2f32.sin(), "seq 4 w slot 0 = sin(2)");
+        close(p.cs[4 * VIT_ROT + half], -0.416_146_84, "cos(2) literal");
     }
 }
