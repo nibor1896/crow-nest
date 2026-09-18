@@ -77,9 +77,9 @@ all nine green at commit `8ff2055` on 2026-09-17.
   record. They are hard-coded with their provenance; a value there moves only when a new
   reference run establishes a new record, and the commit that moves it says so. R8 applies
   unchanged: RED = eine Stufe zurück.
-- The host-side counts the script enforces are `TESTS=165` (98 lib + 67 serve) and
-  `CLIPPY=1422` (the `--all-targets` form, counted as `grep -cE '^warning: '`), both at
-  2026-09-17. The guard loop names three scripts — `check_env_docs` (exit 0, `code 82, doc 82`),
+- The host-side counts the script enforces are `TESTS=179` (103 lib + 74 serve + 2 parity,
+  2026-09-18) and `CLIPPY=1422` (the `--all-targets` form, counted as
+  `grep -cE '^warning: '`, unchanged since 2026-09-17). The guard loop names three scripts — `check_env_docs` (exit 0, `code 82, doc 82`),
   `check_readme_dates` (0 offenders) and `check_model_card_dates`, which is not in this tree and
   reports "not in this tree - skipped" as green.
 - The 1024-row form is a Linux value of record too (`117dd8d9d8dc…`, established 2026-09-17) but

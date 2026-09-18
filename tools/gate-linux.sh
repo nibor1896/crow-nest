@@ -61,7 +61,13 @@
 #                              refusals of a file that is not a hot set at all (the converter's
 #                              per-tensor `*.cnq.sidecar.jsonl`, a missing `sets`, 47 rows, an id
 #                              outside 0..512, an id twice in one row) - so 177 = 103 lib +
-#                              74 serve.
+#                              74 serve. #60 (2026-09-18) added the first two tests `bin/parity.rs`
+#                              has ever had, for the arm rule of the record header: the llama arm's
+#                              `operating_point` is the greedy string whatever sampler the series
+#                              used (`point_for`, the pure half - no server, no GPU, no env), and
+#                              the same through the env-reading front door with `CROW_SAMPLE=1` in
+#                              the environment, which is the accident the ticket names - so
+#                              179 = 103 lib + 74 serve + 2 parity.
 #                              Clippy is unchanged at
 #                              1422: it is the --all-targets form counted as grep -cE '^warning: ',
 #                              the form the 1494 -> 1480 -> 1426 -> 1422 series was counted with.
@@ -86,7 +92,7 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="177"
+TESTS="179"
 CLIPPY="1422"
 
 red=0

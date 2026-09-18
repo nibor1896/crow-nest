@@ -12,6 +12,7 @@
 
 - One row per `[[bin]]` entry in `Cargo.toml`. Eighteen entries, counted 2026-09-17.
 - The product binaries are named `serve`, `decode` and `parity` on Linux and `serve.exe`, `decode.exe` and `parity.exe` on Windows; every command below prints the Linux name.
+- Every binary that opens the container defaults to `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` and lets `CROW_CNQ` override it; `plecheck` and `states` were the last two to be brought over (issue #60, 2026-09-18).
 
 | binary | purpose | kind |
 |---|---|---|
@@ -190,7 +191,7 @@ cd engine
 cargo test --release
 ```
 
-- 177 passed, 0 failed on 2026-09-18 (103 lib + 74 serve; 165 on 2026-09-17, plus the six of issue #67, the three of issue #68 and the three of issue #49), and `cargo clippy --release --all-targets` reports 1,422 warnings, counted as `grep -cE '^warning: '`. Both counts are enforced by `../tools/gate-linux.sh`.
+- 179 passed, 0 failed on 2026-09-18 (103 lib + 74 serve + 2 parity; 165 on 2026-09-17, plus the six of issue #67, the three of issue #68, the three of issue #49 and the two of issue #60), and `cargo clippy --release --all-targets` reports 1,422 warnings, counted as `grep -cE '^warning: '`. Both counts are enforced by `../tools/gate-linux.sh`.
 - The ten tokenizer tests need `../models/` and are skipped without it.
 
 ```

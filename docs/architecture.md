@@ -1850,7 +1850,7 @@ quant. `tools/replay-session.py` and `tools/longctx-gate.py` are the two command
 - CI (E7, #50, 2026-09-11) runs engine lib **72 of 80** and `bin/serve` **55 of 57** on the
   windows-latest runner (the runner moved to ubuntu-latest with the Linux port on 2026-09-17 and no
   run of that workflow is recorded in this repository yet, so these are still the counts of record
-  for CI while the local counts are the 98 / 67 above); the gap is 10 tokenizer tests that need `../models/`, not present on a
+  for CI while the local counts are the 103 lib / 74 serve / 2 parity of 2026-09-18 above); the gap is 10 tokenizer tests that need `../models/`, not present on a
   fresh clone. The full counts above hold locally, where the models directory exists.
 
 **The unit tests #39 added (`engine/src/bin/serve.rs`):**
@@ -2455,9 +2455,9 @@ memory-bounded scope, one engine at a time.
 - **The gate**: `tools/gate-linux.sh [outdir]` from the repo root runs the three parity forms,
   `decode run 32`, `cargo test`, clippy and the doc guards against the first three values
   above, prints GREEN/RED per item and exits non-zero on any RED. Nine items; all nine green at
-  commit `8ff2055` on 2026-09-17. The two host-side values it pins are `TESTS=165`
-  (98 lib + 67 serve) and `CLIPPY=1422` (the `--all-targets` form, counted as
-  `grep -cE '^warning: '`), plus `check_env_docs` exit 0 (`code 82, doc 82`) and
+  commit `8ff2055` on 2026-09-17. The two host-side values it pins are `TESTS=179`
+  (103 lib + 74 serve + 2 parity, 2026-09-18) and `CLIPPY=1422` (the `--all-targets` form,
+  counted as `grep -cE '^warning: '`), plus `check_env_docs` exit 0 (`code 82, doc 82`) and
   `check_readme_dates` 0 offenders. The 1024-row form is not in
   the script — it costs a full long-prompt run and is checked by hand. Every expected value is hard-coded with its
   provenance in the script header. It is not a tuning knob: a value there is changed only when a

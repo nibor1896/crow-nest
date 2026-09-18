@@ -6,13 +6,44 @@
 
 ## v0.3.1 (unreleased) — the reasoning filter, and what the 170k session really was
 
-- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Three issues so far: `#67` (the
-  reasoning filter, `667b68b`), the engine side of `#68` (the long-context measurement, `f14e557`)
-  and `#49` (the ragged hot-set sidecar, this commit). The machine is the second environment block
-  of `docs/system-landscape.md` unless a row names another one.
+- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Four issues so far: `#67` (the
+  reasoning filter, `667b68b`), the engine side of `#68` (the long-context measurement, `f14e557`),
+  `#49` (the ragged hot-set sidecar, `0adbe6a`) and `#60` (the `parity` record header per arm, and
+  the last two bins that hard-coded the pre-`#51` container, this commit). The machine is the
+  second environment block of `docs/system-landscape.md` unless a row names another one.
 - The crate version field stays `0.1.0`, as it has for every release: this file is the record.
 
 ### Fixed
+
+- **The `parity` record header could stamp a sampler profile on the llama arm's greedy answers,
+  and two bins still opened the pre-`#51` container** (`#60`, both found 2026-09-11 in the review
+  of `HARN1`, fixed 2026-09-18). Two harness defects, both off the numeric path by construction:
+  no kernel, no id and no byte of a parity form is reachable from either.
+
+  **The header is per ARM now.** `operating_point()` read `CROW_SAMPLE` and nothing else, while
+  `llama_complete` sends `"temperature": 0.0` on every request and reads no engine variable at all.
+  On this machine the two arms cannot be co-resident — the pinned cold tier and the llama-server
+  model do not fit in 64 GB / 32 GB — so the ten-task gate runs them ARM-PHASED, which means one
+  shell and one environment for both phases. `CROW_SAMPLE=1` set for a crow phase and left in place
+  would therefore have written `sample: temp 0.7 top_p 0.8 top_k 20 presence 1.5 seed 0` into the
+  record of answers drawn at temperature 0, at both sites (the `phase` meta block and the
+  per-measurement row of `run`). Latent: no llama record on this branch carries it. `operating_point`
+  takes the arm now and the llama arm always stamps the greedy string; the rule itself is `point_for`,
+  the pure half — the arm and the sampler as arguments, no environment — so it is unit tested with
+  no llama-server, no oracle venv and no GPU. Tests 177 -> 179, the first two `bin/parity.rs` has
+  ever had: the arm rule against a `Sampler::new(4)` built without env, and the same rule through
+  the env-reading front door with `CROW_SAMPLE=1` in the environment, which is the accident itself.
+
+  **`plecheck` and `states` read `CROW_CNQ` now.** Both hard-coded
+  `../converter/Qwen3.8-Flash-Next-CNQ4.5.cnq` — the container of record before `#51` — and read no
+  variable, because `#52` (2026-09-11) named only `residency` and `sf_scan`. That file is not in this
+  tree (only its per-tensor `*.cnq.sidecar.jsonl` report is), so both bins panicked in `Cnq::open`
+  on this machine, and the `states` acceptance demo would otherwise have printed the expert geometry
+  and the whole allocation plan of a container that is no longer of record. They take the
+  `geo::DEFAULT_CNQ` + `from_engine_dir` pair the other two generator bins use, with `CROW_CNQ`
+  overriding it, and `states` names the container it opened in its first line. `grep -n 'CNQ4.5'
+  engine/src/bin/*.rs` now answers with `-M` in every binary, and `docs/env.md` row `CROW_CNQ` lists
+  five read sites and no exception.
 
 - **A ragged hot-set sidecar asserted instead of naming the row it could not read** (`#49`,
   found 2026-09-10 in stage B, fixed 2026-09-18). Rows of unequal length in the file

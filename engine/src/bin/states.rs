@@ -40,9 +40,14 @@ fn plan_table(context: usize, kv: KvDtype, expert_per_unit: u64, dense_hot: u64,
 }
 
 fn main() {
-    let cnq_path = "../converter/Qwen3.8-Flash-Next-CNQ4.5.cnq";
-    println!("states: opening container index for expert geometry …");
-    let mut cnq = Cnq::open(cnq_path);
+    // #60 (2026-09-18): the demo defaults to the production -M container, like
+    // `decode` and `parity` (#51) and the two generator bins (#52), and reads
+    // CROW_CNQ like they do. It used to hard-code the pre-#51 container, so the
+    // byte counts it printed were the geometry of a file that is no longer of
+    // record. Read only: it opens the container INDEX, never a weight.
+    let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| from_engine_dir(DEFAULT_CNQ));
+    println!("states: opening container index for expert geometry … ({cnq_path})");
+    let mut cnq = Cnq::open(&cnq_path);
     let slabs = crow_nest_engine::residency::expert_slab_info(&mut cnq, 0, "text");
     let expert_per_unit = (slabs.gu_bytes + slabs.dn_bytes) * LAYERS as u64;
     println!(

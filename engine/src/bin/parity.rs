@@ -265,25 +265,45 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
     }
 }
 
-/// #53: the record header names the sampler that produced the answer.
+/// The greedy operating point. It is what the LLAMA arm always is: `llama_complete`
+/// sends `"temperature": 0.0` on every request (`:136`) and reads no engine env var,
+/// so nothing a crow phase sets can change what that arm drew.
+const GREEDY_POINT: &str = "200k floor, -np 1, greedy, temperature 0";
+
+/// #53: the record header names the sampler that produced the answer — and since
+/// #60 it names the sampler of the ARM whose record it heads.
 ///
-/// | case | `operating_point` |
-/// |---|---|
-/// | `CROW_SAMPLE` unset | `200k floor, -np 1, greedy, temperature 0` |
-/// | `CROW_SAMPLE=1` | `200k floor, -np 1, sample: temp <t> top_p <p> top_k <k> presence <pr> seed <s>` |
+/// | arm | case | `operating_point` |
+/// |---|---|---|
+/// | `crow` | `CROW_SAMPLE` unset | `200k floor, -np 1, greedy, temperature 0` |
+/// | `crow` | `CROW_SAMPLE=1` | `200k floor, -np 1, sample: temp <t> top_p <p> top_k <k> presence <pr> seed <s>` |
+/// | `llama` | either | `200k floor, -np 1, greedy, temperature 0` |
 ///
-/// - Source is `sample::Sampler::from_env`, the call `crow_complete` already makes
-///   for `measurements[].note` (`sample.rs:69`).
+/// - Source for the crow arm is `sample::Sampler::from_env`, the call `crow_complete`
+///   already makes for `measurements[].note` (`sample.rs:86`).
 /// - The note keeps the `gpu` or `host` suffix of `Sampler::describe`; the header
 ///   names the profile and the seed only.
 /// - Before #53 both record sites stamped `greedy` on sampled runs too.
-fn operating_point() -> String {
-    match crow_nest_engine::sample::Sampler::from_env() {
-        None => "200k floor, -np 1, greedy, temperature 0".to_string(),
-        Some(s) => format!(
+/// - #60 (2026-09-18): `CROW_SAMPLE` is a CROW-side switch, and the header was
+///   arm-independent. A llama phase started with `CROW_SAMPLE=1` still in the
+///   environment — the arms run in separate phases on this machine, one shell — would
+///   have stamped a sampler profile and a seed on answers drawn at temperature 0.
+///   Latent (no llama record on this branch carries it), and now impossible by
+///   construction: the arm decides, and `point_for` is pinned by the tests below.
+fn operating_point(arm: &str) -> String {
+    point_for(arm, crow_nest_engine::sample::Sampler::from_env().as_ref())
+}
+
+/// the pure half of `operating_point`: the arm, and the sampler that arm used. No
+/// environment and no server, so the arm rule is unit testable on any machine.
+fn point_for(arm: &str, sampler: Option<&crow_nest_engine::sample::Sampler>) -> String {
+    match sampler {
+        Some(s) if arm != "llama" => format!(
             "200k floor, -np 1, sample: temp {} top_p {} top_k {} presence {} seed {}",
             s.temperature, s.top_p, s.top_k, s.presence_penalty, s.seed
         ),
+        // the llama arm, and every unsampled crow arm
+        _ => GREEDY_POINT.to_string(),
     }
 }
 
@@ -360,7 +380,7 @@ fn main() {
                 "first_mover_rule": first,
                 "order": prompts.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
                 "warmup": "one cold prefill per phase start, discarded (spec 0.3)",
-                "operating_point": operating_point(),
+                "operating_point": operating_point(arm),
                 "crow_container": std::env::var("CROW_CNQ").unwrap_or_else(|_| DEFAULT_CNQ.into()),
             })];
             let out = format!("decode_out/{prefix}-run{run_index}-{arm}.json");
@@ -448,7 +468,7 @@ fn main() {
                         "prompt": p.id, "engine": which, "position_in_series": i,
                         "prefill_tok_s": pre, "decode_tok_s": dec, "wall_s": wall,
                         "note": note,
-                        "operating_point": operating_point(),
+                        "operating_point": operating_point(which),
                     }));
                     println!("{:>5} {:6} pre {pre:8.1} tok/s  dec {dec:8.1} tok/s", p.id, which);
                 }
@@ -458,5 +478,42 @@ fn main() {
             println!("parity: written {out}");
         }
         _ => println!("unknown mode {mode}"),
+    }
+}
+
+/// #60 (2026-09-18): the arm rule of the record header, pinned without a
+/// llama-server, without the oracle venv and without a GPU — `point_for` is pure
+/// and `Sampler::new` is the constructor that reads no environment.
+#[cfg(test)]
+mod tests {
+    use super::{operating_point, point_for, GREEDY_POINT};
+    use crow_nest_engine::sample::Sampler;
+
+    /// The llama arm draws through `llama_complete`, which sends `temperature 0.0`
+    /// on every request, so its header says greedy whatever sampler the crow arm of
+    /// the same series used. The crow arm keeps the #53 behaviour.
+    #[test]
+    fn the_llama_arm_header_is_greedy_whatever_the_sampler_is() {
+        let s = Sampler::new(4); // data-sheet instruct profile, seed 4
+        assert_eq!(point_for("llama", Some(&s)), GREEDY_POINT);
+        assert_eq!(point_for("llama", None), GREEDY_POINT);
+        assert_eq!(point_for("crow", None), GREEDY_POINT);
+        assert_eq!(
+            point_for("crow", Some(&s)),
+            "200k floor, -np 1, sample: temp 0.7 top_p 0.8 top_k 20 presence 1.5 seed 4"
+        );
+    }
+
+    /// The same rule through the env-reading front door, with the profile of a crow
+    /// phase left in the environment — the shape of the accident #60 names: one
+    /// shell, the crow phase first with `CROW_SAMPLE=1`, then the llama phase.
+    #[test]
+    fn a_llama_phase_started_with_crow_sample_still_records_greedy() {
+        std::env::set_var("CROW_SAMPLE", "1");
+        assert_eq!(operating_point("llama"), GREEDY_POINT);
+        let crow = operating_point("crow");
+        assert!(crow.starts_with("200k floor, -np 1, sample: temp "), "{crow}");
+        std::env::remove_var("CROW_SAMPLE");
+        assert_eq!(operating_point("crow"), GREEDY_POINT);
     }
 }
