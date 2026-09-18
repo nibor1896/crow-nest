@@ -319,5 +319,155 @@ class Sha256OfASlice(unittest.TestCase):
                 fd.sha256_of(p, 0, 8)
 
 
+
+
+class ExpertSelection(unittest.TestCase):
+    """#79: the routed-expert half of the same derivation."""
+
+    LINES = [
+        json.dumps({"name": "m.layers.0.mlp.experts.gate_up_proj", "section": "text", "dtype": "nvfp4", "n": 16}),
+        json.dumps({"name": "m.layers.7.mlp.experts.gate_up_proj", "section": "text", "dtype": "nvfp4", "n": 32}),
+        json.dumps({"name": "m.layers.7.mlp.experts.down_proj", "section": "text", "dtype": "nvfp4", "n": 64}),
+        json.dumps({"name": "m.layers.7.linear_attn.out_proj.weight", "section": "text", "dtype": "nvfp4", "n": 8}),
+        json.dumps({"name": "m.layers.7.mlp.experts.gate_up_proj", "section": "vit", "dtype": "nvfp4", "n": 999}),
+        json.dumps({"record": "section_summary", "section": "text", "dtype": "nvfp4", "n": 999}),
+    ]
+
+    def test_only_the_asked_layers_survive(self):
+        got = fd.select_expert_tensors(self.LINES, [7])
+        self.assertEqual([t["name"] for t in got],
+                         ["m.layers.7.mlp.experts.gate_up_proj", "m.layers.7.mlp.experts.down_proj"])
+        self.assertEqual([t["layer"] for t in got], [7, 7])
+        self.assertEqual(sum(t["n"] for t in got), 96)
+
+    def test_the_dense_rule_and_the_expert_rule_partition_the_text_nvfp4_tensors(self):
+        # the two selections may never overlap and may never leave a tensor out: that is what
+        # makes "the experts were not touched" of #76 true and #79's file the rest of it
+        dense = {t["name"] for t in fd.select_dense_tensors(self.LINES)}
+        experts = {t["name"] for t in fd.select_expert_tensors(self.LINES, range(64))}
+        self.assertEqual(dense & experts, set())
+        self.assertEqual(dense | experts, {
+            "m.layers.0.mlp.experts.gate_up_proj", "m.layers.7.mlp.experts.gate_up_proj",
+            "m.layers.7.mlp.experts.down_proj", "m.layers.7.linear_attn.out_proj.weight"})
+
+    def test_a_layer_nobody_asked_for_is_not_in_the_plan(self):
+        self.assertEqual(fd.select_expert_tensors(self.LINES, [3]), [])
+
+    def test_the_layer_number_comes_out_of_the_name(self):
+        self.assertEqual(fd.layer_of("model.language_model.layers.43.mlp.experts.down_proj"), 43)
+        self.assertEqual(fd.layer_of("model.language_model.layers.0.ple.conv1d.weight"), 0)
+        self.assertIsNone(fd.layer_of("model.visual.blocks.3.attn.qkv.weight"))
+        self.assertIsNone(fd.layer_of("model.language_model.layers.x.foo"))
+        self.assertIsNone(fd.layer_of("model.language_model.layers."))
+
+    def test_the_layer_spec_takes_a_list_and_a_range(self):
+        self.assertEqual(fd.parse_layers("1,7,13"), [1, 7, 13])
+        self.assertEqual(fd.parse_layers("13,1,7,1"), [1, 7, 13])
+        self.assertEqual(fd.parse_layers("2-5,9"), [2, 3, 4, 5, 9])
+        self.assertEqual(fd.parse_layers(" 3 "), [3])
+
+    def test_a_spec_that_is_not_layers_is_refused(self):
+        for bad in ("", ",", "a", "5-2", "-1", "1..3"):
+            with self.assertRaises(ValueError, msg=bad):
+                fd.parse_layers(bad)
+
+
+class ChunkedRequests(unittest.TestCase):
+    """#79: a 3.36 GB tensor is one range too big to hold, so a span is cut into requests.
+
+    The contract that matters is that the chunk size is invisible in the result: the same
+    bytes land at the same offsets and every sha256 is the same. Run against a fake shard,
+    through the REAL `fetch_group`, so the output file and its manifest are the real ones.
+    """
+
+    SHARD = "model-00004-of-00131.safetensors"
+
+    def setUp(self):
+        payload_a = bytes((i * 7 + 3) & 0xFF for i in range(4096))
+        payload_b = bytes((i * 11 + 5) & 0xFF for i in range(2048))
+        self.raw = safetensors_bytes({
+            "m.layers.7.mlp.experts.gate_up_proj": ("BF16", [2, 1024], payload_a),
+            "m.layers.7.mlp.experts.down_proj": ("BF16", [1024], payload_b),
+        })
+        self.payloads = {"m.layers.7.mlp.experts.gate_up_proj": payload_a,
+                         "m.layers.7.mlp.experts.down_proj": payload_b}
+        self.requests = 0
+
+    def opener(self, req, timeout=None):
+        self.requests += 1
+        lo, hi = req.headers["Range"].split("=")[1].split("-")
+        lo, hi = int(lo), int(hi) + 1
+        blob = self.raw[lo:hi]
+        if len(blob) < hi - lo:  # the 256 KiB header probe asks past the end of this little shard
+            blob += b"\x00" * (hi - lo - len(blob))
+        return FakeResponse(blob)
+
+    def group_for(self, out_dir):
+        return {
+            "layer": 7,
+            "selection": [{"name": n, "n": len(self.payloads[n]) // 2, "layer": 7, "shard": self.SHARD}
+                          for n in sorted(self.payloads)],
+            "out_file": Path(out_dir) / "layer-07.safetensors",
+            "manifest": Path(out_dir) / "layer-07.manifest.json",
+            "header_cache": Path(out_dir) / ".shard-headers",
+            "metadata": {"format": "pt"},
+            "rule": "test",
+        }
+
+    def args_for(self, chunk):
+        import argparse
+        return argparse.Namespace(max_tries=3, max_gap=fd.DEFAULT_MAX_GAP, max_span=fd.DEFAULT_MAX_SPAN,
+                                  chunk_bytes=chunk, skip_verify=False, repo="r", revision="v",
+                                  sidecar=Path("s.jsonl"))
+
+    def fetch_with(self, chunk, out_dir):
+        real = fd.RangeFetcher
+        opener = self.opener
+        fd.RangeFetcher = lambda url, **kw: real(url, opener=opener, sleep=lambda s: None, **kw)
+        try:
+            rc, stats = fd.fetch_group(self.group_for(out_dir), self.args_for(chunk), {}, "https://example/")
+        finally:
+            fd.RangeFetcher = real
+        self.assertEqual(rc, 0)
+        return stats
+
+    def test_the_chunk_size_changes_the_request_count_and_nothing_else(self):
+        results = {}
+        for chunk in (1 << 20, 1024, 100):
+            with tempfile.TemporaryDirectory() as d:
+                stats = self.fetch_with(chunk, d)
+                out = (Path(d) / "layer-07.safetensors").read_bytes()
+                man = json.loads((Path(d) / "layer-07.manifest.json").read_text())
+                results[chunk] = (out, {t["name"]: t["sha256"] for t in man["tensors"]}, stats["requests"])
+        big, small, tiny = results[1 << 20], results[1024], results[100]
+        self.assertEqual(big[0], small[0])
+        self.assertEqual(big[0], tiny[0])
+        self.assertEqual(big[1], small[1])
+        self.assertEqual(big[1], tiny[1])
+        self.assertLess(big[2], tiny[2], "a 100 B chunk must cost more requests than a 1 MiB one")
+
+    def test_the_payload_lands_where_the_written_header_says(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as d:
+            self.fetch_with(1000, d)
+            out = (Path(d) / "layer-07.safetensors").read_bytes()
+            header, data_start = fd.parse_safetensors_header(out)
+            man = json.loads((Path(d) / "layer-07.manifest.json").read_text())
+            recorded = {t["name"]: t["sha256"] for t in man["tensors"]}
+            for name, payload in self.payloads.items():
+                lo, hi = header[name]["data_offsets"]
+                self.assertEqual(out[data_start + lo : data_start + hi], payload, name)
+                self.assertEqual(recorded[name], hashlib.sha256(payload).hexdigest(), name)
+
+    def test_a_second_run_over_the_same_directory_fetches_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            first = self.fetch_with(1 << 20, d)
+            self.requests = 0
+            second = self.fetch_with(1 << 20, d)
+            self.assertEqual(first["fetched"], 2)
+            self.assertEqual(second["fetched"], 0)
+            self.assertEqual(second["verified"], 2)
+            self.assertEqual(self.requests, 0, "the shard header is cached and the tensors are on disk")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
