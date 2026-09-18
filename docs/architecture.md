@@ -481,7 +481,7 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 - `CROW_QSA_PAR` is the decode path only: the prefill selection at `gen.rs:2231` keeps `qsa_select_fast` on `tb` blocks, one block per query.
 - `CROW_QSA_PAR` default since #61b (2026-09-12): the adjacent pair measured 23.9411 against 24.8735 ms per decode token with `0` (-3.75 percent, ids identical), and parity runs 8 of 8 forms including the teacher-forced 16,064 id PX form over the radix path (`decode_out/srv-61b.log`, RTX 5090); every process names its selection in one `[qsa]` boot line.
 - `CROW_ATTN_SPLITS` (4, 8, 16, 32) default 8 again since #61e (2026-09-13): the #61d flip to 32 (robin's performance-over-ids ruling of 2026-09-12, kept of record) was ROLLED BACK one day later under the improvement-loop quality rule - the ten-task quality bar is NOT held at 32, judged 0 Pass / 7 Partial / 3 Fail against the crow record 2 / 5 / 3 at 8 and the llama reference 2 / 6 / 2 (`.superpowers/sdd/task-61d-quality-report.md`); the 61d adjacent pair stays the measurement of record for the knob: 22.8545 against 24.1325 ms per decode token with `8` (-5.3 percent, 32.3 x the fallback spread), B ids `5098f885ab3a` 3 of 3, N ids `c65969f7793a` 3 of 3 (the 61a/61c S32 value); the rollback is the const back to 8 plus its `[attn]` boot line and nothing else (engine commit `fdc00c4`, `decode_out/srv-61d.log`, RTX 5090).
-- The split count still changes the merge order of the flash-decoding partials, so the last bits of the logits move: the generated ids change (first differing index 45 and 48 of 256 on t1-read, `decode_out/srv-61a.log`), so `16` and `32` stay MEASUREMENT ONLY under the quality verdict, and the splits-8 stream of record is again final4-identical (the 61d per-task baseline `decode_out/t61d-run0-crow.json` is superseded); the `attn_sel_split` row (2.44 ms per token, nsys `decode_out/srv-61a.log`) stays the open optimization row of #61.
+- The split count still changes the merge order of the flash-decoding partials, so the last bits of the logits move: the generated ids change (first differing index 45 and 48 of 256 on t1-read, `decode_out/srv-61a.log`), so `16` and `32` stay MEASUREMENT ONLY under the quality verdict, and the splits-8 stream of record is again final4-identical (the 61d per-task baseline `decode_out/t61d-run0-crow.json` is superseded); the `attn_sel_split` row (2.44 ms per token, nsys `decode_out/srv-61a.log`) was the open optimization row of #61 and is re-measured and answered in **section 4.6** (2026-09-18): it is 2.420 ms per token still, and its cost is the per-block e4m3 byte decode, not the split count.
 - The partial buffers `part_o` and `part_ml` are sized for 32 splits (`gen.rs:1879-1880`), VRAM plus 0.55 MB against the old size.
 
 ### 4.3 Kernel hygiene
@@ -510,6 +510,171 @@ timebox (created with spec section 6). Until then the engine runs Blackwell-only
   Linux is a platform of record, its four parity values are in section 8.7, and `tools/gate-linux.sh`
   is the standing gate. A Linux number is quoted like any other: with its date, its machine and its
   artefact.
+
+### 4.6 The decode kernel decomposition at the Linux operating point (#61, 2026-09-18)
+
+The attention row of profile #59 (Windows, nsys, 2026-09-11) was never re-measured after the #61a/b
+and #62e levers landed; this is that re-measurement, on Linux, with the engine's own per-kernel
+profiler. It carries the GDN row of #62 and the whole-step table that #19 and #62 read.
+
+**Machine and form.** RTX 5090 / Arch Linux (the second environment block of
+`docs/system-landscape.md`), HEAD `77c4d40`, 2026-09-18, `decode run decode_out/srv-a5-t1read-ids.json 256`
+on the t1-read prompt of record (16,064 ids, greedy, 256 generated tokens, 255 timed steps, context
+16,320 at the timed steps), inside the same bounded scope `tools/drift-chain.sh` runs its D arm in.
+Logs: `decode_out/61/`.
+
+| form | ms per decode token | tok/s | ids sha256 |
+|---|---|---|---|
+| the chain form of record (`CROW_GRAPH=1`), `decode_out/61/ctl-g1-256.log` | 25.1064 | 39.83 | `56305eee11d6` |
+| `CROW_GRAPH=0` — what the profiler needs | 25.8363 | 38.71 | `56305eee11d6` |
+| `CROW_GRAPH=0 CROW_KPROF=1 CROW_PROFILE=1`, two runs | 33.5811 / 33.5880 | 29.78 | `56305eee11d6` |
+
+The #38 chain of the same morning read 39.81 to 39.86 tok/s over four D runs at the ids sha
+`56305eee11d6` (`decode_out/38/c1-sdsd.out`); the profile arm reproduces it and carries the same
+sha, so the decomposition below sits on the operating point of record. **`CROW_KPROF` is not a
+tok/s form** — it syncs the stream before and after every launch, which is the 7.7 ms per token
+between the third row and the second.
+
+**Method, and why the numbers are decode-only.** `CROW_KPROF=1` charges each row kernel time plus
+one launch latency, and it accumulates from load, so prefill is inside its totals. Two runs of the
+same prompt with `gen` 256 and `gen` 8 have a bit-identical prefill, so
+`(total_256 - total_8) / 248` is the per-decode-token cost with prefill removed exactly. The
+per-launch floor `CROW_KPROF` adds is 5.0 us, read off the cheapest rows in the table
+(`mix_streams[10x1]`, `add_flat[40x1]`, `rope_p[2x1]` all at 5.0 to 5.1 us/call); the last column
+subtracts `5.0 us x calls` and is the column to compare with nsys. Two independent run pairs; every
+row below agrees between them to better than 0.4 %. Row names carry the grid as `name[gx x gy]`,
+which is what separates a decode launch from the prefill launch of the same kernel.
+
+**The attention row — the 12 attention layers, per decode token.**
+
+| kernel | calls/token | ms/token (`CROW_KPROF`) | us/call | ms/token, launch floor removed |
+|---|---|---|---|---|
+| `attn_sel_split[24x1]` | 12.0 | 2.480 | 206.7 | 2.420 |
+| `gemv_bf16_w[1536x1]` (q proj, BF16 keep) | 12.0 | 0.543 | 45.3 | 0.483 |
+| `gemv_fp4_mma_d[40x1]` (o proj) | 12.0 | 0.317 | 26.5 | 0.257 |
+| `gemv_fp4_mma_d[10x1]` (QSA indexer qk) | 12.0 | 0.153 | 12.8 | 0.093 |
+| `gemv_fp4_mma_d[8x1]` (v proj) | 12.0 | 0.152 | 12.7 | 0.092 |
+| `qsa_select_par_e[1x1]` | 12.0 | 0.122 | 10.2 | 0.062 |
+| `gemv_bf16_w[64x1]` (k proj) | 12.0 | 0.105 | 8.8 | 0.045 |
+| `attn_merge[24x1]` | 12.0 | 0.096 | 8.0 | 0.036 |
+| `qsa_scores_par[512x1]` | 12.0 | 0.088 | 7.3 | 0.028 |
+| `qsa_select_par_h[32x1]` | 12.0 | 0.073 | 6.1 | 0.013 |
+| the other 13 rows (`store_kv`, `gate_mul_q`, `rms128`, `split_qg`, `rope64`, `qk_k_append`, `rmsnorm_1pw` x2, `rope_p` x2, and `pool4_cache`/`rms128`/`rope64` every 4th token) | 141.0 | 0.711 | 5.0 to 6.3 | 0.066 |
+| **attention row** | **249.0** | **4.840** | | **3.595** |
+
+| item | #59 (Windows, nsys, 2026-09-11) | this pass (Linux, `CROW_KPROF`, 2026-09-18) | llama.cpp (#59) |
+|---|---|---|---|
+| attention layers, ms per decode token | 4.665 | **3.595** (4.840 with the launch floor) | 0.866 |
+| the selection row | `qsa_select_fast` 1.110 | `qsa_select_par_h` + `_e` 0.075 | — |
+| `attn_sel_split` | 2.439 | 2.420 | — |
+| `attn_merge` | 0.018 | 0.036 | — |
+| ratio to llama.cpp | 5.4 x | **4.2 x** | 1 |
+
+The whole move since #59 is the #61b selection lever: `attn_sel_split` itself is unchanged to 0.8 %,
+and the two nsys/kprof methods agree on it to within that. The row is -1.07 ms per token = -23 %.
+
+**The GDN row — the 36 GDN layers, per decode token** (this is #62's row; the nsys re-decomposition
+#62e left open).
+
+| kernel | calls/token | ms/token (`CROW_KPROF`) | us/call | ms/token, launch floor removed |
+|---|---|---|---|---|
+| `gemv_fp4_mma_g32[515x1]` (grouped input projection, #19g + #62e) | 36.0 | 1.174 | 32.6 | 0.994 |
+| `gemv_fp4_mma_d32[80x1]` (out projection, #62e) | 36.0 | 0.841 | 23.4 | 0.661 |
+| `delta_rule_step_r[48x1]` | 36.0 | 0.325 | 9.0 | 0.145 |
+| `l2norm_repeat[48x1]` | 36.0 | 0.239 | 6.6 | 0.059 |
+| `rmsnorm_gated_q[48x1]` | 36.0 | 0.230 | 6.4 | 0.050 |
+| `conv_step[40x1]` | 36.0 | 0.204 | 5.7 | 0.024 |
+| `beta_g[1x1]` | 36.0 | 0.201 | 5.6 | 0.021 |
+| **GDN row** | **252.0** | **3.214** | | **1.954** |
+
+Against #59's 2.280 ms per token that is -0.326 = -14 %, which is the #62e geometry lever measured
+a second way (62e's pairs read -0.447 ms per token end to end). llama.cpp's row is 0.642, so the
+ratio is 3.0 x, from 3.6 x.
+
+**The whole decode step, the 15 largest of 61 rows** (the table #19 and #62 reuse; `CROW_KPROF`
+totals 30.05 ms per token of the run's 33.58, the rest is host time and the two syncs per launch).
+
+| # | kernel | calls/token | ms/token | us/call | share | row |
+|---|---|---|---|---|---|---|
+| 1 | `stage_cold_ca[40x1]` | 48.0 | 11.468 | 238.9 | 38.2 % | cold staging (#19) |
+| 2 | `attn_sel_split[24x1]` | 12.0 | 2.480 | 206.7 | 8.3 % | attention |
+| 3 | `hc_down_inj[44x1]` | 96.0 | 1.522 | 15.9 | 5.1 % | hyper-connections |
+| 4 | `gemv_fp4_mma_g32[515x1]` | 36.0 | 1.174 | 32.6 | 3.9 % | GDN |
+| 5 | `rms_group[4x1]` | 100.0 | 1.004 | 10.0 | 3.3 % | hyper-connections |
+| 6 | `gemv_bf16_ws[1280x1]` | 97.0 | 0.991 | 10.2 | 3.3 % | hyper-connections |
+| 7 | `gemv_fp4_mma[20x10]` | 48.0 | 0.980 | 20.4 | 3.3 % | MoE |
+| 8 | `sh_gate_up_q[10x1]` | 48.0 | 0.962 | 20.0 | 3.2 % | shared expert |
+| 9 | `gemv_fp4_mma_d32[80x1]` | 36.0 | 0.841 | 23.4 | 2.8 % | GDN |
+| 10 | `gemv_bf16_w[31040x1]` | 1.0 | 0.762 | 774.3 | 2.5 % | head |
+| 11 | `mix_streams_q[10x1]` | 96.0 | 0.585 | 6.1 | 1.9 % | hyper-connections |
+| 12 | `gemv_fp4_mma[40x10]` | 48.0 | 0.569 | 11.8 | 1.9 % | MoE |
+| 13 | `router_top10[1x1]` | 48.0 | 0.557 | 11.6 | 1.9 % | MoE |
+| 14 | `gemv_bf16_w[1536x1]` | 12.0 | 0.543 | 45.3 | 1.8 % | attention |
+| 15 | `gemv_b[512x1]` | 48.0 | 0.510 | 10.6 | 1.7 % | MoE |
+
+**Rank 1 of the whole decode step is not attention and not GDN**: `stage_cold_ca`, the cold-expert
+staging of #19, is 11.47 ms per token at 48 calls (one per MoE layer), 38 % of the kprof total.
+The `[profile]` host row of the same runs splits the step as `moe` 16.92, `attn` 5.07, `gdn` 3.41,
+`hc` 2.14, `tail` 1.08, `head` 0.97, `ple` 0.14 ms per step.
+
+**Why `attn_sel_split` costs what it costs.** The kernel runs grid `(24 heads, 1 token, S splits)`
+at 256 threads, one block per query head and split; at 16k the selection is
+`sel_n` = 2048 + ((pos+1) mod 4) of 16,320 tokens, so each block walks `ceil(sel_n/S)` selected
+tokens. Sweeping `CROW_ATTN_SPLITS` (measurement only — the split count moves the merge order and
+the ids, #61e) gives, per attention layer per decode token:
+
+| `CROW_ATTN_SPLITS` | blocks (170 SMs) | selected tokens per block | us/call | model `8.6 + 0.776 x cnt` |
+|---|---|---|---|---|
+| 4 | 96 | 513 | 406.4 | 406.7 |
+| 8 (default) | 192 | 257 | 206.7 | 208.0 |
+| 16 | 384 | 129 | 108.6 | 108.7 |
+| 32 | 768 | 65 | 59.7 | 59.0 |
+
+The fit is better than 1.2 % at every point, and it is **flat in the block count** from 0.56 waves
+to 4.5 waves: 96 blocks on 170 SMs cost exactly twice what 192 blocks cost for exactly twice the
+per-block work. So the kernel is not tail-effect bound and not occupancy bound — the per-block
+serial walk over the selected list is the whole time. It is not bandwidth bound either: per
+attention layer per decode token the kernel REQUESTS 192 x 257 x 512 B = 25.26 MB of KV and touches
+2 x 2050 x 256 x 2 = 2.10 MB of UNIQUE KV (a 12.0 x re-read — exactly the GQA ratio, 24 query heads
+over 2 KV heads, one block per query head), which over 12 layers is 303 MB requested and 25.2 MB
+unique per decode token; at 201.7 us per layer that is 125 GB/s of requests and 10.4 GB/s of unique
+bytes against this card's 1,792 GB/s, 7.0 % and 0.58 % of peak. Nor compute bound: 50.4 MFLOP per
+layer in 201.7 us is 0.25 TFLOP/s.
+
+What the time was, then: **0.776 us per selected token per block, about 2,250 clocks at the
+2.9 GHz the chain's machine blocks record, for 512 e4m3 BYTE decodes** (256 K + 256 V) plus 512 B
+of KV and 512 fma. `dec_e4m3` (`kernels.rs:52`) is two `ldexpf`, a float divide and three branches
+per byte, and `attn_sel_split` called it straight through `kv_load` — while the NON-split decode
+kernel `attn_sel_s8l` and the prefill path have decoded through a shared 256-entry table since #10.
+That is the one byte-identical lever this decomposition names.
+
+**What the other engines do (source read, 2026-09-18).** llama.cpp does **not** use
+`flash_attn_ext_vec` at this shape: `fattn.cu:617` excludes the vec kernel when
+`gqa_ratio > 4 && K->ne[1] >= 8192`, so at GQA 12 and 16,320 KV it picks the MMA kernel, and
+`fattn.cu:242` sets `ncols2 = 8` there — ONE CTA covers 8 query heads of a KV head, so llama.cpp
+re-reads the KV tile `ceil(12/8)` = **2 x** per token where crow re-reads it **12 x**. Its config
+(`fattn-mma-f16.cuh:70`) is 128 threads, `nbatch_fa` = 64 KV rows per iteration, `nstages` = 2
+(cp.async double-buffered K and V in shared memory), `Q_in_reg`, stream-k over
+`ceil(16320/64)` = 255 KV tiles. The vec kernel it would use at lower GQA is 128 threads with
+128-token KV tiles straight into registers and a split count taken from
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor` and then raised until wave efficiency reaches 95 %
+(`fattn-common.cuh:1126-1199`), with `flash_attn_combine_results` as the reduce. There is no
+fp8_e4m3 KV in ggml-cuda at all (F16 2 B, Q8_0 1.0625 B per element). FlashInfer makes the GQA
+group a **block** dimension (`decode.cuh:685`, `bdy = GROUP_SIZE`, grid `(num_chunks, num_kv_heads)`),
+so a KV row is read exactly once for the whole group, with 16-byte vectorised loads and a 256-token
+floor on the split size (`decode.cuh:723`). vLLM's PagedAttention V2 (`PARTITION_SIZE` 512, grid
+`(head, seq, partition)`) is essentially crow's current geometry — and it has been deleted from
+vLLM main. NVIDIA's own guidance is "at least roughly 4 x more thread blocks than SMs" and "only
+launches with fewer than 300 thread blocks should be examined for tail effects".
+
+The consequence for this issue, in bytes: at 0.866 ms llama.cpp moves about 401 MB of unique KV per
+decode token over the 12 layers if its KV is f16 (dense, 2 x 16,320 x 256 x 2 B x 12; Q8_0 would be
+213 MB and the #59 csv does not name the type), crow moves **25.2 MB** — the sparse selection already
+buys a 16 x cut in KV bytes, and crow was still 5.4 x slower. **The byte count is not the lever
+here; the cost per byte is.** The two byte-level levers the other engines hold and crow does not —
+one CTA per GQA group (llama.cpp `ncols2 = 8`, FlashInfer `bdy = GROUP_SIZE`) and 16-byte
+vectorised KV loads — remain open, and both change the reduction order or the lane mapping, so both
+need the ten-task quality gate, not only parity.
 
 ---
 
