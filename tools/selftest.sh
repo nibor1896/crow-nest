@@ -20,12 +20,16 @@
 #                              at the 531 to 537 MB/s of SHA256SUMS.log, 2026-09-11).
 #   3. decode selftest         the engine's layer outputs against the goldens, max_abs per layer
 #                              against the manifest's gate (layer 0: 0.125, the layercheck gate of
-#                              record since 2026-09-04). The mode's exit code is this item.
+#                              record since 2026-09-04; layer 3: 0.625, set 2026-09-18 with the
+#                              attention sub-block check of issue #69). An output that is
+#                              IDENTICALLY ZERO fails before the gate is consulted, whatever
+#                              max_abs says. The mode's exit code is this item.
 #
 # Provenance of the numbers this script does NOT hard-code: the gate lives in
 # `selftest/manifest.json` next to the goldens it gates, because the manifest travels with the
 # package and this script does not. Values of record on the -M container (RTX 5090 / Arch Linux /
-# driver 610.57.04 / CUDA 13.3.1, 2026-09-18): layer 0 max_abs 9.184837e-2 against the gate 0.125.
+# driver 610.57.04 / CUDA 13.3.1, 2026-09-18): layer 0 max_abs 9.184837e-2 against the gate 0.125,
+# layer 3 max_abs 4.473233e-1 against the gate 0.625, PASS 2 of 2 in both arms.
 #
 # Environment: CROW_CNQ / CROW_HOTSETS override the container and the hot-set manifest (the
 # package's own files are the default). CUDA_LIB names the CUDA runtime directory (default

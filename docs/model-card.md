@@ -44,11 +44,13 @@ Qwen3.8-Flash-Next quantized to CNQ4.5-M: one NVFP4 container at 4.5 bpw with a 
 | `hotsets-M-longctx2100-n160.json` | 83,705 B | `4a408907d553518ee4421e59eae09e243db82ac0cd677557596dfdbaa4b099dc` | hot-set manifest the engine loads so adapted experts stay resident; this is the manifest to use, not a sidecar derived from the container name (engine issue #49) |
 | `selftest/layer0-input.f32` | 327,680 B | `65907fe567547704dd644eea9212c4c71b0b02f2fd954f23ecd28c7f5804d974` | self-test input: the `[8][10240]` f32 layer-0 activation the golden below belongs to (see Self-test) |
 | `selftest/layer0-golden-output.f32` | 327,680 B | `e98292a0413d7aaf6825ab23e80cfae52f2424b5524f835624e9d76e90d7c705` | self-test golden: the `[8][10240]` f32 output of the UNQUANTIZED layer 0 on that input |
-| `selftest/manifest.json` | 3,638 B | `9fb2d5d5b270d1976c17da5b63b4edae226a348611e6b651f4c8a8a732f13388` | the self-test's check list, its gate, the two sums above and the goldens' full provenance |
-| `SHA256SUMS` | 589 B | n/a, it carries the sums | the six sums above; the first three were each read twice when the package was formed (F1, engine issue #57), the self-test lines were added with the self-test (F5, engine issue #64) |
+| `selftest/layer3-attn-input.f32` | 81,920 B | `d2662da06b578f7c2d8a466ea5a1d74b8b13afedd271b25c16bf0237c621cbeb` | self-test input: the `[8][2560]` f32 activation the layer-`3` attention mixer sees (engine issue #69, 2026-09-18) |
+| `selftest/layer3-attn-output.f32` | 81,920 B | `76c64e1747466719dd852e6178f03910b4b45f070b9b5d29bf834af40b2fbd69` | self-test golden: the `[8][2560]` f32 output of the UNQUANTIZED layer-`3` attention mixer on that input (engine issue #69, 2026-09-18) |
+| `selftest/manifest.json` | 6,224 B | `7e9569e6dd3e8f12bc70593386588ffa09081f9f5b54ba61ef824c00c190bee8` | the self-test's check list, its two gates, the four sums above and the goldens' full provenance |
+| `SHA256SUMS` | 784 B | n/a, it carries the sums | the eight sums above; the first three were each read twice when the package was formed (F1, engine issue #57), the layer-`0` self-test lines were added with the self-test (F5, engine issue #64) and the layer-`3` lines with the second check (engine issue #69, 2026-09-18) |
 | `LICENSE` | 3,235 B | `a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08` | Qwen Community License 1.0, verbatim from the upstream revision |
 
-- Verify the download with the first command below, in the package directory; it must report 6 of 6 OK and covers the container, the sidecar, the hot-set manifest and the three self-test files. The second command checks the self-test files alone, which costs no read of the 105 GB container.
+- Verify the download with the first command below, in the package directory; it must report 8 of 8 OK and covers the container, the sidecar, the hot-set manifest and the five self-test files (2026-09-18). The second command checks the self-test files alone, which costs no read of the 105 GB container.
 
 ```
 sha256sum -c SHA256SUMS
@@ -192,17 +194,18 @@ The two arms run different weights, and every comparison names both: llama.cpp r
 
 ## Self-test
 
-This package verifies itself. `selftest/` ships a golden that the layer-wise oracle produced from the UNQUANTIZED originals, and the engine compares its own layer output against it — no original safetensors, no python, no oracle environment, no network. It is the one numeric check a download can actually run (engine issue #64, first run 2026-09-18).
+This package verifies itself. `selftest/` ships goldens that the layer-wise oracle produced from the UNQUANTIZED originals, and the engine compares its own layer outputs against them — no original safetensors, no python, no oracle environment, no network. It is the one numeric check a download can actually run (engine issue #64, first run 2026-09-18; the second check engine issue #69, 2026-09-18).
 
 | item | value |
 |---|---|
-| what runs | `decode selftest <golden-dir>` of the crow-nest engine: one container load and one layer, 32.0 s wall in total on 2026-09-18, of which the load is 23 s |
-| what is compared | the WHOLE text decoder layer `0` — hyper-connection mix, the GDN linear-attention mixer, the second mix, the `352`-expert MoE, both residual injections — on a fixed 8-token input, against the f32 reference of the unquantized weights |
-| the golden | produced 2026-09-02 by the engine repo's `oracle/` chain from `Qwen/Qwen3.8-Flash-Next` at the revision of record: transformers 5.16.1, torch 2.13.0+cpu, f32, real unquantized weights, 24 of 24 layer-`0` tensors suffix-matched. It is data, not code: the engine reads the two arrays and the manifest, and nothing else |
-| gate | `max_abs <= 0.125` and `NaN == 0`, the bound inclusive — the engine's `layercheck` gate of record since 2026-09-04, where `0.125` is the measured spread of genuine NVFP4 round-to-nearest noise on this golden |
-| measured, this package | `max_abs 9.184837e-2`, `rel_L2 1.3671e-2`, `NaN 0` — `73.5` percent of the gate — on 2026-09-18, RTX 5090, driver 610.57.04, CUDA 13.3.1, NVRTC 13.3.33, from a package directory holding nothing but the files in the table above |
+| what runs | `decode selftest <golden-dir>` of the crow-nest engine: one container load and two checks, 32.0 s wall in total on 2026-09-18, of which the load is 23 s |
+| what is compared, check 1 | the WHOLE text decoder layer `0` — hyper-connection mix, the GDN linear-attention mixer, the second mix, the `352`-expert MoE, both residual injections — on a fixed 8-token input, against the f32 reference of the unquantized weights |
+| what is compared, check 2 | the `self_attn` mixer of layer `3`, the first full-attention layer — q/k/v projections, the two head norms, rotary, the KV store, the sparse-attention indexer and its selection, the attention kernel, the sigmoid gate and `o_proj` — on a fixed 8-token input, against the same kind of f32 reference. Layer `0` is a linear-attention layer, so before this check no attention kernel was covered at all (2026-09-18) |
+| the goldens | produced 2026-09-02 by the engine repo's `oracle/` chain from `Qwen/Qwen3.8-Flash-Next` at the revision of record: transformers 5.16.1, torch 2.13.0+cpu, f32, real unquantized weights, 24 of 24 layer-`0` tensors and 9 of 9 layer-`3` `self_attn` tensors suffix-matched. They are data, not code: the engine reads the four arrays and the manifest, and nothing else |
+| gate | `max_abs <= 0.125` for layer `0` and `max_abs <= 0.625` for layer `3`, with `NaN == 0`, both bounds inclusive. `0.125` is the engine's `layercheck` gate of record since 2026-09-04, the measured spread of genuine NVFP4 round-to-nearest noise on that golden; `0.625` is `5x` that and was set on 2026-09-18 from the measured layer-`3` distribution, because the reference is f32 while the whole attention sub-block is NVFP4 at 4.5 bpw. An output that is identically zero fails whatever the gate says (2026-09-18) |
+| measured, this package | layer `0` `max_abs 9.184837e-2`, `rel_L2 1.3671e-2` — `73.5` percent of its gate — and layer `3` `max_abs 4.473233e-1`, `rel_L2 1.2821e-1`, correlation `0.99179` against the golden — `71.6` percent of its gate — at `NaN 0`, `PASS 2 of 2`, on 2026-09-18, RTX 5090, driver 610.57.04, CUDA 13.3.1, NVRTC 13.3.33, from a package directory holding nothing but the files in the table above |
 | positive control | `test ! -d models`: in a directory that holds the originals the self-test REFUSES, before the engine is even started, because such a run says nothing about a download. Both arms run on 2026-09-18 — refused with `models/` present, `ALL GREEN` without it, identical `max_abs` in the arm that was allowed |
-| what it does not cover | one layer on one 8-token input. It catches a container that was corrupted, truncated, converted with the wrong scales or loaded by a broken build; it is not the engine's full numeric contract, which is the byte-identical parity gate of the engine repo and needs that repo's reference dumps, not this package |
+| what it does not cover | two sub-blocks on one 8-token input each. It catches a container that was corrupted, truncated, converted with the wrong scales or loaded by a broken build; it is not the engine's full numeric contract, which is the byte-identical parity gate of the engine repo and needs that repo's reference dumps, not this package |
 
 - The engine repo's `tools/selftest.sh` runs all three items — the control, the sums and the engine — and exits non-zero on any of them:
 

@@ -3245,15 +3245,39 @@ impl Engine {
     /// DEBUG/layercheck helper: run ONLY the attention sub-block of layer `l`
     /// (q/k/v GEMVs → split → q_norm/k_norm → rotary → KV store → QSA select →
     /// attention → sigmoid gate → o_proj) on a host [T][H] `mixed` input,
-    /// returning the [T][H] o_proj output (the p7-golden contract).
+    /// returning the [T][H] o_proj output (the p7-golden contract). This is the
+    /// `attn_subblock` check of `decode selftest` and of `decode layercheck3`,
+    /// and it runs the PRODUCTION `attn_prompt` — the same kernels, buffers and
+    /// defaults a prefill chunk runs layer 3 with.
+    ///
+    /// #69 (2026-09-18): a caller that hands `mixed` over from the host skips
+    /// `hc_run`, and since #19g `hc_run`'s LAST launch is `mix_streams_q`, which
+    /// writes `mixed` AND the NVFP4 activation cascade `xq_m` that every FP4
+    /// projection of the sub-block reads (v, the QSA indexer qk — `attn_prompt`
+    /// itself only quantizes when CROW_QFUSE=0, exactly because the fused
+    /// producer is the default). Without this launch `xq_m` stayed all-zero on
+    /// the run of record, so v and qk came out zero, attention had nothing to
+    /// weight and the o_proj output was IDENTICALLY zero at max_abs = max|golden|
+    /// — a debug path reporting a number that says nothing. `quant_x_fp4` is the
+    /// documented bit-identical twin of the cascade `mix_streams_q` fuses (same
+    /// amax → ue4m3 ceiling → RNE nibble → residual per 16-wide sub-block), and
+    /// it is the launch `attn_prompt` makes itself when the fusion is off, so
+    /// the sub-block is fed what the production path feeds it either way.
     pub unsafe fn run_attn_subblock(&mut self, l: usize, x_host: &[f32], t: usize, pos_base: usize) -> Vec<f32> {
         assert!(is_attn(l), "layer {l} is not an attention layer");
         assert_eq!(x_host.len(), t * H, "attn subblock input must be [T][H]");
         cuda::to_f32_into(self.s.mixed, x_host);
         self.upload_chunk_scalars(t, pos_base, true, ScalarSet::Rows);
+        quant_x_now(&self.k, &self.p, t as u32, self.s.mixed, self.s.xq_m, self.p.n2560, self.p.n2560);
         self.attn_prompt(l, self.s.mixed, t, pos_base);
         cuda::sync();
-        cuda::dtoh(self.s.ay, t * H)
+        let out = cuda::dtoh(self.s.ay, t * H);
+        // the failure mode of #69 read as a measurement: say it out loud here too,
+        // where the sub-block is run by hand (`decode selftest` fails on it).
+        if out.iter().all(|&v| v == 0.0) {
+            tracing::warn!(target: "attn", "[attn {l}] sub-block output is IDENTICALLY ZERO ({} values) — that is a broken path, not a delta", out.len());
+        }
+        out
     }
 
     /// chunked prefill; appends state; returns the last position's greedy token.

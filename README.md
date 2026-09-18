@@ -222,7 +222,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 | `tools/` | Python guards and harness helpers, no GPU needed |
 | `decode_out/` | gate inputs only; measurement records are ignored (`.gitignore`) |
 | `oracle/` | the layer-wise reference against the unquantized originals; its output (`oracle/golden/`) is ignored |
-| `selftest/` | the package self-test's golden set, tracked: two `f32` arrays of 327,680 B each and the manifest that gates them (F5, issue #64, 2026-09-18). These are the files the quant package ships beside the container, and `tools/selftest.sh` is what runs them |
+| `selftest/` | the package self-test's golden set, tracked: the layer-0 pair (two `f32` arrays of 327,680 B each, F5, issue #64, 2026-09-18), the layer-3 attention pair (81,920 B each, issue #69, 2026-09-18) and the manifest that gates them, 825,424 B in all. These are the files the quant package ships beside the container, and `tools/selftest.sh` is what runs them |
 | `probes/` | the hardware probes the plan stands on |
 | `models/`, `converter/*.cnq` | model weights and containers, ignored, never committed |
 
@@ -240,7 +240,8 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 | parity, short and long form | every logit row byte-identical against the reference build, run twice, last green 2026-09-10 | `engine/README.md`, section "Parity gate" |
 | parity, 1024 rows | the largest chunk form in production is the one gated (since 2026-09-05, issue #22) | `CROW_CHUNK=1024 decode parity decode_out/t3-debug-1024-ids.json <dir>` |
 | layercheck | `max_abs` at or below 0.125 on the layer 0 golden (gate hard since 2026-09-04); the Linux reading is 9.184837e-2 on the `-M` container, 2026-09-18 | `decode layercheck` |
-| package self-test, no originals | the same golden and the same 0.125 bound, from a package directory that holds no `models/` — the check a downloader can run. `ALL GREEN` from a hard-linked package copy outside the repository on 2026-09-18 at `max_abs` 9.184837e-2, `rel_L2` 1.3671e-2, NaN 0; the `test ! -d models` control refused the same copy the moment a `models/` directory existed, before the engine was started (issue #64) | `tools/selftest.sh <package-dir>` |
+| layercheck3 | `max_abs` at or below 0.625 and `corr` above 0.99 on the layer-3 attention golden (gate set 2026-09-18, issue #69); the Linux reading is 0.4473 at `corr` 0.99179 on the `-M` container, 2026-09-18 | `decode layercheck3` |
+| package self-test, no originals | the two goldens above and their two bounds, from a package directory that holds no `models/` — the check a downloader can run. `PASS 2 of 2`, `ALL GREEN`, from a hard-linked package copy outside the repository on 2026-09-18 at `max_abs` 9.184837e-2 / `rel_L2` 1.3671e-2 for layer 0 and 4.473233e-1 / 1.2821e-1 for the layer-3 attention sub-block, NaN 0; an output that is identically zero fails whatever the gate says; the `test ! -d models` control refused the same copy the moment a `models/` directory existed, before the engine was started (issues #64 and #69) | `tools/selftest.sh <package-dir>` |
 | ten-task quality | no degeneration, Pass at least the reference minus one, Fail at most the reference | `parity phase 0 <crow or llama> decode_out/ten-tasks.json <outprefix>` |
 | env documentation | code set equals doc set | `python tools/check_env_docs.py` |
 | oracle transport | the harness sets `PYTHONIOENCODING=utf-8` and `PYTHONUTF8=1` on the Python oracle process, not the shell, since 2026-09-11 (issue #34) | `parity phase 0 crow decode_out/c1-tasks/t4-prose.json <prefix>` in a shell without both variables |

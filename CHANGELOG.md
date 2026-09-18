@@ -6,7 +6,7 @@
 
 ## v0.3.1 (unreleased) — the reasoning filter, and what the 170k session really was
 
-- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Twelve issues so far: `#67` (the
+- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Fourteen issues so far: `#67` (the
   reasoning filter, `667b68b`), the engine side of `#68` (the long-context measurement, `f14e557`),
   `#49` (the ragged hot-set sidecar, `0adbe6a`), `#60` (the `parity` record header per arm, and
   the last two bins that hard-coded the pre-`#51` container, `784bd64`), `#54` (the gone-client
@@ -19,11 +19,70 @@
   `docs/measurement-coverage.md`, `77c4d40` — no engine code), `#61` (the decode kernel
   decomposition at the Linux operating point, and the opt-in `CROW_ATTN_LUT` lever it named) and
   `#62` (the GDN row taken apart per kernel, 2026-09-18 — no engine code) and `#19` (the
-  cold-expert staging row taken apart, and the opt-in `CROW_STAGE_PAR` lever it named, 2026-09-18).
+  cold-expert staging row taken apart, and the opt-in `CROW_STAGE_PAR` lever it named, 2026-09-18)
+  and `#69` (the layer-3 sub-block check that F5 found returning zeros, repaired and added to the
+  package self-test, 2026-09-18).
   The machine is the second environment block of `docs/system-landscape.md` unless a row names another one.
 - The crate version field stays `0.1.0`, as it has for every release: this file is the record.
 
 ### Fixed
+
+- **`decode layercheck3` returned an ALL-ZERO `o_proj` and it read as a measurement** (`#69`,
+  found by F5 on 2026-09-18, fixed the same day). On the `-M` container the layer-3
+  full-attention sub-block check printed `max_abs` 5.2512 and `mean_abs` 0.5188 — exactly
+  `max|golden|` and `mean|golden|` of `oracle/golden/layer3-attn-output.f32` — at `rel_L2`
+  1.0000, `corr` 0.00000 and NaN 0. Those are the numbers a zero output produces, and nothing
+  about the engine was measured by them, which is why F5 shipped the package self-test with one
+  check instead of two.
+
+  **The root cause is one missing launch, and it was introduced by a default, not by a kernel.**
+  `Engine::run_attn_subblock` uploads the golden `mixed` row set from the host and calls the
+  production `attn_prompt` — the same kernels, buffers and splits a prefill chunk runs layer 3
+  with. What it skips by entering there is `hc_run`, and since `#19g` (2026-09-13, `CROW_QFUSE`
+  default on) `hc_run`'s last launch is `mix_streams_q`, which writes `mixed` **and** the NVFP4
+  activation cascade `xq_m`. Under `CROW_MMA=1` — the configuration of record, the one
+  `tools/gate-linux.sh` and `tools/selftest.sh` set — the v projection and the QSA indexer read
+  `xq_m` and nothing else; `attn_prompt` quantizes `mixed` itself only when `CROW_QFUSE=0`,
+  precisely because the fused producer is the default. So `xq_m` stayed at its allocation zeros:
+  measured **0 of 34,560 bytes non-zero**, with `mixed` at `max_abs` 3.80 and the BF16 `q`
+  projection at 5.08 while `v` and the indexer `qk` were 0.0 — after which attention had nothing
+  to weight and the gate, `xq_v` and `o_proj` were zero in turn. The same binary with `CROW_MMA`
+  unset read `max_abs` 0.4475 / `corr` 0.99180 against the same golden at HEAD, which is what
+  pinned the cause to the cascade and not to the QSA ring, the selection, the `#61` split or the
+  kernels.
+
+  **The fix** is that launch: `run_attn_subblock` emits `quant_x_fp4` into `xq_m` right after the
+  upload — the documented bit-identical twin of the cascade `mix_streams_q` fuses (same amax →
+  ue4m3 ceiling → RNE nibble → residual per 16-wide sub-block) and the launch `attn_prompt` makes
+  itself when the fusion is off, so the sub-block is fed what the production path feeds it under
+  either default. **Measured 2026-09-18** (RTX 5090 / Arch Linux / driver 610.57.04 / CUDA 13.3.1
+  / NVRTC 13.3.33): `decode layercheck3` reads `max_abs` **0.4473**, `rel_L2` **0.1282**, `corr`
+  **0.99179**, NaN 0, and the stepwise repeat (one token at a time, advancing position) reads the
+  same two numbers, which is the batched == stepped pin.
+
+  **So the package self-test ships two checks now** (`selftest/manifest.json`, `+ layer3-attn-
+  input.f32` and `layer3-attn-output.f32`, 81,920 B each; `selftest/` is 825,424 B = 0.79 MiB
+  against the issue's 100 MB bound, and the four sums are in `SHA256SUMS` with a dated block in
+  `SHA256SUMS.log`). Layer 0 is a GDN layer, so until now no attention kernel of the 12
+  full-attention layers was under the package self-test at all. The layer-3 gate is **0.625**,
+  read off the measured distribution and not carried over from layer 0: `|err|` p50 0.0550, p90
+  0.1391, p99 0.2355, p999 0.3133, max 0.4473 over 20,480 values, against a reference that is f32
+  where the whole sub-block is NVFP4 at 4.5 bpw — the p16 chain measured this very golden at
+  `max_abs` 0.582 with the q and k projections FP4 too (this container keeps them BF16). 0.625 =
+  5 × the layer-0 gate sits just above that mark and carries the same headroom the layer-0 gate
+  carries: 71.6 percent of the gate measured, against layer 0's 73.5. Both arms are ALL GREEN
+  **PASS 2 of 2** on 2026-09-18 — from the repository with `--with-originals` (27.1 s) and from
+  `/home/nibor1896/pkgtest-69`, a hard-linked package copy outside the repository with no
+  `models/` (32.0 s) — at identical numbers, and the control still fires the moment a `models/`
+  directory exists.
+
+  **And the failure mode itself is now a named refusal.** `decode selftest` fails a check whose
+  engine output is IDENTICALLY ZERO before it consults the gate, printing `output is identically
+  zero`: zeros against a golden report the golden's own numbers back (`max_abs` = `max|golden|`,
+  `rel_L2` exactly 1, `corr` exactly 0) and on a gate wide enough they would PASS. Two unit tests
+  pin it and the shipped manifest's two checks with no GPU and no package, so
+  `tools/gate-linux.sh` `TESTS` goes **200 → 202** (113 lib + 78 serve + 6 parity + 5 decode),
+  clippy unchanged at 1421.
 
 - **The ten-task harness lost a whole phase to one python child that died with an EMPTY stderr**
   (`#65`, three occurrences — chains 19f and 19g on 2026-09-13 and the 62b pairs preflight, fixed
@@ -486,7 +545,9 @@
   which are exactly `max|golden|` and `mean|golden|` of that file, at `rel_L2` 1.0000 and `corr`
   0.00000, NaN 0, measured 2026-09-18. The debug path is stale and would gate nothing about the
   quant, and the production attention path is under the parity contract instead, where the logits
-  are byte-identical. It owes its own issue.
+  are byte-identical. It owes its own issue. — That issue is `#69`, opened and closed out the same
+  day: the path was one missing cascade launch, and the layer-3 check ships (see the first item of
+  this section).
 
 - **The model card is tracked, and its dates are back** (`#64`, 2026-09-18). `docs/model-card.md`
   is the Hugging Face card of record and the byte source of that repository's `README.md`; it

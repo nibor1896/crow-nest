@@ -504,6 +504,21 @@ fn main() {
                     sum_abs / nf
                 );
                 println!("layercheck3: p16 FP4 mark for this golden: rel_L2 0.165, max_abs 0.582");
+                // the |error| distribution the layer-3 gate is read off (#69): a gate
+                // wants the SHAPE of the noise, not only its worst element
+                let mut errs: Vec<f32> = (0..n).map(|i| (out[i] - g[i]).abs()).collect();
+                errs.sort_by(f32::total_cmp);
+                let q = |f: f64| errs[((n - 1) as f64 * f) as usize];
+                println!(
+                    "layercheck3: |err| p50={:.4} p90={:.4} p99={:.4} p999={:.4} max={:.4} over {n} values",
+                    q(0.50), q(0.90), q(0.99), q(0.999), errs[n - 1]
+                );
+                // #69: an identically-zero output is a BROKEN PATH, never a delta —
+                // the shape this mode returned before the cascade fix, at a max_abs
+                // that read as max|golden| and a corr of exactly 0
+                if identically_zero(&out) {
+                    println!("layercheck3: FAIL — output is identically zero ({n} values); the numbers above measure nothing");
+                }
 
                 // stepwise pass: the same 8 rows ONE token at a time with
                 // advancing pos (persistent KV + QSA state, single-row GEMV
@@ -613,13 +628,19 @@ fn main() {
                         c.name, out.len(), g.len()
                     );
                     let (max_abs, rel, nan) = compare_golden(&out, &g);
-                    let ok = check_passes(max_abs, nan, c.gate);
+                    // #69: an engine output that is identically zero fails BEFORE the
+                    // gate and says why. Zeros against a golden read as max|golden| /
+                    // rel_L2 1.0 — a number, and on a loose gate a passing one — which
+                    // is how a dead debug path stayed invisible for sixteen days.
+                    let zero = identically_zero(&out);
+                    let ok = !zero && check_passes(max_abs, nan, c.gate);
                     if ok {
                         pass += 1;
                     }
                     println!(
                         "selftest: layer {:>2} {:<14} max_abs {max_abs:.6e}  rel_L2 {rel:.4e}  NaN {nan}  gate {:.3}  {}",
-                        c.layer, c.kind, c.gate, if ok { "PASS" } else { "FAIL" }
+                        c.layer, c.kind, c.gate,
+                        if ok { "PASS" } else if zero { "FAIL  output is identically zero" } else { "FAIL" }
                     );
                 }
                 let n = checks.len();
@@ -756,6 +777,18 @@ fn check_passes(max_abs: f32, nan: usize, gate: f32) -> bool {
     nan == 0 && max_abs.is_finite() && max_abs <= gate
 }
 
+/// #69 (2026-09-18): is this engine output identically zero? A path that computes
+/// nothing returns zeros, and zeros against a golden are not a small delta but the
+/// golden itself: `max_abs` becomes `max|golden|`, `rel_L2` becomes exactly 1 and the
+/// correlation exactly 0. On a gate loose enough it would even PASS. So it is a FAIL
+/// of its own, named, before the gate is consulted — the failure mode `layercheck3`
+/// reported as a measurement from 2026-09-02 to 2026-09-18 may never read as a number
+/// again. An empty output is not "zero": it is a shape error, and the length assert
+/// above catches it.
+fn identically_zero(out: &[f32]) -> bool {
+    !out.is_empty() && out.iter().all(|&v| v == 0.0)
+}
+
 #[cfg(test)]
 mod selftest_contract {
     use super::*;
@@ -820,6 +853,59 @@ mod selftest_contract {
         let (max_abs, rel, nan) = compare_golden(&[1.0f32, 2.5, 3.0], &gold);
         assert_eq!((max_abs, nan), (0.5, 0));
         assert!((rel - 0.5 / 14f64.sqrt()).abs() < 1e-12, "rel_L2 = |e|/|g|");
+    }
+
+    /// #69 (2026-09-18): the manifest this repository SHIPS, not a fixture — the
+    /// second check is the whole point of the ticket, and a manifest that lost it
+    /// (or that names a kind `decode selftest` does not implement) would ship a
+    /// self-test that proves less than the log claims.
+    #[test]
+    fn the_shipped_manifest_carries_both_checks_and_only_kinds_the_mode_implements() {
+        let checks = parse_manifest(include_str!("../../../selftest/manifest.json"))
+            .expect("selftest/manifest.json parses");
+        assert_eq!(checks.len(), 2, "the package ships TWO checks since #69");
+        assert_eq!(checks[0].name, "layer0");
+        assert_eq!((checks[0].layer, checks[0].kind.as_str()), (0, "decoder_layer"));
+        assert_eq!(checks[0].gate, 0.125, "the layer-0 gate of record since 2026-09-04");
+        assert_eq!(checks[1].name, "layer3-attn");
+        assert_eq!((checks[1].layer, checks[1].kind.as_str()), (3, "attn_subblock"));
+        assert_eq!((checks[1].t, checks[1].input_width, checks[1].golden_width), (8, 2560, 2560));
+        assert_eq!(checks[1].gate, 0.625, "the layer-3 gate of record since 2026-09-18");
+        for c in &checks {
+            assert!(
+                matches!(c.kind.as_str(), "decoder_layer" | "attn_subblock"),
+                "`{}` names kind `{}`, which the mode would panic on",
+                c.name, c.kind
+            );
+            assert!(c.t > 0 && c.input_width > 0 && c.golden_width > 0);
+            assert!(c.gate > 0.0 && c.gate.is_finite(), "a gate of 0 fails every check");
+        }
+    }
+
+    /// #69: the zero-output refusal. The engine output of record for the layer-3
+    /// sub-block was ALL ZERO, and zeros against a golden are the golden's own
+    /// numbers back: this is the test that keeps that from reading as a delta.
+    #[test]
+    fn an_identically_zero_output_fails_on_its_own_however_loose_the_gate_is() {
+        let gold = [1.0f32, -2.5, 3.0, 0.5];
+        let zeros = [0.0f32; 4];
+        let (max_abs, rel, nan) = compare_golden(&zeros, &gold);
+        // what the caller would otherwise print: max|golden|, rel_L2 exactly 1, no NaN
+        assert_eq!((max_abs, nan), (3.0, 0));
+        assert!((rel - 1.0).abs() < 1e-12, "rel_L2 of a zero output is exactly 1");
+        // and on a gate wide enough it would PASS the gate — which is why the
+        // detector sits BEFORE it
+        assert!(check_passes(max_abs, nan, 4.0));
+        assert!(identically_zero(&zeros));
+
+        // a real output is not zero, and one zero element does not make it zero
+        assert!(!identically_zero(&[0.0, 0.0, 1e-30, 0.0]));
+        assert!(!identically_zero(&[-0.0, 0.0, f32::NAN]));
+        // the measured layer-3 output of record (#69, after the cascade fix) is not zero
+        assert!(!identically_zero(&[0.0f32, 0.4473, 0.0]));
+        // an EMPTY output is a shape error, not a zero output: the length assert in
+        // the mode catches it, and calling it "identically zero" would mislabel it
+        assert!(!identically_zero(&[]));
     }
 
     #[test]

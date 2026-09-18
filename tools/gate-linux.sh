@@ -129,6 +129,18 @@
 #                              loose ceilings, as a regression guard against a call site
 #                              that starts BLOCKING) - so
 #                              200 = 113 lib + 78 serve + 6 parity + 3 decode.
+#                              #69 (2026-09-18) added two more in `bin/decode.rs`, both
+#                              without a GPU and without a package: the manifest this
+#                              repository SHIPS parses into its TWO checks with the kinds
+#                              `decode selftest` implements and the two gates of record
+#                              (0.125 layer 0, 0.625 layer 3), and the zero-output refusal -
+#                              an identically zero engine output is a FAIL of its own before
+#                              the gate is consulted, because zeros against a golden report
+#                              the golden's own numbers back (max_abs = max|golden|, rel_L2
+#                              exactly 1, corr exactly 0) and would PASS a gate wide enough,
+#                              which is how a dead debug path read as a measurement for
+#                              sixteen days - so 202 = 113 lib + 78 serve + 6 parity +
+#                              5 decode.
 #   clippy 1421                #13 (2026-09-18) LOWERED the count of record by one, and by
 #                              exactly one: `warning: redundant reference in `eprintln!`
 #                              argument` at `gen.rs:2890` is gone because that line is a
@@ -159,7 +171,7 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="200"
+TESTS="202"
 CLIPPY="1421"
 
 red=0

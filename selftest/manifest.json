@@ -1,6 +1,6 @@
 {
   "what": "crow-nest package self-test: the engine's own layer outputs against goldens produced from the UNQUANTIZED originals",
-  "task": "F5, crow-nest issue #64, parent #1",
+  "task": "F5, crow-nest issue #64, parent #1; the layer-3 check added by issue #69",
   "formed": "2026-09-18",
   "why": "A downloader has the container, not the originals. These goldens let the engine alone say whether the quant it just loaded still computes what the unquantized model computes: no models/, no oracle venv, no torch, no network.",
   "run": [
@@ -8,20 +8,24 @@
     "CROW_CNQ=<container> CROW_HOTSETS=<hot sets> decode selftest <this-directory>"
   ],
   "gate": {
-    "rule": "max_abs <= max_abs_gate per check, and NaN == 0; the gate is inclusive",
+    "rule": "max_abs <= max_abs_gate per check, and NaN == 0; the gate is inclusive. An output that is IDENTICALLY ZERO fails before the gate is consulted, whatever max_abs says (#69)",
     "layer0_gate": 0.125,
     "layer0_gate_since": "2026-09-04",
-    "basis": "0.125 is the p10 measured max_abs of genuine NVFP4 round-to-nearest noise on this golden; it is the engine's layercheck gate of record, unchanged since the date above"
+    "basis": "0.125 is the p10 measured max_abs of genuine NVFP4 round-to-nearest noise on this golden; it is the engine's layercheck gate of record, unchanged since the date above",
+    "layer3_gate": 0.625,
+    "layer3_gate_since": "2026-09-18",
+    "layer3_basis": "the layer-3 sub-block is measured at max_abs 0.4473 (|err| p50 0.0550, p90 0.1391, p99 0.2355, p999 0.3133 over 20,480 values), so 0.625 = 5 x the layer-0 gate carries the SAME headroom the layer-0 gate carries (measured at 71.6 percent of the gate, layer 0 at 73.5 percent). It is looser than 0.125 on purpose and for one reason: the oracle is f32 and the whole attention sub-block here is NVFP4 at 4.5 bpw, which the p16 chain measured against this very golden at max_abs 0.582 / rel_L2 0.165 when the q and k projections are FP4 too (this container keeps them BF16, hence 0.4473). The gate sits just above that mark, so a container with a different keep policy is still gated, and 8.4x below the 5.2512 an all-zero output reports"
   },
   "provenance": {
-    "producer": "oracle/ref_layer0_stages.py and the p10 chain that wrote oracle/golden/",
+    "producer": "oracle/ref_layer0_stages.py and the p10 chain that wrote oracle/golden/ (layer 0); the p7 chain that wrote oracle/golden/layer3-attn-* (layer 3)",
     "produced": "2026-09-02",
     "transformers": "5.16.1",
     "torch": "2.13.0+cpu",
     "config_source": "models/Qwen3.8-Flash-Next-original",
-    "weights": "model.language_model.layers.0.* (24 tensors, suffix-matched 24/24), f32, REAL unquantized weights",
+    "weights": "layer 0: model.language_model.layers.0.* (24 tensors, suffix-matched 24/24); layer 3: model.language_model.layers.3.self_attn.* (9 tensors, suffix-matched), f32, REAL unquantized weights in both",
     "dtype": "float32, little-endian, no header",
     "note": "the model expands the hidden state via hidden.repeat(1, 1, hc_count=4) before the layer loop and the mixer collapses it after, so the layer-0 INPUT is already the [T][10240] hyper-connection stream, not [T][2560]; layer 0 has ple=None (PLE lives on layer index 1)",
+    "note_layer3": "layer 3 is the first full_attention layer; the golden is the self_attn MIXER sub-block alone (q/k/v projections, q_norm/k_norm, rotary, the QSA indexer, attention, the sigmoid gate, o_proj) and its input is the [T][2560] `mixed` stream the hyper-connection block hands the mixer, not the [T][10240] layer input. attn_implementation eager, seed 20260902. At T=8 the indexer sees 2 complete blocks against block_topk 512, so the reference path is dense BY CONSTRUCTION - the same regime the engine runs at these positions",
     "copied_from": "the goldens of record in the Windows working tree (oracle/golden/ is gitignored); the bytes here are byte-identical to them and carry their sha256 below"
   },
   "files": {
@@ -32,6 +36,14 @@
     "layer0-golden-output.f32": {
       "bytes": 327680,
       "sha256": "e98292a0413d7aaf6825ab23e80cfae52f2424b5524f835624e9d76e90d7c705"
+    },
+    "layer3-attn-input.f32": {
+      "bytes": 81920,
+      "sha256": "d2662da06b578f7c2d8a466ea5a1d74b8b13afedd271b25c16bf0237c621cbeb"
+    },
+    "layer3-attn-output.f32": {
+      "bytes": 81920,
+      "sha256": "76c64e1747466719dd852e6178f03910b4b45f070b9b5d29bf834af40b2fbd69"
     }
   },
   "checks": [
@@ -47,9 +59,19 @@
       "max_abs_gate": 0.125,
       "what": "the WHOLE text decoder layer 0 (hyper-connection mix, GDN linear-attention mixer, the second hyper-connection mix, the 352-expert MoE, both residual injections) on the deterministic 8-token input above",
       "measured": "max_abs 9.184837e-2, rel_L2 1.3671e-2, NaN 0 on Qwen3.8-Flash-Next-CNQ4.5-M (RTX 5090 / Arch Linux / driver 610.57.04 / CUDA 13.3.1 / NVRTC 13.3.33), 2026-09-18 — 73.5 percent of the gate. `decode layercheck` against the same golden in oracle/golden/ prints the same max_abs to all six digits, which is what says this shipped copy is the golden of record and not a lookalike."
+    },
+    {
+      "name": "layer3-attn",
+      "layer": 3,
+      "kind": "attn_subblock",
+      "t": 8,
+      "input": "layer3-attn-input.f32",
+      "input_width": 2560,
+      "golden": "layer3-attn-output.f32",
+      "golden_width": 2560,
+      "max_abs_gate": 0.625,
+      "what": "the self_attn sub-block of layer 3, the first FULL-ATTENTION layer: q/k/v projections, q_norm/k_norm, rotary, the KV store, the QSA indexer (qk projection, block pooling, scores, select) and the attention kernel, the sigmoid gate and o_proj — the production `attn_prompt`, the same kernels and buffers a prefill chunk runs layer 3 with. Layer 0 is a GDN (linear-attention) layer, so before this check no attention kernel of the 12 full-attention layers was under the package self-test at all.",
+      "measured": "max_abs 0.4473, rel_L2 0.1282, corr 0.99179, NaN 0 on the same machine and container, 2026-09-18 — 71.6 percent of the gate; |err| p50 0.0550, p90 0.1391, p99 0.2355, p999 0.3133 over 20,480 values. Before issue #69 this path returned an IDENTICALLY ZERO output (max_abs 5.2512 = max|golden|, rel_L2 1.0000, corr 0.00000), which is why the check ships only now."
     }
-  ],
-  "not_a_check": {
-    "layer3-attn": "oracle/golden/ also holds a layer-3 full-attention sub-block golden (the p7 chain). It is NOT shipped and NOT a check: on this container `decode layercheck3` returns an ALL-ZERO o_proj output (max_abs 5.2512 = max|golden|, mean_abs 0.5188 = mean|golden|, rel_L2 1.0000, corr 0.00000, NaN 0, measured 2026-09-18), so that debug path is stale and would gate nothing about the quant. The production attention path is under the parity contract instead (tools/gate-linux.sh, byte-identical logits)."
-  }
+  ]
 }

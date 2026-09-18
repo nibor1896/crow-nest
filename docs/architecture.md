@@ -3386,37 +3386,45 @@ payload that arrives whole through stdin).
 **Not covered.** A child that HANGS instead of exiting still hangs the phase: `wait_with_output`
 has no deadline and a timeout needs a waiting thread. No occurrence has had that shape.
 
-### 8.10 The package self-test (F5, issue #64, 2026-09-18)
+### 8.10 The package self-test (F5, issue #64, 2026-09-18; the layer-3 check, issue #69, 2026-09-18)
 
 Sections 5 and 8.7 gate the engine against its own references: the layer-wise oracle needs
 `models/` and a torch environment, and the parity forms need the reference dumps of this
 repository. **Neither can be run by somebody who downloaded the container.** 8.10 is the gate
 that can.
 
-**What travels.** `selftest/` is tracked and ships with the quant package:
-`layer0-input.f32` and `layer0-golden-output.f32` (327,680 B each, `[8][10240]` f32
-little-endian, no header) plus `manifest.json` — 658,998 B in total, 0.63 MiB against a 105 GB
-container. The two arrays are the p10 layer-0 golden the oracle produced from the UNQUANTIZED
-originals on 2026-09-02 (transformers 5.16.1, torch 2.13.0+cpu, f32, `model.language_model.
-layers.0.*` 24 of 24 tensors suffix-matched). They were copied byte-identically out of the
-Windows working tree, because `oracle/golden/` is gitignored and the originals' safetensors do
-not exist on this Linux box (`models/Qwen3.8-Flash-Next-original` holds the config and the
-tokenizer, 23 MB, and no weights): the goldens could be SHIPPED here but not re-derived here,
-and their sha256 in `SHA256SUMS` plus `SHA256SUMS.log` is what carries that.
+**What travels.** `selftest/` is tracked and ships with the quant package: `layer0-input.f32`
+and `layer0-golden-output.f32` (327,680 B each, `[8][10240]` f32 little-endian, no header),
+`layer3-attn-input.f32` and `layer3-attn-output.f32` (81,920 B each, `[8][2560]`, added by #69 on
+2026-09-18) plus `manifest.json` — 825,424 B in total, 0.79 MiB against a 105 GB container. The
+four arrays are the p10 layer-0 golden and the p7 layer-3 attention golden the oracle produced
+from the UNQUANTIZED originals on 2026-09-02 (transformers 5.16.1, torch 2.13.0+cpu, f32,
+`model.language_model.layers.0.*` 24 of 24 tensors suffix-matched and
+`model.language_model.layers.3.self_attn.*` 9 of 9, eager attention, seed 20260902). They were
+copied byte-identically out of the Windows working tree, because `oracle/golden/` is gitignored
+and the originals' safetensors do not exist on this Linux box
+(`models/Qwen3.8-Flash-Next-original` holds the config and the tokenizer, 23 MB, and no weights):
+the goldens could be SHIPPED here but not re-derived here, and their sha256 in `SHA256SUMS` plus
+`SHA256SUMS.log` is what carries that.
 
 **What runs.** `decode selftest [<golden_dir>]` (`bin/decode.rs`). The manifest names a list of
 checks — layer, kind, `[T][width]` shapes, the file names and `max_abs_gate` per check — and the
 mode loads the engine ONCE, runs each check's sub-block on the golden input and prints one
 `max_abs` / `rel_L2` / NaN line per layer plus `PASS n of n checks`. Its EXIT CODE is the
-verdict, the only mode of that bin where that is true. Two `kind`s are implemented:
-`decoder_layer` (layer 0 through `Engine::run_layer0_with_stage_dumps`, the same call
-`layercheck` makes) and `attn_subblock`. Every field of a check is required — a manifest that
-left `max_abs_gate` out would otherwise read as a gate of 0 — and a golden whose byte length
-does not match its declared shape is refused BEFORE the compare, because a truncated download
-read as a measurement would report a delta against the wrong rows. Three unit tests in
-`bin/decode.rs` pin the manifest contract, the inclusive bound with the NaN rule (`f32::max`
-drops a NaN operand, so only the count sees one) and the length refusal, with no GPU and no
-package.
+verdict, the only mode of that bin where that is true. Two `kind`s are implemented and both are
+checks since #69: `decoder_layer` (layer 0 through `Engine::run_layer0_with_stage_dumps`, the
+same call `layercheck` makes) and `attn_subblock` (layer 3 through `Engine::run_attn_subblock`,
+the same call `layercheck3` makes, which is the production `attn_prompt`). Every field of a
+check is required — a manifest that left `max_abs_gate` out would otherwise read as a gate of
+0 — and a golden whose byte length does not match its declared shape is refused BEFORE the
+compare, because a truncated download read as a measurement would report a delta against the
+wrong rows. **An engine output that is IDENTICALLY ZERO is a FAIL of its own, named, before the
+gate is consulted** (#69): zeros against a golden are not a small delta but the golden's own
+numbers back — `max_abs` becomes `max|golden|`, `rel_L2` exactly 1, `corr` exactly 0 — and on a
+gate wide enough they would PASS. Five unit tests in `bin/decode.rs` pin the manifest contract,
+the shipped manifest's two checks and their kinds, the inclusive bound with the NaN rule
+(`f32::max` drops a NaN operand, so only the count sees one), the length refusal and the
+zero-output refusal, with no GPU and no package.
 
 **The positive control.** `tools/selftest.sh [package-dir] [--with-originals] [--full]` is the
 wrapper, and `test ! -d models` in the package directory is the control the ticket names. It is
@@ -3434,24 +3442,48 @@ inside the memory-bounded scope, one engine at a time):
 | arm | package directory | `models/` | result |
 |---|---|---|---|
 | the gate of record, for comparison | the repository, from `engine/` | present | `decode layercheck` `max_abs` **9.184837e-2**, NaN 0 — the first Linux reading of this gate |
-| with the originals | the repository | present, `--with-originals` | ALL GREEN, `max_abs` **9.184837e-2**, `rel_L2` 1.3671e-2, NaN 0, 24.2 s |
-| WITHOUT the originals | `/home/nibor1896/pkgtest-f5`, hard links to the container, the sidecar, the hot sets and the golden set, outside the repository | absent | ALL GREEN, `max_abs` **9.184837e-2**, `rel_L2` 1.3671e-2, NaN 0, 32.0 s |
+| with the originals | the repository | present, `--with-originals` | ALL GREEN 2 of 2, layer 0 `max_abs` **9.184837e-2** / `rel_L2` 1.3671e-2, layer 3 `max_abs` **4.473233e-1** / `rel_L2` 1.2821e-1, NaN 0, 27.1 s (24.2 s at one check, 2026-09-18) |
+| WITHOUT the originals | `/home/nibor1896/pkgtest-69`, hard links to the container, the sidecar, the hot sets and the golden set, outside the repository | absent | ALL GREEN 2 of 2, the same two `max_abs` to all seven digits, NaN 0, 32.0 s |
 | the control | the same copy plus an empty `models/` | present | RED, exit 1, refused before the engine was started |
 
-- The two arms agree to all six digits, and both agree with `decode layercheck` against
-  `oracle/golden/`: the shipped copy is the golden of record and not a lookalike. `max_abs` is
-  73.5 percent of the 0.125 bound, which has been the hard gate since 2026-09-04.
-- The whole cost is one container load (23 s of the 32.0 s) — the layer itself is 8 tokens.
+- The two arms agree to all digits, and layer 0 agrees with `decode layercheck` against
+  `oracle/golden/` while layer 3 agrees with `decode layercheck3` against the same directory
+  (`max_abs` 0.4473, `rel_L2` 0.1282, `corr` 0.99179): the shipped copies are the goldens of
+  record and not lookalikes. Layer 0's `max_abs` is 73.5 percent of the 0.125 bound, hard since
+  2026-09-04; layer 3's is 71.6 percent of the 0.625 bound, set on 2026-09-18 by #69.
+- **Why the layer-3 gate is 0.625 and not 0.125.** The gate is read off the measured
+  distribution, not carried over: `|err|` p50 0.0550, p90 0.1391, p99 0.2355, p999 0.3133, max
+  0.4473 over the 20,480 values. The reference is f32 and the whole sub-block here is NVFP4 at
+  4.5 bpw — the p16 chain measured this very golden at `max_abs` 0.582 / `rel_L2` 0.165 with the
+  q and k projections FP4 too (this container keeps them BF16, which is the difference between
+  0.582 and 0.4473). 0.625 = 5 × the layer-0 gate sits just above that mark, carries the same
+  headroom the layer-0 gate carries (measured at 71.6 against 73.5 percent) and is 8.4× below the
+  5.2512 an all-zero output reports — and an all-zero output now fails on its own anyway.
+- The whole cost is one container load (23 s of the 32.0 s) — both checks are 8 tokens.
 
-**What it does not cover, and one finding.** One layer on one 8-token input. It catches a
-container that was corrupted, truncated, converted with the wrong scales or loaded by a broken
-build; it is not the numeric contract of 8.7. `oracle/golden/` also holds a layer-3
-full-attention sub-block golden (the p7 chain), and it is deliberately NOT shipped: on the `-M`
-container `decode layercheck3` returns an ALL-ZERO `o_proj` output — `max_abs` 5.2512 and
-`mean_abs` 0.5188, which are exactly `max|golden|` and `mean|golden|` of that file, at
-`rel_L2` 1.0000 and `corr` 0.00000, NaN 0, measured 2026-09-18. That debug path is stale and
-would gate nothing about the quant; the production attention path is under the parity contract
-instead, where the logits are byte-identical. It owes its own issue.
+**What it does not cover.** Two sub-blocks on one 8-token input: the whole of layer 0 (GDN, MoE,
+both hyper-connection mixes) and the attention mixer of layer 3. It catches a container that was
+corrupted, truncated, converted with the wrong scales or loaded by a broken build, and since #69
+the 12 full-attention layers are represented in it at all — layer 0 is a GDN layer, so until then
+no attention kernel was under the package self-test. It is still not the numeric contract of 8.7,
+which is the byte-identical parity gate.
+
+**The finding that made the layer-3 check possible (#69, 2026-09-18).** F5 measured `decode
+layercheck3` on the `-M` container at an ALL-ZERO `o_proj` output — `max_abs` 5.2512 and
+`mean_abs` 0.5188, exactly `max|golden|` and `mean|golden|` of that file, `rel_L2` 1.0000, `corr`
+0.00000, NaN 0 — and concluded the debug path was stale. It was, in one launch. `Engine::
+run_attn_subblock` hands `mixed` to the production `attn_prompt` from the host, which skips
+`hc_run` — and since #19g (2026-09-13) `hc_run`'s last launch is `mix_streams_q`, which writes
+`mixed` AND the NVFP4 activation cascade `xq_m` that the v projection and the QSA indexer read
+under `CROW_MMA=1` (`attn_prompt` quantizes `mixed` itself only when `CROW_QFUSE=0`, precisely
+because the fused producer is the default). So `xq_m` stayed at its allocation zeros — measured
+0 of 34,560 bytes non-zero — `q` was fine at `max_abs` 5.08 while `v` and the indexer `qk` were
+0.0, attention had nothing to weight, and gate, `xq_v` and `o_proj` were zero in turn. The fix is
+the missing launch: `run_attn_subblock` emits `quant_x_fp4` into `xq_m` after the upload, which
+is the documented bit-identical twin of the cascade `mix_streams_q` fuses and the launch
+`attn_prompt` makes itself when the fusion is off. With `CROW_MMA` unset the same golden read
+`max_abs` 0.4475 / `corr` 0.99180 all along, at HEAD and before the fix, which is what pinned the
+cause to the cascade and not to the kernels, the ring or the selection.
 
 ## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
 
