@@ -3650,7 +3650,14 @@ extern "C" __global__ void qsa_scores_par(const float* __restrict__ q, const flo
 // attn_sel_split: the selected list (<= 2051 tokens) split over gridDim.z
 // blocks per head; each writes an unnormalized partial (m, l, o[256]) in
 // flash-decoding form, attn_merge combines. grid (24, T, S), block 256.
-extern "C" __global__ void attn_sel_split(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+// LUT (#61f, 2026-09-18): 1 decodes the e4m3 KV bytes through a shared 256-entry
+// table (`kv_ld<1>`, lut[b] = dec_e4m3(b) - the same float, one shared load
+// instead of the branchy ldexpf/divide decode), exactly as attn_sel_s8l does
+// against attn_sel_s8. Only the LOAD changes: every fma chain, the e order, the
+// shuffle tree, the expf and the j order are those of LUT = 0, so the two
+// instantiations are bit-identical by construction.
+template <int LUT>
+__device__ __forceinline__ void attn_sel_split_body(const float* __restrict__ q, const unsigned char* __restrict__ kc,
                                           const unsigned char* __restrict__ vc, const int* __restrict__ sel,
                                           const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
                                           const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
@@ -3670,9 +3677,16 @@ extern "C" __global__ void attn_sel_split(const float* __restrict__ q, const uns
     const float* qt = q + ((size_t)t * 24 + head) * 256;
     __shared__ float p[2051];
     __shared__ float red[256];
+    __shared__ float lut[LUT ? 256 : 1];
     int mode = *mode_p;
     int warp = d >> 5, lane = d & 31;
     const float scale = 0.0625f;
+    if (LUT) {
+        // block is 256 threads (AHD), so one entry per thread; the barrier is the
+        // only instruction the LUT adds outside the loops
+        lut[d] = dec_e4m3((unsigned char)d);
+        __syncthreads();
+    }
     for (int j0 = 0; j0 < cnt; j0 += 8) {
         int j = j0 + warp;
         if (j < cnt) {
@@ -3681,7 +3695,7 @@ extern "C" __global__ void attn_sel_split(const float* __restrict__ q, const uns
             if (tok >= *tmax_p) tok = *tmax_p - 1;
             const unsigned char* kp = kc + (size_t)(kvh * *tmax_p + tok) * 256 * (mode ? 2 : 1);
             float acc = 0.0f;
-            for (int e = lane; e < 256; e += 32) acc += qt[e] * kv_load(kp, e, mode);
+            for (int e = lane; e < 256; e += 32) acc += qt[e] * kv_ld<LUT>(kp, e, mode, lut);
             for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
             if (lane == 0) p[j] = acc * scale;
         }
@@ -3712,11 +3726,25 @@ extern "C" __global__ void attn_sel_split(const float* __restrict__ q, const uns
         if (tok < 0) tok = 0;
         if (tok >= *tmax_p) tok = *tmax_p - 1;
         const unsigned char* vp = vc + (size_t)(kvh * *tmax_p + tok) * 256 * (mode ? 2 : 1);
-        o += p[j] * kv_load(vp, d, mode);
+        o += p[j] * kv_ld<LUT>(vp, d, mode, lut);
     }
     size_t pi = ((size_t)t * 24 + head) * S + split;
     part_o[pi * 256 + d] = o;
     if (d == 0) { part_ml[pi * 2] = (cnt > 0) ? mx : -3.0e38f; part_ml[pi * 2 + 1] = (cnt > 0) ? sum : 0.0f; }
+}
+extern "C" __global__ void attn_sel_split(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                          const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                          const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                          const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                          float* __restrict__ part_o, float* __restrict__ part_ml) {
+    attn_sel_split_body<0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, part_o, part_ml);
+}
+extern "C" __global__ void attn_sel_split_l(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                            const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                            const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                            const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                            float* __restrict__ part_o, float* __restrict__ part_ml) {
+    attn_sel_split_body<1>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, part_o, part_ml);
 }
 extern "C" __global__ void attn_merge(const float* __restrict__ part_o, const float* __restrict__ part_ml,
                                       float* __restrict__ out, const int* __restrict__ s_p) {
@@ -4517,7 +4545,7 @@ impl Kernels {
             "qsa_select", "qsa_select_fast", "qsa_select_par_h", "qsa_select_par_e", "router_top10", "gather_ple_fp4", "gate_dot", "gate_apply", "ple_conv",
             "ple_state_update", "ple_conv_step", "argmax_k", "sample_topk_part", "sample_k", "add_flat",
             "gemv_bf16_b", "gemv_bf16_w", "gemv_fp4_b1k", "hc_down_inj", "gemv_bf16_ws",
-            "gemm_fp4_dense", "gemm_bf16_dense", "gemm_fp4_dense_b", "gemm_bf16_dense_b", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
+            "gemm_fp4_dense", "gemm_bf16_dense", "gemm_fp4_dense_b", "gemm_bf16_dense_b", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_sel_split_l", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
             "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "gemv_fp4_mma_dg", "sh_gate_up_q", "gemv_fp4_mma_d32", "gemv_fp4_mma_g32", "attn_sel_r", "attn_sel_d8", "attn_sel_d9", "attn_sel_s", "attn_sel_s8", "attn_sel_s8l", "attn_sel_g",
             "gemm_fp4_f32x", "vit_ln", "vit_add_bias", "vit_pe_add", "vit_rope", "vit_attn", "gelu_erf", "gelu_tanh",
         ];

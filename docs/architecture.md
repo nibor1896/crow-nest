@@ -481,14 +481,15 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 - `CROW_QSA_PAR` is the decode path only: the prefill selection at `gen.rs:2231` keeps `qsa_select_fast` on `tb` blocks, one block per query.
 - `CROW_QSA_PAR` default since #61b (2026-09-12): the adjacent pair measured 23.9411 against 24.8735 ms per decode token with `0` (-3.75 percent, ids identical), and parity runs 8 of 8 forms including the teacher-forced 16,064 id PX form over the radix path (`decode_out/srv-61b.log`, RTX 5090); every process names its selection in one `[qsa]` boot line.
 - `CROW_ATTN_SPLITS` (4, 8, 16, 32) default 8 again since #61e (2026-09-13): the #61d flip to 32 (robin's performance-over-ids ruling of 2026-09-12, kept of record) was ROLLED BACK one day later under the improvement-loop quality rule - the ten-task quality bar is NOT held at 32, judged 0 Pass / 7 Partial / 3 Fail against the crow record 2 / 5 / 3 at 8 and the llama reference 2 / 6 / 2 (`.superpowers/sdd/task-61d-quality-report.md`); the 61d adjacent pair stays the measurement of record for the knob: 22.8545 against 24.1325 ms per decode token with `8` (-5.3 percent, 32.3 x the fallback spread), B ids `5098f885ab3a` 3 of 3, N ids `c65969f7793a` 3 of 3 (the 61a/61c S32 value); the rollback is the const back to 8 plus its `[attn]` boot line and nothing else (engine commit `fdc00c4`, `decode_out/srv-61d.log`, RTX 5090).
-- The split count still changes the merge order of the flash-decoding partials, so the last bits of the logits move: the generated ids change (first differing index 45 and 48 of 256 on t1-read, `decode_out/srv-61a.log`), so `16` and `32` stay MEASUREMENT ONLY under the quality verdict, and the splits-8 stream of record is again final4-identical (the 61d per-task baseline `decode_out/t61d-run0-crow.json` is superseded); the `attn_sel_split` row (2.44 ms per token, nsys `decode_out/srv-61a.log`) was the open optimization row of #61 and is re-measured and answered in **section 4.6** (2026-09-18): it is 2.420 ms per token still, and its cost is the per-block e4m3 byte decode, not the split count.
+- The split count still changes the merge order of the flash-decoding partials, so the last bits of the logits move: the generated ids change (first differing index 45 and 48 of 256 on t1-read, `decode_out/srv-61a.log`), so `16` and `32` stay MEASUREMENT ONLY under the quality verdict, and the splits-8 stream of record is again final4-identical (the 61d per-task baseline `decode_out/t61d-run0-crow.json` is superseded); the `attn_sel_split` row (2.44 ms per token, nsys `decode_out/srv-61a.log`) was the open optimization row of #61 and is re-measured and answered in **section 4.6** (2026-09-18): it is 2.420 ms per token still, its cost is the per-block e4m3 byte decode and not the split count, and the opt-in `CROW_ATTN_LUT` (4.6.1) takes it to 0.779 without moving a bit.
 - The partial buffers `part_o` and `part_ml` are sized for 32 splits (`gen.rs:1879-1880`), VRAM plus 0.55 MB against the old size.
+- `CROW_ATTN_LUT=1` (#61f, 2026-09-18, DEFAULT OFF) swaps the launch for `attn_sel_split_l`, the same kernel with the e4m3 KV bytes read through a shared 256-entry table; section 4.6.1 carries the measurement and the identity proof.
 
 ### 4.3 Kernel hygiene
 
 - Thin kernels (constant 4): ONE NVRTC module for all families, compiled once per process at
-  load from the frozen `KERNEL_SRC` (`gen.rs:1033`), with 110 launched kernels resolved out of it
-  (`kernels.rs:4508-4527`; the frozen source defines 116 `__global__`s, six of which have no launch
+  load from the frozen `KERNEL_SRC` (`gen.rs:1033`), with 111 launched kernels resolved out of it
+  (`kernels.rs:4508-4527`; the frozen source defines 117 `__global__`s, six of which have no launch
   site left). Shared block-scaled-MMA core.
 - The alternative was weighed and declined on 2026-09-17: `docs/cuda-rust-evaluation.md` measures
   NVIDIA's two CUDA Rust tracks against these families, with one cuTile pilot kernel. The pilot is
@@ -646,7 +647,7 @@ What the time was, then: **0.776 us per selected token per block, about 2,250 cl
 of KV and 512 fma. `dec_e4m3` (`kernels.rs:52`) is two `ldexpf`, a float divide and three branches
 per byte, and `attn_sel_split` called it straight through `kv_load` — while the NON-split decode
 kernel `attn_sel_s8l` and the prefill path have decoded through a shared 256-entry table since #10.
-That is the one byte-identical lever this decomposition names.
+That is the lever of #61f below.
 
 **What the other engines do (source read, 2026-09-18).** llama.cpp does **not** use
 `flash_attn_ext_vec` at this shape: `fattn.cu:617` excludes the vec kernel when
@@ -675,6 +676,51 @@ here; the cost per byte is.** The two byte-level levers the other engines hold a
 one CTA per GQA group (llama.cpp `ncols2 = 8`, FlashInfer `bdy = GROUP_SIZE`) and 16-byte
 vectorised KV loads — remain open, and both change the reduction order or the lane mapping, so both
 need the ten-task quality gate, not only parity.
+
+#### 4.6.1 `CROW_ATTN_LUT` — the e4m3 table in the split attention kernel (#61f, opt-in)
+
+`CROW_ATTN_LUT=1` launches `attn_sel_split_l` instead of `attn_sel_split` (`gen.rs:2455`, kernel
+`kernels.rs:3660`). It is the same kernel: one template on `LUT`, the KV byte read through
+`kv_ld<LUT>` (`kernels.rs:2005`) instead of `kv_load`, and with `LUT = 1` a shared 256-entry table
+filled once per block with `dec_e4m3(b)` for every byte. **Bit-identical by construction** — the
+table holds the same float for the same byte, and the fma chains, the `e` order, the shuffle tree,
+the `expf`, the IEEE divide and the `j` order are untouched; it is the change `attn_sel_s8l` has
+carried against `attn_sel_s8` since #10, on the one decode kernel that never got it. The block is
+`AHD` = 256 threads in both forms, which is what fills the table; the only instruction the table
+adds outside the loops is one `__syncthreads`.
+
+**Measured** (RTX 5090 / Arch Linux, 2026-09-18, `decode run` on t1-read, 16,064 ids, 256 tokens,
+255 timed steps, one fresh process per run, W + 3 adjacent pairs, `decode_out/61/pair-*.log`):
+
+| pair | B, `CROW_ATTN_LUT` unset | N, `CROW_ATTN_LUT=1` | delta ms | percent |
+|---|---|---|---|---|
+| 1 | 25.2435 | 23.5934 | -1.6501 | -6.54 |
+| 2 | 25.2212 | 23.7104 | -1.5108 | -5.99 |
+| 3 | 25.3267 | 23.7278 | -1.5989 | -6.31 |
+| mean | **25.2638 = 39.58 tok/s** | **23.6772 = 42.23 tok/s** | **-1.5866** | **-6.28** |
+
+B spread window 0.1055 ms (1.0042), N 0.1344 ms (1.0057), so the gain is **15.0 B spread windows**
+and 0 of 3 pairs go the wrong way; the discarded warm-up run W read 25.2150. The ids sha256 is
+`56305eee11d6` in **7 of 7** runs, the value the #38 chain's D arm carries.
+
+Under `CROW_KPROF=1` (`CROW_GRAPH=0`) the row it moves reads **206.4 us per attention layer for
+`attn_sel_split` against 64.9 for `attn_sel_split_l`, 2.477 -> 0.779 ms per decode token, -3.18 x**,
+and the `[profile]` attention bucket falls 5.07 -> 3.35 ms per step; the same binary with the flag
+unset reproduces 206.4 us and the ids of record, so the template refactor left the OFF path where it
+was. In the model above the per-selected-token cost falls from 0.776 to 0.219 us: **the e4m3 byte
+decode was 72 % of what a selected token cost.**
+
+**Identity.** Parity with `CROW_ATTN_LUT=1` against the Linux values of record: 8 rows
+`bceba6ff7724...` at 11,919,360 B, 512 rows `8387234709271515...`, and — the form that matters,
+because 8 and 512 are prefill-only while this is a DECODE kernel — **P8 teacher-forced
+`3bb3e69edf90...`**, 504 of the 512 rows fed through `decode_step` (`decode_out/61/parity-on/`).
+Those three forms run in the dense selection regime; the sparse regime (2,050 of 16,320 tokens
+selected) is covered by the 4 LUT-on `decode run` 256 runs above, all at the ids sha of record.
+`tools/gate-linux.sh` is ALL GREEN with the flag OFF at the same commit (`decode_out/gate61`).
+
+**Not flipped.** The default stays `attn_sel_split`; the flag is opt-in and robin decides. Nothing
+here needs the ten-task gate — the lever is byte-identical, which is the whole point of choosing it
+over the two byte-level levers named at the end of 4.6, both of which move the reduction order.
 
 ---
 

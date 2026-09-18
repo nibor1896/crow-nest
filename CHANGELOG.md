@@ -17,7 +17,7 @@
   operating-point report, `788fb64`) and `#38` (the run-position drift of a `serve` rate: the
   Linux chain that answers it, `tools/drift-chain.sh` and the record in
   `docs/measurement-coverage.md`, `77c4d40` — no engine code) and `#61` (the decode kernel
-  decomposition at the Linux operating point, this commit).
+  decomposition at the Linux operating point, and the opt-in `CROW_ATTN_LUT` lever it named).
   The machine is the second environment block of `docs/system-landscape.md` unless a row names another one.
 - The crate version field stays `0.1.0`, as it has for every release: this file is the record.
 
@@ -271,6 +271,38 @@
   rows (`check_env_docs` exit 0, 82 = 82).
 
 ### Added
+
+- **`CROW_ATTN_LUT` — the decode attention kernel reads its e4m3 KV bytes out of a table**
+  (`#61`, 2026-09-18, DEFAULT OFF, opt-in). `CROW_ATTN_LUT=1` launches `attn_sel_split_l` instead
+  of `attn_sel_split`: the same kernel, one template on `LUT`, the KV byte taken through
+  `kv_ld<LUT>` and, at `LUT = 1`, out of a shared 256-entry table filled once per block with
+  `dec_e4m3(b)` for every byte. It is the change `attn_sel_s8l` has carried against `attn_sel_s8`
+  since `#10`, on the one decode kernel that never got it — and the decomposition below is what
+  named it: `dec_e4m3` is two `ldexpf`, a float divide and three branches **per KV byte**, and
+  `attn_sel_split` walks 512 of them per selected token.
+
+  **Bit-identical by construction**: the table holds the same float for the same byte, so the fma
+  chains, the `e` order, the shuffle tree, the `expf`, the IEEE divide and the `j` order are those
+  of `attn_sel_split`. Proven, not only argued — parity with the flag ON reproduces all three Linux
+  values of record (8 rows `bceba6ff7724…` at 11,919,360 B, 512 rows `838723470927…`, and the P8
+  teacher-forced `3bb3e69edf90…`, which is the form that puts the DECODE path under the contract:
+  504 of the 512 rows go through `decode_step`), and the four LUT-on `decode run 256` runs on
+  t1-read carry the ids sha256 `56305eee11d6` of record, which is the SPARSE regime the parity
+  forms never reach (2,050 of 16,320 tokens selected).
+
+  **Measured** (RTX 5090 / Arch Linux, 2026-09-18, t1-read 16,064 ids, 255 timed steps, one fresh
+  process per run, W + 3 adjacent pairs, `decode_out/61/`): B mean **25.2638 ms per decode token =
+  39.58 tok/s** against N **23.6772 = 42.23 tok/s**, **-1.5866 ms = -6.28 percent**, 3 of 3 pairs
+  favour N at 15.0 B spread windows (B window 0.1055 ms), ids identical in 7 of 7 runs. Under
+  `CROW_KPROF=1` the row itself reads 206.4 us per attention layer against 64.9 — 2.477 to 0.779 ms
+  per decode token, **-3.18 x** — and the `[profile]` attention bucket 5.07 to 3.35 ms per step.
+
+  `KERNEL_SRC` CHANGED in this commit: `attn_sel_split` became `attn_sel_split_body<LUT>` plus two
+  `extern "C"` wrappers, so the module now defines 117 `__global__`s and the host resolves 111
+  (was 116 / 110). The OFF path is unchanged where it counts — the same binary with the flag unset
+  reproduces 206.4 us per call and the ids of record, and `tools/gate-linux.sh` is ALL GREEN with
+  the flag OFF. The default is NOT flipped: robin decides. One `[attn]` boot line per process names
+  the kernel it runs. `docs/architecture.md` 4.6.1, `docs/env.md` row (86 -> 87).
 
 - **Engine logging: `tracing` as the single facade, a rotating gzipping file, one routing line per
   request and the operating point as one JSON line** (`#13`, 2026-09-18). Before this commit every
@@ -580,8 +612,8 @@
   at 201.7 us is 125 GB/s of requests and 10.4 GB/s of unique bytes against this card's 1,792 GB/s.
   Nor compute bound: 50.4 MFLOP per layer in 201.7 us is 0.25 TFLOP/s. What it IS: **0.776 us per
   selected token per block, about 2,250 clocks, for 512 e4m3 BYTE decodes** — `dec_e4m3` is two
-  `ldexpf`, a divide and three branches per byte. That term is what a lever has to move, and the one
-  byte-identical way to move it is a table.
+  `ldexpf`, a divide and three branches per byte. Hence the `CROW_ATTN_LUT` lever above, which takes
+  that term to 0.219 us.
 
   External leg, read from source on 2026-09-18: llama.cpp does **not** use `flash_attn_ext_vec` at
   this shape (`fattn.cu:617` excludes vec when `gqa_ratio > 4 && K->ne[1] >= 8192`); it picks the

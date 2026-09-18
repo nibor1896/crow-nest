@@ -4,9 +4,9 @@
 
 | Item | Value |
 |---|---|
-| Variables in this table | 86 |
-| Distinct `CROW_[A-Z0-9_]+` tokens in the code | 86 in `engine/src`, 0 in `converter/src` |
-| Measured | 2026-09-10, task E5, issue #46, parent #1; re-counted 2026-09-17 with the two host-memory rows of #15, the `CROW_PLE_FETCH` row of TASK H and the `CROW_VIT_RESERVE_MB` row of TASK K; re-counted 2026-09-18 with the four logging rows of #13 (82 -> 86) |
+| Variables in this table | 87 |
+| Distinct `CROW_[A-Z0-9_]+` tokens in the code | 87 in `engine/src`, 0 in `converter/src` |
+| Measured | 2026-09-10, task E5, issue #46, parent #1; re-counted 2026-09-17 with the two host-memory rows of #15, the `CROW_PLE_FETCH` row of TASK H and the `CROW_VIT_RESERVE_MB` row of TASK K; re-counted 2026-09-18 with the four logging rows of #13 (82 -> 86) and the `CROW_ATTN_LUT` row of #61f (86 -> 87) |
 | Repository state | branch `main`, HEAD `487128d`, 2026-09-17; every `Read at` line number in this file was re-read off that tree. The four `CROW_LOG*` rows were read off `5a58e0b` + #13, 2026-09-18 |
 | Guard | `tools/check_env_docs.py` (code list minus doc list must be empty, both ways) |
 | Rule | a variable not in this table does not exist |
@@ -90,10 +90,11 @@ Helpers used by the read sites:
 | `CROW_STAGE_KERNEL` | `engine/src/gen.rs:686` | `1` selects the old `stage_cold`; unset or any other value selects `stage_cold_ca`; default `2` | shape of the decode staging copy: `stage_cold_ca` is a persistent grid that pulls each cold combo through `cp.async.cg.shared.global` into 4 KB shared tiles and stores them coalesced to VRAM; the kernel has NO tail tile, so it requires both staged slab byte counts to be exact multiples of 4096, asserted at load (`engine/src/gen.rs:683`) and again at the launch site (`engine/src/gen.rs:2048`), both panic messages naming this switch | operating | default `2` since 2026-09-12 (#19e); measured 2026-09-11 on the #59 profile arm (t1-read 16,064 ids, 255 timed steps, RTX 5090): 26.46 ms per decode token against 29.68 for `stage_cold`, staging row 7.07 ms at 47.78 GB/s against 10.42 ms at 32.45 GB/s (`decode_out/srv-19d.log`); every engine process names its kernel in one `[stage]` line (`engine/src/gen.rs:697`) |
 | `CROW_STAGE_BLOCKS` | `engine/src/gen.rs:695` | integer, accepted `8` to `512`, other values fall back; default `40` | blocks of the persistent `stage_cold_ca` grid (block 256) | operating | default `40` since 2026-09-12 (#19e), read whenever `stage_cold_ca` runs, which is every run without `CROW_STAGE_KERNEL=1`; 19d measured 2026-09-11: 40 and 80 tied inside their own spreads, 20 worse by 0.1532 ms per decode token |
 
-## Attention and kernels (19 rows)
+## Attention and kernels (20 rows)
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
+| `CROW_ATTN_LUT` | `engine/src/gen.rs:1645` | exact `1` enables; default OFF (unset and every other value run `attn_sel_split`) | the decode attention launch takes `attn_sel_split_l`, the twin that decodes the e4m3 KV bytes through a shared 256-entry table (`kv_ld<1>`, `kernels.rs:2005`) instead of the branchy `dec_e4m3`; launch site `gen.rs:2455`, kernel `kernels.rs:3660` | operating | #61f, 2026-09-18, OPT-IN. Bit-identical by construction — the table holds `dec_e4m3(b)` for every byte, so every decoded value is the same float and the fma chains, the `e` order, the shuffle tree, the `expf` and the `j` order are those of `attn_sel_split`; it is the change `attn_sel_s8l` has carried against `attn_sel_s8` since #10. MEASURED (`decode_out/61/`, RTX 5090 / Arch Linux, 2026-09-18, t1-read 16,064 ids, 255 timed steps): the `attn_sel_split` row falls from 206.4 to 64.9 us per attention layer per decode token (2.477 -> 0.779 ms per token over the 12 layers, `CROW_KPROF=1` with `CROW_GRAPH=0`), and the decomposition that named it put the kernel at 8.6 us plus 0.776 us per selected token per BLOCK, flat in the block count from 96 to 768 blocks (splits 4/8/16/32 = 406.4/206.7/108.6/59.7 us). Every engine process prints the kernel it runs in its `[attn]` boot line (`gen.rs:952`). Decode only: the prefill attention is `attn_sel_s8l` and already carries the table |
 | `CROW_ATTN_R` | `engine/src/gen.rs:1526` | `0`, `1`, `2`, `3`, `4`, `5`, `8`, `9`; default unset = `attn_sel_s8l` | selects the decode attention kernel (`gen.rs:1162`) | operating | default since 2026-09-06 late (#10, robin's call), gated by parity 8/512/1024 against the previous build plus ten tasks; `8` and `9` are diagnostics, see the warning table |
 | `CROW_ATTN_SB` | `engine/src/gen.rs:1537` | `0` restores the full-chunk buffer; default on (`ATTN_SB` = 512) | prompt attention in sub-batches of 512 tokens | operating | #16, 2026-09-05: shrinks the QSA score buffer from 512 MB at chunk 2048; bit-identical by construction |
 | `CROW_ATTN_SPLIT` | `engine/src/gen.rs:1516` | `0` disables; default on | decode attention as 8 partials plus merge, QSA scores warp per block | operating | both forms are graph-static |
