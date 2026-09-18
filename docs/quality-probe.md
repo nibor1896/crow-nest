@@ -246,9 +246,17 @@ It CANNOT decide:
 
 ## 9. Where the records are
 
-`decode_out/quality-probe/<label>/`, tracked for these four runs because they are the evidence
+`decode_out/quality-probe/<label>/`, tracked for these runs because they are the evidence
 the requant series is measured against: `records.jsonl` (one JSON object per generation with the
 full text, every metric, the sampling that was sent and the timings), `run.json` (the run header
 with the dictionary provenance and the aggregate) and `summary.md` (the table a human reads).
 The server logs beside them are not tracked. Labels: `A1-crow`, `A2-crow` (the same-seed
 repeat), `A3-crow` (the other seed list) and `B1-llama`.
+
+#77 (2026-09-18) added two more on the same prompt set, the same seeds and the same row, both
+generated at commit `22ec6b4`: `C0-crow-control` (the dense-BF16 overlay built from the
+container's own dequantized NVFP4 — the control, which reads 15.81 on the German long-prose row
+against A1's 16.40, inside the seed noise) and `C1-crow-dense-bf16` (the same overlay built from
+the BF16 originals of #76, 14.61). `docs/dense-overlay.md` section 5.4 is the table and the
+reading; nothing in section 5 above moves, because those runs are a different arm and not a
+re-measurement of this one.

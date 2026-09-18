@@ -119,7 +119,11 @@ never held in RAM. Disk requirement for a conversion: input 360 GB + output ~101
   `shared_expert_gate`, all norms (`hc_norm` et al.). Routing stability and norm
   precision are cheap to keep.
 - **Everything else** (GDN, attention, hyper-connection low-rank, experts, shared
-  expert): NVFP4.
+  expert): NVFP4. This is what the CONVERTER emits and it is unchanged. Since #77
+  (2026-09-18) the ENGINE can be told to read the 495 dense text tensors from a bf16
+  OVERLAY container instead (`CROW_CNQ_OVERLAY`, `converter dense-overlay`,
+  `docs/dense-overlay.md`); the shipped container and the default path are untouched by
+  it, and the overlay is a measurement instrument, not a shipped variant.
 - **PLE block**: NVFP4, **exchangeable** — the header tags it as a self-contained
   section so an FP8 swap (oracle fallback) needs no format change.
 - **ViT + MTP**: carried in the format, tagged optional-to-load (decision 2026-09-02).
@@ -167,6 +171,14 @@ ModelOpt's `--calib_all_experts` idea with real traffic instead of synthetic sam
 | activations + graph pools | 1.5–2.0 | decode graphs are small; measured at first integration |
 | **total non-expert** | **~13.0–13.5** | of 34.4 (32 GiB) |
 | **expert budget** | **~20.9–21.4** | → hard ceiling **~158–162** experts/layer with honest pool sizing |
+
+#77 (2026-09-18) measured what the two-sided clamp does when the dense set GROWS: reading the
+495 dense text tensors as bf16 instead of NVFP4 takes dense from 6.63 to 9.99 GiB, the planner
+sees it (it derives the dense size from measured free VRAM, not from a constant) and lowers N
+from 155 to 128 at the serve operating point — and the LOWER N then needs about 3.4 GiB more
+pinned host RAM, which the 46 GiB cap below does not have. The planner refuses by name
+(`planner_refusal_msg`), which is the behaviour this rule asks for; the measurement runs at
+`CROW_PINNED_BUDGET_GB=50` and is not the operating point of record (`docs/dense-overlay.md` 5).
 
 Loader rule (binding): N=160 is the **target**; the loader verifies the full budget with
 measured overheads at load time and auto-clamps N if the sum exceeds VRAM — it refuses
@@ -3565,7 +3577,10 @@ builders share (`bin/coldtier`, `bin/hybrid`), the Linux page-cache discipline (
 `warm_mode`, the process's one reader pool and the `Send` handle `Cnq::warm` hands out (7.14).
 Surface: 25 `pub fn` plus `Cnq`, `TensorInfo`, `Warm`, `WarmMode`. Depends on nothing in the
 crate. It may not learn about geometry: what a tensor MEANS is `geo`'s and `gen`'s business — the
-row fetch takes byte offsets and a row length and knows nothing about n-grams.
+row fetch takes byte offsets and a row length and knows nothing about n-grams. Since #77 it also
+owns the OVERLAY (`attach_overlay`, `Overlay`, `OverlayReport`, `overlay_refusal`, `kind_of`,
+`parse_tensor_index`): a second CNQ1 container whose tensors `find` returns in preference to the
+base ones, so the shadowing is invisible to every reader above it.
 
 **`geo.rs`** — the model geometry and the runtime `Config`: the probe-pinned constants and
 their derivation chain, `KvDtype`, `Adapt` with `knobs()`, the two policy functions
@@ -3702,8 +3717,9 @@ not line numbers — the files move.
 3. `CROW_GRAPH`, `CROW_MMA`, `CROW_ADAPT_WINDOW` forced to `1` if unset, single-threaded,
    before the context exists; one `[serve]` line each.
 4. `boot::open_model(DEFAULT_CNQ, DEFAULT_HOTSETS)` → `Cnq::open` (trailer index, whole-file
-   mapping), `cuda::Ctx::init`, `Config` at `CONTEXT_FLOOR`. The binding order is the drop
-   order.
+   mapping), then `CROW_CNQ_OVERLAY` → `Cnq::attach_overlay` when it is set (#77: the bf16 dense
+   overlay, with its refusal table and the `[overlay]` lines; unset attaches nothing),
+   `cuda::Ctx::init`, `Config` at `CONTEXT_FLOOR`. The binding order is the drop order.
 5. `cfg.prompt_chunk = SERVE_CHUNK` (= `geo::TRICKLE_CHUNK_THRESHOLD`), `geo::apply_adapt_policy`
    (the `[policy]` line).
 6. `Engine::load`, in this order:
