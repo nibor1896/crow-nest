@@ -274,6 +274,37 @@
 
 ### Added
 
+- **`CROW_STAGE_PAR` — the cold-expert staging copy runs beside the shared expert instead of in
+  front of it** (`#19`, 2026-09-18, DEFAULT OFF, opt-in). `CROW_STAGE_PAR=1` issues `stage_cold_ca`
+  on a side stream and joins the compute stream again immediately before the routed gate|up GEMV,
+  the first reader of the combo pointers the staging kernel rewrites: `cuEventRecord` on the compute
+  stream, `cuStreamWaitEvent` on the side stream, the launch, and the pair back. Inside the decode
+  graph the fork and the join are capture nodes, so the captured graph gains **one parallel branch
+  per MoE layer** and no host work; outside it the same two events order the same two streams. The
+  window it fills is the shared-expert chain of the same layer — `sh_gate_up_q`, the `sgv` `gemv_b`
+  and the fused down `gemv_fp4_mma_dg`, about 22 us per layer = **1.05 ms per decode token** — which
+  reads no staged byte. The fork event carries both hazards at once, because it depends on
+  everything already on the compute stream: `router_top10` of this layer and the routed GEMVs of the
+  previous one.
+
+  **Bit-identical by construction**: the staging kernel is a pure copy into its own slots, the
+  shared expert reads and writes disjoint buffers, and no floating-point operation changes kernel,
+  operand or order — so the lever owes the parity gate and not the ten-task quality gate. Proven
+  with the flag ON against the three Linux values of record (8 rows `bceba6ff7724…` at 11,919,360 B,
+  512 rows `838723470927…`, and the P8 teacher-forced `3bb3e69edf90…`, the form that puts the DECODE
+  path under the contract) plus the 32 generated ids of `decode run`.
+
+  **Measured** (RTX 5090 / Arch Linux, 2026-09-18, t1-read 16,064 ids, 255 timed steps, one fresh
+  process per run, W + 3 adjacent pairs, `decode_out/19/`): B mean **25.2962 ms per decode token =
+  39.53 tok/s** against N **24.4182 = 40.95 tok/s**, **-0.8779 ms = -3.47 percent**, 3 of 3 pairs
+  favour N at 10.0 B spread windows (B window 0.0878 ms), ids sha256 `56305eee11d6` in 7 of 7 runs.
+  Both arms report the same 212.6 cold experts per timed decode token and the same 3,964 trickle
+  swaps: the flag moves the schedule and nothing else, and -0.8779 ms is **84 percent** of the
+  1.05 ms window. Under `CROW_KPROF` the row does not move (244.7 us per call against 242.7) — it
+  must not, because the profiler syncs around every launch, which is the serialization this flag
+  removes; that arm is the control proving no kernel got faster. No kernel source changed, so
+  `KERNEL_SRC` is unchanged. Default NOT flipped; the record is `docs/architecture.md` 4.8.1.
+
 - **`CROW_ATTN_LUT` — the decode attention kernel reads its e4m3 KV bytes out of a table**
   (`#61`, 2026-09-18, DEFAULT OFF, opt-in). `CROW_ATTN_LUT=1` launches `attn_sel_split_l` instead
   of `attn_sel_split`: the same kernel, one template on `LUT`, the KV byte taken through

@@ -312,15 +312,27 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
   load and `gen.rs:2048` again at the launch site; both panic messages name
   `CROW_STAGE_KERNEL=1` as the fallback. This container: `gate_up` 1843200 B = 450 tiles,
   `down` 921600 B = 225 tiles.
+- **`CROW_STAGE_PAR=1` (#19j, 2026-09-18, default off)**: the same kernel, the same
+  bytes, issued on a side stream with an event pair — `cuEventRecord` on the compute
+  stream, `cuStreamWaitEvent` on the side stream, the launch, and the join immediately
+  before the routed gate|up GEMV, the first reader of the pointers the kernel rewrites.
+  The shared-expert chain of the same layer (about 22 us per layer, 1.05 ms per decode
+  token) reads no staged byte and runs beside the copy. Inside the decode graph the fork
+  and the join are capture nodes, so the graph gains one parallel branch per MoE layer.
+  Bit-identical by construction and measured so (parity 8 / 512 / P8 teacher-forced with
+  the flag ON, plus the `decode run` ids of record); the adjacent pairs read
+  **-0.8779 ms per decode token = -3.47 percent**, `docs/architecture.md` 4.8.1.
 - **Boot line**: every engine process prints one `[stage]` line naming the kernel it will
-  run, its grid and the slab byte counts (`gen.rs:697` for `stage_cold_ca`, `gen.rs:700`
-  for `stage_cold`), so every log says which kernel produced it.
+  run, its grid, the slab byte counts and (since #19j) the stream the copy is issued on
+  (`gen.rs` for `stage_cold_ca` and for `stage_cold`), so every log says which kernel
+  produced it and where it ran.
 
 | Switch | Kernel | Grid | Read shape | Mode |
 |---|---|---|---|---|
 | unset (default) | `stage_cold_ca` | `CROW_STAGE_BLOCKS` x 1 x 1, 256 threads | `cp.async.cg.shared.global` 16 B per thread into 4 KB shared tiles, 2-deep, slab bytes must be 4 KB multiples | operating |
 | `CROW_STAGE_KERNEL=1` | `stage_cold` | `t * TOPK` x 2 x `CROW_STAGE_SPLIT`, 256 threads | 4 x 16 B `uint4` loads in flight per thread | operating fallback |
 | `CROW_STAGE_DMA=1` | none, copy engine | host-issued `cuMemcpyDtoDAsync` per cold combo | copy engine, decode graph off | measurement |
+| `CROW_STAGE_PAR=1` (#19j) | `stage_cold_ca`, same grid and same bytes | issued on a SIDE STREAM, joined before the routed GEMV | one parallel branch per layer inside the decode graph | opt-in, default off |
 
 - The decode operating point that decided the staging default: #19e, 2026-09-12.
 - The decode operating point that decided the trickle issue default: #63c, 2026-09-12.
@@ -1058,7 +1070,7 @@ What that rules out, in order of how much was hoped for it:
    scratch plus a QSA ring of 4,100 rows instead of 2,052 is exactly the VRAM the loader then cannot
    give the hot set — `[budget]` clamps 160 to 149 slots instead of 160 to 156, and the stream trickle
    holds 7 of them spare in both cases.
-5. **Overlap** — the one thing left. The internal leg below measures the window it has.
+5. **Overlap** — the one thing left, and the lever this pass built: 4.8.1.
 
 #### The internal leg — what `stage_cold_ca` does per expert, and what can run beside it
 
@@ -1116,6 +1128,66 @@ size of the overlap window**, and 4.8.1 takes 0.88 of it.
   row is. The engines that hold CPU-resident experts pay host DRAM bandwidth for them; crow-nest pays
   PCIe and keeps the GPU's compute. At 4.5 bpw and N 142 the bill is 11.4 ms per token, which is 45 %
   of the step — and it is the price of the residency model, not a kernel that is doing it wrong.
+
+#### 4.8.1 `CROW_STAGE_PAR` — the staging copy on a side stream, joined before the routed GEMV (#19j, opt-in)
+
+`CROW_STAGE_PAR=1` issues `stage_cold_ca` on a **side stream** instead of the compute stream
+(`gen.rs`, the `stage_par` branch in `moe_run`): `cuEventRecord` on the compute stream,
+`cuStreamWaitEvent` on the side stream, the launch, `cuEventRecord` on the side stream, and back —
+with the matching `cuStreamWaitEvent` on the compute stream sitting immediately before the routed
+gate|up GEMV, which is the first reader of the pointers the staging kernel rewrites. Inside the decode
+graph both are capture nodes, so the captured graph gains **one parallel branch per MoE layer** and no
+host work at all; outside the graph the same two events order the same two streams. Default OFF.
+
+**What it overlaps, and the two hazards it does not break.** Between the fork and the join sit the
+activation quant and the whole shared-expert chain — the 1.05 ms per decode token measured above — and
+nothing there reads a staged byte. The fork event carries **everything already issued on the compute
+stream**, which is both hazards at once: `router_top10` of *this* layer (the combo pointers and the
+cold mask the staging kernel reads) and the routed GEMVs of the *previous* layer (the staging slots it
+is about to overwrite).
+
+**Bit-identical by construction.** Nothing moves numerically. The staging kernel is a pure copy into
+its own slots, the shared expert reads and writes disjoint buffers, and every floating-point operation
+keeps its kernel, its operands and its order — no reduce order moves, so this lever owes the parity
+gate and not the ten-task quality gate. Measured so, with the flag ON, against the Linux values of
+record (`decode_out/19/`):
+
+| form | result |
+|---|---|
+| parity 8 rows | `bceba6ff7724...` at 11,919,360 B — IDENTICAL |
+| parity 512 rows | `8387234709271515...` — IDENTICAL |
+| **P8 teacher-forced** (504 of 512 rows fed through `decode_step` — the form that puts this DECODE kernel under the parity contract) | `3bb3e69edf90...` — IDENTICAL |
+| `decode run … 32` | the 32 generated ids of record |
+| `decode run … 256` on t1-read, 4 runs | ids sha256 `56305eee11d6`, the sparse-selection regime no parity form reaches |
+
+**Measured** (RTX 5090 / Arch Linux, 2026-09-18, `decode run` on t1-read, 16,064 ids, 256 tokens, 255
+timed steps, one fresh process per run, W + 3 adjacent pairs, `decode_out/19/pair-*.log`):
+
+| pair | B, `CROW_STAGE_PAR` unset | N, `CROW_STAGE_PAR=1` | delta ms | percent |
+|---|---|---|---|---|
+| 1 | 25.3043 | 24.4467 | -0.8575 | -3.39 |
+| 2 | 25.2482 | 24.4292 | -0.8190 | -3.24 |
+| 3 | 25.3360 | 24.3788 | -0.9573 | -3.78 |
+| mean | **25.2962 = 39.53 tok/s** | **24.4182 = 40.95 tok/s** | **-0.8779** | **-3.47** |
+
+B spread window 0.0878 ms (1.00348), N 0.0680 ms (1.00279), so the gain is **10.0 B spread windows**
+and 0 of 3 pairs go the wrong way; the discarded warm-up run W read 25.2831. Both arms report the same
+212.6 cold experts per timed decode token and the same 3,964 trickle swaps — the flag moves the
+schedule and nothing else. **-0.8779 ms is 84 % of the 1.05 ms window the internal leg measured**,
+which is what a scheduling lever looks like when it works.
+
+Under `CROW_KPROF` the row does **not** move (244.7 us/call flag-free against 242.7 with the flag, at
+1 % fewer cold experts in that arm) — as it must not: the profiler syncs the stream before and after
+every launch, which is exactly the serialization this flag removes. The gain is only visible in wall
+time, and the `CROW_KPROF` arm is the control that proves no kernel got faster.
+
+**Not flipped.** The default stays the compute stream; the flag is opt-in and robin decides. What a
+flip would owe: this is the first parallel branch in the decode graph, so a `serve` arm (the graph is
+captured there too, with a different chunk policy and N 149) and one ten-task run for the record —
+nothing numeric, but the capture shape is new.
+
+
+---
 
 ## Section 5 — correctness: oracle, parity gates, ten-task gate (APPROVED by robin 2026-09-02)
 

@@ -81,7 +81,7 @@ all nine green at commit `8ff2055` on 2026-09-17.
   3 decode, 2026-09-18) and `CLIPPY=1421` (the `--all-targets` form, counted as
   `grep -cE '^warning: '`; 1422 until `#13` on 2026-09-18 turned the one
   `redundant reference in eprintln! argument` site into a `tracing` event). The guard loop names
-  three scripts — `check_env_docs` (exit 0, `code 86, doc 86`),
+  three scripts — `check_env_docs` (exit 0, `code 88, doc 88` since the `CROW_STAGE_PAR` row of #19, 2026-09-18),
   `check_readme_dates` (0 offenders) and `check_model_card_dates` (0 offenders, in this tree and
   running since 2026-09-18).
 - The 1024-row form is a Linux value of record too (`117dd8d9d8dc…`, established 2026-09-17) but

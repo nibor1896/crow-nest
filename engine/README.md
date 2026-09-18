@@ -228,4 +228,4 @@ python3 ../tools/check_env_docs.py
 python3 ../tools/check_readme_dates.py
 ```
 
-- The two doc guards need no GPU and no model: `check_env_docs` reads `code 87, doc 87` and exits 0 (82 = 82 before the four `CROW_LOG*` rows of issue #13 and 86 = 86 before the `CROW_ATTN_LUT` row of issue #61, 2026-09-18), `check_readme_dates` reports 0 offenders.
+- The two doc guards need no GPU and no model: `check_env_docs` reads `code 88, doc 88` and exits 0 (82 = 82 before the four `CROW_LOG*` rows of issue #13, 86 = 86 before the `CROW_ATTN_LUT` row of issue #61 and 87 = 87 before the `CROW_STAGE_PAR` row of issue #19, all 2026-09-18), `check_readme_dates` reports 0 offenders.

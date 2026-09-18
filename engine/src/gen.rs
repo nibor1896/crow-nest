@@ -363,6 +363,11 @@ pub struct Engine {
     pa_ev_plan: cudarc::driver::sys::CUevent,
     pa_ev_filled: [cudarc::driver::sys::CUevent; 2],
     pa_ev_done: [cudarc::driver::sys::CUevent; 2],
+    /// CROW_STAGE_PAR=1 (#19j): the decode staging side stream and its fork/join
+    /// event pair; null / unused with the switch off
+    st_stream: cudarc::driver::sys::CUstream,
+    st_ev_go: cudarc::driver::sys::CUevent,
+    st_ev_done: cudarc::driver::sys::CUevent,
     /// CROW_ROUTE_DUMP=1 (non-graph decode): routed expert ids per token per
     /// layer, [token][layer][10] - measurement A-V3 (hot-set coverage study)
     pub(crate) route_log: Vec<Vec<[i32; 10]>>,
@@ -754,6 +759,22 @@ pub fn stage_blocks() -> u32 {
     *V.get_or_init(|| env_parse("CROW_STAGE_BLOCKS").filter(|&g| (8..=512).contains(&g)).unwrap_or(40))
 }
 
+/// CROW_STAGE_PAR (#19j, exact `1` enables; DEFAULT OFF): `stage_cold_ca` is issued on
+/// a SIDE STREAM instead of the compute stream, so the shared-expert chain of the same
+/// layer — which reads no staged byte — runs while the PCIe copy is in flight; the
+/// compute stream waits on the staging event again before the first routed GEMV, which
+/// is the first reader of the rewritten combo pointers. Inside the decode graph the
+/// fork and the join are capture nodes (`cuEventRecord` on the capture stream,
+/// `cuStreamWaitEvent` on the side stream and back), so the captured graph gains one
+/// parallel branch per layer and no host work. Nothing moves numerically: the staging
+/// kernel is a pure copy into its own slots, the shared expert reads and writes
+/// disjoint buffers, and every FP op keeps its kernel, its order and its operands — the
+/// two arms are byte-identical BY CONSTRUCTION. Why it can pay: the 2026-09-18
+/// decomposition (`docs/architecture.md` 4.8) reads `stage_cold_ca` as bandwidth bound
+/// at ~51 GB/s over PCIe with 40 x 256 threads resident, so the card has 130 of its 170
+/// SMs idle for the 11.5 ms per decode token the row costs.
+pub fn stage_par_on() -> bool { env_flag!("CROW_STAGE_PAR", exact1) }
+
 impl Engine {
     /// Full load: dense weights → states (with N clamp) → residency → scratch.
     /// `warmup_counts` feeds warm-up promotion when no sidecar exists yet.
@@ -918,8 +939,11 @@ impl Engine {
         // still take precedence at the launch site (moe_run).
         let sk = env_or_unset("CROW_STAGE_KERNEL");
         if stage_kernel_ca() {
-            println!("[stage] kernel stage_cold_ca, CROW_STAGE_KERNEL {} (default 2), {} blocks x 256 threads, 4096 B tiles (gate_up {} B = {} tiles, down {} B = {} tiles)",
-                sk, stage_blocks(), slabs.gu_bytes, slabs.gu_bytes / 4096, slabs.dn_bytes, slabs.dn_bytes / 4096);
+            // #19j: the line also names the stream the copy is issued on, because
+            // that is the one thing about this launch a later log cannot infer
+            println!("[stage] kernel stage_cold_ca, CROW_STAGE_KERNEL {} (default 2), {} blocks x 256 threads, 4096 B tiles (gate_up {} B = {} tiles, down {} B = {} tiles), {}",
+                sk, stage_blocks(), slabs.gu_bytes, slabs.gu_bytes / 4096, slabs.dn_bytes, slabs.dn_bytes / 4096,
+                if stage_par_on() { "CROW_STAGE_PAR=1: side stream, joined before the routed GEMV" } else { "compute stream (CROW_STAGE_PAR unset = default)" });
         } else {
             println!("[stage] kernel stage_cold, CROW_STAGE_KERNEL {}, grid t * TOPK x 2 x {} (CROW_STAGE_SPLIT) x 256 threads (gate_up {} B, down {} B)",
                 sk, stage_split(), slabs.gu_bytes, slabs.dn_bytes);
@@ -1144,6 +1168,11 @@ impl Engine {
             pa_ev_plan: cuda::event_create(),
             pa_ev_filled: [cuda::event_create(), cuda::event_create()],
             pa_ev_done: [cuda::event_create(), cuda::event_create()],
+            // #19j: created only when the switch is on — a stream this process
+            // never uses is still a stream the driver has to carry
+            st_stream: if stage_par_on() { cuda::stream_create_non_blocking() } else { std::ptr::null_mut() },
+            st_ev_go: cuda::event_create(),
+            st_ev_done: cuda::event_create(),
             route_log: Vec::new(),
             trickle: None,
             trickle_pend: None,
@@ -2598,6 +2627,12 @@ impl Engine {
         // slots + rewritten combo pointers; prefill chunks stay zero-copy
         let lb = self.res.lb.as_ref();
         let staged = stage_on() && t * TOPK <= self.stage.max;
+        // #19j: the side-stream form runs on the stage_cold_ca branch only (the
+        // DMA branch is host-issued and the lb / stage_cold branches are the
+        // fallbacks of record); `cs` is the stream the join goes back to.
+        let cs = cuda::cur_stream();
+        let stage_par = staged && stage_par_on() && !stage_dma_on() && lb.is_none()
+            && stage_kernel_ca() && !self.st_stream.is_null();
         assert!(staged || lb.is_none() || (mma_on() && pf_gemm_on()),
             "low-bit cold tier needs a staging path (decode: t*TOPK <= stage.max; prefill: CROW_PF_GEMM)");
         // the 9 staging arguments every stage_cold* form takes, in kernel order,
@@ -2624,7 +2659,23 @@ impl Engine {
                     "stage_cold_ca needs both staged byte counts to be multiples of 4096 (gate_up {} B, down {} B); CROW_STAGE_KERNEL=1 falls back to stage_cold",
                     self.stage.gu_bytes, self.stage.dn_bytes);
                 sc[9] = (t * TOPK) as u64;
+                // #19j (CROW_STAGE_PAR=1, default off): fork the copy onto the
+                // side stream and join before the routed GEMV below, so the
+                // shared-expert chain overlaps the PCIe pull. The fork depends on
+                // everything already issued on the compute stream — router_top10
+                // of THIS layer (the pointers and the cold mask it reads) and the
+                // routed GEMVs of the PREVIOUS layer (the staging slots it
+                // overwrites) — so both hazards are carried by the event.
+                if stage_par {
+                    cuda::event_record(self.st_ev_go, cs);
+                    cuda::stream_wait_event(self.st_stream, self.st_ev_go);
+                    cuda::set_stream(self.st_stream as u64);
+                }
                 launch_v(k.f("stage_cold_ca"), stage_blocks(), 1, 1, 256, &sc[..10]);
+                if stage_par {
+                    cuda::event_record(self.st_ev_done, self.st_stream);
+                    cuda::set_stream(cs as u64);
+                }
             } else {
                 launch_v(k.f("stage_cold"), (t * TOPK) as u32, 2, stage_split(), 256, &sc[..9]);
             }
@@ -2842,6 +2893,13 @@ impl Engine {
             launch_v(k.f("acc_combo"), (H / 256) as u32, t as u32, 1, 256, &[
                 s.eo as u64, s.rwts as u64, s.moe_out as u64]);
             return s.moe_out;
+        }
+        // #19j: the join. Everything between the fork above and this line reads
+        // no staged byte (the shared-expert chain and the activation quant); the
+        // routed gate|up GEMV below is the FIRST reader of gu_ptrs/dn_ptrs, which
+        // stage_cold_ca rewrote, so this is the latest point the wait can sit.
+        if stage_par {
+            cuda::stream_wait_event(cs, self.st_ev_done);
         }
         if mma {
             // xq_gu was quantized above (shared with the shared expert)
@@ -4195,6 +4253,14 @@ impl Drop for Engine {
             for e in self.pa_ev_filled.iter().chain(self.pa_ev_done.iter()) {
                 cuda::event_destroy(*e);
             }
+            // #19j: the staging side stream and its event pair (#18 rule — every
+            // stream and event this engine created is destroyed with it)
+            if !self.st_stream.is_null() {
+                cuda::stream_sync(self.st_stream);
+                cuda::stream_destroy(self.st_stream);
+            }
+            cuda::event_destroy(self.st_ev_go);
+            cuda::event_destroy(self.st_ev_done);
             for d in self.pf_ring_gu.iter_mut().chain(self.pf_ring_dn.iter_mut()) {
                 cuda::free_dev(d);
             }
