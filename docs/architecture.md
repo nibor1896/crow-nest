@@ -909,7 +909,76 @@ grouped launch is 27 % slower per byte than qkv and z as two separate launches (
    Lowest value, highest risk — last, if ever.
 
 **Nothing in this section flips a default and no engine code changed for it.** `tools/gate-linux.sh`
-is ALL GREEN at this commit (`decode_out/gate62`).
+is ALL GREEN at this commit (`decode_out/gate62`). Lever 1 of the list above landed one day later,
+behind an opt-in flag and still without flipping anything — the paragraph below.
+
+#### Lever 1 landed — `CROW_GDN_SPLIT_Z`, the z slab out of the grouped launch (#71, 2026-09-18)
+
+`CROW_GDN_SPLIT_Z=1` (DEFAULT OFF, opt-in) keeps the grouping for qkv + b + a and launches z
+beside it: `gemv_fp4_mma_g32[323x1]` over 10240 + 48 + 48 = 10336 rows — the kernel's fourth slab
+slot is given ZERO rows through the device scalar `p.zero`, so no warp ever maps into it and its
+pointers are never read — plus, for z's 6144 rows, the `gemv_fp4_mma_d32[192x1]` launch the
+per-slab fallback already uses, verbatim. Launch site `gen.rs:2182`, flag `gen.rs:1611`, one
+`[gdn]` boot line per process names the launch shape in effect. **No new kernel and no kernel
+source change**: `KERNEL_SRC` still defines 117 `__global__`s and the host still resolves 111. The
+GDN layer goes from 7 launches per decode token to 8, 252 per token to 288.
+
+**Bit-identical by construction**, by exactly #62b's argument: every row keeps its k split
+(`bpb = ceil(bpr/ks_n)`, `ks_n = blockDim >> 6` = 4 in both launches), its `bpr` loop bounds, its
+mma order, its two residual levels, its fixed ascending smem slice reduce and its own per-slab
+`gs` at the store; 10240 and 10240 + 48 are both multiples of 16, so the warp-granular group
+selection still never spans two groups. Only WHICH launch and which warp carries the z rows moves.
+**Proven, not only argued** — with the flag ON, parity reproduces the three Linux values of
+record: 8 rows `bceba6ff7724…` at 11,919,360 B, 512 rows `838723470927…`, and — the form that
+matters, because 8 and 512 are prefill-only (`gdn_prompt`) while this is a DECODE-path change —
+**P8 teacher-forced `3bb3e69edf90…`**, 504 of the 512 rows through `decode_step`. The sparse
+decode regime is covered by the generated ids: `decode run` on t1-read carries the sha256
+`56305eee11d6` of record in **12 of 12 runs** across both arms (`decode_out/71/`).
+
+**Measured** (RTX 5090 / Arch Linux, 2026-09-18, `decode run decode_out/srv-a5-t1read-ids.json 256`
+— 16,064 ids, greedy, 255 timed steps, context 16,320 — one fresh process per run inside the
+bounded scope, W + 3 adjacent pairs, `CROW_ATTN_LUT` and `CROW_STAGE_PAR` unset in BOTH arms so B
+is the operating point of record, `decode_out/71/pair-*.log`):
+
+| pair | B, `CROW_GDN_SPLIT_Z` unset | N, `CROW_GDN_SPLIT_Z=1` | delta ms | percent |
+|---|---|---|---|---|
+| 1 | 25.1230 | 24.9994 | -0.1236 | -0.49 |
+| 2 | 25.2200 | 25.0126 | -0.2074 | -0.82 |
+| 3 | 25.2004 | 24.9707 | -0.2298 | -0.91 |
+| mean | **25.1812 = 39.71 tok/s** | **24.9942 = 40.01 tok/s** | **-0.1869** | **-0.74** |
+
+B spread window 0.0969 ms (1.0039), N 0.0419 ms (1.0017), so the gain is **1.9 B spread windows**
+and 0 of 3 pairs go the wrong way; the discarded warm-up W read 25.1207. This is the smallest of
+the three opt-in levers of these two days and the one with the least margin over its own noise —
+1.9 windows against `CROW_ATTN_LUT`'s 15.0 and `CROW_STAGE_PAR`'s 10.0 — which is what a -0.19 ms
+lever on a 25 ms step looks like; the sign is carried by 3 of 3 pairs and by the `CROW_KPROF`
+reading below, which is an independent measurement of the same kernels.
+
+**The `CROW_KPROF` reading, against this section's own prediction** (`CROW_KPROF=1 CROW_PROFILE=1
+CROW_GRAPH=0`, `gen` 256, same binary both arms, `decode_out/71/kp2-on-256.log` and
+`kp2-off-256.log`; the last column removes the 5.0 us per-launch profiler floor, as the tables
+above do):
+
+| arm | the input-projection launches | us/call | us per GDN layer, floor removed | ms per decode token |
+|---|---|---|---|---|
+| `CROW_GDN_SPLIT_Z` unset | `gemv_fp4_mma_g32[515x1]` | 32.7 | 27.7 | **0.997** |
+| `CROW_GDN_SPLIT_Z=1` | `gemv_fp4_mma_g32[323x1]` + `gemv_fp4_mma_d32[192x1]` | 18.2 + 14.4 | 13.2 + 9.4 = 22.6 | **0.814** |
+| delta | one more launch per layer | +0.1 raw (two floors, not one) | **-5.1** | **-0.184** |
+
+The prediction at the head of this list was -5.95 us per layer = about -0.21 ms per decode token,
+from #62's separate readings of qkv[320] 12.50 and z[192] 9.33 against the grouped 27.78. The
+measurement is **-5.1 us per layer = -0.184 ms**, 86 % of it: the 0.8 us that is missing is the
+b and a rows, which now ride inside the qkv launch and take it from the 17.5 us/call #62 read for
+`d32[320x1]` to 18.2 for `g32[323x1]` — the price of never paying their own 7.06 us again. The
+z row reproduces #62's `d32[192x1]` to 0.7 % (14.4 against 14.3) and the untouched out projection
+to 0.9 % (23.3 and 23.5 against 23.3), which is this method's run-to-run agreement. **The two
+measurements agree**: -0.184 ms from the profiler against -0.1869 ms from the pairs, 1.5 % apart
+on numbers taken a different way.
+
+**Not flipped.** The default stays the one grouped launch; the flag is opt-in and robin decides.
+Nothing here needs the ten-task quality gate — the lever is byte-identical, which is the whole
+point of choosing it. `tools/gate-linux.sh` is ALL GREEN with the flag OFF at the landing commit
+(`decode_out/gate71`).
 
 ### 4.8 The cold-expert staging row: 11.7 ms per decode token, and all but 0.3 of it is the PCIe link (#19, 2026-09-18)
 

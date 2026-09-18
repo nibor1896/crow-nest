@@ -982,8 +982,13 @@ impl Engine {
         // reason: every future log says which projection launch produced it.
         // It sits in the [load] block, so the parity gate prints it too.
         let gfi = env_or_unset("CROW_GDN_FUSE_IN");
-        println!("[gdn] decode input projections {}, CROW_GDN_FUSE_IN {} (0 = per-slab fallback of record, four launches)",
-            if gdn_fuse_in_on() { "grouped (default since 19g, one launch)" } else { "per-slab (fallback of record, four launches)" }, gfi);
+        println!("[gdn] decode input projections {}, CROW_GDN_FUSE_IN {} (0 = per-slab fallback of record, four launches), CROW_GDN_SPLIT_Z {} (#71, default off, 1 = z out of the group)",
+            if !gdn_fuse_in_on() { "per-slab (fallback of record, four launches: gemv_fp4_mma_d32[320x1] + [192x1] + two gemv_fp4_mma_d[1x1])".to_string() }
+            else if gdn_split_z_on() { format!("split (71, two launches: gemv_fp4_mma_g32[{}x1] qkv+b+a + gemv_fp4_mma_d32[{}x1] z)",
+                (GDN_CONV + 2 * GDN_VHEADS).div_ceil(32), GDN_VAL.div_ceil(32)) }
+            else { format!("grouped (default since 19g, one launch: gemv_fp4_mma_g32[{}x1] qkv+z+b+a)",
+                (GDN_CONV + GDN_VAL + 2 * GDN_VHEADS).div_ceil(32)) },
+            gfi, env_or_unset("CROW_GDN_SPLIT_Z"));
         // #19f, 2026-09-13: ONE line per engine process names the hyper-
         // connection decode chain form, next to the [gdn] line and for the
         // same reason: every future log says which hc chain produced it.
@@ -1585,6 +1590,25 @@ fn hc_fuse_on() -> bool { env_flag!("CROW_QFUSE", on) }
 /// the combined 19g parity pass over both levers at once
 /// (decode_out/srv-19g.log).
 fn gdn_fuse_in_on() -> bool { env_flag!("CROW_GDN_FUSE_IN", on) }
+/// #71 CROW_GDN_SPLIT_Z=1 (EXACT "1" only, DEFAULT OFF, opt-in; ignored when
+/// CROW_GDN_FUSE_IN=0 selects the per-slab fallback): the grouped GDN decode
+/// input launch keeps qkv + b + a (10240 + 48 + 48 = 10336 rows, 323 blocks of
+/// gemv_fp4_mma_g32) and the z slab moves out to the existing
+/// gemv_fp4_mma_d32[192x1] launch beside it. The fourth slot of the grouped
+/// kernel is given ZERO rows through the device scalar `p.zero`, so no warp
+/// ever maps into it and its pointers are never dereferenced.
+/// BIT-IDENTICAL BY CONSTRUCTION, the #62b argument exactly: every row keeps
+/// its k split (bpb = ceil(bpr/ks_n), ks_n = blockDim >> 6), its bpr loop
+/// bounds, its mma order, its two residual levels, its fixed ascending smem
+/// slice reduce and its own per-slab `gs` at the store - only WHICH launch and
+/// which warp carries the z rows moves. 10240 and 10240+48 are both multiples
+/// of 16, so the warp-granular group selection still never spans two groups.
+/// MEASURED BASIS (the #62 decomposition, docs/architecture.md 4.7): the
+/// grouped 515-block launch reads 854 GB/s over 27.78 us per layer while the
+/// same bytes as qkv[320] + z[192] read 1,180 and 948 GB/s over 12.50 + 9.33 =
+/// 21.83 us - about -5.95 us per layer = -0.21 ms per decode token over the
+/// 36 GDN layers, at the cost of one more launch per layer (7 -> 8).
+fn gdn_split_z_on() -> bool { env_flag!("CROW_GDN_SPLIT_Z", exact1) }
 
 /// CROW_QFUSE=1 (19h, EXACT "1" only; unset keeps the default of record):
 /// the shared-expert decode chain fuses the two gate|up gemv_fp4_mma_d
@@ -2155,7 +2179,31 @@ launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
         };
         if dense_mma_on() {
             quant_x_if_unfused(k, p, 1, mixed as u64, s.xq_m as u64, p.n2560 as u64, p.n2560 as u64);
-            if gdn_fuse_in_on() {
+            if gdn_fuse_in_on() && gdn_split_z_on() {
+                // #71 (62 lever 1): the grouping stays for qkv + b + a
+                // (10240 + 48 + 48 = 10336 rows, ceil(/32) = 323 blocks) and
+                // the z slab runs beside it through the SAME gemv_fp4_mma_d32
+                // launch the per-slab fallback below uses, verbatim. The
+                // fourth grouped slot gets 0 rows (p.zero), so `total` = s3
+                // and no warp maps into it - its w/gs/y pointers are never
+                // dereferenced (the group reads sit under `active`). Per-row
+                // math unchanged in both launches: same k split, same bpb,
+                // same mma order, same residual levels, same fixed smem
+                // reduce, same per-slab gs -> bit-identical by construction.
+                // (`Dev` is already `u64`, so these two argument lists carry no
+                // `as u64` and the two grids use `div_ceil`. That is 27 clippy
+                // warnings the neighbouring launches do emit and these do not,
+                // which is how the gate's CLIPPY stays at its 1421 of record.)
+                launch_v(k.f("gemv_fp4_mma_g32"), (GDN_CONV + 2 * GDN_VHEADS).div_ceil(32) as u32, 1, 1, mma_bx32(), &[
+                    qkv.w, b.w, a.w, a.w,
+                    qkv.gs, b.gs, a.gs, a.gs,
+                    s.mq, s.gb, s.ga, s.ga,
+                    p.n10240, p.nr48, p.nr48, p.zero,
+                    s.xq_m, p.n2560]);
+                launch_v(k.f("gemv_fp4_mma_d32"), GDN_VAL.div_ceil(32) as u32, 1, 1, mma_bx32(), &[
+                    z.w, s.xq_m, z.gs, s.gz,
+                    p.n2560, p.n6144, p.n6144]);
+            } else if gdn_fuse_in_on() {
                 // #62b lever 1: the four input projections in ONE grouped
                 // launch (qkv 10240 + z 6144 + b 48 + a 48 rows, all k 2560
                 // over the shared xq_m row); per-slab gs kept, per-row math =

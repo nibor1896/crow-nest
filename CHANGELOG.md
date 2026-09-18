@@ -6,7 +6,7 @@
 
 ## v0.3.1 (unreleased) — the reasoning filter, and what the 170k session really was
 
-- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Fifteen issues so far: `#67` (the
+- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Sixteen issues so far: `#67` (the
   reasoning filter, `667b68b`), the engine side of `#68` (the long-context measurement, `f14e557`),
   `#49` (the ragged hot-set sidecar, `0adbe6a`), `#60` (the `parity` record header per arm, and
   the last two bins that hard-coded the pre-`#51` container, `784bd64`), `#54` (the gone-client
@@ -22,7 +22,8 @@
   cold-expert staging row taken apart, and the opt-in `CROW_STAGE_PAR` lever it named, 2026-09-18)
   and `#69` (the layer-3 sub-block check that F5 found returning zeros, repaired and added to the
   package self-test, 2026-09-18) and `#10` (the router GEMM second probe, and the ten-task quality
-  reference it re-based, 2026-09-18 — no engine code).
+  reference it re-based, 2026-09-18 — no engine code) and `#71` (`#62` lever 1: the z slab out of
+  the grouped GDN input launch, and the opt-in `CROW_GDN_SPLIT_Z` it rides on, 2026-09-18).
   The machine is the second environment block of `docs/system-landscape.md` unless a row names another one.
 - The crate version field stays `0.1.0`, as it has for every release: this file is the record.
 
@@ -333,6 +334,38 @@
   rows (`check_env_docs` exit 0, 82 = 82).
 
 ### Added
+
+- **`CROW_GDN_SPLIT_Z` — the z slab leaves the grouped GDN input launch and runs beside it**
+  (`#71`, `#62` lever 1, 2026-09-18, DEFAULT OFF, opt-in). `CROW_GDN_SPLIT_Z=1` keeps the grouping
+  for qkv + b + a — `gemv_fp4_mma_g32[323x1]` over 10240 + 48 + 48 = 10336 rows, the kernel's
+  fourth slab slot given ZERO rows through the device scalar `p.zero`, so no warp ever maps into
+  it and its pointers are never read — and launches z's 6144 rows through the
+  `gemv_fp4_mma_d32[192x1]` the per-slab fallback already uses, verbatim, beside it. The GDN layer
+  goes from 7 launches per decode token to 8. **No new kernel and no kernel source change**:
+  `KERNEL_SRC` still defines 117 `__global__`s and the host still resolves 111. One `[gdn]` boot
+  line per process names the launch shape in effect.
+
+  **Bit-identical by construction**, by exactly `#62b`'s argument: every row keeps its k split
+  (`bpb = ceil(bpr/ks_n)`, `ks_n = 4` in both launches), its `bpr` loop bounds, its mma order, its
+  two residual levels, its fixed ascending smem slice reduce and its own per-slab `gs` at the
+  store; 10240 and 10240 + 48 are both multiples of 16, so the warp-granular group selection never
+  spans two groups. Only WHICH launch carries the z rows moves. Proven with the flag ON against
+  the three Linux values of record (8 rows `bceba6ff7724…` at 11,919,360 B, 512 rows
+  `838723470927…` and the P8 teacher-forced `3bb3e69edf90…`, the form that matters here because 8
+  and 512 are prefill-only while this is a DECODE-path change) plus the sparse regime: `decode run`
+  on t1-read carries the ids sha256 `56305eee11d6` of record in **12 of 12 runs** across both arms.
+
+  **Measured** (RTX 5090 / Arch Linux, 2026-09-18, t1-read 16,064 ids, 256 tokens, 255 timed steps,
+  one fresh process per run, W + 3 adjacent pairs, `CROW_ATTN_LUT` and `CROW_STAGE_PAR` unset in
+  both arms, `decode_out/71/`): B mean **25.1812 ms per decode token = 39.71 tok/s** against N
+  **24.9942 = 40.01 tok/s**, **-0.1869 ms = -0.74 percent**, 3 of 3 pairs favour N (-0.1236 /
+  -0.2074 / -0.2298) at 1.9 B spread windows (B window 0.0969 ms, N 0.0419), W 25.1207. Under
+  `CROW_KPROF=1 CROW_PROFILE=1 CROW_GRAPH=0` the two launches read 18.2 + 14.4 us per call against
+  the grouped 32.7 — floor-removed 22.6 us per GDN layer against 27.7, **-5.1 us per layer =
+  -0.184 ms per decode token**, which is the pairs' number taken a different way (1.5 percent
+  apart) and 86 percent of the -0.21 ms `docs/architecture.md` 4.7 predicted from `#62`'s separate
+  slab readings; the missing 0.8 us is the b and a rows now riding inside the qkv launch. Default
+  NOT flipped; the record is `docs/architecture.md` 4.7, `docs/env.md` row (88 -> 89).
 
 - **`CROW_STAGE_PAR` — the cold-expert staging copy runs beside the shared expert instead of in
   front of it** (`#19`, 2026-09-18, DEFAULT OFF, opt-in). `CROW_STAGE_PAR=1` issues `stage_cold_ca`

@@ -151,6 +151,8 @@ parity <phase> <run_index> <crow|llama> <prompts.json> [llama-url] [outprefix]
 
 - On Linux the whole gate is one script: `../tools/gate-linux.sh [outdir]` from the repository root. It runs the three parity forms, `decode run` over 32 ids, `cargo test --release`, clippy and the doc guards against the values of record, prints GREEN or RED per item and exits non-zero on any RED. Nine items; all nine green at commit `8ff2055` on 2026-09-17. Every expected value carries its provenance in the script header. The steps below are the same gate by hand, and the form Windows uses.
 
+- The three opt-in decode levers of 2026-09-18 are DEFAULT OFF and each was proven under this gate with its flag ON, against the same three values: `CROW_ATTN_LUT=1` (issue #61), `CROW_STAGE_PAR=1` (issue #19) and `CROW_GDN_SPLIT_Z=1` (issue #71, the z slab out of the grouped GDN input launch). For a lever on the DECODE path the form that carries the proof is the P8 teacher-forced one: the 8- and 512-row forms are prefill-only, so they cannot see a decode-path change at all. The sparse decode regime is covered separately by `decode run` on the t1-read ids (`decode_out/71/` for #71: the sha256 `56305eee11d6` of record in 12 of 12 runs of both arms).
+
 1. Build the candidate into its own target directory, then record `sha1sum` of both `decode` binaries (`decode.exe` on Windows).
 2. Export the operating point, with `CROW_ADAPT`, `CROW_SAMPLE`, `CROW_CHUNK` and `CROW_CHUNK_AUTO` unset:
 
@@ -222,7 +224,7 @@ cd engine
 cargo test --release
 ```
 
-- 200 passed, 0 failed on 2026-09-18 (113 lib + 78 serve + 6 parity + 3 decode; 165 on 2026-09-17, plus the six of issue #67, the three of issue #68, the three of issue #49, the two of issue #60, the four of issue #54, the four of issue #65, the three of issue #64 and the ten of issue #13), and `cargo clippy --release --all-targets` reports 1,421 warnings, counted as `grep -cE '^warning: '` — one FEWER than the 1,422 of record, because the `redundant reference in eprintln! argument` warning at `gen.rs:2890` no longer exists: that line is a `tracing` event now (issue #13, 2026-09-18). The 154 converted sites and the new `log.rs` add no warning of their own. Both counts are enforced by `../tools/gate-linux.sh`.
+- 202 passed, 0 failed on 2026-09-18 (113 lib + 78 serve + 6 parity + 5 decode; 165 on 2026-09-17, plus the six of issue #67, the three of issue #68, the three of issue #49, the two of issue #60, the four of issue #54, the four of issue #65, the three of issue #64, the ten of issue #13 and the two of issue #69 — the shipped self-test manifest parsed into its two checks and the zero-output refusal, both in `src/bin/decode.rs`). This line said 200 until issue #71 (2026-09-18) brought it back to what the gate has enforced since #69: `../tools/gate-linux.sh` has `TESTS=202`, and the two counts are the same measurement. Also, `cargo clippy --release --all-targets` reports 1,421 warnings, counted as `grep -cE '^warning: '` — one FEWER than the 1,422 of record, because the `redundant reference in eprintln! argument` warning at `gen.rs:2890` no longer exists: that line is a `tracing` event now (issue #13, 2026-09-18). The 154 converted sites and the new `log.rs` add no warning of their own. Both counts are enforced by `../tools/gate-linux.sh`.
 - The ten tokenizer tests need `../models/` and are skipped without it.
 
 ```
@@ -230,4 +232,4 @@ python3 ../tools/check_env_docs.py
 python3 ../tools/check_readme_dates.py
 ```
 
-- The two doc guards need no GPU and no model: `check_env_docs` reads `code 88, doc 88` and exits 0 (82 = 82 before the four `CROW_LOG*` rows of issue #13, 86 = 86 before the `CROW_ATTN_LUT` row of issue #61 and 87 = 87 before the `CROW_STAGE_PAR` row of issue #19, all 2026-09-18), `check_readme_dates` reports 0 offenders.
+- The two doc guards need no GPU and no model: `check_env_docs` reads `code 89, doc 89` and exits 0 (82 = 82 before the four `CROW_LOG*` rows of issue #13, 86 = 86 before the `CROW_ATTN_LUT` row of issue #61, 87 = 87 before the `CROW_STAGE_PAR` row of issue #19 and 88 = 88 before the `CROW_GDN_SPLIT_Z` row of issue #71, all 2026-09-18), `check_readme_dates` reports 0 offenders.
