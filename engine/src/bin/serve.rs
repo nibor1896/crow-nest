@@ -30,6 +30,10 @@
 //! - A garbage request line answers 400 JSON with `{"error":"bad request"}`.
 //! - A client that sent nothing is closed silently, without a response.
 //! - The write half is shut down after the response is flushed.
+//! - #54: a `stream:false` generation is ended when its client is gone.
+//! - The probe is one `poll(POLLRDHUP)` on the request socket between two decode steps.
+//! - Linux only (`POLLRDHUP`); elsewhere the probe is inert and that path is as it was.
+//! - A client that only half-closed its write side still gets its document (7.11.18).
 //! - The parsed body is kept as `Vec<u8>` for A3 and A4; A2 routes ignore it.
 //!
 //! Operating point (M1 decisions, robin 2026-09-09):
@@ -513,6 +517,14 @@ const DEFAULT_TOP_K: usize = 20;
 const DEFAULT_PRESENCE: f32 = 1.5;
 /// #28: RNG seed when the request carries none; fixed, so warm equals cold (M1)
 const DEFAULT_SEED: u64 = 0;
+/// #54: how many decode steps of the `stream:false` path ONE gone-client probe covers.
+/// 1 means every step, and that is what the measurement bought: one probe is a single
+/// `poll` on one descriptor, no byte read and no byte written, 0.10 us mean and 0.14 us
+/// worst over 1,000,000 calls (2026-09-18, this machine) against a 13.6 ms token on the
+/// live serve (27 ms at the 16k reading of record) - one 136,000th of the budget at worst.
+/// A cadence of k would buy nothing measurable and would pay for it with k-1 further steps
+/// of a generation nobody is reading (7.11.18).
+const PROBE_EVERY: usize = 1;
 
 /// #68: which sampling fields the REQUEST carried, so the `[chat]` line can say per value
 /// whether it came from the client or from the data sheet `serve` fills in.
@@ -2013,6 +2025,156 @@ fn sse_send<W: Write>(w: &mut W, text: &str) -> bool {
     }
 }
 
+// ------------------------------------------------------- #54 the gone-client probe
+
+/// the four `revents` bits this probe reads, by their Linux values. They are named here and
+/// not taken from `libc` so the decision below is pure, testable and compiled on every
+/// platform; `the_probe_reads_the_kernels_own_revents_bits` asserts them against `libc` on
+/// Linux, which is the only platform that polls.
+const PROBE_ERR: i16 = 0x008; // POLLERR
+const PROBE_HUP: i16 = 0x010; // POLLHUP
+const PROBE_NVAL: i16 = 0x020; // POLLNVAL
+const PROBE_RDHUP: i16 = 0x2000; // POLLRDHUP (Linux's own bit)
+
+/// - #54: what ONE probe of the request socket found
+/// - `Open`: nothing to report. Unread request bytes are NOT a report - this asks about the
+///   peer's READ side, never about what it still has to say, so `POLLIN` is not requested.
+/// - `Eof`: the peer sent FIN. `close()` and `shutdown(Write)` are the SAME wire event and no
+///   kernel can tell them apart (measured 2026-09-18: both give `POLLIN|POLLRDHUP` and
+///   `recv(MSG_PEEK) == 0`, and the TCP state is `CLOSE_WAIT` either way), so this on its own
+///   is not "the client is gone" - see `gone_reason`.
+/// - `Hup`: the peer RESET the connection, or the descriptor is unusable (`POLLERR`, `POLLHUP`,
+///   `POLLNVAL`). Unambiguous at any time, and the only thing a write would have discovered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Peer {
+    Open,
+    Eof,
+    Hup,
+}
+
+/// - #54: pure: what `poll`'s return value and the `revents` of ONE descriptor mean
+/// - `rc < 0` is `EINTR` or a bad argument, `rc == 0` is "no bit set": both are `Open`. A
+///   signal that interrupts the probe must not end a generation.
+fn peer_from_poll(rc: i32, revents: i16) -> Peer {
+    if rc <= 0 {
+        return Peer::Open;
+    }
+    if revents & (PROBE_ERR | PROBE_HUP | PROBE_NVAL) != 0 {
+        Peer::Hup
+    } else if revents & PROBE_RDHUP != 0 {
+        Peer::Eof
+    } else {
+        Peer::Open
+    }
+}
+
+/// - #54: pure: `true` when step `step` of the generation carries a probe
+/// - `every == 1` (`PROBE_EVERY`) is every step; `every == 0` would disable the probe
+fn probe_due(step: usize, every: usize) -> bool {
+    every > 0 && step.is_multiple_of(every)
+}
+
+/// - #54: pure: the decision, and the reason the `[chat]` line names
+/// - `base_eof` is what the FIRST probe of this request found, taken before the prefill.
+/// - A reset is gone at any time: nothing else can produce `POLLERR`/`POLLHUP` here.
+/// - An EOF that appears DURING the generation is gone: the client whose read side was open
+///   when this request started has closed the connection while it was our turn to speak.
+/// - An EOF that was ALREADY there is NOT gone: a client that half-closed its write side
+///   after sending the request is waiting for the answer, and since the kernel cannot tell
+///   that client from one that left, it gets its answer. (No client of record does it - curl
+///   and Python `requests` keep the read side open until the response arrives - but a
+///   `shutdown(Write)` client is legal HTTP and must not lose its document.)
+fn gone_reason(base_eof: bool, p: Peer) -> Option<&'static str> {
+    match p {
+        Peer::Open => None,
+        Peer::Hup => Some("the peer reset the connection (POLLERR/POLLHUP/POLLNVAL)"),
+        Peer::Eof if !base_eof => {
+            Some("the peer closed the connection mid-generation (POLLRDHUP; its read side was open at the first probe)")
+        }
+        Peer::Eof => None,
+    }
+}
+
+/// - #54: ONE probe of `fd`: `poll` with timeout 0. No byte is read, no byte is written, and
+///   nothing goes on the wire - a zero-byte write sends no segment, so it could not tell a
+///   closed peer from a live one anyway.
+/// - `events` asks for `POLLRDHUP` alone; `POLLERR`, `POLLHUP` and `POLLNVAL` are reported
+///   whether they were asked for or not, and `POLLIN` would fire on unread request bytes.
+#[cfg(target_os = "linux")]
+fn poll_peer(fd: i32) -> Peer {
+    let mut p = libc::pollfd { fd, events: PROBE_RDHUP, revents: 0 };
+    // unsafe: one `poll` on one descriptor this process owns, timeout 0, no allocation
+    let rc = unsafe { libc::poll(&mut p, 1, 0) };
+    peer_from_poll(rc, p.revents)
+}
+
+/// #54: every other platform has no `POLLRDHUP`, so the document path there is what it was
+/// before this fix: the generation runs its budget out. The Windows build compiles, and the
+/// SSE path detects a gone client by its failed flush on every platform.
+#[cfg(not(target_os = "linux"))]
+fn poll_peer(_fd: i32) -> Peer {
+    Peer::Open
+}
+
+/// #54: the descriptor of the request socket, borrowed for the length of the request.
+/// `None` on a platform that cannot probe, which makes the whole watch inert.
+#[cfg(target_os = "linux")]
+fn socket_fd(stream: &TcpStream) -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+    Some(stream.as_raw_fd())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn socket_fd(_stream: &TcpStream) -> Option<i32> {
+    None
+}
+
+/// - #54: the gone-client watch of ONE `stream:false` request
+/// - Why it exists: the SSE path learns that its client left from the next failed flush
+///   (`sse_send`), and the document path writes NOTHING until the generation is over. So a
+///   client that disconnected after a `stream:false` POST with `max_tokens: 512` held the one
+///   slot of this process for the whole budget - the one asymmetry between the two sinks.
+/// - What it holds: the descriptor (borrowed - the `TcpStream` of `serve_one` owns it for the
+///   whole request and closes it), and what the FIRST probe found.
+/// - `Default` is the no-socket form: `fd` `None`, so `gone` is always `None` and every unit
+///   test and every non-Linux build runs the loop exactly as it ran before #54.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClientProbe {
+    fd: Option<i32>,
+    /// the baseline: `true` when the peer had already closed its write side before the first
+    /// decode step, which is a client that finished SENDING, not one that left
+    base_eof: bool,
+}
+
+impl ClientProbe {
+    /// - #54: the watch of one request, with its baseline taken HERE
+    /// - the baseline is taken before the prefill and after the body, the head, the template
+    ///   render and the tokenizer: a half-closing client's FIN travels the loopback in
+    ///   microseconds and those steps cost milliseconds, so a `shutdown(Write)` sent with the
+    ///   request is in long before this, while a client that dies during the prefill is not
+    ///   (its EOF appears at a later probe and is therefore gone, as it should be)
+    fn new(fd: Option<i32>) -> Self {
+        let base_eof = matches!(fd.map(poll_peer), Some(Peer::Eof));
+        if base_eof {
+            eprintln!(
+                "[chat] the client had already closed its write side when this request started \
+                 (POLLRDHUP at the first probe): a client that finished SENDING, not one that \
+                 left - the document is generated and answered as before (#54)"
+            );
+        }
+        ClientProbe { fd, base_eof }
+    }
+
+    /// one probe at step `step`: `Some(reason)` when this client is gone and the loop must stop
+    fn gone(&mut self, step: usize) -> Option<&'static str> {
+        let fd = self.fd?;
+        if !probe_due(step, PROBE_EVERY) {
+            return None;
+        }
+        gone_reason(self.base_eof, poll_peer(fd))
+    }
+}
+
 /// - #39 B3a: where the per token side effects of ONE generation go
 /// - the SSE writer is one implementation, the collector behind the non streaming document
 ///   is the other; `chat_generate` stays the only generation loop in this file
@@ -2026,6 +2188,14 @@ trait ChatSink {
     fn on_reasoning(&mut self, c: &ChunkCtx, text: &str) -> bool;
     /// after the last token: the final chunk plus `[DONE]`, nothing for a document
     fn on_finish(&mut self, c: &ChunkCtx, a: &FinishArgs) -> bool;
+    /// - #54: between two decode steps: `false` means the client is gone and the loop stops
+    /// - the default is `true`, and that is the SSE path: a sink that writes and flushes per
+    ///   token learns of a gone client from its next failed flush, which is what it has always
+    ///   done. The document sink writes nothing until the generation is over, so it overrides
+    ///   this and asks the socket (`ClientProbe`, 7.11.18).
+    fn still_there(&mut self, _step: usize) -> bool {
+        true
+    }
 }
 
 /// the A4/A5 sink: one flushed SSE frame per piece, over any writer
@@ -2078,6 +2248,17 @@ struct CollectSink {
     reasoning: String,
     /// one entry per tool call index, in the order the parser opened them
     calls: Vec<CallBuf>,
+    /// #54: the gone-client watch of this request. `Default` holds no descriptor and never
+    /// fires, which is what every unit test of this sink gets.
+    probe: ClientProbe,
+}
+
+impl CollectSink {
+    /// #54: the document sink of a LIVE request, watching the socket the one document will go
+    /// out on. The baseline probe of `ClientProbe::new` is taken here, before the prefill.
+    fn watching(stream: &TcpStream) -> Self {
+        CollectSink { probe: ClientProbe::new(socket_fd(stream)), ..Default::default() }
+    }
 }
 
 impl ChatSink for CollectSink {
@@ -2110,6 +2291,19 @@ impl ChatSink for CollectSink {
     }
     fn on_finish(&mut self, _c: &ChunkCtx, _a: &FinishArgs) -> bool {
         true
+    }
+    /// #54: the one sink that has to ASK. One `poll` per step, and one loud line when it fires.
+    fn still_there(&mut self, step: usize) -> bool {
+        match self.probe.gone(step) {
+            None => true,
+            Some(why) => {
+                eprintln!(
+                    "[chat] the client is gone at step {step}: {why} - ending the generation, \
+                     the slot is free for the next request (#54)"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -2443,12 +2637,17 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
 ///   other JSON route of this server
 /// - nothing reaches the socket before the document, so a mid generation failure is still
 ///   a JSON answer, not a half written stream
+/// - #54: because nothing reaches the socket before the document, this path cannot learn of a
+///   gone client from a failed write the way the stream does - so `CollectSink` watches the
+///   socket between the decode steps (`ClientProbe`, 7.11.18) and the generation ends when the
+///   client is gone instead of running the whole `max_tokens` budget out
 fn chat_document(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]) -> &'static str {
     let tk = match crow_nest_engine::tokenizer::global() {
         Ok(t) => t,
         Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(e)),
     };
-    let mut sink = CollectSink::default();
+    // #54: the sink watches the request socket from here on - see `ClientProbe`
+    let mut sink = CollectSink::watching(stream);
     let out = chat_generate(srv, req, ids, tk, &mut sink);
     let doc = completion_json(
         &ChunkCtx::new(&out.id, out.created, &req.model),
@@ -2458,7 +2657,15 @@ fn chat_document(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u3
         out.finish,
         &out.timing,
     );
-    respond_json(stream, "200 OK", &doc)
+    // #54: the document is written even for a client that is gone - one document shape, and
+    // the write either lands in a socket nobody reads or fails with one `[serve]` line. The
+    // STATUS says which it was, the way `chat_stream` has always said it.
+    let status = respond_json(stream, "200 OK", &doc);
+    if out.aborted {
+        "200 OK (client gone)"
+    } else {
+        status
+    }
 }
 
 /// - #39 B3a: what one shared generation produced, whatever its sink did with it
@@ -2472,7 +2679,7 @@ struct GenOut {
     finish: &'static str,
     /// the counts and walls behind `usage` and `timings`
     timing: Timing,
-    /// a sink call refused: the client is gone and the loop stopped early
+    /// a sink call refused, or the #54 probe found the client gone: the loop stopped early
     aborted: bool,
 }
 
@@ -2493,6 +2700,9 @@ fn trickle_ready(eng: &Engine) -> bool {
 ///   and prefills `ids[P..]`, a cold one runs `reset_to_zero` and prefills everything
 /// - ONE snapshot per request, unconditional (M2b, #36): after the prompt
 /// - a sink refusal breaks the loop; the next request rolls back or resets before any prefill
+/// - #54: one `ChatSink::still_there` probe between two decode steps, which is how the
+///   `stream:false` path ends a generation whose client is gone (the stream path answers
+///   `true` there and learns the same thing from its next failed flush)
 fn chat_generate(
     srv: &mut Srv,
     req: &ChatReq,
@@ -2687,6 +2897,15 @@ fn chat_generate(
             }
             // the budget is spent: no decode_step whose token nobody reads
             if i + 1 == req.max_tokens {
+                break;
+            }
+            // #54: BETWEEN two steps, ask whether the client is still there. The SSE sink
+            // answers `true` here and learns it from its next failed flush instead; the
+            // document sink probes the socket, because it writes nothing until the end and a
+            // gone client would otherwise hold this slot for the whole `max_tokens` budget.
+            // One `poll`, 0.10 us, per step (`PROBE_EVERY`, 7.11.18).
+            if !sink.still_there(i) {
+                aborted = true;
                 break;
             }
             // #37: the tick sits INSIDE the decode window, as it does in `decode.rs`, so
@@ -5349,6 +5568,159 @@ mod tests {
         // the marked byte is where serde stopped: the window's left half ends with what
         // came before it, so the defect itself is the first thing after `<HERE>`
         assert!(w.contains(r#"<HERE> "1}""#), "the window must start at the offending byte: {w}");
+    }
+
+    /// #54: the pure decision table of the gone-client probe, plus the `revents` bits it
+    /// reads. Every line of `gone_reason` and every branch of `peer_from_poll` is here, and
+    /// on Linux the four constants are asserted against the kernel's own values - they are
+    /// written out so the decision compiles and is tested on a platform without `poll`.
+    #[test]
+    fn the_probe_reads_the_kernels_own_revents_bits() {
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(PROBE_ERR, libc::POLLERR, "POLLERR");
+            assert_eq!(PROBE_HUP, libc::POLLHUP, "POLLHUP");
+            assert_eq!(PROBE_NVAL, libc::POLLNVAL, "POLLNVAL");
+            assert_eq!(PROBE_RDHUP, libc::POLLRDHUP, "POLLRDHUP");
+        }
+        // nothing set, and the two non-results of the syscall itself: a timeout (0) and an
+        // interrupted call (-1, EINTR). A signal may not end a generation.
+        assert_eq!(peer_from_poll(0, 0), Peer::Open);
+        assert_eq!(peer_from_poll(-1, 0), Peer::Open);
+        assert_eq!(peer_from_poll(-1, PROBE_RDHUP), Peer::Open);
+        // unread request bytes are not a report about the peer's read side
+        assert_eq!(peer_from_poll(1, 0x001), Peer::Open);
+        // EOF, and a reset; a reset outranks the EOF that comes with it
+        assert_eq!(peer_from_poll(1, PROBE_RDHUP), Peer::Eof);
+        assert_eq!(peer_from_poll(1, 0x001 | PROBE_RDHUP), Peer::Eof);
+        assert_eq!(peer_from_poll(1, PROBE_ERR), Peer::Hup);
+        assert_eq!(peer_from_poll(1, PROBE_HUP), Peer::Hup);
+        assert_eq!(peer_from_poll(1, PROBE_NVAL), Peer::Hup);
+        assert_eq!(peer_from_poll(1, 0x001 | PROBE_ERR | PROBE_HUP | PROBE_RDHUP), Peer::Hup);
+
+        // the decision: a reset is gone whatever the baseline was
+        for base in [false, true] {
+            let why = gone_reason(base, Peer::Hup).expect("a reset is always gone");
+            assert!(why.contains("reset"), "{why}");
+            assert_eq!(gone_reason(base, Peer::Open), None);
+        }
+        // an EOF that appears during the generation is gone, and the reason names the bit
+        let why = gone_reason(false, Peer::Eof).expect("an EOF that was not there before is gone");
+        assert!(why.contains("POLLRDHUP"), "{why}");
+        assert!(why.contains("mid-generation"), "{why}");
+        // an EOF that was ALREADY there is a client that finished sending: it gets its answer
+        assert_eq!(gone_reason(true, Peer::Eof), None);
+    }
+
+    /// #54: the cadence. `PROBE_EVERY` is 1 - every step - because one probe is 0.10 us
+    /// against a ~27 ms token; the rule is written for any k so raising the constant needs
+    /// no second reading of it, and k = 0 is the off switch.
+    #[test]
+    fn the_probe_cadence_is_every_k_steps() {
+        assert_eq!(PROBE_EVERY, 1, "the constant of record");
+        // every step, which is what this server runs
+        assert!((0..8).all(|i| probe_due(i, PROBE_EVERY)));
+        // every eighth step, first the one that opens the generation
+        assert_eq!(
+            (0..17).filter(|&i| probe_due(i, 8)).collect::<Vec<_>>(),
+            vec![0, 8, 16]
+        );
+        assert_eq!((0..7).filter(|&i| probe_due(i, 4)).collect::<Vec<_>>(), vec![0, 4]);
+        // k = 0 probes never; a 512-step budget with k = 8 costs 64 probes, that is 6.4 us
+        assert!(!probe_due(0, 0) && !probe_due(7, 0));
+        assert_eq!((0..512).filter(|&i| probe_due(i, 8)).count(), 64);
+    }
+
+    /// #54: the probe against a REAL loopback socket, the three shapes that matter. No
+    /// engine, no GPU: a `TcpListener` on port 0 and one client thread.
+    ///
+    /// The point of the third case is the one the design turns on: a client that closed the
+    /// connection and a client that only shut its WRITE side down are the same wire event,
+    /// so the probe reports `Eof` for both and only the baseline tells them apart.
+    #[test]
+    fn the_probe_sees_a_closed_peer_and_not_a_live_one() {
+        use std::sync::mpsc;
+
+        // wait for the FIN to arrive: on the loopback it is there at once, but a bounded
+        // retry keeps this test off the scheduler's mercy
+        fn wait_eof(fd: Option<i32>) -> Peer {
+            for _ in 0..200 {
+                let p = fd.map(poll_peer).unwrap_or(Peer::Open);
+                if p != Peer::Open {
+                    return p;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Peer::Open
+        }
+
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        let (tx, rx) = mpsc::channel::<&'static str>();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            c.write_all(b"POST /v1/chat/completions\r\n\r\n").expect("write");
+            // 1) still there
+            assert_eq!(rx.recv().expect("step 1"), "half-close");
+            // 2) the write side only, and the read side kept open, waiting for the document
+            c.shutdown(Shutdown::Write).expect("shutdown write");
+            assert_eq!(rx.recv().expect("step 2"), "close");
+            // 3) gone
+            drop(c);
+        });
+        let (srv, _) = l.accept().expect("accept");
+        let fd = socket_fd(&srv);
+
+        // 1) a live client with unread bytes in the socket is OPEN, and a probe at any step
+        //    of any cadence says so
+        let mut probe = ClientProbe::new(fd);
+        assert!(!probe.base_eof, "a live client is not an EOF baseline");
+        for step in 0..4 {
+            assert_eq!(probe.gone(step), None, "step {step} of a live client");
+        }
+
+        // 2) the half-closed client: the probe reports EOF, and the decision keeps generating
+        //    only because the BASELINE of that request saw the same EOF
+        tx.send("half-close").expect("tell the client");
+        let p = wait_eof(fd);
+        assert_eq!(p, Peer::Eof, "a shutdown(Write) client must read as an EOF");
+        assert!(probe.gone(0).is_some(), "an EOF that was not there at the baseline is gone");
+        let mut half = ClientProbe::new(fd);
+        assert!(half.base_eof, "the baseline of a request that starts half-closed");
+        for step in 0..4 {
+            assert_eq!(half.gone(step), None, "a half-closed client still gets its document");
+        }
+
+        // 3) the real thing: the client closes the whole connection. The wire event is the
+        //    one of case 2, which is why the baseline is the whole decision.
+        tx.send("close").expect("tell the client");
+        client.join().expect("the client thread");
+        assert_eq!(wait_eof(fd), Peer::Eof, "a closed peer reads as an EOF too");
+        let mut gone = ClientProbe::new(fd);
+        assert!(gone.base_eof, "and it is indistinguishable at the baseline");
+        assert_eq!(gone.gone(0), None, "which is exactly why the baseline latches");
+        // the request that was already running is the case #54 is about, and it stops
+        let why = probe.gone(1).expect("the client of THIS request is gone");
+        assert!(why.contains("POLLRDHUP"), "{why}");
+    }
+
+    /// #54: the sink side. A `CollectSink` with no socket behind it - the shape every other
+    /// test of this file builds - never reports a gone client, so nothing about the document
+    /// path changed for a client that stays. The stream sink answers `true` by the trait's
+    /// default: its detector is the failed flush, and that is unchanged.
+    #[test]
+    fn a_document_sink_without_a_socket_never_stops_the_loop() {
+        let mut col = CollectSink::default();
+        assert_eq!(col.probe, ClientProbe::default());
+        for step in 0..512 {
+            assert!(col.still_there(step), "step {step}");
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        let mut sse = SseSink::new(&mut buf);
+        for step in 0..8 {
+            assert!(sse.still_there(step), "the stream sink keeps the default at step {step}");
+        }
+        assert!(buf.is_empty(), "the probe may not put a byte on the wire");
     }
 
     /// the accumulator is Crow's own: one string per call index, in fragment order

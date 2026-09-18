@@ -1455,6 +1455,7 @@ C:/x/y.md
 | `usage` | `usage_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1109` (`usage_json`), `serve.rs:1477` | `probe-suite.py:681-683` (`completion_tokens`) |
 | `timings` | `timings_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1122` (`timings_json`), `serve.rs:1477` | neither caller reads it |
 | headers | `application/json`, `Content-Length`, `Connection: close`, as on every other JSON route | `serve.rs:2099` (`chat_document`), `serve.rs:1947` (`respond`) | `urllib.request` in both callers |
+| a client that is GONE | since `#54` (2026-09-18) the generation ENDS instead of running the whole `max_tokens` budget out: one `poll(POLLRDHUP)` on the request socket between two decode steps, `PROBE_EVERY = 1` (7.11.18). A client that only half-closed its write side still gets its document. | `ClientProbe`, `CollectSink::still_there`, `chat_document` | — |
 
 **The decisions #39 took, and why:**
 
@@ -1477,6 +1478,7 @@ C:/x/y.md
 | engine counters and the `Timing` block | `chat_generate` | yes |
 | the three `[chat]` stderr lines, `[chat] ids` included | `chat_generate` | yes |
 | the per delta side effect | `ChatSink::on_emit` (`serve.rs:1327`) | no, this is the split |
+| the gone-client detector | `ChatSink::still_there` — the failed flush of `SseSink` (the trait default), the socket probe of `CollectSink` (#54, 7.11.18) | no, this is the split |
 | the wire form | `SseSink` writes frames (`serve.rs:1346`), `CollectSink` fills two strings (`serve.rs:1397`) | no |
 | the route switch | `chat_route` (`serve.rs:1532`), branch at `serve.rs:2062` | no |
 
@@ -1791,6 +1793,83 @@ answers normally under greedy, the card row and Crow's row alike. The sampler is
 cause of the degeneration, and neither is `#67`; the trigger is context length on this model and
 quant. `tools/replay-session.py` and `tools/longctx-gate.py` are the two commands that reproduce it.
 
+**7.11.18 The gone-client probe of the `stream:false` path (#54, 2026-09-18)**
+
+The asymmetry the whole-branch review of 2026-09-11 found: `CollectSink`'s methods returned
+`true` unconditionally, so the document path could not notice a client that left. The stream
+path learns it from the first failed flush (`sse_send`), because it writes and flushes per
+token; the document path writes NOTHING until the generation is over, so a client that
+disconnected after a `stream:false` POST with `max_tokens: 512` held the one slot of this
+process for the whole budget. Measured on this machine before the fix: the dropped request ran
+`generated 512 tok, decode 8097.1 ms, finish length` to the end and the next request waited
+**7.463 s** (`decode_out/gate54/gone-client-pre2.txt`).
+
+**What the probe is, and what it cannot be.** One `poll` on the request socket's descriptor
+with `timeout 0`, `events = POLLRDHUP`, between two decode steps. No byte is read and no byte
+is written: a zero-byte write sends no segment, so it cannot tell a closed peer from a live one
+either. The one thing a probe cannot do is separate the two meanings of a FIN by itself
+(measured 2026-09-18, five client shapes on a loopback socket):
+
+| what the client did | `poll` revents | `recv(MSG_PEEK)` | what it means |
+|---|---|---|---|
+| nothing, still there | none | `EWOULDBLOCK` | open |
+| `close()` | `POLLIN\|POLLRDHUP` | `Ok(0)` | **gone** |
+| `shutdown(SHUT_WR)`, still reading | `POLLIN\|POLLRDHUP` | `Ok(0)` | finished SENDING, wants its answer |
+| the process `SIGKILL`ed | `POLLIN\|POLLRDHUP` | `Ok(0)` | **gone** |
+| `close()` with `SO_LINGER 0` (RST) | `POLLIN\|POLLERR\|POLLHUP\|POLLRDHUP` | `ECONNRESET` | **gone** |
+
+- Rows 2 and 3 are the SAME wire event and the TCP state is `CLOSE_WAIT` for both. Only a WRITE
+  discovers the difference (the closed peer answers the first byte with an RST, so the second
+  write gives `EPIPE`) — and the document path has nothing it may write yet.
+- So the decision is made at the HTTP layer, with a BASELINE: `ClientProbe::new` probes once
+  when the sink is built — after the body, the head, the template render and the tokenizer, and
+  before the prefill. An EOF that is already there is a client that half-closed after sending
+  its request, and it gets its document. An EOF that appears LATER is a client that was there
+  when this request started and has closed the connection while it was our turn to speak, and
+  the generation ends. `POLLERR`/`POLLHUP`/`POLLNVAL` end it at any time.
+- The race that baseline could lose is bounded by construction: a half-closing client's FIN
+  crosses the loopback in microseconds while the render and the tokenizer cost milliseconds, so
+  it is always in before the baseline; a client that dies during the prefill is NOT in before it
+  and is therefore correctly gone at the first in-loop probe.
+- No client of record half-closes: `curl`, Python `requests`/`urllib` and Crow all keep the read
+  side open until the response arrives. It is legal HTTP nonetheless, and `nginx` and
+  `cpp-httplib` (llama-server's HTTP layer) both treat that client as gone — this server does
+  not, and pays one baseline probe for it.
+
+| item | as built | anchor |
+|---|---|---|
+| the probe | `poll(POLLRDHUP)`, `timeout 0`, one descriptor, nothing on the wire | `poll_peer`, `bin/serve.rs` |
+| the cadence | EVERY step (`PROBE_EVERY = 1`); the rule is `probe_due(step, every)` | `bin/serve.rs` |
+| the cost | 0.10 us mean, 0.14 us worst over 1,000,000 calls, against a 13.6 ms token: 1/136,000 | measured 2026-09-18, this machine |
+| the decision | `gone_reason(base_eof, Peer)`, pure, four lines | `bin/serve.rs` |
+| where it is asked | `ChatSink::still_there(step)` between two `decode_step` calls | `chat_generate` |
+| the stream path | the trait default `true` — its detector is the failed flush, unchanged | `SseSink` |
+| the platform | Linux only (`POLLRDHUP`); elsewhere the probe is inert and that path is what it was | `#[cfg(target_os = "linux")]` |
+| the log | one `[chat]` line naming the reason and the step, plus `client gone` on the summary line | `CollectSink::still_there` |
+| the status | `[serve] ... -> 200 OK (client gone)`, the label `chat_stream` has always used | `chat_document` |
+| the document | still written: one document shape, and the write either lands unread or fails with one `[serve] response write failed: Broken pipe` line | `chat_document` |
+| `finish_reason` | UNCHANGED (`stop`/`length`/`tool_calls`): no new wire value for a client that is not reading | `chat_generate` |
+
+**Live, at this commit** (`tools/replay-toolcalls.py --gone-client`, the reproducible test;
+`decode_out/gate54/gone-client-post3.txt`):
+
+```text
+[chat] the client is gone at step 62: the peer closed the connection mid-generation (POLLRDHUP; its read side was open at the first probe) - ending the generation, the slot is free for the next request (#54)
+[chat] prompt 39 tok (0 cached, 39 prefilled), generated 63 tok, ... decode 856.4 ms, 72.4 tok/s, finish length, ..., client gone
+```
+
+- The drop is a plain `close()` one second into a `max_tokens: 512` generation: the probe fires
+  at step 62, the generation stops ONE step later at 63 tokens, and the next request is served
+  **0.172 s** after the drop (before the fix: 7.463 s, 512 tokens).
+- The half-closed client in the same run — `shutdown(SHUT_WR)`, then waiting — logs
+  `the client had already closed its write side when this request started` and gets its whole
+  document (32 of 32 tokens, `finish length`).
+- Per-token cost, the server's own `timings.predicted_per_token_ms` at steady state, same prompt
+  and same budget on both builds: **13.592 / 13.617 / 13.592 / 13.604 ms** before,
+  **13.585 / 13.589 / 13.595 ms** after. The probe is below the reading's own spread.
+- Streaming identity: the same greedy prompt answers with the same 355 bytes,
+  `sha256 39cbf9a3fd5d2d61...`, on both builds.
+
 ### 7.12 The stage A gate table (what was measured, and where the artefact is)
 
 **Rule: a gate without a log artefact does not count.**
@@ -1850,7 +1929,7 @@ quant. `tools/replay-session.py` and `tools/longctx-gate.py` are the two command
 - CI (E7, #50, 2026-09-11) runs engine lib **72 of 80** and `bin/serve` **55 of 57** on the
   windows-latest runner (the runner moved to ubuntu-latest with the Linux port on 2026-09-17 and no
   run of that workflow is recorded in this repository yet, so these are still the counts of record
-  for CI while the local counts are the 103 lib / 74 serve / 2 parity of 2026-09-18 above); the gap is 10 tokenizer tests that need `../models/`, not present on a
+  for CI while the local counts are the 103 lib / 78 serve / 2 parity of 2026-09-18 above); the gap is 10 tokenizer tests that need `../models/`, not present on a
   fresh clone. The full counts above hold locally, where the models directory exists.
 
 **The unit tests #39 added (`engine/src/bin/serve.rs`):**
@@ -2455,8 +2534,8 @@ memory-bounded scope, one engine at a time.
 - **The gate**: `tools/gate-linux.sh [outdir]` from the repo root runs the three parity forms,
   `decode run 32`, `cargo test`, clippy and the doc guards against the first three values
   above, prints GREEN/RED per item and exits non-zero on any RED. Nine items; all nine green at
-  commit `8ff2055` on 2026-09-17. The two host-side values it pins are `TESTS=179`
-  (103 lib + 74 serve + 2 parity, 2026-09-18) and `CLIPPY=1422` (the `--all-targets` form,
+  commit `8ff2055` on 2026-09-17. The two host-side values it pins are `TESTS=183`
+  (103 lib + 78 serve + 2 parity, 2026-09-18) and `CLIPPY=1422` (the `--all-targets` form,
   counted as `grep -cE '^warning: '`), plus `check_env_docs` exit 0 (`code 82, doc 82`) and
   `check_readme_dates` 0 offenders. The 1024-row form is not in
   the script — it costs a full long-prompt run and is checked by hand. Every expected value is hard-coded with its

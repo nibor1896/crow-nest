@@ -43,12 +43,26 @@ ends with the tag. This mode asserts that NO streamed `content` of any round car
 or `<think>`, and it prints what each round's `reasoning_content` carried, if anything. It
 sends no `tools`: the tags are a content-path bug, not a tool-call one.
 
+`--gone-client` (#54) is the live test of the `stream:false` document path: one POST with
+`stream: false` and `max_tokens 512` on a RAW socket, the connection dropped with a plain
+`close()` after `--drop-after` seconds, then the NEXT request timed from the drop. Before the
+fix that request waited for the whole 512-token budget - measured 7.463 s on 2026-09-18, with
+`generated 512 tok` in the log - because `CollectSink` could not notice a gone client; after it
+the generation ends ONE decode step after the drop and the next request is served 0.172 s
+later. The mode also sends a `shutdown(SHUT_WR)` client that keeps its read side open, which
+is the SAME wire event and must still get its whole document, and it first runs `--cost-rounds`
+timed document rounds plus one streaming round, so the per-token cost of the probe and the
+identity of the streamed answer can be read off the same command on two builds.
+
 Exit 0 when every round answered 200, 1 when any round was refused, 2 on a usage error.
 """
 import argparse
+import hashlib
 import json
 import os
+import socket
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -294,6 +308,169 @@ def think_round(base, max_tokens, rounds):
     return bad
 
 
+# #54: a prompt that runs a 512-token budget out, so a client that leaves mid-generation
+# would otherwise hold the one slot of the process for the whole budget
+GONE_PROMPT = ("Write a detailed essay of at least 600 words about the history of the "
+               "printing press, from Gutenberg to the rotary press.")
+
+
+def document_round(base, prompt, max_tokens, timeout=1800):
+    """one POST with `stream: false` - the 7.11.13 document. Returns the parsed document."""
+    body = {
+        "model": "crow-nest",
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+    }
+    req = urllib.request.Request(
+        base + "/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def raw_request(host, port, prompt, max_tokens):
+    """#54: one whole `stream:false` POST as bytes, head and body, for a RAW socket."""
+    body = json.dumps({
+        "model": "crow-nest",
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+    }).encode()
+    head = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+            f"Connection: close\r\n\r\n").encode()
+    return head + body
+
+
+def raw_post_then_drop(host, port, prompt, max_tokens, drop_after):
+    """#54: send a whole `stream:false` POST, then DROP the connection mid-generation.
+
+    A plain `close()`, never `shutdown(SHUT_WR)`: the two are the same wire event (FIN) and
+    the server may only treat the first as a gone client - which is what the baseline probe of
+    `ClientProbe` decides. Returns the seconds the socket was open."""
+    s = socket.create_connection((host, port), timeout=30)
+    t0 = time.monotonic()
+    s.sendall(raw_request(host, port, prompt, max_tokens))
+    time.sleep(drop_after)
+    s.close()                                  # the drop: FIN, no byte read, no half close
+    return time.monotonic() - t0
+
+
+def raw_post_half_close(host, port, prompt, max_tokens, timeout=120):
+    """#54: send a whole POST, `shutdown(SHUT_WR)`, then WAIT for the document.
+
+    The case the probe may not get wrong: this client is at EOF on the server's read side, the
+    same wire event as the drop above, and it is still waiting for its answer. Returns
+    (status line, the parsed document) - a truncated or missing document is the failure."""
+    s = socket.create_connection((host, port), timeout=timeout)
+    s.sendall(raw_request(host, port, prompt, max_tokens))
+    s.shutdown(socket.SHUT_WR)                 # the write side only; the read side stays open
+    chunks = []
+    while True:
+        part = s.recv(65536)
+        if not part:
+            break
+        chunks.append(part)
+    s.close()
+    raw = b"".join(chunks)
+    status = raw.split(b"\r\n", 1)[0].decode("utf-8", "replace")
+    head_end = raw.find(b"\r\n\r\n")
+    doc = None
+    if head_end >= 0:
+        try:
+            doc = json.loads(raw[head_end + 4:].decode("utf-8", "replace"))
+        except json.JSONDecodeError:
+            doc = None
+    return status, doc
+
+
+def gone_client(base, host, port, max_tokens, drop_after, bound, cost_rounds, serve_log):
+    """#54: the live test - the probe's cost, the streamed answer's identity, then the drop.
+
+    Returns 0 when the next request was served within `bound` seconds of the drop."""
+    bad = 0
+
+    # 1) the per-token cost of the probe, off the server's own `timings` block, and the
+    #    streamed answer of the same prompt, so two builds can be compared value for value
+    rates = []
+    for rnd in range(cost_rounds):
+        doc = document_round(base, GONE_PROMPT, 64)
+        t = doc["timings"]
+        rates.append((t["predicted_per_second"], t["predicted_per_token_ms"]))
+        print(f"cost round {rnd}: {t['predicted_n']} tok, {t['predicted_per_second']} tok/s, "
+              f"{t['predicted_per_token_ms']} ms/token, prefill {t['prompt_per_second']} tok/s")
+    if rates:
+        mean_s = sum(r[0] for r in rates) / len(rates)
+        mean_ms = sum(r[1] for r in rates) / len(rates)
+        print(f"cost: mean {mean_s:.3f} tok/s, {mean_ms:.3f} ms/token over {len(rates)} round(s)")
+    finish, content, _calls, _r = stream_round(base, [{"role": "user", "content": GONE_PROMPT}],
+                                               64, tools=[])
+    digest = hashlib.sha256(content.encode()).hexdigest()
+    print(f"stream identity: finish={finish}, content {len(content)} B, sha256 {digest[:16]}")
+
+    # 2) the drop, and the wait for the NEXT request. `serve` is one request at a time, so the
+    #    time from the drop to that answer IS the time the slot stayed busy.
+    open_s = raw_post_then_drop(host, port, GONE_PROMPT, max_tokens, drop_after)
+    t_drop = time.monotonic()
+    print(f"drop: the socket carried a stream:false POST with max_tokens={max_tokens} and was "
+          f"closed after {open_s:.3f} s")
+    doc = document_round(base, "Say the single word: ready.", 8)
+    waited = time.monotonic() - t_drop
+    served = doc["usage"]["completion_tokens"]
+    print(f"next request: served {served} tok {waited:.3f} s after the drop "
+          f"(bound {bound:.3f} s)")
+    if waited > bound:
+        print(f"gone-client: the slot stayed busy for {waited:.3f} s, over the {bound:.3f} s bound")
+        bad += 1
+
+    # 3) the client the probe may NOT end: half-closed, and waiting for its document. The
+    #    same prompt as the drop, so the budget is what ends it and 32 of 32 tokens is the
+    #    proof that no probe cut it short.
+    status, doc = raw_post_half_close(host, port, GONE_PROMPT, 32)
+    got = (doc or {}).get("usage", {}).get("completion_tokens")
+    finish = ((doc or {}).get("choices") or [{}])[0].get("finish_reason")
+    text = ((doc or {}).get("choices") or [{}])[0].get("message", {}).get("content", "")
+    print(f"half close: shutdown(SHUT_WR) then wait -> {status}, {got} tok, finish={finish}, "
+          f"content {len(text)} B")
+    if "200" not in status or got != 32 or finish != "length":
+        print("half close: the document is missing or was cut short - a client that only "
+              "closed its WRITE side must still be served")
+        bad += 1
+
+    # 4) what the server itself logged, when the log is at hand
+    if serve_log:
+        try:
+            with open(serve_log, encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError as exc:
+            print(f"gone-client: --serve-log {serve_log}: {exc}")
+            return 1
+        gone = [l for l in lines if "the client is gone at step" in l]
+        summary = [l for l in lines if l.startswith("[chat] prompt ") and "client gone" in l]
+        for l in gone[-1:] + summary[-1:]:
+            print(f"          {l}")
+        if not gone:
+            print("gone-client: the log carries no `[chat] the client is gone at step` line")
+            bad += 1
+        elif summary:
+            # the bound in STEPS: the line names the step the probe fired at, and the summary
+            # names how many tokens the generation produced before it stopped
+            step = int(gone[-1].split("at step ")[1].split(":")[0])
+            tok = int(summary[-1].split("generated ")[1].split(" tok")[0])
+            print(f"gone-client: the probe fired at step {step}, the generation produced "
+                  f"{tok} token(s) - {tok - step} step(s) between the drop and the stop")
+            if tok - step > 2:
+                print("gone-client: more than 2 steps between the probe and the stop")
+                bad += 1
+    print(f"replay-toolcalls.py: gone-client, {bad} finding(s)")
+    return 1 if bad else 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8099)
@@ -314,11 +491,28 @@ def main():
                     help="#67: a ~3 KB code paste then three turns; no </think> in any content")
     ap.add_argument("--refusals", action="store_true",
                     help="also send four unrenderable shapes and print the 400 bodies")
+    ap.add_argument("--gone-client", action="store_true",
+                    help="#54: drop a stream:false connection mid-generation and time the slot")
+    ap.add_argument("--drop-after", type=float, default=1.0,
+                    help="#54: seconds the dropped connection stays open (default 1)")
+    ap.add_argument("--gone-max-tokens", type=int, default=512,
+                    help="#54: max_tokens of the dropped request (default 512)")
+    ap.add_argument("--bound", type=float, default=5.0,
+                    help="#54: seconds the next request may wait after the drop (default 5)")
+    ap.add_argument("--cost-rounds", type=int, default=3,
+                    help="#54: timed document rounds before the drop, for the probe cost")
+    ap.add_argument("--serve-log", default=None,
+                    help="#54: the serve stderr log, checked for the `[chat]` gone-client line")
     a = ap.parse_args()
     if a.rounds < 1:
         print("replay-toolcalls.py: --rounds must be at least 1", file=sys.stderr)
         return 2
     base = f"http://127.0.0.1:{a.port}"
+
+    if a.gone_client:
+        # #54: its own path - a raw socket, a drop, and the wait for the next request
+        return gone_client(base, "127.0.0.1", a.port, a.gone_max_tokens, a.drop_after,
+                           a.bound, a.cost_rounds, a.serve_log)
 
     if a.think:
         # #67: its own loop - no tools, no truncating budget, the content path alone. The stray

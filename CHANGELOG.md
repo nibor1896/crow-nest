@@ -6,14 +6,72 @@
 
 ## v0.3.1 (unreleased) — the reasoning filter, and what the 170k session really was
 
-- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Four issues so far: `#67` (the
+- Branch `main`, opened 2026-09-18 on top of `b0102c0` (v0.3.0). Five issues so far: `#67` (the
   reasoning filter, `667b68b`), the engine side of `#68` (the long-context measurement, `f14e557`),
-  `#49` (the ragged hot-set sidecar, `0adbe6a`) and `#60` (the `parity` record header per arm, and
-  the last two bins that hard-coded the pre-`#51` container, this commit). The machine is the
+  `#49` (the ragged hot-set sidecar, `0adbe6a`), `#60` (the `parity` record header per arm, and
+  the last two bins that hard-coded the pre-`#51` container, `784bd64`) and `#54` (the gone-client
+  probe of the `stream:false` path, this commit). The machine is the
   second environment block of `docs/system-landscape.md` unless a row names another one.
 - The crate version field stays `0.1.0`, as it has for every release: this file is the record.
 
 ### Fixed
+
+- **A `stream:false` request whose client disconnected held the one slot for its whole
+  `max_tokens` budget** (`#54`, found 2026-09-11 in the whole-branch review before v0.1.0, fixed
+  2026-09-18). `CollectSink`'s three methods returned `true` unconditionally, so the document path
+  could not notice a client that left. The stream path learns it from the first failed flush
+  (`sse_send`) because it writes and flushes per token; the document path writes NOTHING until the
+  generation is over. Measured here before the fix: a `max_tokens: 512` POST dropped one second in
+  ran `generated 512 tok, decode 8097.1 ms, finish length` to the end and the next request waited
+  **7.463 s**. Not exploitable in the shipped configuration (localhost, one client, Crow), and it
+  was the one asymmetry between the two sinks.
+
+  **One `poll(POLLRDHUP)` between two decode steps, and a BASELINE for what a FIN means.** The
+  probe is `poll` on the request socket's descriptor with `timeout 0`, `events = POLLRDHUP`: no
+  byte read, no byte written, nothing on the wire (a zero-byte write sends no segment, so it could
+  not tell a closed peer from a live one anyway). What a probe cannot do on its own is separate
+  the two meanings of a FIN, and that was measured over five client shapes before anything was
+  written: `close()`, a `SIGKILL`ed process and a `shutdown(SHUT_WR)` client that is still waiting
+  for its answer ALL give `POLLIN|POLLRDHUP` and `recv(MSG_PEEK) == 0`, with the socket in
+  `CLOSE_WAIT` — only a WRITE discovers the difference, and the document path has nothing it may
+  write yet. So the decision is made at the HTTP layer: `ClientProbe::new` probes once when the
+  sink is built, after the body, the head, the template render and the tokenizer and before the
+  prefill. An EOF that is ALREADY there is a client that finished sending and gets its document;
+  an EOF that appears LATER is a client that was there when the request started and has closed the
+  connection while it was our turn to speak, and the generation ends. A reset
+  (`POLLERR`/`POLLHUP`/`POLLNVAL`) ends it at any time. `nginx` and `cpp-httplib`
+  (llama-server's HTTP layer) both treat the half-closed client as gone; this server does not, and
+  pays one baseline probe for it. Details, the measurement table and the anchors are
+  architecture 7.11.18.
+
+  **The cadence is EVERY step, and the cost is why.** One probe is 0.10 us mean and 0.14 us worst
+  over 1,000,000 calls on this machine, against a 13.6 ms token: one 136,000th of the budget. A
+  cadence of k would buy nothing measurable and would pay for it with k-1 further steps of a
+  generation nobody is reading, so `PROBE_EVERY` is 1 and no environment variable was added
+  (`docs/env.md` stays 82 = 82). Read off the server's own `timings.predicted_per_token_ms` at
+  steady state, same prompt and same budget on both builds: 13.592 / 13.617 / 13.592 / 13.604 ms
+  before, 13.585 / 13.589 / 13.595 ms after — below the reading's own spread. Linux only
+  (`POLLRDHUP` is Linux's bit): elsewhere the probe is inert, the Windows build compiles, and the
+  SSE path detects a gone client by its failed flush on every platform.
+
+  **What it looks like live** (`tools/replay-toolcalls.py --gone-client`, new: a raw-socket
+  `stream:false` POST with `max_tokens 512`, a plain `close()` after one second, then the next
+  request timed from the drop): the probe fires at step 62, the generation stops ONE step later at
+  63 tokens with `[chat] the client is gone at step 62: the peer closed the connection
+  mid-generation (POLLRDHUP; its read side was open at the first probe)`, the summary line ends in
+  `client gone`, `[serve]` names `200 OK (client gone)` and the next request is served **0.172 s**
+  after the drop. The same run half-closes a second client with `shutdown(SHUT_WR)`: it logs
+  `the client had already closed its write side when this request started` and gets its whole
+  document, 32 of 32 tokens. The streamed answer to the same greedy prompt is byte-identical on
+  both builds (355 B, `sha256 39cbf9a3fd5d2d61`), and `finish_reason` gained no new value: a
+  client that is not reading does not get a new wire contract.
+
+  Tests 179 -> 183, all four in `bin/serve.rs`: the pure decision table (`peer_from_poll` and
+  `gone_reason`, with the four `revents` constants asserted against `libc` on Linux), the
+  `PROBE_EVERY` cadence, the probe against a REAL loopback socket in its three shapes (live,
+  `shutdown(Write)`, closed — the last two being the same wire event is what the test pins), and
+  the no-socket `CollectSink` that never stops a loop, which is why nothing changed for a client
+  that stays.
 
 - **The `parity` record header could stamp a sampler profile on the llama arm's greedy answers,
   and two bins still opened the pre-`#51` container** (`#60`, both found 2026-09-11 in the review
