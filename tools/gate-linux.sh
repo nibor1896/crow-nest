@@ -211,6 +211,25 @@
 #                              `byte_len` on a shadowed tensor (2 B per value against 36 B per
 #                              64: the 16 / 4.5 the residency planner has to see). So
 #                              231 = 132 lib + 88 serve + 6 parity + 5 decode.
+#   tests 231 -> 232           #79 (2026-09-19) adds ONE library test in `cnq.rs` for the
+#                              ROUTED-EXPERT overlay, pure host logic with no GPU, no
+#                              container and no overlay file:
+#                              `an_expert_overlay_is_accepted_as_nvfp4_of_the_same_byte_length_and_refused_otherwise`
+#                              - the accepting case (nvfp4 over nvfp4, same byte length, its
+#                              OWN global scale), then the three refusals #79 added to the
+#                              table: a routed expert offered as bf16 (the residency planner
+#                              cuts per-expert slabs out of `byte_len / 512` and hands them to
+#                              kernels that index 36 B per 64 values, so a bf16 expert would be
+#                              a silently wrong-size slab), an nvfp4 overlay over a bf16 base
+#                              keep, and a global scale that is zero, negative or NaN. The
+#                              existing ten-row refusal test changed by ONE line and did not
+#                              grow: its `nvfp4` case USED to be the refusal "bf16 only" and is
+#                              now the accepted #79 case, so the refused dtype there is `f32`.
+#                              So 232 = 133 lib + 88 serve + 6 parity + 5 decode.
+#   clippy 1458 (unchanged)    #79 adds no clippy warning: the engine change is one widened
+#                              match in `overlay_refusal`, two fields on `OverlayReport`, one
+#                              boot line and one panic in `residency.rs`. The converter is a
+#                              separate crate and clippy lints this package only.
 #   clippy 1421 -> 1458        #77 RAISED the count by 37, and every one of them is the
 #                              --all-targets noise this tree already carries in bulk: +29
 #                              `casting to the same type is unnecessary (u64 -> u64)` from the
@@ -254,7 +273,7 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="231"
+TESTS="232"
 CLIPPY="1458"
 
 red=0

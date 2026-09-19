@@ -26,7 +26,7 @@ use std::sync::Mutex;
 
 use crate::{bytes_to_f32, elem_size_of, quantize_nvfp4, read_safetensors_header, ScalesMode, MAGIC};
 
-pub const HELP: &str = "usage: converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq> [--threads N] [--limit N]\n  re-quantizes every tensor of the fetched file and compares it with the container's own bytes";
+pub const HELP: &str = "usage: converter [--scales ceil|mse] requant-check <originals.safetensors> <container.cnq> [--experts] [--threads N] [--limit N]\n  re-quantizes every tensor of the fetched file and compares it with the container's own bytes\n  --experts  the fetched file holds ROUTED EXPERTS of one or more layers (#79) instead of the dense path";
 
 /// One tensor as the container's index trailer describes it.
 struct IndexEntry {
@@ -88,6 +88,19 @@ fn is_dense_text(e: &IndexEntry) -> bool {
     e.section == "text" && e.dtype == "nvfp4" && !e.name.contains(".mlp.experts.")
 }
 
+/// #79: the same rule with the sign flipped — the routed experts, under `--experts`.
+fn is_expert_text(e: &IndexEntry) -> bool {
+    e.section == "text" && e.dtype == "nvfp4" && e.name.contains(".mlp.experts.")
+}
+
+/// the layer a tensor name belongs to, so `--experts` can narrow the coverage rule to the
+/// layers the fetched file actually carries
+fn layer_of(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("model.language_model.layers.")?;
+    let dot = rest.find('.')?;
+    rest[..dot].parse::<usize>().ok()
+}
+
 /// What one tensor's comparison found.
 struct Verdict {
     order: usize,
@@ -139,11 +152,13 @@ pub fn run(args: &[String], mode: ScalesMode, mode_explicit: bool) -> i32 {
     let mut positional: Vec<&str> = Vec::new();
     let mut threads: usize = 0;
     let mut limit: usize = 0;
+    let mut experts = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--threads" => threads = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--limit" => limit = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--experts" => experts = true,
             s if s.starts_with("--") => {
                 eprintln!("unknown flag {s}\n{HELP}");
                 return 2;
@@ -196,12 +211,25 @@ pub fn run(args: &[String], mode: ScalesMode, mode_explicit: bool) -> i32 {
         fetched.truncate(limit);
     }
 
-    let want_names: Vec<&IndexEntry> = index.iter().filter(|e| is_dense_text(e)).collect();
+    // #79: `--experts` proves the FETCHED ROUTED EXPERTS the same way, and against the same
+    // container. The fetched file then holds one layer, so the coverage rule below is narrowed
+    // to the layers it carries - everything else about the check is the same code.
+    let fetched_layers: std::collections::BTreeSet<Option<usize>> =
+        fetched.iter().map(|t| layer_of(&t.0)).collect();
+    let want_names: Vec<&IndexEntry> = if experts {
+        index
+            .iter()
+            .filter(|e| is_expert_text(e) && fetched_layers.contains(&layer_of(&e.name)))
+            .collect()
+    } else {
+        index.iter().filter(|e| is_dense_text(e)).collect()
+    };
     println!(
-        "container {}: {} tensors, {} of them dense text nvfp4",
+        "container {}: {} tensors, {} of them {} nvfp4",
         cnq_path.display(),
         index.len(),
-        want_names.len()
+        want_names.len(),
+        if experts { "routed-expert text (in the fetched layers)" } else { "dense text" }
     );
     println!(
         "fetched   {}: {} tensors, {} values, scales {mode_str}",
@@ -218,7 +246,7 @@ pub fn run(args: &[String], mode: ScalesMode, mode_explicit: bool) -> i32 {
         .filter(|n| !have.contains(n))
         .collect();
     if limit == 0 && !missing.is_empty() {
-        println!("MISSING {} dense text tensors from the fetched file:", missing.len());
+        println!("MISSING {} selected tensors from the fetched file:", missing.len());
         for n in missing.iter().take(10) {
             println!("  {n}");
         }
@@ -228,8 +256,13 @@ pub fn run(args: &[String], mode: ScalesMode, mode_explicit: bool) -> i32 {
     let by_name: std::collections::BTreeMap<&str, &IndexEntry> =
         index.iter().map(|e| (e.name.as_str(), e)).collect();
 
+    // One dense tensor is at most 500 MB of f32; one routed-expert tensor is 6.7 GB of f32
+    // plus its blocks and the container's, about 10 GB per worker - so `--experts` defaults to
+    // two workers instead of eight and `--threads` overrides both.
     let n_threads = if threads > 0 {
         threads
+    } else if experts {
+        2
     } else {
         std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4).min(8)
     };

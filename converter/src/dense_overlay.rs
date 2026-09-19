@@ -151,7 +151,7 @@ enum Source {
 
 /// `YYYY-MM-DDTHH:MM:SSZ` from the wall clock, with the Gregorian calendar spelled out — the
 /// converter carries no date crate and the overlay header has to say when it was built.
-fn utc_date_string() -> String {
+pub fn utc_date_string() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

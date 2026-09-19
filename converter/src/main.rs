@@ -68,6 +68,9 @@ use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 mod dense_overlay;
+mod expert_overlay;
+mod expert_requant;
+mod imatrix;
 mod requant_check;
 
 const E2M1_GRID: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
@@ -501,7 +504,66 @@ fn quantize_nvfp4(values: &[f32], mode: ScalesMode) -> (Vec<u8>, f32, QuantStats
     (out, global, stats, sse_ceil)
 }
 
-const HELP: &str = "usage: converter [--scales ceil|mse] <model-dir | file.safetensors> <out.cnq>\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)";
+const HELP: &str = "usage: converter [--scales ceil|mse] <model-dir | file.safetensors> <out.cnq>\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)";
+
+/// `converter imatrix-show <imatrix.gguf> [tensor ...]` — #79. Read-only: the kv block, the
+/// tensor count, and for every named tensor its dims, its data offset, its first eight values,
+/// its last three and its sum. It exists to be compared with a second, independent reader
+/// (`tools/` has none; a stdlib Python GGUF parser was used, see `docs/expert-requant.md`),
+/// because a header parser that is wrong by one field reads plausible numbers out of the wrong
+/// place.
+fn imatrix_show(args: &[String]) -> i32 {
+    let Some(path) = args.first() else {
+        eprintln!("usage: converter imatrix-show <imatrix.gguf> [tensor ...]");
+        return 2;
+    };
+    let g = match imatrix::Gguf::open(std::path::Path::new(path)) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    println!(
+        "{}: GGUF v{}, {} tensors, {} kv, alignment {}, data_start {}, {} B",
+        path,
+        g.version,
+        g.tensors.len(),
+        g.kv.len(),
+        g.alignment,
+        g.data_start,
+        g.file_len
+    );
+    for (k, v) in &g.kv {
+        let s = v.to_string();
+        println!("  kv {k} = {}", if s.len() > 120 { format!("{}… ({} chars)", &s[..120], s.len()) } else { s });
+    }
+    for name in &args[1..] {
+        let Some(t) = g.find(name) else {
+            println!("  {name}: NOT IN THIS FILE");
+            return 1;
+        };
+        let v = match g.read_f32(name) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        };
+        let sum: f64 = v.iter().map(|x| *x as f64).sum();
+        println!(
+            "  {name}  dims {:?}  type {}  offset {}  n {}\n    first8 {:?}\n    last3  {:?}\n    sum    {:.9e}",
+            t.dims,
+            t.ggml_type,
+            t.offset,
+            v.len(),
+            &v[..8.min(v.len())],
+            &v[v.len().saturating_sub(3)..],
+            sum
+        );
+    }
+    0
+}
 
 fn main() {
     // #76: the additive read-only subcommand is taken off the front before the conversion
@@ -544,6 +606,25 @@ fn main() {
             std::process::exit(2);
         }
         std::process::exit(dense_overlay::run(&all[1..]));
+    }
+    // #79: and the same rule once more for the routed-expert overlay. Three subcommands now
+    // sit in front of the conversion path and none of them can be reached by accident: each
+    // one demands its own word as argument zero.
+    if let Some(at) = all.iter().position(|a| a == "expert-overlay") {
+        if at != 0 {
+            eprintln!("unexpected argument {} before expert-overlay\n{}", all[0], expert_overlay::HELP);
+            std::process::exit(2);
+        }
+        std::process::exit(expert_overlay::run(&all[1..]));
+    }
+    // #79: read the importance matrix back out and print it, so its numbers can be checked
+    // against an independent (stdlib Python) GGUF reader.
+    if let Some(at) = all.iter().position(|a| a == "imatrix-show") {
+        if at != 0 {
+            eprintln!("unexpected argument {} before imatrix-show", all[0]);
+            std::process::exit(2);
+        }
+        std::process::exit(imatrix_show(&all[1..]));
     }
 
     let mut positional: Vec<String> = Vec::new();

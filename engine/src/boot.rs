@@ -31,13 +31,18 @@ pub unsafe fn open_model(
         if !ov_path.is_empty() {
             match cnq.attach_overlay(&ov_path) {
                 Ok(r) => {
+                    // #79 made the line say WHICH overlay this is. `dense-bf16` trades bytes
+                    // for precision and the planner sees the difference; `expert-nvfp4` is the
+                    // same format at the same byte length, so "base" and "overlay" must read
+                    // identical or something about the wiring is wrong.
                     println!(
-                        "[overlay] {} — {} tensors shadowed, {} values, {:.2} GB bf16 (base {:.2} GB nvfp4), source {}, built {}",
+                        "[overlay] {} — kind {}, {} tensors shadowed, {} values, {:.2} GB (base {:.2} GB), source {}, built {}",
                         r.path,
+                        r.kind,
                         r.tensors,
                         r.values,
                         r.bytes as f64 / 1e9,
-                        (r.values as f64 * 4.5 / 8.0) / 1e9,
+                        r.base_bytes as f64 / 1e9,
                         r.source,
                         r.built
                     );

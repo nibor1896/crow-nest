@@ -213,6 +213,17 @@ impl Residency {
             progress(&format!("low-bit cold tier: {}-bit records {} + {} B per expert (NVFP4: {} B) from {}",
                 h["bits"], cold_gu_bytes, cold_dn_bytes, slabs.gu_bytes + slabs.dn_bytes, tier_path.as_ref().unwrap()));
         }
+        // #79: an expert overlay shadows the CONTAINER's expert bytes. A low-bit cold tier is a
+        // SECOND file the pinned slabs are filled from, so under both at once only the hot
+        // experts would carry the overlay and the arm would be half an arm. Named at boot
+        // rather than measured.
+        if lb_hdr.is_some() && cnq.overlay_tensors().iter().any(|t| t.name.contains(".mlp.experts.")) {
+            panic!(
+                "CROW_COLD_TIER={} and an expert overlay together: the pinned cold tier is filled from that \
+file, so the overlay would reach the hot experts only",
+                tier_path.as_deref().unwrap_or("?")
+            );
+        }
         // with the low-bit tier every expert is pinned (2.5 bpw: 37.7 GB for all
         // 512 x 48) so the hot set can be re-cut per prompt without host data
         // movement (A-P3); the NVFP4 tier stays cold-only (67.8 GB would not fit)

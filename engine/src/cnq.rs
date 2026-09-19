@@ -565,9 +565,14 @@ pub struct OverlayReport {
     pub path: String,
     pub source: String,
     pub built: String,
+    /// the `overlay.kind` of the trailer: `dense-bf16` (#77) or `expert-nvfp4` (#79)
+    pub kind: String,
     pub tensors: usize,
     pub values: u64,
     pub bytes: u64,
+    /// the bytes the BASE container holds for the same tensors, so the boot line can say what
+    /// the overlay costs - or, for an nvfp4 expert overlay, that it costs nothing
+    pub base_bytes: u64,
     /// (kind, tensors, values), kind-sorted
     pub per_kind: Vec<(String, usize, u64)>,
 }
@@ -614,9 +619,6 @@ pub fn overlay_refusal(
         return Some("carries no tensors".into());
     }
     for t in ov_tensors {
-        if t.dtype != "bf16" {
-            return Some(format!("{}: dtype {} - a dense overlay stores bf16 only", t.name, t.dtype));
-        }
         let Some(b) = base.iter().find(|b| b.name == t.name && b.section == t.section) else {
             return Some(format!("{} [{}]: not in the base container", t.name, t.section));
         };
@@ -628,6 +630,46 @@ pub fn overlay_refusal(
         }
         if !t.shape.is_empty() && !b.shape.is_empty() && t.shape != b.shape {
             return Some(format!("{}: shape {:?} in the overlay, {:?} in the base container", t.name, t.shape, b.shape));
+        }
+        match t.dtype.as_str() {
+            // #77: a DENSE tensor carried at full precision. Its byte length changes (2 B per
+            // value against 36 B per 64) and every reader takes that from `byte_len`. A routed
+            // expert may NOT come this way: `residency` cuts per-expert slabs out of
+            // `byte_len / 512` and hands them to kernels that index 36 B per 64 values, so a
+            // bf16 expert would be a silently wrong-size slab, not a refusal.
+            "bf16" => {
+                if t.name.contains(".mlp.experts.") {
+                    return Some(format!(
+                        "{}: bf16 - a routed expert may only be shadowed as nvfp4 of the same byte length, \
+the expert slabs and the kernels are cut from it",
+                        t.name
+                    ));
+                }
+            }
+            // #79: routed experts re-quantized onto the SAME grid. Here not one byte of length
+            // may move: the residency planner, the hot VRAM slabs, the pinned cold tier and
+            // `gs_dev` are all sized from it, and the kernels are the base container's kernels.
+            "nvfp4" => {
+                if b.dtype != "nvfp4" {
+                    return Some(format!("{}: nvfp4 in the overlay but {} in the base container", t.name, b.dtype));
+                }
+                let (have, want) = (Cnq::byte_len(t), Cnq::byte_len(b));
+                if have != want {
+                    return Some(format!("{}: {have} B in the overlay, {want} B in the base container", t.name));
+                }
+                if !(t.global_scale.is_finite() && t.global_scale > 0.0) {
+                    return Some(format!(
+                        "{}: global scale {} - an nvfp4 overlay carries its own and every block is read through it",
+                        t.name, t.global_scale
+                    ));
+                }
+            }
+            other => {
+                return Some(format!(
+                    "{}: dtype {other} - an overlay stores bf16 (the dense path, #77) or nvfp4 (the routed experts, #79)",
+                    t.name
+                ))
+            }
         }
     }
     None
@@ -678,20 +720,26 @@ impl Cnq {
         let mut per_kind: std::collections::BTreeMap<String, (usize, u64)> = std::collections::BTreeMap::new();
         let mut values = 0u64;
         let mut bytes = 0u64;
+        let mut base_bytes = 0u64;
         for t in &tensors {
             let e = per_kind.entry(kind_of(&t.name)).or_insert((0, 0));
             e.0 += 1;
             e.1 += t.n_values;
             values += t.n_values;
             bytes += Self::byte_len(t);
+            if let Some(b) = self.tensors.iter().find(|b| b.name == t.name && b.section == t.section) {
+                base_bytes += Self::byte_len(b);
+            }
         }
         let report = OverlayReport {
             path: path.to_string(),
             source: index["overlay"]["source"].as_str().unwrap_or("?").to_string(),
             built: index["overlay"]["built"].as_str().unwrap_or("?").to_string(),
+            kind: index["overlay"]["kind"].as_str().unwrap_or("?").to_string(),
             tensors: tensors.len(),
             values,
             bytes,
+            base_bytes,
             per_kind: per_kind.into_iter().map(|(k, (c, n))| (k, c, n)).collect(),
         };
         #[cfg(unix)]
@@ -1184,9 +1232,11 @@ mod tests {
         let m = overlay_refusal(&head("base.cnq", 999), &[], "base.cnq", 999, &base).unwrap();
         assert!(m.contains("no tensors"), "{m}");
 
-        let wrong_dtype = vec![ti("a.weight", "text", "nvfp4", 128, &[2, 64], true)];
+        // #79 widened the dtype rule from "bf16 only" to "bf16 or nvfp4", so the refusal is
+        // now a dtype that is NEITHER
+        let wrong_dtype = vec![ti("a.weight", "text", "f32", 128, &[2, 64], true)];
         let m = overlay_refusal(&head("base.cnq", 999), &wrong_dtype, "base.cnq", 999, &base).unwrap();
-        assert!(m.contains("bf16 only"), "{m}");
+        assert!(m.contains("dtype f32"), "{m}");
 
         let unknown = vec![ti("zzz.weight", "text", "bf16", 128, &[2, 64], true)];
         let m = overlay_refusal(&head("base.cnq", 999), &unknown, "base.cnq", 999, &base).unwrap();
@@ -1218,5 +1268,44 @@ mod tests {
         assert_eq!(super::Cnq::byte_len(&ov), 64 * 100 * 2);
         // 3.555x the bytes, which is 16 / 4.5
         assert_eq!(super::Cnq::byte_len(&ov) * 45, super::Cnq::byte_len(&base) * 160);
+    }
+
+    // ---- #79: the routed-expert overlay, nvfp4 over nvfp4 ----
+
+    /// An expert overlay carries the SAME format at the SAME byte length, so the accepting
+    /// case is the one where nothing about the geometry moved - and every refusal below is a
+    /// way that could stop being true without anybody noticing until a kernel read garbage.
+    #[test]
+    fn an_expert_overlay_is_accepted_as_nvfp4_of_the_same_byte_length_and_refused_otherwise() {
+        let name = "model.language_model.layers.7.mlp.experts.gate_up_proj";
+        let mut base_t = ti(name, "text", "nvfp4", 64 * 100, &[2, 50, 64], false);
+        base_t.global_scale = 2.5e-4;
+        let base = vec![base_t, ti("d.weight", "text", "nvfp4", 64 * 10, &[10, 64], false)];
+        let mut ov_t = ti(name, "text", "nvfp4", 64 * 100, &[2, 50, 64], true);
+        ov_t.global_scale = 3.1e-4; // its own, and different: that is the point of the overlay
+        let ov = vec![ov_t];
+        assert!(overlay_refusal(&head("base.cnq", 999), &ov, "base.cnq", 999, &base).is_none());
+        assert_eq!(super::Cnq::byte_len(&ov[0]), super::Cnq::byte_len(&base[0]));
+
+        // a routed expert as bf16 would be a slab of 2 B per value handed to a kernel that
+        // indexes 36 B per 64 - the residency planner cuts `byte_len / 512` out of it
+        let as_bf16 = vec![ti(name, "text", "bf16", 64 * 100, &[2, 50, 64], true)];
+        let m = overlay_refusal(&head("base.cnq", 999), &as_bf16, "base.cnq", 999, &base).unwrap();
+        assert!(m.contains("only be shadowed as nvfp4"), "{m}");
+
+        // an nvfp4 overlay over a bf16 base tensor: the base's own keeps are raw bytes
+        let bf16_base = vec![ti("k.weight", "text", "bf16", 64, &[1, 64], false)];
+        let over_keep = vec![ti("k.weight", "text", "nvfp4", 64, &[1, 64], true)];
+        let m = overlay_refusal(&head("base.cnq", 999), &over_keep, "base.cnq", 999, &bf16_base).unwrap();
+        assert!(m.contains("but bf16 in the base container"), "{m}");
+
+        // a global scale of zero or a NaN would make every block of the tensor zero or NaN,
+        // and nothing downstream looks at it again
+        for bad in [0.0f32, -1.0, f32::NAN] {
+            let mut t = ti(name, "text", "nvfp4", 64 * 100, &[2, 50, 64], true);
+            t.global_scale = bad;
+            let m = overlay_refusal(&head("base.cnq", 999), &[t], "base.cnq", 999, &base).unwrap();
+            assert!(m.contains("global scale"), "{bad}: {m}");
+        }
     }
 }
