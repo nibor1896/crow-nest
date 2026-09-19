@@ -28,7 +28,7 @@ use crate::expert_requant::{quantize_expert_tensor, ExpertStats, Rule};
 use crate::imatrix::{self, ExpertTensor, Gguf};
 use crate::{bytes_to_f32, read_safetensors_header, MAGIC};
 
-pub const HELP: &str = "usage: converter expert-overlay --base <container.cnq> --out <overlay.cnq> \\\n                               --originals <dir> --layers 1,7,13,... --rule mse|imatrix|imatrix46 \\\n                               [--imatrix <imatrix.gguf>] [--threads N] [--report <report.json>]\n  builds an nvfp4 OVERLAY container over the routed experts of the given layers (#79)\n  --originals  the directory of tools/fetch-dense-originals.py --experts (layer-NN.safetensors)\n  --rule mse   the CONTROL: the conversion's own unweighted rule, byte-identical to the base\n  --rule imatrix / imatrix46  importance-weighted scales; --imatrix is then required";
+pub const HELP: &str = "usage: converter expert-overlay --base <container.cnq> --out <overlay.cnq> \\\n                               --originals <dir> --layers 1,7,13,... --rule mse|mse46|imatrix|imatrix46 \\\n                               [--imatrix <imatrix.gguf>] [--threads N] [--report <report.json>]\n  builds an nvfp4 OVERLAY container over the routed experts of the given layers (#79)\n  --originals  the directory of tools/fetch-dense-originals.py --experts (layer-NN.safetensors)\n  --rule mse   the CONTROL: the conversion's own unweighted rule, byte-identical to the base\n  --rule mse46 the SECOND control: four-over-six candidates, no importance matrix\n  --rule imatrix / imatrix46  importance-weighted scales; --imatrix is then required";
 
 /// The routed-expert selection, derived from the container's own index — the mirror of
 /// `dense_overlay::is_dense_text`, and the twin of the fetch tool's `select_expert_tensors`.
@@ -165,7 +165,7 @@ pub fn run(args: &[String]) -> i32 {
                     return 2;
                 };
                 let Some(r) = Rule::parse(name) else {
-                    eprintln!("--rule {name}: not one of mse, imatrix, imatrix46\n{HELP}");
+                    eprintln!("--rule {name}: not one of mse, mse46, imatrix, imatrix46\n{HELP}");
                     return 2;
                 };
                 rule = r;
@@ -328,11 +328,13 @@ pub fn run(args: &[String]) -> i32 {
         }
 
         // the importance matrix of THIS layer and THIS tensor, divided by the counts
+        // loaded whenever an --imatrix is given, whatever the rule: a weighted rule uses it for
+        // the SEARCH, every rule uses it for the REPORT, so the control's importance-weighted
+        // error is the same quantity as the experiments'
         let mut imw: Vec<f32> = Vec::new();
         let mut zero_experts: Vec<usize> = Vec::new();
         let mut tiny_experts: Vec<usize> = Vec::new();
-        if rule != Rule::Mse {
-            let g = gguf.as_ref().expect("checked above");
+        if let Some(g) = gguf.as_ref() {
             let im = match imatrix::load(g, layer, geo.which) {
                 Ok(v) => v,
                 Err(m) => {
@@ -451,7 +453,7 @@ pub fn run(args: &[String]) -> i32 {
         identical_tensors,
         index_tensors.len()
     );
-    if rule != Rule::Mse {
+    if gguf.is_some() {
         println!("imatrix   {zero_count_total} zero-count and {tiny_count_total} tiny-count (<100) expert slots over the selected tensors");
     }
     println!("expert-overlay: done in {:.0} s", t0.elapsed().as_secs_f64());

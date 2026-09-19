@@ -48,6 +48,11 @@ pub enum Rule {
     Imatrix,
     /// (c) (b) plus the four-over-six candidate.
     ImatrixFourSix,
+    /// (d) the SECOND control, and #79 added it after seeing (c)'s weight-space numbers: the
+    /// four-over-six candidate with NO importance matrix, so `w[l] = 1`. Without it, a win by
+    /// (c) could be the imatrix or could be nothing but a wider candidate set, and the two
+    /// would be impossible to tell apart.
+    MseFourSix,
 }
 
 impl Rule {
@@ -56,6 +61,7 @@ impl Rule {
             "mse" => Some(Rule::Mse),
             "imatrix" => Some(Rule::Imatrix),
             "imatrix46" => Some(Rule::ImatrixFourSix),
+            "mse46" => Some(Rule::MseFourSix),
             _ => None,
         }
     }
@@ -64,10 +70,19 @@ impl Rule {
             Rule::Mse => "mse",
             Rule::Imatrix => "imatrix",
             Rule::ImatrixFourSix => "imatrix46",
+            Rule::MseFourSix => "mse46",
         }
     }
+    /// does the SEARCH use the importance matrix?
     fn weighted(self) -> bool {
+        matches!(self, Rule::Imatrix | Rule::ImatrixFourSix)
+    }
+    /// does the search run the ladder search at all, rather than `encode_subblock_mse`?
+    fn searched(self) -> bool {
         self != Rule::Mse
+    }
+    fn four_six(self) -> bool {
+        matches!(self, Rule::ImatrixFourSix | Rule::MseFourSix)
     }
 }
 
@@ -227,7 +242,12 @@ pub fn global_scale(values: &[f32]) -> f32 {
 /// `values` is the tensor in row-major order, `per_expert` values per expert and `n_cols`
 /// values per row, so value index `i` belongs to expert `i / per_expert` and input column
 /// `i % n_cols`. `imw` is `n_experts * n_cols` importance weights, already divided by the
-/// counts (see `imatrix::ExpertImatrix::row`); it is ignored by `Rule::Mse`.
+/// counts (see `imatrix::ExpertImatrix::row`).
+///
+/// `imw` decides the SEARCH only under a weighted rule, but it decides the REPORT under every
+/// rule: `Rule::Mse`'s importance-weighted error has to be measured with the same weights as
+/// the other two, or the control's column would be a different quantity with the same name.
+/// An empty `imw` means no importance matrix was given and every weight is 1.
 ///
 /// Both `per_expert` and `n_cols` are multiples of 64 in this architecture (1280*2560 and 2560,
 /// 2560*640 and 640), which is what makes a 16-wide sub-block belong to ONE expert and ONE row
@@ -245,6 +265,9 @@ pub fn quantize_expert_tensor(
     assert!(values.len() % per_expert == 0);
     let n_experts = values.len() / per_expert;
     if rule.weighted() {
+        assert!(!imw.is_empty(), "a weighted rule needs an importance matrix");
+    }
+    if !imw.is_empty() {
         assert_eq!(imw.len(), n_experts * n_cols, "importance matrix is {} x {}", n_experts, n_cols);
     }
     let global = global_scale(values);
@@ -289,28 +312,35 @@ fn quantize_blocks(
         let base = b * 64;
         let chunk = &values[base..base + 64];
         // sigma2 over the 64-value NVFP4 block, llama.cpp's `2 * sum(x^2) / super_block_size`
-        let sigma2 = if rule.weighted() {
+        let sigma2 = if rule.searched() {
             2.0f32 * chunk.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() as f32 / 64.0
         } else {
             0.0
         };
         let expert = base / per_expert;
-        let imw_row = if rule.weighted() { &imw[expert * n_cols..(expert + 1) * n_cols] } else { &[][..] };
+        let imw_row = if imw.is_empty() { &[][..] } else { &imw[expert * n_cols..(expert + 1) * n_cols] };
         let mut scales = [0u32; 4];
         let mut nibbles = [0u32; 32];
         for (sb, sub) in chunk.chunks(16).enumerate() {
             let max_abs = sub.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             let ceil_byte = encode_subblock_ceil((max_abs / 6.0) / global);
-            let stored = if rule.weighted() {
+            let stored = if rule.searched() {
                 let col0 = (base + sb * 16) % n_cols;
                 for (l, &v) in sub.iter().enumerate() {
-                    w[l] = (imw_row[col0 + l] as f64) * ((sigma2 + v * v).sqrt() as f64);
+                    // `w[l] = 1` is what makes (d) the unweighted twin of (c): the same
+                    // candidate set, the same objective, no importance matrix in it at all
+                    w[l] = if rule.weighted() {
+                        debug_assert!(!imw_row.is_empty());
+                        (imw_row[col0 + l] as f64) * ((sigma2 + v * v).sqrt() as f64)
+                    } else {
+                        1.0
+                    };
                 }
-                encode_subblock_weighted(sub, &w[..sub.len()], global, ceil_byte, rule == Rule::ImatrixFourSix)
+                encode_subblock_weighted(sub, &w[..sub.len()], global, ceil_byte, rule.four_six())
             } else {
                 encode_subblock_mse(sub, global, ceil_byte).0
             };
-            if rule.weighted() {
+            if rule.searched() {
                 let mse_byte = encode_subblock_mse(sub, global, ceil_byte).0;
                 if mse_byte != stored {
                     st.scales_moved += 1;
@@ -496,9 +526,59 @@ mod tests {
         assert_ne!(oa, ob, "swapping the two experts' importance rows must change the bytes");
     }
 
+    /// The control's `imatrix-mse` column has to be the SAME quantity as the experiments'.
+    /// `Rule::Mse` therefore takes the importance matrix for the REPORT and ignores it for the
+    /// SEARCH: the bytes stay byte-identical to the conversion's own, the number does not.
+    #[test]
+    fn the_control_is_scored_with_the_same_weights_but_still_writes_the_same_bytes() {
+        let n_cols = 64;
+        let per_expert = n_cols * 6;
+        let v = sample(per_expert * 2);
+        let mut imw = vec![0.02f32; 2 * n_cols];
+        for e in 0..2 {
+            for j in 0..n_cols {
+                if (j + 3 * e) % 9 == 0 {
+                    imw[e * n_cols + j] = 400.0;
+                }
+            }
+        }
+        let (bytes_flat, _, flat) = quantize_expert_tensor(&v, per_expert, n_cols, &[], Rule::Mse, 3);
+        let (bytes_weighted, _, scored) = quantize_expert_tensor(&v, per_expert, n_cols, &imw, Rule::Mse, 3);
+        assert_eq!(bytes_flat, bytes_weighted, "the imatrix may not change what Rule::Mse writes");
+        assert_eq!(flat.mse(), scored.mse());
+        assert_ne!(flat.weighted_mse(), scored.weighted_mse(), "with an imatrix the weighted column moves");
+        // and with no imatrix at all the two columns are the same number
+        assert_eq!(flat.mse(), flat.weighted_mse());
+        // the experiment is then comparable with the control on that column
+        let (_, _, b) = quantize_expert_tensor(&v, per_expert, n_cols, &imw, Rule::Imatrix, 3);
+        assert!(b.weighted_mse() < scored.weighted_mse());
+    }
+
+    /// (d) is the control for (c): the same candidate set, no importance matrix. If (c) beats
+    /// (a) only as much as (d) does, the win is the wider search and not the matrix.
+    #[test]
+    fn the_unweighted_four_over_six_control_uses_no_importance_matrix_at_all() {
+        let n_cols = 64;
+        let per_expert = n_cols * 6;
+        let v = sample(per_expert * 2);
+        let mut a = vec![1.0f32; 2 * n_cols];
+        let mut b = vec![1.0f32; 2 * n_cols];
+        for j in 0..n_cols {
+            a[j] = if j % 5 == 0 { 900.0 } else { 0.001 };
+            b[j] = if j % 7 == 0 { 900.0 } else { 0.001 };
+        }
+        let (oa, _, sa) = quantize_expert_tensor(&v, per_expert, n_cols, &a, Rule::MseFourSix, 2);
+        let (ob, _, _) = quantize_expert_tensor(&v, per_expert, n_cols, &b, Rule::MseFourSix, 2);
+        assert_eq!(oa, ob, "mse46 must write the same bytes whatever the imatrix says");
+        // and it is a real search: it beats the three-candidate unweighted rule on plain MSE
+        let (_, _, base) = quantize_expert_tensor(&v, per_expert, n_cols, &a, Rule::Mse, 2);
+        assert!(sa.mse() <= base.mse(), "{} !<= {}", sa.mse(), base.mse());
+        assert!(sa.scales_moved > 0);
+    }
+
     #[test]
     fn the_rule_names_round_trip() {
-        for r in [Rule::Mse, Rule::Imatrix, Rule::ImatrixFourSix] {
+        for r in [Rule::Mse, Rule::Imatrix, Rule::ImatrixFourSix, Rule::MseFourSix] {
             assert_eq!(Rule::parse(r.name()), Some(r));
         }
         assert_eq!(Rule::parse("nonsense"), None);
