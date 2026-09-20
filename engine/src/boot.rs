@@ -4,6 +4,7 @@
 use crate::cnq::Cnq;
 use crate::cuda;
 use crate::geo::{Config, CONTEXT_FLOOR};
+use crate::meta;
 
 /// `CROW_CNQ` / `CROW_HOTSETS` (else the given defaults), the mapped container, a current CUDA context, the config at `CONTEXT_FLOOR`.
 ///
@@ -21,6 +22,14 @@ pub unsafe fn open_model(
 ) -> (Cnq, cuda::Ctx, Config, String, String) {
     let cnq_path = std::env::var("CROW_CNQ").unwrap_or(cnq_default);
     let sidecar = std::env::var("CROW_HOTSETS").unwrap_or(sidecar_default);
+    // #94 phase 1 — the metadata gate, FIRST: the checkpoint's config.json is
+    // parsed and every formula constant asserted equal to the pinned value
+    // before the container is mapped and the CUDA context created, so a
+    // mismatched checkpoint dies at the front door instead of computing
+    // quietly wrong numbers (the llama.cpp get_key discipline). Zero numeric
+    // change on the checkpoint of record; `None` is the selftest package (no
+    // models/ dir beside the container), which continues after a WARN line.
+    let _meta = meta::assert_pinned(&cnq_path);
     let mut cnq = Cnq::open(&cnq_path);
     // #77 CROW_CNQ_OVERLAY: a second CNQ1 container opened BESIDE the base one, holding the
     // dense text tensors as bf16. A tensor it names shadows the base tensor of the same name

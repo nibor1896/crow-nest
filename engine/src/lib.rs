@@ -76,6 +76,11 @@ pub mod weights;
 pub mod gen;
 // the boot sequence the engine-loading bins share: container, CUDA context, config
 pub mod boot;
+// #94 phase 1: the metadata gate — the checkpoint's config.json parsed at boot
+// and every formula constant asserted equal to the pinned value BEFORE the
+// container is mapped (zero numeric change; mismatch = loud named panic). It
+// reads the pins of geo and sample, so it sits above them; boot is its caller.
+pub mod meta;
 pub mod sample;
 pub mod tokenizer;
 // #29 A7 review: the tool-call parser of `bin/serve.rs`, extracted so it is unit tested
