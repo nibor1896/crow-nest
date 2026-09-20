@@ -1,0 +1,43 @@
+{
+ "what": "English long-prose oracle id sets (#90, English-only scope)",
+ "tokenizer": "models/Qwen3.8-Flash-Next-original, add_special_tokens=False, no chat template - plain corpus continuation rows",
+ "slice_rule": "one contiguous slice of rows+1 ids centered on the book's midpoint; rows 0..rows-1 are teacher-forced on it",
+ "rows": 512,
+ "sets": [
+  {
+   "file": "en-prose-moby-dick-ids.json",
+   "text": "moby-dick",
+   "book_ids_start": 155609,
+   "ids": 513,
+   "rows": 512
+  },
+  {
+   "file": "en-prose-pride-prejudice-ids.json",
+   "text": "pride-prejudice",
+   "book_ids_start": 87160,
+   "ids": 513,
+   "rows": 512
+  },
+  {
+   "file": "en-prose-frankenstein-ids.json",
+   "text": "frankenstein",
+   "book_ids_start": 49283,
+   "ids": 513,
+   "rows": 512
+  },
+  {
+   "file": "en-prose-dracula-ids.json",
+   "text": "dracula",
+   "book_ids_start": 107918,
+   "ids": 513,
+   "rows": 512
+  },
+  {
+   "file": "en-prose-huckleberry-finn-ids.json",
+   "text": "huckleberry-finn",
+   "book_ids_start": 77956,
+   "ids": 513,
+   "rows": 512
+  }
+ ]
+}

@@ -1,0 +1,63 @@
+{
+ "what": "public-domain English long prose for the #90 oracle corpus",
+ "fetched_utc_note": "see per-file sha256; refetch and diff rather than trust",
+ "license": "Project Gutenberg / public domain in the US",
+ "strip_rule": "text between the first '*** START OF' line and the first '*** END OF' marker, inclusive cut, utf-8 with replacement",
+ "texts": [
+  {
+   "gutenberg_id": 2701,
+   "name": "moby-dick",
+   "author": "Herman Melville",
+   "title": "Moby Dick",
+   "raw_bytes": 1276267,
+   "raw_sha256": "907420db6c4b68c70e2988cd2ad9c8cf79138667a01b63376d18dd17fef1a18b",
+   "stripped_chars": 1240885,
+   "strip_note": "stripped header (903 B) and footer (18807 B)",
+   "url": "https://www.gutenberg.org/ebooks/2701"
+  },
+  {
+   "gutenberg_id": 1342,
+   "name": "pride-prejudice",
+   "author": "Jane Austen",
+   "title": "Pride and Prejudice",
+   "raw_bytes": 772386,
+   "raw_sha256": "3f6bb9d6f78e0293b56acd4714dd68cb7d6d1d293402031ce9d5a216bcaf9d75",
+   "stripped_chars": 743287,
+   "strip_note": "stripped header (993 B) and footer (18802 B)",
+   "url": "https://www.gutenberg.org/ebooks/1342"
+  },
+  {
+   "gutenberg_id": 84,
+   "name": "frankenstein",
+   "author": "Mary Shelley",
+   "title": "Frankenstein",
+   "raw_bytes": 448885,
+   "raw_sha256": "7810cd483cffcf2cc8a1d8f0d5807931e69d4f48cd14149b8c76f88af82fead3",
+   "stripped_chars": 426704,
+   "strip_note": "stripped header (1056 B) and footer (18822 B)",
+   "url": "https://www.gutenberg.org/ebooks/84"
+  },
+  {
+   "gutenberg_id": 345,
+   "name": "dracula",
+   "author": "Bram Stoker",
+   "title": "Dracula",
+   "raw_bytes": 890348,
+   "raw_sha256": "96cd16eacdbfebae8fdda5591f66e0cc8ee76be18e0cd1aca02bc00615782d28",
+   "stripped_chars": 861405,
+   "strip_note": "stripped header (865 B) and footer (18790 B)",
+   "url": "https://www.gutenberg.org/ebooks/345"
+  },
+  {
+   "gutenberg_id": 76,
+   "name": "huckleberry-finn",
+   "author": "Mark Twain",
+   "title": "Adventures of Huckleberry Finn",
+   "raw_bytes": 622460,
+   "raw_sha256": "d617a37aa7ae1e1a93dcde2634db2bccb86824e31e29a55230bdbf77d6872d59",
+   "stripped_chars": 583031,
+   "strip_note": "stripped header (908 B) and footer (18813 B)",
+   "url": "https://www.gutenberg.org/ebooks/76"
+  }
+ ]
+}

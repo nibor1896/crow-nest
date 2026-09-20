@@ -1,0 +1,53 @@
+{
+ "what": "the clean #68 agentic history as token ids, rebuilt and verified",
+ "gate_run": "decode_out/68/longctx-170k.json",
+ "n_files": 167,
+ "material_chars": 393117,
+ "history_messages": 669,
+ "generator": "tools/longctx-gate.py (build_material/build_session/probes)",
+ "template": "models/Qwen3.8-Flash-Next-original chat_template.jinja, enable_thinking=False, add_generation_prompt=True",
+ "tokenizer": "transformers AutoTokenizer of the original model",
+ "verified_against": "per-probe prompt_tokens of the gate run (all five)",
+ "files": [
+  {
+   "file": "longctx-170k-p1-ids.json",
+   "probe": 1,
+   "ids": 178553,
+   "recorded_prompt_tokens": 178553,
+   "gate_verdict": "Pass",
+   "sha256": "58c08df8497a92725d54e48e131dfe2915be4c168871794a3980acb8285d7d09"
+  },
+  {
+   "file": "longctx-170k-p2-ids.json",
+   "probe": 2,
+   "ids": 178608,
+   "recorded_prompt_tokens": 178608,
+   "gate_verdict": "Pass",
+   "sha256": "844935535515f6d30b6af1d444c4fd54d75eeac6ded556de91dc93d68cef24b6"
+  },
+  {
+   "file": "longctx-170k-p3-ids.json",
+   "probe": 3,
+   "ids": 178664,
+   "recorded_prompt_tokens": 178664,
+   "gate_verdict": "Pass",
+   "sha256": "3e0f1ff2d659aa4072f1b3ea4f492b1930f7adf478f925f1c85570662351ac5c"
+  },
+  {
+   "file": "longctx-170k-p4-ids.json",
+   "probe": 4,
+   "ids": 178728,
+   "recorded_prompt_tokens": 178728,
+   "gate_verdict": "Pass",
+   "sha256": "ddf177a16f6cb7f0cbd6bf7f0cd7d636251c26f6745c79983c3b570915b9b999"
+  },
+  {
+   "file": "longctx-170k-p5-ids.json",
+   "probe": 5,
+   "ids": 178798,
+   "recorded_prompt_tokens": 178798,
+   "gate_verdict": "Fail",
+   "sha256": "f68443abc477f14596c5785aaf0b0b184aaa188539b687c99f3d1c661705c0d8"
+  }
+ ]
+}

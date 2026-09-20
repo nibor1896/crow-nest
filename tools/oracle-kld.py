@@ -49,6 +49,22 @@ blindness beyond its own N, and a token the arm cannot answer for is charged at 
 smallest known probability - which makes the reported KLD a LOWER BOUND, never an estimate
 from above. The report names the reference mass the truncation covers and how often the
 blindness actually bound.
+
+SPARSE DUMPS (#90). A source whose path carries a `<path>.rows.json` sidecar is read as a
+SPARSE dump: the sidecar lists the ABSOLUTE row ids present, in file order, and the f32 file
+holds exactly those rows. That is the long-context form - 178k positions of context with 64
+rows sampled per depth - and it is what `oracle/ref_longctx_logits.py` writes. `--rows A:B`
+then bounds ABSOLUTE row ids and the run collects the rows of the intersection; an arm has to
+carry every row the reference asked for, exactly as a top-N arm does. A dense dump with no
+sidecar is read exactly as before, byte for byte.
+
+ROW GROUPS AND THE POSITION CURVE (#90). `--row-groups FILE` names groups of absolute rows -
+the depth blocks of `decode_out/oracle-longctx/row-plan.json`, the per-text groups of
+`decode_out/oracle-en/en-row-groups.json`, or any {"groups": [{"name", "rows"}]} file - and
+the report gains one block per group per arm: the per-corpus / per-depth summary.
+`--kld-vs-position N` bins the collected rows by ABSOLUTE position into N equal-width bins
+and prints mean KLD and same-top-1 per bin per arm: the KLD-vs-position curve. Both land in
+`--json` under "groups" and "position_curve".
 """
 
 import argparse
@@ -265,6 +281,58 @@ class LogitFile:
         self.handle.close()
 
 
+class SparseLogitFile:
+    """A dump of SAMPLED rows (#90): the f32 file plus a `.rows.json` sidecar that lists
+    the absolute row ids present, in file order. read(row) is by ABSOLUTE row id."""
+
+    def __init__(self, path, vocab):
+        side = path + ".rows.json"
+        with open(side, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+        rows = [int(r) for r in doc["rows"]]
+        if not rows:
+            raise SystemExit("%s lists no rows" % side)
+        if any(rows[i] >= rows[i + 1] for i in range(len(rows) - 1)):
+            raise SystemExit("%s is not strictly increasing - the sparse form is written "
+                             "in ascending row order" % side)
+        self.rows = rows
+        self.index = {r: i for i, r in enumerate(rows)}
+        self.file = LogitFile(path, vocab)
+        self.sparse = True
+
+    def read(self, row):
+        i = self.index.get(row)
+        if i is None:
+            raise SystemExit("this sparse dump has no row %d" % row)
+        return self.file.read(i)
+
+    def close(self):
+        self.file.close()
+
+
+def open_source(path, vocab):
+    """A dump source: sparse when the `.rows.json` sidecar exists, dense otherwise."""
+    if os.path.exists(path + ".rows.json"):
+        return SparseLogitFile(path, vocab)
+    src = LogitFile(path, vocab)
+    src.sparse = False
+    return src
+
+
+def load_row_groups(path):
+    """The #90 row-groups file: {"groups": [{"name": ..., "rows": [...]}]} - which is
+    also the shape of decode_out/oracle-longctx/row-plan.json."""
+    with open(path, "r", encoding="utf-8") as fh:
+        doc = json.load(fh)
+    groups = doc["groups"] if isinstance(doc, dict) else doc
+    out = []
+    for g in groups:
+        out.append((str(g["name"]), [int(r) for r in g["rows"]]))
+    if not out:
+        raise SystemExit("%s names no row groups" % path)
+    return out
+
+
 def load_topn(path):
     """Read a top-N probability file. Returns {row index: (ids, probs)} and its header."""
     with open(path, "r", encoding="utf-8") as fh:
@@ -316,13 +384,27 @@ class Accumulator:
 
 def collect(ref_path, vocab, first, last, full_arms, topn_arms, min_log_prob,
             truncate, arm_topn, per_row_path=None):
-    ref = LogitFile(ref_path, vocab)
-    if last > ref.rows:
-        raise SystemExit("--rows asks for %d rows, the reference has %d" % (last, ref.rows))
+    ref = open_source(ref_path, vocab)
+    if ref.sparse:
+        rows_to_do = [r for r in ref.rows if first <= r < last]
+        if not rows_to_do:
+            raise SystemExit("--rows %d:%d matches no row of the sparse reference %s "
+                             "(it carries %d rows, %d..%d)"
+                             % (first, last, ref_path, len(ref.rows), ref.rows[0],
+                                ref.rows[-1]))
+    else:
+        if last > ref.rows:
+            raise SystemExit("--rows asks for %d rows, the reference has %d" % (last, ref.rows))
+        rows_to_do = list(range(first, last))
 
-    files = [(name, LogitFile(path, vocab)) for name, path in full_arms]
+    files = [(name, open_source(path, vocab)) for name, path in full_arms]
     for name, handle in files:
-        if last > handle.rows:
+        if handle.sparse:
+            missing = [r for r in rows_to_do if r not in handle.index]
+            if missing:
+                raise SystemExit("sparse arm %s has no row %d of the %d the reference asks "
+                                 "for" % (name, missing[0], len(rows_to_do)))
+        elif last > handle.rows:
             raise SystemExit("arm %s has %d rows, the range asks for %d" % (name, handle.rows, last))
     topn = []
     for name, path in topn_arms:
@@ -336,7 +418,7 @@ def collect(ref_path, vocab, first, last, full_arms, topn_arms, min_log_prob,
         acc[name] = Accumulator(name, "top-%d" % int(header.get("n_probs", 0)))
 
     per_row = []
-    for row in range(first, last):
+    for row in rows_to_do:
         p = ref.read(row)
         lse = log_sum_exp(p)
         top1 = argmax(p)
@@ -449,8 +531,15 @@ def report(args, acc, order, prompt_rows, out=None):
     n_rows = None
     for name in order:
         n_rows = len(acc[name].kld)
+    rows_done = acc[order[0]].rows
+    contiguous = n_rows == rows_done[-1] - rows_done[0] + 1
     print("reference        %s" % args.ref, file=out)
-    print("rows             %d..%d (%d)" % (args.first, args.last - 1, args.last - args.first), file=out)
+    if (rows_done[0], rows_done[-1] + 1) != (args.first, args.last) or not contiguous:
+        print("rows             %d..%d (%d collected, of --rows %d:%d on absolute row ids)"
+              % (rows_done[0], rows_done[-1], n_rows, args.first, args.last), file=out)
+    else:
+        print("rows             %d..%d (%d)" % (args.first, args.last - 1, args.last - args.first),
+              file=out)
     if prompt_rows is not None:
         print("split            prompt rows < %d, answer rows >= %d" % (prompt_rows, prompt_rows), file=out)
     print("support          natural log p_ref > %.1f  (llama.cpp perplexity.cpp:222)" % args.min_log_prob,
@@ -481,6 +570,55 @@ def report(args, acc, order, prompt_rows, out=None):
                 continue
             summaries.setdefault(label, {})[name] = s
             print(fmt_arm_line(name, s), file=out)
+        print("", file=out)
+
+    groups_out = {}
+    if getattr(args, "row_groups", None):
+        have = set(rows_done)
+        for name, grows in args.row_groups:
+            sel = set(r for r in grows if r in have)
+            if not sel:
+                print("== %s - no row of this group is in the run" % name, file=out)
+                print("", file=out)
+                continue
+            mask = [r in sel for r in rows_done]
+            print("== %s (%d rows)" % (name, len(sel)), file=out)
+            print(HEADER, file=out)
+            groups_out[name] = {}
+            for arm in order:
+                s = summarize(acc[arm], mask)
+                if s is None:
+                    continue
+                groups_out[name][arm] = s
+                print(fmt_arm_line(arm, s), file=out)
+            print("", file=out)
+
+    curve = []
+    if getattr(args, "kld_vs_position", None):
+        lo, hi = rows_done[0], rows_done[-1]
+        span = hi - lo + 1
+        print("== KLD vs position, %d equal-width bins over absolute rows %d..%d"
+              % (args.kld_vs_position, lo, hi), file=out)
+        print("%-14s %5s  %-19s  %s" % ("bin", "rows", "mean KLD per arm", "same top-1 per arm"),
+              file=out)
+        for b in range(args.kld_vs_position):
+            blo = lo + (span * b) // args.kld_vs_position
+            bhi = lo + (span * (b + 1)) // args.kld_vs_position - 1
+            mask = [blo <= r <= bhi for r in rows_done]
+            entry = {"lo": blo, "hi": bhi, "arms": {}}
+            line = ["%-14s %5d" % ("%d..%d" % (blo, bhi), sum(mask))]
+            for arm in order:
+                s = summarize(acc[arm], mask)
+                if s is None:
+                    continue
+                entry["arms"][arm] = {"n": s["n"], "kld_mean": s["kld_mean"],
+                                      "kld_unc": s["kld_unc"],
+                                      "same_top1_share": s["same_top1_share"],
+                                      "same_top1_unc": s["same_top1_unc"]}
+                line.append("%-22s %9.6f  %6.2f %%"
+                            % (arm, s["kld_mean"], 100 * s["same_top1_share"]))
+            curve.append(entry)
+            print("   ".join(line), file=out)
         print("", file=out)
 
     print("== the reference's top-1 probability, and what the arm does to it "
@@ -521,7 +659,7 @@ def report(args, acc, order, prompt_rows, out=None):
                   % ("%s - %s" % (p["a"], p["b"]), p["n"], p["mean"], p["unc"], p["median"],
                      p["a_above"], p["n"] - p["ties"], p["sign_test_p"]), file=out)
         print("", file=out)
-    return summaries, pairs
+    return summaries, pairs, groups_out, curve
 
 
 def main(argv=None):
@@ -541,6 +679,13 @@ def main(argv=None):
     ap.add_argument("--arm-topn", type=int, default=None,
                     help="give every full arm the same blindness beyond its own top N")
     ap.add_argument("--paired", action="append", default=[], metavar="A,B")
+    ap.add_argument("--row-groups", default=None, metavar="FILE",
+                    help="a {\"groups\": [{\"name\", \"rows\"}]} file - the depth blocks of "
+                         "the #90 row plan or the per-text groups of the English corpus; "
+                         "adds one summary block per group per arm")
+    ap.add_argument("--kld-vs-position", type=int, default=None, metavar="BINS",
+                    help="bin the collected rows by absolute position into BINS equal-width "
+                         "bins and report mean KLD and same-top-1 per bin per arm")
     ap.add_argument("--per-row", default=None, help="write the per-row detail to this JSON file")
     ap.add_argument("--json", dest="json_out", default=None, help="write the summary to this JSON file")
     args = ap.parse_args(argv)
@@ -554,20 +699,34 @@ def main(argv=None):
                          "the top-N arm can answer for, and the same restriction has to reach "
                          "every other arm")
 
-    total = os.path.getsize(args.ref) // (args.vocab * 4)
+    if args.row_groups:
+        args.row_groups = load_row_groups(args.row_groups)
+
+    # for a sparse reference the total is its last absolute row + 1, so `--rows A:B`
+    # bounds absolute row ids in both forms
+    if os.path.exists(args.ref + ".rows.json"):
+        with open(args.ref + ".rows.json", "r", encoding="utf-8") as fh:
+            total = max(int(r) for r in json.load(fh)["rows"]) + 1
+    else:
+        total = os.path.getsize(args.ref) // (args.vocab * 4)
     args.first, args.last = parse_range(args.rows, total)
 
     acc, _ = collect(args.ref, args.vocab, args.first, args.last, full_arms, topn_arms,
                      args.min_log_prob, args.truncate, args.arm_topn, args.per_row)
     order = [n for n, _ in full_arms] + [n for n, _ in topn_arms]
-    summaries, pairs = report(args, acc, order, args.prompt_rows)
+    summaries, pairs, groups_out, curve = report(args, acc, order, args.prompt_rows)
 
     if args.json_out:
+        doc = {"reference": args.ref, "first_row": args.first, "last_row": args.last,
+               "prompt_rows": args.prompt_rows, "min_log_prob": args.min_log_prob,
+               "truncate": args.truncate, "arm_topn": args.arm_topn,
+               "summaries": summaries, "paired": pairs}
+        if groups_out:
+            doc["groups"] = groups_out
+        if curve:
+            doc["position_curve"] = curve
         with open(args.json_out, "w", encoding="utf-8") as fh:
-            json.dump({"reference": args.ref, "first_row": args.first, "last_row": args.last,
-                       "prompt_rows": args.prompt_rows, "min_log_prob": args.min_log_prob,
-                       "truncate": args.truncate, "arm_topn": args.arm_topn,
-                       "summaries": summaries, "paired": pairs}, fh, indent=1)
+            json.dump(doc, fh, indent=1)
     return 0
 
 
