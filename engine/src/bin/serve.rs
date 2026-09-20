@@ -3986,11 +3986,20 @@ fn serve_one(stream: &mut TcpStream, srv: &mut Srv) {
 // unwinding, so no `Drop` runs -- and an engine that dies with its pinned cold
 // tier allocated leaves ~40 GiB held by `nvidia_uvm` until the next reboot
 // (three measurements on this machine, see cuda::ctx_hard_reset). The watcher
-// thread below catches SIGINT/SIGTERM INSTEAD of the default action, asks the
-// accept loop to end, and lets `main` return so every `Drop` and the context
-// reset run. The signals are blocked BEFORE any thread exists (the log writer
-// included), because one unblocked thread is enough for the kernel to kill the
-// process outright.
+// thread below catches SIGINT/SIGTERM/SIGHUP/SIGQUIT INSTEAD of the default
+// action, asks the accept loop to end, and lets `main` return so every `Drop`
+// and the context reset run. The signals are blocked BEFORE any thread exists
+// (the log writer included), because one unblocked thread is enough for the
+// kernel to kill the process outright.
+//
+// SIGHUP/SIGQUIT joined on 2026-09-20, fourth leak of the series: the day's
+// fix-run serve (built WITH this shutdown) was torn down with its systemd
+// scope at 11:58 - no SIGTERM/SIGINT trace, and the tier leaked. A scope or
+// terminal going away hangs up the foreground process group, so SIGHUP is the
+// realistic end of a serve someone started in a terminal; SIGQUIT follows the
+// same rule. SIGKILL stays out on purpose: it is uncatchable, and "kill -9 the
+// engine" remains the one way to leak (documented, not fixed - a watchdog that
+// TERMs first is the answer there, not this file).
 static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LISTENER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
@@ -4000,6 +4009,8 @@ fn install_shutdown_watch() {
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGINT);
         libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGHUP);
+        libc::sigaddset(&mut set, libc::SIGQUIT);
         libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
     }
     std::thread::spawn(|| unsafe {
@@ -4007,6 +4018,8 @@ fn install_shutdown_watch() {
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGINT);
         libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGHUP);
+        libc::sigaddset(&mut set, libc::SIGQUIT);
         let mut sig: libc::c_int = 0;
         while libc::sigwait(&set, &mut sig) == 0 {
             SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
