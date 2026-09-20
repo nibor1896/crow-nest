@@ -1,3 +1,6 @@
+# THIS IS EARLY PRE ALPHA - I RECOMMEND USING THE LLAMA.CPP OPERATING POINTS UNTIL BETA RELEASE
+
+
 # crow-nest
 
 <a href="https://github.com/nibor1896/crow-nest/releases"><img src="https://img.shields.io/github/v/release/nibor1896/crow-nest?style=flat-square&logo=github&logoColor=ffffff&labelColor=000000" alt="release"></a>
