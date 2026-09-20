@@ -13,6 +13,13 @@ __pycache__/
 decode_out/*
 !decode_out/final4-t1-read-run0-crow.json
 !decode_out/final4-t1b-read-lang-run0-crow.json
+!decode_out/kv-ab/
+!decode_out/kv-ab/log.md
+!decode_out/kv-ab/kld-a.json
+!decode_out/kv-ab/kld-a-per-row.json
+!decode_out/kv-ab/kld-d.json
+!decode_out/kv-ab/kld-d-per-row.json
+!decode_out/kv-ab/balloon.py
 !decode_out/final4-t2-write-run0-crow.json
 !decode_out/final4-t2b-write-refactor-run0-crow.json
 !decode_out/final4-t3-debug-run0-crow.json
