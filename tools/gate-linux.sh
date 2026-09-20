@@ -225,7 +225,10 @@
 #                              existing ten-row refusal test changed by ONE line and did not
 #                              grow: its `nvfp4` case USED to be the refusal "bf16 only" and is
 #                              now the accepted #79 case, so the refused dtype there is `f32`.
-#                              So 232 = 133 lib + 88 serve + 6 parity + 5 decode.
+#   tests 232 -> 234           #81 (2026-09-20) adds TWO serve tests for the reasoning
+#                              budget: the integer dialect of `reasoning_budget_tokens` and
+#                              `is_inside` counting only what the block still holds.
+#                              So 234 = 133 lib + 90 serve + 6 parity + 5 decode.
 #   clippy 1458 (unchanged)    #79 adds no clippy warning: the engine change is one widened
 #                              match in `overlay_refusal`, two fields on `OverlayReport`, one
 #                              boot line and one panic in `residency.rs`. The converter is a
@@ -273,7 +276,7 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="232"
+TESTS="234"
 CLIPPY="1458"
 
 red=0

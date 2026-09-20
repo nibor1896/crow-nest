@@ -229,6 +229,15 @@
 //!   names no level renders the ids of record and every parity and gate value stands.
 //! - #74: with thinking on the generation prompt ends in `<think>\n`, so `ThinkFilter` starts
 //!   `Inside` for that request - otherwise the reasoning would leave as `content`.
+//! - #81: `reasoning_budget_tokens` caps the THINKING, not the answer. Absent, null or
+//!   negative is the behaviour of every release before #81; `0` closes the block before it
+//!   opens; `n > 0` closes it once `n` reasoning tokens were generated - the sampled
+//!   continuation is REPLACED by `reasoning_budget_message` (when sent; Crow's
+//!   REASONING_BUDGET_MESSAGE, #176: a bare close starts answers mid-word), the
+//!   `</think>` token and a `\n\n`, all appended as generated ids so the model's own
+//!   context contains the close and it answers in what is left of `max_tokens`. The same
+//!   mechanism llama-server ships as `--reasoning-budget` (its PRs #13771/#17750) and
+//!   Qwen's docs name `thinking_budget`; without the field the ids stay byte-identical.
 //! - Greedy decode: `Engine::prefill` gives the first id, `Engine::decode_step` the rest.
 //! - Stops on `sample::EOS_IDS` (`finish_reason` `stop`) or at `max_tokens` (`length`).
 //! - `prompt ids >= n_ctx` answers 413 before any GPU work.
@@ -520,6 +529,7 @@ use crow_nest_engine::geo::{apply_adapt_policy, DEFAULT_CNQ, DEFAULT_HOTSETS, LA
 use crow_nest_engine::sample::{Sampler, EOS_IDS};
 use crow_nest_engine::slot;
 use crow_nest_engine::toolcall::{Emit, ToolStream, TOOL_OPEN};
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1010,6 +1020,18 @@ struct ChatReq {
     /// #74: the body named `chat_template_kwargs.enable_thinking`; read by the `[chat]` line
     /// only, so the `(request)` tag is true for the second door as well
     kwargs_thinking_sent: bool,
+    /// #81: the thinking budget in TOKENS. `None` (absent, null or negative) is the
+    /// behaviour of every release before #81: reasoning runs until the model closes the
+    /// block itself or `max_tokens` is spent. `Some(0)` closes the block before the first
+    /// reasoning token; `Some(n)` closes it once `n` reasoning tokens were generated --
+    /// the mechanism llama-server owns as `--reasoning-budget` (PR #13771/#17750) and Crow
+    /// has sent since #176, so the two arms of the same client can run the same protocol.
+    reasoning_budget: Option<usize>,
+    /// #81: the wrap-up text injected as the LAST reasoning tokens before the forced
+    /// close. Crow sends `REASONING_BUDGET_MESSAGE` beside the budget because a bare
+    /// force-close was measured to start answers mid-word (2 of 9 capped answers, #176);
+    /// with the message 0 of 6. `None` closes without one.
+    reasoning_budget_message: Option<String>,
     /// `stream_options.include_usage`: `usage` on the final chunk (#27 A5)
     include_usage: bool,
     /// `timings_per_token`: `timings` on the final chunk (#27 A5)
@@ -1299,6 +1321,32 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         presence_penalty: sent("presence_penalty"),
         seed: sent("seed"),
     };
+    // #81: the thinking budget, in llama-server's integer dialect: absent, null or negative
+    // is unrestricted (the behaviour of every release before #81), 0 closes the block
+    // before the first reasoning token, n > 0 caps the reasoning at n tokens. The message
+    // is Crow's REASONING_BUDGET_MESSAGE and travels beside the cap for exactly the
+    // measured reason recorded in #176: a bare force-close starts answers mid-word.
+    let reasoning_budget = match obj.get("reasoning_budget_tokens") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let n = v
+                .as_i64()
+                .ok_or_else(|| "reasoning_budget_tokens is not an integer".to_string())?;
+            if n < 0 {
+                None
+            } else {
+                Some(n as usize)
+            }
+        }
+    };
+    let reasoning_budget_message = match obj.get("reasoning_budget_message") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or_else(|| "reasoning_budget_message is not a string".to_string())?
+                .to_string(),
+        ),
+    };
     Ok(ChatReq {
         model,
         messages: messages.clone(),
@@ -1309,6 +1357,8 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         reasoning_effort,
         reasoning_asked,
         kwargs_thinking_sent: kw_thinking.is_some(),
+        reasoning_budget,
+        reasoning_budget_message,
         include_usage,
         timings_per_token,
         temperature,
@@ -1693,6 +1743,13 @@ impl ThinkFilter {
         } else {
             ThinkFilter::new()
         }
+    }
+
+    /// #81: is the block still open? The budget counter asks this of every generated
+    /// token AFTER the filter has seen its text, so a token that closes the block itself
+    /// is the model's own close and never a counted reasoning token.
+    fn is_inside(&self) -> bool {
+        matches!(self.state, Think::Inside)
     }
 
     /// how many `<think>` / `</think>` tags this filter kept off the wire
@@ -3063,8 +3120,70 @@ fn chat_generate(
     let (adapt_stream, adapt_every, adapt_max) = srv.eng.cfg.adapt.knobs();
     let tick_trickle = adapt_stream && adapt_every > 0 && trickle_ready(srv.eng);
     let mut trickle_swaps = 0usize;
+    // #81: THE THINKING BUDGET, and the shape it takes here. The mechanism llama-server
+    // ships as `--reasoning-budget` (its PRs #13771/#17750) and Qwen's docs describe as
+    // `thinking_budget`: when the cap of reasoning tokens is spent, the close of the think
+    // block is FORCED -- the sampled continuation is replaced by the wrap-up message (when
+    // the request sent one), the `</think>` token and a `\n\n`, all appended as GENERATED
+    // ids, so the model's own context contains the close it never wrote and it continues
+    // with the answer. What is spent of `max_tokens` by the injection belongs to the
+    // budget the same way a sampled token does.
+    //
+    // THE TOKENS ARE REPLACED, NOT MASKED: vLLM's ThinkingPlugin masks every logit except
+    // the close token; this loop achieves the same sequence by discarding the one sampled
+    // id at the top of the next iteration and substituting its own. One id of sampling is
+    // wasted per close, once per request, and no sampler internals change hands.
+    //
+    // OFF BY DEFAULT: no `reasoning_budget_tokens` in the body leaves this whole block
+    // inert and the generated ids byte-identical to every release before #81 -- the same
+    // rule #74 gave `reasoning_effort`.
+    //
+    // `Some(0)` closes before the first reasoning token, armed here rather than in the
+    // loop, so a budget of zero is "do not think" rather than "think one token".
+    let think_budget = if req.enable_thinking {
+        req.reasoning_budget
+    } else {
+        None // a non-thinking request has no block to close
+    };
+    let mut think_tokens = 0usize;
+    let mut inject: VecDeque<usize> = VecDeque::new();
+    let mut injection_built = false;
+    let build_injection = || -> VecDeque<usize> {
+        // the message as raw BPE, then the single close id, then a paragraph break: the
+        // message lands INSIDE the block as its last reasoning text, exactly where Crow's
+        // #176 measurement wants it, and the `\n\n` after the close is what `Lead` trims
+        // so the answer starts at its first real character.
+        let mut ids: Vec<usize> = req
+            .reasoning_budget_message
+            .as_deref()
+            .and_then(|m| tk.encode_raw(m).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| id as usize)
+            .collect();
+        if let Some(close) = tk.token_id(THINK_CLOSE) {
+            ids.push(close as usize);
+        }
+        if let Ok(tail) = tk.encode_raw("\n\n") {
+            ids.extend(tail.into_iter().map(|id| id as usize));
+        }
+        VecDeque::from(ids)
+    };
+    if think_budget == Some(0) {
+        inject = build_injection();
+        injection_built = true;
+        tracing::info!(target: "chat",
+            "[chat] reasoning budget 0 (request): closing the think block before it opens");
+    }
     if !aborted {
         for i in 0..req.max_tokens {
+            // #81: a pending injection REPLACES the token the sampler produced - this one
+            // line is the whole force. It sits above the EOS check because an injected
+            // close is never EOS, and above `out.push`, so the replaced id simply never
+            // exists anywhere.
+            if !inject.is_empty() {
+                next = inject.pop_front().expect("checked non-empty");
+            }
             if EOS_IDS.contains(&next) {
                 finish = "stop";
                 break;
@@ -3088,6 +3207,25 @@ fn chat_generate(
                 if !send_emits(sink, &cx, &pieces, &mut think, &mut counts) {
                     aborted = true;
                     break;
+                }
+            }
+            // #81: COUNT AFTER THE FILTER SAW THE TOKEN. A token that closed the block
+            // left `Inside`, is the model's own close and counts for nothing; everything
+            // the block still holds is reasoning, whatever its text. Arming happens on
+            // the token that SPENDS the budget, the injection starts with the next one.
+            if !injection_built {
+                if let Some(cap) = think_budget {
+                    if think.is_inside() {
+                        think_tokens += 1;
+                        if think_tokens >= cap {
+                            inject = build_injection();
+                            injection_built = true;
+                            tracing::info!(target: "chat",
+                                "[chat] reasoning budget {} spent after {} thinking tokens \
+                                 (request): closing the think block",
+                                cap, think_tokens);
+                        }
+                    }
                 }
             }
             // the budget is spent: no decode_step whose token nobody reads
@@ -4331,6 +4469,73 @@ mod tests {
         assert!(parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stream":"yes"}"#).is_err());
         assert!(parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":0}"#).is_err());
         assert!(parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":-1}"#).is_err());
+    }
+
+    // ------------------------------------------------ reasoning budget (#81)
+
+    const BUDGET_BODY: &str =
+        r#"{"messages":[{"role":"user","content":"hi"}],"reasoning_budget_tokens":"#;
+
+    #[test]
+    fn the_reasoning_budget_parses_in_llama_servers_integer_dialect() {
+        // absent, null and negative are unrestricted - the behaviour of every release
+        // before #81, and the shape a request that names no cap must keep
+        for body in [
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#.to_string(),
+            r#"{"messages":[{"role":"user","content":"hi"}],"reasoning_budget_tokens":null}"#.to_string(),
+            BUDGET_BODY.to_string() + "-1}",
+        ] {
+            let r = parse_chat(body.as_bytes()).unwrap();
+            assert_eq!(r.reasoning_budget, None, "{body}");
+        }
+        // 0 closes before the first reasoning token, n > 0 caps at n
+        assert_eq!(
+            parse_chat((BUDGET_BODY.to_string() + "0}").as_bytes())
+                .unwrap()
+                .reasoning_budget,
+            Some(0)
+        );
+        assert_eq!(
+            parse_chat((BUDGET_BODY.to_string() + "1024}").as_bytes())
+                .unwrap()
+                .reasoning_budget,
+            Some(1024)
+        );
+        // the message travels beside the cap, and only as a string
+        assert_eq!(
+            parse_chat(
+                (BUDGET_BODY.to_string()
+                    + r#"5,"reasoning_budget_message":"wrap up"}"#)
+                    .as_bytes()
+            )
+            .unwrap()
+            .reasoning_budget_message
+            .as_deref(),
+            Some("wrap up")
+        );
+        // rejections, in this parse's own words
+        assert!(parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"reasoning_budget_tokens":"lots"}"#).is_err());
+        assert!(parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"reasoning_budget_tokens":5,"reasoning_budget_message":7}"#).is_err());
+    }
+
+    #[test]
+    fn is_inside_counts_only_what_the_block_still_holds() {
+        // #81: the counter asks the filter AFTER the token's text was seen, so the token
+        // that closes the block is the model's own close and never a counted token.
+        let mut f = ThinkFilter::inside();
+        assert!(f.is_inside());
+        let s = f.push("reasoning text");
+        assert!(!s.content.is_empty() || !s.reasoning.is_empty());
+        assert!(f.is_inside(), "reasoning text keeps the block open");
+        f.push("</think>");
+        assert!(!f.is_inside(), "the model's own close counts for nothing");
+        // and the injection's close takes the same road: message inside, close flips,
+        // the paragraph break after it is trimmed by Lead
+        let mut g = ThinkFilter::inside();
+        let s = g.push("\n\nThat is enough analysis.</think>\n\n");
+        assert!(!s.reasoning.is_empty(), "the wrap-up lands in the block");
+        assert!(!g.is_inside());
+        assert!(s.content.is_empty(), "Lead trims the break after the close");
     }
 
     // ------------------------------------------------------- sampling (#28 A6)
