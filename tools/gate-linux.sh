@@ -229,6 +229,12 @@
 #                              budget: the integer dialect of `reasoning_budget_tokens` and
 #                              `is_inside` counting only what the block still holds.
 #                              So 234 = 133 lib + 90 serve + 6 parity + 5 decode.
+#   clippy 1458 -> 1459        #82 (2026-09-20) adds NO clippy warning: measured 1459 at
+#                              7586234 in a clean worktree BEFORE the SIGHUP/SIGQUIT watcher
+#                              edit, and 1459 after it - the +1 is TOOLCHAIN DRIFT from the
+#                              arch system update of 2026-09-20 07:22 (new clippy lints such
+#                              as manual_div_ceil), not the engine. #79's note below stays
+#                              for the record.
 #   clippy 1458 (unchanged)    #79 adds no clippy warning: the engine change is one widened
 #                              match in `overlay_refusal`, two fields on `OverlayReport`, one
 #                              boot line and one panic in `residency.rs`. The converter is a
@@ -277,7 +283,7 @@ SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
 TESTS="234"
-CLIPPY="1458"
+CLIPPY="1459"
 
 red=0
 green() { printf 'GREEN  %-28s %s\n' "$1" "${2:-}"; }
