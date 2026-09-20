@@ -661,8 +661,14 @@ fn main() {
     // failing self-test; that costs reclaimable page cache and no correctness.
     if selftest_failed {
         crow_nest_engine::log::shutdown();
+        // #82: `exit` runs no destructor, so the context reset is the last CUDA
+        // act this side of the process boundary - see cuda::ctx_hard_reset
+        unsafe { crow_nest_engine::cuda::ctx_hard_reset(); }
         std::process::exit(1);
     }
+    // #82: same reset on the clean path: a GREEN gate parity whose decode
+    // exited 0 still leaked its pinned tier on this machine (2026-09-20)
+    unsafe { crow_nest_engine::cuda::ctx_hard_reset(); }
 }
 
 // ---- the package self-test (F5, issue #64, 2026-09-18) ------------------------------------

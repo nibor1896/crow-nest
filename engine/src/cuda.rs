@@ -638,6 +638,24 @@ pub unsafe fn sync() {
     ck(sys::cuStreamSynchronize(s as CUstream));
 }
 
+/// #82: THE END-OF-PROCESS CONTEXT RESET, and why a plain exit is not enough on
+/// this machine. Every engine binary pins its cold tier with `cuMemHostAlloc`;
+/// on the OPEN kernel module (610.57.04, hybrid machine) a process that dies
+/// with the primary context merely RELEASED leaves its pinned UVA pages held by
+/// `nvidia_uvm` -- no process owns them, `rmmod` is blocked by their own
+/// refcount, and only a reboot reclaims the ~40 GiB. Measured three times
+/// 2026-09-19/20 (serve TERM, serve killed mid-load, and a GREEN gate parity
+/// whose `decode` exited 0). This reset is the documented cleanup for exactly
+/// that state: detach the context, then `cuDevicePrimaryCtxReset_v2`, which
+/// forces the driver to tear the context down while the process still lives.
+/// Every exit path that touched CUDA calls it as its LAST act.
+pub unsafe fn ctx_hard_reset() {
+    let mut dev: sys::CUdevice = 0;
+    let _ = sys::cuDeviceGet(&mut dev, 0);
+    let _ = sys::cuCtxSetCurrent(std::ptr::null_mut());
+    let _ = sys::cuDevicePrimaryCtxReset_v2(dev);
+}
+
 /// the host RAM picture the pinned-tier budget is derived from
 pub struct HostRam {
     /// bytes a `cuMemHostAlloc` may take (see the unix derivation below)

@@ -3237,7 +3237,11 @@ fn chat_generate(
             // document sink probes the socket, because it writes nothing until the end and a
             // gone client would otherwise hold this slot for the whole `max_tokens` budget.
             // One `poll`, 0.10 us, per step (`PROBE_EVERY`, 7.11.18).
-            if !sink.still_there(i) {
+            // #82: a shutdown signal ends the generation THROUGH the normal
+            // abort path, so the slot, the sink and the loop bookkeeping all
+            // close the way a gone client closes them
+            if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
+                || !sink.still_there(i) {
                 aborted = true;
                 break;
             }
@@ -3978,12 +3982,55 @@ fn serve_one(stream: &mut TcpStream, srv: &mut Srv) {
     let _ = stream.shutdown(Shutdown::Write);
 }
 
+// #82: THE GRACEFUL SHUTDOWN STATE. SIGTERM's default action terminates without
+// unwinding, so no `Drop` runs -- and an engine that dies with its pinned cold
+// tier allocated leaves ~40 GiB held by `nvidia_uvm` until the next reboot
+// (three measurements on this machine, see cuda::ctx_hard_reset). The watcher
+// thread below catches SIGINT/SIGTERM INSTEAD of the default action, asks the
+// accept loop to end, and lets `main` return so every `Drop` and the context
+// reset run. The signals are blocked BEFORE any thread exists (the log writer
+// included), because one unblocked thread is enough for the kernel to kill the
+// process outright.
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LISTENER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+fn install_shutdown_watch() {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+    std::thread::spawn(|| unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        let mut sig: libc::c_int = 0;
+        while libc::sigwait(&set, &mut sig) == 0 {
+            SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+            // eprintln, not tracing: the subscriber may not exist yet when an
+            // early signal lands, and this line is the one an operator waits for
+            eprintln!("[serve] signal {sig}: shutting down - the pinned tier is being freed before exit (#82)");
+            let fd = LISTENER_FD.load(std::sync::atomic::Ordering::SeqCst);
+            if fd >= 0 {
+                libc::shutdown(fd, libc::SHUT_RDWR);
+            }
+            // no exit here on purpose: main returns, so Engine, Residency and
+            // the Ctx all Drop, and the caller of this process gets its RAM back
+        }
+    });
+}
+
 fn main() {
     // #13: the subscriber, before the first line this process says. The guard keeps
     // the two writer threads alive for the whole process and drains them when `main`
     // returns; every `std::process::exit` below calls `log::shutdown()` first, because
     // `exit` runs no destructor and a lost `[serve] cannot bind ...` is the one line
     // an operator needs.
+    // #82: FIRST, before the log spawns its writer threads - see the block above
+    install_shutdown_watch();
     let _log = crow_nest_engine::log::init();
     let args: Vec<String> = std::env::args().collect();
     // A3: the tokenize arm returns HERE, before the CUDA context and before Engine::load
@@ -4075,6 +4122,13 @@ fn main() {
     };
     let n_ctx = eng.n_ctx();
     let prompt_chunk = eng.cfg.prompt_chunk;
+    // #82: a signal that arrived DURING the load has no listener to wake; this
+    // check is its exit, through the same drops the normal end takes
+    if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+        crow_nest_engine::log::shutdown();
+        unsafe { crow_nest_engine::cuda::ctx_hard_reset(); }
+        return;
+    }
 
     tracing::info!(target: "serve", "[serve] container {cnq_path}");
     tracing::info!(target: "serve", "[serve] hotsets {sidecar}");
@@ -4116,6 +4170,9 @@ fn main() {
             std::process::exit(3);
         }
     };
+    // #82: the watcher shuts this socket down to break the accept below
+    use std::os::fd::AsRawFd;
+    LISTENER_FD.store(listener.as_raw_fd(), std::sync::atomic::Ordering::SeqCst);
     tracing::info!(target: "serve", "[serve] listening on http://{addr} (blocking, one request at a time)");
 
     let mut eng = eng;
@@ -4167,7 +4224,12 @@ fn main() {
     for conn in listener.incoming() {
         match conn {
             Ok(mut s) => serve_one(&mut s, &mut srv),
-            Err(e) => tracing::warn!(target: "serve", "[serve] accept failed: {e}"),
+            Err(e) => {
+                if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                    break; // #82: the watcher shut the listener - end through the drops
+                }
+                tracing::warn!(target: "serve", "[serve] accept failed: {e}");
+            }
         }
     }
     // #28: a parked device sampler goes back into the engine, so `Engine::drop` frees its
@@ -4175,6 +4237,8 @@ fn main() {
     srv.eng.unpark_sampler(&mut srv.parked_sampler);
     drop(srv);
     drop(eng);
+    // #82: last CUDA act of this process - see cuda::ctx_hard_reset
+    unsafe { crow_nest_engine::cuda::ctx_hard_reset(); }
 }
 
 #[cfg(test)]
