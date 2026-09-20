@@ -148,7 +148,10 @@
 //! | `top_k` | candidates kept, default 20 (data sheet); read only when `temperature > 0` |
 //! | `presence_penalty` | default 1.5 (data sheet); read only when `temperature > 0` |
 //! | `seed` | RNG seed of THIS request, default 0; a warm process draws what a cold one draws |
-//! | `min_p` | ACCEPTED AND IGNORED, the device sampler has no min_p (#28, open for robin) |
+//! | `min_p` | #83: the log-space tail filter, HONORED on device and host; absent, `null` or `<= 0` disables, `(0,1]` filters; read only when `temperature > 0` |
+//! | `repeat_penalty` | #84: llama.cpp asymmetric repeat over the penalty window; absent/`null` = 1.0 NEUTRAL; read in greedy and sampled alike |
+//! | `frequency_penalty` | #84: `l -= count * freq` over the window; absent/`null` = 0 NEUTRAL |
+//! | `penalty_last_n` | #84: window depth in ids, PROMPT TAIL + generated, default 64, clamped to 1024 (the device ring); `0` disables the windowed pass |
 //! | `tools` | array of OpenAI function tools, RENDERED as the template variable `tools` (#29 A7) |
 //! | `stream_options.include_usage` | `true` puts `usage` on the final chunk (#27 A5) |
 //! | `timings_per_token` | `true` puts `timings` on the final chunk (#27 A5) |
@@ -251,13 +254,18 @@
 //! | absent, `null`, `<= 0` | `Engine::prefill` (argmax) | `Engine::decode_step` (argmax) | TAKEN OUT of the engine |
 //! | `> 0` | `Engine::sample_last` | `decode_step` behind the `sample_k` node | ARMED before the first step |
 //!
-//! - Greedy is the A4 path unchanged: same calls, same order, no sampler node in the graph.
+//! - Greedy is the A4 path unchanged: same calls, same order, no sampler node in the graph -
+//!   EXCEPT a greedy request that arms the #84 window (repeat != 1.0 or freq > 0 with a
+//!   window): that one arms the sampler with `temperature <= 0`, whose device draw is
+//!   `ci[0]`, the penalized argmax, exactly as llama.cpp penalizes greedy too.
 //! - `sample::EOS_IDS` stops BOTH modes; `CROW_STOP_EOS` is the harness opt-in and is NOT read here.
 //! - The sampler is built from the REQUEST, never from the environment.
 //! - `CROW_SAMPLE`, `CROW_TEMP`, `CROW_TOP_P`, `CROW_TOP_K`, `CROW_PRESENCE`, `CROW_SEED`
 //!   keep working for `decode` and `parity`; `serve` reads none of them.
 //! - `Sampler::new(seed)` carries the data-sheet defaults, the request overwrites what it sends.
-//! - Absent fields when `temperature > 0`: top_p 0.8, top_k 20, presence_penalty 1.5, seed 0.
+//! - Absent fields when `temperature > 0`: top_p 0.8, top_k 20, presence_penalty 1.5, seed 0 -
+//!   and, since #84, repeat_penalty 1.0 / frequency_penalty 0.0 / penalty_last_n 64, all
+//!   NEUTRAL: no existing row changes implicitly until a row names them.
 //!
 //! Per request reseed (M1, robin 2026-09-09):
 //!
@@ -278,14 +286,14 @@
 //! - `Srv::parked_sampler` holds the `DevSampler` while a greedy request runs.
 //! - The next sampled request hands the same device buffers back, so nothing is reallocated.
 //!
-//! `min_p` (open decision for robin, #28):
+//! `min_p` (#83, since 2026-09-20 HONORED - the "accepted and ignored" era of #28 is over):
 //!
 //! - Crow's operating point is temperature 1.0, top_p 0.95, min_p 0.01 (`crow_core.py`).
-//! - The device sampler (`kernels.rs sample_k`) implements top_k, top_p and presence only.
-//! - A6 does not touch kernels, so `min_p` is parsed, ignored, and logged once per request.
-//! - The log line names it: `min_p accepted and ignored (device sampler has no min_p; #28)`.
-//! - Consequence: an answer at Crow's operating point has NO min_p floor under the nucleus.
-//! - Options for robin: add min_p to `sample_k` (kernel change), or drop it from the profile.
+//! - The filter is llama.cpp's (PR ggml-org/llama.cpp#3841): AFTER top-k, BEFORE the
+//!   temperature softmax, candidates below `max_logit + ln(min_p)` drop out (min_keep 1).
+//! - Host (`sample.rs`), device (`kernels.rs sample_k`) and the `[chat]` line all carry it;
+//!   `ln(min_p)` is computed ONCE on the host and uploaded, so the boundary is bit-equal.
+//! - Absent, `null` or `<= 0` disables it - exactly the old behavior, golden rows included.
 //!
 //! Stream shape (llama-server / OpenAI, `crow_core.py:4831-4877`):
 //!
@@ -561,6 +569,15 @@ const DEFAULT_TOP_P: f32 = 0.8;
 const DEFAULT_TOP_K: usize = 20;
 /// #28: `presence_penalty` when a sampled request carries none (data sheet)
 const DEFAULT_PRESENCE: f32 = 1.5;
+/// #84: `repeat_penalty` when a request carries none - llama.cpp's own default,
+/// and NEUTRAL: the asymmetric div/mul is skipped at exactly 1.0, so no existing
+/// row changes implicitly
+const DEFAULT_REPEAT: f32 = 1.0;
+/// #84: `frequency_penalty` when a request carries none - neutral, as llama.cpp
+const DEFAULT_FREQ: f32 = 0.0;
+/// #84: `penalty_last_n` when a request carries none - llama.cpp's default 64;
+/// the window spans the prompt tail plus the generated ids
+const DEFAULT_LAST_N: usize = 64;
 /// #28: RNG seed when the request carries none; fixed, so warm equals cold (M1)
 const DEFAULT_SEED: u64 = 0;
 /// #54: how many decode steps of the `stream:false` path ONE gone-client probe covers.
@@ -586,6 +603,13 @@ struct SamplingSent {
     top_k: bool,
     presence_penalty: bool,
     seed: bool,
+    /// #83: `min_p` - the one profile field Crow really sends that this
+    /// server ignored until #83 made it real
+    min_p: bool,
+    /// #84: the windowed llama.cpp penalty fields
+    repeat_penalty: bool,
+    frequency_penalty: bool,
+    penalty_last_n: bool,
 }
 
 impl SamplingSent {
@@ -1046,15 +1070,55 @@ struct ChatReq {
     presence_penalty: f32,
     /// #28: RNG seed of this request, `DEFAULT_SEED` when absent
     seed: u64,
-    /// #68: which of `top_p`, `top_k`, `presence_penalty`, `seed` the body carried; read by
-    /// the `[chat]` line only, never by the sampler
+    /// #68: which of the sampling fields the body carried; read by the `[chat]`
+    /// line only, never by the sampler
     sampling_sent: SamplingSent,
-    /// #28: parsed, ignored, logged; the device sampler has no min_p
+    /// #83: the log-space tail filter, `0.0` (absent included) disables;
+    /// `(0,1]` drops candidates below `max_logit + ln(min_p)` after top-k.
+    /// Parsed since #28, HONORED since #83 (host `sample.rs`, device `sample_k`).
     min_p: f32,
+    /// #84: llama.cpp `repeat_penalty` (asymmetric div/mul on the raw logits);
+    /// `1.0` (absent included) is neutral
+    repeat_penalty: f32,
+    /// #84: llama.cpp `frequency_penalty` (`l -= c * freq` over the window);
+    /// `0.0` (absent included) is neutral
+    frequency_penalty: f32,
+    /// #84: the penalty window in ids, prompt tail + generated (llama.cpp
+    /// `penalty_last_n`); `0` disables the windowed pass. Clamped to the
+    /// device ring's depth (`gen::SAMPLE_RING_MAX`, 1024) - the `[chat]` line
+    /// names the effective value, so a clamp is visible, never silent.
+    penalty_last_n: usize,
     /// #VIT: the `image_url` data URLs of the content blocks, in message order.
     /// This is the exact wire form Crow sends (crow_core.py `image_part`):
     /// `{"type":"image_url","image_url":{"url":"data:<mime>;base64,..."}}`.
     images: Vec<String>,
+}
+
+/// - #28/#68/#83/#84: the sampling provenance line. Every VALUE, then
+///   `(request)` or `(data sheet)` for where it came from - `temperature` is
+///   always the request's own (without it this line is not printed unless
+///   the #84 penalties armed a greedy request), the rest say whether the body
+///   carried the field.
+/// - #83: `min_p` joined the line the day it stopped being "accepted and
+///   ignored" - a profile field a client really sends must be visible as
+///   honored, not just present.
+/// - #84: the three windowed-penalty fields, so a row can name its brake.
+/// - pure: the test drives it on a built Sampler, no engine and no socket.
+fn sampling_line(s: &Sampler, sent: SamplingSent) -> String {
+    format!(
+        "[chat] sampling on the device: temperature {} (request) top_p {} ({}) top_k {} ({}) \
+         min_p {} ({}) presence_penalty {} ({}) repeat_penalty {} ({}) frequency_penalty {} ({}) \
+         penalty_last_n {} ({}) seed {} ({})",
+        s.temperature,
+        s.top_p, SamplingSent::tag(sent.top_p),
+        s.top_k, SamplingSent::tag(sent.top_k),
+        s.min_p, SamplingSent::tag(sent.min_p),
+        s.presence_penalty, SamplingSent::tag(sent.presence_penalty),
+        s.repeat_penalty, SamplingSent::tag(sent.repeat_penalty),
+        s.frequency_penalty, SamplingSent::tag(sent.frequency_penalty),
+        s.penalty_last_n, SamplingSent::tag(sent.penalty_last_n),
+        s.seed, SamplingSent::tag(sent.seed)
+    )
 }
 
 /// - a number field of the sampling profile: absent or `null` gives `d`, a non number is a 400
@@ -1150,7 +1214,8 @@ fn thinking_line(req: &ChatReq) -> String {
 
 /// - the request body, as Crow sends it (`crow_core.py:4672-4700`)
 /// - unknown fields are accepted and ignored, as llama-server does
-/// - `tools` falls under that rule in A4; `min_p` under it in A6
+/// - `tools` falls under that rule in A4; `min_p` was its sibling in A6 and
+///   is a strict, honored sampling field since #83
 /// - the sampling fields (#28) are STRICT on type and lenient on absence
 /// - `Err` carries the message for the 400 body
 fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
@@ -1297,6 +1362,20 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
     let top_p = num_field(obj, "top_p", DEFAULT_TOP_P)?;
     let presence_penalty = num_field(obj, "presence_penalty", DEFAULT_PRESENCE)?;
     let min_p = num_field(obj, "min_p", 0.0)?;
+    // #84: the windowed llama.cpp penalties; absent stays neutral, so no
+    // existing row changes implicitly. Greedy reads them too - llama.cpp runs
+    // its penalties sampler in greedy and sampled alike.
+    let repeat_penalty = num_field(obj, "repeat_penalty", DEFAULT_REPEAT)?;
+    let frequency_penalty = num_field(obj, "frequency_penalty", DEFAULT_FREQ)?;
+    let penalty_last_n = match obj.get("penalty_last_n") {
+        None | Some(serde_json::Value::Null) => DEFAULT_LAST_N,
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| "penalty_last_n is not a non negative integer".to_string())? as usize,
+    };
+    // the device ring is SAMPLE_RING_MAX deep; a deeper ask is clamped to it
+    // (the `[chat]` line prints the effective value, so the clamp is visible)
+    let penalty_last_n = penalty_last_n.min(crow_nest_engine::gen::SAMPLE_RING_MAX);
     let top_k = match obj.get("top_k") {
         None | Some(serde_json::Value::Null) => DEFAULT_TOP_K,
         Some(v) => v
@@ -1320,6 +1399,10 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         top_k: sent("top_k"),
         presence_penalty: sent("presence_penalty"),
         seed: sent("seed"),
+        min_p: sent("min_p"),
+        repeat_penalty: sent("repeat_penalty"),
+        frequency_penalty: sent("frequency_penalty"),
+        penalty_last_n: sent("penalty_last_n"),
     };
     // #81: the thinking budget, in llama-server's integer dialect: absent, null or negative
     // is unrestricted (the behaviour of every release before #81), 0 closes the block
@@ -1368,6 +1451,9 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         seed,
         sampling_sent,
         min_p,
+        repeat_penalty,
+        frequency_penalty,
+        penalty_last_n,
         images,
     })
 }
@@ -1416,8 +1502,15 @@ fn decode_data_url(url: &str) -> Result<(&str, Vec<u8>), String> {
 /// - the `Sampler` this request asks for, or `None` for the greedy A4 path
 /// - `None` is the whole greedy contract: no sampler is built, none is armed
 /// - every field the request left out comes from `Sampler::new` (data sheet)
+/// - #84 EXCEPT when the windowed penalties are armed (repeat != 1.0 or
+///   freq > 0 with a window): llama.cpp runs its penalties sampler in greedy
+///   too, so a greedy request that names them gets a sampler after all - one
+///   with `temperature <= 0`, whose device draw is `ci[0]`, the penalized
+///   argmax. A plain greedy request (no penalty fields) is still `None`.
 fn sampler_from(req: &ChatReq) -> Option<Sampler> {
-    if !(req.temperature > 0.0) {
+    let penalties_armed =
+        req.penalty_last_n > 0 && (req.repeat_penalty != 1.0 || req.frequency_penalty > 0.0);
+    if !(req.temperature > 0.0) && !penalties_armed {
         return None;
     }
     let mut s = Sampler::new(req.seed);
@@ -1425,6 +1518,10 @@ fn sampler_from(req: &ChatReq) -> Option<Sampler> {
     s.top_p = req.top_p;
     s.top_k = req.top_k;
     s.presence_penalty = req.presence_penalty;
+    s.min_p = req.min_p;
+    s.repeat_penalty = req.repeat_penalty;
+    s.frequency_penalty = req.frequency_penalty;
+    s.penalty_last_n = req.penalty_last_n;
     Some(s)
 }
 
@@ -3045,30 +3142,50 @@ fn chat_generate(
     // `reset_to_zero` and warm by `PrefixCache::rollback`, so that step re-captures it
     // and the `sample_k` node goes in with it. `enable_dev_sampler` re-uploads `Rng::new(seed)`
     // and clears the presence mask on every call, which is the per request reseed (M1).
-    let sampler = sampler_from(req);
+    let mut sampler = sampler_from(req);
+    // #84: the window spans PROMPT + generated - seed it with the prompt's
+    // last penalty_last_n ids BEFORE the first draw. `arm_sampler` reads the
+    // window back out of the sampler and uploads it to the device ring, so
+    // host and device start from the same ids whatever the prefix cache
+    // reused. The HF presence set stays EMPTY here: that one is this answer's
+    // tokens only (#68).
+    if let Some(s) = sampler.as_mut() {
+        s.observe_prompt(ids);
+    }
     match &sampler {
         Some(s) => {
             // the device buffers a greedy request parked come back here, nothing is reallocated
             srv.eng.unpark_sampler(&mut srv.parked_sampler);
             // unsafe: device uploads and one eager sampler launch, as parity does
             next = unsafe { srv.eng.arm_sampler(s) };
-            // #68: every value says where it came from. `temperature` is the only one that is
-            // always the request's own - without it this branch is not taken at all.
+            // #68/#83/#84: every value says where it came from. `temperature` is the only
+            // one that is always the request's own - without it this branch is not taken
+            // unless the #84 penalties armed a greedy request.
             let sent = req.sampling_sent;
-            tracing::info!(target: "chat",
-                "[chat] sampling on the device: temperature {} (request) top_p {} ({}) top_k {} ({}) presence_penalty {} ({}) seed {} ({})",
-                s.temperature,
-                s.top_p, SamplingSent::tag(sent.top_p),
-                s.top_k, SamplingSent::tag(sent.top_k),
-                s.presence_penalty, SamplingSent::tag(sent.presence_penalty),
-                s.seed, SamplingSent::tag(sent.seed)
-            );
-            // the penalty set of THIS request: `arm_sampler` clears the device mask and reloads
-            // `Rng::new(seed)`, so no token of the prompt and no token of an earlier turn is in
-            // it, whatever the prefix cache reused (7.11.17)
-            tracing::info!(target: "chat",
-                "[chat] presence penalty set: cleared for this request, generated tokens only (#68)"
-            );
+            if s.temperature > 0.0 {
+                tracing::info!(target: "chat", "{}", sampling_line(s, sent));
+            } else {
+                tracing::info!(target: "chat",
+                    "[chat] greedy with windowed penalties (#84): repeat_penalty {} ({}) frequency_penalty {} ({}) penalty_last_n {} ({}) presence_penalty {} ({})",
+                    s.repeat_penalty, SamplingSent::tag(sent.repeat_penalty),
+                    s.frequency_penalty, SamplingSent::tag(sent.frequency_penalty),
+                    s.penalty_last_n, SamplingSent::tag(sent.penalty_last_n),
+                    s.presence_penalty, SamplingSent::tag(sent.presence_penalty)
+                );
+            }
+            if s.win_armed() {
+                tracing::info!(target: "chat",
+                    "[chat] penalty window armed: last {} ids, prompt tail + generated (#84); presence_penalty {} joins the window form (llama.cpp penalties), the HF per-answer set is not read",
+                    s.penalty_last_n, s.presence_penalty
+                );
+            } else {
+                // the penalty set of THIS request: `arm_sampler` clears the device mask and
+                // reloads `Rng::new(seed)`, so no token of the prompt and no token of an
+                // earlier turn is in it, whatever the prefix cache reused (7.11.17)
+                tracing::info!(target: "chat",
+                    "[chat] presence penalty set: cleared for this request, generated tokens only (#68)"
+                );
+            }
         }
         None => {
             // greedy is the A4 path: `decode_step` samples whenever `dev_sampler` is Some
@@ -3076,12 +3193,6 @@ fn chat_generate(
             srv.eng.park_sampler(&mut srv.parked_sampler);
             tracing::info!(target: "chat", "[chat] greedy (temperature absent or <= 0)");
         }
-    }
-    if req.min_p != 0.0 {
-        tracing::info!(target: "chat",
-            "[chat] min_p {} accepted and ignored (device sampler has no min_p; #28)",
-            req.min_p
-        );
     }
     // #74: one line per request that says whether it thought, at which level, and whether the
     // value came from the body - the same provenance shape the two sampling lines above carry
@@ -4686,7 +4797,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             crow.sampling_sent,
-            SamplingSent { top_p: true, top_k: false, presence_penalty: false, seed: false }
+            SamplingSent { top_p: true, top_k: false, presence_penalty: false, seed: false, min_p: true,
+                           repeat_penalty: false, frequency_penalty: false, penalty_last_n: false }
         );
         // the values behind the two flags that are false are this file's, not the client's
         assert_eq!(crow.presence_penalty, DEFAULT_PRESENCE);
@@ -4701,7 +4813,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             full.sampling_sent,
-            SamplingSent { top_p: true, top_k: true, presence_penalty: true, seed: true }
+            SamplingSent { top_p: true, top_k: true, presence_penalty: true, seed: true, min_p: false,
+                           repeat_penalty: false, frequency_penalty: false, penalty_last_n: false }
         );
 
         // an explicit null is an absent field here too, so the tag never contradicts the value
@@ -4713,6 +4826,132 @@ mod tests {
         assert_eq!(nulls.sampling_sent, SamplingSent::default());
         assert_eq!(SamplingSent::tag(true), "request");
         assert_eq!(SamplingSent::tag(false), "data sheet");
+    }
+
+    // #83 (2026-09-20): min_p is REAL - parsed, plumbed into the sampler, on
+    // the provenance line. The whole "accepted and ignored" era (#28) exists
+    // because the field was invisible downstream; these pin all three stops.
+    #[test]
+    fn min_p_is_plumbed_into_the_sampler_and_the_line() {
+        // Crow's own request: temperature 1.0, top_p 0.95, min_p 0.01
+        let r = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "temperature":1.0,"top_p":0.95,"min_p":0.01}"#,
+        )
+        .unwrap();
+        let s = sampler_from(&r).expect("temperature 1.0 samples");
+        assert_eq!(s.min_p, 0.01);
+        // the threshold constant the DEVICE receives is the host's own f32 ln,
+        // so the two samplers filter against the same bytes
+        assert_eq!(s.ln_min_p(), 0.01f32.ln());
+        let line = sampling_line(&s, r.sampling_sent);
+        assert!(line.contains("min_p 0.01 (request)"), "{line}");
+        assert!(line.contains("top_p 0.95 (request)"), "{line}");
+        assert!(line.contains("top_k 20 (data sheet)"), "{line}");
+        assert!(line.contains("presence_penalty 1.5 (data sheet)"), "{line}");
+
+        // absent stays 0.0 = disabled: the exact pre-#83 draw, golden rows included
+        let bare = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],"temperature":1.0}"#,
+        )
+        .unwrap();
+        let sb = sampler_from(&bare).unwrap();
+        assert_eq!(sb.min_p, 0.0);
+        assert_eq!(sb.ln_min_p(), 0.0);
+        let line_b = sampling_line(&sb, bare.sampling_sent);
+        assert!(line_b.contains("min_p 0 (data sheet)"), "{line_b}");
+        // an explicit null is absent here too
+        assert!(!bare.sampling_sent.min_p);
+    }
+
+    // #84 (2026-09-20): the windowed llama.cpp penalties - parse, plumb, arm.
+    #[test]
+    fn penalty_fields_parse_with_neutral_defaults_and_plumb_into_the_sampler() {
+        // absent: neutral, so no existing row changes implicitly
+        let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"temperature":1.0}"#).unwrap();
+        assert_eq!(r.repeat_penalty, DEFAULT_REPEAT);
+        assert_eq!(r.repeat_penalty, 1.0);
+        assert_eq!(r.frequency_penalty, DEFAULT_FREQ);
+        assert_eq!(r.frequency_penalty, 0.0);
+        assert_eq!(r.penalty_last_n, DEFAULT_LAST_N);
+        assert_eq!(r.penalty_last_n, 64);
+        let s = sampler_from(&r).unwrap();
+        assert!(!s.win_armed(), "the defaults must not arm the window");
+        assert_eq!((s.repeat_penalty, s.frequency_penalty, s.penalty_last_n), (1.0, 0.0, 64));
+
+        // a row that names them: Crow's future request shape
+        let r = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "temperature":1.0,"top_p":0.95,"min_p":0.01,
+                 "repeat_penalty":1.05,"frequency_penalty":0.3,"penalty_last_n":64}"#,
+        )
+        .unwrap();
+        let s = sampler_from(&r).unwrap();
+        assert_eq!((s.repeat_penalty, s.frequency_penalty, s.penalty_last_n), (1.05, 0.3, 64));
+        assert!(s.win_armed());
+        // every value says where it came from
+        assert!(r.sampling_sent.repeat_penalty && r.sampling_sent.frequency_penalty && r.sampling_sent.penalty_last_n);
+        let line = sampling_line(&s, r.sampling_sent);
+        assert!(line.contains("repeat_penalty 1.05 (request)"), "{line}");
+        assert!(line.contains("frequency_penalty 0.3 (request)"), "{line}");
+        assert!(line.contains("penalty_last_n 64 (request)"), "{line}");
+
+        // an explicit null is absent, and a wrong type is a 400
+        let nulls = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "temperature":1.0,"repeat_penalty":null,"frequency_penalty":null,"penalty_last_n":null}"#,
+        )
+        .unwrap();
+        assert_eq!(nulls.repeat_penalty, 1.0);
+        assert_eq!(nulls.frequency_penalty, 0.0);
+        assert_eq!(nulls.penalty_last_n, 64);
+        for bad in [
+            &br#"{"messages":[{"role":"user","content":"hi"}],"repeat_penalty":"sharp"}"#[..],
+            &br#"{"messages":[{"role":"user","content":"hi"}],"frequency_penalty":"often"}"#[..],
+            &br#"{"messages":[{"role":"user","content":"hi"}],"penalty_last_n":"deep"}"#[..],
+            &br#"{"messages":[{"role":"user","content":"hi"}],"penalty_last_n":-4}"#[..],
+        ] {
+            assert!(parse_chat(bad).is_err(), "expected a 400 for {}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    /// #84: the window depth is clamped to the device ring's depth, visibly -
+    /// the `[chat]` line prints the effective value.
+    #[test]
+    fn penalty_last_n_clamps_to_the_device_ring() {
+        let r = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "temperature":1.0,"penalty_last_n":100000}"#,
+        )
+        .unwrap();
+        assert_eq!(r.penalty_last_n, crow_nest_engine::gen::SAMPLE_RING_MAX);
+        let s = sampler_from(&r).unwrap();
+        assert_eq!(s.penalty_last_n, crow_nest_engine::gen::SAMPLE_RING_MAX);
+    }
+
+    /// #84: llama.cpp runs its penalties in greedy too - a greedy request
+    /// that names repeat/freq gets a sampler (temperature <= 0, the device
+    /// draw is the penalized argmax ci[0]). A plain greedy request, and one
+    /// that names only top_p/min_p/seed, is still the A4 path: no sampler.
+    #[test]
+    fn greedy_with_penalties_arms_a_sampler_plain_greedy_does_not() {
+        let mk = |t: &str| parse_chat(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{t}}}"#).as_bytes()).unwrap();
+        assert!(sampler_from(&mk("")).is_none());
+        assert!(sampler_from(&mk(r#","temperature":0,"top_p":0.95,"min_p":0.01,"seed":7"#)).is_none());
+        // penalties arm a GREEDY request
+        for t in [
+            r#","temperature":0,"repeat_penalty":1.1"#,
+            r#","temperature":0,"frequency_penalty":0.2"#,
+            r#","repeat_penalty":1.1"#,
+        ] {
+            let s = sampler_from(&mk(t)).expect("penalties arm a greedy request");
+            assert!(s.temperature <= 0.0);
+            assert!(s.win_armed());
+        }
+        // a zero window disarms even a named repeat penalty (llama.cpp: window 0 disables)
+        assert!(sampler_from(&mk(r#","temperature":0,"repeat_penalty":1.1,"penalty_last_n":0"#)).is_none());
+        // repeat 1.0 + freq 0 with a window is neutral: still plain greedy
+        assert!(sampler_from(&mk(r#","temperature":0,"penalty_last_n":64"#)).is_none());
     }
 
     // #68 (2026-09-18): the cross-turn repeat counter. Four tests, all pure - the ring is

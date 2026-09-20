@@ -648,8 +648,13 @@ impl Engine {
 }
 
 /// device state of the #20 sampler: presence mask [V] u8, xorshift64* state
-/// [1] u64, profile {temp, top_p, presence: f32, top_k: i32}; `in_graph` is
-/// set once the launch was captured into the decode graph
+/// [1] u64, profile 36 B {temp, top_p, presence, min_p, ln_min_p, repeat,
+/// freq} f32 + {top_k, last_n} i32; `in_graph` is set once the launch was
+/// captured into the decode graph. #84 adds the windowed-penalty twin of the
+/// host's `win`/`win_counts`: `counts` [V] u16 and `ring` i32
+/// {head, fill, ids[SAMPLE_RING_MAX]}, both re-seeded per request from the
+/// prompt tail by `enable_dev_sampler` and advanced one accept per draw by
+/// `sample_k` itself.
 pub struct DevSampler {
     pub mask: Dev,
     pub rng: Dev,
@@ -657,6 +662,11 @@ pub struct DevSampler {
     /// v2: per-slice top-k candidates [SAMPLE_PARTS * SAMPLE_MAXK] f32 / i32
     pub cand_v: Dev,
     pub cand_i: Dev,
+    /// #84: per-token count inside the penalty window (u16; the window is at
+    /// most SAMPLE_RING_MAX = 1024 deep, so u16 cannot wrap)
+    pub counts: Dev,
+    /// #84: the ring itself - i32 head, i32 fill, then the window ids
+    pub ring: Dev,
     pub in_graph: std::cell::Cell<bool>,
 }
 
@@ -1010,16 +1020,22 @@ impl Engine {
             (0, 0, 0)
         };
         let vit_mrope_held = if mrope_rows > 0 { crate::vit::mrope_bytes(cfg.context) as u64 } else { 0 };
-        // #72: the device sampler's five buffers (mask [V] u8, rng, params, the two
-        // candidate slices). 0.27 MB, but it was the last VRAM the engine took after
-        // the plan: allocated on the first SAMPLED request, which in a Crow session is
-        // the first request. Held here, handed to `enable_dev_sampler` on demand.
+        // #72: the device sampler's seven buffers (mask [V] u8, rng, params,
+        // the two candidate slices; #84 adds counts [V] u16 + the ring).
+        // ~0.8 MB, but it was the last VRAM the engine took after the plan:
+        // allocated on the first SAMPLED request, which in a Crow session is
+        // the first request. Held here, handed to `enable_dev_sampler` on
+        // demand.
+        // #83: params grew 16 -> 36 B (min_p + the host-computed ln_min_p at
+        // [4]/[5]); #84 filled [6..9] (repeat, freq, last_n).
         let dev_sampler_hold = Some(DevSampler {
             mask: cuda::alloc_named("the sampler presence mask", V),
             rng: cuda::alloc_named("the sampler rng state", 8),
-            params: cuda::alloc_named("the sampler profile", 16),
+            params: cuda::alloc_named("the sampler profile", 36),
             cand_v: cuda::alloc_named("the sampler candidate values", SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
             cand_i: cuda::alloc_named("the sampler candidate ids", SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
+            counts: cuda::alloc_named("the sampler window counts", 2 * V),
+            ring: cuda::alloc_named("the sampler penalty ring", (2 + SAMPLE_RING_MAX) * 4),
             in_graph: std::cell::Cell::new(false),
         });
 
@@ -1887,16 +1903,24 @@ pub const QSA_PAR_E_THREADS: u32 = 1024;
 /// tuneables - the candidate buffers are [PARTS][MAXK] and the two kernels
 /// index them with those exact bounds. `assert_kernel_defines()` checks all
 /// four Rust twins against the frozen source at boot.
-/// #72: the device sampler's five buffers, as `enable_dev_sampler` takes them
-/// (mask [V] u8, rng u64, params 16 B, two [SAMPLE_PARTS * SAMPLE_MAXK] slices).
-/// Held at boot since #72, and named on the `[budget]` post-plan line.
+/// #72: the device sampler's seven buffers, as `enable_dev_sampler` takes
+/// them (mask [V] u8, rng u64, params 36 B since #83, two [SAMPLE_PARTS *
+/// SAMPLE_MAXK] slices, and since #84 counts [V] u16 + ring i32
+/// {head, fill, ids[SAMPLE_RING_MAX]}). Held at boot since #72, and named on
+/// the `[budget]` post-plan line.
 pub const fn sampler_bytes() -> u64 {
-    (V + 8 + 16 + 2 * SAMPLE_PARTS as usize * SAMPLE_MAXK * 4) as u64
+    (V + 8 + 36 + 2 * SAMPLE_PARTS as usize * SAMPLE_MAXK * 4 + 2 * V
+        + (2 + SAMPLE_RING_MAX) * 4) as u64
 }
 
 pub const SAMPLE_MAXK: usize = 64;
 pub const SAMPLE_PARTS: u32 = 64;
 pub const SAMPLE_THREADS: u32 = 256;
+/// #84: the device ring buffer's depth cap - the `SAMPLE_RING_MAX` #define
+/// of the sampler region in `KERNEL_SRC`. `penalty_last_n` is clamped to it
+/// at every construction door (`sample.rs from_env`, serve's parse), so the
+/// ring cannot overflow whatever a client names.
+pub const SAMPLE_RING_MAX: usize = 1024;
 
 /// Every Rust twin of a `KERNEL_SRC` `#define`, checked against the source
 /// itself. Called once per `Engine::load`, right after the module compiles.
@@ -1906,6 +1930,7 @@ pub fn assert_kernel_defines() {
         ("SAMPLE_MAXK", SAMPLE_MAXK as u32),
         ("SAMPLE_PARTS", SAMPLE_PARTS),
         ("SAMPLE_THREADS", SAMPLE_THREADS),
+        ("SAMPLE_RING_MAX", SAMPLE_RING_MAX as u32),
     ] {
         let cuda = crate::kernels::define_u32(name);
         assert_eq!(cuda, rust, "{name}: KERNEL_SRC says {cuda}, the Rust twin says {rust}");
@@ -4182,9 +4207,11 @@ impl Engine {
             self.dev_sampler = Some(self.dev_sampler_hold.take().unwrap_or_else(|| DevSampler {
                 mask: cuda::alloc_zeroed(V),
                 rng: cuda::alloc_zeroed(8),
-                params: cuda::alloc_zeroed(16),
+                params: cuda::alloc_zeroed(36),
                 cand_v: cuda::alloc_zeroed(SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
                 cand_i: cuda::alloc_zeroed(SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
+                counts: cuda::alloc_zeroed(2 * V),
+                ring: cuda::alloc_zeroed((2 + SAMPLE_RING_MAX) * 4),
                 in_graph: std::cell::Cell::new(false),
             }));
         }
@@ -4192,12 +4219,49 @@ impl Engine {
         let zero = vec![0u8; V];
         cuda::upload_into(ds.mask, &zero);
         cuda::to_u64_into(ds.rng, &[s.rng.state()]);
-        let mut pb = [0u8; 16];
+        // the 36-byte params block of `sample_k`: {temp, top_p, presence,
+        // min_p, ln_min_p, repeat, freq} f32 + {top_k, last_n} i32.
+        // #83: ln(min_p) is computed HERE, once, so the device adds the same
+        // threshold constant the host sampler adds. #84: repeat/freq/last_n -
+        // last_n clamped to the ring's depth, as both parse doors already do.
+        let mut pb = [0u8; 36];
         pb[0..4].copy_from_slice(&s.temperature.to_le_bytes());
         pb[4..8].copy_from_slice(&s.top_p.to_le_bytes());
         pb[8..12].copy_from_slice(&s.presence_penalty.to_le_bytes());
         pb[12..16].copy_from_slice(&(s.top_k as i32).to_le_bytes());
+        pb[16..20].copy_from_slice(&s.min_p.to_le_bytes());
+        pb[20..24].copy_from_slice(&s.ln_min_p().to_le_bytes());
+        pb[24..28].copy_from_slice(&s.repeat_penalty.to_le_bytes());
+        pb[28..32].copy_from_slice(&s.frequency_penalty.to_le_bytes());
+        pb[32..36].copy_from_slice(&(s.penalty_last_n.min(SAMPLE_RING_MAX) as i32).to_le_bytes());
         cuda::upload_into(ds.params, &pb);
+        // #84: the windowed penalties' device twin, seeded per request like
+        // the mask: counts[V] u16 from the sampler's window counts, and the
+        // ring {head, fill, ids} from its prompt-tail ids (oldest first).
+        // A not-armed sampler uploads zeros - `sample_k` will not touch them.
+        let mut cb = vec![0u8; 2 * V];
+        if s.win_armed() {
+            for (tok, c) in s.win_counts_nonzero() {
+                cb[tok * 2..tok * 2 + 2].copy_from_slice(&c.to_le_bytes());
+            }
+        }
+        cuda::upload_into(ds.counts, &cb);
+        let lastn = s.penalty_last_n.min(SAMPLE_RING_MAX);
+        let mut rb = vec![0u8; (2 + SAMPLE_RING_MAX) * 4];
+        if s.win_armed() && lastn > 0 {
+            let ids: Vec<u32> = s.win_ids().collect();
+            let fill = ids.len().min(lastn);
+            // the tail of the window (a clamped last_n may hold fewer ids
+            // than the sampler does), oldest first; head = fill % lastn is
+            // the next write slot exactly as `sample_k`'s accept advances it
+            let head = (fill % lastn) as i32;
+            rb[0..4].copy_from_slice(&head.to_le_bytes());
+            rb[4..8].copy_from_slice(&(fill as i32).to_le_bytes());
+            for (j, &t) in ids[ids.len() - fill..].iter().enumerate() {
+                rb[8 + j * 4..12 + j * 4].copy_from_slice(&(t as i32).to_le_bytes());
+            }
+        }
+        cuda::upload_into(ds.ring, &rb);
         cuda::sync();
         // invariant: in_graph is true only while the CURRENT decode graph carries the
         // sampler node; arming re-arms for the next capture, so clear it here
@@ -4205,13 +4269,15 @@ impl Engine {
     }
 
     unsafe fn launch_sample(&self, ds: &DevSampler) {
-        // v2: 64 blocks pick their slice's top-k, one block merges and draws
+        // v2: 64 blocks pick their slice's top-k, one block merges and draws.
+        // #84: counts rides stage 1 (the windowed penalties bite on the raw
+        // logits), counts+ring ride stage 2 (the post-draw accept).
         launch_v(self.k.f("sample_topk_part"), SAMPLE_PARTS, 1, 1, SAMPLE_THREADS, &[
-            self.s.logits as u64, self.p.n_vocab as u64, ds.mask as u64, ds.params as u64,
-            ds.cand_v as u64, ds.cand_i as u64]);
+            self.s.logits as u64, self.p.n_vocab as u64, ds.mask as u64, ds.counts as u64,
+            ds.params as u64, ds.cand_v as u64, ds.cand_i as u64]);
         launch_v(self.k.f("sample_k"), 1, 1, 1, SAMPLE_THREADS, &[
             ds.cand_v as u64, ds.cand_i as u64, self.s.argmax as u64, self.p.n_vocab as u64,
-            ds.mask as u64, ds.rng as u64, ds.params as u64]);
+            ds.mask as u64, ds.counts as u64, ds.ring as u64, ds.rng as u64, ds.params as u64]);
     }
 
     /// #20: draw a token from the logits row currently in `s.logits` (the last
@@ -4661,6 +4727,8 @@ impl Drop for Engine {
                 cuda::free_dev(&mut ds.params);
                 cuda::free_dev(&mut ds.cand_v);
                 cuda::free_dev(&mut ds.cand_i);
+                cuda::free_dev(&mut ds.counts);
+                cuda::free_dev(&mut ds.ring);
             }
             // the module last: every CUfunction in self.k points into it
             self.module.unload();

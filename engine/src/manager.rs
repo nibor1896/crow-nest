@@ -495,9 +495,12 @@ mod tests_72 {
     fn the_post_plan_vram_total_is_the_reserve_plus_the_sampler() {
         let p = ledger();
         assert_eq!(p.vram_bytes(), 239_599_616 + 51_200_000 + crate::gen::sampler_bytes());
-        // the reserve of record, 277.3 MB, plus 0.3 MB of sampler
-        assert_eq!(p.vram_bytes(), 291_080_728);
-        assert_eq!(crate::gen::sampler_bytes(), 281_112);
+        // the reserve of record, 277.3 MB, plus ~0.7 MB of sampler
+        // (#83, 2026-09-20: params grew 16 -> 36 B for min_p + ln(min_p);
+        // #84 the same day: the windowed penalties added counts [V] u16 +
+        // the 1026-i32 ring, so the pin moved 281_112 -> 281_132 -> 781_876)
+        assert_eq!(p.vram_bytes(), 291_581_492);
+        assert_eq!(crate::gen::sampler_bytes(), 781_876);
     }
 
     /// the biggest post-plan allocation of the process is the prefix cache, and it
@@ -512,7 +515,7 @@ mod tests_72 {
         assert!(line.starts_with("post-plan allocations held at boot:"), "the label moved: {line}");
         assert!(line.contains("vit tower scratch 228.5 MB"), "the scratch entry moved: {line}");
         assert!(line.contains("vit mrope span 48.8 MB"), "the mrope entry moved: {line}");
-        assert!(line.contains("= 277.6 MB VRAM"), "the VRAM total moved: {line}");
+        assert!(line.contains("= 278.1 MB VRAM"), "the VRAM total moved: {line}");
         assert!(line.contains("host RAM only (never on the card)"), "the host clause moved: {line}");
         assert!(line.contains("prefix cache (3 snapshots) 373.8 MB"), "the snapshot entry moved: {line}");
     }

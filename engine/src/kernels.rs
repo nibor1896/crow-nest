@@ -4037,9 +4037,22 @@ extern "C" __global__ void argmax_k(const float* __restrict__ logits, int* __res
 // Bit-for-bit the host sampler of sample.rs: presence penalty on the raw
 // logits, top-k in (value desc, index asc) order, f32 (v-m)/temp cast to
 // double, exp / softmax / nucleus / draw in double, xorshift64* state in
-// `rng`. `params` = {temp, top_p, presence} f32 + top_k i32; `mask[v]` = 1
-// once v was sampled in this answer. Writes the token into out[0] (the
-// argmax slot), so the readback behind the graph is unchanged.
+// `rng`. `params` (36 B) = {temp, top_p, presence, min_p, ln_min_p,
+// repeat, freq} f32 + {top_k, last_n} i32. `mask[v]` = 1 once v was
+// sampled in this answer. `min_p > 0` (#83, llama.cpp PR #3841) drops
+// candidates below cv[0] + ln_min_p AFTER top-k and BEFORE the softmax -
+// the SAME host-computed ln constant, so the boundary is bit-equal.
+// #84: `last_n > 0 && (repeat != 1.0f || freq > 0.0f)` arms the windowed
+// llama.cpp penalties on the RAW logits: `l > 0 ? l/repeat : l*repeat`
+// (asymmetric - dividing a negative logit would raise it), then
+// `l -= c*freq + (c>0)*presence` with c = counts[i]; `counts[V]` is u16
+// and `ring` is i32 {head, fill, ids[last_n]} in global memory, seeded
+// from the PROMPT TAIL per request and advanced by one accept per draw
+// (the evicted tail id decrements exactly, llama.cpp ring semantics).
+// While the window is NOT armed the HF presence mask (#68) applies alone,
+// byte-identical to the pre-#84 sampler.
+// Writes the token into out[0] (the argmax slot), so the readback behind the
+// graph is unchanged.
 // Two stages (v2): sample_topk_part - SAMPLE_PARTS blocks each pick the k
 // largest keys of their slice into cand; sample_k - one block runs the same
 // key-ordered rounds over the SAMPLE_PARTS*k candidates and draws. The union
@@ -4048,6 +4061,7 @@ extern "C" __global__ void argmax_k(const float* __restrict__ logits, int* __res
 #define SAMPLE_MAXK 64
 #define SAMPLE_PARTS 64
 #define SAMPLE_THREADS 256
+#define SAMPLE_RING_MAX 1024
 
 __device__ __forceinline__ void sample_rounds(const float* __restrict__ vals, const int* __restrict__ idx, int n,
                                               const unsigned char* __restrict__ mask, float pres, int k,
@@ -4090,12 +4104,20 @@ __device__ __forceinline__ void sample_rounds(const float* __restrict__ vals, co
 }
 
 // stage 1: block b owns logits [b*slice, min(n, (b+1)*slice)); writes k keys
-// (value with presence penalty, index) into cand_v/cand_i[b*k ..]
+// (value with the #68/#84 penalties applied, index) into cand_v/cand_i[b*k ..]
 extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_topk_part(
         const float* __restrict__ logits, const int* __restrict__ n_p, const unsigned char* __restrict__ mask,
-        const float* __restrict__ params, float* __restrict__ cand_v, int* __restrict__ cand_i) {
+        const unsigned short* __restrict__ counts, const float* __restrict__ params,
+        float* __restrict__ cand_v, int* __restrict__ cand_i) {
     const int n = *n_p;
     const float pres = params[2];
+    // #84: the windowed penalties arm on the new knobs; presence joins them
+    // as llama.cpp's penalty_present while armed (defaults stay #68's HF form)
+    const float rep = params[6], fq = params[7];
+    int lastn = ((const int*)params)[8];
+    if (lastn < 0) lastn = 0;
+    if (lastn > SAMPLE_RING_MAX) lastn = SAMPLE_RING_MAX;
+    const int win = lastn > 0 && (rep != 1.0f || fq > 0.0f);
     int k = ((const int*)params)[3];
     if (k < 1) k = 1;
     if (k > SAMPLE_MAXK) k = SAMPLE_MAXK;
@@ -4119,7 +4141,20 @@ extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_topk_part(
         int bi = 0x7fffffff;
         for (int i = lo + tid; i < hi; i += SAMPLE_THREADS) {
             float v = logits[i];
-            if (mask[i]) v -= pres;
+            if (win) {
+                // #84: llama.cpp penalties - the WHOLE per-candidate block
+                // sits behind a count > 0 hit (token_count.find); the op
+                // order is the host's win_pen, bit for bit
+                const float c = (float)counts[i];
+                if (c > 0.0f) {
+                    if (rep != 1.0f) {
+                        if (v > 0.0f) v /= rep; else v *= rep;
+                    }
+                    v -= c * fq + pres;
+                }
+            } else if (mask[i]) {
+                v -= pres;
+            }
             if (v < lim_v || (v == lim_v && i > lim_i)) {
                 if (v > best || (v == best && i < bi)) { best = v; bi = i; }
             }
@@ -4149,9 +4184,16 @@ extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_topk_part(
 extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_k(
         const float* __restrict__ cand_v, const int* __restrict__ cand_i, int* __restrict__ out,
         const int* __restrict__ n_p, unsigned char* __restrict__ mask,
+        unsigned short* __restrict__ counts, int* __restrict__ ring,
         unsigned long long* __restrict__ rng, const float* __restrict__ params) {
     const int n = *n_p;
     const float temp = params[0], top_p = params[1];
+    // #84: the same arming rule stage 1 applies (presence stays params[2])
+    const float rep = params[6], fq = params[7];
+    int lastn = ((const int*)params)[8];
+    if (lastn < 0) lastn = 0;
+    if (lastn > SAMPLE_RING_MAX) lastn = SAMPLE_RING_MAX;
+    const int win = lastn > 0 && (rep != 1.0f || fq > 0.0f);
     int k = ((const int*)params)[3];
     if (k < 1) k = 1;
     if (k > n) k = n;
@@ -4167,18 +4209,30 @@ extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_k(
         if (temp <= 0.0f) {
             tok = ci[0];
         } else {
+            // #83: min_p, the log-space tail filter (llama.cpp PR #3841) -
+            // AFTER the rounds (top-k), BEFORE the softmax. cv is sorted
+            // descending, so the survivors are a prefix; k2 starts at 1
+            // because the top candidate is min_keep and survives even a
+            // degenerate min_p > 1. ln_min_p (params[5]) is computed ONCE on
+            // the host, so both samplers add the same constant to the max.
+            int k2 = k;
+            if (params[4] > 0.0f) {
+                const float thr = cv[0] + params[5];
+                k2 = 1;
+                while (k2 < k && cv[k2] >= thr) k2++;
+            }
             double pr[SAMPLE_MAXK];
             const float m = cv[0];
             double z = 0.0;
-            for (int i = 0; i < k; i++) {
+            for (int i = 0; i < k2; i++) {
                 const float a = (cv[i] - m) / temp;
                 pr[i] = exp((double)a);
                 z += pr[i];
             }
-            for (int i = 0; i < k; i++) pr[i] /= z;
-            int keep = k;
+            for (int i = 0; i < k2; i++) pr[i] /= z;
+            int keep = k2;
             double acc = 0.0;
-            for (int i = 0; i < k; i++) {
+            for (int i = 0; i < k2; i++) {
                 acc += pr[i];
                 if (acc >= (double)top_p) { keep = i + 1; break; }
             }
@@ -4200,6 +4254,25 @@ extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_k(
         }
         out[0] = tok;
         mask[tok] = 1;
+        // #84: accept the drawn token into the ring window (llama.cpp
+        // penalties accept): once the window is full the oldest id leaves it
+        // and its count drops by EXACTLY one. The update runs after the
+        // draw, so this token's own count bites from the NEXT sample on -
+        // the host's `observe` sits at the same place in its loop.
+        if (win) {
+            int head = ring[0], fill = ring[1];
+            if (fill >= lastn) {
+                counts[ring[2 + head]] -= 1;
+            } else {
+                fill += 1;
+                ring[1] = fill;
+            }
+            ring[2 + head] = tok;
+            counts[tok] += 1;
+            head += 1;
+            if (head >= lastn) head = 0;
+            ring[0] = head;
+        }
     }
 }
 
