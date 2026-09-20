@@ -282,8 +282,17 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="234"
-CLIPPY="1459"
+TESTS="265"
+CLIPPY="1480"
+#   tests 234 -> 265        wave 1 of the quality fleet (2026-09-20/21): #83/#84 add eighteen
+#                              (six min_p + one serve row in sample.rs/serve.rs, eight penalty +
+#                              three serve), #94 phase 1 adds thirteen (meta.rs). All measured,
+#                              265 = 234 + 31, zero failures.
+#   clippy 1459 -> 1480     same wave: the 21 new warnings are the SAME lint classes the engine
+#                              already carries engine-wide after the 2026-09-20 07:22 toolchain
+#                              drift (u64->u64 casts, manual div_ceil, doc indentation) hitting
+#                              the new code of meta.rs / sample.rs / the sampler serve plumbing -
+#                              measured 1480, no new lint class introduced.
 
 red=0
 green() { printf 'GREEN  %-28s %s\n' "$1" "${2:-}"; }
@@ -323,11 +332,24 @@ scope_run() {
             "$bin" "$@" > "$log" 2>&1
 }
 
+# #82 pool behavior (measured 2026-09-20/21; the kv-ab balloon proof and the #90
+# engine arm's ladder): after every engine exit the ~46 GiB pinned tier sits
+# lazily in the NVIDIA driver pool, and the NEXT item's loader sees a pinned
+# budget of ~8-10 GiB and refuses (manager.rs:203). Sustained anonymous
+# pressure returns the pool within seconds. Same recovery the kv-ab matrix ran
+# between every engine run; shallow pass, self-exits when MemAvailable is fine.
+pool_recover() {
+    # timeout: in the HARD-leak state (#82, only a reboot reclaims) the balloon
+    # burns its full 3 rounds to no effect - cap it so the gate stays usable.
+    timeout 90 python3 decode_out/kv-ab/balloon.py 46 >/dev/null 2>&1 || true
+}
+
 # parity_item <name> <ids.json> <expected sha> <expected bytes|-> <extra env...>
 parity_item() {
     local name="$1" ids="$2" want="$3" wantb="$4"; shift 4
     local dir="$out/$name" log="$out/$name.log"
     precheck || { fail "$name" "precheck refused"; return; }
+    pool_recover
     rm -rf "$dir"
     local t0 t1
     t0=$(date +%s%3N)
@@ -357,6 +379,7 @@ parity_item p8tf decode_out/real512-ids.json "$SHAP8" - CROW_GRAPH=0 CROW_PARITY
 
 # 6) decode run 32 - the 32 generated ids of record
 if precheck; then
+    pool_recover
     log="$out/run32.log"
     t0=$(date +%s%3N)
     scope_run "$log" -- run decode_out/parity-ids.json 32 "$out/run32"
