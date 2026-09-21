@@ -344,10 +344,24 @@ scope_run() {
 # pressure returns the pool within seconds. Same recovery the kv-ab matrix ran
 # between every engine run; shallow pass, self-exits when MemAvailable is fine.
 pool_recover() {
-    # timeout: recovery of a merely-lazy pool (the normal post-engine state)
-    # takes 1-4 minutes at the balloon's 2 s pace; 240 s lets it finish. In the
-    # HARD-leak state (#82, only a reboot reclaims) the cap keeps the gate alive.
-    timeout 240 python3 decode_out/kv-ab/balloon.py 46 >/dev/null 2>&1 || true
+    # verified recovery: one balloon pass is not always enough right after an
+    # engine exit (the pool releases lazily under pressure; a pass can time out
+    # mid-round and leave MemAvailable short - measured 2026-09-21, the gate's
+    # second item refused at budget 25.9 GiB with a single 240 s pass). Loop
+    # until MemAvailable really is >= 46 GiB, max four passes, and SAY what
+    # happened. In the HARD-leak state (#82) this exhausts and the item refuses
+    # with the reason in its log - the honest outcome.
+    local av
+    for i in 1 2 3 4; do
+        av=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
+        if [ "${av:-0}" -ge 46 ]; then
+            [ "$i" -gt 1 ] && echo "  pool_recover: MemAvailable ${av} GiB after $((i-1)) pass(es)"
+            return 0
+        fi
+        timeout 300 python3 "$root/decode_out/kv-ab/balloon.py" 46 >/dev/null 2>&1
+    done
+    av=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
+    echo "  pool_recover: MemAvailable only ${av} GiB after 4 passes - item may refuse"
 }
 
 # parity_item <name> <ids.json> <expected sha> <expected bytes|-> <extra env...>
@@ -361,6 +375,17 @@ parity_item() {
     t0=$(date +%s%3N)
     scope_run "$log" "$@" -- parity "$ids" "$dir"
     local rc=$?
+    # placement fallback (2026-09-21): the -M default tier needs free_for_pin
+    # >= cold 43.51 + margin 3 = 46.5 GiB; a sessionized machine can sit ~1 GiB
+    # under that without anything being wrong. Retry ONCE with a 42 GiB pinned
+    # budget on exactly the residency refusal - placement is numerics-neutral
+    # (#88 proved dumps byte-identical across hot-set placements), so the sha
+    # contract is unchanged; the fallback is LOUD.
+    if [ $rc -ne 0 ] && grep -q "refusing to pin" "$log"; then
+        echo "  $name: default tier refused at the margin - retrying with CROW_RAM_MARGIN_GB=1 (the planner keeps the default tier; only the safety margin yields - outputs byte-identical)"
+        scope_run "$log" CROW_RAM_MARGIN_GB=1 "$@" -- parity "$ids" "$dir"
+        rc=$?
+    fi
     t1=$(date +%s%3N)
     local wall; wall=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", (b-a)/1000}')
     if [ $rc -ne 0 ]; then fail "$name" "decode exit $rc, see $log"; return; fi
@@ -390,6 +415,11 @@ if precheck; then
     t0=$(date +%s%3N)
     scope_run "$log" -- run decode_out/parity-ids.json 32 "$out/run32"
     rc=$?
+    if [ $rc -ne 0 ] && grep -q "refusing to pin" "$log"; then
+        echo "  run32: default tier refused at the margin - retrying with CROW_RAM_MARGIN_GB=1 (the planner keeps the default tier; only the safety margin yields - outputs byte-identical)"
+        scope_run "$log" CROW_RAM_MARGIN_GB=1 -- run decode_out/parity-ids.json 32 "$out/run32"
+        rc=$?
+    fi
     t1=$(date +%s%3N)
     wall=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", (b-a)/1000}')
     cp -f "$root/decode_out/run.json" "$out/run32.json" 2>/dev/null
