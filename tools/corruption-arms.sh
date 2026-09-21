@@ -15,7 +15,15 @@
 #   all-arm     ffn-down-all-originals  (same tensor, ALL layers)
 set -uo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# CORRUPTION_CTX_TOKENS=100000 runs the ladder with the LONG-CONTEXT probe
+# (tools/corruption-probe-long.py: same literals, same grader, N tokens of
+# session in front; CORRUPTION_POSITION=end|start). The short probe sat on its
+# floor at 984 prompt tokens (2026-09-21, all arms ~0.003); results of a depth
+# get their own directory, so the skip guard and the summary never mix depths.
+ctx_tokens="${CORRUPTION_CTX_TOKENS:-}"
+position="${CORRUPTION_POSITION:-end}"
 out="$root/decode_out/corruption-arms"
+[ -n "$ctx_tokens" ] && out="$out-ctx$ctx_tokens-$position"
 mkdir -p "$out"
 port="${CORRUPTION_PORT:-8099}"
 # The RAM threshold follows the pinned budget: with CROW_PINNED_BUDGET_GB set
@@ -143,8 +151,14 @@ run_arm() {  # label overlay_path_or_empty
     # at its start (SIGTERM to serve 2 s after health OK, 2026-09-21 19:25,
     # 8x connection refused). The probe is a 100-line urllib script - it
     # needs no isolation and no memory cap.
-    python3 "$root/tools/corruption-probe.py" --port "$port" --label "$label" \
-        --json "$out/$label.json" >"$out/probe-$label.log" 2>&1
+    if [ -n "$ctx_tokens" ]; then
+        python3 "$root/tools/corruption-probe-long.py" --port "$port" --label "$label" \
+            --ctx-tokens "$ctx_tokens" --position "$position" \
+            --json "$out/$label.json" >"$out/probe-$label.log" 2>&1
+    else
+        python3 "$root/tools/corruption-probe.py" --port "$port" --label "$label" \
+            --json "$out/$label.json" >"$out/probe-$label.log" 2>&1
+    fi
     kill "$serve_pid" 2>/dev/null
     wait "$serve_pid" 2>/dev/null
     settle
