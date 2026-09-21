@@ -22,7 +22,8 @@
 //!     24 blocks at scattered indices, K falls INSIDE the group;
 //!   - boundary-exact: K - above == tie-group size (fill consumes the group);
 //!   - all-tied: every block one bit-identical value (the adversarial floor);
-//!   - dense: ncb <= K (the qsa_select_fast shortcut must emit 0..=pos);
+//!   - dense: ncb <= K — the F1 regression (issue #97): the plain radix
+//!     qsa_select must emit 0..=pos like the fast/par dense shortcuts;
 //!   - tails 0..3 on both sides of the regime boundary.
 //!
 //! Checks per case: sel_n equality; sel_list[0..sel_n) byte-equality across
@@ -160,21 +161,17 @@ fn main() {
             let d_h1 = cuda::alloc_zeroed(QSA_PAR_BINS * 4);
 
             // arm 0: qsa_select; arm 1: qsa_select_fast — production launch
-            // shape grid (nq) x 256 (gen.rs:2632). FINDING (#89): the plain
-            // radix kernel has NO dense shortcut — with K > ncb its threshold
-            // search (`need = K - above` never satisfied) degrades and it
-            // emits a wrong sel_n. Production never reaches it (qsa_fast_on
-            // defaults ON and both fast/par shortcut the dense regime), but
-            // CROW_QSA_FAST=0 + a <= 2048-token prompt does. Skipped here and
-            // filed as a latent env-gated defect in docs/numerics-diff.md.
-            let dense = K >= cs.ncb;
-            if !dense {
-                let vals_a = [
-                    d_scores as u64, d_ncb as u64, devs[0].0, devs[0].1,
-                    d_k as u64, d_cap as u64, d_selmax as u64, d_pos as u64,
-                ];
-                launch_v(f_sel, 1, 1, 1, 256, &vals_a);
-            }
+            // shape grid (nq) x 256 (gen.rs:2632). F1 regression (issue #97,
+            // fixed 2026-09-20 by giving qsa_select the same dense shortcut
+            // the fast/par arms carry): the plain radix used to have NO dense
+            // shortcut — with K > ncb its threshold search (`need = K - above`
+            // never satisfied) degraded and it emitted sel_n = 3 instead of
+            // 1603 on the dense ncb400 case. The dense cases now run through
+            // the plain radix too and must match the reference byte for byte.
+            launch_v(f_sel, 1, 1, 1, 256, &[
+                d_scores as u64, d_ncb as u64, devs[0].0, devs[0].1,
+                d_k as u64, d_cap as u64, d_selmax as u64, d_pos as u64,
+            ]);
             launch_v(f_fast, 1, 1, 1, 256, &[
                 d_scores as u64, d_ncb as u64, devs[1].0, devs[1].1,
                 d_k as u64, d_cap as u64, d_selmax as u64, d_pos as u64,
@@ -193,10 +190,6 @@ fn main() {
             let mut pass = true;
             let mut msg = String::new();
             for (name, arm) in [("qsa_select", 0usize), ("qsa_select_fast", 1), ("par_h+e", 2)] {
-                if arm == 0 && dense {
-                    msg.push_str(" qsa_select: SKIPPED (no dense shortcut — latent defect, see doc);");
-                    continue;
-                }
                 let n = cuda::dtoh_i32(devs[arm].1, 1)[0] as usize;
                 let list = cuda::dtoh_i32(devs[arm].0, QSA_SEL_MAX);                if n != ref_n {
                     pass = false;

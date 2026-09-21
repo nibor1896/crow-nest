@@ -276,7 +276,11 @@ fn repair_single_quotes(t: &str) -> String {
 /// - `Some((at, i))`: `markers[i]` starts at byte `at` of `buf`
 /// - `None`: no marker is complete; the returned length is what can never be part of one
 /// - the returned length is a char boundary, because every marker is ASCII
-fn find_marker(buf: &str, markers: &[&str]) -> (Option<(usize, usize)>, usize) {
+/// - `pub(crate)` since #86: `stopstr` runs the same hold for the OpenAI stop strings
+///   (the byte compare only ever cuts where `is_char_boundary` held, so non-ASCII
+///   markers hold safely too); the tool-call behaviour of this copy is unchanged,
+///   pinned by every test of this module
+pub(crate) fn find_marker(buf: &str, markers: &[&str]) -> (Option<(usize, usize)>, usize) {
     let mut best: Option<(usize, usize)> = None;
     for (i, m) in markers.iter().enumerate() {
         if let Some(at) = buf.find(m) {

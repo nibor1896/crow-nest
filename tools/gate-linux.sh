@@ -282,8 +282,13 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="265"
-CLIPPY="1480"
+TESTS="305"
+CLIPPY="1505"
+#   tests 265 -> 305 / clippy 1480 -> 1505   wave 2 of the quality fleet (2026-09-21): #85 adds the DRY
+#                              suite, #92 the tier suite, #86 the nine stopstr cases plus the serve pipeline
+#                              pins, #96 the scaled-table and warn tests, the probes' regression cases.
+#                              The 25 new clippy warnings are the SAME lint classes as before (u64->u64,
+#                              div_ceil, doc indentation) in the new code - measured, no new class.
 #   tests 234 -> 265        wave 1 of the quality fleet (2026-09-20/21): #83/#84 add eighteen
 #                              (six min_p + one serve row in sample.rs/serve.rs, eight penalty +
 #                              three serve), #94 phase 1 adds thirteen (meta.rs). All measured,

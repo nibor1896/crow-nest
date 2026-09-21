@@ -1837,9 +1837,29 @@ extern "C" __global__ void store_kv(const float* __restrict__ kr, const float* _
     if (mode == 0) dst[d] = enc_e4m3(src[d]);
     else ((unsigned short*)dst)[d] = f32_bf16_bits(src[d]);
 }
+// ---------------- #96: the attention softmax scale ----------------
+// 1/sqrt(256) = 0.0625f is folded into every attention variant below. Issue
+// #96 threads the YaRN mscale into it WITHOUT touching a single default-path
+// launch: the RT = 0 instantiation of attn_scale_src returns the compile-time
+// literal (the kernels of record compile to the same folded multiply as before
+// #96), and only the _y twins read this device global, which Kernels::new sets
+// once at boot when the checkpoint config carries a rope_scaling whose mscale
+// differs from 1. The value is the same 0.0625f either way (a power of two:
+// the multiply is exact), so default-path logits are bit-identical.
+extern "C" __device__ float d_attn_scale = 0.0625f; // 1/sqrt(256) unless YaRN rewrites it at boot (extern "C" keeps the plain PTX name the #96 test greps)
+template <int RT> __device__ __forceinline__ float attn_scale_src();
+template <> __device__ __forceinline__ float attn_scale_src<0>() { return 0.0625f; } // 1/sqrt(256)
+template <> __device__ __forceinline__ float attn_scale_src<1>() { return d_attn_scale; } // #96 YaRN mscale path
+// one boot-time write of the runtime scale (scalars live in device buffers - the p5 rule)
+extern "C" __global__ void set_attn_scale(const float* __restrict__ v) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) d_attn_scale = *v;
+}
 // list-based attention: softmax over the QSA-selected (or dense = all) token
 // list read from the persistent KV cache with on-load dequant. grid (24, Tq).
-extern "C" __global__ void attn_sel(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+// #96: the body is a template on RT ONLY so the _y twin can read the runtime
+// scale; RT = 0 (attn_sel) folds 0.0625f exactly as the pre-#96 kernel did.
+template <int RT>
+__device__ __forceinline__ void attn_sel_body(const float* __restrict__ q, const unsigned char* __restrict__ kc,
                                     const unsigned char* __restrict__ vc, const int* __restrict__ sel,
                                     const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
                                     const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
@@ -1857,7 +1877,7 @@ extern "C" __global__ void attn_sel(const float* __restrict__ q, const unsigned 
     __shared__ float red[256];
     int mode = *mode_p;
     int warp = d >> 5, lane = d & 31;
-    const float scale = 0.0625f; // 1/sqrt(256)
+    const float scale = attn_scale_src<RT>(); // 1/sqrt(256)
     for (int j0 = 0; j0 < n; j0 += 8) {
         int j = j0 + warp;
         if (j < n) {
@@ -1901,12 +1921,29 @@ extern "C" __global__ void attn_sel(const float* __restrict__ q, const unsigned 
     }
     out[((size_t)t * 24 + head) * 256 + d] = o;
 }
+extern "C" __global__ void attn_sel(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                    const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                    const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                    const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                    float* __restrict__ out) {
+    attn_sel_body<0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+}
+// #96: the YaRN runtime-scale twin (same signature, same launch sites — the
+// handle swap happens once, in Kernels::new, when an mscale is armed)
+extern "C" __global__ void attn_sel_y(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                      const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                      const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                      const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                      float* __restrict__ out) {
+    attn_sel_body<1>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+}
 // attn_sel_r (#10 step 3, 2026-09-06): attn_sel with q held in registers (8 floats per lane, same e order),
 // the softmax weights normalised once in shared memory (the same IEEE division per element as p[j] / sum inline)
 // and the V loop unrolled x4 with the loads hoisted; the accumulation order is unchanged. Each per-element op is
 // the same single-product chain as attn_sel, so nvcc contracts identically -> meant bit-identical (gate: parity).
 // R = 8 / 9 are DIAGNOSTICS (no K dot / no V loop, wrong output) that measure the two phases' floors.
-template <int R>
+// #96: RT = the scale source (0 folded, 1 the YaRN runtime global), as attn_sel.
+template <int R, int RT>
 __device__ __forceinline__ void attn_sel_r_body(const float* __restrict__ q, const unsigned char* __restrict__ kc,
                                                 const unsigned char* __restrict__ vc, const int* __restrict__ sel,
                                                 const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
@@ -1929,7 +1966,7 @@ __device__ __forceinline__ void attn_sel_r_body(const float* __restrict__ q, con
     const int esz = mode ? 2 : 1;
     const size_t kvbase = (size_t)kvh * tmax;
     int warp = d >> 5, lane = d & 31;
-    const float scale = 0.0625f; // 1/sqrt(256)
+    const float scale = attn_scale_src<RT>(); // 1/sqrt(256)
     float qr[8];
 #pragma unroll
     for (int k = 0; k < 8; k++) qr[k] = qt[lane + 32 * k];
@@ -2009,21 +2046,42 @@ extern "C" __global__ void attn_sel_r(const float* __restrict__ q, const unsigne
                                       const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
                                       const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
                                       float* __restrict__ out) {
-    attn_sel_r_body<1>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+    attn_sel_r_body<1, 0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+}
+extern "C" __global__ void attn_sel_r_y(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                        const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                        const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                        const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                        float* __restrict__ out) {
+    attn_sel_r_body<1, 1>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out); // #96 YaRN runtime scale
 }
 extern "C" __global__ void attn_sel_d8(const float* __restrict__ q, const unsigned char* __restrict__ kc,
                                        const unsigned char* __restrict__ vc, const int* __restrict__ sel,
                                        const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
                                        const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
                                        float* __restrict__ out) {
-    attn_sel_r_body<8>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+    attn_sel_r_body<8, 0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+}
+extern "C" __global__ void attn_sel_d8_y(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                         const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                         const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                         const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                         float* __restrict__ out) {
+    attn_sel_r_body<8, 1>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out); // #96 YaRN runtime scale
 }
 extern "C" __global__ void attn_sel_d9(const float* __restrict__ q, const unsigned char* __restrict__ kc,
                                        const unsigned char* __restrict__ vc, const int* __restrict__ sel,
                                        const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
                                        const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
                                        float* __restrict__ out) {
-    attn_sel_r_body<9>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+    attn_sel_r_body<9, 0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+}
+extern "C" __global__ void attn_sel_d9_y(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                         const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                         const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                         const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                         float* __restrict__ out) {
+    attn_sel_r_body<9, 1>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out); // #96 YaRN runtime scale
 }
 // kv_ld: kv_load with an optional shared-memory e4m3 LUT (lut[b] = dec_e4m3(b): the same float, one load instead of
 // the branchy decode). LUT = 0 is kv_load itself.
@@ -2063,7 +2121,8 @@ __device__ __forceinline__ void attn_store(const uint4* pre, unsigned char* kb, 
 #pragma unroll
     for (int i = 0; i < NV; i++) *(uint4*)(kb + (size_t)(d + 256 * i) * 16) = pre[i];
 }
-template <int CHB, int LUT>
+// #96: RT = the scale source (0 folded, 1 the YaRN runtime global), as attn_sel.
+template <int CHB, int LUT, int RT>
 __device__ __forceinline__ void attn_sel_s_body(const float* __restrict__ q, const unsigned char* __restrict__ kc,
                                                 const unsigned char* __restrict__ vc, const int* __restrict__ sel,
                                                 const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
@@ -2093,7 +2152,7 @@ __device__ __forceinline__ void attn_sel_s_body(const float* __restrict__ q, con
     constexpr int NV = CHB / 16 / 256;  // uint4 per thread per chunk
     const size_t kvbase = (size_t)kvh * tmax;
     int warp = d >> 5, lane = d & 31;
-    const float scale = 0.0625f; // 1/sqrt(256)
+    const float scale = attn_scale_src<RT>(); // 1/sqrt(256)
     float qr[8];
 #pragma unroll
     for (int k = 0; k < 8; k++) qr[k] = qt[lane + 32 * k];
@@ -2161,21 +2220,42 @@ extern "C" __global__ void attn_sel_s(const float* __restrict__ q, const unsigne
                                       const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
                                       const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
                                       float* __restrict__ out) {
-    attn_sel_s_body<16384, 0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+    attn_sel_s_body<16384, 0, 0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+}
+extern "C" __global__ void attn_sel_s_y(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                        const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                        const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                        const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                        float* __restrict__ out) {
+    attn_sel_s_body<16384, 0, 1>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out); // #96 YaRN runtime scale
 }
 extern "C" __global__ void attn_sel_s8(const float* __restrict__ q, const unsigned char* __restrict__ kc,
                                        const unsigned char* __restrict__ vc, const int* __restrict__ sel,
                                        const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
                                        const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
                                        float* __restrict__ out) {
-    attn_sel_s_body<8192, 0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+    attn_sel_s_body<8192, 0, 0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+}
+extern "C" __global__ void attn_sel_s8_y(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                         const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                         const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                         const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                         float* __restrict__ out) {
+    attn_sel_s_body<8192, 0, 1>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out); // #96 YaRN runtime scale
 }
 extern "C" __global__ void attn_sel_s8l(const float* __restrict__ q, const unsigned char* __restrict__ kc,
                                         const unsigned char* __restrict__ vc, const int* __restrict__ sel,
                                         const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
                                         const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
                                         float* __restrict__ out) {
-    attn_sel_s_body<8192, 1>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+    attn_sel_s_body<8192, 1, 0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+}
+extern "C" __global__ void attn_sel_s8l_y(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                          const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                          const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                          const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                          float* __restrict__ out) {
+    attn_sel_s_body<8192, 1, 1>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out); // #96 YaRN runtime scale
 }
 // attn_sel_g (#10 step 5, 2026-09-06): ONE block per (KV head, query) computing the 12 q heads that share the K/V rows
 // (grid (2, Tq), 384 threads = 12 warps, warp h = head kvh*12+h). The K and V rows are staged in 4 KB chunks (16 keys
@@ -2186,12 +2266,14 @@ extern "C" __global__ void attn_sel_s8l(const float* __restrict__ q, const unsig
 // register k of lane s & 31, and the same tree runs in registers and shuffles), pass 3 o += (e / sum) * v in list order.
 // Every per-element op is attn_sel's (same fma chains, same shuffle tree, same expf, same IEEE division) -> meant
 // bit-identical (gate: parity 8 + 512).
+// #96: RT = the scale source (0 folded, 1 the YaRN runtime global), as attn_sel.
+template <int RT>
 __device__ __forceinline__ float g_score(const float* qr, const unsigned char* kp, int lane, int mode, const float* lut) {
     float acc = 0.0f;
 #pragma unroll
     for (int k = 0; k < 8; k++) acc += qr[k] * kv_ld<1>(kp, lane + 32 * k, mode, lut);
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
-    const float scale = 0.0625f; // 1/sqrt(256)
+    const float scale = attn_scale_src<RT>(); // 1/sqrt(256)
     return __shfl_sync(0xffffffffu, acc * scale, 0);
 }
 __device__ __forceinline__ uint4 g_fetch(const unsigned char* __restrict__ base, size_t kvbase, int rb, int sh,
@@ -2207,7 +2289,10 @@ __device__ __forceinline__ uint4 g_fetch(const unsigned char* __restrict__ base,
     }
     return make_uint4(0u, 0u, 0u, 0u);
 }
-extern "C" __global__ void __launch_bounds__(384) attn_sel_g(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+// #96: the body is a template on RT (0 folded scale, 1 the YaRN runtime
+// global), inlined into the two __launch_bounds__ wrappers below.
+template <int RT>
+__device__ __forceinline__ void attn_sel_g_body(const float* __restrict__ q, const unsigned char* __restrict__ kc,
                                       const unsigned char* __restrict__ vc, const int* __restrict__ sel,
                                       const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
                                       const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
@@ -2249,7 +2334,7 @@ extern "C" __global__ void __launch_bounds__(384) attn_sel_g(const float* __rest
         __syncthreads();
         if (c + 1 < nch && ld) pk = g_fetch(kc, kvbase, rb, sh, list, j0 + KG, n, tmax, tid);
         const int jend = (j0 + KG < n) ? (j0 + KG) : n;
-        for (int j = j0; j < jend; j++) mx = fmaxf(mx, g_score(qr, kb + (j - j0) * rb, lane, mode, lut));
+        for (int j = j0; j < jend; j++) mx = fmaxf(mx, g_score<RT>(qr, kb + (j - j0) * rb, lane, mode, lut));
         __syncthreads();
     }
     // pass 2: the sum, slot s = j mod 256 accumulated in increasing j (register s>>5 of lane s&31), then attn_sel's tree
@@ -2264,7 +2349,7 @@ extern "C" __global__ void __launch_bounds__(384) attn_sel_g(const float* __rest
         if (c + 1 < nch && ld) pk = g_fetch(kc, kvbase, rb, sh, list, j0 + KG, n, tmax, tid);
         const int jend = (j0 + KG < n) ? (j0 + KG) : n;
         for (int j = j0; j < jend; j++) {
-            float e = expf(g_score(qr, kb + (j - j0) * rb, lane, mode, lut) - mx);
+            float e = expf(g_score<RT>(qr, kb + (j - j0) * rb, lane, mode, lut) - mx);
             const int slot = j & 255;
             if ((slot & 31) == lane) {
                 const int k = slot >> 5;
@@ -2295,7 +2380,7 @@ extern "C" __global__ void __launch_bounds__(384) attn_sel_g(const float* __rest
         if (c + 1 < nch && ld) { pk = g_fetch(kc, kvbase, rb, sh, list, j0 + KG, n, tmax, tid); pv = g_fetch(vc, kvbase, rb, sh, list, j0 + KG, n, tmax, tid); }
         const int jend = (j0 + KG < n) ? (j0 + KG) : n;
         for (int j = j0; j < jend; j++) {
-            float w = expf(g_score(qr, kb + (j - j0) * rb, lane, mode, lut) - mx) / sum; // the same division attn_sel does
+            float w = expf(g_score<RT>(qr, kb + (j - j0) * rb, lane, mode, lut) - mx) / sum; // the same division attn_sel does
             const unsigned char* vp = vb + (j - j0) * rb;
 #pragma unroll
             for (int k = 0; k < 8; k++) o[k] += w * kv_ld<1>(vp, lane + 32 * k, mode, lut);
@@ -2304,6 +2389,20 @@ extern "C" __global__ void __launch_bounds__(384) attn_sel_g(const float* __rest
     }
 #pragma unroll
     for (int k = 0; k < 8; k++) out[((size_t)t * 24 + head) * 256 + lane + 32 * k] = o[k];
+}
+extern "C" __global__ void __launch_bounds__(384) attn_sel_g(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                      const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                      const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                      const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                      float* __restrict__ out) {
+    attn_sel_g_body<0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
+}
+extern "C" __global__ void __launch_bounds__(384) attn_sel_g_y(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                      const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                      const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                      const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                      float* __restrict__ out) {
+    attn_sel_g_body<1>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out); // #96 YaRN runtime scale
 }
 extern "C" __global__ void gate_mul(const float* __restrict__ core, const float* __restrict__ gate,
                                     float* __restrict__ out) {
@@ -2455,6 +2554,18 @@ extern "C" __global__ void qsa_select(const float* __restrict__ scores, const in
     int qi = blockIdx.x;
     int ncb = ncb_p[qi];
     int K = *k_p;
+    if (K >= ncb) {
+        // dense regime (below the selection budget): every complete block is
+        // selected, plus the tail -> the list is simply 0..=pos. Identical to
+        // the radix path's output, without its fixed 4-pass + bitmap cost.
+        // (#97 / F1: the same shortcut qsa_select_fast and qsa_select_par_e
+        // always carried — without it the threshold scan's `cum + c >= need`
+        // is never satisfiable when K > ncb and the fill degenerates.)
+        int pos = pos_p[qi];
+        for (int i = threadIdx.x; i <= pos; i += blockDim.x) sel_list[qi * *sel_max_p + i] = i;
+        if (threadIdx.x == 0) sel_n[qi] = pos + 1;
+        return;
+    }
     const float* row = scores + (size_t)qi * *cap_p;
     __shared__ unsigned int hist[256];
     __shared__ unsigned int bitmap[8192]; // 65536 blocks
@@ -3682,7 +3793,8 @@ extern "C" __global__ void qsa_scores_par(const float* __restrict__ q, const flo
 // against attn_sel_s8. Only the LOAD changes: every fma chain, the e order, the
 // shuffle tree, the expf and the j order are those of LUT = 0, so the two
 // instantiations are bit-identical by construction.
-template <int LUT>
+// #96: RT = the scale source (0 folded, 1 the YaRN runtime global), as attn_sel.
+template <int LUT, int RT>
 __device__ __forceinline__ void attn_sel_split_body(const float* __restrict__ q, const unsigned char* __restrict__ kc,
                                           const unsigned char* __restrict__ vc, const int* __restrict__ sel,
                                           const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
@@ -3706,7 +3818,7 @@ __device__ __forceinline__ void attn_sel_split_body(const float* __restrict__ q,
     __shared__ float lut[LUT ? 256 : 1];
     int mode = *mode_p;
     int warp = d >> 5, lane = d & 31;
-    const float scale = 0.0625f;
+    const float scale = attn_scale_src<RT>(); // 1/sqrt(256)
     if (LUT) {
         // block is 256 threads (AHD), so one entry per thread; the barrier is the
         // only instruction the LUT adds outside the loops
@@ -3763,14 +3875,28 @@ extern "C" __global__ void attn_sel_split(const float* __restrict__ q, const uns
                                           const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
                                           const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
                                           float* __restrict__ part_o, float* __restrict__ part_ml) {
-    attn_sel_split_body<0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, part_o, part_ml);
+    attn_sel_split_body<0, 0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, part_o, part_ml);
+}
+extern "C" __global__ void attn_sel_split_y(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                            const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                            const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                            const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                            float* __restrict__ part_o, float* __restrict__ part_ml) {
+    attn_sel_split_body<0, 1>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, part_o, part_ml); // #96 YaRN runtime scale
 }
 extern "C" __global__ void attn_sel_split_l(const float* __restrict__ q, const unsigned char* __restrict__ kc,
                                             const unsigned char* __restrict__ vc, const int* __restrict__ sel,
                                             const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
                                             const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
                                             float* __restrict__ part_o, float* __restrict__ part_ml) {
-    attn_sel_split_body<1>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, part_o, part_ml);
+    attn_sel_split_body<1, 0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, part_o, part_ml);
+}
+extern "C" __global__ void attn_sel_split_l_y(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+                                              const unsigned char* __restrict__ vc, const int* __restrict__ sel,
+                                              const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
+                                              const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
+                                              float* __restrict__ part_o, float* __restrict__ part_ml) {
+    attn_sel_split_body<1, 1>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, part_o, part_ml); // #96 YaRN runtime scale
 }
 extern "C" __global__ void attn_merge(const float* __restrict__ part_o, const float* __restrict__ part_ml,
                                       float* __restrict__ out, const int* __restrict__ s_p) {
@@ -4645,12 +4771,50 @@ impl Kernels {
             "ple_state_update", "ple_conv_step", "argmax_k", "sample_topk_part", "sample_k", "add_flat",
             "gemv_bf16_b", "gemv_bf16_w", "gemv_fp4_b1k", "hc_down_inj", "gemv_bf16_ws", "gemv_bf16_bs",
             "gemm_fp4_dense", "gemm_bf16_dense", "gemm_fp4_dense_b", "gemm_bf16_dense_b", "mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q", "silu_mul_combo_q", "qsa_scores_par", "attn_sel_split", "attn_sel_split_l", "attn_merge", "cast_e4m3_flat", "dec_e4m3_flat",
+            // #96: the YaRN runtime-scale twins (RT = 1) + the one-boot-write
+            // setter; resolved by name but launched only when an mscale is armed
+            "attn_sel_y", "attn_sel_r_y", "attn_sel_d8_y", "attn_sel_d9_y", "attn_sel_s_y", "attn_sel_s8_y", "attn_sel_s8l_y", "attn_sel_g_y", "attn_sel_split_y", "attn_sel_split_l_y", "set_attn_scale",
             "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "gemv_fp4_mma_dg", "sh_gate_up_q", "gemv_fp4_mma_d32", "gemv_fp4_mma_g32", "attn_sel_r", "attn_sel_d8", "attn_sel_d9", "attn_sel_s", "attn_sel_s8", "attn_sel_s8l", "attn_sel_g",
             "gemm_fp4_f32x", "vit_ln", "vit_add_bias", "vit_pe_add", "vit_rope", "vit_attn", "gelu_erf", "gelu_tanh",
         ];
         let mut map = HashMap::new();
         for n in names {
             map.insert(*n, module.get(n));
+        }
+        // #96: arm the YaRN runtime attention scale. With no rope_scaling (the
+        // checkpoint of record) nothing below runs — no upload, no substitution,
+        // every launch resolves the RT = 0 kernel it always resolved, with the
+        // same arguments: byte-identical map, launches and logits. Armed (an
+        // mscale != 1), the scale 0.0625·mscale is written ONCE into the device
+        // global and the ten attention variants swap to their _y twins, which
+        // read it — same signatures, same launch sites, one scalar different
+        // by design.
+        if let Some(s) = crate::meta::boot_rope_scaling().filter(|s| s.mscale() != 1.0) {
+            let scale = 0.0625f32 * s.mscale() as f32;
+            let mut v = cuda::to_f32_dev(&[scale]);
+            launch_sync(*map.get("set_attn_scale").unwrap(), 1, 1, 1, 32, &[v as u64]);
+            cuda::free_dev(&mut v);
+            for (n, y) in [
+                ("attn_sel", "attn_sel_y"),
+                ("attn_sel_r", "attn_sel_r_y"),
+                ("attn_sel_d8", "attn_sel_d8_y"),
+                ("attn_sel_d9", "attn_sel_d9_y"),
+                ("attn_sel_s", "attn_sel_s_y"),
+                ("attn_sel_s8", "attn_sel_s8_y"),
+                ("attn_sel_s8l", "attn_sel_s8l_y"),
+                ("attn_sel_g", "attn_sel_g_y"),
+                ("attn_sel_split", "attn_sel_split_y"),
+                ("attn_sel_split_l", "attn_sel_split_l_y"),
+            ] {
+                map.insert(n, *map.get(y).unwrap());
+            }
+            tracing::info!(
+                target: "kernels",
+                "[kernels] #96 attention scale 0.0625 -> {:.6} (YaRN mscale {:.4}, factor {}) - the _y runtime-scale twins carry every attention launch",
+                scale,
+                s.mscale(),
+                s.factor
+            );
         }
         Kernels { map }
     }
@@ -4768,5 +4932,57 @@ pub unsafe fn launch_v(
             );
         }
         cuda::sync();
+    }
+}
+
+#[cfg(test)]
+mod tests_96 {
+    //! #96: the kernel-source gate. NVRTC is a HOST-side compiler: this parses
+    //! and compiles the frozen KERNEL_SRC to PTX with no CUDA context, no GPU
+    //! and no pinned allocation — the earliest possible gate on a CUDA error in
+    //! the runtime-scale twins. The PTX text then carries the two byte-identity
+    //! claims of the issue: every kernel of record folds the 0.0625f immediate
+    //! and never touches the runtime global; the _y twins load it.
+    use super::KERNEL_SRC;
+
+    /// the PTX text of one entry, from its `.entry <name>(` to the closing
+    /// brace at column 0 (inner braces are indented in PTX)
+    fn body_of<'a>(ptx: &'a str, entry: &str) -> &'a str {
+        let start = ptx
+            .find(&format!(".entry {entry}("))
+            .unwrap_or_else(|| panic!("no .entry {entry} in the PTX"));
+        let end = ptx[start..]
+            .find("\n}\n")
+            .map(|e| start + e + 3)
+            .unwrap_or(ptx.len());
+        &ptx[start..end]
+    }
+
+    #[test]
+    fn the_source_compiles_and_the_scale_split_is_visible_in_the_ptx() {
+        let opts = cudarc::nvrtc::CompileOptions {
+            options: vec!["--gpu-architecture=compute_120a".into()],
+            ..Default::default()
+        };
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(KERNEL_SRC, opts)
+            .expect("nvrtc compile")
+            .to_src();
+        assert!(ptx.contains(".entry set_attn_scale"), "the #96 boot setter must exist");
+        // nvrtc emits `.global .align 4 .f32 d_attn_scale = 0f3D800000;`
+        // (0f3D800000 IS 0.0625f = 2^-4; 0f3E000000 would be 0.125f)
+        assert!(ptx.contains(".global .align 4 .f32 d_attn_scale"), "the runtime scale global must exist");
+        assert!(ptx.contains("= 0f3D800000"), "the runtime global initializes to 0.0625f");
+        // the kernels of record: the folded immediate, never the global
+        for k in ["attn_sel", "attn_sel_r", "attn_sel_s8l", "attn_sel_g", "attn_sel_split_l"] {
+            let b = body_of(&ptx, k);
+            assert!(b.contains("0f3D800000"), "{k} must fold the 0.0625f immediate");
+            assert!(!b.contains("d_attn_scale"), "{k} must not read the runtime scale");
+        }
+        // the _y twins: the global load, present in the module whether or not
+        // any boot ever arms them
+        for k in ["attn_sel_y", "attn_sel_r_y", "attn_sel_s8l_y", "attn_sel_g_y", "attn_sel_split_l_y"] {
+            let b = body_of(&ptx, k);
+            assert!(b.contains("d_attn_scale"), "{k} must read the runtime scale");
+        }
     }
 }

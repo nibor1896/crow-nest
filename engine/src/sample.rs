@@ -9,8 +9,18 @@
 //!   CROW_MIN_P (#83: log-space tail filter, 0 = off)
 //!   CROW_REPEAT CROW_FREQ CROW_LASTN (#84: windowed llama.cpp penalties,
 //!   defaults neutral - repeat 1.0 / freq 0 / last_n 64)
+//!   CROW_DRY_MULTIPLIER CROW_DRY_BASE CROW_DRY_ALLOWED_LENGTH CROW_DRY_LASTN
+//!   (#85: DRY, multiplier 0 = off) and the #92 tier, ALL off by default:
+//!   CROW_TOP_N_SIGMA CROW_TYPICAL_P CROW_XTC_PROB CROW_XTC_THR
+//!   CROW_MIROSTAT CROW_MIROSTAT_TAU CROW_MIROSTAT_ETA
 //! Greedy stays the gate discipline: with CROW_SAMPLE unset nothing here runs
 //! and the traces are unchanged.
+//!
+//! #85/#92 run on the HOST ONLY (the #85 issue's recommendation (a), and #92's
+//! "host-sampler path is the supported route"): `Sampler::host_route` says
+//! whether one of them is armed, and the caller (serve, decode, parity) then
+//! reads the logits row back and draws here instead of arming `sample_k`. The
+//! device sampler of #83/#84 is untouched and keeps its bit-parity role.
 //!
 //! Since the GPU sampler (kernels.rs `sample_k`) the draw runs on the device as
 //! the node behind `argmax_k`; this host code is its bit-for-bit reference and
@@ -48,6 +58,12 @@ impl Rng {
     pub fn state(&self) -> u64 {
         self.0
     }
+    /// #92: the seed word of XTC's OWN stream - the request seed through a
+    /// different constant than the draw stream's, so the two never correlate
+    /// and an armed XTC never shifts the main xorshift64* state.
+    pub fn new_xtc(seed: u64) -> Self {
+        Rng::new(seed ^ 0x5854_4353_5F4F_574E) // "XTCS_OWN"
+    }
 }
 
 /// CROW_SAMPLE_HOST=1: keep sampling on the host (reference path); otherwise
@@ -83,6 +99,56 @@ pub struct Sampler {
     /// to `gen::SAMPLE_RING_MAX` at construction - the device twin's ring is
     /// that deep.
     pub penalty_last_n: usize,
+    /// #85: DRY (Don't Repeat Yourself) multiplier, ported from KoboldCpp PR
+    /// #982 into llama.cpp PR #9702. Over the last `dry_last_n` tokens
+    /// (prompt tail + generated, its OWN window beside #84's) a reverse
+    /// Z-algorithm finds, per candidate, the maximal repeat length L the
+    /// candidate would extend; `logit -= multiplier * base^(L - allowed)`.
+    /// `0.0` (the default) disables the whole pass, exactly llama.cpp's rule
+    /// (`multiplier != 0 && base >= 1 && last_n != 0`).
+    pub dry_multiplier: f32,
+    /// #85: DRY base of the exponential, llama.cpp default 1.75. `>= 1.0`
+    /// required or the pass is disabled; at exactly 1.0 the penalty is flat
+    /// (`multiplier * 1`), as `powf(1.0, x) = 1.0` in the reference too.
+    pub dry_base: f32,
+    /// #85: DRY allowed length, llama.cpp default 2 - repeats up to this
+    /// length cost nothing (`L - allowed` is the exponent).
+    pub dry_allowed_length: i32,
+    /// #85: DRY window depth (`dry_penalty_last_n`), llama.cpp default 64.
+    /// HOST-only state (a `VecDeque`, no device twin), so no ring clamp.
+    pub dry_last_n: usize,
+    /// #92: top-nσ (llama.cpp PR #13264, arXiv:2411.07641): mean and std of
+    /// the (penalized) non-inf logits, mask `logit < max - n*std`. BEFORE
+    /// top-k, as in the chain. `<= 0` (the default) disables.
+    pub top_n_sigma: f32,
+    /// #92: typical_p (arXiv:2202.00666): softmax, entropy H, keep the
+    /// smallest `|-ln p - H|` until the kept mass exceeds the threshold.
+    /// AFTER top-k, BEFORE top_p/min_p, its llama.cpp chain position. `>= 1.0`
+    /// (the default) disables.
+    pub typical_p: f32,
+    /// #92: XTC "exclude top choices" (llama.cpp PR #9742): per token, with
+    /// probability `xtc_probability`, remove the leading run of tokens with
+    /// `p >= xtc_threshold` (renormalized over the current candidate set),
+    /// keeping `xtc_min_keep`. `<= 0` (the default) disables; a threshold
+    /// `> 0.5` disables too, exactly llama.cpp's rule.
+    pub xtc_probability: f32,
+    /// #92: XTC threshold, llama.cpp default 0.1; values above 0.5 disable.
+    pub xtc_threshold: f32,
+    /// #92: XTC min_keep, llama.cpp chain default 1.
+    pub xtc_min_keep: usize,
+    /// #92: mirostat v2 (arXiv:2007.14966): `2` arms it, `0` (the default)
+    /// is off. When armed it REPLACES the top-k/typical/top_p/min_p/xtc tail
+    /// exactly as llama.cpp's chain build does (the mirostat branch adds only
+    /// temp + mirostat): truncate `surprise = -log2(p) > mu`, renormalize,
+    /// draw, `mu -= eta * (surprise - tau)`.
+    pub mirostat: u8,
+    /// #92: mirostat v2 target surprise, llama.cpp default 5.0.
+    pub mirostat_tau: f32,
+    /// #92: mirostat v2 learning rate, llama.cpp default 0.1.
+    pub mirostat_eta: f32,
+    /// #92: mirostat v2's mu - `2*tau` at request start (llama.cpp reset),
+    /// then updated by every draw. Reset per request like the seed.
+    pub miro_mu: f32,
     /// CROW_SEED as given (the record names it, so a sampled answer is reproducible)
     pub seed: u64,
     pub rng: Rng,
@@ -110,6 +176,22 @@ pub struct Sampler {
     /// #84: count of every id currently in `win`; a token evicted from the
     /// ring decrements by exactly one (llama.cpp `token_count`, incremental).
     win_counts: std::collections::HashMap<usize, u16>,
+    /// #85: the DRY window - the last `dry_last_n` accepted ids, prompt tail
+    /// first, oldest first. A SECOND state beside #84's `win` because DRY's
+    /// depth is its own knob; only `dry_armed` samplers push into it (llama.cpp
+    /// `llama_sampler_dry_accept` early-returns when disabled).
+    dry_win: std::collections::VecDeque<u32>,
+    /// #85: the sequence breakers as llama.cpp processes them: head id -> the
+    /// tokenizations of every tail that completes a breaker begun by the head
+    /// (an EMPTY tail is a single-token breaker - `\n`, `:`, `"`, `*` are all
+    /// that kind). Shared via `Arc` so a per-request sampler clones a
+    /// reference, not the map.
+    dry_breakers: std::sync::Arc<std::collections::HashMap<u32, Vec<Vec<u32>>>>,
+    /// #92: XTC's OWN rng stream. llama.cpp seeds XTC's `std::mt19937`
+    /// independently of the dist rng "for reproducibility"; the twin here is
+    /// a second xorshift64* derived from the request seed through a different
+    /// word, so enabling XTC never perturbs the main draw stream.
+    xtc_rng: Rng,
 }
 
 impl Clone for Rng {
@@ -127,6 +209,26 @@ impl Sampler {
         }
         let f = |k: &str, d: f32| crate::geo::env_parse::<f32>(k).unwrap_or(d);
         let u = |k: &str, d: usize| crate::geo::env_parse::<usize>(k).unwrap_or(d);
+        let i = |k: &str, d: i32| crate::geo::env_parse::<i32>(k).unwrap_or(d);
+        let seed = u("CROW_SEED", 0) as u64;
+        // #85: the DRY knobs (multiplier 0 = off, the default). The breaker
+        // map needs the tokenizer; the harness path derives it from the
+        // process-global one when that is reachable, and runs without
+        // breakers otherwise (documented in docs/env.md).
+        let dry_multiplier = f("CROW_DRY_MULTIPLIER", 0.0);
+        let dry_base = f("CROW_DRY_BASE", 1.75);
+        let dry_last_n = u("CROW_DRY_LASTN", 64);
+        let dry_armed = dry_multiplier != 0.0 && dry_base >= 1.0 && dry_last_n > 0;
+        let dry_breakers = if dry_armed {
+            match crate::tokenizer::global() {
+                Ok(tk) => dry_breaker_map(crate::geo::V, |id| tk.decode(&[id]).ok(), |s| tk.encode_raw(s).ok()),
+                Err(_) => std::sync::Arc::new(std::collections::HashMap::new()),
+            }
+        } else {
+            std::sync::Arc::new(std::collections::HashMap::new())
+        };
+        let mirostat = u("CROW_MIROSTAT", 0).min(2) as u8;
+        let mirostat_tau = f("CROW_MIROSTAT_TAU", 5.0);
         Some(Sampler {
             temperature: f("CROW_TEMP", 0.7),
             top_p: f("CROW_TOP_P", 0.8),
@@ -136,11 +238,27 @@ impl Sampler {
             repeat_penalty: f("CROW_REPEAT", 1.0),
             frequency_penalty: f("CROW_FREQ", 0.0),
             penalty_last_n: u("CROW_LASTN", 64).min(crate::gen::SAMPLE_RING_MAX),
-            seed: u("CROW_SEED", 0) as u64,
-            rng: Rng::new(u("CROW_SEED", 0) as u64),
+            dry_multiplier,
+            dry_base,
+            dry_allowed_length: i("CROW_DRY_ALLOWED_LENGTH", 2),
+            dry_last_n,
+            top_n_sigma: f("CROW_TOP_N_SIGMA", 0.0),
+            typical_p: f("CROW_TYPICAL_P", 1.0),
+            xtc_probability: f("CROW_XTC_PROB", 0.0),
+            xtc_threshold: f("CROW_XTC_THR", 0.1),
+            xtc_min_keep: 1,
+            mirostat,
+            mirostat_tau,
+            mirostat_eta: f("CROW_MIROSTAT_ETA", 0.1),
+            miro_mu: 2.0 * mirostat_tau,
+            seed,
+            rng: Rng::new(seed),
             seen: Default::default(),
             win: Default::default(),
             win_counts: Default::default(),
+            dry_win: Default::default(),
+            dry_breakers,
+            xtc_rng: Rng::new_xtc(seed),
         })
     }
 
@@ -160,18 +278,38 @@ impl Sampler {
             repeat_penalty: 1.0,
             frequency_penalty: 0.0,
             penalty_last_n: 64,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_last_n: 64,
+            top_n_sigma: 0.0,
+            typical_p: 1.0,
+            xtc_probability: 0.0,
+            xtc_threshold: 0.1,
+            xtc_min_keep: 1,
+            mirostat: 0,
+            mirostat_tau: 5.0,
+            mirostat_eta: 0.1,
+            miro_mu: 10.0,
             seed,
             rng: Rng::new(seed),
             seen: Default::default(),
             win: Default::default(),
             win_counts: Default::default(),
+            dry_win: Default::default(),
+            dry_breakers: std::sync::Arc::new(std::collections::HashMap::new()),
+            xtc_rng: Rng::new_xtc(seed),
         }
     }
 
     pub fn describe(&self) -> String {
-        format!("sample: temp {} top_p {} top_k {} presence {} min_p {} repeat {} freq {} last_n {} seed {} {}",
+        format!("sample: temp {} top_p {} top_k {} presence {} min_p {} repeat {} freq {} last_n {} dry mul {} base {} allowed {} win {} nsigma {} typical {} xtc {}/{} miro {} tau {} eta {} seed {} {}",
             self.temperature, self.top_p, self.top_k, self.presence_penalty, self.min_p,
-            self.repeat_penalty, self.frequency_penalty, self.penalty_last_n, self.seed,
+            self.repeat_penalty, self.frequency_penalty, self.penalty_last_n,
+            self.dry_multiplier, self.dry_base, self.dry_allowed_length, self.dry_last_n,
+            self.top_n_sigma, self.typical_p, self.xtc_probability, self.xtc_threshold,
+            self.mirostat, self.mirostat_tau, self.mirostat_eta,
+            self.seed,
             if host_forced() { "host" } else { "gpu" })
     }
 
@@ -191,6 +329,32 @@ impl Sampler {
     /// an armed-by-default window would silently move every existing row.
     pub fn win_armed(&self) -> bool {
         self.penalty_last_n > 0 && (self.repeat_penalty != 1.0 || self.frequency_penalty > 0.0)
+    }
+
+    /// #85: llama.cpp's exact DRY disable rule
+    /// (`dry_multiplier == 0 || dry_base < 1 || dry_penalty_last_n == 0`).
+    pub fn dry_armed(&self) -> bool {
+        self.dry_multiplier != 0.0 && self.dry_base >= 1.0 && self.dry_last_n > 0
+    }
+
+    /// #85/#92: does THIS request need the host sampler? DRY and the whole
+    /// #92 tier are host-only (the #85 issue's recommendation (a), #92's "the
+    /// host-sampler path is the supported route"); a sampler that answers
+    /// false arms the device twin of #83/#84 as before. Neutral defaults
+    /// answer false, so no existing row moves.
+    pub fn host_route(&self) -> bool {
+        self.dry_armed()
+            || self.top_n_sigma > 0.0
+            || self.typical_p < 1.0
+            || (self.xtc_probability > 0.0 && self.xtc_threshold <= 0.5)
+            || self.mirostat == 2
+    }
+
+    /// #92: mirostat v2's mu back to `2*tau`, the per-request reset llama.cpp
+    /// performs (`llama_sampler_mirostat_v2_reset`). serve calls it after
+    /// overwriting tau; `Sampler::new` starts there.
+    pub fn reset_mirostat(&mut self) {
+        self.miro_mu = 2.0 * self.mirostat_tau;
     }
 
     /// #84: the windowed per-candidate penalty, the exact llama.cpp form -
@@ -238,15 +402,19 @@ impl Sampler {
 
     /// register a token that is part of the answer: the HF presence set (#68)
     /// AND the #84 window (the drawn id is an accepted id, llama.cpp `accept`)
+    /// AND the #85 DRY window (llama.cpp dry `accept`, armed samplers only)
     pub fn observe(&mut self, tok: usize) {
         self.seen.insert(tok);
         self.win_push(tok as u32);
+        self.dry_push(tok as u32);
     }
 
     /// #84: seed the window with the PROMPT - its last `penalty_last_n` ids,
     /// exactly what llama.cpp feeds its ring before the first sampled token.
     /// The HF presence set stays EMPTY here: it is this answer's tokens only
     /// (the #68 pin two fields up).
+    /// #85: the DRY window seeds from the prompt tail too (the server feeds
+    /// the chain the prompt before the first draw), at its own depth.
     pub fn observe_prompt(&mut self, ids: &[u32]) {
         self.win.clear();
         self.win_counts.clear();
@@ -254,6 +422,14 @@ impl Sampler {
         let tail: &[u32] = if ids.len() > n { &ids[ids.len() - n..] } else { ids };
         for &t in tail {
             self.win_push(t);
+        }
+        self.dry_win.clear();
+        if self.dry_armed() {
+            let dn = self.dry_last_n;
+            let dtail: &[u32] = if ids.len() > dn { &ids[ids.len() - dn..] } else { ids };
+            for &t in dtail {
+                self.dry_push(t);
+            }
         }
     }
 
@@ -267,7 +443,140 @@ impl Sampler {
         self.win_counts.iter().map(|(&k, &v)| (k, v))
     }
 
+    // ---------------------------------------------------------- #85: DRY
+
+    /// #85: push one id into the DRY window (own depth `dry_last_n`). Only an
+    /// ARMED sampler pushes - llama.cpp's dry `accept` early-returns while
+    /// disabled, so a neutral sampler never touches this state.
+    fn dry_push(&mut self, tok: u32) {
+        if !self.dry_armed() {
+            return;
+        }
+        self.dry_win.push_back(tok);
+        while self.dry_win.len() > self.dry_last_n {
+            self.dry_win.pop_front();
+        }
+    }
+
+    /// #85: `dry_max_token_repeat` of llama.cpp `llama_sampler_dry_apply`,
+    /// steps 1-3 verbatim: the breaker-limited rep_limit (step 1), the reverse
+    /// Z-algorithm over the window (step 2, the ivanyu public-domain form the
+    /// reference adapted), and the per-token maximum repeat a candidate would
+    /// EXTEND (step 3). Returns `token -> L`; step 4 (`dry_logit_delta`)
+    /// consumes it.
+    fn dry_max_repeats(&self) -> std::collections::HashMap<u32, i32> {
+        let mut out = std::collections::HashMap::new();
+        let n = self.dry_win.len().min(self.dry_last_n);
+        if n == 0 || n <= self.dry_allowed_length as usize {
+            return out; // llama.cpp: last_n_repeat <= allowed -> nothing to do
+        }
+        let w = &self.dry_win;
+        // rat(i): the i-th id from the END of the window (llama.cpp `rat`)
+        let rat = |i: usize| w[w.len() - 1 - i];
+        // step 1: the most recent sequence breaker bounds the scan; the head
+        // token plus the longest matching tail behind it wins
+        let mut rep_limit = n as i32;
+        'scan: for i in 0..n {
+            let Some(tails) = self.dry_breakers.get(&rat(i)) else { continue };
+            let mut longest = -1i32;
+            for tail in tails {
+                let seq_len = tail.len() as i32;
+                // the head is already matched; the tail must fit at rat(i-1..)
+                if seq_len > longest && seq_len <= i as i32 {
+                    if (0..tail.len()).all(|off| rat(i - off - 1) == tail[off]) {
+                        longest = seq_len;
+                    }
+                }
+            }
+            if longest >= 0 {
+                rep_limit = i as i32 - longest;
+                break 'scan;
+            }
+        }
+        if rep_limit < self.dry_allowed_length {
+            return out;
+        }
+        // step 2: the reverse Z-algorithm. dry_repeat_count[last - k] is the
+        // longest common prefix of rat(0..) and rat(k..), clamped to rep_limit.
+        let last = n as i32 - 1;
+        let mut rc = vec![0i32; n];
+        let (mut lt, mut rt) = (0i32, 0i32);
+        for k in 1..n as i32 {
+            if k > rt {
+                // outside the current Z-box: naive match
+                let mut m = 0i32;
+                while m + k < n as i32 && rat(m as usize) == rat((m + k) as usize) {
+                    m += 1;
+                }
+                rc[(last - k) as usize] = m.min(rep_limit);
+                if m > 0 {
+                    lt = k;
+                    rt = k + m - 1;
+                }
+            } else {
+                let p = k - lt; // pair index
+                let right_part_len = rt - k + 1;
+                if rc[(last - p) as usize] < right_part_len {
+                    rc[(last - k) as usize] = rc[(last - p) as usize].min(rep_limit);
+                } else {
+                    let mut j = rt + 1;
+                    while j < n as i32 && rat(j as usize) == rat((j - k) as usize) {
+                        j += 1;
+                    }
+                    rc[(last - k) as usize] = (j - k).min(rep_limit);
+                    lt = k;
+                    rt = j - 1;
+                }
+            }
+        }
+        // step 3: a token ends a repeat of length rc[i] -> drawing it would
+        // extend one; keep the maximum per token
+        for i in 0..n - 1 {
+            let rl = rc[i];
+            if rl >= self.dry_allowed_length {
+                let tok = rat(n - 2 - i);
+                let e = out.entry(tok).or_insert(i32::MIN);
+                if *e < rl {
+                    *e = rl;
+                }
+            }
+        }
+        out
+    }
+
+    /// #85: step 4, the logit penalty of a maximal repeat length L:
+    /// `multiplier * base^(L - allowed)`, the exponent clamped at
+    /// `FLOAT_MAX_LOG / ln(base)` = 88.7228391/ln(base) so `powf` cannot
+    /// overflow (llama.cpp's own guard; the clamp only arms above
+    /// base 1.000001, and a flat base of exactly 1 is powf's 1).
+    fn dry_logit_delta(&self, repeat_len: i32) -> f32 {
+        const FLOAT_MAX_LOG: f32 = 88.7228391;
+        let mut max_exponent = 0i32;
+        if self.dry_base > 1.000001 {
+            max_exponent = (FLOAT_MAX_LOG / self.dry_base.ln()) as i32;
+        }
+        let mut e = repeat_len - self.dry_allowed_length;
+        if max_exponent > 0 && e > max_exponent {
+            e = max_exponent;
+        }
+        self.dry_multiplier * self.dry_base.powf(e as f32)
+    }
+
+    /// #85: does `tok` BEGIN a single-token sequence breaker (empty tail)?
+    /// llama.cpp exempts exactly those from the penalty.
+    fn dry_is_single_breaker(&self, tok: u32) -> bool {
+        self.dry_breakers.get(&tok).map(|t| t.iter().any(|x| x.is_empty())).unwrap_or(false)
+    }
+
     /// one token from a logits row; greedy when temperature <= 0
+    ///
+    /// The chain, in llama.cpp's order, with the crow-nest positions of #83
+    /// (min_p after top-k, before the temperature softmax) kept as pinned:
+    /// penalties (#68/#84) -> DRY (#85) -> top-nσ (#92, full row) -> top-k ->
+    /// typical (#92) -> min_p (#83) -> temperature softmax -> top_p -> XTC
+    /// (#92) -> draw; mirostat v2 (#92) REPLACES everything after top-nσ, as
+    /// llama.cpp's own chain build does. Neutral defaults take none of the new
+    /// branches, so the draws are the pre-#85/#92 draws byte for byte.
     pub fn sample(&mut self, logits: &[f32]) -> usize {
         // #84: penalties FIRST, on the raw logits (llama.cpp chain order).
         // Window armed -> the llama.cpp form: asymmetric repeat, then
@@ -275,20 +584,39 @@ impl Sampler {
         // armed (the defaults) -> the HF presence subtraction over this
         // answer's tokens (#68), byte-identical to the pre-#84 sampler.
         let armed = self.win_armed();
+        // #85: DRY sits right behind the penalties (llama.cpp chain:
+        // penalties -> DRY), subtracting from the SAME penalized logit.
+        let dry = if self.dry_armed() { self.dry_max_repeats() } else { std::collections::HashMap::new() };
         let pen = |s: &Self, i: usize, l: f32| -> f32 {
-            if armed {
+            let v = if armed {
                 s.win_pen(l, s.win_count(i))
             } else if s.seen.contains(&i) {
                 l - s.presence_penalty
             } else {
                 l
+            };
+            if let Some(&rl) = dry.get(&(i as u32)) {
+                if !s.dry_is_single_breaker(i as u32) {
+                    return v - s.dry_logit_delta(rl);
+                }
             }
+            v
         };
+        // #92: mirostat v2 takes over the tail of the chain (temp-softmax,
+        // surprise truncation, draw, mu update) over the FULL row - llama.cpp
+        // builds [.. penalties/dry, temp, mirostat_v2] and nothing else.
+        if self.mirostat == 2 {
+            let scored: Vec<f32> = logits.iter().enumerate().map(|(i, &l)| pen(self, i, l)).collect();
+            return self.mirostat_v2_draw(&scored);
+        }
         if self.temperature <= 0.0 {
             // greedy: the penalized argmax. #84 put the windowed penalties
             // here too - llama.cpp runs its penalties sampler in greedy and
             // sampled alike; a not-armed sampler is the plain argmax of
-            // record (greedy never had a penalty before #84).
+            // record (greedy never had a penalty before #84). #85's DRY joins
+            // the same branch, and #92's top-nσ is an identity on an argmax
+            // (the maximum never sits below max - n*std), so greedy never
+            // needs it.
             let mut best = 0usize;
             let mut bv = f32::NEG_INFINITY;
             for (i, &l) in logits.iter().enumerate() {
@@ -297,11 +625,46 @@ impl Sampler {
             }
             return best;
         }
+        // #92: top-nσ BEFORE top-k (llama.cpp PR #13264, arXiv:2411.07641):
+        // mean and std of the non-inf penalized logits, mask
+        // `logit < max - n*std`. No softmax, no sort. f32 accumulators in
+        // index order, as the reference accumulates.
+        let sigma_cut: Option<f32> = if self.top_n_sigma > 0.0 && logits.len() > 1 {
+            let mut maxv = f32::NEG_INFINITY;
+            let mut sum = 0f32;
+            let mut cnt = 0usize;
+            for (i, &l) in logits.iter().enumerate() {
+                let v = pen(self, i, l);
+                if v != f32::NEG_INFINITY {
+                    if v > maxv { maxv = v; }
+                    sum += v;
+                    cnt += 1;
+                }
+            }
+            let mean = if cnt > 0 { sum / cnt as f32 } else { 0.0 };
+            let mut acc = 0f32;
+            for (i, &l) in logits.iter().enumerate() {
+                let v = pen(self, i, l);
+                if v != f32::NEG_INFINITY {
+                    let d = v - mean;
+                    acc += d * d;
+                }
+            }
+            let std = if cnt > 0 { (acc / cnt as f32).sqrt() } else { 0.0 };
+            Some(maxv - self.top_n_sigma * std)
+        } else {
+            None
+        };
         // top_k on the penalized scores: keep the k largest candidates
         let k = self.top_k.max(1).min(logits.len());
         let mut cand: Vec<(usize, f32)> = Vec::with_capacity(k + 1);
         for (i, &l) in logits.iter().enumerate() {
-            let v = pen(self, i, l);
+            let mut v = pen(self, i, l);
+            if let Some(t) = sigma_cut {
+                if v < t {
+                    v = f32::NEG_INFINITY; // llama.cpp masks to -INFINITY
+                }
+            }
             if cand.len() < k {
                 cand.push((i, v));
                 if cand.len() == k {
@@ -316,6 +679,37 @@ impl Sampler {
         }
         if cand.len() < k {
             cand.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        }
+        // #92: typical_p, its llama.cpp position (after top-k, before
+        // top-p/min-p; llama.cpp runs it BEFORE the temperature stage, so the
+        // filter's softmax is at temperature 1.0): entropy H, keep the
+        // smallest |-ln p - H| until the kept mass EXCEEDS the threshold
+        // (strict >, llama.cpp's own comparison), min_keep 1 (the chain
+        // default). The kept set is re-sorted by logit, as the next llama.cpp
+        // stage re-sorts; crow-nest's candidate list never left that order.
+        if self.typical_p < 1.0 && cand.len() > 1 {
+            let m = cand[0].1;
+            let pr: Vec<f64> = cand.iter().map(|c| ((c.1 - m) as f64).exp()).collect();
+            let z: f64 = pr.iter().sum();
+            let pn: Vec<f64> = pr.iter().map(|p| p / z).collect();
+            let h: f64 = pn.iter().map(|p| -p * p.ln()).sum();
+            let shifted: Vec<f64> = pn.iter().map(|p| (-p.ln() - h).abs()).collect();
+            let mut idx: Vec<usize> = (0..cand.len()).collect();
+            idx.sort_by(|&a, &b| shifted[a].partial_cmp(&shifted[b]).unwrap());
+            let mut cum = 0.0f64;
+            let mut last = idx.len();
+            for (j, &ix) in idx.iter().enumerate() {
+                cum += pn[ix];
+                // min_keep 1 (the llama.cpp chain default) makes the
+                // `i >= min_keep - 1` half of the reference's condition
+                // always true, so only the strict `>` on the mass remains
+                if cum > self.typical_p as f64 {
+                    last = j + 1;
+                    break;
+                }
+            }
+            let keep: std::collections::HashSet<usize> = idx[..last].iter().copied().collect();
+            cand.retain(|c| keep.contains(&c.0));
         }
         // #83: min_p, the log-space tail filter of llama.cpp (PR #3841, paper
         // arXiv:2407.01082): AFTER top-k, BEFORE the temperature softmax, drop
@@ -347,10 +741,36 @@ impl Sampler {
                 break;
             }
         }
-        let z2: f64 = probs[..keep].iter().sum();
+        // #92: XTC, its llama.cpp position (after min-p, before the dist).
+        // Its OWN rng stream draws the chance first - armed, threshold <= 0.5
+        // and at least two candidates, exactly the reference's gate - and the
+        // threshold compares the probs RENORMALIZED over the current kept
+        // set, because llama.cpp's xtc re-softmaxes the array it receives.
+        // With probability xtc_probability the leading run of `p >= threshold`
+        // is dropped, keeping its LAST member and at least min_keep entries.
+        let mut start = 0usize;
+        if self.xtc_probability > 0.0 && self.xtc_threshold <= 0.5 && keep >= 2 {
+            let chance = self.xtc_rng.next_f64();
+            if chance <= self.xtc_probability as f64 {
+                let zk: f64 = probs[..keep].iter().sum();
+                let thr = self.xtc_threshold as f64;
+                let mut pos_last = 0usize;
+                for i in 0..keep {
+                    if probs[i] / zk >= thr {
+                        pos_last = i;
+                    } else {
+                        break;
+                    }
+                }
+                if keep - pos_last >= self.xtc_min_keep && pos_last > 0 {
+                    start = pos_last;
+                }
+            }
+        }
+        let z2: f64 = probs[start..keep].iter().sum();
         let r = self.rng.next_f64() * z2;
         let mut acc = 0.0;
-        for i in 0..keep {
+        for i in start..keep {
             acc += probs[i];
             if r < acc {
                 return cand[i].0;
@@ -358,6 +778,112 @@ impl Sampler {
         }
         cand[keep - 1].0
     }
+
+    /// #92: mirostat v2 over the full penalized row (llama.cpp
+    /// `llama_sampler_mirostat_v2_apply`): temperature softmax (llama.cpp runs
+    /// its temp sampler BEFORE mirostat), truncate the sorted candidates at
+    /// the first with `surprise = -log2(p) > mu` (min 1), renormalize, draw,
+    /// `mu -= eta * (surprise - tau)` on the RENORMALIZED drawn probability.
+    fn mirostat_v2_draw(&mut self, scored: &[f32]) -> usize {
+        let mut idx: Vec<u32> = (0..scored.len() as u32).collect();
+        // value desc, index asc - the total order the rest of this file uses
+        idx.sort_by(|&a, &b| {
+            scored[b as usize].partial_cmp(&scored[a as usize]).unwrap().then(a.cmp(&b))
+        });
+        let t = if self.temperature > 0.0 { self.temperature } else { 1.0 };
+        let mx = scored[idx[0] as usize];
+        let mut pr: Vec<f64> = idx.iter().map(|&i| (((scored[i as usize] - mx) / t) as f64).exp()).collect();
+        let z: f64 = pr.iter().sum();
+        for p in pr.iter_mut() {
+            *p /= z;
+        }
+        let mut keep = pr.len();
+        for (i, p) in pr.iter().enumerate() {
+            if -p.log2() > self.miro_mu as f64 {
+                keep = i;
+                break;
+            }
+        }
+        let keep = keep.max(1);
+        let zk: f64 = pr[..keep].iter().sum();
+        let r = self.rng.next_f64() * zk;
+        let mut acc = 0.0f64;
+        let mut pick = keep - 1;
+        for i in 0..keep {
+            acc += pr[i];
+            if r < acc {
+                pick = i;
+                break;
+            }
+        }
+        let tok = idx[pick] as usize;
+        let observed = -(pr[pick] / zk).log2();
+        self.miro_mu =
+            (self.miro_mu as f64 - self.mirostat_eta as f64 * (observed - self.mirostat_tau as f64)) as f32;
+        tok
+    }
+}
+
+/// #85: the four DRY sequence breakers of the issue - llama.cpp's own
+/// default set. Repeats are not penalized across them, and a token that
+/// BEGINS one is exempt from the penalty itself.
+pub const DRY_DEFAULT_BREAKERS: [&str; 4] = ["\n", ":", "\"", "*"];
+
+/// #85: llama.cpp `get_overlapping_token_sequences` (from KoboldCpp PR #982),
+/// for the four default breakers: every vocab token whose text CONTAINS a
+/// breaker becomes a single-token breaker (empty tail); every token whose
+/// text merely BEGINS one maps to the tokenization of the breaker's
+/// unmatched rest (its tail, clamped to 20 ids). For the single-character
+/// defaults only the containment branch can fire - a token either contains
+/// the character or does not begin it - so the tails are all empty and the
+/// map is exactly "the ids whose text carries one of the four characters".
+/// The full head->tails shape is kept because the scan and the exemption read
+/// it (a multi-token breaker is exercisable through this door and by tests).
+pub fn dry_breaker_map(
+    n_vocab: usize,
+    text_of: impl Fn(u32) -> Option<String>,
+    encode: impl Fn(&str) -> Option<Vec<u32>>,
+) -> std::sync::Arc<std::collections::HashMap<u32, Vec<Vec<u32>>>> {
+    const MAX_CHAR_LEN: usize = 40;
+    const MAX_SEQ_LEN: usize = 20;
+    let mut map: std::collections::HashMap<u32, Vec<Vec<u32>>> = Default::default();
+    for br in DRY_DEFAULT_BREAKERS {
+        let s: &str = if br.len() > MAX_CHAR_LEN { &br[..MAX_CHAR_LEN] } else { br };
+        let sb = s.as_bytes();
+        for id in 0..n_vocab as u32 {
+            let Some(word) = text_of(id) else { continue };
+            let wb = word.as_bytes();
+            if word.contains(s) {
+                map.entry(id).or_default().push(Vec::new());
+            } else {
+                for pos in 0..wb.len() {
+                    if wb[pos] != sb[0] {
+                        continue;
+                    }
+                    let mut i = 1usize;
+                    let mut matched = true;
+                    while i < sb.len() && i + pos < wb.len() {
+                        if wb[pos + i] != sb[i] {
+                            matched = false;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    if matched {
+                        let mut toks = encode(&s[i..]).unwrap_or_default();
+                        if toks.len() > MAX_SEQ_LEN {
+                            toks.truncate(MAX_SEQ_LEN);
+                        }
+                        let tails = map.entry(id).or_default();
+                        if !tails.iter().any(|t| t == &toks) {
+                            tails.push(toks);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    std::sync::Arc::new(map)
 }
 
 pub fn argmax(logits: &[f32]) -> usize {
@@ -938,5 +1464,535 @@ mod tests {
                 mask[d] = 1;
             }
         }
+    }
+
+    // ---- #85: DRY (Don't Repeat Yourself) ----
+
+    /// a DRY sampler with hand-set breaker ids (empty tail = single-token
+    /// breaker, a Vec<u32> tail = the tokens that complete a multi-token one)
+    fn dry_with(breakers: &[(u32, Vec<Vec<u32>>)]) -> Sampler {
+        let mut s = Sampler::new(1);
+        s.dry_multiplier = 0.8;
+        s.dry_base = 1.75;
+        s.dry_allowed_length = 2;
+        s.dry_last_n = 64;
+        s.dry_breakers = std::sync::Arc::new(breakers.iter().cloned().collect());
+        s
+    }
+
+    /// #85: the defaults are OFF (multiplier 0) and the goldens are
+    /// byte-identical - the pre-#85/#92 draws, pinned. Also llama.cpp's exact
+    /// disable rule: base < 1 or window 0 or multiplier 0 all leave the
+    /// sampler inert, whatever the other knobs say.
+    #[test]
+    fn dry_and_tier_defaults_are_neutral_and_goldens_stay_byte_identical() {
+        let d = Sampler::new(0);
+        assert_eq!((d.dry_multiplier, d.dry_base, d.dry_allowed_length, d.dry_last_n), (0.0, 1.75, 2, 64));
+        assert!(!d.dry_armed(), "multiplier 0 disables, the default");
+        assert!(!d.host_route(), "a neutral sampler arms the device twin as before");
+        assert_eq!((d.top_n_sigma, d.typical_p, d.xtc_probability, d.xtc_threshold, d.mirostat), (0.0, 1.0, 0.0, 0.1, 0));
+        assert!(!d.host_route(), "the #92 tier is off by default");
+        // the disable rule, one knob at a time
+        let mut s = dry_with(&[]);
+        assert!(s.dry_armed());
+        s.dry_base = 0.999;
+        assert!(!s.dry_armed(), "base < 1 disables, llama.cpp's own rule");
+        s.dry_base = 1.0;
+        assert!(s.dry_armed(), "base exactly 1 is armed (the penalty is then flat)");
+        s.dry_last_n = 0;
+        assert!(!s.dry_armed(), "window 0 disables");
+        s.dry_last_n = 64;
+        s.dry_multiplier = 0.0;
+        assert!(!s.dry_armed());
+
+        // the goldens of the pre-#83/#84/#85 code, byte for byte
+        let logits: Vec<f32> = (0..50).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+        let mut a = Sampler::new(42);
+        let got: Vec<usize> = (0..20).map(|_| { let t = a.sample(&logits); a.observe(t); t }).collect();
+        assert_eq!(
+            got,
+            vec![21, 39, 6, 37, 20, 5, 3, 22, 38, 24, 23, 4, 41, 40, 2, 19, 7, 21, 3, 1],
+            "neutral DRY/#92 keeps the sampled golden byte-identical"
+        );
+        let mut g = Sampler::new(9);
+        g.temperature = 0.0;
+        let gg: Vec<usize> = (0..10).map(|_| { let t = g.sample(&logits); g.observe(t); t }).collect();
+        assert_eq!(gg, vec![38, 21, 4, 5, 22, 39, 37, 20, 3, 6], "and the greedy golden");
+    }
+
+    /// #85: a candidate that would EXTEND an existing repeat pays exactly
+    /// `multiplier * base^(L - allowed)`. Window [5,6,5,6], allowed 2: the
+    /// Z-scan gives token 5 L=2, so the penalty is the flat `multiplier`
+    /// (exponent 0); token 6 extends nothing and pays nothing.
+    #[test]
+    fn dry_penalizes_the_token_that_would_extend_a_repeat() {
+        let mk = |window: &[u32], logits: &[f32]| {
+            let mut s = dry_with(&[]);
+            s.temperature = 0.0;
+            s.presence_penalty = 0.0;
+            s.observe_prompt(window);
+            s.sample(logits)
+        };
+        // token 5 at 0.9 pays 0.8 -> 0.1, still beats token 7's 0.05
+        assert_eq!(mk(&[5, 6, 5, 6], &[0.05, -10.0, -10.0, -10.0, -10.0, 0.9, -10.0, 0.0]), 5);
+        // at 0.7 the same candidate falls to -0.1 and the neutral 0.05 wins
+        assert_eq!(mk(&[5, 6, 5, 6], &[0.05, -10.0, -10.0, -10.0, -10.0, 0.7, -10.0, 0.0]), 0);
+        // token 6 is NOT a repeat extender here: it keeps its 0.7 and wins
+        assert_eq!(mk(&[5, 6, 5, 6], &[0.05, -10.0, -10.0, -10.0, -10.0, -10.0, 0.7, 0.0]), 6);
+        // multiplier 0 (disabled): the same 0.7 for token 5 wins untouched
+        let mut off = dry_with(&[]);
+        off.dry_multiplier = 0.0;
+        off.temperature = 0.0;
+        off.presence_penalty = 0.0;
+        off.observe_prompt(&[5, 6, 5, 6]);
+        assert_eq!(off.sample(&[0.05, -10.0, -10.0, -10.0, -10.0, 0.7, -10.0, 0.0]), 5);
+        // the exponent is live: allowed 0 on window [5,6,5,6] gives token 5
+        // L=2 -> penalty 0.8 * 1.75^2 = 2.45, so even 2.0 loses to 0.05
+        let mut exp = dry_with(&[]);
+        exp.dry_allowed_length = 0;
+        exp.temperature = 0.0;
+        exp.presence_penalty = 0.0;
+        exp.observe_prompt(&[5, 6, 5, 6]);
+        assert_eq!(exp.sample(&[0.05, -10.0, -10.0, -10.0, -10.0, 2.0, -10.0, 0.0]), 0);
+        assert_eq!(exp.sample(&[0.05, -10.0, -10.0, -10.0, -10.0, 2.6, -10.0, 0.0]), 5, "2.6 - 2.45 wins again");
+    }
+
+    /// #85: breaker semantics. A single-token breaker as the LAST token
+    /// zeroes rep_limit and nothing is penalized (repeats are not penalized
+    /// across natural boundaries); a breaker further back bounds the scan;
+    /// and the breaker token that would itself extend a repeat is EXEMPT
+    /// (llama.cpp skips candidates that begin a single-token breaker).
+    #[test]
+    fn dry_sequence_breakers_bound_the_scan_and_exempt_their_own_token() {
+        // (a) breaker 9 as the last window id: rep_limit = 0 -> nothing pays
+        let mut s = dry_with(&[(9, vec![vec![]])]);
+        s.temperature = 0.0;
+        s.presence_penalty = 0.0;
+        s.observe_prompt(&[5, 6, 5, 6, 9]);
+        assert_eq!(s.sample(&[0.05, -10.0, -10.0, -10.0, -10.0, 0.7, -10.0, 0.0]), 5,
+            "the boundary behind the breaker hides the repeat from the scan");
+        // (b) window [3,4,9,3,4], breaker 9: rep_limit 2, and the extender the
+        // scan finds IS token 9 - which is exempt, so 9 keeps its logit while
+        // without the breaker it would pay 0.8
+        let mut b = dry_with(&[(9, vec![vec![]])]);
+        b.temperature = 0.0;
+        b.presence_penalty = 0.0;
+        b.observe_prompt(&[3, 4, 9, 3, 4]);
+        assert_eq!(b.sample(&[0.05, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, 0.7]), 9,
+            "the single-token breaker is exempt from its own repeat penalty");
+        let mut nob = dry_with(&[]);
+        nob.temperature = 0.0;
+        nob.presence_penalty = 0.0;
+        nob.observe_prompt(&[3, 4, 9, 3, 4]);
+        assert_eq!(nob.sample(&[0.05, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, 0.7]), 0,
+            "the same window without the breaker pays the flat 0.8 (0.7 - 0.8 < 0.05)");
+        // (c) a MULTI-token breaker (head 7, tail [8]): the full pair at the
+        // end bounds the scan exactly like a single-token one, and a head
+        // that only BEGINS one (its tail does not follow) is NOT exempt
+        let mut c = dry_with(&[(7, vec![vec![8]])]);
+        c.temperature = 0.0;
+        c.presence_penalty = 0.0;
+        c.observe_prompt(&[5, 6, 5, 6, 7, 8]);
+        assert!(c.dry_max_repeats().is_empty(), "the 7,8 pair at the end hides the repeat");
+        // window [5,6,7,8,5,6]: rep_limit = 2 (breaker at i=3, tail len 1),
+        // the scan's extender is token 7 - the HEAD of a multi-token breaker,
+        // which llama.cpp does NOT exempt
+        let mut d = dry_with(&[(7, vec![vec![8]])]);
+        d.temperature = 0.0;
+        d.presence_penalty = 0.0;
+        d.observe_prompt(&[5, 6, 7, 8, 5, 6]);
+        assert_eq!(d.sample(&[0.05, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, 0.7]), 0,
+            "a head-with-tail breaker is not a single-token breaker: 0.7 - 0.8 < 0.05");
+    }
+
+    /// #85: the exponent clamp of llama.cpp step 4 - `88.7228391/ln(base)`,
+    /// armed only above base 1.000001. At base 1.75 the cap is 158: an
+    /// exponent past it freezes the penalty at `multiplier * 1.75^158`
+    /// (finite, ~2.6e38) instead of overflowing, and a base at or under
+    /// 1.000001 clamps nothing (powf's own `powf(1.0, x) = 1`).
+    #[test]
+    fn dry_exponent_clamps_at_float_max_log_over_ln_base() {
+        let mut s = dry_with(&[]); // base 1.75, allowed 2
+        let cap = (88.722_84_f32 / 1.75f32.ln()) as i32; // 158
+        assert_eq!(cap, 158);
+        let at_cap = 0.8f32 * 1.75f32.powf(cap as f32);
+        assert_eq!(s.dry_logit_delta(cap + 2), at_cap, "exponent exactly at the cap");
+        assert_eq!(s.dry_logit_delta(cap + 100), at_cap, "far past the cap: frozen at the cap value");
+        // one under the cap (repeat_len cap+1 -> exponent cap-1, allowed 2) is unclamped
+        assert_eq!(s.dry_logit_delta(cap + 1), 0.8f32 * 1.75f32.powf((cap - 1) as f32));
+        // the behavioral half: an all-one-token window cannot produce a NaN
+        // or an inf - the penalized candidate just loses, finitely
+        let mut b = dry_with(&[]);
+        b.dry_multiplier = 1.0;
+        b.temperature = 0.0;
+        b.presence_penalty = 0.0;
+        let all7: Vec<u32> = vec![7; 300];
+        b.observe_prompt(&all7);
+        let t = b.sample(&[0.05, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, 1.0]);
+        assert!(t < 8, "a valid index came back (no NaN): {t}");
+        assert_eq!(t, 0, "the clamped penalty (~2.6e38) pushes any logit under 0.05");
+        // a base under 1.000001 clamps nothing: flat or near-flat penalties
+        let mut c = dry_with(&[]);
+        c.dry_base = 1.0000005;
+        assert_eq!(c.dry_logit_delta(1_000_000), 0.8f32 * c.dry_base.powf(999_998.0),
+            "no clamp below the 1.000001 line (the exponent is L - allowed 2)");
+        let mut one = dry_with(&[]);
+        one.dry_base = 1.0;
+        assert_eq!(one.dry_logit_delta(999), 0.8, "base exactly 1: the penalty is the flat multiplier");
+    }
+
+    /// #85: the window spans the PROMPT TAIL at its own depth and pushes
+    /// every drawn id, evicting past `dry_last_n` (llama.cpp dry accept).
+    #[test]
+    fn dry_window_spans_the_prompt_tail_and_evicts_at_its_own_depth() {
+        let mut s = dry_with(&[]);
+        s.dry_last_n = 2;
+        s.temperature = 0.0;
+        s.presence_penalty = 0.0;
+        s.observe_prompt(&[5, 6, 5, 6, 9]);
+        // only the last two ids are in the window ([6, 9]) - a window that
+        // shallow cannot hold a repeat of the allowed length
+        assert!(s.dry_max_repeats().is_empty(), "nothing reaches allowed 2 at depth 2");
+        // the repeat has to END at the end of the window: [9,5,6,5,6] ends in
+        // it and token 5 extends L=2; the same ids at depth 2 see only [5,6]
+        let mut w = dry_with(&[]);
+        w.temperature = 0.0;
+        w.presence_penalty = 0.0;
+        w.observe_prompt(&[9, 5, 6, 5, 6]);
+        assert_eq!(w.dry_max_repeats().get(&5), Some(&2), "full depth: token 5 extends L=2");
+        w.dry_last_n = 2;
+        w.observe_prompt(&[9, 5, 6, 5, 6]);
+        assert!(w.dry_max_repeats().is_empty(), "depth 2: the window is [5,6]");
+        // a drawn id enters: after observe(5) on depth 2 the window is [6, 5]
+        w.observe(5);
+        assert!(w.dry_max_repeats().is_empty(), "the window is [6,5]: no repeat reaches allowed 2");
+        // a disabled sampler never touches its window
+        let mut off = dry_with(&[]);
+        off.dry_multiplier = 0.0;
+        off.observe_prompt(&[5, 6, 5, 6]);
+        off.observe(5);
+        assert!(off.dry_win.is_empty(), "llama.cpp dry accept early-returns while disabled");
+    }
+
+    /// #85: the HOST MIRROR. The Z-algorithm's Z-box bookkeeping is where a
+    /// port can silently diverge, so this test recomputes llama.cpp's
+    /// `dry_max_token_repeat` the naive way - a direct O(n^2) LCP per shift,
+    /// no lt/rt reuse - over randomized windows, knobs and breaker maps, and
+    /// demands the same map the sampler computed. Agreement is evidence, not
+    /// tautology: the two share only the definition.
+    #[test]
+    fn dry_matches_the_naive_llama_reference_over_random_windows() {
+        let mut gen = Rng::new(20260920);
+        let mut singles = std::collections::HashMap::<u32, Vec<Vec<u32>>>::new();
+        singles.insert(3, vec![vec![]]);
+        singles.insert(9, vec![vec![]]);
+        let mut multi = singles.clone();
+        multi.insert(5, vec![vec![6, 7]]); // "5,6,7" is a breaker too
+        for case in 0..300 {
+            let n = 4 + (gen.next_u64() % 30) as usize;
+            let win: Vec<u32> = (0..n).map(|_| (gen.next_u64() % 6) as u32).collect();
+            let allowed = 1 + (gen.next_u64() % 3) as i32;
+            let base = 1.0 + gen.next_f64() as f32 * 1.5;
+            let mut s = Sampler {
+                dry_multiplier: 0.1 + gen.next_f64() as f32,
+                dry_base: base,
+                dry_allowed_length: allowed,
+                dry_last_n: n + 5,
+                dry_breakers: std::sync::Arc::new(match case % 3 {
+                    0 => std::collections::HashMap::new(),
+                    1 => singles.clone(),
+                    _ => multi.clone(),
+                }),
+                ..Sampler::new(1)
+            };
+            s.observe_prompt(&win);
+            // the naive reference: reversed window, plain LCP per shift,
+            // breaker scan by hand, step 3 by hand
+            let rev: Vec<u32> = win.iter().rev().copied().collect();
+            let m = rev.len();
+            let mut rep_limit = m as i32;
+            'brk: for i in 0..m {
+                if let Some(tails) = s.dry_breakers.get(&rev[i]) {
+                    let mut longest = -1i32;
+                    for tail in tails {
+                        let sl = tail.len() as i32;
+                        if sl > longest && sl <= i as i32
+                            && (0..tail.len()).all(|o| rev[i - o - 1] == tail[o])
+                        {
+                            longest = sl;
+                        }
+                    }
+                    if longest >= 0 {
+                        rep_limit = i as i32 - longest;
+                        break 'brk;
+                    }
+                }
+            }
+            let mut expect: std::collections::HashMap<u32, i32> = Default::default();
+            if rep_limit >= allowed {
+                let mut rc = vec![0i32; m];
+                for k in 1..m {
+                    let mut z = 0usize;
+                    while z + k < m && rev[z] == rev[z + k] {
+                        z += 1;
+                    }
+                    rc[m - 1 - k] = (z as i32).min(rep_limit);
+                }
+                for i in 0..m - 1 {
+                    if rc[i] >= allowed {
+                        let tok = rev[m - 2 - i];
+                        let e = expect.entry(tok).or_insert(i32::MIN);
+                        if *e < rc[i] {
+                            *e = rc[i];
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                s.dry_max_repeats(),
+                expect,
+                "case {case}: window {win:?} allowed {allowed} base {base:.3}"
+            );
+        }
+    }
+
+    /// #85: the breaker map derivation is llama.cpp's
+    /// `get_overlapping_token_sequences` over a tiny fake vocab - tokens that
+    /// CONTAIN a breaker become single-token breakers, tokens that BEGIN one
+    /// map to the tokenization of the rest, deduped per (head, tail).
+    #[test]
+    fn dry_breaker_map_follows_get_overlapping_token_sequences() {
+        // fake vocab: id -> text. The map is built over ALL FOUR default
+        // breakers at once, as the reference accumulates one multimap.
+        let vocab = [
+            "",        // 0: nothing
+            "\n",      // 1: contains the breaker -> single-token
+            "a\nb",    // 2: contains it inside -> single-token too
+            ":",       // 3
+            "xx\"yy",  // 4
+            "zz*",     // 5
+            "abc",     // 6: no breaker char at all
+            "a",       // 7: begins nothing
+            "\rx",     // 8: contains none of the four
+        ];
+        let text_of = |id: u32| vocab.get(id as usize).map(|s| s.to_string());
+        // "encode" the unmatched rest: map each char to its byte as an id, so
+        // tests can predict the tails
+        let encode = |s: &str| Some(s.bytes().map(|b| b as u32 + 1000).collect::<Vec<u32>>());
+        let m = dry_breaker_map(vocab.len(), text_of, encode);
+        // single-token breakers, empty tails
+        for id in [1u32, 2, 3, 4, 5] {
+            assert!(m.get(&id).map(|t| t.iter().any(|x| x.is_empty())).unwrap_or(false), "id {id}");
+        }
+        assert!(!m.contains_key(&0) && !m.contains_key(&6) && !m.contains_key(&7) && !m.contains_key(&8));
+        // the prefix branch never fires for a single-character breaker: a
+        // token either contains the character or does not begin it, so every
+        // tail the four defaults produce is empty
+        for tails in m.values() {
+            assert!(tails.iter().all(|t| t.is_empty()), "single-char breakers have empty tails only");
+        }
+    }
+
+    // ---- #92: the optional tier ----
+
+    /// #92: top-nσ keeps exactly `{logit >= max - n*std}` over the penalized
+    /// row - no softmax, no sort - and the comparison is strict on the LOW
+    /// side only, so a candidate exactly at the threshold survives.
+    #[test]
+    fn top_n_sigma_keeps_exactly_max_minus_n_std() {
+        // [3.0, 1.0, -1.0, -3.0]: mean 0, var 5, std sqrt(5) ~ 2.2360680
+        let mk = |n: f32| {
+            let mut s = Sampler { top_n_sigma: n, temperature: 1.0, top_p: 1.0, top_k: 4,
+                presence_penalty: 0.0, ..Sampler::new(7) };
+            s.observe_prompt(&[]);
+            let logits = [3.0f32, 1.0, -1.0, -3.0];
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..600 {
+                let t = s.sample(&logits);
+                seen.insert(t);
+            }
+            seen
+        };
+        assert_eq!(mk(1.0), [0, 1].into_iter().collect(), "thr = 3 - 2.236 ~ 0.764 keeps 3 and 1");
+        assert_eq!(mk(2.0), [0, 1, 2].into_iter().collect(), "thr ~ -1.472 keeps three");
+        assert_eq!(mk(10.0), [0, 1, 2, 3].into_iter().collect(), "a wide n keeps the row");
+        // the boundary: with all logits equal, std = 0 and thr = max, and
+        // `v < thr` is false AT the max - nothing is masked
+        let mut b = Sampler { top_n_sigma: 5.0, temperature: 1.0, top_p: 1.0, top_k: 3, presence_penalty: 0.0, ..Sampler::new(7) };
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..300 {
+            seen.insert(b.sample(&[2.0f32, 2.0, 2.0]));
+        }
+        assert_eq!(seen, [0, 1, 2].into_iter().collect(), "std 0: the at-threshold maximum survives");
+        // and it composes with the penalties: mean and std are computed over
+        // the PENALIZED row (llama.cpp chain order), so a windowed repeat
+        // penalty that drags the top token under the line costs it its place.
+        // repeat 40 -> 3.0/40 = 0.075; mean -0.73125, std ~ 1.4889,
+        // thr = 1.0 - 0.5*std ~ 0.2556 > 0.075 -> only token 1 survives
+        let mut c = Sampler { top_n_sigma: 0.5, temperature: 1.0, top_p: 1.0, top_k: 4,
+            repeat_penalty: 40.0, presence_penalty: 0.0, ..Sampler::new(7) };
+        c.observe_prompt(&[0]); // token 0 is in the window
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..600 {
+            seen.insert(c.sample(&[3.0f32, 1.0, -1.0, -3.0]));
+        }
+        assert_eq!(seen, [1].into_iter().collect(),
+            "the mean/std are computed over the PENALIZED row, llama.cpp's chain order");
+    }
+
+    /// #92: typical_p keeps the LOCALLY typical set - smallest `|-ln p - H|`
+    /// until the kept mass exceeds the threshold - which can rank the most
+    /// probable token BEHIND a more typical one. p ~ [0.4, 0.35, 0.25]:
+    /// H ~ 1.0805, |diffs| ~ [0.164, 0.031, 0.306] -> order 1, 0, 2.
+    #[test]
+    fn typical_p_keeps_the_locally_typical_set() {
+        let logits = [(-0.9163f32), (-1.0498), (-1.3863)]; // ln of .4/.35/.25
+        let mk = |p: f32| {
+            let mut s = Sampler { typical_p: p, temperature: 1.0, top_p: 1.0, top_k: 3,
+                presence_penalty: 0.0, ..Sampler::new(11) };
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..600 {
+                seen.insert(s.sample(&logits));
+            }
+            seen
+        };
+        // mass 0.5: the typical order is 1 (0.35), then 0 (0.4) -> cum 0.75:
+        // keep {1, 0}, token 2 is out
+        assert_eq!(mk(0.5), [0, 1].into_iter().collect(), "the atypical tail drops");
+        // a tight 0.1 keeps ONLY the most typical token - not the argmax:
+        // typical sampling's signature
+        assert_eq!(mk(0.1), [1].into_iter().collect(), "0.35 alone crosses 0.1, and it is token 1");
+        // disabled (>= 1.0) is the old sampler exactly
+        assert_eq!(mk(1.0), [0, 1, 2].into_iter().collect());
+        // greedy never sees it: no candidate list exists at temperature 0
+        let mut g = Sampler { typical_p: 0.1, temperature: 0.0, top_p: 1.0, top_k: 3,
+            presence_penalty: 0.0, ..Sampler::new(11) };
+        assert_eq!(g.sample(&logits), 0, "greedy is the plain penalized argmax, typical included");
+    }
+
+    /// #92: XTC removes the leading run of `p >= threshold` (renormalized
+    /// over the kept set) with probability `xtc_probability`, keeping the
+    /// run's LAST member and at least `min_keep` entries - and it draws its
+    /// chance from its OWN rng stream, so the main xorshift64* state after a
+    /// token is exactly what a no-XTC sampler's is.
+    #[test]
+    fn xtc_removes_the_leading_run_with_its_own_rng() {
+        let logits = [3.0f32, 2.9, 0.0, 0.0]; // p ~ [0.499, 0.451, 0.025, 0.025]
+        let mk = |prob: f32, thr: f32, min_keep: usize| {
+            let mut s = Sampler { xtc_probability: prob, xtc_threshold: thr, xtc_min_keep: min_keep,
+                temperature: 1.0, top_p: 1.0, top_k: 4, presence_penalty: 0.0, ..Sampler::new(13) };
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..600 {
+                seen.insert(s.sample(&logits));
+            }
+            seen
+        };
+        // probability 1, threshold 0.4: the leading run is {0, 1}, the cut
+        // keeps index 1 onward - the consensus token 0 is NEVER drawn
+        assert_eq!(mk(1.0, 0.4, 1), [1, 2, 3].into_iter().collect(),
+            "the top choice is hard-removed, the second leads");
+        // min_keep 4 blocks the cut (3 would remain)
+        assert_eq!(mk(1.0, 0.4, 4), [0, 1, 2, 3].into_iter().collect(), "min_keep holds the set");
+        // a threshold above 0.5 disables XTC outright, llama.cpp's own rule
+        assert_eq!(mk(1.0, 0.6, 1), [0, 1, 2, 3].into_iter().collect(), "threshold > 0.5 is off");
+        // probability 0 is the old sampler exactly
+        assert_eq!(mk(0.0, 0.4, 1), [0, 1, 2, 3].into_iter().collect());
+        // THE STREAM PIN: an armed, firing XTC and a disabled one consume the
+        // SAME main-rng state per token - XTC's chance came from its own
+        let mut armed = Sampler { xtc_probability: 1.0, xtc_threshold: 0.4, xtc_min_keep: 1,
+            temperature: 1.0, top_p: 1.0, top_k: 4, presence_penalty: 0.0, ..Sampler::new(13) };
+        let mut plain = Sampler::new(13);
+        plain.temperature = 1.0;
+        plain.top_p = 1.0;
+        plain.top_k = 4;
+        plain.presence_penalty = 0.0;
+        for _ in 0..50 {
+            let _ = armed.sample(&logits);
+            let _ = plain.sample(&logits);
+            assert_eq!(armed.rng.state(), plain.rng.state(),
+                "XTC's chance must never advance the main draw stream");
+        }
+        // and the disabled-by-rule forms do not even advance XTC's own stream
+        let mut thr_off = Sampler { xtc_probability: 1.0, xtc_threshold: 0.6, xtc_min_keep: 1,
+            temperature: 1.0, top_p: 1.0, top_k: 4, presence_penalty: 0.0, ..Sampler::new(13) };
+        let x0 = thr_off.xtc_rng.state();
+        let _ = thr_off.sample(&logits);
+        assert_eq!(thr_off.xtc_rng.state(), x0, "llama.cpp returns before the chance draw");
+        // reproducibility: same seed, same everything -> same sequence
+        let seq = |seed: u64| {
+            let mut s = Sampler { xtc_probability: 1.0, xtc_threshold: 0.4, xtc_min_keep: 1,
+                temperature: 1.0, top_p: 1.0, top_k: 4, presence_penalty: 0.0, ..Sampler::new(seed) };
+            (0..20).map(|_| s.sample(&logits)).collect::<Vec<_>>()
+        };
+        assert_eq!(seq(99), seq(99));
+    }
+
+    /// #92: mirostat v2 truncates the temperature softmax at
+    /// `surprise = -log2(p) > mu`, draws from the renormalized remainder,
+    /// and moves `mu` by `-eta*(surprise - tau)` - the state that makes it
+    /// per-request (reset with the seed). It also REPLACES the usual tail:
+    /// top_k does not bound it, exactly as llama.cpp's chain build drops
+    /// top-k/top-p in the mirostat branch.
+    #[test]
+    fn mirostat_v2_truncates_by_surprise_and_updates_mu() {
+        let logits = [3.0f32, 2.0, 1.0, 0.0]; // p ~ [.644, .237, .087, .032], -log2 ~ [.64, 2.08, 3.52, 4.96]
+        // tau 0.5 -> mu 1.0: every token but the first has surprise > mu, so
+        // the truncation keeps ONE candidate and the draw is deterministic
+        let mut s = Sampler { mirostat: 2, mirostat_tau: 0.5, mirostat_eta: 0.1,
+            temperature: 1.0, top_k: 1, top_p: 1.0, presence_penalty: 0.0, ..Sampler::new(3) };
+        s.reset_mirostat();
+        assert_eq!(s.miro_mu, 1.0);
+        assert_eq!(s.sample(&logits), 0, "surprise 0.64 <= mu 1.0 survives alone; top_k 1 did not matter");
+        // mu moved by -eta*(surprise - tau) = -0.1*(0 - 0.5) = +0.05
+        assert!((s.miro_mu - 1.05f32).abs() < 1e-6, "mu after one draw: {}", s.miro_mu);
+        // tau 5 -> mu 10: nothing truncated, ALL FOUR stay reachable - over
+        // the FULL row, not the top_k slice (top_k is 1 above and was ignored)
+        let mut w = Sampler { mirostat: 2, mirostat_tau: 5.0, mirostat_eta: 0.1,
+            temperature: 1.0, top_k: 1, top_p: 1.0, presence_penalty: 0.0, ..Sampler::new(3) };
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..600 {
+            seen.insert(w.sample(&logits));
+        }
+        assert_eq!(seen, [0, 1, 2, 3].into_iter().collect(),
+            "mirostat sees the full row; mu 10 truncates nothing here");
+        // the state carries: after many low-surprise draws mu drifts UP toward
+        // 2*tau and above, and the reachability set only grows
+        let mu_now = w.miro_mu;
+        assert!(mu_now > 5.0, "surprises under tau 5 raise mu, got {mu_now}");
+        // reset is the per-request door: tau changed, mu follows 2*tau
+        let mut r = Sampler::new(0);
+        r.mirostat_tau = 3.0;
+        r.reset_mirostat();
+        assert_eq!(r.miro_mu, 6.0);
+        // and mirostat 0 (the default) never takes the branch: the golden of
+        // the neutral sampler is already pinned above
+    }
+
+    /// #85/#92: `host_route` is the whole routing truth table - DRY or any
+    /// armed #92 knob says host, everything else (the #83/#84 profile) says
+    /// device.
+    #[test]
+    fn host_route_is_dry_or_the_tier_and_nothing_else() {
+        let mut s = Sampler::new(0);
+        assert!(!s.host_route());
+        s.min_p = 0.01;
+        s.repeat_penalty = 1.05;
+        s.frequency_penalty = 0.2;
+        assert!(!s.host_route(), "#83/#84 stay on the device sampler");
+        s.dry_multiplier = 0.8;
+        assert!(s.host_route());
+        s.dry_multiplier = 0.0;
+        assert!(!s.host_route());
+        s.top_n_sigma = 1.5;
+        assert!(s.host_route());
+        s.top_n_sigma = 0.0;
+        s.typical_p = 0.9;
+        assert!(s.host_route());
+        s.typical_p = 1.0;
+        s.xtc_probability = 0.3;
+        assert!(s.host_route());
+        s.xtc_probability = 0.0;
+        s.mirostat = 2;
+        assert!(s.host_route());
     }
 }

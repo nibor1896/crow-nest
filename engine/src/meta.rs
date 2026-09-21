@@ -36,6 +36,13 @@
 //! - `sample.rs` keeps its EOS pin; this module READS `sample::EOS_IDS` and
 //!   asserts the config against it (the pin and the truth stay one concept,
 //!   written once in sample, compared once here).
+//!
+//! #96 extends the same reader with `rope_scaling`: the object is parsed when
+//! the config carries one (absent on the checkpoint of record = no scaling,
+//! byte-identical everywhere), an unsupported type or a missing field is the
+//! hard-error class, and the green boot path stashes the scaling + the training
+//! context for the two readers that build the rope table (manager.rs) and
+//! thread the YaRN mscale into the attention scale (kernels.rs).
 
 use crate::geo;
 use crate::sample;
@@ -109,6 +116,156 @@ pub struct ModelMeta {
     pub text_bos_token_id: Option<i64>,
     /// `mrope_section` when the config carries it ([11, 11, 10] here)
     pub mrope_section: Option<Vec<u64>>,
+    /// `rope_parameters.rope_type` (or flat `rope_type`): "default" here —
+    /// checked, because any other value is a checkpoint announcing scaling
+    /// through a channel nothing reads (scaling lives in `rope_scaling`)
+    pub rope_type: String,
+    pub rope_type_source: String,
+    /// the `rope_scaling` object of #96 — `None` on the checkpoint of record,
+    /// which means no scaling anywhere: the boot table, the kernel scale and
+    /// every logit stay byte-identical
+    pub rope_scaling: Option<RopeScaling>,
+}
+
+// ---- #96: rope scaling ----
+
+/// which `rope_scaling` flavor the checkpoint asks for. Everything but `Yarn`
+/// and the base rewrites is implemented from the llama.cpp reference; an
+/// unknown type string refuses the parse by name rather than being ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopeKind {
+    /// "default" / "none": the object configures nothing
+    Default,
+    /// naive position interpolation (freq_scale on every pair, no mscale)
+    Linear,
+    /// the YaRN ramp: low/high-frequency mixing + the mscale temperature
+    Yarn,
+    /// NTK-aware theta rewrite: base·factor^(dim/(dim-2)), nothing else
+    NtkAware,
+}
+
+impl RopeKind {
+    fn parse(s: &str) -> Result<RopeKind, String> {
+        match s {
+            "default" | "none" => Ok(RopeKind::Default),
+            "linear" => Ok(RopeKind::Linear),
+            "yarn" => Ok(RopeKind::Yarn),
+            "ntk-aware" | "ntk_aware" => Ok(RopeKind::NtkAware),
+            other => Err(format!(
+                "rope_scaling type '{other}' is not implemented (supported: default, linear, yarn, ntk-aware) \
+- refusing rather than silently ignoring the checkpoint's scaling (issue #96)"
+            )),
+        }
+    }
+}
+
+/// the parsed `rope_scaling` object (#96), with the derived numbers the boot
+/// table builder and the attention-scale arm need. Every formula is the
+/// llama.cpp reference (`ggml_rope_yarn_corr_dims`, `rope_yarn`, `get_mscale`,
+/// the NTK base rewrite of the converter), which is the YaRN paper's reference
+/// implementation. `Copy`, so the boot stash below hands it out freely.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RopeScaling {
+    pub kind: RopeKind,
+    /// the stretch factor (>= 1 in every sane config; llama.cpp `factor`)
+    pub factor: f64,
+    /// the context the model was TRAINED at: the object's own
+    /// `original_max_position_embeddings`, falling back to the config's
+    /// `max_position_embeddings` (llama.cpp's `n_ctx_orig_yarn` fallback)
+    pub original_context: u64,
+    /// YaRN ramp bounds, llama.cpp defaults 32 / 1 when the object omits them
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+    /// optional HF `attention_factor`, a direct multiplier on the mscale
+    /// (llama.cpp `rope.attention.factor`)
+    pub attention_factor: Option<f64>,
+}
+
+impl RopeScaling {
+    /// parse the `rope_scaling` object. `fallback_ctx` is the config's
+    /// `max_position_embeddings`. A missing `rope_type`/`type` or `factor`, or
+    /// a non-positive factor, is a named error — the #94 rule: never a guess.
+    fn from_config(v: &Value, fallback_ctx: u64) -> Result<RopeScaling, String> {
+        let type_str = v
+            .get("rope_type")
+            .and_then(Value::as_str)
+            .or_else(|| v.get("type").and_then(Value::as_str))
+            .ok_or("missing required key(s): rope_scaling.rope_type (or rope_scaling.type)")?;
+        let kind = RopeKind::parse(type_str)?;
+        let factor = f64_of(v, "factor").ok_or("missing required key(s): rope_scaling.factor")?;
+        if !(factor.is_finite() && factor > 0.0) {
+            return Err(format!("rope_scaling.factor {factor} is not a positive number"));
+        }
+        Ok(RopeScaling {
+            kind,
+            factor,
+            original_context: u64_of(v, "original_max_position_embeddings").unwrap_or(fallback_ctx),
+            beta_fast: f64_of(v, "beta_fast").unwrap_or(32.0) as f32,
+            beta_slow: f64_of(v, "beta_slow").unwrap_or(1.0) as f32,
+            attention_factor: f64_of(v, "attention_factor"),
+        })
+    }
+
+    /// llama.cpp `rope_freq_scale` = 1/factor: what an interpolated angle is
+    /// multiplied by
+    pub fn freq_scale(&self) -> f32 {
+        (1.0 / self.factor) as f32
+    }
+
+    /// the YaRN correction range, ggml.c `ggml_rope_yarn_corr_dims` verbatim:
+    /// pairs below `lo` extrapolate (no scaling — the high-frequency bands
+    /// YaRN exists to protect), pairs above `hi` interpolate, the span between
+    /// ramps. The bounds are in DIM units against a PAIR index, exactly as
+    /// llama.cpp and HF ship it (both compare `i/2` against dim-unit bounds).
+    pub fn yarn_corr_range(&self, dim: usize, base: f64) -> (f32, f32) {
+        let corr = |beta: f32| {
+            dim as f32 * (self.original_context as f32 / (beta * 2.0 * std::f32::consts::PI)).ln()
+                / (2.0 * (base as f32).ln())
+        };
+        (corr(self.beta_fast).floor().max(0.0), corr(self.beta_slow).ceil().min(dim as f32 - 1.0))
+    }
+
+    /// the YaRN mscale (llama.cpp `get_mscale(factor, 1.0)`, the YaRN paper's
+    /// attention temperature): `1 + 0.1·ln(1/freq_scale)` = `1 + 0.1·ln(factor)`.
+    /// 1.0 unless yarn with factor > 1 — linear and ntk change no temperature.
+    /// `attention_factor`, when the object carries it, multiplies the result.
+    pub fn mscale(&self) -> f64 {
+        let m = match self.kind {
+            RopeKind::Yarn if self.factor > 1.0 => 1.0 + 0.1 * self.factor.ln(),
+            _ => 1.0,
+        };
+        m * self.attention_factor.unwrap_or(1.0)
+    }
+
+    /// the NTK-aware theta rewrite the llama.cpp converter bakes into the rope
+    /// freq base: `base · factor^(dim/(dim-2))` — slows the low-frequency walk
+    /// without interpolating any pair
+    pub fn ntk_base(&self, dim: usize, base: f64) -> f64 {
+        base * self.factor.powf(dim as f64 / (dim as f64 - 2.0))
+    }
+}
+
+// ---- the #96 boot stash ----
+
+/// The rope truth the boot door parsed, for the two boot-time readers that
+/// cannot be handed it as a parameter: `ThreeStates::allocate` (manager.rs)
+/// builds the table and `Kernels::new` (kernels.rs) threads the mscale — both
+/// are called from `gen.rs` with signatures this issue does not own. `assert_pinned`
+/// sets this BEFORE the container is mapped, so both readers see it; a process
+/// that never passed the front door (unit tests, the probe bins) reads the
+/// `None` default, which is today's behavior everywhere.
+static BOOT_ROPE_SCALING: std::sync::OnceLock<Option<RopeScaling>> = std::sync::OnceLock::new();
+static BOOT_TRAINING_CONTEXT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// the boot-parsed `rope_scaling` (`None` = no scaling: byte-identical behavior)
+pub fn boot_rope_scaling() -> Option<RopeScaling> {
+    BOOT_ROPE_SCALING.get().copied().flatten()
+}
+
+/// the context the checkpoint was TRAINED at — `rope_scaling.original_context`
+/// when the object carries one, else `max_position_embeddings` (262,144 here)
+pub fn boot_training_context() -> Option<u64> {
+    BOOT_TRAINING_CONTEXT.get().copied()
 }
 
 // ---- parsing ----
@@ -171,6 +328,14 @@ impl ModelMeta {
             .and_then(|r| r.get("mrope_section"))
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_u64).collect());
+        // #96: the rope_type token, same nested-then-flat fallback as rope_theta
+        let (rope_type, rope_type_source) = match rp.and_then(|r| r.get("rope_type")).and_then(Value::as_str) {
+            Some(t) => (t.to_string(), "text_config.rope_parameters.rope_type".to_string()),
+            None => match tc.get("rope_type").and_then(Value::as_str) {
+                Some(t) => (t.to_string(), "text_config.rope_type".to_string()),
+                None => (String::new(), String::new()),
+            },
+        };
 
         // generation_config.json is the source of record for the stop ids; the
         // text config's own eos/bos is the fallback and the cross-check
@@ -216,10 +381,22 @@ impl ModelMeta {
         need(!layer_types.is_empty(), "text_config.layer_types");
         need(u64_of(tc, "vocab_size").is_some(), "text_config.vocab_size");
         need(u64_of(tc, "max_position_embeddings").is_some(), "text_config.max_position_embeddings");
+        need(!rope_type_source.is_empty(), "text_config.rope_parameters.rope_type (or text_config.rope_type)");
         need(eos_token_ids.as_ref().is_some_and(|v| !v.is_empty()), "generation_config.json eos_token_id (or text_config.eos_token_id)");
         if !missing.is_empty() {
             return Err(format!("{config_path}: missing required key(s): {}", missing.join(", ")));
         }
+
+        // #96: rope_scaling, after the required-key pass so the fallback context
+        // is known. Absent (the checkpoint of record) = None = no scaling; a
+        // present object must parse or the whole config refuses by name.
+        let rope_scaling = match tc.get("rope_scaling") {
+            Some(rs) if rs.is_object() => {
+                Some(RopeScaling::from_config(rs, u64_of(tc, "max_position_embeddings").unwrap())
+                    .map_err(|why| format!("{config_path}: {why}"))?)
+            }
+            _ => None,
+        };
 
         Ok(ModelMeta {
             config_path: config_path.to_string(),
@@ -244,6 +421,9 @@ impl ModelMeta {
             bos_token_id,
             text_bos_token_id,
             mrope_section,
+            rope_type,
+            rope_type_source,
+            rope_scaling,
         })
     }
 
@@ -381,7 +561,25 @@ impl ModelMeta {
             let sum: u64 = sec.iter().sum();
             c.push(Check::cmp("mrope_section_pairs", geo::ROPE_PAIRS as u64, sum, "geo::ROPE_PAIRS (manager.rs table)", "text_config.rope_parameters.mrope_section sum"));
         }
+        // #96: the rope_type token must say "default" — the scaling this engine
+        // reads lives in the rope_scaling object, parsed separately; a different
+        // value here is a checkpoint announcing scaling through a channel
+        // nothing reads (and any scaling it meant must come as rope_scaling)
+        c.push(Check::cmp(
+            "rope_type",
+            "default",
+            self.rope_type.as_str(),
+            "manager.rs boot RoPE table (no scaling path taken)",
+            &self.rope_type_source,
+        ));
         c
+    }
+
+    /// the context the checkpoint was TRAINED at: the rope_scaling object's own
+    /// `original_max_position_embeddings` when it carries one, else the config's
+    /// `max_position_embeddings` (#96: the warn's threshold)
+    pub fn training_context(&self) -> u64 {
+        self.rope_scaling.map(|s| s.original_context).unwrap_or(self.max_position_embeddings)
     }
 
     /// the named mismatches — [`ModelMeta::checks`] with the green rows
@@ -510,6 +708,13 @@ pub fn assert_pinned(cnq_path: &str) -> Option<ModelMeta> {
         all.len(),
         meta.config_path
     );
+    // #96: stash the rope truth for the two boot-time readers that cannot be
+    // handed it as a parameter (ThreeStates::allocate builds the table,
+    // Kernels::new threads the mscale). Set only on the green path: a red
+    // config panicked above, a missing one has nothing to say — both leave the
+    // `None` default in force, which is the byte-identical behavior.
+    let _ = BOOT_ROPE_SCALING.set(meta.rope_scaling);
+    let _ = BOOT_TRAINING_CONTEXT.set(meta.training_context());
     Some(meta)
 }
 
@@ -675,5 +880,110 @@ mod tests {
         let err = ModelMeta::from_config_files(&dir.join("config.json").to_string_lossy(), None).unwrap_err();
         std::fs::remove_dir_all(&dir).ok();
         assert!(err.contains("head_dim"), "the error must name the key: {err}");
+    }
+
+    // ---- #96: rope_scaling ----
+
+    /// the checkpoint of record carries NO rope_scaling object and rope_type
+    /// "default" — the two facts the byte-identity contract stands on
+    #[test]
+    fn the_real_config_has_no_scaling_and_a_default_rope_type() {
+        let m = real_meta();
+        assert!(m.rope_scaling.is_none(), "the checkpoint of record must parse scaling-free");
+        assert_eq!(m.rope_type, "default");
+        assert_eq!(m.training_context(), 262_144);
+        assert!(!fired(&m, "rope_type"), "the new rope_type check must be green on the checkpoint of record");
+    }
+
+    /// a doctored rope_type fires the new check by name (a checkpoint announcing
+    /// scaling through the token nothing reads is a loud mismatch, not a guess)
+    #[test]
+    fn a_doctored_rope_type_fires_by_name() {
+        let m = doctored(|c, _| c["text_config"]["rope_parameters"]["rope_type"] = json!("yarn"));
+        assert!(fired(&m, "rope_type"));
+    }
+
+    /// config-driven YaRN: the full object parses, and every derived number is
+    /// the llama.cpp reference math (the corr range 14..22 is the checkpoint's
+    /// own dims/base/context with the default betas)
+    #[test]
+    fn a_yarn_rope_scaling_parses_with_the_reference_math() {
+        let m = doctored(|c, _| {
+            c["text_config"]["rope_scaling"] = json!({
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 262_144,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0
+            });
+        });
+        let s = m.rope_scaling.expect("the object must parse");
+        assert_eq!(s.kind, RopeKind::Yarn);
+        assert_eq!(s.factor, 4.0);
+        assert_eq!(s.freq_scale(), 0.25f32);
+        assert_eq!(s.original_context, 262_144);
+        assert_eq!(m.training_context(), 262_144);
+        // get_mscale(4, 1) = 1 + 0.1·ln 4
+        assert!((s.mscale() - (1.0 + 0.1 * 4.0f64.ln())).abs() < 1e-12, "{}", s.mscale());
+        // ggml_rope_yarn_corr_dims(64, 262144, 1e7, 32, 1) = floor(14.23), min(63, ceil(21.11))
+        assert_eq!(s.yarn_corr_range(64, 1e7), (14.0, 22.0));
+        // a parse must never arm the engine: only assert_pinned's green path sets the stash
+        assert!(boot_rope_scaling().is_none(), "from_config_files must not touch the boot stash");
+    }
+
+    /// the legacy "type" spelling parses, and the llama.cpp defaults apply
+    /// (beta 32/1, original context falling back to max_position_embeddings)
+    #[test]
+    fn a_legacy_typed_rope_scaling_takes_the_defaults() {
+        let m = doctored(|c, _| {
+            c["text_config"]["rope_scaling"] = json!({ "type": "yarn", "factor": 2.5 });
+        });
+        let s = m.rope_scaling.expect("the legacy spelling must parse");
+        assert_eq!(s.kind, RopeKind::Yarn);
+        assert_eq!(s.beta_fast, 32.0);
+        assert_eq!(s.beta_slow, 1.0);
+        assert_eq!(s.original_context, 262_144, "no original_max_position_embeddings: the config max is the fallback");
+        assert!((s.freq_scale() - 0.4).abs() < 1e-6);
+    }
+
+    /// linear and ntk-aware parse too, and neither touches the attention
+    /// temperature — only yarn has an mscale
+    #[test]
+    fn linear_and_ntk_parse_with_no_mscale() {
+        let lin = doctored(|c, _| c["text_config"]["rope_scaling"] = json!({ "rope_type": "linear", "factor": 4.0 }));
+        let lin = lin.rope_scaling.unwrap();
+        assert_eq!(lin.kind, RopeKind::Linear);
+        assert_eq!(lin.mscale(), 1.0);
+        assert_eq!(lin.freq_scale(), 0.25f32);
+        let ntk = doctored(|c, _| c["text_config"]["rope_scaling"] = json!({ "rope_type": "ntk-aware", "factor": 4.0 }));
+        let ntk = ntk.rope_scaling.unwrap();
+        assert_eq!(ntk.kind, RopeKind::NtkAware);
+        assert_eq!(ntk.mscale(), 1.0);
+        // base' = 1e7 · 4^(64/62): the NTK-aware theta rewrite
+        assert!((ntk.ntk_base(64, 1e7) - 1e7 * 4.0f64.powf(64.0 / 62.0)).abs() < 1e-6 * 1e7);
+        // a "default" scaling object configures nothing
+        let dflt = doctored(|c, _| c["text_config"]["rope_scaling"] = json!({ "rope_type": "default", "factor": 4.0 }));
+        assert_eq!(dflt.rope_scaling.unwrap().kind, RopeKind::Default);
+    }
+
+    /// an unsupported scaling type (longrope's factor tables, dynamic, su-rope)
+    /// is a NAMED parse error, never a silently ignored object
+    #[test]
+    fn an_unsupported_rope_scaling_type_is_a_named_error() {
+        let mut config: Value = serde_json::from_str(&std::fs::read_to_string(format!("{REAL_DIR}/config.json")).unwrap()).unwrap();
+        config["text_config"]["rope_scaling"] = json!({ "rope_type": "longrope", "factor": 4.0 });
+        let dir = std::env::temp_dir().join(format!("crow-meta-longrope-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let err = ModelMeta::from_config_files(&dir.join("config.json").to_string_lossy(), None).unwrap_err();
+        assert!(err.contains("longrope"), "the error must name the type: {err}");
+        assert!(err.contains("issue #96"), "the error must point at the refusing gate: {err}");
+        // a missing factor is a named missing key of the same class
+        config["text_config"]["rope_scaling"] = json!({ "rope_type": "yarn" });
+        std::fs::create_dir_all(&dir).unwrap(); // the remove above took the dir; the second write needs it back
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let err = ModelMeta::from_config_files(&dir.join("config.json").to_string_lossy(), None).unwrap_err();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(err.contains("rope_scaling.factor"), "the error must name the key: {err}");
     }
 }

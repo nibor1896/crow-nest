@@ -152,6 +152,19 @@
 //! | `repeat_penalty` | #84: llama.cpp asymmetric repeat over the penalty window; absent/`null` = 1.0 NEUTRAL; read in greedy and sampled alike |
 //! | `frequency_penalty` | #84: `l -= count * freq` over the window; absent/`null` = 0 NEUTRAL |
 //! | `penalty_last_n` | #84: window depth in ids, PROMPT TAIL + generated, default 64, clamped to 1024 (the device ring); `0` disables the windowed pass |
+//! | `dry_multiplier` | #85: DRY suffix-repetition penalty (llama.cpp PR #9702); absent/`null`/`0` = OFF; read in greedy and sampled alike; routes the request to the HOST sampler |
+//! | `dry_base` | #85: DRY exponential base, default 1.75; a value `< 1.0` is forced back to 1.75 as llama-server does (the sampler itself would disable DRY) |
+//! | `dry_allowed_length` | #85: repeats up to this length cost nothing, default 2 |
+//! | `dry_last_n` | #85: DRY window depth in ids, PROMPT TAIL + generated, default 64; `0` disables; the sequence breakers are the engine's fixed four (`\n`, `:`, `"`, `*`), derived once per process from the vocab |
+//! | `top_n_sigma` | #92: masks `logit < max - n*std` before top-k (no softmax, no sort); absent/`null`/`<= 0` = OFF; routes to the HOST sampler |
+//! | `typical_p` | #92: locally-typical filter after top-k; absent/`null`/`>= 1` = OFF; routes to the HOST sampler |
+//! | `xtc_probability` | #92: per-token probability of removing the leading `p >= xtc_threshold` run; absent/`null`/`<= 0` = OFF; routes to the HOST sampler |
+//! | `xtc_threshold` | #92: XTC threshold, default 0.1; `> 0.5` disables XTC (llama.cpp's own rule) |
+//! | `mirostat` | #92: `2` arms mirostat v2 (surprise truncation, `mu` state reset per request like the seed); `0`/absent = OFF; `1` is a 400 (v1 is not implemented); needs `temperature > 0`; routes to the HOST sampler |
+//! | `mirostat_tau` | #92: mirostat v2 target surprise, default 5.0 |
+//! | `mirostat_eta` | #92: mirostat v2 learning rate, default 0.1 |
+//! | `stop` | #86: OpenAI stop strings, an array of strings (a bare string is the one-stop form); generation ends BEFORE the sequence is emitted, `finish_reason` `stop`; empty entries drop, no count cap |
+//! | `logit_bias` | #86: map TOKEN ID -> additive bias on the raw logits, applied FIRST, outside the sampler chain (llama.cpp's order); `-inf` as f32 is a hard mask; a biased request samples on the HOST |
 //! | `tools` | array of OpenAI function tools, RENDERED as the template variable `tools` (#29 A7) |
 //! | `stream_options.include_usage` | `true` puts `usage` on the final chunk (#27 A5) |
 //! | `timings_per_token` | `true` puts `timings` on the final chunk (#27 A5) |
@@ -243,6 +256,14 @@
 //!   Qwen's docs name `thinking_budget`; without the field the ids stay byte-identical.
 //! - Greedy decode: `Engine::prefill` gives the first id, `Engine::decode_step` the rest.
 //! - Stops on `sample::EOS_IDS` (`finish_reason` `stop`) or at `max_tokens` (`length`).
+//! - #86: a request with `stop` strings ALSO stops on the CONTENT text — earliest
+//!   match, longest-first on ties, the stop and everything after it swallowed, never
+//!   streamed (`StopStrings`, the tool-call tail-hold on arbitrary strings). The stop
+//!   filter sees the content channel AFTER the think split: reasoning is never
+//!   stop-scanned, a stop inside a think block does not end the answer. A stop that
+//!   completes on the LAST token (or in the held tail at EOS) flips `length` to `stop`
+//!   too — the sequence IS in the generated text. A closed tool call still wins the
+//!   finish word with `tool_calls`, exactly as it does over an EOS stop.
 //! - `prompt ids >= n_ctx` answers 413 before any GPU work.
 //! - Otherwise `max_tokens` is CLAMPED to `n_ctx - prompt ids` and to 32768.
 //! - A clamp logs one stderr line and the request is served, not refused.
@@ -295,6 +316,28 @@
 //!   `ln(min_p)` is computed ONCE on the host and uploaded, so the boundary is bit-equal.
 //! - Absent, `null` or `<= 0` disables it - exactly the old behavior, golden rows included.
 //!
+//! `logit_bias` (#86, the host-sampler route):
+//!
+//! - The map is ADDITIVE on the raw logits and applied FIRST, outside the chain -
+//!   the order llama.cpp applies it in (its `logit_bias` sampler sits before the chain
+//!   and model `suppress_tokens` merge into the same map as `-INFINITY`).
+//! - A biased request therefore draws on the HOST: the logits row is read back
+//!   (1 MB over PCIe, ~0.3 ms per token), `apply_logit_bias` runs on it, then
+//!   `Sampler::sample` - the reference path `CROW_SAMPLE_HOST=1` always ran. The
+//!   device `sample_k` node has no bias input; its twin (bias through the sampler's
+//!   per-request mask/count buffers) is the documented FOLLOW-UP, not built here.
+//! - Greedy counts: a `temperature <= 0` request with a bias runs the biased ARGMAX
+//!   on the host (`sampler_from` arms a sampler for it, as #84 did for penalties),
+//!   with the data-sheet `presence_penalty` 1.5 taken OUT unless the body sent it -
+//!   a bias-only request asked for the bias, not for a silent penalty change.
+//! - The hard mask: strict JSON cannot carry the `-Infinity` literal (serde_json
+//!   refuses it), so a mask is any bias that is `-inf` once cast to f32 — any
+//!   magnitude over `f32::MAX`, e.g. `-1e39`. `-100` is the OpenAI-conventional
+//!   strong ban, additive like every other value, not an absolute mask. `+inf`
+//!   (e.g. `1e39`) forces the token, the additive reading of the same rule.
+//!   Masking an EOS id this way is exactly how llama-server builds `ignore_eos`
+//!   (`logit_bias_eog`) — that field can now ride this door without new plumbing.
+//!
 //! Stream shape (llama-server / OpenAI, `crow_core.py:4831-4877`):
 //!
 //! | order | line |
@@ -309,6 +352,9 @@
 //! - Every frame is flushed on its own; one token never waits for the next, with one
 //!   exception (#29 A7): a content token whose tail is a prefix of `<tool_call>` is HELD
 //!   until the next token resolves it, so no half marker can reach the wire.
+//! - #86 adds the same exception for stop strings: a content tail that is a prefix of
+//!   a stop string is held (`StopStrings`), and on a complete match the stop and
+//!   everything after it NEVER reach the wire — the answer ends `finish_reason` `stop`.
 //! - The concatenated content is the same either way; only the frame boundary moves.
 //!
 //! Tool calls on the wire (#29 A7, `crow_core.py:4864-4877` is the reader):
@@ -533,9 +579,10 @@ use crow_nest_engine::cache::{PrefixCache, SLOTS};
 use crow_nest_engine::boot;
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::{DevSampler, Engine};
-use crow_nest_engine::geo::{apply_adapt_policy, DEFAULT_CNQ, DEFAULT_HOTSETS, LAYERS, TRICKLE_CHUNK_THRESHOLD};
+use crow_nest_engine::geo::{apply_adapt_policy, DEFAULT_CNQ, DEFAULT_HOTSETS, LAYERS, TRICKLE_CHUNK_THRESHOLD, V};
 use crow_nest_engine::sample::{Sampler, EOS_IDS};
 use crow_nest_engine::slot;
+use crow_nest_engine::stopstr::StopStrings;
 use crow_nest_engine::toolcall::{Emit, ToolStream, TOOL_OPEN};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -578,6 +625,29 @@ const DEFAULT_FREQ: f32 = 0.0;
 /// #84: `penalty_last_n` when a request carries none - llama.cpp's default 64;
 /// the window spans the prompt tail plus the generated ids
 const DEFAULT_LAST_N: usize = 64;
+/// #85: `dry_multiplier` when a request carries none - OFF, as llama.cpp
+const DEFAULT_DRY_MULTIPLIER: f32 = 0.0;
+/// #85: `dry_base` when a request carries none - llama.cpp's default 1.75.
+/// A request that names a base below 1.0 gets THIS value back, the same fix
+/// llama-server applies (its sampler would silently disable DRY instead)
+const DEFAULT_DRY_BASE: f32 = 1.75;
+/// #85: `dry_allowed_length` when a request carries none - llama.cpp's default 2
+const DEFAULT_DRY_ALLOWED_LENGTH: i32 = 2;
+/// #85: `dry_last_n` when a request carries none - llama.cpp's default 64;
+/// `dry_penalty_last_n`, the DRY window's own depth (independent of #84's)
+const DEFAULT_DRY_LAST_N: usize = 64;
+/// #92: `top_n_sigma` when a request carries none - OFF (`<= 0` disables)
+const DEFAULT_TOP_N_SIGMA: f32 = 0.0;
+/// #92: `typical_p` when a request carries none - OFF (`>= 1` disables)
+const DEFAULT_TYPICAL_P: f32 = 1.0;
+/// #92: `xtc_probability` when a request carries none - OFF (`<= 0` disables)
+const DEFAULT_XTC_PROBABILITY: f32 = 0.0;
+/// #92: `xtc_threshold` when a request carries none - llama.cpp's default 0.1
+const DEFAULT_XTC_THRESHOLD: f32 = 0.1;
+/// #92: `mirostat_tau` when a request carries none - llama.cpp's default 5.0
+const DEFAULT_MIROSTAT_TAU: f32 = 5.0;
+/// #92: `mirostat_eta` when a request carries none - llama.cpp's default 0.1
+const DEFAULT_MIROSTAT_ETA: f32 = 0.1;
 /// #28: RNG seed when the request carries none; fixed, so warm equals cold (M1)
 const DEFAULT_SEED: u64 = 0;
 /// #54: how many decode steps of the `stream:false` path ONE gone-client probe covers.
@@ -610,6 +680,27 @@ struct SamplingSent {
     repeat_penalty: bool,
     frequency_penalty: bool,
     penalty_last_n: bool,
+    /// #85/#92: the DRY fields and the optional tier. The tier line prints
+    /// them only when one is non-neutral, so these flags exist for exactly
+    /// that line - the sampler itself reads the VALUES, not the flags.
+    tier: TierSent,
+}
+
+/// #85/#92: which of the DRY + optional-tier fields the REQUEST carried,
+/// read by the conditional `tier_line` only
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TierSent {
+    dry_multiplier: bool,
+    dry_base: bool,
+    dry_allowed_length: bool,
+    dry_last_n: bool,
+    top_n_sigma: bool,
+    typical_p: bool,
+    xtc_probability: bool,
+    xtc_threshold: bool,
+    mirostat: bool,
+    mirostat_tau: bool,
+    mirostat_eta: bool,
 }
 
 impl SamplingSent {
@@ -1088,6 +1179,41 @@ struct ChatReq {
     /// device ring's depth (`gen::SAMPLE_RING_MAX`, 1024) - the `[chat]` line
     /// names the effective value, so a clamp is visible, never silent.
     penalty_last_n: usize,
+    /// #85: DRY multiplier; `0.0` (absent included) is OFF. Host-only path.
+    dry_multiplier: f32,
+    /// #85: DRY base - requests below 1.0 were forced to `DEFAULT_DRY_BASE`
+    /// at parse (llama-server's own fix), so this is always `>= 1.0` here.
+    dry_base: f32,
+    /// #85: DRY allowed length, default 2
+    dry_allowed_length: i32,
+    /// #85: the DRY window depth in ids (`dry_penalty_last_n`), default 64;
+    /// `0` disables. Host-only state, so no ring clamp.
+    dry_last_n: usize,
+    /// #92: top-nσ; `<= 0` (absent included) is OFF
+    top_n_sigma: f32,
+    /// #92: typical_p; `>= 1.0` (absent included) is OFF
+    typical_p: f32,
+    /// #92: XTC probability; `<= 0` (absent included) is OFF
+    xtc_probability: f32,
+    /// #92: XTC threshold, default 0.1; `> 0.5` disables (llama.cpp's rule)
+    xtc_threshold: f32,
+    /// #92: `2` arms mirostat v2, `0` (absent included) is OFF. Parse refused
+    /// `1` (v1 is not implemented) and any other value, and refused v2 with
+    /// `temperature <= 0` (the surprise distribution it truncates is the
+    /// temperature softmax).
+    mirostat: u8,
+    /// #92: mirostat v2 target surprise, default 5.0
+    mirostat_tau: f32,
+    /// #92: mirostat v2 learning rate, default 0.1
+    mirostat_eta: f32,
+    /// #86: the OpenAI `stop` strings, in the body's own order (empty entries
+    /// dropped at parse); `StopStrings::new` sorts them longest-first. Empty is
+    /// the behaviour of every release before #86: no filter runs, no byte is held.
+    stop: Vec<String>,
+    /// #86: the OpenAI `logit_bias` map as `(token id, bias)` pairs, sorted by
+    /// token id. Empty is the behaviour of every release before #86. A bias that
+    /// is `-inf` as f32 (any magnitude over `f32::MAX`) is a hard mask.
+    logit_bias: Vec<(usize, f32)>,
     /// #VIT: the `image_url` data URLs of the content blocks, in message order.
     /// This is the exact wire form Crow sends (crow_core.py `image_part`):
     /// `{"type":"image_url","image_url":{"url":"data:<mime>;base64,..."}}`.
@@ -1130,6 +1256,18 @@ fn num_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str, d: f32
             .as_f64()
             .map(|x| x as f32)
             .ok_or_else(|| format!("{key} is not a number")),
+    }
+}
+
+/// the integer shape of `num_field` (#85/#92's integer knobs): absent or null is
+/// the default, anything but a non negative integer is a 400 that names the key
+fn int_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str, d: i64) -> Result<i64, String> {
+    match obj.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(d),
+        Some(v) => v
+            .as_i64()
+            .filter(|n| *n >= 0)
+            .ok_or_else(|| format!("{key} is not a non negative integer")),
     }
 }
 
@@ -1376,6 +1514,94 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
     // the device ring is SAMPLE_RING_MAX deep; a deeper ask is clamped to it
     // (the `[chat]` line prints the effective value, so the clamp is visible)
     let penalty_last_n = penalty_last_n.min(crow_nest_engine::gen::SAMPLE_RING_MAX);
+    // #85: the DRY fields, host-only state (the sampler's window carries them);
+    // `dry_base < 1.0` is forced to the default (llama-server's own fix), the
+    // clamp visible on the tier line like every other effective value
+    let dry_multiplier = num_field(obj, "dry_multiplier", DEFAULT_DRY_MULTIPLIER)?;
+    let dry_base = num_field(obj, "dry_base", DEFAULT_DRY_BASE)?.max(DEFAULT_DRY_BASE);
+    let dry_allowed_length = int_field(obj, "dry_allowed_length", DEFAULT_DRY_ALLOWED_LENGTH.into())? as i32;
+    let dry_last_n = int_field(obj, "dry_last_n", DEFAULT_DRY_LAST_N as i64)? as usize;
+    // #92: the optional tier, all OFF at these defaults (absent included)
+    let top_n_sigma = num_field(obj, "top_n_sigma", 0.0)?;
+    let typical_p = num_field(obj, "typical_p", 1.0)?;
+    let xtc_probability = num_field(obj, "xtc_probability", 0.0)?;
+    let xtc_threshold = num_field(obj, "xtc_threshold", 0.1)?;
+    if xtc_threshold > 0.5 {
+        // llama.cpp disables XTC above 0.5; refuse with the reason named
+        return Err("xtc_threshold above 0.5 disables XTC - send xtc_probability 0 instead".into());
+    }
+    let mirostat = int_field(obj, "mirostat", 0)?;
+    if mirostat == 1 || !(0..=2).contains(&mirostat) {
+        return Err("mirostat is 0 (off) or 2 (v2) here - v1 is not implemented".into());
+    }
+    if mirostat == 2 && !(temperature > 0.0) {
+        return Err(
+            "mirostat v2 needs temperature > 0 - its surprise distribution is the temperature softmax".into(),
+        );
+    }
+    let mirostat_tau = num_field(obj, "mirostat_tau", 5.0)?;
+    let mirostat_eta = num_field(obj, "mirostat_eta", 0.1)?;
+    // #86: the OpenAI stop strings. Strict on type, lenient on absence, like every
+    // sampling field: an array of strings (a bare string is the one-stop form of the
+    // OpenAI contract), a non-string entry is a 400 that names it. An EMPTY entry is
+    // dropped, not refused: it can only match at byte 0 of everything, llama-server
+    // drops it too, and refusing it would break a client that sends `["", "END"]`.
+    // No count cap: this server caps nothing else about the profile either.
+    let stop = match obj.get("stop") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(v) => {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| "stop is not an array of strings".to_string())?;
+            let mut out = Vec::with_capacity(arr.len());
+            for (i, s) in arr.iter().enumerate() {
+                let s = s
+                    .as_str()
+                    .ok_or_else(|| format!("stop[{i}] is not a string"))?;
+                if !s.is_empty() {
+                    out.push(s.to_string());
+                }
+            }
+            out
+        }
+    };
+    // #86: the OpenAI logit_bias map, TOKEN ID -> additive bias. The keys are token
+    // ids as strings (the form llama-server and OpenAI parse); a key that is not an
+    // id of THIS vocabulary is a 400 that names it, a value that is not a number is a
+    // 400 that names it. The bias is kept as the f32 it is applied as: a magnitude
+    // over f32::MAX (e.g. -1e39; strict JSON cannot carry the -Infinity literal) is
+    // -inf there - the hard mask, exactly the form llama-server's `logit_bias_eog`
+    // gives every EOG token under `ignore_eos`.
+    let logit_bias = match obj.get("logit_bias") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(v) => {
+            let map = v.as_object().ok_or_else(|| {
+                "logit_bias is not an object of token id -> bias".to_string()
+            })?;
+            let mut out = Vec::with_capacity(map.len());
+            for (k, val) in map {
+                let tok: usize = k
+                    .parse()
+                    .map_err(|_| format!("logit_bias key {k:?} is not a token id"))?;
+                if tok >= V {
+                    return Err(format!(
+                        "logit_bias key {k:?} is not a token id of this model's vocabulary (0..{V})"
+                    ));
+                }
+                let b = val
+                    .as_f64()
+                    .ok_or_else(|| format!("logit_bias[{k}] is not a number"))?
+                    as f32;
+                if b.is_nan() {
+                    return Err(format!("logit_bias[{k}] is NaN"));
+                }
+                out.push((tok, b));
+            }
+            out.sort_by_key(|&(t, _)| t);
+            out
+        }
+    };
     let top_k = match obj.get("top_k") {
         None | Some(serde_json::Value::Null) => DEFAULT_TOP_K,
         Some(v) => v
@@ -1403,6 +1629,19 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         repeat_penalty: sent("repeat_penalty"),
         frequency_penalty: sent("frequency_penalty"),
         penalty_last_n: sent("penalty_last_n"),
+        tier: TierSent {
+            dry_multiplier: sent("dry_multiplier"),
+            dry_base: sent("dry_base"),
+            dry_allowed_length: sent("dry_allowed_length"),
+            dry_last_n: sent("dry_last_n"),
+            top_n_sigma: sent("top_n_sigma"),
+            typical_p: sent("typical_p"),
+            xtc_probability: sent("xtc_probability"),
+            xtc_threshold: sent("xtc_threshold"),
+            mirostat: sent("mirostat"),
+            mirostat_tau: sent("mirostat_tau"),
+            mirostat_eta: sent("mirostat_eta"),
+        },
     };
     // #81: the thinking budget, in llama-server's integer dialect: absent, null or negative
     // is unrestricted (the behaviour of every release before #81), 0 closes the block
@@ -1454,6 +1693,19 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         repeat_penalty,
         frequency_penalty,
         penalty_last_n,
+        dry_multiplier,
+        dry_base,
+        dry_allowed_length,
+        dry_last_n,
+        top_n_sigma,
+        typical_p,
+        xtc_probability,
+        xtc_threshold,
+        mirostat: mirostat as u8,
+        mirostat_tau,
+        mirostat_eta,
+        stop,
+        logit_bias,
         images,
     })
 }
@@ -1507,10 +1759,15 @@ fn decode_data_url(url: &str) -> Result<(&str, Vec<u8>), String> {
 ///   too, so a greedy request that names them gets a sampler after all - one
 ///   with `temperature <= 0`, whose device draw is `ci[0]`, the penalized
 ///   argmax. A plain greedy request (no penalty fields) is still `None`.
+/// - #86 EXCEPT when `logit_bias` is non-empty: a biased request draws on the
+///   HOST (`chat_generate` reads the row back and runs `apply_logit_bias` first),
+///   so it needs a Sampler even in greedy - the biased argmax. For that greedy
+///   route the data-sheet `presence_penalty` 1.5 is taken OUT unless the body
+///   sent the field: the request asked for a bias, not for a silent penalty.
 fn sampler_from(req: &ChatReq) -> Option<Sampler> {
     let penalties_armed =
         req.penalty_last_n > 0 && (req.repeat_penalty != 1.0 || req.frequency_penalty > 0.0);
-    if !(req.temperature > 0.0) && !penalties_armed {
+    if !(req.temperature > 0.0) && !penalties_armed && req.logit_bias.is_empty() {
         return None;
     }
     let mut s = Sampler::new(req.seed);
@@ -1522,7 +1779,64 @@ fn sampler_from(req: &ChatReq) -> Option<Sampler> {
     s.repeat_penalty = req.repeat_penalty;
     s.frequency_penalty = req.frequency_penalty;
     s.penalty_last_n = req.penalty_last_n;
+    // #85: DRY rides the host sampler's window (the issue's host-first route)
+    s.dry_multiplier = req.dry_multiplier;
+    s.dry_base = req.dry_base;
+    s.dry_allowed_length = req.dry_allowed_length;
+    s.dry_last_n = req.dry_last_n;
+    // #92: the optional tier, all neutral at these request defaults
+    s.top_n_sigma = req.top_n_sigma;
+    s.typical_p = req.typical_p;
+    s.xtc_probability = req.xtc_probability;
+    s.xtc_threshold = req.xtc_threshold;
+    s.mirostat = req.mirostat;
+    s.mirostat_tau = req.mirostat_tau;
+    s.mirostat_eta = req.mirostat_eta;
+    // #86: the greedy bias-only route keeps the pure argmax - only the bias moves
+    // the row. presence is the #68 penalty of a SAMPLED answer (and rides the
+    // llama.cpp window form while the #84 window is armed); extending either to a
+    // greedy request that named no penalty field would change draws nobody asked about.
+    if !(req.temperature > 0.0) && !penalties_armed && !req.sampling_sent.presence_penalty {
+        s.presence_penalty = 0.0;
+    }
     Some(s)
+}
+
+/// - #86: the request's `logit_bias` on ONE logits row, FIRST, before any sampler
+///   reads it - llama.cpp applies the map outside its sampler chain, and
+///   `Sampler::sample` is that chain, so the bias is on the row the chain sees.
+/// - additive: `row[tok] += bias`. An INFINITE bias sets the logit outright, both
+///   signs: `-inf` masks the token (a mask must stay a mask - `-inf + x` is NaN on
+///   an already-masked row, the guard llama.cpp's logit-bias sampler makes for
+///   -INFINITY), `+inf` forces it.
+/// - a token id out of the row's range is skipped, not fatal: the parse already
+///   refused ids out of the VOCABULARY, so this cannot fire today; it is the same
+///   belt every host pass over a row wears.
+/// - pure: the test drives it on hand-built rows, no engine and no socket.
+fn apply_logit_bias(row: &mut [f32], bias: &[(usize, f32)]) {
+    for &(tok, b) in bias {
+        if let Some(l) = row.get_mut(tok) {
+            if b.is_infinite() {
+                *l = b;
+            } else {
+                *l += b;
+            }
+        }
+    }
+}
+
+/// - #86: one HOST draw of the current logits row, with the request's bias on it:
+///   read the row back (1 MB over PCIe, ~0.3 ms), `apply_logit_bias` FIRST, then
+///   the chain (`Sampler::sample`) draws - the order llama.cpp applies the map in.
+/// - `observe` books the drawn id into the sampler's own state (#68 presence set,
+///   #84 window): the bookkeeping the device node does for itself on its path.
+/// - unsafe: one device-to-host copy on the engine's logits buffer
+unsafe fn draw_biased(eng: &Engine, s: &mut Sampler, bias: &[(usize, f32)]) -> usize {
+    let mut row = crow_nest_engine::cuda::dtoh(eng.logits(), V);
+    apply_logit_bias(&mut row, bias);
+    let tok = s.sample(&row);
+    s.observe(tok);
+    tok
 }
 
 /// - what one served request counted and how long each phase took
@@ -2667,6 +2981,10 @@ fn accumulate_args(pieces: &[Emit], acc: &mut Vec<String>) {
 ///   must stay byte-identical.
 /// - The malformed-tool-call path carries its raw markup as `Emit::Content`, so it is
 ///   filtered like any other content - the tag never leaves as content on any path.
+/// - #86: the stop filter runs AFTER the think split, on the CONTENT half alone - a
+///   stop string inside a think block is reasoning and does not end the answer. Once
+///   a stop matched, the rest of this batch is swallowed too: tool fragments of a call
+///   whose markup came after the stop point never reach the wire.
 /// - A piece that is entirely held back or entirely stripped sends NO frame, and is counted
 ///   in neither column: the counters name frames written, which is what they always named.
 fn send_emits(
@@ -2674,13 +2992,18 @@ fn send_emits(
     c: &ChunkCtx,
     pieces: &[Emit],
     think: &mut ThinkFilter,
+    stops: &mut StopStrings,
     counts: &mut Chunks,
 ) -> bool {
     for e in pieces {
+        // #86: the stop string ended this answer; everything after it is cut
+        if stops.hit() {
+            return true;
+        }
         match e {
             Emit::Content(t) => {
                 let split = think.push(t);
-                if !send_split(sink, c, &split, counts) {
+                if !send_split(sink, c, &split, stops, counts) {
                     return false;
                 }
             }
@@ -2695,8 +3018,19 @@ fn send_emits(
     true
 }
 
-/// #67: the two halves of one filtered piece, in wire order: reasoning first, then content
-fn send_split(sink: &mut dyn ChatSink, c: &ChunkCtx, split: &Split, counts: &mut Chunks) -> bool {
+/// - #67: the two halves of one filtered piece, in wire order: reasoning first, then content
+/// - #86: the content half passes the stop filter LAST - the held tail is why a frame
+///   may be shorter than the piece, and a hit is why it may not come at all
+fn send_split(
+    sink: &mut dyn ChatSink,
+    c: &ChunkCtx,
+    split: &Split,
+    stops: &mut StopStrings,
+    counts: &mut Chunks,
+) -> bool {
+    if stops.hit() {
+        return true;
+    }
     if !split.reasoning.is_empty() {
         counts.reasoning += 1;
         if !sink.on_reasoning(c, &split.reasoning) {
@@ -2704,9 +3038,12 @@ fn send_split(sink: &mut dyn ChatSink, c: &ChunkCtx, split: &Split, counts: &mut
         }
     }
     if !split.content.is_empty() {
-        counts.content += 1;
-        if !sink.on_emit(c, &Emit::Content(split.content.clone())) {
-            return false;
+        let piece = stops.push(&split.content);
+        if !piece.is_empty() {
+            counts.content += 1;
+            if !sink.on_emit(c, &Emit::Content(piece)) {
+                return false;
+            }
         }
     }
     true
@@ -3152,8 +3489,37 @@ fn chat_generate(
     if let Some(s) = sampler.as_mut() {
         s.observe_prompt(ids);
     }
-    match &sampler {
-        Some(s) => {
+    // #86: a biased request draws on the HOST - the row is read back, biased FIRST
+    // (llama.cpp applies the map outside the chain), then `Sampler::sample` draws.
+    // The device `sample_k` node has no bias input; its twin through the sampler's
+    // per-request mask/count buffers is the documented FOLLOW-UP of this issue, not
+    // built here. The host route is the reference path `CROW_SAMPLE_HOST=1` ran.
+    let biased = !req.logit_bias.is_empty();
+    match (&mut sampler, biased) {
+        (Some(s), true) => {
+            // the device sampler must be OUT: `decode_step` samples whenever it is
+            // Some (gen.rs:2905-2909), and this request's draw happens on the host
+            srv.eng.park_sampler(&mut srv.parked_sampler);
+            // unsafe: one logits row read back (1 MB, ~0.3 ms), the price of the route
+            next = unsafe { draw_biased(srv.eng, s, &req.logit_bias) };
+            tracing::info!(target: "chat",
+                "[chat] logit_bias: {} entries (request), drawing on the HOST sampler \
+                 (#86): the row is read back, biased first, then the chain; the device \
+                 mask-path twin is the follow-up",
+                req.logit_bias.len()
+            );
+            let sent = req.sampling_sent;
+            if s.temperature > 0.0 {
+                tracing::info!(target: "chat", "{}", sampling_line(s, sent));
+            } else {
+                tracing::info!(target: "chat",
+                    "[chat] greedy with logit_bias (#86): the biased argmax, presence_penalty {} ({})",
+                    s.presence_penalty,
+                    SamplingSent::tag(sent.presence_penalty)
+                );
+            }
+        }
+        (Some(s), false) => {
             // the device buffers a greedy request parked come back here, nothing is reallocated
             srv.eng.unpark_sampler(&mut srv.parked_sampler);
             // unsafe: device uploads and one eager sampler launch, as parity does
@@ -3187,7 +3553,7 @@ fn chat_generate(
                 );
             }
         }
-        None => {
+        (None, _) => {
             // greedy is the A4 path: `decode_step` samples whenever `dev_sampler` is Some
             // (gen.rs:2905-2909) and `reset_to_zero` does not clear it, so it is taken out here
             srv.eng.park_sampler(&mut srv.parked_sampler);
@@ -3206,6 +3572,12 @@ fn chat_generate(
     // partial `</think` back across deltas, and it never touches an id: the loop below
     // samples and pushes the same ids it pushed before this filter existed.
     let mut think = ThinkFilter::for_request(req.enable_thinking);
+    // #86: the stop-string filter of THIS request. It is the LAST gate on the CONTENT
+    // channel, after the think split, and it holds a tail that might still become a
+    // stop string - the tool-call hold on arbitrary strings - so no half of a stop
+    // string ever reaches the wire. It never touches an id either: the ids stop on
+    // `EOS_IDS` and `max_tokens` as before, the TEXT stops on the request's strings.
+    let mut stops = StopStrings::new(&req.stop);
     let mut counts = Chunks::default();
 
     // the id/created/model triple of this response, once
@@ -3315,8 +3687,17 @@ fn chat_generate(
                 emitted = full.len();
                 let pieces = ts.feed(delta);
                 accumulate_args(&pieces, &mut args_acc);
-                if !send_emits(sink, &cx, &pieces, &mut think, &mut counts) {
+                if !send_emits(sink, &cx, &pieces, &mut think, &mut stops, &mut counts) {
                     aborted = true;
+                    break;
+                }
+                // #86: a stop string ended this answer. The filter swallowed the stop
+                // and everything after it; no further decode step runs, and the finish
+                // is `stop` - unless a closed tool call says `tool_calls` after the
+                // loop, the precedence EOS already has. This break sits ABOVE the
+                // budget counter on purpose: the answer is over, nothing else counts.
+                if stops.hit() {
+                    finish = "stop";
                     break;
                 }
             }
@@ -3364,6 +3745,17 @@ fn chat_generate(
             }
             let t = *t_dec.get_or_insert_with(Instant::now);
             next = unsafe { srv.eng.decode_step(srv.cnq, next as i64) };
+            // #86: a biased request re-draws the step on the host. `decode_step`
+            // returned the plain argmax (the device sampler is parked), the row it
+            // left is this position's distribution, and the biased draw replaces
+            // the id the same way the device node would have drawn it - the
+            // readback is the one cost the host route pays per token.
+            if biased {
+                if let Some(s) = sampler.as_mut() {
+                    // unsafe: one logits row read back, as `draw_biased` does
+                    next = unsafe { draw_biased(srv.eng, s, &req.logit_bias) };
+                }
+            }
             decode_ms = t.elapsed().as_secs_f64() * 1e3;
         }
     }
@@ -3393,7 +3785,7 @@ fn chat_generate(
         };
         malformed = ts.finish(&mut pieces);
         accumulate_args(&pieces, &mut args_acc);
-        if !send_emits(sink, &cx, &pieces, &mut think, &mut counts) {
+        if !send_emits(sink, &cx, &pieces, &mut think, &mut stops, &mut counts) {
             aborted = true;
         }
     }
@@ -3401,9 +3793,40 @@ fn chat_generate(
     // is TEXT, and it leaves here, so no byte of the answer is lost to the filter.
     if !aborted {
         let tail = think.flush();
-        if !send_split(sink, &cx, &tail, &mut counts) {
+        if !send_split(sink, &cx, &tail, &mut stops, &mut counts) {
             aborted = true;
         }
+    }
+    // #86: what the STOP filter is still holding back - the same rule. A tail that
+    // might still have become a stop string but never did is TEXT, and it leaves
+    // here, so no byte of the answer is lost to the hold. After a hit this is empty
+    // by construction: everything after the stop point was swallowed.
+    if !aborted {
+        let stail = stops.flush();
+        if !stail.is_empty() {
+            counts.content += 1;
+            if !sink.on_emit(&cx, &Emit::Content(stail)) {
+                aborted = true;
+            }
+        }
+    }
+    // #86: a stop that completed in the FINAL tail - on the last token, or a held
+    // prefix resolving at EOS - ends the answer as `stop` even when `max_tokens`
+    // was spent making it: the sequence IS in the generated text. A stop that hit
+    // inside the loop already set `finish` at its break.
+    if !aborted && stops.hit() && finish == "length" {
+        finish = "stop";
+    }
+    // #86: one line per stopped answer, the shape `toolcall`'s dropped line set: the
+    // string, the content byte it landed on, and what stayed off the wire.
+    if stops.hit() && !aborted {
+        tracing::info!(target: "chat",
+            "[chat] stopped on a stop string (#86): {:?} at content byte {}, {} \
+             byte(s) swallowed - the sequence and everything after it stayed off the wire",
+            stops.matched().unwrap_or_default(),
+            stops.matched_at(),
+            stops.dropped()
+        );
     }
     if think.stripped() > 0 {
         tracing::info!(target: "chat",
@@ -3433,12 +3856,15 @@ fn chat_generate(
     // #29 A7: a closed call answers `tool_calls`; a malformed one keeps `stop` / `length`.
     // `ToolStream::finish` closes a call whose `</function>` arrived, so EOS in the tail is
     // a complete call, not a malformed one (#29 review).
+    // #86: a stop-string hit OVERRIDES the closed-call word - the call's fragments were
+    // swallowed with everything after the stop, so naming `tool_calls` would promise a
+    // call the client never received.
     if malformed {
         tracing::warn!(target: "chat",
             "[chat] MALFORMED tool call: no </function> or no name before the end; \
              the raw markup went out as content, finish stays {finish}"
         );
-    } else if ts.closed() > 0 {
+    } else if ts.closed() > 0 && !stops.hit() {
         finish = "tool_calls";
     }
     if ts.dropped() > 0 {
@@ -4798,7 +5224,8 @@ mod tests {
         assert_eq!(
             crow.sampling_sent,
             SamplingSent { top_p: true, top_k: false, presence_penalty: false, seed: false, min_p: true,
-                           repeat_penalty: false, frequency_penalty: false, penalty_last_n: false }
+                           repeat_penalty: false, frequency_penalty: false, penalty_last_n: false,
+                           tier: TierSent::default() }
         );
         // the values behind the two flags that are false are this file's, not the client's
         assert_eq!(crow.presence_penalty, DEFAULT_PRESENCE);
@@ -4814,7 +5241,8 @@ mod tests {
         assert_eq!(
             full.sampling_sent,
             SamplingSent { top_p: true, top_k: true, presence_penalty: true, seed: true, min_p: false,
-                           repeat_penalty: false, frequency_penalty: false, penalty_last_n: false }
+                           repeat_penalty: false, frequency_penalty: false, penalty_last_n: false,
+                           tier: TierSent::default() }
         );
 
         // an explicit null is an absent field here too, so the tag never contradicts the value
@@ -4952,6 +5380,250 @@ mod tests {
         assert!(sampler_from(&mk(r#","temperature":0,"repeat_penalty":1.1,"penalty_last_n":0"#)).is_none());
         // repeat 1.0 + freq 0 with a window is neutral: still plain greedy
         assert!(sampler_from(&mk(r#","temperature":0,"penalty_last_n":64"#)).is_none());
+    }
+
+    // ------------------------------- #86: OpenAI stop strings + logit_bias (host route)
+
+    const HI: &str = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+
+    #[test]
+    fn stop_parses_in_both_wire_forms_and_refuses_garbage_with_named_reasons() {
+        // the array form, exactly as OpenAI and llama-server document it
+        let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stop":["\n\n","END"]}"#).unwrap();
+        assert_eq!(r.stop, vec!["\n\n".to_string(), "END".to_string()]);
+        // the one-stop form: a bare string is the same request (the OpenAI contract
+        // spells `stop: string | string[]`)
+        let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stop":"END"}"#).unwrap();
+        assert_eq!(r.stop, vec!["END".to_string()]);
+        // empty entries drop, the rest keep their order (StopStrings does the sort)
+        let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stop":["","END",""]}"#).unwrap();
+        assert_eq!(r.stop, vec!["END".to_string()]);
+        // absent, null and the empty array are the pre-#86 default: no filter at all
+        for body in [
+            HI.to_string(),
+            r#"{"messages":[{"role":"user","content":"hi"}],"stop":null}"#.to_string(),
+            r#"{"messages":[{"role":"user","content":"hi"}],"stop":[]}"#.to_string(),
+        ] {
+            assert!(parse_chat(body.as_bytes()).unwrap().stop.is_empty(), "{body}");
+        }
+        // garbage is a 400 that NAMES the field and the entry, house style
+        let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stop":7}"#).unwrap_err();
+        assert!(e.contains("stop is not an array of strings"), "{e}");
+        let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stop":[1]}"#).unwrap_err();
+        assert!(e.contains("stop[0] is not a string"), "{e}");
+        let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stop":["a",null]}"#).unwrap_err();
+        assert!(e.contains("stop[1] is not a string"), "{e}");
+        let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stop":{"a":1}}"#).unwrap_err();
+        assert!(e.contains("stop is not an array of strings"), "{e}");
+    }
+
+    #[test]
+    fn logit_bias_parses_token_ids_strictly_and_sorts_by_token() {
+        // token ids as string keys, numeric biases; -1e39/1e39 are +-inf once f32
+        let r = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"248046":2.5,"5":-1e39,"7":1e39}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            r.logit_bias,
+            vec![(5, f32::NEG_INFINITY), (7, f32::INFINITY), (248046, 2.5)]
+        );
+        // absent, null and the empty map are the pre-#86 default: no bias at all
+        for body in [
+            HI.to_string(),
+            r#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":null}"#.to_string(),
+            r#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{}}"#.to_string(),
+        ] {
+            assert!(parse_chat(body.as_bytes()).unwrap().logit_bias.is_empty(), "{body}");
+        }
+        // garbage is a 400 that NAMES the key or the value
+        let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":[1]}"#).unwrap_err();
+        assert!(e.contains("logit_bias is not an object"), "{e}");
+        let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"five":1.0}}"#).unwrap_err();
+        assert!(e.contains("logit_bias key \"five\" is not a token id"), "{e}");
+        // the vocabulary ends one below V: the first id outside it is a 400, not a
+        // silent no-op the caller would read as a banned token
+        let over = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"logit_bias":{{"{V}":1.0}}}}"#);
+        let e = parse_chat(over.as_bytes()).unwrap_err();
+        assert!(e.contains("is not a token id of this model's vocabulary"), "{e}");
+        let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"5":"high"}}"#).unwrap_err();
+        assert!(e.contains("logit_bias[5] is not a number"), "{e}");
+        let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"5":true}}"#).unwrap_err();
+        assert!(e.contains("logit_bias[5] is not a number"), "{e}");
+        // strict JSON cannot carry the -Infinity literal: the BODY refuses it before
+        // the field parser ever runs, which is why -1e39 is the mask's wire form
+        assert!(parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"5":-Infinity}}"#).is_err());
+    }
+
+    #[test]
+    fn a_bias_is_additive_and_minus_infinity_masks() {
+        // additive, on the raw row, before any sampler reads it
+        let mut row = [1.0, 2.0, 3.0];
+        apply_logit_bias(&mut row, &[(0, 5.0)]);
+        assert_eq!(row, [6.0, 2.0, 3.0]);
+        // a neutral sampler to see the row the way the chain sees it: greedy argmax
+        let greedy = || {
+            let mut s = Sampler::new(0);
+            s.temperature = 0.0;
+            s.presence_penalty = 0.0;
+            s
+        };
+        // promote: a positive bias moves the argmax to the biased token
+        let mut row = [1.0, 2.0];
+        apply_logit_bias(&mut row, &[(0, 3.0)]);
+        assert_eq!(greedy().sample(&row), 0, "the bias promoted token 0");
+        // ban: -inf masks it, the runner-up wins - the additive -100 of the OpenAI
+        // convention is a STRONG ban, this is the absolute one
+        let mut row = [1.0, 2.0];
+        apply_logit_bias(&mut row, &[(0, f32::NEG_INFINITY)]);
+        assert_eq!(row[0], f32::NEG_INFINITY);
+        assert_eq!(greedy().sample(&row), 1, "the masked token cannot win");
+        // a mask stays a mask: no bias turns it into a NaN, whatever the order
+        for bias in [&[(0usize, 5.0f32)][..], &[(0usize, f32::NEG_INFINITY)][..]] {
+            let mut m = [f32::NEG_INFINITY, 1.0];
+            apply_logit_bias(&mut m, bias);
+            apply_logit_bias(&mut m, &[(0, f32::NEG_INFINITY)]);
+            assert_eq!(m[0], f32::NEG_INFINITY, "a mask is never a NaN");
+        }
+        // interaction with EOS: masking BOTH stop ids is the ignore_eos shape
+        // (llama-server's logit_bias_eog) - the draw steps aside instead of ending.
+        // VOCAB-sized row: the EOS ids are real token ids (an 8-slot fixture
+        // indexed 248046 out of bounds - the fleet's second OOM-adjacent test bug).
+        let mut eosrow = vec![0.0f32; crow_nest_engine::geo::V];
+        eosrow[EOS_IDS[0]] = 9.0;
+        eosrow[EOS_IDS[1]] = 8.0;
+        eosrow[3] = 7.0;
+        let mask: Vec<(usize, f32)> = EOS_IDS.iter().map(|&t| (t, f32::NEG_INFINITY)).collect();
+        apply_logit_bias(&mut eosrow, &mask);
+        assert_eq!(greedy().sample(&eosrow), 3, "both EOS ids masked, next best wins");
+        // and the mask arrives from the WIRE as -1e39, not as a literal -Infinity
+        let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"5":-1e39}}"#).unwrap();
+        assert_eq!(r.logit_bias, vec![(5, f32::NEG_INFINITY)]);
+    }
+
+    #[test]
+    fn a_biased_request_draws_on_the_host_even_in_greedy() {
+        let mk = |t: &str| parse_chat(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{t}}}"#).as_bytes()).unwrap();
+        // greedy + bias: the biased argmax, on the host route; the data-sheet
+        // presence 1.5 is OUT unless the body sent it (a bias-only request asked
+        // for the bias, not for a silent penalty change)
+        let s = sampler_from(&mk(r#","logit_bias":{"10":1.0}"#)).expect("bias arms a host sampler in greedy");
+        assert!(s.temperature <= 0.0);
+        assert_eq!(s.presence_penalty, 0.0);
+        // presence sent is honored, exactly as sent
+        let s = sampler_from(&mk(r#","logit_bias":{"10":1.0},"presence_penalty":0.7"#)).unwrap();
+        assert_eq!(s.presence_penalty, 0.7);
+        // sampled + bias keeps the #28/#68 sampled contract, presence included
+        let s = sampler_from(&mk(r#","temperature":1.0,"logit_bias":{"10":-2.5}"#)).unwrap();
+        assert_eq!(s.temperature, 1.0);
+        assert_eq!(s.presence_penalty, DEFAULT_PRESENCE);
+        // greedy + penalties + bias: the #84 window keeps its own presence rule
+        // (the request's default 1.5 rides the windowed form); the bias rides the host
+        let s = sampler_from(&mk(r#","logit_bias":{"10":1.0},"repeat_penalty":1.1"#)).unwrap();
+        assert!(s.win_armed());
+        assert_eq!(s.presence_penalty, DEFAULT_PRESENCE);
+        // and the plain-greedy pin of #84 stands: no bias, no penalties, no sampler
+        assert!(sampler_from(&mk("")).is_none());
+    }
+
+    #[test]
+    fn stop_strings_apply_to_the_content_after_the_think_split() {
+        // the reasoning half carries "END" and does NOT stop the answer; the same
+        // four letters in the content half do - the documented channel contract
+        let pieces = vec![
+            Emit::Content("<think>plan END inside</think>the answ".to_string()),
+            Emit::Content("er END tail".to_string()),
+        ];
+        let mut col = CollectSink::default();
+        let mut think = ThinkFilter::for_request(false);
+        let mut stops = StopStrings::new(&["END".to_string()]);
+        let mut counts = Chunks::default();
+        assert!(send_emits(
+            &mut col,
+            &ChunkCtx::new("i", 1, "m"),
+            &pieces,
+            &mut think,
+            &mut stops,
+            &mut counts
+        ));
+        assert_eq!(col.reasoning, "plan END inside", "reasoning is never stop-scanned");
+        assert_eq!(col.content, "the answer ", "everything before the stop, byte exact");
+        assert!(stops.hit());
+        assert_eq!(stops.matched(), Some("END"));
+        assert_eq!(stops.matched_at(), "the answer ".len());
+        assert_eq!(stops.dropped(), "END tail".len());
+        // the frame counters name frames WRITTEN: one reasoning, two content
+        assert_eq!((counts.content, counts.reasoning), (2, 1));
+        // the held-tail flush after the hit is empty, and nothing more may leave
+        assert_eq!(stops.flush(), "");
+    }
+
+    #[test]
+    fn a_stop_hit_swallows_the_tool_fragments_that_followed_it() {
+        // the stop ended this answer inside the batch: the call whose markup came
+        // after the stop point never reaches the wire, so `finish_reason` has no
+        // call to promise (`chat_generate` keeps `stop` over `tool_calls`)
+        let pieces = vec![
+            Emit::Content("before ".to_string()),
+            Emit::Content("END {".to_string()),
+            Emit::Call { index: 0, id: "call_0".to_string(), name: "read_file".to_string() },
+            Emit::Args { index: 0, text: "{\"path\":\"a.md\"}".to_string() },
+        ];
+        let mut col = CollectSink::default();
+        let mut think = ThinkFilter::for_request(false);
+        let mut stops = StopStrings::new(&["END".to_string()]);
+        let mut counts = Chunks::default();
+        assert!(send_emits(
+            &mut col,
+            &ChunkCtx::new("i", 1, "m"),
+            &pieces,
+            &mut think,
+            &mut stops,
+            &mut counts
+        ));
+        assert_eq!(col.content, "before ");
+        assert!(col.calls.is_empty(), "no fragment of a call after the stop point");
+        assert_eq!(counts.tool, 0);
+    }
+
+    #[test]
+    fn without_stop_and_logit_bias_the_stream_is_the_pre_86_bytes() {
+        // the default of record: both fields absent, the parse carries nothing, and
+        // the stream gate is the think filter alone - byte for byte
+        let r = parse_chat(HI.as_bytes()).unwrap();
+        assert!(r.stop.is_empty());
+        assert!(r.logit_bias.is_empty());
+        assert!(sampler_from(&r).is_none(), "an unbiased greedy request is the A4 path");
+        let pieces = vec![
+            Emit::Content("Hello".to_string()),
+            Emit::Content(" world <tool_call>".to_string()),
+            Emit::Content(" done".to_string()),
+        ];
+        let mut col = CollectSink::default();
+        let mut think = ThinkFilter::new();
+        let mut stops = StopStrings::new(&r.stop);
+        let mut counts = Chunks::default();
+        assert!(send_emits(&mut col, &ChunkCtx::new("i", 1, "m"), &pieces, &mut think, &mut stops, &mut counts));
+        // the pre-#86 bytes: the think split of the same pieces, emitted directly
+        let mut want_content = String::new();
+        let mut want_reasoning = String::new();
+        let mut think2 = ThinkFilter::new();
+        for p in &pieces {
+            if let Emit::Content(t) = p {
+                let s = think2.push(t);
+                want_content.push_str(&s.content);
+                want_reasoning.push_str(&s.reasoning);
+            }
+        }
+        let tail = think2.flush();
+        want_content.push_str(&tail.content);
+        want_reasoning.push_str(&tail.reasoning);
+        assert_eq!(col.content, want_content);
+        assert_eq!(col.reasoning, want_reasoning);
+        // the stop gate held nothing, matched nothing, swallowed nothing
+        assert!(!stops.hit());
+        assert_eq!(stops.flush(), "");
+        assert_eq!(stops.dropped(), 0);
     }
 
     // #68 (2026-09-18): the cross-turn repeat counter. Four tests, all pure - the ring is
@@ -5982,8 +6654,9 @@ mod tests {
         ];
         let mut col = CollectSink::default();
         let mut think = ThinkFilter::new();
+        let mut no_stops = StopStrings::default();
         let mut counts = Chunks::default();
-        assert!(send_emits(&mut col, &ChunkCtx::new("i", 1, "m"), &pieces, &mut think, &mut counts));
+        assert!(send_emits(&mut col, &ChunkCtx::new("i", 1, "m"), &pieces, &mut think, &mut no_stops, &mut counts));
         assert_eq!(col.content, "答え");
         assert_eq!(col.calls[0].arguments, "{\"content\":\"</think>\"}");
         assert_eq!(think.stripped(), 1);
@@ -5998,6 +6671,7 @@ mod tests {
             &ChunkCtx::new("i", 1, "m"),
             &[Emit::Content("<think>why</think>then".to_string())],
             &mut f2,
+            &mut no_stops,
             &mut c2
         ));
         let text = String::from_utf8(buf).expect("utf8 frames");
@@ -6738,9 +7412,10 @@ Red is #FF0000."), "{off}");
         let mut sse = SseSink::new(&mut buf);
         let (mut sf, mut cf) = (ThinkFilter::new(), ThinkFilter::new());
         let (mut sc, mut cc) = (Chunks::default(), Chunks::default());
-        assert!(send_emits(&mut sse, &ChunkCtx::new("id1", 5, "crow"), &pieces, &mut sf, &mut sc));
+        let (mut sn, mut cn) = (StopStrings::default(), StopStrings::default());
+        assert!(send_emits(&mut sse, &ChunkCtx::new("id1", 5, "crow"), &pieces, &mut sf, &mut sn, &mut sc));
         let mut col = CollectSink::default();
-        assert!(send_emits(&mut col, &ChunkCtx::new("id1", 5, "crow"), &pieces, &mut cf, &mut cc));
+        assert!(send_emits(&mut col, &ChunkCtx::new("id1", 5, "crow"), &pieces, &mut cf, &mut cn, &mut cc));
         // the same loop counts the same chunks for both sinks
         assert_eq!(sc, cc);
         assert_eq!((sc.content, sc.reasoning, sc.tool), (2, 0, 3));
@@ -6838,7 +7513,7 @@ Red is #FF0000."), "{off}");
                 text: "1}".to_string(),
             },
         ];
-        assert!(send_emits(&mut col, &ChunkCtx::new("i", 1, "m"), &pieces, &mut think, &mut counts));
+        assert!(send_emits(&mut col, &ChunkCtx::new("i", 1, "m"), &pieces, &mut think, &mut StopStrings::default(), &mut counts));
         assert_eq!(col.calls.len(), 2);
         assert_eq!(col.calls[0].arguments, "{}");
         assert_eq!(col.calls[1].name, "b");

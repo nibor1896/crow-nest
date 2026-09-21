@@ -27,6 +27,7 @@
 //!   derives from, the chunk and adapt policies, `env_parse`.
 //! - [`tokenizer`]: the in-engine HF tokenizer and chat template (`bin/serve` only).
 //! - [`toolcall`]: the streaming `<tool_call>` parser (`bin/serve` only).
+//! - [`stopstr`]: the OpenAI stop-string hold (`bin/serve` only, #86).
 //!
 //! L1 — on the leaves:
 //!
@@ -86,6 +87,9 @@ pub mod tokenizer;
 // #29 A7 review: the tool-call parser of `bin/serve.rs`, extracted so it is unit tested
 // in the library and `serve.rs` keeps only the chunk builders and the call sites
 pub mod toolcall;
+// #86: the OpenAI stop-string filter of `bin/serve.rs`, the same tail-hold
+// `toolcall::find_marker` gives `<tool_call>`, on arbitrary strings
+pub mod stopstr;
 pub mod reset;
 // #31 A9: the prefix cache (spec section 7) - snapshot, rollback and the id prefix rule
 pub mod cache;

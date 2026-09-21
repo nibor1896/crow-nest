@@ -12,7 +12,115 @@
 
 use crate::cuda;
 use crate::geo::*;
+use crate::meta::RopeKind;
+use crate::meta::RopeScaling;
 use cudarc::driver::sys::CUdeviceptr;
+
+// ---------------- #96: rope scaling (YaRN / NTK / linear) ----------------
+
+/// How the per-pair angle blends, from the `rope_scaling` the boot parsed.
+/// `Plain` is the default path; `Interp` is naive linear scaling; `Yarn`
+/// carries (freq_scale, corr_lo, corr_hi) — the low/high-frequency ramp.
+enum Blend {
+    Plain,
+    Interp(f32),
+    Yarn(f32, f32, f32),
+}
+
+/// llama.cpp `rope_yarn_ramp` verbatim: 1 - clamp((pair - low) / max(0.001,
+/// high - low), 0, 1). 1 at and below `low` (extrapolate), 0 at and above
+/// `high` (interpolate), linear between.
+fn yarn_ramp(pair: usize, low: f32, high: f32) -> f32 {
+    let y = (pair as f32 - low) / (high - low).max(0.001);
+    1.0 - y.clamp(0.0, 1.0)
+}
+
+/// The boot RoPE table (#96), pure host f32 math so the byte-identity gate can
+/// build it both ways in a unit test with no GPU and no container.
+///
+/// The `None` / default arm is the loop this replaces, VERBATIM — theta 1e7
+/// (`10_000_000f32.powf(-(2j)/64)`), `t · inv`, f32 cos/sin, t-major layout —
+/// pinned byte-identical by `the_unscaled_table_is_byte_identical_to_the_loop`.
+///
+/// The scaled arms are the llama.cpp reference math (ggml `rope_yarn`, MIT,
+/// jquesnelle/yarn — the YaRN paper's implementation), with the YaRN
+/// extrapolation factor pinned at the llama.cpp default 1.0:
+/// - **yarn**: per pair j, `theta = interp·(1−mix) + extrap·mix` with
+///   `interp = freq_scale·extrap` and `mix = ramp(j)` over the corr range from
+///   beta_fast/beta_slow — the high-frequency pairs below `lo` keep their
+///   trained angles, everything above `hi` interpolates;
+/// - **linear**: `freq_scale·extrap` on every pair (the naive form the paper
+///   shows collapsing — kept because it is one line and one config away);
+/// - **ntk-aware**: theta rewritten to `base·factor^(dim/(dim−2))`, every pair
+///   otherwise untouched (what the llama.cpp converter bakes into the base).
+///
+/// The mscale is deliberately NOT folded in here: it belongs to the attention
+/// temperature, which lives in the kernels (`d_attn_scale`, set once at boot).
+///
+/// NOTE the table is shared: `rope`/`rope_p` (text attention) AND `rope64`
+/// (the QSA indexer keys) read these cos/sin rows, so a scaled table scales
+/// both — the single-table consequence, flagged in docs/acceptance/issue-96.md.
+pub fn build_rope_table(context: usize, scaling: Option<&RopeScaling>) -> (Vec<f32>, Vec<f32>) {
+    let dim = 2 * ROPE_PAIRS; // 64 rotary dims of the 256-dim head
+    let base = match scaling {
+        Some(s) if s.kind == RopeKind::NtkAware => s.ntk_base(dim, 10_000_000f64) as f32,
+        _ => 10_000_000f32,
+    };
+    let blend = match scaling {
+        None | Some(&RopeScaling { kind: RopeKind::Default, .. }) => Blend::Plain,
+        Some(&RopeScaling { kind: RopeKind::Linear, factor, .. }) => {
+            Blend::Interp((1.0 / factor) as f32)
+        }
+        Some(s) if s.kind == RopeKind::Yarn => {
+            let (lo, hi) = s.yarn_corr_range(dim, 10_000_000f64);
+            Blend::Yarn(s.freq_scale(), lo, hi)
+        }
+        Some(_) => Blend::Plain, // NtkAware: handled by the base above
+    };
+    let mut cos_h = vec![0f32; context * ROPE_PAIRS];
+    let mut sin_h = vec![0f32; context * ROPE_PAIRS];
+    for t in 0..context {
+        for j in 0..ROPE_PAIRS {
+            let inv = base.powf(-(2.0 * j as f32) / dim as f32);
+            let extrap = t as f32 * inv;
+            let f = match blend {
+                Blend::Plain => extrap,
+                Blend::Interp(fs) => fs * extrap,
+                Blend::Yarn(fs, lo, hi) => {
+                    let mix = yarn_ramp(j, lo, hi); // ext_factor 1.0 (llama.cpp yarn default)
+                    (fs * extrap) * (1.0 - mix) + extrap * mix
+                }
+            };
+            cos_h[t * ROPE_PAIRS + j] = f.cos();
+            sin_h[t * ROPE_PAIRS + j] = f.sin();
+        }
+    }
+    (cos_h, sin_h)
+}
+
+/// #96 phase 3 — the exceed-training-context warning, a pure function so every
+/// side of the decision is unit-testable without a GPU. Fires when the
+/// effective context runs past the positions the checkpoint was trained on AND
+/// no scaling is armed: positions beyond the training window walk RoPE
+/// frequencies the model never saw, and the failure mode is silent quality
+/// collapse — llama.cpp's "n_ctx > n_ctx_train … quality will be degraded"
+/// discipline, one loud boot WARN, not an error.
+pub fn exceed_training_warning(
+    context: usize,
+    training: Option<u64>,
+    scaling: Option<&RopeScaling>,
+) -> Option<String> {
+    let training = training?;
+    let armed = scaling.is_some_and(|s| s.kind != RopeKind::Default);
+    if armed || context as u64 <= training {
+        return None;
+    }
+    Some(format!(
+        "context {} exceeds the {} positions this checkpoint was trained on and no rope_scaling is armed - \
+output quality WILL be degraded past position {training} (issue #96: configure rope_scaling in the checkpoint config)",
+        context, training
+    ))
+}
 
 /// The planner refusal text (spec 2.1) as a pure function, factored by #10b
 /// (2026-09-13) so the refusal path carries a panic-message test that needs
@@ -297,16 +405,18 @@ impl ThreeStates {
             "GDN state {:9.1} MB  (36 × S[48][128][128] + conv[10240][3], f32, fixed)",
             (sizes.gdn_s_bytes + sizes.gdn_conv_bytes) as f64 / MIB
         ));
-        let mut cos_h = vec![0f32; cfg.context * ROPE_PAIRS];
-        let mut sin_h = vec![0f32; cfg.context * ROPE_PAIRS];
-        for t in 0..cfg.context {
-            for j in 0..ROPE_PAIRS {
-                let inv = 10_000_000f32.powf(-(2.0 * j as f32) / 64.0);
-                let f = t as f32 * inv;
-                cos_h[t * ROPE_PAIRS + j] = f.cos();
-                sin_h[t * ROPE_PAIRS + j] = f.sin();
-            }
+        // ---- RoPE table (#96: the builder is factored out below; None scaling
+        // builds the byte-identical table the inline loop always built) ----
+        // phase 3 FIRST (the cheap hazard close): effective context past the
+        // training window with no scaling armed is one loud boot WARN — the
+        // llama.cpp "quality will be degraded" discipline. `None` training
+        // context (a boot that never saw a config.json — the selftest package)
+        // stays silent.
+        let scaling = crate::meta::boot_rope_scaling();
+        if let Some(w) = exceed_training_warning(cfg.context, crate::meta::boot_training_context(), scaling.as_ref()) {
+            tracing::warn!(target: "rope", "[rope] {w}");
         }
+        let (cos_h, sin_h) = build_rope_table(cfg.context, scaling.as_ref());
         let cos = cuda::to_f32_dev(&cos_h);
         let sin = cuda::to_f32_dev(&sin_h);
         drop(cos_h);
@@ -316,6 +426,27 @@ impl ThreeStates {
             sizes.rope_bytes as f64 / MIB,
             cfg.context
         ));
+        // the armed line: what the config asked for and what was derived from
+        // it, next to the table it changed (silent — nothing is armed by default)
+        if let Some(s) = scaling.filter(|s| s.kind != crate::meta::RopeKind::Default) {
+            let detail = match s.kind {
+                crate::meta::RopeKind::Yarn => {
+                    let (lo, hi) = s.yarn_corr_range(2 * ROPE_PAIRS, 10_000_000f64);
+                    format!(
+                        "YaRN: factor {} ({} training positions -> {}), corr dims [{lo}, {hi}] of {} (beta {} / {}), mscale {:.4} on the attention scale",
+                        s.factor, s.original_context, cfg.context, 2 * ROPE_PAIRS, s.beta_fast, s.beta_slow, s.mscale()
+                    )
+                }
+                crate::meta::RopeKind::Linear => {
+                    format!("linear: factor {} (every pair interpolated by 1/{})", s.factor, s.factor)
+                }
+                crate::meta::RopeKind::NtkAware => {
+                    format!("ntk-aware: theta 1e7 -> {:.0}", s.ntk_base(2 * ROPE_PAIRS, 10_000_000f64))
+                }
+                crate::meta::RopeKind::Default => unreachable!("filtered above"),
+            };
+            rep.lines.push(format!("[rope] rope_scaling armed — {detail}"));
+        }
 
         let free1 = cuda::free_vram_bytes();
         let measured = free0 - free1;
@@ -564,5 +695,139 @@ mod tests_10b {
             m.contains("shrink the chunk/scratch, the PLE cache, or the keep-set (spec 2.1)"),
             "escape-hatch clause moved: {m}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_96 {
+    //! #96: the scaled rope-table builder and the exceed-training-context warn,
+    //! pure host math — no GPU, no container. The first test is THE gate: the
+    //! refactor that factored the boot table into `build_rope_table` changed
+    //! not one byte of the default path, and a present-but-"default"
+    //! rope_scaling object configures nothing either.
+    use super::*;
+
+    fn scaling(kind: RopeKind) -> RopeScaling {
+        RopeScaling {
+            kind,
+            factor: 4.0,
+            original_context: 262_144,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            attention_factor: None,
+        }
+    }
+
+    /// the pre-#96 boot loop, copied VERBATIM from the manager.rs that stood
+    /// before the refactor (theta 1e7, f32 powf/cos/sin, t-major): the oracle
+    /// every byte-identity claim below is measured against
+    #[test]
+    fn the_unscaled_table_is_byte_identical_to_the_loop() {
+        let context = 8192;
+        let mut cos_ref = vec![0f32; context * ROPE_PAIRS];
+        let mut sin_ref = vec![0f32; context * ROPE_PAIRS];
+        for t in 0..context {
+            for j in 0..ROPE_PAIRS {
+                let inv = 10_000_000f32.powf(-(2.0 * j as f32) / 64.0);
+                let f = t as f32 * inv;
+                cos_ref[t * ROPE_PAIRS + j] = f.cos();
+                sin_ref[t * ROPE_PAIRS + j] = f.sin();
+            }
+        }
+        let (cos, sin) = build_rope_table(context, None);
+        assert_eq!(cos, cos_ref, "the default cos table moved");
+        assert_eq!(sin, sin_ref, "the default sin table moved");
+        // a present-but-"default" rope_scaling object configures nothing: same bytes
+        let (c2, s2) = build_rope_table(context, Some(&scaling(RopeKind::Default)));
+        assert_eq!(c2, cos_ref, "a default rope_scaling must not move the table");
+        assert_eq!(s2, sin_ref, "a default rope_scaling must not move the table");
+    }
+
+    /// YaRN shape, against the same oracle: pairs at/below the corr-range floor
+    /// keep their angles BYTE-FOR-BYTE (the high-frequency bands YaRN exists to
+    /// protect), pairs at/above the ceiling take the interpolated angle, and the
+    /// corr range itself is the reference math for this checkpoint's dims
+    #[test]
+    fn yarn_extrapolates_low_pairs_and_interpolates_high_ones() {
+        let s = scaling(RopeKind::Yarn);
+        assert_eq!(s.yarn_corr_range(64, 1e7), (14.0, 22.0), "corr dims for dim 64 / base 1e7 / 262144 ctx / beta 32+1");
+        let (cos_y, _) = build_rope_table(1024, Some(&s));
+        let (cos_0, _) = build_rope_table(1024, None);
+        for t in [0usize, 1, 100, 1023] {
+            // j <= 14: ramp 1 -> pure extrapolation -> identical bytes
+            for j in [0usize, 7, 13, 14] {
+                assert_eq!(
+                    cos_y[t * ROPE_PAIRS + j], cos_0[t * ROPE_PAIRS + j],
+                    "pair {j} at t={t} is high frequency: YaRN keeps the trained angle"
+                );
+            }
+            // j >= 22: ramp 0 -> pure interpolation by 1/factor
+            for j in [22usize, 28, 31] {
+                let inv = 10_000_000f32.powf(-(2.0 * j as f32) / 64.0);
+                assert_eq!(
+                    cos_y[t * ROPE_PAIRS + j],
+                    ((t as f32 * inv) * 0.25f32).cos(),
+                    "pair {j} at t={t} is low frequency: the interpolated angle"
+                );
+                // a witness only where the angles are wide enough to differ in
+                // f32: cos(x) - cos(x/4) ~ 3x²/8, invisible below ~1e-4 rad
+                // (t=0 maps every scaling to angle 0; tiny t x low freq ditto)
+                if t as f32 * inv > 1e-3 {
+                    assert_ne!(cos_y[t * ROPE_PAIRS + j], cos_0[t * ROPE_PAIRS + j]);
+                }
+            }
+        }
+        // the ramp band (14 < j < 22) is neither extreme
+        let (t, j) = (1023usize, 18usize);
+        let inv = 10_000_000f32.powf(-(2.0 * j as f32) / 64.0);
+        let extrap = t as f32 * inv;
+        let blended = (0.25f32 * extrap) * 0.5 + extrap * 0.5;
+        assert_eq!(cos_y[t * ROPE_PAIRS + j], blended.cos(), "the ramp midpoint is the half-and-half angle");
+    }
+
+    /// linear interpolates EVERY pair (pair 0 included — exactly the collapse
+    /// the YaRN paper shows); ntk-aware leaves the angles alone and rewrites
+    /// the theta the pairs are computed from
+    #[test]
+    fn linear_scales_every_pair_and_ntk_rewrites_the_base() {
+        let (cos_l, _) = build_rope_table(64, Some(&scaling(RopeKind::Linear)));
+        let (cos_0, _) = build_rope_table(64, None);
+        let (t, j) = (63usize, 0usize);
+        assert_eq!(cos_l[t * ROPE_PAIRS + j], (63f32 * 0.25f32).cos(), "linear: even pair 0 interpolates");
+        assert_ne!(cos_l[t * ROPE_PAIRS + j], cos_0[t * ROPE_PAIRS + j]);
+        let s = scaling(RopeKind::NtkAware);
+        let b = s.ntk_base(64, 1e7) as f32;
+        let (cos_n, _) = build_rope_table(64, Some(&s));
+        // pair 31 at t=63 is NOT a usable witness for the base rewrite: both
+        // angles are ~1e-5 rad and f32 cos rounds both to exactly 1.0. Pair 8
+        // has base^(-0.25) scale angles O(1) rad, where the rewrite is visible.
+        let (t, j) = (63usize, 8usize);
+        let inv8 = b.powf(-(2.0 * 8f32) / 64.0);
+        assert_eq!(cos_n[t * ROPE_PAIRS + j], (63f32 * inv8).cos(), "ntk-aware: theta' = 1e7·4^(64/62) rewrites every pair's base");
+        assert_ne!(cos_n[t * ROPE_PAIRS + j], cos_0[t * ROPE_PAIRS + j], "the rewritten base moves pair 8's angle");
+        // and the far pair keeps the formula (the O(1e-5) angle both bases)
+        let inv31 = b.powf(-(2.0 * 31f32) / 64.0);
+        assert_eq!(cos_n[63 * ROPE_PAIRS + 31], (63f32 * inv31).cos());
+    }
+
+    /// phase 3: the warn fires only when the effective context exceeds the
+    /// training context AND nothing is armed — every other side is silent
+    #[test]
+    fn the_exceed_training_warning_fires_only_unscaled_and_oversized() {
+        // today's shape: 200k boot against 262144 training positions — silent
+        assert!(exceed_training_warning(200_000, Some(262_144), None).is_none());
+        // equal context is not exceeded
+        assert!(exceed_training_warning(262_144, Some(262_144), None).is_none());
+        // the loud line: oversized and unscaled
+        let w = exceed_training_warning(300_000, Some(262_144), None).expect("oversized + unscaled must warn");
+        assert!(w.contains("300000 exceeds the 262144 positions"), "{w}");
+        assert!(w.contains("quality WILL be degraded"), "{w}");
+        assert!(w.contains("issue #96"), "{w}");
+        // armed yarn: silent — that is what the scaling is for
+        assert!(exceed_training_warning(300_000, Some(262_144), Some(&scaling(RopeKind::Yarn))).is_none());
+        // a "default" scaling object configures nothing: the warn stands
+        assert!(exceed_training_warning(300_000, Some(262_144), Some(&scaling(RopeKind::Default))).is_some());
+        // no config seen at all (the selftest package): never a guessed threshold
+        assert!(exceed_training_warning(300_000, None, None).is_none());
     }
 }

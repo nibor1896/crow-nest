@@ -114,9 +114,21 @@ name = "serve"
 path = "src/bin/serve.rs"
 
 [[bin]]
+name = "ctx_reset_probe"
+path = "src/bin/ctx_reset_probe.rs"
+
+[[bin]]
 name = "qsa_tie_probe"
 path = "src/bin/qsa_tie_probe.rs"
 
 [[bin]]
 name = "attn_path_probe"
 path = "src/bin/attn_path_probe.rs"
+
+[[bin]]
+name = "rope_table_probe"
+path = "src/bin/rope_table_probe.rs"
+
+[[bin]]
+name = "gdn_chunk_probe"
+path = "src/bin/gdn_chunk_probe.rs"
