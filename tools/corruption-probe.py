@@ -43,20 +43,37 @@ def prompt(lines):
     )
 
 
-def call(port, seed, text, max_tokens=1600):
+def call(port, seed, text, max_tokens=1600, stream=False):
     body = {
         "messages": [{"role": "user", "content": text}],
         "max_tokens": max_tokens,
         "seed": seed,
-        "stream": False,
-        "chat_template_kwargs": {"reasoning_effort": "minimal"},
+        "stream": stream,
+        # `none` is thinking OFF and one of serve's five words (serve.rs
+        # REASONING_WORDS); `minimal` is a parity 400 and killed all 8 rounds
+        # of the first ladder run (2026-09-21).
+        "chat_template_kwargs": {"reasoning_effort": "none"},
         **SAMPLING,
     }
     req = urllib.request.Request(
         API % port, data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:
-        return json.loads(r.read())
+        if not stream:
+            return json.loads(r.read())
+        # SSE assembly -- exactly what Crow consumes live. If corruption shows
+        # here but not in the non-stream mode, the stream path is the culprit.
+        parts = []
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            try:
+                delta = json.loads(line[6:])["choices"][0].get("delta", {})
+            except (json.JSONDecodeError, KeyError, IndexError):
+                continue
+            parts.append(delta.get("content") or "")
+        return {"choices": [{"message": {"content": "".join(parts)}}]}
 
 
 def grade(reply, want):

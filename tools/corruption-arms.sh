@@ -18,7 +18,33 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out="$root/decode_out/corruption-arms"
 mkdir -p "$out"
 port="${CORRUPTION_PORT:-8099}"
-need_gib=45
+# The RAM threshold follows the pinned budget: with CROW_PINNED_BUDGET_GB set
+# (a smaller cold tier, more experts hot in VRAM - numerics-neutral, #88 proved
+# placement byte-identical), the ladder runs on a sessionized box whose balloon
+# ceiling is below the full -M tier; every arm shares the same placement, so the
+# overlay comparison stays exact. Pool recovery still needs the margin on top.
+need_gib=$(( ${CROW_PINNED_BUDGET_GB:-44} + 2 ))
+
+# #82 pool behavior: after every engine exit the ~46 GiB pinned tier sits in
+# the NVIDIA driver pool; the next arm's loader sees MemAvailable ~8 GiB and
+# refuses (manager.rs / residency.rs). Sustained anonymous pressure returns
+# the pool. Same recovery gate-linux.sh and run-90-arm-final.sh run between
+# every engine item (verified 2026-09-21, df5fe09) - imported verbatim,
+# because without it this ladder dies after arm 1.
+pool_recover() {
+    local av
+    for i in 1 2 3 4 5 6; do
+        av=$(awk '/^MemAvailable/{print int($2/1048576)}' /proc/meminfo)
+        if [ "${av:-0}" -ge "$need_gib" ]; then
+            [ "$i" -gt 1 ] && echo "  pool_recover: MemAvailable ${av} GiB after $((i-1)) pass(es)"
+            return 0
+        fi
+        echo "  pool_recover: pass $i (MemAvailable ${av} GiB, need $need_gib)"
+        timeout 300 python3 "$root/decode_out/kv-ab/balloon.py" "$need_gib" >/dev/null 2>&1
+    done
+    av=$(awk '/^MemAvailable/{print int($2/1048576)}' /proc/meminfo)
+    echo "  pool_recover: MemAvailable only ${av} GiB after 4 passes (need $need_gib) - arm may refuse"
+}
 
 wait_ram() {
     while true; do
@@ -30,8 +56,9 @@ wait_ram() {
 
 run_arm() {  # label overlay_path_or_empty
     local label="$1" overlay="$2"
+    pool_recover
     wait_ram
-    echo "=== arm $label : $(date +%H:%M:%S) : available $(awk '/^MemAvailable/{print int($2/1048576)}' /proc/meminfo)GiB"
+    echo "=== arm $label : $(date +%H:%M:%S) : MemAvailable $(awk '/^MemAvailable/{print int($2/1048576)}' /proc/meminfo)GiB"
     local envs=(env "CROW_RAM_MARGIN_GB=1")
     [ -n "$overlay" ] && envs+=("CROW_CNQ_OVERLAY=$overlay")
     "${envs[@]}" "$root/tools/serve-linux.sh" --port "$port" \
@@ -46,9 +73,13 @@ run_arm() {  # label overlay_path_or_empty
         kill "$serve_pid" 2>/dev/null
         return 1
     fi
-    systemd-run --quiet --pipe --user -p MemoryMax=2G \
-        python3 "$root/tools/corruption-probe.py" --port "$port" --label "$label" \
-        --json "$out/$label.json"
+    # plain python3, no systemd-run: the --pipe form dies from a nohup
+    # terminal (stdin fd type), and the service form KILLED the serve scope
+    # at its start (SIGTERM to serve 2 s after health OK, 2026-09-21 19:25,
+    # 8x connection refused). The probe is a 100-line urllib script - it
+    # needs no isolation and no memory cap.
+    python3 "$root/tools/corruption-probe.py" --port "$port" --label "$label" \
+        --json "$out/$label.json" >"$out/probe-$label.log" 2>&1
     kill "$serve_pid" 2>/dev/null
     wait "$serve_pid" 2>/dev/null
     sleep 5

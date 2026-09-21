@@ -45,6 +45,24 @@ fi
 crow_env=()
 while IFS= read -r kv; do crow_env+=("$kv"); done < <(env | grep '^CROW_' || true)
 
+# #91 DEFAULT OPERATING POINT (2026-09-21): the attn-v-out BF16 overlay --
+# v_proj/o_proj/linear_attn.out_proj of every layer at full precision, the
+# exact tensor rule llama.cpp holds in its highest tier short of f16 (the
+# engine that won the blind comparison). The corruption class of the long
+# sessions (trailing digits, df5fe00 for df5fe09) is the quantization
+# residual this removes. Caller wins: set CROW_CNQ_OVERLAY yourself and that
+# file is used; set it EMPTY (CROW_CNQ_OVERLAY=) for the bare no-overlay
+# engine of the parity record.
+if [ -z "${CROW_CNQ_OVERLAY+x}" ]; then
+    overlay="$root/converter/layer91-attn-v-out-originals.cnq"
+    if [ -f "$overlay" ]; then
+        export CROW_CNQ_OVERLAY="$overlay"
+        echo "serve-linux.sh: CROW_CNQ_OVERLAY default -> attn-v-out bf16 overlay (set CROW_CNQ_OVERLAY= to disable)" >&2
+    else
+        echo "serve-linux.sh: default overlay missing ($overlay) - serving the bare container" >&2
+    fi
+fi
+
 printf 'serve-linux.sh: scope MemoryHigh=%s MemoryMax=%s MemorySwapMax=0, %s CROW_* passed through\n' \
     "$high" "$max" "${#crow_env[@]}" >&2
 
