@@ -133,3 +133,13 @@ Expected wall time: ~2 minutes total, no GPU, no server, no checkpoint needed fo
 7. Tracked vs ignored: ids jsons + manifests + row-plan + engine-arm.log + corpora tracked (~17 MB text); engine dumps (185 MB) and validate replay dumps (190 MB) stay ignored, results documented.
 
 Live-acceptance note: the engine arm keeps running overnight via the RAM ladder (PID file /tmp/fleet-monitor/90-oracle.pids); case 5 of the seven cases was verified against an actual run by the agent, cases re-runnable one-command from docs/acceptance/issue-90.md.
+
+---
+
+## Addendum 2026-09-21 12:10 — the engine arm: 3 of 4 runs done, the 4th is a VRAM edge, documented
+
+- DONE and hashed: a1000/none, a1000/kvbf16, a2564/none (`plan-rows.f32` + `.rows.json` + `SHA256SUMS` each, dense dumps hashed then removed — the marker the arm script respects).
+- BLOCKED: **a2564/kvbf16**. The engine refuses config: with bf16 KV the state side grows ~2.5 GiB (states are sized by the 200k CONTEXT FLOOR, not the 2565-row prompt), and the 5090's ~22.2 GiB free VRAM at a running desktop leaves the planner no N (the fp8 arm booted with 0.57 GiB to spare at n=153). Measured facts: `CROW_CHUNK` is IGNORED by parity mode (chunk = round4(prompt len), empirically verified 12:08 with the env set and the boot line still reading 2565), so the staging lever does not exist there; `CROW_RAM_MARGIN_GB=1` works (three runs booted at MemAvailable 12–20 GiB — free_for_pin counts the reclaimable pool — the pin gate forces the release on demand).
+- The clean engine-side fix (follow-up, not tonight): parity mode should respect a context cap for short prompts (states sized to the prompt, not CONTEXT_FLOOR) — one config line, gate re-run, byte-identity trivially held (states beyond the prompt are never read).
+- The instrument is USABLE now: the paired-baseline at anchor 1000 has both arms, anchor 2564 has the none arm; the missing cell only narrows the bf16-vs-fp8 comparison at the sparse-QSA boundary, it blocks nothing else.
+- Run evidence: `/tmp/90-arm*.log` (robin's terminal) + `decode_out/oracle-longctx/engine/*/SHA256SUMS`.
