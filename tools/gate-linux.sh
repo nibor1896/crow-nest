@@ -344,9 +344,10 @@ scope_run() {
 # pressure returns the pool within seconds. Same recovery the kv-ab matrix ran
 # between every engine run; shallow pass, self-exits when MemAvailable is fine.
 pool_recover() {
-    # timeout: in the HARD-leak state (#82, only a reboot reclaims) the balloon
-    # burns its full 3 rounds to no effect - cap it so the gate stays usable.
-    timeout 90 python3 decode_out/kv-ab/balloon.py 46 >/dev/null 2>&1 || true
+    # timeout: recovery of a merely-lazy pool (the normal post-engine state)
+    # takes 1-4 minutes at the balloon's 2 s pace; 240 s lets it finish. In the
+    # HARD-leak state (#82, only a reboot reclaims) the cap keeps the gate alive.
+    timeout 240 python3 decode_out/kv-ab/balloon.py 46 >/dev/null 2>&1 || true
 }
 
 # parity_item <name> <ids.json> <expected sha> <expected bytes|-> <extra env...>
@@ -403,7 +404,7 @@ else
 fi
 
 # 10) host-side checks - no GPU, no model
-( cd "$root/engine" && cargo test --release > "$out/cargo-test.log" 2>&1 )
+( cd "$root/engine" && env LD_LIBRARY_PATH="$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" cargo test --release > "$out/cargo-test.log" 2>&1 )
 tpass=$(grep -hoE '^test result: ok\. [0-9]+ passed' "$out/cargo-test.log" | awk '{s+=$4} END{print s+0}')
 tfail=$(grep -hoE '[0-9]+ failed' "$out/cargo-test.log" | awk '{s+=$1} END{print s+0}')
 if [ "$tpass" = "$TESTS" ] && [ "$tfail" = "0" ]; then green "cargo test" "$tpass passed, 0 failed"
