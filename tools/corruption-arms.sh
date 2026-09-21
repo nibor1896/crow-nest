@@ -31,14 +31,44 @@ need_gib=$(( ${CROW_PINNED_BUDGET_GB:-44} + 2 ))
 # the pool. Same recovery gate-linux.sh and run-90-arm-final.sh run between
 # every engine item (verified 2026-09-21, df5fe09) - imported verbatim,
 # because without it this ladder dies after arm 1.
+summary() {
+python3 - "$out" <<'PY'
+import json, sys, glob, os
+rows = []
+for f in sorted(glob.glob(os.path.join(sys.argv[1], "*.json"))):
+    d = json.load(open(f))
+    if "label" not in d:
+        continue
+    rows.append(d)
+print("\n==== corruption arms summary ====")
+print("%-10s %6s %6s %8s %10s %12s" % ("arm", "rounds", "lines", "badlines", "hexerr", "line_err_rate"))
+for d in rows:
+    print("%-10s %6d %6d %8d %10d %12s" % (
+        d["label"], d["rounds_ok"], d["lines_total"], d["lines_with_error"],
+        d["hex_char_errors"], d["line_error_rate"]))
+PY
+}
+
+# HARD #82 state: two balloon passes in a row without a rise (9 -> 9 -> 9 GiB,
+# 2026-09-21 21:45 and 22:47) never recovered in any later pass - only a
+# reboot returns the pool. Say so, print the summary and exit instead of
+# burning four more passes and hanging in wait_ram; finished arms are skipped
+# on the next start.
 pool_recover() {
-    local av
+    local av prev=-1 flat=0
     for i in 1 2 3 4 5 6; do
         av=$(awk '/^MemAvailable/{print int($2/1048576)}' /proc/meminfo)
         if [ "${av:-0}" -ge "$need_gib" ]; then
             [ "$i" -gt 1 ] && echo "  pool_recover: MemAvailable ${av} GiB after $((i-1)) pass(es)"
             return 0
         fi
+        if [ "$prev" -ge 0 ] && [ "$av" -lt $((prev + 2)) ]; then flat=$((flat + 1)); else flat=0; fi
+        if [ "$flat" -ge 2 ]; then
+            echo "  pool_recover: HARD state - two passes without a rise (MemAvailable ${av} GiB, need $need_gib). REBOOT, then start the same command again."
+            summary
+            exit 3
+        fi
+        prev=$av
         echo "  pool_recover: pass $i (MemAvailable ${av} GiB, need $need_gib)"
         timeout 300 python3 "$root/decode_out/kv-ab/balloon.py" "$need_gib" >/dev/null 2>&1
     done
@@ -120,24 +150,31 @@ run_arm() {  # label overlay_path_or_empty
     settle
 }
 
-run_arm baseline ""
-run_arm attn-ctrl "$root/converter/layer91-attn-v-out-control.cnq"
-run_arm attn-arm "$root/converter/layer91-attn-v-out-originals.cnq"
-run_arm rule-arm "$root/converter/layer91-ffn-down-rule-originals.cnq"
-run_arm all-arm  "$root/converter/layer91-ffn-down-all-originals.cnq"
-
-python3 - "$out" <<'PY'
-import json, sys, glob, os
-rows = []
-for f in sorted(glob.glob(os.path.join(sys.argv[1], "*.json"))):
-    d = json.load(open(f))
-    if "label" not in d:
+# CORRUPTION_ARMS selects arms (default: all five). The pool goes into the HARD
+# #82 state after one or two engine exits (2026-09-21 21:45: six balloon passes
+# at 12 GiB after arm 2, ~48 GiB held with no owning process) and only a reboot
+# returns it, so the ladder finishes across boots; the summary below reads every
+# <label>.json in $out, whichever run wrote it.
+overlay_for() {
+    case "$1" in
+        baseline)  echo "" ;;
+        attn-ctrl) echo "$root/converter/layer91-attn-v-out-control.cnq" ;;
+        attn-arm)  echo "$root/converter/layer91-attn-v-out-originals.cnq" ;;
+        rule-arm)  echo "$root/converter/layer91-ffn-down-rule-originals.cnq" ;;
+        all-arm)   echo "$root/converter/layer91-ffn-down-all-originals.cnq" ;;
+        *) echo "unknown arm: $1" >&2; exit 2 ;;
+    esac
+}
+for arm in ${CORRUPTION_ARMS:-baseline attn-ctrl attn-arm rule-arm all-arm}; do
+    ov="$(overlay_for "$arm")" || exit 2
+    # resume across boots: an arm with a complete 8/8 result is not rerun (each
+    # engine exit spends the boot's pool budget; 2026-09-21 22:41 a restart
+    # reran the finished attn-arm first). CORRUPTION_FORCE=1 reruns anyway.
+    if [ -z "${CORRUPTION_FORCE:-}" ] && grep -q '"rounds_ok": 8' "$out/$arm.json" 2>/dev/null; then
+        echo "=== arm $arm : already 8/8 in $arm.json - skipped (CORRUPTION_FORCE=1 reruns)"
         continue
-    rows.append(d)
-print("\n==== corruption arms summary ====")
-print("%-10s %6s %6s %8s %10s %12s" % ("arm", "rounds", "lines", "badlines", "hexerr", "line_err_rate"))
-for d in rows:
-    print("%-10s %6d %6d %8d %10d %12s" % (
-        d["label"], d["rounds_ok"], d["lines_total"], d["lines_with_error"],
-        d["hex_char_errors"], d["line_error_rate"]))
-PY
+    fi
+    run_arm "$arm" "$ov"
+done
+
+summary
