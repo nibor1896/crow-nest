@@ -54,12 +54,45 @@ wait_ram() {
     done
 }
 
+# After an arm: wait for serve's REAL exit, then for MemAvailable to stop
+# rising on its own, and only then let pool_recover balloon. The first clean
+# ladder (2026-09-21 20:58) ran baseline 8/8, then six balloon passes sat at
+# MemAvailable 10 GiB and arm 2 never booted: run_arm slept 5 s after the kill,
+# while serve frees the ~46 GiB pinned tier before exit (#82) - a balloon that
+# presses against pages a draining serve still holds gets nothing back. Both
+# waits are bounded and SAY what they saw, so the log settles which it was.
+settle() {
+    local t0=$SECONDS av prev=-1 flat=0
+    while pgrep -f "release/serve .*--port $port" >/dev/null 2>&1; do
+        if [ $((SECONDS - t0)) -ge 600 ]; then
+            echo "  settle: serve STILL alive 600 s after SIGTERM - not escalating, the next arm will wait on RAM"
+            break
+        fi
+        sleep 5
+    done
+    echo "  settle: serve exit after $((SECONDS - t0)) s"
+    t0=$SECONDS
+    while [ $((SECONDS - t0)) -lt 600 ]; do
+        av=$(awk '/^MemAvailable/{print int($2/1048576)}' /proc/meminfo)
+        [ "$av" -ge "$need_gib" ] && break
+        if [ "$av" -le "$prev" ]; then flat=$((flat + 1)); else flat=0; fi
+        [ "$flat" -ge 6 ] && break  # 90 s without a rise: the rest is the driver pool, balloon territory
+        prev=$av
+        sleep 15
+    done
+    echo "  settle: MemAvailable ${av} GiB after $((SECONDS - t0)) s of waiting (need $need_gib)"
+}
+
 run_arm() {  # label overlay_path_or_empty
     local label="$1" overlay="$2"
     pool_recover
     wait_ram
     echo "=== arm $label : $(date +%H:%M:%S) : MemAvailable $(awk '/^MemAvailable/{print int($2/1048576)}' /proc/meminfo)GiB"
-    local envs=(env "CROW_RAM_MARGIN_GB=1")
+    # CROW_CNQ_OVERLAY= EXPLICITLY EMPTY for the baseline: serve-linux.sh
+    # defaults to the attn overlay since 723d18f, and a baseline that silently
+    # carries it would compare overlay against overlay (2026-09-21, caught
+    # before the first clean run).
+    local envs=(env "CROW_RAM_MARGIN_GB=1" "CROW_CNQ_OVERLAY=")
     [ -n "$overlay" ] && envs+=("CROW_CNQ_OVERLAY=$overlay")
     "${envs[@]}" "$root/tools/serve-linux.sh" --port "$port" \
         >"$out/serve-$label.log" 2>&1 &
@@ -71,6 +104,8 @@ run_arm() {  # label overlay_path_or_empty
     if ! curl -sf "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
         echo "arm $label: serve did not come up (see $out/serve-$label.log)"
         kill "$serve_pid" 2>/dev/null
+        wait "$serve_pid" 2>/dev/null
+        settle
         return 1
     fi
     # plain python3, no systemd-run: the --pipe form dies from a nohup
@@ -82,7 +117,7 @@ run_arm() {  # label overlay_path_or_empty
         --json "$out/$label.json" >"$out/probe-$label.log" 2>&1
     kill "$serve_pid" 2>/dev/null
     wait "$serve_pid" 2>/dev/null
-    sleep 5
+    settle
 }
 
 run_arm baseline ""
