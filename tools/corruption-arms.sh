@@ -26,8 +26,20 @@ position="${CORRUPTION_POSITION:-end}"
 # CORRUPTION_TAG: names the result directory of such a variant, so it never
 # shares a directory (skip guard, summary) with the record.
 sampling="${CORRUPTION_SAMPLING:-}"
+# CORRUPTION_REPLAY=<preset> runs the ladder with the REPLAY probe
+# (tools/corruption-replay-probe.py: a stored Crow session cut at the answers
+# that came back corrupt live, the body Crow builds for it, every returned tool
+# call graded); CORRUPTION_REPLAY_SESSION names the session SNAPSHOT (the probe
+# refuses a file whose sha256 is not the preset's). Its own result directory,
+# like a depth: the numbers are calls, not literal lines.
+replay="${CORRUPTION_REPLAY:-}"
+if [ -n "$replay" ] && [ -n "$ctx_tokens" ]; then
+    echo "CORRUPTION_REPLAY and CORRUPTION_CTX_TOKENS are two instruments - set one" >&2
+    exit 2
+fi
 out="$root/decode_out/corruption-arms"
 [ -n "$ctx_tokens" ] && out="$out-ctx$ctx_tokens-$position"
+[ -n "$replay" ] && out="$out-replay-$replay"
 [ -n "${CORRUPTION_TAG:-}" ] && out="$out-$CORRUPTION_TAG"
 mkdir -p "$out"
 port="${CORRUPTION_PORT:-8099}"
@@ -156,7 +168,12 @@ run_arm() {  # label overlay_path_or_empty
     # at its start (SIGTERM to serve 2 s after health OK, 2026-09-21 19:25,
     # 8x connection refused). The probe is a 100-line urllib script - it
     # needs no isolation and no memory cap.
-    if [ -n "$ctx_tokens" ]; then
+    if [ -n "$replay" ]; then
+        python3 "$root/tools/corruption-replay-probe.py" --port "$port" --label "$label" \
+            --preset "$replay" ${CORRUPTION_REPLAY_SESSION:+--session "$CORRUPTION_REPLAY_SESSION"} \
+            --sampling "${sampling:-{\}}" \
+            --json "$out/$label.json" >"$out/probe-$label.log" 2>&1
+    elif [ -n "$ctx_tokens" ]; then
         python3 "$root/tools/corruption-probe-long.py" --port "$port" --label "$label" \
             --ctx-tokens "$ctx_tokens" --position "$position" --sampling "${sampling:-{\}}" \
             --json "$out/$label.json" >"$out/probe-$label.log" 2>&1
@@ -189,8 +206,13 @@ for arm in ${CORRUPTION_ARMS:-baseline attn-ctrl attn-arm rule-arm all-arm}; do
     # resume across boots: an arm with a complete 8/8 result is not rerun (each
     # engine exit spends the boot's pool budget; 2026-09-21 22:41 a restart
     # reran the finished attn-arm first). CORRUPTION_FORCE=1 reruns anyway.
-    if [ -z "${CORRUPTION_FORCE:-}" ] && grep -q '"rounds_ok": 8' "$out/$arm.json" 2>/dev/null; then
-        echo "=== arm $arm : already 8/8 in $arm.json - skipped (CORRUPTION_FORCE=1 reruns)"
+    # The replay probe runs rounds x points and states completeness itself
+    # ("complete"); a file that carries the key is judged by it alone, so a
+    # partial replay at rounds_ok 8 of 24 is never taken for a finished arm.
+    done_re='"rounds_ok": 8'
+    grep -q '"complete":' "$out/$arm.json" 2>/dev/null && done_re='"complete": true'
+    if [ -z "${CORRUPTION_FORCE:-}" ] && grep -q "$done_re" "$out/$arm.json" 2>/dev/null; then
+        echo "=== arm $arm : already complete in $arm.json - skipped (CORRUPTION_FORCE=1 reruns)"
         continue
     fi
     run_arm "$arm" "$ov"

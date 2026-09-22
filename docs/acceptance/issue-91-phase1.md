@@ -252,6 +252,78 @@ remaining quant question.
 - `docs/improve-loop.md` — the hard rule (issue item 1).
 - this file.
 
+## 8. The replay instrument (added 2026-09-22) — `tools/corruption-replay-probe.py`
+
+Both copy probes sit on their floor (984 tokens: 1/320; 100k: 2/320, the same two dropped
+lines under greedy), while the worst in-vivo corruption came at **6,738 prompt tokens**: the
+first answer after a Crow rollover (`session.json` [2], `run_command` cwd
+`/home/nibor11896/three-staging`, 11896 for 1896 → [3] ENOENT). Same session: [26] a
+`delegate` with `parameter_placeholder` / `context_placeholder`, [69] a `write_file` path
+`"/\n/home/nibor11896/..."`. The replay probe re-asks that exact question: messages[0:K] of the
+stored session, the body **Crow itself builds** for it (crow_core.stream_reply with a capturing
+`_post_stream` — tools, sampling_for → temperature 1.0 / top_p 0.95 / min_p 0.01 / top_k 20 /
+presence_penalty 0.0, max_tokens 16384, streamed), plus `seed`; N seeds per point; every
+returned tool call graded.
+
+**Grader.** Corrupt (the #91 class, `lines_with_error`): `json_invalid`, `placeholder`,
+`control_char` (\n/\r/\t/NUL in a path-like argument), `home_mismatch` (/home/<user> not the
+machine's), `digit_near_miss` (a digit-bearing path component one edit from one in the context,
+confirmed by the filesystem: the corrected prefix exists, the produced one does not). Schema
+(`schema_calls_with_error`): `unknown_tool`, `unknown_arg`, `missing_required`, `type_mismatch`.
+Info only: `token_near_miss`, `digit_near_miss_unconfirmed`, `path_not_in_context`,
+`fs_missing`, `no_tool_call`, `truncated`, `markup_in_content`. Graded over all 302 stored calls
+of the session, it flags **exactly the three known corruptions** ([2], [26], [69]) and nothing
+else as corrupt; 25 calls are schema-wrong (22 × edit_file `old_string`/`new_string` for
+`old`/`new`, 2 × memory `new_text`, 1 × the undeclared `run_image`). The fs confirmation is what
+keeps counters out: 33 candidates like `/tmp/shot13` beside a context `/tmp/shot12` stay info.
+
+**Preset `diorama-0922`** (points K = 2, 26, 69; live figures from engine.log for the same
+requests):
+
+| K | answer that came back live | live prompt tok | live body B | live generated |
+|--:|---|--:|--:|--:|
+| 2 | run_command cwd `/home/nibor11896/three-staging` | 6,738 | 25,539 | 119 |
+| 26 | 3 × web_search + delegate `parameter_placeholder` | 24,410 | 76,183 | 250 |
+| 69 | write_file path `"/\n/home/nibor11896/…"` | 39,273 | 128,812 | 1,186 |
+
+**Fidelity, measured offline (reference tokenizer, `.venv-oracle`, no GPU):** the rebuilt
+request renders **155 tokens short** of the live one at every one of the first 14 assistant
+turns (6,583 vs 6,738 at K=2) and the rebuilt body is **520 bytes short** of serve's
+`body N bytes` on all 325 streamed requests of the session. The history renders identically
+(constant gap); the missing ~520 B sit in the head/tools part and are **not identified** —
+session.json's own prefix fingerprint (TOOLS + head + model) matches today's installed
+crow_core. Every round records `prompt_tokens_delta_vs_live`; if the engine confirms −155,
+capture the live `tools` array once and pass `--tools-json`.
+
+**Seeds.** Crow sends no seed; serve logged `seed 0 (data sheet)` on every request of the
+session, so `--seed0 0` (the default) makes round 0 the live request's seed.
+
+**Run (after GO; the engine up via tools/serve-linux.sh, or through the arms runner):**
+
+```
+mkdir -p decode_out/sessions/2026-09-22-diorama-rollover decode_out/corruption-replay
+cp ~/.local/state/crow/session/session.json decode_out/sessions/2026-09-22-diorama-rollover/
+sha256sum decode_out/sessions/2026-09-22-diorama-rollover/session.json   # 559bb1ed8e17...
+python3 tools/corruption-replay-probe.py --preset diorama-0922 \
+    --session decode_out/sessions/2026-09-22-diorama-rollover/session.json \
+    --rounds 8 --label baseline --json decode_out/corruption-replay/baseline.json
+# or the ladder:
+CORRUPTION_REPLAY=diorama-0922 \
+CORRUPTION_REPLAY_SESSION=$PWD/decode_out/sessions/2026-09-22-diorama-rollover/session.json \
+    tools/corruption-arms.sh
+```
+
+Cost estimate from the live figures (cold prefill ~840 tok/s, decode 40-50 tok/s; rounds 2+
+of a point should resume from the post-prompt snapshot — recorded as cached_tokens, never
+assumed): K=2 ≈ 8 s + 8 × 3 s, K=26 ≈ 29 s + 8 × 6 s, K=69 ≈ 47 s + 8 × 25 s → **~6 min per arm**
+for 24 rounds; the ceiling is a runaway at max_tokens 16,384 (~6 min per round). RAM/GPU are
+the engine's (the arms runner's ~46 GiB MemAvailable gate); the probe itself is a urllib script
+holding a 1.9 MB session.
+
+Verified without the engine: `tools/test_corruption_replay_probe.py` (11 tests, grader), and
+end to end against a stub serve returning serve's streamed delta shape, alternating a clean
+cwd and the 11896 one: 3/6 calls flagged over the preset, exactly the three 11896 answers.
+
 ---
 
 ## Orchestrator verification (appended 2026-09-21, all checks passed)
