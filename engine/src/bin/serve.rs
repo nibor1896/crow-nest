@@ -146,7 +146,7 @@
 //! | `temperature` | absent, `null` or `<= 0` is GREEDY (the A4 path); `> 0` samples (#28 A6) |
 //! | `top_p` | nucleus mass, default 0.8 (data sheet); read only when `temperature > 0` |
 //! | `top_k` | candidates kept, default 20 (data sheet); read only when `temperature > 0` |
-//! | `presence_penalty` | default 1.5 (data sheet); read only when `temperature > 0` |
+//! | `presence_penalty` | default 0 (#91; the data sheet says 1.5, see `DEFAULT_PRESENCE`); read only when `temperature > 0` |
 //! | `seed` | RNG seed of THIS request, default 0; a warm process draws what a cold one draws |
 //! | `min_p` | #83: the log-space tail filter, HONORED on device and host; absent, `null` or `<= 0` disables, `(0,1]` filters; read only when `temperature > 0` |
 //! | `repeat_penalty` | #84: llama.cpp asymmetric repeat over the penalty window; absent/`null` = 1.0 NEUTRAL; read in greedy and sampled alike |
@@ -284,7 +284,7 @@
 //! - `CROW_SAMPLE`, `CROW_TEMP`, `CROW_TOP_P`, `CROW_TOP_K`, `CROW_PRESENCE`, `CROW_SEED`
 //!   keep working for `decode` and `parity`; `serve` reads none of them.
 //! - `Sampler::new(seed)` carries the data-sheet defaults, the request overwrites what it sends.
-//! - Absent fields when `temperature > 0`: top_p 0.8, top_k 20, presence_penalty 1.5, seed 0 -
+//! - Absent fields when `temperature > 0`: top_p 0.8, top_k 20, presence_penalty 0 (#91), seed 0 -
 //!   and, since #84, repeat_penalty 1.0 / frequency_penalty 0.0 / penalty_last_n 64, all
 //!   NEUTRAL: no existing row changes implicitly until a row names them.
 //!
@@ -614,8 +614,15 @@ const MAX_MAX_TOKENS: usize = 32768;
 const DEFAULT_TOP_P: f32 = 0.8;
 /// #28: `top_k` when a sampled request carries none (data sheet)
 const DEFAULT_TOP_K: usize = 20;
-/// #28: `presence_penalty` when a sampled request carries none (data sheet)
-const DEFAULT_PRESENCE: f32 = 1.5;
+/// #28: `presence_penalty` when a sampled request carries none. Was the data
+/// sheet's 1.5 until #91 (2026-09-22): applied HF-style to every token of the
+/// answer (no window, `sample.rs` `seen`), it pushes an agent answer full of
+/// shas, hex and repeated code structure OFF every token it already used - the
+/// trailing-digit and dropped-line class of the long sessions, worse at depth
+/// where the logits are flat (tools/results/91-corruption-ctx100000-end: no
+/// weight change moved it). Crow never sends the field (`SamplingSent` doc), so
+/// this default IS Crow's penalty. Off unless the client asks for one.
+const DEFAULT_PRESENCE: f32 = 0.0;
 /// #84: `repeat_penalty` when a request carries none - llama.cpp's own default,
 /// and NEUTRAL: the asymmetric div/mul is skipped at exactly 1.0, so no existing
 /// row changes implicitly
@@ -5276,7 +5283,7 @@ mod tests {
         assert!(line.contains("min_p 0.01 (request)"), "{line}");
         assert!(line.contains("top_p 0.95 (request)"), "{line}");
         assert!(line.contains("top_k 20 (data sheet)"), "{line}");
-        assert!(line.contains("presence_penalty 1.5 (data sheet)"), "{line}");
+        assert!(line.contains("presence_penalty 0 (data sheet)"), "{line}");
 
         // absent stays 0.0 = disabled: the exact pre-#83 draw, golden rows included
         let bare = parse_chat(
