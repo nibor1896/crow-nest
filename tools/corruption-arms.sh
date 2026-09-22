@@ -32,6 +32,12 @@ sampling="${CORRUPTION_SAMPLING:-}"
 # call graded); CORRUPTION_REPLAY_SESSION names the session SNAPSHOT (the probe
 # refuses a file whose sha256 is not the preset's). Its own result directory,
 # like a depth: the numbers are calls, not literal lines.
+# CORRUPTION_REPLAY_CROW_CORE pins the crow_core.py that builds the body (the
+# probe's default is the INSTALLED one, and a reinstall changes the tools array:
+# 2026-09-22 the session ran on crow 3dbc015, the install moved to 0e65d70 the
+# same evening -- the byte-exact replay needs the old core, exported beside the
+# snapshot). CORRUPTION_REPLAY_ROUNDS sets seeds per point (default 8); a
+# greedy ladder (CORRUPTION_SAMPLING='{"temperature":0}') needs only 1.
 replay="${CORRUPTION_REPLAY:-}"
 if [ -n "$replay" ] && [ -n "$ctx_tokens" ]; then
     echo "CORRUPTION_REPLAY and CORRUPTION_CTX_TOKENS are two instruments - set one" >&2
@@ -171,6 +177,8 @@ run_arm() {  # label overlay_path_or_empty
     if [ -n "$replay" ]; then
         python3 "$root/tools/corruption-replay-probe.py" --port "$port" --label "$label" \
             --preset "$replay" ${CORRUPTION_REPLAY_SESSION:+--session "$CORRUPTION_REPLAY_SESSION"} \
+            ${CORRUPTION_REPLAY_CROW_CORE:+--crow-core "$CORRUPTION_REPLAY_CROW_CORE"} \
+            ${CORRUPTION_REPLAY_ROUNDS:+--rounds "$CORRUPTION_REPLAY_ROUNDS"} \
             --sampling "${sampling:-{\}}" \
             --json "$out/$label.json" >"$out/probe-$label.log" 2>&1
     elif [ -n "$ctx_tokens" ]; then
