@@ -12,30 +12,38 @@ This probe re-asks exactly that question: messages[0:K] of the stored session, t
 Crow builds for it, N seeds, and every returned tool call graded.
 
 WHAT IS SENT, and where each byte comes from:
-  - messages   session.json messages[0:K], unchanged. Crow's save_session writes
+  - messages   session.json messages[0:K]. Crow's save_session writes
                `conversation.payload()`, the same list stream_reply sends, so the file IS
-               the wire history (crow_core.py save_session / stream_reply).
+               the wire history (crow_core.py save_session / stream_reply) -- EXCEPT the head,
+               which the save re-pins: --head-file (a preset names its own) replaces
+               messages[0].content with the head the requests carried.
   - the body   built BY CROW: crow_core.stream_reply() is called with a Conversation holding
                messages[0:K] and a `_post_stream` stand-in that captures the dict and raises
                -- tools, sampling (sampling_for(model): temperature 1.0, top_p 0.95,
                min_p 0.01, top_k 20, presence_penalty 0.0 for flash-next-cnq45-m), max_tokens
-               (MAX_TOKENS 16384), stream + stream_options + timings_per_token, the reasoning
-               budget fields. No second copy of Crow's request lives in this file.
+               (MAX_TOKENS 16384), stream + stream_options + timings_per_token, and
+               `model` = --wire-model (default DEFAULT_MODEL "crow", what the window sends).
+               No second copy of Crow's request lives in this file.
   - added      `seed` (Crow sends none; serve logged `seed 0 (data sheet)` on every request
                of the session, so --seed0 0 makes round 0 the live request's seed). With
                --no-stream also `stream: false`. Nothing else is changed.
   - --tools-json FILE replaces body["tools"] with a captured array (provenance recorded).
 
-FIDELITY IS MEASURED, NOT ASSUMED: every round records serve's usage.prompt_tokens, and a
-preset carries the live number from engine.log for the same request. Offline check of
-2026-09-22 (reference tokenizer, .venv-oracle, same messages, crow_core.TOOLS as installed):
-the rebuilt prompt renders 155 tokens SHORT of the live one at every one of the first 14
-assistant turns (6583 vs 6738 at K=2), and the rebuilt body is 520 bytes short of serve's
-`body N bytes` on all 325 streamed requests of the session. The history renders identically
-(the gap is constant); the missing ~520 bytes sit in the head/tools part of the request and
-are NOT identified (session.json's own prefix fingerprint matches today's TOOLS + head).
-Every record says `prompt_tokens_delta_vs_live`; a non-zero delta means "same history,
-not byte-identical request".
+FIDELITY IS MEASURED, NOT ASSUMED, and for the preset it is exact. session.json's messages[0]
+is the head at SAVE time (17:54), not the one the requests carried: the post-rollover head
+(prompt_head(include_status=True), crow_core #210) was base + SKILLS + the goal block WITH the
+cut's marks (steps 1-8 [done], 9 [running]) -- no MEMORY yet, it was written at [75] -- and
+the saved head is base + MEMORY + SKILLS. The preset therefore sends that head
+(tools/corpora/91-replay-diorama-0922-head.txt: rollover-20260922-171255.json's head + "\n\n" +
+goal_block(the goal_set of that file, those marks, include_status=True)). Second, the window
+sends `model: "crow"` (its --model default) and resolves sampling from the display name, so no
+reasoning-budget fields travel. With both, checked offline 2026-09-22: the body is
+byte-for-byte serve's `body N bytes` on ALL 325 streamed requests of the session (delta 0;
+[9] "[open]" instead of "[running]" leaves exactly 3 B), the reference tokenizer
+(.venv-oracle) renders 6738 tokens at K=2 = serve's prompt_tokens, and the longest common
+prefix with the pre-cut request is 4092 = serve's `[cache] COLD L 4092`. Before the fix the
+rebuilt request was 155 tokens / 520 B short. Every point records body_bytes_delta_vs_live,
+every round prompt_tokens_delta_vs_live.
 
 GRADING (per returned tool call; BFCL-style AST checks plus the #91 classes):
   errors (count toward calls_with_error):
@@ -76,7 +84,8 @@ line_error_rate = the ratio; schema_calls_with_error and error_kinds sit beside 
 Usage: corruption-replay-probe.py --preset diorama-0922 --session SNAPSHOT [--rounds 8]
            [--port 8099] [--seed0 0] [--label arm] [--json OUT]
        corruption-replay-probe.py --session S --at K [--at K2 ...] [...]
-Options: --no-stream, --sampling JSON (merged over Crow's), --tools-json FILE,
+Options: --no-stream, --sampling JSON (merged over Crow's), --tools-json FILE, --head-file FILE,
+         --wire-model NAME,
          --crow-core PATH (default the INSTALLED ~/.local/share/crow/cli/crow_core.py, the
          file the live GUI ran), --home DIR (default ~), --base-url URL (default
          http://127.0.0.1:<port>/v1, Crow's local endpoint), --live-only (grade the stored
@@ -103,6 +112,9 @@ PRESETS = {
     "diorama-0922": {
         "session": "~/.local/state/crow/session/session.json",
         "session_sha256": "559bb1ed8e17ec4beecfc9ed2aba33f2538e1b53df446921160019441b3729a8",
+        # the head the window SENT, not the one session.json kept (see FIDELITY above)
+        "head_file": "corpora/91-replay-diorama-0922-head.txt",
+        "head_sha256": "bd462012b971412cf3804d6e04fac08d0e880f94572a311065bdb36a94eddae6",
         "points": [
             {"at": 2, "live_prompt_tokens": 6738, "live_body_bytes": 25539,
              "live_generated": 119,
@@ -148,8 +160,14 @@ class _Captured(Exception):
     pass
 
 
-def crow_body(crow, messages, model, base_url):
-    """The body crow_core.stream_reply builds for this history -- captured, never sent."""
+def crow_body(crow, messages, model, wire_model, base_url):
+    """The body crow_core.stream_reply builds for this history -- captured, never sent.
+
+    TWO MODEL NAMES, as in the window (crow_gui.py): sampling is resolved from the model the
+    server reports (`sampling_for(self._model)`, the display name the session stores), while
+    the request's `model` field is the endpoint's (`provider_endpoint(..., args.model)`, whose
+    default is DEFAULT_MODEL "crow"). The reasoning budget is resolved inside stream_reply from
+    the WIRE name, so "crow" sends no budget fields -- which is what the live bodies measure."""
     got = {}
 
     def capture(url, body, api_key, timeout, extra=None):
@@ -163,7 +181,7 @@ def crow_body(crow, messages, model, base_url):
         conv._messages = copy.deepcopy(messages)
         s = crow.sampling_for(model)
         try:
-            crow.stream_reply(conv, base_url=base_url, model=model, api_key="",
+            crow.stream_reply(conv, base_url=base_url, model=wire_model, api_key="",
                               temperature=s["temperature"], top_p=s["top_p"],
                               min_p=s["min_p"], top_k=s.get("top_k"),
                               presence_penalty=s.get("presence_penalty"), timeout=10)
@@ -446,6 +464,10 @@ def main():
     ap.add_argument("--sampling", default="{}", help="JSON merged over the body Crow built")
     ap.add_argument("--tools-json", default=None, help="a captured tools array to send instead of Crow's")
     ap.add_argument("--crow-core", default=CROW_CORE)
+    ap.add_argument("--head-file", default=None,
+                    help="system text to send as messages[0] instead of the stored one (a preset names its own)")
+    ap.add_argument("--wire-model", default=None,
+                    help="the request's `model` field (default: crow_core.DEFAULT_MODEL, the window's --model default)")
     ap.add_argument("--home", default=os.path.expanduser("~"))
     ap.add_argument("--no-stream", action="store_true")
     ap.add_argument("--live-only", action="store_true", help="grade the stored answers only, send nothing")
@@ -467,6 +489,19 @@ def main():
                                                                        preset["session_sha256"][:16]))
     doc = json.loads(blob)
     messages, model = doc["messages"], doc.get("model") or ""
+    head_file = args.head_file or ((preset or {}).get("head_file") and
+                                   os.path.join(os.path.dirname(os.path.abspath(__file__)), preset["head_file"]))
+    head_sha = None
+    if head_file:
+        with open(head_file, encoding="utf-8") as fh:
+            head = fh.read()
+        head_sha = hashlib.sha256(head.encode("utf-8")).hexdigest()
+        if preset and not args.head_file and head_sha != preset["head_sha256"]:
+            sys.exit("head file %s has sha256 %s, the preset pins %s" % (head_file, head_sha[:16],
+                                                                        preset["head_sha256"][:16]))
+        if messages[0].get("role") != "system":
+            sys.exit("--head-file: the session has no system message to replace")
+        messages = [dict(messages[0], content=head)] + messages[1:]
     points = [dict(p) for p in preset["points"]] if preset else []
     points += [{"at": k} for k in args.at if k not in {p["at"] for p in points}]
     if not points:
@@ -478,6 +513,7 @@ def main():
                 k, k, len(messages)))
 
     crow = load_crow(args.crow_core)
+    wire_model = args.wire_model or crow.DEFAULT_MODEL
     base_url = args.base_url or "http://127.0.0.1:%d/v1" % args.port
     tools_override = None
     if args.tools_json:
@@ -486,7 +522,8 @@ def main():
     extra = json.loads(args.sampling)
     with open(args.crow_core, "rb") as fh:
         crow_sha = hashlib.sha256(fh.read()).hexdigest()
-    info = {"session": session, "session_sha256": sha, "model": model, "home": args.home,
+    info = {"session": session, "session_sha256": sha, "model": model, "wire_model": wire_model,
+            "head_file": head_file, "head_sha256": head_sha, "home": args.home,
             "crow_core": args.crow_core,
             "crow_core_sha256": crow_sha,
             "tools_source": ("--tools-json %s" % args.tools_json) if tools_override is not None
@@ -497,7 +534,7 @@ def main():
     for p in points:
         k = p["at"]
         hist = messages[:k]
-        url, body = crow_body(crow, hist, model, base_url)
+        url, body = crow_body(crow, hist, model, wire_model, base_url)
         if tools_override is not None:
             body["tools"] = tools_override
         body.update(extra)
@@ -506,7 +543,9 @@ def main():
             body.pop("stream_options", None)
         ctx = context_index(hist)
         tools = body.get("tools") or []
-        p.update({"body_bytes": len(json.dumps(body).encode("utf-8")), "url": url,
+        nbytes = len(json.dumps(body).encode("utf-8"))
+        p.update({"body_bytes": nbytes, "url": url,
+                  "body_bytes_delta_vs_live": nbytes - p["live_body_bytes"] if p.get("live_body_bytes") else None,
                   "tools": len(tools),
                   "tools_sha256": hashlib.sha256(json.dumps(tools, sort_keys=True).encode()).hexdigest()[:16],
                   "sampling": {f: body.get(f) for f in ("temperature", "top_p", "min_p", "top_k",

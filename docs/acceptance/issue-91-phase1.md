@@ -286,14 +286,29 @@ requests):
 | 26 | 3 × web_search + delegate `parameter_placeholder` | 24,410 | 76,183 | 250 |
 | 69 | write_file path `"/\n/home/nibor11896/…"` | 39,273 | 128,812 | 1,186 |
 
-**Fidelity, measured offline (reference tokenizer, `.venv-oracle`, no GPU):** the rebuilt
-request renders **155 tokens short** of the live one at every one of the first 14 assistant
-turns (6,583 vs 6,738 at K=2) and the rebuilt body is **520 bytes short** of serve's
-`body N bytes` on all 325 streamed requests of the session. The history renders identically
-(constant gap); the missing ~520 B sit in the head/tools part and are **not identified** —
-session.json's own prefix fingerprint (TOOLS + head + model) matches today's installed
-crow_core. Every round records `prompt_tokens_delta_vs_live`; if the engine confirms −155,
-capture the live `tools` array once and pass `--tools-json`.
+**Fidelity — byte-exact, measured offline (reference tokenizer `.venv-oracle`, no GPU).** The
+first build was 155 tokens / 520 B short of every live request (constant over all 325). Two
+causes, both found:
+
+1. **The head.** session.json keeps the head of SAVE time (17:54: base + MEMORY + SKILLS). The
+   requests after the 17:12 cut carried the #210 seam head: base + SKILLS + the goal block
+   with the cut's marks (steps 1-8 `[done]`, 9 `[running]`, `Next: step 9`, GOAL_SEAM_NOTE).
+   There was no MEMORY yet; it was written at [75]. The preset sends that head, rebuilt from
+   `rollover-20260922-171255.json` (its head, plus `goal_block` of its `goal_set` with those
+   marks) and committed as `tools/corpora/91-replay-diorama-0922-head.txt` (sha pinned).
+2. **The wire model.** The window sends `model: "crow"` (the `--model` default, via
+   `provider_endpoint`). Sampling is still resolved from the display name, so top_k 20 /
+   presence 0 do travel. The reasoning budget is resolved from the wire name, so no budget
+   fields travel.
+
+With both: body bytes equal serve's `body N bytes` on **all 325 requests (delta 0)**; `[open]`
+instead of `[running]` for step 9 leaves exactly 3 B. Tokens match too: 6738 / 24410 / 39273
+at K = 2 / 26 / 69, equal to serve's prompt_tokens. The common prefix with the pre-cut request
+is 4092 tokens, equal to serve's `[cache] COLD L 4092`. Ruled out along the way: MCP (no
+mcp.json; the fingerprint matches today's TOOLS), tool-description drift across Crow
+revisions, and minijinja-vs-HF tool rendering (serve's tests pin it byte-identical).
+engine.log records no per-request tools data. It was the prompt_tokens / `COLD L` / body-bytes
+triple that located the gap.
 
 **Seeds.** Crow sends no seed; serve logged `seed 0 (data sheet)` on every request of the
 session, so `--seed0 0` (the default) makes round 0 the live request's seed.
