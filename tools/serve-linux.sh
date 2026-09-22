@@ -41,9 +41,13 @@ if [ "$high" -le 0 ] || [ "$max" -le 0 ]; then
     exit 2
 fi
 
-# pass the caller's CROW_* switches through the `env` that sets LD_LIBRARY_PATH
+# pass the caller's CROW_* switches through the `env` that sets LD_LIBRARY_PATH -
+# except secrets: a CROW_*_KEY / _TOKEN / _SECRET belongs to Crow the client
+# (CROW_TAVILY_KEY, crow_core.py), the engine has no read site for it
+# (docs/env.md), and it has no business in serve's process environment.
 crow_env=()
-while IFS= read -r kv; do crow_env+=("$kv"); done < <(env | grep '^CROW_' || true)
+while IFS= read -r kv; do crow_env+=("$kv"); done \
+    < <(env | grep '^CROW_' | grep -vE '^CROW_[A-Z0-9_]*(KEY|TOKEN|SECRET)=' || true)
 
 # #91 NO OVERLAY BY DEFAULT (2026-09-22, tools/results/91-corruption-ctx100000-end):
 # the attn-v-out BF16 overlay was the default from 723d18f to here on the
