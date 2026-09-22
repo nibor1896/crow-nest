@@ -42,6 +42,9 @@ pub const IMAGE_PAD: i64 = 248056;
 pub const VIT_HIDDEN: usize = 1152;
 pub const VIT_HEADS: usize = 16;
 pub const VIT_HEAD_DIM: usize = VIT_HIDDEN / VIT_HEADS; // 72
+/// #98 step 2: query rows per `vit_attn` block (the `BR` of the kernel);
+/// the launch grid is (ceil(n / VIT_ATTN_ROWS), VIT_HEADS)
+pub const VIT_ATTN_ROWS: usize = 16;
 pub const VIT_ROT: usize = VIT_HEAD_DIM / 2; // 36
 pub const VIT_BLOCKS: usize = 27;
 pub const VIT_INTER: usize = 4304;
@@ -521,8 +524,8 @@ impl Vit {
             launch_v(k.f("vit_rope"), VIT_HEADS as u32, n as u32, 1, 64, &[
                 self.qkv, self.cs, self.sn]);
             self.trace_dump(b0, "b0-qkv-rope", self.qkv, n * VIT_QKV);
-            // non-causal attention over the whole image, one query row per block
-            launch_v(k.f("vit_attn"), n as u32, VIT_HEADS as u32, 1, 256, &[
+            // non-causal attention over the whole image, 16 query rows per block
+            launch_v(k.f("vit_attn"), n.div_ceil(VIT_ATTN_ROWS) as u32, VIT_HEADS as u32, 1, 256, &[
                 self.qkv, self.attn, self.s[S_N]]);
             self.trace_dump(b0, "b0-attn", self.attn, n * VIT_HIDDEN);
             // proj + residual
@@ -1386,8 +1389,9 @@ mod layout {
 
 #[cfg(test)]
 mod attn_98 {
-    //! #98 step 1: `vit_attn` with one scalar accumulator per output dim against
-    //! the kernel it replaced, on the GPU, bit for bit. The old kernel is kept
+    //! #98: the shipped `vit_attn` (step 2, 16-row tiles) against the kernel
+    //! #98 replaced, on the GPU, bit for bit; step 1 rides along, checked and
+    //! timed. The old kernel is kept
     //! here VERBATIM (renamed `vit_attn_pre98`, nothing else changed) as the
     //! oracle; the new one is cut out of KERNEL_SRC itself, so the test checks
     //! the text that ships. Synthetic q/k/v, no weights, no container, a few
@@ -1472,6 +1476,70 @@ extern "C" __global__ void vit_attn_pre98(const float* __restrict__ qkv, float* 
     }
 }"#;
 
+    /// step 1 (834f983, one accumulator per dim, one query row per block),
+    /// timed beside the other two so the record keeps both steps' gains
+    const STEP1: &str = r#"
+extern "C" __global__ void vit_attn_s1(const float* __restrict__ qkv, float* __restrict__ out,
+                                    const int* __restrict__ n_p) {
+    int n = *n_p;
+    int qi = blockIdx.x;
+    int h = blockIdx.y;
+    int t = threadIdx.x;
+    const float* qp = qkv + (size_t)qi * 3456 + h * 72;
+    __shared__ float qs[72];
+    __shared__ float red[256];   // per-tile scores, then the sum partials
+    __shared__ float ps[256];    // the tile's probabilities, kept for the V walk
+    if (t < 72) qs[t] = qp[t];
+    __syncthreads();
+    float acc = 0.0f;   // output dim t (threads t >= 72 carry an unused 0)
+    float m = -__int_as_float(0x7f800000), l = 0.0f;
+    const float SCALE = 0.11785113019775793f;   // 1/sqrt(72)
+    for (int kt = 0; kt < n; kt += 256) {
+        int j = kt + t;
+        float s = -__int_as_float(0x7f800000);
+        if (j < n) {
+            const float* kp = qkv + (size_t)j * 3456 + 1152 + h * 72;
+            float dot = 0.0f;
+            #pragma unroll 8
+            for (int d = 0; d < 72; d++) dot += qs[d] * kp[d];
+            s = dot * SCALE;
+        }
+        red[t] = s;
+        __syncthreads();
+        for (int st = 128; st > 0; st >>= 1) {
+            if (t < st) red[t] = fmaxf(red[t], red[t + st]);
+            __syncthreads();
+        }
+        float mn = red[0];
+        __syncthreads();
+        float mn_new = fmaxf(m, mn);
+        float p = (j < n) ? expf(s - mn_new) : 0.0f;
+        red[t] = p;
+        ps[t] = p;
+        __syncthreads();
+        for (int st = 128; st > 0; st >>= 1) {
+            if (t < st) red[t] += red[t + st];
+            __syncthreads();
+        }
+        float ln = red[0];
+        __syncthreads();
+        float r = expf(m - mn_new);
+        l = l * r + ln;
+        acc *= r;
+        m = mn_new;
+        // EVERY thread t < 72 walks the WHOLE tile's probabilities — output
+        // dim t accumulates p_j * v_j[t] over ALL keys, not one key per tile;
+        // the 72 v_j[t] reads of one jj are one coalesced 288-byte row
+        if (t < 72) {
+            int lim = (n - kt) < 256 ? (n - kt) : 256;
+            const float* vp = qkv + (size_t)kt * 3456 + 2304 + h * 72 + t;
+            for (int jj = 0; jj < lim; jj++) acc += ps[jj] * vp[(size_t)jj * 3456];
+        }
+        __syncthreads();
+    }
+    if (t < 72) out[((size_t)qi * 16 + h) * 72 + t] = acc / l;
+}"#;
+
     /// the shipped `vit_attn`, from its `extern "C"` line to its closing brace
     fn shipped() -> &'static str {
         let src = crate::kernels::KERNEL_SRC;
@@ -1516,11 +1584,11 @@ extern "C" __global__ void vit_attn_pre98(const float* __restrict__ qkv, float* 
 
     #[test]
     #[ignore = "needs the GPU: cargo test --release attn_98 -- --ignored --nocapture"]
-    fn the_one_dim_accumulator_is_bit_identical_to_the_pre_98_kernel() {
+    fn the_shipped_vit_attn_is_bit_identical_to_the_pre_98_kernel() {
         unsafe {
             let _ctx = cuda::Ctx::init();
-            let mut module = cuda::compile(&format!("{PRE98}\n{}", shipped()));
-            let (f_old, f_new) = (module.get("vit_attn_pre98"), module.get("vit_attn"));
+            let mut module = cuda::compile(&format!("{PRE98}\n{STEP1}\n{}", shipped()));
+            let (f_old, f_s1, f_new) = (module.get("vit_attn_pre98"), module.get("vit_attn_s1"), module.get("vit_attn"));
             // timing events (`cuda::event_create` makes DISABLE_TIMING ones)
             let ev = || {
                 let mut e: sys::CUevent = std::ptr::null_mut();
@@ -1542,18 +1610,23 @@ extern "C" __global__ void vit_attn_pre98(const float* __restrict__ qkv, float* 
                 let mut o_old = cuda::alloc_zeroed(n * VIT_HIDDEN * 4);
                 let mut o_new = cuda::alloc_zeroed(n * VIT_HIDDEN * 4);
                 let mut n_p = cuda::to_i32_dev(&[n as i32]);
-                let timed = |f, o: Dev| {
+                // the two row kernels launch one block per query row, the
+                // shipped one a block per VIT_ATTN_ROWS rows
+                let timed = |f, gx: usize, o: Dev| {
                     cuda::event_record(e0, s);
-                    launch_v(f, n as u32, VIT_HEADS as u32, 1, 256, &[qkv, o, n_p]);
+                    launch_v(f, gx as u32, VIT_HEADS as u32, 1, 256, &[qkv, o, n_p]);
                     cuda::event_record(e1, s);
                     cuda::stream_sync(s);
                     elapsed_ms(e0, e1)
                 };
-                let t_old = timed(f_old, o_old);
-                let t_new = timed(f_new, o_new);
+                let t_old = timed(f_old, n, o_old);
+                let t_s1 = timed(f_s1, n, o_new);
+                let s1_bits = cuda::dtoh_u32(o_new, n * VIT_HIDDEN);
+                let t_new = timed(f_new, n.div_ceil(VIT_ATTN_ROWS), o_new);
                 let (a, b) = (cuda::dtoh_u32(o_old, n * VIT_HIDDEN), cuda::dtoh_u32(o_new, n * VIT_HIDDEN));
                 let diff = a.iter().zip(&b).filter(|(x, y)| x != y).count();
                 assert_eq!(diff, 0, "n {n} amp {amp}: {diff} of {} outputs differ in their bits", a.len());
+                assert!(s1_bits == a, "n {n} amp {amp}: step 1 left the pre-#98 bits");
                 // both are the attention, not merely equal: f64 on three rows.
                 // The f32 score error grows with |q||k| (amp^2), and so does
                 // the band: 9e-5 at amp 3, 1.4e-3 at amp 12 (scores ~ +-200)
@@ -1567,8 +1640,8 @@ extern "C" __global__ void vit_attn_pre98(const float* __restrict__ qkv, float* 
                     }
                 }
                 println!(
-                    "[#98] n {n:>4} amp {amp:>4}: {} outputs bit-identical; vit_attn old {t_old:9.3} ms, new {t_new:7.3} ms per layer (x{:.1}), x27 layers {:.2} s -> {:.3} s",
-                    a.len(), t_old / t_new, t_old * 27.0 / 1e3, t_new * 27.0 / 1e3
+                    "[#98] n {n:>4} amp {amp:>4}: {} outputs bit-identical; per layer pre-#98 {t_old:9.3} ms, step 1 {t_s1:7.3} ms, shipped {t_new:7.3} ms (x{:.0} / x{:.1}); x27 layers {:.2} s -> {:.3} s -> {:.3} s",
+                    a.len(), t_old / t_new, t_s1 / t_new, t_old * 27.0 / 1e3, t_s1 * 27.0 / 1e3, t_new * 27.0 / 1e3
                 );
                 for p in [&mut qkv, &mut o_old, &mut o_new, &mut n_p] {
                     cuda::free_dev(p);

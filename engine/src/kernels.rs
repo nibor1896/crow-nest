@@ -4542,75 +4542,156 @@ extern "C" __global__ void vit_rope(float* __restrict__ qkv, const float* __rest
     kp[36] = b * c + a * s;
 }
 
-// Non-causal single-image attention, one query row per block, online softmax
-// (flash row form): grid (n, 16 heads), block 256. scale = 1/sqrt(72), head
-// dim 72, q/k/v read straight from the fused [n][3456] qkv buffer thirds.
-// #98: thread t < 72 owns output dim t and ONLY dim t — one scalar
-// accumulator. Until #98 every one of the 72 threads carried acc[72] and walked
-// all 72 dims (72 identical copies of the P.V product, n^2 * 72 * 72 FMAs per
-// head and layer: 3,520 patches = ~20 s of tower). Per output dim the
-// operations and their order are unchanged (same jj walk, same rescale by r,
-// same fma, same final divide), so the output is bit-identical to the pre-#98
-// kernel — proven old vs new on the GPU by vit.rs `attn_98`.
+// Non-causal single-image attention, online softmax (flash row form), scale
+// 1/sqrt(72), head dim 72, q/k/v read straight from the fused [n][3456] qkv
+// buffer thirds. #98 step 2: a block owns a TILE of 16 query rows of one head
+// (grid (ceil(n/16), 16 heads), block 256, 47 KiB static smem): K and V are
+// staged in 64-key chunks and reused by all 16 rows, so global K/V traffic is
+// 1/16 of the one-row-per-block kernel's, and all 256 threads work in both
+// the score and the P.V phase.
+// BIT-IDENTICAL to the pre-#98 row kernel by construction, and that is the
+// contract (`vit::attn_98` checks every output bit against the old kernel,
+// kept verbatim in the test): the key tile stays 256 wide; each score is the
+// same sequential 72-term fma chain times SCALE; the tile max is fmaxf (exact,
+// order-free); the tile sum is the SAME 256-leaf pairwise tree (k + 128, 64,
+// 32 in smem, then 16 .. 1 as shfl_down, which pairs lane k with k + off
+// exactly as red[k] += red[k + off] did); l = l*r + ln, acc *= r and the
+// ascending-jj fma walk per (row, dim) are the old expressions in the old
+// order; the final divide is the same. Nothing is reassociated, so no
+// tolerance and no oracle re-run is needed. (Pre-#98 every one of 72 threads
+// walked all 72 dims: n^2 * 72 * 72 FMAs per head and layer, ~20 s of tower
+// at 3,520 patches; step 1 cut that to one dim per thread.)
 extern "C" __global__ void vit_attn(const float* __restrict__ qkv, float* __restrict__ out,
                                     const int* __restrict__ n_p) {
+    const int BR = 16, KC = 64, KS = 73;   // rows per block, key chunk, padded smem row
     int n = *n_p;
-    int qi = blockIdx.x;
+    int q0 = blockIdx.x * BR;
     int h = blockIdx.y;
     int t = threadIdx.x;
-    const float* qp = qkv + (size_t)qi * 3456 + h * 72;
-    __shared__ float qs[72];
-    __shared__ float red[256];   // per-tile scores, then the sum partials
-    __shared__ float ps[256];    // the tile's probabilities, kept for the V walk
-    if (t < 72) qs[t] = qp[t];
-    __syncthreads();
-    float acc = 0.0f;   // output dim t (threads t >= 72 carry an unused 0)
-    float m = -__int_as_float(0x7f800000), l = 0.0f;
+    int lane = t & 31, w = t >> 5;
+    __shared__ float qs[16 * 72];
+    __shared__ float kv[64 * 73];          // one K or V chunk, stride 73: conflict-free
+    __shared__ float ps[16 * 256];         // the tile's scores, then its probabilities
+    __shared__ float red[16 * 128];        // the sum tree's upper levels
+    __shared__ float mrow[16], lrow[16], mnew[16], rsc[16];
+    const float NEG_INF = -__int_as_float(0x7f800000);
+    for (int i = t; i < BR * 72; i += 256) {
+        int r = i / 72, d = i - r * 72;
+        qs[i] = (q0 + r < n) ? qkv[(size_t)(q0 + r) * 3456 + h * 72 + d] : 0.0f;
+    }
+    if (t < BR) { mrow[t] = NEG_INF; lrow[t] = 0.0f; }
+    // output accumulator a = t + 256 * i is (row a / 72, dim a % 72): 1152 per block
+    float acc[5];
+    #pragma unroll
+    for (int i = 0; i < 5; i++) acc[i] = 0.0f;
     const float SCALE = 0.11785113019775793f;   // 1/sqrt(72)
     for (int kt = 0; kt < n; kt += 256) {
-        int j = kt + t;
-        float s = -__int_as_float(0x7f800000);
-        if (j < n) {
-            const float* kp = qkv + (size_t)j * 3456 + 1152 + h * 72;
-            float dot = 0.0f;
+        int lim = (n - kt) < 256 ? (n - kt) : 256;
+        // scores, 64 keys at a time: thread = key (t & 63) x rows (t >> 6) + 4i
+        for (int c = 0; c < 4; c++) {
+            __syncthreads();   // kv is free: the last chunk / the last tile's V walk is done
+            for (int i = t; i < KC * 72; i += 256) {
+                int kk = i / 72, d = i - kk * 72;
+                int j = kt + c * KC + kk;
+                kv[kk * KS + d] = (j < n) ? qkv[(size_t)j * 3456 + 1152 + h * 72 + d] : 0.0f;
+            }
+            __syncthreads();
+            int kk = t & 63, rg = t >> 6;
+            const float* kr = kv + kk * KS;
+            float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
             #pragma unroll 8
-            for (int d = 0; d < 72; d++) dot += qs[d] * kp[d];
-            s = dot * SCALE;
+            for (int d = 0; d < 72; d++) {
+                float kd = kr[d];
+                dot0 += qs[rg * 72 + d] * kd;
+                dot1 += qs[(rg + 4) * 72 + d] * kd;
+                dot2 += qs[(rg + 8) * 72 + d] * kd;
+                dot3 += qs[(rg + 12) * 72 + d] * kd;
+            }
+            bool in = kt + c * KC + kk < n;
+            float* sp = ps + rg * 256 + c * KC + kk;
+            sp[0] = in ? dot0 * SCALE : NEG_INF;
+            sp[4 * 256] = in ? dot1 * SCALE : NEG_INF;
+            sp[8 * 256] = in ? dot2 * SCALE : NEG_INF;
+            sp[12 * 256] = in ? dot3 * SCALE : NEG_INF;
         }
-        red[t] = s;
         __syncthreads();
-        for (int st = 128; st > 0; st >>= 1) {
-            if (t < st) red[t] = fmaxf(red[t], red[t + st]);
+        // the tile max per row: warp w owns rows w and w + 8
+        for (int rr = 0; rr < 2; rr++) {
+            int r = w + 8 * rr;
+            float mx = NEG_INF;
+            for (int i = 0; i < 8; i++) mx = fmaxf(mx, ps[r * 256 + lane + 32 * i]);
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            if (lane == 0) mnew[r] = fmaxf(mrow[r], mx);
+        }
+        __syncthreads();
+        for (int i = t; i < BR * 256; i += 256) {
+            int r = i >> 8, k = i & 255;
+            ps[i] = (kt + k < n) ? expf(ps[i] - mnew[r]) : 0.0f;
+        }
+        __syncthreads();
+        // the tile sum per row: the pre-#98 tree, level by level
+        for (int i = t; i < BR * 128; i += 256) {
+            int r = i >> 7, k = i & 127;
+            red[i] = ps[r * 256 + k] + ps[r * 256 + k + 128];
+        }
+        __syncthreads();
+        for (int i = t; i < BR * 64; i += 256) {
+            int r = i >> 6, k = i & 63;
+            red[r * 128 + k] += red[r * 128 + k + 64];
+        }
+        __syncthreads();
+        for (int i = t; i < BR * 32; i += 256) {
+            int r = i >> 5, k = i & 31;
+            red[r * 128 + k] += red[r * 128 + k + 32];
+        }
+        __syncthreads();
+        for (int rr = 0; rr < 2; rr++) {
+            int r = w + 8 * rr;
+            float v = red[r * 128 + lane];
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+            if (lane == 0) {
+                float mn_new = mnew[r];
+                float rs = expf(mrow[r] - mn_new);
+                lrow[r] = lrow[r] * rs + v;
+                mrow[r] = mn_new;
+                rsc[r] = rs;
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < 5; i++) {
+            int a = t + 256 * i;
+            if (a < BR * 72) acc[i] *= rsc[a / 72];
+        }
+        // P.V: the tile's keys ascending, one 64-key V chunk at a time
+        for (int c = 0; c * KC < lim; c++) {
             __syncthreads();
-        }
-        float mn = red[0];
-        __syncthreads();
-        float mn_new = fmaxf(m, mn);
-        float p = (j < n) ? expf(s - mn_new) : 0.0f;
-        red[t] = p;
-        ps[t] = p;
-        __syncthreads();
-        for (int st = 128; st > 0; st >>= 1) {
-            if (t < st) red[t] += red[t + st];
+            for (int i = t; i < KC * 72; i += 256) {
+                int kk = i / 72, d = i - kk * 72;
+                int j = kt + c * KC + kk;
+                kv[kk * KS + d] = (j < n) ? qkv[(size_t)j * 3456 + 2304 + h * 72 + d] : 0.0f;
+            }
             __syncthreads();
+            int cl = (lim - c * KC) < KC ? (lim - c * KC) : KC;
+            #pragma unroll
+            for (int i = 0; i < 5; i++) {
+                int a = t + 256 * i;
+                if (a < BR * 72) {
+                    int r = a / 72, d = a - r * 72;
+                    const float* pr = ps + r * 256 + c * KC;
+                    for (int jj = 0; jj < cl; jj++) acc[i] += pr[jj] * kv[jj * KS + d];
+                }
+            }
         }
-        float ln = red[0];
-        __syncthreads();
-        float r = expf(m - mn_new);
-        l = l * r + ln;
-        acc *= r;
-        m = mn_new;
-        // EVERY thread t < 72 walks the WHOLE tile's probabilities — output
-        // dim t accumulates p_j * v_j[t] over ALL keys, not one key per tile;
-        // the 72 v_j[t] reads of one jj are one coalesced 288-byte row
-        if (t < 72) {
-            int lim = (n - kt) < 256 ? (n - kt) : 256;
-            const float* vp = qkv + (size_t)kt * 3456 + 2304 + h * 72 + t;
-            for (int jj = 0; jj < lim; jj++) acc += ps[jj] * vp[(size_t)jj * 3456];
-        }
-        __syncthreads();
     }
-    if (t < 72) out[((size_t)qi * 16 + h) * 72 + t] = acc / l;
+    #pragma unroll
+    for (int i = 0; i < 5; i++) {
+        int a = t + 256 * i;
+        if (a < BR * 72) {
+            int r = a / 72, d = a - r * 72;
+            if (q0 + r < n) out[((size_t)(q0 + r) * 16 + h) * 72 + d] = acc[i] / lrow[r];
+        }
+    }
 }
 
 // Tiled f32-activation NVFP4 GEMM for the vision tower (#VIT hotfix):
