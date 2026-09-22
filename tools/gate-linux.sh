@@ -282,8 +282,15 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="313"
+TESTS="319"
 CLIPPY="1505"
+#   tests 313 -> 319 / clippy 1505 (unchanged)   #91 logprobs (2026-09-22): two sample.rs tests
+#                              (pos_logprobs against an f64 log-softmax reference; exact ties, NaN and -inf),
+#                              one tokenizer test (token_bytes concatenate to the exact text, split UTF-8
+#                              included) and three serve tests (the request fields and their named 400s,
+#                              the OpenAI entry in both wire forms, no `logprobs` key anywhere when off).
+#                              Measured 318 / 0 with the NVRTC ptx test skipped (no NVRTC run for this
+#                              task; 319 with it), clippy 1505, no new warning.
 #   tests 305 -> 313 / clippy 1505 (unchanged)   #99 (2026-09-22): six toolcall tests (the live
 #                              markup-only shapes, the named cut, both give-up names, the split sweep of
 #                              the records) and two serve tests (decide_finish, crow_malformed_calls on

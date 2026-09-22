@@ -81,10 +81,25 @@ unchanged: lines_total = tool calls graded, lines_with_error = CORRUPT calls,
 hex_char_errors = digit_near_miss count, missing = rounds without a tool call,
 line_error_rate = the ratio; schema_calls_with_error and error_kinds sit beside them.
 
+LOGPROBS (--top-logprobs N, 2..20; serve #91, architecture 7.11.22): every round asks for
+`logprobs: true, top_logprobs: N` -- the RAW model distribution at every generated id,
+tool-call markup and arguments included, `token`/`bytes` the raw token text. For every
+graded call with an error the probe finds the corrupt span in the concatenated token bytes
+(home_mismatch: `/home/<produced user>` vs `/home/<--home user>`; digit_near_miss: the
+produced component vs the context's; control_char: the value vs the value without control
+characters; placeholder: the value, no correct form), locates the FIRST DIVERGING TOKEN (the
+token holding the first byte where produced and correct differ), and prints the tokens around
+it with their top-N alternatives and the MARGIN = logprob[chosen] - logprob[best alternative]
+(positive: the chosen id was the raw argmax by that many nats; negative: it was not) plus the
+margin to the alternative that spells the CORRECT continuation, when one is in the top N.
+Every round, erroneous or not, also records the NARROWEST margins inside tool calls, so a
+clean round (the placebo arm) shows the same position's margin. All of it lands in the JSON
+(`rounds_detail[].logprobs`); the full entry list is not stored.
+
 Usage: corruption-replay-probe.py --preset diorama-0922 --session SNAPSHOT [--rounds 8]
            [--port 8099] [--seed0 0] [--label arm] [--json OUT]
        corruption-replay-probe.py --session S --at K [--at K2 ...] [...]
-Options: --no-stream, --sampling JSON (merged over Crow's), --tools-json FILE, --head-file FILE,
+Options: --top-logprobs N, --no-stream, --sampling JSON (merged over Crow's), --tools-json FILE, --head-file FILE,
          --wire-model NAME,
          --crow-core PATH (default the INSTALLED ~/.local/share/crow/cli/crow_core.py, the
          file the live GUI ran), --home DIR (default ~), --base-url URL (default
@@ -195,8 +210,10 @@ def crow_body(crow, messages, model, wire_model, base_url):
 
 
 def post(url, body, timeout=3600):
-    """(content, tool_calls, finish, usage). Streamed like Crow: `index` picks a slot, id/name
-    only on a truthy value, `arguments` concatenated raw (crow_core.stream_reply)."""
+    """(content, tool_calls, finish, usage, logprobs). Streamed like Crow: `index` picks a slot,
+    id/name only on a truthy value, `arguments` concatenated raw (crow_core.stream_reply).
+    `logprobs` is the concatenation of every `choices[0].logprobs.content` (#91), [] when the
+    body did not ask for them."""
     req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -207,8 +224,9 @@ def post(url, body, timeout=3600):
             calls = [{"id": c.get("id") or "", "name": (c.get("function") or {}).get("name") or "",
                       "arguments": (c.get("function") or {}).get("arguments") or ""}
                      for c in msg.get("tool_calls") or []]
-            return msg.get("content") or "", calls, ch.get("finish_reason"), ans.get("usage") or {}
-        content, slots, finish, usage = [], {}, None, {}
+            lps = list(((ch.get("logprobs") or {}).get("content")) or [])
+            return msg.get("content") or "", calls, ch.get("finish_reason"), ans.get("usage") or {}, lps
+        content, slots, finish, usage, lps = [], {}, None, {}, []
         for raw in r:
             line = raw.decode("utf-8", "replace").strip()
             if not line.startswith("data: ") or line == "data: [DONE]":
@@ -222,6 +240,7 @@ def post(url, body, timeout=3600):
             for ch in chunk.get("choices") or []:
                 if ch.get("finish_reason"):
                     finish = ch["finish_reason"]
+                lps += ((ch.get("logprobs") or {}).get("content")) or []
                 delta = ch.get("delta") or {}
                 for call in delta.get("tool_calls") or []:
                     slot = slots.setdefault(call.get("index", 0), {"id": "", "name": "", "arguments": ""})
@@ -234,7 +253,150 @@ def post(url, body, timeout=3600):
                         slot["arguments"] += fn["arguments"]
                 if delta.get("content"):
                     content.append(delta["content"])
-        return "".join(content), [slots[i] for i in sorted(slots)], finish, usage
+        return "".join(content), [slots[i] for i in sorted(slots)], finish, usage, lps
+
+
+# ------------------------------------------------------------------ logprobs (#91)
+
+def _alts(e):
+    return [a for a in e.get("top_logprobs") or [] if bytes(a.get("bytes") or []) != bytes(e.get("bytes") or [])]
+
+
+def margin(e):
+    """logprob[chosen] - logprob[best alternative that is not the chosen id], or None when the
+    top list names no other id. By bytes: two ids never share their bytes in this vocabulary
+    except for an added token and its spelling, which is the same text either way."""
+    alts = _alts(e)
+    return round(e["logprob"] - max(a["logprob"] for a in alts), 6) if alts else None
+
+
+def _tok(e):
+    return bytes(e.get("bytes") or []).decode("utf-8", "replace")
+
+
+def token_view(e, i):
+    return {"i": i, "token": _tok(e), "logprob": round(e["logprob"], 6), "margin": margin(e),
+            "top": [[bytes(a.get("bytes") or []).decode("utf-8", "replace"), round(a["logprob"], 6)]
+                    for a in e.get("top_logprobs") or []]}
+
+
+def token_offsets(entries):
+    """(the concatenated bytes, [start byte of each entry])"""
+    starts, buf = [], bytearray()
+    for e in entries:
+        starts.append(len(buf))
+        buf += bytes(e.get("bytes") or [])
+    return bytes(buf), starts
+
+
+def error_pair(e, home):
+    """(produced, correct or None) of one grader error, the strings whose first difference is
+    the first diverging token; None when the error names no span (json_invalid, schema)."""
+    k = e["kind"]
+    if k == "home_mismatch":
+        return "/home/" + e["user"], "/home/" + e["want"]
+    if k == "digit_near_miss":
+        return e["got"], e["context"]
+    if k == "control_char":
+        return e["value"], CONTROL.sub("", e["value"])
+    if k == "placeholder":
+        return e["value"], None
+    return None
+
+
+def divergence(entries, produced, correct, window=6):
+    """The first diverging token of `produced` (vs `correct`) in the generated token bytes:
+    {first_diverging_token, margin, correct_alt, window[...]} or None when the span is not
+    in the generated text. The LAST occurrence is taken: a path the model echoes in its
+    reasoning before the call is not the call."""
+    text, starts = token_offsets(entries)
+    pb = produced.encode("utf-8")
+    at = text.rfind(pb)
+    if at < 0 or not pb:
+        return None
+    cp = 0
+    if correct is not None:
+        cb = correct.encode("utf-8")
+        while cp < min(len(pb), len(cb)) and pb[cp] == cb[cp]:
+            cp += 1
+    # a produced span that is a strict prefix of the correct one diverges right after it
+    div = min(at + cp, len(text) - 1)
+    j = max(i for i, s in enumerate(starts) if s <= div)
+    e = entries[j]
+    out = {"produced": produced, "correct": correct, "byte": div, "token_index": j,
+           "first_diverging_token": token_view(e, j), "margin": margin(e),
+           "window": [token_view(entries[i], i) for i in range(max(0, j - window), min(len(entries), j + window + 1))]}
+    if correct is not None:
+        # what the correct text continues with FROM THIS TOKEN'S START
+        want = text[starts[j]:div] + correct.encode("utf-8")[cp:]
+        ok = [a for a in _alts(e) if bytes(a.get("bytes") or []) and want.startswith(bytes(a["bytes"]))]
+        if ok:
+            best = max(ok, key=lambda a: a["logprob"])
+            out["correct_alt"] = {"token": bytes(best["bytes"]).decode("utf-8", "replace"),
+                                  "logprob": round(best["logprob"], 6),
+                                  "margin_vs_correct": round(e["logprob"] - best["logprob"], 6)}
+        else:
+            out["correct_alt"] = None
+    return out
+
+
+def tool_spans(entries):
+    """Indices of the entries between `<tool_call>` and `</tool_call>` (markup included)."""
+    inside, idx = False, []
+    for i, e in enumerate(entries):
+        t = _tok(e)
+        if "<tool_call>" in t:
+            inside = True
+        if inside:
+            idx.append(i)
+        if "</tool_call>" in t:
+            inside = False
+    return idx
+
+
+def logprob_report(entries, graded, home, narrowest=8):
+    """What a round's logprobs say: one `divergence` per errored call's spannable error, and
+    the `narrowest` smallest |margin| tokens inside tool calls (every round, clean or not)."""
+    spans = []
+    for ci, g in enumerate(graded["calls"]):
+        for e in g["errors"]:
+            pair = error_pair(e, home)
+            if not pair:
+                continue
+            d = divergence(entries, *pair)
+            spans.append(dict(d or {"produced": pair[0], "correct": pair[1], "not_found": True},
+                              call=ci, name=g["name"], kind=e["kind"]))
+    cand = [(abs(margin(entries[i])), i) for i in tool_spans(entries) if margin(entries[i]) is not None]
+    near = [token_view(entries[i], i) for _, i in sorted(cand)[:narrowest]]
+    return {"n_tokens": len(entries), "spans": spans, "narrowest_in_tool_calls": near}
+
+
+def print_report(rep, k, seed, out=sys.stderr):
+    for s in rep["spans"]:
+        if s.get("not_found"):
+            print("  logprobs: call %d %s (%s): %r not in the generated tokens" % (
+                s["call"], s["name"], s["kind"], s["produced"]), file=out)
+            continue
+        f = s["first_diverging_token"]
+        ca = s.get("correct_alt")
+        print("  logprobs at %d seed %d: call %d %s (%s) %r vs %r: first diverging token #%d %r "
+              "logprob %.4f, margin %s%s" % (
+                  k, seed, s["call"], s["name"], s["kind"], s["produced"], s["correct"],
+                  f["i"], f["token"], f["logprob"],
+                  "n/a" if s["margin"] is None else "%+.4f" % s["margin"],
+                  (", correct %r logprob %.4f (margin vs correct %+.4f)" % (
+                      ca["token"], ca["logprob"], ca["margin_vs_correct"])) if ca else
+                  (", correct continuation not in the top list" if s["correct"] is not None else "")),
+              file=out)
+        for t in s["window"]:
+            print("    %s#%-4d %-18r %9.4f  margin %-9s top %s" % (
+                ">" if t["i"] == f["i"] else " ", t["i"], t["token"], t["logprob"],
+                "n/a" if t["margin"] is None else "%+.4f" % t["margin"],
+                ", ".join("%r %.3f" % (a, lp) for a, lp in t["top"])), file=out)
+    if rep["narrowest_in_tool_calls"]:
+        print("  logprobs at %d seed %d: narrowest margins in tool calls: %s" % (
+            k, seed, ", ".join("#%d %r %+.4f" % (t["i"], t["token"], t["margin"])
+                               for t in rep["narrowest_in_tool_calls"][:5])), file=out)
 
 
 # ------------------------------------------------------------------ the grader
@@ -470,11 +632,16 @@ def main():
                     help="the request's `model` field (default: crow_core.DEFAULT_MODEL, the window's --model default)")
     ap.add_argument("--home", default=os.path.expanduser("~"))
     ap.add_argument("--no-stream", action="store_true")
+    ap.add_argument("--top-logprobs", type=int, default=None, metavar="N",
+                    help="ask serve for logprobs + N alternatives (2..20, #91) and report the margin "
+                         "at the first diverging token of every corrupt call")
     ap.add_argument("--live-only", action="store_true", help="grade the stored answers only, send nothing")
     ap.add_argument("--allow-session-drift", action="store_true",
                     help="run a preset against a session whose sha256 differs from the preset's")
     ap.add_argument("--json", default="-")
     args = ap.parse_args()
+    if args.top_logprobs is not None and not 2 <= args.top_logprobs <= 20:
+        sys.exit("--top-logprobs N: 2..20 (a margin needs one alternative beside the chosen id)")
 
     preset = PRESETS.get(args.preset) if args.preset else None
     session = os.path.expanduser(args.session or (preset or {}).get("session") or "")
@@ -528,7 +695,7 @@ def main():
             "crow_core_sha256": crow_sha,
             "tools_source": ("--tools-json %s" % args.tools_json) if tools_override is not None
             else "crow_core.TOOLS via stream_reply", "stream": not args.no_stream,
-            "sampling_override": extra}
+            "sampling_override": extra, "top_logprobs": args.top_logprobs}
 
     rounds, per_point = [], []
     for p in points:
@@ -541,6 +708,9 @@ def main():
         if args.no_stream:
             body["stream"] = False
             body.pop("stream_options", None)
+        if args.top_logprobs is not None:
+            body["logprobs"] = True
+            body["top_logprobs"] = args.top_logprobs
         ctx = context_index(hist)
         tools = body.get("tools") or []
         nbytes = len(json.dumps(body).encode("utf-8"))
@@ -566,7 +736,7 @@ def main():
             b = dict(body, seed=seed)
             t0 = time.time()
             try:
-                content, calls, finish, usage = post(url, b)
+                content, calls, finish, usage, lps = post(url, b)
             except urllib.error.HTTPError as exc:
                 rounds.append({"at": k, "seed": seed, "error": "HTTP %d: %s" % (exc.code, exc.read()[:300])})
                 continue
@@ -582,11 +752,15 @@ def main():
                       "prompt_tokens_delta_vs_live": (ptok - p["live_prompt_tokens"])
                       if ptok is not None and p.get("live_prompt_tokens") else None,
                       "content_chars": len(content), "reply": _short(calls)})
+            if args.top_logprobs is not None:
+                g["logprobs"] = logprob_report(lps, g, args.home)
             rounds.append(g)
             print("at %d seed %d: %d call(s), %d corrupt %s, prompt %s tok (%s cached), %.0f s" % (
                 k, seed, g["n_calls"], g["calls_with_error"],
                 sorted({e["kind"] for c in g["calls"] for e in c["errors"]}), ptok,
                 g["cached_tokens"], g["seconds"]), file=sys.stderr)
+            if "logprobs" in g:
+                print_report(g["logprobs"], k, seed)
 
     ok = [x for x in rounds if "error" not in x]
     kinds = {}

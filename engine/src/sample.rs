@@ -898,6 +898,82 @@ pub fn argmax(logits: &[f32]) -> usize {
     best
 }
 
+/// #91: the most `top_logprobs` a request may ask for - OpenAI's own ceiling
+/// (`CreateChatCompletionRequest.top_logprobs`, 0..=20).
+pub const MAX_TOP_LOGPROBS: usize = 20;
+
+/// what the log-probability of a JSON-unrepresentable value (a `-inf` logit, or
+/// a NaN) is reported as: OpenAI's own floor for "vanishingly unlikely"
+pub const LOGPROB_FLOOR: f64 = -9999.0;
+
+/// #91: the log-probabilities of ONE position, read off the RAW logits row
+#[derive(Debug, Clone, PartialEq)]
+pub struct PosLogprobs {
+    /// the id this position generated (drawn, argmax, or #81-injected)
+    pub chosen: usize,
+    /// `ln p(chosen)` under the raw distribution
+    pub chosen_lp: f64,
+    /// the `n` most likely ids, value descending, index ascending on a tie
+    pub top: Vec<(usize, f64)>,
+}
+
+/// - #91: `log_softmax(row)` at `chosen` and at the `n` largest entries, in f64
+/// - the RAW model distribution: the lm_head row as it left the device, before
+///   `logit_bias`, the penalties, DRY, temperature and every truncation of the
+///   chain (`Sampler::sample`) - llama-server's default (`n_probs` without
+///   `post_sampling_probs`: "a simple softmax of the logits without considering
+///   any other sampler settings"). The margin a near-tie question needs is a
+///   property of the MODEL, not of the sampler profile that happened to run.
+/// - order: value descending, index ascending on an exact tie - the total order
+///   the rest of this file uses; so `top[0]` is the lowest id among the maxima.
+///   The device `argmax_k` reduction may pick another id of an exact tie, and
+///   then `chosen != top[0].0` with a margin of exactly 0.
+/// - `ln Z` = max + ln(sum exp(l - max)), accumulated in f64 in index order.
+///   NaN entries are skipped (never top, not in Z); a `-inf` entry is probability
+///   0. A non-finite result is reported as `LOGPROB_FLOOR` (JSON has no -inf).
+/// - one pass for the max and the top-n (a bounded insertion list, n <= 20), one
+///   for Z: 2 x V reads of an f32 row the caller already holds on the host.
+/// - pure: the test drives it on synthetic rows.
+pub fn pos_logprobs(row: &[f32], chosen: usize, n: usize) -> PosLogprobs {
+    let n = n.min(MAX_TOP_LOGPROBS).min(row.len());
+    let mut maxv = f32::NEG_INFINITY;
+    // descending by value; a later index never displaces an equal earlier one
+    let mut top: Vec<(usize, f32)> = Vec::with_capacity(n + 1);
+    for (i, &l) in row.iter().enumerate() {
+        if l.is_nan() {
+            continue;
+        }
+        if l > maxv {
+            maxv = l;
+        }
+        if n > 0 && (top.len() < n || l > top[top.len() - 1].1) {
+            let pos = top.iter().position(|c| l > c.1).unwrap_or(top.len());
+            top.insert(pos, (i, l));
+            if top.len() > n {
+                top.pop();
+            }
+        }
+    }
+    let mut z = 0f64;
+    if maxv.is_finite() {
+        for &l in row {
+            if !l.is_nan() {
+                z += ((l - maxv) as f64).exp();
+            }
+        }
+    }
+    let lnz = maxv as f64 + z.ln();
+    let lp = |l: f32| -> f64 {
+        let v = l as f64 - lnz;
+        if v.is_finite() { v } else { LOGPROB_FLOOR }
+    };
+    PosLogprobs {
+        chosen,
+        chosen_lp: row.get(chosen).map(|&l| lp(l)).unwrap_or(LOGPROB_FLOOR),
+        top: top.into_iter().map(|(i, l)| (i, lp(l))).collect(),
+    }
+}
+
 /// EOS ids of the checkpoint (generation_config): `<|im_end|>` and
 /// `<|endoftext|>`. The second one is `geo::PLE_EOS` - the PLE shard reader's
 /// end marker and the sampler's stop id are the SAME token, written once.
@@ -1994,5 +2070,53 @@ mod tests {
         s.xtc_probability = 0.0;
         s.mirostat = 2;
         assert!(s.host_route());
+    }
+
+    /// #91: `pos_logprobs` is log_softmax of the RAW row - checked against an
+    /// f64 reference on a synthetic row, the chosen id may sit outside the top
+    /// n, the probabilities of the full row sum to 1, and n is capped at 20.
+    #[test]
+    fn pos_logprobs_is_the_log_softmax_of_the_raw_row() {
+        let row: Vec<f32> = (0..1000).map(|i| ((i * 7919) % 1000) as f32 * 0.013 - 6.0).collect();
+        let m = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let lnz = m + row.iter().map(|&l| (l as f64 - m).exp()).sum::<f64>().ln();
+        let mut order: Vec<usize> = (0..row.len()).collect();
+        order.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
+        let p = pos_logprobs(&row, 17, 5);
+        assert_eq!(p.chosen, 17);
+        assert!((p.chosen_lp - (row[17] as f64 - lnz)).abs() < 1e-9);
+        assert_eq!(p.top.iter().map(|t| t.0).collect::<Vec<_>>(), order[..5].to_vec());
+        for (i, lp) in &p.top {
+            assert!((lp - (row[*i] as f64 - lnz)).abs() < 1e-9);
+        }
+        let all = pos_logprobs(&row, 0, 20);
+        assert_eq!(all.top.len(), 20, "n is capped at MAX_TOP_LOGPROBS");
+        let total: f64 = (0..row.len()).map(|i| pos_logprobs(&row, i, 0).chosen_lp.exp()).sum();
+        assert!((total - 1.0).abs() < 1e-9, "the row's probabilities sum to {total}");
+        assert!(pos_logprobs(&row, 3, 0).top.is_empty(), "top_logprobs 0 is an empty list");
+    }
+
+    /// #91: the near-tie the logprobs exist to measure. An EXACT tie orders by
+    /// index ascending (margin 0, both entries equal), NaN never enters the
+    /// list or Z, `-inf` is probability 0 and reports as the OpenAI floor.
+    #[test]
+    fn pos_logprobs_orders_ties_by_index_and_survives_non_finite_logits() {
+        let mut row = vec![0.0f32; 64];
+        row[40] = 5.0;
+        row[9] = 5.0; // exact tie with 40: 9 comes first
+        row[30] = 4.999;
+        row[2] = f32::NAN;
+        row[3] = f32::NEG_INFINITY;
+        let p = pos_logprobs(&row, 40, 4);
+        assert_eq!(p.top.iter().map(|t| t.0).collect::<Vec<_>>(), vec![9, 40, 30, 0]);
+        assert_eq!(p.top[0].1, p.top[1].1, "a tie is a tie");
+        assert_eq!(p.chosen_lp, p.top[1].1);
+        assert!(p.top[1].1 - p.top[2].1 > 0.0 && p.top[1].1 - p.top[2].1 < 2e-3);
+        // Z over the finite entries only: 2 e^5 + e^4.999 + 59 e^0 (NaN skipped, -inf = 0)
+        let z = 2.0 * 5f64.exp() + (4.999f32 as f64).exp() + 59.0;
+        assert!((p.chosen_lp - (5.0 - z.ln())).abs() < 1e-9);
+        assert_eq!(pos_logprobs(&row, 3, 0).chosen_lp, LOGPROB_FLOOR);
+        assert_eq!(pos_logprobs(&row, 2, 0).chosen_lp, LOGPROB_FLOOR);
+        assert_eq!(pos_logprobs(&row, 999, 0).chosen_lp, LOGPROB_FLOOR, "an id off the row");
     }
 }

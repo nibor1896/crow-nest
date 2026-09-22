@@ -2307,6 +2307,9 @@ Therefore:
 | `messages[].reasoning_content` | passed through untouched; the template renders a STRING one into the assistant turn's think block, ignores any other type (`chat:112`) | `normalize_messages` | `crow_core.py:3755` (stored when the stream carried one) |
 | every other `messages[]` shape | checked BEFORE the render; a refusal names the message index and the field (7.11.14) | `serve.rs:1564` (`check_messages`) | — |
 | `tool_call_id` | carried, never read; this template pairs by order | `serve.rs:1481` | `crow_core.py` tool turns |
+| `logprobs` | **read since #91 (2026-09-22)**: `true` adds the log-probability of every generated id, from the RAW model distribution (before `logit_bias`, penalties, temperature and every filter); absent, `null` or `false` is the behaviour of record, no readback and no new key (7.11.22) | `parse_chat`, `chat_generate`, `sample::pos_logprobs` | not sent by Crow; `tools/corruption-replay-probe.py --top-logprobs N` |
+| `top_logprobs` | 0..=20 alternatives per position, default 0; only with `logprobs: true`, otherwise a 400 (OpenAI's rule) (7.11.22) | `parse_chat` | as above |
+| `post_sampling_probs` | llama-server's post-sampler switch: **not offered**, `true` is a 400 naming why; `false` is accepted (7.11.22) | `parse_chat` | — |
 
 **7.11.4 `POST /v1/chat/completions`, the stream**
 
@@ -2315,6 +2318,7 @@ Therefore:
 | 1 | `delta:{"role":"assistant"}`, `finish_reason` null | `serve.rs:1299` (`chunk_role`) | `crow_core.py:4831-4877` |
 | 2..n | `delta:{"content":"..."}` , one per emitted piece | `serve.rs:1304` (`chunk_content`) | `crow_core.py:4831-4877` (`delta.content`) |
 | 2..n | `delta:{"reasoning_content":"..."}` — the whole reasoning of a THINKING request (#74, 7.11.20), or the `<think>` block a non-thinking model opened by itself (7.11.16); never an empty frame | `chunk_reasoning` | `crow_core.py:5045` (`reasoning_delta`), shown behind `--show-reasoning`, stored at `:3755` |
+| 2..n | `delta:{}` plus `logprobs:{"content":[<one entry>],"refusal":null}` — ONLY with `logprobs: true`, one per generated id, before any text of that id (#91, 7.11.22) | `chunk_logprobs`, `logprob_entry` | not read by Crow |
 | n+1 | `delta:{}` plus `finish_reason`, optionally `usage` and `timings`; `crow_malformed_calls` when the parser abandoned a call (#99, 7.11.21) | `chunk_finish`, `attach_malformed` | `crow_core.py:4831-4877`, `:4999-5018` |
 | n+2 | `data: [DONE]` | `serve.rs:517` (`SSE_DONE`) | `crow_core.py:4035` |
 | framing | `data: <compact json>` plus a blank line, one flush per frame | `serve.rs:1354` (`sse_frame`) | `crow_core.py:4831-4877` |
@@ -2448,6 +2452,7 @@ C:/x/y.md
 | a second `serve` process | non-zero exit on `engine/.engine.lock` | `serve.rs` module doc, `Engine::load` |
 | read or write timeout (10 s per connection) | one stderr line, that connection closed, accept loop continues | `serve.rs:499` |
 | a client that sent nothing | closed silently, no response | `serve.rs:2563` (`read_head_from`) |
+| `top_logprobs` without `logprobs: true`, over 20 or not a non-negative integer; a non-boolean `logprobs`; `post_sampling_probs: true` | 400 JSON naming the field (#91, 7.11.22) | `parse_chat` |
 | a `messages` shape the chat template cannot render (content that is not string/list/null, a part that is not text or `image_url`, `tool_calls` not an array, a call or `function` that is not an object, a non-string `function.name`, an unknown role, a system message that is not first) | 400 JSON naming the message index and the field, BEFORE the render | `serve.rs:1564` (`check_messages`), `:1601` (`check_content`), `:1640` (`check_tool_call`) |
 | an `image_url` block without `image_url.url` | 400 JSON naming the message index | `serve.rs:1006` |
 | an image over `VIT_MAX_PATCHES` | 413 JSON | `vit.rs` module doc |
@@ -2527,6 +2532,7 @@ C:/x/y.md
 | `choices[0].message.reasoning_content` | present when the reasoning filter has reasoning to give: a block the model opened itself (#67, 7.11.16) or the whole thought of a request that asked to think (#74, 7.11.20); absent otherwise, as before | `completion_json` | `probe-suite.py:680` reads it when present |
 | `choices[0].finish_reason` | `stop`, `length` or `tool_calls`, the stream's rules unchanged; `abort` when the generation was cut by a gone client or a shutdown (#99: the document is still written, 7.11.21) | `decide_finish` | `probe-suite.py:678` |
 | `crow_malformed_calls` | top level, present ONLY when the parser abandoned a call, the same array as the stream's final chunk (#99, 7.11.21) | `attach_malformed` | Crow #217 |
+| `choices[0].logprobs` | present ONLY with `logprobs: true`: `{"content": [one entry per generated id], "refusal": null}`, the entries the stream sends one per chunk (#91, 7.11.22) | `attach_logprobs` | `corruption-replay-probe.py --top-logprobs` |
 | `usage` | `usage_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1109` (`usage_json`), `serve.rs:1477` | `probe-suite.py:681-683` (`completion_tokens`) |
 | `timings` | `timings_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1122` (`timings_json`), `serve.rs:1477` | neither caller reads it |
 | headers | `application/json`, `Content-Length`, `Connection: close`, as on every other JSON route | `serve.rs:2099` (`chat_document`), `serve.rs:1947` (`respond`) | `urllib.request` in both callers |
@@ -3180,6 +3186,33 @@ Replayed against 2026-09-22 (by the parser tests over the stored shapes; no engi
 four silent rounds give one `close-before-function` record each, 15:16:42 one `end-in-call`,
 so the log counts 8 of 8, not 4; 10:23:37 reaches the client once; 13:58:31 and 15:54:30 log
 `finish abort` and no `ERROR`.
+
+**7.11.22 `logprobs` / `top_logprobs`: the raw distribution at every generated id (#91, 2026-09-22)**
+
+Why: at replay point K=2 of #91 the engine writes `/home/nibor11896` for `/home/nibor1896` under
+GREEDY on the bare container, and a numerically neutral BF16 "placebo" overlay flips it back.
+The hypothesis is a near-tie between the right and the wrong id at that position; the margin
+is a property of the MODEL's distribution, so that is what this reports.
+
+| question | as built |
+|---|---|
+| which distribution | the RAW one: `log_softmax` of the lm_head row as it left the device - BEFORE `logit_bias` (#86), the penalties (#68/#84), DRY (#85), temperature, top-k, top-p, min-p and the #92 tier. This is llama-server's default (`n_probs` without `post_sampling_probs`: "a simple softmax of the logits without considering any other sampler settings", `tools/server/README.md`; `get_token_probabilities`, `tools/server/server-common.cpp`). Under greedy without bias or penalties the chosen id IS the raw argmax |
+| the post-sampler distribution | **not offered**. The device node `sample_k` never materialises its truncated, tempered distribution on the host and the host chain returns only the drawn id; `post_sampling_probs: true` is a 400 instead of raw numbers under a flag that says otherwise |
+| wire, one entry | OpenAI `ChatCompletionTokenLogprob`: `{"token", "logprob", "bytes", "top_logprobs": [{"token", "logprob", "bytes"}]}`. `bytes` are the id's exact bytes (`ChatTokenizer::token_bytes`: an added token is its content, a vocabulary token its GPT-2 byte-level string mapped back); `token` is their lossy UTF-8, so half of a split character is U+FFFD in `token` and its true byte in `bytes` |
+| wire, stream | one extra chunk per generated id: `delta:{}`, `logprobs:{"content":[entry],"refusal":null}`, `finish_reason` null; sent right after the id is generated, before any text it produces (text can be held back by the UTF-8, tool-call, think and stop holds, an entry never is). A client concatenates `logprobs.content` across chunks |
+| wire, document | `choices[0].logprobs = {"content":[every entry],"refusal":null}` |
+| which ids | EVERY generated id, in generation order, whatever channel its text ends in - reasoning, content, tool-call markup (`<tool_call>`, `<function=...>`), a tool call's `arguments`, a stop string the stop filter swallowed, an #81-injected close. `token` is the RAW token text, so the entries of a tool call spell its markup, not the `arguments` JSON: a client finds a corrupt argument by concatenating `token` bytes. EOS is not an entry (it is not generated text, as with OpenAI). An #81-injected id is priced under the distribution of the position it was forced into |
+| ordering, ties | `top_logprobs` by value descending, id ascending on an exact tie (the total order of `sample.rs`); the device `argmax_k` may pick another id of an exact tie, so `chosen != top_logprobs[0]` with a margin of exactly 0 is possible and means a tie |
+| non-finite | NaN logits are skipped (not in the list, not in Z); a `-inf` logit is probability 0; a non-finite logprob is reported as `-9999.0` (OpenAI's floor; JSON has no `-inf`) |
+| where the row is read | `chat_generate`, right after `out.push(next)`: `s.logits` (row 0, `V` f32) still holds the row that produced `next` - the prefill or the last `decode_step` wrote it, `arm_sampler`, the device `sample_topk_part`/`sample_k` nodes and `draw_biased` only read it, and the next `decode_step` has not run |
+| cost OFF | nothing: one `if req.logprobs` per token; no readback, no chunk, no key. Every chunk and document of record is byte-identical (`without_logprobs_no_chunk_and_no_document_carries_the_key`) |
+| cost ON | the host route `draw_biased` already pays: one `cuda::dtoh` of the row (248,320 f32 = 0.99 MB, pageable) plus two host passes over it (max and top-n with a bounded insertion list, then `ln Z` in f64); the `[chat]` line reports the total wall of both. A device top-k plus a ~200 B copy would remove the MB but is a kernel change that needs a GPU oracle; it is the follow-up if the readback ever matters (it does not for a measurement run) |
+| the `[chat]` line | `[chat] logprobs (#91): N entries, top_logprobs k, raw distribution (pre-sampler), readback + log-softmax X ms in total, narrowest top-1/top-2 gap G nats at generated id i` |
+
+Refusals (400, named): `top_logprobs` without `logprobs: true`, over 20, or not a non-negative
+integer; `logprobs` not a boolean; `post_sampling_probs: true`. Unlike llama-server
+(`logprobs is not supported with tools + stream`), a streamed request WITH tools is served: the
+tool-call argument is exactly where #91's corruption sits.
 
 ### 7.12 The stage A gate table (what was measured, and where the artefact is)
 

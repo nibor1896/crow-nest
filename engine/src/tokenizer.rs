@@ -387,6 +387,59 @@ impl ChatTokenizer {
     pub fn token_id(&self, token: &str) -> Option<u32> {
         self.tok.token_to_id(token)
     }
+
+    /// - #91: the exact bytes ONE id stands for, the `bytes` of an OpenAI logprobs entry
+    /// - an added token (`<tool_call>`, `<|im_end|>`, ...) is its content, verbatim: the
+    ///   decoder emits added tokens as their content, special or not
+    /// - a vocabulary token is the GPT-2 byte-level string of this tokenizer's `ByteLevel`
+    ///   decoder, mapped back char by char (`byte_level_char`); a char outside that table
+    ///   stays its own UTF-8, which cannot happen for a byte-level vocabulary entry
+    /// - may be a PARTIAL UTF-8 sequence (a multi-byte character split over two ids) - the
+    ///   reason OpenAI carries `bytes` beside the `token` string at all
+    /// - an id outside the vocabulary is empty
+    pub fn token_bytes(&self, id: u32) -> Vec<u8> {
+        if let Some(t) = self.tok.get_added_vocabulary().get_added_tokens_decoder().get(&id) {
+            return t.content.as_bytes().to_vec();
+        }
+        let Some(piece) = self.tok.id_to_token(id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(piece.len());
+        for ch in piece.chars() {
+            match byte_level_char(ch) {
+                Some(b) => out.push(b),
+                None => out.extend_from_slice(ch.encode_utf8(&mut [0u8; 4]).as_bytes()),
+            }
+        }
+        out
+    }
+}
+
+/// - #91: the inverse of GPT-2's `bytes_to_unicode`, the table HF's `ByteLevel`
+///   pre-tokenizer and decoder use: the 188 printable bytes `!`..`~`, `\u{a1}`..`\u{ac}`,
+///   `\u{ae}`..`\u{ff}` map to themselves, the other 68 bytes, in ascending order, to
+///   U+0100, U+0101, ... (so the space 0x20 is `\u{120}`, the `Ġ` of every vocabulary)
+/// - `None`: the char is not in the table
+fn byte_level_char(ch: char) -> Option<u8> {
+    let c = ch as u32;
+    let printable = |b: u32| (0x21..=0x7e).contains(&b) || (0xa1..=0xac).contains(&b) || (0xae..=0xff).contains(&b);
+    if printable(c) {
+        return Some(c as u8);
+    }
+    if !(0x100..0x100 + 68).contains(&c) {
+        return None;
+    }
+    // the (c - 0x100)-th byte, ascending, that is NOT printable
+    let mut k = c - 0x100;
+    for b in 0u32..256 {
+        if !printable(b) {
+            if k == 0 {
+                return Some(b as u8);
+            }
+            k -= 1;
+        }
+    }
+    None
 }
 
 /// the single user message `tokenize_ids.py --chat` sends
@@ -731,5 +784,30 @@ mod tests {
         let t = tk();
         assert!(t.token_id("<|im_end|>").is_some());
         assert_eq!(t.token_id("<|im_end|>"), Some(248046));
+    }
+
+    /// #91: the `bytes` of a logprobs entry. The byte-level table is GPT-2's
+    /// (space = U+0120, newline = U+010A, 0x7f = U+0121, 0xad = U+0143), every id of an
+    /// encoded text concatenates back to the text's exact bytes - a split multi-byte
+    /// character included - and an added token is its content.
+    #[test]
+    fn token_bytes_concatenate_to_the_exact_text() {
+        assert_eq!(byte_level_char('\u{120}'), Some(b' '));
+        assert_eq!(byte_level_char('\u{10a}'), Some(b'\n'));
+        assert_eq!(byte_level_char('\u{100}'), Some(0x00));
+        assert_eq!(byte_level_char('\u{121}'), Some(0x7f));
+        assert_eq!(byte_level_char('\u{143}'), Some(0xad));
+        assert_eq!(byte_level_char('A'), Some(b'A'));
+        assert_eq!(byte_level_char(' '), None);
+        assert_eq!(byte_level_char('\u{144}'), None);
+        let t = tk();
+        for text in ["/home/nibor1896/Projects/x.rs", "  indent\n\tgrüße ẞ 🦀 ok", "{\"a\": [1, 2]}"] {
+            let ids = t.encode_raw(text).unwrap();
+            let bytes: Vec<u8> = ids.iter().flat_map(|&i| t.token_bytes(i)).collect();
+            assert_eq!(bytes, text.as_bytes(), "ids {ids:?}");
+        }
+        let im_end = t.token_id("<|im_end|>").unwrap();
+        assert_eq!(t.token_bytes(im_end), b"<|im_end|>");
+        assert!(t.token_bytes(u32::MAX).is_empty());
     }
 }

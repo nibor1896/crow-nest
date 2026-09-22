@@ -165,6 +165,8 @@
 //! | `mirostat_eta` | #92: mirostat v2 learning rate, default 0.1 |
 //! | `stop` | #86: OpenAI stop strings, an array of strings (a bare string is the one-stop form); generation ends BEFORE the sequence is emitted, `finish_reason` `stop`; empty entries drop, no count cap |
 //! | `logit_bias` | #86: map TOKEN ID -> additive bias on the raw logits, applied FIRST, outside the sampler chain (llama.cpp's order); `-inf` as f32 is a hard mask; a biased request samples on the HOST |
+//! | `logprobs` | #91: `true` adds OpenAI logprobs for EVERY generated id (tool-call markup and arguments included), from the RAW distribution (log-softmax of the lm_head row, before bias, penalties, temperature and every filter); one row readback per token, nothing when off; architecture 7.11.22 |
+//! | `top_logprobs` | #91: 0..=20 alternatives per position, default 0; a 400 without `logprobs: true`. `post_sampling_probs: true` is a 400: the post-sampler distribution is not offered |
 //! | `tools` | array of OpenAI function tools, RENDERED as the template variable `tools` (#29 A7) |
 //! | `stream_options.include_usage` | `true` puts `usage` on the final chunk (#27 A5) |
 //! | `timings_per_token` | `true` puts `timings` on the final chunk (#27 A5) |
@@ -580,7 +582,7 @@ use crow_nest_engine::boot;
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::{DevSampler, Engine};
 use crow_nest_engine::geo::{apply_adapt_policy, DEFAULT_CNQ, DEFAULT_HOTSETS, LAYERS, TRICKLE_CHUNK_THRESHOLD, V};
-use crow_nest_engine::sample::{Sampler, EOS_IDS};
+use crow_nest_engine::sample::{pos_logprobs, PosLogprobs, Sampler, EOS_IDS, MAX_TOP_LOGPROBS};
 use crow_nest_engine::slot;
 use crow_nest_engine::stopstr::StopStrings;
 use crow_nest_engine::toolcall::{Emit, Malformed, ToolStream, TOOL_OPEN};
@@ -1225,6 +1227,12 @@ struct ChatReq {
     /// This is the exact wire form Crow sends (crow_core.py `image_part`):
     /// `{"type":"image_url","image_url":{"url":"data:<mime>;base64,..."}}`.
     images: Vec<String>,
+    /// #91: OpenAI `logprobs`. `false` (absent included) is the behaviour of every
+    /// release before #91: no logits row is read back, no chunk or field is added.
+    logprobs: bool,
+    /// #91: OpenAI `top_logprobs`, 0..=20 alternatives per position; only with
+    /// `logprobs: true` (the body naming it without that is a 400, as OpenAI answers)
+    top_logprobs: usize,
 }
 
 /// - #28/#68/#83/#84: the sampling provenance line. Every VALUE, then
@@ -1676,6 +1684,36 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
                 .to_string(),
         ),
     };
+    // #91: `logprobs` / `top_logprobs`, the OpenAI pair. The values are the RAW model
+    // distribution (`sample::pos_logprobs`); llama-server's `post_sampling_probs` - the
+    // distribution AFTER the sampler chain - is NOT offered, and a body asking for it is
+    // refused by name rather than answered with the raw numbers under a flag that says
+    // otherwise.
+    let logprobs = match obj.get("logprobs") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(v) => v.as_bool().ok_or_else(|| "logprobs is not a boolean".to_string())?,
+    };
+    let top_logprobs = match obj.get("top_logprobs") {
+        None | Some(serde_json::Value::Null) => 0,
+        Some(v) => {
+            if !logprobs {
+                return Err("top_logprobs requires logprobs to be true".to_string());
+            }
+            let n = v
+                .as_u64()
+                .ok_or_else(|| "top_logprobs is not a non negative integer".to_string())?
+                as usize;
+            if n > MAX_TOP_LOGPROBS {
+                return Err(format!("top_logprobs {n} is over the limit of {MAX_TOP_LOGPROBS}"));
+            }
+            n
+        }
+    };
+    if obj.get("post_sampling_probs").and_then(|v| v.as_bool()) == Some(true) {
+        return Err("post_sampling_probs is not offered: logprobs are the raw model \
+                    distribution, before temperature and every sampler filter"
+            .to_string());
+    }
     Ok(ChatReq {
         model,
         messages: messages.clone(),
@@ -1714,6 +1752,8 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         stop,
         logit_bias,
         images,
+        logprobs,
+        top_logprobs,
     })
 }
 
@@ -2022,6 +2062,59 @@ fn chunk_tool_args(c: &ChunkCtx, index: usize, args: &str) -> serde_json::Value 
         }],
     });
     chunk(c, delta, None)
+}
+
+/// - #91: one OpenAI `ChatCompletionTokenLogprob` object: `{token, logprob, bytes,
+///   top_logprobs: [{token, logprob, bytes}]}`
+/// - `bytes` are the id's exact bytes (`ChatTokenizer::token_bytes`), `token` their lossy
+///   UTF-8 - a character split over two ids shows U+FFFD in both `token`s and the true
+///   bytes in `bytes`, the reason OpenAI carries both
+/// - `token` is the RAW token text, whatever channel the id ended in: reasoning, content,
+///   tool-call markup or a tool call's `arguments` - the parser, the think filter and the
+///   stop filter never see these entries
+/// - pure: `bytes_of` is the tokenizer lookup, a closure so the test can drive it
+fn logprob_entry(p: &PosLogprobs, bytes_of: &dyn Fn(u32) -> Vec<u8>) -> serde_json::Value {
+    let one = |id: usize, lp: f64| -> serde_json::Value {
+        let b = bytes_of(id as u32);
+        serde_json::json!({
+            "token": String::from_utf8_lossy(&b),
+            "logprob": lp,
+            "bytes": b,
+        })
+    };
+    let mut e = one(p.chosen, p.chosen_lp);
+    let top: Vec<serde_json::Value> = p.top.iter().map(|&(id, lp)| one(id, lp)).collect();
+    if let Some(obj) = e.as_object_mut() {
+        obj.insert("top_logprobs".to_string(), serde_json::Value::Array(top));
+    }
+    e
+}
+
+/// - #91: the logprobs of ONE generated id, as their own chunk: empty `delta`,
+///   `choices[0].logprobs.content` = `[entry]`, `finish_reason` null
+/// - one per generated id, sent BEFORE any text that id produced (text may be held back by
+///   the UTF-8, tool-call, think or stop holds; the entry never is), so the entries arrive
+///   in generation order and a client concatenates `logprobs.content` across chunks, as it
+///   does with OpenAI's stream
+/// - never sent without `logprobs: true`: every other chunk stays the chunk it was
+fn chunk_logprobs(c: &ChunkCtx, entry: serde_json::Value) -> serde_json::Value {
+    let mut doc = chunk(c, serde_json::json!({}), None);
+    if let Some(ch) = doc.get_mut("choices").and_then(|a| a.get_mut(0)).and_then(|o| o.as_object_mut()) {
+        ch.insert("logprobs".to_string(), serde_json::json!({ "content": [entry], "refusal": null }));
+    }
+    doc
+}
+
+/// - #91: the `stream:false` form - every entry of the answer in `choices[0].logprobs`
+///   `{"content": [...], "refusal": null}`, the OpenAI document shape
+/// - pure
+fn attach_logprobs(doc: &mut serde_json::Value, entries: &[serde_json::Value]) {
+    if let Some(ch) = doc.get_mut("choices").and_then(|a| a.get_mut(0)).and_then(|o| o.as_object_mut()) {
+        ch.insert(
+            "logprobs".to_string(),
+            serde_json::json!({ "content": entries, "refusal": null }),
+        );
+    }
 }
 
 /// - last chunk before `[DONE]`: empty delta, the finish reason
@@ -2920,6 +3013,9 @@ trait ChatSink {
     fn on_reasoning(&mut self, c: &ChunkCtx, text: &str) -> bool;
     /// after the last token: the final chunk plus `[DONE]`, nothing for a document
     fn on_finish(&mut self, c: &ChunkCtx, a: &FinishArgs) -> bool;
+    /// #91: the logprobs entry of one generated id (`logprob_entry`); only called for a
+    /// request with `logprobs: true`
+    fn on_logprobs(&mut self, c: &ChunkCtx, entry: serde_json::Value) -> bool;
     /// - #54: between two decode steps: `false` means the client is gone and the loop stops
     /// - the default is `true`, and that is the SSE path: a sink that writes and flushes per
     ///   token learns of a gone client from its next failed flush, which is what it has always
@@ -2959,6 +3055,9 @@ impl<W: Write> ChatSink for SseSink<W> {
     fn on_finish(&mut self, c: &ChunkCtx, a: &FinishArgs) -> bool {
         sse_send(&mut self.w, &sse_frame(&chunk_finish(c, a))) && sse_send(&mut self.w, SSE_DONE)
     }
+    fn on_logprobs(&mut self, c: &ChunkCtx, entry: serde_json::Value) -> bool {
+        sse_send(&mut self.w, &sse_frame(&chunk_logprobs(c, entry)))
+    }
 }
 
 /// - #39 B3a: what the fragments of ONE tool call add up to
@@ -2980,6 +3079,8 @@ struct CollectSink {
     reasoning: String,
     /// one entry per tool call index, in the order the parser opened them
     calls: Vec<CallBuf>,
+    /// #91: one `logprob_entry` per generated id, in order; empty unless `logprobs: true`
+    logprobs: Vec<serde_json::Value>,
     /// #54: the gone-client watch of this request. `Default` holds no descriptor and never
     /// fires, which is what every unit test of this sink gets.
     probe: ClientProbe,
@@ -3022,6 +3123,10 @@ impl ChatSink for CollectSink {
         true
     }
     fn on_finish(&mut self, _c: &ChunkCtx, _a: &FinishArgs) -> bool {
+        true
+    }
+    fn on_logprobs(&mut self, _c: &ChunkCtx, entry: serde_json::Value) -> bool {
+        self.logprobs.push(entry);
         true
     }
     /// #54: the one sink that has to ASK. One `poll` per step, and one loud line when it fires.
@@ -3423,6 +3528,10 @@ fn chat_document(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u3
     );
     // #99: the same record the stream's final chunk carries
     attach_malformed(&mut doc, &out.malformed);
+    // #91: absent unless asked for, so the document is the document it always was
+    if req.logprobs {
+        attach_logprobs(&mut doc, &sink.logprobs);
+    }
     // #54: the document is written even for a client that is gone - one document shape, and
     // the write either lands in a socket nobody reads or fails with one `[serve]` line. The
     // STATUS says which it was, the way `chat_stream` has always said it.
@@ -3684,6 +3793,10 @@ fn chat_generate(
     // contract can be checked where it is produced (see the loop after the flush)
     let mut args_acc: Vec<String> = Vec::new();
     let mut decode_ms = 0.0f64;
+    // #91: the narrowest raw top-1/top-2 gap of the answer and the index of its id, and
+    // the host wall of the readbacks, for the one `[chat]` line a logprobs request gets
+    let mut lp_gap = (f64::INFINITY, 0usize);
+    let mut lp_ms = 0.0f64;
     // #37: the stream trickle, one tick per `decode_step`, the mirror of `decode.rs:224-231`.
     // `cfg.adapt` is what `apply_adapt_policy` (geo.rs:167-176) gave this process: with
     // `CROW_ADAPT_STREAM` unset and chunk 2048 that is stream / 7 spare / every 8 / max 7.
@@ -3761,6 +3874,28 @@ fn chat_generate(
                 break;
             }
             out.push(next as u32);
+            // #91: the logprobs of THIS position, read off the row that produced `next`.
+            // `s.logits` still holds it: the prefill (or the last `decode_step`) wrote it,
+            // `arm_sampler` / the device `sample_k` node / `draw_biased` only READ it, and
+            // the next `decode_step` has not run yet - so an #81-injected id is priced under
+            // the model's distribution at the position it was forced into. Host route:
+            // one row read back (V f32 = 0.99 MB) and two passes over it on the host, the
+            // price `draw_biased` already pays; nothing of it runs without `logprobs: true`.
+            if req.logprobs {
+                let t_lp = Instant::now();
+                // unsafe: one device-to-host copy on the engine's logits buffer
+                let row = unsafe { crow_nest_engine::cuda::dtoh(srv.eng.logits(), V) };
+                let p = pos_logprobs(&row, next, req.top_logprobs);
+                lp_ms += t_lp.elapsed().as_secs_f64() * 1e3;
+                if p.top.len() >= 2 && p.top[0].1 - p.top[1].1 < lp_gap.0 {
+                    lp_gap = (p.top[0].1 - p.top[1].1, out.len() - 1);
+                }
+                let entry = logprob_entry(&p, &|id| tk.token_bytes(id));
+                if !sink.on_logprobs(&cx, entry) {
+                    aborted = true;
+                    break;
+                }
+            }
             // #29 A7: the ID is what opens a tool call, never the text (spec of the task)
             if Some(next as u32) == tool_open {
                 ts.arm();
@@ -3853,6 +3988,19 @@ fn chat_generate(
         }
     }
 
+    if req.logprobs {
+        tracing::info!(target: "chat",
+            "[chat] logprobs (#91): {} entries, top_logprobs {}, raw distribution (pre-sampler), \
+             readback + log-softmax {lp_ms:.1} ms in total{}",
+            out.len(),
+            req.top_logprobs,
+            if lp_gap.0.is_finite() {
+                format!(", narrowest top-1/top-2 gap {:.4} nats at generated id {}", lp_gap.0, lp_gap.1)
+            } else {
+                String::new()
+            }
+        );
+    }
     // #37: finish the trickle of THIS request, as `decode.rs:253` does after its loop.
     // Outside the decode window on purpose: `decode run` does not charge the drain to a
     // token either. No copy is left in flight, so the next request prefills on a settled
@@ -7950,5 +8098,119 @@ Red is #FF0000."), "{off}");
         let before = d.clone();
         attach_malformed(&mut d, &[]);
         assert_eq!(d, before);
+    }
+
+    /// #91: the OpenAI pair parses, is OFF by default, and every refusal is named:
+    /// `top_logprobs` without `logprobs: true`, over 20, not an integer, a non-boolean
+    /// `logprobs`, and `post_sampling_probs: true` (the post-sampler distribution is not
+    /// offered, so it is refused rather than answered with the raw numbers)
+    #[test]
+    fn logprobs_fields_parse_off_by_default_and_refuse_by_name() {
+        let mk = |t: &str| parse_chat(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{t}}}"#).as_bytes());
+        let r = mk("").unwrap();
+        assert!(!r.logprobs);
+        assert_eq!(r.top_logprobs, 0);
+        let r = mk(r#","logprobs":null,"top_logprobs":null"#).unwrap();
+        assert!(!r.logprobs);
+        let r = mk(r#","logprobs":true"#).unwrap();
+        assert!(r.logprobs);
+        assert_eq!(r.top_logprobs, 0, "OpenAI's default: the entry, no alternatives");
+        let r = mk(r#","logprobs":true,"top_logprobs":20,"post_sampling_probs":false"#).unwrap();
+        assert_eq!((r.logprobs, r.top_logprobs), (true, 20));
+        for (extra, why) in [
+            (r#","top_logprobs":5"#, "requires logprobs"),
+            (r#","logprobs":false,"top_logprobs":0"#, "requires logprobs"),
+            (r#","logprobs":true,"top_logprobs":21"#, "over the limit of 20"),
+            (r#","logprobs":true,"top_logprobs":-1"#, "not a non negative integer"),
+            (r#","logprobs":true,"top_logprobs":2.5"#, "not a non negative integer"),
+            (r#","logprobs":"yes""#, "logprobs is not a boolean"),
+            (r#","logprobs":true,"post_sampling_probs":true"#, "post_sampling_probs is not offered"),
+        ] {
+            let e = mk(extra).expect_err(extra);
+            assert!(e.contains(why), "{extra}: {e}");
+        }
+    }
+
+    /// #91: the wire form. One entry is OpenAI's `ChatCompletionTokenLogprob`; a partial
+    /// UTF-8 id keeps its true `bytes` beside a lossy `token`; the stream carries one entry
+    /// per chunk with an empty delta, the document all of them in `choices[0].logprobs`;
+    /// and both sinks see the same entries in the same order.
+    #[test]
+    fn a_logprobs_entry_is_the_openai_token_object_in_both_forms() {
+        let bytes_of = |id: u32| -> Vec<u8> {
+            match id {
+                7 => b"/home".to_vec(),
+                8 => vec![0xc3], // the first half of a two-byte character
+                9 => b"<tool_call>".to_vec(),
+                _ => format!("t{id}").into_bytes(),
+            }
+        };
+        let row: Vec<f32> = (0..16).map(|i| if i == 7 { 3.0 } else if i == 8 { 2.5 } else { i as f32 * 0.01 }).collect();
+        let p = pos_logprobs(&row, 8, 2);
+        let e = logprob_entry(&p, &bytes_of);
+        let keys: Vec<&str> = e.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["token", "logprob", "bytes", "top_logprobs"]);
+        assert_eq!(e["token"], "\u{fffd}");
+        assert_eq!(e["bytes"], serde_json::json!([0xc3]));
+        assert_eq!(e["logprob"].as_f64().unwrap(), p.chosen_lp);
+        assert_eq!(e["top_logprobs"].as_array().unwrap().len(), 2);
+        assert_eq!(e["top_logprobs"][0]["token"], "/home");
+        assert_eq!(e["top_logprobs"][0]["bytes"], serde_json::json!(b"/home".to_vec()));
+        assert_eq!(e["top_logprobs"][1]["logprob"].as_f64().unwrap(), p.chosen_lp);
+        assert!(e["top_logprobs"][0].get("top_logprobs").is_none(), "alternatives carry no nested list");
+        // the margin a near-tie question reads: chosen - best alternative, here -0.5 nats
+        let margin = p.chosen_lp - p.top[0].1;
+        assert!((margin + 0.5).abs() < 1e-6, "{margin}");
+
+        let cx = ChunkCtx::new("id1", 5, "crow");
+        let entries: Vec<serde_json::Value> =
+            [7usize, 8, 9].iter().map(|&c| logprob_entry(&pos_logprobs(&row, c, 1), &bytes_of)).collect();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut sse = SseSink::new(&mut buf);
+        let mut col = CollectSink::default();
+        for en in &entries {
+            assert!(sse.on_logprobs(&cx, en.clone()));
+            assert!(col.on_logprobs(&cx, en.clone()));
+        }
+        let text = String::from_utf8(buf).unwrap();
+        let mut streamed = Vec::new();
+        for frame in text.split("\n\n").filter(|f| !f.is_empty()) {
+            let d: serde_json::Value = serde_json::from_str(frame.trim_start_matches("data: ")).unwrap();
+            assert_eq!(d["object"], "chat.completion.chunk");
+            let ch = &d["choices"][0];
+            assert_eq!(ch["delta"], serde_json::json!({}), "a logprobs chunk carries no text");
+            assert!(ch["finish_reason"].is_null());
+            assert!(ch["logprobs"]["refusal"].is_null());
+            streamed.extend(ch["logprobs"]["content"].as_array().unwrap().iter().cloned());
+        }
+        assert_eq!(streamed, entries);
+        assert_eq!(col.logprobs, entries);
+        let mut doc = completion_json(&cx, "", "", &[], "stop", &b3a_timing());
+        attach_logprobs(&mut doc, &col.logprobs);
+        assert_eq!(doc["choices"][0]["logprobs"]["content"], serde_json::json!(entries));
+        assert!(doc["choices"][0]["logprobs"]["refusal"].is_null());
+        assert_eq!(doc["choices"][0]["logprobs"]["content"][2]["token"], "<tool_call>");
+    }
+
+    /// #91: OFF costs nothing on the wire either - no builder this server uses without
+    /// `logprobs: true` writes a `logprobs` key, so every chunk and the document stay the
+    /// bytes they were (the readback itself sits behind `req.logprobs` in `chat_generate`)
+    #[test]
+    fn without_logprobs_no_chunk_and_no_document_carries_the_key() {
+        let cx = ChunkCtx::new("id1", 5, "crow");
+        let t = b3a_timing();
+        let docs = [
+            chunk_role(&cx),
+            chunk_content(&cx, "x"),
+            chunk_reasoning(&cx, "r"),
+            chunk_tool_open(&cx, 0, "call_0", "read_file"),
+            chunk_tool_args(&cx, 0, "{}"),
+            chunk_finish(&cx, &FinishArgs { finish: "stop", t: &t, include_usage: true, timings_per_token: true, malformed: &[] }),
+            completion_json(&cx, "x", "r", &[], "stop", &t),
+        ];
+        for d in docs {
+            assert!(!d.to_string().contains("logprobs"), "{d}");
+        }
+        assert!(CollectSink::default().logprobs.is_empty());
     }
 }
