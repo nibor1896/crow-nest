@@ -1,0 +1,93 @@
+{
+ "label": "all-arm",
+ "rounds": 8,
+ "rounds_ok": 8,
+ "lines_total": 320,
+ "lines_with_error": 2,
+ "hex_char_errors": 0,
+ "missing": 2,
+ "line_error_rate": 0.0063,
+ "char_error_rate": 0.0,
+ "rounds_detail": [
+  {
+   "lines": 40,
+   "missing": 1,
+   "extra": 0,
+   "lines_with_error": 1,
+   "hex_char_errors": 0,
+   "seed": 1,
+   "seconds": 15.3,
+   "reply_chars": 1488
+  },
+  {
+   "lines": 40,
+   "missing": 1,
+   "extra": 0,
+   "lines_with_error": 1,
+   "hex_char_errors": 0,
+   "seed": 2,
+   "seconds": 15.0,
+   "reply_chars": 1488
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 3,
+   "seconds": 14.2,
+   "reply_chars": 1487
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 4,
+   "seconds": 14.6,
+   "reply_chars": 1487
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 5,
+   "seconds": 14.3,
+   "reply_chars": 1487
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 6,
+   "seconds": 14.4,
+   "reply_chars": 1487
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 7,
+   "seconds": 14.5,
+   "reply_chars": 1497
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 8,
+   "seconds": 14.2,
+   "reply_chars": 1487
+  }
+ ]
+}

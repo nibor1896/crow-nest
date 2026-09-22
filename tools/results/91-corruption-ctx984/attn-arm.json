@@ -1,0 +1,93 @@
+{
+ "label": "attn-arm",
+ "rounds": 8,
+ "rounds_ok": 8,
+ "lines_total": 320,
+ "lines_with_error": 1,
+ "hex_char_errors": 1,
+ "missing": 0,
+ "line_error_rate": 0.0031,
+ "char_error_rate": 0.000521,
+ "rounds_detail": [
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 1,
+   "seconds": 15.2,
+   "reply_chars": 1487
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 1,
+   "hex_char_errors": 1,
+   "seed": 2,
+   "seconds": 15.5,
+   "reply_chars": 1487
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 3,
+   "seconds": 15.1,
+   "reply_chars": 1487
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 4,
+   "seconds": 15.2,
+   "reply_chars": 1487
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 5,
+   "seconds": 15.1,
+   "reply_chars": 1487
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 6,
+   "seconds": 15.1,
+   "reply_chars": 1487
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 7,
+   "seconds": 14.9,
+   "reply_chars": 1487
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 8,
+   "seconds": 14.7,
+   "reply_chars": 1487
+  }
+ ]
+}
