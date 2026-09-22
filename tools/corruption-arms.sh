@@ -144,6 +144,70 @@ settle() {
     echo "  settle: MemAvailable ${av} GiB after $((SECONDS - t0)) s of waiting (need $need_gib)"
 }
 
+complete() {  # json_path -> 0 when the probe said it finished
+    grep -q '"complete": true' "$1" 2>/dev/null
+}
+
+replay_probe() {  # label rounds_or_empty sampling_json
+    local label="$1" rounds="$2" samp="$3"
+    if complete "$out/$label.json"; then
+        echo "  $label: already complete - skipped"
+        return 0
+    fi
+    python3 "$root/tools/corruption-replay-probe.py" --port "$port" --label "$label" \
+        --preset "$replay" ${CORRUPTION_REPLAY_SESSION:+--session "$CORRUPTION_REPLAY_SESSION"} \
+        ${CORRUPTION_REPLAY_CROW_CORE:+--crow-core "$CORRUPTION_REPLAY_CROW_CORE"} \
+        ${rounds:+--rounds "$rounds"} --sampling "$samp" \
+        --json "$out/$label.json" >"$out/probe-$label.log" 2>&1
+}
+
+# THE TABLE IS WRITTEN AFTER EVERY ARM, not at the end: the ladder of record
+# runs across reboots (#82 HARD pool state), and a result that only lives in a
+# summary printed by the last boot is a result a reboot can lose. One row per
+# probe file, appended once (the row carries the file's sha, a rerun of the
+# table step never duplicates it). $out/TABLE.md is the durable record.
+table_rows() {  # arm
+python3 - "$out" "$1" <<'PY'
+import hashlib, json, os, sys, time
+out, arm = sys.argv[1], sys.argv[2]
+table = os.path.join(out, "TABLE.md")
+if not os.path.exists(table):
+    with open(table, "w") as fh:
+        fh.write("| written | arm | variant | complete | corrupt calls / calls | per point (K: kinds) | line_error_rate | file sha |\n")
+        fh.write("|---|---|---|---|---|---|---|---|\n")
+have = open(table).read()
+for label, variant in ((arm, "seeded"), (arm + "-greedy", "greedy")):
+    path = os.path.join(out, label + ".json")
+    if not os.path.exists(path):
+        continue
+    raw = open(path, "rb").read()
+    sha = hashlib.sha256(raw).hexdigest()[:12]
+    if sha in have:
+        continue
+    d = json.loads(raw)
+    pts = []
+    for p in d.get("points") or []:
+        bad = []
+        for r in d.get("rounds_detail") or []:
+            if r.get("at") != p.get("at"):
+                continue
+            kinds = sorted({e.get("kind") for c in r.get("calls") or []
+                            for e in c.get("errors") or []})
+            if r.get("error"):
+                kinds = ["request error"]
+            if kinds:
+                bad.append("seed %s %s" % (r.get("seed"), "+".join(kinds)))
+        pts.append("K=%s: %s" % (p.get("at"), ", ".join(bad) or "clean"))
+    row = "| %s | %s | %s | %s | %s / %s | %s | %s | %s |\n" % (
+        time.strftime("%Y-%m-%d %H:%M"), arm, variant, d.get("complete"),
+        d.get("lines_with_error"), d.get("lines_total"), "; ".join(pts) or "-",
+        d.get("line_error_rate"), sha)
+    with open(table, "a") as fh:
+        fh.write(row)
+    print("  table: " + row.strip())
+PY
+}
+
 run_arm() {  # label overlay_path_or_empty
     local label="$1" overlay="$2"
     pool_recover
@@ -175,12 +239,14 @@ run_arm() {  # label overlay_path_or_empty
     # 8x connection refused). The probe is a 100-line urllib script - it
     # needs no isolation and no memory cap.
     if [ -n "$replay" ]; then
-        python3 "$root/tools/corruption-replay-probe.py" --port "$port" --label "$label" \
-            --preset "$replay" ${CORRUPTION_REPLAY_SESSION:+--session "$CORRUPTION_REPLAY_SESSION"} \
-            ${CORRUPTION_REPLAY_CROW_CORE:+--crow-core "$CORRUPTION_REPLAY_CROW_CORE"} \
-            ${CORRUPTION_REPLAY_ROUNDS:+--rounds "$CORRUPTION_REPLAY_ROUNDS"} \
-            --sampling "${sampling:-{\}}" \
-            --json "$out/$label.json" >"$out/probe-$label.log" 2>&1
+        replay_probe "$label" "${CORRUPTION_REPLAY_ROUNDS:-}" "${sampling:-{\}}"
+        # CORRUPTION_REPLAY_GREEDY=1: the same boot also answers under greedy
+        # (one round -- greedy has one answer). A boot is the expensive unit:
+        # 2026-09-22 the pool needed a REBOOT after every engine exit, so each
+        # boot carries both questions -- seed 0 (the live condition) and
+        # argmax (is the wrong digit the MOST likely token under this arm?).
+        [ -n "${CORRUPTION_REPLAY_GREEDY:-}" ] && \
+            replay_probe "$label-greedy" 1 '{"temperature":0}'
     elif [ -n "$ctx_tokens" ]; then
         python3 "$root/tools/corruption-probe-long.py" --port "$port" --label "$label" \
             --ctx-tokens "$ctx_tokens" --position "$position" --sampling "${sampling:-{\}}" \
@@ -219,11 +285,16 @@ for arm in ${CORRUPTION_ARMS:-baseline attn-ctrl attn-arm rule-arm all-arm}; do
     # partial replay at rounds_ok 8 of 24 is never taken for a finished arm.
     done_re='"rounds_ok": 8'
     grep -q '"complete":' "$out/$arm.json" 2>/dev/null && done_re='"complete": true'
+    if [ -n "$replay" ] && [ -n "${CORRUPTION_REPLAY_GREEDY:-}" ] \
+        && ! complete "$out/$arm-greedy.json"; then
+        done_re='never-matches-a-half-finished-arm'
+    fi
     if [ -z "${CORRUPTION_FORCE:-}" ] && grep -q "$done_re" "$out/$arm.json" 2>/dev/null; then
         echo "=== arm $arm : already complete in $arm.json - skipped (CORRUPTION_FORCE=1 reruns)"
         continue
     fi
     run_arm "$arm" "$ov"
+    [ -n "$replay" ] && table_rows "$arm"
 done
 
 summary
