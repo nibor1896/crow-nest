@@ -96,6 +96,16 @@ Every round, erroneous or not, also records the NARROWEST margins inside tool ca
 clean round (the placebo arm) shows the same position's margin. All of it lands in the JSON
 (`rounds_detail[].logprobs`); the full entry list is not stored.
 
+TEACHER FORCING (#91, serve `crow_force_ids`): --dump-lp FILE stores the FULL
+entry list of every round WITH the engine's token ids (the body then carries
+`crow_force_ids`, `[]` unless --force-ids is given, which makes serve add `crow_id` to every
+entry and alternative). --force-ids FILE (a JSON id list, or a --dump-lp file: its first
+round's ids) makes serve REPLACE the generated id at each position by the file's id, so the
+entry at position i prices the forced id under the model's distribution after the forced
+prefix #0..#i-1 - the same prompt bytes, render, prefill and decode path as the free run.
+`--force-n N` forces only the first N ids (the rest runs free). Both need --top-logprobs.
+tools/teacher-forced-compare.py reads the dumps.
+
 Usage: corruption-replay-probe.py --preset diorama-0922 --session SNAPSHOT [--rounds 8]
            [--port 8099] [--seed0 0] [--label arm] [--json OUT]
        corruption-replay-probe.py --session S --at K [--at K2 ...] [...]
@@ -611,6 +621,17 @@ def _short(calls):
 
 # ------------------------------------------------------------------ main
 
+def load_force_ids(path, n=None):
+    """the ids to teacher-force: a JSON list of ints, or a --dump-lp file (its first round's
+    ids, which must all be known - a dump written without crow_id cannot be forced)"""
+    with open(path) as fh:
+        doc = json.load(fh)
+    ids = doc if isinstance(doc, list) else doc["rounds"][0]["ids"]
+    if not ids or any(not isinstance(i, int) or i < 0 for i in ids):
+        sys.exit("--force-ids %s: not a list of token ids (a dump without crow_id?)" % path)
+    return ids[:n] if n is not None else ids
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--session", help="Crow session.json (a SNAPSHOT: Crow rewrites the live file on exit)")
@@ -638,8 +659,17 @@ def main():
     ap.add_argument("--live-only", action="store_true", help="grade the stored answers only, send nothing")
     ap.add_argument("--allow-session-drift", action="store_true",
                     help="run a preset against a session whose sha256 differs from the preset's")
+    ap.add_argument("--dump-lp", default=None, metavar="FILE",
+                    help="store every round's full logprob entries with the engine's ids (sends crow_force_ids)")
+    ap.add_argument("--force-ids", default=None, metavar="FILE",
+                    help="teacher-force these ids (a JSON id list or a --dump-lp file)")
+    ap.add_argument("--force-n", type=int, default=None, metavar="N",
+                    help="force only the first N ids of --force-ids")
     ap.add_argument("--json", default="-")
     args = ap.parse_args()
+    if (args.dump_lp or args.force_ids) and args.top_logprobs is None:
+        sys.exit("--dump-lp / --force-ids need --top-logprobs N")
+    force = load_force_ids(args.force_ids, args.force_n) if args.force_ids else None
     if args.top_logprobs is not None and not 2 <= args.top_logprobs <= 20:
         sys.exit("--top-logprobs N: 2..20 (a margin needs one alternative beside the chosen id)")
 
@@ -697,7 +727,7 @@ def main():
             else "crow_core.TOOLS via stream_reply", "stream": not args.no_stream,
             "sampling_override": extra, "top_logprobs": args.top_logprobs}
 
-    rounds, per_point = [], []
+    rounds, per_point, dumps = [], [], []
     for p in points:
         k = p["at"]
         hist = messages[:k]
@@ -711,6 +741,11 @@ def main():
         if args.top_logprobs is not None:
             body["logprobs"] = True
             body["top_logprobs"] = args.top_logprobs
+        if args.dump_lp or force is not None:
+            body["crow_force_ids"] = list(force or [])
+            max_t = body.get("max_tokens")
+            if force and (max_t is None or max_t < len(force) + 1):
+                body["max_tokens"] = len(force) + 1
         ctx = context_index(hist)
         tools = body.get("tools") or []
         nbytes = len(json.dumps(body).encode("utf-8"))
@@ -754,6 +789,11 @@ def main():
                       "content_chars": len(content), "reply": _short(calls)})
             if args.top_logprobs is not None:
                 g["logprobs"] = logprob_report(lps, g, args.home)
+            if args.dump_lp:
+                dumps.append({"at": k, "seed": seed, "prompt_tokens": ptok,
+                              "cached_tokens": g["cached_tokens"],
+                              "forced": len(force or []),
+                              "ids": [e.get("crow_id") for e in lps], "entries": lps})
             rounds.append(g)
             print("at %d seed %d: %d call(s), %d corrupt %s, prompt %s tok (%s cached), %.0f s" % (
                 k, seed, g["n_calls"], g["calls_with_error"],
@@ -792,6 +832,12 @@ def main():
         "points": per_point,
         "rounds_detail": rounds,
     }
+    if args.dump_lp:
+        with open(args.dump_lp, "w") as fh:
+            json.dump({"label": args.label, "force_ids_file": args.force_ids,
+                       "force_n": args.force_n, "forced_ids": force, **info,
+                       "rounds": dumps}, fh)
+            fh.write("\n")
     out = json.dumps(summary, indent=1)
     if args.json == "-":
         print(out)

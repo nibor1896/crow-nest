@@ -282,8 +282,10 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="319"
+TESTS="320"
 CLIPPY="1505"
+#   tests 319 -> 320   #91 (2026-09-22): one serve test (`crow_force_ids` parse,
+#                              its named 400s, the `crow_id`-carrying logprob entry).
 #   tests 313 -> 319 / clippy 1505 (unchanged)   #91 logprobs (2026-09-22): two sample.rs tests
 #                              (pos_logprobs against an f64 log-softmax reference; exact ties, NaN and -inf),
 #                              one tokenizer test (token_bytes concatenate to the exact text, split UTF-8

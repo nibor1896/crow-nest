@@ -6,6 +6,10 @@
 
 ## Unreleased — after v0.3.1
 
+### Added
+
+- **Teacher forcing on `serve` for the #91 K=2 measurement: `crow_force_ids`** (`#91`, `#91`, 2026-09-22). A request field (array of token ids) whose ids REPLACE the generated ones step by step through the #81 injection door, so with `logprobs: true` every entry prices the forced id under the raw distribution after the forced prefix; the entries then carry `crow_id` (`[]` forces nothing and only adds the ids); a 400 beside `reasoning_budget_tokens`; under `CROW_LOG=info,chat=debug` the prompt ids are logged. Absent, every byte is unchanged. `tools/corruption-replay-probe.py --dump-lp/--force-ids/--force-n`, `tools/teacher-forced-compare.py` (logprob of the correct vs produced digit at #65, top-N, the per-position forced-id logprob per arm), `tools/teacher-forced-oracle-seq.py` (serve's own prompt ids + the bare completion as `gen-sequence.json` for `oracle/ref_engine_logits.py`, and its rows back as a dump), `tools/teacher-forced-91.sh` (the arms, one command). cargo test --release 319 -> 320, clippy 1505 unchanged; probe tests 14 -> 16. No engine run yet (pinned pool, #82).
+
 ### Fixed
 
 - **The vision tower spent ~20 s per 1280x720 screenshot in attention: `vit_attn` computed P·V 72 times over** (`#98`, 2026-09-22, `7e9c54e` + `c0bc1d7`). Every one of the 72 active threads accumulated all 72 output dims; step 1 gives each thread one dim, step 2 tiles 16 query rows per block with K/V shared in smem. Both **bit-identical** to the old kernel (same fma chains, same 256-leaf sum tree), proven every output bit by `vit::attn_98` on the GPU at n = 1..4,000. Per layer at 3,520 patches 665 ms -> 5.3 ms; over the 27 blocks 17.95 s -> 0.144 s (RTX 5090, cuEvent). End-to-end `read_image` through serve not yet measured.

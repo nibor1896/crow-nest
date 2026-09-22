@@ -167,6 +167,7 @@
 //! | `logit_bias` | #86: map TOKEN ID -> additive bias on the raw logits, applied FIRST, outside the sampler chain (llama.cpp's order); `-inf` as f32 is a hard mask; a biased request samples on the HOST |
 //! | `logprobs` | #91: `true` adds OpenAI logprobs for EVERY generated id (tool-call markup and arguments included), from the RAW distribution (log-softmax of the lm_head row, before bias, penalties, temperature and every filter); one row readback per token, nothing when off; architecture 7.11.22 |
 //! | `top_logprobs` | #91: 0..=20 alternatives per position, default 0; a 400 without `logprobs: true`. `post_sampling_probs: true` is a 400: the post-sampler distribution is not offered |
+//! | `crow_force_ids` | #91: array of token ids that REPLACE the generated ids one per step, from the first generated position on (teacher forcing, the #81 injection door); with `logprobs: true` every entry then prices the forced id under the model's raw distribution at that position and carries `crow_id` (entry and alternatives); `[]` forces nothing but still adds `crow_id`; a 400 together with `reasoning_budget_tokens`; after the list runs out generation continues free (greedy/sampled as requested) |
 //! | `tools` | array of OpenAI function tools, RENDERED as the template variable `tools` (#29 A7) |
 //! | `stream_options.include_usage` | `true` puts `usage` on the final chunk (#27 A5) |
 //! | `timings_per_token` | `true` puts `timings` on the final chunk (#27 A5) |
@@ -1233,6 +1234,10 @@ struct ChatReq {
     /// #91: OpenAI `top_logprobs`, 0..=20 alternatives per position; only with
     /// `logprobs: true` (the body naming it without that is a 400, as OpenAI answers)
     top_logprobs: usize,
+    /// #91: `crow_force_ids`, the ids that replace the generated
+    /// ones step by step (teacher forcing). `None` (absent) is every release before it:
+    /// nothing is forced and the logprob entries carry no `crow_id`.
+    force_ids: Option<Vec<usize>>,
 }
 
 /// - #28/#68/#83/#84: the sampling provenance line. Every VALUE, then
@@ -1709,6 +1714,28 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
             n
         }
     };
+    // #91: the forced ids, token ids below V. They ride the #81
+    // injection queue, so a thinking budget in the same body would fight over it - 400.
+    let force_ids = match obj.get("crow_force_ids") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| "crow_force_ids is not an array of token ids".to_string())?;
+            let mut ids = Vec::with_capacity(arr.len());
+            for x in arr {
+                let id = x
+                    .as_u64()
+                    .filter(|&id| (id as usize) < V)
+                    .ok_or_else(|| format!("crow_force_ids entry {x} is not a token id below {V}"))?;
+                ids.push(id as usize);
+            }
+            if reasoning_budget.is_some() {
+                return Err("crow_force_ids cannot be combined with reasoning_budget_tokens".to_string());
+            }
+            Some(ids)
+        }
+    };
     if obj.get("post_sampling_probs").and_then(|v| v.as_bool()) == Some(true) {
         return Err("post_sampling_probs is not offered: logprobs are the raw model \
                     distribution, before temperature and every sampler filter"
@@ -1754,6 +1781,7 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         images,
         logprobs,
         top_logprobs,
+        force_ids,
     })
 }
 
@@ -2073,14 +2101,30 @@ fn chunk_tool_args(c: &ChunkCtx, index: usize, args: &str) -> serde_json::Value 
 ///   tool-call markup or a tool call's `arguments` - the parser, the think filter and the
 ///   stop filter never see these entries
 /// - pure: `bytes_of` is the tokenizer lookup, a closure so the test can drive it
+#[cfg(test)]
 fn logprob_entry(p: &PosLogprobs, bytes_of: &dyn Fn(u32) -> Vec<u8>) -> serde_json::Value {
+    logprob_entry_ids(p, bytes_of, false)
+}
+
+/// - `logprob_entry`, plus `crow_id` on the entry and on every alternative when `with_ids`
+///   (#91: a request with `crow_force_ids` - the ids a teacher-forced
+///   replay needs, which the OpenAI shape does not carry)
+fn logprob_entry_ids(
+    p: &PosLogprobs,
+    bytes_of: &dyn Fn(u32) -> Vec<u8>,
+    with_ids: bool,
+) -> serde_json::Value {
     let one = |id: usize, lp: f64| -> serde_json::Value {
         let b = bytes_of(id as u32);
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "token": String::from_utf8_lossy(&b),
             "logprob": lp,
             "bytes": b,
-        })
+        });
+        if with_ids {
+            v["crow_id"] = serde_json::json!(id);
+        }
+        v
     };
     let mut e = one(p.chosen, p.chosen_lp);
     let top: Vec<serde_json::Value> = p.top.iter().map(|&(id, lp)| one(id, lp)).collect();
@@ -3854,6 +3898,16 @@ fn chat_generate(
         }
         VecDeque::from(ids)
     };
+    // #91: the forced ids take the #81 door - each one replaces the
+    // id the step produced, from the first generated position on (parse_chat refuses a
+    // thinking budget beside it, so nothing else fills this queue)
+    if let Some(f) = req.force_ids.as_ref() {
+        inject = f.iter().copied().collect();
+        tracing::info!(target: "chat", "[chat] teacher forcing: {} forced ids", inject.len());
+        // the exact prompt ids this request prefilled, for an oracle over the same
+        // sequence (`CROW_LOG=info,chat=debug`; the generated ids follow as `[chat] ids`)
+        tracing::debug!(target: "chat", "[chat] prompt ids {ids:?}");
+    }
     if think_budget == Some(0) {
         inject = build_injection();
         injection_built = true;
@@ -3890,7 +3944,8 @@ fn chat_generate(
                 if p.top.len() >= 2 && p.top[0].1 - p.top[1].1 < lp_gap.0 {
                     lp_gap = (p.top[0].1 - p.top[1].1, out.len() - 1);
                 }
-                let entry = logprob_entry(&p, &|id| tk.token_bytes(id));
+                let entry =
+                    logprob_entry_ids(&p, &|id| tk.token_bytes(id), req.force_ids.is_some());
                 if !sink.on_logprobs(&cx, entry) {
                     aborted = true;
                     break;
@@ -8135,6 +8190,40 @@ Red is #FF0000."), "{off}");
     /// UTF-8 id keeps its true `bytes` beside a lossy `token`; the stream carries one entry
     /// per chunk with an empty delta, the document all of them in `choices[0].logprobs`;
     /// and both sinks see the same entries in the same order.
+    /// #91: `crow_force_ids` parses to the id list (empty allowed),
+    /// is `None` when absent/null, and refuses non-ids, ids >= V and a thinking budget
+    /// beside it; the entry form carries `crow_id` only when asked, the OpenAI keys unchanged.
+    #[test]
+    fn crow_force_ids_parse_and_the_id_carrying_entry() {
+        let mk = |t: &str| parse_chat(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{t}}}"#).as_bytes());
+        assert_eq!(mk("").unwrap().force_ids, None);
+        assert_eq!(mk(r#","crow_force_ids":null"#).unwrap().force_ids, None);
+        assert_eq!(mk(r#","crow_force_ids":[]"#).unwrap().force_ids, Some(vec![]));
+        assert_eq!(mk(r#","crow_force_ids":[0,7,248319]"#).unwrap().force_ids, Some(vec![0, 7, 248319]));
+        for (t, why) in [
+            (r#","crow_force_ids":7"#, "not an array"),
+            (r#","crow_force_ids":[1,-2]"#, "not a token id"),
+            (r#","crow_force_ids":[248320]"#, "not a token id"),
+            (r#","crow_force_ids":["a"]"#, "not a token id"),
+            (r#","crow_force_ids":[1],"reasoning_budget_tokens":4"#, "cannot be combined"),
+        ] {
+            let e = mk(t).unwrap_err();
+            assert!(e.contains(why), "{t}: {e}");
+        }
+        let bytes_of = |id: u32| -> Vec<u8> { format!("t{id}").into_bytes() };
+        let row: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
+        let p = pos_logprobs(&row, 3, 2);
+        let plain = logprob_entry(&p, &bytes_of);
+        assert_eq!(plain, logprob_entry_ids(&p, &bytes_of, false));
+        let e = logprob_entry_ids(&p, &bytes_of, true);
+        let keys: Vec<&str> = e.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["token", "logprob", "bytes", "crow_id", "top_logprobs"]);
+        assert_eq!(e["crow_id"], 3);
+        assert_eq!(e["top_logprobs"][0]["crow_id"], 15);
+        assert_eq!(e["top_logprobs"][1]["crow_id"], 14);
+        assert_eq!(e["logprob"], plain["logprob"]);
+    }
+
     #[test]
     fn a_logprobs_entry_is_the_openai_token_object_in_both_forms() {
         let bytes_of = |id: u32| -> Vec<u8> {

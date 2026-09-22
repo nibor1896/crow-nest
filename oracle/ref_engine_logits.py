@@ -225,6 +225,11 @@ with torch.no_grad():
 
 ref = logits.contiguous().numpy()
 ref.tofile(os.path.join(OUT, "ref-logits.f32"))
+# #91: a reference-only run (tools/teacher-forced-oracle-seq.py prep) has no
+# engine dump beside it - the reference rows are the product, the gate below needs both
+if not os.path.exists(os.path.join(OUT, "gpu-logits.f32")):
+    print(f"reference only: {T} rows -> {os.path.join(OUT, 'ref-logits.f32')} (no gpu-logits.f32 to gate against)")
+    raise SystemExit(0)
 
 gpu = np.fromfile(os.path.join(OUT, "gpu-logits.f32"), dtype=np.float32).reshape(T, -1)
 print(f"ENGINE parity gate: [T={T}][V={gpu.shape[1]}] - production FP4/FP8 vs f32 reference")

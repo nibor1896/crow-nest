@@ -273,5 +273,66 @@ class Logprobs(unittest.TestCase):
         self.assertIsNone(rp.error_pair({"kind": "json_invalid"}, HOME))
 
 
+
+TFSPEC = importlib.util.spec_from_file_location("tf_compare", TOOLS / "teacher-forced-compare.py")
+tfc = importlib.util.module_from_spec(TFSPEC)
+TFSPEC.loader.exec_module(tfc)
+
+
+def _ide(tok, tid, lp, top):
+    return {"token": tok, "crow_id": tid, "logprob": lp, "bytes": list(tok.encode()),
+            "top_logprobs": [{"token": t, "crow_id": i, "logprob": l, "bytes": list(t.encode())}
+                             for t, i, l in top]}
+
+
+class TeacherForced(unittest.TestCase):
+    """#91: the --force-ids input and the compare tool, no server."""
+
+    def _dump(self, d, name, entries, forced=0):
+        path = os.path.join(d, name)
+        with open(path, "w") as fh:
+            json.dump({"rounds": [{"ids": [e["crow_id"] for e in entries], "entries": entries,
+                                   "forced": forced, "prompt_tokens": 6738, "cached_tokens": 0}]}, fh)
+        return path
+
+    def test_force_ids_from_a_list_or_a_dump(self):
+        with tempfile.TemporaryDirectory() as d:
+            lst = os.path.join(d, "ids.json")
+            with open(lst, "w") as fh:
+                json.dump([5, 6, 7], fh)
+            self.assertEqual(rp.load_force_ids(lst), [5, 6, 7])
+            self.assertEqual(rp.load_force_ids(lst, 2), [5, 6])
+            dump = self._dump(d, "dump.json", [_ide("a", 9, -0.1, []), _ide("b", 10, -0.2, [])])
+            self.assertEqual(rp.load_force_ids(dump), [9, 10])
+            with open(dump, "w") as fh:          # a dump written without crow_id
+                json.dump({"rounds": [{"ids": [None, None], "entries": []}]}, fh)
+            with self.assertRaises(SystemExit):
+                rp.load_force_ids(dump)
+
+    def test_compare_reads_the_digit_and_refuses_a_different_sequence(self):
+        ref = [_ide("/n", 1, -0.0, [("/n", 1, -0.0)]),
+               _ide("1", 16, -0.013, [("1", 16, -0.013), ("8", 23, -4.41), ("9", 24, -6.0)])]
+        arm = [_ide("/n", 1, -0.001, [("/n", 1, -0.001)]),
+               _ide("1", 16, -2.0, [("8", 23, -0.2), ("1", 16, -2.0)])]
+        with tempfile.TemporaryDirectory() as d:
+            r = self._dump(d, "ref.json", ref)
+            a = self._dump(d, "arm.json", arm, forced=2)
+            out = os.path.join(d, "out.json")
+            buf = io.StringIO()
+            import contextlib
+            with contextlib.redirect_stdout(buf):
+                rc = tfc.main(["--ref", "bare=" + r, "--arm", "x=" + a, "--at", "1", "--json", out])
+            self.assertEqual(rc, 0)
+            doc = json.load(open(out))
+            [b, x] = doc["dumps"]
+            self.assertAlmostEqual(b["margin_got_minus_want"], -0.013 + 4.41)
+            self.assertAlmostEqual(x["margin_got_minus_want"], -2.0 + 0.2)
+            self.assertIn("*", buf.getvalue(), "the top-1 flip at #1 is marked")
+            # a token outside the top-N is a bound, not a number
+            self.assertEqual(tfc.tok_lp(ref[1], "7"), (-6.0, False))
+            bad = self._dump(d, "bad.json", [ref[0], _ide("2", 17, -1.0, [])], forced=2)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(tfc.main(["--ref", "bare=" + r, "--arm", "y=" + bad]), 2)
+
 if __name__ == "__main__":
     unittest.main()
