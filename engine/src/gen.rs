@@ -584,6 +584,39 @@ impl Engine {
         self.enable_dev_sampler(s);
         self.sample_last()
     }
+    /// #93: the device sampler booked `drawn`; the host replaced it with
+    /// `kept` (a tool-grammar redraw). Move the booking (`sample::rebook_plan`): a few
+    /// bytes read, a few written, on a rejection only. `lastn` = the device window depth,
+    /// 0 when the window is not armed. No sampler armed: nothing to do.
+    ///
+    /// # Safety
+    ///
+    /// - a CUDA context must be current; call between two `decode_step`s (the step that
+    ///   drew `drawn` has returned, so its accept has landed). The writes go out on the
+    ///   current stream, ahead of the next step's launch.
+    pub unsafe fn rebook_sampler(&self, drawn: usize, kept: usize, drawn_seen: bool, lastn: usize) {
+        let Some(ds) = self.dev_sampler.as_ref() else { return };
+        if drawn == kept || drawn >= V || kept >= V {
+            return;
+        }
+        let (head, cd, ck) = if lastn > 0 {
+            (
+                cuda::dtoh_i32(ds.ring, 1)[0],
+                cuda::dtoh_t::<u16>(ds.counts + (drawn * 2) as u64, 1)[0],
+                cuda::dtoh_t::<u16>(ds.counts + (kept * 2) as u64, 1)[0],
+            )
+        } else {
+            (0, 0, 0)
+        };
+        for (buf, off, bytes) in crate::sample::rebook_plan(drawn, kept, drawn_seen, lastn, head, cd, ck) {
+            let base = match buf {
+                crate::sample::RebookBuf::Mask => ds.mask,
+                crate::sample::RebookBuf::Counts => ds.counts,
+                crate::sample::RebookBuf::Ring => ds.ring,
+            };
+            cuda::upload_into(base + off as u64, &bytes);
+        }
+    }
     /// #28: a greedy request parks the sampler OUT of the engine, so `decode_step` stops sampling and the buffers survive
     pub fn park_sampler(&mut self, parked: &mut Option<DevSampler>) {
         if self.dev_sampler.is_some() {

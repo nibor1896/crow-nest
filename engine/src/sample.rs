@@ -986,6 +986,54 @@ pub fn stop_on_eos() -> bool {
     std::env::var("CROW_STOP_EOS").as_deref() == Ok("1")
 }
 
+/// #93: the device buffer a re-booking write goes to
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebookBuf {
+    /// the presence mask, `[V]` u8
+    Mask,
+    /// the #84 window counts, `[V]` u16
+    Counts,
+    /// the #84 ring, i32 `{head, fill, ids[..]}`
+    Ring,
+}
+
+/// - #93: the device `sample_k` node ACCEPTS the id it drew (presence
+///   bit, and with the window armed: ring slot + count, `kernels.rs` after the draw).
+///   When the host REPLACES that id (a tool-grammar redraw), the booking must follow,
+///   or the refused id is penalized for the rest of the answer (an EOS the grammar
+///   refused mid-call would carry the presence penalty to the end) and the kept one
+///   is not.
+/// - pure: the writes, as `(buffer, byte offset, bytes)`, that turn the state after
+///   `accept(drawn)` into the state after `accept(kept)`. Inputs read off the device
+///   AFTER the draw: `head_after` = ring[0], `count_drawn` / `count_kept` = counts.
+/// - `drawn_seen`: `drawn` was in this answer before this draw, so its presence bit
+///   stays; `lastn`: the device window depth, 0 when the window is not armed.
+pub fn rebook_plan(
+    drawn: usize,
+    kept: usize,
+    drawn_seen: bool,
+    lastn: usize,
+    head_after: i32,
+    count_drawn: u16,
+    count_kept: u16,
+) -> Vec<(RebookBuf, usize, Vec<u8>)> {
+    let mut w = Vec::new();
+    if drawn == kept {
+        return w;
+    }
+    if !drawn_seen {
+        w.push((RebookBuf::Mask, drawn, vec![0u8]));
+    }
+    w.push((RebookBuf::Mask, kept, vec![1u8]));
+    if lastn > 0 {
+        let slot = (head_after.max(0) as usize + lastn - 1) % lastn;
+        w.push((RebookBuf::Ring, (2 + slot) * 4, (kept as i32).to_le_bytes().to_vec()));
+        w.push((RebookBuf::Counts, drawn * 2, count_drawn.saturating_sub(1).to_le_bytes().to_vec()));
+        w.push((RebookBuf::Counts, kept * 2, count_kept.saturating_add(1).to_le_bytes().to_vec()));
+    }
+    w
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2070,6 +2118,67 @@ mod tests {
         s.xtc_probability = 0.0;
         s.mirostat = 2;
         assert!(s.host_route());
+    }
+
+    /// #93: `rebook_plan` against a host model of the device accept,
+    /// over random answers, with and without the window, eviction included.
+    #[test]
+    fn rebook_turns_the_device_accept_of_the_drawn_id_into_the_accept_of_the_kept_one() {
+        // a host model of `sample_k`'s accept (kernels.rs, after the draw): presence bit,
+        // then, window armed, evict-when-full + ring write + count
+        #[derive(Clone, PartialEq, Debug)]
+        struct Dev {
+            mask: Vec<u8>,
+            counts: Vec<u16>,
+            ring: Vec<i32>,
+        }
+        fn accept(d: &mut Dev, tok: usize, lastn: usize) {
+            d.mask[tok] = 1;
+            if lastn > 0 {
+                let (head, mut fill) = (d.ring[0] as usize, d.ring[1] as usize);
+                if fill >= lastn {
+                    let old = d.ring[2 + head] as usize;
+                    d.counts[old] -= 1;
+                } else {
+                    fill += 1;
+                    d.ring[1] = fill as i32;
+                }
+                d.ring[2 + head] = tok as i32;
+                d.counts[tok] += 1;
+                d.ring[0] = ((head + 1) % lastn) as i32;
+            }
+        }
+        fn apply(d: &mut Dev, w: &[(RebookBuf, usize, Vec<u8>)]) {
+            for (buf, off, b) in w {
+                match buf {
+                    RebookBuf::Mask => d.mask[*off] = b[0],
+                    RebookBuf::Counts => d.counts[off / 2] = u16::from_le_bytes([b[0], b[1]]),
+                    RebookBuf::Ring => d.ring[off / 4] = i32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                }
+            }
+        }
+        let v = 16;
+        let mut rng = Rng::new(5);
+        for lastn in [0usize, 1, 3, 8] {
+            for trial in 0..200 {
+                let mut d = Dev { mask: vec![0; v], counts: vec![0; v], ring: vec![0; 2 + 8] };
+                let mut out = Vec::new();
+                for _ in 0..(rng.next_u64() % 12) {
+                    let t = (rng.next_u64() % v as u64) as usize;
+                    accept(&mut d, t, lastn);
+                    out.push(t);
+                }
+                let drawn = (rng.next_u64() % v as u64) as usize;
+                let kept = (rng.next_u64() % v as u64) as usize;
+                let mut want = d.clone();
+                accept(&mut want, kept, lastn);
+                let seen = out.contains(&drawn);
+                accept(&mut d, drawn, lastn);
+                let w = rebook_plan(drawn, kept, seen, lastn, d.ring[0], d.counts[drawn], d.counts[kept]);
+                apply(&mut d, &w);
+                assert_eq!(d, want, "lastn {lastn} trial {trial} drawn {drawn} kept {kept} out {out:?}");
+            }
+        }
     }
 
     /// #91: `pos_logprobs` is log_softmax of the RAW row - checked against an

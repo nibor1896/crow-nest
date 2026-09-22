@@ -282,8 +282,18 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="320"
+TESTS="335"
 CLIPPY="1505"
+#   tests 320 -> 335 / clippy 1505 (unchanged)   #93 (2026-09-22): eleven toolgrammar
+#                              tests (the Crow 3dbc015 tools compile; the byte machine on well-formed
+#                              calls and on the observed failure shapes; the JSON subset; required /
+#                              parallel; masks on the real vocabulary agree with the per-token check and
+#                              are never empty; a random walk finds no dead end; the parser turns an
+#                              accepted call into the declared arguments; the CPU cost measurement),
+#                              one sample.rs test (rebook_plan against a host model of the device accept)
+#                              and three serve tests (tool_choice / parallel_tool_calls and their 400s,
+#                              the gate per switch and tool_choice, the redraw landing on `old` where the
+#                              rows prefer `old_string`). Measured 334 / 0 / 1 ignored, clippy 1505.
 #   tests 319 -> 320   #91 (2026-09-22): one serve test (`crow_force_ids` parse,
 #                              its named 400s, the `crow_id`-carrying logprob entry).
 #   tests 313 -> 319 / clippy 1505 (unchanged)   #91 logprobs (2026-09-22): two sample.rs tests

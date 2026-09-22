@@ -388,6 +388,17 @@ impl ChatTokenizer {
         self.tok.token_to_id(token)
     }
 
+    /// - #93: is `id` an added token marked `special`? `decode` skips those
+    ///   (`skip_special_tokens`), so they add no text - the tool grammar never lets one
+    ///   into a call
+    pub fn is_special(&self, id: u32) -> bool {
+        self.tok
+            .get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .get(&id)
+            .is_some_and(|t| t.special)
+    }
+
     /// - #91: the exact bytes ONE id stands for, the `bytes` of an OpenAI logprobs entry
     /// - an added token (`<tool_call>`, `<|im_end|>`, ...) is its content, verbatim: the
     ///   decoder emits added tokens as their content, special or not

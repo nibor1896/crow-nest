@@ -27,6 +27,7 @@
 //!   derives from, the chunk and adapt policies, `env_parse`.
 //! - [`tokenizer`]: the in-engine HF tokenizer and chat template (`bin/serve` only).
 //! - [`toolcall`]: the streaming `<tool_call>` parser (`bin/serve` only).
+//! - [`toolgrammar`]: the lazy tool-call grammar and its vocabulary trie (`bin/serve` only).
 //! - [`stopstr`]: the OpenAI stop-string hold (`bin/serve` only, #86).
 //!
 //! L1 — on the leaves:
@@ -87,6 +88,9 @@ pub mod tokenizer;
 // #29 A7 review: the tool-call parser of `bin/serve.rs`, extracted so it is unit tested
 // in the library and `serve.rs` keeps only the chunk builders and the call sites
 pub mod toolcall;
+// #93: the lazy tool-call grammar (llama.cpp qwen3_coder semantics) and the
+// vocabulary trie its token masks walk; `bin/serve.rs` owns the redraw
+pub mod toolgrammar;
 // #86: the OpenAI stop-string filter of `bin/serve.rs`, the same tail-hold
 // `toolcall::find_marker` gives `<tool_call>`, on arbitrary strings
 pub mod stopstr;

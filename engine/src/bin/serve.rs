@@ -169,6 +169,9 @@
 //! | `top_logprobs` | #91: 0..=20 alternatives per position, default 0; a 400 without `logprobs: true`. `post_sampling_probs: true` is a 400: the post-sampler distribution is not offered |
 //! | `crow_force_ids` | #91: array of token ids that REPLACE the generated ids one per step, from the first generated position on (teacher forcing, the #81 injection door); with `logprobs: true` every entry then prices the forced id under the model's raw distribution at that position and carries `crow_id` (entry and alternatives); `[]` forces nothing but still adds `crow_id`; a 400 together with `reasoning_budget_tokens`; after the list runs out generation continues free (greedy/sampled as requested) |
 //! | `tools` | array of OpenAI function tools, RENDERED as the template variable `tools` (#29 A7) |
+//! | `tools` | array of OpenAI function tools, RENDERED as the template variable `tools` (#29 A7); since #93 also COMPILED into the lazy tool-call grammar (`toolgrammar`, architecture 7.11.23) |
+//! | `tool_choice` | #93: `"auto"` (default, absent, `null`) = the lazy grammar: prose free, every call constrained from its `<tool_call>` on; `"required"` = the same, and end of generation refused until one call closed; `{"type":"function","function":{"name":N}}` = required, only tool N; `"none"` = no grammar (the template still renders `tools`). Anything else is a 400 |
+//! | `parallel_tool_calls` | #93: default `true`; `false` = after the first `</tool_call>` only end of generation is allowed |
 //! | `stream_options.include_usage` | `true` puts `usage` on the final chunk (#27 A5) |
 //! | `timings_per_token` | `true` puts `timings` on the final chunk (#27 A5) |
 //!
@@ -587,6 +590,7 @@ use crow_nest_engine::sample::{pos_logprobs, PosLogprobs, Sampler, EOS_IDS, MAX_
 use crow_nest_engine::slot;
 use crow_nest_engine::stopstr::StopStrings;
 use crow_nest_engine::toolcall::{Emit, Malformed, ToolStream, TOOL_OPEN};
+use crow_nest_engine::toolgrammar::{self, Gate, ToolGrammar, Vocab};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -1238,6 +1242,20 @@ struct ChatReq {
     /// ones step by step (teacher forcing). `None` (absent) is every release before it:
     /// nothing is forced and the logprob entries carry no `crow_id`.
     force_ids: Option<Vec<usize>>,
+    /// #93: OpenAI `tool_choice`, parsed (it was silently ignored before)
+    tool_choice: ToolChoice,
+    /// #93: OpenAI `parallel_tool_calls`, default `true`
+    parallel_tool_calls: bool,
+}
+
+/// #93: the request's `tool_choice`
+#[derive(Debug, Clone, PartialEq)]
+enum ToolChoice {
+    Auto,
+    None,
+    Required,
+    /// `{"type":"function","function":{"name":...}}`: required, that tool only
+    Named(String),
 }
 
 /// - #28/#68/#83/#84: the sampling provenance line. Every VALUE, then
@@ -1741,6 +1759,48 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
                     distribution, before temperature and every sampler filter"
             .to_string());
     }
+    // #93: `tool_choice` and `parallel_tool_calls`, OpenAI's forms. Both were
+    // accepted and ignored before; now they steer the tool grammar, so a value this server
+    // cannot honor is a named 400 (the #74 rule), never a silent default.
+    let tool_choice = match obj.get("tool_choice") {
+        None | Some(serde_json::Value::Null) => ToolChoice::Auto,
+        Some(serde_json::Value::String(w)) => match w.as_str() {
+            "auto" => ToolChoice::Auto,
+            "none" => ToolChoice::None,
+            "required" => ToolChoice::Required,
+            other => {
+                return Err(format!(
+                    "tool_choice {other:?} is not one of \"auto\", \"none\", \"required\" or a function object"
+                ))
+            }
+        },
+        Some(v) => {
+            let name = v
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .filter(|_| v.get("type").and_then(|t| t.as_str()) == Some("function"))
+                .ok_or_else(|| {
+                    "tool_choice object is not {\"type\":\"function\",\"function\":{\"name\":...}}".to_string()
+                })?;
+            let declared = tools
+                .as_ref()
+                .and_then(|t| t.as_array())
+                .is_some_and(|a| {
+                    a.iter().any(|t| t.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) == Some(name))
+                });
+            if !declared {
+                return Err(format!("tool_choice names {name:?}, which no tool in the request declares"));
+            }
+            ToolChoice::Named(name.to_string())
+        }
+    };
+    let parallel_tool_calls = match obj.get("parallel_tool_calls") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| "parallel_tool_calls is not a boolean".to_string())?,
+    };
     Ok(ChatReq {
         model,
         messages: messages.clone(),
@@ -1782,6 +1842,8 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         logprobs,
         top_logprobs,
         force_ids,
+        tool_choice,
+        parallel_tool_calls,
     })
 }
 
@@ -1906,12 +1968,137 @@ fn apply_logit_bias(row: &mut [f32], bias: &[(usize, f32)]) {
 /// - `observe` books the drawn id into the sampler's own state (#68 presence set,
 ///   #84 window): the bookkeeping the device node does for itself on its path.
 /// - unsafe: one device-to-host copy on the engine's logits buffer
-unsafe fn draw_biased(eng: &Engine, s: &mut Sampler, bias: &[(usize, f32)]) -> usize {
+/// - #93: with a tool grammar inside a call, the drawn id is CHECKED
+///   before `observe` books it; a refused id is redrawn from the same row with the
+///   grammar's mask on it (llama.cpp's rejection order), so the host sampler's state
+///   only ever sees the id that is kept.
+unsafe fn draw_biased(eng: &Engine, s: &mut Sampler, bias: &[(usize, f32)], gate: Option<&mut Gate<'static>>) -> usize {
     let mut row = crow_nest_engine::cuda::dtoh(eng.logits(), V);
     apply_logit_bias(&mut row, bias);
-    let tok = s.sample(&row);
+    let mut tok = s.sample(&row);
+    if let Some(g) = gate {
+        if g.armed() && !g.check(tok as u32) {
+            g.stats.redrawn += 1;
+            g.mask_row(&mut row);
+            tok = s.sample(&row);
+            if !g.v.token_ok(&g.g, &g.st, tok as u32) {
+                tok = crow_nest_engine::sample::argmax(&row);
+            }
+        }
+    }
     s.observe(tok);
     tok
+}
+
+/// - #93: is the tool grammar on for this process? `CROW_TOOL_GRAMMAR=0`
+///   turns it off (every id then leaves the loop as before this change); unset or any
+///   other value = on
+fn tool_grammar_on() -> bool {
+    std::env::var("CROW_TOOL_GRAMMAR").as_deref() != Ok("0")
+}
+
+/// #93: the vocabulary trie the masks walk, built once per process on the
+/// first request that has a grammar; `.1` is its build wall in ms
+static TOOL_VOCAB: std::sync::OnceLock<(Vocab, f64)> = std::sync::OnceLock::new();
+
+fn tool_vocab(tk: &crow_nest_engine::tokenizer::ChatTokenizer) -> &'static (Vocab, f64) {
+    TOOL_VOCAB.get_or_init(|| {
+        let t = Instant::now();
+        let eos: Vec<u32> = EOS_IDS.iter().map(|&e| e as u32).collect();
+        let open = tk.token_id(TOOL_OPEN).unwrap_or(u32::MAX);
+        let v = Vocab::build(V, |id| tk.token_bytes(id), |id| tk.is_special(id), &eos, open);
+        (v, t.elapsed().as_secs_f64() * 1e3)
+    })
+}
+
+/// - #93: the grammar of THIS request and the one line that says so;
+///   `(None, None)` for a request without tools (nothing is logged, nothing changes)
+/// - off: `CROW_TOOL_GRAMMAR=0`, `tool_choice: "none"`, or a tools array the grammar
+///   cannot express (named in the line); the request then runs unconstrained
+/// - `on` is `tool_grammar_on()` in serve, a parameter so the test drives both sides
+fn tool_gate(
+    req: &ChatReq,
+    tk: &crow_nest_engine::tokenizer::ChatTokenizer,
+    on: bool,
+) -> (Option<Gate<'static>>, Option<String>) {
+    let Some(tools) = req.tools.as_ref().filter(|t| t.as_array().is_some_and(|a| !a.is_empty())) else {
+        return (None, None);
+    };
+    if !on {
+        return (None, Some("[chat] tool grammar OFF (CROW_TOOL_GRAMMAR=0): tool calls are not constrained".to_string()));
+    }
+    let (mode, only) = match &req.tool_choice {
+        ToolChoice::None => {
+            return (None, Some("[chat] tool grammar off: tool_choice \"none\" (request)".to_string()));
+        }
+        ToolChoice::Auto => (toolgrammar::Mode::Auto, None),
+        ToolChoice::Required => (toolgrammar::Mode::Required, None),
+        ToolChoice::Named(n) => (toolgrammar::Mode::Required, Some(n.as_str())),
+    };
+    let t = Instant::now();
+    match ToolGrammar::build(tools, mode, req.parallel_tool_calls, only) {
+        Ok(g) => {
+            let build_ms = t.elapsed().as_secs_f64() * 1e3;
+            let fresh = TOOL_VOCAB.get().is_none();
+            let (v, vocab_ms) = tool_vocab(tk);
+            let line = format!(
+                "[chat] tool grammar ON (CROW_TOOL_GRAMMAR): lazy at the <tool_call> id, tool_choice {}, \
+                 parallel_tool_calls {}; {} tools / {} parameters compiled in {build_ms:.2} ms{}",
+                match &req.tool_choice {
+                    ToolChoice::Named(n) => format!("function {n:?}"),
+                    ToolChoice::Required => "required".to_string(),
+                    _ => "auto".to_string(),
+                },
+                req.parallel_tool_calls,
+                g.n_tools(),
+                g.n_params(),
+                if fresh {
+                    format!("; vocabulary trie {} nodes built in {vocab_ms:.0} ms (once per process)", v.trie_nodes())
+                } else {
+                    String::new()
+                }
+            );
+            (Some(Gate::new(g, v)), Some(line))
+        }
+        Err(e) => (None, Some(format!("[chat] tool grammar off for this request: {e}"))),
+    }
+}
+
+/// - #93: the id the device (or the greedy argmax) produced breaks the tool
+///   call in flight; draw again from the SAME logits row with the grammar's mask on it
+/// - the row: `s.logits` still holds the row that produced the refused id (the #91 rule)
+/// - greedy (`sampler_from` is `None`): the masked argmax
+/// - sampled: a HOST twin of the device sampler at this position - the request's
+///   profile, the prompt tail in the #84 window, this answer's ids booked (presence and
+///   window), and an RNG of its own derived from the seed and the position, so the redraw
+///   is reproducible; the caller moves the device booking (`Engine::rebook_sampler`)
+/// - unsafe: one device-to-host copy of the logits row
+unsafe fn grammar_redraw(eng: &Engine, req: &ChatReq, prompt: &[u32], out: &[u32], gate: &mut Gate<'static>) -> usize {
+    redraw_from_row(req, prompt, out, gate, crow_nest_engine::cuda::dtoh(eng.logits(), V))
+}
+
+/// the host half of `grammar_redraw`, on a row already read back (pure; the test drives it)
+fn redraw_from_row(req: &ChatReq, prompt: &[u32], out: &[u32], gate: &mut Gate<'static>, mut row: Vec<f32>) -> usize {
+    gate.mask_row(&mut row);
+    let tok = match sampler_from(req) {
+        None => crow_nest_engine::sample::argmax(&row),
+        Some(mut m) => {
+            m.observe_prompt(prompt);
+            for &t in out {
+                m.observe(t as usize);
+            }
+            m.rng = crow_nest_engine::sample::Rng::new(
+                req.seed ^ (out.len() as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            );
+            m.sample(&row)
+        }
+    };
+    if gate.v.token_ok(&gate.g, &gate.st, tok as u32) {
+        tok
+    } else {
+        // a filter of the chain kept only refused ids: the masked argmax is always allowed
+        crow_nest_engine::sample::argmax(&row)
+    }
 }
 
 /// - what one served request counted and how long each phase took
@@ -3734,13 +3921,21 @@ fn chat_generate(
     // per-request mask/count buffers is the documented FOLLOW-UP of this issue, not
     // built here. The host route is the reference path `CROW_SAMPLE_HOST=1` ran.
     let biased = !req.logit_bias.is_empty();
+    // #93: the tool grammar of THIS request (`None` without tools, with
+    // `CROW_TOOL_GRAMMAR=0` or `tool_choice: "none"`), and its one request line. Built
+    // before the first draw: the biased route checks inside `draw_biased`.
+    let (mut gate, gate_line) = tool_gate(req, tk, tool_grammar_on());
+    if let Some(l) = gate_line {
+        tracing::info!(target: "chat", "{l}");
+    }
+    let mut redraw_ms = 0.0f64;
     match (&mut sampler, biased) {
         (Some(s), true) => {
             // the device sampler must be OUT: `decode_step` samples whenever it is
             // Some (gen.rs:2905-2909), and this request's draw happens on the host
             srv.eng.park_sampler(&mut srv.parked_sampler);
             // unsafe: one logits row read back (1 MB, ~0.3 ms), the price of the route
-            next = unsafe { draw_biased(srv.eng, s, &req.logit_bias) };
+            next = unsafe { draw_biased(srv.eng, s, &req.logit_bias, gate.as_mut()) };
             tracing::info!(target: "chat",
                 "[chat] logit_bias: {} entries (request), drawing on the HOST sampler \
                  (#86): the row is read back, biased first, then the chain; the device \
@@ -3922,12 +4117,51 @@ fn chat_generate(
             // exists anywhere.
             if !inject.is_empty() {
                 next = inject.pop_front().expect("checked non-empty");
+            } else if let Some(gt) = gate.as_mut() {
+                // #93: inside a call (or, `required`, before one) the id the
+                // step produced is CHECKED - one walk over its bytes - and a refused id is
+                // drawn again from the same row under the grammar's mask (llama.cpp's
+                // rejection order). Outside a call in `auto` mode `armed()` is false and
+                // nothing else runs. The biased route checked inside `draw_biased`.
+                if !biased && gt.armed() && !gt.check(next as u32) {
+                    let t_rd = Instant::now();
+                    let drawn = next;
+                    // unsafe: one logits row read back, as `draw_biased` does
+                    next = unsafe { grammar_redraw(srv.eng, req, ids, &out, gt) };
+                    gt.stats.redrawn += 1;
+                    // the device sampler booked `drawn`; move that to `next`
+                    if let Some(s) = sampler.as_ref() {
+                        let lastn = if s.win_armed() {
+                            s.penalty_last_n.min(crow_nest_engine::gen::SAMPLE_RING_MAX)
+                        } else {
+                            0
+                        };
+                        let seen = out.contains(&(drawn as u32));
+                        // unsafe: a few bytes read and written on the sampler's buffers
+                        unsafe { srv.eng.rebook_sampler(drawn, next, seen, lastn) };
+                    }
+                    redraw_ms += t_rd.elapsed().as_secs_f64() * 1e3;
+                    tracing::debug!(target: "chat",
+                        "[chat] tool grammar: id {drawn} refused in phase {}, redrawn {next}", gt.phase());
+                }
             }
             if EOS_IDS.contains(&next) {
                 finish = "stop";
                 break;
             }
             out.push(next as u32);
+            // #93: the kept id advances the grammar (the `<tool_call>` id opens
+            // it). Only a FORCED id (#81 injection) can be refused here: the grammar then
+            // steps aside for the rest of the answer, the force wins, as it does over the
+            // sampler.
+            if let Some(gt) = gate.as_mut() {
+                let phase = gt.phase();
+                if !gt.accept(next as u32) {
+                    tracing::warn!(target: "chat",
+                        "[chat] tool grammar: the forced id {next} is outside the grammar ({phase}); \
+                         the grammar steps aside for the rest of this answer");
+                }
+            }
             // #91: the logprobs of THIS position, read off the row that produced `next`.
             // `s.logits` still holds it: the prefill (or the last `decode_step`) wrote it,
             // `arm_sampler` / the device `sample_k` node / `draw_biased` only READ it, and
@@ -4036,13 +4270,30 @@ fn chat_generate(
             if biased {
                 if let Some(s) = sampler.as_mut() {
                     // unsafe: one logits row read back, as `draw_biased` does
-                    next = unsafe { draw_biased(srv.eng, s, &req.logit_bias) };
+                    next = unsafe { draw_biased(srv.eng, s, &req.logit_bias, gate.as_mut()) };
                 }
             }
             decode_ms = t.elapsed().as_secs_f64() * 1e3;
         }
     }
 
+    // #93: one line per request whose grammar ever checked an id
+    if let Some(gt) = gate.as_ref() {
+        let st = gt.stats;
+        if st.checked > 0 || st.stepped_aside {
+            tracing::info!(target: "chat",
+                "[chat] tool grammar: {} call(s) closed under it, {} id(s) checked, {} refused and \
+                 redrawn ({} mask(s) built, {:.2} ms; redraw path {:.2} ms in total){}",
+                st.calls_closed,
+                st.checked,
+                st.redrawn,
+                st.masks_built,
+                st.mask_ms,
+                redraw_ms,
+                if st.stepped_aside { "; stepped aside for a forced id" } else { "" }
+            );
+        }
+    }
     if req.logprobs {
         tracing::info!(target: "chat",
             "[chat] logprobs (#91): {} entries, top_logprobs {}, raw distribution (pre-sampler), \
@@ -8301,5 +8552,140 @@ Red is #FF0000."), "{off}");
             assert!(!d.to_string().contains("logprobs"), "{d}");
         }
         assert!(CollectSink::default().logprobs.is_empty());
+    }
+
+    // ------------------------------------------- #93: tool_choice + the gate
+
+    /// the tools array Crow 3dbc015 sent on 2026-09-22 (the #91 replay session), as
+    /// `tools/corruption-replay-probe.py`'s `crow_body` builds it
+    const TOOLS_3DBC015: &str = include_str!("../../../tools/corpora/crow-3dbc015-tools.json");
+
+    fn tool_req(extra: &str) -> ChatReq {
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":"x"}}],"tools":{TOOLS_3DBC015}{extra}}}"#
+        );
+        parse_chat(body.as_bytes()).expect("parses")
+    }
+
+    #[test]
+    fn tool_choice_and_parallel_tool_calls_parse_with_named_400s() {
+        let r = tool_req("");
+        assert_eq!(r.tool_choice, ToolChoice::Auto);
+        assert!(r.parallel_tool_calls);
+        assert_eq!(tool_req(r#","tool_choice":null"#).tool_choice, ToolChoice::Auto);
+        assert_eq!(tool_req(r#","tool_choice":"auto""#).tool_choice, ToolChoice::Auto);
+        assert_eq!(tool_req(r#","tool_choice":"none""#).tool_choice, ToolChoice::None);
+        assert_eq!(tool_req(r#","tool_choice":"required""#).tool_choice, ToolChoice::Required);
+        assert_eq!(
+            tool_req(r#","tool_choice":{"type":"function","function":{"name":"read_file"}}"#).tool_choice,
+            ToolChoice::Named("read_file".to_string())
+        );
+        assert!(!tool_req(r#","parallel_tool_calls":false"#).parallel_tool_calls);
+        let err = |extra: &str| {
+            let body = format!(r#"{{"messages":[{{"role":"user","content":"x"}}],"tools":{TOOLS_3DBC015}{extra}}}"#);
+            parse_chat(body.as_bytes()).unwrap_err()
+        };
+        assert!(err(r#","tool_choice":"any""#).contains("is not one of"));
+        assert!(err(r#","tool_choice":{"type":"function","function":{"name":"nope"}}"#).contains("no tool in the request declares"));
+        assert!(err(r#","tool_choice":{"function":{"name":"read_file"}}"#).contains("tool_choice object"));
+        assert!(err(r#","parallel_tool_calls":"yes""#).contains("parallel_tool_calls is not a boolean"));
+    }
+
+    #[test]
+    fn the_tool_gate_follows_the_switch_the_tool_choice_and_the_tools() {
+        let tk = tk();
+        let (g, line) = tool_gate(&tool_req(""), &tk, true);
+        let g = g.expect("a gate for Crow's tools");
+        assert_eq!((g.g.n_tools(), g.g.n_params()), (26, 51));
+        assert!(!g.armed(), "auto: nothing is checked before the first <tool_call>");
+        let line = line.unwrap();
+        assert!(line.starts_with("[chat] tool grammar ON (CROW_TOOL_GRAMMAR)"), "{line}");
+        assert!(line.contains("tool_choice auto, parallel_tool_calls true; 26 tools / 51 parameters"), "{line}");
+        let (g, line) = tool_gate(&tool_req(""), &tk, false);
+        assert!(g.is_none());
+        assert!(line.unwrap().contains("OFF (CROW_TOOL_GRAMMAR=0)"));
+        let (g, line) = tool_gate(&tool_req(r#","tool_choice":"none""#), &tk, true);
+        assert!(g.is_none() && line.unwrap().contains("tool_choice \"none\""));
+        let (g, _) = tool_gate(&tool_req(r#","tool_choice":"required""#), &tk, true);
+        assert!(g.expect("required").armed(), "required: EOS is checked from the first id");
+        let (g, line) = tool_gate(&tool_req(r#","tool_choice":{"type":"function","function":{"name":"edit_file"}}"#), &tk, true);
+        assert_eq!(g.expect("named").g.n_tools(), 1);
+        assert!(line.unwrap().contains("tool_choice function \"edit_file\""));
+        // no tools, or an empty array: no gate and no line - the request of record
+        let plain = parse_chat(br#"{"messages":[{"role":"user","content":"x"}]}"#).unwrap();
+        assert!(matches!(tool_gate(&plain, &tk, true), (None, None)));
+        let empty = parse_chat(br#"{"messages":[{"role":"user","content":"x"}],"tools":[]}"#).unwrap();
+        assert!(matches!(tool_gate(&empty, &tk, true), (None, None)));
+    }
+
+    /// The loop's grammar path on the host, against a scripted "model": every row prefers
+    /// the next id of the OBSERVED failure (`old_string` for edit_file's `old`, the 22-of-302
+    /// shape of 2026-09-22) by one logit over the declared spelling. Unconstrained, the
+    /// argmax writes the failure; with the gate, the refused id is redrawn from the masked
+    /// row - greedy and sampled - and the parser gets a call with the declared arguments.
+    #[test]
+    fn a_refused_id_is_redrawn_under_the_mask_and_the_call_parses_as_declared() {
+        let tk = tk();
+        let bad = "<tool_call>\n<function=edit_file>\n<parameter=path>\na.rs\n</parameter>\n<parameter=old_string>\nx\n</parameter>\n<parameter=new_string>\ny\n</parameter>\n</function>\n</tool_call>";
+        let good = "<tool_call>\n<function=edit_file>\n<parameter=path>\na.rs\n</parameter>\n<parameter=old>\nx\n</parameter>\n<parameter=new>\ny\n</parameter>\n</function>\n</tool_call>";
+        let enc = |t: &str| -> Vec<u32> { tk.encode_raw(t).expect("encodes") };
+        let (bad, good) = (enc(bad), enc(good));
+        let eos = EOS_IDS[0] as u32;
+        let row_for = |out: &[u32]| -> Vec<f32> {
+            let mut row = vec![-10.0f32; V];
+            for (script, logit) in [(&good, 4.0f32), (&bad, 5.0f32)] {
+                if script.starts_with(out) {
+                    let next = script.get(out.len()).copied().unwrap_or(eos);
+                    row[next as usize] = logit;
+                }
+            }
+            row
+        };
+        for extra in ["", r#","temperature":1.0,"top_p":0.95,"min_p":0.01,"seed":3"#] {
+            let req = tool_req(extra);
+            let (gate, _) = tool_gate(&req, &tk, true);
+            let mut gate = gate.expect("gate");
+            let mut out: Vec<u32> = Vec::new();
+            let mut redrawn = 0;
+            for _ in 0..200 {
+                let row = row_for(&out);
+                let mut next = crow_nest_engine::sample::argmax(&row) as u32;
+                if gate.armed() && !gate.check(next) {
+                    next = redraw_from_row(&req, &[], &out, &mut gate, row) as u32;
+                    redrawn += 1;
+                }
+                if next == eos {
+                    break;
+                }
+                assert!(gate.accept(next));
+                out.push(next);
+            }
+            assert_eq!(out, good, "{extra:?}: the redraws land on the declared spelling");
+            // the script prefers the failure only while the answer is still a prefix of
+            // it: one refusal (at `old_string`) puts the rest on the declared spelling
+            assert_eq!(redrawn, 1, "{extra:?}");
+            assert_eq!(gate.stats.redrawn, 0, "the loop, not the gate, counts this path");
+            let text = tk.decode(&out).unwrap();
+            let tools: serde_json::Value = serde_json::from_str(TOOLS_3DBC015).unwrap();
+            let mut ts = ToolStream::new(Some(&tools));
+            ts.arm();
+            let mut pieces = ts.feed(&text);
+            assert!(!ts.finish(&mut pieces));
+            let mut acc = Vec::new();
+            accumulate_args(&pieces, &mut acc);
+            let v: serde_json::Value = serde_json::from_str(&acc[0]).unwrap();
+            assert_eq!(v, serde_json::json!({"path": "a.rs", "old": "x", "new": "y"}));
+            assert!(ts.malformed().is_empty());
+        }
+        // and without the grammar the same rows write the failure
+        let mut out: Vec<u32> = Vec::new();
+        for _ in 0..200 {
+            let next = crow_nest_engine::sample::argmax(&row_for(&out)) as u32;
+            if next == eos {
+                break;
+            }
+            out.push(next);
+        }
+        assert_eq!(out, bad);
     }
 }

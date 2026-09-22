@@ -2310,6 +2310,8 @@ Therefore:
 | `logprobs` | **read since #91 (2026-09-22)**: `true` adds the log-probability of every generated id, from the RAW model distribution (before `logit_bias`, penalties, temperature and every filter); absent, `null` or `false` is the behaviour of record, no readback and no new key (7.11.22) | `parse_chat`, `chat_generate`, `sample::pos_logprobs` | not sent by Crow; `tools/corruption-replay-probe.py --top-logprobs N` |
 | `top_logprobs` | 0..=20 alternatives per position, default 0; only with `logprobs: true`, otherwise a 400 (OpenAI's rule) (7.11.22) | `parse_chat` | as above |
 | `post_sampling_probs` | llama-server's post-sampler switch: **not offered**, `true` is a 400 naming why; `false` is accepted (7.11.22) | `parse_chat` | — |
+| `tool_choice` | **read since #93 (2026-09-22)**; before, accepted and ignored. `auto` (default) = the lazy tool grammar, `required` = the same plus EOS refused before the first closed call, `{"type":"function","function":{"name":N}}` = required with tool N only, `none` = no grammar (7.11.23) | `parse_chat`, `tool_gate` | not sent by Crow (auto) |
+| `parallel_tool_calls` | default `true`; `false` = only EOS after the first `</tool_call>` (7.11.23) | `parse_chat`, `tool_gate` | not sent by Crow |
 
 **7.11.4 `POST /v1/chat/completions`, the stream**
 
@@ -2453,6 +2455,7 @@ C:/x/y.md
 | read or write timeout (10 s per connection) | one stderr line, that connection closed, accept loop continues | `serve.rs:499` |
 | a client that sent nothing | closed silently, no response | `serve.rs:2563` (`read_head_from`) |
 | `top_logprobs` without `logprobs: true`, over 20 or not a non-negative integer; a non-boolean `logprobs`; `post_sampling_probs: true` | 400 JSON naming the field (#91, 7.11.22) | `parse_chat` |
+| `tool_choice` not `auto`/`none`/`required`/a function object, a function object naming an undeclared tool; a non-boolean `parallel_tool_calls` | 400 JSON naming the field (7.11.23) | `parse_chat` |
 | a `messages` shape the chat template cannot render (content that is not string/list/null, a part that is not text or `image_url`, `tool_calls` not an array, a call or `function` that is not an object, a non-string `function.name`, an unknown role, a system message that is not first) | 400 JSON naming the message index and the field, BEFORE the render | `serve.rs:1564` (`check_messages`), `:1601` (`check_content`), `:1640` (`check_tool_call`) |
 | an `image_url` block without `image_url.url` | 400 JSON naming the message index | `serve.rs:1006` |
 | an image over `VIT_MAX_PATCHES` | 413 JSON | `vit.rs` module doc |
@@ -3213,6 +3216,28 @@ Refusals (400, named): `top_logprobs` without `logprobs: true`, over 20, or not 
 integer; `logprobs` not a boolean; `post_sampling_probs: true`. Unlike llama-server
 (`logprobs is not supported with tools + stream`), a streamed request WITH tools is served: the
 tool-call argument is exactly where #91's corruption sits.
+
+**7.11.23 The lazy tool-call grammar (#93, 2026-09-22)**
+
+Why: over the stored Crow sessions, malformed calls ran at 0.28 per 100 on llama.cpp and 2.93
+per 100 on crow-nest, wrong argument names (`old_string` for `old`, ...) at 0 vs 2.68 per 100.
+llama.cpp constrains every call with a LAZY grammar built from the request's `tools`
+(`common_chat_params_init_qwen3_coder`, pinned tree cbca449 `common/chat.cpp:1162-1330`;
+`tools/server/server-common.cpp:1299-1351` hands it to the sampler); crow-nest parsed the
+markup after the fact (`toolcall.rs`) and could only report what went wrong (#99).
+
+| question | as built |
+|---|---|
+| when | from the `<tool_call>` token ID on (the id that also arms `ToolStream`; llama.cpp triggers on the word, which this model always emits as that token) until the end of the answer. Before it nothing is checked in `auto` mode |
+| the frame | `\n<function=NAME>\n` (NAME declared), then any number of `<parameter=P>\nVALUE\n</parameter>\n` (P declared for that tool, each at most once), `</function>` only when every required P was written, `\n</tool_call>`; after it `space` (llama.cpp's: at most 2 newlines, 22 bytes), then EOS or, with `parallel_tool_calls`, the next `<tool_call>` id. No prose after a call (llama.cpp's root, and the template's "NO suffix") |
+| VALUE | by schema, llama.cpp's `resolves_to_string` split: a string is free text up to `\n</parameter>\n` that contains neither `</parameter>` nor `</tool_call>` (the parser would cut the value there; llama.cpp only stops at the full `\n</parameter>\n`); a string `enum` is one of its options (stricter than llama.cpp, which leaves it free); every other type is JSON: integer `-?(0\|[1-9][0-9]{0,15})`, number, boolean, null, enum/const literals, arrays by `items`, objects by `properties`/`required`/`additionalProperties`; untyped, unions, `$ref`, `allOf` = any JSON value. Not enforced: `minimum`/`maximum`, `minItems`/`maxItems`, `pattern`, `format` |
+| order | parameters in ANY order (llama.cpp: required ones first, permuted, then optionals); an optional one cannot repeat (llama.cpp's `zero_or_more` allows it; the parser would emit a duplicate key) |
+| token level | a byte machine (`ToolGrammar::step`, a fixed-size `Copy` state, JSON nesting to depth 6); a token is allowed when all its bytes step, so a token may span `>\n`, `\n</parameter>\n<parameter=` or any other boundary. The full mask walks a preorder byte TRIE of the vocabulary (591,646 nodes): a refused byte skips its subtree. Special tokens are not in the trie (the detokenizer skips them): inside a call only EOS (where complete) and `<tool_call>` (between calls) pass, by id |
+| where it hooks in | `chat_generate`, top of the loop, after the #81 injection: `gate.armed()` (inside a call, or `required`) then `gate.check(next)`; a refused id goes to `grammar_redraw`. After `out.push`, `gate.accept(next)` advances the state |
+| the redraw | llama.cpp's rejection order (`common_sampler_sample`): the drawn id is checked; only a refused one costs the row. `s.logits` still holds the row (the #91 rule), it is read back, the mask sets `-inf` on every refused id, then greedy = the masked argmax; sampled = a host twin of the device sampler at this position (request profile, prompt tail in the #84 window, this answer's ids booked, an RNG seeded from `seed` and the position), then `Engine::rebook_sampler` moves the device's presence bit / window slot / count from the refused id to the kept one (`sample::rebook_plan`, checked against a host model of the kernel's accept); without it a refused EOS would carry the presence penalty to the end of the answer. The biased host route (#86) checks inside `draw_biased`, before `observe` |
+| #81, logprobs, stop | an injected id is not checked; if it is outside the grammar (a budget spent inside a call opened in the think block) the grammar steps aside for the rest of the answer, with one WARN. Logprobs stay the RAW distribution (a redrawn id is priced under it). Stop strings are unchanged |
+| cost | measured on CPU (`toolgrammar::tests::mask_cost_on_cpu`, release, this machine): trie built once per process in 104-119 ms; per generated id inside a call 27 ns (check + advance); outside a call 2.8 ns (the `armed()` branch 0.38 ns + the advance 2.4 ns); a full mask 4.75 ms in a string value, <= 0.01 ms in every other phase, built only for a refused id and cached per state (256 masks max). The redraw adds one 0.99 MB readback. GPU: NOT measured (the box was RAM-locked, #82) |
+| switch and lines | `CROW_TOOL_GRAMMAR=0` = off (ids byte-identical to before). Per request with tools: `[chat] tool grammar ON (CROW_TOOL_GRAMMAR): lazy at the <tool_call> id, tool_choice auto, parallel_tool_calls true; 26 tools / 51 parameters compiled in X ms`; per request whose grammar checked an id: `[chat] tool grammar: N call(s) closed under it, C id(s) checked, R refused and redrawn (M mask(s) built, X ms; redraw path Y ms in total)` |
 
 ### 7.12 The stage A gate table (what was measured, and where the artefact is)
 
