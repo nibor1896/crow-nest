@@ -4545,6 +4545,13 @@ extern "C" __global__ void vit_rope(float* __restrict__ qkv, const float* __rest
 // Non-causal single-image attention, one query row per block, online softmax
 // (flash row form): grid (n, 16 heads), block 256. scale = 1/sqrt(72), head
 // dim 72, q/k/v read straight from the fused [n][3456] qkv buffer thirds.
+// #98: thread t < 72 owns output dim t and ONLY dim t — one scalar
+// accumulator. Until #98 every one of the 72 threads carried acc[72] and walked
+// all 72 dims (72 identical copies of the P.V product, n^2 * 72 * 72 FMAs per
+// head and layer: 3,520 patches = ~20 s of tower). Per output dim the
+// operations and their order are unchanged (same jj walk, same rescale by r,
+// same fma, same final divide), so the output is bit-identical to the pre-#98
+// kernel — proven old vs new on the GPU by vit.rs `attn_98`.
 extern "C" __global__ void vit_attn(const float* __restrict__ qkv, float* __restrict__ out,
                                     const int* __restrict__ n_p) {
     int n = *n_p;
@@ -4557,9 +4564,7 @@ extern "C" __global__ void vit_attn(const float* __restrict__ qkv, float* __rest
     __shared__ float ps[256];    // the tile's probabilities, kept for the V walk
     if (t < 72) qs[t] = qp[t];
     __syncthreads();
-    float acc[72];
-    #pragma unroll
-    for (int d = 0; d < 72; d++) acc[d] = 0.0f;
+    float acc = 0.0f;   // output dim t (threads t >= 72 carry an unused 0)
     float m = -__int_as_float(0x7f800000), l = 0.0f;
     const float SCALE = 0.11785113019775793f;   // 1/sqrt(72)
     for (int kt = 0; kt < n; kt += 256) {
@@ -4593,26 +4598,19 @@ extern "C" __global__ void vit_attn(const float* __restrict__ qkv, float* __rest
         __syncthreads();
         float r = expf(m - mn_new);
         l = l * r + ln;
-        #pragma unroll
-        for (int d = 0; d < 72; d++) acc[d] *= r;
+        acc *= r;
         m = mn_new;
         // EVERY thread t < 72 walks the WHOLE tile's probabilities — output
-        // dim t accumulates p_j * v_j[t] over ALL keys, not one key per tile
+        // dim t accumulates p_j * v_j[t] over ALL keys, not one key per tile;
+        // the 72 v_j[t] reads of one jj are one coalesced 288-byte row
         if (t < 72) {
             int lim = (n - kt) < 256 ? (n - kt) : 256;
-            for (int jj = 0; jj < lim; jj++) {
-                const float* vp = qkv + (size_t)(kt + jj) * 3456 + 2304 + h * 72;
-                #pragma unroll
-                for (int d = 0; d < 72; d++) acc[d] += ps[jj] * vp[d];
-            }
+            const float* vp = qkv + (size_t)kt * 3456 + 2304 + h * 72 + t;
+            for (int jj = 0; jj < lim; jj++) acc += ps[jj] * vp[(size_t)jj * 3456];
         }
         __syncthreads();
     }
-    if (t < 72) {
-        float* op = out + ((size_t)qi * 16 + h) * 72;
-        #pragma unroll
-        for (int d = 0; d < 72; d++) op[d] = acc[d] / l;
-    }
+    if (t < 72) out[((size_t)qi * 16 + h) * 72 + t] = acc / l;
 }
 
 // Tiled f32-activation NVFP4 GEMM for the vision tower (#VIT hotfix):
