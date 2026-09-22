@@ -583,7 +583,7 @@ use crow_nest_engine::geo::{apply_adapt_policy, DEFAULT_CNQ, DEFAULT_HOTSETS, LA
 use crow_nest_engine::sample::{Sampler, EOS_IDS};
 use crow_nest_engine::slot;
 use crow_nest_engine::stopstr::StopStrings;
-use crow_nest_engine::toolcall::{Emit, ToolStream, TOOL_OPEN};
+use crow_nest_engine::toolcall::{Emit, Malformed, ToolStream, TOOL_OPEN};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -1954,6 +1954,8 @@ struct FinishArgs<'a> {
     t: &'a Timing,
     include_usage: bool,
     timings_per_token: bool,
+    /// #99: the calls the parser abandoned; `crow_malformed_calls` when non-empty
+    malformed: &'a [Malformed],
 }
 
 /// one `chat.completion.chunk`, the only object shape this endpoint streams
@@ -2024,10 +2026,14 @@ fn chunk_tool_args(c: &ChunkCtx, index: usize, args: &str) -> serde_json::Value 
 
 /// - last chunk before `[DONE]`: empty delta, the finish reason
 /// - `usage` rides along when `include_usage`, `timings` when `timings_per_token` (#27 A5)
-/// - neither flag: the object is exactly the A4 chunk, no empty placeholders
+/// - #99: `crow_malformed_calls` rides along when the parser abandoned a call, whatever the
+///   flags (`attach_malformed`)
+/// - neither flag and nothing abandoned: the object is exactly the A4 chunk, no empty
+///   placeholders
 /// - pure: the whole final chunk contract is one function the test can drive
 fn chunk_finish(c: &ChunkCtx, a: &FinishArgs) -> serde_json::Value {
     let mut doc = chunk(c, serde_json::json!({}), Some(a.finish));
+    attach_malformed(&mut doc, a.malformed);
     if let Some(obj) = doc.as_object_mut() {
         if a.include_usage {
             obj.insert("usage".to_string(), usage_json(a.t));
@@ -2037,6 +2043,74 @@ fn chunk_finish(c: &ChunkCtx, a: &FinishArgs) -> serde_json::Value {
         }
     }
     doc
+}
+
+/// - #99: the machine-readable record of every call the parser ABANDONED, one object each,
+///   at the top level of the final chunk and of the `stream:false` document
+/// - `{"kind": "close-before-function" | "bad-name" | "bad-param-name" | "end-in-call",
+///   "index": <tool_calls index> | null, "raw_in_content": bool}`
+/// - `index` names the `tool_calls` entry whose arguments carry `_truncated` (the call was
+///   named before it broke); `null` means it never got a name and never reached `tool_calls`
+/// - `raw_in_content` says the call's raw markup IS the `content` (no call was named before
+///   it); `false` means the markup was dropped - never both, the `toolcall` byte rule
+/// - absent when nothing was abandoned, so an ordinary answer is the chunk it always was;
+///   `crow_` like the engine's other extension keys (`timings.crow_*`), unknown to OpenAI
+///   clients and ignored by them
+/// - pure
+fn attach_malformed(doc: &mut serde_json::Value, malformed: &[Malformed]) {
+    if malformed.is_empty() {
+        return;
+    }
+    let arr: Vec<serde_json::Value> = malformed
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "kind": m.kind.as_str(),
+                "index": m.index,
+                "raw_in_content": m.raw_as_content,
+            })
+        })
+        .collect();
+    if let Some(obj) = doc.as_object_mut() {
+        obj.insert(MALFORMED_KEY.to_string(), serde_json::Value::Array(arr));
+    }
+}
+
+/// #99: the top-level key of `attach_malformed`
+const MALFORMED_KEY: &str = "crow_malformed_calls";
+
+/// #99: the finish of a generation that ended because its client left or the server is
+/// shutting down. Log and routing only on the stream (no final chunk is written); the
+/// `stream:false` document carries it too, since that document is still written.
+const FINISH_ABORT: &str = "abort";
+
+/// - #99: the finish one generation records, in the `[chat]` line, the routing JSON, the
+///   final chunk and the document - decided in ONE place
+/// - `aborted` (client gone, or the #82 shutdown): `abort`, whatever the loop had set. It
+///   used to keep the loop's default `length`, so a closed window read as a spent budget.
+/// - #29 A7: a closed call answers `tool_calls`; a call the generation ENDED inside
+///   (`ended_in_call`) keeps `stop` / `length`. `ToolStream::finish` closes a call whose
+///   `</function>` arrived, so EOS in the tail is a complete call (#29 review). A call
+///   abandoned EARLIER does not keep a later closed one from `tool_calls`: its
+///   `crow_malformed_calls` record says what happened to it.
+/// - #86: a stop-string hit OVERRIDES the closed-call word - the call's fragments were
+///   swallowed with everything after the stop, so naming `tool_calls` would promise a call
+///   the client never received.
+/// - pure
+fn decide_finish(
+    loop_finish: &'static str,
+    aborted: bool,
+    ended_in_call: bool,
+    closed: usize,
+    stop_hit: bool,
+) -> &'static str {
+    if aborted {
+        return FINISH_ABORT;
+    }
+    if !ended_in_call && closed > 0 && !stop_hit {
+        return "tool_calls";
+    }
+    loop_finish
 }
 
 /// one SSE event: `data: <compact json>` plus the blank line that ends it
@@ -3339,7 +3413,7 @@ fn chat_document(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u3
     // #54: the sink watches the request socket from here on - see `ClientProbe`
     let mut sink = CollectSink::watching(stream);
     let out = chat_generate(srv, req, ids, tk, &mut sink);
-    let doc = completion_json(
+    let mut doc = completion_json(
         &ChunkCtx::new(&out.id, out.created, &req.model),
         &sink.content,
         &sink.reasoning,
@@ -3347,6 +3421,8 @@ fn chat_document(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u3
         out.finish,
         &out.timing,
     );
+    // #99: the same record the stream's final chunk carries
+    attach_malformed(&mut doc, &out.malformed);
     // #54: the document is written even for a client that is gone - one document shape, and
     // the write either lands in a socket nobody reads or fails with one `[serve]` line. The
     // STATUS says which it was, the way `chat_stream` has always said it.
@@ -3365,12 +3441,15 @@ struct GenOut {
     id: String,
     /// the unix second of this request, the `created` of both forms
     created: u64,
-    /// `stop`, `length` or `tool_calls`
+    /// `stop`, `length`, `tool_calls`, or `abort` (#99: the client left or the server is
+    /// shutting down; it used to stay `length`)
     finish: &'static str,
     /// the counts and walls behind `usage` and `timings`
     timing: Timing,
     /// a sink call refused, or the #54 probe found the client gone: the loop stopped early
     aborted: bool,
+    /// #99: every call the tool-call parser abandoned, for the document's record
+    malformed: Vec<Malformed>,
 }
 
 /// - #37: the two preconditions `Engine::trickle_tick` ASSERTS (`gen.rs:3128-3129`)
@@ -3590,6 +3669,9 @@ fn chat_generate(
     // the id/created/model triple of this response, once
     let cx = ChunkCtx::new(&id, created, &model);
     let mut aborted = !sink.open(&cx);
+    // #99: an abort caused by the #82 shutdown signal rather than by a gone client; only
+    // the `[chat]` line tells the two apart, both finish as `abort`
+    let mut shutdown = false;
 
     // #27 A5: the decode window opens at the FIRST `decode_step` and closes when the last one
     // returns, so the detokenize and the sink call of token 1 are not counted as decode
@@ -3739,8 +3821,12 @@ fn chat_generate(
             // #82: a shutdown signal ends the generation THROUGH the normal
             // abort path, so the slot, the sink and the loop bookkeeping all
             // close the way a gone client closes them
-            if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
-                || !sink.still_there(i) {
+            if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                aborted = true;
+                shutdown = true;
+                break;
+            }
+            if !sink.still_there(i) {
                 aborted = true;
                 break;
             }
@@ -3855,25 +3941,46 @@ fn chat_generate(
     // for the request that just ran. A stream cannot be repaired - the fragments are already
     // on the wire - so a violation is a named, loud line with `serde_json`'s own message and
     // the byte window, instead of a `{"_raw": ...}` two turns later in someone else's history.
-    for (i, a) in args_acc.iter().enumerate() {
-        if let (_, Some(note)) = args_object_or_raw(a) {
-            tracing::error!(target: "chat", "[chat] BUG: the arguments of tool call {i} are not a JSON object - {note}");
+    // #99: NOT after an abort. `ts.finish` - the step that closes a call in flight - never
+    // ran, so an open fragment is the disconnect, not the parser; 13:58:31 on 2026-09-22
+    // logged it as `ERROR ... BUG` although the client was gone. The call left open is named
+    // on one INFO line instead.
+    if aborted {
+        let open = args_acc
+            .iter()
+            .filter(|a| args_object_or_raw(a).1.is_some())
+            .count();
+        if open > 0 {
+            tracing::info!(target: "chat",
+                "[chat] aborted with {open} tool call(s) in flight: their arguments stay \
+                 unterminated on a connection nobody reads - not a parser fault, not checked (#99)"
+            );
+        }
+    } else {
+        for (i, a) in args_acc.iter().enumerate() {
+            if let (_, Some(note)) = args_object_or_raw(a) {
+                tracing::error!(target: "chat", "[chat] BUG: the arguments of tool call {i} are not a JSON object - {note}");
+            }
         }
     }
-    // #29 A7: a closed call answers `tool_calls`; a malformed one keeps `stop` / `length`.
-    // `ToolStream::finish` closes a call whose `</function>` arrived, so EOS in the tail is
-    // a complete call, not a malformed one (#29 review).
-    // #86: a stop-string hit OVERRIDES the closed-call word - the call's fragments were
-    // swallowed with everything after the stop, so naming `tool_calls` would promise a
-    // call the client never received.
-    if malformed {
+    // #99: the finish is decided ONCE, here, by `decide_finish` - before the lines below, so
+    // they name the finish that is recorded
+    finish = decide_finish(finish, aborted, malformed, ts.closed(), stops.hit());
+    // #99: ONE WARN per abandoned call, on every path. Before, only an END inside a call
+    // was logged; the `give_up` paths were silent (4 of the 8 malformed calls of 2026-09-22).
+    for m in ts.malformed() {
         tracing::warn!(target: "chat",
-            "[chat] MALFORMED tool call: no </function> or no name before the end; \
-             the raw markup went out as content, finish stays {finish}"
+            "[chat] MALFORMED tool call ({}): {}; {}, finish {finish}",
+            m.kind.as_str(),
+            m.kind.what(),
+            match (m.index, m.raw_as_content) {
+                (Some(i), _) => format!("sent once, as tool_calls[{i}] with \"_truncated\" arguments; its raw markup was dropped"),
+                (None, true) => "never named: its raw markup went out as content".to_string(),
+                (None, false) => "never named, after an earlier call: its raw markup was dropped".to_string(),
+            }
         );
-    } else if ts.closed() > 0 && !stops.hit() {
-        finish = "tool_calls";
     }
+
     if ts.dropped() > 0 {
         tracing::info!(target: "chat",
             "[chat] {} byte(s) dropped after the first tool call started: text the template \
@@ -3922,6 +4029,7 @@ fn chat_generate(
                 t: &timing,
                 include_usage: req.include_usage,
                 timings_per_token: req.timings_per_token,
+                malformed: ts.malformed(),
             },
         );
     }
@@ -3948,7 +4056,7 @@ fn chat_generate(
         (true, true)
     };
     tracing::info!(target: "chat",
-        "[chat] prompt {} tok ({cached_n} cached, {prefilled} prefilled), generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {}, reasoning chunks {}, thinking {}, tool chunks {}, think tags stripped {}, tool calls {}, usage {}, timings {}, crow_trickle_swaps {trickle_swaps}{}{}",
+        "[chat] prompt {} tok ({cached_n} cached, {prefilled} prefilled), generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {}, reasoning chunks {}, thinking {}, tool chunks {}, think tags stripped {}, tool calls {}, malformed {}, usage {}, timings {}, crow_trickle_swaps {trickle_swaps}{}{}",
         ids.len(),
         per_second(prefilled, prefill_ms),
         (gen.saturating_sub(1)) as f64 * 1000.0 / decode_ms.max(1e-9),
@@ -3958,9 +4066,14 @@ fn chat_generate(
         counts.tool,
         think.stripped(),
         ts.closed(),
+        ts.malformed().len(),
         log_usage,
         log_timings,
-        if aborted { ", client gone" } else { "" },
+        match (aborted, shutdown) {
+            (true, true) => ", shutdown",
+            (true, false) => ", client gone",
+            _ => "",
+        },
         repeat_note(&rep)
     );
     // #30 A8: the same numbers the `timings` block carries, cumulative since process start
@@ -4033,6 +4146,7 @@ fn chat_generate(
         finish,
         timing,
         aborted,
+        malformed: ts.malformed().to_vec(),
     }
 }
 
@@ -5827,11 +5941,11 @@ mod tests {
 
         // the last chunk: empty delta, a finish reason, and only ONE of them exists
         let t = T0;
-        let f = chunk_finish(&ChunkCtx::new("chatcmpl-1", 1, "crow-nest"), &FinishArgs { finish: "stop", t: &t, include_usage: false, timings_per_token: false });
+        let f = chunk_finish(&ChunkCtx::new("chatcmpl-1", 1, "crow-nest"), &FinishArgs { finish: "stop", t: &t, include_usage: false, timings_per_token: false, malformed: &[] });
         assert_eq!(f["choices"][0]["finish_reason"], "stop");
         assert_eq!(f["choices"][0]["delta"], serde_json::json!({}));
         assert_eq!(
-            chunk_finish(&ChunkCtx::new("i", 1, "m"), &FinishArgs { finish: "length", t: &t, include_usage: false, timings_per_token: false })["choices"][0]["finish_reason"],
+            chunk_finish(&ChunkCtx::new("i", 1, "m"), &FinishArgs { finish: "length", t: &t, include_usage: false, timings_per_token: false, malformed: &[] })["choices"][0]["finish_reason"],
             "length"
         );
     }
@@ -5851,7 +5965,7 @@ mod tests {
 
     #[test]
     fn without_the_two_flags_the_final_chunk_is_the_a4_chunk() {
-        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: false });
+        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: false, malformed: &[] });
         assert!(f.get("usage").is_none());
         assert!(f.get("timings").is_none());
         // nothing else moved either: the object is exactly what A4 sent
@@ -5860,10 +5974,10 @@ mod tests {
             chunk(&ChunkCtx::new("id", 7, "m"), serde_json::json!({}), Some("stop")),
         );
         // one flag at a time carries one object at a time
-        let u = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: false });
+        let u = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: false, malformed: &[] });
         assert!(u.get("usage").is_some());
         assert!(u.get("timings").is_none());
-        let t = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: true });
+        let t = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: true, malformed: &[] });
         assert!(t.get("usage").is_none());
         assert!(t.get("timings").is_some());
     }
@@ -5871,7 +5985,7 @@ mod tests {
     #[test]
     fn the_final_chunk_carries_the_eight_fields_crow_reads() {
         // crow_core.py:4838-4845 (usage) and :4999-5018 (timings)
-        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: true });
+        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: true, malformed: &[] });
         // the finish reason did not move: Crow reads it off the SAME chunk
         assert_eq!(f["choices"][0]["finish_reason"], "stop");
 
@@ -5912,7 +6026,7 @@ mod tests {
     /// #31 A9: `prompt_tokens` stays the WHOLE prompt, `cached_tokens` is P, `prompt_n` the rest
     #[test]
     fn a_warm_turn_splits_the_prompt_into_cached_and_prefilled() {
-        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T_WARM, include_usage: true, timings_per_token: true });
+        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T_WARM, include_usage: true, timings_per_token: true, malformed: &[] });
         let u = &f["usage"];
         // the same 16,064 token prompt as the cold turn: the client's accounting cannot move
         assert_eq!(u["prompt_tokens"].as_u64(), Some(16_064));
@@ -5950,7 +6064,7 @@ mod tests {
     #[test]
     fn the_cache_fields_are_present_as_integers_warm_and_cold() {
         for t in [&T0, &T_WARM] {
-            let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &t, include_usage: true, timings_per_token: true });
+            let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &t, include_usage: true, timings_per_token: true, malformed: &[] });
             let c = &f["usage"]["prompt_tokens_details"]["cached_tokens"];
             let n = &f["timings"]["cache_n"];
             assert!(c.is_u64() || c.is_i64(), "cached_tokens is not an int: {c}");
@@ -6004,7 +6118,7 @@ mod tests {
             ple_rows_total: 0,
             ple_miss_total: 0,
         };
-        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &z, include_usage: true, timings_per_token: true });
+        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &z, include_usage: true, timings_per_token: true, malformed: &[] });
         for k in ["prompt_ms", "prompt_per_second", "predicted_per_second", "predicted_per_token_ms"] {
             assert_eq!(f["timings"][k].as_f64(), Some(0.0), "{k} is {}", f["timings"][k]);
         }
@@ -6015,7 +6129,7 @@ mod tests {
     /// #30 A8: the five keys, their exact names, and u64 (never a float)
     #[test]
     fn the_timings_block_carries_the_engine_counters_as_u64() {
-        let g = &chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: true })["timings"];
+        let g = &chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: true, malformed: &[] })["timings"];
         // the names are the contract: a renamed key silently breaks every difference reader
         assert_eq!(g["crow_expert_selections"].as_u64(), Some(7_710_720));
         assert_eq!(g["crow_expert_cold"].as_u64(), Some(2_534_400));
@@ -6042,14 +6156,14 @@ mod tests {
     #[test]
     fn the_counters_are_passed_through_unchanged_and_only_live_in_timings() {
         // no flag at all: the counters are NOT on the chunk, the A4 shape is untouched
-        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: false });
+        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: false, malformed: &[] });
         assert!(!f.to_string().contains("crow_expert"), "{f}");
         // include_usage alone: `usage` carries none of them either
-        let u = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: false });
+        let u = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: false, malformed: &[] });
         assert!(u.get("timings").is_none());
         assert!(!u.to_string().contains("crow_"), "{u}");
         // timings on: the value on the wire is the value the engine read, byte for byte
-        let g = &chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: true })["timings"];
+        let g = &chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: true, malformed: &[] })["timings"];
         assert_eq!(g["crow_expert_selections"].as_u64(), Some(T0.selections_total));
         assert_eq!(g["crow_expert_cold"].as_u64(), Some(T0.cold_total));
         assert_eq!(g["crow_ple_rows"].as_u64(), Some(T0.ple_rows_total));
@@ -7756,5 +7870,85 @@ Red is #FF0000."), "{off}");
         for a in &acc {
             assert!(serde_json::from_str::<serde_json::Value>(a).unwrap().is_object());
         }
+    }
+
+    // ------------------------------------------- #99: what the end of a generation reports
+
+    /// the finish reason of every end, decided in one place: an abort is `abort` whatever the
+    /// loop had set (13:58:31 and 15:54:30 on 2026-09-22 logged `finish length, client gone`
+    /// with neither request near its budget), and a call abandoned EARLIER does not keep a
+    /// later closed call from `tool_calls`
+    #[test]
+    fn an_abort_finishes_as_abort_and_never_as_length() {
+        // (loop finish, aborted, ended in a call, closed calls, stop hit) -> recorded
+        let cases: [(&'static str, bool, bool, usize, bool, &str); 10] = [
+            ("length", true, false, 0, false, "abort"), // the client left mid-answer
+            ("length", true, true, 0, false, "abort"),  // ... mid-call (13:58:31)
+            ("stop", true, false, 1, false, "abort"),   // a write failed on the final flush
+            ("length", true, false, 1, true, "abort"),
+            ("length", false, false, 0, false, "length"), // the budget, really spent
+            ("stop", false, false, 0, false, "stop"),
+            ("stop", false, false, 1, false, "tool_calls"),
+            ("stop", false, true, 1, false, "stop"),   // a closed call, then EOS inside the next
+            ("length", false, true, 0, false, "length"),
+            ("stop", false, false, 1, true, "stop"),   // #86: the stop string wins
+        ];
+        for (lf, aborted, ended_in_call, closed, hit, want) in cases {
+            assert_eq!(
+                decide_finish(lf, aborted, ended_in_call, closed, hit),
+                want,
+                "{lf} aborted {aborted} ended_in_call {ended_in_call} closed {closed} hit {hit}"
+            );
+        }
+        assert_eq!(FINISH_ABORT, "abort", "the vLLM word for the same event");
+    }
+
+    /// the parser run the way `chat_generate` runs it, over the live shapes, and its records
+    /// put on the final chunk and the document: the wire contract Crow #217 reads
+    fn records_of(markup: &str, arms: usize) -> (Vec<Emit>, bool, Vec<Malformed>) {
+        let mut ts = ToolStream::new(None);
+        for _ in 0..arms {
+            ts.arm();
+        }
+        let mut out = ts.feed(markup);
+        let bad = ts.finish(&mut out);
+        (out, bad, ts.malformed().to_vec())
+    }
+
+    #[test]
+    fn the_final_chunk_and_the_document_carry_every_abandoned_call() {
+        let t = T0;
+        let ctx = ChunkCtx::new("id", 7, "m");
+        // (1) the silent live shape: no call, the markup IS the content
+        let (_, bad, m) = records_of("<tool_call>\n\n</function>\n</tool_call>", 1);
+        assert!(!bad);
+        let f = chunk_finish(&ctx, &FinishArgs { finish: decide_finish("stop", false, bad, 0, false), t: &t, include_usage: false, timings_per_token: false, malformed: &m });
+        assert_eq!(f["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            f[MALFORMED_KEY],
+            serde_json::json!([{"kind": "close-before-function", "index": null, "raw_in_content": true}])
+        );
+        // (2) the 10:23:37 shape: a named call cut by EOS, sent once as tool_calls[0]
+        let (_, bad, m) = records_of("<tool_call>\n<function=read_image>\n<parameter=path>\nhttp://x", 1);
+        assert!(bad);
+        let f = chunk_finish(&ctx, &FinishArgs { finish: decide_finish("stop", false, bad, 0, false), t: &t, include_usage: true, timings_per_token: true, malformed: &m });
+        assert_eq!(f["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            f[MALFORMED_KEY],
+            serde_json::json!([{"kind": "end-in-call", "index": 0, "raw_in_content": false}])
+        );
+        // the flags still add exactly what they added
+        assert!(f.get("usage").is_some() && f.get("timings").is_some());
+        // (3) the document: the same record, beside the same finish
+        let mut d = completion_json(&ctx, "", "", &[], "stop", &t);
+        attach_malformed(&mut d, &m);
+        assert_eq!(d[MALFORMED_KEY], f[MALFORMED_KEY]);
+        // (4) nothing abandoned: the key is ABSENT, the chunk is the one it always was
+        let f = chunk_finish(&ctx, &FinishArgs { finish: "stop", t: &t, include_usage: false, timings_per_token: false, malformed: &[] });
+        assert!(f.get(MALFORMED_KEY).is_none(), "{f}");
+        let mut d = completion_json(&ctx, "hi", "", &[], "stop", &t);
+        let before = d.clone();
+        attach_malformed(&mut d, &[]);
+        assert_eq!(d, before);
     }
 }

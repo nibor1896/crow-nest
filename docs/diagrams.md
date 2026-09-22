@@ -211,7 +211,7 @@ flowchart TB
     SINK -.->|"when the answer is complete, either form"| REP["the cross-turn repeat counter (#68, 7.11.19)\nFNV-1a over the GENERATED ids into a ring of the last 8 answers\nrepeat_of · repeat_run · single_token on the routing line,\nthe [chat] line only when they are not the healthy values\nWARN at three identical answers in a row: no 4xx, no brake,\nthe sampler and the wire untouched. Per PROCESS, by design"]
     DOCU --> PROBE{"CollectSink::still_there(step), every step (PROBE_EVERY = 1)\npoll(POLLRDHUP), timeout 0, nothing on the wire\nagainst the BASELINE probe taken when the sink was built"}
     PROBE -->|"EOF already there: a client that half-closed"| DOCU2["it gets its whole document"]
-    PROBE -->|"EOF appears later: gone"| STOPG["the generation ENDS, the slot is free;\nfinish_reason unchanged, status 200 OK (client gone)"]
+    PROBE -->|"EOF appears later: gone"| STOPG["the generation ENDS, the slot is free;\nfinish abort (#99), status 200 OK (client gone)"]
     SRV --> SLOT["slot file, across processes (#32 A10)\nKV rows 0..pos + pooled blocks 0..floor(pos/4)\nmeasured 352,843,384 B at 16k\nneeds --slot-save-path, else both actions answer 400\ncontract: n_saved = n_restored"]
     SLOT -.->|"restore into a fresh process"| ROLL
 ```

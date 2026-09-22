@@ -2315,11 +2315,11 @@ Therefore:
 | 1 | `delta:{"role":"assistant"}`, `finish_reason` null | `serve.rs:1299` (`chunk_role`) | `crow_core.py:4831-4877` |
 | 2..n | `delta:{"content":"..."}` , one per emitted piece | `serve.rs:1304` (`chunk_content`) | `crow_core.py:4831-4877` (`delta.content`) |
 | 2..n | `delta:{"reasoning_content":"..."}` — the whole reasoning of a THINKING request (#74, 7.11.20), or the `<think>` block a non-thinking model opened by itself (7.11.16); never an empty frame | `chunk_reasoning` | `crow_core.py:5045` (`reasoning_delta`), shown behind `--show-reasoning`, stored at `:3755` |
-| n+1 | `delta:{}` plus `finish_reason`, optionally `usage` and `timings` | `serve.rs:1340` (`chunk_finish`) | `crow_core.py:4831-4877`, `:4999-5018` |
+| n+1 | `delta:{}` plus `finish_reason`, optionally `usage` and `timings`; `crow_malformed_calls` when the parser abandoned a call (#99, 7.11.21) | `chunk_finish`, `attach_malformed` | `crow_core.py:4831-4877`, `:4999-5018` |
 | n+2 | `data: [DONE]` | `serve.rs:517` (`SSE_DONE`) | `crow_core.py:4035` |
 | framing | `data: <compact json>` plus a blank line, one flush per frame | `serve.rs:1354` (`sse_frame`) | `crow_core.py:4831-4877` |
 | headers | `text/event-stream`, `no-cache`, `Connection: close`, no `Content-Length` | `serve.rs:2072` (`chat_stream`) | `crow_core.py:4821` (the train) |
-| `finish_reason` | `stop` (EOS), `length` (budget), `tool_calls` (a call was closed) | `serve.rs:2072` | `crow_core.py:4831-4877` |
+| `finish_reason` | `stop` (EOS or a stop string), `length` (budget), `tool_calls` (a call was closed); `abort` is RECORDED for a gone client or a shutdown but never reaches a stream, which gets no final chunk (#99, 7.11.21) | `decide_finish` | `crow_core.py:4831-4877` |
 
 - One exception to "one token, one frame": a content token whose tail is a prefix of
   `<tool_call>` is HELD until the next token resolves it (`engine/src/toolcall.rs`).
@@ -2393,7 +2393,9 @@ C:/x/y.md
 - EOS after `</function>` CLOSES the call: `finish_reason` `tool_calls`, trailing markup
   dropped and counted, never replayed as content (`toolcall.rs:339`).
 - Malformed markup (no `</function>`, no name): the RAW markup goes out as `delta.content`
-  and `finish_reason` stays `stop` or `length`.
+  ONLY when no call was named - once the call went out as `tool_calls[i]` its markup is dropped
+  (#99, 7.11.21) - and `finish_reason` stays `stop` or `length`. Every abandoned call is one
+  `crow_malformed_calls` record and one WARN.
 - **TASK J (2026-09-17)**: such a call CLOSES its `arguments` object and marks it
   `"_truncated": true` (`toolcall.rs:485`, `close_args_truncated`). The concatenation of the
   `Emit::Args` fragments of every index the parser NAMED is therefore a parseable JSON object
@@ -2523,7 +2525,8 @@ C:/x/y.md
 | `choices[0].message.content` | ALWAYS a string: every content delta of the stream, concatenated; empty when a tool call was the whole answer | `serve.rs:1397` (`CollectSink`), `serve.rs:1477` | `probe-suite.py:679`, `crow_core.py:2984` |
 | `choices[0].message.tool_calls` | present ONLY when the parser closed a call: `[{id, type "function", function{name, arguments}}]`, `arguments` a JSON STRING | `serve.rs:1388` (`CallBuf`), `serve.rs:1477` | neither caller reads it |
 | `choices[0].message.reasoning_content` | present when the reasoning filter has reasoning to give: a block the model opened itself (#67, 7.11.16) or the whole thought of a request that asked to think (#74, 7.11.20); absent otherwise, as before | `completion_json` | `probe-suite.py:680` reads it when present |
-| `choices[0].finish_reason` | `stop`, `length` or `tool_calls`, the stream's rules unchanged | `serve.rs:1648` | `probe-suite.py:678` |
+| `choices[0].finish_reason` | `stop`, `length` or `tool_calls`, the stream's rules unchanged; `abort` when the generation was cut by a gone client or a shutdown (#99: the document is still written, 7.11.21) | `decide_finish` | `probe-suite.py:678` |
+| `crow_malformed_calls` | top level, present ONLY when the parser abandoned a call, the same array as the stream's final chunk (#99, 7.11.21) | `attach_malformed` | Crow #217 |
 | `usage` | `usage_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1109` (`usage_json`), `serve.rs:1477` | `probe-suite.py:681-683` (`completion_tokens`) |
 | `timings` | `timings_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1122` (`timings_json`), `serve.rs:1477` | neither caller reads it |
 | headers | `application/json`, `Content-Length`, `Connection: close`, as on every other JSON route | `serve.rs:2099` (`chat_document`), `serve.rs:1947` (`respond`) | `urllib.request` in both callers |
@@ -2925,7 +2928,7 @@ either. The one thing a probe cannot do is separate the two meanings of a FIN by
 | the log | one `[chat]` line naming the reason and the step, plus `client gone` on the summary line | `CollectSink::still_there` |
 | the status | `[serve] ... -> 200 OK (client gone)`, the label `chat_stream` has always used | `chat_document` |
 | the document | still written: one document shape, and the write either lands unread or fails with one `[serve] response write failed: Broken pipe` line | `chat_document` |
-| `finish_reason` | UNCHANGED (`stop`/`length`/`tool_calls`): no new wire value for a client that is not reading | `chat_generate` |
+| `finish_reason` | `abort` since #99 (2026-09-22) in the `[chat]` line, the routing JSON and the document. It used to stay the loop's default `length`, so a closed window read as a spent budget in every statistic built on those lines (7.11.21) | `decide_finish` |
 
 **Live, at this commit** (`tools/replay-toolcalls.py --gone-client`, the reproducible test;
 `decode_out/gate54/gone-client-post3.txt`):
@@ -3125,6 +3128,58 @@ Crow's own `crow_core.stream_reply` at this model's operating point (`temperatur
   long tool call at this budget. `reasoning_budget_tokens`, which llama-server has and Crow sends
   for the GGUF twin, is NOT implemented here; a client that wants `high` on a file-writing turn
   has to raise `max_tokens` instead. Not in scope for #74.
+
+**7.11.21 End-of-generation accounting: malformed calls, the byte rule, `abort` (#99, 2026-09-22)**
+
+What the engine REPORTS about how a generation ended was wrong three ways on 2026-09-22
+(engine.log, UTC, crow-nest `b6d57f8`), and a fourth defect turned up while fixing them:
+
+| defect | evidence | root cause | fix |
+|---|---|---|---|
+| (1) malformed calls without a line | `[chat] … generated 8 tok … finish stop, content chunks 1 … tool calls 0` at 15:17:12, 15:20:04, 15:39:50, 15:45:28 (11 tok), no WARN; the client stored `<tool_call>\n\n</function>\n</tool_call>` | only `ToolStream::finish` returned "malformed", and only when the stream ENDED inside a call; the three `give_up` paths flushed the markup silently | every abandoned call pushes one `Malformed` record (`ToolStream::abandon`); serve logs one WARN per record and `malformed N` on the `[chat]` line |
+| (2) a cut named call delivered twice | 10:23:37 `MALFORMED`, `generated 6986 tok … finish stop … tool chunks 6920`; Crow stored the call AND its raw markup as content | `flush_raw` emitted the markup whenever `index == 0`, ignoring `named`, although the call already went out as `Emit::Call` | `flush_raw` drops (and counts) the markup once ANY call was named, `named` included - the rule `content()` already applied to prose |
+| (3) a disconnect as `finish length` plus `ERROR … BUG` | 13:58:31 `ERROR … BUG: the arguments of tool call 0 … EOF while parsing a string`, then `finish length … client gone`, routing `"finish":"length"`; 15:54:30 `write failed … Connection reset by peer`, `generated 2 tok … finish length … client gone` | `let mut finish = "length"` was never overwritten on an abort path, and the TASK K invariant loop ran over fragments `ts.finish` never got to close | `decide_finish` answers `abort` for every abort; the invariant loop is skipped after an abort and one INFO line names the calls left open |
+| (4) the parser was not split-invariant after a `give_up` | found by the new sweep: `<tool_call>\n\n</function>\n</tool_call>` then a complete call, in ONE piece, lost the second call; split finer, it was parsed | `flush_raw` also flushed the UNREAD rest of the piece (`buf`) with the abandoned markup | `flush_raw` flushes only what the call consumed; `finish` moves its held-back tail into `raw` itself |
+
+**The client contract** (the stream's final chunk and the `stream:false` document alike):
+
+| what the model produced | `content` | `tool_calls` | `finish_reason` | `crow_malformed_calls` |
+|---|---|---|---|---|
+| prose | the prose | — | `stop` / `length` | absent |
+| a closed call (also EOS after `</function>`) | prose before it | the call | `tool_calls` | absent |
+| `</tool_call>` before `<function=` (the live 15:17 shape) | the raw markup, byte for byte | — | `stop` / `length` | `[{"kind":"close-before-function","index":null,"raw_in_content":true}]` |
+| an empty or unclosed (> 128 B) function name | the raw markup | — | `stop` / `length` | `kind` `bad-name`, `index` null, `raw_in_content` true |
+| the end (EOS, budget or stop string) before a name (15:16:42) | the raw markup | — | `stop` / `length` | `kind` `end-in-call`, `index` null, `raw_in_content` true |
+| the end inside a NAMED call (10:23:37) | prose before it, NO markup | `tool_calls[i]`, arguments closed with `"_truncated":true` | `stop` / `length` - the only way to tell a stop inside the arguments from the token cap | `kind` `end-in-call`, `index` i, `raw_in_content` false |
+| a bad parameter name inside a named call | prose before it, NO markup | `tool_calls[i]` with `"_truncated":true`; a later closed call keeps its own index | `tool_calls` when a later call closed, else `stop` / `length` | `kind` `bad-param-name`, `index` i, `raw_in_content` false |
+| any abandoned call after an earlier NAMED one | unchanged, its markup is dropped | the earlier call(s) | as above | `index` null, `raw_in_content` false |
+| the client left / the server shut down | — (stream: no final chunk and no `[DONE]`; document: still written) | — | `abort` (log, routing, document) | on the document when a record exists |
+
+- ONE byte rule: a byte of an abandoned call leaves either in `tool_calls` (named, `_truncated`)
+  or in `content` (never named), never in both; `raw_in_content` says which. vLLM's Qwen parser
+  fixes converge on the same rule (vllm#22975).
+- `crow_malformed_calls` is ABSENT from an ordinary answer, so every chunk and document of record
+  is byte-identical; `crow_` because it is this engine's extension, like `timings.crow_*`.
+- `kind` names a defect of the MARKUP; the cause of an `end-in-call` (EOS, `max_tokens` or a stop
+  string) is `finish_reason`. A record with `index` i is the explanation of the `_truncated` on
+  `tool_calls[i]`.
+- `abort` is vLLM's word for the same event (vllm PR #47933). A stream never carries it: the
+  client is gone, or the shutdown ends the stream without a final chunk. The `[chat]` line says
+  `, client gone` or `, shutdown`.
+- The parser records are split-invariant, swept over every byte prefix of the give-up shapes at
+  four piece sizes (`every_abandoned_call_is_recorded_once_and_its_bytes_go_one_way`).
+
+The WARN, one per record (target `chat`):
+
+```text
+[chat] MALFORMED tool call (close-before-function): </tool_call> before any <function=; never named: its raw markup went out as content, finish stop
+[chat] MALFORMED tool call (end-in-call): the generation ended before </function>; sent once, as tool_calls[0] with "_truncated" arguments; its raw markup was dropped, finish stop
+```
+
+Replayed against 2026-09-22 (by the parser tests over the stored shapes; no engine run): the
+four silent rounds give one `close-before-function` record each, 15:16:42 one `end-in-call`,
+so the log counts 8 of 8, not 4; 10:23:37 reaches the client once; 13:58:31 and 15:54:30 log
+`finish abort` and no `ERROR`.
 
 ### 7.12 The stage A gate table (what was measured, and where the artefact is)
 
