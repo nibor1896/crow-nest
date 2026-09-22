@@ -45,22 +45,16 @@ fi
 crow_env=()
 while IFS= read -r kv; do crow_env+=("$kv"); done < <(env | grep '^CROW_' || true)
 
-# #91 DEFAULT OPERATING POINT (2026-09-21): the attn-v-out BF16 overlay --
-# v_proj/o_proj/linear_attn.out_proj of every layer at full precision, the
-# exact tensor rule llama.cpp holds in its highest tier short of f16 (the
-# engine that won the blind comparison). The corruption class of the long
-# sessions (trailing digits, df5fe00 for df5fe09) is the quantization
-# residual this removes. Caller wins: set CROW_CNQ_OVERLAY yourself and that
-# file is used; set it EMPTY (CROW_CNQ_OVERLAY=) for the bare no-overlay
-# engine of the parity record.
-if [ -z "${CROW_CNQ_OVERLAY+x}" ]; then
-    overlay="$root/converter/layer91-attn-v-out-originals.cnq"
-    if [ -f "$overlay" ]; then
-        export CROW_CNQ_OVERLAY="$overlay"
-        echo "serve-linux.sh: CROW_CNQ_OVERLAY default -> attn-v-out bf16 overlay (set CROW_CNQ_OVERLAY= to disable)" >&2
-    else
-        echo "serve-linux.sh: default overlay missing ($overlay) - serving the bare container" >&2
-    fi
+# #91 NO OVERLAY BY DEFAULT (2026-09-22, tools/results/91-corruption-ctx100000-end):
+# the attn-v-out BF16 overlay was the default from 723d18f to here on the
+# expectation that it removes the long-session corruption. Measured at 100k
+# context it is the one arm that gets WORSE with depth: 28/320 dropped or
+# wrong lines against the bare container's 8/320 (placebo 2/320), errors on
+# three seeds where every other arm errs on one. The bare container of the
+# parity record is the operating point again. An overlay is opt-in only:
+# CROW_CNQ_OVERLAY=<file>.
+if [ -n "${CROW_CNQ_OVERLAY:-}" ]; then
+    echo "serve-linux.sh: CROW_CNQ_OVERLAY=$CROW_CNQ_OVERLAY (opt-in; the default is the bare container since the #91 100k ladder)" >&2
 fi
 
 printf 'serve-linux.sh: scope MemoryHigh=%s MemoryMax=%s MemorySwapMax=0, %s CROW_* passed through\n' \
