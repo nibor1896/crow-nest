@@ -147,8 +147,12 @@ def main():
     ap.add_argument("--filler-seed", type=int, default=91)
     ap.add_argument("--position", choices=("end", "start"), default="end")
     ap.add_argument("--label", default="arm")
+    ap.add_argument("--sampling", default="{}",
+                    help='JSON merged over the short probe\'s SAMPLING, e.g. \'{"presence_penalty": 0}\' '
+                         '(what serve fills in from the data sheet when absent: presence_penalty 1.5)')
     ap.add_argument("--json", default="-")
     args = ap.parse_args()
+    short.SAMPLING.update(json.loads(args.sampling))   # post() reads it through short.SAMPLING
 
     # room for the literal block (~1k tokens), the reply and the template
     ceiling = N_CTX - REPLY_BUDGET - 3000
@@ -157,7 +161,7 @@ def main():
             args.ctx_tokens, ceiling, N_CTX))
 
     info = {"ctx_tokens_target": args.ctx_tokens, "position": args.position,
-            "filler_seed": args.filler_seed}
+            "filler_seed": args.filler_seed, "sampling": dict(short.SAMPLING)}
     fill = ""
     if args.ctx_tokens > 0:
         cal = post(args.port, [{"role": "user", "content": filler(args.filler_seed, CAL_LINES)}],

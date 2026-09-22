@@ -22,8 +22,13 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # get their own directory, so the skip guard and the summary never mix depths.
 ctx_tokens="${CORRUPTION_CTX_TOKENS:-}"
 position="${CORRUPTION_POSITION:-end}"
+# CORRUPTION_SAMPLING: JSON merged over the probe's sampling (long probe only),
+# CORRUPTION_TAG: names the result directory of such a variant, so it never
+# shares a directory (skip guard, summary) with the record.
+sampling="${CORRUPTION_SAMPLING:-}"
 out="$root/decode_out/corruption-arms"
 [ -n "$ctx_tokens" ] && out="$out-ctx$ctx_tokens-$position"
+[ -n "${CORRUPTION_TAG:-}" ] && out="$out-$CORRUPTION_TAG"
 mkdir -p "$out"
 port="${CORRUPTION_PORT:-8099}"
 # The RAM threshold follows the pinned budget: with CROW_PINNED_BUDGET_GB set
@@ -153,7 +158,7 @@ run_arm() {  # label overlay_path_or_empty
     # needs no isolation and no memory cap.
     if [ -n "$ctx_tokens" ]; then
         python3 "$root/tools/corruption-probe-long.py" --port "$port" --label "$label" \
-            --ctx-tokens "$ctx_tokens" --position "$position" \
+            --ctx-tokens "$ctx_tokens" --position "$position" --sampling "${sampling:-{\}}" \
             --json "$out/$label.json" >"$out/probe-$label.log" 2>&1
     else
         python3 "$root/tools/corruption-probe.py" --port "$port" --label "$label" \
