@@ -50,27 +50,13 @@ if [ "$high" -le 0 ] || [ "$max" -le 0 ]; then
     exit 2
 fi
 
-# #91 OPERATING POINT (2026-09-23): the dense BF16 overlay is the default. The
-# 495 dense tensors (GDN in/out proj, attn o/v, indexer, shared experts, PLE,
-# hyper-connection) run from their BF16 originals; the routed experts stay FP4.
-# Measured (decode_out/meas-0923/multisite, 23 corrupt sites of the 2026-09-23
-# diorama run): at #65 the margin moves by -11.6 nats and `nibor1896` wins; on the
-# uncontaminated sites the corrupt token wins 3/9 instead of 6/9; free-run a48
-# 5 -> 1 index errors; no single dense group, and not tierA, does as much. Cost:
-# decode 66.6 -> 55.8 tok/s. The pinned settings are the ones the measured dense
-# arm booted with (cold tier 48.33 GiB, allocation wc). Opt out with
-# CROW_CNQ_OVERLAY=none (the bare container); any other value names the overlay.
-dense_overlay="$root/converter/dense-bf16-originals.cnq"
-if [ -z "${CROW_CNQ_OVERLAY+x}" ]; then
-    if [ ! -f "$dense_overlay" ]; then
-        echo "serve-linux.sh: the default overlay $dense_overlay is missing - build it or set CROW_CNQ_OVERLAY=none" >&2
-        exit 2
-    fi
-    export CROW_CNQ_OVERLAY="$dense_overlay"
-    export CROW_PINNED_BUDGET_GB="${CROW_PINNED_BUDGET_GB:-50}"
-    export CROW_PINNED_ALLOC="${CROW_PINNED_ALLOC:-wc}"
-    export CROW_RAM_MARGIN_GB="${CROW_RAM_MARGIN_GB:-1}"
-elif [ "$CROW_CNQ_OVERLAY" = "none" ]; then
+# #91 (2026-09-23): NO OVERLAY BY DEFAULT again. The corruption's cause was the PLE
+# row read at the wrong container offset (85a48e7); the dense BF16 overlay only masked
+# part of it and cost the operating point: pinned 50 GiB write-combined (the serve was
+# OOM-killed at 18:38 CEST with the desktop left ~14 GiB) and a hot set of 128 instead
+# of 156 (prefill 500-600 tok/s, decode 33-37 tok/s). An overlay stays opt-in:
+# CROW_CNQ_OVERLAY=<file> (CROW_CNQ_OVERLAY=none is accepted and means none).
+if [ "${CROW_CNQ_OVERLAY:-}" = "none" ]; then
     unset CROW_CNQ_OVERLAY
 fi
 
