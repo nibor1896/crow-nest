@@ -41,7 +41,9 @@ fn enc_ue4m3_up(s: f32) -> u8 {
     for e in 0..16i32 {
         let mul = if e == 0 { 512.0f32 } else { (2.0f32).powi(10 - e) };
         let m = (s * mul).ceil() - if e == 0 { 0.0 } else { 8.0 };
-        if (0.0..=7.0).contains(&m) {
+        // e = 15 stops at m = 6: (15 << 3) | 7 = 0x7F is the E4M3 NaN byte
+        let m_max = if e == 15 { 6.0 } else { 7.0 };
+        if (0.0..=m_max).contains(&m) {
             return ((e << 3) | m as i32) as u8;
         }
     }

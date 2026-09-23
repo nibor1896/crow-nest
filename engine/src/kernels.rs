@@ -242,13 +242,16 @@ __device__ __forceinline__ unsigned int q_e2m1(float v) { // |v| in [0,6]
     return s | 7;
 }
 // smallest ue4m3 >= s (no-overflow scale encoding; 0 iff s <= 0; saturates at
-// 0x7E = 448 — 0x7F is the E4M3 NaN encoding on the tensor core, mma_probe2)
+// 0x7E = 448 — 0x7F is the E4M3 NaN encoding on the tensor core, mma_probe2).
+// At e = 15 the mantissa stops at 6: s in (448, 480] gives m = 7 there, i.e.
+// (15 << 3) | 7 = 0x7F, which must fall through to the 0x7E saturation.
 __device__ __forceinline__ unsigned char enc_ue4m3_up(float s) {
     if (!(s > 0.0f)) return 0;
     for (int e = 0; e < 16; e++) {
         float mul = (e == 0) ? 512.0f : ldexpf(1.0f, 10 - e);
         float m = ceilf(s * mul) - ((e == 0) ? 0.0f : 8.0f);
-        if (m >= 0.0f && m <= 7.0f) return (unsigned char)((e << 3) | (int)m);
+        float m_max = (e == 15) ? 6.0f : 7.0f;
+        if (m >= 0.0f && m <= m_max) return (unsigned char)((e << 3) | (int)m);
     }
     return 0x7E;
 }
@@ -5074,5 +5077,58 @@ mod tests_96 {
             let b = body_of(&ptx, k);
             assert!(b.contains("d_attn_scale"), "{k} must read the runtime scale");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_ue4m3_enc {
+    //! Host twin of the CUDA `enc_ue4m3_up` (the activation-quant scale
+    //! encoder of #10), mirrored expression by expression: ldexpf(1, 10 - e)
+    //! is the exact power of two 2^(10-e), ceilf is f32::ceil. The source
+    //! check pins the twin to the kernel text so the two cannot drift.
+    use super::KERNEL_SRC;
+
+    fn enc_ue4m3_up(s: f32) -> u8 {
+        if !(s > 0.0) { return 0; }
+        for e in 0..16i32 {
+            let mul = if e == 0 { 512.0f32 } else { 2.0f32.powi(10 - e) };
+            let m = (s * mul).ceil() - if e == 0 { 0.0 } else { 8.0 };
+            let m_max = if e == 15 { 6.0 } else { 7.0 };
+            if m >= 0.0 && m <= m_max { return ((e << 3) | m as i32) as u8; }
+        }
+        0x7E
+    }
+
+    #[test]
+    fn the_twin_matches_the_kernel_text() {
+        assert!(KERNEL_SRC.contains("float m_max = (e == 15) ? 6.0f : 7.0f;"));
+        assert!(KERNEL_SRC.contains("if (m >= 0.0f && m <= m_max) return (unsigned char)((e << 3) | (int)m);"));
+    }
+
+    #[test]
+    fn the_encoder_never_emits_the_nan_byte() {
+        // geometric sweep 1e-4 .. 2000, ~20k points per decade
+        let (lo, hi) = (1e-4f64, 2000f64);
+        let n = 150_000usize;
+        let step = (hi / lo).ln() / n as f64;
+        for i in 0..=n {
+            let s = (lo * (step * i as f64).exp()) as f32;
+            let b = enc_ue4m3_up(s);
+            assert_ne!(b, 0x7F, "s = {s} encodes to the E4M3 NaN byte");
+        }
+        // every f32 in (448, 480] explicitly (the old failure band)
+        let mut s = 448.0f32;
+        while s <= 480.0 {
+            s = f32::from_bits(s.to_bits() + 1);
+            assert_ne!(enc_ue4m3_up(s), 0x7F, "s = {s}");
+        }
+        assert_eq!(enc_ue4m3_up(460.0), 0x7E);
+        assert_eq!(enc_ue4m3_up(480.0), 0x7E);
+        assert_eq!(enc_ue4m3_up(448.0), 0x7E);
+        assert_eq!(enc_ue4m3_up(2000.0), 0x7E);
+        // the regular range is unchanged: 416 < s <= 448 still hits m = 6
+        assert_eq!(enc_ue4m3_up(420.0), (15 << 3) | 6);
+        assert_eq!(enc_ue4m3_up(1.0), 7 << 3);
+        assert_eq!(enc_ue4m3_up(0.0), 0);
     }
 }
