@@ -493,8 +493,9 @@
 //!   request, after the last `decode_step`, and eight `u64` of state.
 //! - SCOPE: per PROCESS, not per session. `serve` holds one conversation and there is no
 //!   session id on the wire; and a COLD prefill is NOT a new conversation - an identical
-//!   re-send is cold by construction (its snapshot sits at its own prompt length, spec 7.4),
-//!   which is exactly the case this counter exists to see. So the ring lives as long as the
+//!   re-send was cold by construction until #100 (its snapshot sat at its own prompt length,
+//!   spec 7.4) and is now a zero-prefill WARM request; either way it is exactly the case this
+//!   counter exists to see, and neither kind of request resets it. So the ring lives as long as the
 //!   process does and a restart is what clears it.
 //!
 //! Counters that exist in the engine and are NOT in the block (names are not invented):
@@ -524,6 +525,8 @@
 //! - ONE held conversation per process; a request that shares no prefix replaces it.
 //! - `L` = longest common id prefix of the request and `Engine::history`, ids only.
 //! - `P` = the newest snapshot position at or below `L`, and below the request length.
+//! - #100: or AT the request length, for a snapshot that holds its logits row: then
+//!   `PrefixCache::restore_logits` replaces the prefill, `prefill 0 of N tok`.
 //! - `P` found: `PrefixCache::rollback` restores the state, `prefill` gets `ids[P..]`.
 //! - No such snapshot: `Engine::reset_to_zero`, the slot dropped, the whole prompt prefilled.
 //! - ONE snapshot per request, unconditional (M2b, robin 2026-09-10, #36): after the prompt.
@@ -3833,9 +3836,14 @@ fn chat_generate(
     if req.images.is_empty() {
         srv.eng.end_vision();
     }
+    // #VIT: under CROW_VIT_DUMP=dir the prefill also collects every prompt logit
+    // row (the oracle compare path) and the patch inputs are written before it.
+    let dump_dir = std::env::var("CROW_VIT_DUMP").ok().filter(|_| !req.images.is_empty());
     // #31 A9: the detection rule of spec 7.4, host side, IDS ONLY. `Engine::history` is the
     // held conversation: prompt ids AND generated ids (`gen.rs:2698`, `gen.rs:2945`).
-    let plan = srv.cache.decide(srv.eng.history(), &prompt);
+    // #100: a snapshot holding its logits row may sit AT the prompt length (an identical
+    // re-request prefills nothing); a VIT dump needs the prefill's rows, so not for it.
+    let plan = srv.cache.decide_for(srv.eng.history(), &prompt, dump_dir.is_none());
     let held = srv.eng.history().len();
     let cache_on = srv.cache.enabled();
     let snaps = srv.cache.positions();
@@ -3872,15 +3880,15 @@ fn chat_generate(
     );
     // #27 A5: the timed window is the prefill CALL alone, the same window `decode run` prints
     // as `prefill done in X s`; the rollback, the reset and the tokenizer are outside it.
-    // #VIT: under CROW_VIT_DUMP=dir the prefill also collects every prompt logit
-    // row (the oracle compare path) and the patch inputs are written before it.
-    let dump_dir = std::env::var("CROW_VIT_DUMP").ok().filter(|_| !req.images.is_empty());
     let mut collect = dump_dir.as_ref().map(|_| Vec::new());
     let t_pre = Instant::now();
     let mut next = unsafe {
-        match collect.as_mut() {
-            Some(c) => srv.eng.prefill(srv.cnq, &prompt[cached_n..], Some(c)),
-            None => srv.eng.prefill(srv.cnq, &prompt[cached_n..], None),
+        match (plan.reuse, collect.as_mut()) {
+            // #100: the whole prompt is held: the snapshot's logits row goes back into
+            // `s.logits` and its greedy id stands in for what `prefill` would return
+            (Some((slot, p)), None) if p == prompt.len() => srv.cache.restore_logits(srv.eng, slot),
+            (_, Some(c)) => srv.eng.prefill(srv.cnq, &prompt[cached_n..], Some(c)),
+            (_, None) => srv.eng.prefill(srv.cnq, &prompt[cached_n..], None),
         }
     };
     let prefill_ms = t_pre.elapsed().as_secs_f64() * 1e3;
@@ -3891,7 +3899,8 @@ fn chat_generate(
     // Before the first `decode_step`, so no capture stream is live and no graph exists yet.
     // prefill clean: the prefill above started at 0 or at a prefill clean `P`, so every
     // KV and pooled QSA row below `pos` is a prefill row (`cache.rs`, the induction)
-    let snap1_ms = unsafe { srv.cache.snapshot(srv.eng, true) };
+    // #100: `next` is the greedy id of the row the snapshot keeps with the state
+    let snap1_ms = unsafe { srv.cache.snapshot(srv.eng, true, next) };
     // a disabled cache copies nothing, so it reports nothing either
     if cache_on {
         tracing::info!(target: "cache",
@@ -5305,9 +5314,10 @@ fn main() {
     // #36 M2b: SLOTS is 1, and the line below reads it instead of naming a count of its own.
     let cache = PrefixCache::new(&eng);
     tracing::info!(target: "serve",
-        "[serve] prefix cache {}, {} B per snapshot, {} snapshot(s) in HOST RAM (#72: never VRAM, see cache.rs), QSA ring rows {}",
+        "[serve] prefix cache {}, {} B per snapshot + {} B logits row (#100), {} snapshot(s) in HOST RAM (#72: never VRAM, see cache.rs), QSA ring rows {}",
         if cache.enabled() { "on" } else { "off (CROW_PREFIX_CACHE=0)" },
         cache.shape().snapshot_bytes(),
+        V * 4,
         SLOTS,
         eng.qsa_ring_rows()
     );

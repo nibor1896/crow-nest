@@ -1876,6 +1876,12 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 - Reason for the extra guard: `prefill` of an empty slice has no last position to return a
   greedy id from. It is a guard, not a change of the rule.
+- #100 (2026-09-23): the guard is lifted for a slot that holds its prompt's last logits row
+  and greedy id (`reuse_slot_with_logits`, `PrefixCache::restore_logits`): an identical
+  re-send rolls back onto it and prefills nothing. A slot filled from a slot file has no row
+  and keeps the guard. #101: a rollback onto `P` forgets every slot above `P`, and a snapshot
+  at a held position replaces that slot instead of adding a duplicate (`cache.rs` module doc,
+  "Slot bookkeeping").
 
 **Why ids and not text:**
 
@@ -3000,9 +3006,10 @@ one prefix cache. So it counts, says what it sees, and changes nothing.
 
 **Scope: per process, and deliberately not per "session".** `serve` holds ONE conversation
 (7.4, #31 A9) and the wire carries no session id, so there is nothing else to key on. A cold
-prefill would be the wrong key: an identical re-send is cold BY CONSTRUCTION — the snapshot sits
-at that prompt's own length, so the reuse rule needs `S_pos < len` and finds `P = 0` — and an
-identical re-send is exactly the case this counter exists to see. The ring therefore lives as
+prefill would be the wrong key: an identical re-send was cold BY CONSTRUCTION until #100 — the
+snapshot sat at that prompt's own length and the reuse rule needed `S_pos < len` — and is a
+zero-prefill WARM request since; either way an identical re-send is exactly the case this
+counter exists to see. The ring therefore lives as
 long as the process does, and a restart is what clears it.
 
 **Live at this commit** (`serve` on 8099, four identical greedy requests, then `max_tokens 1`,

@@ -13,6 +13,7 @@
 //! |---|---|
 //! | `L` | longest common prefix length of the request ids and `Engine::history` |
 //! | `P` | `max { S_pos : S_pos <= L and S_pos < request length }` over the held snapshots |
+//! | `P` (#100) | a snapshot that holds its LOGITS ROW may also sit AT the request length |
 //! | cold | no such `S_pos` exists; `Engine::reset_to_zero` runs and the slot is dropped |
 //!
 //! - Only a PREFILL CLEAN snapshot is a reuse candidate; see the section below.
@@ -20,6 +21,18 @@
 //! - `Engine::history` covers prompt AND generated ids (`gen.rs:2698`, `gen.rs:2945`).
 //! - `S_pos < request length` is a guard, not a spec change: `prefill` of an empty
 //!   slice has no last position to return a greedy id from.
+//! - #100: the guard made an IDENTICAL re-request (Crow #217's same-prefix retry) roll
+//!   back to an older snapshot, or go cold. A snapshot therefore also keeps the last
+//!   position's logits row (`s.logits` row 0, V f32 = 993,280 B) and its greedy id, the
+//!   only two things `prefill` leaves behind besides the state (`gen.rs:3973-3979`).
+//!   A request whose ids equal such a snapshot's prefix rolls back onto it, the row is
+//!   uploaded back, and NO token is prefilled: the first draw reads the same row the
+//!   first prefill wrote (`arm_sampler`, `draw_biased`, the #91 logprobs readback).
+//! - llama.cpp and vLLM recompute the last token instead (`n_past--`, "need to evaluate
+//!   at least 1 token"; vLLM `max_cache_hit_length = num_tokens - 1`); for recurrent
+//!   state llama.cpp needs a checkpoint 4 tokens early for that (its PR #20288). The row
+//!   is cheaper here: ONE held conversation, and the state is copied at that instant.
+//! - A slot filled from a slot file (#32 A10) carries no row and keeps the old guard.
 //!
 //! What is snapshotted, and why (spec 7.6):
 //!
@@ -62,7 +75,22 @@
 //! | slot | point | position |
 //! |---|---|---|
 //! | `SLOT_PROMPT` (slot 0) | after the prefill of this turn's prompt | rendered prompt length |
-//! | slots 1..`SLOTS` | the previous turns' prompts, aged by `rotate_right` | their rendered lengths |
+//! | slots 1..`SLOTS` | the previous turns' prompts, largest position first | their rendered lengths |
+//!
+//! Slot bookkeeping (#100, #101), the invariant: every held slot names a PREFIX of
+//! `Engine::history`, and every row below it is a prefill row.
+//!
+//! - #101: `rollback` onto `P` forgets every slot ABOVE `P`: the prefill and decode after
+//!   it rewrite the KV rows `P..`, so those slots name a branch the engine no longer holds
+//!   (seen live twice on 2026-09-22 before this rule; llama.cpp: "erase any checkpoints
+//!   with pos_max > pos_next"). The cold start forgets all of them (`invalidate`).
+//! - So the held slots are nested prefixes, and the newest snapshot is the largest one.
+//! - #100: a snapshot at a position a slot already holds RE-USES that slot (the same ids
+//!   over prefill rows); before, `rotate_right` pushed duplicates that evicted the shared
+//!   prefix after three identical requests. llama.cpp: "replace an existing checkpoint at
+//!   the same n_tokens instead of appending a duplicate".
+//! - Otherwise an empty slot is taken, else the one with the SMALLEST position (the
+//!   oldest turn boundary of the nested chain). The chosen slot moves to slot 0.
 //!
 //! - Holding the last few prompt snapshots is what turns a history edit that diverges
 //!   below the newest position from a full cold prefill into a rollback to the previous turn.
@@ -79,7 +107,11 @@
 //! QSA ring 12 * 2052 * 128     * 4 =  12,607,488 B
 //! total per slot                   = 130,646,016 B = 124.60 MiB
 //! process total (SLOTS = 3)        = 391,938,048 B = 373.80 MiB
+//! #100 logits row  248320      * 4 =     993,280 B per slot, 2,979,840 B for SLOTS = 3
 //! ```
+//!
+//! - The logits row is NOT part of `Shape::snapshot_bytes`: that number is the slot
+//!   file's `state_bytes` (#32 A10), and the file does not carry the row.
 //!
 //! - M1 held two slots (261,292,032 B); M2 (robin, 2026-09-10, #36) dropped the
 //!   after-answer slot; M3 keeps `SLOTS` prompt snapshots (newest in slot 0) so a
@@ -157,7 +189,7 @@
 
 use crate::cuda;
 use crate::gen::Engine;
-use crate::geo::{GD, GDN_CONV, GDN_VHEADS};
+use crate::geo::{GD, GDN_CONV, GDN_VHEADS, V};
 use cudarc::driver::sys;
 
 /// slot of the snapshot taken after the prompt prefill (spec 7.6, point 1)
@@ -187,10 +219,23 @@ pub fn common_prefix_len(a: &[i64], b: &[i64]) -> usize {
 /// - `None` = no snapshot at or below `l`, so the request is a cold start
 /// - returns `(slot index, S_pos)`; a tie on `S_pos` takes the lower index
 pub fn reuse_slot(positions: &[Option<usize>], l: usize, new_len: usize) -> Option<(usize, usize)> {
+    reuse_slot_with_logits(positions, &[], l, new_len)
+}
+
+/// - #100: `reuse_slot`, except that a slot whose `logits[i]` is true may also sit AT
+///   `new_len`: its stored logits row stands in for the prefill of the last position
+/// - `logits` shorter than `positions` counts as false for the missing slots
+pub fn reuse_slot_with_logits(
+    positions: &[Option<usize>],
+    logits: &[bool],
+    l: usize,
+    new_len: usize,
+) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize)> = None;
     for (i, p) in positions.iter().enumerate() {
         let Some(p) = *p else { continue };
-        if p > l || p >= new_len {
+        let exact = logits.get(i).copied().unwrap_or(false);
+        if p > l || p > new_len || (p == new_len && !exact) {
             continue;
         }
         match best {
@@ -265,6 +310,12 @@ struct Snapshot {
     ple_state: Vec<f32>,
     /// `[attn_layers][ring*128]` f32
     qsa_ring: Vec<Vec<f32>>,
+    /// #100: `s.logits` row 0 as the prefill of `pos` left it, `[V]` f32
+    logits: Vec<f32>,
+    /// #100: the greedy id `prefill` returned for that row; `None` = no row held (an
+    /// empty slot, or one filled from a slot file), and then `pos` must stay below the
+    /// request length
+    greedy: Option<usize>,
 }
 
 /// - `vec![0f32; n]`, with every page of it faulted in before it is returned
@@ -287,7 +338,7 @@ fn faulted(n: usize) -> Vec<f32> {
 
 impl Snapshot {
     /// allocate once; every later snapshot writes into these buffers
-    fn new(shape: &Shape) -> Snapshot {
+    fn new(shape: &Shape, vocab: usize) -> Snapshot {
         Snapshot {
             pos: None,
             prefill_clean: false,
@@ -298,6 +349,8 @@ impl Snapshot {
             qsa_ring: (0..shape.attn_layers)
                 .map(|_| faulted(shape.qsa_ring_len))
                 .collect(),
+            logits: faulted(vocab),
+            greedy: None,
         }
     }
 }
@@ -334,7 +387,7 @@ impl PrefixCache {
         let enabled = std::env::var("CROW_PREFIX_CACHE").as_deref() != Ok("0");
         let shape = Shape::of(eng);
         let slots = if enabled {
-            (0..SLOTS).map(|_| Snapshot::new(&shape)).collect()
+            (0..SLOTS).map(|_| Snapshot::new(&shape, V)).collect()
         } else {
             Vec::new()
         };
@@ -368,11 +421,25 @@ impl PrefixCache {
     /// - the whole detection rule of spec 7.4 for ONE request
     /// - `history` is `Engine::history`, `ids` the rendered request
     pub fn decide(&self, history: &[i64], ids: &[i64]) -> Decision {
+        self.decide_for(history, ids, true)
+    }
+
+    /// - `decide`, with the #100 zero-prefill reuse allowed or not
+    /// - `allow_exact == false` keeps the old guard `S_pos < request length` for every
+    ///   slot: a request that needs its prompt's own prefill (the `CROW_VIT_DUMP` logits
+    ///   collection) must get at least one token prefilled
+    pub fn decide_for(&self, history: &[i64], ids: &[i64], allow_exact: bool) -> Decision {
         if !self.enabled {
             return Decision { l: 0, reuse: None };
         }
         let l = common_prefix_len(history, ids);
-        Decision { l, reuse: reuse_slot(&self.reuse_candidates(), l, ids.len()) }
+        let logits = if allow_exact { self.logits_held() } else { Vec::new() };
+        Decision { l, reuse: reuse_slot_with_logits(&self.reuse_candidates(), &logits, l, ids.len()) }
+    }
+
+    /// #100: per slot, whether it holds a logits row it may stand in with
+    pub fn logits_held(&self) -> Vec<bool> {
+        self.slots.iter().map(|s| s.prefill_clean && s.greedy.is_some()).collect()
     }
 
     /// - `Some((pos, done_blocks))` of the PROMPT slot while it is a reuse candidate
@@ -419,6 +486,8 @@ impl PrefixCache {
             s.pos = Some(pos);
             s.prefill_clean = true;
             s.done_blocks = done_blocks;
+            // #100: a slot file carries no logits row
+            s.greedy = None;
         }
     }
 
@@ -428,16 +497,19 @@ impl PrefixCache {
         for s in self.slots.iter_mut() {
             s.pos = None;
             s.prefill_clean = false;
+            s.greedy = None;
         }
     }
 
     /// - copy the four recurrent buffers device to host into `SLOT_PROMPT` (slot 0)
     /// - `prefill_clean` says whether every row below `Engine::pos` is a prefill row;
     ///   `false` keeps the slot out of `reuse_candidates` (see the module doc)
-    /// - BEFORE the copy the held slots age by one (`rotate_right`): the oldest moves into
-    ///   slot 0 and is the one this snapshot overwrites in place, so no buffer is reallocated.
-    ///   A history edit that diverges below the newest position then still finds the previous
-    ///   turn's snapshot further down (partial reuse, llama.cpp's behaviour).
+    /// - BEFORE the copy `claim` picks the slot and moves it to slot 0 (#100): the slot that
+    ///   already holds `Engine::pos`, else an empty one, else the smallest position. It is
+    ///   overwritten in place, so no buffer is reallocated. A history edit that diverges
+    ///   below the newest position then still finds an earlier turn's snapshot further down.
+    /// - `greedy` is what `prefill` returned; with it the logits row `s.logits` row 0 is
+    ///   copied too (#100), so a later identical request needs no prefill at all
     /// - returns the wall of the copy in ms (spec 7.9 asks for it)
     /// - a disabled cache does nothing and returns 0.0
     ///
@@ -445,15 +517,15 @@ impl PrefixCache {
     ///
     /// - a CUDA context must be current, as for every other engine call
     /// - no kernel of this engine may be in flight on another thread
-    pub unsafe fn snapshot(&mut self, eng: &Engine, prefill_clean: bool) -> f64 {
+    pub unsafe fn snapshot(&mut self, eng: &Engine, prefill_clean: bool, greedy: usize) -> f64 {
         if !self.enabled || self.slots.is_empty() {
             return 0.0;
         }
         let t0 = std::time::Instant::now();
         // whatever the last launch left in flight must land before the copy reads it
         cuda::sync();
-        self.slots.rotate_right(1);
-        let s = &mut self.slots[SLOT_PROMPT];
+        let slot = self.claim(eng.pos);
+        let s = &mut self.slots[slot];
         for (i, buf) in s.gdn_s.iter_mut().enumerate() {
             dtoh_into(buf, eng.st.gdn_s[i]);
         }
@@ -464,10 +536,68 @@ impl PrefixCache {
         for (i, buf) in s.qsa_ring.iter_mut().enumerate() {
             dtoh_into(buf, eng.st.qsa_keys[i]);
         }
-        s.pos = Some(eng.pos);
-        s.prefill_clean = prefill_clean;
-        s.done_blocks = eng.done_blocks;
+        dtoh_into(&mut s.logits, eng.logits());
+        self.name(slot, eng.pos, prefill_clean, eng.done_blocks, Some(greedy));
         t0.elapsed().as_secs_f64() * 1e3
+    }
+
+    /// - host bookkeeping of a snapshot at `pos`: which slot the copy goes into (#100)
+    /// - the slot already holding `pos` (no duplicate), else an empty slot, else the one
+    ///   with the smallest position; it is moved to `SLOT_PROMPT`, the others keep their order
+    /// - with the #101 invariant every held slot is a prefix of `history`, so a slot at
+    ///   `pos` holds the same ids over prefill rows, and the smallest is the oldest turn
+    fn claim(&mut self, pos: usize) -> usize {
+        let same = self.slots.iter().position(|s| s.pos == Some(pos));
+        let empty = || self.slots.iter().position(|s| s.pos.is_none());
+        let smallest = || {
+            (0..self.slots.len())
+                .min_by_key(|&i| self.slots[i].pos.unwrap_or(0))
+                .unwrap_or(SLOT_PROMPT)
+        };
+        let i = same.or_else(empty).unwrap_or_else(smallest);
+        self.slots[..=i].rotate_right(1);
+        SLOT_PROMPT
+    }
+
+    /// host bookkeeping of a snapshot: name the slot the copy went into
+    fn name(&mut self, slot: usize, pos: usize, prefill_clean: bool, done_blocks: usize, greedy: Option<usize>) {
+        let s = &mut self.slots[slot];
+        s.pos = Some(pos);
+        s.prefill_clean = prefill_clean;
+        s.done_blocks = done_blocks;
+        s.greedy = greedy;
+    }
+
+    /// - host bookkeeping of a rollback onto `slot` (#101)
+    /// - every slot ABOVE its position is forgotten: the prefill and the decode that
+    ///   follow rewrite the KV rows from there, so those slots name a discarded branch
+    fn rolled_back(&mut self, slot: usize) {
+        let Some(p) = self.slots[slot].pos else { return };
+        for s in self.slots.iter_mut() {
+            if s.pos.is_some_and(|q| q > p) {
+                s.pos = None;
+                s.prefill_clean = false;
+                s.greedy = None;
+            }
+        }
+    }
+
+    /// - #100: the zero-prefill path. Upload the logits row `slot` holds into `s.logits`
+    ///   row 0 and return its greedy id: the state `prefill` of the last prompt position
+    ///   would have left for the first draw
+    /// - call right after `rollback(eng, slot)`, instead of `prefill`
+    /// - panics on a slot without a row: `decide` only picks one at the request length
+    ///   when `logits_held` said it has one
+    ///
+    /// # Safety
+    ///
+    /// - a CUDA context must be current, as for every other engine call
+    pub unsafe fn restore_logits(&self, eng: &Engine, slot: usize) -> usize {
+        let s = &self.slots[slot];
+        let greedy = s.greedy.expect("zero-prefill reuse of a slot without a logits row");
+        cuda::to_f32_into(eng.logits(), &s.logits);
+        cuda::sync();
+        greedy
     }
 
     /// - roll the engine back to the position `slot` holds (spec 7.6)
@@ -508,6 +638,7 @@ impl PrefixCache {
         eng.done_blocks = s.done_blocks;
         eng.history.truncate(pos);
         eng.route_log.clear();
+        self.rolled_back(slot);
 
         // the uploads read the slot's vectors; sync before the caller may touch them
         cuda::sync();
@@ -521,7 +652,7 @@ impl PrefixCache {
     /// - `enabled == false` reproduces `CROW_PREFIX_CACHE=0`: no slot is allocated
     fn for_shape(shape: Shape, enabled: bool) -> PrefixCache {
         let slots = if enabled {
-            (0..SLOTS).map(|_| Snapshot::new(&shape)).collect()
+            (0..SLOTS).map(|_| Snapshot::new(&shape, 4)).collect()
         } else {
             Vec::new()
         };
@@ -613,6 +744,21 @@ mod tests {
         // `prefill` needs at least one token: it returns the last position's greedy id
         assert_eq!(reuse_slot(&[Some(200)], 250, 200), None);
         assert_eq!(reuse_slot(&[Some(60), Some(200)], 250, 200), Some((0, 60)));
+    }
+
+    /// #100: a slot that holds its logits row may sit AT the new length; one without may not
+    #[test]
+    fn a_snapshot_at_the_new_length_is_taken_when_it_holds_its_logits_row() {
+        assert_eq!(reuse_slot_with_logits(&[Some(200)], &[true], 250, 200), Some((0, 200)));
+        assert_eq!(reuse_slot_with_logits(&[Some(200)], &[false], 250, 200), None);
+        // the row never lets a snapshot ABOVE the request length through
+        assert_eq!(reuse_slot_with_logits(&[Some(201)], &[true], 250, 200), None);
+        // nor one above L
+        assert_eq!(reuse_slot_with_logits(&[Some(200)], &[true], 150, 200), None);
+        // the exact slot beats an older one below it
+        assert_eq!(reuse_slot_with_logits(&[Some(60), Some(200)], &[true, true], 250, 200), Some((1, 200)));
+        // a missing flag counts as no row
+        assert_eq!(reuse_slot_with_logits(&[Some(60), Some(200)], &[true], 250, 200), Some((0, 60)));
     }
 
     #[test]
@@ -800,5 +946,158 @@ mod tests {
             .reuse,
             None
         );
+    }
+
+    // ------------------------------------------------ #100: the serve request, host side
+
+    /// - one `chat_generate` of `serve`, host side only: `decide`, then the rollback's or
+    ///   the cold start's bookkeeping, the prefill's `history`, the point 1 snapshot's
+    ///   bookkeeping, and the answer's ids appended to `history` as `decode_step` does
+    /// - returns the `cached` count the `[chat]` line and the wire report
+    fn serve_request(c: &mut PrefixCache, history: &mut Vec<i64>, prompt: &[i64], answer: &[i64]) -> usize {
+        let d = c.decide(history, prompt);
+        let cached = match d.reuse {
+            Some((slot, p)) => {
+                history.truncate(p);
+                c.rolled_back(slot);
+                p
+            }
+            None => {
+                history.clear();
+                c.invalidate();
+                0
+            }
+        };
+        history.extend_from_slice(&prompt[cached..]);
+        let slot = c.claim(history.len());
+        c.name(slot, history.len(), true, history.len() / 4, Some(7));
+        history.extend_from_slice(answer);
+        cached
+    }
+
+    /// the #91 replay probe of 2026-09-22 (`decode_out/corruption-replay/baseline.log`):
+    /// three prompts of one session, each a prefix of the next, sent 8 times each in that
+    /// order (point major), every answer different (fresh seed)
+    fn replay_probe(c: &mut PrefixCache) -> Vec<Vec<usize>> {
+        let lens = [6_738usize, 24_410, 39_273];
+        let session: Vec<i64> = (0..lens[2] as i64).collect();
+        let mut history = Vec::new();
+        let mut out = Vec::new();
+        for (k, &n) in lens.iter().enumerate() {
+            let mut row = Vec::new();
+            for seed in 0..8i64 {
+                let answer: Vec<i64> = (0..20).map(|j| 1_000_000 + 1_000 * (10 * k as i64 + seed) + j).collect();
+                row.push(serve_request(c, &mut history, &session[..n], &answer));
+            }
+            out.push(row);
+        }
+        out
+    }
+
+    /// #100: an identical re-request reuses the whole prompt, and eight repeats of one
+    /// prompt never evict the snapshot of the prefix the next prompt shares
+    #[test]
+    fn the_replay_probe_reuses_every_identical_prompt_and_keeps_the_shared_prefix() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        let got = replay_probe(&mut c);
+        assert_eq!(
+            got,
+            vec![
+                vec![0, 6_738, 6_738, 6_738, 6_738, 6_738, 6_738, 6_738],
+                vec![6_738, 24_410, 24_410, 24_410, 24_410, 24_410, 24_410, 24_410],
+                vec![24_410, 39_273, 39_273, 39_273, 39_273, 39_273, 39_273, 39_273],
+            ]
+        );
+        // and after the run the three prompt ends are held, newest first, no duplicate
+        assert_eq!(c.positions(), vec![Some(39_273), Some(24_410), Some(6_738)]);
+    }
+
+    /// #101: a rollback onto an OLDER snapshot rewrites every KV row above it, so the
+    /// newer snapshots above that point name a history the engine no longer holds and
+    /// must never be rolled back onto again
+    #[test]
+    fn a_rollback_forgets_every_snapshot_above_its_point() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        let mut history: Vec<i64> = Vec::new();
+        // three turns of one conversation: prompt ends at 100, 200, 300
+        let conv: Vec<i64> = (0..400).collect();
+        for n in [100usize, 200, 300] {
+            serve_request(&mut c, &mut history, &conv[..n], &[]);
+        }
+        assert_eq!(c.positions(), vec![Some(300), Some(200), Some(100)]);
+        // an edit at 250 rolls back onto 200 and prefills a DIFFERENT tail to 280
+        let mut edited: Vec<i64> = conv[..250].to_vec();
+        edited.extend(5_000..5_030);
+        assert_eq!(serve_request(&mut c, &mut history, &edited, &(6_000..6_040).collect::<Vec<i64>>()), 200);
+        // the snapshot at 300 held the recurrent state of the OLD tokens 250..300
+        assert!(!c.positions().contains(&Some(300)), "stale snapshot kept: {:?}", c.positions());
+        // the next turn extends the edited branch past 300: it must land on 280, not 300
+        let mut next = history.clone();
+        next.extend(7_000..7_050);
+        let d = c.decide(&history, &next);
+        assert_eq!(d.reuse.map(|(_, p)| p), Some(280));
+    }
+
+    /// #100: a snapshot at a position already held re-uses that slot, moved to the front
+    #[test]
+    fn a_snapshot_at_a_held_position_replaces_that_slot_instead_of_a_duplicate() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        for (i, p) in [300usize, 200, 100].into_iter().enumerate() {
+            c.set_slot(i, p, true);
+        }
+        assert_eq!(c.claim(200), SLOT_PROMPT);
+        c.name(SLOT_PROMPT, 200, true, 50, Some(1));
+        assert_eq!(c.positions(), vec![Some(200), Some(300), Some(100)]);
+    }
+
+    /// #100: a new position takes an empty slot first, else the smallest position
+    #[test]
+    fn a_new_snapshot_takes_an_empty_slot_else_the_smallest_position() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        c.set_slot(0, 100, true);
+        c.claim(200);
+        c.name(SLOT_PROMPT, 200, true, 50, Some(1));
+        assert_eq!(c.positions(), vec![Some(200), Some(100), None]);
+        c.claim(300);
+        c.name(SLOT_PROMPT, 300, true, 75, Some(1));
+        assert_eq!(c.positions(), vec![Some(300), Some(200), Some(100)]);
+        c.claim(400);
+        c.name(SLOT_PROMPT, 400, true, 100, Some(1));
+        assert_eq!(c.positions(), vec![Some(400), Some(300), Some(200)]);
+    }
+
+    /// #100 + #32 A10: a slot filled from a slot file has no logits row, so an identical
+    /// request after a restore keeps the old guard; `set_slot` models the same (no row)
+    #[test]
+    fn a_slot_without_a_logits_row_is_not_reused_at_the_request_length() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        c.set_prompt_slot(100, 25);
+        assert_eq!(c.logits_held(), vec![false, false, false]);
+        let ids: Vec<i64> = (0..100).collect();
+        assert_eq!(c.decide(&ids, &ids).reuse, None);
+        // with a row it is taken, and `decide_for(.., false)` refuses it again
+        c.name(SLOT_PROMPT, 100, true, 25, Some(3));
+        assert_eq!(c.decide(&ids, &ids).reuse, Some((SLOT_PROMPT, 100)));
+        assert_eq!(c.decide_for(&ids, &ids, false).reuse, None);
+        // a cold start forgets the row with the position
+        c.invalidate();
+        assert_eq!(c.logits_held(), vec![false, false, false]);
+    }
+
+    /// #100, the Crow #217 retry: the same prompt again after an answer, with the
+    /// previous turns held below it; nothing is prefilled and nothing is evicted
+    #[test]
+    fn an_identical_retry_is_served_from_the_prompt_snapshot_and_evicts_nothing() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        let mut history = Vec::new();
+        let conv: Vec<i64> = (0..1_000).collect();
+        for n in [300usize, 600, 900] {
+            serve_request(&mut c, &mut history, &conv[..n], &[9_000, 9_001]);
+        }
+        for retry in 0..10i64 {
+            let cached = serve_request(&mut c, &mut history, &conv[..900], &[9_100 + retry]);
+            assert_eq!(cached, 900, "retry {retry}");
+        }
+        assert_eq!(c.positions(), vec![Some(900), Some(600), Some(300)]);
     }
 }
