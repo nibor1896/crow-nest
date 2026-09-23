@@ -22,28 +22,28 @@
 |---|---|
 | Engine | one model, one GPU, Rust + thin CUDA kernels |
 | Model | Qwen3.8-Flash-Next, NVFP4 container CNQ4.5-M |
-| API | OpenAI-compatible HTTP, client [Crow](https://github.com/nibor1896/Crow) (2026-09-23) |
-| Release | v0.4.0 (2026-09-23), [CHANGELOG.md](CHANGELOG.md) |
+| API | OpenAI-compatible HTTP, client [Crow](https://github.com/nibor1896/Crow) |
+| Release | v0.4.0, [CHANGELOG.md](CHANGELOG.md) |
 
-## Status (2026-09-23)
+## Status
 
 | | |
 |---|---|
 | #91 output corruption | fixed: PLE n-gram rows read at the wrong container offset |
-| Live agent run | 60 → 0 corrupt tokens (2026-09-23) |
-| 23-site corruption set | 15/23 → 4/23 (llama.cpp UD-Q2_K_XL: 4/23) (2026-09-23) |
+| Live agent run | 60 → 0 corrupt tokens |
+| 23-site corruption set | 15/23 → 4/23 (llama.cpp UD-Q2_K_XL: 4/23) |
 | Full table | [docs/status.md](docs/status.md) |
 
-## Requirements (2026-09-23)
+## Requirements
 
 | | |
 |---|---|
 | GPU | NVIDIA Blackwell `sm_120`, RTX 5090 32 GB |
 | Host RAM | 64 GB |
-| CUDA | 13.3 runtime (NVRTC) (2026-09-23) |
+| CUDA | 13.3 runtime (NVRTC) |
 | Rust | stable |
 | OS | Linux, Windows |
-| Container | `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq`, 104.7 GB, [Hugging Face](https://huggingface.co/nibor1896/Qwen3.8-Flash-Next-CNQ4.5-M) (2026-09-23) |
+| Container | `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq`, 104.7 GB, [Hugging Face](https://huggingface.co/nibor1896/Qwen3.8-Flash-Next-CNQ4.5-M) |
 
 ## Quick start
 

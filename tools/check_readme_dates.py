@@ -51,7 +51,9 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_FILES = ["README.md", "engine/README.md", "converter/README.md"]
+# The top README is a quick start (robin, 2026-09-23): no dates in it. Its dated
+# facts live in docs/ (status.md, measurements.md, getting-started.md).
+DEFAULT_FILES = ["engine/README.md", "converter/README.md"]
 
 FENCE_RE = re.compile(r"^\s*```")
 BADGE_RE = re.compile(r"^\s*<a href=.*img\.shields\.io/")
