@@ -1548,15 +1548,23 @@ extern "C" __global__ void conv_silu(const float* __restrict__ in_, const float*
         out[(size_t)ch * tt + t] = acc / (1.0f + expf(-acc));
     }
 }
-// refresh the [C][3] conv state from the last 3 rows of a chunk ([C][T] layout)
+// refresh the [C][3] conv state from the last 3 rows of a chunk ([C][T] layout).
+// A chunk shorter than the window (tt < 3: a prompt tail, a warm resume with a
+// 1-2 token suffix) keeps the newest 3 - tt OLD rows, shifted down by tt - the
+// window conv_step would hold after tt single steps. All reads before any write:
+// thread j reads old slot j + tt, which another thread overwrites.
 extern "C" __global__ void conv_state_update(const float* __restrict__ in_, float* __restrict__ state,
                                              const int* __restrict__ t_p) {
     int tt = *t_p;
     int ch = blockIdx.x;
     int j = threadIdx.x; // 3 threads
-    if (j >= 3) return;
-    int src = tt - 3 + j;
-    if (src >= 0) state[ch * 3 + j] = in_[(size_t)ch * tt + src];
+    float v = 0.0f;
+    if (j < 3) {
+        int src = tt - 3 + j;
+        v = (src >= 0) ? in_[(size_t)ch * tt + src] : state[ch * 3 + j + tt];
+    }
+    __syncthreads();
+    if (j < 3) state[ch * 3 + j] = v;
 }
 // [T][C] -> [C][T] device transpose (replaces the p13 host roundtrip)
 extern "C" __global__ void transpose_rt(const float* __restrict__ in_, float* __restrict__ out,
@@ -4093,8 +4101,11 @@ extern "C" __global__ void ple_state_update(const float* __restrict__ gn, float*
     int tt = *t_p;
     for (int j = 0; j < 9; j++) {
         int src = tt - 9 + j;
-        if (src >= 0) state[c * 9 + j] = gn[(size_t)src * 10240 + c];
-        // src < 0 only on the very first chunk when old state is zeros — keep
+        // src < 0: a chunk shorter than the 9-row window (a prompt tail, a warm
+        // resume with a short suffix): the old row j + tt shifts down to j, what
+        // ple_conv_step does after tt single steps. Ascending j reads slot j + tt
+        // before it is overwritten.
+        state[c * 9 + j] = (src >= 0) ? gn[(size_t)src * 10240 + c] : state[c * 9 + j + tt];
     }
 }
 extern "C" __global__ void ple_conv_step(const float* __restrict__ gn_row,
