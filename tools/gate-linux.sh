@@ -282,8 +282,19 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="335"
+TESTS="358"
 CLIPPY="1505"
+#   tests 335 -> 358   integration-0923 + 0923 fixes (2026-09-23, release-2026-09-23): #103 cold tier /
+#                              free_for_pin, #102 CROW_KV + unread-CROW_* warning, #100/#101 prefix cache,
+#                              the ue4m3 0x7F encoder test (5c6891a), tests_act_prescale (488a840),
+#                              the toolgrammar closer/owed-parameter cases (492f137) and tests_ple_row
+#                              (85a48e7). Measured 2026-09-23: lib 237 / 0 / 1 ignored, decode 5, parity 6,
+#                              serve 110 = 358 / 0. Clippy NOT re-counted on this branch.
+#   NOTE (2026-09-23): the per-row activation pre-scale (488a840) and the PLE row-offset fix
+#                              (85a48e7) change the engine's numerics ON PURPOSE, so the three parity
+#                              shas and the run32 ids above are expected to move. They are the values
+#                              of the pre-0923 engine; new values of record need a gate run on the GPU,
+#                              which has not happened yet. Until then items 1, 2, 3 and 6 are expected RED.
 #   tests 320 -> 335 / clippy 1505 (unchanged)   #93 (2026-09-22): eleven toolgrammar
 #                              tests (the Crow 3dbc015 tools compile; the byte machine on well-formed
 #                              calls and on the observed failure shapes; the JSON subset; required /

@@ -13,7 +13,7 @@
 # Limits are computed from /proc/meminfo MemTotal: MemoryHigh = MemTotal - 8G,
 # MemoryMax = MemTotal - 6G, so the desktop keeps a floor the engine cannot eat.
 #
-# Since the #103 (2026-09-23) the cold tier is registered ANONYMOUS
+# Since #103 (2026-09-23) the cold tier is registered ANONYMOUS
 # memory (CROW_PINNED_ALLOC=register), so it is charged to this scope: a 45.1 GiB
 # tier boots at memory.current ~49.9 GiB (tier + heap + page cache), under
 # MemoryHigh 54.2 GiB on the 62 GiB host. The old write-combined tier
@@ -55,7 +55,9 @@ fi
 # part of it and cost the operating point: pinned 50 GiB write-combined (the serve was
 # OOM-killed at 18:38 CEST with the desktop left ~14 GiB) and a hot set of 128 instead
 # of 156 (prefill 500-600 tok/s, decode 33-37 tok/s). An overlay stays opt-in:
-# CROW_CNQ_OVERLAY=<file> (CROW_CNQ_OVERLAY=none is accepted and means none).
+# CROW_CNQ_OVERLAY=<file> (CROW_CNQ_OVERLAY=none is accepted and means none; an empty
+# value also attaches nothing, engine/src/boot.rs). The dense-overlay default lived from
+# 0924406 to 0254ed6 on 2026-09-23.
 if [ "${CROW_CNQ_OVERLAY:-}" = "none" ]; then
     unset CROW_CNQ_OVERLAY
 fi
@@ -70,7 +72,7 @@ while IFS= read -r kv; do crow_env+=("$kv"); done \
 
 # The attn-v-out overlay (default 723d18f..2026-09-22) got WORSE at 100k context
 # (tools/results/91-corruption-ctx100000-end: 28/320 wrong lines vs bare 8/320).
-# The dense overlay above is a different, measured set; see the #91 block.
+# Neither overlay is a default any more; see the #91 block above.
 echo "serve-linux.sh: CROW_CNQ_OVERLAY=${CROW_CNQ_OVERLAY:-none (bare container)} CROW_PINNED_BUDGET_GB=${CROW_PINNED_BUDGET_GB:-unset} CROW_PINNED_ALLOC=${CROW_PINNED_ALLOC:-default}" >&2
 
 # #102: CROW_KV=bf16 (the KV cache in bf16 instead of FP8 E4M3) is read by serve and

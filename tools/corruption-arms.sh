@@ -176,9 +176,11 @@ run_arm() {  # label overlay_path_or_empty
     wait_ram
     echo "=== arm $label : $(date +%H:%M:%S) : MemAvailable $(awk '/^MemAvailable/{print int($2/1048576)}' /proc/meminfo)GiB"
     # CROW_CNQ_OVERLAY= EXPLICITLY EMPTY for the baseline: serve-linux.sh
-    # defaults to the attn overlay since 723d18f, and a baseline that silently
-    # carries it would compare overlay against overlay (2026-09-21, caught
-    # before the first clean run).
+    # defaulted to the attn overlay from 723d18f to 0efe3b5 and to the dense
+    # overlay from 0924406 to 0254ed6 (2026-09-23; no overlay by default since),
+    # and a baseline that silently carries one would compare overlay against
+    # overlay (2026-09-21, caught before the first clean run). An empty value
+    # attaches nothing (boot.rs), so the guard stays harmless.
     local envs=(env "CROW_RAM_MARGIN_GB=1" "CROW_CNQ_OVERLAY=")
     [ -n "$overlay" ] && envs+=("CROW_CNQ_OVERLAY=$overlay")
     "${envs[@]}" "$root/tools/serve-linux.sh" --port "$port" \
