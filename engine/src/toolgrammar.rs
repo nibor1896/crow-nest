@@ -584,11 +584,6 @@ impl ToolGrammar {
 
     // -------------------------------------------------------------- the byte machine
 
-    fn required_done(&self, s: &St) -> bool {
-        let t = &self.tools[s.tool as usize];
-        (s.seen & t.required) == t.required
-    }
-
     fn unseen_param(&self, s: &St) -> bool {
         let n = self.tools[s.tool as usize].pnames.len();
         n > 0 && s.seen.count_ones() < n as u32
@@ -655,7 +650,10 @@ impl ToolGrammar {
                 Ph::BodyLt => {
                     s.ph = match b {
                         b'p' if self.unseen_param(s) => Ph::Lit { id: L_PARAM, off: 2 },
-                        b'/' if self.required_done(s) => Ph::Lit { id: L_FCLOSE, off: 2 },
+                        // the call may close with a required parameter missing: the client
+                        // reports that as a schema error the model can repair, while refusing
+                        // `/` FORCED `<parameter=` plus filler text into the model's context
+                        b'/' => Ph::Lit { id: L_FCLOSE, off: 2 },
                         _ => return false,
                     };
                     return true;
@@ -679,9 +677,12 @@ impl ToolGrammar {
                 Ph::RawStr { g, pat, nlb, nl } => {
                     match guard_step(g, pat, b) {
                         Err(p) => {
-                            // a marker completed: the closer when it is `</parameter>` right
-                            // after a newline, else a value `toolcall` would cut - refused
-                            if p == 0 && nlb {
+                            // a marker completed: `</parameter>` closes the value whether or
+                            // not a newline stood before it - `toolcall::find_marker` cuts there
+                            // either way, so refusing it only FORCED a junk token into the
+                            // model's context (live 2026-09-23: `src/scene.js\nparameter_path`,
+                            // a `task` of `parameter`). `</tool_call>` inside a value stays refused.
+                            if p == 0 {
                                 s.ph = Ph::Lit { id: L_NL, off: 0 };
                                 return true;
                             }
@@ -1506,10 +1507,16 @@ mod tests {
         assert_eq!(run(&g, &format!("{p}_string>")), Err(p.len()));
         // an undeclared tool
         assert_eq!(run(&g, "\n<function=edit>"), Err("\n<function=edit".len()));
-        // a required parameter missing: `</function>` is refused, `<parameter=` is not
+        // a required parameter missing: `</function>` is ACCEPTED since 2026-09-23 - the
+        // client reports the missing parameter; refusing forced filler into the context
         let p = "\n<function=edit_file>\n<parameter=path>\np\n</parameter>\n<";
         assert!(run(&g, p).is_ok());
-        assert_eq!(run(&g, &format!("{p}/function>")), Err(p.len()));
+        assert!(run(&g, &format!("{p}/function>")).is_ok());
+        // a value closed without a newline before `</parameter>` is accepted too (the
+        // parser cuts there anyway); `</tool_call>` inside a value stays refused
+        assert!(run(&g, "\n<function=read_file>\n<parameter=path>\na</parameter>\n</function>").is_ok());
+        assert!(run(&g, "\n<function=read_file>\n<parameter=path>\n</parameter>\n</function>").is_ok());
+        assert!(run(&g, "\n<function=read_file>\n<parameter=path>\na</tool_call>").is_err());
         // a non-integer for an integer, in each spelling the model reaches for
         let p = "\n<function=read_file>\n<parameter=path>\na\n</parameter>\n<parameter=start_line>\n";
         for bad in ["ten", "\"10\"", "1.5", "10a", "01", " 10", "+1"] {
@@ -1518,9 +1525,10 @@ mod tests {
         // a parameter written twice: refused at its first byte, `p` leads to no unseen name
         let p = "\n<function=read_file>\n<parameter=path>\na\n</parameter>\n<parameter=";
         assert_eq!(run(&g, &format!("{p}path>")), Err(p.len()));
-        // a string that contains `</parameter>` without the newline, or `</tool_call>`
+        // `</parameter>` without the newline CLOSES the string since 2026-09-23 (the parser
+        // cuts there too); `</tool_call>` inside it stays refused
         let p = "\n<function=read_file>\n<parameter=path>\nab";
-        assert!(run(&g, &format!("{p}</parameter>")).is_err());
+        assert!(run(&g, &format!("{p}</parameter>")).is_ok());
         assert!(run(&g, &format!("{p}\n</tool_call>")).is_err());
         // prose after a call
         let p = "\n<function=git_status>\n</function>\n</tool_call>\n\n";
@@ -1672,8 +1680,8 @@ mod tests {
         assert!(!v.token_ok(&g, &s, under), "the `_string` piece ({under}) allowed after `old`");
         let gt = tk.encode_raw(">\n").unwrap();
         assert!(v.token_ok(&g, &s, gt[0]), "`>` closes `old`");
-        // missing required: `</function>` refused while `new` and `old` are owed - its
-        // tokens are walked until one is refused
+        // missing required: `</function>` ACCEPTED while `new` and `old` are owed (the
+        // client reports it; refusing forced filler) - its tokens all walk through
         let s = at("\n<function=edit_file>\n<parameter=path>\np\n</parameter>\n");
         let close = tk.encode_raw("</function>").unwrap();
         let mut bits = Vec::new();
@@ -1685,7 +1693,7 @@ mod tests {
             }
             !ok
         });
-        assert!(refused, "`</function>` with required parameters owed");
+        assert!(!refused, "`</function>` with required parameters owed must close the call");
         // a non-integer for an integer: `ten`, `"`, `.` refused at their first id
         let s = at("\n<function=read_file>\n<parameter=path>\na\n</parameter>\n<parameter=start_line>\n");
         for bad in ["ten", "\"", "x"] {

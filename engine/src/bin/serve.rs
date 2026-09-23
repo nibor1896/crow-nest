@@ -4150,8 +4150,12 @@ fn chat_generate(
                         unsafe { srv.eng.rebook_sampler(drawn, next, seen, lastn) };
                     }
                     redraw_ms += t_rd.elapsed().as_secs_f64() * 1e3;
-                    tracing::debug!(target: "chat",
-                        "[chat] tool grammar: id {drawn} refused in phase {}, redrawn {next}", gt.phase());
+                    // info, not debug: every refusal puts a token the model did not pick
+                    // into its context, so each one has to be attributable from engine.log
+                    tracing::info!(target: "chat",
+                        "[chat] tool grammar: id {drawn} {:?} refused in phase {}, redrawn {next} {:?}",
+                        String::from_utf8_lossy(&tk.token_bytes(drawn as u32)), gt.phase(),
+                        String::from_utf8_lossy(&tk.token_bytes(next as u32)));
                 }
             }
             if EOS_IDS.contains(&next) {
