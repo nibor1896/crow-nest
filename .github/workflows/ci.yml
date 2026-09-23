@@ -141,7 +141,10 @@ jobs:
           ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003 vocab.json
           SUMS
           python3 -m pip install --quiet "nvidia-cuda-nvrtc==13.*"
-          lib=$(python3 -c "import nvidia.cuda_nvrtc, os; print(os.path.join(list(nvidia.cuda_nvrtc.__path__)[0], 'lib'))")
+          loc=$(python3 -m pip show nvidia-cuda-nvrtc | awk '/^Location:/{print $2}')
+          so=$(find "$loc/nvidia" -name 'libnvrtc.so*' | head -1)
+          test -n "$so"
+          lib=$(dirname "$so")
           ls "$lib"
           echo "LD_LIBRARY_PATH=$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
       - name: engine tests
