@@ -4,7 +4,7 @@
 - Every item names its issue number in `crow-nest`, or the commit it landed in when the work had no issue.
 - Every number names its date; the machine is `docs/system-landscape.md` unless another one is named.
 
-## Unreleased — after v0.3.1
+## 2026-09-23 — v0.4.0: the output corruption fixed (PLE row offset), the activation pre-scale, the tool-call grammar, the prefix cache and the registered cold tier
 
 ### Added
 
