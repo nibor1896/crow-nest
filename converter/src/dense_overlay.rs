@@ -121,7 +121,9 @@ pub fn f32_to_bf16_rne(v: f32) -> u16 {
 /// NVFP4 blocks -> bf16 little-endian bytes. 36 B per 64 values: 4 ue4m3 sub-block scale bytes
 /// then 32 B of LSB-first packed E2M1 nibbles; value = e2m1 * ue4m3 * global. This is the same
 /// arithmetic `cnq::dequant_block` runs in the engine and `gemv_fp4_b` runs on the card.
-fn blocks_to_bf16(raw: &[u8], global: f32, n_values: usize, out: &mut Vec<u8>) -> u64 {
+/// `pub` since #91: `layer_rule_overlay` re-uses it for its `--from-container` control, so the
+/// two controls dequant by the one arithmetic, not two copies of it.
+pub fn blocks_to_bf16(raw: &[u8], global: f32, n_values: usize, out: &mut Vec<u8>) -> u64 {
     out.clear();
     out.reserve(n_values * 2);
     let mut inexact = 0u64;

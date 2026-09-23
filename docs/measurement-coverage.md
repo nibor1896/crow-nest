@@ -355,3 +355,76 @@ Under rule 3 the serve number that enters section 4.6.1, next to its adjacent ar
 It replaces the single serve reading of the `#61g` flip (53.31 tok/s, one run) as the serve figure
 of record; that one-run pair stays in 4.6.1 as the lever's own `CROW_ATTN_LUT` A/B, which is what
 it measures. Artefacts as for the two chains above, 296 KiB, all gitignored.
+
+## 2026-09-23 — instruments for token corruption (issue #91)
+
+The sections above measure expert coverage and serve-rate drift. The corruption work of #91
+added three facts about instruments to this page: one instrument was retired, and two replaced
+it. Each is listed with what it covers and what it does not.
+
+### Retired: the K=2 pass/fail replay ladder (2026-09-22)
+
+- **What it was.** The replay preset diorama-0922, run as 8 seeded rounds plus 1 greedy round
+  per point, counting corrupt tool calls per arm. The rows are in
+  `decode_out/corruption-arms-replay-diorama-0922/TABLE.md`.
+- **Why it was retired** (#91 comment 2026-09-22T20:38Z). The placebo overlay changes only the
+  kernel path: the values are byte-identical, run through BF16 instead of NVFP4. At the first
+  command token (#15) that placebo flipped a 0.039-nat tie, after which the two paths generate
+  different text. So "K=2 greedy clean/corrupt" measured that fork and nothing about the error
+  mechanism. The ladder is retired as an instrument at n = 8, and its arm "fixes" prove nothing.
+- **What replaced it.** Continuous, teacher-forced logprob margins. The first was the single
+  site #65 (`tools/teacher-forced-91.sh`, #91 comment 2026-09-23T03:38Z). It was then extended
+  to the multi-site probe below, because one site cannot rank fixes.
+
+### Multi-site teacher-forced probe (`tools/multisite-corruption-probe.py`, runner `tools/multisite-0923.sh`)
+
+- **What it covers.** 23 corrupt tool-call sites from robin's 2026-09-23 diorama session, in
+  the site set `tools/corpora/91-multisite-0923.json`. 9 sites are "fresh" (no earlier corrupt
+  spelling in the context) and 14 are "contaminated". Prompts run 18k to 103k tokens, so the
+  probe reaches the sparse-attention long-context regime that the oracle-KLD rows (298 / 607
+  tokens) cannot reach.
+- **How it measures.** Per site it teacher-forces the model's own tokens up to and including
+  the corrupt token, through `serve` (`crow_force_ids`, `top_logprobs` 20, greedy). It reads
+  lp(correct) and lp(corrupt) there. Per arm it reports the corrupt-win count, the mean margin
+  lp(correct) - lp(corrupt), and correct top-1. Optional extras: `freerun` (sampled generation,
+  counting digit errors) and `speed` (256 short-prompt decode tokens, median of 3). The runner
+  boots one serve per arm on port 8111, behind `ramcheck --need`, with logs under `$OUT`.
+- **Its measurement of record** is the 2026-09-23 arm table in `docs/numerics-diff.md` §7 and
+  `docs/dense-overlay.md` §8:
+
+  | arm | corrupt wins |
+  |---|---|
+  | bare, before the fix | 15/23 |
+  | dense overlay | 12/23 |
+  | activation pre-scale | 9/23 |
+  | PLE fix, with overlay | 4/23 |
+  | llama.cpp UD-Q2_K_XL | 4/23 |
+- **What it does not cover:**
+  - The forced ids are the stored text re-tokenized with the model's tokenizer, not the live
+    ids, which were not logged. That is an approximation.
+  - All sites come from one session, and it scores only sites that were already corrupt. It
+    cannot find new corruption classes, and it says nothing about general answer quality or
+    distance to the f32 model.
+  - The free-run counts are n = 1 per point and not significant (2026-09-23).
+  - It needs the untracked, sha-pinned session snapshots under
+    `decode_out/sessions/2026-09-23-diorama/`.
+
+### Per-layer diff against llama.cpp (`tools/layerdiff/`, README there)
+
+- **What it covers.** At one position of a corrupt site, it compares crow-nest and llama.cpp
+  UD-Q2_K_XL (`ldump.cpp`) layer by layer: residual stream, sub-block outputs, the layer-1 PLE
+  contribution, per-stream cos, experts in common, and the final logit margin (`compare.py`).
+  `cnq_ple.py` / `flat.py` decode PLE rows straight from the CNQ container and the GGUF. This
+  instrument located the PLE row-offset bug (`85a48e7`). At mat44-a149 and N33-a131 on
+  2026-09-23:
+  - layer 0 matched (cos ≥ 0.9985)
+  - layer 1 split (residual cos 0.23 / 0.21)
+  - with the flat read, the layer-1 residual cos was 0.997 to 0.999
+- **What it does not cover:**
+  - The reference is llama.cpp's own 2.4 bpw quantization, not BF16. Agreement means "the same
+    function up to two different weight quantizations", not "both are right". The gap left at
+    layer 47 (cos 0.91 / 0.92) is not attributed.
+  - The crow-nest dump side (`decode sitedump`) is a local instrumentation patch that is not on
+    this branch. It lives in the measurement worktree
+    (`decode_out/meas-0923/layerdiff/cn-dump-instrumentation+ple-flat.patch`).
+  - It was run at 2 sites, one position each, with `CROW_GRAPH=0`.

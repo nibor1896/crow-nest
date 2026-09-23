@@ -11,6 +11,20 @@ GGUF this project keeps comparing itself against — on the SAME reference rows.
 - `docs/dense-overlay.md` — the arms `control` and `orig` below, and what they are.
 - `docs/dense-originals.md` — where the BF16 originals came from.
 
+> **These numbers describe the engine before 2026-09-23.** Every oracle-KLD number in this
+> document was measured 2026-09-19 at repo commit `09cb00a`. On 2026-09-23 three things
+> changed, and no oracle-KLD arm has been re-measured since:
+>
+> 1. The PLE n-gram row read was fixed (`85a48e7`, #91). Before it, every token got the
+>    embedding of unrelated rows. The `row*108` read is in the tree since its first commit.
+>    See `docs/numerics-diff.md` §7.2.
+> 2. The activation encoding gained a per-row power-of-two pre-scale (`488a840`), plus the
+>    ue4m3 NaN encoder fix (`5c6891a`).
+> 3. `CROW_QFUSE` became opt-in (exact `1`).
+>
+> The `none` arm below is therefore the OLD default. The tables are records of that engine, not
+> of the current one. What they rule in or out is restated in 7.3 and 7.4.
+
 ## 1. What is measured, and in whose units
 
 The literature's reading of a quantization is reference-based: teacher-force the quantized
@@ -203,10 +217,10 @@ time, the crow arms at repo commit `09cb00a`.
 
 | arm | what it is |
 |---|---|
-| `none` | `CNQ4.5-M` at the default of record — NVFP4 everywhere, FP8 E4M3 KV cache, the NVFP4 activation cascade, `CROW_GRAPH=1 CROW_MMA=1` |
+| `none` | `CNQ4.5-M` at the default of record ON 2026-09-19 — NVFP4 everywhere, FP8 E4M3 KV cache, the NVFP4 activation cascade without the per-row pre-scale, the `CROW_QFUSE` fusions on (then the default), the pre-`85a48e7` PLE row read, `CROW_GRAPH=1 CROW_MMA=1` |
 | `control` | `none` plus the DEQUANTIZED-control overlay (#77): the container's own NVFP4 dense values widened to bf16. Carries no new information |
 | `orig` | `none` plus the ORIGINALS overlay (#77): the 495 dense text tensors as the BF16 originals of #76 |
-| `kvbf16` | `none` with `CROW_KV=bf16` — the KV cache in bf16 instead of FP8 E4M3, i.e. strictly MORE precision |
+| `kvbf16` | `none` with `CROW_KV=bf16` — the KV cache in bf16 instead of FP8 E4M3, i.e. strictly MORE precision. Valid: `decode parity` read `CROW_KV` then. `serve` did not, until #102 (`27d0228`, 2026-09-23) moved the read into `boot::open_model` |
 | `mma0` | `none` with `CROW_MMA=0` — f32 activations instead of the NVFP4 cascade, again strictly more precision |
 | `llama` | Unsloth `Qwen3.8-Flash-Next-UD-Q2_K_XL` through `llama-server`, every row prefilled from scratch (section 4) |
 | `llama-cached` | the same GGUF, every row one decode step on the previous row's KV — the control of section 4.3, not a second quant |
@@ -405,7 +419,10 @@ Each of these arms removes one suspect and leaves the distance where it was:
   mean KLD by +0.0116 ± 0.0148 on 607 rows, inside the floor and in the wrong direction.
 - **the NVFP4 activation cascade is not a source.** `mma0` computes the dense projections on
   f32 activations and moves +0.0227 ± 0.0116, again inside the floor and in the wrong
-  direction.
+  direction. *(2026-09-23: this reading is narrower than it looks. `mma0` changes only the
+  dense projections. The ue4m3 activation floor found on 2026-09-23 sat in every FP4
+  activation encode, including small rows like SwiGLU h2, and was fixed in `488a840`
+  (`docs/numerics-diff.md` §7.1). Its effect on this instrument is not measured.)*
 - **the engine is not re-deciding anything between runs.** Two runs of the same arm are the
   same bytes.
 
@@ -415,6 +432,11 @@ Each of these arms removes one suspect and leaves the distance where it was:
   either. 97 % of the container's bytes are routed experts at RTN NVFP4, and the PLE row table
   is NVFP4 too; no arm in this document tells the two apart, and the 0.348 that survives the
   dense overlay is theirs to share with whatever the engine's own numerics contribute.
+  *(2026-09-23: part of it was an engine defect. The PLE rows were read at the wrong container
+  offset (`85a48e7`), so every row here was computed with the n-gram embeddings of unrelated
+  rows. How much of the 0.348 that accounts for is not measured, because oracle-KLD was not
+  re-run on the fixed engine. The #91 measurements of the fix are long-context multi-site
+  margins, not KLD. See `docs/numerics-diff.md` §7.2.)*
 - **Engine numerics against quantization error.** The control arm proves that the BF16 dense
   path computes what the FP4 dense path computes (`docs/dense-overlay.md` 4.1); it does not
   prove that either is what the model should compute. A kernel that is subtly wrong in a way
@@ -447,6 +469,9 @@ systemd-run --user --scope --slice=session.slice --quiet -p MemorySwapMax=0 \
         decode_out/oracle-t2b/none
 #   control / orig add CROW_CNQ_OVERLAY=$PWD/converter/dense-bf16-{control,originals}.cnq
 #                  and CROW_PINNED_BUDGET_GB=50; kvbf16 adds CROW_KV=bf16; mma0 CROW_MMA=0
+#   (2026-09-23 on: this command measures the CURRENT engine, which has the PLE fix and the
+#    pre-scale and runs with CROW_QFUSE off unless it is set to exactly 1. It does not reproduce
+#    the 2026-09-19 tables; for those, check out 09cb00a.)
 
 # the llama arm (7.6 min for 298 rows, 18.7 min for 607; the card must be free first)
 ~/.local/share/crow/venv/bin/python ~/.local/share/crow/tools/start-server.py flash-next-q2-k-xl &

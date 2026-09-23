@@ -282,8 +282,56 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="234"
-CLIPPY="1459"
+TESTS="358"
+CLIPPY="1505"
+#   tests 335 -> 358   integration-0923 + 0923 fixes (2026-09-23, release-2026-09-23): #103 cold tier /
+#                              free_for_pin, #102 CROW_KV + unread-CROW_* warning, #100/#101 prefix cache,
+#                              the ue4m3 0x7F encoder test (5c6891a), tests_act_prescale (488a840),
+#                              the toolgrammar closer/owed-parameter cases (492f137) and tests_ple_row
+#                              (85a48e7). Measured 2026-09-23: lib 237 / 0 / 1 ignored, decode 5, parity 6,
+#                              serve 110 = 358 / 0. Clippy NOT re-counted on this branch.
+#   NOTE (2026-09-23): the per-row activation pre-scale (488a840) and the PLE row-offset fix
+#                              (85a48e7) change the engine's numerics ON PURPOSE, so the three parity
+#                              shas and the run32 ids above are expected to move. They are the values
+#                              of the pre-0923 engine; new values of record need a gate run on the GPU,
+#                              which has not happened yet. Until then items 1, 2, 3 and 6 are expected RED.
+#   tests 320 -> 335 / clippy 1505 (unchanged)   #93 (2026-09-22): eleven toolgrammar
+#                              tests (the Crow 3dbc015 tools compile; the byte machine on well-formed
+#                              calls and on the observed failure shapes; the JSON subset; required /
+#                              parallel; masks on the real vocabulary agree with the per-token check and
+#                              are never empty; a random walk finds no dead end; the parser turns an
+#                              accepted call into the declared arguments; the CPU cost measurement),
+#                              one sample.rs test (rebook_plan against a host model of the device accept)
+#                              and three serve tests (tool_choice / parallel_tool_calls and their 400s,
+#                              the gate per switch and tool_choice, the redraw landing on `old` where the
+#                              rows prefer `old_string`). Measured 334 / 0 / 1 ignored, clippy 1505.
+#   tests 319 -> 320   #91 (2026-09-22): one serve test (`crow_force_ids` parse,
+#                              its named 400s, the `crow_id`-carrying logprob entry).
+#   tests 313 -> 319 / clippy 1505 (unchanged)   #91 logprobs (2026-09-22): two sample.rs tests
+#                              (pos_logprobs against an f64 log-softmax reference; exact ties, NaN and -inf),
+#                              one tokenizer test (token_bytes concatenate to the exact text, split UTF-8
+#                              included) and three serve tests (the request fields and their named 400s,
+#                              the OpenAI entry in both wire forms, no `logprobs` key anywhere when off).
+#                              Measured 318 / 0 with the NVRTC ptx test skipped (no NVRTC run for this
+#                              task; 319 with it), clippy 1505, no new warning.
+#   tests 305 -> 313 / clippy 1505 (unchanged)   #99 (2026-09-22): six toolcall tests (the live
+#                              markup-only shapes, the named cut, both give-up names, the split sweep of
+#                              the records) and two serve tests (decide_finish, crow_malformed_calls on
+#                              the final chunk and the document). Measured 313 / 0 and 1505, no new warning.
+#   tests 265 -> 305 / clippy 1480 -> 1505   wave 2 of the quality fleet (2026-09-21): #85 adds the DRY
+#                              suite, #92 the tier suite, #86 the nine stopstr cases plus the serve pipeline
+#                              pins, #96 the scaled-table and warn tests, the probes' regression cases.
+#                              The 25 new clippy warnings are the SAME lint classes as before (u64->u64,
+#                              div_ceil, doc indentation) in the new code - measured, no new class.
+#   tests 234 -> 265        wave 1 of the quality fleet (2026-09-20/21): #83/#84 add eighteen
+#                              (six min_p + one serve row in sample.rs/serve.rs, eight penalty +
+#                              three serve), #94 phase 1 adds thirteen (meta.rs). All measured,
+#                              265 = 234 + 31, zero failures.
+#   clippy 1459 -> 1480     same wave: the 21 new warnings are the SAME lint classes the engine
+#                              already carries engine-wide after the 2026-09-20 07:22 toolchain
+#                              drift (u64->u64 casts, manual div_ceil, doc indentation) hitting
+#                              the new code of meta.rs / sample.rs / the sampler serve plumbing -
+#                              measured 1480, no new lint class introduced.
 
 red=0
 green() { printf 'GREEN  %-28s %s\n' "$1" "${2:-}"; }
@@ -323,16 +371,37 @@ scope_run() {
             "$bin" "$@" > "$log" 2>&1
 }
 
+# #103 (2026-09-23): every engine item is gated on the engine's own
+# free_for_pin (tools/pin-room.sh -> engine ramcheck) instead of MemAvailable +
+# balloon. The NVIDIA driver pool an earlier engine left is reclaimable and
+# counted as free there; the engine's allocation takes it back itself.
+. "$root/tools/pin-room.sh"
+pool_recover() {
+    pin_room 46 || echo "  pool_recover: free_for_pin below 46 GiB - live processes hold the RAM (see above); item may refuse"
+}
+
 # parity_item <name> <ids.json> <expected sha> <expected bytes|-> <extra env...>
 parity_item() {
     local name="$1" ids="$2" want="$3" wantb="$4"; shift 4
     local dir="$out/$name" log="$out/$name.log"
     precheck || { fail "$name" "precheck refused"; return; }
+    pool_recover
     rm -rf "$dir"
     local t0 t1
     t0=$(date +%s%3N)
     scope_run "$log" "$@" -- parity "$ids" "$dir"
     local rc=$?
+    # placement fallback (2026-09-21): the -M default tier needs free_for_pin
+    # >= cold 43.51 + margin 3 = 46.5 GiB; a sessionized machine can sit ~1 GiB
+    # under that without anything being wrong. Retry ONCE with a 42 GiB pinned
+    # budget on exactly the residency refusal - placement is numerics-neutral
+    # (#88 proved dumps byte-identical across hot-set placements), so the sha
+    # contract is unchanged; the fallback is LOUD.
+    if [ $rc -ne 0 ] && grep -q "refusing to pin" "$log"; then
+        echo "  $name: default tier refused at the margin - retrying with CROW_RAM_MARGIN_GB=1 (the planner keeps the default tier; only the safety margin yields - outputs byte-identical)"
+        scope_run "$log" CROW_RAM_MARGIN_GB=1 "$@" -- parity "$ids" "$dir"
+        rc=$?
+    fi
     t1=$(date +%s%3N)
     local wall; wall=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", (b-a)/1000}')
     if [ $rc -ne 0 ]; then fail "$name" "decode exit $rc, see $log"; return; fi
@@ -357,10 +426,16 @@ parity_item p8tf decode_out/real512-ids.json "$SHAP8" - CROW_GRAPH=0 CROW_PARITY
 
 # 6) decode run 32 - the 32 generated ids of record
 if precheck; then
+    pool_recover
     log="$out/run32.log"
     t0=$(date +%s%3N)
     scope_run "$log" -- run decode_out/parity-ids.json 32 "$out/run32"
     rc=$?
+    if [ $rc -ne 0 ] && grep -q "refusing to pin" "$log"; then
+        echo "  run32: default tier refused at the margin - retrying with CROW_RAM_MARGIN_GB=1 (the planner keeps the default tier; only the safety margin yields - outputs byte-identical)"
+        scope_run "$log" CROW_RAM_MARGIN_GB=1 -- run decode_out/parity-ids.json 32 "$out/run32"
+        rc=$?
+    fi
     t1=$(date +%s%3N)
     wall=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", (b-a)/1000}')
     cp -f "$root/decode_out/run.json" "$out/run32.json" 2>/dev/null
@@ -375,7 +450,7 @@ else
 fi
 
 # 10) host-side checks - no GPU, no model
-( cd "$root/engine" && cargo test --release > "$out/cargo-test.log" 2>&1 )
+( cd "$root/engine" && env LD_LIBRARY_PATH="$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" cargo test --release > "$out/cargo-test.log" 2>&1 )
 tpass=$(grep -hoE '^test result: ok\. [0-9]+ passed' "$out/cargo-test.log" | awk '{s+=$4} END{print s+0}')
 tfail=$(grep -hoE '[0-9]+ failed' "$out/cargo-test.log" | awk '{s+=$1} END{print s+0}')
 if [ "$tpass" = "$TESTS" ] && [ "$tfail" = "0" ]; then green "cargo test" "$tpass passed, 0 failed"

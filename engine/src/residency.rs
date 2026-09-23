@@ -240,8 +240,8 @@ file, so the overlay would reach the hot experts only",
         let free_phys = cuda::free_physical_ram();
         let margin = crate::manager::ram_margin_bytes();
         progress(&format!(
-            "pinned cold tier {:.2} GiB vs free physical RAM {:.2} GiB (margin {:.0} GiB)",
-            cold_total as f64 / GIB, free_phys as f64 / GIB, margin as f64 / GIB
+            "pinned cold tier {:.2} GiB vs free physical RAM {:.2} GiB (margin {:.0} GiB), allocation {:?} (CROW_PINNED_ALLOC)",
+            cold_total as f64 / GIB, free_phys as f64 / GIB, margin as f64 / GIB, cuda::pin_alloc_mode()
         ));
         if free_phys > 0 && cold_total + margin > free_phys {
             panic!(
@@ -261,19 +261,20 @@ file, so the overlay would reach the hot experts only",
         let mut stage = vec![0u8; slabs.gu_bytes.max(slabs.dn_bytes) as usize];
         for l in 0..LAYERS {
             let ncold = if full_tier { E } else { E - sets[l].len() };
-            // write-combined pinned memory: the host only WRITES the cold tier (at
-            // load), the GPU only READS it. Measured 2026-09-04 (pcie_probe): a
-            // coalesced kernel read of WC-pinned memory runs at 47.6 GB/s vs 24 GB/s
-            // for cacheable pinned memory (CPU-cache snooping off the path).
-            // CROW_PINNED_WC=0 restores the cacheable allocation.
-            let wc = std::env::var("CROW_PINNED_WC").as_deref() != Ok("0");
-            let (mut pg, mut pd) = if wc {
-                (Pinned::alloc_wc((ncold as u64 * cold_gu_bytes) as usize),
-                 Pinned::alloc_wc((ncold as u64 * cold_dn_bytes) as usize))
-            } else {
-                (Pinned::alloc((ncold as u64 * cold_gu_bytes) as usize),
-                 Pinned::alloc((ncold as u64 * cold_dn_bytes) as usize))
-            };
+            // #103 (2026-09-23): the cold slabs are anonymous memory
+            // registered with the driver (`Pinned::alloc_cold`, CROW_PINNED_ALLOC,
+            // default `register` on unix), so the kernel owns the pages and gets
+            // them back on free, exit and SIGKILL. The old write-combined
+            // `cuMemHostAlloc` (`CROW_PINNED_ALLOC=wc`, still the windows default)
+            // left every freed page in the NVIDIA driver's sysmem pool. The 2026-09-04
+            // WC argument (47.6 vs 24 GB/s) was a Windows measurement: on this Linux
+            // box WC, cacheable and registered all read at 51.6 GB/s in the stage
+            // pattern (`pin_return_probe bw`), and CROW_KPROF measured 244.5 vs
+            // 244.7 us per stage call (architecture 4.8).
+            let (mut pg, mut pd) = (
+                Pinned::alloc_cold((ncold as u64 * cold_gu_bytes) as usize),
+                Pinned::alloc_cold((ncold as u64 * cold_dn_bytes) as usize),
+            );
             let mut tier_file = tier_path.as_ref().map(|p| crate::cnq::open_sequential(p)); // no cache retention (see cnq.rs)
             let mut idx = HashMap::with_capacity(ncold);
             let mut slot = 0usize;

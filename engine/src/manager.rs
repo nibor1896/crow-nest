@@ -12,7 +12,115 @@
 
 use crate::cuda;
 use crate::geo::*;
+use crate::meta::RopeKind;
+use crate::meta::RopeScaling;
 use cudarc::driver::sys::CUdeviceptr;
+
+// ---------------- #96: rope scaling (YaRN / NTK / linear) ----------------
+
+/// How the per-pair angle blends, from the `rope_scaling` the boot parsed.
+/// `Plain` is the default path; `Interp` is naive linear scaling; `Yarn`
+/// carries (freq_scale, corr_lo, corr_hi) — the low/high-frequency ramp.
+enum Blend {
+    Plain,
+    Interp(f32),
+    Yarn(f32, f32, f32),
+}
+
+/// llama.cpp `rope_yarn_ramp` verbatim: 1 - clamp((pair - low) / max(0.001,
+/// high - low), 0, 1). 1 at and below `low` (extrapolate), 0 at and above
+/// `high` (interpolate), linear between.
+fn yarn_ramp(pair: usize, low: f32, high: f32) -> f32 {
+    let y = (pair as f32 - low) / (high - low).max(0.001);
+    1.0 - y.clamp(0.0, 1.0)
+}
+
+/// The boot RoPE table (#96), pure host f32 math so the byte-identity gate can
+/// build it both ways in a unit test with no GPU and no container.
+///
+/// The `None` / default arm is the loop this replaces, VERBATIM — theta 1e7
+/// (`10_000_000f32.powf(-(2j)/64)`), `t · inv`, f32 cos/sin, t-major layout —
+/// pinned byte-identical by `the_unscaled_table_is_byte_identical_to_the_loop`.
+///
+/// The scaled arms are the llama.cpp reference math (ggml `rope_yarn`, MIT,
+/// jquesnelle/yarn — the YaRN paper's implementation), with the YaRN
+/// extrapolation factor pinned at the llama.cpp default 1.0:
+/// - **yarn**: per pair j, `theta = interp·(1−mix) + extrap·mix` with
+///   `interp = freq_scale·extrap` and `mix = ramp(j)` over the corr range from
+///   beta_fast/beta_slow — the high-frequency pairs below `lo` keep their
+///   trained angles, everything above `hi` interpolates;
+/// - **linear**: `freq_scale·extrap` on every pair (the naive form the paper
+///   shows collapsing — kept because it is one line and one config away);
+/// - **ntk-aware**: theta rewritten to `base·factor^(dim/(dim−2))`, every pair
+///   otherwise untouched (what the llama.cpp converter bakes into the base).
+///
+/// The mscale is deliberately NOT folded in here: it belongs to the attention
+/// temperature, which lives in the kernels (`d_attn_scale`, set once at boot).
+///
+/// NOTE the table is shared: `rope`/`rope_p` (text attention) AND `rope64`
+/// (the QSA indexer keys) read these cos/sin rows, so a scaled table scales
+/// both — the single-table consequence, flagged in docs/acceptance/issue-96.md.
+pub fn build_rope_table(context: usize, scaling: Option<&RopeScaling>) -> (Vec<f32>, Vec<f32>) {
+    let dim = 2 * ROPE_PAIRS; // 64 rotary dims of the 256-dim head
+    let base = match scaling {
+        Some(s) if s.kind == RopeKind::NtkAware => s.ntk_base(dim, 10_000_000f64) as f32,
+        _ => 10_000_000f32,
+    };
+    let blend = match scaling {
+        None | Some(&RopeScaling { kind: RopeKind::Default, .. }) => Blend::Plain,
+        Some(&RopeScaling { kind: RopeKind::Linear, factor, .. }) => {
+            Blend::Interp((1.0 / factor) as f32)
+        }
+        Some(s) if s.kind == RopeKind::Yarn => {
+            let (lo, hi) = s.yarn_corr_range(dim, 10_000_000f64);
+            Blend::Yarn(s.freq_scale(), lo, hi)
+        }
+        Some(_) => Blend::Plain, // NtkAware: handled by the base above
+    };
+    let mut cos_h = vec![0f32; context * ROPE_PAIRS];
+    let mut sin_h = vec![0f32; context * ROPE_PAIRS];
+    for t in 0..context {
+        for j in 0..ROPE_PAIRS {
+            let inv = base.powf(-(2.0 * j as f32) / dim as f32);
+            let extrap = t as f32 * inv;
+            let f = match blend {
+                Blend::Plain => extrap,
+                Blend::Interp(fs) => fs * extrap,
+                Blend::Yarn(fs, lo, hi) => {
+                    let mix = yarn_ramp(j, lo, hi); // ext_factor 1.0 (llama.cpp yarn default)
+                    (fs * extrap) * (1.0 - mix) + extrap * mix
+                }
+            };
+            cos_h[t * ROPE_PAIRS + j] = f.cos();
+            sin_h[t * ROPE_PAIRS + j] = f.sin();
+        }
+    }
+    (cos_h, sin_h)
+}
+
+/// #96 phase 3 — the exceed-training-context warning, a pure function so every
+/// side of the decision is unit-testable without a GPU. Fires when the
+/// effective context runs past the positions the checkpoint was trained on AND
+/// no scaling is armed: positions beyond the training window walk RoPE
+/// frequencies the model never saw, and the failure mode is silent quality
+/// collapse — llama.cpp's "n_ctx > n_ctx_train … quality will be degraded"
+/// discipline, one loud boot WARN, not an error.
+pub fn exceed_training_warning(
+    context: usize,
+    training: Option<u64>,
+    scaling: Option<&RopeScaling>,
+) -> Option<String> {
+    let training = training?;
+    let armed = scaling.is_some_and(|s| s.kind != RopeKind::Default);
+    if armed || context as u64 <= training {
+        return None;
+    }
+    Some(format!(
+        "context {} exceeds the {} positions this checkpoint was trained on and no rope_scaling is armed - \
+output quality WILL be degraded past position {training} (issue #96: configure rope_scaling in the checkpoint config)",
+        context, training
+    ))
+}
 
 /// The planner refusal text (spec 2.1) as a pure function, factored by #10b
 /// (2026-09-13) so the refusal path carries a panic-message test that needs
@@ -71,12 +179,13 @@ pub fn derive_host_pinned_budget(cap: u64, log: &mut dyn FnMut(&str)) -> u64 {
             }
         }
     };
-    // #15 follow-up: the driver's pinned pool counts as free only while we are the
-    // only CUDA process; with another one alive the figure IS MemAvailable
-    let basis_ram = if ram.other_cuda { " (another CUDA process is alive: using MemAvailable)" } else { "" };
+    // #103: the driver's page pool counts as free (it is reclaimable), the
+    // driver memory live processes still map does not - whether or not another CUDA
+    // process is alive (the old MemAvailable fallback refused boots next to a pool)
+    let other = if ram.other_cuda { ", another CUDA process is alive" } else { "" };
     log(&format!(
-        "[budget] host pinned budget {:.2} GiB ({basis}); free for pinning {:.2} GiB{basis_ram}, MemAvailable {:.2} GiB, cap {:.2} GiB",
-        gib(budget), gib(free_for_pin), gib(mem_available), gib(cap)
+        "[budget] host pinned budget {:.2} GiB ({basis}); free for pinning {:.2} GiB, MemAvailable {:.2} GiB, cap {:.2} GiB; NVIDIA driver pages {:.2} GiB of which {:.2} GiB mapped by live processes (subtracted){other}",
+        gib(budget), gib(free_for_pin), gib(mem_available), gib(cap), gib(ram.driver_held), gib(ram.driver_live)
     ));
     budget
 }
@@ -115,6 +224,15 @@ impl StateSizes {
             gdn_conv_bytes: (GDN_LAYERS * GDN_CONV * 3) as u64 * 4,
             rope_bytes: (context * ROPE_PAIRS * 2) as u64 * 4,
         }
+    }
+}
+
+impl StateSizes {
+    /// every state byte the planner sets aside before the hot set (KV at the
+    /// config's dtype - bf16 doubles `kv_bytes`, #102 - plus QSA, GDN, rope)
+    pub fn total(&self) -> u64 {
+        self.kv_bytes + self.qsa_keys_bytes + self.qsa_pooled_bytes
+            + self.gdn_s_bytes + self.gdn_conv_bytes + self.rope_bytes
     }
 }
 
@@ -171,73 +289,27 @@ impl ThreeStates {
         // auto-clamp N with measured numbers, never the context (spec 2.1).
         // TWO-sided: VRAM lowers N, the HOST pinned budget RAISES it (fewer
         // cold experts) — measured host ceiling ~48.5 GB on this machine.
-        let mut n = cfg.n_hot;
         let sizes = StateSizes::plan(cfg.context, cfg.kv, cfg.prompt_chunk);
         // the state bytes do not depend on N (the hot-expert count): one plan for the whole clamp loop
-        let states_bytes = sizes.kv_bytes + sizes.qsa_keys_bytes + sizes.qsa_pooled_bytes
-            + sizes.gdn_s_bytes + sizes.gdn_conv_bytes + sizes.rope_bytes;
-        // Termination guard (2026-09-04): when VRAM pushes N down and the host
-        // budget pushes it up, no N is feasible. Without this the loop
-        // oscillated forever and grew `rep.lines` without bound -> the whole
-        // machine froze from RAM exhaustion (chunk 1024 on the M container).
-        let mut went_down = false;
-        let mut went_up = false;
-        let mut iters = 0u32;
+        let states_bytes = sizes.total();
         let spare = cfg.adapt.spare; // #17: from the policy in geo.rs, not the env
-        loop {
-            let sum = states_bytes + pending_bytes + n as u64 * expert_bytes_per_n_unit;
-            let cold = (if cold_fixed { E } else { E - n.min(E) + spare }) as u64 * cold_bytes_per_n_unit;
-            if sum + SAFETY < free0 && cold <= cfg.host_pinned_budget {
-                break;
+        let n = match clamp_hot_n(&ClampInput {
+            n_hot: cfg.n_hot,
+            states_bytes,
+            pending_bytes,
+            expert_bytes_per_n_unit,
+            cold_bytes_per_n_unit,
+            cold_fixed,
+            spare,
+            free0,
+            host_pinned_budget: cfg.host_pinned_budget,
+        }) {
+            Ok((n, lines)) => {
+                rep.lines.extend(lines);
+                n
             }
-            if n == N_MIN {
-                break;
-            }
-            iters += 1;
-            if (went_down && went_up) || iters > 2 * E as u32 {
-                rep.lines.push(format!(
-                    "no feasible N: VRAM allows at most N={} while the host pinned budget needs more — refusing",
-                    n
-                ));
-                // #10b: the message moved into planner_refusal_msg (tested)
-                panic!("{}", planner_refusal_msg(free0, cfg.host_pinned_budget));
-            }
-            if sum + SAFETY >= free0 {
-                went_down = true;
-                n -= 1;
-                if n % 8 == 0 {
-                    rep.lines.push(format!(
-                        "VRAM budget over by {:.0} MB at N={} — clamping",
-                        (sum + SAFETY - free0) as f64 / MIB,
-                        n
-                    ));
-                }
-            } else {
-                went_up = true;
-                n += 1;
-                if n % 8 == 0 {
-                    rep.lines.push(format!(
-                        "host pinned tier over by {:.0} MB at N={} — raising N",
-                        (cold - cfg.host_pinned_budget) as f64 / MIB,
-                        n
-                    ));
-                }
-            }
-            if cfg_n_dbg() {
-                tracing::info!(target: "manager", "[clamp] n={n} vram_sum={:.0} MB cold={:.0} MB free0={:.0} MB",
-                    states_bytes as f64 / MIB,
-                    ((if cold_fixed { E } else { E - n.min(E) + spare }) as u64 * cold_bytes_per_n_unit) as f64 / MIB,
-                    free0 as f64 / MIB);
-            }
-        }
-        let cold_final = (if cold_fixed { E } else { E - n.min(E) + spare }) as u64 * cold_bytes_per_n_unit;
-        if cold_final > cfg.host_pinned_budget {
-            panic!(
-                "refusing config: hot set N={n} would pin {:.1} GiB cold > budget {:.1} GiB — no feasible N (spec 2.1)",
-                cold_final as f64 / GIB,
-                cfg.host_pinned_budget as f64 / GIB
-            );
-        }
+            Err(msg) => panic!("{msg}"),
+        };
         if n < cfg.n_hot {
             rep.lines.push(format!(
                 "loader auto-clamped hot set: N {} -> {} (measured budget, spec 2.6)",
@@ -297,16 +369,18 @@ impl ThreeStates {
             "GDN state {:9.1} MB  (36 × S[48][128][128] + conv[10240][3], f32, fixed)",
             (sizes.gdn_s_bytes + sizes.gdn_conv_bytes) as f64 / MIB
         ));
-        let mut cos_h = vec![0f32; cfg.context * ROPE_PAIRS];
-        let mut sin_h = vec![0f32; cfg.context * ROPE_PAIRS];
-        for t in 0..cfg.context {
-            for j in 0..ROPE_PAIRS {
-                let inv = 10_000_000f32.powf(-(2.0 * j as f32) / 64.0);
-                let f = t as f32 * inv;
-                cos_h[t * ROPE_PAIRS + j] = f.cos();
-                sin_h[t * ROPE_PAIRS + j] = f.sin();
-            }
+        // ---- RoPE table (#96: the builder is factored out below; None scaling
+        // builds the byte-identical table the inline loop always built) ----
+        // phase 3 FIRST (the cheap hazard close): effective context past the
+        // training window with no scaling armed is one loud boot WARN — the
+        // llama.cpp "quality will be degraded" discipline. `None` training
+        // context (a boot that never saw a config.json — the selftest package)
+        // stays silent.
+        let scaling = crate::meta::boot_rope_scaling();
+        if let Some(w) = exceed_training_warning(cfg.context, crate::meta::boot_training_context(), scaling.as_ref()) {
+            tracing::warn!(target: "rope", "[rope] {w}");
         }
+        let (cos_h, sin_h) = build_rope_table(cfg.context, scaling.as_ref());
         let cos = cuda::to_f32_dev(&cos_h);
         let sin = cuda::to_f32_dev(&sin_h);
         drop(cos_h);
@@ -316,6 +390,27 @@ impl ThreeStates {
             sizes.rope_bytes as f64 / MIB,
             cfg.context
         ));
+        // the armed line: what the config asked for and what was derived from
+        // it, next to the table it changed (silent — nothing is armed by default)
+        if let Some(s) = scaling.filter(|s| s.kind != crate::meta::RopeKind::Default) {
+            let detail = match s.kind {
+                crate::meta::RopeKind::Yarn => {
+                    let (lo, hi) = s.yarn_corr_range(2 * ROPE_PAIRS, 10_000_000f64);
+                    format!(
+                        "YaRN: factor {} ({} training positions -> {}), corr dims [{lo}, {hi}] of {} (beta {} / {}), mscale {:.4} on the attention scale",
+                        s.factor, s.original_context, cfg.context, 2 * ROPE_PAIRS, s.beta_fast, s.beta_slow, s.mscale()
+                    )
+                }
+                crate::meta::RopeKind::Linear => {
+                    format!("linear: factor {} (every pair interpolated by 1/{})", s.factor, s.factor)
+                }
+                crate::meta::RopeKind::NtkAware => {
+                    format!("ntk-aware: theta 1e7 -> {:.0}", s.ntk_base(2 * ROPE_PAIRS, 10_000_000f64))
+                }
+                crate::meta::RopeKind::Default => unreachable!("filtered above"),
+            };
+            rep.lines.push(format!("[rope] rope_scaling armed — {detail}"));
+        }
 
         let free1 = cuda::free_vram_bytes();
         let measured = free0 - free1;
@@ -324,12 +419,7 @@ impl ThreeStates {
         rep.lines.push(format!(
             "states+dense+hot measured in VRAM: {:.1} MiB (planned {:.1} MiB, N={n})",
             measured as f64 / MIB,
-            (sizes.kv_bytes
-                + sizes.qsa_keys_bytes
-                + sizes.qsa_pooled_bytes
-                + sizes.gdn_s_bytes
-                + sizes.gdn_conv_bytes
-                + sizes.rope_bytes
+            (sizes.total()
                 + pending_bytes
                 + n as u64 * expert_bytes_per_n_unit) as f64 / MIB
         ));
@@ -362,6 +452,89 @@ impl ThreeStates {
             * AHD as u64
             * b
     }
+}
+
+/// The inputs of the two-sided hot-set clamp, all measured or planned bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct ClampInput {
+    pub n_hot: usize,
+    /// `StateSizes::total()`: KV (at the config's dtype) + QSA + GDN + rope
+    pub states_bytes: u64,
+    pub pending_bytes: u64,
+    pub expert_bytes_per_n_unit: u64,
+    pub cold_bytes_per_n_unit: u64,
+    pub cold_fixed: bool,
+    pub spare: usize,
+    pub free0: u64,
+    pub host_pinned_budget: u64,
+}
+
+/// The hot-set size N the planner picks, as pure arithmetic (#102: factored
+/// out of `ThreeStates::allocate` unchanged so the KV-dtype effect on N is
+/// testable without a GPU). VRAM lowers N, the host pinned budget RAISES it
+/// (fewer cold experts). `Err` is the refusal text the caller panics with.
+pub fn clamp_hot_n(c: &ClampInput) -> Result<(usize, Vec<String>), String> {
+    let mut lines = Vec::new();
+    let mut n = c.n_hot;
+    let cold_of = |n: usize| (if c.cold_fixed { E } else { E - n.min(E) + c.spare }) as u64 * c.cold_bytes_per_n_unit;
+    // Termination guard (2026-09-04): when VRAM pushes N down and the host
+    // budget pushes it up, no N is feasible. Without this the loop
+    // oscillated forever and grew the report lines without bound -> the whole
+    // machine froze from RAM exhaustion (chunk 1024 on the M container).
+    let mut went_down = false;
+    let mut went_up = false;
+    let mut iters = 0u32;
+    loop {
+        let sum = c.states_bytes + c.pending_bytes + n as u64 * c.expert_bytes_per_n_unit;
+        let cold = cold_of(n);
+        if sum + SAFETY < c.free0 && cold <= c.host_pinned_budget {
+            break;
+        }
+        if n == N_MIN {
+            break;
+        }
+        iters += 1;
+        if (went_down && went_up) || iters > 2 * E as u32 {
+            // #10b: the message moved into planner_refusal_msg (tested)
+            return Err(planner_refusal_msg(c.free0, c.host_pinned_budget));
+        }
+        if sum + SAFETY >= c.free0 {
+            went_down = true;
+            n -= 1;
+            if n % 8 == 0 {
+                lines.push(format!(
+                    "VRAM budget over by {:.0} MB at N={} — clamping",
+                    (sum + SAFETY - c.free0) as f64 / MIB,
+                    n
+                ));
+            }
+        } else {
+            went_up = true;
+            n += 1;
+            if n % 8 == 0 {
+                lines.push(format!(
+                    "host pinned tier over by {:.0} MB at N={} — raising N",
+                    (cold - c.host_pinned_budget) as f64 / MIB,
+                    n
+                ));
+            }
+        }
+        if cfg_n_dbg() {
+            tracing::info!(target: "manager", "[clamp] n={n} vram_sum={:.0} MB cold={:.0} MB free0={:.0} MB",
+                c.states_bytes as f64 / MIB,
+                cold_of(n) as f64 / MIB,
+                c.free0 as f64 / MIB);
+        }
+    }
+    let cold_final = cold_of(n);
+    if cold_final > c.host_pinned_budget {
+        return Err(format!(
+            "refusing config: hot set N={n} would pin {:.1} GiB cold > budget {:.1} GiB — no feasible N (spec 2.1)",
+            cold_final as f64 / GIB,
+            c.host_pinned_budget as f64 / GIB
+        ));
+    }
+    Ok((n, lines))
 }
 
 pub const SAFETY: u64 = 512 << 20; // launch pools, scratch, telemetry slack
@@ -495,9 +668,12 @@ mod tests_72 {
     fn the_post_plan_vram_total_is_the_reserve_plus_the_sampler() {
         let p = ledger();
         assert_eq!(p.vram_bytes(), 239_599_616 + 51_200_000 + crate::gen::sampler_bytes());
-        // the reserve of record, 277.3 MB, plus 0.3 MB of sampler
-        assert_eq!(p.vram_bytes(), 291_080_728);
-        assert_eq!(crate::gen::sampler_bytes(), 281_112);
+        // the reserve of record, 277.3 MB, plus ~0.7 MB of sampler
+        // (#83, 2026-09-20: params grew 16 -> 36 B for min_p + ln(min_p);
+        // #84 the same day: the windowed penalties added counts [V] u16 +
+        // the 1026-i32 ring, so the pin moved 281_112 -> 281_132 -> 781_876)
+        assert_eq!(p.vram_bytes(), 291_581_492);
+        assert_eq!(crate::gen::sampler_bytes(), 781_876);
     }
 
     /// the biggest post-plan allocation of the process is the prefix cache, and it
@@ -512,7 +688,7 @@ mod tests_72 {
         assert!(line.starts_with("post-plan allocations held at boot:"), "the label moved: {line}");
         assert!(line.contains("vit tower scratch 228.5 MB"), "the scratch entry moved: {line}");
         assert!(line.contains("vit mrope span 48.8 MB"), "the mrope entry moved: {line}");
-        assert!(line.contains("= 277.6 MB VRAM"), "the VRAM total moved: {line}");
+        assert!(line.contains("= 278.1 MB VRAM"), "the VRAM total moved: {line}");
         assert!(line.contains("host RAM only (never on the card)"), "the host clause moved: {line}");
         assert!(line.contains("prefix cache (3 snapshots) 373.8 MB"), "the snapshot entry moved: {line}");
     }
@@ -540,6 +716,87 @@ mod tests_72 {
 }
 
 #[cfg(test)]
+mod tests_kv_dtype {
+    //! #102: CROW_KV=bf16 doubles the KV bytes and the planner pays for them in
+    //! hot experts (VRAM) and therefore in pinned cold bytes (host). Pure arithmetic.
+    use super::*;
+
+    /// 48 layers x 2,764,800 B per expert (`operating_point.cold_path.expert_bytes`
+    /// of the MEAS-0923 serve logs, 2026-09-23) = the bytes of one hot-set unit
+    const UNIT: u64 = 48 * 2_764_800;
+
+    #[test]
+    fn bf16_kv_is_exactly_twice_fp8_and_nothing_else_moves() {
+        let f = StateSizes::plan(200_000, KvDtype::Fp8E4m3, 2048);
+        let b = StateSizes::plan(200_000, KvDtype::Bf16, 2048);
+        // 12 layers x 2 (k,v) x 2 kv-heads x 256 x 200000 x 1 B: the 2343.8 MB of the
+        // `[budget] KV` line in serve-tf-dense-kv.log
+        assert_eq!(f.kv_bytes, 2_457_600_000);
+        assert_eq!(b.kv_bytes, 2 * f.kv_bytes);
+        assert_eq!(b.total() - f.total(), f.kv_bytes);
+        assert_eq!(
+            (b.qsa_keys_bytes, b.qsa_pooled_bytes, b.gdn_s_bytes, b.gdn_conv_bytes, b.rope_bytes),
+            (f.qsa_keys_bytes, f.qsa_pooled_bytes, f.gdn_s_bytes, f.gdn_conv_bytes, f.rope_bytes)
+        );
+        assert_eq!(format!("{:.1}", f.kv_bytes as f64 / MIB), "2343.8");
+        assert_eq!(format!("{:.1}", b.kv_bytes as f64 / MIB), "4687.5");
+    }
+
+    /// a card sized so that FP8 KV lands on N=155 (the serve-bare boot of MEAS-0923)
+    fn card(kv: KvDtype, budget_gib: u64) -> ClampInput {
+        let fp8 = StateSizes::plan(200_000, KvDtype::Fp8E4m3, 2048).total();
+        let pending = 1 << 30;
+        ClampInput {
+            n_hot: 160,
+            states_bytes: StateSizes::plan(200_000, kv, 2048).total(),
+            pending_bytes: pending,
+            expert_bytes_per_n_unit: UNIT,
+            cold_bytes_per_n_unit: UNIT,
+            cold_fixed: false,
+            spare: 7,
+            free0: fp8 + pending + 155 * UNIT + SAFETY + 1,
+            host_pinned_budget: budget_gib << 30,
+        }
+    }
+
+    #[test]
+    fn bf16_kv_costs_19_hot_experts_per_layer_at_200k() {
+        let (n8, _) = clamp_hot_n(&card(KvDtype::Fp8E4m3, 48)).unwrap();
+        let (n16, lines) = clamp_hot_n(&card(KvDtype::Bf16, 48)).unwrap();
+        assert_eq!(n8, 155);
+        // 2,457,600,000 B / 132,710,400 B = 18.52 -> the first N that fits is 19 lower
+        assert_eq!(n16, 136);
+        assert!(lines.iter().any(|l| l.contains("clamping")), "{lines:?}");
+    }
+
+    #[test]
+    fn bf16_kv_at_the_46_gib_default_cap_is_refused_loudly_not_squeezed() {
+        // N=136 pins (512 - 136 + 7) x UNIT = 47.34 GiB > 46 GiB: no feasible N
+        assert!(clamp_hot_n(&card(KvDtype::Fp8E4m3, 46)).is_ok());
+        let e = clamp_hot_n(&card(KvDtype::Bf16, 46)).unwrap_err();
+        assert!(e.starts_with("refusing config: no hot-set size fits BOTH"), "{e}");
+    }
+
+    #[test]
+    fn crow_kv_words_parse_and_a_typo_is_an_error() {
+        assert_eq!(KvDtype::parse("bf16"), Ok(KvDtype::Bf16));
+        assert_eq!(KvDtype::parse("BF16"), Ok(KvDtype::Bf16));
+        assert_eq!(KvDtype::parse("fp8"), Ok(KvDtype::Fp8E4m3));
+        assert_eq!(KvDtype::parse("fp8_e4m3"), Ok(KvDtype::Fp8E4m3));
+        for k in [KvDtype::Fp8E4m3, KvDtype::Bf16] {
+            assert_eq!(KvDtype::parse(k.name()), Ok(k), "name() must round-trip");
+        }
+        for bad in ["", "f16", "bf-16", "fp8e4m3", "1", " bf16"] {
+            let e = KvDtype::parse(bad).unwrap_err();
+            assert!(e.contains("accepted: bf16, fp8, fp8_e4m3"), "{bad:?}: {e}");
+        }
+        assert_eq!(KvDtype::from_env_value(None), Ok(None));
+        assert_eq!(KvDtype::from_env_value(Some("bf16")), Ok(Some(KvDtype::Bf16)));
+        assert!(KvDtype::from_env_value(Some("bf61")).is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests_10b {
     use super::planner_refusal_msg;
 
@@ -561,5 +818,139 @@ mod tests_10b {
             m.contains("shrink the chunk/scratch, the PLE cache, or the keep-set (spec 2.1)"),
             "escape-hatch clause moved: {m}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_96 {
+    //! #96: the scaled rope-table builder and the exceed-training-context warn,
+    //! pure host math — no GPU, no container. The first test is THE gate: the
+    //! refactor that factored the boot table into `build_rope_table` changed
+    //! not one byte of the default path, and a present-but-"default"
+    //! rope_scaling object configures nothing either.
+    use super::*;
+
+    fn scaling(kind: RopeKind) -> RopeScaling {
+        RopeScaling {
+            kind,
+            factor: 4.0,
+            original_context: 262_144,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            attention_factor: None,
+        }
+    }
+
+    /// the pre-#96 boot loop, copied VERBATIM from the manager.rs that stood
+    /// before the refactor (theta 1e7, f32 powf/cos/sin, t-major): the oracle
+    /// every byte-identity claim below is measured against
+    #[test]
+    fn the_unscaled_table_is_byte_identical_to_the_loop() {
+        let context = 8192;
+        let mut cos_ref = vec![0f32; context * ROPE_PAIRS];
+        let mut sin_ref = vec![0f32; context * ROPE_PAIRS];
+        for t in 0..context {
+            for j in 0..ROPE_PAIRS {
+                let inv = 10_000_000f32.powf(-(2.0 * j as f32) / 64.0);
+                let f = t as f32 * inv;
+                cos_ref[t * ROPE_PAIRS + j] = f.cos();
+                sin_ref[t * ROPE_PAIRS + j] = f.sin();
+            }
+        }
+        let (cos, sin) = build_rope_table(context, None);
+        assert_eq!(cos, cos_ref, "the default cos table moved");
+        assert_eq!(sin, sin_ref, "the default sin table moved");
+        // a present-but-"default" rope_scaling object configures nothing: same bytes
+        let (c2, s2) = build_rope_table(context, Some(&scaling(RopeKind::Default)));
+        assert_eq!(c2, cos_ref, "a default rope_scaling must not move the table");
+        assert_eq!(s2, sin_ref, "a default rope_scaling must not move the table");
+    }
+
+    /// YaRN shape, against the same oracle: pairs at/below the corr-range floor
+    /// keep their angles BYTE-FOR-BYTE (the high-frequency bands YaRN exists to
+    /// protect), pairs at/above the ceiling take the interpolated angle, and the
+    /// corr range itself is the reference math for this checkpoint's dims
+    #[test]
+    fn yarn_extrapolates_low_pairs_and_interpolates_high_ones() {
+        let s = scaling(RopeKind::Yarn);
+        assert_eq!(s.yarn_corr_range(64, 1e7), (14.0, 22.0), "corr dims for dim 64 / base 1e7 / 262144 ctx / beta 32+1");
+        let (cos_y, _) = build_rope_table(1024, Some(&s));
+        let (cos_0, _) = build_rope_table(1024, None);
+        for t in [0usize, 1, 100, 1023] {
+            // j <= 14: ramp 1 -> pure extrapolation -> identical bytes
+            for j in [0usize, 7, 13, 14] {
+                assert_eq!(
+                    cos_y[t * ROPE_PAIRS + j], cos_0[t * ROPE_PAIRS + j],
+                    "pair {j} at t={t} is high frequency: YaRN keeps the trained angle"
+                );
+            }
+            // j >= 22: ramp 0 -> pure interpolation by 1/factor
+            for j in [22usize, 28, 31] {
+                let inv = 10_000_000f32.powf(-(2.0 * j as f32) / 64.0);
+                assert_eq!(
+                    cos_y[t * ROPE_PAIRS + j],
+                    ((t as f32 * inv) * 0.25f32).cos(),
+                    "pair {j} at t={t} is low frequency: the interpolated angle"
+                );
+                // a witness only where the angles are wide enough to differ in
+                // f32: cos(x) - cos(x/4) ~ 3x²/8, invisible below ~1e-4 rad
+                // (t=0 maps every scaling to angle 0; tiny t x low freq ditto)
+                if t as f32 * inv > 1e-3 {
+                    assert_ne!(cos_y[t * ROPE_PAIRS + j], cos_0[t * ROPE_PAIRS + j]);
+                }
+            }
+        }
+        // the ramp band (14 < j < 22) is neither extreme
+        let (t, j) = (1023usize, 18usize);
+        let inv = 10_000_000f32.powf(-(2.0 * j as f32) / 64.0);
+        let extrap = t as f32 * inv;
+        let blended = (0.25f32 * extrap) * 0.5 + extrap * 0.5;
+        assert_eq!(cos_y[t * ROPE_PAIRS + j], blended.cos(), "the ramp midpoint is the half-and-half angle");
+    }
+
+    /// linear interpolates EVERY pair (pair 0 included — exactly the collapse
+    /// the YaRN paper shows); ntk-aware leaves the angles alone and rewrites
+    /// the theta the pairs are computed from
+    #[test]
+    fn linear_scales_every_pair_and_ntk_rewrites_the_base() {
+        let (cos_l, _) = build_rope_table(64, Some(&scaling(RopeKind::Linear)));
+        let (cos_0, _) = build_rope_table(64, None);
+        let (t, j) = (63usize, 0usize);
+        assert_eq!(cos_l[t * ROPE_PAIRS + j], (63f32 * 0.25f32).cos(), "linear: even pair 0 interpolates");
+        assert_ne!(cos_l[t * ROPE_PAIRS + j], cos_0[t * ROPE_PAIRS + j]);
+        let s = scaling(RopeKind::NtkAware);
+        let b = s.ntk_base(64, 1e7) as f32;
+        let (cos_n, _) = build_rope_table(64, Some(&s));
+        // pair 31 at t=63 is NOT a usable witness for the base rewrite: both
+        // angles are ~1e-5 rad and f32 cos rounds both to exactly 1.0. Pair 8
+        // has base^(-0.25) scale angles O(1) rad, where the rewrite is visible.
+        let (t, j) = (63usize, 8usize);
+        let inv8 = b.powf(-(2.0 * 8f32) / 64.0);
+        assert_eq!(cos_n[t * ROPE_PAIRS + j], (63f32 * inv8).cos(), "ntk-aware: theta' = 1e7·4^(64/62) rewrites every pair's base");
+        assert_ne!(cos_n[t * ROPE_PAIRS + j], cos_0[t * ROPE_PAIRS + j], "the rewritten base moves pair 8's angle");
+        // and the far pair keeps the formula (the O(1e-5) angle both bases)
+        let inv31 = b.powf(-(2.0 * 31f32) / 64.0);
+        assert_eq!(cos_n[63 * ROPE_PAIRS + 31], (63f32 * inv31).cos());
+    }
+
+    /// phase 3: the warn fires only when the effective context exceeds the
+    /// training context AND nothing is armed — every other side is silent
+    #[test]
+    fn the_exceed_training_warning_fires_only_unscaled_and_oversized() {
+        // today's shape: 200k boot against 262144 training positions — silent
+        assert!(exceed_training_warning(200_000, Some(262_144), None).is_none());
+        // equal context is not exceeded
+        assert!(exceed_training_warning(262_144, Some(262_144), None).is_none());
+        // the loud line: oversized and unscaled
+        let w = exceed_training_warning(300_000, Some(262_144), None).expect("oversized + unscaled must warn");
+        assert!(w.contains("300000 exceeds the 262144 positions"), "{w}");
+        assert!(w.contains("quality WILL be degraded"), "{w}");
+        assert!(w.contains("issue #96"), "{w}");
+        // armed yarn: silent — that is what the scaling is for
+        assert!(exceed_training_warning(300_000, Some(262_144), Some(&scaling(RopeKind::Yarn))).is_none());
+        // a "default" scaling object configures nothing: the warn stands
+        assert!(exceed_training_warning(300_000, Some(262_144), Some(&scaling(RopeKind::Default))).is_some());
+        // no config seen at all (the selftest package): never a guessed threshold
+        assert!(exceed_training_warning(300_000, None, None).is_none());
     }
 }

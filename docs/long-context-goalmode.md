@@ -159,6 +159,9 @@ answer, which is the same band once the ~11k visual tokens are accounted for.
   and the reuse rule needs `S_pos < request length` (`cache.rs`, spec 7.4), so a second request
   with the SAME ids finds `P = 0` (`[cache] COLD L 120924 (held 122091), P 0, snapshots [121880,
   121492, 120924]`). A request that EXTENDS the history is warm; a repeat of the same one is not.
+  (Until #100. Since then a snapshot also keeps its prompt's last logits row, and a request
+  with the SAME ids rolls back onto it and prefills 0 tokens; unit-tested on branch t-100,
+  the live re-measurement is pending there.)
 
 ### 3.3 What the live log says about stage 3, and where the report needs correcting
 

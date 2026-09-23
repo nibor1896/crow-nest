@@ -35,7 +35,7 @@
 //! |---|---|---|
 //! | `Text` | the rest is content, or dropped and counted when a call already ran | `false` |
 //! | `Tail`, after `</function>` | the call is CLOSED, the trailing markup is dropped and counted | `false` |
-//! | any other | MALFORMED: the `arguments` object is closed and marked, the raw markup of the call in flight goes out as content | `true` |
+//! | any other | MALFORMED (`end-in-call`): the `arguments` object is closed and marked; the raw markup of the call in flight goes out as content ONLY when no call was ever named, else it is dropped and counted | `true` |
 //!
 //! - `Tail` means the call is COMPLETE: `</function>` already emitted the closing `}`.
 //! - So the client gets a parseable call, `finish_reason` `tool_calls`, and NOT the raw markup.
@@ -60,12 +60,35 @@
 //!   argument error instead. The old contract bought the same safety by leaving the JSON
 //!   broken; that is what poisoned the history.
 //! - `finish_reason` is unchanged: a malformed call keeps `stop` or `length`, never
-//!   `tool_calls`, and the raw markup still goes out as content before the first call.
+//!   `tool_calls`, and the raw markup still goes out as content before the first call
+//!   was NAMED (#99: before, a named call cut at EOS went out twice - as `Emit::Call` with
+//!   `_truncated` arguments AND as its whole raw markup in `content`; 6,986 tokens of a
+//!   runaway URL at 2026-09-22T10:23:37Z).
+//!
+//! Malformed calls, one record each (#99):
+//!
+//! - EVERY path that abandons a call pushes one `Malformed` record, so `malformed()` counts
+//!   what the model actually produced. Before #99 only an END inside a call was reported
+//!   (`finish` returned `true`); the three `give_up` paths flushed their markup without a
+//!   trace, and 4 of the 8 malformed calls of 2026-09-22 had no line in engine.log.
+//!
+//! | kind | where | the call was named? |
+//! |---|---|---|
+//! | `close-before-function` | `</tool_call>` in `Func`, before any `<function=` (the live `<tool_call>\n\n</function>\n</tool_call>`) | no |
+//! | `bad-name` | the function name is empty, or no `>` within `MAX_TOOL_NAME` bytes | no |
+//! | `bad-param-name` | a parameter name is empty, or no `>` within `MAX_TOOL_NAME` bytes | yes |
+//! | `end-in-call` | the generation ended (EOS, `max_tokens` or a stop string) before `</function>` | when it got past `<function=NAME>` |
+//!
+//! - The ONE byte rule: a byte of an abandoned call leaves either in `tool_calls` (the named
+//!   index, `_truncated` arguments) or in `content` (no index was ever named), never in both;
+//!   `Malformed::raw_as_content` says which. `bin/serve.rs` puts the records on the wire as
+//!   `crow_malformed_calls` and logs one WARN per record.
 //!
 //! Byte accounting:
 //!
 //! - `dropped()` counts every content or markup byte the parser swallowed without emitting it.
-//! - That is content after the first call, the `Tail` remainder, and a `give_up` after a call.
+//! - That is content after the first call, the `Tail` remainder, and the raw markup of an
+//!   abandoned call once a call was named (#99: including the call in flight itself).
 //! - `serve` prints the total in one stderr line per request, so the number is exact.
 
 /// `<tool_call>`, added token id 248058 of this model, `special: false`
@@ -108,6 +131,53 @@ const MAX_TOOL_NAME: usize = 128;
 /// TASK J: the key a TRUNCATED call's `arguments` object carries, and the only key in it
 /// that no tool declares; `pub` because `bin/serve.rs` names it in its contract table test
 pub const TRUNCATED_KEY: &str = "_truncated";
+
+/// #99: why the parser abandoned a call; the wire and the log carry `as_str()`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MalformedKind {
+    /// `</tool_call>` before any `<function=`
+    CloseBeforeFunction,
+    /// the function name is empty or longer than `MAX_TOOL_NAME`
+    BadName,
+    /// a parameter name is empty or longer than `MAX_TOOL_NAME`
+    BadParamName,
+    /// the generation ended inside the call, before `</function>`
+    EndInCall,
+}
+
+impl MalformedKind {
+    /// the stable, machine-readable name (log and wire)
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MalformedKind::CloseBeforeFunction => "close-before-function",
+            MalformedKind::BadName => "bad-name",
+            MalformedKind::BadParamName => "bad-param-name",
+            MalformedKind::EndInCall => "end-in-call",
+        }
+    }
+
+    /// one clause for the log line: what the markup did wrong
+    pub fn what(self) -> &'static str {
+        match self {
+            MalformedKind::CloseBeforeFunction => "</tool_call> before any <function=",
+            MalformedKind::BadName => "the function name is empty or never closed",
+            MalformedKind::BadParamName => "a parameter name is empty or never closed",
+            MalformedKind::EndInCall => "the generation ended before </function>",
+        }
+    }
+}
+
+/// #99: one abandoned call
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Malformed {
+    pub kind: MalformedKind,
+    /// the `tool_calls` index this call was NAMED under (its arguments carry `_truncated`),
+    /// `None` when it never got a name and so never reached `tool_calls`
+    pub index: Option<usize>,
+    /// its raw markup went out as `content` (no call was named before it); otherwise the
+    /// markup was dropped and counted in `dropped()`
+    pub raw_as_content: bool,
+}
 
 /// what the parser wants the stream writer to send next
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,7 +346,11 @@ fn repair_single_quotes(t: &str) -> String {
 /// - `Some((at, i))`: `markers[i]` starts at byte `at` of `buf`
 /// - `None`: no marker is complete; the returned length is what can never be part of one
 /// - the returned length is a char boundary, because every marker is ASCII
-fn find_marker(buf: &str, markers: &[&str]) -> (Option<(usize, usize)>, usize) {
+/// - `pub(crate)` since #86: `stopstr` runs the same hold for the OpenAI stop strings
+///   (the byte compare only ever cuts where `is_char_boundary` held, so non-ASCII
+///   markers hold safely too); the tool-call behaviour of this copy is unchanged,
+///   pinned by every test of this module
+pub(crate) fn find_marker(buf: &str, markers: &[&str]) -> (Option<(usize, usize)>, usize) {
     let mut best: Option<(usize, usize)> = None;
     for (i, m) in markers.iter().enumerate() {
         if let Some(at) = buf.find(m) {
@@ -368,7 +442,9 @@ fn tool_param_types(
 /// - So `<tool_call>` is matched by TOKEN ID; `</tool_call>` is matched by TEXT.
 /// - The literal text `<tool_call>` out of ordinary tokens therefore stays content.
 /// - `finish()` in `Tail` (after `</function>`) CLOSES the call: complete, no raw markup.
-/// - `finish()` in any other state but `Text` is MALFORMED: the raw markup goes out as content.
+/// - `finish()` in any other state but `Text` is MALFORMED: the raw markup goes out as content
+///   when no call was named yet, else it is dropped (#99).
+/// - Every abandoned call leaves one `Malformed` record (#99), whichever path gave it up.
 pub struct ToolStream {
     /// declared parameter types, from the request's `tools`
     types: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
@@ -407,6 +483,8 @@ pub struct ToolStream {
     tail_from: usize,
     /// bytes swallowed without being emitted: content after a call, or a `Tail` remainder
     dropped: usize,
+    /// #99: one record per abandoned call, in the order they were abandoned
+    malformed: Vec<Malformed>,
 }
 
 impl ToolStream {
@@ -430,6 +508,7 @@ impl ToolStream {
             raw: String::new(),
             tail_from: 0,
             dropped: 0,
+            malformed: Vec::new(),
         }
     }
 
@@ -449,6 +528,12 @@ impl ToolStream {
         self.dropped
     }
 
+    /// - #99: every call this parser abandoned, on every path, in order
+    /// - split-invariant like the fragments: the same text gives the same records
+    pub fn malformed(&self) -> &[Malformed] {
+        &self.malformed
+    }
+
     /// one decoded text piece in, the fragments it completes out
     pub fn feed(&mut self, piece: &str) -> Vec<Emit> {
         self.buf.push_str(piece);
@@ -461,8 +546,11 @@ impl ToolStream {
     /// - `Text`: the rest is content, or dropped and counted when a call already ran
     /// - `Tail`: the call is COMPLETE (`</function>` emitted the closing `}`), so it is
     ///   CLOSED here and the trailing markup is dropped, never replayed as content
-    /// - any other state: MALFORMED, the raw markup of the call in flight goes out as content
-    /// - `true` means MALFORMED, and only that; `Tail` returns `false`
+    /// - any other state: MALFORMED (`end-in-call`), the raw markup of the call in flight goes
+    ///   out as content when no call was named yet, else it is dropped (#99)
+    /// - `true` means the generation ENDED inside a call, and only that; `Tail` returns `false`
+    /// - a call abandoned EARLIER (`give_up`) is not in this bool: it is in `malformed()`, and a
+    ///   later call that closed still makes the answer `tool_calls`
     pub fn finish(&mut self, out: &mut Vec<Emit>) -> bool {
         if self.state == TState::Text {
             let rest = std::mem::take(&mut self.buf);
@@ -480,27 +568,47 @@ impl ToolStream {
             return false;
         }
         // TASK J: the fragments already on the wire are closed into a JSON object and
-        // marked, so Crow's stored history renders and the half call is not runnable
-        self.close_args_truncated(out);
-        self.flush_raw(out);
+        // marked, so Crow's stored history renders and the half call is not runnable.
+        // At the end, the text still held back belongs to the call in flight.
+        let rest = std::mem::take(&mut self.buf);
+        self.raw.push_str(&rest);
+        self.abandon(MalformedKind::EndInCall, out);
         self.state = TState::Text;
         true
     }
 
+    /// - #99: the ONE exit of an abandoned call, for `finish` and `give_up` alike
+    /// - closes the arguments (TASK J), flushes or drops the raw markup, records the kind
+    fn abandon(&mut self, kind: MalformedKind, out: &mut Vec<Emit>) {
+        let index = if self.named { Some(self.index) } else { None };
+        self.close_args_truncated(out);
+        let raw_as_content = self.flush_raw(out);
+        self.malformed.push(Malformed { kind, index, raw_as_content });
+    }
+
     /// - the raw markup of the call in flight leaves the parser
-    /// - before the first completed call it goes out as content, after one it is DROPPED
+    /// - before the first NAMED call it goes out as content; once a call was named - an
+    ///   earlier one (`index > 0`) or THIS one (`named`) - it is DROPPED, the rule `content`
+    ///   applies to prose (#99: the call in flight already went out as `Emit::Call`, so its
+    ///   markup as content was the same call a second time)
     /// - either way every byte is accounted for, so the `dropped` line is exact
-    fn flush_raw(&mut self, out: &mut Vec<Emit>) {
-        let mut raw = std::mem::take(&mut self.raw);
-        raw.push_str(&std::mem::take(&mut self.buf));
-        if raw.is_empty() {
-            return;
-        }
-        if self.index > 0 {
+    /// - `true` when the markup went out as content
+    /// - #99: only `raw` - what the call CONSUMED. The unread rest of `buf` stays for the
+    ///   `Text` state after a `give_up`: it used to be flushed with the call, so a complete
+    ///   call that arrived in the SAME piece as an abandoned one was flushed as markup, and
+    ///   the same text split finer was parsed as a call (the parser was not split-invariant
+    ///   on that path). `finish` moves its held-back tail into `raw` itself.
+    fn flush_raw(&mut self, out: &mut Vec<Emit>) -> bool {
+        let raw = std::mem::take(&mut self.raw);
+        if self.index > 0 || self.named {
             self.dropped += raw.len();
-            return;
+            return false;
+        }
+        if raw.is_empty() {
+            return false;
         }
         out.push(Emit::Content(raw));
+        true
     }
 
     /// content before the first call goes out; after it, it is dropped and counted
@@ -705,10 +813,10 @@ impl ToolStream {
         }
     }
 
-    fn give_up(&mut self, out: &mut Vec<Emit>) {
-        // TASK J: whatever went out for this index stays a parseable JSON object
-        self.close_args_truncated(out);
-        self.flush_raw(out);
+    fn give_up(&mut self, kind: MalformedKind, out: &mut Vec<Emit>) {
+        // TASK J: whatever went out for this index stays a parseable JSON object; #99: and
+        // the abandonment is recorded, so no give-up path is silent any more
+        self.abandon(kind, out);
         // an abandoned call keeps its index: a later call must not land in the same slot
         if self.named {
             self.index += 1;
@@ -762,7 +870,7 @@ impl ToolStream {
                         }
                         Some((at, _)) => {
                             self.eat(at + TOOL_CLOSE.len());
-                            self.give_up(out);
+                            self.give_up(MalformedKind::CloseBeforeFunction, out);
                         }
                         None => {
                             self.eat(safe);
@@ -783,7 +891,7 @@ impl ToolStream {
                     }
                     Ok(None) => return,
                     Err(()) => {
-                        self.give_up(out);
+                        self.give_up(MalformedKind::BadName, out);
                         continue;
                     }
                 },
@@ -823,7 +931,7 @@ impl ToolStream {
                     }
                     Ok(None) => return,
                     Err(()) => {
-                        self.give_up(out);
+                        self.give_up(MalformedKind::BadParamName, out);
                         continue;
                     }
                 },
@@ -1227,13 +1335,15 @@ mod tests {
     }
 
     #[test]
-    fn a_call_that_never_closes_goes_out_as_content_and_is_malformed() {
+    fn a_named_call_that_never_closes_goes_out_once_as_a_marked_call_and_not_as_content() {
         let tools = a7_tools_fixture();
         let cut_off = "<tool_call>\n<function=read_file>\n<parameter=path>\nC:/x/y.md";
         let (es, bad, closed) = drive(Some(&tools), 1, &cut(cut_off, 5));
         assert!(bad, "an unclosed call is malformed");
         assert_eq!(closed, 0);
-        assert_eq!(content_of(&es), cut_off, "the raw markup is what the client sees");
+        // #99: the call already went out as `Emit::Call`; its raw markup as content was the
+        // same call a second time (2026-09-22T10:23:37Z, 6,986 tokens delivered twice)
+        assert_eq!(content_of(&es), "", "the raw markup of a NAMED call is dropped, not replayed");
         // TASK J: the half built arguments are CLOSED into a JSON object and marked. They
         // used to stay unterminated on purpose, and that unterminated string is what Crow
         // stored and re-sent until the chat template refused the whole session with a 400.
@@ -1432,6 +1542,204 @@ mod tests {
                     serde_json::from_str(&args).expect("arguments parse");
                 assert_eq!(v["command"], value, "value {value:?} split {n}");
                 assert_eq!(content_of(&es), "", "value {value:?} split {n}");
+            }
+        }
+    }
+
+    // ------------------------------------------- #99: every abandoned call is counted, once
+
+    /// `drive`, plus the parser's `malformed()` records and its `dropped()` count
+    fn drive_m(
+        tools: Option<&serde_json::Value>,
+        arms: usize,
+        pieces: &[&str],
+    ) -> (Vec<Emit>, bool, Vec<Malformed>, usize) {
+        let mut ts = ToolStream::new(tools);
+        for _ in 0..arms {
+            ts.arm();
+        }
+        let mut out = Vec::new();
+        for p in pieces {
+            out.extend(ts.feed(p));
+        }
+        let bad = ts.finish(&mut out);
+        (out, bad, ts.malformed().to_vec(), ts.dropped())
+    }
+
+    /// the three markup-only rounds of 2026-09-22 that reached Crow as content with NO line
+    /// in engine.log (15:17:12, 15:20:04, 15:39:50: session.json msgs 71 / 139 / 469; 15:45:28:
+    /// msg 561). `</tool_call>` arrives before any `<function=`: the `give_up` path.
+    #[test]
+    fn the_live_markup_only_rounds_are_counted_as_close_before_function() {
+        for markup in [
+            "<tool_call>\n\n</function>\n</tool_call>",
+            "<tool_call>\nfunction>\n</function>\n</tool_call>",
+        ] {
+            for n in [1usize, 2, 3, 7, 1000] {
+                let (es, bad, m, _) = drive_m(None, 1, &cut(markup, n));
+                assert!(!bad, "{markup:?} split {n}: the generation did not END inside the call");
+                assert_eq!(
+                    m,
+                    vec![Malformed {
+                        kind: MalformedKind::CloseBeforeFunction,
+                        index: None,
+                        raw_as_content: true
+                    }],
+                    "{markup:?} split {n}"
+                );
+                // no call was named, so the markup is the content, byte for byte - the
+                // one place its bytes go (Crow #217 classifies it as `markup`)
+                assert_eq!(content_of(&es), markup, "split {n}");
+                assert!(es.iter().all(|e| matches!(e, Emit::Content(_))), "split {n}: {es:?}");
+            }
+        }
+    }
+
+    /// the one round of that hour that WAS logged (15:16:42, msg 65): the end inside the call,
+    /// with a second `<tool_call>` token in it. Still one record, `end-in-call`, as content.
+    #[test]
+    fn the_live_logged_round_is_one_end_in_call_record() {
+        let markup = "<tool_call>\n\n\n\n\n\n<tool_call>";
+        for n in [1usize, 4, 1000] {
+            let (es, bad, m, _) = drive_m(None, 2, &cut(markup, n));
+            assert!(bad, "split {n}");
+            assert_eq!(
+                m,
+                vec![Malformed { kind: MalformedKind::EndInCall, index: None, raw_as_content: true }],
+                "split {n}"
+            );
+            assert_eq!(content_of(&es), markup, "split {n}");
+        }
+    }
+
+    /// 10:23:37: EOS inside `<parameter=path>` after the name. The call goes out ONCE, as
+    /// `tool_calls[0]` with `_truncated` arguments; its markup is counted in `dropped`.
+    #[test]
+    fn eos_inside_a_parameter_of_a_named_call_emits_the_call_and_no_content() {
+        let tools = serde_json::json!([{ "type": "function", "function": {
+            "name": "read_image",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]);
+        let prose = "Let me look at it.\n";
+        let call = "<tool_call>\n<function=read_image>\n<parameter=path>\nhttp://routify-file-proxy/aaaaaaaa";
+        let whole = format!("{prose}{call}");
+        for n in [1usize, 3, 7, 64, 100_000] {
+            let (es, bad, m, dropped) = drive_m(Some(&tools), 1, &cut(&whole, n));
+            assert!(bad, "split {n}");
+            assert_eq!(content_of(&es), prose, "split {n}: only the prose, never the markup");
+            let calls: Vec<&Emit> = es.iter().filter(|e| matches!(e, Emit::Call { .. })).collect();
+            assert_eq!(calls.len(), 1, "split {n}: {es:?}");
+            let v: serde_json::Value =
+                serde_json::from_str(&args_of(&es, 0)).expect("arguments parse");
+            assert_eq!(v["path"], "http://routify-file-proxy/aaaaaaaa", "split {n}");
+            assert_eq!(v[TRUNCATED_KEY], true, "split {n}");
+            assert_eq!(
+                m,
+                vec![Malformed { kind: MalformedKind::EndInCall, index: Some(0), raw_as_content: false }],
+                "split {n}"
+            );
+            assert_eq!(dropped, call.len(), "split {n}: every byte of the markup is counted");
+        }
+    }
+
+    /// the other two `give_up` paths, one record each, split-invariant
+    #[test]
+    fn a_bad_name_and_a_bad_parameter_name_are_each_one_record() {
+        let long = "z".repeat(MAX_TOOL_NAME + 3);
+        let bad_name = format!("<tool_call>\n<function={long}>\n</function>\n</tool_call>");
+        let empty_name = "<tool_call>\n<function=>\n</function>\n</tool_call>".to_string();
+        let bad_param = "<tool_call>\n<function=f>\n<parameter=>\n1\n</parameter>\n</function>\n</tool_call>".to_string();
+        let cases = [
+            (&bad_name, MalformedKind::BadName, None, true),
+            (&empty_name, MalformedKind::BadName, None, true),
+            (&bad_param, MalformedKind::BadParamName, Some(0), false),
+        ];
+        for (markup, kind, index, raw_as_content) in cases {
+            for n in [1usize, 2, 5, 1000] {
+                let (es, _, m, _) = drive_m(None, 1, &cut(markup, n));
+                assert_eq!(
+                    m,
+                    vec![Malformed { kind, index, raw_as_content }],
+                    "{kind:?} split {n}: {es:?}"
+                );
+                if index.is_some() {
+                    assert_eq!(content_of(&es), "", "{kind:?} split {n}: named, so no content");
+                } else {
+                    assert_eq!(content_of(&es), *markup, "{kind:?} split {n}");
+                }
+            }
+        }
+    }
+
+    /// a complete call AFTER an abandoned one, in the same piece or split finer, is the same
+    /// call - `give_up` used to flush the unread rest of the piece with the abandoned markup,
+    /// so the whole-piece run lost the second call that the byte-split run parsed
+    #[test]
+    fn a_call_after_an_abandoned_one_is_parsed_whatever_the_split() {
+        let tools = a7_tools_fixture();
+        let markup = format!("<tool_call>\n\n</function>\n</tool_call>\n{A7_CALL}");
+        let mut seen: Option<(Vec<Emit>, Vec<Malformed>)> = None;
+        for n in [1usize, 2, 3, 7, 13, 100_000] {
+            let (es, bad, m, _) = drive_m(Some(&tools), 2, &cut(&markup, n));
+            assert!(!bad, "split {n}");
+            let calls: Vec<Emit> =
+                es.iter().filter(|e| !matches!(e, Emit::Content(_))).cloned().collect();
+            let norm = (vec![Emit::Content(content_of(&es))], m.clone());
+            assert!(calls.iter().any(|e| matches!(e, Emit::Call { index: 0, .. })), "split {n}: {es:?}");
+            assert_eq!(
+                args_of(&es, 0),
+                "{\"path\":\"C:/Users/robin/dev/crow-nest/docs/ten-tasks.md\",\"start_line\":1}",
+                "split {n}"
+            );
+            assert_eq!(m.len(), 1, "split {n}: {m:?}");
+            assert_eq!(m[0].kind, MalformedKind::CloseBeforeFunction, "split {n}");
+            match &seen {
+                None => seen = Some(norm),
+                Some(first) => assert_eq!(*first, norm, "split {n} differs from split 1"),
+            }
+        }
+    }
+
+    /// the #99 byte rule, swept: over every byte prefix of the give-up shapes at four piece
+    /// sizes, the records are split-invariant, a NAMED abandoned call never has its markup
+    /// in content, and an unnamed one never has an index
+    #[test]
+    fn every_abandoned_call_is_recorded_once_and_its_bytes_go_one_way() {
+        let tools = a7_tools_fixture();
+        let long_name = "x".repeat(MAX_TOOL_NAME + 8);
+        let corpus = [
+            A7_CALL.to_string(),
+            "<tool_call>\n\n</function>\n</tool_call>".to_string(),
+            format!("<tool_call>\n<function=read_file>\n<parameter=path>\na.md\n</parameter>\n<parameter={long_name}"),
+            format!("<tool_call>\n<function={long_name}"),
+            "<tool_call>\n<function=f>\n<parameter=n>\nnot json".to_string(),
+            format!("<tool_call>\n<function=f>\n<parameter=>\n1\n</parameter>\n</function>\n</tool_call>\n{A7_CALL}"),
+        ];
+        for markup in &corpus {
+            for end in 1..=markup.len() {
+                if !markup.is_char_boundary(end) {
+                    continue;
+                }
+                let mut first: Option<Vec<Malformed>> = None;
+                for n in [1usize, 3, 7, 4096] {
+                    let (es, _, m, _) = drive_m(Some(&tools), 2, &cut(&markup[..end], n));
+                    let ctx = format!("prefix {end} split {n}: {:?}", &markup[..end]);
+                    for r in &m {
+                        assert!(
+                            !(r.index.is_some() && r.raw_as_content),
+                            "{ctx}: a named call's markup went out as content: {r:?}"
+                        );
+                    }
+                    if es.iter().any(|e| matches!(e, Emit::Call { .. })) {
+                        assert!(
+                            !content_of(&es).contains("<function="),
+                            "{ctx}: markup in content beside a named call: {es:?}"
+                        );
+                    }
+                    match &first {
+                        None => first = Some(m),
+                        Some(f) => assert_eq!(*f, m, "{ctx}: records differ by split"),
+                    }
+                }
             }
         }
     }

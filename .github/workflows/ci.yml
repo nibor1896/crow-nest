@@ -113,6 +113,40 @@ jobs:
       #                              the four in `requant_check.rs` that pin the block
       #                              comparison and the selection rule, and the one that
       #                              pins the f32 global scale through the index JSON)
+      # 2026-09-23 (robin's decision, release-2026-09-23): 26 more tests read models/
+      # (config.json, tokenizer.json: meta, tokenizer, toolgrammar real-vocabulary tests) or
+      # load NVRTC (kernels compile test). The runner has neither; the test job was red on
+      # main since 2026-09-18. They stay covered by the local gate (tools/gate-linux.sh).
+      # 2026-09-23: the engine tests read the model's config and tokenizer (meta, tokenizer,
+      # toolgrammar) and compile the kernels with NVRTC. The runner has no models/ (gitignored)
+      # and no CUDA, so 26 tests failed on every run since 2026-09-18. Fetch ONLY the small
+      # non-weight files from the public upstream repo, pinned by sha256 (identical to the
+      # files the local gate uses), and NVRTC 13 from PyPI. No weights are downloaded.
+      - name: model config, tokenizer and NVRTC for the host tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          d=models/Qwen3.8-Flash-Next-original
+          mkdir -p "$d"
+          while read -r sum f; do
+            curl -fsSL --retry 3 -o "$d/$f" "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/$f"
+            echo "$sum  $d/$f" | sha256sum -c -
+          done <<'SUMS'
+          889658f2508e8c61d409b02e70e0d78d8d4452ec65aaafbe129805d213d2e74b config.json
+          e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e generation_config.json
+          0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3 tokenizer.json
+          b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27 tokenizer_config.json
+          c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041 chat_template.jinja
+          a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d merges.txt
+          ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003 vocab.json
+          SUMS
+          python3 -m pip install --quiet "nvidia-cuda-nvrtc==13.*"
+          loc=$(python3 -m pip show nvidia-cuda-nvrtc | awk '/^Location:/{print $2}')
+          so=$(find "$loc/nvidia" -name 'libnvrtc.so*' | head -1)
+          test -n "$so"
+          lib=$(dirname "$so")
+          ls "$lib"
+          echo "LD_LIBRARY_PATH=$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
       - name: engine tests
         working-directory: engine
         shell: bash
@@ -129,11 +163,37 @@ jobs:
             --skip the_stop_token_resolves \
             --skip a_split_multibyte_token_never_reaches_a_chunk \
             --skip a_history_with_a_tool_turn_renders_byte_identical_to_the_oracle \
+            --skip a_doctored_eps_fires_by_name \
+            --skip a_doctored_head_dim_fires_scale_and_pairs_and_head_dim \
+            --skip a_doctored_hidden_size_fires_by_name \
+            --skip a_doctored_layer_count_and_layout_fire_by_name \
+            --skip a_doctored_partial_rotary_fires_rope_pairs \
+            --skip a_doctored_rope_type_fires_by_name \
+            --skip a_doctored_theta_fires_by_name \
+            --skip a_legacy_typed_rope_scaling_takes_the_defaults \
+            --skip a_missing_field_is_a_named_error \
+            --skip a_random_walk_over_allowed_ids_never_reaches_a_dead_end \
+            --skip a_yarn_rope_scaling_parses_with_the_reference_math \
+            --skip an_out_of_range_special_id_is_a_named_mismatch \
+            --skip an_unsupported_rope_scaling_type_is_a_named_error \
+            --skip doctored_generation_ids_fire_by_name \
+            --skip doctored_head_counts_fire_gqa_and_the_pins \
+            --skip doctored_vocab_and_positions_fire_by_name \
+            --skip linear_and_ntk_parse_with_no_mscale \
+            --skip mask_cost_on_cpu \
+            --skip reasoning_effort_is_a_template_variable_and_undefined_is_the_default \
+            --skip the_container_convention_finds_the_repo_checkpoint \
+            --skip the_observed_failure_shapes_are_masked_on_the_real_vocabulary \
+            --skip the_real_config_has_no_scaling_and_a_default_rope_type \
+            --skip the_real_config_passes_every_check \
+            --skip the_source_compiles_and_the_scale_split_is_visible_in_the_ptx \
+            --skip token_bytes_concatenate_to_the_exact_text \
+            --skip token_masks_on_the_real_vocabulary_agree_with_the_per_token_check \
             2>&1 | tee target_ci/engine-tests.txt
           {
             echo "### test: engine"
             echo ""
-            echo "- 10 tests skipped, no weights on the runner"
+            echo "- 36 tests skipped, no weights / no NVRTC on the runner"
             echo '```'
             grep -E '^(     Running|   Doc-tests|test result:)' target_ci/engine-tests.txt || true
             echo '```'

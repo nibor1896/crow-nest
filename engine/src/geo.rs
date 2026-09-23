@@ -109,6 +109,25 @@ impl KvDtype {
             KvDtype::Bf16 => "bf16",
         }
     }
+
+    /// The one parser of a KV dtype word (#102). `bf16`, `fp8` and `fp8_e4m3`
+    /// (the `name()` spelling, so a logged value round-trips), ASCII case
+    /// ignored. Anything else, the empty string included, is an error that
+    /// names the accepted words: a typo must not silently fall back to FP8.
+    pub fn parse(s: &str) -> Result<KvDtype, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "bf16" => Ok(KvDtype::Bf16),
+            "fp8" | "fp8_e4m3" => Ok(KvDtype::Fp8E4m3),
+            _ => Err(format!("CROW_KV={s:?} is not a KV dtype; accepted: bf16, fp8, fp8_e4m3 (unset = fp8_e4m3)")),
+        }
+    }
+
+    /// `CROW_KV` as read at the `boot::open_model` front door, shared by
+    /// `decode`, `parity` and `serve` (#102). `None` = unset, keep the default;
+    /// a set value goes through `parse`, including the error.
+    pub fn from_env_value(v: Option<&str>) -> Result<Option<KvDtype>, String> {
+        v.map(KvDtype::parse).transpose()
+    }
 }
 
 /// runtime configuration — the knobs the loader honours (spec 0.2, 2.1)
@@ -116,7 +135,7 @@ impl KvDtype {
 pub struct Config {
     pub context: usize,       // default 262_144, floor 200_000
     pub n_hot: usize,         // target 160 experts per layer, loader clamps
-    pub kv: KvDtype,          // FP8 default, BF16 fallback via config
+    pub kv: KvDtype,          // FP8 default; CROW_KV=bf16 at boot::open_model (#102)
     pub ple_cache_bytes: u64, // hot-row cache, default 128 MB (#16, 2026-09-05; was 1 GB)
     pub prompt_chunk: usize,  // prefill chunk size (correctness stage: 256..512)
     /// pinned-host budget for the cold tier (spec 3.4: ~43-47 GB of 64 GB);

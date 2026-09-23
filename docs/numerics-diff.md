@@ -1,0 +1,244 @@
+# Numerics diff: GDN normalization + QSA sparse attention vs HF reference and llama.cpp
+
+Issue #89. Produced 2026-09-20 by line-by-line reading of three implementations.
+No engine code was changed; probes listed in §3 were added as new `engine/src/bin/*_probe.rs` files.
+
+**Sources compared (all read locally):**
+
+- **crow-nest** — `engine/src/kernels.rs` (CUDA `KERNEL_SRC`), `engine/src/gen.rs`, `engine/src/manager.rs`, `engine/src/geo.rs`.
+- **HF reference** — transformers 5.16.1 in `.venv-oracle/lib/python3.14/site-packages/transformers/models/qwen4_exp/modeling_qwen4_exp.py` (the oracle venv; `geo.rs` names qwen4_exp the text tower; `config.json` `model_type = qwen4_exp`). The GDN + indexer are **pure-torch inside the modeling file** (no `fla` import); the `l2norm` helper at modeling line 259 is documented as "intended to align with the l2norm implementation in the FLA library".
+- **llama.cpp** — shallow clone at `/tmp/llamacpp` (master, 2026-09): `src/models/qwen4exp.cpp` (this arch **is** implemented there, including the QSA indexer), `src/models/qwen3next.cpp`, `src/models/models.h`, `src/models/delta-net-base.cpp`, `src/llama-graph.cpp`, `src/llama-memory-hybrid-idx.cpp`.
+- **config** — `models/Qwen3.8-Flash-Next-original/config.json` (text_config).
+
+**Verdict summary: 17 MATCH / 0 MISMATCH / 3 UNVERIFIABLE** (tie-break order vs `torch.topk`; GGUF-side +1 weight fold; RoPE table bit-provenance). Details and severities below. Every pinned constant checked against `config.json` agrees (see §4).
+
+> **Scope note, 2026-09-23 (#91).** This diff compared FORMULAS on the GDN / QSA / dense path, and its verdict stands for those formulas. It did not cover the NVFP4 activation encoding or how rows are READ from the container. Two engine defects outside that scope were found on 2026-09-23 and are fixed on branch `release-2026-09-23`: the ue4m3 activation floor (`488a840`, with the encoder NaN fix `5c6891a`) and the PLE row-offset read (`85a48e7`). See §7. "0 MISMATCH" therefore does not mean "the engine computes what the model should compute".
+
+---
+
+## 1. Diff table
+
+Verdicts: **MATCH** = formula and constants identical (fp reduction order may differ — noted); **MISMATCH** = different formula/constant; **UNVERIFIABLE** = cannot be decided from the sources read, with reason.
+
+| # | check item | crow-nest | HF reference | llama.cpp | VERDICT |
+|---|---|---|---|---|---|
+| 1 | Full-attn q/k norm form + eps | per-head RMSNorm over 256, `rsqrtf(Σx²/256 + 1e-6)`, weight `(1+w)`, f32 — `rmsnorm_1pw` kernels.rs:1431-1446 | `Qwen4ExpTextRMSNorm`: `x.f32()·rsqrt(mean(x²)+eps)·(1+w)`, eps=`rms_norm_eps`=1e-6 — modeling:158-181, applied modeling:810-811 | `build_norm(..., LLM_NORM_RMS)` + direct weight mul — llama-graph.cpp:1591,1604-1605; qwen4exp.cpp:810-817 | **MATCH** (llama.cpp folds `+1` at GGUF conversion — see U2) |
+| 2 | GDN q/k l2norm formula (post-#28068 form) | `x·rsqrtf(Σx² + 1e-6)`, q additionally `·rsqrtf(128)` — `l2norm_repeat` kernels.rs:1589-1602 | `l2norm`: `x·rsqrt(Σx² + 1e-6)`; then `query = query·(1/√128)` — modeling:259-262, 279-281, 295-296 / 361-362, 369-370 | `ggml_scale(ggml_rms_norm(x, eps/n), 1/√n)` ≡ `x·rsqrt(Σx²+eps)` algebraically; q-scale inside the GDN op — models.h:14-18 ("ref: …pull/28068"), qwen4exp.cpp:956-968 | **MATCH** — the #28068 class of bug (max instead of rsqrt) is **not** present in crow-nest |
+| 3 | GDN out-norm (gated) | `w[d]·x·rsqrtf(Σx²/128 + 1e-6)·sigmoid(z)`, f32, weight applied directly — `rmsnorm_gated` kernels.rs:1756-1772 (fused twin 3405-3419) | `RMSNormGated`: `weight·(x·rsqrt(mean+eps))·ACT(gate)`, weight direct (ones-init), activation=`config.output_gate_type`=**sigmoid** — modeling:185-201, 437-439; config.json | `rms_norm` then `ggml_sigmoid(gate)` mul — qwen4exp.cpp:476-486 ("sigmoid output gate, not silu") | **MATCH** |
+| 4 | GDN recurrence (decode/step) | `S·=g; kv=Σ_dk S·k; δ=(v−kv)β; S+=k⊗δ; o=Σ_dk S·q`, f32, intrinsics pin op order — `delta_rule_persist` kernels.rs:1619-1644 / `_r` 1687-1727 / `delta_rule_step_r` 1728-1755 | identical step in f32 — modeling:381-392 (`torch_recurrent_gated_delta_rule`) | same recurrence via fused GDN ops — delta-net-base.cpp:527-572, qwen4exp.cpp:968 | **MATCH** (per-element op order equal; 128-sum reduction order differs — f32 reassociation only) |
+| 5 | GDN prefill algorithm | token-recurrent over the whole chunk (`delta_rule_persist`), same op order as decode | **chunked** UT-transform, chunk_size=64 — modeling:266-344 (`torch_chunk_gated_delta_rule`, chosen at modeling:539-550) | chunked fused (`LLM_FUSED_OP_GDN_CH`) — delta-net-base.cpp:568-572 | **MATCH** as formulas / **numerics-class difference**: recurrent vs chunked reassociation (see P2) |
+| 6 | GDN β and decay g | `β=sigmoid(b)`, `g=−expf(A_log)·logf(1+expf(a+dt_bias))`, f32 — `beta_g` kernels.rs:1603-1617 | `β=b.sigmoid()`, `g=−A_log.float().exp()·softplus(a.float()+dt_bias)` — modeling:517-519 | `sigmoid`, `softplus`, `mul` — qwen3next.cpp:443-455 | **MATCH** (notes: torch `softplus` linearizes above 20 (≤2e-9 rel); HF computes β in bf16, crow in f32) |
+| 7 | GDN GQA mapping (k→v heads) | `khead = vhead / 3` (16 k-heads → 48 v-heads) — kernels.rs:1594; norm computed once per k-head, value replicated | `repeat_interleave(3, dim=2)` — modeling:520-522 | `ggml_repeat_4d` interleave — qwen3next.cpp:514-530, qwen4exp.cpp:960-964 | **MATCH** |
+| 8 | Attention scale value + application point | `0.0625` (=256^−0.5) at kernels.rs:1860, 1932, 2096, 2194 (`g_score`), 3709 (+`attn_merge` divide); applied to the raw dot `p[j]=acc·scale` **before** max-subtraction (1871/1950/2117/3726) | `scaling = head_dim**-0.5` = 0.0625 — modeling:766; eager: `matmul(q,kᵀ)·scaling` then softmax (max-subtract inside) — modeling:745-749 | `kq_scale = 1/√n_embd_head` (or `f_attention_scale` metadata) passed to `ggml_soft_max_ext` — qwen4exp.cpp:841-842, llama-graph.cpp:2694 | **MATCH** (positive scale commutes with max-subtraction; all three apply it pre-softmax) |
+| 9 | Softmax accumulation precision | f32 end-to-end: warp-shuffle dot, shared-mem max/sum trees, `expf`, per-element IEEE `p[j]/sum` — kernels.rs:1869-1901; router f32 — 2945-2953 | eager softmax `dtype=torch.float32` — modeling:749; router `softmax(dtype=float)` — modeling:910 | kq accumulation forced f32 (`ggml_prec_set_acc(kq, GGML_PREC_F32)`) — llama-graph.cpp:2665; soft_max in f32 | **MATCH** on precision class; reduction order differs per engine (expected, not a formula item) |
+| 10 | RoPE pairing + theta + partial split | pairs `(d, d+32)` for d<32 = rotate_half on the first **64 of 256** dims, dims ≥64 pass through; table `cos/sin[t·32+j]`, `inv=1e7^(−2j/64)` host f32 — `rope` kernels.rs:1784-1799, `rope_p` 1802-1819; manager.rs:300-311; `ROPE_PAIRS=32` geo.rs:26 | `partial_rotary_factor=0.25` → rotary dim 64; `inv_freq = 1/(θ^(arange(0,64,2)/64))`, θ=`rope_theta`=1e7; `emb=cat(freqs,freqs)`; `q_rope·cos + rotate_half(q_rope)·sin`, pass-through rest — modeling:108-116, 566-608; config.json | `ggml_rope_ext`/`ggml_rope_multi` with `n_rot`, `freq_base` from metadata — qwen4exp.cpp:716-723, 822-833 | **MATCH** (table bits vs torch: ULP-level, U3) |
+| 11 | mrope (text path) | single T-plane table (all positions equal for text) | `apply_interleaved_mrope` mixes H/W planes at interleaved sections — modeling:121-155; **no-op when the 3 position planes are equal** (text-only decoding) | `ggml_rope_multi` with sections; text uses equal planes — qwen4exp.cpp:716-723 | **MATCH** for text; multimodal not in scope of this engine |
+| 12 | GQA head mapping (full attention) | `kvh = head / 12` (24 q → 2 kv, contiguous blocks of 12) — kernels.rs:1850, 1918, 3695; `store_kv` layout kernels.rs:1832-1835 | `repeat_kv` expand+reshape ≡ head h ← kv `h // 12` — modeling:720-729, 742-743 | standard llama.cpp GQA mapping in `build_attn_mha` | **MATCH** |
+| 13 | QSA indexer q/k norm + eps | per-head RMSNorm over 128, `(1+w)`, eps 1e-6 — `rms128` kernels.rs:2336-2354 (q: gen.rs:2582; pooled k: gen.rs:2600) | `Qwen4ExpTextRMSNorm(128, eps=rms_norm_eps)` for q and pooled k — modeling:628-629, 651, 682 | `build_norm(..., LLM_NORM_RMS)` — qwen4exp.cpp:634-635, 643-645 | **MATCH** |
+| 14 | QSA indexer geometry (budget/compress/block math) | budget 2048, ratio 4, block top-k 512 (`min(K, ncb)` blocks), `ncb=(pos+1)>>2` complete blocks, tail `(pos+1) mod 4` appended unconditionally, list = 4 tokens/block ascending + tail; `QSA_BLOCK_TOPK=512` geo.rs:89, `qsa_scores` kernels.rs:2421, `qsa_select` 2451-2586, dense shortcut 2596-2604, decode `ncb1` gen.rs:3941-3946 | `token_budget=2048`, `compress_ratio=4`, `block_topk=2048//4=512`; `num_complete_blocks = visible//4`; `topk(min(block_topk, ncb))` blocks → 4 tokens each; `tail = visible[4·ncb:]` concatenated — modeling:620-622, 672-701; config.json | token-level top-k with `width = min(n_kv, top_k + r − 1)` over per-token expanded block scores ("the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail") — qwen4exp.cpp:678-682; incomplete groups not pooled — llama-memory-hybrid-idx.cpp:354 | **MATCH** (all three select whole blocks + unconditional tail; set-equal) |
+| 15 | QSA indexer score formula | `(Σ_h relu(q_h·k̂_b))·rsqrtf(128)` in f32 — `qsa_scores` kernels.rs:2415-2442 / `qsa_scores_par` 3644-3674 | `relu(q·kᵀ)`, sum over the 4 heads, `/√128`, f32 matmul — modeling:690-693 | relu per head then head-sum, **no `/√128`** — qwen4exp.cpp:649-661 | **MATCH** (scores feed only top-k, a positive scale is rank-invariant; llama.cpp omitting it is harmless — noted for completeness) |
+| 16 | QSA pooled-key pipeline order | pool **raw** keys → RMSNorm → RoPE at block start `p=4·b` — `pool4_cache` kernels.rs:2379-2390 (raw ring), gen.rs:2592-2607; `pos_mul4=4`, `pos_base_b4`=block index (rope64 kernels.rs:2368 `p=(pos_base+t)·4`) | raw keys cached (`update_indexer`), `mean(dim=1)` in f32 → **cast back to bf16** → `k_layernorm` → RoPE at `group_starts` (block start) — modeling:654-688 | "cached indexer keys are raw: pooling precedes norm and rotation"; mean → rms_norm → rope at block-start pos — qwen4exp.cpp:593-641, llama-memory-hybrid-idx.cpp:474-493 | **MATCH** (precision note: HF rounds the pooled mean to bf16 before the norm; crow keeps f32 — crow strictly finer) |
+| 17 | QSA pooling formula | `(k0+k1+k2+k3)·0.25` over 4-aligned raw rows — kernels.rs:2388-2389 | `key_groups.float().mean(dim=1)` — modeling:681 | slice-add ×4 then `ggml_scale(1/r)` — qwen4exp.cpp:620-631 | **MATCH** |
+| 18 | QSA raw-key ring + wraparound | ring = `round4(chunk+4)` rows (default; `CROW_QSA_FULL=1` → context), `ring%4==0` ⇒ a block's 4 rows never straddle the wrap; row = `pos % ring`; pooled immediately at block completion so the pooled cache is full-length — manager.rs:100-113, `qk_k_append` kernels.rs:2392-2401, `pool4_cache` 2386 | raw keys kept for **all** positions (cache) — modeling:654-655 | full indexer cache — qwen4exp.cpp:593-596 | **MATCH** (mechanism is engine-eigen but numerics-neutral: pooled values are a pure function of the same 4 raw rows) |
+| 19 | QSA selection tie-break | exact radix/`ordkey` top-k, ties resolved **lowest block index**, ascending emit — `qsa_select` kernels.rs:2447-2542, `qsa_select_fast` 2589+, `qsa_select_par_h/_e` 2741-2912 ("Output rule reproduced byte for byte from qsa_select_fast") | `torch.topk` — modeling:695 (**tie index order unspecified on CUDA**) | `ggml_top_k` over expanded token scores — qwen4exp.cpp:679 (tie order = argsort implementation detail) | **UNVERIFIABLE** vs torch (U1) — engine-side determinism proven by probe P1 |
+| 20 | QSA list semantics vs HF mask | gathered list `[4·b ascending…] + tail`, count `sel_n`; out-of-range clamps `tok<0→0, tok≥tmax→tmax−1` are defensive only (selectors never emit them) — kernels.rs:1865-1866, 2571, 2581 | selected indices scattered into a boolean/float mask over kv; `-1` padding scattered to `kv_length` and dropped — modeling:704-717 | top-k indices unmask rows of an otherwise `−inf` mask — qwen4exp.cpp:719-752 | **MATCH** (set-equal; padding never attended in any engine) |
+| 21 | Prefill-vs-decode row equality (QSA attention) | prefill `attn_sel*`: normalize each weight `p[j]/sum` then `o += w·v` in list order; decode `attn_sel_split`+`attn_merge`: unnormalized partials `(m,l,o)`, merged `o/L` once — kernels.rs:1886-1901 vs 3740-3791 | single eager/sdpa path (mask-based), no engine-internal split | single graph path, no engine-internal split | **MATCH** at formula level (same token set, f32); bit-level differs by design — measured by probe P4 |
+| 22 | Router softmax + top-10 + renorm | f32 softmax with max-subtract; iterative argmax ×10 with `atomicMin` ⇒ ties **lowest expert index**; weights renormalized `s_ws/s_sum` over the 10 — `router_top10` kernels.rs:2915-2990 | `softmax(dtype=float)` → `torch.topk(10)` → `/= sum` when `norm_topk_prob` (true) — modeling:907-916 | `build_moe_ffn` with `expert_weights_scale` + norm top-k — qwen4exp.cpp:1015-1030 | **MATCH** (renorm exact; tie-break shares U1's caveat — exact f32 prob ties are rare on continuous logits) |
+| 23 | Attention output gate | `core / (1+expf(−g))` = `core·sigmoid(gate)` — `gate_mul` kernels.rs:2308-2313 (+fused `gate_mul_q` 3421+); q/gate split: q first 256, gate second 256 per head — `split_qg` kernels.rs:1775-1783 | `chunk(q_proj.view(…, head_dim·2), 2)` = q then gate; `attn_output·sigmoid(gate)` — modeling:805-808, 836 | `ggml_sigmoid(gate)` mul; gate = second half of wq — qwen4exp.cpp:791-799, 851-853 | **MATCH** |
+| 24 | Hyper-connection (HC) mixing | group RMSNorm per 2560-stream `(1+w)` — `rms_group` kernels.rs:1411-1429; mix = `sigmoid(up(silu(down(x)·0.25)))` — `silu_div4` 1448-1454 + `sigmoid_el` 1455-1459; mean over 4 streams `·0.25` — `mix_streams` 1466-1474; inject = `2·sigmoid(w·0.25)` — `sig2_div4` 1460-1465 + `inject_residual` 1475-1483 | `hc_norm = RMSNorm(4·2560, group_size=2560)`; `silu(down(x)/hc_count)` → `sigmoid(up(·))` → `.mean(dim=-2)`; `injection = 2·sigmoid(block_inject_weight(x)/hc_count)`; residual `hyper_input + out·injection` per stream — modeling:941-969, 1236-1243 | `silu`/`sigmoid` lora chain with `/hc` scales — qwen4exp.cpp:285-345 | **MATCH** |
+
+### Verdict tally
+
+**17 MATCH, 0 MISMATCH, 3 UNVERIFIABLE** (U1 tie-break order, U2 GGUF +1 fold, U3 RoPE table bits — all minor; see §2).
+
+Two systematic, engine-wide observations that are **not** mismatches but bound every comparison:
+
+- **dtype path**: HF computes elementwise math in bf16 (model dtype) and upcasts only norms/softmax/delta-rule to f32; crow-nest dequantizes once and stays f32 throughout; llama.cpp runs its native f16/f32 mix. crow-nest is everywhere ≥ HF precision at the sites compared, so no crow-side correction is indicated by this diff.
+- **reduction order**: every f32 sum (softmax Z, 128-dim dots, 10-rank MoE combine) has a different but deterministic order per engine. This is bit-level noise (~1 ulp/class), the existing parity gates' domain — not a formula divergence.
+
+---
+
+## 2. UNVERIFIABLE items, with reasons and severity
+
+**U1 — top-k tie-break vs `torch.topk` (severity: MEDIUM for long contexts, ZERO for current oracle rows).**
+crow-nest resolves exact-f32 score ties by lowest index in all three selector kernels (kernels.rs:2513-2542, 2747-2749) and the router (kernels.rs:2965). `torch.topk`'s index order among equal values is an implementation detail of the CUDA sort, not a contract (modeling:695, 911). Exact ties are measure-zero on continuous router logits, but QSA **block scores can tie exactly** (e.g. relu-clamped zero scores, identical pooled keys after e4m3/bf16 rounding), and in the sparse regime (ncb > 512, i.e. prompts > 2048 tokens) a tie straddling the budget boundary selects a *different block* → a different 4-token set in the attention mask. The oracle rows (298/607 tokens) are entirely in the dense regime (ncb ≤ 151 < 512), so no oracle row can detect this — that is precisely the #68 long-context coverage gap. Probe P1 pins the engine side; the torch side needs one venv experiment (P1b).
+
+**U2 — llama.cpp GGUF-side `+1` fold for zero-centered RMSNorm (severity: INFO).**
+llama.cpp's graph multiplies RMSNorm weight directly (llama-graph.cpp:1604-1605), so the `(1+w)` fold must happen at GGUF conversion for the zero-centered qwen4exp norms (HF applies `1+w` at runtime, modeling:177). The converter script is not present in the shallow clone (`convert_hf_to_gguf.py` is a 312-line shim; the real converter moved). The fold is the long-standing convention for this family (qwen3next historically did `weight + 1.0` at conversion), so I file this as an unverified micro-detail of llama.cpp, not of crow-nest. No action.
+
+**U3 — RoPE table bit-provenance (severity: NEGLIGIBLE).**
+crow-nest builds the table in host f32: `10_000_000f32.powf(−2j/64)` then `t·inv`, `(cos,sin)` f32 (manager.rs:300-311). HF computes `base ** (arange/64)` in torch f32 then f32 matmul with positions (modeling:115, 125-136). Same formula, same f32 class, but `powf` vs torch's pow can differ by ≤1-2 ulp per `inv_freq`, which after `t·inv` and cos/sin is still ~ulp-level in the rotated 64 dims. Formula MATCH; exact-bit equality unverified and almost certainly immaterial. Optional probe P3.
+
+---
+
+## 3. Probe plan (for every UNVERIFIABLE, plus the numerics-class items)
+
+Pattern: the existing `engine/src/bin/router_probe.rs` / `qsa_probe.rs` shape — no model, no container, no engine lock; `cuda::compile(kernels::KERNEL_SRC)` + `launch_v` on synthetic buffers; deterministic `sample::Rng`; explicit pass line. All new files; no existing source touched.
+
+### P1 — `qsa_tie_probe` (implements U1's engine side) — **IMPLEMENTED AND RUN (2026-09-20, RTX 5090): 7/7 PASS**
+- **Input**: one score row per case, `ncb ∈ {400..3000}`, K = 512 (production `QSA_BLOCK_TOPK`), `cap = 65536`, `sel_max = QSA_SEL_MAX` (2051); constructed so a group of 8-24 blocks shares one **bit-identical** f32 value that straddles rank 512 (i.e. the K-th largest value is tied across the boundary), plus a boundary-exact case (tie group exactly consumed by the fill), an all-tied case, and dense-regime cases; tails 0..3.
+- **Reference (host Rust)**: select blocks by (value desc, index asc) — the documented-intent torch rule — then emit 4 tokens per selected block in ascending block order + ascending tail (the engines' emit contract).
+- **Run**: `qsa_select`, `qsa_select_fast`, and the `qsa_select_par_h`+`qsa_select_par_e` pair (via `gen::launch_qsa_par_e`, h1 zeroed between cases), grid/block exactly as gen.rs launches them.
+- **Result**: all three selectors byte-identical to the reference on every case, including all-tied and boundary-exact; ties resolved lowest-index; h1 re-zeroed; poison beyond `sel_n` untouched. The engine side of U1 is pinned deterministic; only the torch side (P1b) remains open.
+- **Also found** (see §6): the plain radix `qsa_select` has no dense shortcut and breaks for K > ncb — latent, env-gated. **FIXED 2026-09-21 (issue #97, F1)**: `qsa_select` now carries the same `if (K >= ncb)` dense shortcut as `qsa_select_fast`/`qsa_select_par_e`; the probe's dense cases run through the plain radix too (the pre-fix run reproduced `sel_n 3 != ref 1603`, the post-fix run is 7/7 PASS with all three selectors agreeing byte-for-byte). Default arms (fast/par) untouched — `qsa_probe` 4928 rows 0 differences, `attn_path_probe` 3/3, `router_probe` PASS, `cargo test` 265/265 after the change.
+- **Command**: `LD_LIBRARY_PATH=$HOME/.local/share/crow/cuda/lib cargo run --bin qsa_tie_probe` (from `engine/`).
+
+### P1b — torch tie-order experiment (venv, no code) — **RUN 2026-09-21 (torch 2.14.0+cu130, RTX 5090): torch CUDA matches crow's lowest-index SET rule on every ambiguous case; CPU does not**
+- **Setup**: the same planted-tie rows as P1 (bit-identical 0.5 straddling rank 512, `ncb ∈ {600..65536}`, tie groups 2..64 scattered, 500/505 above; boundary-exact; all-tied; plus the REALISTIC tie source — relu-clamped exactly-`+0.0` scores, 300 zeros among 600 blocks, need 212), each through `torch.topk(row, min(512, ncb))` exactly as modeling:695 calls it, on CPU and CUDA, with 3x repeatability checks and 60 random ambiguous replicates.
+- **Verdict (SET — the only thing the mask consumes)**: **CUDA matches the lowest-index rule in every ambiguous case** — all fixed cases, 60/60 random replicates, and the relu-zero case; results repeat bitwise across runs. **CPU diverges**: 49/60 random replicates (its quickselect path is not stable) and the straddle-24/ncb3000 fixed case pick a different subset of the tie group. The oracle (`ref_engine_logits.py`) runs on CUDA, so current crow-vs-oracle parity cannot be affected by the CPU behavior; a CPU oracle would diverge from crow on ~18% of planted tie rows.
+- **Order (informational — HF scatters via `index_select`, order never reaches the mask)**: CUDA emits equal values in ascending index order (same as crow's ascending emit); CPU emits an unordered permutation.
+- **Contract status**: still an implementation detail (torch does not document tie order), so this is an empirical alignment on the current stack, not a proof. Frequency of exact ties in real long-context rows is not measurable with current instruments (oracle rows are 298/607 tokens, dense regime) — #90's 100k-context KLD instrument is the tool for that.
+- **Consequence quantification (worst case, 2048-token list)**: a tie-driven block swap exchanges 4 of 2048 list entries with equal indexer scores but arbitrary content. Numerically (f32 softmax over N(0,σ) logits): 4 tokens sitting AT the row max hold 3.9% of mass at σ=1 and 63.0% at σ=4; with a +2-logit content advantage the swapped-in block draws 23.2% / 99.98%. I.e. the tie itself is harmless when content is exchangeable, but a swapped block whose keys happen to align with the query can redirect O(10–100%) of the attention mass — bounded by the softmax mass of any 4 tokens, as with any top-k boundary sensitivity, not specific to the tie mechanism.
+- **Bonus (U3 cross-check)**: torch's `inv_freq` (`1.0 / base**e`) vs crow's (`base**(-e)`, the bits printed by `rope_table_probe`): 17/32 bitwise equal, the other 15 differ by exactly 1 ulp (reciprocal-of-pow vs pow-of-negated-exponent); both ≤ 1 ulp off the correctly-rounded value. So the two engines' RoPE arguments `f32(t·inv)` can differ by ~1 product-ulp — at oracle-row positions (t ≤ 607) a ≤ 3.7e-5 rad phase difference in the worst rotated pair, ulp-class noise inside the existing parity gates.
+
+### P2 — GDN prefill numerics-class probe (recurrent vs HF chunked) — **IMPLEMENTED AND RUN 2026-09-21 (RTX 5090): PASS, rel_L2 ≤ 4e-7 at every T — 26x inside the 1e-5 line, no growth with T**
+- **Input**: normed q/k (post-`l2norm_repeat` semantics: unit-L2 + 1e-6 eps, q pre-scaled 1/√128 — the exact kernel-input class), v/g/β drawn O(1) (v ~ N(0,1), β ∈ (0.2, 0.8), g ∈ (−0.05, 0] i.e. per-token decay ∈ (0.951, 1]), T ∈ {64, 512, 4096}, 48 heads; dumper `/tmp/p2_gdn_dump.py` in `.venv-oracle` (torch 2.14.0+cu130; fla absent so the modeling functions run their pure-torch bodies — verified by import guard), dumps `/tmp/crow-gdn-p2/gdn_T{T}.bin`.
+- **Reference**: BOTH torch forms on the same f32 bits — `torch_chunk_gated_delta_rule` (chunk 64, the HF production prefill) and `torch_recurrent_gated_delta_rule` (crow's algorithm class, different device reduction order; the crow-vs-recurrent gap is the same-algorithm device floor, and torch's own rec-vs-chunk gap is the class floor measured without crow in the loop).
+- **Run**: crow `delta_rule_persist_r` in its production launch shape (grid 48 heads × 128 threads, gen.rs:2362), init_p=1, on the dumped bits.
+- **Results (rel_L2 whole-tensor; worst head in parens)**:
+  - crow out vs **chunked**: 3.64e-7 (4.06e-7) at T=64, 3.88e-7 (4.18e-7) at T=512, 3.92e-7 (4.00e-7) at T=4096; max_abs ≤ 9.0e-8 — **PASS at every T with a 26x margin to the 1e-5 line** (and 250x to the 1e-4 decision line).
+  - crow out vs torch recurrent (device floor): 2.46e-7 / 2.56e-7 / 2.57e-7 — the recurrent-vs-chunked *class* itself contributes only ~1.4e-7 on top of the floor.
+  - torch's own rec-vs-chunk floor (dumper): 3.14e-7 / 3.41e-7 / 3.45e-7 — crow-vs-chunked (3.9e-7) is the same class as torch-vs-torch (3.5e-7); crow's recurrent prefill is numerically indistinguishable from either torch form.
+  - **final state S vs chunked**: 2.52e-7 / 2.70e-7 / 2.66e-7 — **flat across T ∈ {64→4096}: NO growth with sequence length** on these inputs; ‖S‖_F stays ≈ 175→180 (the delta rule self-bounds S: it is a decayed sum of rank-1 k⊗δ updates with |k| = 1 and |δ| ≤ β·|v−kv|, and g ≤ 0 contracts it). The hypothesized long-context state-compounding risk does not materialize at T = 4096 on O(1) inputs.
+- **Verdict**: the GDN prefill numerics class (recurrent vs chunked) is ~4e-7 rel_L2 — three orders below the layer-3 residual (2.9% = 2.9e-2). Per §6's attribution rule, the layer-3 residual is now firmly attributable to weight quantization (FP4/BF16 keeps), not to GDN prefill algorithm drift. No crow-side change indicated; the probe stays as the regression gate.
+- **Commands**: dumper `.venv-oracle/bin/python /tmp/p2_gdn_dump.py` (re-creates the dumps), then `LD_LIBRARY_PATH=$HOME/.local/share/crow/cuda/lib cargo run --release --bin gdn_chunk_probe` (from `engine/`; the dumps are inputs — re-run the dumper first if /tmp was cleared).
+
+### P3 — RoPE table ULP probe — **IMPLEMENTED AND RUN 2026-09-21 (host-only): PASS, ≤ 1 ulp**
+`rope_table_probe` (engine/src/bin/rope_table_probe.rs) recomputes the manager.rs:300-309 table byte-for-byte (host f32 `powf`/mul/`cos`/`sin`) over the full 262144 positions × 32 pairs and measures, in ulp:
+- **inv_freq**: crow `10_000_000f32.powf(-2j/64)` vs f64 `powf` rounded to f32 — **max 0 ulp** (glibc's f32 powf is correctly rounded here; all 32 values are the f64-rounded result; bits printed by the probe and cross-checked against torch in P1b).
+- **cos/sin, shared-argument reference (the gate)**: `cos_f64(f64::from(f32(t·inv)))` vs the table's `cosf(f32(t·inv))` — **max 1 ulp** (cos at t=8/j=4, sin at t=1/j=3). The reference deliberately shares the table's own f32 argument because that argument is engine-identical by construction (every f32 engine, HF included, forms `t·inv` as a single-rounded f32 product).
+- **end-to-end f64 reference (report-only)**: powf+product+cos/sin all in f64 vs the f32 table — max ~2.0e9 ulp at t≈2.5e5, first >2 ulp already at t=3..5. This is the classic RoPE-table-in-f32 property (the product rounding is amplified by the argument magnitude — 262143·2^-24 ≈ 0.0156 rad phase), which every f32 table shares including HF's; it measures table-vs-true-math, not crow-vs-HF, and is not gated.
+- **golden vector**: the device `rope` pairing formula vs a host rotate_half (HF form, duplicated cos/sin) on 4 deterministic rows — **bitwise equal** at every t sampled (sub vs add-of-negated-product is an exact IEEE identity; Rust contracts neither into an FMA). Info: the pairing arithmetic vs f64 ops max 3 ulp (three f32 roundings with cancellation — expected, not an engine comparison).
+**Verdict: U3 closed at ≤ 1 ulp on everything crow controls; the pairing formula is exactly HF's rotate_half.** (`cargo run --release --bin rope_table_probe`.)
+
+### P4 — `attn_path_probe` (prefill-vs-decode QSA attention row equality) — **IMPLEMENTED AND RUN (2026-09-20, RTX 5090): 3/3 PASS**
+- **Input**: one query row (24 heads × 256, O(1)), a bf16-mode KV cache (`tmax = 4096`) filled with distinct bf16-truncated f32 values, and one selected list of n = 2051 ascending distinct tokens (< tmax) — the sparse-regime worst case.
+- **Run**: prefill form `attn_sel` vs decode form `attn_sel_split` (S = 1, 2, 8 splits) + `attn_merge`, launched exactly as gen.rs does (grid (24, T[, S]), block 256, device scalars).
+- **Measured floor**: rel_L2 1.08e-6 (S=1), 8.98e-7 (S=2), 7.97e-7 (S=8); max_abs ≈ 1.1e-7 on O(1) outputs. The prefill-vs-decode divergence is real but two orders below the 1e-5 line and three below the layer-3 residual (2.9%) — it cannot explain the residual.
+- **Command**: `LD_LIBRARY_PATH=$HOME/.local/share/crow/cuda/lib cargo run --bin attn_path_probe` (from `engine/`).
+
+### Existing gates that already cover other rows
+- `parity` / selftest goldens (layer-0/layer-3 max_abs/rel_L2) — the promotion path for any future fix; row 5/21's engine-internal bit-differences are already inside those gates' tolerance.
+- `qsa_probe` — par-vs-fast selector byte equality on random + narrow + tied distributions (complements P1's reference-defined semantics).
+- `router_probe` — gemv vs dense router forms, top-10 set agreement.
+
+---
+
+## 4. Constant cross-check (config.json vs crow-nest pins)
+
+| constant | config.json | crow-nest | site |
+|---|---|---|---|
+| `rms_norm_eps` | 1e-06 | `1e-6f` (every norm) | kernels.rs:1426, 1444, 1599, 1769, 2352, 3413 |
+| `rope_theta` | 10 000 000 | `10_000_000f32` | manager.rs:303 |
+| `partial_rotary_factor` | 0.25 → 64 of 256 | `ROPE_PAIRS = 32` | geo.rs:26 |
+| `head_dim` | 256 | `AHD = 256`; scale 0.0625 | geo.rs:18, kernels.rs:1860 |
+| `num_attention_heads` | 24 | `NQ = 24` | geo.rs:16 |
+| `num_key_value_heads` | 2 | `NKV = 2`; `kvh = head/12` | geo.rs:17, kernels.rs:1850 |
+| `output_gate_type` | sigmoid | `1/(1+e^{-z})` | kernels.rs:1770, 2312 |
+| `hidden_act` | silu | `x/(1+e^{-x})` | kernels.rs:1448-1449, 1548 |
+| `indexer_budget` | 2048 | `QSA_BLOCK_TOPK·QSA_COMPRESS` | geo.rs:88-90 |
+| `indexer_compress_ratio` | 4 | `QSA_COMPRESS = 4` | geo.rs:88 |
+| `indexer_n_heads` / `kv_heads` / `head_dim` | 4 / 1 / 128 | `QSA_HEADS/KVHEADS/HD` | geo.rs:84-86 |
+| `linear_{k,v}_heads`, head dims | 16 / 48 / 128 / 128 | `GDN_KHEADS/VHEADS/GD` | geo.rs:13-15 |
+| `num_experts` / per-tok | 512 / 10 | `E` / `TOPK` | geo.rs:7-8 |
+| `hc_count` / `hc_lowrank` | 4 / 320 | `HCN` / `LOWRANK` | geo.rs:4, 6 |
+| `max_position_embeddings` | 262144 | `context` default; score cap 65536 blocks | geo.rs:163, gen.rs:2030 |
+
+All pins agree with the config. The pinning *practice* (vs metadata-read) remains the T12 concern — the values themselves are correct today.
+
+## 5. Findings beyond the diff (engine-internal, discovered by the probes)
+
+**F1 — `qsa_select` (plain radix) breaks in the dense regime, K > ncb (severity: LOW — env-gated, unreachable by default) — FIXED 2026-09-21 (issue #97).**
+Found by `qsa_tie_probe` case "dense ncb400" on 2026-09-20: `sel_n = 3` instead of 1603. Mechanism: the radix threshold search (kernels.rs:2481-2494) computes `need = K - above` and scans buckets for `cum + c >= need`; with K = 512 > ncb = 400 the condition is never met, `B` stays at its 255 initializer, and the bitmap/fill logic degenerates. `qsa_select_fast` (kernels.rs:2596-2604) and `qsa_select_par_e` (2836-2842) both guard `if (K >= ncb)` with the dense shortcut and are correct. Production paths never reach the plain radix: prefill defaults to `qsa_select_fast` (`CROW_QSA_FAST` on) and decode to the par pair (`CROW_QSA_PAR` on). Reachable only via `CROW_QSA_FAST=0` **and** `CROW_QSA_PAR=0` **and** a prompt of ≤ 2048 tokens. Not a numerics mismatch vs HF (the default arms match HF exactly).
+**Fix (2026-09-21, same session as this doc's probes)**: `qsa_select` now carries the same two-line dense shortcut (`if (K >= ncb) { emit 0..=pos; sel_n = pos+1; return; }` — kernels.rs, immediately after the `K = *k_p` read), verbatim the guard `qsa_select_fast` has had all along. Regression proven both ways in `qsa_tie_probe`: the probe's dense cases now run through the plain radix arm (previously skipped with a note) — before the fix the run prints `dense ncb400 tail3 -> FAIL qsa_select: sel_n 3 != ref 1603`, after it 7/7 PASS with all three selectors byte-identical. Default arms pinned untouched: `qsa_probe` 4928 rows / 0 differences, `attn_path_probe` 3/3 PASS, `router_probe` PASS, `cargo test` 265/265 green.
+
+## 6. Conclusion for the acceptance metric
+
+(2026-09-23: this conclusion is about formulas only. The engine defects §7 records, the activation floor and the PLE row read, lie outside what this diff compared.) The #89 hypothesis — a wrong-formula constant or op in GDN normalization or QSA attention ("the engine numerics suspect of expert-requant.md §8") — is **acquitted on every line compared**: no MISMATCH was found, including the exact bug class of llama.cpp #28068 (crow-nest's `l2norm_repeat` was already the rsqrt form). Measured floors so far: the prefill-vs-decode QSA attention divergence is ≤ 1.1e-6 rel_L2 at the full sparse list length (P4), two orders below the 1e-5 line and three below the layer-3 residual; the engine-side QSA tie-break is deterministic lowest-index across all three selectors (P1). The remaining open risk is (a) the tie-break order vs `torch.topk` at exact score ties in the sparse regime (U1/P1b, untestable by the current dense-regime oracle rows), (b) the recurrent-vs-chunked GDN prefill numerics class (P2, planned), and (c) generic f32-order noise. If the layer-3 attention residual (2.9% rel_L2) does not move after P2 measures its floor, the residual is attributable to weight quantization (FP4/BF16 keeps), not attention/GDN formula drift — that attribution is exactly what these probes provide. Fixes, if ever needed, go through the standard env-gated → bit-parity promotion path and become model-read via #T12. One engine-internal latent defect was found and filed without fixing it (F1, §6).
+
+**Follow-up 2026-09-21 (acceptance doc: docs/acceptance/issue-89-followup.md).** F1 fixed (#97) with regression proven; P1b run — torch CUDA matches crow's lowest-index SET rule on every ambiguous case tested (CPU does not; the oracle is CUDA so parity is unaffected); P3 run — table ≤ 1 ulp everywhere crow controls it, pairing formula bitwise HF's rotate_half (U3 closed); P2 run — see §3 P2 for the recurrent-vs-chunked floor.
+
+**Correction 2026-09-23.** P2's verdict (§3), which attributes the layer-3 residual to weight quantization, and the "acquitted" reading of §6 hold only for the formulas this diff compared. Two defects outside its scope were found on 2026-09-23 (§7). Neither is a formula mismatch: one is how activations are ENCODED to NVFP4, the other is which bytes are READ for a PLE row. A formula diff cannot see either.
+
+## 7. The expert/activation path and the PLE read (2026-09-23, #91)
+
+The #89 diff covered the dense GDN/QSA formulas. On 2026-09-23 the expert/activation path and the
+PLE layer were covered by two further readings. Both found a defect, and both are fixed on branch
+`release-2026-09-23`. All multi-site numbers below come from the multi-site probe
+(`tools/multisite-corruption-probe.py`, 23 corrupt tool-call sites of robin's 2026-09-23 diorama
+session, teacher-forced, prompts 18k to 103k tokens, -M container, hot-set sidecar
+`hotsets-M-longctx2100-n160.json`, KV fp8_e4m3, one serve boot per arm;
+`decode_out/meas-0923/multisite/` in the measurement worktree). "Corrupt wins" counts sites where
+lp(corrupt) > lp(correct). The probe is described in `docs/measurement-coverage.md`.
+
+### 7.1 The activation floor (fixed `488a840`, with `5c6891a`)
+
+- **Finding.** The NVFP4 activation cascade (#10) encodes each 16-element sub-block with a ue4m3
+  scale. The smallest ue4m3 scale is 2^-9, and the cascade had no per-row global scale. So every
+  level had an absolute error floor of about 4.9e-4 per element. Small rows (SwiGLU h2, small
+  `mixed` rows) were quantized at 7 to 23 % mean relative error instead of about 1e-3 (commit
+  message of `488a840`).
+- **Fix `488a840`.** `quant_x_fp4` / `quant_tiles` compute a per-row power-of-two pre-scale:
+  they choose k so that amax·2^k is in [1024, 2048), with k clamped to [-64, 64] and k = 0 for
+  zero or non-finite rows. They store the f32 factor 2^-k after the three levels
+  (`XQ_ROW(bpr) = bpr*108 + 4`). All ten FP4 MMA consumers compute `(acc*gs)*rs`. With k = 0 the
+  result is bit for bit the old cascade. Host twin, measured cascade mean relative L2 on rows of
+  640 N(0,σ) values: σ 0.004: 7.08e-2 -> 9.75e-4; σ 0.0012: 2.34e-1 -> 9.81e-4; σ 3:
+  1.07e-3 -> 9.79e-4.
+- **Consequence for `CROW_QFUSE`.** The fused producers never see a whole row, so they store
+  the factor 1.0 and keep the old floor. `CROW_QFUSE` is therefore opt-in since `488a840`
+  (exact `1`). Before that, unset meant all fused (the #19i default since 2026-09-13). The
+  unfused default's decode speed is not measured. Every parity sha of record moves, and no new
+  shas of record exist yet.
+- **Fix `5c6891a`.** `enc_ue4m3_up` returned the E4M3 NaN byte 0x7F for block scales in
+  (448, 480]. That band now saturates to 0x7E (448).
+- **Measured effect (2026-09-23, multi-site probe, dense BF16 overlay, pinned 50 GiB WC in both
+  arms).** Before the PLE fix, the `actfloor` arm (`488a840`) had 9/23 corrupt wins, against
+  12/23 for the `dense` arm. Mean margin was +0.45 against -0.23, and correct top-1 was 13
+  against 11. The fix is real, but it moved the count by 3 sites.
+
+### 7.2 The PLE row-offset read (fixed `85a48e7`)
+
+- **Instrument.** The per-layer diff against llama.cpp (`tools/layerdiff/`, README there). It
+  compares crow-nest (the `488a840` build before the PLE fix, dense BF16 overlay, pinned 50 GiB
+  WC, `CROW_GRAPH=0`) with llama.cpp UD-Q2_K_XL (`ldump`) at two corrupt sites: mat44-a149
+  (103,559 tokens) and N33-a131 (98,015 tokens).
+- **Reading (2026-09-23).** Layer 0 matches, with residual cos 0.9985 / 0.9992. Layer 1, the
+  PLE layer, splits:
+  - gathered PLE embedding: cos -0.01 to the GGUF row
+  - PLE contribution: cos -0.03 / -0.04
+  - residual: cos 0.23 / 0.21
+
+  The residual never recovers. At layer 47 its cos is 0.74 / 0.54.
+- **Cause.** The PLE n-gram shards of the -M container are a FLAT stream of 64-value NVFP4
+  blocks, with 160 values per row. `ensure_rows`, the batched warm fetch and the prefill
+  prefetch read row r at byte `row*108`, i.e. 3 padded blocks. So every token got the n-gram
+  embedding of unrelated rows. That read is present since the engine tree's first commit
+  (`7ba3ed6`, 2026-09-05, `gen.rs:990`).
+- **Fix `85a48e7`.** `gen::ple_row_span` / `gen::ple_row_pad` read the row at value 160·r and
+  repack it into the padded 3-block layout that `gather_ple_fp4` and the row cache use (lib tests
+  `tests_ple_row`). With the flat read, re-dumped the same day (`compare-dense-flat.json`):
+  - gathered embedding: cos 0.993
+  - layer-1 residual: cos 0.997 to 0.999
+  - layer 47: cos 0.91 / 0.92
+  - margins: -0.81 / -7.77 -> +12.53 / +12.71
+
+  llama.cpp reads +14.60 / +14.16 in the same `ldump` dumps. The gap left at layer 47 is not
+  attributed, because the two weight quantizations differ.
+- **Multi-site (2026-09-23).** With `plefix` (`85a48e7`, dense overlay, pinned 50 GiB WC):
+  - corrupt wins: 4/23, and 0/9 on fresh-context sites
+  - mean margin: +8.40
+  - correct top-1: 17
+
+  llama.cpp UD-Q2_K_XL through llama-server scored 4/23, 1/9 fresh, +8.29 and 18. The 4 sites
+  crow-nest still loses all have contaminated context. llama.cpp also loses three of them. There
+  is NO multi-site number for the bare container with the fix, because that boot panicked with
+  `CUDA_ERROR_INVALID_CONTEXT`.
+- **Why the #89 diff could not see it.** The formulas are right. The engine applied them to the
+  wrong bytes. That is a data-layout read, outside what a formula diff compares. The lesson is in
+  `docs/improve-loop.md`: diff per layer against a reference engine before running precision
+  arms.
+
+Also on the branch, from the same #91 audit: `c4d37ca`. For prefill chunks shorter than the
+window, the GDN conv state (3 rows) and the PLE state (9 rows) did not shift their older slots.
+Robin's 2026-09-23 run hit this on 7 of 612 requests. No multi-site arm isolates it.

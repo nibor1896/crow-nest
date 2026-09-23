@@ -71,6 +71,7 @@ mod dense_overlay;
 mod expert_overlay;
 mod expert_requant;
 mod imatrix;
+mod layer_rule_overlay;
 mod requant_check;
 
 const E2M1_GRID: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
@@ -504,7 +505,7 @@ fn quantize_nvfp4(values: &[f32], mode: ScalesMode) -> (Vec<u8>, f32, QuantStats
     (out, global, stats, sse_ceil)
 }
 
-const HELP: &str = "usage: converter [--scales ceil|mse] <model-dir | file.safetensors> <out.cnq>\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)";
+const HELP: &str = "usage: converter [--scales ceil|mse] <model-dir | file.safetensors> <out.cnq>\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter layer-rule-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) --arm attn-v-out|ffn-down-rule|ffn-down-all\n  builds a bf16 overlay container for one llama.cpp-shaped layer-rule arm (#91 phase 1)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)";
 
 /// `converter imatrix-show <imatrix.gguf> [tensor ...]` — #79. Read-only: the kv block, the
 /// tensor count, and for every named tensor its dims, its data offset, its first eight values,
@@ -607,7 +608,7 @@ fn main() {
         }
         std::process::exit(dense_overlay::run(&all[1..]));
     }
-    // #79: and the same rule once more for the routed-expert overlay. Three subcommands now
+    // #79: and the same rule once more for the routed-expert overlay. Four subcommands now
     // sit in front of the conversion path and none of them can be reached by accident: each
     // one demands its own word as argument zero.
     if let Some(at) = all.iter().position(|a| a == "expert-overlay") {
@@ -616,6 +617,16 @@ fn main() {
             std::process::exit(2);
         }
         std::process::exit(expert_overlay::run(&all[1..]));
+    }
+    // #91 phase 1: the llama.cpp layer-rule arms, as bf16 overlays over the dense path. Same
+    // additive rule as the three above: its own word as argument zero, and the conversion path
+    // below never sees it.
+    if let Some(at) = all.iter().position(|a| a == "layer-rule-overlay") {
+        if at != 0 {
+            eprintln!("unexpected argument {} before layer-rule-overlay\n{}", all[0], layer_rule_overlay::HELP);
+            std::process::exit(2);
+        }
+        std::process::exit(layer_rule_overlay::run(&all[1..]));
     }
     // #79: read the importance matrix back out and print it, so its numbers can be checked
     // against an independent (stdlib Python) GGUF reader.

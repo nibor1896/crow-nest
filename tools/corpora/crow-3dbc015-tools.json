@@ -1,0 +1,589 @@
+[
+ {
+  "type": "function",
+  "function": {
+   "name": "read_file",
+   "description": "Read a UTF-8 text file. Give start_line and end_line for a range -- everything read costs prefill time, so read the part you need, not the whole file. search_text returns line numbers for exactly this.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path to the file."
+     },
+     "start_line": {
+      "type": "integer",
+      "description": "First line, 1-based."
+     },
+     "end_line": {
+      "type": "integer",
+      "description": "Last line, inclusive."
+     }
+    },
+    "required": [
+     "path"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "read_image",
+   "description": "Look at an image file -- a screenshot, a render, a diagram. Use it to CHECK your own work when a step says it has to look right; read_file cannot open one. Needs a model with a projector; on one without, this refuses and says so.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path to the image."
+     }
+    },
+    "required": [
+     "path"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "render_page",
+   "description": "Open a local page or a URL in a real browser and get back a screenshot plus the console output. Use it to SEE what you built -- then read_image the screenshot. Do not drive a browser through run_command; this one is supervised and always comes back.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "A file in the working area, or an http(s) URL."
+     },
+     "wait_ms": {
+      "type": "integer",
+      "description": "How long the page may take to settle. Default 4000."
+     },
+     "width": {
+      "type": "integer",
+      "description": "Viewport width, default 1280."
+     },
+     "height": {
+      "type": "integer",
+      "description": "Viewport height, default 800."
+     }
+    },
+    "required": [
+     "path"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "write_file",
+   "description": "Write a file whole, creating directories as needed. An existing file must have been read first in this session; otherwise the call is refused. For a file too large for one call, write the skeleton here and grow it with append_file -- never shell-heredoc big content.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path to write."
+     },
+     "content": {
+      "type": "string",
+      "description": "Full new contents."
+     }
+    },
+    "required": [
+     "path",
+     "content"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "append_file",
+   "description": "Append content to a file, creating it if missing, and return the new total size. THE way to build a large file in parts: write_file the head, then one append per section -- each append is a clean round instead of a shell heredoc that breaks mid-escape. No read-first guard: appending destroys nothing.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path to append to."
+     },
+     "content": {
+      "type": "string",
+      "description": "Text to append at the end."
+     }
+    },
+    "required": [
+     "path",
+     "content"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "edit_file",
+   "description": "Replace one exact occurrence of 'old' with 'new'. The file must have been read first. Fails if 'old' is absent or appears more than once.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "File to edit."
+     },
+     "old": {
+      "type": "string",
+      "description": "Exact text to replace, unique in the file."
+     },
+     "new": {
+      "type": "string",
+      "description": "Replacement text."
+     }
+    },
+    "required": [
+     "path",
+     "old",
+     "new"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "list_dir",
+   "description": "List the entries of a directory.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Directory, default the working directory."
+     }
+    },
+    "required": []
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "find_files",
+   "description": "Find files by name pattern, recursively.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "root": {
+      "type": "string",
+      "description": "Where to start."
+     },
+     "pattern": {
+      "type": "string",
+      "description": "Glob on the filename, e.g. *.cpp"
+     }
+    },
+    "required": [
+     "pattern"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "search_text",
+   "description": "Search file contents by regular expression, recursively.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "root": {
+      "type": "string",
+      "description": "Where to start."
+     },
+     "pattern": {
+      "type": "string",
+      "description": "Regular expression."
+     },
+     "glob": {
+      "type": "string",
+      "description": "Only files matching this glob, e.g. *.py"
+     }
+    },
+    "required": [
+     "pattern"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "run_command",
+   "description": "Run a shell command locally and return its exit code and output. Killed after 120s. On Linux the shell is bash -- use ls and grep.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "command": {
+      "type": "string",
+      "description": "The command line."
+     },
+     "cwd": {
+      "type": "string",
+      "description": "Working directory."
+     }
+    },
+    "required": [
+     "command"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "git_status",
+   "description": "The repository under the working area: current branch, ahead/behind its upstream, every changed file, and the +/- line totals. Read-only; start here before any commit.",
+   "parameters": {
+    "type": "object",
+    "properties": {},
+    "required": []
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "git_diff",
+   "description": "The uncommitted changes as a unified diff -- working tree and index against HEAD. Read-only.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Limit the diff to one file or directory."
+     },
+     "staged": {
+      "type": "boolean",
+      "description": "Only what is already staged for commit."
+     }
+    },
+    "required": []
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "git_log",
+   "description": "The last commits, newest first: hash, date, subject, author.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "count": {
+      "type": "integer",
+      "description": "How many, default 10, at most 50."
+     }
+    },
+    "required": []
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "git_commit",
+   "description": "Stage the named paths and commit them with the message. Asks the user first, at every release level. Paths are staged exactly as named -- nothing else is swept in.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "message": {
+      "type": "string",
+      "description": "The commit message."
+     },
+     "paths": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "description": "Files to stage for this commit. Omit to commit what is already staged."
+     }
+    },
+    "required": [
+     "message"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "git_push",
+   "description": "Push a branch to its remote. This leaves the machine, so it asks the user at every release level, every single time.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "remote": {
+      "type": "string",
+      "description": "Remote name, default origin."
+     },
+     "branch": {
+      "type": "string",
+      "description": "Branch, default the current one."
+     }
+    },
+    "required": []
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "github_connect",
+   "description": "Connect the user's GitHub account over the OAuth device flow: hand them a code for github.com/login/device, keep polling in the background, and store the token owner-only next to the provider keys once they authorize. Needs github_client_id in providers.json.",
+   "parameters": {
+    "type": "object",
+    "properties": {},
+    "required": []
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "web_search",
+   "description": "Look something up beyond this machine -- a library version, a flag added recently, anything past your training. WHAT THIS REACHES DEPENDS ON THE INSTALLATION AND NOT ON THE QUESTION: with a general index configured it is the open web; with none it is an index of code, packages and reference, which settles a version or a flag and answers nothing about the world. The result says which on its first line -- read that line before you build on a hit, because without a general index a match can be a keyword collision rather than an answer. Read the snippets first: they usually settle it. Answer from what you read and name the sources you used. A list of links is not an answer, unless the user asked for the link itself. Weigh what you found: a registry or an official page settles a fact, one forum post or one pull request in somebody else's project does not -- say plainly that something is unconfirmed rather than presenting it as a specification. If the thing you were asked about does not appear in any source, say it was not found. Fetch at most 4 pages per question -- each one costs about two minutes.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string",
+      "description": "What to search for."
+     },
+     "count": {
+      "type": "integer",
+      "description": "How many results, default 6, at most 10."
+     }
+    },
+    "required": [
+     "query"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "fetch_url",
+   "description": "Fetch one http(s) page and return its readable text, markup removed. Use it on a result from web_search that the snippet did not settle, or on a URL the user gave you.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "url": {
+      "type": "string",
+      "description": "An http or https URL."
+     }
+    },
+    "required": [
+     "url"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "memory",
+   "description": "Remember something across sessions, or correct what you remember. Save what you would want to know at the START of the next session and cannot cheaply look up again: how this project is laid out, its conventions and commands, a tool quirk you had to work around, a correction the user made, work you finished. Do NOT save what a single read would answer, raw output, or anything that is only true for this one turn. Entries are short and dense -- pack related facts into one line rather than adding a line each. The store is small and never trimmed for you: when it is nearly full, use 'replace' to merge two entries into one shorter entry before you add.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "action": {
+      "type": "string",
+      "description": "add, replace or remove."
+     },
+     "target": {
+      "type": "string",
+      "description": "'memory' for facts about this project and machine, 'user' for who the user is and how they want to be worked with."
+     },
+     "content": {
+      "type": "string",
+      "description": "The new entry, for add and replace."
+     },
+     "old_text": {
+      "type": "string",
+      "description": "For replace and remove: a SHORT substring that occurs in exactly one entry. Not the whole entry."
+     }
+    },
+    "required": [
+     "action"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "skill",
+   "description": "Your own procedures, kept between sessions. The prompt lists the ones you have by name and description only -- call this with action=read to get the steps of one before you follow it. Call action=save when a conversation has worked out a repeatable WAY of doing something that would otherwise be rediscovered: the order of steps, the flags that worked, the check that catches the usual mistake. Do NOT save facts about this project -- those are `memory` -- and do not save a summary of what just happened. Rewrite an existing skill with save rather than adding a second one beside it.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "action": {
+      "type": "string",
+      "description": "read, save or remove."
+     },
+     "name": {
+      "type": "string",
+      "description": "Lower-case letters, digits and hyphens."
+     },
+     "description": {
+      "type": "string",
+      "description": "One line: WHEN this applies. It is all the prompt carries about the skill, so it decides whether the skill is ever chosen."
+     },
+     "body": {
+      "type": "string",
+      "description": "For save: the steps, in full."
+     }
+    },
+    "required": [
+     "action"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "session_search",
+   "description": "Search everything said in earlier conversations, including ones from months ago. Costs no context until you call it, so use it instead of guessing when the user refers to something you cannot see -- 'the thing we decided last week', a number, a path, a name. Returns the real messages, not a summary.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string",
+      "description": "Words to look for. All of them must appear; two or three specific ones beat a sentence."
+     },
+     "limit": {
+      "type": "integer",
+      "description": "How many messages, default 8."
+     }
+    },
+    "required": [
+     "query"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "delegate",
+   "description": "Hand one task to a separate model and keep working. Returns at once with an id; the work runs beside this conversation, on a remote model -- never on this machine's server. The subtask sees NOTHING of this conversation and has no tools: put everything it needs into task and context, and give it work that is text in, text out -- research over its own knowledge, summarising, drafting, judging. Fan out every delegate first, keep working, then collect once at the end; results come back only through collect.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "task": {
+      "type": "string",
+      "description": "What the subtask is to do, complete in itself."
+     },
+     "context": {
+      "type": "string",
+      "description": "Background it needs -- it cannot see this conversation or ask follow-up questions."
+     }
+    },
+    "required": [
+     "task"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "subtasks",
+   "description": "Where every delegated subtask of this session stands: running or finished, seconds, tokens. Costs nothing and waits for nothing -- check it between delegating and collecting.",
+   "parameters": {
+    "type": "object",
+    "properties": {},
+    "required": []
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "collect",
+   "description": "Wait for delegated subtasks and return their results. Pass an id from delegate, or 'all' for every subtask not collected yet. It blocks until they finish, so delegate everything first and collect once.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string",
+      "description": "An id from delegate, or 'all'."
+     }
+    },
+    "required": []
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "goal_set",
+   "description": "Use Goals to manage complex work with continuous planning, execution and verification. Write the plan BEFORE starting: a short title and the steps, in order. Use this at the beginning of any task that needs more than a couple of turns -- you do not have to be asked. Once a plan is set, work it step by step without stopping, and call goal_step as you go. The plan survives a context rollover and a restart, so it is what you come back to when the conversation above has been cut. Replaces any earlier plan.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "title": {
+      "type": "string",
+      "description": "Short name for the whole job."
+     },
+     "steps": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "description": "The steps, in the order they will be done. Each one a single verifiable piece of work."
+     }
+    },
+    "required": [
+     "title",
+     "steps"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "goal_step",
+   "description": "Move one step of the plan. Call it with 'running' before you start a step and with 'done' once you have VERIFIED it -- not when you think it should work. Use 'failed' with a reason when it cannot be finished; a failed step may be started again later. Costs nothing and does not move the prompt head.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "step": {
+      "type": "integer",
+      "description": "1-based number of the step, as listed by goal_set."
+     },
+     "status": {
+      "type": "string",
+      "description": "running, done or failed."
+     },
+     "note": {
+      "type": "string",
+      "description": "For done: what proves it. For failed: why."
+     }
+    },
+    "required": [
+     "step",
+     "status"
+    ]
+   }
+  }
+ }
+]

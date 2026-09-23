@@ -649,6 +649,11 @@ pub unsafe fn sync() {
 /// that state: detach the context, then `cuDevicePrimaryCtxReset_v2`, which
 /// forces the driver to tear the context down while the process still lives.
 /// Every exit path that touched CUDA calls it as its LAST act.
+///
+/// 2026-09-23 (#103): what remained after a CLEAN exit was not held
+/// by `nvidia_uvm` but parked in the driver's reclaimable sysmem page pool
+/// (see `free_physical_ram_parts`); the cold tier is now registered anonymous
+/// memory (`Pinned::alloc_registered`) and never enters that pool.
 pub unsafe fn ctx_hard_reset() {
     let mut dev: sys::CUdevice = 0;
     let _ = sys::cuDeviceGet(&mut dev, 0);
@@ -662,9 +667,42 @@ pub struct HostRam {
     pub free_for_pin: u64,
     /// the kernel's own conservative figure (`MemAvailable`)
     pub mem_available: u64,
-    /// another live CUDA process holds the driver's pinned pool, so that pool
-    /// is not ours to count and `free_for_pin` IS `mem_available`
+    /// another live process holds `/dev/nvidia-uvm` (information only since
+    /// the #103: its live driver memory is in `driver_live`)
     pub other_cuda: bool,
+    /// NVIDIA driver memory that live processes (this one included) have
+    /// mapped: `/dev/nvidiactl` + `/dev/nvidia<N>` mappings by size, the
+    /// resident pages of `/dev/nvidia-uvm` mappings; subtracted from `free_for_pin`
+    pub driver_live: u64,
+    /// RAM in no /proc/meminfo class (see `Meminfo::driver_held`): the NVIDIA
+    /// driver's live pinned allocations plus its sysmem page pool; 0 on windows
+    pub driver_held: u64,
+}
+
+/// /proc/meminfo, parsed once (bytes); a missing field reads 0
+#[derive(Default, Clone)]
+pub struct Meminfo(pub HashMap<String, u64>);
+
+impl Meminfo {
+    pub fn parse(txt: &str) -> Meminfo {
+        let mut m = HashMap::new();
+        for line in txt.lines() {
+            let Some((k, rest)) = line.split_once(':') else { continue };
+            let mut it = rest.split_whitespace();
+            let Some(v) = it.next().and_then(|v| v.parse::<u64>().ok()) else { continue };
+            let mul = if it.next() == Some("kB") { 1024 } else { 1 };
+            m.insert(k.trim().to_string(), v * mul);
+        }
+        Meminfo(m)
+    }
+    pub fn get(&self, k: &str) -> u64 {
+        self.0.get(k).copied().unwrap_or(0)
+    }
+}
+
+/// the live /proc/meminfo (empty without /proc)
+pub fn meminfo() -> Meminfo {
+    std::fs::read_to_string("/proc/meminfo").map(|t| Meminfo::parse(&t)).unwrap_or_default()
 }
 
 /// free physical host RAM in bytes (kernel32 GlobalMemoryStatusEx); 0 if the
@@ -686,7 +724,7 @@ pub fn free_physical_ram_parts() -> HostRam {
     }
     type FnGms = unsafe extern "system" fn(*mut MemStatusEx) -> i32;
     unsafe {
-        let none = HostRam { free_for_pin: 0, mem_available: 0, other_cuda: false };
+        let none = HostRam { free_for_pin: 0, mem_available: 0, other_cuda: false, driver_live: 0, driver_held: 0 };
         let Ok(lib) = libloading::Library::new("kernel32.dll") else { return none };
         let Ok(f) = lib.get::<FnGms>(b"GlobalMemoryStatusEx\0") else { return none };
         let mut st = MemStatusEx {
@@ -696,22 +734,27 @@ pub fn free_physical_ram_parts() -> HostRam {
         };
         if f(&mut st) == 0 { return none }
         // one number on windows: avail_phys already excludes what cannot be paged
-        HostRam { free_for_pin: st.avail_phys, mem_available: st.avail_phys, other_cuda: false }
+        HostRam { free_for_pin: st.avail_phys, mem_available: st.avail_phys, other_cuda: false, driver_live: 0, driver_held: 0 }
     }
 }
 
 /// unix twin; all zero without /proc.
 ///
 /// `MemAvailable` is the WRONG input for the pinned tier on this host, low by
-/// tens of GiB, for two reasons (both measured 2026-09-17, issue #15):
+/// tens of GiB, for two reasons (both measured 2026-09-17, issue #15; the pool
+/// mechanism read out of the driver source 2026-09-23, #103):
 ///
-/// - The NVIDIA driver keeps its pinned-page pool after a process exits (about
-///   45 GiB after one engine run). Those pages belong to no process and land in
-///   no /proc/meminfo class, so `MemAvailable` does not see them - yet the next
-///   `cuMemHostAlloc` is served out of that pool, and the pool is handed back
-///   under pressure (`pin_leak` took 8 GiB of WC pinned memory with `MemFree`
-///   unmoved; a cgroup-capped balloon pushed the whole pool back). Without this
-///   every second engine start refused with "only 10.26 GiB physical RAM free".
+/// - The NVIDIA open driver keeps a sysmem PAGE POOL (kernel-open/nvidia/nv-vm.c,
+///   `nv_mem_pool_*`, module parameter `NVreg_EnableSystemMemoryPools`, default
+///   0x211 = 4K + 64K + 2M pools). Every page of a freed driver allocation - the
+///   write-combined `cuMemHostAlloc` cold tier of the old engines among them -
+///   goes onto that pool instead of back to the kernel, and stays there after
+///   the process is gone. The pages land in no /proc/meminfo class, so
+///   `MemAvailable` does not see them; the next driver allocation is served from
+///   the pool first, and the pool registers a SHRINKER, so memory pressure hands
+///   it back (measured 2026-09-23: an 8 GiB pool went to 0 within 3 s while a
+///   52 GiB registered allocation faulted in, zero swap, `pin_return_probe`).
+///   It is reclaimable, not lost - `driver_held` shows its size.
 /// - The page cache is reclaimable by definition, and the cold-tier fill is
 ///   what fills it.
 ///
@@ -720,10 +763,14 @@ pub fn free_physical_ram_parts() -> HostRam {
 ///
 /// ```text
 /// free_for_pin = MemTotal
-///              - AnonPages   process anonymous memory (swap is not counted on)
-///              - Shmem       tmpfs + shared anon, incl. ShmemHugePages
+///              - AnonPages   process anonymous memory, incl. a registered cold tier
+///              - Shmem       tmpfs + shared anon, incl. ShmemHugePages and the
+///                            cacheable cuMemHostAlloc blocks (/dev/zero shared maps)
 ///              - SUnreclaim  kernel slab no shrinker can free
 ///              - KernelStack - PageTables - Percpu
+///              - driver_live NVIDIA driver memory live processes have mapped
+///                            (`driver_mapped_bytes`): what of the classless
+///                            pages is NOT the reclaimable pool
 /// ```
 ///
 /// `Unevictable` and `Mlocked` are deliberately NOT subtracted: an mlocked page
@@ -735,33 +782,126 @@ pub fn free_physical_ram_parts() -> HostRam {
 /// estimate errs LARGE; the `CROW_RAM_MARGIN_GB` margin, the 46 GiB budget cap
 /// and the pre-pin gate in `residency::build` are what bound it.
 ///
-/// One caveat the pool itself carries: it is only OURS to count while no other
-/// CUDA process is alive. A second process may own those pinned pages, and
-/// taking them for free would overcommit the host. So when `other_cuda_fd`
-/// finds another process holding an NVIDIA device node, the conservative
-/// `MemAvailable` is the answer and the boot line says so.
+/// Before 2026-09-23 a second CUDA process switched the whole figure to
+/// `MemAvailable` (its live pinned pages would otherwise have counted as our
+/// pool). That fallback refused the boot outright whenever an old pool and any
+/// other CUDA client (zcode's Electron, a llama-server) were present at once -
+/// the pool is invisible to `MemAvailable` - and it is replaced by the
+/// subtraction of `driver_live`, which is exactly the part of the classless
+/// memory another process still owns. What stays uncounted: driver memory a
+/// process owns WITHOUT mapping it (GPU page tables, UVM eviction buffers),
+/// ~0.7-1.7 GiB on this host with the desktop running; the margin covers it.
 #[cfg(unix)]
 pub fn free_physical_ram_parts() -> HostRam {
-    let none = HostRam { free_for_pin: 0, mem_available: 0, other_cuda: false };
-    let Ok(txt) = std::fs::read_to_string("/proc/meminfo") else { return none };
-    let f = |name: &str| -> u64 {
-        for line in txt.lines() {
-            if let Some(rest) = line.strip_prefix(name) {
-                if rest.starts_with(':') {
-                    return rest[1..].split_whitespace().next()
-                        .and_then(|kb| kb.parse::<u64>().ok()).unwrap_or(0) * 1024;
-                }
+    let m = meminfo();
+    let total = m.get("MemTotal");
+    if total == 0 {
+        return HostRam { free_for_pin: 0, mem_available: 0, other_cuda: false, driver_live: 0, driver_held: 0 };
+    }
+    let unreclaimable = m.get("AnonPages") + m.get("Shmem") + m.get("SUnreclaim")
+        + m.get("KernelStack") + m.get("PageTables") + m.get("Percpu");
+    let mem_available = m.get("MemAvailable");
+    let driver_held = driver_held(&m, zram_used());
+    let proc_root = std::path::Path::new("/proc");
+    let driver_live = driver_mapped_bytes(proc_root);
+    let other_cuda = other_cuda_fd(proc_root, std::process::id());
+    let free_for_pin = total.saturating_sub(unreclaimable).saturating_sub(driver_live);
+    HostRam { free_for_pin, mem_available, other_cuda, driver_live, driver_held }
+}
+
+/// Sum of NVIDIA driver memory mapped by every readable process under
+/// `proc_root` (`driver_live` of `HostRam`). A process whose `maps` names no
+/// `/dev/nvidia*` node costs one small read; the few that do have their
+/// `smaps` parsed by `smaps_driver_bytes`.
+#[cfg(unix)]
+pub fn driver_mapped_bytes(proc_root: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(proc_root) else { return 0 };
+    let mut sum = 0u64;
+    for e in entries.flatten() {
+        if !e.file_name().to_str().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())) {
+            continue;
+        }
+        let Ok(maps) = std::fs::read_to_string(e.path().join("maps")) else { continue };
+        if !maps.contains("/dev/nvidia") {
+            continue;
+        }
+        if let Ok(smaps) = std::fs::read_to_string(e.path().join("smaps")) {
+            sum += smaps_driver_bytes(&smaps);
+        }
+    }
+    sum
+}
+
+/// One process's live NVIDIA driver memory out of its `/proc/<pid>/smaps`:
+///
+/// - `/dev/nvidiactl` and `/dev/nvidia<N>` mappings count by their SIZE. A
+///   `cuMemHostAlloc(WRITECOMBINED)` block is exactly such a mapping
+///   (measured 2026-09-23, `pin_return_probe hold host-wc`: 4 x 512 MiB
+///   `rw-s /dev/nvidiactl`), and its pages sit in no meminfo class. They are
+///   PFN maps, so `Rss` reads 0 and only the size tells. BAR (VRAM) windows
+///   map the same nodes and are counted too - that errs small, never large;
+///   the whole desktop maps ~70 MiB of them on this host.
+/// - `/dev/nvidia-uvm` mappings are managed-memory VA reservations (tens of
+///   GiB of address space, mostly empty): only their resident pages count.
+/// - `/dev/zero` (cacheable `cuMemHostAlloc`, i.e. shmem) and anonymous
+///   mappings (`cuMemHostRegister`) are NOT counted here: their pages are in
+///   `Shmem` / `AnonPages` already.
+pub fn smaps_driver_bytes(smaps: &str) -> u64 {
+    #[derive(PartialEq)]
+    enum Cur { Other, Ctl, Uvm }
+    let mut cur = Cur::Other;
+    let mut sum = 0u64;
+    for line in smaps.lines() {
+        let mut it = line.split_whitespace();
+        let Some(first) = it.next() else { continue };
+        if let Some((lo, hi)) = first.split_once('-') {
+            if let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo, 16), u64::from_str_radix(hi, 16)) {
+                // a VMA header: addr perms offset dev inode [path]
+                let path = line.split_whitespace().nth(5).unwrap_or("");
+                let node = path.strip_prefix("/dev/nvidia").unwrap_or("-");
+                cur = if path.starts_with("/dev/nvidia-uvm") {
+                    Cur::Uvm
+                } else if node == "ctl" || (!node.is_empty() && node.bytes().all(|b| b.is_ascii_digit())) {
+                    sum += hi.saturating_sub(lo);
+                    Cur::Ctl
+                } else {
+                    Cur::Other
+                };
+                continue;
             }
         }
-        0
-    };
-    let total = f("MemTotal");
-    let unreclaimable = f("AnonPages") + f("Shmem") + f("SUnreclaim")
-        + f("KernelStack") + f("PageTables") + f("Percpu");
-    let mem_available = f("MemAvailable");
-    let other_cuda = other_cuda_fd(std::path::Path::new("/proc"), std::process::id());
-    let free_for_pin = if other_cuda { mem_available } else { total.saturating_sub(unreclaimable) };
-    HostRam { free_for_pin, mem_available, other_cuda }
+        if cur == Cur::Uvm && first == "Rss:" {
+            sum += it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1024;
+        }
+    }
+    sum
+}
+
+/// RAM that sits in NO /proc/meminfo class: `MemTotal` minus every class the
+/// kernel does account. On this host that is the NVIDIA driver's pages - the
+/// live `cuMemHostAlloc` allocations of every CUDA process AND the driver's
+/// sysmem page pool that keeps them after a free (nv-vm.c
+/// `nv_mem_pool_free_pages`) - plus a small fixed rest (firmware, other
+/// drivers' pages; ~0.7 GiB measured on a freshly booted host). zram's
+/// compressed store is also classless, so its `mem_used_total` is taken out.
+pub fn driver_held(m: &Meminfo, zram: u64) -> u64 {
+    let accounted = m.get("MemFree") + m.get("Buffers") + m.get("Cached") + m.get("SwapCached")
+        + m.get("AnonPages") + m.get("Slab") + m.get("KernelStack") + m.get("PageTables")
+        + m.get("SecPageTables") + m.get("Percpu") + m.get("VmallocUsed") + m.get("Hugetlb")
+        + m.get("Unaccepted") + zram;
+    m.get("MemTotal").saturating_sub(accounted)
+}
+
+/// bytes zram's compressed store occupies (`mm_stat` field 3, mem_used_total),
+/// summed over every zram device; 0 without zram
+#[cfg(unix)]
+pub fn zram_used() -> u64 {
+    let Ok(rd) = std::fs::read_dir("/sys/block") else { return 0 };
+    rd.flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("zram")))
+        .filter_map(|e| std::fs::read_to_string(e.path().join("mm_stat")).ok())
+        .filter_map(|t| t.split_whitespace().nth(2).and_then(|v| v.parse::<u64>().ok()))
+        .sum()
 }
 
 /// Is another CUDA process alive? `/proc/<pid>/fd` of every process but
@@ -805,7 +945,48 @@ pub struct Pinned {
     pub host: *mut std::ffi::c_void,
     pub dev: CUdeviceptr, // UVA device pointer for zero-copy reads
     pub bytes: usize,
+    /// 0 = a `cuMemHostAlloc` block; > 0 = a registered anonymous mapping of
+    /// this many bytes at `host` (`alloc_registered`), unregistered + unmapped
+    /// by `free`
+    map_len: usize,
 }
+
+/// How the pinned cold tier is allocated (`CROW_PINNED_ALLOC`, issue #103).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PinAlloc {
+    /// anonymous mmap + `cuMemHostRegister(PORTABLE|DEVICEMAP)` - kernel-owned
+    /// pages, the Linux default
+    Register,
+    /// `cuMemHostAlloc(PORTABLE|DEVICEMAP|WRITECOMBINED)` - driver-owned pages
+    /// that go to the driver's sysmem page pool on free; the Windows default
+    /// and the documented Linux fallback
+    Wc,
+    /// `cuMemHostAlloc(PORTABLE|DEVICEMAP)` - cacheable
+    Host,
+}
+
+/// `CROW_PINNED_ALLOC` = `register` | `wc` | `host`; unset or anything else
+/// takes the platform default (`register` on unix, `wc` on windows, where
+/// there is no mmap and the WDDM measurement of 2026-09-04 favoured WC).
+pub fn pin_alloc_mode() -> PinAlloc {
+    match std::env::var("CROW_PINNED_ALLOC").as_deref() {
+        Ok("wc") => PinAlloc::Wc,
+        Ok("host") => PinAlloc::Host,
+        Ok("register") if cfg!(unix) => PinAlloc::Register,
+        _ if cfg!(unix) => PinAlloc::Register,
+        _ => PinAlloc::Wc,
+    }
+}
+
+/// the registered ranges are cut into pieces of at most this size: a single
+/// `cuMemHostRegister` above 2 GiB failed with CUDA_ERROR_INVALID_ARGUMENT and
+/// left every page of the request pinned for good on 570.133.20 / Linux 6.11
+/// (NVIDIA developer forums, "failed cuMemHostRegister (> 2 GiB) permanently
+/// leaks pinned host memory"); 1 GiB keeps every call far from that edge
+#[cfg(unix)]
+const REG_CHUNK: usize = 1 << 30;
+#[cfg(unix)]
+const HUGE: usize = 2 << 20;
 
 impl Pinned {
     /// the one `cuMemHostAlloc`; `alloc` and `alloc_wc` differ only by the flag word
@@ -814,7 +995,7 @@ impl Pinned {
         ck(sys::cuMemHostAlloc(&mut host, bytes, flags));
         let mut dev: CUdeviceptr = 0;
         ck(sys::cuMemHostGetDevicePointer_v2(&mut dev, host, 0));
-        Pinned { host, dev, bytes }
+        Pinned { host, dev, bytes, map_len: 0 }
     }
 
     /// mapped pinned allocation; the returned `dev` pointer is what kernels read
@@ -822,19 +1003,115 @@ impl Pinned {
         Pinned::alloc_flags(bytes, sys::CU_MEMHOSTALLOC_PORTABLE | sys::CU_MEMHOSTALLOC_DEVICEMAP)
     }
 
+    /// the cold-tier allocation, by `pin_alloc_mode()`
+    pub unsafe fn alloc_cold(bytes: usize) -> Pinned {
+        match pin_alloc_mode() {
+            PinAlloc::Wc => Pinned::alloc_wc(bytes),
+            PinAlloc::Host => Pinned::alloc(bytes),
+            #[cfg(unix)]
+            PinAlloc::Register => Pinned::alloc_registered(bytes),
+            #[cfg(not(unix))]
+            PinAlloc::Register => Pinned::alloc_wc(bytes),
+        }
+    }
+
+    /// #103: page-locked memory the KERNEL owns. An anonymous private
+    /// mapping (2 MiB aligned, MADV_HUGEPAGE, MADV_DONTFORK so a child process
+    /// never copy-on-writes 46 GiB of pinned pages) registered with
+    /// `cuMemHostRegister(PORTABLE|DEVICEMAP)`. The driver only pins these pages
+    /// (FOLL_PIN); on `free`, on exit and on SIGKILL they go straight back to
+    /// the kernel - measured 2026-09-23 with `pin_return_probe`: `AnonPages`,
+    /// `MemFree` and `/proc/vmstat` nr_foll_pin back to their start values in
+    /// all three cases. A `cuMemHostAlloc` block is instead kept by the driver's
+    /// sysmem page pool after it is freed (nv-vm.c `nv_mem_pool_free_pages`),
+    /// invisible to `MemAvailable` until memory pressure runs the pool's
+    /// shrinker. GPU read bandwidth is the same (51.6 GB/s stage pattern for
+    /// register, WC and cacheable alike, `pin_return_probe bw` / `scatter`).
+    #[cfg(unix)]
+    pub unsafe fn alloc_registered(bytes: usize) -> Pinned {
+        let len = bytes.max(1).div_ceil(HUGE) * HUGE;
+        let raw = libc::mmap(
+            std::ptr::null_mut(),
+            len + HUGE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if raw == libc::MAP_FAILED {
+            panic!("pinned tier: mmap of {len} B failed: {}", std::io::Error::last_os_error());
+        }
+        // trim to a 2 MiB aligned range so every huge page can be a huge page
+        let base = (raw as usize).div_ceil(HUGE) * HUGE;
+        let head = base - raw as usize;
+        if head > 0 {
+            libc::munmap(raw, head);
+        }
+        let tail = HUGE - head;
+        if tail > 0 {
+            libc::munmap((base + len) as *mut libc::c_void, tail);
+        }
+        let host = base as *mut std::ffi::c_void;
+        libc::madvise(host, len, libc::MADV_HUGEPAGE);
+        libc::madvise(host, len, libc::MADV_DONTFORK);
+        let flags = sys::CU_MEMHOSTREGISTER_PORTABLE | sys::CU_MEMHOSTREGISTER_DEVICEMAP;
+        let mut done = 0usize;
+        let mut dev0: CUdeviceptr = 0;
+        while done < len {
+            let n = REG_CHUNK.min(len - done);
+            let p = (base + done) as *mut std::ffi::c_void;
+            let r = sys::cuMemHostRegister_v2(p, n, flags);
+            if r != sys::CUresult::CUDA_SUCCESS {
+                // give back what is registered so far, then fail loudly
+                let mut o = 0;
+                while o < done {
+                    let _ = sys::cuMemHostUnregister((base + o) as *mut std::ffi::c_void);
+                    o += REG_CHUNK;
+                }
+                libc::munmap(host, len);
+                panic!("pinned tier: cuMemHostRegister of {n} B at offset {done} failed: {r:?}");
+            }
+            let mut d: CUdeviceptr = 0;
+            ck(sys::cuMemHostGetDevicePointer_v2(&mut d, p, 0));
+            if done == 0 {
+                dev0 = d;
+            } else {
+                // kernels index one slab linearly, so the pieces must be one device range
+                assert_eq!(d, dev0 + done as u64, "registered pieces are not device-contiguous");
+            }
+            done += n;
+        }
+        Pinned { host, dev: dev0, bytes, map_len: len }
+    }
+
     pub unsafe fn write_bytes(&mut self, offset: usize, v: &[u8]) {
         assert!(offset + v.len() <= self.bytes);
         std::ptr::copy_nonoverlapping(v.as_ptr(), (self.host as *mut u8).add(offset), v.len());
     }
 
-    /// the pinned twin of `free_dev`: the same `cuMemFreeHost`, and the same
-    /// teardown rule (`ck_call` - logged instead of aborting a live unwind)
+    /// the pinned twin of `free_dev`: the same `cuMemFreeHost` (or, for a
+    /// registered mapping, `cuMemHostUnregister` per piece + `munmap`), and
+    /// the same teardown rule (`ck_call` - logged instead of aborting a live
+    /// unwind)
     pub unsafe fn free(&mut self) {
-        if !self.host.is_null() {
-            ck_call("cuMemFreeHost", sys::cuMemFreeHost(self.host));
-            self.host = std::ptr::null_mut();
-            self.dev = 0;
+        if self.host.is_null() {
+            return;
         }
+        if self.map_len == 0 {
+            ck_call("cuMemFreeHost", sys::cuMemFreeHost(self.host));
+        } else {
+            #[cfg(unix)]
+            {
+                let mut o = 0;
+                while o < self.map_len {
+                    ck_call("cuMemHostUnregister", sys::cuMemHostUnregister((self.host as usize + o) as *mut std::ffi::c_void));
+                    o += REG_CHUNK;
+                }
+                libc::munmap(self.host, self.map_len);
+            }
+        }
+        self.host = std::ptr::null_mut();
+        self.dev = 0;
     }
 
     /// write combined variant for host->device flag buffers (p9 lesson)
@@ -864,6 +1141,53 @@ pub fn write_le<T: Copy>(path: &str, v: &[T]) -> std::io::Result<()> {
     use std::io::Write;
     let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) };
     std::fs::File::create(path)?.write_all(bytes)
+}
+
+#[cfg(test)]
+mod ram_view {
+    //! #103: the classless-memory arithmetic behind `free_for_pin`, on
+    //! fixed text (the numbers are the 2026-09-23 `pin_return_probe` readings)
+    use super::{driver_held, smaps_driver_bytes, Meminfo};
+
+    /// one smaps VMA block
+    fn vma(lo: u64, hi: u64, perms: &str, path: &str, rss_kb: u64) -> String {
+        format!("{lo:x}-{hi:x} {perms} 00000000 00:06 123 {path}\nSize: {} kB\nRss: {rss_kb} kB\nPss: {rss_kb} kB\n", (hi - lo) / 1024)
+    }
+
+    #[test]
+    fn a_wc_block_counts_by_size_uvm_by_rss_shmem_and_anon_not_at_all() {
+        let mib = 1u64 << 20;
+        let mut t = String::new();
+        // cuMemHostAlloc(WRITECOMBINED): a PFN map of /dev/nvidiactl, Rss 0
+        t += &vma(0x7000_0000_0000, 0x7000_0000_0000 + 512 * mib, "rw-s", "/dev/nvidiactl", 0);
+        // a BAR window of /dev/nvidia0
+        t += &vma(0x7100_0000_0000, 0x7100_0000_0000 + 2 * mib, "rw-s", "/dev/nvidia0", 0);
+        // managed VA: 8 GiB reserved, 3 MiB resident
+        t += &vma(0x2000_0000_0000, 0x2000_0000_0000 + 8192 * mib, "rw-s", "/dev/nvidia-uvm", 3072);
+        // cacheable cuMemHostAlloc (shmem) and a registered anonymous tier: in Shmem / AnonPages already
+        t += &vma(0x7200_0000_0000, 0x7200_0000_0000 + 512 * mib, "rw-s", "/dev/zero (deleted)", 524288);
+        t += &vma(0x7300_0000_0000, 0x7300_0000_0000 + 1024 * mib, "rw-p", "", 1048576);
+        // nodes that are not driver memory
+        t += &vma(0x7400_0000_0000, 0x7400_0000_0000 + 4096, "rw-s", "/dev/nvidia-modeset", 4);
+        assert_eq!(smaps_driver_bytes(&t), 512 * mib + 2 * mib + 3 * mib);
+        assert_eq!(smaps_driver_bytes(""), 0);
+    }
+
+    #[test]
+    fn driver_held_is_memtotal_minus_every_accounted_class() {
+        let m = Meminfo::parse(
+            "MemTotal: 1000 kB\nMemFree: 300 kB\nBuffers: 10 kB\nCached: 100 kB\nSwapCached: 0 kB\n\
+             AnonPages: 200 kB\nSlab: 50 kB\nKernelStack: 10 kB\nPageTables: 10 kB\nSecPageTables: 0 kB\n\
+             Percpu: 10 kB\nVmallocUsed: 10 kB\nHugetlb: 0 kB\nHugePages_Total: 0\n",
+        );
+        assert_eq!(m.get("MemTotal"), 1000 * 1024);
+        assert_eq!(m.get("HugePages_Total"), 0, "a count without kB stays a count");
+        assert_eq!(m.get("NoSuchField"), 0);
+        // 1000 - (300+10+100+200+50+10+10+10+10) = 300 kB classless, minus 40 kB of zram
+        assert_eq!(driver_held(&m, 40 * 1024), 260 * 1024);
+        // never negative
+        assert_eq!(driver_held(&m, 1 << 30), 0);
+    }
 }
 
 #[cfg(all(test, unix))]

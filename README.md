@@ -89,10 +89,18 @@ engine/target/release/serve --port 8099
   uses for `llama-server` on Linux.
 - `CUDA_LIB` names the CUDA runtime directory (default `~/.local/share/crow/cuda/lib`, never
   the `lib/stubs` sibling); every `CROW_*` variable of the caller and every argument are
-  passed through. `docs/env.md` has the host-memory rows the launcher bounds:
-  `CROW_RAM_MARGIN_GB`, `CROW_PINNED_BUDGET_GB`.
-- **Keep the container off a compressed mount** (2026-09-17). The PLE section is read as 108-byte
-  rows at random offsets, on the critical path of every token, so a filesystem that decompresses a
+  passed through, except secrets (`CROW_*KEY`, `CROW_*TOKEN`, `CROW_*SECRET` belong to the client
+  and are dropped). `docs/env.md` has the host-memory rows the launcher bounds:
+  `CROW_RAM_MARGIN_GB`, `CROW_PINNED_BUDGET_GB`, `CROW_PINNED_ALLOC`.
+- The launcher's operating point is the BARE container since 2026-09-23 (`0254ed6`): no overlay,
+  the engine's default pinned budget and allocation (`register` on Linux, issue #103). An overlay
+  is opt-in with `CROW_CNQ_OVERLAY=<file>`; `CROW_CNQ_OVERLAY=none` and an empty value mean none.
+  The dense BF16 overlay was the launcher default for five hours that day (`0924406`) and was
+  reverted: at pinned 50 GiB write-combined robin's `serve` was OOM-killed (2026-09-23, 18:38 CEST),
+  and the overlay shrank the hot set to 128 slots instead of 156 in that run (2026-09-23).
+  `CROW_KV=bf16` is read by `serve` since issue #102 and needs a larger `CROW_PINNED_BUDGET_GB` (`docs/env.md`).
+- **Keep the container off a compressed mount** (2026-09-17). The PLE section is read as rows of
+  160 values (up to four 36-byte NVFP4 blocks of the flat stream since `85a48e7`, 2026-09-23) at random offsets, on the critical path of every token, so a filesystem that decompresses a
   whole extent per 4 KiB read is the wrong home for it. On btrfs, check with
   `filefrag -v <container> | grep -c encoded` (0 is what you want) and give the file `chattr +m`
   BEFORE it is written — `chattr +m` plus `btrfs filesystem defragment` on an already compressed
@@ -105,12 +113,17 @@ engine/target/release/serve --port 8099
 tools/gate-linux.sh
 ```
 
-- It runs the three parity forms, the short generated-id run, the tests, clippy and the two doc
+- It runs the three parity forms, the short generated-id run, the tests, clippy and the three doc
   guards against the Linux values of record, prints GREEN or RED per item and exits non-zero on
   any RED. Every expected value carries its provenance in the script header.
 - All nine items green at commit 8ff2055 on 2026-09-17, with `cargo test` at 165 (`decode_out/final/GATES.md` section 2); the `487128d` follow-up re-ran build, tests and both doc guards. Run again through 2026-09-18 at eight commits of that day, all nine green each time and the three doc guards with it, the last GPU run at `bc9cd9b` (`decode_out/gate61`, `gate61g`, `gate62`, `gate69`, `gate68b`, `gate71`, `gate13-final`); the host-side counts the script pins are `TESTS=221` and `CLIPPY=1421` on 2026-09-18.
-- Engine runs are sequential on purpose: the RAM gate refuses a second engine while the first
-  one holds the pinned tier.
+- On 2026-09-23 the pinned count is `TESTS=358` (237 lib + 110 serve + 6 parity + 5 decode, measured
+  that day on `release-2026-09-23`). The parity shas and the run-32 ids of record are the values of
+  the pre-2026-09-23 engine: the activation pre-scale (`488a840`) and the PLE fix (`85a48e7`) change
+  the numerics on purpose, so those four items are expected RED until a GPU gate run records new
+  values. That run has not happened yet.
+- Engine runs are sequential on purpose: before every engine start the gate asks the engine's own
+  `ramcheck --need` (`free_for_pin`, issue #103, `tools/pin-room.sh`) whether the pinned tier fits.
 
 ### Check the endpoint after the load
 
@@ -156,10 +169,12 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 ## What is measured
 
 - The two arms run different weights: crow-nest CNQ4.5-M (NVFP4, 4.5 bpw); llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL (GGUF, 2.4 bpw). Every comparison names both.
+- **Every crow-nest number in this section predates the numerics changes of 2026-09-23**: the PLE n-gram rows were read at the wrong container offset until `85a48e7` (every token got the n-gram embedding of unrelated rows), the NVFP4 activations gained a per-row power-of-two pre-scale in `488a840`, and `CROW_QFUSE` became opt-in with it. The engine the tables describe is the pre-2026-09-23 one; none of its rows has been re-measured yet. What exists after the fix, 2026-09-23: the #91 multi-site probe (23 corrupted tool-call sites, teacher-forced, dense BF16 overlay) went from 12 of 23 sites where the corrupt token wins to 4 of 23, the same 4 of 23 llama.cpp UD-Q2_K_XL reads (`CHANGELOG.md`, Unreleased); robin's live Crow session of 2026-09-23 evening decoded at 24 to 27 tok/s with a hot-set hit rate of 0.52 to 0.70 (0.77 to 0.80 before), see the known limitation in `CHANGELOG.md`.
 
 | metric | crow-nest | llama.cpp | delta | machine | date | source |
 |---|---|---|---|---|---|---|
 | ten-task quality, greedy | 2 Pass / 5 Partial / 3 Fail of 10 | 2 Pass / 6 Partial / 2 Fail of 10 | n/a | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
+| ten-task quality, the Linux record, sampled at the real row (thinking `high`, 3 seeds × 10 tasks, `max_tokens` 16384), blind pointwise grading | 2 Pass / 7 Partial / 21 Fail of 30, 21 of the fails empty (budget exhaustion into thinking), share_met 0.221; the same arm at 32768: 7/14/9, share_met 0.606, English 6/27 | 9 Pass / 3 Partial / 18 Fail of 30, 17 empty, share_met 0.388, English 6/27 | n/a | RTX 5090, Arch Linux | 2026-09-20 | issue #87 phase 1; B-llama-32k aborted by the user before any answer — missing control, documented in `docs/ten-task-linux.md` LIMITS |
 | decode, engine arm, ten tasks | 35.5 to 46.8 tok/s | 44.4 to 48.2 tok/s | n/a | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
 | prefill, engine arm, ten tasks | 110 to 706 tok/s | 265 to 846 tok/s | n/a | RTX 5090 | 2026-09-10 | issue #11 (comment); `nibor1896/Crow` issue #192 (comment) |
 | prefill on Linux, the value of record, t1-read 16,064 ids, `decode run` at 128 tokens, two runs with identical id traces | 16.60 s = 968 tok/s and 16.66 s = 964 tok/s | n/a | n/a | RTX 5090, Arch Linux | 2026-09-17 | commit 1032bc5 (the PLE prefill floor); unchanged at 4004e66 (16.49 and 16.50 s) |
@@ -227,7 +242,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 |---|---|
 | `engine/` | the engine crate, the CUDA kernels and the 19 binaries counted 2026-09-17 (`engine/README.md`) |
 | `converter/` | the streaming safetensors to CNQ quantizer (`converter/README.md`) |
-| `docs/` | `architecture.md` (the spec, sections 0 to 9, the code map added 2026-09-17, the package self-test 8.10 and the logging section 9 added 2026-09-18), `model-card.md` (the Hugging Face model card of record, tracked here since 2026-09-18 and uploaded verbatim as that repo's `README.md`), `system-landscape.md`, `env.md`, `diagrams.md`, `long-context-goalmode.md` (the measurement record of the 170k goal-mode session, 2026-09-18), `measurement-coverage.md` (what is measured and what is not, with the run-position drift chains of 2026-09-18), `cuda-rust-evaluation.md` (the CUDA Rust / cuTile evaluation and its pilot, 2026-09-17), `quality-probe.md` (what the answer-quality probe measures, both engines' baseline of 2026-09-18, the noise floor and what it cannot decide, issue #75), `dense-originals.md` (the BF16 originals of the dense path fetched back by HTTP range on 2026-09-18 and proven against the container's own bytes, issue #76), `dense-overlay.md` (the dense path in BF16 as an overlay container over the shipped one, the dequantized-control that proves the wiring and the measurement with the originals, 2026-09-18, issue #77), `oracle-kld.md` (the reference-based reading of both quants against the f32 oracle of 2026-09-05 - top-1 agreement and KL divergence in llama.cpp's own units, the noise floor and what is ruled out, 2026-09-19, issue #78), `expert-requant.md` (the routed experts of 8 layers re-quantized with Unsloth's importance matrix and loaded as an NVFP4 expert overlay, the byte-identical wiring control, and the negative stop-rule verdict - every rule lowers the weight-space error and lands further from the f32 oracle, 2026-09-19, issue #79), the ten-task material |
+| `docs/` | `architecture.md` (the spec, sections 0 to 9, the code map added 2026-09-17, the package self-test 8.10 and the logging section 9 added 2026-09-18), `model-card.md` (the Hugging Face model card of record, tracked here since 2026-09-18 and uploaded verbatim as that repo's `README.md`), `system-landscape.md`, `env.md`, `diagrams.md`, `long-context-goalmode.md` (the measurement record of the 170k goal-mode session, 2026-09-18), `measurement-coverage.md` (what is measured and what is not, with the run-position drift chains of 2026-09-18), `cuda-rust-evaluation.md` (the CUDA Rust / cuTile evaluation and its pilot, 2026-09-17), `quality-probe.md` (what the answer-quality probe measures, both engines' baseline of 2026-09-18, the noise floor and what it cannot decide, issue #75), `dense-originals.md` (the BF16 originals of the dense path fetched back by HTTP range on 2026-09-18 and proven against the container's own bytes, issue #76), `dense-overlay.md` (the dense path in BF16 as an overlay container over the shipped one, the dequantized-control that proves the wiring and the measurement with the originals, 2026-09-18, issue #77), `oracle-kld.md` (the reference-based reading of both quants against the f32 oracle of 2026-09-05 - top-1 agreement and KL divergence in llama.cpp's own units, the noise floor and what is ruled out, 2026-09-19, issue #78), `expert-requant.md` (the routed experts of 8 layers re-quantized with Unsloth's importance matrix and loaded as an NVFP4 expert overlay, the byte-identical wiring control, and the negative stop-rule verdict - every rule lowers the weight-space error and lands further from the f32 oracle, 2026-09-19, issue #79), `numerics-diff.md` (the 24-row three-way numerics diff of GDN normalization and QSA sparse attention against the HF reference and llama.cpp - 17 MATCH, 0 MISMATCH, 3 UNVERIFIABLE, the #28068 bug class acquitted, two probes run on the RTX 5090, 2026-09-20, issue #89), the ten-task material |
 | `tools/` | Python guards and harness helpers, no GPU needed: the three doc guards (`check_env_docs.py`, `check_readme_dates.py`, `check_model_card_dates.py`, the last tracked since 2026-09-18), the launcher and the gates (`serve-linux.sh`, `gate-linux.sh`, `selftest.sh`, `drift-chain.sh`), the replays (`replay-toolcalls.py`, `replay-session.py`) and the probes (`longctx-gate.py`, `quality-probe.py` with its prompt set and its unit tests since 2026-09-18, `vit-colorprobe.py`, `vit-lag.py`, `vit-imgprobe.py`) and the weight fetcher (`fetch-dense-originals.py` with its unit tests, added 2026-09-18), and the reference-based pair of 2026-09-19 (`oracle-kld.py` with its unit tests, and `llama-row-probs.py`, which needs a running llama-server and no GPU of its own). The gate, the self-test wrapper, the drift chain and the session replay all start an engine; nothing else here does |
 | `decode_out/` | gate inputs and the four quality-probe baseline runs of 2026-09-18 (`quality-probe/`, issue #75); every other measurement record is ignored (`.gitignore`) |
 | `oracle/` | the layer-wise reference against the unquantized originals; its output (`oracle/golden/`) is ignored |
@@ -276,7 +291,9 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 
 | item | value |
 |---|---|
-| version | v0.3.1, this release, on `8bad310`, 2026-09-18. The tags before it: `v0.1.0` = `592d05d` (2026-09-11), `v0.2.0` = `42e2b67` and `v0.2.1` = `61b8dc6` (both 2026-09-14), `v0.3.0` = `b0102c0` (2026-09-17). The crate version field in `engine/Cargo.toml` stays `0.1.0` and has never been bumped: `CHANGELOG.md` is the release record, not the manifest |
+| unreleased | branch `release-2026-09-23` on top of v0.3.1: the #91 PLE row-offset fix, the NVFP4 activation pre-scale, the tool-call grammar (#93), `logprobs` and teacher forcing on `serve`, the #98 to #103 fixes; `CHANGELOG.md` section Unreleased has every entry with its numbers and its known limitations (2026-09-23) |
+| open, tool-call corruption | issue #91: digit and path corruption in tool-call arguments of long Crow sessions. Root cause found 2026-09-23: the PLE n-gram rows were read at byte `row*108` instead of value `160*r` of the flat block stream (`85a48e7`). Multi-site probe with the dense BF16 overlay: 12 of 23 sites where the corrupt token wins before the fix, 4 of 23 after it (the bare container with the fix is not measured yet), llama.cpp UD-Q2_K_XL 4 of 23; robin's live session that evening: 0 corruption hits in 73,887 tool-call argument characters, against 60 in the same amount before. Stays open for the hot-set recalibration and robin's acceptance |
+| version | v0.3.1, the last tagged release, on `8bad310`, 2026-09-18. The tags before it: `v0.1.0` = `592d05d` (2026-09-11), `v0.2.0` = `42e2b67` and `v0.2.1` = `61b8dc6` (both 2026-09-14), `v0.3.0` = `b0102c0` (2026-09-17). The crate version field in `engine/Cargo.toml` stays `0.1.0` and has never been bumped: `CHANGELOG.md` is the release record, not the manifest |
 | history | branch `main`, pushed to `origin` (`github.com/nibor1896/crow-nest`, private); the day's twenty-six commits `667b68b` to `8bad310` all landed 2026-09-18, and the fourteen before them `9f12429` to `487128d` on 2026-09-17. `release-v0.1` and `linux-refactor` stay on the remote as history |
 | scope | one model, one GPU, one client; Linux and Windows |
 | open, throughput | prefill gap to the target, issue #10; its second probe is measured and still opt-in (2026-09-18, RED greedy on the degeneration clause, GREEN sampled, prefill −1.750 s = −10.81 percent on the 16k form). What remains of a warm turn is PCIe staging of the cold experts the chunk routes to: 9,431 MB and 192.8 ms of a 256.4 ms chunk, measured 2026-09-17; the decode side of that row is issue #19, measured 2026-09-18 at 587.8 MB per decode token over a link running at 51.1 of the 51.6 GB/s this box can reach |

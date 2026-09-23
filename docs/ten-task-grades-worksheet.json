@@ -1,0 +1,2647 @@
+{
+ "_what": "#87 phase 1 / #80: the pointwise grading worksheet. Section 'blind' covers the 60 sealed blind answers (decode_out/ten-task/blind/answers.md) graded WITHOUT the id map; section 'supplement_A-crow-32k' covers the 30 answers of the A-crow-32k arm, which is NOT part of the sealed blind set (it was generated after the seal was written) and is graded non-blind, arm identity known by construction.",
+ "_how": "Every requirement of decode_out/ten-task/checklist.json scored met/partly/not with a one-line justification. share_met = mean with met 1.0, partly 0.5, not 0.0. verdict: pass = all met, fail = nothing met (all empty answers land here), partial = between. Empty answers carry the justification 'empty answer - no content produced...' on every requirement.",
+ "_order": "The 'blind' grades were fixed in full BEFORE idmap.json was opened and BEFORE the A-crow-32k answers were read. Byte-identities between 32k answers and blind answers (same engine, same seed) were only compared AFTER the blind grades were fixed; identical texts received identical grades.",
+ "_verified_extras": {
+  "cmake_syntax": "The two 32k t5-agent one-liner command lines that mix configure and build options were executed against cmake 4.4.3 with a dummy project: both forms exit with 'Unknown argument --target/--parallel'; the two-step form (configure, then cmake --build <dir> --target server) exits 0.",
+  "t6b_latex": "The runner's mechanical number matcher does not recognise LaTeX '{,}' thousands separators (1{,}610{,}612{,}736); two blind t6b answers report every value correctly but were marked missing by the mechanical check. Graded by reading."
+ },
+ "blind": {
+  "94F713EF": {
+   "task": "t1-read",
+   "reqs": {
+    "R1": {
+     "score": "partly",
+     "why": "outline names 'GGUF/GGML metadata loading and tensor registration' but no gguf_init_from_file/weights_map specifics; text cuts off right after the constructor entry point"
+    },
+    "R2": {
+     "score": "partly",
+     "why": "'File payload reading through the llama_file abstraction' names the layer, but no byte primitive (read_raw/read_aligned_chunk/mmap) and no tensor-agnostic claim"
+    },
+    "R3": {
+     "score": "partly",
+     "why": "'a tensor does not take a single visible open file -> memcpy path' is explicit, but where the copy happens system-wide (load_tensors/load_all_data) is never reached - truncated"
+    },
+    "R4": {
+     "score": "partly",
+     "why": "outline order metadata -> file payload -> final copy is right, but the detailed chain gguf_init_from_file -> weights_map -> allocation -> read_raw/mmap is absent"
+    },
+    "R5": {
+     "score": "met",
+     "why": "attributes the final copy to later code, makes no claim that the shown code reads tensor bytes into a backend buffer"
+    }
+   },
+   "share_met": 0.6,
+   "verdict": "partial",
+   "empty": false
+  },
+  "681D1484": {
+   "task": "t1-read",
+   "reqs": {
+    "R1": {
+     "score": "partly",
+     "why": "'metadata loader ... builds a unified tensor index (weights_map)' is right, but gguf_init_from_file and the no-tensor-bytes-at-construction point are not stated"
+    },
+    "R2": {
+     "score": "partly",
+     "why": "'llama_file/impl ... can read raw bytes' characterizes the layer as low-level, but names no primitive and never says it knows nothing about tensors"
+    },
+    "R3": {
+     "score": "partly",
+     "why": "'no backend tensor copy is proven' is explicit; the where-it-happens half (load_tensors/load_all_data -> backend buffer) is truncated away"
+    },
+    "R4": {
+     "score": "partly",
+     "why": "metadata loader before file reading is consistent; buffer allocation and the read/copy step are never completed"
+    },
+    "R5": {
+     "score": "met",
+     "why": "explicitly refuses the unproven backend-copy reading of the snippet"
+    }
+   },
+   "share_met": 0.6,
+   "verdict": "partial",
+   "empty": false
+  },
+  "5BAA3DC8": {
+   "task": "t1-read",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "gguf_init_from_file with no_alloc=true, weights_map.emplace(llama_tensor_weight(file, idx, offset...)), 'knows where every tensor is, but it has not copied tensor bytes anywhere'"
+    },
+    "R2": {
+     "score": "met",
+     "why": "read_raw/read_raw_at/read_aligned_chunk and the mmap path detailed as low-level byte machinery only"
+    },
+    "R3": {
+     "score": "met",
+     "why": "'no tensor payload is moved into a backend buffer in the code shown' + load_all_data/load_tensors_data -> read_raw/mmap memcpy -> ggml_backend_tensor_set"
+    },
+    "R4": {
+     "score": "met",
+     "why": "section 8 gives the full consistent order constructor -> gguf_init_from_file -> weights_map -> load_all_data -> read_raw -> memcpy -> backend set"
+    },
+    "R5": {
+     "score": "met",
+     "why": "explicitly denies the snippet moves payload to a backend buffer"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass",
+   "empty": false
+  },
+  "CF0794CB": {
+   "task": "t1-read",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "gguf_init_from_file (no_alloc true), n_elements/n_bytes accumulation, weights_map.emplace llama_tensor_weight, 'metadata only. Tensor data remains on disk'"
+    },
+    "R2": {
+     "score": "met",
+     "why": "llama-mmap.cpp llama_file::impl 'low-level file access object', read_raw dispatch to read_aligned_chunk/read_raw_unsafe quoted"
+    },
+    "R3": {
+     "score": "partly",
+     "why": "'the actual copy into a backend tensor buffer happens in code that is not included in the snippet' is explicit, but the where (load_tensors/load_all_data) is never named - truncated at section 2"
+    },
+    "R4": {
+     "score": "partly",
+     "why": "gguf_init_from_file -> weights_map -> raw read path is consistent, but the buffer-allocation step is missing (truncated)"
+    },
+    "R5": {
+     "score": "met",
+     "why": "no false claim; the snippet is credited with nothing beyond descriptor parsing and raw reads"
+    }
+   },
+   "share_met": 0.8,
+   "verdict": "partial",
+   "empty": false
+  },
+  "215BDDA1": {
+   "task": "t1b-read-lang",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "names gemv_fp4, gemv_fp4_b, gemv_fp4_ptrb, gemv_fp4_bs and excludes dequant_fp4_flat as non-GEMV"
+    },
+    "R2": {
+     "score": "met",
+     "why": "blk = rowp + b*36, 'first four bytes are UE4M3 scales, one per 16-element sub-block', gs = gs_ptr[0], s = ue4m3(blk[sb])*gs, part += e2m1(nib)*x, acc += part*s"
+    },
+    "R3": {
+     "score": "met",
+     "why": "y[(size_t)t * ys + row] with row = blockIdx.x, t = blockIdx.y, ys = *y_stride_p, all three named"
+    },
+    "R4": {
+     "score": "met",
+     "why": "comment quoted: shared expert gate|up into ONE [t][1280] buffer read by silu_mul640, stride must be 1280; gemv_fp4_b compact y[t*gridDim.x + row]"
+    },
+    "R5": {
+     "score": "partly",
+     "why": "'no bounds check ... can silently corrupt', too small overlaps / too large gaps-or-past-buffer all present; the single-token-invisibility clause ('the stride never multiplies at t=0') is absent"
+    },
+    "R6": {
+     "score": "met",
+     "why": "conv_silu named from the file with its stride loop over tt; plain guard would leave positions >= blockDim.x unwritten - one fixed launch covers every runtime size"
+    }
+   },
+   "share_met": 0.9167,
+   "verdict": "partial",
+   "empty": false
+  },
+  "7647E0B8": {
+   "task": "t1b-read-lang",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "111 characters: heading 'The kernels that implement the block-scaled FP4 GEMV' then cut - no content at all"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R6": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": false
+  },
+  "37E531DF": {
+   "task": "t1b-read-lang",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "gemv_fp4, gemv_fp4_b, gemv_fp4_bs, gemv_fp4_ptrb all named"
+    },
+    "R2": {
+     "score": "met",
+     "why": "'first four bytes are the per-16-subblock scales, and the following 32 bytes hold 64 packed nibbles', s = ue4m3(blk[sb])*gs with gs = gs_ptr[0], acc += part*s"
+    },
+    "R3": {
+     "score": "met",
+     "why": "y[(size_t)t * ys + row] = red2[0], ys = *y_stride_p, row = blockIdx.x, t = blockIdx.y"
+    },
+    "R4": {
+     "score": "met",
+     "why": "source comment quoted verbatim: ONE [t][1280] gate|up buffer, silu_mul640 contract, plain gemv_fp4_b [t][rows] compact, ptrb y[combo*gridDim.x + row]"
+    },
+    "R5": {
+     "score": "not",
+     "why": "truncated mid-contract ('exactly `1'); the failure-mode discussion was never reached"
+    },
+    "R6": {
+     "score": "not",
+     "why": "no third section - the stride-loop question is never reached"
+    }
+   },
+   "share_met": 0.6667,
+   "verdict": "partial",
+   "empty": false
+  },
+  "CB8E03F2": {
+   "task": "t1b-read-lang",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "four kernels with correct one-line roles each; dequant_fp4_flat excluded"
+    },
+    "R2": {
+     "score": "met",
+     "why": "4 bytes sub-block scales + 32 bytes packed nibbles (blk[4 + (idx>>1)]), gs = gs_ptr[0], s = ue4m3*gs, part*s into acc, 'no final scale multiplication at output'"
+    },
+    "R3": {
+     "score": "met",
+     "why": "y[(size_t)t * ys + row], ys = *y_stride_p, row = blockIdx.x, t = blockIdx.y"
+    },
+    "R4": {
+     "score": "met",
+     "why": "[t][1280] buffer, silu_mul640 h1[t*1280+j] quoted, ys must be 1280, gemv_fp4_b compact y[t*gridDim.x+row]; corrects that gemv_fp4_ptrb's stride is an INPUT stride"
+    },
+    "R5": {
+     "score": "partly",
+     "why": "'does not validate it ... can silently corrupt', too small aliasing / too large gaps-or-overrun present; single-token-invisibility clause absent"
+    },
+    "R6": {
+     "score": "met",
+     "why": "rms_group over 2560 with blockDim 256: partial reduction AND 2304 unwritten outputs under a plain guard; stride loop = one fixed launch for every size"
+    }
+   },
+   "share_met": 0.9167,
+   "verdict": "partial",
+   "empty": false
+  },
+  "57D5660E": {
+   "task": "t1b-read-lang",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "gemv_fp4, gemv_fp4_b (after an explicit self-correction), gemv_fp4_bs, gemv_fp4_ptrb"
+    },
+    "R2": {
+     "score": "met",
+     "why": "36-byte block, 4 scale bytes / 64 values per block, s = ue4m3(blk[sb])*gs, part += e2m1(nib)*x, acc += part*s, 'not applied only at the end of the full row'"
+    },
+    "R3": {
+     "score": "met",
+     "why": "y[(size_t)t * ys + row], row = blockIdx.x, t = blockIdx.y, ys = *y_stride_p"
+    },
+    "R4": {
+     "score": "met",
+     "why": "contract comment quoted, y_stride_p must be 1280, silu_mul640 quoted, gemv_fp4_b compact; note: two '[t][11280]' typos for [t][1280], substance correct"
+    },
+    "R5": {
+     "score": "partly",
+     "why": "silent misplacement with ys>1280 gaps/overrun and ys<1280 overwrite fully covered; single-token-invisibility clause absent"
+    },
+    "R6": {
+     "score": "met",
+     "why": "rms_group concrete example (2560 row, stride 256) plus incomplete-reduction and partial-output failure names; also gemv_f32/argmax_k as further stride-loop kernels"
+    }
+   },
+   "share_met": 0.9167,
+   "verdict": "partial",
+   "empty": false
+  },
+  "790C2D1B": {
+   "task": "t2-write",
+   "reqs": {
+    "R1": {
+     "score": "partly",
+     "why": "LRU_CACHE_HPP guard + <cstddef> <list> then the text ends mid-include-list; no template, not self-contained (truncated; also fails g++ -fsyntax-only: unterminated #ifndef)"
+    },
+    "R2": {
+     "score": "not",
+     "why": "no constructor code; std::invalid_argument appears only in a design comment"
+    },
+    "R3": {
+     "score": "not",
+     "why": "no get() anywhere"
+    },
+    "R4": {
+     "score": "not",
+     "why": "no put() anywhere"
+    },
+    "R5": {
+     "score": "not",
+     "why": "no erase/size/capacity/clear code; only a clear() design note"
+    },
+    "R6": {
+     "score": "partly",
+     "why": "design comments describe exactly unordered_map<K, list iterator> + splice with stable iterators and O(1); no implementing code"
+    },
+    "R7": {
+     "score": "not",
+     "why": "peek() never mentioned"
+    },
+    "R8": {
+     "score": "not",
+     "why": "no main()/assert() tests"
+    },
+    "R9": {
+     "score": "met",
+     "why": "design comments explain max_load_factor/reserve and clear() bucket reuse - the non-obvious choices"
+    }
+   },
+   "share_met": 0.2222,
+   "verdict": "partial",
+   "empty": false
+  },
+  "91D044F4": {
+   "task": "t4-prose",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "German prose, 218 words (<= 400)"
+    },
+    "R2": {
+     "score": "partly",
+     "why": "names the wrong assumption as '58-Slot-Betrieb funktioniert auch auf halbem VRAM'; the per-slot-cost-constant-at-312.44-MiB framing is absent (312.44 never appears)"
+    },
+    "R3": {
+     "score": "partly",
+     "why": "working set ~25.5 GiB vs 16 GiB and collapse of the main claims argued; the driver-silently-spills-to-host-memory clause is absent"
+    },
+    "R4": {
+     "score": "met",
+     "why": "6,51 GiB / 17,70 GiB / 1,32 GiB / 58 slots all used correctly; no wrong number ('25,b>5 GiB' is a garbled rendering of ~25.5, not a wrong value)"
+    }
+   },
+   "share_met": 0.75,
+   "verdict": "partial",
+   "empty": false
+  },
+  "A60C33C6": {
+   "task": "t4-prose",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "German prose, 168 words"
+    },
+    "R2": {
+     "score": "met",
+     "why": "'58 Experten-Slots a 312,44 MiB' + 'die pro-Slot-Kosten sind laut Text nicht mehr konstant' - the constant-per-slot-cost assumption with the exact number"
+    },
+    "R3": {
+     "score": "met",
+     "why": "~7-8 GiB left => ~25 slots instead of 58, 'der Treiber verschiebt in Host-RAM', hit-rate/SSD bottleneck, per-slot cost model collapses"
+    },
+    "R4": {
+     "score": "met",
+     "why": "6,5 GiB / 1,3 GiB / 312,44 MiB / 58 / 17,7 GiB all correct"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass",
+   "empty": false
+  },
+  "50E9A637": {
+   "task": "t4-prose",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "German prose, 223 words"
+    },
+    "R2": {
+     "score": "met",
+     "why": "wrong assumption = the 32-GiB-dimensioned VRAM-resident blocks and slot caches keep fitting / scale linearly on half memory; 'der Preis pro Slot ... bleibt nicht mehr konstant'"
+    },
+    "R3": {
+     "score": "met",
+     "why": "'verschiebt der Treiber Daten still in Host-RAM', gemessene Konstanten gelten nicht mehr, Hitrate sinkt, Latenzen steigen"
+    },
+    "R4": {
+     "score": "met",
+     "why": "6,5 / 1,3 / 17,7 GiB and 58 slots correct; no wrong numbers"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass",
+   "empty": false
+  },
+  "24B82839": {
+   "task": "t4-prose",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "German prose, 283 words"
+    },
+    "R2": {
+     "score": "met",
+     "why": "'die im Text ausdruecklich genannte Annahme, dass der Preis pro Slot konstant bleibt' + tight 32,6-GiB operation with 6,51/1,32/17,70"
+    },
+    "R3": {
+     "score": "met",
+     "why": "fixed Sockel does not scale, 'kann der Treiber Ueberschuesse in Host-RAM verschieben', per-slot cost not constant, 'Hit-Rate, Latenz und Durchsatz ... einbrechen'"
+    },
+    "R4": {
+     "score": "met",
+     "why": "6,51 / 1,32 / 17,70 GiB, 58 Slots, ~25,5 GiB sum - all match"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass",
+   "empty": false
+  },
+  "12222A63": {
+   "task": "t4-prose",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "German prose, 284 words"
+    },
+    "R2": {
+     "score": "met",
+     "why": "wrong assumption = fixed VRAM base + 200k-KV + 58-slot cache transferable to a 16-GiB card because streaming only offloads experts (material equivalent of the below-ceiling assumption)"
+    },
+    "R3": {
+     "score": "partly",
+     "why": "25.5 GiB Sockel vs 16 GiB and miss-cost/latency collapse argued; the driver-silently-spills-to-host clause is absent (only the designed SSD/Host-Tier miss path is named)"
+    },
+    "R4": {
+     "score": "met",
+     "why": "6.51 / 1.32 / 17.70 GiB, 58 Slots, 16 GiB floor - all correct"
+    }
+   },
+   "share_met": 0.875,
+   "verdict": "partial",
+   "empty": false
+  },
+  "76134399": {
+   "task": "t4-prose",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "German prose, 292 words"
+    },
+    "R2": {
+     "score": "met",
+     "why": "'die angegebenen 16 GB VRAM seien eine praktikable Untergrenze' + Grundannahme 'Slot-Kosten sind konstant' explicitly named as what breaks"
+    },
+    "R3": {
+     "score": "met",
+     "why": "'der Treiber den Expert-Cache in Host-Speicher verlagern kann und pro Slot-Kosten nicht mehr konstant sind', Paging/IO/sinkende Cache-Trefferquoten dominieren"
+    },
+    "R4": {
+     "score": "met",
+     "why": "6,51 / 1,32 / 17,70 GiB, 58 Slots, 32.607 / 30.548 MiB, 63,4 GB, UD-IQ3_XXS rung - every number matches the source text"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass",
+   "empty": false
+  },
+  "4271624B": {
+   "task": "t5-agent",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "one line: cmake -S . -B build-server-cuda ... -DLLAMA_BUILD_SERVER=ON -DGGML_CUDA=ON -DTOOLS/TESTS=OFF && cmake --build --target server"
+    },
+    "R2": {
+     "score": "met",
+     "why": "-DGGML_CUDA=ON; deprecated LLAMA_CUDA/LLAMA_CUBLAS explicitly not used"
+    },
+    "R3": {
+     "score": "met",
+     "why": "26 assumptions incl. exact server target name (#4), LLAMA_BUILD_COMMON dependency (#6), CUDA toolkit discoverability (#16/#17), generator (#19)"
+    },
+    "R4": {
+     "score": "met",
+     "why": "every load-bearing choice marked 'the transcript does not show/confirm'; nothing invented as confirmed"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass",
+   "empty": false
+  },
+  "B429C962": {
+   "task": "t5-agent",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "one configure line into -B build with LLAMA_BUILD_SERVER=ON + GGML_CUDA=ON + TOOLS/TESTS/APP/UI OFF, then --build --target server"
+    },
+    "R2": {
+     "score": "met",
+     "why": "-DGGML_CUDA=ON used"
+    },
+    "R3": {
+     "score": "met",
+     "why": "20 assumptions incl. target name (#13), LLAMA_BUILD_COMMON (#11), build type/generator (#6), unused-CLI risk (#19)"
+    },
+    "R4": {
+     "score": "met",
+     "why": "'the transcript never shows the actual target definition' - no invented confirmations"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass",
+   "empty": false
+  },
+  "C4796875": {
+   "task": "t5-agent",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "cmake -S . -B build/llama-server-cuda -DLLAMA_BUILD_SERVER=ON -DGGML_CUDA=ON ... && cmake --build --target llama-server"
+    },
+    "R2": {
+     "score": "met",
+     "why": "-DGGML_CUDA=ON; deprecated alias explicitly flagged as not preferred"
+    },
+    "R3": {
+     "score": "met",
+     "why": "68 numbered assumptions across command/environment, target name (21-22), LLAMA_BUILD_COMMON (25), CUDA toolkit (39-44), generator/build type (9-16)"
+    },
+    "R4": {
+     "score": "met",
+     "why": "all listed as 'assumptions the transcript does not confirm'; nothing quoted as confirmation"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass",
+   "empty": false
+  },
+  "E6658ECD": {
+   "task": "t6b-reason-multi",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "12 x 2 x 256 x 1 B = 6144 bytes/token, shown stepwise"
+    },
+    "R2": {
+     "score": "met",
+     "why": "6144 x 262,144 = 1,610,612,736 B = 3/2 GiB = 1.5 GiB exactly (3 x 2^29 proof)"
+    },
+    "R3": {
+     "score": "met",
+     "why": "3,221,225,472 / 6,144 = 524,288 FULL tokens, 524,288 x 6,144 = 3,221,225,472 remainder-zero proof"
+    },
+    "R4": {
+     "score": "met",
+     "why": "12,288 B/token; 262,144 x 12,288 = 3,221,225,472 B = exactly the 3 GiB budget; +100% overhead derived from the byte difference"
+    },
+    "R5": {
+     "score": "met",
+     "why": "2,457,600,000 <= 3,221,225,472 -> PASS, margin 763,625,472 B = 728.25 MiB (728 x 2^20 + 262,144 = 1/4 MiB) - note: numbers written with LaTeX {,} separators, which the runner's mechanical matcher does not recognize"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass",
+   "empty": false
+  },
+  "C2FD45EF": {
+   "task": "t6b-reason-multi",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "6,144 bytes/token stepwise"
+    },
+    "R2": {
+     "score": "met",
+     "why": "1,610,612,736 B = 3/2 GiB = 1.5 GiB via 3 x 2^29"
+    },
+    "R3": {
+     "score": "met",
+     "why": "floor(3,221,225,472/6,144) = 524,288, remainder 0 shown"
+    },
+    "R4": {
+     "score": "met",
+     "why": "12,288 B/token; 2 x 1,610,612,736 = 3,221,225,472 B = 3 GiB; +100%"
+    },
+    "R5": {
+     "score": "met",
+     "why": "2,457,600,000 B, margin 763,625,472 B = 728.25 MiB, PASS - LaTeX {,} separators hid the values from the mechanical matcher"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass",
+   "empty": false
+  },
+  "8BBC1E15": {
+   "task": "t6b-reason-multi",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "6,144 bytes/token"
+    },
+    "R2": {
+     "score": "met",
+     "why": "1,610,612,736 B = 3/2 GiB"
+    },
+    "R3": {
+     "score": "met",
+     "why": "524,288 tokens with 6 x 2^29 = 3 x 2^30 exactness proof, remainder 0"
+    },
+    "R4": {
+     "score": "met",
+     "why": "12,288 B/token, 3,221,225,472 B = 3.0 GiB, +100% (200% of FP8)"
+    },
+    "R5": {
+     "score": "met",
+     "why": "2,457,600,000 B fits, margin 763,625,472 B = 728.25 MiB, PASS - only answer whose numbers the mechanical matcher also found (plain comma separators)"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass",
+   "empty": false
+  },
+  "87D21F89": {
+   "task": "t2b-write-refactor",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "391C996A": {
+   "task": "t3b-debug-syn",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R6": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "04DB4C75": {
+   "task": "t6-reason",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "88DC36D8": {
+   "task": "t6b-reason-multi",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "95694443": {
+   "task": "t3-debug",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "39C02D96": {
+   "task": "t1b-read-lang",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R6": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "4C8A4217": {
+   "task": "t5-agent",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "C31FD291": {
+   "task": "t5-agent",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "9BF5761D": {
+   "task": "t3-debug",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "9AC5AB3F": {
+   "task": "t2b-write-refactor",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "8131364D": {
+   "task": "t2-write",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R6": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R7": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R8": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R9": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "11A4006A": {
+   "task": "t3b-debug-syn",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R6": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "72F173D2": {
+   "task": "t3b-debug-syn",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R6": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "729DFE18": {
+   "task": "t2b-write-refactor",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "AE75EBD9": {
+   "task": "t5-agent",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "B056BA92": {
+   "task": "t6-reason",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "C4410B82": {
+   "task": "t3-debug",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "21D5187A": {
+   "task": "t6-reason",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "168BA158": {
+   "task": "t3b-debug-syn",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R6": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "58715BDC": {
+   "task": "t6b-reason-multi",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "CDFD1718": {
+   "task": "t3-debug",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "0302C24B": {
+   "task": "t2-write",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R6": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R7": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R8": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R9": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "93046CCF": {
+   "task": "t2b-write-refactor",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "17ACF758": {
+   "task": "t3b-debug-syn",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R6": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "18B1745E": {
+   "task": "t1-read",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "7A10EEF4": {
+   "task": "t6b-reason-multi",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "154BEF92": {
+   "task": "t2-write",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R6": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R7": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R8": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R9": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "F777C175": {
+   "task": "t6-reason",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "09E94491": {
+   "task": "t2-write",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R6": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R7": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R8": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R9": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "2336D1BB": {
+   "task": "t3-debug",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "643ECF48": {
+   "task": "t6-reason",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "4A0CEB95": {
+   "task": "t2b-write-refactor",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "4613D408": {
+   "task": "t3b-debug-syn",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R6": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "79B2352F": {
+   "task": "t2b-write-refactor",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "13535155": {
+   "task": "t1-read",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "DC074ABE": {
+   "task": "t6-reason",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "31F79C79": {
+   "task": "t2-write",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R6": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R7": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R8": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R9": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  },
+  "C3F932EE": {
+   "task": "t3-debug",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail",
+   "empty": true
+  }
+ },
+ "supplement_A-crow-32k": {
+  "t1-read-2101": {
+   "task": "t1-read",
+   "reqs": {
+    "R1": {
+     "score": "partly",
+     "why": "weights_map named as the tensor index the loader builds, but gguf_init_from_file and the no-tensor-bytes-at-construction point absent"
+    },
+    "R2": {
+     "score": "partly",
+     "why": "'llama_file/impl ... can read raw bytes' - layer named, no primitive named, tensor-agnostic point implicit"
+    },
+    "R3": {
+     "score": "partly",
+     "why": "'no backend tensor copy is proven' explicit; the where (load_tensors/load_all_data) never reached - ends at 'The file size is'"
+    },
+    "R4": {
+     "score": "partly",
+     "why": "metadata loader before file opening consistent; allocation + read/copy steps not completed"
+    },
+    "R5": {
+     "score": "met",
+     "why": "explicitly refuses the unproven backend-copy reading"
+    }
+   },
+   "share_met": 0.6,
+   "verdict": "partial"
+  },
+  "t1-read-2102": {
+   "task": "t1-read",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "gguf_init_from_file no_alloc=true, tensor walk with n_elements/n_bytes, weights_map.emplace llama_tensor_weight(file, idx, gguf_ctx, cur)"
+    },
+    "R2": {
+     "score": "met",
+     "why": "llama_file as raw byte machinery: read_raw -> read_aligned_chunk/read_raw_unsafe, read_raw_at, ReadFile; init_fp/init_direct"
+    },
+    "R3": {
+     "score": "partly",
+     "why": "copy localized to ReadFile/memcpy inside the shown reader; load_tensors/load_all_data and backend-buffer allocation never named"
+    },
+    "R4": {
+     "score": "partly",
+     "why": "linear trace consistent, but the buffer-allocation step between weights_map and read_raw is missing"
+    },
+    "R5": {
+     "score": "partly",
+     "why": "constructor copy denied and metadata-array copy distinguished, but the backend copy is presented as fully inside the shown code ('destination that becomes the backend buffer')"
+    }
+   },
+   "share_met": 0.7,
+   "verdict": "partial"
+  },
+  "t1-read-2103": {
+   "task": "t1-read",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "constructor 'does not copy tensor bytes', gguf_init_from_file no_alloc, weights_map.emplace, 'only records tensors and their sizes/offsets'"
+    },
+    "R2": {
+     "score": "met",
+     "why": "read_raw dispatch quoted, read_aligned_chunk/read_raw_unsafe/read_raw_at chain, POSIX init_fd/init_fp mentioned"
+    },
+    "R3": {
+     "score": "partly",
+     "why": "set_tensor_data callback flagged as 'not shown in the excerpt'; the load_tensors/load_all_data driver and backend allocation still not named"
+    },
+    "R4": {
+     "score": "partly",
+     "why": "condensed path gguf_init -> tensors -> file open -> read chain consistent; buffer allocation absent"
+    },
+    "R5": {
+     "score": "met",
+     "why": "constructor copy explicitly denied; the only visible copies named precisely; backend setter marked not shown"
+    }
+   },
+   "share_met": 0.8,
+   "verdict": "partial"
+  },
+  "t2-write-2101": {
+   "task": "t2-write",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "guarded self-contained header template<class K,class V>, includes cstddef/list/optional/unordered_map + the implied <stdexcept>"
+    },
+    "R2": {
+     "score": "met",
+     "why": "explicit LruCache(std::size_t), throws std::invalid_argument on 0"
+    },
+    "R3": {
+     "score": "met",
+     "why": "get -> std::optional<V> with splice to begin (MRU promotion)"
+    },
+    "R4": {
+     "score": "met",
+     "why": "put update path returns early without growth; insert path evicts order_.back() when full"
+    },
+    "R5": {
+     "score": "met",
+     "why": "erase -> bool, size(), capacity(), clear() all present"
+    },
+    "R6": {
+     "score": "met",
+     "why": "unordered_map<K, OrderIt> + std::list with splice; iterator stability and no-rehash reserve documented"
+    },
+    "R7": {
+     "score": "met",
+     "why": "peek() const, no splice"
+    },
+    "R8": {
+     "score": "met",
+     "why": "assert() tests in main(): eviction order, update-no-grow, erase of LRU tail AND MRU head, capacity-1 edge - all logically correct"
+    },
+    "R9": {
+     "score": "met",
+     "why": "design comments for max_load_factor/reserve and clear() bucket reuse"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass"
+  },
+  "t2-write-2102": {
+   "task": "t2-write",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "one self-contained file, template, includes limited to the four named + justified <stdexcept>"
+    },
+    "R2": {
+     "score": "met",
+     "why": "explicit constructor, throws std::invalid_argument on 0"
+    },
+    "R3": {
+     "score": "met",
+     "why": "get -> optional, splice to front, iterator-stability comment"
+    },
+    "R4": {
+     "score": "met",
+     "why": "update path no growth; evict via order_.size()==capacity_ -> back()"
+    },
+    "R5": {
+     "score": "met",
+     "why": "erase/size/capacity/clear present"
+    },
+    "R6": {
+     "score": "met",
+     "why": "unordered_map + list + splice, O(1) amortised argued"
+    },
+    "R7": {
+     "score": "met",
+     "why": "peek const, no recency change"
+    },
+    "R8": {
+     "score": "partly",
+     "why": "coverage complete (eviction, update, tail+head erase, capacity-1, clear) but three asserts are missing their closing paren so the test file does not compile, and assert is a home-grown throw-macro instead of the standard one"
+    },
+    "R9": {
+     "score": "met",
+     "why": "splice-stability and exception notes"
+    }
+   },
+   "share_met": 0.9444,
+   "verdict": "partial"
+  },
+  "t2-write-2103": {
+   "task": "t2-write",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R6": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R7": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R8": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R9": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail"
+  },
+  "t3-debug-2101": {
+   "task": "t3-debug",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail"
+  },
+  "t3-debug-2102": {
+   "task": "t3-debug",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail"
+  },
+  "t3-debug-2103": {
+   "task": "t3-debug",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail"
+  },
+  "t4-prose-2101": {
+   "task": "t4-prose",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "German prose, 284 words"
+    },
+    "R2": {
+     "score": "met",
+     "why": "wrong assumption = fixed VRAM base + 200k-KV + 58-slot cache transferable to a 16-GiB card"
+    },
+    "R3": {
+     "score": "partly",
+     "why": "25.5 GiB vs 16 GiB and miss-cost collapse argued; driver-silently-spills-to-host clause absent"
+    },
+    "R4": {
+     "score": "met",
+     "why": "6.51 / 1.32 / 17.70 GiB, 58 slots, 16 GiB floor - all match the text"
+    }
+   },
+   "share_met": 0.875,
+   "verdict": "partial"
+  },
+  "t4-prose-2102": {
+   "task": "t4-prose",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "German prose, 218 words"
+    },
+    "R2": {
+     "score": "partly",
+     "why": "half-VRAM-fits assumption named; per-slot-cost-constant-at-312.44 framing absent"
+    },
+    "R3": {
+     "score": "partly",
+     "why": "working-set-over-ceiling argued, claims collapse; driver-spill clause absent"
+    },
+    "R4": {
+     "score": "met",
+     "why": "6,51 / 17,70 / 1,32 GiB and 58 slots correct; no wrong number"
+    }
+   },
+   "share_met": 0.75,
+   "verdict": "partial"
+  },
+  "t4-prose-2103": {
+   "task": "t4-prose",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "German prose, 168 words"
+    },
+    "R2": {
+     "score": "met",
+     "why": "'58 Experten-Slots a 312,44 MiB' + 'pro-Slot-Kosten ... nicht mehr konstant'"
+    },
+    "R3": {
+     "score": "met",
+     "why": "~25 statt 58 Slots, 'der Treiber verschiebt in Host-RAM', hit-rate bottleneck, cost model collapse"
+    },
+    "R4": {
+     "score": "met",
+     "why": "6,5 / 1,3 / 312,44 / 58 / 17,7 all correct"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass"
+  },
+  "t5-agent-2101": {
+   "task": "t5-agent",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "configure into fresh -B build + GGML_CUDA + LLAMA_BUILD_SERVER=ON, then cmake --build --target server"
+    },
+    "R2": {
+     "score": "met",
+     "why": "-DGGML_CUDA=ON"
+    },
+    "R3": {
+     "score": "met",
+     "why": "20 assumptions incl. target name #13, LLAMA_BUILD_COMMON #11, build type #6, unused-CLI #19"
+    },
+    "R4": {
+     "score": "met",
+     "why": "'the transcript never shows the actual target definition'"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass"
+  },
+  "t5-agent-2102": {
+   "task": "t5-agent",
+   "reqs": {
+    "R1": {
+     "score": "partly",
+     "why": "right flags and fresh dir, but the single line mixes configure options with '--build --target llama-server' - verified invalid: cmake exits 'Unknown argument --target'"
+    },
+    "R2": {
+     "score": "met",
+     "why": "-DGGML_CUDA=ON"
+    },
+    "R3": {
+     "score": "met",
+     "why": "16 assumptions incl. target name #7, common #8, CUDA toolkit #12, generator/build type #5"
+    },
+    "R4": {
+     "score": "met",
+     "why": "all framed as unconfirmed assumptions"
+    }
+   },
+   "share_met": 0.875,
+   "verdict": "partial"
+  },
+  "t5-agent-2103": {
+   "task": "t5-agent",
+   "reqs": {
+    "R1": {
+     "score": "partly",
+     "why": "right flags, but '--target server --parallel' on the configure line with no --build step - verified invalid (cmake configure rejects --target/--parallel; exits 1)"
+    },
+    "R2": {
+     "score": "met",
+     "why": "GGML_CUDA used, deprecated LLAMA_CUDA/LLAMA_CUBLAS discussed"
+    },
+    "R3": {
+     "score": "met",
+     "why": "15 assumptions incl. target name #5, build type #8, CUDA availability #11"
+    },
+    "R4": {
+     "score": "met",
+     "why": "everything marked as assumption"
+    }
+   },
+   "share_met": 0.875,
+   "verdict": "partial"
+  },
+  "t6-reason-2101": {
+   "task": "t6-reason",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail"
+  },
+  "t6-reason-2102": {
+   "task": "t6-reason",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "offline sweep by r, last[v] updated per occurrence (remove old point, insert new), present iff p_v(r) in [l,r]"
+    },
+    "R2": {
+     "score": "met",
+     "why": "segment tree over value ranks, per-node sorted position list + Fenwick + tot, build code given - implementable"
+    },
+    "R3": {
+     "score": "met",
+     "why": "O((n+q) log m log n) = O((n+q) log^2 n) derived per phase, O(n log n) memory, 2 s argued at n,q=2e5, log2 n <= 18"
+    },
+    "R4": {
+     "score": "met",
+     "why": "n=8 worked with per-prefix point tables; (1,5,2)->3, (2,7,3)->4, (4,4,2)->-1 all exact with the descent shown"
+    },
+    "R5": {
+     "score": "met",
+     "why": "all-identical array and all-distinct full-range queries, each with the concrete failure reason"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass"
+  },
+  "t6-reason-2103": {
+   "task": "t6-reason",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "mirror variant: offline by l right-to-left, first-occurrence-after-l representative, present iff next_c(l) <= r - mathematically equivalent marking technique"
+    },
+    "R2": {
+     "score": "met",
+     "why": "value segment tree with per-node Fenwicks over positions, build code complete"
+    },
+    "R3": {
+     "score": "not",
+     "why": "only fragmentary counts (3.8e6 insertions, depth <= 19); no total complexity stated - truncated"
+    },
+    "R4": {
+     "score": "not",
+     "why": "worked case never reached"
+    },
+    "R5": {
+     "score": "not",
+     "why": "breaking inputs never reached"
+    }
+   },
+   "share_met": 0.4,
+   "verdict": "partial"
+  },
+  "t1b-read-lang-2101": {
+   "task": "t1b-read-lang",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "gemv_fp4, gemv_fp4_b (self-corrected), gemv_fp4_bs, gemv_fp4_ptrb"
+    },
+    "R2": {
+     "score": "met",
+     "why": "36-byte block, 4 scale bytes / 64 values, s = ue4m3(blk[sb])*gs, part += e2m1(nib)*x, acc += part*s"
+    },
+    "R3": {
+     "score": "met",
+     "why": "y[(size_t)t * ys + row], row=blockIdx.x, t=blockIdx.y, ys=*y_stride_p"
+    },
+    "R4": {
+     "score": "met",
+     "why": "contract comment quoted, y_stride_p must be 1280, silu_mul640 quoted, gemv_fp4_b compact (two '[t][11280]' typos, substance correct)"
+    },
+    "R5": {
+     "score": "partly",
+     "why": "silent misplacement, ys>1280 gaps/overrun, ys<1280 overwrite; single-token-invisibility clause absent"
+    },
+    "R6": {
+     "score": "met",
+     "why": "rms_group concrete (2560 row, stride 256), gemv_f32/argmax_k named"
+    }
+   },
+   "share_met": 0.9167,
+   "verdict": "partial"
+  },
+  "t1b-read-lang-2102": {
+   "task": "t1b-read-lang",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "four kernels named"
+    },
+    "R2": {
+     "score": "met",
+     "why": "4 bytes sub-block scales + 32 bytes nibbles, gs = gs_ptr[0], full accumulation chain"
+    },
+    "R3": {
+     "score": "met",
+     "why": "formula with all three index sources"
+    },
+    "R4": {
+     "score": "met",
+     "why": "contract comment quoted, ys must be 1280, silu_mul640 quoted ('silu_mul6640'/'[t][1180]' name garbles, substance correct)"
+    },
+    "R5": {
+     "score": "partly",
+     "why": "silent breakage with clobber/gaps; single-token-invisibility clause absent"
+    },
+    "R6": {
+     "score": "met",
+     "why": "rms_group + the GEMV k_dim stride-loop pattern"
+    }
+   },
+   "share_met": 0.9167,
+   "verdict": "partial"
+  },
+  "t1b-read-lang-2103": {
+   "task": "t1b-read-lang",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "four kernels + dequant_fp4_flat excluded"
+    },
+    "R2": {
+     "score": "met",
+     "why": "full nibble-extraction code, 4+32 byte layout, two-level scale at sub-block granularity"
+    },
+    "R3": {
+     "score": "met",
+     "why": "formula with row/t/ys all named"
+    },
+    "R4": {
+     "score": "met",
+     "why": "[T][1280], ys==1280, silu_mul640 code quoted with p13 halves"
+    },
+    "R5": {
+     "score": "partly",
+     "why": "silent corruption, gaps/overwrite, no fault if inside allocation; single-token-invisibility clause absent"
+    },
+    "R6": {
+     "score": "met",
+     "why": "rms_group full kernel code + gate_dot"
+    }
+   },
+   "share_met": 0.9167,
+   "verdict": "partial"
+  },
+  "t3b-debug-syn-2101": {
+   "task": "t3b-debug-syn",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "missing release/acquire edge between host publication and GPU consumption; volatile not acquire; consumer launched before first submission; both snippets needed to see it"
+    },
+    "R2": {
+     "score": "met",
+     "why": "init 0, consumer launched waiting target=1, host fill_payload then flags[0]=1, consumer exits on >=1, may read stale payload"
+    },
+    "R3": {
+     "score": "met",
+     "why": "3-step mis-execution with observed values (flags[0]: 0 -> 1, stale jobs[0] read)"
+    },
+    "R4": {
+     "score": "met",
+     "why": "release-publish/acquire-read via cuda::memory_order atomics or system-scope fences (PTX-style st.release/ld.acquire sys); fence names garbled but the fix family is correct"
+    },
+    "R5": {
+     "score": "met",
+     "why": "'No, not as a complete fix' - == creates no happens-before edge; == only unambiguous with non-wrapping unique sequences"
+    },
+    "R6": {
+     "score": "met",
+     "why": "wrap -> equality collision (ABA), wider counter/epoch fix - internally consistent and justified"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass"
+  },
+  "t3b-debug-syn-2102": {
+   "task": "t3b-debug-syn",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "lower-bound wait on a reusable global sequence number = ring ABA; consumer launched before any submission; late-starting consumer catches a later occurrence"
+    },
+    "R2": {
+     "score": "met",
+     "why": "init 0, launch, poll 0, publish 1, republish 2 - exact sequence given"
+    },
+    "R3": {
+     "score": "met",
+     "why": "3-step interleaving: flags[0] 0 -> 1 (job A) -> 2 (job B); consumer sees 2, 2<1 false, consumes job B, job A lost"
+    },
+    "R4": {
+     "score": "met",
+     "why": "exact-equality occurrence token + release/acquire with PTX st.release.gpu.sys / ld.acquire.gpu.sys"
+    },
+    "R5": {
+     "score": "met",
+     "why": "== fixes the aliasing bug but not release/acquire; == may wait forever when the slot was already overwritten; only correct non-wrapping with exact targets"
+    },
+    "R6": {
+     "score": "met",
+     "why": "wrap destroys equality uniqueness (ABA), wider counter/epoch/(epoch,sequence) remedies"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass"
+  },
+  "t3b-debug-syn-2103": {
+   "task": "t3b-debug-syn",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "reusable ring slot used as one-shot sequence + no release/acquire; ABA/generation family, both snippets required"
+    },
+    "R2": {
+     "score": "met",
+     "why": "flags[0]=0, consumer waits, job A publishes 1, slot reused with job Z / 257"
+    },
+    "R3": {
+     "score": "met",
+     "why": "3-step: 257 >= 1 accepted, job Z read instead of job A; plus the no-acquire stale-payload variant"
+    },
+    "R4": {
+     "score": "met",
+     "why": "unique generation tag + exact equality, and cuda::memory_order release/acquire pair"
+    },
+    "R5": {
+     "score": "met",
+     "why": "== removes the specific misexecution only non-wrapping; 'still need acquire/release'; wait-forever/full-wrap wait noted"
+    },
+    "R6": {
+     "score": "met",
+     "why": "wrap -> tag collision, epoch/generation struct or wider counter"
+    }
+   },
+   "share_met": 1.0,
+   "verdict": "pass"
+  },
+  "t2b-write-refactor-2101": {
+   "task": "t2b-write-refactor",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail"
+  },
+  "t2b-write-refactor-2102": {
+   "task": "t2b-write-refactor",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "two identical field-parse blocks named; parse_one<T> helper with expected_kind, elem_bytes, kind/count targets, header mode"
+    },
+    "R2": {
+     "score": "met",
+     "why": "'|| short-circuits ... second B header word into the same kind_b ... count_b is never assigned ... indeterminate ... undefined behaviour'"
+    },
+    "R3": {
+     "score": "met",
+     "why": "memcpy native byte order / big-endian host named; 32-bit size_t overflow kept as ADDITIONAL hazard"
+    },
+    "R4": {
+     "score": "met",
+     "why": "bug deliberately preserved (SameFieldTwice mode, 'Deliberately uninitialised') and flagged, not silently fixed"
+    },
+    "R5": {
+     "score": "partly",
+     "why": "complete translation unit with a_out-before-b order preserved, but it does not compile: 'uint644_t' twice and a degenerate '#define push_back push_back'"
+    }
+   },
+   "share_met": 0.9,
+   "verdict": "partial"
+  },
+  "t2b-write-refactor-2103": {
+   "task": "t2b-write-refactor",
+   "reqs": {
+    "R1": {
+     "score": "met",
+     "why": "repeated shape named; parse_field<T, HeaderReader> with expected_kind and element_size"
+    },
+    "R2": {
+     "score": "met",
+     "why": "kind_b read twice into the same variable, count_b never written, indeterminate use"
+    },
+    "R3": {
+     "score": "not",
+     "why": "only the size_t-overflow hazard named; the memcpy endianness hazard is absent (the rubric counts overflow as additional, not as replacement)"
+    },
+    "R4": {
+     "score": "met",
+     "why": "read_b_header preserves the bug exactly, documented as deliberate"
+    },
+    "R5": {
+     "score": "partly",
+     "why": "complete code with call order preserved, but does not compile ('uint332_t' three times) and carries stray embedded tokens ('fit.9727', 'refactoring.8763')"
+    }
+   },
+   "share_met": 0.7,
+   "verdict": "partial"
+  },
+  "t6b-reason-multi-2101": {
+   "task": "t6b-reason-multi",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail"
+  },
+  "t6b-reason-multi-2102": {
+   "task": "t6b-reason-multi",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail"
+  },
+  "t6b-reason-multi-2103": {
+   "task": "t6b-reason-multi",
+   "reqs": {
+    "R1": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R2": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R3": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R4": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    },
+    "R5": {
+     "score": "not",
+     "why": "empty answer - no content produced; nothing to grade against any requirement"
+    }
+   },
+   "share_met": 0.0,
+   "verdict": "fail"
+  }
+ }
+}

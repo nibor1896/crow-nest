@@ -19,34 +19,9 @@ use crow_nest_engine::cnq;
 use crow_nest_engine::cuda::{self, CUdeviceptr, Pinned};
 use crow_nest_engine::geo::*;
 use crow_nest_engine::sample::Rng;
-use crow_nest_engine::kernels::{launch_sync, launch_v, Kernels};
+use crow_nest_engine::kernels::{act_cascade::{self, xq_row_bytes}, launch_sync, launch_v, Kernels};
 
 // ---------------- Rust twins of the device math ----------------
-
-fn q_e2m1(v: f32) -> u32 {
-    let s = if v < 0.0 { 8u32 } else { 0 };
-    let r = v.abs();
-    if r <= 0.25 { s }
-    else if r < 0.75 { s | 1 }
-    else if r <= 1.25 { s | 2 }
-    else if r < 1.75 { s | 3 }
-    else if r <= 2.5 { s | 4 }
-    else if r < 3.5 { s | 5 }
-    else if r <= 5.0 { s | 6 }
-    else { s | 7 }
-}
-
-fn enc_ue4m3_up(s: f32) -> u8 {
-    if !(s > 0.0) { return 0; }
-    for e in 0..16i32 {
-        let mul = if e == 0 { 512.0f32 } else { (2.0f32).powi(10 - e) };
-        let m = (s * mul).ceil() - if e == 0 { 0.0 } else { 8.0 };
-        if (0.0..=7.0).contains(&m) {
-            return ((e << 3) | m as i32) as u8;
-        }
-    }
-    0x7E
-}
 
 /// dequantize a [rows][k_dim] NVFP4 slab (36-byte 64-blocks) — container math
 fn dequant_slab(w: &[u8], rows: usize, k_dim: usize, gs: f32) -> Vec<f32> {
@@ -66,62 +41,17 @@ fn dequant_slab(w: &[u8], rows: usize, k_dim: usize, gs: f32) -> Vec<f32> {
     out
 }
 
-/// Rust twin of quant_x_fp4: THREE levels per 16-block (level 0: smallest
+/// Rust twin of quant_x_fp4 (lib `kernels::act_cascade`): the per-row
+/// power-of-two pre-scale, THREE levels per 16-block (level 0: smallest
 /// ue4m3>=amax/6 scale + RNE ties-to-even e2m1; levels 1-2: the residual
-/// quantized the same way). Returns [level0 | level1 | level2] bytes.
+/// quantized the same way), then the f32 row factor 2^-k.
 fn quant_row(x: &[f32], k_dim: usize) -> Vec<u8> {
-    let bpr = k_dim / 64;
-    let mut out = vec![0u8; bpr * 108];
-    for b in 0..bpr {
-        for s in 0..4usize {
-            let p = &x[b * 64 + s * 16..b * 64 + s * 16 + 16];
-            let mut src = p.to_vec();
-            for lv in 0..3usize {
-                let base = lv * bpr * 36 + b * 36;
-                let amax = src.iter().fold(0f32, |a, &v| a.max(v.abs()));
-                let sc = enc_ue4m3_up(amax / 6.0f32);
-                let inv = 1.0f32 / cnq::ue4m3(sc as u32);
-                let scf = cnq::ue4m3(sc as u32);
-                out[base + s] = sc;
-                let mut r = [0f32; 16];
-                for j in 0..8usize {
-                    let n0 = q_e2m1(src[2 * j] * inv);
-                    let n1 = q_e2m1(src[2 * j + 1] * inv);
-                    out[base + 4 + s * 8 + j] = (n0 | (n1 << 4)) as u8;
-                    r[2 * j] = src[2 * j] - cnq::e2m1(n0) * scf;
-                    r[2 * j + 1] = src[2 * j + 1] - cnq::e2m1(n1) * scf;
-                }
-                src = r.to_vec();
-            }
-        }
-    }
-    out
+    act_cascade::quant_row(x, k_dim)
 }
 
+/// what the MMA consumers see: (level 0 + level 1 + level 2) * 2^-k
 fn dequant_quant_row_2l(q: &[u8], k_dim: usize) -> Vec<f32> {
-    let bpr = k_dim / 64;
-    let mut out = dequant_quant_row(&q[..bpr * 36], k_dim);
-    for lv in 1..3usize {
-        let l = dequant_quant_row(&q[lv * bpr * 36..(lv + 1) * bpr * 36], k_dim);
-        for (o, v) in out.iter_mut().zip(l.iter()) {
-            *o += v;
-        }
-    }
-    out
-}
-
-fn dequant_quant_row(q: &[u8], k_dim: usize) -> Vec<f32> {
-    let bpr = k_dim / 64;
-    let mut out = vec![0f32; k_dim];
-    for b in 0..bpr {
-        let blk = &q[b * 36..b * 36 + 36];
-        for idx in 0..64usize {
-            let byte = blk[4 + (idx >> 1)] as u32;
-            let nib = if idx & 1 == 1 { byte >> 4 } else { byte & 0xF };
-            out[b * 64 + idx] = cnq::e2m1(nib) * cnq::ue4m3(blk[idx >> 4] as u32);
-        }
-    }
-    out
+    act_cascade::dequant_row(q, k_dim)
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -320,7 +250,7 @@ unsafe fn gate_stage(k: &Kernels, n2560: CUdeviceptr, n640: CUdeviceptr, n64: CU
         let gs_dev = cuda::to_f32_dev(&[gs]);
         let y_naive = cuda::alloc_zeroed(n_combos * rows * 4);
         let y_mma = cuda::alloc_zeroed(n_combos * rows * 4);
-        let xq_dev = cuda::alloc_zeroed(x_rows * bpr * 108);
+        let xq_dev = cuda::alloc_zeroed(x_rows * xq_row_bytes(bpr));
 
         // naive path (p10-verified reference)
         launch_sync(k.f("gemv_fp4_ptrb"), rows as u32, n_combos as u32, 1, 256, &[
@@ -340,13 +270,13 @@ unsafe fn gate_stage(k: &Kernels, n2560: CUdeviceptr, n640: CUdeviceptr, n64: CU
 
         let y_n = cuda::dtoh(y_naive, n_combos * rows);
         let y_m = cuda::dtoh(y_mma, n_combos * rows);
-        let xq_host = dtoh_bytes(xq_dev, x_rows * bpr * 108);
+        let xq_host = dtoh_bytes(xq_dev, x_rows * xq_row_bytes(bpr));
 
         // device quant vs Rust twin must agree BYTE-EXACT (all levels)
         let mut q_mismatch = 0usize;
         for r in 0..x_rows {
             let twin = quant_row(&x[r * k_dim..(r + 1) * k_dim], k_dim);
-            let dev = &xq_host[r * bpr * 108..(r + 1) * bpr * 108];
+            let dev = &xq_host[r * xq_row_bytes(bpr)..(r + 1) * xq_row_bytes(bpr)];
             if twin[..] != dev[..] {
                 q_mismatch += 1;
             }
@@ -414,8 +344,8 @@ unsafe fn bench_stage(k: &Kernels, n2560: CUdeviceptr, n640: CUdeviceptr, one: C
         let h1 = cuda::alloc_zeroed(combos * 2 * INTER * 4);
         let h2 = cuda::alloc_zeroed(combos * INTER * 4);
         let eo = cuda::alloc_zeroed(combos * H * 4);
-        let xq_gu = cuda::alloc_zeroed(tokens * bpr_gu * 108);
-        let xq_dn = cuda::alloc_zeroed(combos * bpr_dn * 108);
+        let xq_gu = cuda::alloc_zeroed(tokens * xq_row_bytes(bpr_gu));
+        let xq_dn = cuda::alloc_zeroed(combos * xq_row_bytes(bpr_dn));
         let nt_combo = cuda::to_i32_dev(&[(combos * INTER) as i32]);
 
         let seq_naive = || {
@@ -502,7 +432,7 @@ unsafe fn dense_gate_stage(k: &Kernels) -> bool {
         let one = cuda::to_i32_dev(&[1]);
         let y_naive = cuda::alloc_zeroed(tokens * rows * 4);
         let y_mma = cuda::alloc_zeroed(tokens * rows * 4);
-        let xq_dev = cuda::alloc_zeroed(tokens * bpr * 108);
+        let xq_dev = cuda::alloc_zeroed(tokens * xq_row_bytes(bpr));
 
         launch_sync(k.f("gemv_fp4_b"), rows as u32, tokens as u32, 1, 256, &[
             w_dev as u64, x_dev as u64, gs_dev as u64, y_naive as u64, k_dim_dev as u64]);
@@ -556,7 +486,7 @@ unsafe fn dense_gate_stage(k: &Kernels) -> bool {
         let one = cuda::to_i32_dev(&[1]);
         let sh12_naive = cuda::alloc_zeroed(tokens * 2 * INTER * 4);
         let sh12_mma = cuda::alloc_zeroed(tokens * 2 * INTER * 4);
-        let xq_dev = cuda::alloc_zeroed(tokens * bpr * 108);
+        let xq_dev = cuda::alloc_zeroed(tokens * xq_row_bytes(bpr));
 
         launch_sync(k.f("gemv_fp4_bs"), rows as u32, tokens as u32, 1, 256, &[
             wsg_dev as u64, x_dev as u64, gs_dev as u64, sh12_naive as u64,
@@ -688,7 +618,7 @@ unsafe fn dense_bench_stage(k: &Kernels) {
         let w_dev = cuda::upload_dev(&w);
         let x_dev = cuda::to_f32_dev(&x);
         let y = cuda::alloc_zeroed(t * rows * 4);
-        let xq = cuda::alloc_zeroed(t * (k_dim / 64) * 108);
+        let xq = cuda::alloc_zeroed(t * xq_row_bytes(k_dim / 64));
         let rows_dev = cuda::to_i32_dev(&[rows as i32]);
         group!("hc-inject", 96,
             (),
@@ -716,8 +646,8 @@ unsafe fn dense_bench_stage(k: &Kernels) {
         let wout = cuda::upload_dev(&rand_slab(&mut rng, H, GDN_VAL));
         let xm = cuda::to_f32_dev(&rand_rows(&mut rng, t, H));
         let xg = cuda::to_f32_dev(&rand_rows(&mut rng, t, GDN_VAL));
-        let xq_m = cuda::alloc_zeroed(t * (H / 64) * 108);
-        let xq_v = cuda::alloc_zeroed(t * (GDN_VAL / 64) * 108);
+        let xq_m = cuda::alloc_zeroed(t * xq_row_bytes(H / 64));
+        let xq_v = cuda::alloc_zeroed(t * xq_row_bytes(GDN_VAL / 64));
         let o_mq = cuda::alloc_zeroed(t * GDN_CONV * 4);
         let o_gz = cuda::alloc_zeroed(t * GDN_VAL * 4);
         let o_gb = cuda::alloc_zeroed(t * GDN_VHEADS * 4);
@@ -771,8 +701,8 @@ unsafe fn dense_bench_stage(k: &Kernels) {
         let wo = cuda::upload_dev(&rand_slab(&mut rng, H, GDN_VAL));
         let xm = cuda::to_f32_dev(&rand_rows(&mut rng, t, H));
         let xg = cuda::to_f32_dev(&rand_rows(&mut rng, t, GDN_VAL));
-        let xq_m = cuda::alloc_zeroed(t * (H / 64) * 108);
-        let xq_v = cuda::alloc_zeroed(t * (GDN_VAL / 64) * 108);
+        let xq_m = cuda::alloc_zeroed(t * xq_row_bytes(H / 64));
+        let xq_v = cuda::alloc_zeroed(t * xq_row_bytes(GDN_VAL / 64));
         let o_v = cuda::alloc_zeroed(t * KV_ROWS * 4);
         let o_qk = cuda::alloc_zeroed(t * QSA_QK_ROWS * 4);
         let o_ay = cuda::alloc_zeroed(t * H * 4);
@@ -814,8 +744,8 @@ unsafe fn dense_bench_stage(k: &Kernels) {
         let wsdn = cuda::upload_dev(&rand_slab(&mut rng, H, INTER));
         let xm = cuda::to_f32_dev(&rand_rows(&mut rng, t, H));
         let xs = cuda::to_f32_dev(&rand_rows(&mut rng, t, INTER));
-        let xq_gu = cuda::alloc_zeroed(t * (H / 64) * 108);
-        let xq_s = cuda::alloc_zeroed(t * (INTER / 64) * 108);
+        let xq_gu = cuda::alloc_zeroed(t * xq_row_bytes(H / 64));
+        let xq_s = cuda::alloc_zeroed(t * xq_row_bytes(INTER / 64));
         let sh12 = cuda::alloc_zeroed(t * 2 * INTER * 4);
         let sdown = cuda::alloc_zeroed(t * H * 4);
         group!("shared", 48,
@@ -852,7 +782,7 @@ unsafe fn dense_bench_stage(k: &Kernels) {
         let wk = cuda::upload_dev(&rand_slab(&mut rng, HCT, H));
         let wv2 = cuda::upload_dev(&rand_slab(&mut rng, H, H));
         let xe = cuda::to_f32_dev(&rand_rows(&mut rng, t, H));
-        let xq_e = cuda::alloc_zeroed(t * (H / 64) * 108);
+        let xq_e = cuda::alloc_zeroed(t * xq_row_bytes(H / 64));
         let ok = cuda::alloc_zeroed(t * HCT * 4);
         let ov = cuda::alloc_zeroed(t * H * 4);
         group!("ple", 1,

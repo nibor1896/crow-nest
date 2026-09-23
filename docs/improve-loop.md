@@ -94,3 +94,34 @@ all nine green at commit `8ff2055` on 2026-09-17.
 - Machine and method for every Linux number: the second environment block of
   `docs/system-landscape.md`, one engine at a time, inside the memory-bounded scope of
   `tools/serve-linux.sh` (the RAM gate refuses a second engine while the first holds the tier).
+
+## The quantization acceptance rule (Ergänzung 2026-09-20, issue #91)
+
+A HARD RULE for every container or precision change, written down because #79 earned it: **no
+container/precision change is accepted on weight-space evidence.** Not plain MSE, not
+importance-weighted MSE, not any error term — #79 measured three requant rules that all
+LOWERED the weight-space error (best −19.74 % importance-weighted) and all moved the model
+FURTHER from its f32 oracle (+0.025…+0.104, sign tests to 6.5e-22;
+`docs/expert-requant.md` §7.5/§8: "the instrument that would have been used to tune such a
+rule, weight-space MSE, points the wrong way on this architecture").
+
+Acceptance = oracle-KLD on the #90 corpora (short + long-context + German) against the
+`none` baseline, beyond the 0.025 paired threshold. Weight-space numbers may be REPORTED for
+the record, never used to accept, reject, tune or select. Phase-1 artifacts of #91:
+`docs/acceptance/issue-91-phase1.md`.
+
+**Lesson of 2026-09-23 (#91): the per-layer reference diff comes before precision arms.**
+
+- **What happened.** The dense BF16 overlay improved the symptom metric. On the multi-site
+  corruption probe it went from 15 to 12 of 23 corrupt sites, and it was briefly made the
+  serve default (`0924406`, reverted `0254ed6`).
+- **What it was hiding.** The cause was an engine wiring bug: the PLE n-gram rows were read
+  at the wrong container offset (`85a48e7`). The overlay was partly masking that bug. With the
+  fix the probe reads 4/23, the same as llama.cpp.
+- **What found the bug.** A per-layer diff against a reference engine
+  (`tools/layerdiff/`). Layer 0 matched, and layer 1 split at cos 0.2. None of the precision
+  arms found it.
+- **The rule.** When a symptom points at quantization, first diff the engine per layer against
+  a reference engine at a failing site. Run precision or overlay arms only after the first
+  divergent layer is explained. An arm that moves a symptom metric is not evidence about the
+  cause. Acceptance of any precision change stays paired oracle-KLD, as above.

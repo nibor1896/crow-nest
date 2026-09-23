@@ -1,0 +1,133 @@
+{
+ "label": "presence0",
+ "rounds": 8,
+ "rounds_ok": 8,
+ "lines_total": 320,
+ "lines_with_error": 2,
+ "hex_char_errors": 0,
+ "missing": 2,
+ "line_error_rate": 0.0063,
+ "char_error_rate": 0.0,
+ "prompt_tokens_mean": 102752,
+ "ctx_tokens_target": 100000,
+ "position": "end",
+ "filler_seed": 91,
+ "sampling": {
+  "temperature": 1.0,
+  "top_p": 0.95,
+  "top_k": 20,
+  "min_p": 0.01
+ },
+ "tokens_per_filler_line": 35.81,
+ "filler_lines": 2792,
+ "warmup": {
+  "prompt_tokens": 101761,
+  "seconds": 110.6
+ },
+ "rounds_detail": [
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 1,
+   "seconds": 17.5,
+   "reply_chars": 1487,
+   "prompt_tokens": 102748,
+   "cached_tokens": 101761,
+   "finish": "stop"
+  },
+  {
+   "lines": 40,
+   "missing": 2,
+   "extra": 0,
+   "lines_with_error": 2,
+   "hex_char_errors": 0,
+   "seed": 2,
+   "seconds": 16.6,
+   "reply_chars": 1487,
+   "prompt_tokens": 102752,
+   "cached_tokens": 101761,
+   "finish": "stop"
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 3,
+   "seconds": 16.9,
+   "reply_chars": 1487,
+   "prompt_tokens": 102752,
+   "cached_tokens": 101761,
+   "finish": "stop"
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 4,
+   "seconds": 127.9,
+   "reply_chars": 1487,
+   "prompt_tokens": 102761,
+   "cached_tokens": 0,
+   "finish": "stop"
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 5,
+   "seconds": 127.9,
+   "reply_chars": 1487,
+   "prompt_tokens": 102757,
+   "cached_tokens": 0,
+   "finish": "stop"
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 6,
+   "seconds": 127.7,
+   "reply_chars": 1487,
+   "prompt_tokens": 102743,
+   "cached_tokens": 0,
+   "finish": "stop"
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 7,
+   "seconds": 127.8,
+   "reply_chars": 1487,
+   "prompt_tokens": 102751,
+   "cached_tokens": 0,
+   "finish": "stop"
+  },
+  {
+   "lines": 40,
+   "missing": 0,
+   "extra": 0,
+   "lines_with_error": 0,
+   "hex_char_errors": 0,
+   "seed": 8,
+   "seconds": 127.5,
+   "reply_chars": 1487,
+   "prompt_tokens": 102748,
+   "cached_tokens": 0,
+   "finish": "stop"
+  }
+ ]
+}

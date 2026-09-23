@@ -1,0 +1,294 @@
+{
+ "what": "#91 multi-site corruption set: corrupted tool-call arguments of robin's 2026-09-23 diorama session (serve 70a69e3 bare container, Crow c4f1b3c, boot 2026-09-23T04:37:47Z). produced = the stored argument text around the site, correct = the same text as the context spells it.",
+ "tokenizer": "../../models/Qwen3.8-Flash-Next-original",
+ "crow_core": "../../decode_out/sessions/2026-09-23-diorama/crow-c4f1b3c/cli/crow_core.py",
+ "served_model": "Qwen3.8-Flash-Next-CNQ4.5-M.cnq",
+ "template_reasoning_effort": "xhigh",
+ "engine_log": "../../decode_out/sessions/2026-09-23-diorama/engine.log",
+ "engine_log_after": "2026-09-23T04:37:47",
+ "segments": {
+  "1": {
+   "file": "../../decode_out/sessions/2026-09-23-diorama/seg1-rollover-20260923-073002.json",
+   "engine_requests": [
+    1,
+    230
+   ]
+  },
+  "2": {
+   "file": "../../decode_out/sessions/2026-09-23-diorama/seg2-rollover-20260923-082406.json",
+   "engine_requests": [
+    231,
+    480
+   ]
+  },
+  "3": {
+   "file": "../../decode_out/sessions/2026-09-23-diorama/seg3-session.json",
+   "engine_requests": [
+    481,
+    612
+   ]
+  }
+ },
+ "sites": [
+  {
+   "id": "home-1196",
+   "segment": "1",
+   "at": 22,
+   "param": "cwd",
+   "class": "path digit",
+   "produced": "/home/nibor1196",
+   "correct": "/home/nibor1896",
+   "context": "fresh"
+  },
+  {
+   "id": "home-1018",
+   "segment": "1",
+   "at": 26,
+   "param": "cwd",
+   "class": "path digit",
+   "produced": "/home/nibor1018",
+   "correct": "/home/nibor1896",
+   "context": "fresh"
+  },
+  {
+   "id": "o113-a48",
+   "segment": "1",
+   "at": 48,
+   "param": "content",
+   "class": "index digit",
+   "produced": "o[113]=p[1]",
+   "correct": "o[13]=p[1]",
+   "context": "fresh"
+  },
+  {
+   "id": "o115-a48",
+   "segment": "1",
+   "at": 48,
+   "param": "content",
+   "class": "index digit",
+   "produced": "o[115]=1",
+   "correct": "o[15]=1",
+   "context": "contaminated"
+  },
+  {
+   "id": "o110-a50",
+   "segment": "1",
+   "at": 50,
+   "param": "content",
+   "class": "index digit",
+   "produced": "o[110] = c",
+   "correct": "o[10] = c",
+   "context": "fresh"
+  },
+  {
+   "id": "zero00-a50",
+   "segment": "1",
+   "at": 50,
+   "param": "content",
+   "class": "literal digit",
+   "produced": "[0,0,00]",
+   "correct": "[0,0,0]",
+   "context": "fresh"
+  },
+  {
+   "id": "o111-a52",
+   "segment": "1",
+   "at": 52,
+   "param": "command",
+   "class": "index digit",
+   "produced": "o[111] = 0",
+   "correct": "o[11] = 0",
+   "context": "fresh"
+  },
+  {
+   "id": "o1100-a85",
+   "segment": "1",
+   "at": 85,
+   "param": "content",
+   "class": "index digit",
+   "produced": "o[1100]",
+   "correct": "o[10]",
+   "context": "contaminated"
+  },
+  {
+   "id": "o112-a85",
+   "segment": "1",
+   "at": 85,
+   "param": "content",
+   "class": "index digit",
+   "produced": "o[112] = x",
+   "correct": "o[12] = x",
+   "context": "contaminated"
+  },
+  {
+   "id": "o112-a93",
+   "segment": "1",
+   "at": 93,
+   "param": "content",
+   "class": "index digit",
+   "produced": "o[112] = -(r",
+   "correct": "o[12] = -(r",
+   "context": "contaminated"
+  },
+  {
+   "id": "o111-a97",
+   "segment": "1",
+   "at": 97,
+   "param": "content",
+   "class": "index digit",
+   "produced": "o[111] = 0",
+   "correct": "o[11] = 0",
+   "context": "contaminated"
+  },
+  {
+   "id": "leak-a121",
+   "segment": "1",
+   "at": 121,
+   "param": "path",
+   "class": "markup leak",
+   "produced": "src/scene.js\nparameter_path",
+   "correct": "src/scene.js\n</parameter>",
+   "context": "fresh"
+  },
+  {
+   "id": "N33-a131",
+   "segment": "1",
+   "at": 131,
+   "param": "content",
+   "class": "identifier digit",
+   "produced": "Uint16Array(N33)",
+   "correct": "Uint16Array(N3)",
+   "context": "fresh"
+  },
+  {
+   "id": "N33-a145",
+   "segment": "1",
+   "at": 145,
+   "param": "content",
+   "class": "identifier digit",
+   "produced": "Uint16Array(N33)",
+   "correct": "Uint16Array(N3)",
+   "context": "contaminated"
+  },
+  {
+   "id": "mat44-a149",
+   "segment": "1",
+   "at": 149,
+   "param": "content",
+   "class": "identifier digit",
+   "produced": "uniform mat44 uVP",
+   "correct": "uniform mat4 uVP",
+   "context": "fresh"
+  },
+  {
+   "id": "leak-a169",
+   "segment": "1",
+   "at": 169,
+   "param": "path",
+   "class": "markup leak",
+   "produced": "src/math.js\nparameter_",
+   "correct": "src/math.js\n</parameter>",
+   "context": "contaminated"
+  },
+  {
+   "id": "o111-a179",
+   "segment": "1",
+   "at": 179,
+   "param": "content",
+   "class": "index digit",
+   "produced": "o[111] = -1",
+   "correct": "o[11] = -1",
+   "context": "contaminated"
+  },
+  {
+   "id": "tex33D-b108",
+   "segment": "2",
+   "at": 108,
+   "param": "new",
+   "class": "identifier digit",
+   "produced": "texImage33D",
+   "correct": "texImage3D",
+   "context": "contaminated"
+  },
+  {
+   "id": "o1100-b174",
+   "segment": "2",
+   "at": 174,
+   "param": "content",
+   "class": "index digit",
+   "produced": "o[1100]",
+   "correct": "o[10]",
+   "context": "contaminated"
+  },
+  {
+   "id": "n330-c108",
+   "segment": "3",
+   "at": 108,
+   "param": "content",
+   "class": "literal digit",
+   "produced": "[24,22,330 ,",
+   "correct": "[24,22,30,",
+   "context": "contaminated"
+  },
+  {
+   "id": "nbrack-c230",
+   "live_request": 594,
+   "segment": "3",
+   "at": 230,
+   "param": "content",
+   "class": "table junk",
+   "produced": "0 ],\nn[\"asphalt\"",
+   "correct": "0 ],\n [\"asphalt\"",
+   "context": "contaminated"
+  },
+  {
+   "id": "1_28-c230",
+   "live_request": 594,
+   "segment": "3",
+   "at": 230,
+   "param": "content",
+   "class": "literal digit",
+   "produced": "\"brick\",     1 28,",
+   "correct": "\"brick\",     128,",
+   "context": "contaminated"
+  },
+  {
+   "id": "amp-c230",
+   "live_request": 594,
+   "segment": "3",
+   "at": 230,
+   "param": "content",
+   "class": "literal junk",
+   "produced": "0.90&0.20",
+   "correct": "0.90,0.20",
+   "context": "contaminated"
+  }
+ ],
+ "freerun": [
+  {
+   "id": "fr-a48",
+   "segment": "1",
+   "at": 48,
+   "param": "content",
+   "max_new": 700,
+   "note": "math.js write at 53.8k context (live: o[113], o[115])"
+  },
+  {
+   "id": "fr-a85",
+   "segment": "1",
+   "at": 85,
+   "param": "content",
+   "max_new": 500,
+   "note": "math.js rewrite at 76.4k (live: o[1100], o[112])"
+  },
+  {
+   "id": "fr-a97",
+   "segment": "1",
+   "at": 97,
+   "param": "content",
+   "max_new": 500,
+   "note": "lookAt append at 80.3k (live: o[111], o[120])"
+  }
+ ],
+ "context_rule": "fresh = the corrupt spelling (o[113], N33, parameter_, ...) occurs nowhere in messages[0:K] and no earlier site of the same turn precedes it in the forced prefix; contaminated = the model can copy its own earlier corruption (counted 2026-09-23 on the snapshots: e.g. o[1100] 13x in the context of o1100-a85)"
+}

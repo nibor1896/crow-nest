@@ -146,10 +146,32 @@
 //! | `temperature` | absent, `null` or `<= 0` is GREEDY (the A4 path); `> 0` samples (#28 A6) |
 //! | `top_p` | nucleus mass, default 0.8 (data sheet); read only when `temperature > 0` |
 //! | `top_k` | candidates kept, default 20 (data sheet); read only when `temperature > 0` |
-//! | `presence_penalty` | default 1.5 (data sheet); read only when `temperature > 0` |
+//! | `presence_penalty` | default 0 (#91; the data sheet says 1.5, see `DEFAULT_PRESENCE`); read only when `temperature > 0` |
 //! | `seed` | RNG seed of THIS request, default 0; a warm process draws what a cold one draws |
-//! | `min_p` | ACCEPTED AND IGNORED, the device sampler has no min_p (#28, open for robin) |
+//! | `min_p` | #83: the log-space tail filter, HONORED on device and host; absent, `null` or `<= 0` disables, `(0,1]` filters; read only when `temperature > 0` |
+//! | `repeat_penalty` | #84: llama.cpp asymmetric repeat over the penalty window; absent/`null` = 1.0 NEUTRAL; read in greedy and sampled alike |
+//! | `frequency_penalty` | #84: `l -= count * freq` over the window; absent/`null` = 0 NEUTRAL |
+//! | `penalty_last_n` | #84: window depth in ids, PROMPT TAIL + generated, default 64, clamped to 1024 (the device ring); `0` disables the windowed pass |
+//! | `dry_multiplier` | #85: DRY suffix-repetition penalty (llama.cpp PR #9702); absent/`null`/`0` = OFF; read in greedy and sampled alike; routes the request to the HOST sampler |
+//! | `dry_base` | #85: DRY exponential base, default 1.75; a value `< 1.0` is forced back to 1.75 as llama-server does (the sampler itself would disable DRY) |
+//! | `dry_allowed_length` | #85: repeats up to this length cost nothing, default 2 |
+//! | `dry_last_n` | #85: DRY window depth in ids, PROMPT TAIL + generated, default 64; `0` disables; the sequence breakers are the engine's fixed four (`\n`, `:`, `"`, `*`), derived once per process from the vocab |
+//! | `top_n_sigma` | #92: masks `logit < max - n*std` before top-k (no softmax, no sort); absent/`null`/`<= 0` = OFF; routes to the HOST sampler |
+//! | `typical_p` | #92: locally-typical filter after top-k; absent/`null`/`>= 1` = OFF; routes to the HOST sampler |
+//! | `xtc_probability` | #92: per-token probability of removing the leading `p >= xtc_threshold` run; absent/`null`/`<= 0` = OFF; routes to the HOST sampler |
+//! | `xtc_threshold` | #92: XTC threshold, default 0.1; `> 0.5` disables XTC (llama.cpp's own rule) |
+//! | `mirostat` | #92: `2` arms mirostat v2 (surprise truncation, `mu` state reset per request like the seed); `0`/absent = OFF; `1` is a 400 (v1 is not implemented); needs `temperature > 0`; routes to the HOST sampler |
+//! | `mirostat_tau` | #92: mirostat v2 target surprise, default 5.0 |
+//! | `mirostat_eta` | #92: mirostat v2 learning rate, default 0.1 |
+//! | `stop` | #86: OpenAI stop strings, an array of strings (a bare string is the one-stop form); generation ends BEFORE the sequence is emitted, `finish_reason` `stop`; empty entries drop, no count cap |
+//! | `logit_bias` | #86: map TOKEN ID -> additive bias on the raw logits, applied FIRST, outside the sampler chain (llama.cpp's order); `-inf` as f32 is a hard mask; a biased request samples on the HOST |
+//! | `logprobs` | #91: `true` adds OpenAI logprobs for EVERY generated id (tool-call markup and arguments included), from the RAW distribution (log-softmax of the lm_head row, before bias, penalties, temperature and every filter); one row readback per token, nothing when off; architecture 7.11.22 |
+//! | `top_logprobs` | #91: 0..=20 alternatives per position, default 0; a 400 without `logprobs: true`. `post_sampling_probs: true` is a 400: the post-sampler distribution is not offered |
+//! | `crow_force_ids` | #91: array of token ids that REPLACE the generated ids one per step, from the first generated position on (teacher forcing, the #81 injection door); with `logprobs: true` every entry then prices the forced id under the model's raw distribution at that position and carries `crow_id` (entry and alternatives); `[]` forces nothing but still adds `crow_id`; a 400 together with `reasoning_budget_tokens`; after the list runs out generation continues free (greedy/sampled as requested) |
 //! | `tools` | array of OpenAI function tools, RENDERED as the template variable `tools` (#29 A7) |
+//! | `tools` | array of OpenAI function tools, RENDERED as the template variable `tools` (#29 A7); since #93 also COMPILED into the lazy tool-call grammar (`toolgrammar`, architecture 7.11.23) |
+//! | `tool_choice` | #93: `"auto"` (default, absent, `null`) = the lazy grammar: prose free, every call constrained from its `<tool_call>` on; `"required"` = the same, and end of generation refused until one call closed; `{"type":"function","function":{"name":N}}` = required, only tool N; `"none"` = no grammar (the template still renders `tools`). Anything else is a 400 |
+//! | `parallel_tool_calls` | #93: default `true`; `false` = after the first `</tool_call>` only end of generation is allowed |
 //! | `stream_options.include_usage` | `true` puts `usage` on the final chunk (#27 A5) |
 //! | `timings_per_token` | `true` puts `timings` on the final chunk (#27 A5) |
 //!
@@ -240,6 +262,14 @@
 //!   Qwen's docs name `thinking_budget`; without the field the ids stay byte-identical.
 //! - Greedy decode: `Engine::prefill` gives the first id, `Engine::decode_step` the rest.
 //! - Stops on `sample::EOS_IDS` (`finish_reason` `stop`) or at `max_tokens` (`length`).
+//! - #86: a request with `stop` strings ALSO stops on the CONTENT text — earliest
+//!   match, longest-first on ties, the stop and everything after it swallowed, never
+//!   streamed (`StopStrings`, the tool-call tail-hold on arbitrary strings). The stop
+//!   filter sees the content channel AFTER the think split: reasoning is never
+//!   stop-scanned, a stop inside a think block does not end the answer. A stop that
+//!   completes on the LAST token (or in the held tail at EOS) flips `length` to `stop`
+//!   too — the sequence IS in the generated text. A closed tool call still wins the
+//!   finish word with `tool_calls`, exactly as it does over an EOS stop.
 //! - `prompt ids >= n_ctx` answers 413 before any GPU work.
 //! - Otherwise `max_tokens` is CLAMPED to `n_ctx - prompt ids` and to 32768.
 //! - A clamp logs one stderr line and the request is served, not refused.
@@ -251,13 +281,18 @@
 //! | absent, `null`, `<= 0` | `Engine::prefill` (argmax) | `Engine::decode_step` (argmax) | TAKEN OUT of the engine |
 //! | `> 0` | `Engine::sample_last` | `decode_step` behind the `sample_k` node | ARMED before the first step |
 //!
-//! - Greedy is the A4 path unchanged: same calls, same order, no sampler node in the graph.
+//! - Greedy is the A4 path unchanged: same calls, same order, no sampler node in the graph -
+//!   EXCEPT a greedy request that arms the #84 window (repeat != 1.0 or freq > 0 with a
+//!   window): that one arms the sampler with `temperature <= 0`, whose device draw is
+//!   `ci[0]`, the penalized argmax, exactly as llama.cpp penalizes greedy too.
 //! - `sample::EOS_IDS` stops BOTH modes; `CROW_STOP_EOS` is the harness opt-in and is NOT read here.
 //! - The sampler is built from the REQUEST, never from the environment.
 //! - `CROW_SAMPLE`, `CROW_TEMP`, `CROW_TOP_P`, `CROW_TOP_K`, `CROW_PRESENCE`, `CROW_SEED`
 //!   keep working for `decode` and `parity`; `serve` reads none of them.
 //! - `Sampler::new(seed)` carries the data-sheet defaults, the request overwrites what it sends.
-//! - Absent fields when `temperature > 0`: top_p 0.8, top_k 20, presence_penalty 1.5, seed 0.
+//! - Absent fields when `temperature > 0`: top_p 0.8, top_k 20, presence_penalty 0 (#91), seed 0 -
+//!   and, since #84, repeat_penalty 1.0 / frequency_penalty 0.0 / penalty_last_n 64, all
+//!   NEUTRAL: no existing row changes implicitly until a row names them.
 //!
 //! Per request reseed (M1, robin 2026-09-09):
 //!
@@ -278,14 +313,36 @@
 //! - `Srv::parked_sampler` holds the `DevSampler` while a greedy request runs.
 //! - The next sampled request hands the same device buffers back, so nothing is reallocated.
 //!
-//! `min_p` (open decision for robin, #28):
+//! `min_p` (#83, since 2026-09-20 HONORED - the "accepted and ignored" era of #28 is over):
 //!
 //! - Crow's operating point is temperature 1.0, top_p 0.95, min_p 0.01 (`crow_core.py`).
-//! - The device sampler (`kernels.rs sample_k`) implements top_k, top_p and presence only.
-//! - A6 does not touch kernels, so `min_p` is parsed, ignored, and logged once per request.
-//! - The log line names it: `min_p accepted and ignored (device sampler has no min_p; #28)`.
-//! - Consequence: an answer at Crow's operating point has NO min_p floor under the nucleus.
-//! - Options for robin: add min_p to `sample_k` (kernel change), or drop it from the profile.
+//! - The filter is llama.cpp's (PR ggml-org/llama.cpp#3841): AFTER top-k, BEFORE the
+//!   temperature softmax, candidates below `max_logit + ln(min_p)` drop out (min_keep 1).
+//! - Host (`sample.rs`), device (`kernels.rs sample_k`) and the `[chat]` line all carry it;
+//!   `ln(min_p)` is computed ONCE on the host and uploaded, so the boundary is bit-equal.
+//! - Absent, `null` or `<= 0` disables it - exactly the old behavior, golden rows included.
+//!
+//! `logit_bias` (#86, the host-sampler route):
+//!
+//! - The map is ADDITIVE on the raw logits and applied FIRST, outside the chain -
+//!   the order llama.cpp applies it in (its `logit_bias` sampler sits before the chain
+//!   and model `suppress_tokens` merge into the same map as `-INFINITY`).
+//! - A biased request therefore draws on the HOST: the logits row is read back
+//!   (1 MB over PCIe, ~0.3 ms per token), `apply_logit_bias` runs on it, then
+//!   `Sampler::sample` - the reference path `CROW_SAMPLE_HOST=1` always ran. The
+//!   device `sample_k` node has no bias input; its twin (bias through the sampler's
+//!   per-request mask/count buffers) is the documented FOLLOW-UP, not built here.
+//! - Greedy counts: a `temperature <= 0` request with a bias runs the biased ARGMAX
+//!   on the host (`sampler_from` arms a sampler for it, as #84 did for penalties),
+//!   with the data-sheet `presence_penalty` 1.5 taken OUT unless the body sent it -
+//!   a bias-only request asked for the bias, not for a silent penalty change.
+//! - The hard mask: strict JSON cannot carry the `-Infinity` literal (serde_json
+//!   refuses it), so a mask is any bias that is `-inf` once cast to f32 — any
+//!   magnitude over `f32::MAX`, e.g. `-1e39`. `-100` is the OpenAI-conventional
+//!   strong ban, additive like every other value, not an absolute mask. `+inf`
+//!   (e.g. `1e39`) forces the token, the additive reading of the same rule.
+//!   Masking an EOS id this way is exactly how llama-server builds `ignore_eos`
+//!   (`logit_bias_eog`) — that field can now ride this door without new plumbing.
 //!
 //! Stream shape (llama-server / OpenAI, `crow_core.py:4831-4877`):
 //!
@@ -301,6 +358,9 @@
 //! - Every frame is flushed on its own; one token never waits for the next, with one
 //!   exception (#29 A7): a content token whose tail is a prefix of `<tool_call>` is HELD
 //!   until the next token resolves it, so no half marker can reach the wire.
+//! - #86 adds the same exception for stop strings: a content tail that is a prefix of
+//!   a stop string is held (`StopStrings`), and on a complete match the stop and
+//!   everything after it NEVER reach the wire — the answer ends `finish_reason` `stop`.
 //! - The concatenated content is the same either way; only the frame boundary moves.
 //!
 //! Tool calls on the wire (#29 A7, `crow_core.py:4864-4877` is the reader):
@@ -433,8 +493,9 @@
 //!   request, after the last `decode_step`, and eight `u64` of state.
 //! - SCOPE: per PROCESS, not per session. `serve` holds one conversation and there is no
 //!   session id on the wire; and a COLD prefill is NOT a new conversation - an identical
-//!   re-send is cold by construction (its snapshot sits at its own prompt length, spec 7.4),
-//!   which is exactly the case this counter exists to see. So the ring lives as long as the
+//!   re-send was cold by construction until #100 (its snapshot sat at its own prompt length,
+//!   spec 7.4) and is now a zero-prefill WARM request; either way it is exactly the case this
+//!   counter exists to see, and neither kind of request resets it. So the ring lives as long as the
 //!   process does and a restart is what clears it.
 //!
 //! Counters that exist in the engine and are NOT in the block (names are not invented):
@@ -464,6 +525,8 @@
 //! - ONE held conversation per process; a request that shares no prefix replaces it.
 //! - `L` = longest common id prefix of the request and `Engine::history`, ids only.
 //! - `P` = the newest snapshot position at or below `L`, and below the request length.
+//! - #100: or AT the request length, for a snapshot that holds its logits row: then
+//!   `PrefixCache::restore_logits` replaces the prefill, `prefill 0 of N tok`.
 //! - `P` found: `PrefixCache::rollback` restores the state, `prefill` gets `ids[P..]`.
 //! - No such snapshot: `Engine::reset_to_zero`, the slot dropped, the whole prompt prefilled.
 //! - ONE snapshot per request, unconditional (M2b, robin 2026-09-10, #36): after the prompt.
@@ -525,10 +588,12 @@ use crow_nest_engine::cache::{PrefixCache, SLOTS};
 use crow_nest_engine::boot;
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::{DevSampler, Engine};
-use crow_nest_engine::geo::{apply_adapt_policy, DEFAULT_CNQ, DEFAULT_HOTSETS, LAYERS, TRICKLE_CHUNK_THRESHOLD};
-use crow_nest_engine::sample::{Sampler, EOS_IDS};
+use crow_nest_engine::geo::{apply_adapt_policy, DEFAULT_CNQ, DEFAULT_HOTSETS, LAYERS, TRICKLE_CHUNK_THRESHOLD, V};
+use crow_nest_engine::sample::{pos_logprobs, PosLogprobs, Sampler, EOS_IDS, MAX_TOP_LOGPROBS};
 use crow_nest_engine::slot;
-use crow_nest_engine::toolcall::{Emit, ToolStream, TOOL_OPEN};
+use crow_nest_engine::stopstr::StopStrings;
+use crow_nest_engine::toolcall::{Emit, Malformed, ToolStream, TOOL_OPEN};
+use crow_nest_engine::toolgrammar::{self, Gate, ToolGrammar, Vocab};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -559,8 +624,47 @@ const MAX_MAX_TOKENS: usize = 32768;
 const DEFAULT_TOP_P: f32 = 0.8;
 /// #28: `top_k` when a sampled request carries none (data sheet)
 const DEFAULT_TOP_K: usize = 20;
-/// #28: `presence_penalty` when a sampled request carries none (data sheet)
-const DEFAULT_PRESENCE: f32 = 1.5;
+/// #28: `presence_penalty` when a sampled request carries none. Was the data
+/// sheet's 1.5 until #91 (2026-09-22): applied HF-style to every token of the
+/// answer (no window, `sample.rs` `seen`), it pushes an agent answer full of
+/// shas, hex and repeated code structure OFF every token it already used - the
+/// trailing-digit and dropped-line class of the long sessions, worse at depth
+/// where the logits are flat (tools/results/91-corruption-ctx100000-end: no
+/// weight change moved it). Crow never sends the field (`SamplingSent` doc), so
+/// this default IS Crow's penalty. Off unless the client asks for one.
+const DEFAULT_PRESENCE: f32 = 0.0;
+/// #84: `repeat_penalty` when a request carries none - llama.cpp's own default,
+/// and NEUTRAL: the asymmetric div/mul is skipped at exactly 1.0, so no existing
+/// row changes implicitly
+const DEFAULT_REPEAT: f32 = 1.0;
+/// #84: `frequency_penalty` when a request carries none - neutral, as llama.cpp
+const DEFAULT_FREQ: f32 = 0.0;
+/// #84: `penalty_last_n` when a request carries none - llama.cpp's default 64;
+/// the window spans the prompt tail plus the generated ids
+const DEFAULT_LAST_N: usize = 64;
+/// #85: `dry_multiplier` when a request carries none - OFF, as llama.cpp
+const DEFAULT_DRY_MULTIPLIER: f32 = 0.0;
+/// #85: `dry_base` when a request carries none - llama.cpp's default 1.75.
+/// A request that names a base below 1.0 gets THIS value back, the same fix
+/// llama-server applies (its sampler would silently disable DRY instead)
+const DEFAULT_DRY_BASE: f32 = 1.75;
+/// #85: `dry_allowed_length` when a request carries none - llama.cpp's default 2
+const DEFAULT_DRY_ALLOWED_LENGTH: i32 = 2;
+/// #85: `dry_last_n` when a request carries none - llama.cpp's default 64;
+/// `dry_penalty_last_n`, the DRY window's own depth (independent of #84's)
+const DEFAULT_DRY_LAST_N: usize = 64;
+/// #92: `top_n_sigma` when a request carries none - OFF (`<= 0` disables)
+const DEFAULT_TOP_N_SIGMA: f32 = 0.0;
+/// #92: `typical_p` when a request carries none - OFF (`>= 1` disables)
+const DEFAULT_TYPICAL_P: f32 = 1.0;
+/// #92: `xtc_probability` when a request carries none - OFF (`<= 0` disables)
+const DEFAULT_XTC_PROBABILITY: f32 = 0.0;
+/// #92: `xtc_threshold` when a request carries none - llama.cpp's default 0.1
+const DEFAULT_XTC_THRESHOLD: f32 = 0.1;
+/// #92: `mirostat_tau` when a request carries none - llama.cpp's default 5.0
+const DEFAULT_MIROSTAT_TAU: f32 = 5.0;
+/// #92: `mirostat_eta` when a request carries none - llama.cpp's default 0.1
+const DEFAULT_MIROSTAT_ETA: f32 = 0.1;
 /// #28: RNG seed when the request carries none; fixed, so warm equals cold (M1)
 const DEFAULT_SEED: u64 = 0;
 /// #54: how many decode steps of the `stream:false` path ONE gone-client probe covers.
@@ -586,6 +690,34 @@ struct SamplingSent {
     top_k: bool,
     presence_penalty: bool,
     seed: bool,
+    /// #83: `min_p` - the one profile field Crow really sends that this
+    /// server ignored until #83 made it real
+    min_p: bool,
+    /// #84: the windowed llama.cpp penalty fields
+    repeat_penalty: bool,
+    frequency_penalty: bool,
+    penalty_last_n: bool,
+    /// #85/#92: the DRY fields and the optional tier. The tier line prints
+    /// them only when one is non-neutral, so these flags exist for exactly
+    /// that line - the sampler itself reads the VALUES, not the flags.
+    tier: TierSent,
+}
+
+/// #85/#92: which of the DRY + optional-tier fields the REQUEST carried,
+/// read by the conditional `tier_line` only
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TierSent {
+    dry_multiplier: bool,
+    dry_base: bool,
+    dry_allowed_length: bool,
+    dry_last_n: bool,
+    top_n_sigma: bool,
+    typical_p: bool,
+    xtc_probability: bool,
+    xtc_threshold: bool,
+    mirostat: bool,
+    mirostat_tau: bool,
+    mirostat_eta: bool,
 }
 
 impl SamplingSent {
@@ -1046,15 +1178,114 @@ struct ChatReq {
     presence_penalty: f32,
     /// #28: RNG seed of this request, `DEFAULT_SEED` when absent
     seed: u64,
-    /// #68: which of `top_p`, `top_k`, `presence_penalty`, `seed` the body carried; read by
-    /// the `[chat]` line only, never by the sampler
+    /// #68: which of the sampling fields the body carried; read by the `[chat]`
+    /// line only, never by the sampler
     sampling_sent: SamplingSent,
-    /// #28: parsed, ignored, logged; the device sampler has no min_p
+    /// #83: the log-space tail filter, `0.0` (absent included) disables;
+    /// `(0,1]` drops candidates below `max_logit + ln(min_p)` after top-k.
+    /// Parsed since #28, HONORED since #83 (host `sample.rs`, device `sample_k`).
     min_p: f32,
+    /// #84: llama.cpp `repeat_penalty` (asymmetric div/mul on the raw logits);
+    /// `1.0` (absent included) is neutral
+    repeat_penalty: f32,
+    /// #84: llama.cpp `frequency_penalty` (`l -= c * freq` over the window);
+    /// `0.0` (absent included) is neutral
+    frequency_penalty: f32,
+    /// #84: the penalty window in ids, prompt tail + generated (llama.cpp
+    /// `penalty_last_n`); `0` disables the windowed pass. Clamped to the
+    /// device ring's depth (`gen::SAMPLE_RING_MAX`, 1024) - the `[chat]` line
+    /// names the effective value, so a clamp is visible, never silent.
+    penalty_last_n: usize,
+    /// #85: DRY multiplier; `0.0` (absent included) is OFF. Host-only path.
+    dry_multiplier: f32,
+    /// #85: DRY base - requests below 1.0 were forced to `DEFAULT_DRY_BASE`
+    /// at parse (llama-server's own fix), so this is always `>= 1.0` here.
+    dry_base: f32,
+    /// #85: DRY allowed length, default 2
+    dry_allowed_length: i32,
+    /// #85: the DRY window depth in ids (`dry_penalty_last_n`), default 64;
+    /// `0` disables. Host-only state, so no ring clamp.
+    dry_last_n: usize,
+    /// #92: top-nσ; `<= 0` (absent included) is OFF
+    top_n_sigma: f32,
+    /// #92: typical_p; `>= 1.0` (absent included) is OFF
+    typical_p: f32,
+    /// #92: XTC probability; `<= 0` (absent included) is OFF
+    xtc_probability: f32,
+    /// #92: XTC threshold, default 0.1; `> 0.5` disables (llama.cpp's rule)
+    xtc_threshold: f32,
+    /// #92: `2` arms mirostat v2, `0` (absent included) is OFF. Parse refused
+    /// `1` (v1 is not implemented) and any other value, and refused v2 with
+    /// `temperature <= 0` (the surprise distribution it truncates is the
+    /// temperature softmax).
+    mirostat: u8,
+    /// #92: mirostat v2 target surprise, default 5.0
+    mirostat_tau: f32,
+    /// #92: mirostat v2 learning rate, default 0.1
+    mirostat_eta: f32,
+    /// #86: the OpenAI `stop` strings, in the body's own order (empty entries
+    /// dropped at parse); `StopStrings::new` sorts them longest-first. Empty is
+    /// the behaviour of every release before #86: no filter runs, no byte is held.
+    stop: Vec<String>,
+    /// #86: the OpenAI `logit_bias` map as `(token id, bias)` pairs, sorted by
+    /// token id. Empty is the behaviour of every release before #86. A bias that
+    /// is `-inf` as f32 (any magnitude over `f32::MAX`) is a hard mask.
+    logit_bias: Vec<(usize, f32)>,
     /// #VIT: the `image_url` data URLs of the content blocks, in message order.
     /// This is the exact wire form Crow sends (crow_core.py `image_part`):
     /// `{"type":"image_url","image_url":{"url":"data:<mime>;base64,..."}}`.
     images: Vec<String>,
+    /// #91: OpenAI `logprobs`. `false` (absent included) is the behaviour of every
+    /// release before #91: no logits row is read back, no chunk or field is added.
+    logprobs: bool,
+    /// #91: OpenAI `top_logprobs`, 0..=20 alternatives per position; only with
+    /// `logprobs: true` (the body naming it without that is a 400, as OpenAI answers)
+    top_logprobs: usize,
+    /// #91: `crow_force_ids`, the ids that replace the generated
+    /// ones step by step (teacher forcing). `None` (absent) is every release before it:
+    /// nothing is forced and the logprob entries carry no `crow_id`.
+    force_ids: Option<Vec<usize>>,
+    /// #93: OpenAI `tool_choice`, parsed (it was silently ignored before)
+    tool_choice: ToolChoice,
+    /// #93: OpenAI `parallel_tool_calls`, default `true`
+    parallel_tool_calls: bool,
+}
+
+/// #93: the request's `tool_choice`
+#[derive(Debug, Clone, PartialEq)]
+enum ToolChoice {
+    Auto,
+    None,
+    Required,
+    /// `{"type":"function","function":{"name":...}}`: required, that tool only
+    Named(String),
+}
+
+/// - #28/#68/#83/#84: the sampling provenance line. Every VALUE, then
+///   `(request)` or `(data sheet)` for where it came from - `temperature` is
+///   always the request's own (without it this line is not printed unless
+///   the #84 penalties armed a greedy request), the rest say whether the body
+///   carried the field.
+/// - #83: `min_p` joined the line the day it stopped being "accepted and
+///   ignored" - a profile field a client really sends must be visible as
+///   honored, not just present.
+/// - #84: the three windowed-penalty fields, so a row can name its brake.
+/// - pure: the test drives it on a built Sampler, no engine and no socket.
+fn sampling_line(s: &Sampler, sent: SamplingSent) -> String {
+    format!(
+        "[chat] sampling on the device: temperature {} (request) top_p {} ({}) top_k {} ({}) \
+         min_p {} ({}) presence_penalty {} ({}) repeat_penalty {} ({}) frequency_penalty {} ({}) \
+         penalty_last_n {} ({}) seed {} ({})",
+        s.temperature,
+        s.top_p, SamplingSent::tag(sent.top_p),
+        s.top_k, SamplingSent::tag(sent.top_k),
+        s.min_p, SamplingSent::tag(sent.min_p),
+        s.presence_penalty, SamplingSent::tag(sent.presence_penalty),
+        s.repeat_penalty, SamplingSent::tag(sent.repeat_penalty),
+        s.frequency_penalty, SamplingSent::tag(sent.frequency_penalty),
+        s.penalty_last_n, SamplingSent::tag(sent.penalty_last_n),
+        s.seed, SamplingSent::tag(sent.seed)
+    )
 }
 
 /// - a number field of the sampling profile: absent or `null` gives `d`, a non number is a 400
@@ -1066,6 +1297,18 @@ fn num_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str, d: f32
             .as_f64()
             .map(|x| x as f32)
             .ok_or_else(|| format!("{key} is not a number")),
+    }
+}
+
+/// the integer shape of `num_field` (#85/#92's integer knobs): absent or null is
+/// the default, anything but a non negative integer is a 400 that names the key
+fn int_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str, d: i64) -> Result<i64, String> {
+    match obj.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(d),
+        Some(v) => v
+            .as_i64()
+            .filter(|n| *n >= 0)
+            .ok_or_else(|| format!("{key} is not a non negative integer")),
     }
 }
 
@@ -1150,7 +1393,8 @@ fn thinking_line(req: &ChatReq) -> String {
 
 /// - the request body, as Crow sends it (`crow_core.py:4672-4700`)
 /// - unknown fields are accepted and ignored, as llama-server does
-/// - `tools` falls under that rule in A4; `min_p` under it in A6
+/// - `tools` falls under that rule in A4; `min_p` was its sibling in A6 and
+///   is a strict, honored sampling field since #83
 /// - the sampling fields (#28) are STRICT on type and lenient on absence
 /// - `Err` carries the message for the 400 body
 fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
@@ -1297,6 +1541,108 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
     let top_p = num_field(obj, "top_p", DEFAULT_TOP_P)?;
     let presence_penalty = num_field(obj, "presence_penalty", DEFAULT_PRESENCE)?;
     let min_p = num_field(obj, "min_p", 0.0)?;
+    // #84: the windowed llama.cpp penalties; absent stays neutral, so no
+    // existing row changes implicitly. Greedy reads them too - llama.cpp runs
+    // its penalties sampler in greedy and sampled alike.
+    let repeat_penalty = num_field(obj, "repeat_penalty", DEFAULT_REPEAT)?;
+    let frequency_penalty = num_field(obj, "frequency_penalty", DEFAULT_FREQ)?;
+    let penalty_last_n = match obj.get("penalty_last_n") {
+        None | Some(serde_json::Value::Null) => DEFAULT_LAST_N,
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| "penalty_last_n is not a non negative integer".to_string())? as usize,
+    };
+    // the device ring is SAMPLE_RING_MAX deep; a deeper ask is clamped to it
+    // (the `[chat]` line prints the effective value, so the clamp is visible)
+    let penalty_last_n = penalty_last_n.min(crow_nest_engine::gen::SAMPLE_RING_MAX);
+    // #85: the DRY fields, host-only state (the sampler's window carries them);
+    // `dry_base < 1.0` is forced to the default (llama-server's own fix), the
+    // clamp visible on the tier line like every other effective value
+    let dry_multiplier = num_field(obj, "dry_multiplier", DEFAULT_DRY_MULTIPLIER)?;
+    let dry_base = num_field(obj, "dry_base", DEFAULT_DRY_BASE)?.max(DEFAULT_DRY_BASE);
+    let dry_allowed_length = int_field(obj, "dry_allowed_length", DEFAULT_DRY_ALLOWED_LENGTH.into())? as i32;
+    let dry_last_n = int_field(obj, "dry_last_n", DEFAULT_DRY_LAST_N as i64)? as usize;
+    // #92: the optional tier, all OFF at these defaults (absent included)
+    let top_n_sigma = num_field(obj, "top_n_sigma", 0.0)?;
+    let typical_p = num_field(obj, "typical_p", 1.0)?;
+    let xtc_probability = num_field(obj, "xtc_probability", 0.0)?;
+    let xtc_threshold = num_field(obj, "xtc_threshold", 0.1)?;
+    if xtc_threshold > 0.5 {
+        // llama.cpp disables XTC above 0.5; refuse with the reason named
+        return Err("xtc_threshold above 0.5 disables XTC - send xtc_probability 0 instead".into());
+    }
+    let mirostat = int_field(obj, "mirostat", 0)?;
+    if mirostat == 1 || !(0..=2).contains(&mirostat) {
+        return Err("mirostat is 0 (off) or 2 (v2) here - v1 is not implemented".into());
+    }
+    if mirostat == 2 && !(temperature > 0.0) {
+        return Err(
+            "mirostat v2 needs temperature > 0 - its surprise distribution is the temperature softmax".into(),
+        );
+    }
+    let mirostat_tau = num_field(obj, "mirostat_tau", 5.0)?;
+    let mirostat_eta = num_field(obj, "mirostat_eta", 0.1)?;
+    // #86: the OpenAI stop strings. Strict on type, lenient on absence, like every
+    // sampling field: an array of strings (a bare string is the one-stop form of the
+    // OpenAI contract), a non-string entry is a 400 that names it. An EMPTY entry is
+    // dropped, not refused: it can only match at byte 0 of everything, llama-server
+    // drops it too, and refusing it would break a client that sends `["", "END"]`.
+    // No count cap: this server caps nothing else about the profile either.
+    let stop = match obj.get("stop") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(v) => {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| "stop is not an array of strings".to_string())?;
+            let mut out = Vec::with_capacity(arr.len());
+            for (i, s) in arr.iter().enumerate() {
+                let s = s
+                    .as_str()
+                    .ok_or_else(|| format!("stop[{i}] is not a string"))?;
+                if !s.is_empty() {
+                    out.push(s.to_string());
+                }
+            }
+            out
+        }
+    };
+    // #86: the OpenAI logit_bias map, TOKEN ID -> additive bias. The keys are token
+    // ids as strings (the form llama-server and OpenAI parse); a key that is not an
+    // id of THIS vocabulary is a 400 that names it, a value that is not a number is a
+    // 400 that names it. The bias is kept as the f32 it is applied as: a magnitude
+    // over f32::MAX (e.g. -1e39; strict JSON cannot carry the -Infinity literal) is
+    // -inf there - the hard mask, exactly the form llama-server's `logit_bias_eog`
+    // gives every EOG token under `ignore_eos`.
+    let logit_bias = match obj.get("logit_bias") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(v) => {
+            let map = v.as_object().ok_or_else(|| {
+                "logit_bias is not an object of token id -> bias".to_string()
+            })?;
+            let mut out = Vec::with_capacity(map.len());
+            for (k, val) in map {
+                let tok: usize = k
+                    .parse()
+                    .map_err(|_| format!("logit_bias key {k:?} is not a token id"))?;
+                if tok >= V {
+                    return Err(format!(
+                        "logit_bias key {k:?} is not a token id of this model's vocabulary (0..{V})"
+                    ));
+                }
+                let b = val
+                    .as_f64()
+                    .ok_or_else(|| format!("logit_bias[{k}] is not a number"))?
+                    as f32;
+                if b.is_nan() {
+                    return Err(format!("logit_bias[{k}] is NaN"));
+                }
+                out.push((tok, b));
+            }
+            out.sort_by_key(|&(t, _)| t);
+            out
+        }
+    };
     let top_k = match obj.get("top_k") {
         None | Some(serde_json::Value::Null) => DEFAULT_TOP_K,
         Some(v) => v
@@ -1320,6 +1666,23 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         top_k: sent("top_k"),
         presence_penalty: sent("presence_penalty"),
         seed: sent("seed"),
+        min_p: sent("min_p"),
+        repeat_penalty: sent("repeat_penalty"),
+        frequency_penalty: sent("frequency_penalty"),
+        penalty_last_n: sent("penalty_last_n"),
+        tier: TierSent {
+            dry_multiplier: sent("dry_multiplier"),
+            dry_base: sent("dry_base"),
+            dry_allowed_length: sent("dry_allowed_length"),
+            dry_last_n: sent("dry_last_n"),
+            top_n_sigma: sent("top_n_sigma"),
+            typical_p: sent("typical_p"),
+            xtc_probability: sent("xtc_probability"),
+            xtc_threshold: sent("xtc_threshold"),
+            mirostat: sent("mirostat"),
+            mirostat_tau: sent("mirostat_tau"),
+            mirostat_eta: sent("mirostat_eta"),
+        },
     };
     // #81: the thinking budget, in llama-server's integer dialect: absent, null or negative
     // is unrestricted (the behaviour of every release before #81), 0 closes the block
@@ -1347,6 +1710,100 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
                 .to_string(),
         ),
     };
+    // #91: `logprobs` / `top_logprobs`, the OpenAI pair. The values are the RAW model
+    // distribution (`sample::pos_logprobs`); llama-server's `post_sampling_probs` - the
+    // distribution AFTER the sampler chain - is NOT offered, and a body asking for it is
+    // refused by name rather than answered with the raw numbers under a flag that says
+    // otherwise.
+    let logprobs = match obj.get("logprobs") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(v) => v.as_bool().ok_or_else(|| "logprobs is not a boolean".to_string())?,
+    };
+    let top_logprobs = match obj.get("top_logprobs") {
+        None | Some(serde_json::Value::Null) => 0,
+        Some(v) => {
+            if !logprobs {
+                return Err("top_logprobs requires logprobs to be true".to_string());
+            }
+            let n = v
+                .as_u64()
+                .ok_or_else(|| "top_logprobs is not a non negative integer".to_string())?
+                as usize;
+            if n > MAX_TOP_LOGPROBS {
+                return Err(format!("top_logprobs {n} is over the limit of {MAX_TOP_LOGPROBS}"));
+            }
+            n
+        }
+    };
+    // #91: the forced ids, token ids below V. They ride the #81
+    // injection queue, so a thinking budget in the same body would fight over it - 400.
+    let force_ids = match obj.get("crow_force_ids") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| "crow_force_ids is not an array of token ids".to_string())?;
+            let mut ids = Vec::with_capacity(arr.len());
+            for x in arr {
+                let id = x
+                    .as_u64()
+                    .filter(|&id| (id as usize) < V)
+                    .ok_or_else(|| format!("crow_force_ids entry {x} is not a token id below {V}"))?;
+                ids.push(id as usize);
+            }
+            if reasoning_budget.is_some() {
+                return Err("crow_force_ids cannot be combined with reasoning_budget_tokens".to_string());
+            }
+            Some(ids)
+        }
+    };
+    if obj.get("post_sampling_probs").and_then(|v| v.as_bool()) == Some(true) {
+        return Err("post_sampling_probs is not offered: logprobs are the raw model \
+                    distribution, before temperature and every sampler filter"
+            .to_string());
+    }
+    // #93: `tool_choice` and `parallel_tool_calls`, OpenAI's forms. Both were
+    // accepted and ignored before; now they steer the tool grammar, so a value this server
+    // cannot honor is a named 400 (the #74 rule), never a silent default.
+    let tool_choice = match obj.get("tool_choice") {
+        None | Some(serde_json::Value::Null) => ToolChoice::Auto,
+        Some(serde_json::Value::String(w)) => match w.as_str() {
+            "auto" => ToolChoice::Auto,
+            "none" => ToolChoice::None,
+            "required" => ToolChoice::Required,
+            other => {
+                return Err(format!(
+                    "tool_choice {other:?} is not one of \"auto\", \"none\", \"required\" or a function object"
+                ))
+            }
+        },
+        Some(v) => {
+            let name = v
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .filter(|_| v.get("type").and_then(|t| t.as_str()) == Some("function"))
+                .ok_or_else(|| {
+                    "tool_choice object is not {\"type\":\"function\",\"function\":{\"name\":...}}".to_string()
+                })?;
+            let declared = tools
+                .as_ref()
+                .and_then(|t| t.as_array())
+                .is_some_and(|a| {
+                    a.iter().any(|t| t.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) == Some(name))
+                });
+            if !declared {
+                return Err(format!("tool_choice names {name:?}, which no tool in the request declares"));
+            }
+            ToolChoice::Named(name.to_string())
+        }
+    };
+    let parallel_tool_calls = match obj.get("parallel_tool_calls") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| "parallel_tool_calls is not a boolean".to_string())?,
+    };
     Ok(ChatReq {
         model,
         messages: messages.clone(),
@@ -1368,7 +1825,28 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         seed,
         sampling_sent,
         min_p,
+        repeat_penalty,
+        frequency_penalty,
+        penalty_last_n,
+        dry_multiplier,
+        dry_base,
+        dry_allowed_length,
+        dry_last_n,
+        top_n_sigma,
+        typical_p,
+        xtc_probability,
+        xtc_threshold,
+        mirostat: mirostat as u8,
+        mirostat_tau,
+        mirostat_eta,
+        stop,
+        logit_bias,
         images,
+        logprobs,
+        top_logprobs,
+        force_ids,
+        tool_choice,
+        parallel_tool_calls,
     })
 }
 
@@ -1416,8 +1894,20 @@ fn decode_data_url(url: &str) -> Result<(&str, Vec<u8>), String> {
 /// - the `Sampler` this request asks for, or `None` for the greedy A4 path
 /// - `None` is the whole greedy contract: no sampler is built, none is armed
 /// - every field the request left out comes from `Sampler::new` (data sheet)
+/// - #84 EXCEPT when the windowed penalties are armed (repeat != 1.0 or
+///   freq > 0 with a window): llama.cpp runs its penalties sampler in greedy
+///   too, so a greedy request that names them gets a sampler after all - one
+///   with `temperature <= 0`, whose device draw is `ci[0]`, the penalized
+///   argmax. A plain greedy request (no penalty fields) is still `None`.
+/// - #86 EXCEPT when `logit_bias` is non-empty: a biased request draws on the
+///   HOST (`chat_generate` reads the row back and runs `apply_logit_bias` first),
+///   so it needs a Sampler even in greedy - the biased argmax. For that greedy
+///   route the data-sheet `presence_penalty` 1.5 is taken OUT unless the body
+///   sent the field: the request asked for a bias, not for a silent penalty.
 fn sampler_from(req: &ChatReq) -> Option<Sampler> {
-    if !(req.temperature > 0.0) {
+    let penalties_armed =
+        req.penalty_last_n > 0 && (req.repeat_penalty != 1.0 || req.frequency_penalty > 0.0);
+    if !(req.temperature > 0.0) && !penalties_armed && req.logit_bias.is_empty() {
         return None;
     }
     let mut s = Sampler::new(req.seed);
@@ -1425,7 +1915,193 @@ fn sampler_from(req: &ChatReq) -> Option<Sampler> {
     s.top_p = req.top_p;
     s.top_k = req.top_k;
     s.presence_penalty = req.presence_penalty;
+    s.min_p = req.min_p;
+    s.repeat_penalty = req.repeat_penalty;
+    s.frequency_penalty = req.frequency_penalty;
+    s.penalty_last_n = req.penalty_last_n;
+    // #85: DRY rides the host sampler's window (the issue's host-first route)
+    s.dry_multiplier = req.dry_multiplier;
+    s.dry_base = req.dry_base;
+    s.dry_allowed_length = req.dry_allowed_length;
+    s.dry_last_n = req.dry_last_n;
+    // #92: the optional tier, all neutral at these request defaults
+    s.top_n_sigma = req.top_n_sigma;
+    s.typical_p = req.typical_p;
+    s.xtc_probability = req.xtc_probability;
+    s.xtc_threshold = req.xtc_threshold;
+    s.mirostat = req.mirostat;
+    s.mirostat_tau = req.mirostat_tau;
+    s.mirostat_eta = req.mirostat_eta;
+    // #86: the greedy bias-only route keeps the pure argmax - only the bias moves
+    // the row. presence is the #68 penalty of a SAMPLED answer (and rides the
+    // llama.cpp window form while the #84 window is armed); extending either to a
+    // greedy request that named no penalty field would change draws nobody asked about.
+    if !(req.temperature > 0.0) && !penalties_armed && !req.sampling_sent.presence_penalty {
+        s.presence_penalty = 0.0;
+    }
     Some(s)
+}
+
+/// - #86: the request's `logit_bias` on ONE logits row, FIRST, before any sampler
+///   reads it - llama.cpp applies the map outside its sampler chain, and
+///   `Sampler::sample` is that chain, so the bias is on the row the chain sees.
+/// - additive: `row[tok] += bias`. An INFINITE bias sets the logit outright, both
+///   signs: `-inf` masks the token (a mask must stay a mask - `-inf + x` is NaN on
+///   an already-masked row, the guard llama.cpp's logit-bias sampler makes for
+///   -INFINITY), `+inf` forces it.
+/// - a token id out of the row's range is skipped, not fatal: the parse already
+///   refused ids out of the VOCABULARY, so this cannot fire today; it is the same
+///   belt every host pass over a row wears.
+/// - pure: the test drives it on hand-built rows, no engine and no socket.
+fn apply_logit_bias(row: &mut [f32], bias: &[(usize, f32)]) {
+    for &(tok, b) in bias {
+        if let Some(l) = row.get_mut(tok) {
+            if b.is_infinite() {
+                *l = b;
+            } else {
+                *l += b;
+            }
+        }
+    }
+}
+
+/// - #86: one HOST draw of the current logits row, with the request's bias on it:
+///   read the row back (1 MB over PCIe, ~0.3 ms), `apply_logit_bias` FIRST, then
+///   the chain (`Sampler::sample`) draws - the order llama.cpp applies the map in.
+/// - `observe` books the drawn id into the sampler's own state (#68 presence set,
+///   #84 window): the bookkeeping the device node does for itself on its path.
+/// - unsafe: one device-to-host copy on the engine's logits buffer
+/// - #93: with a tool grammar inside a call, the drawn id is CHECKED
+///   before `observe` books it; a refused id is redrawn from the same row with the
+///   grammar's mask on it (llama.cpp's rejection order), so the host sampler's state
+///   only ever sees the id that is kept.
+unsafe fn draw_biased(eng: &Engine, s: &mut Sampler, bias: &[(usize, f32)], gate: Option<&mut Gate<'static>>) -> usize {
+    let mut row = crow_nest_engine::cuda::dtoh(eng.logits(), V);
+    apply_logit_bias(&mut row, bias);
+    let mut tok = s.sample(&row);
+    if let Some(g) = gate {
+        if g.armed() && !g.check(tok as u32) {
+            g.stats.redrawn += 1;
+            g.mask_row(&mut row);
+            tok = s.sample(&row);
+            if !g.v.token_ok(&g.g, &g.st, tok as u32) {
+                tok = crow_nest_engine::sample::argmax(&row);
+            }
+        }
+    }
+    s.observe(tok);
+    tok
+}
+
+/// - #93: is the tool grammar on for this process? `CROW_TOOL_GRAMMAR=0`
+///   turns it off (every id then leaves the loop as before this change); unset or any
+///   other value = on
+fn tool_grammar_on() -> bool {
+    std::env::var("CROW_TOOL_GRAMMAR").as_deref() != Ok("0")
+}
+
+/// #93: the vocabulary trie the masks walk, built once per process on the
+/// first request that has a grammar; `.1` is its build wall in ms
+static TOOL_VOCAB: std::sync::OnceLock<(Vocab, f64)> = std::sync::OnceLock::new();
+
+fn tool_vocab(tk: &crow_nest_engine::tokenizer::ChatTokenizer) -> &'static (Vocab, f64) {
+    TOOL_VOCAB.get_or_init(|| {
+        let t = Instant::now();
+        let eos: Vec<u32> = EOS_IDS.iter().map(|&e| e as u32).collect();
+        let open = tk.token_id(TOOL_OPEN).unwrap_or(u32::MAX);
+        let v = Vocab::build(V, |id| tk.token_bytes(id), |id| tk.is_special(id), &eos, open);
+        (v, t.elapsed().as_secs_f64() * 1e3)
+    })
+}
+
+/// - #93: the grammar of THIS request and the one line that says so;
+///   `(None, None)` for a request without tools (nothing is logged, nothing changes)
+/// - off: `CROW_TOOL_GRAMMAR=0`, `tool_choice: "none"`, or a tools array the grammar
+///   cannot express (named in the line); the request then runs unconstrained
+/// - `on` is `tool_grammar_on()` in serve, a parameter so the test drives both sides
+fn tool_gate(
+    req: &ChatReq,
+    tk: &crow_nest_engine::tokenizer::ChatTokenizer,
+    on: bool,
+) -> (Option<Gate<'static>>, Option<String>) {
+    let Some(tools) = req.tools.as_ref().filter(|t| t.as_array().is_some_and(|a| !a.is_empty())) else {
+        return (None, None);
+    };
+    if !on {
+        return (None, Some("[chat] tool grammar OFF (CROW_TOOL_GRAMMAR=0): tool calls are not constrained".to_string()));
+    }
+    let (mode, only) = match &req.tool_choice {
+        ToolChoice::None => {
+            return (None, Some("[chat] tool grammar off: tool_choice \"none\" (request)".to_string()));
+        }
+        ToolChoice::Auto => (toolgrammar::Mode::Auto, None),
+        ToolChoice::Required => (toolgrammar::Mode::Required, None),
+        ToolChoice::Named(n) => (toolgrammar::Mode::Required, Some(n.as_str())),
+    };
+    let t = Instant::now();
+    match ToolGrammar::build(tools, mode, req.parallel_tool_calls, only) {
+        Ok(g) => {
+            let build_ms = t.elapsed().as_secs_f64() * 1e3;
+            let fresh = TOOL_VOCAB.get().is_none();
+            let (v, vocab_ms) = tool_vocab(tk);
+            let line = format!(
+                "[chat] tool grammar ON (CROW_TOOL_GRAMMAR): lazy at the <tool_call> id, tool_choice {}, \
+                 parallel_tool_calls {}; {} tools / {} parameters compiled in {build_ms:.2} ms{}",
+                match &req.tool_choice {
+                    ToolChoice::Named(n) => format!("function {n:?}"),
+                    ToolChoice::Required => "required".to_string(),
+                    _ => "auto".to_string(),
+                },
+                req.parallel_tool_calls,
+                g.n_tools(),
+                g.n_params(),
+                if fresh {
+                    format!("; vocabulary trie {} nodes built in {vocab_ms:.0} ms (once per process)", v.trie_nodes())
+                } else {
+                    String::new()
+                }
+            );
+            (Some(Gate::new(g, v)), Some(line))
+        }
+        Err(e) => (None, Some(format!("[chat] tool grammar off for this request: {e}"))),
+    }
+}
+
+/// - #93: the id the device (or the greedy argmax) produced breaks the tool
+///   call in flight; draw again from the SAME logits row with the grammar's mask on it
+/// - the row: `s.logits` still holds the row that produced the refused id (the #91 rule)
+/// - greedy (`sampler_from` is `None`): the masked argmax
+/// - sampled: a HOST twin of the device sampler at this position - the request's
+///   profile, the prompt tail in the #84 window, this answer's ids booked (presence and
+///   window), and an RNG of its own derived from the seed and the position, so the redraw
+///   is reproducible; the caller moves the device booking (`Engine::rebook_sampler`)
+/// - unsafe: one device-to-host copy of the logits row
+unsafe fn grammar_redraw(eng: &Engine, req: &ChatReq, prompt: &[u32], out: &[u32], gate: &mut Gate<'static>) -> usize {
+    redraw_from_row(req, prompt, out, gate, crow_nest_engine::cuda::dtoh(eng.logits(), V))
+}
+
+/// the host half of `grammar_redraw`, on a row already read back (pure; the test drives it)
+fn redraw_from_row(req: &ChatReq, prompt: &[u32], out: &[u32], gate: &mut Gate<'static>, mut row: Vec<f32>) -> usize {
+    gate.mask_row(&mut row);
+    let tok = match sampler_from(req) {
+        None => crow_nest_engine::sample::argmax(&row),
+        Some(mut m) => {
+            m.observe_prompt(prompt);
+            for &t in out {
+                m.observe(t as usize);
+            }
+            m.rng = crow_nest_engine::sample::Rng::new(
+                req.seed ^ (out.len() as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            );
+            m.sample(&row)
+        }
+    };
+    if gate.v.token_ok(&gate.g, &gate.st, tok as u32) {
+        tok
+    } else {
+        // a filter of the chain kept only refused ids: the masked argmax is always allowed
+        crow_nest_engine::sample::argmax(&row)
+    }
 }
 
 /// - what one served request counted and how long each phase took
@@ -1536,6 +2212,8 @@ struct FinishArgs<'a> {
     t: &'a Timing,
     include_usage: bool,
     timings_per_token: bool,
+    /// #99: the calls the parser abandoned; `crow_malformed_calls` when non-empty
+    malformed: &'a [Malformed],
 }
 
 /// one `chat.completion.chunk`, the only object shape this endpoint streams
@@ -1604,12 +2282,85 @@ fn chunk_tool_args(c: &ChunkCtx, index: usize, args: &str) -> serde_json::Value 
     chunk(c, delta, None)
 }
 
+/// - #91: one OpenAI `ChatCompletionTokenLogprob` object: `{token, logprob, bytes,
+///   top_logprobs: [{token, logprob, bytes}]}`
+/// - `bytes` are the id's exact bytes (`ChatTokenizer::token_bytes`), `token` their lossy
+///   UTF-8 - a character split over two ids shows U+FFFD in both `token`s and the true
+///   bytes in `bytes`, the reason OpenAI carries both
+/// - `token` is the RAW token text, whatever channel the id ended in: reasoning, content,
+///   tool-call markup or a tool call's `arguments` - the parser, the think filter and the
+///   stop filter never see these entries
+/// - pure: `bytes_of` is the tokenizer lookup, a closure so the test can drive it
+#[cfg(test)]
+fn logprob_entry(p: &PosLogprobs, bytes_of: &dyn Fn(u32) -> Vec<u8>) -> serde_json::Value {
+    logprob_entry_ids(p, bytes_of, false)
+}
+
+/// - `logprob_entry`, plus `crow_id` on the entry and on every alternative when `with_ids`
+///   (#91: a request with `crow_force_ids` - the ids a teacher-forced
+///   replay needs, which the OpenAI shape does not carry)
+fn logprob_entry_ids(
+    p: &PosLogprobs,
+    bytes_of: &dyn Fn(u32) -> Vec<u8>,
+    with_ids: bool,
+) -> serde_json::Value {
+    let one = |id: usize, lp: f64| -> serde_json::Value {
+        let b = bytes_of(id as u32);
+        let mut v = serde_json::json!({
+            "token": String::from_utf8_lossy(&b),
+            "logprob": lp,
+            "bytes": b,
+        });
+        if with_ids {
+            v["crow_id"] = serde_json::json!(id);
+        }
+        v
+    };
+    let mut e = one(p.chosen, p.chosen_lp);
+    let top: Vec<serde_json::Value> = p.top.iter().map(|&(id, lp)| one(id, lp)).collect();
+    if let Some(obj) = e.as_object_mut() {
+        obj.insert("top_logprobs".to_string(), serde_json::Value::Array(top));
+    }
+    e
+}
+
+/// - #91: the logprobs of ONE generated id, as their own chunk: empty `delta`,
+///   `choices[0].logprobs.content` = `[entry]`, `finish_reason` null
+/// - one per generated id, sent BEFORE any text that id produced (text may be held back by
+///   the UTF-8, tool-call, think or stop holds; the entry never is), so the entries arrive
+///   in generation order and a client concatenates `logprobs.content` across chunks, as it
+///   does with OpenAI's stream
+/// - never sent without `logprobs: true`: every other chunk stays the chunk it was
+fn chunk_logprobs(c: &ChunkCtx, entry: serde_json::Value) -> serde_json::Value {
+    let mut doc = chunk(c, serde_json::json!({}), None);
+    if let Some(ch) = doc.get_mut("choices").and_then(|a| a.get_mut(0)).and_then(|o| o.as_object_mut()) {
+        ch.insert("logprobs".to_string(), serde_json::json!({ "content": [entry], "refusal": null }));
+    }
+    doc
+}
+
+/// - #91: the `stream:false` form - every entry of the answer in `choices[0].logprobs`
+///   `{"content": [...], "refusal": null}`, the OpenAI document shape
+/// - pure
+fn attach_logprobs(doc: &mut serde_json::Value, entries: &[serde_json::Value]) {
+    if let Some(ch) = doc.get_mut("choices").and_then(|a| a.get_mut(0)).and_then(|o| o.as_object_mut()) {
+        ch.insert(
+            "logprobs".to_string(),
+            serde_json::json!({ "content": entries, "refusal": null }),
+        );
+    }
+}
+
 /// - last chunk before `[DONE]`: empty delta, the finish reason
 /// - `usage` rides along when `include_usage`, `timings` when `timings_per_token` (#27 A5)
-/// - neither flag: the object is exactly the A4 chunk, no empty placeholders
+/// - #99: `crow_malformed_calls` rides along when the parser abandoned a call, whatever the
+///   flags (`attach_malformed`)
+/// - neither flag and nothing abandoned: the object is exactly the A4 chunk, no empty
+///   placeholders
 /// - pure: the whole final chunk contract is one function the test can drive
 fn chunk_finish(c: &ChunkCtx, a: &FinishArgs) -> serde_json::Value {
     let mut doc = chunk(c, serde_json::json!({}), Some(a.finish));
+    attach_malformed(&mut doc, a.malformed);
     if let Some(obj) = doc.as_object_mut() {
         if a.include_usage {
             obj.insert("usage".to_string(), usage_json(a.t));
@@ -1619,6 +2370,74 @@ fn chunk_finish(c: &ChunkCtx, a: &FinishArgs) -> serde_json::Value {
         }
     }
     doc
+}
+
+/// - #99: the machine-readable record of every call the parser ABANDONED, one object each,
+///   at the top level of the final chunk and of the `stream:false` document
+/// - `{"kind": "close-before-function" | "bad-name" | "bad-param-name" | "end-in-call",
+///   "index": <tool_calls index> | null, "raw_in_content": bool}`
+/// - `index` names the `tool_calls` entry whose arguments carry `_truncated` (the call was
+///   named before it broke); `null` means it never got a name and never reached `tool_calls`
+/// - `raw_in_content` says the call's raw markup IS the `content` (no call was named before
+///   it); `false` means the markup was dropped - never both, the `toolcall` byte rule
+/// - absent when nothing was abandoned, so an ordinary answer is the chunk it always was;
+///   `crow_` like the engine's other extension keys (`timings.crow_*`), unknown to OpenAI
+///   clients and ignored by them
+/// - pure
+fn attach_malformed(doc: &mut serde_json::Value, malformed: &[Malformed]) {
+    if malformed.is_empty() {
+        return;
+    }
+    let arr: Vec<serde_json::Value> = malformed
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "kind": m.kind.as_str(),
+                "index": m.index,
+                "raw_in_content": m.raw_as_content,
+            })
+        })
+        .collect();
+    if let Some(obj) = doc.as_object_mut() {
+        obj.insert(MALFORMED_KEY.to_string(), serde_json::Value::Array(arr));
+    }
+}
+
+/// #99: the top-level key of `attach_malformed`
+const MALFORMED_KEY: &str = "crow_malformed_calls";
+
+/// #99: the finish of a generation that ended because its client left or the server is
+/// shutting down. Log and routing only on the stream (no final chunk is written); the
+/// `stream:false` document carries it too, since that document is still written.
+const FINISH_ABORT: &str = "abort";
+
+/// - #99: the finish one generation records, in the `[chat]` line, the routing JSON, the
+///   final chunk and the document - decided in ONE place
+/// - `aborted` (client gone, or the #82 shutdown): `abort`, whatever the loop had set. It
+///   used to keep the loop's default `length`, so a closed window read as a spent budget.
+/// - #29 A7: a closed call answers `tool_calls`; a call the generation ENDED inside
+///   (`ended_in_call`) keeps `stop` / `length`. `ToolStream::finish` closes a call whose
+///   `</function>` arrived, so EOS in the tail is a complete call (#29 review). A call
+///   abandoned EARLIER does not keep a later closed one from `tool_calls`: its
+///   `crow_malformed_calls` record says what happened to it.
+/// - #86: a stop-string hit OVERRIDES the closed-call word - the call's fragments were
+///   swallowed with everything after the stop, so naming `tool_calls` would promise a call
+///   the client never received.
+/// - pure
+fn decide_finish(
+    loop_finish: &'static str,
+    aborted: bool,
+    ended_in_call: bool,
+    closed: usize,
+    stop_hit: bool,
+) -> &'static str {
+    if aborted {
+        return FINISH_ABORT;
+    }
+    if !ended_in_call && closed > 0 && !stop_hit {
+        return "tool_calls";
+    }
+    loop_finish
 }
 
 /// one SSE event: `data: <compact json>` plus the blank line that ends it
@@ -2428,6 +3247,9 @@ trait ChatSink {
     fn on_reasoning(&mut self, c: &ChunkCtx, text: &str) -> bool;
     /// after the last token: the final chunk plus `[DONE]`, nothing for a document
     fn on_finish(&mut self, c: &ChunkCtx, a: &FinishArgs) -> bool;
+    /// #91: the logprobs entry of one generated id (`logprob_entry`); only called for a
+    /// request with `logprobs: true`
+    fn on_logprobs(&mut self, c: &ChunkCtx, entry: serde_json::Value) -> bool;
     /// - #54: between two decode steps: `false` means the client is gone and the loop stops
     /// - the default is `true`, and that is the SSE path: a sink that writes and flushes per
     ///   token learns of a gone client from its next failed flush, which is what it has always
@@ -2467,6 +3289,9 @@ impl<W: Write> ChatSink for SseSink<W> {
     fn on_finish(&mut self, c: &ChunkCtx, a: &FinishArgs) -> bool {
         sse_send(&mut self.w, &sse_frame(&chunk_finish(c, a))) && sse_send(&mut self.w, SSE_DONE)
     }
+    fn on_logprobs(&mut self, c: &ChunkCtx, entry: serde_json::Value) -> bool {
+        sse_send(&mut self.w, &sse_frame(&chunk_logprobs(c, entry)))
+    }
 }
 
 /// - #39 B3a: what the fragments of ONE tool call add up to
@@ -2488,6 +3313,8 @@ struct CollectSink {
     reasoning: String,
     /// one entry per tool call index, in the order the parser opened them
     calls: Vec<CallBuf>,
+    /// #91: one `logprob_entry` per generated id, in order; empty unless `logprobs: true`
+    logprobs: Vec<serde_json::Value>,
     /// #54: the gone-client watch of this request. `Default` holds no descriptor and never
     /// fires, which is what every unit test of this sink gets.
     probe: ClientProbe,
@@ -2532,6 +3359,10 @@ impl ChatSink for CollectSink {
     fn on_finish(&mut self, _c: &ChunkCtx, _a: &FinishArgs) -> bool {
         true
     }
+    fn on_logprobs(&mut self, _c: &ChunkCtx, entry: serde_json::Value) -> bool {
+        self.logprobs.push(entry);
+        true
+    }
     /// #54: the one sink that has to ASK. One `poll` per step, and one loud line when it fires.
     fn still_there(&mut self, step: usize) -> bool {
         match self.probe.gone(step) {
@@ -2570,6 +3401,10 @@ fn accumulate_args(pieces: &[Emit], acc: &mut Vec<String>) {
 ///   must stay byte-identical.
 /// - The malformed-tool-call path carries its raw markup as `Emit::Content`, so it is
 ///   filtered like any other content - the tag never leaves as content on any path.
+/// - #86: the stop filter runs AFTER the think split, on the CONTENT half alone - a
+///   stop string inside a think block is reasoning and does not end the answer. Once
+///   a stop matched, the rest of this batch is swallowed too: tool fragments of a call
+///   whose markup came after the stop point never reach the wire.
 /// - A piece that is entirely held back or entirely stripped sends NO frame, and is counted
 ///   in neither column: the counters name frames written, which is what they always named.
 fn send_emits(
@@ -2577,13 +3412,18 @@ fn send_emits(
     c: &ChunkCtx,
     pieces: &[Emit],
     think: &mut ThinkFilter,
+    stops: &mut StopStrings,
     counts: &mut Chunks,
 ) -> bool {
     for e in pieces {
+        // #86: the stop string ended this answer; everything after it is cut
+        if stops.hit() {
+            return true;
+        }
         match e {
             Emit::Content(t) => {
                 let split = think.push(t);
-                if !send_split(sink, c, &split, counts) {
+                if !send_split(sink, c, &split, stops, counts) {
                     return false;
                 }
             }
@@ -2598,8 +3438,19 @@ fn send_emits(
     true
 }
 
-/// #67: the two halves of one filtered piece, in wire order: reasoning first, then content
-fn send_split(sink: &mut dyn ChatSink, c: &ChunkCtx, split: &Split, counts: &mut Chunks) -> bool {
+/// - #67: the two halves of one filtered piece, in wire order: reasoning first, then content
+/// - #86: the content half passes the stop filter LAST - the held tail is why a frame
+///   may be shorter than the piece, and a hit is why it may not come at all
+fn send_split(
+    sink: &mut dyn ChatSink,
+    c: &ChunkCtx,
+    split: &Split,
+    stops: &mut StopStrings,
+    counts: &mut Chunks,
+) -> bool {
+    if stops.hit() {
+        return true;
+    }
     if !split.reasoning.is_empty() {
         counts.reasoning += 1;
         if !sink.on_reasoning(c, &split.reasoning) {
@@ -2607,9 +3458,12 @@ fn send_split(sink: &mut dyn ChatSink, c: &ChunkCtx, split: &Split, counts: &mut
         }
     }
     if !split.content.is_empty() {
-        counts.content += 1;
-        if !sink.on_emit(c, &Emit::Content(split.content.clone())) {
-            return false;
+        let piece = stops.push(&split.content);
+        if !piece.is_empty() {
+            counts.content += 1;
+            if !sink.on_emit(c, &Emit::Content(piece)) {
+                return false;
+            }
         }
     }
     true
@@ -2898,7 +3752,7 @@ fn chat_document(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u3
     // #54: the sink watches the request socket from here on - see `ClientProbe`
     let mut sink = CollectSink::watching(stream);
     let out = chat_generate(srv, req, ids, tk, &mut sink);
-    let doc = completion_json(
+    let mut doc = completion_json(
         &ChunkCtx::new(&out.id, out.created, &req.model),
         &sink.content,
         &sink.reasoning,
@@ -2906,6 +3760,12 @@ fn chat_document(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u3
         out.finish,
         &out.timing,
     );
+    // #99: the same record the stream's final chunk carries
+    attach_malformed(&mut doc, &out.malformed);
+    // #91: absent unless asked for, so the document is the document it always was
+    if req.logprobs {
+        attach_logprobs(&mut doc, &sink.logprobs);
+    }
     // #54: the document is written even for a client that is gone - one document shape, and
     // the write either lands in a socket nobody reads or fails with one `[serve]` line. The
     // STATUS says which it was, the way `chat_stream` has always said it.
@@ -2924,12 +3784,15 @@ struct GenOut {
     id: String,
     /// the unix second of this request, the `created` of both forms
     created: u64,
-    /// `stop`, `length` or `tool_calls`
+    /// `stop`, `length`, `tool_calls`, or `abort` (#99: the client left or the server is
+    /// shutting down; it used to stay `length`)
     finish: &'static str,
     /// the counts and walls behind `usage` and `timings`
     timing: Timing,
     /// a sink call refused, or the #54 probe found the client gone: the loop stopped early
     aborted: bool,
+    /// #99: every call the tool-call parser abandoned, for the document's record
+    malformed: Vec<Malformed>,
 }
 
 /// - #37: the two preconditions `Engine::trickle_tick` ASSERTS (`gen.rs:3128-3129`)
@@ -2973,9 +3836,14 @@ fn chat_generate(
     if req.images.is_empty() {
         srv.eng.end_vision();
     }
+    // #VIT: under CROW_VIT_DUMP=dir the prefill also collects every prompt logit
+    // row (the oracle compare path) and the patch inputs are written before it.
+    let dump_dir = std::env::var("CROW_VIT_DUMP").ok().filter(|_| !req.images.is_empty());
     // #31 A9: the detection rule of spec 7.4, host side, IDS ONLY. `Engine::history` is the
     // held conversation: prompt ids AND generated ids (`gen.rs:2698`, `gen.rs:2945`).
-    let plan = srv.cache.decide(srv.eng.history(), &prompt);
+    // #100: a snapshot holding its logits row may sit AT the prompt length (an identical
+    // re-request prefills nothing); a VIT dump needs the prefill's rows, so not for it.
+    let plan = srv.cache.decide_for(srv.eng.history(), &prompt, dump_dir.is_none());
     let held = srv.eng.history().len();
     let cache_on = srv.cache.enabled();
     let snaps = srv.cache.positions();
@@ -3012,15 +3880,15 @@ fn chat_generate(
     );
     // #27 A5: the timed window is the prefill CALL alone, the same window `decode run` prints
     // as `prefill done in X s`; the rollback, the reset and the tokenizer are outside it.
-    // #VIT: under CROW_VIT_DUMP=dir the prefill also collects every prompt logit
-    // row (the oracle compare path) and the patch inputs are written before it.
-    let dump_dir = std::env::var("CROW_VIT_DUMP").ok().filter(|_| !req.images.is_empty());
     let mut collect = dump_dir.as_ref().map(|_| Vec::new());
     let t_pre = Instant::now();
     let mut next = unsafe {
-        match collect.as_mut() {
-            Some(c) => srv.eng.prefill(srv.cnq, &prompt[cached_n..], Some(c)),
-            None => srv.eng.prefill(srv.cnq, &prompt[cached_n..], None),
+        match (plan.reuse, collect.as_mut()) {
+            // #100: the whole prompt is held: the snapshot's logits row goes back into
+            // `s.logits` and its greedy id stands in for what `prefill` would return
+            (Some((slot, p)), None) if p == prompt.len() => srv.cache.restore_logits(srv.eng, slot),
+            (_, Some(c)) => srv.eng.prefill(srv.cnq, &prompt[cached_n..], Some(c)),
+            (_, None) => srv.eng.prefill(srv.cnq, &prompt[cached_n..], None),
         }
     };
     let prefill_ms = t_pre.elapsed().as_secs_f64() * 1e3;
@@ -3031,7 +3899,8 @@ fn chat_generate(
     // Before the first `decode_step`, so no capture stream is live and no graph exists yet.
     // prefill clean: the prefill above started at 0 or at a prefill clean `P`, so every
     // KV and pooled QSA row below `pos` is a prefill row (`cache.rs`, the induction)
-    let snap1_ms = unsafe { srv.cache.snapshot(srv.eng, true) };
+    // #100: `next` is the greedy id of the row the snapshot keeps with the state
+    let snap1_ms = unsafe { srv.cache.snapshot(srv.eng, true, next) };
     // a disabled cache copies nothing, so it reports nothing either
     if cache_on {
         tracing::info!(target: "cache",
@@ -3045,43 +3914,94 @@ fn chat_generate(
     // `reset_to_zero` and warm by `PrefixCache::rollback`, so that step re-captures it
     // and the `sample_k` node goes in with it. `enable_dev_sampler` re-uploads `Rng::new(seed)`
     // and clears the presence mask on every call, which is the per request reseed (M1).
-    let sampler = sampler_from(req);
-    match &sampler {
-        Some(s) => {
+    let mut sampler = sampler_from(req);
+    // #84: the window spans PROMPT + generated - seed it with the prompt's
+    // last penalty_last_n ids BEFORE the first draw. `arm_sampler` reads the
+    // window back out of the sampler and uploads it to the device ring, so
+    // host and device start from the same ids whatever the prefix cache
+    // reused. The HF presence set stays EMPTY here: that one is this answer's
+    // tokens only (#68).
+    if let Some(s) = sampler.as_mut() {
+        s.observe_prompt(ids);
+    }
+    // #86: a biased request draws on the HOST - the row is read back, biased FIRST
+    // (llama.cpp applies the map outside the chain), then `Sampler::sample` draws.
+    // The device `sample_k` node has no bias input; its twin through the sampler's
+    // per-request mask/count buffers is the documented FOLLOW-UP of this issue, not
+    // built here. The host route is the reference path `CROW_SAMPLE_HOST=1` ran.
+    let biased = !req.logit_bias.is_empty();
+    // #93: the tool grammar of THIS request (`None` without tools, with
+    // `CROW_TOOL_GRAMMAR=0` or `tool_choice: "none"`), and its one request line. Built
+    // before the first draw: the biased route checks inside `draw_biased`.
+    let (mut gate, gate_line) = tool_gate(req, tk, tool_grammar_on());
+    if let Some(l) = gate_line {
+        tracing::info!(target: "chat", "{l}");
+    }
+    let mut redraw_ms = 0.0f64;
+    match (&mut sampler, biased) {
+        (Some(s), true) => {
+            // the device sampler must be OUT: `decode_step` samples whenever it is
+            // Some (gen.rs:2905-2909), and this request's draw happens on the host
+            srv.eng.park_sampler(&mut srv.parked_sampler);
+            // unsafe: one logits row read back (1 MB, ~0.3 ms), the price of the route
+            next = unsafe { draw_biased(srv.eng, s, &req.logit_bias, gate.as_mut()) };
+            tracing::info!(target: "chat",
+                "[chat] logit_bias: {} entries (request), drawing on the HOST sampler \
+                 (#86): the row is read back, biased first, then the chain; the device \
+                 mask-path twin is the follow-up",
+                req.logit_bias.len()
+            );
+            let sent = req.sampling_sent;
+            if s.temperature > 0.0 {
+                tracing::info!(target: "chat", "{}", sampling_line(s, sent));
+            } else {
+                tracing::info!(target: "chat",
+                    "[chat] greedy with logit_bias (#86): the biased argmax, presence_penalty {} ({})",
+                    s.presence_penalty,
+                    SamplingSent::tag(sent.presence_penalty)
+                );
+            }
+        }
+        (Some(s), false) => {
             // the device buffers a greedy request parked come back here, nothing is reallocated
             srv.eng.unpark_sampler(&mut srv.parked_sampler);
             // unsafe: device uploads and one eager sampler launch, as parity does
             next = unsafe { srv.eng.arm_sampler(s) };
-            // #68: every value says where it came from. `temperature` is the only one that is
-            // always the request's own - without it this branch is not taken at all.
+            // #68/#83/#84: every value says where it came from. `temperature` is the only
+            // one that is always the request's own - without it this branch is not taken
+            // unless the #84 penalties armed a greedy request.
             let sent = req.sampling_sent;
-            tracing::info!(target: "chat",
-                "[chat] sampling on the device: temperature {} (request) top_p {} ({}) top_k {} ({}) presence_penalty {} ({}) seed {} ({})",
-                s.temperature,
-                s.top_p, SamplingSent::tag(sent.top_p),
-                s.top_k, SamplingSent::tag(sent.top_k),
-                s.presence_penalty, SamplingSent::tag(sent.presence_penalty),
-                s.seed, SamplingSent::tag(sent.seed)
-            );
-            // the penalty set of THIS request: `arm_sampler` clears the device mask and reloads
-            // `Rng::new(seed)`, so no token of the prompt and no token of an earlier turn is in
-            // it, whatever the prefix cache reused (7.11.17)
-            tracing::info!(target: "chat",
-                "[chat] presence penalty set: cleared for this request, generated tokens only (#68)"
-            );
+            if s.temperature > 0.0 {
+                tracing::info!(target: "chat", "{}", sampling_line(s, sent));
+            } else {
+                tracing::info!(target: "chat",
+                    "[chat] greedy with windowed penalties (#84): repeat_penalty {} ({}) frequency_penalty {} ({}) penalty_last_n {} ({}) presence_penalty {} ({})",
+                    s.repeat_penalty, SamplingSent::tag(sent.repeat_penalty),
+                    s.frequency_penalty, SamplingSent::tag(sent.frequency_penalty),
+                    s.penalty_last_n, SamplingSent::tag(sent.penalty_last_n),
+                    s.presence_penalty, SamplingSent::tag(sent.presence_penalty)
+                );
+            }
+            if s.win_armed() {
+                tracing::info!(target: "chat",
+                    "[chat] penalty window armed: last {} ids, prompt tail + generated (#84); presence_penalty {} joins the window form (llama.cpp penalties), the HF per-answer set is not read",
+                    s.penalty_last_n, s.presence_penalty
+                );
+            } else {
+                // the penalty set of THIS request: `arm_sampler` clears the device mask and
+                // reloads `Rng::new(seed)`, so no token of the prompt and no token of an
+                // earlier turn is in it, whatever the prefix cache reused (7.11.17)
+                tracing::info!(target: "chat",
+                    "[chat] presence penalty set: cleared for this request, generated tokens only (#68)"
+                );
+            }
         }
-        None => {
+        (None, _) => {
             // greedy is the A4 path: `decode_step` samples whenever `dev_sampler` is Some
             // (gen.rs:2905-2909) and `reset_to_zero` does not clear it, so it is taken out here
             srv.eng.park_sampler(&mut srv.parked_sampler);
             tracing::info!(target: "chat", "[chat] greedy (temperature absent or <= 0)");
         }
-    }
-    if req.min_p != 0.0 {
-        tracing::info!(target: "chat",
-            "[chat] min_p {} accepted and ignored (device sampler has no min_p; #28)",
-            req.min_p
-        );
     }
     // #74: one line per request that says whether it thought, at which level, and whether the
     // value came from the body - the same provenance shape the two sampling lines above carry
@@ -3095,11 +4015,20 @@ fn chat_generate(
     // partial `</think` back across deltas, and it never touches an id: the loop below
     // samples and pushes the same ids it pushed before this filter existed.
     let mut think = ThinkFilter::for_request(req.enable_thinking);
+    // #86: the stop-string filter of THIS request. It is the LAST gate on the CONTENT
+    // channel, after the think split, and it holds a tail that might still become a
+    // stop string - the tool-call hold on arbitrary strings - so no half of a stop
+    // string ever reaches the wire. It never touches an id either: the ids stop on
+    // `EOS_IDS` and `max_tokens` as before, the TEXT stops on the request's strings.
+    let mut stops = StopStrings::new(&req.stop);
     let mut counts = Chunks::default();
 
     // the id/created/model triple of this response, once
     let cx = ChunkCtx::new(&id, created, &model);
     let mut aborted = !sink.open(&cx);
+    // #99: an abort caused by the #82 shutdown signal rather than by a gone client; only
+    // the `[chat]` line tells the two apart, both finish as `abort`
+    let mut shutdown = false;
 
     // #27 A5: the decode window opens at the FIRST `decode_step` and closes when the last one
     // returns, so the detokenize and the sink call of token 1 are not counted as decode
@@ -3112,6 +4041,10 @@ fn chat_generate(
     // contract can be checked where it is produced (see the loop after the flush)
     let mut args_acc: Vec<String> = Vec::new();
     let mut decode_ms = 0.0f64;
+    // #91: the narrowest raw top-1/top-2 gap of the answer and the index of its id, and
+    // the host wall of the readbacks, for the one `[chat]` line a logprobs request gets
+    let mut lp_gap = (f64::INFINITY, 0usize);
+    let mut lp_ms = 0.0f64;
     // #37: the stream trickle, one tick per `decode_step`, the mirror of `decode.rs:224-231`.
     // `cfg.adapt` is what `apply_adapt_policy` (geo.rs:167-176) gave this process: with
     // `CROW_ADAPT_STREAM` unset and chunk 2048 that is stream / 7 spare / every 8 / max 7.
@@ -3169,6 +4102,16 @@ fn chat_generate(
         }
         VecDeque::from(ids)
     };
+    // #91: the forced ids take the #81 door - each one replaces the
+    // id the step produced, from the first generated position on (parse_chat refuses a
+    // thinking budget beside it, so nothing else fills this queue)
+    if let Some(f) = req.force_ids.as_ref() {
+        inject = f.iter().copied().collect();
+        tracing::info!(target: "chat", "[chat] teacher forcing: {} forced ids", inject.len());
+        // the exact prompt ids this request prefilled, for an oracle over the same
+        // sequence (`CROW_LOG=info,chat=debug`; the generated ids follow as `[chat] ids`)
+        tracing::debug!(target: "chat", "[chat] prompt ids {ids:?}");
+    }
     if think_budget == Some(0) {
         inject = build_injection();
         injection_built = true;
@@ -3183,12 +4126,78 @@ fn chat_generate(
             // exists anywhere.
             if !inject.is_empty() {
                 next = inject.pop_front().expect("checked non-empty");
+            } else if let Some(gt) = gate.as_mut() {
+                // #93: inside a call (or, `required`, before one) the id the
+                // step produced is CHECKED - one walk over its bytes - and a refused id is
+                // drawn again from the same row under the grammar's mask (llama.cpp's
+                // rejection order). Outside a call in `auto` mode `armed()` is false and
+                // nothing else runs. The biased route checked inside `draw_biased`.
+                if !biased && gt.armed() && !gt.check(next as u32) {
+                    let t_rd = Instant::now();
+                    let drawn = next;
+                    // unsafe: one logits row read back, as `draw_biased` does
+                    next = unsafe { grammar_redraw(srv.eng, req, ids, &out, gt) };
+                    gt.stats.redrawn += 1;
+                    // the device sampler booked `drawn`; move that to `next`
+                    if let Some(s) = sampler.as_ref() {
+                        let lastn = if s.win_armed() {
+                            s.penalty_last_n.min(crow_nest_engine::gen::SAMPLE_RING_MAX)
+                        } else {
+                            0
+                        };
+                        let seen = out.contains(&(drawn as u32));
+                        // unsafe: a few bytes read and written on the sampler's buffers
+                        unsafe { srv.eng.rebook_sampler(drawn, next, seen, lastn) };
+                    }
+                    redraw_ms += t_rd.elapsed().as_secs_f64() * 1e3;
+                    // info, not debug: every refusal puts a token the model did not pick
+                    // into its context, so each one has to be attributable from engine.log
+                    tracing::info!(target: "chat",
+                        "[chat] tool grammar: id {drawn} {:?} refused in phase {}, redrawn {next} {:?}",
+                        String::from_utf8_lossy(&tk.token_bytes(drawn as u32)), gt.phase(),
+                        String::from_utf8_lossy(&tk.token_bytes(next as u32)));
+                }
             }
             if EOS_IDS.contains(&next) {
                 finish = "stop";
                 break;
             }
             out.push(next as u32);
+            // #93: the kept id advances the grammar (the `<tool_call>` id opens
+            // it). Only a FORCED id (#81 injection) can be refused here: the grammar then
+            // steps aside for the rest of the answer, the force wins, as it does over the
+            // sampler.
+            if let Some(gt) = gate.as_mut() {
+                let phase = gt.phase();
+                if !gt.accept(next as u32) {
+                    tracing::warn!(target: "chat",
+                        "[chat] tool grammar: the forced id {next} is outside the grammar ({phase}); \
+                         the grammar steps aside for the rest of this answer");
+                }
+            }
+            // #91: the logprobs of THIS position, read off the row that produced `next`.
+            // `s.logits` still holds it: the prefill (or the last `decode_step`) wrote it,
+            // `arm_sampler` / the device `sample_k` node / `draw_biased` only READ it, and
+            // the next `decode_step` has not run yet - so an #81-injected id is priced under
+            // the model's distribution at the position it was forced into. Host route:
+            // one row read back (V f32 = 0.99 MB) and two passes over it on the host, the
+            // price `draw_biased` already pays; nothing of it runs without `logprobs: true`.
+            if req.logprobs {
+                let t_lp = Instant::now();
+                // unsafe: one device-to-host copy on the engine's logits buffer
+                let row = unsafe { crow_nest_engine::cuda::dtoh(srv.eng.logits(), V) };
+                let p = pos_logprobs(&row, next, req.top_logprobs);
+                lp_ms += t_lp.elapsed().as_secs_f64() * 1e3;
+                if p.top.len() >= 2 && p.top[0].1 - p.top[1].1 < lp_gap.0 {
+                    lp_gap = (p.top[0].1 - p.top[1].1, out.len() - 1);
+                }
+                let entry =
+                    logprob_entry_ids(&p, &|id| tk.token_bytes(id), req.force_ids.is_some());
+                if !sink.on_logprobs(&cx, entry) {
+                    aborted = true;
+                    break;
+                }
+            }
             // #29 A7: the ID is what opens a tool call, never the text (spec of the task)
             if Some(next as u32) == tool_open {
                 ts.arm();
@@ -3204,8 +4213,17 @@ fn chat_generate(
                 emitted = full.len();
                 let pieces = ts.feed(delta);
                 accumulate_args(&pieces, &mut args_acc);
-                if !send_emits(sink, &cx, &pieces, &mut think, &mut counts) {
+                if !send_emits(sink, &cx, &pieces, &mut think, &mut stops, &mut counts) {
                     aborted = true;
+                    break;
+                }
+                // #86: a stop string ended this answer. The filter swallowed the stop
+                // and everything after it; no further decode step runs, and the finish
+                // is `stop` - unless a closed tool call says `tool_calls` after the
+                // loop, the precedence EOS already has. This break sits ABOVE the
+                // budget counter on purpose: the answer is over, nothing else counts.
+                if stops.hit() {
+                    finish = "stop";
                     break;
                 }
             }
@@ -3240,8 +4258,12 @@ fn chat_generate(
             // #82: a shutdown signal ends the generation THROUGH the normal
             // abort path, so the slot, the sink and the loop bookkeeping all
             // close the way a gone client closes them
-            if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
-                || !sink.still_there(i) {
+            if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                aborted = true;
+                shutdown = true;
+                break;
+            }
+            if !sink.still_there(i) {
                 aborted = true;
                 break;
             }
@@ -3253,10 +4275,51 @@ fn chat_generate(
             }
             let t = *t_dec.get_or_insert_with(Instant::now);
             next = unsafe { srv.eng.decode_step(srv.cnq, next as i64) };
+            // #86: a biased request re-draws the step on the host. `decode_step`
+            // returned the plain argmax (the device sampler is parked), the row it
+            // left is this position's distribution, and the biased draw replaces
+            // the id the same way the device node would have drawn it - the
+            // readback is the one cost the host route pays per token.
+            if biased {
+                if let Some(s) = sampler.as_mut() {
+                    // unsafe: one logits row read back, as `draw_biased` does
+                    next = unsafe { draw_biased(srv.eng, s, &req.logit_bias, gate.as_mut()) };
+                }
+            }
             decode_ms = t.elapsed().as_secs_f64() * 1e3;
         }
     }
 
+    // #93: one line per request whose grammar ever checked an id
+    if let Some(gt) = gate.as_ref() {
+        let st = gt.stats;
+        if st.checked > 0 || st.stepped_aside {
+            tracing::info!(target: "chat",
+                "[chat] tool grammar: {} call(s) closed under it, {} id(s) checked, {} refused and \
+                 redrawn ({} mask(s) built, {:.2} ms; redraw path {:.2} ms in total){}",
+                st.calls_closed,
+                st.checked,
+                st.redrawn,
+                st.masks_built,
+                st.mask_ms,
+                redraw_ms,
+                if st.stepped_aside { "; stepped aside for a forced id" } else { "" }
+            );
+        }
+    }
+    if req.logprobs {
+        tracing::info!(target: "chat",
+            "[chat] logprobs (#91): {} entries, top_logprobs {}, raw distribution (pre-sampler), \
+             readback + log-softmax {lp_ms:.1} ms in total{}",
+            out.len(),
+            req.top_logprobs,
+            if lp_gap.0.is_finite() {
+                format!(", narrowest top-1/top-2 gap {:.4} nats at generated id {}", lp_gap.0, lp_gap.1)
+            } else {
+                String::new()
+            }
+        );
+    }
     // #37: finish the trickle of THIS request, as `decode.rs:253` does after its loop.
     // Outside the decode window on purpose: `decode run` does not charge the drain to a
     // token either. No copy is left in flight, so the next request prefills on a settled
@@ -3282,7 +4345,7 @@ fn chat_generate(
         };
         malformed = ts.finish(&mut pieces);
         accumulate_args(&pieces, &mut args_acc);
-        if !send_emits(sink, &cx, &pieces, &mut think, &mut counts) {
+        if !send_emits(sink, &cx, &pieces, &mut think, &mut stops, &mut counts) {
             aborted = true;
         }
     }
@@ -3290,9 +4353,40 @@ fn chat_generate(
     // is TEXT, and it leaves here, so no byte of the answer is lost to the filter.
     if !aborted {
         let tail = think.flush();
-        if !send_split(sink, &cx, &tail, &mut counts) {
+        if !send_split(sink, &cx, &tail, &mut stops, &mut counts) {
             aborted = true;
         }
+    }
+    // #86: what the STOP filter is still holding back - the same rule. A tail that
+    // might still have become a stop string but never did is TEXT, and it leaves
+    // here, so no byte of the answer is lost to the hold. After a hit this is empty
+    // by construction: everything after the stop point was swallowed.
+    if !aborted {
+        let stail = stops.flush();
+        if !stail.is_empty() {
+            counts.content += 1;
+            if !sink.on_emit(&cx, &Emit::Content(stail)) {
+                aborted = true;
+            }
+        }
+    }
+    // #86: a stop that completed in the FINAL tail - on the last token, or a held
+    // prefix resolving at EOS - ends the answer as `stop` even when `max_tokens`
+    // was spent making it: the sequence IS in the generated text. A stop that hit
+    // inside the loop already set `finish` at its break.
+    if !aborted && stops.hit() && finish == "length" {
+        finish = "stop";
+    }
+    // #86: one line per stopped answer, the shape `toolcall`'s dropped line set: the
+    // string, the content byte it landed on, and what stayed off the wire.
+    if stops.hit() && !aborted {
+        tracing::info!(target: "chat",
+            "[chat] stopped on a stop string (#86): {:?} at content byte {}, {} \
+             byte(s) swallowed - the sequence and everything after it stayed off the wire",
+            stops.matched().unwrap_or_default(),
+            stops.matched_at(),
+            stops.dropped()
+        );
     }
     if think.stripped() > 0 {
         tracing::info!(target: "chat",
@@ -3314,22 +4408,46 @@ fn chat_generate(
     // for the request that just ran. A stream cannot be repaired - the fragments are already
     // on the wire - so a violation is a named, loud line with `serde_json`'s own message and
     // the byte window, instead of a `{"_raw": ...}` two turns later in someone else's history.
-    for (i, a) in args_acc.iter().enumerate() {
-        if let (_, Some(note)) = args_object_or_raw(a) {
-            tracing::error!(target: "chat", "[chat] BUG: the arguments of tool call {i} are not a JSON object - {note}");
+    // #99: NOT after an abort. `ts.finish` - the step that closes a call in flight - never
+    // ran, so an open fragment is the disconnect, not the parser; 13:58:31 on 2026-09-22
+    // logged it as `ERROR ... BUG` although the client was gone. The call left open is named
+    // on one INFO line instead.
+    if aborted {
+        let open = args_acc
+            .iter()
+            .filter(|a| args_object_or_raw(a).1.is_some())
+            .count();
+        if open > 0 {
+            tracing::info!(target: "chat",
+                "[chat] aborted with {open} tool call(s) in flight: their arguments stay \
+                 unterminated on a connection nobody reads - not a parser fault, not checked (#99)"
+            );
+        }
+    } else {
+        for (i, a) in args_acc.iter().enumerate() {
+            if let (_, Some(note)) = args_object_or_raw(a) {
+                tracing::error!(target: "chat", "[chat] BUG: the arguments of tool call {i} are not a JSON object - {note}");
+            }
         }
     }
-    // #29 A7: a closed call answers `tool_calls`; a malformed one keeps `stop` / `length`.
-    // `ToolStream::finish` closes a call whose `</function>` arrived, so EOS in the tail is
-    // a complete call, not a malformed one (#29 review).
-    if malformed {
+    // #99: the finish is decided ONCE, here, by `decide_finish` - before the lines below, so
+    // they name the finish that is recorded
+    finish = decide_finish(finish, aborted, malformed, ts.closed(), stops.hit());
+    // #99: ONE WARN per abandoned call, on every path. Before, only an END inside a call
+    // was logged; the `give_up` paths were silent (4 of the 8 malformed calls of 2026-09-22).
+    for m in ts.malformed() {
         tracing::warn!(target: "chat",
-            "[chat] MALFORMED tool call: no </function> or no name before the end; \
-             the raw markup went out as content, finish stays {finish}"
+            "[chat] MALFORMED tool call ({}): {}; {}, finish {finish}",
+            m.kind.as_str(),
+            m.kind.what(),
+            match (m.index, m.raw_as_content) {
+                (Some(i), _) => format!("sent once, as tool_calls[{i}] with \"_truncated\" arguments; its raw markup was dropped"),
+                (None, true) => "never named: its raw markup went out as content".to_string(),
+                (None, false) => "never named, after an earlier call: its raw markup was dropped".to_string(),
+            }
         );
-    } else if ts.closed() > 0 {
-        finish = "tool_calls";
     }
+
     if ts.dropped() > 0 {
         tracing::info!(target: "chat",
             "[chat] {} byte(s) dropped after the first tool call started: text the template \
@@ -3378,6 +4496,7 @@ fn chat_generate(
                 t: &timing,
                 include_usage: req.include_usage,
                 timings_per_token: req.timings_per_token,
+                malformed: ts.malformed(),
             },
         );
     }
@@ -3404,7 +4523,7 @@ fn chat_generate(
         (true, true)
     };
     tracing::info!(target: "chat",
-        "[chat] prompt {} tok ({cached_n} cached, {prefilled} prefilled), generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {}, reasoning chunks {}, thinking {}, tool chunks {}, think tags stripped {}, tool calls {}, usage {}, timings {}, crow_trickle_swaps {trickle_swaps}{}{}",
+        "[chat] prompt {} tok ({cached_n} cached, {prefilled} prefilled), generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {}, reasoning chunks {}, thinking {}, tool chunks {}, think tags stripped {}, tool calls {}, malformed {}, usage {}, timings {}, crow_trickle_swaps {trickle_swaps}{}{}",
         ids.len(),
         per_second(prefilled, prefill_ms),
         (gen.saturating_sub(1)) as f64 * 1000.0 / decode_ms.max(1e-9),
@@ -3414,9 +4533,14 @@ fn chat_generate(
         counts.tool,
         think.stripped(),
         ts.closed(),
+        ts.malformed().len(),
         log_usage,
         log_timings,
-        if aborted { ", client gone" } else { "" },
+        match (aborted, shutdown) {
+            (true, true) => ", shutdown",
+            (true, false) => ", client gone",
+            _ => "",
+        },
         repeat_note(&rep)
     );
     // #30 A8: the same numbers the `timings` block carries, cumulative since process start
@@ -3489,6 +4613,7 @@ fn chat_generate(
         finish,
         timing,
         aborted,
+        malformed: ts.malformed().to_vec(),
     }
 }
 
@@ -4193,9 +5318,10 @@ fn main() {
     // #36 M2b: SLOTS is 1, and the line below reads it instead of naming a count of its own.
     let cache = PrefixCache::new(&eng);
     tracing::info!(target: "serve",
-        "[serve] prefix cache {}, {} B per snapshot, {} snapshot(s) in HOST RAM (#72: never VRAM, see cache.rs), QSA ring rows {}",
+        "[serve] prefix cache {}, {} B per snapshot + {} B logits row (#100), {} snapshot(s) in HOST RAM (#72: never VRAM, see cache.rs), QSA ring rows {}",
         if cache.enabled() { "on" } else { "off (CROW_PREFIX_CACHE=0)" },
         cache.shape().snapshot_bytes(),
+        V * 4,
         SLOTS,
         eng.qsa_ring_rows()
     );
@@ -4686,7 +5812,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             crow.sampling_sent,
-            SamplingSent { top_p: true, top_k: false, presence_penalty: false, seed: false }
+            SamplingSent { top_p: true, top_k: false, presence_penalty: false, seed: false, min_p: true,
+                           repeat_penalty: false, frequency_penalty: false, penalty_last_n: false,
+                           tier: TierSent::default() }
         );
         // the values behind the two flags that are false are this file's, not the client's
         assert_eq!(crow.presence_penalty, DEFAULT_PRESENCE);
@@ -4701,7 +5829,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             full.sampling_sent,
-            SamplingSent { top_p: true, top_k: true, presence_penalty: true, seed: true }
+            SamplingSent { top_p: true, top_k: true, presence_penalty: true, seed: true, min_p: false,
+                           repeat_penalty: false, frequency_penalty: false, penalty_last_n: false,
+                           tier: TierSent::default() }
         );
 
         // an explicit null is an absent field here too, so the tag never contradicts the value
@@ -4713,6 +5843,376 @@ mod tests {
         assert_eq!(nulls.sampling_sent, SamplingSent::default());
         assert_eq!(SamplingSent::tag(true), "request");
         assert_eq!(SamplingSent::tag(false), "data sheet");
+    }
+
+    // #83 (2026-09-20): min_p is REAL - parsed, plumbed into the sampler, on
+    // the provenance line. The whole "accepted and ignored" era (#28) exists
+    // because the field was invisible downstream; these pin all three stops.
+    #[test]
+    fn min_p_is_plumbed_into_the_sampler_and_the_line() {
+        // Crow's own request: temperature 1.0, top_p 0.95, min_p 0.01
+        let r = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "temperature":1.0,"top_p":0.95,"min_p":0.01}"#,
+        )
+        .unwrap();
+        let s = sampler_from(&r).expect("temperature 1.0 samples");
+        assert_eq!(s.min_p, 0.01);
+        // the threshold constant the DEVICE receives is the host's own f32 ln,
+        // so the two samplers filter against the same bytes
+        assert_eq!(s.ln_min_p(), 0.01f32.ln());
+        let line = sampling_line(&s, r.sampling_sent);
+        assert!(line.contains("min_p 0.01 (request)"), "{line}");
+        assert!(line.contains("top_p 0.95 (request)"), "{line}");
+        assert!(line.contains("top_k 20 (data sheet)"), "{line}");
+        assert!(line.contains("presence_penalty 0 (data sheet)"), "{line}");
+
+        // absent stays 0.0 = disabled: the exact pre-#83 draw, golden rows included
+        let bare = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],"temperature":1.0}"#,
+        )
+        .unwrap();
+        let sb = sampler_from(&bare).unwrap();
+        assert_eq!(sb.min_p, 0.0);
+        assert_eq!(sb.ln_min_p(), 0.0);
+        let line_b = sampling_line(&sb, bare.sampling_sent);
+        assert!(line_b.contains("min_p 0 (data sheet)"), "{line_b}");
+        // an explicit null is absent here too
+        assert!(!bare.sampling_sent.min_p);
+    }
+
+    // #84 (2026-09-20): the windowed llama.cpp penalties - parse, plumb, arm.
+    #[test]
+    fn penalty_fields_parse_with_neutral_defaults_and_plumb_into_the_sampler() {
+        // absent: neutral, so no existing row changes implicitly
+        let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"temperature":1.0}"#).unwrap();
+        assert_eq!(r.repeat_penalty, DEFAULT_REPEAT);
+        assert_eq!(r.repeat_penalty, 1.0);
+        assert_eq!(r.frequency_penalty, DEFAULT_FREQ);
+        assert_eq!(r.frequency_penalty, 0.0);
+        assert_eq!(r.penalty_last_n, DEFAULT_LAST_N);
+        assert_eq!(r.penalty_last_n, 64);
+        let s = sampler_from(&r).unwrap();
+        assert!(!s.win_armed(), "the defaults must not arm the window");
+        assert_eq!((s.repeat_penalty, s.frequency_penalty, s.penalty_last_n), (1.0, 0.0, 64));
+
+        // a row that names them: Crow's future request shape
+        let r = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "temperature":1.0,"top_p":0.95,"min_p":0.01,
+                 "repeat_penalty":1.05,"frequency_penalty":0.3,"penalty_last_n":64}"#,
+        )
+        .unwrap();
+        let s = sampler_from(&r).unwrap();
+        assert_eq!((s.repeat_penalty, s.frequency_penalty, s.penalty_last_n), (1.05, 0.3, 64));
+        assert!(s.win_armed());
+        // every value says where it came from
+        assert!(r.sampling_sent.repeat_penalty && r.sampling_sent.frequency_penalty && r.sampling_sent.penalty_last_n);
+        let line = sampling_line(&s, r.sampling_sent);
+        assert!(line.contains("repeat_penalty 1.05 (request)"), "{line}");
+        assert!(line.contains("frequency_penalty 0.3 (request)"), "{line}");
+        assert!(line.contains("penalty_last_n 64 (request)"), "{line}");
+
+        // an explicit null is absent, and a wrong type is a 400
+        let nulls = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "temperature":1.0,"repeat_penalty":null,"frequency_penalty":null,"penalty_last_n":null}"#,
+        )
+        .unwrap();
+        assert_eq!(nulls.repeat_penalty, 1.0);
+        assert_eq!(nulls.frequency_penalty, 0.0);
+        assert_eq!(nulls.penalty_last_n, 64);
+        for bad in [
+            &br#"{"messages":[{"role":"user","content":"hi"}],"repeat_penalty":"sharp"}"#[..],
+            &br#"{"messages":[{"role":"user","content":"hi"}],"frequency_penalty":"often"}"#[..],
+            &br#"{"messages":[{"role":"user","content":"hi"}],"penalty_last_n":"deep"}"#[..],
+            &br#"{"messages":[{"role":"user","content":"hi"}],"penalty_last_n":-4}"#[..],
+        ] {
+            assert!(parse_chat(bad).is_err(), "expected a 400 for {}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    /// #84: the window depth is clamped to the device ring's depth, visibly -
+    /// the `[chat]` line prints the effective value.
+    #[test]
+    fn penalty_last_n_clamps_to_the_device_ring() {
+        let r = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "temperature":1.0,"penalty_last_n":100000}"#,
+        )
+        .unwrap();
+        assert_eq!(r.penalty_last_n, crow_nest_engine::gen::SAMPLE_RING_MAX);
+        let s = sampler_from(&r).unwrap();
+        assert_eq!(s.penalty_last_n, crow_nest_engine::gen::SAMPLE_RING_MAX);
+    }
+
+    /// #84: llama.cpp runs its penalties in greedy too - a greedy request
+    /// that names repeat/freq gets a sampler (temperature <= 0, the device
+    /// draw is the penalized argmax ci[0]). A plain greedy request, and one
+    /// that names only top_p/min_p/seed, is still the A4 path: no sampler.
+    #[test]
+    fn greedy_with_penalties_arms_a_sampler_plain_greedy_does_not() {
+        let mk = |t: &str| parse_chat(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{t}}}"#).as_bytes()).unwrap();
+        assert!(sampler_from(&mk("")).is_none());
+        assert!(sampler_from(&mk(r#","temperature":0,"top_p":0.95,"min_p":0.01,"seed":7"#)).is_none());
+        // penalties arm a GREEDY request
+        for t in [
+            r#","temperature":0,"repeat_penalty":1.1"#,
+            r#","temperature":0,"frequency_penalty":0.2"#,
+            r#","repeat_penalty":1.1"#,
+        ] {
+            let s = sampler_from(&mk(t)).expect("penalties arm a greedy request");
+            assert!(s.temperature <= 0.0);
+            assert!(s.win_armed());
+        }
+        // a zero window disarms even a named repeat penalty (llama.cpp: window 0 disables)
+        assert!(sampler_from(&mk(r#","temperature":0,"repeat_penalty":1.1,"penalty_last_n":0"#)).is_none());
+        // repeat 1.0 + freq 0 with a window is neutral: still plain greedy
+        assert!(sampler_from(&mk(r#","temperature":0,"penalty_last_n":64"#)).is_none());
+    }
+
+    // ------------------------------- #86: OpenAI stop strings + logit_bias (host route)
+
+    const HI: &str = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+
+    #[test]
+    fn stop_parses_in_both_wire_forms_and_refuses_garbage_with_named_reasons() {
+        // the array form, exactly as OpenAI and llama-server document it
+        let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stop":["\n\n","END"]}"#).unwrap();
+        assert_eq!(r.stop, vec!["\n\n".to_string(), "END".to_string()]);
+        // the one-stop form: a bare string is the same request (the OpenAI contract
+        // spells `stop: string | string[]`)
+        let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stop":"END"}"#).unwrap();
+        assert_eq!(r.stop, vec!["END".to_string()]);
+        // empty entries drop, the rest keep their order (StopStrings does the sort)
+        let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stop":["","END",""]}"#).unwrap();
+        assert_eq!(r.stop, vec!["END".to_string()]);
+        // absent, null and the empty array are the pre-#86 default: no filter at all
+        for body in [
+            HI.to_string(),
+            r#"{"messages":[{"role":"user","content":"hi"}],"stop":null}"#.to_string(),
+            r#"{"messages":[{"role":"user","content":"hi"}],"stop":[]}"#.to_string(),
+        ] {
+            assert!(parse_chat(body.as_bytes()).unwrap().stop.is_empty(), "{body}");
+        }
+        // garbage is a 400 that NAMES the field and the entry, house style
+        let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stop":7}"#).unwrap_err();
+        assert!(e.contains("stop is not an array of strings"), "{e}");
+        let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stop":[1]}"#).unwrap_err();
+        assert!(e.contains("stop[0] is not a string"), "{e}");
+        let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stop":["a",null]}"#).unwrap_err();
+        assert!(e.contains("stop[1] is not a string"), "{e}");
+        let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"stop":{"a":1}}"#).unwrap_err();
+        assert!(e.contains("stop is not an array of strings"), "{e}");
+    }
+
+    #[test]
+    fn logit_bias_parses_token_ids_strictly_and_sorts_by_token() {
+        // token ids as string keys, numeric biases; -1e39/1e39 are +-inf once f32
+        let r = parse_chat(
+            br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"248046":2.5,"5":-1e39,"7":1e39}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            r.logit_bias,
+            vec![(5, f32::NEG_INFINITY), (7, f32::INFINITY), (248046, 2.5)]
+        );
+        // absent, null and the empty map are the pre-#86 default: no bias at all
+        for body in [
+            HI.to_string(),
+            r#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":null}"#.to_string(),
+            r#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{}}"#.to_string(),
+        ] {
+            assert!(parse_chat(body.as_bytes()).unwrap().logit_bias.is_empty(), "{body}");
+        }
+        // garbage is a 400 that NAMES the key or the value
+        let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":[1]}"#).unwrap_err();
+        assert!(e.contains("logit_bias is not an object"), "{e}");
+        let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"five":1.0}}"#).unwrap_err();
+        assert!(e.contains("logit_bias key \"five\" is not a token id"), "{e}");
+        // the vocabulary ends one below V: the first id outside it is a 400, not a
+        // silent no-op the caller would read as a banned token
+        let over = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"logit_bias":{{"{V}":1.0}}}}"#);
+        let e = parse_chat(over.as_bytes()).unwrap_err();
+        assert!(e.contains("is not a token id of this model's vocabulary"), "{e}");
+        let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"5":"high"}}"#).unwrap_err();
+        assert!(e.contains("logit_bias[5] is not a number"), "{e}");
+        let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"5":true}}"#).unwrap_err();
+        assert!(e.contains("logit_bias[5] is not a number"), "{e}");
+        // strict JSON cannot carry the -Infinity literal: the BODY refuses it before
+        // the field parser ever runs, which is why -1e39 is the mask's wire form
+        assert!(parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"5":-Infinity}}"#).is_err());
+    }
+
+    #[test]
+    fn a_bias_is_additive_and_minus_infinity_masks() {
+        // additive, on the raw row, before any sampler reads it
+        let mut row = [1.0, 2.0, 3.0];
+        apply_logit_bias(&mut row, &[(0, 5.0)]);
+        assert_eq!(row, [6.0, 2.0, 3.0]);
+        // a neutral sampler to see the row the way the chain sees it: greedy argmax
+        let greedy = || {
+            let mut s = Sampler::new(0);
+            s.temperature = 0.0;
+            s.presence_penalty = 0.0;
+            s
+        };
+        // promote: a positive bias moves the argmax to the biased token
+        let mut row = [1.0, 2.0];
+        apply_logit_bias(&mut row, &[(0, 3.0)]);
+        assert_eq!(greedy().sample(&row), 0, "the bias promoted token 0");
+        // ban: -inf masks it, the runner-up wins - the additive -100 of the OpenAI
+        // convention is a STRONG ban, this is the absolute one
+        let mut row = [1.0, 2.0];
+        apply_logit_bias(&mut row, &[(0, f32::NEG_INFINITY)]);
+        assert_eq!(row[0], f32::NEG_INFINITY);
+        assert_eq!(greedy().sample(&row), 1, "the masked token cannot win");
+        // a mask stays a mask: no bias turns it into a NaN, whatever the order
+        for bias in [&[(0usize, 5.0f32)][..], &[(0usize, f32::NEG_INFINITY)][..]] {
+            let mut m = [f32::NEG_INFINITY, 1.0];
+            apply_logit_bias(&mut m, bias);
+            apply_logit_bias(&mut m, &[(0, f32::NEG_INFINITY)]);
+            assert_eq!(m[0], f32::NEG_INFINITY, "a mask is never a NaN");
+        }
+        // interaction with EOS: masking BOTH stop ids is the ignore_eos shape
+        // (llama-server's logit_bias_eog) - the draw steps aside instead of ending.
+        // VOCAB-sized row: the EOS ids are real token ids (an 8-slot fixture
+        // indexed 248046 out of bounds - the fleet's second OOM-adjacent test bug).
+        let mut eosrow = vec![0.0f32; crow_nest_engine::geo::V];
+        eosrow[EOS_IDS[0]] = 9.0;
+        eosrow[EOS_IDS[1]] = 8.0;
+        eosrow[3] = 7.0;
+        let mask: Vec<(usize, f32)> = EOS_IDS.iter().map(|&t| (t, f32::NEG_INFINITY)).collect();
+        apply_logit_bias(&mut eosrow, &mask);
+        assert_eq!(greedy().sample(&eosrow), 3, "both EOS ids masked, next best wins");
+        // and the mask arrives from the WIRE as -1e39, not as a literal -Infinity
+        let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"5":-1e39}}"#).unwrap();
+        assert_eq!(r.logit_bias, vec![(5, f32::NEG_INFINITY)]);
+    }
+
+    #[test]
+    fn a_biased_request_draws_on_the_host_even_in_greedy() {
+        let mk = |t: &str| parse_chat(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{t}}}"#).as_bytes()).unwrap();
+        // greedy + bias: the biased argmax, on the host route; the data-sheet
+        // presence 1.5 is OUT unless the body sent it (a bias-only request asked
+        // for the bias, not for a silent penalty change)
+        let s = sampler_from(&mk(r#","logit_bias":{"10":1.0}"#)).expect("bias arms a host sampler in greedy");
+        assert!(s.temperature <= 0.0);
+        assert_eq!(s.presence_penalty, 0.0);
+        // presence sent is honored, exactly as sent
+        let s = sampler_from(&mk(r#","logit_bias":{"10":1.0},"presence_penalty":0.7"#)).unwrap();
+        assert_eq!(s.presence_penalty, 0.7);
+        // sampled + bias keeps the #28/#68 sampled contract, presence included
+        let s = sampler_from(&mk(r#","temperature":1.0,"logit_bias":{"10":-2.5}"#)).unwrap();
+        assert_eq!(s.temperature, 1.0);
+        assert_eq!(s.presence_penalty, DEFAULT_PRESENCE);
+        // greedy + penalties + bias: the #84 window keeps its own presence rule
+        // (the request's default 1.5 rides the windowed form); the bias rides the host
+        let s = sampler_from(&mk(r#","logit_bias":{"10":1.0},"repeat_penalty":1.1"#)).unwrap();
+        assert!(s.win_armed());
+        assert_eq!(s.presence_penalty, DEFAULT_PRESENCE);
+        // and the plain-greedy pin of #84 stands: no bias, no penalties, no sampler
+        assert!(sampler_from(&mk("")).is_none());
+    }
+
+    #[test]
+    fn stop_strings_apply_to_the_content_after_the_think_split() {
+        // the reasoning half carries "END" and does NOT stop the answer; the same
+        // four letters in the content half do - the documented channel contract
+        let pieces = vec![
+            Emit::Content("<think>plan END inside</think>the answ".to_string()),
+            Emit::Content("er END tail".to_string()),
+        ];
+        let mut col = CollectSink::default();
+        let mut think = ThinkFilter::for_request(false);
+        let mut stops = StopStrings::new(&["END".to_string()]);
+        let mut counts = Chunks::default();
+        assert!(send_emits(
+            &mut col,
+            &ChunkCtx::new("i", 1, "m"),
+            &pieces,
+            &mut think,
+            &mut stops,
+            &mut counts
+        ));
+        assert_eq!(col.reasoning, "plan END inside", "reasoning is never stop-scanned");
+        assert_eq!(col.content, "the answer ", "everything before the stop, byte exact");
+        assert!(stops.hit());
+        assert_eq!(stops.matched(), Some("END"));
+        assert_eq!(stops.matched_at(), "the answer ".len());
+        assert_eq!(stops.dropped(), "END tail".len());
+        // the frame counters name frames WRITTEN: one reasoning, two content
+        assert_eq!((counts.content, counts.reasoning), (2, 1));
+        // the held-tail flush after the hit is empty, and nothing more may leave
+        assert_eq!(stops.flush(), "");
+    }
+
+    #[test]
+    fn a_stop_hit_swallows_the_tool_fragments_that_followed_it() {
+        // the stop ended this answer inside the batch: the call whose markup came
+        // after the stop point never reaches the wire, so `finish_reason` has no
+        // call to promise (`chat_generate` keeps `stop` over `tool_calls`)
+        let pieces = vec![
+            Emit::Content("before ".to_string()),
+            Emit::Content("END {".to_string()),
+            Emit::Call { index: 0, id: "call_0".to_string(), name: "read_file".to_string() },
+            Emit::Args { index: 0, text: "{\"path\":\"a.md\"}".to_string() },
+        ];
+        let mut col = CollectSink::default();
+        let mut think = ThinkFilter::for_request(false);
+        let mut stops = StopStrings::new(&["END".to_string()]);
+        let mut counts = Chunks::default();
+        assert!(send_emits(
+            &mut col,
+            &ChunkCtx::new("i", 1, "m"),
+            &pieces,
+            &mut think,
+            &mut stops,
+            &mut counts
+        ));
+        assert_eq!(col.content, "before ");
+        assert!(col.calls.is_empty(), "no fragment of a call after the stop point");
+        assert_eq!(counts.tool, 0);
+    }
+
+    #[test]
+    fn without_stop_and_logit_bias_the_stream_is_the_pre_86_bytes() {
+        // the default of record: both fields absent, the parse carries nothing, and
+        // the stream gate is the think filter alone - byte for byte
+        let r = parse_chat(HI.as_bytes()).unwrap();
+        assert!(r.stop.is_empty());
+        assert!(r.logit_bias.is_empty());
+        assert!(sampler_from(&r).is_none(), "an unbiased greedy request is the A4 path");
+        let pieces = vec![
+            Emit::Content("Hello".to_string()),
+            Emit::Content(" world <tool_call>".to_string()),
+            Emit::Content(" done".to_string()),
+        ];
+        let mut col = CollectSink::default();
+        let mut think = ThinkFilter::new();
+        let mut stops = StopStrings::new(&r.stop);
+        let mut counts = Chunks::default();
+        assert!(send_emits(&mut col, &ChunkCtx::new("i", 1, "m"), &pieces, &mut think, &mut stops, &mut counts));
+        // the pre-#86 bytes: the think split of the same pieces, emitted directly
+        let mut want_content = String::new();
+        let mut want_reasoning = String::new();
+        let mut think2 = ThinkFilter::new();
+        for p in &pieces {
+            if let Emit::Content(t) = p {
+                let s = think2.push(t);
+                want_content.push_str(&s.content);
+                want_reasoning.push_str(&s.reasoning);
+            }
+        }
+        let tail = think2.flush();
+        want_content.push_str(&tail.content);
+        want_reasoning.push_str(&tail.reasoning);
+        assert_eq!(col.content, want_content);
+        assert_eq!(col.reasoning, want_reasoning);
+        // the stop gate held nothing, matched nothing, swallowed nothing
+        assert!(!stops.hit());
+        assert_eq!(stops.flush(), "");
+        assert_eq!(stops.dropped(), 0);
     }
 
     // #68 (2026-09-18): the cross-turn repeat counter. Four tests, all pure - the ring is
@@ -4909,11 +6409,11 @@ mod tests {
 
         // the last chunk: empty delta, a finish reason, and only ONE of them exists
         let t = T0;
-        let f = chunk_finish(&ChunkCtx::new("chatcmpl-1", 1, "crow-nest"), &FinishArgs { finish: "stop", t: &t, include_usage: false, timings_per_token: false });
+        let f = chunk_finish(&ChunkCtx::new("chatcmpl-1", 1, "crow-nest"), &FinishArgs { finish: "stop", t: &t, include_usage: false, timings_per_token: false, malformed: &[] });
         assert_eq!(f["choices"][0]["finish_reason"], "stop");
         assert_eq!(f["choices"][0]["delta"], serde_json::json!({}));
         assert_eq!(
-            chunk_finish(&ChunkCtx::new("i", 1, "m"), &FinishArgs { finish: "length", t: &t, include_usage: false, timings_per_token: false })["choices"][0]["finish_reason"],
+            chunk_finish(&ChunkCtx::new("i", 1, "m"), &FinishArgs { finish: "length", t: &t, include_usage: false, timings_per_token: false, malformed: &[] })["choices"][0]["finish_reason"],
             "length"
         );
     }
@@ -4933,7 +6433,7 @@ mod tests {
 
     #[test]
     fn without_the_two_flags_the_final_chunk_is_the_a4_chunk() {
-        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: false });
+        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: false, malformed: &[] });
         assert!(f.get("usage").is_none());
         assert!(f.get("timings").is_none());
         // nothing else moved either: the object is exactly what A4 sent
@@ -4942,10 +6442,10 @@ mod tests {
             chunk(&ChunkCtx::new("id", 7, "m"), serde_json::json!({}), Some("stop")),
         );
         // one flag at a time carries one object at a time
-        let u = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: false });
+        let u = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: false, malformed: &[] });
         assert!(u.get("usage").is_some());
         assert!(u.get("timings").is_none());
-        let t = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: true });
+        let t = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: true, malformed: &[] });
         assert!(t.get("usage").is_none());
         assert!(t.get("timings").is_some());
     }
@@ -4953,7 +6453,7 @@ mod tests {
     #[test]
     fn the_final_chunk_carries_the_eight_fields_crow_reads() {
         // crow_core.py:4838-4845 (usage) and :4999-5018 (timings)
-        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: true });
+        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: true, malformed: &[] });
         // the finish reason did not move: Crow reads it off the SAME chunk
         assert_eq!(f["choices"][0]["finish_reason"], "stop");
 
@@ -4994,7 +6494,7 @@ mod tests {
     /// #31 A9: `prompt_tokens` stays the WHOLE prompt, `cached_tokens` is P, `prompt_n` the rest
     #[test]
     fn a_warm_turn_splits_the_prompt_into_cached_and_prefilled() {
-        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T_WARM, include_usage: true, timings_per_token: true });
+        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T_WARM, include_usage: true, timings_per_token: true, malformed: &[] });
         let u = &f["usage"];
         // the same 16,064 token prompt as the cold turn: the client's accounting cannot move
         assert_eq!(u["prompt_tokens"].as_u64(), Some(16_064));
@@ -5032,7 +6532,7 @@ mod tests {
     #[test]
     fn the_cache_fields_are_present_as_integers_warm_and_cold() {
         for t in [&T0, &T_WARM] {
-            let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &t, include_usage: true, timings_per_token: true });
+            let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &t, include_usage: true, timings_per_token: true, malformed: &[] });
             let c = &f["usage"]["prompt_tokens_details"]["cached_tokens"];
             let n = &f["timings"]["cache_n"];
             assert!(c.is_u64() || c.is_i64(), "cached_tokens is not an int: {c}");
@@ -5086,7 +6586,7 @@ mod tests {
             ple_rows_total: 0,
             ple_miss_total: 0,
         };
-        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &z, include_usage: true, timings_per_token: true });
+        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &z, include_usage: true, timings_per_token: true, malformed: &[] });
         for k in ["prompt_ms", "prompt_per_second", "predicted_per_second", "predicted_per_token_ms"] {
             assert_eq!(f["timings"][k].as_f64(), Some(0.0), "{k} is {}", f["timings"][k]);
         }
@@ -5097,7 +6597,7 @@ mod tests {
     /// #30 A8: the five keys, their exact names, and u64 (never a float)
     #[test]
     fn the_timings_block_carries_the_engine_counters_as_u64() {
-        let g = &chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: true })["timings"];
+        let g = &chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: true, malformed: &[] })["timings"];
         // the names are the contract: a renamed key silently breaks every difference reader
         assert_eq!(g["crow_expert_selections"].as_u64(), Some(7_710_720));
         assert_eq!(g["crow_expert_cold"].as_u64(), Some(2_534_400));
@@ -5124,14 +6624,14 @@ mod tests {
     #[test]
     fn the_counters_are_passed_through_unchanged_and_only_live_in_timings() {
         // no flag at all: the counters are NOT on the chunk, the A4 shape is untouched
-        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: false });
+        let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: false, malformed: &[] });
         assert!(!f.to_string().contains("crow_expert"), "{f}");
         // include_usage alone: `usage` carries none of them either
-        let u = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: false });
+        let u = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: true, timings_per_token: false, malformed: &[] });
         assert!(u.get("timings").is_none());
         assert!(!u.to_string().contains("crow_"), "{u}");
         // timings on: the value on the wire is the value the engine read, byte for byte
-        let g = &chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: true })["timings"];
+        let g = &chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &T0, include_usage: false, timings_per_token: true, malformed: &[] })["timings"];
         assert_eq!(g["crow_expert_selections"].as_u64(), Some(T0.selections_total));
         assert_eq!(g["crow_expert_cold"].as_u64(), Some(T0.cold_total));
         assert_eq!(g["crow_ple_rows"].as_u64(), Some(T0.ple_rows_total));
@@ -5743,8 +7243,9 @@ mod tests {
         ];
         let mut col = CollectSink::default();
         let mut think = ThinkFilter::new();
+        let mut no_stops = StopStrings::default();
         let mut counts = Chunks::default();
-        assert!(send_emits(&mut col, &ChunkCtx::new("i", 1, "m"), &pieces, &mut think, &mut counts));
+        assert!(send_emits(&mut col, &ChunkCtx::new("i", 1, "m"), &pieces, &mut think, &mut no_stops, &mut counts));
         assert_eq!(col.content, "答え");
         assert_eq!(col.calls[0].arguments, "{\"content\":\"</think>\"}");
         assert_eq!(think.stripped(), 1);
@@ -5759,6 +7260,7 @@ mod tests {
             &ChunkCtx::new("i", 1, "m"),
             &[Emit::Content("<think>why</think>then".to_string())],
             &mut f2,
+            &mut no_stops,
             &mut c2
         ));
         let text = String::from_utf8(buf).expect("utf8 frames");
@@ -6499,9 +8001,10 @@ Red is #FF0000."), "{off}");
         let mut sse = SseSink::new(&mut buf);
         let (mut sf, mut cf) = (ThinkFilter::new(), ThinkFilter::new());
         let (mut sc, mut cc) = (Chunks::default(), Chunks::default());
-        assert!(send_emits(&mut sse, &ChunkCtx::new("id1", 5, "crow"), &pieces, &mut sf, &mut sc));
+        let (mut sn, mut cn) = (StopStrings::default(), StopStrings::default());
+        assert!(send_emits(&mut sse, &ChunkCtx::new("id1", 5, "crow"), &pieces, &mut sf, &mut sn, &mut sc));
         let mut col = CollectSink::default();
-        assert!(send_emits(&mut col, &ChunkCtx::new("id1", 5, "crow"), &pieces, &mut cf, &mut cc));
+        assert!(send_emits(&mut col, &ChunkCtx::new("id1", 5, "crow"), &pieces, &mut cf, &mut cn, &mut cc));
         // the same loop counts the same chunks for both sinks
         assert_eq!(sc, cc);
         assert_eq!((sc.content, sc.reasoning, sc.tool), (2, 0, 3));
@@ -6599,7 +8102,7 @@ Red is #FF0000."), "{off}");
                 text: "1}".to_string(),
             },
         ];
-        assert!(send_emits(&mut col, &ChunkCtx::new("i", 1, "m"), &pieces, &mut think, &mut counts));
+        assert!(send_emits(&mut col, &ChunkCtx::new("i", 1, "m"), &pieces, &mut think, &mut StopStrings::default(), &mut counts));
         assert_eq!(col.calls.len(), 2);
         assert_eq!(col.calls[0].arguments, "{}");
         assert_eq!(col.calls[1].name, "b");
@@ -6835,5 +8338,368 @@ Red is #FF0000."), "{off}");
         for a in &acc {
             assert!(serde_json::from_str::<serde_json::Value>(a).unwrap().is_object());
         }
+    }
+
+    // ------------------------------------------- #99: what the end of a generation reports
+
+    /// the finish reason of every end, decided in one place: an abort is `abort` whatever the
+    /// loop had set (13:58:31 and 15:54:30 on 2026-09-22 logged `finish length, client gone`
+    /// with neither request near its budget), and a call abandoned EARLIER does not keep a
+    /// later closed call from `tool_calls`
+    #[test]
+    fn an_abort_finishes_as_abort_and_never_as_length() {
+        // (loop finish, aborted, ended in a call, closed calls, stop hit) -> recorded
+        let cases: [(&'static str, bool, bool, usize, bool, &str); 10] = [
+            ("length", true, false, 0, false, "abort"), // the client left mid-answer
+            ("length", true, true, 0, false, "abort"),  // ... mid-call (13:58:31)
+            ("stop", true, false, 1, false, "abort"),   // a write failed on the final flush
+            ("length", true, false, 1, true, "abort"),
+            ("length", false, false, 0, false, "length"), // the budget, really spent
+            ("stop", false, false, 0, false, "stop"),
+            ("stop", false, false, 1, false, "tool_calls"),
+            ("stop", false, true, 1, false, "stop"),   // a closed call, then EOS inside the next
+            ("length", false, true, 0, false, "length"),
+            ("stop", false, false, 1, true, "stop"),   // #86: the stop string wins
+        ];
+        for (lf, aborted, ended_in_call, closed, hit, want) in cases {
+            assert_eq!(
+                decide_finish(lf, aborted, ended_in_call, closed, hit),
+                want,
+                "{lf} aborted {aborted} ended_in_call {ended_in_call} closed {closed} hit {hit}"
+            );
+        }
+        assert_eq!(FINISH_ABORT, "abort", "the vLLM word for the same event");
+    }
+
+    /// the parser run the way `chat_generate` runs it, over the live shapes, and its records
+    /// put on the final chunk and the document: the wire contract Crow #217 reads
+    fn records_of(markup: &str, arms: usize) -> (Vec<Emit>, bool, Vec<Malformed>) {
+        let mut ts = ToolStream::new(None);
+        for _ in 0..arms {
+            ts.arm();
+        }
+        let mut out = ts.feed(markup);
+        let bad = ts.finish(&mut out);
+        (out, bad, ts.malformed().to_vec())
+    }
+
+    #[test]
+    fn the_final_chunk_and_the_document_carry_every_abandoned_call() {
+        let t = T0;
+        let ctx = ChunkCtx::new("id", 7, "m");
+        // (1) the silent live shape: no call, the markup IS the content
+        let (_, bad, m) = records_of("<tool_call>\n\n</function>\n</tool_call>", 1);
+        assert!(!bad);
+        let f = chunk_finish(&ctx, &FinishArgs { finish: decide_finish("stop", false, bad, 0, false), t: &t, include_usage: false, timings_per_token: false, malformed: &m });
+        assert_eq!(f["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            f[MALFORMED_KEY],
+            serde_json::json!([{"kind": "close-before-function", "index": null, "raw_in_content": true}])
+        );
+        // (2) the 10:23:37 shape: a named call cut by EOS, sent once as tool_calls[0]
+        let (_, bad, m) = records_of("<tool_call>\n<function=read_image>\n<parameter=path>\nhttp://x", 1);
+        assert!(bad);
+        let f = chunk_finish(&ctx, &FinishArgs { finish: decide_finish("stop", false, bad, 0, false), t: &t, include_usage: true, timings_per_token: true, malformed: &m });
+        assert_eq!(f["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            f[MALFORMED_KEY],
+            serde_json::json!([{"kind": "end-in-call", "index": 0, "raw_in_content": false}])
+        );
+        // the flags still add exactly what they added
+        assert!(f.get("usage").is_some() && f.get("timings").is_some());
+        // (3) the document: the same record, beside the same finish
+        let mut d = completion_json(&ctx, "", "", &[], "stop", &t);
+        attach_malformed(&mut d, &m);
+        assert_eq!(d[MALFORMED_KEY], f[MALFORMED_KEY]);
+        // (4) nothing abandoned: the key is ABSENT, the chunk is the one it always was
+        let f = chunk_finish(&ctx, &FinishArgs { finish: "stop", t: &t, include_usage: false, timings_per_token: false, malformed: &[] });
+        assert!(f.get(MALFORMED_KEY).is_none(), "{f}");
+        let mut d = completion_json(&ctx, "hi", "", &[], "stop", &t);
+        let before = d.clone();
+        attach_malformed(&mut d, &[]);
+        assert_eq!(d, before);
+    }
+
+    /// #91: the OpenAI pair parses, is OFF by default, and every refusal is named:
+    /// `top_logprobs` without `logprobs: true`, over 20, not an integer, a non-boolean
+    /// `logprobs`, and `post_sampling_probs: true` (the post-sampler distribution is not
+    /// offered, so it is refused rather than answered with the raw numbers)
+    #[test]
+    fn logprobs_fields_parse_off_by_default_and_refuse_by_name() {
+        let mk = |t: &str| parse_chat(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{t}}}"#).as_bytes());
+        let r = mk("").unwrap();
+        assert!(!r.logprobs);
+        assert_eq!(r.top_logprobs, 0);
+        let r = mk(r#","logprobs":null,"top_logprobs":null"#).unwrap();
+        assert!(!r.logprobs);
+        let r = mk(r#","logprobs":true"#).unwrap();
+        assert!(r.logprobs);
+        assert_eq!(r.top_logprobs, 0, "OpenAI's default: the entry, no alternatives");
+        let r = mk(r#","logprobs":true,"top_logprobs":20,"post_sampling_probs":false"#).unwrap();
+        assert_eq!((r.logprobs, r.top_logprobs), (true, 20));
+        for (extra, why) in [
+            (r#","top_logprobs":5"#, "requires logprobs"),
+            (r#","logprobs":false,"top_logprobs":0"#, "requires logprobs"),
+            (r#","logprobs":true,"top_logprobs":21"#, "over the limit of 20"),
+            (r#","logprobs":true,"top_logprobs":-1"#, "not a non negative integer"),
+            (r#","logprobs":true,"top_logprobs":2.5"#, "not a non negative integer"),
+            (r#","logprobs":"yes""#, "logprobs is not a boolean"),
+            (r#","logprobs":true,"post_sampling_probs":true"#, "post_sampling_probs is not offered"),
+        ] {
+            let e = mk(extra).expect_err(extra);
+            assert!(e.contains(why), "{extra}: {e}");
+        }
+    }
+
+    /// #91: the wire form. One entry is OpenAI's `ChatCompletionTokenLogprob`; a partial
+    /// UTF-8 id keeps its true `bytes` beside a lossy `token`; the stream carries one entry
+    /// per chunk with an empty delta, the document all of them in `choices[0].logprobs`;
+    /// and both sinks see the same entries in the same order.
+    /// #91: `crow_force_ids` parses to the id list (empty allowed),
+    /// is `None` when absent/null, and refuses non-ids, ids >= V and a thinking budget
+    /// beside it; the entry form carries `crow_id` only when asked, the OpenAI keys unchanged.
+    #[test]
+    fn crow_force_ids_parse_and_the_id_carrying_entry() {
+        let mk = |t: &str| parse_chat(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{t}}}"#).as_bytes());
+        assert_eq!(mk("").unwrap().force_ids, None);
+        assert_eq!(mk(r#","crow_force_ids":null"#).unwrap().force_ids, None);
+        assert_eq!(mk(r#","crow_force_ids":[]"#).unwrap().force_ids, Some(vec![]));
+        assert_eq!(mk(r#","crow_force_ids":[0,7,248319]"#).unwrap().force_ids, Some(vec![0, 7, 248319]));
+        for (t, why) in [
+            (r#","crow_force_ids":7"#, "not an array"),
+            (r#","crow_force_ids":[1,-2]"#, "not a token id"),
+            (r#","crow_force_ids":[248320]"#, "not a token id"),
+            (r#","crow_force_ids":["a"]"#, "not a token id"),
+            (r#","crow_force_ids":[1],"reasoning_budget_tokens":4"#, "cannot be combined"),
+        ] {
+            let e = mk(t).unwrap_err();
+            assert!(e.contains(why), "{t}: {e}");
+        }
+        let bytes_of = |id: u32| -> Vec<u8> { format!("t{id}").into_bytes() };
+        let row: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
+        let p = pos_logprobs(&row, 3, 2);
+        let plain = logprob_entry(&p, &bytes_of);
+        assert_eq!(plain, logprob_entry_ids(&p, &bytes_of, false));
+        let e = logprob_entry_ids(&p, &bytes_of, true);
+        let keys: Vec<&str> = e.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["token", "logprob", "bytes", "crow_id", "top_logprobs"]);
+        assert_eq!(e["crow_id"], 3);
+        assert_eq!(e["top_logprobs"][0]["crow_id"], 15);
+        assert_eq!(e["top_logprobs"][1]["crow_id"], 14);
+        assert_eq!(e["logprob"], plain["logprob"]);
+    }
+
+    #[test]
+    fn a_logprobs_entry_is_the_openai_token_object_in_both_forms() {
+        let bytes_of = |id: u32| -> Vec<u8> {
+            match id {
+                7 => b"/home".to_vec(),
+                8 => vec![0xc3], // the first half of a two-byte character
+                9 => b"<tool_call>".to_vec(),
+                _ => format!("t{id}").into_bytes(),
+            }
+        };
+        let row: Vec<f32> = (0..16).map(|i| if i == 7 { 3.0 } else if i == 8 { 2.5 } else { i as f32 * 0.01 }).collect();
+        let p = pos_logprobs(&row, 8, 2);
+        let e = logprob_entry(&p, &bytes_of);
+        let keys: Vec<&str> = e.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["token", "logprob", "bytes", "top_logprobs"]);
+        assert_eq!(e["token"], "\u{fffd}");
+        assert_eq!(e["bytes"], serde_json::json!([0xc3]));
+        assert_eq!(e["logprob"].as_f64().unwrap(), p.chosen_lp);
+        assert_eq!(e["top_logprobs"].as_array().unwrap().len(), 2);
+        assert_eq!(e["top_logprobs"][0]["token"], "/home");
+        assert_eq!(e["top_logprobs"][0]["bytes"], serde_json::json!(b"/home".to_vec()));
+        assert_eq!(e["top_logprobs"][1]["logprob"].as_f64().unwrap(), p.chosen_lp);
+        assert!(e["top_logprobs"][0].get("top_logprobs").is_none(), "alternatives carry no nested list");
+        // the margin a near-tie question reads: chosen - best alternative, here -0.5 nats
+        let margin = p.chosen_lp - p.top[0].1;
+        assert!((margin + 0.5).abs() < 1e-6, "{margin}");
+
+        let cx = ChunkCtx::new("id1", 5, "crow");
+        let entries: Vec<serde_json::Value> =
+            [7usize, 8, 9].iter().map(|&c| logprob_entry(&pos_logprobs(&row, c, 1), &bytes_of)).collect();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut sse = SseSink::new(&mut buf);
+        let mut col = CollectSink::default();
+        for en in &entries {
+            assert!(sse.on_logprobs(&cx, en.clone()));
+            assert!(col.on_logprobs(&cx, en.clone()));
+        }
+        let text = String::from_utf8(buf).unwrap();
+        let mut streamed = Vec::new();
+        for frame in text.split("\n\n").filter(|f| !f.is_empty()) {
+            let d: serde_json::Value = serde_json::from_str(frame.trim_start_matches("data: ")).unwrap();
+            assert_eq!(d["object"], "chat.completion.chunk");
+            let ch = &d["choices"][0];
+            assert_eq!(ch["delta"], serde_json::json!({}), "a logprobs chunk carries no text");
+            assert!(ch["finish_reason"].is_null());
+            assert!(ch["logprobs"]["refusal"].is_null());
+            streamed.extend(ch["logprobs"]["content"].as_array().unwrap().iter().cloned());
+        }
+        assert_eq!(streamed, entries);
+        assert_eq!(col.logprobs, entries);
+        let mut doc = completion_json(&cx, "", "", &[], "stop", &b3a_timing());
+        attach_logprobs(&mut doc, &col.logprobs);
+        assert_eq!(doc["choices"][0]["logprobs"]["content"], serde_json::json!(entries));
+        assert!(doc["choices"][0]["logprobs"]["refusal"].is_null());
+        assert_eq!(doc["choices"][0]["logprobs"]["content"][2]["token"], "<tool_call>");
+    }
+
+    /// #91: OFF costs nothing on the wire either - no builder this server uses without
+    /// `logprobs: true` writes a `logprobs` key, so every chunk and the document stay the
+    /// bytes they were (the readback itself sits behind `req.logprobs` in `chat_generate`)
+    #[test]
+    fn without_logprobs_no_chunk_and_no_document_carries_the_key() {
+        let cx = ChunkCtx::new("id1", 5, "crow");
+        let t = b3a_timing();
+        let docs = [
+            chunk_role(&cx),
+            chunk_content(&cx, "x"),
+            chunk_reasoning(&cx, "r"),
+            chunk_tool_open(&cx, 0, "call_0", "read_file"),
+            chunk_tool_args(&cx, 0, "{}"),
+            chunk_finish(&cx, &FinishArgs { finish: "stop", t: &t, include_usage: true, timings_per_token: true, malformed: &[] }),
+            completion_json(&cx, "x", "r", &[], "stop", &t),
+        ];
+        for d in docs {
+            assert!(!d.to_string().contains("logprobs"), "{d}");
+        }
+        assert!(CollectSink::default().logprobs.is_empty());
+    }
+
+    // ------------------------------------------- #93: tool_choice + the gate
+
+    /// the tools array Crow 3dbc015 sent on 2026-09-22 (the #91 replay session), as
+    /// `tools/corruption-replay-probe.py`'s `crow_body` builds it
+    const TOOLS_3DBC015: &str = include_str!("../../../tools/corpora/crow-3dbc015-tools.json");
+
+    fn tool_req(extra: &str) -> ChatReq {
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":"x"}}],"tools":{TOOLS_3DBC015}{extra}}}"#
+        );
+        parse_chat(body.as_bytes()).expect("parses")
+    }
+
+    #[test]
+    fn tool_choice_and_parallel_tool_calls_parse_with_named_400s() {
+        let r = tool_req("");
+        assert_eq!(r.tool_choice, ToolChoice::Auto);
+        assert!(r.parallel_tool_calls);
+        assert_eq!(tool_req(r#","tool_choice":null"#).tool_choice, ToolChoice::Auto);
+        assert_eq!(tool_req(r#","tool_choice":"auto""#).tool_choice, ToolChoice::Auto);
+        assert_eq!(tool_req(r#","tool_choice":"none""#).tool_choice, ToolChoice::None);
+        assert_eq!(tool_req(r#","tool_choice":"required""#).tool_choice, ToolChoice::Required);
+        assert_eq!(
+            tool_req(r#","tool_choice":{"type":"function","function":{"name":"read_file"}}"#).tool_choice,
+            ToolChoice::Named("read_file".to_string())
+        );
+        assert!(!tool_req(r#","parallel_tool_calls":false"#).parallel_tool_calls);
+        let err = |extra: &str| {
+            let body = format!(r#"{{"messages":[{{"role":"user","content":"x"}}],"tools":{TOOLS_3DBC015}{extra}}}"#);
+            parse_chat(body.as_bytes()).unwrap_err()
+        };
+        assert!(err(r#","tool_choice":"any""#).contains("is not one of"));
+        assert!(err(r#","tool_choice":{"type":"function","function":{"name":"nope"}}"#).contains("no tool in the request declares"));
+        assert!(err(r#","tool_choice":{"function":{"name":"read_file"}}"#).contains("tool_choice object"));
+        assert!(err(r#","parallel_tool_calls":"yes""#).contains("parallel_tool_calls is not a boolean"));
+    }
+
+    #[test]
+    fn the_tool_gate_follows_the_switch_the_tool_choice_and_the_tools() {
+        let tk = tk();
+        let (g, line) = tool_gate(&tool_req(""), &tk, true);
+        let g = g.expect("a gate for Crow's tools");
+        assert_eq!((g.g.n_tools(), g.g.n_params()), (26, 51));
+        assert!(!g.armed(), "auto: nothing is checked before the first <tool_call>");
+        let line = line.unwrap();
+        assert!(line.starts_with("[chat] tool grammar ON (CROW_TOOL_GRAMMAR)"), "{line}");
+        assert!(line.contains("tool_choice auto, parallel_tool_calls true; 26 tools / 51 parameters"), "{line}");
+        let (g, line) = tool_gate(&tool_req(""), &tk, false);
+        assert!(g.is_none());
+        assert!(line.unwrap().contains("OFF (CROW_TOOL_GRAMMAR=0)"));
+        let (g, line) = tool_gate(&tool_req(r#","tool_choice":"none""#), &tk, true);
+        assert!(g.is_none() && line.unwrap().contains("tool_choice \"none\""));
+        let (g, _) = tool_gate(&tool_req(r#","tool_choice":"required""#), &tk, true);
+        assert!(g.expect("required").armed(), "required: EOS is checked from the first id");
+        let (g, line) = tool_gate(&tool_req(r#","tool_choice":{"type":"function","function":{"name":"edit_file"}}"#), &tk, true);
+        assert_eq!(g.expect("named").g.n_tools(), 1);
+        assert!(line.unwrap().contains("tool_choice function \"edit_file\""));
+        // no tools, or an empty array: no gate and no line - the request of record
+        let plain = parse_chat(br#"{"messages":[{"role":"user","content":"x"}]}"#).unwrap();
+        assert!(matches!(tool_gate(&plain, &tk, true), (None, None)));
+        let empty = parse_chat(br#"{"messages":[{"role":"user","content":"x"}],"tools":[]}"#).unwrap();
+        assert!(matches!(tool_gate(&empty, &tk, true), (None, None)));
+    }
+
+    /// The loop's grammar path on the host, against a scripted "model": every row prefers
+    /// the next id of the OBSERVED failure (`old_string` for edit_file's `old`, the 22-of-302
+    /// shape of 2026-09-22) by one logit over the declared spelling. Unconstrained, the
+    /// argmax writes the failure; with the gate, the refused id is redrawn from the masked
+    /// row - greedy and sampled - and the parser gets a call with the declared arguments.
+    #[test]
+    fn a_refused_id_is_redrawn_under_the_mask_and_the_call_parses_as_declared() {
+        let tk = tk();
+        let bad = "<tool_call>\n<function=edit_file>\n<parameter=path>\na.rs\n</parameter>\n<parameter=old_string>\nx\n</parameter>\n<parameter=new_string>\ny\n</parameter>\n</function>\n</tool_call>";
+        let good = "<tool_call>\n<function=edit_file>\n<parameter=path>\na.rs\n</parameter>\n<parameter=old>\nx\n</parameter>\n<parameter=new>\ny\n</parameter>\n</function>\n</tool_call>";
+        let enc = |t: &str| -> Vec<u32> { tk.encode_raw(t).expect("encodes") };
+        let (bad, good) = (enc(bad), enc(good));
+        let eos = EOS_IDS[0] as u32;
+        let row_for = |out: &[u32]| -> Vec<f32> {
+            let mut row = vec![-10.0f32; V];
+            for (script, logit) in [(&good, 4.0f32), (&bad, 5.0f32)] {
+                if script.starts_with(out) {
+                    let next = script.get(out.len()).copied().unwrap_or(eos);
+                    row[next as usize] = logit;
+                }
+            }
+            row
+        };
+        for extra in ["", r#","temperature":1.0,"top_p":0.95,"min_p":0.01,"seed":3"#] {
+            let req = tool_req(extra);
+            let (gate, _) = tool_gate(&req, &tk, true);
+            let mut gate = gate.expect("gate");
+            let mut out: Vec<u32> = Vec::new();
+            let mut redrawn = 0;
+            for _ in 0..200 {
+                let row = row_for(&out);
+                let mut next = crow_nest_engine::sample::argmax(&row) as u32;
+                if gate.armed() && !gate.check(next) {
+                    next = redraw_from_row(&req, &[], &out, &mut gate, row) as u32;
+                    redrawn += 1;
+                }
+                if next == eos {
+                    break;
+                }
+                assert!(gate.accept(next));
+                out.push(next);
+            }
+            assert_eq!(out, good, "{extra:?}: the redraws land on the declared spelling");
+            // the script prefers the failure only while the answer is still a prefix of
+            // it: one refusal (at `old_string`) puts the rest on the declared spelling
+            assert_eq!(redrawn, 1, "{extra:?}");
+            assert_eq!(gate.stats.redrawn, 0, "the loop, not the gate, counts this path");
+            let text = tk.decode(&out).unwrap();
+            let tools: serde_json::Value = serde_json::from_str(TOOLS_3DBC015).unwrap();
+            let mut ts = ToolStream::new(Some(&tools));
+            ts.arm();
+            let mut pieces = ts.feed(&text);
+            assert!(!ts.finish(&mut pieces));
+            let mut acc = Vec::new();
+            accumulate_args(&pieces, &mut acc);
+            let v: serde_json::Value = serde_json::from_str(&acc[0]).unwrap();
+            assert_eq!(v, serde_json::json!({"path": "a.rs", "old": "x", "new": "y"}));
+            assert!(ts.malformed().is_empty());
+        }
+        // and without the grammar the same rows write the failure
+        let mut out: Vec<u32> = Vec::new();
+        for _ in 0..200 {
+            let next = crow_nest_engine::sample::argmax(&row_for(&out)) as u32;
+            if next == eos {
+                break;
+            }
+            out.push(next);
+        }
+        assert_eq!(out, bad);
     }
 }

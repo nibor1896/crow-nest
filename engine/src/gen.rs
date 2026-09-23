@@ -10,7 +10,7 @@
 
 use crate::cuda::{self, CUdeviceptr as Dev};
 use crate::geo::*;
-use crate::kernels::{launch_v, Kernels};
+use crate::kernels::{act_cascade::xq_row_bytes, launch_v, Kernels};
 use crate::weights::{dequant_fp4_dev, load_bf16_twin, load_f32, load_fp4, load_small_f32, Fp4};
 use crate::manager::ThreeStates;
 use crate::residency::{Residency, PendingSwap, EMPTY};
@@ -319,12 +319,14 @@ pub struct Scratch {
     pub h1: Dev,       // [C*10][1280]
     pub h2: Dev,       // [C*10][640]
     pub eo: Dev,       // [C*10][2560]
-    pub xq_gu: Dev,    // [C][3*40*36] MMA quantized MoE input (per token, 3 levels)
-    pub xq_dn: Dev,    // [C*10][3*10*36] MMA quantized silu·up (per combo, 3 levels)
-    pub xq_m: Dev,     // [C][3*40*36] quantized mixed rows k2560 (GDN qkv/z/b/a, attn v/iqk)
-    pub xq_v: Dev,     // [C][3*96*36] quantized 6144 rows (GDN out, attn o)
-    pub xq_s: Dev,     // [C][3*10*36] quantized 640 rows (shared down input sh2)
-    pub xq_e: Dev,     // [C][3*40*36] quantized PLE embed rows k2560
+    // quantized activation rows are xq_row_bytes(bpr) = 3*bpr*36 + 4 bytes:
+    // three cascade levels, then the row's f32 pre-scale factor 2^-k
+    pub xq_gu: Dev,    // [C][3*40*36+4] MMA quantized MoE input (per token, 3 levels)
+    pub xq_dn: Dev,    // [C*10][3*10*36+4] MMA quantized silu·up (per combo, 3 levels)
+    pub xq_m: Dev,     // [C][3*40*36+4] quantized mixed rows k2560 (GDN qkv/z/b/a, attn v/iqk)
+    pub xq_v: Dev,     // [C][3*96*36+4] quantized 6144 rows (GDN out, attn o)
+    pub xq_s: Dev,     // [C][3*10*36+4] quantized 640 rows (shared down input sh2)
+    pub xq_e: Dev,     // [C][3*40*36+4] quantized PLE embed rows k2560
     pub sdown: Dev,    // [C][2560]
     pub sh12: Dev,     // [C][1280] shared-expert gate|up (p13 layout)
     pub sh2: Dev,      // [C][640]
@@ -527,10 +529,8 @@ impl Engine {
                 .iter()
                 .map(|s| s.iter().filter(|id| **id != EMPTY).count())
                 .collect(),
-            kv_dtype: match self.cfg.kv {
-                crate::geo::KvDtype::Fp8E4m3 => "fp8_e4m3",
-                crate::geo::KvDtype::Bf16 => "bf16",
-            },
+            // the dtype the KV buffer was allocated with (#102: CROW_KV at boot::open_model)
+            kv_dtype: self.st.kv.name(),
             kernel_path: match (mma_on(), dense_mma_on(), graph_on()) {
                 (true, true, true) => "moe mma + dense mma, cuda graph",
                 (true, true, false) => "moe mma + dense mma, no graph",
@@ -583,6 +583,39 @@ impl Engine {
     pub unsafe fn arm_sampler(&mut self, s: &crate::sample::Sampler) -> usize {
         self.enable_dev_sampler(s);
         self.sample_last()
+    }
+    /// #93: the device sampler booked `drawn`; the host replaced it with
+    /// `kept` (a tool-grammar redraw). Move the booking (`sample::rebook_plan`): a few
+    /// bytes read, a few written, on a rejection only. `lastn` = the device window depth,
+    /// 0 when the window is not armed. No sampler armed: nothing to do.
+    ///
+    /// # Safety
+    ///
+    /// - a CUDA context must be current; call between two `decode_step`s (the step that
+    ///   drew `drawn` has returned, so its accept has landed). The writes go out on the
+    ///   current stream, ahead of the next step's launch.
+    pub unsafe fn rebook_sampler(&self, drawn: usize, kept: usize, drawn_seen: bool, lastn: usize) {
+        let Some(ds) = self.dev_sampler.as_ref() else { return };
+        if drawn == kept || drawn >= V || kept >= V {
+            return;
+        }
+        let (head, cd, ck) = if lastn > 0 {
+            (
+                cuda::dtoh_i32(ds.ring, 1)[0],
+                cuda::dtoh_t::<u16>(ds.counts + (drawn * 2) as u64, 1)[0],
+                cuda::dtoh_t::<u16>(ds.counts + (kept * 2) as u64, 1)[0],
+            )
+        } else {
+            (0, 0, 0)
+        };
+        for (buf, off, bytes) in crate::sample::rebook_plan(drawn, kept, drawn_seen, lastn, head, cd, ck) {
+            let base = match buf {
+                crate::sample::RebookBuf::Mask => ds.mask,
+                crate::sample::RebookBuf::Counts => ds.counts,
+                crate::sample::RebookBuf::Ring => ds.ring,
+            };
+            cuda::upload_into(base + off as u64, &bytes);
+        }
     }
     /// #28: a greedy request parks the sampler OUT of the engine, so `decode_step` stops sampling and the buffers survive
     pub fn park_sampler(&mut self, parked: &mut Option<DevSampler>) {
@@ -648,8 +681,13 @@ impl Engine {
 }
 
 /// device state of the #20 sampler: presence mask [V] u8, xorshift64* state
-/// [1] u64, profile {temp, top_p, presence: f32, top_k: i32}; `in_graph` is
-/// set once the launch was captured into the decode graph
+/// [1] u64, profile 36 B {temp, top_p, presence, min_p, ln_min_p, repeat,
+/// freq} f32 + {top_k, last_n} i32; `in_graph` is set once the launch was
+/// captured into the decode graph. #84 adds the windowed-penalty twin of the
+/// host's `win`/`win_counts`: `counts` [V] u16 and `ring` i32
+/// {head, fill, ids[SAMPLE_RING_MAX]}, both re-seeded per request from the
+/// prompt tail by `enable_dev_sampler` and advanced one accept per draw by
+/// `sample_k` itself.
 pub struct DevSampler {
     pub mask: Dev,
     pub rng: Dev,
@@ -657,6 +695,11 @@ pub struct DevSampler {
     /// v2: per-slice top-k candidates [SAMPLE_PARTS * SAMPLE_MAXK] f32 / i32
     pub cand_v: Dev,
     pub cand_i: Dev,
+    /// #84: per-token count inside the penalty window (u16; the window is at
+    /// most SAMPLE_RING_MAX = 1024 deep, so u16 cannot wrap)
+    pub counts: Dev,
+    /// #84: the ring itself - i32 head, i32 fill, then the window ids
+    pub ring: Dev,
     pub in_graph: std::cell::Cell<bool>,
 }
 
@@ -1010,16 +1053,22 @@ impl Engine {
             (0, 0, 0)
         };
         let vit_mrope_held = if mrope_rows > 0 { crate::vit::mrope_bytes(cfg.context) as u64 } else { 0 };
-        // #72: the device sampler's five buffers (mask [V] u8, rng, params, the two
-        // candidate slices). 0.27 MB, but it was the last VRAM the engine took after
-        // the plan: allocated on the first SAMPLED request, which in a Crow session is
-        // the first request. Held here, handed to `enable_dev_sampler` on demand.
+        // #72: the device sampler's seven buffers (mask [V] u8, rng, params,
+        // the two candidate slices; #84 adds counts [V] u16 + the ring).
+        // ~0.8 MB, but it was the last VRAM the engine took after the plan:
+        // allocated on the first SAMPLED request, which in a Crow session is
+        // the first request. Held here, handed to `enable_dev_sampler` on
+        // demand.
+        // #83: params grew 16 -> 36 B (min_p + the host-computed ln_min_p at
+        // [4]/[5]); #84 filled [6..9] (repeat, freq, last_n).
         let dev_sampler_hold = Some(DevSampler {
             mask: cuda::alloc_named("the sampler presence mask", V),
             rng: cuda::alloc_named("the sampler rng state", 8),
-            params: cuda::alloc_named("the sampler profile", 16),
+            params: cuda::alloc_named("the sampler profile", 36),
             cand_v: cuda::alloc_named("the sampler candidate values", SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
             cand_i: cuda::alloc_named("the sampler candidate ids", SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
+            counts: cuda::alloc_named("the sampler window counts", 2 * V),
+            ring: cuda::alloc_named("the sampler penalty ring", (2 + SAMPLE_RING_MAX) * 4),
             in_graph: std::cell::Cell::new(false),
         });
 
@@ -1106,14 +1155,14 @@ impl Engine {
         // #19f, 2026-09-13: ONE line per engine process names the hyper-
         // connection decode chain form, next to the [gdn] line and for the
         // same reason: every future log says which hc chain produced it.
-        // CROW_QFUSE is the SAME switch as the NVFP4 cascade above: default
-        // on since 19g (unset = cascade on + chain fused); the value "0"
-        // turns BOTH off (the unfused fallback of record; bit-identical, so
-        // the ids and logits cannot move; only the launch shape does).
+        // CROW_QFUSE is the SAME switch as the NVFP4 cascade above: opt-in
+        // (exact "1") since the activation-floor fix of 2026-09-23 (unset =
+        // pre-scaled quant_x_fp4 launches + unfused chains; "1" = all fused,
+        // the fused producers keep the unscaled ue4m3 floor).
         let hcf = env_or_unset("CROW_QFUSE");
-        println!("[hc] hyper-connection decode chain {}, shared-expert chain {}, CROW_QFUSE {} (1 = 19f fused hc + 19h fused shared, 0 = all off)",
-            if hc_fuse_on() { "fused (default since 19g, 4 launches per hc block)" } else { "unfused (fallback of record, 8 launches)" },
-            if sh_fuse_on() { "fused (19h, 3 launches)" } else { "unfused (0 = fallback, 6 launches)" }, hcf);
+        println!("[hc] hyper-connection decode chain {}, shared-expert chain {}, CROW_QFUSE {} (1 = 19f fused hc + 19h fused shared + fused unscaled cascade, unset = all off)",
+            if hc_fuse_on() { "fused (19f opt-in, 4 launches per hc block)" } else { "unfused (default since the activation-floor fix, 8 launches)" },
+            if sh_fuse_on() { "fused (19h opt-in, 3 launches)" } else { "unfused (default, 6 launches)" }, hcf);
         // #10c, 2026-09-14: ONE line per engine process names the prefill
         // dense GEMM form, next to the [hc] line and for the same reason:
         // every future log says which dense form produced it. It sits in the
@@ -1369,6 +1418,44 @@ pub unsafe fn load_pw(cnq: &mut Cnq, name: &str, sec: &str) -> PW {
     }
 }
 
+
+/// #91 (2026-09-23): a PLE n-gram shard in the container is a FLAT stream of 64-value
+/// NVFP4 blocks (36 B each: 4 ue4m3 group scales, then 32 B of e2m1 pairs), 160 values
+/// per row: row r starts at value 160*r, on a block boundary for even r and 32 values
+/// into a block for odd r. The row cache and `gather_ple_fp4` hold a row padded to 3
+/// blocks (108 B). Reading the container at `row * 108` returned bytes of OTHER rows:
+/// the layer diff against llama.cpp (decode_out/meas-0923/layerdiff) measured the
+/// gathered embedding at cos -0.01 to the GGUF row, the flat read at 0.993, and the
+/// corrupt-digit sites mat44-a149 / N33-a131 moved from -0.81 / -7.77 to +12.53 / +12.71.
+pub const PLE_ROW_VALUES: u64 = 160;
+
+/// (byte offset of the first block, blocks to read, value offset inside the first block)
+/// of PLE row `row` in a shard of `n_values` values
+pub fn ple_row_span(row: u64, n_values: u64) -> (u64, usize, usize) {
+    let v0 = row * PLE_ROW_VALUES;
+    let b0 = v0 / 64;
+    let nblk = 4u64.min(n_values / 64 - b0) as usize;
+    (b0 * 36, nblk, (v0 % 64) as usize)
+}
+
+/// repack `nblk` flat blocks, starting `off` values into the first (0 or 32: whole
+/// 16-value scale groups), into the padded 3-block row layout of the cache
+pub fn ple_row_pad(src: &[u8], off: usize, nblk: usize) -> [u8; 108] {
+    let mut out = [0u8; 108];
+    for d in 0..3usize {
+        for g in 0..4usize {
+            let sv = off + d * 64 + g * 16;
+            let (sb, sg) = (sv / 64, (sv % 64) / 16);
+            if sb < nblk {
+                out[d * 36 + g] = src[sb * 36 + sg];
+                out[d * 36 + 4 + g * 8..d * 36 + 4 + g * 8 + 8]
+                    .copy_from_slice(&src[sb * 36 + 4 + sg * 8..sb * 36 + 4 + sg * 8 + 8]);
+            }
+        }
+    }
+    out
+}
+
 impl Ple {
     pub unsafe fn load(cnq: &mut Cnq, cache_bytes: u64) -> Ple {
         // projections/norms/conv + the I64 tables live in the `text` section;
@@ -1492,7 +1579,8 @@ impl Ple {
                 }
                 let shard = (id / PLE_ROWS_PER_SHARD) as usize;
                 let r = (id % PLE_ROWS_PER_SHARD) as u64;
-                out.push(cnq.abs_offset(&self.shards[shard].0, r * 108));
+                let t = &self.shards[shard].0;
+                out.push(cnq.abs_offset(t, ple_row_span(r, t.n_values).0));
             }
         }
         out
@@ -1540,10 +1628,10 @@ impl Ple {
                     .iter()
                     .map(|&(_, id)| {
                         let (t, _) = &self.shards[(id / rows_per_shard) as usize];
-                        cnq.abs_offset(t, (id % rows_per_shard) as u64 * 108)
+                        cnq.abs_offset(t, ple_row_span((id % rows_per_shard) as u64, t.n_values).0)
                     })
                     .collect();
-                cnq.warm().rows(&offs, 108);
+                cnq.warm().rows(&offs, 4 * 36);
             }
             // group by shard for sequential reads
             let mut by_shard: HashMap<i64, Vec<(usize, i64)>> = HashMap::new();
@@ -1560,7 +1648,8 @@ impl Ple {
                 let gs = t.global_scale;
                 for &(slot, id) in &rows {
                     let row = (id % rows_per_shard) as u64;
-                    let raw = cnq.read_range(t, row * 108, 108);
+                    let (b_off, nblk, off) = ple_row_span(row, t.n_values);
+                    let raw = ple_row_pad(&cnq.read_range(t, b_off, nblk * 36), off, nblk);
                     cuda::upload_into(self.cache + (slot * 108) as u64, &raw);
                     self.gs_host[slot] = gs;
                     cuda::to_f32_into(self.gs + (slot * 4) as u64, &[gs]);
@@ -1699,12 +1788,18 @@ fn qsa_fast_on() -> bool { env_flag!("CROW_QSA_FAST", on) }
 fn bf16_w_on() -> bool { env_flag!("CROW_BF16_W", on) }
 fn inj_1k_on() -> bool { env_flag!("CROW_INJ_1K", on) }
 
-/// CROW_QFUSE (default on): producers emit the NVFP4 activation cascade
-/// themselves (no separate quant_x_fp4 launch). Bit-identical.
-fn qfuse_on() -> bool { env_flag!("CROW_QFUSE", on) }
-/// CROW_QFUSE hc-fusion meaning, DEFAULT ON SINCE #19g, 2026-09-13 (unset
-/// and any value but `0` run the fusion; `0` selects the unfused 8-launch
-/// fallback of record): the hc_run decode chain fuses silu_div4 / sigmoid_el
+/// CROW_QFUSE, OPT-IN (exact `1`) SINCE THE ACTIVATION-FLOOR FIX, 2026-09-23:
+/// producers emit the NVFP4 activation cascade themselves (no separate
+/// quant_x_fp4 launch). A fused producer never sees its whole row, so it
+/// cannot take the per-row power-of-two pre-scale and stores the factor 1.0:
+/// `1` keeps the old ue4m3 absolute floor (~4.9e-4 per element, e.g. sigma
+/// 0.004 rows at ~7 percent relative error). Unset or any other value runs
+/// the pre-scaled whole-row quantizers (quant_x_fp4 / quant_tiles).
+fn qfuse_on() -> bool { env_flag!("CROW_QFUSE", exact1) }
+/// CROW_QFUSE hc-fusion meaning, default on from #19g (2026-09-13) until the
+/// activation-floor fix (2026-09-23), now OPT-IN with the rest of the switch
+/// (exact `1` runs the fusion; unset / any other value selects the unfused
+/// 8-launch chain): the hc_run decode chain fuses silu_div4 / sigmoid_el
 /// / sig2_div4 into the neighbouring GEMV epilogues and merges the 4-row
 /// inject GEMV (gemv_fp4_b1k) into the down GEMV launch (hc_down_inj, the
 /// b1k 1024-slot reduce emulated bit for bit on 256 threads; gemv_bf16_ws
@@ -1719,7 +1814,7 @@ fn qfuse_on() -> bool { env_flag!("CROW_QFUSE", on) }
 /// construction. DEFAULT BASIS (#19g): the 19f pairs (-0.9806 ms per token,
 /// 3 of 3 pairs, decode_out/srv-19f.log) plus the combined 19g parity pass
 /// over both levers at once (decode_out/srv-19g.log).
-fn hc_fuse_on() -> bool { env_flag!("CROW_QFUSE", on) }
+fn hc_fuse_on() -> bool { env_flag!("CROW_QFUSE", exact1) }
 /// #62b CROW_GDN_FUSE_IN, DEFAULT ON SINCE #19g, 2026-09-13 (unset and any
 /// value but `0` run the grouped form; `0` selects the four per-slab
 /// gemv_fp4_mma_d launches, the fallback of record): one grouped dense-FP4
@@ -1770,7 +1865,9 @@ fn gdn_split_z_on() -> bool { env_flag!("CROW_GDN_SPLIT_Z", exact1) }
 /// env name, check_env_docs 74 = 74). 6 -> 3 launches per layer, decode
 /// t < 8 and the mma/dense path only: prefill (gemm_fp4_dense) and the
 /// gemv_fp4_bs fallback keep the separate launches verbatim.
-fn sh_fuse_on() -> bool { env_flag!("CROW_QFUSE", on) }
+/// Opt-in (exact `1`) again since the activation-floor fix, 2026-09-23: the
+/// fused silu epilogue quantizes sh2 without the per-row pre-scale.
+fn sh_fuse_on() -> bool { env_flag!("CROW_QFUSE", exact1) }
 
 /// CROW_ATTN_SPLIT (default on): decode attention as S=8 partials + merge,
 /// QSA scores warp-per-block (both graph-static; cost no longer grows
@@ -1887,16 +1984,24 @@ pub const QSA_PAR_E_THREADS: u32 = 1024;
 /// tuneables - the candidate buffers are [PARTS][MAXK] and the two kernels
 /// index them with those exact bounds. `assert_kernel_defines()` checks all
 /// four Rust twins against the frozen source at boot.
-/// #72: the device sampler's five buffers, as `enable_dev_sampler` takes them
-/// (mask [V] u8, rng u64, params 16 B, two [SAMPLE_PARTS * SAMPLE_MAXK] slices).
-/// Held at boot since #72, and named on the `[budget]` post-plan line.
+/// #72: the device sampler's seven buffers, as `enable_dev_sampler` takes
+/// them (mask [V] u8, rng u64, params 36 B since #83, two [SAMPLE_PARTS *
+/// SAMPLE_MAXK] slices, and since #84 counts [V] u16 + ring i32
+/// {head, fill, ids[SAMPLE_RING_MAX]}). Held at boot since #72, and named on
+/// the `[budget]` post-plan line.
 pub const fn sampler_bytes() -> u64 {
-    (V + 8 + 16 + 2 * SAMPLE_PARTS as usize * SAMPLE_MAXK * 4) as u64
+    (V + 8 + 36 + 2 * SAMPLE_PARTS as usize * SAMPLE_MAXK * 4 + 2 * V
+        + (2 + SAMPLE_RING_MAX) * 4) as u64
 }
 
 pub const SAMPLE_MAXK: usize = 64;
 pub const SAMPLE_PARTS: u32 = 64;
 pub const SAMPLE_THREADS: u32 = 256;
+/// #84: the device ring buffer's depth cap - the `SAMPLE_RING_MAX` #define
+/// of the sampler region in `KERNEL_SRC`. `penalty_last_n` is clamped to it
+/// at every construction door (`sample.rs from_env`, serve's parse), so the
+/// ring cannot overflow whatever a client names.
+pub const SAMPLE_RING_MAX: usize = 1024;
 
 /// Every Rust twin of a `KERNEL_SRC` `#define`, checked against the source
 /// itself. Called once per `Engine::load`, right after the module compiles.
@@ -1906,6 +2011,7 @@ pub fn assert_kernel_defines() {
         ("SAMPLE_MAXK", SAMPLE_MAXK as u32),
         ("SAMPLE_PARTS", SAMPLE_PARTS),
         ("SAMPLE_THREADS", SAMPLE_THREADS),
+        ("SAMPLE_RING_MAX", SAMPLE_RING_MAX as u32),
     ] {
         let cuda = crate::kernels::define_u32(name);
         assert_eq!(cuda, rust, "{name}: KERNEL_SRC says {cuda}, the Rust twin says {rust}");
@@ -2037,9 +2143,9 @@ impl Scratch {
             ("mixed", 4 * c * H),
             ("mixed_m", 4 * c * H),
             ("moe_out", 4 * c * H),
-            ("xq_m", c * 3 * (H / 64) * 36),
-            ("xq_gu", c * 3 * (H / 64) * 36),
-            ("xq_v", c * 3 * (GDN_VAL / 64) * 36),
+            ("xq_m", c * xq_row_bytes(H / 64)),
+            ("xq_gu", c * xq_row_bytes(H / 64)),
+            ("xq_v", c * xq_row_bytes(GDN_VAL / 64)),
             ("injr", 4 * c * HCN),
             ("injw", 4 * c * HCN),
             ("mixed_final", 4 * c * H),
@@ -2099,14 +2205,14 @@ impl Scratch {
             ("ple_gn", 4 * c * HCT),
             ("ple_out", 4 * c * HCT),
             ("ple_slots", c * PLE_NHEADS * 4),
-            ("xq_e", c * 3 * (H / 64) * 36),
+            ("xq_e", c * xq_row_bytes(H / 64)),
         ];
         let moe_set: &[(&str, usize)] = &[
             ("h1", 4 * c * TOPK * 2 * INTER),
             ("h2", 4 * c * TOPK * INTER),
             ("eo", 4 * c * TOPK * H),
-            ("xq_dn", c * TOPK * 3 * (INTER / 64) * 36),
-            ("xq_s", c * 3 * (INTER / 64) * 36),
+            ("xq_dn", c * TOPK * xq_row_bytes(INTER / 64)),
+            ("xq_s", c * xq_row_bytes(INTER / 64)),
             ("sh12", 4 * c * 2 * INTER),
             ("sh2", 4 * c * INTER),
             ("sdown", 4 * c * H),
@@ -2209,7 +2315,7 @@ impl Engine {
         let p = &self.p;
         let s = &self.s;
         launch_v(k.f("rms_group"), 4, t as u32, 1, 256, &[x as u64, w.norm as u64, s.normed as u64]);
-        // #19f, default on since 19g (CROW_QFUSE != "0"): decode regime
+        // #19f, opt-in (CROW_QFUSE=1; default on 19g..2026-09-23): decode regime
         // (t < 8) fuses the
         // elementwise hc chain into the GEMV epilogues - hc_down_inj carries
         // down + silu_div4 + the 4-row inject GEMV + sig2_div4 in ONE launch
@@ -3591,15 +3697,15 @@ impl Engine {
     /// `hc_run`, and since #19g `hc_run`'s LAST launch is `mix_streams_q`, which
     /// writes `mixed` AND the NVFP4 activation cascade `xq_m` that every FP4
     /// projection of the sub-block reads (v, the QSA indexer qk — `attn_prompt`
-    /// itself only quantizes when CROW_QFUSE=0, exactly because the fused
-    /// producer is the default). Without this launch `xq_m` stayed all-zero on
+    /// itself quantizes unless CROW_QFUSE=1; from #19g to 2026-09-23 the fused
+    /// producer was the default). Without this launch `xq_m` stayed all-zero on
     /// the run of record, so v and qk came out zero, attention had nothing to
     /// weight and the o_proj output was IDENTICALLY zero at max_abs = max|golden|
     /// — a debug path reporting a number that says nothing. `quant_x_fp4` is the
-    /// documented bit-identical twin of the cascade `mix_streams_q` fuses (same
-    /// amax → ue4m3 ceiling → RNE nibble → residual per 16-wide sub-block), and
-    /// it is the launch `attn_prompt` makes itself when the fusion is off, so
-    /// the sub-block is fed what the production path feeds it either way.
+    /// launch `attn_prompt` makes itself when the fusion is off (the default
+    /// since the activation-floor fix of 2026-09-23; it adds the per-row
+    /// power-of-two pre-scale the fused `mix_streams_q` cannot), so the
+    /// sub-block is fed what the default production path feeds it.
     pub unsafe fn run_attn_subblock(&mut self, l: usize, x_host: &[f32], t: usize, pos_base: usize) -> Vec<f32> {
         assert!(is_attn(l), "layer {l} is not an attention layer");
         assert_eq!(x_host.len(), t * H, "attn subblock input must be [T][H]");
@@ -3674,7 +3780,7 @@ impl Engine {
                 // TASK H: the same batched fetch `ensure_rows` uses, but queued
                 // behind every urgent batch - this thread runs WHILE the current
                 // chunk computes and must never delay the rows it waits on.
-                prefetch = Some(std::thread::spawn(move || warm.rows_ahead(&offsets, 108)));
+                prefetch = Some(std::thread::spawn(move || warm.rows_ahead(&offsets, 4 * 36)));
             }
             // per-chunk scalar refresh (device buffers, one sync each — chunk level)
             self.upload_chunk_scalars(t, pos_base, first && start == 0, ScalarSet::Full);
@@ -4182,9 +4288,11 @@ impl Engine {
             self.dev_sampler = Some(self.dev_sampler_hold.take().unwrap_or_else(|| DevSampler {
                 mask: cuda::alloc_zeroed(V),
                 rng: cuda::alloc_zeroed(8),
-                params: cuda::alloc_zeroed(16),
+                params: cuda::alloc_zeroed(36),
                 cand_v: cuda::alloc_zeroed(SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
                 cand_i: cuda::alloc_zeroed(SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
+                counts: cuda::alloc_zeroed(2 * V),
+                ring: cuda::alloc_zeroed((2 + SAMPLE_RING_MAX) * 4),
                 in_graph: std::cell::Cell::new(false),
             }));
         }
@@ -4192,12 +4300,49 @@ impl Engine {
         let zero = vec![0u8; V];
         cuda::upload_into(ds.mask, &zero);
         cuda::to_u64_into(ds.rng, &[s.rng.state()]);
-        let mut pb = [0u8; 16];
+        // the 36-byte params block of `sample_k`: {temp, top_p, presence,
+        // min_p, ln_min_p, repeat, freq} f32 + {top_k, last_n} i32.
+        // #83: ln(min_p) is computed HERE, once, so the device adds the same
+        // threshold constant the host sampler adds. #84: repeat/freq/last_n -
+        // last_n clamped to the ring's depth, as both parse doors already do.
+        let mut pb = [0u8; 36];
         pb[0..4].copy_from_slice(&s.temperature.to_le_bytes());
         pb[4..8].copy_from_slice(&s.top_p.to_le_bytes());
         pb[8..12].copy_from_slice(&s.presence_penalty.to_le_bytes());
         pb[12..16].copy_from_slice(&(s.top_k as i32).to_le_bytes());
+        pb[16..20].copy_from_slice(&s.min_p.to_le_bytes());
+        pb[20..24].copy_from_slice(&s.ln_min_p().to_le_bytes());
+        pb[24..28].copy_from_slice(&s.repeat_penalty.to_le_bytes());
+        pb[28..32].copy_from_slice(&s.frequency_penalty.to_le_bytes());
+        pb[32..36].copy_from_slice(&(s.penalty_last_n.min(SAMPLE_RING_MAX) as i32).to_le_bytes());
         cuda::upload_into(ds.params, &pb);
+        // #84: the windowed penalties' device twin, seeded per request like
+        // the mask: counts[V] u16 from the sampler's window counts, and the
+        // ring {head, fill, ids} from its prompt-tail ids (oldest first).
+        // A not-armed sampler uploads zeros - `sample_k` will not touch them.
+        let mut cb = vec![0u8; 2 * V];
+        if s.win_armed() {
+            for (tok, c) in s.win_counts_nonzero() {
+                cb[tok * 2..tok * 2 + 2].copy_from_slice(&c.to_le_bytes());
+            }
+        }
+        cuda::upload_into(ds.counts, &cb);
+        let lastn = s.penalty_last_n.min(SAMPLE_RING_MAX);
+        let mut rb = vec![0u8; (2 + SAMPLE_RING_MAX) * 4];
+        if s.win_armed() && lastn > 0 {
+            let ids: Vec<u32> = s.win_ids().collect();
+            let fill = ids.len().min(lastn);
+            // the tail of the window (a clamped last_n may hold fewer ids
+            // than the sampler does), oldest first; head = fill % lastn is
+            // the next write slot exactly as `sample_k`'s accept advances it
+            let head = (fill % lastn) as i32;
+            rb[0..4].copy_from_slice(&head.to_le_bytes());
+            rb[4..8].copy_from_slice(&(fill as i32).to_le_bytes());
+            for (j, &t) in ids[ids.len() - fill..].iter().enumerate() {
+                rb[8 + j * 4..12 + j * 4].copy_from_slice(&(t as i32).to_le_bytes());
+            }
+        }
+        cuda::upload_into(ds.ring, &rb);
         cuda::sync();
         // invariant: in_graph is true only while the CURRENT decode graph carries the
         // sampler node; arming re-arms for the next capture, so clear it here
@@ -4205,13 +4350,15 @@ impl Engine {
     }
 
     unsafe fn launch_sample(&self, ds: &DevSampler) {
-        // v2: 64 blocks pick their slice's top-k, one block merges and draws
+        // v2: 64 blocks pick their slice's top-k, one block merges and draws.
+        // #84: counts rides stage 1 (the windowed penalties bite on the raw
+        // logits), counts+ring ride stage 2 (the post-draw accept).
         launch_v(self.k.f("sample_topk_part"), SAMPLE_PARTS, 1, 1, SAMPLE_THREADS, &[
-            self.s.logits as u64, self.p.n_vocab as u64, ds.mask as u64, ds.params as u64,
-            ds.cand_v as u64, ds.cand_i as u64]);
+            self.s.logits as u64, self.p.n_vocab as u64, ds.mask as u64, ds.counts as u64,
+            ds.params as u64, ds.cand_v as u64, ds.cand_i as u64]);
         launch_v(self.k.f("sample_k"), 1, 1, 1, SAMPLE_THREADS, &[
             ds.cand_v as u64, ds.cand_i as u64, self.s.argmax as u64, self.p.n_vocab as u64,
-            ds.mask as u64, ds.rng as u64, ds.params as u64]);
+            ds.mask as u64, ds.counts as u64, ds.ring as u64, ds.rng as u64, ds.params as u64]);
     }
 
     /// #20: draw a token from the logits row currently in `s.logits` (the last
@@ -4661,6 +4808,8 @@ impl Drop for Engine {
                 cuda::free_dev(&mut ds.params);
                 cuda::free_dev(&mut ds.cand_v);
                 cuda::free_dev(&mut ds.cand_i);
+                cuda::free_dev(&mut ds.counts);
+                cuda::free_dev(&mut ds.ring);
             }
             // the module last: every CUfunction in self.k points into it
             self.module.unload();
@@ -4784,5 +4933,49 @@ impl Drop for Scratch {
                 cuda::free_dev(f);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_ple_row {
+    use super::{ple_row_pad, ple_row_span, PLE_ROW_VALUES};
+
+    /// a flat shard whose 16-value group k carries scale byte k and data bytes k
+    fn flat(n_rows: u64) -> (Vec<u8>, u64) {
+        let n_values = n_rows * PLE_ROW_VALUES;
+        let n_blk = (n_values / 64) as usize;
+        let mut v = vec![0u8; n_blk * 36];
+        for b in 0..n_blk {
+            for g in 0..4 {
+                let k = ((b * 4 + g) % 251) as u8;
+                v[b * 36 + g] = k;
+                v[b * 36 + 4 + g * 8..b * 36 + 4 + g * 8 + 8].fill(k);
+            }
+        }
+        (v, n_values)
+    }
+
+    /// #91: every row, even (block-aligned) and odd (32 values into a block), the last
+    /// row of the shard included, comes back as ITS 10 groups of 16 values
+    #[test]
+    fn a_ple_row_is_read_from_the_flat_stream_at_value_160_r() {
+        // an even row count, like the container's 2,500,012 rows per shard: the shard
+        // then ends on a block boundary (160 * 2 = 5 blocks)
+        let (v, n_values) = flat(10);
+        for row in 0..10u64 {
+            let (b_off, nblk, off) = ple_row_span(row, n_values);
+            let b = b_off as usize;
+            let out = ple_row_pad(&v[b..b + nblk * 36], off, nblk);
+            for q in 0..10usize {
+                let (d, g) = (q / 4, q % 4);
+                let want = ((row as usize * 10 + q) % 251) as u8;
+                assert_eq!(out[d * 36 + g], want, "row {row} group {q} scale");
+                assert!(out[d * 36 + 4 + g * 8..d * 36 + 4 + g * 8 + 8].iter().all(|&x| x == want), "row {row} group {q} data");
+            }
+        }
+        // the old `row * 108` offset is NOT where row 1 starts
+        assert_ne!(ple_row_span(1, n_values).0, 108);
+        assert_eq!(ple_row_span(1, n_values), (2 * 36, 4, 32));
+        assert_eq!(ple_row_span(2, n_values), (5 * 36, 4, 0));
     }
 }
