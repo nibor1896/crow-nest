@@ -50,6 +50,30 @@ if [ "$high" -le 0 ] || [ "$max" -le 0 ]; then
     exit 2
 fi
 
+# #91 OPERATING POINT (2026-09-23): the dense BF16 overlay is the default. The
+# 495 dense tensors (GDN in/out proj, attn o/v, indexer, shared experts, PLE,
+# hyper-connection) run from their BF16 originals; the routed experts stay FP4.
+# Measured (decode_out/meas-0923/multisite, 23 corrupt sites of the 2026-09-23
+# diorama run): at #65 the margin moves by -11.6 nats and `nibor1896` wins; on the
+# uncontaminated sites the corrupt token wins 3/9 instead of 6/9; free-run a48
+# 5 -> 1 index errors; no single dense group, and not tierA, does as much. Cost:
+# decode 66.6 -> 55.8 tok/s. The pinned settings are the ones the measured dense
+# arm booted with (cold tier 48.33 GiB, allocation wc). Opt out with
+# CROW_CNQ_OVERLAY=none (the bare container); any other value names the overlay.
+dense_overlay="$root/converter/dense-bf16-originals.cnq"
+if [ -z "${CROW_CNQ_OVERLAY+x}" ]; then
+    if [ ! -f "$dense_overlay" ]; then
+        echo "serve-linux.sh: the default overlay $dense_overlay is missing - build it or set CROW_CNQ_OVERLAY=none" >&2
+        exit 2
+    fi
+    export CROW_CNQ_OVERLAY="$dense_overlay"
+    export CROW_PINNED_BUDGET_GB="${CROW_PINNED_BUDGET_GB:-50}"
+    export CROW_PINNED_ALLOC="${CROW_PINNED_ALLOC:-wc}"
+    export CROW_RAM_MARGIN_GB="${CROW_RAM_MARGIN_GB:-1}"
+elif [ "$CROW_CNQ_OVERLAY" = "none" ]; then
+    unset CROW_CNQ_OVERLAY
+fi
+
 # pass the caller's CROW_* switches through the `env` that sets LD_LIBRARY_PATH -
 # except secrets: a CROW_*_KEY / _TOKEN / _SECRET belongs to Crow the client
 # (CROW_TAVILY_KEY, crow_core.py), the engine has no read site for it
@@ -58,17 +82,10 @@ crow_env=()
 while IFS= read -r kv; do crow_env+=("$kv"); done \
     < <(env | grep '^CROW_' | grep -vE '^CROW_[A-Z0-9_]*(KEY|TOKEN|SECRET)=' || true)
 
-# #91 NO OVERLAY BY DEFAULT (2026-09-22, tools/results/91-corruption-ctx100000-end):
-# the attn-v-out BF16 overlay was the default from 723d18f to here on the
-# expectation that it removes the long-session corruption. Measured at 100k
-# context it is the one arm that gets WORSE with depth: 28/320 dropped or
-# wrong lines against the bare container's 8/320 (placebo 2/320), errors on
-# three seeds where every other arm errs on one. The bare container of the
-# parity record is the operating point again. An overlay is opt-in only:
-# CROW_CNQ_OVERLAY=<file>.
-if [ -n "${CROW_CNQ_OVERLAY:-}" ]; then
-    echo "serve-linux.sh: CROW_CNQ_OVERLAY=$CROW_CNQ_OVERLAY (opt-in; the default is the bare container since the #91 100k ladder)" >&2
-fi
+# The attn-v-out overlay (default 723d18f..2026-09-22) got WORSE at 100k context
+# (tools/results/91-corruption-ctx100000-end: 28/320 wrong lines vs bare 8/320).
+# The dense overlay above is a different, measured set; see the #91 block.
+echo "serve-linux.sh: CROW_CNQ_OVERLAY=${CROW_CNQ_OVERLAY:-none (bare container)} CROW_PINNED_BUDGET_GB=${CROW_PINNED_BUDGET_GB:-unset} CROW_PINNED_ALLOC=${CROW_PINNED_ALLOC:-default}" >&2
 
 # #102: CROW_KV=bf16 (the KV cache in bf16 instead of FP8 E4M3) is read by serve and
 # passed through like every CROW_* above. It doubles the KV bytes, the

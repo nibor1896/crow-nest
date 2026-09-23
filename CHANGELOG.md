@@ -6,6 +6,10 @@
 
 ## Unreleased — after v0.3.1
 
+### Changed
+
+- **The dense BF16 overlay is the default operating point of `tools/serve-linux.sh`** (`#91`, 2026-09-23). `converter/dense-bf16-originals.cnq` (495 dense tensors from their BF16 originals; routed experts stay FP4) loads unless `CROW_CNQ_OVERLAY` is set; `CROW_CNQ_OVERLAY=none` restores the bare container. Defaults set with it: `CROW_PINNED_BUDGET_GB=50`, `CROW_PINNED_ALLOC=wc`, `CROW_RAM_MARGIN_GB=1`, the settings the measured dense arm booted with (cold tier 48.33 GiB). Measured on the 23 corrupt sites of the 2026-09-23 diorama run (`decode_out/meas-0923/multisite`, crow-nest-wt-meas): #65 margin −11.6 nats, `nibor1896` wins; uncontaminated sites where the corrupt token wins 6/9 → 3/9; free-run a48 index errors 5 → 1; no single dense group and not tierA does as much. Known limitation: 3/9 uncontaminated sites stay corrupt, and decode drops from 66.6 to 55.8 tok/s. Acceptance is robin's diorama replay.
+
 ### Added
 
 - **Teacher forcing on `serve` for the #91 K=2 measurement: `crow_force_ids`** (`#91`, 2026-09-22). A request field (array of token ids) whose ids REPLACE the generated ones step by step through the #81 injection door, so with `logprobs: true` every entry prices the forced id under the raw distribution after the forced prefix; the entries then carry `crow_id` (`[]` forces nothing and only adds the ids); a 400 beside `reasoning_budget_tokens`; under `CROW_LOG=info,chat=debug` the prompt ids are logged. Absent, every byte is unchanged. `tools/corruption-replay-probe.py --dump-lp/--force-ids/--force-n`, `tools/teacher-forced-compare.py` (logprob of the correct vs produced digit at #65, top-N, the per-position forced-id logprob per arm), `tools/teacher-forced-oracle-seq.py` (serve's own prompt ids + the bare completion as `gen-sequence.json` for `oracle/ref_engine_logits.py`, and its rows back as a dump), `tools/teacher-forced-91.sh` (the arms, one command). cargo test --release 319 -> 320, clippy 1505 unchanged; probe tests 14 -> 16. No engine run yet (pinned pool, #82).
