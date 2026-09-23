@@ -260,11 +260,42 @@ __device__ __forceinline__ unsigned char enc_ue4m3_up(float s) {
 // with its own ue4m3 scales; the residual cascade halves the activation
 // quantization error ~10x per level at the cost of one extra mma per k-block
 // — the weight fragments are reused).
-// Layout per row: LV * bpr*36 bytes, level L at L*bpr*36.
+// Layout per row: LV * bpr*36 bytes, level L at L*bpr*36, then the row's f32
+// pre-scale factor 2^-k at byte bpr*108 (row stride XQ_ROW(bpr) = bpr*108 + 4).
+// Per-row power-of-two pre-scale (the activation floor fix): the smallest
+// ue4m3 scale is 2^-9, so without it every level has an absolute error floor
+// (~4.9e-4 per element) and small-magnitude rows (the SwiGLU h2 rows, small
+// `mixed` rows) quantize far worse than the relative design claim. The whole-
+// row quantizers (quant_x_fp4, quant_tiles) take the row amax, pick k with
+// amax * 2^k in [1024, 2048) (below the level-0 no-clip top 6 * 448 = 2688),
+// quantize x * 2^k and store 2^-k; every FP4 MMA epilogue multiplies it back
+// in after the gs product. Both factors are exact powers of two, so the
+// rescale adds no rounding; k = 0 (zero / non-finite amax) stores 1.0 and
+// reproduces the unscaled cascade bit for bit. The fused producers
+// (CROW_QFUSE=1) see no whole row and store 1.0: they keep the old floor.
 // grid (rows), block 128; row r reads x[r * x_stride] where r = blockIdx.x —
 // callers pass the combo table decomposition like gemv_fp4_ptrb (x_div/x_stride),
 // so one quantized row serves all TOPK combos of a token (gate_up) or is
 // per-combo (down, x_div=1).
+#define XQ_ROW(bpr) ((size_t)(bpr) * 108 + 4)
+// the per-row factor 2^-k of quantized row r (see the layout note above)
+__device__ __forceinline__ float xq_rs(const unsigned char* xq, int bpr, size_t r) {
+    return *(const float*)(xq + r * XQ_ROW(bpr) + (size_t)bpr * 108);
+}
+__device__ __forceinline__ void xq_set_rs(unsigned char* xq_row, int bpr, float f) {
+    *(float*)(xq_row + (size_t)bpr * 108) = f;
+}
+// k for a row amax: frexp exponent e (amax = m * 2^e, m in [0.5, 1)) from the
+// bits, subnormals included; k = 11 - e puts amax * 2^k in [1024, 2048),
+// clamped to [-64, 64] so both 2^k and 2^-k stay normal f32. Zero, NaN and
+// inf rows are left unscaled (k = 0).
+__device__ __forceinline__ int row_prescale_k(float amax) {
+    if (!(amax > 0.0f) || !(amax <= 3.402823466e38f)) return 0;
+    unsigned int bits = __float_as_uint(amax);
+    int ef = (int)((bits >> 23) & 0xFFu);
+    int e = ef ? ef - 126 : (31 - __clz((int)(bits & 0x7FFFFFu))) - 148;
+    return max(-64, min(64, 11 - e));
+}
 __device__ __forceinline__ void quant_level(const float* p, float* r, unsigned char* sc_dst,
                                             unsigned char* d_dst) {
     float amax = 0.0f;
@@ -283,6 +314,34 @@ __device__ __forceinline__ void quant_level(const float* p, float* r, unsigned c
         r[2 * j + 1] = p[2 * j + 1] - e2m1(n1) * scf;
     }
 }
+// one whole row (bpr 64-blocks at xp) -> the pre-scaled 3-level cascade + its
+// factor at op; block-cooperative (blockDim a multiple of 32, <= 1024), every
+// thread of the block must call it (two barriers)
+__device__ __forceinline__ void quant_row_prescaled(const float* xp, unsigned char* op, int bpr) {
+    __shared__ float amax_w[32];
+    float amax = 0.0f;
+    for (int i = threadIdx.x; i < bpr * 64; i += blockDim.x) amax = fmaxf(amax, fabsf(xp[i]));
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    if ((threadIdx.x & 31) == 0) amax_w[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    amax = 0.0f;
+    for (int w = 0; w < (int)(blockDim.x >> 5); w++) amax = fmaxf(amax, amax_w[w]);
+    int k = row_prescale_k(amax);
+    float up = ldexpf(1.0f, k);   // exact 2^k: x * up is exact (no overflow by choice of k)
+    for (int sb = threadIdx.x; sb < bpr * 4; sb += blockDim.x) {
+        int b = sb >> 2, s = sb & 3;
+        const float* p = xp + b * 64 + s * 16;
+        float xs[16], r0[16], r1[16];
+        #pragma unroll
+        for (int j = 0; j < 16; j++) xs[j] = p[j] * up;
+        quant_level(xs, r0, op + b * 36 + s, op + b * 36 + 4 + s * 8);
+        quant_level(r0, r1, op + bpr * 36 + b * 36 + s, op + bpr * 36 + b * 36 + 4 + s * 8);
+        quant_level(r1, r0, op + 2 * bpr * 36 + b * 36 + s, op + 2 * bpr * 36 + b * 36 + 4 + s * 8);
+    }
+    if (threadIdx.x == 0) xq_set_rs(op, bpr, ldexpf(1.0f, -k));
+    __syncthreads(); // amax_w is reused by the next call
+}
 extern "C" __global__ void quant_x_fp4(const float* __restrict__ x, unsigned char* __restrict__ xq,
                                        const int* __restrict__ k_dim_p, const int* __restrict__ x_div_p,
                                        const int* __restrict__ x_stride_p) {
@@ -290,15 +349,8 @@ extern "C" __global__ void quant_x_fp4(const float* __restrict__ x, unsigned cha
     int bpr = k_dim >> 6;
     int row = blockIdx.x / *x_div_p;
     const float* xp = x + (size_t)row * *x_stride_p;
-    unsigned char* op = xq + (size_t)blockIdx.x * bpr * 108; // 3 levels
-    for (int sb = threadIdx.x; sb < bpr * 4; sb += blockDim.x) {
-        int b = sb >> 2, s = sb & 3;
-        const float* p = xp + b * 64 + s * 16;
-        float r0[16], r1[16];
-        quant_level(p, r0, op + b * 36 + s, op + b * 36 + 4 + s * 8);
-        quant_level(r0, r1, op + bpr * 36 + b * 36 + s, op + bpr * 36 + b * 36 + 4 + s * 8);
-        quant_level(r1, r0, op + 2 * bpr * 36 + b * 36 + s, op + 2 * bpr * 36 + b * 36 + 4 + s * 8);
-    }
+    unsigned char* op = xq + (size_t)blockIdx.x * XQ_ROW(bpr); // 3 levels + factor
+    quant_row_prescaled(xp, op, bpr);
 }
 // p2-proven instruction, wrapped for reuse (D accumulates in-place)
 __device__ __forceinline__ void mma_fp4_16n8k64(float& d0, float& d1, float& d2, float& d3,
@@ -344,7 +396,7 @@ extern "C" __global__ void gemv_fp4_mma(const unsigned long long* __restrict__ p
     int combo = blockIdx.y;
     const unsigned char* w = (const unsigned char*)ptrs[combo];
     int xr = combo / *x_div_p;
-    const unsigned char* xa = xq + (size_t)xr * bpr * 108;
+    const unsigned char* xa = xq + (size_t)xr * XQ_ROW(bpr);
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int ks_n = blockDim.x >> 7;
     int rg = warp & 3, ks = warp >> 2;
@@ -388,8 +440,9 @@ extern "C" __global__ void gemv_fp4_mma(const unsigned long long* __restrict__ p
     if (ks == 0 && t == 0) {
         float s0 = 0.0f, s2 = 0.0f;
         for (int i = 0; i < ks_n; i++) { s0 += red[i][0][(rg << 4) + g]; s2 += red[i][1][(rg << 4) + g]; }
-        y[(size_t)combo * ((size_t)gridDim.x << 6) + w0 + g] = s0 * gs;
-        y[(size_t)combo * ((size_t)gridDim.x << 6) + w0 + g + 8] = s2 * gs;
+        float rs = xq_rs(xq, bpr, (size_t)xr); // the row's pre-scale 2^-k (exact)
+        y[(size_t)combo * ((size_t)gridDim.x << 6) + w0 + g] = (s0 * gs) * rs;
+        y[(size_t)combo * ((size_t)gridDim.x << 6) + w0 + g + 8] = (s2 * gs) * rs;
     }
 }
 
@@ -421,7 +474,7 @@ extern "C" __global__ void gemv_fp4_mma_d(const unsigned char* __restrict__ w,
     float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
     int r0 = w0 + g, r1 = w0 + g + 8;
     if (active) {
-        const unsigned char* xa = xq + (size_t)tok * bpr * 108;
+        const unsigned char* xa = xq + (size_t)tok * XQ_ROW(bpr);
         const unsigned char* rowg = w + (size_t)min(r0, rows - 1) * bpr * 36;
         const unsigned char* rowg8 = w + (size_t)min(r1, rows - 1) * bpr * 36;
         const unsigned char* sfrow = (lt & 1) ? rowg8 : rowg;
@@ -460,8 +513,9 @@ extern "C" __global__ void gemv_fp4_mma_d(const unsigned char* __restrict__ w,
     if (ks == 0 && lt == 0 && active) {
         float s0 = 0.0f, s2 = 0.0f;
         for (int i = 0; i < ks_n; i++) { s0 += red[i][0][(rg << 4) + g]; s2 += red[i][1][(rg << 4) + g]; }
-        if (r0 < rows) y[(size_t)tok * ys + r0] = s0 * gs;
-        if (r1 < rows) y[(size_t)tok * ys + r1] = s2 * gs;
+        float rs = xq_rs(xq, bpr, (size_t)tok); // the row's pre-scale 2^-k (exact)
+        if (r0 < rows) y[(size_t)tok * ys + r0] = (s0 * gs) * rs;
+        if (r1 < rows) y[(size_t)tok * ys + r1] = (s2 * gs) * rs;
     }
 }
 
@@ -490,7 +544,7 @@ extern "C" __global__ void gemm_fp4_dense(const unsigned char* __restrict__ w,
     int w0 = (blockIdx.x << 6) + (rg << 4);
     bool active = w0 < rows;
     int tok_g = blockIdx.y * 8 + g;
-    const unsigned char* xa = xq + (size_t)min(tok_g, tt - 1) * bpr * 108;
+    const unsigned char* xa = xq + (size_t)min(tok_g, tt - 1) * XQ_ROW(bpr);
     float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
     int r0 = w0 + g, r1 = w0 + g + 8;
     if (active) {
@@ -536,13 +590,15 @@ extern "C" __global__ void gemm_fp4_dense(const unsigned char* __restrict__ w,
         }
         float gs = gs_ptr[0];
         int n0 = blockIdx.y * 8 + 2 * lt, n1 = n0 + 1;
-        if (n0 < tt) {
-            if (r0 < rows) y[(size_t)n0 * ys + r0] = s0 * gs;
-            if (r1 < rows) y[(size_t)n0 * ys + r1] = s2 * gs;
+        if (n0 < tt) { // per-token pre-scale 2^-k (exact)
+            float rs = xq_rs(xq, bpr, (size_t)n0);
+            if (r0 < rows) y[(size_t)n0 * ys + r0] = (s0 * gs) * rs;
+            if (r1 < rows) y[(size_t)n0 * ys + r1] = (s2 * gs) * rs;
         }
         if (n1 < tt) {
-            if (r0 < rows) y[(size_t)n1 * ys + r0] = s1 * gs;
-            if (r1 < rows) y[(size_t)n1 * ys + r1] = s3 * gs;
+            float rs = xq_rs(xq, bpr, (size_t)n1);
+            if (r0 < rows) y[(size_t)n1 * ys + r0] = (s1 * gs) * rs;
+            if (r1 < rows) y[(size_t)n1 * ys + r1] = (s3 * gs) * rs;
         }
     }
 }
@@ -643,7 +699,7 @@ extern "C" __global__ void gemm_fp4_dense_b(const unsigned char* __restrict__ w,
             #pragma unroll
             for (int j = 0; j < 4; j++) {
                 int tok_g = tokg0 + 8 * j + g;
-                const unsigned char* ab = xq + (size_t)min(tok_g, tt - 1) * bpr * 108 + b * 36;
+                const unsigned char* ab = xq + (size_t)min(tok_g, tt - 1) * XQ_ROW(bpr) + b * 36;
                 unsigned int sb = *(const unsigned int*)(ab);
                 unsigned int b0 = *(const unsigned int*)(ab + 4 + 4 * lt);
                 unsigned int b1 = *(const unsigned int*)(ab + 20 + 4 * lt);
@@ -673,13 +729,15 @@ extern "C" __global__ void gemm_fp4_dense_b(const unsigned char* __restrict__ w,
             }
             float gs = gs_ptr[0];
             int n0 = tokg0 + 8 * j + 2 * lt, n1 = n0 + 1;
-            if (n0 < tt) {
-                if (r0 < rows) y[(size_t)n0 * ys + r0] = s0 * gs;
-                if (r1 < rows) y[(size_t)n0 * ys + r1] = s2 * gs;
+            if (n0 < tt) { // per-token pre-scale 2^-k (exact)
+                float rs = xq_rs(xq, bpr, (size_t)n0);
+                if (r0 < rows) y[(size_t)n0 * ys + r0] = (s0 * gs) * rs;
+                if (r1 < rows) y[(size_t)n0 * ys + r1] = (s2 * gs) * rs;
             }
             if (n1 < tt) {
-                if (r0 < rows) y[(size_t)n1 * ys + r0] = s1 * gs;
-                if (r1 < rows) y[(size_t)n1 * ys + r1] = s3 * gs;
+                float rs = xq_rs(xq, bpr, (size_t)n1);
+                if (r0 < rows) y[(size_t)n1 * ys + r0] = (s1 * gs) * rs;
+                if (r1 < rows) y[(size_t)n1 * ys + r1] = (s3 * gs) * rs;
             }
         }
         __syncthreads();
@@ -736,7 +794,7 @@ extern "C" __global__ void gemv_fp4_mma_g(const unsigned char* __restrict__ w0,
     float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
     int r0 = lr + g, r1 = lr + g + 8;
     if (active) {
-        const unsigned char* xa = xq + (size_t)tok * bpr * 108;
+        const unsigned char* xa = xq + (size_t)tok * XQ_ROW(bpr);
         const unsigned char* rowg = w + (size_t)min(r0, grows - 1) * bpr * 36;
         const unsigned char* rowg8 = w + (size_t)min(r1, grows - 1) * bpr * 36;
         const unsigned char* sfrow = (lt & 1) ? rowg8 : rowg;
@@ -775,8 +833,9 @@ extern "C" __global__ void gemv_fp4_mma_g(const unsigned char* __restrict__ w0,
         float gs = gsp[0];
         float s0 = 0.0f, s2 = 0.0f;
         for (int i = 0; i < ks_n; i++) { s0 += red[i][0][(rg << 4) + g]; s2 += red[i][1][(rg << 4) + g]; }
-        if (r0 < grows) y[(size_t)tok * grows + r0] = s0 * gs;
-        if (r1 < grows) y[(size_t)tok * grows + r1] = s2 * gs;
+        float rs = xq_rs(xq, bpr, (size_t)tok); // the row's pre-scale 2^-k (exact)
+        if (r0 < grows) y[(size_t)tok * grows + r0] = (s0 * gs) * rs;
+        if (r1 < grows) y[(size_t)tok * grows + r1] = (s2 * gs) * rs;
     }
 }
 
@@ -813,7 +872,7 @@ extern "C" __global__ void gemv_fp4_mma_d32(const unsigned char* __restrict__ w,
     float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
     int r0 = w0 + g, r1 = w0 + g + 8;
     if (active) {
-        const unsigned char* xa = xq + (size_t)tok * bpr * 108;
+        const unsigned char* xa = xq + (size_t)tok * XQ_ROW(bpr);
         const unsigned char* rowg = w + (size_t)min(r0, rows - 1) * bpr * 36;
         const unsigned char* rowg8 = w + (size_t)min(r1, rows - 1) * bpr * 36;
         const unsigned char* sfrow = (lt & 1) ? rowg8 : rowg;
@@ -852,8 +911,9 @@ extern "C" __global__ void gemv_fp4_mma_d32(const unsigned char* __restrict__ w,
     if (ks == 0 && lt == 0 && active) {
         float s0 = 0.0f, s2 = 0.0f;
         for (int i = 0; i < ks_n; i++) { s0 += red[i][0][(rg << 4) + g]; s2 += red[i][1][(rg << 4) + g]; }
-        if (r0 < rows) y[(size_t)tok * ys + r0] = s0 * gs;
-        if (r1 < rows) y[(size_t)tok * ys + r1] = s2 * gs;
+        float rs = xq_rs(xq, bpr, (size_t)tok); // the row's pre-scale 2^-k (exact)
+        if (r0 < rows) y[(size_t)tok * ys + r0] = (s0 * gs) * rs;
+        if (r1 < rows) y[(size_t)tok * ys + r1] = (s2 * gs) * rs;
     }
 }
 
@@ -904,7 +964,7 @@ extern "C" __global__ void gemv_fp4_mma_g32(const unsigned char* __restrict__ w0
     float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
     int r0 = lr + g, r1 = lr + g + 8;
     if (active) {
-        const unsigned char* xa = xq + (size_t)tok * bpr * 108;
+        const unsigned char* xa = xq + (size_t)tok * XQ_ROW(bpr);
         const unsigned char* rowg = w + (size_t)min(r0, grows - 1) * bpr * 36;
         const unsigned char* rowg8 = w + (size_t)min(r1, grows - 1) * bpr * 36;
         const unsigned char* sfrow = (lt & 1) ? rowg8 : rowg;
@@ -943,8 +1003,9 @@ extern "C" __global__ void gemv_fp4_mma_g32(const unsigned char* __restrict__ w0
         float gs = gsp[0];
         float s0 = 0.0f, s2 = 0.0f;
         for (int i = 0; i < ks_n; i++) { s0 += red[i][0][(rg << 4) + g]; s2 += red[i][1][(rg << 4) + g]; }
-        if (r0 < grows) y[(size_t)tok * grows + r0] = s0 * gs;
-        if (r1 < grows) y[(size_t)tok * grows + r1] = s2 * gs;
+        float rs = xq_rs(xq, bpr, (size_t)tok); // the row's pre-scale 2^-k (exact)
+        if (r0 < grows) y[(size_t)tok * grows + r0] = (s0 * gs) * rs;
+        if (r1 < grows) y[(size_t)tok * grows + r1] = (s2 * gs) * rs;
     }
 }
 
@@ -3377,7 +3438,7 @@ extern "C" __global__ void gemm_fp4_tiles(const int4* __restrict__ tiles, const 
     int rows = gridDim.x << 6;
     // column g = token g of the tile (columns past n replay token 0, stores masked)
     int cg = perm[tl.y + ((g < tl.z) ? g : 0)];
-    const unsigned char* xa = xq + (size_t)(cg / *xdiv_p) * bpr * 108;
+    const unsigned char* xa = xq + (size_t)(cg / *xdiv_p) * XQ_ROW(bpr);
     const unsigned char* rowg = w + (size_t)(w0 + g) * bpr * 36;
     const unsigned char* rowg8 = rowg + 8 * bpr * 36;
     const unsigned char* sfrow = (t & 1) ? rowg8 : rowg;
@@ -3420,13 +3481,17 @@ extern "C" __global__ void gemm_fp4_tiles(const int4* __restrict__ tiles, const 
         }
         float gs = gs_ptr[0];
         int n0 = 2 * t, n1 = 2 * t + 1;
-        if (n0 < tl.z) {
-            size_t c0 = (size_t)perm[tl.y + n0] * rows;
-            y[c0 + w0 + g] = s0 * gs; y[c0 + w0 + g + 8] = s2 * gs;
+        if (n0 < tl.z) { // the combo's quantized row = combo / xdiv, its pre-scale 2^-k (exact)
+            int cn = perm[tl.y + n0];
+            float rs = xq_rs(xq, bpr, (size_t)(cn / *xdiv_p));
+            size_t c0 = (size_t)cn * rows;
+            y[c0 + w0 + g] = (s0 * gs) * rs; y[c0 + w0 + g + 8] = (s2 * gs) * rs;
         }
         if (n1 < tl.z) {
-            size_t c1 = (size_t)perm[tl.y + n1] * rows;
-            y[c1 + w0 + g] = s1 * gs; y[c1 + w0 + g + 8] = s3 * gs;
+            int cn = perm[tl.y + n1];
+            float rs = xq_rs(xq, bpr, (size_t)(cn / *xdiv_p));
+            size_t c1 = (size_t)cn * rows;
+            y[c1 + w0 + g] = (s1 * gs) * rs; y[c1 + w0 + g + 8] = (s3 * gs) * rs;
         }
     }
 }
@@ -3447,7 +3512,7 @@ extern "C" __global__ void silu_tiles(const float* __restrict__ h1, float* __res
     }
 }
 // per-combo activation quant (k=640) for the combos of tile group `group`:
-// grid (TG, 8), block 128 - same 3-level cascade as quant_x_fp4
+// grid (TG, 8), block 128 - same pre-scaled 3-level cascade as quant_x_fp4
 extern "C" __global__ void quant_tiles(const float* __restrict__ h2, unsigned char* __restrict__ xq,
                                        const int4* __restrict__ tiles, const int* __restrict__ n_tiles_p,
                                        const int* __restrict__ group_p, const int* __restrict__ tg_p,
@@ -3460,23 +3525,19 @@ extern "C" __global__ void quant_tiles(const float* __restrict__ h2, unsigned ch
     size_t c = (size_t)perm[tl.y + j];
     const int bpr = 10;
     const float* xp = h2 + c * 640;
-    unsigned char* op = xq + c * bpr * 108;
-    for (int sb = threadIdx.x; sb < bpr * 4; sb += blockDim.x) {
-        int b = sb >> 2, s = sb & 3;
-        const float* p = xp + b * 64 + s * 16;
-        float r0[16], r1[16];
-        quant_level(p, r0, op + b * 36 + s, op + b * 36 + 4 + s * 8);
-        quant_level(r0, r1, op + bpr * 36 + b * 36 + s, op + bpr * 36 + b * 36 + 4 + s * 8);
-        quant_level(r1, r0, op + 2 * bpr * 36 + b * 36 + s, op + 2 * bpr * 36 + b * 36 + 4 + s * 8);
-    }
+    unsigned char* op = xq + c * XQ_ROW(bpr);
+    quant_row_prescaled(xp, op, bpr); // whole-block early returns above are uniform
 }
 
 // ---------------- fused activation quant (CROW_QFUSE) ----------------
 // 16-lane groups quantize one 16-wide sub-block in place: producer kernels
 // (mix_streams, rmsnorm_gated, gate_mul, silu_mul640, silu_mul_combo) emit
 // the NVFP4 3-level cascade alongside their f32 output - one launch and one
-// HBM round trip less per projection. Bit-identical to quant_x_fp4 (same
-// amax -> ue4m3 ceiling -> RNE nibble -> residual math per element).
+// HBM round trip less per projection. Bit-identical to the UNSCALED cascade
+// (same amax -> ue4m3 ceiling -> RNE nibble -> residual math per element),
+// i.e. to quant_x_fp4 only for rows it pre-scales with k = 0: a fused
+// producer never sees its whole row, so it stores the factor 1.0 and keeps
+// the ue4m3 absolute floor. That is why CROW_QFUSE is opt-in (=1).
 // Caller guarantees whole warps active (all element counts are multiples
 // of 32 and block starts are multiples of 32).
 __device__ __forceinline__ void quant16_store(float x, int j, unsigned char* sc_base,
@@ -3515,8 +3576,9 @@ extern "C" __global__ void mix_streams_q(const float* __restrict__ mixw, const f
     float v = acc * 0.25f;
     out[t * 2560 + c] = v;
     const int bpr = 40;
-    unsigned char* row = xq + (size_t)t * bpr * 108;
+    unsigned char* row = xq + (size_t)t * XQ_ROW(bpr);
     qf_store(v, row, bpr, c);
+    if (c == 0) xq_set_rs(row, bpr, 1.0f); // unscaled row (fused producer)
 }
 extern "C" __global__ void rmsnorm_gated_q(const float* __restrict__ x, const float* __restrict__ z,
                                            const float* __restrict__ w, float* __restrict__ out,
@@ -3538,8 +3600,9 @@ extern "C" __global__ void rmsnorm_gated_q(const float* __restrict__ x, const fl
     out[((size_t)t * 48 + vhead) * 128 + d] = v;
     const int bpr = 96;
     int e = vhead * 128 + d;
-    unsigned char* row = xq + (size_t)t * bpr * 108;
+    unsigned char* row = xq + (size_t)t * XQ_ROW(bpr);
     qf_store(v, row, bpr, e);
+    if (e == 0) xq_set_rs(row, bpr, 1.0f); // unscaled row (fused producer)
 }
 extern "C" __global__ void gate_mul_q(const float* __restrict__ core, const float* __restrict__ gate,
                                       float* __restrict__ out, unsigned char* __restrict__ xq) {
@@ -3549,8 +3612,9 @@ extern "C" __global__ void gate_mul_q(const float* __restrict__ core, const floa
     out[i] = v;
     const int bpr = 96;
     int t = i / 6144, e = i % 6144;
-    unsigned char* row = xq + (size_t)t * bpr * 108;
+    unsigned char* row = xq + (size_t)t * XQ_ROW(bpr);
     qf_store(v, row, bpr, e);
+    if (e == 0) xq_set_rs(row, bpr, 1.0f); // unscaled row (fused producer)
 }
 extern "C" __global__ void silu_mul640_q(const float* __restrict__ h1, float* __restrict__ h2,
                                          unsigned char* __restrict__ xq) {
@@ -3561,8 +3625,9 @@ extern "C" __global__ void silu_mul640_q(const float* __restrict__ h1, float* __
     float v = (gate / (1.0f + expf(-gate))) * h1[t * 1280 + 640 + j];
     h2[t * 640 + j] = v;
     const int bpr = 10;
-    unsigned char* row = xq + (size_t)t * bpr * 108;
+    unsigned char* row = xq + (size_t)t * XQ_ROW(bpr);
     qf_store(v, row, bpr, j);
+    if (j == 0) xq_set_rs(row, bpr, 1.0f); // unscaled row (fused producer)
 }
 // ---------------- 19h (CROW_QFUSE=1): fused shared-expert decode launches ----------------
 // ONE launch replaces the TWO shared-expert gate|up gemv_fp4_mma_d launches AND
@@ -3611,7 +3676,7 @@ extern "C" __global__ void sh_gate_up_q(const unsigned char* __restrict__ wg,
         const unsigned char* w = (pass == 0) ? wg : wu;
         float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
         if (active) {
-            const unsigned char* xa = xq + (size_t)tok * bpr * 108;
+            const unsigned char* xa = xq + (size_t)tok * XQ_ROW(bpr);
             const unsigned char* rowg = w + (size_t)min(r0, rows - 1) * bpr * 36;
             const unsigned char* rowg8 = w + (size_t)min(r1, rows - 1) * bpr * 36;
             const unsigned char* sfrow = (lt & 1) ? rowg8 : rowg;
@@ -3649,8 +3714,9 @@ extern "C" __global__ void sh_gate_up_q(const unsigned char* __restrict__ wg,
             float s0 = 0.0f, s2 = 0.0f;
             for (int i = 0; i < ks_n; i++) { s0 += red[i][0][(rg << 4) + g]; s2 += red[i][1][(rg << 4) + g]; }
             float gs = ((pass == 0) ? gsg_ptr : gsu_ptr)[0];
-            if (pass == 0) { sg0 = s0 * gs; sg2 = s2 * gs; }
-            else           { su0 = s0 * gs; su2 = s2 * gs; }
+            float rs = xq_rs(xq, bpr, (size_t)tok); // the input row's pre-scale 2^-k (exact)
+            if (pass == 0) { sg0 = (s0 * gs) * rs; sg2 = (s2 * gs) * rs; }
+            else           { su0 = (s0 * gs) * rs; su2 = (s2 * gs) * rs; }
         }
         __syncthreads(); // the red slots are rewritten by the next pass
     }
@@ -3666,8 +3732,9 @@ extern "C" __global__ void sh_gate_up_q(const unsigned char* __restrict__ wg,
             float v = (gate / (1.0f + expf(-gate))) * su_sh[j - tile];
             h2[(size_t)tok * 640 + j] = v;
             const int bprq = 10;
-            unsigned char* row = xq_s + (size_t)tok * bprq * 108;
+            unsigned char* row = xq_s + (size_t)tok * XQ_ROW(bprq);
             qf_store(v, row, bprq, j);
+            if (j == 0) xq_set_rs(row, bprq, 1.0f); // unscaled row (fused producer)
         }
     }
 }
@@ -3701,7 +3768,7 @@ extern "C" __global__ void gemv_fp4_mma_dg(const unsigned char* __restrict__ w,
     float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
     int r0 = w0 + g, r1 = w0 + g + 8;
     if (active) {
-        const unsigned char* xa = xq + (size_t)tok * bpr * 108;
+        const unsigned char* xa = xq + (size_t)tok * XQ_ROW(bpr);
         const unsigned char* rowg = w + (size_t)min(r0, rows - 1) * bpr * 36;
         const unsigned char* rowg8 = w + (size_t)min(r1, rows - 1) * bpr * 36;
         const unsigned char* sfrow = (lt & 1) ? rowg8 : rowg;
@@ -3741,8 +3808,9 @@ extern "C" __global__ void gemv_fp4_mma_dg(const unsigned char* __restrict__ w,
         float s0 = 0.0f, s2 = 0.0f;
         for (int i = 0; i < ks_n; i++) { s0 += red[i][0][(rg << 4) + g]; s2 += red[i][1][(rg << 4) + g]; }
         float sig = 1.0f / (1.0f + expf(-sgv[tok]));   // gate_shared epilogue, ASSIGN
-        if (r0 < rows) y[(size_t)tok * ys + r0] = sig * (s0 * gs);
-        if (r1 < rows) y[(size_t)tok * ys + r1] = sig * (s2 * gs);
+        float rs = xq_rs(xq, bpr, (size_t)tok); // the row's pre-scale 2^-k (exact)
+        if (r0 < rows) y[(size_t)tok * ys + r0] = sig * ((s0 * gs) * rs);
+        if (r1 < rows) y[(size_t)tok * ys + r1] = sig * ((s2 * gs) * rs);
     }
 }
 
@@ -3756,8 +3824,9 @@ extern "C" __global__ void silu_mul_combo_q(const float* __restrict__ h1, float*
     float v = (gate / (1.0f + expf(-gate))) * h1[(size_t)c * 1280 + 640 + j];
     h2[i] = v;
     const int bpr = 10;
-    unsigned char* row = xq + (size_t)c * bpr * 108;
+    unsigned char* row = xq + (size_t)c * XQ_ROW(bpr);
     qf_store(v, row, bpr, j);
+    if (j == 0) xq_set_rs(row, bpr, 1.0f); // unscaled row (fused producer)
 }
 
 // ---------------- decode attention that does not scale with the context ----------------
@@ -5028,6 +5097,133 @@ pub unsafe fn launch_v(
     }
 }
 
+/// Host twins of the NVFP4 activation cascade (quant_x_fp4 / quant_tiles and
+/// the helpers they call), expression for expression, for the lib tests and
+/// the mma_gate byte-exact check. Row layout: three levels of bpr 36-byte
+/// blocks, then the f32 pre-scale factor 2^-k (`xq_row_bytes`).
+pub mod act_cascade {
+    use crate::cnq;
+
+    /// bytes of one quantized activation row: 3 levels * bpr * 36 + the f32 factor
+    pub const fn xq_row_bytes(bpr: usize) -> usize {
+        bpr * 108 + 4
+    }
+
+    /// twin of `q_e2m1` (RNE ties-to-even onto {0,.5,1,1.5,2,3,4,6})
+    pub fn q_e2m1(v: f32) -> u32 {
+        let s = if v < 0.0 { 8u32 } else { 0 };
+        let r = v.abs();
+        if r <= 0.25 { s }
+        else if r < 0.75 { s | 1 }
+        else if r <= 1.25 { s | 2 }
+        else if r < 1.75 { s | 3 }
+        else if r <= 2.5 { s | 4 }
+        else if r < 3.5 { s | 5 }
+        else if r <= 5.0 { s | 6 }
+        else { s | 7 }
+    }
+
+    /// twin of `enc_ue4m3_up`: ldexpf(1, 10 - e) is the exact 2^(10-e)
+    pub fn enc_ue4m3_up(s: f32) -> u8 {
+        if !(s > 0.0) { return 0; }
+        for e in 0..16i32 {
+            let mul = if e == 0 { 512.0f32 } else { 2.0f32.powi(10 - e) };
+            let m = (s * mul).ceil() - if e == 0 { 0.0 } else { 8.0 };
+            let m_max = if e == 15 { 6.0 } else { 7.0 };
+            if m >= 0.0 && m <= m_max { return ((e << 3) | m as i32) as u8; }
+        }
+        0x7E
+    }
+
+    /// twin of `row_prescale_k`: frexp exponent from the bits, k = 11 - e
+    /// clamped to [-64, 64]; zero / NaN / inf rows get k = 0
+    pub fn row_prescale_k(amax: f32) -> i32 {
+        if !(amax > 0.0) || !(amax <= f32::MAX) { return 0; }
+        let bits = amax.to_bits();
+        let ef = ((bits >> 23) & 0xFF) as i32;
+        let e = if ef != 0 { ef - 126 } else { (31 - (bits & 0x7F_FFFF).leading_zeros() as i32) - 148 };
+        (11 - e).clamp(-64, 64)
+    }
+
+    /// twin of `quant_level`: one 16-wide sub-block, returns the residual
+    fn quant_level(p: &[f32; 16], out: &mut [u8], base: usize, s: usize) -> [f32; 16] {
+        let amax = p.iter().fold(0f32, |a, &v| a.max(v.abs()));
+        let sc = enc_ue4m3_up(amax * (1.0f32 / 6.0f32));
+        let inv = 1.0f32 / cnq::ue4m3(sc as u32);
+        let scf = cnq::ue4m3(sc as u32);
+        out[base + s] = sc;
+        let mut r = [0f32; 16];
+        for j in 0..8usize {
+            let n0 = q_e2m1(p[2 * j] * inv);
+            let n1 = q_e2m1(p[2 * j + 1] * inv);
+            out[base + 4 + s * 8 + j] = (n0 | (n1 << 4)) as u8;
+            r[2 * j] = p[2 * j] - cnq::e2m1(n0) * scf;
+            r[2 * j + 1] = p[2 * j + 1] - cnq::e2m1(n1) * scf;
+        }
+        r
+    }
+
+    /// twin of `quant_row_prescaled` (prescale = true) — or of the unscaled
+    /// cascade the fused CROW_QFUSE producers emit (prescale = false, factor 1.0)
+    pub fn quant_row_with(x: &[f32], k_dim: usize, prescale: bool) -> Vec<u8> {
+        let bpr = k_dim / 64;
+        let mut out = vec![0u8; xq_row_bytes(bpr)];
+        let amax = x[..k_dim].iter().fold(0f32, |a, &v| a.max(v.abs()));
+        let k = if prescale { row_prescale_k(amax) } else { 0 };
+        let up = 2.0f32.powi(k);
+        for b in 0..bpr {
+            for s in 0..4usize {
+                let mut src = [0f32; 16];
+                for j in 0..16 { src[j] = x[b * 64 + s * 16 + j] * up; }
+                for lv in 0..3usize {
+                    src = quant_level(&src, &mut out, lv * bpr * 36 + b * 36, s);
+                }
+            }
+        }
+        out[bpr * 108..].copy_from_slice(&2.0f32.powi(-k).to_le_bytes());
+        out
+    }
+
+    /// twin of quant_x_fp4 (the pre-scaled whole-row cascade)
+    pub fn quant_row(x: &[f32], k_dim: usize) -> Vec<u8> {
+        quant_row_with(x, k_dim, true)
+    }
+
+    /// the row's factor 2^-k
+    pub fn row_factor(q: &[u8], k_dim: usize) -> f32 {
+        let o = (k_dim / 64) * 108;
+        f32::from_le_bytes([q[o], q[o + 1], q[o + 2], q[o + 3]])
+    }
+
+    /// dequantize one level (bpr 36-byte blocks), scale bytes and nibbles only
+    pub fn dequant_level(q: &[u8], k_dim: usize) -> Vec<f32> {
+        let bpr = k_dim / 64;
+        let mut out = vec![0f32; k_dim];
+        for b in 0..bpr {
+            let blk = &q[b * 36..b * 36 + 36];
+            for idx in 0..64usize {
+                let byte = blk[4 + (idx >> 1)] as u32;
+                let nib = if idx & 1 == 1 { byte >> 4 } else { byte & 0xF };
+                out[b * 64 + idx] = cnq::e2m1(nib) * cnq::ue4m3(blk[idx >> 4] as u32);
+            }
+        }
+        out
+    }
+
+    /// the value the MMA consumers see: (sum of the three levels) * 2^-k
+    pub fn dequant_row(q: &[u8], k_dim: usize) -> Vec<f32> {
+        let bpr = k_dim / 64;
+        let mut out = dequant_level(&q[..bpr * 36], k_dim);
+        for lv in 1..3usize {
+            let l = dequant_level(&q[lv * bpr * 36..(lv + 1) * bpr * 36], k_dim);
+            for (o, v) in out.iter_mut().zip(l.iter()) { *o += v; }
+        }
+        let f = row_factor(q, k_dim);
+        for o in out.iter_mut() { *o *= f; }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests_96 {
     //! #96: the kernel-source gate. NVRTC is a HOST-side compiler: this parses
@@ -5082,22 +5278,13 @@ mod tests_96 {
 
 #[cfg(test)]
 mod tests_ue4m3_enc {
-    //! Host twin of the CUDA `enc_ue4m3_up` (the activation-quant scale
-    //! encoder of #10), mirrored expression by expression: ldexpf(1, 10 - e)
-    //! is the exact power of two 2^(10-e), ceilf is f32::ceil. The source
-    //! check pins the twin to the kernel text so the two cannot drift.
+    //! The CUDA `enc_ue4m3_up` (the activation-quant scale encoder of #10)
+    //! through its host twin `act_cascade::enc_ue4m3_up`, mirrored expression
+    //! by expression: ldexpf(1, 10 - e) is the exact power of two 2^(10-e),
+    //! ceilf is f32::ceil. The source check pins the twin to the kernel text
+    //! so the two cannot drift.
+    use super::act_cascade::enc_ue4m3_up;
     use super::KERNEL_SRC;
-
-    fn enc_ue4m3_up(s: f32) -> u8 {
-        if !(s > 0.0) { return 0; }
-        for e in 0..16i32 {
-            let mul = if e == 0 { 512.0f32 } else { 2.0f32.powi(10 - e) };
-            let m = (s * mul).ceil() - if e == 0 { 0.0 } else { 8.0 };
-            let m_max = if e == 15 { 6.0 } else { 7.0 };
-            if m >= 0.0 && m <= m_max { return ((e << 3) | m as i32) as u8; }
-        }
-        0x7E
-    }
 
     #[test]
     fn the_twin_matches_the_kernel_text() {
@@ -5130,5 +5317,170 @@ mod tests_ue4m3_enc {
         assert_eq!(enc_ue4m3_up(420.0), (15 << 3) | 6);
         assert_eq!(enc_ue4m3_up(1.0), 7 << 3);
         assert_eq!(enc_ue4m3_up(0.0), 0);
+    }
+}
+
+#[cfg(test)]
+mod tests_act_prescale {
+    //! The per-row power-of-two activation pre-scale (the ue4m3 floor fix):
+    //! the host twin of the cascade shows the floor and its removal, k is
+    //! pinned to the kernel text, and every FP4 MMA epilogue is checked to
+    //! multiply the row factor in.
+    use super::act_cascade::*;
+    use super::KERNEL_SRC;
+    use crate::sample::Rng;
+
+    fn gauss(rng: &mut Rng) -> f32 {
+        let u1 = rng.next_f64().max(1e-300);
+        let u2 = rng.next_f64();
+        ((-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()) as f32
+    }
+
+    /// mean relative L2 error of the dequantized cascade over `n` rows of
+    /// k = 640 (the h2 row width) with N(0, sigma) entries
+    fn mean_rel_err(sigma: f32, prescale: bool, n: usize, seed: u64) -> f64 {
+        let k_dim = 640;
+        let mut rng = Rng::new(seed);
+        let mut acc = 0f64;
+        for _ in 0..n {
+            let x: Vec<f32> = (0..k_dim).map(|_| gauss(&mut rng) * sigma).collect();
+            let q = quant_row_with(&x, k_dim, prescale);
+            let d = dequant_row(&q, k_dim);
+            let (mut e2, mut x2) = (0f64, 0f64);
+            for (a, b) in d.iter().zip(x.iter()) {
+                e2 += ((a - b) as f64).powi(2);
+                x2 += (*b as f64).powi(2);
+            }
+            acc += (e2 / x2).sqrt();
+        }
+        acc / n as f64
+    }
+
+    #[test]
+    fn the_prescale_removes_the_absolute_floor() {
+        let sigmas = [3.0f32, 0.4, 0.04, 0.004, 0.0012, 1e-4];
+        let mut table = Vec::new();
+        for (i, &sg) in sigmas.iter().enumerate() {
+            let off = mean_rel_err(sg, false, 64, 0xF100 + i as u64);
+            let on = mean_rel_err(sg, true, 64, 0xF100 + i as u64);
+            println!("sigma {sg:>8}: mean rel err unscaled {off:.3e}  pre-scaled {on:.3e}");
+            table.push((sg, off, on));
+        }
+        let reference = table[1].2; // sigma 0.4, pre-scaled
+        for &(sg, off, on) in &table {
+            // pre-scaled: scale-invariant, every sigma at the sigma >= 0.4 level
+            assert!(on < 2e-3, "sigma {sg}: pre-scaled rel err {on:.3e}");
+            assert!(on < 1.5 * reference && on > reference / 1.5,
+                    "sigma {sg}: pre-scaled {on:.3e} vs sigma-0.4 level {reference:.3e}");
+            // never worse than the unscaled cascade (small tolerance for the
+            // RNE lattice landing differently at large sigma)
+            assert!(on <= off * 1.25, "sigma {sg}: pre-scale made it worse ({on:.3e} > {off:.3e})");
+        }
+        // the floor the fix removes: unscaled small rows are percent-level
+        let off_004 = table[3].1;
+        let off_0012 = table[4].1;
+        assert!(off_004 > 3e-2, "unscaled sigma 0.004 should sit on the floor: {off_004:.3e}");
+        assert!(off_0012 > 1e-1, "unscaled sigma 0.0012 should sit on the floor: {off_0012:.3e}");
+    }
+
+    #[test]
+    fn k_matches_its_definition_and_the_kernel_text() {
+        // the kernel spelling the twin mirrors
+        for line in [
+            "if (!(amax > 0.0f) || !(amax <= 3.402823466e38f)) return 0;",
+            "int ef = (int)((bits >> 23) & 0xFFu);",
+            "int e = ef ? ef - 126 : (31 - __clz((int)(bits & 0x7FFFFFu))) - 148;",
+            "return max(-64, min(64, 11 - e));",
+            "float up = ldexpf(1.0f, k);",
+            "for (int j = 0; j < 16; j++) xs[j] = p[j] * up;",
+            "if (threadIdx.x == 0) xq_set_rs(op, bpr, ldexpf(1.0f, -k));",
+        ] {
+            assert!(KERNEL_SRC.contains(line), "kernel text drifted: {line}");
+        }
+        assert_eq!(row_prescale_k(0.0), 0);
+        assert_eq!(row_prescale_k(f32::NAN), 0);
+        assert_eq!(row_prescale_k(f32::INFINITY), 0);
+        assert_eq!(row_prescale_k(1.0), 10);   // 1 * 2^10 = 1024
+        assert_eq!(row_prescale_k(2047.0), 0); // unscaled rows stay unscaled
+        assert_eq!(row_prescale_k(2048.0), -1);
+        // geometric sweep incl. subnormals: amax * 2^k in [1024, 2048)
+        // whenever unclamped, and k agrees with the f64 frexp exponent
+        let mut af = f32::from_bits(1) as f64;
+        while af < 1e30 {
+            let a = af as f32;
+            af *= 1.37;
+            let k = row_prescale_k(a);
+            let e = (a as f64).log2().floor() as i32 + 1;
+            assert_eq!(k, (11 - e).clamp(-64, 64), "amax {a:e}");
+            if (-64..=64).contains(&(11 - e)) {
+                let v = a as f64 * 2f64.powi(k);
+                assert!((1024.0..2048.0).contains(&v), "amax {a:e}: {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn k_zero_rows_reproduce_the_unscaled_cascade_bit_for_bit() {
+        let k_dim = 640;
+        let mut rng = Rng::new(0xC0DE);
+        // amax in [1024, 2048): k = 0, factor 1.0
+        let mut x: Vec<f32> = (0..k_dim).map(|_| gauss(&mut rng) * 300.0).collect();
+        x[17] = 1500.0;
+        assert_eq!(row_prescale_k(x.iter().fold(0f32, |a, &v| a.max(v.abs()))), 0);
+        assert_eq!(quant_row_with(&x, k_dim, true), quant_row_with(&x, k_dim, false));
+        assert_eq!(row_factor(&quant_row(&x, k_dim), k_dim), 1.0);
+        // a zero row: k = 0, all-zero values, factor 1.0
+        let z = vec![0f32; k_dim];
+        assert_eq!(quant_row(&z, k_dim), quant_row_with(&z, k_dim, false));
+        assert!(dequant_row(&quant_row(&z, k_dim), k_dim).iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn the_rescale_is_exact_power_of_two_arithmetic() {
+        // scaling a row by 2^j moves k by -j and leaves the level bytes
+        // unchanged, so the dequantized row scales EXACTLY by 2^j
+        let k_dim = 640;
+        let mut rng = Rng::new(0xBEEF);
+        let x: Vec<f32> = (0..k_dim).map(|_| gauss(&mut rng) * 0.01).collect();
+        let q0 = quant_row(&x, k_dim);
+        let d0 = dequant_row(&q0, k_dim);
+        for j in [-20i32, -3, 5, 17] {
+            let xs: Vec<f32> = x.iter().map(|&v| v * 2f32.powi(j)).collect();
+            let q = quant_row(&xs, k_dim);
+            assert_eq!(q[..k_dim / 64 * 108], q0[..k_dim / 64 * 108], "level bytes, j = {j}");
+            let d = dequant_row(&q, k_dim);
+            for (a, b) in d.iter().zip(d0.iter()) {
+                assert_eq!(*a, *b * 2f32.powi(j), "j = {j}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_fp4_mma_consumer_multiplies_the_row_factor() {
+        // the body of each kernel that reads quantized activations must load
+        // xq_rs and store (acc * gs) * rs; the fused producers store 1.0
+        fn body<'a>(src: &'a str, name: &str) -> &'a str {
+            let start = src.find(&format!("void {name}(")).unwrap_or_else(|| panic!("no kernel {name}"));
+            let end = src[start..].find("\n}\n").map(|e| start + e).unwrap();
+            &src[start..end]
+        }
+        for k in ["gemv_fp4_mma", "gemv_fp4_mma_d", "gemv_fp4_mma_dg", "gemv_fp4_mma_g",
+                  "gemv_fp4_mma_d32", "gemv_fp4_mma_g32", "gemm_fp4_dense", "gemm_fp4_dense_b",
+                  "gemm_fp4_tiles", "sh_gate_up_q"] {
+            let b = body(KERNEL_SRC, k);
+            assert!(b.contains("xq_rs(xq, bpr,"), "{k} must read the row factor");
+            assert!(b.contains("* gs) * rs"), "{k} must fold the row factor into the store");
+            assert!(!b.contains("* bpr * 108"), "{k} must use the XQ_ROW stride");
+        }
+        for k in ["mix_streams_q", "rmsnorm_gated_q", "gate_mul_q", "silu_mul640_q",
+                  "silu_mul_combo_q", "sh_gate_up_q"] {
+            assert!(body(KERNEL_SRC, k).contains(", 1.0f); // unscaled row (fused producer)"), "{k}");
+        }
+        for k in ["quant_x_fp4", "quant_tiles"] {
+            assert!(body(KERNEL_SRC, k).contains("quant_row_prescaled("), "{k}");
+        }
+        // no kernel outside these reads xq rows (the stride literal is gone)
+        assert!(!KERNEL_SRC.contains("* bpr * 108"));
+        assert!(!KERNEL_SRC.contains("* bprq * 108"));
     }
 }

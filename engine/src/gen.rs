@@ -10,7 +10,7 @@
 
 use crate::cuda::{self, CUdeviceptr as Dev};
 use crate::geo::*;
-use crate::kernels::{launch_v, Kernels};
+use crate::kernels::{act_cascade::xq_row_bytes, launch_v, Kernels};
 use crate::weights::{dequant_fp4_dev, load_bf16_twin, load_f32, load_fp4, load_small_f32, Fp4};
 use crate::manager::ThreeStates;
 use crate::residency::{Residency, PendingSwap, EMPTY};
@@ -319,12 +319,14 @@ pub struct Scratch {
     pub h1: Dev,       // [C*10][1280]
     pub h2: Dev,       // [C*10][640]
     pub eo: Dev,       // [C*10][2560]
-    pub xq_gu: Dev,    // [C][3*40*36] MMA quantized MoE input (per token, 3 levels)
-    pub xq_dn: Dev,    // [C*10][3*10*36] MMA quantized silu·up (per combo, 3 levels)
-    pub xq_m: Dev,     // [C][3*40*36] quantized mixed rows k2560 (GDN qkv/z/b/a, attn v/iqk)
-    pub xq_v: Dev,     // [C][3*96*36] quantized 6144 rows (GDN out, attn o)
-    pub xq_s: Dev,     // [C][3*10*36] quantized 640 rows (shared down input sh2)
-    pub xq_e: Dev,     // [C][3*40*36] quantized PLE embed rows k2560
+    // quantized activation rows are xq_row_bytes(bpr) = 3*bpr*36 + 4 bytes:
+    // three cascade levels, then the row's f32 pre-scale factor 2^-k
+    pub xq_gu: Dev,    // [C][3*40*36+4] MMA quantized MoE input (per token, 3 levels)
+    pub xq_dn: Dev,    // [C*10][3*10*36+4] MMA quantized silu·up (per combo, 3 levels)
+    pub xq_m: Dev,     // [C][3*40*36+4] quantized mixed rows k2560 (GDN qkv/z/b/a, attn v/iqk)
+    pub xq_v: Dev,     // [C][3*96*36+4] quantized 6144 rows (GDN out, attn o)
+    pub xq_s: Dev,     // [C][3*10*36+4] quantized 640 rows (shared down input sh2)
+    pub xq_e: Dev,     // [C][3*40*36+4] quantized PLE embed rows k2560
     pub sdown: Dev,    // [C][2560]
     pub sh12: Dev,     // [C][1280] shared-expert gate|up (p13 layout)
     pub sh2: Dev,      // [C][640]
@@ -1153,14 +1155,14 @@ impl Engine {
         // #19f, 2026-09-13: ONE line per engine process names the hyper-
         // connection decode chain form, next to the [gdn] line and for the
         // same reason: every future log says which hc chain produced it.
-        // CROW_QFUSE is the SAME switch as the NVFP4 cascade above: default
-        // on since 19g (unset = cascade on + chain fused); the value "0"
-        // turns BOTH off (the unfused fallback of record; bit-identical, so
-        // the ids and logits cannot move; only the launch shape does).
+        // CROW_QFUSE is the SAME switch as the NVFP4 cascade above: opt-in
+        // (exact "1") since the activation-floor fix of 2026-09-23 (unset =
+        // pre-scaled quant_x_fp4 launches + unfused chains; "1" = all fused,
+        // the fused producers keep the unscaled ue4m3 floor).
         let hcf = env_or_unset("CROW_QFUSE");
-        println!("[hc] hyper-connection decode chain {}, shared-expert chain {}, CROW_QFUSE {} (1 = 19f fused hc + 19h fused shared, 0 = all off)",
-            if hc_fuse_on() { "fused (default since 19g, 4 launches per hc block)" } else { "unfused (fallback of record, 8 launches)" },
-            if sh_fuse_on() { "fused (19h, 3 launches)" } else { "unfused (0 = fallback, 6 launches)" }, hcf);
+        println!("[hc] hyper-connection decode chain {}, shared-expert chain {}, CROW_QFUSE {} (1 = 19f fused hc + 19h fused shared + fused unscaled cascade, unset = all off)",
+            if hc_fuse_on() { "fused (19f opt-in, 4 launches per hc block)" } else { "unfused (default since the activation-floor fix, 8 launches)" },
+            if sh_fuse_on() { "fused (19h opt-in, 3 launches)" } else { "unfused (default, 6 launches)" }, hcf);
         // #10c, 2026-09-14: ONE line per engine process names the prefill
         // dense GEMM form, next to the [hc] line and for the same reason:
         // every future log says which dense form produced it. It sits in the
@@ -1746,12 +1748,18 @@ fn qsa_fast_on() -> bool { env_flag!("CROW_QSA_FAST", on) }
 fn bf16_w_on() -> bool { env_flag!("CROW_BF16_W", on) }
 fn inj_1k_on() -> bool { env_flag!("CROW_INJ_1K", on) }
 
-/// CROW_QFUSE (default on): producers emit the NVFP4 activation cascade
-/// themselves (no separate quant_x_fp4 launch). Bit-identical.
-fn qfuse_on() -> bool { env_flag!("CROW_QFUSE", on) }
-/// CROW_QFUSE hc-fusion meaning, DEFAULT ON SINCE #19g, 2026-09-13 (unset
-/// and any value but `0` run the fusion; `0` selects the unfused 8-launch
-/// fallback of record): the hc_run decode chain fuses silu_div4 / sigmoid_el
+/// CROW_QFUSE, OPT-IN (exact `1`) SINCE THE ACTIVATION-FLOOR FIX, 2026-09-23:
+/// producers emit the NVFP4 activation cascade themselves (no separate
+/// quant_x_fp4 launch). A fused producer never sees its whole row, so it
+/// cannot take the per-row power-of-two pre-scale and stores the factor 1.0:
+/// `1` keeps the old ue4m3 absolute floor (~4.9e-4 per element, e.g. sigma
+/// 0.004 rows at ~7 percent relative error). Unset or any other value runs
+/// the pre-scaled whole-row quantizers (quant_x_fp4 / quant_tiles).
+fn qfuse_on() -> bool { env_flag!("CROW_QFUSE", exact1) }
+/// CROW_QFUSE hc-fusion meaning, default on from #19g (2026-09-13) until the
+/// activation-floor fix (2026-09-23), now OPT-IN with the rest of the switch
+/// (exact `1` runs the fusion; unset / any other value selects the unfused
+/// 8-launch chain): the hc_run decode chain fuses silu_div4 / sigmoid_el
 /// / sig2_div4 into the neighbouring GEMV epilogues and merges the 4-row
 /// inject GEMV (gemv_fp4_b1k) into the down GEMV launch (hc_down_inj, the
 /// b1k 1024-slot reduce emulated bit for bit on 256 threads; gemv_bf16_ws
@@ -1766,7 +1774,7 @@ fn qfuse_on() -> bool { env_flag!("CROW_QFUSE", on) }
 /// construction. DEFAULT BASIS (#19g): the 19f pairs (-0.9806 ms per token,
 /// 3 of 3 pairs, decode_out/srv-19f.log) plus the combined 19g parity pass
 /// over both levers at once (decode_out/srv-19g.log).
-fn hc_fuse_on() -> bool { env_flag!("CROW_QFUSE", on) }
+fn hc_fuse_on() -> bool { env_flag!("CROW_QFUSE", exact1) }
 /// #62b CROW_GDN_FUSE_IN, DEFAULT ON SINCE #19g, 2026-09-13 (unset and any
 /// value but `0` run the grouped form; `0` selects the four per-slab
 /// gemv_fp4_mma_d launches, the fallback of record): one grouped dense-FP4
@@ -1817,7 +1825,9 @@ fn gdn_split_z_on() -> bool { env_flag!("CROW_GDN_SPLIT_Z", exact1) }
 /// env name, check_env_docs 74 = 74). 6 -> 3 launches per layer, decode
 /// t < 8 and the mma/dense path only: prefill (gemm_fp4_dense) and the
 /// gemv_fp4_bs fallback keep the separate launches verbatim.
-fn sh_fuse_on() -> bool { env_flag!("CROW_QFUSE", on) }
+/// Opt-in (exact `1`) again since the activation-floor fix, 2026-09-23: the
+/// fused silu epilogue quantizes sh2 without the per-row pre-scale.
+fn sh_fuse_on() -> bool { env_flag!("CROW_QFUSE", exact1) }
 
 /// CROW_ATTN_SPLIT (default on): decode attention as S=8 partials + merge,
 /// QSA scores warp-per-block (both graph-static; cost no longer grows
@@ -2093,9 +2103,9 @@ impl Scratch {
             ("mixed", 4 * c * H),
             ("mixed_m", 4 * c * H),
             ("moe_out", 4 * c * H),
-            ("xq_m", c * 3 * (H / 64) * 36),
-            ("xq_gu", c * 3 * (H / 64) * 36),
-            ("xq_v", c * 3 * (GDN_VAL / 64) * 36),
+            ("xq_m", c * xq_row_bytes(H / 64)),
+            ("xq_gu", c * xq_row_bytes(H / 64)),
+            ("xq_v", c * xq_row_bytes(GDN_VAL / 64)),
             ("injr", 4 * c * HCN),
             ("injw", 4 * c * HCN),
             ("mixed_final", 4 * c * H),
@@ -2155,14 +2165,14 @@ impl Scratch {
             ("ple_gn", 4 * c * HCT),
             ("ple_out", 4 * c * HCT),
             ("ple_slots", c * PLE_NHEADS * 4),
-            ("xq_e", c * 3 * (H / 64) * 36),
+            ("xq_e", c * xq_row_bytes(H / 64)),
         ];
         let moe_set: &[(&str, usize)] = &[
             ("h1", 4 * c * TOPK * 2 * INTER),
             ("h2", 4 * c * TOPK * INTER),
             ("eo", 4 * c * TOPK * H),
-            ("xq_dn", c * TOPK * 3 * (INTER / 64) * 36),
-            ("xq_s", c * 3 * (INTER / 64) * 36),
+            ("xq_dn", c * TOPK * xq_row_bytes(INTER / 64)),
+            ("xq_s", c * xq_row_bytes(INTER / 64)),
             ("sh12", 4 * c * 2 * INTER),
             ("sh2", 4 * c * INTER),
             ("sdown", 4 * c * H),
@@ -2265,7 +2275,7 @@ impl Engine {
         let p = &self.p;
         let s = &self.s;
         launch_v(k.f("rms_group"), 4, t as u32, 1, 256, &[x as u64, w.norm as u64, s.normed as u64]);
-        // #19f, default on since 19g (CROW_QFUSE != "0"): decode regime
+        // #19f, opt-in (CROW_QFUSE=1; default on 19g..2026-09-23): decode regime
         // (t < 8) fuses the
         // elementwise hc chain into the GEMV epilogues - hc_down_inj carries
         // down + silu_div4 + the 4-row inject GEMV + sig2_div4 in ONE launch
@@ -3647,15 +3657,15 @@ impl Engine {
     /// `hc_run`, and since #19g `hc_run`'s LAST launch is `mix_streams_q`, which
     /// writes `mixed` AND the NVFP4 activation cascade `xq_m` that every FP4
     /// projection of the sub-block reads (v, the QSA indexer qk — `attn_prompt`
-    /// itself only quantizes when CROW_QFUSE=0, exactly because the fused
-    /// producer is the default). Without this launch `xq_m` stayed all-zero on
+    /// itself quantizes unless CROW_QFUSE=1; from #19g to 2026-09-23 the fused
+    /// producer was the default). Without this launch `xq_m` stayed all-zero on
     /// the run of record, so v and qk came out zero, attention had nothing to
     /// weight and the o_proj output was IDENTICALLY zero at max_abs = max|golden|
     /// — a debug path reporting a number that says nothing. `quant_x_fp4` is the
-    /// documented bit-identical twin of the cascade `mix_streams_q` fuses (same
-    /// amax → ue4m3 ceiling → RNE nibble → residual per 16-wide sub-block), and
-    /// it is the launch `attn_prompt` makes itself when the fusion is off, so
-    /// the sub-block is fed what the production path feeds it either way.
+    /// launch `attn_prompt` makes itself when the fusion is off (the default
+    /// since the activation-floor fix of 2026-09-23; it adds the per-row
+    /// power-of-two pre-scale the fused `mix_streams_q` cannot), so the
+    /// sub-block is fed what the default production path feeds it.
     pub unsafe fn run_attn_subblock(&mut self, l: usize, x_host: &[f32], t: usize, pos_base: usize) -> Vec<f32> {
         assert!(is_attn(l), "layer {l} is not an attention layer");
         assert_eq!(x_host.len(), t * H, "attn subblock input must be [T][H]");
