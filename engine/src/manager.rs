@@ -179,12 +179,13 @@ pub fn derive_host_pinned_budget(cap: u64, log: &mut dyn FnMut(&str)) -> u64 {
             }
         }
     };
-    // #15 follow-up: the driver's pinned pool counts as free only while we are the
-    // only CUDA process; with another one alive the figure IS MemAvailable
-    let basis_ram = if ram.other_cuda { " (another CUDA process is alive: using MemAvailable)" } else { "" };
+    // #103: the driver's page pool counts as free (it is reclaimable), the
+    // driver memory live processes still map does not - whether or not another CUDA
+    // process is alive (the old MemAvailable fallback refused boots next to a pool)
+    let other = if ram.other_cuda { ", another CUDA process is alive" } else { "" };
     log(&format!(
-        "[budget] host pinned budget {:.2} GiB ({basis}); free for pinning {:.2} GiB{basis_ram}, MemAvailable {:.2} GiB, cap {:.2} GiB",
-        gib(budget), gib(free_for_pin), gib(mem_available), gib(cap)
+        "[budget] host pinned budget {:.2} GiB ({basis}); free for pinning {:.2} GiB, MemAvailable {:.2} GiB, cap {:.2} GiB; NVIDIA driver pages {:.2} GiB of which {:.2} GiB mapped by live processes (subtracted){other}",
+        gib(budget), gib(free_for_pin), gib(mem_available), gib(cap), gib(ram.driver_held), gib(ram.driver_live)
     ));
     budget
 }
