@@ -12,6 +12,8 @@ No engine code was changed; probes listed in §3 were added as new `engine/src/b
 
 **Verdict summary: 17 MATCH / 0 MISMATCH / 3 UNVERIFIABLE** (tie-break order vs `torch.topk`; GGUF-side +1 weight fold; RoPE table bit-provenance). Details and severities below. Every pinned constant checked against `config.json` agrees (see §4).
 
+> **Scope note, 2026-09-23 (#91).** This diff compared FORMULAS on the GDN / QSA / dense path, and its verdict stands for those formulas. It did not cover the NVFP4 activation encoding or how rows are READ from the container. Two engine defects outside that scope were found on 2026-09-23 and are fixed on branch `release-2026-09-23`: the ue4m3 activation floor (`488a840`, with the encoder NaN fix `5c6891a`) and the PLE row-offset read (`85a48e7`). See §7. "0 MISMATCH" therefore does not mean "the engine computes what the model should compute".
+
 ---
 
 ## 1. Diff table
@@ -152,6 +154,91 @@ Found by `qsa_tie_probe` case "dense ncb400" on 2026-09-20: `sel_n = 3` instead 
 
 ## 6. Conclusion for the acceptance metric
 
-The #89 hypothesis — a wrong-formula constant or op in GDN normalization or QSA attention ("the engine numerics suspect of expert-requant.md §8") — is **acquitted on every line compared**: no MISMATCH was found, including the exact bug class of llama.cpp #28068 (crow-nest's `l2norm_repeat` was already the rsqrt form). Measured floors so far: the prefill-vs-decode QSA attention divergence is ≤ 1.1e-6 rel_L2 at the full sparse list length (P4), two orders below the 1e-5 line and three below the layer-3 residual; the engine-side QSA tie-break is deterministic lowest-index across all three selectors (P1). The remaining open risk is (a) the tie-break order vs `torch.topk` at exact score ties in the sparse regime (U1/P1b, untestable by the current dense-regime oracle rows), (b) the recurrent-vs-chunked GDN prefill numerics class (P2, planned), and (c) generic f32-order noise. If the layer-3 attention residual (2.9% rel_L2) does not move after P2 measures its floor, the residual is attributable to weight quantization (FP4/BF16 keeps), not attention/GDN formula drift — that attribution is exactly what these probes provide. Fixes, if ever needed, go through the standard env-gated → bit-parity promotion path and become model-read via #T12. One engine-internal latent defect was found and filed without fixing it (F1, §6).
+(2026-09-23: this conclusion is about formulas only. The engine defects §7 records, the activation floor and the PLE row read, lie outside what this diff compared.) The #89 hypothesis — a wrong-formula constant or op in GDN normalization or QSA attention ("the engine numerics suspect of expert-requant.md §8") — is **acquitted on every line compared**: no MISMATCH was found, including the exact bug class of llama.cpp #28068 (crow-nest's `l2norm_repeat` was already the rsqrt form). Measured floors so far: the prefill-vs-decode QSA attention divergence is ≤ 1.1e-6 rel_L2 at the full sparse list length (P4), two orders below the 1e-5 line and three below the layer-3 residual; the engine-side QSA tie-break is deterministic lowest-index across all three selectors (P1). The remaining open risk is (a) the tie-break order vs `torch.topk` at exact score ties in the sparse regime (U1/P1b, untestable by the current dense-regime oracle rows), (b) the recurrent-vs-chunked GDN prefill numerics class (P2, planned), and (c) generic f32-order noise. If the layer-3 attention residual (2.9% rel_L2) does not move after P2 measures its floor, the residual is attributable to weight quantization (FP4/BF16 keeps), not attention/GDN formula drift — that attribution is exactly what these probes provide. Fixes, if ever needed, go through the standard env-gated → bit-parity promotion path and become model-read via #T12. One engine-internal latent defect was found and filed without fixing it (F1, §6).
 
 **Follow-up 2026-09-21 (acceptance doc: docs/acceptance/issue-89-followup.md).** F1 fixed (#97) with regression proven; P1b run — torch CUDA matches crow's lowest-index SET rule on every ambiguous case tested (CPU does not; the oracle is CUDA so parity is unaffected); P3 run — table ≤ 1 ulp everywhere crow controls it, pairing formula bitwise HF's rotate_half (U3 closed); P2 run — see §3 P2 for the recurrent-vs-chunked floor.
+
+**Correction 2026-09-23.** P2's verdict (§3), which attributes the layer-3 residual to weight quantization, and the "acquitted" reading of §6 hold only for the formulas this diff compared. Two defects outside its scope were found on 2026-09-23 (§7). Neither is a formula mismatch: one is how activations are ENCODED to NVFP4, the other is which bytes are READ for a PLE row. A formula diff cannot see either.
+
+## 7. The expert/activation path and the PLE read (2026-09-23, #91)
+
+The #89 diff covered the dense GDN/QSA formulas. On 2026-09-23 the expert/activation path and the
+PLE layer were covered by two further readings. Both found a defect, and both are fixed on branch
+`release-2026-09-23`. All multi-site numbers below come from the multi-site probe
+(`tools/multisite-corruption-probe.py`, 23 corrupt tool-call sites of robin's 2026-09-23 diorama
+session, teacher-forced, prompts 18k to 103k tokens, -M container, hot-set sidecar
+`hotsets-M-longctx2100-n160.json`, KV fp8_e4m3, one serve boot per arm;
+`decode_out/meas-0923/multisite/` in the measurement worktree). "Corrupt wins" counts sites where
+lp(corrupt) > lp(correct). The probe is described in `docs/measurement-coverage.md`.
+
+### 7.1 The activation floor (fixed `488a840`, with `5c6891a`)
+
+- **Finding.** The NVFP4 activation cascade (#10) encodes each 16-element sub-block with a ue4m3
+  scale. The smallest ue4m3 scale is 2^-9, and the cascade had no per-row global scale. So every
+  level had an absolute error floor of about 4.9e-4 per element. Small rows (SwiGLU h2, small
+  `mixed` rows) were quantized at 7 to 23 % mean relative error instead of about 1e-3 (commit
+  message of `488a840`).
+- **Fix `488a840`.** `quant_x_fp4` / `quant_tiles` compute a per-row power-of-two pre-scale:
+  they choose k so that amax·2^k is in [1024, 2048), with k clamped to [-64, 64] and k = 0 for
+  zero or non-finite rows. They store the f32 factor 2^-k after the three levels
+  (`XQ_ROW(bpr) = bpr*108 + 4`). All ten FP4 MMA consumers compute `(acc*gs)*rs`. With k = 0 the
+  result is bit for bit the old cascade. Host twin, measured cascade mean relative L2 on rows of
+  640 N(0,σ) values: σ 0.004: 7.08e-2 -> 9.75e-4; σ 0.0012: 2.34e-1 -> 9.81e-4; σ 3:
+  1.07e-3 -> 9.79e-4.
+- **Consequence for `CROW_QFUSE`.** The fused producers never see a whole row, so they store
+  the factor 1.0 and keep the old floor. `CROW_QFUSE` is therefore opt-in since `488a840`
+  (exact `1`). Before that, unset meant all fused (the #19i default since 2026-09-13). The
+  unfused default's decode speed is not measured. Every parity sha of record moves, and no new
+  shas of record exist yet.
+- **Fix `5c6891a`.** `enc_ue4m3_up` returned the E4M3 NaN byte 0x7F for block scales in
+  (448, 480]. That band now saturates to 0x7E (448).
+- **Measured effect (2026-09-23, multi-site probe, dense BF16 overlay, pinned 50 GiB WC in both
+  arms).** Before the PLE fix, the `actfloor` arm (`488a840`) had 9/23 corrupt wins, against
+  12/23 for the `dense` arm. Mean margin was +0.45 against -0.23, and correct top-1 was 13
+  against 11. The fix is real, but it moved the count by 3 sites.
+
+### 7.2 The PLE row-offset read (fixed `85a48e7`)
+
+- **Instrument.** The per-layer diff against llama.cpp (`tools/layerdiff/`, README there). It
+  compares crow-nest (the `488a840` build before the PLE fix, dense BF16 overlay, pinned 50 GiB
+  WC, `CROW_GRAPH=0`) with llama.cpp UD-Q2_K_XL (`ldump`) at two corrupt sites: mat44-a149
+  (103,559 tokens) and N33-a131 (98,015 tokens).
+- **Reading (2026-09-23).** Layer 0 matches, with residual cos 0.9985 / 0.9992. Layer 1, the
+  PLE layer, splits:
+  - gathered PLE embedding: cos -0.01 to the GGUF row
+  - PLE contribution: cos -0.03 / -0.04
+  - residual: cos 0.23 / 0.21
+
+  The residual never recovers. At layer 47 its cos is 0.74 / 0.54.
+- **Cause.** The PLE n-gram shards of the -M container are a FLAT stream of 64-value NVFP4
+  blocks, with 160 values per row. `ensure_rows`, the batched warm fetch and the prefill
+  prefetch read row r at byte `row*108`, i.e. 3 padded blocks. So every token got the n-gram
+  embedding of unrelated rows. That read is present since the engine tree's first commit
+  (`7ba3ed6`, 2026-09-05, `gen.rs:990`).
+- **Fix `85a48e7`.** `gen::ple_row_span` / `gen::ple_row_pad` read the row at value 160·r and
+  repack it into the padded 3-block layout that `gather_ple_fp4` and the row cache use (lib tests
+  `tests_ple_row`). With the flat read, re-dumped the same day (`compare-dense-flat.json`):
+  - gathered embedding: cos 0.993
+  - layer-1 residual: cos 0.997 to 0.999
+  - layer 47: cos 0.91 / 0.92
+  - margins: -0.81 / -7.77 -> +12.53 / +12.71
+
+  llama.cpp reads +14.60 / +14.16 in the same `ldump` dumps. The gap left at layer 47 is not
+  attributed, because the two weight quantizations differ.
+- **Multi-site (2026-09-23).** With `plefix` (`85a48e7`, dense overlay, pinned 50 GiB WC):
+  - corrupt wins: 4/23, and 0/9 on fresh-context sites
+  - mean margin: +8.40
+  - correct top-1: 17
+
+  llama.cpp UD-Q2_K_XL through llama-server scored 4/23, 1/9 fresh, +8.29 and 18. The 4 sites
+  crow-nest still loses all have contaminated context. llama.cpp also loses three of them. There
+  is NO multi-site number for the bare container with the fix, because that boot panicked with
+  `CUDA_ERROR_INVALID_CONTEXT`.
+- **Why the #89 diff could not see it.** The formulas are right. The engine applied them to the
+  wrong bytes. That is a data-layout read, outside what a formula diff compares. The lesson is in
+  `docs/improve-loop.md`: diff per layer against a reference engine before running precision
+  arms.
+
+Also on the branch, from the same #91 audit: `c4d37ca`. For prefill chunks shorter than the
+window, the GDN conv state (3 rows) and the PLE state (9 rows) did not shift their older slots.
+Robin's 2026-09-23 run hit this on 7 of 612 requests. No multi-site arm isolates it.

@@ -8,7 +8,10 @@ the day's `cea9406` pass over v0.3.0 (`9f12429`..`487128d`) and the first seven 
 and 2, 3, 5 and 8 moved again at the release pass for the commits that followed
 (`6c87054`, `74970b5`, `b70310a`, `cf6a135`, `bc9cd9b`); diagram 6 (the converter) and diagram 7
 (the module graph) were re-read against the same tree and are unchanged, and each says why.
-Every box names the section of `architecture.md` it renders.
+Every box names the section of `architecture.md` it renders. Corrected on 2026-09-23 against
+branch `release-2026-09-23` (`ebcd780`): diagrams 1, 2, 4 and 5 for the launcher's overlay
+default, the `CROW_QFUSE` default, the flat PLE row read, the registered cold tier and the #100
+zero-prefill reuse (changelog entry of that date); 3, 6, 7 and 8 were not re-read.
 
 ## 1 · System overview, from originals to served tokens
 
@@ -24,7 +27,7 @@ flowchart LR
         LOAD --> ENG["engine (Rust + CUDA sm_120a)\nWindows, and Linux since 2026-09-17 (#15)\none CUDA graph replay per decode token"]
         ENG -->|"tokens"| API["serve (Rust)\nOpenAI-style chat, np = 1\nGET /health · GET /props · GET /slots\nPOST /v1/chat/completions · POST /slots/0\nprefix cache A9 · slot file A10"]
     end
-    SCOPE["tools/serve-linux.sh\nsystemd-run --user --scope, MemorySwapMax=0,\nMemoryHigh / MemoryMax from /proc/meminfo"] -.bounds the process.-> API
+    SCOPE["tools/serve-linux.sh\nsystemd-run --user --scope, MemorySwapMax=0,\nMemoryHigh / MemoryMax from /proc/meminfo\nbare container: no overlay unless CROW_CNQ_OVERLAY is set (0254ed6)"] -.bounds the process.-> API
     CNQ -.ships together.-> PKG["the quant package: container + sidecar +\nhot sets + selftest/ + docs/model-card.md"]
     GOLD -.ships together.-> PKG
     PKG --> SELF["decode selftest · the gate a downloader can run\nexit code is the verdict (diagram 8)"]
@@ -45,11 +48,11 @@ the harness, 8.10 for the package and the self-test.
 flowchart TB
     GRAPH["one CUDA graph replay per decode_step\nscalar refreshes · table flip · ev_commit before the launch\none boot line each names the staging kernel, the trickle order, the selection"]
     TRICKLE["stream trickle, deferred since #63c\ncopies parked in trickle_tick are issued right after the launch\nand overlap the replay (trickle_drain_after_launch)\nthe hot-set re-cut behind it ticks every 8 decode tokens\n(geo::TRICKLE_EVERY, TASK I 2026-09-17; 16 under #17)\nCROW_TRICKLE_DEFER=0 restores the eager issue before the launch"]
-    GRAPH --> EMB["embedding row → residual stream 10240\nPLE host prep: n-gram ids, row cache, slot upload\nrow misses are ONE batch on the cnq::Warm reader pool\n(pread, 16 threads): about 0.5 ms of host time per step"]
+    GRAPH --> EMB["embedding row → residual stream 10240\nPLE host prep: n-gram ids, row cache, slot upload\nrow misses are ONE batch on the cnq::Warm reader pool\n(pread, 16 threads): about 0.5 ms of host time per step (TASK H)\nrow r read from the flat block stream at value 160·r,\nrepacked to the 108 B cache row (85a48e7, 2026-09-23)"]
     TRICKLE -.overlaps the replay.-> GRAPH
     EMB --> L0["layer 0 (GDN + MoE)"]
     L0 --> PLE["PLE at the top of layer 1\ngather · key/value proj · gate · dilated conv (state 9)\nh += gated + silu(conv), same place as prefill and reference"]
-    PLE --> HC["hyper-connections\nper layer: mix → sub-block → inject"]
+    PLE --> HC["hyper-connections\nper layer: mix → sub-block → inject\nunfused 8-launch chain + pre-scaled NVFP4 cascade by default\nsince 2026-09-23 (488a840); CROW_QFUSE=1 fuses hc + shared chains"]
     HC --> LOOP["layers 1..47 · 36 GDN + 12 attention\ninterleaved per layer_types"]
     LOOP -->|each MoE layer| RT["router_top10 (BF16)\n2560 × 512 · top-10 + shared expert"]
     RT --> STG["stage_cold_ca, default since #19e, inside the graph\npersistent grid, CROW_STAGE_BLOCKS=40 × 256 threads\npulls every cold combo of the layer into its VRAM staging slot\ncp.async 4 KB tiles · rewrites the combo pointer tables\nCROW_STAGE_KERNEL=1 falls back to stage_cold"]
@@ -84,7 +87,10 @@ set is the tokens this answer generated and never the prompt, so it is drawn ins
 not over the history. Windows operating point of record, 2026-09-12: 23.94 ms per token =
 41.8 tok/s against 24.87 with the fallback (`decode_out/srv-61b.log`, architecture 3.4); the
 Linux figure of record is 23.52 ms = 42.5 tok/s at the `#61g` default (`CHANGELOG.md`,
-2026-09-18; it was 27.19 ms = 36.8 tok/s on 2026-09-17, before that flip). Spec: 3.4, 3.5,
+2026-09-18; it was 27.19 ms = 36.8 tok/s on 2026-09-17, before that flip). Both figures are
+the ALL-FUSED `CROW_QFUSE` default of 2026-09-13 to 2026-09-23 and the pre-`85a48e7` PLE
+read; the 2026-09-23 default (unfused chains, pre-scaled cascade, flat PLE rows) has no decode
+figure of record yet (not measured). Spec: 3.4, 3.5,
 4.2, 4.6, 7.14, 7.11.17.
 
 ## 3 · VRAM layout at the default operating point (262k ctx, FP8-KV)
@@ -123,13 +129,9 @@ Spec: 2.1, 2.5, 7.13, 8.4 step 8.
 ```mermaid
 flowchart TB
     subgraph hostmem["the host-memory model (8.8)"]
-        RAM["cuda::free_physical_ram_parts\nfree_for_pin = MemTotal − (AnonPages + Shmem + SUnreclaim\n+ KernelStack + PageTables + Percpu)\nthe driver's pinned pool is reclaimable, so it counts as free"]
-        UVM{"cuda::other_cuda_fd:\nanother process holding /dev/nvidia-uvm?"}
-        FALL["fall back to MemAvailable\nthe [budget] line names that basis"]
+        RAM["cuda::free_physical_ram_parts\nfree_for_pin = MemTotal − (AnonPages + Shmem + SUnreclaim\n+ KernelStack + PageTables + Percpu) − driver_live\nthe driver's pool is reclaimable, so it counts as free;\ndriver memory live processes map does not (#103, 2026-09-23)"]
         BUD["manager::derive_host_pinned_budget\nmin(46 GiB cap, free_for_pin − CROW_RAM_MARGIN_GB)\none [budget] boot line, before anything is pinned"]
-        RAM --> UVM
-        UVM -->|"no, the pool is ours"| BUD
-        UVM -->|"yes"| FALL --> BUD
+        RAM --> BUD
     end
     BUD --> PLAN["manager::ThreeStates::allocate\ntwo-sided clamp: VRAM lowers N, the pinned budget raises it\npending = LAUNCH_SLACK + ring reserve + vision reserve\nrefuses only when no N satisfies both sides"]
     SIDE["hot-set sidecar · residency::sidecar_sets (#49)\none JSON object, a sets array of 48 rows;\nevery row adapted to THIS run's N per row — short rows padded\nwith the lowest unused ids, long ones truncated, each row logged;\nnot 48 rows, a bad id, an id twice: refused by name"] --> BUILD
@@ -137,7 +139,7 @@ flowchart TB
     PLAN --> BUILD["Residency::build\nRAM gate, hot slabs in VRAM, pinned cold tier,\nONE ascending sweep per expert tensor"]
     BUILD -->|"Cnq::fadvise_consumed drops the pages behind the\ncursor in 64 MiB batches, every section but ple"| PC["the load leaves no page-cache trail\nmax Cached 33.04 → 5.14 GiB, 2026-09-17\nCROW_CNQ_PURGE=0 disables it"]
     subgraph host["host RAM"]
-        COLD["cold tier, PINNED to the derived budget\nexpert slabs as UVA pinned host pointers"]
+        COLD["cold tier, PINNED to the derived budget\nexpert slabs as UVA pinned host pointers\nLinux default: anon mmap + cuMemHostRegister\n(CROW_PINNED_ALLOC=register, #103); wc on Windows"]
     end
     subgraph vram["VRAM · 32 GiB budget"]
         HOT["hot set: N expert slabs per layer\n7 slots spare for the trickle"]
@@ -152,7 +154,7 @@ flowchart TB
     STAGE --> GEMV["routed expert GEMVs read VRAM pointers only:\nhot slab slot or this step's staging slot"]
     HOT --> GEMV
     subgraph plerow["the PLE row path (7.14)"]
-        MISS["Ple::ensure_rows misses, 108 B rows\nscattered over the 26.8 GiB ple section"]
+        MISS["Ple::ensure_rows misses: row r = value 160·r of the\nflat block stream, up to 4 blocks (144 B) per row,\nrepacked to 108 B (ple_row_span / ple_row_pad, 85a48e7)\nscattered over the 26.8 GiB ple section"]
         RUNS["cnq::page_runs coalesces and de-duplicates the pages"]
         WARM["Cnq::warm: the process's one reader pool,\nCROW_PLE_FETCH=16 threads, pread on a second\ndescriptor with POSIX_FADV_RANDOM, two queues so a\nbackground prefetch never blocks the current chunk"]
         MISS --> RUNS --> WARM
@@ -170,7 +172,11 @@ everything above it is v0.3.0 and v0.3.1. New boxes: the derived pinned budget w
 `pending` bytes (8.4 step 8), the single ascending sweep with `fadvise_consumed` (8.8 point 4),
 the `ple`-sparing exit purge (8.8 point 5), the batched PLE row fetch (7.14 parts 1 and 2), the
 per-row sidecar rule of `#49` (2.2, `0adbe6a`), and the trickle's 8-token re-cut (7.14 part 4).
-Spec: 2.1, 2.2, 2.3, 3.4 as amended, 7.14, 8.8.
+Corrected 2026-09-23: the `/dev/nvidia-uvm` fallback to `MemAvailable` is gone (`free_for_pin`
+subtracts `driver_live`, 8.8 point 3), the Linux cold tier is registered anonymous memory
+(8.8 point 7), and the PLE miss box reads the flat-stream span instead of `row*108` (2.4); the
+TASK H figures in the PLE boxes were measured with the old offsets and not re-measured.
+Spec: 2.1, 2.2, 2.3, 2.4, 3.4 as amended, 7.14, 8.8.
 
 ## 5 · Serve: one chat request end to end (in, reuse, out)
 
@@ -193,7 +199,7 @@ flowchart TB
     ENC --> IMG["image branch, when the request carries images and the tower is loaded\nbuild_vision_plan: LRU hit, else prep_image → Vit::run\nthe plan holds HOST rows only (7.13)"]
     IMG --> CLAMP["clamped_max_tokens FIRST, then begin_vision\nso the interleaved-mrope span tables are at most n_ctx rows\ndefault 8192 since 8bad310, cap 32768"]
     CLAMP --> LCP{"longest common id prefix L\nof the request ids vs the held history\nids only, never text (#31 A9)"}
-    LCP --> P["reuse point P: the largest snapshot position at or below L\nwhose rows are all PREFILL CLEAN\nnothing is erased: pos moves back to P,\nrows at or above P are stale but unreachable"]
+    LCP --> P["reuse point P: the largest snapshot position at or below L\nwhose rows are all PREFILL CLEAN\nnothing is erased: pos moves back to P,\nrows at or above P are stale but unreachable\n#100: an identical re-send reuses a slot holding its\nlast logits row, 0 prefill; #101: a rollback forgets\nthe slots above P (2026-09-23, host tests only)"]
     P --> ROLL["rollback: GDN state, conv state and QSA ring restored\nfrom the snapshot at P; P = 0 is the cold start,\none 16k prefill of 21.6 to 22.0 s"]
     ROLL --> PF["prefill P to prompt_len\nrewrites the re-rendered previous answer as prefill rows"]
     PF --> S2["snapshot at the prompt end (prefill clean)"]
@@ -297,9 +303,9 @@ flowchart TB
         P512["parity 512 rows · 8387234709271515…"]
         PTF["P8 teacher-forced · 3bb3e69edf90…\nprefill 8 ids, the other 504 through decode_step"]
         D32["decode run over 32 ids"]
-        TST["cargo test --release · TESTS 221\n128 lib + 82 serve + 6 parity + 5 decode"]
-        CLP["clippy --all-targets · CLIPPY 1421"]
-        G1["check_env_docs · code 89, doc 89"]
+        TST["cargo test --release · TESTS 358\n237 lib + 110 serve + 6 parity + 5 decode"]
+        CLP["clippy --all-targets · CLIPPY 1505"]
+        G1["check_env_docs · code 107, doc 107"]
         G2["check_readme_dates · 0 offenders"]
         G3["check_model_card_dates · 0 offenders,\nrunning since 2026-09-18 (it was never committed before)"]
     end
@@ -337,7 +343,10 @@ flowchart TB
 ```
 
 Status: new on 2026-09-18, renders `8bad310` — its two host-side boxes carry the values the
-script pins at the release commit (`TESTS=221`, `check_env_docs` 89 = 89). It draws what section 5.2 asks for and what
+script pins at the release commit (`TESTS=221`, `check_env_docs` 89 = 89); updated 2026-09-23 on `release-2026-09-23` to
+`TESTS=358` (measured that day), `CLIPPY=1505` (the pinned value, not re-counted) and `check_env_docs` 107 = 107. The three
+parity shas in the boxes are the values of the pre-2026-09-23 engine: `488a840` and `85a48e7` change the numerics on purpose,
+and no new values are recorded yet. It draws what section 5.2 asks for and what
 v0.3.0 and v0.3.1 built around it: the nine-item Linux gate and the two host-side values it
 pins (8.7), the package self-test with its `models/` control and its sha256 (8.10, `#64`), the
 bounded retry around the harness's two oracle children (8.9, `#65`), and the three replay
@@ -364,3 +373,4 @@ Spec: 5.1, 5.2, 5.3, 7.11.16 to 7.11.18, 8.7, 8.9, 8.10.
   - **7, module graph: unchanged, re-generated.** The `use crate::` edges of `engine/src` at `cea9406` are edge for edge those of `487128d`: only `sample.rs` and `residency.rs` were touched in the library, and every other v0.3.1 change landed in a bin, which this graph does not draw. The status line now names those bins so the next reader does not look for `ThinkFilter` in a module.
   - **8, gates, guards and the self-test: NEW.** The verification side had no picture at all, and three commits of v0.3.1 built one: `tools/gate-linux.sh`'s nine items and the two host-side values they pin (8.7), `decode selftest` with `tools/selftest.sh`, the `test ! -d models` refusal and the sha256 of the shipped golden (8.10, `#64`), `oracle_child`'s bounded retry with the exit code leading the diagnosis (8.9, `#65`), and the three replay commands that reproduce `#67`, `#54` and `#68` (7.11.16, 7.11.18, 7.11.17). The 1024-row parity form is drawn outside the script, where 8.7 puts it.
 - 2026-09-18, the v0.3.1 release pass (`8bad310`): the seventeen commits that landed after the `#13` pass (`788fb64`) were read against all eight pictures, and four moved. **2, decode path:** the split decode attention kernel is `attn_sel_split_l` since `#61g` (`6c87054`) and the box says so, with `CROW_ATTN_LUT=0` named as the bit-identical fallback; the Linux figure in the status line is 23.52 ms = 42.5 tok/s now, and the two levers of the same day (`CROW_STAGE_PAR` `#19`, `CROW_GDN_SPLIT_Z` `#71`) are deliberately NOT drawn, because both are DEFAULT OFF and a picture of a default is a picture of what runs. **3, VRAM pie:** the vision slice is HELD at boot since `#72` (`74970b5`) and reads 277.6 MB, the device sampler's five buffers included, against a `[budget]` ledger and a 0.25 GiB free-VRAM floor — the slice was planned-only before, which is exactly what let the first image request of a session find 35.7 MiB free. **5, request path:** the cross-turn repeat counter of `#68` (`b70310a`) hangs off the sink as a dotted box, because it reads the answer and changes nothing; `ToolStream` names the one exception it now makes to "fragments are never rewritten" (`cf6a135`); and the clamp box carries the 8192 default of `8bad310`. **8, gates:** `TESTS 221` and `check_env_docs` 89 = 89, the values the script pins at this commit. Diagrams 1, 4, 6 and 7 were re-read and are unchanged. The module graph in particular: the whole `crate::` edge set of `engine/src` at `8bad310` is the one of `788fb64`, with exactly one addition, `manager → gen::sampler_bytes` inside `#[cfg(test)] mod tests_72` — test code, not a layering edge, and the picture draws the layering. Everything the seventeen commits added to the library landed inside modules that were already drawn (`vit::arm_scratch`, `manager::PostPlan`, `toolcall::repair_json`, `gen`'s two levers), and the rest landed in the bins, which this graph does not draw. All eight were rendered locally with `@mermaid-js/mermaid-cli` 11.17.0 before the release commit (#14).
+- 2026-09-23, branch `release-2026-09-23` (`ebcd780`): four diagrams corrected where they stated a default or the PLE layout that the branch changed. **1:** the launcher box says the bare container is the default (`0254ed6`; the dense-overlay default of `0924406` lasted from 13:57 to 18:43 that day). **2:** the PLE prep box names the flat-stream row read (`85a48e7`, architecture 2.4) and the hyper-connection box the unfused default of the activation-floor fix (`488a840`, `CROW_QFUSE=1` opt-in); the status line says the Linux decode figure is the all-fused, pre-fix one and that the new default is not measured. **4:** the `/dev/nvidia-uvm` decision and its `MemAvailable` fallback are removed (`free_for_pin` subtracts `driver_live`, #103), the cold tier names `CROW_PINNED_ALLOC=register`, the PLE miss box the flat-stream span. **5:** the reuse box names the #100 zero-prefill reuse and the #101 rollback rule. Not drawn: the #102 `CROW_KV` read at `boot::open_model`, the `492f137` grammar relaxations (architecture 7.11.23), the GDN/PLE window shift of `c4d37ca` (architecture 7.3). Diagrams 3, 6, 7 and 8 were not re-read in this pass.

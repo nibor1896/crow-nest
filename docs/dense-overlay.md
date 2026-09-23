@@ -410,3 +410,54 @@ the FP4 path computes, not that either is what the model should compute.
   container would put these tensors in the base file and drop the second open entirely.
 - **The unfused cost.** Every BF16 site is deliberately unfused. A fused BF16 chain (a bf16
   `hc_down_inj`, a bf16 `sh_gate_up`) is a speed ticket, not a correctness one.
+
+## 8. The default that lasted five hours (2026-09-23, #91)
+
+**What happened.** On 2026-09-23 `tools/serve-linux.sh` briefly made this overlay the default,
+then reverted it:
+
+- `0924406` (13:57) loaded `converter/dense-bf16-originals.cnq` unless `CROW_CNQ_OVERLAY` was
+  set. It used the pinned settings the measured dense arm booted with: budget 50 GiB, alloc
+  `wc`, margin 1.
+- `0254ed6` (18:43) reverted it. The script now boots the bare container with the default
+  pinned budget and allocation.
+
+**The script today.** The overlay is opt-in: `CROW_CNQ_OVERLAY=<file>` loads it.
+`CROW_CNQ_OVERLAY=none` is accepted, and the script unsets it. An empty value also means no
+overlay, because `boot.rs` ignores an empty value. The Linux default for pinned allocation is
+now `CROW_PINNED_ALLOC=register` (#103, `e46090c`). `wc` and `host` stay selectable, and
+`CROW_PINNED_WC` is no longer read. The pinned budget of §5.1 and §5.2 (the 46 GiB cap, and
+`CROW_PINNED_BUDGET_GB=50` for the overlay arms) is unchanged by this. The runs in this document
+used the allocation of their day, and none was re-run under `register`.
+
+**What the overlay measured before the fix.** Multi-site probe, 2026-09-23: 23 corrupt tool-call
+sites (9 with fresh context), teacher-forced, prompts 18k to 103k tokens. Hot-set sidecar
+`hotsets-M-longctx2100-n160.json`, KV fp8_e4m3, build before the PLE fix. Per arm: corrupt wins,
+mean margin, correct top-1.
+
+| arm | corrupt wins /23 | fresh /9 | mean margin | correct top-1 |
+|---|---|---|---|---|
+| bare (`70a69e3`, pinned 46) | 15 | 6 | -1.67 | 8 |
+| placebo (attn-v-out control overlay, pinned 47) | 15 | - | -2.01 | 8 |
+| dense (originals overlay, pinned 50 WC) | 12 | 3 | -0.23 | 11 |
+| dense + `CROW_KV=bf16` (pinned 52) | 12 | 4 | -0.10 | 9 |
+
+- **Short-prompt decode** (probe `speed`, 256 tokens, median of 3, before the fix): bare
+  66.6 tok/s, dense overlay 55.8 tok/s.
+- **Group bisection** (14-site subset, before the fix): each dense kind group was enabled alone
+  (attn v/o, GDN in-proj, GDN out-proj, HC, indexer, PLE+HC, PLE, rest, shared experts). Each
+  had 8 to 11 of 14 sites corrupt. No single group reproduces the dense arm.
+
+**Most of that benefit was masking the PLE read bug.** The cause of the corruption was the PLE
+n-gram row read at the wrong container offset. It is fixed in `85a48e7`
+(`docs/numerics-diff.md` §7.2). With the fix and the same overlay, the `plefix` arm has 4/23
+corrupt wins, 0/9 fresh, mean margin +8.40 and correct top-1 17. llama.cpp UD-Q2_K_XL has 4/23.
+The dense arm's 15 -> 12 is small next to 12 -> 4. **The bare container with the fix has NO
+multi-site number:** that boot (`plefix-bare`, 18:41) panicked with `CUDA_ERROR_INVALID_CONTEXT`
+(`cuda.rs:252`). So what the overlay adds on top of the fix is not measured.
+
+**Why it was reverted.** It cost the operating point. At pinned 50 GiB WC, robin's serve was
+OOM-killed at 18:38 CEST, with the desktop left about 14 GiB. The hot set was 128 instead of 156,
+and that run read prefill 500 to 600 tok/s and decode 33 to 37 tok/s. Section 7's open questions
+(which kinds are needed, BF16 or FP8) stand. They are now to be asked on the fixed engine, with
+paired oracle-KLD as the acceptance rule (`docs/improve-loop.md`).

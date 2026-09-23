@@ -123,7 +123,9 @@ never held in RAM. Disk requirement for a conversion: input 360 GB + output ~101
   (2026-09-18) the ENGINE can be told to read the 495 dense text tensors from a bf16
   OVERLAY container instead (`CROW_CNQ_OVERLAY`, `converter dense-overlay`,
   `docs/dense-overlay.md`); the shipped container and the default path are untouched by
-  it, and the overlay is a measurement instrument, not a shipped variant.
+  it, and the overlay is a measurement instrument, not a shipped variant. (The launcher
+  `tools/serve-linux.sh` defaulted to an overlay twice and was reverted both times; since
+  `0254ed6`, 2026-09-23, it attaches none unless asked — 8.8 point 6.)
 - **PLE block**: NVFP4, **exchangeable** — the header tags it as a self-contained
   section so an FP8 swap (oracle fallback) needs no format change.
 - **ViT + MTP**: carried in the format, tagged optional-to-load (decision 2026-09-02).
@@ -195,7 +197,10 @@ scan, readable entries only), the pool may be that process's, so the budget fall
 conservative `MemAvailable` and the `[budget]` boot line names that basis. `/dev/nvidia-uvm`
 is the right node: every CUDA context opens it and no graphics client does — measured
 2026-09-17, the compositor and every GL app hold `/dev/nvidiactl` and `/dev/nvidia0` while
-owning no pinned pool, and testing for THOSE refused the engine's own operating point. The planner refuses only when no N satisfies both sides (`planner_refusal_msg`).
+owning no pinned pool, and testing for THOSE refused the engine's own operating point. Since
+#103 (2026-09-23) the fallback is gone: `free_for_pin` subtracts the driver memory live processes
+map (`driver_live`) instead, and the Linux cold tier is registered anonymous memory
+(`CROW_PINNED_ALLOC=register`) that returns to the kernel on exit (8.8 points 3 and 7). The planner refuses only when no N satisfies both sides (`planner_refusal_msg`).
 
 The clamp also carries a **vision reserve** (TASK K, 2026-09-17): with `CROW_VIT` on, the VRAM the
 image path allocates inside a request — the cap-sized tower scratch and the interleaved-mrope
@@ -245,15 +250,52 @@ point (7.13 has the two numbers and the measurement). `CROW_VIT=0` reserves noth
 - Row format NVFP4, block-exchangeable to FP8 (section 1); `ple_layer_ids: [2]` vs
   tensors on `layers.1` — the converter resolves the index once and records the
   resolution in the header.
-- Row granularity on NVMe: a row is ~108 B NVFP4; reads happen at page granularity, so
-  the cache design assumes read amplification (~37 rows per 4 KB page) and lets the
-  hot-row cache absorb it — hit rate is measured, never assumed.
+- Row granularity on NVMe: reads happen at page granularity, so the cache design assumes
+  read amplification and lets the hot-row cache absorb it — hit rate is measured, never
+  assumed. (The 2026-09-02 text said "a row is ~108 B NVFP4, ~37 rows per 4 KB page"; that is
+  the PADDED row of the VRAM cache, not the on-disk layout — see the next point.)
+- **On-disk row layout, as built (corrected 2026-09-23, #91, `85a48e7`).** A PLE n-gram shard
+  of the `-M` container is a FLAT stream of 64-value NVFP4 blocks (36 B each: 4 ue4m3 group
+  scales, then 32 B of e2m1 pairs) with 160 values per row: 400,001,920 values = 2,500,012
+  rows = 225,001,080 B per shard. Row `r` starts at value `160*r`, i.e. in block
+  `floor(160r/64)`, on a block boundary for even `r` and 32 values into the block for odd `r`;
+  a row spans up to 4 blocks (144 B) on disk. `gen::ple_row_span(row, n_values)` returns
+  (byte offset `b0*36`, blocks to read, value offset 0 or 32) and `gen::ple_row_pad` repacks
+  the span into the padded 3-block row (108 B) that the VRAM row cache and `gather_ple_fp4`
+  use. `Ple::ensure_rows`, the batched warm fetch (`Cnq::warm().rows(.., 4*36)`) and the
+  prefill prefetch (`Ple::row_offsets`) all take their offsets from `ple_row_span`.
+- **The bug this replaced.** Until `85a48e7` all three read row `r` at byte `r*108` — the
+  padded cache layout applied to the flat file — so every token got bytes of OTHER rows as its
+  n-gram embedding. The `row * 108` read is already in the first engine commit (`7ba3ed6`,
+  2026-09-05); since when every container matched the flat layout is not established here.
+  Evidence (2026-09-23, `tools/layerdiff`, `decode_out/meas-0923/layerdiff`, crow-nest with
+  the dense-BF16 overlay, pinned 50 GiB wc, `CROW_GRAPH=0`, against llama.cpp UD-Q2_K_XL
+  `ldump` at the corrupt-digit sites mat44-a149 (103,559 tokens) and N33-a131 (98,015 tokens)):
+  layer 0 matches (residual cos 0.9985 / 0.9992); layer 1, the PLE layer, splits — gathered
+  embedding cos -0.01 to the GGUF row, PLE contribution cos -0.03 / -0.04, residual cos 0.23 /
+  0.21 — and never recovers (layer 47 residual cos 0.74 / 0.54). With the flat read: embedding
+  cos 0.993, layer-1 residual 0.998 / 0.999, layer 47 0.91 / 0.92; the correct-token margin
+  moves from -0.81 / -7.77 to +12.53 / +12.71 nats (llama.cpp +14.60 / +14.16 in the same
+  `ldump`). Multi-site teacher-forced probe (23 sites, 2026-09-23, dense overlay, pinned 50 GiB
+  wc, KV fp8_e4m3): corrupt token wins 9 of 23 before the fix (build with `488a840`), 4 of 23
+  with it, mean margin +0.45 -> +8.40; llama.cpp UD-Q2_K_XL through llama-server 4 of 23. No
+  multi-site number exists for the BARE container with the fix (that arm's boot panicked with
+  `CUDA_ERROR_INVALID_CONTEXT`). The hot-set sidecar `hotsets-M-longctx2100-n160.json` was
+  calibrated on the wrong rows and needs recalibration (live hit rate 0.52-0.70 after the fix
+  against 0.77-0.80 before, robin's session of 2026-09-23; not done on this branch). Lib tests
+  `tests_ple_row`.
 
 ### 2.5 Three-state manager
 
 - **KV**: 12 full-attention layers, 2 KV heads × head_dim 256, FP8 E4M3 default, BF16
   fallback via config; allocation at load for the configured context; resize only
-  across full reloads (no mid-session shrink in stage 1).
+  across full reloads (no mid-session shrink in stage 1). As built: `CROW_KV`
+  (`bf16` / `fp8` / `fp8_e4m3`), read once in `boot::open_model` for `decode`, `parity` and
+  `serve` since #102 (2026-09-23; `serve` ignored it before). bf16 at `n_ctx` 200,000 is
+  2343.8 -> 4687.5 MB of KV (+2.29 GiB VRAM), which the planner takes out of the hot set, so the
+  pinned cold tier grows and the 46 GiB default cap refuses the bare container (N 155 -> 136
+  needs 47.3 GiB); `CROW_PINNED_BUDGET_GB` 48 bare / 52 with the dense overlay — computed from
+  the MEAS-0923 boots, not measured; no serve has booted with bf16 KV yet (2026-09-23).
 - **GDN recurrent state**: 36 layers, f32 (16 K / 48 V heads at 128, conv kernel 4) —
   fixed size, context-independent.
 - **QSA indexer cache**: budget 2,048 tokens, compress ratio 4 — third state kind,
@@ -379,6 +421,7 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 - The decode operating point that crossed the llama.cpp line: #62e, 2026-09-13 (the resumed #62d lever, 62a lever 2, the 32-rows-per-block GDN slab geometry, joins the default set with no new env; the no-env N mean 22.1761 ms per token = 45.1 tok/s is the first engine default under the 22.27 llama.cpp row).
 - The prefill operating point that opened the compute levers: #10c, 2026-09-14 (the dense GEMM variant B, F50's named next dense form, lands as OPT-IN `CROW_PF_GEMM_B`, no default flip; the clean pairs measured -2.27 and -2.33 s = -11 percent on t1-read 16k, and the llama 922.5 tok/s prefill row stays open: 18.44 s = 871 tok/s is 1.03 s short of it and 0.51 s above the 17.93 s no-copy floor band of F50).
 - The Linux prefill of record crosses that row, on the same prompt and a different machine: the 16,064-id t1-read form (`decode run … 128`, `CROW_CHUNK` unset so the policy picks 2048, context fill 16,192, crow-nest CNQ4.5-M NVFP4 4.5 bpw) reads **16.60 s = 968 tok/s and 16.66 s = 964 tok/s** on 2026-09-17, RTX 5090 / Arch Linux, commit `1032bc5`, against **598 / 601 tok/s** on the same two runs of the preceding build — an interleaved A/B in one session, two runs per arm, identical id traces (`CHANGELOG.md` 2026-09-17, the PLE prefill floor). It is NOT a row of the table above and does not close the 922.5 row: the llama.cpp arm of record (17.41 s = 922.5 tok/s, 2026-09-11) is a WINDOWS measurement with GGUF Q2_K_XL at 2.4 bpw, and no llama.cpp arm has been run adjacent to it on this machine. Section 8.7 holds the Linux values of record.
+- **The fused rows below are history since 2026-09-23.** The activation-floor fix (`488a840`, 4.2 item 2) made `CROW_QFUSE` opt-in (exact `1`): the engine default is now the pre-scaled separate-launch cascade with the UNFUSED 8-launch hc chain and 6-launch shared chain. The fusions' cost of record is 19f -0.98 and 19h -0.23 ms per token, so the unfused default is expected to be roughly 1.2 ms per token slower than the 22.43 ms all-fused row; that is an estimate, NOT a measurement — no decode time of the 2026-09-23 default has been taken yet.
 - Every row of this table is one adjacent pair of one chain; the two crow-nest columns are the two arms of that pair.
 - The two arms run different weights: crow-nest CNQ4.5-M (NVFP4, 4.5 bpw); llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL (GGUF, 2.4 bpw).
 - A tok/s figure is quoted only next to its adjacent arm in the same chain (#38, 0.5 rule 2). For a `serve` rate that rule is about the operating point since 2026-09-18 and not about the drift: `serve` (N 149, chunk 2048, trickle ticking) and `decode run` (N 142, chunk 4096, no tick) are different arms, so the adjacent `decode run` is what anchors the serve number.
@@ -432,19 +475,44 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
    the graph.
 2. **Dense paths**: hidden 2560 ↔ residual stream 10240 (hyper-connections), attention
    QKVO, GDN projections (`in_proj_qkvz`, `out_proj`), `conv1d`, PLE gather + conv.
-   - hyper-connection decode chain, DEFAULT fused since #19g (2026-09-13; the 19f
-     fusion of 2026-09-13 behind the flip): with `CROW_QFUSE` unset the eight launches
+   - the NVFP4 ACTIVATION cascade (#10), as built since 2026-09-23 (`488a840`, `5c6891a`):
+     the whole-row quantizers `quant_x_fp4` / `quant_tiles` take the row amax, choose `k`
+     with `amax * 2^k` in [1024, 2048) (clamped to [-64, 64]; `k = 0` for a zero or
+     non-finite row), quantize `x * 2^k` into the three levels and store the f32 factor
+     `2^-k` after them — row stride `XQ_ROW(bpr) = bpr*108 + 4` (`kernels.rs:280`). Every
+     FP4 MMA consumer (`gemv_fp4_mma`, `_d`, `_dg`, `_g`, `_d32`, `_g32`, `gemm_fp4_dense`,
+     `gemm_fp4_dense_b`, `gemm_fp4_tiles`, `sh_gate_up_q`) stores `(acc * gs) * rs` with its
+     row's factor; exact powers of two, so `k = 0` reproduces the unscaled cascade bit for
+     bit. Why: the ue4m3 sub-block scale bottoms out at 2^-9, which left an absolute floor
+     of ~4.9e-4 per element with no per-row global scale; host twin
+     (`kernels::act_cascade`, rows of 640 N(0, sigma)), cascade mean rel L2 without -> with
+     the pre-scale: sigma 0.004 7.08e-2 -> 9.75e-4, sigma 0.0012 2.34e-1 -> 9.81e-4, sigma 3
+     1.07e-3 -> 9.79e-4 (lib tests `tests_act_prescale`). `enc_ue4m3_up` (`kernels.rs:248`)
+     no longer returns the E4M3 NaN byte `0x7F` for a scale in (448, 480]: at e = 15 the
+     mantissa stops at 6 and the band saturates to `0x7E` = 448 (`5c6891a`, test
+     `tests_ue4m3_enc`). The fused producers of `CROW_QFUSE=1` (`mix_streams_q`,
+     `rmsnorm_gated_q`, `gate_mul_q`, `silu_mul640_q`, `silu_mul_combo_q`, `sh_gate_up_q`)
+     never see a whole row, store the factor 1.0 and keep the old floor, which is why
+     `CROW_QFUSE` became OPT-IN (exact `1`) with this change and the two chain fusions below
+     went off by default with it. Every parity sha256 of record (8.7) moves on purpose; no
+     new values of record and no decode time for the unfused default are measured yet
+     (2026-09-23).
+   - hyper-connection decode chain — OPT-IN since 2026-09-23 (`CROW_QFUSE=1`, exact; the
+     default is the unfused 8-launch chain). History: DEFAULT fused from #19g (2026-09-13;
+     the 19f fusion of 2026-09-13 behind the flip) until 2026-09-23. Fused form: the eight launches
      of one hc block (`rms_group`, down `gemv_bf16_w`,
      `silu_div4`, up `gemv_bf16_w`, `sigmoid_el`, `mix_streams_q`, `gemv_fp4_b1k`,
      `sig2_div4`) run as FOUR: `rms_group`, `hc_down_inj` (down GEMV + `silu_div4` + the
      4-row inject GEMV + `sig2_div4` in one launch — the `gemv_fp4_b1k` 1024-slot reduce
      emulated bit for bit on 256 threads, 44 blocks x T), `gemv_bf16_ws` (up GEMV storing
      the `sigmoid_el` epilogue) and `mix_streams_q`; `head_run` fuses the same epilogues
-     (no inject rows). Launch sites `gen.rs:1928` / `gen.rs:2988` behind `hc_fuse_on()`,
-     decode `t < 8` only — prefill keeps the `gemm_bf16_dense` path verbatim; one `[hc]`
-     boot line names the form (`gen.rs:911`). `CROW_QFUSE=0` selects the unfused 8-launch
-     fallback of record (and takes the NVFP4 cascade to its separate-launch path — the
-     documented overload of `docs/env.md`; cascade on + unfused is no longer reachable).
+     (no inject rows). Launch sites `gen.rs:2331` (`hc_run`) / `gen.rs:3572` (`head_run`)
+     behind `hc_fuse_on()` (`gen.rs:1817`), decode `t < 8` only — prefill keeps the
+     `gemm_bf16_dense` path verbatim; one `[hc]` boot line names the form (`gen.rs:1163`).
+     Until 2026-09-23 `CROW_QFUSE=0` selected the unfused 8-launch fallback (and took the
+     NVFP4 cascade to its separate-launch path — the documented overload of `docs/env.md`);
+     since then unset or any value but exact `1` is that unfused path, now with the
+     pre-scaled cascade above.
    - bit identity: by construction (every epilogue is elementwise on the finished
      accumulator, the merged grid keeps each row's dot product unchanged) and measured:
      the 19f switch-ON P8FUSE (504 teacher-forced rows) and PXFUSE (16,056 rows) forms
@@ -454,22 +522,23 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
      plus the 16,056-row PXBOTH form byte-identical with the 61b sha256 values of
      record, the double-fallback 8 rows identical, ten tasks 10 of 10 equal BOTH
      splits-8 records (`decode_out/srv-19g.log`).
-   - shared-expert decode chain, fused by DEFAULT since #19i (2026-09-13; the
-     #19h fusion behind the SAME `CROW_QFUSE`: unset or any value but `0` =
-     hc chain FUSED + shared chain FUSED + cascade, `1` kept accepted and
-     redundant, `0` stays all off): the SIX launches
+   - shared-expert decode chain — OPT-IN since 2026-09-23 with the same exact `1`
+     (default: the unfused 6-launch chain). History: fused by DEFAULT from #19i
+     (2026-09-13; the #19h fusion behind the SAME `CROW_QFUSE`: then unset or any value
+     but `0` = hc chain FUSED + shared chain FUSED + cascade, `0` all off) until
+     2026-09-23. Fused form: the SIX launches
      of the shared chain (gate|up `gemv_fp4_mma_d` x2, `silu_mul640_q`, down
      `gemv_fp4_mma_d`, the `sgv` `gemv_b`, `gate_shared`) run as THREE:
      `sh_gate_up_q` (both gate|up GEMVs in one launch, the mma_d body twice
      verbatim over the gate and up slabs, the `silu_mul640_q` math warp-wide on
-     the finished accumulator pairs, writes `sh2` + `xq_s`, `kernels.rs:3438`),
+     the finished accumulator pairs, writes `sh2` + `xq_s`, `kernels.rs:3651`),
      the hoisted `gemv_b` (`sgv`, reads `mixed_m` only, data-safe) and
      `gemv_fp4_mma_dg` (down GEMV + the `gate_shared` epilogue at the store:
      `moe_out = sigmoid(sgv) * down` ASSIGN, still the FIRST writer of `moe_out`,
-     `kernels.rs:3534`). Launch site `gen.rs:2579` behind `sh_fuse_on()`
-     (`gen.rs:1511`), decode `t < 8` and the mma/dense path only: prefill
+     `kernels.rs:3749`). Launch site `gen.rs:3130` behind `sh_fuse_on()`
+     (`gen.rs:1870`), decode `t < 8` and the mma/dense path only: prefill
      (`gemm_fp4_dense`) and the `gemv_fp4_bs` fallback keep the separate launches
-     verbatim; the `[hc]` boot line names the shared state too (`gen.rs:911`).
+     verbatim; the `[hc]` boot line names the shared state too (`gen.rs:1163`).
      Bit identity: epilogue folding only (every op elementwise, or warp-wide with
      the standalone 16-consecutive-j quant layout, on a finished accumulator;
      each k walk in the separate-launch order; the merged grid keeps every row's
@@ -1796,7 +1865,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 | **KV cache**: 12 attention layers, `[12][2][2][context][256]`, FP8 E4M3 default (`geo.rs:23-25`, `manager.rs:43`, `manager.rs:200`) | **Yes, for rows PREFILL wrote.** A row is addressed by the absolute slot `pos` and its RoPE was applied at that absolute position before the store, so rows `0..L` stay valid for any request whose ids agree on `0..L`. **Corrected 2026-09-10 (A9, #31): a row DOES depend on the code path that wrote it.** `decode_step` rows are not bit-equal to `prefill` rows at the same position. A reuse point is valid only while every row below it was written by `prefill` (PREFILL CLEAN, `engine/src/cache.rs`). | Host-side only, from the id lists (7.4). The cache is never probed: there is no key in a KV row to compare against. **Plus the prefill-clean flag per slot**, which is state the server keeps, not something read out of a row. | **Nothing is erased.** `pos` is set back to P. Rows `>= P` are stale but unreachable: the selector only scans blocks below `ncb = (pos+1)/4` (`gen.rs:2611-2614`, `gen.rs:2854`). The new suffix overwrites them as it is prefilled. | Full miss (P = 0) = one 16k prefill = **21.6 to 22.0 s** on the serve build (A9, #31); **24.13 s** is the plan's reference on the installed decode build. A partial miss of n tokens is `n/16384 x` that as a **linear estimate only** (unmeasured). Prefill is not linear in n: the chunk policy (`geo.rs:138-152`) and the one-cold-tier-pass-per-chunk cost (`gen.rs:2552-2556`) both bend it. |
 | **QSA indexer state**: raw-key **ring** `[12][ring][128]` f32 with `row = pos % ring`, `ring = min(ceil4(prompt_chunk + 4), context)` (`manager.rs:37-41`, `manager.rs:58`, `kernels.rs:1759-1769`). Plus the **full-length pooled cache** `[12][ceil(context/4)][128]` f32 indexed by the absolute block `pos/4` (`manager.rs:46`, `manager.rs:60`, `kernels.rs:1747-1758`) | **Pooled cache: yes, under the same prefill-clean rule as KV** (A9, #31: a pooled block over decode-written rows is not bit-equal either). **Ring: conditionally.** The ring is modular and holds only the last `ring` positions. Its only reader is `pool4_cache`, which for a resume at P needs the `P mod 4` rows of the still-incomplete block. Those are live iff the held run advanced fewer than `ring - 3` positions past P. Made unconditional by snapshotting the ring (7.6) or by rounding P down to a multiple of 4. | Host-side only (7.4). | Set `done_blocks = P/4` and restore the ring from the snapshot. Pooled blocks `>= P/4` are stale but unreachable by the same `ncb` bound. Block `P/4` is re-pooled by the resumed prefill **before** any query scores it (pooling precedes scoring inside `attn_prompt`: `gen.rs:1668-1682` then `gen.rs:1701-1704`). | No separate cost. The ring and the pooled blocks of the diverged suffix are rebuilt inside the same prefill pass that rebuilds KV. They add no pass of their own. Their share of the prefill is **unmeasured** (`CROW_KPROF=1` would produce a per-kernel breakdown; none is recorded). |
 | **GDN recurrent state**: 36 layers, `S[48][128][128]` f32 + `conv[10240][3]` f32, **112.22 MiB**, fixed and context-independent (`geo.rs:24`, `geo.rs:12-15`, `manager.rs:47-48`, `manager.rs:226-237`) | **No, not without a snapshot.** The state holds no position. It is the fold of every token seen so far. After the held run reached L there is no `S` at any P < L anywhere in the process. It is reusable **exactly at P = L**, and for any P < L **only from a snapshot taken at P** (7.6). | Host-side only, and this is the point: the state itself **cannot be probed**. Nothing in `S` says which ids produced it. If the id comparison is wrong, nothing downstream notices. | Restore `S` and `conv` from the newest prefill-clean snapshot at a position `S_pos <= L`, then re-prefill from `S_pos`. With **no** such snapshot, the only correct move is a **cold start** (`S_pos = 0`): the KV and pooled rows that are still valid must be thrown away with it, because a KV prefix without the matching GDN state is precisely the silent-wrong-answer case. | **This is the state that sets the price.** The suffix to re-prefill starts at the last snapshot, not at the divergence point: extra cost = `(L - S_pos)` tokens of prefill on top of the diverged suffix. No snapshot at all = the full **21.6 to 22.0 s** at 16k on this build. Its own share of a prefill is **unmeasured**. |
-| **PLE row cache**: hot rows of the 128 n-gram shards, `n_slots = cache_bytes / 112`, default 128 MB = **1,198,372 slots** (`geo.rs:72`, `geo.rs:108`, `gen.rs:913-916`) | **Yes, unconditionally.** It is **content-addressed**, not position-addressed: `slot = ngram_row_id % n_slots` with `slot_map[slot]` holding the id (`gen.rs:1027-1054`), and a slot's content is a verbatim copy of a container row. It carries no position and does not depend on which request filled it. | **Not needed.** Divergence cannot invalidate it: a slot either already holds the row a token asks for, or is refilled from the container. | **Nothing.** The cache survives every divergence, every request, and every rollback. Rows filled by a discarded prefix stay useful. | A PLE miss is a container row read, **not** a prefill. It never forces recomputation. Not measured in seconds anywhere in the repo; the measured quantity is the **miss rate** (#16, 2026-09-05: 128 MB costs +0.2 % misses against 1 GB and frees ~7 hot-set units, `geo.rs:108`). |
+| **PLE row cache**: hot rows of the 128 n-gram shards, `n_slots = cache_bytes / 112`, default 128 MB = **1,198,372 slots** (`geo.rs:72`, `geo.rs:108`, `gen.rs:913-916`) | **Yes, unconditionally.** It is **content-addressed**, not position-addressed: `slot = ngram_row_id % n_slots` with `slot_map[slot]` holding the id (`Ple::ensure_rows`, `gen.rs:1590`), and a slot's content is a container row repacked into the padded 108 B layout (since `85a48e7`, 2026-09-23, read from the flat block stream at value `160*r`, 2.4; before that the slot held the bytes at `r*108`, which were other rows' bytes). It carries no position and does not depend on which request filled it. | **Not needed.** Divergence cannot invalidate it: a slot either already holds the row a token asks for, or is refilled from the container. | **Nothing.** The cache survives every divergence, every request, and every rollback. Rows filled by a discarded prefix stay useful. | A PLE miss is a container row read, **not** a prefill. It never forces recomputation. Not measured in seconds anywhere in the repo; the measured quantity is the **miss rate** (#16, 2026-09-05: 128 MB costs +0.2 % misses against 1 GB and frees ~7 hot-set units, `geo.rs:108`). |
 
 **The prefill-clean rule (A9, #31, measured 2026-09-10, binding):**
 
@@ -1835,10 +1904,18 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 - "PLE" in the plan means the *row cache*.
 - The PLE layer also owns a **recurrent conv state** `Ple::state`, `[10240][9]` f32 =
   368,640 B (`gen.rs:916`).
-- The conv is dilated (`src = t + k*3 - 9`, `kernels.rs:2839-2856`), so it needs nine
+- The conv is dilated (`src = t + k*3 - 9`, `kernels.rs:4159`), so it needs nine
   history rows.
-- `ple_state_update` (`kernels.rs:2857-2867`) refreshes it per prefill chunk.
-- `ple_conv_step` (`kernels.rs:2868-2879`) shifts it per decode token.
+- `ple_state_update` (`kernels.rs:4169`) refreshes it per prefill chunk.
+- `ple_conv_step` (`kernels.rs:4183`) shifts it per decode token.
+- Fixed 2026-09-23 (`c4d37ca`, #91 audit): `ple_state_update` (9 rows) and the GDN
+  `conv_state_update` (3 rows, `kernels.rs:1620`) wrote only the slots the chunk fed and left
+  the older slots in place instead of shifting them down by `tt`. A prefill chunk shorter than
+  the window — a prompt's tail chunk, or a warm prefix-cache resume with a short suffix — left
+  a wrong x[t-3]/x[t-2] (GDN) or up to 8 wrong PLE rows for the following steps, and the
+  snapshot taken after that prefill stored the wrong state. Robin's 2026-09-23 session hit it
+  on 7 of 612 requests (engine.log, prefill n < 9). Both kernels now shift first, the way
+  `tt` single `ple_conv_step` / `conv_step` calls would.
 - It behaves exactly like the GDN conv window and **must be snapshotted with it**.
 - The #11 finding of 2026-09-05 (`gen.rs:2376-2381`) records what a wrong row in this path
   costs.
@@ -2153,6 +2230,11 @@ with `ring = ceil4(prompt_chunk + 4).min(context)` (`manager.rs:37-41`):
 | M2b, one snapshot | **115.60 MiB** | **124.60 MiB = 130,646,016 B** |
 | saved by M2b | 115.60 MiB | **124.60 MiB = 130,646,016 B** |
 
+- #100 (2026-09-23) adds, per slot, the prompt's last logits row (`s.logits` row 0, 248,320 f32 =
+  993,280 B) and its greedy id, so an identical re-send reuses the slot with zero prefill (7.4). The
+  row is NOT part of `Shape::snapshot_bytes` and the slot file does not carry it (`cache.rs`
+  module doc). Host tests only; the live check is pending (2026-09-23).
+
 **Confirmed against the build (A9, #31, `decode_out/srv-a9.log`, `cache.rs:235`):**
 
 | quantity | value | note |
@@ -2300,9 +2382,14 @@ Therefore:
 | `temperature` | absent, `null` or `<= 0` is GREEDY; `> 0` samples | `serve.rs:1158` (`sampler_from`) | `crow_core.py:4672-4700` |
 | `top_p` | nucleus mass, default 0.8 (data sheet), read only when `temperature > 0` | `serve.rs:509`, `serve.rs:1158` | `crow_core.py:4672-4700` |
 | `top_k` | default 20 (data sheet), clamped to 64 by the device sampler (`SAMPLE_MAXK`, `engine/src/kernels.rs:3994`), read only when `temperature > 0` | `serve.rs:511`, `serve.rs:1158` | not sent by Crow |
-| `presence_penalty` | default 1.5 (data sheet), read only when `temperature > 0` | `serve.rs:513`, `serve.rs:1158` | **never sent by Crow** — the string does not occur in `crow_core.py` (measured 2026-09-18, #68, 7.11.17); the 1.5 of the live `[chat]` line is this default |
+| `presence_penalty` | default **0** since `56e0297` (2026-09-22; the data sheet's 1.5 applies only when the client sends it, `DEFAULT_PRESENCE`), read only when `temperature > 0`. Until then the default was 1.5 and applied to every sampled Crow request | `serve.rs` (`DEFAULT_PRESENCE`, `parse_chat`), `sampler_from` | **never sent by Crow** — the string does not occur in `crow_core.py` (measured 2026-09-18, #68, 7.11.17) |
 | `seed` | RNG seed of THIS request, default 0, reseeded per request (M1) | `serve.rs:515`, `serve.rs:1158` | not sent by Crow |
-| `min_p` | **ACCEPTED AND IGNORED**, one stderr line per request | `serve.rs:2262` (the stderr line); `sampler_from` (`serve.rs:1158`) carries no `min_p`; `serve.rs` module doc | `crow_core.py:4672-4700` (0.01 at Crow's operating point) |
+| `min_p` | **read since #83**: the log-space tail filter (llama.cpp PR #3841) after top-k and before the temperature softmax, on the device and the host sampler alike; absent, `null` or `<= 0` disables; read only when `temperature > 0`. Before #83 accepted and ignored | `parse_chat`, `sampler_from` | `crow_core.py:4672-4700` (0.01 at Crow's operating point) |
+| `repeat_penalty`, `frequency_penalty`, `penalty_last_n` | #84: llama.cpp windowed penalties over prompt tail + generated ids, read in greedy AND sampled requests; neutral when absent (1.0 / 0 / window 64, clamped to 1024) | `parse_chat`, `serve.rs` module doc | not sent by Crow |
+| `dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_last_n` | #85: DRY (llama.cpp PR #9702); off when the multiplier is absent or 0; a DRY request samples on the HOST | as above | not sent by Crow |
+| `top_n_sigma`, `typical_p`, `xtc_probability`, `xtc_threshold`, `mirostat`, `mirostat_tau`, `mirostat_eta` | #92: the optional sampler tier, all neutral when absent; any of them armed routes the request to the HOST sampler; `mirostat: 1` is a 400 | as above | not sent by Crow |
+| `stop`, `logit_bias` | #86: OpenAI stop strings (generation ends BEFORE the sequence, `finish_reason` `stop`) and a token-id -> additive bias on the raw logits, applied first, outside the sampler chain | as above | not sent by Crow |
+| `crow_force_ids` | #91 (`d7f484a`, 2026-09-22), a crow-nest extension: an array of token ids that REPLACE the generated ids one per step from the first generated position on (teacher forcing through the #81 injection door); with `logprobs: true` each entry prices the forced id under the raw distribution and carries `crow_id`; `[]` forces nothing but adds `crow_id`; a 400 together with `reasoning_budget_tokens` or with an id >= V; after the list runs out generation continues as requested | `parse_chat` | `tools/teacher-forced-91.sh`, `tools/multisite-corruption-probe.py` (not Crow) |
 | `tools` | rendered as the template variable `tools` | `serve.rs:970`, `tokenizer::render_chat` | `crow_core.py:4672-4700`, `TOOLS` (25 builtin at `crow_core.py:579-838`, frozen at `:846`, plus the `mcp.json` tools added at import, `:841`) |
 | `chat_template_kwargs.enable_thinking` | template variable, default false; an EXPLICIT `false` beats a named level (7.11.20) | `serve.rs` (`parse_chat`) | `crow_core.py:2970` (digest path) |
 | `reasoning_effort` | **read since #74 (2026-09-18)**, top level and in `chat_template_kwargs`, top level first. `none` and an absent field render the prompt of record; `low` and `medium` pass through; `high` and `xhigh` both render `xhigh`; anything else is a 400 naming the five words (7.11.20) | `serve.rs` (`map_reasoning_effort`, `parse_chat`) | `crow_core.py:5017` (`stream_reply`, top level, since Crow #176) |
@@ -3236,15 +3323,15 @@ markup after the fact (`toolcall.rs`) and could only report what went wrong (#99
 | question | as built |
 |---|---|
 | when | from the `<tool_call>` token ID on (the id that also arms `ToolStream`; llama.cpp triggers on the word, which this model always emits as that token) until the end of the answer. Before it nothing is checked in `auto` mode |
-| the frame | `\n<function=NAME>\n` (NAME declared), then any number of `<parameter=P>\nVALUE\n</parameter>\n` (P declared for that tool, each at most once), `</function>` only when every required P was written, `\n</tool_call>`; after it `space` (llama.cpp's: at most 2 newlines, 22 bytes), then EOS or, with `parallel_tool_calls`, the next `<tool_call>` id. No prose after a call (llama.cpp's root, and the template's "NO suffix") |
-| VALUE | by schema, llama.cpp's `resolves_to_string` split: a string is free text up to `\n</parameter>\n` that contains neither `</parameter>` nor `</tool_call>` (the parser would cut the value there; llama.cpp only stops at the full `\n</parameter>\n`); a string `enum` is one of its options (stricter than llama.cpp, which leaves it free); every other type is JSON: integer `-?(0\|[1-9][0-9]{0,15})`, number, boolean, null, enum/const literals, arrays by `items`, objects by `properties`/`required`/`additionalProperties`; untyped, unions, `$ref`, `allOf` = any JSON value. Not enforced: `minimum`/`maximum`, `minItems`/`maxItems`, `pattern`, `format` |
+| the frame | `\n<function=NAME>\n` (NAME declared), then any number of `<parameter=P>\nVALUE\n</parameter>\n` (P declared for that tool, each at most once), `</function>` (since `492f137`, 2026-09-23, also while a required P is still owed: the call closes and the client reports the missing parameter; before, `</function>` was refused there, which FORCED `<parameter=` plus filler into the model's context), `\n</tool_call>`; after it `space` (llama.cpp's: at most 2 newlines, 22 bytes), then EOS or, with `parallel_tool_calls`, the next `<tool_call>` id. No prose after a call (llama.cpp's root, and the template's "NO suffix") |
+| VALUE | by schema, llama.cpp's `resolves_to_string` split: a string is free text closed by `</parameter>` with OR without a newline before it (since `492f137`, 2026-09-23: `toolcall::find_marker` cuts at any complete `</parameter>`, so the old newline-only closer refused the model's own id and forced a junk token — live shapes of 2026-09-23: a path `src/scene.js\nparameter_path`, a delegate `task` of `parameter`); `</tool_call>` inside a value stays refused (llama.cpp only stops at the full `\n</parameter>\n`); a string `enum` is one of its options (stricter than llama.cpp, which leaves it free); every other type is JSON: integer `-?(0\|[1-9][0-9]{0,15})`, number, boolean, null, enum/const literals, arrays by `items`, objects by `properties`/`required`/`additionalProperties`; untyped, unions, `$ref`, `allOf` = any JSON value. Not enforced: `minimum`/`maximum`, `minItems`/`maxItems`, `pattern`, `format` |
 | order | parameters in ANY order (llama.cpp: required ones first, permuted, then optionals); an optional one cannot repeat (llama.cpp's `zero_or_more` allows it; the parser would emit a duplicate key) |
 | token level | a byte machine (`ToolGrammar::step`, a fixed-size `Copy` state, JSON nesting to depth 6); a token is allowed when all its bytes step, so a token may span `>\n`, `\n</parameter>\n<parameter=` or any other boundary. The full mask walks a preorder byte TRIE of the vocabulary (591,646 nodes): a refused byte skips its subtree. Special tokens are not in the trie (the detokenizer skips them): inside a call only EOS (where complete) and `<tool_call>` (between calls) pass, by id |
 | where it hooks in | `chat_generate`, top of the loop, after the #81 injection: `gate.armed()` (inside a call, or `required`) then `gate.check(next)`; a refused id goes to `grammar_redraw`. After `out.push`, `gate.accept(next)` advances the state |
 | the redraw | llama.cpp's rejection order (`common_sampler_sample`): the drawn id is checked; only a refused one costs the row. `s.logits` still holds the row (the #91 rule), it is read back, the mask sets `-inf` on every refused id, then greedy = the masked argmax; sampled = a host twin of the device sampler at this position (request profile, prompt tail in the #84 window, this answer's ids booked, an RNG seeded from `seed` and the position), then `Engine::rebook_sampler` moves the device's presence bit / window slot / count from the refused id to the kept one (`sample::rebook_plan`, checked against a host model of the kernel's accept); without it a refused EOS would carry the presence penalty to the end of the answer. The biased host route (#86) checks inside `draw_biased`, before `observe` |
 | #81, logprobs, stop | an injected id is not checked; if it is outside the grammar (a budget spent inside a call opened in the think block) the grammar steps aside for the rest of the answer, with one WARN. Logprobs stay the RAW distribution (a redrawn id is priced under it). Stop strings are unchanged |
 | cost | measured on CPU (`toolgrammar::tests::mask_cost_on_cpu`, release, this machine): trie built once per process in 104-119 ms; per generated id inside a call 27 ns (check + advance); outside a call 2.8 ns (the `armed()` branch 0.38 ns + the advance 2.4 ns); a full mask 4.75 ms in a string value, <= 0.01 ms in every other phase, built only for a refused id and cached per state (256 masks max). The redraw adds one 0.99 MB readback. GPU: NOT measured (the box was RAM-locked, #82) |
-| switch and lines | `CROW_TOOL_GRAMMAR=0` = off (ids byte-identical to before). Per request with tools: `[chat] tool grammar ON (CROW_TOOL_GRAMMAR): lazy at the <tool_call> id, tool_choice auto, parallel_tool_calls true; 26 tools / 51 parameters compiled in X ms`; per request whose grammar checked an id: `[chat] tool grammar: N call(s) closed under it, C id(s) checked, R refused and redrawn (M mask(s) built, X ms; redraw path Y ms in total)` |
+| switch and lines | `CROW_TOOL_GRAMMAR=0` = off (ids byte-identical to before). Per request with tools: `[chat] tool grammar ON (CROW_TOOL_GRAMMAR): lazy at the <tool_call> id, tool_choice auto, parallel_tool_calls true; 26 tools / 51 parameters compiled in X ms`; per request whose grammar checked an id: `[chat] tool grammar: N call(s) closed under it, C id(s) checked, R refused and redrawn (M mask(s) built, X ms; redraw path Y ms in total)`. Since `492f137` (2026-09-23) every refusal is also one INFO line with the text of the refused and the kept id (DEBUG before), because each refusal puts a token the model did not pick into its context; one live request of 2026-09-23 refused and redrew 36 ids and closed no call |
 
 ### 7.12 The stage A gate table (what was measured, and where the artefact is)
 
@@ -3472,6 +3559,14 @@ Section 2.4 designed the PLE as an NVMe-mmap window with a VRAM hot-row cache an
 amplification would be measured, never assumed. This is that measurement, on Linux, and it moved
 two things: the row read is no longer a mapping fault, and a chunk's misses are no longer read one
 at a time. It also names the cost that the PLE was being blamed for and is not.
+
+**Correction, 2026-09-23 (#91, `85a48e7`).** Every measurement in this section read each row at
+byte `row*108` of the shard — the wrong address (2.4: the shard is a flat 64-value block stream,
+row `r` starts at value `160*r`). The rows fetched were the wrong rows' bytes; the timings below
+are the timings of those reads. Since the fix a miss reads the row's span of up to 4 blocks
+(144 B, `ple_row_span`) and repacks it to the 108 B cache row (`ple_row_pad`); the batched fetch
+warms `4*36` B per row. The per-row cost, the batch figures and the miss counts of this section
+were NOT re-measured with the fixed offsets.
 
 **1. The row read.** `Ple::ensure_rows` reads every miss with `Cnq::read_range`, one 108 B row at a
 time, at addresses scattered over the 26.8 GiB `ple` section. Through the mapping that is one page
@@ -3837,9 +3932,15 @@ not line numbers — the files move.
    tokenizer and chat template load BEFORE any CUDA call.
 3. `CROW_GRAPH`, `CROW_MMA`, `CROW_ADAPT_WINDOW` forced to `1` if unset, single-threaded,
    before the context exists; one `[serve]` line each.
-4. `boot::open_model(DEFAULT_CNQ, DEFAULT_HOTSETS)` → `Cnq::open` (trailer index, whole-file
-   mapping), then `CROW_CNQ_OVERLAY` → `Cnq::attach_overlay` when it is set (#77: the bf16 dense
-   overlay, with its refusal table and the `[overlay]` lines; unset attaches nothing),
+4. `boot::open_model(DEFAULT_CNQ, DEFAULT_HOTSETS)` → `CROW_KV` parsed once for all three bins
+   (#102, 2026-09-23: `bf16` / `fp8` / `fp8_e4m3`, anything else — the empty string included —
+   panics `[boot] refused` before the container is mapped; until then only `decode parity` read
+   it, so `serve` booted FP8 under `CROW_KV=bf16`), one WARN per `CROW_*` name in the environment
+   that has no row in `docs/env.md` (compiled in, names only), the #94 metadata gate, then
+   `Cnq::open` (trailer index, whole-file mapping), then `CROW_CNQ_OVERLAY` →
+   `Cnq::attach_overlay` when it is set AND non-empty (#77: the bf16 dense overlay, with its
+   refusal table and the `[overlay]` lines; unset or empty attaches nothing — the engine
+   default; what the launcher sets is 8.8 point 6),
    `cuda::Ctx::init`, `Config` at `CONTEXT_FLOOR`. The binding order is the drop order.
 5. `cfg.prompt_chunk = SERVE_CHUNK` (= `geo::TRICKLE_CHUNK_THRESHOLD`), `geo::apply_adapt_policy`
    (the `[policy]` line).
@@ -3863,8 +3964,10 @@ not line numbers — the files move.
       The planner's `pending` bytes are `LAUNCH_SLACK + ring_reserve + vit_reserve` (`gen.rs:976-977`):
       `vit::reserve_bytes(cfg.context)` enters here, with its own `[budget]` line, so the image path
       is subtracted BEFORE N is chosen (7.13, TASK K).
-   9. `Residency::build` — hot set, the RAM gate, the VRAM hot slabs, the pinned cold tier, one
-      ascending sweep per expert tensor, the slot tables.
+   9. `Residency::build` — hot set, the RAM gate, the VRAM hot slabs, the pinned cold tier
+      (`Pinned::alloc_cold`, `CROW_PINNED_ALLOC`: registered anonymous memory by default on
+      Linux since #103, 2026-09-23; 8.8 point 7), one ascending sweep per expert tensor, the
+      slot tables.
    10. the prefetch ring and its non-blocking stream.
    11. `kernels::kprof_init`, `cuda::compile(KERNEL_SRC)` (NVRTC, `--gpu-architecture=compute_120a`),
        `Kernels::new`, `assert_kernel_defines` (8.6), `Params::setup`.
@@ -3959,7 +4062,8 @@ memory-bounded scope, one engine at a time.
   NVRTC 13.3.73 + driver 616.56, Linux NVRTC 13.3.33 + driver 610.57). At `9f12429` the 512-row
   form was bit-identical for rows 0–22 and drifted from row 23 with max |d| 7.0, while the ids
   stayed identical in all 517 positions; the drift was deterministic across `CROW_MMAP=0`,
-  `CROW_PINNED_WC=0`, `CROW_PF_ASYNC=0` and `CROW_GRAPH=0`, which exonerates the port surface.
+  `CROW_PINNED_WC=0` (the cacheable pinned tier; `CROW_PINNED_ALLOC=host` since #103),
+  `CROW_PF_ASYNC=0` and `CROW_GRAPH=0`, which exonerates the port surface.
   Over a 1024-token generation the same drift does flip near-ties (`GATES.md` section 3).
 - **The gate**: `tools/gate-linux.sh [outdir]` from the repo root runs the three parity forms,
   `decode run 32`, `cargo test`, clippy and the doc guards against the first three values
@@ -3978,6 +4082,16 @@ memory-bounded scope, one engine at a time.
   the script — it costs a full long-prompt run and is checked by hand. Every expected value is hard-coded with its
   provenance in the script header. It is not a tuning knob: a value there is changed only when a
   new reference run establishes a new record, and the commit that does it says so.
+- **The values above are not the current engine's (2026-09-23).** Three commits of
+  `release-2026-09-23` change the numerics on purpose: the per-row activation pre-scale with
+  `CROW_QFUSE` opt-in (`488a840`), the flat PLE row read (`85a48e7`) and the short-chunk
+  window shift (`c4d37ca`; it can only move a form where a chunk shorter than the conv window
+  follows earlier state — a multi-chunk prompt's short tail or a warm resume; a cold
+  single-chunk prefill shifts in zeros either way). No new sha256 values of record have been measured for them yet;
+  `tools/gate-linux.sh` still carries the four of the table and pins `TESTS="358"` /
+  `CLIPPY="1505"` (read off the script, 2026-09-23). Measured on the branch the same day:
+  `cargo test --release --lib` 237 passed / 0 failed / 1 ignored, `--bin serve` 110 passed /
+  0 failed (`85a48e7`).
 - **The full battery** behind those values — eleven items, the ten-task gate, the throughput
   readings and what could not be run — is `decode_out/final/GATES.md` (gitignored; the summary
   is in `CHANGELOG.md`, 2026-09-17).
@@ -3992,9 +4106,10 @@ mechanism in one place, without repeating them.
    `Engine::load` before the planner, so every bin gets it. One `[budget]` boot line names the
    value and its basis. `CROW_PINNED_BUDGET_GB` holds it fixed for a measurement.
 2. **`free_for_pin` is not `MemAvailable` on Linux.** `cuda::free_physical_ram_parts` returns
-   `HostRam { free_for_pin, mem_available, other_cuda }`, with
+   `HostRam { free_for_pin, mem_available, other_cuda, driver_live, driver_held }`, with
    `free_for_pin = MemTotal - (AnonPages + Shmem + SUnreclaim + KernelStack + PageTables +
-   Percpu)` — what cannot be reclaimed, subtracted from the total. `Unevictable` and `Mlocked`
+   Percpu) - driver_live` — what cannot be reclaimed, subtracted from the total (`driver_live`
+   since #103, 2026-09-23, point 3). `Unevictable` and `Mlocked`
    are deliberately not subtracted: they already sit inside `AnonPages` / `Shmem`. The reason is
    the NVIDIA driver's pinned-page pool: after an engine exits, ~45 GiB stays in it, in no
    `/proc/meminfo` class, invisible to `MemAvailable`, yet reclaimable and served straight back
@@ -4002,8 +4117,17 @@ mechanism in one place, without repeating them.
    60.76 GiB against `MemAvailable` 10.89 GiB (the `0c9feb5` reading; section 2.1 quotes a
    second reading of the same day, 60.78 against 12.44 GiB — the pool is stable across readings,
    `MemAvailable` is not, which is the point).
-3. **The `/dev/nvidia-uvm` rule.** That pool is only ours to count while no other CUDA process
-   is alive. `cuda::other_cuda_fd` scans `/proc/<pid>/fd` (readable entries only) for
+3. **The `/dev/nvidia-uvm` rule — REPLACED 2026-09-23 (#103, `e46090c`).** Since then
+   `free_for_pin` subtracts `driver_live`, the NVIDIA driver memory that live processes (this one
+   included) still map, read from `/proc/<pid>/smaps` (`/dev/nvidiactl` and `/dev/nvidia<N>`
+   mappings by size, `/dev/nvidia-uvm` mappings by `Rss`), and the `MemAvailable` fallback is
+   gone: it refused every boot where an old driver pool and any other CUDA client (an Electron
+   app, a llama-server) met, because the pool is invisible to `MemAvailable`. `other_cuda` is still
+   read and only named on the `[budget]` line, which also names the driver pages (held and live).
+   Driver memory a process owns without mapping it (GPU page tables, UVM eviction buffers,
+   ~0.7-1.7 GiB on this host with the desktop running, per the `cuda.rs` doc) stays uncounted; the
+   margin covers it. The rule as it stood from 2026-09-17: that pool is only ours to count while
+   no other CUDA process is alive. `cuda::other_cuda_fd` scans `/proc/<pid>/fd` (readable entries only) for
    `/dev/nvidia-uvm*` held by another process — the node every CUDA context opens and no
    graphics client does. `/dev/nvidia0` and `/dev/nvidiactl` are the WRONG test: measured
    2026-09-17, the compositor, quickshell, Xwayland and GTK hold them permanently and own no
@@ -4035,7 +4159,36 @@ mechanism in one place, without repeating them.
    `MemoryHigh=MemTotal-8G`, `MemoryMax=MemTotal-6G`, computed from `/proc/meminfo`. The scope
    is a property of the launcher, not of the engine: the engine never raises its own limits, and
    a run outside the scope is a run without that floor. `session.slice` is deliberate —
-   `systemd-oomd` watches `app.slice` on this machine.
+   `systemd-oomd` watches `app.slice` on this machine. Since #103 the registered cold tier is
+   anonymous memory and is CHARGED to that scope (a 45.1 GiB tier boots at `memory.current`
+   ~49.9 GiB under `MemoryHigh` 54.2 GiB on the 62 GiB host, 2026-09-23, script header); the old
+   `wc` tier was driver memory and escaped it (3.0 GiB with the same tier). The launcher's
+   overlay default, as of `0254ed6` (2026-09-23 18:43): NONE — the bare container with the
+   engine's default pinned budget and allocation; `CROW_CNQ_OVERLAY=<file>` opts in,
+   `CROW_CNQ_OVERLAY=none` is accepted and unset by the script, and an empty value attaches
+   nothing because `boot::open_model` skips it. History: the attn-v-out bf16 overlay was the
+   default from `723d18f` until `0efe3b5` removed it (it was the one arm of the #91 100k ladder
+   that got WORSE with depth, 28/320 wrong lines against the bare container's 8/320);
+   `0924406` (2026-09-23 13:57) made the dense BF16 overlay `converter/dense-bf16-originals.cnq`
+   the default with pinned 50 GiB, `wc`, margin 1, and `0254ed6` (18:43) reverted it: the
+   corruption's cause was the PLE row read (2.4), the overlay only masked part of it and cost
+   the operating point — at pinned 50 GiB wc robin's serve was OOM-killed at 18:38 CEST with the
+   desktop left ~14 GiB, and the hot set was 128 instead of 156 (prefill 500-600 tok/s, decode
+   33-37 tok/s in that run).
+7. **The cold tier's allocation (#103, 2026-09-23).** `Pinned::alloc_cold` follows
+   `CROW_PINNED_ALLOC`: `register` (the Linux default: anonymous mmap, 2 MiB aligned,
+   `MADV_HUGEPAGE`, `MADV_DONTFORK`, then `cuMemHostRegister(PORTABLE|DEVICEMAP)` in pieces of at
+   most 1 GiB), `wc` (`cuMemHostAlloc(..|WRITECOMBINED)`, the Windows default and the Linux
+   default before 2026-09-23) or `host` (the same without WRITECOMBINED). It replaces
+   `CROW_PINNED_WC`, which is no longer read. Why: a freed `wc` block goes to the driver's sysmem
+   page pool (`nv-vm.c`) and stays there after exit, invisible to `MemAvailable` until pressure
+   runs the pool's shrinker — the "pool flat at 44 GiB, REBOOT needed" state; registered pages
+   are kernel anon pages and return on free, exit and SIGKILL. Measured 2026-09-23 on this host
+   (`pin_return_probe`, commit `e46090c`): stage-pattern read 51.6 GB/s for all three kinds,
+   serve decode 49.3-49.9 tok/s registered against 49.8 wc. Scripts gate a boot on the engine's
+   own view: `ramcheck --need <GiB>` prints `free_for_pin` and the driver pages, and
+   `tools/pin-room.sh` (`pin_room <need_gib>`) retries it for up to 120 s while a previous serve
+   exits; it replaced the `MemAvailable` + balloon loops of the tool scripts (`01a2f43`).
 
 ### 8.9 The oracle children of the `parity` harness (#65, 2026-09-18)
 
@@ -4227,7 +4380,8 @@ run_attn_subblock` hands `mixed` to the production `attn_prompt` from the host, 
 `hc_run` — and since #19g (2026-09-13) `hc_run`'s last launch is `mix_streams_q`, which writes
 `mixed` AND the NVFP4 activation cascade `xq_m` that the v projection and the QSA indexer read
 under `CROW_MMA=1` (`attn_prompt` quantizes `mixed` itself only when `CROW_QFUSE=0`, precisely
-because the fused producer is the default). So `xq_m` stayed at its allocation zeros — measured
+because the fused producer is the default). (That was the state of 2026-09-18. Since 2026-09-23, `488a840`, the fused producer is opt-in: `attn_prompt` quantizes `mixed` itself, pre-scaled, unless `CROW_QFUSE=1`, and `hc_run` no longer
+ends in `mix_streams_q` by default.) So `xq_m` stayed at its allocation zeros — measured
 0 of 34,560 bytes non-zero — `q` was fine at `max_abs` 5.08 while `v` and the indexer `qk` were
 0.0, attention had nothing to weight, and gate, `xq_v` and `o_proj` were zero in turn. The fix is
 the missing launch: `run_attn_subblock` emits `quant_x_fp4` into `xq_m` after the upload, which

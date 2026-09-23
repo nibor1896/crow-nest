@@ -75,10 +75,26 @@ Read on 2026-09-17 from `/proc/meminfo`, `/proc/sys/vm/swappiness`, `zramctl`, `
    those refused the engine's own operating point. `/dev/nvidia-uvm` is opened by every CUDA
    context and by no graphics client, so that is the node the check reads (`bb9d2ca`).
 
+**Both facts as of 2026-09-23 (#103, `e46090c`, branch `release-2026-09-23`).** The pool of
+fact 1 is where the WRITE-COMBINED cold tier (`cuMemHostAlloc`, the default until then) went on
+free (`nv-vm.c`, `NVreg_EnableSystemMemoryPools`). The Linux default is now a registered
+anonymous tier (`CROW_PINNED_ALLOC=register`: anon mmap + `cuMemHostRegister`), whose pages
+return to the kernel on free, exit and SIGKILL (measured on this box that day with
+`pin_return_probe`; stage-pattern read 51.6 GB/s for all three allocation kinds). The
+`/dev/nvidia-uvm` rule of fact 2 no longer switches the budget to `MemAvailable`:
+`free_for_pin` subtracts `driver_live`, the driver memory live processes map, and a second CUDA
+process is only named on the `[budget]` line. Scripts gate a boot with `ramcheck --need <GiB>` /
+`tools/pin-room.sh` instead of `MemAvailable` and a balloon (`docs/architecture.md` 8.8 points
+3 and 7).
+
 - Consequence for every measurement on this box: engine runs go through
   `tools/serve-linux.sh` or the same `systemd-run --user --scope --slice=session.slice`
   form (`MemorySwapMax=0`, `MemoryHigh=MemTotal-8G`, `MemoryMax=MemTotal-6G`), one engine at a
   time, because the RAM gate refuses a second engine while the first holds the pinned tier.
+  The launcher's operating point (2026-09-23, `0254ed6`): the bare `-M` container, no overlay
+  unless `CROW_CNQ_OVERLAY` is set, the engine's default pinned budget and allocation, KV
+  `fp8_e4m3` unless `CROW_KV` says otherwise; the engine's `CROW_QFUSE` default is the unfused,
+  pre-scaled path since `488a840` (`docs/env.md`).
 - The Windows-vs-Linux logit drift (Windows NVRTC 13.3.73 + driver 616.56 against Linux NVRTC
   13.3.33 + driver 610.57) is the toolchain, not the port: `docs/architecture.md` section 8.7
   carries the four values of record and the evidence.

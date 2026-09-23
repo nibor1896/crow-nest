@@ -163,6 +163,8 @@ Current numbers: crow-nest v0.3.1 (2026-09-18), one RTX 5090, Arch Linux, driver
 
 <!-- end of the numbers of record -->
 
+- The rows above were measured on the engine as it was before 2026-09-23. On 2026-09-23 the engine changed in three ways: the PLE row read was fixed (engine commit `85a48e7`, issue #91), activations gained a per-row pre-scale (`488a840`), and `CROW_QFUSE` fusions became opt-in. None of the rows was re-measured after that (2026-09-23). The fusions' cost of record is 19f -0.98 ms and 19h -0.23 ms per token, and the unfused default's decode speed is not measured (2026-09-23).
+- Operating point after those changes (robin's live Crow session, evening of 2026-09-23): bare container, fixed engine, the shipped hot-set manifest, decode 24 to 27 tok/s. See Known limitations.
 - crow-nest moves about 1.9x the expert bytes per token of the 2.4 bpw GGUF.
 - The 972 tok/s prefill and 42 tok/s decode figures of the engine's decision record are targets (spec section 0.1, approved 2026-09-02); prefill is above that target on Linux since v0.3.0, and decode at 16k context reads above it since 2026-09-18 — but the decode target names a session filled to the 200,000 token floor, which has no Linux reading, so neither row is the target met.
 - Earlier numbers (Windows, v0.2.0) are in the engine's `CHANGELOG.md` and its v0.2.0 release notes.
@@ -187,7 +189,7 @@ The two arms run different weights, and every comparison names both: llama.cpp r
 | engine | crow-nest, `https://github.com/nibor1896/crow-nest`; the server binary is `serve`, started from the engine repo root as its README Start section shows | engine README |
 | OS | Linux (x86_64, tested on Arch Linux, kernel 7.2, driver 610.57.04) and Windows x64. Linux needs the CUDA 13.3 runtime libraries on `LD_LIBRARY_PATH` and the container on a path WITHOUT filesystem compression (`chattr +m` on btrfs `compress=` mounts); `tools/serve-linux.sh` of the engine starts `serve` inside a memory-bounded `systemd-run` scope | engine README, Platform and Run on Linux; engine issue #15, closed 2026-09-17 |
 | GPU | one NVIDIA Blackwell GPU, `sm_120`, `compute_120a` target; every measured number here is one RTX 5090 | `docs/system-landscape.md:12` of the engine repo |
-| host RAM | 62 to 64 GB class: the engine pins up to 46 GiB of host memory for the cold expert tier, sized at boot from the RAM that can be pinned (on Linux the NVIDIA driver's freed pinned-page pool and the page cache count as free; another live CUDA process makes the gate conservative); the chain gate (engine issue #38) still applies to measurements; the budget as built was measured 2026-09-17 | `docs/system-landscape.md` and `docs/architecture.md` 2.1 of the engine repo |
+| host RAM | 62 to 64 GB class: the engine pins up to 46 GiB of host memory for the cold expert tier, sized at boot from the RAM that can be pinned (on Linux the NVIDIA driver's freed pinned-page pool and the page cache count as free; another live CUDA process makes the gate conservative); the chain gate (engine issue #38) still applies to measurements; the budget as built was measured 2026-09-17. On Linux the cold tier has been allocated as `register` by default since 2026-09-23: anonymous memory registered with the driver, charged to the serve scope (engine issue #103, `CROW_PINNED_ALLOC`) | `docs/system-landscape.md` and `docs/architecture.md` 2.1 of the engine repo |
 | CUDA | CUDA 13.3 toolkit. Windows: `nvrtc64_133_0.dll` needs the toolkit bin directory on `PATH`. Linux: `libnvrtc.so.13` and the runtime on `LD_LIBRARY_PATH` (never the `lib/stubs` directory); the driver's own `libcuda.so.1` | `docs/system-landscape.md` of the engine repo |
 | container placement | the engine default path is `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` inside the engine repo, or `CROW_CNQ` names any path | `geo.rs` `DEFAULT_CNQ` and `boot.rs` of the engine, `docs/env.md`, row `CROW_CNQ` |
 | hot-set manifest placement | the engine default path is `decode_out/hotsets-M-longctx2100-n160.json`, or `CROW_HOTSETS` names any path | `geo.rs` `DEFAULT_HOTSETS` and `boot.rs` of the engine, `docs/env.md`, row `CROW_HOTSETS` |
@@ -213,6 +215,34 @@ This package verifies itself. `selftest/` ships goldens that the layer-wise orac
 ```
 tools/selftest.sh /path/to/this/package
 ```
+
+## Known limitations
+
+### Token corruption in long tool calls (engine issue #91)
+
+Corrupted tokens in long agentic tool calls (for example `mat4` -> `mat44`, `N3` -> `N33`, a wrong digit in a path) had one engine cause. The PLE n-gram rows were read at the wrong container offset, so every token got the embedding of unrelated rows. That read had been in the engine since its first commit (2026-09-05), and it is fixed in engine commit `85a48e7` (2026-09-23).
+
+The table below is the multi-site probe of 2026-09-23. It covers 23 corrupt tool-call sites from one Crow session, 9 of them with fresh context. Each site is teacher-forced to the corrupt token, with prompts of 18k to 103k tokens. All crow arms used this container, the hot-set manifest above, KV fp8_e4m3 and one serve boot per arm.
+
+| arm | corrupt token wins | fresh context | mean margin, nats | date |
+|---|---|---|---|---|
+| crow-nest before the fix, bare container | 15 of 23 | 6 of 9 | -1.67 | 2026-09-23 |
+| crow-nest before the fix, dense BF16 overlay | 12 of 23 | 3 of 9 | -0.23 | 2026-09-23 |
+| crow-nest with the fix (`85a48e7`), dense BF16 overlay | 4 of 23 | 0 of 9 | +8.40 | 2026-09-23 |
+| llama.cpp UD-Q2_K_XL through llama-server | 4 of 23 | 1 of 9 | +8.29 | 2026-09-23 |
+
+- The bare container with the fix has no multi-site number, because that boot crashed with `CUDA_ERROR_INVALID_CONTEXT` (2026-09-23). The fixed row above uses the dense BF16 overlay, which the serve script no longer loads by default (2026-09-23).
+- The 4 sites still corrupt after the fix all carry an earlier corrupt spelling in their context. llama.cpp loses three of the same four (2026-09-23).
+- Live reading (robin's Crow session, evening of 2026-09-23, bare container with the fix): 0 corruption hits in 73,887 characters of tool-call arguments. The same amount of argument text before the fix had 60 hits. This is one session, counted once.
+
+### Hot-set manifest needs recalibration (2026-09-23)
+
+`hotsets-M-longctx2100-n160.json` was calibrated on the engine with the PLE read bug. The wrong n-gram embeddings changed the routing, so the manifest keeps the wrong experts resident for the fixed engine. robin's live session on the evening of 2026-09-23 measured a hot-set hit rate of 0.52 to 0.70, against 0.77 to 0.80 before the fix, and decode of 24 to 27 tok/s. A recalibrated manifest has not been made (2026-09-23). Until it exists, the manifest in the Files table is the only one, and the decode numbers of record above do not describe the fixed engine.
+
+### Other open items (2026-09-23)
+
+- No parity sha of record exists yet for the engine with the pre-scale and the PLE fix (2026-09-23).
+- The oracle-KLD numbers of the engine repo (`docs/oracle-kld.md`, measured 2026-09-19) predate both fixes.
 
 ## Not measured
 
