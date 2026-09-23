@@ -1418,6 +1418,44 @@ pub unsafe fn load_pw(cnq: &mut Cnq, name: &str, sec: &str) -> PW {
     }
 }
 
+
+/// #91 (2026-09-23): a PLE n-gram shard in the container is a FLAT stream of 64-value
+/// NVFP4 blocks (36 B each: 4 ue4m3 group scales, then 32 B of e2m1 pairs), 160 values
+/// per row: row r starts at value 160*r, on a block boundary for even r and 32 values
+/// into a block for odd r. The row cache and `gather_ple_fp4` hold a row padded to 3
+/// blocks (108 B). Reading the container at `row * 108` returned bytes of OTHER rows:
+/// the layer diff against llama.cpp (decode_out/meas-0923/layerdiff) measured the
+/// gathered embedding at cos -0.01 to the GGUF row, the flat read at 0.993, and the
+/// corrupt-digit sites mat44-a149 / N33-a131 moved from -0.81 / -7.77 to +12.53 / +12.71.
+pub const PLE_ROW_VALUES: u64 = 160;
+
+/// (byte offset of the first block, blocks to read, value offset inside the first block)
+/// of PLE row `row` in a shard of `n_values` values
+pub fn ple_row_span(row: u64, n_values: u64) -> (u64, usize, usize) {
+    let v0 = row * PLE_ROW_VALUES;
+    let b0 = v0 / 64;
+    let nblk = 4u64.min(n_values / 64 - b0) as usize;
+    (b0 * 36, nblk, (v0 % 64) as usize)
+}
+
+/// repack `nblk` flat blocks, starting `off` values into the first (0 or 32: whole
+/// 16-value scale groups), into the padded 3-block row layout of the cache
+pub fn ple_row_pad(src: &[u8], off: usize, nblk: usize) -> [u8; 108] {
+    let mut out = [0u8; 108];
+    for d in 0..3usize {
+        for g in 0..4usize {
+            let sv = off + d * 64 + g * 16;
+            let (sb, sg) = (sv / 64, (sv % 64) / 16);
+            if sb < nblk {
+                out[d * 36 + g] = src[sb * 36 + sg];
+                out[d * 36 + 4 + g * 8..d * 36 + 4 + g * 8 + 8]
+                    .copy_from_slice(&src[sb * 36 + 4 + sg * 8..sb * 36 + 4 + sg * 8 + 8]);
+            }
+        }
+    }
+    out
+}
+
 impl Ple {
     pub unsafe fn load(cnq: &mut Cnq, cache_bytes: u64) -> Ple {
         // projections/norms/conv + the I64 tables live in the `text` section;
@@ -1541,7 +1579,8 @@ impl Ple {
                 }
                 let shard = (id / PLE_ROWS_PER_SHARD) as usize;
                 let r = (id % PLE_ROWS_PER_SHARD) as u64;
-                out.push(cnq.abs_offset(&self.shards[shard].0, r * 108));
+                let t = &self.shards[shard].0;
+                out.push(cnq.abs_offset(t, ple_row_span(r, t.n_values).0));
             }
         }
         out
@@ -1589,10 +1628,10 @@ impl Ple {
                     .iter()
                     .map(|&(_, id)| {
                         let (t, _) = &self.shards[(id / rows_per_shard) as usize];
-                        cnq.abs_offset(t, (id % rows_per_shard) as u64 * 108)
+                        cnq.abs_offset(t, ple_row_span((id % rows_per_shard) as u64, t.n_values).0)
                     })
                     .collect();
-                cnq.warm().rows(&offs, 108);
+                cnq.warm().rows(&offs, 4 * 36);
             }
             // group by shard for sequential reads
             let mut by_shard: HashMap<i64, Vec<(usize, i64)>> = HashMap::new();
@@ -1609,7 +1648,8 @@ impl Ple {
                 let gs = t.global_scale;
                 for &(slot, id) in &rows {
                     let row = (id % rows_per_shard) as u64;
-                    let raw = cnq.read_range(t, row * 108, 108);
+                    let (b_off, nblk, off) = ple_row_span(row, t.n_values);
+                    let raw = ple_row_pad(&cnq.read_range(t, b_off, nblk * 36), off, nblk);
                     cuda::upload_into(self.cache + (slot * 108) as u64, &raw);
                     self.gs_host[slot] = gs;
                     cuda::to_f32_into(self.gs + (slot * 4) as u64, &[gs]);
@@ -3740,7 +3780,7 @@ impl Engine {
                 // TASK H: the same batched fetch `ensure_rows` uses, but queued
                 // behind every urgent batch - this thread runs WHILE the current
                 // chunk computes and must never delay the rows it waits on.
-                prefetch = Some(std::thread::spawn(move || warm.rows_ahead(&offsets, 108)));
+                prefetch = Some(std::thread::spawn(move || warm.rows_ahead(&offsets, 4 * 36)));
             }
             // per-chunk scalar refresh (device buffers, one sync each — chunk level)
             self.upload_chunk_scalars(t, pos_base, first && start == 0, ScalarSet::Full);
@@ -4893,5 +4933,49 @@ impl Drop for Scratch {
                 cuda::free_dev(f);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_ple_row {
+    use super::{ple_row_pad, ple_row_span, PLE_ROW_VALUES};
+
+    /// a flat shard whose 16-value group k carries scale byte k and data bytes k
+    fn flat(n_rows: u64) -> (Vec<u8>, u64) {
+        let n_values = n_rows * PLE_ROW_VALUES;
+        let n_blk = (n_values / 64) as usize;
+        let mut v = vec![0u8; n_blk * 36];
+        for b in 0..n_blk {
+            for g in 0..4 {
+                let k = ((b * 4 + g) % 251) as u8;
+                v[b * 36 + g] = k;
+                v[b * 36 + 4 + g * 8..b * 36 + 4 + g * 8 + 8].fill(k);
+            }
+        }
+        (v, n_values)
+    }
+
+    /// #91: every row, even (block-aligned) and odd (32 values into a block), the last
+    /// row of the shard included, comes back as ITS 10 groups of 16 values
+    #[test]
+    fn a_ple_row_is_read_from_the_flat_stream_at_value_160_r() {
+        // an even row count, like the container's 2,500,012 rows per shard: the shard
+        // then ends on a block boundary (160 * 2 = 5 blocks)
+        let (v, n_values) = flat(10);
+        for row in 0..10u64 {
+            let (b_off, nblk, off) = ple_row_span(row, n_values);
+            let b = b_off as usize;
+            let out = ple_row_pad(&v[b..b + nblk * 36], off, nblk);
+            for q in 0..10usize {
+                let (d, g) = (q / 4, q % 4);
+                let want = ((row as usize * 10 + q) % 251) as u8;
+                assert_eq!(out[d * 36 + g], want, "row {row} group {q} scale");
+                assert!(out[d * 36 + 4 + g * 8..d * 36 + 4 + g * 8 + 8].iter().all(|&x| x == want), "row {row} group {q} data");
+            }
+        }
+        // the old `row * 108` offset is NOT where row 1 starts
+        assert_ne!(ple_row_span(1, n_values).0, 108);
+        assert_eq!(ple_row_span(1, n_values), (2 * 36, 4, 32));
+        assert_eq!(ple_row_span(2, n_values), (5 * 36, 4, 0));
     }
 }
