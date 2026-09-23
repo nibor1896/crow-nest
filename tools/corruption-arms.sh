@@ -56,12 +56,11 @@ port="${CORRUPTION_PORT:-8099}"
 # overlay comparison stays exact. Pool recovery still needs the margin on top.
 need_gib=$(( ${CROW_PINNED_BUDGET_GB:-44} + 2 ))
 
-# #82 pool behavior: after every engine exit the ~46 GiB pinned tier sits in
-# the NVIDIA driver pool; the next arm's loader sees MemAvailable ~8 GiB and
-# refuses (manager.rs / residency.rs). Sustained anonymous pressure returns
-# the pool. Same recovery gate-linux.sh and run-90-arm-final.sh run between
-# every engine item (verified 2026-09-21, df5fe09) - imported verbatim,
-# because without it this ladder dies after arm 1.
+# #103 (2026-09-23): the boot gate is the engine's own free_for_pin
+# (tools/pin-room.sh -> engine ramcheck), not MemAvailable. The driver pool the
+# old balloon pressed against is reclaimable and counted as free there; a
+# refusal means live processes hold the RAM, and says which.
+. "$root/tools/pin-room.sh"
 summary() {
 python3 - "$out" <<'PY'
 import json, sys, glob, os
@@ -80,50 +79,23 @@ for d in rows:
 PY
 }
 
-# HARD #82 state: two balloon passes in a row without a rise (9 -> 9 -> 9 GiB,
-# 2026-09-21 21:45 and 22:47) never recovered in any later pass - only a
-# reboot returns the pool. Say so, print the summary and exit instead of
-# burning four more passes and hanging in wait_ram; finished arms are skipped
-# on the next start.
 pool_recover() {
-    local av prev=-1 flat=0
-    for i in 1 2 3 4 5 6; do
-        av=$(awk '/^MemAvailable/{print int($2/1048576)}' /proc/meminfo)
-        if [ "${av:-0}" -ge "$need_gib" ]; then
-            [ "$i" -gt 1 ] && echo "  pool_recover: MemAvailable ${av} GiB after $((i-1)) pass(es)"
-            return 0
-        fi
-        if [ "$prev" -ge 0 ] && [ "$av" -lt $((prev + 2)) ]; then flat=$((flat + 1)); else flat=0; fi
-        if [ "$flat" -ge 2 ]; then
-            echo "  pool_recover: HARD state - two passes without a rise (MemAvailable ${av} GiB, need $need_gib). REBOOT, then start the same command again."
-            summary
-            exit 3
-        fi
-        prev=$av
-        echo "  pool_recover: pass $i (MemAvailable ${av} GiB, need $need_gib)"
-        timeout 300 python3 "$root/decode_out/kv-ab/balloon.py" "$need_gib" >/dev/null 2>&1
-    done
-    av=$(awk '/^MemAvailable/{print int($2/1048576)}' /proc/meminfo)
-    echo "  pool_recover: MemAvailable only ${av} GiB after 4 passes (need $need_gib) - arm may refuse"
+    pin_room "$need_gib" && return 0
+    echo "  pool_recover: free_for_pin below $need_gib GiB - live processes hold the RAM (see above); stopping, finished arms are skipped on the next start"
+    summary
+    exit 3
 }
 
 wait_ram() {
-    while true; do
-        a=$(awk '/^MemAvailable/{print int($2/1048576)}' /proc/meminfo)
-        [ "$a" -ge "$need_gib" ] && return 0
+    while ! PIN_ROOM_WAIT_S=0 pin_room "$need_gib" >/dev/null; do
         sleep 10
     done
 }
 
-# After an arm: wait for serve's REAL exit, then for MemAvailable to stop
-# rising on its own, and only then let pool_recover balloon. The first clean
-# ladder (2026-09-21 20:58) ran baseline 8/8, then six balloon passes sat at
-# MemAvailable 10 GiB and arm 2 never booted: run_arm slept 5 s after the kill,
-# while serve frees the ~46 GiB pinned tier before exit (#82) - a balloon that
-# presses against pages a draining serve still holds gets nothing back. Both
-# waits are bounded and SAY what they saw, so the log settles which it was.
+# After an arm: wait for serve's REAL exit (it frees the pinned tier before it
+# goes, #82), bounded and said out loud; pool_recover then reads free_for_pin.
 settle() {
-    local t0=$SECONDS av prev=-1 flat=0
+    local t0=$SECONDS
     while pgrep -f "release/serve .*--port $port" >/dev/null 2>&1; do
         if [ $((SECONDS - t0)) -ge 600 ]; then
             echo "  settle: serve STILL alive 600 s after SIGTERM - not escalating, the next arm will wait on RAM"
@@ -132,16 +104,6 @@ settle() {
         sleep 5
     done
     echo "  settle: serve exit after $((SECONDS - t0)) s"
-    t0=$SECONDS
-    while [ $((SECONDS - t0)) -lt 600 ]; do
-        av=$(awk '/^MemAvailable/{print int($2/1048576)}' /proc/meminfo)
-        [ "$av" -ge "$need_gib" ] && break
-        if [ "$av" -le "$prev" ]; then flat=$((flat + 1)); else flat=0; fi
-        [ "$flat" -ge 6 ] && break  # 90 s without a rise: the rest is the driver pool, balloon territory
-        prev=$av
-        sleep 15
-    done
-    echo "  settle: MemAvailable ${av} GiB after $((SECONDS - t0)) s of waiting (need $need_gib)"
 }
 
 complete() {  # json_path -> 0 when the probe said it finished
@@ -162,7 +124,7 @@ replay_probe() {  # label rounds_or_empty sampling_json
 }
 
 # THE TABLE IS WRITTEN AFTER EVERY ARM, not at the end: the ladder of record
-# runs across reboots (#82 HARD pool state), and a result that only lives in a
+# runs across several starts, and a result that only lives in a
 # summary printed by the last boot is a result a reboot can lose. One row per
 # probe file, appended once (the row carries the file's sha, a rerun of the
 # table step never duplicates it). $out/TABLE.md is the durable record.
@@ -242,7 +204,8 @@ run_arm() {  # label overlay_path_or_empty
         replay_probe "$label" "${CORRUPTION_REPLAY_ROUNDS:-}" "${sampling:-{\}}"
         # CORRUPTION_REPLAY_GREEDY=1: the same boot also answers under greedy
         # (one round -- greedy has one answer). A boot is the expensive unit:
-        # 2026-09-22 the pool needed a REBOOT after every engine exit, so each
+        # 2026-09-22 every engine exit was followed by a MemAvailable gate that
+        # asked for a reboot (#103: a wrong gate, fixed), so each
         # boot carries both questions -- seed 0 (the live condition) and
         # argmax (is the wrong digit the MOST likely token under this arm?).
         [ -n "${CORRUPTION_REPLAY_GREEDY:-}" ] && \
@@ -260,11 +223,11 @@ run_arm() {  # label overlay_path_or_empty
     settle
 }
 
-# CORRUPTION_ARMS selects arms (default: all five). The pool goes into the HARD
-# #82 state after one or two engine exits (2026-09-21 21:45: six balloon passes
-# at 12 GiB after arm 2, ~48 GiB held with no owning process) and only a reboot
-# returns it, so the ladder finishes across boots; the summary below reads every
-# <label>.json in $out, whichever run wrote it.
+# CORRUPTION_ARMS selects arms (default: all five). Before the #103
+# (2026-09-23) the balloon gate stalled after one or two engine exits
+# (2026-09-21 21:45: six passes at 12 GiB) and the ladder was finished across
+# reboots; the summary below still reads every <label>.json in $out, whichever
+# run wrote it.
 overlay_for() {
     case "$1" in
         baseline)  echo "" ;;

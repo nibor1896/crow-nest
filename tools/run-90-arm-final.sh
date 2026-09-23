@@ -1,6 +1,6 @@
 #!/bin/bash
 # #90 engine arm, the working invocation (2026-09-21):
-#   - balloon before EVERY run (the pool refills after each engine exit)
+#   - RAM gate before EVERY run on the engine's own free_for_pin (tools/pin-room.sh, #82)
 #   - CROW_RAM_MARGIN_GB=1 and NO CROW_PINNED_BUDGET_GB override - the
 #     planner keeps the default tier (the arm script's low ladder rungs
 #     can never boot -M: low budget => more hot experts => VRAM refuses)
@@ -15,14 +15,9 @@ OUT=decode_out/oracle-longctx/engine
 PLAN=decode_out/oracle-longctx/row-plan.json
 export LD_LIBRARY_PATH="$HOME/.local/share/crow/cuda/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-recover() {  # balloon until >=45 GiB, max 4 passes
-  for i in 1 2 3 4; do
-    local av; av=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
-    [ "${av:-0}" -ge 45 ] && return 0
-    echo "  balloon pass $i (avail ${av} GiB)"
-    timeout 280 python3 "$root/decode_out/kv-ab/balloon.py" 46 >/dev/null 2>&1
-  done
-  awk '/MemAvailable/{print "  WARNING: avail only " int($2/1048576) " GiB"}' /proc/meminfo
+. "$root/tools/pin-room.sh"
+recover() {  # #103: the engine's own free_for_pin, no balloon
+  pin_room 46 || echo "  WARNING: free_for_pin below 46 GiB - live processes hold the RAM"
 }
 
 run_one() {  # anchor arm

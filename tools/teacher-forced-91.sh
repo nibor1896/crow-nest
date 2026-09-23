@@ -15,11 +15,11 @@
 #   dense-kv   + CROW_KV=bf16        ... and the KV cache BF16 (only expert FP4 left)
 #   placebo    attn-v-out-control    kernel-path noise at #65 (numerically neutral overlay)
 #
-# Every boot needs the pinned pool back (#82): recover() balloons, and stops with
-# "REBOOT needed" when MemAvailable stays flat below the arm's need. Arms already on disk
-# are skipped, so a rerun after a reboot continues where it stopped.
+# Every boot is gated on the engine's own free_for_pin (tools/pin-room.sh, #103):
+# the driver pool of an earlier engine counts as free there because it is reclaimable.
+# A refusal names the live processes that hold the RAM. Arms already on disk are skipped.
 #
-# Usage (from anywhere; after a reboot is best):  tools/teacher-forced-91.sh [arm ...]
+# Usage (from anywhere):  tools/teacher-forced-91.sh [arm ...]
 # Output: decode_out/91-teacher-forced/ (dumps, serve logs, compare.txt, oracle/gen-sequence.json)
 set -uo pipefail
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,18 +36,9 @@ for f in "$MAIN"/converter/*.cnq; do ln -sfn "$f" "converter/$(basename "$f")"; 
 [ -e decode_out/hotsets-M-longctx2100-n160.json ] || ln -sfn "$MAIN/decode_out/hotsets-M-longctx2100-n160.json" decode_out/
 [ -x target/release/serve ] || { echo "build first: cd engine && CARGO_TARGET_DIR=$WT/target cargo build --release --bin serve"; exit 2; }
 
-avail() { awk '/^MemAvailable/{print int($2/1048576)}' /proc/meminfo; }
+. "$WT/tools/pin-room.sh"
 recover() {  # need_gib
-  local need=$1 prev=-1 flat=0 av
-  for i in 1 2 3 4 5 6 7 8; do
-    av=$(avail); echo "recover: pass $i MemAvailable ${av} GiB (need $need)"
-    [ "$av" -ge "$need" ] && return 0
-    if [ "$prev" -ge 0 ] && [ "$av" -lt $((prev + 2)) ]; then flat=$((flat+1)); else flat=0; fi
-    [ "$flat" -ge 2 ] && { echo "HARD: pool not coming back - REBOOT needed"; exit 3; }
-    prev=$av
-    timeout 300 python3 "$MAIN/decode_out/kv-ab/balloon.py" "$need" >/dev/null 2>&1
-  done
-  [ "$(avail)" -ge "$need" ] || { echo "pool did not reach $need GiB - REBOOT needed"; exit 3; }
+  pin_room "$1" || { echo "free_for_pin below $1 GiB - live processes hold the RAM (see above); stopping"; exit 3; }
 }
 SERVE=
 boot() {  # label pinned_gb overlay [extra env...]

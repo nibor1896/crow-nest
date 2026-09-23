@@ -360,31 +360,13 @@ scope_run() {
             "$bin" "$@" > "$log" 2>&1
 }
 
-# #82 pool behavior (measured 2026-09-20/21; the kv-ab balloon proof and the #90
-# engine arm's ladder): after every engine exit the ~46 GiB pinned tier sits
-# lazily in the NVIDIA driver pool, and the NEXT item's loader sees a pinned
-# budget of ~8-10 GiB and refuses (manager.rs:203). Sustained anonymous
-# pressure returns the pool within seconds. Same recovery the kv-ab matrix ran
-# between every engine run; shallow pass, self-exits when MemAvailable is fine.
+# #103 (2026-09-23): every engine item is gated on the engine's own
+# free_for_pin (tools/pin-room.sh -> engine ramcheck) instead of MemAvailable +
+# balloon. The NVIDIA driver pool an earlier engine left is reclaimable and
+# counted as free there; the engine's allocation takes it back itself.
+. "$root/tools/pin-room.sh"
 pool_recover() {
-    # verified recovery: one balloon pass is not always enough right after an
-    # engine exit (the pool releases lazily under pressure; a pass can time out
-    # mid-round and leave MemAvailable short - measured 2026-09-21, the gate's
-    # second item refused at budget 25.9 GiB with a single 240 s pass). Loop
-    # until MemAvailable really is >= 46 GiB, max four passes, and SAY what
-    # happened. In the HARD-leak state (#82) this exhausts and the item refuses
-    # with the reason in its log - the honest outcome.
-    local av
-    for i in 1 2 3 4; do
-        av=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
-        if [ "${av:-0}" -ge 46 ]; then
-            [ "$i" -gt 1 ] && echo "  pool_recover: MemAvailable ${av} GiB after $((i-1)) pass(es)"
-            return 0
-        fi
-        timeout 300 python3 "$root/decode_out/kv-ab/balloon.py" 46 >/dev/null 2>&1
-    done
-    av=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
-    echo "  pool_recover: MemAvailable only ${av} GiB after 4 passes - item may refuse"
+    pin_room 46 || echo "  pool_recover: free_for_pin below 46 GiB - live processes hold the RAM (see above); item may refuse"
 }
 
 # parity_item <name> <ids.json> <expected sha> <expected bytes|-> <extra env...>

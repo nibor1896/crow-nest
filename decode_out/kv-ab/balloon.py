@@ -7,7 +7,19 @@ loader then sees MemAvailable ~8 GiB and refuses config (manager.rs:203) or the
 pre-pin gate (residency.rs:247). Sustained anonymous-memory pressure forces the
 pool back within seconds to a minute; one shallow pass is sometimes not enough,
 so the deep pattern (stop at 1.5 GiB, 2 s pace, up to 60 GiB) repeats until the
-target MemAvailable is reached or three rounds pass."""
+target MemAvailable is reached or three rounds pass.
+
+OBSOLETE since the #103, the #82 follow-up (2026-09-23): no tools/ script calls it any
+more - they gate on the engine's own free_for_pin (tools/pin-room.sh), which
+counts the reclaimable driver pool as free. Why it was an unreliable gate:
+`if memavail() > 40 GiB: break` ends every round after ONE GiB once
+MemAvailable is above 40, so it can never lift MemAvailable past ~40 + what is
+already free (MEAS-0923 01:11: 44 -> 44 -> 44 GiB, "REBOOT needed" for need
+51). Not measured, a suspicion for the lower flat states: its bytearrays are
+zero-filled, which zram (swappiness 150 on this host) stores as same-filled
+pages at almost no RAM cost, so swapping the balloon itself may relieve the
+pressure the pool's shrinker needs.
+"""
 import sys, time
 
 TARGET_GIB = float(sys.argv[1]) if len(sys.argv) > 1 else 46.0

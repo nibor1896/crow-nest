@@ -13,6 +13,15 @@
 # Limits are computed from /proc/meminfo MemTotal: MemoryHigh = MemTotal - 8G,
 # MemoryMax = MemTotal - 6G, so the desktop keeps a floor the engine cannot eat.
 #
+# Since the #103 (2026-09-23) the cold tier is registered ANONYMOUS
+# memory (CROW_PINNED_ALLOC=register), so it is charged to this scope: a 45.1 GiB
+# tier boots at memory.current ~49.9 GiB (tier + heap + page cache), under
+# MemoryHigh 54.2 GiB on the 62 GiB host. The old write-combined tier
+# (CROW_PINNED_ALLOC=wc) was driver memory and escaped the scope entirely
+# (memory.current 3.0 GiB with the same tier pinned). A pinned budget near
+# 50 GiB therefore runs close to MemoryHigh; the page cache is what gets reclaimed
+# first, the pinned tier cannot be.
+#
 # Environment: CUDA_LIB names the CUDA runtime directory (default
 # ~/.local/share/crow/cuda/lib; never the .../lib/stubs sibling). Every CROW_*
 # variable of the caller is passed through. Every argument is passed to `serve`.
