@@ -70,6 +70,14 @@ if [ -n "${CROW_CNQ_OVERLAY:-}" ]; then
     echo "serve-linux.sh: CROW_CNQ_OVERLAY=$CROW_CNQ_OVERLAY (opt-in; the default is the bare container since the #91 100k ladder)" >&2
 fi
 
+# #102: CROW_KV=bf16 (the KV cache in bf16 instead of FP8 E4M3) is read by serve and
+# passed through like every CROW_* above. It doubles the KV bytes, the
+# planner pays with hot experts, and the larger cold tier no longer fits the 46 GiB
+# default cap: set CROW_PINNED_BUDGET_GB with it (docs/env.md, CROW_KV row).
+if [ -n "${CROW_KV:-}" ]; then
+    echo "serve-linux.sh: CROW_KV=$CROW_KV (KV cache dtype; bf16 needs a larger CROW_PINNED_BUDGET_GB, now ${CROW_PINNED_BUDGET_GB:-unset})" >&2
+fi
+
 printf 'serve-linux.sh: scope MemoryHigh=%s MemoryMax=%s MemorySwapMax=0, %s CROW_* passed through\n' \
     "$high" "$max" "${#crow_env[@]}" >&2
 

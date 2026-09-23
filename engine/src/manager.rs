@@ -227,6 +227,15 @@ impl StateSizes {
     }
 }
 
+impl StateSizes {
+    /// every state byte the planner sets aside before the hot set (KV at the
+    /// config's dtype - bf16 doubles `kv_bytes`, #102 - plus QSA, GDN, rope)
+    pub fn total(&self) -> u64 {
+        self.kv_bytes + self.qsa_keys_bytes + self.qsa_pooled_bytes
+            + self.gdn_s_bytes + self.gdn_conv_bytes + self.rope_bytes
+    }
+}
+
 pub struct ThreeStates {
     pub context: usize,
     pub kv: KvDtype,
@@ -280,73 +289,27 @@ impl ThreeStates {
         // auto-clamp N with measured numbers, never the context (spec 2.1).
         // TWO-sided: VRAM lowers N, the HOST pinned budget RAISES it (fewer
         // cold experts) — measured host ceiling ~48.5 GB on this machine.
-        let mut n = cfg.n_hot;
         let sizes = StateSizes::plan(cfg.context, cfg.kv, cfg.prompt_chunk);
         // the state bytes do not depend on N (the hot-expert count): one plan for the whole clamp loop
-        let states_bytes = sizes.kv_bytes + sizes.qsa_keys_bytes + sizes.qsa_pooled_bytes
-            + sizes.gdn_s_bytes + sizes.gdn_conv_bytes + sizes.rope_bytes;
-        // Termination guard (2026-09-04): when VRAM pushes N down and the host
-        // budget pushes it up, no N is feasible. Without this the loop
-        // oscillated forever and grew `rep.lines` without bound -> the whole
-        // machine froze from RAM exhaustion (chunk 1024 on the M container).
-        let mut went_down = false;
-        let mut went_up = false;
-        let mut iters = 0u32;
+        let states_bytes = sizes.total();
         let spare = cfg.adapt.spare; // #17: from the policy in geo.rs, not the env
-        loop {
-            let sum = states_bytes + pending_bytes + n as u64 * expert_bytes_per_n_unit;
-            let cold = (if cold_fixed { E } else { E - n.min(E) + spare }) as u64 * cold_bytes_per_n_unit;
-            if sum + SAFETY < free0 && cold <= cfg.host_pinned_budget {
-                break;
+        let n = match clamp_hot_n(&ClampInput {
+            n_hot: cfg.n_hot,
+            states_bytes,
+            pending_bytes,
+            expert_bytes_per_n_unit,
+            cold_bytes_per_n_unit,
+            cold_fixed,
+            spare,
+            free0,
+            host_pinned_budget: cfg.host_pinned_budget,
+        }) {
+            Ok((n, lines)) => {
+                rep.lines.extend(lines);
+                n
             }
-            if n == N_MIN {
-                break;
-            }
-            iters += 1;
-            if (went_down && went_up) || iters > 2 * E as u32 {
-                rep.lines.push(format!(
-                    "no feasible N: VRAM allows at most N={} while the host pinned budget needs more — refusing",
-                    n
-                ));
-                // #10b: the message moved into planner_refusal_msg (tested)
-                panic!("{}", planner_refusal_msg(free0, cfg.host_pinned_budget));
-            }
-            if sum + SAFETY >= free0 {
-                went_down = true;
-                n -= 1;
-                if n % 8 == 0 {
-                    rep.lines.push(format!(
-                        "VRAM budget over by {:.0} MB at N={} — clamping",
-                        (sum + SAFETY - free0) as f64 / MIB,
-                        n
-                    ));
-                }
-            } else {
-                went_up = true;
-                n += 1;
-                if n % 8 == 0 {
-                    rep.lines.push(format!(
-                        "host pinned tier over by {:.0} MB at N={} — raising N",
-                        (cold - cfg.host_pinned_budget) as f64 / MIB,
-                        n
-                    ));
-                }
-            }
-            if cfg_n_dbg() {
-                tracing::info!(target: "manager", "[clamp] n={n} vram_sum={:.0} MB cold={:.0} MB free0={:.0} MB",
-                    states_bytes as f64 / MIB,
-                    ((if cold_fixed { E } else { E - n.min(E) + spare }) as u64 * cold_bytes_per_n_unit) as f64 / MIB,
-                    free0 as f64 / MIB);
-            }
-        }
-        let cold_final = (if cold_fixed { E } else { E - n.min(E) + spare }) as u64 * cold_bytes_per_n_unit;
-        if cold_final > cfg.host_pinned_budget {
-            panic!(
-                "refusing config: hot set N={n} would pin {:.1} GiB cold > budget {:.1} GiB — no feasible N (spec 2.1)",
-                cold_final as f64 / GIB,
-                cfg.host_pinned_budget as f64 / GIB
-            );
-        }
+            Err(msg) => panic!("{msg}"),
+        };
         if n < cfg.n_hot {
             rep.lines.push(format!(
                 "loader auto-clamped hot set: N {} -> {} (measured budget, spec 2.6)",
@@ -456,12 +419,7 @@ impl ThreeStates {
         rep.lines.push(format!(
             "states+dense+hot measured in VRAM: {:.1} MiB (planned {:.1} MiB, N={n})",
             measured as f64 / MIB,
-            (sizes.kv_bytes
-                + sizes.qsa_keys_bytes
-                + sizes.qsa_pooled_bytes
-                + sizes.gdn_s_bytes
-                + sizes.gdn_conv_bytes
-                + sizes.rope_bytes
+            (sizes.total()
                 + pending_bytes
                 + n as u64 * expert_bytes_per_n_unit) as f64 / MIB
         ));
@@ -494,6 +452,89 @@ impl ThreeStates {
             * AHD as u64
             * b
     }
+}
+
+/// The inputs of the two-sided hot-set clamp, all measured or planned bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct ClampInput {
+    pub n_hot: usize,
+    /// `StateSizes::total()`: KV (at the config's dtype) + QSA + GDN + rope
+    pub states_bytes: u64,
+    pub pending_bytes: u64,
+    pub expert_bytes_per_n_unit: u64,
+    pub cold_bytes_per_n_unit: u64,
+    pub cold_fixed: bool,
+    pub spare: usize,
+    pub free0: u64,
+    pub host_pinned_budget: u64,
+}
+
+/// The hot-set size N the planner picks, as pure arithmetic (#102: factored
+/// out of `ThreeStates::allocate` unchanged so the KV-dtype effect on N is
+/// testable without a GPU). VRAM lowers N, the host pinned budget RAISES it
+/// (fewer cold experts). `Err` is the refusal text the caller panics with.
+pub fn clamp_hot_n(c: &ClampInput) -> Result<(usize, Vec<String>), String> {
+    let mut lines = Vec::new();
+    let mut n = c.n_hot;
+    let cold_of = |n: usize| (if c.cold_fixed { E } else { E - n.min(E) + c.spare }) as u64 * c.cold_bytes_per_n_unit;
+    // Termination guard (2026-09-04): when VRAM pushes N down and the host
+    // budget pushes it up, no N is feasible. Without this the loop
+    // oscillated forever and grew the report lines without bound -> the whole
+    // machine froze from RAM exhaustion (chunk 1024 on the M container).
+    let mut went_down = false;
+    let mut went_up = false;
+    let mut iters = 0u32;
+    loop {
+        let sum = c.states_bytes + c.pending_bytes + n as u64 * c.expert_bytes_per_n_unit;
+        let cold = cold_of(n);
+        if sum + SAFETY < c.free0 && cold <= c.host_pinned_budget {
+            break;
+        }
+        if n == N_MIN {
+            break;
+        }
+        iters += 1;
+        if (went_down && went_up) || iters > 2 * E as u32 {
+            // #10b: the message moved into planner_refusal_msg (tested)
+            return Err(planner_refusal_msg(c.free0, c.host_pinned_budget));
+        }
+        if sum + SAFETY >= c.free0 {
+            went_down = true;
+            n -= 1;
+            if n % 8 == 0 {
+                lines.push(format!(
+                    "VRAM budget over by {:.0} MB at N={} — clamping",
+                    (sum + SAFETY - c.free0) as f64 / MIB,
+                    n
+                ));
+            }
+        } else {
+            went_up = true;
+            n += 1;
+            if n % 8 == 0 {
+                lines.push(format!(
+                    "host pinned tier over by {:.0} MB at N={} — raising N",
+                    (cold - c.host_pinned_budget) as f64 / MIB,
+                    n
+                ));
+            }
+        }
+        if cfg_n_dbg() {
+            tracing::info!(target: "manager", "[clamp] n={n} vram_sum={:.0} MB cold={:.0} MB free0={:.0} MB",
+                c.states_bytes as f64 / MIB,
+                cold_of(n) as f64 / MIB,
+                c.free0 as f64 / MIB);
+        }
+    }
+    let cold_final = cold_of(n);
+    if cold_final > c.host_pinned_budget {
+        return Err(format!(
+            "refusing config: hot set N={n} would pin {:.1} GiB cold > budget {:.1} GiB — no feasible N (spec 2.1)",
+            cold_final as f64 / GIB,
+            c.host_pinned_budget as f64 / GIB
+        ));
+    }
+    Ok((n, lines))
 }
 
 pub const SAFETY: u64 = 512 << 20; // launch pools, scratch, telemetry slack
@@ -671,6 +712,87 @@ mod tests_72 {
         let short = headroom_line(37_450_000, POST_PLAN_FLOOR);
         assert!(short.starts_with("SHORT:"), "{short}");
         assert!(short.contains("BELOW the floor 0.25 GiB"), "{short}");
+    }
+}
+
+#[cfg(test)]
+mod tests_kv_dtype {
+    //! #102: CROW_KV=bf16 doubles the KV bytes and the planner pays for them in
+    //! hot experts (VRAM) and therefore in pinned cold bytes (host). Pure arithmetic.
+    use super::*;
+
+    /// 48 layers x 2,764,800 B per expert (`operating_point.cold_path.expert_bytes`
+    /// of the MEAS-0923 serve logs, 2026-09-23) = the bytes of one hot-set unit
+    const UNIT: u64 = 48 * 2_764_800;
+
+    #[test]
+    fn bf16_kv_is_exactly_twice_fp8_and_nothing_else_moves() {
+        let f = StateSizes::plan(200_000, KvDtype::Fp8E4m3, 2048);
+        let b = StateSizes::plan(200_000, KvDtype::Bf16, 2048);
+        // 12 layers x 2 (k,v) x 2 kv-heads x 256 x 200000 x 1 B: the 2343.8 MB of the
+        // `[budget] KV` line in serve-tf-dense-kv.log
+        assert_eq!(f.kv_bytes, 2_457_600_000);
+        assert_eq!(b.kv_bytes, 2 * f.kv_bytes);
+        assert_eq!(b.total() - f.total(), f.kv_bytes);
+        assert_eq!(
+            (b.qsa_keys_bytes, b.qsa_pooled_bytes, b.gdn_s_bytes, b.gdn_conv_bytes, b.rope_bytes),
+            (f.qsa_keys_bytes, f.qsa_pooled_bytes, f.gdn_s_bytes, f.gdn_conv_bytes, f.rope_bytes)
+        );
+        assert_eq!(format!("{:.1}", f.kv_bytes as f64 / MIB), "2343.8");
+        assert_eq!(format!("{:.1}", b.kv_bytes as f64 / MIB), "4687.5");
+    }
+
+    /// a card sized so that FP8 KV lands on N=155 (the serve-bare boot of MEAS-0923)
+    fn card(kv: KvDtype, budget_gib: u64) -> ClampInput {
+        let fp8 = StateSizes::plan(200_000, KvDtype::Fp8E4m3, 2048).total();
+        let pending = 1 << 30;
+        ClampInput {
+            n_hot: 160,
+            states_bytes: StateSizes::plan(200_000, kv, 2048).total(),
+            pending_bytes: pending,
+            expert_bytes_per_n_unit: UNIT,
+            cold_bytes_per_n_unit: UNIT,
+            cold_fixed: false,
+            spare: 7,
+            free0: fp8 + pending + 155 * UNIT + SAFETY + 1,
+            host_pinned_budget: budget_gib << 30,
+        }
+    }
+
+    #[test]
+    fn bf16_kv_costs_19_hot_experts_per_layer_at_200k() {
+        let (n8, _) = clamp_hot_n(&card(KvDtype::Fp8E4m3, 48)).unwrap();
+        let (n16, lines) = clamp_hot_n(&card(KvDtype::Bf16, 48)).unwrap();
+        assert_eq!(n8, 155);
+        // 2,457,600,000 B / 132,710,400 B = 18.52 -> the first N that fits is 19 lower
+        assert_eq!(n16, 136);
+        assert!(lines.iter().any(|l| l.contains("clamping")), "{lines:?}");
+    }
+
+    #[test]
+    fn bf16_kv_at_the_46_gib_default_cap_is_refused_loudly_not_squeezed() {
+        // N=136 pins (512 - 136 + 7) x UNIT = 47.34 GiB > 46 GiB: no feasible N
+        assert!(clamp_hot_n(&card(KvDtype::Fp8E4m3, 46)).is_ok());
+        let e = clamp_hot_n(&card(KvDtype::Bf16, 46)).unwrap_err();
+        assert!(e.starts_with("refusing config: no hot-set size fits BOTH"), "{e}");
+    }
+
+    #[test]
+    fn crow_kv_words_parse_and_a_typo_is_an_error() {
+        assert_eq!(KvDtype::parse("bf16"), Ok(KvDtype::Bf16));
+        assert_eq!(KvDtype::parse("BF16"), Ok(KvDtype::Bf16));
+        assert_eq!(KvDtype::parse("fp8"), Ok(KvDtype::Fp8E4m3));
+        assert_eq!(KvDtype::parse("fp8_e4m3"), Ok(KvDtype::Fp8E4m3));
+        for k in [KvDtype::Fp8E4m3, KvDtype::Bf16] {
+            assert_eq!(KvDtype::parse(k.name()), Ok(k), "name() must round-trip");
+        }
+        for bad in ["", "f16", "bf-16", "fp8e4m3", "1", " bf16"] {
+            let e = KvDtype::parse(bad).unwrap_err();
+            assert!(e.contains("accepted: bf16, fp8, fp8_e4m3"), "{bad:?}: {e}");
+        }
+        assert_eq!(KvDtype::from_env_value(None), Ok(None));
+        assert_eq!(KvDtype::from_env_value(Some("bf16")), Ok(Some(KvDtype::Bf16)));
+        assert!(KvDtype::from_env_value(Some("bf61")).is_err());
     }
 }
 

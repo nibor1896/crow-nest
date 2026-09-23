@@ -85,7 +85,10 @@ for a in "${ARMS[@]}"; do
   case $a in
     bare)     arm bare 46 46 "" ;;
     dense)    arm dense 51 50 "$WT/converter/dense-bf16-originals.cnq" ;;
-    dense-kv) arm dense-kv 51 50 "$WT/converter/dense-bf16-originals.cnq" CROW_KV=bf16 ;;
+    # #102: serve reads CROW_KV now; bf16 KV costs ~19 hot experts per layer at 200k, so the
+    # cold tier grows ~2.35 GiB: 50 GiB pinned is computed to refuse; 51 fits at N 107 with
+    # 0.08 GiB to spare, so 52 (free VRAM moved N by 2 between the MEAS-0923 dense boots; not measured)
+    dense-kv) arm dense-kv 53 52 "$WT/converter/dense-bf16-originals.cnq" CROW_KV=bf16 ;;
     placebo)  arm placebo 48 47 "$WT/converter/layer91-attn-v-out-control.cnq" ;;
     *) echo "unknown arm $a"; exit 2 ;;
   esac

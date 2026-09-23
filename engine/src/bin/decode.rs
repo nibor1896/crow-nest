@@ -62,10 +62,8 @@ fn main() {
                 if let Some(c) = env_parse::<usize>("CROW_CHUNK") {
                     cfg.prompt_chunk = c.max(ids.len());
                 }
-                // parity ladder switches (bisect FP4 / FP8-KV / PLE)
-                if std::env::var("CROW_KV").as_deref() == Ok("bf16") {
-                    cfg.kv = KvDtype::Bf16;
-                }
+                // parity ladder switches (bisect FP4 / FP8-KV / PLE); the KV one,
+                // CROW_KV, is read once at boot::open_model for every mode and bin (#102)
                 if std::env::var("CROW_PLE").as_deref() == Ok("off") {
                     cfg.ple = false;
                 }

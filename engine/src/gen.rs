@@ -527,10 +527,8 @@ impl Engine {
                 .iter()
                 .map(|s| s.iter().filter(|id| **id != EMPTY).count())
                 .collect(),
-            kv_dtype: match self.cfg.kv {
-                crate::geo::KvDtype::Fp8E4m3 => "fp8_e4m3",
-                crate::geo::KvDtype::Bf16 => "bf16",
-            },
+            // the dtype the KV buffer was allocated with (#102: CROW_KV at boot::open_model)
+            kv_dtype: self.st.kv.name(),
             kernel_path: match (mma_on(), dense_mma_on(), graph_on()) {
                 (true, true, true) => "moe mma + dense mma, cuda graph",
                 (true, true, false) => "moe mma + dense mma, no graph",
