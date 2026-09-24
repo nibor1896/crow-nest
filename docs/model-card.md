@@ -31,8 +31,8 @@ Qwen3.8-Flash-Next quantized to CNQ4.5-M: one NVFP4 container at 4.5 bpw with a 
 | quantization | CNQ4.5-M: NVFP4 at 4.5 bpw, round to nearest, calibration free; BF16 keeps for embeddings, `lm_head`, router, shared expert gate, all norms and every 1-D tensor; sub-block scales by `--scales mse` |
 | container | one file, `Qwen3.8-Flash-Next-CNQ4.5-M.cnq`, 104,727,179,972 B (about 105 GB) |
 | engine | crow-nest, `https://github.com/nibor1896/crow-nest`: own HTTP server, own container format, no GGUF, no transformers |
-| vision | the container carries the FULL vision tower, same quant policy as the text tower (see Vision) |
-| platform | Linux and Windows (crow-nest v0.3.1, 2026-09-18), CUDA, NVIDIA Blackwell (`sm_120`); every measured number on this card comes from one RTX 5090 |
+| vision | the container carries the FULL vision tower, same quant policy as the text tower; since crow-nest v0.5.0 (2026-09-24) `serve` prefers llama.cpp's F16 projector when it finds one (see Vision) |
+| platform | Linux and Windows (crow-nest v0.5.0, 2026-09-24; each measured number names the version it was read on), CUDA, NVIDIA Blackwell (`sm_120`); every measured number on this card comes from one RTX 5090 |
 | licence | model weights: Qwen Community License 1.0 (see License); engine and converter code: Apache-2.0 |
 
 ## Files
@@ -134,7 +134,8 @@ The container includes the complete vision tower of the base model, quantized wi
 | engine support | the crow-nest engine image path landed 2026-09-14 (engine `#VIT`, issue #66): the tower loads beside the text sections by default and `serve` answers image requests; ViT embeddings against the f32 oracle over the same container weights read max_abs 3.43e-06 at cos 1.000000 that day |
 
 - The tower rides inside the single container file, verified by the same `SHA256SUMS` check as everything else, so a vision boot needs nothing else.
-- Since 2026-09-24 (engine #108), `serve` PREFERS llama.cpp's F16 projector `mmproj-F16.gguf` (unsloth, 904,004,000 B, the file Crow's llama.cpp operating point loads) when `CROW_VIT_MMPROJ` finds one: the 112 vision linears then run in F16 instead of NVFP4, for +611 MiB of VRAM. Each of the 333 container `vit` tensors matches its projector tensor at cosine >= 0.9958 (CPU check, 2026-09-24). Without the file the container's NVFP4 section is used, as before.
+- Since 2026-09-24 (engine #108), `serve` PREFERS llama.cpp's F16 projector `mmproj-F16.gguf` (unsloth, 904,004,000 B, the file Crow's llama.cpp operating point loads) when `CROW_VIT_MMPROJ` finds one: the 112 vision linears then run in F16 instead of NVFP4, for +611 MiB of VRAM. Each of the 333 container `vit` tensors matches its projector tensor at cosine >= 0.9958 (CPU check, 2026-09-24). Without the file the container's NVFP4 section is used, as before. Live on 2026-09-24 (engine #108, #109, #114): the boot line names `mode f16`, and the colour probe reads 11 of 11.
+- Since 2026-09-24 (engine #107) every image reaches the model at 1,024 to 1,280 visual tokens (`CROW_VIT_MIN_TOKENS`, `CROW_VIT_MAX_TOKENS`), the window llama.cpp's `--image-min-tokens 1024` point uses; Crow's renders got 527 to 620 before (2026-09-23).
 - Vision quality rows against another engine are not claimed here: the llama.cpp `mmproj` comparison was deferred on 2026-09-14 and the oracle is the gate that ran instead.
 
 ## Converter command of record
@@ -239,7 +240,7 @@ The table below is the multi-site probe of 2026-09-23. It covers 23 corrupt tool
 
 ### Hot-set manifest recalibrated (2026-09-24)
 
-Recalibrated on 2026-09-24 as `hotsets-M-crow0924-n160.json`: held-out hit rate on generated positions 0.401 -> 0.723, decode on a 122k-token prompt 32.5 -> 35.8 tok/s ([hot-set calibration](hotset-calibration.md)). The published package still ships the manifest below. The paragraph that follows is the 2026-09-23 state.
+Recalibrated on 2026-09-24 as `hotsets-M-crow0924-n160.json`: held-out hit rate on generated positions 0.401 -> 0.723, decode on a 122k-token prompt 32.5 -> 35.8 tok/s ([hot-set calibration](hotset-calibration.md)). Live in `serve` on 2026-09-24 (engine #106): median 38.0 tok/s at hit rate 0.72 on 100k to 150k context (n = 50), 37.4 tok/s at 0.71 above 150k (n = 22). The published package still ships the manifest below. The paragraph that follows is the 2026-09-23 state.
 
 #### 2026-09-23
 
