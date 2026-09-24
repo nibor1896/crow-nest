@@ -133,7 +133,8 @@ The container includes the complete vision tower of the base model, quantized wi
 | tokenizer | the `image_pad` token (`248056`) and the vision markers are part of the base tokenizer; image prompts splice the tower output at the placeholder positions |
 | engine support | the crow-nest engine image path landed 2026-09-14 (engine `#VIT`, issue #66): the tower loads beside the text sections by default and `serve` answers image requests; ViT embeddings against the f32 oracle over the same container weights read max_abs 3.43e-06 at cos 1.000000 that day |
 
-- There is no separate vision file to download and no projector to fetch: the tower rides inside the single container file, verified by the same `SHA256SUMS` check as everything else.
+- The tower rides inside the single container file, verified by the same `SHA256SUMS` check as everything else, so a vision boot needs nothing else.
+- Since 2026-09-24 (engine #108), `serve` PREFERS llama.cpp's F16 projector `mmproj-F16.gguf` (unsloth, 904,004,000 B, the file Crow's llama.cpp operating point loads) when `CROW_VIT_MMPROJ` finds one: the 112 vision linears then run in F16 instead of NVFP4, for +611 MiB of VRAM. Each of the 333 container `vit` tensors matches its projector tensor at cosine >= 0.9958 (CPU check, 2026-09-24). Without the file the container's NVFP4 section is used, as before.
 - Vision quality rows against another engine are not claimed here: the llama.cpp `mmproj` comparison was deferred on 2026-09-14 and the oracle is the gate that ran instead.
 
 ## Converter command of record

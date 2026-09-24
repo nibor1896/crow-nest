@@ -1017,6 +1017,11 @@ impl Engine {
         // #72: the reserve is HELD here, not noted. `hold` is off only with
         // CROW_VIT_RESERVE_MB=0, the documented escape hatch back to the lazy
         // pre-#72 behaviour (and the old N) for a measurement.
+        // #107: a bad CROW_VIT_MIN_TOKENS / CROW_VIT_MAX_TOKENS stops the boot HERE,
+        // before a byte is loaded, never inside a request
+        if crate::vit::vit_on() {
+            let _ = crate::vit::budget();
+        }
         let vit_hold = crate::vit::reserve_bytes(cfg.context) > 0;
         let mut vit_scratch_held = 0u64;
         let vit = if crate::vit::vit_on() {
@@ -1028,9 +1033,11 @@ impl Engine {
                 vt.arm_scratch();
                 vit_scratch_held = crate::vit::scratch_bytes() as u64;
             }
-            println!("[vit] visual tower loaded: mode nvfp4 (f32 tower math), CROW_VIT {} (0 = the text-only placeholder), cap {} patches = {} visual tokens per image, vit weights {:.0} MiB ({})",
+            println!("[vit] visual tower loaded: mode {} (f32 tower math), CROW_VIT {} (0 = the text-only placeholder), {}, vit weights {:.0} MiB ({})",
+                vt.w.mode,
                 env_or_unset("CROW_VIT"),
-                vt.cap, vt.cap / 4, vit_bytes as f64 / MIB,
+                crate::vit::budget_words(&crate::vit::budget()),
+                vit_bytes as f64 / MIB,
                 if vit_hold {
                     format!("scratch held at boot, {:.1} MiB at the patch cap", vit_scratch_held as f64 / MIB)
                 } else {
