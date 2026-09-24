@@ -31,8 +31,8 @@ Qwen3.8-Flash-Next quantized to CNQ4.5-M: one NVFP4 container at 4.5 bpw with a 
 | quantization | CNQ4.5-M: NVFP4 at 4.5 bpw, round to nearest, calibration free; BF16 keeps for embeddings, `lm_head`, router, shared expert gate, all norms and every 1-D tensor; sub-block scales by `--scales mse` |
 | container | one file, `Qwen3.8-Flash-Next-CNQ4.5-M.cnq`, 104,727,179,972 B (about 105 GB) |
 | engine | crow-nest, `https://github.com/nibor1896/crow-nest`: own HTTP server, own container format, no GGUF, no transformers |
-| vision | the container carries the FULL vision tower, same quant policy as the text tower (see Vision) |
-| platform | Linux and Windows (crow-nest v0.3.1, 2026-09-18), CUDA, NVIDIA Blackwell (`sm_120`); every measured number on this card comes from one RTX 5090 |
+| vision | the container carries the FULL vision tower, same quant policy as the text tower; since crow-nest v0.5.0 (2026-09-24) `serve` prefers llama.cpp's F16 projector when it finds one (see Vision) |
+| platform | Linux and Windows (crow-nest v0.5.0, 2026-09-24; each measured number names the version it was read on), CUDA, NVIDIA Blackwell (`sm_120`); every measured number on this card comes from one RTX 5090 |
 | licence | model weights: Qwen Community License 1.0 (see License); engine and converter code: Apache-2.0 |
 
 ## Files
@@ -41,7 +41,7 @@ Qwen3.8-Flash-Next quantized to CNQ4.5-M: one NVFP4 container at 4.5 bpw with a 
 |---|---|---|---|
 | `Qwen3.8-Flash-Next-CNQ4.5-M.cnq` | 104,727,179,972 B | `7c058e555667b1c3d8f7d804d4a3393ba3664161dd307305718d85e4f33646b7` | the container |
 | `Qwen3.8-Flash-Next-CNQ4.5-M.cnq.sidecar.jsonl` | 436,716 B | `af85905fbf46c12fa9528d22f2932b8785c55731a8c8fb013b2e91eecc6f0692` | verification sidecar: one JSON line per tensor with max and mean error against the sub-block scales, gate 0 of the measurement ladder |
-| `hotsets-M-longctx2100-n160.json` | 83,705 B | `4a408907d553518ee4421e59eae09e243db82ac0cd677557596dfdbaa4b099dc` | hot-set manifest the engine loads so adapted experts stay resident; this is the manifest to use, not a sidecar derived from the container name (engine issue #49) |
+| `hotsets-M-longctx2100-n160.json` | 83,705 B | `4a408907d553518ee4421e59eae09e243db82ac0cd677557596dfdbaa4b099dc` | hot-set manifest of the published package and of the gates of record; not a sidecar derived from the container name (engine issue #49). The repository default since 2026-09-24 is `hotsets-M-crow0924-n160.json` (37,167 B, `f83e210a21391521b145d53d41fb0308f99cf6543bada03860127544a1b6fff5`, [hot-set calibration](hotset-calibration.md)) |
 | `selftest/layer0-input.f32` | 327,680 B | `65907fe567547704dd644eea9212c4c71b0b02f2fd954f23ecd28c7f5804d974` | self-test input: the `[8][10240]` f32 layer-0 activation the golden below belongs to (see Self-test) |
 | `selftest/layer0-golden-output.f32` | 327,680 B | `e98292a0413d7aaf6825ab23e80cfae52f2424b5524f835624e9d76e90d7c705` | self-test golden: the `[8][10240]` f32 output of the UNQUANTIZED layer 0 on that input |
 | `selftest/layer3-attn-input.f32` | 81,920 B | `d2662da06b578f7c2d8a466ea5a1d74b8b13afedd271b25c16bf0237c621cbeb` | self-test input: the `[8][2560]` f32 activation the layer-`3` attention mixer sees (engine issue #69, 2026-09-18) |
@@ -133,7 +133,9 @@ The container includes the complete vision tower of the base model, quantized wi
 | tokenizer | the `image_pad` token (`248056`) and the vision markers are part of the base tokenizer; image prompts splice the tower output at the placeholder positions |
 | engine support | the crow-nest engine image path landed 2026-09-14 (engine `#VIT`, issue #66): the tower loads beside the text sections by default and `serve` answers image requests; ViT embeddings against the f32 oracle over the same container weights read max_abs 3.43e-06 at cos 1.000000 that day |
 
-- There is no separate vision file to download and no projector to fetch: the tower rides inside the single container file, verified by the same `SHA256SUMS` check as everything else.
+- The tower rides inside the single container file, verified by the same `SHA256SUMS` check as everything else, so a vision boot needs nothing else.
+- Since 2026-09-24 (engine #108), `serve` PREFERS llama.cpp's F16 projector `mmproj-F16.gguf` (unsloth, 904,004,000 B, the file Crow's llama.cpp operating point loads) when `CROW_VIT_MMPROJ` finds one: the 112 vision linears then run in F16 instead of NVFP4, for +611 MiB of VRAM. Each of the 333 container `vit` tensors matches its projector tensor at cosine >= 0.9958 (CPU check, 2026-09-24). Without the file the container's NVFP4 section is used, as before. Live on 2026-09-24 (engine #108, #109, #114): the boot line names `mode f16`, and the colour probe reads 11 of 11.
+- Since 2026-09-24 (engine #107) every image reaches the model at 1,024 to 1,280 visual tokens (`CROW_VIT_MIN_TOKENS`, `CROW_VIT_MAX_TOKENS`), the window llama.cpp's `--image-min-tokens 1024` point uses; Crow's renders got 527 to 620 before (2026-09-23).
 - Vision quality rows against another engine are not claimed here: the llama.cpp `mmproj` comparison was deferred on 2026-09-14 and the oracle is the gate that ran instead.
 
 ## Converter command of record
@@ -181,6 +183,7 @@ The two arms run different weights, and every comparison names both: llama.cpp r
 - No sugarcoating: greedy crow-nest is 2 Pass / 5 Partial / 3 Fail, one task below the llama.cpp reference 2 / 6 / 2 on this reading, and sampling met the gate in 1 of 6 seeds (RTX 5090, 2026-09-10, engine issue #44).
 - On the C2 basis greedy met the gate in 0 of 1 seed (decision record, 2026-09-11, comment on engine issue #1).
 - Default since the C2 decision, option a, robin, 2026-09-11, comment on engine issue #1: `serve` is request decides. A request without `temperature` or with `temperature <= 0` runs greedy; a request with `temperature > 0` samples with top_p 0.8, top_k 20, presence_penalty 1.5, seed 0 (`serve.rs:1041` of the engine). Greedy stays the identity gate; the measured basis is the rows above.
+- **Superseded by crow-nest #111 (robin 2026-09-24):** an absent `temperature`, `top_p`, `top_k` or `min_p` is filled from the model card row of the request's thinking mode (thinking 1.0 / 0.95 / 20 / 0, non-thinking 0.7 / 0.8 / 20 / 0); greedy is `temperature <= 0` sent explicitly; `presence_penalty` stays 0 when absent (#91).
 
 ## Requirements
 
@@ -235,7 +238,11 @@ The table below is the multi-site probe of 2026-09-23. It covers 23 corrupt tool
 - The 4 sites still corrupt after the fix all carry an earlier corrupt spelling in their context. llama.cpp loses three of the same four (2026-09-23).
 - Live reading (robin's Crow session, evening of 2026-09-23, bare container with the fix): 0 corruption hits in 73,887 characters of tool-call arguments. The same amount of argument text before the fix had 60 hits. This is one session, counted once.
 
-### Hot-set manifest needs recalibration (2026-09-23)
+### Hot-set manifest recalibrated (2026-09-24)
+
+Recalibrated on 2026-09-24 as `hotsets-M-crow0924-n160.json`: held-out hit rate on generated positions 0.401 -> 0.723, decode on a 122k-token prompt 32.5 -> 35.8 tok/s ([hot-set calibration](hotset-calibration.md)). Live in `serve` on 2026-09-24 (engine #106): median 38.0 tok/s at hit rate 0.72 on 100k to 150k context (n = 50), 37.4 tok/s at 0.71 above 150k (n = 22). The published package still ships the manifest below. The paragraph that follows is the 2026-09-23 state.
+
+#### 2026-09-23
 
 `hotsets-M-longctx2100-n160.json` was calibrated on the engine with the PLE read bug. The wrong n-gram embeddings changed the routing, so the manifest keeps the wrong experts resident for the fixed engine. robin's live session on the evening of 2026-09-23 measured a hot-set hit rate of 0.52 to 0.70, against 0.77 to 0.80 before the fix, and decode of 24 to 27 tok/s. A recalibrated manifest has not been made (2026-09-23). Until it exists, the manifest in the Files table is the only one, and the decode numbers of record above do not describe the fixed engine.
 

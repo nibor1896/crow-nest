@@ -73,7 +73,10 @@ pub const GIB: f64 = (1u64 << 30) as f64;
 /// run from `engine/` wrap them in `from_engine_dir`. Nine sites used to spell
 /// these two strings out across two CWD conventions.
 pub const DEFAULT_CNQ: &str = "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq";
-pub const DEFAULT_HOTSETS: &str = "decode_out/hotsets-M-longctx2100-n160.json";
+// 2026-09-24: cut on the generated positions of three Crow goal-mode sessions
+// (tools/hotset-eval.py, docs/hotset-calibration.md); the gates of record keep
+// pinning hotsets-M-longctx2100-n160.json through CROW_HOTSETS (tools/gate-linux.sh).
+pub const DEFAULT_HOTSETS: &str = "decode_out/hotsets-M-crow0924-n160.json";
 
 /// a repo-root-relative path as seen from `engine/` (where `cargo run`,
 /// `cargo test` and the probe bins start)

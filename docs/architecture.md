@@ -282,7 +282,8 @@ point (7.13 has the two numbers and the measurement). `CROW_VIT=0` reserves noth
   multi-site number exists for the BARE container with the fix (that arm's boot panicked with
   `CUDA_ERROR_INVALID_CONTEXT`). The hot-set sidecar `hotsets-M-longctx2100-n160.json` was
   calibrated on the wrong rows and needs recalibration (live hit rate 0.52-0.70 after the fix
-  against 0.77-0.80 before, robin's session of 2026-09-23; not done on this branch). Lib tests
+  against 0.77-0.80 before, robin's session of 2026-09-23). Recalibrated 2026-09-24 as
+  `hotsets-M-crow0924-n160.json` (`docs/hotset-calibration.md`). Lib tests
   `tests_ple_row`.
 
 ### 2.5 Three-state manager
@@ -1960,6 +1961,31 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
   at a held position replaces that slot instead of adding a duplicate (`cache.rs` module doc,
   "Slot bookkeeping").
 
+**Images (#114, 2026-09-24):**
+
+- An image's prompt ids are `IMAGE_PAD` (248056) repeated once per visual token
+  (`vit::expand_ids`), so two DIFFERENT images of the same grid are the same id run.
+  Measured 2026-09-24: 7 of 12 colour-probe requests went `WARM ... prefill 0 of 1047` on a
+  new image and were answered for the first one.
+- So the comparison carries each image's content identity at its span, the llama.cpp rule
+  (`server_tokens::get_common_prefix`: a media chunk is equal only if its id and token
+  count are equal, else the prefix ends at its first index):
+
+| piece | implementation |
+|---|---|
+| request spans | `VisionPlan::spans`, `ImageSpan { start, len, hash }` per image (`vit::image_spans`) |
+| hash | `vit::image_key`, SHA-256 of the encoded bytes (`vit::ImageKey = [u8; 32]`), the key of the tower-output cache and its LRU too. A 64-bit SipHash (`DefaultHasher`, fixed keys) until 2026-09-24: a collision is a cache hit for a DIFFERENT image, so the identity is llama.cpp's cryptographic one (`tools/mtmd/mtmd-helper.cpp` `mtmd_helper_bitmap_init_from_buf`, "use sha256 to prevent cache poisoning"). In-crate FIPS 180-4, pinned to the NIST example vectors; no new dependency |
+| held spans | `Engine::history_images`: set after each prompt's prefill, truncated by `rollback`, cleared by `reset_to_zero` and by a slot-file restore (a file carries no image identity) |
+| `L` | `common_prefix_len_mm`: the id prefix, cut to the `start` of the first span on either side with no identical span on the other |
+| decision | `PrefixCache::decide_mm` (`decide_for` = the same with no spans) |
+
+- A re-sent identical image (Crow resends the whole history every turn) keeps full reuse.
+- mrope: positions below a row depend only on the types and grids before it, so identical
+  spans give identical positions; a differing image cuts `L` where both sides are still
+  plain text. A text-only request after an image one stops at the held image.
+- The `[cache]` line adds `images held H request R` and, when an image cut `L`,
+  `image cut L <id prefix> -> <L>`.
+
 **Why ids and not text:**
 
 - Rule: comparing ids and not text is not a stylistic choice.
@@ -2332,7 +2358,9 @@ Therefore:
   process, **124.60 MiB** at chunk 2048, the after-answer point dropped. See 7.6 and 7.7.
 - Row 5 confirmed by C2 (robin 2026-09-11, #55): the default stays request driven, greedy
   without `temperature`, sampled above 0; the ten-task gate under sampling is met in 1 of 6
-  seeds (#44), under greedy in 0 of 1 (#11). See 7.12.
+  seeds (#44), under greedy in 0 of 1 (#11). See 7.12. **Superseded for an absent `temperature` by
+  #111 (robin 2026-09-24):** it samples at the model card row of its thinking mode; greedy is a
+  SENT `temperature <= 0` only (the A9 identity gate sends it).
 
 **Note carried from the proposal, still open as a measurement, not a doc edit:**
 
@@ -2378,16 +2406,17 @@ Therefore:
 | `stream` | `true` streams `chat.completion.chunk` frames; `false` or absent answers ONE `chat.completion` document (#39 B3a, 7.11.13) | `serve.rs:970`, `serve.rs:2062` | `crow_core.py:4672-4700` (always `true`), `:2971` (digest path, no `stream` field) |
 | `stream_options.include_usage` | `true` puts `usage` on the final chunk | `serve.rs:970`, `serve.rs:1340` | `crow_core.py:4672-4700` |
 | `timings_per_token` | `true` puts `timings` on the final chunk | `serve.rs:970`, `serve.rs:1340` | `crow_core.py:4672-4700` |
-| `max_tokens` | default 8192 (1024 until 2026-09-18), capped at 32768, clamped to `n_ctx - prompt ids` | `serve.rs:1363` (`clamped_max_tokens`) | `crow_core.py:4672-4700` |
-| `temperature` | absent, `null` or `<= 0` is GREEDY; `> 0` samples | `serve.rs:1158` (`sampler_from`) | `crow_core.py:4672-4700` |
-| `top_p` | nucleus mass, default 0.8 (data sheet), read only when `temperature > 0` | `serve.rs:509`, `serve.rs:1158` | `crow_core.py:4672-4700` |
-| `top_k` | default 20 (data sheet), clamped to 64 by the device sampler (`SAMPLE_MAXK`, `engine/src/kernels.rs:3994`), read only when `temperature > 0` | `serve.rs:511`, `serve.rs:1158` | not sent by Crow |
-| `presence_penalty` | default **0** since `56e0297` (2026-09-22; the data sheet's 1.5 applies only when the client sends it, `DEFAULT_PRESENCE`), read only when `temperature > 0`. Until then the default was 1.5 and applied to every sampled Crow request | `serve.rs` (`DEFAULT_PRESENCE`, `parse_chat`), `sampler_from` | **never sent by Crow** — the string does not occur in `crow_core.py` (measured 2026-09-18, #68, 7.11.17) |
+| `max_tokens` | default 8192 (1024 until 2026-09-18), capped at 32768, clamped to `n_ctx - prompt ids` | `serve.rs:1363` (`clamped_max_tokens`) | `crow_core.py:6663` (always sent, 16384 by default) |
+| `max_completion_tokens` | #112 (2026-09-24): OpenAI's current name of the same budget (`max_tokens` is deprecated in its favor), same rules; both present with DIFFERENT values is a 400 naming both (llama-server takes the first alias found, silently). Before #112 ignored | `parse_chat`, `budget_field` | not sent by Crow |
+| `temperature` | **#111 (2026-09-24): absent or `null` = the model card row of the request's thinking mode** - thinking 1.0, non-thinking 0.7 (`CARD_THINKING` / `CARD_INSTRUCT`, huggingface.co/Qwen/Qwen3.8-Flash-Next "Best Practices"), so an absent field SAMPLES; `<= 0` SENT is GREEDY (the gates and probes); `> 0` samples. Until #111 absent was greedy. A `[chat] absent sampling fields filled from the model card, <row>` line names every field the card supplied | `parse_chat`, `card_row`, `card_fill_line`, `sampler_from` | `crow_core.py:6634` (always sent) |
+| `top_p` | nucleus mass; absent = card row (thinking 0.95, non-thinking 0.8, #111), read only when `temperature > 0` | `parse_chat`, `CARD_*` | `crow_core.py:6639` |
+| `top_k` | absent = card row (20 in both rows, #111); `0` or `-1` = top-k OFF (llama.cpp `llama-sampler.cpp:326`, vLLM), other negatives a 400; the device sampler holds 1..=64 (`SAMPLE_MAXK`), so a sampled `0` or `> 64` draws on the HOST sampler (one logits row read back per token) instead of being clamped - until #111 `0` was clamped to 1 (greedy) and `> 64` to 64 on the device only; read only when `temperature > 0` | `parse_chat`, `Sampler::top_k_needs_host`, `chat_generate` (`host`) | sent when the Crow manifest names it |
+| `presence_penalty` | default **0** since `56e0297` (2026-09-22; the data sheet's 1.5 applies only when the client sends it, `DEFAULT_PRESENCE`), read only when `temperature > 0`. #111 does NOT take it from the card row (non-thinking says 1.5): open for robin. Until then the default was 1.5 and applied to every sampled Crow request | `serve.rs` (`DEFAULT_PRESENCE`, `parse_chat`), `sampler_from` | **never sent by Crow** — the string does not occur in `crow_core.py` (measured 2026-09-18, #68, 7.11.17) |
 | `seed` | RNG seed of THIS request, default 0, reseeded per request (M1) | `serve.rs:515`, `serve.rs:1158` | not sent by Crow |
-| `min_p` | **read since #83**: the log-space tail filter (llama.cpp PR #3841) after top-k and before the temperature softmax, on the device and the host sampler alike; absent, `null` or `<= 0` disables; read only when `temperature > 0`. Before #83 accepted and ignored | `parse_chat`, `sampler_from` | `crow_core.py:4672-4700` (0.01 at Crow's operating point) |
+| `min_p` | **read since #83**: the log-space tail filter (llama.cpp PR #3841) after top-k and before the temperature softmax, on the device and the host sampler alike; absent or `null` = card row (0.0 in both rows = off, #111), `<= 0` disables; read only when `temperature > 0`. Before #83 accepted and ignored | `parse_chat`, `sampler_from` | `crow_core.py:4672-4700` (0.01 at Crow's operating point) |
 | `repeat_penalty`, `frequency_penalty`, `penalty_last_n` | #84: llama.cpp windowed penalties over prompt tail + generated ids, read in greedy AND sampled requests; neutral when absent (1.0 / 0 / window 64, clamped to 1024) | `parse_chat`, `serve.rs` module doc | not sent by Crow |
-| `dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_last_n` | #85: DRY (llama.cpp PR #9702); off when the multiplier is absent or 0; a DRY request samples on the HOST | as above | not sent by Crow |
-| `top_n_sigma`, `typical_p`, `xtc_probability`, `xtc_threshold`, `mirostat`, `mirostat_tau`, `mirostat_eta` | #92: the optional sampler tier, all neutral when absent; any of them armed routes the request to the HOST sampler; `mirostat: 1` is a 400 | as above | not sent by Crow |
+| `dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_last_n` | #85: DRY (llama.cpp PR #9702); off when the multiplier is absent or 0 (or `dry_last_n` 0); an armed request draws on the HOST sampler, greedy included (the DRY-penalized argmax). `dry_base < 1` is forced to 1.75 as llama-server does, any other base is kept (a `.max(1.75)` raised every base below 1.75 until 2026-09-24). Until 2026-09-24 the route was never taken: `Sampler::host_route` had no caller and the device `sample_k` drew without DRY | `parse_chat`, `sampler_from`, `draws_on_host`, `host_knobs_line` | not sent by Crow |
+| `top_n_sigma`, `typical_p`, `xtc_probability`, `xtc_threshold`, `mirostat`, `mirostat_tau`, `mirostat_eta` | #92: the optional sampler tier, all neutral when absent; any of them armed routes the request to the HOST sampler (`draws_on_host`, wired 2026-09-24 with #85; a `[chat] host-only sampler knobs armed (#85/#92): ...` line names the knobs); `mirostat: 1` is a 400 | as above | not sent by Crow |
 | `stop`, `logit_bias` | #86: OpenAI stop strings (generation ends BEFORE the sequence, `finish_reason` `stop`) and a token-id -> additive bias on the raw logits, applied first, outside the sampler chain | as above | not sent by Crow |
 | `crow_force_ids` | #91 (`d7f484a`, 2026-09-22), a crow-nest extension: an array of token ids that REPLACE the generated ids one per step from the first generated position on (teacher forcing through the #81 injection door); with `logprobs: true` each entry prices the forced id under the raw distribution and carries `crow_id`; `[]` forces nothing but adds `crow_id`; a 400 together with `reasoning_budget_tokens` or with an id >= V; after the list runs out generation continues as requested | `parse_chat` | `tools/teacher-forced-91.sh`, `tools/multisite-corruption-probe.py` (not Crow) |
 | `tools` | rendered as the template variable `tools` | `serve.rs:970`, `tokenizer::render_chat` | `crow_core.py:4672-4700`, `TOOLS` (25 builtin at `crow_core.py:579-838`, frozen at `:846`, plus the `mcp.json` tools added at import, `:841`) |
@@ -2538,7 +2567,7 @@ C:/x/y.md
 | garbage request line | 400 JSON `{"error":"bad request"}` | `serve.rs:2563` (`read_head_from`) |
 | malformed or repeated `Content-Length` | 400 JSON | `serve.rs:2563` |
 | head (request line plus headers) over 64 KiB | 431 JSON, then close | `serve.rs:501`, `serve.rs:2563` |
-| body over 16 MiB | 413 JSON, then close | `serve.rs:503`, `serve.rs:2563` |
+| body over 100 MiB (16 MiB until #113, 2026-09-24: under one Crow image of up to 32 MiB, 42.7 MiB as base64; 100 MiB is llama-server's cpp-httplib cap) | 413 JSON, then close | `MAX_BODY_BYTES`, `read_head_from` |
 | `Transfer-Encoding: chunked` | 501 JSON | `serve.rs:2563` |
 | `stream: false` or absent | **200, one `chat.completion` document** (501 until #39) | `serve.rs:2062` (`chat_route` branch), `serve.rs:2099` (`chat_document`) |
 | prompt ids `>= n_ctx` | 413 before any GPU work | `serve.rs:1363` (`clamped_max_tokens`) |
@@ -2551,7 +2580,7 @@ C:/x/y.md
 | `tool_choice` not `auto`/`none`/`required`/a function object, a function object naming an undeclared tool; a non-boolean `parallel_tool_calls` | 400 JSON naming the field (7.11.23) | `parse_chat` |
 | a `messages` shape the chat template cannot render (content that is not string/list/null, a part that is not text or `image_url`, `tool_calls` not an array, a call or `function` that is not an object, a non-string `function.name`, an unknown role, a system message that is not first) | 400 JSON naming the message index and the field, BEFORE the render | `serve.rs:1564` (`check_messages`), `:1601` (`check_content`), `:1640` (`check_tool_call`) |
 | an `image_url` block without `image_url.url` | 400 JSON naming the message index | `serve.rs:1006` |
-| an image over `VIT_MAX_PATCHES` | 413 JSON | `vit.rs` module doc |
+| an image over `CROW_VIT_MAX_TOKENS` (default 1,280 visual tokens) | not refused: downscaled into the cap (`vit::resized_dims`; corrected 2026-09-24, this row said 413 and named a `VIT_MAX_PATCHES` that never refused) | `vit.rs` module doc |
 | a CUDA allocation refused INSIDE a request (tower scratch, mrope tables, a state buffer) | **503 JSON naming the allocation, its byte count and the free VRAM**; the request is dropped, the engine is reset and stays up. An SSE error frame instead when the head is already out. The only 503 this server answers; any other panic still ends the process (TASK K, 2026-09-17) | `serve.rs:2678` (`guarded`), `:2684` (`cuda::RequestScope`), `:2691` (`AllocFailed` downcast), `:2716` |
 
 - Measured (A2, #24): `engine/.engine.lock` is held for the process life and is **left
@@ -3367,8 +3396,8 @@ markup after the fact (`toolcall.rs`) and could only report what went wrong (#99
 | greedy result | gate met in 0 of 1 arms, 2 Pass / 5 Partial / 3 Fail of 10 (#11, Crow #192) |
 | reference llama.cpp | 2 Pass / 6 Partial / 2 Fail of 10 on UD-Q2_K_XL greedy, gate met (#11, Crow #192) |
 | decision | the default stays as built (#28 A6), the request decides: `sampler_from` at `engine/src/bin/serve.rs:1158` |
-| request without `temperature` | greedy, the A4 path; `null` or `<= 0` is the same path (`engine/src/bin/serve.rs:1158`, `sampler_from`) |
-| request with `temperature > 0` | samples; absent fields take the data sheet `top_p` 0.8, `top_k` 20, `presence_penalty` 1.5, `seed` 0 reseeded per request (`engine/src/bin/serve.rs:509-515`) |
+| request without `temperature` | **superseded by #111 (robin 2026-09-24): samples at the model card row of its thinking mode** (1.0 / 0.95 / 20 thinking, 0.7 / 0.8 / 20 non-thinking); until then greedy. Greedy is `temperature <= 0` SENT (`sampler_from`) |
+| request with `temperature > 0` | samples; absent fields take the card row of the thinking mode (#111; until then `top_p` 0.8, `top_k` 20 in both modes), `presence_penalty` 0 (#91), `seed` 0 reseeded per request |
 | what a Crow turn gets | sampled at `temperature` 1.0, `top_p` 0.95, `min_p` 0.01 accepted and ignored (`Crow cli/crow_core.py:472`, #28); `top_k` 20, `presence_penalty` 1.5 and `seed` 0 come from THIS file's defaults, not from Crow (measured 2026-09-18, #68, 7.11.17) |
 | unmeasured | the ten-task gate at Crow's own profile (temperature 1.0, top_p 0.95); the six series ran temp 0.7, top_p 0.8, top_k 20, presence 1.5 (`engine/src/sample.rs:76-81`) |
 | t2b-write-refactor | Fail under greedy after 21 ids (#11), Partial on 6 of 6 sampled seeds (`decode_out/srv-c2-reader.log:214`, #44) |
@@ -3448,12 +3477,14 @@ markup after the fact (`toolcall.rs`) and could only report what went wrong (#99
 
 ### 7.13 The image path (#VIT, 2026-09-14)
 
-- The container's `vit` section (27 vision blocks x 12 tensors + patch embed + learned position table + merger; 112 NVFP4 + 221 bf16 keeps) loads beside the text sections when `CROW_VIT` is unset (default ON); `CROW_VIT=0` is the text-only placeholder of record. Weights resident at load; the cap-sized scratch (228.5 MiB at 16,384 patches = 4,096 visual tokens, `vit::scratch_bytes()` = 239,599,616 B, pinned by the test at `vit.rs:1084`) allocates lazily on the first image request, so text-only boots keep the full planner budget.
+- The container's `vit` section (27 vision blocks x 12 tensors + patch embed + learned position table + merger; 112 NVFP4 + 221 bf16 keeps) loads beside the text sections when `CROW_VIT` is unset (default ON); `CROW_VIT=0` is the text-only placeholder of record. Weights resident at load; the cap-sized scratch (228.5 MiB at 4,096 patches = 1,024 visual tokens - corrected 2026-09-24, this line said 16,384 patches = 4,096 tokens; 285.6 MiB at the #107 default of 5,120 patches = 1,280 tokens; `vit::scratch_bytes_for(4096)` = 239,599,616 B, pinned by the test at `vit.rs:1084`) allocates lazily on the first image request, so text-only boots keep the full planner budget.
 - Serve accepts Crow's image wire exactly (`image_url` data-URL blocks, `crow_core.py image_part`), decodes the five client formats (the `image` crate, decode features), preprocesses per the HF fast processor (smart_resize factor 32, min 65,536 / max 16,777,216 px, antialiased bicubic, 0.5/0.5 normalize, spatial-merge-block patch order), and runs the tower in f32 on the NVFP4 weights (`engine/src/vit.rs`).
 - The visual embeddings splice into the text stream at the expanded `<|image_pad|>` rows (host-side, pre-upload), and the rope kernels read a per-request INTERLEAVED-mrope cos/sin span table (section [11, 11, 10], partial rotary 0.25, theta 1e7 — the `get_rope_index` positions) instead of the load-time table while an image conversation is live. All physical indexing (KV rows, QSA rings, pooled blocks) stays sequential; only the table content changes.
 - Measured (RTX 5090, 2026-09-14, `decode_out/srv-vit.log`): ViT embeddings vs the f32 container-dequant oracle max_abs 3.43e-06 at cos 1.000000; text parity with the tower loaded AND with `CROW_VIT=0` byte-identical to `d211ab52ad2b` at the 61b sha256 values of record including the PX teacher-forced 16,064-row form `f217e1c55926` under the > 26 GiB VRAM headroom gate (23 of 23 subchecks); ten tasks 10 of 10 identical to final4; image-prompt pairs (text-only 26-token prompt vs the 224-token image prompt, fresh process per run): text prefill 406.1 ms vs 1,626.2 ms, pair delta mean +1,220.1 ms, plus the vision window of 35.3 s per request (`[vit-chat]`) — the tower GEMVs run the text-style per-token shape and are the known optimization lever.
 - **What that measurement did NOT cover (`#73`, 2026-09-18).** Every figure in the bullet above was taken with ONE image per process, and that is the only case the visual path got right. `Vit::run` handed its device buffer back with the tower still in flight, so `build_plan`'s blocking D2H (legacy null stream, not ordered against a non-blocking one) read the PREVIOUS image's embeddings: from the second image of a process on, the model answered for the image before it, and the wrong rows were then cached under the new image's hash. The oracle cos of 1.000000 was therefore true and blind at the same time. `Vit::run` now synchronizes before it returns; the end-to-end guard is the probe set in `tools/vit-colorprobe.py` / `vit-lag.py` / `vit-imgprobe.py` (a colour or shape claim about this path needs one of them, not a single-image oracle run), and the host-side layout tests in `vit.rs` pin the patch, channel, merge-block, position-tap and rotary order that the symptom imitated.
 - **The attention was the tower's cost, not the GEMVs (`#98`, 2026-09-22).** `vit_attn` (one query row per block, online softmax) gave every one of its 72 active threads the whole `acc[72]`, so the P·V product ran 72 times over: n² · 72 · 72 FMAs per head and layer. The time grew with the square of the patch count (912 patches 1.6 s, 3,520 patches 19.9 s, 4,000 patches 25.3 s of `[vit-chat] vision`; 402 s of tower on 2026-09-22 with the single-slot engine blocked). Step 1: thread t < 72 carries ONE accumulator, for output dim t, and the V row of one key is one coalesced 288-byte read. Per output dim the operations and their order are unchanged, so the output is **bit-identical** to the kernel it replaced: `vit::attn_98` (GPU, `#[ignore]`d for CI; `cargo test --release attn_98 -- --ignored --nocapture`) runs the pre-#98 kernel, kept verbatim in the test, against the shipped one on synthetic q/k/v at n = 1, 255, 256, 257, 512, 912, 1,000 (twice) and 3,520 / 4,000 and requires every output bit to match. Kernel time per layer, RTX 5090, cuEvent: 912 patches 46.0 -> 2.29 ms, 3,520 patches 664.3 -> 33.7 ms, 4,000 patches 849.6 -> 43.7 ms (x19-20); over the 27 blocks that is 17.9 s -> 0.91 s at 3,520 patches, i.e. the old kernel alone was ~90 % of the logged 19.9 s. A deliberate unfused-FMA mutation of the new kernel fails the test (41 % of outputs at n = 255), so the test does see a changed reduction. Step 2, the same day: a block owns a tile of 16 query rows of one head (`VIT_ATTN_ROWS`, grid (ceil(n/16), 16), block 256, 47 KiB static smem), K and V are staged in 64-key chunks at a padded stride of 73 and reused by all 16 rows, and all 256 threads work in both phases. It is **still bit-identical** by construction, not within a tolerance: the key tile stays 256 wide, each score is the same sequential 72-term fma chain, the tile max is `fmaxf` (exact, order-free), the tile sum is the same 256-leaf pairwise tree (levels 128/64/32 in smem, 16..1 as `shfl_down`, which pairs lane k with k + off exactly as `red[k] += red[k + off]` did), and `l = l*r + ln`, `acc *= r`, the ascending-jj fma walk and the final divide are the old expressions in the old order. The same test holds it (every bit, all ten shapes; a mutation that pairs the sum tree's first level differently fails it at 126,183 of 293,760 outputs). Per layer: 912 patches 0.40 ms, 3,520 patches 5.38 ms, 4,000 patches 6.99 ms, i.e. x6 over step 1 and x120 over the pre-#98 kernel; the 27 blocks' attention at 3,520 patches is 0.145 s (was 17.96 s). No tensor cores and no reassociation: an `mma.sync` path would be faster again, but would leave bit-identity and need the #73 visual oracle with a stated band. The #73 oracle record and the parity records stand without re-measuring.
+
+- **The token window and the weight source (#107, #108, #109, 2026-09-24).** (1) Every image is resized into `CROW_VIT_MIN_TOKENS`..`CROW_VIT_MAX_TOKENS` visual tokens, default 1,024..1,280 (`vit::VitBudget`, smart_resize with min/max pixels = tokens x 1,024). The old window (the preprocessor's 64-token floor, a 1,024-token cap) gave Crow's 1000x560 / 1280x720 renders 558 / 880 tokens where llama.cpp's `--image-min-tokens 1024` point gives 1,032; the new default gives 1,032 for both (unit-tested against the logged grids). The tower scratch and the `[budget]` vit reserve follow the cap (285.6 MiB, +57.1 MiB). (2) The tower's 112 linears run in F16 from llama.cpp's projector `mmproj-F16.gguf` when `CROW_VIT_MMPROJ` finds and validates one (`engine/src/gguf.rs` reads the header, `vit::validate_mmproj` checks the projector type, the geometry and all 334 tensors, `vit::interleave_patch_kernel` rebuilds the Conv3d kernel from its two temporal halves), through `gemm_f16_f32x` - the `gemm_fp4_f32x` tile with an exact f16 widening instead of the e2m1 decode. Else the container's NVFP4 section runs, and the `[vit]` line says why. Cost: +611 MiB of weights (891,740,160 B F16 vs 250,801,920 B NVFP4 linears), about 4.8 hot-set units, taken before the planner chooses N. (3) `gemm_fp4_f32x` had no row guard: fc1's 4,304 rows are 67 x 64 + 16, and the last row tile decoded 48 rows past the weight and wrote them into the next token's first 48 fc1 outputs (a race with that token's own tile). `vit::gemm_vit` (GPU, `--ignored`) shows it: relative error 1.1e4 at token 65 row 45 without the guard, < 1e-3 on all seven tower shapes with it.
 
 **The VRAM reserve, and why the lazy allocation needed one (TASK K, 2026-09-17).** The first bullet's
 "allocates lazily on the first image request, so text-only boots keep the full planner budget" was

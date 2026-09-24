@@ -1,0 +1,12 @@
+  pin_room: ramcheck: free_for_pin 60.34 GiB, MemAvailable 55.90 GiB, NVIDIA driver pages 1.26 GiB (mapped by live processes 0.11, pool + unmapped rest 1.15), FOLL_PIN outstanding 0 pages
+2026-09-24T08:53:43+02:00 hotsets-M-longctx2100-n160-r1: decode: mean 30.79 ms  p50 29.66 ms  (32.5 tok/s)  context 122019  cold experts/token 217.7
+  pin_room: ramcheck: free_for_pin 60.46 GiB, MemAvailable 56.34 GiB, NVIDIA driver pages 0.93 GiB (mapped by live processes 0.11, pool + unmapped rest 0.83), FOLL_PIN outstanding 14 pages
+2026-09-24T08:56:14+02:00 hotsets-M-crow0924-n160-r1: decode: mean 28.06 ms  p50 26.50 ms  (35.6 tok/s)  context 122019  cold experts/token 180.5
+  pin_room: ramcheck: free_for_pin 60.47 GiB, MemAvailable 56.34 GiB, NVIDIA driver pages 0.94 GiB (mapped by live processes 0.11, pool + unmapped rest 0.83), FOLL_PIN outstanding 0 pages
+2026-09-24T08:58:44+02:00 hotsets-M-longctx2100-n160-r2: decode: mean 30.86 ms  p50 29.92 ms  (32.4 tok/s)  context 122019  cold experts/token 217.7
+  pin_room: ramcheck: free_for_pin 60.47 GiB, MemAvailable 56.25 GiB, NVIDIA driver pages 1.03 GiB (mapped by live processes 0.11, pool + unmapped rest 0.93), FOLL_PIN outstanding 78 pages
+2026-09-24T09:01:14+02:00 hotsets-M-crow0924-n160-r2: decode: mean 27.92 ms  p50 26.12 ms  (35.8 tok/s)  context 122019  cold experts/token 180.5
+  pin_room: ramcheck: free_for_pin 60.47 GiB, MemAvailable 56.20 GiB, NVIDIA driver pages 1.08 GiB (mapped by live processes 0.11, pool + unmapped rest 0.98), FOLL_PIN outstanding 0 pages
+2026-09-24T09:03:45+02:00 hotsets-M-longctx2100-n160-r3: decode: mean 30.76 ms  p50 29.86 ms  (32.5 tok/s)  context 122019  cold experts/token 217.7
+  pin_room: ramcheck: free_for_pin 60.49 GiB, MemAvailable 56.18 GiB, NVIDIA driver pages 1.11 GiB (mapped by live processes 0.11, pool + unmapped rest 1.01), FOLL_PIN outstanding 0 pages
+2026-09-24T09:06:14+02:00 hotsets-M-crow0924-n160-r3: decode: mean 27.92 ms  p50 26.19 ms  (35.8 tok/s)  context 122019  cold experts/token 180.5

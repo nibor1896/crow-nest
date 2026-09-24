@@ -407,6 +407,9 @@ pub struct Engine {
     pub cfg: Config,
     pub(crate) pos: usize,
     pub(crate) history: Vec<i64>,
+    /// #114: the image spans inside `history` (rows + content hash), so the prefix cache
+    /// can tell two different images of the same grid apart; see `cache::common_prefix_len_mm`
+    pub(crate) history_images: Vec<crate::vit::ImageSpan>,
     pub(crate) done_blocks: usize,
     sel_counts: Dev, // [48][512] u64 per-expert routing counts
     // ---- CUDA Graphs (CROW_GRAPH=1) ----
@@ -494,6 +497,19 @@ impl Engine {
     pub fn pos(&self) -> usize { self.pos }
     /// the held conversation — prompt ids AND generated ids
     pub fn history(&self) -> &[i64] { &self.history }
+    /// #114: the image spans of `history`
+    pub fn history_images(&self) -> &[crate::vit::ImageSpan] { &self.history_images }
+    /// - #114: name the images of the prompt just prefilled (the request plan's spans;
+    ///   empty for a text-only prompt). Generated ids carry no image, so the spans of
+    ///   the prompt are the spans of the whole history
+    pub fn set_history_images(&mut self, spans: &[crate::vit::ImageSpan]) {
+        self.history_images = spans.to_vec();
+    }
+    /// - #114: `history` was cut to `pos` rows: forget every image that starts at or
+    ///   above it (an image cut in the middle keeps its span: its first rows are held)
+    pub(crate) fn truncate_history_images(&mut self, pos: usize) {
+        self.history_images.retain(|sp| sp.start < pos);
+    }
     /// CROW_ROUTE_DUMP=1: the routed expert ids per token per layer
     pub fn route_log(&self) -> &[Vec<[i32; 10]>] { &self.route_log }
     /// the context length the three states were allocated for
@@ -1017,6 +1033,11 @@ impl Engine {
         // #72: the reserve is HELD here, not noted. `hold` is off only with
         // CROW_VIT_RESERVE_MB=0, the documented escape hatch back to the lazy
         // pre-#72 behaviour (and the old N) for a measurement.
+        // #107: a bad CROW_VIT_MIN_TOKENS / CROW_VIT_MAX_TOKENS stops the boot HERE,
+        // before a byte is loaded, never inside a request
+        if crate::vit::vit_on() {
+            let _ = crate::vit::budget();
+        }
         let vit_hold = crate::vit::reserve_bytes(cfg.context) > 0;
         let mut vit_scratch_held = 0u64;
         let vit = if crate::vit::vit_on() {
@@ -1028,17 +1049,19 @@ impl Engine {
                 vt.arm_scratch();
                 vit_scratch_held = crate::vit::scratch_bytes() as u64;
             }
-            println!("[vit] visual tower loaded: mode nvfp4 (f32 tower math), CROW_VIT {} (0 = the text-only placeholder), cap {} patches = {} visual tokens per image, vit weights {:.0} MiB ({})",
+            log_vit_tower(&format!("[vit] visual tower loaded: mode {} (f32 tower math), CROW_VIT {} (0 = the text-only placeholder), {}, vit weights {:.0} MiB ({})",
+                vt.w.mode,
                 env_or_unset("CROW_VIT"),
-                vt.cap, vt.cap / 4, vit_bytes as f64 / MIB,
+                crate::vit::budget_words(&crate::vit::budget()),
+                vit_bytes as f64 / MIB,
                 if vit_hold {
                     format!("scratch held at boot, {:.1} MiB at the patch cap", vit_scratch_held as f64 / MIB)
                 } else {
                     "scratch lazy, allocated on the first image request (CROW_VIT_RESERVE_MB=0)".to_string()
-                });
+                }));
             Some(vt)
         } else {
-            println!("[vit] visual tower NOT loaded, CROW_VIT 0 (the text-only placeholder of record, /props vision false)");
+            log_vit_tower("[vit] visual tower NOT loaded, CROW_VIT 0 (the text-only placeholder of record, /props vision false)");
             None
         };
         // #72: the interleaved-mrope span tables, at the widest span serve can
@@ -1355,6 +1378,7 @@ impl Engine {
             cfg,
             pos: 0,
             history: Vec::new(),
+            history_images: Vec::new(),
             done_blocks: 0,
             sel_counts,
             stage,
@@ -3037,6 +3061,14 @@ impl Engine {
         launch_v(k.f("router_top10"), t as u32, 1, 1, 512, &[
             s.rlog as u64, bitmap, s.rids as u64, s.rwts as u64, s.gu_ptrs as u64,
             s.dn_ptrs as u64, table, s.cold as u64, counters, sel_counts]);
+        // Hot-set calibration (2026-09-24): CROW_ROUTE_DUMP_PREFILL=<file> appends
+        // the routed ids of every prefill chunk, layer by layer, so the counts can
+        // be taken over chosen positions only (the tokens the model generated,
+        // the routing decode sees). Measurement only: it syncs the device per
+        // layer, and unset it costs one env lookup per chunk-layer.
+        if t > 1 {
+            route_dump_prefill(l, t, s.rids);
+        }
         // cold staging (decode-sized batches): coalesced PCIe pull into VRAM
         // slots + rewritten combo pointers; prefill chunks stay zero-copy
         let lb = self.res.lb.as_ref();
@@ -4280,6 +4312,24 @@ impl Engine {
     /// before the first decode_step of the process so the node is captured with
     /// the graph; enabled later it runs as an eager launch behind each replay.
     pub unsafe fn enable_dev_sampler(&mut self, s: &crate::sample::Sampler) {
+        // #111: the kernel keeps 1..=SAMPLE_MAXK candidates and would CLAMP any other
+        // top_k (0 = off -> 1 = greedy; 100 -> 64) without a word. serve routes such a
+        // request to the host sampler first; a harness run that reaches here is stopped
+        // loudly instead of drawing from a different distribution than it asked for.
+        assert!(
+            !s.top_k_needs_host(),
+            "top_k {} cannot run on the device sampler (1..={SAMPLE_MAXK}; 0 = off): \
+             set CROW_SAMPLE_HOST=1 for the host sampler",
+            s.top_k
+        );
+        // #85/#92: DRY and the #92 tier have no field in the params block below; the
+        // harness routes them to the host (decode.rs / parity.rs), serve too
+        // (`draws_on_host`). Reaching here with one armed would drop it silently.
+        assert!(
+            !s.host_route(),
+            "host-only sampler knobs armed ({}): the device sampler has no input for them",
+            s.host_knobs().join(", ")
+        );
         if self.dev_sampler.is_none() {
             // #72: the buffers come from the boot hold; the fallback allocates, for
             // a bin that built its Engine before the hold existed. Either way they
@@ -4977,5 +5027,81 @@ mod tests_ple_row {
         assert_ne!(ple_row_span(1, n_values).0, 108);
         assert_eq!(ple_row_span(1, n_values), (2 * 36, 4, 32));
         assert_eq!(ple_row_span(2, n_values), (5 * 36, 4, 0));
+    }
+}
+
+
+/// One record per (chunk, layer): u32 layer, u32 t, then t * TOPK routed ids as
+/// u16 little-endian. Written only under `CROW_ROUTE_DUMP_PREFILL` (see `moe_run`).
+unsafe fn route_dump_prefill(l: usize, t: usize, rids: Dev) {
+    use std::io::Write;
+    static SINK: std::sync::Mutex<Option<std::io::BufWriter<std::fs::File>>> =
+        std::sync::Mutex::new(None);
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| std::env::var("CROW_ROUTE_DUMP_PREFILL").ok()) else {
+        return;
+    };
+    cuda::sync();
+    let ids = cuda::dtoh_i32(rids as u64, t * TOPK);
+    let mut sink = SINK.lock().unwrap();
+    if sink.is_none() {
+        let file = std::fs::File::create(path).expect("CROW_ROUTE_DUMP_PREFILL: cannot create the file");
+        *sink = Some(std::io::BufWriter::new(file));
+    }
+    let w = sink.as_mut().unwrap();
+    let mut rec = Vec::with_capacity(8 + ids.len() * 2);
+    rec.extend_from_slice(&(l as u32).to_le_bytes());
+    rec.extend_from_slice(&(t as u32).to_le_bytes());
+    for id in ids {
+        rec.extend_from_slice(&(id as u16).to_le_bytes());
+    }
+    w.write_all(&rec).expect("CROW_ROUTE_DUMP_PREFILL: write failed");
+    w.flush().expect("CROW_ROUTE_DUMP_PREFILL: flush failed");
+}
+
+/// - the boot line that says WHICH visual tower this process runs (mode, projector path,
+///   token budget), or that none is loaded
+/// - a tracing event (target `vit`, INFO), so `engine.log` records it; it was a
+///   `println!` and reached serve's terminal only (2026-09-24: `grep "visual tower"`
+///   found nothing in `~/.local/state/crow/logs/engine.log`)
+pub(crate) fn log_vit_tower(line: &str) {
+    tracing::info!(target: "vit", "{line}");
+}
+
+#[cfg(test)]
+mod vit_tower_line {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// the tower line is a `vit` INFO event under serve's default filter, so the log
+    /// file receives it (a `println!` leaves the subscriber's writer empty)
+    #[test]
+    fn the_tower_line_reaches_the_log_as_a_vit_info_event() {
+        let buf = Buf::default();
+        let w = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(crate::log::DEFAULT_FILTER))
+            .with_ansi(false)
+            .with_writer(move || w.clone())
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            super::log_vit_tower("[vit] visual tower loaded: mode f16 (llama.cpp projector x.gguf)")
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("INFO"), "not an INFO event: {out:?}");
+        assert!(out.contains("vit:"), "not target vit: {out:?}");
+        assert!(out.contains("[vit] visual tower loaded: mode f16"), "line missing: {out:?}");
     }
 }

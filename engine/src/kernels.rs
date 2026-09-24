@@ -4787,7 +4787,11 @@ extern "C" __global__ void vit_attn(const float* __restrict__ qkv, float* __rest
 // Per output element the product tree is EXACTLY gemv_fp4_vit's: sub-blocks
 // ascending, part = sum_j e2m1 * x (j ascending), acc += part * scale, one
 // acc — bit-identical results, hundreds of times fewer instructions.
-// Requires rows % 64 == 0 and k_dim % 16 == 0 (every vision linear shape).
+// Requires k_dim % 16 == 0 (every vision linear shape). #109: rows
+// need NOT be a multiple of 64 - the block fc1 has 4304 = 67 x 64 + 16 rows, and
+// before the row guards below the last row tile decoded 48 rows past the weight
+// and wrote them into the NEXT token's first 48 outputs (y is [t][rows]). Valid
+// rows keep the exact same product tree.
 extern "C" __global__ void gemm_fp4_f32x(const unsigned char* __restrict__ w,
                                          const float* __restrict__ x,
                                          const float* __restrict__ gs_ptr,
@@ -4817,7 +4821,7 @@ extern "C" __global__ void gemm_fp4_f32x(const unsigned char* __restrict__ w,
         for (int i = ti; i < 64 * 64; i += 256) {
             int rr = i >> 6, vv = i & 63;
             float outv = 0.0f;
-            if (vv < lim) {
+            if (vv < lim && r0 + rr < rows) {
                 int G = (r0 + rr) * bpr + (kt >> 4) + (vv >> 4);
                 const unsigned char* blk = w + (size_t)(G >> 2) * 36;
                 int sb = G & 3;
@@ -4832,7 +4836,7 @@ extern "C" __global__ void gemm_fp4_f32x(const unsigned char* __restrict__ w,
         for (int i = ti; i < 64 * 4; i += 256) {
             int rr = i >> 2, sb = i & 3;
             float s = 0.0f;
-            if (kt + sb * 16 < k_dim) {
+            if (kt + sb * 16 < k_dim && r0 + rr < rows) {
                 int G = (r0 + rr) * bpr + (kt >> 4) + sb;
                 const unsigned char* blk = w + (size_t)(G >> 2) * 36;
                 s = ue4m3(blk[G & 3]) * gs;
@@ -4869,6 +4873,82 @@ extern "C" __global__ void gemm_fp4_f32x(const unsigned char* __restrict__ w,
         }
         __syncthreads();
     }
+    if (r0 + rl >= rows) return;          // row tail: nothing to write
+    for (int j = 0; j < 8; j++) {
+        int tok = t0 + tg * 8 + j;
+        if (tok < t) y[(size_t)tok * rows + r0 + rl] = acc[j];
+    }
+}
+
+// #108: exact f16 -> f32 widening (PTX cvt; every f16 value is an f32)
+__device__ __forceinline__ float h2f_bits(unsigned short h) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+    return f;
+}
+
+// #108: the tiled f32-activation GEMM of gemm_fp4_f32x for an F16 weight
+// (llama.cpp's mmproj-F16 projector, row-major u16 [rows][k_dim]). Same block
+// (64 rows x 32 tokens, 256 threads, k in 64-wide tiles staged in smem), same
+// per-element order: 16-value sub-blocks ascending, part = sum_j w * x
+// (j ascending), acc += part. No scale: the f16 value IS the weight. Row tail
+// guarded (fc1 has 4304 rows); requires k_dim % 16 == 0.
+extern "C" __global__ void gemm_f16_f32x(const unsigned short* __restrict__ w,
+                                         const float* __restrict__ x,
+                                         float* __restrict__ y,
+                                         const int* __restrict__ k_dim_p,
+                                         const int* __restrict__ rows_p,
+                                         const int* __restrict__ t_p) {
+    int k_dim = *k_dim_p;
+    int rows = *rows_p;
+    int t = *t_p;
+    int r0 = blockIdx.x * 64;
+    int t0 = blockIdx.y * 32;
+    int ti = threadIdx.x;
+    __shared__ float wv[64][64];          // tile weight values (f16 widened)
+    __shared__ float xs[32][64];          // tile activations
+    float acc[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) acc[i] = 0.0f;
+    int rl = ti >> 2;                     // row within the block (0..63)
+    int tg = ti & 3;                      // token octant (0..3)
+    for (int kt = 0; kt < k_dim; kt += 64) {
+        int lim = k_dim - kt; if (lim > 64) lim = 64;
+        for (int i = ti; i < 64 * 64; i += 256) {
+            int rr = i >> 6, vv = i & 63;
+            float outv = 0.0f;
+            if (vv < lim && r0 + rr < rows) outv = h2f_bits(w[(size_t)(r0 + rr) * k_dim + kt + vv]);
+            wv[rr][vv] = outv;
+        }
+        for (int i = ti; i < 32 * 64; i += 256) {
+            int tt = i >> 6, vv = i & 63;
+            float xv = 0.0f;
+            if (t0 + tt < t && vv < lim) xv = x[(size_t)(t0 + tt) * k_dim + kt + vv];
+            xs[tt][vv] = xv;
+        }
+        __syncthreads();
+        for (int j = 0; j < 8; j++) {
+            int tok = tg * 8 + j;
+            if (t0 + tok >= t) continue;
+            float a = 0.0f;
+            for (int sb = 0; sb < 4; sb++) {
+                if (kt + sb * 16 >= k_dim) break;
+                int n = k_dim - kt - sb * 16; if (n > 16) n = 16;
+                const float* wr = wv[rl] + sb * 16;
+                const float* xr = xs[tok] + sb * 16;
+                float part = 0.0f;
+                #pragma unroll
+                for (int jj = 0; jj < 16; jj++) {
+                    if (jj >= n) break;
+                    part += wr[jj] * xr[jj];
+                }
+                a += part;
+            }
+            acc[j] += a;
+        }
+        __syncthreads();
+    }
+    if (r0 + rl >= rows) return;
     for (int j = 0; j < 8; j++) {
         int tok = t0 + tg * 8 + j;
         if (tok < t) y[(size_t)tok * rows + r0 + rl] = acc[j];
@@ -4937,7 +5017,7 @@ impl Kernels {
             // setter; resolved by name but launched only when an mscale is armed
             "attn_sel_y", "attn_sel_r_y", "attn_sel_d8_y", "attn_sel_d9_y", "attn_sel_s_y", "attn_sel_s8_y", "attn_sel_s8l_y", "attn_sel_g_y", "attn_sel_split_y", "attn_sel_split_l_y", "set_attn_scale",
             "quant_x_fp4", "gemv_fp4_mma", "gemv_fp4_mma_d", "gemv_fp4_mma_dg", "sh_gate_up_q", "gemv_fp4_mma_d32", "gemv_fp4_mma_g32", "attn_sel_r", "attn_sel_d8", "attn_sel_d9", "attn_sel_s", "attn_sel_s8", "attn_sel_s8l", "attn_sel_g",
-            "gemm_fp4_f32x", "vit_ln", "vit_add_bias", "vit_pe_add", "vit_rope", "vit_attn", "gelu_erf", "gelu_tanh",
+            "gemm_fp4_f32x", "gemm_f16_f32x", "vit_ln", "vit_add_bias", "vit_pe_add", "vit_rope", "vit_attn", "gelu_erf", "gelu_tanh",
         ];
         let mut map = HashMap::new();
         for n in names {

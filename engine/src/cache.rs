@@ -12,6 +12,7 @@
 //! | symbol | value |
 //! |---|---|
 //! | `L` | longest common prefix length of the request ids and `Engine::history` |
+//! | `L` (#114) | cut to the first row of the first image whose span (start, len, content hash) is not held identically, `common_prefix_len_mm` |
 //! | `P` | `max { S_pos : S_pos <= L and S_pos < request length }` over the held snapshots |
 //! | `P` (#100) | a snapshot that holds its LOGITS ROW may also sit AT the request length |
 //! | cold | no such `S_pos` exists; `Engine::reset_to_zero` runs and the slot is dropped |
@@ -213,6 +214,34 @@ const PLE_STATE: usize = GDN_CONV * 9;
 /// - ids only, never text, never a hash of the rendered prompt
 pub fn common_prefix_len(a: &[i64], b: &[i64]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+/// - #114: `common_prefix_len`, image aware: the prompt ids of an image are
+///   `IMAGE_PAD` repeated per visual token, so two DIFFERENT images of the same grid
+///   are the same id run. The prefix therefore ends at the START of the first image
+///   whose span (`start`, `len`, content `hash`) is not held identically on both sides.
+/// - `a_imgs` / `b_imgs` are the image spans of `a` / `b` (`vit::ImageSpan`); a span on
+///   one side with no equal span at the same start on the other side is a difference,
+///   whichever side it is on (a slot file restores ids without spans, so an image the
+///   held side cannot name never matches)
+/// - no spans on either side: exactly `common_prefix_len` (text-only requests, and the
+///   `CROW_VIT=0` placeholder whose lone `IMAGE_PAD` is an ordinary token)
+/// - llama.cpp `server_tokens::get_common_prefix` (tools/server/server-common.cpp):
+///   media chunks are equal only if chunk id (image hash) AND token count are equal,
+///   else the prefix is the chunk's first index
+pub fn common_prefix_len_mm(
+    a: &[i64],
+    a_imgs: &[crate::vit::ImageSpan],
+    b: &[i64],
+    b_imgs: &[crate::vit::ImageSpan],
+) -> usize {
+    let l = common_prefix_len(a, b);
+    [(a_imgs, b_imgs), (b_imgs, a_imgs)]
+        .iter()
+        .flat_map(|(mine, theirs)| mine.iter().filter(move |sp| !theirs.contains(sp)))
+        .map(|sp| sp.start)
+        .filter(|&s| s < l)
+        .fold(l, usize::min)
 }
 
 /// - `P = max { S_pos in positions : S_pos <= l and S_pos < new_len }` (spec 7.4, 7.6)
@@ -429,10 +458,25 @@ impl PrefixCache {
     ///   slot: a request that needs its prompt's own prefill (the `CROW_VIT_DUMP` logits
     ///   collection) must get at least one token prefilled
     pub fn decide_for(&self, history: &[i64], ids: &[i64], allow_exact: bool) -> Decision {
+        self.decide_mm(history, &[], ids, &[], allow_exact)
+    }
+
+    /// - #114: `decide_for` with the image spans of both sides: `L` is
+    ///   `common_prefix_len_mm`, so a request whose image differs from the held one
+    ///   at the same place gets no snapshot at or past that image's first row
+    /// - `held_imgs` is `Engine::history_images`, `imgs` the request plan's spans
+    pub fn decide_mm(
+        &self,
+        history: &[i64],
+        held_imgs: &[crate::vit::ImageSpan],
+        ids: &[i64],
+        imgs: &[crate::vit::ImageSpan],
+        allow_exact: bool,
+    ) -> Decision {
         if !self.enabled {
             return Decision { l: 0, reuse: None };
         }
-        let l = common_prefix_len(history, ids);
+        let l = common_prefix_len_mm(history, held_imgs, ids, imgs);
         let logits = if allow_exact { self.logits_held() } else { Vec::new() };
         Decision { l, reuse: reuse_slot_with_logits(&self.reuse_candidates(), &logits, l, ids.len()) }
     }
@@ -637,6 +681,7 @@ impl PrefixCache {
         eng.pos = pos;
         eng.done_blocks = s.done_blocks;
         eng.history.truncate(pos);
+        eng.truncate_history_images(pos);
         eng.route_log.clear();
         self.rolled_back(slot);
 
@@ -1099,5 +1144,120 @@ mod tests {
             assert_eq!(cached, 900, "retry {retry}");
         }
         assert_eq!(c.positions(), vec![Some(900), Some(600), Some(300)]);
+    }
+
+    // ------------------------------------------------ #114: image-aware prefix
+
+    use crate::vit::{ImageSpan, IMAGE_PAD};
+
+    /// the colour-probe shape of 2026-09-24: 10 text ids, one image of `n` visual tokens
+    /// (all `IMAGE_PAD`), then 13 text ids of the question
+    fn probe_prompt(n: usize) -> Vec<i64> {
+        let mut v: Vec<i64> = (0..10).collect();
+        v.extend(std::iter::repeat(IMAGE_PAD).take(n));
+        v.extend(100..113);
+        v
+    }
+
+    /// a span whose 32-byte identity is `hash` spread over its first eight bytes
+    fn img(start: usize, len: usize, hash: u64) -> ImageSpan {
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&hash.to_le_bytes());
+        ImageSpan { start, len, hash: key }
+    }
+
+    /// the defect: same ids, DIFFERENT image. The held prompt snapshot (with its logits
+    /// row) sat at the request length and was taken, `prefill 0 of 1047` - the new image
+    /// was never spliced. `L` must stop at the image's first row, so only a snapshot at or
+    /// below it is a candidate
+    #[test]
+    fn same_ids_with_a_different_image_are_not_reused_past_the_image_start() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        let ids = probe_prompt(1024);
+        c.set_slot(1, 8, true);
+        c.name(SLOT_PROMPT, ids.len(), true, ids.len() / 4, Some(7));
+        let d = c.decide_mm(&ids, &[img(10, 1024, 0xAAAA)], &ids, &[img(10, 1024, 0xBBBB)], true);
+        assert_eq!(d.l, 10, "L past the first row of an image the engine does not hold");
+        assert_eq!(d.reuse, Some((1, 8)), "the only snapshot below the image is the reuse point");
+        // without a snapshot below the image it is a cold start
+        c.invalidate();
+        c.name(SLOT_PROMPT, ids.len(), true, ids.len() / 4, Some(7));
+        let d = c.decide_mm(&ids, &[img(10, 1024, 0xAAAA)], &ids, &[img(10, 1024, 0xBBBB)], true);
+        assert_eq!(d.reuse, None);
+    }
+
+    /// the same image re-sent (an agent loop resends its whole history): full reuse,
+    /// including the #100 zero-prefill path at the request length
+    #[test]
+    fn the_same_image_again_is_reused_in_full() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        let ids = probe_prompt(1024);
+        c.name(SLOT_PROMPT, ids.len(), true, ids.len() / 4, Some(7));
+        let span = [img(10, 1024, 0xAAAA)];
+        let d = c.decide_mm(&ids, &span, &ids, &span, true);
+        assert_eq!(d.l, ids.len());
+        assert_eq!(d.reuse, Some((SLOT_PROMPT, ids.len())));
+        // and a next turn that appends after the image rolls back onto the whole prompt
+        let mut next = ids.clone();
+        next.extend([500, 501, 502]);
+        let d = c.decide_mm(&ids, &span, &next, &span, true);
+        assert_eq!(d.reuse, Some((SLOT_PROMPT, ids.len())));
+    }
+
+    /// a text-only exchange has no spans: `L` is the id prefix, as before #114
+    #[test]
+    fn text_only_requests_decide_exactly_as_before() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        let held: Vec<i64> = (0..200).collect();
+        let mut new = held.clone();
+        new.extend([900, 901]);
+        c.set_slot(0, 200, true);
+        c.set_slot(1, 120, true);
+        assert_eq!(c.decide_mm(&held, &[], &new, &[], true), c.decide(&held, &new));
+        let edited: Vec<i64> = (0..150).chain(700..760).collect();
+        assert_eq!(c.decide_mm(&held, &[], &edited, &[], true), c.decide(&held, &edited));
+        assert_eq!(common_prefix_len_mm(&held, &[], &edited, &[]), common_prefix_len(&held, &edited));
+    }
+
+    /// an image AFTER the difference, or an equal image before a later different one:
+    /// the prefix ends at the first image that differs, not at the first image
+    #[test]
+    fn the_prefix_ends_at_the_first_image_that_differs() {
+        // text 0..5, image A at 5 (4 rows), text 9..12, image at 12 (4 rows), text 16..20
+        let mut ids: Vec<i64> = (0..5).collect();
+        ids.extend([IMAGE_PAD; 4]);
+        ids.extend(50..53);
+        ids.extend([IMAGE_PAD; 4]);
+        ids.extend(60..64);
+        let held = [img(5, 4, 1), img(12, 4, 2)];
+        assert_eq!(common_prefix_len_mm(&ids, &held, &ids, &[img(5, 4, 1), img(12, 4, 3)]), 12);
+        assert_eq!(common_prefix_len_mm(&ids, &held, &ids, &[img(5, 4, 9), img(12, 4, 2)]), 5);
+        assert_eq!(common_prefix_len_mm(&ids, &held, &ids, &held), ids.len());
+        // an id difference below both images wins over them
+        let mut edited = ids.clone();
+        edited[3] = 999;
+        assert_eq!(common_prefix_len_mm(&ids, &held, &edited, &held), 3);
+    }
+
+    /// a held image the request does not name (a slot file restores ids without spans,
+    /// or a text-only request carries the same pads) and the reverse: both are a
+    /// difference at that image's start
+    #[test]
+    fn an_image_only_one_side_can_name_is_a_difference() {
+        let ids = probe_prompt(16);
+        let span = [img(10, 16, 0xAAAA)];
+        assert_eq!(common_prefix_len_mm(&ids, &[], &ids, &span), 10);
+        assert_eq!(common_prefix_len_mm(&ids, &span, &ids, &[]), 10);
+        // the same hash with another token count (another grid) is another image
+        assert_eq!(common_prefix_len_mm(&ids, &span, &ids, &[img(10, 12, 0xAAAA)]), 10);
+    }
+
+    /// a disabled cache still decides cold, spans or not
+    #[test]
+    fn a_disabled_cache_decides_cold_with_images_too() {
+        let c = PrefixCache::for_shape(tiny(), false);
+        let ids = probe_prompt(16);
+        let span = [img(10, 16, 1)];
+        assert_eq!(c.decide_mm(&ids, &span, &ids, &span, true), Decision { l: 0, reuse: None });
     }
 }

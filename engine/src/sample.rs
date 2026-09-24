@@ -310,7 +310,7 @@ impl Sampler {
             self.top_n_sigma, self.typical_p, self.xtc_probability, self.xtc_threshold,
             self.mirostat, self.mirostat_tau, self.mirostat_eta,
             self.seed,
-            if host_forced() { "host" } else { "gpu" })
+            if host_forced() || self.host_route() { "host" } else { "gpu" })
     }
 
     /// #83: ln(min_p) as ONE host-computed f32. The device sampler receives
@@ -348,6 +348,42 @@ impl Sampler {
             || self.typical_p < 1.0
             || (self.xtc_probability > 0.0 && self.xtc_threshold <= 0.5)
             || self.mirostat == 2
+    }
+
+    /// #85/#92: the armed host-only knobs by name and value, for the route line
+    /// serve logs - empty exactly when `host_route()` is false.
+    pub fn host_knobs(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if self.dry_armed() {
+            v.push(format!(
+                "dry_multiplier {} (base {}, allowed {}, last_n {})",
+                self.dry_multiplier, self.dry_base, self.dry_allowed_length, self.dry_last_n
+            ));
+        }
+        if self.top_n_sigma > 0.0 {
+            v.push(format!("top_n_sigma {}", self.top_n_sigma));
+        }
+        if self.typical_p < 1.0 {
+            v.push(format!("typical_p {}", self.typical_p));
+        }
+        if self.xtc_probability > 0.0 && self.xtc_threshold <= 0.5 {
+            v.push(format!("xtc_probability {} (threshold {})", self.xtc_probability, self.xtc_threshold));
+        }
+        if self.mirostat == 2 {
+            v.push(format!("mirostat 2 (tau {}, eta {})", self.mirostat_tau, self.mirostat_eta));
+        }
+        v
+    }
+
+    /// #111: can the device `sample_k` draw THIS top_k? It keeps 1..=`SAMPLE_MAXK`
+    /// (64) candidates in shared memory; `0` (top-k off) or more than 64 would be
+    /// silently clamped there (`kernels.rs` `sample_topk_part` / `sample_k`). A
+    /// sampled request that answers true draws on the HOST sampler instead (serve)
+    /// or is refused by `enable_dev_sampler` (the harness door, CROW_SAMPLE_HOST=1).
+    /// Greedy (`temperature <= 0`) answers false: its device draw is `ci[0]`, the
+    /// (penalized) argmax, whatever k is.
+    pub fn top_k_needs_host(&self) -> bool {
+        self.temperature > 0.0 && !(1..=crate::gen::SAMPLE_MAXK).contains(&self.top_k)
     }
 
     /// #92: mirostat v2's mu back to `2*tau`, the per-request reset llama.cpp
@@ -655,8 +691,11 @@ impl Sampler {
         } else {
             None
         };
-        // top_k on the penalized scores: keep the k largest candidates
-        let k = self.top_k.max(1).min(logits.len());
+        // top_k on the penalized scores: keep the k largest candidates.
+        // #111: `0` is top-k OFF (llama.cpp `llama_sampler_top_k_impl`: `k <= 0`
+        // returns untouched) - the whole row goes on. Until #111 it was clamped
+        // to 1 here, which made `top_k 0` a silent greedy.
+        let k = if self.top_k == 0 { logits.len() } else { self.top_k.min(logits.len()) };
         let mut cand: Vec<(usize, f32)> = Vec::with_capacity(k + 1);
         for (i, &l) in logits.iter().enumerate() {
             let mut v = pen(self, i, l);
@@ -1041,6 +1080,28 @@ mod tests {
     fn greedy_when_cold() {
         let mut s = Sampler { temperature: 0.0, top_p: 1.0, top_k: 5, presence_penalty: 0.0, rng: Rng::new(1), ..Sampler::new(0) };
         assert_eq!(s.sample(&[0.1, 3.0, 2.0]), 1);
+    }
+    /// #111: `top_k 0` is top-k OFF (llama.cpp `k <= 0` returns untouched), not
+    /// a clamp to 1. On a flat row every one of the 8 ids is reachable; before
+    /// #111 `max(1)` kept only the argmax and 400 draws returned id 0 400 times.
+    #[test]
+    fn top_k_zero_is_off_not_greedy() {
+        let row = [1.0f32, 0.99, 0.98, 0.97, 0.96, 0.95, 0.94, 0.93];
+        let mut s = Sampler { temperature: 1.0, top_p: 1.0, top_k: 0, presence_penalty: 0.0, ..Sampler::new(11) };
+        let mut hit = [false; 8];
+        for _ in 0..400 {
+            hit[s.sample(&row)] = true;
+        }
+        assert!(hit.iter().all(|&h| h), "top_k 0 must keep the whole row: {hit:?}");
+        // the routing truth: the device holds 1..=64 candidates, a sampled 0 or 65 cannot run there
+        assert!(s.top_k_needs_host());
+        s.top_k = 65;
+        assert!(s.top_k_needs_host());
+        s.top_k = 64;
+        assert!(!s.top_k_needs_host());
+        s.top_k = 0;
+        s.temperature = 0.0;
+        assert!(!s.top_k_needs_host(), "greedy draws the argmax on the device whatever k is");
     }
     #[test]
     fn nucleus_never_picks_outside_top_k() {
@@ -2118,6 +2179,9 @@ mod tests {
         s.xtc_probability = 0.0;
         s.mirostat = 2;
         assert!(s.host_route());
+        assert_eq!(s.host_knobs().len(), 1, "the route line names exactly the armed knob");
+        s.mirostat = 0;
+        assert!(!s.host_route() && s.host_knobs().is_empty());
     }
 
     /// #93: `rebook_plan` against a host model of the device accept,

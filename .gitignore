@@ -49,6 +49,12 @@ decode_out/oracle-longctx/validate/
 !decode_out/tentasks-all-ids.json
 !decode_out/parity-ids.json
 !decode_out/hotsets-M-longctx2100-n160.json
+!decode_out/hotsets-M-crow0924-n160.json
+!decode_out/hotset-0924/
+decode_out/hotset-0924/*
+!decode_out/hotset-0924/PREREG.md
+!decode_out/hotset-0924/eval.txt
+!decode_out/hotset-0924/speed.log
 !decode_out/ten-tasks.json
 !decode_out/ten-tasks-authored-t7-t10.json
 !decode_out/README.md

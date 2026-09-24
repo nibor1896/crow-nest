@@ -26,10 +26,16 @@
 //! weights) differs by math precision only; the band is a measurement, not a
 //! bit gate.
 //!
-//! Image size limits (preprocessor_config.json): smart_resize factor
-//! patch*merge = 32, min_pixels 65536, max_pixels 16777216; an image may
-//! produce at most `VIT_MAX_PATCHES` patches (4096 visual tokens — the
-//! llama-server `--image-max-tokens` default), larger requests answer 400.
+//! Image size limits: smart_resize factor patch*merge = 32, so one visual token
+//! covers 32x32 source pixels. The preprocessor_config.json window (min_pixels
+//! 65536 = 64 tokens, max_pixels 16777216 = 16384 tokens) is NOT the serving
+//! window: `VitBudget` (#107) resizes every image into
+//! [`CROW_VIT_MIN_TOKENS`, `CROW_VIT_MAX_TOKENS`] visual tokens, default
+//! [1024, 1280] - the floor is the llama.cpp operating point's
+//! `--image-min-tokens 1024` (clip.cpp warns that Qwen-VL needs 1024), the cap
+//! the upper end of the Qwen3-VL README's 256-1280 recommendation. An image
+//! over the cap is DOWNSCALED (never refused); the tower scratch and the
+//! planner reserve are sized from the cap (`scratch_bytes`).
 
 use crate::cuda::{self, CUdeviceptr as Dev};
 use crate::weights::{dequant_fp4_dev, load_fp4, Fp4};
@@ -55,14 +61,112 @@ pub const VIT_MERGE: usize = 2;
 pub const VIT_SIDE: usize = 48; // sqrt(num_position_embeddings)
 pub const VIT_IN: usize = 3 * VIT_TPATCH * VIT_PATCH * VIT_PATCH; // 1536 conv row
 pub const VIT_QKV: usize = 3 * VIT_HIDDEN; // 3456
-/// hard patch cap per image (4096 patches = 1024 visual tokens; every
-/// production VLM bounds image resolution - at 16384 the patch attention
-/// alone costs hours, and no chat question needs more than this grid)
-pub const VIT_MAX_PATCHES: usize = 4096;
+/// min_pixels / max_pixels of the preprocessor config (size shortest/longest_edge):
+/// the HF reference window `smart_resize_for_test` checks the port against. The
+/// SERVING window is `VitBudget`.
+const HF_MIN_PIXELS: u64 = 65536;
+const HF_MAX_PIXELS: u64 = 16777216;
 
-/// min_pixels / max_pixels of the preprocessor config (size shortest/longest_edge)
-const MIN_PIXELS: u64 = 65536;
-const MAX_PIXELS: u64 = 16777216;
+/// source pixels per visual token: (patch * merge)^2 = 32 * 32
+pub const VIT_PIXELS_PER_TOKEN: u64 = ((VIT_PATCH * VIT_MERGE) * (VIT_PATCH * VIT_MERGE)) as u64;
+
+/// #107: the default visual-token FLOOR per image. Before this the
+/// floor was the preprocessor's 64 tokens, and Crow's renders reached the model
+/// at 527-880 tokens where llama.cpp's operating point gives the same PNGs 1032
+/// (`--image-min-tokens 1024`; at ~350 tokens the model said no image arrived,
+/// Crow docs/operating-points.md). clip.cpp's load_hparams warns: "Qwen-VL models
+/// require at minimum 1024 image tokens to function correctly on grounding tasks".
+pub const VIT_MIN_TOKENS_DEFAULT: usize = 1024;
+/// the default visual-token CAP per image (was 1024 = 4096 patches): the upper
+/// end of the Qwen3-VL README's "256-1280" token budget. It sits above the floor
+/// so the floor's ceil rounding (1000x560 -> 1032) is never cut by the cap.
+pub const VIT_MAX_TOKENS_DEFAULT: usize = 1280;
+/// the bounds either env var may take: clip.cpp `set_limit_image_tokens(8, 4096)`
+/// for the Qwen-VL projectors (4096 tokens = 16384 patches, 914 MiB of scratch)
+pub const VIT_TOKENS_LOWEST: usize = 8;
+pub const VIT_TOKENS_HIGHEST: usize = 4096;
+
+/// The per-image visual-token window the server resizes into, read once per
+/// process from `CROW_VIT_MIN_TOKENS` / `CROW_VIT_MAX_TOKENS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VitBudget {
+    pub min_tokens: usize,
+    pub max_tokens: usize,
+}
+
+impl VitBudget {
+    pub const DEFAULT: VitBudget =
+        VitBudget { min_tokens: VIT_MIN_TOKENS_DEFAULT, max_tokens: VIT_MAX_TOKENS_DEFAULT };
+
+    /// the env values as strings (None = unset); a malformed or out-of-range
+    /// value is an ERROR, not a silent default - a typo must not change what
+    /// the model sees without a word
+    pub fn parse(min: Option<&str>, max: Option<&str>) -> Result<VitBudget, String> {
+        let one = |key: &str, v: Option<&str>, dflt: usize| -> Result<usize, String> {
+            let Some(v) = v else { return Ok(dflt) };
+            let n: usize = v
+                .trim()
+                .parse()
+                .map_err(|_| format!("{key}={v:?} is not a whole number of visual tokens"))?;
+            if !(VIT_TOKENS_LOWEST..=VIT_TOKENS_HIGHEST).contains(&n) {
+                return Err(format!(
+                    "{key}={n} is outside {VIT_TOKENS_LOWEST}..={VIT_TOKENS_HIGHEST} visual tokens (clip.cpp's Qwen-VL limits)"
+                ));
+            }
+            Ok(n)
+        };
+        let min_tokens = one("CROW_VIT_MIN_TOKENS", min, VIT_MIN_TOKENS_DEFAULT)?;
+        // an explicit floor above the default cap lifts the default cap with it
+        let max_default = VIT_MAX_TOKENS_DEFAULT.max(min_tokens);
+        let max_tokens = one("CROW_VIT_MAX_TOKENS", max, max_default)?;
+        if min_tokens > max_tokens {
+            return Err(format!(
+                "CROW_VIT_MIN_TOKENS={min_tokens} is above CROW_VIT_MAX_TOKENS={max_tokens}"
+            ));
+        }
+        Ok(VitBudget { min_tokens, max_tokens })
+    }
+
+    pub fn from_env() -> Result<VitBudget, String> {
+        let min = std::env::var("CROW_VIT_MIN_TOKENS").ok();
+        let max = std::env::var("CROW_VIT_MAX_TOKENS").ok();
+        VitBudget::parse(min.as_deref(), max.as_deref())
+    }
+
+    /// the patch cap the tower scratch is sized for (4 patches per visual token)
+    pub const fn max_patches(&self) -> usize {
+        self.max_tokens * VIT_MERGE * VIT_MERGE
+    }
+    pub const fn min_pixels(&self) -> u64 {
+        self.min_tokens as u64 * VIT_PIXELS_PER_TOKEN
+    }
+    pub const fn max_pixels(&self) -> u64 {
+        self.max_tokens as u64 * VIT_PIXELS_PER_TOKEN
+    }
+}
+
+/// the process's budget: `CROW_VIT_MIN_TOKENS` / `CROW_VIT_MAX_TOKENS`, read
+/// once. A bad value stops the boot with the reason (`Engine::load` calls this
+/// before the tower loads, so it never fails inside a request).
+pub fn budget() -> VitBudget {
+    static B: std::sync::OnceLock<VitBudget> = std::sync::OnceLock::new();
+    *B.get_or_init(|| VitBudget::from_env().unwrap_or_else(|e| panic!("[vit] {e}")))
+}
+
+/// the `[vit]` boot line's words for the budget, naming where each bound came from
+pub fn budget_words(b: &VitBudget) -> String {
+    let src = |key: &str| {
+        if std::env::var(key).is_ok() { key.to_string() } else { "default".to_string() }
+    };
+    format!(
+        "{}..{} visual tokens per image (floor {}, cap {}; {} patches at the cap)",
+        b.min_tokens,
+        b.max_tokens,
+        src("CROW_VIT_MIN_TOKENS"),
+        src("CROW_VIT_MAX_TOKENS"),
+        b.max_patches()
+    )
+}
 
 /// CROW_VIT: unset or any value but `0` = vision ON (the default after gates);
 /// `0` = the text-only placeholder of record (no vit load, /props vision false)
@@ -70,25 +174,28 @@ pub fn vit_on() -> bool {
     std::env::var("CROW_VIT").as_deref() != Ok("0")
 }
 
-/// visual tokens one image can produce at the patch cap (4096 / 2 / 2)
-pub const VIT_MAX_VISUAL: usize = VIT_MAX_PATCHES / (VIT_MERGE * VIT_MERGE);
-
 /// device buffers `ensure_scratch` takes (the 16 i32 scalar slots are counted
 /// apart: 64 B in total, inside the same group unwind)
 pub const VIT_SCRATCH_BUFFERS: usize = 12;
 
-/// bytes of the cap-sized tower scratch — the twelve buffers `ensure_scratch`
-/// takes, counted from the same geometry the allocator uses
-pub const fn scratch_bytes() -> usize {
-    let elems = VIT_MAX_PATCHES * VIT_HIDDEN * 3   // x, normed, attn
-        + VIT_MAX_PATCHES * VIT_QKV
-        + VIT_MAX_PATCHES * VIT_INTER
-        + VIT_MAX_PATCHES / 4 * VIT_MERGED
-        + VIT_MAX_PATCHES / 4 * H
-        + VIT_MAX_PATCHES * VIT_IN
-        + VIT_MAX_PATCHES * 8                      // pe_idx + pe_w
-        + VIT_MAX_PATCHES * VIT_ROT * 2;           // cs + sn
+/// bytes of the tower scratch at a patch cap — the twelve buffers
+/// `ensure_scratch` takes, counted from the same geometry the allocator uses
+/// (58,496 B per patch: 4096 patches = 228.5 MiB, 5120 = 285.6 MiB)
+pub const fn scratch_bytes_for(cap: usize) -> usize {
+    let elems = cap * VIT_HIDDEN * 3   // x, normed, attn
+        + cap * VIT_QKV
+        + cap * VIT_INTER
+        + cap / 4 * VIT_MERGED
+        + cap / 4 * H
+        + cap * VIT_IN
+        + cap * 8                      // pe_idx + pe_w
+        + cap * VIT_ROT * 2;           // cs + sn
     elems * 4
+}
+
+/// the scratch at this process's cap (`budget().max_patches()`)
+pub fn scratch_bytes() -> usize {
+    scratch_bytes_for(budget().max_patches())
 }
 
 /// bytes of the interleaved-mrope span tables at their widest: the whole
@@ -155,33 +262,234 @@ pub fn reserve_line(context: usize, held: u64) -> String {
 // weights
 // ---------------------------------------------------------------------------
 
+/// one vision linear [rows][k] as the tower's GEMM reads it: the container's
+/// NVFP4 pair (`gemm_fp4_f32x`) or #108's exact F16 copy from llama.cpp's
+/// projector file (`gemm_f16_f32x`, row-major u16 [rows][k])
+#[derive(Clone, Copy)]
+pub enum Lin {
+    Fp4(Fp4),
+    F16(Dev),
+}
+
 pub struct VitBlockW {
     pub n1w: Dev,
     pub n1b: Dev,
     pub n2w: Dev,
     pub n2b: Dev,
-    pub qkv: Fp4,
+    pub qkv: Lin,
     pub qkv_b: Dev,
-    pub proj: Fp4,
+    pub proj: Lin,
     pub proj_b: Dev,
-    pub fc1: Fp4,
+    pub fc1: Lin,
     pub fc1_b: Dev,
-    pub fc2: Fp4,
+    pub fc2: Lin,
     pub fc2_b: Dev,
 }
 
 pub struct VitW {
-    pub patch_proj: Fp4,
+    pub patch_proj: Lin,
     pub patch_bias: Dev,
     /// f32 [2304][1152], dequantized once at load (the interp gathers read f32)
     pub pos_embed: Dev,
     pub blocks: Vec<VitBlockW>,
     pub m_norm_w: Dev,
     pub m_norm_b: Dev,
-    pub m_fc1: Fp4,
+    pub m_fc1: Lin,
     pub m_fc1_b: Dev,
-    pub m_fc2: Fp4,
+    pub m_fc2: Lin,
     pub m_fc2_b: Dev,
+    /// the `[vit]` boot line's "mode": where the weights came from
+    pub mode: String,
+}
+
+// ---------------------------------------------------------------------------
+// #108: the F16 projector file as the tower's weight source
+// ---------------------------------------------------------------------------
+
+/// the file name Crow's llama.cpp operating point loads with `--mmproj`
+pub const MMPROJ_FILE: &str = "mmproj-F16.gguf";
+
+/// Where the tower's weights come from, decided once at load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VitSource {
+    /// llama.cpp's F16 projector (the default whenever the file is found)
+    Mmproj(String),
+    /// the container's NVFP4 `vit` section; the string says why (the fallback)
+    Container(String),
+}
+
+/// `CROW_VIT_MMPROJ` wins: `0` = the container's NVFP4 section, any other
+/// value = that file (missing -> the container, with the reason). Unset: the
+/// first `mmproj-F16.gguf` found in `models/` beside the container (the #94
+/// checkpoint convention), `$CROW_MODELS` (Crow's models root) and
+/// `~/.local/share/crow/models` (Crow's Linux install link). `exists` is the
+/// file test, injected so the unit test runs without the files.
+pub fn resolve_mmproj(
+    env: Option<&str>,
+    cnq_path: &str,
+    crow_models: Option<&str>,
+    home: Option<&str>,
+    exists: &dyn Fn(&str) -> bool,
+) -> VitSource {
+    match env {
+        Some("0") => return VitSource::Container("CROW_VIT_MMPROJ=0".to_string()),
+        Some(p) if !p.is_empty() => {
+            return if exists(p) {
+                VitSource::Mmproj(p.to_string())
+            } else {
+                VitSource::Container(format!("CROW_VIT_MMPROJ={p} does not exist"))
+            };
+        }
+        _ => {}
+    }
+    let mut tried = Vec::new();
+    let cnq = std::path::Path::new(cnq_path);
+    if let Some(root) = cnq.parent().and_then(|d| d.parent()) {
+        tried.push(root.join("models").join(MMPROJ_FILE));
+    }
+    if let Some(m) = crow_models.filter(|m| !m.is_empty()) {
+        tried.push(std::path::Path::new(m).join(MMPROJ_FILE));
+    }
+    if let Some(h) = home.filter(|h| !h.is_empty()) {
+        tried.push(std::path::Path::new(h).join(".local/share/crow/models").join(MMPROJ_FILE));
+    }
+    for p in &tried {
+        let s = p.to_string_lossy();
+        if exists(&s) {
+            return VitSource::Mmproj(s.into_owned());
+        }
+    }
+    let list = tried.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join(", ");
+    VitSource::Container(format!("no {MMPROJ_FILE} in {list}"))
+}
+
+/// the process's choice, from the real env and filesystem
+pub fn mmproj_source(cnq_path: &str) -> VitSource {
+    let env = std::env::var("CROW_VIT_MMPROJ").ok();
+    let models = std::env::var("CROW_MODELS").ok();
+    let home = std::env::var("HOME").ok();
+    resolve_mmproj(env.as_deref(), cnq_path, models.as_deref(), home.as_deref(), &|p| {
+        std::path::Path::new(p).is_file()
+    })
+}
+
+/// the kind of one projector tensor the tower reads
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmKind {
+    /// an F16 linear, ggml dims (k, rows)
+    Linear,
+    /// an F32 vector or table read as f32
+    F32,
+}
+
+/// Every projector tensor the tower reads: (gguf name, ggml dims, kind, the
+/// container tensor it replaces). llama.cpp's names (convert_hf_to_gguf.py,
+/// Qwen3-VL): `v.blk.N.{ln1,ln2,attn_qkv,attn_out,ffn_up,ffn_down}`,
+/// `v.post_ln` = merger.norm, `mm.0`/`mm.2` = merger.linear_fc1/fc2, the Conv3d
+/// patch kernel split along its temporal axis into `v.patch_embd.weight`
+/// (t = 0) and `v.patch_embd.weight.1` (t = 1), `v.position_embd.weight` F32.
+pub fn mmproj_plan() -> Vec<(String, Vec<u64>, MmKind, String)> {
+    let (h, i, q, m, o) = (VIT_HIDDEN as u64, VIT_INTER as u64, VIT_QKV as u64, VIT_MERGED as u64, H as u64);
+    let p = VIT_PATCH as u64;
+    let mut v: Vec<(String, Vec<u64>, MmKind, String)> = vec![
+        ("v.patch_embd.weight".into(), vec![p, p, 3, h], MmKind::Linear, "model.visual.patch_embed.proj.weight".into()),
+        ("v.patch_embd.weight.1".into(), vec![p, p, 3, h], MmKind::Linear, "model.visual.patch_embed.proj.weight".into()),
+        ("v.patch_embd.bias".into(), vec![h], MmKind::F32, "model.visual.patch_embed.proj.bias".into()),
+        ("v.position_embd.weight".into(), vec![h, (VIT_SIDE * VIT_SIDE) as u64], MmKind::F32, "model.visual.pos_embed.weight".into()),
+        ("v.post_ln.weight".into(), vec![m / 4], MmKind::F32, "model.visual.merger.norm.weight".into()),
+        ("v.post_ln.bias".into(), vec![m / 4], MmKind::F32, "model.visual.merger.norm.bias".into()),
+        ("mm.0.weight".into(), vec![m, m], MmKind::Linear, "model.visual.merger.linear_fc1.weight".into()),
+        ("mm.0.bias".into(), vec![m], MmKind::F32, "model.visual.merger.linear_fc1.bias".into()),
+        ("mm.2.weight".into(), vec![m, o], MmKind::Linear, "model.visual.merger.linear_fc2.weight".into()),
+        ("mm.2.bias".into(), vec![o], MmKind::F32, "model.visual.merger.linear_fc2.bias".into()),
+    ];
+    for b in 0..VIT_BLOCKS {
+        let g = |s: &str| format!("v.blk.{b}.{s}");
+        let c = |s: &str| format!("model.visual.blocks.{b}.{s}");
+        v.extend([
+            (g("ln1.weight"), vec![h], MmKind::F32, c("norm1.weight")),
+            (g("ln1.bias"), vec![h], MmKind::F32, c("norm1.bias")),
+            (g("ln2.weight"), vec![h], MmKind::F32, c("norm2.weight")),
+            (g("ln2.bias"), vec![h], MmKind::F32, c("norm2.bias")),
+            (g("attn_qkv.weight"), vec![h, q], MmKind::Linear, c("attn.qkv.weight")),
+            (g("attn_qkv.bias"), vec![q], MmKind::F32, c("attn.qkv.bias")),
+            (g("attn_out.weight"), vec![h, h], MmKind::Linear, c("attn.proj.weight")),
+            (g("attn_out.bias"), vec![h], MmKind::F32, c("attn.proj.bias")),
+            (g("ffn_up.weight"), vec![h, i], MmKind::Linear, c("mlp.linear_fc1.weight")),
+            (g("ffn_up.bias"), vec![i], MmKind::F32, c("mlp.linear_fc1.bias")),
+            (g("ffn_down.weight"), vec![i, h], MmKind::Linear, c("mlp.linear_fc2.weight")),
+            (g("ffn_down.bias"), vec![h], MmKind::F32, c("mlp.linear_fc2.bias")),
+        ]);
+    }
+    v
+}
+
+/// the header check before a byte is uploaded: the projector type and the
+/// geometry keys this tower is built for, then every tensor of `mmproj_plan`
+/// present with its exact dims and type (Linear = F16, F32 = F32). A file that
+/// fails any of it is NOT loaded - the boot falls back to the container, loudly.
+pub fn validate_mmproj(g: &crate::gguf::Gguf) -> Result<(), String> {
+    use crate::gguf::{GGML_TYPE_F16, GGML_TYPE_F32};
+    let want_str = [("clip.projector_type", "qwen3vl_merger")];
+    for (k, v) in want_str {
+        match g.kv_str(k) {
+            Some(s) if s == v => {}
+            other => return Err(format!("{}: {k} is {other:?}, the tower needs {v:?}", g.path)),
+        }
+    }
+    let want_u = [
+        ("clip.vision.block_count", VIT_BLOCKS as u64),
+        ("clip.vision.embedding_length", VIT_HIDDEN as u64),
+        ("clip.vision.feed_forward_length", VIT_INTER as u64),
+        ("clip.vision.attention.head_count", VIT_HEADS as u64),
+        ("clip.vision.patch_size", VIT_PATCH as u64),
+        ("clip.vision.spatial_merge_size", VIT_MERGE as u64),
+        ("clip.vision.projection_dim", H as u64),
+    ];
+    for (k, v) in want_u {
+        if g.kv_u64(k) != Some(v) {
+            return Err(format!("{}: {k} is {:?}, the tower needs {v}", g.path, g.kv_u64(k)));
+        }
+    }
+    for (name, dims, kind, _) in mmproj_plan() {
+        let t = g.find(&name).ok_or_else(|| format!("{}: tensor {name} missing", g.path))?;
+        if t.dims != dims {
+            return Err(format!("{}: tensor {name} dims {:?}, expected {dims:?}", g.path, t.dims));
+        }
+        let want = if kind == MmKind::Linear { GGML_TYPE_F16 } else { GGML_TYPE_F32 };
+        if t.ggml_type != want {
+            return Err(format!("{}: tensor {name} ggml type {}, expected {want}", g.path, t.ggml_type));
+        }
+    }
+    Ok(())
+}
+
+/// the Conv3d patch kernel [1152][3][2][16][16] (our patch-row order
+/// ((c*2 + t)*16 + ty)*16 + tx) from the two temporal halves llama.cpp stores,
+/// each [1152][3][16][16] (ggml dims (16, 16, 3, 1152)); raw f16 bits
+pub fn interleave_patch_kernel(t0: &[u16], t1: &[u16]) -> Vec<u16> {
+    let pp = VIT_PATCH * VIT_PATCH;
+    assert_eq!(t0.len(), VIT_HIDDEN * 3 * pp);
+    assert_eq!(t1.len(), t0.len());
+    let mut out = vec![0u16; VIT_HIDDEN * VIT_IN];
+    for o in 0..VIT_HIDDEN {
+        for c in 0..3 {
+            let src = (o * 3 + c) * pp;
+            for (t, half) in [t0, t1].iter().enumerate() {
+                let dst = o * VIT_IN + (c * VIT_TPATCH + t) * pp;
+                out[dst..dst + pp].copy_from_slice(&half[src..src + pp]);
+            }
+        }
+    }
+    out
+}
+
+fn u16s(raw: &[u8]) -> Vec<u16> {
+    raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+}
+
+fn f32s(raw: &[u8]) -> Vec<f32> {
+    raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
 /// every vit keep is a bf16 tensor; read_f32 asserts that
@@ -191,14 +499,81 @@ unsafe fn load_f32_small(cnq: &mut Cnq, name: &str) -> Dev {
 
 /// fp4 with a loud assert — the sidecar of record has all 112 big vit tensors
 /// NVFP4; a bf16 keep here would silently run the wrong GEMV
-unsafe fn load_f4(cnq: &mut Cnq, name: &str) -> Fp4 {
+unsafe fn load_f4(cnq: &mut Cnq, name: &str) -> Lin {
     let t = cnq.find(name, "vit").clone();
     assert_eq!(t.dtype, "nvfp4", "{name}: the vit section of record is NVFP4, got {}", t.dtype);
-    load_fp4(cnq, name, "vit")
+    Lin::Fp4(load_fp4(cnq, name, "vit"))
 }
 
 impl VitW {
+    /// #108: the tower's weights from the source `mmproj_source` picks -
+    /// llama.cpp's F16 projector when the file is there and passes
+    /// `validate_mmproj`, else the container's NVFP4 section (the fallback,
+    /// named on the `[vit]` boot line with its reason).
     pub unsafe fn load(cnq: &mut Cnq) -> VitW {
+        match mmproj_source(&cnq.path) {
+            VitSource::Mmproj(path) => match crate::gguf::Gguf::open(&path).and_then(|g| validate_mmproj(&g).map(|_| g)) {
+                Ok(g) => VitW::load_mmproj(&g),
+                Err(why) => {
+                    tracing::error!(target: "vit", "[vit] the F16 projector is NOT used: {why} - falling back to the container's NVFP4 vit section");
+                    VitW::load_container(cnq, &format!("fallback, {path} refused: {why}"))
+                }
+            },
+            VitSource::Container(why) => VitW::load_container(cnq, &why),
+        }
+    }
+
+    /// the projector file's tensors, F16 linears kept F16 on the device, the
+    /// F32 vectors and the position table as f32. `g` passed `validate_mmproj`.
+    unsafe fn load_mmproj(g: &crate::gguf::Gguf) -> VitW {
+        let raw = |name: &str| -> Vec<u8> {
+            let t = g.find(name).unwrap_or_else(|| panic!("{}: {name} vanished after validation", g.path));
+            g.read_raw(t).unwrap_or_else(|e| panic!("[vit] {e}"))
+        };
+        let lin = |name: &str| -> Lin { Lin::F16(cuda::upload_dev_named("a vit F16 linear", &raw(name))) };
+        let vec32 = |name: &str| -> Dev { cuda::to_f32_dev(&f32s(&raw(name))) };
+        let t0 = u16s(&raw("v.patch_embd.weight"));
+        let t1 = u16s(&raw("v.patch_embd.weight.1"));
+        let pk = interleave_patch_kernel(&t0, &t1);
+        let patch_proj = Lin::F16(cuda::upload_dev_named(
+            "the vit F16 patch kernel",
+            std::slice::from_raw_parts(pk.as_ptr() as *const u8, pk.len() * 2),
+        ));
+        let blocks = (0..VIT_BLOCKS)
+            .map(|b| {
+                let p = |s: &str| format!("v.blk.{b}.{s}");
+                VitBlockW {
+                    n1w: vec32(&p("ln1.weight")),
+                    n1b: vec32(&p("ln1.bias")),
+                    n2w: vec32(&p("ln2.weight")),
+                    n2b: vec32(&p("ln2.bias")),
+                    qkv: lin(&p("attn_qkv.weight")),
+                    qkv_b: vec32(&p("attn_qkv.bias")),
+                    proj: lin(&p("attn_out.weight")),
+                    proj_b: vec32(&p("attn_out.bias")),
+                    fc1: lin(&p("ffn_up.weight")),
+                    fc1_b: vec32(&p("ffn_up.bias")),
+                    fc2: lin(&p("ffn_down.weight")),
+                    fc2_b: vec32(&p("ffn_down.bias")),
+                }
+            })
+            .collect();
+        VitW {
+            patch_proj,
+            patch_bias: vec32("v.patch_embd.bias"),
+            pos_embed: vec32("v.position_embd.weight"),
+            blocks,
+            m_norm_w: vec32("v.post_ln.weight"),
+            m_norm_b: vec32("v.post_ln.bias"),
+            m_fc1: lin("mm.0.weight"),
+            m_fc1_b: vec32("mm.0.bias"),
+            m_fc2: lin("mm.2.weight"),
+            m_fc2_b: vec32("mm.2.bias"),
+            mode: format!("f16 (llama.cpp projector {}, 112 F16 linears)", g.path),
+        }
+    }
+
+    unsafe fn load_container(cnq: &mut Cnq, why: &str) -> VitW {
         let trace = std::env::var("CROW_VIT_TRACE").is_ok();
         macro_rules! say { ($m:expr) => { if trace { tracing::info!(target: "vit", "[vit-trace] {}", $m); } } }
         say!("patch_embed");
@@ -239,6 +614,7 @@ impl VitW {
             m_fc1_b: load_f32_small(cnq, "model.visual.merger.linear_fc1.bias"),
             m_fc2: load_f4(cnq, "model.visual.merger.linear_fc2.weight"),
             m_fc2_b: load_f32_small(cnq, "model.visual.merger.linear_fc2.bias"),
+            mode: format!("nvfp4 (the container vit section; {why})"),
         };
         say!("weights ok");
         w2
@@ -256,12 +632,12 @@ pub struct Vit {
     /// #VIT cache: image-bytes hash -> (grid, n_visual, tower embeddings on
     /// the host). A conversation that re-sends its whole history (Crow does,
     /// base64 and all) pays for each picture ONCE per process, not per turn.
-    image_cache: std::collections::HashMap<u64, ((usize, usize, usize), usize, Vec<f32>)>,
+    image_cache: std::collections::HashMap<ImageKey, ((usize, usize, usize), usize, Vec<f32>)>,
     /// cache keys, least recently used first: the cache is per PROCESS and a
     /// serve runs for days, so it is bounded by bytes (`CROW_VIT_CACHE_MB`)
     /// and evicted LRU. Unbounded it grew by up to 10 MiB per distinct image,
     /// forever (about 1 GiB per 100 screenshots).
-    image_lru: Vec<u64>,
+    image_lru: Vec<ImageKey>,
     image_cache_bytes: usize,
     x: Dev,        // [cap][1152] residual stream
     normed: Dev,   // [cap][1152] ln output / gemv scratch
@@ -314,7 +690,7 @@ impl Vit {
         let w = VitW::load(cnq);
         Vit {
             w,
-            cap: VIT_MAX_PATCHES,
+            cap: budget().max_patches(),
             x: 0,
             normed: 0,
             qkv: 0,
@@ -444,9 +820,16 @@ impl Vit {
     /// tiled `gemm_fp4_f32x` (bit-identical product tree to gemv_fp4_vit,
     /// reads amortized over 32 tokens x 64 rows). rows_p/kd name SCALAR slots
     /// holding the row and k_dim counts (values reuse the k_dim/bias slots).
-    unsafe fn gemv(&self, k: &Kernels, f: &Fp4, rows: usize, kd: usize, rows_p: usize, t: usize, x: Dev, y: Dev) {
-        launch_v(k.f("gemm_fp4_f32x"), ((rows + 63) / 64) as u32, ((t + 31) / 32) as u32, 1, 256, &[
-            f.w, x, f.gs, y, self.s[kd], self.s[rows_p], self.s[S_N]]);
+    /// #108: an F16 linear runs `gemm_f16_f32x`, the same tile geometry
+    /// with the exact f16 -> f32 widening in place of the e2m1 decode and scale.
+    unsafe fn gemv(&self, k: &Kernels, f: &Lin, rows: usize, kd: usize, rows_p: usize, t: usize, x: Dev, y: Dev) {
+        let grid = (rows.div_ceil(64) as u32, t.div_ceil(32) as u32);
+        match f {
+            Lin::Fp4(f) => launch_v(k.f("gemm_fp4_f32x"), grid.0, grid.1, 1, 256, &[
+                f.w, x, f.gs, y, self.s[kd], self.s[rows_p], self.s[S_N]]),
+            Lin::F16(w) => launch_v(k.f("gemm_f16_f32x"), grid.0, grid.1, 1, 256, &[
+                *w, x, y, self.s[kd], self.s[rows_p], self.s[S_N]]),
+        }
     }
 
     /// out[t][stride] rows get +bias[0..cols]; stride == cols for every vision
@@ -485,6 +868,8 @@ impl Vit {
         n: usize,
     ) -> Dev {
         self.ensure_scratch();
+        // the scratch holds `cap` patch rows; prep_image sizes to the same budget
+        assert!(n <= self.cap, "vit: {n} patches over the scratch cap {}", self.cap);
         let nv = n / (VIT_MERGE * VIT_MERGE);
         cuda::to_f32_into(self.patches, patches_host);
         cuda::to_i32_into(self.pe_idx, idx_host);
@@ -621,14 +1006,15 @@ pub struct ImagePrep {
     pub n_visual: usize,
 }
 
-/// unit-test accessor for the private `smart_resize`
+/// unit-test accessor for the private `smart_resize` at the preprocessor
+/// config's own window (the HF reference cases)
 pub fn smart_resize_for_test(h: u64, w: u64) -> Result<(u64, u64), String> {
-    smart_resize(h, w)
+    smart_resize(h, w, HF_MIN_PIXELS, HF_MAX_PIXELS)
 }
 
 /// HF `smart_resize` (qwen2_vl image processing), factor 32. Python's
 /// `round` is banker's rounding — round-half-EVEN — replicated here exactly.
-fn smart_resize(height: u64, width: u64) -> Result<(u64, u64), String> {
+fn smart_resize(height: u64, width: u64, min_pixels: u64, max_pixels: u64) -> Result<(u64, u64), String> {
     const FACTOR: u64 = (VIT_PATCH * VIT_MERGE) as u64;
     if height < FACTOR || width < FACTOR {
         return Err(format!(
@@ -644,13 +1030,13 @@ fn smart_resize(height: u64, width: u64) -> Result<(u64, u64), String> {
     };
     let h_bar = (pyround(height as f64 / FACTOR as f64) as u64) * FACTOR;
     let w_bar = (pyround(width as f64 / FACTOR as f64) as u64) * FACTOR;
-    if h_bar * w_bar > MAX_PIXELS {
-        let beta = ((height * width) as f64 / MAX_PIXELS as f64).sqrt();
+    if h_bar * w_bar > max_pixels {
+        let beta = ((height * width) as f64 / max_pixels as f64).sqrt();
         let h2 = ((height as f64 / beta / FACTOR as f64).floor() as u64) * FACTOR;
         let w2 = ((width as f64 / beta / FACTOR as f64).floor() as u64) * FACTOR;
         Ok((h2.max(FACTOR), w2.max(FACTOR)))
-    } else if h_bar * w_bar < MIN_PIXELS {
-        let beta = (MIN_PIXELS as f64 / ((height * width) as f64)).sqrt();
+    } else if h_bar * w_bar < min_pixels {
+        let beta = (min_pixels as f64 / ((height * width) as f64)).sqrt();
         let h2 = ((height as f64 * beta / FACTOR as f64).ceil() as u64) * FACTOR;
         let w2 = ((width as f64 * beta / FACTOR as f64).ceil() as u64) * FACTOR;
         Ok((h2, w2))
@@ -726,19 +1112,21 @@ pub fn decode_rgb(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
 /// rescale 1/255, normalize mean/std 0.5, patchify in merge-block order with
 /// the temporal frame duplicated — plus the host tables the tower launches
 /// need (pos-table taps, rotary cos/sin).
-pub fn prep_image(bytes: &[u8]) -> Result<ImagePrep, String> {
-    let (rgb, w0, h0) = decode_rgb(bytes)?;
-    let (rh, rw) = smart_resize(h0 as u64, w0 as u64)?;
+/// #107: the resized pixel size (h, w) of an `h0` x `w0` source under
+/// `b`: HF `smart_resize` with the budget's min/max pixels, then the patch-cap
+/// clamp for the one case smart_resize can overshoot (the floor's ceil rounding
+/// on an extreme aspect ratio). Pure host math, unit-tested against known grids.
+pub fn resized_dims(h0: u64, w0: u64, b: &VitBudget) -> Result<(usize, usize), String> {
+    let (rh, rw) = smart_resize(h0, w0, b.min_pixels(), b.max_pixels())?;
     let (mut rh, mut rw) = (rh as usize, rw as usize);
-    let (w0, h0) = (w0 as usize, h0 as usize);
-
+    let cap = b.max_patches();
     // #VIT cap: an image over the patch budget is DOWNSCALED further, never
     // refused - a screenshot must reach the model at the resolution a chat
     // needs, the same clamp every production VLM applies. Dims stay
     // FACTOR-multiples so the patch grid keeps its merge alignment.
     const FACTOR: usize = VIT_PATCH * VIT_MERGE;
-    while (rh / VIT_PATCH) * (rw / VIT_PATCH) > VIT_MAX_PATCHES {
-        let beta = ((rh * rw) as f64 / (VIT_MAX_PATCHES * VIT_PATCH * VIT_PATCH) as f64).sqrt() * 1.06;
+    while (rh / VIT_PATCH) * (rw / VIT_PATCH) > cap {
+        let beta = ((rh * rw) as f64 / (cap * VIT_PATCH * VIT_PATCH) as f64).sqrt() * 1.06;
         let nh = (((rh as f64 / beta) / FACTOR as f64).floor() as usize).max(1) * FACTOR;
         let nw = (((rw as f64 / beta) / FACTOR as f64).floor() as usize).max(1) * FACTOR;
         if nh >= rh && nw >= rw {
@@ -747,6 +1135,26 @@ pub fn prep_image(bytes: &[u8]) -> Result<ImagePrep, String> {
         rh = nh;
         rw = nw;
     }
+    Ok((rh, rw))
+}
+
+/// the `image_grid_thw` row and the visual-token count `resized_dims` gives
+pub fn grid_for(h0: u64, w0: u64, b: &VitBudget) -> Result<((usize, usize, usize), usize), String> {
+    let (rh, rw) = resized_dims(h0, w0, b)?;
+    let (hp, wp) = (rh / VIT_PATCH, rw / VIT_PATCH);
+    Ok(((1, hp, wp), hp * wp / (VIT_MERGE * VIT_MERGE)))
+}
+
+pub fn prep_image(bytes: &[u8]) -> Result<ImagePrep, String> {
+    prep_image_with(bytes, &budget())
+}
+
+/// `prep_image` under an explicit window (the layout tests pin the
+/// preprocessor's own 64-token floor so a 256x256 raster is not resized)
+pub fn prep_image_with(bytes: &[u8], b: &VitBudget) -> Result<ImagePrep, String> {
+    let (rgb, w0, h0) = decode_rgb(bytes)?;
+    let (rh, rw) = resized_dims(h0 as u64, w0 as u64, b)?;
+    let (w0, h0) = (w0 as usize, h0 as usize);
     let hp = rh / VIT_PATCH;
     let wp = rw / VIT_PATCH;
     let n_patches = hp * wp;
@@ -870,6 +1278,65 @@ pub fn prep_image(bytes: &[u8]) -> Result<ImagePrep, String> {
 /// one image's grid (t, hp, wp) — `image_grid_thw` row
 pub type Grid = (usize, usize, usize);
 
+/// - #114: one image's place in the EXPANDED prompt and its content identity
+/// - `start..start + len` are the rows its visual tokens occupy (all `IMAGE_PAD` ids)
+/// - `hash` is `image_key` of the image bytes (SHA-256), the key the tower-output cache uses
+/// - the prefix cache compares these next to the ids: `IMAGE_PAD` ids alone say
+///   nothing about WHICH image sits there (`cache::common_prefix_len_mm`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageSpan {
+    pub start: usize,
+    pub len: usize,
+    pub hash: ImageKey,
+}
+
+/// #114: an image's content identity, the SHA-256 digest of its encoded bytes
+pub type ImageKey = [u8; 32];
+
+/// - #114: the content identity of one image: SHA-256 of its encoded bytes
+/// - the ONE definition, shared by the tower-output cache (`Vit::build_plan`, its LRU
+///   included) and the prefix cache's image spans, so both agree on what "the same
+///   image" is
+/// - SHA-256, not a 64-bit hash: a collision is a cache HIT for a different image (the
+///   other image's tower rows or KV prefix answer the request), and a client that can
+///   pick the bytes could aim for one against a 64-bit SipHash with fixed keys.
+///   llama.cpp hashes its mtmd bitmaps with SHA-256 for exactly that reason
+///   (`tools/mtmd/mtmd-helper.cpp` `mtmd_helper_bitmap_init_from_buf`: "use sha256 to
+///   prevent cache poisoning"). Until 2026-09-24 this was `DefaultHasher` (SipHash-1-3).
+/// - RustCrypto `sha2` (robin, 2026-09-24: no hand-rolled crypto), pinned to the NIST
+///   example vectors in the tests. Cost is one pass over the encoded bytes per image
+///   per request, next to a decode + preprocess of the same bytes on a miss.
+pub fn image_key(bytes: &[u8]) -> ImageKey {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).into()
+}
+
+/// - #114: the spans of the images in the EXPANDED prompt, from the RENDERED ids (one
+///   `IMAGE_PAD` per image), each image's visual token count and its hash
+/// - the same walk `expand_ids` does, so `start` is exactly where the splice puts it
+pub fn image_spans(ids: &[u32], counts: &[usize], hashes: &[ImageKey]) -> Result<Vec<ImageSpan>, String> {
+    if counts.len() != hashes.len() {
+        return Err(format!("{} image counts but {} image hashes", counts.len(), hashes.len()));
+    }
+    let mut out = Vec::with_capacity(counts.len());
+    let mut row = 0usize;
+    let mut k = 0usize;
+    for &id in ids {
+        if id as i64 == IMAGE_PAD {
+            let len = *counts.get(k).ok_or("more image_pad tokens than images")?;
+            out.push(ImageSpan { start: row, len, hash: hashes[k] });
+            row += len;
+            k += 1;
+        } else {
+            row += 1;
+        }
+    }
+    if k != counts.len() {
+        return Err("more images than image_pad tokens".into());
+    }
+    Ok(out)
+}
+
 /// the per-request vision plan: where the visual embeddings land in the
 /// (already expanded) prompt id list, the embeddings themselves, and the
 /// mrope delta the decode path needs
@@ -890,6 +1357,9 @@ pub struct VisionPlan {
     pub n_visual: usize,
     /// mrope_position_deltas of the oracle (max_pos + 1 - seq_len)
     pub delta: i64,
+    /// #114: each image's rows in `ids` and its content hash, message order: what the
+    /// prefix cache compares so two prompts are equal only if their images are
+    pub spans: Vec<ImageSpan>,
 }
 
 /// expand every IMAGE_PAD token (one per image, template order) into
@@ -1012,7 +1482,7 @@ impl Vit {
     /// insert one tower output, then evict least-recently-used entries until the
     /// cache is back under `vit_cache_bytes()`. An entry larger than the whole
     /// ceiling is not cached at all (it would evict everything and then itself).
-    fn cache_insert(&mut self, key: u64, grid: (usize, usize, usize), n_visual: usize, rows: Vec<f32>) {
+    fn cache_insert(&mut self, key: ImageKey, grid: (usize, usize, usize), n_visual: usize, rows: Vec<f32>) {
         let bytes = rows.len() * 4;
         let ceiling = vit_cache_bytes();
         if bytes > ceiling {
@@ -1051,12 +1521,10 @@ impl Vit {
             let _ = std::fs::create_dir_all(dir);
         }
         let mut misses = 0usize;
+        let mut hashes: Vec<ImageKey> = Vec::with_capacity(images.len());
         for (i, bytes) in images.iter().enumerate() {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            bytes.hash(&mut hasher);
-            let key = hasher.finish();
+            let key = image_key(bytes);
+            hashes.push(key);
             if let Some((grid, n_visual, rows)) = self.image_cache.get(&key) {
                 tracing::info!(target: "vit", "[vit-cache] image {i}: HIT grid {grid:?}, {n_visual} visual tokens");
                 infos.push((*grid, *n_visual));
@@ -1091,6 +1559,7 @@ impl Vit {
         );
         let counts: Vec<usize> = infos.iter().map(|(_, n)| *n).collect();
         let expanded = expand_ids(ids, &counts)?;
+        let spans = image_spans(ids, &counts, &hashes)?;
         // walk the expanded ids, mark the image rows
         let mut types = vec![0u8; expanded.len()];
         let mut map = vec![-1i32; expanded.len()];
@@ -1120,6 +1589,7 @@ impl Vit {
             grids: infos.iter().map(|(g, _)| *g).collect(),
             n_visual: flat as usize,
             delta,
+            spans,
         })
     }
 }
@@ -1145,9 +1615,12 @@ mod reserve {
     fn the_scratch_is_the_twelve_buffers_the_allocator_takes() {
         // x + normed + attn: 3 x 4096 x 1152, qkv 4096 x 3456, mlp 4096 x 4304,
         // m1 1024 x 4608, out 1024 x 2560, patches 4096 x 1536, pe_idx + pe_w 2 x 16384,
-        // cs + sn 2 x 4096 x 36 - all f32
-        assert_eq!(scratch_bytes(), 239_599_616);
-        assert_eq!(VIT_MAX_VISUAL, 1024);
+        // cs + sn 2 x 4096 x 36 - all f32 (the pre-#107 cap, 1024 tokens)
+        assert_eq!(scratch_bytes_for(4096), 239_599_616);
+        // 58,496 B per patch; the default cap 1280 tokens = 5120 patches = 285.6 MiB
+        assert_eq!(scratch_bytes_for(5120), 299_499_520);
+        assert_eq!(VitBudget::DEFAULT.max_patches(), 5120);
+        assert_eq!(scratch_bytes(), scratch_bytes_for(budget().max_patches()));
     }
 
     /// the span tables are `n_ctx` rows since serve clamps the budget before arming them
@@ -1166,8 +1639,8 @@ mod reserve {
         );
         let line = reserve_line(ctx, 0);
         assert!(line.starts_with("vit reserve"), "the [budget] label moved: {line}");
-        assert!(line.contains("277.3 MB"), "the reserve total moved: {line}");
-        assert!(line.contains("tower scratch 228.5"), "the scratch part moved: {line}");
+        assert!(line.contains("334.5 MB"), "the reserve total moved: {line}");
+        assert!(line.contains("tower scratch 285.6"), "the scratch part moved: {line}");
         assert!(line.contains("mrope span 48.8"), "the mrope part moved: {line}");
     }
 
@@ -1183,7 +1656,7 @@ mod reserve {
             assert_eq!(reserve_bytes(ctx).saturating_sub(held), 0, "ctx {ctx}: bytes left pending");
         }
         // the twelve buffers, each counted from the geometry ensure_scratch uses
-        let cap = VIT_MAX_PATCHES;
+        let cap = budget().max_patches();
         let buffers: [usize; VIT_SCRATCH_BUFFERS] = [
             cap * VIT_HIDDEN,      // x
             cap * VIT_HIDDEN,      // normed
@@ -1234,6 +1707,10 @@ mod layout {
 
     use super::*;
 
+    /// the preprocessor's own 64-token floor: a 256x256 raster stays 16x16
+    /// patches (the serving floor of 1024 tokens would upscale it)
+    const HF_WINDOW: VitBudget = VitBudget { min_tokens: 64, max_tokens: 1024 };
+
     /// encode an RGB8 raster as a PNG, which is what `prep_image` takes
     fn png(w: u32, h: u32, px: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8> {
         use image::ImageEncoder;
@@ -1268,7 +1745,7 @@ mod layout {
     /// different NUMBER, not as a different shade.
     #[test]
     fn the_patch_rows_are_channel_major_with_the_temporal_frame_duplicated() {
-        let p = prep_image(&png(256, 256, |x, y| [x as u8, y as u8, 7])).expect("prep");
+        let p = prep_image_with(&png(256, 256, |x, y| [x as u8, y as u8, 7]), &HF_WINDOW).expect("prep");
         assert_eq!(p.grid, (1, 16, 16));
         assert_eq!(p.resized, (256, 256));
         assert_eq!(p.n_patches, 256);
@@ -1315,7 +1792,7 @@ mod layout {
     #[test]
     fn a_solid_colour_fills_every_patch_row_with_that_colour_in_rgb_order() {
         let (r, g, b) = (230u8, 20u8, 20u8);
-        let p = prep_image(&png(256, 256, |_, _| [r, g, b])).expect("prep");
+        let p = prep_image_with(&png(256, 256, |_, _| [r, g, b]), &HF_WINDOW).expect("prep");
         let (nr, ng, nb) = (
             r as f32 / 127.5 - 1.0,
             g as f32 / 127.5 - 1.0,
@@ -1345,7 +1822,7 @@ mod layout {
     /// and 4 of the table and sits whole on column 0.
     #[test]
     fn the_position_table_taps_are_align_corners_bilinear_in_h0w0_order() {
-        let p = prep_image(&png(256, 256, |_, _| [9, 9, 9])).expect("prep");
+        let p = prep_image_with(&png(256, 256, |_, _| [9, 9, 9]), &HF_WINDOW).expect("prep");
         // seq 0 = patch (0, 0): the exact corner, all weight on the first tap
         assert_eq!(&p.pe_idx[0..4], &[0, 1, 48, 49], "seq 0 taps");
         close(p.pe_w[0], 1.0, "seq 0 w00");
@@ -1370,7 +1847,7 @@ mod layout {
     /// inv_freq[0] is 1. An h/w swap moves cos(1) and cos(2) past each other.
     #[test]
     fn the_rotary_half_is_the_patch_row_and_the_second_half_the_patch_column() {
-        let p = prep_image(&png(256, 256, |_, _| [9, 9, 9])).expect("prep");
+        let p = prep_image_with(&png(256, 256, |_, _| [9, 9, 9]), &HF_WINDOW).expect("prep");
         let half = VIT_ROT / 2; // 18
         // seq 2 = patch (row 1, col 0)
         close(p.cs[2 * VIT_ROT], 1f32.cos(), "seq 2 h slot 0 = cos(1)");
@@ -1651,5 +2128,465 @@ extern "C" __global__ void vit_attn_s1(const float* __restrict__ qkv, float* __r
             cuda::event_destroy(e1);
             module.unload();
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_and_mmproj {
+    //! #107 and #108: the resize window, the projector file
+    //! choice and the projector layout, all host-side (no GPU).
+    use super::*;
+    use crate::gguf::{self, Gguf, GGML_TYPE_F16, GGML_TYPE_F32};
+
+    const OLD: VitBudget = VitBudget { min_tokens: 64, max_tokens: 1024 };
+
+    #[test]
+    fn the_old_window_reproduces_the_grids_the_engine_logged() {
+        // [vit-chat] grids of record: 1280x720 -> (1, 44, 80) = 880 (#98 closing,
+        // 2026-09-22); 1000x560 -> 558 and a 992x544 render -> (1, 34, 62) = 527
+        // (engine.log, 2026-09-23)
+        assert_eq!(grid_for(720, 1280, &OLD).unwrap(), ((1, 44, 80), 880));
+        assert_eq!(grid_for(560, 1000, &OLD).unwrap(), ((1, 36, 62), 558));
+        assert_eq!(grid_for(544, 992, &OLD).unwrap(), ((1, 34, 62), 527));
+    }
+
+    #[test]
+    fn the_default_window_gives_crows_renders_the_llama_cpp_token_count() {
+        let b = VitBudget::DEFAULT;
+        assert_eq!((b.min_tokens, b.max_tokens), (1024, 1280));
+        // llama.cpp at --image-min-tokens 1024 gives both renders 1032 tokens
+        assert_eq!(grid_for(560, 1000, &b).unwrap(), ((1, 48, 86), 1032));
+        assert_eq!(grid_for(720, 1280, &b).unwrap(), ((1, 48, 86), 1032));
+        assert_eq!(grid_for(544, 992, &b).unwrap(), ((1, 48, 88), 1056));
+        // the 1097x380 paste that read as "no image" at ~350 tokens
+        assert_eq!(grid_for(380, 1097, &b).unwrap(), ((1, 38, 110), 1045));
+        // over the cap: downscaled into it
+        assert_eq!(grid_for(1080, 1920, &b).unwrap(), ((1, 52, 94), 1222));
+        assert_eq!(grid_for(2160, 3840, &b).unwrap(), ((1, 52, 94), 1222));
+        assert_eq!(grid_for(1024, 1024, &b).unwrap(), ((1, 64, 64), 1024));
+    }
+
+    #[test]
+    fn every_grid_stays_inside_the_cap_and_on_the_merge_lattice() {
+        for b in [OLD, VitBudget::DEFAULT, VitBudget { min_tokens: 1024, max_tokens: 1024 }] {
+            for h in (32..3000u64).step_by(97) {
+                for w in (32..3000u64).step_by(89) {
+                    if h.max(w) / h.min(w) > 200 {
+                        continue;
+                    }
+                    let (rh, rw) = resized_dims(h, w, &b).unwrap();
+                    assert!(rh % 32 == 0 && rw % 32 == 0, "{h}x{w} -> {rh}x{rw}");
+                    let n = (rh / 16) * (rw / 16);
+                    assert!(n <= b.max_patches(), "{h}x{w} under {b:?}: {n} patches");
+                    // the floor holds wherever the cap leaves room for it
+                    if b.max_tokens >= b.min_tokens + b.min_tokens / 4 && h.max(w) / h.min(w) < 8 {
+                        assert!(n / 4 >= b.min_tokens, "{h}x{w} under {b:?}: {} tokens", n / 4);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_env_window_parses_and_a_bad_value_is_an_error() {
+        assert_eq!(VitBudget::parse(None, None), Ok(VitBudget::DEFAULT));
+        assert_eq!(VitBudget::parse(Some("256"), Some("1280")), Ok(VitBudget { min_tokens: 256, max_tokens: 1280 }));
+        // a floor above the default cap lifts the default cap with it
+        assert_eq!(VitBudget::parse(Some("2048"), None), Ok(VitBudget { min_tokens: 2048, max_tokens: 2048 }));
+        assert_eq!(VitBudget::parse(Some(" 64 "), Some("1024")), Ok(OLD));
+        for (min, max, word) in [
+            (Some("1k"), None, "not a whole number"),
+            (None, Some("-1"), "not a whole number"),
+            (Some("4"), None, "outside 8..=4096"),
+            (None, Some("8192"), "outside 8..=4096"),
+            (Some("2048"), Some("1024"), "is above"),
+        ] {
+            let e = VitBudget::parse(min, max).unwrap_err();
+            assert!(e.contains(word), "{min:?}/{max:?}: {e}");
+        }
+        assert_eq!(VitBudget::DEFAULT.min_pixels(), 1_048_576);
+        assert_eq!(VitBudget::DEFAULT.max_pixels(), 1_310_720);
+    }
+
+    #[test]
+    fn the_projector_file_is_found_by_the_documented_order() {
+        let cnq = "/r/crow-nest/converter/x.cnq";
+        // CROW_VIT_MMPROJ wins, 0 forces the container
+        assert_eq!(
+            resolve_mmproj(Some("0"), cnq, None, None, &|_| true),
+            VitSource::Container("CROW_VIT_MMPROJ=0".into())
+        );
+        assert_eq!(
+            resolve_mmproj(Some("/a/p.gguf"), cnq, None, None, &|p| p == "/a/p.gguf"),
+            VitSource::Mmproj("/a/p.gguf".into())
+        );
+        assert!(matches!(resolve_mmproj(Some("/a/p.gguf"), cnq, None, None, &|_| false),
+            VitSource::Container(w) if w.contains("does not exist")));
+        // unset: models/ beside the container, then $CROW_MODELS, then Crow's install link
+        let m = |p: &str| resolve_mmproj(None, cnq, Some("/cm"), Some("/home/u"), &|q| q == p);
+        for hit in [
+            "/r/crow-nest/models/mmproj-F16.gguf",
+            "/cm/mmproj-F16.gguf",
+            "/home/u/.local/share/crow/models/mmproj-F16.gguf",
+        ] {
+            assert_eq!(m(hit), VitSource::Mmproj(hit.into()));
+        }
+        // the first hit wins when several exist
+        assert_eq!(
+            resolve_mmproj(None, cnq, Some("/cm"), Some("/home/u"), &|_| true),
+            VitSource::Mmproj("/r/crow-nest/models/mmproj-F16.gguf".into())
+        );
+        match resolve_mmproj(None, cnq, Some("/cm"), Some("/home/u"), &|_| false) {
+            VitSource::Container(w) => assert!(
+                w.contains("/r/crow-nest/models/mmproj-F16.gguf") && w.contains("/cm/") && w.contains("/home/u/"),
+                "{w}"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// a header-only projector image with the given tensor table (no data: the
+    /// parser is told the file is big enough, validation reads no bytes)
+    fn header(kv_over: Option<(&str, u32)>, drop: Option<&str>, redim: Option<(&str, Vec<u64>)>) -> Gguf {
+        let u = |v: u32| v.to_le_bytes().to_vec();
+        let mut kvs: Vec<(&str, u32, Vec<u8>)> = vec![
+            ("clip.projector_type", 8, gguf::tests::str_payload("qwen3vl_merger")),
+            ("clip.vision.block_count", 4, u(27)),
+            ("clip.vision.embedding_length", 4, u(1152)),
+            ("clip.vision.feed_forward_length", 4, u(4304)),
+            ("clip.vision.attention.head_count", 4, u(16)),
+            ("clip.vision.patch_size", 4, u(16)),
+            ("clip.vision.spatial_merge_size", 4, u(2)),
+            ("clip.vision.projection_dim", 4, u(2560)),
+        ];
+        if let Some((k, v)) = kv_over {
+            for e in kvs.iter_mut() {
+                if e.0 == k {
+                    e.2 = u(v);
+                }
+            }
+        }
+        let plan = mmproj_plan();
+        let tensors: Vec<(&str, Vec<u64>, u32, Vec<u8>)> = plan
+            .iter()
+            .filter(|(n, ..)| Some(n.as_str()) != drop)
+            .map(|(n, d, k, _)| {
+                let d = match &redim {
+                    Some((rn, rd)) if rn == n => rd.clone(),
+                    _ => d.clone(),
+                };
+                (n.as_str(), d, if *k == MmKind::Linear { GGML_TYPE_F16 } else { GGML_TYPE_F32 }, Vec::new())
+            })
+            .collect();
+        let img = gguf::tests::build(&kvs, &tensors);
+        Gguf::parse(&img[..], 1 << 40, "synthetic.gguf").unwrap()
+    }
+
+    #[test]
+    fn the_projector_layout_is_checked_before_a_byte_is_loaded() {
+        let plan = mmproj_plan();
+        assert_eq!(plan.len(), 334, "the unsloth file carries 334 tensors");
+        assert_eq!(plan.iter().filter(|e| e.2 == MmKind::Linear).count(), 27 * 4 + 2 + 2);
+        let names: std::collections::BTreeSet<_> = plan.iter().map(|e| e.0.clone()).collect();
+        assert_eq!(names.len(), 334);
+        let targets: std::collections::BTreeSet<_> = plan.iter().map(|e| e.3.clone()).collect();
+        assert_eq!(targets.len(), 333, "the container's vit section has 333 tensors");
+        assert_eq!(validate_mmproj(&header(None, None, None)), Ok(()));
+        let e = validate_mmproj(&header(Some(("clip.vision.block_count", 26)), None, None)).unwrap_err();
+        assert!(e.contains("block_count"), "{e}");
+        let e = validate_mmproj(&header(None, Some("v.blk.13.ffn_down.weight"), None)).unwrap_err();
+        assert!(e.contains("v.blk.13.ffn_down.weight missing"), "{e}");
+        // fc2 stored transposed (rows and k swapped) must not load
+        let e = validate_mmproj(&header(None, None, Some(("v.blk.0.ffn_down.weight", vec![1152, 4304])))).unwrap_err();
+        assert!(e.contains("dims"), "{e}");
+    }
+
+    #[test]
+    fn the_patch_kernel_halves_interleave_into_the_conv3d_row_order() {
+        let pp = VIT_PATCH * VIT_PATCH;
+        let n = VIT_HIDDEN * 3 * pp;
+        // value = a code of (half, o, c, ty*16+tx)
+        let code = |t: usize, o: usize, c: usize, i: usize| ((t * 7919 + o * 263 + c * 1031 + i) % 65521) as u16;
+        let mk = |t: usize| (0..n).map(|j| code(t, j / (3 * pp), (j / pp) % 3, j % pp)).collect::<Vec<u16>>();
+        let out = interleave_patch_kernel(&mk(0), &mk(1));
+        for o in [0, 1, 577, VIT_HIDDEN - 1] {
+            for c in 0..3 {
+                for t in 0..2 {
+                    for i in [0, 1, 17, pp - 1] {
+                        // our patch row: ((c * 2 + t) * 16 + ty) * 16 + tx
+                        assert_eq!(out[o * VIT_IN + (c * 2 + t) * pp + i], code(t, o, c, i));
+                    }
+                }
+            }
+        }
+    }
+
+    /// the real file, when this machine has it: the header passes validation
+    /// (reads ~20 KB, no tensor data)
+    #[test]
+    fn the_projector_on_this_machine_passes_the_header_check() {
+        let VitSource::Mmproj(p) = mmproj_source("../converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq") else {
+            eprintln!("no mmproj-F16.gguf on this machine - skipped");
+            return;
+        };
+        let g = Gguf::open(&p).unwrap();
+        assert_eq!(g.tensors.len(), 334);
+        validate_mmproj(&g).unwrap();
+    }
+
+    /// cos(container NVFP4 dequant, mmproj F16) per tensor: a mapping or
+    /// orientation error (a wrong name, a transposed fc2, swapped patch halves)
+    /// drops far below NVFP4's own error. CPU only, reads ~1.1 GB:
+    /// `CROW_CNQ=<container> cargo test --release mmproj_matches -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn mmproj_matches_the_container_tensor_by_tensor() {
+        let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| "../converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq".into());
+        let VitSource::Mmproj(p) = mmproj_source(&cnq_path) else { panic!("no mmproj file") };
+        let g = Gguf::open(&p).unwrap();
+        let mut cnq = Cnq::open(&cnq_path);
+        let cos = |a: &[f32], b: &[f32]| {
+            assert_eq!(a.len(), b.len());
+            let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
+            for (x, y) in a.iter().zip(b) {
+                ab += (*x as f64) * (*y as f64);
+                aa += (*x as f64).powi(2);
+                bb += (*y as f64).powi(2);
+            }
+            ab / (aa.sqrt() * bb.sqrt())
+        };
+        let raw = |name: &str| g.read_raw(g.find(name).unwrap()).unwrap();
+        let mut worst = (1.0f64, String::new());
+        for (gname, dims, kind, cname) in mmproj_plan() {
+            if gname == "v.patch_embd.weight.1" {
+                continue;
+            }
+            let n: usize = if gname == "v.patch_embd.weight" { VIT_HIDDEN * VIT_IN } else { dims.iter().product::<u64>() as usize };
+            let t = cnq.find(&cname, "vit").clone();
+            let ours: Vec<f32> = if t.dtype == "bf16" {
+                cnq.read_f32(&cname, "vit")
+            } else {
+                let bytes = cnq.read_bytes(&t);
+                let mut out = vec![0f32; n];
+                let mut blk = [0f32; 64];
+                for (b, chunk) in bytes.chunks_exact(36).enumerate() {
+                    crate::cnq::dequant_block(chunk, t.global_scale, &mut blk);
+                    let end = ((b + 1) * 64).min(n);
+                    out[b * 64..end].copy_from_slice(&blk[..end - b * 64]);
+                }
+                out
+            };
+            let theirs: Vec<f32> = if gname == "v.patch_embd.weight" {
+                let pk = interleave_patch_kernel(&u16s(&raw("v.patch_embd.weight")), &u16s(&raw("v.patch_embd.weight.1")));
+                pk.iter().map(|h| gguf::f16_to_f32(*h)).collect()
+            } else if kind == MmKind::Linear {
+                u16s(&raw(&gname)).iter().map(|h| gguf::f16_to_f32(*h)).collect()
+            } else {
+                f32s(&raw(&gname))
+            };
+            let c = cos(&ours, &theirs);
+            if gname == "v.patch_embd.weight" {
+                // the control: the two temporal halves swapped must read worse
+                let sw = interleave_patch_kernel(&u16s(&raw("v.patch_embd.weight.1")), &u16s(&raw("v.patch_embd.weight")));
+                let sw: Vec<f32> = sw.iter().map(|h| gguf::f16_to_f32(*h)).collect();
+                let cs = cos(&ours, &sw);
+                eprintln!("patch kernel cos {c:.6}, halves swapped {cs:.6}");
+                assert!(cs < c, "the patch test cannot tell the halves apart");
+            }
+            if c < worst.0 {
+                worst = (c, gname.clone());
+            }
+            assert!(c > 0.995, "{gname} vs {cname}: cos {c:.6}");
+        }
+        eprintln!("worst cos {:.6} at {}", worst.0, worst.1);
+    }
+}
+
+#[cfg(test)]
+mod gemm_vit {
+    //! #109 and #108 on the GPU: the two vision GEMMs
+    //! (`gemm_fp4_f32x`, `gemm_f16_f32x`) against an f64 host reference at the
+    //! tower's real shapes, INCLUDING the fc1 shape whose 4304 rows are not a
+    //! multiple of the 64-row tile. The weight buffer carries a nonzero garbage
+    //! tail, so a row tile that reads past the last row decodes nonzero values -
+    //! and before the row guard it wrote them into the next token's first 48
+    //! outputs. `#[ignore]`: CI has no GPU. Run with
+    //! `cargo test --release gemm_vit -- --ignored --nocapture` (a few MB of VRAM).
+    use super::*;
+
+    fn fill_u8(n: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed.max(1);
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x >> 11) as u8
+            })
+            .collect()
+    }
+
+    fn fill_f32(n: usize, seed: u32) -> Vec<f32> {
+        fill_u8(n * 3, seed).chunks_exact(3).map(|b| (b[0] as f32 - 127.5) / 64.0 + b[1] as f32 / 4096.0).collect()
+    }
+
+    /// max |gpu - ref| / (|ref| + 1e-3 * max|ref|) over every output
+    fn worst(gpu: &[f32], reference: &[f64]) -> (f64, usize) {
+        let scale = reference.iter().fold(0f64, |a, v| a.max(v.abs()));
+        let mut w = (0f64, 0usize);
+        for (i, (g, r)) in gpu.iter().zip(reference).enumerate() {
+            let e = (*g as f64 - r).abs() / (r.abs() + 1e-3 * scale);
+            if e > w.0 {
+                w = (e, i);
+            }
+        }
+        w
+    }
+
+    fn reference(wf: &[f32], x: &[f32], rows: usize, k: usize, t: usize) -> Vec<f64> {
+        let mut y = vec![0f64; t * rows];
+        for tok in 0..t {
+            for r in 0..rows {
+                y[tok * rows + r] = (0..k).map(|j| wf[r * k + j] as f64 * x[tok * k + j] as f64).sum();
+            }
+        }
+        y
+    }
+
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release gemm_vit -- --ignored --nocapture"]
+    fn both_vision_gemms_match_the_host_at_every_tower_shape_and_keep_the_row_tail_in_bounds() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let module = cuda::compile(crate::kernels::KERNEL_SRC);
+            let (f_fp4, f_f16) = (module.get("gemm_fp4_f32x"), module.get("gemm_f16_f32x"));
+            // (rows, k): qkv, proj, fc1 (row tail), fc2 (k tail), merger fc1, fc2, patch
+            let shapes = [(3456, 1152), (1152, 1152), (4304, 1152), (1152, 4304), (4608, 4608), (2560, 4608), (1152, 1536)];
+            let t = 70; // three token tiles, the last one partial
+            for (si, &(rows, k)) in shapes.iter().enumerate() {
+                let x = fill_f32(t * k, 0x51 + si as u32);
+                let xd = cuda::to_f32_dev(&x);
+                let (kd, rd, td) = (cuda::to_i32_dev(&[k as i32]), cuda::to_i32_dev(&[rows as i32]), cuda::to_i32_dev(&[t as i32]));
+                // --- NVFP4: 36-byte blocks, scale bytes in a sane ue4m3 range, 1 MiB garbage tail
+                let nblk = rows * k / 64;
+                let mut wb = fill_u8(nblk * 36 + (1 << 20), 0x77 + si as u32);
+                for b in 0..nblk {
+                    for s in 0..4 {
+                        wb[b * 36 + s] = 0x30 + (wb[b * 36 + s] & 0x0f);
+                    }
+                }
+                let gs = 0.37f32;
+                let mut wf = vec![0f32; rows * k];
+                let mut blk = [0f32; 64];
+                for b in 0..nblk {
+                    crate::cnq::dequant_block(&wb[b * 36..b * 36 + 36], gs, &mut blk);
+                    wf[b * 64..b * 64 + 64].copy_from_slice(&blk);
+                }
+                let want = reference(&wf, &x, rows, k, t);
+                let wd = cuda::upload_dev(&wb);
+                let gsd = cuda::to_f32_dev(&[gs]);
+                let yd = cuda::alloc_zeroed((t + 1) * rows * 4);
+                for rep in 0..5 {
+                    launch_v(f_fp4, rows.div_ceil(64) as u32, t.div_ceil(32) as u32, 1, 256, &[wd, xd, gsd, yd, kd, rd, td]);
+                    cuda::sync();
+                    let got = cuda::dtoh(yd, (t + 1) * rows);
+                    let (e, at) = worst(&got[..t * rows], &want);
+                    assert!(e < 1e-3, "fp4 {rows}x{k} rep {rep}: rel err {e:.3e} at token {} row {}", at / rows, at % rows);
+                    assert!(got[t * rows..].iter().all(|v| *v == 0.0), "fp4 {rows}x{k}: wrote past the last token");
+                }
+                // --- F16: the same values rounded to f16 bits, garbage tail again
+                let wh: Vec<u16> = fill_u8(rows * k * 2, 0x99 + si as u32)
+                    .chunks_exact(2)
+                    .map(|b| {
+                        // sign, exponent 10..17 (|w| ~ 1e-3..4), random mantissa
+                        (((b[0] as u16) & 0x80) << 8) | ((10 + (b[0] as u16 & 7)) << 10) | (((b[1] as u16) << 2) & 0x3ff)
+                    })
+                    .collect();
+                let wf16: Vec<f32> = wh.iter().map(|h| crate::gguf::f16_to_f32(*h)).collect();
+                let want = reference(&wf16, &x, rows, k, t);
+                let mut bytes: Vec<u8> = wh.iter().flat_map(|h| h.to_le_bytes()).collect();
+                bytes.extend(fill_u8(1 << 20, 3));
+                let wd = cuda::upload_dev(&bytes);
+                let yd = cuda::alloc_zeroed((t + 1) * rows * 4);
+                for rep in 0..5 {
+                    launch_v(f_f16, rows.div_ceil(64) as u32, t.div_ceil(32) as u32, 1, 256, &[wd, xd, yd, kd, rd, td]);
+                    cuda::sync();
+                    let got = cuda::dtoh(yd, (t + 1) * rows);
+                    let (e, at) = worst(&got[..t * rows], &want);
+                    assert!(e < 1e-3, "f16 {rows}x{k} rep {rep}: rel err {e:.3e} at token {} row {}", at / rows, at % rows);
+                    assert!(got[t * rows..].iter().all(|v| *v == 0.0), "f16 {rows}x{k}: wrote past the last token");
+                }
+                eprintln!("gemm_vit {rows}x{k} t {t}: fp4 and f16 within 1e-3 of the f64 host, 5 reps each");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod image_identity {
+    //! #114: what the prefix cache compares next to the ids of an image
+    use super::*;
+
+    const P: u32 = IMAGE_PAD as u32;
+
+    /// the spans land exactly where `expand_ids` puts the visual tokens
+    #[test]
+    fn the_spans_are_the_rows_expand_ids_fills() {
+        let ids = [1u32, 2, P, 3, P, 4];
+        let counts = [4usize, 2];
+        let spans = image_spans(&ids, &counts, &[[11; 32], [22; 32]]).unwrap();
+        assert_eq!(
+            spans,
+            vec![ImageSpan { start: 2, len: 4, hash: [11; 32] }, ImageSpan { start: 7, len: 2, hash: [22; 32] }]
+        );
+        let expanded = expand_ids(&ids, &counts).unwrap();
+        for sp in &spans {
+            assert!(expanded[sp.start..sp.start + sp.len].iter().all(|&v| v == P));
+            assert_ne!(expanded[sp.start - 1], P);
+        }
+        assert!(image_spans(&ids, &[4], &[[11; 32]]).is_err());
+        assert!(image_spans(&ids, &[4, 2, 1], &[[1; 32], [2; 32], [3; 32]]).is_err());
+        assert!(image_spans(&ids, &[4, 2], &[[1; 32]]).is_err());
+    }
+
+    /// two images that differ in one byte get different keys; the same bytes the same key
+    #[test]
+    fn the_image_key_is_the_content_of_the_bytes() {
+        let red = vec![0x89u8, b'P', b'N', b'G', 255, 0, 0];
+        let mut green = red.clone();
+        green[4] = 0;
+        green[5] = 255;
+        assert_eq!(image_key(&red), image_key(&red.clone()));
+        assert_ne!(image_key(&red), image_key(&green));
+        // one flipped bit anywhere in a large image moves the key
+        let big: Vec<u8> = (0..200_003u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let mut flip = big.clone();
+        flip[123_457] ^= 1;
+        assert_eq!(image_key(&big), image_key(&big.clone()));
+        assert_ne!(image_key(&big), image_key(&flip));
+    }
+
+    fn hex(d: &[u8]) -> String {
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// #114: `image_key` IS SHA-256 - the FIPS 180-4 / NIST CSRC example vectors
+    /// ("abc", the empty string, the 448-bit two-block message, one million 'a'),
+    /// plus the 55/56/64-byte padding edges against values from coreutils `sha256sum`
+    #[test]
+    fn the_image_key_is_sha256() {
+        assert_eq!(hex(&image_key(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(hex(&image_key(b"")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(
+            hex(&image_key(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        assert_eq!(
+            hex(&image_key(&vec![b'a'; 1_000_000])),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+        assert_eq!(hex(&image_key(&[b'a'; 55])), "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318");
+        assert_eq!(hex(&image_key(&[b'a'; 56])), "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a");
+        assert_eq!(hex(&image_key(&[b'a'; 64])), "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb");
     }
 }

@@ -282,8 +282,11 @@ BYTES8="11919360"
 SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
 SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="358"
+TESTS="387"
 CLIPPY="1505"
+#   tests 358 -> 387   v0.5.0 (2026-09-24, `9c9fd51`): #106, #107/#108/#109, #111, #112, #113, #114, #85/#92.
+#                              Measured 2026-09-24 by running the test binaries built at `9c9fd51`: lib 259 / 0 /
+#                              3 ignored, serve 117, decode 5, parity 6 = 387 / 0. Clippy NOT re-counted.
 #   tests 335 -> 358   integration-0923 + 0923 fixes (2026-09-23, release-2026-09-23): #103 cold tier /
 #                              free_for_pin, #102 CROW_KV + unread-CROW_* warning, #100/#101 prefix cache,
 #                              the ue4m3 0x7F encoder test (5c6891a), tests_act_prescale (488a840),
