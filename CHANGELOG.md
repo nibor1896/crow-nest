@@ -6,7 +6,7 @@
 
 ## Unreleased
 
-## v0.5.0 — 2026-09-24
+## 2026-09-24 — v0.5.0: the hot set on real Crow traffic, images through the F16 projector, card-row sampling instead of silent greedy, and the request contract completed
 
 The day after the #91 fix: the engine is tuned to the traffic it actually serves. The hot set is cut on robin's real Crow sessions (held-out hit 0.401 -> 0.723, live 38.0 tok/s at 100k to 150k context, 2026-09-24). Images reach the model the way llama.cpp's operating point sends them: through the F16 projector, at 1,024 to 1,280 visual tokens, without the fc1 row overrun, and a new image of the same size no longer answers with the old image's cached state. A request that omits `temperature` samples at the model card row instead of decoding greedy; `max_completion_tokens`, bodies up to 100 MiB and the DRY / #92 sampler knobs now reach the engine. Every serve-side change was checked live on 2026-09-24; the #91 fix path is untouched by the release (read from the code, see Measured). 13 commits since v0.4.0, `4876b2c`..`9c9fd51`.
 
