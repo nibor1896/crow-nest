@@ -176,7 +176,9 @@ fn main() {
                 // with the graph, so it must be enabled before the warm-up step)
                 // unless CROW_SAMPLE_HOST=1 keeps the host path (logits readback)
                 let mut sampler = crow_nest_engine::sample::Sampler::from_env();
-                let sample_host = crow_nest_engine::sample::host_forced();
+                // #85/#92: a host-only knob (DRY, the #92 tier) takes the host path too
+                let sample_host = crow_nest_engine::sample::host_forced()
+                    || sampler.as_ref().is_some_and(|s| s.host_route());
                 if let Some(s) = &sampler {
                     println!("{}", s.describe());
                     if !sample_host {

@@ -1675,7 +1675,12 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
     // `dry_base < 1.0` is forced to the default (llama-server's own fix), the
     // clamp visible on the tier line like every other effective value
     let dry_multiplier = num_field(obj, "dry_multiplier", DEFAULT_DRY_MULTIPLIER)?;
-    let dry_base = num_field(obj, "dry_base", DEFAULT_DRY_BASE)?.max(DEFAULT_DRY_BASE);
+    // (`if (dry_base < 1.0f) dry_base = defaults.dry_base` in llama-server; a `.max(1.75)`
+    // here until 2026-09-24 raised every base below 1.75, 1.1 included)
+    let dry_base = match num_field(obj, "dry_base", DEFAULT_DRY_BASE)? {
+        b if b < 1.0 => DEFAULT_DRY_BASE,
+        b => b,
+    };
     let dry_allowed_length = int_field(obj, "dry_allowed_length", DEFAULT_DRY_ALLOWED_LENGTH.into())? as i32;
     let dry_last_n = int_field(obj, "dry_last_n", DEFAULT_DRY_LAST_N as i64)? as usize;
     // #92: the optional tier, all OFF at these defaults (absent included)
@@ -2023,6 +2028,9 @@ fn decode_data_url(url: &str) -> Result<(&str, Vec<u8>), String> {
 ///   too, so a greedy request that names them gets a sampler after all - one
 ///   with `temperature <= 0`, whose device draw is `ci[0]`, the penalized
 ///   argmax. A plain greedy request (no penalty fields) is still `None`.
+/// - #85 EXCEPT when DRY is armed: the greedy DRY request gets a sampler (temperature
+///   <= 0, the DRY-penalized argmax) and draws on the HOST, as the device kernel has no
+///   DRY input
 /// - #86 EXCEPT when `logit_bias` is non-empty: a biased request draws on the
 ///   HOST (`chat_generate` reads the row back and runs `apply_logit_bias` first),
 ///   so it needs a Sampler even in greedy - the biased argmax. For that greedy
@@ -2031,7 +2039,11 @@ fn decode_data_url(url: &str) -> Result<(&str, Vec<u8>), String> {
 fn sampler_from(req: &ChatReq) -> Option<Sampler> {
     let penalties_armed =
         req.penalty_last_n > 0 && (req.repeat_penalty != 1.0 || req.frequency_penalty > 0.0);
-    if !(req.temperature > 0.0) && !penalties_armed && req.logit_bias.is_empty() {
+    // #85: DRY is read in greedy and sampled alike (llama.cpp's chain runs it ahead of
+    // the argmax), so a greedy request that arms it gets a sampler - the HOST one,
+    // `host_reasons` routes it there. `Sampler::dry_armed` is the same rule.
+    let dry_armed = req.dry_multiplier != 0.0 && req.dry_base >= 1.0 && req.dry_last_n > 0;
+    if !(req.temperature > 0.0) && !penalties_armed && !dry_armed && req.logit_bias.is_empty() {
         return None;
     }
     let mut s = Sampler::new(req.seed);
@@ -2064,6 +2076,26 @@ fn sampler_from(req: &ChatReq) -> Option<Sampler> {
         s.presence_penalty = 0.0;
     }
     Some(s)
+}
+
+/// - #85/#86/#92/#111: does THIS request draw on the HOST sampler? A `logit_bias`
+///   (#86), a sampled top_k the device kernel cannot hold (#111), or any armed host-only
+///   knob - DRY, top-n-sigma, typical_p, XTC, mirostat v2 (`Sampler::host_route`) - says
+///   yes; the device `sample_k` params block (`gen.rs` `enable_dev_sampler`) has none of
+///   them and would draw as if they were absent
+/// - greedy without a sampler (`None`) is the A4 path and never draws on the host
+fn draws_on_host(req: &ChatReq, sampler: Option<&Sampler>) -> bool {
+    sampler.is_some_and(|s| !req.logit_bias.is_empty() || s.top_k_needs_host() || s.host_route())
+}
+
+/// - #85/#92: the route line of a request that arms a host-only knob: WHICH knobs sent it
+///   to the host and what that costs
+fn host_knobs_line(s: &Sampler) -> String {
+    format!(
+        "[chat] host-only sampler knobs armed (#85/#92): {}; drawing on the HOST sampler \
+         (the device sample_k has no input for them), one logits row read back per token",
+        s.host_knobs().join(", ")
+    )
 }
 
 /// - #86: the request's `logit_bias` on ONE logits row, FIRST, before any sampler
@@ -4084,9 +4116,12 @@ fn chat_generate(
     let biased = !req.logit_bias.is_empty();
     // #111: a sampled top_k the device kernel cannot hold (0 = off, or over
     // SAMPLE_MAXK 64) takes the same host route - the kernel would clamp it
-    // silently. `host` is the one switch every route check below reads.
+    // silently. #85/#92: so does every host-only knob (DRY, top-n-sigma, typical_p,
+    // XTC, mirostat v2) - the device `sample_k` params block has no field for any of
+    // them. `host` is the one switch every route check below reads.
     let top_k_host = sampler.as_ref().is_some_and(|s| s.top_k_needs_host());
-    let host = biased || top_k_host;
+    let knobs_host = sampler.as_ref().is_some_and(|s| s.host_route());
+    let host = draws_on_host(req, sampler.as_ref());
     // #93: the tool grammar of THIS request (`None` without tools, with
     // `CROW_TOOL_GRAMMAR=0` or `tool_choice: "none"`), and its one request line. Built
     // before the first draw: the biased route checks inside `draw_biased`.
@@ -4121,12 +4156,22 @@ fn chat_generate(
                     crow_nest_engine::gen::SAMPLE_MAXK
                 );
             }
+            if knobs_host {
+                tracing::info!(target: "chat", "{}", host_knobs_line(s));
+            }
             let sent = req.sampling_sent;
             if s.temperature > 0.0 {
                 tracing::info!(target: "chat", "{}", sampling_line(s, sent, req.card, true));
-            } else {
+            } else if biased {
                 tracing::info!(target: "chat",
                     "[chat] greedy with logit_bias (#86): the biased argmax, presence_penalty {} ({})",
+                    s.presence_penalty,
+                    SamplingSent::tag(sent.presence_penalty)
+                );
+            } else {
+                tracing::info!(target: "chat",
+                    "[chat] greedy with host-only knobs (#85): the penalized argmax on the HOST, \
+                     presence_penalty {} ({})",
                     s.presence_penalty,
                     SamplingSent::tag(sent.presence_penalty)
                 );
@@ -6597,6 +6642,50 @@ mod tests {
         let s = sampler_from(&r).unwrap();
         assert!(sampling_line(&s, r.sampling_sent, r.card, true).contains("sampling on the HOST"));
         assert!(sampling_line(&s, r.sampling_sent, r.card, true).contains("top_k off (request)"));
+    }
+
+    /// #85/#92: a request that arms a host-only knob draws on the HOST sampler - before
+    /// the fix `host_route` had no caller and the device `sample_k` (no DRY/tier input)
+    /// drew as if the knob were absent; a greedy DRY request got no sampler at all.
+    #[test]
+    fn host_only_knobs_route_the_request_to_the_host_sampler() {
+        let mk = |t: &str| parse_chat(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{t}}}"#).as_bytes()).unwrap();
+        let route = |t: &str| {
+            let r = mk(t);
+            let s = sampler_from(&r);
+            (s.is_some(), draws_on_host(&r, s.as_ref()))
+        };
+        // without: the device route (sampled) and the A4 path (greedy)
+        assert_eq!(route(r#","temperature":1.0"#), (true, false));
+        assert_eq!(route(r#","temperature":1.0,"repeat_penalty":1.1"#), (true, false), "#84 stays on the device");
+        assert_eq!(route(r#","temperature":0"#), (false, false));
+        assert_eq!(route(r#","temperature":1.0,"dry_multiplier":0"#), (true, false), "0 is DRY off");
+        // with: every host-only knob sends the request to the host
+        assert_eq!(route(r#","temperature":1.0,"dry_multiplier":0.8"#), (true, true));
+        assert_eq!(route(r#","temperature":0,"dry_multiplier":0.8"#), (true, true), "greedy DRY is the host argmax");
+        assert_eq!(route(r#","temperature":1.0,"top_n_sigma":1.5"#), (true, true));
+        assert_eq!(route(r#","temperature":1.0,"typical_p":0.9"#), (true, true));
+        assert_eq!(route(r#","temperature":1.0,"xtc_probability":0.5"#), (true, true));
+        assert_eq!(route(r#","temperature":1.0,"mirostat":2"#), (true, true));
+        // a DRY window of 0 disables DRY (llama.cpp), so it stays on the device
+        assert_eq!(route(r#","temperature":1.0,"dry_multiplier":0.8,"dry_last_n":0"#), (true, false));
+        // the greedy DRY sampler keeps the pure argmax apart from DRY: no silent presence
+        let s = sampler_from(&mk(r#","temperature":0,"dry_multiplier":0.8"#)).unwrap();
+        assert_eq!(s.presence_penalty, 0.0);
+        // the route line names the knob that sent it
+        let s = sampler_from(&mk(r#","temperature":1.0,"dry_multiplier":0.8"#)).unwrap();
+        assert!(host_knobs_line(&s).contains("dry_multiplier 0.8"));
+    }
+
+    /// #85: `dry_base < 1.0` is forced back to 1.75 (llama-server), every other base is
+    /// the request's own. Until 2026-09-24 a `.max(1.75)` raised 1.1 to 1.75 as well.
+    #[test]
+    fn dry_base_below_one_is_the_default_and_nothing_else_moves() {
+        let mk = |t: &str| parse_chat(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{t}}}"#).as_bytes()).unwrap();
+        assert_eq!(mk(r#","dry_base":1.1"#).dry_base, 1.1);
+        assert_eq!(mk(r#","dry_base":2.5"#).dry_base, 2.5);
+        assert_eq!(mk(r#","dry_base":0.5"#).dry_base, DEFAULT_DRY_BASE);
+        assert_eq!(mk("").dry_base, DEFAULT_DRY_BASE);
     }
 
     #[test]
