@@ -632,12 +632,12 @@ pub struct Vit {
     /// #VIT cache: image-bytes hash -> (grid, n_visual, tower embeddings on
     /// the host). A conversation that re-sends its whole history (Crow does,
     /// base64 and all) pays for each picture ONCE per process, not per turn.
-    image_cache: std::collections::HashMap<u64, ((usize, usize, usize), usize, Vec<f32>)>,
+    image_cache: std::collections::HashMap<ImageKey, ((usize, usize, usize), usize, Vec<f32>)>,
     /// cache keys, least recently used first: the cache is per PROCESS and a
     /// serve runs for days, so it is bounded by bytes (`CROW_VIT_CACHE_MB`)
     /// and evicted LRU. Unbounded it grew by up to 10 MiB per distinct image,
     /// forever (about 1 GiB per 100 screenshots).
-    image_lru: Vec<u64>,
+    image_lru: Vec<ImageKey>,
     image_cache_bytes: usize,
     x: Dev,        // [cap][1152] residual stream
     normed: Dev,   // [cap][1152] ln output / gemv scratch
@@ -1280,33 +1280,107 @@ pub type Grid = (usize, usize, usize);
 
 /// - #114: one image's place in the EXPANDED prompt and its content identity
 /// - `start..start + len` are the rows its visual tokens occupy (all `IMAGE_PAD` ids)
-/// - `hash` is `image_key` of the image bytes, the key the tower-output cache uses
+/// - `hash` is `image_key` of the image bytes (SHA-256), the key the tower-output cache uses
 /// - the prefix cache compares these next to the ids: `IMAGE_PAD` ids alone say
 ///   nothing about WHICH image sits there (`cache::common_prefix_len_mm`)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageSpan {
     pub start: usize,
     pub len: usize,
-    pub hash: u64,
+    pub hash: ImageKey,
 }
 
-/// - #114: the content identity of one image: a 64-bit hash of its encoded bytes
-/// - the ONE definition, shared by the tower-output cache (`Vit::build_plan`) and the
-///   prefix cache's image spans, so both agree on what "the same image" is
-/// - `DefaultHasher::new()` is SipHash-1-3 with fixed keys: stable within a process,
-///   which is all either cache needs (neither outlives the process)
-pub fn image_key(bytes: &[u8]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
+/// #114: an image's content identity, the SHA-256 digest of its encoded bytes
+pub type ImageKey = [u8; 32];
+
+/// - #114: the content identity of one image: SHA-256 of its encoded bytes
+/// - the ONE definition, shared by the tower-output cache (`Vit::build_plan`, its LRU
+///   included) and the prefix cache's image spans, so both agree on what "the same
+///   image" is
+/// - SHA-256, not a 64-bit hash: a collision is a cache HIT for a different image (the
+///   other image's tower rows or KV prefix answer the request), and a client that can
+///   pick the bytes could aim for one against a 64-bit SipHash with fixed keys.
+///   llama.cpp hashes its mtmd bitmaps with SHA-256 for exactly that reason
+///   (`tools/mtmd/mtmd-helper.cpp` `mtmd_helper_bitmap_init_from_buf`: "use sha256 to
+///   prevent cache poisoning"). Until 2026-09-24 this was `DefaultHasher` (SipHash-1-3).
+/// - in-crate FIPS 180-4 (`sha256` below), no new dependency; pinned to the NIST
+///   example vectors in the tests. Cost is one pass over the encoded bytes per image
+///   per request, next to a decode + preprocess of the same bytes on a miss.
+pub fn image_key(bytes: &[u8]) -> ImageKey {
+    sha256(bytes)
+}
+
+/// FIPS 180-4 SHA-256 (section 6.2), the plain one-shot form
+fn sha256(msg: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+    let mut compress = |block: &[u8]| {
+        let mut w = [0u32; 64];
+        for (t, c) in block.chunks_exact(4).enumerate() {
+            w[t] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        for t in 16..64 {
+            let s0 = w[t - 15].rotate_right(7) ^ w[t - 15].rotate_right(18) ^ (w[t - 15] >> 3);
+            let s1 = w[t - 2].rotate_right(17) ^ w[t - 2].rotate_right(19) ^ (w[t - 2] >> 10);
+            w[t] = w[t - 16].wrapping_add(s0).wrapping_add(w[t - 7]).wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for t in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[t]).wrapping_add(w[t]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *x = x.wrapping_add(y);
+        }
+    };
+    let mut blocks = msg.chunks_exact(64);
+    for b in &mut blocks {
+        compress(b);
+    }
+    // padding (5.1.1): 0x80, zeros, the message length in bits as a big-endian u64
+    let rest = blocks.remainder();
+    let mut tail = [0u8; 128];
+    tail[..rest.len()].copy_from_slice(rest);
+    tail[rest.len()] = 0x80;
+    let n = if rest.len() < 56 { 64 } else { 128 };
+    tail[n - 8..n].copy_from_slice(&((msg.len() as u64).wrapping_mul(8)).to_be_bytes());
+    for b in tail[..n].chunks_exact(64) {
+        compress(b);
+    }
+    let mut out = [0u8; 32];
+    for (o, x) in out.chunks_exact_mut(4).zip(h) {
+        o.copy_from_slice(&x.to_be_bytes());
+    }
+    out
 }
 
 /// - #114: the spans of the images in the EXPANDED prompt, from the RENDERED ids (one
 ///   `IMAGE_PAD` per image), each image's visual token count and its hash
 /// - the same walk `expand_ids` does, so `start` is exactly where the splice puts it
-pub fn image_spans(ids: &[u32], counts: &[usize], hashes: &[u64]) -> Result<Vec<ImageSpan>, String> {
+pub fn image_spans(ids: &[u32], counts: &[usize], hashes: &[ImageKey]) -> Result<Vec<ImageSpan>, String> {
     if counts.len() != hashes.len() {
         return Err(format!("{} image counts but {} image hashes", counts.len(), hashes.len()));
     }
@@ -1474,7 +1548,7 @@ impl Vit {
     /// insert one tower output, then evict least-recently-used entries until the
     /// cache is back under `vit_cache_bytes()`. An entry larger than the whole
     /// ceiling is not cached at all (it would evict everything and then itself).
-    fn cache_insert(&mut self, key: u64, grid: (usize, usize, usize), n_visual: usize, rows: Vec<f32>) {
+    fn cache_insert(&mut self, key: ImageKey, grid: (usize, usize, usize), n_visual: usize, rows: Vec<f32>) {
         let bytes = rows.len() * 4;
         let ceiling = vit_cache_bytes();
         if bytes > ceiling {
@@ -1513,7 +1587,7 @@ impl Vit {
             let _ = std::fs::create_dir_all(dir);
         }
         let mut misses = 0usize;
-        let mut hashes: Vec<u64> = Vec::with_capacity(images.len());
+        let mut hashes: Vec<ImageKey> = Vec::with_capacity(images.len());
         for (i, bytes) in images.iter().enumerate() {
             let key = image_key(bytes);
             hashes.push(key);
@@ -2526,19 +2600,19 @@ mod image_identity {
     fn the_spans_are_the_rows_expand_ids_fills() {
         let ids = [1u32, 2, P, 3, P, 4];
         let counts = [4usize, 2];
-        let spans = image_spans(&ids, &counts, &[11, 22]).unwrap();
+        let spans = image_spans(&ids, &counts, &[[11; 32], [22; 32]]).unwrap();
         assert_eq!(
             spans,
-            vec![ImageSpan { start: 2, len: 4, hash: 11 }, ImageSpan { start: 7, len: 2, hash: 22 }]
+            vec![ImageSpan { start: 2, len: 4, hash: [11; 32] }, ImageSpan { start: 7, len: 2, hash: [22; 32] }]
         );
         let expanded = expand_ids(&ids, &counts).unwrap();
         for sp in &spans {
             assert!(expanded[sp.start..sp.start + sp.len].iter().all(|&v| v == P));
             assert_ne!(expanded[sp.start - 1], P);
         }
-        assert!(image_spans(&ids, &[4], &[11]).is_err());
-        assert!(image_spans(&ids, &[4, 2, 1], &[1, 2, 3]).is_err());
-        assert!(image_spans(&ids, &[4, 2], &[1]).is_err());
+        assert!(image_spans(&ids, &[4], &[[11; 32]]).is_err());
+        assert!(image_spans(&ids, &[4, 2, 1], &[[1; 32], [2; 32], [3; 32]]).is_err());
+        assert!(image_spans(&ids, &[4, 2], &[[1; 32]]).is_err());
     }
 
     /// two images that differ in one byte get different keys; the same bytes the same key
@@ -2550,5 +2624,35 @@ mod image_identity {
         green[5] = 255;
         assert_eq!(image_key(&red), image_key(&red.clone()));
         assert_ne!(image_key(&red), image_key(&green));
+        // one flipped bit anywhere in a large image moves the key
+        let big: Vec<u8> = (0..200_003u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let mut flip = big.clone();
+        flip[123_457] ^= 1;
+        assert_eq!(image_key(&big), image_key(&big.clone()));
+        assert_ne!(image_key(&big), image_key(&flip));
+    }
+
+    fn hex(d: &[u8]) -> String {
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// #114: `image_key` IS SHA-256 - the FIPS 180-4 / NIST CSRC example vectors
+    /// ("abc", the empty string, the 448-bit two-block message, one million 'a'),
+    /// plus the 55/56/64-byte padding edges against values from coreutils `sha256sum`
+    #[test]
+    fn the_image_key_is_sha256() {
+        assert_eq!(hex(&image_key(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(hex(&image_key(b"")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(
+            hex(&image_key(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        assert_eq!(
+            hex(&image_key(&vec![b'a'; 1_000_000])),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+        assert_eq!(hex(&image_key(&[b'a'; 55])), "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318");
+        assert_eq!(hex(&image_key(&[b'a'; 56])), "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a");
+        assert_eq!(hex(&image_key(&[b'a'; 64])), "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb");
     }
 }

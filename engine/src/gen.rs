@@ -4322,6 +4322,14 @@ impl Engine {
              set CROW_SAMPLE_HOST=1 for the host sampler",
             s.top_k
         );
+        // #85/#92: DRY and the #92 tier have no field in the params block below; the
+        // harness routes them to the host (decode.rs / parity.rs), serve too
+        // (`draws_on_host`). Reaching here with one armed would drop it silently.
+        assert!(
+            !s.host_route(),
+            "host-only sampler knobs armed ({}): the device sampler has no input for them",
+            s.host_knobs().join(", ")
+        );
         if self.dev_sampler.is_none() {
             // #72: the buffers come from the boot hold; the fallback allocates, for
             // a bin that built its Engine before the hold existed. Either way they

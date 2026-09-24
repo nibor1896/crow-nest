@@ -413,7 +413,9 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
         // #20: CROW_SAMPLE=1 -> sampling with the data-sheet profile: on the device
         // (sample_k behind argmax_k) unless CROW_SAMPLE_HOST=1 keeps the host path
         let mut sampler = crow_nest_engine::sample::Sampler::from_env();
-        let sample_host = crow_nest_engine::sample::host_forced();
+        // #85/#92: a host-only knob (DRY, the #92 tier) takes the host path too
+        let sample_host = crow_nest_engine::sample::host_forced()
+            || sampler.as_ref().is_some_and(|s| s.host_route());
         if let Some(s) = &mut sampler {
             eprintln!("[{}]", s.describe());
             if sample_host {

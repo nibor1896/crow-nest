@@ -310,7 +310,7 @@ impl Sampler {
             self.top_n_sigma, self.typical_p, self.xtc_probability, self.xtc_threshold,
             self.mirostat, self.mirostat_tau, self.mirostat_eta,
             self.seed,
-            if host_forced() { "host" } else { "gpu" })
+            if host_forced() || self.host_route() { "host" } else { "gpu" })
     }
 
     /// #83: ln(min_p) as ONE host-computed f32. The device sampler receives
@@ -348,6 +348,31 @@ impl Sampler {
             || self.typical_p < 1.0
             || (self.xtc_probability > 0.0 && self.xtc_threshold <= 0.5)
             || self.mirostat == 2
+    }
+
+    /// #85/#92: the armed host-only knobs by name and value, for the route line
+    /// serve logs - empty exactly when `host_route()` is false.
+    pub fn host_knobs(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if self.dry_armed() {
+            v.push(format!(
+                "dry_multiplier {} (base {}, allowed {}, last_n {})",
+                self.dry_multiplier, self.dry_base, self.dry_allowed_length, self.dry_last_n
+            ));
+        }
+        if self.top_n_sigma > 0.0 {
+            v.push(format!("top_n_sigma {}", self.top_n_sigma));
+        }
+        if self.typical_p < 1.0 {
+            v.push(format!("typical_p {}", self.typical_p));
+        }
+        if self.xtc_probability > 0.0 && self.xtc_threshold <= 0.5 {
+            v.push(format!("xtc_probability {} (threshold {})", self.xtc_probability, self.xtc_threshold));
+        }
+        if self.mirostat == 2 {
+            v.push(format!("mirostat 2 (tau {}, eta {})", self.mirostat_tau, self.mirostat_eta));
+        }
+        v
     }
 
     /// #111: can the device `sample_k` draw THIS top_k? It keeps 1..=`SAMPLE_MAXK`
@@ -2154,6 +2179,9 @@ mod tests {
         s.xtc_probability = 0.0;
         s.mirostat = 2;
         assert!(s.host_route());
+        assert_eq!(s.host_knobs().len(), 1, "the route line names exactly the armed knob");
+        s.mirostat = 0;
+        assert!(!s.host_route() && s.host_knobs().is_empty());
     }
 
     /// #93: `rebook_plan` against a host model of the device accept,
