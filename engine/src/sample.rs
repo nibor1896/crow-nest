@@ -350,6 +350,17 @@ impl Sampler {
             || self.mirostat == 2
     }
 
+    /// #111: can the device `sample_k` draw THIS top_k? It keeps 1..=`SAMPLE_MAXK`
+    /// (64) candidates in shared memory; `0` (top-k off) or more than 64 would be
+    /// silently clamped there (`kernels.rs` `sample_topk_part` / `sample_k`). A
+    /// sampled request that answers true draws on the HOST sampler instead (serve)
+    /// or is refused by `enable_dev_sampler` (the harness door, CROW_SAMPLE_HOST=1).
+    /// Greedy (`temperature <= 0`) answers false: its device draw is `ci[0]`, the
+    /// (penalized) argmax, whatever k is.
+    pub fn top_k_needs_host(&self) -> bool {
+        self.temperature > 0.0 && !(1..=crate::gen::SAMPLE_MAXK).contains(&self.top_k)
+    }
+
     /// #92: mirostat v2's mu back to `2*tau`, the per-request reset llama.cpp
     /// performs (`llama_sampler_mirostat_v2_reset`). serve calls it after
     /// overwriting tau; `Sampler::new` starts there.
@@ -655,8 +666,11 @@ impl Sampler {
         } else {
             None
         };
-        // top_k on the penalized scores: keep the k largest candidates
-        let k = self.top_k.max(1).min(logits.len());
+        // top_k on the penalized scores: keep the k largest candidates.
+        // #111: `0` is top-k OFF (llama.cpp `llama_sampler_top_k_impl`: `k <= 0`
+        // returns untouched) - the whole row goes on. Until #111 it was clamped
+        // to 1 here, which made `top_k 0` a silent greedy.
+        let k = if self.top_k == 0 { logits.len() } else { self.top_k.min(logits.len()) };
         let mut cand: Vec<(usize, f32)> = Vec::with_capacity(k + 1);
         for (i, &l) in logits.iter().enumerate() {
             let mut v = pen(self, i, l);
@@ -1041,6 +1055,28 @@ mod tests {
     fn greedy_when_cold() {
         let mut s = Sampler { temperature: 0.0, top_p: 1.0, top_k: 5, presence_penalty: 0.0, rng: Rng::new(1), ..Sampler::new(0) };
         assert_eq!(s.sample(&[0.1, 3.0, 2.0]), 1);
+    }
+    /// #111: `top_k 0` is top-k OFF (llama.cpp `k <= 0` returns untouched), not
+    /// a clamp to 1. On a flat row every one of the 8 ids is reachable; before
+    /// #111 `max(1)` kept only the argmax and 400 draws returned id 0 400 times.
+    #[test]
+    fn top_k_zero_is_off_not_greedy() {
+        let row = [1.0f32, 0.99, 0.98, 0.97, 0.96, 0.95, 0.94, 0.93];
+        let mut s = Sampler { temperature: 1.0, top_p: 1.0, top_k: 0, presence_penalty: 0.0, ..Sampler::new(11) };
+        let mut hit = [false; 8];
+        for _ in 0..400 {
+            hit[s.sample(&row)] = true;
+        }
+        assert!(hit.iter().all(|&h| h), "top_k 0 must keep the whole row: {hit:?}");
+        // the routing truth: the device holds 1..=64 candidates, a sampled 0 or 65 cannot run there
+        assert!(s.top_k_needs_host());
+        s.top_k = 65;
+        assert!(s.top_k_needs_host());
+        s.top_k = 64;
+        assert!(!s.top_k_needs_host());
+        s.top_k = 0;
+        s.temperature = 0.0;
+        assert!(!s.top_k_needs_host(), "greedy draws the argmax on the device whatever k is");
     }
     #[test]
     fn nucleus_never_picks_outside_top_k() {

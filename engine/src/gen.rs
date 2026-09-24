@@ -4295,6 +4295,16 @@ impl Engine {
     /// before the first decode_step of the process so the node is captured with
     /// the graph; enabled later it runs as an eager launch behind each replay.
     pub unsafe fn enable_dev_sampler(&mut self, s: &crate::sample::Sampler) {
+        // #111: the kernel keeps 1..=SAMPLE_MAXK candidates and would CLAMP any other
+        // top_k (0 = off -> 1 = greedy; 100 -> 64) without a word. serve routes such a
+        // request to the host sampler first; a harness run that reaches here is stopped
+        // loudly instead of drawing from a different distribution than it asked for.
+        assert!(
+            !s.top_k_needs_host(),
+            "top_k {} cannot run on the device sampler (1..={SAMPLE_MAXK}; 0 = off): \
+             set CROW_SAMPLE_HOST=1 for the host sampler",
+            s.top_k
+        );
         if self.dev_sampler.is_none() {
             // #72: the buffers come from the boot hold; the fallback allocates, for
             // a bin that built its Engine before the hold existed. Either way they

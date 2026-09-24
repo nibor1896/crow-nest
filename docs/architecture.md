@@ -2333,7 +2333,9 @@ Therefore:
   process, **124.60 MiB** at chunk 2048, the after-answer point dropped. See 7.6 and 7.7.
 - Row 5 confirmed by C2 (robin 2026-09-11, #55): the default stays request driven, greedy
   without `temperature`, sampled above 0; the ten-task gate under sampling is met in 1 of 6
-  seeds (#44), under greedy in 0 of 1 (#11). See 7.12.
+  seeds (#44), under greedy in 0 of 1 (#11). See 7.12. **Superseded for an absent `temperature` by
+  #111 (robin 2026-09-24):** it samples at the model card row of its thinking mode; greedy is a
+  SENT `temperature <= 0` only (the A9 identity gate sends it).
 
 **Note carried from the proposal, still open as a measurement, not a doc edit:**
 
@@ -2380,12 +2382,12 @@ Therefore:
 | `stream_options.include_usage` | `true` puts `usage` on the final chunk | `serve.rs:970`, `serve.rs:1340` | `crow_core.py:4672-4700` |
 | `timings_per_token` | `true` puts `timings` on the final chunk | `serve.rs:970`, `serve.rs:1340` | `crow_core.py:4672-4700` |
 | `max_tokens` | default 8192 (1024 until 2026-09-18), capped at 32768, clamped to `n_ctx - prompt ids` | `serve.rs:1363` (`clamped_max_tokens`) | `crow_core.py:4672-4700` |
-| `temperature` | absent, `null` or `<= 0` is GREEDY; `> 0` samples | `serve.rs:1158` (`sampler_from`) | `crow_core.py:4672-4700` |
-| `top_p` | nucleus mass, default 0.8 (data sheet), read only when `temperature > 0` | `serve.rs:509`, `serve.rs:1158` | `crow_core.py:4672-4700` |
-| `top_k` | default 20 (data sheet), clamped to 64 by the device sampler (`SAMPLE_MAXK`, `engine/src/kernels.rs:3994`), read only when `temperature > 0` | `serve.rs:511`, `serve.rs:1158` | not sent by Crow |
-| `presence_penalty` | default **0** since `56e0297` (2026-09-22; the data sheet's 1.5 applies only when the client sends it, `DEFAULT_PRESENCE`), read only when `temperature > 0`. Until then the default was 1.5 and applied to every sampled Crow request | `serve.rs` (`DEFAULT_PRESENCE`, `parse_chat`), `sampler_from` | **never sent by Crow** — the string does not occur in `crow_core.py` (measured 2026-09-18, #68, 7.11.17) |
+| `temperature` | **#111 (2026-09-24): absent or `null` = the model card row of the request's thinking mode** - thinking 1.0, non-thinking 0.7 (`CARD_THINKING` / `CARD_INSTRUCT`, huggingface.co/Qwen/Qwen3.8-Flash-Next "Best Practices"), so an absent field SAMPLES; `<= 0` SENT is GREEDY (the gates and probes); `> 0` samples. Until #111 absent was greedy. A `[chat] absent sampling fields filled from the model card, <row>` line names every field the card supplied | `parse_chat`, `card_row`, `card_fill_line`, `sampler_from` | `crow_core.py:6634` (always sent) |
+| `top_p` | nucleus mass; absent = card row (thinking 0.95, non-thinking 0.8, #111), read only when `temperature > 0` | `parse_chat`, `CARD_*` | `crow_core.py:6639` |
+| `top_k` | absent = card row (20 in both rows, #111); `0` or `-1` = top-k OFF (llama.cpp `llama-sampler.cpp:326`, vLLM), other negatives a 400; the device sampler holds 1..=64 (`SAMPLE_MAXK`), so a sampled `0` or `> 64` draws on the HOST sampler (one logits row read back per token) instead of being clamped - until #111 `0` was clamped to 1 (greedy) and `> 64` to 64 on the device only; read only when `temperature > 0` | `parse_chat`, `Sampler::top_k_needs_host`, `chat_generate` (`host`) | sent when the Crow manifest names it |
+| `presence_penalty` | default **0** since `56e0297` (2026-09-22; the data sheet's 1.5 applies only when the client sends it, `DEFAULT_PRESENCE`), read only when `temperature > 0`. #111 does NOT take it from the card row (non-thinking says 1.5): open for robin. Until then the default was 1.5 and applied to every sampled Crow request | `serve.rs` (`DEFAULT_PRESENCE`, `parse_chat`), `sampler_from` | **never sent by Crow** — the string does not occur in `crow_core.py` (measured 2026-09-18, #68, 7.11.17) |
 | `seed` | RNG seed of THIS request, default 0, reseeded per request (M1) | `serve.rs:515`, `serve.rs:1158` | not sent by Crow |
-| `min_p` | **read since #83**: the log-space tail filter (llama.cpp PR #3841) after top-k and before the temperature softmax, on the device and the host sampler alike; absent, `null` or `<= 0` disables; read only when `temperature > 0`. Before #83 accepted and ignored | `parse_chat`, `sampler_from` | `crow_core.py:4672-4700` (0.01 at Crow's operating point) |
+| `min_p` | **read since #83**: the log-space tail filter (llama.cpp PR #3841) after top-k and before the temperature softmax, on the device and the host sampler alike; absent or `null` = card row (0.0 in both rows = off, #111), `<= 0` disables; read only when `temperature > 0`. Before #83 accepted and ignored | `parse_chat`, `sampler_from` | `crow_core.py:4672-4700` (0.01 at Crow's operating point) |
 | `repeat_penalty`, `frequency_penalty`, `penalty_last_n` | #84: llama.cpp windowed penalties over prompt tail + generated ids, read in greedy AND sampled requests; neutral when absent (1.0 / 0 / window 64, clamped to 1024) | `parse_chat`, `serve.rs` module doc | not sent by Crow |
 | `dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_last_n` | #85: DRY (llama.cpp PR #9702); off when the multiplier is absent or 0; a DRY request samples on the HOST | as above | not sent by Crow |
 | `top_n_sigma`, `typical_p`, `xtc_probability`, `xtc_threshold`, `mirostat`, `mirostat_tau`, `mirostat_eta` | #92: the optional sampler tier, all neutral when absent; any of them armed routes the request to the HOST sampler; `mirostat: 1` is a 400 | as above | not sent by Crow |
@@ -3368,8 +3370,8 @@ markup after the fact (`toolcall.rs`) and could only report what went wrong (#99
 | greedy result | gate met in 0 of 1 arms, 2 Pass / 5 Partial / 3 Fail of 10 (#11, Crow #192) |
 | reference llama.cpp | 2 Pass / 6 Partial / 2 Fail of 10 on UD-Q2_K_XL greedy, gate met (#11, Crow #192) |
 | decision | the default stays as built (#28 A6), the request decides: `sampler_from` at `engine/src/bin/serve.rs:1158` |
-| request without `temperature` | greedy, the A4 path; `null` or `<= 0` is the same path (`engine/src/bin/serve.rs:1158`, `sampler_from`) |
-| request with `temperature > 0` | samples; absent fields take the data sheet `top_p` 0.8, `top_k` 20, `presence_penalty` 1.5, `seed` 0 reseeded per request (`engine/src/bin/serve.rs:509-515`) |
+| request without `temperature` | **superseded by #111 (robin 2026-09-24): samples at the model card row of its thinking mode** (1.0 / 0.95 / 20 thinking, 0.7 / 0.8 / 20 non-thinking); until then greedy. Greedy is `temperature <= 0` SENT (`sampler_from`) |
+| request with `temperature > 0` | samples; absent fields take the card row of the thinking mode (#111; until then `top_p` 0.8, `top_k` 20 in both modes), `presence_penalty` 0 (#91), `seed` 0 reseeded per request |
 | what a Crow turn gets | sampled at `temperature` 1.0, `top_p` 0.95, `min_p` 0.01 accepted and ignored (`Crow cli/crow_core.py:472`, #28); `top_k` 20, `presence_penalty` 1.5 and `seed` 0 come from THIS file's defaults, not from Crow (measured 2026-09-18, #68, 7.11.17) |
 | unmeasured | the ten-task gate at Crow's own profile (temperature 1.0, top_p 0.95); the six series ran temp 0.7, top_p 0.8, top_k 20, presence 1.5 (`engine/src/sample.rs:76-81`) |
 | t2b-write-refactor | Fail under greedy after 21 ids (#11), Partial on 6 of 6 sampled seeds (`decode_out/srv-c2-reader.log:214`, #44) |

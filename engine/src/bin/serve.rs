@@ -143,12 +143,12 @@
 //! | `model` | echoed into every chunk, default `crow-nest` |
 //! | `chat_template_kwargs.enable_thinking` | template variable, default false |
 //! | `reasoning_effort` | #74: top level OR `chat_template_kwargs`; `none` and an absent field are the render of record, `low` / `medium` pass through, `high` and `xhigh` both render `xhigh`, anything else is a 400 |
-//! | `temperature` | absent, `null` or `<= 0` is GREEDY (the A4 path); `> 0` samples (#28 A6) |
-//! | `top_p` | nucleus mass, default 0.8 (data sheet); read only when `temperature > 0` |
-//! | `top_k` | candidates kept, default 20 (data sheet); read only when `temperature > 0` |
+//! | `temperature` | #111: absent or `null` = the MODEL CARD row of the request's thinking mode (thinking 1.0, non-thinking 0.7), so an absent field SAMPLES; `<= 0` sent explicitly is GREEDY (the A4 path, gates and probes); `> 0` samples (#28 A6) |
+//! | `top_p` | nucleus mass; absent = card row (thinking 0.95, non-thinking 0.8, #111); read only when `temperature > 0` |
+//! | `top_k` | candidates kept; absent = card row (20 both rows, #111); `0` or `-1` = top-k OFF (llama.cpp/vLLM); other negatives a 400; `0` or `> 64` routes to the HOST sampler (the device kernel holds 64); read only when `temperature > 0` |
 //! | `presence_penalty` | default 0 (#91; the data sheet says 1.5, see `DEFAULT_PRESENCE`); read only when `temperature > 0` |
 //! | `seed` | RNG seed of THIS request, default 0; a warm process draws what a cold one draws |
-//! | `min_p` | #83: the log-space tail filter, HONORED on device and host; absent, `null` or `<= 0` disables, `(0,1]` filters; read only when `temperature > 0` |
+//! | `min_p` | #83: the log-space tail filter, HONORED on device and host; absent/`null` = card row (0.0 both rows, #111), `<= 0` disables, `(0,1]` filters; read only when `temperature > 0` |
 //! | `repeat_penalty` | #84: llama.cpp asymmetric repeat over the penalty window; absent/`null` = 1.0 NEUTRAL; read in greedy and sampled alike |
 //! | `frequency_penalty` | #84: `l -= count * freq` over the window; absent/`null` = 0 NEUTRAL |
 //! | `penalty_last_n` | #84: window depth in ids, PROMPT TAIL + generated, default 64, clamped to 1024 (the device ring); `0` disables the windowed pass |
@@ -278,8 +278,8 @@
 //!
 //! | `temperature` | first id | rest of the ids | device sampler |
 //! |---|---|---|---|
-//! | absent, `null`, `<= 0` | `Engine::prefill` (argmax) | `Engine::decode_step` (argmax) | TAKEN OUT of the engine |
-//! | `> 0` | `Engine::sample_last` | `decode_step` behind the `sample_k` node | ARMED before the first step |
+//! | `<= 0` sent | `Engine::prefill` (argmax) | `Engine::decode_step` (argmax) | TAKEN OUT of the engine |
+//! | `> 0`, absent or `null` (#111: the card row's temperature) | `Engine::sample_last` | `decode_step` behind the `sample_k` node | ARMED before the first step |
 //!
 //! - Greedy is the A4 path unchanged: same calls, same order, no sampler node in the graph -
 //!   EXCEPT a greedy request that arms the #84 window (repeat != 1.0 or freq > 0 with a
@@ -290,7 +290,10 @@
 //! - `CROW_SAMPLE`, `CROW_TEMP`, `CROW_TOP_P`, `CROW_TOP_K`, `CROW_PRESENCE`, `CROW_SEED`
 //!   keep working for `decode` and `parity`; `serve` reads none of them.
 //! - `Sampler::new(seed)` carries the data-sheet defaults, the request overwrites what it sends.
-//! - Absent fields when `temperature > 0`: top_p 0.8, top_k 20, presence_penalty 0 (#91), seed 0 -
+//! - #111: absent `temperature`, `top_p`, `top_k`, `min_p` come from the model card row of the
+//!   request's thinking mode (`CARD_THINKING` 1.0 / 0.95 / 20 / 0, `CARD_INSTRUCT`
+//!   0.7 / 0.8 / 20 / 0), logged per field on a `[chat] absent sampling fields` line.
+//! - Other absent fields: presence_penalty 0 (#91, NOT the card's 1.5), seed 0 -
 //!   and, since #84, repeat_penalty 1.0 / frequency_penalty 0.0 / penalty_last_n 64, all
 //!   NEUTRAL: no existing row changes implicitly until a row names them.
 //!
@@ -620,10 +623,42 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_TOKENS: usize = 8192;
 /// ceiling for `max_tokens`, so one request cannot hold the process forever
 const MAX_MAX_TOKENS: usize = 32768;
-/// #28: `top_p` when a sampled request carries none (data sheet, `generation_config.json`)
-const DEFAULT_TOP_P: f32 = 0.8;
-/// #28: `top_k` when a sampled request carries none (data sheet)
-const DEFAULT_TOP_K: usize = 20;
+/// #111: one row of the model card's sampling table - what `serve` fills in for a
+/// sampling field the request left out (absent or `null`), per thinking mode, the way
+/// vLLM fills absent fields from `generation_config.json` (`--generation-config auto`).
+///
+/// - Source: huggingface.co/Qwen/Qwen3.8-Flash-Next, "Best Practices" (read 2026-09-24),
+///   and `models/Qwen3.8-Flash-Next-original/generation_config.json` (`do_sample: true`,
+///   1.0 / 0.95 / 20 - the thinking row). The card lists NO greedy row: this model is
+///   never decoded greedy in production (robin 2026-09-24; the 10e greedy arm's
+///   t5-agent repetition loop, `docs/architecture.md` 5.4). Greedy is `temperature <= 0`
+///   SENT by the client - the gates and probes - never a default.
+/// - `presence_penalty` is NOT in the row on purpose: the card's non-thinking row says
+///   1.5, crow-nest applies it HF-style over the whole answer, and #91 (`56e0297`) set
+///   the default to 0 for exactly that (`DEFAULT_PRESENCE`). `generation_config.json`
+///   carries no presence field, so vLLM would not fill one either. Open for robin (#111).
+/// - `repetition_penalty` 1.0 in both rows is `DEFAULT_REPEAT`, neutral already.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CardRow {
+    /// the row's name on the `[chat]` provenance line
+    name: &'static str,
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+    min_p: f32,
+}
+
+/// #111: the card's thinking row (`enable_thinking` true)
+const CARD_THINKING: CardRow =
+    CardRow { name: "model card, thinking row", temperature: 1.0, top_p: 0.95, top_k: 20, min_p: 0.0 };
+/// #111: the card's non-thinking (instruct) row (`enable_thinking` false)
+const CARD_INSTRUCT: CardRow =
+    CardRow { name: "model card, non-thinking row", temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0 };
+
+/// #111: the card row a request with this thinking switch gets for its absent fields
+fn card_row(enable_thinking: bool) -> &'static CardRow {
+    if enable_thinking { &CARD_THINKING } else { &CARD_INSTRUCT }
+}
 /// #28: `presence_penalty` when a sampled request carries none. Was the data
 /// sheet's 1.5 until #91 (2026-09-22): applied HF-style to every token of the
 /// answer (no window, `sample.rs` `seen`), it pushes an agent answer full of
@@ -686,6 +721,8 @@ const PROBE_EVERY: usize = 1;
 /// that way costs four words; a wrong attribution cost an issue.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SamplingSent {
+    /// #111: `temperature` - absent now means the card row, no longer greedy
+    temperature: bool,
     top_p: bool,
     top_k: bool,
     presence_penalty: bool,
@@ -1168,12 +1205,16 @@ struct ChatReq {
     include_usage: bool,
     /// `timings_per_token`: `timings` on the final chunk (#27 A5)
     timings_per_token: bool,
-    /// #28: `<= 0` (absent included) is greedy, `> 0` samples
+    /// #28: `<= 0` SENT is greedy, `> 0` samples; #111: absent (or `null`) is the
+    /// card row's temperature (`card`), so an absent field samples
     temperature: f32,
-    /// #28: nucleus mass, `DEFAULT_TOP_P` when absent
+    /// #28: nucleus mass; #111: the card row's when absent
     top_p: f32,
-    /// #28: candidates kept, `DEFAULT_TOP_K` when absent
+    /// #28: candidates kept; #111: the card row's when absent, and `0` = top-k OFF
+    /// (the body's `0` or `-1`, llama.cpp `k <= 0` / vLLM semantics)
     top_k: usize,
+    /// #111: the card row the absent sampling fields were filled from (by thinking mode)
+    card: &'static CardRow,
     /// #28: presence penalty, `DEFAULT_PRESENCE` when absent
     presence_penalty: f32,
     /// #28: RNG seed of this request, `DEFAULT_SEED` when absent
@@ -1271,21 +1312,67 @@ enum ToolChoice {
 ///   honored, not just present.
 /// - #84: the three windowed-penalty fields, so a row can name its brake.
 /// - pure: the test drives it on a built Sampler, no engine and no socket.
-fn sampling_line(s: &Sampler, sent: SamplingSent) -> String {
+fn sampling_line(s: &Sampler, sent: SamplingSent, card: &CardRow, host: bool) -> String {
     format!(
-        "[chat] sampling on the device: temperature {} (request) top_p {} ({}) top_k {} ({}) \
+        "[chat] sampling on the {}: temperature {} ({}) top_p {} ({}) top_k {} ({}) \
          min_p {} ({}) presence_penalty {} ({}) repeat_penalty {} ({}) frequency_penalty {} ({}) \
          penalty_last_n {} ({}) seed {} ({})",
-        s.temperature,
-        s.top_p, SamplingSent::tag(sent.top_p),
-        s.top_k, SamplingSent::tag(sent.top_k),
-        s.min_p, SamplingSent::tag(sent.min_p),
+        if host { "HOST" } else { "device" },
+        s.temperature, card_tag(sent.temperature, card),
+        s.top_p, card_tag(sent.top_p, card),
+        top_k_word(s.top_k), card_tag(sent.top_k, card),
+        s.min_p, card_tag(sent.min_p, card),
         s.presence_penalty, SamplingSent::tag(sent.presence_penalty),
         s.repeat_penalty, SamplingSent::tag(sent.repeat_penalty),
         s.frequency_penalty, SamplingSent::tag(sent.frequency_penalty),
         s.penalty_last_n, SamplingSent::tag(sent.penalty_last_n),
         s.seed, SamplingSent::tag(sent.seed)
     )
+}
+
+/// #111: the provenance tag of a field the card row fills: `request`, or the row's name
+fn card_tag(sent: bool, card: &CardRow) -> &'static str {
+    if sent { "request" } else { card.name }
+}
+
+/// #111: `top_k` as the `[chat]` line prints it - `0` is top-k OFF, not a count
+fn top_k_word(k: usize) -> String {
+    if k == 0 { "off".to_string() } else { k.to_string() }
+}
+
+/// - #111: the line that says which sampling fields the MODEL CARD supplied, and from which
+///   row, for a sampled request that left any of them out. `None` when the body named all
+///   four or sent `temperature <= 0` (greedy reads none of them).
+/// - presence_penalty is named because it is the one card value NOT adopted (#91).
+/// - pure: the test drives it on parsed bodies.
+fn card_fill_line(req: &ChatReq) -> Option<String> {
+    if !(req.temperature > 0.0) {
+        return None;
+    }
+    let sent = req.sampling_sent;
+    let mut filled = Vec::new();
+    if !sent.temperature {
+        filled.push(format!("temperature {}", req.temperature));
+    }
+    if !sent.top_p {
+        filled.push(format!("top_p {}", req.top_p));
+    }
+    if !sent.top_k {
+        filled.push(format!("top_k {}", top_k_word(req.top_k)));
+    }
+    if !sent.min_p {
+        filled.push(format!("min_p {}", req.min_p));
+    }
+    if filled.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "[chat] absent sampling fields filled from the {} (#111): {}; presence_penalty is not \
+         taken from the card (serve default {}, #91)",
+        req.card.name,
+        filled.join(" "),
+        DEFAULT_PRESENCE
+    ))
 }
 
 /// - a number field of the sampling profile: absent or `null` gives `d`, a non number is a 400
@@ -1535,12 +1622,15 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         .get("timings_per_token")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    // #28 A6: the sampling profile. Absent stays the data sheet, a wrong type is a 400 (the
-    // caller asked for a draw and must know it did not get the one it named).
-    let temperature = num_field(obj, "temperature", 0.0)?;
-    let top_p = num_field(obj, "top_p", DEFAULT_TOP_P)?;
+    // #28 A6: the sampling profile. A wrong type is a 400 (the caller asked for a draw and
+    // must know it did not get the one it named). #111: an ABSENT field is the model card's
+    // row for THIS request's thinking mode - never greedy. Greedy is `temperature <= 0`
+    // sent explicitly (the gates and probes), exactly as before.
+    let card = card_row(enable_thinking);
+    let temperature = num_field(obj, "temperature", card.temperature)?;
+    let top_p = num_field(obj, "top_p", card.top_p)?;
     let presence_penalty = num_field(obj, "presence_penalty", DEFAULT_PRESENCE)?;
-    let min_p = num_field(obj, "min_p", 0.0)?;
+    let min_p = num_field(obj, "min_p", card.min_p)?;
     // #84: the windowed llama.cpp penalties; absent stays neutral, so no
     // existing row changes implicitly. Greedy reads them too - llama.cpp runs
     // its penalties sampler in greedy and sampled alike.
@@ -1643,11 +1733,16 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
             out
         }
     };
+    // #111: `0` and `-1` are top-k OFF (llama.cpp `llama_sampler_top_k_impl`: `k <= 0`
+    // returns untouched; vLLM: "0 (or -1) to consider all tokens") - until #111 `0` was
+    // clamped to 1 by both samplers, a silent greedy. Other negatives stay a 400.
     let top_k = match obj.get("top_k") {
-        None | Some(serde_json::Value::Null) => DEFAULT_TOP_K,
-        Some(v) => v
-            .as_u64()
-            .ok_or_else(|| "top_k is not a non negative integer".to_string())? as usize,
+        None | Some(serde_json::Value::Null) => card.top_k,
+        Some(v) => match v.as_i64() {
+            Some(0) | Some(-1) => 0,
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("top_k is not a positive integer, 0 or -1 (both: top-k off)".to_string()),
+        },
     };
     // llama-server takes -1 as "pick a seed"; M1 wants determinism, so a negative seed is
     // used as its unsigned bit pattern and nothing here ever draws a seed of its own
@@ -1662,6 +1757,7 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
     // condition every reader above treats as "absent", so the tag cannot disagree with the value
     let sent = |k: &str| !matches!(obj.get(k), None | Some(serde_json::Value::Null));
     let sampling_sent = SamplingSent {
+        temperature: sent("temperature"),
         top_p: sent("top_p"),
         top_k: sent("top_k"),
         presence_penalty: sent("presence_penalty"),
@@ -1821,6 +1917,7 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
         temperature,
         top_p,
         top_k,
+        card,
         presence_penalty,
         seed,
         sampling_sent,
@@ -1893,7 +1990,8 @@ fn decode_data_url(url: &str) -> Result<(&str, Vec<u8>), String> {
 
 /// - the `Sampler` this request asks for, or `None` for the greedy A4 path
 /// - `None` is the whole greedy contract: no sampler is built, none is armed
-/// - every field the request left out comes from `Sampler::new` (data sheet)
+/// - every field the request left out was filled at parse: the card row (#111) or the
+///   serve defaults above
 /// - #84 EXCEPT when the windowed penalties are armed (repeat != 1.0 or
 ///   freq > 0 with a window): llama.cpp runs its penalties sampler in greedy
 ///   too, so a greedy request that names them gets a sampler after all - one
@@ -3930,6 +4028,11 @@ fn chat_generate(
     // per-request mask/count buffers is the documented FOLLOW-UP of this issue, not
     // built here. The host route is the reference path `CROW_SAMPLE_HOST=1` ran.
     let biased = !req.logit_bias.is_empty();
+    // #111: a sampled top_k the device kernel cannot hold (0 = off, or over
+    // SAMPLE_MAXK 64) takes the same host route - the kernel would clamp it
+    // silently. `host` is the one switch every route check below reads.
+    let top_k_host = sampler.as_ref().is_some_and(|s| s.top_k_needs_host());
+    let host = biased || top_k_host;
     // #93: the tool grammar of THIS request (`None` without tools, with
     // `CROW_TOOL_GRAMMAR=0` or `tool_choice: "none"`), and its one request line. Built
     // before the first draw: the biased route checks inside `draw_biased`.
@@ -3938,22 +4041,35 @@ fn chat_generate(
         tracing::info!(target: "chat", "{l}");
     }
     let mut redraw_ms = 0.0f64;
-    match (&mut sampler, biased) {
+    if let Some(l) = card_fill_line(req) {
+        tracing::info!(target: "chat", "{l}");
+    }
+    match (&mut sampler, host) {
         (Some(s), true) => {
             // the device sampler must be OUT: `decode_step` samples whenever it is
             // Some (gen.rs:2905-2909), and this request's draw happens on the host
             srv.eng.park_sampler(&mut srv.parked_sampler);
             // unsafe: one logits row read back (1 MB, ~0.3 ms), the price of the route
             next = unsafe { draw_biased(srv.eng, s, &req.logit_bias, gate.as_mut()) };
-            tracing::info!(target: "chat",
-                "[chat] logit_bias: {} entries (request), drawing on the HOST sampler \
-                 (#86): the row is read back, biased first, then the chain; the device \
-                 mask-path twin is the follow-up",
-                req.logit_bias.len()
-            );
+            if biased {
+                tracing::info!(target: "chat",
+                    "[chat] logit_bias: {} entries (request), drawing on the HOST sampler \
+                     (#86): the row is read back, biased first, then the chain; the device \
+                     mask-path twin is the follow-up",
+                    req.logit_bias.len()
+                );
+            }
+            if top_k_host {
+                tracing::info!(target: "chat",
+                    "[chat] top_k {} is outside the device sampler's 1..={} (#111): drawing on \
+                     the HOST sampler, one logits row read back per token",
+                    top_k_word(s.top_k),
+                    crow_nest_engine::gen::SAMPLE_MAXK
+                );
+            }
             let sent = req.sampling_sent;
             if s.temperature > 0.0 {
-                tracing::info!(target: "chat", "{}", sampling_line(s, sent));
+                tracing::info!(target: "chat", "{}", sampling_line(s, sent, req.card, true));
             } else {
                 tracing::info!(target: "chat",
                     "[chat] greedy with logit_bias (#86): the biased argmax, presence_penalty {} ({})",
@@ -3972,7 +4088,7 @@ fn chat_generate(
             // unless the #84 penalties armed a greedy request.
             let sent = req.sampling_sent;
             if s.temperature > 0.0 {
-                tracing::info!(target: "chat", "{}", sampling_line(s, sent));
+                tracing::info!(target: "chat", "{}", sampling_line(s, sent, req.card, false));
             } else {
                 tracing::info!(target: "chat",
                     "[chat] greedy with windowed penalties (#84): repeat_penalty {} ({}) frequency_penalty {} ({}) penalty_last_n {} ({}) presence_penalty {} ({})",
@@ -4000,7 +4116,9 @@ fn chat_generate(
             // greedy is the A4 path: `decode_step` samples whenever `dev_sampler` is Some
             // (gen.rs:2905-2909) and `reset_to_zero` does not clear it, so it is taken out here
             srv.eng.park_sampler(&mut srv.parked_sampler);
-            tracing::info!(target: "chat", "[chat] greedy (temperature absent or <= 0)");
+            // #111: an absent temperature is the card row now, so this is ONLY a body that
+            // sent `temperature <= 0` - the gates and probes
+            tracing::info!(target: "chat", "[chat] greedy (temperature <= 0 sent explicitly)");
         }
     }
     // #74: one line per request that says whether it thought, at which level, and whether the
@@ -4132,7 +4250,7 @@ fn chat_generate(
                 // drawn again from the same row under the grammar's mask (llama.cpp's
                 // rejection order). Outside a call in `auto` mode `armed()` is false and
                 // nothing else runs. The biased route checked inside `draw_biased`.
-                if !biased && gt.armed() && !gt.check(next as u32) {
+                if !host && gt.armed() && !gt.check(next as u32) {
                     let t_rd = Instant::now();
                     let drawn = next;
                     // unsafe: one logits row read back, as `draw_biased` does
@@ -4280,7 +4398,7 @@ fn chat_generate(
             // left is this position's distribution, and the biased draw replaces
             // the id the same way the device node would have drawn it - the
             // readback is the one cost the host route pays per token.
-            if biased {
+            if host {
                 if let Some(s) = sampler.as_mut() {
                     // unsafe: one logits row read back, as `draw_biased` does
                     next = unsafe { draw_biased(srv.eng, s, &req.logit_bias, gate.as_mut()) };
@@ -5759,11 +5877,11 @@ mod tests {
         assert_eq!(r.presence_penalty, 0.5);
         assert_eq!(r.seed, 7);
 
-        // nothing present: the data sheet, a fixed seed, and greedy
+        // nothing present: the card's non-thinking row (#111 - never greedy), a fixed seed
         let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
-        assert_eq!(r.temperature, 0.0);
-        assert_eq!(r.top_p, DEFAULT_TOP_P);
-        assert_eq!(r.top_k, DEFAULT_TOP_K);
+        assert_eq!(r.temperature, CARD_INSTRUCT.temperature);
+        assert_eq!(r.top_p, CARD_INSTRUCT.top_p);
+        assert_eq!(r.top_k, CARD_INSTRUCT.top_k);
         assert_eq!(r.presence_penalty, DEFAULT_PRESENCE);
         assert_eq!(r.seed, DEFAULT_SEED);
         assert_eq!(r.min_p, 0.0);
@@ -5774,8 +5892,8 @@ mod tests {
                  "temperature":null,"top_p":null,"top_k":null,"seed":null,"min_p":null}"#,
         )
         .unwrap();
-        assert_eq!(r.top_p, DEFAULT_TOP_P);
-        assert_eq!(r.top_k, DEFAULT_TOP_K);
+        assert_eq!(r.top_p, CARD_INSTRUCT.top_p);
+        assert_eq!(r.top_k, CARD_INSTRUCT.top_k);
         assert_eq!(r.seed, DEFAULT_SEED);
 
         // llama-server's "pick a seed" is taken as a value, never as a draw (M1: determinism)
@@ -5812,14 +5930,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             crow.sampling_sent,
-            SamplingSent { top_p: true, top_k: false, presence_penalty: false, seed: false, min_p: true,
+            SamplingSent { temperature: true, top_p: true, top_k: false, presence_penalty: false, seed: false, min_p: true,
                            repeat_penalty: false, frequency_penalty: false, penalty_last_n: false,
                            tier: TierSent::default() }
         );
         // the values behind the two flags that are false are this file's, not the client's
         assert_eq!(crow.presence_penalty, DEFAULT_PRESENCE);
         assert_eq!(crow.seed, DEFAULT_SEED);
-        assert_eq!(crow.top_k, DEFAULT_TOP_K);
+        assert_eq!(crow.top_k, CARD_INSTRUCT.top_k);
 
         // a body that names every field
         let full = parse_chat(
@@ -5829,7 +5947,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             full.sampling_sent,
-            SamplingSent { top_p: true, top_k: true, presence_penalty: true, seed: true, min_p: false,
+            SamplingSent { temperature: true, top_p: true, top_k: true, presence_penalty: true, seed: true, min_p: false,
                            repeat_penalty: false, frequency_penalty: false, penalty_last_n: false,
                            tier: TierSent::default() }
         );
@@ -5840,7 +5958,7 @@ mod tests {
                  "temperature":1.0,"top_p":null,"top_k":null,"presence_penalty":null,"seed":null}"#,
         )
         .unwrap();
-        assert_eq!(nulls.sampling_sent, SamplingSent::default());
+        assert_eq!(nulls.sampling_sent, SamplingSent { temperature: true, ..SamplingSent::default() });
         assert_eq!(SamplingSent::tag(true), "request");
         assert_eq!(SamplingSent::tag(false), "data sheet");
     }
@@ -5861,10 +5979,10 @@ mod tests {
         // the threshold constant the DEVICE receives is the host's own f32 ln,
         // so the two samplers filter against the same bytes
         assert_eq!(s.ln_min_p(), 0.01f32.ln());
-        let line = sampling_line(&s, r.sampling_sent);
+        let line = sampling_line(&s, r.sampling_sent, r.card, false);
         assert!(line.contains("min_p 0.01 (request)"), "{line}");
         assert!(line.contains("top_p 0.95 (request)"), "{line}");
-        assert!(line.contains("top_k 20 (data sheet)"), "{line}");
+        assert!(line.contains("top_k 20 (model card, non-thinking row)"), "{line}");
         assert!(line.contains("presence_penalty 0 (data sheet)"), "{line}");
 
         // absent stays 0.0 = disabled: the exact pre-#83 draw, golden rows included
@@ -5875,8 +5993,8 @@ mod tests {
         let sb = sampler_from(&bare).unwrap();
         assert_eq!(sb.min_p, 0.0);
         assert_eq!(sb.ln_min_p(), 0.0);
-        let line_b = sampling_line(&sb, bare.sampling_sent);
-        assert!(line_b.contains("min_p 0 (data sheet)"), "{line_b}");
+        let line_b = sampling_line(&sb, bare.sampling_sent, bare.card, false);
+        assert!(line_b.contains("min_p 0 (model card, non-thinking row)"), "{line_b}");
         // an explicit null is absent here too
         assert!(!bare.sampling_sent.min_p);
     }
@@ -5908,7 +6026,7 @@ mod tests {
         assert!(s.win_armed());
         // every value says where it came from
         assert!(r.sampling_sent.repeat_penalty && r.sampling_sent.frequency_penalty && r.sampling_sent.penalty_last_n);
-        let line = sampling_line(&s, r.sampling_sent);
+        let line = sampling_line(&s, r.sampling_sent, r.card, false);
         assert!(line.contains("repeat_penalty 1.05 (request)"), "{line}");
         assert!(line.contains("frequency_penalty 0.3 (request)"), "{line}");
         assert!(line.contains("penalty_last_n 64 (request)"), "{line}");
@@ -5953,13 +6071,13 @@ mod tests {
     #[test]
     fn greedy_with_penalties_arms_a_sampler_plain_greedy_does_not() {
         let mk = |t: &str| parse_chat(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{t}}}"#).as_bytes()).unwrap();
-        assert!(sampler_from(&mk("")).is_none());
+        assert!(sampler_from(&mk(r#","temperature":0"#)).is_none());
         assert!(sampler_from(&mk(r#","temperature":0,"top_p":0.95,"min_p":0.01,"seed":7"#)).is_none());
-        // penalties arm a GREEDY request
+        // penalties arm a GREEDY request (#111: greedy is `temperature 0` sent)
         for t in [
             r#","temperature":0,"repeat_penalty":1.1"#,
             r#","temperature":0,"frequency_penalty":0.2"#,
-            r#","repeat_penalty":1.1"#,
+            r#","temperature":-1,"repeat_penalty":1.1"#,
         ] {
             let s = sampler_from(&mk(t)).expect("penalties arm a greedy request");
             assert!(s.temperature <= 0.0);
@@ -6096,11 +6214,11 @@ mod tests {
         // greedy + bias: the biased argmax, on the host route; the data-sheet
         // presence 1.5 is OUT unless the body sent it (a bias-only request asked
         // for the bias, not for a silent penalty change)
-        let s = sampler_from(&mk(r#","logit_bias":{"10":1.0}"#)).expect("bias arms a host sampler in greedy");
+        let s = sampler_from(&mk(r#","temperature":0,"logit_bias":{"10":1.0}"#)).expect("bias arms a host sampler in greedy");
         assert!(s.temperature <= 0.0);
         assert_eq!(s.presence_penalty, 0.0);
         // presence sent is honored, exactly as sent
-        let s = sampler_from(&mk(r#","logit_bias":{"10":1.0},"presence_penalty":0.7"#)).unwrap();
+        let s = sampler_from(&mk(r#","temperature":0,"logit_bias":{"10":1.0},"presence_penalty":0.7"#)).unwrap();
         assert_eq!(s.presence_penalty, 0.7);
         // sampled + bias keeps the #28/#68 sampled contract, presence included
         let s = sampler_from(&mk(r#","temperature":1.0,"logit_bias":{"10":-2.5}"#)).unwrap();
@@ -6108,11 +6226,11 @@ mod tests {
         assert_eq!(s.presence_penalty, DEFAULT_PRESENCE);
         // greedy + penalties + bias: the #84 window keeps its own presence rule
         // (the request's default 1.5 rides the windowed form); the bias rides the host
-        let s = sampler_from(&mk(r#","logit_bias":{"10":1.0},"repeat_penalty":1.1"#)).unwrap();
+        let s = sampler_from(&mk(r#","temperature":0,"logit_bias":{"10":1.0},"repeat_penalty":1.1"#)).unwrap();
         assert!(s.win_armed());
         assert_eq!(s.presence_penalty, DEFAULT_PRESENCE);
         // and the plain-greedy pin of #84 stands: no bias, no penalties, no sampler
-        assert!(sampler_from(&mk("")).is_none());
+        assert!(sampler_from(&mk(r#","temperature":0"#)).is_none());
     }
 
     #[test]
@@ -6179,7 +6297,7 @@ mod tests {
     fn without_stop_and_logit_bias_the_stream_is_the_pre_86_bytes() {
         // the default of record: both fields absent, the parse carries nothing, and
         // the stream gate is the think filter alone - byte for byte
-        let r = parse_chat(HI.as_bytes()).unwrap();
+        let r = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"temperature":0}"#).unwrap();
         assert!(r.stop.is_empty());
         assert!(r.logit_bias.is_empty());
         assert!(sampler_from(&r).is_none(), "an unbiased greedy request is the A4 path");
@@ -6320,20 +6438,100 @@ mod tests {
         assert_eq!(repeat_note(&mk(1, true, 1)), ", single-token answer");
     }
 
+    /// #111 (robin 2026-09-24): Qwen3.8-Flash-Next never decodes greedy in production. An
+    /// absent sampling field is the MODEL CARD row of the request's thinking mode (thinking
+    /// 1.0 / 0.95 / 20 / 0, non-thinking 0.7 / 0.8 / 20 / 0; huggingface.co/Qwen/
+    /// Qwen3.8-Flash-Next "Best Practices"), the way vLLM fills from generation_config.json.
+    /// Before #111 an absent temperature was greedy and top_p was 0.8 in both modes.
     #[test]
-    fn greedy_is_absent_zero_and_negative_temperature() {
+    fn an_absent_temperature_samples_at_the_card_row_of_the_thinking_mode() {
+        let mk = |t: &str| {
+            parse_chat(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{t}}}"#).as_bytes()).unwrap()
+        };
+        let row = |r: &ChatReq| {
+            let s = sampler_from(r).expect("an absent temperature samples (#111)");
+            (s.temperature, s.top_p, s.top_k, s.min_p, s.presence_penalty)
+        };
+        // thinking off (the default render): the non-thinking row
+        assert_eq!(row(&mk("")), (0.7, 0.8, 20, 0.0, DEFAULT_PRESENCE));
+        // thinking on, through either door: the thinking row
+        assert_eq!(row(&mk(r#","chat_template_kwargs":{"enable_thinking":true}"#)), (1.0, 0.95, 20, 0.0, DEFAULT_PRESENCE));
+        assert_eq!(row(&mk(r#","reasoning_effort":"low""#)), (1.0, 0.95, 20, 0.0, DEFAULT_PRESENCE));
+        // a null is an absent field
+        assert_eq!(row(&mk(r#","temperature":null,"reasoning_effort":"medium""#)).0, 1.0);
+        // field by field: what the body sends wins, the rest is the card row of ITS mode
+        let r = mk(r#","temperature":0.5,"chat_template_kwargs":{"enable_thinking":true}"#);
+        assert_eq!(row(&r), (0.5, 0.95, 20, 0.0, DEFAULT_PRESENCE));
+        // presence is the one card value not adopted (#91): 0 in both modes, never 1.5
+        assert_eq!(mk("").presence_penalty, 0.0);
+
+        // the provenance: every filled field names the row it came from
+        let r = mk(r#","chat_template_kwargs":{"enable_thinking":true}"#);
+        let fill = card_fill_line(&r).expect("four fields came from the card");
+        assert!(fill.contains("model card, thinking row"), "{fill}");
+        assert!(fill.contains("temperature 1 top_p 0.95 top_k 20 min_p 0"), "{fill}");
+        assert!(fill.contains("presence_penalty is not taken from the card"), "{fill}");
+        let s = sampler_from(&r).unwrap();
+        let line = sampling_line(&s, r.sampling_sent, r.card, false);
+        assert!(line.contains("temperature 1 (model card, thinking row)"), "{line}");
+        assert!(line.contains("top_p 0.95 (model card, thinking row)"), "{line}");
+        // only the absent ones are named
+        let r = mk(r#","temperature":1.0,"top_p":0.95,"min_p":0.01"#);
+        assert_eq!(
+            card_fill_line(&r).as_deref(),
+            Some("[chat] absent sampling fields filled from the model card, non-thinking row (#111): \
+                  top_k 20; presence_penalty is not taken from the card (serve default 0, #91)")
+        );
+        let s = sampler_from(&r).unwrap();
+        assert!(sampling_line(&s, r.sampling_sent, r.card, false).contains("temperature 1 (request)"));
+        // a body that names all four, and a greedy body, get no fill line
+        assert!(card_fill_line(&mk(r#","temperature":1.0,"top_p":0.95,"min_p":0.01,"top_k":20"#)).is_none());
+        assert!(card_fill_line(&mk(r#","temperature":0"#)).is_none());
+    }
+
+    /// #111: `top_k` 0 and -1 are top-k OFF (llama.cpp `src/llama-sampler.cpp:326`
+    /// `if (k <= 0) return;`, vLLM "0 (or -1) to consider all tokens"). Before #111 `0` was
+    /// clamped to 1 by both samplers (a silent greedy), `-1` was a 400, and `> 64` was
+    /// clamped to 64 on the device only (`kernels.rs` SAMPLE_MAXK).
+    #[test]
+    fn top_k_zero_and_minus_one_are_off_and_leave_the_device() {
+        let mk = |t: &str| parse_chat(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{t}}}"#).as_bytes());
+        assert_eq!(mk(r#","top_k":0"#).unwrap().top_k, 0);
+        assert_eq!(mk(r#","top_k":-1"#).unwrap().top_k, 0);
+        assert_eq!(mk(r#","top_k":100"#).unwrap().top_k, 100);
+        assert!(mk(r#","top_k":-3"#).is_err());
+        assert!(mk(r#","top_k":2.5"#).is_err());
+        // routing: a sampled top_k the kernel cannot hold goes to the host, never clamped
+        let host = |t: &str| sampler_from(&mk(t).unwrap()).map(|s| s.top_k_needs_host());
+        assert_eq!(host(r#","temperature":1.0,"top_k":0"#), Some(true));
+        assert_eq!(host(r#","temperature":1.0,"top_k":-1"#), Some(true));
+        assert_eq!(host(r#","temperature":1.0,"top_k":65"#), Some(true));
+        assert_eq!(host(r#","temperature":1.0,"top_k":64"#), Some(false));
+        assert_eq!(host(r#","temperature":1.0"#), Some(false), "the card's 20 stays on the device");
+        // greedy with penalties: the device draw is the argmax whatever k is
+        assert_eq!(host(r#","temperature":0,"top_k":0,"repeat_penalty":1.1"#), Some(false));
+        // the line says "off", not "0"
+        let r = mk(r#","temperature":1.0,"top_k":0"#).unwrap();
+        let s = sampler_from(&r).unwrap();
+        assert!(sampling_line(&s, r.sampling_sent, r.card, true).contains("sampling on the HOST"));
+        assert!(sampling_line(&s, r.sampling_sent, r.card, true).contains("top_k off (request)"));
+    }
+
+    #[test]
+    fn greedy_is_only_a_sent_zero_or_negative_temperature() {
         let mk = |t: &str| {
             let body = format!(
                 r#"{{"messages":[{{"role":"user","content":"hi"}}]{t}}}"#
             );
             parse_chat(body.as_bytes()).unwrap()
         };
-        // greedy: the A4 path, no sampler is built at all
-        assert!(sampler_from(&mk("")).is_none());
+        // greedy: the A4 path, no sampler is built at all - only when the body SENDS it
         assert!(sampler_from(&mk(r#","temperature":0"#)).is_none());
         assert!(sampler_from(&mk(r#","temperature":0.0"#)).is_none());
-        assert!(sampler_from(&mk(r#","temperature":null"#)).is_none());
         assert!(sampler_from(&mk(r#","temperature":-1.0"#)).is_none());
+        // #111: absent and null are the card row, never greedy
+        assert!(sampler_from(&mk("")).is_some());
+        assert!(sampler_from(&mk(r#","temperature":null"#)).is_some());
         // greedy stays greedy even when the rest of the profile is sent
         assert!(sampler_from(&mk(r#","temperature":0,"top_p":0.95,"min_p":0.01,"seed":7"#)).is_none());
         // any positive temperature samples
@@ -6351,8 +6549,8 @@ mod tests {
         let s = sampler_from(&r).expect("temperature 1.0 samples");
         assert_eq!(s.seed, 7);
         assert_eq!(s.temperature, 1.0);
-        assert_eq!(s.top_p, DEFAULT_TOP_P);
-        assert_eq!(s.top_k, DEFAULT_TOP_K);
+        assert_eq!(s.top_p, CARD_INSTRUCT.top_p);
+        assert_eq!(s.top_k, CARD_INSTRUCT.top_k);
         assert_eq!(s.presence_penalty, DEFAULT_PRESENCE);
         // the RNG state is the seed's, so two requests with the same seed upload the same state
         assert_eq!(s.rng.state(), Sampler::new(7).rng.state());
