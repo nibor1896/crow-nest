@@ -140,6 +140,7 @@
 //! | `messages` | required, non empty array, every entry needs a string `role` |
 //! | `stream` | `true` streams `chat.completion.chunk` frames; `false` or absent answers ONE `chat.completion` document (#39 B3a) |
 //! | `max_tokens` | default 8192 (1024 until 2026-09-18), capped at 32768 |
+//! | `max_completion_tokens` | #112: OpenAI's current name for the same budget, same rules; both sent with different values is a 400 naming both |
 //! | `model` | echoed into every chunk, default `crow-nest` |
 //! | `chat_template_kwargs.enable_thinking` | template variable, default false |
 //! | `reasoning_effort` | #74: top level OR `chat_template_kwargs`; `none` and an absent field are the render of record, `low` / `medium` pass through, `high` and `xhigh` both render `xhigh`, anything else is a 400 |
@@ -615,11 +616,13 @@ const IO_TIMEOUT_SECS: u64 = 10;
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// declared `Content-Length`, 16 MiB; over it the answer is 413
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
-/// `max_tokens` when the request carries none
-// 8192 since 2026-09-18: Crow sends no max_tokens on the local path, and at 1024 a
-// write_file that carries a whole SVG ends in `finish length` before the model has
-// written the `path` parameter (robin's session, 13:49 UTC). An agentic client needs
-// room for one file per call; the 32768 cap and the n_ctx clamp are unchanged.
+/// `max_tokens` when the request carries none (nor `max_completion_tokens`, #112)
+// 8192 since 2026-09-18: at 1024 a write_file that carries a whole SVG ended in
+// `finish length` before the model had written the `path` parameter (robin's session,
+// 13:49 UTC). Crow sent no max_tokens on the local path THEN; it has sent one on every
+// request since (`max_tokens or MAX_TOKENS`, 16384 by default, Crow `cli/crow_core.py`
+// `stream_reply`, checked at Crow 2d29fa2, #112), so this default is for other clients.
+// The 32768 cap and the n_ctx clamp are unchanged.
 const DEFAULT_MAX_TOKENS: usize = 8192;
 /// ceiling for `max_tokens`, so one request cannot hold the process forever
 const MAX_MAX_TOKENS: usize = 32768;
@@ -1387,6 +1390,19 @@ fn num_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str, d: f32
     }
 }
 
+/// #112: one generation-budget field (`max_tokens` or `max_completion_tokens`): absent or
+/// `null` is `None`; a positive integer is `Some`; `0` or anything else is a 400 naming the key
+fn budget_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Result<Option<u64>, String> {
+    match obj.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => match v.as_u64() {
+            Some(0) => Err(format!("{key} is 0")),
+            Some(n) => Ok(Some(n)),
+            None => Err(format!("{key} is not a positive integer")),
+        },
+    }
+}
+
 /// the integer shape of `num_field` (#85/#92's integer knobs): absent or null is
 /// the default, anything but a non negative integer is a 400 that names the key
 fn int_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str, d: i64) -> Result<i64, String> {
@@ -1555,17 +1571,20 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
             .as_bool()
             .ok_or_else(|| "stream is not a boolean".to_string())?,
     };
-    let max_tokens = match obj.get("max_tokens") {
-        None | Some(serde_json::Value::Null) => DEFAULT_MAX_TOKENS,
-        Some(v) => {
-            let n = v
-                .as_u64()
-                .ok_or_else(|| "max_tokens is not a positive integer".to_string())?;
-            if n == 0 {
-                return Err("max_tokens is 0".to_string());
-            }
-            (n as usize).min(MAX_MAX_TOKENS)
+    // #112: OpenAI's current name for the budget is `max_completion_tokens` (`max_tokens` is
+    // "deprecated in favor of" it, openai-openapi `CreateChatCompletionRequest`); llama-server
+    // reads both as aliases of `n_predict` (`tools/server/server-schema.cpp:44-47`), first
+    // found wins. Here both are read; two DIFFERENT values are a 400 naming both - a silent
+    // pick between two budgets the client named is the #74 rule's "never silent". The raw
+    // values are compared, before the MAX_MAX_TOKENS cap.
+    let max_tokens = match (budget_field(obj, "max_tokens")?, budget_field(obj, "max_completion_tokens")?) {
+        (Some(a), Some(b)) if a != b => {
+            return Err(format!(
+                "max_tokens {a} and max_completion_tokens {b} disagree - send one of them"
+            ))
         }
+        (Some(n), _) | (None, Some(n)) => (n as usize).min(MAX_MAX_TOKENS),
+        (None, None) => DEFAULT_MAX_TOKENS,
     };
     // #74: the two doors, and which one wins. `chat_template_kwargs.enable_thinking` is the
     // direct template variable and was the only one `serve` read until today; the TOP-LEVEL
@@ -5737,6 +5756,24 @@ mod tests {
         assert_eq!(error_json("payload too large")["error"], "payload too large");
     }
     // ------------------------------------------------ chat completions (#26 A4)
+
+    /// #112: `max_completion_tokens` is the budget too (OpenAI's current field; llama-server
+    /// aliases it to `n_predict`). Before #112 it was ignored: alone it gave DEFAULT_MAX_TOKENS.
+    #[test]
+    fn max_completion_tokens_is_the_budget_and_a_conflict_is_a_400() {
+        let mk = |t: &str| parse_chat(format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{t}}}"#).as_bytes());
+        assert_eq!(mk(r#","max_completion_tokens":64"#).unwrap().max_tokens, 64);
+        assert_eq!(mk(r#","max_completion_tokens":64,"max_tokens":64"#).unwrap().max_tokens, 64);
+        assert_eq!(mk(r#","max_completion_tokens":null,"max_tokens":7"#).unwrap().max_tokens, 7);
+        assert_eq!(mk(r#","max_completion_tokens":999999"#).unwrap().max_tokens, MAX_MAX_TOKENS);
+        let e = mk(r#","max_completion_tokens":64,"max_tokens":65"#).unwrap_err();
+        assert!(e.contains("max_tokens 65") && e.contains("max_completion_tokens 64"), "{e}");
+        // compared raw, before the cap: two different over-cap budgets still disagree
+        assert!(mk(r#","max_completion_tokens":40000,"max_tokens":50000"#).is_err());
+        assert_eq!(mk(r#","max_completion_tokens":0"#).unwrap_err(), "max_completion_tokens is 0");
+        assert!(mk(r#","max_completion_tokens":"lots""#).is_err());
+        assert_eq!(mk("").unwrap().max_tokens, DEFAULT_MAX_TOKENS);
+    }
 
     #[test]
     fn chat_body_parses_messages_max_tokens_and_stream() {
