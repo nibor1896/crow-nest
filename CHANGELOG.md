@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- **The request body cap is 100 MiB, llama-server's** (`#113`, 2026-09-24). It was 16 MiB, under one Crow image: Crow reads images up to 32 MiB (42.7 MiB as base64) and resends every image of the history on every turn, so a conversation with one image over about 12 MiB got a 413 on every turn. Cost read from code, not measured: about 6-7x the body in transient host RAM for the one request in flight, about 0.7 GB at the cap. Two 32 MiB images plus text still fit, three do not; that bound is Crow's (noted in #113).
 - **`max_completion_tokens` is read as the generation budget** (`#112`, 2026-09-24). OpenAI's current field (`max_tokens` is deprecated in its favor) was silently ignored, so a client that sent only it got 8192 tokens. Same rules as `max_tokens` (positive, capped at 32768); both present with different values is a 400 naming both. Stale comment "Crow sends no max_tokens" at `DEFAULT_MAX_TOKENS` corrected: Crow sends 16384 on every request.
 - **The vit fc1 GEMM wrote past its row count** (`#109`, 2026-09-24). `gemm_fp4_f32x` had no row guard. fc1 has 4,304 = 67 x 64 + 16 rows, so the last 64-row tile decoded 48 rows past the weight and stored them into the next token's first 48 fc1 outputs, racing that token's own tile. Decode and store are now bounded. Valid rows keep the same product tree.
   - New GPU test `vit::gemm_vit` (`--ignored`). Without the guard: relative error 1.121e4 at token 65, row 45. With it: < 1e-3 on all seven tower shapes, 5 reps each, fp4 and f16.

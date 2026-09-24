@@ -25,7 +25,7 @@
 //! - A malformed or repeated `Content-Length` answers 400 JSON.
 //! - `Transfer-Encoding: chunked` answers 501 JSON, A3 may implement it.
 //! - The body is read and discarded before the response is written.
-//! - Body capped at 16 MiB; over the cap: 413 JSON, then close.
+//! - Body capped at 100 MiB (#113, llama-server's cpp-httplib cap); over the cap: 413 JSON, then close.
 //! - A bodied POST to an unknown route therefore gets the 404 JSON, not a reset.
 //! - A garbage request line answers 400 JSON with `{"error":"bad request"}`.
 //! - A client that sent nothing is closed silently, without a response.
@@ -614,8 +614,15 @@ const SERVE_CHUNK: usize = TRICKLE_CHUNK_THRESHOLD;
 const IO_TIMEOUT_SECS: u64 = 10;
 /// request line plus headers, 64 KiB total; over it the answer is 431
 const MAX_HEAD_BYTES: usize = 64 * 1024;
-/// declared `Content-Length`, 16 MiB; over it the answer is 413
-const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// declared `Content-Length`; over it the answer is 413.
+/// #113: 100 MiB, llama-server's own cap (cpp-httplib `CPPHTTPLIB_PAYLOAD_MAX_LENGTH`,
+/// `vendor/cpp-httplib/httplib.h:130`), so both engines Crow drives refuse at one size.
+/// It was 16 MiB, under ONE Crow image: Crow reads images up to 32 MiB
+/// (`cli/crow_core.py:203` `IMAGE_MAX_BYTES`) and resends every one of the history as a
+/// base64 data URL (4/3 the size) on every turn. Cost, read from code: one request at a
+/// time, held about 6-7x over (raw body, parsed JSON, `messages` clone, image URLs, the
+/// normalised copy, decoded bytes) - about 0.7 GB transient host RAM at the cap.
+const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
 /// `max_tokens` when the request carries none (nor `max_completion_tokens`, #112)
 // 8192 since 2026-09-18: at 1024 a write_file that carries a whole SVG ended in
 // `finish length` before the model had written the `path` parameter (robin's session,
@@ -7918,6 +7925,23 @@ Red is #FF0000."), "{off}");
         let mut c = Cursor::new(raw);
         assert_eq!(read_head_from(&mut c).unwrap(), Head::HeadTooLarge);
         assert!(c.position() <= MAX_HEAD_BYTES as u64);
+    }
+
+    /// #113: the body cap is llama-server's 100 MiB. A 32 MiB image (Crow's
+    /// `IMAGE_MAX_BYTES`) is 44,739,244 bytes as base64 - over the old 16 MiB cap, under
+    /// the new one. The head alone decides: the body is refused before it is allocated.
+    #[test]
+    fn the_body_cap_takes_a_crow_sized_image_and_refuses_over_100_mib() {
+        let head = |n: usize| {
+            Cursor::new(format!("POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {n}\r\n\r\n").into_bytes())
+        };
+        let b64_of_32_mib = (32 * 1024 * 1024usize).div_ceil(3) * 4;
+        // under the cap: the reader goes on to read the (absent) body - an EOF, not a 413
+        assert!(read_head_from(&mut head(b64_of_32_mib)).is_err(), "a 42.7 MiB body is read, not refused");
+        assert_eq!(
+            read_head_from(&mut head(100 * 1024 * 1024 + 1)).unwrap(),
+            Head::BodyTooLarge(100 * 1024 * 1024 + 1)
+        );
     }
 
     #[test]

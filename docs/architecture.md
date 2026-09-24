@@ -2542,7 +2542,7 @@ C:/x/y.md
 | garbage request line | 400 JSON `{"error":"bad request"}` | `serve.rs:2563` (`read_head_from`) |
 | malformed or repeated `Content-Length` | 400 JSON | `serve.rs:2563` |
 | head (request line plus headers) over 64 KiB | 431 JSON, then close | `serve.rs:501`, `serve.rs:2563` |
-| body over 16 MiB | 413 JSON, then close | `serve.rs:503`, `serve.rs:2563` |
+| body over 100 MiB (16 MiB until #113, 2026-09-24: under one Crow image of up to 32 MiB, 42.7 MiB as base64; 100 MiB is llama-server's cpp-httplib cap) | 413 JSON, then close | `MAX_BODY_BYTES`, `read_head_from` |
 | `Transfer-Encoding: chunked` | 501 JSON | `serve.rs:2563` |
 | `stream: false` or absent | **200, one `chat.completion` document** (501 until #39) | `serve.rs:2062` (`chat_route` branch), `serve.rs:2099` (`chat_document`) |
 | prompt ids `>= n_ctx` | 413 before any GPU work | `serve.rs:1363` (`clamped_max_tokens`) |
