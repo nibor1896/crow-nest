@@ -3928,6 +3928,17 @@ fn trickle_ready(eng: &Engine) -> bool {
     eng.residency().lb.is_none() && eng.residency().stride > eng.residency().n
 }
 
+/// - #114: the image part of the `[cache]` line: empty for a text-only exchange (the line
+///   stays what it was), else the image counts of both sides and, when an image that is
+///   not the held one cut `L` below the id-only prefix, both numbers
+fn image_note(cache_on: bool, held_imgs: usize, req_imgs: usize, l_ids: usize, l: usize) -> String {
+    if !cache_on || (held_imgs == 0 && req_imgs == 0) {
+        return String::new();
+    }
+    let cut = if l < l_ids { format!(", image cut L {l_ids} -> {l}") } else { String::new() };
+    format!(", images held {held_imgs} request {req_imgs}{cut}")
+}
+
 /// - #39 B3a: THE generation loop of this server, the only one. `stream:true` runs it with
 ///   `SseSink`, `stream:false` with `CollectSink`; prefix cache, sampler, stop rules,
 ///   tool-call parser, snapshot, counters and the three `[chat]` stderr lines are shared.
@@ -3967,8 +3978,22 @@ fn chat_generate(
     // held conversation: prompt ids AND generated ids (`gen.rs:2698`, `gen.rs:2945`).
     // #100: a snapshot holding its logits row may sit AT the prompt length (an identical
     // re-request prefills nothing); a VIT dump needs the prefill's rows, so not for it.
-    let plan = srv.cache.decide_for(srv.eng.history(), &prompt, dump_dir.is_none());
+    // #114: IMAGE AWARE. An image's prompt ids are `IMAGE_PAD` repeated per visual token,
+    // so a different image of the same grid is the same id run; the spans (rows + content
+    // hash) of both sides make `L` stop at the first image that is not the held one.
+    let req_imgs: Vec<crow_nest_engine::vit::ImageSpan> =
+        srv.eng.vision_plan().map(|p| p.spans.clone()).unwrap_or_default();
+    let plan = srv.cache.decide_mm(
+        srv.eng.history(),
+        srv.eng.history_images(),
+        &prompt,
+        &req_imgs,
+        dump_dir.is_none(),
+    );
     let held = srv.eng.history().len();
+    // #114: the id-only prefix, logged next to `L` when an image cut it shorter
+    let l_ids = crow_nest_engine::cache::common_prefix_len(srv.eng.history(), &prompt);
+    let held_imgs = srv.eng.history_images().len();
     let cache_on = srv.cache.enabled();
     let snaps = srv.cache.positions();
     let reusable = srv.cache.reuse_candidates();
@@ -3994,13 +4019,14 @@ fn chat_generate(
     // `reset_to_zero` of a cold one. The `[chat]` line below calls it `reset` as well.
     // With the cache off `decide` returns before it computes `L`, so no number is claimed.
     tracing::info!(target: "cache",
-        "[cache] {} L {} (held {}), P {cached_n}, snapshots {:?}, reusable {:?}, prefill {prefilled} of {} tok, reset {reset_ms:.3} ms",
+        "[cache] {} L {} (held {}), P {cached_n}, snapshots {:?}, reusable {:?}, prefill {prefilled} of {} tok, reset {reset_ms:.3} ms{}",
         if plan.reuse.is_some() { "WARM" } else { "COLD" },
         if cache_on { plan.l.to_string() } else { "n/a".to_string() },
         held,
         snaps,
         reusable,
-        prompt.len()
+        prompt.len(),
+        image_note(cache_on, held_imgs, req_imgs.len(), l_ids, plan.l)
     );
     // #27 A5: the timed window is the prefill CALL alone, the same window `decode run` prints
     // as `prefill done in X s`; the rollback, the reset and the tokenizer are outside it.
@@ -4016,6 +4042,8 @@ fn chat_generate(
         }
     };
     let prefill_ms = t_pre.elapsed().as_secs_f64() * 1e3;
+    // #114: `history` now holds this prompt, so its image spans are this request's
+    srv.eng.set_history_images(&req_imgs);
     if let Some(dir) = dump_dir.as_ref() {
         unsafe { write_vit_dump(srv, dir, &prompt, collect.as_deref(), prefill_ms) };
     }
@@ -5528,6 +5556,16 @@ fn main() {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// #114: a text-only `[cache]` line is the line it was; an image exchange names both
+    /// sides' image counts, and an image cut names the id prefix and `L`
+    #[test]
+    fn the_cache_line_names_an_image_cut() {
+        assert_eq!(image_note(true, 0, 0, 500, 500), "");
+        assert_eq!(image_note(false, 1, 1, 1047, 10), "");
+        assert_eq!(image_note(true, 1, 1, 1047, 1047), ", images held 1 request 1");
+        assert_eq!(image_note(true, 1, 1, 1047, 10), ", images held 1 request 1, image cut L 1047 -> 10");
+    }
 
     #[test]
     fn request_line_is_method_and_target() {

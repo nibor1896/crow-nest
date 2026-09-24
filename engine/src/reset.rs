@@ -14,6 +14,7 @@
 //! |---|---|---|
 //! | `Engine::pos` | `gen.rs:2697`, `gen.rs:2944` | only grows; `prefill` reads it as `pos_base` |
 //! | `Engine::history` | `gen.rs:2698`, `gen.rs:2945` | PLE n-gram prefix `history[pos_base-2..pos_base]` (`gen.rs:2550`) |
+//! | `Engine::history_images` | #114, `cache::common_prefix_len_mm` | image spans of `history`; stale spans would name images the state no longer holds |
 //! | `Engine::done_blocks` | `gen.rs:2696`, `gen.rs:2947` | QSA pooled block cursor (`gen.rs:1648-1660`) |
 //! | `Ple::state` | `gen.rs:902`, `kernels.rs:2839` | `[10240][9]` dilated conv left state, carried chunk to chunk |
 //! | `ThreeStates::gdn_conv` | `manager.rs:47`, `kernels.rs:902` | `[36][10240][3]` causal conv left state, carried chunk to chunk |
@@ -118,6 +119,7 @@ impl Engine {
 
         self.pos = 0;
         self.history.clear();
+        self.history_images.clear();
         self.done_blocks = 0;
         self.route_log.clear();
 

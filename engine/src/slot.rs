@@ -663,6 +663,9 @@ pub unsafe fn restore(
     eng.pos = h.pos as usize;
     eng.done_blocks = h.done_blocks as usize;
     eng.history = ids;
+    // #114: a slot file carries ids, not image identities: an image in the restored
+    // history can never match a request's image (`cache::common_prefix_len_mm`)
+    eng.history_images.clear();
     eng.route_log.clear();
     // #32 review: LAST. Every upload above is a `cuda::ck`, which ends the process on a
     // device error (serve has no catch_unwind), so naming the slot before them could leave

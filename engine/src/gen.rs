@@ -407,6 +407,9 @@ pub struct Engine {
     pub cfg: Config,
     pub(crate) pos: usize,
     pub(crate) history: Vec<i64>,
+    /// #114: the image spans inside `history` (rows + content hash), so the prefix cache
+    /// can tell two different images of the same grid apart; see `cache::common_prefix_len_mm`
+    pub(crate) history_images: Vec<crate::vit::ImageSpan>,
     pub(crate) done_blocks: usize,
     sel_counts: Dev, // [48][512] u64 per-expert routing counts
     // ---- CUDA Graphs (CROW_GRAPH=1) ----
@@ -494,6 +497,19 @@ impl Engine {
     pub fn pos(&self) -> usize { self.pos }
     /// the held conversation — prompt ids AND generated ids
     pub fn history(&self) -> &[i64] { &self.history }
+    /// #114: the image spans of `history`
+    pub fn history_images(&self) -> &[crate::vit::ImageSpan] { &self.history_images }
+    /// - #114: name the images of the prompt just prefilled (the request plan's spans;
+    ///   empty for a text-only prompt). Generated ids carry no image, so the spans of
+    ///   the prompt are the spans of the whole history
+    pub fn set_history_images(&mut self, spans: &[crate::vit::ImageSpan]) {
+        self.history_images = spans.to_vec();
+    }
+    /// - #114: `history` was cut to `pos` rows: forget every image that starts at or
+    ///   above it (an image cut in the middle keeps its span: its first rows are held)
+    pub(crate) fn truncate_history_images(&mut self, pos: usize) {
+        self.history_images.retain(|sp| sp.start < pos);
+    }
     /// CROW_ROUTE_DUMP=1: the routed expert ids per token per layer
     pub fn route_log(&self) -> &[Vec<[i32; 10]>] { &self.route_log }
     /// the context length the three states were allocated for
@@ -1033,7 +1049,7 @@ impl Engine {
                 vt.arm_scratch();
                 vit_scratch_held = crate::vit::scratch_bytes() as u64;
             }
-            println!("[vit] visual tower loaded: mode {} (f32 tower math), CROW_VIT {} (0 = the text-only placeholder), {}, vit weights {:.0} MiB ({})",
+            log_vit_tower(&format!("[vit] visual tower loaded: mode {} (f32 tower math), CROW_VIT {} (0 = the text-only placeholder), {}, vit weights {:.0} MiB ({})",
                 vt.w.mode,
                 env_or_unset("CROW_VIT"),
                 crate::vit::budget_words(&crate::vit::budget()),
@@ -1042,10 +1058,10 @@ impl Engine {
                     format!("scratch held at boot, {:.1} MiB at the patch cap", vit_scratch_held as f64 / MIB)
                 } else {
                     "scratch lazy, allocated on the first image request (CROW_VIT_RESERVE_MB=0)".to_string()
-                });
+                }));
             Some(vt)
         } else {
-            println!("[vit] visual tower NOT loaded, CROW_VIT 0 (the text-only placeholder of record, /props vision false)");
+            log_vit_tower("[vit] visual tower NOT loaded, CROW_VIT 0 (the text-only placeholder of record, /props vision false)");
             None
         };
         // #72: the interleaved-mrope span tables, at the widest span serve can
@@ -1362,6 +1378,7 @@ impl Engine {
             cfg,
             pos: 0,
             history: Vec::new(),
+            history_images: Vec::new(),
             done_blocks: 0,
             sel_counts,
             stage,
@@ -5032,4 +5049,51 @@ unsafe fn route_dump_prefill(l: usize, t: usize, rids: Dev) {
     }
     w.write_all(&rec).expect("CROW_ROUTE_DUMP_PREFILL: write failed");
     w.flush().expect("CROW_ROUTE_DUMP_PREFILL: flush failed");
+}
+
+/// - the boot line that says WHICH visual tower this process runs (mode, projector path,
+///   token budget), or that none is loaded
+/// - a tracing event (target `vit`, INFO), so `engine.log` records it; it was a
+///   `println!` and reached serve's terminal only (2026-09-24: `grep "visual tower"`
+///   found nothing in `~/.local/state/crow/logs/engine.log`)
+pub(crate) fn log_vit_tower(line: &str) {
+    tracing::info!(target: "vit", "{line}");
+}
+
+#[cfg(test)]
+mod vit_tower_line {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// the tower line is a `vit` INFO event under serve's default filter, so the log
+    /// file receives it (a `println!` leaves the subscriber's writer empty)
+    #[test]
+    fn the_tower_line_reaches_the_log_as_a_vit_info_event() {
+        let buf = Buf::default();
+        let w = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(crate::log::DEFAULT_FILTER))
+            .with_ansi(false)
+            .with_writer(move || w.clone())
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            super::log_vit_tower("[vit] visual tower loaded: mode f16 (llama.cpp projector x.gguf)")
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("INFO"), "not an INFO event: {out:?}");
+        assert!(out.contains("vit:"), "not target vit: {out:?}");
+        assert!(out.contains("[vit] visual tower loaded: mode f16"), "line missing: {out:?}");
+    }
 }

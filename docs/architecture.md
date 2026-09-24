@@ -1961,6 +1961,31 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
   at a held position replaces that slot instead of adding a duplicate (`cache.rs` module doc,
   "Slot bookkeeping").
 
+**Images (#114, 2026-09-24):**
+
+- An image's prompt ids are `IMAGE_PAD` (248056) repeated once per visual token
+  (`vit::expand_ids`), so two DIFFERENT images of the same grid are the same id run.
+  Measured 2026-09-24: 7 of 12 colour-probe requests went `WARM ... prefill 0 of 1047` on a
+  new image and were answered for the first one.
+- So the comparison carries each image's content identity at its span, the llama.cpp rule
+  (`server_tokens::get_common_prefix`: a media chunk is equal only if its id and token
+  count are equal, else the prefix ends at its first index):
+
+| piece | implementation |
+|---|---|
+| request spans | `VisionPlan::spans`, `ImageSpan { start, len, hash }` per image (`vit::image_spans`) |
+| hash | `vit::image_key`, 64-bit hash of the encoded bytes, the key of the tower-output LRU |
+| held spans | `Engine::history_images`: set after each prompt's prefill, truncated by `rollback`, cleared by `reset_to_zero` and by a slot-file restore (a file carries no image identity) |
+| `L` | `common_prefix_len_mm`: the id prefix, cut to the `start` of the first span on either side with no identical span on the other |
+| decision | `PrefixCache::decide_mm` (`decide_for` = the same with no spans) |
+
+- A re-sent identical image (Crow resends the whole history every turn) keeps full reuse.
+- mrope: positions below a row depend only on the types and grids before it, so identical
+  spans give identical positions; a differing image cuts `L` where both sides are still
+  plain text. A text-only request after an image one stops at the held image.
+- The `[cache]` line adds `images held H request R` and, when an image cut `L`,
+  `image cut L <id prefix> -> <L>`.
+
 **Why ids and not text:**
 
 - Rule: comparing ids and not text is not a stylistic choice.
