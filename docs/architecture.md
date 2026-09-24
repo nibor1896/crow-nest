@@ -1974,7 +1974,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 | piece | implementation |
 |---|---|
 | request spans | `VisionPlan::spans`, `ImageSpan { start, len, hash }` per image (`vit::image_spans`) |
-| hash | `vit::image_key`, 64-bit hash of the encoded bytes, the key of the tower-output LRU |
+| hash | `vit::image_key`, SHA-256 of the encoded bytes (`vit::ImageKey = [u8; 32]`), the key of the tower-output cache and its LRU too. A 64-bit SipHash (`DefaultHasher`, fixed keys) until 2026-09-24: a collision is a cache hit for a DIFFERENT image, so the identity is llama.cpp's cryptographic one (`tools/mtmd/mtmd-helper.cpp` `mtmd_helper_bitmap_init_from_buf`, "use sha256 to prevent cache poisoning"). In-crate FIPS 180-4, pinned to the NIST example vectors; no new dependency |
 | held spans | `Engine::history_images`: set after each prompt's prefill, truncated by `rollback`, cleared by `reset_to_zero` and by a slot-file restore (a file carries no image identity) |
 | `L` | `common_prefix_len_mm`: the id prefix, cut to the `start` of the first span on either side with no identical span on the other |
 | decision | `PrefixCache::decide_mm` (`decide_for` = the same with no spans) |

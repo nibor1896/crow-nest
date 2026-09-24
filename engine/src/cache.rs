@@ -1159,8 +1159,11 @@ mod tests {
         v
     }
 
+    /// a span whose 32-byte identity is `hash` spread over its first eight bytes
     fn img(start: usize, len: usize, hash: u64) -> ImageSpan {
-        ImageSpan { start, len, hash }
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&hash.to_le_bytes());
+        ImageSpan { start, len, hash: key }
     }
 
     /// the defect: same ids, DIFFERENT image. The held prompt snapshot (with its logits
