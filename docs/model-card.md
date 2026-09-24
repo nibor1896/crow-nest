@@ -182,6 +182,7 @@ The two arms run different weights, and every comparison names both: llama.cpp r
 - No sugarcoating: greedy crow-nest is 2 Pass / 5 Partial / 3 Fail, one task below the llama.cpp reference 2 / 6 / 2 on this reading, and sampling met the gate in 1 of 6 seeds (RTX 5090, 2026-09-10, engine issue #44).
 - On the C2 basis greedy met the gate in 0 of 1 seed (decision record, 2026-09-11, comment on engine issue #1).
 - Default since the C2 decision, option a, robin, 2026-09-11, comment on engine issue #1: `serve` is request decides. A request without `temperature` or with `temperature <= 0` runs greedy; a request with `temperature > 0` samples with top_p 0.8, top_k 20, presence_penalty 1.5, seed 0 (`serve.rs:1041` of the engine). Greedy stays the identity gate; the measured basis is the rows above.
+- **Superseded by crow-nest #111 (robin 2026-09-24):** an absent `temperature`, `top_p`, `top_k` or `min_p` is filled from the model card row of the request's thinking mode (thinking 1.0 / 0.95 / 20 / 0, non-thinking 0.7 / 0.8 / 20 / 0); greedy is `temperature <= 0` sent explicitly; `presence_penalty` stays 0 when absent (#91).
 
 ## Requirements
 

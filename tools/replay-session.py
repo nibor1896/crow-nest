@@ -29,7 +29,7 @@ The three sampling rows (`--row`):
 
 | row | temperature | top_p | top_k | presence_penalty | seed | what it is |
 |---|---|---|---|---|---|---|
-| `greedy` | absent | - | - | - | - | the A4 greedy path, the gate discipline |
+| `greedy` | 0 (sent) | - | - | - | - | the A4 greedy path, the gate discipline; `temperature 0` is SENT - since crow-nest #111 an absent temperature samples at the card row |
 | `card` | 0.7 | 0.8 | 20 | 1.5 | 0 | the model card's NON-thinking row (= the engine's defaults) |
 | `crow` | 1.0 | 0.95 | 20 | 1.5 | 0 | what Crow sent live (thinking-row temperature, non-thinking penalty) |
 
@@ -81,8 +81,9 @@ SESSION = "decode_out/sessions/2026-09-17-goalmode/crow-session/session.json"
 CROW_CORE = os.path.expanduser("~/.local/share/crow/cli/crow_core.py")
 
 ROWS = {
-    # name: (temperature, top_p, top_k, presence_penalty, seed) - None temperature = greedy
-    "greedy": (None, None, None, None, None),
+    # name: (temperature, top_p, top_k, presence_penalty, seed) - 0 temperature = greedy,
+    # sent explicitly: since crow-nest #111 an ABSENT temperature samples at the card row
+    "greedy": (0, None, None, None, None),
     "card": (0.7, 0.8, 20, 1.5, 0),
     "crow": (1.0, 0.95, 20, 1.5, 0),
 }
@@ -282,7 +283,9 @@ def stream_round(base, messages, tools, row, max_tokens, timeout):
     body = {"model": "crow-nest", "messages": messages, "tools": tools, "stream": True,
             "stream_options": {"include_usage": True}, "timings_per_token": True,
             "max_tokens": max_tokens}
-    if temperature is not None:
+    if temperature == 0:
+        body["temperature"] = 0     # #111: greedy is a sent temperature 0, never an absent one
+    else:
         body.update({"temperature": temperature, "top_p": top_p, "top_k": top_k,
                      "presence_penalty": presence, "seed": seed})
     req = urllib.request.Request(base + "/v1/chat/completions",
