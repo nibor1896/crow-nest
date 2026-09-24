@@ -4,6 +4,16 @@
 - Every item names its issue number in `crow-nest`, or the commit it landed in when the work had no issue.
 - Every number names its date; the machine is `docs/system-landscape.md` unless another one is named.
 
+## Unreleased
+
+### Changed
+
+- **Hot-set manifest recalibrated on real Crow traffic** (`#106`, 2026-09-24). `geo::DEFAULT_HOTSETS` is `decode_out/hotsets-M-crow0924-n160.json`, cut on the generated positions of robin's three 2026-09-23 diorama rollover archives. Held-out (that run's `session.json`, 77,271 generated positions), N 160: hit 0.401 -> 0.723, diff +0.322, 95 % CI [+0.310, +0.335]; leave-one-out 4 of 4 folds better; `decode run` 64 on the 122k held-out prompt, N 148: 32.4-32.5 -> 35.6-35.8 tok/s, cold experts/token 217.7 -> 180.5. Criteria fixed beforehand in `decode_out/hotset-0924/PREREG.md`. The gates of record keep the previous manifest (`tools/gate-linux.sh` pins it); `hf-package/` is unchanged. `docs/hotset-calibration.md`.
+
+### Added
+
+- `CROW_ROUTE_DUMP_PREFILL=<file>` (`#106`): every prefill position's routed ids, per chunk and layer (`gen.rs` `moe_run`); measurement only, 0 cost measured at 525 tok/s. `tools/session_ids.py` (Crow session -> ids + generated spans), `tools/hotset-calibrate.sh`, `tools/hotset-eval.py`, `tools/hotset-speed.sh`, `tools/hotset-from-counts.py`.
+
 ## 2026-09-23 — v0.4.0: the output corruption fixed (PLE row offset), the activation pre-scale, the tool-call grammar, the prefix cache and the registered cold tier
 
 ### Added
@@ -116,7 +126,7 @@
 
 ### Known limitations
 
-- **The hot-set sidecar needs recalibration after the PLE fix** (2026-09-23). `decode_out/hotsets-M-longctx2100-n160.json` was calibrated on the engine with the wrong PLE rows, so on the routing of the buggy engine. robin's live session after the fix (evening of 2026-09-23, bare container) decoded at 24-27 tok/s with a hot-set hit rate of 0.52-0.70, against 0.77-0.80 before the fix. No recalibrated sidecar exists on this branch.
+- **The hot-set sidecar needs recalibration after the PLE fix** (2026-09-23; done 2026-09-24, see Unreleased). `decode_out/hotsets-M-longctx2100-n160.json` was calibrated on the engine with the wrong PLE rows, so on the routing of the buggy engine. robin's live session after the fix (evening of 2026-09-23, bare container) decoded at 24-27 tok/s with a hot-set hit rate of 0.52-0.70, against 0.77-0.80 before the fix. No recalibrated sidecar exists on this branch.
 - **The bare container with the PLE fix has no multi-site number** (2026-09-23): the `plefix-bare` boot at 18:41 panicked in `serve` with `CUDA_ERROR_INVALID_CONTEXT` (`cuda.rs:252`) before the probe ran; the cause is not investigated. The 4/23 of record is the dense-overlay arm; the bare-container evidence after the fix is robin's live session (see Fixed).
 - **The parity values of record are those of the pre-2026-09-23 engine.** The activation pre-scale (`488a840`, with `CROW_QFUSE` off by default) and the PLE fix (`85a48e7`) change the numerics on purpose; `tools/gate-linux.sh` items parity8, parity512, p8tf and run32 are expected RED until a GPU gate run records new values, which has not happened. No oracle-KLD, ten-task or long-context reading exists yet for the fixed engine.
 - **The default decode path after `488a840` is not timed.** With `CROW_QFUSE` unset the cascade, hc and shared-expert fusions are off; the fusions' cost of record is 19f -0.98 ms and 19h -0.23 ms per token, so decode is expected at least about 1.2 ms per token slower than the 22.43 ms all-fused default (expected, not measured).

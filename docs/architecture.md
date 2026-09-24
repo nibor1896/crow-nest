@@ -282,7 +282,8 @@ point (7.13 has the two numbers and the measurement). `CROW_VIT=0` reserves noth
   multi-site number exists for the BARE container with the fix (that arm's boot panicked with
   `CUDA_ERROR_INVALID_CONTEXT`). The hot-set sidecar `hotsets-M-longctx2100-n160.json` was
   calibrated on the wrong rows and needs recalibration (live hit rate 0.52-0.70 after the fix
-  against 0.77-0.80 before, robin's session of 2026-09-23; not done on this branch). Lib tests
+  against 0.77-0.80 before, robin's session of 2026-09-23). Recalibrated 2026-09-24 as
+  `hotsets-M-crow0924-n160.json` (`docs/hotset-calibration.md`). Lib tests
   `tests_ple_row`.
 
 ### 2.5 Three-state manager

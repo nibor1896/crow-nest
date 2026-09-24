@@ -1,0 +1,33 @@
+self-test session                      positions  121955 generated  77271  dump counts == engine counters: True
+self-test rollover-20260923-195925     positions  174149 generated 100263  dump counts == engine counters: True
+self-test rollover-20260923-210418     positions  171748 generated 112721  dump counts == engine counters: True
+self-test rollover-20260923-225111     positions  167867 generated 100571  dump counts == engine counters: True
+
+held-out session  (generated positions = primary; all positions = old primary)
+  N 155
+    current                    gen 0.389  all 0.406  diff vs current +0.000  95% CI [+0.000, +0.000]
+    tentasks                   gen 0.412  all 0.484  diff vs current +0.023  95% CI [+0.011, +0.035]
+    P                          gen 0.685  all 0.673  diff vs current +0.296  95% CI [+0.284, +0.308]
+    G                          gen 0.713  all 0.669  diff vs current +0.324  95% CI [+0.310, +0.337]
+    G+0.1P                     gen 0.711  all 0.670  diff vs current +0.322  95% CI [+0.309, +0.335]
+    G+0.3P                     gen 0.709  all 0.672  diff vs current +0.320  95% CI [+0.307, +0.332]
+    oracle (held-out's own G)  gen 0.781  all 0.672  diff vs current +0.392  95% CI [+0.378, +0.406]
+  N 160
+    current                    gen 0.401  all 0.416  diff vs current +0.000  95% CI [+0.000, +0.000]
+    tentasks                   gen 0.426  all 0.496  diff vs current +0.025  95% CI [+0.014, +0.038]
+    P                          gen 0.698  all 0.685  diff vs current +0.297  95% CI [+0.285, +0.310]
+    G                          gen 0.723  all 0.681  diff vs current +0.322  95% CI [+0.310, +0.335]
+    G+0.1P                     gen 0.722  all 0.682  diff vs current +0.321  95% CI [+0.309, +0.334]
+    G+0.3P                     gen 0.720  all 0.684  diff vs current +0.319  95% CI [+0.307, +0.332]
+    oracle (held-out's own G)  gen 0.791  all 0.683  diff vs current +0.390  95% CI [+0.375, +0.404]
+
+leave-one-out (cut on three, score generated positions of the fourth), N 160
+  held session                    current 0.401  P 0.698  G 0.723  G+0.1P 0.722  G+0.3P 0.720
+  held rollover-20260923-195925   current 0.349  P 0.654  G 0.621  G+0.1P 0.625  G+0.3P 0.632
+  held rollover-20260923-210418   current 0.383  P 0.705  G 0.713  G+0.1P 0.713  G+0.3P 0.713
+  held rollover-20260923-225111   current 0.392  P 0.724  G 0.741  G+0.1P 0.741  G+0.3P 0.740
+
+held-out by context depth (generated positions), N 160
+       0-32000  n   9057  current 0.409  tentasks 0.492  P 0.733  G 0.758  G+0.1P 0.757  G+0.3P 0.755
+   32000-100000 n  51045  current 0.402  tentasks 0.424  P 0.695  G 0.719  G+0.1P 0.718  G+0.3P 0.716
+  100000-       n  17169  current 0.395  tentasks 0.396  P 0.688  G 0.719  G+0.1P 0.717  G+0.3P 0.714

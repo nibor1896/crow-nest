@@ -30,7 +30,7 @@ Full build, run and check instructions, moved out of the README on 2026-09-23. T
 | Rust | Rust 1.97.0, cargo 1.97.0 on the Windows box; rustc 1.98.1 from rustup stable on the Linux box | `docs/system-landscape.md:23` |
 | cudarc | 0.19.9, features `cuda-13030`, `dynamic-loading`, `nvrtc` | `docs/system-landscape.md:24` |
 | container | `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq`, 104,727,179,972 B, not in the repository, produced by `converter` | `engine/src/geo.rs:71` |
-| hot set | `decode_out/hotsets-M-longctx2100-n160.json`, tracked in the repository | `engine/src/geo.rs:72` |
+| hot set | `decode_out/hotsets-M-crow0924-n160.json`, tracked in the repository (since 2026-09-24, [hot-set calibration](hotset-calibration.md)) | `engine/src/geo.rs` `DEFAULT_HOTSETS` |
 
 ## Start
 

@@ -3037,6 +3037,14 @@ impl Engine {
         launch_v(k.f("router_top10"), t as u32, 1, 1, 512, &[
             s.rlog as u64, bitmap, s.rids as u64, s.rwts as u64, s.gu_ptrs as u64,
             s.dn_ptrs as u64, table, s.cold as u64, counters, sel_counts]);
+        // Hot-set calibration (2026-09-24): CROW_ROUTE_DUMP_PREFILL=<file> appends
+        // the routed ids of every prefill chunk, layer by layer, so the counts can
+        // be taken over chosen positions only (the tokens the model generated,
+        // the routing decode sees). Measurement only: it syncs the device per
+        // layer, and unset it costs one env lookup per chunk-layer.
+        if t > 1 {
+            route_dump_prefill(l, t, s.rids);
+        }
         // cold staging (decode-sized batches): coalesced PCIe pull into VRAM
         // slots + rewritten combo pointers; prefill chunks stay zero-copy
         let lb = self.res.lb.as_ref();
@@ -4978,4 +4986,33 @@ mod tests_ple_row {
         assert_eq!(ple_row_span(1, n_values), (2 * 36, 4, 32));
         assert_eq!(ple_row_span(2, n_values), (5 * 36, 4, 0));
     }
+}
+
+
+/// One record per (chunk, layer): u32 layer, u32 t, then t * TOPK routed ids as
+/// u16 little-endian. Written only under `CROW_ROUTE_DUMP_PREFILL` (see `moe_run`).
+unsafe fn route_dump_prefill(l: usize, t: usize, rids: Dev) {
+    use std::io::Write;
+    static SINK: std::sync::Mutex<Option<std::io::BufWriter<std::fs::File>>> =
+        std::sync::Mutex::new(None);
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| std::env::var("CROW_ROUTE_DUMP_PREFILL").ok()) else {
+        return;
+    };
+    cuda::sync();
+    let ids = cuda::dtoh_i32(rids as u64, t * TOPK);
+    let mut sink = SINK.lock().unwrap();
+    if sink.is_none() {
+        let file = std::fs::File::create(path).expect("CROW_ROUTE_DUMP_PREFILL: cannot create the file");
+        *sink = Some(std::io::BufWriter::new(file));
+    }
+    let w = sink.as_mut().unwrap();
+    let mut rec = Vec::with_capacity(8 + ids.len() * 2);
+    rec.extend_from_slice(&(l as u32).to_le_bytes());
+    rec.extend_from_slice(&(t as u32).to_le_bytes());
+    for id in ids {
+        rec.extend_from_slice(&(id as u16).to_le_bytes());
+    }
+    w.write_all(&rec).expect("CROW_ROUTE_DUMP_PREFILL: write failed");
+    w.flush().expect("CROW_ROUTE_DUMP_PREFILL: flush failed");
 }

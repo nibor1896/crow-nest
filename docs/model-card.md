@@ -41,7 +41,7 @@ Qwen3.8-Flash-Next quantized to CNQ4.5-M: one NVFP4 container at 4.5 bpw with a 
 |---|---|---|---|
 | `Qwen3.8-Flash-Next-CNQ4.5-M.cnq` | 104,727,179,972 B | `7c058e555667b1c3d8f7d804d4a3393ba3664161dd307305718d85e4f33646b7` | the container |
 | `Qwen3.8-Flash-Next-CNQ4.5-M.cnq.sidecar.jsonl` | 436,716 B | `af85905fbf46c12fa9528d22f2932b8785c55731a8c8fb013b2e91eecc6f0692` | verification sidecar: one JSON line per tensor with max and mean error against the sub-block scales, gate 0 of the measurement ladder |
-| `hotsets-M-longctx2100-n160.json` | 83,705 B | `4a408907d553518ee4421e59eae09e243db82ac0cd677557596dfdbaa4b099dc` | hot-set manifest the engine loads so adapted experts stay resident; this is the manifest to use, not a sidecar derived from the container name (engine issue #49) |
+| `hotsets-M-longctx2100-n160.json` | 83,705 B | `4a408907d553518ee4421e59eae09e243db82ac0cd677557596dfdbaa4b099dc` | hot-set manifest of the published package and of the gates of record; not a sidecar derived from the container name (engine issue #49). The repository default since 2026-09-24 is `hotsets-M-crow0924-n160.json` (37,167 B, `f83e210a21391521b145d53d41fb0308f99cf6543bada03860127544a1b6fff5`, [hot-set calibration](hotset-calibration.md)) |
 | `selftest/layer0-input.f32` | 327,680 B | `65907fe567547704dd644eea9212c4c71b0b02f2fd954f23ecd28c7f5804d974` | self-test input: the `[8][10240]` f32 layer-0 activation the golden below belongs to (see Self-test) |
 | `selftest/layer0-golden-output.f32` | 327,680 B | `e98292a0413d7aaf6825ab23e80cfae52f2424b5524f835624e9d76e90d7c705` | self-test golden: the `[8][10240]` f32 output of the UNQUANTIZED layer 0 on that input |
 | `selftest/layer3-attn-input.f32` | 81,920 B | `d2662da06b578f7c2d8a466ea5a1d74b8b13afedd271b25c16bf0237c621cbeb` | self-test input: the `[8][2560]` f32 activation the layer-`3` attention mixer sees (engine issue #69, 2026-09-18) |
@@ -235,7 +235,11 @@ The table below is the multi-site probe of 2026-09-23. It covers 23 corrupt tool
 - The 4 sites still corrupt after the fix all carry an earlier corrupt spelling in their context. llama.cpp loses three of the same four (2026-09-23).
 - Live reading (robin's Crow session, evening of 2026-09-23, bare container with the fix): 0 corruption hits in 73,887 characters of tool-call arguments. The same amount of argument text before the fix had 60 hits. This is one session, counted once.
 
-### Hot-set manifest needs recalibration (2026-09-23)
+### Hot-set manifest recalibrated (2026-09-24)
+
+Recalibrated on 2026-09-24 as `hotsets-M-crow0924-n160.json`: held-out hit rate on generated positions 0.401 -> 0.723, decode on a 122k-token prompt 32.5 -> 35.8 tok/s ([hot-set calibration](hotset-calibration.md)). The published package still ships the manifest below. The paragraph that follows is the 2026-09-23 state.
+
+#### 2026-09-23
 
 `hotsets-M-longctx2100-n160.json` was calibrated on the engine with the PLE read bug. The wrong n-gram embeddings changed the routing, so the manifest keeps the wrong experts resident for the fixed engine. robin's live session on the evening of 2026-09-23 measured a hot-set hit rate of 0.52 to 0.70, against 0.77 to 0.80 before the fix, and decode of 24 to 27 tok/s. A recalibrated manifest has not been made (2026-09-23). Until it exists, the manifest in the Files table is the only one, and the decode numbers of record above do not describe the fixed engine.
 

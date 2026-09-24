@@ -40,7 +40,7 @@
 //!
 //! - Container default `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq`.
 //! - `CROW_CNQ` overrides the container path.
-//! - Hot sets default `decode_out/hotsets-M-longctx2100-n160.json`.
+//! - Hot sets default `decode_out/hotsets-M-crow0924-n160.json` (`geo::DEFAULT_HOTSETS`).
 //! - `CROW_HOTSETS` overrides the hot set sidecar.
 //! - Prompt chunk pinned at 2048 for the whole process.
 //! - The per prompt policy `geo::apply_chunk_policy` is NOT applied.
