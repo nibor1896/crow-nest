@@ -76,6 +76,7 @@ pub mod residency;
 // what `gen` and `vit` both need, so neither has to reach into the other
 pub mod weights;
 pub mod gen;
+pub mod gguf;
 // the boot sequence the engine-loading bins share: container, CUDA context, config
 pub mod boot;
 // #94 phase 1: the metadata gate — the checkpoint's config.json parsed at boot

@@ -8,11 +8,24 @@
 
 ### Changed
 
+- **The vision tower runs llama.cpp's F16 projector by default** (`#108`, 2026-09-24). `serve` looks for `mmproj-F16.gguf` in this order: `CROW_VIT_MMPROJ` (`0` = the container), `<repo>/models/`, `$CROW_MODELS`, `~/.local/share/crow/models`. A file is used only after its header passes the check: `qwen3vl_merger`, the geometry keys, and all 334 tensors with exact dims and types. The tower's 112 linears then run in F16 through the new `gemm_f16_f32x`, and the math stays f32. Otherwise the container's NVFP4 section runs, and the `[vit]` boot line says why. New `engine/src/gguf.rs`, a std-only header reader.
+  - Cost: +611 MiB of VRAM (891,740,160 B F16 vs 250,801,920 B NVFP4 linears), about 4.8 hot-set units, taken before the planner chooses N.
+  - CPU check: each of the 333 container tensors matches its projector tensor at cos >= 0.995789. Not yet run in `serve`; robin's smoke check is in #108.
+- **Every image gets 1,024 to 1,280 visual tokens** (`#107`, 2026-09-24). `CROW_VIT_MIN_TOKENS` (default 1024) and `CROW_VIT_MAX_TOKENS` (default 1280) set the window.
+  - Before: the preprocessor's 64-token floor and a 1,024-token cap. Crow's renders reached the model at 527 to 620 tokens, 176 at the least (engine.log 2026-09-23). llama.cpp's `--image-min-tokens 1024` point gives the same 1000x560 / 1280x720 PNGs 1,032 tokens, and this build now does too (unit-tested).
+  - The tower scratch and the `[budget]` vit reserve follow the cap: 285.6 MiB (+57.1), reserve 334.5 MiB at 200k.
+  - Stale "4,096 visual tokens / 400 / 413" claims fixed in the `vit.rs` module doc, `docs/env.md` and `docs/architecture.md` 7.11 and 7.13.
 - **Hot-set manifest recalibrated on real Crow traffic** (`#106`, 2026-09-24). `geo::DEFAULT_HOTSETS` is `decode_out/hotsets-M-crow0924-n160.json`, cut on the generated positions of robin's three 2026-09-23 diorama rollover archives. Held-out (that run's `session.json`, 77,271 generated positions), N 160: hit 0.401 -> 0.723, diff +0.322, 95 % CI [+0.310, +0.335]; leave-one-out 4 of 4 folds better; `decode run` 64 on the 122k held-out prompt, N 148: 32.4-32.5 -> 35.6-35.8 tok/s, cold experts/token 217.7 -> 180.5. Criteria fixed beforehand in `decode_out/hotset-0924/PREREG.md`. The gates of record keep the previous manifest (`tools/gate-linux.sh` pins it); `hf-package/` is unchanged. `docs/hotset-calibration.md`.
 
 ### Added
 
 - `CROW_ROUTE_DUMP_PREFILL=<file>` (`#106`): every prefill position's routed ids, per chunk and layer (`gen.rs` `moe_run`); measurement only, 0 cost measured at 525 tok/s. `tools/session_ids.py` (Crow session -> ids + generated spans), `tools/hotset-calibrate.sh`, `tools/hotset-eval.py`, `tools/hotset-speed.sh`, `tools/hotset-from-counts.py`.
+
+### Fixed
+
+- **The vit fc1 GEMM wrote past its row count** (`#109`, 2026-09-24). `gemm_fp4_f32x` had no row guard. fc1 has 4,304 = 67 x 64 + 16 rows, so the last 64-row tile decoded 48 rows past the weight and stored them into the next token's first 48 fc1 outputs, racing that token's own tile. Decode and store are now bounded. Valid rows keep the same product tree.
+  - New GPU test `vit::gemm_vit` (`--ignored`). Without the guard: relative error 1.121e4 at token 65, row 45. With it: < 1e-3 on all seven tower shapes, 5 reps each, fp4 and f16.
+  - What that did to served images is not measured.
 
 ## 2026-09-23 — v0.4.0: the output corruption fixed (PLE row offset), the activation pre-scale, the tool-call grammar, the prefix cache and the registered cold tier
 
