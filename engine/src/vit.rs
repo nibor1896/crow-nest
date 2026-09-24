@@ -1278,6 +1278,57 @@ pub fn prep_image_with(bytes: &[u8], b: &VitBudget) -> Result<ImagePrep, String>
 /// one image's grid (t, hp, wp) — `image_grid_thw` row
 pub type Grid = (usize, usize, usize);
 
+/// - #114: one image's place in the EXPANDED prompt and its content identity
+/// - `start..start + len` are the rows its visual tokens occupy (all `IMAGE_PAD` ids)
+/// - `hash` is `image_key` of the image bytes, the key the tower-output cache uses
+/// - the prefix cache compares these next to the ids: `IMAGE_PAD` ids alone say
+///   nothing about WHICH image sits there (`cache::common_prefix_len_mm`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageSpan {
+    pub start: usize,
+    pub len: usize,
+    pub hash: u64,
+}
+
+/// - #114: the content identity of one image: a 64-bit hash of its encoded bytes
+/// - the ONE definition, shared by the tower-output cache (`Vit::build_plan`) and the
+///   prefix cache's image spans, so both agree on what "the same image" is
+/// - `DefaultHasher::new()` is SipHash-1-3 with fixed keys: stable within a process,
+///   which is all either cache needs (neither outlives the process)
+pub fn image_key(bytes: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// - #114: the spans of the images in the EXPANDED prompt, from the RENDERED ids (one
+///   `IMAGE_PAD` per image), each image's visual token count and its hash
+/// - the same walk `expand_ids` does, so `start` is exactly where the splice puts it
+pub fn image_spans(ids: &[u32], counts: &[usize], hashes: &[u64]) -> Result<Vec<ImageSpan>, String> {
+    if counts.len() != hashes.len() {
+        return Err(format!("{} image counts but {} image hashes", counts.len(), hashes.len()));
+    }
+    let mut out = Vec::with_capacity(counts.len());
+    let mut row = 0usize;
+    let mut k = 0usize;
+    for &id in ids {
+        if id as i64 == IMAGE_PAD {
+            let len = *counts.get(k).ok_or("more image_pad tokens than images")?;
+            out.push(ImageSpan { start: row, len, hash: hashes[k] });
+            row += len;
+            k += 1;
+        } else {
+            row += 1;
+        }
+    }
+    if k != counts.len() {
+        return Err("more images than image_pad tokens".into());
+    }
+    Ok(out)
+}
+
 /// the per-request vision plan: where the visual embeddings land in the
 /// (already expanded) prompt id list, the embeddings themselves, and the
 /// mrope delta the decode path needs
@@ -1298,6 +1349,9 @@ pub struct VisionPlan {
     pub n_visual: usize,
     /// mrope_position_deltas of the oracle (max_pos + 1 - seq_len)
     pub delta: i64,
+    /// #114: each image's rows in `ids` and its content hash, message order: what the
+    /// prefix cache compares so two prompts are equal only if their images are
+    pub spans: Vec<ImageSpan>,
 }
 
 /// expand every IMAGE_PAD token (one per image, template order) into
@@ -1459,12 +1513,10 @@ impl Vit {
             let _ = std::fs::create_dir_all(dir);
         }
         let mut misses = 0usize;
+        let mut hashes: Vec<u64> = Vec::with_capacity(images.len());
         for (i, bytes) in images.iter().enumerate() {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            bytes.hash(&mut hasher);
-            let key = hasher.finish();
+            let key = image_key(bytes);
+            hashes.push(key);
             if let Some((grid, n_visual, rows)) = self.image_cache.get(&key) {
                 tracing::info!(target: "vit", "[vit-cache] image {i}: HIT grid {grid:?}, {n_visual} visual tokens");
                 infos.push((*grid, *n_visual));
@@ -1499,6 +1551,7 @@ impl Vit {
         );
         let counts: Vec<usize> = infos.iter().map(|(_, n)| *n).collect();
         let expanded = expand_ids(ids, &counts)?;
+        let spans = image_spans(ids, &counts, &hashes)?;
         // walk the expanded ids, mark the image rows
         let mut types = vec![0u8; expanded.len()];
         let mut map = vec![-1i32; expanded.len()];
@@ -1528,6 +1581,7 @@ impl Vit {
             grids: infos.iter().map(|(g, _)| *g).collect(),
             n_visual: flat as usize,
             delta,
+            spans,
         })
     }
 }
@@ -2457,5 +2511,44 @@ mod gemm_vit {
                 eprintln!("gemm_vit {rows}x{k} t {t}: fp4 and f16 within 1e-3 of the f64 host, 5 reps each");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod image_identity {
+    //! #114: what the prefix cache compares next to the ids of an image
+    use super::*;
+
+    const P: u32 = IMAGE_PAD as u32;
+
+    /// the spans land exactly where `expand_ids` puts the visual tokens
+    #[test]
+    fn the_spans_are_the_rows_expand_ids_fills() {
+        let ids = [1u32, 2, P, 3, P, 4];
+        let counts = [4usize, 2];
+        let spans = image_spans(&ids, &counts, &[11, 22]).unwrap();
+        assert_eq!(
+            spans,
+            vec![ImageSpan { start: 2, len: 4, hash: 11 }, ImageSpan { start: 7, len: 2, hash: 22 }]
+        );
+        let expanded = expand_ids(&ids, &counts).unwrap();
+        for sp in &spans {
+            assert!(expanded[sp.start..sp.start + sp.len].iter().all(|&v| v == P));
+            assert_ne!(expanded[sp.start - 1], P);
+        }
+        assert!(image_spans(&ids, &[4], &[11]).is_err());
+        assert!(image_spans(&ids, &[4, 2, 1], &[1, 2, 3]).is_err());
+        assert!(image_spans(&ids, &[4, 2], &[1]).is_err());
+    }
+
+    /// two images that differ in one byte get different keys; the same bytes the same key
+    #[test]
+    fn the_image_key_is_the_content_of_the_bytes() {
+        let red = vec![0x89u8, b'P', b'N', b'G', 255, 0, 0];
+        let mut green = red.clone();
+        green[4] = 0;
+        green[5] = 255;
+        assert_eq!(image_key(&red), image_key(&red.clone()));
+        assert_ne!(image_key(&red), image_key(&green));
     }
 }
