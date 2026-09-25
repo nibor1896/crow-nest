@@ -23,7 +23,7 @@
 | Engine | one model, one GPU, Rust + thin CUDA kernels |
 | Model | Qwen3.8-Flash-Next, NVFP4 container CNQ4.5-M |
 | API | OpenAI-compatible HTTP, client [Crow](https://github.com/nibor1896/Crow) |
-| Release | v0.5.0, [CHANGELOG.md](CHANGELOG.md) |
+| Release | v0.6.0, [CHANGELOG.md](CHANGELOG.md) |
 
 ## Status
 
@@ -36,6 +36,8 @@
 | Vision | llama.cpp's F16 projector `mmproj-F16.gguf` when found, 1,024 to 1,280 visual tokens per image (#107, #108) |
 | Sampling | absent `temperature` = model card row of the thinking mode, never greedy (#111) |
 | Requests | `max_completion_tokens` (#112), body up to 100 MiB (#113) |
+| GPU sharing | serve lends ~1.7 GiB of scratch VRAM to Crow's renderer while idle (#117) |
+| Prefix cache | a short side request parks the main conversation, the next main turn stays warm (#118) |
 | Full table | [docs/status.md](docs/status.md) |
 
 ## Requirements

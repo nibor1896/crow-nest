@@ -209,6 +209,21 @@ added to the planner's `pending` bytes, so N is chosen with it and an image requ
 the card full. It is named on its own `[budget]` line and costs N 157 -> 155 at the serve operating
 point (7.13 has the two numbers and the measurement). `CROW_VIT=0` reserves nothing.
 
+It carries a **render reserve** too (#110, robin's decision 2026-09-25): `CROW_RENDER_RESERVE_MB`,
+default 0 since the #110 follow-up (1536 MiB refused the boot on the 46 GiB pinned cap: at N=150 the
+cold tier is 45.61 GiB, so N may not drop below 147), is GRANTED best-effort by
+`manager::grant_render_reserve` (the whole request when both budgets hold, else the largest multiple of
+a hot-set unit that fits, down to 0; one `[budget] render reserve: requested X MiB, granted Y MiB — <binding
+budget>` line; never a boot refusal). The granted part is added to `pending` and never
+allocated, so it stays FREE for a co-resident GPU client — Crow's `render_page`, whose GPU gate
+needs 512 MiB and which fell back to SwiftShader in every capture while serve left 73-185 MiB
+free (2026-09-23/24). 1536 MiB is Crow's gate with its browser panel open (Crow #279), above
+llama.cpp's default per-device `--fit-target` margin of 1024 MiB. It is
+named on its own `[budget] render reserve` line with its cost in hot-set units (1536 MiB = 12.1
+units, about 12 hot experts per layer), and the post-plan check below requires
+`POST_PLAN_FLOOR + reserve`. Its decode cost is estimated at about -4 % and NOT measured
+(2026-09-25); dynamic lending of hot units instead of a fixed reserve is out of scope (#110).
+
 ### 2.2 Expert residency (per layer, data-driven)
 
 - Residency sets are **per-layer top-N by selection frequency** — per-layer ranking, not
@@ -2108,7 +2123,9 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 - `SLOTS = 1` (`cache.rs:162`): one slot per process, and it is the prompt slot.
 - The last generated id is never fed back, so it is not in `history` and not in `pos`.
-- ONE held conversation per process (M1): a request that shares no prefix replaces it.
+- ONE held conversation per process (M1): a request that shares no prefix replaces it. Since
+  #118 (7.16) a short one PARKS it instead: the held conversation's snapshots stay and the KV
+  rows the new request overwrites are kept in host RAM.
 - The M1 after-answer point is gone from `chat_stream`; the block below says why.
 
 **The after-answer snapshot was never the reuse case, and is DROPPED (M2b, #36):**
@@ -3544,7 +3561,9 @@ took after the plan) are held beside them and handed to `enable_dev_sampler` on 
 was chosen, with its side of the bus: `post-plan allocations held at boot: vit tower scratch
 228.5 MB + vit mrope span 48.8 MB + device sampler 0.3 MB = 277.6 MB VRAM; host RAM only (never on
 the card): vit image cache 256.0 MB`, followed by `free VRAM after load 0.54 GiB >= floor 0.25 GiB`
-(`manager::POST_PLAN_FLOOR`, what the decode graph and the driver pools still have to fit in). The
+(`manager::POST_PLAN_FLOOR`, what the decode graph and the driver pools still have to fit in; since
+#110 the floor is `POST_PLAN_FLOOR + granted render reserve`; with 1536 MiB granted the line reads
+`>= floor 1.75 GiB (post-plan 0.25 + render reserve 1.50)`, section 2.1; default 0). The
 prefix-cache snapshots (3 x 124.6 MiB) were the issue's prime suspect and they are **host RAM**, not
 VRAM — `Vec<f32>` per `cache.rs`'s memory section — so they stay out of the VRAM total; subtracting
 them would have cost about 150 hot experts for nothing.
@@ -3754,6 +3773,97 @@ is not exhausted), more VRAM for the hot set (the planner already maximizes N ag
 KV budget; N=155 with 7 slots surrendered to the trickle), or a cold tier that is smaller per expert
 (a low-bit tier, which is not bit-identical and therefore not this).
 
+### 7.15 VRAM lending to a co-resident renderer (#117, 2026-09-25)
+
+Crow's `render_page` renders on the GPU only (Crow #293) and needs 512 MiB free (1536 with its
+browser panel, Crow #279); serve leaves about 0.57 GiB free after load and less during a request.
+A static reserve (#110) does not boot on robin's machine (the 46 GiB host pinned cap binds, see
+2.1). While Crow renders, the engine is idle, so serve LENDS the physical memory of the buffers
+that hold no state between requests and takes it back afterwards.
+
+| part | where | what |
+|---|---|---|
+| lendable allocation | `cuda::try_alloc_lendable` / `alloc_lendable` | `cuMemAddressReserve` once, then `cuMemCreate` + `cuMemMap` + `cuMemSetAccess` + zero; below `LEND_MIN_BYTES` (8 MiB) or with `CROW_VRAM_LEND=0` plain `cuMemAlloc` |
+| lend | `cuda::lend_release(target)` | `cuCtxSynchronize`, then `cuMemUnmap` + `cuMemRelease` largest first until the target is reached; the VA stays reserved |
+| return | `cuda::lend_remap()` | new physical memory mapped at the SAME address, zeroed (the boot state); a refusal leaves the rest lent and is retried |
+| state machine | `lend::LendGate`, `lend::Parked`, `lend::parse_lend` | idle / lent, no double lend, ttl (default 120 s, max 600 s), retry every 1 s after a failed return, FIFO of parked engine requests |
+| endpoints | `serve.rs` `vram_lend`, `vram_return`, `vram_status` | `POST /v1/crow/vram/lend {"mib","ttl_s"}`, `POST /v1/crow/vram/return`, `GET /v1/crow/vram` (engine/README endpoint table) |
+
+- **Lendable (tier 1, `lend::tier1_plan`):** the #10b scratch persist and union regions (every
+  buffer written in the layer body before it is read, the liveness audit in `Scratch::alloc`'s doc),
+  the QSA `pool_raw/nrm/rot` and `scores` scratch, the cold staging `Stage.gu/dn` (written by
+  `stage_cold` before every read), the vit scratch buffers of at least 8 MiB (rewritten by `run` per
+  image; the scalar slots are constants and stay), the mrope span pair (rewritten by `begin_vision`).
+  NOT lendable: KV, QSA key ring and pooled cache, GDN state, rope table, hot experts and their pointer
+  table, PLE row cache, dense weights, `logits`/`argmax`, the sampler, every parameter slot.
+- **Why VMM:** the decode CUDA graph bakes these buffers' raw addresses (`decode_step`, captured
+  once). `cuMemFree` + `cuMemAlloc` could move them; unmapping only the physical memory keeps the VA,
+  so the graph and every stored pointer stay valid (torch_memory_saver, SGLang
+  `release_memory_occupation`, cited in #117).
+- **Idle gate:** serve's accept loop is single threaded, so a lend is read only after the request in
+  flight ended. While lent the loop polls the listener with the ttl left; a chat or `/slots/0`
+  request is read and parked, then served in arrival order right after the return (vLLM #28714 is the
+  failure this prevents). `/health`, `/props`, `/slots` answer at once.
+- **Tier 2 (not built):** evicting hot units and restoring them from the container on disk. Tier 1
+  already lends 1698 MiB at the serve point, above the 1.6 GiB bar of #117.
+
+Measured 2026-09-25, RTX 5090, worktree build of #117 (on top of `93cd2c0`), serve default settings, n=1 run:
+
+| check | result |
+|---|---|
+| boot | N 160 -> 150 as before, `free VRAM after load 0.57 GiB`, `1698 MiB lendable in 18 VMM allocation(s)` |
+| free VRAM (nvidia-smi) | idle 574 MiB -> lent 2272 MiB -> returned 574 MiB |
+| lend / return wall | 4.0 ms release (curl 4.4 ms) / 9.6 ms remap (curl 9.7 ms); ttl return 1.4 ms |
+| headless Chromium while lent | `ANGLE (NVIDIA, Vulkan 1.4.341 (NVIDIA NVIDIA GeForce RTX 5090 (0x00002B85)), NVIDIA)` |
+| parked request | a chat sent while lent waited, was served after the return (200), text identical to the pre-lend prefix |
+| decode, 3 identical seeded requests (136 tok) | before 56.2 / 56.2 / 56.1 tok/s, after one lend/return 58.0 / 56.2 / 56.2 (mean +1.1 %); all nine answers byte-identical |
+| image request after a return | 200, the tower ran on the remapped scratch; no CUDA error in the whole log |
+
+Live with Crow in the 2026-09-25 lighthouse run: 1698 MiB lent, lend 1-5 ms, return 1-8 ms.
+
+### 7.16 Parking the held conversation for a short unrelated request (#118, 2026-09-25)
+
+A snapshot (7.6) holds the recurrent state, not the KV rows. The KV rows sit in the ONE KV buffer,
+addressed by position, so a cold request that writes rows `0..n` leaves every snapshot of the held
+conversation over rows it no longer has, and until #118 the cold start dropped them all. Measured
+2026-09-25 (engine.log, serve `57773d5`): Crow's judge (#266 in Crow) sent 4,659 fresh ids between two
+main turns; the snapshots `[116900, 116202, 115944]` went to `[4659, None, None]` and the next main
+turn prefilled 118,282 of 118,282 ids in 139.5 s. The same happened 37 times that day, 4,590 s in total.
+
+| step | where | what |
+|---|---|---|
+| plan | `PrefixCache::plan_cold` | the held conversation is PARKED when its newest snapshot `T` survives the new request (`min(n, T) <= R`, `R = min(T, CROW_PREFIX_PARK_ROWS)`, default 8192); a conversation parked earlier is KEPT when it saves more; else DROP (the old rule) |
+| park | `PrefixCache::cold_start` | KV rows `0..R` and pooled QSA blocks `0..R/4+1` device to host (`slot::kv_row_order`, the #32 slot-file walk), `history` and image spans kept, the slots marked `parked`, then `reset_to_zero` |
+| side request | `claim` | its snapshot takes an empty or live slot first, then the smallest parked slot, never the parked conversation's last one |
+| decide | `PrefixCache::decide_mm` | the prefix rule against the held AND the parked history; a parked slot `P` counts only while `min(dirty, P) <= R` (`dirty` = the highest row written since the park, `rolled_back` counts rows written before a rollback) |
+| unpark | `PrefixCache::unpark`, then `rollback` | rows and blocks host to device, `history` and spans back, the parked slots made live, the side conversation's slots dropped |
+
+- **Why the output is unchanged (7.5):** rows `0..R` and blocks `0..R/4+1` come back byte for byte;
+  rows `R..P` were never written while `dirty <= R`; rows `>= P` are unreachable (7.6); the recurrent
+  state is the snapshot's. The extra pooled block covers the decode graph's write to block
+  `done_blocks`.
+- **Cost:** no VRAM. Host RAM 113,252,352 B = 108.0 MiB at fp8 KV and the default cap (bf16 204.0 MiB),
+  allocated at the first park, next to the 373.8 MiB of the three snapshots. The 37 side requests of
+  2026-09-25 wrote at most 4,947 rows.
+- **Comparison:** llama.cpp saves the whole sequence state of a slot to host RAM when a new prompt
+  would drop more than half of it (`--cache-ram`, default 8192 MiB, PR #16391); vLLM (automatic prefix
+  caching, LRU free queue) and SGLang (RadixAttention, LRU leaf eviction) keep other prefixes in paged
+  KV. Here the rest of the KV stays in VRAM, so only the overwritten rows are copied: 108 MiB instead
+  of 1.34 GiB at 117k.
+- **Not covered:** the side conversation itself is not kept across the main turn (the judge stays
+  cold, about 5.5 s per round).
+
+Measured 2026-09-25 20:54-20:56 local, RTX 5090, serve at `0263990` with defaults (`tools/serve-linux.sh`),
+seed 1118, `reasoning_effort none`, card non-thinking row; main = an 8,640-token ledger, side = an unrelated
+1,339-token prompt, then main + its answer + one user turn:
+
+| check | result |
+|---|---|
+| side request | `COLD ... held conversation parked (snapshots [Some(8640), None, None], KV rows 8192, DtoH 43.391 ms)` at the first park (host buffer allocated), 10.181 ms at the second |
+| next main turn | `WARM L 8642 (held 1370), P 8640 ... prefill 28 of 8668 tok ... parked conversation restored (KV rows 8192, HtoD 10.190 ms)`; prefill 196.6 ms against 8,312-9,239 ms for the cold 8,640-token prompt; with a 32-token answer `prefill 37 of 8677`, HtoD 9.111 ms |
+| output | the main turn's answer byte-identical with and without the side request, for a 2-token and a 32-token answer |
+| long side request | 12,087 tokens (longer than the held conversation): the snapshots are dropped, the old rule |
+
 ## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18)
 
 Sections 0 to 7 say what the engine must do. This section says how the crate is put together,
@@ -3810,7 +3920,7 @@ and module load, device alloc/copy/free, the active-stream register, the CUDA-Gr
 points loaded by hand out of `nvcuda.dll` / `libcuda.so.1` (cudarc 0.19.9 binds them for CUDA
 11.4–11.8 only), pinned host memory (`Pinned`), and the host-RAM reading the pinned budget is
 derived from (`free_physical_ram_parts` → `HostRam`, `other_cuda_fd`), and the request-scoped
-allocation contract of TASK K (`try_alloc_zeroed`, `AllocFailed`, `RequestScope`). Surface: 69 `pub fn`
+allocation contract of TASK K (`try_alloc_zeroed`, `AllocFailed`, `RequestScope`), and since #117 the lendable VMM allocations (`try_alloc_lendable`, `lend_release`, `lend_remap`, `lendable_bytes`; `lend.rs` holds the pure state machine, 7.15). Surface: 69 `pub fn`
 plus `Ctx`, `Module`, `Pinned`, `HostRam`. Depends on nothing in the crate and may never
 depend on anything: it is the bottom. Every `#[cfg(windows)]` / `#[cfg(unix)]` split in the
 crate lives here except three: `cnq.rs`'s container mapping, `gen.rs`'s `pid_alive`, and the
@@ -3856,7 +3966,8 @@ count from `geo` and the context, `ThreeStates::allocate` is the planner with th
 clamp loop (VRAM lowers N, the host pinned budget raises it), `derive_host_pinned_budget` and
 `ram_margin_bytes` are the host-memory half of that loop (8.8), and `kv_row_ptr` is the KV
 addressing. Surface: 6 `pub fn` plus `StateSizes`, `ThreeStates`, `AllocReport`, the consts
-`SAFETY` and `N_MIN`. Depends on `cuda` and `geo`; it may not know about the container or the
+`SAFETY` and `N_MIN`; since #110 also the render reserve (`render_reserve_bytes`, `grant_render_reserve`,
+`planner_pending`, `post_plan_floor`, `headroom_ok`). Depends on `cuda` and `geo`; it may not know about the container or the
 kernels.
 
 **`sample.rs`** — the host-side sampling reference and the sampler profile: `Rng` (the xorshift
@@ -3992,7 +4103,9 @@ not line numbers — the files move.
    7. the `[stage]` / `[trickle]` / `[qsa]` / `[attn]` / `[gdn]` / `[hc]` / `[pf-gemm-b]` provenance
       lines and the `Stage` device allocations.
    8. `ThreeStates::allocate` — the two-sided clamp loop, then KV, QSA, GDN and rope allocation.
-      The planner's `pending` bytes are `LAUNCH_SLACK + ring_reserve + vit_reserve` (`gen.rs:976-977`):
+      The planner's `pending` bytes are `LAUNCH_SLACK + ring_reserve + vit_reserve + render_reserve`
+      (`manager::planner_pending`, called in `gen.rs` `Engine::load`; the render reserve is #110's, granted inside `allocate` by `grant_render_reserve`,
+      kept free for a co-resident renderer and named on its own `[budget]` line, 2.1):
       `vit::reserve_bytes(cfg.context)` enters here, with its own `[budget]` line, so the image path
       is subtracted BEFORE N is chosen (7.13, TASK K).
    9. `Residency::build` — hot set, the RAM gate, the VRAM hot slabs, the pinned cold tier

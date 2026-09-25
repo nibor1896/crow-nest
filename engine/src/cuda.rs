@@ -476,6 +476,12 @@ pub unsafe fn alloc_zeroed(bytes: usize) -> CUdeviceptr {
 }
 
 pub unsafe fn free_dev(d: &mut CUdeviceptr) {
+    // #117: a lendable (VMM) allocation is torn down as one, never cuMemFree'd
+    if *d != 0 && free_lendable(*d) {
+        live_allocs().lock().unwrap().remove(d);
+        *d = 0;
+        return;
+    }
     if *d != 0 {
         ck_call("cuMemFree_v2", sys::cuMemFree_v2(*d));
         live_allocs().lock().unwrap().remove(&(*d as u64));
@@ -1296,4 +1302,243 @@ mod alloc_failure {
         drop(outer);
         assert!(!in_request());
     }
+}
+
+// ---------- #117: lendable device memory (CUDA VMM, the VA survives a lend) ----------
+//
+// serve lends VRAM to a co-resident GPU client (Crow's render_page) while it is
+// idle. The buffers it lends hold NO state between requests (#117 lists them),
+// but their raw addresses are baked into the captured decode graph and stored
+// in `Scratch`/`Stage`/`Vit`. So they are allocated through the VMM API: the
+// virtual range is reserved once, and a lend only unmaps + releases the
+// PHYSICAL memory (`cuMemUnmap` + `cuMemRelease`); the return creates new
+// physical memory and maps it at the SAME address (`cuMemCreate` + `cuMemMap`
+// + `cuMemSetAccess`), then zeroes it, which is the state `alloc_zeroed` left at
+// boot. torch_memory_saver (SGLang's release/resume_memory_occupation) does the
+// same. Allocations below `LEND_MIN_BYTES` stay on `cuMemAlloc`: the 2 MiB
+// granularity would waste more than they lend.
+
+/// smallest allocation that goes through VMM (below it the rounding waste is > 25 %)
+pub const LEND_MIN_BYTES: usize = 8 << 20;
+
+/// `CROW_VRAM_LEND` (#117): unset or anything but `0` = lendable buffers go
+/// through VMM and serve's lend endpoints work; `0` = every buffer stays on
+/// `cuMemAlloc` exactly as before and the endpoints answer 501. Read once.
+pub fn lend_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CROW_VRAM_LEND").as_deref() != Ok("0"))
+}
+
+struct Lendable {
+    va: u64,
+    /// mapped bytes (the request rounded up to the granularity)
+    size: usize,
+    what: String,
+    /// `None` while the physical memory is lent
+    handle: Option<sys::CUmemGenericAllocationHandle>,
+}
+
+fn lendables() -> &'static Mutex<Vec<Lendable>> {
+    static M: OnceLock<Mutex<Vec<Lendable>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// `bytes` rounded up to a multiple of `g` (a power of two or any positive size)
+pub const fn round_up(bytes: usize, g: usize) -> usize {
+    bytes.div_ceil(g) * g
+}
+
+unsafe fn vmm_prop() -> sys::CUmemAllocationProp {
+    let mut prop: sys::CUmemAllocationProp = std::mem::zeroed();
+    prop.type_ = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type_ = sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE; // device 0 (zeroed id)
+    prop
+}
+
+/// the minimum VMM granularity of device 0 (2 MiB on the RTX 5090, read once)
+///
+/// # Safety
+///
+/// - a CUDA context must be current
+pub unsafe fn vmm_granularity() -> usize {
+    static G: OnceLock<usize> = OnceLock::new();
+    *G.get_or_init(|| {
+        let prop = vmm_prop();
+        let mut g: usize = 0;
+        ck(sys::cuMemGetAllocationGranularity(
+            &mut g,
+            &prop,
+            sys::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+        ));
+        g.max(1)
+    })
+}
+
+/// physical memory of `size` bytes mapped read-write at `va`, or the failing call
+unsafe fn vmm_map(va: u64, size: usize) -> Result<sys::CUmemGenericAllocationHandle, (&'static str, CUresult)> {
+    let prop = vmm_prop();
+    let mut h: sys::CUmemGenericAllocationHandle = 0;
+    let r = sys::cuMemCreate(&mut h, size, &prop, 0);
+    if r != CUresult::CUDA_SUCCESS {
+        return Err(("cuMemCreate", r));
+    }
+    let r = sys::cuMemMap(va as CUdeviceptr, size, 0, h, 0);
+    if r != CUresult::CUDA_SUCCESS {
+        let _ = sys::cuMemRelease(h);
+        return Err(("cuMemMap", r));
+    }
+    let mut desc: sys::CUmemAccessDesc = std::mem::zeroed();
+    desc.location = prop.location;
+    desc.flags = sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    let r = sys::cuMemSetAccess(va as CUdeviceptr, size, &desc, 1);
+    if r != CUresult::CUDA_SUCCESS {
+        let _ = sys::cuMemUnmap(va as CUdeviceptr, size);
+        let _ = sys::cuMemRelease(h);
+        return Err(("cuMemSetAccess", r));
+    }
+    Ok(h)
+}
+
+/// #117: `try_alloc_zeroed` for a buffer that holds no state between requests.
+/// With lending on and at least `LEND_MIN_BYTES`, a VMM allocation whose
+/// physical memory serve can lend; otherwise exactly `try_alloc_zeroed`.
+/// Freed through `free_dev` like any other buffer.
+///
+/// # Safety
+///
+/// - a CUDA context must be current, as for every other call in this module
+pub unsafe fn try_alloc_lendable(what: &str, bytes: usize) -> Result<CUdeviceptr, AllocFailed> {
+    if !lend_enabled() || bytes < LEND_MIN_BYTES {
+        return try_alloc_zeroed(what, bytes);
+    }
+    let size = round_up(bytes, vmm_granularity());
+    let fail = |r: CUresult| AllocFailed { what: what.to_string(), bytes: size, free: free_vram_bytes(), result: format!("{r:?}") };
+    let mut va: CUdeviceptr = 0;
+    let r = sys::cuMemAddressReserve(&mut va, size, 0, 0, 0);
+    if r != CUresult::CUDA_SUCCESS {
+        return Err(fail(r));
+    }
+    let h = match vmm_map(va as u64, size) {
+        Ok(h) => h,
+        Err((_, r)) => {
+            let _ = sys::cuMemAddressFree(va, size);
+            return Err(fail(r));
+        }
+    };
+    ck(sys::cuMemsetD8_v2(va, 0, size));
+    live_allocs().lock().unwrap().insert(va, size);
+    lendables().lock().unwrap().push(Lendable { va, size, what: what.to_string(), handle: Some(h) });
+    Ok(va)
+}
+
+/// `try_alloc_lendable` that ends the call on failure, with the name in the message
+///
+/// # Safety
+///
+/// - a CUDA context must be current
+pub unsafe fn alloc_lendable(what: &str, bytes: usize) -> CUdeviceptr {
+    match try_alloc_lendable(what, bytes) {
+        Ok(d) => d,
+        Err(e) => e.raise(),
+    }
+}
+
+/// true (and torn down) when `d` is a lendable allocation
+unsafe fn free_lendable(d: CUdeviceptr) -> bool {
+    let mut v = lendables().lock().unwrap();
+    let Some(i) = v.iter().position(|l| l.va == d) else { return false };
+    let l = v.remove(i);
+    if let Some(h) = l.handle {
+        ck_call("cuMemUnmap", sys::cuMemUnmap(d, l.size));
+        ck_call("cuMemRelease", sys::cuMemRelease(h));
+    }
+    ck_call("cuMemAddressFree", sys::cuMemAddressFree(d, l.size));
+    true
+}
+
+/// (bytes of every lendable allocation, bytes of them currently lent, count)
+pub fn lendable_bytes() -> (u64, u64, usize) {
+    let v = lendables().lock().unwrap();
+    let total = v.iter().map(|l| l.size as u64).sum();
+    let lent = v.iter().filter(|l| l.handle.is_none()).map(|l| l.size as u64).sum();
+    (total, lent, v.len())
+}
+
+/// what one lend or return did
+#[derive(Debug, Clone, Default)]
+pub struct LendOutcome {
+    pub regions: usize,
+    pub bytes: u64,
+    pub ms: f64,
+    /// the names, largest first, as the log line prints them
+    pub what: Vec<String>,
+}
+
+/// #117: release the physical memory of mapped lendable allocations, largest
+/// first, until at least `target` bytes are free or none is left. The whole
+/// context is synchronized first: no stream may still read a buffer that is
+/// about to vanish (vLLM #28714 is what happens otherwise). The caller (serve)
+/// guarantees that no request runs until `lend_remap`.
+///
+/// # Safety
+///
+/// - a CUDA context must be current; no kernel may touch a lendable buffer
+///   until `lend_remap` returned `Ok`
+pub unsafe fn lend_release(target: u64) -> LendOutcome {
+    let t = std::time::Instant::now();
+    ck(sys::cuCtxSynchronize());
+    let mut v = lendables().lock().unwrap();
+    let mut order: Vec<usize> = (0..v.len()).filter(|&i| v[i].handle.is_some()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(v[i].size));
+    let mut out = LendOutcome::default();
+    for i in order {
+        if out.bytes >= target {
+            break;
+        }
+        let l = &mut v[i];
+        let h = l.handle.take().unwrap();
+        ck_call("cuMemUnmap", sys::cuMemUnmap(l.va as CUdeviceptr, l.size));
+        ck_call("cuMemRelease", sys::cuMemRelease(h));
+        out.regions += 1;
+        out.bytes += l.size as u64;
+        out.what.push(format!("{} {:.1} MiB", l.what, l.size as f64 / (1u64 << 20) as f64));
+    }
+    out.ms = t.elapsed().as_secs_f64() * 1e3;
+    out
+}
+
+/// #117: map new physical memory under every lent allocation, at the SAME
+/// address, and zero it (the boot state). On a refusal (another process holds
+/// the VRAM) the allocations mapped so far stay mapped, the rest stay lent, and
+/// the error names the first one refused; calling again continues.
+///
+/// # Safety
+///
+/// - a CUDA context must be current
+pub unsafe fn lend_remap() -> Result<LendOutcome, AllocFailed> {
+    let t = std::time::Instant::now();
+    let mut v = lendables().lock().unwrap();
+    let mut out = LendOutcome::default();
+    for l in v.iter_mut().filter(|l| l.handle.is_none()) {
+        match vmm_map(l.va, l.size) {
+            Ok(h) => {
+                l.handle = Some(h);
+                ck(sys::cuMemsetD8_v2(l.va as CUdeviceptr, 0, l.size));
+                out.regions += 1;
+                out.bytes += l.size as u64;
+                out.what.push(l.what.clone());
+            }
+            Err((call, r)) => {
+                return Err(AllocFailed {
+                    what: format!("{} (lend return, {call})", l.what),
+                    bytes: l.size,
+                    free: free_vram_bytes(),
+                    result: format!("{r:?}"),
+                });
+            }
+        }
+    }
+    ck(sys::cuCtxSynchronize());
+    out.ms = t.elapsed().as_secs_f64() * 1e3;
+    Ok(out)
 }

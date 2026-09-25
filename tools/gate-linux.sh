@@ -277,13 +277,54 @@ bin="$root/engine/target/release/decode"
 cuda_lib="${CUDA_LIB:-$HOME/.local/share/crow/cuda/lib}"
 
 # ---- the values of record (see the provenance block above) --------------------------------------
-SHA8="bceba6ff772431dedf57631e83c7418d3f0bca3ab7e33da828f8da5d12a122a2"
+SHA8="148cb72e8e4494bf8652504696073e4f99640e7276aa2fbd5b0d24271ddc6293"
 BYTES8="11919360"
-SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
-SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
-IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
-TESTS="387"
-CLIPPY="1505"
+SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
+SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
+IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
+TESTS="413"
+CLIPPY="1522"
+#   v0.6.0 release gate (2026-09-25, `0263990`, decode_out/gate-0925-release): all nine items GREEN against the
+#                              values of record below - #110 (reserve default 0), #117 (VMM, same bytes) and #118
+#                              (serve only) moved no numerics. No value re-recorded.
+#   tests 404 -> 413 / clippy 1522 (unchanged)   #118 (2026-09-25, branch `t-judge-keeps-main-cache`): nine
+#                              `cache::tests` of the park (the synthetic judge replay WARM from 116900 with every KV
+#                              row checked, eight judge rounds, the dirty-row guard after a shortening rollback, cap 0
+#                              and long cold requests keep the old rule). Measured 2026-09-25: lib 284 / 0 / 3
+#                              ignored, serve 118, decode 5, parity 6 = 413 / 0.
+#   tests 396 -> 404 / clippy 1522 (unchanged)   #117 (2026-09-25, branch `t-vram-lend`): six `lend::tests` (lend
+#                              body, no double lend, parked requests until the return, ttl + retry, tier-1 plan
+#                              >= 1.6 GiB, only stateless scratch lendable), `vit::tests_117`, one serve route test.
+#                              Measured 2026-09-25: lib 275 / 0 / 3 ignored, serve 118, decode 5, parity 6 = 404 / 0.
+#                              The lendable buffers are VMM allocations now (same bytes, zeroed); parity items
+#                              1-6 NOT re-run (no kernel, shape or size change).
+#   tests 391 -> 396 / clippy 1522 (unchanged)   #110 follow-up (2026-09-25, branch `t-vram-lend` off `56a9740`):
+#                              five `manager::tests_110_boot` tests (the measured card N=150 / cold 45.61 of
+#                              46.00 GiB, 1536 MiB granted as 3 units instead of the boot refusal, whole grant
+#                              with headroom, grant 0 with no room, refusal only without a reserve). Measured
+#                              2026-09-25: lib 268 / 0 / 3 ignored, serve 117, decode 5, parity 6 = 396 / 0;
+#                              clippy 1522. Default reserve back to 0, so N in `decode`/`parity` is the pre-#110 N.
+#   tests 387 -> 391 / clippy 1522 (unchanged)   #110 (2026-09-25, branch `t110-render-reserve` off `decc3e9`):
+#                              four `manager::tests_110` tests (the CROW_RENDER_RESERVE_MB parse, N lowered by
+#                              the render reserve, the post-plan floor + reserve, the `[budget]` line). Measured
+#                              2026-09-25: lib 263 / 0 / 3 ignored, serve 117, decode 5, parity 6 = 391 / 0;
+#                              clippy 1522. Items 1-6 (parity shas, run32) NOT re-run: the reserve (default 1536
+#                              MiB) lowers N by about 12 in `decode`/`parity` too; TASK K moved N 157 -> 155 with the values held.
+#   parity 8 / 512 / P8 tf / run 32 / clippy 1505 -> 1522   new values of record (2026-09-25, #94 phase 2 C0):
+#                              measured at `eb0913f` (= v0.5.0 `a4ec526` plus a handoff-only commit, no
+#                              engine change) on RTX 5090 / driver 610.57.04 / rustc 1.98.1, twice with
+#                              the same binary: decode_out/gate-0925 (02:20 CEST) and gate-0925b (02:30
+#                              CEST), all four values byte-identical. 8 rows = 148cb72e..., still
+#                              11,919,360 B; 512 rows = 6e9cb25f...; P8 tf = 8f5e5ce8...; run 32 = the
+#                              ids above. They replace the pre-0923 values (bceba6ff / 83872347 /
+#                              3bb3e69e) that the NOTE below expected to move with 488a840 and 85a48e7.
+#                              Tests 387 / 0 (lib 259 / 3 ignored, serve 117, decode 5, parity 6).
+#                              Clippy 1522 vs decode_out/gate (2026-09-21, 1505): net +13 warnings
+#                              (+6 constant chunk size, +3 negated partial-ord comparisons, +2 unsafe
+#                              docs, +2 "written more concisely", +1 same-type cast, +1 "consider
+#                              using", +1 operator precedence, -2 manual reimplementation, -1 manual
+#                              prefix strip) and +4 "generated N warnings" summary lines of the two new
+#                              bins `pin_return_probe` and `ramcheck`. Not tracked back per commit.
 #   tests 358 -> 387   v0.5.0 (2026-09-24, `9c9fd51`): #106, #107/#108/#109, #111, #112, #113, #114, #85/#92.
 #                              Measured 2026-09-24 by running the test binaries built at `9c9fd51`: lib 259 / 0 /
 #                              3 ignored, serve 117, decode 5, parity 6 = 387 / 0. Clippy NOT re-counted.
@@ -298,6 +339,7 @@ CLIPPY="1505"
 #                              shas and the run32 ids above are expected to move. They are the values
 #                              of the pre-0923 engine; new values of record need a gate run on the GPU,
 #                              which has not happened yet. Until then items 1, 2, 3 and 6 are expected RED.
+#                              RESOLVED 2026-09-25: see the new values of record at the top of this block.
 #   tests 320 -> 335 / clippy 1505 (unchanged)   #93 (2026-09-22): eleven toolgrammar
 #                              tests (the Crow 3dbc015 tools compile; the byte machine on well-formed
 #                              calls and on the observed failure shapes; the JSON subset; required /

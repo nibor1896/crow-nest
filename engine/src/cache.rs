@@ -84,7 +84,8 @@
 //! - #101: `rollback` onto `P` forgets every slot ABOVE `P`: the prefill and decode after
 //!   it rewrite the KV rows `P..`, so those slots name a branch the engine no longer holds
 //!   (seen live twice on 2026-09-22 before this rule; llama.cpp: "erase any checkpoints
-//!   with pos_max > pos_next"). The cold start forgets all of them (`invalidate`).
+//!   with pos_max > pos_next"). The cold start forgets all of them (`invalidate`), unless
+//!   it PARKS them (#118, the section below).
 //! - So the held slots are nested prefixes, and the newest snapshot is the largest one.
 //! - #100: a snapshot at a position a slot already holds RE-USES that slot (the same ids
 //!   over prefill rows); before, `rotate_right` pushed duplicates that evicted the shared
@@ -97,7 +98,36 @@
 //!   below the newest position from a full cold prefill into a rollback to the previous turn.
 //! - The after-answer snapshot of M1 (spec 7.6 point 2) is DROPPED, see the section below.
 //! - The last generated id is never fed back, so it is not in `history` and not in `pos`.
-//! - ONE held conversation per process (M1): a request that shares no prefix replaces it.
+//! - ONE held conversation per process (M1): a request that shares no prefix replaces it,
+//!   and since #118 may PARK it (below).
+//!
+//! Parking a conversation for a short unrelated request (#118, 2026-09-25):
+//!
+//! - A snapshot holds the recurrent state, not the KV rows: those sit in the ONE KV buffer,
+//!   addressed by position. A cold request writes rows `0..n`, so before #118 every snapshot
+//!   of the held conversation named rows it no longer had, and `invalidate` dropped them.
+//!   Measured 2026-09-25: Crow's judge (4,659 prompt ids, 4,947 rows written) cost the next
+//!   main turn a cold 118,282-token prefill, 139.5 s; 37 such pairs that day, 4,590 s.
+//! - The fix copies only the rows the side request can overwrite. On a cold request
+//!   `plan_cold` PARKS the held conversation when its newest snapshot `T` survives it:
+//!   KV rows `0..R` and pooled blocks `0..R/4+1` go device to host (`R = min(T, cap)`,
+//!   `CROW_PREFIX_PARK_ROWS`, default 8192), `history` and its image spans are kept, and
+//!   its slots stay, marked `parked`. A conversation parked earlier is kept instead when
+//!   it saves more; else everything is dropped as before.
+//! - A parked slot at `P` stays usable while `min(dirty, P) <= R` (`parked_usable`),
+//!   `dirty` = the highest row written since the park (`rolled_back` counts the rows a
+//!   request wrote before its rollback shortens `history`). `decide` runs the prefix rule
+//!   against the parked history too, and the one that reuses more wins; `unpark` then
+//!   uploads the rows back and `rollback` proceeds as for any warm request.
+//! - Why the state is the one of record: rows `0..R` and blocks `0..R/4+1` come back byte
+//!   for byte, rows `R..P` were never written (`dirty <= R`), rows `>= P` are unreachable,
+//!   and the recurrent state is the snapshot's. The extra block covers the decode graph's
+//!   write to block `done_blocks` ("garbage lands beyond done_blocks", `gen.rs`).
+//! - The side request's own snapshot takes an empty or live slot first, then the smallest
+//!   parked one, never the parked conversation's last one (`claim`).
+//! - llama.cpp saves the WHOLE sequence state to host RAM for the same case (`--cache-ram`,
+//!   `server_slot::prompt_save`); vLLM and SGLang keep other prefixes in paged or radix KV.
+//!   Here the rest of the KV stays in VRAM, so only the overwritten rows are copied.
 //!
 //! Memory (spec 7.7, chunk 2048, ring 2052):
 //!
@@ -113,6 +143,13 @@
 //!
 //! - The logits row is NOT part of `Shape::snapshot_bytes`: that number is the slot
 //!   file's `state_bytes` (#32 A10), and the file does not carry the row.
+//! - #118 park stash (`park_host_bytes`), pageable host RAM, allocated at the FIRST park:
+//!
+//! ```text
+//! KV      8192 * 12 * 2 * 2 * 256 * 1 (fp8) = 100,663,296 B
+//! pooled  12 * 2049 * 128 * 4              =  12,589,056 B
+//! total at the default cap, fp8 KV         = 113,252,352 B = 108.0 MiB (bf16 KV: 204.0 MiB)
+//! ```
 //!
 //! - M1 held two slots (261,292,032 B); M2 (robin, 2026-09-10, #36) dropped the
 //!   after-answer slot; M3 keeps `SLOTS` prompt snapshots (newest in slot 0) so a
@@ -187,6 +224,7 @@
 //! |---|---|
 //! | `CROW_PREFIX_CACHE=0` | no slots are allocated, every request is a cold start |
 //! | | `/slots/0` then refuses save and restore: there is no slot to write or fill |
+//! | `CROW_PREFIX_PARK_ROWS=0` | #118: no park; a cold start drops every snapshot (the pre-#118 rule) |
 
 use crate::cuda;
 use crate::gen::Engine;
@@ -200,6 +238,65 @@ pub const SLOT_PROMPT: usize = 0;
 /// position roll back to an older prefill clean point (partial reuse) instead of
 /// paying the whole prefill the way a single snapshot does.
 pub const SLOTS: usize = 3;
+
+/// - #118: the most KV rows a PARKED conversation keeps in host RAM (`CROW_PREFIX_PARK_ROWS`)
+/// - 8192 rows cost 113,252,352 B = 108.0 MiB at fp8 KV (12,288 B KV per row plus 2,049
+///   pooled QSA blocks of 6,144 B), 204.0 MiB at bf16 (`park_host_bytes`); the 37 side
+///   requests of 2026-09-25 wrote at most 4,947 rows (engine.log, the judge of Crow #266)
+pub const PARK_ROWS_DEFAULT: usize = 8192;
+
+/// - #118: `CROW_PREFIX_PARK_ROWS`, read once per process: the row cap of a park
+/// - `0` turns parking off (every cold start drops every snapshot, the pre-#118 rule);
+///   unset or not a number gives `PARK_ROWS_DEFAULT`
+pub fn park_rows_cap() -> usize {
+    std::env::var("CROW_PREFIX_PARK_ROWS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(PARK_ROWS_DEFAULT)
+}
+
+/// - #118: rows `0..park_rows(top, cap)` of KV and pooled QSA are copied to host RAM when
+///   a conversation whose newest snapshot sits at `top` is parked
+/// - never more than the snapshot needs (`top`), never more than the cap
+pub fn park_rows(top: usize, cap: usize) -> usize {
+    top.min(cap)
+}
+
+/// - #118: pooled QSA blocks a park of `rows` rows copies: `rows / 4 + 1`, so the block that
+///   HOLDS row `rows` is in it too. The decode graph writes block `done_blocks` on every
+///   step (`gen.rs`, "garbage lands beyond done_blocks"), which is `dirty / 4` for a
+///   request that ended at `dirty`; with `dirty <= rows` that block is `<= rows / 4`
+/// - capped at the `ceil(n_ctx / 4)` blocks `qsa_pooled` holds (`manager.rs`)
+pub fn park_blocks(rows: usize, n_ctx: usize) -> usize {
+    (rows / 4 + 1).min(n_ctx.div_ceil(4))
+}
+
+/// - #118: host RAM of a park of `rows` rows: the KV rows of every attention layer (K and
+///   V, `NKV` heads of `AHD` values at `kv_value_bytes`) plus `park_blocks` pooled QSA
+///   blocks of `QSA_HIDD` f32 per attention layer
+pub fn park_host_bytes(rows: usize, n_ctx: usize, attn_layers: usize, kv_value_bytes: usize) -> usize {
+    rows * attn_layers * 2 * crate::geo::NKV * crate::geo::AHD * kv_value_bytes
+        + attn_layers * park_blocks(rows, n_ctx) * crate::geo::QSA_HIDD * 4
+}
+
+/// - #118: may a parked snapshot at `p` be rolled back onto after other requests wrote
+///   KV rows `0..dirty`? Its state needs rows `0..p`; rows `0..min(dirty, p)` were
+///   overwritten, and the park put back rows `0..rows`
+/// - true iff `min(dirty, p) <= rows`
+pub fn parked_usable(p: usize, dirty: usize, rows: usize) -> bool {
+    p.min(dirty) <= rows
+}
+
+/// #118: what a cold start does with the held snapshots (`PrefixCache::plan_cold`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColdPlan {
+    /// the held conversation is parked: its snapshots stay, rows `0..rows` go to host RAM
+    Park { rows: usize },
+    /// a conversation parked earlier stays parked; the held one (a side request) is dropped
+    Keep,
+    /// every snapshot is dropped (the pre-#118 cold start)
+    Drop,
+}
 
 /// f32 slots of one GDN layer's recurrent state S, `[48][128][128]` (`manager.rs:60`)
 const GDN_S_STATE: usize = GDN_VHEADS * GD * GD;
@@ -282,6 +379,9 @@ pub struct Decision {
     pub l: usize,
     /// `Some((slot, P))` = roll back to that slot; `None` = cold start
     pub reuse: Option<(usize, usize)>,
+    /// #118: `reuse` names a slot of the PARKED conversation, and `l` is the prefix
+    /// against its history; `PrefixCache::unpark` runs before the rollback
+    pub parked: bool,
 }
 
 impl Decision {
@@ -345,6 +445,22 @@ struct Snapshot {
     /// empty slot, or one filled from a slot file), and then `pos` must stay below the
     /// request length
     greedy: Option<usize>,
+    /// #118: the slot belongs to the PARKED conversation, not to `Engine::history`
+    parked: bool,
+}
+
+/// #118: a conversation set aside while an unrelated request uses the one KV buffer
+struct Parked {
+    /// its `Engine::history` when it was parked
+    history: Vec<i64>,
+    /// its `Engine::history_images` when it was parked
+    images: Vec<crate::vit::ImageSpan>,
+    /// KV rows `0..rows` and pooled blocks `0..blocks` are held in `PrefixCache::park_kv`
+    /// and `park_pooled`, byte for byte as they stood when it was parked
+    rows: usize,
+    blocks: usize,
+    /// the highest KV row the requests since the park have written (their end `pos`)
+    dirty: usize,
 }
 
 /// - `vec![0f32; n]`, with every page of it faulted in before it is returned
@@ -380,6 +496,7 @@ impl Snapshot {
                 .collect(),
             logits: faulted(vocab),
             greedy: None,
+            parked: false,
         }
     }
 }
@@ -401,12 +518,22 @@ unsafe fn dtoh_into(dst: &mut [f32], src: cuda::CUdeviceptr) {
 
 // ----------------------------------------------------------------- the cache
 
-/// the ONE held conversation of this process (M1), with its ONE snapshot (M2b, #36)
+/// the ONE held conversation of this process (M1) with its `SLOTS` prompt snapshots, plus
+/// at most ONE parked conversation (#118)
 pub struct PrefixCache {
     /// `CROW_PREFIX_CACHE=0` turns every request into a cold start
     enabled: bool,
     shape: Shape,
     slots: Vec<Snapshot>,
+    /// #118: `CROW_PREFIX_PARK_ROWS`, 0 = never park
+    park_cap: usize,
+    /// #118: the parked conversation, if any; its snapshots are the slots with `parked`
+    park: Option<Parked>,
+    /// #118: KV rows `0..rows` of the parked conversation, in `slot::kv_row_order`,
+    /// allocated at the first park and reused (pageable host RAM, like the slots)
+    park_kv: Vec<u8>,
+    /// #118: pooled QSA blocks `0..blocks` of the parked conversation, per attention layer
+    park_pooled: Vec<u8>,
 }
 
 impl PrefixCache {
@@ -420,7 +547,20 @@ impl PrefixCache {
         } else {
             Vec::new()
         };
-        PrefixCache { enabled, shape, slots }
+        PrefixCache {
+            enabled,
+            shape,
+            slots,
+            park_cap: park_rows_cap(),
+            park: None,
+            park_kv: Vec::new(),
+            park_pooled: Vec::new(),
+        }
+    }
+
+    /// #118: the row cap of a park in force for this process (0 = parking off)
+    pub fn park_cap(&self) -> usize {
+        self.park_cap
     }
 
     /// on or off for this process
@@ -440,10 +580,40 @@ impl PrefixCache {
 
     /// - the position of each slot that may be ROLLED BACK ONTO, `None` for the others
     /// - a slot that is not prefill clean is hidden here, never in `positions`
+    /// - #118: so is a slot of the parked conversation (`parked_positions` names those)
     pub fn reuse_candidates(&self) -> Vec<Option<usize>> {
         self.slots
             .iter()
-            .map(|s| if s.prefill_clean { s.pos } else { None })
+            .map(|s| if s.prefill_clean && !s.parked { s.pos } else { None })
+            .collect()
+    }
+
+    /// #118: the position of each slot of the PARKED conversation, `None` for the others
+    pub fn parked_positions(&self) -> Vec<Option<usize>> {
+        self.slots.iter().map(|s| if s.parked { s.pos } else { None }).collect()
+    }
+
+    /// #118: `(history length, rows held, rows written since)` of the parked conversation
+    pub fn parked(&self) -> Option<(usize, usize, usize)> {
+        self.park.as_ref().map(|pk| (pk.history.len(), pk.rows, pk.dirty))
+    }
+
+    /// #118: the newest (largest) position among the held, prefill clean LIVE slots
+    fn live_top(&self) -> Option<usize> {
+        self.reuse_candidates().into_iter().flatten().max()
+    }
+
+    /// - #118: the parked slots that may still be rolled back onto once the requests since
+    ///   the park have written KV rows `0..dirty` (`parked_usable`)
+    /// - `None` for every slot while nothing is parked
+    fn parked_candidates(&self, dirty: usize) -> Vec<Option<usize>> {
+        let Some(pk) = self.park.as_ref() else { return vec![None; self.slots.len()] };
+        self.slots
+            .iter()
+            .map(|s| match s.pos {
+                Some(p) if s.parked && s.prefill_clean && parked_usable(p, dirty, pk.rows) => Some(p),
+                _ => None,
+            })
             .collect()
     }
 
@@ -474,11 +644,24 @@ impl PrefixCache {
         allow_exact: bool,
     ) -> Decision {
         if !self.enabled {
-            return Decision { l: 0, reuse: None };
+            return Decision { l: 0, reuse: None, parked: false };
         }
         let l = common_prefix_len_mm(history, held_imgs, ids, imgs);
         let logits = if allow_exact { self.logits_held() } else { Vec::new() };
-        Decision { l, reuse: reuse_slot_with_logits(&self.reuse_candidates(), &logits, l, ids.len()) }
+        let live = Decision {
+            l,
+            reuse: reuse_slot_with_logits(&self.reuse_candidates(), &logits, l, ids.len()),
+            parked: false,
+        };
+        // #118: the same rule against the PARKED conversation; `history.len()` is where the
+        // requests since the park have written up to. The one that reuses more wins.
+        let Some(pk) = self.park.as_ref() else { return live };
+        let lp = common_prefix_len_mm(&pk.history, &pk.images, ids, imgs);
+        let cands = self.parked_candidates(pk.dirty.max(history.len()));
+        match reuse_slot_with_logits(&cands, &logits, lp, ids.len()) {
+            Some((slot, p)) if p > live.cached_n() => Decision { l: lp, reuse: Some((slot, p)), parked: true },
+            _ => live,
+        }
     }
 
     /// #100: per slot, whether it holds a logits row it may stand in with
@@ -491,7 +674,8 @@ impl PrefixCache {
     /// - #32 A10: this is the position a slot file holds, and `n_saved` on the wire
     pub fn prompt_slot(&self) -> Option<(usize, usize)> {
         let s = self.slots.get(SLOT_PROMPT)?;
-        if !s.prefill_clean {
+        // #118: a parked slot names another conversation than `Engine::history`
+        if !s.prefill_clean || s.parked {
             return None;
         }
         s.pos.map(|p| (p, s.done_blocks))
@@ -535,14 +719,183 @@ impl PrefixCache {
         }
     }
 
-    /// - the slot forgets its position; the buffers stay allocated
-    /// - called with every cold start, so no slot can name a discarded history
+    /// - every slot forgets its position, and the parked conversation is dropped (#118);
+    ///   the buffers stay allocated
+    /// - the cold start of `CROW_PREFIX_PARK_ROWS=0`, a slot file restore and a dropped
+    ///   request call it, so no slot can name a discarded history
     pub fn invalidate(&mut self) {
         for s in self.slots.iter_mut() {
             s.pos = None;
             s.prefill_clean = false;
             s.greedy = None;
+            s.parked = false;
         }
+        self.park = None;
+    }
+
+    /// #118: the live conversation has written KV rows `0..written`; a parked one counts them
+    fn note_written(&mut self, written: usize) {
+        if let Some(pk) = self.park.as_mut() {
+            pk.dirty = pk.dirty.max(written);
+        }
+    }
+
+    /// #118: forget the LIVE slots only; the parked conversation keeps its snapshots
+    fn drop_live(&mut self) {
+        for s in self.slots.iter_mut().filter(|s| !s.parked) {
+            s.pos = None;
+            s.prefill_clean = false;
+            s.greedy = None;
+        }
+    }
+
+    /// - #118: what a COLD start does with the held snapshots, host side only
+    /// - `live_len` is `Engine::history().len()` (the rows the held conversation wrote),
+    ///   `new_len` the prompt of the cold request (it writes at least rows `0..new_len`)
+    /// - the held conversation is parked when its newest snapshot survives the new request
+    ///   (`parked_usable` at `dirty = new_len`) and it is at least as large as what is
+    ///   parked already (the one that saves more prefill is kept)
+    /// - else a conversation parked earlier stays, if the new request leaves it usable
+    /// - else everything is dropped, the pre-#118 cold start
+    pub fn plan_cold(&self, live_len: usize, new_len: usize) -> ColdPlan {
+        if !self.enabled || self.park_cap == 0 {
+            return ColdPlan::Drop;
+        }
+        let live = self
+            .live_top()
+            .filter(|&t| parked_usable(t, new_len, park_rows(t, self.park_cap)));
+        let kept = self.park.as_ref().and_then(|pk| {
+            let dirty = pk.dirty.max(live_len).max(new_len);
+            self.parked_candidates(dirty).into_iter().flatten().max()
+        });
+        match (live, kept) {
+            (Some(t), k) if k.is_none_or(|k| t >= k) => ColdPlan::Park { rows: park_rows(t, self.park_cap) },
+            (_, Some(_)) => ColdPlan::Keep,
+            _ => ColdPlan::Drop,
+        }
+    }
+
+    /// - #118: the host bookkeeping of a cold start after `plan_cold`; `history` and
+    ///   `images` are the held conversation's, and `Park` takes them
+    /// - `Park`: an older parked conversation is dropped, every prefill clean live slot
+    ///   becomes a parked slot, `dirty` starts at 0 (nothing has overwritten a row yet)
+    /// - `Keep`: the live slots are dropped, and the rows the held conversation wrote are
+    ///   added to `dirty`
+    /// - the stash bytes themselves are copied by `cold_start`, not here
+    fn apply_cold(
+        &mut self,
+        plan: ColdPlan,
+        history: Vec<i64>,
+        images: Vec<crate::vit::ImageSpan>,
+        blocks: usize,
+    ) {
+        match plan {
+            ColdPlan::Drop => self.invalidate(),
+            ColdPlan::Keep => {
+                let written = history.len();
+                self.drop_live();
+                if let Some(pk) = self.park.as_mut() {
+                    pk.dirty = pk.dirty.max(written);
+                }
+            }
+            ColdPlan::Park { rows } => {
+                for s in self.slots.iter_mut() {
+                    if s.parked || !s.prefill_clean {
+                        s.pos = None;
+                        s.prefill_clean = false;
+                        s.greedy = None;
+                        s.parked = false;
+                    } else if s.pos.is_some() {
+                        s.parked = true;
+                    }
+                }
+                self.park = Some(Parked { history, images, rows, blocks, dirty: 0 });
+            }
+        }
+    }
+
+    /// - #118: the COLD start of a request of `new_len` prompt ids: park the held
+    ///   conversation (or keep the one parked earlier, or drop all, `plan_cold`), then
+    ///   `Engine::reset_to_zero`
+    /// - a park copies KV rows `0..rows` and pooled blocks `0..blocks` device to host,
+    ///   BEFORE the reset and the new prefill write them
+    /// - returns the plan and the wall of the copy in ms (0.0 without a park)
+    ///
+    /// # Safety
+    ///
+    /// - a CUDA context must be current, as for every other engine call
+    /// - no kernel of this engine may be in flight on another thread
+    pub unsafe fn cold_start(&mut self, eng: &mut Engine, new_len: usize) -> (ColdPlan, f64) {
+        let plan = self.plan_cold(eng.history.len(), new_len);
+        let mut ms = 0.0;
+        let mut blocks = 0;
+        if let ColdPlan::Park { rows } = plan {
+            let t0 = std::time::Instant::now();
+            blocks = park_blocks(rows, eng.st.context);
+            // whatever the last request left in flight must land before the copies read it
+            cuda::sync();
+            let row_bytes = crate::geo::AHD * eng.st.kv.byte_per_value();
+            let n = rows * row_bytes;
+            let groups: Vec<_> = crate::slot::kv_row_order(eng.st.qsa_pooled.len()).collect();
+            self.park_kv.resize(groups.len() * n, 0);
+            for (g, (layer, is_k, kvh)) in groups.into_iter().enumerate() {
+                crate::slot::dtoh_bytes(&mut self.park_kv[g * n..(g + 1) * n], eng.st.kv_row_ptr(layer, is_k, kvh, 0));
+            }
+            let pb = blocks * crate::geo::QSA_HIDD * 4;
+            self.park_pooled.resize(eng.st.qsa_pooled.len() * pb, 0);
+            for (layer, &src) in eng.st.qsa_pooled.iter().enumerate() {
+                crate::slot::dtoh_bytes(&mut self.park_pooled[layer * pb..(layer + 1) * pb], src);
+            }
+            ms = t0.elapsed().as_secs_f64() * 1e3;
+        }
+        // `reset_to_zero` clears both; `Park` keeps them for the unpark
+        let history = std::mem::take(&mut eng.history);
+        let images = std::mem::take(&mut eng.history_images);
+        self.apply_cold(plan, history, images, blocks);
+        eng.reset_to_zero();
+        (plan, ms)
+    }
+
+    /// - #118: host bookkeeping of an unpark: the live slots are dropped, the parked ones
+    ///   become the live ones, and the parked history is handed back to be put into
+    ///   `Engine::history`
+    fn adopt_parked(&mut self) -> Option<Parked> {
+        let pk = self.park.take()?;
+        self.drop_live();
+        for s in self.slots.iter_mut() {
+            s.parked = false;
+        }
+        Some(pk)
+    }
+
+    /// - #118: bring the parked conversation back: KV rows `0..rows` and pooled blocks
+    ///   `0..blocks` host to device, `Engine::history` and its image spans put back, its
+    ///   snapshots made the live ones. `rollback` onto the slot `decide` picked follows
+    /// - the decode graph and the capture stream are dropped FIRST (A4), as in `rollback`
+    /// - returns the wall in ms, 0.0 when nothing is parked
+    ///
+    /// # Safety
+    ///
+    /// - a CUDA context must be current, as for every other engine call
+    /// - no kernel of this engine may be in flight on another thread
+    pub unsafe fn unpark(&mut self, eng: &mut Engine) -> f64 {
+        let t0 = std::time::Instant::now();
+        let Some(pk) = self.adopt_parked() else { return 0.0 };
+        cuda::sync();
+        eng.drop_decode_graph();
+        let row_bytes = crate::geo::AHD * eng.st.kv.byte_per_value();
+        let n = pk.rows * row_bytes;
+        for (g, (layer, is_k, kvh)) in crate::slot::kv_row_order(eng.st.qsa_pooled.len()).enumerate() {
+            cuda::upload_into(eng.st.kv_row_ptr(layer, is_k, kvh, 0), &self.park_kv[g * n..(g + 1) * n]);
+        }
+        let pb = pk.blocks * crate::geo::QSA_HIDD * 4;
+        for (layer, &dst) in eng.st.qsa_pooled.iter().enumerate() {
+            cuda::upload_into(dst, &self.park_pooled[layer * pb..(layer + 1) * pb]);
+        }
+        cuda::sync();
+        eng.history = pk.history;
+        eng.history_images = pk.images;
+        t0.elapsed().as_secs_f64() * 1e3
     }
 
     /// - copy the four recurrent buffers device to host into `SLOT_PROMPT` (slot 0)
@@ -590,15 +943,31 @@ impl PrefixCache {
     ///   with the smallest position; it is moved to `SLOT_PROMPT`, the others keep their order
     /// - with the #101 invariant every held slot is a prefix of `history`, so a slot at
     ///   `pos` holds the same ids over prefill rows, and the smallest is the oldest turn
+    /// - #118: a parked slot is never `same` (it names another history). It is taken only
+    ///   when no empty and no live slot is left, the smallest parked one, and never the
+    ///   parked conversation's LAST slot while another exists; taking the last one drops
+    ///   the park
     fn claim(&mut self, pos: usize) -> usize {
-        let same = self.slots.iter().position(|s| s.pos == Some(pos));
+        let n = self.slots.len();
+        let same = self.slots.iter().position(|s| !s.parked && s.pos == Some(pos));
         let empty = || self.slots.iter().position(|s| s.pos.is_none());
-        let smallest = || {
-            (0..self.slots.len())
+        let smallest_of = |parked: bool| {
+            (0..n)
+                .filter(|&i| self.slots[i].parked == parked && self.slots[i].pos.is_some())
                 .min_by_key(|&i| self.slots[i].pos.unwrap_or(0))
-                .unwrap_or(SLOT_PROMPT)
         };
-        let i = same.or_else(empty).unwrap_or_else(smallest);
+        let parked_n = self.slots.iter().filter(|s| s.parked).count();
+        let spare_parked = || if parked_n > 1 { smallest_of(true) } else { None };
+        let i = same
+            .or_else(empty)
+            .or_else(|| smallest_of(false))
+            .or_else(spare_parked)
+            .or_else(|| smallest_of(true))
+            .unwrap_or(SLOT_PROMPT);
+        self.slots[i].parked = false;
+        if !self.slots.iter().any(|s| s.parked) {
+            self.park = None;
+        }
         self.slots[..=i].rotate_right(1);
         SLOT_PROMPT
     }
@@ -615,9 +984,14 @@ impl PrefixCache {
     /// - host bookkeeping of a rollback onto `slot` (#101)
     /// - every slot ABOVE its position is forgotten: the prefill and the decode that
     ///   follow rewrite the KV rows from there, so those slots name a discarded branch
-    fn rolled_back(&mut self, slot: usize) {
+    /// - #118: `written` is `Engine::history().len()` BEFORE the rollback: the held
+    ///   conversation wrote KV rows `0..written`, and a parked one counts them
+    ///   (`note_written`) also when this rollback cuts `history` shorter than that
+    fn rolled_back(&mut self, slot: usize, written: usize) {
+        self.note_written(written);
         let Some(p) = self.slots[slot].pos else { return };
-        for s in self.slots.iter_mut() {
+        // #118: a parked slot names another history, which this rollback does not touch
+        for s in self.slots.iter_mut().filter(|s| !s.parked) {
             if s.pos.is_some_and(|q| q > p) {
                 s.pos = None;
                 s.prefill_clean = false;
@@ -680,10 +1054,12 @@ impl PrefixCache {
 
         eng.pos = pos;
         eng.done_blocks = s.done_blocks;
+        // #118: the rows the held conversation wrote, before `history` is cut to `pos`
+        let written = eng.history.len();
         eng.history.truncate(pos);
         eng.truncate_history_images(pos);
         eng.route_log.clear();
-        self.rolled_back(slot);
+        self.rolled_back(slot, written);
 
         // the uploads read the slot's vectors; sync before the caller may touch them
         cuda::sync();
@@ -701,7 +1077,15 @@ impl PrefixCache {
         } else {
             Vec::new()
         };
-        PrefixCache { enabled, shape, slots }
+        PrefixCache {
+            enabled,
+            shape,
+            slots,
+            park_cap: PARK_ROWS_DEFAULT,
+            park: None,
+            park_kv: Vec::new(),
+            park_pooled: Vec::new(),
+        }
     }
 
     /// - name a slot's position and its prefill clean flag without a device copy
@@ -848,13 +1232,13 @@ mod tests {
 
     #[test]
     fn a_decision_reports_zero_cached_tokens_for_a_cold_start() {
-        let d = Decision { l: 12, reuse: None };
+        let d = Decision { l: 12, reuse: None, parked: false };
         assert_eq!(d.cached_n(), 0);
     }
 
     #[test]
     fn a_decision_reports_p_as_the_cached_tokens() {
-        let d = Decision { l: 120, reuse: Some((1, 100)) };
+        let d = Decision { l: 120, reuse: Some((1, 100)), parked: false };
         assert_eq!(d.cached_n(), 100);
     }
 
@@ -906,7 +1290,7 @@ mod tests {
         let mut new = held.clone();
         new.extend(200..210);
         let d = c.decide(&held, &new);
-        assert_eq!(d, Decision { l: 0, reuse: None });
+        assert_eq!(d, Decision { l: 0, reuse: None, parked: false });
         assert_eq!(d.cached_n(), 0);
         // and no slot exists to be reported
         assert!(c.positions().is_empty());
@@ -1003,8 +1387,9 @@ mod tests {
         let d = c.decide(history, prompt);
         let cached = match d.reuse {
             Some((slot, p)) => {
+                let written = history.len();
                 history.truncate(p);
-                c.rolled_back(slot);
+                c.rolled_back(slot, written);
                 p
             }
             None => {
@@ -1258,6 +1643,250 @@ mod tests {
         let c = PrefixCache::for_shape(tiny(), false);
         let ids = probe_prompt(16);
         let span = [img(10, 16, 1)];
-        assert_eq!(c.decide_mm(&ids, &span, &ids, &span, true), Decision { l: 0, reuse: None });
+        assert_eq!(c.decide_mm(&ids, &span, &ids, &span, true), Decision { l: 0, reuse: None, parked: false });
+    }
+
+    // ------------------------------------------------ #118: a side request parks the conversation
+
+    /// the n_ctx of the 2026-09-25 operating point (`[load] ... 200000 x fp8_e4m3`)
+    const N_CTX: usize = 200_000;
+
+    /// - the device side of `serve` as far as #118 needs it: `kv[i]` is the id whose KV row
+    ///   sits at row `i` (the rows are absolutely addressed), `stash` the host copy of a park
+    /// - every conversation of a test uses its own id range, so a row another conversation
+    ///   wrote is seen as a wrong id
+    struct Dev {
+        history: Vec<i64>,
+        kv: Vec<i64>,
+        stash: Vec<i64>,
+    }
+
+    impl Dev {
+        fn new() -> Dev {
+            Dev { history: Vec::new(), kv: vec![-1; N_CTX], stash: Vec::new() }
+        }
+    }
+
+    /// - one `chat_generate` of `serve`, host side, with the #118 park: `decide`, then the
+    ///   unpark and rollback (warm) or `plan_cold` + the stash copy + `apply_cold` (cold,
+    ///   `PrefixCache::cold_start`), the prefill's rows, the point 1 snapshot, the answer
+    /// - on every warm request it checks the state it resumes from: every KV row below `P`
+    ///   holds the id `history` names there (the row was not overwritten by another
+    ///   conversation, or was put back by the unpark)
+    /// - returns `(cached, the decision came from the parked conversation)`
+    fn serve_kv(c: &mut PrefixCache, dev: &mut Dev, prompt: &[i64], answer: &[i64]) -> (usize, bool) {
+        let d = c.decide(&dev.history, prompt);
+        let cached = match d.reuse {
+            Some((slot, p)) => {
+                if d.parked {
+                    let (_, rows, _) = c.parked().expect("a parked decision without a park");
+                    let pk = c.adopt_parked().expect("a parked decision without a park");
+                    dev.kv[..rows].copy_from_slice(&dev.stash[..rows]);
+                    dev.history = pk.history;
+                }
+                // `rollback`, host side
+                let written = dev.history.len();
+                dev.history.truncate(p);
+                c.rolled_back(slot, written);
+                assert_eq!(&dev.kv[..p], &dev.history[..p], "rollback onto {p} over rows another request wrote");
+                p
+            }
+            None => {
+                let plan = c.plan_cold(dev.history.len(), prompt.len());
+                if let ColdPlan::Park { rows } = plan {
+                    dev.stash = dev.kv[..rows].to_vec();
+                }
+                let blocks = match plan {
+                    ColdPlan::Park { rows } => park_blocks(rows, N_CTX),
+                    _ => 0,
+                };
+                let h = std::mem::take(&mut dev.history);
+                c.apply_cold(plan, h, Vec::new(), blocks);
+                0
+            }
+        };
+        for (i, &id) in prompt.iter().enumerate().skip(cached) {
+            dev.kv[i] = id;
+        }
+        dev.history.extend_from_slice(&prompt[cached..]);
+        let slot = c.claim(dev.history.len());
+        c.name(slot, dev.history.len(), true, dev.history.len() / 4, Some(7));
+        for &id in answer {
+            dev.kv[dev.history.len()] = id;
+            dev.history.push(id);
+        }
+        (cached, d.parked)
+    }
+
+    /// the main Crow conversation of 2026-09-25 17:30 (engine.log): three turns that leave
+    /// the snapshots `[116900, 116202, 115944]`, the last answer 711 ids long
+    fn main_conversation(c: &mut PrefixCache, dev: &mut Dev) -> Vec<i64> {
+        let main: Vec<i64> = (0..130_000).collect();
+        for (k, n) in [115_944usize, 116_202, 116_900].into_iter().enumerate() {
+            let len = if k == 2 { 711 } else { 40 };
+            let answer: Vec<i64> = (0..len).map(|j| 1_000_000 + 10_000 * k as i64 + j).collect();
+            serve_kv(c, dev, &main[..n], &answer);
+        }
+        assert_eq!(c.positions(), vec![Some(116_900), Some(116_202), Some(115_944)]);
+        assert_eq!(dev.history.len(), 117_611, "held 117611 before the judge (engine.log 17:31:14)");
+        main
+    }
+
+    /// the judge request of 17:31:14: 4,659 prompt ids of an unrelated context, 288 generated
+    fn judge(round: i64) -> (Vec<i64>, Vec<i64>) {
+        let base = 50_000_000 + 1_000_000 * round;
+        ((base..base + 4_659).collect(), (0..288).map(|j| 90_000_000 + j).collect())
+    }
+
+    /// #118, the measured defect: `[116900, 116202, 115944]` -> judge 4,659 (COLD) ->
+    /// the next main request of 118,282 ids. Before the fix the judge's cold start
+    /// dropped every snapshot (`[Some(4659), None, None]`) and the main request
+    /// prefilled 118,282 of 118,282 ids (139.5 s); now it resumes from 116,900
+    #[test]
+    fn a_short_side_request_keeps_the_main_conversation_warm_from_its_newest_snapshot() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        let mut dev = Dev::new();
+        let main = main_conversation(&mut c, &mut dev);
+        let (jp, ja) = judge(0);
+        assert_eq!(serve_kv(&mut c, &mut dev, &jp, &ja), (0, false), "the judge itself is cold");
+        let (cached, parked) = serve_kv(&mut c, &mut dev, &main[..118_282], &[7; 30]);
+        assert_eq!((cached, parked), (116_900, true), "main must be WARM from 116900, prefill 1382");
+        // the judge's snapshot had taken the smallest parked slot (115944); the park is
+        // consumed by the unpark, the newest two main snapshots are the live ones again
+        assert!(c.parked().is_none());
+        assert_eq!(c.positions(), vec![Some(118_282), Some(116_900), Some(116_202)]);
+    }
+
+    /// #118: the lighthouse step 5 pattern: judge rounds between main turns, many times
+    #[test]
+    fn every_judge_round_leaves_the_next_main_turn_warm() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        let mut dev = Dev::new();
+        let main = main_conversation(&mut c, &mut dev);
+        let mut n = 116_900;
+        for round in 0..8i64 {
+            let (jp, ja) = judge(round);
+            assert_eq!(serve_kv(&mut c, &mut dev, &jp, &ja).0, 0);
+            let before = n;
+            n += 1_000;
+            let answer: Vec<i64> = (0..200).map(|j| 2_000_000 + 1_000 * round + j).collect();
+            assert_eq!(serve_kv(&mut c, &mut dev, &main[..n], &answer), (before, true), "round {round}");
+        }
+    }
+
+    /// #118: two side requests in a row, the second one warm on the first one's prefix,
+    /// then the main turn: the park survives both
+    #[test]
+    fn two_side_requests_in_a_row_keep_the_park() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        let mut dev = Dev::new();
+        let main = main_conversation(&mut c, &mut dev);
+        let (jp, ja) = judge(0);
+        serve_kv(&mut c, &mut dev, &jp, &ja);
+        // the same judge context again with a longer tail: warm on its own snapshot
+        let mut jp2 = jp.clone();
+        jp2.extend(60_000_000..60_000_100);
+        assert_eq!(serve_kv(&mut c, &mut dev, &jp2, &ja), (4_659, false));
+        // an unrelated third one: cold, and the park is KEPT (it saves more than the judge)
+        let (jp3, ja3) = judge(5);
+        assert_eq!(c.plan_cold(dev.history.len(), jp3.len()), ColdPlan::Keep);
+        assert_eq!(serve_kv(&mut c, &mut dev, &jp3, &ja3), (0, false));
+        assert_eq!(serve_kv(&mut c, &mut dev, &main[..118_282], &[]), (116_900, true));
+    }
+
+    /// #118: the judge's cold start parks the three main snapshots, and the judge's own
+    /// snapshot takes the smallest of them, never the newest
+    #[test]
+    fn the_judge_parks_the_main_snapshots_and_evicts_only_the_oldest() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        let mut dev = Dev::new();
+        main_conversation(&mut c, &mut dev);
+        assert_eq!(c.plan_cold(117_611, 4_659), ColdPlan::Park { rows: 8_192 });
+        let (jp, ja) = judge(0);
+        serve_kv(&mut c, &mut dev, &jp, &ja);
+        assert_eq!(c.parked_positions(), vec![None, Some(116_900), Some(116_202)]);
+        assert_eq!(c.positions(), vec![Some(4_659), Some(116_900), Some(116_202)]);
+        assert_eq!(c.reuse_candidates(), vec![Some(4_659), None, None]);
+        assert_eq!(c.parked(), Some((117_611, 8_192, 0)));
+    }
+
+    /// #118, the guard: a side request that writes past the park's rows makes every parked
+    /// snapshot above them unusable, also when a later rollback cuts `history` shorter than
+    /// the rows it wrote. Cap 100 rows, main snapshots at 1,000
+    #[test]
+    fn a_side_conversation_that_wrote_past_the_park_leaves_the_main_one_cold() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        c.park_cap = 100;
+        let mut dev = Dev::new();
+        let main: Vec<i64> = (0..2_000).collect();
+        serve_kv(&mut c, &mut dev, &main[..1_000], &[1_000_001; 5]);
+        let side: Vec<i64> = (5_000_000..5_000_060).collect();
+        assert_eq!(c.plan_cold(1_005, 60), ColdPlan::Park { rows: 100 });
+        // 60 prompt + 50 answer ids: rows 0..110 written, 10 past the park
+        serve_kv(&mut c, &mut dev, &side, &[5_900_000; 50]);
+        // warm on the side snapshot at 60: `history` is cut back to 60, then 70 long
+        let mut side2 = side.clone();
+        side2.extend(6_000_000..6_000_010);
+        assert_eq!(serve_kv(&mut c, &mut dev, &side2, &[]), (60, false));
+        assert_eq!(dev.history.len(), 70);
+        // rows 100..110 hold side ids: the main turn must NOT roll back onto 1,000
+        assert_eq!(serve_kv(&mut c, &mut dev, &main[..1_200], &[]), (0, false));
+    }
+
+    /// #118: a cold request at least as long as the cap (a context rollover of the main
+    /// conversation, 71,116 ids at 14:54:29) leaves nothing a park could keep: the
+    /// pre-#118 cold start, every snapshot dropped
+    #[test]
+    fn a_cold_request_longer_than_the_park_drops_every_snapshot() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        let mut dev = Dev::new();
+        main_conversation(&mut c, &mut dev);
+        assert_eq!(c.plan_cold(117_611, 71_116), ColdPlan::Drop);
+        let other: Vec<i64> = (70_000_000..70_071_116).collect();
+        serve_kv(&mut c, &mut dev, &other, &[]);
+        assert_eq!(c.positions(), vec![Some(71_116), None, None]);
+        assert!(c.parked().is_none());
+    }
+
+    /// #118: `CROW_PREFIX_PARK_ROWS=0` is the pre-#118 cold start
+    #[test]
+    fn a_park_cap_of_zero_never_parks() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        c.park_cap = 0;
+        let mut dev = Dev::new();
+        let main = main_conversation(&mut c, &mut dev);
+        let (jp, ja) = judge(0);
+        serve_kv(&mut c, &mut dev, &jp, &ja);
+        assert_eq!(c.positions(), vec![Some(4_659), None, None], "the 2026-09-25 17:31:27 state");
+        assert_eq!(serve_kv(&mut c, &mut dev, &main[..118_282], &[]), (0, false));
+    }
+
+    /// #118: the parked conversation's LAST snapshot is never evicted while a live or an
+    /// empty slot can take the new one
+    #[test]
+    fn a_snapshot_never_takes_the_last_parked_slot() {
+        let mut c = PrefixCache::for_shape(tiny(), true);
+        c.set_slot(0, 500, true);
+        c.apply_cold(ColdPlan::Park { rows: 500 }, (0..500).collect(), Vec::new(), 126);
+        assert_eq!(c.parked_positions(), vec![Some(500), None, None]);
+        for p in [10usize, 20, 30, 40] {
+            c.claim(p);
+            c.name(SLOT_PROMPT, p, true, p / 4, Some(1));
+        }
+        assert_eq!(c.parked_positions().into_iter().flatten().collect::<Vec<_>>(), vec![500]);
+        assert!(c.parked().is_some());
+    }
+
+    /// #118: the host RAM of a park, the numbers the docs and the boot line state
+    #[test]
+    fn the_park_costs_108_mib_at_the_default_cap_with_fp8_kv() {
+        assert_eq!(park_blocks(8_192, N_CTX), 2_049);
+        assert_eq!(park_host_bytes(8_192, N_CTX, 12, 1), 113_252_352);
+        assert_eq!(park_host_bytes(8_192, N_CTX, 12, 2), 213_915_648);
+        // the judge of 17:31 wrote 4,947 rows, the largest of the 37 side requests that day
+        assert!(parked_usable(116_900, 4_947, park_rows(116_900, PARK_ROWS_DEFAULT)));
+        assert!(!parked_usable(116_900, 8_193, park_rows(116_900, PARK_ROWS_DEFAULT)));
+        // the pooled block count never runs past `qsa_pooled` (ceil(n_ctx / 4) blocks)
+        assert_eq!(park_blocks(N_CTX, N_CTX), 50_000);
     }
 }
