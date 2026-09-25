@@ -88,6 +88,9 @@ serve [--port <n>] [--slot-save-path <dir>]
 | `POST /v1/chat/completions` | SSE `chat.completion.chunk` frames, or one `chat.completion` document when `stream` is `false` | `src/bin/serve.rs:545` |
 | `GET /slots` | the one slot of this process as an array of one | `src/bin/serve.rs:546` |
 | `POST /slots/0?action=save\|restore` | writes or reads the slot file; `400` without `--slot-save-path` | `src/bin/serve.rs:547` |
+| `POST /v1/crow/vram/lend` | #117: `{"mib": N, "ttl_s": T}` releases stateless scratch VRAM (up to about 1.7 GiB at the serve point) while idle and answers the MiB lent; engine requests wait until the return; `409` when already lent, `501` with `CROW_VRAM_LEND=0` | `src/bin/serve.rs:815` |
+| `POST /v1/crow/vram/return` | #117: maps the memory back at the same addresses (automatic after `ttl_s`); `200` with `returned_mib` 0 when nothing is lent, `503` while another process still holds the VRAM (serve retries every second) | `src/bin/serve.rs:816` |
+| `GET /v1/crow/vram` | #117: lend state: `enabled`, `lendable_mib`, `lent`, `lent_mib`, `ttl_remaining_s`, `parked` | `src/bin/serve.rs:817` |
 | anything else | `404` with a JSON body | `src/bin/serve.rs:905` |
 
 ### Request fields read by `POST /v1/chat/completions`

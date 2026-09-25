@@ -193,6 +193,25 @@ pub const fn scratch_bytes_for(cap: usize) -> usize {
     elems * 4
 }
 
+/// #117: the twelve scratch buffers at a patch cap, `(name, bytes)`, in the
+/// order `ensure_scratch_named` takes them; they sum to `scratch_bytes_for`
+pub const fn scratch_buffer_bytes(cap: usize) -> [(&'static str, usize); VIT_SCRATCH_BUFFERS] {
+    [
+        ("vit x", cap * VIT_HIDDEN * 4),
+        ("vit normed", cap * VIT_HIDDEN * 4),
+        ("vit qkv", cap * VIT_QKV * 4),
+        ("vit attn", cap * VIT_HIDDEN * 4),
+        ("vit mlp", cap * VIT_INTER * 4),
+        ("vit m1", cap / 4 * VIT_MERGED * 4),
+        ("vit out", cap / 4 * H * 4),
+        ("vit patches", cap * VIT_IN * 4),
+        ("vit pe_idx", cap * 4 * 4),
+        ("vit pe_w", cap * 4 * 4),
+        ("vit cs", cap * VIT_ROT * 4),
+        ("vit sn", cap * VIT_ROT * 4),
+    ]
+}
+
 /// the scratch at this process's cap (`budget().max_patches()`)
 pub fn scratch_bytes() -> usize {
     scratch_bytes_for(budget().max_patches())
@@ -788,9 +807,29 @@ impl Vit {
             s.push(d);
         }
         self.s = s;
+        // #117: the twelve buffers are LENDABLE: `run` rewrites every one of them per
+        // image before the tower reads it; the scalar slots above are not (constants)
+        let alloc_or_unwind_lendable = |what: &str, bytes: usize, taken: &mut Vec<Dev>| -> Dev {
+            match cuda::try_alloc_lendable(what, bytes) {
+                Ok(d) => {
+                    taken.push(d);
+                    d
+                }
+                Err(e) => {
+                    for d in taken.iter_mut() {
+                        cuda::free_dev(d);
+                    }
+                    tracing::info!(target: "vit",
+                        "[vit] scratch allocation refused after {} buffer(s) - they were freed, the tower stays unarmed",
+                        taken.len()
+                    );
+                    e.raise()
+                }
+            }
+        };
         let mut alloc4 = |what: &str, n: usize, taken: &mut Vec<Dev>| {
             bytes += n * 4;
-            alloc_or_unwind(what, n * 4, taken)
+            alloc_or_unwind_lendable(what, n * 4, taken)
         };
         self.x = alloc4("the vit residual stream", cap * VIT_HIDDEN, &mut taken);
         self.normed = alloc4("the vit norm scratch", cap * VIT_HIDDEN, &mut taken);
@@ -2588,5 +2627,18 @@ mod image_identity {
         assert_eq!(hex(&image_key(&[b'a'; 55])), "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318");
         assert_eq!(hex(&image_key(&[b'a'; 56])), "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a");
         assert_eq!(hex(&image_key(&[b'a'; 64])), "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb");
+    }
+}
+
+#[cfg(test)]
+mod tests_117 {
+    use super::*;
+
+    #[test]
+    fn the_twelve_buffers_sum_to_the_scratch_bytes() {
+        for cap in [4096usize, 5120] {
+            let sum: usize = scratch_buffer_bytes(cap).iter().map(|&(_, b)| b).sum();
+            assert_eq!(sum, scratch_bytes_for(cap), "cap {cap}");
+        }
     }
 }

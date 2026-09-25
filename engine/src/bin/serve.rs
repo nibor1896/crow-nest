@@ -81,6 +81,13 @@
 //!
 //! - `std::net::TcpListener`, blocking, one request at a time, no async stack.
 //! - A second connection waits in the accept queue; no 503.
+//! - #117 VRAM lending: `POST /v1/crow/vram/lend` runs between two requests (so the
+//!   engine is idle by construction), releases the physical memory of the stateless
+//!   scratch (`cuda::lend_release`) and answers; `POST /v1/crow/vram/return` or the
+//!   `ttl_s` maps it back at the same addresses (`cuda::lend_remap`). While lent the
+//!   loop polls the listener with the ttl left; a chat or `/slots/0` request is read
+//!   and PARKED (`lend::Parked`), served in arrival order right after the return;
+//!   `/health`, `/props`, `/slots` and the lend routes answer at once.
 //!
 //! One engine per machine:
 //!
@@ -794,6 +801,12 @@ enum Route {
     Slots,
     /// `POST /slots/0?action=save|restore` (#32 A10)
     Slot0,
+    /// #117: `POST /v1/crow/vram/lend`, lend stateless scratch VRAM while idle
+    VramLend,
+    /// #117: `POST /v1/crow/vram/return`, take it back
+    VramReturn,
+    /// #117: `GET /v1/crow/vram`, the lend state
+    VramStatus,
     /// everything else, a wrong method on a known path included
     NotFound,
 }
@@ -806,8 +819,17 @@ fn route(method: &str, path: &str) -> Route {
         ("POST", "/v1/chat/completions") => Route::Chat,
         ("GET", "/slots") => Route::Slots,
         ("POST", "/slots/0") => Route::Slot0,
+        ("POST", "/v1/crow/vram/lend") => Route::VramLend,
+        ("POST", "/v1/crow/vram/return") => Route::VramReturn,
+        ("GET", "/v1/crow/vram") => Route::VramStatus,
         _ => Route::NotFound,
     }
+}
+
+/// #117: the routes that run the ENGINE (touch device memory). While VRAM is
+/// lent they are parked until the return; every other route answers at once.
+fn engine_route(r: Route) -> bool {
+    matches!(r, Route::Chat | Route::Slot0)
 }
 
 /// what one connection sent, as far as the head reader could tell
@@ -3349,7 +3371,7 @@ fn socket_fd(_stream: &TcpStream) -> Option<i32> {
 ///   (`sse_send`), and the document path writes NOTHING until the generation is over. So a
 ///   client that disconnected after a `stream:false` POST with `max_tokens: 512` held the one
 ///   slot of this process for the whole budget - the one asymmetry between the two sinks.
-/// - What it holds: the descriptor (borrowed - the `TcpStream` of `serve_one` owns it for the
+/// - What it holds: the descriptor (borrowed - the `TcpStream` of `dispatch` owns it for the
 ///   whole request and closes it), and what the FIRST probe found.
 /// - `Default` is the no-socket form: `fd` `None`, so `gone` is always `None` and every unit
 ///   test and every non-Linux build runs the loop exactly as it ran before #54.
@@ -5122,6 +5144,10 @@ struct Srv<'a> {
     /// request is the difference of two blocks - held here, never on the device.
     prev_counters: Vec<[u64; 2]>,
     prev_ple: (u64, u64),
+    /// #117: the VRAM lend state (idle or lent, ttl, retry)
+    lend: crow_nest_engine::lend::LendGate,
+    /// #117: engine requests that arrived while the VRAM was lent, served after the return
+    parked: crow_nest_engine::lend::Parked<(TcpStream, Head)>,
     /// #68: the cross-turn repeat counter's ring, per process (see the module doc). The one
     /// piece of state this server keeps about what the MODEL said, and only the log reads it.
     repeats: RepeatRing,
@@ -5181,7 +5207,7 @@ where
 
 /// - `POST /slots/0?action=save|restore` (#32 A10)
 /// - every refusal is a 4xx with a JSON error body and leaves the engine untouched
-/// - the return value is the status and the document `serve_one` writes
+/// - the return value is the status and the document `dispatch` writes
 fn slot_route(srv: &mut Srv, target: &str, body: &[u8]) -> (&'static str, serde_json::Value) {
     let refuse = |msg: String| {
         tracing::warn!(target: "slot", "[slot] refused: {msg}");
@@ -5243,25 +5269,152 @@ fn slot_route(srv: &mut Srv, target: &str, body: &[u8]) -> (&'static str, serde_
     }
 }
 
-fn serve_one(stream: &mut TcpStream, srv: &mut Srv) {
+// ------------------------------------------------ #117: VRAM lending
+
+const MIB_F: f64 = (1u64 << 20) as f64;
+
+/// the one boot line: lendable MiB, or why lending is off
+fn vram_boot_line() -> String {
+    let (total, _, n) = crow_nest_engine::cuda::lendable_bytes();
+    if !crow_nest_engine::cuda::lend_enabled() {
+        "#117 VRAM lending off (CROW_VRAM_LEND=0): POST /v1/crow/vram/lend answers 501".to_string()
+    } else {
+        format!(
+            "#117 VRAM lending on: {:.0} MiB lendable in {n} VMM allocation(s) (stateless scratch; POST /v1/crow/vram/lend, /return, GET /v1/crow/vram)",
+            total as f64 / MIB_F
+        )
+    }
+}
+
+/// `POST /v1/crow/vram/lend`: release stateless scratch while idle. serve is single
+/// threaded, so the request in flight (if any) has ended before this runs.
+fn vram_lend(srv: &mut Srv, body: &[u8]) -> (&'static str, serde_json::Value) {
+    use crow_nest_engine::lend::{parse_lend, Refusal};
+    let (lendable, _, _) = crow_nest_engine::cuda::lendable_bytes();
+    if !crow_nest_engine::cuda::lend_enabled() || lendable == 0 {
+        return ("501 Not Implemented", error_json("VRAM lending is off in this serve (CROW_VRAM_LEND=0 or nothing lendable)"));
+    }
+    let p = match parse_lend(body).and_then(|p| srv.lend.check_lend().map(|_| p)) {
+        Ok(p) => p,
+        Err(Refusal::AlreadyLent) => {
+            return ("409 Conflict", error_json(&format!(
+                "VRAM is already lent ({:.0} MiB); POST /v1/crow/vram/return first", srv.lend.lent_bytes() as f64 / MIB_F)));
+        }
+        Err(Refusal::BadRequest(m)) => return ("400 Bad Request", error_json(&m)),
+    };
+    // SAFETY: the context is current (this thread loaded the engine); no request
+    // runs until the return, because every engine route is parked while lent
+    let before = unsafe { crow_nest_engine::cuda::free_vram_bytes() };
+    let out = unsafe { crow_nest_engine::cuda::lend_release(p.bytes) };
+    let after = unsafe { crow_nest_engine::cuda::free_vram_bytes() };
+    srv.lend.lent(Instant::now(), out.bytes, p.ttl);
+    tracing::info!(target: "lend",
+        "[lend] lent {:.0} MiB of {:.0} requested in {:.1} ms ({} region(s): {}), free VRAM {:.0} -> {:.0} MiB, ttl {} s",
+        out.bytes as f64 / MIB_F, p.bytes as f64 / MIB_F, out.ms, out.regions, out.what.join(", "),
+        before as f64 / MIB_F, after as f64 / MIB_F, p.ttl.as_secs());
+    ("200 OK", serde_json::json!({
+        "lent_mib": out.bytes as f64 / MIB_F,
+        "requested_mib": p.bytes >> 20,
+        "free_vram_mib": after as f64 / MIB_F,
+        "free_vram_mib_before": before as f64 / MIB_F,
+        "release_ms": out.ms,
+        "regions": out.regions,
+        "ttl_s": p.ttl.as_secs(),
+    }))
+}
+
+/// `POST /v1/crow/vram/return`, the ttl and the retry: map the memory back at the
+/// same addresses. Nothing lent = 200 with 0 (idempotent for a client's `finally`).
+fn vram_return(srv: &mut Srv, why: &str) -> (&'static str, serde_json::Value) {
+    if !srv.lend.is_lent() {
+        return ("200 OK", serde_json::json!({ "returned_mib": 0, "note": "nothing lent" }));
+    }
+    // SAFETY: the context is current; the lent ranges are reserved and unmapped
+    match unsafe { crow_nest_engine::cuda::lend_remap() } {
+        Ok(out) => {
+            let (bytes, lent_for) = srv.lend.returned(Instant::now()).unwrap_or_default();
+            let free = unsafe { crow_nest_engine::cuda::free_vram_bytes() };
+            tracing::info!(target: "lend",
+                "[lend] returned {:.0} MiB in {:.1} ms ({} region(s) remapped at the same addresses and zeroed) after {:.1} s lent ({why}), free VRAM {:.0} MiB, {} parked request(s) next",
+                bytes as f64 / MIB_F, out.ms, out.regions, lent_for.as_secs_f64(), free as f64 / MIB_F, srv.parked.len());
+            ("200 OK", serde_json::json!({
+                "returned_mib": bytes as f64 / MIB_F,
+                "remap_ms": out.ms,
+                "lent_s": lent_for.as_secs_f64(),
+                "free_vram_mib": free as f64 / MIB_F,
+            }))
+        }
+        Err(e) => {
+            srv.lend.return_failed(Instant::now());
+            let msg = e.message();
+            tracing::warn!(target: "lend",
+                "[lend] return failed ({why}): {msg} - the VRAM is still held by another process; retrying in 1 s, {} request(s) wait",
+                srv.parked.len());
+            ("503 Service Unavailable", error_json(&format!("return failed, serve retries every second: {msg}")))
+        }
+    }
+}
+
+/// `GET /v1/crow/vram`
+fn vram_status(srv: &Srv) -> serde_json::Value {
+    let (total, lent, _) = crow_nest_engine::cuda::lendable_bytes();
+    serde_json::json!({
+        "enabled": crow_nest_engine::cuda::lend_enabled() && total > 0,
+        "lendable_mib": total as f64 / MIB_F,
+        "lent": srv.lend.is_lent(),
+        "lent_mib": lent as f64 / MIB_F,
+        "ttl_remaining_s": srv.lend.ttl_remaining(Instant::now()).map(|d| d.as_secs_f64()),
+        "parked": srv.parked.len(),
+    })
+}
+
+/// the head of one connection, or `None` when it cannot be read (logged)
+fn read_conn(stream: &mut TcpStream) -> Option<Head> {
     let t = Duration::from_secs(IO_TIMEOUT_SECS);
     if let Err(e) = stream.set_read_timeout(Some(t)) {
         tracing::warn!(target: "serve", "[serve] no read timeout on this connection, closing: {e}");
-        return;
+        return None;
     }
     if let Err(e) = stream.set_write_timeout(Some(t)) {
         tracing::warn!(target: "serve", "[serve] no write timeout on this connection, closing: {e}");
-        return;
+        return None;
     }
-
-    let head = match read_head(stream) {
-        Ok(h) => h,
+    match read_head(stream) {
+        Ok(h) => Some(h),
         Err(e) => {
             tracing::warn!(target: "serve", "[serve] read failed or timed out after {IO_TIMEOUT_SECS}s, closing: {e}");
+            None
+        }
+    }
+}
+
+/// #117: one accepted connection. An engine request that arrives while VRAM is
+/// lent is PARKED (connection held, head already read) and served right after
+/// the return; everything else is answered now.
+fn accept_one(mut stream: TcpStream, srv: &mut Srv) {
+    let Some(head) = read_conn(&mut stream) else { return };
+    if let Head::Req { method, target, .. } = &head {
+        if !srv.lend.admits_engine() && engine_route(route(method, route_path(target))) {
+            tracing::info!(target: "lend",
+                "[lend] parked {method} {target} until the VRAM is returned ({} waiting, ttl left {:.0} s)",
+                srv.parked.len() + 1,
+                srv.lend.ttl_remaining(Instant::now()).unwrap_or_default().as_secs_f64());
+            srv.parked.park((stream, head));
             return;
         }
-    };
+    }
+    dispatch(&mut stream, srv, head);
+}
 
+/// #117: serve the parked engine requests, first come first served, once the
+/// VRAM is back
+fn drain_parked(srv: &mut Srv) {
+    while let Some((mut stream, head)) = srv.parked.next_admitted(&srv.lend) {
+        dispatch(&mut stream, srv, head);
+    }
+}
+
+fn dispatch(stream: &mut TcpStream, srv: &mut Srv, head: Head) {
     let (label, status, doc) = match head {
         Head::Empty => return,
         Head::Bad => (
@@ -5310,6 +5463,15 @@ fn serve_one(stream: &mut TcpStream, srv: &mut Srv) {
                     let (status, doc) = slot_route(srv, &target, &body);
                     (label, status, doc)
                 }
+                Route::VramLend => {
+                    let (status, doc) = vram_lend(srv, &body);
+                    (label, status, doc)
+                }
+                Route::VramReturn => {
+                    let (status, doc) = vram_return(srv, "POST /v1/crow/vram/return");
+                    (label, status, doc)
+                }
+                Route::VramStatus => (label, "200 OK", vram_status(srv)),
                 Route::NotFound => (label, "404 Not Found", not_found_json(&path)),
             }
         }
@@ -5576,10 +5738,40 @@ fn main() {
         prev_counters: Vec::new(),
         prev_ple: (0, 0),
         repeats: RepeatRing::default(),
+        lend: crow_nest_engine::lend::LendGate::new(),
+        parked: crow_nest_engine::lend::Parked::default(),
     };
-    for conn in listener.incoming() {
-        match conn {
-            Ok(mut s) => serve_one(&mut s, &mut srv),
+    tracing::info!(target: "serve", "[serve] {}", vram_boot_line());
+    let lfd = listener.as_raw_fd();
+    loop {
+        // #117: while VRAM is lent the loop must wake up for the ttl even when no
+        // client connects: poll the listener with the time left, then accept
+        if let Some(due) = srv.lend.due(Instant::now()) {
+            let why = match due {
+                crow_nest_engine::lend::Due::Ttl => "ttl expired",
+                crow_nest_engine::lend::Due::Retry => "retry after a failed return",
+            };
+            let _ = vram_return(&mut srv, why);
+            drain_parked(&mut srv);
+            continue;
+        }
+        if let Some(w) = srv.lend.wait(Instant::now()) {
+            let ms = w.as_millis().clamp(1, 1000) as libc::c_int;
+            let mut pfd = libc::pollfd { fd: lfd, events: libc::POLLIN, revents: 0 };
+            // SAFETY: one valid pollfd for the listener's open descriptor
+            let r = unsafe { libc::poll(&mut pfd, 1, ms) };
+            if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            if r <= 0 {
+                continue; // timeout or EINTR: check the ttl again
+            }
+        }
+        match listener.accept() {
+            Ok((s, _)) => {
+                accept_one(s, &mut srv);
+                drain_parked(&mut srv);
+            }
             Err(e) => {
                 if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
                     break; // #82: the watcher shut the listener - end through the drops
@@ -5588,6 +5780,12 @@ fn main() {
             }
         }
     }
+    // #117: a request still parked at shutdown gets its connection closed, and the
+    // lent address ranges are freed by the Engine drop (`cuda::free_dev`)
+    if !srv.parked.is_empty() {
+        tracing::info!(target: "lend", "[lend] shutdown with {} parked request(s): closed unanswered", srv.parked.len());
+    }
+    srv.parked.clear();
     // #28: a parked device sampler goes back into the engine, so `Engine::drop` frees its
     // buffers (the accept loop above only ends on a listener error)
     srv.eng.unpark_sampler(&mut srv.parked_sampler);
@@ -5640,7 +5838,7 @@ mod tests {
 
     #[test]
     fn dispatch_is_method_and_path() {
-        // the request line goes through the same two helpers serve_one uses
+        // the request line goes through the same two helpers read_conn uses
         let d = |line: &str| {
             let (m, t) = parse_request_line(line).expect("request line parses");
             route(&m, route_path(&t))
@@ -5659,6 +5857,27 @@ mod tests {
         assert_eq!(d("POST /v1/chat/completions?x=1 HTTP/1.1\r\n"), Route::Chat);
         // the chat path answers POST only
         assert_eq!(d("GET /v1/chat/completions HTTP/1.1\r\n"), Route::NotFound);
+    }
+
+    /// #117: the lend routes, and which routes wait while the VRAM is lent
+    #[test]
+    fn the_vram_lend_routes_and_the_engine_routes_that_wait_for_the_return() {
+        let d = |line: &str| {
+            let (m, t) = parse_request_line(line).expect("request line parses");
+            route(&m, route_path(&t))
+        };
+        assert_eq!(d("POST /v1/crow/vram/lend HTTP/1.1\r\n"), Route::VramLend);
+        assert_eq!(d("POST /v1/crow/vram/return HTTP/1.1\r\n"), Route::VramReturn);
+        assert_eq!(d("GET /v1/crow/vram HTTP/1.1\r\n"), Route::VramStatus);
+        assert_eq!(d("GET /v1/crow/vram/lend HTTP/1.1\r\n"), Route::NotFound);
+        assert_eq!(d("POST /v1/crow/vram HTTP/1.1\r\n"), Route::NotFound);
+        // parked while lent: everything that runs the engine
+        assert!(engine_route(Route::Chat));
+        assert!(engine_route(Route::Slot0));
+        // answered at once: health, props, the slot list, the lend routes themselves
+        for r in [Route::Health, Route::Props, Route::Slots, Route::VramLend, Route::VramReturn, Route::VramStatus, Route::NotFound] {
+            assert!(!engine_route(r), "{r:?}");
+        }
     }
 
     #[test]

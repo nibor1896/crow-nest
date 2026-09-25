@@ -58,6 +58,7 @@
 //!   the reason `impl Drop for Engine` in `gen` can call `drop_decode_graph`
 //!   without a `use` edge that any import graph would show.
 //! - [`slot`] → cache, cuda, gen, geo: the slot file behind `POST /slots/0`.
+//! - [`lend`] → cuda, gen, vit: #117 VRAM lending, the state machine, the parked queue and the tier-1 plan.
 //!
 //! The bins (`engine/src/bin`) are separate crates: `pub(crate)` is a hard wall to
 //! them, so `Engine`'s API surface is what they can reach (architecture 8.3).
@@ -103,6 +104,9 @@ pub mod slot;
 // #VIT: the visual tower (the container "vit" section), Crow image decoding and
 // preprocessing, the interleaved-mrope tables and the prefill splice plan
 pub mod vit;
+// #117: VRAM lending to a co-resident GPU client - the state machine, the parked
+// request queue and the tier-1 plan (pure); the VMM half lives in `cuda`
+pub mod lend;
 // TASK D (2026-09-17): the cuTile Rust pilot, behind the default-off `cutile-pilot`
 // feature. An evaluation artefact for docs/cuda-rust-evaluation.md, not a production
 // path; nothing in the engine calls it.

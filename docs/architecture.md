@@ -3771,6 +3771,52 @@ is not exhausted), more VRAM for the hot set (the planner already maximizes N ag
 KV budget; N=155 with 7 slots surrendered to the trickle), or a cold tier that is smaller per expert
 (a low-bit tier, which is not bit-identical and therefore not this).
 
+### 7.15 VRAM lending to a co-resident renderer (#117, 2026-09-25)
+
+Crow's `render_page` renders on the GPU only (Crow #293) and needs 512 MiB free (1536 with its
+browser panel, Crow #279); serve leaves about 0.57 GiB free after load and less during a request.
+A static reserve (#110) does not boot on robin's machine (the 46 GiB host pinned cap binds, see
+2.1). While Crow renders, the engine is idle, so serve LENDS the physical memory of the buffers
+that hold no state between requests and takes it back afterwards.
+
+| part | where | what |
+|---|---|---|
+| lendable allocation | `cuda::try_alloc_lendable` / `alloc_lendable` | `cuMemAddressReserve` once, then `cuMemCreate` + `cuMemMap` + `cuMemSetAccess` + zero; below `LEND_MIN_BYTES` (8 MiB) or with `CROW_VRAM_LEND=0` plain `cuMemAlloc` |
+| lend | `cuda::lend_release(target)` | `cuCtxSynchronize`, then `cuMemUnmap` + `cuMemRelease` largest first until the target is reached; the VA stays reserved |
+| return | `cuda::lend_remap()` | new physical memory mapped at the SAME address, zeroed (the boot state); a refusal leaves the rest lent and is retried |
+| state machine | `lend::LendGate`, `lend::Parked`, `lend::parse_lend` | idle / lent, no double lend, ttl (default 120 s, max 600 s), retry every 1 s after a failed return, FIFO of parked engine requests |
+| endpoints | `serve.rs` `vram_lend`, `vram_return`, `vram_status` | `POST /v1/crow/vram/lend {"mib","ttl_s"}`, `POST /v1/crow/vram/return`, `GET /v1/crow/vram` (engine/README endpoint table) |
+
+- **Lendable (tier 1, `lend::tier1_plan`):** the #10b scratch persist and union regions (every
+  buffer written in the layer body before it is read, the liveness audit in `Scratch::alloc`'s doc),
+  the QSA `pool_raw/nrm/rot` and `scores` scratch, the cold staging `Stage.gu/dn` (written by
+  `stage_cold` before every read), the vit scratch buffers of at least 8 MiB (rewritten by `run` per
+  image; the scalar slots are constants and stay), the mrope span pair (rewritten by `begin_vision`).
+  NOT lendable: KV, QSA key ring and pooled cache, GDN state, rope table, hot experts and their pointer
+  table, PLE row cache, dense weights, `logits`/`argmax`, the sampler, every parameter slot.
+- **Why VMM:** the decode CUDA graph bakes these buffers' raw addresses (`decode_step`, captured
+  once). `cuMemFree` + `cuMemAlloc` could move them; unmapping only the physical memory keeps the VA,
+  so the graph and every stored pointer stay valid (torch_memory_saver, SGLang
+  `release_memory_occupation`, cited in #117).
+- **Idle gate:** serve's accept loop is single threaded, so a lend is read only after the request in
+  flight ended. While lent the loop polls the listener with the ttl left; a chat or `/slots/0`
+  request is read and parked, then served in arrival order right after the return (vLLM #28714 is the
+  failure this prevents). `/health`, `/props`, `/slots` answer at once.
+- **Tier 2 (not built):** evicting hot units and restoring them from the container on disk. Tier 1
+  already lends 1698 MiB at the serve point, above the 1.6 GiB bar of #117.
+
+Measured 2026-09-25, RTX 5090, worktree build of #117 (on top of `93cd2c0`), serve default settings, n=1 run:
+
+| check | result |
+|---|---|
+| boot | N 160 -> 150 as before, `free VRAM after load 0.57 GiB`, `1698 MiB lendable in 18 VMM allocation(s)` |
+| free VRAM (nvidia-smi) | idle 574 MiB -> lent 2272 MiB -> returned 574 MiB |
+| lend / return wall | 4.0 ms release (curl 4.4 ms) / 9.6 ms remap (curl 9.7 ms); ttl return 1.4 ms |
+| headless Chromium while lent | `ANGLE (NVIDIA, Vulkan 1.4.341 (NVIDIA NVIDIA GeForce RTX 5090 (0x00002B85)), NVIDIA)` |
+| parked request | a chat sent while lent waited, was served after the return (200), text identical to the pre-lend prefix |
+| decode, 3 identical seeded requests (136 tok) | before 56.2 / 56.2 / 56.1 tok/s, after one lend/return 58.0 / 56.2 / 56.2 (mean +1.1 %); all nine answers byte-identical |
+| image request after a return | 200, the tower ran on the remapped scratch; no CUDA error in the whole log |
+
 ## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18)
 
 Sections 0 to 7 say what the engine must do. This section says how the crate is put together,
@@ -3827,7 +3873,7 @@ and module load, device alloc/copy/free, the active-stream register, the CUDA-Gr
 points loaded by hand out of `nvcuda.dll` / `libcuda.so.1` (cudarc 0.19.9 binds them for CUDA
 11.4–11.8 only), pinned host memory (`Pinned`), and the host-RAM reading the pinned budget is
 derived from (`free_physical_ram_parts` → `HostRam`, `other_cuda_fd`), and the request-scoped
-allocation contract of TASK K (`try_alloc_zeroed`, `AllocFailed`, `RequestScope`). Surface: 69 `pub fn`
+allocation contract of TASK K (`try_alloc_zeroed`, `AllocFailed`, `RequestScope`), and since #117 the lendable VMM allocations (`try_alloc_lendable`, `lend_release`, `lend_remap`, `lendable_bytes`; `lend.rs` holds the pure state machine, 7.15). Surface: 69 `pub fn`
 plus `Ctx`, `Module`, `Pinned`, `HostRam`. Depends on nothing in the crate and may never
 depend on anything: it is the bottom. Every `#[cfg(windows)]` / `#[cfg(unix)]` split in the
 crate lives here except three: `cnq.rs`'s container mapping, `gen.rs`'s `pid_alive`, and the

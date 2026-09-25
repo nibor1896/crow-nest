@@ -1073,7 +1073,8 @@ impl Engine {
         let (mrope_cos, mrope_sin, mrope_rows) = if vit.is_some() && vit_hold {
             let bytes = cfg.context * ROPE_PAIRS * 4;
             let what = format!("the interleaved-mrope span tables ({} rows x {ROPE_PAIRS} pairs f32, held at boot)", cfg.context);
-            (cuda::alloc_named(&what, bytes), cuda::alloc_named(&what, bytes), cfg.context)
+            // #117: lendable, rewritten by every begin_vision (`to_f32_into` below)
+            (cuda::alloc_lendable(&what, bytes), cuda::alloc_lendable(&what, bytes), cfg.context)
         } else {
             (0, 0, 0)
         };
@@ -1198,8 +1199,9 @@ impl Engine {
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
         let max_tiles = cfg.prompt_chunk * TOPK / 8 + E + 1;
         let stage = Stage {
-            gu: cuda::alloc_zeroed(stage_max * slabs.gu_bytes as usize),
-            dn: cuda::alloc_zeroed(stage_max * slabs.dn_bytes as usize),
+            // #117: lendable, cold-expert staging written by stage_cold before every read
+            gu: cuda::alloc_lendable("the cold staging gate_up slots", stage_max * slabs.gu_bytes as usize),
+            dn: cuda::alloc_lendable("the cold staging down slots", stage_max * slabs.dn_bytes as usize),
             sgu: cuda::alloc_zeroed(stage_max * 8),
             sdn: cuda::alloc_zeroed(stage_max * 8),
             gu_b: cuda::to_i32_dev(&[slabs.gu_bytes as i32]),
@@ -2143,6 +2145,110 @@ impl Params {
 }
 
 impl Scratch {
+    /// #117: the six #10b sets at chunk `c` (persist, hc, attn, gdn, ple, moe),
+    /// `(name, bytes)`, exactly what `alloc` lays out; pure, so the lendable
+    /// bytes are testable without a GPU
+    pub fn diet_sets(c: usize) -> [Vec<(&'static str, usize)>; 6] {
+        let persist_set: Vec<(&'static str, usize)> = vec![
+            ("h", 4 * c * HCT),
+            ("x1", 4 * c * HCT),
+            ("mixed", 4 * c * H),
+            ("mixed_m", 4 * c * H),
+            ("moe_out", 4 * c * H),
+            ("xq_m", c * xq_row_bytes(H / 64)),
+            ("xq_gu", c * xq_row_bytes(H / 64)),
+            ("xq_v", c * xq_row_bytes(GDN_VAL / 64)),
+            ("injr", 4 * c * HCN),
+            ("injw", 4 * c * HCN),
+            ("mixed_final", 4 * c * H),
+        ];
+        let hc_set: Vec<(&'static str, usize)> = vec![
+            ("normed", 4 * c * HCT),
+            ("mixw", 4 * c * HCT),
+            ("low", 4 * c * LOWRANK),
+            ("sil", 4 * c * LOWRANK),
+        ];
+        let attn_set: Vec<(&'static str, usize)> = vec![
+            ("qg", 4 * c * Q_ROWS),
+            ("aq", 4 * c * CORE),
+            ("agate", 4 * c * CORE),
+            ("aqn", 4 * c * CORE),
+            ("aqr", 4 * c * CORE),
+            ("ak", 4 * c * KV_ROWS),
+            ("akn", 4 * c * KV_ROWS),
+            ("akr", 4 * c * KV_ROWS),
+            ("av", 4 * c * KV_ROWS),
+            ("aout", 4 * c * CORE),
+            ("agated", 4 * c * CORE),
+            ("ay", 4 * c * H),
+            ("qk", 4 * c * QSA_QK_ROWS),
+            ("q_nrm", 4 * c * QSA_HEADS * QSA_HD),
+            ("q_rot", 4 * c * QSA_HEADS * QSA_HD),
+            ("sel", c * QSA_SEL_MAX * 4),
+            ("sel_n", c * 4),
+        ];
+        let gdn_set: Vec<(&'static str, usize)> = vec![
+            ("mq", 4 * c * GDN_CONV),
+            ("mq_t", 4 * GDN_CONV * c),
+            ("cout_t", 4 * GDN_CONV * c),
+            ("gq", 4 * c * GDN_KEY),
+            ("gk", 4 * c * GDN_KEY),
+            ("gv", 4 * c * GDN_VAL),
+            ("gz", 4 * c * GDN_VAL),
+            ("gb", 4 * c * GDN_VHEADS),
+            ("ga", 4 * c * GDN_VHEADS),
+            ("gbeta", 4 * c * GDN_VHEADS),
+            ("gg", 4 * c * GDN_VHEADS),
+            ("gqr", 4 * c * GDN_VAL),
+            ("gkr", 4 * c * GDN_VAL),
+            ("gcore", 4 * c * GDN_VAL),
+            ("gnorm", 4 * c * GDN_VAL),
+            ("gout", 4 * c * H),
+        ];
+        let ple_set: Vec<(&'static str, usize)> = vec![
+            ("emb", 4 * c * PLE_EMBED),
+            ("ple_key", 4 * c * HCT),
+            ("ple_kn", 4 * c * HCT),
+            ("ple_val", 4 * c * PLE_EMBED),
+            ("ple_qn", 4 * c * HCT),
+            ("ple_gate", 4 * c * HCN),
+            ("ple_gs", 4 * c * HCN),
+            ("ple_gated", 4 * c * HCT),
+            ("ple_gn", 4 * c * HCT),
+            ("ple_out", 4 * c * HCT),
+            ("ple_slots", c * PLE_NHEADS * 4),
+            ("xq_e", c * xq_row_bytes(H / 64)),
+        ];
+        let moe_set: Vec<(&'static str, usize)> = vec![
+            ("h1", 4 * c * TOPK * 2 * INTER),
+            ("h2", 4 * c * TOPK * INTER),
+            ("eo", 4 * c * TOPK * H),
+            ("xq_dn", c * TOPK * xq_row_bytes(INTER / 64)),
+            ("xq_s", c * xq_row_bytes(INTER / 64)),
+            ("sh12", 4 * c * 2 * INTER),
+            ("sh2", 4 * c * INTER),
+            ("sdown", 4 * c * H),
+            ("sgv", 4 * c),
+            ("rlog", 4 * c * E),
+            ("rids", c * TOPK * 4),
+            ("rwts", 4 * c * TOPK),
+            ("gu_ptrs", c * TOPK * 8),
+            ("dn_ptrs", c * TOPK * 8),
+            ("cold", c * 4),
+        ];
+        [persist_set, hc_set, attn_set, gdn_set, ple_set, moe_set]
+    }
+
+    /// #117: (persist region, union region) bytes at chunk `c`, as `alloc` takes them
+    pub fn diet_region_bytes(c: usize) -> (usize, usize) {
+        let region_bytes = |set: &[(&str, usize)]| -> usize {
+            set.iter().map(|&(_, n)| (n + 255) & !255).sum()
+        };
+        let [pe, hc, at, gd, pl, mo] = Self::diet_sets(c);
+        let union = [&hc, &at, &gd, &pl, &mo].iter().map(|set| region_bytes(set)).max().unwrap();
+        (region_bytes(&pe), union)
+    }
+
     /// #10b (2026-09-13): per-chunk scratch diet. Every per-chunk buffer was
     /// audited and classified by liveness (the full table lives in
     /// task-10b-report.md); the layout becomes two regions instead of one
@@ -2180,99 +2286,14 @@ impl Scratch {
         // (name, bytes) sets; the byte counts are EXACTLY the old per-buffer
         // d()/db() calls (d = n*4 for the f32/i32 buffers, db = n for the
         // byte buffers), so every buffer keeps its old shape.
-        let persist_set: &[(&str, usize)] = &[
-            ("h", 4 * c * HCT),
-            ("x1", 4 * c * HCT),
-            ("mixed", 4 * c * H),
-            ("mixed_m", 4 * c * H),
-            ("moe_out", 4 * c * H),
-            ("xq_m", c * xq_row_bytes(H / 64)),
-            ("xq_gu", c * xq_row_bytes(H / 64)),
-            ("xq_v", c * xq_row_bytes(GDN_VAL / 64)),
-            ("injr", 4 * c * HCN),
-            ("injw", 4 * c * HCN),
-            ("mixed_final", 4 * c * H),
-        ];
-        let hc_set: &[(&str, usize)] = &[
-            ("normed", 4 * c * HCT),
-            ("mixw", 4 * c * HCT),
-            ("low", 4 * c * LOWRANK),
-            ("sil", 4 * c * LOWRANK),
-        ];
-        let attn_set: &[(&str, usize)] = &[
-            ("qg", 4 * c * Q_ROWS),
-            ("aq", 4 * c * CORE),
-            ("agate", 4 * c * CORE),
-            ("aqn", 4 * c * CORE),
-            ("aqr", 4 * c * CORE),
-            ("ak", 4 * c * KV_ROWS),
-            ("akn", 4 * c * KV_ROWS),
-            ("akr", 4 * c * KV_ROWS),
-            ("av", 4 * c * KV_ROWS),
-            ("aout", 4 * c * CORE),
-            ("agated", 4 * c * CORE),
-            ("ay", 4 * c * H),
-            ("qk", 4 * c * QSA_QK_ROWS),
-            ("q_nrm", 4 * c * QSA_HEADS * QSA_HD),
-            ("q_rot", 4 * c * QSA_HEADS * QSA_HD),
-            ("sel", c * QSA_SEL_MAX * 4),
-            ("sel_n", c * 4),
-        ];
-        let gdn_set: &[(&str, usize)] = &[
-            ("mq", 4 * c * GDN_CONV),
-            ("mq_t", 4 * GDN_CONV * c),
-            ("cout_t", 4 * GDN_CONV * c),
-            ("gq", 4 * c * GDN_KEY),
-            ("gk", 4 * c * GDN_KEY),
-            ("gv", 4 * c * GDN_VAL),
-            ("gz", 4 * c * GDN_VAL),
-            ("gb", 4 * c * GDN_VHEADS),
-            ("ga", 4 * c * GDN_VHEADS),
-            ("gbeta", 4 * c * GDN_VHEADS),
-            ("gg", 4 * c * GDN_VHEADS),
-            ("gqr", 4 * c * GDN_VAL),
-            ("gkr", 4 * c * GDN_VAL),
-            ("gcore", 4 * c * GDN_VAL),
-            ("gnorm", 4 * c * GDN_VAL),
-            ("gout", 4 * c * H),
-        ];
-        let ple_set: &[(&str, usize)] = &[
-            ("emb", 4 * c * PLE_EMBED),
-            ("ple_key", 4 * c * HCT),
-            ("ple_kn", 4 * c * HCT),
-            ("ple_val", 4 * c * PLE_EMBED),
-            ("ple_qn", 4 * c * HCT),
-            ("ple_gate", 4 * c * HCN),
-            ("ple_gs", 4 * c * HCN),
-            ("ple_gated", 4 * c * HCT),
-            ("ple_gn", 4 * c * HCT),
-            ("ple_out", 4 * c * HCT),
-            ("ple_slots", c * PLE_NHEADS * 4),
-            ("xq_e", c * xq_row_bytes(H / 64)),
-        ];
-        let moe_set: &[(&str, usize)] = &[
-            ("h1", 4 * c * TOPK * 2 * INTER),
-            ("h2", 4 * c * TOPK * INTER),
-            ("eo", 4 * c * TOPK * H),
-            ("xq_dn", c * TOPK * xq_row_bytes(INTER / 64)),
-            ("xq_s", c * xq_row_bytes(INTER / 64)),
-            ("sh12", 4 * c * 2 * INTER),
-            ("sh2", 4 * c * INTER),
-            ("sdown", 4 * c * H),
-            ("sgv", 4 * c),
-            ("rlog", 4 * c * E),
-            ("rids", c * TOPK * 4),
-            ("rwts", 4 * c * TOPK),
-            ("gu_ptrs", c * TOPK * 8),
-            ("dn_ptrs", c * TOPK * 8),
-            ("cold", c * 4),
-        ];
+        let [persist_set, hc_set, attn_set, gdn_set, ple_set, moe_set] = Self::diet_sets(c);
         let region_bytes = |set: &[(&str, usize)]| -> usize {
             set.iter().map(|&(_, n)| (n + 255) & !255).sum()
         };
-        let union_bytes = [hc_set, attn_set, gdn_set, ple_set, moe_set]
-            .iter().map(|&set| region_bytes(set)).max().unwrap();
-        let persist_bytes = region_bytes(persist_set);
+        let union_bytes = [&hc_set, &attn_set, &gdn_set, &ple_set, &moe_set]
+            .iter().map(|set| region_bytes(set)).max().unwrap();
+        let persist_bytes = region_bytes(&persist_set);
+        debug_assert_eq!((persist_bytes, union_bytes), Self::diet_region_bytes(c));
         // lay one set out from base at 256 B alignment, return the pointers
         let alloc_set = |base: Dev, set: &[(&str, usize)]| -> Vec<Dev> {
             let mut off = 0usize;
@@ -2282,14 +2303,16 @@ impl Scratch {
                 p
             }).collect()
         };
-        let persist_region = cuda::alloc_zeroed(persist_bytes);
-        let union_region = cuda::alloc_zeroed(union_bytes);
-        let pe = alloc_set(persist_region, persist_set);
-        let hc = alloc_set(union_region, hc_set);
-        let at = alloc_set(union_region, attn_set);
-        let gd = alloc_set(union_region, gdn_set);
-        let pl = alloc_set(union_region, ple_set);
-        let mo = alloc_set(union_region, moe_set);
+        // #117: both regions are LENDABLE (no state between requests, #10b liveness
+        // above: every buffer is written in the layer body before it is read)
+        let persist_region = cuda::alloc_lendable("the scratch persist region (#10b)", persist_bytes);
+        let union_region = cuda::alloc_lendable("the scratch union region (#10b)", union_bytes);
+        let pe = alloc_set(persist_region, &persist_set);
+        let hc = alloc_set(union_region, &hc_set);
+        let at = alloc_set(union_region, &attn_set);
+        let gd = alloc_set(union_region, &gdn_set);
+        let pl = alloc_set(union_region, &ple_set);
+        let mo = alloc_set(union_region, &moe_set);
         Scratch {
             // persist
             h: pe[0], x1: pe[1], mixed: pe[2], mixed_m: pe[3], moe_out: pe[4],
@@ -2315,10 +2338,11 @@ impl Scratch {
             sh12: mo[5], sh2: mo[6], sdown: mo[7], sgv: mo[8], rlog: mo[9],
             rids: mo[10], rwts: mo[11], gu_ptrs: mo[12], dn_ptrs: mo[13], cold: mo[14],
             // fixed size, never chunk scaled (the #16 caps)
-            pool_raw: cuda::alloc_zeroed(cap_blocks * QSA_HID),
-            pool_nrm: cuda::alloc_zeroed(cap_blocks * QSA_HID),
-            pool_rot: cuda::alloc_zeroed(cap_blocks * QSA_HID),
-            scores: cuda::alloc_zeroed(attn_sb(c) * cap_blocks * 4),
+            // #117: lendable, per-chunk QSA temps (pooled/normed/rotated keys, scores)
+            pool_raw: cuda::alloc_lendable("the QSA pool_raw scratch", cap_blocks * QSA_HID),
+            pool_nrm: cuda::alloc_lendable("the QSA pool_nrm scratch", cap_blocks * QSA_HID),
+            pool_rot: cuda::alloc_lendable("the QSA pool_rot scratch", cap_blocks * QSA_HID),
+            scores: cuda::alloc_lendable("the QSA scores scratch", attn_sb(c) * cap_blocks * 4),
             part_o: cuda::alloc_zeroed(NQ * ATTN_SPLITS_MAX * AHD * 4),
             part_ml: cuda::alloc_zeroed(NQ * ATTN_SPLITS_MAX * 2 * 4),
             qsa_h1: cuda::alloc_zeroed(QSA_PAR_BINS * 4),
