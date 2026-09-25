@@ -554,9 +554,11 @@ pub const POST_PLAN_FLOOR: u64 = 256 << 20;
 /// `render_page`, a browser, the compositor), in MiB, when
 /// `CROW_RENDER_RESERVE_MB` is unset. robin's decision of 2026-09-25: under
 /// serve only 73-185 MiB stayed free and every Crow capture fell back to
-/// SwiftShader (Crow's GPU gate needs 512 MiB). 1024 MiB is llama.cpp's default
-/// per-device `--fit-target` margin.
-pub const RENDER_RESERVE_DEFAULT_MB: u64 = 1024;
+/// SwiftShader (Crow's GPU gate needs 512 MiB). 1536 MiB (lead, 2026-09-25, under
+/// robin's go; first 1024) also covers Crow's gate with its browser panel open
+/// (`crow_platform.py` `_GPU_HEADROOM_PANEL_MIB`, Crow #279) and is above
+/// llama.cpp's default per-device `--fit-target` margin of 1024 MiB.
+pub const RENDER_RESERVE_DEFAULT_MB: u64 = 1536;
 
 /// #110: `CROW_RENDER_RESERVE_MB` as bytes. `None` (unset) or an empty value =
 /// the default; `0` = off; anything that is not a whole number of MiB is an
@@ -793,7 +795,7 @@ mod tests_72 {
 mod tests_110 {
     //! #110: the render reserve. While serve ran, 73-185 MiB of VRAM stayed free
     //! and Crow's render_page (GPU gate 512 MiB) fell back to SwiftShader in every
-    //! capture of 2026-09-23/24. robin, 2026-09-25: 1024 MiB by default, kept FREE
+    //! capture of 2026-09-23/24. robin, 2026-09-25: 1536 MiB by default (Crow's panel gate), kept FREE
     //! by the planner, checked after the load. Pure arithmetic, no GPU.
     use super::*;
 
@@ -820,11 +822,11 @@ mod tests_110 {
     }
 
     #[test]
-    fn the_render_reserve_defaults_to_1024_mib_and_0_turns_it_off() {
-        assert_eq!(render_reserve_from(None), Ok(1024 << 20));
-        assert_eq!(render_reserve_from(Some("")), Ok(1024 << 20));
+    fn the_render_reserve_defaults_to_1536_mib_and_0_turns_it_off() {
+        assert_eq!(render_reserve_from(None), Ok(1536 << 20));
+        assert_eq!(render_reserve_from(Some("")), Ok(1536 << 20));
         assert_eq!(render_reserve_from(Some("0")), Ok(0));
-        assert_eq!(render_reserve_from(Some(" 1536 ")), Ok(1536 << 20));
+        assert_eq!(render_reserve_from(Some(" 1024 ")), Ok(1024 << 20));
         for bad in ["1g", "-1", "1.5", "off", "18446744073709551615"] {
             let e = render_reserve_from(Some(bad)).unwrap_err();
             assert!(e.starts_with("refusing config: CROW_RENDER_RESERVE_MB="), "{bad:?}: {e}");
@@ -832,15 +834,15 @@ mod tests_110 {
     }
 
     #[test]
-    fn the_default_render_reserve_costs_about_eight_units_and_stays_free_after_the_plan() {
+    fn the_default_render_reserve_costs_about_twelve_units_and_stays_free_after_the_plan() {
         let (n_off, _) = clamp_hot_n(&card(0)).unwrap();
         let reserve = render_reserve_from(None).unwrap();
         let c = card(reserve);
         let (n_on, lines) = clamp_hot_n(&c).unwrap();
         assert_eq!(n_off, 155);
-        // 1024 MiB / 132,710,400 B = 8.09 units: on this card (155 lands exactly on
-        // the boundary) the first N that fits is 9 lower
-        assert_eq!(n_on, 146, "the reserve did not lower N: {lines:?}");
+        // 1536 MiB / 132,710,400 B = 12.14 units: on this card (155 lands exactly on
+        // the boundary) the first N that fits is 13 lower
+        assert_eq!(n_on, 142, "the reserve did not lower N: {lines:?}");
         // what the plan leaves on the card once states, launch slack and the hot set
         // are counted: the clamp's SAFETY for the engine AND the whole reserve
         let planned = c.states_bytes + planner_pending(LAUNCH_SLACK, 0, 0, 0) + n_on as u64 * UNIT;
@@ -849,19 +851,19 @@ mod tests_110 {
 
     #[test]
     fn the_post_plan_check_requires_the_floor_plus_the_render_reserve() {
-        let reserve = 1024 << 20;
-        assert_eq!(post_plan_floor(reserve), (256 + 1024) << 20);
+        let reserve = render_reserve_from(None).unwrap();
+        assert_eq!(post_plan_floor(reserve), (256 + 1536) << 20);
         // 551 MiB: the #72 live check's free VRAM after load WITHOUT the reserve -
-        // enough for the old floor, SHORT once the renderer's 1 GiB is owed
+        // enough for the old floor, SHORT once the renderer's 1.5 GiB is owed
         let free = 551 << 20;
         assert!(headroom_ok(free, 0));
         assert!(!headroom_ok(free, reserve));
         let short = headroom_line(free, reserve);
-        assert!(short.starts_with("SHORT: free VRAM after load 0.54 GiB is BELOW the floor 1.25 GiB (post-plan 0.25 + render reserve 1.00)"), "{short}");
+        assert!(short.starts_with("SHORT: free VRAM after load 0.54 GiB is BELOW the floor 1.75 GiB (post-plan 0.25 + render reserve 1.50)"), "{short}");
         assert!(short.contains("CROW_RENDER_RESERVE_MB"), "{short}");
-        // the same boot with the reserve kept: 551 + 1024 MiB
+        // the same boot with the reserve kept: 551 + 1536 MiB
         let ok = headroom_line(free + reserve, reserve);
-        assert!(ok.starts_with("free VRAM after load 1.54 GiB >= floor 1.25 GiB (post-plan 0.25 + render reserve 1.00)"), "{ok}");
+        assert!(ok.starts_with("free VRAM after load 2.04 GiB >= floor 1.75 GiB (post-plan 0.25 + render reserve 1.50)"), "{ok}");
         // the boundary is inclusive, one byte less is SHORT
         assert!(headroom_ok(post_plan_floor(reserve), reserve));
         assert!(!headroom_ok(post_plan_floor(reserve) - 1, reserve));
@@ -869,12 +871,12 @@ mod tests_110 {
 
     #[test]
     fn the_render_reserve_has_its_own_budget_line() {
-        let on = render_reserve_line(1024 << 20, UNIT, false);
-        assert!(on.starts_with("render reserve    1024.0 MB  (default, CROW_RENDER_RESERVE_MB unset)"), "{on}");
+        let on = render_reserve_line(1536 << 20, UNIT, false);
+        assert!(on.starts_with("render reserve    1536.0 MB  (default, CROW_RENDER_RESERVE_MB unset)"), "{on}");
         assert!(on.contains("never allocated by the engine"), "{on}");
-        assert!(on.contains("costs 8.1 hot-set units"), "{on}");
-        let set = render_reserve_line(1536 << 20, UNIT, true);
-        assert!(set.contains("(CROW_RENDER_RESERVE_MB)") && set.contains("costs 12.1 hot-set units"), "{set}");
+        assert!(on.contains("costs 12.1 hot-set units"), "{on}");
+        let set = render_reserve_line(1024 << 20, UNIT, true);
+        assert!(set.contains("(CROW_RENDER_RESERVE_MB)") && set.contains("costs 8.1 hot-set units"), "{set}");
         let off = render_reserve_line(0, UNIT, true);
         assert!(off.starts_with("render reserve    0.0 MB  (CROW_RENDER_RESERVE_MB: off)"), "{off}");
         assert!(off.contains("fall back to software"), "{off}");

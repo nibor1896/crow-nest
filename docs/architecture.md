@@ -210,13 +210,14 @@ the card full. It is named on its own `[budget]` line and costs N 157 -> 155 at 
 point (7.13 has the two numbers and the measurement). `CROW_VIT=0` reserves nothing.
 
 It carries a **render reserve** too (#110, robin's decision 2026-09-25): `CROW_RENDER_RESERVE_MB`,
-default 1024 MiB, `0` = off, is added to `pending` (`manager::planner_pending`) and never
+default 1536 MiB, `0` = off, is added to `pending` (`manager::planner_pending`) and never
 allocated, so it stays FREE for a co-resident GPU client — Crow's `render_page`, whose GPU gate
 needs 512 MiB and which fell back to SwiftShader in every capture while serve left 73-185 MiB
-free (2026-09-23/24). 1024 MiB is llama.cpp's default per-device `--fit-target` margin. It is
-named on its own `[budget] render reserve` line with its cost in hot-set units (1024 MiB = 8.1
-units, about 8 hot experts per layer), and the post-plan check below requires
-`POST_PLAN_FLOOR + reserve`. Its decode cost is estimated at about -2.5 % and NOT measured
+free (2026-09-23/24). 1536 MiB is Crow's gate with its browser panel open (Crow #279), above
+llama.cpp's default per-device `--fit-target` margin of 1024 MiB. It is
+named on its own `[budget] render reserve` line with its cost in hot-set units (1536 MiB = 12.1
+units, about 12 hot experts per layer), and the post-plan check below requires
+`POST_PLAN_FLOOR + reserve`. Its decode cost is estimated at about -4 % and NOT measured
 (2026-09-25); dynamic lending of hot units instead of a fixed reserve is out of scope (#110).
 
 ### 2.2 Expert residency (per layer, data-driven)
@@ -3555,8 +3556,8 @@ was chosen, with its side of the bus: `post-plan allocations held at boot: vit t
 228.5 MB + vit mrope span 48.8 MB + device sampler 0.3 MB = 277.6 MB VRAM; host RAM only (never on
 the card): vit image cache 256.0 MB`, followed by `free VRAM after load 0.54 GiB >= floor 0.25 GiB`
 (`manager::POST_PLAN_FLOOR`, what the decode graph and the driver pools still have to fit in; since
-#110 the floor is `POST_PLAN_FLOOR + CROW_RENDER_RESERVE_MB`, 1.25 GiB by default, and the line reads
-`>= floor 1.25 GiB (post-plan 0.25 + render reserve 1.00)`, section 2.1). The
+#110 the floor is `POST_PLAN_FLOOR + CROW_RENDER_RESERVE_MB`, 1.75 GiB by default, and the line reads
+`>= floor 1.75 GiB (post-plan 0.25 + render reserve 1.50)`, section 2.1). The
 prefix-cache snapshots (3 x 124.6 MiB) were the issue's prime suspect and they are **host RAM**, not
 VRAM — `Vec<f32>` per `cache.rs`'s memory section — so they stay out of the VRAM total; subtracting
 them would have cost about 150 hot experts for nothing.

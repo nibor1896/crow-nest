@@ -288,8 +288,8 @@ CLIPPY="1522"
 #                              four `manager::tests_110` tests (the CROW_RENDER_RESERVE_MB parse, N lowered by
 #                              the render reserve, the post-plan floor + reserve, the `[budget]` line). Measured
 #                              2026-09-25: lib 263 / 0 / 3 ignored, serve 117, decode 5, parity 6 = 391 / 0;
-#                              clippy 1522. Items 1-6 (parity shas, run32) NOT re-run: the reserve lowers N by
-#                              about 8 in `decode`/`parity` too; TASK K moved N 157 -> 155 with the values held.
+#                              clippy 1522. Items 1-6 (parity shas, run32) NOT re-run: the reserve (default 1536
+#                              MiB) lowers N by about 12 in `decode`/`parity` too; TASK K moved N 157 -> 155 with the values held.
 #   parity 8 / 512 / P8 tf / run 32 / clippy 1505 -> 1522   new values of record (2026-09-25, #94 phase 2 C0):
 #                              measured at `eb0913f` (= v0.5.0 `a4ec526` plus a handoff-only commit, no
 #                              engine change) on RTX 5090 / driver 610.57.04 / rustc 1.98.1, twice with

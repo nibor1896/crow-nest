@@ -23,7 +23,7 @@ flowchart LR
         ORAC["oracle · torch f32 over the UNQUANTIZED originals"] --> GOLD["selftest/ · the layer-0 golden\n2 × 327,680 B + manifest.json = 658,998 B\nmanifest carries max_abs_gate 0.125"]
     end
     subgraph runtime["runtime · per session"]
-        CNQ --> LOAD["loader · boot::open_model then Engine::load\nhost pinned budget DERIVED at boot\nvision reserve subtracted before N is chosen\nrender reserve kept FREE (#110, 1024 MiB)\ntwo-sided clamp of N · cold-path policy per layer"]
+        CNQ --> LOAD["loader · boot::open_model then Engine::load\nhost pinned budget DERIVED at boot\nvision reserve subtracted before N is chosen\nrender reserve kept FREE (#110, 1536 MiB)\ntwo-sided clamp of N · cold-path policy per layer"]
         LOAD --> ENG["engine (Rust + CUDA sm_120a)\nWindows, and Linux since 2026-09-17 (#15)\none CUDA graph replay per decode token"]
         ENG -->|"tokens"| API["serve (Rust)\nOpenAI-style chat, np = 1\nGET /health · GET /props · GET /slots\nPOST /v1/chat/completions · POST /slots/0\nprefix cache A9 · slot file A10"]
     end
@@ -97,7 +97,7 @@ figure of record yet (not measured). Spec: 3.4, 3.5,
 
 ```mermaid
 pie showData title 32 GiB budget
-    "hot experts (N≈152/layer: the 2.1 target minus the #110 render reserve)" : 20.2
+    "hot experts (N≈148/layer: the 2.1 target minus the #110 render reserve)" : 19.7
     "dense resident (NVFP4 + BF16 keeps)" : 6.0
     "KV cache FP8" : 3.2
     "PLE hot-row cache (128 MB default since 2026-09-05)" : 0.13
@@ -105,13 +105,13 @@ pie showData title 32 GiB budget
     "activations + graph pools" : 1.8
     "vision reserve + device sampler, HELD at boot since #72 (277.6 MB)" : 0.28
     "headroom" : 1.72
-    "render reserve, kept FREE for a co-resident renderer (#110)" : 1.0
+    "render reserve, kept FREE for a co-resident renderer (#110)" : 1.5
 ```
 
-#110 (2026-09-25): the planner keeps `CROW_RENDER_RESERVE_MB` (default 1024 MiB, `0` = off) FREE
+#110 (2026-09-25): the planner keeps `CROW_RENDER_RESERVE_MB` (default 1536 MiB, `0` = off) FREE
 for another GPU client, Crow's `render_page` first. The slice is taken from the hot experts
-(1024 MiB = 8.1 units of 132,710,400 B, about 8 experts per layer); the hot-expert slice above is
-that arithmetic, not a measured boot. The post-plan floor becomes 0.25 + 1.00 GiB.
+(1536 MiB = 12.1 units of 132,710,400 B, about 12 experts per layer); the hot-expert slice above is
+that arithmetic, not a measured boot. The post-plan floor becomes 0.25 + 1.50 GiB.
 
 Status: renders `8bad310`, 2026-09-18 — the section 2.1 estimate of 2026-09-02 with the PLE
 slice corrected 2026-09-05 (#16), plus the one slice v0.3.0 added: the vision reserve of TASK K
@@ -139,7 +139,7 @@ flowchart TB
         BUD["manager::derive_host_pinned_budget\nmin(46 GiB cap, free_for_pin − CROW_RAM_MARGIN_GB)\none [budget] boot line, before anything is pinned"]
         RAM --> BUD
     end
-    BUD --> PLAN["manager::ThreeStates::allocate\ntwo-sided clamp: VRAM lowers N, the pinned budget raises it\npending = LAUNCH_SLACK + ring reserve + vision reserve\n+ render reserve (#110, 1024 MiB, never allocated)\nrefuses only when no N satisfies both sides"]
+    BUD --> PLAN["manager::ThreeStates::allocate\ntwo-sided clamp: VRAM lowers N, the pinned budget raises it\npending = LAUNCH_SLACK + ring reserve + vision reserve\n+ render reserve (#110, 1536 MiB, never allocated)\nrefuses only when no N satisfies both sides"]
     SIDE["hot-set sidecar · residency::sidecar_sets (#49)\none JSON object, a sets array of 48 rows;\nevery row adapted to THIS run's N per row — short rows padded\nwith the lowest unused ids, long ones truncated, each row logged;\nnot 48 rows, a bad id, an id twice: refused by name"] --> BUILD
     NVME["NVMe tier · the CNQ4.5 container\nread through Cnq::read_range"] --> BUILD
     PLAN --> BUILD["Residency::build\nRAM gate, hot slabs in VRAM, pinned cold tier,\nONE ascending sweep per expert tensor"]
@@ -380,4 +380,4 @@ Spec: 5.1, 5.2, 5.3, 7.11.16 to 7.11.18, 8.7, 8.9, 8.10.
   - **8, gates, guards and the self-test: NEW.** The verification side had no picture at all, and three commits of v0.3.1 built one: `tools/gate-linux.sh`'s nine items and the two host-side values they pin (8.7), `decode selftest` with `tools/selftest.sh`, the `test ! -d models` refusal and the sha256 of the shipped golden (8.10, `#64`), `oracle_child`'s bounded retry with the exit code leading the diagnosis (8.9, `#65`), and the three replay commands that reproduce `#67`, `#54` and `#68` (7.11.16, 7.11.18, 7.11.17). The 1024-row parity form is drawn outside the script, where 8.7 puts it.
 - 2026-09-18, the v0.3.1 release pass (`8bad310`): the seventeen commits that landed after the `#13` pass (`788fb64`) were read against all eight pictures, and four moved. **2, decode path:** the split decode attention kernel is `attn_sel_split_l` since `#61g` (`6c87054`) and the box says so, with `CROW_ATTN_LUT=0` named as the bit-identical fallback; the Linux figure in the status line is 23.52 ms = 42.5 tok/s now, and the two levers of the same day (`CROW_STAGE_PAR` `#19`, `CROW_GDN_SPLIT_Z` `#71`) are deliberately NOT drawn, because both are DEFAULT OFF and a picture of a default is a picture of what runs. **3, VRAM pie:** the vision slice is HELD at boot since `#72` (`74970b5`) and reads 277.6 MB, the device sampler's five buffers included, against a `[budget]` ledger and a 0.25 GiB free-VRAM floor — the slice was planned-only before, which is exactly what let the first image request of a session find 35.7 MiB free. **5, request path:** the cross-turn repeat counter of `#68` (`b70310a`) hangs off the sink as a dotted box, because it reads the answer and changes nothing; `ToolStream` names the one exception it now makes to "fragments are never rewritten" (`cf6a135`); and the clamp box carries the 8192 default of `8bad310`. **8, gates:** `TESTS 221` and `check_env_docs` 89 = 89, the values the script pins at this commit. Diagrams 1, 4, 6 and 7 were re-read and are unchanged. The module graph in particular: the whole `crate::` edge set of `engine/src` at `8bad310` is the one of `788fb64`, with exactly one addition, `manager → gen::sampler_bytes` inside `#[cfg(test)] mod tests_72` — test code, not a layering edge, and the picture draws the layering. Everything the seventeen commits added to the library landed inside modules that were already drawn (`vit::arm_scratch`, `manager::PostPlan`, `toolcall::repair_json`, `gen`'s two levers), and the rest landed in the bins, which this graph does not draw. All eight were rendered locally with `@mermaid-js/mermaid-cli` 11.17.0 before the release commit (#14).
 - 2026-09-23, branch `release-2026-09-23` (`ebcd780`): four diagrams corrected where they stated a default or the PLE layout that the branch changed. **1:** the launcher box says the bare container is the default (`0254ed6`; the dense-overlay default of `0924406` lasted from 13:57 to 18:43 that day). **2:** the PLE prep box names the flat-stream row read (`85a48e7`, architecture 2.4) and the hyper-connection box the unfused default of the activation-floor fix (`488a840`, `CROW_QFUSE=1` opt-in); the status line says the Linux decode figure is the all-fused, pre-fix one and that the new default is not measured. **4:** the `/dev/nvidia-uvm` decision and its `MemAvailable` fallback are removed (`free_for_pin` subtracts `driver_live`, #103), the cold tier names `CROW_PINNED_ALLOC=register`, the PLE miss box the flat-stream span. **5:** the reuse box names the #100 zero-prefill reuse and the #101 rollback rule. Not drawn: the #102 `CROW_KV` read at `boot::open_model`, the `492f137` grammar relaxations (architecture 7.11.23), the GDN/PLE window shift of `c4d37ca` (architecture 7.3). Diagrams 3, 6, 7 and 8 were not re-read in this pass.
-- 2026-09-25, #110: **1, system overview:** the loader box names the render reserve. **3, VRAM pie:** one new slice, the render reserve (1.0 GiB, kept free for a co-resident renderer, `CROW_RENDER_RESERVE_MB`), taken from the hot-expert slice (21.2 -> 20.2, arithmetic, not a measured boot). **4, residency and load:** the planner box names the render reserve in `pending`. The other diagrams do not show the planner's reserves.
+- 2026-09-25, #110: **1, system overview:** the loader box names the render reserve. **3, VRAM pie:** one new slice, the render reserve (1.5 GiB, kept free for a co-resident renderer, `CROW_RENDER_RESERVE_MB`), taken from the hot-expert slice (21.2 -> 19.7, arithmetic, not a measured boot). **4, residency and load:** the planner box names the render reserve in `pending`. The other diagrams do not show the planner's reserves.
