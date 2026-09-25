@@ -282,7 +282,7 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="404"
+TESTS="413"
 CLIPPY="1522"
 #   tests 396 -> 404 / clippy 1522 (unchanged)   #117 (2026-09-25, branch `t-vram-lend`): six `lend::tests` (lend
 #                              body, no double lend, parked requests until the return, ttl + retry, tier-1 plan

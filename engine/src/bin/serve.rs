@@ -534,12 +534,17 @@
 //! One conversation at a time (M1), with the prefix cache (#31 A9, spec section 7):
 //!
 //! - ONE held conversation per process; a request that shares no prefix replaces it.
+//! - #118: ... and PARKS it when that request leaves its newest snapshot usable: the KV
+//!   rows the new request overwrites (at most `CROW_PREFIX_PARK_ROWS`, default 8192) go to
+//!   host RAM, and the next request that shares more with the parked conversation than
+//!   with the held one brings it back (`PrefixCache::cold_start`, `unpark`).
 //! - `L` = longest common id prefix of the request and `Engine::history`, ids only.
 //! - `P` = the newest snapshot position at or below `L`, and below the request length.
 //! - #100: or AT the request length, for a snapshot that holds its logits row: then
 //!   `PrefixCache::restore_logits` replaces the prefill, `prefill 0 of N tok`.
 //! - `P` found: `PrefixCache::rollback` restores the state, `prefill` gets `ids[P..]`.
-//! - No such snapshot: `Engine::reset_to_zero`, the slot dropped, the whole prompt prefilled.
+//! - No such snapshot: `Engine::reset_to_zero`, the live slots parked (#118) or dropped,
+//!   the whole prompt prefilled.
 //! - ONE snapshot per request, unconditional (M2b, robin 2026-09-10, #36): after the prompt.
 //! - The after-answer snapshot of M1 is DROPPED: `decode_step` rows are not bit equal to
 //!   prefill rows at the same positions (#31 A9 gate part 3, measured), so it was never a
@@ -554,6 +559,10 @@
 //! | line | carries |
 //! |---|---|
 //! | `[cache] WARM\|COLD L .., P .., snapshots [..], reusable [..], prefill n of m tok, reset X ms` | the decision and the HtoD wall |
+//! | `..., parked [..]` (after `reusable`) | #118: the slots of the parked conversation, while one is parked |
+//! | `..., held conversation parked (snapshots [..], KV rows R, DtoH X ms, #118)` | #118: a cold start parked the held conversation |
+//! | `..., parked conversation kept (snapshots [..], #118)` | #118: a cold start kept the one parked earlier |
+//! | `..., parked conversation restored (held H, KV rows R, HtoD X ms, #118)` | #118: a warm request brought the parked conversation back |
 //! | `[cache] snapshot point 1 (after prompt) at pos .., DtoH X ms` | point 1 of spec 7.6 |
 //!
 //! - `reset X ms` is the ONE number the `[chat]` line also calls `reset`: the rollback of a
@@ -595,7 +604,7 @@
 //! - A refusal answers 4xx with a JSON error body and leaves the engine exactly as it was.
 //! - `--slot-save-path` must name an EXISTING directory; a typo refuses the BOOT, not the save.
 
-use crow_nest_engine::cache::{PrefixCache, SLOTS};
+use crow_nest_engine::cache::{ColdPlan, PrefixCache, SLOTS};
 use crow_nest_engine::boot;
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::{DevSampler, Engine};
@@ -3982,6 +3991,17 @@ fn trickle_ready(eng: &Engine) -> bool {
     eng.residency().lb.is_none() && eng.residency().stride > eng.residency().n
 }
 
+/// - #118: the park part of the `[serve] prefix cache` boot line: the row cap and the
+///   host RAM a full park takes (`Engine::park_host_bytes`), allocated at the first park only
+fn park_boot_note(cache_on: bool, cap: usize, bytes: usize) -> String {
+    if !cache_on || cap == 0 {
+        return "no park (CROW_PREFIX_PARK_ROWS=0 or cache off, #118)".to_string();
+    }
+    format!(
+        "park up to {cap} KV rows of a held conversation for a shorter unrelated request, {bytes} B host RAM at the first park (CROW_PREFIX_PARK_ROWS, #118)"
+    )
+}
+
 /// - #114: the image part of the `[cache]` line: empty for a text-only exchange (the line
 ///   stays what it was), else the image counts of both sides and, when an image that is
 ///   not the held one cut `L` below the id-only prefix, both numbers
@@ -4051,19 +4071,43 @@ fn chat_generate(
     let cache_on = srv.cache.enabled();
     let snaps = srv.cache.positions();
     let reusable = srv.cache.reuse_candidates();
+    let parked_before = srv.cache.parked_positions();
     // unsafe: engine kernels; the CUDA context and engine/.engine.lock are this process's
     let t_reset = Instant::now();
+    let mut park_note = String::new();
     let cached_n = match plan.reuse {
         // warm: restore the four recurrent buffers, put pos, done_blocks and history back
         Some((slot, p)) => {
+            // #118: the slot is the PARKED conversation's: its KV rows, history and
+            // snapshots come back first, and the request that ran since is dropped
+            if plan.parked {
+                let rows = srv.cache.parked().map(|(_, r, _)| r).unwrap_or(0);
+                let ms = unsafe { srv.cache.unpark(srv.eng) };
+                park_note = format!(
+                    ", parked conversation restored (held {}, KV rows {rows}, HtoD {ms:.3} ms, #118)",
+                    srv.eng.history().len()
+                );
+            }
             unsafe { srv.cache.rollback(srv.eng, slot) };
             p
         }
-        // cold: no snapshot at or below L, so the whole state goes back to 0 (A4). The
-        // slot is dropped with it: its position names a history this process discards.
+        // cold: no snapshot at or below L, so the whole state goes back to 0 (A4). #118:
+        // the held conversation is PARKED when this request leaves its snapshots usable
+        // (its KV rows 0..rows go to host RAM), a conversation parked earlier is kept, or
+        // every slot is dropped (`PrefixCache::plan_cold`).
         None => {
-            unsafe { srv.eng.reset_to_zero() };
-            srv.cache.invalidate();
+            let (cold, ms) = unsafe { srv.cache.cold_start(srv.eng, prompt.len()) };
+            park_note = match cold {
+                ColdPlan::Park { rows } => format!(
+                    ", held conversation parked (snapshots {:?}, KV rows {rows}, DtoH {ms:.3} ms, #118)",
+                    srv.cache.parked_positions()
+                ),
+                ColdPlan::Keep => format!(
+                    ", parked conversation kept (snapshots {:?}, #118)",
+                    srv.cache.parked_positions()
+                ),
+                ColdPlan::Drop => String::new(),
+            };
             0
         }
     };
@@ -4072,8 +4116,20 @@ fn chat_generate(
     // `reset_ms` is the ONE name for this number: the rollback of a warm request or the
     // `reset_to_zero` of a cold one. The `[chat]` line below calls it `reset` as well.
     // With the cache off `decide` returns before it computes `L`, so no number is claimed.
+    // #118: `L` of a parked restore is the prefix against the PARKED history, and the
+    // image note compares against it as well
+    let (l_ids, held_imgs) = if plan.parked {
+        (crow_nest_engine::cache::common_prefix_len(srv.eng.history(), &prompt), srv.eng.history_images().len())
+    } else {
+        (l_ids, held_imgs)
+    };
+    let parked_note = if parked_before.iter().any(|p| p.is_some()) {
+        format!(", parked {parked_before:?}")
+    } else {
+        String::new()
+    };
     tracing::info!(target: "cache",
-        "[cache] {} L {} (held {}), P {cached_n}, snapshots {:?}, reusable {:?}, prefill {prefilled} of {} tok, reset {reset_ms:.3} ms{}",
+        "[cache] {} L {} (held {}), P {cached_n}, snapshots {:?}, reusable {:?}{parked_note}, prefill {prefilled} of {} tok, reset {reset_ms:.3} ms{}{park_note}",
         if plan.reuse.is_some() { "WARM" } else { "COLD" },
         if cache_on { plan.l.to_string() } else { "n/a".to_string() },
         held,
@@ -5697,12 +5753,13 @@ fn main() {
     // #36 M2b: SLOTS is 1, and the line below reads it instead of naming a count of its own.
     let cache = PrefixCache::new(&eng);
     tracing::info!(target: "serve",
-        "[serve] prefix cache {}, {} B per snapshot + {} B logits row (#100), {} snapshot(s) in HOST RAM (#72: never VRAM, see cache.rs), QSA ring rows {}",
+        "[serve] prefix cache {}, {} B per snapshot + {} B logits row (#100), {} snapshot(s) in HOST RAM (#72: never VRAM, see cache.rs), QSA ring rows {}, {}",
         if cache.enabled() { "on" } else { "off (CROW_PREFIX_CACHE=0)" },
         cache.shape().snapshot_bytes(),
         V * 4,
         SLOTS,
-        eng.qsa_ring_rows()
+        eng.qsa_ring_rows(),
+        park_boot_note(cache.enabled(), cache.park_cap(), eng.park_host_bytes(cache.park_cap()))
     );
     // #13: the boot report as ONE structured line, target `boot`, at INFO, in
     // addition to the eight human lines above - the operating point every later

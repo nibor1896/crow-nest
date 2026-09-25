@@ -516,6 +516,10 @@ impl Engine {
     pub fn n_ctx(&self) -> usize { self.st.context }
     /// rows of the QSA raw-key ring
     pub fn qsa_ring_rows(&self) -> usize { self.st.qsa_ring_rows }
+    /// #118: host bytes a park of `rows` KV rows takes (`cache::park_host_bytes`)
+    pub fn park_host_bytes(&self, rows: usize) -> usize {
+        crate::cache::park_host_bytes(rows, self.st.context, self.st.qsa_pooled.len(), self.st.kv.byte_per_value())
+    }
     /// #13: the operating point of this process, for the ONE structured boot
     /// line (`log::boot`). Reporting only — it reads the loaded state and the
     /// three kernel switches and writes nothing.

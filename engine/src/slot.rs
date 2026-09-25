@@ -439,7 +439,7 @@ fn bytes_into_f32(src: &[u8], dst: &mut [f32]) {
 /// - a CUDA context must be current and `src` must hold at least `dst.len()` bytes
 /// The KV row groups in file order - layer, then K before V, then kv head:
 /// this sequence IS the payload layout, so save and restore both walk it here.
-fn kv_row_order(attn_layers: usize) -> impl Iterator<Item = (usize, bool, usize)> {
+pub(crate) fn kv_row_order(attn_layers: usize) -> impl Iterator<Item = (usize, bool, usize)> {
     (0..attn_layers).flat_map(|layer| {
         [true, false]
             .into_iter()
@@ -447,7 +447,7 @@ fn kv_row_order(attn_layers: usize) -> impl Iterator<Item = (usize, bool, usize)
     })
 }
 
-unsafe fn dtoh_bytes(dst: &mut [u8], src: cuda::CUdeviceptr) {
+pub(crate) unsafe fn dtoh_bytes(dst: &mut [u8], src: cuda::CUdeviceptr) {
     cuda::ck(sys::cuMemcpyDtoH_v2(
         dst.as_mut_ptr() as *mut std::ffi::c_void,
         src,

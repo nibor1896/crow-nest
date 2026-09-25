@@ -2123,7 +2123,9 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 
 - `SLOTS = 1` (`cache.rs:162`): one slot per process, and it is the prompt slot.
 - The last generated id is never fed back, so it is not in `history` and not in `pos`.
-- ONE held conversation per process (M1): a request that shares no prefix replaces it.
+- ONE held conversation per process (M1): a request that shares no prefix replaces it. Since
+  #118 (7.16) a short one PARKS it instead: the held conversation's snapshots stay and the KV
+  rows the new request overwrites are kept in host RAM.
 - The M1 after-answer point is gone from `chat_stream`; the block below says why.
 
 **The after-answer snapshot was never the reuse case, and is DROPPED (M2b, #36):**
@@ -3816,6 +3818,38 @@ Measured 2026-09-25, RTX 5090, worktree build of #117 (on top of `93cd2c0`), ser
 | parked request | a chat sent while lent waited, was served after the return (200), text identical to the pre-lend prefix |
 | decode, 3 identical seeded requests (136 tok) | before 56.2 / 56.2 / 56.1 tok/s, after one lend/return 58.0 / 56.2 / 56.2 (mean +1.1 %); all nine answers byte-identical |
 | image request after a return | 200, the tower ran on the remapped scratch; no CUDA error in the whole log |
+
+### 7.16 Parking the held conversation for a short unrelated request (#118, 2026-09-25)
+
+A snapshot (7.6) holds the recurrent state, not the KV rows. The KV rows sit in the ONE KV buffer,
+addressed by position, so a cold request that writes rows `0..n` leaves every snapshot of the held
+conversation over rows it no longer has, and until #118 the cold start dropped them all. Measured
+2026-09-25 (engine.log, serve `57773d5`): Crow's judge (#266 in Crow) sent 4,659 fresh ids between two
+main turns; the snapshots `[116900, 116202, 115944]` went to `[4659, None, None]` and the next main
+turn prefilled 118,282 of 118,282 ids in 139.5 s. The same happened 37 times that day, 4,590 s in total.
+
+| step | where | what |
+|---|---|---|
+| plan | `PrefixCache::plan_cold` | the held conversation is PARKED when its newest snapshot `T` survives the new request (`min(n, T) <= R`, `R = min(T, CROW_PREFIX_PARK_ROWS)`, default 8192); a conversation parked earlier is KEPT when it saves more; else DROP (the old rule) |
+| park | `PrefixCache::cold_start` | KV rows `0..R` and pooled QSA blocks `0..R/4+1` device to host (`slot::kv_row_order`, the #32 slot-file walk), `history` and image spans kept, the slots marked `parked`, then `reset_to_zero` |
+| side request | `claim` | its snapshot takes an empty or live slot first, then the smallest parked slot, never the parked conversation's last one |
+| decide | `PrefixCache::decide_mm` | the prefix rule against the held AND the parked history; a parked slot `P` counts only while `min(dirty, P) <= R` (`dirty` = the highest row written since the park, `rolled_back` counts rows written before a rollback) |
+| unpark | `PrefixCache::unpark`, then `rollback` | rows and blocks host to device, `history` and spans back, the parked slots made live, the side conversation's slots dropped |
+
+- **Why the output is unchanged (7.5):** rows `0..R` and blocks `0..R/4+1` come back byte for byte;
+  rows `R..P` were never written while `dirty <= R`; rows `>= P` are unreachable (7.6); the recurrent
+  state is the snapshot's. The extra pooled block covers the decode graph's write to block
+  `done_blocks`.
+- **Cost:** no VRAM. Host RAM 113,252,352 B = 108.0 MiB at fp8 KV and the default cap (bf16 204.0 MiB),
+  allocated at the first park, next to the 373.8 MiB of the three snapshots. The 37 side requests of
+  2026-09-25 wrote at most 4,947 rows. The DtoH/HtoD walls of a park are not measured yet.
+- **Comparison:** llama.cpp saves the whole sequence state of a slot to host RAM when a new prompt
+  would drop more than half of it (`--cache-ram`, default 8192 MiB, PR #16391); vLLM (automatic prefix
+  caching, LRU free queue) and SGLang (RadixAttention, LRU leaf eviction) keep other prefixes in paged
+  KV. Here the rest of the KV stays in VRAM, so only the overwritten rows are copied: 108 MiB instead
+  of 1.34 GiB at 117k.
+- **Not covered:** the side conversation itself is not kept across the main turn (the judge stays
+  cold, about 5.5 s per round).
 
 ## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18)
 
