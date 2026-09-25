@@ -6,6 +6,13 @@
 
 ## Unreleased
 
+### Changed
+
+- **serve keeps 1 GiB of VRAM free for a co-resident renderer** (`#110`, 2026-09-25, robin's decision). While serve ran, only 73-185 MiB stayed free (2026-09-23/24), below the 512 MiB GPU gate of Crow's `render_page`, so every capture fell back to SwiftShader (Crow #271: 49 of 49). The planner now adds `CROW_RENDER_RESERVE_MB` (default 1024 = llama.cpp's default `--fit-target` margin, `0` = off, a malformed value refuses the boot) to its `pending` bytes and never allocates it. A `[budget] render reserve` line names it with its cost in hot-set units, and the post-load check requires `POST_PLAN_FLOOR + reserve` (1.25 GiB by default). This applies to every loader (`serve`, `decode`, `parity`).
+  - Cost: 8.1 hot-set units, so N is about 8 lower per layer (unit-tested arithmetic). The decode cost is estimated at about -2.5 % and **not measured**. Free VRAM under serve with the reserve is **not measured** either (derived about 1.1-1.2 GiB).
+  - Crow's gate with its browser panel open is 1536 MiB (Crow #279), which the default does not cover.
+- **`tools/gate-linux.sh` pins `TESTS=391`** (`#110`, 2026-09-25, was 387): 263 lib / 3 ignored + 117 serve + 6 parity + 5 decode. `CLIPPY=1522` is unchanged, re-counted the same day.
+
 ## 2026-09-24 — v0.5.0: the hot set on real Crow traffic, images through the F16 projector, card-row sampling instead of silent greedy, and the request contract completed
 
 The day after the #91 fix: the engine is tuned to the traffic it actually serves. The hot set is cut on robin's real Crow sessions (held-out hit 0.401 -> 0.723, live 38.0 tok/s at 100k to 150k context, 2026-09-24). Images reach the model the way llama.cpp's operating point sends them: through the F16 projector, at 1,024 to 1,280 visual tokens, without the fc1 row overrun, and a new image of the same size no longer answers with the old image's cached state. A request that omits `temperature` samples at the model card row instead of decoding greedy; `max_completion_tokens`, bodies up to 100 MiB and the DRY / #92 sampler knobs now reach the engine. Every serve-side change was checked live on 2026-09-24; the #91 fix path is untouched by the release (read from the code, see Measured). 13 commits since v0.4.0, `4876b2c`..`9c9fd51`.

@@ -209,6 +209,16 @@ added to the planner's `pending` bytes, so N is chosen with it and an image requ
 the card full. It is named on its own `[budget]` line and costs N 157 -> 155 at the serve operating
 point (7.13 has the two numbers and the measurement). `CROW_VIT=0` reserves nothing.
 
+It carries a **render reserve** too (#110, robin's decision 2026-09-25): `CROW_RENDER_RESERVE_MB`,
+default 1024 MiB, `0` = off, is added to `pending` (`manager::planner_pending`) and never
+allocated, so it stays FREE for a co-resident GPU client — Crow's `render_page`, whose GPU gate
+needs 512 MiB and which fell back to SwiftShader in every capture while serve left 73-185 MiB
+free (2026-09-23/24). 1024 MiB is llama.cpp's default per-device `--fit-target` margin. It is
+named on its own `[budget] render reserve` line with its cost in hot-set units (1024 MiB = 8.1
+units, about 8 hot experts per layer), and the post-plan check below requires
+`POST_PLAN_FLOOR + reserve`. Its decode cost is estimated at about -2.5 % and NOT measured
+(2026-09-25); dynamic lending of hot units instead of a fixed reserve is out of scope (#110).
+
 ### 2.2 Expert residency (per layer, data-driven)
 
 - Residency sets are **per-layer top-N by selection frequency** — per-layer ranking, not
@@ -3544,7 +3554,9 @@ took after the plan) are held beside them and handed to `enable_dev_sampler` on 
 was chosen, with its side of the bus: `post-plan allocations held at boot: vit tower scratch
 228.5 MB + vit mrope span 48.8 MB + device sampler 0.3 MB = 277.6 MB VRAM; host RAM only (never on
 the card): vit image cache 256.0 MB`, followed by `free VRAM after load 0.54 GiB >= floor 0.25 GiB`
-(`manager::POST_PLAN_FLOOR`, what the decode graph and the driver pools still have to fit in). The
+(`manager::POST_PLAN_FLOOR`, what the decode graph and the driver pools still have to fit in; since
+#110 the floor is `POST_PLAN_FLOOR + CROW_RENDER_RESERVE_MB`, 1.25 GiB by default, and the line reads
+`>= floor 1.25 GiB (post-plan 0.25 + render reserve 1.00)`, section 2.1). The
 prefix-cache snapshots (3 x 124.6 MiB) were the issue's prime suspect and they are **host RAM**, not
 VRAM — `Vec<f32>` per `cache.rs`'s memory section — so they stay out of the VRAM total; subtracting
 them would have cost about 150 hot experts for nothing.
@@ -3856,7 +3868,8 @@ count from `geo` and the context, `ThreeStates::allocate` is the planner with th
 clamp loop (VRAM lowers N, the host pinned budget raises it), `derive_host_pinned_budget` and
 `ram_margin_bytes` are the host-memory half of that loop (8.8), and `kv_row_ptr` is the KV
 addressing. Surface: 6 `pub fn` plus `StateSizes`, `ThreeStates`, `AllocReport`, the consts
-`SAFETY` and `N_MIN`. Depends on `cuda` and `geo`; it may not know about the container or the
+`SAFETY` and `N_MIN`; since #110 also the render reserve (`render_reserve_bytes`,
+`planner_pending`, `post_plan_floor`, `headroom_ok`). Depends on `cuda` and `geo`; it may not know about the container or the
 kernels.
 
 **`sample.rs`** — the host-side sampling reference and the sampler profile: `Rng` (the xorshift
@@ -3992,7 +4005,9 @@ not line numbers — the files move.
    7. the `[stage]` / `[trickle]` / `[qsa]` / `[attn]` / `[gdn]` / `[hc]` / `[pf-gemm-b]` provenance
       lines and the `Stage` device allocations.
    8. `ThreeStates::allocate` — the two-sided clamp loop, then KV, QSA, GDN and rope allocation.
-      The planner's `pending` bytes are `LAUNCH_SLACK + ring_reserve + vit_reserve` (`gen.rs:976-977`):
+      The planner's `pending` bytes are `LAUNCH_SLACK + ring_reserve + vit_reserve + render_reserve`
+      (`manager::planner_pending`, called in `gen.rs` `Engine::load`; the render reserve is #110's,
+      kept free for a co-resident renderer and named on its own `[budget]` line, 2.1):
       `vit::reserve_bytes(cfg.context)` enters here, with its own `[budget]` line, so the image path
       is subtracted BEFORE N is chosen (7.13, TASK K).
    9. `Residency::build` — hot set, the RAM gate, the VRAM hot slabs, the pinned cold tier

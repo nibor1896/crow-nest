@@ -932,6 +932,8 @@ impl Engine {
         if std::env::var("CROW_KPROF").is_ok() && graph_on() {
             panic!("refusing CROW_KPROF with CROW_GRAPH=1: the per-kernel profile syncs the stream before and after every launch, and a sync inside the open decode-graph capture is CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED — the run would die on the first captured decode token. Re-run the measurement with CROW_GRAPH=0, or unset CROW_KPROF");
         }
+        // #110: a bad CROW_RENDER_RESERVE_MB stops the boot here, before a byte is loaded
+        let render_reserve = crate::manager::render_reserve_bytes();
         let sec = "text";
         let t0 = std::time::Instant::now();
         engine_lock_acquire();
@@ -1255,7 +1257,10 @@ impl Engine {
         let vit_reserve = if vit.is_some() {
             crate::vit::reserve_bytes(cfg.context).saturating_sub(vit_held)
         } else { 0 };
-        let pending = LAUNCH_SLACK + ring_reserve + vit_reserve;
+        // + #110: the render reserve, VRAM kept FREE for a co-resident GPU client
+        //   (Crow's render_page). The engine never allocates it; counting it as
+        //   pending is what leaves it on the card after the load.
+        let pending = crate::manager::planner_pending(LAUNCH_SLACK, ring_reserve, vit_reserve, render_reserve);
         // pinned-side sizing follows the cold tier actually used (record size
         // of a low-bit tier, full tier = constant; see residency::build)
         let (cold_unit, cold_fixed) = match std::env::var("CROW_COLD_TIER").ok() {
@@ -1285,6 +1290,15 @@ impl Engine {
             } else {
                 "vit reserve       0.0 MB  (CROW_VIT 0, the tower is not loaded)".to_string()
             }
+        ));
+        // #110: the render reserve on its own line, with what it cost in hot-set units
+        log(&format!(
+            "  [budget] {}",
+            crate::manager::render_reserve_line(
+                render_reserve,
+                per_expert_unit,
+                std::env::var("CROW_RENDER_RESERVE_MB").is_ok_and(|v| !v.trim().is_empty())
+            )
         ));
 
         // ---- residency (#8) ----
@@ -1348,8 +1362,9 @@ impl Engine {
         post.vram("device sampler", sampler_bytes());
         log(&format!("  [budget] {}", post.line()));
         let free_after = cuda::free_vram_bytes();
-        let hl = crate::manager::headroom_line(free_after, crate::manager::POST_PLAN_FLOOR);
-        if free_after >= crate::manager::POST_PLAN_FLOOR {
+        // #110: the floor is POST_PLAN_FLOOR + the render reserve
+        let hl = crate::manager::headroom_line(free_after, render_reserve);
+        if crate::manager::headroom_ok(free_after, render_reserve) {
             log(&format!("  [budget] {hl}"));
         } else {
             tracing::error!(target: "load", "[load]   [budget] {hl}");
