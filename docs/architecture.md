@@ -3819,6 +3819,8 @@ Measured 2026-09-25, RTX 5090, worktree build of #117 (on top of `93cd2c0`), ser
 | decode, 3 identical seeded requests (136 tok) | before 56.2 / 56.2 / 56.1 tok/s, after one lend/return 58.0 / 56.2 / 56.2 (mean +1.1 %); all nine answers byte-identical |
 | image request after a return | 200, the tower ran on the remapped scratch; no CUDA error in the whole log |
 
+Live with Crow in the 2026-09-25 lighthouse run: 1698 MiB lent, lend 1-5 ms, return 1-8 ms.
+
 ### 7.16 Parking the held conversation for a short unrelated request (#118, 2026-09-25)
 
 A snapshot (7.6) holds the recurrent state, not the KV rows. The KV rows sit in the ONE KV buffer,
@@ -3842,7 +3844,7 @@ turn prefilled 118,282 of 118,282 ids in 139.5 s. The same happened 37 times tha
   `done_blocks`.
 - **Cost:** no VRAM. Host RAM 113,252,352 B = 108.0 MiB at fp8 KV and the default cap (bf16 204.0 MiB),
   allocated at the first park, next to the 373.8 MiB of the three snapshots. The 37 side requests of
-  2026-09-25 wrote at most 4,947 rows. The DtoH/HtoD walls of a park are not measured yet.
+  2026-09-25 wrote at most 4,947 rows.
 - **Comparison:** llama.cpp saves the whole sequence state of a slot to host RAM when a new prompt
   would drop more than half of it (`--cache-ram`, default 8192 MiB, PR #16391); vLLM (automatic prefix
   caching, LRU free queue) and SGLang (RadixAttention, LRU leaf eviction) keep other prefixes in paged
@@ -3850,6 +3852,17 @@ turn prefilled 118,282 of 118,282 ids in 139.5 s. The same happened 37 times tha
   of 1.34 GiB at 117k.
 - **Not covered:** the side conversation itself is not kept across the main turn (the judge stays
   cold, about 5.5 s per round).
+
+Measured 2026-09-25 20:54-20:56 local, RTX 5090, serve at `0263990` with defaults (`tools/serve-linux.sh`),
+seed 1118, `reasoning_effort none`, card non-thinking row; main = an 8,640-token ledger, side = an unrelated
+1,339-token prompt, then main + its answer + one user turn:
+
+| check | result |
+|---|---|
+| side request | `COLD ... held conversation parked (snapshots [Some(8640), None, None], KV rows 8192, DtoH 43.391 ms)` at the first park (host buffer allocated), 10.181 ms at the second |
+| next main turn | `WARM L 8642 (held 1370), P 8640 ... prefill 28 of 8668 tok ... parked conversation restored (KV rows 8192, HtoD 10.190 ms)`; prefill 196.6 ms against 8,312-9,239 ms for the cold 8,640-token prompt; with a 32-token answer `prefill 37 of 8677`, HtoD 9.111 ms |
+| output | the main turn's answer byte-identical with and without the side request, for a 2-token and a 32-token answer |
+| long side request | 12,087 tokens (longer than the held conversation): the snapshots are dropped, the old rule |
 
 ## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18)
 
