@@ -1,4 +1,6 @@
 <picture>
+  <source media="(max-width: 700px) and (prefers-color-scheme: dark)" srcset="docs/images/readme/crow-nest-mobile-dark.svg">
+  <source media="(max-width: 700px)" srcset="docs/images/readme/crow-nest-mobile-light.svg">
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme/crow-nest-dark.svg">
   <img src="docs/images/readme/crow-nest-light.svg" width="100%" alt="crow-nest: one model, one GPU, its own quant. An inference engine in Rust and CUDA for Qwen3.8-Flash-Next as CNQ4.5-M, OpenAI-compatible, the engine behind Crow.">
 </picture>

@@ -19,9 +19,11 @@ C = dict(page="#0b0e17", panel="#0e1220", raised="#131829", line="#1c2438", text
          sub="#39c6d8", mark="#7eb0f8", bevel="#2c5bac", bad="#f0655a", skip="#b392f0",
          term="#080b13")
 VARIANT = os.environ.get("VARIANT")  # dark = crow theme, light = GitHub light
-if VARIANT is None:  # one call writes both files: this module draws into globals, so each theme is its own run
-    for v in ("dark", "light"):
-        subprocess.run([sys.executable, __file__], env={**os.environ, "VARIANT": v}, check=True)
+MOBILE = os.environ.get("LAYOUT") == "mobile"  # one column at 440 px for phones (crow-nest-mobile-*.svg)
+if VARIANT is None:  # one call writes all four files: this module draws into globals, so each is its own run
+    for layout in ("desktop", "mobile"):
+        for v in ("dark", "light"):
+            subprocess.run([sys.executable, __file__], env={**os.environ, "VARIANT": v, "LAYOUT": layout}, check=True)
     sys.exit(0)
 C = dict(page="#ffffff", panel="#ffffff", raised="#f0f1f3", line="#e4e4e7", text="#0f1114",
          soft="#3f4550", faint="#6b7280", dim="#6b7280", ok="#12855a", gold="#8a6400",
@@ -187,9 +189,132 @@ t(X0 + 24, y + 66, "cargo build, then serve on port 8099. Crow connects with --b
 t(X0 + 24, y + 90, "The 104.7 GB container downloads from Hugging Face.", 13, C["faint"])
 t(X1 - 30, y + 66, "↓", 40, C["ok"], anchor="end")
 y += 158
+
+
+def wrap(text, n):
+    lines, cur = [], ""
+    for w in text.split():
+        if cur and len(cur) + 1 + len(w) > n:
+            lines.append(cur); cur = w
+        else:
+            cur = (cur + " " + w).strip()
+    return lines + ([cur] if cur else [])
+
+
+def mobile():
+    """One column at 440 px, drawn from the same lists as the desktop image above."""
+    global W, X0, X1
+    W, X0, X1 = 440, 10, 430
+    CW = X1 - X0
+    o.clear()
+
+    def msection(y, title, acc):
+        o.append(f'<rect x="{X0}" y="{y}" width="4" height="22" rx="2" fill="{C[acc]}"/>')
+        t(X0 + 14, y + 17, escape(title), 19, C["text"], weight=600)
+        return y + 38
+
+    y = 10
+    card(X0, y, CW, 350, r=14)
+    o.append(f'<svg x="{W/2 - 110:.0f}" y="{y - 14}" width="220" height="220" viewBox="0 0 1024 1024">{mark()}</svg>')
+    t(W / 2, y + 222, "CROW-NEST", 40, C["text"], weight=300, anchor="middle", ls=8)
+    t(W / 2, y + 248, "INFERENCE ENGINE", 12.5, C["faint"], anchor="middle", ls=5)
+    o.append(f'<text x="{W/2}" y="{y + 284}" text-anchor="middle" font-family="{UI}" font-size="18" fill="{C["soft"]}">'
+             f'One model, one GPU, its own quant.<tspan fill="{C["mark"]}">▍<animate attributeName="opacity" values="1;1;0;0" '
+             f'keyTimes="0;.5;.5;1" dur="1.1s" repeatCount="indefinite"/></tspan></text>')
+    pills = (("v" + VERSION, "mark"), ("Apache-2.0", "faint"), ("Linux · Windows · sm_120", "sub"))
+    tot = sum(22 + len(l) * 7.6 for l, _ in pills) + 10 * (len(pills) - 1)
+    x = W / 2 - tot / 2
+    for label, acc in pills:
+        x = pill(x, y + 304, label, C[acc])
+    y += 350 + 26
+
+    intro = ("An inference engine for one model on one GPU: its own quantization, its own container, thin CUDA "
+             "kernels in Rust. OpenAI-compatible HTTP, and the engine behind Crow. Qwen3.8-Flash-Next as "
+             "CNQ4.5-M, converted from the original safetensors.")
+    for i, line in enumerate(wrap(intro, 46)):
+        t(W / 2, y + i * 23, line, 16, C["soft"], anchor="middle")
+    y += len(wrap(intro, 46)) * 23 + 14
+
+    for i, (v, l) in enumerate(STATS):
+        sx, sy = X0 + (i % 2) * 214, y + (i // 2) * 84
+        card(sx, sy, 206, 76, C["raised"], C["raised"])
+        t(sx + 16, sy + 36, v, 24, C["text"], MONO, 600)
+        t(sx + 16, sy + 59, escape(l), 13, C["faint"])
+    y += 3 * 84 + 8
+    note = "Decode and prefill: v0.3.0, one RTX 5090, Windows, 2026-09-13/14. VRAM loan: #117, 2026-09-25. Conditions: docs/measurements.md"
+    for i, line in enumerate(wrap(note, 62)):
+        t(W / 2, y + i * 16, line, 11.5, C["dim"], anchor="middle")
+    y += len(wrap(note, 62)) * 16 + 30
+
+    y = msection(y, "Features", "ok")
+    for i, (ti, d, acc) in enumerate(FEATURES):
+        fy = y + i * 74
+        card(X0, fy, CW, 66)
+        o.append(f'<circle cx="{X0+20}" cy="{fy+25}" r="4.5" fill="{C[acc]}"/>')
+        t(X0 + 34, fy + 30, ti, 17, C["text"], weight=600)
+        t(X0 + 34, fy + 52, escape(d), 14, C["faint"])
+    y += len(FEATURES) * 74 + 26
+
+    y = msection(y, "Measured, not claimed.", "gold")
+    card(X0, y, CW, 262)
+    for i, (v, col, d) in enumerate(MEAS):
+        mx, my = X0 + 18 + (i % 2) * 206, y + 16 + (i // 2) * 104
+        t(mx, my + 24, v, 18, col, MONO, 600)
+        for k, part in enumerate(d.split("|")):
+            t(mx, my + 50 + k * 19, escape(part), 13, C["faint"])
+    for k, line in enumerate(wrap("Every figure has an issue or a release note behind it. Full table: docs/status.md", 52)):
+        t(X0 + 18, y + 230 + k * 19, line, 13.5, C["soft"])
+    y += 262 + 30
+
+    y = msection(y, "Requirements", "sub")
+    lines = []
+    for g, v in REQ:
+        lines.append(("g", g))
+        lines += [("n", part) for part in wrap(v, 40)]
+    h = 16 + sum(28 if k == "g" else 22 for k, _ in lines) + 12
+    card(X0, y, CW, h)
+    ly = y + 16
+    for k, v in lines:
+        if k == "g":
+            if ly > y + 20:
+                o.append(f'<line x1="{X0+16}" y1="{ly-2}" x2="{X1-16}" y2="{ly-2}" stroke="{C["line"]}" stroke-dasharray="2 4"/>')
+            t(X0 + 18, ly + 20, v, 15, C["text"], weight=600); ly += 28
+        else:
+            t(X0 + 18, ly + 16, escape(v), 14, C["sub"], MONO); ly += 22
+    y += h + 30
+
+    y = msection(y, "Against llama.cpp", "mark")
+    card(X0, y, CW, 20 + len(OPS) * 62 + 80)
+    for i, (a, cn, lc, u) in enumerate(OPS):
+        ry = y + 14 + i * 62
+        if i:
+            o.append(f'<line x1="{X0+16}" y1="{ry}" x2="{X1-16}" y2="{ry}" stroke="{C["line"]}"/>')
+        t(X0 + 18, ry + 26, a, 15.5, C["text"])
+        t(X1 - 18, ry + 26, cn + (" vs " + lc if lc else ""), 15.5, C["mark"], MONO, 600, anchor="end")
+        t(X0 + 18, ry + 49, u, 13.5, C["faint"])
+        t(X1 - 18, ry + 49, "crow-nest" + (" vs llama.cpp" if lc else ""), 13, C["dim"], anchor="end")
+    note = "crow-nest v0.3.0, one RTX 5090: Windows 2026-09-13/14 (#62, #10), Linux 2026-09-17 (v0.3.0 notes). CROW_PF_GEMM_B=1: 871."
+    ny = y + 20 + len(OPS) * 62 + 8
+    for k, line in enumerate(wrap(note, 60)):
+        t(X0 + 18, ny + k * 16, line, 11.5, C["dim"])
+    y += 20 + len(OPS) * 62 + 80 + 30
+
+    y = msection(y, "Build and run", "ok")
+    body = wrap("cargo build, then serve on port 8099. Crow connects with --base-url. The 104.7 GB container downloads from Hugging Face.", 50)
+    ih = 58 + len(body) * 20 + 14
+    card(X0, y, CW, ih, C["term"], C["bevel"], 12)
+    t(X0 + 18, y + 34, "Copy it right below this picture.", 17, C["text"], weight=600)
+    for k, line in enumerate(body):
+        t(X0 + 18, y + 62 + k * 20, line, 14, C["faint"])
+    t(X1 - 20, y + 36, "↓", 30, C["ok"], anchor="end")
+    return y + ih + 12
+
+
+if MOBILE:
+    y = mobile()
 H = y - 20
 
 svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" '
        f'aria-label="crow-nest: one model, one GPU, its own quant. Features, measurements, requirements.">'
        + "".join(o) + "</svg>\n")
-(OUT / ("crow-nest-" + VARIANT + ".svg")).write_text(svg)
+(OUT / ("crow-nest-" + ("mobile-" if MOBILE else "") + VARIANT + ".svg")).write_text(svg)
