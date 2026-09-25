@@ -277,13 +277,28 @@ bin="$root/engine/target/release/decode"
 cuda_lib="${CUDA_LIB:-$HOME/.local/share/crow/cuda/lib}"
 
 # ---- the values of record (see the provenance block above) --------------------------------------
-SHA8="bceba6ff772431dedf57631e83c7418d3f0bca3ab7e33da828f8da5d12a122a2"
+SHA8="148cb72e8e4494bf8652504696073e4f99640e7276aa2fbd5b0d24271ddc6293"
 BYTES8="11919360"
-SHA512="8387234709271515b091b1c4dbd0d59c66550d0e3feab551a6418d30b55c9105"
-SHAP8="3bb3e69edf90a6c3839222d1ceae7fe06aed1ba49813daa1f7487e3c6e7cff2d"
-IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 11316, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 271, 1919, 7701, 310, 381, 264]"
+SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
+SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
+IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
 TESTS="387"
-CLIPPY="1505"
+CLIPPY="1522"
+#   parity 8 / 512 / P8 tf / run 32 / clippy 1505 -> 1522   new values of record (2026-09-25, #94 phase 2 C0):
+#                              measured at `eb0913f` (= v0.5.0 `a4ec526` plus a handoff-only commit, no
+#                              engine change) on RTX 5090 / driver 610.57.04 / rustc 1.98.1, twice with
+#                              the same binary: decode_out/gate-0925 (02:20 CEST) and gate-0925b (02:30
+#                              CEST), all four values byte-identical. 8 rows = 148cb72e..., still
+#                              11,919,360 B; 512 rows = 6e9cb25f...; P8 tf = 8f5e5ce8...; run 32 = the
+#                              ids above. They replace the pre-0923 values (bceba6ff / 83872347 /
+#                              3bb3e69e) that the NOTE below expected to move with 488a840 and 85a48e7.
+#                              Tests 387 / 0 (lib 259 / 3 ignored, serve 117, decode 5, parity 6).
+#                              Clippy 1522 vs decode_out/gate (2026-09-21, 1505): net +13 warnings
+#                              (+6 constant chunk size, +3 negated partial-ord comparisons, +2 unsafe
+#                              docs, +2 "written more concisely", +1 same-type cast, +1 "consider
+#                              using", +1 operator precedence, -2 manual reimplementation, -1 manual
+#                              prefix strip) and +4 "generated N warnings" summary lines of the two new
+#                              bins `pin_return_probe` and `ramcheck`. Not tracked back per commit.
 #   tests 358 -> 387   v0.5.0 (2026-09-24, `9c9fd51`): #106, #107/#108/#109, #111, #112, #113, #114, #85/#92.
 #                              Measured 2026-09-24 by running the test binaries built at `9c9fd51`: lib 259 / 0 /
 #                              3 ignored, serve 117, decode 5, parity 6 = 387 / 0. Clippy NOT re-counted.
@@ -298,6 +313,7 @@ CLIPPY="1505"
 #                              shas and the run32 ids above are expected to move. They are the values
 #                              of the pre-0923 engine; new values of record need a gate run on the GPU,
 #                              which has not happened yet. Until then items 1, 2, 3 and 6 are expected RED.
+#                              RESOLVED 2026-09-25: see the new values of record at the top of this block.
 #   tests 320 -> 335 / clippy 1505 (unchanged)   #93 (2026-09-22): eleven toolgrammar
 #                              tests (the Crow 3dbc015 tools compile; the byte machine on well-formed
 #                              calls and on the observed failure shapes; the JSON subset; required /
