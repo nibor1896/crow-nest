@@ -256,6 +256,8 @@ pub struct AllocReport {
     pub lines: Vec<String>,
     pub total_bytes: u64,
     pub effective_n: usize,
+    /// #110 follow-up: the render reserve GRANTED (bytes), <= the requested one
+    pub render_reserve: u64,
 }
 
 impl ThreeStates {
@@ -271,6 +273,9 @@ impl ThreeStates {
         // (every expert pinned: constant size, independent of N)
         cold_bytes_per_n_unit: u64,
         cold_fixed: bool,
+        // #110 follow-up: the REQUESTED render reserve (NOT in `pending_bytes`);
+        // granted best-effort by `grant_render_reserve`, never a boot refusal
+        render_reserve_requested: u64,
     ) -> (ThreeStates, AllocReport) {
         assert!(
             cfg.context >= CONTEXT_FLOOR,
@@ -293,7 +298,7 @@ impl ThreeStates {
         // the state bytes do not depend on N (the hot-expert count): one plan for the whole clamp loop
         let states_bytes = sizes.total();
         let spare = cfg.adapt.spare; // #17: from the policy in geo.rs, not the env
-        let n = match clamp_hot_n(&ClampInput {
+        let base = ClampInput {
             n_hot: cfg.n_hot,
             states_bytes,
             pending_bytes,
@@ -303,13 +308,19 @@ impl ThreeStates {
             spare,
             free0,
             host_pinned_budget: cfg.host_pinned_budget,
-        }) {
-            Ok((n, lines)) => {
-                rep.lines.extend(lines);
-                n
+        };
+        let n = match grant_render_reserve(&base, render_reserve_requested) {
+            Ok(g) => {
+                rep.lines.extend(g.lines);
+                rep.lines.push(g.line);
+                rep.render_reserve = g.granted;
+                g.n
             }
+            // the refusal WITHOUT any reserve: the planner's own, as before #110
             Err(msg) => panic!("{msg}"),
         };
+        // the rest of the plan counts the granted reserve as pending
+        let pending_bytes = pending_bytes + rep.render_reserve;
         if n < cfg.n_hot {
             rep.lines.push(format!(
                 "loader auto-clamped hot set: N {} -> {} (measured budget, spec 2.6)",
@@ -473,10 +484,17 @@ pub struct ClampInput {
 /// out of `ThreeStates::allocate` unchanged so the KV-dtype effect on N is
 /// testable without a GPU). VRAM lowers N, the host pinned budget RAISES it
 /// (fewer cold experts). `Err` is the refusal text the caller panics with.
+impl ClampInput {
+    /// bytes of the pinned cold tier at hot-set size `n` (the clamp's own formula)
+    pub fn cold_at(&self, n: usize) -> u64 {
+        (if self.cold_fixed { E } else { E - n.min(E) + self.spare }) as u64 * self.cold_bytes_per_n_unit
+    }
+}
+
 pub fn clamp_hot_n(c: &ClampInput) -> Result<(usize, Vec<String>), String> {
     let mut lines = Vec::new();
     let mut n = c.n_hot;
-    let cold_of = |n: usize| (if c.cold_fixed { E } else { E - n.min(E) + c.spare }) as u64 * c.cold_bytes_per_n_unit;
+    let cold_of = |n: usize| c.cold_at(n);
     // Termination guard (2026-09-04): when VRAM pushes N down and the host
     // budget pushes it up, no N is feasible. Without this the loop
     // oscillated forever and grew the report lines without bound -> the whole
@@ -558,7 +576,15 @@ pub const POST_PLAN_FLOOR: u64 = 256 << 20;
 /// robin's go; first 1024) also covers Crow's gate with its browser panel open
 /// (`crow_platform.py` `_GPU_HEADROOM_PANEL_MIB`, Crow #279) and is above
 /// llama.cpp's default per-device `--fit-target` margin of 1024 MiB.
-pub const RENDER_RESERVE_DEFAULT_MB: u64 = 1536;
+///
+/// #110 follow-up (2026-09-25): the default is 0 (off). The 1536 MiB default did
+/// not boot on the machine it was written for: at N=150 the pinned cold tier is
+/// 45.61 GiB against the 46.00 GiB host cap, every hot unit given up moves
+/// 126.6 MiB into that tier, and `clamp_hot_n` refused the config
+/// (`manager.rs:311` panic). Crow now borrows VRAM per render through serve's
+/// lending endpoints (#117); the variable stays for machines with host RAM
+/// headroom, and is granted best-effort (`grant_render_reserve`).
+pub const RENDER_RESERVE_DEFAULT_MB: u64 = 0;
 
 /// #110: `CROW_RENDER_RESERVE_MB` as bytes. `None` (unset) or an empty value =
 /// the default; `0` = off; anything that is not a whole number of MiB is an
@@ -577,8 +603,9 @@ pub fn render_reserve_from(v: Option<&str>) -> Result<u64, String> {
         .ok_or_else(|| format!("refusing config: CROW_RENDER_RESERVE_MB={mb} is out of range"))
 }
 
-/// #110: the process's render reserve, read from the environment. A bad value
-/// panics with the reason; `Engine::load` calls this before it loads a byte.
+/// #110: the process's REQUESTED render reserve, read from the environment. A
+/// bad value panics with the reason; `Engine::load` calls this before it loads a
+/// byte. What is granted is decided by `grant_render_reserve` against both budgets.
 pub fn render_reserve_bytes() -> u64 {
     render_reserve_from(std::env::var("CROW_RENDER_RESERVE_MB").ok().as_deref())
         .unwrap_or_else(|e| panic!("{e}"))
@@ -603,7 +630,7 @@ pub fn render_reserve_line(render_reserve: u64, unit: u64, from_env: bool) -> St
     let src = if from_env { "CROW_RENDER_RESERVE_MB" } else { "default, CROW_RENDER_RESERVE_MB unset" };
     if render_reserve == 0 {
         return format!(
-            "render reserve    0.0 MB  ({src}: off) — no VRAM is kept for a co-resident renderer; Crow's render_page will fall back to software under serve"
+            "render reserve    0.0 MB  ({src}: off) — no VRAM is kept for a co-resident renderer; Crow's render_page borrows it per render through POST /v1/crow/vram/lend (#117)"
         );
     }
     let units = if unit > 0 { render_reserve as f64 / unit as f64 } else { 0.0 };
@@ -611,6 +638,80 @@ pub fn render_reserve_line(render_reserve: u64, unit: u64, from_env: bool) -> St
         "render reserve {:9.1} MB  ({src}) — kept FREE for a co-resident GPU client (Crow's render_page, a browser); never allocated by the engine; costs {units:.1} hot-set units",
         render_reserve as f64 / MIB
     )
+}
+
+/// #110 follow-up: what the planner GRANTS of a requested render reserve.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReserveGrant {
+    pub requested: u64,
+    pub granted: u64,
+    /// the hot-set size chosen with the granted reserve
+    pub n: usize,
+    /// the clamp's own lines for that N
+    pub lines: Vec<String>,
+    /// the `[budget] render reserve: requested X MiB, granted Y MiB — ...` line
+    pub line: String,
+}
+
+/// #110 follow-up (2026-09-25): the render reserve is BEST-EFFORT and never
+/// blocks the boot. `base` is the clamp input WITHOUT the reserve in
+/// `pending_bytes`. The whole request is granted when both budgets hold with it;
+/// otherwise the largest multiple of one hot-set unit (`expert_bytes_per_n_unit`)
+/// below the request that still fits both the VRAM budget and the host pinned
+/// budget, down to 0. `Err` only when the config does not fit even WITHOUT a
+/// reserve - that is the planner's own refusal, not the reserve's.
+///
+/// Measured case (engine.log 2026-09-25 07:44 UTC, 56a9740 boot 10:34 UTC): N=150,
+/// cold tier 369 units = 45.61 GiB against a 46.00 GiB cap. N may not drop below
+/// 147, so 1536 MiB (12.1 units) panicked at `clamp_hot_n`; granted here: 3 units.
+pub fn grant_render_reserve(base: &ClampInput, requested: u64) -> Result<ReserveGrant, String> {
+    let with = |r: u64| clamp_hot_n(&ClampInput { pending_bytes: base.pending_bytes + r, ..*base });
+    let mib = |b: u64| b as f64 / MIB;
+    let unit = base.expert_bytes_per_n_unit.max(1);
+    if requested == 0 {
+        let (n, lines) = with(0)?;
+        return Ok(ReserveGrant { requested, granted: 0, n, lines,
+            line: "render reserve: requested 0 MiB, granted 0 MiB — off (CROW_RENDER_RESERVE_MB 0 or unset)".into() });
+    }
+    if let Ok((n, lines)) = with(requested) {
+        return Ok(ReserveGrant { requested, granted: requested, n, lines,
+            line: format!("render reserve: requested {:.0} MiB, granted {:.0} MiB — both budgets hold (N={n})", mib(requested), mib(requested)) });
+    }
+    // the largest k*unit strictly below the request, then down to 0
+    let mut k = (requested - 1) / unit;
+    loop {
+        let r = k * unit;
+        match with(r) {
+            Ok((n, lines)) => {
+                let failed = requested.min((k + 1) * unit);
+                let why = reserve_binding(base, failed);
+                return Ok(ReserveGrant { requested, granted: r, n, lines,
+                    line: format!(
+                        "render reserve: requested {:.0} MiB, granted {:.1} MiB ({k} hot-set unit(s), N={n}) — {why}",
+                        mib(requested), mib(r)
+                    ) });
+            }
+            Err(e) if k == 0 => return Err(e),
+            Err(_) => k -= 1,
+        }
+    }
+}
+
+/// which budget stops a reserve of `r` bytes: the host pinned cap (N may not
+/// drop far enough for the VRAM side) or the VRAM budget (even N_MIN is too big)
+fn reserve_binding(base: &ClampInput, r: u64) -> String {
+    let gib = |b: u64| b as f64 / GIB;
+    let vram_fits = |n: usize| base.states_bytes + base.pending_bytes + r + n as u64 * base.expert_bytes_per_n_unit + SAFETY < base.free0;
+    let n_vram = (N_MIN..=E).rev().find(|&n| vram_fits(n));
+    let n_host = (N_MIN..=E).find(|&n| base.cold_at(n) <= base.host_pinned_budget);
+    match (n_vram, n_host) {
+        (None, _) => format!("the VRAM budget binds: even N={N_MIN} does not leave {:.2} GiB free (free {:.2} GiB)", gib(r), gib(base.free0)),
+        (Some(v), Some(h)) if v < h => format!(
+            "the host pinned budget binds: N must stay >= {h} so the cold tier fits {:.2} GiB, and VRAM would need N <= {v} for more",
+            gib(base.host_pinned_budget)),
+        (Some(v), None) => format!("the host pinned budget binds: no N fits the cold tier in {:.2} GiB (VRAM alone allows N <= {v})", gib(base.host_pinned_budget)),
+        (Some(v), Some(h)) => format!("the clamp refused (VRAM allows N <= {v}, host needs N >= {h})"),
+    }
 }
 
 /// where a boot allocation lives; the #72 audit found the biggest suspect
@@ -822,9 +923,10 @@ mod tests_110 {
     }
 
     #[test]
-    fn the_render_reserve_defaults_to_1536_mib_and_0_turns_it_off() {
-        assert_eq!(render_reserve_from(None), Ok(1536 << 20));
-        assert_eq!(render_reserve_from(Some("")), Ok(1536 << 20));
+    fn the_render_reserve_defaults_to_off_now_that_lending_exists() {
+        // #110 follow-up: 0 by default (the 1536 MiB default refused the boot)
+        assert_eq!(render_reserve_from(None), Ok(0));
+        assert_eq!(render_reserve_from(Some("")), Ok(0));
         assert_eq!(render_reserve_from(Some("0")), Ok(0));
         assert_eq!(render_reserve_from(Some(" 1024 ")), Ok(1024 << 20));
         for bad in ["1g", "-1", "1.5", "off", "18446744073709551615"] {
@@ -834,9 +936,9 @@ mod tests_110 {
     }
 
     #[test]
-    fn the_default_render_reserve_costs_about_twelve_units_and_stays_free_after_the_plan() {
+    fn a_1536_mib_render_reserve_costs_about_twelve_units_and_stays_free_after_the_plan() {
         let (n_off, _) = clamp_hot_n(&card(0)).unwrap();
-        let reserve = render_reserve_from(None).unwrap();
+        let reserve = render_reserve_from(Some("1536")).unwrap();
         let c = card(reserve);
         let (n_on, lines) = clamp_hot_n(&c).unwrap();
         assert_eq!(n_off, 155);
@@ -851,7 +953,7 @@ mod tests_110 {
 
     #[test]
     fn the_post_plan_check_requires_the_floor_plus_the_render_reserve() {
-        let reserve = render_reserve_from(None).unwrap();
+        let reserve = render_reserve_from(Some("1536")).unwrap();
         assert_eq!(post_plan_floor(reserve), (256 + 1536) << 20);
         // 551 MiB: the #72 live check's free VRAM after load WITHOUT the reserve -
         // enough for the old floor, SHORT once the renderer's 1.5 GiB is owed
@@ -879,7 +981,96 @@ mod tests_110 {
         assert!(set.contains("(CROW_RENDER_RESERVE_MB)") && set.contains("costs 8.1 hot-set units"), "{set}");
         let off = render_reserve_line(0, UNIT, true);
         assert!(off.starts_with("render reserve    0.0 MB  (CROW_RENDER_RESERVE_MB: off)"), "{off}");
-        assert!(off.contains("fall back to software"), "{off}");
+        assert!(off.contains("POST /v1/crow/vram/lend (#117)"), "{off}");
+    }
+}
+
+#[cfg(test)]
+mod tests_110_boot {
+    //! #110 follow-up: the static render reserve must never block the boot.
+    //! The real numbers of 2026-09-25 (engine.log 07:44 UTC boot without a
+    //! reserve, and the 10:34 UTC boot at 56a9740 that panicked at
+    //! `manager.rs:311`): N 160 -> 150 (143 logical + 7 spare), cold tier 369
+    //! units = 45.61 GiB, host pinned cap 46.00 GiB, reserve 1536 MiB.
+    use super::*;
+
+    const UNIT: u64 = 48 * 2_764_800; // 126.6 MiB, the measured hot-set unit
+    const LAUNCH_SLACK: u64 = 128 << 20;
+
+    /// the planner input that lands on N=150 without a reserve (VRAM-bound)
+    fn real_card() -> ClampInput {
+        let states = StateSizes::plan(200_000, KvDtype::Fp8E4m3, 2048).total();
+        let pending = planner_pending(LAUNCH_SLACK, 0, 0, 0);
+        ClampInput {
+            n_hot: 160,
+            states_bytes: states,
+            pending_bytes: pending,
+            expert_bytes_per_n_unit: UNIT,
+            cold_bytes_per_n_unit: UNIT,
+            cold_fixed: false,
+            spare: 7,
+            free0: states + pending + 150 * UNIT + SAFETY + 1,
+            host_pinned_budget: 46 << 30,
+        }
+    }
+
+    #[test]
+    fn the_real_card_is_the_measured_one() {
+        let c = real_card();
+        let (n, _) = clamp_hot_n(&c).unwrap();
+        assert_eq!(n, 150);
+        // 369 cold units = 45.61 GiB of the 46.00 GiB cap
+        assert_eq!(c.cold_at(150), 369 * UNIT);
+        assert_eq!(format!("{:.2}", c.cold_at(150) as f64 / GIB), "45.61");
+        // and 1536 MiB with the old arithmetic (reserve inside pending) is the refusal
+        let old = ClampInput { pending_bytes: c.pending_bytes + (1536 << 20), ..c };
+        assert!(clamp_hot_n(&old).unwrap_err().starts_with("refusing config: no hot-set size fits BOTH"));
+    }
+
+    #[test]
+    fn a_1536_mib_reserve_on_the_real_card_boots_with_what_fits() {
+        let c = real_card();
+        // the boot's own decision: red at 56a9740, where the reserve sat inside
+        // `pending` and `clamp_hot_n` refused (the panic at manager.rs:311)
+        let g = grant_render_reserve(&c, 1536 << 20).expect("the render reserve blocked the boot");
+        // N may drop to 147 (cold 372 units = 45.98 GiB <= 46.00): 3 units granted
+        assert_eq!(g.n, 147, "{g:?}");
+        assert_eq!(g.granted, 3 * UNIT, "{g:?}");
+        assert!(g.line.starts_with("render reserve: requested 1536 MiB, granted 379.7 MiB (3 hot-set unit(s), N=147) — the host pinned budget binds: N must stay >= 147"), "{}", g.line);
+        // the grant leaves both budgets satisfied
+        let planned = c.states_bytes + c.pending_bytes + g.granted + g.n as u64 * UNIT + SAFETY;
+        assert!(planned < c.free0);
+        assert!(c.cold_at(g.n) <= c.host_pinned_budget);
+    }
+
+    #[test]
+    fn a_reserve_that_fits_is_granted_whole_and_0_is_off() {
+        let mut c = real_card();
+        c.host_pinned_budget = 60 << 30; // RAM headroom: N may drop freely
+        let g = grant_render_reserve(&c, 1536 << 20).unwrap();
+        assert_eq!(g.granted, 1536 << 20);
+        assert!(g.line.contains("granted 1536 MiB — both budgets hold"), "{}", g.line);
+        let off = grant_render_reserve(&real_card(), 0).unwrap();
+        assert_eq!((off.granted, off.n), (0, 150));
+        assert!(off.line.starts_with("render reserve: requested 0 MiB, granted 0 MiB — off"), "{}", off.line);
+    }
+
+    #[test]
+    fn with_no_room_at_all_the_grant_is_zero_not_a_panic() {
+        // cap exactly the cold tier at N=150: N may not drop at all
+        let mut c = real_card();
+        c.host_pinned_budget = c.cold_at(150);
+        let g = grant_render_reserve(&c, 1536 << 20).unwrap();
+        assert_eq!((g.granted, g.n), (0, 150));
+        assert!(g.line.contains("granted 0.0 MiB (0 hot-set unit(s), N=150) — the host pinned budget binds"), "{}", g.line);
+    }
+
+    #[test]
+    fn a_config_that_does_not_fit_without_a_reserve_is_still_refused() {
+        let mut c = real_card();
+        c.free0 = c.states_bytes; // no room for anything
+        assert!(grant_render_reserve(&c, 1536 << 20).is_err());
+        assert!(grant_render_reserve(&c, 0).is_err());
     }
 }
 

@@ -282,8 +282,14 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="391"
+TESTS="396"
 CLIPPY="1522"
+#   tests 391 -> 396 / clippy 1522 (unchanged)   #110 follow-up (2026-09-25, branch `t-vram-lend` off `56a9740`):
+#                              five `manager::tests_110_boot` tests (the measured card N=150 / cold 45.61 of
+#                              46.00 GiB, 1536 MiB granted as 3 units instead of the boot refusal, whole grant
+#                              with headroom, grant 0 with no room, refusal only without a reserve). Measured
+#                              2026-09-25: lib 268 / 0 / 3 ignored, serve 117, decode 5, parity 6 = 396 / 0;
+#                              clippy 1522. Default reserve back to 0, so N in `decode`/`parity` is the pre-#110 N.
 #   tests 387 -> 391 / clippy 1522 (unchanged)   #110 (2026-09-25, branch `t110-render-reserve` off `decc3e9`):
 #                              four `manager::tests_110` tests (the CROW_RENDER_RESERVE_MB parse, N lowered by
 #                              the render reserve, the post-plan floor + reserve, the `[budget]` line). Measured

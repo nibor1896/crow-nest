@@ -86,19 +86,19 @@ fn main() {
     unsafe {
         let _ctx = cuda::Ctx::init();
         let cfg = Config::default();
-        let (_, rep) = ThreeStates::allocate(&cfg, dense_bytes, expert_per_unit, expert_per_unit, false);
+        let (_, rep) = ThreeStates::allocate(&cfg, dense_bytes, expert_per_unit, expert_per_unit, false, 0);
         println!("\n=== measured load @262k FP8-KV (default) ===");
         for l in &rep.lines {
             println!("{l}");
         }
         let cfg192 = Config { n_hot: 192, ..Default::default() };
-        let (_, rep) = ThreeStates::allocate(&cfg192, dense_bytes, expert_per_unit, expert_per_unit, false);
+        let (_, rep) = ThreeStates::allocate(&cfg192, dense_bytes, expert_per_unit, expert_per_unit, false, 0);
         println!("\n=== forced N=192 @262k (auto-clamp expected, spec 2.6) ===");
         for l in &rep.lines {
             println!("{l}");
         }
         let cfgbf = Config { context: 200_000, kv: KvDtype::Bf16, ..Default::default() };
-        let (_, rep) = ThreeStates::allocate(&cfgbf, dense_bytes, expert_per_unit, expert_per_unit, false);
+        let (_, rep) = ThreeStates::allocate(&cfgbf, dense_bytes, expert_per_unit, expert_per_unit, false, 0);
         println!("\n=== fallback point 200k BF16-KV ===");
         for l in &rep.lines {
             println!("{l}");
@@ -106,7 +106,7 @@ fn main() {
         println!("\n=== refusing 150k context (must refuse) ===");
         let cfgbad = Config { context: 150_000, ..Default::default() };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ThreeStates::allocate(&cfgbad, dense_bytes, expert_per_unit, expert_per_unit, false)
+            ThreeStates::allocate(&cfgbad, dense_bytes, expert_per_unit, expert_per_unit, false, 0)
         }));
         match r {
             Ok(_) => {

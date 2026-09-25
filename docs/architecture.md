@@ -210,7 +210,11 @@ the card full. It is named on its own `[budget]` line and costs N 157 -> 155 at 
 point (7.13 has the two numbers and the measurement). `CROW_VIT=0` reserves nothing.
 
 It carries a **render reserve** too (#110, robin's decision 2026-09-25): `CROW_RENDER_RESERVE_MB`,
-default 1536 MiB, `0` = off, is added to `pending` (`manager::planner_pending`) and never
+default 0 since the #110 follow-up (1536 MiB refused the boot on the 46 GiB pinned cap: at N=150 the
+cold tier is 45.61 GiB, so N may not drop below 147), is GRANTED best-effort by
+`manager::grant_render_reserve` (the whole request when both budgets hold, else the largest multiple of
+a hot-set unit that fits, down to 0; one `[budget] render reserve: requested X MiB, granted Y MiB — <binding
+budget>` line; never a boot refusal). The granted part is added to `pending` and never
 allocated, so it stays FREE for a co-resident GPU client — Crow's `render_page`, whose GPU gate
 needs 512 MiB and which fell back to SwiftShader in every capture while serve left 73-185 MiB
 free (2026-09-23/24). 1536 MiB is Crow's gate with its browser panel open (Crow #279), above
@@ -3556,8 +3560,8 @@ was chosen, with its side of the bus: `post-plan allocations held at boot: vit t
 228.5 MB + vit mrope span 48.8 MB + device sampler 0.3 MB = 277.6 MB VRAM; host RAM only (never on
 the card): vit image cache 256.0 MB`, followed by `free VRAM after load 0.54 GiB >= floor 0.25 GiB`
 (`manager::POST_PLAN_FLOOR`, what the decode graph and the driver pools still have to fit in; since
-#110 the floor is `POST_PLAN_FLOOR + CROW_RENDER_RESERVE_MB`, 1.75 GiB by default, and the line reads
-`>= floor 1.75 GiB (post-plan 0.25 + render reserve 1.50)`, section 2.1). The
+#110 the floor is `POST_PLAN_FLOOR + granted render reserve`; with 1536 MiB granted the line reads
+`>= floor 1.75 GiB (post-plan 0.25 + render reserve 1.50)`, section 2.1; default 0). The
 prefix-cache snapshots (3 x 124.6 MiB) were the issue's prime suspect and they are **host RAM**, not
 VRAM — `Vec<f32>` per `cache.rs`'s memory section — so they stay out of the VRAM total; subtracting
 them would have cost about 150 hot experts for nothing.
@@ -3869,7 +3873,7 @@ count from `geo` and the context, `ThreeStates::allocate` is the planner with th
 clamp loop (VRAM lowers N, the host pinned budget raises it), `derive_host_pinned_budget` and
 `ram_margin_bytes` are the host-memory half of that loop (8.8), and `kv_row_ptr` is the KV
 addressing. Surface: 6 `pub fn` plus `StateSizes`, `ThreeStates`, `AllocReport`, the consts
-`SAFETY` and `N_MIN`; since #110 also the render reserve (`render_reserve_bytes`,
+`SAFETY` and `N_MIN`; since #110 also the render reserve (`render_reserve_bytes`, `grant_render_reserve`,
 `planner_pending`, `post_plan_floor`, `headroom_ok`). Depends on `cuda` and `geo`; it may not know about the container or the
 kernels.
 
@@ -4007,7 +4011,7 @@ not line numbers — the files move.
       lines and the `Stage` device allocations.
    8. `ThreeStates::allocate` — the two-sided clamp loop, then KV, QSA, GDN and rope allocation.
       The planner's `pending` bytes are `LAUNCH_SLACK + ring_reserve + vit_reserve + render_reserve`
-      (`manager::planner_pending`, called in `gen.rs` `Engine::load`; the render reserve is #110's,
+      (`manager::planner_pending`, called in `gen.rs` `Engine::load`; the render reserve is #110's, granted inside `allocate` by `grant_render_reserve`,
       kept free for a co-resident renderer and named on its own `[budget]` line, 2.1):
       `vit::reserve_bytes(cfg.context)` enters here, with its own `[budget]` line, so the image path
       is subtracted BEFORE N is chosen (7.13, TASK K).

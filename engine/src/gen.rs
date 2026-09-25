@@ -1258,9 +1258,11 @@ impl Engine {
             crate::vit::reserve_bytes(cfg.context).saturating_sub(vit_held)
         } else { 0 };
         // + #110: the render reserve, VRAM kept FREE for a co-resident GPU client
-        //   (Crow's render_page). The engine never allocates it; counting it as
-        //   pending is what leaves it on the card after the load.
-        let pending = crate::manager::planner_pending(LAUNCH_SLACK, ring_reserve, vit_reserve, render_reserve);
+        //   (Crow's render_page). The engine never allocates it; the planner
+        //   counts the GRANTED part as pending, which leaves it on the card.
+        //   #110 follow-up: it is granted best-effort inside `allocate`
+        //   (`grant_render_reserve`), so it is NOT in `pending` here.
+        let pending = crate::manager::planner_pending(LAUNCH_SLACK, ring_reserve, vit_reserve, 0);
         // pinned-side sizing follows the cold tier actually used (record size
         // of a low-bit tier, full tier = constant; see residency::build)
         let (cold_unit, cold_fixed) = match std::env::var("CROW_COLD_TIER").ok() {
@@ -1276,7 +1278,9 @@ impl Engine {
             }
             None => (per_expert_unit, false),
         };
-        let (st, st_rep) = ThreeStates::allocate(&cfg, pending, per_expert_unit, cold_unit, cold_fixed);
+        let (st, st_rep) = ThreeStates::allocate(&cfg, pending, per_expert_unit, cold_unit, cold_fixed, render_reserve);
+        // #110 follow-up: from here on the reserve is what was GRANTED
+        let render_reserve = st_rep.render_reserve;
         for l in &st_rep.lines {
             log(&format!("  [budget] {l}"));
         }
