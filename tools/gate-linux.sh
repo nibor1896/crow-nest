@@ -284,6 +284,14 @@ SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
 TESTS="413"
 CLIPPY="1522"
+#   v0.6.0 release gate (2026-09-25, `0263990`, decode_out/gate-0925-release): all nine items GREEN against the
+#                              values of record below - #110 (reserve default 0), #117 (VMM, same bytes) and #118
+#                              (serve only) moved no numerics. No value re-recorded.
+#   tests 404 -> 413 / clippy 1522 (unchanged)   #118 (2026-09-25, branch `t-judge-keeps-main-cache`): nine
+#                              `cache::tests` of the park (the synthetic judge replay WARM from 116900 with every KV
+#                              row checked, eight judge rounds, the dirty-row guard after a shortening rollback, cap 0
+#                              and long cold requests keep the old rule). Measured 2026-09-25: lib 284 / 0 / 3
+#                              ignored, serve 118, decode 5, parity 6 = 413 / 0.
 #   tests 396 -> 404 / clippy 1522 (unchanged)   #117 (2026-09-25, branch `t-vram-lend`): six `lend::tests` (lend
 #                              body, no double lend, parked requests until the return, ttl + retry, tier-1 plan
 #                              >= 1.6 GiB, only stateless scratch lendable), `vit::tests_117`, one serve route test.
