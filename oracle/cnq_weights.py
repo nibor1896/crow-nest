@@ -27,7 +27,11 @@ E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=np.float32)
 
 
 class CnqReader:
-    def __init__(self, path):
+    def __init__(self, path, sanitize_sf=False):
+        # sanitize_sf (Crow #300 phase 2): read an NVFP4 scale byte 0x7F (the E4M3 NaN
+        # code) as 0x7E, the rule the engine applies at load to every NVFP4 weight of a
+        # non-Flash-Next container (gen.rs `load_pw_x`), so both sides see the same weights
+        self.sanitize_sf = sanitize_sf
         self.path = path
         f = open(path, "rb")
         f.seek(-8, 2)
@@ -130,6 +134,8 @@ class CnqReader:
         b = np.frombuffer(raw[:n_blocks * 36], dtype=np.uint8).reshape(n_blocks, 36)
         # scales: 4 ue4m3 bytes per block, one per 16-value sub-block
         sc = b[:, 0:4].astype(np.uint32)
+        if self.sanitize_sf:
+            sc = np.where(sc == 0x7F, np.uint32(0x7E), sc)
         e = (sc >> 3) & 0xF
         m = (sc & 7).astype(np.float32)
         s = np.where(e == 0, m * np.float32(2.0 ** -6 / 8),

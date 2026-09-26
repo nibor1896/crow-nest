@@ -17,3 +17,10 @@ Pass thresholds (engine math may add at most 1/10 of the quantization error the 
 
 l3-attn under the default FP8 KV is reported as a measurement, not judged (FP8 KV is the production choice of record, a deliberate precision trade).
 Engine: default switches (CROW_MMA / CROW_GRAPH as the binary defaults them), one run each, RTX 5090.
+
+## Amendment 2026-09-26 (written before the l17-mlp golden is run)
+
+Added golden `l17-mlp` (Qwen3_5MLP, layer 17, whose down_proj carries one NVFP4 scale byte 0x7F): the
+regression check of the engine's load rule 0x7F -> 0x7E (gen.rs `load_pw_x`). Same rule as above: rel_rms <=
+1/10 of its own `cnq_vs_bf16.rel_rms` mark, judged with and without CROW_MMA=1. The existing four goldens and
+their inputs are unchanged (the new input is drawn after them).

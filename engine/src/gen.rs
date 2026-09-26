@@ -372,6 +372,8 @@ pub struct Scratch {
     pub cold: Dev,     // [C] u32
     pub dg: Dev,       // [C][I] Crow #300 phase 2: dense gate rows, silu(gate) * up in place
     pub du: Dev,       // [C][I] dense up rows
+    pub xq_d: Dev,     // [C][xq_row_bytes(I / 64)] quantized down_proj input (phase 2, CROW_MMA=1)
+    pub xq_o: Dev,     // [C][xq_row_bytes(core / 64)] quantized o_proj input of Attn::Full (phase 2)
     // gdn
     pub mq: Dev,       // [C][10240]
     pub mq_t: Dev,     // [10240][C]
@@ -1018,6 +1020,12 @@ impl Engine {
         cfg.host_pinned_budget = crate::manager::derive_host_pinned_budget(cfg.host_pinned_budget, log);
 
         // ---- head + dense (residents before the budget verify) ----
+        // Crow #300 phase 2: a container other than Flash-Next's of record gets the MMA-path
+        // scale rule on every NVFP4 weight at load (0x7F, the E4M3 NaN code, -> 0x7E), the
+        // rule `residency` applies to expert slabs; the count is logged below. Flash-Next
+        // (`None`) loads its bytes untouched: its dense weights carry four such bytes, and
+        // the gate values of record are computed with them.
+        let mut sf: Option<u64> = if geo.family == Family::FlashNext { None } else { Some(0) };
         log("loading embeddings (BF16 keep → host f32) …");
         let emb_t = cnq.find("model.language_model.embed_tokens.weight", sec).clone();
         let emb_raw = cnq.read_bytes(&emb_t);
@@ -1037,8 +1045,8 @@ impl Engine {
                 (
                     lm_head,
                     load_f32(cnq, "model.language_model.hyper_connection_mixer.hc_norm.weight", sec),
-                    load_pw(cnq, "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight", sec),
-                    load_pw(cnq, "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight", sec),
+                    load_pw_x(cnq, "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight", sec, &mut sf),
+                    load_pw_x(cnq, "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight", sec, &mut sf),
                     None,
                 )
             }
@@ -1047,7 +1055,7 @@ impl Engine {
                 0,
                 PW::Bf16(0),
                 PW::Bf16(0),
-                Some((load_f32(cnq, "model.language_model.norm.weight", sec), load_pw(cnq, "lm_head.weight", sec))),
+                Some((load_f32(cnq, "model.language_model.norm.weight", sec), load_pw_x(cnq, "lm_head.weight", sec, &mut sf))),
             ),
         };
 
@@ -1064,9 +1072,9 @@ impl Engine {
             match geo.residual {
                 Residual::Hc { .. } => hc.push(HcW {
                     norm: load_f32(cnq, &pfx("attn_hyper_connection.hc_norm.weight"), sec),
-                    down: load_pw(cnq, &pfx("attn_hyper_connection.input_mix_weight_down.weight"), sec),
-                    up: load_pw(cnq, &pfx("attn_hyper_connection.input_mix_weight_up.weight"), sec),
-                    inj: load_pw(cnq, &pfx("attn_hyper_connection.block_inject_weight.weight"), sec),
+                    down: load_pw_x(cnq, &pfx("attn_hyper_connection.input_mix_weight_down.weight"), sec, &mut sf),
+                    up: load_pw_x(cnq, &pfx("attn_hyper_connection.input_mix_weight_up.weight"), sec, &mut sf),
+                    inj: load_pw_x(cnq, &pfx("attn_hyper_connection.block_inject_weight.weight"), sec, &mut sf),
                 }),
                 Residual::Plain => {
                     ln1.push(load_f32(cnq, &pfx("input_layernorm.weight"), sec));
@@ -1077,23 +1085,23 @@ impl Engine {
                 // C5: the attention arm (Qsa: attention plus the QSA indexer)
                 sub.push(match geo.attn {
                     Attn::Qsa { .. } => SubW::Attn {
-                        q: load_pw(cnq, &pfx("self_attn.q_proj.weight"), sec),
-                        k: load_pw(cnq, &pfx("self_attn.k_proj.weight"), sec),
-                        v: load_pw(cnq, &pfx("self_attn.v_proj.weight"), sec),
-                        o: load_pw(cnq, &pfx("self_attn.o_proj.weight"), sec),
+                        q: load_pw_x(cnq, &pfx("self_attn.q_proj.weight"), sec, &mut sf),
+                        k: load_pw_x(cnq, &pfx("self_attn.k_proj.weight"), sec, &mut sf),
+                        v: load_pw_x(cnq, &pfx("self_attn.v_proj.weight"), sec, &mut sf),
+                        o: load_pw_x(cnq, &pfx("self_attn.o_proj.weight"), sec, &mut sf),
                         qn: load_f32(cnq, &pfx("self_attn.q_norm.weight"), sec),
                         kn: load_f32(cnq, &pfx("self_attn.k_norm.weight"), sec),
-                        iqk: load_pw(cnq, &pfx("self_attn.indexer.index_qk_proj.weight"), sec),
+                        iqk: load_pw_x(cnq, &pfx("self_attn.indexer.index_qk_proj.weight"), sec, &mut sf),
                         iqln: load_f32(cnq, &pfx("self_attn.indexer.q_layernorm.weight"), sec),
                         ikln: load_f32(cnq, &pfx("self_attn.indexer.k_layernorm.weight"), sec),
                     },
                     // phase 2: the same projections and norms without the QSA indexer
                     // (its three fields stay empty: no launch of a Full layer reads them)
                     Attn::Full => SubW::Attn {
-                        q: load_pw(cnq, &pfx("self_attn.q_proj.weight"), sec),
-                        k: load_pw(cnq, &pfx("self_attn.k_proj.weight"), sec),
-                        v: load_pw(cnq, &pfx("self_attn.v_proj.weight"), sec),
-                        o: load_pw(cnq, &pfx("self_attn.o_proj.weight"), sec),
+                        q: load_pw_x(cnq, &pfx("self_attn.q_proj.weight"), sec, &mut sf),
+                        k: load_pw_x(cnq, &pfx("self_attn.k_proj.weight"), sec, &mut sf),
+                        v: load_pw_x(cnq, &pfx("self_attn.v_proj.weight"), sec, &mut sf),
+                        o: load_pw_x(cnq, &pfx("self_attn.o_proj.weight"), sec, &mut sf),
                         qn: load_f32(cnq, &pfx("self_attn.q_norm.weight"), sec),
                         kn: load_f32(cnq, &pfx("self_attn.k_norm.weight"), sec),
                         iqk: PW::Bf16(0),
@@ -1103,15 +1111,15 @@ impl Engine {
                 });
             } else {
                 sub.push(SubW::Gdn {
-                    qkv: load_pw(cnq, &pfx("linear_attn.in_proj_qkv.weight"), sec),
+                    qkv: load_pw_x(cnq, &pfx("linear_attn.in_proj_qkv.weight"), sec, &mut sf),
                     conv: dequant_fp4_dev(cnq, &pfx("linear_attn.conv1d.weight"), sec, d.gdn_conv * d.conv_kernel),
-                    z: load_pw(cnq, &pfx("linear_attn.in_proj_z.weight"), sec),
-                    b: load_pw(cnq, &pfx("linear_attn.in_proj_b.weight"), sec),
-                    a: load_pw(cnq, &pfx("linear_attn.in_proj_a.weight"), sec),
+                    z: load_pw_x(cnq, &pfx("linear_attn.in_proj_z.weight"), sec, &mut sf),
+                    b: load_pw_x(cnq, &pfx("linear_attn.in_proj_b.weight"), sec, &mut sf),
+                    a: load_pw_x(cnq, &pfx("linear_attn.in_proj_a.weight"), sec, &mut sf),
                     alog: load_small_f32(cnq, &pfx("linear_attn.A_log"), sec, d.gdn_vheads),
                     dt: load_small_f32(cnq, &pfx("linear_attn.dt_bias"), sec, d.gdn_vheads),
                     norm: load_f32(cnq, &pfx("linear_attn.norm.weight"), sec),
-                    out: load_pw(cnq, &pfx("linear_attn.out_proj.weight"), sec),
+                    out: load_pw_x(cnq, &pfx("linear_attn.out_proj.weight"), sec, &mut sf),
                 });
             }
             // C5: the FFN arm (Moe: the router and the shared expert; the routed
@@ -1120,15 +1128,15 @@ impl Engine {
                 Ffn::Moe { .. } => moe.push(MoeW {
                     router: load_f32(cnq, &pfx("mlp.gate.weight"), sec),
                     router_bf: load_bf16_twin(cnq, &pfx("mlp.gate.weight"), sec),
-                    sg: load_pw(cnq, &pfx("mlp.shared_expert.gate_proj.weight"), sec),
-                    su: load_pw(cnq, &pfx("mlp.shared_expert.up_proj.weight"), sec),
-                    sdn: load_pw(cnq, &pfx("mlp.shared_expert.down_proj.weight"), sec),
+                    sg: load_pw_x(cnq, &pfx("mlp.shared_expert.gate_proj.weight"), sec, &mut sf),
+                    su: load_pw_x(cnq, &pfx("mlp.shared_expert.up_proj.weight"), sec, &mut sf),
+                    sdn: load_pw_x(cnq, &pfx("mlp.shared_expert.down_proj.weight"), sec, &mut sf),
                     sgate: load_f32(cnq, &pfx("mlp.shared_expert_gate.weight"), sec),
                 }),
                 Ffn::Dense { .. } => mlp.push(MlpW {
-                    gate: load_pw(cnq, &pfx("mlp.gate_proj.weight"), sec),
-                    up: load_pw(cnq, &pfx("mlp.up_proj.weight"), sec),
-                    down: load_pw(cnq, &pfx("mlp.down_proj.weight"), sec),
+                    gate: load_pw_x(cnq, &pfx("mlp.gate_proj.weight"), sec, &mut sf),
+                    up: load_pw_x(cnq, &pfx("mlp.up_proj.weight"), sec, &mut sf),
+                    down: load_pw_x(cnq, &pfx("mlp.down_proj.weight"), sec, &mut sf),
                 }),
             }
             if l % 12 == 0 {
@@ -1142,9 +1150,9 @@ impl Engine {
             match geo.residual {
                 Residual::Hc { .. } => hc2.push(HcW {
                     norm: load_f32(cnq, &pfx("mlp_hyper_connection.hc_norm.weight"), sec),
-                    down: load_pw(cnq, &pfx("mlp_hyper_connection.input_mix_weight_down.weight"), sec),
-                    up: load_pw(cnq, &pfx("mlp_hyper_connection.input_mix_weight_up.weight"), sec),
-                    inj: load_pw(cnq, &pfx("mlp_hyper_connection.block_inject_weight.weight"), sec),
+                    down: load_pw_x(cnq, &pfx("mlp_hyper_connection.input_mix_weight_down.weight"), sec, &mut sf),
+                    up: load_pw_x(cnq, &pfx("mlp_hyper_connection.input_mix_weight_up.weight"), sec, &mut sf),
+                    inj: load_pw_x(cnq, &pfx("mlp_hyper_connection.block_inject_weight.weight"), sec, &mut sf),
                 }),
                 // phase 2: a plain residual has no second block (post_attention_layernorm
                 // was loaded with the first)
@@ -1152,6 +1160,9 @@ impl Engine {
             }
         }
         let dense = head_rms.map(|(norm, lm_head)| DenseW { ln1, ln2, mlp, norm, lm_head });
+        if let Some(n) = sf {
+            log(&format!("NVFP4 scale bytes 0x7F (the E4M3 NaN code) rewritten to 0x7E: {n} (the MMA path reads 0x7F as NaN; the same rule as the expert slabs)"));
+        }
         let dense_measured = cuda::total_vram_bytes() - cuda::free_vram_bytes();
 
         // ---- PLE weights (layer index 1) ----
@@ -1650,6 +1661,26 @@ fn st_res_n(rep: &crate::manager::AllocReport, target: usize) -> usize {
 // the one loader that stays here: PW carries a launch policy (env switches,
 // tile forms), not just bytes - see weights.rs for the rest
 /// dtype-agnostic loader: nvfp4 → FP4 GEMV, bf16 keep → BF16 GEMV
+/// Crow #300 phase 2: `load_pw`, or - with `sf` = `Some(count)` - the same weight with every
+/// NVFP4 scale byte 0x7F rewritten to 0x7E (`residency::sanitize_sf_slab`, the rule of the expert
+/// slabs: the mxf4nvf4 MMA instruction turns 0x7F into NaN; the scalar decode reads it as 480, the
+/// rewritten byte is 448). The 27B container carries four such bytes (layers 11, 17, 17, 37);
+/// through the MMA path each one made the whole residual stream NaN.
+///
+/// # Safety
+///
+/// A CUDA context must be current (the weight is uploaded), as for `load_pw`.
+pub unsafe fn load_pw_x(cnq: &mut Cnq, name: &str, sec: &str, sf: &mut Option<u64>) -> PW {
+    let Some(count) = sf.as_mut() else { return load_pw(cnq, name, sec) };
+    let t = cnq.find(name, sec).clone();
+    if t.dtype == "bf16" {
+        return load_pw(cnq, name, sec);
+    }
+    let mut raw = cnq.read_bytes(&t);
+    *count += crate::residency::sanitize_sf_slab(&mut raw);
+    PW::Fp4(cuda::upload_dev(&raw), cuda::to_f32_dev(&[t.global_scale]))
+}
+
 pub unsafe fn load_pw(cnq: &mut Cnq, name: &str, sec: &str) -> PW {
     let t = cnq.find(name, sec).clone();
     if t.dtype == "bf16" {
@@ -2394,6 +2425,9 @@ impl Scratch {
             ("q_rot", 4 * c * d.qsa_heads * d.qsa_hd),
             ("sel", c * d.qsa_sel_max * 4),
             ("sel_n", c * 4),
+            // Crow #300 phase 2: the quantized o_proj input of full attention (K = core);
+            // 0 B with QSA (Flash-Next), and a 0-byte entry at the end moves no offset
+            ("xq_o", if d.qsa_sel_max == 0 { c * xq_row_bytes(d.core / 64) } else { 0 }),
         ];
         let gdn_set: Vec<(&'static str, usize)> = vec![
             ("mq", 4 * c * d.gdn_conv),
@@ -2447,6 +2481,8 @@ impl Scratch {
             // and a 0-byte entry at the end of a set moves no offset)
             ("dg", 4 * c * d.dense_inter),
             ("du", 4 * c * d.dense_inter),
+            // the quantized down_proj input (K = I)
+            ("xq_d", c * xq_row_bytes(d.dense_inter / 64)),
         ];
         [persist_set, hc_set, attn_set, gdn_set, ple_set, moe_set]
     }
@@ -2536,7 +2572,7 @@ impl Scratch {
             qg: at[0], aq: at[1], agate: at[2], aqn: at[3], aqr: at[4],
             ak: at[5], akn: at[6], akr: at[7], av: at[8], aout: at[9],
             agated: at[10], ay: at[11], qk: at[12], q_nrm: at[13], q_rot: at[14],
-            sel: at[15], sel_n: at[16],
+            sel: at[15], sel_n: at[16], xq_o: at[17],
             // gdn temps (union)
             mq: gd[0], mq_t: gd[1], cout_t: gd[2], gq: gd[3], gk: gd[4],
             gv: gd[5], gz: gd[6], gb: gd[7], ga: gd[8], gbeta: gd[9], gg: gd[10],
@@ -2549,7 +2585,7 @@ impl Scratch {
             h1: mo[0], h2: mo[1], eo: mo[2], xq_dn: mo[3], xq_s: mo[4],
             sh12: mo[5], sh2: mo[6], sdown: mo[7], sgv: mo[8], rlog: mo[9],
             rids: mo[10], rwts: mo[11], gu_ptrs: mo[12], dn_ptrs: mo[13], cold: mo[14],
-            dg: mo[15], du: mo[16],
+            dg: mo[15], du: mo[16], xq_d: mo[17],
             // fixed size, never chunk scaled (the #16 caps)
             // #117: lendable, per-chunk QSA temps (pooled/normed/rotated keys, scores)
             // Crow #300 phase 2: full attention has no indexer, so no QSA temps (0 = none)
@@ -3236,6 +3272,29 @@ impl Engine {
         launch_v(self.k.f("rms_group"), 1, t as u32, 1, 256, &[x, w, out]);
     }
 
+    /// Crow #300 phase 2: one projection of the dense family over `t` rows of `x` into `y`
+    /// (`[t][rows]`). An NVFP4 weight under `CROW_MMA=1` takes Flash-Next's MMA path
+    /// (`launch_mma_d`: the 8-token tile GEMM at t >= 8, else `gemv_fp4_mma_d`) on `xq`,
+    /// which must hold `x` quantized by `quant_rows`; otherwise, and for a BF16 weight, the
+    /// plain GEMV of step 1 (`PW::launch_gemv`) on the f32 rows.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn dense_proj(&self, w: &PW, rows: usize, rows_p: Dev, t: usize, x: Dev, xq: Dev, y: Dev, k_p: Dev) {
+        match w {
+            PW::Fp4(wp, gs) if dense_mma_on() => {
+                launch_mma_d(&self.k, rows.div_ceil(64) as u32, t, self.p.t, &[*wp, xq, *gs, y, k_p, rows_p, rows_p]);
+            }
+            _ => w.launch_gemv(&self.k, rows, rows_p, t, self.p.t, x, y, k_p),
+        }
+    }
+
+    /// Crow #300 phase 2: `t` f32 rows of width `*k_p` into the NVFP4 activation cascade
+    /// the MMA path reads (`quant_x_fp4`); a no-op without `CROW_MMA=1`
+    unsafe fn quant_rows(&self, t: usize, x: Dev, xq: Dev, k_p: Dev) {
+        if dense_mma_on() {
+            quant_x_now(&self.k, &self.p, t as u32, x, xq, k_p, k_p);
+        }
+    }
+
     /// Crow #300 phase 2: the plain residual add `h += y` over `[t][H]` (`add_flat`; the
     /// element count is `nt_hct` = t * H, refreshed per chunk and per decode step)
     unsafe fn residual_add(&self, y: Dev, t: usize) {
@@ -3249,12 +3308,14 @@ impl Engine {
         let (k, p, s) = (&self.k, &self.p, &self.s);
         let m = &self.dw().mlp[l];
         let inter = self.d.dense_inter;
-        m.gate.launch_gemv(k, inter, p.n_dinter, t, p.t, x, s.dg, p.n2560);
-        m.up.launch_gemv(k, inter, p.n_dinter, t, p.t, x, s.du, p.n2560);
+        self.quant_rows(t, x, s.xq_gu, p.n2560);
+        self.dense_proj(&m.gate, inter, p.n_dinter, t, x, s.xq_gu, s.dg, p.n2560);
+        self.dense_proj(&m.up, inter, p.n_dinter, t, x, s.xq_gu, s.du, p.n2560);
         // t * I elements: the constant I at t = 1 (the decode graph), else the chunk count
         let n_p = if t == 1 { p.n_dinter } else { p.nt_dinter };
         launch_v(k.f("silu_mul_n"), (t * inter).div_ceil(256) as u32, 1, 1, 256, &[s.dg, s.du, n_p]);
-        m.down.launch_gemv(k, self.d.h, p.n2560, t, p.t, s.dg, s.moe_out, p.n_dinter);
+        self.quant_rows(t, s.dg, s.xq_d, p.n_dinter);
+        self.dense_proj(&m.down, self.d.h, p.n2560, t, s.dg, s.xq_d, s.moe_out, p.n_dinter);
         s.moe_out
     }
 
@@ -3271,24 +3332,26 @@ impl Engine {
         let (kc, vc, _, _) = self.layer_cache_ptrs(l);
         let cos = self.cos_tbl() + (pos_base * self.d.rope_pairs * 4) as u64;
         let sin = self.sin_tbl() + (pos_base * self.d.rope_pairs * 4) as u64;
-        q.launch_gemv(k, self.d.q_rows, p.n12288, t, p.t, mixed, s.qg, p.n2560);
+        self.quant_rows(t, mixed, s.xq_m, p.n2560);
+        self.dense_proj(q, self.d.q_rows, p.n12288, t, mixed, s.xq_m, s.qg, p.n2560);
         launch_v(k.f("split_qg"), self.d.nq as u32, t as u32, 1, self.d.ahd as u32, &[
             s.qg, s.aq, s.agate]);
         launch_v(k.f("rmsnorm_1pw"), self.d.nq as u32, t as u32, 1, self.d.ahd as u32, &[
             s.aq, *qn, s.aqn]);
         launch_v(k.f("rope"), self.d.nq as u32, t as u32, 1, self.d.ahd as u32, &[s.aqn, cos, sin, s.aqr]);
-        kk.launch_gemv(k, self.d.kv_rows, p.nr512, t, p.t, mixed, s.ak, p.n2560);
+        self.dense_proj(kk, self.d.kv_rows, p.nr512, t, mixed, s.xq_m, s.ak, p.n2560);
         launch_v(k.f("rmsnorm_1pw"), self.d.nkv as u32, t as u32, 1, self.d.ahd as u32, &[
             s.ak, *kn, s.akn]);
         launch_v(k.f("rope"), self.d.nkv as u32, t as u32, 1, self.d.ahd as u32, &[s.akn, cos, sin, s.akr]);
-        v.launch_gemv(k, self.d.kv_rows, p.nr512, t, p.t, mixed, s.av, p.n2560);
+        self.dense_proj(v, self.d.kv_rows, p.nr512, t, mixed, s.xq_m, s.av, p.n2560);
         launch_v(k.f("store_kv"), (2 * self.d.nkv) as u32, t as u32, 1, self.d.ahd as u32, &[
             s.akr, s.av, kc, vc, p.pos_base, p.tmax, p.mode]);
         launch_v(k.f("attn_full_split"), self.d.nq as u32, t as u32, 1, self.d.ahd as u32, &[
             s.aqr, kc, vc, p.pos_base, p.tmax, p.mode, s.aout, 0]);
         launch_v(k.f("gate_mul"), (t * self.d.core).div_ceil(256) as u32, 1, 1, 256, &[
             s.aout, s.agate, s.agated]);
-        o.launch_gemv(k, self.d.h, p.n2560, t, p.t, s.agated, s.ay, p.n_core);
+        self.quant_rows(t, s.agated, s.xq_o, p.n_core);
+        self.dense_proj(o, self.d.h, p.n2560, t, s.agated, s.xq_o, s.ay, p.n_core);
         s.ay
     }
 
@@ -3302,14 +3365,15 @@ impl Engine {
         };
         let (kc, vc, _, _) = self.layer_cache_ptrs(l);
         let (cos, sin) = (self.cos_tbl(), self.sin_tbl());
-        q.launch_gemv1(k, self.d.q_rows, p.n12288, mixed, s.qg, p.n2560);
+        self.quant_rows(1, mixed, s.xq_m, p.n2560);
+        self.dense_proj(q, self.d.q_rows, p.n12288, 1, mixed, s.xq_m, s.qg, p.n2560);
         launch_v(k.f("split_qg"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[s.qg, s.aq, s.agate]);
         launch_v(k.f("rmsnorm_1pw"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[s.aq, *qn, s.aqn]);
         launch_v(k.f("rope_p"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[s.aqn, cos, sin, s.aqr, p.pos_base]);
-        kk.launch_gemv1(k, self.d.kv_rows, p.nr512, mixed, s.ak, p.n2560);
+        self.dense_proj(kk, self.d.kv_rows, p.nr512, 1, mixed, s.xq_m, s.ak, p.n2560);
         launch_v(k.f("rmsnorm_1pw"), self.d.nkv as u32, 1, 1, self.d.ahd as u32, &[s.ak, *kn, s.akn]);
         launch_v(k.f("rope_p"), self.d.nkv as u32, 1, 1, self.d.ahd as u32, &[s.akn, cos, sin, s.akr, p.pos_base]);
-        v.launch_gemv1(k, self.d.kv_rows, p.nr512, mixed, s.av, p.n2560);
+        self.dense_proj(v, self.d.kv_rows, p.nr512, 1, mixed, s.xq_m, s.av, p.n2560);
         launch_v(k.f("store_kv"), (2 * self.d.nkv) as u32, 1, 1, self.d.ahd as u32, &[
             s.akr, s.av, kc, vc, p.slot1, p.tmax, p.mode]);
         launch_v(k.f("attn_full_split"), self.d.nq as u32, 1, attn_splits() as u32, self.d.ahd as u32, &[
@@ -3318,7 +3382,8 @@ impl Engine {
             s.part_o, s.part_ml, s.aout, p.n_splits]);
         launch_v(k.f("gate_mul"), self.d.core.div_ceil(256) as u32, 1, 1, 256, &[
             s.aout, s.agate, s.agated]);
-        o.launch_gemv1(k, self.d.h, p.n2560, s.agated, s.ay, p.n_core);
+        self.quant_rows(1, s.agated, s.xq_o, p.n_core);
+        self.dense_proj(o, self.d.h, p.n2560, 1, s.agated, s.xq_o, s.ay, p.n_core);
         s.ay
     }
 }
@@ -3987,8 +4052,9 @@ impl Engine {
         let dst = self.s.logits as u64;
         // Crow #300 phase 2: the FinalNorm::Rms head's lm_head is a PW (NVFP4 in the dense recipe)
         if let Some(dw) = self.w.dense.as_ref() {
-            dw.lm_head.launch_gemv1(&self.k, self.d.v, self.p.n_vocab,
-                self.s.mixed_final + (row * self.d.h * 4) as u64, dst, self.p.n2560);
+            let x = self.s.mixed_final + (row * self.d.h * 4) as u64;
+            self.quant_rows(1, x, self.s.xq_m, self.p.n2560);
+            self.dense_proj(&dw.lm_head, self.d.v, self.p.n_vocab, 1, x, self.s.xq_m, dst, self.p.n2560);
             return;
         }
         if bf16_w_on() {

@@ -58,7 +58,7 @@ class WeightSource:
             self.path = cnq_path
             # a container still being written (or cut short) has no index trailer yet
             assert has_trailer(cnq_path), f"{cnq_path}: no index trailer - conversion unfinished?"
-            self.cnq = CnqReader(cnq_path)
+            self.cnq = CnqReader(cnq_path, sanitize_sf=True)  # the engine's load rule (gen.rs load_pw_x)
         else:
             self.model_dir = model_dir
             self.wm = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))["weight_map"]

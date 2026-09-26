@@ -70,6 +70,12 @@ inputs = {
     "l0-mlp": torch.randn(T, H, generator=gen),
     "l3-attn": torch.randn(N, H, generator=gen),
 }
+# drawn AFTER the four above, so their inputs (and files) are unchanged by it
+inputs["l17-mlp"] = torch.randn(T, H, generator=gen)
+# Crow #300 phase 2: layer 17's down_proj carries one NVFP4 scale byte 0x7F (the E4M3 NaN
+# code); through the engine's MMA path it made the residual stream NaN until the load rule
+# (gen.rs load_pw_x) rewrote it. This golden is the regression check for that rule.
+MLP17_LAYER = 17
 
 rotary = Qwen3_5TextRotaryEmbedding(config=tc).float().eval()
 
@@ -93,6 +99,11 @@ def run_norm(ws):
 def run_mlp(ws):
     m = ws.load(build_meta(Qwen3_5MLP, tc, tc.intermediate_size), f"{LM}layers.{GDN_LAYER}.mlp.")
     return m(inputs["l0-mlp"][None])[0], {}
+
+
+def run_mlp17(ws):
+    m = ws.load(build_meta(Qwen3_5MLP, tc, tc.intermediate_size), f"{LM}layers.{MLP17_LAYER}.mlp.")
+    return m(inputs["l17-mlp"][None])[0], {}
 
 
 def run_gdn(ws):
@@ -150,6 +161,9 @@ GOLDENS = [
      "rows 0..39: batched prompt, positions 0..39, causal mask; rows 40..43: single-token decode at positions "
      "40..43 against the DynamicCache KV of all previous rows. Text-only rope: position_ids 2-D -> 3 equal mrope "
      "rows == plain 1-D NeoX rope over dims 0..63 (asserted)"),
+    ("l17-mlp", run_mlp17, "Qwen3_5MLP", MLP17_LAYER, f"{LM}layers.{MLP17_LAYER}.mlp.*",
+     "rows 0..39: positions 0..39 (position-independent); down_proj carries one scale byte 0x7F, read as 0x7E "
+     "(the engine's load rule) on the cnq side"),
 ]
 
 
@@ -168,7 +182,7 @@ manifest = {
     "attn_implementation": "eager",
     "device": "cpu",
     "seed": SEED,
-    "input_draws": "one torch.Generator(seed): norm randn[T][5120]*3, gdn randn[T+D][5120], mlp randn[T][5120], attn randn[T+D][5120]",
+    "input_draws": "one torch.Generator(seed): norm randn[T][5120]*3, gdn randn[T+D][5120], mlp randn[T][5120], attn randn[T+D][5120], then l17-mlp randn[T][5120]",
     "T_prompt": T,
     "D_decode": D,
     "config": os.path.relpath(os.path.join(ROOT, "models", "Qwen3.8-27B", "config.json"), ROOT),

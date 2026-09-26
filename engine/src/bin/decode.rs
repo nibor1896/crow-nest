@@ -581,6 +581,9 @@ fn main() {
                     ("l0-mlp", "mlp", 0, false, true),
                     ("l0-gdn", "gdn", 0, true, true),
                     ("l3-attn", "attn", 3, true, kv_bf16),
+                    // layer 17's down_proj carries a scale byte 0x7F: the check of the load rule
+                    // `gen::load_pw_x` (PREREG amendment 2026-09-26)
+                    ("l17-mlp", "mlp", 17, false, true),
                 ] {
                     let g = &man["goldens"][name];
                     let mark = g["cnq_vs_bf16"]["rel_rms"].as_f64().unwrap();

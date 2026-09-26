@@ -5032,10 +5032,29 @@ Flash-Next's with the SiLU gate (`CN_GATE_ACT`, C4).
   + 4 decode steps against `oracle/ref_qwen35_logits.py`, f32, same weights): argmax 67 / 67; with
   FP8 KV mean KL 1.3e-4, max 1.5e-3, worst |Δlogit| 14.3 (one tail token); with BF16 KV mean KL
   5.5e-7, max 4.6e-6, worst |Δlogit| 0.066.
-- **Not yet.** Every NVFP4 projection runs the plain GEMV (`gemv_fp4` / `gemv_fp4_b`): decode
-  3.8 tok/s, prefill 18 tok/s on the RTX 5090. `serve` is not wired for the family (the slot
-  file, the prefix-cache park and the lend listing read `Geo::qsa`). The F16 projector, the MTP
-  head and the per-card planner above the context floor are open.
+- **The MMA path** (step 2). Under `CROW_MMA=1` every NVFP4 projection of the dense arms
+  (q/k/v/o, gate/up/down, lm_head) runs Flash-Next's MMA kernels through `Engine::dense_proj`:
+  the activation rows are quantized once per input (`quant_rows`: `mixed` -> `xq_m`, `mixed_m`
+  -> `xq_gu`, the gated attention output -> `xq_o`, silu(gate)·up -> `xq_d`), then
+  `launch_mma_d` (the 8-token tile GEMM at t >= 8, `gemv_fp4_mma_d` below). Without the switch
+  and for a BF16 weight the plain GEMV of step 1 runs. `xq_o` and `xq_d` are new scratch entries,
+  0 B on Flash-Next. RTX 5090, `CROW_MMA=1 CROW_GRAPH=1`, FP8 KV: decode 36.1 ms mean over 128
+  tokens (27.7 tok/s), prefill 1,364 tok/s on a 63-token prompt; step 1 was 265 ms / 18 tok/s.
+- **The 0x7F scale byte.** The mxf4nvf4 MMA instruction turns an NVFP4 scale byte 0x7F (the E4M3
+  NaN code; the scalar decode reads it as 480) into NaN. The 27B container carries four
+  (layers 11 `o_proj`, 17 `in_proj_z`, 17 `down_proj`, 37 `up_proj`), and through the MMA path each
+  one made the whole residual stream NaN (the MMA lm_head then wrote all-zero logits). Every
+  NVFP4 weight of a non-Flash-Next container is loaded through `load_pw_x`, which rewrites 0x7F to
+  0x7E (448), the rule `residency` applies to expert slabs, and logs the count
+  (`NVFP4 scale bytes 0x7F ... rewritten to 0x7E: 4`). Flash-Next loads its bytes untouched: its
+  dense weights carry four such bytes too (three `conv1d`, dequantized on the CPU, and layer 24's
+  `mlp_hyper_connection.block_inject_weight`), and the gate values of record are computed with
+  them. The oracle reads the same rule (`CnqReader(sanitize_sf=True)` in `qwen35_common.py`).
+  Regression check: golden `l17-mlp` (layer 17's `down_proj`), NaN without the rule under
+  `CROW_MMA=1`, 1.5e-3 with it.
+- **Not yet.** `serve` is not wired for the family (the slot file, the prefix-cache park and the
+  lend listing read `Geo::qsa`). The F16 projector, the MTP head and the per-card planner above
+  the context floor are open.
 
 ## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
 

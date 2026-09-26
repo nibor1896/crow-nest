@@ -119,7 +119,7 @@ pub fn expert_slab_info(cnq: &Cnq, layer: usize, section: &str, experts: usize) 
 /// that byte (mma_probe2), so slabs served to the MMA path must not carry it.
 /// Rare (1 byte in ~5e7 at layer 9); error is a 6.7% scale reduction on the
 /// affected 16-element subblocks only.
-fn sanitize_sf_slab(raw: &mut [u8]) -> u64 {
+pub(crate) fn sanitize_sf_slab(raw: &mut [u8]) -> u64 {
     let mut n = 0u64;
     for blk in raw.chunks_exact_mut(36) {
         for b in blk.iter_mut().take(4) {
