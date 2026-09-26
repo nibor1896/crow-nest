@@ -1,0 +1,5 @@
+{
+  "bos_token_id": 1,
+  "eos_token_id": [2, 3],
+  "temperature": 0.7
+}
