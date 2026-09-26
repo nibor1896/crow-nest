@@ -1091,11 +1091,16 @@ fn convert(input: &std::path::Path, out_path: &std::path::Path, mode: ScalesMode
     }
     sidecar.flush().ok();
 
-    // coverage check in dir mode: every tensor the model index knows must be in the output
+    // coverage check in dir mode: every tensor the model index knows must be in the output,
+    // or be one the recipe omits by name (`recipe::omitted`, Crow #300: the dense vision tower)
     if let Some(wm) = &m.weight_map {
-        let mut missing = 0usize;
+        let (mut missing, mut omitted) = (0usize, 0usize);
         for name in wm.keys() {
             if !tensors.iter().any(|t| &t.name == name) {
+                if recipe::omitted(m.family, name).is_some() {
+                    omitted += 1;
+                    continue;
+                }
                 eprintln!("MISSING from output: {name}");
                 missing += 1;
             }
@@ -1104,7 +1109,7 @@ fn convert(input: &std::path::Path, out_path: &std::path::Path, mode: ScalesMode
             eprintln!("coverage check FAILED: {missing} tensors missing");
             return 3;
         }
-        eprintln!("coverage check: all {} weight_map tensors present", wm.len());
+        eprintln!("coverage check: all {} weight_map tensors present ({omitted} omitted by the {} recipe)", wm.len(), m.family.recipe());
     }
 
     let index = index_v2(&model, scales_mode_str, blob_start, index_tensors);
@@ -1434,6 +1439,29 @@ mod tests {
         assert!(e.contains("no --revision"), "{e}");
         assert_eq!(convert(&st, &out, ScalesMode::Ceil, &Provenance::default()), 2);
         assert!(!out.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Dir mode (a `model.safetensors.index.json` beside the shards) runs the coverage check
+    /// against the checkpoint's `weight_map`. A tensor the recipe omits (`recipe::omitted`: the
+    /// dense vision tower) is absent from the output on purpose and must not fail it; the 27B
+    /// conversion of 2026-09-26 exited 3 with "333 tensors missing" before this was known.
+    #[test]
+    fn a_dir_conversion_passes_the_coverage_check_with_the_omitted_vision_tower() {
+        let dir = std::env::temp_dir().join(format!("cnq-300-omit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(fixture_dir().join("config.json"), dir.join("config.json")).unwrap();
+        std::fs::copy(fixture_dir().join("generation_config.json"), dir.join("generation_config.json")).unwrap();
+        write_synthetic_safetensors(&dir.join("model.safetensors"));
+        let wm: serde_json::Map<String, serde_json::Value> =
+            synthetic_v2_tensors().iter().map(|(n, _)| (n.to_string(), "model.safetensors".into())).collect();
+        assert!(wm.keys().any(|n| recipe::omitted(recipe::Family::Qwen35Dense, n).is_some()), "the fixture carries a vision tensor");
+        std::fs::write(dir.join("model.safetensors.index.json"), serde_json::to_vec(&serde_json::json!({ "weight_map": wm })).unwrap()).unwrap();
+        let out = dir.join("x.cnq");
+        let prov = Provenance { repo: Some("crow-nest/synthetic-v2".into()), revision: Some("c6".into()) };
+        assert_eq!(convert(&dir, &out, ScalesMode::Ceil, &prov), 0);
+        let idx = trailer(&std::fs::read(&out).unwrap());
+        assert!(idx["tensors"].as_array().unwrap().iter().all(|t| !t["name"].as_str().unwrap().contains("visual")));
         std::fs::remove_dir_all(&dir).ok();
     }
 
