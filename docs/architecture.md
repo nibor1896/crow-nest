@@ -5040,6 +5040,24 @@ Flash-Next's with the SiLU gate (`CN_GATE_ACT`, C4).
   and for a BF16 weight the plain GEMV of step 1 runs. `xq_o` and `xq_d` are new scratch entries,
   0 B on Flash-Next. RTX 5090, `CROW_MMA=1 CROW_GRAPH=1`, FP8 KV: decode 36.1 ms mean over 128
   tokens (27.7 tok/s), prefill 1,364 tok/s on a 63-token prompt; step 1 was 265 ms / 18 tok/s.
+- **The decode GEMV** (step 3). The per-kernel profile (`CROW_KPROF=1 CROW_PROFILE=1`, graph
+  off) put the 36 ms in two places the Flash-Next kernels were never built for: `quant_x_fp4`,
+  one 128-thread block per 5,120 / 17,408-wide row, 257 calls at 49 us per token (27.5 %), and
+  `gemv_fp4_mma_d` at ~640 GB/s on the 17,408 x 5,120 matrices (it computes 8 tokens per MMA and
+  gets 80-272 blocks for 170 SMs). Flash-Next's own profile beside it: 39 % `stage_cold_ca` (the
+  PCIe expert copy), its MMA GEMVs on 10-40-block matrices at 11 us. One token (t = 1) now takes
+  `gemv_nvfp4_w` (`kernels_p2`): one warp per row, the row staged 32 blocks at a time through
+  shared memory with 16-byte loads, then one pack byte and one coalesced float2 of x per lane,
+  on the f32 activation row (no quantization; exact like `gemv_fp4`). The GDN decode projections
+  of the dense family take it too (`gdn_step`: a `dense` arm before Flash-Next's, which is
+  unchanged). The prompt quantization runs one 1,024-thread block per row (the bytes of the
+  128-thread launch: `quant_row_prescaled` reads `blockDim` only as its stride). Decode 128
+  tokens: 36.1 -> 30.5 (1,024-thread quant) -> 24.1 (first `gemv_nvfp4_w`, one lane per block)
+  -> 20.8 (coalesced) -> **17.4 ms, 57.5 tok/s** (GDN too); the greedy trace is identical at
+  every step. llama.cpp on the same card, 27B `UD-Q4_K_XL` without MTP: 66.5 tok/s
+  (`manifests/operating-point.json`, 2026-08-21); the bandwidth ceiling of 14.45 GB per token is
+  ~124 tok/s. `gemv_nvfp4_w` reaches ~1.0-1.3 TB/s (gate/up 50 MB in 49 us, lm_head 715 MB in
+  548 us, profile timings include one launch latency).
 - **The 0x7F scale byte.** The mxf4nvf4 MMA instruction turns an NVFP4 scale byte 0x7F (the E4M3
   NaN code; the scalar decode reads it as 480) into NaN. The 27B container carries four
   (layers 11 `o_proj`, 17 `in_proj_z`, 17 `down_proj`, 37 `up_proj`), and through the MMA path each

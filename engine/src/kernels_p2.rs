@@ -10,7 +10,7 @@
 //! `dec_e4m3`) as they are; the Flash-Next source stays `prelude + KERNEL_SRC`.
 
 /// the entries of `P2_SRC`, resolved by `Kernels::add_p2` when the family compiles them
-pub const P2_NAMES: &[&str] = &["attn_full_split", "silu_mul_n"];
+pub const P2_NAMES: &[&str] = &["attn_full_split", "silu_mul_n", "gemv_nvfp4_w"];
 
 /// the phase 2 kernel source, appended after `KERNEL_SRC` (`KernelGeo::source`)
 pub const P2_SRC: &str = r#"
@@ -86,6 +86,55 @@ extern "C" __global__ void attn_full_split(const float* __restrict__ q, const un
         part_ml[pi * 2] = (hi > lo) ? m : -3.0e38f;
         part_ml[pi * 2 + 1] = (hi > lo) ? l : 0.0f;
     }
+}
+
+// ---------------- the decode GEMV of the dense family (one token) ----------------
+// y[row] = gs * sum_b sum_s ue4m3(scale[b][s]) * sum_j e2m1(nib[b][s][j]) * x[64b + 16s + j]
+// over NVFP4 rows (36-byte blocks: 4 ue4m3 sub-block scales, then 32 bytes of e2m1 pairs, low
+// nibble = even value), on the f32 activation row itself: no activation quantization.
+// One warp per row, 8 rows per 256-thread block. Both streams are read the way Flash-Next's
+// gemv_bf16_w reads its BF16 lm_head (1.67 TB/s, profile 2026-09-26): the row, 32 blocks =
+// 1152 B at a time, with 16-byte loads into shared memory; then the warp walks the 32 blocks,
+// lane l taking pack byte l (values 2l, 2l + 1, sub-block l / 8) and the float2 x pair of
+// those two values, so every x load of the warp is 256 contiguous bytes. The first version
+// (one lane per block: 9 four-byte loads at a 36-byte stride, x pairs 256 bytes apart) ran at
+// ~800 GB/s. grid (ceil(rows / 8)), block 256; k_dim % 256 == 0 (a 32-block chunk is then a
+// whole number of 16-byte words).
+extern "C" __global__ void gemv_nvfp4_w(const unsigned char* __restrict__ w, const float* __restrict__ x,
+                                        const float* __restrict__ gs_ptr, float* __restrict__ y,
+                                        const int* __restrict__ k_dim_p, const int* __restrict__ rows_p) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    // e2m1() indexes a local array (a local-memory load per nibble); the table lives here
+    __shared__ float lut[16];
+    __shared__ uint4 stage[8][72]; // one 32-block chunk per warp (1152 B)
+    if (threadIdx.x < 16) lut[threadIdx.x] = e2m1(threadIdx.x);
+    __syncthreads();
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= *rows_p) return; // no block-wide barrier below this line
+    const int bpr = *k_dim_p >> 6;
+    const unsigned char* rowb = w + (size_t)row * bpr * 36;
+    const unsigned char* sb = (const unsigned char*)stage[warp];
+    const int sub = lane >> 3;
+    float acc = 0.0f;
+    for (int b0 = 0; b0 < bpr; b0 += 32) {
+        const int nb = min(32, bpr - b0);
+        const int nq = nb * 36 / 16;
+        const uint4* src = (const uint4*)(rowb + (size_t)b0 * 36);
+        for (int q = lane; q < nq; q += 32) stage[warp][q] = __ldg(src + q);
+        __syncwarp();
+        const float2* xp = (const float2*)(x + (size_t)b0 * 64) + lane;
+        #pragma unroll 4
+        for (int j = 0; j < nb; j++) {
+            const unsigned int byte = sb[j * 36 + 4 + lane];
+            const float s = ue4m3(sb[j * 36 + sub]);
+            const float2 xv = __ldg(xp + j * 32);
+            acc += (lut[byte & 0xF] * xv.x + lut[byte >> 4] * xv.y) * s;
+        }
+        __syncwarp(); // the next chunk overwrites the stage
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) y[row] = acc * gs_ptr[0];
 }
 
 // ---------------- Ffn::Dense: the SwiGLU product ----------------

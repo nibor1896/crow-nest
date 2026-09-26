@@ -2799,10 +2799,19 @@ launch_v(k.f("l2norm_repeat"), self.d.gdn_vheads as u32, t as u32, 1, self.d.gd 
         // slab takes the kernel its own dtype needs. `in_fp4` is false only with an overlay.
         let in_fp4 = !qkv.is_bf16() && !z.is_bf16() && !b.is_bf16() && !a.is_bf16();
         let mma = dense_mma_on();
-        if mma {
+        // Crow #300 phase 2: the dense family's projections take `dense_proj` (one token:
+        // `gemv_nvfp4_w` on the f32 row, a BF16 slab its warp GEMV) - no activation cascade.
+        // Flash-Next's arms below are the code of record, unchanged.
+        let dense = self.w.dense.is_some();
+        if mma && !dense {
             quant_x_if_unfused(k, p, 1, mixed as u64, s.xq_m as u64, p.n2560 as u64, p.n2560 as u64);
         }
-        if mma && in_fp4 {
+        if dense {
+            self.dense_proj(qkv, self.d.gdn_conv, p.n_gdn_conv, 1, mixed, s.xq_m, s.mq, p.n2560);
+            self.dense_proj(z, self.d.gdn_val, p.n6144, 1, mixed, s.xq_m, s.gz, p.n2560);
+            self.dense_proj(b, self.d.gdn_vheads, p.nr48, 1, mixed, s.xq_m, s.gb, p.n2560);
+            self.dense_proj(a, self.d.gdn_vheads, p.nr48, 1, mixed, s.xq_m, s.ga, p.n2560);
+        } else if mma && in_fp4 {
             if gdn_fuse_in_on() && gdn_split_z_on() {
                 // #71 (62 lever 1): the grouping stays for qkv + b + a
                 // (10240 + 48 + 48 = 10336 rows, ceil(/32) = 323 blocks) and
@@ -2912,6 +2921,10 @@ launch_v(k.f("l2norm_repeat"), self.d.gdn_vheads as u32, t as u32, 1, self.d.gd 
         } else {
             launch_v(k.f("rmsnorm_gated"), self.d.gdn_vheads as u32, 1, 1, self.d.gdv as u32, &[
                 s.gcore as u64, s.gz as u64, *norm as u64, s.gnorm as u64]);
+        }
+        if dense {
+            self.dense_proj(out, self.d.h, p.n2560, 1, s.gnorm, s.xq_v, s.gout, p.n6144);
+            return s.gout;
         }
         if mma {
             quant_x_if_unfused(k, p, 1, s.gnorm as u64, s.xq_v as u64, p.n6144 as u64, p.n6144 as u64);
@@ -3273,13 +3286,19 @@ impl Engine {
     }
 
     /// Crow #300 phase 2: one projection of the dense family over `t` rows of `x` into `y`
-    /// (`[t][rows]`). An NVFP4 weight under `CROW_MMA=1` takes Flash-Next's MMA path
+    /// (`[t][rows]`). One NVFP4 row (t = 1) takes `gemv_nvfp4_w` on the f32 row. More rows
+    /// of an NVFP4 weight under `CROW_MMA=1` take Flash-Next's MMA path
     /// (`launch_mma_d`: the 8-token tile GEMM at t >= 8, else `gemv_fp4_mma_d`) on `xq`,
     /// which must hold `x` quantized by `quant_rows`; otherwise, and for a BF16 weight, the
     /// plain GEMV of step 1 (`PW::launch_gemv`) on the f32 rows.
     #[allow(clippy::too_many_arguments)]
     unsafe fn dense_proj(&self, w: &PW, rows: usize, rows_p: Dev, t: usize, x: Dev, xq: Dev, y: Dev, k_p: Dev) {
         match w {
+            // one token (decode, lm_head): the warp-per-row GEMV on the f32 row, no activation
+            // quantization; the MMA kernels compute 8 tokens per instruction (profile 2026-09-26)
+            PW::Fp4(wp, gs) if t == 1 => {
+                launch_v(self.k.f("gemv_nvfp4_w"), rows.div_ceil(8) as u32, 1, 1, 256, &[*wp, x, *gs, y, k_p, rows_p]);
+            }
             PW::Fp4(wp, gs) if dense_mma_on() => {
                 launch_mma_d(&self.k, rows.div_ceil(64) as u32, t, self.p.t, &[*wp, xq, *gs, y, k_p, rows_p, rows_p]);
             }
@@ -3289,9 +3308,15 @@ impl Engine {
 
     /// Crow #300 phase 2: `t` f32 rows of width `*k_p` into the NVFP4 activation cascade
     /// the MMA path reads (`quant_x_fp4`); a no-op without `CROW_MMA=1`
+    ///
+    /// One 1024-thread block per row: `quant_row_prescaled` reads `blockDim` only as its
+    /// loop stride (the row max is exact, each 16-value sub-block is quantized on its own), so
+    /// the bytes equal the 128-thread launch of `quant_x_now`; the profile of 2026-09-26 had
+    /// that launch at 49 us per 5120/17408-wide row, 257 calls per 27B decode token.
     unsafe fn quant_rows(&self, t: usize, x: Dev, xq: Dev, k_p: Dev) {
-        if dense_mma_on() {
-            quant_x_now(&self.k, &self.p, t as u32, x, xq, k_p, k_p);
+        // t = 1 takes `gemv_nvfp4_w` on the f32 row (`dense_proj`), which reads no cascade
+        if dense_mma_on() && t > 1 {
+            launch_v(self.k.f("quant_x_fp4"), t as u32, 1, 1, 1024, &[x, xq, k_p, self.p.one, k_p]);
         }
     }
 
