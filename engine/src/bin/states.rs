@@ -55,7 +55,7 @@ fn main() {
     // Crow #300 C3: the model's Geo through the same metadata gate the front door uses
     let geo = crow_nest_engine::boot::model_geo(&cnq_path);
     let mut cnq = Cnq::open(&cnq_path);
-    let slabs = crow_nest_engine::residency::expert_slab_info(&mut cnq, 0, "text");
+    let slabs = crow_nest_engine::residency::expert_slab_info(&mut cnq, 0, "text", geo.moe().experts);
     let expert_per_unit = (slabs.gu_bytes + slabs.dn_bytes) * geo.layers as u64;
     println!(
         "expert slab: gate_up {:.2} MiB + down {:.2} MiB = {:.2} MiB per expert per layer (gs {:.3}/{:.3})",

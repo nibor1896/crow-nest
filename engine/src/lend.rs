@@ -217,9 +217,9 @@ pub fn tier1_plan(geo: &crate::geo::Geo, chunk: usize, vit_cap: Option<usize>, c
     let mut v: Vec<(&'static str, usize)> = vec![
         ("scratch persist region", persist),
         ("scratch union region", union),
-        ("qsa pool_raw", cap_blocks * crate::gen::QSA_HID),
-        ("qsa pool_nrm", cap_blocks * crate::gen::QSA_HID),
-        ("qsa pool_rot", cap_blocks * crate::gen::QSA_HID),
+        ("qsa pool_raw", cap_blocks * geo.qsa().hidd()),
+        ("qsa pool_nrm", cap_blocks * geo.qsa().hidd()),
+        ("qsa pool_rot", cap_blocks * geo.qsa().hidd()),
         ("qsa scores", chunk.clamp(1, crate::gen::ATTN_SB) * cap_blocks * 4),
         ("stage gate_up", stage_slots * gu_bytes),
         ("stage down", stage_slots * dn_bytes),

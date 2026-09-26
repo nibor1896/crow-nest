@@ -16,7 +16,7 @@
 //! p5-verified chain over per-combo device pointer tables.
 
 use crate::cuda::{self, Pinned};
-use crate::geo::{E, GIB, LAYERS, MIB};
+use crate::geo::{Geo, GIB, MIB};
 use crate::cnq::Cnq;
 use cudarc::driver::sys::CUdeviceptr;
 use std::collections::HashMap;
@@ -39,6 +39,10 @@ pub struct PendingSwap {
 }
 
 pub struct Residency {
+    /// Crow #300 C3: MoE layers and routed experts per layer, from the model's `Geo`
+    /// (48 x 512 on Flash-Next); every per-layer table below is sized by them
+    pub layers: usize,
+    pub experts: usize,
     pub n: usize, // hot experts per layer (after clamp; logical, excludes spares)
     pub stride: usize, // hot slots allocated per layer (n + spares)
     pub gu_bytes: u64,
@@ -96,12 +100,13 @@ pub struct ExpertSlabs {
     pub dn_gs: f32,
 }
 
-pub fn expert_slab_info(cnq: &Cnq, layer: usize, section: &str) -> ExpertSlabs {
+/// one expert's slab bytes (C3: `experts` = routed experts per layer, `Geo::moe().experts`)
+pub fn expert_slab_info(cnq: &Cnq, layer: usize, section: &str, experts: usize) -> ExpertSlabs {
     let gu = cnq.find(&format!("model.language_model.layers.{layer}.mlp.experts.gate_up_proj"), section);
     let dn = cnq.find(&format!("model.language_model.layers.{layer}.mlp.experts.down_proj"), section);
     ExpertSlabs {
-        gu_bytes: Cnq::byte_len(gu) / E as u64,
-        dn_bytes: Cnq::byte_len(dn) / E as u64,
+        gu_bytes: Cnq::byte_len(gu) / experts as u64,
+        dn_bytes: Cnq::byte_len(dn) / experts as u64,
         gu_gs: gu.global_scale,
         dn_gs: dn.global_scale,
     }
@@ -133,16 +138,21 @@ impl Residency {
     /// slabs + tables: hot → VRAM, cold → pinned UVA.
     pub unsafe fn build(
         cnq: &mut Cnq,
+        geo: &Geo,
         section: &str,
         n: usize,
-        warmup_counts: Option<&[[u64; E]; LAYERS]>,
+        warmup_counts: Option<&[Vec<u64>]>,
         sidecar_path: &str,
         persist: bool,
         full_tier_req: bool,
         spare: usize,
         progress: &mut dyn FnMut(&str),
     ) -> Residency {
-        let slabs = expert_slab_info(cnq, 0, section);
+        // C3: the MoE shape from the model's Geo (48 layers x 512 experts on Flash-Next);
+        // one hot-set bitmap word per 32 experts (16 on Flash-Next)
+        let (layers, experts) = (geo.layers, geo.moe().experts);
+        let words = bitmap_words(experts);
+        let slabs = expert_slab_info(cnq, 0, section, experts);
         // `n` is the planned slot count; `spare` of them stay unoccupied for
         // the stream-side trickle (A-P3c) - the logical hot set is n - spare
         assert!(spare < n, "spare hot slots {spare} must leave a hot set (N={n})");
@@ -152,16 +162,16 @@ impl Residency {
             progress(&format!("stream trickle: {spare} spare hot slot(s) per layer, logical hot set N={n} of {n_slots} slots"));
         }
         // all layers share the expert geometry (checkpoint fact, asserted once)
-        for l in (1..LAYERS).step_by(16) {
-            let s = expert_slab_info(cnq, l, section);
+        for l in (1..layers).step_by(16) {
+            let s = expert_slab_info(cnq, l, section, experts);
             assert_eq!((s.gu_bytes, s.dn_bytes), (slabs.gu_bytes, slabs.dn_bytes));
         }
         progress(&format!(
             "expert slabs per layer: gate_up {:.2} MB + down {:.2} MB per expert ({} experts, {} layers)",
             slabs.gu_bytes as f64 / MIB,
             slabs.dn_bytes as f64 / MIB,
-            E,
-            LAYERS
+            experts,
+            layers
         ));
 
         // ---- sets: sidecar or warm-up ----
@@ -170,7 +180,7 @@ impl Residency {
         let (sets, source) = if std::path::Path::new(sidecar_path).exists() {
             let txt = std::fs::read_to_string(sidecar_path)
                 .unwrap_or_else(|e| panic!("hot-set sidecar {sidecar_path}: {e}"));
-            let (sets, notes) = sidecar_sets(&txt, n)
+            let (sets, notes) = sidecar_sets(&txt, n, layers, experts)
                 .unwrap_or_else(|e| panic!("hot-set sidecar {sidecar_path}: {e}"));
             for m in &notes {
                 progress(m);
@@ -180,9 +190,11 @@ impl Residency {
         } else {
             let counts = warmup_counts
                 .expect("no sidecar and no warm-up counts — run the warm-up first");
-            let mut sets = Vec::with_capacity(LAYERS);
-            for l in 0..LAYERS {
-                let mut ord: Vec<u32> = (0..E as u32).collect();
+            assert_eq!(counts.len(), layers, "warm-up counts: one row per MoE layer");
+            let mut sets = Vec::with_capacity(layers);
+            for l in 0..layers {
+                assert_eq!(counts[l].len(), experts, "warm-up counts: one count per expert (layer {l})");
+                let mut ord: Vec<u32> = (0..experts as u32).collect();
                 ord.sort_by(|&a, &b| counts[l][b as usize].cmp(&counts[l][a as usize]).then(a.cmp(&b)));
                 ord.truncate(n);
                 // keep FREQUENCY order — the sidecar's ordering is what makes
@@ -228,8 +240,8 @@ file, so the overlay would reach the hot experts only",
         // 512 x 48) so the hot set can be re-cut per prompt without host data
         // movement (A-P3); the NVFP4 tier stays cold-only (67.8 GB would not fit)
         let full_tier = lb_hdr.is_some() && full_tier_req;
-        let cold_total: u64 = (0..LAYERS)
-            .map(|l| (if full_tier { E } else { E - sets[l].len() }) as u64 * (cold_gu_bytes + cold_dn_bytes))
+        let cold_total: u64 = (0..layers)
+            .map(|l| (if full_tier { experts } else { experts - sets[l].len() }) as u64 * (cold_gu_bytes + cold_dn_bytes))
             .sum();
         // free_phys is the RAM that can be PINNED, not MemAvailable: the driver's
         // pinned-page pool and the page cache are both reclaimable and both
@@ -250,17 +262,17 @@ file, so the overlay would reach the hot experts only",
             );
         }
         // ---- VRAM hot slabs + pinned cold slabs ----
-        let hot_gu_bytes = (LAYERS * n_slots) as u64 * slabs.gu_bytes;
-        let hot_dn_bytes = (LAYERS * n_slots) as u64 * slabs.dn_bytes;
+        let hot_gu_bytes = (layers * n_slots) as u64 * slabs.gu_bytes;
+        let hot_dn_bytes = (layers * n_slots) as u64 * slabs.dn_bytes;
         let hot_gu = cuda::alloc_zeroed(hot_gu_bytes as usize);
         let hot_dn = cuda::alloc_zeroed(hot_dn_bytes as usize);
-        let mut cold_gu = Vec::with_capacity(LAYERS);
-        let mut cold_dn = Vec::with_capacity(LAYERS);
-        let mut cold_index = Vec::with_capacity(LAYERS);
+        let mut cold_gu = Vec::with_capacity(layers);
+        let mut cold_dn = Vec::with_capacity(layers);
+        let mut cold_index = Vec::with_capacity(layers);
         // hot experts: container -> staging -> VRAM slab (async + sync, WDDM rule)
         let mut stage = vec![0u8; slabs.gu_bytes.max(slabs.dn_bytes) as usize];
-        for l in 0..LAYERS {
-            let ncold = if full_tier { E } else { E - sets[l].len() };
+        for l in 0..layers {
+            let ncold = if full_tier { experts } else { experts - sets[l].len() };
             // #103 (2026-09-23): the cold slabs are anonymous memory
             // registered with the driver (`Pinned::alloc_cold`, CROW_PINNED_ALLOC,
             // default `register` on unix), so the kernel owns the pages and gets
@@ -278,7 +290,7 @@ file, so the overlay would reach the hot experts only",
             let mut tier_file = tier_path.as_ref().map(|p| crate::cnq::open_sequential(p)); // no cache retention (see cnq.rs)
             let mut idx = HashMap::with_capacity(ncold);
             let mut slot = 0usize;
-            for id in 0..E as u32 {
+            for id in 0..experts as u32 {
                 if full_tier || !sets[l].contains(&id) {
                     idx.insert(id, slot);
                     slot += 1;
@@ -319,12 +331,12 @@ file, so the overlay would reach the hot experts only",
             // hot ids left their pages stranded: the kernel's readahead window sails
             // over a 1.76 MB gap, and nothing ever dropped what it pulled in (measured
             // 2026-09-17: the page cache still held 14 GiB at the end of the fill).
-            let mut hot_slot = vec![usize::MAX; E];
+            let mut hot_slot = vec![usize::MAX; experts];
             for (slot, &id) in sets[l].iter().enumerate() {
                 hot_slot[id as usize] = slot;
             }
             let cold_here = lb_hdr.is_none(); // else the tier file above filled `pg`/`pd`
-            for id in 0..E as u32 {
+            for id in 0..experts as u32 {
                 let slot = hot_slot[id as usize];
                 let cs = if cold_here { idx.get(&id).copied() } else { None };
                 if slot == usize::MAX && cs.is_none() {
@@ -342,7 +354,7 @@ file, so the overlay would reach the hot experts only",
                     cuda::upload_into(dst, &stage[..raw.len()]);
                 }
             }
-            for id in 0..E as u32 {
+            for id in 0..experts as u32 {
                 let slot = hot_slot[id as usize];
                 let cs = if cold_here { idx.get(&id).copied() } else { None };
                 if slot == usize::MAX && cs.is_none() {
@@ -380,37 +392,37 @@ file, so the overlay would reach the hot experts only",
         drop(stage);
 
         // ---- pointer tables + bitmaps + counters ----
-        let tables = cuda::alloc_zeroed(LAYERS * E * 2 * 8);
-        let bitmaps = cuda::alloc_zeroed(LAYERS * 16 * 4);
-        let counters = cuda::alloc_zeroed(LAYERS * 2 * 8);
+        let tables = cuda::alloc_zeroed(layers * experts * 2 * 8);
+        let bitmaps = cuda::alloc_zeroed(layers * words * 4);
+        let counters = cuda::alloc_zeroed(layers * 2 * 8);
         let bounce_gu = cuda::alloc_zeroed(slabs.gu_bytes as usize);
         let bounce_dn = cuda::alloc_zeroed(slabs.dn_bytes as usize);
-        let mut tbl = vec![0u64; LAYERS * E * 2];
-        let mut bmp = vec![0u32; LAYERS * 16];
-        for l in 0..LAYERS {
+        let mut tbl = vec![0u64; layers * experts * 2];
+        let mut bmp = vec![0u32; layers * words];
+        for l in 0..layers {
             for (&id, &cs) in &cold_index[l] {
-                tbl[(l * E + id as usize) * 2] = cold_gu[l].dev as u64 + (cs as u64) * cold_gu_bytes;
-                tbl[(l * E + id as usize) * 2 + 1] =
+                tbl[(l * experts + id as usize) * 2] = cold_gu[l].dev as u64 + (cs as u64) * cold_gu_bytes;
+                tbl[(l * experts + id as usize) * 2 + 1] =
                     cold_dn[l].dev as u64 + (cs as u64) * cold_dn_bytes;
             }
             for (slot, &id) in sets[l].iter().enumerate() {
-                tbl[(l * E + id as usize) * 2] =
+                tbl[(l * experts + id as usize) * 2] =
                     hot_gu as u64 + ((l * n_slots + slot) as u64) * slabs.gu_bytes;
-                tbl[(l * E + id as usize) * 2 + 1] =
+                tbl[(l * experts + id as usize) * 2 + 1] =
                     hot_dn as u64 + ((l * n_slots + slot) as u64) * slabs.dn_bytes;
             }
             for &id in &sets[l] {
-                bmp[l * 16 + (id >> 5) as usize] |= 1 << (id & 31);
+                bmp[l * words + (id >> 5) as usize] |= 1 << (id & 31);
             }
         }
         cuda::to_u64_into(tables, &tbl);
         upload_u32(bitmaps, &bmp);
 
         // per-tensor global scales DIFFER per layer (sidecar ratio range was
-        // 0.42..1.77 against layer 0) — [LAYERS][2] f32, indexed by moe_run
-        let mut gs_all = vec![0f32; LAYERS * 2];
+        // 0.42..1.77 against layer 0) — [layers][2] f32, indexed by moe_run
+        let mut gs_all = vec![0f32; layers * 2];
         for (li, g) in gs_all.chunks_exact_mut(2).enumerate() {
-            let s = expert_slab_info(cnq, li, section);
+            let s = expert_slab_info(cnq, li, section, experts);
             g[0] = s.gu_gs;
             g[1] = s.dn_gs;
         }
@@ -422,12 +434,12 @@ file, so the overlay would reach the hot experts only",
             let lut_dev = cuda::upload_dev(&lut);
             LowBit { bits, gu_rec: cold_gu_bytes, dn_rec: cold_dn_bytes, lut_dev, bits_dev: cuda::to_i32_dev(&[bits as i32]) }
         });
-        let gs_dev = cuda::alloc_zeroed((LAYERS * 8) as usize);
+        let gs_dev = cuda::alloc_zeroed(layers * 8);
         cuda::to_f32_into(gs_dev, &gs_all);
 
         // spare slots: unoccupied, marked EMPTY in the slot map
         let mut sets = sets;
-        let mut spare_free = Vec::with_capacity(LAYERS);
+        let mut spare_free = Vec::with_capacity(layers);
         for (l, s) in sets.iter_mut().enumerate() {
             // an internal invariant since #49: a sidecar row is normalized to
             // exactly `n` by `sidecar_sets`, a warm-up row is a top-n of E
@@ -436,6 +448,8 @@ file, so the overlay would reach the hot experts only",
             spare_free.push((n..n_slots).collect::<Vec<usize>>());
         }
         Residency {
+            layers,
+            experts,
             n,
             stride: n_slots,
             gu_bytes: slabs.gu_bytes,
@@ -528,7 +542,7 @@ file, so the overlay would reach the hot experts only",
         self.sets[l][slot] = new_id;
     }
 
-    /// Build layer `l`'s pointer table (512 x 2 u64) and its 16-word hot
+    /// Build layer `l`'s pointer table (experts x 2 u64) and its hot
     /// bitmap from the host bookkeeping: every expert's cold record first,
     /// then the hot residents written over the top. The ONE place that order
     /// lives - both flushes fill their buffer through it.
@@ -550,21 +564,23 @@ file, so the overlay would reach the hot experts only",
     /// one layer's table + bitmap, uploaded once — called after a layer's
     /// swaps (two small HtoD copies per layer instead of four syncs per swap)
     pub unsafe fn flush_layer_tables(&self, l: usize) {
-        let mut tbl = vec![0u64; E * 2];
-        let mut words = [0u32; 16];
+        let w = bitmap_words(self.experts);
+        let mut tbl = vec![0u64; self.experts * 2];
+        let mut words = vec![0u32; w];
         self.fill_layer_table(l, &mut tbl, &mut words);
-        cuda::to_u64_into(self.tables + (l * E * 2 * 8) as u64, &tbl);
-        upload_u32(self.bitmaps + (l * 16 * 4) as u64, &words);
+        cuda::to_u64_into(self.tables + (l * self.experts * 2 * 8) as u64, &tbl);
+        upload_u32(self.bitmaps + (l * w * 4) as u64, &words);
     }
 
     /// rebuild EVERY layer's pointer table and bitmap from the host
     /// bookkeeping and upload them in two copies (the trickle tick touches
     /// up to 48 layers per token; 96 small uploads cost ~2 ms of host time)
     pub unsafe fn flush_all_tables(&self) {
-        let mut tbl = vec![0u64; LAYERS * E * 2];
-        let mut words = vec![0u32; LAYERS * 16];
-        for l in 0..LAYERS {
-            self.fill_layer_table(l, &mut tbl[l * E * 2..(l + 1) * E * 2], &mut words[l * 16..(l + 1) * 16]);
+        let (e, w) = (self.experts, bitmap_words(self.experts));
+        let mut tbl = vec![0u64; self.layers * e * 2];
+        let mut words = vec![0u32; self.layers * w];
+        for l in 0..self.layers {
+            self.fill_layer_table(l, &mut tbl[l * e * 2..(l + 1) * e * 2], &mut words[l * w..(l + 1) * w]);
         }
         cuda::to_u64_into(self.tables, &tbl);
         upload_u32(self.bitmaps, &words);
@@ -593,13 +609,14 @@ file, so the overlay would reach the hot experts only",
         let n = self.n;
         // resident flag per expert (array, not a hash set: the comparator runs
         // ~5k times per layer and 48 layers per tick)
-        let mut have = [false; E];
+        // C3: sized by the model's expert count (was a `[bool; E]` on the stack)
+        let mut have = vec![false; self.experts];
         for &e in &self.sets[l] { if e != EMPTY { have[e as usize] = true; } }
-        let mut want: Vec<u32> = (0..E as u32).collect();
+        let mut want: Vec<u32> = (0..self.experts as u32).collect();
         want.sort_unstable_by(|&a, &b| c[b as usize].cmp(&c[a as usize])
             .then(have[b as usize].cmp(&have[a as usize])).then(a.cmp(&b)));
         want.truncate(n);
-        let mut want_set = [false; E];
+        let mut want_set = vec![false; self.experts];
         for &e in &want { want_set[e as usize] = true; }
         // candidates in: hottest first; slots out: coldest resident first
         let incoming: Vec<u32> = want.iter().copied().filter(|&e| !have[e as usize]).collect();
@@ -655,14 +672,14 @@ file, so the overlay would reach the hot experts only",
 
     /// control-plane drain (between tokens / chunks, never per layer)
     pub unsafe fn drain_counters(&self) -> Vec<[u64; 2]> {
-        let raw = cuda::dtoh_u64(self.counters, LAYERS * 2);
-        (0..LAYERS).map(|l| [raw[l * 2], raw[l * 2 + 1]]).collect()
+        let raw = cuda::dtoh_u64(self.counters, self.layers * 2);
+        (0..self.layers).map(|l| [raw[l * 2], raw[l * 2 + 1]]).collect()
     }
 
     pub fn layer_ptrs(&self, layer: usize) -> (u64, u64, u64, u64, u64) {
         (
-            self.tables as u64 + (layer * E * 2 * 8) as u64,
-            self.bitmaps as u64 + (layer * 16 * 4) as u64,
+            self.tables as u64 + (layer * self.experts * 2 * 8) as u64,
+            self.bitmaps as u64 + (layer * bitmap_words(self.experts) * 4) as u64,
             self.counters as u64 + (layer * 2 * 8) as u64,
             self.gu_bytes,
             self.dn_bytes,
@@ -673,6 +690,12 @@ file, so the overlay would reach the hot experts only",
         self.cold_gu.iter().map(|p| p.bytes as u64).sum::<u64>()
             + self.cold_dn.iter().map(|p| p.bytes as u64).sum::<u64>()
     }
+}
+
+/// u32 words of one layer's hot-set bitmap: one bit per expert (16 on Flash-Next, the
+/// `[16]` the MoE kernels index)
+pub const fn bitmap_words(experts: usize) -> usize {
+    experts.div_ceil(32)
 }
 
 fn upload_u32(dst: CUdeviceptr, v: &[u32]) {
@@ -722,27 +745,28 @@ fn upload_u32(dst: CUdeviceptr, v: &[u32]) {
 /// duplicate would leave the layer's cold tier, sized `E - sets[l].len()`, one
 /// slot short of the ids indexed into it, and the fill would die in
 /// `Pinned::write_bytes`'s own bounds assert instead.
-pub fn sidecar_sets(txt: &str, n: usize) -> Result<(Vec<Vec<u32>>, Vec<String>), String> {
-    if n == 0 || n > E {
-        return Err(format!("N={n} is not a hot-set size (1..={E} experts per layer)"));
+pub fn sidecar_sets(txt: &str, n: usize, layers: usize, experts: usize) -> Result<(Vec<Vec<u32>>, Vec<String>), String> {
+    // C3: `layers` x `experts` is the model's MoE shape (`Geo`), 48 x 512 on Flash-Next
+    if n == 0 || n > experts {
+        return Err(format!("N={n} is not a hot-set size (1..={experts} experts per layer)"));
     }
     let v: serde_json::Value = serde_json::from_str(txt).map_err(|e| {
-        format!("not one JSON object ({e}); a hot-set sidecar is one JSON object with a \"sets\" array of {LAYERS} rows of expert ids")
+        format!("not one JSON object ({e}); a hot-set sidecar is one JSON object with a \"sets\" array of {layers} rows of expert ids")
     })?;
     let rows = v.get("sets").and_then(|s| s.as_array()).ok_or_else(|| {
-        format!("no \"sets\" array; a hot-set sidecar is one JSON object with a \"sets\" array of {LAYERS} rows of expert ids")
+        format!("no \"sets\" array; a hot-set sidecar is one JSON object with a \"sets\" array of {layers} rows of expert ids")
     })?;
-    if rows.len() != LAYERS {
-        return Err(format!("\"sets\" has {} rows, the model has {LAYERS} layers", rows.len()));
+    if rows.len() != layers {
+        return Err(format!("\"sets\" has {} rows, the model has {layers} layers", rows.len()));
     }
-    let mut sets: Vec<Vec<u32>> = Vec::with_capacity(LAYERS);
+    let mut sets: Vec<Vec<u32>> = Vec::with_capacity(layers);
     for (l, r) in rows.iter().enumerate() {
         let a = r.as_array().ok_or_else(|| format!("row {l} is not an array of expert ids"))?;
         let mut row: Vec<u32> = Vec::with_capacity(a.len());
         for (i, x) in a.iter().enumerate() {
             let id = x.as_u64().ok_or_else(|| format!("row {l} entry {i} is not an expert id: {x}"))?;
-            if id >= E as u64 {
-                return Err(format!("row {l} entry {i} names expert {id}, outside 0..{E}"));
+            if id >= experts as u64 {
+                return Err(format!("row {l} entry {i} names expert {id}, outside 0..{experts}"));
             }
             let id = id as u32;
             if row.contains(&id) {
@@ -762,7 +786,7 @@ pub fn sidecar_sets(txt: &str, n: usize) -> Result<(Vec<Vec<u32>>, Vec<String>),
         notes.push(format!("sidecar N={lo} adapted to config N={n} (deterministic truncate/extend)"));
     } else if lo != hi {
         notes.push(format!(
-            "ragged sidecar (#49): the {LAYERS} rows are {lo}..{hi} ids long, not all N={n} - every row is adapted on its own"
+            "ragged sidecar (#49): the {layers} rows are {lo}..{hi} ids long, not all N={n} - every row is adapted on its own"
         ));
     }
     let mut named = 0usize;
@@ -774,7 +798,7 @@ pub fn sidecar_sets(txt: &str, n: usize) -> Result<(Vec<Vec<u32>>, Vec<String>),
         }
         s.truncate(n);
         if s.len() < n {
-            let mut extra = (0..E as u32).filter(|id| !s.contains(id)).collect::<Vec<_>>();
+            let mut extra = (0..experts as u32).filter(|id| !s.contains(id)).collect::<Vec<_>>();
             extra.truncate(n - s.len());
             s.extend(extra);
         }
@@ -840,6 +864,7 @@ impl Drop for Residency {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geo::{E, LAYERS};
 
     /// `lens` for a file whose rows are all `k` long
     fn uniform(k: usize, rows: usize) -> Vec<usize> {
@@ -865,7 +890,7 @@ mod tests {
         lens[3] = 47; // the length of the finding
         lens[12] = 0;
         lens[17] = 170; // longer than N
-        let (sets, notes) = sidecar_sets(&sidecar(&lens), n).expect("a ragged sidecar loads");
+        let (sets, notes) = sidecar_sets(&sidecar(&lens), n, LAYERS, E).expect("a ragged sidecar loads");
         assert_eq!(sets.len(), LAYERS);
         for (l, s) in sets.iter().enumerate() {
             assert_eq!(s.len(), n, "row {l}");
@@ -882,17 +907,17 @@ mod tests {
         assert!(all.contains("row 12 has 0 ids: padded with the 160 lowest unused expert ids"), "{all}");
         assert!(all.contains("row 17 has 170 ids: truncated to the first 160"), "{all}");
         // the file's own ids come first, the padding after (frequency order)
-        assert_eq!(&sets[3][..47], &sidecar_sets(&sidecar(&uniform(47, LAYERS)), 47).unwrap().0[3][..]);
+        assert_eq!(&sets[3][..47], &sidecar_sets(&sidecar(&uniform(47, LAYERS)), 47, LAYERS, E).unwrap().0[3][..]);
     }
 
     /// one N for the whole file is the pre-#49 case and keeps its one line
     #[test]
     fn a_sidecar_cut_at_another_n_keeps_its_single_adapted_line() {
-        let (sets, notes) = sidecar_sets(&sidecar(&uniform(160, LAYERS)), 155).unwrap();
+        let (sets, notes) = sidecar_sets(&sidecar(&uniform(160, LAYERS)), 155, LAYERS, E).unwrap();
         assert!(sets.iter().all(|s| s.len() == 155));
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert_eq!(notes[0], "sidecar N=160 adapted to config N=155 (deterministic truncate/extend)");
-        let (sets, notes) = sidecar_sets(&sidecar(&uniform(160, LAYERS)), 160).unwrap();
+        let (sets, notes) = sidecar_sets(&sidecar(&uniform(160, LAYERS)), 160, LAYERS, E).unwrap();
         assert!(sets.iter().all(|s| s.len() == 160));
         assert!(notes.is_empty(), "{notes:?}");
     }
@@ -904,34 +929,50 @@ mod tests {
     fn a_file_that_is_not_a_hot_set_is_refused_by_name() {
         let jsonl = "{\"dtype\":\"bf16\",\"n\":10240,\"name\":\"a.weight\",\"section\":\"text\"}\n\
                      {\"dtype\":\"nvfp4\",\"n\":3276800,\"name\":\"b.weight\",\"section\":\"text\"}\n";
-        let e = sidecar_sets(jsonl, 160).unwrap_err();
+        let e = sidecar_sets(jsonl, 160, LAYERS, E).unwrap_err();
         assert_eq!(
             e,
             "not one JSON object (trailing characters at line 2 column 1); a hot-set sidecar is \
              one JSON object with a \"sets\" array of 48 rows of expert ids"
         );
 
-        let e = sidecar_sets("{\"version\":1}", 160).unwrap_err();
+        let e = sidecar_sets("{\"version\":1}", 160, LAYERS, E).unwrap_err();
         assert!(e.starts_with("no \"sets\" array"), "{e}");
 
-        let e = sidecar_sets(&sidecar(&uniform(160, LAYERS - 1)), 160).unwrap_err();
+        let e = sidecar_sets(&sidecar(&uniform(160, LAYERS - 1)), 160, LAYERS, E).unwrap_err();
         assert_eq!(e, "\"sets\" has 47 rows, the model has 48 layers");
 
         let mut v: serde_json::Value = serde_json::from_str(&sidecar(&uniform(4, LAYERS))).unwrap();
         v["sets"][5][2] = serde_json::json!(E);
-        let e = sidecar_sets(&v.to_string(), 4).unwrap_err();
+        let e = sidecar_sets(&v.to_string(), 4, LAYERS, E).unwrap_err();
         assert_eq!(e, format!("row 5 entry 2 names expert {E}, outside 0..{E}"));
 
         v["sets"][5][2] = v["sets"][5][0].clone();
-        let e = sidecar_sets(&v.to_string(), 4).unwrap_err();
+        let e = sidecar_sets(&v.to_string(), 4, LAYERS, E).unwrap_err();
         assert_eq!(e, "row 5 names expert 7 twice (entry 2): a hot set is a set");
 
         v["sets"][5][2] = serde_json::json!("7");
-        let e = sidecar_sets(&v.to_string(), 4).unwrap_err();
+        let e = sidecar_sets(&v.to_string(), 4, LAYERS, E).unwrap_err();
         assert_eq!(e, "row 5 entry 2 is not an expert id: \"7\"");
 
         v["sets"][5] = serde_json::json!(160);
-        let e = sidecar_sets(&v.to_string(), 4).unwrap_err();
+        let e = sidecar_sets(&v.to_string(), 4, LAYERS, E).unwrap_err();
         assert_eq!(e, "row 5 is not an array of expert ids");
+    }
+
+    /// Crow #300 C3: the MoE shape a sidecar is checked against is the loaded model's
+    /// (`Geo`), not the Flash-Next consts - a 48-row file is refused by a 64-layer model,
+    /// an id valid for 512 experts by a 256-expert one, and the bitmap is one bit per expert
+    #[test]
+    fn the_sidecar_is_checked_against_the_model_shape_it_is_given() {
+        let file = sidecar(&uniform(160, LAYERS));
+        assert!(sidecar_sets(&file, 160, LAYERS, E).is_ok());
+        let e = sidecar_sets(&file, 160, 64, E).unwrap_err();
+        assert_eq!(e, format!("\"sets\" has {LAYERS} rows, the model has 64 layers"));
+        let e = sidecar_sets(&file, 160, LAYERS, 256).unwrap_err();
+        assert!(e.contains("outside 0..256"), "{e}");
+        let e = sidecar_sets(&file, 300, LAYERS, 256).unwrap_err();
+        assert_eq!(e, "N=300 is not a hot-set size (1..=256 experts per layer)");
+        assert_eq!((bitmap_words(E), bitmap_words(256), bitmap_words(33)), (16, 8, 2));
     }
 }

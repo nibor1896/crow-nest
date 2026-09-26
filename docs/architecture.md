@@ -4616,10 +4616,13 @@ tests read the checkpoint of record in `models/`, as before.
 - **Free functions take it as a parameter**, never from a global: `StateSizes::plan(geo, ..)`,
   `build_rope_table(geo, ..)`, `vit::reserve_bytes(geo, ..)` / `reserve_line`,
   `vit::scratch_bytes_for(cap, out_hidden)`, `vit::mrope_bytes(context, rope_pairs)`,
-  `lend::tier1_plan(geo, ..)`, `slot::kv_row_order(layers, kv_heads)`. There is no process-wide
-  `OnceLock<Geo>`: every site found so far has an engine handle or a caller that has one. The
-  probe bins that map a container without the front door (`residency`, `states`) ask
-  `boot::model_geo` for it.
+  `lend::tier1_plan(geo, ..)`, `slot::kv_row_order(layers, kv_heads)`,
+  `Residency::build(cnq, geo, ..)`, `residency::sidecar_sets(txt, n, layers, experts)`,
+  `expert_slab_info(.., experts)`, `cache::Shape::with_geo`, `cache::park_host_bytes(geo, ..)`,
+  serve's `parse_chat_vocab(body, vocab)` and `tool_gate(req, tk, geo, on)`,
+  `Sampler::from_env(Some(vocab))`. There is no process-wide `OnceLock<Geo>`: every site found so
+  far has an engine handle or a caller that has one. The tools that map a container without the
+  front door (`residency`, `states`, `coldtier`, `hybrid`, `sf_scan`) ask `boot::model_geo` for it.
 - **Accessors.** The code still assumes the Flash-Next STRUCTURE (the family switches are C5), so
   it reads the family-specific numbers through `Geo::moe()`, `qsa()` (`QsaGeo`: `qk_rows`,
   `sel_max`, `hidd`), `ple_geo()`, `hc_lowrank()`, `vision_out()`, `attn_index` / `gdn_index`. On a
@@ -4637,12 +4640,16 @@ tests read the checkpoint of record in `models/`, as before.
   `[budget]`, `[residency]`, `[diet]` and `scratch + staging` line is identical to `f7ca9f5`
   (host-measured free RAM / VRAM masked).
 
-**What still reads the consts** (C3a, 2026-09-26): `gen.rs` (the loader, the layer primitives,
-the decode and prefill loops), `residency.rs`, `cache.rs` (`Shape` and the snapshot sizes),
-`bin/serve.rs` (vocab and layer counts, the tool vocabulary), `bin/decode.rs`, `bin/parity.rs`,
-the probe bins; `meta.rs` reads them on purpose (the Flash-Next expected-values row is the pin),
-and so do the tests that pin a const against its `Geo` field. The kernels (`kernels.rs` source
-text, `head / 12`, `2560`, `1e-6f`) are C4.
+**What still reads the consts** (C3b, 2026-09-26): `gen.rs` (the loader, the layer primitives,
+the decode and prefill loops). On purpose: `meta.rs` (the Flash-Next expected-values row is the
+pin), the tests that pin a const against its `Geo` field or feed a Flash-Next fixture, and the
+synthetic kernel probes (`mma_gate`, `attn_path_probe`, `qsa_probe`, `qsa_tie_probe`,
+`gdn_chunk_probe`, `rope_table_probe`, `router_probe`): they load no model and exercise the
+kernels at the Flash-Next shapes the kernel source pins, so they move with C4. The kernels
+(`kernels.rs` source text, `head / 12`, `2560`, `1e-6f`) are C4. Container facts that are not
+model geometry stay consts: `PLE_ROWS_PER_SHARD` (the converter's shard layout, C6),
+`HOST_PINNED_CAP`, the chunk policy. The QSA block of 4 rows is still a literal in
+`slot::Header::check_content` (`done_blocks == pos / 4`).
 
 ## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
 

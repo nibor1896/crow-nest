@@ -412,14 +412,14 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
         let (ple_r0, ple_m0) = (eng.ple().req, eng.ple().miss);
         // #20: CROW_SAMPLE=1 -> sampling with the data-sheet profile: on the device
         // (sample_k behind argmax_k) unless CROW_SAMPLE_HOST=1 keeps the host path
-        let mut sampler = crow_nest_engine::sample::Sampler::from_env();
+        let mut sampler = crow_nest_engine::sample::Sampler::from_env(Some(eng.geo.vocab));
         // #85/#92: a host-only knob (DRY, the #92 tier) takes the host path too
         let sample_host = crow_nest_engine::sample::host_forced()
             || sampler.as_ref().is_some_and(|s| s.host_route());
         if let Some(s) = &mut sampler {
             eprintln!("[{}]", s.describe());
             if sample_host {
-                let lg = crow_nest_engine::cuda::dtoh(eng.logits(), crow_nest_engine::geo::V);
+                let lg = crow_nest_engine::cuda::dtoh(eng.logits(), eng.geo.vocab);
                 next = s.sample(&lg);
                 s.observe(next);
             } else {
@@ -440,7 +440,7 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
             next = eng.decode_step(&mut cnq, next as i64);
             if sample_host {
                 if let Some(s) = &mut sampler {
-                    let lg = crow_nest_engine::cuda::dtoh(eng.logits(), crow_nest_engine::geo::V);
+                    let lg = crow_nest_engine::cuda::dtoh(eng.logits(), eng.geo.vocab);
                     next = s.sample(&lg);
                     s.observe(next);
                 }
@@ -520,7 +520,8 @@ const GREEDY_POINT: &str = "200k floor, -np 1, greedy, temperature 0";
 ///   Latent (no llama record on this branch carries it), and now impossible by
 ///   construction: the arm decides, and `point_for` is pinned by the tests below.
 fn operating_point(arm: &str) -> String {
-    point_for(arm, crow_nest_engine::sample::Sampler::from_env().as_ref())
+    // the header reads the profile only: no DRY breaker map is built for it
+    point_for(arm, crow_nest_engine::sample::Sampler::from_env(None).as_ref())
 }
 
 /// the pure half of `operating_point`: the arm, and the sampler that arm used. No

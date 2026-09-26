@@ -608,8 +608,8 @@ use crow_nest_engine::cache::{ColdPlan, PrefixCache, SLOTS};
 use crow_nest_engine::boot;
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::{DevSampler, Engine};
-use crow_nest_engine::geo::{apply_adapt_policy, DEFAULT_CNQ, DEFAULT_HOTSETS, LAYERS, TRICKLE_CHUNK_THRESHOLD, V};
-use crow_nest_engine::sample::{pos_logprobs, PosLogprobs, Sampler, EOS_IDS, MAX_TOP_LOGPROBS};
+use crow_nest_engine::geo::{apply_adapt_policy, Geo, DEFAULT_CNQ, DEFAULT_HOTSETS, TRICKLE_CHUNK_THRESHOLD};
+use crow_nest_engine::sample::{pos_logprobs, PosLogprobs, Sampler, MAX_TOP_LOGPROBS};
 use crow_nest_engine::slot;
 use crow_nest_engine::stopstr::StopStrings;
 use crow_nest_engine::toolcall::{Emit, Malformed, ToolStream, TOOL_OPEN};
@@ -1538,7 +1538,15 @@ fn thinking_line(req: &ChatReq) -> String {
 ///   is a strict, honored sampling field since #83
 /// - the sampling fields (#28) are STRICT on type and lenient on absence
 /// - `Err` carries the message for the 400 body
+/// the tests' one-argument form: the Flash-Next vocabulary of record
+#[cfg(test)]
 fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
+    parse_chat_vocab(body, Geo::FLASH_NEXT.vocab)
+}
+
+/// - C3: `vocab` is the loaded model's vocabulary size (`Engine::geo.vocab`), the bound
+///   `logit_bias` keys and `crow_force_ids` entries are checked against
+fn parse_chat_vocab(body: &[u8], vocab: usize) -> Result<ChatReq, String> {
     let doc: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| format!("body is not JSON: {e}"))?;
     let obj = doc
@@ -1777,9 +1785,9 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
                 let tok: usize = k
                     .parse()
                     .map_err(|_| format!("logit_bias key {k:?} is not a token id"))?;
-                if tok >= V {
+                if tok >= vocab {
                     return Err(format!(
-                        "logit_bias key {k:?} is not a token id of this model's vocabulary (0..{V})"
+                        "logit_bias key {k:?} is not a token id of this model's vocabulary (0..{vocab})"
                     ));
                 }
                 let b = val
@@ -1905,8 +1913,8 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
             for x in arr {
                 let id = x
                     .as_u64()
-                    .filter(|&id| (id as usize) < V)
-                    .ok_or_else(|| format!("crow_force_ids entry {x} is not a token id below {V}"))?;
+                    .filter(|&id| (id as usize) < vocab)
+                    .ok_or_else(|| format!("crow_force_ids entry {x} is not a token id below {vocab}"))?;
                 ids.push(id as usize);
             }
             if reasoning_budget.is_some() {
@@ -2163,7 +2171,7 @@ fn apply_logit_bias(row: &mut [f32], bias: &[(usize, f32)]) {
 ///   grammar's mask on it (llama.cpp's rejection order), so the host sampler's state
 ///   only ever sees the id that is kept.
 unsafe fn draw_biased(eng: &Engine, s: &mut Sampler, bias: &[(usize, f32)], gate: Option<&mut Gate<'static>>) -> usize {
-    let mut row = crow_nest_engine::cuda::dtoh(eng.logits(), V);
+    let mut row = crow_nest_engine::cuda::dtoh(eng.logits(), eng.geo.vocab);
     apply_logit_bias(&mut row, bias);
     let mut tok = s.sample(&row);
     if let Some(g) = gate {
@@ -2191,12 +2199,14 @@ fn tool_grammar_on() -> bool {
 /// first request that has a grammar; `.1` is its build wall in ms
 static TOOL_VOCAB: std::sync::OnceLock<(Vocab, f64)> = std::sync::OnceLock::new();
 
-fn tool_vocab(tk: &crow_nest_engine::tokenizer::ChatTokenizer) -> &'static (Vocab, f64) {
+/// C3: `geo` is the loaded model's (vocabulary size and stop ids); one model per process,
+/// so the trie built for the first request is the trie of every later one
+fn tool_vocab(tk: &crow_nest_engine::tokenizer::ChatTokenizer, geo: &Geo) -> &'static (Vocab, f64) {
     TOOL_VOCAB.get_or_init(|| {
         let t = Instant::now();
-        let eos: Vec<u32> = EOS_IDS.iter().map(|&e| e as u32).collect();
+        let eos: Vec<u32> = geo.eos_ids.iter().map(|&e| e as u32).collect();
         let open = tk.token_id(TOOL_OPEN).unwrap_or(u32::MAX);
-        let v = Vocab::build(V, |id| tk.token_bytes(id), |id| tk.is_special(id), &eos, open);
+        let v = Vocab::build(geo.vocab, |id| tk.token_bytes(id), |id| tk.is_special(id), &eos, open);
         (v, t.elapsed().as_secs_f64() * 1e3)
     })
 }
@@ -2209,6 +2219,7 @@ fn tool_vocab(tk: &crow_nest_engine::tokenizer::ChatTokenizer) -> &'static (Voca
 fn tool_gate(
     req: &ChatReq,
     tk: &crow_nest_engine::tokenizer::ChatTokenizer,
+    geo: &Geo,
     on: bool,
 ) -> (Option<Gate<'static>>, Option<String>) {
     let Some(tools) = req.tools.as_ref().filter(|t| t.as_array().is_some_and(|a| !a.is_empty())) else {
@@ -2230,7 +2241,7 @@ fn tool_gate(
         Ok(g) => {
             let build_ms = t.elapsed().as_secs_f64() * 1e3;
             let fresh = TOOL_VOCAB.get().is_none();
-            let (v, vocab_ms) = tool_vocab(tk);
+            let (v, vocab_ms) = tool_vocab(tk, geo);
             let line = format!(
                 "[chat] tool grammar ON (CROW_TOOL_GRAMMAR): lazy at the <tool_call> id, tool_choice {}, \
                  parallel_tool_calls {}; {} tools / {} parameters compiled in {build_ms:.2} ms{}",
@@ -2264,7 +2275,7 @@ fn tool_gate(
 ///   is reproducible; the caller moves the device booking (`Engine::rebook_sampler`)
 /// - unsafe: one device-to-host copy of the logits row
 unsafe fn grammar_redraw(eng: &Engine, req: &ChatReq, prompt: &[u32], out: &[u32], gate: &mut Gate<'static>) -> usize {
-    redraw_from_row(req, prompt, out, gate, crow_nest_engine::cuda::dtoh(eng.logits(), V))
+    redraw_from_row(req, prompt, out, gate, crow_nest_engine::cuda::dtoh(eng.logits(), eng.geo.vocab))
 }
 
 /// the host half of `grammar_redraw`, on a row already read back (pure; the test drives it)
@@ -2315,6 +2326,8 @@ struct Timing {
     ple_rows_total: u64,
     /// #30 A8: PLE rows filled from the container (row cache misses), cumulative
     ple_miss_total: u64,
+    /// C3: the loaded model's layer count (`Engine::geo.layers`), the `crow_layers` field
+    layers: usize,
 }
 
 /// - tokens per second out of a count and a wall time in ms
@@ -2375,7 +2388,7 @@ fn timings_json(t: &Timing) -> serde_json::Value {
         "crow_expert_cold": t.cold_total,
         "crow_ple_rows": t.ple_rows_total,
         "crow_ple_misses": t.ple_miss_total,
-        "crow_layers": LAYERS,
+        "crow_layers": t.layers,
     })
 }
 
@@ -3778,7 +3791,7 @@ fn respond_json(
 /// - every rejection happens BEFORE the first stream byte, as a JSON response
 /// - the return value is the status for the access log line
 fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static str {
-    let mut req = match parse_chat(body) {
+    let mut req = match parse_chat_vocab(body, srv.eng.geo.vocab) {
         Ok(r) => r,
         Err(e) => return respond_json(stream, "400 Bad Request", &error_json(&e)),
     };
@@ -4203,7 +4216,7 @@ fn chat_generate(
     // #93: the tool grammar of THIS request (`None` without tools, with
     // `CROW_TOOL_GRAMMAR=0` or `tool_choice: "none"`), and its one request line. Built
     // before the first draw: the biased route checks inside `draw_biased`.
-    let (mut gate, gate_line) = tool_gate(req, tk, tool_grammar_on());
+    let (mut gate, gate_line) = tool_gate(req, tk, &srv.eng.geo, tool_grammar_on());
     if let Some(l) = gate_line {
         tracing::info!(target: "chat", "{l}");
     }
@@ -4480,7 +4493,7 @@ fn chat_generate(
             if req.logprobs {
                 let t_lp = Instant::now();
                 // unsafe: one device-to-host copy on the engine's logits buffer
-                let row = unsafe { crow_nest_engine::cuda::dtoh(srv.eng.logits(), V) };
+                let row = unsafe { crow_nest_engine::cuda::dtoh(srv.eng.logits(), srv.eng.geo.vocab) };
                 let p = pos_logprobs(&row, next, req.top_logprobs);
                 lp_ms += t_lp.elapsed().as_secs_f64() * 1e3;
                 if p.top.len() >= 2 && p.top[0].1 - p.top[1].1 < lp_gap.0 {
@@ -4782,6 +4795,7 @@ fn chat_generate(
         cold_total,
         ple_rows_total,
         ple_miss_total,
+        layers: srv.eng.geo.layers,
     };
     if !aborted {
         let _ = sink.on_finish(
@@ -4842,7 +4856,8 @@ fn chat_generate(
     tracing::info!(target: "chat",
         "[chat] counters (cumulative, never reset): expert selections {selections_total}, \
          expert cold {cold_total}, ple rows {ple_rows_total}, ple misses {ple_miss_total}, \
-         layers {LAYERS}, counter read {counters_ms:.3} ms"
+         layers {}, counter read {counters_ms:.3} ms",
+        srv.eng.geo.layers
     );
     // #13: ONE structured routing line per request, target `routing`, at INFO.
     // Same source as the `timings` block and the two lines above - the counters
@@ -4944,7 +4959,7 @@ unsafe fn write_vit_dump(
     });
     let _ = std::fs::write(format!("{dir}/vit-gen-sequence.json"), seq.to_string());
     if let Some(c) = collect {
-        let mut flat = Vec::with_capacity(c.len() * crow_nest_engine::geo::V);
+        let mut flat = Vec::with_capacity(c.len() * srv.eng.geo.vocab);
         for row in c {
             flat.extend_from_slice(row);
         }
@@ -5756,7 +5771,7 @@ fn main() {
         "[serve] prefix cache {}, {} B per snapshot + {} B logits row (#100), {} snapshot(s) in HOST RAM (#72: never VRAM, see cache.rs), QSA ring rows {}, {}",
         if cache.enabled() { "on" } else { "off (CROW_PREFIX_CACHE=0)" },
         cache.shape().snapshot_bytes(),
-        V * 4,
+        eng.geo.vocab * 4,
         SLOTS,
         eng.qsa_ring_rows(),
         park_boot_note(cache.enabled(), cache.park_cap(), eng.park_host_bytes(cache.park_cap()))
@@ -5855,6 +5870,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crow_nest_engine::geo::{LAYERS, V};
+    use crow_nest_engine::sample::EOS_IDS;
     use std::io::Cursor;
 
     /// #114: a text-only `[cache]` line is the line it was; an image exchange names both
@@ -6556,6 +6573,13 @@ mod tests {
         let over = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"logit_bias":{{"{V}":1.0}}}}"#);
         let e = parse_chat(over.as_bytes()).unwrap_err();
         assert!(e.contains("is not a token id of this model's vocabulary"), "{e}");
+        // Crow #300 C3: the bound is the LOADED model's vocabulary, not the const -
+        // the same key is fine for a model one id wider, and a narrower one names its size
+        assert_eq!(parse_chat_vocab(over.as_bytes(), V + 1).unwrap().logit_bias, vec![(V, 1.0)]);
+        let e = parse_chat_vocab(br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"1000":1.0}}"#, 1000).unwrap_err();
+        assert!(e.contains("(0..1000)"), "{e}");
+        let e = parse_chat_vocab(br#"{"messages":[{"role":"user","content":"hi"}],"crow_force_ids":[1000]}"#, 1000).unwrap_err();
+        assert!(e.contains("not a token id below 1000"), "{e}");
         let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"5":"high"}}"#).unwrap_err();
         assert!(e.contains("logit_bias[5] is not a number"), "{e}");
         let e = parse_chat(br#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"5":true}}"#).unwrap_err();
@@ -7074,6 +7098,7 @@ mod tests {
         cold_total: 2_534_400,
         ple_rows_total: 160_640,
         ple_miss_total: 12_811,
+        layers: LAYERS,
     };
 
     #[test]
@@ -7230,6 +7255,7 @@ mod tests {
             cold_total: 0,
             ple_rows_total: 0,
             ple_miss_total: 0,
+            layers: LAYERS,
         };
         let f = chunk_finish(&ChunkCtx::new("id", 7, "m"), &FinishArgs { finish: "stop", t: &z, include_usage: true, timings_per_token: true, malformed: &[] });
         for k in ["prompt_ms", "prompt_per_second", "predicted_per_second", "predicted_per_token_ms"] {
@@ -8573,6 +8599,7 @@ Red is #FF0000."), "{off}");
             cold_total: 2,
             ple_rows_total: 9,
             ple_miss_total: 4,
+            layers: LAYERS,
         }
     }
 
@@ -9270,28 +9297,28 @@ Red is #FF0000."), "{off}");
     #[test]
     fn the_tool_gate_follows_the_switch_the_tool_choice_and_the_tools() {
         let tk = tk();
-        let (g, line) = tool_gate(&tool_req(""), &tk, true);
+        let (g, line) = tool_gate(&tool_req(""), &tk, &Geo::FLASH_NEXT, true);
         let g = g.expect("a gate for Crow's tools");
         assert_eq!((g.g.n_tools(), g.g.n_params()), (26, 51));
         assert!(!g.armed(), "auto: nothing is checked before the first <tool_call>");
         let line = line.unwrap();
         assert!(line.starts_with("[chat] tool grammar ON (CROW_TOOL_GRAMMAR)"), "{line}");
         assert!(line.contains("tool_choice auto, parallel_tool_calls true; 26 tools / 51 parameters"), "{line}");
-        let (g, line) = tool_gate(&tool_req(""), &tk, false);
+        let (g, line) = tool_gate(&tool_req(""), &tk, &Geo::FLASH_NEXT, false);
         assert!(g.is_none());
         assert!(line.unwrap().contains("OFF (CROW_TOOL_GRAMMAR=0)"));
-        let (g, line) = tool_gate(&tool_req(r#","tool_choice":"none""#), &tk, true);
+        let (g, line) = tool_gate(&tool_req(r#","tool_choice":"none""#), &tk, &Geo::FLASH_NEXT, true);
         assert!(g.is_none() && line.unwrap().contains("tool_choice \"none\""));
-        let (g, _) = tool_gate(&tool_req(r#","tool_choice":"required""#), &tk, true);
+        let (g, _) = tool_gate(&tool_req(r#","tool_choice":"required""#), &tk, &Geo::FLASH_NEXT, true);
         assert!(g.expect("required").armed(), "required: EOS is checked from the first id");
-        let (g, line) = tool_gate(&tool_req(r#","tool_choice":{"type":"function","function":{"name":"edit_file"}}"#), &tk, true);
+        let (g, line) = tool_gate(&tool_req(r#","tool_choice":{"type":"function","function":{"name":"edit_file"}}"#), &tk, &Geo::FLASH_NEXT, true);
         assert_eq!(g.expect("named").g.n_tools(), 1);
         assert!(line.unwrap().contains("tool_choice function \"edit_file\""));
         // no tools, or an empty array: no gate and no line - the request of record
         let plain = parse_chat(br#"{"messages":[{"role":"user","content":"x"}]}"#).unwrap();
-        assert!(matches!(tool_gate(&plain, &tk, true), (None, None)));
+        assert!(matches!(tool_gate(&plain, &tk, &Geo::FLASH_NEXT, true), (None, None)));
         let empty = parse_chat(br#"{"messages":[{"role":"user","content":"x"}],"tools":[]}"#).unwrap();
-        assert!(matches!(tool_gate(&empty, &tk, true), (None, None)));
+        assert!(matches!(tool_gate(&empty, &tk, &Geo::FLASH_NEXT, true), (None, None)));
     }
 
     /// The loop's grammar path on the host, against a scripted "model": every row prefers
@@ -9319,7 +9346,7 @@ Red is #FF0000."), "{off}");
         };
         for extra in ["", r#","temperature":1.0,"top_p":0.95,"min_p":0.01,"seed":3"#] {
             let req = tool_req(extra);
-            let (gate, _) = tool_gate(&req, &tk, true);
+            let (gate, _) = tool_gate(&req, &tk, &Geo::FLASH_NEXT, true);
             let mut gate = gate.expect("gate");
             let mut out: Vec<u32> = Vec::new();
             let mut redrawn = 0;

@@ -282,8 +282,15 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="424"
+TESTS="425"
 CLIPPY="1519"
+#   tests 424 -> 425 / clippy 1519 (unchanged)   Crow #300 phase 1 C3b (2026-09-26, on `3e14d2f`): residency.rs,
+#                              cache.rs (`Shape`, the park), the serve / decode / parity bins and the container-reading
+#                              tools (coldtier, hybrid, sf_scan, residency, states) read the runtime `Geo`. +1
+#                              `residency::tests` (the sidecar is checked against the model shape it is given); the
+#                              serve logit_bias test gained the runtime-vocabulary bound (count unchanged). Both were
+#                              shown red with their hunk reverted. Measured 2026-09-26: lib 296 / 0 / 3 ignored, serve
+#                              118, decode 5, parity 6 = 425 / 0; clippy 1519, no warning added or removed.
 #   tests 421 -> 424 / clippy 1522 -> 1519   Crow #300 phase 1 C3a (2026-09-26, on `f7ca9f5`): the runtime `Geo`
 #                              threaded from `boot::open_model` into `Engine::load` (manager, reset, vit, slot, the EOS
 #                              ids of the generation loops). +1 `geo::tests_300` (the C3 accessors reproduce the consts,

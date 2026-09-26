@@ -86,7 +86,7 @@ fn main() {
                 let mut tf_trace: Vec<usize> = vec![tok];
                 for &fed in &ids[tf_split..] {
                     tok = eng.decode_step(&mut cnq, fed);
-                    logits.push(crow_nest_engine::cuda::dtoh(eng.logits(), V));
+                    logits.push(crow_nest_engine::cuda::dtoh(eng.logits(), eng.geo.vocab));
                     tf_trace.push(tok);
                 }
                 if tf_split < ids.len() {
@@ -107,7 +107,7 @@ fn main() {
                     println!("  decode pos {pos} → {next} ({:.1} ms)", t0.elapsed().as_secs_f64() * 1e3);
                     // recompute logits row for this position (decode wrote row 0)
                     // — captured via head_run inside decode_step; read it back:
-                    let lg = crow_nest_engine::cuda::dtoh(eng.logits(), V);
+                    let lg = crow_nest_engine::cuda::dtoh(eng.logits(), eng.geo.vocab);
                     logits.push(lg);
                 }
                 all_ids.push(next as i64);
@@ -175,7 +175,7 @@ fn main() {
                 // overridable) - on the device (sample_k behind argmax_k, captured
                 // with the graph, so it must be enabled before the warm-up step)
                 // unless CROW_SAMPLE_HOST=1 keeps the host path (logits readback)
-                let mut sampler = crow_nest_engine::sample::Sampler::from_env();
+                let mut sampler = crow_nest_engine::sample::Sampler::from_env(Some(eng.geo.vocab));
                 // #85/#92: a host-only knob (DRY, the #92 tier) takes the host path too
                 let sample_host = crow_nest_engine::sample::host_forced()
                     || sampler.as_ref().is_some_and(|s| s.host_route());
@@ -208,7 +208,7 @@ fn main() {
                 // CROW_STOP_EOS=1 ends the run at EOS
                 if sample_host {
                     if let Some(s) = &mut sampler {
-                        let lg = crow_nest_engine::cuda::dtoh(eng.logits(), V);
+                        let lg = crow_nest_engine::cuda::dtoh(eng.logits(), eng.geo.vocab);
                         next = s.sample(&lg);
                         s.observe(next);
                         trace[0] = next;
@@ -242,7 +242,7 @@ fn main() {
                     next = eng.decode_step(&mut cnq, next as i64);
                     if sample_host {
                         if let Some(s) = &mut sampler {
-                            let lg = crow_nest_engine::cuda::dtoh(eng.logits(), V);
+                            let lg = crow_nest_engine::cuda::dtoh(eng.logits(), eng.geo.vocab);
                             next = s.sample(&lg);
                             s.observe(next);
                         }
@@ -356,9 +356,9 @@ fn main() {
                 assert!(!std::path::Path::new(&out).exists(), "warmup: {out} exists - refusing to overwrite");
                 let ids = read_ids(&ids_path);
                 cfg.n_hot = n;
-                let even: [[u64; E]; LAYERS] = [[1u64; E]; LAYERS];
+                let even = vec![vec![1u64; geo.moe().experts]; geo.layers];
                 let mut eng =
-                    Engine::load(&mut cnq, geo, cfg, Some(&even), &out, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, Some(&even[..]), &out, false, &mut |m| println!("[load] {m}"));
                 println!("warmup: prefill over {} real tokens (chunk {}) …", ids.len(), cfg.prompt_chunk);
                 let t0 = std::time::Instant::now();
                 let _ = eng.prefill(&mut cnq, &ids, None);
@@ -367,7 +367,7 @@ fn main() {
                 let sets: Vec<Vec<u32>> = counts
                     .iter()
                     .map(|c| {
-                        let mut ord: Vec<u32> = (0..E as u32).collect();
+                        let mut ord: Vec<u32> = (0..geo.moe().experts as u32).collect();
                         ord.sort_by(|&a, &b| c[b as usize].cmp(&c[a as usize]).then(a.cmp(&b)));
                         ord.truncate(n);
                         ord // frequency order (truncate-safe)
@@ -380,7 +380,7 @@ fn main() {
                     tot += c.iter().sum::<u64>();
                     hit += sets[l].iter().map(|&e| c[e as usize]).sum::<u64>();
                 }
-                let slabs = crow_nest_engine::residency::expert_slab_info(&cnq, 0, "text");
+                let slabs = crow_nest_engine::residency::expert_slab_info(&cnq, 0, "text", geo.moe().experts);
                 crow_nest_engine::residency::persist_sidecar(
                     &out, n, &sets, &slabs,
                     &format!("decode warmup, {} real tokens from {}, top-{n}/layer, frequency order", ids.len(), ids_path),
@@ -421,7 +421,8 @@ fn main() {
                 let inp = std::fs::read("../oracle/golden/layer0-input.f32").unwrap();
                 let gold = std::fs::read("../oracle/golden/layer0-golden-output.f32").unwrap();
                 let t = 8usize;
-                assert_eq!(inp.len(), t * HCT * 4);
+                let hct = geo.residual_width();
+                assert_eq!(inp.len(), t * hct * 4);
                 let to_f32 = |b: &[u8]| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>();
                 let x = to_f32(&inp);
                 let g = to_f32(&gold);
@@ -430,7 +431,7 @@ fn main() {
                 let out = eng.run_layer0_with_stage_dumps(&h_in, t, "../probes/engine-p8debug");
                 let mut nan = 0usize;
                 let mut max_abs = 0f32;
-                for i in 0..t * HCT {
+                for i in 0..t * hct {
                     if out[i].is_nan() { nan += 1; }
                     max_abs = max_abs.max((out[i] - g[i]).abs());
                 }
@@ -450,8 +451,9 @@ fn main() {
                 let inp = std::fs::read("../oracle/golden/layer3-attn-input.f32").unwrap();
                 let gold = std::fs::read("../oracle/golden/layer3-attn-output.f32").unwrap();
                 let t = 8usize;
-                assert_eq!(inp.len(), t * H * 4, "golden input shape [8][2560] f32");
-                assert_eq!(gold.len(), t * H * 4, "golden output shape [8][2560] f32");
+                let h = geo.hidden;
+                assert_eq!(inp.len(), t * h * 4, "golden input shape [8][2560] f32");
+                assert_eq!(gold.len(), t * h * 4, "golden output shape [8][2560] f32");
                 let x = to_f32(&inp);
                 let g = to_f32(&gold);
                 match &eng.weights().sub[3] {
@@ -528,10 +530,10 @@ fn main() {
                 let mut s_sg = 0f64;
                 let mut s_nan = 0usize;
                 for i in 0..t {
-                    let row = eng.run_attn_subblock(3, &x[i * H..(i + 1) * H], 1, i);
-                    let gold_row = &g[i * H..(i + 1) * H];
+                    let row = eng.run_attn_subblock(3, &x[i * h..(i + 1) * h], 1, i);
+                    let gold_row = &g[i * h..(i + 1) * h];
                     let mut r_max = 0f32;
-                    for j in 0..H {
+                    for j in 0..h {
                         if row[j].is_nan() { s_nan += 1; }
                         let a = (row[j] - gold_row[j]).abs();
                         r_max = r_max.max(a);
@@ -613,11 +615,13 @@ fn main() {
                         // (p10 fed it as x0), which is why the width is HCT and not H
                         "decoder_layer" => {
                             assert_eq!(c.layer, 0, "selftest: `decoder_layer` runs layer 0 only, `{}` names layer {}", c.name, c.layer);
-                            assert_eq!(c.input_width, HCT, "selftest: `{}` input width {} is not HCT {HCT}", c.name, c.input_width);
+                            let hct = geo.residual_width();
+                            assert_eq!(c.input_width, hct, "selftest: `{}` input width {} is not HCT {hct}", c.name, c.input_width);
                             eng.run_layer0_with_stage_dumps(&x, c.t, &dumps)
                         }
                         "attn_subblock" => {
-                            assert_eq!(c.input_width, H, "selftest: `{}` input width {} is not H {H}", c.name, c.input_width);
+                            let h = geo.hidden;
+                            assert_eq!(c.input_width, h, "selftest: `{}` input width {} is not H {h}", c.name, c.input_width);
                             eng.run_attn_subblock(c.layer, &x, c.t, 0)
                         }
                         other => panic!("selftest: unknown check kind `{other}` in {mpath}"),

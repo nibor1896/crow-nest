@@ -523,7 +523,7 @@ impl Engine {
     pub fn qsa_ring_rows(&self) -> usize { self.st.qsa_ring_rows }
     /// #118: host bytes a park of `rows` KV rows takes (`cache::park_host_bytes`)
     pub fn park_host_bytes(&self, rows: usize) -> usize {
-        crate::cache::park_host_bytes(rows, self.st.context, self.st.qsa_pooled.len(), self.st.kv.byte_per_value())
+        crate::cache::park_host_bytes(&self.geo, rows, self.st.context, self.st.qsa_pooled.len(), self.st.kv.byte_per_value())
     }
     /// #13: the operating point of this process, for the ONE structured boot
     /// line (`log::boot`). Reporting only — it reads the loaded state and the
@@ -926,7 +926,7 @@ impl Engine {
         cnq: &mut Cnq,
         geo: Geo,
         mut cfg: Config,
-        warmup_counts: Option<&[[u64; E]; LAYERS]>,
+        warmup_counts: Option<&[Vec<u64>]>,
         sidecar_path: &str,
         persist: bool,
         log: &mut dyn FnMut(&str),
@@ -1112,7 +1112,7 @@ impl Engine {
         // so everything chunk-sized must already be resident (C=512 scratch is
         // ~0.7 GB; an unplanned allocation past the card limit gets paged by
         // WDDM and silently costs 3x per token - found 2026-09-04 at C=1024) ----
-        let slabs = crate::residency::expert_slab_info(cnq, 0, sec);
+        let slabs = crate::residency::expert_slab_info(cnq, 0, sec, geo.moe().experts);
         let per_expert_unit = (slabs.gu_bytes + slabs.dn_bytes) * LAYERS as u64;
         let s = Scratch::alloc(cfg.prompt_chunk);
         // cold staging: decode-sized batches only (t*TOPK <= stage_max)
@@ -1319,7 +1319,7 @@ impl Engine {
 
         // ---- residency (#8) ----
         log("building residency (hot VRAM slabs + pinned cold tier) …");
-        let res = Residency::build(cnq, sec, st_res_n(&st_rep, cfg.n_hot), warmup_counts, sidecar_path, persist, cold_fixed, cfg.adapt.spare, &mut |m| {
+        let res = Residency::build(cnq, &geo, sec, st_res_n(&st_rep, cfg.n_hot), warmup_counts, sidecar_path, persist, cold_fixed, cfg.adapt.spare, &mut |m| {
             log(&format!("  [residency] {m}"));
         });
         // ---- copy-engine prefetch ring (A-P3b) ----

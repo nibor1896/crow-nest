@@ -18,7 +18,6 @@
 //!
 //! usage: coldtier <cnq> <out.bin> [--bits 2|3] [--levels 1,3] [--threads N]
 use crow_nest_engine::cnq::{self, Cnq};
-use crow_nest_engine::geo::*;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 /// nibble of a signed e2m1 level given its magnitude index
@@ -40,6 +39,9 @@ fn main() {
     }
     let cnq_path = args[1].clone();
     let out_path = args[2].clone();
+    // Crow #300 C3: the MoE shape from the checkpoint's Geo (the metadata gate), not the consts
+    let geo = crow_nest_engine::boot::model_geo(&cnq_path);
+    let (n_layers, n_exp, inter, hidden) = (geo.layers, geo.moe().experts, geo.moe().expert_inter, geo.hidden);
     let mut bits = 2u32;
     let mut levels: Vec<f32> = vec![1.0, 3.0];
     let mut threads = 12usize;
@@ -65,20 +67,20 @@ fn main() {
     let blob = cnq_idx.blob_offset;
     // per layer: (gu offset, gu bytes, gu gs, dn offset, dn bytes, dn gs)
     let mut layers = Vec::new();
-    for l in 0..LAYERS {
+    for l in 0..n_layers {
         let gu = cnq_idx.find(&format!("model.language_model.layers.{l}.mlp.experts.gate_up_proj"), "text").clone();
         let dn = cnq_idx.find(&format!("model.language_model.layers.{l}.mlp.experts.down_proj"), "text").clone();
         layers.push((blob + gu.offset, Cnq::byte_len(&gu), gu.global_scale, blob + dn.offset, Cnq::byte_len(&dn), dn.global_scale));
     }
-    let gu_blocks = (2 * INTER * H) / 64;
-    let dn_blocks = (H * INTER) / 64;
+    let gu_blocks = (2 * inter * hidden) / 64;
+    let dn_blocks = (hidden * inter) / 64;
     let gu_rec = gu_blocks * rec_bytes;
     let dn_rec = dn_blocks * rec_bytes;
-    let per_layer_out = E * (gu_rec + dn_rec);
+    let per_layer_out = n_exp * (gu_rec + dn_rec);
     eprintln!("coldtier: {bits}-bit, codebook {:?}, record {rec_bytes} B/64 values, per expert {} B (was {} B), output {:.1} GB",
-        levels, gu_rec + dn_rec, (gu_blocks + dn_blocks) * 36, (per_layer_out * LAYERS) as f64 / 1e9);
+        levels, gu_rec + dn_rec, (gu_blocks + dn_blocks) * 36, (per_layer_out * n_layers) as f64 / 1e9);
 
-    // ---- worker: one layer -> Vec<u8> of E*(gu_rec+dn_rec) bytes, plus SSE stats
+    // ---- worker: one layer -> Vec<u8> of n_exp*(gu_rec+dn_rec) bytes, plus SSE stats
     let work = |l: usize| -> (Vec<u8>, f64, f64, u64) {
         let (gu_off, gu_len, gu_gs, dn_off, dn_len, dn_gs) = layers[l];
         let mut f = std::fs::File::open(&cnq_path).unwrap();
@@ -89,9 +91,9 @@ fn main() {
         let mut blk = [0f32; 64];
         for (which, off, len, gs, nblk) in [(0usize, gu_off, gu_len, gu_gs, gu_blocks), (1, dn_off, dn_len, dn_gs, dn_blocks)] {
             let per_expert_in = nblk * 36;
-            assert_eq!(per_expert_in as u64 * E as u64, len);
+            assert_eq!(per_expert_in as u64 * n_exp as u64, len);
             let mut raw = vec![0u8; per_expert_in];
-            for e in 0..E {
+            for e in 0..n_exp {
                 f.seek(SeekFrom::Start(off + (e * per_expert_in) as u64)).unwrap();
                 f.read_exact(&mut raw).unwrap();
                 let obase = e * (gu_rec + dn_rec) + if which == 0 { 0 } else { gu_rec };
@@ -137,7 +139,7 @@ fn main() {
     let header = serde_json::json!({
         "format": "crow-nest-coldtier", "version": 1, "bits": bits, "levels": levels,
         "codebook_nibbles": cb_nib, "record_bytes": rec_bytes,
-        "gu_record_bytes": gu_rec, "dn_record_bytes": dn_rec, "layers": LAYERS, "experts": E,
+        "gu_record_bytes": gu_rec, "dn_record_bytes": dn_rec, "layers": n_layers, "experts": n_exp,
         "layer_bytes": per_layer_out, "source": cnq_path,
     });
     let mut done = 0usize;
@@ -145,8 +147,8 @@ fn main() {
     let mut tot_ref = 0f64;
     let mut tot_n = 0u64;
     let mut next = 0usize;
-    while next < LAYERS {
-        let batch: Vec<usize> = (next..(next + threads).min(LAYERS)).collect();
+    while next < n_layers {
+        let batch: Vec<usize> = (next..(next + threads).min(n_layers)).collect();
         let results: Vec<(usize, (Vec<u8>, f64, f64, u64))> = std::thread::scope(|sc| {
             let hs: Vec<_> = batch.iter().map(|&l| { let w = &work; sc.spawn(move || (l, w(l))) }).collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
