@@ -567,7 +567,18 @@ fn main() {
                 let k: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(3);
                 crow_nest_engine::geo::apply_chunk_policy(&mut cfg, ids.len());
                 let mut eng = Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
-                let first = eng.prefill(&mut cnq, &ids, None) as i64;
+                // CROW_SAMPLE=1 (+ CROW_TEMP / CROW_TOP_P / CROW_TOP_K / CROW_MIN_P / CROW_PRESENCE /
+                // CROW_SEED): every run draws with the device sampler, re-armed per run (same seed),
+                // the first token drawn from the prefill row; C2's identity is then a greedy-only claim
+                let sampler = crow_nest_engine::sample::Sampler::from_env(Some(eng.geo.vocab));
+                if let Some(sm) = &sampler {
+                    println!("{}", sm.describe());
+                    eng.enable_dev_sampler(sm);
+                }
+                let mut first = eng.prefill(&mut cnq, &ids, None) as i64;
+                if sampler.is_some() {
+                    first = eng.sample_last() as i64;
+                }
                 let t0 = std::time::Instant::now();
                 let mut plain = vec![first];
                 while plain.len() < n {
@@ -576,8 +587,14 @@ fn main() {
                 }
                 let plain_s = t0.elapsed().as_secs_f64();
                 eng.reset_to_zero();
-                let first2 = eng.prefill(&mut cnq, &ids, None) as i64;
-                assert_eq!(first, first2, "the prefill is deterministic");
+                if let Some(sm) = &sampler {
+                    eng.enable_dev_sampler(sm);
+                }
+                let mut first2 = eng.prefill(&mut cnq, &ids, None) as i64;
+                if sampler.is_some() {
+                    first2 = eng.sample_last() as i64;
+                }
+                assert_eq!(first, first2, "the prefill (and the first draw, same seed) is deterministic");
                 let t1 = std::time::Instant::now();
                 let (spec, st) = eng.mtp_spec_greedy(&mut cnq, first2, n, k);
                 let spec_s = t1.elapsed().as_secs_f64();
@@ -592,8 +609,14 @@ fn main() {
                     (n - 1) as f64 / plain_s, (n - 1) as f64 / spec_s);
                 // step 2b: the batched verify (one weight read for the k + 1 rows)
                 eng.reset_to_zero();
-                let first3 = eng.prefill(&mut cnq, &ids, None) as i64;
-                assert_eq!(first, first3, "the prefill is deterministic");
+                if let Some(sm) = &sampler {
+                    eng.enable_dev_sampler(sm);
+                }
+                let mut first3 = eng.prefill(&mut cnq, &ids, None) as i64;
+                if sampler.is_some() {
+                    first3 = eng.sample_last() as i64;
+                }
+                assert_eq!(first, first3, "the prefill (and the first draw, same seed) is deterministic");
                 // CROW_KPROF=1 (with CROW_GRAPH=0): the per-kernel profile of the batched run only
                 if let Ok(mut g) = crow_nest_engine::kernels::KPROF.lock() {
                     *g = None;

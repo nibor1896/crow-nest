@@ -5210,6 +5210,29 @@ impl Engine {
         }
     }
 
+    /// crow-nest #95 step 4: draw the verify's rows with the device sampler, row by row, and
+    /// stop after the first row whose draw differs from the next draft (`toks[i + 1]`). Returns
+    /// the draws made (at least one); the rows after the stop are never drawn.
+    ///
+    /// # Safety
+    ///
+    /// Right after `verify_rows(toks)`; the device sampler is enabled.
+    pub unsafe fn sample_verify_rows(&self, toks: &[i64]) -> Vec<i64> {
+        let ds = self.dev_sampler.as_ref().expect("sample_verify_rows without the device sampler");
+        let vb = &self.w.mtp.as_ref().expect("verify without the MTP head").vb;
+        let mut ys = Vec::with_capacity(toks.len());
+        for i in 0..toks.len() {
+            self.launch_sample_at(ds, vb.logits + (4 * i * self.d.v) as u64, vb.argmax + (4 * i) as u64);
+            cuda::sync();
+            let y = cuda::dtoh_i32(vb.argmax + (4 * i) as u64, 1)[0] as i64;
+            ys.push(y);
+            if toks.get(i + 1) != Some(&y) {
+                break;
+            }
+        }
+        ys
+    }
+
     /// crow-nest #95 step 2b: settle a verify of `rows` rows of which the first `keep` are
     /// accepted (1 <= keep <= rows): the GDN state goes back to slot keep-1 when a row after it
     /// was rejected; the position and history move by `keep` (K / V rows past them are stale and
@@ -5271,7 +5294,15 @@ impl Engine {
             }
             st.passes += 1;
             let tb = std::time::Instant::now();
-            let ys = self.verify_rows(&toks);
+            let mut ys = self.verify_rows(&toks);
+            // crow-nest #95 step 4: with the device sampler armed, the verify's rows are DRAWN,
+            // one after the other (llama.cpp's rule: a draft stands while it equals the target's
+            // own draw at the row before). Row i is drawn only when rows 0..i all held, so the
+            // sampler's penalty window counts exactly the accepted tokens and no draw is
+            // thrown away; the draft d1 of a k = 0 pass is compared with the one draw.
+            if self.dev_sampler.is_some() {
+                ys = self.sample_verify_rows(&toks);
+            }
             let tc = std::time::Instant::now();
             // accept drafts while they equal the main model's token of the row before; with
             // k = 0 the draft d1 is still compared (free evidence for a_1)
@@ -5751,15 +5782,21 @@ impl Engine {
     }
 
     unsafe fn launch_sample(&self, ds: &DevSampler) {
+        self.launch_sample_at(ds, self.s.logits, self.s.argmax);
+    }
+
+    /// `launch_sample` on the logits row `logits` into the i32 slot `out` (crow-nest #95: the
+    /// verify's rows; the kernels are the decode's, only the two pointers move)
+    unsafe fn launch_sample_at(&self, ds: &DevSampler, logits: Dev, out: Dev) {
         // v2: 64 blocks pick their slice's top-k, one block merges and draws.
         // #84: counts rides stage 1 (the windowed penalties bite on the raw
         // logits), counts+ring ride stage 2 (the post-draw accept).
         launch_v(self.k.f("sample_topk_part"), SAMPLE_PARTS, 1, 1, SAMPLE_THREADS, &[
-            self.s.logits as u64, self.p.n_vocab as u64, ds.mask as u64, ds.counts as u64,
-            ds.params as u64, ds.cand_v as u64, ds.cand_i as u64]);
+            logits, self.p.n_vocab, ds.mask, ds.counts,
+            ds.params, ds.cand_v, ds.cand_i]);
         launch_v(self.k.f("sample_k"), 1, 1, 1, SAMPLE_THREADS, &[
-            ds.cand_v as u64, ds.cand_i as u64, self.s.argmax as u64, self.p.n_vocab as u64,
-            ds.mask as u64, ds.counts as u64, ds.ring as u64, ds.rng as u64, ds.params as u64]);
+            ds.cand_v, ds.cand_i, out, self.p.n_vocab,
+            ds.mask, ds.counts, ds.ring, ds.rng, ds.params]);
     }
 
     /// #20: draw a token from the logits row currently in `s.logits` (the last
