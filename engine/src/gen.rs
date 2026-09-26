@@ -151,6 +151,67 @@ pub struct MtpStats {
     /// proposed[i] / accepted[i]: drafts at chain position i + 1
     pub proposed: [usize; MTP_MAX_ROWS],
     pub accepted: [usize; MTP_MAX_ROWS],
+    /// passes run with k drafts (k = 0: a one-row verify, the draft d1 only observed)
+    pub k_hist: [usize; MTP_VERIFY_MAX],
+}
+
+/// crow-nest #95: the adaptive draft length (design: "adaptive k in {0..3}"). Keeps an EMA of
+/// the conditional acceptance a_j of every chain position and of the measured costs (verify of
+/// m rows, one chain draft, the catch-up) and picks the k with the most expected tokens per
+/// millisecond: E(k) = 1 + sum_{j <= k} prod_{i <= j} a_i over C(k) = T_verify(k + 1) +
+/// (k - 1) T_draft + T_catch. a_1 is observed on every pass (d1 exists anyway); a deeper
+/// position only while k reaches it, so every 16th pass tries one draft more than chosen.
+#[derive(Debug, Clone)]
+pub struct AdaptiveK {
+    pub kmax: usize,
+    pub acc: [f64; MTP_VERIFY_MAX],
+    pub t_verify: [f64; MTP_VERIFY_MAX + 1],
+    pub t_draft: f64,
+    pub t_catch: f64,
+    pub pass: usize,
+}
+
+impl AdaptiveK {
+    /// priors: acceptance 0.8 per position, costs of the 27B on the RTX 5090 (2026-09-27, ms)
+    pub fn new(kmax: usize) -> AdaptiveK {
+        AdaptiveK { kmax, acc: [0.8; MTP_VERIFY_MAX], t_verify: [0.0, 14.0, 17.5, 21.4, 25.2], t_draft: 1.2, t_catch: 1.8, pass: 0 }
+    }
+
+    /// expected tokens per millisecond of a pass with k drafts
+    pub fn rate(&self, k: usize) -> f64 {
+        let (mut e, mut prod) = (1.0, 1.0);
+        for j in 0..k {
+            prod *= self.acc[j];
+            e += prod;
+        }
+        let c = self.t_verify[k + 1] + k.saturating_sub(1) as f64 * self.t_draft + self.t_catch;
+        e / c
+    }
+
+    /// the k of the next pass
+    pub fn choose(&mut self) -> usize {
+        self.pass += 1;
+        let best = (0..=self.kmax).max_by(|&a, &b| self.rate(a).total_cmp(&self.rate(b))).unwrap_or(0);
+        if self.pass.is_multiple_of(16) { (best + 1).min(self.kmax) } else { best }
+    }
+
+    fn ema(v: &mut f64, x: f64) {
+        *v += 0.1 * (x - *v);
+    }
+
+    /// one pass: `seen[j]` = whether chain position j + 1 was checked, and if so accepted
+    pub fn observe(&mut self, seen: &[Option<bool>], m: usize, t_verify: f64, t_draft: Option<f64>, t_catch: f64) {
+        for (j, s) in seen.iter().enumerate() {
+            if let Some(ok) = s {
+                AdaptiveK::ema(&mut self.acc[j], if *ok { 1.0 } else { 0.0 });
+            }
+        }
+        AdaptiveK::ema(&mut self.t_verify[m], t_verify);
+        if let Some(t) = t_draft {
+            AdaptiveK::ema(&mut self.t_draft, t);
+        }
+        AdaptiveK::ema(&mut self.t_catch, t_catch);
+    }
 }
 
 /// Projection weight: NVFP4 (dequant on the fly) or BF16 keep (exact bit
@@ -4451,6 +4512,13 @@ impl Engine {
             }
         }
         self.upload_chunk_scalars(t, pos_base, false, ScalarSet::Full);
+        // 1..=4 rows (drafts and catch-up at decode time): the per-row split-K attention of the
+        // verify, positions and row count from the verify's device scalars
+        let rows_form = t <= MTP_VERIFY_MAX;
+        if rows_form {
+            cuda::to_i32_into(m.vb.m, &[t as i32]);
+            cuda::to_i32_into(m.vb.pos, &(0..t).map(|i| (pos_base + i) as i32).collect::<Vec<_>>());
+        }
         cuda::to_f32_into(self.s.h, &e);
         self.add_norm(0, m.enorm, m.a, t); // a = enorm(embed(t_{p+1}))
         cuda::d2d_async(self.s.h, h_rows, 4 * t * h);
@@ -4458,7 +4526,11 @@ impl Engine {
         self.dense_proj(&m.fc_e, h, p.n2560, t, m.a, 0, self.s.h, p.n2560); // h = fc_e a
         self.dense_proj(&m.fc_h, h, p.n2560, t, m.b, 0, m.y, p.n2560);
         self.add_norm(m.y, m.ln1, self.s.mixed, t); // h = fc(cat[a, b]); mixed = ln1(h)
-        let ay = self.attn_full_prompt_w(&m.attn, m.kc, m.vc, self.s.mixed, t, pos_base);
+        let ay = if rows_form {
+            self.attn_rows_w(&m.attn, m.kc, m.vc, t)
+        } else {
+            self.attn_full_prompt_w(&m.attn, m.kc, m.vc, self.s.mixed, t, pos_base)
+        };
         self.add_norm(ay, m.ln2, self.s.mixed, t);
         let f = self.dense_ffn_w(&m.mlp, self.s.mixed, t);
         self.add_norm(f, m.norm, self.s.mixed_final, t);
@@ -4945,18 +5017,19 @@ impl Engine {
     }
 
     /// crow-nest #95 step 2b: one projection over the verify's `m` rows of `x` (row stride
-    /// `k`) into `y` (row stride `rows`): an NVFP4 weight takes `gemv_nvfp4_wm` (one weight read,
+    /// `*k_p`) into `y` (row stride `rows`): an NVFP4 weight takes `gemv_nvfp4_wm` (one weight read,
     /// bit-identical per row to the decode's `gemv_nvfp4_w`), a BF16 weight its decode GEMV once
     /// per row
     #[allow(clippy::too_many_arguments)]
-    unsafe fn proj_m(&self, w: &PW, rows: usize, rows_p: Dev, m: usize, x: Dev, y: Dev, k_p: Dev, k: usize) {
+    unsafe fn proj_m(&self, w: &PW, rows: usize, rows_p: Dev, m: usize, x: Dev, y: Dev, k_p: Dev) {
         let vb = &self.w.mtp.as_ref().expect("verify without the MTP head").vb;
         match w {
             PW::Fp4(wp, gs) => launch_v(self.k.f("gemv_nvfp4_wm"), rows.div_ceil(16) as u32, 1, 1, 256, &[*wp, x, *gs, y, k_p, rows_p, vb.m]),
-            PW::Bf16(_) => {
-                for i in 0..m {
-                    self.dense_proj(w, rows, rows_p, 1, x + (4 * i * k) as u64, 0, y + (4 * i * rows) as u64, k_p);
-                }
+            // BF16: only the MTP head's weights come here (the main model's BF16 keeps, GDN b / a,
+            // take `gemv_bf16_ba` row by row), so no decode bit-identity is owed
+            PW::Bf16(_) if m == 1 => self.dense_proj(w, rows, rows_p, 1, x, 0, y, k_p),
+            PW::Bf16(wb) => {
+                launch_v(self.k.f("gemv_bf16_wm"), rows.div_ceil(8) as u32, 1, 1, 256, &[*wb, x, y, k_p, rows_p, vb.m]);
             }
         }
     }
@@ -4973,8 +5046,8 @@ impl Engine {
             panic!("layer {l} is not GDN");
         };
         let (h, nv) = (self.d.h, self.d.gdn_vheads);
-        self.proj_m(qkv, self.d.gdn_conv, p.n_gdn_conv, m, s.mixed, s.mq, p.n2560, h);
-        self.proj_m(z, self.d.gdn_val, p.n6144, m, s.mixed, s.gz, p.n2560, h);
+        self.proj_m(qkv, self.d.gdn_conv, p.n_gdn_conv, m, s.mixed, s.mq, p.n2560);
+        self.proj_m(z, self.d.gdn_val, p.n6144, m, s.mixed, s.gz, p.n2560);
         for i in 0..m {
             let x = s.mixed + (4 * i * h) as u64;
             let (gb, ga) = (s.gb + (4 * i * nv) as u64, s.ga + (4 * i * nv) as u64);
@@ -5006,7 +5079,7 @@ impl Engine {
                 cuda::d2d_async(vb.slot_conv[i] + (gi * vb.conv_bytes) as u64, self.st.gdn_conv[gi], vb.conv_bytes);
             }
         }
-        self.proj_m(out, h, p.n2560, m, s.gnorm, s.gout, p.n6144, self.d.gdn_val);
+        self.proj_m(out, h, p.n2560, m, s.gnorm, s.gout, p.n6144);
         s.gout
     }
 
@@ -5015,18 +5088,25 @@ impl Engine {
     /// `attn_full_step`'s own kernels and launch shapes (row i stores its K / V before it
     /// attends, so it sees rows 0..=i). Returns `s.ay` ([m][H]).
     unsafe fn attn_verify(&self, l: usize, m: usize) -> Dev {
+        let (kc, vc, _, _) = self.layer_cache_ptrs(l);
+        self.attn_rows_w(&self.w.sub[l], kc, vc, m)
+    }
+
+    /// `attn_verify` on the given weights and caches (crow-nest #95: the MTP head's 1..=4 rows
+    /// at decode time take the split-K decode attention too; its prompt form ran one block per
+    /// KV head over all keys, 7 ms per draft pass at 8k)
+    unsafe fn attn_rows_w(&self, w: &SubW, kc: u64, vc: u64, m: usize) -> Dev {
         let (k, p, s) = (&self.k, &self.p, &self.s);
         let vb = &self.w.mtp.as_ref().expect("verify without the MTP head").vb;
-        let SubW::Attn { q, k: kk, v, o, qn, kn, .. } = &self.w.sub[l] else {
-            panic!("layer {l} is not attention");
+        let SubW::Attn { q, k: kk, v, o, qn, kn, .. } = w else {
+            panic!("attn_rows_w: not an attention block");
         };
         assert!(std::env::var("CROW_P2_FA").as_deref() != Ok("0"), "the verify runs the tiled attention only (CROW_P2_FA=0 is an A/B knob of the plain path)");
-        let (kc, vc, _, _) = self.layer_cache_ptrs(l);
         let (cos, sin) = (self.cos_tbl(), self.sin_tbl());
         let h = self.d.h;
-        self.proj_m(q, self.d.q_rows, p.n12288, m, s.mixed, s.qg, p.n2560, h);
-        self.proj_m(kk, self.d.kv_rows, p.nr512, m, s.mixed, s.ak, p.n2560, h);
-        self.proj_m(v, self.d.kv_rows, p.nr512, m, s.mixed, s.av, p.n2560, h);
+        self.proj_m(q, self.d.q_rows, p.n12288, m, s.mixed, s.qg, p.n2560);
+        self.proj_m(kk, self.d.kv_rows, p.nr512, m, s.mixed, s.ak, p.n2560);
+        self.proj_m(v, self.d.kv_rows, p.nr512, m, s.mixed, s.av, p.n2560);
         for i in 0..m {
             let pi = vb.pos + (4 * i) as u64;
             let qg = s.qg + (4 * i * self.d.q_rows) as u64;
@@ -5044,7 +5124,7 @@ impl Engine {
             launch_v(k.f("attn_merge"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[s.fa_part_o, s.fa_part_ml, s.aout, p.n_splits_fa]);
             launch_v(k.f("gate_mul"), self.d.core.div_ceil(256) as u32, 1, 1, 256, &[s.aout, s.agate, agated]);
         }
-        self.proj_m(o, h, p.n2560, m, s.agated, s.ay, p.n_core, self.d.core);
+        self.proj_m(o, h, p.n2560, m, s.agated, s.ay, p.n_core);
         s.ay
     }
 
@@ -5120,11 +5200,11 @@ impl Engine {
             };
             launch_v(self.k.f("gemv_nvfp4_gum"), self.d.dense_inter.div_ceil(16) as u32, 1, 1, 256, &[
                 *wg, *wu, self.s.mixed_m, *gg, *gu, self.s.dg, p.n2560, p.n_dinter, vb.m]);
-            self.proj_m(&mw.down, h, p.n2560, m, self.s.dg, self.s.moe_out, p.n_dinter, self.d.dense_inter);
+            self.proj_m(&mw.down, h, p.n2560, m, self.s.dg, self.s.moe_out, p.n_dinter);
             let (w, out) = self.next_norm(l);
             self.add_norm(self.s.moe_out, w, out, m);
         }
-        self.proj_m(&self.dw().lm_head, self.d.v, p.n_vocab, m, self.s.mixed_final, vb.logits, p.n2560, h);
+        self.proj_m(&self.dw().lm_head, self.d.v, p.n_vocab, m, self.s.mixed_final, vb.logits, p.n2560);
         for i in 0..m {
             launch_v(self.k.f("argmax_k"), 1, 1, 1, 1024, &[vb.logits + (4 * i * self.d.v) as u64, vb.argmax + (4 * i) as u64, p.n_vocab]);
         }
@@ -5161,9 +5241,12 @@ impl Engine {
     /// # Safety
     ///
     /// As `mtp_spec_greedy`.
-    pub unsafe fn mtp_spec_greedy_batched(&mut self, first: i64, n: usize, k: usize) -> (Vec<i64>, MtpStats) {
-        assert!((1..MTP_VERIFY_MAX).contains(&k), "k in 1..{MTP_VERIFY_MAX}");
+    pub unsafe fn mtp_spec_greedy_batched(&mut self, first: i64, n: usize, kmax: usize) -> (Vec<i64>, MtpStats) {
+        assert!((1..MTP_VERIFY_MAX).contains(&kmax), "k in 1..{MTP_VERIFY_MAX}");
         let (hlast, h) = (self.w.mtp.as_ref().expect("mtp_spec_greedy_batched without the MTP head").hlast, self.d.h);
+        // CROW_MTP_K=<k>: a fixed draft length (the measurement arms); unset: adaptive
+        let fixed: Option<usize> = std::env::var("CROW_MTP_K").ok().and_then(|v| v.parse().ok()).map(|k: usize| k.min(kmax));
+        let mut ak = AdaptiveK::new(kmax);
         let mut st = MtpStats::default();
         let mut out = vec![first];
         let mut x = first;
@@ -5174,8 +5257,13 @@ impl Engine {
         let (mut t_draft, mut t_verify, mut t_catch) = (0f64, 0f64, 0f64);
         while out.len() < n {
             let pos = self.pos;
+            let k = fixed.unwrap_or_else(|| ak.choose());
+            st.k_hist[k] += 1;
             let ta = std::time::Instant::now();
-            let mut toks = vec![x, d1];
+            let mut toks = vec![x];
+            if k >= 1 {
+                toks.push(d1);
+            }
             for j in 2..=k {
                 self.mtp_rows(self.s.mixed_final + (4 * last_row * h) as u64, &[toks[j - 1]], pos + j - 2);
                 toks.push(self.mtp_argmax_row(0));
@@ -5185,15 +5273,22 @@ impl Engine {
             let tb = std::time::Instant::now();
             let ys = self.verify_rows(&toks);
             let tc = std::time::Instant::now();
-            // accept drafts while they equal the main model's token of the row before
+            // accept drafts while they equal the main model's token of the row before; with
+            // k = 0 the draft d1 is still compared (free evidence for a_1)
+            let mut seen: Vec<Option<bool>> = vec![None; MTP_VERIFY_MAX];
             let mut keep = 1usize;
             while keep < toks.len() {
                 st.proposed[keep - 1] += 1;
-                if ys[keep - 1] != toks[keep] {
+                let ok = ys[keep - 1] == toks[keep];
+                seen[keep - 1] = Some(ok);
+                if !ok {
                     break;
                 }
                 st.accepted[keep - 1] += 1;
                 keep += 1;
+            }
+            if k == 0 {
+                seen[0] = Some(ys[0] == d1);
             }
             self.mtp_accept(&toks, keep);
             out.extend_from_slice(&ys[..keep]);
@@ -5202,15 +5297,16 @@ impl Engine {
             last_row = keep - 1;
             d1 = self.mtp_argmax_row(last_row);
             x = ys[keep - 1];
-            if timing {
-                t_draft += (tb - ta).as_secs_f64();
-                t_verify += (tc - tb).as_secs_f64();
-                t_catch += tc.elapsed().as_secs_f64();
-            }
+            let (dv, dd, dc) = ((tc - tb).as_secs_f64() * 1e3, (tb - ta).as_secs_f64() * 1e3, tc.elapsed().as_secs_f64() * 1e3);
+            ak.observe(&seen, toks.len(), dv, (k >= 2).then(|| dd / (k - 1) as f64), dc);
+            t_draft += dd;
+            t_verify += dv;
+            t_catch += dc;
         }
         if timing {
-            let per = |t: f64| t * 1e3 / st.passes.max(1) as f64;
-            println!("[mtp-time] per pass: drafts {:.2} ms, verify {:.2} ms, accept + catch-up {:.2} ms", per(t_draft), per(t_verify), per(t_catch));
+            let per = |t: f64| t / st.passes.max(1) as f64;
+            println!("[mtp-time] per pass: drafts {:.2} ms, verify {:.2} ms, accept + catch-up {:.2} ms; k histogram {:?}; adaptive state {:?}",
+                per(t_draft), per(t_verify), per(t_catch), st.k_hist, ak);
         }
         out.truncate(n);
         st.tokens = out.len();
@@ -6412,6 +6508,38 @@ mod vit_tower_line {
 
 #[cfg(test)]
 mod tests_95_mtp {
+    use super::AdaptiveK;
+
+    #[test]
+    fn adaptive_k_drafts_deep_when_drafts_land_and_shallow_when_they_do_not() {
+        // crow-nest #95: the rates of the 2026-09-27 measurements: apollo's acceptance picks
+        // k = 3, dracula's (0.62 / 0.52 / 0.49) k = 1, and a head that never lands k = 0
+        let mut a = AdaptiveK::new(3);
+        a.acc = [0.93, 0.92, 0.94, 0.8];
+        assert_eq!(a.choose(), 3);
+        a.acc = [0.62, 0.52, 0.49, 0.8];
+        assert_eq!(a.choose(), 1);
+        a.acc = [0.05, 0.05, 0.05, 0.8];
+        assert_eq!(a.choose(), 0);
+        // every 16th pass explores one draft deeper
+        let mut b = AdaptiveK::new(3);
+        b.acc = [0.62, 0.52, 0.49, 0.8];
+        let ks: Vec<usize> = (0..16).map(|_| b.choose()).collect();
+        assert_eq!(ks[15], 2);
+        assert!(ks[..15].iter().all(|&k| k == 1));
+    }
+
+    #[test]
+    fn adaptive_k_moves_its_estimates_toward_what_it_observes() {
+        let mut a = AdaptiveK::new(3);
+        for _ in 0..100 {
+            a.observe(&[Some(false), None, None, None], 2, 18.0, None, 1.5);
+        }
+        assert!(a.acc[0] < 0.01, "{:?}", a.acc);
+        assert!((a.acc[1] - 0.8).abs() < 1e-12, "an unseen position keeps its prior");
+        assert!((a.t_verify[2] - 18.0).abs() < 0.01);
+        assert_eq!(a.choose(), 0);
+    }
     #[test]
     fn the_fc_split_gives_each_half_its_own_columns_row_by_row() {
         // crow-nest #95: [H][2H] BF16 -> fc_e = columns 0..H, fc_h = columns H..2H; checked with
