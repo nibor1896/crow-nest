@@ -282,8 +282,16 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="421"
-CLIPPY="1522"
+TESTS="424"
+CLIPPY="1519"
+#   tests 421 -> 424 / clippy 1522 -> 1519   Crow #300 phase 1 C3a (2026-09-26, on `f7ca9f5`): the runtime `Geo`
+#                              threaded from `boot::open_model` into `Engine::load` (manager, reset, vit, slot, the EOS
+#                              ids of the generation loops). +1 `geo::tests_300` (the C3 accessors reproduce the consts,
+#                              refuse by name on a family without the block, the Flash-Next fingerprint of record) and
+#                              +2 `slot::tests` (a format 1 slot file and a slot file of another model are refused by
+#                              name). Each was shown red with its hunk reverted. Measured 2026-09-26: lib 295 / 0 / 3
+#                              ignored, serve 118, decode 5, parity 6 = 424 / 0. Clippy -3: two same-type `usize`
+#                              casts and one manual `div_ceil` in `manager.rs` went with the consts they wrapped.
 #   tests 413 -> 421 / clippy 1522 (unchanged)   Crow #300 phase 1 C1+C2 (2026-09-26, on `07d9340`): one
 #                              `geo::tests_300` test (Geo::FLASH_NEXT derives every pinned const) and seven
 #                              `meta::tests` (family detection, the 27B fixture parse + its Geo, the Flash-Next

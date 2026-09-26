@@ -68,12 +68,7 @@
 
 use crate::cuda;
 use crate::gen::Engine;
-use crate::geo::GDN_CONV;
-
-/// f32 slots of one GDN layer's causal conv state, `[10240][3]` (`manager.rs:47`)
-const GDN_CONV_STATE: usize = GDN_CONV * 3;
-/// f32 slots of the PLE dilated conv state, `[10240][9]` (`gen.rs:902`)
-const PLE_STATE: usize = GDN_CONV * 9;
+use crate::manager::{gdn_conv_state_len, ple_state_len};
 
 impl Engine {
     /// - drops the captured decode graph and its capture stream, legacy stream made active
@@ -123,11 +118,13 @@ impl Engine {
         self.done_blocks = 0;
         self.route_log.clear();
 
-        let z_conv = vec![0f32; GDN_CONV_STATE];
+        // C3: the two state sizes from the engine's Geo - one GDN layer's causal conv
+        // state `[10240][3]` and the PLE dilated conv state `[10240][9]` on Flash-Next
+        let z_conv = vec![0f32; gdn_conv_state_len(&self.geo)];
         for i in 0..self.st.gdn_conv.len() {
             cuda::to_f32_into(self.st.gdn_conv[i], &z_conv);
         }
-        let z_ple = vec![0f32; PLE_STATE];
+        let z_ple = vec![0f32; ple_state_len(&self.geo)];
         cuda::to_f32_into(self.ple.state, &z_ple);
 
         // the uploads read `z_conv` / `z_ple`, which die with this frame

@@ -211,7 +211,7 @@ pub const PLAN_GRANULARITY: u64 = 2 << 20;
 /// table, the hot experts and their pointer table, the PLE row cache, the dense
 /// weights, `logits`/`argmax`, the device sampler, the scalar parameter slots
 /// (`Params`, the vit scalar slots) and every small buffer of `Stage`.
-pub fn tier1_plan(chunk: usize, vit_cap: Option<usize>, context: usize, stage_slots: usize, gu_bytes: usize, dn_bytes: usize) -> Vec<(&'static str, u64)> {
+pub fn tier1_plan(geo: &crate::geo::Geo, chunk: usize, vit_cap: Option<usize>, context: usize, stage_slots: usize, gu_bytes: usize, dn_bytes: usize) -> Vec<(&'static str, u64)> {
     let (persist, union) = crate::gen::Scratch::diet_region_bytes(chunk);
     let cap_blocks = 65536usize;
     let mut v: Vec<(&'static str, usize)> = vec![
@@ -225,8 +225,8 @@ pub fn tier1_plan(chunk: usize, vit_cap: Option<usize>, context: usize, stage_sl
         ("stage down", stage_slots * dn_bytes),
     ];
     if let Some(cap) = vit_cap {
-        v.extend(crate::vit::scratch_buffer_bytes(cap));
-        let half = crate::vit::mrope_bytes(context) / 2;
+        v.extend(crate::vit::scratch_buffer_bytes(cap, geo.vision_out()));
+        let half = crate::vit::mrope_bytes(context, geo.rope_pairs) / 2;
         v.push(("mrope cos", half));
         v.push(("mrope sin", half));
     }
@@ -312,7 +312,7 @@ mod tests {
     /// the serve operating point of 2026-09-25: chunk 2048, vit cap 5120 patches,
     /// n_ctx 200,000, 2 x 64 stage slots of 1,843,200 + 921,600 B
     fn serve_plan() -> Vec<(&'static str, u64)> {
-        tier1_plan(2048, Some(5120), 200_000, 128, 1_843_200, 921_600)
+        tier1_plan(&crate::geo::Geo::FLASH_NEXT, 2048, Some(5120), 200_000, 128, 1_843_200, 921_600)
     }
 
     #[test]
@@ -346,7 +346,7 @@ mod tests {
             assert!(!names.contains(&n), "{n} must not be lendable");
         }
         // text-only boot: no vit, no mrope
-        let text = tier1_plan(2048, None, 200_000, 128, 1_843_200, 921_600);
+        let text = tier1_plan(&crate::geo::Geo::FLASH_NEXT, 2048, None, 200_000, 128, 1_843_200, 921_600);
         assert!(text.iter().all(|&(n, _)| !n.starts_with("vit") && !n.starts_with("mrope")));
     }
 }

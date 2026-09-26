@@ -1603,7 +1603,7 @@ mod tests {
     }
 
     fn vocab(tk: &crate::tokenizer::ChatTokenizer) -> Vocab {
-        let eos: Vec<u32> = crate::sample::EOS_IDS.iter().map(|&e| e as u32).collect();
+        let eos: Vec<u32> = crate::geo::Geo::FLASH_NEXT.eos_ids.iter().map(|&e| e as u32).collect();
         let open = tk.token_id("<tool_call>").expect("<tool_call> id");
         Vocab::build(crate::geo::V, |id| tk.token_bytes(id), |id| tk.is_special(id), &eos, open)
     }
@@ -1631,7 +1631,7 @@ mod tests {
             // the mask and the per-token walk are the same predicate: every id of a
             // random sample, plus every EOS and the opener
             let mut probe: Vec<u32> = (0..400).map(|_| (rng.next_u64() % crate::geo::V as u64) as u32).collect();
-            probe.extend(crate::sample::EOS_IDS.iter().map(|&e| e as u32));
+            probe.extend(crate::geo::Geo::FLASH_NEXT.eos_ids.iter().map(|&e| e as u32));
             probe.push(tk.token_id("<tool_call>").unwrap());
             for p in probe {
                 assert_eq!(allowed(&bits, p as usize), v.token_ok(&g, &s, p), "state #{k} id {p}");
@@ -1648,7 +1648,7 @@ mod tests {
         let tk = tokenizer();
         let v = vocab(&tk);
         let g = crow();
-        let eos = crate::sample::EOS_IDS[0] as u32;
+        let eos = crate::geo::Geo::FLASH_NEXT.eos_ids[0] as u32;
         // walk `prefix`, then report whether each id of `bad` is allowed next
         let at = |prefix: &str| -> St {
             let mut s = St::IDLE;

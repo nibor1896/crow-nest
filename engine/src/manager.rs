@@ -60,11 +60,14 @@ fn yarn_ramp(pair: usize, low: f32, high: f32) -> f32 {
 /// NOTE the table is shared: `rope`/`rope_p` (text attention) AND `rope64`
 /// (the QSA indexer keys) read these cos/sin rows, so a scaled table scales
 /// both — the single-table consequence, flagged in docs/acceptance/issue-96.md.
-pub fn build_rope_table(context: usize, scaling: Option<&RopeScaling>) -> (Vec<f32>, Vec<f32>) {
-    let dim = 2 * ROPE_PAIRS; // 64 rotary dims of the 256-dim head
+pub fn build_rope_table(geo: &Geo, context: usize, scaling: Option<&RopeScaling>) -> (Vec<f32>, Vec<f32>) {
+    // C3: pairs and theta from the model's Geo (Flash-Next: 32 pairs = 64 rotary
+    // dims of the 256-dim head, theta 1e7; `1e7f64 as f32` is exactly 10_000_000f32)
+    let pairs = geo.rope_pairs;
+    let dim = 2 * pairs;
     let base = match scaling {
-        Some(s) if s.kind == RopeKind::NtkAware => s.ntk_base(dim, 10_000_000f64) as f32,
-        _ => 10_000_000f32,
+        Some(s) if s.kind == RopeKind::NtkAware => s.ntk_base(dim, geo.rope_theta) as f32,
+        _ => geo.rope_theta as f32,
     };
     let blend = match scaling {
         None | Some(&RopeScaling { kind: RopeKind::Default, .. }) => Blend::Plain,
@@ -72,15 +75,15 @@ pub fn build_rope_table(context: usize, scaling: Option<&RopeScaling>) -> (Vec<f
             Blend::Interp((1.0 / factor) as f32)
         }
         Some(s) if s.kind == RopeKind::Yarn => {
-            let (lo, hi) = s.yarn_corr_range(dim, 10_000_000f64);
+            let (lo, hi) = s.yarn_corr_range(dim, geo.rope_theta);
             Blend::Yarn(s.freq_scale(), lo, hi)
         }
         Some(_) => Blend::Plain, // NtkAware: handled by the base above
     };
-    let mut cos_h = vec![0f32; context * ROPE_PAIRS];
-    let mut sin_h = vec![0f32; context * ROPE_PAIRS];
+    let mut cos_h = vec![0f32; context * pairs];
+    let mut sin_h = vec![0f32; context * pairs];
     for t in 0..context {
-        for j in 0..ROPE_PAIRS {
+        for j in 0..pairs {
             let inv = base.powf(-(2.0 * j as f32) / dim as f32);
             let extrap = t as f32 * inv;
             let f = match blend {
@@ -91,8 +94,8 @@ pub fn build_rope_table(context: usize, scaling: Option<&RopeScaling>) -> (Vec<f
                     (fs * extrap) * (1.0 - mix) + extrap * mix
                 }
             };
-            cos_h[t * ROPE_PAIRS + j] = f.cos();
-            sin_h[t * ROPE_PAIRS + j] = f.sin();
+            cos_h[t * pairs + j] = f.cos();
+            sin_h[t * pairs + j] = f.sin();
         }
     }
     (cos_h, sin_h)
@@ -203,9 +206,12 @@ pub struct StateSizes {
 }
 
 impl StateSizes {
-    /// all byte counts derived from geometry + context (measured shapes)
-    pub fn plan(context: usize, kv: KvDtype, prompt_chunk: usize) -> StateSizes {
+    /// all byte counts derived from geometry + context (measured shapes); C3: the
+    /// geometry is the model's `Geo`
+    pub fn plan(geo: &Geo, context: usize, kv: KvDtype, prompt_chunk: usize) -> StateSizes {
         let bpv = kv.byte_per_value() as u64;
+        let q = geo.qsa();
+        let (attn_layers, gdn_layers) = (geo.attn_layers, geo.gdn_layers);
         // raw keys are consumed by pool4_cache right after they are appended
         // (the pooled per-block keys are the long-lived cache): a 4-aligned ring
         // of chunk + 4 rows holds every row a chunk can still pool (up to 3 rows
@@ -213,18 +219,36 @@ impl StateSizes {
         let ring = if std::env::var("CROW_QSA_FULL").as_deref() == Ok("1") {
             context
         } else {
-            ((prompt_chunk + QSA_COMPRESS + QSA_COMPRESS - 1) / QSA_COMPRESS * QSA_COMPRESS).min(context)
+            ((prompt_chunk + q.compress + q.compress - 1) / q.compress * q.compress).min(context)
         };
         StateSizes {
-            kv_bytes: (ATTN_LAYERS * 2 * NKV * AHD * context) as u64 * bpv,
-            qsa_keys_bytes: (ATTN_LAYERS * ring * QSA_HIDD) as u64 * 4,
+            kv_bytes: (attn_layers * 2 * geo.kv_heads * geo.head_dim * context) as u64 * bpv,
+            qsa_keys_bytes: (attn_layers * ring * q.hidd()) as u64 * 4,
             qsa_ring_rows: ring,
-            qsa_pooled_bytes: (ATTN_LAYERS * ((context + QSA_COMPRESS - 1) / QSA_COMPRESS) * QSA_HIDD) as u64 * 4,
-            gdn_s_bytes: (GDN_LAYERS * GDN_VHEADS * GD * GD) as u64 * 4,
-            gdn_conv_bytes: (GDN_LAYERS * GDN_CONV * 3) as u64 * 4,
-            rope_bytes: (context * ROPE_PAIRS * 2) as u64 * 4,
+            qsa_pooled_bytes: (attn_layers * ((context + q.compress - 1) / q.compress) * q.hidd()) as u64 * 4,
+            gdn_s_bytes: (gdn_layers * geo.gdn_value_heads * geo.gdn_key_dim * geo.gdn_value_dim) as u64 * 4,
+            gdn_conv_bytes: (gdn_layers * gdn_conv_state_len(geo)) as u64 * 4,
+            rope_bytes: (context * geo.rope_pairs * 2) as u64 * 4,
         }
     }
+}
+
+/// C3: f32 of ONE GDN layer's recurrent state S, `[value heads][key dim][value dim]`
+/// (Flash-Next `[48][128][128]`)
+pub const fn gdn_s_state_len(geo: &Geo) -> usize {
+    geo.gdn_value_heads * geo.gdn_key_dim * geo.gdn_value_dim
+}
+
+/// C3: f32 of ONE GDN layer's causal conv state, `[conv channels][conv_kernel - 1]`
+/// (Flash-Next `[10240][3]`)
+pub const fn gdn_conv_state_len(geo: &Geo) -> usize {
+    geo.gdn_conv() * (geo.conv_kernel - 1)
+}
+
+/// C3: f32 of the PLE dilated conv state (`gen.rs` `Ple::state`), `[residual width][9]`
+/// (Flash-Next `[10240][9]`; the 9 taps are the PLE kernel's own, pinned in kernels.rs)
+pub const fn ple_state_len(geo: &Geo) -> usize {
+    geo.residual_width() * 9
 }
 
 impl StateSizes {
@@ -237,6 +261,8 @@ impl StateSizes {
 }
 
 pub struct ThreeStates {
+    /// C3: the geometry the states were shaped for (a copy of the engine's `Geo`)
+    pub geo: Geo,
     pub context: usize,
     pub kv: KvDtype,
     pub kv_buf: CUdeviceptr,      // [12][2][nkv][t][256] — one accounting
@@ -266,6 +292,7 @@ impl ThreeStates {
     /// slack); the deficit clamps N, the context floor refuses configs.
     pub unsafe fn allocate(
         cfg: &Config,
+        geo: &Geo,
         pending_bytes: u64, // planned but NOT yet resident (dense already sits inside free0)
         expert_bytes_per_n_unit: u64,
         // host side: bytes per hot-set unit in the PINNED tier (record size of a
@@ -278,10 +305,12 @@ impl ThreeStates {
         render_reserve_requested: u64,
     ) -> (ThreeStates, AllocReport) {
         assert!(
-            cfg.context >= CONTEXT_FLOOR,
-            "refusing config: context {} below the 200k floor (spec 0.2)",
-            cfg.context
+            cfg.context >= geo.context_floor,
+            "refusing config: context {} below the {} floor (spec 0.2)",
+            cfg.context,
+            geo.context_floor
         );
+        let q = geo.qsa();
         let mut rep = AllocReport::default();
         let total = cuda::total_vram_bytes();
         let free0 = cuda::free_vram_bytes();
@@ -294,12 +323,13 @@ impl ThreeStates {
         // auto-clamp N with measured numbers, never the context (spec 2.1).
         // TWO-sided: VRAM lowers N, the HOST pinned budget RAISES it (fewer
         // cold experts) — measured host ceiling ~48.5 GB on this machine.
-        let sizes = StateSizes::plan(cfg.context, cfg.kv, cfg.prompt_chunk);
+        let sizes = StateSizes::plan(geo, cfg.context, cfg.kv, cfg.prompt_chunk);
         // the state bytes do not depend on N (the hot-expert count): one plan for the whole clamp loop
         let states_bytes = sizes.total();
         let spare = cfg.adapt.spare; // #17: from the policy in geo.rs, not the env
         let base = ClampInput {
             n_hot: cfg.n_hot,
+            experts: geo.moe().experts,
             states_bytes,
             pending_bytes,
             expert_bytes_per_n_unit,
@@ -344,41 +374,54 @@ impl ThreeStates {
         // ---- allocate (the real allocations ARE the measurement) ----
         let kv_buf = cuda::alloc_zeroed(sizes.kv_bytes as usize);
         rep.lines.push(format!(
-            "KV        {:9.1} MB  (12 layers × 2 kv-heads × 256 × {context} × {})",
+            "KV        {:9.1} MB  ({} layers × {} kv-heads × {} × {context} × {})",
             sizes.kv_bytes as f64 / MIB,
+            geo.attn_layers,
+            geo.kv_heads,
+            geo.head_dim,
             cfg.kv.name(),
             context = cfg.context
         ));
-        let mut qsa_keys = Vec::with_capacity(ATTN_LAYERS);
-        for _ in 0..ATTN_LAYERS {
-            qsa_keys.push(cuda::alloc_zeroed((sizes.qsa_ring_rows * QSA_HIDD * 4) as usize));
+        let mut qsa_keys = Vec::with_capacity(geo.attn_layers);
+        for _ in 0..geo.attn_layers {
+            qsa_keys.push(cuda::alloc_zeroed((sizes.qsa_ring_rows * q.hidd() * 4) as usize));
         }
         rep.lines.push(format!(
-            "QSA keys  {:9.1} MB  (12 layers × {} × 128 f32 — raw-key ring, pooled cache stays full-length)",
+            "QSA keys  {:9.1} MB  ({} layers × {} × {} f32 — raw-key ring, pooled cache stays full-length)",
             sizes.qsa_keys_bytes as f64 / MIB,
-            sizes.qsa_ring_rows
+            geo.attn_layers,
+            sizes.qsa_ring_rows,
+            q.hidd()
         ));
-        let mut qsa_pooled = Vec::with_capacity(ATTN_LAYERS);
-        let cap_blocks = (cfg.context + 3) / 4;
-        for _ in 0..ATTN_LAYERS {
-            qsa_pooled.push(cuda::alloc_zeroed((cap_blocks * QSA_HIDD * 4) as usize));
+        let mut qsa_pooled = Vec::with_capacity(geo.attn_layers);
+        let cap_blocks = cfg.context.div_ceil(q.compress);
+        for _ in 0..geo.attn_layers {
+            qsa_pooled.push(cuda::alloc_zeroed((cap_blocks * q.hidd() * 4) as usize));
         }
         rep.lines.push(format!(
-            "QSA pooled{:9.1} MB  (12 layers × {} blocks × 128 f32)",
+            "QSA pooled{:9.1} MB  ({} layers × {} blocks × {} f32)",
             sizes.qsa_pooled_bytes as f64 / MIB,
-            cap_blocks
+            geo.attn_layers,
+            cap_blocks,
+            q.hidd()
         ));
-        let mut gdn_s = Vec::with_capacity(GDN_LAYERS);
-        for _ in 0..GDN_LAYERS {
-            gdn_s.push(cuda::alloc_zeroed((GDN_VHEADS * GD * GD * 4) as usize));
+        let mut gdn_s = Vec::with_capacity(geo.gdn_layers);
+        for _ in 0..geo.gdn_layers {
+            gdn_s.push(cuda::alloc_zeroed(gdn_s_state_len(geo) * 4));
         }
-        let mut gdn_conv = Vec::with_capacity(GDN_LAYERS);
-        for _ in 0..GDN_LAYERS {
-            gdn_conv.push(cuda::alloc_zeroed((GDN_CONV * 3 * 4) as usize));
+        let mut gdn_conv = Vec::with_capacity(geo.gdn_layers);
+        for _ in 0..geo.gdn_layers {
+            gdn_conv.push(cuda::alloc_zeroed(gdn_conv_state_len(geo) * 4));
         }
         rep.lines.push(format!(
-            "GDN state {:9.1} MB  (36 × S[48][128][128] + conv[10240][3], f32, fixed)",
-            (sizes.gdn_s_bytes + sizes.gdn_conv_bytes) as f64 / MIB
+            "GDN state {:9.1} MB  ({} × S[{}][{}][{}] + conv[{}][{}], f32, fixed)",
+            (sizes.gdn_s_bytes + sizes.gdn_conv_bytes) as f64 / MIB,
+            geo.gdn_layers,
+            geo.gdn_value_heads,
+            geo.gdn_key_dim,
+            geo.gdn_value_dim,
+            geo.gdn_conv(),
+            geo.conv_kernel - 1
         ));
         // ---- RoPE table (#96: the builder is factored out below; None scaling
         // builds the byte-identical table the inline loop always built) ----
@@ -391,32 +434,33 @@ impl ThreeStates {
         if let Some(w) = exceed_training_warning(cfg.context, crate::meta::boot_training_context(), scaling.as_ref()) {
             tracing::warn!(target: "rope", "[rope] {w}");
         }
-        let (cos_h, sin_h) = build_rope_table(cfg.context, scaling.as_ref());
+        let (cos_h, sin_h) = build_rope_table(geo, cfg.context, scaling.as_ref());
         let cos = cuda::to_f32_dev(&cos_h);
         let sin = cuda::to_f32_dev(&sin_h);
         drop(cos_h);
         drop(sin_h);
         rep.lines.push(format!(
-            "RoPE tbl  {:9.1} MB  ({} positions × 32 pairs × cos+sin)",
+            "RoPE tbl  {:9.1} MB  ({} positions × {} pairs × cos+sin)",
             sizes.rope_bytes as f64 / MIB,
-            cfg.context
+            cfg.context,
+            geo.rope_pairs
         ));
         // the armed line: what the config asked for and what was derived from
         // it, next to the table it changed (silent — nothing is armed by default)
         if let Some(s) = scaling.filter(|s| s.kind != crate::meta::RopeKind::Default) {
             let detail = match s.kind {
                 crate::meta::RopeKind::Yarn => {
-                    let (lo, hi) = s.yarn_corr_range(2 * ROPE_PAIRS, 10_000_000f64);
+                    let (lo, hi) = s.yarn_corr_range(2 * geo.rope_pairs, geo.rope_theta);
                     format!(
                         "YaRN: factor {} ({} training positions -> {}), corr dims [{lo}, {hi}] of {} (beta {} / {}), mscale {:.4} on the attention scale",
-                        s.factor, s.original_context, cfg.context, 2 * ROPE_PAIRS, s.beta_fast, s.beta_slow, s.mscale()
+                        s.factor, s.original_context, cfg.context, 2 * geo.rope_pairs, s.beta_fast, s.beta_slow, s.mscale()
                     )
                 }
                 crate::meta::RopeKind::Linear => {
                     format!("linear: factor {} (every pair interpolated by 1/{})", s.factor, s.factor)
                 }
                 crate::meta::RopeKind::NtkAware => {
-                    format!("ntk-aware: theta 1e7 -> {:.0}", s.ntk_base(2 * ROPE_PAIRS, 10_000_000f64))
+                    format!("ntk-aware: theta {:e} -> {:.0}", geo.rope_theta, s.ntk_base(2 * geo.rope_pairs, geo.rope_theta))
                 }
                 crate::meta::RopeKind::Default => unreachable!("filtered above"),
             };
@@ -437,6 +481,7 @@ impl ThreeStates {
 
         (
             ThreeStates {
+                geo: *geo,
                 context: cfg.context,
                 kv: cfg.kv,
                 kv_buf,
@@ -457,10 +502,10 @@ impl ThreeStates {
     pub unsafe fn kv_row_ptr(&self, layer: usize, is_k: bool, kvh: usize, slot: usize) -> u64 {
         let b = (self.kv.byte_per_value()) as u64;
         self.kv_buf as u64
-            + ((layer * 2 + if is_k { 0 } else { 1 }) * NKV * self.context
+            + ((layer * 2 + if is_k { 0 } else { 1 }) * self.geo.kv_heads * self.context
                 + kvh * self.context
                 + slot) as u64
-            * AHD as u64
+            * self.geo.head_dim as u64
             * b
     }
 }
@@ -469,6 +514,8 @@ impl ThreeStates {
 #[derive(Clone, Copy, Debug)]
 pub struct ClampInput {
     pub n_hot: usize,
+    /// C3: routed experts per layer (`Geo::moe().experts`), the ceiling of N
+    pub experts: usize,
     /// `StateSizes::total()`: KV (at the config's dtype) + QSA + GDN + rope
     pub states_bytes: u64,
     pub pending_bytes: u64,
@@ -487,7 +534,8 @@ pub struct ClampInput {
 impl ClampInput {
     /// bytes of the pinned cold tier at hot-set size `n` (the clamp's own formula)
     pub fn cold_at(&self, n: usize) -> u64 {
-        (if self.cold_fixed { E } else { E - n.min(E) + self.spare }) as u64 * self.cold_bytes_per_n_unit
+        let e = self.experts;
+        (if self.cold_fixed { e } else { e - n.min(e) + self.spare }) as u64 * self.cold_bytes_per_n_unit
     }
 }
 
@@ -512,7 +560,7 @@ pub fn clamp_hot_n(c: &ClampInput) -> Result<(usize, Vec<String>), String> {
             break;
         }
         iters += 1;
-        if (went_down && went_up) || iters > 2 * E as u32 {
+        if (went_down && went_up) || iters > 2 * c.experts as u32 {
             // #10b: the message moved into planner_refusal_msg (tested)
             return Err(planner_refusal_msg(c.free0, c.host_pinned_budget));
         }
@@ -702,8 +750,8 @@ pub fn grant_render_reserve(base: &ClampInput, requested: u64) -> Result<Reserve
 fn reserve_binding(base: &ClampInput, r: u64) -> String {
     let gib = |b: u64| b as f64 / GIB;
     let vram_fits = |n: usize| base.states_bytes + base.pending_bytes + r + n as u64 * base.expert_bytes_per_n_unit + SAFETY < base.free0;
-    let n_vram = (N_MIN..=E).rev().find(|&n| vram_fits(n));
-    let n_host = (N_MIN..=E).find(|&n| base.cold_at(n) <= base.host_pinned_budget);
+    let n_vram = (N_MIN..=base.experts).rev().find(|&n| vram_fits(n));
+    let n_host = (N_MIN..=base.experts).find(|&n| base.cold_at(n) <= base.host_pinned_budget);
     match (n_vram, n_host) {
         (None, _) => format!("the VRAM budget binds: even N={N_MIN} does not leave {:.2} GiB free (free {:.2} GiB)", gib(r), gib(base.free0)),
         (Some(v), Some(h)) if v < h => format!(
@@ -908,9 +956,10 @@ mod tests_110 {
     /// a card that lands the planner on N=155 with no render reserve (the #72
     /// serve boot of 2026-09-18: N 160 -> 155), the vit reserve already held
     fn card(render: u64) -> ClampInput {
-        let states = StateSizes::plan(200_000, KvDtype::Fp8E4m3, 2048).total();
+        let states = StateSizes::plan(&Geo::FLASH_NEXT, 200_000, KvDtype::Fp8E4m3, 2048).total();
         ClampInput {
             n_hot: 160,
+            experts: E,
             states_bytes: states,
             pending_bytes: planner_pending(LAUNCH_SLACK, 0, 0, render),
             expert_bytes_per_n_unit: UNIT,
@@ -999,10 +1048,11 @@ mod tests_110_boot {
 
     /// the planner input that lands on N=150 without a reserve (VRAM-bound)
     fn real_card() -> ClampInput {
-        let states = StateSizes::plan(200_000, KvDtype::Fp8E4m3, 2048).total();
+        let states = StateSizes::plan(&Geo::FLASH_NEXT, 200_000, KvDtype::Fp8E4m3, 2048).total();
         let pending = planner_pending(LAUNCH_SLACK, 0, 0, 0);
         ClampInput {
             n_hot: 160,
+            experts: E,
             states_bytes: states,
             pending_bytes: pending,
             expert_bytes_per_n_unit: UNIT,
@@ -1086,8 +1136,8 @@ mod tests_kv_dtype {
 
     #[test]
     fn bf16_kv_is_exactly_twice_fp8_and_nothing_else_moves() {
-        let f = StateSizes::plan(200_000, KvDtype::Fp8E4m3, 2048);
-        let b = StateSizes::plan(200_000, KvDtype::Bf16, 2048);
+        let f = StateSizes::plan(&Geo::FLASH_NEXT, 200_000, KvDtype::Fp8E4m3, 2048);
+        let b = StateSizes::plan(&Geo::FLASH_NEXT, 200_000, KvDtype::Bf16, 2048);
         // 12 layers x 2 (k,v) x 2 kv-heads x 256 x 200000 x 1 B: the 2343.8 MB of the
         // `[budget] KV` line in serve-tf-dense-kv.log
         assert_eq!(f.kv_bytes, 2_457_600_000);
@@ -1103,11 +1153,12 @@ mod tests_kv_dtype {
 
     /// a card sized so that FP8 KV lands on N=155 (the serve-bare boot of MEAS-0923)
     fn card(kv: KvDtype, budget_gib: u64) -> ClampInput {
-        let fp8 = StateSizes::plan(200_000, KvDtype::Fp8E4m3, 2048).total();
+        let fp8 = StateSizes::plan(&Geo::FLASH_NEXT, 200_000, KvDtype::Fp8E4m3, 2048).total();
         let pending = 1 << 30;
         ClampInput {
             n_hot: 160,
-            states_bytes: StateSizes::plan(200_000, kv, 2048).total(),
+            experts: E,
+            states_bytes: StateSizes::plan(&Geo::FLASH_NEXT, 200_000, kv, 2048).total(),
             pending_bytes: pending,
             expert_bytes_per_n_unit: UNIT,
             cold_bytes_per_n_unit: UNIT,
@@ -1216,11 +1267,11 @@ mod tests_96 {
                 sin_ref[t * ROPE_PAIRS + j] = f.sin();
             }
         }
-        let (cos, sin) = build_rope_table(context, None);
+        let (cos, sin) = build_rope_table(&Geo::FLASH_NEXT, context, None);
         assert_eq!(cos, cos_ref, "the default cos table moved");
         assert_eq!(sin, sin_ref, "the default sin table moved");
         // a present-but-"default" rope_scaling object configures nothing: same bytes
-        let (c2, s2) = build_rope_table(context, Some(&scaling(RopeKind::Default)));
+        let (c2, s2) = build_rope_table(&Geo::FLASH_NEXT, context, Some(&scaling(RopeKind::Default)));
         assert_eq!(c2, cos_ref, "a default rope_scaling must not move the table");
         assert_eq!(s2, sin_ref, "a default rope_scaling must not move the table");
     }
@@ -1233,8 +1284,8 @@ mod tests_96 {
     fn yarn_extrapolates_low_pairs_and_interpolates_high_ones() {
         let s = scaling(RopeKind::Yarn);
         assert_eq!(s.yarn_corr_range(64, 1e7), (14.0, 22.0), "corr dims for dim 64 / base 1e7 / 262144 ctx / beta 32+1");
-        let (cos_y, _) = build_rope_table(1024, Some(&s));
-        let (cos_0, _) = build_rope_table(1024, None);
+        let (cos_y, _) = build_rope_table(&Geo::FLASH_NEXT, 1024, Some(&s));
+        let (cos_0, _) = build_rope_table(&Geo::FLASH_NEXT, 1024, None);
         for t in [0usize, 1, 100, 1023] {
             // j <= 14: ramp 1 -> pure extrapolation -> identical bytes
             for j in [0usize, 7, 13, 14] {
@@ -1272,14 +1323,14 @@ mod tests_96 {
     /// the theta the pairs are computed from
     #[test]
     fn linear_scales_every_pair_and_ntk_rewrites_the_base() {
-        let (cos_l, _) = build_rope_table(64, Some(&scaling(RopeKind::Linear)));
-        let (cos_0, _) = build_rope_table(64, None);
+        let (cos_l, _) = build_rope_table(&Geo::FLASH_NEXT, 64, Some(&scaling(RopeKind::Linear)));
+        let (cos_0, _) = build_rope_table(&Geo::FLASH_NEXT, 64, None);
         let (t, j) = (63usize, 0usize);
         assert_eq!(cos_l[t * ROPE_PAIRS + j], (63f32 * 0.25f32).cos(), "linear: even pair 0 interpolates");
         assert_ne!(cos_l[t * ROPE_PAIRS + j], cos_0[t * ROPE_PAIRS + j]);
         let s = scaling(RopeKind::NtkAware);
         let b = s.ntk_base(64, 1e7) as f32;
-        let (cos_n, _) = build_rope_table(64, Some(&s));
+        let (cos_n, _) = build_rope_table(&Geo::FLASH_NEXT, 64, Some(&s));
         // pair 31 at t=63 is NOT a usable witness for the base rewrite: both
         // angles are ~1e-5 rad and f32 cos rounds both to exactly 1.0. Pair 8
         // has base^(-0.25) scale angles O(1) rad, where the rewrite is visible.

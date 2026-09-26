@@ -42,7 +42,7 @@ fn main() {
     // (e.g. a sidecar warmed on real traffic via `decode warmup`)
     // defaults (#48): the production -M container and the id-sorted rectangular
     // sidecar serve.rs loads, both relative to engine/, the cwd of `decode`
-    let (mut cnq, _ctx, mut cfg, cnq_path, sidecar) = unsafe {
+    let (mut cnq, _ctx, mut cfg, cnq_path, sidecar, geo) = unsafe {
         boot::open_model(from_engine_dir(DEFAULT_CNQ), from_engine_dir(DEFAULT_HOTSETS))
     };
 
@@ -76,7 +76,7 @@ fn main() {
                 }
                 std::fs::create_dir_all(&out).unwrap();
                 let mut eng =
-                    Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
                 println!("decode/parity: {} prompt tokens ({} prefilled, {} teacher-forced), collecting all logits …",
                     ids.len(), tf_split, ids.len() - tf_split);
                 let mut logits = Vec::new();
@@ -144,7 +144,7 @@ fn main() {
                 crow_nest_engine::geo::apply_chunk_policy(&mut cfg, ids.len());
                 std::fs::create_dir_all("decode_out").unwrap();
                 let mut eng =
-                    Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
                 println!("decode/run: {} prompt tokens → {gen} steps", ids.len());
                 // #13: the operating point as ONE structured line on target `boot`
                 // (stderr + the log file), so every number this run prints has the
@@ -215,7 +215,7 @@ fn main() {
                     }
                 }
                 let stop_eos = crow_nest_engine::sample::stop_on_eos();
-                let mut stopped_eos = stop_eos && crow_nest_engine::sample::EOS_IDS.contains(&next);
+                let mut stopped_eos = stop_eos && geo.eos_ids.contains(&next);
                 // CROW_ADAPT_EVERY=K: re-cut the hot set from the cumulative routing
                 // every K decode tokens (<= CROW_ADAPT_MAX swaps per layer, default 8);
                 // the swap time is charged to that token's latency (amortized cost)
@@ -249,7 +249,7 @@ fn main() {
                     }
                     lat.push(t0.elapsed().as_secs_f64() * 1e3);
                     trace.push(next);
-                    if stop_eos && crow_nest_engine::sample::EOS_IDS.contains(&next) {
+                    if stop_eos && geo.eos_ids.contains(&next) {
                         stopped_eos = true;
                     }
                 }
@@ -322,7 +322,7 @@ fn main() {
                 std::env::set_var("CROW_ROUTE_DUMP", "1");
                 std::env::set_var("CROW_GRAPH", "0");
                 let mut eng =
-                    Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
                 let t0 = std::time::Instant::now();
                 let mut next = eng.prefill(&mut cnq, &ids, None);
                 println!("routestats: prefill {} tokens in {:.1} s", ids.len(), t0.elapsed().as_secs_f64());
@@ -358,7 +358,7 @@ fn main() {
                 cfg.n_hot = n;
                 let even: [[u64; E]; LAYERS] = [[1u64; E]; LAYERS];
                 let mut eng =
-                    Engine::load(&mut cnq, cfg, Some(&even), &out, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, Some(&even), &out, false, &mut |m| println!("[load] {m}"));
                 println!("warmup: prefill over {} real tokens (chunk {}) …", ids.len(), cfg.prompt_chunk);
                 let t0 = std::time::Instant::now();
                 let _ = eng.prefill(&mut cnq, &ids, None);
@@ -398,7 +398,7 @@ fn main() {
                 println!("reloadcheck: free VRAM before any load {:.1} MB", f0 as f64 / 1e6);
                 for i in 0..n {
                     let mut eng =
-                        Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |_| {});
+                        Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |_| {});
                     let ids = [760i64, 3841, 13477, 37550, 33075, 888, 279, 15217];
                     let mut next = eng.prefill(&mut cnq, &ids, None);
                     for _ in 0..3 {
@@ -417,7 +417,7 @@ fn main() {
                 // oracle/golden/layer0-input.f32, run layer 0, compare to
                 // oracle/golden/layer0-golden-output.f32
                 let mut eng =
-                    Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
                 let inp = std::fs::read("../oracle/golden/layer0-input.f32").unwrap();
                 let gold = std::fs::read("../oracle/golden/layer0-golden-output.f32").unwrap();
                 let t = 8usize;
@@ -445,7 +445,7 @@ fn main() {
                 // Reference marks (p16, all-proj FP4 vs this golden): rel_L2
                 // 0.165, max_abs 0.582 — the "expected bad" FP4 attention delta.
                 let mut eng =
-                    Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
                 let to_f32 = |b: &[u8]| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>();
                 let inp = std::fs::read("../oracle/golden/layer3-attn-input.f32").unwrap();
                 let gold = std::fs::read("../oracle/golden/layer3-attn-output.f32").unwrap();
@@ -601,7 +601,7 @@ fn main() {
                 let dumps = std::env::temp_dir().join("crow-selftest-stage");
                 let dumps = dumps.to_string_lossy().into_owned();
                 let mut eng =
-                    Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
                 let mut pass = 0usize;
                 for c in &checks {
                     let x = read_f32_exact(&format!("{dir}/{}", c.input), c.t, c.input_width)

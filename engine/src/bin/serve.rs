@@ -4453,7 +4453,7 @@ fn chat_generate(
                         String::from_utf8_lossy(&tk.token_bytes(next as u32)));
                 }
             }
-            if EOS_IDS.contains(&next) {
+            if srv.eng.geo.eos_ids.contains(&next) {
                 finish = "stop";
                 break;
             }
@@ -5682,7 +5682,7 @@ fn main() {
     }
 
     // unsafe: creates the CUDA context; it must outlive every device allocation
-    let (mut cnq, _ctx, mut cfg, cnq_path, sidecar) = unsafe {
+    let (mut cnq, _ctx, mut cfg, cnq_path, sidecar, geo) = unsafe {
         boot::open_model(DEFAULT_CNQ.into(), DEFAULT_HOTSETS.into())
     };
     // M1: chunk pinned for the process, no per prompt policy
@@ -5691,7 +5691,7 @@ fn main() {
 
     // unsafe: pins device and host memory; takes engine/.engine.lock, a second serve dies here
     let eng = unsafe {
-        Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| tracing::info!(target: "load", "[load] {m}"))
+        Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |m| tracing::info!(target: "load", "[load] {m}"))
     };
     let n_ctx = eng.n_ctx();
     let prompt_chunk = eng.cfg.prompt_chunk;

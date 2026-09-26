@@ -40,7 +40,7 @@
 use crate::cuda::{self, CUdeviceptr as Dev};
 use crate::weights::{dequant_fp4_dev, load_fp4, Fp4};
 use crate::kernels::{launch_v, Kernels};
-use crate::{cnq::Cnq, geo::{H, MIB}};
+use crate::{cnq::Cnq, geo::{Geo, MIB}};
 
 /// the `<|image_pad|>` token (tokenizer_config.json added_tokens_decoder)
 pub const IMAGE_PAD: i64 = 248056;
@@ -180,13 +180,15 @@ pub const VIT_SCRATCH_BUFFERS: usize = 12;
 
 /// bytes of the tower scratch at a patch cap — the twelve buffers
 /// `ensure_scratch` takes, counted from the same geometry the allocator uses
-/// (58,496 B per patch: 4096 patches = 228.5 MiB, 5120 = 285.6 MiB)
-pub const fn scratch_bytes_for(cap: usize) -> usize {
+/// (58,496 B per patch: 4096 patches = 228.5 MiB, 5120 = 285.6 MiB). C3:
+/// `out_hidden` is the merger's output width, the model's `Geo::vision_out`
+/// (2560 on Flash-Next)
+pub const fn scratch_bytes_for(cap: usize, out_hidden: usize) -> usize {
     let elems = cap * VIT_HIDDEN * 3   // x, normed, attn
         + cap * VIT_QKV
         + cap * VIT_INTER
         + cap / 4 * VIT_MERGED
-        + cap / 4 * H
+        + cap / 4 * out_hidden
         + cap * VIT_IN
         + cap * 8                      // pe_idx + pe_w
         + cap * VIT_ROT * 2;           // cs + sn
@@ -195,7 +197,7 @@ pub const fn scratch_bytes_for(cap: usize) -> usize {
 
 /// #117: the twelve scratch buffers at a patch cap, `(name, bytes)`, in the
 /// order `ensure_scratch_named` takes them; they sum to `scratch_bytes_for`
-pub const fn scratch_buffer_bytes(cap: usize) -> [(&'static str, usize); VIT_SCRATCH_BUFFERS] {
+pub const fn scratch_buffer_bytes(cap: usize, out_hidden: usize) -> [(&'static str, usize); VIT_SCRATCH_BUFFERS] {
     [
         ("vit x", cap * VIT_HIDDEN * 4),
         ("vit normed", cap * VIT_HIDDEN * 4),
@@ -203,7 +205,7 @@ pub const fn scratch_buffer_bytes(cap: usize) -> [(&'static str, usize); VIT_SCR
         ("vit attn", cap * VIT_HIDDEN * 4),
         ("vit mlp", cap * VIT_INTER * 4),
         ("vit m1", cap / 4 * VIT_MERGED * 4),
-        ("vit out", cap / 4 * H * 4),
+        ("vit out", cap / 4 * out_hidden * 4),
         ("vit patches", cap * VIT_IN * 4),
         ("vit pe_idx", cap * 4 * 4),
         ("vit pe_w", cap * 4 * 4),
@@ -213,14 +215,15 @@ pub const fn scratch_buffer_bytes(cap: usize) -> [(&'static str, usize); VIT_SCR
 }
 
 /// the scratch at this process's cap (`budget().max_patches()`)
-pub fn scratch_bytes() -> usize {
-    scratch_bytes_for(budget().max_patches())
+pub fn scratch_bytes(out_hidden: usize) -> usize {
+    scratch_bytes_for(budget().max_patches(), out_hidden)
 }
 
 /// bytes of the interleaved-mrope span tables at their widest: the whole
 /// context, cos and sin, exactly the shape `Engine::begin_vision` allocates
-pub const fn mrope_bytes(context: usize) -> usize {
-    context * crate::geo::ROPE_PAIRS * 2 * 4
+/// (C3: `rope_pairs` = the model's `Geo::rope_pairs`)
+pub const fn mrope_bytes(context: usize, rope_pairs: usize) -> usize {
+    context * rope_pairs * 2 * 4
 }
 
 /// The VRAM the PLANNER sets aside for the image path when the tower is loaded
@@ -238,32 +241,33 @@ pub const fn mrope_bytes(context: usize) -> usize {
 /// `CROW_VIT_RESERVE_MB` replaces the derived value (0 = no reserve, the
 /// pre-TASK-K behaviour, for a measurement that wants the old N back).
 /// `CROW_VIT=0` never calls this at all.
-pub fn reserve_bytes(context: usize) -> u64 {
+pub fn reserve_bytes(geo: &Geo, context: usize) -> u64 {
     if let Some(mb) = crate::geo::env_parse::<u64>("CROW_VIT_RESERVE_MB") {
         return mb << 20;
     }
-    (scratch_bytes() + mrope_bytes(context)) as u64
+    (scratch_bytes(geo.vision_out()) + mrope_bytes(context, geo.rope_pairs)) as u64
 }
 
 /// the `[budget]` line's own words for what `reserve_bytes` covers; with
 /// `CROW_VIT_RESERVE_MB` set it names the override AND what the derived value
 /// would have been, so a log that shows a bigger N still says what paid for it
-pub fn reserve_line(context: usize, held: u64) -> String {
+pub fn reserve_line(geo: &Geo, context: usize, held: u64) -> String {
     let mib = |b: usize| b as f64 / MIB;
-    let derived = (scratch_bytes() + mrope_bytes(context)) as f64 / MIB;
+    let (scratch, mrope) = (scratch_bytes(geo.vision_out()), mrope_bytes(context, geo.rope_pairs));
+    let derived = (scratch + mrope) as f64 / MIB;
     let basis = match crate::geo::env_parse::<u64>("CROW_VIT_RESERVE_MB") {
         Some(_) => format!("CROW_VIT_RESERVE_MB, derived would be {derived:.1} MB"),
         None => format!(
             "tower scratch {:.1} + mrope span {:.1}",
-            mib(scratch_bytes()),
-            mib(mrope_bytes(context))
+            mib(scratch),
+            mib(mrope)
         ),
     };
     // #72: what the planner still has to SET ASIDE, now that the tower scratch and
     // the mrope span are taken at boot. With the derived reserve the two are the
     // same number and nothing is pending; a bigger CROW_VIT_RESERVE_MB pads the
     // plan by the difference, a smaller one is already covered by what is held.
-    let pending = reserve_bytes(context).saturating_sub(held);
+    let pending = reserve_bytes(geo, context).saturating_sub(held);
     let state = if held == 0 {
         "lazy, allocated on the first image request".to_string()
     } else if pending == 0 {
@@ -273,7 +277,7 @@ pub fn reserve_line(context: usize, held: u64) -> String {
     };
     format!(
         "vit reserve {:9.1} MB  ({basis}, CROW_VIT on) — {state}",
-        reserve_bytes(context) as f64 / MIB
+        reserve_bytes(geo, context) as f64 / MIB
     )
 }
 
@@ -407,8 +411,8 @@ pub enum MmKind {
 /// `v.post_ln` = merger.norm, `mm.0`/`mm.2` = merger.linear_fc1/fc2, the Conv3d
 /// patch kernel split along its temporal axis into `v.patch_embd.weight`
 /// (t = 0) and `v.patch_embd.weight.1` (t = 1), `v.position_embd.weight` F32.
-pub fn mmproj_plan() -> Vec<(String, Vec<u64>, MmKind, String)> {
-    let (h, i, q, m, o) = (VIT_HIDDEN as u64, VIT_INTER as u64, VIT_QKV as u64, VIT_MERGED as u64, H as u64);
+pub fn mmproj_plan(out_hidden: usize) -> Vec<(String, Vec<u64>, MmKind, String)> {
+    let (h, i, q, m, o) = (VIT_HIDDEN as u64, VIT_INTER as u64, VIT_QKV as u64, VIT_MERGED as u64, out_hidden as u64);
     let p = VIT_PATCH as u64;
     let mut v: Vec<(String, Vec<u64>, MmKind, String)> = vec![
         ("v.patch_embd.weight".into(), vec![p, p, 3, h], MmKind::Linear, "model.visual.patch_embed.proj.weight".into()),
@@ -447,7 +451,7 @@ pub fn mmproj_plan() -> Vec<(String, Vec<u64>, MmKind, String)> {
 /// geometry keys this tower is built for, then every tensor of `mmproj_plan`
 /// present with its exact dims and type (Linear = F16, F32 = F32). A file that
 /// fails any of it is NOT loaded - the boot falls back to the container, loudly.
-pub fn validate_mmproj(g: &crate::gguf::Gguf) -> Result<(), String> {
+pub fn validate_mmproj(g: &crate::gguf::Gguf, out_hidden: usize) -> Result<(), String> {
     use crate::gguf::{GGML_TYPE_F16, GGML_TYPE_F32};
     let want_str = [("clip.projector_type", "qwen3vl_merger")];
     for (k, v) in want_str {
@@ -463,14 +467,14 @@ pub fn validate_mmproj(g: &crate::gguf::Gguf) -> Result<(), String> {
         ("clip.vision.attention.head_count", VIT_HEADS as u64),
         ("clip.vision.patch_size", VIT_PATCH as u64),
         ("clip.vision.spatial_merge_size", VIT_MERGE as u64),
-        ("clip.vision.projection_dim", H as u64),
+        ("clip.vision.projection_dim", out_hidden as u64),
     ];
     for (k, v) in want_u {
         if g.kv_u64(k) != Some(v) {
             return Err(format!("{}: {k} is {:?}, the tower needs {v}", g.path, g.kv_u64(k)));
         }
     }
-    for (name, dims, kind, _) in mmproj_plan() {
+    for (name, dims, kind, _) in mmproj_plan(out_hidden) {
         let t = g.find(&name).ok_or_else(|| format!("{}: tensor {name} missing", g.path))?;
         if t.dims != dims {
             return Err(format!("{}: tensor {name} dims {:?}, expected {dims:?}", g.path, t.dims));
@@ -529,9 +533,9 @@ impl VitW {
     /// llama.cpp's F16 projector when the file is there and passes
     /// `validate_mmproj`, else the container's NVFP4 section (the fallback,
     /// named on the `[vit]` boot line with its reason).
-    pub unsafe fn load(cnq: &mut Cnq) -> VitW {
+    pub unsafe fn load(cnq: &mut Cnq, out_hidden: usize) -> VitW {
         match mmproj_source(&cnq.path) {
-            VitSource::Mmproj(path) => match crate::gguf::Gguf::open(&path).and_then(|g| validate_mmproj(&g).map(|_| g)) {
+            VitSource::Mmproj(path) => match crate::gguf::Gguf::open(&path).and_then(|g| validate_mmproj(&g, out_hidden).map(|_| g)) {
                 Ok(g) => VitW::load_mmproj(&g),
                 Err(why) => {
                     tracing::error!(target: "vit", "[vit] the F16 projector is NOT used: {why} - falling back to the container's NVFP4 vit section");
@@ -648,6 +652,8 @@ impl VitW {
 pub struct Vit {
     pub w: VitW,
     pub cap: usize,
+    /// C3: the merger's output width, the model's `Geo::vision_out` (2560 on Flash-Next)
+    pub out_hidden: usize,
     /// #VIT cache: image-bytes hash -> (grid, n_visual, tower embeddings on
     /// the host). A conversation that re-sends its whole history (Crow does,
     /// base64 and all) pays for each picture ONCE per process, not per turn.
@@ -705,11 +711,12 @@ impl Vit {
     /// post-plan allocations, and robin's first image request found 35.7 MiB
     /// free. `Engine::load` now calls `arm_scratch` right after this, so the
     /// reserve is held; the lazy path stays as the fallback (`CROW_VIT_RESERVE_MB=0`).
-    pub unsafe fn new(cnq: &mut Cnq) -> Vit {
-        let w = VitW::load(cnq);
+    pub unsafe fn new(cnq: &mut Cnq, out_hidden: usize) -> Vit {
+        let w = VitW::load(cnq, out_hidden);
         Vit {
             w,
             cap: budget().max_patches(),
+            out_hidden,
             x: 0,
             normed: 0,
             qkv: 0,
@@ -837,7 +844,7 @@ impl Vit {
         self.attn = alloc4("the vit attention output", cap * VIT_HIDDEN, &mut taken);
         self.mlp = alloc4("the vit block MLP scratch", cap * VIT_INTER, &mut taken);
         self.m1 = alloc4("the vit merger fc1 output", cap / 4 * VIT_MERGED, &mut taken);
-        self.out = alloc4("the vit visual embeddings", cap / 4 * H, &mut taken);
+        self.out = alloc4("the vit visual embeddings", cap / 4 * self.out_hidden, &mut taken);
         self.patches = alloc4("the vit patch input", cap * VIT_IN, &mut taken);
         self.pe_idx = alloc4("the vit position taps", cap * 4, &mut taken);
         self.pe_w = alloc4("the vit position tap weights", cap * 4, &mut taken);
@@ -847,10 +854,10 @@ impl Vit {
         cuda::to_i32_into(self.s[S_BIAS_QKV], &[VIT_QKV as i32]);
         cuda::to_i32_into(self.s[S_BIAS_INTER], &[VIT_INTER as i32]);
         cuda::to_i32_into(self.s[S_BIAS_MERGED], &[VIT_MERGED as i32]);
-        cuda::to_i32_into(self.s[S_BIAS_H], &[H as i32]);
+        cuda::to_i32_into(self.s[S_BIAS_H], &[self.out_hidden as i32]);
         cuda::sync();
         self.scratch = true;
-        debug_assert_eq!(bytes, scratch_bytes(), "scratch_bytes() and ensure_scratch disagree");
+        debug_assert_eq!(bytes, scratch_bytes(self.out_hidden), "scratch_bytes() and ensure_scratch disagree");
         tracing::info!(target: "vit", "[vit] tower scratch {how}: {:.1} MiB at cap {} patches ({} buffers + {} scalars)",
             bytes as f64 / MIB, cap, VIT_SCRATCH_BUFFERS, scalars.len());
     }
@@ -980,7 +987,7 @@ impl Vit {
         self.bias(k, self.w.m_fc1_b, S_BIAS_MERGED, nv, self.m1);
         launch_v(k.f("gelu_erf"), ((nv * VIT_MERGED + 255) / 256) as u32, 1, 1, 256, &[
             self.m1, self.s[S_NMERGE]]);
-        self.gemv(k, &self.w.m_fc2, H, S_KD_MERGED, S_BIAS_H, nv, self.m1, self.out);
+        self.gemv(k, &self.w.m_fc2, self.out_hidden, S_KD_MERGED, S_BIAS_H, nv, self.m1, self.out);
         self.bias(k, self.w.m_fc2_b, S_BIAS_H, nv, self.out);
         // #73: the tower is ASYNC. Every launch above went to `cuda::cur_stream()`,
         // and the only reader of `self.out` is the blocking `cuMemcpyDtoH_v2` in
@@ -1575,7 +1582,7 @@ impl Vit {
             let p = prep_image(bytes)
                 .map_err(|e| format!("image {i}: {e}"))?;
             let out = self.run(k, &p.patches, &p.pe_idx, &p.pe_w, &p.cs, &p.sn, p.n_patches);
-            let rows = cuda::dtoh(out, p.n_visual * H);
+            let rows = cuda::dtoh(out, p.n_visual * self.out_hidden);
             if let Some(dir) = &dump {
                 f32_file(&format!("{dir}/img{i}.patches.f32"), &p.patches);
                 f32_file(&format!("{dir}/img{i}.pe-w.f32"), &p.pe_w);
@@ -1649,34 +1656,35 @@ mod reserve {
     //! `debug_assert_eq!` at the end of `ensure_scratch` is what keeps `scratch_bytes`
     //! tied to the twelve allocations it counts.
     use super::*;
+    use crate::geo::H;
 
     #[test]
     fn the_scratch_is_the_twelve_buffers_the_allocator_takes() {
         // x + normed + attn: 3 x 4096 x 1152, qkv 4096 x 3456, mlp 4096 x 4304,
         // m1 1024 x 4608, out 1024 x 2560, patches 4096 x 1536, pe_idx + pe_w 2 x 16384,
         // cs + sn 2 x 4096 x 36 - all f32 (the pre-#107 cap, 1024 tokens)
-        assert_eq!(scratch_bytes_for(4096), 239_599_616);
+        assert_eq!(scratch_bytes_for(4096, H), 239_599_616);
         // 58,496 B per patch; the default cap 1280 tokens = 5120 patches = 285.6 MiB
-        assert_eq!(scratch_bytes_for(5120), 299_499_520);
+        assert_eq!(scratch_bytes_for(5120, H), 299_499_520);
         assert_eq!(VitBudget::DEFAULT.max_patches(), 5120);
-        assert_eq!(scratch_bytes(), scratch_bytes_for(budget().max_patches()));
+        assert_eq!(scratch_bytes(H), scratch_bytes_for(budget().max_patches(), H));
     }
 
     /// the span tables are `n_ctx` rows since serve clamps the budget before arming them
     #[test]
     fn the_mrope_span_is_the_whole_context_cos_and_sin() {
-        assert_eq!(mrope_bytes(200_000), 51_200_000);
-        assert_eq!(mrope_bytes(262_144), 67_108_864);
+        assert_eq!(mrope_bytes(200_000, 32), 51_200_000);
+        assert_eq!(mrope_bytes(262_144, 32), 67_108_864);
     }
 
     #[test]
     fn the_reserve_is_the_sum_and_the_budget_line_names_its_parts() {
         let ctx = 200_000;
         assert_eq!(
-            reserve_bytes(ctx),
-            (scratch_bytes() + mrope_bytes(ctx)) as u64
+            reserve_bytes(&Geo::FLASH_NEXT, ctx),
+            (scratch_bytes(H) + mrope_bytes(ctx, 32)) as u64
         );
-        let line = reserve_line(ctx, 0);
+        let line = reserve_line(&Geo::FLASH_NEXT, ctx, 0);
         assert!(line.starts_with("vit reserve"), "the [budget] label moved: {line}");
         assert!(line.contains("334.5 MB"), "the reserve total moved: {line}");
         assert!(line.contains("tower scratch 285.6"), "the scratch part moved: {line}");
@@ -1690,9 +1698,9 @@ mod reserve {
     #[test]
     fn the_held_bytes_are_the_whole_derived_reserve_and_nothing_stays_pending() {
         for ctx in [200_000usize, 262_144] {
-            let held = (scratch_bytes() + mrope_bytes(ctx)) as u64;
-            assert_eq!(held, reserve_bytes(ctx), "ctx {ctx}: the hold is not the reserve");
-            assert_eq!(reserve_bytes(ctx).saturating_sub(held), 0, "ctx {ctx}: bytes left pending");
+            let held = (scratch_bytes(H) + mrope_bytes(ctx, 32)) as u64;
+            assert_eq!(held, reserve_bytes(&Geo::FLASH_NEXT, ctx), "ctx {ctx}: the hold is not the reserve");
+            assert_eq!(reserve_bytes(&Geo::FLASH_NEXT, ctx).saturating_sub(held), 0, "ctx {ctx}: bytes left pending");
         }
         // the twelve buffers, each counted from the geometry ensure_scratch uses
         let cap = budget().max_patches();
@@ -1710,7 +1718,7 @@ mod reserve {
             cap * VIT_ROT,         // cs
             cap * VIT_ROT,         // sn
         ];
-        assert_eq!(buffers.iter().sum::<usize>() * 4, scratch_bytes());
+        assert_eq!(buffers.iter().sum::<usize>() * 4, scratch_bytes(H));
     }
 
     /// #72 gate 2: the `[budget]` line says HELD once the loader holds it, and
@@ -1718,13 +1726,13 @@ mod reserve {
     #[test]
     fn the_budget_line_says_whether_the_reserve_is_held_or_only_planned() {
         let ctx = 200_000;
-        let held = reserve_line(ctx, reserve_bytes(ctx));
+        let held = reserve_line(&Geo::FLASH_NEXT, ctx, reserve_bytes(&Geo::FLASH_NEXT, ctx));
         assert!(held.contains("HELD at boot"), "the held wording moved: {held}");
         assert!(held.contains("nothing left pending"), "the pending clause moved: {held}");
-        let lazy = reserve_line(ctx, 0);
+        let lazy = reserve_line(&Geo::FLASH_NEXT, ctx, 0);
         assert!(lazy.contains("lazy, allocated on the first image request"), "the lazy wording moved: {lazy}");
         // a bigger override pads the plan by the difference, and says so
-        let part = reserve_line(ctx, scratch_bytes() as u64);
+        let part = reserve_line(&Geo::FLASH_NEXT, ctx, scratch_bytes(H) as u64);
         assert!(part.contains("48.8 MB pending"), "the partial-hold wording moved: {part}");
     }
 }
@@ -2175,6 +2183,7 @@ mod budget_and_mmproj {
     //! #107 and #108: the resize window, the projector file
     //! choice and the projector layout, all host-side (no GPU).
     use super::*;
+    use crate::geo::H;
     use crate::gguf::{self, Gguf, GGML_TYPE_F16, GGML_TYPE_F32};
 
     const OLD: VitBudget = VitBudget { min_tokens: 64, max_tokens: 1024 };
@@ -2305,7 +2314,7 @@ mod budget_and_mmproj {
                 }
             }
         }
-        let plan = mmproj_plan();
+        let plan = mmproj_plan(H);
         let tensors: Vec<(&str, Vec<u64>, u32, Vec<u8>)> = plan
             .iter()
             .filter(|(n, ..)| Some(n.as_str()) != drop)
@@ -2323,20 +2332,20 @@ mod budget_and_mmproj {
 
     #[test]
     fn the_projector_layout_is_checked_before_a_byte_is_loaded() {
-        let plan = mmproj_plan();
+        let plan = mmproj_plan(H);
         assert_eq!(plan.len(), 334, "the unsloth file carries 334 tensors");
         assert_eq!(plan.iter().filter(|e| e.2 == MmKind::Linear).count(), 27 * 4 + 2 + 2);
         let names: std::collections::BTreeSet<_> = plan.iter().map(|e| e.0.clone()).collect();
         assert_eq!(names.len(), 334);
         let targets: std::collections::BTreeSet<_> = plan.iter().map(|e| e.3.clone()).collect();
         assert_eq!(targets.len(), 333, "the container's vit section has 333 tensors");
-        assert_eq!(validate_mmproj(&header(None, None, None)), Ok(()));
-        let e = validate_mmproj(&header(Some(("clip.vision.block_count", 26)), None, None)).unwrap_err();
+        assert_eq!(validate_mmproj(&header(None, None, None), H), Ok(()));
+        let e = validate_mmproj(&header(Some(("clip.vision.block_count", 26)), None, None), H).unwrap_err();
         assert!(e.contains("block_count"), "{e}");
-        let e = validate_mmproj(&header(None, Some("v.blk.13.ffn_down.weight"), None)).unwrap_err();
+        let e = validate_mmproj(&header(None, Some("v.blk.13.ffn_down.weight"), None), H).unwrap_err();
         assert!(e.contains("v.blk.13.ffn_down.weight missing"), "{e}");
         // fc2 stored transposed (rows and k swapped) must not load
-        let e = validate_mmproj(&header(None, None, Some(("v.blk.0.ffn_down.weight", vec![1152, 4304])))).unwrap_err();
+        let e = validate_mmproj(&header(None, None, Some(("v.blk.0.ffn_down.weight", vec![1152, 4304]))), H).unwrap_err();
         assert!(e.contains("dims"), "{e}");
     }
 
@@ -2370,7 +2379,7 @@ mod budget_and_mmproj {
         };
         let g = Gguf::open(&p).unwrap();
         assert_eq!(g.tensors.len(), 334);
-        validate_mmproj(&g).unwrap();
+        validate_mmproj(&g, H).unwrap();
     }
 
     /// cos(container NVFP4 dequant, mmproj F16) per tensor: a mapping or
@@ -2396,7 +2405,7 @@ mod budget_and_mmproj {
         };
         let raw = |name: &str| g.read_raw(g.find(name).unwrap()).unwrap();
         let mut worst = (1.0f64, String::new());
-        for (gname, dims, kind, cname) in mmproj_plan() {
+        for (gname, dims, kind, cname) in mmproj_plan(H) {
             if gname == "v.patch_embd.weight.1" {
                 continue;
             }
@@ -2633,12 +2642,13 @@ mod image_identity {
 #[cfg(test)]
 mod tests_117 {
     use super::*;
+    use crate::geo::H;
 
     #[test]
     fn the_twelve_buffers_sum_to_the_scratch_bytes() {
         for cap in [4096usize, 5120] {
-            let sum: usize = scratch_buffer_bytes(cap).iter().map(|&(_, b)| b).sum();
-            assert_eq!(sum, scratch_bytes_for(cap), "cap {cap}");
+            let sum: usize = scratch_buffer_bytes(cap, H).iter().map(|&(_, b)| b).sum();
+            assert_eq!(sum, scratch_bytes_for(cap, H), "cap {cap}");
         }
     }
 }

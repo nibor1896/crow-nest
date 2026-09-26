@@ -1016,6 +1016,10 @@ pub fn pos_logprobs(row: &[f32], chosen: usize, n: usize) -> PosLogprobs {
 /// EOS ids of the checkpoint (generation_config): `<|im_end|>` and
 /// `<|endoftext|>`. The second one is `geo::PLE_EOS` - the PLE shard reader's
 /// end marker and the sampler's stop id are the SAME token, written once.
+///
+/// Crow #300 C3: this is the Flash-Next PIN (the `meta` expected-values row and
+/// `Geo::FLASH_NEXT.eos_ids` are checked against it). The generation loops stop on
+/// the loaded model's own ids, `Engine::geo.eos_ids`, never on this const.
 pub const EOS_IDS: [usize; 2] = [248046, crate::geo::PLE_EOS as usize];
 
 /// the same two ids as i64, for the callers that compare a signed id

@@ -396,6 +396,11 @@ pub struct Scratch {
 }
 
 pub struct Engine {
+    /// Crow #300 C3: the runtime geometry of the loaded model, owned here the way
+    /// llama.cpp's `llama_model` owns its `hparams`. `Engine::load` takes it from
+    /// the boot (`boot::open_model` -> `meta::assert_pinned`); every host site reads
+    /// its numbers from this field (the kernels still pin Flash-Next until C4)
+    pub geo: Geo,
     k: Kernels,
     module: cuda::Module, // #18: kept so Drop can unload it after every kernel user is gone
     pub(crate) st: ThreeStates,
@@ -919,6 +924,7 @@ impl Engine {
     /// `warmup_counts` feeds warm-up promotion when no sidecar exists yet.
     pub unsafe fn load(
         cnq: &mut Cnq,
+        geo: Geo,
         mut cfg: Config,
         warmup_counts: Option<&[[u64; E]; LAYERS]>,
         sidecar_path: &str,
@@ -1044,16 +1050,16 @@ impl Engine {
         if crate::vit::vit_on() {
             let _ = crate::vit::budget();
         }
-        let vit_hold = crate::vit::reserve_bytes(cfg.context) > 0;
+        let vit_hold = crate::vit::reserve_bytes(&geo, cfg.context) > 0;
         let mut vit_scratch_held = 0u64;
         let vit = if crate::vit::vit_on() {
             log("loading the vit section (27 vision blocks + patch embed + merger) …");
             let before = cuda::total_vram_bytes() - cuda::free_vram_bytes();
-            let mut vt = crate::vit::Vit::new(cnq);
+            let mut vt = crate::vit::Vit::new(cnq, geo.vision_out());
             let vit_bytes = cuda::total_vram_bytes() - cuda::free_vram_bytes() - before;
             if vit_hold {
                 vt.arm_scratch();
-                vit_scratch_held = crate::vit::scratch_bytes() as u64;
+                vit_scratch_held = crate::vit::scratch_bytes(geo.vision_out()) as u64;
             }
             log_vit_tower(&format!("[vit] visual tower loaded: mode {} (f32 tower math), CROW_VIT {} (0 = the text-only placeholder), {}, vit weights {:.0} MiB ({})",
                 vt.w.mode,
@@ -1082,7 +1088,7 @@ impl Engine {
         } else {
             (0, 0, 0)
         };
-        let vit_mrope_held = if mrope_rows > 0 { crate::vit::mrope_bytes(cfg.context) as u64 } else { 0 };
+        let vit_mrope_held = if mrope_rows > 0 { crate::vit::mrope_bytes(cfg.context, geo.rope_pairs) as u64 } else { 0 };
         // #72: the device sampler's seven buffers (mask [V] u8, rng, params,
         // the two candidate slices; #84 adds counts [V] u16 + the ring).
         // ~0.8 MB, but it was the last VRAM the engine took after the plan:
@@ -1261,7 +1267,7 @@ impl Engine {
         // planner only has to set aside what is left of the reserve.
         let vit_held = vit_scratch_held + vit_mrope_held;
         let vit_reserve = if vit.is_some() {
-            crate::vit::reserve_bytes(cfg.context).saturating_sub(vit_held)
+            crate::vit::reserve_bytes(&geo, cfg.context).saturating_sub(vit_held)
         } else { 0 };
         // + #110: the render reserve, VRAM kept FREE for a co-resident GPU client
         //   (Crow's render_page). The engine never allocates it; the planner
@@ -1284,7 +1290,7 @@ impl Engine {
             }
             None => (per_expert_unit, false),
         };
-        let (st, st_rep) = ThreeStates::allocate(&cfg, pending, per_expert_unit, cold_unit, cold_fixed, render_reserve);
+        let (st, st_rep) = ThreeStates::allocate(&cfg, &geo, pending, per_expert_unit, cold_unit, cold_fixed, render_reserve);
         // #110 follow-up: from here on the reserve is what was GRANTED
         let render_reserve = st_rep.render_reserve;
         for l in &st_rep.lines {
@@ -1296,7 +1302,7 @@ impl Engine {
         log(&format!(
             "  [budget] {}",
             if vit.is_some() {
-                crate::vit::reserve_line(cfg.context, vit_held)
+                crate::vit::reserve_line(&geo, cfg.context, vit_held)
             } else {
                 "vit reserve       0.0 MB  (CROW_VIT 0, the tower is not loaded)".to_string()
             }
@@ -1392,6 +1398,7 @@ impl Engine {
         ));
 
         Engine {
+            geo,
             k,
             module,
             st,

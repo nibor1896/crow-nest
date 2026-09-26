@@ -836,7 +836,7 @@ impl PrefixCache {
             cuda::sync();
             let row_bytes = crate::geo::AHD * eng.st.kv.byte_per_value();
             let n = rows * row_bytes;
-            let groups: Vec<_> = crate::slot::kv_row_order(eng.st.qsa_pooled.len()).collect();
+            let groups: Vec<_> = crate::slot::kv_row_order(eng.st.qsa_pooled.len(), eng.geo.kv_heads).collect();
             self.park_kv.resize(groups.len() * n, 0);
             for (g, (layer, is_k, kvh)) in groups.into_iter().enumerate() {
                 crate::slot::dtoh_bytes(&mut self.park_kv[g * n..(g + 1) * n], eng.st.kv_row_ptr(layer, is_k, kvh, 0));
@@ -885,7 +885,7 @@ impl PrefixCache {
         eng.drop_decode_graph();
         let row_bytes = crate::geo::AHD * eng.st.kv.byte_per_value();
         let n = pk.rows * row_bytes;
-        for (g, (layer, is_k, kvh)) in crate::slot::kv_row_order(eng.st.qsa_pooled.len()).enumerate() {
+        for (g, (layer, is_k, kvh)) in crate::slot::kv_row_order(eng.st.qsa_pooled.len(), eng.geo.kv_heads).enumerate() {
             cuda::upload_into(eng.st.kv_row_ptr(layer, is_k, kvh, 0), &self.park_kv[g * n..(g + 1) * n]);
         }
         let pb = pk.blocks * crate::geo::QSA_HIDD * 4;

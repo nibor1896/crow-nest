@@ -329,6 +329,19 @@ impl Family {
     }
     /// every family, in table order
     pub const ALL: [Family; 2] = [Family::FlashNext, Family::Qwen35Dense];
+
+    /// Crow #300 C3: the family's number in a slot file header (`slot::Header::model_family`);
+    /// 0 is never written, so a zeroed field reads as no family
+    pub const fn code(self) -> u64 {
+        match self {
+            Family::FlashNext => 1,
+            Family::Qwen35Dense => 2,
+        }
+    }
+    /// the family a slot-file code names, `None` for a code no family carries
+    pub fn from_code(code: u64) -> Option<Family> {
+        Family::ALL.into_iter().find(|f| f.code() == code)
+    }
 }
 
 /// the residual stream: hyper-connection streams (mixed in and out of every
@@ -387,6 +400,45 @@ impl PleGeo {
     }
     pub const fn emb_dim(self) -> usize {
         self.embed / self.nheads()
+    }
+    /// the n-gram context: the ids before the current one (`PLE_CTX`)
+    pub const fn ctx(self) -> usize {
+        self.ngram - 1
+    }
+}
+
+/// C3: the routed-expert numbers of a MoE family, as `Geo::moe` hands them out
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MoeGeo {
+    pub experts: usize,
+    pub topk: usize,
+    pub expert_inter: usize,
+    pub shared_inter: usize,
+}
+
+/// C3: the QSA indexer numbers of a QSA family, as `Geo::qsa` hands them out
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct QsaGeo {
+    pub heads: usize,
+    pub kv_heads: usize,
+    /// the indexer head dim, also the raw indexer key width (`QSA_HD` = `QSA_HIDD`)
+    pub head_dim: usize,
+    pub compress: usize,
+    pub block_topk: usize,
+}
+
+impl QsaGeo {
+    /// rows of `index_qk_proj`: query heads plus the key head (`QSA_QK_ROWS`)
+    pub const fn qk_rows(self) -> usize {
+        (self.heads + self.kv_heads) * self.head_dim
+    }
+    /// the most rows one query attends (`QSA_SEL_MAX`)
+    pub const fn sel_max(self) -> usize {
+        self.block_topk * self.compress + self.compress - 1
+    }
+    /// the raw indexer key width (`QSA_HIDD`): the key head of `index_qk_proj`
+    pub const fn hidd(self) -> usize {
+        self.kv_heads * self.head_dim
     }
 }
 
@@ -554,6 +606,58 @@ impl Geo {
     pub const fn is_attn(&self, layer: usize) -> bool {
         layer % self.attn_interval == self.attn_interval - 1
     }
+    /// the attention-layer index of full-attention layer `layer` (`geo::attn_index`)
+    pub const fn attn_index(&self, layer: usize) -> usize {
+        layer / self.attn_interval
+    }
+    /// the GDN-layer index of linear-attention layer `layer` (`geo::gdn_index`):
+    /// the layers below it minus the attention layers among them
+    pub const fn gdn_index(&self, layer: usize) -> usize {
+        layer - layer / self.attn_interval
+    }
+
+    // ---- C3: the family-specific numbers the host sites read ----
+    //
+    // Every call site of C3 still assumes the Flash-Next STRUCTURE (the family
+    // switches are C5); these accessors hand it the numbers and refuse by name
+    // on a family that has no such block. A dense boot dies at the metadata
+    // gate before any of them can run, so the refusals are a guard, not a path.
+
+    /// the hyper-connection low-rank width (`LOWRANK`)
+    pub const fn hc_lowrank(&self) -> usize {
+        match self.residual {
+            Residual::Hc { lowrank, .. } => lowrank,
+            Residual::Plain => panic!("Geo::hc_lowrank: a plain residual has no hyper-connection mixer (Crow #300 C5 builds that path)"),
+        }
+    }
+    /// the routed-expert block (`E`, `TOPK`, `INTER`)
+    pub const fn moe(&self) -> MoeGeo {
+        match self.ffn {
+            Ffn::Moe { experts, topk, expert_inter, shared_inter } => MoeGeo { experts, topk, expert_inter, shared_inter },
+            Ffn::Dense { .. } => panic!("Geo::moe: a dense FFN has no experts (Crow #300 C5 builds that path)"),
+        }
+    }
+    /// the QSA indexer (`QSA_*`)
+    pub const fn qsa(&self) -> QsaGeo {
+        match self.attn {
+            Attn::Qsa { heads, kv_heads, head_dim, compress, block_topk } => QsaGeo { heads, kv_heads, head_dim, compress, block_topk },
+            Attn::Full => panic!("Geo::qsa: full causal attention has no QSA indexer (Crow #300 C5 builds that path)"),
+        }
+    }
+    /// the PLE layer (`PLE_*`)
+    pub const fn ple_geo(&self) -> PleGeo {
+        match self.ple {
+            Some(p) => p,
+            None => panic!("Geo::ple_geo: this model has no PLE layer (Crow #300 C5 makes it optional)"),
+        }
+    }
+    /// the vision merger's output width (`H` in vit.rs)
+    pub const fn vision_out(&self) -> usize {
+        match self.vision_out_hidden {
+            Some(w) => w,
+            None => panic!("Geo::vision_out: this config has no vision tower"),
+        }
+    }
 
     /// every field as (name, rendered value), in declaration order — the boot
     /// print and the mismatch table are both this list
@@ -595,6 +699,23 @@ impl Geo {
             ("mtp_layers", self.mtp_layers.to_string()),
             ("vision_out_hidden", format!("{:?}", self.vision_out_hidden)),
         ]
+    }
+
+    /// Crow #300 C3: a 64-bit fingerprint of this geometry - fnv1a-64 over the
+    /// `rows` rendering (`name=value` lines, declaration order). The slot file
+    /// carries it next to the family (`slot::Header::geo_hash`), so a slot saved
+    /// by one model is refused by another even where every buffer SIZE agrees.
+    /// It is only as stable as the `rows` text: a renamed field or a changed
+    /// Debug rendering moves it, which refuses old slot files - the safe side.
+    pub fn fingerprint(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for (name, value) in self.rows() {
+            for b in name.bytes().chain(std::iter::once(b'=')).chain(value.bytes()).chain(std::iter::once(b'\n')) {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
     }
 
     /// the fields where `self` differs from `want`: (name, self, want)
@@ -644,5 +765,48 @@ mod tests_300 {
         assert_eq!((0..LAYERS).filter(|l| g.is_attn(*l)).count(), ATTN_LAYERS);
         assert_eq!(g.rows().len(), 35, "one row per Geo field");
         assert!(g.diff(&Geo::FLASH_NEXT).is_empty());
+    }
+
+    /// C3: the accessors the migrated host sites read hand out exactly the consts
+    /// they replaced, and refuse by name on a family without that block
+    #[test]
+    fn c3_accessors_reproduce_the_consts_they_replace() {
+        let g = Geo::FLASH_NEXT;
+        assert_eq!(g.hc_lowrank(), LOWRANK);
+        let m = g.moe();
+        assert_eq!((m.experts, m.topk, m.expert_inter, m.shared_inter), (E, TOPK, INTER, INTER));
+        let q = g.qsa();
+        assert_eq!((q.heads, q.kv_heads, q.head_dim, q.compress, q.block_topk), (QSA_HEADS, QSA_KVHEADS, QSA_HD, QSA_COMPRESS, QSA_BLOCK_TOPK));
+        assert_eq!((q.qk_rows(), q.sel_max(), q.hidd()), (QSA_QK_ROWS, QSA_SEL_MAX, QSA_HIDD));
+        let p = g.ple_geo();
+        assert_eq!((p.layer, p.ngram, p.ctx(), p.heads_per_ngram, p.embed), (PLE_LAYER, PLE_NGRAM, PLE_CTX, PLE_HEADS_PER_NGRAM, PLE_EMBED));
+        assert_eq!(g.vision_out(), H);
+        for l in 0..LAYERS {
+            if is_attn(l) {
+                assert_eq!(g.attn_index(l), attn_index(l), "layer {l}");
+            } else {
+                assert_eq!(g.gdn_index(l), gdn_index(l), "layer {l}");
+            }
+        }
+        assert_eq!(crate::manager::gdn_s_state_len(&g), GDN_VHEADS * GD * GD);
+        assert_eq!(crate::manager::gdn_conv_state_len(&g), GDN_CONV * 3);
+        assert_eq!(crate::manager::ple_state_len(&g), GDN_CONV * 9, "the PLE conv runs over the 10240-wide residual");
+        // the fingerprint of record: a change here refuses every slot file saved before it
+        assert_eq!(g.fingerprint(), 0x7191_8a73_24c6_5fdd, "Geo::FLASH_NEXT fingerprint");
+        assert_eq!(Family::from_code(g.family.code()), Some(Family::FlashNext));
+        assert_eq!(Family::from_code(0), None);
+        // a family without the block refuses by name (a dense boot never gets here: it
+        // dies at the metadata gate; the refusal is the guard behind it)
+        let dense = Geo { residual: Residual::Plain, ffn: Ffn::Dense { inter: 17408 }, attn: Attn::Full, ple: None, ..g };
+        for (what, r) in [
+            ("hc_lowrank", std::panic::catch_unwind(|| dense.hc_lowrank())),
+            ("moe", std::panic::catch_unwind(|| dense.moe().experts)),
+            ("qsa", std::panic::catch_unwind(|| dense.qsa().heads)),
+            ("ple_geo", std::panic::catch_unwind(|| dense.ple_geo().layer)),
+        ] {
+            let e = r.unwrap_err();
+            let msg = e.downcast_ref::<&str>().copied().map(String::from).or_else(|| e.downcast_ref::<String>().cloned()).unwrap();
+            assert!(msg.contains(&format!("Geo::{what}")) && msg.contains("Crow #300 C5"), "{what}: {msg}");
+        }
     }
 }

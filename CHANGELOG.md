@@ -18,11 +18,15 @@
 
 ### Changed
 
+- **The engine computes with the runtime `Geo` instead of the `geo.rs` consts** (Crow #300 phase 1, C3, 2026-09-26). `boot::open_model` hands the model's `Geo` (from `meta::assert_pinned`) to `Engine::load`, and the engine owns it (`Engine::geo`), the way llama.cpp's `llama_model` owns its `hparams`. The host sites read their numbers from it; the kernels still pin Flash-Next until C4, and the code still assumes the Flash-Next structure until C5. On Flash-Next nothing moved: the gate's parity 8 / 512 / P8 tf shas and run-32 ids are byte-identical after every step, and so is every `[budget]` / `[residency]` / `[diet]` boot line. `docs/architecture.md` 8.11.
+  - C3a: the boot threading, `manager.rs` (the state plan, the RoPE table's pairs and theta, the context floor), `reset.rs`, `vit.rs` (the merger width), `lend.rs`, the EOS ids of the `decode` / `parity` / `serve` generation loops (`sample::EOS_IDS` stays as the Flash-Next pin the metadata gate checks), and `slot.rs`.
+  - **The slot file carries a model fingerprint** (format 2, header 136 bytes, was 120): the model family and a 64-bit fingerprint of its `Geo`. A slot file of another family, or of another geometry, is refused by name before anything is read past the header. A format 1 file is refused by name too (`carries no model fingerprint (written before Crow #300 C3)`): save the slot again.
+- **`tools/gate-linux.sh` pins `TESTS=424` and `CLIPPY=1519`** (2026-09-26, C3a; was 421 / 1522): +1 `geo::tests_300`, +2 `slot::tests`; clippy -3 (two same-type casts and one manual `div_ceil` in `manager.rs` went with the consts they wrapped).
 - **`tools/gate-linux.sh` pins `TESTS=421`** (2026-09-26, was 413): +1 `geo::tests_300` and +7 `meta::tests` (Crow #300 C1 + C2). The count is lib 292 / 3 ignored + serve 118 + parity 6 + decode 5. `CLIPPY=1522` is unchanged, and no new warning appeared.
 
 ### Known limitations
 
-- **Crow #300 phase 1 is not finished.** No call site reads the `Geo` yet. C3 threads it from `boot::open_model` to the host sites, and C4 moves the kernel `#define`s (proof: the PTX of record is byte-identical). The dense `context_floor` of 200,000 is provisional; the per-family floor is C5.
+- **Crow #300 phase 1 is not finished.** C3 moves the host sites onto the `Geo` step by step; `docs/architecture.md` 8.11 lists what still reads the consts. C4 moves the kernel `#define`s (proof: the PTX of record is byte-identical). The dense `context_floor` of 200,000 is provisional; the per-family floor is C5.
 
 ## 2026-09-25 — v0.6.0: VRAM lent to Crow's renderer, the main conversation parked across side requests, the render reserve made best-effort, and the gate values of record
 

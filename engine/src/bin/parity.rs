@@ -387,14 +387,14 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
     // path to itself. That window is the leading suspect of #65 (engine/README's
     // Windows rule is to wait for 50.5 GiB of free host RAM before a load).
     let ids = tokenize(text);
-    let (mut cnq, _ctx, mut cfg, _cnq_path, sidecar) = unsafe {
+    let (mut cnq, _ctx, mut cfg, _cnq_path, sidecar, geo) = unsafe {
         crow_nest_engine::boot::open_model(DEFAULT_CNQ.into(), DEFAULT_HOTSETS.into())
     };
     unsafe {
         // #16: CROW_CHUNK explicit, else auto by prompt length (geo.rs)
         crow_nest_engine::geo::apply_chunk_policy(&mut cfg, ids.len());
         let mut eng = crow_nest_engine::gen::Engine::load(
-            &mut cnq, cfg, None, &sidecar, false, &mut |_| {},
+            &mut cnq, geo, cfg, None, &sidecar, false, &mut |_| {},
         );
         let t0 = Instant::now();
         let mut next = eng.prefill(&mut cnq, &ids, None);
@@ -427,7 +427,7 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
             }
         }
         let mut answer: Vec<i64> = vec![next as i64];
-        let mut stopped_eos = crow_nest_engine::sample::EOS_IDS_I64.contains(&(next as i64));
+        let mut stopped_eos = geo.eos_ids.contains(&next);
         let t1 = Instant::now();
         let mut steps = 1usize;
         while answer.len() < max_tokens && !stopped_eos {
@@ -447,7 +447,7 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
             }
             answer.push(next as i64);
             steps += 1;
-            if crow_nest_engine::sample::EOS_IDS_I64.contains(&(next as i64)) {
+            if geo.eos_ids.contains(&next) {
                 stopped_eos = true;
             }
             if steps % 10 == 0 || answer.len() >= max_tokens || stopped_eos {

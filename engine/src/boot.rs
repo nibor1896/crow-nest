@@ -3,12 +3,13 @@
 
 use crate::cnq::Cnq;
 use crate::cuda;
-use crate::geo::{Config, KvDtype, CONTEXT_FLOOR};
+use crate::geo::{Config, Geo, KvDtype};
 use crate::meta;
 
-/// `CROW_CNQ` / `CROW_HOTSETS` (else the given defaults), the mapped container, a current CUDA context, the config at `CONTEXT_FLOOR`.
+/// `CROW_CNQ` / `CROW_HOTSETS` (else the given defaults), the mapped container, a current CUDA context, the config at
+/// the model's context floor, and the model's runtime `Geo` (Crow #300 C3: the engine loaded from these owns it).
 ///
-/// The RETURNED ORDER is the drop order: bound as `let (mut cnq, _ctx, mut cfg, cnq_path, sidecar) = open_model(..)`
+/// The RETURNED ORDER is the drop order: bound as `let (mut cnq, _ctx, mut cfg, cnq_path, sidecar, geo) = open_model(..)`
 /// the bindings drop in reverse, so the `Engine` loaded below them dies first, then the context, then the container
 /// mapping — the order all three bins wrote by hand. A `#[must_use]` guard cannot order anything, so it would say less.
 ///
@@ -19,7 +20,7 @@ use crate::meta;
 pub unsafe fn open_model(
     cnq_default: String,
     sidecar_default: String,
-) -> (Cnq, cuda::Ctx, Config, String, String) {
+) -> (Cnq, cuda::Ctx, Config, String, String, Geo) {
     // #102: CROW_KV is read HERE, once, for all three bins (it used to be read by
     // `decode parity` only, so `serve` booted FP8 under CROW_KV=bf16 and said nothing).
     // A bad value dies before the container is mapped and before any CUDA work.
@@ -40,8 +41,10 @@ pub unsafe fn open_model(
     // Crow #300 C1/C2: the same door detects the model family, refuses unknown
     // config keys by name, and derives the runtime `Geo`, asserted equal to
     // `Geo::FLASH_NEXT` (a dense checkpoint prints its geometry and dies here).
-    // Nothing below reads the `Geo` yet: the consts stay in force until C3.
-    let _meta = meta::assert_pinned(&cnq_path);
+    // C3: the `Geo` is handed back to the caller, which gives it to `Engine::load`;
+    // the engine owns it from there (the way llama.cpp's `llama_model` owns its
+    // `hparams`) and every host site reads its numbers from it.
+    let geo = model_geo(&cnq_path);
     let mut cnq = Cnq::open(&cnq_path);
     // #77 CROW_CNQ_OVERLAY: a second CNQ1 container opened BESIDE the base one, holding the
     // dense text tensors as bf16. A tensor it names shadows the base tensor of the same name
@@ -78,13 +81,26 @@ pub unsafe fn open_model(
         }
     }
     let ctx = cuda::Ctx::init();
-    let mut cfg = Config { context: CONTEXT_FLOOR, ..Config::default() };
+    let mut cfg = Config { context: geo.context_floor, ..Config::default() };
     if let Some(kv) = kv {
         cfg.kv = kv;
     }
     tracing::info!(target: "boot", "[boot] kv cache dtype {} ({})", cfg.kv.name(),
         if kv.is_some() { "CROW_KV" } else { "default, CROW_KV unset" });
-    (cnq, ctx, cfg, cnq_path, sidecar)
+    (cnq, ctx, cfg, cnq_path, sidecar, geo)
+}
+
+/// The runtime `Geo` of the checkpoint beside `cnq_path`, through the #94 / Crow #300
+/// metadata gate (`meta::assert_pinned`: a refused config panics here, by name).
+/// `open_model` calls it; so do the probe bins that map a container without the
+/// front door. A container with no config.json beside it (the selftest package) gets
+/// `Geo::FLASH_NEXT`, the pins of record, after the gate's WARN line - the same
+/// "pins stand unchecked" behavior as before C3.
+pub fn model_geo(cnq_path: &str) -> Geo {
+    match meta::assert_pinned(cnq_path) {
+        Some((_meta, geo)) => geo,
+        None => Geo::FLASH_NEXT,
+    }
 }
 
 /// The variable table of record, compiled in: `docs/env.md` is kept equal to the

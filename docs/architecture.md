@@ -4536,12 +4536,13 @@ is the documented bit-identical twin of the cascade `mix_streams_q` fuses and th
 `max_abs` 0.4475 / `corr` 0.99180 all along, at HEAD and before the fix, which is what pinned the
 cause to the cascade and not to the kernels, the ring or the selection.
 
-### 8.11 Model families and the runtime `Geo` (Crow #300 phase 1, C1 + C2, 2026-09-26)
+### 8.11 Model families and the runtime `Geo` (Crow #300 phase 1, C1 + C2 + C3, 2026-09-26)
 
-crow-nest serves one model today, and every shape is a `geo.rs` const. Phase 1 of Crow #300 makes
-the shapes come from the checkpoint. C1 and C2 (this section) build the reader and the runtime
-geometry and assert them at boot. **No call site reads the `Geo` yet**: the consts stay in force,
-and moving the sites onto a `Geo` is C3. No kernel, buffer, loader or numeric changed.
+crow-nest serves one model today, and every shape was a `geo.rs` const. Phase 1 of Crow #300 makes
+the shapes come from the checkpoint. C1 and C2 build the reader and the runtime geometry and
+assert them at boot. C3 moves the host call sites onto that `Geo` (see "C3: how the `Geo` is
+threaded" at the end of this section). No kernel, buffer size, allocation order, loader or
+numeric changed: the gate values of record hold after every C3 step.
 
 **Families.** `meta::ModelMeta` detects the family from `text_config.model_type`. Any other string
 refuses the parse by name.
@@ -4596,13 +4597,52 @@ implemented value refuse any other value by name: `hidden_act` silu, `mamba_ssm_
 4. dense prints the 35-row geometry and gives the named refusal;
 5. Flash-Next with everything equal logs `meta: 21 constants verified against config.json (zero numeric change) [...]; family FlashNext (qwen4_exp_text), runtime Geo == Geo::FLASH_NEXT (35 fields)`.
 
-All five are before `Cnq::open` and before the CUDA context. `assert_pinned` now returns
-`Option<(ModelMeta, Geo)>`, and `boot::open_model` still discards it; C3 threads it through.
+All five are before `Cnq::open` and before the CUDA context. `assert_pinned` returns
+`Option<(ModelMeta, Geo)>`; since C3 `boot::open_model` hands the `Geo` to its caller.
 
 The 27B fixture is `engine/tests/fixtures/Qwen3.8-27B/{config.json, generation_config.json}`,
 copied from `models/Qwen3.8-27B/` (revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`,
 sha256-checked 2026-09-25). It is the only model config the repository tracks. The Flash-Next
 tests read the checkpoint of record in `models/`, as before.
+
+**C3: how the `Geo` is threaded** (2026-09-26).
+
+- **Owner.** `boot::open_model` returns the `Geo` as the sixth element of its tuple
+  (`boot::model_geo`: the metadata gate's `Geo`, or `Geo::FLASH_NEXT` after the gate's WARN when no
+  config.json sits beside the container, the selftest package). The caller passes it to
+  `Engine::load(cnq, geo, cfg, ..)`, and the engine owns it as `Engine::geo`, the way llama.cpp's
+  `llama_model` owns its `hparams`. Everything the engine builds is shaped from that field or
+  from a copy handed down at construction: `ThreeStates::geo`, `Vit::out_hidden`.
+- **Free functions take it as a parameter**, never from a global: `StateSizes::plan(geo, ..)`,
+  `build_rope_table(geo, ..)`, `vit::reserve_bytes(geo, ..)` / `reserve_line`,
+  `vit::scratch_bytes_for(cap, out_hidden)`, `vit::mrope_bytes(context, rope_pairs)`,
+  `lend::tier1_plan(geo, ..)`, `slot::kv_row_order(layers, kv_heads)`. There is no process-wide
+  `OnceLock<Geo>`: every site found so far has an engine handle or a caller that has one. The
+  probe bins that map a container without the front door (`residency`, `states`) ask
+  `boot::model_geo` for it.
+- **Accessors.** The code still assumes the Flash-Next STRUCTURE (the family switches are C5), so
+  it reads the family-specific numbers through `Geo::moe()`, `qsa()` (`QsaGeo`: `qk_rows`,
+  `sel_max`, `hidd`), `ple_geo()`, `hc_lowrank()`, `vision_out()`, `attn_index` / `gdn_index`. On a
+  family without that block each one panics with `Geo::<name>: ... (Crow #300 C5 builds that path)`;
+  a dense boot never reaches them, because it dies at the metadata gate.
+  `geo::tests_300::c3_accessors_reproduce_the_consts_they_replace` pins every accessor to the const
+  it replaced.
+- **The slot file names its model** (format 2): `model_family` (`Family::code`) and `geo_hash`
+  (`Geo::fingerprint`, fnv1a-64 over the `rows` rendering; `0x7191_8a73_24c6_5fdd` for Flash-Next,
+  pinned by the same test). `Header::shape_matches` checks both first and names the two models; a
+  format 1 file is refused by name, never parsed.
+- **Byte identity.** Every buffer is allocated in the same order with the same size: the migrated
+  expressions are the const expressions with the const replaced by the `Geo` field that
+  `Geo::FLASH_NEXT` fills from it. Checked per step against the gate's boot logs: every
+  `[budget]`, `[residency]`, `[diet]` and `scratch + staging` line is identical to `f7ca9f5`
+  (host-measured free RAM / VRAM masked).
+
+**What still reads the consts** (C3a, 2026-09-26): `gen.rs` (the loader, the layer primitives,
+the decode and prefill loops), `residency.rs`, `cache.rs` (`Shape` and the snapshot sizes),
+`bin/serve.rs` (vocab and layer counts, the tool vocabulary), `bin/decode.rs`, `bin/parity.rs`,
+the probe bins; `meta.rs` reads them on purpose (the Flash-Next expected-values row is the pin),
+and so do the tests that pin a const against its `Geo` field. The kernels (`kernels.rs` source
+text, `head / 12`, `2560`, `1e-6f`) are C4.
 
 ## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
 
