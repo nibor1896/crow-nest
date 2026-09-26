@@ -6,6 +6,10 @@ publish = false
 
 [dependencies]
 serde_json = "1"
+# Crow #300 C6: the index v2 records the sha256 of the config files and of every source shard
+# the Hugging Face cache has no LFS record for. RustCrypto sha2 at the version the engine
+# already pins (engine/Cargo.toml, #114: no hand-rolled crypto).
+sha2 = "=0.10.9"
 
 [profile.release]
 debug = false

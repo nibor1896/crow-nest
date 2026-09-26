@@ -72,6 +72,7 @@ mod expert_overlay;
 mod expert_requant;
 mod imatrix;
 mod layer_rule_overlay;
+mod recipe;
 mod requant_check;
 
 const E2M1_GRID: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
@@ -164,50 +165,18 @@ struct TensorEntry {
     name: String,
     shape: Vec<usize>,
     n_values: usize,
-    dtype_out: &'static str, // "nvfp4" | "bf16"
-    section: &'static str,   // "text" | "ple" | "vit" | "mtp"
+    /// the safetensors dtype of the source (`BF16`, `F32`, `F16`, `I64`)
+    src_dtype: String,
+    /// Crow #300 C6: the recipe's decision (dtype, section and the row that made it)
+    decision: recipe::Decision,
     shard: String,
     data_begin: u64, // byte offset inside the shard file (incl. header)
     data_end: u64,
 }
 
-fn section_of(name: &str) -> &'static str {
-    if name.contains("ngram_embedding") {
-        "ple"
-    } else if name.contains(".visual.") || name.starts_with("model.visual") {
-        "vit"
-    } else if name.contains(".mtp.") || name.starts_with("mtp") {
-        "mtp"
-    } else {
-        "text"
-    }
-}
-
-/// BF16 keep-set per spec 1.2 — precision where routing and norm stability live.
-fn keep_bf16(name: &str, shape: &[usize], n: usize) -> bool {
-    if shape.len() == 1 {
-        return true; // 1-D: norms/biases/A_log/dt_bias/gates — flagged in the ticket comment
-    }
-    if name.contains("norm")
-        || name.contains("embed_tokens")
-        || name.contains("lm_head")
-        || name.contains("mlp.gate.weight") // router GEMM
-        || name.contains("shared_expert_gate")
-    {
-        return true;
-    }
-    // Amendment 2026-09-03 (robin GO, mix of options 1+2 on the #11 gate
-    // finding): FP4 compounding through 48 layers breaks argmax parity —
-    // keep the residual-path HC mix projections and attention q/k in BF16.
-    if name.contains("input_mix_weight_down")
-        || name.contains("input_mix_weight_up")
-        || name.contains("self_attn.q_proj.weight")
-        || name.contains("self_attn.k_proj.weight")
-    {
-        return true;
-    }
-    n % 64 != 0 || n < 64
-}
+// The BF16 keep set and the section patterns moved to `recipe.rs` with Crow #300 C6: they are
+// now one row per model family. The Flash-Next row (`recipe::decide_flash_next`) is the keep set
+// that stood here at `64c242b`, verbatim, and is proved against every tensor of CNQ4.5-M.
 
 fn read_safetensors_header(path: &std::path::Path) -> std::io::Result<(serde_json::Value, u64)> {
     let mut f = std::fs::File::open(path)?;
@@ -505,7 +474,7 @@ fn quantize_nvfp4(values: &[f32], mode: ScalesMode) -> (Vec<u8>, f32, QuantStats
     (out, global, stats, sse_ceil)
 }
 
-const HELP: &str = "usage: converter [--scales ceil|mse] <model-dir | file.safetensors> <out.cnq>\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter layer-rule-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) --arm attn-v-out|ffn-down-rule|ffn-down-all\n  builds a bf16 overlay container for one llama.cpp-shaped layer-rule arm (#91 phase 1)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)";
+const HELP: &str = "usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>] <model-dir | file.safetensors> <out.cnq>\n  writes an index v2 container: config.json + generation_config.json verbatim, the family's recipe, source repo/revision/shard sha256\n  (--revision defaults to the Hugging Face cache in the model dir; Crow #300 C6)\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter layer-rule-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) --arm attn-v-out|ffn-down-rule|ffn-down-all\n  builds a bf16 overlay container for one llama.cpp-shaped layer-rule arm (#91 phase 1)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)\n       converter plan [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  the dry run: family, recipe, per-tensor dtype/section table, GPU / host byte totals (Crow #300 C6)";
 
 /// `converter imatrix-show <imatrix.gguf> [tensor ...]` — #79. Read-only: the kv block, the
 /// tensor count, and for every named tensor its dims, its data offset, its first eight values,
@@ -638,8 +607,19 @@ fn main() {
         std::process::exit(imatrix_show(&all[1..]));
     }
 
+    // Crow #300 C6: the read-only plan. Same additive rule as every subcommand above: its own
+    // word as argument zero, and it reads the index, the shard headers and the config only.
+    if let Some(at) = all.iter().position(|a| a == "plan") {
+        if at != 0 {
+            eprintln!("unexpected argument {} before plan\n{PLAN_HELP}", all[0]);
+            std::process::exit(2);
+        }
+        std::process::exit(plan(&all[1..]));
+    }
+
     let mut positional: Vec<String> = Vec::new();
     let mut mode = ScalesMode::Ceil;
+    let mut prov = Provenance::default();
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         match arg.as_str() {
@@ -651,6 +631,8 @@ fn main() {
                     std::process::exit(2);
                 }
             },
+            "--source-repo" => prov.repo = argv.next(),
+            "--revision" => prov.revision = argv.next(),
             a if a.starts_with("--") => {
                 eprintln!("unknown flag {a}\n{HELP}");
                 std::process::exit(2);
@@ -664,44 +646,60 @@ fn main() {
     }
     let input = std::path::PathBuf::from(&positional[0]);
     let out_path = std::path::PathBuf::from(&positional[1]);
-    let scales_mode_str = if mode == ScalesMode::Mse { "mse" } else { "ceil" };
-    let single_file = input.is_file();
-    let t_start = std::time::Instant::now();
+    std::process::exit(convert(&input, &out_path, mode, &prov));
+}
 
-    // ---- manifest: scan headers only (fast), collect every tensor's location ----
+/// `--source-repo` / `--revision`: where the checkpoint came from, for the index v2 `model`
+/// block. The revision defaults to the Hugging Face local-dir cache's (`recipe::read_hf_tree`).
+#[derive(Default, Clone)]
+struct Provenance {
+    repo: Option<String>,
+    revision: Option<String>,
+}
+
+/// The header scan of a conversion (and of `plan`): the config, the family, and every tensor
+/// with its recipe decision. Reads the model index, the shard headers and the two config files,
+/// never a tensor's payload.
+struct Manifest {
+    family: recipe::Family,
+    config_json: String,
+    generation_config_json: String,
+    config: serde_json::Value,
+    tensors: Vec<TensorEntry>,
+    shard_files: Vec<std::path::PathBuf>,
+    weight_map: Option<BTreeMap<String, String>>,
+    single_file: bool,
+    /// the directory the configs (and the HF cache) are read from
+    model_dir: std::path::PathBuf,
+}
+
+fn build_manifest(input: &std::path::Path) -> Result<Manifest, String> {
+    let single_file = input.is_file();
+    let model_dir = if single_file { input.parent().map(|p| p.to_path_buf()).unwrap_or_default() } else { input.to_path_buf() };
+    let model_dir = if model_dir.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { model_dir };
+    let (family, config_json, generation_config_json, config) = recipe::read_model_configs(&model_dir)?;
     let mut tensors: Vec<TensorEntry> = Vec::new();
     let mut weight_map: Option<BTreeMap<String, String>> = None;
     let shard_files: Vec<std::path::PathBuf> = if single_file {
-        vec![input.clone()]
+        vec![input.to_path_buf()]
     } else {
-        let index: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(input.join("model.safetensors.index.json")).expect("read model index"),
-        )
-        .expect("parse model index");
+        let p = input.join("model.safetensors.index.json");
+        let index: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?)
+            .map_err(|e| format!("{}: {e}", p.display()))?;
         let mut wm = BTreeMap::new();
-        for (name, shard) in index["weight_map"].as_object().expect("weight_map") {
-            wm.insert(name.clone(), shard.as_str().unwrap().to_string());
+        for (name, shard) in index["weight_map"].as_object().ok_or("model index: no weight_map")? {
+            wm.insert(name.clone(), shard.as_str().ok_or("model index: weight_map value is not a string")?.to_string());
         }
-        weight_map = Some(wm);
-        let mut files: Vec<String> = weight_map
-            .as_ref()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect();
+        let mut files: Vec<String> = wm.values().cloned().collect();
         files.sort();
         files.dedup();
+        weight_map = Some(wm);
         files.iter().map(|f| input.join(f)).collect()
     };
-
+    let mut refusals: Vec<String> = Vec::new();
     for path in &shard_files {
-        let shard_name = path
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        let (header, data_start) = read_safetensors_header(path).expect("shard header");
+        let shard_name = path.file_name().unwrap().to_str().unwrap().to_string();
+        let (header, data_start) = read_safetensors_header(path).map_err(|e| format!("{}: shard header: {e}", path.display()))?;
         if let Some(entries) = header.as_object() {
             for (name, info) in entries {
                 if name == "__metadata__" {
@@ -723,15 +721,19 @@ fn main() {
                 let begin = info["data_offsets"][0].as_u64().unwrap();
                 let end = info["data_offsets"][1].as_u64().unwrap();
                 assert_eq!(end - begin, (n * es) as u64, "{name}: length mismatch");
-                // I64: integer metadata (PLE index tables — layer_multipliers,
-                // ngram_heads_offsets, ngram_heads_vocab_sizes) — raw carry, never quantize
-                let dtype_out = if dt == "I64" || keep_bf16(name, &shape, n) { "bf16" } else { "nvfp4" };
+                let decision = match recipe::decide(family, name, &shape, dt) {
+                    Ok(d) => d,
+                    Err(why) => {
+                        refusals.push(why);
+                        continue;
+                    }
+                };
                 tensors.push(TensorEntry {
                     name: name.clone(),
                     shape,
                     n_values: n,
-                    dtype_out,
-                    section: section_of(name),
+                    src_dtype: dt.to_string(),
+                    decision,
                     shard: shard_name.clone(),
                     data_begin: data_start + begin,
                     data_end: data_start + end,
@@ -739,16 +741,201 @@ fn main() {
             }
         }
     }
+    if !refusals.is_empty() {
+        refusals.sort();
+        return Err(format!("{} tensor(s) refused by the {} recipe:\n  {}", refusals.len(), family.recipe(), refusals.join("\n  ")));
+    }
     tensors.sort_by(|a, b| a.shard.cmp(&b.shard).then(a.data_begin.cmp(&b.data_begin)));
+    let geo = recipe::derive_geo(family, &config);
+    let named: Vec<(String, Vec<usize>)> = tensors.iter().map(|t| (t.name.clone(), t.shape.clone())).collect();
+    recipe::check_geo_against_tensors(&geo, &named)?;
+    Ok(Manifest { family, config_json, generation_config_json, config, tensors, shard_files, weight_map, single_file, model_dir })
+}
+
+/// The index v2 `model` block's provenance: repo from `--source-repo`, revision from
+/// `--revision` or the HF cache (both, when given, must agree), and one record per shard.
+/// `compute` hashes a shard the HF cache has no LFS record for (the conversion); the plan
+/// passes `false` and reports those shards as "computed at conversion".
+fn provenance(m: &Manifest, prov: &Provenance, compute: bool) -> Result<(String, String, Vec<recipe::ShardRecord>, usize), String> {
+    let tree = recipe::read_hf_tree(&m.model_dir)?;
+    let revision = match (&prov.revision, tree.as_ref().map(|t| t.revision.clone())) {
+        (Some(a), Some(b)) if *a != b => return Err(format!("--revision {a}, but the Hugging Face cache in this directory is revision {b}")),
+        (Some(a), _) => a.clone(),
+        (None, Some(b)) => b,
+        (None, None) => return Err("no --revision given and no Hugging Face cache (.cache/huggingface/trees) to read it from".into()),
+    };
+    let repo = prov.repo.clone().ok_or("--source-repo <org/name> is required: the index v2 names the checkpoint it was converted from")?;
+    let mut shards = Vec::new();
+    let mut pending = 0usize;
+    for p in &m.shard_files {
+        match recipe::shard_record(p, tree.as_ref(), compute)? {
+            Some(r) => shards.push(r),
+            None => pending += 1,
+        }
+    }
+    Ok((repo, revision, shards, pending))
+}
+
+fn gib(b: u64) -> f64 {
+    b as f64 / (1u64 << 30) as f64
+}
+
+const PLAN_HELP: &str = "usage: converter plan [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  reads the model index, the shard headers and config.json only; prints the family, the recipe,\n  the per-tensor dtype/section decision table, the per-row summary and the GPU / host byte totals";
+
+/// `converter plan <model-dir>` (Crow #300 C6): the dry run. Nothing is quantized and no
+/// tensor payload is read.
+fn plan(args: &[String]) -> i32 {
+    let mut prov = Provenance::default();
+    let mut input: Option<std::path::PathBuf> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--source-repo" => prov.repo = it.next().cloned(),
+            "--revision" => prov.revision = it.next().cloned(),
+            s if s.starts_with("--") || input.is_some() => {
+                eprintln!("unexpected argument {s}\n{PLAN_HELP}");
+                return 2;
+            }
+            s => input = Some(std::path::PathBuf::from(s)),
+        }
+    }
+    let Some(input) = input else {
+        eprintln!("{PLAN_HELP}");
+        return 2;
+    };
+    let m = match build_manifest(&input) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("plan refused: {e}");
+            return 2;
+        }
+    };
+    println!(
+        "plan      {}: family {} ({}), recipe {}, {} tensors from {} shard file(s)",
+        input.display(),
+        m.family.name(),
+        m.family.model_type(),
+        m.family.recipe(),
+        m.tensors.len(),
+        m.shard_files.len()
+    );
+    println!(
+        "config    config.json {} B sha256 {}, generation_config.json {} B sha256 {} (stored verbatim in the index v2)",
+        m.config_json.len(),
+        recipe::sha256_hex(m.config_json.as_bytes()),
+        m.generation_config_json.len(),
+        recipe::sha256_hex(m.generation_config_json.as_bytes())
+    );
+    let prov_repo = prov.repo.clone();
+    match provenance(&m, &Provenance { repo: prov_repo.or(Some("<--source-repo required at conversion>".into())), ..prov }, false) {
+        Ok((repo, rev, shards, pending)) => {
+            let lfs = shards.iter().filter(|s| s.sha256_from == "hf-lfs").count();
+            println!("source    repo {repo}, revision {rev}; shard sha256: {lfs} from the HF LFS record, {pending} computed at conversion");
+        }
+        Err(e) => println!("source    NOT READY for a conversion: {e}"),
+    }
+    println!("geo       {}", recipe::derive_geo(m.family, &m.config));
+    println!();
+    println!("{:<72} {:>22} {:>5} -> {:<5} {:<4} {:>13}  rule", "tensor", "shape", "src", "out", "sect", "bytes");
+    let mut sorted: Vec<&TensorEntry> = m.tensors.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    for t in &sorted {
+        let d = t.decision;
+        println!(
+            "{:<72} {:>22} {:>5} -> {:<5} {:<4} {:>13}  {}",
+            t.name,
+            format!("{:?}", t.shape),
+            t.src_dtype,
+            d.dtype.as_str(),
+            d.section,
+            d.dtype.bytes(t.n_values),
+            d.rule
+        );
+    }
+    // per row
+    let mut rows: BTreeMap<(&str, &str, &str), (usize, u64, u64)> = BTreeMap::new();
+    for t in &m.tensors {
+        let d = t.decision;
+        let e = rows.entry((d.section, d.dtype.as_str(), d.rule)).or_default();
+        e.0 += 1;
+        e.1 += t.n_values as u64;
+        e.2 += d.dtype.bytes(t.n_values);
+    }
+    println!();
+    println!("{:<4} {:<5} {:<64} {:>7} {:>15} {:>15} {:>10}", "sect", "dtype", "rule", "tensors", "values", "bytes", "GiB");
+    for ((s, dt, rule), (c, v, b)) in &rows {
+        println!("{s:<4} {dt:<5} {rule:<64} {c:>7} {v:>15} {b:>15} {:>10.4}", gib(*b));
+    }
+    // totals: the token embedding is the one text tensor that lives in host RAM (a table
+    // lookup, no GEMM); `vit` and `mtp` are optional to load; `ple` is Flash-Next's own tier
+    let is_embed = |t: &TensorEntry| t.name.ends_with("language_model.embed_tokens.weight");
+    let sum = |f: &dyn Fn(&TensorEntry) -> bool| -> u64 { m.tensors.iter().filter(|t| f(t)).map(|t| t.decision.dtype.bytes(t.n_values)).sum() };
+    let text_nvfp4 = sum(&|t| t.decision.section == "text" && t.decision.dtype == recipe::DtypeOut::Nvfp4);
+    let text_keep = sum(&|t| t.decision.section == "text" && t.decision.dtype != recipe::DtypeOut::Nvfp4 && !is_embed(t));
+    let host_embed = sum(&|t| is_embed(t));
+    let mtp = sum(&|t| t.decision.section == "mtp");
+    let vit = sum(&|t| t.decision.section == "vit");
+    let ple = sum(&|t| t.decision.section == "ple");
+    let total = sum(&|_| true);
+    println!();
+    println!("totals    (GiB = 2^30 B; nvfp4 = 36 B per 64 values, plus one f32 global scale per tensor in the index, not counted)");
+    println!("  GPU, text weights NVFP4          {:>15} B  {:>8.3} GiB", text_nvfp4, gib(text_nvfp4));
+    println!("  GPU, text keeps (bf16/f32/i64)   {:>15} B  {:>8.3} GiB  (without the token embedding)", text_keep, gib(text_keep));
+    println!("  GPU, text subtotal               {:>15} B  {:>8.3} GiB", text_nvfp4 + text_keep, gib(text_nvfp4 + text_keep));
+    println!("  host RAM, token embedding        {:>15} B  {:>8.3} GiB", host_embed, gib(host_embed));
+    println!("  optional section mtp             {:>15} B  {:>8.3} GiB", mtp, gib(mtp));
+    println!("  optional section vit             {:>15} B  {:>8.3} GiB", vit, gib(vit));
+    if ple > 0 {
+        println!("  section ple (Flash-Next tier)    {:>15} B  {:>8.3} GiB", ple, gib(ple));
+    }
+    println!("  container payload                {:>15} B  {:>8.3} GiB", total, gib(total));
+    0
+}
+
+/// The conversion: the manifest, the streamed payload, the index v2 trailer. Returns the exit
+/// code (0, 1 on a bound violation under `--scales ceil`, 2 on a refusal, 3 on a coverage gap).
+fn convert(input: &std::path::Path, out_path: &std::path::Path, mode: ScalesMode, prov: &Provenance) -> i32 {
+    let scales_mode_str = if mode == ScalesMode::Mse { "mse" } else { "ceil" };
+    let t_start = std::time::Instant::now();
+
+    // ---- manifest: scan headers only (fast), collect every tensor's location ----
+    let m = match build_manifest(input) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("conversion refused: {e}");
+            return 2;
+        }
+    };
+    // ---- the index v2 `model` block: provenance first, so a missing flag costs nothing ----
+    let (repo, revision, shards, _) = match provenance(&m, prov, true) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("conversion refused: {e}");
+            return 2;
+        }
+    };
+    let model = recipe::ModelSource {
+        family: m.family,
+        config_json: m.config_json.clone(),
+        generation_config_json: m.generation_config_json.clone(),
+        config: m.config.clone(),
+        repo,
+        revision,
+        shards,
+    };
+    let tensors = &m.tensors;
+    let single_file = m.single_file;
     eprintln!(
-        "manifest: {} tensors from {} shard file(s), {:.1} GB to read",
+        "manifest: {} tensors from {} shard file(s), {:.1} GB to read — family {}, recipe {}",
         tensors.len(),
-        shard_files.len(),
-        tensors.iter().map(|t| (t.data_end - t.data_begin) as u64).sum::<u64>() as f64 / 1e9
+        m.shard_files.len(),
+        tensors.iter().map(|t| (t.data_end - t.data_begin) as u64).sum::<u64>() as f64 / 1e9,
+        m.family.name(),
+        m.family.recipe()
     );
 
     // ---- write container: magic, streamed blob, index trailer ----
-    let mut out = std::fs::File::create(&out_path).expect("create output");
+    let mut out = std::fs::File::create(out_path).expect("create output");
     out.write_all(MAGIC).expect("magic");
     out.write_all(&0u64.to_le_bytes()).expect("reserved");
     let blob_start: u64 = 12;
@@ -765,7 +952,7 @@ fn main() {
 
     for (i, t) in tensors.iter().enumerate() {
         let shard_path = if single_file {
-            input.clone()
+            input.to_path_buf()
         } else {
             input.join(&t.shard)
         };
@@ -775,21 +962,24 @@ fn main() {
         f.read_exact(&mut raw).expect("read tensor");
         drop(f);
 
-        let is_i64 = raw.len() == t.n_values * 8;
-        let dt_in = if is_i64 { "I64" } else if raw.len() == t.n_values * 4 { "F32" } else { "BF16" };
+        // C6: the source dtype comes from the shard header. It used to be guessed from the
+        // byte length, which read an F16 tensor as BF16; for the BF16/F32/I64 sources both
+        // checkpoints of record carry, the two agree.
+        let dt_in = t.src_dtype.as_str();
+        let section = t.decision.section;
         let mut entry_json = serde_json::json!({
-            "name": t.name, "shape": t.shape, "section": t.section,
+            "name": t.name, "shape": t.shape, "section": section,
             "n_values": t.n_values, "offset": blob_len,
         });
 
-        if t.dtype_out == "nvfp4" {
+        if t.decision.dtype == recipe::DtypeOut::Nvfp4 {
             let values = bytes_to_f32(&raw, dt_in);
             let (blocks, global, stats, sse_ceil) = quantize_nvfp4(&values, mode);
             total_violations += stats.violations;
             let mse = stats.sum_sq_err / t.n_values as f64;
             let mse_ceil = sse_ceil / t.n_values as f64;
             let mse_ratio = if mse_ceil > 0.0 { mse / mse_ceil } else { 1.0 };
-            let agg = section_agg.entry(t.section).or_insert(SectAgg {
+            let agg = section_agg.entry(section).or_insert(SectAgg {
                 tensors: 0,
                 n: 0,
                 sse_new: 0.0,
@@ -810,7 +1000,7 @@ fn main() {
             serde_json::to_writer(
                 &mut sidecar,
                 &serde_json::json!({
-                    "name": t.name, "section": t.section, "dtype": "nvfp4",
+                    "name": t.name, "section": section, "dtype": "nvfp4",
                     "n": t.n_values, "global_scale": global,
                     "max_abs_err": stats.max_abs_err,
                     "mean_abs_err": stats.sum_abs_err / t.n_values as f64,
@@ -826,15 +1016,25 @@ fn main() {
             .expect("sidecar line");
             writeln!(sidecar).expect("sidecar newline");
         } else {
-            out.write_all(&raw).expect("write bf16");
-            entry_json["dtype"] = serde_json::Value::from(if is_i64 { "i64" } else { "bf16" });
-            entry_json["len"] = serde_json::Value::from(raw.len() as u64);
-            blob_len += raw.len() as u64;
+            // bf16 and i64: the source's raw bytes (`recipe::decide` guarantees a bf16 keep
+            // has a BF16 source). f32 (C6, the dense row's A_log): an F32 source is carried,
+            // a BF16 source is widened exactly (bf16 is the top half of an f32).
+            let out_dtype = t.decision.dtype;
+            let payload: Vec<u8> = if out_dtype == recipe::DtypeOut::F32 && dt_in == "BF16" {
+                bytes_to_f32(&raw, "BF16").iter().flat_map(|v| v.to_le_bytes()).collect()
+            } else {
+                raw
+            };
+            assert_eq!(payload.len() as u64, out_dtype.bytes(t.n_values), "{}: payload length", t.name);
+            out.write_all(&payload).expect("write keep");
+            entry_json["dtype"] = serde_json::Value::from(out_dtype.as_str());
+            entry_json["len"] = serde_json::Value::from(payload.len() as u64);
+            blob_len += payload.len() as u64;
             bf16_count += 1;
             serde_json::to_writer(
                 &mut sidecar,
                 &serde_json::json!({
-                    "name": t.name, "section": t.section, "dtype": "bf16", "n": t.n_values,
+                    "name": t.name, "section": section, "dtype": out_dtype.as_str(), "n": t.n_values,
                 }),
             )
             .expect("sidecar line");
@@ -847,7 +1047,7 @@ fn main() {
                 i + 1,
                 tensors.len(),
                 t.name,
-                t.section,
+                section,
                 blob_len as f64 / 1e9,
                 t_start.elapsed().as_secs_f64()
             );
@@ -879,7 +1079,7 @@ fn main() {
     sidecar.flush().ok();
 
     // coverage check in dir mode: every tensor the model index knows must be in the output
-    if let Some(wm) = &weight_map {
+    if let Some(wm) = &m.weight_map {
         let mut missing = 0usize;
         for name in wm.keys() {
             if !tensors.iter().any(|t| &t.name == name) {
@@ -889,22 +1089,12 @@ fn main() {
         }
         if missing > 0 {
             eprintln!("coverage check FAILED: {missing} tensors missing");
-            std::process::exit(3);
+            return 3;
         }
         eprintln!("coverage check: all {} weight_map tensors present", wm.len());
     }
 
-    let index = serde_json::json!({
-        "format": "crow-nest-quant", "version": 1,
-        "block_geometry": { "values": 64, "sub_block": 16, "bytes_per_block": 36, "bpw": 4.5 },
-        "sections": {
-            "ple": { "format": "nvfp4", "exchangeable_to": "fp8" },
-            "vit": { "optional_to_load": true },
-            "mtp": { "optional_to_load": true }
-        },
-        "blob_offset": blob_start,
-        "tensors": index_tensors,
-    });
+    let index = index_v2(&model, scales_mode_str, blob_start, index_tensors);
     let index_json = serde_json::to_vec_pretty(&index).expect("index json");
     out.write_all(&index_json).expect("index");
     out.write_all(&(index_json.len() as u64).to_le_bytes()).expect("index len");
@@ -930,9 +1120,47 @@ expected under --scales mse, see the MSE report"
             );
         } else {
             eprintln!("WARNING: {total_violations} bound violations — check the sidecar");
-            std::process::exit(1);
+            return 1;
         }
     }
+    0
+}
+
+/// The index v2 trailer (Crow #300 C6). What changed against v1 (`64c242b`):
+///
+/// - `format_version: 2` replaces `version: 1`; the engine reads a v1 index only for the one
+///   container of record (`engine/src/cnq.rs`, `CNQ45M_INDEX_SHA256`);
+/// - `recipe` names the family row that decided every tensor's dtype, `scales` the sub-block
+///   scale policy;
+/// - `model` carries the checkpoint: `config.json` and `generation_config.json` as verbatim
+///   strings with their sha256, the family, the derived geometry and the source repo, revision
+///   and per-shard sha256 (`recipe::ModelSource::model_block`);
+/// - `sections` lists only the sections the container has (a dense model has no `ple`).
+///
+/// The tensor records, the block geometry and `blob_offset` are unchanged.
+fn index_v2(model: &recipe::ModelSource, scales: &str, blob_offset: u64, tensors: Vec<serde_json::Value>) -> serde_json::Value {
+    let present = |s: &str| tensors.iter().any(|t| t["section"] == s);
+    let mut sections = serde_json::Map::new();
+    if present("ple") {
+        sections.insert("ple".into(), serde_json::json!({ "format": "nvfp4", "exchangeable_to": "fp8" }));
+    }
+    if present("vit") {
+        sections.insert("vit".into(), serde_json::json!({ "optional_to_load": true }));
+    }
+    if present("mtp") {
+        sections.insert("mtp".into(), serde_json::json!({ "optional_to_load": true }));
+    }
+    serde_json::json!({
+        "format": "crow-nest-quant",
+        "format_version": 2,
+        "recipe": model.family.recipe(),
+        "scales": scales,
+        "model": model.model_block(),
+        "block_geometry": { "values": 64, "sub_block": 16, "bytes_per_block": 36, "bpw": 4.5 },
+        "sections": sections,
+        "blob_offset": blob_offset,
+        "tensors": tensors,
+    })
 }
 
 // ---------------- tests ----------------
@@ -1040,6 +1268,159 @@ mod tests {
                 assert_eq!(st.sum_sq_err, sse_ceil);
             }
         }
+    }
+
+    // ---- Crow #300 C6: the index v2 round trip ----
+
+    /// The synthetic dense model of the index v2 fixture: every row of the dense recipe once
+    /// (nvfp4, bf16 keeps, the f32 A_log, the mtp and vit sections), BF16 values from a fixed
+    /// LCG. Returns (name, shape) in file order.
+    fn synthetic_v2_tensors() -> Vec<(&'static str, Vec<usize>)> {
+        vec![
+            ("model.language_model.embed_tokens.weight", vec![128, 64]),
+            ("model.language_model.layers.0.input_layernorm.weight", vec![64]),
+            ("model.language_model.layers.0.linear_attn.A_log", vec![2]),
+            ("model.language_model.layers.0.linear_attn.dt_bias", vec![2]),
+            ("model.language_model.layers.0.linear_attn.conv1d.weight", vec![128, 1, 4]),
+            ("model.language_model.layers.0.linear_attn.in_proj_a.weight", vec![2, 64]),
+            ("model.language_model.layers.0.linear_attn.in_proj_qkv.weight", vec![128, 64]),
+            ("model.language_model.layers.0.linear_attn.out_proj.weight", vec![64, 64]),
+            ("model.language_model.layers.0.mlp.gate_proj.weight", vec![128, 64]),
+            ("model.language_model.layers.1.self_attn.q_proj.weight", vec![128, 64]),
+            ("model.language_model.layers.1.self_attn.k_norm.weight", vec![32]),
+            ("model.language_model.layers.1.mlp.down_proj.weight", vec![64, 128]),
+            ("model.language_model.norm.weight", vec![64]),
+            ("lm_head.weight", vec![128, 64]),
+            ("mtp.fc.weight", vec![64, 128]),
+            ("model.visual.blocks.0.attn.qkv.weight", vec![192, 64]),
+        ]
+    }
+
+    /// Write the synthetic model as one BF16 `.safetensors` file.
+    fn write_synthetic_safetensors(path: &std::path::Path) {
+        let mut header = serde_json::Map::new();
+        let mut data: Vec<u8> = Vec::new();
+        let mut x: u32 = 0xC6C6_0300;
+        for (name, shape) in synthetic_v2_tensors() {
+            let n: usize = shape.iter().product();
+            let begin = data.len();
+            for _ in 0..n {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                let v = (((x >> 8) % 2001) as f32 - 1000.0) / 4000.0;
+                data.extend_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
+            }
+            header.insert(name.into(), serde_json::json!({ "dtype": "BF16", "shape": shape, "data_offsets": [begin, data.len()] }));
+        }
+        header.insert("__metadata__".into(), serde_json::json!({ "format": "pt" }));
+        let h = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(&(h.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(&h).unwrap();
+        f.write_all(&data).unwrap();
+    }
+
+    fn fixture_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/tests/fixtures/synthetic-v2")
+    }
+
+    fn trailer(bytes: &[u8]) -> serde_json::Value {
+        let n = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
+        serde_json::from_slice(&bytes[bytes.len() - 8 - n..bytes.len() - 8]).unwrap()
+    }
+
+    /// A synthetic v2 container written by `convert` carries both config files byte for byte,
+    /// with their sha256, the family, the recipe, the geometry and the provenance; the f32 row
+    /// is the exact widening of the BF16 source; and the container is byte-identical to the
+    /// engine's fixture `engine/tests/fixtures/synthetic-v2/synthetic-v2.cnq`, which
+    /// `engine/src/cnq.rs` reads back. That pair is the round trip across the two crates.
+    /// `CNQ_C6_REGEN=1` rewrites the fixture instead of comparing.
+    #[test]
+    fn a_synthetic_v2_container_carries_its_config_verbatim_and_is_the_engine_fixture() {
+        let dir = std::env::temp_dir().join(format!("cnq-c6-v2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = std::fs::read(fixture_dir().join("config.json")).unwrap();
+        let gen = std::fs::read(fixture_dir().join("generation_config.json")).unwrap();
+        std::fs::write(dir.join("config.json"), &cfg).unwrap();
+        std::fs::write(dir.join("generation_config.json"), &gen).unwrap();
+        let st = dir.join("model.safetensors");
+        write_synthetic_safetensors(&st);
+        let out = dir.join("synthetic-v2.cnq");
+        let prov = Provenance { repo: Some("crow-nest/synthetic-v2".into()), revision: Some("c6".into()) };
+        assert_eq!(convert(&st, &out, ScalesMode::Ceil, &prov), 0);
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(&bytes[..4], b"CNQ1");
+        let idx = trailer(&bytes);
+        assert_eq!(idx["format_version"], 2);
+        assert!(idx.get("version").is_none());
+        assert_eq!(idx["recipe"], "cnq4.5-qwen35-dense");
+        let m = &idx["model"];
+        assert_eq!(m["family"], "Qwen35Dense");
+        assert_eq!(m["config_json"].as_str().unwrap().as_bytes(), cfg.as_slice());
+        assert_eq!(m["generation_config_json"].as_str().unwrap().as_bytes(), gen.as_slice());
+        assert_eq!(m["config_json_sha256"], recipe::sha256_hex(&cfg));
+        assert_eq!(m["generation_config_json_sha256"], recipe::sha256_hex(&gen));
+        assert_eq!(m["geo"]["hidden"], 64);
+        assert_eq!(m["geo"]["gqa"], 2);
+        assert_eq!(m["source"]["repo"], "crow-nest/synthetic-v2");
+        assert_eq!(m["source"]["revision"], "c6");
+        let sh = &m["source"]["shards"][0];
+        assert_eq!(sh["sha256"], recipe::sha256_file(&st).unwrap());
+        assert_eq!(sh["sha256_from"], "computed");
+        assert_eq!(idx["sections"].as_object().unwrap().keys().collect::<Vec<_>>(), ["mtp", "vit"]);
+        // dtypes per the dense row, and the f32 A_log is the BF16 source widened exactly
+        let ts = idx["tensors"].as_array().unwrap();
+        let get = |n: &str| ts.iter().find(|t| t["name"] == n).unwrap();
+        assert_eq!(get("lm_head.weight")["dtype"], "nvfp4");
+        assert_eq!(get("model.language_model.layers.0.linear_attn.in_proj_a.weight")["dtype"], "bf16");
+        assert_eq!(get("model.language_model.layers.0.linear_attn.conv1d.weight")["dtype"], "bf16");
+        assert_eq!(get("mtp.fc.weight")["section"], "mtp");
+        assert_eq!(get("model.visual.blocks.0.attn.qkv.weight")["section"], "vit");
+        let a = get("model.language_model.layers.0.linear_attn.A_log");
+        assert_eq!((a["dtype"].as_str(), a["len"].as_u64()), (Some("f32"), Some(8)));
+        let (hdr, start) = read_safetensors_header(&st).unwrap();
+        let src_off = start + hdr["model.language_model.layers.0.linear_attn.A_log"]["data_offsets"][0].as_u64().unwrap();
+        let src = std::fs::read(&st).unwrap();
+        let at = (12 + a["offset"].as_u64().unwrap()) as usize;
+        for i in 0..2 {
+            let b = u16::from_le_bytes([src[src_off as usize + 2 * i], src[src_off as usize + 2 * i + 1]]);
+            let w = u32::from_le_bytes(bytes[at + 4 * i..at + 4 * i + 4].try_into().unwrap());
+            assert_eq!(w, (b as u32) << 16, "A_log[{i}]");
+        }
+        // the engine fixture
+        let fx = fixture_dir().join("synthetic-v2.cnq");
+        if std::env::var("CNQ_C6_REGEN").as_deref() == Ok("1") {
+            std::fs::write(&fx, &bytes).unwrap();
+        }
+        let want = std::fs::read(&fx).expect("engine/tests/fixtures/synthetic-v2/synthetic-v2.cnq (CNQ_C6_REGEN=1 writes it)");
+        assert!(want == bytes, "the converter no longer writes the engine's fixture byte for byte ({} vs {} B)", bytes.len(), want.len());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// No config, no container: an index v2 carries the checkpoint's config, so a conversion
+    /// without `config.json` beside the input is refused before anything is written; so is one
+    /// without `--source-repo`.
+    #[test]
+    fn a_conversion_without_config_or_source_repo_is_refused() {
+        let dir = std::env::temp_dir().join(format!("cnq-c6-noconf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = dir.join("model.safetensors");
+        write_synthetic_safetensors(&st);
+        let out = dir.join("x.cnq");
+        let prov = Provenance { repo: Some("r".into()), revision: Some("v".into()) };
+        let m = build_manifest(&st).err().unwrap();
+        assert!(m.contains("carries the checkpoint's config.json"), "{m}");
+        assert_eq!(convert(&st, &out, ScalesMode::Ceil, &prov), 2);
+        assert!(!out.exists());
+        std::fs::copy(fixture_dir().join("config.json"), dir.join("config.json")).unwrap();
+        std::fs::copy(fixture_dir().join("generation_config.json"), dir.join("generation_config.json")).unwrap();
+        let m = build_manifest(&st).unwrap();
+        let e = provenance(&m, &Provenance { repo: None, revision: Some("v".into()) }, false).err().unwrap();
+        assert!(e.contains("--source-repo"), "{e}");
+        let e = provenance(&m, &Provenance { repo: Some("r".into()), revision: None }, false).err().unwrap();
+        assert!(e.contains("no --revision"), "{e}");
+        assert_eq!(convert(&st, &out, ScalesMode::Ceil, &Provenance::default()), 2);
+        assert!(!out.exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

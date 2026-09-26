@@ -48,20 +48,7 @@ pub struct BaseEntry {
 /// The base container's index. Same trailer rule as `requant_check`: the last 8 bytes are the
 /// u64 length of the JSON that sits in front of them.
 pub fn read_base_index(path: &Path) -> std::io::Result<Vec<BaseEntry>> {
-    let mut f = std::fs::File::open(path)?;
-    let mut magic = [0u8; 4];
-    f.read_exact(&mut magic)?;
-    if &magic != MAGIC {
-        return Err(std::io::Error::other(format!("{}: magic is {magic:?}, not CNQ1", path.display())));
-    }
-    let trailer = f.seek(SeekFrom::End(-8))?;
-    let mut len_buf = [0u8; 8];
-    f.read_exact(&mut len_buf)?;
-    let index_len = u64::from_le_bytes(len_buf);
-    f.seek(SeekFrom::Start(trailer - index_len))?;
-    let mut buf = vec![0u8; index_len as usize];
-    f.read_exact(&mut buf)?;
-    let index: serde_json::Value = serde_json::from_slice(&buf)?;
+    let index = read_index_json(path)?;
     let blob_offset = index["blob_offset"].as_u64().unwrap_or(12);
     if blob_offset != 12 {
         return Err(std::io::Error::other(format!(
@@ -83,6 +70,26 @@ pub fn read_base_index(path: &Path) -> std::io::Result<Vec<BaseEntry>> {
         });
     }
     Ok(out)
+}
+
+/// The whole index trailer as JSON (Crow #300 C6: the layer-rule arms read the base's
+/// `model.family` from it; `read_base_index` reads its tensor list).
+pub fn read_index_json(path: &Path) -> std::io::Result<serde_json::Value> {
+    let mut f = std::fs::File::open(path)?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic)?;
+    if &magic != MAGIC {
+        return Err(std::io::Error::other(format!("{}: magic is {magic:?}, not CNQ1", path.display())));
+    }
+    let trailer = f.seek(SeekFrom::End(-8))?;
+    let mut len_buf = [0u8; 8];
+    f.read_exact(&mut len_buf)?;
+    let index_len = u64::from_le_bytes(len_buf);
+    f.seek(SeekFrom::Start(trailer - index_len))?;
+    let mut buf = vec![0u8; index_len as usize];
+    f.read_exact(&mut buf)?;
+    let index: serde_json::Value = serde_json::from_slice(&buf)?;
+    Ok(index)
 }
 
 /// The #76 selection rule, derived from the container's own index: a text-section NVFP4 tensor

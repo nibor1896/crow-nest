@@ -61,7 +61,8 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::dense_overlay::{blocks_to_bf16, is_dense_text, kind_of, read_base_index, utc_date_string, BaseEntry};
+use crate::dense_overlay::{blocks_to_bf16, is_dense_text, kind_of, read_base_index, read_index_json, utc_date_string, BaseEntry};
+use crate::recipe::Family;
 use crate::expert_overlay::layer_of;
 use crate::{read_safetensors_header, MAGIC};
 
@@ -109,8 +110,34 @@ impl LayerRule {
 pub struct Arm {
     pub name: &'static str,
     pub what: &'static str,
+    /// the kinds on a Flash-Next base (the #91 phase 1 arms as they were measured)
     pub kinds: &'static [&'static str],
+    /// Crow #300 C6: the same arm's kinds on a dense Qwen3.5/3.8 base. The dense MLP has no
+    /// shared expert: its `ffn_down` is `mlp.down_proj`. The attention and GDN names are the
+    /// same in both families.
+    pub kinds_dense: &'static [&'static str],
     pub layer_rule: LayerRule,
+}
+
+impl Arm {
+    /// The arm's kinds on a base of `family` (read from the base's index, `base_family`).
+    pub fn kinds(&self, family: Family) -> &'static [&'static str] {
+        match family {
+            Family::FlashNext => self.kinds,
+            Family::Qwen35Dense => self.kinds_dense,
+        }
+    }
+}
+
+/// The family of a base container: `model.family` of an index v2 (Crow #300 C6); a v1 index is
+/// Flash-Next, because the only v1 container the engine accepts is the Flash-Next CNQ4.5-M
+/// container of record (`engine/src/cnq.rs`, `CNQ45M_INDEX_SHA256`).
+pub fn base_family(index: &serde_json::Value) -> Result<Family, String> {
+    if index.get("format_version").is_none() {
+        return Ok(Family::FlashNext);
+    }
+    let name = index["model"]["family"].as_str().unwrap_or("");
+    Family::from_name(name).ok_or_else(|| format!("the base index names model family '{name}', which this converter has no arms for"))
 }
 
 pub const ARMS: &[Arm] = &[
@@ -120,6 +147,7 @@ pub const ARMS: &[Arm] = &[
             what: "attention v/out projections to bf16 on every layer (llama.cpp: attn_v is the \
 most sensitive attention tensor and gets the top tier; the router and lm_head are already bf16)",
             kinds: &["self_attn.v_proj", "self_attn.o_proj", "linear_attn.out_proj"],
+            kinds_dense: &["self_attn.v_proj", "self_attn.o_proj", "linear_attn.out_proj"],
             layer_rule: LayerRule::All,
         }
     },
@@ -129,6 +157,7 @@ most sensitive attention tensor and gets the top tier; the router and lm_head ar
             what: "the ffn_down-equivalent dense tensor to bf16 on llama.cpp's use_more_bits \
 layers: first eighth, last eighth, every third middle layer",
             kinds: &["mlp.shared_expert.down_proj"],
+            kinds_dense: &["mlp.down_proj"],
             layer_rule: LayerRule::LlamaUseMoreBits,
         }
     },
@@ -138,6 +167,7 @@ layers: first eighth, last eighth, every third middle layer",
             what: "the ffn_down-equivalent dense tensor to bf16 on every layer — the companion \
 that separates the layer rule from the tensor",
             kinds: &["mlp.shared_expert.down_proj"],
+            kinds_dense: &["mlp.down_proj"],
             layer_rule: LayerRule::All,
         }
     },
@@ -163,11 +193,11 @@ pub fn n_layers_of(index: &[BaseEntry]) -> usize {
 /// Does `e` belong to the arm? The dense-text rule of #77 (text section, nvfp4, not a routed
 /// expert), then the arm's kinds, then the arm's layer rule. A kind that matches no tensor is
 /// the empty-overlay hazard #77 refuses, so the caller refuses it too.
-pub fn arm_selects(arm: &Arm, e: &BaseEntry, n_layers: usize) -> bool {
+pub fn arm_selects(arm: &Arm, family: Family, e: &BaseEntry, n_layers: usize) -> bool {
     if !is_dense_text(e) {
         return false;
     }
-    if !arm.kinds.contains(&kind_of(&e.name).as_str()) {
+    if !arm.kinds(family).contains(&kind_of(&e.name).as_str()) {
         return false;
     }
     match arm.layer_rule {
@@ -284,21 +314,29 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
+    let family = match read_index_json(&base).map_err(|e| e.to_string()).and_then(|v| base_family(&v)) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("base container index: {e}");
+            return 2;
+        }
+    };
     let n_layers = n_layers_of(&index);
     if n_layers == 0 {
         eprintln!("the base index carries no model.language_model.layers.<N> text tensors");
         return 2;
     }
-    let selected: Vec<&BaseEntry> = index.iter().filter(|e| arm_selects(arm, e, n_layers)).collect();
+    let selected: Vec<&BaseEntry> = index.iter().filter(|e| arm_selects(arm, family, e, n_layers)).collect();
     let layers: Vec<usize> = selected.iter().filter_map(|e| layer_of(&e.name)).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     println!(
-        "base      {}: {} B, {} tensors, {} layers — arm {} (kinds {}, layer rule {})",
+        "base      {}: {} B, {} tensors, {} layers, family {} — arm {} (kinds {}, layer rule {})",
         base.display(),
         base_len,
         index.len(),
         n_layers,
+        family.name(),
         arm.name,
-        arm.kinds.join(","),
+        arm.kinds(family).join(","),
         arm.layer_rule.name()
     );
     match arm.layer_rule {
@@ -314,7 +352,7 @@ pub fn run(args: &[String]) -> i32 {
     }
     // a kind that selects nothing is the #77 empty-overlay hazard: it would be measured as
     // "the originals change nothing"
-    for k in arm.kinds {
+    for k in arm.kinds(family) {
         if !selected.iter().any(|e| kind_of(&e.name) == *k) {
             eprintln!("kind {k} of arm {} selects no tensor of this base — refusing", arm.name);
             return 2;
@@ -326,7 +364,7 @@ pub fn run(args: &[String]) -> i32 {
     }
     // the issue's arm (a) names the router and the output head beside v/out: in THIS container
     // both are already bf16, and a tool that quietly wrote a no-op would be read as one
-    if arm.name == "attn-v-out" {
+    if arm.name == "attn-v-out" && family == Family::FlashNext {
         let already: Vec<&str> = index
             .iter()
             .filter(|e| {
@@ -341,6 +379,10 @@ pub fn run(args: &[String]) -> i32 {
             already.len(),
             &already[..already.len().min(3)]
         );
+    } else if arm.name == "attn-v-out" {
+        // C6: a dense base has no router, and its recipe quantizes lm_head - nothing named
+        // beside v/out is already bf16, and this arm does not elevate the head either
+        println!("dense base: no router; lm_head is nvfp4 under the {} recipe and not part of this arm", Family::Qwen35Dense.recipe());
     }
 
     // ---- the source side (#77 verbatim) ----
@@ -475,7 +517,7 @@ be built from the container it shadows",
             "source": source_str,
             "arm": arm.name,
             "arm_what": arm.what,
-            "kinds": arm.kinds,
+            "kinds": arm.kinds(family),
             "layer_rule": arm.layer_rule.name(),
             "n_layers": n_layers,
             "layers": layers,
@@ -612,7 +654,7 @@ mod tests {
             e("model.language_model.layers.3.mlp.shared_expert.down_proj.weight", "nvfp4"),
         ];
         let arm = arm_by_name("attn-v-out").unwrap();
-        let got: Vec<&str> = idx.iter().filter(|t| arm_selects(arm, t, 48)).map(|t| t.name.as_str()).collect();
+        let got: Vec<&str> = idx.iter().filter(|t| arm_selects(arm, Family::FlashNext, t, 48)).map(|t| t.name.as_str()).collect();
         assert_eq!(got, vec![
             "model.language_model.layers.3.self_attn.v_proj.weight",
             "model.language_model.layers.3.self_attn.o_proj.weight",
@@ -629,14 +671,45 @@ mod tests {
         let rule = arm_by_name("ffn-down-rule").unwrap();
         let got: Vec<usize> = idx
             .iter()
-            .filter(|t| arm_selects(rule, t, 48))
+            .filter(|t| arm_selects(rule, Family::FlashNext, t, 48))
             .map(|t| layer_of(&t.name).unwrap())
             .collect();
         assert_eq!(got, use_more_bits_layers(48));
         let all = arm_by_name("ffn-down-all").unwrap();
-        assert_eq!(idx.iter().filter(|t| arm_selects(all, t, 48)).count(), 48);
+        assert_eq!(idx.iter().filter(|t| arm_selects(all, Family::FlashNext, t, 48)).count(), 48);
         // layer 6 and 7 are in NO arm: the first eighth ends at 5 and the middle stride starts at 8
         assert!(!llama_use_more_bits(6, 48) && !llama_use_more_bits(7, 48));
+    }
+
+    /// Crow #300 C6: the arms name their kinds per family. On a dense base the ffn_down arm is
+    /// `mlp.down_proj` (there is no shared expert) over the base's own 64 layers, and the base's
+    /// family comes off its index (`model.family` of a v2 index; a v1 index is Flash-Next).
+    #[test]
+    fn the_arms_name_their_kinds_per_family_and_the_family_comes_off_the_base_index() {
+        let mut idx = Vec::new();
+        for l in 0..64 {
+            idx.push(e(&format!("model.language_model.layers.{l}.mlp.down_proj.weight"), "nvfp4"));
+            idx.push(e(&format!("model.language_model.layers.{l}.mlp.shared_expert.down_proj.weight"), "nvfp4"));
+        }
+        let all = arm_by_name("ffn-down-all").unwrap();
+        let dense: Vec<&str> = idx.iter().filter(|t| arm_selects(all, Family::Qwen35Dense, t, 64)).map(|t| t.name.as_str()).collect();
+        assert_eq!(dense.len(), 64);
+        assert!(dense.iter().all(|n| n.ends_with(".mlp.down_proj.weight")), "{dense:?}");
+        let flash: Vec<&str> = idx.iter().filter(|t| arm_selects(all, Family::FlashNext, t, 64)).map(|t| t.name.as_str()).collect();
+        assert!(flash.iter().all(|n| n.contains("shared_expert")), "{flash:?}");
+        let rule = arm_by_name("ffn-down-rule").unwrap();
+        let got: Vec<usize> = idx
+            .iter()
+            .filter(|t| arm_selects(rule, Family::Qwen35Dense, t, 64))
+            .filter_map(|t| layer_of(&t.name))
+            .collect();
+        assert_eq!(got, use_more_bits_layers(64));
+        assert_eq!(arm_by_name("attn-v-out").unwrap().kinds(Family::Qwen35Dense), &["self_attn.v_proj", "self_attn.o_proj", "linear_attn.out_proj"]);
+
+        assert_eq!(base_family(&serde_json::json!({ "version": 1 })).unwrap(), Family::FlashNext);
+        assert_eq!(base_family(&serde_json::json!({ "format_version": 2, "model": { "family": "Qwen35Dense" } })).unwrap(), Family::Qwen35Dense);
+        let m = base_family(&serde_json::json!({ "format_version": 2, "model": { "family": "Llama" } })).unwrap_err();
+        assert!(m.contains("'Llama'"), "{m}");
     }
 
     #[test]

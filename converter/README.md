@@ -2,7 +2,7 @@
 
 | item | value |
 |---|---|
-| what it does | streams the original safetensors shard by shard and writes one CNQ v1 container |
+| what it does | streams the original safetensors shard by shard and writes one CNQ container with an index v2 (Crow #300 C6, 2026-09-26; v1 before) |
 | quantization | NVFP4 per ggml geometry, round to nearest, calibration free |
 | what it never does | hold the model in RAM, judge its own output, or read a GGUF |
 | spec | `../docs/architecture.md` section 1, approved 2026-09-02 |
@@ -12,16 +12,22 @@
 ## Usage
 
 ```
-usage: converter [--scales ceil|mse] <model-dir | file.safetensors> <out.cnq>
+usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>] <model-dir | file.safetensors> <out.cnq>
+  writes an index v2 container: config.json + generation_config.json verbatim, the family's recipe, source repo/revision/shard sha256
+  (--revision defaults to the Hugging Face cache in the model dir; Crow #300 C6)
   --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)
   --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report
        converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>
   re-quantizes fetched originals and compares them with the container's own bytes (#76)
+       converter plan [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>
+  the dry run: family, recipe, per-tensor dtype/section table, GPU / host byte totals (Crow #300 C6)
 ```
 
 - The usage text above is the `HELP` constant verbatim (`src/main.rs:503`).
 - Input is a directory with `model.safetensors.index.json`, or a single `.safetensors` file.
 - Two positional arguments are required; anything else exits 2.
+- `config.json` and `generation_config.json` must sit in the model directory (or beside the single file): the index v2 carries them, and `text_config.model_type` picks the recipe. `--source-repo` is required; a missing one exits 2 before anything is written.
+- The usage block above omits the overlay and `imatrix-show` lines of `HELP`.
 - `requant-check` is the read-only subcommand of issue #76; it is described below.
 
 ## Container layout
@@ -50,7 +56,21 @@ usage: converter [--scales ceil|mse] <model-dir | file.safetensors> <out.cnq>
 | second level | one global `f32` scale per tensor | `src/main.rs:11` |
 | calibration | none, round to nearest | `src/main.rs:11` |
 
-## BF16 keep set
+## Index v2 and the per-model recipe (Crow #300 C6, 2026-09-26)
+
+| item | value |
+|---|---|
+| index keys added | `format_version: 2` (replaces `version: 1`), `recipe`, `scales`, `model` |
+| `model` block | `config_json` and `generation_config_json` verbatim as strings, each with its hash in `<name>_sha256`; `family`, `model_type`, `geo`; `source.repo`, `source.revision`, `source.shards[]` (`file`, `size`, `sha256`, `sha256_from`: `hf-lfs` or `computed`) |
+| recipe rows | `cnq4.5-flash-next` (`qwen4_exp_text`): the keep set below, verbatim. `cnq4.5-qwen35-dense` (`qwen3_5_text`): the phase 2 recipe, a whitelist |
+| new dtype | `f32`: the dense row's `A_log`, widened exactly from BF16 |
+| dry run | `converter plan <model-dir>`: headers and configs only |
+| source | `src/recipe.rs`, `src/main.rs` `index_v2`; full table in `../docs/architecture.md` 1.7 |
+
+- The Flash-Next row is proved against all 1658 tensors of the CNQ4.5-M index (`tests/fixtures/cnq45m-index.tsv`, extracted 2026-09-26).
+- The engine accepts a v1 index only for the CNQ4.5-M container of record (`../engine/src/cnq.rs`, `CNQ45M_INDEX_SHA256`).
+
+## BF16 keep set (the Flash-Next row)
 
 - Approved as spec 1.2 on 2026-09-02, source `src/main.rs:13-17`.
 
@@ -126,4 +146,5 @@ cargo test --release
 ```
 
 - Seven `#[test]` functions in `src/main.rs`, counted 2026-09-17, plus five in `src/requant_check.rs` added on 2026-09-18 (issue #76), so `cargo test --release` in this crate reads 12 passed, 0 failed on 2026-09-18.
+- 2026-09-26 (Crow #300 C6): `cargo test` reads 57 passed, 0 failed (46 before C6; the eleven new ones cover the recipe rows, the index v2 round trip against `../engine/tests/fixtures/synthetic-v2/`, provenance and the per-family layer-rule arms).
 - They are not part of the engine's count: `cd engine && cargo test --release` reads 165 passed, 0 failed on 2026-09-17 and covers `crow_nest_engine` and `bin/serve` only. `tools/gate-linux.sh` pins THAT count, not this one, so a test added here moves no gate value.
