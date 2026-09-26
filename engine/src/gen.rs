@@ -976,7 +976,7 @@ impl Engine {
         let mx_down = load_pw(cnq, "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight", sec);
         let mx_up = load_pw(cnq, "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight", sec);
 
-        log("loading 48 dense layer bundles (FP4 + keeps) …");
+        log(&format!("loading {} dense layer bundles (FP4 + keeps) …", d.layers));
         let mut hc = Vec::with_capacity(d.layers);
         let mut sub = Vec::with_capacity(d.layers);
         let mut moe = Vec::with_capacity(d.layers);
@@ -1007,8 +1007,8 @@ impl Engine {
                     z: load_pw(cnq, &pfx("linear_attn.in_proj_z.weight"), sec),
                     b: load_pw(cnq, &pfx("linear_attn.in_proj_b.weight"), sec),
                     a: load_pw(cnq, &pfx("linear_attn.in_proj_a.weight"), sec),
-                    alog: load_small_f32(cnq, &pfx("linear_attn.A_log"), sec, 48),
-                    dt: load_small_f32(cnq, &pfx("linear_attn.dt_bias"), sec, 48),
+                    alog: load_small_f32(cnq, &pfx("linear_attn.A_log"), sec, d.gdn_vheads),
+                    dt: load_small_f32(cnq, &pfx("linear_attn.dt_bias"), sec, d.gdn_vheads),
                     norm: load_f32(cnq, &pfx("linear_attn.norm.weight"), sec),
                     out: load_pw(cnq, &pfx("linear_attn.out_proj.weight"), sec),
                 });
@@ -1022,7 +1022,7 @@ impl Engine {
                 sgate: load_f32(cnq, &pfx("mlp.shared_expert_gate.weight"), sec),
             });
             if l % 12 == 0 {
-                log(&format!("  dense layers {l}/48"));
+                log(&format!("  dense layers {l}/{}", d.layers));
             }
         }
         // mlp HC bundle (second per-layer HC block)
@@ -1190,7 +1190,7 @@ impl Engine {
         // It sits in the [load] block, so the parity gate prints it too.
         let gfi = env_or_unset("CROW_GDN_FUSE_IN");
         println!("[gdn] decode input projections {}, CROW_GDN_FUSE_IN {} (0 = per-slab fallback of record, four launches), CROW_GDN_SPLIT_Z {} (#71, default off, 1 = z out of the group)",
-            if !gdn_fuse_in_on() { "per-slab (fallback of record, four launches: gemv_fp4_mma_d32[320x1] + [192x1] + two gemv_fp4_mma_d[1x1])".to_string() }
+            if !gdn_fuse_in_on() { format!("per-slab (fallback of record, four launches: gemv_fp4_mma_d32[{}x1] + [{}x1] + two gemv_fp4_mma_d[1x1])", d.gdn_conv.div_ceil(32), d.gdn_val.div_ceil(32)) }
             else if gdn_split_z_on() { format!("split (71, two launches: gemv_fp4_mma_g32[{}x1] qkv+b+a + gemv_fp4_mma_d32[{}x1] z)",
                 (d.gdn_conv + 2 * d.gdn_vheads).div_ceil(32), d.gdn_val.div_ceil(32)) }
             else { format!("grouped (default since 19g, one launch: gemv_fp4_mma_g32[{}x1] qkv+z+b+a)",
@@ -1397,11 +1397,12 @@ impl Engine {
 
         let dense_after = cuda::total_vram_bytes() - cuda::free_vram_bytes();
         log(&format!(
-            "load done in {:.0} s — VRAM used {:.2} GiB (dense {:.2} GiB + hot experts {} × 48 × {:.2} MB + states)",
+            "load done in {:.0} s — VRAM used {:.2} GiB (dense {:.2} GiB + hot experts {} × {} × {:.2} MB + states)",
             t0.elapsed().as_secs_f64(),
             dense_after as f64 / GIB,
             dense_measured as f64 / GIB,
             res.n,
+            d.layers,
             (res.gu_bytes + res.dn_bytes) as f64 / MIB
         ));
 
@@ -2387,9 +2388,9 @@ impl Scratch {
 impl Engine {
     // (kc, vc, qsa_keys, qsa_pooled) device addresses of a layer's caches
     fn layer_cache_ptrs(&self, layer: usize) -> (u64, u64, u64, u64) {
-        let ai = attn_index(layer);
+        let ai = self.d.attn_index(layer);
         let bpv = self.st.kv.byte_per_value() as u64;
-        let per_layer = (NKV * self.st.context * AHD) as u64 * bpv;
+        let per_layer = (self.d.nkv * self.st.context * self.d.ahd) as u64 * bpv;
         // kv_buf holds ATTN_LAYERS layer slots — index by ATTENTION index,
         // not by the raw layer id (36 GDN layers shift the numbering!)
         let kc = self.st.kv_buf as u64 + (ai * 2) as u64 * per_layer;
@@ -2406,7 +2407,7 @@ impl Engine {
         let k = &self.k;
         let p = &self.p;
         let s = &self.s;
-        launch_v(k.f("rms_group"), 4, t as u32, 1, 256, &[x as u64, w.norm as u64, s.normed as u64]);
+        launch_v(k.f("rms_group"), self.d.hcn as u32, t as u32, 1, 256, &[x as u64, w.norm as u64, s.normed as u64]);
         // #19f, opt-in (CROW_QFUSE=1; default on 19g..2026-09-23): decode regime
         // (t < 8) fuses the
         // elementwise hc chain into the GEMV epilogues - hc_down_inj carries
@@ -2425,24 +2426,24 @@ impl Engine {
         if fuse {
             let PW::Bf16(dw) = &w.down else { unreachable!() };
             let PW::Bf16(uw) = &w.up else { unreachable!() };
-            launch_v(k.f("hc_down_inj"), ((LOWRANK + 7) / 8 + HCN) as u32, t as u32, 1, 256, &[
+            launch_v(k.f("hc_down_inj"), ((self.d.lowrank + 7) / 8 + self.d.hcn) as u32, t as u32, 1, 256, &[
                 *dw as u64, s.normed as u64, s.sil as u64,
                 w.inj.w() as u64, w.inj.gs() as u64, injw as u64, p.n10240 as u64, p.n320 as u64]);
-            launch_v(k.f("gemv_bf16_ws"), ((HCT + 7) / 8) as u32, t as u32, 1, 256, &[
+            launch_v(k.f("gemv_bf16_ws"), ((self.d.hct + 7) / 8) as u32, t as u32, 1, 256, &[
                 *uw as u64, s.sil as u64, s.mixw as u64, p.n320 as u64, p.n10240 as u64]);
         } else {
-            w.down.launch_gemv(k, LOWRANK, p.n320 as u64, t, p.t as u64, s.normed as u64, s.low as u64, p.n10240 as u64);
-            launch_v(k.f("silu_div4"), ((t * LOWRANK + 255) / 256) as u32, 1, 1, 256, &[
+            w.down.launch_gemv(k, self.d.lowrank, p.n320 as u64, t, p.t as u64, s.normed as u64, s.low as u64, p.n10240 as u64);
+            launch_v(k.f("silu_div4"), ((t * self.d.lowrank + 255) / 256) as u32, 1, 1, 256, &[
                 s.low as u64, s.sil as u64, p.nt_low as u64]);
-            w.up.launch_gemv(k, HCT, p.n10240 as u64, t, p.t as u64, s.sil as u64, s.mixw as u64, p.n320 as u64);
-            launch_v(k.f("sigmoid_el"), ((t * HCT + 255) / 256) as u32, 1, 1, 256, &[
+            w.up.launch_gemv(k, self.d.hct, p.n10240 as u64, t, p.t as u64, s.sil as u64, s.mixw as u64, p.n320 as u64);
+            launch_v(k.f("sigmoid_el"), ((t * self.d.hct + 255) / 256) as u32, 1, 1, 256, &[
                 s.mixw as u64, p.nt_hct as u64]);
         }
         if qfuse_on() && xq != 0 {
-            launch_v(k.f("mix_streams_q"), 10, t as u32, 1, 256, &[
+            launch_v(k.f("mix_streams_q"), (self.d.h / 256) as u32, t as u32, 1, 256, &[
                 s.mixw as u64, s.normed as u64, mixed as u64, xq as u64]);
         } else {
-            launch_v(k.f("mix_streams"), 10, t as u32, 1, 256, &[
+            launch_v(k.f("mix_streams"), (self.d.h / 256) as u32, t as u32, 1, 256, &[
                 s.mixw as u64, s.normed as u64, mixed as u64]);
         }
         // unfused chain: the inject GEMV + sig2_div4 stay their own launches
@@ -2452,16 +2453,16 @@ impl Engine {
         // rows=4 saturates the naive kernel (4×256 threads) while the MMA tile
         // is a single active warp on one SM — mma_d is ~10x SLOWER at t=1 and
         // still behind at t=512. Documented skip, quality/perf over uniformity.
-        w.inj.or_bf16(k, HCN, p.nr4, t, p.t, s.normed, s.injr, p.n10240, |iw, igs| {
+        w.inj.or_bf16(k, self.d.hcn, p.nr4, t, p.t, s.normed, s.injr, p.n10240, |iw, igs| {
         if inj_1k_on() {
-            launch_v(k.f("gemv_fp4_b1k"), HCN as u32, t as u32, 1, 1024, &[
+            launch_v(k.f("gemv_fp4_b1k"), self.d.hcn as u32, t as u32, 1, 1024, &[
                 iw as u64, s.normed as u64, igs as u64, s.injr as u64, p.n10240 as u64]);
         } else {
-            launch_v(k.f("gemv_fp4_b"), HCN as u32, t as u32, 1, 256, &[
+            launch_v(k.f("gemv_fp4_b"), self.d.hcn as u32, t as u32, 1, 256, &[
                 iw as u64, s.normed as u64, igs as u64, s.injr as u64, p.n10240 as u64]);
         }
         });
-        launch_v(k.f("sig2_div4"), ((t * HCN + 255) / 256) as u32, 1, 1, 256, &[
+        launch_v(k.f("sig2_div4"), ((t * self.d.hcn + 255) / 256) as u32, 1, 1, 256, &[
             s.injr as u64, injw as u64, p.nt_hc as u64]);
         }
     }
@@ -2470,7 +2471,7 @@ impl Engine {
         let k = &self.k;
         let p = &self.p;
         let s = &self.s;
-        let gi = gdn_index(l);
+        let gi = self.d.gdn_index(l);
         let SubW::Gdn { qkv, conv, z, b, a, alog, dt, norm, out } = &self.w.sub[l] else {
             panic!("layer {l} is not GDN");
         };
@@ -2480,78 +2481,78 @@ impl Engine {
             // dense overlay shadows reads the f32 `mixed` row instead and ignores the cascade.
             quant_x_if_unfused(k, p, t as u32, mixed as u64, s.xq_m as u64, p.n2560 as u64, p.n2560 as u64);
         }
-        qkv.or_bf16(k, GDN_CONV, p.n10240, t, p.t, mixed, s.mq, p.n2560, |w, gs| {
+        qkv.or_bf16(k, self.d.gdn_conv, p.n10240, t, p.t, mixed, s.mq, p.n2560, |w, gs| {
             if mma {
-            launch_mma_d(k, (GDN_CONV / 64) as u32, t, p.t as u64, &[
+            launch_mma_d(k, (self.d.gdn_conv / 64) as u32, t, p.t as u64, &[
                 w as u64, s.xq_m as u64, gs as u64, s.mq as u64,
                 p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
             } else {
-            launch_v(k.f("gemv_fp4_b"), GDN_CONV as u32, t as u32, 1, 256, &[
+            launch_v(k.f("gemv_fp4_b"), self.d.gdn_conv as u32, t as u32, 1, 256, &[
                 w as u64, mixed as u64, gs as u64, s.mq as u64, p.n2560 as u64]);
             }
         });
-        z.or_bf16(k, GDN_VAL, p.n6144, t, p.t, mixed, s.gz, p.n2560, |w, gs| {
+        z.or_bf16(k, self.d.gdn_val, p.n6144, t, p.t, mixed, s.gz, p.n2560, |w, gs| {
             if mma {
-            launch_mma_d(k, (GDN_VAL / 64) as u32, t, p.t as u64, &[
+            launch_mma_d(k, (self.d.gdn_val / 64) as u32, t, p.t as u64, &[
                 w as u64, s.xq_m as u64, gs as u64, s.gz as u64,
                 p.n2560 as u64, p.n6144 as u64, p.n6144 as u64]);
             } else {
-            launch_v(k.f("gemv_fp4_b"), GDN_VAL as u32, t as u32, 1, 256, &[
+            launch_v(k.f("gemv_fp4_b"), self.d.gdn_val as u32, t as u32, 1, 256, &[
                 w as u64, mixed as u64, gs as u64, s.gz as u64, p.n2560 as u64]);
             }
         });
-        b.or_bf16(k, GDN_VHEADS, p.nr48, t, p.t, mixed, s.gb, p.n2560, |w, gs| {
+        b.or_bf16(k, self.d.gdn_vheads, p.nr48, t, p.t, mixed, s.gb, p.n2560, |w, gs| {
             if mma {
             launch_mma_d(k, 1, t, p.t as u64, &[
                 w as u64, s.xq_m as u64, gs as u64, s.gb as u64,
                 p.n2560 as u64, p.nr48 as u64, p.nr48 as u64]);
             } else {
-            launch_v(k.f("gemv_fp4_b"), 48, t as u32, 1, 256, &[
+            launch_v(k.f("gemv_fp4_b"), self.d.gdn_vheads as u32, t as u32, 1, 256, &[
                 w as u64, mixed as u64, gs as u64, s.gb as u64, p.n2560 as u64]);
             }
         });
-        a.or_bf16(k, GDN_VHEADS, p.nr48, t, p.t, mixed, s.ga, p.n2560, |w, gs| {
+        a.or_bf16(k, self.d.gdn_vheads, p.nr48, t, p.t, mixed, s.ga, p.n2560, |w, gs| {
             if mma {
             launch_mma_d(k, 1, t, p.t as u64, &[
                 w as u64, s.xq_m as u64, gs as u64, s.ga as u64,
                 p.n2560 as u64, p.nr48 as u64, p.nr48 as u64]);
             } else {
-            launch_v(k.f("gemv_fp4_b"), 48, t as u32, 1, 256, &[
+            launch_v(k.f("gemv_fp4_b"), self.d.gdn_vheads as u32, t as u32, 1, 256, &[
                 w as u64, mixed as u64, gs as u64, s.ga as u64, p.n2560 as u64]);
             }
         });
-        launch_v(k.f("transpose_rt"), GDN_CONV as u32, 1, 1, 256, &[
+        launch_v(k.f("transpose_rt"), self.d.gdn_conv as u32, 1, 1, 256, &[
             s.mq as u64, s.mq_t as u64, p.t as u64, p.n10240 as u64]);
-        launch_v(k.f("conv_silu"), GDN_CONV as u32, 1, 1, 256, &[
+        launch_v(k.f("conv_silu"), self.d.gdn_conv as u32, 1, 1, 256, &[
             s.mq_t as u64, *conv as u64, s.cout_t as u64, p.t as u64, self.st.gdn_conv[gi] as u64]);
-        launch_v(k.f("conv_state_update"), GDN_CONV as u32, 1, 1, 3, &[
+        launch_v(k.f("conv_state_update"), self.d.gdn_conv as u32, 1, 1, (self.d.conv_kernel - 1) as u32, &[
             s.mq_t as u64, self.st.gdn_conv[gi] as u64, p.t as u64]);
-        launch_v(k.f("split_qkv"), ((t * GDN_CONV + 255) / 256) as u32, 1, 1, 256, &[
+        launch_v(k.f("split_qkv"), ((t * self.d.gdn_conv + 255) / 256) as u32, 1, 1, 256, &[
             s.cout_t as u64, s.gq as u64, s.gk as u64, s.gv as u64, p.t as u64]);
-        launch_v(k.f("beta_g"), ((t * 48 + 255) / 256) as u32, 1, 1, 256, &[
+        launch_v(k.f("beta_g"), ((t * self.d.gdn_vheads + 255) / 256) as u32, 1, 1, 256, &[
             s.gb as u64, s.ga as u64, *alog as u64, *dt as u64, s.gbeta as u64, s.gg as u64, p.t as u64]);
-launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
+launch_v(k.f("l2norm_repeat"), self.d.gdn_vheads as u32, t as u32, 1, self.d.gd as u32, &[
             s.gq as u64, s.gk as u64, s.gqr as u64, s.gkr as u64]);
-        launch_v(k.f(if gdn_reg_mode() & 1 != 0 { "delta_rule_persist_r" } else { "delta_rule_persist" }), 48, 1, 1, 128, &[
+        launch_v(k.f(if gdn_reg_mode() & 1 != 0 { "delta_rule_persist_r" } else { "delta_rule_persist" }), self.d.gdn_vheads as u32, 1, 1, self.d.gdv as u32, &[
             s.gqr as u64, s.gkr as u64, s.gv as u64, s.gg as u64, s.gbeta as u64,
             s.gcore as u64, self.st.gdn_s[gi] as u64, p.t as u64, p.init as u64]);
         if qfuse_on() {
-            launch_v(k.f("rmsnorm_gated_q"), 48, t as u32, 1, 128, &[
+            launch_v(k.f("rmsnorm_gated_q"), self.d.gdn_vheads as u32, t as u32, 1, self.d.gdv as u32, &[
                 s.gcore as u64, s.gz as u64, *norm as u64, s.gnorm as u64, s.xq_v as u64]);
         } else {
-            launch_v(k.f("rmsnorm_gated"), 48, t as u32, 1, 128, &[
+            launch_v(k.f("rmsnorm_gated"), self.d.gdn_vheads as u32, t as u32, 1, self.d.gdv as u32, &[
                 s.gcore as u64, s.gz as u64, *norm as u64, s.gnorm as u64]);
         }
         if mma {
             quant_x_if_unfused(k, p, t as u32, s.gnorm as u64, s.xq_v as u64, p.n6144 as u64, p.n6144 as u64);
         }
-        out.or_bf16(k, H, p.n2560, t, p.t, s.gnorm, s.gout, p.n6144, |w, gs| {
+        out.or_bf16(k, self.d.h, p.n2560, t, p.t, s.gnorm, s.gout, p.n6144, |w, gs| {
             if mma {
-            launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
+            launch_mma_d(k, (self.d.h / 64) as u32, t, p.t as u64, &[
                 w as u64, s.xq_v as u64, gs as u64, s.gout as u64,
                 p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
             } else {
-            launch_v(k.f("gemv_fp4_b"), H as u32, t as u32, 1, 256, &[
+            launch_v(k.f("gemv_fp4_b"), self.d.h as u32, t as u32, 1, 256, &[
                 w as u64, s.gnorm as u64, gs as u64, s.gout as u64, p.n6144 as u64]);
             }
         });
@@ -2562,7 +2563,7 @@ launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
         let k = &self.k;
         let p = &self.p;
         let s = &self.s;
-        let gi = gdn_index(l);
+        let gi = self.d.gdn_index(l);
         let SubW::Gdn { qkv, conv, z, b, a, alog, dt, norm, out } = &self.w.sub[l] else {
             panic!("layer {l} is not GDN");
         };
@@ -2591,13 +2592,13 @@ launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
                 // `as u64` and the two grids use `div_ceil`. That is 27 clippy
                 // warnings the neighbouring launches do emit and these do not,
                 // which is how the gate's CLIPPY stays at its 1421 of record.)
-                launch_v(k.f("gemv_fp4_mma_g32"), (GDN_CONV + 2 * GDN_VHEADS).div_ceil(32) as u32, 1, 1, mma_bx32(), &[
+                launch_v(k.f("gemv_fp4_mma_g32"), (self.d.gdn_conv + 2 * self.d.gdn_vheads).div_ceil(32) as u32, 1, 1, mma_bx32(), &[
                     qkv.w(), b.w(), a.w(), a.w(),
                     qkv.gs(), b.gs(), a.gs(), a.gs(),
                     s.mq, s.gb, s.ga, s.ga,
                     p.n10240, p.nr48, p.nr48, p.zero,
                     s.xq_m, p.n2560]);
-                launch_v(k.f("gemv_fp4_mma_d32"), GDN_VAL.div_ceil(32) as u32, 1, 1, mma_bx32(), &[
+                launch_v(k.f("gemv_fp4_mma_d32"), self.d.gdn_val.div_ceil(32) as u32, 1, 1, mma_bx32(), &[
                     z.w(), s.xq_m, z.gs(), s.gz,
                     p.n2560, p.n6144, p.n6144]);
             } else if gdn_fuse_in_on() {
@@ -2605,17 +2606,17 @@ launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
                 // launch (qkv 10240 + z 6144 + b 48 + a 48 rows, all k 2560
                 // over the shared xq_m row); per-slab gs kept, per-row math =
                 // gemv_fp4_mma_d bit for bit (62a report lever 1).
-                launch_v(k.f("gemv_fp4_mma_g32"), ((GDN_CONV + GDN_VAL + 2 * GDN_VHEADS + 31) / 32) as u32, 1, 1, mma_bx32(), &[
+                launch_v(k.f("gemv_fp4_mma_g32"), ((self.d.gdn_conv + self.d.gdn_val + 2 * self.d.gdn_vheads + 31) / 32) as u32, 1, 1, mma_bx32(), &[
                     qkv.w() as u64, z.w() as u64, b.w() as u64, a.w() as u64,
                     qkv.gs() as u64, z.gs() as u64, b.gs() as u64, a.gs() as u64,
                     s.mq as u64, s.gz as u64, s.gb as u64, s.ga as u64,
                     p.n10240 as u64, p.n6144 as u64, p.nr48 as u64, p.nr48 as u64,
                     s.xq_m as u64, p.n2560 as u64]);
             } else {
-                launch_v(k.f("gemv_fp4_mma_d32"), ((GDN_CONV + 31) / 32) as u32, 1, 1, mma_bx32(), &[
+                launch_v(k.f("gemv_fp4_mma_d32"), ((self.d.gdn_conv + 31) / 32) as u32, 1, 1, mma_bx32(), &[
                     qkv.w() as u64, s.xq_m as u64, qkv.gs() as u64, s.mq as u64,
                     p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
-                launch_v(k.f("gemv_fp4_mma_d32"), ((GDN_VAL + 31) / 32) as u32, 1, 1, mma_bx32(), &[
+                launch_v(k.f("gemv_fp4_mma_d32"), ((self.d.gdn_val + 31) / 32) as u32, 1, 1, mma_bx32(), &[
                     z.w() as u64, s.xq_m as u64, z.gs() as u64, s.gz as u64,
                     p.n2560 as u64, p.n6144 as u64, p.n6144 as u64]);
                 launch_v(k.f("gemv_fp4_mma_d"), 1, 1, 1, mma_bx(), &[
@@ -2628,74 +2629,74 @@ launch_v(k.f("l2norm_repeat"), 48, t as u32, 1, 128, &[
         } else {
             // per-slab: the FP4 fallback of record for an NVFP4 slab, the BF16 warp GEMV
             // off the f32 `mixed` row for one the overlay shadows (#77)
-            qkv.or_bf16_1(k, GDN_CONV, p.n10240, mixed, s.mq, p.n2560, |w, gs| {
+            qkv.or_bf16_1(k, self.d.gdn_conv, p.n10240, mixed, s.mq, p.n2560, |w, gs| {
                 if mma {
-                    launch_v(k.f("gemv_fp4_mma_d32"), ((GDN_CONV + 31) / 32) as u32, 1, 1, mma_bx32(), &[
+                    launch_v(k.f("gemv_fp4_mma_d32"), ((self.d.gdn_conv + 31) / 32) as u32, 1, 1, mma_bx32(), &[
                         w as u64, s.xq_m as u64, gs as u64, s.mq as u64,
                         p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
                 } else {
-                    launch_v(k.f("gemv_fp4"), GDN_CONV as u32, 1, 1, 256, &[
+                    launch_v(k.f("gemv_fp4"), self.d.gdn_conv as u32, 1, 1, 256, &[
                         w as u64, mixed as u64, gs as u64, s.mq as u64, p.n2560 as u64]);
                 }
             });
-            z.or_bf16_1(k, GDN_VAL, p.n6144, mixed, s.gz, p.n2560, |w, gs| {
+            z.or_bf16_1(k, self.d.gdn_val, p.n6144, mixed, s.gz, p.n2560, |w, gs| {
                 if mma {
-                    launch_v(k.f("gemv_fp4_mma_d32"), ((GDN_VAL + 31) / 32) as u32, 1, 1, mma_bx32(), &[
+                    launch_v(k.f("gemv_fp4_mma_d32"), ((self.d.gdn_val + 31) / 32) as u32, 1, 1, mma_bx32(), &[
                         w as u64, s.xq_m as u64, gs as u64, s.gz as u64,
                         p.n2560 as u64, p.n6144 as u64, p.n6144 as u64]);
                 } else {
-                    launch_v(k.f("gemv_fp4"), GDN_VAL as u32, 1, 1, 256, &[
+                    launch_v(k.f("gemv_fp4"), self.d.gdn_val as u32, 1, 1, 256, &[
                         w as u64, mixed as u64, gs as u64, s.gz as u64, p.n2560 as u64]);
                 }
             });
-            b.or_bf16_1(k, GDN_VHEADS, p.nr48, mixed, s.gb, p.n2560, |w, gs| {
+            b.or_bf16_1(k, self.d.gdn_vheads, p.nr48, mixed, s.gb, p.n2560, |w, gs| {
                 if mma {
                     launch_v(k.f("gemv_fp4_mma_d"), 1, 1, 1, mma_bx(), &[
                         w as u64, s.xq_m as u64, gs as u64, s.gb as u64,
                         p.n2560 as u64, p.nr48 as u64, p.nr48 as u64]);
                 } else {
-                    launch_v(k.f("gemv_fp4"), 48, 1, 1, 256, &[
+                    launch_v(k.f("gemv_fp4"), self.d.gdn_vheads as u32, 1, 1, 256, &[
                         w as u64, mixed as u64, gs as u64, s.gb as u64, p.n2560 as u64]);
                 }
             });
-            a.or_bf16_1(k, GDN_VHEADS, p.nr48, mixed, s.ga, p.n2560, |w, gs| {
+            a.or_bf16_1(k, self.d.gdn_vheads, p.nr48, mixed, s.ga, p.n2560, |w, gs| {
                 if mma {
                     launch_v(k.f("gemv_fp4_mma_d"), 1, 1, 1, mma_bx(), &[
                         w as u64, s.xq_m as u64, gs as u64, s.ga as u64,
                         p.n2560 as u64, p.nr48 as u64, p.nr48 as u64]);
                 } else {
-                    launch_v(k.f("gemv_fp4"), 48, 1, 1, 256, &[
+                    launch_v(k.f("gemv_fp4"), self.d.gdn_vheads as u32, 1, 1, 256, &[
                         w as u64, mixed as u64, gs as u64, s.ga as u64, p.n2560 as u64]);
                 }
             });
         }
-        launch_v(k.f("conv_step"), (GDN_CONV as u32 + 255) / 256, 1, 1, 256, &[
+        launch_v(k.f("conv_step"), (self.d.gdn_conv as u32 + 255) / 256, 1, 1, 256, &[
             s.mq as u64, *conv as u64, self.st.gdn_conv[gi] as u64, s.cout_t as u64]);
         // cout layout [10240] = q | k | v (pointer slices, no copy)
-        let (q_p, k_p, v_p) = (s.cout_t as u64, s.cout_t as u64 + (GDN_KEY * 4) as u64, s.cout_t as u64 + (2 * GDN_KEY * 4) as u64);
-        launch_v(k.f("beta_g"), 1, 1, 1, 48, &[
+        let (q_p, k_p, v_p) = (s.cout_t as u64, s.cout_t as u64 + (self.d.gdn_key * 4) as u64, s.cout_t as u64 + (2 * self.d.gdn_key * 4) as u64);
+        launch_v(k.f("beta_g"), 1, 1, 1, self.d.gdn_vheads as u32, &[
             s.gb as u64, s.ga as u64, *alog as u64, *dt as u64, s.gbeta as u64, s.gg as u64, p.t as u64]);
-        launch_v(k.f("l2norm_repeat"), 48, 1, 1, 128, &[q_p, k_p, s.gqr as u64, s.gkr as u64]);
-        launch_v(k.f(if gdn_reg_mode() & 2 != 0 { "delta_rule_step_r" } else { "delta_rule_step" }), 48, 1, 1, 128, &[
+        launch_v(k.f("l2norm_repeat"), self.d.gdn_vheads as u32, 1, 1, self.d.gd as u32, &[q_p, k_p, s.gqr as u64, s.gkr as u64]);
+        launch_v(k.f(if gdn_reg_mode() & 2 != 0 { "delta_rule_step_r" } else { "delta_rule_step" }), self.d.gdn_vheads as u32, 1, 1, self.d.gdv as u32, &[
             self.st.gdn_s[gi] as u64, s.gqr as u64, s.gkr as u64, v_p, s.gg as u64,
             s.gbeta as u64, s.gcore as u64]);
         if qfuse_on() {
-            launch_v(k.f("rmsnorm_gated_q"), 48, 1, 1, 128, &[
+            launch_v(k.f("rmsnorm_gated_q"), self.d.gdn_vheads as u32, 1, 1, self.d.gdv as u32, &[
                 s.gcore as u64, s.gz as u64, *norm as u64, s.gnorm as u64, s.xq_v as u64]);
         } else {
-            launch_v(k.f("rmsnorm_gated"), 48, 1, 1, 128, &[
+            launch_v(k.f("rmsnorm_gated"), self.d.gdn_vheads as u32, 1, 1, self.d.gdv as u32, &[
                 s.gcore as u64, s.gz as u64, *norm as u64, s.gnorm as u64]);
         }
         if mma {
             quant_x_if_unfused(k, p, 1, s.gnorm as u64, s.xq_v as u64, p.n6144 as u64, p.n6144 as u64);
         }
-        out.or_bf16_1(k, H, p.n2560, s.gnorm, s.gout, p.n6144, |w, gs| {
+        out.or_bf16_1(k, self.d.h, p.n2560, s.gnorm, s.gout, p.n6144, |w, gs| {
             if mma {
-            launch_v(k.f("gemv_fp4_mma_d32"), ((H + 31) / 32) as u32, 1, 1, mma_bx32(), &[
+            launch_v(k.f("gemv_fp4_mma_d32"), ((self.d.h + 31) / 32) as u32, 1, 1, mma_bx32(), &[
                 w as u64, s.xq_v as u64, gs as u64, s.gout as u64,
                 p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
             } else {
-            launch_v(k.f("gemv_fp4"), H as u32, 1, 1, 256, &[
+            launch_v(k.f("gemv_fp4"), self.d.h as u32, 1, 1, 256, &[
                 w as u64, s.gnorm as u64, gs as u64, s.gout as u64, p.n6144 as u64]);
             }
         });
@@ -2721,28 +2722,28 @@ impl Engine {
             panic!("layer {l} is not attention");
         };
         let (kc, vc, keys, pooled) = self.layer_cache_ptrs(l);
-        let cos = self.cos_tbl() as u64 + (pos_base * ROPE_PAIRS * 4) as u64;
-        let sin = self.sin_tbl() as u64 + (pos_base * ROPE_PAIRS * 4) as u64;
+        let cos = self.cos_tbl() as u64 + (pos_base * self.d.rope_pairs * 4) as u64;
+        let sin = self.sin_tbl() as u64 + (pos_base * self.d.rope_pairs * 4) as u64;
 
-        q.launch_gemv(k, Q_ROWS, p.n12288 as u64, t, p.t as u64, mixed as u64, s.qg as u64, p.n2560 as u64);
+        q.launch_gemv(k, self.d.q_rows, p.n12288 as u64, t, p.t as u64, mixed as u64, s.qg as u64, p.n2560 as u64);
         step!("launch #1");
         step!("q gemv");
-        launch_v(k.f("split_qg"), NQ as u32, t as u32, 1, AHD as u32, &[
+        launch_v(k.f("split_qg"), self.d.nq as u32, t as u32, 1, self.d.ahd as u32, &[
             s.qg as u64, s.aq as u64, s.agate as u64]);
         step!("launch #2");
         step!("split_qg");
-        launch_v(k.f("rmsnorm_1pw"), NQ as u32, t as u32, 1, AHD as u32, &[
+        launch_v(k.f("rmsnorm_1pw"), self.d.nq as u32, t as u32, 1, self.d.ahd as u32, &[
             s.aq as u64, *qn as u64, s.aqn as u64]);
         step!("launch #3");
-        launch_v(k.f("rope"), NQ as u32, t as u32, 1, AHD as u32, &[
+        launch_v(k.f("rope"), self.d.nq as u32, t as u32, 1, self.d.ahd as u32, &[
             s.aqn as u64, cos, sin, s.aqr as u64]);
         step!("launch #4");
-        kk.launch_gemv(k, KV_ROWS, p.nr512 as u64, t, p.t as u64, mixed as u64, s.ak as u64, p.n2560 as u64);
+        kk.launch_gemv(k, self.d.kv_rows, p.nr512 as u64, t, p.t as u64, mixed as u64, s.ak as u64, p.n2560 as u64);
         step!("launch #5");
-        launch_v(k.f("rmsnorm_1pw"), NKV as u32, t as u32, 1, AHD as u32, &[
+        launch_v(k.f("rmsnorm_1pw"), self.d.nkv as u32, t as u32, 1, self.d.ahd as u32, &[
             s.ak as u64, *kn as u64, s.akn as u64]);
         step!("launch #6");
-        launch_v(k.f("rope"), NKV as u32, t as u32, 1, AHD as u32, &[
+        launch_v(k.f("rope"), self.d.nkv as u32, t as u32, 1, self.d.ahd as u32, &[
             s.akn as u64, cos, sin, s.akr as u64]);
         step!("launch #7");
         let mma = dense_mma_on();
@@ -2750,41 +2751,41 @@ impl Engine {
             // one quantized `mixed` row set serves v + indexer qk (both k=2560)
             quant_x_if_unfused(k, p, t as u32, mixed as u64, s.xq_m as u64, p.n2560 as u64, p.n2560 as u64);
         }
-        v.or_bf16(k, KV_ROWS, p.nr512, t, p.t, mixed, s.av, p.n2560, |w, gs| {
+        v.or_bf16(k, self.d.kv_rows, p.nr512, t, p.t, mixed, s.av, p.n2560, |w, gs| {
             if mma {
-            launch_mma_d(k, (KV_ROWS / 64) as u32, t, p.t as u64, &[
+            launch_mma_d(k, (self.d.kv_rows / 64) as u32, t, p.t as u64, &[
                 w as u64, s.xq_m as u64, gs as u64, s.av as u64,
                 p.n2560 as u64, p.nr512 as u64, p.nr512 as u64]);
             } else {
-            launch_v(k.f("gemv_fp4_b"), KV_ROWS as u32, t as u32, 1, 256, &[
+            launch_v(k.f("gemv_fp4_b"), self.d.kv_rows as u32, t as u32, 1, 256, &[
                 w as u64, mixed as u64, gs as u64, s.av as u64, p.n2560 as u64]);
             }
         });
         step!("launch #8");
-        launch_v(k.f("store_kv"), 4, t as u32, 1, AHD as u32, &[
+        launch_v(k.f("store_kv"), (2 * self.d.nkv) as u32, t as u32, 1, self.d.ahd as u32, &[
             s.akr as u64, s.av as u64, kc, vc, p.pos_base as u64, p.tmax as u64, p.mode as u64]);
         step!("launch #9");
 
         // ---- QSA indexer (raw keys append + block pooling + scores + select) ----
-        iqk.or_bf16(k, QSA_QK_ROWS, p.n640, t, p.t, mixed, s.qk, p.n2560, |w, gs| {
+        iqk.or_bf16(k, self.d.qsa_qk_rows, p.n640, t, p.t, mixed, s.qk, p.n2560, |w, gs| {
             if mma {
-            launch_mma_d(k, (QSA_QK_ROWS / 64) as u32, t, p.t as u64, &[
+            launch_mma_d(k, (self.d.qsa_qk_rows / 64) as u32, t, p.t as u64, &[
                 w as u64, s.xq_m as u64, gs as u64, s.qk as u64,
                 p.n2560 as u64, p.n640 as u64, p.n640 as u64]);
             } else {
-            launch_v(k.f("gemv_fp4_b"), QSA_QK_ROWS as u32, t as u32, 1, 256, &[
+            launch_v(k.f("gemv_fp4_b"), self.d.qsa_qk_rows as u32, t as u32, 1, 256, &[
                 w as u64, mixed as u64, gs as u64, s.qk as u64, p.n2560 as u64]);
             }
         });
         step!("launch #10");
-        launch_v(k.f("rms128"), QSA_HEADS as u32, t as u32, 1, QSA_HD as u32, &[
+        launch_v(k.f("rms128"), self.d.qsa_heads as u32, t as u32, 1, self.d.qsa_hd as u32, &[
             s.qk as u64, *iqln as u64, s.q_nrm as u64, p.q_heads4 as u64, p.qk_stride as u64]);
         step!("launch #11");
-        launch_v(k.f("rope64"), QSA_HEADS as u32, t as u32, 1, QSA_HD as u32, &[
+        launch_v(k.f("rope64"), self.d.qsa_heads as u32, t as u32, 1, self.d.qsa_hd as u32, &[
             s.q_nrm as u64, self.cos_tbl() as u64, self.sin_tbl() as u64, s.q_rot as u64,
             p.q_heads4 as u64, p.pos_mul1 as u64, p.stride512 as u64, p.pos_base as u64]);
         step!("launch #12");
-        launch_v(k.f("qk_k_append"), ((t * QSA_HD + 255) / 256) as u32, 1, 1, 256, &[
+        launch_v(k.f("qk_k_append"), ((t * self.d.qsa_hd + 255) / 256) as u32, 1, 1, 256, &[
             s.qk as u64, keys, p.pos_base as u64, p.t as u64, p.keys_ring as u64]);
         step!("launch #13");
         let new_done = (pos_base + t) / 4;
@@ -2792,15 +2793,15 @@ impl Engine {
         if n_new > 0 {
             cuda::to_i32_into(p.block_base, &[self.done_blocks as i32]);
             cuda::to_i32_into(p.n_new, &[n_new as i32]);
-            launch_v(k.f("pool4_cache"), n_new as u32, 1, 1, QSA_HD as u32, &[
+            launch_v(k.f("pool4_cache"), n_new as u32, 1, 1, self.d.qsa_hd as u32, &[
                 keys, s.pool_raw as u64, p.stride128 as u64, p.block_base as u64, p.n_new as u64, p.keys_ring as u64]);
         step!("launch #14");
-            launch_v(k.f("rms128"), 1, n_new as u32, 1, QSA_HD as u32, &[
+            launch_v(k.f("rms128"), 1, n_new as u32, 1, self.d.qsa_hd as u32, &[
                 s.pool_raw as u64, *ikln as u64, s.pool_nrm as u64, p.q_heads1 as u64, p.stride128 as u64]);
         step!("launch #15");
-            launch_v(k.f("rope64"), 1, n_new as u32, 1, QSA_HD as u32, &[
+            launch_v(k.f("rope64"), 1, n_new as u32, 1, self.d.qsa_hd as u32, &[
                 s.pool_nrm as u64, self.cos_tbl() as u64, self.sin_tbl() as u64,
-                pooled + (self.done_blocks * QSA_HD * 4) as u64,
+                pooled + (self.done_blocks * self.d.qsa_hd * 4) as u64,
                 p.q_heads1 as u64, p.pos_mul4 as u64, p.stride128 as u64, p.pos_base_b4 as u64]);
         step!("launch #16");
         }
@@ -2815,15 +2816,15 @@ impl Engine {
             let t0 = i * sb;
             let tb = (t - t0).min(sb);
             let pos_base_i = p.pos_base_sb as u64 + (i * 4) as u64;
-            let q_rot_i = s.q_rot as u64 + (t0 * QSA_HEADS * QSA_HD * 4) as u64;
-            let sel_i = s.sel as u64 + (t0 * QSA_SEL_MAX * 4) as u64;
+            let q_rot_i = s.q_rot as u64 + (t0 * self.d.qsa_heads * self.d.qsa_hd * 4) as u64;
+            let sel_i = s.sel as u64 + (t0 * self.d.qsa_sel_max * 4) as u64;
             let sel_n_i = s.sel_n as u64 + (t0 * 4) as u64;
             if attn_split_on() {
                 let ncb_max = ((pos_base + t0 + tb + 3) / 4).min(65536);
                 launch_v(k.f("qsa_scores_par"), (((ncb_max + 3) / 4).clamp(1, 512)) as u32, tb as u32, 1, 128, &[
                     q_rot_i, pooled, s.scores as u64, p.cap as u64, pos_base_i]);
             } else {
-                launch_v(k.f("qsa_scores"), tb as u32, 1, 1, QSA_HD as u32, &[
+                launch_v(k.f("qsa_scores"), tb as u32, 1, 1, self.d.qsa_hd as u32, &[
                     q_rot_i, pooled, s.scores as u64, p.cap as u64, pos_base_i]);
             }
             step!("launch #17");
@@ -2832,8 +2833,8 @@ impl Engine {
                 p.cap as u64, p.n_selmax as u64, p.pos_row as u64 + (t0 * 4) as u64]);
             step!("launch #18");
             launch_v(k.f(attn_sel_name()), attn_sel_gx_bx(&self.d).0, tb as u32, 1, attn_sel_gx_bx(&self.d).1, &[
-                s.aqr as u64 + (t0 * CORE * 4) as u64, kc, vc, sel_i, sel_n_i, p.tmax as u64, p.mode as u64,
-                p.n_selmax as u64, s.aout as u64 + (t0 * CORE * 4) as u64]);
+                s.aqr as u64 + (t0 * self.d.core * 4) as u64, kc, vc, sel_i, sel_n_i, p.tmax as u64, p.mode as u64,
+                p.n_selmax as u64, s.aout as u64 + (t0 * self.d.core * 4) as u64]);
         }
 
         if dbg {
@@ -2844,23 +2845,23 @@ impl Engine {
         }
         step!("launch #19");        step!("launch #19");
         if qfuse_on() {
-            launch_v(k.f("gate_mul_q"), ((t * CORE + 255) / 256) as u32, 1, 1, 256, &[
+            launch_v(k.f("gate_mul_q"), ((t * self.d.core + 255) / 256) as u32, 1, 1, 256, &[
                 s.aout as u64, s.agate as u64, s.agated as u64, s.xq_v as u64]);
         } else {
-            launch_v(k.f("gate_mul"), ((t * CORE + 255) / 256) as u32, 1, 1, 256, &[
+            launch_v(k.f("gate_mul"), ((t * self.d.core + 255) / 256) as u32, 1, 1, 256, &[
                 s.aout as u64, s.agate as u64, s.agated as u64]);
         }
         step!("launch #20");
         if mma {
             quant_x_if_unfused(k, p, t as u32, s.agated as u64, s.xq_v as u64, p.n6144 as u64, p.n6144 as u64);
         }
-        o.or_bf16(k, H, p.n2560, t, p.t, s.agated, s.ay, p.n6144, |w, gs| {
+        o.or_bf16(k, self.d.h, p.n2560, t, p.t, s.agated, s.ay, p.n6144, |w, gs| {
             if mma {
-            launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
+            launch_mma_d(k, (self.d.h / 64) as u32, t, p.t as u64, &[
                 w as u64, s.xq_v as u64, gs as u64, s.ay as u64,
                 p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
             } else {
-            launch_v(k.f("gemv_fp4_b"), H as u32, t as u32, 1, 256, &[
+            launch_v(k.f("gemv_fp4_b"), self.d.h as u32, t as u32, 1, 256, &[
                 w as u64, s.agated as u64, gs as u64, s.ay as u64, p.n6144 as u64]);
             }
         });
@@ -2881,46 +2882,46 @@ impl Engine {
         // captured graph and replay the capture token position forever
         let (cos, sin) = (self.cos_tbl() as u64, self.sin_tbl() as u64);
 
-        q.launch_gemv1(k, Q_ROWS, p.n12288 as u64, mixed as u64, s.qg as u64, p.n2560 as u64);
-        launch_v(k.f("split_qg"), NQ as u32, 1, 1, AHD as u32, &[s.qg as u64, s.aq as u64, s.agate as u64]);
-        launch_v(k.f("rmsnorm_1pw"), NQ as u32, 1, 1, AHD as u32, &[s.aq as u64, *qn as u64, s.aqn as u64]);
-        launch_v(k.f("rope_p"), NQ as u32, 1, 1, AHD as u32, &[s.aqn as u64, cos, sin, s.aqr as u64, p.pos_base as u64]);
-        kk.launch_gemv1(k, KV_ROWS, p.nr512 as u64, mixed as u64, s.ak as u64, p.n2560 as u64);
-        launch_v(k.f("rmsnorm_1pw"), NKV as u32, 1, 1, AHD as u32, &[s.ak as u64, *kn as u64, s.akn as u64]);
-        launch_v(k.f("rope_p"), NKV as u32, 1, 1, AHD as u32, &[s.akn as u64, cos, sin, s.akr as u64, p.pos_base as u64]);
+        q.launch_gemv1(k, self.d.q_rows, p.n12288 as u64, mixed as u64, s.qg as u64, p.n2560 as u64);
+        launch_v(k.f("split_qg"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[s.qg as u64, s.aq as u64, s.agate as u64]);
+        launch_v(k.f("rmsnorm_1pw"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[s.aq as u64, *qn as u64, s.aqn as u64]);
+        launch_v(k.f("rope_p"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[s.aqn as u64, cos, sin, s.aqr as u64, p.pos_base as u64]);
+        kk.launch_gemv1(k, self.d.kv_rows, p.nr512 as u64, mixed as u64, s.ak as u64, p.n2560 as u64);
+        launch_v(k.f("rmsnorm_1pw"), self.d.nkv as u32, 1, 1, self.d.ahd as u32, &[s.ak as u64, *kn as u64, s.akn as u64]);
+        launch_v(k.f("rope_p"), self.d.nkv as u32, 1, 1, self.d.ahd as u32, &[s.akn as u64, cos, sin, s.akr as u64, p.pos_base as u64]);
         let mma = dense_mma_on();
         if mma {
             quant_x_if_unfused(k, p, 1, mixed as u64, s.xq_m as u64, p.n2560 as u64, p.n2560 as u64);
         }
-        v.or_bf16_1(k, KV_ROWS, p.nr512, mixed, s.av, p.n2560, |w, gs| {
+        v.or_bf16_1(k, self.d.kv_rows, p.nr512, mixed, s.av, p.n2560, |w, gs| {
             if mma {
-            launch_v(k.f("gemv_fp4_mma_d"), (KV_ROWS / 64) as u32, 1, 1, mma_bx(), &[
+            launch_v(k.f("gemv_fp4_mma_d"), (self.d.kv_rows / 64) as u32, 1, 1, mma_bx(), &[
                 w as u64, s.xq_m as u64, gs as u64, s.av as u64,
                 p.n2560 as u64, p.nr512 as u64, p.nr512 as u64]);
             } else {
-            launch_v(k.f("gemv_fp4"), KV_ROWS as u32, 1, 1, 256, &[
+            launch_v(k.f("gemv_fp4"), self.d.kv_rows as u32, 1, 1, 256, &[
                 w as u64, mixed as u64, gs as u64, s.av as u64, p.n2560 as u64]);
             }
         });
-        launch_v(k.f("store_kv"), 4, 1, 1, AHD as u32, &[
+        launch_v(k.f("store_kv"), (2 * self.d.nkv) as u32, 1, 1, self.d.ahd as u32, &[
             s.akr as u64, s.av as u64, kc, vc, p.slot1 as u64, p.tmax as u64, p.mode as u64]);
 
-        iqk.or_bf16_1(k, QSA_QK_ROWS, p.n640, mixed, s.qk, p.n2560, |w, gs| {
+        iqk.or_bf16_1(k, self.d.qsa_qk_rows, p.n640, mixed, s.qk, p.n2560, |w, gs| {
             if mma {
-            launch_v(k.f("gemv_fp4_mma_d"), (QSA_QK_ROWS / 64) as u32, 1, 1, mma_bx(), &[
+            launch_v(k.f("gemv_fp4_mma_d"), (self.d.qsa_qk_rows / 64) as u32, 1, 1, mma_bx(), &[
                 w as u64, s.xq_m as u64, gs as u64, s.qk as u64,
                 p.n2560 as u64, p.n640 as u64, p.n640 as u64]);
             } else {
-            launch_v(k.f("gemv_fp4"), QSA_QK_ROWS as u32, 1, 1, 256, &[
+            launch_v(k.f("gemv_fp4"), self.d.qsa_qk_rows as u32, 1, 1, 256, &[
                 w as u64, mixed as u64, gs as u64, s.qk as u64, p.n2560 as u64]);
             }
         });
-        launch_v(k.f("rms128"), QSA_HEADS as u32, 1, 1, QSA_HD as u32, &[
+        launch_v(k.f("rms128"), self.d.qsa_heads as u32, 1, 1, self.d.qsa_hd as u32, &[
             s.qk as u64, *iqln as u64, s.q_nrm as u64, p.q_heads4 as u64, p.qk_stride as u64]);
-        launch_v(k.f("rope64"), QSA_HEADS as u32, 1, 1, QSA_HD as u32, &[
+        launch_v(k.f("rope64"), self.d.qsa_heads as u32, 1, 1, self.d.qsa_hd as u32, &[
             s.q_nrm as u64, self.cos_tbl() as u64, self.sin_tbl() as u64, s.q_rot as u64,
             p.q_heads4 as u64, p.pos_mul1 as u64, p.stride512 as u64, p.pos_base as u64]);
-        launch_v(k.f("qk_k_append"), 1, 1, 1, QSA_HD as u32, &[
+        launch_v(k.f("qk_k_append"), 1, 1, 1, self.d.qsa_hd as u32, &[
             s.qk as u64, keys, p.pos_base as u64, p.one as u64, p.keys_ring as u64]);
         if graph {
             // graph mode: static launch sequence. n_new may be 0 — grids stay
@@ -2933,11 +2934,11 @@ impl Engine {
             // staging BEFORE the graph launch - no HtoD inside the captured
             // region (pageable memcpy may sync the stream = capture-illegal)
             let nn1 = sb[1].max(0).max(1) as u32;
-            launch_v(k.f("pool4_cache"), nn1, 1, 1, QSA_HD as u32, &[
+            launch_v(k.f("pool4_cache"), nn1, 1, 1, self.d.qsa_hd as u32, &[
                 keys, s.pool_raw as u64, p.stride128 as u64, p.block_base as u64, p.n_new as u64, p.keys_ring as u64]);
-            launch_v(k.f("rms128"), 1, nn1, 1, QSA_HD as u32, &[
+            launch_v(k.f("rms128"), 1, nn1, 1, self.d.qsa_hd as u32, &[
                 s.pool_raw as u64, *ikln as u64, s.pool_nrm as u64, p.q_heads1 as u64, p.stride128 as u64]);
-            launch_v(k.f("rope64"), 1, nn1, 1, QSA_HD as u32, &[
+            launch_v(k.f("rope64"), 1, nn1, 1, self.d.qsa_hd as u32, &[
                 s.pool_nrm as u64, self.cos_tbl() as u64, self.sin_tbl() as u64, s.pool_nrm as u64,
                 p.q_heads1 as u64, p.pos_mul4 as u64, p.stride128 as u64, p.pos_base_b4 as u64]);
             launch_v(k.f("d2d_block"), 1, 1, 1, 128, &[
@@ -2946,20 +2947,20 @@ impl Engine {
             let bb = (pos + 1) / 4 - 1;
             cuda::to_i32_into(p.block_base, &[bb as i32]);
             cuda::to_i32_into(p.n_new, &[1]);
-            launch_v(k.f("pool4_cache"), 1, 1, 1, QSA_HD as u32, &[
+            launch_v(k.f("pool4_cache"), 1, 1, 1, self.d.qsa_hd as u32, &[
                 keys, s.pool_raw as u64, p.stride128 as u64, p.block_base as u64, p.one as u64, p.keys_ring as u64]);
-            launch_v(k.f("rms128"), 1, 1, 1, QSA_HD as u32, &[
+            launch_v(k.f("rms128"), 1, 1, 1, self.d.qsa_hd as u32, &[
                 s.pool_raw as u64, *ikln as u64, s.pool_nrm as u64, p.q_heads1 as u64, p.stride128 as u64]);
-            launch_v(k.f("rope64"), 1, 1, 1, QSA_HD as u32, &[
+            launch_v(k.f("rope64"), 1, 1, 1, self.d.qsa_hd as u32, &[
                 s.pool_nrm as u64, self.cos_tbl() as u64, self.sin_tbl() as u64,
-                pooled + (bb * QSA_HD * 4) as u64,
+                pooled + (bb * self.d.qsa_hd * 4) as u64,
                 p.q_heads1 as u64, p.pos_mul4 as u64, p.stride128 as u64, p.pos_base_b4 as u64]);
         }
         if attn_split_on() {
             launch_v(k.f("qsa_scores_par"), QSA_SCORES_BLOCKS, 1, 1, 128, &[
                 s.q_rot as u64, pooled, s.scores as u64, p.cap as u64, p.pos_base as u64]);
         } else {
-            launch_v(k.f("qsa_scores"), 1, 1, 1, QSA_HD as u32, &[
+            launch_v(k.f("qsa_scores"), 1, 1, 1, self.d.qsa_hd as u32, &[
                 s.q_rot as u64, pooled, s.scores as u64, p.cap as u64, p.pos_base as u64]);
         }
         if qsa_par_on() {
@@ -2989,10 +2990,10 @@ impl Engine {
             // pre-61f kernel. The block is AHD = 256 threads in both forms, which
             // is what fills the 256-entry table
             launch_v(k.f(if attn_lut_on() { "attn_sel_split_l" } else { "attn_sel_split" }),
-                NQ as u32, 1, attn_splits() as u32, AHD as u32, &[
+                self.d.nq as u32, 1, attn_splits() as u32, self.d.ahd as u32, &[
                 s.aqr as u64, kc, vc, s.sel as u64, s.sel_n as u64, p.tmax as u64, p.mode as u64,
                 p.n_selmax as u64, s.part_o as u64, s.part_ml as u64]);
-            launch_v(k.f("attn_merge"), NQ as u32, 1, 1, AHD as u32, &[
+            launch_v(k.f("attn_merge"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[
                 s.part_o as u64, s.part_ml as u64, s.aout as u64, p.n_splits as u64]);
         } else {
             launch_v(k.f(attn_sel_name()), attn_sel_gx_bx(&self.d).0, 1, 1, attn_sel_gx_bx(&self.d).1, &[
@@ -3000,22 +3001,22 @@ impl Engine {
                 p.n_selmax as u64, s.aout as u64]);
         }
         if qfuse_on() {
-            launch_v(k.f("gate_mul_q"), (CORE as u32 + 255) / 256, 1, 1, 256, &[
+            launch_v(k.f("gate_mul_q"), (self.d.core as u32 + 255) / 256, 1, 1, 256, &[
                 s.aout as u64, s.agate as u64, s.agated as u64, s.xq_v as u64]);
         } else {
-            launch_v(k.f("gate_mul"), (CORE as u32 + 255) / 256, 1, 1, 256, &[
+            launch_v(k.f("gate_mul"), (self.d.core as u32 + 255) / 256, 1, 1, 256, &[
                 s.aout as u64, s.agate as u64, s.agated as u64]);
         }
         if mma {
             quant_x_if_unfused(k, p, 1, s.agated as u64, s.xq_v as u64, p.n6144 as u64, p.n6144 as u64);
         }
-        o.or_bf16_1(k, H, p.n2560, s.agated, s.ay, p.n6144, |w, gs| {
+        o.or_bf16_1(k, self.d.h, p.n2560, s.agated, s.ay, p.n6144, |w, gs| {
             if mma {
-            launch_v(k.f("gemv_fp4_mma_d"), (H / 64) as u32, 1, 1, mma_bx(), &[
+            launch_v(k.f("gemv_fp4_mma_d"), (self.d.h / 64) as u32, 1, 1, mma_bx(), &[
                 w as u64, s.xq_v as u64, gs as u64, s.ay as u64,
                 p.n6144 as u64, p.n2560 as u64, p.n2560 as u64]);
             } else {
-            launch_v(k.f("gemv_fp4"), H as u32, 1, 1, 256, &[
+            launch_v(k.f("gemv_fp4"), self.d.h as u32, 1, 1, 256, &[
                 w as u64, s.agated as u64, gs as u64, s.ay as u64, p.n6144 as u64]);
             }
         });
@@ -3072,7 +3073,7 @@ impl Engine {
         let s = &self.s;
         let st = &self.stage;
         let pin = st.dma.as_ref().expect("CROW_STAGE_DMA needs the pinned staging scratch");
-        let n = t * TOPK;
+        let n = t * self.d.topk;
         let (gu_b, dn_b) = (self.res.gu_bytes as usize, self.res.dn_bytes as usize);
         let h = pin.host as *mut u8;
         let h_gu = h as *mut u64;
@@ -3092,7 +3093,7 @@ impl Engine {
         // needed (a side stream would need one event per layer for the same order)
         let (mut copies, mut bytes) = (0u64, 0u64);
         for c in 0..n {
-            if (*h_cold.add(c / TOPK) >> (c % TOPK)) & 1 == 0 { continue; }
+            if (*h_cold.add(c / self.d.topk) >> (c % self.d.topk)) & 1 == 0 { continue; }
             let (dgu, ddn) = (st.gu + (c * gu_b) as Dev, st.dn + (c * dn_b) as Dev);
             cuda::d2d_async(dgu, *h_gu.add(c), gu_b);
             cuda::d2d_async(ddn, *h_dn.add(c), dn_b);
@@ -3115,18 +3116,18 @@ impl Engine {
         let s = &self.s;
         let m = &self.w.moe[l];
         let (table, bitmap, counters, _, _) = self.res.layer_ptrs(l);
-        let sel_counts = self.sel_counts as u64 + (l * E * 8) as u64;
+        let sel_counts = self.sel_counts as u64 + (l * self.d.e * 8) as u64;
 
         if t >= 8 && std::env::var("CROW_ROUTER_GEMM").as_deref() == Ok("1") {
             // bf16 tensor-core GEMM on the exact bf16 twin (summation order differs
             // from gemv_b -> not bit-identical, env-gated until validated); the
             // #10c variant B selection lives in the ONE bf16 dense launch helper
-            launch_bf16_dense(k, m.router_bf as u64, mixed_m as u64, s.rlog as u64, p.n2560 as u64, E, p.nr512 as u64, t, p.t as u64);
+            launch_bf16_dense(k, m.router_bf as u64, mixed_m as u64, s.rlog as u64, p.n2560 as u64, self.d.e, p.nr512 as u64, t, p.t as u64);
         } else {
-            launch_v(k.f("gemv_b"), E as u32, t as u32, 1, 256, &[
+            launch_v(k.f("gemv_b"), self.d.e as u32, t as u32, 1, 256, &[
                 m.router as u64, mixed_m as u64, s.rlog as u64, p.n2560 as u64]);
         }
-        launch_v(k.f("router_top10"), t as u32, 1, 1, 512, &[
+        launch_v(k.f("router_top10"), t as u32, 1, 1, self.d.e as u32, &[
             s.rlog as u64, bitmap, s.rids as u64, s.rwts as u64, s.gu_ptrs as u64,
             s.dn_ptrs as u64, table, s.cold as u64, counters, sel_counts]);
         // Hot-set calibration (2026-09-24): CROW_ROUTE_DUMP_PREFILL=<file> appends
@@ -3140,7 +3141,7 @@ impl Engine {
         // cold staging (decode-sized batches): coalesced PCIe pull into VRAM
         // slots + rewritten combo pointers; prefill chunks stay zero-copy
         let lb = self.res.lb.as_ref();
-        let staged = stage_on() && t * TOPK <= self.stage.max;
+        let staged = stage_on() && t * self.d.topk <= self.stage.max;
         // #19j: the side-stream form runs on the stage_cold_ca branch only (the
         // DMA branch is host-issued and the lb / stage_cold branches are the
         // fallbacks of record); `cs` is the stream the join goes back to.
@@ -3160,7 +3161,7 @@ impl Engine {
             } else if let Some(lb) = lb {
                 sc[9] = lb.bits_dev as u64;
                 sc[10] = lb.lut_dev as u64;
-                launch_v(k.f("stage_cold_lb"), (t * TOPK) as u32, 2, stage_split(), 256, &sc[..11]);
+                launch_v(k.f("stage_cold_lb"), (t * self.d.topk) as u32, 2, stage_split(), 256, &sc[..11]);
             } else if stage_kernel_ca() {
                 // #19d: persistent cp.async.cg 4 KB tile copy, grid CROW_STAGE_BLOCKS
                 // x 1 x 1; the tenth argument is the combo count BY VALUE, the very
@@ -3172,7 +3173,7 @@ impl Engine {
                 assert!(self.stage.gu_bytes % 4096 == 0 && self.stage.dn_bytes % 4096 == 0,
                     "stage_cold_ca needs both staged byte counts to be multiples of 4096 (gate_up {} B, down {} B); CROW_STAGE_KERNEL=1 falls back to stage_cold",
                     self.stage.gu_bytes, self.stage.dn_bytes);
-                sc[9] = (t * TOPK) as u64;
+                sc[9] = (t * self.d.topk) as u64;
                 // #19j (CROW_STAGE_PAR=1, default off): fork the copy onto the
                 // side stream and join before the routed GEMV below, so the
                 // shared-expert chain overlaps the PCIe pull. The fork depends on
@@ -3191,7 +3192,7 @@ impl Engine {
                     cuda::set_stream(cs as u64);
                 }
             } else {
-                launch_v(k.f("stage_cold"), (t * TOPK) as u32, 2, stage_split(), 256, &sc[..9]);
+                launch_v(k.f("stage_cold"), (t * self.d.topk) as u32, 2, stage_split(), 256, &sc[..9]);
             }
             (self.stage.sgu as u64, self.stage.sdn as u64)
         } else {
@@ -3230,36 +3231,36 @@ impl Engine {
         let sh_fuse = sh_fuse_on() && mma && dense && t < 8
             && !m.sg.is_bf16() && !m.su.is_bf16() && !m.sdn.is_bf16();
         if sh_fuse {
-            launch_v(k.f("sh_gate_up_q"), (INTER / 64) as u32, t as u32, 1, mma_bx(), &[
+            launch_v(k.f("sh_gate_up_q"), (self.d.inter / 64) as u32, t as u32, 1, mma_bx(), &[
                 m.sg.w() as u64, m.su.w() as u64, s.xq_gu as u64, m.sg.gs() as u64,
                 m.su.gs() as u64, s.sh2 as u64, s.xq_s as u64, p.n2560 as u64, p.n640 as u64]);
         } else {
-            m.sg.or_bf16_s(k, INTER, p.n640, t, p.t, mixed_m, s.sh12, p.n2560, p.n1280, |w, gs| {
+            m.sg.or_bf16_s(k, self.d.inter, p.n640, t, p.t, mixed_m, s.sh12, p.n2560, p.n1280, |w, gs| {
                 if dense {
-                launch_mma_d(k, (INTER / 64) as u32, t, p.t as u64, &[
+                launch_mma_d(k, (self.d.inter / 64) as u32, t, p.t as u64, &[
                     w as u64, s.xq_gu as u64, gs as u64, s.sh12 as u64,
                     p.n2560 as u64, p.n640 as u64, p.n1280 as u64]);
                 } else {
-                launch_v(k.f("gemv_fp4_bs"), INTER as u32, t as u32, 1, 256, &[
+                launch_v(k.f("gemv_fp4_bs"), self.d.inter as u32, t as u32, 1, 256, &[
                     w as u64, mixed_m as u64, gs as u64, s.sh12 as u64, p.n2560 as u64, p.n1280 as u64]);
                 }
             });
-            m.su.or_bf16_s(k, INTER, p.n640, t, p.t, mixed_m, s.sh12 + (INTER * 4) as u64, p.n2560, p.n1280, |w, gs| {
+            m.su.or_bf16_s(k, self.d.inter, p.n640, t, p.t, mixed_m, s.sh12 + (self.d.inter * 4) as u64, p.n2560, p.n1280, |w, gs| {
                 if dense {
-                launch_mma_d(k, (INTER / 64) as u32, t, p.t as u64, &[
-                    w as u64, s.xq_gu as u64, gs as u64, (s.sh12 + (INTER * 4) as u64),
+                launch_mma_d(k, (self.d.inter / 64) as u32, t, p.t as u64, &[
+                    w as u64, s.xq_gu as u64, gs as u64, (s.sh12 + (self.d.inter * 4) as u64),
                     p.n2560 as u64, p.n640 as u64, p.n1280 as u64]);
                 } else {
-                launch_v(k.f("gemv_fp4_bs"), INTER as u32, t as u32, 1, 256, &[
-                    w as u64, mixed_m as u64, gs as u64, (s.sh12 + (INTER * 4) as u64), p.n2560 as u64, p.n1280 as u64]);
+                launch_v(k.f("gemv_fp4_bs"), self.d.inter as u32, t as u32, 1, 256, &[
+                    w as u64, mixed_m as u64, gs as u64, (s.sh12 + (self.d.inter * 4) as u64), p.n2560 as u64, p.n1280 as u64]);
                 }
             });
         }
         if !sh_fuse {
             if qfuse_on() {
-                launch_v(k.f("silu_mul640_q"), 3, t as u32, 1, 256, &[s.sh12 as u64, s.sh2 as u64, s.xq_s as u64]);
+                launch_v(k.f("silu_mul640_q"), self.d.inter.div_ceil(256) as u32, t as u32, 1, 256, &[s.sh12 as u64, s.sh2 as u64, s.xq_s as u64]);
             } else {
-                launch_v(k.f("silu_mul640"), 3, t as u32, 1, 256, &[s.sh12 as u64, s.sh2 as u64]);
+                launch_v(k.f("silu_mul640"), self.d.inter.div_ceil(256) as u32, t as u32, 1, 256, &[s.sh12 as u64, s.sh2 as u64]);
             }
         }
         if sh_fuse {
@@ -3270,20 +3271,20 @@ impl Engine {
             // down GEMV + gate_shared epilogue in ONE launch: moe_out =
             // sigmoid(sgv[t]) * down, ASSIGN, first writer (no memset:
             // the cuMemsetD8 history above applies unchanged)
-            launch_v(k.f("gemv_fp4_mma_dg"), (H / 64) as u32, t as u32, 1, mma_bx(), &[
+            launch_v(k.f("gemv_fp4_mma_dg"), (self.d.h / 64) as u32, t as u32, 1, mma_bx(), &[
                 m.sdn.w() as u64, s.xq_s as u64, m.sdn.gs() as u64, s.sgv as u64,
                 s.moe_out as u64, p.n640 as u64, p.n2560 as u64, p.n2560 as u64]);
         } else {
             if dense && !m.sdn.is_bf16() {
                 quant_x_if_unfused(k, p, t as u32, s.sh2 as u64, s.xq_s as u64, p.n640 as u64, p.n640 as u64);
             }
-            m.sdn.or_bf16(k, H, p.n2560, t, p.t, s.sh2, s.sdown, p.n640, |w, gs| {
+            m.sdn.or_bf16(k, self.d.h, p.n2560, t, p.t, s.sh2, s.sdown, p.n640, |w, gs| {
                 if dense {
-                launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
+                launch_mma_d(k, (self.d.h / 64) as u32, t, p.t as u64, &[
                     w as u64, s.xq_s as u64, gs as u64, s.sdown as u64,
                     p.n640 as u64, p.n2560 as u64, p.n2560 as u64]);
                 } else {
-                launch_v(k.f("gemv_fp4_b"), H as u32, t as u32, 1, 256, &[
+                launch_v(k.f("gemv_fp4_b"), self.d.h as u32, t as u32, 1, 256, &[
                     w as u64, s.sh2 as u64, gs as u64, s.sdown as u64, p.n640 as u64]);
                 }
             });
@@ -3294,7 +3295,7 @@ impl Engine {
             // moe_out is ASSIGNED by gate_shared (first writer) - no memset: the
             // synchronous cuMemsetD8 ran on the legacy stream and was never part
             // of a captured graph (replay would accumulate across layers)
-            launch_v(k.f("gate_shared"), 10, t as u32, 1, 256, &[
+            launch_v(k.f("gate_shared"), (self.d.h / 256) as u32, t as u32, 1, 256, &[
                 s.sdown as u64, s.sgv as u64, s.moe_out as u64]);
         }
 
@@ -3304,14 +3305,14 @@ impl Engine {
             // prefill-sized batch: expert-grouped tile GEMM (each cold expert
             // crosses PCIe ONCE per layer, n = 8 tokens per mma)
             let st = &self.stage;
-            launch_v(k.f("moe_count"), ((t * TOPK + 255) / 256) as u32, 1, 1, 256, &[
+            launch_v(k.f("moe_count"), ((t * self.d.topk + 255) / 256) as u32, 1, 1, 256, &[
                 s.rids as u64, st.counts as u64, self.pf_ncombo as u64]);
             launch_v(k.f("moe_plan"), 1, 1, 1, 1024, &[
                 st.counts as u64, st.offsets as u64, st.tiles as u64, st.n_tiles as u64,
                 st.cursor as u64, st.tg as u64, st.max_tiles_p as u64]);
-            launch_v(k.f("moe_scatter"), ((t * TOPK + 255) / 256) as u32, 1, 1, 256, &[
+            launch_v(k.f("moe_scatter"), ((t * self.d.topk + 255) / 256) as u32, 1, 1, 256, &[
                 s.rids as u64, st.offsets as u64, st.cursor as u64, st.perm as u64, self.pf_ncombo as u64]);
-            let max_tiles_now = t * TOPK / 8 + E + 1;
+            let max_tiles_now = t * self.d.topk / 8 + self.d.e + 1;
             let tg = pf_tg();
             let n_groups = (max_tiles_now + tg - 1) / tg;
             assert!(n_groups <= PF_MAX_GROUPS);
@@ -3331,8 +3332,8 @@ impl Engine {
             let (tiles_h, hot_h) = if ce {
                 let nt = cuda::dtoh_i32(st.n_tiles, 1)[0] as usize;
                 let tl = cuda::dtoh_i32(st.tiles, nt * 4);
-                let mut hot = vec![false; E];
-                for &id in &self.res.sets[l] { if (id as usize) < E { hot[id as usize] = true; } }
+                let mut hot = vec![false; self.d.e];
+                for &id in &self.res.sets[l] { if (id as usize) < self.d.e { hot[id as usize] = true; } }
                 (tl, hot)
             } else { (Vec::new(), Vec::new()) };
             // TASK I: the loop bound above is the WORST CASE a host that has not seen
@@ -3404,14 +3405,14 @@ impl Engine {
                     stage_group(gi);
                 }
                 if pf_async_mode() != 4 { // DIAGNOSTIC (=4): copy-only floor, no tile GEMMs
-                launch_v(k.f("gemm_fp4_tiles"), ((2 * INTER) / 64) as u32, tg as u32, 1, mma_bx(), &[
+                launch_v(k.f("gemm_fp4_tiles"), ((2 * self.d.inter) / 64) as u32, tg as u32, 1, mma_bx(), &[
                     st.tiles as u64, st.n_tiles as u64, grp, st.tg as u64, st.eptr as u64, p.zero as u64,
                     s.xq_gu as u64, st.perm as u64, s.h1 as u64, p.n2560 as u64, p.k_top10 as u64, gs_gu]);
                 launch_v(k.f("silu_tiles"), tg as u32, 8, 1, 256, &[
                     s.h1 as u64, s.h2 as u64, st.tiles as u64, st.n_tiles as u64, grp, st.tg as u64, st.perm as u64]);
                 launch_v(k.f("quant_tiles"), tg as u32, 8, 1, 128, &[
                     s.h2 as u64, s.xq_dn as u64, st.tiles as u64, st.n_tiles as u64, grp, st.tg as u64, st.perm as u64]);
-                launch_v(k.f("gemm_fp4_tiles"), (H / 64) as u32, tg as u32, 1, mma_bx(), &[
+                launch_v(k.f("gemm_fp4_tiles"), (self.d.h / 64) as u32, tg as u32, 1, mma_bx(), &[
                     st.tiles as u64, st.n_tiles as u64, grp, st.tg as u64, st.eptr as u64, p.one as u64,
                     s.xq_dn as u64, st.perm as u64, s.eo as u64, p.n640 as u64, p.one as u64, gs_dn]);
                 }
@@ -3419,7 +3420,7 @@ impl Engine {
                     cuda::event_record(self.pa_ev_done[gi % 2], cs);
                 }
             }
-            launch_v(k.f("acc_combo"), (H / 256) as u32, t as u32, 1, 256, &[
+            launch_v(k.f("acc_combo"), (self.d.h / 256) as u32, t as u32, 1, 256, &[
                 s.eo as u64, s.rwts as u64, s.moe_out as u64]);
             return s.moe_out;
         }
@@ -3432,33 +3433,33 @@ impl Engine {
         }
         if mma {
             // xq_gu was quantized above (shared with the shared expert)
-            launch_v(k.f("gemv_fp4_mma"), ((2 * INTER) / 64) as u32, (t * TOPK) as u32, 1, mma_bx(), &[
+            launch_v(k.f("gemv_fp4_mma"), ((2 * self.d.inter) / 64) as u32, (t * self.d.topk) as u32, 1, mma_bx(), &[
                 gu_ptrs, s.xq_gu as u64, (self.res.gs_dev + (l * 8) as u64) as u64,
                 s.h1 as u64, p.n2560 as u64, p.k_top10 as u64]);
         } else {
-            launch_v(k.f("gemv_fp4_ptrb"), (2 * INTER) as u32, (t * TOPK) as u32, 1, 256, &[
+            launch_v(k.f("gemv_fp4_ptrb"), (2 * self.d.inter) as u32, (t * self.d.topk) as u32, 1, 256, &[
                 gu_ptrs, mixed_m as u64, (self.res.gs_dev + (l * 8) as u64) as u64, s.h1 as u64,
                 p.n2560 as u64, p.k_top10 as u64, p.n2560 as u64]);
         }
         if qfuse_on() && mma {
-            launch_v(k.f("silu_mul_combo_q"), ((t * TOPK * INTER + 255) / 256) as u32, 1, 1, 256, &[
+            launch_v(k.f("silu_mul_combo_q"), ((t * self.d.topk * self.d.inter + 255) / 256) as u32, 1, 1, 256, &[
                 s.h1 as u64, s.h2 as u64, p.nt_combo as u64, s.xq_dn as u64]);
         } else {
-            launch_v(k.f("silu_mul_combo"), ((t * TOPK * INTER + 255) / 256) as u32, 1, 1, 256, &[
+            launch_v(k.f("silu_mul_combo"), ((t * self.d.topk * self.d.inter + 255) / 256) as u32, 1, 1, 256, &[
                 s.h1 as u64, s.h2 as u64, p.nt_combo as u64]);
         }
         if mma {
             // h2 is per-combo ([t*TOPK][640]) — quantize per combo row
-            quant_x_if_unfused(k, p, (t * TOPK) as u32, s.h2 as u64, s.xq_dn as u64, p.n640 as u64, p.n640 as u64);
-            launch_v(k.f("gemv_fp4_mma"), (H / 64) as u32, (t * TOPK) as u32, 1, mma_bx(), &[
+            quant_x_if_unfused(k, p, (t * self.d.topk) as u32, s.h2 as u64, s.xq_dn as u64, p.n640 as u64, p.n640 as u64);
+            launch_v(k.f("gemv_fp4_mma"), (self.d.h / 64) as u32, (t * self.d.topk) as u32, 1, mma_bx(), &[
                 dn_ptrs, s.xq_dn as u64, (self.res.gs_dev + (l * 8 + 4) as u64) as u64,
                 s.eo as u64, p.n640 as u64, p.one as u64]);
         } else {
-            launch_v(k.f("gemv_fp4_ptrb"), H as u32, (t * TOPK) as u32, 1, 256, &[
+            launch_v(k.f("gemv_fp4_ptrb"), self.d.h as u32, (t * self.d.topk) as u32, 1, 256, &[
                 dn_ptrs, s.h2 as u64, (self.res.gs_dev + (l * 8 + 4) as u64) as u64, s.eo as u64,
                 p.n640 as u64, p.one as u64, p.n640 as u64]);
         }
-        launch_v(k.f("acc_combo"), (H / 256) as u32, t as u32, 1, 256, &[
+        launch_v(k.f("acc_combo"), (self.d.h / 256) as u32, t as u32, 1, 256, &[
             s.eo as u64, s.rwts as u64, s.moe_out as u64]);
         s.moe_out
     }
@@ -3489,34 +3490,34 @@ impl Engine {
             // of layer 1, i.e. to layer 0's output; only the host prep (n-gram
             // ids, row cache, slot upload) stays here, before any graph capture
         } else {
-            launch_v(k.f("gather_ple_fp4"), PLE_NHEADS as u32, t as u32, 1, PLE_EMB_DIM as u32, &[
+            launch_v(k.f("gather_ple_fp4"), self.d.ple_nheads as u32, t as u32, 1, self.d.ple_emb_dim as u32, &[
                 pl.cache as u64, pl.gs as u64, s.ple_slots as u64, s.emb as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 11"); }
             let mma = dense_mma_on();
             if mma {
                 quant_x_now(k, p, t as u32, s.emb as u64, s.xq_e as u64, p.n2560 as u64, p.n2560 as u64);
             }
-            pl.key.or_bf16(k, HCT, p.n10240, t, p.t, s.emb, s.ple_key, p.n2560, |w, gs| {
+            pl.key.or_bf16(k, self.d.hct, p.n10240, t, p.t, s.emb, s.ple_key, p.n2560, |w, gs| {
                 if mma {
-                launch_mma_d(k, (HCT / 64) as u32, t, p.t as u64, &[
+                launch_mma_d(k, (self.d.hct / 64) as u32, t, p.t as u64, &[
                     w as u64, s.xq_e as u64, gs as u64, s.ple_key as u64,
                     p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
                 } else {
-                launch_v(k.f("gemv_fp4_b"), HCT as u32, t as u32, 1, 256, &[
+                launch_v(k.f("gemv_fp4_b"), self.d.hct as u32, t as u32, 1, 256, &[
                     w as u64, s.emb as u64, gs as u64, s.ple_key as u64, p.n2560 as u64]);
                 }
             });
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 12"); }
-            launch_v(k.f("rms_group"), 4, t as u32, 1, 256, &[
+            launch_v(k.f("rms_group"), self.d.hcn as u32, t as u32, 1, 256, &[
                 s.ple_key as u64, pl.norm_key as u64, s.ple_kn as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 13"); }
-            pl.value.or_bf16(k, H, p.n2560, t, p.t, s.emb, s.ple_val, p.n2560, |w, gs| {
+            pl.value.or_bf16(k, self.d.h, p.n2560, t, p.t, s.emb, s.ple_val, p.n2560, |w, gs| {
                 if mma {
-                launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
+                launch_mma_d(k, (self.d.h / 64) as u32, t, p.t as u64, &[
                     w as u64, s.xq_e as u64, gs as u64, s.ple_val as u64,
                     p.n2560 as u64, p.n2560 as u64, p.n2560 as u64]);
                 } else {
-                launch_v(k.f("gemv_fp4_b"), H as u32, t as u32, 1, 256, &[
+                launch_v(k.f("gemv_fp4_b"), self.d.h as u32, t as u32, 1, 256, &[
                     w as u64, s.emb as u64, gs as u64, s.ple_val as u64, p.n2560 as u64]);
                 }
             });
@@ -3526,51 +3527,51 @@ impl Engine {
                 let dump = |tag: &str, v: Vec<f32>| {
                     cuda::write_le(&format!("{dir}/ple-{tag}.f32"), &v).unwrap();
                 };
-                dump("h-before-qn", cuda::dtoh(s.h, t * HCT));
-                dump("norm-query-w", cuda::dtoh(pl.norm_query, HCT));
+                dump("h-before-qn", cuda::dtoh(s.h, t * self.d.hct));
+                dump("norm-query-w", cuda::dtoh(pl.norm_query, self.d.hct));
             }
-            launch_v(k.f("rms_group"), 4, t as u32, 1, 256, &[
+            launch_v(k.f("rms_group"), self.d.hcn as u32, t as u32, 1, 256, &[
                 s.h as u64, pl.norm_query as u64, s.ple_qn as u64]);
             if let Some(dir) = dump_h() {
                 cuda::sync();
-                let v = cuda::dtoh(s.ple_qn, t * HCT);
+                let v = cuda::dtoh(s.ple_qn, t * self.d.hct);
                 cuda::write_le(&format!("{dir}/ple-qn-immediate.f32"), &v).unwrap();
             }
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 15"); }
-            launch_v(k.f("gate_dot"), 4, t as u32, 1, 256, &[
+            launch_v(k.f("gate_dot"), self.d.hcn as u32, t as u32, 1, 256, &[
                 s.ple_kn as u64, s.ple_qn as u64, s.ple_gate as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 16"); }
-            launch_v(k.f("gate_apply"), 4, t as u32, 1, 256, &[
+            launch_v(k.f("gate_apply"), self.d.hcn as u32, t as u32, 1, 256, &[
                 s.ple_gate as u64, s.ple_val as u64, s.ple_gs as u64, s.ple_gated as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 17"); }
-            launch_v(k.f("rms_group"), 4, t as u32, 1, 256, &[
+            launch_v(k.f("rms_group"), self.d.hcn as u32, t as u32, 1, 256, &[
                 s.ple_gated as u64, pl.norm_conv as u64, s.ple_gn as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 18"); }
-            launch_v(k.f("ple_conv"), GDN_CONV as u32, 1, 1, 256, &[
+            launch_v(k.f("ple_conv"), self.d.hct as u32, 1, 1, 256, &[
                 s.ple_gn as u64, pl.conv as u64, s.ple_gated as u64, s.ple_out as u64,
                 p.t as u64, pl.state as u64]);
         if dbg {
             cuda::sync();
-            let emb = cuda::dtoh(s.emb, t * PLE_EMBED);
-            let kn = cuda::dtoh(s.ple_kn, t * HCT);
-            let gd = cuda::dtoh(s.ple_gated, t * HCT);
-            let gn = cuda::dtoh(s.ple_gn, t * HCT);
-            let po = cuda::dtoh(s.ple_out, t * HCT);
+            let emb = cuda::dtoh(s.emb, t * self.d.ple_embed);
+            let kn = cuda::dtoh(s.ple_kn, t * self.d.hct);
+            let gd = cuda::dtoh(s.ple_gated, t * self.d.hct);
+            let gn = cuda::dtoh(s.ple_gn, t * self.d.hct);
+            let po = cuda::dtoh(s.ple_out, t * self.d.hct);
             let cnt = |v: &[f32]| v.iter().filter(|x| x.is_nan()).count();
             let mut rows = Vec::new();
             for r in 0..t {
-                let lo = r * HCT;
-                rows.push(cnt(&po[lo..lo + HCT]));
+                let lo = r * self.d.hct;
+                rows.push(cnt(&po[lo..lo + self.d.hct]));
             }
             tracing::info!(target: "ple", "[ple dbg] nan emb={} key_n={} gated={} gn={} out={} out_rows={:?} slots0={:?}",
                 cnt(&emb), cnt(&kn), cnt(&gd), cnt(&gn), cnt(&po), rows,
                 &cuda::dtoh_i32(s.ple_slots, 16));
         }
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 19"); }
-            launch_v(k.f("ple_state_update"), (GDN_CONV as u32 + 255) / 256, 1, 1, 256, &[
+            launch_v(k.f("ple_state_update"), (self.d.hct as u32 + 255) / 256, 1, 1, 256, &[
                 s.ple_gn as u64, pl.state as u64, p.t as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 20"); }
-            launch_v(k.f("add_flat"), ((t * HCT + 255) / 256) as u32, 1, 1, 256, &[
+            launch_v(k.f("add_flat"), ((t * self.d.hct + 255) / 256) as u32, 1, 1, 256, &[
                 s.ple_out as u64, s.h as u64, p.nt_hct as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 21"); }
             if let Some(dir) = dump_h() {
@@ -3578,15 +3579,15 @@ impl Engine {
                 let dump = |tag: &str, v: Vec<f32>| {
                     cuda::write_le(&format!("{dir}/ple-{tag}.f32"), &v).unwrap();
                 };
-                dump("emb", cuda::dtoh(s.emb, t * PLE_EMBED));
-                dump("key", cuda::dtoh(s.ple_key, t * HCT));
-                dump("val", cuda::dtoh(s.ple_val, t * H));
-                dump("qn", cuda::dtoh(s.ple_qn, t * HCT));
+                dump("emb", cuda::dtoh(s.emb, t * self.d.ple_embed));
+                dump("key", cuda::dtoh(s.ple_key, t * self.d.hct));
+                dump("val", cuda::dtoh(s.ple_val, t * self.d.h));
+                dump("qn", cuda::dtoh(s.ple_qn, t * self.d.hct));
                 dump("gate", cuda::dtoh(s.ple_gate, t * 4));
-                dump("gated", cuda::dtoh(s.ple_gated, t * HCT));
-                dump("gn", cuda::dtoh(s.ple_gn, t * HCT));
-                dump("out", cuda::dtoh(s.ple_out, t * HCT));
-                let sl = cuda::dtoh_i32(s.ple_slots, t * PLE_NHEADS);
+                dump("gated", cuda::dtoh(s.ple_gated, t * self.d.hct));
+                dump("gn", cuda::dtoh(s.ple_gn, t * self.d.hct));
+                dump("out", cuda::dtoh(s.ple_out, t * self.d.hct));
+                let sl = cuda::dtoh_i32(s.ple_slots, t * self.d.ple_nheads);
                 std::fs::write(format!("{dir}/ple-slots.json"), format!("{sl:?}")).unwrap();
                 std::fs::write(format!("{dir}/ple-ngids.json"), format!("{flat:?}")).unwrap();
             }
@@ -3602,7 +3603,7 @@ impl Engine {
         let pl = &self.ple;
         let t = 1usize;
         let dbg = dbg_step();
-            launch_v(k.f("gather_ple_fp4"), PLE_NHEADS as u32, 1, 1, PLE_EMB_DIM as u32, &[
+            launch_v(k.f("gather_ple_fp4"), self.d.ple_nheads as u32, 1, 1, self.d.ple_emb_dim as u32, &[
                 pl.cache as u64, pl.gs as u64, s.ple_slots as u64, s.emb as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 1"); }
             let mma = dense_mma_on();
@@ -3610,41 +3611,41 @@ impl Engine {
                 // one quantized embed row set serves key + value (both k=2560)
                 quant_x_now(k, p, t as u32, s.emb as u64, s.xq_e as u64, p.n2560 as u64, p.n2560 as u64);
             }
-            pl.key.or_bf16_1(k, HCT, p.n10240, s.emb, s.ple_key, p.n2560, |w, gs| {
+            pl.key.or_bf16_1(k, self.d.hct, p.n10240, s.emb, s.ple_key, p.n2560, |w, gs| {
                 if mma {
-                launch_mma_d(k, (HCT / 64) as u32, t, p.t as u64, &[
+                launch_mma_d(k, (self.d.hct / 64) as u32, t, p.t as u64, &[
                     w as u64, s.xq_e as u64, gs as u64, s.ple_key as u64,
                     p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
                 } else {
-                launch_v(k.f("gemv_fp4"), HCT as u32, 1, 1, 256, &[
+                launch_v(k.f("gemv_fp4"), self.d.hct as u32, 1, 1, 256, &[
                     w as u64, s.emb as u64, gs as u64, s.ple_key as u64, p.n2560 as u64]);
                 }
             });
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 2"); }
-            launch_v(k.f("rms_group"), 4, 1, 1, 256, &[
+            launch_v(k.f("rms_group"), self.d.hcn as u32, 1, 1, 256, &[
                 s.ple_key as u64, pl.norm_key as u64, s.ple_kn as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 3"); }
-            pl.value.or_bf16_1(k, H, p.n2560, s.emb, s.ple_val, p.n2560, |w, gs| {
+            pl.value.or_bf16_1(k, self.d.h, p.n2560, s.emb, s.ple_val, p.n2560, |w, gs| {
                 if mma {
-                launch_mma_d(k, (H / 64) as u32, t, p.t as u64, &[
+                launch_mma_d(k, (self.d.h / 64) as u32, t, p.t as u64, &[
                     w as u64, s.xq_e as u64, gs as u64, s.ple_val as u64,
                     p.n2560 as u64, p.n2560 as u64, p.n2560 as u64]);
                 } else {
-                launch_v(k.f("gemv_fp4"), H as u32, 1, 1, 256, &[
+                launch_v(k.f("gemv_fp4"), self.d.h as u32, 1, 1, 256, &[
                     w as u64, s.emb as u64, gs as u64, s.ple_val as u64, p.n2560 as u64]);
                 }
             });
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 4"); }
-            launch_v(k.f("rms_group"), 4, 1, 1, 256, &[
+            launch_v(k.f("rms_group"), self.d.hcn as u32, 1, 1, 256, &[
                 s.h as u64, pl.norm_query as u64, s.ple_qn as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 5"); }
-            launch_v(k.f("gate_dot"), 4, 1, 1, 256, &[
+            launch_v(k.f("gate_dot"), self.d.hcn as u32, 1, 1, 256, &[
                 s.ple_kn as u64, s.ple_qn as u64, s.ple_gate as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 6"); }
-            launch_v(k.f("gate_apply"), 4, 1, 1, 256, &[
+            launch_v(k.f("gate_apply"), self.d.hcn as u32, 1, 1, 256, &[
                 s.ple_gate as u64, s.ple_val as u64, s.ple_gs as u64, s.ple_gated as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 7"); }
-            launch_v(k.f("rms_group"), 4, 1, 1, 256, &[
+            launch_v(k.f("rms_group"), self.d.hcn as u32, 1, 1, 256, &[
                 s.ple_gated as u64, pl.norm_conv as u64, s.ple_gn as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 8"); }
             // #11 (2026-09-05): the step passed s.h as gated_row, so the token got
@@ -3652,10 +3653,10 @@ impl Engine {
             // (prefill's ple_conv uses ple_gated). Decode rows drifted 5-15 logit
             // units from the prefill rows over the same context; with PLE off both
             // paths agreed within 1.8. gated_row is the gated value row, as in prefill.
-            launch_v(k.f("ple_conv_step"), (GDN_CONV as u32 + 255) / 256, 1, 1, 256, &[
+            launch_v(k.f("ple_conv_step"), (self.d.hct as u32 + 255) / 256, 1, 1, 256, &[
                 s.ple_gn as u64, s.ple_gated as u64, pl.conv as u64, pl.state as u64, s.ple_out as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 9"); }
-            launch_v(k.f("add_flat"), (HCT as u32 + 255) / 256, 1, 1, 256, &[
+            launch_v(k.f("add_flat"), (self.d.hct as u32 + 255) / 256, 1, 1, 256, &[
                 s.ple_out as u64, s.h as u64, p.nt_hct1 as u64]);
         if dbg { cuda::sync(); tracing::info!(target: "ple", "[ple] step 10"); }
     }
@@ -3664,7 +3665,7 @@ impl Engine {
         let k = &self.k;
         let p = &self.p;
         let s = &self.s;
-        launch_v(k.f("rms_group"), 4, rows as u32, 1, 256, &[
+        launch_v(k.f("rms_group"), self.d.hcn as u32, rows as u32, 1, 256, &[
             s.h as u64, self.w.mx_norm as u64, s.normed as u64]);
         // #19f: the same CROW_QFUSE epilogue fusion as hc_run. The mixer
         // has no inject rows, so the hc_down_inj grid carries no inj blocks
@@ -3674,31 +3675,31 @@ impl Engine {
         if fuse {
             let PW::Bf16(dw) = &self.w.mx_down else { unreachable!() };
             let PW::Bf16(uw) = &self.w.mx_up else { unreachable!() };
-            launch_v(k.f("hc_down_inj"), ((LOWRANK + 7) / 8) as u32, rows as u32, 1, 256, &[
+            launch_v(k.f("hc_down_inj"), ((self.d.lowrank + 7) / 8) as u32, rows as u32, 1, 256, &[
                 *dw as u64, s.normed as u64, s.sil as u64, 0, 0, 0, p.n10240 as u64, p.n320 as u64]);
-            launch_v(k.f("gemv_bf16_ws"), ((HCT + 7) / 8) as u32, rows as u32, 1, 256, &[
+            launch_v(k.f("gemv_bf16_ws"), ((self.d.hct + 7) / 8) as u32, rows as u32, 1, 256, &[
                 *uw as u64, s.sil as u64, s.mixw as u64, p.n320 as u64, p.n10240 as u64]);
         } else {
-            self.w.mx_down.launch_gemv(k, LOWRANK, p.n320 as u64, rows, p.t as u64, s.normed as u64, s.low as u64, p.n10240 as u64);
-            launch_v(k.f("silu_div4"), ((rows * LOWRANK + 255) / 256) as u32, 1, 1, 256, &[
+            self.w.mx_down.launch_gemv(k, self.d.lowrank, p.n320 as u64, rows, p.t as u64, s.normed as u64, s.low as u64, p.n10240 as u64);
+            launch_v(k.f("silu_div4"), ((rows * self.d.lowrank + 255) / 256) as u32, 1, 1, 256, &[
                 s.low as u64, s.sil as u64, p.nt_low as u64]);
-            self.w.mx_up.launch_gemv(k, HCT, p.n10240 as u64, rows, p.t as u64, s.sil as u64, s.mixw as u64, p.n320 as u64);
-            launch_v(k.f("sigmoid_el"), ((rows * HCT + 255) / 256) as u32, 1, 1, 256, &[
+            self.w.mx_up.launch_gemv(k, self.d.hct, p.n10240 as u64, rows, p.t as u64, s.sil as u64, s.mixw as u64, p.n320 as u64);
+            launch_v(k.f("sigmoid_el"), ((rows * self.d.hct + 255) / 256) as u32, 1, 1, 256, &[
                 s.mixw as u64, p.nt_hct as u64]);
         }
-        launch_v(k.f("mix_streams"), 10, rows as u32, 1, 256, &[
+        launch_v(k.f("mix_streams"), (self.d.h / 256) as u32, rows as u32, 1, 256, &[
             s.mixw as u64, s.normed as u64, s.mixed_final as u64]);
     }
 
     unsafe fn lm_head_row(&self, row: usize) {
         let dst = self.s.logits as u64;
         if bf16_w_on() {
-            launch_v(self.k.f("gemv_bf16_w"), ((V + 7) / 8) as u32, 1, 1, 256, &[
-                self.w.lm_head as u64, (self.s.mixed_final as u64 + (row * H * 4) as u64),
+            launch_v(self.k.f("gemv_bf16_w"), ((self.d.v + 7) / 8) as u32, 1, 1, 256, &[
+                self.w.lm_head as u64, (self.s.mixed_final as u64 + (row * self.d.h * 4) as u64),
                 dst, self.p.n2560 as u64, self.p.n_vocab as u64]);
         } else {
-            launch_v(self.k.f("gemv_bf16"), V as u32, 1, 1, 256, &[
-                self.w.lm_head as u64, (self.s.mixed_final as u64 + (row * H * 4) as u64),
+            launch_v(self.k.f("gemv_bf16"), self.d.v as u32, 1, 1, 256, &[
+                self.w.lm_head as u64, (self.s.mixed_final as u64 + (row * self.d.h * 4) as u64),
                 dst, self.p.n2560 as u64]);
         }
     }

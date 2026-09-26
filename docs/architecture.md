@@ -4648,8 +4648,11 @@ tests read the checkpoint of record in `models/`, as before.
   `[budget]`, `[residency]`, `[diet]` and `scratch + staging` line is identical to `f7ca9f5`
   (host-measured free RAM / VRAM masked).
 
-**What still reads the consts** (C3c, 2026-09-26): in `gen.rs` the layer primitives (`hc_run`
-.. `lm_head_row`) and the loops (`upload_chunk_scalars` .. the trickle and the route log). On purpose: `meta.rs` (the Flash-Next expected-values row is the
+**What still reads the consts** (C3d, 2026-09-26): in `gen.rs` the loops (`upload_chunk_scalars`
+.. the trickle and the route log). Host literals that stay, because they describe a kernel's own
+launch contract rather than the model: the 256 / 128 / 1024 block sizes, `qsa_scores_par`'s
+`(ncb + 3) / 4` grid and its `QSA_SCORES_BLOCKS` cap, the NVFP4 block bytes (36) and the PLE cache
+row (108 B, `PLE_ROW_VALUES` 160, asserted equal to the model's PLE embedding dim at load). On purpose: `meta.rs` (the Flash-Next expected-values row is the
 pin), the tests that pin a const against its `Geo` field or feed a Flash-Next fixture, and the
 synthetic kernel probes (`mma_gate`, `attn_path_probe`, `qsa_probe`, `qsa_tie_probe`,
 `gdn_chunk_probe`, `rope_table_probe`, `router_probe`): they load no model and exercise the
