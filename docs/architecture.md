@@ -4774,17 +4774,22 @@ dense arm is not built and refuses by name.
   context).
 - **The arms.**
 
-  | block | built (Flash-Next) | not built: refusal (`Geo::built`, `geo.rs:900-915`) | switch sites |
+  | block | built (Flash-Next) | not built: refusal (`Geo::built`, `geo.rs:900-915`) | switch sites (C5a: boot, plan, loader; C5b: layer loops, head) |
   |---|---|---|---|
-  | residual | `Residual::Hc` | `Residual::Plain (one pre-norm residual stream)` | loader: both per-layer HC bundles; `[hc]` boot line |
-  | PLE | `Some`: `Ple::load`, the step at its layer; `None`: skipped, `Engine::ple` is `None` and `cfg.ple` off | (both built) | loader; `ple_state_len`; `cache::Shape`; reset; the snapshot copies |
-  | attention | `Attn::Qsa` | `Attn::Full (uncapped causal attention)` | loader (attention + indexer weights); `StateSizes::plan`; `ThreeStates::allocate` (ring + pool); `cache::Shape`; `park_host_bytes`; `[qsa]` boot line |
-  | FFN | `Ffn::Moe` | `Ffn::Dense (one SwiGLU per layer)` | loader (router + shared expert, expert slabs, residency); the hot-set clamp in `ThreeStates::allocate`; `boot::hot_set_sidecar` |
-  | final norm | `FinalNorm::HcMixer` | `FinalNorm::Rms (one RMSNorm before lm_head)` | loader (the mixer weights) |
+  | residual | `Residual::Hc` | `Residual::Plain (one pre-norm residual stream)` | loader: both per-layer HC bundles (`gen.rs:1012`, `:1071`); `[hc]` boot line; prefill and decode: both HC mixes and both `inject_residual` (`:4029`, `:4098`, `:4112`, `:4164`; `:4359`, `:4398`, `:4417`) |
+  | PLE | `Some`: `Ple::load`, the step at its layer; `None`: skipped, `Engine::ple` is `None` and `cfg.ple` off | (both built) | loader; `ple_state_len`; `cache::Shape`; reset; the snapshot copies; the loops' `cfg.ple` step |
+  | attention | `Attn::Qsa` | `Attn::Full (uncapped causal attention)` | loader (attention + indexer weights, `:1028`); `StateSizes::plan`; `ThreeStates::allocate` (ring + pool); `cache::Shape`; `park_host_bytes`; `[qsa]` boot line; `attn_prompt` / `attn_step` (`:4051`, `:4380`) |
+  | FFN | `Ffn::Moe` | `Ffn::Dense (one SwiGLU per layer)` | loader (router + shared expert `:1054`, expert slabs and residency `:1174`); the hot-set clamp (`manager.rs:349`); `boot::hot_set_sidecar`; `moe_run` (`:4130`, `:4403`) |
+  | final norm | `FinalNorm::HcMixer` | `FinalNorm::Rms (one RMSNorm before lm_head)` | loader (the mixer weights, `:995`); `head_run` (`:4207`, `:4424`) |
 
   Behind the boot check each dense arm in the loader and the planner is `geo::unbuilt_arm`, which
   panics with the same message plus `- reached past the boot check`: a guard for a `Geo` that did
-  not come through `boot::model_geo`, never a path a request can take.
+  not come through `boot::model_geo`, never a path a request can take. `Engine::load` refuses
+  before its first allocation, so every `Engine` that exists holds only built arms; the
+  per-layer matches in the loops cost one discriminant compare each, outside the replayed
+  decode graph. The layer loops also count `0..d.layers` and replicate the embedding over
+  `d.hcn` streams now; C3 had left `LAYERS` / `HCN` at twelve `gen.rs` sites (two loader loops, C5a). The stage-dump probes
+  (`run_layer0_with_stage_dumps`, `run_attn_subblock`) stay Flash-Next probes.
 - **Hot sets are the MoE arm.** `boot::hot_set_sidecar(geo, CROW_HOTSETS, default)` is `Some` for
   `Ffn::Moe` and `None` otherwise, so `CROW_HOTSETS` is required for a MoE family only; a family
   without routed experts that has it set gets one `[boot] ... ignored` WARN line. `open_model`

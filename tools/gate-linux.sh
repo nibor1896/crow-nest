@@ -284,6 +284,11 @@ SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
 TESTS="436"
 CLIPPY="1512"
+#   tests 436 / clippy 1512 (both unchanged)   Crow #300 phase 1 C5b (2026-09-26, on `6762df8`): the prefill and
+#                              decode layer loops and the head match per family block (residual, attention, FFN,
+#                              final norm); the loops read `d.layers` / `d.hcn` instead of LAYERS / HCN. No test added
+#                              or removed (the dense arms are unreachable behind `Engine::load`'s `Geo::built`).
+#                              Measured 2026-09-26: 436 / 0 (6 ignored); clippy 1512.
 #   tests 431 -> 436 / clippy 1516 -> 1512   Crow #300 phase 1 C5a (2026-09-26, on `64c242b`): the family switches in
 #                              the boot door, the state plan and the loader. `Geo::built` refuses a family at its first
 #                              unbuilt arm (the dense refusal moved there from the metadata gate); QSA ring / pool, PLE

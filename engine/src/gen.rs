@@ -3971,12 +3971,12 @@ impl Engine {
                 if vit_row >= 0 {
                     let emb = self.vit_plan.as_ref().unwrap().embeds_host.as_slice();
                     let row = &emb[vit_row as usize * self.d.h..(vit_row as usize + 1) * self.d.h];
-                    for g in 0..HCN {
+                    for g in 0..self.d.hcn {
                         h_host[i * self.d.hct + g * self.d.h..i * self.d.hct + (g + 1) * self.d.h].copy_from_slice(row);
                     }
                 } else {
                     let row = &self.w.embed_host[id as usize * self.d.h..(id as usize + 1) * self.d.h];
-                    for g in 0..HCN {
+                    for g in 0..self.d.hcn {
                         for (dst, &b) in h_host[i * self.d.hct + g * self.d.h..i * self.d.hct + (g + 1) * self.d.h].iter_mut().zip(row) {
                             *dst = f32::from_bits((b as u32) << 16);
                         }
@@ -3994,7 +3994,7 @@ impl Engine {
                 self.pf_issue(1);
             }
             // 48 decoder layers
-            for l in 0..LAYERS {
+            for l in 0..self.d.layers {
                 if dbg_nan() && l <= 3 {
                     cuda::sync();
                     let hst = cuda::dtoh(self.s.h, t * self.d.hct);
@@ -4003,6 +4003,7 @@ impl Engine {
                     let mx = hst.iter().filter(|x| x.is_finite()).fold(0f32, |a, &b| a.max(b.abs()));
                     tracing::info!(target: "nanwatch", "[nanwatch] layer {l} ENTRY: nan={nn} inf={ni} max_abs={mx:.3e}");
                 }
+                // C5: the PLE arm (`cfg.ple` is off for a model without PLE)
                 if l == self.d.ple_layer && self.cfg.ple {
                     // reference: hidden += ple(hidden, input_ids) at the TOP
                     // of layer 1's forward — host index math, spec 3.5
@@ -4022,7 +4023,11 @@ impl Engine {
                     }
                 }
                 let (mixed, injw) = (self.s.mixed, self.s.injw);
-                self.hc_run(&self.w.hc[l], self.s.h, t, mixed, injw);
+                // C5: the residual arm, attention side (Hc: mix the streams into `mixed`)
+                match self.geo.residual {
+                    Residual::Hc { .. } => self.hc_run(&self.w.hc[l], self.s.h, t, mixed, injw),
+                    Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, self.geo.family),
+                }
                 let dbg = dbg_sync();
                 if dbg {
                     tracing::info!(target: "prefill", "[prefill layer {l}] enter");
@@ -4040,7 +4045,11 @@ impl Engine {
                 dump0("injw", injw, t * self.d.hcn);
                 let sub = match &self.w.sub[l] {
                     SubW::Gdn { .. } => self.gdn_prompt(l, mixed, t, first && start == 0),
-                    SubW::Attn { .. } => self.attn_prompt(l, mixed, t, pos_base),
+                    // C5: the attention arm (Qsa: the indexer's block selection, then attention)
+                    SubW::Attn { .. } => match self.geo.attn {
+                        Attn::Qsa { .. } => self.attn_prompt(l, mixed, t, pos_base),
+                        Attn::Full => unbuilt_arm(Block::ATTN_FULL, self.geo.family),
+                    },
                 };
                 dump0("sub", sub, t * self.d.h);
                 dump0("gdn-mq", self.s.mq, t * self.d.gdn_conv);
@@ -4082,9 +4091,12 @@ impl Engine {
                         tracing::info!(target: "nanwatch", "[nanwatch] after layer {l}: nan=0 inf=0 max_abs={mx:.3e}");
                     }
                 }
-                // x1 = h + sub ⊗ injw
-                launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (t * (self.d.h / 256)) as u32, 1, 256, &[
-                    self.s.h as u64, sub as u64, self.s.injw as u64, self.s.x1 as u64]);
+                // x1 = h + sub ⊗ injw (C5: the residual arm)
+                match self.geo.residual {
+                    Residual::Hc { .. } => launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (t * (self.d.h / 256)) as u32, 1, 256, &[
+                        self.s.h as u64, sub as u64, self.s.injw as u64, self.s.x1 as u64]),
+                    Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, self.geo.family),
+                }
                 if nan_watch && l == 0 {
                     cuda::sync();
                     let v = cuda::dtoh(self.s.x1, t * self.d.hct);
@@ -4094,7 +4106,11 @@ impl Engine {
                         v.iter().filter(|x| x.is_infinite()).count(),
                         rowmax(4, self.d.hct), rowmax(7, self.d.hct));
                 }
-                self.hc_run(&self.w.hc2[l], self.s.x1, t, self.s.mixed_m, self.s.injw);
+                // C5: the residual arm, FFN side
+                match self.geo.residual {
+                    Residual::Hc { .. } => self.hc_run(&self.w.hc2[l], self.s.x1, t, self.s.mixed_m, self.s.injw),
+                    Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, self.geo.family),
+                }
                 if nan_watch && l == 0 {
                     cuda::sync();
                     let v = cuda::dtoh(self.s.mixed_m, t * self.d.h);
@@ -4108,7 +4124,11 @@ impl Engine {
                     cuda::stream_wait_event(cuda::cur_stream(), self.pf_ev_filled[l % 2]);
                 }
                 dump0("moe-mixed_m", self.s.mixed_m, t * self.d.h);
-                let moe = self.moe_run(l, self.s.mixed_m, t);
+                // C5: the FFN arm (Moe: router, hot and cold experts, shared expert)
+                let moe = match self.geo.ffn {
+                    Ffn::Moe { .. } => self.moe_run(l, self.s.mixed_m, t),
+                    Ffn::Dense { .. } => unbuilt_arm(Block::FFN_DENSE, self.geo.family),
+                };
                 dump0("moe-rlog", self.s.rlog, t * self.d.e);
                 dump0("moe-rwts", self.s.rwts, t * self.d.topk);
                 dump0("moe-h1", self.s.h1, t * self.d.topk * 2 * self.d.inter);
@@ -4138,8 +4158,11 @@ impl Engine {
                         v.iter().filter(|x| x.is_nan()).count(),
                         v.iter().filter(|x| x.is_infinite()).count());
                 }
-                launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (t * (self.d.h / 256)) as u32, 1, 256, &[
-                    self.s.x1 as u64, moe as u64, self.s.injw as u64, self.s.h as u64]);
+                match self.geo.residual {
+                    Residual::Hc { .. } => launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (t * (self.d.h / 256)) as u32, 1, 256, &[
+                        self.s.x1 as u64, moe as u64, self.s.injw as u64, self.s.h as u64]),
+                    Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, self.geo.family),
+                }
                 // CROW_DUMP_H=<dir>: per-layer residual-stream dump (determinism bisect)
                 if let Some(dir) = dump_h() {
                     cuda::sync();
@@ -4178,7 +4201,11 @@ impl Engine {
             });
 
             // head: mixer + lm_head (+ optional logits collection, + argmax last)
-            self.head_run(t);
+            // C5: the final-norm arm (HcMixer: the model-level hyper-connection mixer)
+            match self.geo.final_norm {
+                FinalNorm::HcMixer => self.head_run(t),
+                FinalNorm::Rms => unbuilt_arm(Block::FINAL_NORM_RMS, self.geo.family),
+            }
             if let Some(out) = collect_logits.as_deref_mut() {
                 for i in 0..t {
                     self.lm_head_row(i);
@@ -4274,7 +4301,7 @@ impl Engine {
         // the async HtoD source outlives the call (graph-mode requirement)
         let t_emb = std::time::Instant::now();
         let row = &self.w.embed_host[id as usize * self.d.h..(id as usize + 1) * self.d.h];
-        for g in 0..HCN {
+        for g in 0..self.d.hcn {
             for (dst, &b) in self.embed_buf[g * self.d.h..(g + 1) * self.d.h].iter_mut().zip(row) {
                 *dst = f32::from_bits((b as u32) << 16);
             }
@@ -4319,13 +4346,18 @@ impl Engine {
         // WDDM launch on the critical path
         let mut t_head = t_layer;
         if !replay {
-        for l in 0..LAYERS {
+        for l in 0..self.d.layers {
+            // C5: the PLE arm (`cfg.ple` is off for a model without PLE)
             if l == self.d.ple_layer && self.cfg.ple {
                 // reference order: hidden += ple(hidden, ids) at the top of layer 1
                 self.ple_step_kernels();
             }
             let t_hc = std::time::Instant::now();
-            self.hc_run(&self.w.hc[l], self.s.h, 1, self.s.mixed, self.s.injw);
+            // C5: the residual arm, attention side
+            match self.geo.residual {
+                Residual::Hc { .. } => self.hc_run(&self.w.hc[l], self.s.h, 1, self.s.mixed, self.s.injw),
+                Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, self.geo.family),
+            }
             let d_hc = t_hc.elapsed().as_micros() as u64;
             if prof {
                 prof::add(&prof::HC, d_hc);
@@ -4342,7 +4374,11 @@ impl Engine {
             self.sb_pack[1] = if complete { 1 } else { 0 };
             let sub = match &self.w.sub[l] {
                 SubW::Gdn { .. } => self.gdn_step(l, self.s.mixed),
-                SubW::Attn { .. } => self.attn_step(l, self.s.mixed, pos, &self.sb_pack, graph),
+                // C5: the attention arm
+                SubW::Attn { .. } => match self.geo.attn {
+                    Attn::Qsa { .. } => self.attn_step(l, self.s.mixed, pos, &self.sb_pack, graph),
+                    Attn::Full => unbuilt_arm(Block::ATTN_FULL, self.geo.family),
+                },
             };
             let d_sub = t_sub.elapsed().as_micros() as u64;
             if prof {
@@ -4352,11 +4388,20 @@ impl Engine {
                     prof::add(&prof::SUB_ATTN, d_sub);
                 }
             }
-            launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (self.d.h / 256) as u32, 1, 256, &[
-                self.s.h as u64, sub as u64, self.s.injw as u64, self.s.x1 as u64]);
-            self.hc_run(&self.w.hc2[l], self.s.x1, 1, self.s.mixed_m, self.s.injw);
+            // C5: the residual arm (inject, then the FFN-side mix) and the FFN arm
+            match self.geo.residual {
+                Residual::Hc { .. } => {
+                    launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (self.d.h / 256) as u32, 1, 256, &[
+                        self.s.h as u64, sub as u64, self.s.injw as u64, self.s.x1 as u64]);
+                    self.hc_run(&self.w.hc2[l], self.s.x1, 1, self.s.mixed_m, self.s.injw);
+                }
+                Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, self.geo.family),
+            }
             let t_moe = std::time::Instant::now();
-            let moe = self.moe_run(l, self.s.mixed_m, 1);
+            let moe = match self.geo.ffn {
+                Ffn::Moe { .. } => self.moe_run(l, self.s.mixed_m, 1),
+                Ffn::Dense { .. } => unbuilt_arm(Block::FFN_DENSE, self.geo.family),
+            };
             if prof {
                 prof::add(&prof::MOE, t_moe.elapsed().as_micros() as u64);
             }
@@ -4366,11 +4411,18 @@ impl Engine {
                 if l == 0 { self.route_log.push(Vec::with_capacity(self.d.layers)); }
                 self.route_log.last_mut().unwrap().push(ids);
             }
-            launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (self.d.h / 256) as u32, 1, 256, &[
-                self.s.x1 as u64, moe as u64, self.s.injw as u64, self.s.h as u64]);
+            match self.geo.residual {
+                Residual::Hc { .. } => launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (self.d.h / 256) as u32, 1, 256, &[
+                    self.s.x1 as u64, moe as u64, self.s.injw as u64, self.s.h as u64]),
+                Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, self.geo.family),
+            }
         }
         t_head = std::time::Instant::now();
-        self.head_run(1);
+        // C5: the final-norm arm
+        match self.geo.final_norm {
+            FinalNorm::HcMixer => self.head_run(1),
+            FinalNorm::Rms => unbuilt_arm(Block::FINAL_NORM_RMS, self.geo.family),
+        }
         self.lm_head_row(0);
         launch_v(self.k.f("argmax_k"), 1, 1, 1, 1024, &[
             self.s.logits as u64, self.s.argmax as u64, self.p.n_vocab as u64]);
@@ -4591,7 +4643,7 @@ impl Engine {
         with_nblk(&d, |nblk_gu, nblk_dn| {
             let mut total = 0usize;
             let none = std::collections::HashSet::new();
-            for l in 0..LAYERS {
+            for l in 0..self.d.layers {
                 let plan = self.res.plan_swaps(l, &counts[l], max_swaps, &none);
                 for &(slot, evict, new_id) in &plan {
                     self.res.swap_in(&self.k, l, slot, evict, new_id, nblk_gu, nblk_dn);
@@ -4619,7 +4671,7 @@ impl Engine {
             return None;
         }
         self.decay_window();
-        Some((0..LAYERS).map(|l| self.window_layer(l)).collect())
+        Some((0..self.d.layers).map(|l| self.window_layer(l)).collect())
     }
 
     /// Fold the selections SINCE the last tick into the per-expert EMA
@@ -4662,7 +4714,7 @@ impl Engine {
             let bundle = swap_bundle_on() && self.res.lb.is_none();
             let (mut gu_pairs, mut dn_pairs) = (Vec::new(), Vec::new());
             let mut touched: Vec<usize> = Vec::new();
-            for l in 0..LAYERS {
+            for l in 0..self.d.layers {
                 let c = self.window_layer(l);
                 let plan = self.res.plan_swaps(l, &c, max_swaps, &none);
                 for &(slot, evict, new_id) in &plan {
@@ -4730,7 +4782,7 @@ impl Engine {
         let mut new_a: Vec<(usize, usize, u32)> = Vec::new();
         if plan {
             let counts = self.window_counts().unwrap_or_else(|| self.drain_sel_counts());
-            for l in 0..LAYERS {
+            for l in 0..self.d.layers {
                 let free = self.res.spare_free[l].len();
                 if free == 0 { continue; }
                 let k = if max_per_layer == 0 { free } else { max_per_layer.min(free) };
@@ -4861,7 +4913,7 @@ impl Engine {
     /// drain per-expert selection counts (warm-up bookkeeping, [48][512])
     pub unsafe fn drain_sel_counts(&self) -> Vec<Vec<u64>> {
         let raw = cuda::dtoh_u64(self.sel_counts, self.d.layers * self.d.e);
-        (0..LAYERS).map(|l| raw[l * self.d.e..(l + 1) * self.d.e].to_vec()).collect()
+        (0..self.d.layers).map(|l| raw[l * self.d.e..(l + 1) * self.d.e].to_vec()).collect()
     }
 }
 
