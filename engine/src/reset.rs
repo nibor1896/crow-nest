@@ -125,7 +125,10 @@ impl Engine {
             cuda::to_f32_into(self.st.gdn_conv[i], &z_conv);
         }
         let z_ple = vec![0f32; ple_state_len(&self.geo)];
-        cuda::to_f32_into(self.ple.state, &z_ple);
+        // C5: a model without PLE has no PLE state
+        if let Some(pl) = &self.ple {
+            cuda::to_f32_into(pl.state, &z_ple);
+        }
 
         // the uploads read `z_conv` / `z_ple`, which die with this frame
         cuda::sync();

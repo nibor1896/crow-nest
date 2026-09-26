@@ -66,7 +66,7 @@ fn main() {
         } else {
             println!("residency: warm-up phase on {warm_tokens} demo tokens …");
             let even = vec![vec![1u64; geo.moe().experts]; geo.layers];
-            let mut eng0 = Engine::load(&mut cnq, geo, cfg, Some(&even[..]), &sidecar, false, &mut |m| {
+            let mut eng0 = Engine::load(&mut cnq, geo, cfg, Some(&even[..]), Some(&sidecar), false, &mut |m| {
                 eprintln!("[load0] {m}");
             });
             let warm_ids = demo_tokenize(WARMUP, warm_tokens);
@@ -103,7 +103,7 @@ fn main() {
         }
 
         let mut eng =
-            Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |m| eprintln!("[load] {m}"));
+            Engine::load(&mut cnq, geo, cfg, None, Some(&sidecar), false, &mut |m| eprintln!("[load] {m}"));
         println!(
             "residency ready: N={} ({}) — pinned cold tier {:.2} GiB",
             eng.residency().n,

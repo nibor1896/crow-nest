@@ -3864,7 +3864,7 @@ seed 1118, `reasoning_effort none`, card non-thinking row; main = an 8,640-token
 | output | the main turn's answer byte-identical with and without the side request, for a 2-token and a 32-token answer |
 | long side request | 12,087 tokens (longer than the held conversation): the snapshots are dropped, the old rule |
 
-## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18; 8.11 added 2026-09-26 with Crow #300 C1/C2, C4 kernel rule amended in 8.2)
+## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18; 8.11 added 2026-09-26 with Crow #300 C1/C2, C4 kernel rule amended in 8.2, C5 family switches in 8.11)
 
 Sections 0 to 7 say what the engine must do. This section says how the crate is put together,
 so a reader who opens `engine/src` knows which file to open and what it may reach for. It was
@@ -4550,7 +4550,7 @@ is the documented bit-identical twin of the cascade `mix_streams_q` fuses and th
 `max_abs` 0.4475 / `corr` 0.99180 all along, at HEAD and before the fix, which is what pinned the
 cause to the cascade and not to the kernels, the ring or the selection.
 
-### 8.11 Model families and the runtime `Geo` (Crow #300 phase 1, C1 + C2 + C3 + C4, 2026-09-26)
+### 8.11 Model families and the runtime `Geo` (Crow #300 phase 1, C1 + C2 + C3 + C4 + C5, 2026-09-26)
 
 crow-nest serves one model today, and every shape was a `geo.rs` const. Phase 1 of Crow #300 makes
 the shapes come from the checkpoint. C1 and C2 build the reader and the runtime geometry and
@@ -4564,7 +4564,7 @@ refuses the parse by name.
 | family | `model_type` | residual | FFN | attention | PLE | gate act | final norm | boot |
 |---|---|---|---|---|---|---|---|---|
 | `FlashNext` | `qwen4_exp_text` | `Hc` (4 streams, low rank 320) | `Moe` (512 experts, top 10, 640, shared 640) | `Qsa` (4 heads, 1 kv, 128, ratio 4, 512 blocks) | layer 1 | sigmoid | `HcMixer` | runs; `Geo` must equal `Geo::FLASH_NEXT` |
-| `Qwen35Dense` | `qwen3_5_text` | `Plain` | `Dense` (17408) | `Full` (uncapped) | none | swish (= silu) | `Rms` | parsed, geometry printed, then refused: `dense Qwen3.5 family parsed; engine path not built yet (Crow #300 phase 2)` |
+| `Qwen35Dense` | `qwen3_5_text` | `Plain` | `Dense` (17408) | `Full` (uncapped) | none | swish (= silu) | `Rms` | parsed, geometry printed, then refused at its first unbuilt block (C5): `Residual::Plain (one pre-norm residual stream) for family Qwen35Dense not built yet (Crow #300 phase 2)` |
 
 **Expected values per family** (`meta::Expected`). The Flash-Next row is today's pins, read out of
 `geo` and `sample`, and gives the same 21 checks as before (the 20 of #94 phase 1 plus #96's
@@ -4595,7 +4595,7 @@ implemented value refuse any other value by name: `hidden_act` silu, `mamba_ssm_
 | FFN | `Moe { 512, 10, 640, 640 }` | `Dense { 17408 }` |
 | PLE | `{ layer 1, ngram 3, 8 heads/ngram, embed 2560, conv 4, eos 248044 }` | none |
 | final norm, (1 + w) norm, eps | `HcMixer`, true, 1e-6 | `Rms`, true, 1e-6 |
-| vocab, tied lm_head, context max / floor | 248,320, false, 262,144 / 200,000 | 248,320, false, 262,144 / 200,000 (provisional; the per-family floor is C5) |
+| vocab, tied lm_head, context max / floor | 248,320, false, 262,144 / 200,000 | 248,320, false, 262,144 / 100,000 (C5: `geo::DENSE_CONTEXT_FLOOR`, the 16 GB point of the phase 2 plan) |
 | eos, MTP layers, vision out | [248046, 248044], 1, 2560 | [248046, 248044], 1, 5120 |
 
 `Geo` carries the derivation chain of the consts (`residual_width` = `HCT`, `q_rows`, `kv_rows`,
@@ -4608,10 +4608,10 @@ implemented value refuse any other value by name: `hidden_act` silu, `mamba_ssm_
 1. a red check of the family row gives the #94 table;
 2. no `Geo` form for a value (a fractional rope pair count, not two eos ids, not three mrope sections, not one PLE layer) gives a named refusal;
 3. Flash-Next whose `Geo` differs from `Geo::FLASH_NEXT` gives `[meta] N of 35 runtime Geo fields differ from Geo::FLASH_NEXT` with one row per field, `config derives X, Geo::FLASH_NEXT pins Y`;
-4. dense prints the 35-row geometry and gives the named refusal;
+4. dense passes with its 35-row geometry on the log (C5; before C5 it was refused here by one blanket message), and `boot::model_geo` refuses it right after at its first unbuilt block (`Geo::built`, below);
 5. Flash-Next with everything equal logs `meta: 21 constants verified against config.json (zero numeric change) [...]; family FlashNext (qwen4_exp_text), runtime Geo == Geo::FLASH_NEXT (35 fields)`.
 
-All five are before `Cnq::open` and before the CUDA context. `assert_pinned` returns
+All five, and the C5 family check after them, are before `Cnq::open` and before the CUDA context. `assert_pinned` returns
 `Option<(ModelMeta, Geo)>`; since C3 `boot::open_model` hands the `Geo` to its caller.
 
 The 27B fixture is `engine/tests/fixtures/Qwen3.8-27B/{config.json, generation_config.json}`,
@@ -4645,11 +4645,11 @@ tests read the checkpoint of record in `models/`, as before.
   `Scratch::alloc(d, chunk)`, `Ple::load(cnq, d, ..)`). It is a cache of the `Geo`, never a second
   source, and it keeps the per-launch host code at one field read instead of a family match.
   `geo::tests_300` pins every field to its const.
-- **Accessors.** The code still assumes the Flash-Next STRUCTURE (the family switches are C5), so
+- **Accessors.** C3 still assumed the Flash-Next STRUCTURE (the family switches came with C5), so
   it reads the family-specific numbers through `Geo::moe()`, `qsa()` (`QsaGeo`: `qk_rows`,
   `sel_max`, `hidd`), `ple_geo()`, `hc_lowrank()`, `vision_out()`, `attn_index` / `gdn_index`. On a
-  family without that block each one panics with `Geo::<name>: ... (Crow #300 C5 builds that path)`;
-  a dense boot never reaches them, because it dies at the metadata gate.
+  family without that block each one panics with `Geo::<name>: ... (Crow #300 phase 2 builds that path)`;
+  a dense boot never reaches them, because it dies at `Geo::built` in the boot door (C5).
   `geo::tests_300::c3_accessors_reproduce_the_consts_they_replace` pins every accessor to the const
   it replaced.
 - **The slot file names its model** (format 2): `model_family` (`Family::code`) and `geo_hash`
@@ -4751,6 +4751,62 @@ after C4c; each is a kernel-shape fact, not a literal a macro can replace):
   (`:1677`, HF `l2norm(eps=1e-6)`), the PLE sign-sqrt clamp (`:4159`, HF `clamp_min(1e-6)`), the
   ViT LayerNorm (`vit_ln`, HF `eps=1e-6`). The ViT kernels carry the vision tower's own shape
   (1152 hidden, `:4612`), which is not part of the text `Geo`.
+
+**C5: the family switches** (2026-09-26). The engine `match`es on the `Geo`'s family enums where
+it used to assume Flash-Next. Each Flash-Next arm is the code of record, moved verbatim; each
+dense arm is not built and refuses by name.
+
+- **The refusal.** `Geo::built` (`geo.rs`) walks the blocks in forward order (the residual stream
+  the embedding writes, then per layer the PLE add, the attention and the FFN, then the final
+  norm) and returns the first arm this engine has not built as
+  `<block> for family <F> not built yet (Crow #300 phase 2)` (`geo::not_built`, the block names are
+  the `geo::Block` constants). `boot::model_geo` calls it right after the metadata gate, before
+  `Cnq::open` and before `cuda::Ctx::init`, and panics with `[boot] refused: ...`; every bin and
+  probe that asks for a `Geo` goes through it. `Engine::load` calls it again before its first
+  allocation (`[load] refused: ...`). So a dense model still dies before any CUDA work, but at
+  the block that is missing, not at a blanket family refusal: as phase 2 builds arms, a
+  checkpoint gets exactly as far as the engine supports. The metadata gate no longer refuses
+  the dense family; it logs its geometry (`meta: 20 constants verified ... runtime Geo derived
+  (35 fields):` plus the table) and passes it on. Smoke, 2026-09-26:
+  `CROW_MODEL_DIR=engine/tests/fixtures/Qwen3.8-27B decode run ...` prints the table and dies
+  with `[boot] refused: Residual::Plain (one pre-norm residual stream) for family Qwen35Dense not
+  built yet (Crow #300 phase 2)`, before the `[boot] kv cache dtype` line (which follows the CUDA
+  context).
+- **The arms.**
+
+  | block | built (Flash-Next) | not built: refusal (`Geo::built`, `geo.rs:900-915`) | switch sites |
+  |---|---|---|---|
+  | residual | `Residual::Hc` | `Residual::Plain (one pre-norm residual stream)` | loader: both per-layer HC bundles; `[hc]` boot line |
+  | PLE | `Some`: `Ple::load`, the step at its layer; `None`: skipped, `Engine::ple` is `None` and `cfg.ple` off | (both built) | loader; `ple_state_len`; `cache::Shape`; reset; the snapshot copies |
+  | attention | `Attn::Qsa` | `Attn::Full (uncapped causal attention)` | loader (attention + indexer weights); `StateSizes::plan`; `ThreeStates::allocate` (ring + pool); `cache::Shape`; `park_host_bytes`; `[qsa]` boot line |
+  | FFN | `Ffn::Moe` | `Ffn::Dense (one SwiGLU per layer)` | loader (router + shared expert, expert slabs, residency); the hot-set clamp in `ThreeStates::allocate`; `boot::hot_set_sidecar` |
+  | final norm | `FinalNorm::HcMixer` | `FinalNorm::Rms (one RMSNorm before lm_head)` | loader (the mixer weights) |
+
+  Behind the boot check each dense arm in the loader and the planner is `geo::unbuilt_arm`, which
+  panics with the same message plus `- reached past the boot check`: a guard for a `Geo` that did
+  not come through `boot::model_geo`, never a path a request can take.
+- **Hot sets are the MoE arm.** `boot::hot_set_sidecar(geo, CROW_HOTSETS, default)` is `Some` for
+  `Ffn::Moe` and `None` otherwise, so `CROW_HOTSETS` is required for a MoE family only; a family
+  without routed experts that has it set gets one `[boot] ... ignored` WARN line. `open_model`
+  returns `Option<String>`, `Engine::load` takes `Option<&str>` and unwraps it inside the MoE arm,
+  before `Residency::build`.
+- **The state plan per family.** `StateSizes::plan`, `ThreeStates::allocate`, `cache::Shape::with_geo`
+  and `cache::park_host_bytes` plan the QSA raw-key ring and the pooled blocks only for
+  `Attn::Qsa` (full attention: zero bytes, zero rows, no `QSA` budget lines); `manager::ple_state_len`
+  is zero without PLE, so the snapshot carries no PLE row. `Geo::dims` gives zero PLE fields
+  without PLE instead of panicking. On Flash-Next the plan is the plan of record:
+  `manager::tests_300_c5` pins every byte count of the gate's `[budget]` lines, the 121,208,832 B
+  snapshot and the 113,252,352 B park; on the 27B fixture it plans KV 3,276,800,000 B at the
+  100k floor, GDN 150,994,944 + 5,898,240 B, and no QSA, PLE or hot-set part.
+- **Per-family context floor.** Flash-Next keeps `CONTEXT_FLOOR` 200,000. The dense floor is
+  `DENSE_CONTEXT_FLOOR` 100,000, the smallest point of the phase 2 plan (16 GB: 100k with a 4-bit
+  KV cache; 20-24 GB: 200k FP8 KV; 32 GB: 200k FP8 plus vision and MTP; the planner picks from
+  free VRAM). The planner is a TODO naming phase 2; nothing reads the dense floor until the dense
+  arms exist.
+- **Byte identity.** Every Flash-Next allocation keeps its order and size: the matches wrap the
+  existing expressions, and the arms that print boot lines print them unchanged. Checked per
+  step against the gate's boot logs (`decode_out/gate-c5*` vs `gate-c4`, host free RAM / VRAM
+  masked).
 
 ## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
 

@@ -58,16 +58,14 @@
 //!   the other family count as unknown.
 //! - **the runtime [`geo::Geo`]** ([`ModelMeta::geo`]) derived from the config.
 //!   A Flash-Next boot asserts it equal to `Geo::FLASH_NEXT` (a mismatch table
-//!   otherwise); a dense boot prints it and dies with [`DENSE_NOT_BUILT`]. The
-//!   engine still computes with the `geo` consts; moving call sites is C3.
+//!   otherwise); a dense boot prints it and passes it on. C5: the refusal of a
+//!   family moved from here to its first unbuilt block (`Geo::built`, called by
+//!   `boot::model_geo` right after this gate, still before the container and CUDA).
 
 use crate::geo;
 use crate::geo::{Attn, Family, FinalNorm, Ffn, GateAct, Geo, PleGeo, Residual};
 use crate::sample;
 use serde_json::Value;
-
-/// the named refusal of a dense checkpoint until the engine path exists
-pub const DENSE_NOT_BUILT: &str = "dense Qwen3.5 family parsed; engine path not built yet (Crow #300 phase 2)";
 
 // ---- C1: the family table ----
 
@@ -110,8 +108,8 @@ pub struct Expected {
     /// the PLE shard end marker the text eos must equal (`None` = no PLE)
     pub ple_eos: Option<i64>,
     pub rope_type: &'static str,
-    /// the context the boot allocates at least; the dense value is
-    /// provisional (the per-family floor is C5, the 16 GB point is open)
+    /// the context the boot allocates at least, per family (C5: Flash-Next
+    /// `geo::CONTEXT_FLOOR`, dense `geo::DENSE_CONTEXT_FLOOR`)
     pub context_floor: usize,
 }
 
@@ -163,7 +161,8 @@ impl Expected {
         eos_ids: [248046, 248044],
         ple_eos: None,
         rope_type: "default",
-        context_floor: 200_000,
+        // C5: the per-family floor; the per-card planner above it is phase 2
+        context_floor: geo::DENSE_CONTEXT_FLOOR,
     };
 
     pub fn of(family: Family) -> Expected {
@@ -1231,6 +1230,16 @@ fn config_dir_in_root(root: &std::path::Path, hint: &str) -> Option<std::path::P
 
 // ---- the boot door ----
 
+/// Crow #300 C5: the 27B fixture's derived `Geo` (engine/tests/fixtures/Qwen3.8-27B),
+/// for the tests of the modules that plan per family
+#[cfg(test)]
+pub(crate) fn dense_fixture_geo() -> Geo {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/Qwen3.8-27B");
+    ModelMeta::from_config_files(&format!("{dir}/config.json"), Some(&format!("{dir}/generation_config.json")))
+        .and_then(|m| m.geo())
+        .unwrap()
+}
+
 /// the geometry as the boot prints it, one `[meta]` row per `Geo` field
 pub fn geo_table(g: &Geo) -> String {
     g.rows().iter().map(|(n, v)| format!("[meta]   {n:<20} {v}")).collect::<Vec<_>>().join("\n")
@@ -1243,8 +1252,9 @@ pub fn geo_table(g: &Geo) -> String {
 /// - the `Geo` not derivable → `Err`, the named reason;
 /// - Flash-Next whose `Geo` differs from `Geo::FLASH_NEXT` → `Err`, a table of
 ///   every differing field (derived vs pinned);
-/// - dense → `Err`, the derived geometry and [`DENSE_NOT_BUILT`];
-/// - Flash-Next, everything equal → `Ok(geo)`.
+/// - Flash-Next, everything equal → `Ok(geo)`;
+/// - dense → `Ok(geo)` (C5: the family's first unbuilt block refuses it next,
+///   `Geo::built` in `boot::model_geo`).
 pub fn verdict(meta: &ModelMeta) -> Result<Geo, String> {
     let all = meta.checks();
     let bad: Vec<&Check> = all.iter().filter(|c| !c.ok).collect();
@@ -1281,15 +1291,7 @@ pub fn verdict(meta: &ModelMeta) -> Result<Geo, String> {
                 meta.config_path
             ))
         }
-        Family::Qwen35Dense => Err(format!(
-            "[meta] family {:?} ({}), {} constants verified against its row ({QWEN35_DENSE_SOURCE}) [{}]\n\
-[meta] derived geometry:\n{}\n[meta] {DENSE_NOT_BUILT}",
-            meta.family,
-            meta.family.model_type(),
-            all.len(),
-            meta.config_path,
-            geo_table(&geo)
-        )),
+        Family::Qwen35Dense => Ok(geo),
     }
 }
 
@@ -1299,9 +1301,11 @@ pub fn verdict(meta: &ModelMeta) -> Result<Geo, String> {
 /// - config.json found, every check green and (Flash-Next) the runtime `Geo`
 ///   equal to `Geo::FLASH_NEXT` → one INFO line, the meta and the `Geo`
 ///   returned for the later phases;
-/// - config.json found and anything red or unreadable, or a dense checkpoint
-///   (parsed, geometry printed, never run) → a panic carrying the whole table
-///   (llama.cpp-style loud failure);
+/// - a dense checkpoint, every check green → the INFO line and the derived
+///   geometry, returned the same way (C5: `boot::model_geo` refuses it next, at
+///   its first unbuilt block);
+/// - config.json found and anything red or unreadable → a panic carrying the
+///   whole table (llama.cpp-style loud failure);
 /// - no config.json anywhere next to the container → one WARN line, boot
 ///   continues (the selftest package ships without `models/` on purpose).
 pub fn assert_pinned(cnq_path: &str) -> Option<(ModelMeta, Geo)> {
@@ -1320,22 +1324,38 @@ pub fn assert_pinned(cnq_path: &str) -> Option<(ModelMeta, Geo)> {
     let geo = match verdict(&meta) {
         Ok(geo) => geo,
         Err(refusal) => {
-            // the dense geometry goes to the log too, not only to the panic text
+            // the table goes to the log too, not only to the panic text
             for line in refusal.lines() {
                 tracing::error!(target: "meta", "{line}");
             }
             panic!("{refusal}")
         }
     };
-    tracing::info!(
-        target: "meta",
-        "meta: {} constants verified against config.json (zero numeric change) [{}]; family {:?} ({}), runtime Geo == Geo::FLASH_NEXT ({} fields)",
-        meta.checks().len(),
-        meta.config_path,
-        meta.family,
-        meta.family.model_type(),
-        geo.rows().len()
-    );
+    match meta.family {
+        Family::FlashNext => tracing::info!(
+            target: "meta",
+            "meta: {} constants verified against config.json (zero numeric change) [{}]; family {:?} ({}), runtime Geo == Geo::FLASH_NEXT ({} fields)",
+            meta.checks().len(),
+            meta.config_path,
+            meta.family,
+            meta.family.model_type(),
+            geo.rows().len()
+        ),
+        Family::Qwen35Dense => {
+            tracing::info!(
+                target: "meta",
+                "meta: {} constants verified against config.json ({QWEN35_DENSE_SOURCE}) [{}]; family {:?} ({}), runtime Geo derived ({} fields):",
+                meta.checks().len(),
+                meta.config_path,
+                meta.family,
+                meta.family.model_type(),
+                geo.rows().len()
+            );
+            for line in geo_table(&geo).lines() {
+                tracing::info!(target: "meta", "{line}");
+            }
+        }
+    }
     // #96: stash the rope truth for the two boot-time readers that cannot be
     // handed it as a parameter (ThreeStates::allocate builds the table,
     // Kernels::new threads the mscale). Set only on the green path: a red
@@ -1732,16 +1752,24 @@ mod tests {
         assert!(err.contains("  gate_act: config derives Silu, Geo::FLASH_NEXT pins Sigmoid"), "{err}");
     }
 
-    /// a dense checkpoint parses, prints its geometry and refuses with the
-    /// named message — it never reaches the container or the GPU
+    /// C5: a dense checkpoint passes the metadata gate with its derived geometry
+    /// (the table the boot prints) and is refused at its first unbuilt block by
+    /// name (`Geo::built`, which `boot::model_geo` calls before the container
+    /// and the GPU)
     #[test]
-    fn a_dense_checkpoint_prints_its_geometry_and_refuses() {
-        let err = verdict(&dense_meta()).unwrap_err();
-        assert!(err.ends_with(DENSE_NOT_BUILT), "{err}");
-        assert_eq!(DENSE_NOT_BUILT, "dense Qwen3.5 family parsed; engine path not built yet (Crow #300 phase 2)");
-        assert!(err.contains("[meta]   hidden               5120"), "{err}");
-        assert!(err.contains("[meta]   ffn                  Dense { inter: 17408 }"), "{err}");
-        assert!(err.contains("20 constants verified against its row"), "{err}");
+    fn a_dense_checkpoint_passes_the_gate_and_refuses_at_its_first_unbuilt_block() {
+        let geo = verdict(&dense_meta()).unwrap();
+        assert_eq!(geo, dense_fixture_geo());
+        let table = geo_table(&geo);
+        assert!(table.contains("[meta]   hidden               5120"), "{table}");
+        assert!(table.contains("[meta]   ffn                  Dense { inter: 17408 }"), "{table}");
+        assert_eq!(dense_meta().checks().len(), 20);
+        assert_eq!(
+            geo.built(),
+            Err("Residual::Plain (one pre-norm residual stream) for family Qwen35Dense not built yet (Crow #300 phase 2)".to_string())
+        );
+        // the per-family floor: 100k (the 16 GB point of the phase 2 plan), Flash-Next keeps 200k
+        assert_eq!((geo.context_floor, Geo::FLASH_NEXT.context_floor), (100_000, 200_000));
         // a doctored dense config is refused by the dense row, not by the pins
         let m = doctored_from(DENSE_DIR, |c, _| c["text_config"]["hidden_size"] = json!(4096)).unwrap();
         let err = verdict(&m).unwrap_err();

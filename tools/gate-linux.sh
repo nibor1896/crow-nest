@@ -282,8 +282,21 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="431"
-CLIPPY="1516"
+TESTS="436"
+CLIPPY="1512"
+#   tests 431 -> 436 / clippy 1516 -> 1512   Crow #300 phase 1 C5a (2026-09-26, on `64c242b`): the family switches in
+#                              the boot door, the state plan and the loader. `Geo::built` refuses a family at its first
+#                              unbuilt arm (the dense refusal moved there from the metadata gate); QSA ring / pool, PLE
+#                              state and the hot-set sidecar are per-family arms. +2 `geo::tests_300_c5` (Flash-Next
+#                              passes and PLE is optional; each unbuilt arm refuses by name in forward order), +1
+#                              `boot::tests` (CROW_HOTSETS required for a MoE family only), +2 `manager::tests_300_c5`
+#                              (Flash-Next selects the plan of record incl. the 121,208,832 B snapshot; the 27B fixture's
+#                              Geo plans no PLE / QSA / hot-set parts and refuses by name); the meta dense test was
+#                              rewritten (count unchanged). Each shown red with its hunk reverted. Clippy -4: clippy no
+#                              longer reports the four manual `is_multiple_of` on the `% 4096 == 0` slab asserts in
+#                              `Engine::load` (old gen.rs:1133/1137, lib + lib test) since `slabs` comes out of the
+#                              `Ffn` match; no warning added (diffed by message and file). Measured 2026-09-26:
+#                              lib 307 / 0 / 6 ignored, serve 118, decode 5, parity 6 = 436 / 0; clippy 1512.
 #   tests 431 / clippy 1516 (both unchanged)   Crow #300 phase 1 C4c (2026-09-26, on `ebb68f4`): `rmsnorm_1pw` reads
 #                              CN_AHD (PTX of record unchanged, `tests_300_c4` green); the synthetic probes read
 #                              `Geo::FLASH_NEXT.dims()` instead of the consts (kcheck, rope_table_probe,

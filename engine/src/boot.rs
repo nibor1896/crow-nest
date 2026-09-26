@@ -3,11 +3,12 @@
 
 use crate::cnq::Cnq;
 use crate::cuda;
-use crate::geo::{Config, Geo, KvDtype};
+use crate::geo::{Config, Ffn, Geo, KvDtype};
 use crate::meta;
 
 /// `CROW_CNQ` / `CROW_HOTSETS` (else the given defaults), the mapped container, a current CUDA context, the config at
 /// the model's context floor, and the model's runtime `Geo` (Crow #300 C3: the engine loaded from these owns it).
+/// The hot-set sidecar is `None` for a family without routed experts (C5, [`hot_set_sidecar`]).
 ///
 /// The RETURNED ORDER is the drop order: bound as `let (mut cnq, _ctx, mut cfg, cnq_path, sidecar, geo) = open_model(..)`
 /// the bindings drop in reverse, so the `Engine` loaded below them dies first, then the context, then the container
@@ -20,7 +21,7 @@ use crate::meta;
 pub unsafe fn open_model(
     cnq_default: String,
     sidecar_default: String,
-) -> (Cnq, cuda::Ctx, Config, String, String, Geo) {
+) -> (Cnq, cuda::Ctx, Config, String, Option<String>, Geo) {
     // #102: CROW_KV is read HERE, once, for all three bins (it used to be read by
     // `decode parity` only, so `serve` booted FP8 under CROW_KV=bf16 and said nothing).
     // A bad value dies before the container is mapped and before any CUDA work.
@@ -30,7 +31,6 @@ pub unsafe fn open_model(
     };
     warn_unknown_crow_env();
     let cnq_path = std::env::var("CROW_CNQ").unwrap_or(cnq_default);
-    let sidecar = std::env::var("CROW_HOTSETS").unwrap_or(sidecar_default);
     // #94 phase 1 — the metadata gate, FIRST: the checkpoint's config.json is
     // parsed and every formula constant asserted equal to the pinned value
     // before the container is mapped and the CUDA context created, so a
@@ -44,7 +44,17 @@ pub unsafe fn open_model(
     // C3: the `Geo` is handed back to the caller, which gives it to `Engine::load`;
     // the engine owns it from there (the way llama.cpp's `llama_model` owns its
     // `hparams`) and every host site reads its numbers from it.
+    // C5: the same door refuses a family at its first unbuilt block (`Geo::built`).
     let geo = model_geo(&cnq_path);
+    // C5: the hot-set sidecar belongs to the MoE arm; a family without routed
+    // experts reads none, so CROW_HOTSETS is not required there (a set one is named
+    // and ignored)
+    let hotsets_env = std::env::var("CROW_HOTSETS").ok();
+    if hotsets_env.is_some() && !matches!(geo.ffn, Ffn::Moe { .. }) {
+        tracing::warn!(target: "boot",
+            "[boot] CROW_HOTSETS is set but family {:?} has no routed experts (Ffn::Dense) - ignored", geo.family);
+    }
+    let sidecar = hot_set_sidecar(&geo, hotsets_env, sidecar_default);
     let mut cnq = Cnq::open(&cnq_path);
     // #77 CROW_CNQ_OVERLAY: a second CNQ1 container opened BESIDE the base one, holding the
     // dense text tensors as bf16. A tensor it names shadows the base tensor of the same name
@@ -96,10 +106,31 @@ pub unsafe fn open_model(
 /// front door. A container with no config.json beside it (the selftest package) gets
 /// `Geo::FLASH_NEXT`, the pins of record, after the gate's WARN line - the same
 /// "pins stand unchecked" behavior as before C3.
+///
+/// Crow #300 C5: then the family check (`Geo::built`): a `Geo` with an arm this
+/// engine has not built panics here by the name of its first such block, still
+/// before the container is mapped and before any CUDA call.
 pub fn model_geo(cnq_path: &str) -> Geo {
-    match meta::assert_pinned(cnq_path) {
+    let geo = match meta::assert_pinned(cnq_path) {
         Some((_meta, geo)) => geo,
         None => Geo::FLASH_NEXT,
+    };
+    if let Err(why) = geo.built() {
+        tracing::error!(target: "boot", "[boot] {why}");
+        panic!("[boot] refused: {why}");
+    }
+    geo
+}
+
+/// Crow #300 C5: the hot-set sidecar a boot of `geo` reads. The hot sets, the
+/// residency planner and the expert slabs are the `Ffn::Moe` arm, so a MoE family
+/// reads `CROW_HOTSETS` (else the caller's default) and a family without routed
+/// experts reads none: `None`, whatever the variable says. Pure, so the rule is
+/// tested without touching the process environment.
+pub fn hot_set_sidecar(geo: &Geo, env: Option<String>, default: String) -> Option<String> {
+    match geo.ffn {
+        Ffn::Moe { .. } => Some(env.unwrap_or(default)),
+        Ffn::Dense { .. } => None,
     }
 }
 
@@ -169,6 +200,18 @@ mod tests {
             assert!(known.contains(n), "{n} missing from the parsed doc rows");
         }
         assert!(!known.iter().any(|n| !n.starts_with("CROW_") || n.len() <= 5));
+    }
+
+    /// C5: CROW_HOTSETS is read for a MoE family only; a dense family needs no
+    /// hot-set sidecar and ignores a set variable
+    #[test]
+    fn the_hot_set_sidecar_is_required_for_a_moe_family_only() {
+        let (fnx, dense) = (Geo::FLASH_NEXT, crate::meta::dense_fixture_geo());
+        let d = || "decode_out/default.json".to_string();
+        assert_eq!(hot_set_sidecar(&fnx, None, d()), Some(d()));
+        assert_eq!(hot_set_sidecar(&fnx, Some("x.json".into()), d()), Some("x.json".to_string()));
+        assert_eq!(hot_set_sidecar(&dense, None, d()), None);
+        assert_eq!(hot_set_sidecar(&dense, Some("x.json".into()), d()), None);
     }
 
     #[test]

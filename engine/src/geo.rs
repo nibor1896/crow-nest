@@ -194,7 +194,17 @@ impl Default for Config {
     }
 }
 
+/// the Flash-Next context floor (`Geo::FLASH_NEXT.context_floor`): the boot allocates
+/// at least this many positions and refuses below it (spec 0.2)
 pub const CONTEXT_FLOOR: usize = 200_000;
+
+/// Crow #300 C5: the dense family's context floor (`Geo::context_floor` of a
+/// `Qwen35Dense` checkpoint). The phase 2 plan picks the context from the card's
+/// free VRAM: 16 GB -> 100k with a 4-bit KV cache, 20-24 GB -> 200k with FP8 KV,
+/// 32 GB -> 200k FP8 plus vision and MTP. The floor is the smallest of those points.
+/// TODO(Crow #300 phase 2): the per-card planner that raises the context above this
+/// floor; until it exists a dense boot is refused before it would use the value.
+pub const DENSE_CONTEXT_FLOOR: usize = 100_000;
 
 /// per-layer type dispatch (layer % 4 == 3 is full attention — probe-pinned)
 pub fn is_attn(layer: usize) -> bool {
@@ -412,8 +422,8 @@ impl PleGeo {
 /// the const's name in lower case (`H` -> `h`, `QSA_SEL_MAX` -> `qsa_sel_max`). It is
 /// a CACHE of the `Geo`, never a second source: `Engine::load` builds it from
 /// `Engine::geo` once, so the per-launch host code reads a field instead of matching
-/// the family enums, and the code keeps the Flash-Next structure it assumes (C5 adds
-/// the family switches).
+/// the family enums. C5: the family switches match on the `Geo` enums; `Dims` carries
+/// the numbers of the blocks that exist (a model without PLE gets zero PLE fields).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Dims {
     pub h: usize,
@@ -692,37 +702,38 @@ impl Geo {
 
     // ---- C3: the family-specific numbers the host sites read ----
     //
-    // Every call site of C3 still assumes the Flash-Next STRUCTURE (the family
-    // switches are C5); these accessors hand it the numbers and refuse by name
-    // on a family that has no such block. A dense boot dies at the metadata
-    // gate before any of them can run, so the refusals are a guard, not a path.
+    // These accessors hand a block's numbers to the code inside that block's
+    // family arm and refuse by name on a family that has no such block. C5: a
+    // family whose arms are not built dies at `Geo::built` in the boot door
+    // (`boot::model_geo`) before any of them can run, so the refusals are a
+    // guard, not a path.
 
     /// the hyper-connection low-rank width (`LOWRANK`)
     pub const fn hc_lowrank(&self) -> usize {
         match self.residual {
             Residual::Hc { lowrank, .. } => lowrank,
-            Residual::Plain => panic!("Geo::hc_lowrank: a plain residual has no hyper-connection mixer (Crow #300 C5 builds that path)"),
+            Residual::Plain => panic!("Geo::hc_lowrank: a plain residual has no hyper-connection mixer (Crow #300 phase 2 builds that path)"),
         }
     }
     /// the routed-expert block (`E`, `TOPK`, `INTER`)
     pub const fn moe(&self) -> MoeGeo {
         match self.ffn {
             Ffn::Moe { experts, topk, expert_inter, shared_inter } => MoeGeo { experts, topk, expert_inter, shared_inter },
-            Ffn::Dense { .. } => panic!("Geo::moe: a dense FFN has no experts (Crow #300 C5 builds that path)"),
+            Ffn::Dense { .. } => panic!("Geo::moe: a dense FFN has no experts (Crow #300 phase 2 builds that path)"),
         }
     }
     /// the QSA indexer (`QSA_*`)
     pub const fn qsa(&self) -> QsaGeo {
         match self.attn {
             Attn::Qsa { heads, kv_heads, head_dim, compress, block_topk } => QsaGeo { heads, kv_heads, head_dim, compress, block_topk },
-            Attn::Full => panic!("Geo::qsa: full causal attention has no QSA indexer (Crow #300 C5 builds that path)"),
+            Attn::Full => panic!("Geo::qsa: full causal attention has no QSA indexer (Crow #300 phase 2 builds that path)"),
         }
     }
     /// the PLE layer (`PLE_*`)
     pub const fn ple_geo(&self) -> PleGeo {
         match self.ple {
             Some(p) => p,
-            None => panic!("Geo::ple_geo: this model has no PLE layer (Crow #300 C5 makes it optional)"),
+            None => panic!("Geo::ple_geo: this model has no PLE layer (C5: its PLE arm is `None`, skipped by the loader and the layer loop)"),
         }
     }
     /// the vision merger's output width (`H` in vit.rs)
@@ -777,12 +788,17 @@ impl Geo {
 
     /// Crow #300 C3: the flat view `gen.rs` computes with (`Dims`), one field per
     /// const it replaces. Built once per `Engine::load`; panics by name (through
-    /// `moe` / `qsa` / `ple_geo` / `hc_lowrank`) on a family whose structure the
-    /// engine does not build yet (C5).
+    /// `moe` / `qsa` / `hc_lowrank`) on a family whose arms the engine does not
+    /// build yet (`Geo::built` refuses those at boot, before this runs). C5: a model
+    /// without PLE gets zero PLE fields; every reader sits behind the PLE arm.
     pub const fn dims(&self) -> Dims {
         let m = self.moe();
         let q = self.qsa();
-        let p = self.ple_geo();
+        // (layer, ngram, ctx, heads per ngram, nheads, emb dim, embed, eos)
+        let p = match self.ple {
+            Some(p) => (p.layer, p.ngram, p.ctx(), p.heads_per_ngram, p.nheads(), p.emb_dim(), p.embed, p.eos),
+            None => (0, 0, 0, 0, 0, 0, 0, 0),
+        };
         Dims {
             h: self.hidden,
             hcn: self.hc_streams(),
@@ -811,14 +827,14 @@ impl Geo {
             attn_layers: self.attn_layers,
             attn_interval: self.attn_interval,
             rope_pairs: self.rope_pairs,
-            ple_layer: p.layer,
-            ple_ngram: p.ngram,
-            ple_ctx: p.ctx(),
-            ple_heads_per_ngram: p.heads_per_ngram,
-            ple_nheads: p.nheads(),
-            ple_emb_dim: p.emb_dim(),
-            ple_embed: p.embed,
-            ple_eos: p.eos,
+            ple_layer: p.0,
+            ple_ngram: p.1,
+            ple_ctx: p.2,
+            ple_heads_per_ngram: p.3,
+            ple_nheads: p.4,
+            ple_emb_dim: p.5,
+            ple_embed: p.6,
+            ple_eos: p.7,
             qsa_heads: q.heads,
             qsa_kvheads: q.kv_heads,
             qsa_hd: q.head_dim,
@@ -862,6 +878,69 @@ impl Geo {
         }
         d
     }
+
+    /// Crow #300 C5: the boot check of the family switches. It walks the blocks in
+    /// forward order (the residual stream the embedding writes, then per layer the
+    /// PLE add, the attention and the FFN, then the final norm) and refuses at the
+    /// FIRST arm this engine has not built, by name ([`not_built`]). As phase 2
+    /// builds arms, a checkpoint gets exactly as far as the engine supports.
+    /// `boot::model_geo` calls it before the container is mapped and before the
+    /// CUDA context exists; `Engine::load` calls it again before its first byte.
+    ///
+    /// | block | built arm (Flash-Next) | not built yet (Qwen35Dense) |
+    /// |---|---|---|
+    /// | residual | `Residual::Hc` | `Residual::Plain` |
+    /// | PLE | `Some` (loaded, added at its layer) and `None` (skipped) | - |
+    /// | attention | `Attn::Qsa` | `Attn::Full` |
+    /// | FFN | `Ffn::Moe` (hot sets, residency, expert slabs, cold staging) | `Ffn::Dense` |
+    /// | final norm | `FinalNorm::HcMixer` | `FinalNorm::Rms` |
+    pub fn built(&self) -> Result<(), String> {
+        match self.residual {
+            Residual::Hc { .. } => {}
+            Residual::Plain => return Err(not_built(Block::RESIDUAL_PLAIN, self.family)),
+        }
+        match self.ple {
+            Some(_) | None => {}
+        }
+        match self.attn {
+            Attn::Qsa { .. } => {}
+            Attn::Full => return Err(not_built(Block::ATTN_FULL, self.family)),
+        }
+        match self.ffn {
+            Ffn::Moe { .. } => {}
+            Ffn::Dense { .. } => return Err(not_built(Block::FFN_DENSE, self.family)),
+        }
+        match self.final_norm {
+            FinalNorm::HcMixer => {}
+            FinalNorm::Rms => return Err(not_built(Block::FINAL_NORM_RMS, self.family)),
+        }
+        Ok(())
+    }
+}
+
+/// Crow #300 C5: the names of the family arms the engine has not built yet, as
+/// `not_built` prints them (one constant each, so a refusal is greppable)
+pub struct Block;
+
+impl Block {
+    pub const RESIDUAL_PLAIN: &'static str = "Residual::Plain (one pre-norm residual stream)";
+    pub const ATTN_FULL: &'static str = "Attn::Full (uncapped causal attention)";
+    pub const FFN_DENSE: &'static str = "Ffn::Dense (one SwiGLU per layer)";
+    pub const FINAL_NORM_RMS: &'static str = "FinalNorm::Rms (one RMSNorm before lm_head)";
+}
+
+/// Crow #300 C5: the refusal of an arm the engine has not built:
+/// "<block> for family <F> not built yet (Crow #300 phase 2)"
+pub fn not_built(block: &str, family: Family) -> String {
+    format!("{block} for family {family:?} not built yet (Crow #300 phase 2)")
+}
+
+/// Crow #300 C5: an unbuilt arm reached past the boot check. `Geo::built` refuses
+/// every such `Geo` at boot, so this is a guard for a `Geo` that did not come
+/// through `boot::model_geo`, never a path a request can take.
+#[track_caller]
+pub fn unbuilt_arm(block: &str, family: Family) -> ! {
+    panic!("{} - reached past the boot check (Geo::built refuses it at boot)", not_built(block, family))
 }
 
 #[cfg(test)]
@@ -947,7 +1026,7 @@ mod tests_300 {
         assert_eq!(Family::from_code(g.family.code()), Some(Family::FlashNext));
         assert_eq!(Family::from_code(0), None);
         // a family without the block refuses by name (a dense boot never gets here: it
-        // dies at the metadata gate; the refusal is the guard behind it)
+        // dies at `Geo::built` in the boot door, C5; the refusal is the guard behind it)
         let dense = Geo { residual: Residual::Plain, ffn: Ffn::Dense { inter: 17408 }, attn: Attn::Full, ple: None, ..g };
         for (what, r) in [
             ("hc_lowrank", std::panic::catch_unwind(|| dense.hc_lowrank())),
@@ -958,7 +1037,47 @@ mod tests_300 {
         ] {
             let e = r.unwrap_err();
             let msg = e.downcast_ref::<&str>().copied().map(String::from).or_else(|| e.downcast_ref::<String>().cloned()).unwrap();
-            assert!(msg.contains(&format!("Geo::{what}")) && msg.contains("Crow #300 C5"), "{what}: {msg}");
+            let why = if what == "ple_geo" { "its PLE arm is `None`" } else { "Crow #300 phase 2" };
+            assert!(msg.contains(&format!("Geo::{what}")) && msg.contains(why), "{what}: {msg}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_300_c5 {
+    use super::*;
+
+    /// C5: Flash-Next takes every built arm, so the boot check passes, and a
+    /// Flash-Next without its PLE layer is built too (the `None` arm is a skip):
+    /// its `Dims` carry zero PLE fields and every other field unchanged
+    #[test]
+    fn flash_next_passes_the_family_check_and_ple_is_optional() {
+        let g = Geo::FLASH_NEXT;
+        assert_eq!(g.built(), Ok(()));
+        assert_eq!(g.context_floor, 200_000, "the Flash-Next floor of record");
+        let no_ple = Geo { ple: None, ..g };
+        assert_eq!(no_ple.built(), Ok(()), "a model without PLE skips the block");
+        let (d, dn) = (g.dims(), no_ple.dims());
+        assert_eq!((dn.ple_layer, dn.ple_ctx, dn.ple_nheads, dn.ple_emb_dim, dn.ple_embed, dn.ple_eos), (0, 0, 0, 0, 0, 0));
+        assert_eq!(Dims { ple_layer: d.ple_layer, ple_ngram: d.ple_ngram, ple_ctx: d.ple_ctx, ple_heads_per_ngram: d.ple_heads_per_ngram,
+            ple_nheads: d.ple_nheads, ple_emb_dim: d.ple_emb_dim, ple_embed: d.ple_embed, ple_eos: d.ple_eos, ..dn }, d);
+    }
+
+    /// C5: each unbuilt arm refuses by its own name, the first one in forward
+    /// order wins, and building an arm moves the refusal to the next block
+    #[test]
+    fn each_unbuilt_arm_refuses_by_name_in_forward_order() {
+        let g = Geo::FLASH_NEXT;
+        let f = Family::Qwen35Dense;
+        let dense = Geo { family: f, residual: Residual::Plain, attn: Attn::Full, ffn: Ffn::Dense { inter: 17408 }, ple: None, final_norm: FinalNorm::Rms, ..g };
+        let want = |b: &str| Err(format!("{b} for family Qwen35Dense not built yet (Crow #300 phase 2)"));
+        assert_eq!(dense.built(), want(Block::RESIDUAL_PLAIN));
+        assert_eq!(Geo { residual: g.residual, ..dense }.built(), want(Block::ATTN_FULL));
+        assert_eq!(Geo { residual: g.residual, attn: g.attn, ..dense }.built(), want(Block::FFN_DENSE));
+        assert_eq!(Geo { residual: g.residual, attn: g.attn, ffn: g.ffn, ..dense }.built(), want(Block::FINAL_NORM_RMS));
+        assert_eq!(Geo { residual: g.residual, attn: g.attn, ffn: g.ffn, final_norm: g.final_norm, ..dense }.built(), Ok(()));
+        let e = std::panic::catch_unwind(|| unbuilt_arm(Block::FFN_DENSE, f)).unwrap_err();
+        let msg = e.downcast_ref::<String>().cloned().unwrap();
+        assert!(msg.starts_with("Ffn::Dense (one SwiGLU per layer) for family Qwen35Dense not built yet (Crow #300 phase 2)"), "{msg}");
     }
 }

@@ -76,7 +76,7 @@ fn main() {
                 }
                 std::fs::create_dir_all(&out).unwrap();
                 let mut eng =
-                    Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
                 println!("decode/parity: {} prompt tokens ({} prefilled, {} teacher-forced), collecting all logits …",
                     ids.len(), tf_split, ids.len() - tf_split);
                 let mut logits = Vec::new();
@@ -144,7 +144,7 @@ fn main() {
                 crow_nest_engine::geo::apply_chunk_policy(&mut cfg, ids.len());
                 std::fs::create_dir_all("decode_out").unwrap();
                 let mut eng =
-                    Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
                 println!("decode/run: {} prompt tokens → {gen} steps", ids.len());
                 // #13: the operating point as ONE structured line on target `boot`
                 // (stderr + the log file), so every number this run prints has the
@@ -154,7 +154,7 @@ fn main() {
                 crow_nest_engine::log::boot(&eng.boot_point(
                     "decode run",
                     &cnq_path,
-                    &sidecar,
+                    sidecar.as_deref().unwrap_or("none (no routed experts)"),
                     "zero-copy read from the pinned tier; the trickle policy of the [policy] line",
                     false,
                 ));
@@ -194,9 +194,9 @@ fn main() {
                 // counter baseline AFTER prefill + warm-up: cold/token below is per
                 // timed decode token (the counters are cumulative since load)
                 let c0 = eng.drain_counters();
-                let (ple_r0, ple_m0) = (eng.ple().req, eng.ple().miss);
+                let (ple_r0, ple_m0) = eng.ple_counts();
                 println!("ple rows during prefill+warm-up: {} requested, {} misses ({:.1} %), cache slots {}",
-                    ple_r0, ple_m0, 100.0 * ple_m0 as f64 / ple_r0.max(1) as f64, eng.ple().n_slots);
+                    ple_r0, ple_m0, 100.0 * ple_m0 as f64 / ple_r0.max(1) as f64, eng.ple().map_or(0, |p| p.n_slots));
                 {
                     let (s0, k0): (u64, u64) = (c0.iter().map(|x| x[0]).sum(), c0.iter().map(|x| x[1]).sum());
                     println!("cold experts during prefill+warm-up: {:.1} per token of {:.0} selections ({} tokens)",
@@ -273,7 +273,7 @@ fn main() {
                 );
                 let gen_timed = (gen - 1).max(1) as f64;
                 {
-                    let (r, m) = (eng.ple().req - ple_r0, eng.ple().miss - ple_m0);
+                    let (r, m) = (eng.ple_counts().0 - ple_r0, eng.ple_counts().1 - ple_m0);
                     println!("ple rows per timed decode token: {:.1} requested, {:.2} misses ({:.1} %)",
                         r as f64 / gen_timed, m as f64 / gen_timed, 100.0 * m as f64 / r.max(1) as f64);
                 }
@@ -322,7 +322,7 @@ fn main() {
                 std::env::set_var("CROW_ROUTE_DUMP", "1");
                 std::env::set_var("CROW_GRAPH", "0");
                 let mut eng =
-                    Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
                 let t0 = std::time::Instant::now();
                 let mut next = eng.prefill(&mut cnq, &ids, None);
                 println!("routestats: prefill {} tokens in {:.1} s", ids.len(), t0.elapsed().as_secs_f64());
@@ -358,7 +358,7 @@ fn main() {
                 cfg.n_hot = n;
                 let even = vec![vec![1u64; geo.moe().experts]; geo.layers];
                 let mut eng =
-                    Engine::load(&mut cnq, geo, cfg, Some(&even[..]), &out, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, Some(&even[..]), Some(&out), false, &mut |m| println!("[load] {m}"));
                 println!("warmup: prefill over {} real tokens (chunk {}) …", ids.len(), cfg.prompt_chunk);
                 let t0 = std::time::Instant::now();
                 let _ = eng.prefill(&mut cnq, &ids, None);
@@ -398,7 +398,7 @@ fn main() {
                 println!("reloadcheck: free VRAM before any load {:.1} MB", f0 as f64 / 1e6);
                 for i in 0..n {
                     let mut eng =
-                        Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |_| {});
+                        Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |_| {});
                     let ids = [760i64, 3841, 13477, 37550, 33075, 888, 279, 15217];
                     let mut next = eng.prefill(&mut cnq, &ids, None);
                     for _ in 0..3 {
@@ -417,7 +417,7 @@ fn main() {
                 // oracle/golden/layer0-input.f32, run layer 0, compare to
                 // oracle/golden/layer0-golden-output.f32
                 let mut eng =
-                    Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
                 let inp = std::fs::read("../oracle/golden/layer0-input.f32").unwrap();
                 let gold = std::fs::read("../oracle/golden/layer0-golden-output.f32").unwrap();
                 let t = 8usize;
@@ -446,7 +446,7 @@ fn main() {
                 // Reference marks (p16, all-proj FP4 vs this golden): rel_L2
                 // 0.165, max_abs 0.582 — the "expected bad" FP4 attention delta.
                 let mut eng =
-                    Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
                 let to_f32 = |b: &[u8]| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>();
                 let inp = std::fs::read("../oracle/golden/layer3-attn-input.f32").unwrap();
                 let gold = std::fs::read("../oracle/golden/layer3-attn-output.f32").unwrap();
@@ -571,7 +571,7 @@ fn main() {
                     .unwrap_or_else(|| "unstated".to_string());
                 println!("selftest: crow-nest package self-test (F5, issue #64)");
                 println!("selftest: container  {cnq_path}");
-                println!("selftest: hot sets   {sidecar}");
+                println!("selftest: hot sets   {}", sidecar.as_deref().unwrap_or("none (no routed experts)"));
                 println!(
                     "selftest: golden     {dir}  ({} check{}, manifest formed {formed})",
                     checks.len(),
@@ -603,7 +603,7 @@ fn main() {
                 let dumps = std::env::temp_dir().join("crow-selftest-stage");
                 let dumps = dumps.to_string_lossy().into_owned();
                 let mut eng =
-                    Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
                 let mut pass = 0usize;
                 for c in &checks {
                     let x = read_f32_exact(&format!("{dir}/{}", c.input), c.t, c.input_width)

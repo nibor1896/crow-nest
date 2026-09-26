@@ -411,7 +411,8 @@ pub struct Engine {
     pub(crate) st: ThreeStates,
     res: Residency,
     w: Weights,
-    pub(crate) ple: Ple,
+    /// C5: `None` for a model without PLE (`Geo::ple` `None`: skipped, `cfg.ple` off)
+    pub(crate) ple: Option<Ple>,
     p: Params,
     s: Scratch,
     pub cfg: Config,
@@ -502,7 +503,13 @@ impl Engine {
     /// the [V] f32 row the last `prefill` / `decode_step` scored
     pub fn logits(&self) -> Dev { self.s.logits }
     /// the PLE row cache (its `req` / `miss` counters and slot count)
-    pub fn ple(&self) -> &Ple { &self.ple }
+    /// C5: `None` for a model without PLE
+    pub fn ple(&self) -> Option<&Ple> { self.ple.as_ref() }
+    /// the PLE hit-rate counters (rows requested, rows filled from the container)
+    /// since load; `(0, 0)` for a model without PLE (C5)
+    pub fn ple_counts(&self) -> (u64, u64) {
+        self.ple.as_ref().map_or((0, 0), |p| (p.req, p.miss))
+    }
     /// ids consumed so far: the next row `prefill` writes
     pub fn pos(&self) -> usize { self.pos }
     /// the held conversation — prompt ids AND generated ids
@@ -932,7 +939,8 @@ impl Engine {
         geo: Geo,
         mut cfg: Config,
         warmup_counts: Option<&[Vec<u64>]>,
-        sidecar_path: &str,
+        // C5: the hot-set sidecar, `Some` for a MoE family (`boot::hot_set_sidecar`)
+        sidecar_path: Option<&str>,
         persist: bool,
         log: &mut dyn FnMut(&str),
     ) -> Engine {
@@ -947,8 +955,13 @@ impl Engine {
         if std::env::var("CROW_KPROF").is_ok() && graph_on() {
             panic!("refusing CROW_KPROF with CROW_GRAPH=1: the per-kernel profile syncs the stream before and after every launch, and a sync inside the open decode-graph capture is CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED — the run would die on the first captured decode token. Re-run the measurement with CROW_GRAPH=0, or unset CROW_KPROF");
         }
-        // C3: the flat view of the model's Geo this loader computes with (Geo::dims
-        // refuses by name a family whose structure is not built yet, C5)
+        // C5: the family check again (`boot::model_geo` ran it before the container was
+        // mapped): an arm this engine has not built stops the load here, by name,
+        // before a byte is allocated. Every family `match` below takes a built arm.
+        if let Err(why) = geo.built() {
+            panic!("[load] refused: {why}");
+        }
+        // C3: the flat view of the model's Geo this loader computes with
         let d = geo.dims();
         // #110: a bad CROW_RENDER_RESERVE_MB stops the boot here, before a byte is loaded
         let render_reserve = crate::manager::render_reserve_bytes();
@@ -972,33 +985,47 @@ impl Engine {
         let lm_head = cuda::upload_dev(&lm_raw);
         drop(lm_raw);
 
-        let mx_norm = load_f32(cnq, "model.language_model.hyper_connection_mixer.hc_norm.weight", sec);
-        let mx_down = load_pw(cnq, "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight", sec);
-        let mx_up = load_pw(cnq, "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight", sec);
+        // C5: the final-norm arm (HcMixer: the model-level hyper-connection mixer)
+        let (mx_norm, mx_down, mx_up) = match geo.final_norm {
+            FinalNorm::HcMixer => (
+                load_f32(cnq, "model.language_model.hyper_connection_mixer.hc_norm.weight", sec),
+                load_pw(cnq, "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight", sec),
+                load_pw(cnq, "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight", sec),
+            ),
+            FinalNorm::Rms => unbuilt_arm(Block::FINAL_NORM_RMS, geo.family),
+        };
 
         log(&format!("loading {} dense layer bundles (FP4 + keeps) …", d.layers));
         let mut hc = Vec::with_capacity(d.layers);
         let mut sub = Vec::with_capacity(d.layers);
         let mut moe = Vec::with_capacity(d.layers);
-        for l in 0..LAYERS {
+        for l in 0..d.layers {
             let pfx = |s: &str| format!("model.language_model.layers.{l}.{s}");
-            hc.push(HcW {
-                norm: load_f32(cnq, &pfx("attn_hyper_connection.hc_norm.weight"), sec),
-                down: load_pw(cnq, &pfx("attn_hyper_connection.input_mix_weight_down.weight"), sec),
-                up: load_pw(cnq, &pfx("attn_hyper_connection.input_mix_weight_up.weight"), sec),
-                inj: load_pw(cnq, &pfx("attn_hyper_connection.block_inject_weight.weight"), sec),
+            // C5: the residual arm (Hc: the attention-side hyper-connection block)
+            hc.push(match geo.residual {
+                Residual::Hc { .. } => HcW {
+                    norm: load_f32(cnq, &pfx("attn_hyper_connection.hc_norm.weight"), sec),
+                    down: load_pw(cnq, &pfx("attn_hyper_connection.input_mix_weight_down.weight"), sec),
+                    up: load_pw(cnq, &pfx("attn_hyper_connection.input_mix_weight_up.weight"), sec),
+                    inj: load_pw(cnq, &pfx("attn_hyper_connection.block_inject_weight.weight"), sec),
+                },
+                Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, geo.family),
             });
             if d.is_attn(l) {
-                sub.push(SubW::Attn {
-                    q: load_pw(cnq, &pfx("self_attn.q_proj.weight"), sec),
-                    k: load_pw(cnq, &pfx("self_attn.k_proj.weight"), sec),
-                    v: load_pw(cnq, &pfx("self_attn.v_proj.weight"), sec),
-                    o: load_pw(cnq, &pfx("self_attn.o_proj.weight"), sec),
-                    qn: load_f32(cnq, &pfx("self_attn.q_norm.weight"), sec),
-                    kn: load_f32(cnq, &pfx("self_attn.k_norm.weight"), sec),
-                    iqk: load_pw(cnq, &pfx("self_attn.indexer.index_qk_proj.weight"), sec),
-                    iqln: load_f32(cnq, &pfx("self_attn.indexer.q_layernorm.weight"), sec),
-                    ikln: load_f32(cnq, &pfx("self_attn.indexer.k_layernorm.weight"), sec),
+                // C5: the attention arm (Qsa: attention plus the QSA indexer)
+                sub.push(match geo.attn {
+                    Attn::Qsa { .. } => SubW::Attn {
+                        q: load_pw(cnq, &pfx("self_attn.q_proj.weight"), sec),
+                        k: load_pw(cnq, &pfx("self_attn.k_proj.weight"), sec),
+                        v: load_pw(cnq, &pfx("self_attn.v_proj.weight"), sec),
+                        o: load_pw(cnq, &pfx("self_attn.o_proj.weight"), sec),
+                        qn: load_f32(cnq, &pfx("self_attn.q_norm.weight"), sec),
+                        kn: load_f32(cnq, &pfx("self_attn.k_norm.weight"), sec),
+                        iqk: load_pw(cnq, &pfx("self_attn.indexer.index_qk_proj.weight"), sec),
+                        iqln: load_f32(cnq, &pfx("self_attn.indexer.q_layernorm.weight"), sec),
+                        ikln: load_f32(cnq, &pfx("self_attn.indexer.k_layernorm.weight"), sec),
+                    },
+                    Attn::Full => unbuilt_arm(Block::ATTN_FULL, geo.family),
                 });
             } else {
                 sub.push(SubW::Gdn {
@@ -1013,38 +1040,58 @@ impl Engine {
                     out: load_pw(cnq, &pfx("linear_attn.out_proj.weight"), sec),
                 });
             }
-            moe.push(MoeW {
-                router: load_f32(cnq, &pfx("mlp.gate.weight"), sec),
-                router_bf: load_bf16_twin(cnq, &pfx("mlp.gate.weight"), sec),
-                sg: load_pw(cnq, &pfx("mlp.shared_expert.gate_proj.weight"), sec),
-                su: load_pw(cnq, &pfx("mlp.shared_expert.up_proj.weight"), sec),
-                sdn: load_pw(cnq, &pfx("mlp.shared_expert.down_proj.weight"), sec),
-                sgate: load_f32(cnq, &pfx("mlp.shared_expert_gate.weight"), sec),
+            // C5: the FFN arm (Moe: the router and the shared expert; the routed
+            // experts are the residency's slabs below)
+            moe.push(match geo.ffn {
+                Ffn::Moe { .. } => MoeW {
+                    router: load_f32(cnq, &pfx("mlp.gate.weight"), sec),
+                    router_bf: load_bf16_twin(cnq, &pfx("mlp.gate.weight"), sec),
+                    sg: load_pw(cnq, &pfx("mlp.shared_expert.gate_proj.weight"), sec),
+                    su: load_pw(cnq, &pfx("mlp.shared_expert.up_proj.weight"), sec),
+                    sdn: load_pw(cnq, &pfx("mlp.shared_expert.down_proj.weight"), sec),
+                    sgate: load_f32(cnq, &pfx("mlp.shared_expert_gate.weight"), sec),
+                },
+                Ffn::Dense { .. } => unbuilt_arm(Block::FFN_DENSE, geo.family),
             });
             if l % 12 == 0 {
                 log(&format!("  dense layers {l}/{}", d.layers));
             }
         }
-        // mlp HC bundle (second per-layer HC block)
+        // mlp HC bundle (second per-layer HC block; C5: the residual arm again)
         let mut hc2 = Vec::with_capacity(d.layers);
-        for l in 0..LAYERS {
+        for l in 0..d.layers {
             let pfx = |s: &str| format!("model.language_model.layers.{l}.{s}");
-            hc2.push(HcW {
-                norm: load_f32(cnq, &pfx("mlp_hyper_connection.hc_norm.weight"), sec),
-                down: load_pw(cnq, &pfx("mlp_hyper_connection.input_mix_weight_down.weight"), sec),
-                up: load_pw(cnq, &pfx("mlp_hyper_connection.input_mix_weight_up.weight"), sec),
-                inj: load_pw(cnq, &pfx("mlp_hyper_connection.block_inject_weight.weight"), sec),
+            hc2.push(match geo.residual {
+                Residual::Hc { .. } => HcW {
+                    norm: load_f32(cnq, &pfx("mlp_hyper_connection.hc_norm.weight"), sec),
+                    down: load_pw(cnq, &pfx("mlp_hyper_connection.input_mix_weight_down.weight"), sec),
+                    up: load_pw(cnq, &pfx("mlp_hyper_connection.input_mix_weight_up.weight"), sec),
+                    inj: load_pw(cnq, &pfx("mlp_hyper_connection.block_inject_weight.weight"), sec),
+                },
+                Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, geo.family),
             });
         }
         let dense_measured = cuda::total_vram_bytes() - cuda::free_vram_bytes();
 
         // ---- PLE weights (layer index 1) ----
-        log("loading PLE (layer 1) weights + row cache …");
-        // CROW_PLE_CACHE_MB=<n>: hot-row cache size override (VRAM diet, 2026-09-05)
-        let ple_bytes = std::env::var("CROW_PLE_CACHE_MB").ok().and_then(|v| v.parse::<u64>().ok())
-            .map(|mb| mb << 20).unwrap_or(cfg.ple_cache_bytes);
-        let ple = Ple::load(cnq, &d, ple_bytes);
-        log("PLE done — budget verify next");
+        // C5: the PLE arm. `Some`: the weights and the row cache; `None`: nothing is
+        // loaded and `cfg.ple` is off, so no PLE step runs in any loop
+        let ple = match geo.ple {
+            Some(_) => {
+                log("loading PLE (layer 1) weights + row cache …");
+                // CROW_PLE_CACHE_MB=<n>: hot-row cache size override (VRAM diet, 2026-09-05)
+                let ple_bytes = std::env::var("CROW_PLE_CACHE_MB").ok().and_then(|v| v.parse::<u64>().ok())
+                    .map(|mb| mb << 20).unwrap_or(cfg.ple_cache_bytes);
+                let ple = Ple::load(cnq, &d, ple_bytes);
+                log("PLE done — budget verify next");
+                Some(ple)
+            }
+            None => {
+                cfg.ple = false;
+                log("no PLE layer in this model (Geo::ple None) — skipped; budget verify next");
+                None
+            }
+        };
 
         // ---- #VIT: the visual tower, BEFORE the budget verify (the planner
         // must see the true free VRAM). CROW_VIT=0 skips the load entirely —
@@ -1120,7 +1167,12 @@ impl Engine {
         // so everything chunk-sized must already be resident (C=512 scratch is
         // ~0.7 GB; an unplanned allocation past the card limit gets paged by
         // WDDM and silently costs 3x per token - found 2026-09-04 at C=1024) ----
-        let slabs = crate::residency::expert_slab_info(cnq, 0, sec, geo.moe().experts);
+        // C5: the expert slabs, the cold staging, the residency planner and the hot-set
+        // sidecar are the `Ffn::Moe` arm
+        let slabs = match geo.ffn {
+            Ffn::Moe { experts, .. } => crate::residency::expert_slab_info(cnq, 0, sec, experts),
+            Ffn::Dense { .. } => unbuilt_arm(Block::FFN_DENSE, geo.family),
+        };
         let per_expert_unit = (slabs.gu_bytes + slabs.dn_bytes) * d.layers as u64;
         let s = Scratch::alloc(&d, cfg.prompt_chunk);
         // cold staging: decode-sized batches only (t*TOPK <= stage_max)
@@ -1167,13 +1219,16 @@ impl Engine {
         // selection form, next to the [stage] and [trickle] lines and for the
         // same reason: every future log says which selection produced it. It
         // sits in the [load] block, so the parity gate prints it too.
-        let qp = env_or_unset("CROW_QSA_PAR");
-        if qsa_par_on() {
-            println!("[qsa] decode selection qsa_select_par (default), G={}, CROW_QSA_PAR {} (0 = qsa_select_fast fallback)",
-                qsa_select_blocks(), qp);
-        } else {
-            println!("[qsa] decode selection qsa_select_fast (fallback, G unused), CROW_QSA_PAR {} (0 = qsa_select_fast fallback)",
-                qp);
+        // C5: the Attn::Qsa arm only (full attention has no selection to name)
+        if let Attn::Qsa { .. } = geo.attn {
+            let qp = env_or_unset("CROW_QSA_PAR");
+            if qsa_par_on() {
+                println!("[qsa] decode selection qsa_select_par (default), G={}, CROW_QSA_PAR {} (0 = qsa_select_fast fallback)",
+                    qsa_select_blocks(), qp);
+            } else {
+                println!("[qsa] decode selection qsa_select_fast (fallback, G unused), CROW_QSA_PAR {} (0 = qsa_select_fast fallback)",
+                    qp);
+            }
         }
         // #61d, 2026-09-12: ONE line per engine process names the decode
         // attention split count, next to the [qsa] line and for the same
@@ -1203,10 +1258,13 @@ impl Engine {
         // (exact "1") since the activation-floor fix of 2026-09-23 (unset =
         // pre-scaled quant_x_fp4 launches + unfused chains; "1" = all fused,
         // the fused producers keep the unscaled ue4m3 floor).
-        let hcf = env_or_unset("CROW_QFUSE");
-        println!("[hc] hyper-connection decode chain {}, shared-expert chain {}, CROW_QFUSE {} (1 = 19f fused hc + 19h fused shared + fused unscaled cascade, unset = all off)",
-            if hc_fuse_on() { "fused (19f opt-in, 4 launches per hc block)" } else { "unfused (default since the activation-floor fix, 8 launches)" },
-            if sh_fuse_on() { "fused (19h opt-in, 3 launches)" } else { "unfused (default, 6 launches)" }, hcf);
+        // C5: the Residual::Hc arm only (a plain residual has no hc chain)
+        if let Residual::Hc { .. } = geo.residual {
+            let hcf = env_or_unset("CROW_QFUSE");
+            println!("[hc] hyper-connection decode chain {}, shared-expert chain {}, CROW_QFUSE {} (1 = 19f fused hc + 19h fused shared + fused unscaled cascade, unset = all off)",
+                if hc_fuse_on() { "fused (19f opt-in, 4 launches per hc block)" } else { "unfused (default since the activation-floor fix, 8 launches)" },
+                if sh_fuse_on() { "fused (19h opt-in, 3 launches)" } else { "unfused (default, 6 launches)" }, hcf);
+        }
         // #10c, 2026-09-14: ONE line per engine process names the prefill
         // dense GEMM form, next to the [hc] line and for the same reason:
         // every future log says which dense form produced it. It sits in the
@@ -1327,6 +1385,9 @@ impl Engine {
 
         // ---- residency (#8) ----
         log("building residency (hot VRAM slabs + pinned cold tier) …");
+        // C5: the Ffn::Moe arm (the slabs above already took it), which boots with a
+        // hot-set sidecar path (`boot::hot_set_sidecar`)
+        let sidecar_path = sidecar_path.expect("a MoE family loads with a hot-set sidecar path (boot::hot_set_sidecar)");
         let res = Residency::build(cnq, &geo, sec, st_res_n(&st_rep, cfg.n_hot), warmup_counts, sidecar_path, persist, cold_fixed, cfg.adapt.spare, &mut |m| {
             log(&format!("  [residency] {m}"));
         });
@@ -3472,7 +3533,8 @@ impl Engine {
         let s = &self.s;
         let dbg = dbg_step();
         if dbg { tracing::info!(target: "ple", "[ple] enter"); }
-        let pl = &mut self.ple;
+        // C5: every caller sits behind `cfg.ple`, which `Engine::load` turns off for a model without PLE
+        let Some(pl) = self.ple.as_mut() else { unreachable!("ple_run without a PLE layer (cfg.ple is off for Geo::ple None, Crow #300 C5)") };
         // p15 semantics: the returned rows cover prefix+chunk; keep only the
         // chunk's rows (the prefix rows are history, already processed)
         let all_ngids = pl.ngram_ids(prefix, chunk_ids);
@@ -3602,7 +3664,8 @@ impl Engine {
         let k = &self.k;
         let p = &self.p;
         let s = &self.s;
-        let pl = &self.ple;
+        // C5: called only behind `cfg.ple`, which `Engine::load` turns off for a model without PLE
+        let Some(pl) = self.ple.as_ref() else { unreachable!("ple_step_kernels without a PLE layer (cfg.ple is off for Geo::ple None, Crow #300 C5)") };
         let t = 1usize;
         let dbg = dbg_step();
             launch_v(k.f("gather_ple_fp4"), self.d.ple_nheads as u32, 1, 1, self.d.ple_emb_dim as u32, &[
@@ -3880,7 +3943,9 @@ impl Engine {
                     }
                     v
                 };
-                let offsets = self.ple.row_offsets(cnq, &pre, next);
+                // C5: `cfg.ple` (checked above) is off for a model without PLE
+                let Some(pl) = self.ple.as_ref() else { unreachable!("PLE prefetch without a PLE layer (Crow #300 C5)") };
+                let offsets = pl.row_offsets(cnq, &pre, next);
                 let warm = cnq.warm();
                 // TASK H: the same batched fetch `ensure_rows` uses, but queued
                 // behind every urgent batch - this thread runs WHILE the current
@@ -4107,8 +4172,8 @@ impl Engine {
                 predicted_n: done,
                 prompt_ms: el * 1e3,
                 tok_s: done as f64 / el,
-                ple_rows: self.ple.req,
-                ple_fills: self.ple.miss,
+                ple_rows: self.ple_counts().0,
+                ple_fills: self.ple_counts().1,
                 ..Default::default()
             });
 
@@ -4374,8 +4439,8 @@ impl Engine {
             "[dec] pos {pos} in {id} -> out {tok}, graph {}, captured {}, ple rows {} misses {}, step {:.3} ms",
             graph as u8,
             capturing as u8,
-            self.ple.req,
-            self.ple.miss,
+            self.ple_counts().0,
+            self.ple_counts().1,
             t0.elapsed().as_secs_f64() * 1e3
         );
         tok

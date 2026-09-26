@@ -207,25 +207,36 @@ pub struct StateSizes {
 
 impl StateSizes {
     /// all byte counts derived from geometry + context (measured shapes); C3: the
-    /// geometry is the model's `Geo`
+    /// geometry is the model's `Geo`. C5: the QSA ring and pooled cache are the
+    /// `Attn::Qsa` arm; full attention plans none of them (zero bytes, zero rows).
     pub fn plan(geo: &Geo, context: usize, kv: KvDtype, prompt_chunk: usize) -> StateSizes {
         let bpv = kv.byte_per_value() as u64;
-        let q = geo.qsa();
         let (attn_layers, gdn_layers) = (geo.attn_layers, geo.gdn_layers);
-        // raw keys are consumed by pool4_cache right after they are appended
-        // (the pooled per-block keys are the long-lived cache): a 4-aligned ring
-        // of chunk + 4 rows holds every row a chunk can still pool (up to 3 rows
-        // of the previous chunk's incomplete block) — measured 2026-09-05
-        let ring = if std::env::var("CROW_QSA_FULL").as_deref() == Ok("1") {
-            context
-        } else {
-            ((prompt_chunk + q.compress + q.compress - 1) / q.compress * q.compress).min(context)
+        let (qsa_keys_bytes, ring, qsa_pooled_bytes) = match geo.attn {
+            Attn::Qsa { .. } => {
+                let q = geo.qsa();
+                // raw keys are consumed by pool4_cache right after they are appended
+                // (the pooled per-block keys are the long-lived cache): a 4-aligned ring
+                // of chunk + 4 rows holds every row a chunk can still pool (up to 3 rows
+                // of the previous chunk's incomplete block) — measured 2026-09-05
+                let ring = if std::env::var("CROW_QSA_FULL").as_deref() == Ok("1") {
+                    context
+                } else {
+                    ((prompt_chunk + q.compress + q.compress - 1) / q.compress * q.compress).min(context)
+                };
+                (
+                    (attn_layers * ring * q.hidd()) as u64 * 4,
+                    ring,
+                    (attn_layers * ((context + q.compress - 1) / q.compress) * q.hidd()) as u64 * 4,
+                )
+            }
+            Attn::Full => (0, 0, 0),
         };
         StateSizes {
             kv_bytes: (attn_layers * 2 * geo.kv_heads * geo.head_dim * context) as u64 * bpv,
-            qsa_keys_bytes: (attn_layers * ring * q.hidd()) as u64 * 4,
+            qsa_keys_bytes,
             qsa_ring_rows: ring,
-            qsa_pooled_bytes: (attn_layers * ((context + q.compress - 1) / q.compress) * q.hidd()) as u64 * 4,
+            qsa_pooled_bytes,
             gdn_s_bytes: (gdn_layers * geo.gdn_value_heads * geo.gdn_key_dim * geo.gdn_value_dim) as u64 * 4,
             gdn_conv_bytes: (gdn_layers * gdn_conv_state_len(geo)) as u64 * 4,
             rope_bytes: (context * geo.rope_pairs * 2) as u64 * 4,
@@ -246,9 +257,13 @@ pub const fn gdn_conv_state_len(geo: &Geo) -> usize {
 }
 
 /// C3: f32 of the PLE dilated conv state (`gen.rs` `Ple::state`), `[residual width][9]`
-/// (Flash-Next `[10240][9]`; the 9 taps are the PLE kernel's own, pinned in kernels.rs)
+/// (Flash-Next `[10240][9]`; the 9 taps are the PLE kernel's own, pinned in kernels.rs).
+/// C5: zero for a model without PLE (the `None` arm has no state).
 pub const fn ple_state_len(geo: &Geo) -> usize {
-    geo.residual_width() * 9
+    match geo.ple {
+        Some(_) => geo.residual_width() * 9,
+        None => 0,
+    }
 }
 
 impl StateSizes {
@@ -310,7 +325,6 @@ impl ThreeStates {
             cfg.context,
             geo.context_floor
         );
-        let q = geo.qsa();
         let mut rep = AllocReport::default();
         let total = cuda::total_vram_bytes();
         let free0 = cuda::free_vram_bytes();
@@ -329,7 +343,11 @@ impl ThreeStates {
         let spare = cfg.adapt.spare; // #17: from the policy in geo.rs, not the env
         let base = ClampInput {
             n_hot: cfg.n_hot,
-            experts: geo.moe().experts,
+            // C5: the hot-set clamp is the `Ffn::Moe` arm of the planner
+            experts: match geo.ffn {
+                Ffn::Moe { experts, .. } => experts,
+                Ffn::Dense { .. } => unbuilt_arm(Block::FFN_DENSE, geo.family),
+            },
             states_bytes,
             pending_bytes,
             expert_bytes_per_n_unit,
@@ -382,29 +400,38 @@ impl ThreeStates {
             cfg.kv.name(),
             context = cfg.context
         ));
-        let mut qsa_keys = Vec::with_capacity(geo.attn_layers);
-        for _ in 0..geo.attn_layers {
-            qsa_keys.push(cuda::alloc_zeroed((sizes.qsa_ring_rows * q.hidd() * 4) as usize));
-        }
-        rep.lines.push(format!(
-            "QSA keys  {:9.1} MB  ({} layers × {} × {} f32 — raw-key ring, pooled cache stays full-length)",
-            sizes.qsa_keys_bytes as f64 / MIB,
-            geo.attn_layers,
-            sizes.qsa_ring_rows,
-            q.hidd()
-        ));
-        let mut qsa_pooled = Vec::with_capacity(geo.attn_layers);
-        let cap_blocks = cfg.context.div_ceil(q.compress);
-        for _ in 0..geo.attn_layers {
-            qsa_pooled.push(cuda::alloc_zeroed((cap_blocks * q.hidd() * 4) as usize));
-        }
-        rep.lines.push(format!(
-            "QSA pooled{:9.1} MB  ({} layers × {} blocks × {} f32)",
-            sizes.qsa_pooled_bytes as f64 / MIB,
-            geo.attn_layers,
-            cap_blocks,
-            q.hidd()
-        ));
+        // C5: the indexer's raw-key ring and pooled blocks are the `Attn::Qsa` arm;
+        // full attention allocates neither (and prints no QSA line)
+        let (qsa_keys, qsa_pooled) = match geo.attn {
+            Attn::Qsa { .. } => {
+                let q = geo.qsa();
+                let mut qsa_keys = Vec::with_capacity(geo.attn_layers);
+                for _ in 0..geo.attn_layers {
+                    qsa_keys.push(cuda::alloc_zeroed((sizes.qsa_ring_rows * q.hidd() * 4) as usize));
+                }
+                rep.lines.push(format!(
+                    "QSA keys  {:9.1} MB  ({} layers × {} × {} f32 — raw-key ring, pooled cache stays full-length)",
+                    sizes.qsa_keys_bytes as f64 / MIB,
+                    geo.attn_layers,
+                    sizes.qsa_ring_rows,
+                    q.hidd()
+                ));
+                let mut qsa_pooled = Vec::with_capacity(geo.attn_layers);
+                let cap_blocks = cfg.context.div_ceil(q.compress);
+                for _ in 0..geo.attn_layers {
+                    qsa_pooled.push(cuda::alloc_zeroed((cap_blocks * q.hidd() * 4) as usize));
+                }
+                rep.lines.push(format!(
+                    "QSA pooled{:9.1} MB  ({} layers × {} blocks × {} f32)",
+                    sizes.qsa_pooled_bytes as f64 / MIB,
+                    geo.attn_layers,
+                    cap_blocks,
+                    q.hidd()
+                ));
+                (qsa_keys, qsa_pooled)
+            }
+            Attn::Full => (Vec::new(), Vec::new()),
+        };
         let mut gdn_s = Vec::with_capacity(geo.gdn_layers);
         for _ in 0..geo.gdn_layers {
             gdn_s.push(cuda::alloc_zeroed(gdn_s_state_len(geo) * 4));
@@ -1362,5 +1389,53 @@ mod tests_96 {
         assert!(exceed_training_warning(300_000, Some(262_144), Some(&scaling(RopeKind::Default))).is_some());
         // no config seen at all (the selftest package): never a guessed threshold
         assert!(exceed_training_warning(300_000, None, None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests_300_c5 {
+    //! Crow #300 C5: the state plan per family. Pure arithmetic, no GPU.
+    use super::*;
+    use crate::cache::{park_host_bytes, Shape};
+
+    /// Flash-Next selects the plan of record: every byte count of the gate's
+    /// `[budget]` lines (200k context, fp8 KV, chunk 512: KV 2343.8 MB, QSA keys
+    /// 3.0 MB on a 516-row ring, QSA pooled 293.0 MB, GDN 112.2 MB, RoPE 48.8 MB),
+    /// the 121,208,832 B snapshot and the #118 park
+    #[test]
+    fn flash_next_selects_the_plan_of_record() {
+        let g = Geo::FLASH_NEXT;
+        let s = StateSizes::plan(&g, 200_000, KvDtype::Fp8E4m3, 512);
+        assert_eq!(
+            (s.kv_bytes, s.qsa_keys_bytes, s.qsa_ring_rows, s.qsa_pooled_bytes, s.gdn_s_bytes, s.gdn_conv_bytes, s.rope_bytes),
+            (2_457_600_000, 3_170_304, 516, 307_200_000, 113_246_208, 4_423_680, 51_200_000)
+        );
+        assert_eq!(ple_state_len(&g), 92_160, "[10240][9]");
+        assert_eq!(Shape::with_geo(&g, 36, 12, 516).snapshot_bytes(), 121_208_832);
+        assert_eq!(park_host_bytes(&g, 8_192, 200_000, 12, 1), 113_252_352);
+    }
+
+    /// a dense Geo (the 27B fixture) plans no QSA ring or pool, no PLE state and
+    /// no hot set, and refuses at its first unbuilt block by name
+    #[test]
+    fn a_dense_geo_plans_no_ple_qsa_or_hot_set_parts_and_refuses_by_name() {
+        let g = crate::meta::dense_fixture_geo();
+        let s = StateSizes::plan(&g, g.context_floor, KvDtype::Fp8E4m3, 512);
+        assert_eq!((s.qsa_keys_bytes, s.qsa_ring_rows, s.qsa_pooled_bytes), (0, 0, 0), "no QSA indexer");
+        // 16 attention layers x 2 x 4 kv-heads x 256 x 100k fp8; 48 GDN layers
+        assert_eq!(s.kv_bytes, 3_276_800_000);
+        assert_eq!((s.gdn_s_bytes, s.gdn_conv_bytes, s.rope_bytes), (150_994_944, 5_898_240, 25_600_000));
+        assert_eq!(s.total(), 3_276_800_000 + 150_994_944 + 5_898_240 + 25_600_000);
+        assert_eq!(ple_state_len(&g), 0, "no PLE state");
+        let shape = Shape::with_geo(&g, 48, 16, 516);
+        assert_eq!((shape.qsa_ring_len, shape.ple_len), (0, 0));
+        assert_eq!(shape.snapshot_bytes(), 4 * 48 * (48 * 128 * 128 + 10_240 * 3));
+        assert_eq!(park_host_bytes(&g, 8_192, 100_000, 16, 1), 8_192 * 16 * 2 * 4 * 256, "KV rows only, no pooled blocks");
+        assert_eq!(crate::boot::hot_set_sidecar(&g, Some("hot.json".into()), "d.json".into()), None, "no hot set");
+        assert_eq!(g.context_floor, DENSE_CONTEXT_FLOOR);
+        assert_eq!(
+            g.built(),
+            Err("Residual::Plain (one pre-norm residual stream) for family Qwen35Dense not built yet (Crow #300 phase 2)".to_string())
+        );
     }
 }

@@ -228,7 +228,7 @@
 
 use crate::cuda;
 use crate::gen::Engine;
-use crate::geo::Geo;
+use crate::geo::{Attn, Geo};
 use cudarc::driver::sys;
 
 /// slot of the snapshot taken after the prompt prefill (spec 7.6, point 1)
@@ -275,10 +275,16 @@ pub fn park_blocks(rows: usize, n_ctx: usize, compress: usize) -> usize {
 /// - #118: host RAM of a park of `rows` rows: the KV rows of every attention layer (K and
 ///   V, `Geo::kv_heads` heads of `Geo::head_dim` values at `kv_value_bytes`) plus
 ///   `park_blocks` pooled QSA blocks of the QSA raw key width in f32 per attention layer
+/// - C5: the pooled blocks are the `Attn::Qsa` arm; full attention parks KV rows only
 pub fn park_host_bytes(geo: &Geo, rows: usize, n_ctx: usize, attn_layers: usize, kv_value_bytes: usize) -> usize {
-    let q = geo.qsa();
-    rows * attn_layers * 2 * geo.kv_heads * geo.head_dim * kv_value_bytes
-        + attn_layers * park_blocks(rows, n_ctx, q.compress) * q.hidd() * 4
+    let pooled = match geo.attn {
+        Attn::Qsa { .. } => {
+            let q = geo.qsa();
+            attn_layers * park_blocks(rows, n_ctx, q.compress) * q.hidd() * 4
+        }
+        Attn::Full => 0,
+    };
+    rows * attn_layers * 2 * geo.kv_heads * geo.head_dim * kv_value_bytes + pooled
 }
 
 /// - #118: may a parked snapshot at `p` be rolled back onto after other requests wrote
@@ -413,12 +419,16 @@ impl Shape {
     }
 
     /// the shape of `gdn_layers` / `attn_layers` loaded state buffers and a ring of
-    /// `qsa_ring_rows` rows, every per-buffer size from the model's `Geo` (C3)
+    /// `qsa_ring_rows` rows, every per-buffer size from the model's `Geo` (C3). C5:
+    /// no QSA ring for full attention, no PLE state for a model without PLE.
     pub fn with_geo(geo: &Geo, gdn_layers: usize, attn_layers: usize, qsa_ring_rows: usize) -> Shape {
         Shape {
             gdn_layers,
             attn_layers,
-            qsa_ring_len: qsa_ring_rows * geo.qsa().hidd(),
+            qsa_ring_len: match geo.attn {
+                Attn::Qsa { .. } => qsa_ring_rows * geo.qsa().hidd(),
+                Attn::Full => 0,
+            },
             gdn_s_len: crate::manager::gdn_s_state_len(geo),
             gdn_conv_len: crate::manager::gdn_conv_state_len(geo),
             ple_len: crate::manager::ple_state_len(geo),
@@ -940,7 +950,10 @@ impl PrefixCache {
         for (i, buf) in s.gdn_conv.iter_mut().enumerate() {
             dtoh_into(buf, eng.st.gdn_conv[i]);
         }
-        dtoh_into(&mut s.ple_state, eng.ple.state);
+        // C5: a model without PLE has no PLE state (and a zero-length snapshot row)
+        if let Some(pl) = &eng.ple {
+            dtoh_into(&mut s.ple_state, pl.state);
+        }
         for (i, buf) in s.qsa_ring.iter_mut().enumerate() {
             dtoh_into(buf, eng.st.qsa_keys[i]);
         }
@@ -1058,7 +1071,9 @@ impl PrefixCache {
         for (i, buf) in s.gdn_conv.iter().enumerate() {
             cuda::to_f32_into(eng.st.gdn_conv[i], buf);
         }
-        cuda::to_f32_into(eng.ple.state, &s.ple_state);
+        if let Some(pl) = &eng.ple {
+            cuda::to_f32_into(pl.state, &s.ple_state);
+        }
         for (i, buf) in s.qsa_ring.iter().enumerate() {
             cuda::to_f32_into(eng.st.qsa_keys[i], buf);
         }

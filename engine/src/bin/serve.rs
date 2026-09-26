@@ -4773,7 +4773,7 @@ fn chat_generate(
     let (selections_total, cold_total) = blocks
         .iter()
         .fold((0u64, 0u64), |a, c| (a.0 + c[0], a.1 + c[1]));
-    let (ple_rows_total, ple_miss_total) = (srv.eng.ple().req, srv.eng.ple().miss);
+    let (ple_rows_total, ple_miss_total) = srv.eng.ple_counts();
     let counters_ms = t_ctr.elapsed().as_secs_f64() * 1e3;
 
     let gen = out.len();
@@ -5706,7 +5706,7 @@ fn main() {
 
     // unsafe: pins device and host memory; takes engine/.engine.lock, a second serve dies here
     let eng = unsafe {
-        Engine::load(&mut cnq, geo, cfg, None, &sidecar, false, &mut |m| tracing::info!(target: "load", "[load] {m}"))
+        Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| tracing::info!(target: "load", "[load] {m}"))
     };
     let n_ctx = eng.n_ctx();
     let prompt_chunk = eng.cfg.prompt_chunk;
@@ -5719,6 +5719,8 @@ fn main() {
     }
 
     tracing::info!(target: "serve", "[serve] container {cnq_path}");
+    // C5: `None` for a family without routed experts (boot::hot_set_sidecar)
+    let sidecar = sidecar.unwrap_or_else(|| "none (no routed experts)".to_string());
     tracing::info!(target: "serve", "[serve] hotsets {sidecar}");
     tracing::info!(target: "serve", "[serve] n_ctx {n_ctx}");
     tracing::info!(target: "serve", "[serve] prompt_chunk {prompt_chunk}");
