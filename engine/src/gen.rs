@@ -4242,27 +4242,25 @@ impl Engine {
         cuda::dtoh(self.s.h, t * self.d.hct)
     }
 
-    /// DEBUG/layercheck helper: run ONLY the attention sub-block of layer `l`
-    /// (q/k/v GEMVs → split → q_norm/k_norm → rotary → KV store → QSA select →
-    /// attention → sigmoid gate → o_proj) on a host [T][H] `mixed` input,
-    /// returning the [T][H] o_proj output (the p7-golden contract). This is the
-    /// `attn_subblock` check of `decode selftest` and of `decode layercheck3`,
-    /// and it runs the PRODUCTION `attn_prompt` — the same kernels, buffers and
-    /// defaults a prefill chunk runs layer 3 with.
+    /// Crow #300 phase 2: rows `0..rows` of one KV cache plane (attention layer `ai` by its
+    /// attention index, K or V, KV head `kvh`) as f32 `[rows][AHD]`, decoded from the cache's
+    /// dtype (bf16 exactly, e4m3 by `cnq::e4m3_to_f32`) - the measurement door of `decode kvstats`
     ///
-    /// #69 (2026-09-18): a caller that hands `mixed` over from the host skips
-    /// `hc_run`, and since #19g `hc_run`'s LAST launch is `mix_streams_q`, which
-    /// writes `mixed` AND the NVFP4 activation cascade `xq_m` that every FP4
-    /// projection of the sub-block reads (v, the QSA indexer qk — `attn_prompt`
-    /// itself quantizes unless CROW_QFUSE=1; from #19g to 2026-09-23 the fused
-    /// producer was the default). Without this launch `xq_m` stayed all-zero on
-    /// the run of record, so v and qk came out zero, attention had nothing to
-    /// weight and the o_proj output was IDENTICALLY zero at max_abs = max|golden|
-    /// — a debug path reporting a number that says nothing. `quant_x_fp4` is the
-    /// launch `attn_prompt` makes itself when the fusion is off (the default
-    /// since the activation-floor fix of 2026-09-23; it adds the per-row
-    /// power-of-two pre-scale the fused `mix_streams_q` cannot), so the
-    /// sub-block is fed what the default production path feeds it.
+    /// # Safety
+    ///
+    /// A CUDA context must be current and no kernel of this engine may be in flight.
+    pub unsafe fn kv_rows_host(&self, ai: usize, is_k: bool, kvh: usize, rows: usize) -> Vec<f32> {
+        cuda::sync();
+        let bpv = self.st.kv.byte_per_value();
+        let mut raw = vec![0u8; rows * self.d.ahd * bpv];
+        crate::slot::dtoh_bytes(&mut raw, self.st.kv_row_ptr(ai, is_k, kvh, 0));
+        if bpv == 2 {
+            raw.as_chunks::<2>().0.iter().map(|c| f32::from_bits((u16::from_le_bytes(*c) as u32) << 16)).collect()
+        } else {
+            raw.iter().map(|&b| crate::cnq::e4m3_to_f32(b)).collect()
+        }
+    }
+
     /// Crow #300 phase 2: one sub-block of a dense layer over host rows, for the goldens of
     /// `oracle/export_qwen35_goldens.py`. `kind`: "ln1" (input_layernorm) and "mlp" over
     /// `t` rows; "attn" / "gdn" over a prompt of `t` rows from position 0 and the zero
@@ -4303,6 +4301,27 @@ impl Engine {
         cuda::dtoh(out, t * self.d.h)
     }
 
+    /// DEBUG/layercheck helper: run ONLY the attention sub-block of layer `l`
+    /// (q/k/v GEMVs → split → q_norm/k_norm → rotary → KV store → QSA select →
+    /// attention → sigmoid gate → o_proj) on a host [T][H] `mixed` input,
+    /// returning the [T][H] o_proj output (the p7-golden contract). This is the
+    /// `attn_subblock` check of `decode selftest` and of `decode layercheck3`,
+    /// and it runs the PRODUCTION `attn_prompt` — the same kernels, buffers and
+    /// defaults a prefill chunk runs layer 3 with.
+    ///
+    /// #69 (2026-09-18): a caller that hands `mixed` over from the host skips
+    /// `hc_run`, and since #19g `hc_run`'s LAST launch is `mix_streams_q`, which
+    /// writes `mixed` AND the NVFP4 activation cascade `xq_m` that every FP4
+    /// projection of the sub-block reads (v, the QSA indexer qk — `attn_prompt`
+    /// itself quantizes unless CROW_QFUSE=1; from #19g to 2026-09-23 the fused
+    /// producer was the default). Without this launch `xq_m` stayed all-zero on
+    /// the run of record, so v and qk came out zero, attention had nothing to
+    /// weight and the o_proj output was IDENTICALLY zero at max_abs = max|golden|
+    /// — a debug path reporting a number that says nothing. `quant_x_fp4` is the
+    /// launch `attn_prompt` makes itself when the fusion is off (the default
+    /// since the activation-floor fix of 2026-09-23; it adds the per-row
+    /// power-of-two pre-scale the fused `mix_streams_q` cannot), so the
+    /// sub-block is fed what the default production path feeds it.
     pub unsafe fn run_attn_subblock(&mut self, l: usize, x_host: &[f32], t: usize, pos_base: usize) -> Vec<f32> {
         assert!(self.d.is_attn(l), "layer {l} is not an attention layer");
         assert_eq!(x_host.len(), t * self.d.h, "attn subblock input must be [T][H]");

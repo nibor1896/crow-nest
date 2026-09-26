@@ -557,6 +557,51 @@ fn main() {
                     "layercheck3 stepwise: max_abs={s_max:.4} rel_L2={s_rel:.4} NaN={s_nan} (batched==stepped pin, p11/p12 pattern)"
                 );
             }
+            "kvstats" => {
+                // Crow #300 phase 2: why the raw FP8 KV costs so much at long context. Boot with
+                // CROW_KV=bf16 (the exact values), prefill the prompt, read every attention
+                // layer's K and V cache and compare three e4m3 encodings of the same values:
+                // the raw cast `store_kv` does today, one scale per (layer, K/V, KV head) and
+                // one scale per row (token x head, 256 values); scale = amax / 448.
+                let ids = read_ids(&args[2]);
+                cfg.prompt_chunk = ids.len().min(2048);
+                let mut eng = Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
+                eng.prefill(&mut cnq, &ids, None);
+                let rows = eng.pos();
+                let q = |x: f32| crow_nest_engine::cnq::e4m3_to_f32(crow_nest_engine::cnq::f32_to_e4m3(x));
+                let relerr = |v: &[f32], f: &dyn Fn(usize, f32) -> f32| -> f64 {
+                    let (mut e, mut r) = (0f64, 0f64);
+                    for (i, &x) in v.iter().enumerate() {
+                        let d = (f(i, x) - x) as f64;
+                        e += d * d;
+                        r += (x as f64) * (x as f64);
+                    }
+                    (e / r.max(1e-30)).sqrt()
+                };
+                let ahd = eng.geo.head_dim;
+                println!("kvstats: {rows} rows, KV heads {}, head dim {ahd}; rel RMS error of three e4m3 encodings", eng.geo.kv_heads);
+                println!("{:<5} {:<2} {:>10} {:>10} {:>10} {:>9} {:>10} {:>10} {:>10}", "layer", "kv", "p50|x|", "p99|x|", "max|x|", "subnorm%", "raw", "per-head", "per-row");
+                for ai in 0..eng.geo.attn_layers {
+                    for is_k in [true, false] {
+                        let mut v: Vec<f32> = Vec::new();
+                        for kvh in 0..eng.geo.kv_heads {
+                            v.extend(eng.kv_rows_host(ai, is_k, kvh, rows));
+                        }
+                        let mut a: Vec<f32> = v.iter().map(|x| x.abs()).collect();
+                        a.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                        let pct = |p: f64| a[((a.len() - 1) as f64 * p) as usize];
+                        let sub = a.iter().filter(|&&x| x > 0.0 && x < 0.015625).count() as f64 / a.len() as f64 * 100.0;
+                        let per_plane = rows * ahd;
+                        let head_amax: Vec<f32> = (0..eng.geo.kv_heads).map(|h| v[h * per_plane..(h + 1) * per_plane].iter().fold(0f32, |m, x| m.max(x.abs()))).collect();
+                        let row_amax: Vec<f32> = v.chunks(ahd).map(|r| r.iter().fold(0f32, |m, x| m.max(x.abs()))).collect();
+                        let raw = relerr(&v, &|_, x| q(x));
+                        let ph = relerr(&v, &|i, x| { let s = (head_amax[i / per_plane] / 448.0).max(1e-30); q(x / s) * s });
+                        let pr = relerr(&v, &|i, x| { let s = (row_amax[i / ahd] / 448.0).max(1e-30); q(x / s) * s });
+                        println!("{:<5} {:<2} {:>10.4e} {:>10.4e} {:>10.4e} {:>8.2}% {:>10.3e} {:>10.3e} {:>10.3e}",
+                            ai, if is_k { "K" } else { "V" }, pct(0.5), pct(0.99), a[a.len() - 1], sub, raw, ph, pr);
+                    }
+                }
+            }
             "p2golden" => {
                 // Crow #300 phase 2: the dense sub-blocks against the HF qwen3_5 goldens of
                 // `oracle/export_qwen35_goldens.py` (weights = this container dequantized, so

@@ -16,6 +16,7 @@ extra tensor is an error, not a silent default.
 """
 import hashlib
 import json
+import re
 import os
 
 import torch
@@ -50,10 +51,43 @@ def sha256_file(path, chunk=1 << 22):
     return h.hexdigest()
 
 
+# Crow #300 phase 2, measurement arm R1 (decode_out/p2-kld/PREREG.md): the precision split of
+# nvidia/Qwen3.8-27B-NVFP4 simulated on our container - attention q/k/v/o and GDN in_proj_qkv /
+# in_proj_z / out_proj as FP8 e4m3 with one scale per tensor (amax / 448) from the BF16
+# originals, everything else as the CNQ container
+R1_FP8 = re.compile(r"\.(self_attn\.(q|k|v|o)_proj|linear_attn\.(in_proj_qkv|in_proj_z|out_proj))\.weight$")
+
+
+# attribution arms (decode_out/p2-kld): `only-<group>` = that group from the CNQ container (NVFP4),
+# every other tensor from the BF16 originals
+GROUPS = {
+    "mlp": re.compile(r"\.mlp\.(gate|up|down)_proj\.weight$"),
+    "lmhead": re.compile(r"^lm_head\.weight$"),
+    "gdn": re.compile(r"\.linear_attn\.(in_proj_qkv|in_proj_z|out_proj)\.weight$"),
+    "attn": re.compile(r"\.self_attn\.(q|k|v|o)_proj\.weight$"),
+}
+
+
+def fp8_per_tensor(w):
+    s = w.abs().max().clamp(min=1e-30) / 448.0
+    return (w / s).to(torch.float8_e4m3fn).to(torch.float32) * s
+
+
 class WeightSource:
     def __init__(self, kind, cnq_path=CNQ_PATH, model_dir=MODEL_DIR):
-        assert kind in ("cnq", "bf16"), kind
+        assert kind in ("cnq", "bf16", "r1") or (kind.startswith("only-") and kind[5:] in GROUPS), kind
         self.kind = kind
+        if kind.startswith("only-"):
+            self.group = GROUPS[kind[5:]]
+            self.cnq_src = WeightSource("cnq", cnq_path, model_dir)
+            self.bf16_src = WeightSource("bf16", cnq_path, model_dir)
+            self.path = f"{kind}: {cnq_path} for the group, {model_dir} for the rest"
+            return
+        if kind == "r1":
+            self.cnq_src = WeightSource("cnq", cnq_path, model_dir)
+            self.bf16_src = WeightSource("bf16", cnq_path, model_dir)
+            self.path = f"r1: {cnq_path} + FP8 from {model_dir}"
+            return
         if kind == "cnq":
             self.path = cnq_path
             # a container still being written (or cut short) has no index trailer yet
@@ -70,11 +104,19 @@ class WeightSource:
         return safe_open(os.path.join(self.model_dir, self.wm[name]), framework="pt", device="cpu")
 
     def has(self, name):
+        if self.kind == "r1" or self.kind.startswith("only-"):
+            return self.cnq_src.has(name)
         return self.cnq.has(name) if self.kind == "cnq" else name in self.wm
 
     def get(self, name):
         """the whole tensor, f32, in its checkpoint shape"""
         assert self.has(name), f"{self.kind}: missing {name}"
+        if self.kind.startswith("only-"):
+            return (self.cnq_src if self.group.search(name) else self.bf16_src).get(name)
+        if self.kind == "r1":
+            if R1_FP8.search(name):
+                return fp8_per_tensor(self.bf16_src.get(name))
+            return self.cnq_src.get(name)
         if self.kind == "cnq":
             return self.cnq.tensor(name)
         with self._open(name) as f:
@@ -82,18 +124,26 @@ class WeightSource:
 
     def rows(self, name, r0, r1):
         """rows [r0, r1) of a 2-D tensor, f32 — never the whole table"""
+        if self.kind.startswith("only-"):
+            return (self.cnq_src if self.group.search(name) else self.bf16_src).rows(name, r0, r1)
+        if self.kind == "r1":
+            return self.cnq_src.rows(name, r0, r1)  # embedding and lm_head: CNQ in R1
         if self.kind == "cnq":
             return self.cnq.rows_f32(name, r0, r1)
         with self._open(name) as f:
             return f.get_slice(name)[r0:r1].to(torch.float32).clone()
 
     def n_rows(self, name):
+        if self.kind == "r1" or self.kind.startswith("only-"):
+            return self.cnq_src.n_rows(name)
         if self.kind == "cnq":
             return self.cnq.tensors[name]["shape"][0]
         with self._open(name) as f:
             return f.get_slice(name).get_shape()[0]
 
     def dtype_of(self, name):
+        if self.kind == "r1":
+            return "fp8-sim" if R1_FP8.search(name) else self.cnq_src.dtype_of(name)
         if self.kind == "cnq":
             return self.cnq.tensors[name]["dtype"]
         with self._open(name) as f:
@@ -108,6 +158,11 @@ class WeightSource:
         return module.float().eval()
 
     def provenance(self):
+        if self.kind.startswith("only-"):
+            return {"weights": f"{self.kind} (the group from CNQ, the rest BF16)"}
+        if self.kind == "r1":
+            return {"weights": "r1 (CNQ + FP8 per-tensor attention/GDN projections from the BF16 originals)",
+                    "cnq": self.cnq_src.provenance(), "bf16": self.bf16_src.provenance()}
         if self.kind == "cnq":
             st = os.stat(self.path)
             idx = self.cnq.index

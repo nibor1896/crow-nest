@@ -43,7 +43,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 )
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--weights", choices=("cnq", "bf16"), default="cnq")
+ap.add_argument("--weights", default="cnq", help="cnq | bf16 | r1 | only-mlp | only-lmhead | only-gdn | only-attn")
 ap.add_argument("--threads", type=int, default=int(os.environ.get("ORACLE_THREADS", "16")))
 ap.add_argument("--lm-head-chunk", type=int, default=16384, help="lm_head rows dequantized per step")
 args = ap.parse_args()

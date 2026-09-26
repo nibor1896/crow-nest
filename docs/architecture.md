@@ -5105,6 +5105,14 @@ Flash-Next's with the SiLU gate (`CN_GATE_ACT`, C4).
   right answer), slot save (158,925,432 B, 30 ms) and restore (23 ms; the continuation reuses 62
   of 82 tokens), VRAM lend and return (602 MiB). The F16 projector, the MTP head and the
   per-card planner above the context floor are open.
+- **Quality instruments.** `oracle/ref_qwen35_logits.py --weights` takes `cnq`, `bf16`, `r1` (attention
+  and GDN projections through FP8 e4m3 per-tensor, NVIDIA's split for this model, the rest CNQ) and
+  `only-mlp` / `only-gdn` / `only-attn` / `only-lmhead` (that group from the container, the rest BF16),
+  so the KLD of each weight group is measured on its own (`qwen35_common.WeightSource`). `decode kvstats
+  <ids.json>` boots with `CROW_KV=bf16`, prefills and reads every attention layer's K / V cache
+  (`Engine::kv_rows_host`): |x| quantiles, the subnormal share, and the relative error of three e4m3
+  encodings (the raw cast of `store_kv`, one scale per head, one per row). Results of 2026-09-26 in the
+  CHANGELOG (Measured).
 
 ## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
 
