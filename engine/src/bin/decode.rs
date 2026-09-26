@@ -332,7 +332,7 @@ fn main() {
                     next = eng.decode_step(&mut cnq, next as i64);
                     trace.push(next as i64);
                 }
-                let routes: Vec<Vec<[i32; 10]>> = eng.route_log().to_vec();
+                let routes: Vec<Vec<Vec<i32>>> = eng.route_log().to_vec();
                 serde_json::to_writer(
                     std::fs::File::create(&out).unwrap(),
                     &serde_json::json!({

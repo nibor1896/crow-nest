@@ -4648,19 +4648,23 @@ tests read the checkpoint of record in `models/`, as before.
   `[budget]`, `[residency]`, `[diet]` and `scratch + staging` line is identical to `f7ca9f5`
   (host-measured free RAM / VRAM masked).
 
-**What still reads the consts** (C3d, 2026-09-26): in `gen.rs` the loops (`upload_chunk_scalars`
-.. the trickle and the route log). Host literals that stay, because they describe a kernel's own
-launch contract rather than the model: the 256 / 128 / 1024 block sizes, `qsa_scores_par`'s
-`(ncb + 3) / 4` grid and its `QSA_SCORES_BLOCKS` cap, the NVFP4 block bytes (36) and the PLE cache
-row (108 B, `PLE_ROW_VALUES` 160, asserted equal to the model's PLE embedding dim at load). On purpose: `meta.rs` (the Flash-Next expected-values row is the
+**What still reads the consts** (C3e, 2026-09-26): no host site of the engine. `gen.rs`,
+`manager.rs`, `residency.rs`, `cache.rs`, `slot.rs`, `reset.rs`, `vit.rs`, `lend.rs` and the
+`serve` / `decode` / `parity` bins read the `Geo` (or its `Dims`). Host literals that stay, because
+they describe a kernel's own launch contract rather than the model: the 256 / 128 / 1024 block
+sizes, `qsa_scores_par`'s `(ncb + 3) / 4` grid and its `QSA_SCORES_BLOCKS` cap, the NVFP4 block
+bytes (36), the PLE cache row (108 B, `PLE_ROW_VALUES` 160, asserted equal to the model's PLE
+embedding dim at load), the PLE conv's 4 taps x dilation 3 = 9 state rows (`manager::ple_state_len`),
+`CROW_CHUNK_BALANCE`'s rounding to 4, and `slot::Header::check_content`'s `done_blocks == pos / 4`
+(a pure header check with no `Geo` in reach; the loaded model's compress ratio is 4). On purpose: `meta.rs` (the Flash-Next expected-values row is the
 pin), the tests that pin a const against its `Geo` field or feed a Flash-Next fixture, and the
 synthetic kernel probes (`mma_gate`, `attn_path_probe`, `qsa_probe`, `qsa_tie_probe`,
 `gdn_chunk_probe`, `rope_table_probe`, `router_probe`): they load no model and exercise the
 kernels at the Flash-Next shapes the kernel source pins, so they move with C4. The kernels
 (`kernels.rs` source text, `head / 12`, `2560`, `1e-6f`) are C4. Container facts that are not
 model geometry stay consts: `PLE_ROWS_PER_SHARD` (the converter's shard layout, C6),
-`HOST_PINNED_CAP`, the chunk policy. The QSA block of 4 rows is still a literal in
-`slot::Header::check_content` (`done_blocks == pos / 4`).
+`HOST_PINNED_CAP`, the chunk policy; `sample::EOS_IDS` stays as the Flash-Next pin the
+metadata gate checks.
 
 ## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
 

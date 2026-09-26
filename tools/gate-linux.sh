@@ -283,7 +283,13 @@ SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
 TESTS="425"
-CLIPPY="1519"
+CLIPPY="1517"
+#   tests 425 / clippy 1519 -> 1517   Crow #300 phase 1 C3c..C3e (2026-09-26, on `f2a26f6`): gen.rs reads the runtime
+#                              `Geo` through `Dims` (loader and buffers, layer primitives, loops). The `geo::tests_300`
+#                              accessor test gained the `Dims` block (shown red with `hct` mutated); no test added.
+#                              Clippy -2: two manual `div_ceil` (`(context + 3) / 4`) in the QSA block bookkeeping
+#                              became `div_ceil(qsa_compress)`. Measured 2026-09-26: lib 296 / 0 / 3 ignored, serve
+#                              118, decode 5, parity 6 = 425 / 0; clippy 1517.
 #   tests 424 -> 425 / clippy 1519 (unchanged)   Crow #300 phase 1 C3b (2026-09-26, on `3e14d2f`): residency.rs,
 #                              cache.rs (`Shape`, the park), the serve / decode / parity bins and the container-reading
 #                              tools (coldtier, hybrid, sf_scan, residency, states) read the runtime `Geo`. +1

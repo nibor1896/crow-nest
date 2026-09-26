@@ -455,7 +455,7 @@ pub struct Engine {
     st_ev_done: cudarc::driver::sys::CUevent,
     /// CROW_ROUTE_DUMP=1 (non-graph decode): routed expert ids per token per
     /// layer, [token][layer][10] - measurement A-V3 (hot-set coverage study)
-    pub(crate) route_log: Vec<Vec<[i32; 10]>>,
+    pub(crate) route_log: Vec<Vec<Vec<i32>>>,
     /// stream-side trickle adaptation (A-P3c, CROW_ADAPT_STREAM=1): created
     /// on first use by `trickle_tick`
     trickle: Option<Trickle>,
@@ -521,7 +521,7 @@ impl Engine {
         self.history_images.retain(|sp| sp.start < pos);
     }
     /// CROW_ROUTE_DUMP=1: the routed expert ids per token per layer
-    pub fn route_log(&self) -> &[Vec<[i32; 10]>] { &self.route_log }
+    pub fn route_log(&self) -> &[Vec<Vec<i32>>] { &self.route_log }
     /// the context length the three states were allocated for
     pub fn n_ctx(&self) -> usize { self.st.context }
     /// rows of the QSA raw-key ring
@@ -3136,7 +3136,7 @@ impl Engine {
         // the routing decode sees). Measurement only: it syncs the device per
         // layer, and unset it costs one env lookup per chunk-layer.
         if t > 1 {
-            route_dump_prefill(l, t, s.rids);
+            route_dump_prefill(l, t, self.d.topk, s.rids);
         }
         // cold staging (decode-sized batches): coalesced PCIe pull into VRAM
         // slots + rewritten combo pointers; prefill chunks stay zero-copy
@@ -3726,23 +3726,24 @@ impl Engine {
         cuda::to_i32_into(p.init, &[i32::from(init)]);
         cuda::to_i32_into(p.pos_base, &[pos_base as i32]);
         // rope base for pooled blocks = BLOCK index base (kernel multiplies by 4)
-        if rows { cuda::to_i32_into(p.pos_base_b4, &[(pos_base / 4) as i32]); }
+        let qc = self.d.qsa_compress;
+        if rows { cuda::to_i32_into(p.pos_base_b4, &[(pos_base / qc) as i32]); }
         cuda::to_i32_into(p.slot_base, &[pos_base as i32]);
         if rows {
             let ncb: Vec<i32> = (0..t)
-                .map(|i| ((pos_base + i + 1) / 4).min((self.st.context + 3) / 4) as i32)
+                .map(|i| ((pos_base + i + 1) / qc).min(self.st.context.div_ceil(qc)) as i32)
                 .collect();
             cuda::to_i32_into(p.ncb, &ncb);
             let posrows: Vec<i32> = (0..t).map(|i| (pos_base + i) as i32).collect();
             cuda::to_i32_into(p.pos_row, &posrows);
         }
         if counts {
-            cuda::to_i32_into(p.nt_low, &[((t * LOWRANK) as i32)]);
-            cuda::to_i32_into(p.nt_hct, &[((t * HCT) as i32)]);
-            cuda::to_i32_into(p.nt_hc, &[((t * HCN) as i32)]);
-            cuda::to_i32_into(p.nt_6144, &[((t * GDN_VAL) as i32)]);
-            cuda::to_i32_into(p.nt_combo, &[((t * TOPK * INTER) as i32)]);
-            cuda::to_i32_into(self.pf_ncombo, &[(t * TOPK) as i32]);
+            cuda::to_i32_into(p.nt_low, &[((t * self.d.lowrank) as i32)]);
+            cuda::to_i32_into(p.nt_hct, &[((t * self.d.hct) as i32)]);
+            cuda::to_i32_into(p.nt_hc, &[((t * self.d.hcn) as i32)]);
+            cuda::to_i32_into(p.nt_6144, &[((t * self.d.gdn_val) as i32)]);
+            cuda::to_i32_into(p.nt_combo, &[((t * self.d.topk * self.d.inter) as i32)]);
+            cuda::to_i32_into(self.pf_ncombo, &[(t * self.d.topk) as i32]);
         }
     }
 
@@ -3759,31 +3760,31 @@ impl Engine {
         };
         self.hc_run(&self.w.hc[l], self.s.h, t, self.s.mixed, self.s.injw);
         cuda::sync();
-        dump(dir, "mixed-a", &cuda::dtoh(self.s.mixed, t * H));
+        dump(dir, "mixed-a", &cuda::dtoh(self.s.mixed, t * self.d.h));
         if dbg_hc() {
-            dump(dir, "hc-normed-a", &cuda::dtoh(self.s.normed, t * HCT));
-            dump(dir, "hc-low", &cuda::dtoh(self.s.low, t * LOWRANK));
-            dump(dir, "hc-sil", &cuda::dtoh(self.s.sil, t * LOWRANK));
-            dump(dir, "hc-mixw-a", &cuda::dtoh(self.s.mixw, t * HCT));
-            dump(dir, "hc-injw-a", &cuda::dtoh(self.s.injw, t * HCN));
+            dump(dir, "hc-normed-a", &cuda::dtoh(self.s.normed, t * self.d.hct));
+            dump(dir, "hc-low", &cuda::dtoh(self.s.low, t * self.d.lowrank));
+            dump(dir, "hc-sil", &cuda::dtoh(self.s.sil, t * self.d.lowrank));
+            dump(dir, "hc-mixw-a", &cuda::dtoh(self.s.mixw, t * self.d.hct));
+            dump(dir, "hc-injw-a", &cuda::dtoh(self.s.injw, t * self.d.hcn));
         }
         let sub = self.gdn_prompt(l, self.s.mixed, t, true);
         cuda::sync();
-        dump(dir, "gdn-out", &cuda::dtoh(sub, t * H));
-        launch_v(self.k.f("inject_residual"), 4, (t * 10) as u32, 1, 256, &[
+        dump(dir, "gdn-out", &cuda::dtoh(sub, t * self.d.h));
+        launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (t * (self.d.h / 256)) as u32, 1, 256, &[
             self.s.h as u64, sub as u64, self.s.injw as u64, self.s.x1 as u64]);
         cuda::sync();
-        dump(dir, "x1", &cuda::dtoh(self.s.x1, t * HCT));
+        dump(dir, "x1", &cuda::dtoh(self.s.x1, t * self.d.hct));
         self.hc_run(&self.w.hc2[l], self.s.x1, t, self.s.mixed_m, self.s.injw);
         cuda::sync();
-        dump(dir, "mixed-m", &cuda::dtoh(self.s.mixed_m, t * H));
+        dump(dir, "mixed-m", &cuda::dtoh(self.s.mixed_m, t * self.d.h));
         let moe = self.moe_run(l, self.s.mixed_m, t);
         cuda::sync();
-        dump(dir, "moe", &cuda::dtoh(moe, t * H));
-        launch_v(self.k.f("inject_residual"), 4, (t * 10) as u32, 1, 256, &[
+        dump(dir, "moe", &cuda::dtoh(moe, t * self.d.h));
+        launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (t * (self.d.h / 256)) as u32, 1, 256, &[
             self.s.x1 as u64, moe as u64, self.s.injw as u64, self.s.h as u64]);
         cuda::sync();
-        cuda::dtoh(self.s.h, t * HCT)
+        cuda::dtoh(self.s.h, t * self.d.hct)
     }
 
     /// DEBUG/layercheck helper: run ONLY the attention sub-block of layer `l`
@@ -3808,14 +3809,14 @@ impl Engine {
     /// power-of-two pre-scale the fused `mix_streams_q` cannot), so the
     /// sub-block is fed what the default production path feeds it.
     pub unsafe fn run_attn_subblock(&mut self, l: usize, x_host: &[f32], t: usize, pos_base: usize) -> Vec<f32> {
-        assert!(is_attn(l), "layer {l} is not an attention layer");
-        assert_eq!(x_host.len(), t * H, "attn subblock input must be [T][H]");
+        assert!(self.d.is_attn(l), "layer {l} is not an attention layer");
+        assert_eq!(x_host.len(), t * self.d.h, "attn subblock input must be [T][H]");
         cuda::to_f32_into(self.s.mixed, x_host);
         self.upload_chunk_scalars(t, pos_base, true, ScalarSet::Rows);
         quant_x_now(&self.k, &self.p, t as u32, self.s.mixed, self.s.xq_m, self.p.n2560, self.p.n2560);
         self.attn_prompt(l, self.s.mixed, t, pos_base);
         cuda::sync();
-        let out = cuda::dtoh(self.s.ay, t * H);
+        let out = cuda::dtoh(self.s.ay, t * self.d.h);
         // the failure mode of #69 read as a measurement: say it out loud here too,
         // where the sub-block is run by hand (`decode selftest` fails on it).
         if out.iter().all(|&v| v == 0.0) {
@@ -3870,9 +3871,10 @@ impl Engine {
                 let pre: Vec<i64> = {
                     let mut v: Vec<i64> = Vec::new();
                     let full: Vec<i64> = self.history.iter().copied().chain(chunk.iter().copied()).collect();
-                    for k in 0..2 {
-                        let idx = full.len() as i64 - 2 + k;
-                        v.push(if idx >= 0 { full[idx as usize] } else { PLE_EOS });
+                    let ctx = self.d.ple_ctx;
+                    for k in 0..ctx {
+                        let idx = full.len() as i64 - ctx as i64 + k as i64;
+                        v.push(if idx >= 0 { full[idx as usize] } else { self.d.ple_eos });
                     }
                     v
                 };
@@ -3891,7 +3893,7 @@ impl Engine {
             // (never-read) image_pad embed row — the oracle splices
             // inputs_embeds[mask] = image_features at exactly these rows.
             let plan_rows = self.vit_plan.as_ref().map(|pl| pl.map.len()).unwrap_or(0);
-            let mut h_host = vec![0f32; t * HCT];
+            let mut h_host = vec![0f32; t * self.d.hct];
             for (i, &id) in chunk.iter().enumerate() {
                 let prompt_row = pos_base + i;
                 let vit_row = if prompt_row < plan_rows {
@@ -3901,14 +3903,14 @@ impl Engine {
                 };
                 if vit_row >= 0 {
                     let emb = self.vit_plan.as_ref().unwrap().embeds_host.as_slice();
-                    let row = &emb[vit_row as usize * H..(vit_row as usize + 1) * H];
+                    let row = &emb[vit_row as usize * self.d.h..(vit_row as usize + 1) * self.d.h];
                     for g in 0..HCN {
-                        h_host[i * HCT + g * H..i * HCT + (g + 1) * H].copy_from_slice(row);
+                        h_host[i * self.d.hct + g * self.d.h..i * self.d.hct + (g + 1) * self.d.h].copy_from_slice(row);
                     }
                 } else {
-                    let row = &self.w.embed_host[id as usize * H..(id as usize + 1) * H];
+                    let row = &self.w.embed_host[id as usize * self.d.h..(id as usize + 1) * self.d.h];
                     for g in 0..HCN {
-                        for (dst, &b) in h_host[i * HCT + g * H..i * HCT + (g + 1) * H].iter_mut().zip(row) {
+                        for (dst, &b) in h_host[i * self.d.hct + g * self.d.h..i * self.d.hct + (g + 1) * self.d.h].iter_mut().zip(row) {
                             *dst = f32::from_bits((b as u32) << 16);
                         }
                     }
@@ -3918,7 +3920,7 @@ impl Engine {
 
             // copy-engine prefetch of the cold tier, two layers ahead (grouped
             // prefill path only; decode-sized chunks use the staged path)
-            let dma = self.pf_ring_gu[0] != 0 && mma_on() && pf_gemm_on() && !(stage_on() && t * TOPK <= self.stage.max);
+            let dma = self.pf_ring_gu[0] != 0 && mma_on() && pf_gemm_on() && !(stage_on() && t * self.d.topk <= self.stage.max);
             self.pf_dma_live.set(dma);
             if dma {
                 self.pf_issue(0);
@@ -3928,24 +3930,25 @@ impl Engine {
             for l in 0..LAYERS {
                 if dbg_nan() && l <= 3 {
                     cuda::sync();
-                    let hst = cuda::dtoh(self.s.h, t * HCT);
+                    let hst = cuda::dtoh(self.s.h, t * self.d.hct);
                     let ni = hst.iter().filter(|x| x.is_infinite()).count();
                     let nn = hst.iter().filter(|x| x.is_nan()).count();
                     let mx = hst.iter().filter(|x| x.is_finite()).fold(0f32, |a, &b| a.max(b.abs()));
                     tracing::info!(target: "nanwatch", "[nanwatch] layer {l} ENTRY: nan={nn} inf={ni} max_abs={mx:.3e}");
                 }
-                if l == PLE_LAYER && self.cfg.ple {
+                if l == self.d.ple_layer && self.cfg.ple {
                     // reference: hidden += ple(hidden, input_ids) at the TOP
                     // of layer 1's forward — host index math, spec 3.5
-                    let prefix: Vec<i64> = if pos_base >= 2 {
-                        self.history[pos_base - 2..pos_base].to_vec()
+                    let ctx = self.d.ple_ctx;
+                    let prefix: Vec<i64> = if pos_base >= ctx {
+                        self.history[pos_base - ctx..pos_base].to_vec()
                     } else {
-                        vec![PLE_EOS; 2 - pos_base]
+                        vec![self.d.ple_eos; ctx - pos_base]
                     };
                     self.ple_run(cnq, t, &prefix, chunk, false);
                     if dbg_nan() {
                         cuda::sync();
-                        let hst = cuda::dtoh(self.s.h, t * HCT);
+                        let hst = cuda::dtoh(self.s.h, t * self.d.hct);
                         let nn = hst.iter().filter(|x| x.is_nan()).count();
                         let ni = hst.iter().filter(|x| x.is_infinite()).count();
                         tracing::info!(target: "nanwatch", "[nanwatch] layer 1 AFTER PLE: nan={nn} inf={ni}");
@@ -3966,28 +3969,28 @@ impl Engine {
                         cuda::write_le(&format!("{dir}/l0-{tag}.f32"), &v).unwrap();
                     } }
                 };
-                dump0("mixed", mixed, t * H);
-                dump0("injw", injw, t * HCN);
+                dump0("mixed", mixed, t * self.d.h);
+                dump0("injw", injw, t * self.d.hcn);
                 let sub = match &self.w.sub[l] {
                     SubW::Gdn { .. } => self.gdn_prompt(l, mixed, t, first && start == 0),
                     SubW::Attn { .. } => self.attn_prompt(l, mixed, t, pos_base),
                 };
-                dump0("sub", sub, t * H);
-                dump0("gdn-mq", self.s.mq, t * GDN_CONV);
-                dump0("gdn-gq", self.s.gq, t * GDN_KEY);
-                dump0("gdn-gv", self.s.gv, t * GDN_VAL);
-                dump0("gdn-gz", self.s.gz, t * GDN_VAL);
+                dump0("sub", sub, t * self.d.h);
+                dump0("gdn-mq", self.s.mq, t * self.d.gdn_conv);
+                dump0("gdn-gq", self.s.gq, t * self.d.gdn_key);
+                dump0("gdn-gv", self.s.gv, t * self.d.gdn_val);
+                dump0("gdn-gz", self.s.gz, t * self.d.gdn_val);
                 dump0("gdn-gb", self.s.gb, t * 48);
                 dump0("gdn-ga", self.s.ga, t * 48);
-                dump0("gdn-core", self.s.gcore, t * GDN_VAL);
-                dump0("gdn-norm", self.s.gnorm, t * GDN_VAL);
+                dump0("gdn-core", self.s.gcore, t * self.d.gdn_val);
+                dump0("gdn-norm", self.s.gnorm, t * self.d.gdn_val);
                 if dbg {
                     cuda::sync();
                     tracing::info!(target: "prefill", "[prefill layer {l}] done");
                 }
                 if nan_watch {
                     cuda::sync();
-                    let hst = cuda::dtoh(self.s.h, t * HCT);
+                    let hst = cuda::dtoh(self.s.h, t * self.d.hct);
                     let (mut nn, mut ni, mut mx) = (0usize, 0usize, 0f32);
                     let mut first_nan = 0usize;
                     let mut first_inf = 0usize;
@@ -4003,32 +4006,32 @@ impl Engine {
                         if v.is_finite() { mx = mx.max(v.abs()); }
                     }
                     if nn > 0 || ni > 0 {
-                        let row = first_nan / HCT;
-                        let rest = first_nan % HCT;
-                        let stream = rest / H;
-                        let irow = first_inf / HCT;
+                        let row = first_nan / self.d.hct;
+                        let rest = first_nan % self.d.hct;
+                        let stream = rest / self.d.h;
+                        let irow = first_inf / self.d.hct;
                         tracing::info!(target: "nanwatch", "[nanwatch] after layer {l}: nan={nn} inf={ni} max_abs={mx:.3e} first_nan idx={first_nan} (row {row}, stream {stream}) first_inf row {irow}");
                     } else {
                         tracing::info!(target: "nanwatch", "[nanwatch] after layer {l}: nan=0 inf=0 max_abs={mx:.3e}");
                     }
                 }
                 // x1 = h + sub ⊗ injw
-                launch_v(self.k.f("inject_residual"), 4, (t * 10) as u32, 1, 256, &[
+                launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (t * (self.d.h / 256)) as u32, 1, 256, &[
                     self.s.h as u64, sub as u64, self.s.injw as u64, self.s.x1 as u64]);
                 if nan_watch && l == 0 {
                     cuda::sync();
-                    let v = cuda::dtoh(self.s.x1, t * HCT);
+                    let v = cuda::dtoh(self.s.x1, t * self.d.hct);
                     let rowmax = |r: usize, w: usize| v[r * w..(r + 1) * w].iter().fold(0f32, |a, &b| a.max(b.abs()));
                     tracing::info!(target: "nanwatch", "[nanwatch] l0 x1: nan={} inf={} rowmax4={:.3e} rowmax7={:.3e}",
                         v.iter().filter(|x| x.is_nan()).count(),
                         v.iter().filter(|x| x.is_infinite()).count(),
-                        rowmax(4, HCT), rowmax(7, HCT));
+                        rowmax(4, self.d.hct), rowmax(7, self.d.hct));
                 }
                 self.hc_run(&self.w.hc2[l], self.s.x1, t, self.s.mixed_m, self.s.injw);
                 if nan_watch && l == 0 {
                     cuda::sync();
-                    let v = cuda::dtoh(self.s.mixed_m, t * H);
-                    let rowmax = |r: usize| v[r * H..(r + 1) * H].iter().fold(0f32, |a, &b| a.max(b.abs()));
+                    let v = cuda::dtoh(self.s.mixed_m, t * self.d.h);
+                    let rowmax = |r: usize| v[r * self.d.h..(r + 1) * self.d.h].iter().fold(0f32, |a, &b| a.max(b.abs()));
                     tracing::info!(target: "nanwatch", "[nanwatch] l0 mixed_m: nan={} inf={} max0={:.3e} max4={:.3e} max7={:.3e}",
                         v.iter().filter(|x| x.is_nan()).count(),
                         v.iter().filter(|x| x.is_infinite()).count(),
@@ -4037,13 +4040,13 @@ impl Engine {
                 if dma {
                     cuda::stream_wait_event(cuda::cur_stream(), self.pf_ev_filled[l % 2]);
                 }
-                dump0("moe-mixed_m", self.s.mixed_m, t * H);
+                dump0("moe-mixed_m", self.s.mixed_m, t * self.d.h);
                 let moe = self.moe_run(l, self.s.mixed_m, t);
-                dump0("moe-rlog", self.s.rlog, t * E);
-                dump0("moe-rwts", self.s.rwts, t * TOPK);
-                dump0("moe-h1", self.s.h1, t * TOPK * 2 * INTER);
-                dump0("moe-eo", self.s.eo, t * TOPK * H);
-                dump0("moe-out", moe, t * H);
+                dump0("moe-rlog", self.s.rlog, t * self.d.e);
+                dump0("moe-rwts", self.s.rwts, t * self.d.topk);
+                dump0("moe-h1", self.s.h1, t * self.d.topk * 2 * self.d.inter);
+                dump0("moe-eo", self.s.eo, t * self.d.topk * self.d.h);
+                dump0("moe-out", moe, t * self.d.h);
                 if l == 0 { if let Some(dir) = dump_h() {
                     // grouped-GEMM plan of layer 0: perm [t*10] i32, tiles [n_tiles] int4, rids [t*10]
                     cuda::sync();
@@ -4051,34 +4054,34 @@ impl Engine {
                         cuda::write_le(&format!("{dir}/l0-{tag}.i32"), &v).unwrap();
                     };
                     let nt = cuda::dtoh_i32(self.stage.n_tiles, 1)[0] as usize;
-                    wr("moe-perm", cuda::dtoh_i32(self.stage.perm, t * TOPK));
+                    wr("moe-perm", cuda::dtoh_i32(self.stage.perm, t * self.d.topk));
                     wr("moe-tiles", cuda::dtoh_i32(self.stage.tiles, nt * 4));
-                    wr("moe-rids", cuda::dtoh_i32(self.s.rids, t * TOPK));
+                    wr("moe-rids", cuda::dtoh_i32(self.s.rids, t * self.d.topk));
                 } }
                 if dma {
                     cuda::event_record(self.pf_ev_done[l % 2], cuda::cur_stream());
-                    if l + 2 < LAYERS {
+                    if l + 2 < self.d.layers {
                         self.pf_issue(l + 2);
                     }
                 }
                 if nan_watch && l == 0 {
                     cuda::sync();
-                    let v = cuda::dtoh(self.s.moe_out, t * H);
+                    let v = cuda::dtoh(self.s.moe_out, t * self.d.h);
                     tracing::info!(target: "nanwatch", "[nanwatch] l0 moe_out: nan={} inf={}",
                         v.iter().filter(|x| x.is_nan()).count(),
                         v.iter().filter(|x| x.is_infinite()).count());
                 }
-                launch_v(self.k.f("inject_residual"), 4, (t * 10) as u32, 1, 256, &[
+                launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (t * (self.d.h / 256)) as u32, 1, 256, &[
                     self.s.x1 as u64, moe as u64, self.s.injw as u64, self.s.h as u64]);
                 // CROW_DUMP_H=<dir>: per-layer residual-stream dump (determinism bisect)
                 if let Some(dir) = dump_h() {
                     cuda::sync();
-                    let v = cuda::dtoh(self.s.h, t * HCT);
+                    let v = cuda::dtoh(self.s.h, t * self.d.hct);
                     cuda::write_le(&format!("{dir}/h-chunk{start}-layer{l:02}.f32"), &v).unwrap();
                 }
             }
             self.pf_dma_live.set(false);
-            self.done_blocks = (pos_base + t) / 4;
+            self.done_blocks = (pos_base + t) / self.d.qsa_compress;
             self.pos = pos_base + t;
             self.history.extend_from_slice(chunk);
             start += t;
@@ -4115,7 +4118,7 @@ impl Engine {
                     launch_v(self.k.f("argmax_k"), 1, 1, 1, 1024, &[
                         self.s.logits as u64, self.s.argmax as u64, self.p.n_vocab as u64]);
                     cuda::sync();
-                    let lg = cuda::dtoh(self.s.logits, V);
+                    let lg = cuda::dtoh(self.s.logits, self.d.v);
                     out.push(lg);
                 }
             }
@@ -4144,13 +4147,14 @@ impl Engine {
             cuda::set_stream(self.cap_stream);
         }
 
-        let bb_if_complete = if (pos + 1) % 4 == 0 { (pos + 1) / 4 - 1 } else { 0 };
-        let ncb1 = (((pos + 1) / 4).min((self.st.context + 3) / 4)) as i32;
+        let qc = self.d.qsa_compress;
+        let bb_if_complete = if (pos + 1) % qc == 0 { (pos + 1) / qc - 1 } else { 0 };
+        let ncb1 = (((pos + 1) / qc).min(self.st.context.div_ceil(qc))) as i32;
         // QSA block bookkeeping for this token: a block completes when
         // (pos+1) % 4 == 0; otherwise block_base names the NEXT (incomplete)
         // block = done_blocks, which the selector never scans (ncb = done_blocks)
-        let complete = (pos + 1) % 4 == 0;
-        let blk_base = if complete { (pos + 1) / 4 - 1 } else { self.done_blocks };
+        let complete = (pos + 1) % qc == 0;
+        let blk_base = if complete { (pos + 1) / qc - 1 } else { self.done_blocks };
         let gdbg = graph && std::env::var("CROW_GRAPH_DBG").is_ok();
         let route_dump = std::env::var("CROW_ROUTE_DUMP").is_ok();
         if graph {
@@ -4165,10 +4169,10 @@ impl Engine {
             *sb.add(4) = pos as i32;
             *sb.add(6) = ncb1;
             *sb.add(7) = pos as i32;
-            *sb.add(8) = LOWRANK as i32;
-            *sb.add(9) = HCT as i32;
-            *sb.add(10) = HCN as i32;
-            *sb.add(11) = (TOPK * INTER) as i32;
+            *sb.add(8) = self.d.lowrank as i32;
+            *sb.add(9) = self.d.hct as i32;
+            *sb.add(10) = self.d.hcn as i32;
+            *sb.add(11) = (self.d.topk * self.d.inter) as i32;
             *sb.add(12) = blk_base as i32;
             *sb.add(13) = if complete { 1 } else { 0 };
             for (dev, off) in [
@@ -4190,10 +4194,10 @@ impl Engine {
             cuda::to_i32_into(p.slot1, &[pos as i32]);
             cuda::to_i32_into(p.ncb1, &[ncb1]);
             cuda::to_i32_into(p.pos_row1, &[pos as i32]);
-            cuda::to_i32_into(p.nt_low, &[LOWRANK as i32]);
-            cuda::to_i32_into(p.nt_hct, &[HCT as i32]);
-            cuda::to_i32_into(p.nt_hc, &[HCN as i32]);
-            cuda::to_i32_into(p.nt_combo, &[(TOPK * INTER) as i32]);
+            cuda::to_i32_into(p.nt_low, &[self.d.lowrank as i32]);
+            cuda::to_i32_into(p.nt_hct, &[self.d.hct as i32]);
+            cuda::to_i32_into(p.nt_hc, &[self.d.hcn as i32]);
+            cuda::to_i32_into(p.nt_combo, &[(self.d.topk * self.d.inter) as i32]);
             if prof {
                 prof::add(&prof::SCALAR, t0.elapsed().as_micros() as u64);
             }
@@ -4202,9 +4206,9 @@ impl Engine {
         // embedding row → [1][10240]; the staging buffer is engine-owned so
         // the async HtoD source outlives the call (graph-mode requirement)
         let t_emb = std::time::Instant::now();
-        let row = &self.w.embed_host[id as usize * H..(id as usize + 1) * H];
+        let row = &self.w.embed_host[id as usize * self.d.h..(id as usize + 1) * self.d.h];
         for g in 0..HCN {
-            for (dst, &b) in self.embed_buf[g * H..(g + 1) * H].iter_mut().zip(row) {
+            for (dst, &b) in self.embed_buf[g * self.d.h..(g + 1) * self.d.h].iter_mut().zip(row) {
                 *dst = f32::from_bits((b as u32) << 16);
             }
         }
@@ -4218,10 +4222,11 @@ impl Engine {
         // run at PLE_LAYER inside the layer loop (#11, 2026-09-05)
         if self.cfg.ple {
             let t_ple = std::time::Instant::now();
-            let prefix: Vec<i64> = if pos >= 2 {
-                self.history[pos - 2..pos].to_vec()
+            let ctx = self.d.ple_ctx;
+            let prefix: Vec<i64> = if pos >= ctx {
+                self.history[pos - ctx..pos].to_vec()
             } else {
-                vec![PLE_EOS; 2 - pos]
+                vec![self.d.ple_eos; ctx - pos]
             };
             self.ple_run(cnq, 1, &prefix, &[id], true);
             if prof {
@@ -4248,7 +4253,7 @@ impl Engine {
         let mut t_head = t_layer;
         if !replay {
         for l in 0..LAYERS {
-            if l == PLE_LAYER && self.cfg.ple {
+            if l == self.d.ple_layer && self.cfg.ple {
                 // reference order: hidden += ple(hidden, ids) at the top of layer 1
                 self.ple_step_kernels();
             }
@@ -4260,7 +4265,7 @@ impl Engine {
             }
             if nan_watch && l >= 11 && l <= 31 {
                 cuda::sync();
-                let v = cuda::dtoh(self.s.mixed, H);
+                let v = cuda::dtoh(self.s.mixed, self.d.h);
                 tracing::info!(target: "nanwatch", "[nanwatch-decode] l{l} mixed: nan={} inf={}",
                     v.iter().filter(|x| x.is_nan()).count(),
                     v.iter().filter(|x| x.is_infinite()).count());
@@ -4280,7 +4285,7 @@ impl Engine {
                     prof::add(&prof::SUB_ATTN, d_sub);
                 }
             }
-            launch_v(self.k.f("inject_residual"), 4, 10, 1, 256, &[
+            launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (self.d.h / 256) as u32, 1, 256, &[
                 self.s.h as u64, sub as u64, self.s.injw as u64, self.s.x1 as u64]);
             self.hc_run(&self.w.hc2[l], self.s.x1, 1, self.s.mixed_m, self.s.injw);
             let t_moe = std::time::Instant::now();
@@ -4290,13 +4295,11 @@ impl Engine {
             }
             if !graph && route_dump {
                 cuda::sync();
-                let ids = cuda::dtoh_i32(self.s.rids, TOPK);
-                let mut a = [0i32; 10];
-                a.copy_from_slice(&ids[..10]);
-                if l == 0 { self.route_log.push(Vec::with_capacity(LAYERS)); }
-                self.route_log.last_mut().unwrap().push(a);
+                let ids = cuda::dtoh_i32(self.s.rids, self.d.topk);
+                if l == 0 { self.route_log.push(Vec::with_capacity(self.d.layers)); }
+                self.route_log.last_mut().unwrap().push(ids);
             }
-            launch_v(self.k.f("inject_residual"), 4, 10, 1, 256, &[
+            launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (self.d.h / 256) as u32, 1, 256, &[
                 self.s.x1 as u64, moe as u64, self.s.injw as u64, self.s.h as u64]);
         }
         t_head = std::time::Instant::now();
@@ -4355,7 +4358,7 @@ impl Engine {
         self.pos = pos + 1;
         self.history.push(id);
         if complete {
-            self.done_blocks = (pos + 1) / 4;
+            self.done_blocks = (pos + 1) / self.d.qsa_compress;
         }
         // #13: the decode-path forensics of requirement 4, TRACE only
         // (`CROW_LOG=info,decode=trace` asks for it; an operator never sees it).
@@ -4405,18 +4408,18 @@ impl Engine {
             // are zeroed, and the three uploads below are what makes them the
             // request's sampler - the path is byte-identical to the pre-#72 one.
             self.dev_sampler = Some(self.dev_sampler_hold.take().unwrap_or_else(|| DevSampler {
-                mask: cuda::alloc_zeroed(V),
+                mask: cuda::alloc_zeroed(self.d.v),
                 rng: cuda::alloc_zeroed(8),
                 params: cuda::alloc_zeroed(36),
                 cand_v: cuda::alloc_zeroed(SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
                 cand_i: cuda::alloc_zeroed(SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
-                counts: cuda::alloc_zeroed(2 * V),
+                counts: cuda::alloc_zeroed(2 * self.d.v),
                 ring: cuda::alloc_zeroed((2 + SAMPLE_RING_MAX) * 4),
                 in_graph: std::cell::Cell::new(false),
             }));
         }
         let ds = self.dev_sampler.as_ref().expect("enable_dev_sampler: just armed");
-        let zero = vec![0u8; V];
+        let zero = vec![0u8; self.d.v];
         cuda::upload_into(ds.mask, &zero);
         cuda::to_u64_into(ds.rng, &[s.rng.state()]);
         // the 36-byte params block of `sample_k`: {temp, top_p, presence,
@@ -4439,7 +4442,7 @@ impl Engine {
         // the mask: counts[V] u16 from the sampler's window counts, and the
         // ring {head, fill, ids} from its prompt-tail ids (oldest first).
         // A not-armed sampler uploads zeros - `sample_k` will not touch them.
-        let mut cb = vec![0u8; 2 * V];
+        let mut cb = vec![0u8; 2 * self.d.v];
         if s.win_armed() {
             for (tok, c) in s.win_counts_nonzero() {
                 cb[tok * 2..tok * 2 + 2].copy_from_slice(&c.to_le_bytes());
@@ -4516,7 +4519,7 @@ impl Engine {
         }
         let counts = self.drain_sel_counts();
         self.adapt_base = counts.concat();
-        self.adapt_ema = vec![0.0; LAYERS * E];
+        self.adapt_ema = vec![0.0; self.d.layers * self.d.e];
         let d = self.d;
         with_nblk(&d, |nblk_gu, nblk_dn| {
             let mut total = 0usize;
@@ -4572,7 +4575,7 @@ impl Engine {
 
     /// `plan_swaps` ranks by u64 counts: layer `l`'s decayed window, x1024
     fn window_layer(&self, l: usize) -> Vec<u64> {
-        self.adapt_ema[l * E..(l + 1) * E].iter().map(|v| (v * 1024.0) as u64).collect()
+        self.adapt_ema[l * self.d.e..(l + 1) * self.d.e].iter().map(|v| (v * 1024.0) as u64).collect()
     }
 
     pub unsafe fn adapt_tick(&mut self, max_swaps: usize) -> usize {
@@ -4790,8 +4793,8 @@ impl Engine {
     }
     /// drain per-expert selection counts (warm-up bookkeeping, [48][512])
     pub unsafe fn drain_sel_counts(&self) -> Vec<Vec<u64>> {
-        let raw = cuda::dtoh_u64(self.sel_counts, LAYERS * E);
-        (0..LAYERS).map(|l| raw[l * E..(l + 1) * E].to_vec()).collect()
+        let raw = cuda::dtoh_u64(self.sel_counts, self.d.layers * self.d.e);
+        (0..LAYERS).map(|l| raw[l * self.d.e..(l + 1) * self.d.e].to_vec()).collect()
     }
 }
 
@@ -5104,7 +5107,7 @@ mod tests_ple_row {
 
 /// One record per (chunk, layer): u32 layer, u32 t, then t * TOPK routed ids as
 /// u16 little-endian. Written only under `CROW_ROUTE_DUMP_PREFILL` (see `moe_run`).
-unsafe fn route_dump_prefill(l: usize, t: usize, rids: Dev) {
+unsafe fn route_dump_prefill(l: usize, t: usize, topk: usize, rids: Dev) {
     use std::io::Write;
     static SINK: std::sync::Mutex<Option<std::io::BufWriter<std::fs::File>>> =
         std::sync::Mutex::new(None);
@@ -5113,7 +5116,7 @@ unsafe fn route_dump_prefill(l: usize, t: usize, rids: Dev) {
         return;
     };
     cuda::sync();
-    let ids = cuda::dtoh_i32(rids as u64, t * TOPK);
+    let ids = cuda::dtoh_i32(rids as u64, t * topk);
     let mut sink = SINK.lock().unwrap();
     if sink.is_none() {
         let file = std::fs::File::create(path).expect("CROW_ROUTE_DUMP_PREFILL: cannot create the file");
