@@ -672,6 +672,9 @@ file, so the overlay would reach the hot experts only",
 
     /// control-plane drain (between tokens / chunks, never per layer)
     pub unsafe fn drain_counters(&self) -> Vec<[u64; 2]> {
+        if self.counters == 0 {
+            return vec![[0, 0]; self.layers]; // Crow #300 phase 2: no experts, no counters
+        }
         let raw = cuda::dtoh_u64(self.counters, self.layers * 2);
         (0..self.layers).map(|l| [raw[l * 2], raw[l * 2 + 1]]).collect()
     }
@@ -841,6 +844,37 @@ pub fn persist_sidecar(
         "sets": sets,
     });
     std::fs::write(path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+}
+
+impl Residency {
+    /// Crow #300 phase 2: the residency of a dense FFN, which has no experts: no hot
+    /// slabs, no cold tier, every device pointer 0 (`Drop` frees them as no-ops)
+    pub fn none(geo: &crate::geo::Geo) -> Residency {
+        Residency {
+            layers: geo.layers,
+            experts: 0,
+            n: 0,
+            stride: 0,
+            gu_bytes: 0,
+            dn_bytes: 0,
+            sets: Vec::new(),
+            spare_free: Vec::new(),
+            hot_gu: 0,
+            hot_dn: 0,
+            cold_gu: Vec::new(),
+            cold_dn: Vec::new(),
+            tables: 0,
+            bitmaps: 0,
+            counters: 0,
+            cold_index: Vec::new(),
+            source: "none (dense FFN)".to_string(),
+            gs_dev: 0,
+            lb: None,
+            bounce_gu: 0,
+            bounce_dn: 0,
+            full: false,
+        }
+    }
 }
 
 impl Drop for Residency {

@@ -5026,13 +5026,20 @@ pub struct KernelGeo {
     /// `RMSNormGated(activation=...)`); the attention output gate is sigmoid
     /// in every family and stays a literal
     pub gate_act: crate::geo::GateAct,
+    /// Crow #300 phase 2: append `kernels_p2::P2_SRC` (a family with a block
+    /// Flash-Next does not have: plain residual, full attention, dense FFN)
+    pub p2: bool,
 }
 
 impl KernelGeo {
     /// panics by name (the `Geo` accessors, "Crow #300 C5") on a family whose
     /// structure the engine does not build yet
     pub fn of(geo: &crate::geo::Geo) -> KernelGeo {
-        KernelGeo { d: geo.dims(), eps: geo.rms_eps as f32, gate_act: geo.gate_act }
+        let p2 = !matches!(
+            (geo.residual, geo.attn, geo.ffn),
+            (crate::geo::Residual::Hc { .. }, crate::geo::Attn::Qsa { .. }, crate::geo::Ffn::Moe { .. })
+        );
+        KernelGeo { d: geo.dims(), eps: geo.rms_eps as f32, gate_act: geo.gate_act, p2 }
     }
 
     pub fn flash_next() -> KernelGeo {
@@ -5043,6 +5050,12 @@ impl KernelGeo {
     pub fn defines(&self) -> Vec<(&'static str, String)> {
         let d = &self.d;
         let int = |v: usize| v.to_string();
+        // Crow #300 phase 2: a block the family does not have (no experts, no QSA
+        // indexer) is 0 in `Dims`; its kernels are still compiled (one KERNEL_SRC for
+        // every family) but never launched, and their shared arrays and divisors need
+        // a value > 0. Compile-only 1; on Flash-Next every such field is > 0, so its
+        // prelude is unchanged
+        let cpl = |v: usize| v.max(1).to_string();
         let f32_lit = |v: f32| {
             // shortest round-trip form, always with an exponent or a point
             let s = format!("{v:e}");
@@ -5052,9 +5065,9 @@ impl KernelGeo {
             ("CN_H", int(d.h)),
             ("CN_HCN", int(d.hcn)),
             ("CN_HCT", int(d.hct)),
-            ("CN_E", int(d.e)),
-            ("CN_TOPK", int(d.topk)),
-            ("CN_INTER", int(d.inter)),
+            ("CN_E", cpl(d.e)),
+            ("CN_TOPK", cpl(d.topk)),
+            ("CN_INTER", cpl(d.inter)),
             ("CN_GDN_KHEADS", int(d.gdn_kheads)),
             ("CN_GDN_VHEADS", int(d.gdn_vheads)),
             ("CN_GD", int(d.gd)),
@@ -5070,10 +5083,10 @@ impl KernelGeo {
             ("CN_CORE", int(d.core)),
             ("CN_ATTN_SCALE", f32_lit(1.0 / (d.ahd as f32).sqrt())),
             ("CN_ROPE_PAIRS", int(d.rope_pairs)),
-            ("CN_QSA_HEADS", int(d.qsa_heads)),
-            ("CN_QSA_HD", int(d.qsa_hd)),
-            ("CN_QSA_QK_ROWS", int(d.qsa_qk_rows)),
-            ("CN_QSA_SEL_MAX", int(d.qsa_sel_max)),
+            ("CN_QSA_HEADS", cpl(d.qsa_heads)),
+            ("CN_QSA_HD", cpl(d.qsa_hd)),
+            ("CN_QSA_QK_ROWS", cpl(d.qsa_qk_rows)),
+            ("CN_QSA_SEL_MAX", cpl(d.qsa_sel_max)),
             ("CN_EPS", f32_lit(self.eps)),
             (
                 "CN_GATE_ACT",
@@ -5094,9 +5107,14 @@ impl KernelGeo {
         s
     }
 
-    /// the text NVRTC compiles: the prelude, then `KERNEL_SRC`
+    /// the text NVRTC compiles: the prelude, then `KERNEL_SRC` (then, for a
+    /// phase 2 family, `kernels_p2::P2_SRC`; Flash-Next's text is unchanged)
     pub fn source(&self) -> String {
-        format!("{}{}", self.prelude(), KERNEL_SRC)
+        if self.p2 {
+            format!("{}{}{}", self.prelude(), KERNEL_SRC, crate::kernels_p2::P2_SRC)
+        } else {
+            format!("{}{}", self.prelude(), KERNEL_SRC)
+        }
     }
 }
 
@@ -5107,7 +5125,7 @@ pub struct Kernels {
 impl Kernels {
     /// Every kernel the host LAUNCHES, resolved once. KERNEL_SRC defines
     /// more (six of them have no launch site left); this list is the launched set.
-    pub unsafe fn new(module: &crate::cuda::Module) -> Kernels {
+    pub unsafe fn new(module: &crate::cuda::Module, p2: bool) -> Kernels {
         let names: &[&'static str] = &[
             "gemv_b", "gemv_fp4", "gemv_fp4_b", "gemv_fp4_bs", "gemv_fp4_ptrb", "gemv_bf16",
             "rms_group", "rmsnorm_1pw", "silu_div4",
@@ -5129,6 +5147,13 @@ impl Kernels {
         let mut map = HashMap::new();
         for n in names {
             map.insert(*n, module.get(n));
+        }
+        // Crow #300 phase 2: a family whose source carries `P2_SRC` resolves its entries
+        // too; `Module::get` of a missing entry fails, so the Flash-Next module is never asked
+        if p2 {
+            for n in crate::kernels_p2::P2_NAMES {
+                map.insert(*n, module.get(n));
+            }
         }
         // #96: arm the YaRN runtime attention scale. With no rope_scaling (the
         // checkpoint of record) nothing below runs — no upload, no substitution,

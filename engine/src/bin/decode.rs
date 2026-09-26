@@ -548,6 +548,70 @@ fn main() {
                     "layercheck3 stepwise: max_abs={s_max:.4} rel_L2={s_rel:.4} NaN={s_nan} (batched==stepped pin, p11/p12 pattern)"
                 );
             }
+            "p2golden" => {
+                // Crow #300 phase 2: the dense sub-blocks against the HF qwen3_5 goldens of
+                // `oracle/export_qwen35_goldens.py` (weights = this container dequantized, so
+                // the difference is engine math). Thresholds of record:
+                // decode_out/p2-golden/PREREG.md (2026-09-26, sha256 b547f8d6…): the engine may
+                // add at most 1/10 of the quantization mark `cnq_vs_bf16.rel_rms`; the norm
+                // (mark 0) 1e-5. Attention is judged under CROW_KV=bf16 only, FP8 is reported.
+                let dir = args.get(2).cloned().unwrap_or_else(|| "../oracle/golden/qwen35-27b".into());
+                let man: serde_json::Value = serde_json::from_slice(&std::fs::read(format!("{dir}/manifest.json")).unwrap()).unwrap();
+                let (tp, td) = (man["T_prompt"].as_u64().unwrap() as usize, man["D_decode"].as_u64().unwrap() as usize);
+                cfg.prompt_chunk = tp;
+                let mut eng = Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
+                let h = eng.geo.hidden;
+                let kv_bf16 = std::env::var("CROW_KV").as_deref() == Ok("bf16");
+                let read = |f: &str| -> Vec<f32> {
+                    std::fs::read(format!("{dir}/{f}")).unwrap().as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
+                };
+                let rel = |a: &[f32], b: &[f32]| -> (f64, f64) {
+                    let (mut e2, mut r2, mut mx) = (0f64, 0f64, 0f64);
+                    for (x, y) in a.iter().zip(b) {
+                        let d = (*x - *y) as f64;
+                        e2 += d * d;
+                        r2 += (*y as f64) * (*y as f64);
+                        mx = mx.max(d.abs());
+                    }
+                    ((e2 / r2.max(1e-30)).sqrt(), mx)
+                };
+                let mut fails = 0usize;
+                for (name, kind, layer, stepped, judged) in [
+                    ("l0-input-layernorm", "ln1", 0usize, false, true),
+                    ("l0-mlp", "mlp", 0, false, true),
+                    ("l0-gdn", "gdn", 0, true, true),
+                    ("l3-attn", "attn", 3, true, kv_bf16),
+                ] {
+                    let g = &man["goldens"][name];
+                    let mark = g["cnq_vs_bf16"]["rel_rms"].as_f64().unwrap();
+                    let thr = if mark == 0.0 { 1e-5 } else { mark / 10.0 };
+                    let x = read(g["files"]["input"].as_str().unwrap());
+                    let want = read(g["files"]["output_cnq"].as_str().unwrap());
+                    let rows = x.len() / h;
+                    let prompt = if stepped { tp } else { rows };
+                    let mut got = eng.run_subblock_p2(kind, layer, &x[..prompt * h], prompt, 0);
+                    if stepped {
+                        for r in tp..tp + td {
+                            got.extend(eng.run_subblock_p2(&format!("{kind}_step"), layer, &x[r * h..(r + 1) * h], 1, r));
+                        }
+                    }
+                    let mut groups = vec![("prompt", 0, prompt)];
+                    if stepped {
+                        groups.push(("decode", tp, tp + td));
+                    }
+                    for (gname, a, b) in groups {
+                        let (rr, mx) = rel(&got[a * h..b * h], &want[a * h..b * h]);
+                        let ok = rr <= thr;
+                        let verdict = if !judged { "reported (FP8 KV)" } else if ok { "PASS" } else { "FAIL" };
+                        if judged && !ok {
+                            fails += 1;
+                        }
+                        println!("p2golden {name:<20} {gname:<6} rows {a:>2}..{:<2} rel_rms {rr:.3e}  max_abs {mx:.3e}  threshold {thr:.2e} (quant mark {mark:.4})  {verdict}", b - 1);
+                    }
+                }
+                println!("p2golden: {} (KV {})", if fails == 0 { "ALL PASS" } else { "FAILED" }, if kv_bf16 { "bf16" } else { "fp8, attention not judged" });
+                selftest_failed = fails > 0;
+            }
             "selftest" => {
                 // F5 (#64, 2026-09-18): the PACKAGE self-test. The engine runs on the
                 // package alone — the container `CROW_CNQ` names, the hot-set manifest

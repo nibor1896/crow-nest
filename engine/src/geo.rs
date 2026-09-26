@@ -471,6 +471,8 @@ pub struct Dims {
     pub qsa_block_topk: usize,
     pub qsa_sel_max: usize,
     pub qsa_hidd: usize,
+    /// Crow #300 phase 2: the dense SwiGLU width (`Ffn::Dense`), 0 on a MoE family
+    pub dense_inter: usize,
 }
 
 impl Dims {
@@ -792,8 +794,30 @@ impl Geo {
     /// build yet (`Geo::built` refuses those at boot, before this runs). C5: a model
     /// without PLE gets zero PLE fields; every reader sits behind the PLE arm.
     pub const fn dims(&self) -> Dims {
-        let m = self.moe();
-        let q = self.qsa();
+        // Crow #300 phase 2: a block the family does not have reads as zeros in the
+        // flat view (no experts, no indexer, no mixer); no host site of that family
+        // computes with them, and `KernelGeo::defines` gives the kernels that are
+        // compiled but never launched a compile-only value
+        let m = match self.ffn {
+            Ffn::Moe { .. } => self.moe(),
+            Ffn::Dense { .. } => MoeGeo { experts: 0, topk: 0, expert_inter: 0, shared_inter: 0 },
+        };
+        let q = match self.attn {
+            Attn::Qsa { .. } => self.qsa(),
+            Attn::Full => QsaGeo { heads: 0, kv_heads: 0, head_dim: 0, compress: 0, block_topk: 0 },
+        };
+        let lowrank = match self.residual {
+            Residual::Hc { lowrank, .. } => lowrank,
+            Residual::Plain => 0,
+        };
+        let sel_max = match self.attn {
+            Attn::Qsa { .. } => q.sel_max(),
+            Attn::Full => 0,
+        };
+        let dense_inter = match self.ffn {
+            Ffn::Moe { .. } => 0,
+            Ffn::Dense { inter } => inter,
+        };
         // (layer, ngram, ctx, heads per ngram, nheads, emb dim, embed, eos)
         let p = match self.ple {
             Some(p) => (p.layer, p.ngram, p.ctx(), p.heads_per_ngram, p.nheads(), p.emb_dim(), p.embed, p.eos),
@@ -803,10 +827,11 @@ impl Geo {
             h: self.hidden,
             hcn: self.hc_streams(),
             hct: self.residual_width(),
-            lowrank: self.hc_lowrank(),
+            lowrank,
             e: m.experts,
             topk: m.topk,
             inter: m.expert_inter,
+            dense_inter,
             gdn_key: self.gdn_key(),
             gdn_val: self.gdn_val(),
             gdn_conv: self.gdn_conv(),
@@ -841,7 +866,7 @@ impl Geo {
             qsa_qk_rows: q.qk_rows(),
             qsa_compress: q.compress,
             qsa_block_topk: q.block_topk,
-            qsa_sel_max: q.sel_max(),
+            qsa_sel_max: sel_max,
             qsa_hidd: q.hidd(),
         }
     }
@@ -887,46 +912,35 @@ impl Geo {
     /// `boot::model_geo` calls it before the container is mapped and before the
     /// CUDA context exists; `Engine::load` calls it again before its first byte.
     ///
-    /// | block | built arm (Flash-Next) | not built yet (Qwen35Dense) |
+    /// | block | Flash-Next | Qwen35Dense (Crow #300 phase 2) |
     /// |---|---|---|
     /// | residual | `Residual::Hc` | `Residual::Plain` |
-    /// | PLE | `Some` (loaded, added at its layer) and `None` (skipped) | - |
+    /// | PLE | `Some` (loaded, added at its layer) | `None` (skipped) |
     /// | attention | `Attn::Qsa` | `Attn::Full` |
     /// | FFN | `Ffn::Moe` (hot sets, residency, expert slabs, cold staging) | `Ffn::Dense` |
     /// | final norm | `FinalNorm::HcMixer` | `FinalNorm::Rms` |
+    ///
+    /// Since phase 2 every arm of every block is built, so this returns `Ok` for every
+    /// `Geo`; a new enum variant must get its arm here (the matches are exhaustive), and
+    /// until its engine path exists it refuses with [`not_built`].
     pub fn built(&self) -> Result<(), String> {
         match self.residual {
-            Residual::Hc { .. } => {}
-            Residual::Plain => return Err(not_built(Block::RESIDUAL_PLAIN, self.family)),
+            Residual::Hc { .. } | Residual::Plain => {}
         }
         match self.ple {
             Some(_) | None => {}
         }
         match self.attn {
-            Attn::Qsa { .. } => {}
-            Attn::Full => return Err(not_built(Block::ATTN_FULL, self.family)),
+            Attn::Qsa { .. } | Attn::Full => {}
         }
         match self.ffn {
-            Ffn::Moe { .. } => {}
-            Ffn::Dense { .. } => return Err(not_built(Block::FFN_DENSE, self.family)),
+            Ffn::Moe { .. } | Ffn::Dense { .. } => {}
         }
         match self.final_norm {
-            FinalNorm::HcMixer => {}
-            FinalNorm::Rms => return Err(not_built(Block::FINAL_NORM_RMS, self.family)),
+            FinalNorm::HcMixer | FinalNorm::Rms => {}
         }
         Ok(())
     }
-}
-
-/// Crow #300 C5: the names of the family arms the engine has not built yet, as
-/// `not_built` prints them (one constant each, so a refusal is greppable)
-pub struct Block;
-
-impl Block {
-    pub const RESIDUAL_PLAIN: &'static str = "Residual::Plain (one pre-norm residual stream)";
-    pub const ATTN_FULL: &'static str = "Attn::Full (uncapped causal attention)";
-    pub const FFN_DENSE: &'static str = "Ffn::Dense (one SwiGLU per layer)";
-    pub const FINAL_NORM_RMS: &'static str = "FinalNorm::Rms (one RMSNorm before lm_head)";
 }
 
 /// Crow #300 C5: the refusal of an arm the engine has not built:
@@ -1025,15 +1039,18 @@ mod tests_300 {
         assert_eq!(g.fingerprint(), 0x7191_8a73_24c6_5fdd, "Geo::FLASH_NEXT fingerprint");
         assert_eq!(Family::from_code(g.family.code()), Some(Family::FlashNext));
         assert_eq!(Family::from_code(0), None);
-        // a family without the block refuses by name (a dense boot never gets here: it
-        // dies at `Geo::built` in the boot door, C5; the refusal is the guard behind it)
+        // a family without the block refuses the block's accessor by name; its flat
+        // `dims()` reads the missing blocks as zeros instead (Crow #300 phase 2: the
+        // dense engine computes with the Dims of a family that has none of them)
         let dense = Geo { residual: Residual::Plain, ffn: Ffn::Dense { inter: 17408 }, attn: Attn::Full, ple: None, ..g };
+        let dd = dense.dims();
+        assert_eq!((dd.e, dd.topk, dd.inter, dd.lowrank, dd.qsa_sel_max, dd.qsa_hidd, dd.dense_inter, dd.hcn, dd.hct), (0, 0, 0, 0, 0, 0, 17408, 1, g.hidden));
+        assert_eq!(g.dims().dense_inter, 0, "Flash-Next has no dense FFN");
         for (what, r) in [
             ("hc_lowrank", std::panic::catch_unwind(|| dense.hc_lowrank())),
             ("moe", std::panic::catch_unwind(|| dense.moe().experts)),
             ("qsa", std::panic::catch_unwind(|| dense.qsa().heads)),
             ("ple_geo", std::panic::catch_unwind(|| dense.ple_geo().layer)),
-            ("moe", std::panic::catch_unwind(|| dense.dims().e)),
         ] {
             let e = r.unwrap_err();
             let msg = e.downcast_ref::<&str>().copied().map(String::from).or_else(|| e.downcast_ref::<String>().cloned()).unwrap();
@@ -1066,18 +1083,18 @@ mod tests_300_c5 {
     /// C5: each unbuilt arm refuses by its own name, the first one in forward
     /// order wins, and building an arm moves the refusal to the next block
     #[test]
-    fn each_unbuilt_arm_refuses_by_name_in_forward_order() {
+    fn every_arm_is_built_and_the_refusal_still_names_its_block() {
         let g = Geo::FLASH_NEXT;
         let f = Family::Qwen35Dense;
         let dense = Geo { family: f, residual: Residual::Plain, attn: Attn::Full, ffn: Ffn::Dense { inter: 17408 }, ple: None, final_norm: FinalNorm::Rms, ..g };
-        let want = |b: &str| Err(format!("{b} for family Qwen35Dense not built yet (Crow #300 phase 2)"));
-        assert_eq!(dense.built(), want(Block::RESIDUAL_PLAIN));
-        assert_eq!(Geo { residual: g.residual, ..dense }.built(), want(Block::ATTN_FULL));
-        assert_eq!(Geo { residual: g.residual, attn: g.attn, ..dense }.built(), want(Block::FFN_DENSE));
-        assert_eq!(Geo { residual: g.residual, attn: g.attn, ffn: g.ffn, ..dense }.built(), want(Block::FINAL_NORM_RMS));
-        assert_eq!(Geo { residual: g.residual, attn: g.attn, ffn: g.ffn, final_norm: g.final_norm, ..dense }.built(), Ok(()));
-        let e = std::panic::catch_unwind(|| unbuilt_arm(Block::FFN_DENSE, f)).unwrap_err();
+        // phase 2: the dense arms and every mix of them with the Flash-Next ones pass
+        assert_eq!(dense.built(), Ok(()));
+        assert_eq!(Geo { residual: g.residual, ..dense }.built(), Ok(()));
+        assert_eq!(Geo { attn: g.attn, ffn: g.ffn, ..dense }.built(), Ok(()));
+        // the refusal a future unbuilt arm takes (`not_built`, `unbuilt_arm`) keeps its form
+        assert_eq!(not_built("X::Y (a block)", f), "X::Y (a block) for family Qwen35Dense not built yet (Crow #300 phase 2)");
+        let e = std::panic::catch_unwind(|| unbuilt_arm("X::Y (a block)", f)).unwrap_err();
         let msg = e.downcast_ref::<String>().cloned().unwrap();
-        assert!(msg.starts_with("Ffn::Dense (one SwiGLU per layer) for family Qwen35Dense not built yet (Crow #300 phase 2)"), "{msg}");
+        assert!(msg.starts_with("X::Y (a block) for family Qwen35Dense not built yet (Crow #300 phase 2)"), "{msg}");
     }
 }

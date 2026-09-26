@@ -1902,21 +1902,18 @@ mod tests {
     }
 
     /// C5: a dense checkpoint passes the metadata gate with its derived geometry
-    /// (the table the boot prints) and is refused at its first unbuilt block by
-    /// name (`Geo::built`, which `boot::model_geo` calls before the container
-    /// and the GPU)
+    /// (the table the boot prints) and the family check (`Geo::built`, which
+    /// `boot::model_geo` calls before the container and the GPU; Crow #300 phase 2
+    /// built the dense arms)
     #[test]
-    fn a_dense_checkpoint_passes_the_gate_and_refuses_at_its_first_unbuilt_block() {
+    fn a_dense_checkpoint_passes_the_gate_and_the_family_check() {
         let geo = verdict(&dense_meta()).unwrap();
         assert_eq!(geo, dense_fixture_geo());
         let table = geo_table(&geo);
         assert!(table.contains("[meta]   hidden               5120"), "{table}");
         assert!(table.contains("[meta]   ffn                  Dense { inter: 17408 }"), "{table}");
         assert_eq!(dense_meta().checks().len(), 20);
-        assert_eq!(
-            geo.built(),
-            Err("Residual::Plain (one pre-norm residual stream) for family Qwen35Dense not built yet (Crow #300 phase 2)".to_string())
-        );
+        assert_eq!(geo.built(), Ok(()));
         // the per-family floor: 100k (the 16 GB point of the phase 2 plan), Flash-Next keeps 200k
         assert_eq!((geo.context_floor, Geo::FLASH_NEXT.context_floor), (100_000, 200_000));
         // a doctored dense config is refused by the dense row, not by the pins

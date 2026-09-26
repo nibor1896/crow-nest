@@ -396,18 +396,16 @@ mod tests_300_c7 {
     }
 
     /// A dense index v2 container (the 27B's config, 27B-shaped tensors) passes the gate and
-    /// reaches `Geo::built`, which refuses it at its first unbuilt block, by name. `geo_for`
-    /// is the whole boot door and touches no CUDA.
+    /// `Geo::built` (Crow #300 phase 2 built its arms). `geo_for` is the whole boot door and
+    /// touches no CUDA.
     #[test]
-    fn a_dense_v2_container_reaches_geo_built_and_refuses_at_residual_plain() {
+    fn a_dense_v2_container_passes_the_boot_door() {
         let path = v2("dense", &read(DENSE, "config.json"), &read(DENSE, "generation_config.json"), "Qwen35Dense", "qwen3_5_text", &tensors(5120, 64));
         let peek = Cnq::peek_index(&path).unwrap();
         let (meta, geo) = meta::gate(&path, &peek, None).unwrap().unwrap();
         assert_eq!((meta.family, geo.hidden, geo.layers), (Family::Qwen35Dense, 5120, 64));
-        assert_eq!(
-            geo_for(&path, &peek, None).unwrap_err(),
-            "Residual::Plain (one pre-norm residual stream) for family Qwen35Dense not built yet (Crow #300 phase 2)"
-        );
+        let g = geo_for(&path, &peek, None).unwrap();
+        assert_eq!((g.family, g.residual, g.attn), (Family::Qwen35Dense, crate::geo::Residual::Plain, crate::geo::Attn::Full));
     }
 
     /// `CROW_MODEL_DIR` beside an index v2 container is a sha-checked cross-check: the same

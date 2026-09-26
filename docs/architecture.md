@@ -3965,7 +3965,7 @@ seed 1118, `reasoning_effort none`, card non-thinking row; main = an 8,640-token
 | output | the main turn's answer byte-identical with and without the side request, for a 2-token and a 32-token answer |
 | long side request | 12,087 tokens (longer than the held conversation): the snapshots are dropped, the old rule |
 
-## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18; 8.11 added 2026-09-26 with Crow #300 C1/C2, C4 kernel rule amended in 8.2, C5 family switches in 8.11)
+## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18; 8.11 added 2026-09-26 with Crow #300 C1/C2, C4 kernel rule amended in 8.2, C5 family switches in 8.11, 8.12 the dense path with Crow #300 phase 2)
 
 Sections 0 to 7 say what the engine must do. This section says how the crate is put together,
 so a reader who opens `engine/src` knows which file to open and what it may reach for. It was
@@ -4673,7 +4673,7 @@ refuses the parse by name.
 | family | `model_type` | residual | FFN | attention | PLE | gate act | final norm | boot |
 |---|---|---|---|---|---|---|---|---|
 | `FlashNext` | `qwen4_exp_text` | `Hc` (4 streams, low rank 320) | `Moe` (512 experts, top 10, 640, shared 640) | `Qsa` (4 heads, 1 kv, 128, ratio 4, 512 blocks) | layer 1 | sigmoid | `HcMixer` | runs; `Geo` must equal `Geo::FLASH_NEXT` |
-| `Qwen35Dense` | `qwen3_5_text` | `Plain` | `Dense` (17408) | `Full` (uncapped) | none | swish (= silu) | `Rms` | parsed, geometry printed, then refused at its first unbuilt block (C5): `Residual::Plain (one pre-norm residual stream) for family Qwen35Dense not built yet (Crow #300 phase 2)` |
+| `Qwen35Dense` | `qwen3_5_text` | `Plain` | `Dense` (17408) | `Full` (uncapped) | none | swish (= silu) | `Rms` | runs since phase 2 (8.12); until then it was refused at its first unbuilt block (C5) |
 
 **Expected values per family** (`meta::Expected`). The Flash-Next row is today's pins, read out of
 `geo` and `sample`, and gives the same 21 checks as before (the 20 of #94 phase 1 plus #96's
@@ -4866,7 +4866,9 @@ after C4c; each is a kernel-shape fact, not a literal a macro can replace):
 
 **C5: the family switches** (2026-09-26). The engine `match`es on the `Geo`'s family enums where
 it used to assume Flash-Next. Each Flash-Next arm is the code of record, moved verbatim; each
-dense arm is not built and refuses by name.
+dense arm was not built and refused by name until phase 2 built all four (8.12). `Geo::built`
+now returns `Ok` for every arm; `not_built` / `unbuilt_arm` stay as the form a future unbuilt
+arm refuses with, and the `geo::Block` names are gone with the arms they named.
 
 - **The refusal.** `Geo::built` (`geo.rs`) walks the blocks in forward order (the residual stream
   the embedding writes, then per layer the PLE add, the attention and the FFN, then the final
@@ -4988,10 +4990,52 @@ and hold every config against the container it is meant for.
   / `[stage]` / `meta:` line is identical (`decode_out/gate-c7` vs `gate-c5b`, host free RAM /
   VRAM masked).
 - **Phase 1 status.** One binary reads the model's shape from the container and refuses a
-  foreign config by name; Flash-Next is byte-identical at the gate values of record. The 27B does
-  not run: no 27B container exists yet, and a dense container stops at `Residual::Plain`, the
-  first arm phase 2 builds (`gen.rs`: the residual matches in the loader and in `prefill` /
-  `decode_step`; `geo.rs` `Geo::built`).
+  foreign config by name; Flash-Next is byte-identical at the gate values of record. At the end of
+  phase 1 the 27B did not run (no container, and a dense container stopped at `Residual::Plain`);
+  phase 2 built the dense arms, 8.12.
+
+### 8.12 The dense path (Crow #300 phase 2, 2026-09-26)
+
+The dense Qwen3.5/3.8 family (`Qwen35Dense`, the 27B) runs through the same `Engine`, `prefill`
+and `decode_step` as Flash-Next; each family arm of 8.11 now has a dense side. The forward pass is
+HF `modeling_qwen3_5.py` (transformers 5.16.1; the research with citations is a Crow #300
+comment): every norm but the GDN one is zero-centred `(1 + w)`, eps 1e-6, which `rms_group` and
+`rmsnorm_1pw` already compute; the attention is Flash-Next's without the QSA indexer; the GDN is
+Flash-Next's with the SiLU gate (`CN_GATE_ACT`, C4).
+
+| block | dense arm | code |
+|---|---|---|
+| residual | `Plain`: `rms_group` with one stream (grid (1, t)) into `mixed`, the sub-block, `h += sub` (`add_flat`); the same for the FFN | `Engine::rms_rows`, `residual_add`; `DenseW::ln1` / `ln2` |
+| attention | `Full`: q\|gate split, per-head q/k norms, partial RoPE, `store_kv` (unchanged kernels), then `attn_full_split`: rows `0..=pos` per query, online softmax over 64-row tiles, no row cap. Prefill S = 1 (one block per query row and head, normalized in place); decode S = `attn_splits()` + `attn_merge`, device scalars only, so the decode graph replays it | `attn_full_prompt`, `attn_full_step` |
+| FFN | `Dense`: gate and up GEMV, `silu_mul_n` (runtime width), down GEMV | `dense_ffn`; `MlpW` |
+| final norm | `Rms`: `rms_group` with `model.norm`, lm_head a `PW` (NVFP4 in the dense recipe) | `lm_head_row`; `DenseW::norm` / `lm_head` |
+| planner | no hot set: states + pending + `SAFETY` must fit the free VRAM, else a named refusal; the render reserve is granted from the rest | `manager::dense_fit` |
+| MoE machinery | `Residency::none`, `Stage::none`, no slabs, no sidecar; the adaptation entry points return at once | `residency.rs`, `gen.rs` |
+
+- **Kernels.** The two new kernels (`attn_full_split`, `silu_mul_n`) are in their own source,
+  `kernels_p2::P2_SRC`. A family that needs them compiles `prelude + KERNEL_SRC + P2_SRC`
+  (`KernelGeo::p2`); Flash-Next's text stays `prelude + KERNEL_SRC`, so its PTX of record (8.2,
+  C4) is untouched by construction. The fields of a block a family does not have are 0 in `Dims`;
+  `KernelGeo::defines` gives the kernels that are compiled but never launched a compile-only 1
+  (`CN_E`, `CN_TOPK`, `CN_INTER`, `CN_QSA_*`), which leaves Flash-Next's prelude unchanged.
+- **A latent C3 alias, fixed.** The GDN launches passed `p.n10240` as the conv channel count
+  (qkv rows, `transpose_rt`), and C3 had made `n10240` = `d.hct`, the residual width. On
+  Flash-Next both are 10240; on the 27B `hct` is 5120 and `gdn_conv` 10240. The GDN sites read
+  `p.n_gdn_conv` now.
+- **The vision tower.** The dense recipe writes none (the 27B reads images through the F16
+  projector, not built yet), so the loader only loads `vit` when the container carries it.
+- **Verified.** Sub-block goldens (`oracle/export_qwen35_goldens.py`: the HF modules on the
+  container's own dequantized weights, T = 40 prompt rows + 4 decode rows; `decode p2golden`;
+  thresholds in `decode_out/p2-golden/PREREG.md`), rel_rms engine vs golden with BF16 KV:
+  input norm 5.7e-8, MLP 1.9e-7, GDN 2.2e-6 / 2.8e-6 (prompt / decode), attention 2.0e-3 / 2.0e-3;
+  under FP8 KV the attention is 3.1e-2 / 3.2e-2. End to end (`decode parity` on a 63-token prompt
+  + 4 decode steps against `oracle/ref_qwen35_logits.py`, f32, same weights): argmax 67 / 67; with
+  FP8 KV mean KL 1.3e-4, max 1.5e-3, worst |Δlogit| 14.3 (one tail token); with BF16 KV mean KL
+  5.5e-7, max 4.6e-6, worst |Δlogit| 0.066.
+- **Not yet.** Every NVFP4 projection runs the plain GEMV (`gemv_fp4` / `gemv_fp4_b`): decode
+  3.8 tok/s, prefill 18 tok/s on the RTX 5090. `serve` is not wired for the family (the slot
+  file, the prefix-cache park and the lend listing read `Geo::qsa`). The F16 projector, the MTP
+  head and the per-card planner above the context floor are open.
 
 ## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
 

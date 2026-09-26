@@ -70,6 +70,28 @@ pub struct Weights {
     pub hc2: Vec<HcW>,
     pub sub: Vec<SubW>,
     pub moe: Vec<MoeW>,
+    /// Crow #300 phase 2: the plain-residual / dense-FFN / RMS-final-norm parts;
+    /// `None` on Flash-Next (whose head, hc and moe fields are the ones above)
+    pub dense: Option<DenseW>,
+}
+
+/// Crow #300 phase 2: one dense SwiGLU, `down(silu(gate(x)) * up(x))` (HF `Qwen3_5MLP`)
+pub struct MlpW {
+    pub gate: PW, // [I][H]
+    pub up: PW,   // [I][H]
+    pub down: PW, // [H][I]
+}
+
+/// Crow #300 phase 2: the weights of a family with a plain pre-norm residual, a dense
+/// FFN and one final RMSNorm (the dense Qwen3.5/3.8). Every norm here is zero-centred
+/// (HF `Qwen3_5RMSNorm`: `x * rsqrt(mean(x^2) + eps) * (1 + w)`), which is what
+/// `rms_group` computes, so the weights are loaded as stored.
+pub struct DenseW {
+    pub ln1: Vec<Dev>, // f32 [H] per layer: input_layernorm
+    pub ln2: Vec<Dev>, // f32 [H] per layer: post_attention_layernorm
+    pub mlp: Vec<MlpW>,
+    pub norm: Dev,     // f32 [H] model.norm
+    pub lm_head: PW,   // [V][H], NVFP4 in the dense recipe
 }
 
 /// Projection weight: NVFP4 (dequant on the fly) or BF16 keep (exact bit
@@ -303,6 +325,15 @@ pub struct Params {
     pub nr48: Dev,  // GDN b/a rows
     pub nr512: Dev, // KV_ROWS (attention v)
     pub n_splits: Dev, // ATTN_SPLITS
+    /// Crow #300 phase 2 (0 = not allocated, the Flash-Next case): the attention core
+    /// width (o_proj K), the dense SwiGLU width, and its per-chunk element count t * I
+    pub n_core: Dev,
+    pub n_dinter: Dev,
+    /// Crow #300 phase 2: the GDN conv channel count (`d.gdn_conv`, the qkv rows). The GDN
+    /// sites read `n10240` before, which C3 made `d.hct`: equal on Flash-Next (10240), not
+    /// on the dense 27B (hct 5120, gdn_conv 10240)
+    pub n_gdn_conv: Dev,
+    pub nt_dinter: Dev,
 }
 
 pub struct Scratch {
@@ -339,6 +370,8 @@ pub struct Scratch {
     pub gu_ptrs: Dev,  // [C][10] u64
     pub dn_ptrs: Dev,
     pub cold: Dev,     // [C] u32
+    pub dg: Dev,       // [C][I] Crow #300 phase 2: dense gate rows, silu(gate) * up in place
+    pub du: Dev,       // [C][I] dense up rows
     // gdn
     pub mq: Dev,       // [C][10240]
     pub mq_t: Dev,     // [10240][C]
@@ -792,6 +825,18 @@ pub const PF_TG: usize = 64;
 /// runtime tiles-per-group (CROW_PF_TG, default PF_TG): larger groups cut the
 /// 5-launch chain per group and raise the tile-GEMM grid; costs
 /// CROW_PF_TG x 2.76 MB of staging slots
+impl Stage {
+    /// Crow #300 phase 2: no cold-expert staging (a dense FFN); every pointer 0, which
+    /// `Engine::drop` frees as a no-op and no launch of a dense family reads
+    pub fn none() -> Stage {
+        Stage {
+            gu: 0, dn: 0, sgu: 0, sdn: 0, gu_b: 0, dn_b: 0, gu_bytes: 0, dn_bytes: 0, max: 0, dma: None,
+            counts: 0, offsets: 0, cursor: 0, perm: 0, tiles: 0, n_tiles: 0, eptr: 0, grp: 0, tg: 0,
+            max_tiles_p: 0, max_tiles: 0,
+        }
+    }
+}
+
 pub fn pf_tg() -> usize {
     use std::sync::OnceLock;
     static V: OnceLock<usize> = OnceLock::new();
@@ -980,37 +1025,54 @@ impl Engine {
         assert_eq!(embed_host.len(), d.v * d.h);
         drop(emb_raw);
 
-        let lm_t = cnq.find("lm_head.weight", sec).clone();
-        let lm_raw = cnq.read_bytes(&lm_t);
-        let lm_head = cuda::upload_dev(&lm_raw);
-        drop(lm_raw);
-
-        // C5: the final-norm arm (HcMixer: the model-level hyper-connection mixer)
-        let (mx_norm, mx_down, mx_up) = match geo.final_norm {
-            FinalNorm::HcMixer => (
-                load_f32(cnq, "model.language_model.hyper_connection_mixer.hc_norm.weight", sec),
-                load_pw(cnq, "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight", sec),
-                load_pw(cnq, "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight", sec),
+        // C5: the final-norm arm (HcMixer: the model-level hyper-connection mixer and the
+        // BF16-keep lm_head read raw; Rms, Crow #300 phase 2: `model.norm` and an lm_head of
+        // any dtype, both in `DenseW`, so the Flash-Next head fields stay empty there)
+        let (lm_head, mx_norm, mx_down, mx_up, head_rms) = match geo.final_norm {
+            FinalNorm::HcMixer => {
+                let lm_t = cnq.find("lm_head.weight", sec).clone();
+                let lm_raw = cnq.read_bytes(&lm_t);
+                let lm_head = cuda::upload_dev(&lm_raw);
+                drop(lm_raw);
+                (
+                    lm_head,
+                    load_f32(cnq, "model.language_model.hyper_connection_mixer.hc_norm.weight", sec),
+                    load_pw(cnq, "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight", sec),
+                    load_pw(cnq, "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight", sec),
+                    None,
+                )
+            }
+            FinalNorm::Rms => (
+                0,
+                0,
+                PW::Bf16(0),
+                PW::Bf16(0),
+                Some((load_f32(cnq, "model.language_model.norm.weight", sec), load_pw(cnq, "lm_head.weight", sec))),
             ),
-            FinalNorm::Rms => unbuilt_arm(Block::FINAL_NORM_RMS, geo.family),
         };
 
         log(&format!("loading {} dense layer bundles (FP4 + keeps) …", d.layers));
         let mut hc = Vec::with_capacity(d.layers);
         let mut sub = Vec::with_capacity(d.layers);
         let mut moe = Vec::with_capacity(d.layers);
+        // Crow #300 phase 2: the plain residual's two pre-norms and the dense SwiGLUs
+        let (mut ln1, mut ln2, mut mlp) = (Vec::new(), Vec::new(), Vec::new());
         for l in 0..d.layers {
             let pfx = |s: &str| format!("model.language_model.layers.{l}.{s}");
-            // C5: the residual arm (Hc: the attention-side hyper-connection block)
-            hc.push(match geo.residual {
-                Residual::Hc { .. } => HcW {
+            // C5: the residual arm (Hc: the attention-side hyper-connection block; Plain:
+            // input_layernorm and post_attention_layernorm, phase 2)
+            match geo.residual {
+                Residual::Hc { .. } => hc.push(HcW {
                     norm: load_f32(cnq, &pfx("attn_hyper_connection.hc_norm.weight"), sec),
                     down: load_pw(cnq, &pfx("attn_hyper_connection.input_mix_weight_down.weight"), sec),
                     up: load_pw(cnq, &pfx("attn_hyper_connection.input_mix_weight_up.weight"), sec),
                     inj: load_pw(cnq, &pfx("attn_hyper_connection.block_inject_weight.weight"), sec),
-                },
-                Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, geo.family),
-            });
+                }),
+                Residual::Plain => {
+                    ln1.push(load_f32(cnq, &pfx("input_layernorm.weight"), sec));
+                    ln2.push(load_f32(cnq, &pfx("post_attention_layernorm.weight"), sec));
+                }
+            }
             if d.is_attn(l) {
                 // C5: the attention arm (Qsa: attention plus the QSA indexer)
                 sub.push(match geo.attn {
@@ -1025,7 +1087,19 @@ impl Engine {
                         iqln: load_f32(cnq, &pfx("self_attn.indexer.q_layernorm.weight"), sec),
                         ikln: load_f32(cnq, &pfx("self_attn.indexer.k_layernorm.weight"), sec),
                     },
-                    Attn::Full => unbuilt_arm(Block::ATTN_FULL, geo.family),
+                    // phase 2: the same projections and norms without the QSA indexer
+                    // (its three fields stay empty: no launch of a Full layer reads them)
+                    Attn::Full => SubW::Attn {
+                        q: load_pw(cnq, &pfx("self_attn.q_proj.weight"), sec),
+                        k: load_pw(cnq, &pfx("self_attn.k_proj.weight"), sec),
+                        v: load_pw(cnq, &pfx("self_attn.v_proj.weight"), sec),
+                        o: load_pw(cnq, &pfx("self_attn.o_proj.weight"), sec),
+                        qn: load_f32(cnq, &pfx("self_attn.q_norm.weight"), sec),
+                        kn: load_f32(cnq, &pfx("self_attn.k_norm.weight"), sec),
+                        iqk: PW::Bf16(0),
+                        iqln: 0,
+                        ikln: 0,
+                    },
                 });
             } else {
                 sub.push(SubW::Gdn {
@@ -1041,18 +1115,22 @@ impl Engine {
                 });
             }
             // C5: the FFN arm (Moe: the router and the shared expert; the routed
-            // experts are the residency's slabs below)
-            moe.push(match geo.ffn {
-                Ffn::Moe { .. } => MoeW {
+            // experts are the residency's slabs below. Dense, phase 2: one SwiGLU)
+            match geo.ffn {
+                Ffn::Moe { .. } => moe.push(MoeW {
                     router: load_f32(cnq, &pfx("mlp.gate.weight"), sec),
                     router_bf: load_bf16_twin(cnq, &pfx("mlp.gate.weight"), sec),
                     sg: load_pw(cnq, &pfx("mlp.shared_expert.gate_proj.weight"), sec),
                     su: load_pw(cnq, &pfx("mlp.shared_expert.up_proj.weight"), sec),
                     sdn: load_pw(cnq, &pfx("mlp.shared_expert.down_proj.weight"), sec),
                     sgate: load_f32(cnq, &pfx("mlp.shared_expert_gate.weight"), sec),
-                },
-                Ffn::Dense { .. } => unbuilt_arm(Block::FFN_DENSE, geo.family),
-            });
+                }),
+                Ffn::Dense { .. } => mlp.push(MlpW {
+                    gate: load_pw(cnq, &pfx("mlp.gate_proj.weight"), sec),
+                    up: load_pw(cnq, &pfx("mlp.up_proj.weight"), sec),
+                    down: load_pw(cnq, &pfx("mlp.down_proj.weight"), sec),
+                }),
+            }
             if l % 12 == 0 {
                 log(&format!("  dense layers {l}/{}", d.layers));
             }
@@ -1061,16 +1139,19 @@ impl Engine {
         let mut hc2 = Vec::with_capacity(d.layers);
         for l in 0..d.layers {
             let pfx = |s: &str| format!("model.language_model.layers.{l}.{s}");
-            hc2.push(match geo.residual {
-                Residual::Hc { .. } => HcW {
+            match geo.residual {
+                Residual::Hc { .. } => hc2.push(HcW {
                     norm: load_f32(cnq, &pfx("mlp_hyper_connection.hc_norm.weight"), sec),
                     down: load_pw(cnq, &pfx("mlp_hyper_connection.input_mix_weight_down.weight"), sec),
                     up: load_pw(cnq, &pfx("mlp_hyper_connection.input_mix_weight_up.weight"), sec),
                     inj: load_pw(cnq, &pfx("mlp_hyper_connection.block_inject_weight.weight"), sec),
-                },
-                Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, geo.family),
-            });
+                }),
+                // phase 2: a plain residual has no second block (post_attention_layernorm
+                // was loaded with the first)
+                Residual::Plain => {}
+            }
         }
+        let dense = head_rms.map(|(norm, lm_head)| DenseW { ln1, ln2, mlp, norm, lm_head });
         let dense_measured = cuda::total_vram_bytes() - cuda::free_vram_bytes();
 
         // ---- PLE weights (layer index 1) ----
@@ -1107,7 +1188,10 @@ impl Engine {
         }
         let vit_hold = crate::vit::reserve_bytes(&geo, cfg.context) > 0;
         let mut vit_scratch_held = 0u64;
-        let vit = if crate::vit::vit_on() {
+        // Crow #300: the dense recipe writes no vision tower (its images go through the F16
+        // projector, not built yet), so the tower loads only when the container has it
+        let vit_in_cnq = cnq.tensors.iter().any(|t| t.section == "vit");
+        let vit = if crate::vit::vit_on() && vit_in_cnq {
             log("loading the vit section (27 vision blocks + patch embed + merger) …");
             let before = cuda::total_vram_bytes() - cuda::free_vram_bytes();
             let mut vt = crate::vit::Vit::new(cnq, geo.vision_out());
@@ -1127,6 +1211,9 @@ impl Engine {
                     "scratch lazy, allocated on the first image request (CROW_VIT_RESERVE_MB=0)".to_string()
                 }));
             Some(vt)
+        } else if !vit_in_cnq {
+            log_vit_tower("[vit] visual tower NOT loaded: the container has no vit section (Crow #300: the dense recipe omits it; the F16 projector path is not built yet), /props vision false");
+            None
         } else {
             log_vit_tower("[vit] visual tower NOT loaded, CROW_VIT 0 (the text-only placeholder of record, /props vision false)");
             None
@@ -1171,7 +1258,8 @@ impl Engine {
         // sidecar are the `Ffn::Moe` arm
         let slabs = match geo.ffn {
             Ffn::Moe { experts, .. } => crate::residency::expert_slab_info(cnq, 0, sec, experts),
-            Ffn::Dense { .. } => unbuilt_arm(Block::FFN_DENSE, geo.family),
+            // phase 2: a dense FFN has no expert slabs (zero bytes: no staging, no ring)
+            Ffn::Dense { .. } => crate::residency::ExpertSlabs { gu_bytes: 0, dn_bytes: 0, gu_gs: 0.0, dn_gs: 0.0 },
         };
         let per_expert_unit = (slabs.gu_bytes + slabs.dn_bytes) * d.layers as u64;
         let s = Scratch::alloc(&d, cfg.prompt_chunk);
@@ -1197,7 +1285,11 @@ impl Engine {
         // CROW_STAGE_DMA and the low-bit tier
         // still take precedence at the launch site (moe_run).
         let sk = env_or_unset("CROW_STAGE_KERNEL");
-        if stage_kernel_ca() {
+        // Crow #300 phase 2: the [stage] and [trickle] lines name expert machinery, so a
+        // dense FFN prints neither (Flash-Next prints both, unchanged)
+        let moe_ffn = matches!(geo.ffn, Ffn::Moe { .. });
+        if !moe_ffn {
+        } else if stage_kernel_ca() {
             // #19j: the line also names the stream the copy is issued on, because
             // that is the one thing about this launch a later log cannot infer
             println!("[stage] kernel stage_cold_ca, CROW_STAGE_KERNEL {} (default 2), {} blocks x 256 threads, 4096 B tiles (gate_up {} B = {} tiles, down {} B = {} tiles), {}",
@@ -1212,9 +1304,9 @@ impl Engine {
         // log says which order produced it. It sits in the [load] block, so the
         // parity gate prints it too (decode parity never calls apply_adapt_policy).
         let td = env_or_unset("CROW_TRICKLE_DEFER");
-        println!("[trickle] copies issued {}, CROW_TRICKLE_DEFER {} (unset or any value but 0 defers)",
+        if moe_ffn { println!("[trickle] copies issued {}, CROW_TRICKLE_DEFER {} (unset or any value but 0 defers)",
             if trickle_defer_on() { "AFTER the graph launch, in decode_step (deferred, default)" }
-            else { "BEFORE the launch, in trickle_tick (eager fallback)" }, td);
+            else { "BEFORE the launch, in trickle_tick (eager fallback)" }, td); }
         // #61b, 2026-09-12: ONE line per engine process names the decode QSA
         // selection form, next to the [stage] and [trickle] lines and for the
         // same reason: every future log says which selection produced it. It
@@ -1235,10 +1327,15 @@ impl Engine {
         // reason: every future log says which split count produced it. It
         // sits in the [load] block, so the parity gate prints it too.
         let asplits = env_or_unset("CROW_ATTN_SPLITS");
+        if let Attn::Full = geo.attn {
+            println!("[attn] full causal attention (Crow #300 phase 2): prefill attn_full_split S=1 (one block per query row and head), decode attn_full_split S={} + attn_merge, CROW_ATTN_SPLITS {}",
+                attn_splits(), asplits);
+        } else {
         println!("[attn] decode attention splits {} (default 8, restored by 61e), CROW_ATTN_SPLITS {} (32 = rolled back, knob 4/8/16/32), kernel {}, CROW_ATTN_LUT {} (#61g, DEFAULT ON since 2026-09-18, 0 = attn_sel_split, the pre-61f kernel of record)",
             attn_splits(), asplits,
             if attn_lut_on() { "attn_sel_split_l (default, the e4m3-LUT twin)" } else { "attn_sel_split (fallback of record, CROW_ATTN_LUT=0)" },
             env_or_unset("CROW_ATTN_LUT"));
+        }
         // #62b, 2026-09-12: ONE line per engine process names the GDN decode
         // input-projection form, next to the [attn] line and for the same
         // reason: every future log says which projection launch produced it.
@@ -1274,7 +1371,7 @@ impl Engine {
             if pf_gemm_b_on() { "variant B (gemm_fp4_dense_b / gemm_bf16_dense_b)" } else { "8-token tiles (of record)" }, pgb);
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
         let max_tiles = cfg.prompt_chunk * d.topk / 8 + d.e + 1;
-        let stage = Stage {
+        let stage = if !moe_ffn { Stage::none() } else { Stage {
             // #117: lendable, cold-expert staging written by stage_cold before every read
             gu: cuda::alloc_lendable("the cold staging gate_up slots", stage_max * slabs.gu_bytes as usize),
             dn: cuda::alloc_lendable("the cold staging down slots", stage_max * slabs.dn_bytes as usize),
@@ -1297,7 +1394,7 @@ impl Engine {
             tg: cuda::to_i32_dev(&[pf_tg() as i32, if pf_async_on() { 2 } else { 1 }, pf_async_mode()]),
             max_tiles_p: cuda::to_i32_dev(&[max_tiles as i32]),
             max_tiles,
-        };
+        } };
         if pf_async_on() {
             log(&format!("prefill staging on a side stream (CROW_PF_ASYNC={}): 2 x {} slots", pf_async_mode(), pf_tg()));
         }
@@ -1384,13 +1481,18 @@ impl Engine {
         ));
 
         // ---- residency (#8) ----
-        log("building residency (hot VRAM slabs + pinned cold tier) …");
-        // C5: the Ffn::Moe arm (the slabs above already took it), which boots with a
-        // hot-set sidecar path (`boot::hot_set_sidecar`)
-        let sidecar_path = sidecar_path.expect("a MoE family loads with a hot-set sidecar path (boot::hot_set_sidecar)");
-        let res = Residency::build(cnq, &geo, sec, st_res_n(&st_rep, cfg.n_hot), warmup_counts, sidecar_path, persist, cold_fixed, cfg.adapt.spare, &mut |m| {
-            log(&format!("  [residency] {m}"));
-        });
+        // Crow #300 phase 2: a dense FFN has no experts, so no residency to build
+        let res = if moe_ffn {
+            log("building residency (hot VRAM slabs + pinned cold tier) …");
+            // C5: the Ffn::Moe arm (the slabs above already took it), which boots with a
+            // hot-set sidecar path (`boot::hot_set_sidecar`)
+            let sidecar_path = sidecar_path.expect("a MoE family loads with a hot-set sidecar path (boot::hot_set_sidecar)");
+            Residency::build(cnq, &geo, sec, st_res_n(&st_rep, cfg.n_hot), warmup_counts, sidecar_path, persist, cold_fixed, cfg.adapt.spare, &mut |m| {
+                log(&format!("  [residency] {m}"));
+            })
+        } else {
+            Residency::none(&geo)
+        };
         // ---- copy-engine prefetch ring (A-P3b) ----
         let (ring_gu, ring_dn, pf_stream) = if ring_reserve > 0 {
             let need_gu = res.cold_gu.iter().map(|p| p.bytes as u64).max().unwrap_or(0);
@@ -1413,10 +1515,12 @@ impl Engine {
         // C4: the kernel source takes its shape from the runtime Geo (a `#define CN_*`
         // prelude); for Flash-Next the PTX is byte-identical to the pre-C4 source
         let module = cuda::compile(&crate::kernels::KernelGeo::of(&geo).source());
-        let k = Kernels::new(&module);
+        let kgeo = crate::kernels::KernelGeo::of(&geo);
+        let k = Kernels::new(&module, kgeo.p2);
         assert_kernel_defines();
         let p = Params::setup(&cfg, &d, &st);
-        let sel_counts = cuda::alloc_zeroed(d.layers * d.e * 8);
+        // routing counts per expert: none without experts (phase 2)
+        let sel_counts = if d.e > 0 { cuda::alloc_zeroed(d.layers * d.e * 8) } else { 0 };
         let w = Weights {
             embed_host,
             lm_head,
@@ -1427,6 +1531,7 @@ impl Engine {
             hc2,
             sub,
             moe,
+            dense,
         };
 
         // ---- #72: the post-plan ledger ----
@@ -1459,6 +1564,7 @@ impl Engine {
         }
 
         let dense_after = cuda::total_vram_bytes() - cuda::free_vram_bytes();
+        if moe_ffn {
         log(&format!(
             "load done in {:.0} s — VRAM used {:.2} GiB (dense {:.2} GiB + hot experts {} × {} × {:.2} MB + states)",
             t0.elapsed().as_secs_f64(),
@@ -1468,6 +1574,14 @@ impl Engine {
             d.layers,
             (res.gu_bytes + res.dn_bytes) as f64 / MIB
         ));
+        } else {
+            log(&format!(
+                "load done in {:.0} s — VRAM used {:.2} GiB (weights {:.2} GiB + scratch + states; dense FFN, no hot experts)",
+                t0.elapsed().as_secs_f64(),
+                dense_after as f64 / GIB,
+                dense_measured as f64 / GIB
+            ));
+        }
 
         Engine {
             geo,
@@ -2230,6 +2344,10 @@ impl Params {
             nr48: cuda::to_i32_dev(&[d.gdn_vheads as i32]),
             nr512: cuda::to_i32_dev(&[d.kv_rows as i32]),
             n_splits: cuda::to_i32_dev(&[attn_splits() as i32]),
+            n_gdn_conv: cuda::to_i32_dev(&[d.gdn_conv as i32]),
+            n_core: if d.qsa_sel_max == 0 { cuda::to_i32_dev(&[d.core as i32]) } else { 0 },
+            n_dinter: if d.dense_inter > 0 { cuda::to_i32_dev(&[d.dense_inter as i32]) } else { 0 },
+            nt_dinter: if d.dense_inter > 0 { cuda::to_i32_dev(&[d.dense_inter as i32]) } else { 0 },
         }
     }
 }
@@ -2325,6 +2443,10 @@ impl Scratch {
             ("gu_ptrs", c * d.topk * 8),
             ("dn_ptrs", c * d.topk * 8),
             ("cold", c * 4),
+            // Crow #300 phase 2: the dense SwiGLU gate / up rows ([C][I]; 0 B on a MoE family,
+            // and a 0-byte entry at the end of a set moves no offset)
+            ("dg", 4 * c * d.dense_inter),
+            ("du", 4 * c * d.dense_inter),
         ];
         [persist_set, hc_set, attn_set, gdn_set, ple_set, moe_set]
     }
@@ -2427,12 +2549,14 @@ impl Scratch {
             h1: mo[0], h2: mo[1], eo: mo[2], xq_dn: mo[3], xq_s: mo[4],
             sh12: mo[5], sh2: mo[6], sdown: mo[7], sgv: mo[8], rlog: mo[9],
             rids: mo[10], rwts: mo[11], gu_ptrs: mo[12], dn_ptrs: mo[13], cold: mo[14],
+            dg: mo[15], du: mo[16],
             // fixed size, never chunk scaled (the #16 caps)
             // #117: lendable, per-chunk QSA temps (pooled/normed/rotated keys, scores)
-            pool_raw: cuda::alloc_lendable("the QSA pool_raw scratch", cap_blocks * d.qsa_hidd),
-            pool_nrm: cuda::alloc_lendable("the QSA pool_nrm scratch", cap_blocks * d.qsa_hidd),
-            pool_rot: cuda::alloc_lendable("the QSA pool_rot scratch", cap_blocks * d.qsa_hidd),
-            scores: cuda::alloc_lendable("the QSA scores scratch", attn_sb(c) * cap_blocks * 4),
+            // Crow #300 phase 2: full attention has no indexer, so no QSA temps (0 = none)
+            pool_raw: if d.qsa_hidd > 0 { cuda::alloc_lendable("the QSA pool_raw scratch", cap_blocks * d.qsa_hidd) } else { 0 },
+            pool_nrm: if d.qsa_hidd > 0 { cuda::alloc_lendable("the QSA pool_nrm scratch", cap_blocks * d.qsa_hidd) } else { 0 },
+            pool_rot: if d.qsa_hidd > 0 { cuda::alloc_lendable("the QSA pool_rot scratch", cap_blocks * d.qsa_hidd) } else { 0 },
+            scores: if d.qsa_hidd > 0 { cuda::alloc_lendable("the QSA scores scratch", attn_sb(c) * cap_blocks * 4) } else { 0 },
             part_o: cuda::alloc_zeroed(d.nq * ATTN_SPLITS_MAX * d.ahd * 4),
             part_ml: cuda::alloc_zeroed(d.nq * ATTN_SPLITS_MAX * 2 * 4),
             qsa_h1: cuda::alloc_zeroed(QSA_PAR_BINS * 4),
@@ -2458,7 +2582,10 @@ impl Engine {
         // not by the raw layer id (36 GDN layers shift the numbering!)
         let kc = self.st.kv_buf as u64 + (ai * 2) as u64 * per_layer;
         let vc = kc + per_layer;
-        (kc, vc, self.st.qsa_keys[ai] as u64, self.st.qsa_pooled[ai] as u64)
+        // Crow #300 phase 2: full attention allocates no QSA ring / pooled cache (0)
+        let keys = self.st.qsa_keys.get(ai).copied().unwrap_or(0);
+        let pooled = self.st.qsa_pooled.get(ai).copied().unwrap_or(0);
+        (kc, vc, keys, pooled)
     }
 
     /// GatedResidual block: norm → down → silu/4 → up → sigmoid → mix + inject
@@ -2544,11 +2671,11 @@ impl Engine {
             // dense overlay shadows reads the f32 `mixed` row instead and ignores the cascade.
             quant_x_if_unfused(k, p, t as u32, mixed as u64, s.xq_m as u64, p.n2560 as u64, p.n2560 as u64);
         }
-        qkv.or_bf16(k, self.d.gdn_conv, p.n10240, t, p.t, mixed, s.mq, p.n2560, |w, gs| {
+        qkv.or_bf16(k, self.d.gdn_conv, p.n_gdn_conv, t, p.t, mixed, s.mq, p.n2560, |w, gs| {
             if mma {
             launch_mma_d(k, (self.d.gdn_conv / 64) as u32, t, p.t as u64, &[
                 w as u64, s.xq_m as u64, gs as u64, s.mq as u64,
-                p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
+                p.n2560 as u64, p.n_gdn_conv as u64, p.n_gdn_conv as u64]);
             } else {
             launch_v(k.f("gemv_fp4_b"), self.d.gdn_conv as u32, t as u32, 1, 256, &[
                 w as u64, mixed as u64, gs as u64, s.mq as u64, p.n2560 as u64]);
@@ -2585,7 +2712,7 @@ impl Engine {
             }
         });
         launch_v(k.f("transpose_rt"), self.d.gdn_conv as u32, 1, 1, 256, &[
-            s.mq as u64, s.mq_t as u64, p.t as u64, p.n10240 as u64]);
+            s.mq as u64, s.mq_t as u64, p.t as u64, p.n_gdn_conv as u64]);
         launch_v(k.f("conv_silu"), self.d.gdn_conv as u32, 1, 1, 256, &[
             s.mq_t as u64, *conv as u64, s.cout_t as u64, p.t as u64, self.st.gdn_conv[gi] as u64]);
         launch_v(k.f("conv_state_update"), self.d.gdn_conv as u32, 1, 1, (self.d.conv_kernel - 1) as u32, &[
@@ -2659,7 +2786,7 @@ launch_v(k.f("l2norm_repeat"), self.d.gdn_vheads as u32, t as u32, 1, self.d.gd 
                     qkv.w(), b.w(), a.w(), a.w(),
                     qkv.gs(), b.gs(), a.gs(), a.gs(),
                     s.mq, s.gb, s.ga, s.ga,
-                    p.n10240, p.nr48, p.nr48, p.zero,
+                    p.n_gdn_conv, p.nr48, p.nr48, p.zero,
                     s.xq_m, p.n2560]);
                 launch_v(k.f("gemv_fp4_mma_d32"), self.d.gdn_val.div_ceil(32) as u32, 1, 1, mma_bx32(), &[
                     z.w(), s.xq_m, z.gs(), s.gz,
@@ -2673,12 +2800,12 @@ launch_v(k.f("l2norm_repeat"), self.d.gdn_vheads as u32, t as u32, 1, self.d.gd 
                     qkv.w() as u64, z.w() as u64, b.w() as u64, a.w() as u64,
                     qkv.gs() as u64, z.gs() as u64, b.gs() as u64, a.gs() as u64,
                     s.mq as u64, s.gz as u64, s.gb as u64, s.ga as u64,
-                    p.n10240 as u64, p.n6144 as u64, p.nr48 as u64, p.nr48 as u64,
+                    p.n_gdn_conv as u64, p.n6144 as u64, p.nr48 as u64, p.nr48 as u64,
                     s.xq_m as u64, p.n2560 as u64]);
             } else {
                 launch_v(k.f("gemv_fp4_mma_d32"), ((self.d.gdn_conv + 31) / 32) as u32, 1, 1, mma_bx32(), &[
                     qkv.w() as u64, s.xq_m as u64, qkv.gs() as u64, s.mq as u64,
-                    p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
+                    p.n2560 as u64, p.n_gdn_conv as u64, p.n_gdn_conv as u64]);
                 launch_v(k.f("gemv_fp4_mma_d32"), ((self.d.gdn_val + 31) / 32) as u32, 1, 1, mma_bx32(), &[
                     z.w() as u64, s.xq_m as u64, z.gs() as u64, s.gz as u64,
                     p.n2560 as u64, p.n6144 as u64, p.n6144 as u64]);
@@ -2692,11 +2819,11 @@ launch_v(k.f("l2norm_repeat"), self.d.gdn_vheads as u32, t as u32, 1, self.d.gd 
         } else {
             // per-slab: the FP4 fallback of record for an NVFP4 slab, the BF16 warp GEMV
             // off the f32 `mixed` row for one the overlay shadows (#77)
-            qkv.or_bf16_1(k, self.d.gdn_conv, p.n10240, mixed, s.mq, p.n2560, |w, gs| {
+            qkv.or_bf16_1(k, self.d.gdn_conv, p.n_gdn_conv, mixed, s.mq, p.n2560, |w, gs| {
                 if mma {
                     launch_v(k.f("gemv_fp4_mma_d32"), ((self.d.gdn_conv + 31) / 32) as u32, 1, 1, mma_bx32(), &[
                         w as u64, s.xq_m as u64, gs as u64, s.mq as u64,
-                        p.n2560 as u64, p.n10240 as u64, p.n10240 as u64]);
+                        p.n2560 as u64, p.n_gdn_conv as u64, p.n_gdn_conv as u64]);
                 } else {
                     launch_v(k.f("gemv_fp4"), self.d.gdn_conv as u32, 1, 1, 256, &[
                         w as u64, mixed as u64, gs as u64, s.mq as u64, p.n2560 as u64]);
@@ -3095,6 +3222,106 @@ static DMA_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 static DMA_NS_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// host nanoseconds inside the per-layer copy issue loop plus the pointer-table HtoD
 static DMA_NS_ISSUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Engine {
+    /// Crow #300 phase 2: the dense family's weights (`Some` whenever a phase 2 arm runs)
+    fn dw(&self) -> &DenseW {
+        self.w.dense.as_ref().expect("a phase 2 arm ran on a family without DenseW (Crow #300)")
+    }
+
+    /// Crow #300 phase 2: one zero-centred RMSNorm per row of `[t][H]`, HF `Qwen3_5RMSNorm`
+    /// (`x * rsqrt(mean(x^2) + eps) * (1 + w)`, eps `CN_EPS`). That is `rms_group` with one
+    /// stream (`CN_HCN` = 1 for a plain residual), grid (1, t).
+    unsafe fn rms_rows(&self, x: Dev, w: Dev, out: Dev, t: usize) {
+        launch_v(self.k.f("rms_group"), 1, t as u32, 1, 256, &[x, w, out]);
+    }
+
+    /// Crow #300 phase 2: the plain residual add `h += y` over `[t][H]` (`add_flat`; the
+    /// element count is `nt_hct` = t * H, refreshed per chunk and per decode step)
+    unsafe fn residual_add(&self, y: Dev, t: usize) {
+        launch_v(self.k.f("add_flat"), (t * self.d.h).div_ceil(256) as u32, 1, 1, 256, &[
+            y, self.s.h, self.p.nt_hct]);
+    }
+
+    /// Crow #300 phase 2: `Ffn::Dense`, HF `Qwen3_5MLP`: `down(silu(gate(x)) * up(x))` over
+    /// `[t][H]` rows of `x`; returns `s.moe_out` ([t][H]).
+    unsafe fn dense_ffn(&self, l: usize, x: Dev, t: usize) -> Dev {
+        let (k, p, s) = (&self.k, &self.p, &self.s);
+        let m = &self.dw().mlp[l];
+        let inter = self.d.dense_inter;
+        m.gate.launch_gemv(k, inter, p.n_dinter, t, p.t, x, s.dg, p.n2560);
+        m.up.launch_gemv(k, inter, p.n_dinter, t, p.t, x, s.du, p.n2560);
+        // t * I elements: the constant I at t = 1 (the decode graph), else the chunk count
+        let n_p = if t == 1 { p.n_dinter } else { p.nt_dinter };
+        launch_v(k.f("silu_mul_n"), (t * inter).div_ceil(256) as u32, 1, 1, 256, &[s.dg, s.du, n_p]);
+        m.down.launch_gemv(k, self.d.h, p.n2560, t, p.t, s.dg, s.moe_out, p.n_dinter);
+        s.moe_out
+    }
+
+    /// Crow #300 phase 2: `Attn::Full` over a prompt chunk, HF `Qwen3_5Attention`: the
+    /// same q|gate split, per-head (1+w) q/k norms, partial RoPE and KV store as
+    /// `attn_prompt`, then uncapped causal attention (`attn_full_split`, S = 1: rows
+    /// 0..=pos_base+i for query row i), the sigmoid output gate and o_proj. Returns
+    /// `s.ay` ([t][H]).
+    unsafe fn attn_full_prompt(&self, l: usize, mixed: Dev, t: usize, pos_base: usize) -> Dev {
+        let (k, p, s) = (&self.k, &self.p, &self.s);
+        let SubW::Attn { q, k: kk, v, o, qn, kn, .. } = &self.w.sub[l] else {
+            panic!("layer {l} is not attention");
+        };
+        let (kc, vc, _, _) = self.layer_cache_ptrs(l);
+        let cos = self.cos_tbl() + (pos_base * self.d.rope_pairs * 4) as u64;
+        let sin = self.sin_tbl() + (pos_base * self.d.rope_pairs * 4) as u64;
+        q.launch_gemv(k, self.d.q_rows, p.n12288, t, p.t, mixed, s.qg, p.n2560);
+        launch_v(k.f("split_qg"), self.d.nq as u32, t as u32, 1, self.d.ahd as u32, &[
+            s.qg, s.aq, s.agate]);
+        launch_v(k.f("rmsnorm_1pw"), self.d.nq as u32, t as u32, 1, self.d.ahd as u32, &[
+            s.aq, *qn, s.aqn]);
+        launch_v(k.f("rope"), self.d.nq as u32, t as u32, 1, self.d.ahd as u32, &[s.aqn, cos, sin, s.aqr]);
+        kk.launch_gemv(k, self.d.kv_rows, p.nr512, t, p.t, mixed, s.ak, p.n2560);
+        launch_v(k.f("rmsnorm_1pw"), self.d.nkv as u32, t as u32, 1, self.d.ahd as u32, &[
+            s.ak, *kn, s.akn]);
+        launch_v(k.f("rope"), self.d.nkv as u32, t as u32, 1, self.d.ahd as u32, &[s.akn, cos, sin, s.akr]);
+        v.launch_gemv(k, self.d.kv_rows, p.nr512, t, p.t, mixed, s.av, p.n2560);
+        launch_v(k.f("store_kv"), (2 * self.d.nkv) as u32, t as u32, 1, self.d.ahd as u32, &[
+            s.akr, s.av, kc, vc, p.pos_base, p.tmax, p.mode]);
+        launch_v(k.f("attn_full_split"), self.d.nq as u32, t as u32, 1, self.d.ahd as u32, &[
+            s.aqr, kc, vc, p.pos_base, p.tmax, p.mode, s.aout, 0]);
+        launch_v(k.f("gate_mul"), (t * self.d.core).div_ceil(256) as u32, 1, 1, 256, &[
+            s.aout, s.agate, s.agated]);
+        o.launch_gemv(k, self.d.h, p.n2560, t, p.t, s.agated, s.ay, p.n_core);
+        s.ay
+    }
+
+    /// Crow #300 phase 2: `Attn::Full` for one decode token at `p.pos_base` (device
+    /// scalars only, so the decode graph replays it): rope_p, store_kv at `p.slot1`,
+    /// `attn_full_split` over `attn_splits()` blocks per head + `attn_merge`.
+    unsafe fn attn_full_step(&self, l: usize, mixed: Dev) -> Dev {
+        let (k, p, s) = (&self.k, &self.p, &self.s);
+        let SubW::Attn { q, k: kk, v, o, qn, kn, .. } = &self.w.sub[l] else {
+            panic!("layer {l} is not attention");
+        };
+        let (kc, vc, _, _) = self.layer_cache_ptrs(l);
+        let (cos, sin) = (self.cos_tbl(), self.sin_tbl());
+        q.launch_gemv1(k, self.d.q_rows, p.n12288, mixed, s.qg, p.n2560);
+        launch_v(k.f("split_qg"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[s.qg, s.aq, s.agate]);
+        launch_v(k.f("rmsnorm_1pw"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[s.aq, *qn, s.aqn]);
+        launch_v(k.f("rope_p"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[s.aqn, cos, sin, s.aqr, p.pos_base]);
+        kk.launch_gemv1(k, self.d.kv_rows, p.nr512, mixed, s.ak, p.n2560);
+        launch_v(k.f("rmsnorm_1pw"), self.d.nkv as u32, 1, 1, self.d.ahd as u32, &[s.ak, *kn, s.akn]);
+        launch_v(k.f("rope_p"), self.d.nkv as u32, 1, 1, self.d.ahd as u32, &[s.akn, cos, sin, s.akr, p.pos_base]);
+        v.launch_gemv1(k, self.d.kv_rows, p.nr512, mixed, s.av, p.n2560);
+        launch_v(k.f("store_kv"), (2 * self.d.nkv) as u32, 1, 1, self.d.ahd as u32, &[
+            s.akr, s.av, kc, vc, p.slot1, p.tmax, p.mode]);
+        launch_v(k.f("attn_full_split"), self.d.nq as u32, 1, attn_splits() as u32, self.d.ahd as u32, &[
+            s.aqr, kc, vc, p.pos_base, p.tmax, p.mode, s.part_o, s.part_ml]);
+        launch_v(k.f("attn_merge"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[
+            s.part_o, s.part_ml, s.aout, p.n_splits]);
+        launch_v(k.f("gate_mul"), self.d.core.div_ceil(256) as u32, 1, 1, 256, &[
+            s.aout, s.agate, s.agated]);
+        o.launch_gemv1(k, self.d.h, p.n2560, s.agated, s.ay, p.n_core);
+        s.ay
+    }
+}
 
 pub fn stage_dma_reset() {
     use std::sync::atomic::Ordering;
@@ -3758,6 +3985,12 @@ impl Engine {
 
     unsafe fn lm_head_row(&self, row: usize) {
         let dst = self.s.logits as u64;
+        // Crow #300 phase 2: the FinalNorm::Rms head's lm_head is a PW (NVFP4 in the dense recipe)
+        if let Some(dw) = self.w.dense.as_ref() {
+            dw.lm_head.launch_gemv1(&self.k, self.d.v, self.p.n_vocab,
+                self.s.mixed_final + (row * self.d.h * 4) as u64, dst, self.p.n2560);
+            return;
+        }
         if bf16_w_on() {
             launch_v(self.k.f("gemv_bf16_w"), ((self.d.v + 7) / 8) as u32, 1, 1, 256, &[
                 self.w.lm_head as u64, (self.s.mixed_final as u64 + (row * self.d.h * 4) as u64),
@@ -3792,6 +4025,8 @@ impl Engine {
         cuda::to_i32_into(p.pos_base, &[pos_base as i32]);
         // rope base for pooled blocks = BLOCK index base (kernel multiplies by 4)
         let qc = self.d.qsa_compress;
+        // Crow #300 phase 2: the pooled-block tables are the QSA arm (qc = 0 without it)
+        let rows = rows && qc > 0;
         if rows { cuda::to_i32_into(p.pos_base_b4, &[(pos_base / qc) as i32]); }
         cuda::to_i32_into(p.slot_base, &[pos_base as i32]);
         if rows {
@@ -3809,6 +4044,9 @@ impl Engine {
             cuda::to_i32_into(p.nt_6144, &[((t * self.d.gdn_val) as i32)]);
             cuda::to_i32_into(p.nt_combo, &[((t * self.d.topk * self.d.inter) as i32)]);
             cuda::to_i32_into(self.pf_ncombo, &[(t * self.d.topk) as i32]);
+            if self.p.nt_dinter != 0 {
+                cuda::to_i32_into(p.nt_dinter, &[(t * self.d.dense_inter) as i32]);
+            }
         }
     }
 
@@ -3873,6 +4111,44 @@ impl Engine {
     /// since the activation-floor fix of 2026-09-23; it adds the per-row
     /// power-of-two pre-scale the fused `mix_streams_q` cannot), so the
     /// sub-block is fed what the default production path feeds it.
+    /// Crow #300 phase 2: one sub-block of a dense layer over host rows, for the goldens of
+    /// `oracle/export_qwen35_goldens.py`. `kind`: "ln1" (input_layernorm) and "mlp" over
+    /// `t` rows; "attn" / "gdn" over a prompt of `t` rows from position 0 and the zero
+    /// state (the call resets the engine first); "attn_step" / "gdn_step" over one row at
+    /// `pos_base` through the decode path, on the KV rows and states the calls before it
+    /// left. Returns `[t][H]` f32.
+    ///
+    /// # Safety
+    ///
+    /// A CUDA context must be current and no kernel of this engine may be in flight on
+    /// another thread (as for `prefill`); the call resets the engine's position.
+    pub unsafe fn run_subblock_p2(&mut self, kind: &str, l: usize, x_host: &[f32], t: usize, pos_base: usize) -> Vec<f32> {
+        assert_eq!(x_host.len(), t * self.d.h, "sub-block input must be [T][H]");
+        let step = kind.ends_with("_step");
+        assert!(!step || t == 1, "a step sub-block takes one row");
+        if matches!(kind, "attn" | "gdn") {
+            assert_eq!(pos_base, 0, "a prompt sub-block starts at position 0");
+            self.reset_to_zero();
+        }
+        cuda::to_f32_into(self.s.mixed, x_host);
+        self.upload_chunk_scalars(t, pos_base, pos_base == 0, ScalarSet::Full);
+        cuda::to_i32_into(self.p.slot1, &[pos_base as i32]);
+        let out = match kind {
+            "ln1" => {
+                self.rms_rows(self.s.mixed, self.dw().ln1[l], self.s.mixed_m, t);
+                self.s.mixed_m
+            }
+            "mlp" => self.dense_ffn(l, self.s.mixed, t),
+            "attn" => self.attn_full_prompt(l, self.s.mixed, t, 0),
+            "attn_step" => self.attn_full_step(l, self.s.mixed),
+            "gdn" => self.gdn_prompt(l, self.s.mixed, t, true),
+            "gdn_step" => self.gdn_step(l, self.s.mixed),
+            k => panic!("unknown phase 2 sub-block {k:?}"),
+        };
+        cuda::sync();
+        cuda::dtoh(out, t * self.d.h)
+    }
+
     pub unsafe fn run_attn_subblock(&mut self, l: usize, x_host: &[f32], t: usize, pos_base: usize) -> Vec<f32> {
         assert!(self.d.is_attn(l), "layer {l} is not an attention layer");
         assert_eq!(x_host.len(), t * self.d.h, "attn subblock input must be [T][H]");
@@ -4026,7 +4302,7 @@ impl Engine {
                 // C5: the residual arm, attention side (Hc: mix the streams into `mixed`)
                 match self.geo.residual {
                     Residual::Hc { .. } => self.hc_run(&self.w.hc[l], self.s.h, t, mixed, injw),
-                    Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, self.geo.family),
+                    Residual::Plain => self.rms_rows(self.s.h, self.dw().ln1[l], mixed, t),
                 }
                 let dbg = dbg_sync();
                 if dbg {
@@ -4048,7 +4324,7 @@ impl Engine {
                     // C5: the attention arm (Qsa: the indexer's block selection, then attention)
                     SubW::Attn { .. } => match self.geo.attn {
                         Attn::Qsa { .. } => self.attn_prompt(l, mixed, t, pos_base),
-                        Attn::Full => unbuilt_arm(Block::ATTN_FULL, self.geo.family),
+                        Attn::Full => self.attn_full_prompt(l, mixed, t, pos_base),
                     },
                 };
                 dump0("sub", sub, t * self.d.h);
@@ -4091,11 +4367,11 @@ impl Engine {
                         tracing::info!(target: "nanwatch", "[nanwatch] after layer {l}: nan=0 inf=0 max_abs={mx:.3e}");
                     }
                 }
-                // x1 = h + sub ⊗ injw (C5: the residual arm)
+                // x1 = h + sub ⊗ injw (C5: the residual arm; Plain: h += sub in place)
                 match self.geo.residual {
                     Residual::Hc { .. } => launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (t * (self.d.h / 256)) as u32, 1, 256, &[
                         self.s.h as u64, sub as u64, self.s.injw as u64, self.s.x1 as u64]),
-                    Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, self.geo.family),
+                    Residual::Plain => self.residual_add(sub, t),
                 }
                 if nan_watch && l == 0 {
                     cuda::sync();
@@ -4109,7 +4385,7 @@ impl Engine {
                 // C5: the residual arm, FFN side
                 match self.geo.residual {
                     Residual::Hc { .. } => self.hc_run(&self.w.hc2[l], self.s.x1, t, self.s.mixed_m, self.s.injw),
-                    Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, self.geo.family),
+                    Residual::Plain => self.rms_rows(self.s.h, self.dw().ln2[l], self.s.mixed_m, t),
                 }
                 if nan_watch && l == 0 {
                     cuda::sync();
@@ -4127,14 +4403,14 @@ impl Engine {
                 // C5: the FFN arm (Moe: router, hot and cold experts, shared expert)
                 let moe = match self.geo.ffn {
                     Ffn::Moe { .. } => self.moe_run(l, self.s.mixed_m, t),
-                    Ffn::Dense { .. } => unbuilt_arm(Block::FFN_DENSE, self.geo.family),
+                    Ffn::Dense { .. } => self.dense_ffn(l, self.s.mixed_m, t),
                 };
                 dump0("moe-rlog", self.s.rlog, t * self.d.e);
                 dump0("moe-rwts", self.s.rwts, t * self.d.topk);
                 dump0("moe-h1", self.s.h1, t * self.d.topk * 2 * self.d.inter);
                 dump0("moe-eo", self.s.eo, t * self.d.topk * self.d.h);
                 dump0("moe-out", moe, t * self.d.h);
-                if l == 0 { if let Some(dir) = dump_h() {
+                if l == 0 && self.d.e > 0 { if let Some(dir) = dump_h() {
                     // grouped-GEMM plan of layer 0: perm [t*10] i32, tiles [n_tiles] int4, rids [t*10]
                     cuda::sync();
                     let wr = |tag: &str, v: Vec<i32>| {
@@ -4161,7 +4437,7 @@ impl Engine {
                 match self.geo.residual {
                     Residual::Hc { .. } => launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (t * (self.d.h / 256)) as u32, 1, 256, &[
                         self.s.x1 as u64, moe as u64, self.s.injw as u64, self.s.h as u64]),
-                    Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, self.geo.family),
+                    Residual::Plain => self.residual_add(moe, t),
                 }
                 // CROW_DUMP_H=<dir>: per-layer residual-stream dump (determinism bisect)
                 if let Some(dir) = dump_h() {
@@ -4171,7 +4447,10 @@ impl Engine {
                 }
             }
             self.pf_dma_live.set(false);
-            self.done_blocks = (pos_base + t) / self.d.qsa_compress;
+            // Crow #300 phase 2: full attention has no blocks (qsa_compress 0)
+            if let Some(b) = (pos_base + t).checked_div(self.d.qsa_compress) {
+                self.done_blocks = b;
+            }
             self.pos = pos_base + t;
             self.history.extend_from_slice(chunk);
             start += t;
@@ -4204,7 +4483,7 @@ impl Engine {
             // C5: the final-norm arm (HcMixer: the model-level hyper-connection mixer)
             match self.geo.final_norm {
                 FinalNorm::HcMixer => self.head_run(t),
-                FinalNorm::Rms => unbuilt_arm(Block::FINAL_NORM_RMS, self.geo.family),
+                FinalNorm::Rms => self.rms_rows(self.s.h, self.dw().norm, self.s.mixed_final, t),
             }
             if let Some(out) = collect_logits.as_deref_mut() {
                 for i in 0..t {
@@ -4241,7 +4520,9 @@ impl Engine {
             cuda::set_stream(self.cap_stream);
         }
 
-        let qc = self.d.qsa_compress;
+        // Crow #300 phase 2: full attention has no blocks (qsa_compress 0); any qc > 0 keeps
+        // the QSA scalars below finite, and no launch of that family reads them
+        let qc = self.d.qsa_compress.max(1);
         let bb_if_complete = if (pos + 1) % qc == 0 { (pos + 1) / qc - 1 } else { 0 };
         let ncb1 = (((pos + 1) / qc).min(self.st.context.div_ceil(qc))) as i32;
         // QSA block bookkeeping for this token: a block completes when
@@ -4356,7 +4637,7 @@ impl Engine {
             // C5: the residual arm, attention side
             match self.geo.residual {
                 Residual::Hc { .. } => self.hc_run(&self.w.hc[l], self.s.h, 1, self.s.mixed, self.s.injw),
-                Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, self.geo.family),
+                Residual::Plain => self.rms_rows(self.s.h, self.dw().ln1[l], self.s.mixed, 1),
             }
             let d_hc = t_hc.elapsed().as_micros() as u64;
             if prof {
@@ -4377,7 +4658,7 @@ impl Engine {
                 // C5: the attention arm
                 SubW::Attn { .. } => match self.geo.attn {
                     Attn::Qsa { .. } => self.attn_step(l, self.s.mixed, pos, &self.sb_pack, graph),
-                    Attn::Full => unbuilt_arm(Block::ATTN_FULL, self.geo.family),
+                    Attn::Full => self.attn_full_step(l, self.s.mixed),
                 },
             };
             let d_sub = t_sub.elapsed().as_micros() as u64;
@@ -4395,12 +4676,15 @@ impl Engine {
                         self.s.h as u64, sub as u64, self.s.injw as u64, self.s.x1 as u64]);
                     self.hc_run(&self.w.hc2[l], self.s.x1, 1, self.s.mixed_m, self.s.injw);
                 }
-                Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, self.geo.family),
+                Residual::Plain => {
+                    self.residual_add(sub, 1);
+                    self.rms_rows(self.s.h, self.dw().ln2[l], self.s.mixed_m, 1);
+                }
             }
             let t_moe = std::time::Instant::now();
             let moe = match self.geo.ffn {
                 Ffn::Moe { .. } => self.moe_run(l, self.s.mixed_m, 1),
-                Ffn::Dense { .. } => unbuilt_arm(Block::FFN_DENSE, self.geo.family),
+                Ffn::Dense { .. } => self.dense_ffn(l, self.s.mixed_m, 1),
             };
             if prof {
                 prof::add(&prof::MOE, t_moe.elapsed().as_micros() as u64);
@@ -4414,14 +4698,14 @@ impl Engine {
             match self.geo.residual {
                 Residual::Hc { .. } => launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (self.d.h / 256) as u32, 1, 256, &[
                     self.s.x1 as u64, moe as u64, self.s.injw as u64, self.s.h as u64]),
-                Residual::Plain => unbuilt_arm(Block::RESIDUAL_PLAIN, self.geo.family),
+                Residual::Plain => self.residual_add(moe, 1),
             }
         }
         t_head = std::time::Instant::now();
         // C5: the final-norm arm
         match self.geo.final_norm {
             FinalNorm::HcMixer => self.head_run(1),
-            FinalNorm::Rms => unbuilt_arm(Block::FINAL_NORM_RMS, self.geo.family),
+            FinalNorm::Rms => self.rms_rows(self.s.h, self.dw().norm, self.s.mixed_final, 1),
         }
         self.lm_head_row(0);
         launch_v(self.k.f("argmax_k"), 1, 1, 1, 1024, &[
@@ -4477,7 +4761,7 @@ impl Engine {
         self.pos = pos + 1;
         self.history.push(id);
         if complete {
-            self.done_blocks = (pos + 1) / self.d.qsa_compress;
+            self.done_blocks = (pos + 1) / qc;
         }
         // #13: the decode-path forensics of requirement 4, TRACE only
         // (`CROW_LOG=info,decode=trace` asks for it; an operator never sees it).
@@ -4629,6 +4913,9 @@ impl Engine {
     /// Needs CROW_COLD_TIER (full low-bit tier). Stream-ordered; call between
     /// prefill and decode (never inside the captured graph).
     pub unsafe fn adapt_hot_set(&mut self, max_swaps: usize) -> usize {
+        if self.d.e == 0 {
+            return 0; // Crow #300 phase 2: a dense FFN has no hot set
+        }
         if self.res.lb.is_some() && !self.res.full {
             tracing::warn!(target: "adapt", "[adapt] cold-only low-bit tier: hot experts have no record to fall back to - no adaptation");
             return 0;
@@ -4667,6 +4954,9 @@ impl Engine {
     /// (selections since the last tick, decayed by CROW_ADAPT_DECAY), scaled by
     /// 1024 for the planner's integer ranking. None when the window is off.
     pub unsafe fn window_counts(&mut self) -> Option<Vec<Vec<u64>>> {
+        if self.d.e == 0 {
+            return None; // Crow #300 phase 2: no experts
+        }
         if std::env::var("CROW_ADAPT_WINDOW").as_deref() != Ok("1") {
             return None;
         }
@@ -4698,6 +4988,9 @@ impl Engine {
     }
 
     pub unsafe fn adapt_tick(&mut self, max_swaps: usize) -> usize {
+        if self.d.e == 0 {
+            return 0; // Crow #300 phase 2: a dense FFN has no hot set
+        }
         if std::env::var("CROW_ADAPT_WINDOW").as_deref() != Ok("1") {
             return self.adapt_hot_set(max_swaps);
         }
@@ -4746,6 +5039,9 @@ impl Engine {
     /// compute. Exact three-way exchange as `swap_in`, host RAM never grows.
     /// Returns the number of new swaps started.
     pub unsafe fn trickle_tick(&mut self, plan: bool, max_per_layer: usize) -> usize {
+        if self.d.e == 0 {
+            return 0; // Crow #300 phase 2: a dense FFN has no hot set
+        }
         assert!(self.res.lb.is_none(), "stream trickle: exact NVFP4 tier only");
         assert!(self.res.stride > self.res.n, "stream trickle needs CROW_ADAPT_STREAM=1 (spare hot slots)");
         // #63b: a tick whose `decode_step` never ran (EOS stop in
@@ -4912,6 +5208,9 @@ impl Engine {
     }
     /// drain per-expert selection counts (warm-up bookkeeping, [48][512])
     pub unsafe fn drain_sel_counts(&self) -> Vec<Vec<u64>> {
+        if self.d.e == 0 {
+            return vec![Vec::new(); self.d.layers]; // Crow #300 phase 2: no experts, no counts
+        }
         let raw = cuda::dtoh_u64(self.sel_counts, self.d.layers * self.d.e);
         (0..self.d.layers).map(|l| raw[l * self.d.e..(l + 1) * self.d.e].to_vec()).collect()
     }
@@ -5099,6 +5398,18 @@ impl Drop for Weights {
                     }
                 }
             }
+            if let Some(dw) = self.dense.as_mut() {
+                for d in dw.ln1.iter_mut().chain(dw.ln2.iter_mut()) {
+                    cuda::free_dev(d);
+                }
+                for m in dw.mlp.iter_mut() {
+                    for w in [&mut m.gate, &mut m.up, &mut m.down] {
+                        free_pw(w);
+                    }
+                }
+                cuda::free_dev(&mut dw.norm);
+                free_pw(&mut dw.lm_head);
+            }
             for m in self.moe.iter_mut() {
                 cuda::free_dev(&mut m.router);
                 // #18: the bf16 router twin (2.62 MB x 48 layers = 125.8 MB) was never
@@ -5146,7 +5457,8 @@ impl Drop for Params {
                       &mut self.q_heads1, &mut self.pos_mul1, &mut self.pos_mul4, &mut self.stride512,
                       &mut self.stride128, &mut self.keys_ring, &mut self.qk_stride, &mut self.ncb1, &mut self.pos_row1,
                       &mut self.k_top10, &mut self.nt_hct1,
-                      &mut self.nr4, &mut self.nr48, &mut self.nr512] {
+                      &mut self.nr4, &mut self.nr48, &mut self.nr512,
+                      &mut self.n_gdn_conv, &mut self.n_core, &mut self.n_dinter, &mut self.nt_dinter] {
                 cuda::free_dev(f);
             }
         }

@@ -156,7 +156,7 @@ fn main() {
     unsafe {
         let _ctx = cuda::Ctx::init();
         let module = cuda::compile(&crow_nest_engine::kernels::KernelGeo::flash_next().source());
-        let k = Kernels::new(&module);
+        let k = Kernels::new(&module, false);
 
         let n2560 = cuda::to_i32_dev(&[H as i32]);
         let n640 = cuda::to_i32_dev(&[INTER as i32]);

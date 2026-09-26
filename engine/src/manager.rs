@@ -340,54 +340,64 @@ impl ThreeStates {
         let sizes = StateSizes::plan(geo, cfg.context, cfg.kv, cfg.prompt_chunk);
         // the state bytes do not depend on N (the hot-expert count): one plan for the whole clamp loop
         let states_bytes = sizes.total();
-        let spare = cfg.adapt.spare; // #17: from the policy in geo.rs, not the env
-        let base = ClampInput {
-            n_hot: cfg.n_hot,
-            // C5: the hot-set clamp is the `Ffn::Moe` arm of the planner
-            experts: match geo.ffn {
-                Ffn::Moe { experts, .. } => experts,
-                Ffn::Dense { .. } => unbuilt_arm(Block::FFN_DENSE, geo.family),
-            },
-            states_bytes,
-            pending_bytes,
-            expert_bytes_per_n_unit,
-            cold_bytes_per_n_unit,
-            cold_fixed,
-            spare,
-            free0,
-            host_pinned_budget: cfg.host_pinned_budget,
-        };
-        let n = match grant_render_reserve(&base, render_reserve_requested) {
-            Ok(g) => {
-                rep.lines.extend(g.lines);
-                rep.lines.push(g.line);
-                rep.render_reserve = g.granted;
-                g.n
+        // C5: the hot-set clamp is the `Ffn::Moe` arm of the planner; a dense FFN has no
+        // hot set, so its plan is one sum (Crow #300 phase 2)
+        let n = match geo.ffn {
+            Ffn::Moe { experts, .. } => {
+                let spare = cfg.adapt.spare; // #17: from the policy in geo.rs, not the env
+                let base = ClampInput {
+                    n_hot: cfg.n_hot,
+                    experts,
+                    states_bytes,
+                    pending_bytes,
+                    expert_bytes_per_n_unit,
+                    cold_bytes_per_n_unit,
+                    cold_fixed,
+                    spare,
+                    free0,
+                    host_pinned_budget: cfg.host_pinned_budget,
+                };
+                let n = match grant_render_reserve(&base, render_reserve_requested) {
+                    Ok(g) => {
+                        rep.lines.extend(g.lines);
+                        rep.lines.push(g.line);
+                        rep.render_reserve = g.granted;
+                        g.n
+                    }
+                    // the refusal WITHOUT any reserve: the planner's own, as before #110
+                    Err(msg) => panic!("{msg}"),
+                };
+                // the rest of the plan counts the granted reserve as pending
+                let pending_bytes = pending_bytes + rep.render_reserve;
+                if n < cfg.n_hot {
+                    rep.lines.push(format!(
+                        "loader auto-clamped hot set: N {} -> {} (measured budget, spec 2.6)",
+                        cfg.n_hot, n
+                    ));
+                }
+                if n == N_MIN {
+                    let sum = sizes.kv_bytes
+                        + pending_bytes
+                        + N_MIN as u64 * expert_bytes_per_n_unit;
+                    if sum + SAFETY > free0 {
+                        panic!(
+                            "refusing config: even N={N_MIN} does not fit context {} states (need {:.2} GiB, free {:.2} GiB)",
+                            cfg.context,
+                            sum as f64 / GIB,
+                            free0 as f64 / GIB
+                        );
+                    }
+                }
+                n
             }
-            // the refusal WITHOUT any reserve: the planner's own, as before #110
-            Err(msg) => panic!("{msg}"),
-        };
-        // the rest of the plan counts the granted reserve as pending
-        let pending_bytes = pending_bytes + rep.render_reserve;
-        if n < cfg.n_hot {
-            rep.lines.push(format!(
-                "loader auto-clamped hot set: N {} -> {} (measured budget, spec 2.6)",
-                cfg.n_hot, n
-            ));
-        }
-        if n == N_MIN {
-            let sum = sizes.kv_bytes
-                + pending_bytes
-                + N_MIN as u64 * expert_bytes_per_n_unit;
-            if sum + SAFETY > free0 {
-                panic!(
-                    "refusing config: even N={N_MIN} does not fit context {} states (need {:.2} GiB, free {:.2} GiB)",
-                    cfg.context,
-                    sum as f64 / GIB,
-                    free0 as f64 / GIB
-                );
+            Ffn::Dense { .. } => {
+                let (granted, lines) = dense_fit(free0, states_bytes, pending_bytes, render_reserve_requested, cfg.context)
+                    .unwrap_or_else(|msg| panic!("{msg}"));
+                rep.lines.extend(lines);
+                rep.render_reserve = granted;
+                0
             }
-        }
+        };
 
         // ---- allocate (the real allocations ARE the measurement) ----
         let kv_buf = cuda::alloc_zeroed(sizes.kv_bytes as usize);
@@ -739,6 +749,39 @@ pub struct ReserveGrant {
 /// Measured case (engine.log 2026-09-25 07:44 UTC, 56a9740 boot 10:34 UTC): N=150,
 /// cold tier 369 units = 45.61 GiB against a 46.00 GiB cap. N may not drop below
 /// 147, so 1536 MiB (12.1 units) panicked at `clamp_hot_n`; granted here: 3 units.
+/// Crow #300 phase 2: the plan of a dense FFN, which has no hot set to clamp: the
+/// states and the pending bytes must fit the free VRAM with `SAFETY` to spare, or
+/// the boot refuses by name (the #102 rule: say what does not fit, never page).
+/// The render reserve is granted from what is left, best-effort as for MoE (#110).
+/// Returns (granted reserve, the `[budget]` lines).
+pub fn dense_fit(free0: u64, states_bytes: u64, pending_bytes: u64, requested: u64, context: usize) -> Result<(u64, Vec<String>), String> {
+    let gib = |b: u64| b as f64 / GIB;
+    let need = states_bytes + pending_bytes + SAFETY;
+    if need > free0 {
+        return Err(format!(
+            "refusing config: context {context} needs {:.2} GiB of states + {:.2} GiB pending + {:.2} GiB safety = {:.2} GiB, free {:.2} GiB - lower the context or use a smaller KV dtype (CROW_KV)",
+            gib(states_bytes), gib(pending_bytes), gib(SAFETY), gib(need), gib(free0)
+        ));
+    }
+    let room = free0 - need;
+    let granted = requested.min(room);
+    let mib = |b: u64| b as f64 / MIB;
+    let reserve = if requested == 0 {
+        "render reserve: requested 0 MiB, granted 0 MiB — off (CROW_RENDER_RESERVE_MB 0 or unset)".to_string()
+    } else if granted == requested {
+        format!("render reserve: requested {:.0} MiB, granted {:.0} MiB — the VRAM budget holds", mib(requested), mib(granted))
+    } else {
+        format!("render reserve: requested {:.0} MiB, granted {:.1} MiB — the VRAM budget binds", mib(requested), mib(granted))
+    };
+    Ok((granted, vec![
+        format!(
+            "dense FFN, no hot set: states {:.2} GiB + pending {:.2} GiB + safety {:.2} GiB fit free {:.2} GiB ({:.2} GiB left)",
+            gib(states_bytes), gib(pending_bytes), gib(SAFETY), gib(free0), gib(room)
+        ),
+        reserve,
+    ]))
+}
+
 pub fn grant_render_reserve(base: &ClampInput, requested: u64) -> Result<ReserveGrant, String> {
     let with = |r: u64| clamp_hot_n(&ClampInput { pending_bytes: base.pending_bytes + r, ..*base });
     let mib = |b: u64| b as f64 / MIB;
@@ -1416,9 +1459,9 @@ mod tests_300_c5 {
     }
 
     /// a dense Geo (the 27B fixture) plans no QSA ring or pool, no PLE state and
-    /// no hot set, and refuses at its first unbuilt block by name
+    /// no hot set, and passes the family check (Crow #300 phase 2)
     #[test]
-    fn a_dense_geo_plans_no_ple_qsa_or_hot_set_parts_and_refuses_by_name() {
+    fn a_dense_geo_plans_no_ple_qsa_or_hot_set_parts() {
         let g = crate::meta::dense_fixture_geo();
         let s = StateSizes::plan(&g, g.context_floor, KvDtype::Fp8E4m3, 512);
         assert_eq!((s.qsa_keys_bytes, s.qsa_ring_rows, s.qsa_pooled_bytes), (0, 0, 0), "no QSA indexer");
@@ -1433,9 +1476,23 @@ mod tests_300_c5 {
         assert_eq!(park_host_bytes(&g, 8_192, 100_000, 16, 1), 8_192 * 16 * 2 * 4 * 256, "KV rows only, no pooled blocks");
         assert_eq!(crate::boot::hot_set_sidecar(&g, Some("hot.json".into()), "d.json".into()), None, "no hot set");
         assert_eq!(g.context_floor, DENSE_CONTEXT_FLOOR);
-        assert_eq!(
-            g.built(),
-            Err("Residual::Plain (one pre-norm residual stream) for family Qwen35Dense not built yet (Crow #300 phase 2)".to_string())
-        );
+        assert_eq!(g.built(), Ok(()));
+    }
+
+    /// Crow #300 phase 2: the dense plan is one sum. It fits, grants the render reserve
+    /// from what is left (best-effort), and refuses by name when the states do not fit.
+    #[test]
+    fn the_dense_plan_fits_grants_the_reserve_best_effort_and_refuses_by_name() {
+        const G: u64 = 1 << 30;
+        let (granted, lines) = dense_fit(20 * G, 7 * G, G, 2 * G, 200_000).unwrap();
+        assert_eq!(granted, 2 * G);
+        assert!(lines[0].starts_with("dense FFN, no hot set: states 7.00 GiB + pending 1.00 GiB"), "{}", lines[0]);
+        assert!(lines[1].contains("both") || lines[1].contains("holds"), "{}", lines[1]);
+        let left = 20 * G - 8 * G - SAFETY;
+        let (granted, lines) = dense_fit(20 * G, 7 * G, G, 64 * G, 200_000).unwrap();
+        assert_eq!(granted, left, "granted what is left, not refused");
+        assert!(lines[1].contains("binds"), "{}", lines[1]);
+        let why = dense_fit(8 * G, 7 * G, G, 0, 200_000).unwrap_err();
+        assert!(why.starts_with("refusing config: context 200000 needs 7.00 GiB of states"), "{why}");
     }
 }

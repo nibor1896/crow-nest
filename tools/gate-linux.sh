@@ -282,8 +282,14 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="446"
-CLIPPY="1512"
+TESTS="448"
+CLIPPY="1510"
+#   tests 446 -> 448 / clippy 1512 -> 1510   Crow #300 phase 2, the dense 27B path (2026-09-26): +1
+#                              `kernels_p2::tests_300_p2` (the dense kernel source compiles, carries the phase 2 entries,
+#                              Flash-Next's source is unchanged) and +1 `manager::tests_300_c5` (the dense plan fits,
+#                              grants the reserve best-effort, refuses by name); three C5 refusal tests were rewritten
+#                              now that the dense arms are built. Clippy -2: `layer_cache_ptrs` lost two same-type casts
+#                              when its QSA lookups became `get(ai)`; no warning points into the new code.
 #   tests 436 -> 446 / clippy 1512 (unchanged)   Crow #300 phase 1 C6 + C7 (2026-09-26, on `1580320`): the merge of
 #                              `c6-converter-index` (`4dcf664`) brought +4 `cnq::tests_300_c6` (the v2 fixture round
 #                              trip, the f32 dtype, the v1-of-record rule, the refusals; +1 ignored, the real-container
