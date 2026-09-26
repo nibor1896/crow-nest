@@ -37,6 +37,10 @@ pub unsafe fn open_model(
     // quietly wrong numbers (the llama.cpp get_key discipline). Zero numeric
     // change on the checkpoint of record; `None` is the selftest package (no
     // models/ dir beside the container), which continues after a WARN line.
+    // Crow #300 C1/C2: the same door detects the model family, refuses unknown
+    // config keys by name, and derives the runtime `Geo`, asserted equal to
+    // `Geo::FLASH_NEXT` (a dense checkpoint prints its geometry and dies here).
+    // Nothing below reads the `Geo` yet: the consts stay in force until C3.
     let _meta = meta::assert_pinned(&cnq_path);
     let mut cnq = Cnq::open(&cnq_path);
     // #77 CROW_CNQ_OVERLAY: a second CNQ1 container opened BESIDE the base one, holding the

@@ -3864,7 +3864,7 @@ seed 1118, `reasoning_effort none`, card non-thinking row; main = an 8,640-token
 | output | the main turn's answer byte-identical with and without the side request, for a 2-token and a 32-token answer |
 | long side request | 12,087 tokens (longer than the held conversation): the snapshots are dropped, the old rule |
 
-## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18)
+## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18; 8.11 added 2026-09-26 with Crow #300 C1/C2)
 
 Sections 0 to 7 say what the engine must do. This section says how the crate is put together,
 so a reader who opens `engine/src` knows which file to open and what it may reach for. It was
@@ -3942,7 +3942,8 @@ base ones, so the shadowing is invisible to every reader above it.
 **`geo.rs`** — the model geometry and the runtime `Config`: the probe-pinned constants and
 their derivation chain, `KvDtype`, `Adapt` with `knobs()`, the two policy functions
 (`apply_chunk_policy`, `apply_adapt_policy`) and `env_parse::<T>`. Surface: 10 `pub fn`, 3
-types, 51 `pub const`. Depends on nothing. It is the one place a number that two modules must
+types, 51 `pub const`; since Crow #300 C2 also the runtime `Geo` with `Geo::FLASH_NEXT` and
+its family enums (`Family`, `Residual`, `Ffn`, `Attn`, `PleGeo`, `GateAct`, `FinalNorm`), 8.11. Depends on nothing. It is the one place a number that two modules must
 agree on is allowed to live (8.6).
 
 **`tokenizer.rs`** — the in-engine HF tokenizer and the minijinja chat template, producing ids
@@ -4078,7 +4079,8 @@ not line numbers — the files move.
    (#102, 2026-09-23: `bf16` / `fp8` / `fp8_e4m3`, anything else — the empty string included —
    panics `[boot] refused` before the container is mapped; until then only `decode parity` read
    it, so `serve` booted FP8 under `CROW_KV=bf16`), one WARN per `CROW_*` name in the environment
-   that has no row in `docs/env.md` (compiled in, names only), the #94 metadata gate, then
+   that has no row in `docs/env.md` (compiled in, names only), the #94 metadata gate (since Crow #300
+   C1/C2 also the family, the key ledger and the `Geo == Geo::FLASH_NEXT` assert, 8.11), then
    `Cnq::open` (trailer index, whole-file mapping), then `CROW_CNQ_OVERLAY` →
    `Cnq::attach_overlay` when it is set AND non-empty (#77: the bf16 dense overlay, with its
    refusal table and the `[overlay]` lines; unset or empty attaches nothing — the engine
@@ -4533,6 +4535,74 @@ is the documented bit-identical twin of the cascade `mix_streams_q` fuses and th
 `attn_prompt` makes itself when the fusion is off. With `CROW_MMA` unset the same golden read
 `max_abs` 0.4475 / `corr` 0.99180 all along, at HEAD and before the fix, which is what pinned the
 cause to the cascade and not to the kernels, the ring or the selection.
+
+### 8.11 Model families and the runtime `Geo` (Crow #300 phase 1, C1 + C2, 2026-09-26)
+
+crow-nest serves one model today, and every shape is a `geo.rs` const. Phase 1 of Crow #300 makes
+the shapes come from the checkpoint. C1 and C2 (this section) build the reader and the runtime
+geometry and assert them at boot. **No call site reads the `Geo` yet**: the consts stay in force,
+and moving the sites onto a `Geo` is C3. No kernel, buffer, loader or numeric changed.
+
+**Families.** `meta::ModelMeta` detects the family from `text_config.model_type`. Any other string
+refuses the parse by name.
+
+| family | `model_type` | residual | FFN | attention | PLE | gate act | final norm | boot |
+|---|---|---|---|---|---|---|---|---|
+| `FlashNext` | `qwen4_exp_text` | `Hc` (4 streams, low rank 320) | `Moe` (512 experts, top 10, 640, shared 640) | `Qsa` (4 heads, 1 kv, 128, ratio 4, 512 blocks) | layer 1 | sigmoid | `HcMixer` | runs; `Geo` must equal `Geo::FLASH_NEXT` |
+| `Qwen35Dense` | `qwen3_5_text` | `Plain` | `Dense` (17408) | `Full` (uncapped) | none | swish (= silu) | `Rms` | parsed, geometry printed, then refused: `dense Qwen3.5 family parsed; engine path not built yet (Crow #300 phase 2)` |
+
+**Expected values per family** (`meta::Expected`). The Flash-Next row is today's pins, read out of
+`geo` and `sample`, and gives the same 21 checks as before (the 20 of #94 phase 1 plus #96's
+`rope_type`). The check table text is byte-identical to `07d9340` on the real config and on a
+doctored one. The dense row is `Qwen/Qwen3.8-27B` @ `1d4bf0f2`: H 5120, 24 q / 4 kv heads x 256,
+GQA 6, 64 layers = 48 GDN + 16 attention (`layer % 4 == 3`), vocab 248,320, eos `[248046, 248044]`,
+theta 1e7, eps 1e-6, 32 rope pairs. It has no `ple_eos` check, so 20 checks.
+
+**The key ledger.** Every `text_config` key is consumed (it feeds a check or the `Geo`) or ignored by
+name, with the reason it cannot change a logit (`meta::IGNORED_KEYS`: dropout, init, `dtype`,
+`use_cache`, `pad_token_id`, the MTP descriptor while crow-nest#95 is open, router-loss terms, PLE
+table sizing that the container's shard shapes already fix). An unknown key, a key of the other
+family, or an unknown `rope_parameters` key refuses the parse and names every such key. A
+flat config (no `text_config`) may also carry the multimodal wrapper keys. Formula facts with one
+implemented value refuse any other value by name: `hidden_act` silu, `mamba_ssm_dtype` float32,
+`output_gate_type` sigmoid/swish/silu. The top-level and text `tie_word_embeddings` must agree.
+
+**`geo::Geo`**, 35 fields, derived by `ModelMeta::geo`:
+
+| field group | Flash-Next (`Geo::FLASH_NEXT`, from the consts) | Qwen3.8-27B (derived from the fixture) |
+|---|---|---|
+| hidden, residual | 2560, `Hc { 4, 320 }` | 5120, `Plain` |
+| layers / gdn / attn / interval | 48 / 36 / 12 / 4 | 64 / 48 / 16 / 4 |
+| q / kv heads, head dim, GQA | 24 / 2, 256, 12 | 24 / 4, 256, 6 |
+| attention, output gate, gate act, bias | `Qsa` (sel max 2051), true, `Sigmoid`, false | `Full`, true, `Silu`, false |
+| rope pairs, theta, mrope | 32, 1e7, [11, 11, 10] interleaved | same |
+| GDN key/value heads x dims, conv | 16 / 48 x 128 / 128, 4 | same |
+| FFN | `Moe { 512, 10, 640, 640 }` | `Dense { 17408 }` |
+| PLE | `{ layer 1, ngram 3, 8 heads/ngram, embed 2560, conv 4, eos 248044 }` | none |
+| final norm, (1 + w) norm, eps | `HcMixer`, true, 1e-6 | `Rms`, true, 1e-6 |
+| vocab, tied lm_head, context max / floor | 248,320, false, 262,144 / 200,000 | 248,320, false, 262,144 / 200,000 (provisional; the per-family floor is C5) |
+| eos, MTP layers, vision out | [248046, 248044], 1, 2560 | [248046, 248044], 1, 5120 |
+
+`Geo` carries the derivation chain of the consts (`residual_width` = `HCT`, `q_rows`, `kv_rows`,
+`core`, `gqa`, `gdn_key`, `gdn_val`, `gdn_conv`, `Attn::sel_max` = `QSA_SEL_MAX`, `PleGeo::nheads` /
+`emb_dim`, `is_attn`). `geo::tests_300` asserts that each one reproduces its const on
+`Geo::FLASH_NEXT`.
+
+**The boot door** (`meta::verdict`, pure; `meta::assert_pinned` panics on its `Err`):
+
+1. a red check of the family row gives the #94 table;
+2. no `Geo` form for a value (a fractional rope pair count, not two eos ids, not three mrope sections, not one PLE layer) gives a named refusal;
+3. Flash-Next whose `Geo` differs from `Geo::FLASH_NEXT` gives `[meta] N of 35 runtime Geo fields differ from Geo::FLASH_NEXT` with one row per field, `config derives X, Geo::FLASH_NEXT pins Y`;
+4. dense prints the 35-row geometry and gives the named refusal;
+5. Flash-Next with everything equal logs `meta: 21 constants verified against config.json (zero numeric change) [...]; family FlashNext (qwen4_exp_text), runtime Geo == Geo::FLASH_NEXT (35 fields)`.
+
+All five are before `Cnq::open` and before the CUDA context. `assert_pinned` now returns
+`Option<(ModelMeta, Geo)>`, and `boot::open_model` still discards it; C3 threads it through.
+
+The 27B fixture is `engine/tests/fixtures/Qwen3.8-27B/{config.json, generation_config.json}`,
+copied from `models/Qwen3.8-27B/` (revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`,
+sha256-checked 2026-09-25). It is the only model config the repository tracks. The Flash-Next
+tests read the checkpoint of record in `models/`, as before.
 
 ## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
 

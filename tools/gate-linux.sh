@@ -282,8 +282,15 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="413"
+TESTS="421"
 CLIPPY="1522"
+#   tests 413 -> 421 / clippy 1522 (unchanged)   Crow #300 phase 1 C1+C2 (2026-09-26, on `07d9340`): one
+#                              `geo::tests_300` test (Geo::FLASH_NEXT derives every pinned const) and seven
+#                              `meta::tests` (family detection, the 27B fixture parse + its Geo, the Flash-Next
+#                              Geo == Geo::FLASH_NEXT, the unknown-key refusal, the unimplemented-value refusal,
+#                              the Geo mismatch table, the dense refusal). Each was shown red with its hunk
+#                              reverted. Measured 2026-09-26: lib 292 / 0 / 3 ignored, serve 118, decode 5,
+#                              parity 6 = 421 / 0; clippy 1522 (the one meta.rs warning moved, none added).
 #   v0.6.0 release gate (2026-09-25, `0263990`, decode_out/gate-0925-release): all nine items GREEN against the
 #                              values of record below - #110 (reserve default 0), #117 (VMM, same bytes) and #118
 #                              (serve only) moved no numerics. No value re-recorded.

@@ -6,6 +6,24 @@
 
 ## Unreleased
 
+### Added
+
+- **The metadata gate knows model families, and derives a runtime `Geo`** (Crow #300 phase 1, C1 + C2, 2026-09-26; was crow-nest#94 phase 2). This is the groundwork for serving more than one model; the engine still computes only with the `geo.rs` consts. `docs/architecture.md` 8.11.
+  - `meta.rs` detects the family from `text_config.model_type`: `qwen4_exp_text` is Flash-Next, `qwen3_5_text` is the dense Qwen3.5/3.8 family. Any other value is refused by name.
+  - Each family has its own expected-values row. The Flash-Next row is today's pins: the same 21 checks as before, and on the real config and on a doctored one the check table text is byte-identical to `07d9340`. The dense row is `Qwen/Qwen3.8-27B` @ `1d4bf0f2`.
+  - Every `text_config` key is either consumed or on a named ignore list that gives the reason. An unknown key, a key belonging to the other family, or an unknown `rope_parameters` key refuses the parse and names the key. So does an unimplemented `hidden_act`, `mamba_ssm_dtype` or `output_gate_type` value.
+  - `geo::Geo` (35 fields) and `Geo::FLASH_NEXT`, which is written from the consts. A Flash-Next boot asserts that the config-derived `Geo` equals `Geo::FLASH_NEXT`; if not, it refuses with one table row per differing field.
+  - A dense checkpoint parses, prints its 35-row geometry and dies before the container or CUDA with `dense Qwen3.5 family parsed; engine path not built yet (Crow #300 phase 2)`. Checked on 2026-09-26 with `CROW_MODEL_DIR=../models/Qwen3.8-27B decode run`: no GPU process was started.
+  - New test fixture `engine/tests/fixtures/Qwen3.8-27B/` (`config.json` sha256 `191e0af2…`, `generation_config.json` `e70c136c…`). Eight new tests (`geo::tests_300` 1, `meta::tests` 7); each one was shown red with its implementation hunk reverted.
+
+### Changed
+
+- **`tools/gate-linux.sh` pins `TESTS=421`** (2026-09-26, was 413): +1 `geo::tests_300` and +7 `meta::tests` (Crow #300 C1 + C2). The count is lib 292 / 3 ignored + serve 118 + parity 6 + decode 5. `CLIPPY=1522` is unchanged, and no new warning appeared.
+
+### Known limitations
+
+- **Crow #300 phase 1 is not finished.** No call site reads the `Geo` yet. C3 threads it from `boot::open_model` to the host sites, and C4 moves the kernel `#define`s (proof: the PTX of record is byte-identical). The dense `context_floor` of 200,000 is provisional; the per-family floor is C5.
+
 ## 2026-09-25 — v0.6.0: VRAM lent to Crow's renderer, the main conversation parked across side requests, the render reserve made best-effort, and the gate values of record
 
 serve now shares the GPU with Crow instead of fighting it. While idle it lends about 1.7 GiB of stateless scratch VRAM to Crow's `render_page` and maps it back at the same addresses, so the captured decode graph stays valid (#117; lend 1-5 ms, return 1-8 ms live in the 2026-09-25 lighthouse run). A short unrelated request, Crow's judge, no longer throws away the main conversation's prefix cache: before the fix it caused 37 full re-prefills on 2026-09-25, 4,590 s in total. The main conversation is now parked in host RAM and the next main turn resumes warm (#118; live on 2026-09-25: prefill 28 of 8,668 tokens instead of 8,640, same seeded answer with and without the side request). The static render reserve of #110 refused the boot on the 46 GiB pinned cap; it is now best-effort and off by default. The GPU gate has new values of record (#94 phase 2 C0), and all nine items are GREEN on the release head `0263990`. 7 commits since v0.5.0, `eb0913f`..`0263990`.

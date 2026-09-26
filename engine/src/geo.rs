@@ -296,3 +296,353 @@ pub fn apply_adapt_policy(cfg: &mut Config) {
         a.spare, a.every, a.max
     );
 }
+
+// ---- Crow #300 phase 1 (C2): the runtime geometry ----
+//
+// `Geo` is the geometry a checkpoint's config DERIVES (`meta::ModelMeta::geo`),
+// as one runtime value instead of the compile-time consts above. C2 only builds
+// it and asserts it at boot: on the Flash-Next checkpoint the derived `Geo` must
+// equal `Geo::FLASH_NEXT`, which is written FROM the consts above, so a config
+// that derives anything else refuses the boot with a table of the differing
+// fields. Every call site still reads the consts; moving them onto a `Geo` is
+// C3. Nothing here is read by a kernel, a buffer size or a loader yet.
+
+/// the model families this engine can parse (`text_config.model_type`)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Family {
+    /// `qwen4_exp_text`: Qwen3.8-Flash-Next, the checkpoint of record — hyper-
+    /// connection residual, 512-expert MoE, QSA attention, one PLE layer
+    FlashNext,
+    /// `qwen3_5_text`: the dense Qwen3.5 / Qwen3.8 family (Qwen3.8-27B) — plain
+    /// pre-norm residual, dense SwiGLU, full causal attention. Parsed, not run
+    /// (Crow #300 phase 2 builds the engine path)
+    Qwen35Dense,
+}
+
+impl Family {
+    /// the `text_config.model_type` string of the family
+    pub fn model_type(self) -> &'static str {
+        match self {
+            Family::FlashNext => "qwen4_exp_text",
+            Family::Qwen35Dense => "qwen3_5_text",
+        }
+    }
+    /// every family, in table order
+    pub const ALL: [Family; 2] = [Family::FlashNext, Family::Qwen35Dense];
+}
+
+/// the residual stream: hyper-connection streams (mixed in and out of every
+/// sub-block) or one plain pre-norm residual
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Residual {
+    Hc { streams: usize, lowrank: usize },
+    Plain,
+}
+
+/// the feed-forward block of every layer
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ffn {
+    /// routed experts plus one shared expert (and its sigmoid gate)
+    Moe { experts: usize, topk: usize, expert_inter: usize, shared_inter: usize },
+    /// one dense SwiGLU of width `inter`
+    Dense { inter: usize },
+}
+
+/// what the full-attention layers attend over
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Attn {
+    /// the QSA indexer picks `block_topk` compressed blocks (`sel_max` rows)
+    Qsa { heads: usize, kv_heads: usize, head_dim: usize, compress: usize, block_topk: usize },
+    /// uncapped causal attention over every row
+    Full,
+}
+
+impl Attn {
+    /// the most rows one query attends (`QSA_SEL_MAX`); `None` = uncapped
+    pub const fn sel_max(self) -> Option<usize> {
+        match self {
+            Attn::Qsa { compress, block_topk, .. } => Some(block_topk * compress + compress - 1),
+            Attn::Full => None,
+        }
+    }
+}
+
+/// the per-layer n-gram embedding (PLE) of one layer
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PleGeo {
+    /// 0-based layer index (config `ple_layer_ids` is 1-based)
+    pub layer: usize,
+    pub ngram: usize,
+    pub heads_per_ngram: usize,
+    /// the concatenated embedding width (`ple_embed_dim`)
+    pub embed: usize,
+    pub conv_kernel: usize,
+    /// the shard end marker, the text config's own eos id
+    pub eos: i64,
+}
+
+impl PleGeo {
+    pub const fn nheads(self) -> usize {
+        (self.ngram - 1) * self.heads_per_ngram
+    }
+    pub const fn emb_dim(self) -> usize {
+        self.embed / self.nheads()
+    }
+}
+
+/// the attention output gate's activation (`output_gate_type`)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GateAct {
+    Sigmoid,
+    /// `swish` in the config: x·sigmoid(x)
+    Silu,
+}
+
+/// what turns the last layer's residual into the lm_head input
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FinalNorm {
+    /// the model-level hyper-connection mixer (`head_run`)
+    HcMixer,
+    /// one RMSNorm
+    Rms,
+}
+
+/// the runtime geometry of one checkpoint (C2). Every field is a number or a
+/// formula switch the engine computes with; `meta::ModelMeta::geo` derives it
+/// from config.json + generation_config.json + the family table.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Geo {
+    pub family: Family,
+    pub hidden: usize,
+    pub residual: Residual,
+    pub layers: usize,
+    pub gdn_layers: usize,
+    pub attn_layers: usize,
+    /// layer % interval == interval - 1 is full attention
+    pub attn_interval: usize,
+    pub q_heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub attn: Attn,
+    pub attn_output_gate: bool,
+    pub gate_act: GateAct,
+    pub attention_bias: bool,
+    pub rope_pairs: usize,
+    pub rope_theta: f64,
+    pub mrope_section: [usize; 3],
+    pub mrope_interleaved: bool,
+    pub gdn_key_heads: usize,
+    pub gdn_value_heads: usize,
+    pub gdn_key_dim: usize,
+    pub gdn_value_dim: usize,
+    pub conv_kernel: usize,
+    pub ffn: Ffn,
+    pub ple: Option<PleGeo>,
+    pub final_norm: FinalNorm,
+    /// RMSNorm weight applied as (1 + w) (the zero-centred gamma of the family)
+    pub norm_one_plus_w: bool,
+    pub rms_eps: f64,
+    pub vocab: usize,
+    pub tie_word_embeddings: bool,
+    /// the checkpoint's `max_position_embeddings` (`Config::default().context`)
+    pub context_max: usize,
+    /// the context the boot allocates at least (`CONTEXT_FLOOR`)
+    pub context_floor: usize,
+    /// the generation stop ids (`sample::EOS_IDS`)
+    pub eos_ids: [usize; 2],
+    pub mtp_layers: usize,
+    /// the vision merger's output width; `None` = no vision tower in the config
+    pub vision_out_hidden: Option<usize>,
+}
+
+impl Geo {
+    /// today's compile-time geometry, written from the consts above (and the
+    /// literals the kernels and the boot table pin: eps 1e-6, theta 1e7, the
+    /// sigmoid gate, the (1 + w) norm, conv kernel 4). A Flash-Next boot asserts
+    /// the config-derived `Geo` equal to this.
+    pub const FLASH_NEXT: Geo = Geo {
+        family: Family::FlashNext,
+        hidden: H,
+        residual: Residual::Hc { streams: HCN, lowrank: LOWRANK },
+        layers: LAYERS,
+        gdn_layers: GDN_LAYERS,
+        attn_layers: ATTN_LAYERS,
+        attn_interval: 4,
+        q_heads: NQ,
+        kv_heads: NKV,
+        head_dim: AHD,
+        attn: Attn::Qsa {
+            heads: QSA_HEADS,
+            kv_heads: QSA_KVHEADS,
+            head_dim: QSA_HD,
+            compress: QSA_COMPRESS,
+            block_topk: QSA_BLOCK_TOPK,
+        },
+        attn_output_gate: true,
+        gate_act: GateAct::Sigmoid,
+        attention_bias: false,
+        rope_pairs: ROPE_PAIRS,
+        rope_theta: 1e7,
+        mrope_section: [11, 11, 10],
+        mrope_interleaved: true,
+        gdn_key_heads: GDN_KHEADS,
+        gdn_value_heads: GDN_VHEADS,
+        gdn_key_dim: GD,
+        gdn_value_dim: GDN_VAL / GDN_VHEADS,
+        conv_kernel: 4,
+        // the shared expert runs through the same 640/1280 silu·mul chain
+        ffn: Ffn::Moe { experts: E, topk: TOPK, expert_inter: INTER, shared_inter: INTER },
+        ple: Some(PleGeo {
+            layer: PLE_LAYER,
+            ngram: PLE_NGRAM,
+            heads_per_ngram: PLE_HEADS_PER_NGRAM,
+            embed: PLE_EMBED,
+            conv_kernel: 4,
+            eos: PLE_EOS,
+        }),
+        final_norm: FinalNorm::HcMixer,
+        norm_one_plus_w: true,
+        rms_eps: 1e-6,
+        vocab: V,
+        tie_word_embeddings: false,
+        context_max: 262_144,
+        context_floor: CONTEXT_FLOOR,
+        // = sample::EOS_IDS (sample depends on geo, so the equality is a test)
+        eos_ids: [248046, PLE_EOS as usize],
+        mtp_layers: 1,
+        vision_out_hidden: Some(H),
+    };
+
+    // the derivation chain of the consts above, per Geo
+
+    /// hyper-connection streams (1 for a plain residual)
+    pub const fn hc_streams(&self) -> usize {
+        match self.residual {
+            Residual::Hc { streams, .. } => streams,
+            Residual::Plain => 1,
+        }
+    }
+    /// the residual stream width (`HCT` on Flash-Next)
+    pub const fn residual_width(&self) -> usize {
+        self.hc_streams() * self.hidden
+    }
+    /// query + output gate rows (`Q_ROWS`)
+    pub const fn q_rows(&self) -> usize {
+        self.q_heads * self.head_dim * if self.attn_output_gate { 2 } else { 1 }
+    }
+    pub const fn kv_rows(&self) -> usize {
+        self.kv_heads * self.head_dim
+    }
+    /// the attention core width (`CORE`)
+    pub const fn core(&self) -> usize {
+        self.q_heads * self.head_dim
+    }
+    /// query heads per kv head (the kernels' `head / 12`)
+    pub const fn gqa(&self) -> usize {
+        self.q_heads / self.kv_heads
+    }
+    pub const fn gdn_key(&self) -> usize {
+        self.gdn_key_heads * self.gdn_key_dim
+    }
+    pub const fn gdn_val(&self) -> usize {
+        self.gdn_value_heads * self.gdn_value_dim
+    }
+    /// the GDN conv channels: q, k and v (`GDN_CONV`)
+    pub const fn gdn_conv(&self) -> usize {
+        self.gdn_key() * 2 + self.gdn_val()
+    }
+    pub const fn is_attn(&self, layer: usize) -> bool {
+        layer % self.attn_interval == self.attn_interval - 1
+    }
+
+    /// every field as (name, rendered value), in declaration order — the boot
+    /// print and the mismatch table are both this list
+    pub fn rows(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("family", format!("{:?} ({})", self.family, self.family.model_type())),
+            ("hidden", self.hidden.to_string()),
+            ("residual", format!("{:?}", self.residual)),
+            ("layers", self.layers.to_string()),
+            ("gdn_layers", self.gdn_layers.to_string()),
+            ("attn_layers", self.attn_layers.to_string()),
+            ("attn_interval", self.attn_interval.to_string()),
+            ("q_heads", self.q_heads.to_string()),
+            ("kv_heads", self.kv_heads.to_string()),
+            ("head_dim", self.head_dim.to_string()),
+            ("attn", format!("{:?}", self.attn)),
+            ("attn_output_gate", self.attn_output_gate.to_string()),
+            ("gate_act", format!("{:?}", self.gate_act)),
+            ("attention_bias", self.attention_bias.to_string()),
+            ("rope_pairs", self.rope_pairs.to_string()),
+            ("rope_theta", format!("{:?}", self.rope_theta)),
+            ("mrope_section", format!("{:?}", self.mrope_section)),
+            ("mrope_interleaved", self.mrope_interleaved.to_string()),
+            ("gdn_key_heads", self.gdn_key_heads.to_string()),
+            ("gdn_value_heads", self.gdn_value_heads.to_string()),
+            ("gdn_key_dim", self.gdn_key_dim.to_string()),
+            ("gdn_value_dim", self.gdn_value_dim.to_string()),
+            ("conv_kernel", self.conv_kernel.to_string()),
+            ("ffn", format!("{:?}", self.ffn)),
+            ("ple", format!("{:?}", self.ple)),
+            ("final_norm", format!("{:?}", self.final_norm)),
+            ("norm_one_plus_w", self.norm_one_plus_w.to_string()),
+            ("rms_eps", format!("{:?}", self.rms_eps)),
+            ("vocab", self.vocab.to_string()),
+            ("tie_word_embeddings", self.tie_word_embeddings.to_string()),
+            ("context_max", self.context_max.to_string()),
+            ("context_floor", self.context_floor.to_string()),
+            ("eos_ids", format!("{:?}", self.eos_ids)),
+            ("mtp_layers", self.mtp_layers.to_string()),
+            ("vision_out_hidden", format!("{:?}", self.vision_out_hidden)),
+        ]
+    }
+
+    /// the fields where `self` differs from `want`: (name, self, want)
+    pub fn diff(&self, want: &Geo) -> Vec<(&'static str, String, String)> {
+        let mut d: Vec<_> = self
+            .rows()
+            .into_iter()
+            .zip(want.rows())
+            .filter(|((_, a), (_, b))| a != b)
+            .map(|((name, a), (_, b))| (name, a, b))
+            .collect();
+        // a field `rows` forgot must still refuse: the derived PartialEq decides
+        if d.is_empty() && self != want {
+            d.push(("(a field missing from Geo::rows)", format!("{self:?}"), format!("{want:?}")));
+        }
+        d
+    }
+}
+
+#[cfg(test)]
+mod tests_300 {
+    use super::*;
+
+    /// `Geo::FLASH_NEXT` and its derivation chain reproduce every compile-time
+    /// const the call sites read today (the C3 migration moves a site from the
+    /// const to the Geo; this is the table it must agree with)
+    #[test]
+    fn flash_next_geo_derives_every_pinned_const() {
+        let g = Geo::FLASH_NEXT;
+        assert_eq!(g.residual_width(), HCT);
+        assert_eq!(g.q_rows(), Q_ROWS);
+        assert_eq!(g.kv_rows(), KV_ROWS);
+        assert_eq!(g.core(), CORE);
+        assert_eq!(g.gqa(), 12, "the kernels' `head / 12`");
+        assert_eq!(g.gdn_key(), GDN_KEY);
+        assert_eq!(g.gdn_val(), GDN_VAL);
+        assert_eq!(g.gdn_conv(), GDN_CONV);
+        assert_eq!(g.attn.sel_max(), Some(QSA_SEL_MAX));
+        let ple = g.ple.unwrap();
+        assert_eq!(ple.nheads(), PLE_NHEADS);
+        assert_eq!(ple.emb_dim(), PLE_EMB_DIM);
+        assert_eq!(g.context_max, Config::default().context);
+        assert_eq!(g.eos_ids, crate::sample::EOS_IDS);
+        for l in 0..LAYERS {
+            assert_eq!(g.is_attn(l), is_attn(l), "layer {l}");
+        }
+        assert_eq!((0..LAYERS).filter(|l| g.is_attn(*l)).count(), ATTN_LAYERS);
+        assert_eq!(g.rows().len(), 35, "one row per Geo field");
+        assert!(g.diff(&Geo::FLASH_NEXT).is_empty());
+    }
+}
