@@ -120,6 +120,9 @@ impl Engine {
         self.drop_decode_graph();
 
         self.pos = 0;
+        // crow-nest #95: a pass of the previous sequence is void (its rows are gone)
+        self.spec = None;
+        self.spec_d1 = None;
         self.history.clear();
         self.history_images.clear();
         self.done_blocks = 0;

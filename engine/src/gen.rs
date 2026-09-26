@@ -155,6 +155,17 @@ pub struct MtpStats {
     pub k_hist: [usize; MTP_VERIFY_MAX],
 }
 
+/// crow-nest #95 step 5: one verify pass as `spec_step` consumes it: the rows' inputs, where it
+/// started, and how many rows have been drawn (handed out) so far
+#[derive(Debug, Clone)]
+pub struct SpecPass {
+    pub pos0: usize,
+    pub toks: Vec<i64>,
+    pub drawn: usize,
+    pub t_verify: f64,
+    pub t_draft: Option<f64>,
+}
+
 /// crow-nest #95: the adaptive draft length (design: "adaptive k in {0..3}"). Keeps an EMA of
 /// the conditional acceptance a_j of every chain position and of the measured costs (verify of
 /// m rows, one chain draft, the catch-up) and picks the k with the most expected tokens per
@@ -590,6 +601,18 @@ pub struct Engine {
     pub(crate) graph_exec: u64, // CUgraphExec handle, 0 = not instantiated
     /// crow-nest #95: the batched verify's graph per row count m (index m), 0 = not captured
     pub(crate) vgraph: [u64; MTP_VERIFY_MAX + 1],
+    /// crow-nest #95 step 5: the verify pass `spec_step` is consuming, if any
+    pub(crate) spec: Option<SpecPass>,
+    /// crow-nest #95 step 5: the draft for the next pass (the MTP head's output after the last
+    /// catch-up), `None` until the first `spec_step` of a sequence
+    pub(crate) spec_d1: Option<i64>,
+    /// crow-nest #95 step 5: the adaptive draft length and the counters of this process
+    pub spec_k: AdaptiveK,
+    pub spec_stats: MtpStats,
+    /// the row of `mixed_final` that holds the MTP head's output the draft chain continues from
+    pub(crate) spec_last_row: usize,
+    /// the d1 of the pass in flight, for the acceptance evidence of a k = 0 pass
+    pub(crate) spec_d1_seen: Option<i64>,
     pub(crate) cap_stream: u64, // capture stream handle, 0 = not created
     scalar_stage: cuda::Pinned, // pinned [16] i32 staging for scalar refreshes
     embed_buf: Vec<f32>,        // persistent embedding staging (async HtoD source)
@@ -1794,6 +1817,12 @@ impl Engine {
             mrope_active: false,
             graph_exec: 0,
             vgraph: [0; MTP_VERIFY_MAX + 1],
+            spec: None,
+            spec_d1: None,
+            spec_k: AdaptiveK::new(MTP_VERIFY_MAX - 1),
+            spec_stats: MtpStats::default(),
+            spec_last_row: 0,
+            spec_d1_seen: None,
             cap_stream: 0,
             scalar_stage: unsafe { cuda::Pinned::alloc(16 * 4) },
             embed_buf: vec![0f32; d.hct],
@@ -4642,6 +4671,11 @@ impl Engine {
         ids: &[i64],
         mut collect_logits: Option<&mut Vec<Vec<f32>>>,
     ) -> usize {
+        // crow-nest #95: new tokens follow; a pass `spec_step` left open is settled first
+        if self.spec.is_some() {
+            self.spec_finish();
+        }
+        self.spec_d1 = None;
         let mut start = 0usize;
         let first = self.pos == 0;
         // live prefill progress on stderr (unbuffered — visible immediately in
@@ -5208,6 +5242,155 @@ impl Engine {
         for i in 0..m {
             launch_v(self.k.f("argmax_k"), 1, 1, 1, 1024, &[vb.logits + (4 * i * self.d.v) as u64, vb.argmax + (4 * i) as u64, p.n_vocab]);
         }
+    }
+
+    /// crow-nest #95 step 5: `decode_step` with MTP speculative decoding - the same contract:
+    /// feed the token `feed` at the current position and return the next token (the device
+    /// sampler's draw, else the argmax), its logits row left in `s.logits` for the caller's
+    /// logprobs, grammar redraw or host draw. Between calls the caller may replace a token
+    /// (a forced id, a grammar redraw, a host draw) or stop; nothing else is needed.
+    ///
+    /// How: one verify pass computes the rows [x, d1..dk] at once, but a row is DRAWN only when
+    /// the caller asks for the next token and has fed exactly the draft that row was computed
+    /// with. Any other feed - a rejected draft, a replaced token - settles the pass at the rows
+    /// drawn so far (GDN state from the slot of the last one, position, history, the MTP head's
+    /// catch-up with the tokens actually fed) and starts the next pass from `feed`. So every
+    /// emitted token is one draw, as in plain decoding, and a row is never used out of its
+    /// context. `spec_finish` settles the last pass when the sequence stops.
+    ///
+    /// # Safety
+    ///
+    /// As `decode_step`; the MTP head is loaded; the prompt was prefilled with it.
+    pub unsafe fn spec_step(&mut self, feed: i64) -> usize {
+        if let Some(p) = self.spec.as_ref() {
+            let j = p.drawn - 1;
+            if j + 1 < p.toks.len() && feed == p.toks[j + 1] {
+                self.spec.as_mut().expect("checked").drawn += 1;
+                return self.spec_draw_row(j + 1);
+            }
+        }
+        // no pass, or it is used up / left: settle it with `feed` as the token after its last row
+        self.spec_settle(Some(feed));
+        let d1 = self.spec_d1.take().expect("spec_settle leaves the next draft");
+        let fixed: Option<usize> = std::env::var("CROW_MTP_K").ok().and_then(|v| v.parse().ok());
+        let k = fixed.unwrap_or_else(|| self.spec_k.choose()).min(MTP_VERIFY_MAX - 1);
+        self.spec_stats.k_hist[k] += 1;
+        self.spec_stats.passes += 1;
+        let h = self.d.h;
+        let pos = self.pos;
+        let ta = std::time::Instant::now();
+        let mut toks = vec![feed];
+        if k >= 1 {
+            toks.push(d1);
+        }
+        let mut last_row = self.spec_last_row;
+        for j in 2..=k {
+            self.mtp_rows(self.s.mixed_final + (4 * last_row * h) as u64, &[toks[j - 1]], pos + j - 2);
+            toks.push(self.mtp_argmax_row(0));
+            last_row = 0;
+        }
+        let tb = std::time::Instant::now();
+        let _ = self.verify_rows(&toks);
+        let t_verify = tb.elapsed().as_secs_f64() * 1e3;
+        let t_draft = (k >= 2).then(|| (tb - ta).as_secs_f64() * 1e3 / (k - 1) as f64);
+        self.spec_d1_seen = Some(d1);
+        self.spec = Some(SpecPass { pos0: pos, toks, drawn: 1, t_verify, t_draft });
+        self.spec_draw_row(0)
+    }
+
+    /// crow-nest #95 step 5: hand out verify row `i`: the device sampler's draw from its logits
+    /// (else its argmax), its logits copied into `s.logits` (the row `decode_step` leaves)
+    unsafe fn spec_draw_row(&self, i: usize) -> usize {
+        let vb = &self.w.mtp.as_ref().expect("spec without the MTP head").vb;
+        let row = vb.logits + (4 * i * self.d.v) as u64;
+        let slot = vb.argmax + (4 * i) as u64;
+        if let Some(ds) = self.dev_sampler.as_ref() {
+            self.launch_sample_at(ds, row, slot);
+        }
+        cuda::d2d_async(self.s.logits, row, 4 * self.d.v);
+        cuda::d2d_async(self.s.argmax, slot, 4);
+        cuda::sync();
+        cuda::dtoh_i32(slot, 1)[0] as usize
+    }
+
+    /// crow-nest #95 step 5: settle the pass `spec_step` was consuming (if any) at the rows it
+    /// drew: `next` = the token fed after the last drawn row (`None` at the end of a sequence).
+    /// Leaves the engine as plain decoding would after the same tokens, the MTP head's KV caught
+    /// up over every pair whose next token is known, and - with `next` - the draft of the next
+    /// pass in `spec_d1`; without it the last row's hidden waits in `hlast` for the next prefill.
+    unsafe fn spec_settle(&mut self, next: Option<i64>) {
+        let h = self.d.h;
+        let hlast = self.w.mtp.as_ref().expect("spec without the MTP head").hlast;
+        let Some(p) = self.spec.take() else {
+            // the first step after a prefill: its last row waits in hlast
+            if let Some(x) = next {
+                self.mtp_rows(hlast, &[x], self.pos - 1);
+                self.spec_d1 = Some(self.mtp_argmax_row(0));
+                self.spec_last_row = 0;
+            }
+            return;
+        };
+        let keep = p.drawn;
+        // acceptance evidence: row i + 1 was drawn iff draft i + 1 held; the draft after the
+        // last drawn row was checked against `next` when there was one
+        let mut seen: Vec<Option<bool>> = vec![None; MTP_VERIFY_MAX];
+        for (i, s) in seen.iter_mut().enumerate().take(p.toks.len() - 1) {
+            if i + 1 < keep {
+                *s = Some(true);
+            } else if i + 1 == keep {
+                *s = next.map(|x| x == p.toks[i + 1]);
+            }
+        }
+        for (i, s) in seen.iter().enumerate() {
+            if let Some(ok) = s {
+                self.spec_stats.proposed[i] += 1;
+                if *ok {
+                    self.spec_stats.accepted[i] += 1;
+                }
+            }
+        }
+        if p.toks.len() == 1 {
+            seen[0] = match (next, self.spec_d1_seen) {
+                (Some(x), Some(d)) => Some(x == d),
+                _ => None,
+            };
+        }
+        self.mtp_accept(&p.toks, keep);
+        self.spec_stats.tokens += keep;
+        // the tokens fed after each kept row: the next input of the pass, then `next`
+        let mut fed: Vec<i64> = p.toks[1..keep].to_vec();
+        let tc = std::time::Instant::now();
+        match next {
+            Some(x) => {
+                fed.push(x);
+                self.mtp_rows(self.s.mixed_final, &fed, p.pos0);
+                self.spec_last_row = keep - 1;
+                self.spec_d1 = Some(self.mtp_argmax_row(keep - 1));
+            }
+            None => {
+                cuda::d2d_async(hlast, self.s.mixed_final + (4 * (keep - 1) * h) as u64, 4 * h);
+                if !fed.is_empty() {
+                    self.mtp_rows(self.s.mixed_final, &fed, p.pos0);
+                }
+                cuda::sync();
+                self.spec_d1 = None;
+            }
+        }
+        let t_catch = tc.elapsed().as_secs_f64() * 1e3;
+        self.spec_k.observe(&seen, p.toks.len(), p.t_verify, p.t_draft, t_catch);
+    }
+
+    /// crow-nest #95 step 5: the sequence ends (stop, EOS, budget, abort): settle the last pass
+    /// so the engine stands exactly where plain decoding would after the emitted tokens.
+    ///
+    /// # Safety
+    ///
+    /// After the last `spec_step` of a sequence; a no-op without a pass.
+    pub unsafe fn spec_finish(&mut self) {
+        if self.spec.is_some() {
+            self.spec_settle(None);
+        }
+        self.spec_d1 = None;
     }
 
     /// crow-nest #95 step 4: draw the verify's rows with the device sampler, row by row, and

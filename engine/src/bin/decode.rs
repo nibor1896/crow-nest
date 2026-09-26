@@ -581,11 +581,13 @@ fn main() {
                 }
                 let t0 = std::time::Instant::now();
                 let mut plain = vec![first];
-                while plain.len() < n {
+                // 16 tokens more than the spec runs make: the serve-shaped run hands the rest to
+                // decode_step after spec_finish, which must continue exactly as plain did
+                while plain.len() < n + 16 {
                     let y = eng.decode_step(&mut cnq, *plain.last().unwrap()) as i64;
                     plain.push(y);
                 }
-                let plain_s = t0.elapsed().as_secs_f64();
+                let plain_s = t0.elapsed().as_secs_f64() * n as f64 / (n + 16) as f64;
                 eng.reset_to_zero();
                 if let Some(sm) = &sampler {
                     eng.enable_dev_sampler(sm);
@@ -633,6 +635,36 @@ fn main() {
                 let accb: Vec<String> = (0..k).map(|i| format!("{:.3} ({}/{})", sb.accepted[i] as f64 / sb.proposed[i].max(1) as f64, sb.accepted[i], sb.proposed[i])).collect();
                 println!("mtpspec-batched: passes {}, tokens per pass {:.3}, acceptance [{}], {:.1} tok/s (plain {:.1})",
                     sb.passes, (sb.tokens - 1) as f64 / sb.passes.max(1) as f64, accb.join(", "), (n - 1) as f64 / bat_s, (n - 1) as f64 / plain_s);
+                // step 5: the serve-shaped path - spec_step as decode_step's stand-in, spec_finish,
+                // then plain decode_step for 16 tokens (the engine must stand where plain stood)
+                eng.reset_to_zero();
+                if let Some(sm) = &sampler {
+                    eng.enable_dev_sampler(sm);
+                }
+                let mut first4 = eng.prefill(&mut cnq, &ids, None) as i64;
+                if sampler.is_some() {
+                    first4 = eng.sample_last() as i64;
+                }
+                assert_eq!(first, first4, "the prefill (and the first draw, same seed) is deterministic");
+                eng.spec_stats = Default::default();
+                let t3 = std::time::Instant::now();
+                let mut sv = vec![first4];
+                while sv.len() < n {
+                    let y = eng.spec_step(*sv.last().unwrap()) as i64;
+                    sv.push(y);
+                }
+                let sv_s = t3.elapsed().as_secs_f64();
+                eng.spec_finish();
+                while sv.len() < n + 16 {
+                    let y = eng.decode_step(&mut cnq, *sv.last().unwrap()) as i64;
+                    sv.push(y);
+                }
+                let ds = plain.iter().zip(&sv).position(|(a, b)| a != b);
+                let st5 = eng.spec_stats.clone();
+                println!("mtpspec-step: C2 ids identical over {} tokens (spec_step x {n}, spec_finish, decode_step x 16): {}{}", n + 16, ds.is_none(),
+                    ds.map(|i| format!(" (first difference at token {i}: plain {} spec_step {})", plain[i], sv[i])).unwrap_or_default());
+                println!("mtpspec-step: passes {}, tokens per pass {:.3}, k histogram {:?}, {:.1} tok/s (plain {:.1})",
+                    st5.passes, st5.tokens as f64 / st5.passes.max(1) as f64, st5.k_hist, (n - 1) as f64 / sv_s, (n - 1) as f64 / plain_s);
                 println!("trace-plain: {plain:?}");
             }
             "mtpgolden" => {
