@@ -5113,7 +5113,7 @@ Flash-Next's with the SiLU gate (`CN_GATE_ACT`, C4).
   (`Engine::kv_rows_host`): |x| quantiles, the subnormal share, and the relative error of three e4m3
   encodings (the raw cast of `store_kv`, one scale per head, one per row). Results of 2026-09-26 in the
   CHANGELOG (Measured).
-- **MTP speculative decoding** (crow-nest #95, `CROW_MTP=1`). The BF16 head (`MtpW`, `load_mtp`) runs
+- **MTP speculative decoding** (crow-nest #95; on by default, `CROW_MTP=0` off). Context: the dense floor and default is 65,536 (was 100,000). The BF16 head (`MtpW`, `load_mtp`) runs
   over pairs (h_p, t_{p+1}) (`mtp_rows`: `fc` split into column halves, one gated full-attention layer with its
   own KV cache; 1..=4 rows take the verify's per-row split-K attention). The prefill writes its KV over every
   chunk (`mtp_prefill_chunk`). `spec_step` is `decode_step`'s drop-in: drafts (chain) -> `verify_rows` (projections

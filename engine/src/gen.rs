@@ -1348,9 +1348,10 @@ impl Engine {
             }
         }
         let dense = head_rms.map(|(norm, lm_head)| DenseW { ln1, ln2, mlp, norm, lm_head });
-        let mtp = if dense.is_some() && mtp_on() {
+        let has_mtp = cnq.tensors.iter().any(|t| t.name == "mtp.fc.weight" && t.section == "mtp");
+        let mtp = if dense.is_some() && has_mtp && mtp_on() {
             let m = load_mtp(cnq, &d, &geo, cfg.context, cfg.kv.byte_per_value(), cfg.prompt_chunk);
-            log(&format!("MTP head loaded (CROW_MTP=1, crow-nest #95): BF16 weights, own KV cache {:.1} MB, scratch {:.1} MB",
+            log(&format!("MTP head loaded (default, CROW_MTP=0 turns it off; crow-nest #95): BF16 weights, own KV cache {:.1} MB, scratch {:.1} MB",
                 (2 * d.nkv * cfg.context * d.ahd * cfg.kv.byte_per_value()) as f64 / 1e6,
                 (4 * 4 * cfg.prompt_chunk * d.h) as f64 / 1e6));
             Some(m)
@@ -2620,9 +2621,11 @@ pub unsafe fn launch_qsa_par_e(
     launch_v(f, nq, 1, 1, QSA_PAR_E_THREADS, vals);
 }
 
-/// crow-nest #95: `CROW_MTP=1` loads the dense family's MTP head (step 1: the forward only)
+/// crow-nest #95: whether a dense container's MTP head is loaded, and `serve` decodes through
+/// `spec_step`. On by default since 2026-09-27 (robin: "wir nehmen auf jeden Fall MTP");
+/// `CROW_MTP=0` turns it off. Flash-Next has no dense head and loads none either way.
 pub fn mtp_on() -> bool {
-    std::env::var("CROW_MTP").as_deref() == Ok("1")
+    std::env::var("CROW_MTP").as_deref() != Ok("0")
 }
 
 fn dense_mma_on() -> bool {

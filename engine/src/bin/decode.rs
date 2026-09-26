@@ -561,7 +561,7 @@ fn main() {
                 // crow-nest #95 step 2a: greedy with the MTP head (verified row by row) against
                 // plain greedy on the same engine: the token ids must be identical (PREREG C2)
                 // and the draft counters give the head's acceptance inside the engine.
-                // mtpspec <ids.json> [n = 128] [k = 3]; needs CROW_MTP=1.
+                // mtpspec <ids.json> [n = 128] [k = 3]; needs the MTP head (the default; not CROW_MTP=0).
                 let ids = read_ids(&args[2]);
                 let n: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(128);
                 let k: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(3);
@@ -671,7 +671,7 @@ fn main() {
                 // crow-nest #95 step 1 (decode_out/p2-mtp/PREREG.md C1): the MTP head's draft
                 // logits of every pair of <dir>/gen-sequence.json, teacher-forced in one chunk, to
                 // <dir>/mtp-gpu-logits.f32 [T-1][V]; the reference is oracle/ref_qwen35_mtp.py's
-                // <dir>/mtp-logits.f32. Needs CROW_MTP=1.
+                // <dir>/mtp-logits.f32. Needs the MTP head (the default; not CROW_MTP=0).
                 let dir = args[2].clone();
                 let seq: serde_json::Value = serde_json::from_slice(&std::fs::read(format!("{dir}/gen-sequence.json")).unwrap()).unwrap();
                 let rows = seq["rows"].as_u64().unwrap() as usize;

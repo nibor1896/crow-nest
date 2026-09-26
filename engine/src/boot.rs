@@ -104,7 +104,7 @@ pub unsafe fn open_model(
 }
 
 /// Crow #300 phase 2: the context the boot allocates. Unset (or empty) is the family's floor
-/// (`Geo::context_floor`: Flash-Next 200,000, the dense family 100,000); a value must be an
+/// (`Geo::context_floor`: Flash-Next 200,000, the dense family 65,536); a value must be an
 /// integer in `floor..=max` (`Geo::context_max`, the checkpoint's max_position_embeddings).
 pub fn context_from_env(v: Option<&str>, floor: usize, max: usize) -> Result<usize, String> {
     let Some(v) = v.map(str::trim).filter(|v| !v.is_empty()) else { return Ok(floor) };

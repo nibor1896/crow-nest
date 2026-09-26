@@ -1914,8 +1914,8 @@ mod tests {
         assert!(table.contains("[meta]   ffn                  Dense { inter: 17408 }"), "{table}");
         assert_eq!(dense_meta().checks().len(), 20);
         assert_eq!(geo.built(), Ok(()));
-        // the per-family floor: 100k (the 16 GB point of the phase 2 plan), Flash-Next keeps 200k
-        assert_eq!((geo.context_floor, Geo::FLASH_NEXT.context_floor), (100_000, 200_000));
+        // the per-family floor: 64k (the image stack's point, Crow #300 2026-09-27), Flash-Next keeps 200k
+        assert_eq!((geo.context_floor, Geo::FLASH_NEXT.context_floor), (65_536, 200_000));
         // a doctored dense config is refused by the dense row, not by the pins
         let m = doctored_from(DENSE_DIR, |c, _| c["text_config"]["hidden_size"] = json!(4096)).unwrap();
         let err = verdict(&m).unwrap_err();

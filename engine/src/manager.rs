@@ -1465,10 +1465,10 @@ mod tests_300_c5 {
         let g = crate::meta::dense_fixture_geo();
         let s = StateSizes::plan(&g, g.context_floor, KvDtype::Fp8E4m3, 512);
         assert_eq!((s.qsa_keys_bytes, s.qsa_ring_rows, s.qsa_pooled_bytes), (0, 0, 0), "no QSA indexer");
-        // 16 attention layers x 2 x 4 kv-heads x 256 x 100k fp8; 48 GDN layers
-        assert_eq!(s.kv_bytes, 3_276_800_000);
-        assert_eq!((s.gdn_s_bytes, s.gdn_conv_bytes, s.rope_bytes), (150_994_944, 5_898_240, 25_600_000));
-        assert_eq!(s.total(), 3_276_800_000 + 150_994_944 + 5_898_240 + 25_600_000);
+        // 16 attention layers x 2 x 4 kv-heads x 256 x 64k fp8; 48 GDN layers
+        assert_eq!(s.kv_bytes, 2_147_483_648);
+        assert_eq!((s.gdn_s_bytes, s.gdn_conv_bytes, s.rope_bytes), (150_994_944, 5_898_240, 16_777_216));
+        assert_eq!(s.total(), 2_147_483_648 + 150_994_944 + 5_898_240 + 16_777_216);
         assert_eq!(ple_state_len(&g), 0, "no PLE state");
         let shape = Shape::with_geo(&g, 48, 16, 516);
         assert_eq!((shape.qsa_ring_len, shape.ple_len), (0, 0));

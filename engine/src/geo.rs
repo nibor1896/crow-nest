@@ -199,12 +199,12 @@ impl Default for Config {
 pub const CONTEXT_FLOOR: usize = 200_000;
 
 /// Crow #300 C5: the dense family's context floor (`Geo::context_floor` of a
-/// `Qwen35Dense` checkpoint). The phase 2 plan picks the context from the card's
-/// free VRAM: 16 GB -> 100k with a 4-bit KV cache, 20-24 GB -> 200k with FP8 KV,
-/// 32 GB -> 200k FP8 plus vision and MTP. The floor is the smallest of those points.
-/// TODO(Crow #300 phase 2): the per-card planner that raises the context above this
-/// floor; until it exists a dense boot is refused before it would use the value.
-pub const DENSE_CONTEXT_FLOOR: usize = 100_000;
+/// `Qwen35Dense` checkpoint), which is also its default context (`CROW_CONTEXT` raises it).
+/// Crow #300, 2026-09-27 (robin): the 27B serves Crow's image stack, where a high-quality image
+/// takes about 9-14k tokens (Crow's first turn is 6,738 prompt tokens); 64k (65,536) with BF16
+/// KV and the MTP head leaves Qwen-Image 2.1 (7.8 GiB) and the F16 projector room beside it
+/// without a lend. Was 100,000.
+pub const DENSE_CONTEXT_FLOOR: usize = 65_536;
 
 /// per-layer type dispatch (layer % 4 == 3 is full attention — probe-pinned)
 pub fn is_attn(layer: usize) -> bool {
