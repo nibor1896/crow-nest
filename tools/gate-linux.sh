@@ -282,8 +282,15 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="425"
+TESTS="427"
 CLIPPY="1517"
+#   tests 425 -> 427 / clippy 1517 (unchanged)   Crow #300 phase 1 C4a (2026-09-26, on `3154b3b`): the PTX of record.
+#                              `engine/tests/fixtures/kernels-3154b3b.cu` is KERNEL_SRC cut byte-exact out of `3154b3b`,
+#                              `ptx-manifest-3154b3b.txt` its NVRTC 13.3 PTX: 130 `.entry` rows (sha256 each) plus the
+#                              whole module. +2 `kernels::tests_300_c4` (the fixture is the source of record; every
+#                              entry of today's source compiles to the recorded PTX), +1 ignored (the manifest printer).
+#                              Shown red with rms_group's eps set to 1e-5f: "1 of 130 kernel entries differ ... rms_group
+#                              of record 9c023f971aaa now 7aa96e681e9d". Measured 2026-09-26: 427 / 0; clippy 1517.
 #   tests 425 / clippy 1519 -> 1517   Crow #300 phase 1 C3c..C3e (2026-09-26, on `f2a26f6`): gen.rs reads the runtime
 #                              `Geo` through `Dims` (loader and buffers, layer primitives, loops). The `geo::tests_300`
 #                              accessor test gained the `Dims` block (shown red with `hct` mutated); no test added.
