@@ -141,7 +141,7 @@ fn main() {
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("gate");
     unsafe {
         let _ctx = cuda::Ctx::init();
-        let module = cuda::compile(crow_nest_engine::kernels::KERNEL_SRC);
+        let module = cuda::compile(&crow_nest_engine::kernels::KernelGeo::flash_next().source());
         let k = Kernels::new(&module);
 
         let n2560 = cuda::to_i32_dev(&[H as i32]);

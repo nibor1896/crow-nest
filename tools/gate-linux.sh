@@ -282,8 +282,21 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="427"
-CLIPPY="1517"
+TESTS="431"
+CLIPPY="1516"
+#   tests 427 -> 431 / clippy 1517 -> 1516   Crow #300 phase 1 C4b (2026-09-26, on `f6df9ec`): the kernel source reads
+#                              its geometry from a per-boot `#define CN_*` prelude (`kernels::KernelGeo`, 27 macros from
+#                              the runtime `Geo`); the Flash-Next PTX of all 130 entries stays byte-identical to the
+#                              frozen `3154b3b` source (`tests_300_c4`, shown red with CN_QSA_SEL_MAX + 1: 18 of 130
+#                              entries differ). +4 `kernels::tests_300_c4`: the prelude defines exactly the macros the
+#                              source reads; the bare source refuses to compile; the Flash-Next prelude text of record;
+#                              a geometry change moves exactly the kernels that read it (swish -> the two GDN gated
+#                              norms, 4 KV heads -> store_kv + the 20 attention variants). +2 ignored GPU tests
+#                              (`tests_300_c4_gpu`, swish gate and store_kv/attn_sel at 4 KV heads / GQA 6 against a
+#                              CPU reference; run once 2026-09-26, green). Each shown red with its hunk reverted.
+#                              Clippy -1: the needless borrow `cuda::compile(&KERNEL_SRC)` in gen.rs is gone.
+#                              Measured 2026-09-26: lib 302 / 0 / 6 ignored, serve 118, decode 5, parity 6 = 431 / 0;
+#                              clippy 1516.
 #   tests 425 -> 427 / clippy 1517 (unchanged)   Crow #300 phase 1 C4a (2026-09-26, on `3154b3b`): the PTX of record.
 #                              `engine/tests/fixtures/kernels-3154b3b.cu` is KERNEL_SRC cut byte-exact out of `3154b3b`,
 #                              `ptx-manifest-3154b3b.txt` its NVRTC 13.3 PTX: 130 `.entry` rows (sha256 each) plus the

@@ -13,7 +13,7 @@ fn main() {
     let _log = crow_nest_engine::log::init();
     unsafe {
         let _ctx = cuda::Ctx::init();
-        let module = cuda::compile(crow_nest_engine::kernels::KERNEL_SRC);
+        let module = cuda::compile(&crow_nest_engine::kernels::KernelGeo::flash_next().source());
         let k = Kernels::new(&module);
 
         // ---- FP8 sweep: device enc/dec vs Rust twin, bit-exact expected ----

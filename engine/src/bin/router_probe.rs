@@ -113,7 +113,7 @@ fn main() {
     let mut ok = true;
     unsafe {
         let _ctx = cuda::Ctx::init();
-        let module = cuda::compile(crow_nest_engine::kernels::KERNEL_SRC);
+        let module = cuda::compile(&crow_nest_engine::kernels::KernelGeo::flash_next().source());
         let f_ref = module.get("gemv_b");
         let f_g8 = module.get("gemm_bf16_dense");
         let f_g32 = module.get("gemm_bf16_dense_b");

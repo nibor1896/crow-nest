@@ -164,7 +164,7 @@ mod tests {
             options: vec!["--gpu-architecture=compute_120a".into()],
             ..Default::default()
         };
-        let ptx = cudarc::nvrtc::compile_ptx_with_opts(crate::kernels::KERNEL_SRC, opts)
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(crate::kernels::KernelGeo::flash_next().source(), opts)
             .expect("nvrtc compile");
         let (nvrtc_s, t) = (t.elapsed().as_secs_f64(), std::time::Instant::now());
         let c = std::ffi::CString::new(ptx.to_src()).unwrap();

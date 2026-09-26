@@ -513,7 +513,10 @@ impl QsaGeo {
     }
 }
 
-/// the attention output gate's activation (`output_gate_type`)
+/// the GDN gated RMSNorm's activation (`output_gate_type`; HF qwen4_exp builds
+/// `RMSNormGated(activation=config.output_gate_type)`, qwen3_5 hard-codes silu).
+/// The attention output gate is `sigmoid(gate)` in both families and is not
+/// this field (Crow #300 C4 found the old wording wrong).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GateAct {
     Sigmoid,

@@ -1349,7 +1349,9 @@ impl Engine {
 
         // ---- kernels + params + scratch ----
         crate::kernels::kprof_init();
-        let module = cuda::compile(&crate::kernels::KERNEL_SRC);
+        // C4: the kernel source takes its shape from the runtime Geo (a `#define CN_*`
+        // prelude); for Flash-Next the PTX is byte-identical to the pre-C4 source
+        let module = cuda::compile(&crate::kernels::KernelGeo::of(&geo).source());
         let k = Kernels::new(&module);
         assert_kernel_defines();
         let p = Params::setup(&cfg, &d, &st);

@@ -68,7 +68,7 @@ fn main() {
     let bench = args.iter().any(|a| a == "--bench");
     unsafe {
         let _ctx = cuda::Ctx::init();
-        let module = cuda::compile(crow_nest_engine::kernels::KERNEL_SRC);
+        let module = cuda::compile(&crow_nest_engine::kernels::KernelGeo::flash_next().source());
         let f_fast = module.get("qsa_select_fast");
         let f_par_h = module.get("qsa_select_par_h");
         let f_par_e = module.get("qsa_select_par_e");

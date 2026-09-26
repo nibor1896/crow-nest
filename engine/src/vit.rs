@@ -2506,7 +2506,7 @@ mod gemm_vit {
     fn both_vision_gemms_match_the_host_at_every_tower_shape_and_keep_the_row_tail_in_bounds() {
         unsafe {
             let _ctx = cuda::Ctx::init();
-            let module = cuda::compile(crate::kernels::KERNEL_SRC);
+            let module = cuda::compile(&crate::kernels::KernelGeo::flash_next().source());
             let (f_fp4, f_f16) = (module.get("gemm_fp4_f32x"), module.get("gemm_f16_f32x"));
             // (rows, k): qkv, proj, fc1 (row tail), fc2 (k tail), merger fc1, fc2, patch
             let shapes = [(3456, 1152), (1152, 1152), (4304, 1152), (1152, 4304), (4608, 4608), (2560, 4608), (1152, 1536)];

@@ -107,7 +107,7 @@ fn main() {
     let mut ok = true;
     unsafe {
         let _ctx = cuda::Ctx::init();
-        let module = cuda::compile(crow_nest_engine::kernels::KERNEL_SRC);
+        let module = cuda::compile(&crow_nest_engine::kernels::KernelGeo::flash_next().source());
         let f_sel = module.get("qsa_select");
         let f_fast = module.get("qsa_select_fast");
         let f_par_h = module.get("qsa_select_par_h");

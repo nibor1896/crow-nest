@@ -32,7 +32,7 @@ fn main() {
     let mut ok = true;
     unsafe {
         let _ctx = cuda::Ctx::init();
-        let module = cuda::compile(crow_nest_engine::kernels::KERNEL_SRC);
+        let module = cuda::compile(&crow_nest_engine::kernels::KernelGeo::flash_next().source());
         let f_sel = module.get("attn_sel");
         let f_split = module.get("attn_sel_split");
         let f_merge = module.get("attn_merge");
