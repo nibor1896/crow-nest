@@ -159,8 +159,6 @@ ModelOpt's `--calib_all_experts` idea with real traffic instead of synthetic sam
 
 ### 1.7 Container index v2 and the per-model recipe (Crow #300 phase 1, C6, 2026-09-26)
 
-<!-- C6 section: added on branch c6-converter-index; self-contained for the C7 merge -->
-
 The container layout of 1.2 is unchanged: magic `CNQ1`, 8 reserved bytes, the streamed
 payload, the index JSON as a trailer, the `u64` LE index length. What changed is the index,
 and which indexes the engine accepts.
@@ -201,8 +199,9 @@ name and byte size (`overlay_refusal`), not by this rule.
 **Accessors** (`Cnq`): `index_version()`, `model()`, `config_json()`,
 `generation_config_json()`, `family()` (`FlashNext` for the v1 container of record). For the
 v1 container `config_json()` is `None` and the boot keeps reading the config from
-`CROW_MODEL_DIR`; for a v2 container the config travels inside it. The boot does not read it
-yet (C7).
+`CROW_MODEL_DIR` (else `models/`); for a v2 container the config travels inside it, and since C7
+the boot reads it from there: `Cnq::peek_index` classifies the trailer and hands the `model`
+block to the metadata gate before the container is mapped (8.4, 8.11 "C7").
 
 **The recipe table.** The family comes from the checkpoint's `config.json`
 (`text_config.model_type`), the key `meta.rs` reads.
@@ -258,8 +257,6 @@ the byte totals. On `Qwen/Qwen3.8-27B` @ `1d4bf0f2`, 2026-09-26 (computed, not m
 The first two rows equal the #300 computed budget (13.41 GiB NVFP4 + 0.05 GiB BF16 keeps).
 All 18 shard sha256 come from the HF LFS record; `config.json` sha256 `191e0af2…`,
 `generation_config.json` `e70c136c…`, the same files as the engine's test fixture.
-
-<!-- end of the C6 section -->
 
 ---
 
@@ -4044,6 +4041,9 @@ owns the OVERLAY (`attach_overlay`, `Overlay`, `OverlayReport`, `overlay_refusal
 base ones, so the shadowing is invisible to every reader above it. Since Crow #300 C6 it classifies the index
 at `open` (`classify_index`, `IndexKind`, `ModelBlock`): an index v2 hands back the checkpoint's
 config files verbatim, a v1 index is accepted only for the CNQ4.5-M container of record (1.7).
+Since C7 `Cnq::peek_index` gives the same classification and the tensor table without mapping
+the file (`IndexPeek`); `open_checked` and `peek_index` share one trailer reader
+(`read_index_trailer`), so the boot door and the mapping cannot disagree.
 
 **`geo.rs`** — the model geometry and the runtime `Config`: the probe-pinned constants and
 their derivation chain, `KvDtype`, `Adapt` with `knobs()`, the two policy functions
@@ -4199,9 +4199,12 @@ not line numbers — the files move.
    (#102, 2026-09-23: `bf16` / `fp8` / `fp8_e4m3`, anything else — the empty string included —
    panics `[boot] refused` before the container is mapped; until then only `decode parity` read
    it, so `serve` booted FP8 under `CROW_KV=bf16`), one WARN per `CROW_*` name in the environment
-   that has no row in `docs/env.md` (compiled in, names only), the #94 metadata gate (since Crow #300
-   C1/C2 also the family, the key ledger and the `Geo == Geo::FLASH_NEXT` assert, 8.11), then
-   `Cnq::open` (trailer index, whole-file mapping), then `CROW_CNQ_OVERLAY` →
+   that has no row in `docs/env.md` (compiled in, names only), then `boot::model_geo`: the index
+   trailer (`Cnq::peek_index`, no mapping; since Crow #300 C7, with the `[boot] container index v1|v2`
+   line that names where the config comes from), the #94 metadata gate on that config (since
+   Crow #300 C1/C2 also the family, the key ledger and the `Geo == Geo::FLASH_NEXT` assert; since C7
+   the container check, 8.11), `Geo::built` (C5), then `Cnq::open` (trailer index, whole-file
+   mapping), then `CROW_CNQ_OVERLAY` →
    `Cnq::attach_overlay` when it is set AND non-empty (#77: the bf16 dense overlay, with its
    refusal table and the `[overlay]` lines; unset or empty attaches nothing — the engine
    default; what the launcher sets is 8.8 point 6),
@@ -4656,7 +4659,7 @@ is the documented bit-identical twin of the cascade `mix_streams_q` fuses and th
 `max_abs` 0.4475 / `corr` 0.99180 all along, at HEAD and before the fix, which is what pinned the
 cause to the cascade and not to the kernels, the ring or the selection.
 
-### 8.11 Model families and the runtime `Geo` (Crow #300 phase 1, C1 + C2 + C3 + C4 + C5, 2026-09-26)
+### 8.11 Model families and the runtime `Geo` (Crow #300 phase 1, C1 to C7, 2026-09-26)
 
 crow-nest serves one model today, and every shape was a `geo.rs` const. Phase 1 of Crow #300 makes
 the shapes come from the checkpoint. C1 and C2 build the reader and the runtime geometry and
@@ -4716,14 +4719,17 @@ implemented value refuse any other value by name: `hidden_act` silu, `mamba_ssm_
 3. Flash-Next whose `Geo` differs from `Geo::FLASH_NEXT` gives `[meta] N of 35 runtime Geo fields differ from Geo::FLASH_NEXT` with one row per field, `config derives X, Geo::FLASH_NEXT pins Y`;
 4. dense passes with its 35-row geometry on the log (C5; before C5 it was refused here by one blanket message), and `boot::model_geo` refuses it right after at its first unbuilt block (`Geo::built`, below);
 5. Flash-Next with everything equal logs `meta: 21 constants verified against config.json (zero numeric change) [...]; family FlashNext (qwen4_exp_text), runtime Geo == Geo::FLASH_NEXT (35 fields)`.
+6. (C7, `meta::gate`) a config that does not fit the container gives `[meta] N of 3 container facts differ from the config` with one row per fact (below, "C7").
 
-All five, and the C5 family check after them, are before `Cnq::open` and before the CUDA context. `assert_pinned` returns
+All six, and the C5 family check after them, are before `Cnq::open` and before the CUDA context. `assert_pinned` returns
 `Option<(ModelMeta, Geo)>`; since C3 `boot::open_model` hands the `Geo` to its caller.
 
 The 27B fixture is `engine/tests/fixtures/Qwen3.8-27B/{config.json, generation_config.json}`,
 copied from `models/Qwen3.8-27B/` (revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`,
-sha256-checked 2026-09-25). It is the only model config the repository tracks. The Flash-Next
-tests read the checkpoint of record in `models/`, as before.
+sha256-checked 2026-09-25). Since C7 the Flash-Next config is tracked too,
+`engine/tests/fixtures/Qwen3.8-Flash-Next/` (byte copies of `models/Qwen3.8-Flash-Next-original/`:
+`config.json` sha256 `889658f2…`, `generation_config.json` `e70c136c…`, the same bytes as the 27B's),
+for the C7 boot-door tests; the `meta::tests` still read the checkpoint of record in `models/`.
 
 **C3: how the `Geo` is threaded** (2026-09-26).
 
@@ -4918,6 +4924,74 @@ dense arm is not built and refuses by name.
   existing expressions, and the arms that print boot lines print them unchanged. Checked per
   step against the gate's boot logs (`decode_out/gate-c5*` vs `gate-c4`, host free RAM / VRAM
   masked).
+
+**C7: the boot reads the container's config** (2026-09-26; merge `4dcf664` of C6, then C7). C6
+put the checkpoint's config into the container (index v2, 1.7). C7 makes the boot door read it,
+and hold every config against the container it is meant for.
+
+- **The boot order** (`boot::model_geo`, called by `open_model` and by every tool that maps a
+  container):
+  1. `Cnq::peek_index(cnq_path)`: the index trailer, classified exactly as `Cnq::open` classifies
+     it (a v1 that is not the container of record, an unknown `format_version`, an altered model
+     block: `[cnq] refused: ...`), plus the tensor table. Nothing is mapped.
+  2. The `[boot] container index` line. v1: `[boot] container index v1 (the Flash-Next CNQ4.5-M
+     container of record, index sha256 a21afc43203d…): config from CROW_MODEL_DIR=<dir>` or `...
+     config from models/ beside the container (CROW_MODEL_DIR unset)`. v2: `[boot] container index
+     v2 (family F, recipe R, repo @ revision): config from its model block (config.json sha256
+     …)`, plus `, CROW_MODEL_DIR sha-checked against it` when the variable is set.
+  3. `meta::assert_pinned` → `meta::gate` (pure; `boot::geo_for` is the whole door without the
+     process, for the tests): the `CROW_MODEL_DIR` cross-check of a v2, the config by index kind,
+     `verdict` (the family row, the `Geo`), `container_mismatch`.
+  4. `Geo::built` (C5): the first unbuilt block refuses, `[boot] refused: ...`.
+  5. `Cnq::open` (the mapping), the overlay, `cuda::Ctx::init`, `Config`.
+- **Which config.** Index v2: the `model` block's `config_json` and `generation_config_json`,
+  parsed by `ModelMeta::from_config_texts` (the text half of `from_config_files`) and named
+  `<cnq> [index v2 model.config_json]` in the `meta:` line and in every refusal. `models/` beside
+  a v2 container is never read. Index v1 (only the CNQ4.5-M container of record): the pre-C7 path,
+  `meta::from_container(cnq, CROW_MODEL_DIR)`: the variable, else `models/`, else the selftest
+  WARN and `Geo::FLASH_NEXT`. `CROW_MODEL_DIR` is read once in `model_geo` and handed down; no
+  function under it reads the process environment.
+- **`CROW_MODEL_DIR` beside a v2** (`meta::check_model_dir_override`): the container's config
+  wins, the variable is a cross-check. Its `config.json`, and its `generation_config.json` when
+  the directory has one, must hash to the container's bytes, else `[meta] CROW_MODEL_DIR
+  <dir>/config.json sha256 X differs from the container's model.config_json sha256 Y (family F,
+  repo @ revision) - an index v2 container carries its own config; unset CROW_MODEL_DIR or point
+  it at the checkpoint this container was converted from - refusing to boot (Crow #300)`.
+- **The container check** (`meta::container_mismatch`). A config of the other family passes its
+  own family row, so `verdict` alone cannot catch the swap. The gate holds the config's `Geo`
+  against three facts of the index: the family the container was converted as (`model.family`,
+  `FlashNext` for the v1 container of record), `embed_tokens` = `[vocab, hidden]`, and the
+  number of distinct text layers. The refusal is one row per differing fact:
+
+  ```
+  [meta] 3 of 3 container facts differ from the config - the container and its config describe different models, refusing to boot (Crow #300):
+    family: container FlashNext (index v1), config Qwen35Dense
+    embed_tokens [vocab, hidden]: container [248320, 2560], config [248320, 5120]
+    text layers: container 48, config 64
+  [meta]   container: converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq
+  [meta]   config: engine/tests/fixtures/Qwen3.8-27B/config.json
+  ```
+
+  That is the release `decode run` on the container of record with
+  `CROW_MODEL_DIR=engine/tests/fixtures/Qwen3.8-27B`, 2026-09-26. A synthetic dense v2 container
+  whose model block is Flash-Next's dies with 2 of 3 (embedding, layers). A synthetic dense v2
+  container with the 27B's own config passes the gate (`meta: 20 constants verified ... runtime
+  Geo derived (35 fields)`) and dies at `Residual::Plain`. None of the three reached the CUDA
+  context (no `[boot] kv cache dtype` line).
+- **The `f32` dtype in the loaders.** `weights::host_f32` is the one host decode of
+  `load_small_f32` and `dequant_fp4_dev`: `bf16` widened, `f32` as stored, `nvfp4` dequantized.
+  Without the `f32` arm the dense recipe's `A_log` (8 bytes in the synthetic fixture) fell into
+  the 36-byte NVFP4 walk and came back as zeros with the length assert passing.
+- **Byte identity.** The gate container is index v1, so the gate runs the pre-C7 config path; its
+  boot differs from C5b by the one `[boot] container index v1 ... config from models/ beside the
+  container (CROW_MODEL_DIR unset)` line, and every `[budget]` / `[residency]` / `[diet]` / `[vit]`
+  / `[stage]` / `meta:` line is identical (`decode_out/gate-c7` vs `gate-c5b`, host free RAM /
+  VRAM masked).
+- **Phase 1 status.** One binary reads the model's shape from the container and refuses a
+  foreign config by name; Flash-Next is byte-identical at the gate values of record. The 27B does
+  not run: no 27B container exists yet, and a dense container stops at `Residual::Plain`, the
+  first arm phase 2 builds (`gen.rs`: the residual matches in the loader and in `prefill` /
+  `decode_step`; `geo.rs` `Geo::built`).
 
 ## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
 
