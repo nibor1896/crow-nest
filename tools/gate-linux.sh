@@ -282,8 +282,21 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="436"
+TESTS="446"
 CLIPPY="1512"
+#   tests 436 -> 446 / clippy 1512 (unchanged)   Crow #300 phase 1 C6 + C7 (2026-09-26, on `1580320`): the merge of
+#                              `c6-converter-index` (`4dcf664`) brought +4 `cnq::tests_300_c6` (the v2 fixture round
+#                              trip, the f32 dtype, the v1-of-record rule, the refusals; +1 ignored, the real-container
+#                              v1 test, run once green) = 440 / 0 / 7 ignored. C7 adds +6: `boot::tests_300_c7` (a v2
+#                              container boots its gate from its own model block; the other model's config dies with
+#                              the named mismatch table, v2 and v1; a dense v2 reaches `Geo::built` and refuses at
+#                              `Residual::Plain`; CROW_MODEL_DIR is a sha-checked cross-check beside a v2; the v1
+#                              container of record reads CROW_MODEL_DIR) and `weights::tests_300_c7` (an f32 tensor
+#                              loads as f32, not as an NVFP4 dequant). Each shown red with its hunk reverted, e.g.
+#                              "expected the mismatch table, got Ok(Some(FlashNext))" and "left: [0.0, 0.0] right:
+#                              [-0.15136719, 0.19238281]". No clippy warning in the new code (1512 = C5b's count).
+#                              Measured 2026-09-26: lib 317 / 0 / 7 ignored, serve 118, decode 5, parity 6 = 446 / 0;
+#                              clippy 1512.
 #   tests 436 / clippy 1512 (both unchanged)   Crow #300 phase 1 C5b (2026-09-26, on `6762df8`): the prefill and
 #                              decode layer loops and the head match per family block (residual, attention, FFN,
 #                              final norm); the loops read `d.layers` / `d.hcn` instead of LAYERS / HCN. No test added

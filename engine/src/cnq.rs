@@ -114,6 +114,57 @@ pub enum IndexKind {
     V2(Box<ModelBlock>),
 }
 
+/// What `Cnq::peek_index` reads without mapping the container (Crow #300 C7): the index kind
+/// and the tensor table.
+#[derive(Clone)]
+pub struct IndexPeek {
+    pub kind: IndexKind,
+    pub tensors: Vec<TensorInfo>,
+}
+
+impl IndexPeek {
+    /// the index v2 `model` block; `None` for the v1 container of record
+    pub fn model(&self) -> Option<&ModelBlock> {
+        match &self.kind {
+            IndexKind::V2(m) => Some(m),
+            IndexKind::V1OfRecord => None,
+        }
+    }
+
+    /// the family the container was converted as (`Cnq::family`'s rule)
+    pub fn family(&self) -> &str {
+        self.model().map(|m| m.family.as_str()).unwrap_or("FlashNext")
+    }
+}
+
+/// The index trailer of an open CNQ1 file: `(file length, the raw index bytes, the parsed
+/// index)`. Checks the magic and that the recorded index length fits the file. One reader for
+/// `Cnq::open_checked` and `Cnq::peek_index`, so the two cannot classify differently.
+fn read_index_trailer(f: &mut std::fs::File) -> Result<(u64, Vec<u8>, serde_json::Value), String> {
+    let file_len = f.metadata().map_err(|e| e.to_string())?.len();
+    if file_len < 20 {
+        return Err(format!("{file_len} B is too small to be a CNQ1 container"));
+    }
+    let mut magic = [0u8; 4];
+    f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    f.read_exact(&mut magic).map_err(|e| e.to_string())?;
+    if &magic != b"CNQ1" {
+        return Err(format!("magic is {magic:?}, not CNQ1"));
+    }
+    f.seek(SeekFrom::Start(file_len - 8)).map_err(|e| e.to_string())?;
+    let mut b8 = [0u8; 8];
+    f.read_exact(&mut b8).map_err(|e| e.to_string())?;
+    let idx_len = u64::from_le_bytes(b8) as usize;
+    if idx_len == 0 || idx_len as u64 + 20 > file_len {
+        return Err(format!("index length {idx_len} does not fit a {file_len} B file"));
+    }
+    f.seek(SeekFrom::Start(file_len - 8 - idx_len as u64)).map_err(|e| e.to_string())?;
+    let mut ib = vec![0u8; idx_len];
+    f.read_exact(&mut ib).map_err(|e| e.to_string())?;
+    let index: serde_json::Value = serde_json::from_slice(&ib).map_err(|e| format!("index json: {e}"))?;
+    Ok((file_len, ib, index))
+}
+
 /// hex sha256
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
@@ -904,26 +955,7 @@ impl Cnq {
         // working set (2026-09-06: 3.3 GB stayed "in use" after the engine
         // drop until process exit, and the reload's RAM check refused the tier)
         let mut f = open_sequential(path);
-        let file_len = f.metadata().map_err(|e| e.to_string())?.len();
-        if file_len < 20 {
-            return Err(format!("{file_len} B is too small to be a CNQ1 container"));
-        }
-        let mut magic = [0u8; 4];
-        f.read_exact(&mut magic).map_err(|e| e.to_string())?;
-        if &magic != b"CNQ1" {
-            return Err(format!("magic is {magic:?}, not CNQ1"));
-        }
-        f.seek(SeekFrom::Start(file_len - 8)).map_err(|e| e.to_string())?;
-        let mut b8 = [0u8; 8];
-        f.read_exact(&mut b8).map_err(|e| e.to_string())?;
-        let idx_len = u64::from_le_bytes(b8) as usize;
-        if idx_len == 0 || idx_len as u64 + 20 > file_len {
-            return Err(format!("index length {idx_len} does not fit a {file_len} B file"));
-        }
-        f.seek(SeekFrom::Start(file_len - 8 - idx_len as u64)).map_err(|e| e.to_string())?;
-        let mut ib = vec![0u8; idx_len];
-        f.read_exact(&mut ib).map_err(|e| e.to_string())?;
-        let index: serde_json::Value = serde_json::from_slice(&ib).map_err(|e| format!("index json: {e}"))?;
+        let (file_len, ib, index) = read_index_trailer(&mut f)?;
         let index_kind = classify_index(&ib, &index)?;
         let blob_offset = index["blob_offset"].as_u64().ok_or("index has no blob_offset")?;
         let tensors = parse_tensor_index(&index, false);
@@ -947,6 +979,19 @@ impl Cnq {
             ple_range = (0, 0);
         }
         Ok(Cnq { file: f, blob_offset, tensors, map, map_len, map_handle, path: path.to_string(), fadv: (0, 0), ple_range, ov: None, index_kind })
+    }
+
+    /// Crow #300 C7: the index trailer alone - classified exactly as `open_checked` classifies
+    /// it, plus the tensor table - without mapping the file. The boot door reads it FIRST: an
+    /// index v2 carries the config the metadata gate judges, and the tensor table is what the
+    /// gate holds that config against (`meta::container_mismatch`), all before `Cnq::open` maps
+    /// the container and before any CUDA call. The trailer is read twice per boot (here and in
+    /// `open`); on the container of record that is 473,528 B.
+    pub fn peek_index(path: &str) -> Result<IndexPeek, String> {
+        let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let (_, ib, index) = read_index_trailer(&mut f)?;
+        let kind = classify_index(&ib, &index)?;
+        Ok(IndexPeek { kind, tensors: parse_tensor_index(&index, false) })
     }
 
     /// The index v2 `model` block; `None` for the v1 container of record.

@@ -32,7 +32,10 @@
 //!   but unparseable / missing a field / a value that differs / a special id
 //!   out of vocab range) is the hard-error class and panics.
 //! - **`CROW_MODEL_DIR`** names the checkpoint dir when it is not the
-//!   `models/` sibling of the container.
+//!   `models/` sibling of the container. Crow #300 C7: that is the index v1
+//!   path (the CNQ4.5-M container of record). An index v2 container carries its
+//!   config in its `model` block and the gate reads it from there; a set
+//!   `CROW_MODEL_DIR` is then only a sha256 cross-check ([`gate`]).
 //! - `sample.rs` keeps its EOS pin; this module READS `sample::EOS_IDS` and
 //!   asserts the config against it (the pin and the truth stay one concept,
 //!   written once in sample, compared once here).
@@ -64,6 +67,7 @@
 
 use crate::geo;
 use crate::geo::{Attn, Family, FinalNorm, Ffn, GateAct, Geo, PleGeo, Residual};
+use crate::cnq::{sha256_hex, IndexPeek, ModelBlock};
 use crate::sample;
 use serde_json::Value;
 
@@ -609,8 +613,25 @@ impl ModelMeta {
     /// field is a hard, named error, never a defaulted guess.
     pub fn from_config_files(config_path: &str, generation_config_path: Option<&str>) -> Result<ModelMeta, String> {
         let config_text = std::fs::read_to_string(config_path).map_err(|e| format!("{config_path}: {e}"))?;
+        let generation = match generation_config_path {
+            Some(p) => Some((std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?, p)),
+            None => None,
+        };
+        ModelMeta::from_config_texts(&config_text, config_path, generation.as_ref().map(|(t, p)| (t.as_str(), *p)))
+    }
+
+    /// `from_config_files` on the two files' TEXTS (Crow #300 C7: an index v2 container carries
+    /// them verbatim in its `model` block). `config_path` and the generation label are what the
+    /// log lines and the refusals name as the source: a file path, or the container's
+    /// `<cnq> [index v2 model.config_json]`.
+    pub fn from_config_texts(
+        config_text: &str,
+        config_path: &str,
+        generation_config: Option<(&str, &str)>,
+    ) -> Result<ModelMeta, String> {
+        let generation_config_path = generation_config.map(|(_, p)| p);
         let config: Value =
-            serde_json::from_str(&config_text).map_err(|e| format!("{config_path}: not valid json: {e}"))?;
+            serde_json::from_str(config_text).map_err(|e| format!("{config_path}: not valid json: {e}"))?;
         let tc = text_config(&config);
 
         // rope fields nest in `rope_parameters` in this checkpoint; a flat
@@ -642,11 +663,8 @@ impl ModelMeta {
 
         // generation_config.json is the source of record for the stop ids; the
         // text config's own eos/bos is the fallback and the cross-check
-        let generation = match generation_config_path {
-            Some(p) => {
-                let s = std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?;
-                Some(serde_json::from_str::<Value>(&s).map_err(|e| format!("{p}: not valid json: {e}"))?)
-            }
+        let generation = match generation_config {
+            Some((s, p)) => Some(serde_json::from_str::<Value>(s).map_err(|e| format!("{p}: not valid json: {e}"))?),
             None => None,
         };
         let eos_from_generation = generation.as_ref().and_then(|g| ids_of(g, "eos_token_id")).is_some();
@@ -1155,13 +1173,15 @@ silently ignoring them (Crow #300); each must be consumed or put on the ignore l
 
 // ---- locating the checkpoint's config next to the container ----
 
-/// `CROW_MODEL_DIR` wins; otherwise `models/` beside the container (the
-/// container lives in `<repo>/converter/`, so the repo root is its parent
-/// directory's parent — the same convention both cwd forms of the bins give:
-/// `converter/x.cnq` from the repo root, `../converter/x.cnq` from `engine/`).
-/// `Ok(None)` = no config found (the selftest package): the caller warns.
-pub fn from_container(cnq_path: &str) -> Result<Option<ModelMeta>, String> {
-    let config_dir = if let Ok(dir) = std::env::var("CROW_MODEL_DIR") {
+/// The index v1 path (the CNQ4.5-M container of record, which carries no
+/// config): `CROW_MODEL_DIR` (`model_dir`, read by the caller) wins; otherwise
+/// `models/` beside the container (the container lives in `<repo>/converter/`,
+/// so the repo root is its parent directory's parent — the same convention both
+/// cwd forms of the bins give: `converter/x.cnq` from the repo root,
+/// `../converter/x.cnq` from `engine/`). `Ok(None)` = no config found (the
+/// selftest package): the caller warns.
+pub fn from_container(cnq_path: &str, model_dir: Option<&str>) -> Result<Option<ModelMeta>, String> {
+    let config_dir = if let Some(dir) = model_dir {
         if dir.is_empty() {
             return Err("CROW_MODEL_DIR is set but empty".to_string());
         }
@@ -1226,6 +1246,132 @@ fn config_dir_in_root(root: &std::path::Path, hint: &str) -> Option<std::path::P
             .into_iter()
             .find(|c| c.file_name().map(|n| n.to_string_lossy().starts_with(hint)).unwrap_or(false)),
     }
+}
+
+// ---- Crow #300 C7: which config the gate judges, and the container it must fit ----
+
+/// the log / refusal label of an index v2 config: the container, and the block key
+pub fn v2_config_label(cnq_path: &str, key: &str) -> String {
+    format!("{cnq_path} [index v2 model.{key}]")
+}
+
+/// The config the gate judges, by the container's index kind:
+///
+/// - **index v2**: the `model` block's `config_json` / `generation_config_json`,
+///   the bytes the converter read (their sha256 were checked by
+///   `cnq::classify_index`). The container's config wins: neither `models/`
+///   beside the container nor `CROW_MODEL_DIR` is read for it
+///   ([`check_model_dir_override`] only compares a set `CROW_MODEL_DIR`).
+/// - **index v1** (the CNQ4.5-M container of record, no config inside):
+///   [`from_container`], the pre-C7 path: `CROW_MODEL_DIR`, else `models/`.
+pub fn config_for_container(cnq_path: &str, peek: &IndexPeek, model_dir: Option<&str>) -> Result<Option<ModelMeta>, String> {
+    match peek.model() {
+        None => from_container(cnq_path, model_dir),
+        Some(m) => {
+            let label = v2_config_label(cnq_path, "config_json");
+            let glabel = v2_config_label(cnq_path, "generation_config_json");
+            ModelMeta::from_config_texts(&m.config_json, &label, Some((m.generation_config_json.as_str(), glabel.as_str()))).map(Some)
+        }
+    }
+}
+
+/// Crow #300 C7: `CROW_MODEL_DIR` beside an index v2 container. The container's
+/// config wins, so the variable is only a cross-check: its `config.json` (and its
+/// `generation_config.json`, when the directory has one) must hash to the bytes
+/// the container carries, or the boot is refused by name. A caller that points
+/// the variable at one checkpoint and the container at another is told so,
+/// instead of one of the two being silently ignored.
+pub fn check_model_dir_override(dir: &str, m: &ModelBlock) -> Result<(), String> {
+    if dir.is_empty() {
+        return Err("CROW_MODEL_DIR is set but empty".to_string());
+    }
+    let d = std::path::Path::new(dir);
+    for (file, carried, key, required) in [
+        ("config.json", m.config_json.as_str(), "config_json", true),
+        ("generation_config.json", m.generation_config_json.as_str(), "generation_config_json", false),
+    ] {
+        let p = d.join(file);
+        let bytes = match std::fs::read(&p) {
+            Ok(b) => b,
+            Err(_) if !required => continue,
+            Err(e) => return Err(format!("CROW_MODEL_DIR {dir}: {file}: {e} - refusing (Crow #300 C7)")),
+        };
+        let (got, want) = (sha256_hex(&bytes), sha256_hex(carried.as_bytes()));
+        if got != want {
+            return Err(format!(
+                "[meta] CROW_MODEL_DIR {} sha256 {got} differs from the container's model.{key} sha256 {want} \
+(family {}, {} @ {}) - an index v2 container carries its own config; unset CROW_MODEL_DIR or point it at the \
+checkpoint this container was converted from - refusing to boot (Crow #300)",
+                p.display(),
+                m.family,
+                m.source_repo,
+                m.source_revision
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The container facts a config must fit, read off the index trailer: the
+/// family it was converted as, the token embedding's `[vocab, hidden]`, and the
+/// number of text layers. A config of another model passes its own family row
+/// (`verdict`), so this is what catches it, before `Cnq::open` and before any
+/// CUDA work: `Err` is a table with one row per differing fact, `container X,
+/// config Y`. Crow #300 phase 1 acceptance: "a container with the other model's
+/// config dies at boot with a named mismatch table".
+pub fn container_mismatch(geo: &Geo, peek: &IndexPeek, cnq_path: &str, config_label: &str) -> Result<(), String> {
+    let text = || peek.tensors.iter().filter(|t| t.section == "text");
+    let embed = text()
+        .find(|t| t.name.ends_with("embed_tokens.weight"))
+        .map(|t| format!("{:?}", t.shape))
+        .unwrap_or_else(|| "no embed_tokens tensor".to_string());
+    let layers = text()
+        .filter_map(|t| t.name.split(".layers.").nth(1)?.split('.').next()?.parse::<usize>().ok())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let family = format!("{:?}", geo.family);
+    let rows = [
+        ("family", format!("{} (index v{})", peek.family(), if peek.model().is_some() { 2 } else { 1 }), family.clone(), peek.family() == family),
+        ("embed_tokens [vocab, hidden]", embed.clone(), format!("{:?}", [geo.vocab, geo.hidden]), embed == format!("{:?}", [geo.vocab, geo.hidden])),
+        ("text layers", layers.to_string(), geo.layers.to_string(), layers == geo.layers),
+    ];
+    let bad: Vec<_> = rows.iter().filter(|r| !r.3).collect();
+    if bad.is_empty() {
+        return Ok(());
+    }
+    let table = bad.iter().map(|(n, c, g, _)| format!("  {n}: container {c}, config {g}")).collect::<Vec<_>>().join("\n");
+    Err(format!(
+        "[meta] {} of {} container facts differ from the config - the container and its config describe different models, \
+refusing to boot (Crow #300):\n{table}\n[meta]   container: {cnq_path}\n[meta]   config: {config_label}",
+        bad.len(),
+        rows.len()
+    ))
+}
+
+/// Why the gate refused: a config it could not read (the #94 "unreadable truth
+/// source" class), or a config it read and refused (a table, a named reason).
+#[derive(Debug)]
+pub enum GateRefusal {
+    Unreadable(String),
+    Refused(String),
+}
+
+/// The metadata gate, pure (no panic, no log, no stash), so every branch is
+/// unit-tested on a container's peeked index: the `CROW_MODEL_DIR` cross-check
+/// of an index v2, the config by index kind ([`config_for_container`]), the
+/// family row and the `Geo` ([`verdict`]), then the container facts
+/// ([`container_mismatch`]). `Ok(None)` = an index v1 with no config found (the
+/// selftest package).
+pub fn gate(cnq_path: &str, peek: &IndexPeek, model_dir: Option<&str>) -> Result<Option<(ModelMeta, Geo)>, GateRefusal> {
+    if let (Some(m), Some(dir)) = (peek.model(), model_dir) {
+        check_model_dir_override(dir, m).map_err(GateRefusal::Refused)?;
+    }
+    let Some(meta) = config_for_container(cnq_path, peek, model_dir).map_err(GateRefusal::Unreadable)? else {
+        return Ok(None);
+    };
+    let geo = verdict(&meta).map_err(GateRefusal::Refused)?;
+    container_mismatch(&geo, peek, cnq_path, &meta.config_path).map_err(GateRefusal::Refused)?;
+    Ok(Some((meta, geo)))
 }
 
 // ---- the boot door ----
@@ -1296,7 +1442,11 @@ pub fn verdict(meta: &ModelMeta) -> Result<Geo, String> {
 }
 
 /// The gate `boot::open_model` calls FIRST, before the container is mapped and
-/// the CUDA context created:
+/// the CUDA context created ([`gate`], plus the log lines, the panic and the #96
+/// stash). Since Crow #300 C7 it judges the config the container's index names:
+/// an index v2 container's own `model` block, or for the index v1 container of
+/// record `CROW_MODEL_DIR` / `models/` (`model_dir` is the variable, read by the
+/// caller):
 ///
 /// - config.json found, every check green and (Flash-Next) the runtime `Geo`
 ///   equal to `Geo::FLASH_NEXT` → one INFO line, the meta and the `Geo`
@@ -1305,12 +1455,14 @@ pub fn verdict(meta: &ModelMeta) -> Result<Geo, String> {
 ///   geometry, returned the same way (C5: `boot::model_geo` refuses it next, at
 ///   its first unbuilt block);
 /// - config.json found and anything red or unreadable → a panic carrying the
-///   whole table (llama.cpp-style loud failure);
+///   whole table (llama.cpp-style loud failure); since C7 that includes a
+///   config that does not fit the container (`container_mismatch`) and, for an
+///   index v2, a `CROW_MODEL_DIR` whose config is not the container's;
 /// - no config.json anywhere next to the container → one WARN line, boot
 ///   continues (the selftest package ships without `models/` on purpose).
-pub fn assert_pinned(cnq_path: &str) -> Option<(ModelMeta, Geo)> {
-    let meta = match from_container(cnq_path) {
-        Ok(Some(meta)) => meta,
+pub fn assert_pinned(cnq_path: &str, peek: &IndexPeek, model_dir: Option<&str>) -> Option<(ModelMeta, Geo)> {
+    let (meta, geo) = match gate(cnq_path, peek, model_dir) {
+        Ok(Some(pair)) => pair,
         Ok(None) => {
             tracing::warn!(
                 target: "meta",
@@ -1319,11 +1471,8 @@ pub fn assert_pinned(cnq_path: &str) -> Option<(ModelMeta, Geo)> {
             );
             return None;
         }
-        Err(why) => panic!("{why} - the #94 metadata gate refuses to boot on an unreadable truth source"),
-    };
-    let geo = match verdict(&meta) {
-        Ok(geo) => geo,
-        Err(refusal) => {
+        Err(GateRefusal::Unreadable(why)) => panic!("{why} - the #94 metadata gate refuses to boot on an unreadable truth source"),
+        Err(GateRefusal::Refused(refusal)) => {
             // the table goes to the log too, not only to the panic text
             for line in refusal.lines() {
                 tracing::error!(target: "meta", "{line}");
