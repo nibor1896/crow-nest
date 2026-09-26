@@ -5113,6 +5113,8 @@ Flash-Next's with the SiLU gate (`CN_GATE_ACT`, C4).
   (`Engine::kv_rows_host`): |x| quantiles, the subnormal share, and the relative error of three e4m3
   encodings (the raw cast of `store_kv`, one scale per head, one per row). Results of 2026-09-26 in the
   CHANGELOG (Measured).
+- **KV dtype.** An unset `CROW_KV` takes `Family::default_kv`: BF16 for the dense family (FP8 failed
+  the long-context KLD criterion, 5 of 6 anchors), FP8 e4m3 for Flash-Next (values of record).
 
 ## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
 

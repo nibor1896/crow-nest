@@ -95,12 +95,11 @@ pub unsafe fn open_model(
     let context = context_from_env(std::env::var("CROW_CONTEXT").ok().as_deref(), geo.context_floor, geo.context_max)
         .unwrap_or_else(|why| panic!("[boot] refused: {why}"));
     let ctx = cuda::Ctx::init();
-    let mut cfg = Config { context, ..Config::default() };
-    if let Some(kv) = kv {
-        cfg.kv = kv;
-    }
+    // Crow #300 phase 2: unset CROW_KV takes the family's default (Flash-Next FP8, the dense
+    // family BF16, `Family::default_kv`)
+    let cfg = Config { context, kv: kv.unwrap_or(geo.family.default_kv()), ..Config::default() };
     tracing::info!(target: "boot", "[boot] kv cache dtype {} ({})", cfg.kv.name(),
-        if kv.is_some() { "CROW_KV" } else { "default, CROW_KV unset" });
+        if kv.is_some() { "CROW_KV".to_string() } else { format!("default of family {:?}, CROW_KV unset", geo.family) });
     (cnq, ctx, cfg, cnq_path, sidecar, geo)
 }
 

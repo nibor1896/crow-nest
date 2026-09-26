@@ -608,14 +608,15 @@ fn main() {
                 // the difference is engine math). Thresholds of record:
                 // decode_out/p2-golden/PREREG.md (2026-09-26, sha256 b547f8d6…): the engine may
                 // add at most 1/10 of the quantization mark `cnq_vs_bf16.rel_rms`; the norm
-                // (mark 0) 1e-5. Attention is judged under CROW_KV=bf16 only, FP8 is reported.
+                // (mark 0) 1e-5. Attention is judged with BF16 KV only (the dense default), FP8 is reported.
                 let dir = args.get(2).cloned().unwrap_or_else(|| "../oracle/golden/qwen35-27b".into());
                 let man: serde_json::Value = serde_json::from_slice(&std::fs::read(format!("{dir}/manifest.json")).unwrap()).unwrap();
                 let (tp, td) = (man["T_prompt"].as_u64().unwrap() as usize, man["D_decode"].as_u64().unwrap() as usize);
                 cfg.prompt_chunk = tp;
                 let mut eng = Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
                 let h = eng.geo.hidden;
-                let kv_bf16 = std::env::var("CROW_KV").as_deref() == Ok("bf16");
+                // the dtype the boot chose (CROW_KV, else the family's default: BF16 on the 27B)
+                let kv_bf16 = cfg.kv == KvDtype::Bf16;
                 let read = |f: &str| -> Vec<f32> {
                     std::fs::read(format!("{dir}/{f}")).unwrap().as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
                 };

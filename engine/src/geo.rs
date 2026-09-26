@@ -121,7 +121,7 @@ impl KvDtype {
         match s.to_ascii_lowercase().as_str() {
             "bf16" => Ok(KvDtype::Bf16),
             "fp8" | "fp8_e4m3" => Ok(KvDtype::Fp8E4m3),
-            _ => Err(format!("CROW_KV={s:?} is not a KV dtype; accepted: bf16, fp8, fp8_e4m3 (unset = fp8_e4m3)")),
+            _ => Err(format!("CROW_KV={s:?} is not a KV dtype; accepted: bf16, fp8, fp8_e4m3 (unset = the family's default, Family::default_kv)")),
         }
     }
 
@@ -324,8 +324,8 @@ pub enum Family {
     /// connection residual, 512-expert MoE, QSA attention, one PLE layer
     FlashNext,
     /// `qwen3_5_text`: the dense Qwen3.5 / Qwen3.8 family (Qwen3.8-27B) — plain
-    /// pre-norm residual, dense SwiGLU, full causal attention. Parsed, not run
-    /// (Crow #300 phase 2 builds the engine path)
+    /// pre-norm residual, dense SwiGLU, full causal attention; runs since Crow #300
+    /// phase 2
     Qwen35Dense,
 }
 
@@ -335,6 +335,17 @@ impl Family {
         match self {
             Family::FlashNext => "qwen4_exp_text",
             Family::Qwen35Dense => "qwen3_5_text",
+        }
+    }
+    /// Crow #300 phase 2: the KV cache dtype a boot takes when `CROW_KV` is unset. Flash-Next
+    /// keeps FP8 e4m3 (its gate values of record are computed with it). The dense family takes
+    /// BF16: on the 27B the raw FP8 cast failed the pre-registered long-context criterion at
+    /// 5 of 6 anchors (KL(BF16 || FP8) 0.04 to 4.4 against the limit 0.073,
+    /// `decode_out/p2-kld/PREREG.md`), while BF16 KV tracks the f32 reference (median KL 4e-5)
+    pub fn default_kv(self) -> KvDtype {
+        match self {
+            Family::FlashNext => KvDtype::Fp8E4m3,
+            Family::Qwen35Dense => KvDtype::Bf16,
         }
     }
     /// every family, in table order
@@ -1062,6 +1073,15 @@ mod tests_300 {
 
 #[cfg(test)]
 mod tests_300_c5 {
+    #[test]
+    fn an_unset_crow_kv_is_fp8_on_flash_next_and_bf16_on_the_dense_family() {
+        // Crow #300 phase 2: Flash-Next's gate values of record are FP8; the 27B failed the
+        // long-context criterion with FP8 KV, so its default is BF16
+        use super::{Family, KvDtype};
+        assert_eq!(Family::FlashNext.default_kv(), KvDtype::Fp8E4m3);
+        assert_eq!(Family::Qwen35Dense.default_kv(), KvDtype::Bf16);
+    }
+
     use super::*;
 
     /// C5: Flash-Next takes every built arm, so the boot check passes, and a
