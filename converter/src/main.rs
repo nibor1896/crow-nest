@@ -45,6 +45,12 @@
 //!          elements, |v| > 6·scale — the name is per report spec, it is a count),
 //!          plus one `record: "section_summary"` line per nvfp4 section
 //!          (text/vit/ple/mtp) with the aggregated numbers.
+//!   diag — Crow #300 phase 2 (`--diag-stats <f.json>`): all 126 finite ladder steps per
+//!          sub-block, scored by the ACTIVATION-weighted SSE sum_j d_j (q_j - w_j)^2
+//!          (d_j = sum x_j^2 of the input column over calibration tokens,
+//!          `oracle/calib_qwen35_stats.py` + `oracle/export_diag_stats.py`); searched on
+//!          every core. Clipping allowed and reported as under `mse`. The 27B's scale
+//!          policy since 2026-09-26 (decode_out/p2-lh: KLD 0.290 -> 0.223).
 //!          The GLOBAL tensor scale stays max-based in BOTH modes, so ladder
 //!          utilization is unchanged; only the SUBBLOCK scale choice differs.
 //!          Cost: ~2-3x the per-value quantization work of `ceil` (a handful of
@@ -488,6 +494,9 @@ fn quantize_nvfp4_w(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], usiz
     if let Some((d, cols)) = diag {
         assert!(cols % 16 == 0 && d.len() == cols && values.len() % cols == 0);
     }
+    // `--scales diag` tries 126 steps per sub-block (~2.5 h on one core for the 27B): the bytes
+    // are chosen up front on every core, each sub-block independently, so the result is the
+    // same as the serial search byte for byte
     let n_blocks = values.len() / 64;
     let mut raw_scales = vec![0.0f32; n_blocks * 4];
     for (b, chunk) in values.chunks(64).enumerate() {
@@ -498,6 +507,27 @@ fn quantize_nvfp4_w(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], usiz
     }
     let max_scale = raw_scales.iter().fold(0.0f32, |m, s| m.max(*s));
     let global = if max_scale > 0.0 { max_scale / UE4M3_MAX } else { 1.0 };
+    let diag_bytes: Vec<u32> = match diag {
+        Some((d, cols)) => {
+            let n_sub = values.len() / 16;
+            let mut out = vec![0u32; n_sub];
+            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            let per = n_sub.div_ceil(threads).max(1);
+            std::thread::scope(|sc| {
+                for (c, chunk) in out.chunks_mut(per).enumerate() {
+                    sc.spawn(move || {
+                        for (k, byte) in chunk.iter_mut().enumerate() {
+                            let i = c * per + k;
+                            let col = (i * 16) % cols;
+                            *byte = encode_subblock_diag(&values[i * 16..i * 16 + 16], global, &d[col..col + 16]);
+                        }
+                    });
+                }
+            });
+            out
+        }
+        None => Vec::new(),
+    };
 
     let mut out = Vec::with_capacity(n_blocks * 36);
     let mut stats = QuantStats::zero();
@@ -516,10 +546,8 @@ fn quantize_nvfp4_w(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], usiz
                     byte
                 }
                 ScalesMode::Diag => {
-                    let (d, cols) = diag.expect("checked above");
-                    let col = (b * 64 + sb * 16) % cols;
                     sse_ceil += subblock_sse(sub, decode_ue4m3(ceil_byte) * global);
-                    encode_subblock_diag(sub, global, &d[col..col + 16])
+                    diag_bytes[b * 4 + sb]
                 }
             };
             scales[sb] = stored;

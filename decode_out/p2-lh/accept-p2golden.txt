@@ -1,0 +1,79 @@
+[log] file /home/nibor1896/.local/state/crow/logs/engine.log (rotate at 64.000 MiB, keep 8, gzip on rotation), stderr mirror on, filter info
+[boot] CROW_TAVILY_KEY is set but no engine code reads it (not in docs/env.md) - ignored
+[boot] container index v2 (family Qwen35Dense, recipe cnq4.5-qwen35-dense, Qwen/Qwen3.8-27B @ 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0): config from its model block (config.json sha256 191e0af23210…)
+meta: 20 constants verified against config.json (Qwen/Qwen3.8-27B @ 1d4bf0f2 config.json) [../converter/Qwen3.8-27B-CNQ4.5.cnq [index v2 model.config_json]]; family Qwen35Dense (qwen3_5_text), runtime Geo derived (35 fields):
+[meta]   family               Qwen35Dense (qwen3_5_text)
+[meta]   hidden               5120
+[meta]   residual             Plain
+[meta]   layers               64
+[meta]   gdn_layers           48
+[meta]   attn_layers          16
+[meta]   attn_interval        4
+[meta]   q_heads              24
+[meta]   kv_heads             4
+[meta]   head_dim             256
+[meta]   attn                 Full
+[meta]   attn_output_gate     true
+[meta]   gate_act             Silu
+[meta]   attention_bias       false
+[meta]   rope_pairs           32
+[meta]   rope_theta           10000000.0
+[meta]   mrope_section        [11, 11, 10]
+[meta]   mrope_interleaved    true
+[meta]   gdn_key_heads        16
+[meta]   gdn_value_heads      48
+[meta]   gdn_key_dim          128
+[meta]   gdn_value_dim        128
+[meta]   conv_kernel          4
+[meta]   ffn                  Dense { inter: 17408 }
+[meta]   ple                  None
+[meta]   final_norm           Rms
+[meta]   norm_one_plus_w      true
+[meta]   rms_eps              1e-6
+[meta]   vocab                248320
+[meta]   tie_word_embeddings  false
+[meta]   context_max          262144
+[meta]   context_floor        100000
+[meta]   eos_ids              [248046, 248044]
+[meta]   mtp_layers           1
+[meta]   vision_out_hidden    Some(5120)
+[boot] kv cache dtype bf16 (default of family Qwen35Dense, CROW_KV unset)
+[load] [budget] host pinned budget 45.29 GiB (free for pinning 48.29 GiB - margin 3 GiB); free for pinning 48.29 GiB, MemAvailable 42.63 GiB, cap 46.00 GiB; NVIDIA driver pages 1.21 GiB of which 0.14 GiB mapped by live processes (subtracted)
+[load] loading embeddings (BF16 keep → host f32) …
+[load] loading 64 dense layer bundles (FP4 + keeps) …
+[load]   dense layers 0/64
+[load]   dense layers 12/64
+[load]   dense layers 24/64
+[load]   dense layers 36/64
+[load]   dense layers 48/64
+[load]   dense layers 60/64
+[load] NVFP4 scale bytes 0x7F (the E4M3 NaN code) rewritten to 0x7E: 0 (the MMA path reads 0x7F as NaN; the same rule as the expert slabs)
+[load] no PLE layer in this model (Geo::ple None) — skipped; budget verify next
+[vit] visual tower NOT loaded: the container has no vit section (Crow #300: the dense recipe omits it; the F16 projector path is not built yet), /props vision false
+[attn] full causal attention (Crow #300 phase 2): prefill attn_full_split S=1 (one block per query row and head), decode attn_full_split S=8 + attn_merge, CROW_ATTN_SPLITS unset
+[gdn] decode input projections grouped (default since 19g, one launch: gemv_fp4_mma_g32[515x1] qkv+z+b+a), CROW_GDN_FUSE_IN unset (0 = per-slab fallback of record, four launches), CROW_GDN_SPLIT_Z unset (#71, default off, 1 = z out of the group)
+[pf-gemm-b] prefill dense GEMM variant B (gemm_fp4_dense_b / gemm_bf16_dense_b), CROW_PF_GEMM_B unset (exact 1 = variant B 32-token tiles, unset or other = the 8-token form of record)
+[load] prefill staging on a side stream (CROW_PF_ASYNC=2): 2 x 64 slots
+[load] scratch + staging resident: 24 MiB (chunk 40)
+[load] [diet] scratch persist region 6 MiB + union region 12 MiB (largest of the hc/attn/gdn/ple/moe phase sets), CROW_CHUNK 40
+[load]   [budget] VRAM total 31.37 GiB, free at start 16.49 GiB
+[load]   [budget] dense FFN, no hot set: states 6.27 GiB + pending 0.12 GiB + safety 0.50 GiB fit free 16.49 GiB (9.59 GiB left)
+[load]   [budget] render reserve: requested 0 MiB, granted 0 MiB — off (CROW_RENDER_RESERVE_MB 0 or unset)
+[load]   [budget] KV           6250.0 MB  (16 layers × 4 kv-heads × 256 × 100000 × bf16)
+[load]   [budget] GDN state     149.6 MB  (48 × S[48][128][128] + conv[10240][3], f32, fixed)
+[load]   [budget] RoPE tbl       24.4 MB  (100000 positions × 32 pairs × cos+sin)
+[load]   [budget] states+dense+hot measured in VRAM: 6474.0 MiB (planned 6552.0 MiB, N=0)
+[load]   [budget] vit reserve       0.0 MB  (CROW_VIT 0, the tower is not loaded)
+[load]   [budget] render reserve    0.0 MB  (default, CROW_RENDER_RESERVE_MB unset: off) — no VRAM is kept for a co-resident renderer; Crow's render_page borrows it per render through POST /v1/crow/vram/lend (#117)
+[load]   [budget] post-plan allocations held at boot: device sampler 0.7 MB = 0.7 MB VRAM; host RAM only (never on the card): nothing
+[load]   [budget] free VRAM after load 10.16 GiB >= floor 0.25 GiB — the image path is held, not borrowed from here
+[load] load done in 6 s — VRAM used 21.22 GiB (weights 14.87 GiB + scratch + states; dense FFN, no hot experts)
+[stream] priority side stream 0x564e442a7950 (priority range 0..-5)
+p2golden l0-input-layernorm   prompt rows  0..39 rel_rms 7.669e-8  max_abs 7.153e-7  threshold 1.00e-5 (quant mark 0.0000)  PASS
+p2golden l0-mlp               prompt rows  0..39 rel_rms 4.488e-4  max_abs 3.574e-2  threshold 4.13e-3 (quant mark 0.0413)  PASS
+p2golden l0-gdn               prompt rows  0..39 rel_rms 2.200e-3  max_abs 2.674e-1  threshold 1.29e-2 (quant mark 0.1286)  PASS
+p2golden l0-gdn               decode rows 40..43 rel_rms 1.324e-3  max_abs 1.270e-1  threshold 1.29e-2 (quant mark 0.1286)  PASS
+p2golden l3-attn              prompt rows  0..39 rel_rms 2.653e-3  max_abs 6.065e-2  threshold 1.55e-2 (quant mark 0.1546)  PASS
+p2golden l3-attn              decode rows 40..43 rel_rms 2.457e-3  max_abs 4.256e-2  threshold 1.55e-2 (quant mark 0.1546)  PASS
+p2golden l17-mlp              prompt rows  0..39 rel_rms 1.495e-3  max_abs 7.213e-3  threshold 1.23e-2 (quant mark 0.1228)  PASS
+p2golden: ALL PASS (KV bf16)
