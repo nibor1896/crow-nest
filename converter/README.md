@@ -89,7 +89,7 @@ usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>]
 |---|---|---|
 | `text` | the default section | always |
 | `ple` | `ngram_embedding`, NVFP4, block exchangeable to FP8 | always |
-| `vit` | `model.visual`, carried in the container | optional |
+| `vit` | `model.visual`, carried in the Flash-Next container; the dense 27B recipe does not write it (the 27B uses `mmproj-F16.gguf`) | optional |
 | `mtp` | carried in the container | optional |
 
 ## Verification sidecar

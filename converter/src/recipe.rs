@@ -140,6 +140,21 @@ pub fn section_of(name: &str) -> &'static str {
     }
 }
 
+/// Why the dense row omits the vision tower: the 27B sees images through the F16 projector.
+pub const OMIT_VIT_DENSE: &str = "vision tower not written: the 27B sees images through the F16 projector mmproj-F16.gguf (Crow #300)";
+
+/// Tensors `family`'s recipe does not write at all, with the reason the plan prints. The
+/// manifest drops them before [`decide`], so they have no index record, no payload and no
+/// section. The dense row omits `model.visual.*` (#300 decision 2026-09-26: the 27B reads
+/// images through llama.cpp's F16 projector on the GPU, the container gets no vision part).
+/// Flash-Next omits nothing: its `vit` section is part of the container of record.
+pub fn omitted(family: Family, name: &str) -> Option<&'static str> {
+    match family {
+        Family::Qwen35Dense if section_of(name) == "vit" => Some(OMIT_VIT_DENSE),
+        _ => None,
+    }
+}
+
 /// The decision for one tensor under `family`'s recipe. `src_dtype` is the safetensors dtype
 /// (`BF16`, `F32`, `F16`, `I64`).
 pub fn decide(family: Family, name: &str, shape: &[usize], src_dtype: &str) -> Result<Decision, String> {
@@ -214,9 +229,9 @@ pub fn decide_flash_next(name: &str, shape: &[usize], src_dtype: &str) -> Decisi
 /// - BF16: `in_proj_a` / `in_proj_b`, `conv1d`, every norm, `dt_bias`; the token embedding
 ///   (it lives in host RAM);
 /// - f32: `A_log`;
-/// - `vit` and `mtp`: their own sections, every tensor BF16 (the published NVIDIA NVFP4 27B
-///   keeps vision and MTP BF16; robin wants BF16 vision on crow-nest). Both are optional to
-///   load, so they cost GPU memory only on the cards that load them.
+/// - `mtp`: its own section, every tensor BF16 (the published NVIDIA NVFP4 27B keeps MTP BF16),
+///   optional to load, so it costs GPU memory only on the cards that load it;
+/// - `vit`: NOT WRITTEN, see [`omitted`]. It never reaches this row; if it does, it is refused.
 ///
 /// A text tensor matching none of the rows is refused by name.
 pub fn decide_qwen35_dense(name: &str, shape: &[usize], src_dtype: &str) -> Result<Decision, String> {
@@ -226,7 +241,7 @@ pub fn decide_qwen35_dense(name: &str, shape: &[usize], src_dtype: &str) -> Resu
         return Err(format!("{name}: an I64 tensor in a dense checkpoint - the dense recipe has no row for it"));
     }
     match section {
-        "vit" => return d(DtypeOut::Bf16, "vision tower BF16 (own section)"),
+        "vit" => return Err(format!("{name}: the dense recipe omits the vision tower (`recipe::omitted`), it never decides it")),
         "mtp" => return d(DtypeOut::Bf16, "MTP BF16 (own section)"),
         "ple" => return Err(format!("{name}: a `ple` tensor in a dense checkpoint - the dense family has no PLE")),
         _ => {}
@@ -537,6 +552,7 @@ mod tests {
             let f: Vec<&str> = line.split('\t').collect();
             let (name, sh, section, dtype) = (f[0], shape(f[1]), f[2], f[3]);
             let src = if dtype == "i64" { "I64" } else { "BF16" };
+            assert_eq!(omitted(Family::FlashNext, name), None, "{name}: Flash-Next omits nothing");
             let d = decide(Family::FlashNext, name, &sh, src).unwrap();
             assert_eq!(d.dtype.as_str(), dtype, "{name}: dtype ({})", d.rule);
             assert_eq!(d.section, section, "{name}: section");
@@ -566,20 +582,29 @@ mod tests {
         }
     }
 
-    /// Every tensor of the 27B (names and shapes from its 18 shard headers) is decided by a
-    /// named row of the dense recipe, none is refused, and the per-row counts are the recipe.
+    /// Every tensor of the 27B (names and shapes from its 18 shard headers) is either omitted
+    /// (the 333 vision-tower tensors, and only those) or decided by a named row of the dense
+    /// recipe; none is refused, and the per-row counts are the recipe.
     #[test]
     fn the_dense_row_decides_every_tensor_of_the_27b() {
         let tsv = include_str!("../tests/fixtures/qwen3.8-27b-tensors.tsv");
         let mut per: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();
         let mut n = 0;
+        let mut omit = 0;
         for line in tsv.lines().filter(|l| !l.starts_with('#')) {
             let f: Vec<&str> = line.split('\t').collect();
+            n += 1;
+            if let Some(why) = omitted(Family::Qwen35Dense, f[0]) {
+                assert_eq!(why, OMIT_VIT_DENSE);
+                assert!(decide(Family::Qwen35Dense, f[0], &shape(f[1]), f[2]).unwrap_err().contains("omits the vision tower"));
+                omit += 1;
+                continue;
+            }
             let d = decide(Family::Qwen35Dense, f[0], &shape(f[1]), f[2]).unwrap_or_else(|e| panic!("{e}"));
             *per.entry((d.section, d.dtype.as_str(), d.rule)).or_default() += 1;
-            n += 1;
         }
         assert_eq!(n, 1199);
+        assert_eq!(omit, 27 * 12 + 6 + 3, "the whole vision tower, and nothing else, is omitted");
         let want = BTreeMap::from([
             (("mtp", "bf16", "MTP BF16 (own section)"), 15),
             (("text", "bf16", "GDN conv1d BF16"), 48),
@@ -592,7 +617,6 @@ mod tests {
             (("text", "nvfp4", "MLP gate/up/down NVFP4"), 192),
             (("text", "nvfp4", "attention q/k/v/o NVFP4"), 64),
             (("text", "nvfp4", "lm_head NVFP4"), 1),
-            (("vit", "bf16", "vision tower BF16 (own section)"), 27 * 12 + 6 + 3),
         ]);
         assert_eq!(per, want);
     }

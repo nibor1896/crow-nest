@@ -17,7 +17,8 @@
 //! whose length is not a multiple of 64 stays BF16.
 //!
 //! Section tags (decision 2026-09-02): `ple` (ngram_embedding — NVFP4, block
-//! exchangeable to FP8), `vit` (model.visual — carried, optional to load), `mtp`
+//! exchangeable to FP8), `vit` (model.visual — carried, optional to load; the dense 27B row
+//! omits it, `recipe::omitted`), `mtp`
 //! (carried, optional to load), `text` (default).
 //!
 //! Verification sidecar: `<out>.cnq.sidecar.jsonl`, one JSON line per tensor with
@@ -666,6 +667,8 @@ struct Manifest {
     generation_config_json: String,
     config: serde_json::Value,
     tensors: Vec<TensorEntry>,
+    /// tensors the recipe does not write (`recipe::omitted`): reason -> (count, source bytes)
+    omitted: BTreeMap<&'static str, (usize, u64)>,
     shard_files: Vec<std::path::PathBuf>,
     weight_map: Option<BTreeMap<String, String>>,
     single_file: bool,
@@ -697,6 +700,7 @@ fn build_manifest(input: &std::path::Path) -> Result<Manifest, String> {
         files.iter().map(|f| input.join(f)).collect()
     };
     let mut refusals: Vec<String> = Vec::new();
+    let mut omitted: BTreeMap<&'static str, (usize, u64)> = BTreeMap::new();
     for path in &shard_files {
         let shard_name = path.file_name().unwrap().to_str().unwrap().to_string();
         let (header, data_start) = read_safetensors_header(path).map_err(|e| format!("{}: shard header: {e}", path.display()))?;
@@ -721,6 +725,12 @@ fn build_manifest(input: &std::path::Path) -> Result<Manifest, String> {
                 let begin = info["data_offsets"][0].as_u64().unwrap();
                 let end = info["data_offsets"][1].as_u64().unwrap();
                 assert_eq!(end - begin, (n * es) as u64, "{name}: length mismatch");
+                if let Some(why) = recipe::omitted(family, name) {
+                    let e = omitted.entry(why).or_default();
+                    e.0 += 1;
+                    e.1 += end - begin;
+                    continue;
+                }
                 let decision = match recipe::decide(family, name, &shape, dt) {
                     Ok(d) => d,
                     Err(why) => {
@@ -749,7 +759,7 @@ fn build_manifest(input: &std::path::Path) -> Result<Manifest, String> {
     let geo = recipe::derive_geo(family, &config);
     let named: Vec<(String, Vec<usize>)> = tensors.iter().map(|t| (t.name.clone(), t.shape.clone())).collect();
     recipe::check_geo_against_tensors(&geo, &named)?;
-    Ok(Manifest { family, config_json, generation_config_json, config, tensors, shard_files, weight_map, single_file, model_dir })
+    Ok(Manifest { family, config_json, generation_config_json, config, tensors, omitted, shard_files, weight_map, single_file, model_dir })
 }
 
 /// The index v2 `model` block's provenance: repo from `--source-repo`, revision from
@@ -889,6 +899,9 @@ fn plan(args: &[String]) -> i32 {
         println!("  section ple (Flash-Next tier)    {:>15} B  {:>8.3} GiB", ple, gib(ple));
     }
     println!("  container payload                {:>15} B  {:>8.3} GiB", total, gib(total));
+    for (why, (c, b)) in &m.omitted {
+        println!("  omitted, not written             {c:>7} tensors, {b:>15} B source  {:>8.3} GiB  ({why})", gib(*b));
+    }
     0
 }
 
@@ -1366,7 +1379,8 @@ mod tests {
         let sh = &m["source"]["shards"][0];
         assert_eq!(sh["sha256"], recipe::sha256_file(&st).unwrap());
         assert_eq!(sh["sha256_from"], "computed");
-        assert_eq!(idx["sections"].as_object().unwrap().keys().collect::<Vec<_>>(), ["mtp", "vit"]);
+        // the vision tower is omitted by the dense row: no section, no record (#300 projector decision)
+        assert_eq!(idx["sections"].as_object().unwrap().keys().collect::<Vec<_>>(), ["mtp"]);
         // dtypes per the dense row, and the f32 A_log is the BF16 source widened exactly
         let ts = idx["tensors"].as_array().unwrap();
         let get = |n: &str| ts.iter().find(|t| t["name"] == n).unwrap();
@@ -1374,7 +1388,7 @@ mod tests {
         assert_eq!(get("model.language_model.layers.0.linear_attn.in_proj_a.weight")["dtype"], "bf16");
         assert_eq!(get("model.language_model.layers.0.linear_attn.conv1d.weight")["dtype"], "bf16");
         assert_eq!(get("mtp.fc.weight")["section"], "mtp");
-        assert_eq!(get("model.visual.blocks.0.attn.qkv.weight")["section"], "vit");
+        assert!(ts.iter().all(|t| t["section"] != "vit" && !t["name"].as_str().unwrap().contains("visual")));
         let a = get("model.language_model.layers.0.linear_attn.A_log");
         assert_eq!((a["dtype"].as_str(), a["len"].as_u64()), (Some("f32"), Some(8)));
         let (hdr, start) = read_safetensors_header(&st).unwrap();
