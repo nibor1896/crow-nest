@@ -283,6 +283,64 @@ enum ScalesMode {
     /// per-sub-block SSE-minimizing step (analytic pre-selection + local
     /// refinement) — clipping allowed, max_rel bound void
     Mse,
+    /// Crow #300 phase 2 (decode_out/p2-lh): every one of the 126 finite ue4m3 steps is tried
+    /// and the one with the smallest ACTIVATION-WEIGHTED error sum_j d_j (q_j - w_j)^2 wins,
+    /// d_j = sum over calibration tokens of x_j^2 for the sub-block's input column j
+    /// (`--diag-stats`, `oracle/export_diag_stats.py`) — clipping allowed, as `Mse`
+    Diag,
+}
+
+/// Crow #300 phase 2: the `--scales diag` weights, one f32 vector per input group
+/// (`oracle/calib_qwen35_stats.py` groups: `layers.N.attn_in`, `o_in`, `gdn_in`, `gdn_out_in`,
+/// `mlp_in`, `down_in`, `head_in`), read from `oracle/export_diag_stats.py`'s JSON
+struct DiagStats {
+    groups: BTreeMap<String, Vec<f32>>,
+    path: String,
+    stats_sha256: String,
+}
+
+impl DiagStats {
+    fn load(path: &str) -> Result<DiagStats, String> {
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).map_err(|e| format!("{path}: {e}"))?)
+            .map_err(|e| format!("{path}: {e}"))?;
+        let mut groups = BTreeMap::new();
+        for (k, arr) in v["groups"].as_object().ok_or(format!("{path}: no groups"))? {
+            let vals: Vec<f32> = arr.as_array().ok_or(format!("{path}: {k} is not an array"))?
+                .iter().map(|x| x.as_f64().map(|f| f as f32).ok_or(format!("{path}: {k}: not a number")))
+                .collect::<Result<_, _>>()?;
+            groups.insert(k.clone(), vals);
+        }
+        Ok(DiagStats { groups, path: path.to_string(), stats_sha256: v["stats_sha256"].as_str().unwrap_or("").to_string() })
+    }
+
+    /// the input group of one NVFP4 projection of the dense family, None for any other tensor
+    fn key_of(name: &str) -> Option<String> {
+        if name == "lm_head.weight" {
+            return Some("head_in".into());
+        }
+        let rest = name.strip_prefix("model.language_model.layers.")?;
+        let (layer, proj) = rest.split_once('.')?;
+        let group = match proj {
+            "self_attn.q_proj.weight" | "self_attn.k_proj.weight" | "self_attn.v_proj.weight" => "attn_in",
+            "self_attn.o_proj.weight" => "o_in",
+            "linear_attn.in_proj_qkv.weight" | "linear_attn.in_proj_z.weight" => "gdn_in",
+            "linear_attn.out_proj.weight" => "gdn_out_in",
+            "mlp.gate_proj.weight" | "mlp.up_proj.weight" => "mlp_in",
+            "mlp.down_proj.weight" => "down_in",
+            _ => return None,
+        };
+        Some(format!("layers.{layer}.{group}"))
+    }
+
+    /// the weights of one tensor's input columns, or a named refusal
+    fn weights_for(&self, name: &str, cols: usize) -> Result<&[f32], String> {
+        let key = DiagStats::key_of(name).ok_or(format!("--scales diag: no calibration group for {name}"))?;
+        let d = self.groups.get(&key).ok_or(format!("--scales diag: {} has no group {key} (for {name})", self.path))?;
+        if d.len() != cols {
+            return Err(format!("--scales diag: group {key} has {} columns, {name} has {cols}", d.len()));
+        }
+        Ok(d)
+    }
 }
 
 /// Ceiling byte for a sub-block in DIVIDED units: `encode_ue4m3_ceil` plus the
@@ -387,13 +445,49 @@ fn encode_subblock_mse(sub: &[f32], global: f32, ceil_byte: u32) -> (u32, f64, f
     (best, best_sse, ceil_sse)
 }
 
+/// `--scales diag`: all 126 finite ue4m3 steps (bytes 1..=0x7E; 0x7F is the NaN code) scored by
+/// sum_j (d_j * (q_j - w_j)^2 summed in order), the packing arithmetic of `quant_dequant`; the
+/// smallest wins, ties keep the smaller byte, an all-zero sub-block keeps byte 0. The same
+/// search as `oracle/nvfp4_sim.py` `search("diag")`, which the simulation of record ran.
+fn encode_subblock_diag(sub: &[f32], global: f32, d: &[f32]) -> u32 {
+    if sub.iter().all(|v| *v == 0.0) {
+        return 0;
+    }
+    let mut best = 0u32;
+    let mut best_err = f32::INFINITY;
+    for b in 1..=126u32 {
+        let s = decode_ue4m3(b) * global;
+        let inv = 1.0 / s;
+        let mut err = 0.0f32;
+        for (v, w) in sub.iter().zip(d) {
+            let e = quant_dequant(*v, s, inv) - *v;
+            err += e * e * *w;
+        }
+        if err < best_err {
+            best_err = err;
+            best = b;
+        }
+    }
+    best
+}
+
 /// NVFP4-RTN with in-place dequant statistics (gate 0 of the measurement ladder).
 /// Returns (packed blocks, global scale, stats of the WRITTEN encoding, ceiling-
 /// reference SSE on the SAME weights — identical to the written SSE in Ceil mode).
 /// The GLOBAL scale stays max-based in both modes: ladder utilization unchanged;
 /// only the sub-block scale choice differs.
 fn quantize_nvfp4(values: &[f32], mode: ScalesMode) -> (Vec<u8>, f32, QuantStats, f64) {
+    quantize_nvfp4_w(values, mode, None)
+}
+
+/// `quantize_nvfp4` with the `--scales diag` weights: `diag` = (d over the input columns, the
+/// row length); a sub-block is 16 consecutive columns of one row (row length % 16 == 0)
+fn quantize_nvfp4_w(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], usize)>) -> (Vec<u8>, f32, QuantStats, f64) {
     assert!(values.len() % 64 == 0);
+    assert_eq!(mode == ScalesMode::Diag, diag.is_some(), "--scales diag needs its weights, and only it");
+    if let Some((d, cols)) = diag {
+        assert!(cols % 16 == 0 && d.len() == cols && values.len() % cols == 0);
+    }
     let n_blocks = values.len() / 64;
     let mut raw_scales = vec![0.0f32; n_blocks * 4];
     for (b, chunk) in values.chunks(64).enumerate() {
@@ -420,6 +514,12 @@ fn quantize_nvfp4(values: &[f32], mode: ScalesMode) -> (Vec<u8>, f32, QuantStats
                     let (byte, _sse, ceil_sse) = encode_subblock_mse(sub, global, ceil_byte);
                     sse_ceil += ceil_sse;
                     byte
+                }
+                ScalesMode::Diag => {
+                    let (d, cols) = diag.expect("checked above");
+                    let col = (b * 64 + sb * 16) % cols;
+                    sse_ceil += subblock_sse(sub, decode_ue4m3(ceil_byte) * global);
+                    encode_subblock_diag(sub, global, &d[col..col + 16])
                 }
             };
             scales[sb] = stored;
@@ -475,7 +575,7 @@ fn quantize_nvfp4(values: &[f32], mode: ScalesMode) -> (Vec<u8>, f32, QuantStats
     (out, global, stats, sse_ceil)
 }
 
-const HELP: &str = "usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>] <model-dir | file.safetensors> <out.cnq>\n  writes an index v2 container: config.json + generation_config.json verbatim, the family's recipe, source repo/revision/shard sha256\n  (--revision defaults to the Hugging Face cache in the model dir; Crow #300 C6)\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter layer-rule-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) --arm attn-v-out|ffn-down-rule|ffn-down-all\n  builds a bf16 overlay container for one llama.cpp-shaped layer-rule arm (#91 phase 1)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)\n       converter plan [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  the dry run: family, recipe, per-tensor dtype/section table, GPU / host byte totals (Crow #300 C6)";
+const HELP: &str = "usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>] <model-dir | file.safetensors> <out.cnq>\n  writes an index v2 container: config.json + generation_config.json verbatim, the family's recipe, source repo/revision/shard sha256\n  (--revision defaults to the Hugging Face cache in the model dir; Crow #300 C6)\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n  --scales diag --diag-stats <f.json>  all 126 ue4m3 steps scored by the activation-weighted error (Crow #300 p2-lh)\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter layer-rule-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) --arm attn-v-out|ffn-down-rule|ffn-down-all\n  builds a bf16 overlay container for one llama.cpp-shaped layer-rule arm (#91 phase 1)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)\n       converter plan [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  the dry run: family, recipe, per-tensor dtype/section table, GPU / host byte totals (Crow #300 C6)";
 
 /// `converter imatrix-show <imatrix.gguf> [tensor ...]` — #79. Read-only: the kv block, the
 /// tensor count, and for every named tensor its dims, its data offset, its first eight values,
@@ -621,17 +721,20 @@ fn main() {
     let mut positional: Vec<String> = Vec::new();
     let mut mode = ScalesMode::Ceil;
     let mut prov = Provenance::default();
+    let mut diag_path: Option<String> = None;
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         match arg.as_str() {
             "--scales" => match argv.next().as_deref() {
                 Some("ceil") => mode = ScalesMode::Ceil,
                 Some("mse") => mode = ScalesMode::Mse,
+                Some("diag") => mode = ScalesMode::Diag,
                 other => {
-                    eprintln!("--scales needs `ceil` or `mse`, got {other:?}\n{HELP}");
+                    eprintln!("--scales needs `ceil`, `mse` or `diag`, got {other:?}\n{HELP}");
                     std::process::exit(2);
                 }
             },
+            "--diag-stats" => diag_path = argv.next(),
             "--source-repo" => prov.repo = argv.next(),
             "--revision" => prov.revision = argv.next(),
             a if a.starts_with("--") => {
@@ -647,7 +750,18 @@ fn main() {
     }
     let input = std::path::PathBuf::from(&positional[0]);
     let out_path = std::path::PathBuf::from(&positional[1]);
-    std::process::exit(convert(&input, &out_path, mode, &prov));
+    let diag = match diag_path.as_deref().map(DiagStats::load) {
+        None => None,
+        Some(Ok(d)) => {
+            eprintln!("--diag-stats {}: {} groups (stats sha256 {})", d.path, d.groups.len(), d.stats_sha256);
+            Some(d)
+        }
+        Some(Err(e)) => {
+            eprintln!("conversion refused: {e}");
+            std::process::exit(2);
+        }
+    };
+    std::process::exit(convert(&input, &out_path, mode, &prov, diag.as_ref()));
 }
 
 /// `--source-repo` / `--revision`: where the checkpoint came from, for the index v2 `model`
@@ -907,8 +1021,16 @@ fn plan(args: &[String]) -> i32 {
 
 /// The conversion: the manifest, the streamed payload, the index v2 trailer. Returns the exit
 /// code (0, 1 on a bound violation under `--scales ceil`, 2 on a refusal, 3 on a coverage gap).
-fn convert(input: &std::path::Path, out_path: &std::path::Path, mode: ScalesMode, prov: &Provenance) -> i32 {
-    let scales_mode_str = if mode == ScalesMode::Mse { "mse" } else { "ceil" };
+fn convert(input: &std::path::Path, out_path: &std::path::Path, mode: ScalesMode, prov: &Provenance, diag: Option<&DiagStats>) -> i32 {
+    if (mode == ScalesMode::Diag) != diag.is_some() {
+        eprintln!("conversion refused: --scales diag and --diag-stats go together\n{HELP}");
+        return 2;
+    }
+    let scales_mode_str = match mode {
+        ScalesMode::Ceil => "ceil",
+        ScalesMode::Mse => "mse",
+        ScalesMode::Diag => "diag",
+    };
     let t_start = std::time::Instant::now();
 
     // ---- manifest: scan headers only (fast), collect every tensor's location ----
@@ -987,7 +1109,20 @@ fn convert(input: &std::path::Path, out_path: &std::path::Path, mode: ScalesMode
 
         if t.decision.dtype == recipe::DtypeOut::Nvfp4 {
             let values = bytes_to_f32(&raw, dt_in);
-            let (blocks, global, stats, sse_ceil) = quantize_nvfp4(&values, mode);
+            let w = match (mode, diag) {
+                (ScalesMode::Diag, Some(ds)) => {
+                    let cols = *t.shape.last().expect("an nvfp4 tensor has a shape") as usize;
+                    match ds.weights_for(&t.name, cols) {
+                        Ok(d) => Some((d, cols)),
+                        Err(e) => {
+                            eprintln!("conversion refused: {e}");
+                            return 2;
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let (blocks, global, stats, sse_ceil) = quantize_nvfp4_w(&values, mode, w);
             total_violations += stats.violations;
             let mse = stats.sum_sq_err / t.n_values as f64;
             let mse_ceil = sse_ceil / t.n_values as f64;
@@ -1129,7 +1264,7 @@ violations {total_violations}, elapsed {:.0} s",
         t_start.elapsed().as_secs_f64()
     );
     if total_violations > 0 {
-        if mode == ScalesMode::Mse {
+        if mode != ScalesMode::Ceil {
             // the old per-element relative bound is void BY DESIGN here (clipping
             // allowed); quality is carried by the MSE fields of the report above
             eprintln!(
@@ -1364,7 +1499,7 @@ mod tests {
         write_synthetic_safetensors(&st);
         let out = dir.join("synthetic-v2.cnq");
         let prov = Provenance { repo: Some("crow-nest/synthetic-v2".into()), revision: Some("c6".into()) };
-        assert_eq!(convert(&st, &out, ScalesMode::Ceil, &prov), 0);
+        assert_eq!(convert(&st, &out, ScalesMode::Ceil, &prov, None), 0);
         let bytes = std::fs::read(&out).unwrap();
         assert_eq!(&bytes[..4], b"CNQ1");
         let idx = trailer(&bytes);
@@ -1428,7 +1563,7 @@ mod tests {
         let prov = Provenance { repo: Some("r".into()), revision: Some("v".into()) };
         let m = build_manifest(&st).err().unwrap();
         assert!(m.contains("carries the checkpoint's config.json"), "{m}");
-        assert_eq!(convert(&st, &out, ScalesMode::Ceil, &prov), 2);
+        assert_eq!(convert(&st, &out, ScalesMode::Ceil, &prov, None), 2);
         assert!(!out.exists());
         std::fs::copy(fixture_dir().join("config.json"), dir.join("config.json")).unwrap();
         std::fs::copy(fixture_dir().join("generation_config.json"), dir.join("generation_config.json")).unwrap();
@@ -1437,7 +1572,7 @@ mod tests {
         assert!(e.contains("--source-repo"), "{e}");
         let e = provenance(&m, &Provenance { repo: Some("r".into()), revision: None }, false).err().unwrap();
         assert!(e.contains("no --revision"), "{e}");
-        assert_eq!(convert(&st, &out, ScalesMode::Ceil, &Provenance::default()), 2);
+        assert_eq!(convert(&st, &out, ScalesMode::Ceil, &Provenance::default(), None), 2);
         assert!(!out.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1459,7 +1594,7 @@ mod tests {
         std::fs::write(dir.join("model.safetensors.index.json"), serde_json::to_vec(&serde_json::json!({ "weight_map": wm })).unwrap()).unwrap();
         let out = dir.join("x.cnq");
         let prov = Provenance { repo: Some("crow-nest/synthetic-v2".into()), revision: Some("c6".into()) };
-        assert_eq!(convert(&dir, &out, ScalesMode::Ceil, &prov), 0);
+        assert_eq!(convert(&dir, &out, ScalesMode::Ceil, &prov, None), 0);
         let idx = trailer(&std::fs::read(&out).unwrap());
         assert!(idx["tensors"].as_array().unwrap().iter().all(|t| !t["name"].as_str().unwrap().contains("visual")));
         std::fs::remove_dir_all(&dir).ok();
@@ -1481,5 +1616,82 @@ mod tests {
         let (_b, _g, st, sse_ceil) = quantize_nvfp4(&vals, ScalesMode::Mse);
         assert!(st.sum_sq_err <= sse_ceil * 1.000_000_1);
         assert!(st.sum_sq_err < sse_ceil, "MSE must strictly win overall");
+    }
+
+    fn weighted_err(sub: &[f32], s: f32, d: &[f32]) -> f32 {
+        let inv = 1.0 / s;
+        sub.iter().zip(d).fold(0.0f32, |a, (v, w)| {
+            let e = quant_dequant(*v, s, inv) - *v;
+            a + e * e * *w
+        })
+    }
+
+    fn lcg_values(n: usize, seed: u32) -> Vec<f32> {
+        let mut x = seed;
+        (0..n).map(|_| {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            let m = ((x >> 8) % 1000) as f32 / 1000.0;
+            (m - 0.5) * if (x >> 20) % 16 == 0 { 40.0 } else { 1.0 }
+        }).collect()
+    }
+
+    #[test]
+    fn diag_picks_the_smallest_weighted_error_of_all_126_steps() {
+        // Crow #300 p2-lh: the chosen byte is the brute-force minimum over 1..=126, ties to the
+        // smaller byte, and never the NaN code 0x7F
+        let vals = lcg_values(16 * 64, 7);
+        let d: Vec<f32> = (0..16).map(|j| 0.1 + (j * j) as f32).collect();
+        let global = 0.01f32;
+        for sub in vals.chunks(16) {
+            let b = encode_subblock_diag(sub, global, &d);
+            assert!((1..=126).contains(&b));
+            let e_b = weighted_err(sub, decode_ue4m3(b) * global, &d);
+            for c in 1..=126u32 {
+                let e_c = weighted_err(sub, decode_ue4m3(c) * global, &d);
+                assert!(e_b < e_c || (e_b == e_c && b <= c) || b == c, "byte {b} ({e_b}) vs {c} ({e_c})");
+            }
+        }
+        assert_eq!(encode_subblock_diag(&[0.0; 16], global, &d), 0);
+    }
+
+    #[test]
+    fn diag_never_loses_to_mse_on_its_own_objective_and_reads_its_columns() {
+        // per sub-block the weighted error of the diag bytes <= that of the mse bytes (mse's
+        // byte is one of the 126 candidates); a row of 128 columns uses d[col..col + 16]
+        let (rows, cols) = (8usize, 128usize);
+        let vals = lcg_values(rows * cols, 11);
+        let d: Vec<f32> = (0..cols).map(|j| if j % 32 < 4 { 50.0 } else { 0.5 }).collect();
+        let (bd, g, _, _) = quantize_nvfp4_w(&vals, ScalesMode::Diag, Some((&d, cols)));
+        let (bm, g2, _, _) = quantize_nvfp4(&vals, ScalesMode::Mse);
+        assert_eq!(g, g2, "the global scale does not depend on the scale rule");
+        let byte_of = |blocks: &[u8], sb: usize| blocks[(sb / 4) * 36 + sb % 4] as u32;
+        let (mut tot_d, mut tot_m) = (0.0f64, 0.0f64);
+        for (i, sub) in vals.chunks(16).enumerate() {
+            let col = (i * 16) % cols;
+            let w = &d[col..col + 16];
+            let ed = weighted_err(sub, decode_ue4m3(byte_of(&bd, i)) * g, w);
+            let em = weighted_err(sub, decode_ue4m3(byte_of(&bm, i)) * g, w);
+            assert!(ed <= em, "sub-block {i}: diag {ed} > mse {em}");
+            tot_d += ed as f64;
+            tot_m += em as f64;
+        }
+        assert!(tot_d < tot_m, "diag must win on the weighted error overall");
+    }
+
+    #[test]
+    fn diag_stats_map_every_dense_projection_to_its_input_group() {
+        let k = |n: &str| DiagStats::key_of(n);
+        assert_eq!(k("model.language_model.layers.3.self_attn.k_proj.weight").as_deref(), Some("layers.3.attn_in"));
+        assert_eq!(k("model.language_model.layers.3.self_attn.o_proj.weight").as_deref(), Some("layers.3.o_in"));
+        assert_eq!(k("model.language_model.layers.0.linear_attn.in_proj_z.weight").as_deref(), Some("layers.0.gdn_in"));
+        assert_eq!(k("model.language_model.layers.0.linear_attn.out_proj.weight").as_deref(), Some("layers.0.gdn_out_in"));
+        assert_eq!(k("model.language_model.layers.63.mlp.up_proj.weight").as_deref(), Some("layers.63.mlp_in"));
+        assert_eq!(k("model.language_model.layers.63.mlp.down_proj.weight").as_deref(), Some("layers.63.down_in"));
+        assert_eq!(k("lm_head.weight").as_deref(), Some("head_in"));
+        assert_eq!(k("model.language_model.layers.0.linear_attn.in_proj_a.weight"), None);
+        let ds = DiagStats { groups: [("head_in".to_string(), vec![1.0f32; 32])].into_iter().collect(), path: "t".into(), stats_sha256: String::new() };
+        assert!(ds.weights_for("lm_head.weight", 32).is_ok());
+        assert!(ds.weights_for("lm_head.weight", 48).is_err());
+        assert!(ds.weights_for("model.language_model.layers.1.mlp.up_proj.weight", 32).is_err());
     }
 }
