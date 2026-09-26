@@ -10,7 +10,7 @@
 //! `dec_e4m3`) as they are; the Flash-Next source stays `prelude + KERNEL_SRC`.
 
 /// the entries of `P2_SRC`, resolved by `Kernels::add_p2` when the family compiles them
-pub const P2_NAMES: &[&str] = &["attn_full_split", "silu_mul_n", "gemv_nvfp4_w", "gemv_nvfp4_gu", "add_rms_1k", "gemv_bf16_ba"];
+pub const P2_NAMES: &[&str] = &["attn_full_split", "silu_mul_n", "gemv_nvfp4_w", "gemv_nvfp4_gu", "add_rms_1k", "gemv_bf16_ba", "attn_full_fa"];
 
 /// the phase 2 kernel source, appended after `KERNEL_SRC` (`KernelGeo::source`)
 pub const P2_SRC: &str = r#"
@@ -85,6 +85,202 @@ extern "C" __global__ void attn_full_split(const float* __restrict__ q, const un
     if (d == 0) {
         part_ml[pi * 2] = (hi > lo) ? m : -3.0e38f;
         part_ml[pi * 2 + 1] = (hi > lo) ? l : 0.0f;
+    }
+}
+
+// ---------------- Attn::Full prefill: tiled attention on tensor cores ----------------
+// FlashAttention-2 form (Dao 2023, arXiv 2307.08691 alg. 1) for the prompt chunk: one block per
+// (kv head, 16 query rows), one warp per query head of the GQA group (CN_GQA warps), all sharing
+// each K / V tile of 16 keys, which the block stages ONCE from the KV cache (e4m3 or bf16) into
+// shared memory as f16 (K row-major, V transposed, both padded against bank conflicts).
+// Per warp and tile: S = Q K^T with mma.m16n8k16 f16 (f32 accumulate; Q held as f16 A fragments),
+// online softmax in f32 (exp2 with the scale folded), O += P V with P repacked from the S
+// accumulators as the next A operand. Rows g and g + 8 of the m16 tile belong to lane g * 4 + t.
+// The causal mask applies on the tile that holds the diagonal. attn_full_split with S = 1 read
+// every K / V row once per query row and head (GQA 6): 240 tok/s at position 20k (2026-09-26).
+// Split K (gridDim.z = S > 1, the decode form): split z takes an equal share of the key range
+// and writes the unnormalized partial (o, m, l) in attn_merge's layout [T][NQ][S] (m in natural
+// log units) to part_o / part_ml; S = 1 writes the normalized rows to part_o as [T][NQ][AHD].
+// Decode reads each K / V row once per KV head instead of once per query head (GQA 6).
+// grid (NKV, ceil(T / 16), S), block 32 * CN_GQA. CN_AHD % 16 == 0.
+#define FA_KT 16
+#define FA_KS (CN_AHD + 8)   // K_s row stride in halves (bank padding)
+#define FA_VS (FA_KT + 2)    // V_t row stride in halves (bank padding)
+// f16 without cuda_fp16.h (NVRTC compiles with no include path): the PTX conversions
+#define FA_NEG_INF __int_as_float(0xff800000)
+__device__ __forceinline__ unsigned int fa_pack_h2(float lo, float hi) {
+    unsigned int r;
+    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo)); // first source -> upper half
+    return r;
+}
+// two e4m3 bytes (low byte = first value) -> f16x2 (low half = first value), one instruction
+__device__ __forceinline__ unsigned int fa_e4m3x2_h2(unsigned short v) {
+    unsigned int r;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(v));
+    return r;
+}
+__device__ __forceinline__ unsigned short fa_h(float x) {
+    unsigned short r;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(r) : "f"(x));
+    return r;
+}
+__device__ __forceinline__ void mma_f16_16n8k16(float& d0, float& d1, float& d2, float& d3,
+                                                unsigned int a0, unsigned int a1, unsigned int a2,
+                                                unsigned int a3, unsigned int b0, unsigned int b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+extern "C" __global__ void __launch_bounds__(32 * CN_GQA, 1)
+attn_full_fa(const float* __restrict__ q, const unsigned char* __restrict__ kc, const unsigned char* __restrict__ vc,
+             const int* __restrict__ pos_base_p, const int* __restrict__ t_p, const int* __restrict__ tmax_p,
+             const int* __restrict__ mode_p, float* __restrict__ out, float* __restrict__ part_ml) {
+    __shared__ unsigned short k_s[FA_KT * FA_KS]; // f16 bits
+    __shared__ unsigned short v_t[CN_AHD * FA_VS];
+    const int kvh = blockIdx.x;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, tq = lane & 3;
+    const int head = kvh * CN_GQA + warp;
+    const int T = *t_p, pos_base = *pos_base_p, tmax = *tmax_p, mode = *mode_p;
+    const int esz = mode ? 2 : 1;
+    const int r0 = blockIdx.y * 16;
+    const int ra = r0 + g, rb = r0 + g + 8;            // this lane's two query rows
+    const int qa = pos_base + ra, qb = pos_base + rb;   // their positions
+    const float sl2 = CN_ATTN_SCALE * 1.4426950408889634f; // scale * log2(e)
+    // Q A fragments for the 16 k-steps of the head dim (rows beyond T read row T - 1, never stored)
+    unsigned int qf[CN_AHD / 16][4];
+    {
+        const float* pa = q + ((size_t)min(ra, T - 1) * CN_NQ + head) * CN_AHD;
+        const float* pb = q + ((size_t)min(rb, T - 1) * CN_NQ + head) * CN_AHD;
+        #pragma unroll
+        for (int ks = 0; ks < CN_AHD / 16; ks++) {
+            const int c = ks * 16 + 2 * tq;
+            qf[ks][0] = fa_pack_h2(pa[c], pa[c + 1]);
+            qf[ks][1] = fa_pack_h2(pb[c], pb[c + 1]);
+            qf[ks][2] = fa_pack_h2(pa[c + 8], pa[c + 9]);
+            qf[ks][3] = fa_pack_h2(pb[c + 8], pb[c + 9]);
+        }
+    }
+    float o[CN_AHD / 8][4];
+    #pragma unroll
+    for (int n = 0; n < CN_AHD / 8; n++) { o[n][0] = 0.0f; o[n][1] = 0.0f; o[n][2] = 0.0f; o[n][3] = 0.0f; }
+    float ma = FA_NEG_INF, mb = FA_NEG_INF, la = 0.0f, lb = 0.0f;
+    // keys 0 ..= the tile's last query position
+    const int kall = min(pos_base + min(r0 + 15, T - 1) + 1, tmax);
+    const int S = gridDim.z, split = blockIdx.z;
+    const int per = ((kall + S - 1) / S + FA_KT - 1) / FA_KT * FA_KT; // whole tiles per split
+    const int kbeg = min(kall, split * per), kend = min(kall, kbeg + per);
+    const size_t kvbase = (size_t)kvh * tmax;
+    for (int k0 = kbeg; k0 < kend; k0 += FA_KT) {
+        __syncthreads(); // the previous tile's readers are done
+        // stage: 16 keys x CN_AHD values of K and V, e4m3 or bf16 -> f16
+        for (int i = threadIdx.x; i < FA_KT * CN_AHD / 2; i += blockDim.x) {
+            const int key = i / (CN_AHD / 2), d = (i % (CN_AHD / 2)) * 2;
+            const int kk = min(k0 + key, tmax - 1);
+            const unsigned char* kp = kc + (kvbase + kk) * CN_AHD * esz;
+            const unsigned char* vp = vc + (kvbase + kk) * CN_AHD * esz;
+            unsigned int kh, vh;
+            if (mode == 0) {
+                // e4m3 -> f16 is exact (f16 holds every e4m3 value); the hardware pair convert
+                // replaced dec_e4m3's ldexpf (666 us per decode layer at 30k, 2026-09-26)
+                kh = fa_e4m3x2_h2(*(const unsigned short*)(kp + d));
+                vh = fa_e4m3x2_h2(*(const unsigned short*)(vp + d));
+            } else {
+                kh = fa_pack_h2(kv_load(kp, d, 1), kv_load(kp, d + 1, 1));
+                vh = fa_pack_h2(kv_load(vp, d, 1), kv_load(vp, d + 1, 1));
+            }
+            *(unsigned int*)&k_s[key * FA_KS + d] = kh;
+            v_t[d * FA_VS + key] = (unsigned short)(vh & 0xFFFF);
+            v_t[(d + 1) * FA_VS + key] = (unsigned short)(vh >> 16);
+        }
+        __syncthreads();
+        // S = Q K^T over the 16 keys: two n8 tiles
+        float s[2][4];
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            s[j][0] = 0.0f; s[j][1] = 0.0f; s[j][2] = 0.0f; s[j][3] = 0.0f;
+            const unsigned short* kr = &k_s[(j * 8 + g) * FA_KS + 2 * tq];
+            #pragma unroll
+            for (int ks = 0; ks < CN_AHD / 16; ks++) {
+                const unsigned int b0 = *(const unsigned int*)(kr + ks * 16);
+                const unsigned int b1 = *(const unsigned int*)(kr + ks * 16 + 8);
+                mma_f16_16n8k16(s[j][0], s[j][1], s[j][2], s[j][3], qf[ks][0], qf[ks][1], qf[ks][2], qf[ks][3], b0, b1);
+            }
+        }
+        // scale (log2 domain) and the causal mask: key k0 + 8j + 2tq (+1) against qa / qb
+        float mxa = ma, mxb = mb;
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const int key = k0 + j * 8 + 2 * tq;
+            s[j][0] = (key <= qa && key < kend) ? s[j][0] * sl2 : FA_NEG_INF;
+            s[j][1] = (key + 1 <= qa && key + 1 < kend) ? s[j][1] * sl2 : FA_NEG_INF;
+            s[j][2] = (key <= qb && key < kend) ? s[j][2] * sl2 : FA_NEG_INF;
+            s[j][3] = (key + 1 <= qb && key + 1 < kend) ? s[j][3] * sl2 : FA_NEG_INF;
+            mxa = fmaxf(mxa, fmaxf(s[j][0], s[j][1]));
+            mxb = fmaxf(mxb, fmaxf(s[j][2], s[j][3]));
+        }
+        mxa = fmaxf(mxa, __shfl_xor_sync(0xffffffffu, mxa, 1));
+        mxa = fmaxf(mxa, __shfl_xor_sync(0xffffffffu, mxa, 2));
+        mxb = fmaxf(mxb, __shfl_xor_sync(0xffffffffu, mxb, 1));
+        mxb = fmaxf(mxb, __shfl_xor_sync(0xffffffffu, mxb, 2));
+        // a row whose keys are all masked so far keeps m = -inf; its exps are 0 (use 0 as base)
+        const float ba = (mxa == FA_NEG_INF) ? 0.0f : mxa, bb = (mxb == FA_NEG_INF) ? 0.0f : mxb;
+        const float ca = exp2f(ma - ba), cb = exp2f(mb - bb);
+        ma = mxa; mb = mxb;
+        float p[2][4], sa = 0.0f, sb = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            p[j][0] = exp2f(s[j][0] - ba); p[j][1] = exp2f(s[j][1] - ba);
+            p[j][2] = exp2f(s[j][2] - bb); p[j][3] = exp2f(s[j][3] - bb);
+            sa += p[j][0] + p[j][1];
+            sb += p[j][2] + p[j][3];
+        }
+        sa += __shfl_xor_sync(0xffffffffu, sa, 1); sa += __shfl_xor_sync(0xffffffffu, sa, 2);
+        sb += __shfl_xor_sync(0xffffffffu, sb, 1); sb += __shfl_xor_sync(0xffffffffu, sb, 2);
+        la = la * ca + sa;
+        lb = lb * cb + sb;
+        // P as the A operand of P V (keys 0..15 = k16): rows g / g + 8, keys 2tq (+1) and 2tq + 8 (+9)
+        const unsigned int pa0 = fa_pack_h2(p[0][0], p[0][1]), pa1 = fa_pack_h2(p[0][2], p[0][3]);
+        const unsigned int pa2 = fa_pack_h2(p[1][0], p[1][1]), pa3 = fa_pack_h2(p[1][2], p[1][3]);
+        #pragma unroll
+        for (int n = 0; n < CN_AHD / 8; n++) {
+            o[n][0] *= ca; o[n][1] *= ca; o[n][2] *= cb; o[n][3] *= cb;
+            const unsigned short* vr = &v_t[(n * 8 + g) * FA_VS + 2 * tq];
+            const unsigned int b0 = *(const unsigned int*)vr;
+            const unsigned int b1 = *(const unsigned int*)(vr + 8);
+            mma_f16_16n8k16(o[n][0], o[n][1], o[n][2], o[n][3], pa0, pa1, pa2, pa3, b0, b1);
+        }
+    }
+    if (S > 1) {
+        // partial for attn_merge: o unnormalized, m in natural log units (m2 * ln 2), l
+        const size_t pa = ((size_t)ra * CN_NQ + head) * S + split, pb = ((size_t)rb * CN_NQ + head) * S + split;
+        #pragma unroll
+        for (int n = 0; n < CN_AHD / 8; n++) {
+            const int c = n * 8 + 2 * tq;
+            if (ra < T) { out[pa * CN_AHD + c] = o[n][0]; out[pa * CN_AHD + c + 1] = o[n][1]; }
+            if (rb < T) { out[pb * CN_AHD + c] = o[n][2]; out[pb * CN_AHD + c + 1] = o[n][3]; }
+        }
+        if (tq == 0) {
+            // an empty split (no key of it at or below the row) weighs 0 in attn_merge
+            if (ra < T) { part_ml[pa * 2] = (la > 0.0f) ? ma * 0.6931471805599453f : -3.0e38f; part_ml[pa * 2 + 1] = la; }
+            if (rb < T) { part_ml[pb * 2] = (lb > 0.0f) ? mb * 0.6931471805599453f : -3.0e38f; part_ml[pb * 2 + 1] = lb; }
+        }
+        return;
+    }
+    const float ia = 1.0f / la, ib = 1.0f / lb;
+    #pragma unroll
+    for (int n = 0; n < CN_AHD / 8; n++) {
+        const int c = n * 8 + 2 * tq;
+        if (ra < T) {
+            float* oa = out + ((size_t)ra * CN_NQ + head) * CN_AHD + c;
+            oa[0] = o[n][0] * ia; oa[1] = o[n][1] * ia;
+        }
+        if (rb < T) {
+            float* ob = out + ((size_t)rb * CN_NQ + head) * CN_AHD + c;
+            ob[0] = o[n][2] * ib; ob[1] = o[n][3] * ib;
+        }
     }
 }
 

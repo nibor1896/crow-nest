@@ -71,8 +71,15 @@ fn main() {
                 // ids[n..] teacher-forced through decode_step (one logits row per step) —
                 // decode-path rows against prefill-path rows under the same context
                 let tf_split: usize = env_parse("CROW_PARITY_PREFILL").unwrap_or(ids.len()).clamp(1, ids.len());
+                // Crow #300 phase 2: CROW_PARITY_TAIL=<n> - the long-context form: prefill ids[..T-n]
+                // WITHOUT collecting logits (T rows x 248,320 f32 would be 8 GB at 8k tokens), then
+                // the last n ids teacher-forced through decode_step, one logits row each; the
+                // reference (`oracle/ref_qwen35_logits.py`) scores the same rows (`row0_pos`)
+                let tail: Option<usize> = env_parse::<usize>("CROW_PARITY_TAIL").map(|n| n.clamp(1, ids.len() - 1));
+                let tf_split = tail.map_or(tf_split, |n| ids.len() - n);
                 if tf_split < ids.len() {
-                    cfg.prompt_chunk = tf_split;
+                    // the tail form prefills in serve's chunks (2048), the path a long session takes
+                    cfg.prompt_chunk = if tail.is_some() { tf_split.min(2048) } else { tf_split };
                 }
                 std::fs::create_dir_all(&out).unwrap();
                 let mut eng =
@@ -81,7 +88,7 @@ fn main() {
                     ids.len(), tf_split, ids.len() - tf_split);
                 let mut logits = Vec::new();
                 let t0 = std::time::Instant::now();
-                let mut tok = eng.prefill(&mut cnq, &ids[..tf_split], Some(&mut logits));
+                let mut tok = eng.prefill(&mut cnq, &ids[..tf_split], if tail.is_some() { None } else { Some(&mut logits) });
                 println!("prefill+logits in {:.1} s", t0.elapsed().as_secs_f64());
                 let mut tf_trace: Vec<usize> = vec![tok];
                 for &fed in &ids[tf_split..] {
@@ -126,6 +133,8 @@ fn main() {
                     &serde_json::json!({
                         "prompt_len": ids.len(),
                         "prefill_len": tf_split,
+                        // the position of logits row 0 (0 unless CROW_PARITY_TAIL collected the tail only)
+                        "row0_pos": if tail.is_some() { tf_split } else { 0 },
                         "tf_trace": tf_trace,
                         "all_ids": all_ids,
                         "rows": logits.len(),

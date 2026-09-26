@@ -333,6 +333,10 @@ pub struct Params {
     /// sites read `n10240` before, which C3 made `d.hct`: equal on Flash-Next (10240), not
     /// on the dense 27B (hct 5120, gdn_conv 10240)
     pub n_gdn_conv: Dev,
+    /// Crow #300 phase 2: ATTN_SPLITS_MAX, the split count of the tiled decode attention
+    pub n_splits_max: Dev,
+    /// Crow #300 phase 2: FA_DECODE_SPLITS, the split count of the tiled decode attention
+    pub n_splits_fa: Dev,
     pub nt_dinter: Dev,
 }
 
@@ -417,6 +421,10 @@ pub struct Scratch {
     // head
     pub part_o: Dev,   // [24][ATTN_SPLITS_MAX][256] decode attention partials
     pub part_ml: Dev,  // [24][ATTN_SPLITS_MAX][2]
+    /// Crow #300 phase 2: the tiled decode attention's partials [NQ][FA_DECODE_SPLITS][AHD] / [..][2];
+    /// full attention only (0 on Flash-Next, whose allocations stay as they are)
+    pub fa_part_o: Dev,
+    pub fa_part_ml: Dev,
     pub qsa_h1: Dev,   // #61a [QSA_PAR_BINS] u32, the CROW_QSA_PAR key histogram
     pub logits: Dev,   // [C][V]
     pub argmax: Dev,   // [1] i32
@@ -909,7 +917,14 @@ fn pf_gemm_on() -> bool { env_flag!("CROW_PF_GEMM", on) }
 /// and `launch_bf16_dense`). Unset or any other value runs the 8-token tile
 /// forms of record bit for bit. DISTINCT from `CROW_PF_GEMM` (the grouped MoE
 /// tile path); deliberately not overloaded (lesson 11).
-fn pf_gemm_b_on() -> bool { env_flag!("CROW_PF_GEMM_B", exact1) }
+///
+/// Crow #300 phase 2: a dense-family engine turns variant B on for its process at load
+/// (`DENSE_PF_GEMM_B`): 8k prefill of the 27B 951 -> 2,090 tok/s, greedy trace identical
+/// (2026-09-26). Flash-Next never sets it, so its prefill stays the 8-token form of record.
+fn pf_gemm_b_on() -> bool {
+    env_flag!("CROW_PF_GEMM_B", exact1) || DENSE_PF_GEMM_B.load(std::sync::atomic::Ordering::Relaxed)
+}
+static DENSE_PF_GEMM_B: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// CROW_PF_ASYNC=1: the prefill staging copies (`stage_tiles`, SM reads over
 /// PCIe) run on a side stream into two slot sets (group parity), overlapping
@@ -1026,6 +1041,10 @@ impl Engine {
         // (`None`) loads its bytes untouched: its dense weights carry four such bytes, and
         // the gate values of record are computed with them.
         let mut sf: Option<u64> = if geo.family == Family::FlashNext { None } else { Some(0) };
+        // Crow #300 phase 2: the 32-token prefill GEMM tiles for every non-Flash-Next family
+        if geo.family != Family::FlashNext {
+            DENSE_PF_GEMM_B.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         log("loading embeddings (BF16 keep → host f32) …");
         let emb_t = cnq.find("model.language_model.embed_tokens.weight", sec).clone();
         let emb_raw = cnq.read_bytes(&emb_t);
@@ -2179,6 +2198,10 @@ pub const ATTN_SPLITS: usize = 8;
 /// #61a: the partial buffers are sized for the largest allowed split count,
 /// so CROW_ATTN_SPLITS can be raised at runtime without a reallocation.
 pub const ATTN_SPLITS_MAX: usize = 32;
+/// Crow #300 phase 2: splits per KV head of the tiled decode attention (`attn_full_fa`,
+/// `fa_part_o` / `fa_part_ml`): 4 KV heads x 128 = 512 blocks for one token; at 30k keys 32
+/// splits (128 blocks) walked 59 tiles each
+pub const FA_DECODE_SPLITS: usize = 128;
 /// #61a: grid of `qsa_scores_par` (the SCORES kernel). Unrelated to
 /// `qsa_select_blocks()` below, which sizes the histogram kernel - they used
 /// to be `QSA_PAR_BLOCKS` and `qsa_par_blocks()`, one letter apart.
@@ -2376,6 +2399,8 @@ impl Params {
             nr512: cuda::to_i32_dev(&[d.kv_rows as i32]),
             n_splits: cuda::to_i32_dev(&[attn_splits() as i32]),
             n_gdn_conv: cuda::to_i32_dev(&[d.gdn_conv as i32]),
+            n_splits_max: if d.qsa_sel_max == 0 { cuda::to_i32_dev(&[ATTN_SPLITS_MAX as i32]) } else { 0 },
+            n_splits_fa: if d.qsa_sel_max == 0 { cuda::to_i32_dev(&[FA_DECODE_SPLITS as i32]) } else { 0 },
             n_core: if d.qsa_sel_max == 0 { cuda::to_i32_dev(&[d.core as i32]) } else { 0 },
             n_dinter: if d.dense_inter > 0 { cuda::to_i32_dev(&[d.dense_inter as i32]) } else { 0 },
             nt_dinter: if d.dense_inter > 0 { cuda::to_i32_dev(&[d.dense_inter as i32]) } else { 0 },
@@ -2595,6 +2620,8 @@ impl Scratch {
             scores: if d.qsa_hidd > 0 { cuda::alloc_lendable("the QSA scores scratch", attn_sb(c) * cap_blocks * 4) } else { 0 },
             part_o: cuda::alloc_zeroed(d.nq * ATTN_SPLITS_MAX * d.ahd * 4),
             part_ml: cuda::alloc_zeroed(d.nq * ATTN_SPLITS_MAX * 2 * 4),
+            fa_part_o: if d.qsa_sel_max == 0 { cuda::alloc_zeroed(d.nq * FA_DECODE_SPLITS * d.ahd * 4) } else { 0 },
+            fa_part_ml: if d.qsa_sel_max == 0 { cuda::alloc_zeroed(d.nq * FA_DECODE_SPLITS * 2 * 4) } else { 0 },
             qsa_h1: cuda::alloc_zeroed(QSA_PAR_BINS * 4),
             logits: cuda::alloc_zeroed(d.v * 4),
             argmax: cuda::alloc_zeroed(4),
@@ -3387,8 +3414,15 @@ impl Engine {
         self.dense_proj(v, self.d.kv_rows, p.nr512, t, mixed, s.xq_m, s.av, p.n2560);
         launch_v(k.f("store_kv"), (2 * self.d.nkv) as u32, t as u32, 1, self.d.ahd as u32, &[
             s.akr, s.av, kc, vc, p.pos_base, p.tmax, p.mode]);
-        launch_v(k.f("attn_full_split"), self.d.nq as u32, t as u32, 1, self.d.ahd as u32, &[
-            s.aqr, kc, vc, p.pos_base, p.tmax, p.mode, s.aout, 0]);
+        if std::env::var("CROW_P2_FA").as_deref() == Ok("0") {
+            launch_v(k.f("attn_full_split"), self.d.nq as u32, t as u32, 1, self.d.ahd as u32, &[
+                s.aqr, kc, vc, p.pos_base, p.tmax, p.mode, s.aout, 0]);
+        } else {
+            // the tiled tensor-core form: one block per (kv head, 16 query rows), one warp per
+            // query head of the group, K / V tiles staged once per block
+            launch_v(k.f("attn_full_fa"), self.d.nkv as u32, t.div_ceil(16) as u32, 1, (32 * self.d.nq / self.d.nkv) as u32, &[
+                s.aqr, kc, vc, p.pos_base, p.t, p.tmax, p.mode, s.aout, 0]);
+        }
         launch_v(k.f("gate_mul"), (t * self.d.core).div_ceil(256) as u32, 1, 1, 256, &[
             s.aout, s.agate, s.agated]);
         self.quant_rows(t, s.agated, s.xq_o, p.n_core);
@@ -3417,10 +3451,21 @@ impl Engine {
         self.dense_proj(v, self.d.kv_rows, p.nr512, 1, mixed, s.xq_m, s.av, p.n2560);
         launch_v(k.f("store_kv"), (2 * self.d.nkv) as u32, 1, 1, self.d.ahd as u32, &[
             s.akr, s.av, kc, vc, p.slot1, p.tmax, p.mode]);
-        launch_v(k.f("attn_full_split"), self.d.nq as u32, 1, attn_splits() as u32, self.d.ahd as u32, &[
-            s.aqr, kc, vc, p.pos_base, p.tmax, p.mode, s.part_o, s.part_ml]);
-        launch_v(k.f("attn_merge"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[
-            s.part_o, s.part_ml, s.aout, p.n_splits]);
+        if std::env::var("CROW_P2_FA").as_deref() == Ok("0") {
+            launch_v(k.f("attn_full_split"), self.d.nq as u32, 1, attn_splits() as u32, self.d.ahd as u32, &[
+                s.aqr, kc, vc, p.pos_base, p.tmax, p.mode, s.part_o, s.part_ml]);
+        } else {
+            // the tiled form, split K: each K / V row is read once per KV head, not once per
+            // query head; ATTN_SPLITS_MAX splits per head for the parallelism of one token
+            launch_v(k.f("attn_full_fa"), self.d.nkv as u32, 1, FA_DECODE_SPLITS as u32, (32 * self.d.nq / self.d.nkv) as u32, &[
+                s.aqr, kc, vc, p.pos_base, p.one, p.tmax, p.mode, s.fa_part_o, s.fa_part_ml]);
+        }
+        let (po, pml, splits_p) = if std::env::var("CROW_P2_FA").as_deref() == Ok("0") {
+            (s.part_o, s.part_ml, p.n_splits)
+        } else {
+            (s.fa_part_o, s.fa_part_ml, p.n_splits_fa)
+        };
+        launch_v(k.f("attn_merge"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[po, pml, s.aout, splits_p]);
         launch_v(k.f("gate_mul"), self.d.core.div_ceil(256) as u32, 1, 1, 256, &[
             s.aout, s.agate, s.agated]);
         self.quant_rows(1, s.agated, s.xq_o, p.n_core);
@@ -5573,7 +5618,7 @@ impl Drop for Params {
                       &mut self.stride128, &mut self.keys_ring, &mut self.qk_stride, &mut self.ncb1, &mut self.pos_row1,
                       &mut self.k_top10, &mut self.nt_hct1,
                       &mut self.nr4, &mut self.nr48, &mut self.nr512,
-                      &mut self.n_gdn_conv, &mut self.n_core, &mut self.n_dinter, &mut self.nt_dinter] {
+                      &mut self.n_gdn_conv, &mut self.n_splits_max, &mut self.n_splits_fa, &mut self.n_core, &mut self.n_dinter, &mut self.nt_dinter] {
                 cuda::free_dev(f);
             }
         }
@@ -5594,7 +5639,7 @@ impl Drop for Scratch {
                       &mut self.pool_nrm,
                       &mut self.pool_rot, // the fixed pools keep their own allocations
                       &mut self.part_o, // #18: the two attention-split partials were never freed
-                      &mut self.part_ml,
+                      &mut self.part_ml, &mut self.fa_part_o, &mut self.fa_part_ml,
                       &mut self.qsa_h1, // #61a: the CROW_QSA_PAR histogram
                       &mut self.scores,
                       &mut self.logits,

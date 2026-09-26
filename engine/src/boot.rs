@@ -90,14 +90,30 @@ pub unsafe fn open_model(
             }
         }
     }
+    // Crow #300 phase 2: CROW_CONTEXT raises the context above the family's floor, up to the
+    // checkpoint's max_position_embeddings; a bad value stops the boot here, by name
+    let context = context_from_env(std::env::var("CROW_CONTEXT").ok().as_deref(), geo.context_floor, geo.context_max)
+        .unwrap_or_else(|why| panic!("[boot] refused: {why}"));
     let ctx = cuda::Ctx::init();
-    let mut cfg = Config { context: geo.context_floor, ..Config::default() };
+    let mut cfg = Config { context, ..Config::default() };
     if let Some(kv) = kv {
         cfg.kv = kv;
     }
     tracing::info!(target: "boot", "[boot] kv cache dtype {} ({})", cfg.kv.name(),
         if kv.is_some() { "CROW_KV" } else { "default, CROW_KV unset" });
     (cnq, ctx, cfg, cnq_path, sidecar, geo)
+}
+
+/// Crow #300 phase 2: the context the boot allocates. Unset (or empty) is the family's floor
+/// (`Geo::context_floor`: Flash-Next 200,000, the dense family 100,000); a value must be an
+/// integer in `floor..=max` (`Geo::context_max`, the checkpoint's max_position_embeddings).
+pub fn context_from_env(v: Option<&str>, floor: usize, max: usize) -> Result<usize, String> {
+    let Some(v) = v.map(str::trim).filter(|v| !v.is_empty()) else { return Ok(floor) };
+    let n: usize = v.parse().map_err(|_| format!("CROW_CONTEXT {v:?} is not a whole number of tokens"))?;
+    if n < floor || n > max {
+        return Err(format!("CROW_CONTEXT {n} is outside {floor}..={max} (the family's context floor .. max_position_embeddings)"));
+    }
+    Ok(n)
 }
 
 /// The runtime `Geo` of the checkpoint beside `cnq_path`, through the #94 / Crow #300
@@ -393,6 +409,19 @@ mod tests_300_c7 {
         assert!(why.contains("  family: container FlashNext (index v1), config Qwen35Dense"), "{why}");
         assert!(why.contains("  embed_tokens [vocab, hidden]: container [248320, 2560], config [248320, 5120]"), "{why}");
         assert!(why.contains("  text layers: container 48, config 64"), "{why}");
+    }
+
+    /// Crow #300 phase 2: CROW_CONTEXT - unset or empty is the floor, a value in floor..=max is
+    /// taken, anything else refuses by name
+    #[test]
+    fn crow_context_takes_a_value_between_the_floor_and_the_max() {
+        use crate::boot::context_from_env;
+        assert_eq!(context_from_env(None, 100_000, 262_144), Ok(100_000));
+        assert_eq!(context_from_env(Some(" "), 100_000, 262_144), Ok(100_000));
+        assert_eq!(context_from_env(Some("131072"), 100_000, 262_144), Ok(131_072));
+        assert!(context_from_env(Some("99999"), 100_000, 262_144).unwrap_err().contains("outside 100000..=262144"));
+        assert!(context_from_env(Some("262145"), 100_000, 262_144).unwrap_err().contains("outside"));
+        assert!(context_from_env(Some("128k"), 100_000, 262_144).unwrap_err().contains("not a whole number"));
     }
 
     /// A dense index v2 container (the 27B's config, 27B-shaped tensors) passes the gate and

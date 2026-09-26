@@ -57,13 +57,15 @@ def rss_gb():
 OUT = os.environ.get("CROW_PARITY_DIR") or os.path.join(ROOT, "decode_out")
 seq = json.load(open(os.path.join(OUT, "gen-sequence.json")))
 rows = seq["rows"]
-ids = seq["all_ids"][:rows]
+# Crow #300 phase 2: with CROW_PARITY_TAIL the engine's logits start at position `row0_pos`
+row0 = seq.get("row0_pos", 0)
+ids = seq["all_ids"][:row0 + rows]
 T = len(ids)
-assert rows == T, f"logit rows {rows} != processed tokens {T}"
+assert rows == T - row0, f"logit rows {rows} != processed tokens {T} - row0 {row0}"
 
 tc = text_config()
 ws = WeightSource(args.weights)
-print(f"qwen35 ref: weights={args.weights} T={T} prompt_len={seq.get('prompt_len')} ids={ids}")
+print(f"qwen35 ref: weights={args.weights} T={T} rows {row0}..{T - 1} prompt_len={seq.get('prompt_len')} ids={ids if T <= 256 else '[' + str(T) + ' ids]'}")
 t_start = time.time()
 
 with torch.no_grad():
@@ -88,8 +90,11 @@ with torch.no_grad():
 
     norm = ws.load(build_meta(Qwen3_5RMSNorm, tc.hidden_size, tc.rms_norm_eps), f"{LM}norm.")
     h = norm(h)[0]                                                           # [T,5120]
+    # Crow #300 phase 2: `row0_pos` (decode parity with CROW_PARITY_TAIL) - the engine collected
+    # logits for positions row0_pos..T only; the head runs on those rows (8k x 248k f32 = 8 GB)
+    h = h[row0:]
     V = ws.n_rows("lm_head.weight")
-    logits = torch.empty(T, V, dtype=torch.float32)
+    logits = torch.empty(T - row0, V, dtype=torch.float32)
     for r0 in range(0, V, args.lm_head_chunk):
         r1 = min(V, r0 + args.lm_head_chunk)
         logits[:, r0:r1] = h @ ws.rows("lm_head.weight", r0, r1).t()
@@ -110,12 +115,13 @@ print("ref greedy next token per position:", " ".join(f"{int(a)}{dec(a)}" for a 
 
 gpu_path = os.path.join(OUT, "gpu-logits.f32")
 if not os.path.exists(gpu_path):
-    print(f"reference only: {T} rows (no gpu-logits.f32 to gate against)")
+    print(f"reference only: {T - row0} rows (no gpu-logits.f32 to gate against)")
     raise SystemExit(0)
 
-gpu = np.fromfile(gpu_path, dtype=np.float32).reshape(T, -1)
+R = T - row0
+gpu = np.fromfile(gpu_path, dtype=np.float32).reshape(R, -1)
 assert gpu.shape[1] == V, f"gpu-logits width {gpu.shape[1]} != vocab {V}"
-print(f"ENGINE parity: [T={T}][V={V}] engine vs f32 reference ({args.weights} weights)")
+print(f"ENGINE parity: [rows={R} from pos {row0}][V={V}] engine vs f32 reference ({args.weights} weights)")
 
 
 def log_softmax64(x):
@@ -125,7 +131,7 @@ def log_softmax64(x):
 
 
 worst, match, top5, kls, margins = 0.0, 0, [], [], []
-for t in range(T):
+for t in range(R):
     d = np.abs(gpu[t] - ref[t])
     worst = max(worst, float(d.max()))
     g_am, r_am = int(np.argmax(gpu[t])), int(np.argmax(ref[t]))
@@ -137,13 +143,13 @@ for t in range(T):
     match += g_am == r_am
     top5.append(o5)
     kls.append(kl)
-    print(f"  pos {t:3d}: max_abs={d.max():.3e} argmax gpu={g_am} ref={r_am} match={g_am == r_am} "
+    print(f"  pos {row0 + t:5d}: max_abs={d.max():.3e} argmax gpu={g_am} ref={r_am} match={g_am == r_am} "
           f"top5={o5}/5 KL={kl:.3e} ref_top2_margin={margins[-1]:.4f}")
-print(f"worst |dlogit| {worst:.3e} | argmax {match}/{T} | mean top-5 overlap {np.mean(top5):.2f}/5 | "
+print(f"worst |dlogit| {worst:.3e} | argmax {match}/{R} | mean top-5 overlap {np.mean(top5):.2f}/5 | "
       f"mean KL {np.mean(kls):.3e} max KL {np.max(kls):.3e} | min ref margin {min(margins):.4f}")
 nan = int(np.isnan(gpu).sum())
 print("nan gpu:", nan)
-if match == T and nan == 0:
+if match == R and nan == 0:
     print("engine parity: PASS (argmax trace matches the f32 reference)")
 else:
     print("engine parity: ARGMAX MISMATCH - investigate")

@@ -5086,6 +5086,12 @@ Flash-Next's with the SiLU gate (`CN_GATE_ACT`, C4).
   them. The oracle reads the same rule (`CnqReader(sanitize_sf=True)` in `qwen35_common.py`).
   Regression check: golden `l17-mlp` (layer 17's `down_proj`), NaN without the rule under
   `CROW_MMA=1`, 1.5e-3 with it.
+- **Long context** (step 6). `attn_full_fa` replaces the untiled attention in both forms (FlashAttention-2, f16
+  `mma.m16n8k16`, one block per KV head and 16 query rows, one warp per query head of the GQA group sharing each
+  K / V tile of 16 keys staged once as f16 via `cvt.rn.f16x2.e4m3x2`; decode split-K, `FA_DECODE_SPLITS` = 128 per KV
+  head into `fa_part_o` / `fa_part_ml`, then `attn_merge`), and the dense family runs the 32-token prefill GEMM tiles
+  (`DENSE_PF_GEMM_B`, set at load; Flash-Next keeps the 8-token form of record). 30k-token prompt: prefill
+  337 -> 1,279 tok/s, decode 26.2 -> 16.6 ms. `CROW_P2_FA=0` keeps the untiled kernels (A/B).
 - **serve** (step 5). `serve` boots the 27B unchanged; four places counted the attention layers
   as the number of QSA buffers (`qsa_keys.len()` / `qsa_pooled.len()`), which is 0 for full
   attention: `cache::Shape::of` (and through it the slot file's `kv_groups`), the park and the

@@ -282,8 +282,10 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="449"
+TESTS="450"
 CLIPPY="1510"
+#   tests 449 -> 450 / clippy 1510 (unchanged)   Crow #300 phase 2 (2026-09-26): +1
+#                              `boot::tests_300_c7::crow_context_takes_a_value_between_the_floor_and_the_max`.
 #   tests 448 -> 449 / clippy 1510 (unchanged)   Crow #300 phase 2, serve for the dense family (2026-09-26): +1
 #                              `slot::tests::a_full_attention_slot_has_no_pooled_blocks_and_keeps_its_kv_rows` (red with
 #                              the old `done_blocks == pos / 4` rule, green with the full-attention arm).
