@@ -212,7 +212,7 @@ pub const PLAN_GRANULARITY: u64 = 2 << 20;
 /// weights, `logits`/`argmax`, the device sampler, the scalar parameter slots
 /// (`Params`, the vit scalar slots) and every small buffer of `Stage`.
 pub fn tier1_plan(geo: &crate::geo::Geo, chunk: usize, vit_cap: Option<usize>, context: usize, stage_slots: usize, gu_bytes: usize, dn_bytes: usize) -> Vec<(&'static str, u64)> {
-    let (persist, union) = crate::gen::Scratch::diet_region_bytes(chunk);
+    let (persist, union) = crate::gen::Scratch::diet_region_bytes(&geo.dims(), chunk);
     let cap_blocks = 65536usize;
     let mut v: Vec<(&'static str, usize)> = vec![
         ("scratch persist region", persist),

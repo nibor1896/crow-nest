@@ -14,12 +14,14 @@ fn main() {
     // CROW_CNQ like they do. It used to hard-code the pre-#51 container, which
     // on this machine is a file the tree no longer ships.
     let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| from_engine_dir(DEFAULT_CNQ));
+    // Crow #300 C3: the PLE numbers from the checkpoint's Geo (the metadata gate)
+    let d = crow_nest_engine::boot::model_geo(&cnq_path).dims();
     let mut cnq = crow_nest_engine::cnq::Cnq::open(&cnq_path);
     step("container open");
     unsafe {
         let _ctx = crow_nest_engine::cuda::Ctx::init();
         step("ctx");
-        let ple = crow_nest_engine::gen::Ple::load(&mut cnq, 1 << 30);
+        let ple = crow_nest_engine::gen::Ple::load(&mut cnq, &d, 1 << 30);
         step("ple loaded");
         let _ = ple;
     }

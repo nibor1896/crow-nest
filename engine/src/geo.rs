@@ -407,6 +407,77 @@ impl PleGeo {
     }
 }
 
+/// Crow #300 C3: the numbers `gen.rs` computes with, as one flat `Copy` value derived
+/// from the model's `Geo` (`Geo::dims`) - one field per `geo.rs` const it replaces,
+/// the const's name in lower case (`H` -> `h`, `QSA_SEL_MAX` -> `qsa_sel_max`). It is
+/// a CACHE of the `Geo`, never a second source: `Engine::load` builds it from
+/// `Engine::geo` once, so the per-launch host code reads a field instead of matching
+/// the family enums, and the code keeps the Flash-Next structure it assumes (C5 adds
+/// the family switches).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Dims {
+    pub h: usize,
+    pub hcn: usize,
+    pub hct: usize,
+    pub lowrank: usize,
+    pub e: usize,
+    pub topk: usize,
+    pub inter: usize,
+    pub gdn_key: usize,
+    pub gdn_val: usize,
+    pub gdn_conv: usize,
+    pub gdn_kheads: usize,
+    pub gdn_vheads: usize,
+    /// GDN key head dim (`GD`)
+    pub gd: usize,
+    /// GDN value head dim (`GDN_VAL / GDN_VHEADS`, 128 = `GD` on Flash-Next)
+    pub gdv: usize,
+    pub conv_kernel: usize,
+    pub nq: usize,
+    pub nkv: usize,
+    pub ahd: usize,
+    pub q_rows: usize,
+    pub kv_rows: usize,
+    pub core: usize,
+    pub v: usize,
+    pub layers: usize,
+    pub gdn_layers: usize,
+    pub attn_layers: usize,
+    pub attn_interval: usize,
+    pub rope_pairs: usize,
+    pub ple_layer: usize,
+    pub ple_ngram: usize,
+    pub ple_ctx: usize,
+    pub ple_heads_per_ngram: usize,
+    pub ple_nheads: usize,
+    pub ple_emb_dim: usize,
+    pub ple_embed: usize,
+    pub ple_eos: i64,
+    pub qsa_heads: usize,
+    pub qsa_kvheads: usize,
+    pub qsa_hd: usize,
+    pub qsa_qk_rows: usize,
+    pub qsa_compress: usize,
+    pub qsa_block_topk: usize,
+    pub qsa_sel_max: usize,
+    pub qsa_hidd: usize,
+}
+
+impl Dims {
+    /// layer % interval == interval - 1 is full attention (`geo::is_attn`)
+    pub const fn is_attn(&self, layer: usize) -> bool {
+        layer % self.attn_interval == self.attn_interval - 1
+    }
+    /// `geo::attn_index`
+    pub const fn attn_index(&self, layer: usize) -> usize {
+        layer / self.attn_interval
+    }
+    /// `geo::gdn_index`
+    pub const fn gdn_index(&self, layer: usize) -> usize {
+        layer - layer / self.attn_interval
+    }
+}
+
 /// C3: the routed-expert numbers of a MoE family, as `Geo::moe` hands them out
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MoeGeo {
@@ -701,6 +772,61 @@ impl Geo {
         ]
     }
 
+    /// Crow #300 C3: the flat view `gen.rs` computes with (`Dims`), one field per
+    /// const it replaces. Built once per `Engine::load`; panics by name (through
+    /// `moe` / `qsa` / `ple_geo` / `hc_lowrank`) on a family whose structure the
+    /// engine does not build yet (C5).
+    pub const fn dims(&self) -> Dims {
+        let m = self.moe();
+        let q = self.qsa();
+        let p = self.ple_geo();
+        Dims {
+            h: self.hidden,
+            hcn: self.hc_streams(),
+            hct: self.residual_width(),
+            lowrank: self.hc_lowrank(),
+            e: m.experts,
+            topk: m.topk,
+            inter: m.expert_inter,
+            gdn_key: self.gdn_key(),
+            gdn_val: self.gdn_val(),
+            gdn_conv: self.gdn_conv(),
+            gdn_kheads: self.gdn_key_heads,
+            gdn_vheads: self.gdn_value_heads,
+            gd: self.gdn_key_dim,
+            gdv: self.gdn_value_dim,
+            conv_kernel: self.conv_kernel,
+            nq: self.q_heads,
+            nkv: self.kv_heads,
+            ahd: self.head_dim,
+            q_rows: self.q_rows(),
+            kv_rows: self.kv_rows(),
+            core: self.core(),
+            v: self.vocab,
+            layers: self.layers,
+            gdn_layers: self.gdn_layers,
+            attn_layers: self.attn_layers,
+            attn_interval: self.attn_interval,
+            rope_pairs: self.rope_pairs,
+            ple_layer: p.layer,
+            ple_ngram: p.ngram,
+            ple_ctx: p.ctx(),
+            ple_heads_per_ngram: p.heads_per_ngram,
+            ple_nheads: p.nheads(),
+            ple_emb_dim: p.emb_dim(),
+            ple_embed: p.embed,
+            ple_eos: p.eos,
+            qsa_heads: q.heads,
+            qsa_kvheads: q.kv_heads,
+            qsa_hd: q.head_dim,
+            qsa_qk_rows: q.qk_rows(),
+            qsa_compress: q.compress,
+            qsa_block_topk: q.block_topk,
+            qsa_sel_max: q.sel_max(),
+            qsa_hidd: q.hidd(),
+        }
+    }
+
     /// Crow #300 C3: a 64-bit fingerprint of this geometry - fnv1a-64 over the
     /// `rows` rendering (`name=value` lines, declaration order). The slot file
     /// carries it next to the family (`slot::Header::geo_hash`), so a slot saved
@@ -788,6 +914,28 @@ mod tests_300 {
                 assert_eq!(g.gdn_index(l), gdn_index(l), "layer {l}");
             }
         }
+        // `Dims`, the flat view gen.rs computes with: every field is the const it replaces
+        let d = g.dims();
+        assert_eq!((d.h, d.hcn, d.hct, d.lowrank, d.e, d.topk, d.inter), (H, HCN, HCT, LOWRANK, E, TOPK, INTER));
+        assert_eq!(
+            (d.gdn_key, d.gdn_val, d.gdn_conv, d.gdn_kheads, d.gdn_vheads, d.gd, d.gdv),
+            (GDN_KEY, GDN_VAL, GDN_CONV, GDN_KHEADS, GDN_VHEADS, GD, GD)
+        );
+        assert_eq!(
+            (d.nq, d.nkv, d.ahd, d.q_rows, d.kv_rows, d.core, d.v, d.layers, d.gdn_layers, d.attn_layers, d.rope_pairs, d.conv_kernel),
+            (NQ, NKV, AHD, Q_ROWS, KV_ROWS, CORE, V, LAYERS, GDN_LAYERS, ATTN_LAYERS, ROPE_PAIRS, 4)
+        );
+        assert_eq!(
+            (d.ple_layer, d.ple_ngram, d.ple_ctx, d.ple_heads_per_ngram, d.ple_nheads, d.ple_emb_dim, d.ple_embed, d.ple_eos),
+            (PLE_LAYER, PLE_NGRAM, PLE_CTX, PLE_HEADS_PER_NGRAM, PLE_NHEADS, PLE_EMB_DIM, PLE_EMBED, PLE_EOS)
+        );
+        assert_eq!(
+            (d.qsa_heads, d.qsa_kvheads, d.qsa_hd, d.qsa_qk_rows, d.qsa_compress, d.qsa_block_topk, d.qsa_sel_max, d.qsa_hidd),
+            (QSA_HEADS, QSA_KVHEADS, QSA_HD, QSA_QK_ROWS, QSA_COMPRESS, QSA_BLOCK_TOPK, QSA_SEL_MAX, QSA_HIDD)
+        );
+        for l in 0..LAYERS {
+            assert_eq!((d.is_attn(l), d.attn_index(l), d.gdn_index(l)), (is_attn(l), attn_index(l), gdn_index(l)), "layer {l}");
+        }
         assert_eq!(crate::manager::gdn_s_state_len(&g), GDN_VHEADS * GD * GD);
         assert_eq!(crate::manager::gdn_conv_state_len(&g), GDN_CONV * 3);
         assert_eq!(crate::manager::ple_state_len(&g), GDN_CONV * 9, "the PLE conv runs over the 10240-wide residual");
@@ -803,6 +951,7 @@ mod tests_300 {
             ("moe", std::panic::catch_unwind(|| dense.moe().experts)),
             ("qsa", std::panic::catch_unwind(|| dense.qsa().heads)),
             ("ple_geo", std::panic::catch_unwind(|| dense.ple_geo().layer)),
+            ("moe", std::panic::catch_unwind(|| dense.dims().e)),
         ] {
             let e = r.unwrap_err();
             let msg = e.downcast_ref::<&str>().copied().map(String::from).or_else(|| e.downcast_ref::<String>().cloned()).unwrap();

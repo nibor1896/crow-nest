@@ -882,7 +882,7 @@ mod tests_72 {
         let mut p = PostPlan::new();
         p.vram("vit tower scratch", 239_599_616);
         p.vram("vit mrope span", 51_200_000);
-        p.vram("device sampler", crate::gen::sampler_bytes());
+        p.vram("device sampler", crate::gen::sampler_bytes(V));
         p.host("prefix cache (3 snapshots)", 3 * 130_646_016);
         p.host("vit image cache (CROW_VIT_CACHE_MB, LRU)", 256 << 20);
         p
@@ -891,13 +891,13 @@ mod tests_72 {
     #[test]
     fn the_post_plan_vram_total_is_the_reserve_plus_the_sampler() {
         let p = ledger();
-        assert_eq!(p.vram_bytes(), 239_599_616 + 51_200_000 + crate::gen::sampler_bytes());
+        assert_eq!(p.vram_bytes(), 239_599_616 + 51_200_000 + crate::gen::sampler_bytes(V));
         // the reserve of record, 277.3 MB, plus ~0.7 MB of sampler
         // (#83, 2026-09-20: params grew 16 -> 36 B for min_p + ln(min_p);
         // #84 the same day: the windowed penalties added counts [V] u16 +
         // the 1026-i32 ring, so the pin moved 281_112 -> 281_132 -> 781_876)
         assert_eq!(p.vram_bytes(), 291_581_492);
-        assert_eq!(crate::gen::sampler_bytes(), 781_876);
+        assert_eq!(crate::gen::sampler_bytes(V), 781_876);
     }
 
     /// the biggest post-plan allocation of the process is the prefix cache, and it

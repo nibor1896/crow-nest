@@ -4623,6 +4623,14 @@ tests read the checkpoint of record in `models/`, as before.
   `Sampler::from_env(Some(vocab))`. There is no process-wide `OnceLock<Geo>`: every site found so
   far has an engine handle or a caller that has one. The tools that map a container without the
   front door (`residency`, `states`, `coldtier`, `hybrid`, `sf_scan`) ask `boot::model_geo` for it.
+- **`Dims`, the flat view `gen.rs` computes with.** `Geo::dims()` flattens the `Geo` into one
+  `Copy` value with one field per const it replaces, the const's name in lower case (`H` -> `h`,
+  `QSA_SEL_MAX` -> `qsa_sel_max`, plus `is_attn` / `attn_index` / `gdn_index`). `Engine::load`
+  builds it once (`let d = geo.dims()`) and keeps it as `Engine::d`; `Ple` keeps a copy, and the
+  buffer builders take it as a parameter (`Params::setup(cfg, d, ..)`, `Scratch::diet_sets(d, c)`,
+  `Scratch::alloc(d, chunk)`, `Ple::load(cnq, d, ..)`). It is a cache of the `Geo`, never a second
+  source, and it keeps the per-launch host code at one field read instead of a family match.
+  `geo::tests_300` pins every field to its const.
 - **Accessors.** The code still assumes the Flash-Next STRUCTURE (the family switches are C5), so
   it reads the family-specific numbers through `Geo::moe()`, `qsa()` (`QsaGeo`: `qk_rows`,
   `sel_max`, `hidd`), `ple_geo()`, `hc_lowrank()`, `vision_out()`, `attn_index` / `gdn_index`. On a
@@ -4640,8 +4648,8 @@ tests read the checkpoint of record in `models/`, as before.
   `[budget]`, `[residency]`, `[diet]` and `scratch + staging` line is identical to `f7ca9f5`
   (host-measured free RAM / VRAM masked).
 
-**What still reads the consts** (C3b, 2026-09-26): `gen.rs` (the loader, the layer primitives,
-the decode and prefill loops). On purpose: `meta.rs` (the Flash-Next expected-values row is the
+**What still reads the consts** (C3c, 2026-09-26): in `gen.rs` the layer primitives (`hc_run`
+.. `lm_head_row`) and the loops (`upload_chunk_scalars` .. the trickle and the route log). On purpose: `meta.rs` (the Flash-Next expected-values row is the
 pin), the tests that pin a const against its `Geo` field or feed a Flash-Next fixture, and the
 synthetic kernel probes (`mma_gate`, `attn_path_probe`, `qsa_probe`, `qsa_tie_probe`,
 `gdn_chunk_probe`, `rope_table_probe`, `router_probe`): they load no model and exercise the

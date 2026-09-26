@@ -242,6 +242,8 @@ pub struct Ple {
     pub miss: u64, // PLE rows filled from the container
     pub state: Dev,   // [10240][9] conv state
     pub shards: Vec<(crate::cnq::TensorInfo, f32)>,
+    /// C3: the model's numbers the n-gram math reads (`ple_*`), a copy of `Engine::d`
+    d: Dims,
 }
 
 pub struct Params {
@@ -401,6 +403,9 @@ pub struct Engine {
     /// the boot (`boot::open_model` -> `meta::assert_pinned`); every host site reads
     /// its numbers from this field (the kernels still pin Flash-Next until C4)
     pub geo: Geo,
+    /// C3: the flat view of `geo` every host site below computes with (`Geo::dims`,
+    /// built once at load; a cache of `geo`, never a second source)
+    pub(crate) d: Dims,
     k: Kernels,
     module: cuda::Module, // #18: kept so Drop can unload it after every kernel user is gone
     pub(crate) st: ThreeStates,
@@ -546,7 +551,7 @@ impl Engine {
             prompt_chunk: self.cfg.prompt_chunk,
             residency_n: r.n,
             residency_stride: r.stride,
-            experts: E,
+            experts: self.d.e,
             // the cold-path policy PER LAYER: layer `l` reads `E - hot[l]` of its
             // experts from the tier, and `hot[l]` is the occupied hot slots
             hot_per_layer: r
@@ -575,7 +580,7 @@ impl Engine {
             expert_bytes: r.gu_bytes + r.dn_bytes,
             pinned_bytes: r.pinned_bytes(),
             cold_policy,
-            layers: LAYERS,
+            layers: self.d.layers,
             qsa_ring_rows: self.st.qsa_ring_rows,
             ple_cache_bytes: self.cfg.ple_cache_bytes,
             vit: self.vit.is_some(),
@@ -621,7 +626,7 @@ impl Engine {
     ///   current stream, ahead of the next step's launch.
     pub unsafe fn rebook_sampler(&self, drawn: usize, kept: usize, drawn_seen: bool, lastn: usize) {
         let Some(ds) = self.dev_sampler.as_ref() else { return };
-        if drawn == kept || drawn >= V || kept >= V {
+        if drawn == kept || drawn >= self.d.v || kept >= self.d.v {
             return;
         }
         let (head, cd, ck) = if lastn > 0 {
@@ -667,7 +672,7 @@ impl Engine {
         let seq = plan.types.len();
         let (pos, _delta) = crate::vit::mrope_positions(&plan.types, &plan.grids);
         let (cos, sin) = crate::vit::mrope_tables(&pos, seq, span, plan.delta);
-        assert_eq!(cos.len(), span * ROPE_PAIRS);
+        assert_eq!(cos.len(), span * self.d.rope_pairs);
         if span > self.mrope_rows {
             // TASK K: the old tables go first (the new pair is what the request
             // needs), and a refusal on either half leaves NO half-armed state:
@@ -679,8 +684,8 @@ impl Engine {
                 cuda::free_dev(&mut self.mrope_sin);
                 self.mrope_rows = 0;
             }
-            let bytes = span * ROPE_PAIRS * 4;
-            let what = format!("the interleaved-mrope span tables ({span} rows x {ROPE_PAIRS} pairs f32)");
+            let bytes = span * self.d.rope_pairs * 4;
+            let what = format!("the interleaved-mrope span tables ({span} rows x {} pairs f32)", self.d.rope_pairs);
             self.mrope_cos = cuda::alloc_named(&what, bytes);
             match cuda::try_alloc_zeroed(&what, bytes) {
                 Ok(d) => self.mrope_sin = d,
@@ -942,6 +947,9 @@ impl Engine {
         if std::env::var("CROW_KPROF").is_ok() && graph_on() {
             panic!("refusing CROW_KPROF with CROW_GRAPH=1: the per-kernel profile syncs the stream before and after every launch, and a sync inside the open decode-graph capture is CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED — the run would die on the first captured decode token. Re-run the measurement with CROW_GRAPH=0, or unset CROW_KPROF");
         }
+        // C3: the flat view of the model's Geo this loader computes with (Geo::dims
+        // refuses by name a family whose structure is not built yet, C5)
+        let d = geo.dims();
         // #110: a bad CROW_RENDER_RESERVE_MB stops the boot here, before a byte is loaded
         let render_reserve = crate::manager::render_reserve_bytes();
         let sec = "text";
@@ -956,7 +964,7 @@ impl Engine {
         let emb_t = cnq.find("model.language_model.embed_tokens.weight", sec).clone();
         let emb_raw = cnq.read_bytes(&emb_t);
         let embed_host: Vec<u16> = emb_raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        assert_eq!(embed_host.len(), V * H);
+        assert_eq!(embed_host.len(), d.v * d.h);
         drop(emb_raw);
 
         let lm_t = cnq.find("lm_head.weight", sec).clone();
@@ -969,9 +977,9 @@ impl Engine {
         let mx_up = load_pw(cnq, "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight", sec);
 
         log("loading 48 dense layer bundles (FP4 + keeps) …");
-        let mut hc = Vec::with_capacity(LAYERS);
-        let mut sub = Vec::with_capacity(LAYERS);
-        let mut moe = Vec::with_capacity(LAYERS);
+        let mut hc = Vec::with_capacity(d.layers);
+        let mut sub = Vec::with_capacity(d.layers);
+        let mut moe = Vec::with_capacity(d.layers);
         for l in 0..LAYERS {
             let pfx = |s: &str| format!("model.language_model.layers.{l}.{s}");
             hc.push(HcW {
@@ -980,7 +988,7 @@ impl Engine {
                 up: load_pw(cnq, &pfx("attn_hyper_connection.input_mix_weight_up.weight"), sec),
                 inj: load_pw(cnq, &pfx("attn_hyper_connection.block_inject_weight.weight"), sec),
             });
-            if is_attn(l) {
+            if d.is_attn(l) {
                 sub.push(SubW::Attn {
                     q: load_pw(cnq, &pfx("self_attn.q_proj.weight"), sec),
                     k: load_pw(cnq, &pfx("self_attn.k_proj.weight"), sec),
@@ -995,7 +1003,7 @@ impl Engine {
             } else {
                 sub.push(SubW::Gdn {
                     qkv: load_pw(cnq, &pfx("linear_attn.in_proj_qkv.weight"), sec),
-                    conv: dequant_fp4_dev(cnq, &pfx("linear_attn.conv1d.weight"), sec, GDN_CONV * 4),
+                    conv: dequant_fp4_dev(cnq, &pfx("linear_attn.conv1d.weight"), sec, d.gdn_conv * d.conv_kernel),
                     z: load_pw(cnq, &pfx("linear_attn.in_proj_z.weight"), sec),
                     b: load_pw(cnq, &pfx("linear_attn.in_proj_b.weight"), sec),
                     a: load_pw(cnq, &pfx("linear_attn.in_proj_a.weight"), sec),
@@ -1018,7 +1026,7 @@ impl Engine {
             }
         }
         // mlp HC bundle (second per-layer HC block)
-        let mut hc2 = Vec::with_capacity(LAYERS);
+        let mut hc2 = Vec::with_capacity(d.layers);
         for l in 0..LAYERS {
             let pfx = |s: &str| format!("model.language_model.layers.{l}.{s}");
             hc2.push(HcW {
@@ -1035,7 +1043,7 @@ impl Engine {
         // CROW_PLE_CACHE_MB=<n>: hot-row cache size override (VRAM diet, 2026-09-05)
         let ple_bytes = std::env::var("CROW_PLE_CACHE_MB").ok().and_then(|v| v.parse::<u64>().ok())
             .map(|mb| mb << 20).unwrap_or(cfg.ple_cache_bytes);
-        let ple = Ple::load(cnq, ple_bytes);
+        let ple = Ple::load(cnq, &d, ple_bytes);
         log("PLE done — budget verify next");
 
         // ---- #VIT: the visual tower, BEFORE the budget verify (the planner
@@ -1081,8 +1089,8 @@ impl Engine {
         // `begin_vision` never allocates inside a request again. Same rule as the
         // scratch: taken while the card is empty, counted by the planner as resident.
         let (mrope_cos, mrope_sin, mrope_rows) = if vit.is_some() && vit_hold {
-            let bytes = cfg.context * ROPE_PAIRS * 4;
-            let what = format!("the interleaved-mrope span tables ({} rows x {ROPE_PAIRS} pairs f32, held at boot)", cfg.context);
+            let bytes = cfg.context * d.rope_pairs * 4;
+            let what = format!("the interleaved-mrope span tables ({} rows x {} pairs f32, held at boot)", cfg.context, d.rope_pairs);
             // #117: lendable, rewritten by every begin_vision (`to_f32_into` below)
             (cuda::alloc_lendable(&what, bytes), cuda::alloc_lendable(&what, bytes), cfg.context)
         } else {
@@ -1098,12 +1106,12 @@ impl Engine {
         // #83: params grew 16 -> 36 B (min_p + the host-computed ln_min_p at
         // [4]/[5]); #84 filled [6..9] (repeat, freq, last_n).
         let dev_sampler_hold = Some(DevSampler {
-            mask: cuda::alloc_named("the sampler presence mask", V),
+            mask: cuda::alloc_named("the sampler presence mask", d.v),
             rng: cuda::alloc_named("the sampler rng state", 8),
             params: cuda::alloc_named("the sampler profile", 36),
             cand_v: cuda::alloc_named("the sampler candidate values", SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
             cand_i: cuda::alloc_named("the sampler candidate ids", SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
-            counts: cuda::alloc_named("the sampler window counts", 2 * V),
+            counts: cuda::alloc_named("the sampler window counts", 2 * d.v),
             ring: cuda::alloc_named("the sampler penalty ring", (2 + SAMPLE_RING_MAX) * 4),
             in_graph: std::cell::Cell::new(false),
         });
@@ -1113,10 +1121,10 @@ impl Engine {
         // ~0.7 GB; an unplanned allocation past the card limit gets paged by
         // WDDM and silently costs 3x per token - found 2026-09-04 at C=1024) ----
         let slabs = crate::residency::expert_slab_info(cnq, 0, sec, geo.moe().experts);
-        let per_expert_unit = (slabs.gu_bytes + slabs.dn_bytes) * LAYERS as u64;
-        let s = Scratch::alloc(cfg.prompt_chunk);
+        let per_expert_unit = (slabs.gu_bytes + slabs.dn_bytes) * d.layers as u64;
+        let s = Scratch::alloc(&d, cfg.prompt_chunk);
         // cold staging: decode-sized batches only (t*TOPK <= stage_max)
-        let stage_max = (2 * TOPK).max(pf_tg() * if pf_async_on() { 2 } else { 1 }); // 2 x 64 slots x 2.76 MB = 354 MB (default since 2026-09-09; CROW_PF_ASYNC=0 CROW_PF_TG=32 = 88 MB)
+        let stage_max = (2 * d.topk).max(pf_tg() * if pf_async_on() { 2 } else { 1 }); // 2 x 64 slots x 2.76 MB = 354 MB (default since 2026-09-09; CROW_PF_ASYNC=0 CROW_PF_TG=32 = 88 MB)
         // #19e fix C4 of 19d: CROW_STAGE_SPLIT shapes the stage_cold grid only, so its
         // assert gates the kernel 1 fallback only. Kernel 2, the default, carries no
         // tail tile and needs 4 KB multiples instead, asserted here at load and again
@@ -1184,9 +1192,9 @@ impl Engine {
         println!("[gdn] decode input projections {}, CROW_GDN_FUSE_IN {} (0 = per-slab fallback of record, four launches), CROW_GDN_SPLIT_Z {} (#71, default off, 1 = z out of the group)",
             if !gdn_fuse_in_on() { "per-slab (fallback of record, four launches: gemv_fp4_mma_d32[320x1] + [192x1] + two gemv_fp4_mma_d[1x1])".to_string() }
             else if gdn_split_z_on() { format!("split (71, two launches: gemv_fp4_mma_g32[{}x1] qkv+b+a + gemv_fp4_mma_d32[{}x1] z)",
-                (GDN_CONV + 2 * GDN_VHEADS).div_ceil(32), GDN_VAL.div_ceil(32)) }
+                (d.gdn_conv + 2 * d.gdn_vheads).div_ceil(32), d.gdn_val.div_ceil(32)) }
             else { format!("grouped (default since 19g, one launch: gemv_fp4_mma_g32[{}x1] qkv+z+b+a)",
-                (GDN_CONV + GDN_VAL + 2 * GDN_VHEADS).div_ceil(32)) },
+                (d.gdn_conv + d.gdn_val + 2 * d.gdn_vheads).div_ceil(32)) },
             gfi, env_or_unset("CROW_GDN_SPLIT_Z"));
         // #19f, 2026-09-13: ONE line per engine process names the hyper-
         // connection decode chain form, next to the [gdn] line and for the
@@ -1207,7 +1215,7 @@ impl Engine {
         println!("[pf-gemm-b] prefill dense GEMM {}, CROW_PF_GEMM_B {} (exact 1 = variant B 32-token tiles, unset or other = the 8-token form of record)",
             if pf_gemm_b_on() { "variant B (gemm_fp4_dense_b / gemm_bf16_dense_b)" } else { "8-token tiles (of record)" }, pgb);
         // worst case every expert ends with a partial tile: t*10/8 + 512 tiles
-        let max_tiles = cfg.prompt_chunk * TOPK / 8 + E + 1;
+        let max_tiles = cfg.prompt_chunk * d.topk / 8 + d.e + 1;
         let stage = Stage {
             // #117: lendable, cold-expert staging written by stage_cold before every read
             gu: cuda::alloc_lendable("the cold staging gate_up slots", stage_max * slabs.gu_bytes as usize),
@@ -1220,10 +1228,10 @@ impl Engine {
             dn_bytes: slabs.dn_bytes,
             max: stage_max,
             dma: if stage_dma_on() { Some(cuda::Pinned::alloc(stage_max * 16 + 256)) } else { None },
-            counts: cuda::alloc_zeroed(E * 4),
-            offsets: cuda::alloc_zeroed((E + 1) * 4),
-            cursor: cuda::alloc_zeroed(E * 4),
-            perm: cuda::alloc_zeroed(cfg.prompt_chunk.max(1) * TOPK * 4),
+            counts: cuda::alloc_zeroed(d.e * 4),
+            offsets: cuda::alloc_zeroed((d.e + 1) * 4),
+            cursor: cuda::alloc_zeroed(d.e * 4),
+            perm: cuda::alloc_zeroed(cfg.prompt_chunk.max(1) * d.topk * 4),
             tiles: cuda::alloc_zeroed(max_tiles * 16),
             n_tiles: cuda::alloc_zeroed(4),
             eptr: cuda::alloc_zeroed(max_tiles * 16),
@@ -1251,7 +1259,7 @@ impl Engine {
         // + the prefetch ring (2 x one layer's cold slab; sized for N down to
         //   n_hot-24, verified after the residency build)
         let ring_reserve = if pf_dma_on() && mma_on() && pf_gemm_on() {
-            2 * (E - cfg.n_hot.saturating_sub(24).min(E)) as u64 * (slabs.gu_bytes + slabs.dn_bytes)
+            2 * (d.e - cfg.n_hot.saturating_sub(24).min(d.e)) as u64 * (slabs.gu_bytes + slabs.dn_bytes)
         } else { 0 };
         // VRAM the planner must leave free for launch/param plumbing. Sibling
         // of `manager::SAFETY` (512 MiB), which covers the clamp loop's own
@@ -1281,11 +1289,11 @@ impl Engine {
             Some(p) => {
                 let (h, _) = crate::residency::read_coldtier_header(&p);
                 let rec = h["gu_record_bytes"].as_u64().unwrap() + h["dn_record_bytes"].as_u64().unwrap();
-                let unit = rec * LAYERS as u64;
+                let unit = rec * d.layers as u64;
                 // FULL tier (every expert pinned, enables the prompt-adaptive hot set)
                 // when it fits the host budget, else cold-only; CROW_COLD_FULL=1/0 forces
                 let full = match std::env::var("CROW_COLD_FULL").as_deref() {
-                    Ok("1") => true, Ok("0") => false, _ => E as u64 * unit <= cfg.host_pinned_budget };
+                    Ok("1") => true, Ok("0") => false, _ => d.e as u64 * unit <= cfg.host_pinned_budget };
                 (unit, full)
             }
             None => (per_expert_unit, false),
@@ -1344,8 +1352,8 @@ impl Engine {
         let module = cuda::compile(&crate::kernels::KERNEL_SRC);
         let k = Kernels::new(&module);
         assert_kernel_defines();
-        let p = Params::setup(&cfg, &st);
-        let sel_counts = cuda::alloc_zeroed(LAYERS * E * 8);
+        let p = Params::setup(&cfg, &d, &st);
+        let sel_counts = cuda::alloc_zeroed(d.layers * d.e * 8);
         let w = Weights {
             embed_host,
             lm_head,
@@ -1375,7 +1383,7 @@ impl Engine {
             }
             post.host("vit image cache (CROW_VIT_CACHE_MB, LRU)", crate::vit::image_cache_budget_bytes());
         }
-        post.vram("device sampler", sampler_bytes());
+        post.vram("device sampler", sampler_bytes(d.v));
         log(&format!("  [budget] {}", post.line()));
         let free_after = cuda::free_vram_bytes();
         // #110: the floor is POST_PLAN_FLOOR + the render reserve
@@ -1399,6 +1407,7 @@ impl Engine {
 
         Engine {
             geo,
+            d,
             k,
             module,
             st,
@@ -1414,7 +1423,7 @@ impl Engine {
             done_blocks: 0,
             sel_counts,
             stage,
-            pf_ncombo: cuda::to_i32_dev(&[TOPK as i32]),
+            pf_ncombo: cuda::to_i32_dev(&[d.topk as i32]),
             pf_ring_gu: ring_gu,
             pf_ring_dn: ring_dn,
             pf_stream,
@@ -1446,7 +1455,7 @@ impl Engine {
             graph_exec: 0,
             cap_stream: 0,
             scalar_stage: unsafe { cuda::Pinned::alloc(16 * 4) },
-            embed_buf: vec![0f32; HCT],
+            embed_buf: vec![0f32; d.hct],
             sb_pack: Box::new([0i32; 2]),
         }
     }
@@ -1513,17 +1522,22 @@ pub fn ple_row_pad(src: &[u8], off: usize, nblk: usize) -> [u8; 108] {
 }
 
 impl Ple {
-    pub unsafe fn load(cnq: &mut Cnq, cache_bytes: u64) -> Ple {
+    pub unsafe fn load(cnq: &mut Cnq, d: &Dims, cache_bytes: u64) -> Ple {
+        // C3: the cache's padded 108-byte row (3 NVFP4 blocks, `ple_row_pad`) and the PLE
+        // kernels hold PLE_ROW_VALUES values per row; the model's row width must be that
+        assert_eq!(d.ple_emb_dim as u64, PLE_ROW_VALUES, "PLE embedding dim {} is not the {PLE_ROW_VALUES}-value row the cache layout and the kernels pin", d.ple_emb_dim);
         // projections/norms/conv + the I64 tables live in the `text` section;
         // only the 128 big shard tables carry the `ple` section tag
         let sec = "text";
-        let P = |s: &str| format!("model.language_model.layers.1.ple.{s}");
+        let pl = d.ple_layer;
+        let P = |s: &str| format!("model.language_model.layers.{pl}.ple.{s}");
         let key = load_pw(cnq, &P("key_proj.weight"), sec);
         let value = load_pw(cnq, &P("value_proj.weight"), sec);
         let norm_key = load_f32(cnq, &P("norm_key.weight"), sec);
         let norm_query = load_f32(cnq, &P("norm_query.weight"), sec);
         let norm_conv = load_f32(cnq, &P("norm_conv.weight"), sec);
-        let conv = dequant_fp4_dev(cnq, &P("conv1d.weight"), sec, GDN_CONV * 4);
+        // the PLE conv runs over the residual width (10240 = hct), kernel 4 (the ple_conv kernel's taps)
+        let conv = dequant_fp4_dev(cnq, &P("conv1d.weight"), sec, d.hct * 4);
         let multipliers = cnq.read_i64(&P("ple_embedding.layer_multipliers"), sec);
         let vocab_sizes = cnq.read_i64(&P("ple_embedding.ngram_heads_vocab_sizes"), sec);
         let offsets = cnq.read_i64(&P("ple_embedding.ngram_heads_offsets"), sec);
@@ -1531,12 +1545,12 @@ impl Ple {
         let n_slots = (cache_bytes / 112) as usize; // 108 B row + 4 B gs per slot
         let cache = cuda::alloc_zeroed(n_slots * 108);
         let gs = cuda::alloc_zeroed(n_slots * 4);
-        let state = cuda::alloc_zeroed(GDN_CONV * 9 * 4);
+        let state = cuda::alloc_zeroed(d.hct * 9 * 4);
 
         // shard tensor infos + global scales (128 shards)
         let mut shards = Vec::with_capacity(128);
         for i in 0..128 {
-            let name = format!("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_{i}.weight");
+            let name = format!("model.language_model.layers.{pl}.ple.ple_embedding.ngram_embedding.shard_{i}.weight");
             let t = cnq.find(&name, "ple").clone();
             shards.push((t, 1.0f32));
         }
@@ -1562,6 +1576,7 @@ impl Ple {
             miss: 0,
             state,
             shards,
+            d: *d,
         }
     }
 
@@ -1578,7 +1593,7 @@ impl Ple {
             .map(|shift| {
                 let mut eos_pos = vec![-1i64; n];
                 for (i, &v) in history.iter().enumerate() {
-                    if v == PLE_EOS {
+                    if v == self.d.ple_eos {
                         eos_pos[i] = i as i64;
                     }
                 }
@@ -1596,16 +1611,16 @@ impl Ple {
                         let src = i as i64 - shift as i64;
                         let gather = src.max(0) as usize;
                         let valid = pos_in_seg >= shift as i64 && src >= 0;
-                        if valid { history[gather] } else { PLE_EOS }
+                        if valid { history[gather] } else { self.d.ple_eos }
                     })
                     .collect()
             })
             .collect();
         let mut out = Vec::new();
         for i in 0..n {
-            let mut row = Vec::with_capacity(PLE_NHEADS);
-            for ngram in 2..=PLE_NGRAM {
-                let start = (ngram - 2) * PLE_HEADS_PER_NGRAM;
+            let mut row = Vec::with_capacity(self.d.ple_nheads);
+            for ngram in 2..=self.d.ple_ngram {
+                let start = (ngram - 2) * self.d.ple_heads_per_ngram;
                 let mut mixed = (shifted[0][i] as u64).wrapping_mul(multipliers[0] as u64);
                 for p in 1..ngram {
                     mixed ^= (shifted[p][i] as u64).wrapping_mul(multipliers[p] as u64);
@@ -1626,7 +1641,7 @@ impl Ple {
     /// cache instead of NVMe - HugeCTR-HPS pattern, spec R6)
     pub fn row_offsets(&self, cnq: &Cnq, prefix: &[i64], chunk: &[i64]) -> Vec<u64> {
         let all = self.ngram_ids(prefix, chunk);
-        let mut out = Vec::with_capacity(chunk.len() * PLE_NHEADS);
+        let mut out = Vec::with_capacity(chunk.len() * self.d.ple_nheads);
         for row in &all[prefix.len()..] {
             for &id in row {
                 let slot = (id as u64 % self.n_slots as u64) as usize;
@@ -1812,9 +1827,9 @@ pub fn mma_bx32() -> u32 { 64 * mma_ks() }
 /// The `expand_slab` block-count scalars, alive for exactly one adaptation
 /// pass: allocate, run the pass, sync, free. Both ticks bracket their swap
 /// loop with this, and a missing `free` here leaks 2 device allocs per token.
-unsafe fn with_nblk<R>(f: impl FnOnce(Dev, Dev) -> R) -> R {
-    let nblk_gu = cuda::to_i32_dev(&[((2 * INTER * H) / 64) as i32]);
-    let nblk_dn = cuda::to_i32_dev(&[((H * INTER) / 64) as i32]);
+unsafe fn with_nblk<R>(d: &Dims, f: impl FnOnce(Dev, Dev) -> R) -> R {
+    let nblk_gu = cuda::to_i32_dev(&[((2 * d.inter * d.h) / 64) as i32]);
+    let nblk_dn = cuda::to_i32_dev(&[((d.h * d.inter) / 64) as i32]);
     let r = f(nblk_gu, nblk_dn);
     cuda::sync();
     let (mut a, mut b) = (nblk_gu, nblk_dn);
@@ -1941,7 +1956,7 @@ fn attn_split_on() -> bool { env_flag!("CROW_ATTN_SPLIT", on) }
 fn attn_r_mode() -> i32 { static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new(); *V.get_or_init(|| env_parse("CROW_ATTN_R").unwrap_or(-1)) }
 fn attn_sel_name() -> &'static str { match attn_r_mode() { 0 => "attn_sel", 1 => "attn_sel_r", 2 => "attn_sel_s", 3 => "attn_sel_s8", 4 => "attn_sel_s8l", 5 => "attn_sel_g", 8 => "attn_sel_d8", 9 => "attn_sel_d9", _ => "attn_sel_s8l" } }
 /// (grid.x, block) of the selected attention kernel: one block per q head (NQ, AHD) or per KV head (NKV, 384).
-fn attn_sel_gx_bx() -> (u32, u32) { if attn_r_mode() == 5 { (NKV as u32, 384) } else { (NQ as u32, AHD as u32) } }
+fn attn_sel_gx_bx(d: &Dims) -> (u32, u32) { if attn_r_mode() == 5 { (d.nkv as u32, 384) } else { (d.nq as u32, d.ahd as u32) } }
 /// #16 (2026-09-05): prompt attention in sub-batches of ATTN_SB tokens. The QSA
 /// score buffer [chunk][cap] f32 (256 KB per token, 512 MB at chunk 2048) shrinks
 /// to [ATTN_SB][cap]; scores / select / attn_sel take pointer offsets per
@@ -2045,8 +2060,8 @@ pub const QSA_PAR_E_THREADS: u32 = 1024;
 /// SAMPLE_MAXK] slices, and since #84 counts [V] u16 + ring i32
 /// {head, fill, ids[SAMPLE_RING_MAX]}). Held at boot since #72, and named on
 /// the `[budget]` post-plan line.
-pub const fn sampler_bytes() -> u64 {
-    (V + 8 + 36 + 2 * SAMPLE_PARTS as usize * SAMPLE_MAXK * 4 + 2 * V
+pub const fn sampler_bytes(vocab: usize) -> u64 {
+    (vocab + 8 + 36 + 2 * SAMPLE_PARTS as usize * SAMPLE_MAXK * 4 + 2 * vocab
         + (2 + SAMPLE_RING_MAX) * 4) as u64
 }
 
@@ -2096,21 +2111,21 @@ fn dense_mma_on() -> bool {
 
 
 impl Params {
-    pub unsafe fn setup(cfg: &Config, _st: &ThreeStates) -> Params {
+    pub unsafe fn setup(cfg: &Config, d: &Dims, _st: &ThreeStates) -> Params {
         let cap_blocks = (cfg.context + 3) / 4;
         Params {
-            n320: cuda::to_i32_dev(&[LOWRANK as i32]),
-            n128: cuda::to_i32_dev(&[QSA_HD as i32]),
-            n2560: cuda::to_i32_dev(&[H as i32]),
-            n640: cuda::to_i32_dev(&[INTER as i32]),
-            n1280: cuda::to_i32_dev(&[(2 * INTER) as i32]),
-            n6144: cuda::to_i32_dev(&[GDN_VAL as i32]),
-            n10240: cuda::to_i32_dev(&[HCT as i32]),
-            n2048: cuda::to_i32_dev(&[GDN_KEY as i32]),
-            n12288: cuda::to_i32_dev(&[Q_ROWS as i32]),
-            n_conv_deq: cuda::to_i32_dev(&[(GDN_CONV * 4) as i32]),
-            n_selmax: cuda::to_i32_dev(&[QSA_SEL_MAX as i32]),
-            k_top: cuda::to_i32_dev(&[QSA_BLOCK_TOPK as i32]),
+            n320: cuda::to_i32_dev(&[d.lowrank as i32]),
+            n128: cuda::to_i32_dev(&[d.qsa_hd as i32]),
+            n2560: cuda::to_i32_dev(&[d.h as i32]),
+            n640: cuda::to_i32_dev(&[d.inter as i32]),
+            n1280: cuda::to_i32_dev(&[(2 * d.inter) as i32]),
+            n6144: cuda::to_i32_dev(&[d.gdn_val as i32]),
+            n10240: cuda::to_i32_dev(&[d.hct as i32]),
+            n2048: cuda::to_i32_dev(&[d.gdn_key as i32]),
+            n12288: cuda::to_i32_dev(&[d.q_rows as i32]),
+            n_conv_deq: cuda::to_i32_dev(&[(d.gdn_conv * d.conv_kernel) as i32]),
+            n_selmax: cuda::to_i32_dev(&[d.qsa_sel_max as i32]),
+            k_top: cuda::to_i32_dev(&[d.qsa_block_topk as i32]),
             cap: cuda::to_i32_dev(&[cap_blocks as i32]),
             tmax: cuda::to_i32_dev(&[cfg.context as i32]),
             mode: cuda::to_i32_dev(&[match cfg.kv { KvDtype::Fp8E4m3 => 0, KvDtype::Bf16 => 1 }]),
@@ -2129,27 +2144,27 @@ impl Params {
             slot1: cuda::to_i32_dev(&[0]),
             one: cuda::to_i32_dev(&[1]),
             zero: cuda::to_i32_dev(&[0]),
-            n_vocab: cuda::to_i32_dev(&[V as i32]),
+            n_vocab: cuda::to_i32_dev(&[d.v as i32]),
             nt_low: cuda::to_i32_dev(&[1]),
             nt_hct: cuda::to_i32_dev(&[1]),
             nt_hc: cuda::to_i32_dev(&[1]),
             nt_6144: cuda::to_i32_dev(&[1]),
             nt_combo: cuda::to_i32_dev(&[1]),
-            q_heads4: cuda::to_i32_dev(&[QSA_HEADS as i32]),
-            q_heads1: cuda::to_i32_dev(&[QSA_KVHEADS as i32]),
+            q_heads4: cuda::to_i32_dev(&[d.qsa_heads as i32]),
+            q_heads1: cuda::to_i32_dev(&[d.qsa_kvheads as i32]),
             pos_mul1: cuda::to_i32_dev(&[1]),
-            pos_mul4: cuda::to_i32_dev(&[QSA_COMPRESS as i32]),
-            stride512: cuda::to_i32_dev(&[(QSA_HEADS * QSA_HD) as i32]),
-            stride128: cuda::to_i32_dev(&[QSA_HD as i32]),
+            pos_mul4: cuda::to_i32_dev(&[d.qsa_compress as i32]),
+            stride512: cuda::to_i32_dev(&[(d.qsa_heads * d.qsa_hd) as i32]),
+            stride128: cuda::to_i32_dev(&[d.qsa_hd as i32]),
             keys_ring: cuda::to_i32_dev(&[_st.qsa_ring_rows as i32]),
-            qk_stride: cuda::to_i32_dev(&[QSA_QK_ROWS as i32]),
+            qk_stride: cuda::to_i32_dev(&[d.qsa_qk_rows as i32]),
             ncb1: cuda::to_i32_dev(&[0]),
             pos_row1: cuda::to_i32_dev(&[0]),
-            k_top10: cuda::to_i32_dev(&[TOPK as i32]),
-            nt_hct1: cuda::to_i32_dev(&[HCT as i32]),
-            nr4: cuda::to_i32_dev(&[HCN as i32]),
-            nr48: cuda::to_i32_dev(&[GDN_VHEADS as i32]),
-            nr512: cuda::to_i32_dev(&[KV_ROWS as i32]),
+            k_top10: cuda::to_i32_dev(&[d.topk as i32]),
+            nt_hct1: cuda::to_i32_dev(&[d.hct as i32]),
+            nr4: cuda::to_i32_dev(&[d.hcn as i32]),
+            nr48: cuda::to_i32_dev(&[d.gdn_vheads as i32]),
+            nr512: cuda::to_i32_dev(&[d.kv_rows as i32]),
             n_splits: cuda::to_i32_dev(&[attn_splits() as i32]),
         }
     }
@@ -2159,103 +2174,103 @@ impl Scratch {
     /// #117: the six #10b sets at chunk `c` (persist, hc, attn, gdn, ple, moe),
     /// `(name, bytes)`, exactly what `alloc` lays out; pure, so the lendable
     /// bytes are testable without a GPU
-    pub fn diet_sets(c: usize) -> [Vec<(&'static str, usize)>; 6] {
+    pub fn diet_sets(d: &Dims, c: usize) -> [Vec<(&'static str, usize)>; 6] {
         let persist_set: Vec<(&'static str, usize)> = vec![
-            ("h", 4 * c * HCT),
-            ("x1", 4 * c * HCT),
-            ("mixed", 4 * c * H),
-            ("mixed_m", 4 * c * H),
-            ("moe_out", 4 * c * H),
-            ("xq_m", c * xq_row_bytes(H / 64)),
-            ("xq_gu", c * xq_row_bytes(H / 64)),
-            ("xq_v", c * xq_row_bytes(GDN_VAL / 64)),
-            ("injr", 4 * c * HCN),
-            ("injw", 4 * c * HCN),
-            ("mixed_final", 4 * c * H),
+            ("h", 4 * c * d.hct),
+            ("x1", 4 * c * d.hct),
+            ("mixed", 4 * c * d.h),
+            ("mixed_m", 4 * c * d.h),
+            ("moe_out", 4 * c * d.h),
+            ("xq_m", c * xq_row_bytes(d.h / 64)),
+            ("xq_gu", c * xq_row_bytes(d.h / 64)),
+            ("xq_v", c * xq_row_bytes(d.gdn_val / 64)),
+            ("injr", 4 * c * d.hcn),
+            ("injw", 4 * c * d.hcn),
+            ("mixed_final", 4 * c * d.h),
         ];
         let hc_set: Vec<(&'static str, usize)> = vec![
-            ("normed", 4 * c * HCT),
-            ("mixw", 4 * c * HCT),
-            ("low", 4 * c * LOWRANK),
-            ("sil", 4 * c * LOWRANK),
+            ("normed", 4 * c * d.hct),
+            ("mixw", 4 * c * d.hct),
+            ("low", 4 * c * d.lowrank),
+            ("sil", 4 * c * d.lowrank),
         ];
         let attn_set: Vec<(&'static str, usize)> = vec![
-            ("qg", 4 * c * Q_ROWS),
-            ("aq", 4 * c * CORE),
-            ("agate", 4 * c * CORE),
-            ("aqn", 4 * c * CORE),
-            ("aqr", 4 * c * CORE),
-            ("ak", 4 * c * KV_ROWS),
-            ("akn", 4 * c * KV_ROWS),
-            ("akr", 4 * c * KV_ROWS),
-            ("av", 4 * c * KV_ROWS),
-            ("aout", 4 * c * CORE),
-            ("agated", 4 * c * CORE),
-            ("ay", 4 * c * H),
-            ("qk", 4 * c * QSA_QK_ROWS),
-            ("q_nrm", 4 * c * QSA_HEADS * QSA_HD),
-            ("q_rot", 4 * c * QSA_HEADS * QSA_HD),
-            ("sel", c * QSA_SEL_MAX * 4),
+            ("qg", 4 * c * d.q_rows),
+            ("aq", 4 * c * d.core),
+            ("agate", 4 * c * d.core),
+            ("aqn", 4 * c * d.core),
+            ("aqr", 4 * c * d.core),
+            ("ak", 4 * c * d.kv_rows),
+            ("akn", 4 * c * d.kv_rows),
+            ("akr", 4 * c * d.kv_rows),
+            ("av", 4 * c * d.kv_rows),
+            ("aout", 4 * c * d.core),
+            ("agated", 4 * c * d.core),
+            ("ay", 4 * c * d.h),
+            ("qk", 4 * c * d.qsa_qk_rows),
+            ("q_nrm", 4 * c * d.qsa_heads * d.qsa_hd),
+            ("q_rot", 4 * c * d.qsa_heads * d.qsa_hd),
+            ("sel", c * d.qsa_sel_max * 4),
             ("sel_n", c * 4),
         ];
         let gdn_set: Vec<(&'static str, usize)> = vec![
-            ("mq", 4 * c * GDN_CONV),
-            ("mq_t", 4 * GDN_CONV * c),
-            ("cout_t", 4 * GDN_CONV * c),
-            ("gq", 4 * c * GDN_KEY),
-            ("gk", 4 * c * GDN_KEY),
-            ("gv", 4 * c * GDN_VAL),
-            ("gz", 4 * c * GDN_VAL),
-            ("gb", 4 * c * GDN_VHEADS),
-            ("ga", 4 * c * GDN_VHEADS),
-            ("gbeta", 4 * c * GDN_VHEADS),
-            ("gg", 4 * c * GDN_VHEADS),
-            ("gqr", 4 * c * GDN_VAL),
-            ("gkr", 4 * c * GDN_VAL),
-            ("gcore", 4 * c * GDN_VAL),
-            ("gnorm", 4 * c * GDN_VAL),
-            ("gout", 4 * c * H),
+            ("mq", 4 * c * d.gdn_conv),
+            ("mq_t", 4 * d.gdn_conv * c),
+            ("cout_t", 4 * d.gdn_conv * c),
+            ("gq", 4 * c * d.gdn_key),
+            ("gk", 4 * c * d.gdn_key),
+            ("gv", 4 * c * d.gdn_val),
+            ("gz", 4 * c * d.gdn_val),
+            ("gb", 4 * c * d.gdn_vheads),
+            ("ga", 4 * c * d.gdn_vheads),
+            ("gbeta", 4 * c * d.gdn_vheads),
+            ("gg", 4 * c * d.gdn_vheads),
+            ("gqr", 4 * c * d.gdn_val),
+            ("gkr", 4 * c * d.gdn_val),
+            ("gcore", 4 * c * d.gdn_val),
+            ("gnorm", 4 * c * d.gdn_val),
+            ("gout", 4 * c * d.h),
         ];
         let ple_set: Vec<(&'static str, usize)> = vec![
-            ("emb", 4 * c * PLE_EMBED),
-            ("ple_key", 4 * c * HCT),
-            ("ple_kn", 4 * c * HCT),
-            ("ple_val", 4 * c * PLE_EMBED),
-            ("ple_qn", 4 * c * HCT),
-            ("ple_gate", 4 * c * HCN),
-            ("ple_gs", 4 * c * HCN),
-            ("ple_gated", 4 * c * HCT),
-            ("ple_gn", 4 * c * HCT),
-            ("ple_out", 4 * c * HCT),
-            ("ple_slots", c * PLE_NHEADS * 4),
-            ("xq_e", c * xq_row_bytes(H / 64)),
+            ("emb", 4 * c * d.ple_embed),
+            ("ple_key", 4 * c * d.hct),
+            ("ple_kn", 4 * c * d.hct),
+            ("ple_val", 4 * c * d.ple_embed),
+            ("ple_qn", 4 * c * d.hct),
+            ("ple_gate", 4 * c * d.hcn),
+            ("ple_gs", 4 * c * d.hcn),
+            ("ple_gated", 4 * c * d.hct),
+            ("ple_gn", 4 * c * d.hct),
+            ("ple_out", 4 * c * d.hct),
+            ("ple_slots", c * d.ple_nheads * 4),
+            ("xq_e", c * xq_row_bytes(d.h / 64)),
         ];
         let moe_set: Vec<(&'static str, usize)> = vec![
-            ("h1", 4 * c * TOPK * 2 * INTER),
-            ("h2", 4 * c * TOPK * INTER),
-            ("eo", 4 * c * TOPK * H),
-            ("xq_dn", c * TOPK * xq_row_bytes(INTER / 64)),
-            ("xq_s", c * xq_row_bytes(INTER / 64)),
-            ("sh12", 4 * c * 2 * INTER),
-            ("sh2", 4 * c * INTER),
-            ("sdown", 4 * c * H),
+            ("h1", 4 * c * d.topk * 2 * d.inter),
+            ("h2", 4 * c * d.topk * d.inter),
+            ("eo", 4 * c * d.topk * d.h),
+            ("xq_dn", c * d.topk * xq_row_bytes(d.inter / 64)),
+            ("xq_s", c * xq_row_bytes(d.inter / 64)),
+            ("sh12", 4 * c * 2 * d.inter),
+            ("sh2", 4 * c * d.inter),
+            ("sdown", 4 * c * d.h),
             ("sgv", 4 * c),
-            ("rlog", 4 * c * E),
-            ("rids", c * TOPK * 4),
-            ("rwts", 4 * c * TOPK),
-            ("gu_ptrs", c * TOPK * 8),
-            ("dn_ptrs", c * TOPK * 8),
+            ("rlog", 4 * c * d.e),
+            ("rids", c * d.topk * 4),
+            ("rwts", 4 * c * d.topk),
+            ("gu_ptrs", c * d.topk * 8),
+            ("dn_ptrs", c * d.topk * 8),
             ("cold", c * 4),
         ];
         [persist_set, hc_set, attn_set, gdn_set, ple_set, moe_set]
     }
 
     /// #117: (persist region, union region) bytes at chunk `c`, as `alloc` takes them
-    pub fn diet_region_bytes(c: usize) -> (usize, usize) {
+    pub fn diet_region_bytes(d: &Dims, c: usize) -> (usize, usize) {
         let region_bytes = |set: &[(&str, usize)]| -> usize {
             set.iter().map(|&(_, n)| (n + 255) & !255).sum()
         };
-        let [pe, hc, at, gd, pl, mo] = Self::diet_sets(c);
+        let [pe, hc, at, gd, pl, mo] = Self::diet_sets(d, c);
         let union = [&hc, &at, &gd, &pl, &mo].iter().map(|set| region_bytes(set)).max().unwrap();
         (region_bytes(&pe), union)
     }
@@ -2291,20 +2306,20 @@ impl Scratch {
     /// which lifts the F52 planner wall at chunk 4096 without touching the
     /// 46.5 GiB host pinned budget (robin's standing no) and funds the
     /// second chunk's activation scratch for the two-chunk wavefront.
-    pub unsafe fn alloc(chunk: usize) -> Scratch {
+    pub unsafe fn alloc(d: &Dims, chunk: usize) -> Scratch {
         let c = chunk;
         let cap_blocks = 65536usize; // pooled/score cap at the 262k ceiling
         // (name, bytes) sets; the byte counts are EXACTLY the old per-buffer
         // d()/db() calls (d = n*4 for the f32/i32 buffers, db = n for the
         // byte buffers), so every buffer keeps its old shape.
-        let [persist_set, hc_set, attn_set, gdn_set, ple_set, moe_set] = Self::diet_sets(c);
+        let [persist_set, hc_set, attn_set, gdn_set, ple_set, moe_set] = Self::diet_sets(d, c);
         let region_bytes = |set: &[(&str, usize)]| -> usize {
             set.iter().map(|&(_, n)| (n + 255) & !255).sum()
         };
         let union_bytes = [&hc_set, &attn_set, &gdn_set, &ple_set, &moe_set]
             .iter().map(|set| region_bytes(set)).max().unwrap();
         let persist_bytes = region_bytes(&persist_set);
-        debug_assert_eq!((persist_bytes, union_bytes), Self::diet_region_bytes(c));
+        debug_assert_eq!((persist_bytes, union_bytes), Self::diet_region_bytes(d, c));
         // lay one set out from base at 256 B alignment, return the pointers
         let alloc_set = |base: Dev, set: &[(&str, usize)]| -> Vec<Dev> {
             let mut off = 0usize;
@@ -2350,14 +2365,14 @@ impl Scratch {
             rids: mo[10], rwts: mo[11], gu_ptrs: mo[12], dn_ptrs: mo[13], cold: mo[14],
             // fixed size, never chunk scaled (the #16 caps)
             // #117: lendable, per-chunk QSA temps (pooled/normed/rotated keys, scores)
-            pool_raw: cuda::alloc_lendable("the QSA pool_raw scratch", cap_blocks * QSA_HID),
-            pool_nrm: cuda::alloc_lendable("the QSA pool_nrm scratch", cap_blocks * QSA_HID),
-            pool_rot: cuda::alloc_lendable("the QSA pool_rot scratch", cap_blocks * QSA_HID),
+            pool_raw: cuda::alloc_lendable("the QSA pool_raw scratch", cap_blocks * d.qsa_hidd),
+            pool_nrm: cuda::alloc_lendable("the QSA pool_nrm scratch", cap_blocks * d.qsa_hidd),
+            pool_rot: cuda::alloc_lendable("the QSA pool_rot scratch", cap_blocks * d.qsa_hidd),
             scores: cuda::alloc_lendable("the QSA scores scratch", attn_sb(c) * cap_blocks * 4),
-            part_o: cuda::alloc_zeroed(NQ * ATTN_SPLITS_MAX * AHD * 4),
-            part_ml: cuda::alloc_zeroed(NQ * ATTN_SPLITS_MAX * 2 * 4),
+            part_o: cuda::alloc_zeroed(d.nq * ATTN_SPLITS_MAX * d.ahd * 4),
+            part_ml: cuda::alloc_zeroed(d.nq * ATTN_SPLITS_MAX * 2 * 4),
             qsa_h1: cuda::alloc_zeroed(QSA_PAR_BINS * 4),
-            logits: cuda::alloc_zeroed(V * 4),
+            logits: cuda::alloc_zeroed(d.v * 4),
             argmax: cuda::alloc_zeroed(4),
             scratch_gn: cuda::alloc_zeroed(4),
             persist_region,
@@ -2368,7 +2383,6 @@ impl Scratch {
     }
 }
 
-pub const QSA_HID: usize = QSA_HIDD;
 
 impl Engine {
     // (kc, vc, qsa_keys, qsa_pooled) device addresses of a layer's caches
@@ -2817,7 +2831,7 @@ impl Engine {
                 s.scores as u64, p.ncb as u64 + (t0 * 4) as u64, sel_i, sel_n_i, p.k_top as u64,
                 p.cap as u64, p.n_selmax as u64, p.pos_row as u64 + (t0 * 4) as u64]);
             step!("launch #18");
-            launch_v(k.f(attn_sel_name()), attn_sel_gx_bx().0, tb as u32, 1, attn_sel_gx_bx().1, &[
+            launch_v(k.f(attn_sel_name()), attn_sel_gx_bx(&self.d).0, tb as u32, 1, attn_sel_gx_bx(&self.d).1, &[
                 s.aqr as u64 + (t0 * CORE * 4) as u64, kc, vc, sel_i, sel_n_i, p.tmax as u64, p.mode as u64,
                 p.n_selmax as u64, s.aout as u64 + (t0 * CORE * 4) as u64]);
         }
@@ -2981,7 +2995,7 @@ impl Engine {
             launch_v(k.f("attn_merge"), NQ as u32, 1, 1, AHD as u32, &[
                 s.part_o as u64, s.part_ml as u64, s.aout as u64, p.n_splits as u64]);
         } else {
-            launch_v(k.f(attn_sel_name()), attn_sel_gx_bx().0, 1, 1, attn_sel_gx_bx().1, &[
+            launch_v(k.f(attn_sel_name()), attn_sel_gx_bx(&self.d).0, 1, 1, attn_sel_gx_bx(&self.d).1, &[
                 s.aqr as u64, kc, vc, s.sel as u64, s.sel_n as u64, p.tmax as u64, p.mode as u64,
                 p.n_selmax as u64, s.aout as u64]);
         }
@@ -4502,7 +4516,8 @@ impl Engine {
         let counts = self.drain_sel_counts();
         self.adapt_base = counts.concat();
         self.adapt_ema = vec![0.0; LAYERS * E];
-        with_nblk(|nblk_gu, nblk_dn| {
+        let d = self.d;
+        with_nblk(&d, |nblk_gu, nblk_dn| {
             let mut total = 0usize;
             let none = std::collections::HashSet::new();
             for l in 0..LAYERS {
@@ -4567,7 +4582,8 @@ impl Engine {
             return 0;
         }
         self.decay_window();
-        with_nblk(|nblk_gu, nblk_dn| {
+        let d = self.d;
+        with_nblk(&d, |nblk_gu, nblk_dn| {
             let mut total = 0usize;
             let none = std::collections::HashSet::new();
             // #17: CROW_SWAP_BUNDLE=1 exchanges all pairs of the tick in one launch per
