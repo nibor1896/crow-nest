@@ -74,6 +74,7 @@ grep ' selftest/' SHA256SUMS | sha256sum -c -
 
 - The index is a trailer, not a header: the payload streams to disk without knowing the index size up front, so the model is never held in RAM (`main.rs:5-7`).
 - Tensor offsets in the index are relative to blob start (`main.rs:58`).
+- This container's index is version 1. Since 2026-09-26 (Crow #300 C6) the converter writes an index version 2 that carries the checkpoint's `config.json` and `generation_config.json` verbatim, and the engine accepts a version 1 index only for this container, recognised by the sha256 of its index trailer, `a21afc43203d983e46be5dd378ac5fb34581ab31fb5a0f6e8093d4730078c4ba` (engine `docs/architecture.md` 1.7). The container itself is unchanged.
 
 ### NVFP4 geometry
 

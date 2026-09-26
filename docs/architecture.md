@@ -157,6 +157,110 @@ ModelOpt's `--calib_all_experts` idea with real traffic instead of synthetic sam
   VRAM; the hard hot-set ceiling drops from ~177 to ~169 experts/layer (default 160
   unchanged, loader auto-clamps).
 
+### 1.7 Container index v2 and the per-model recipe (Crow #300 phase 1, C6, 2026-09-26)
+
+<!-- C6 section: added on branch c6-converter-index; self-contained for the C7 merge -->
+
+The container layout of 1.2 is unchanged: magic `CNQ1`, 8 reserved bytes, the streamed
+payload, the index JSON as a trailer, the `u64` LE index length. What changed is the index,
+and which indexes the engine accepts.
+
+**Index v2** (`converter/src/main.rs` `index_v2`, `converter/src/recipe.rs`):
+
+| key | content |
+|---|---|
+| `format` | `crow-nest-quant`, as in v1 |
+| `format_version` | `2`. Replaces v1's `version: 1`; its presence is what makes an index v2 |
+| `recipe` | the family row that decided every tensor's dtype: `cnq4.5-flash-next` or `cnq4.5-qwen35-dense` |
+| `scales` | the sub-block scale policy, `ceil` or `mse` |
+| `model.family` | the engine's family name (`meta::Family`): `FlashNext` or `Qwen35Dense` |
+| `model.model_type` | `text_config.model_type` of the config |
+| `model.config_json`, `model.generation_config_json` | the checkpoint's two files **verbatim**, as JSON strings: a string survives the round trip byte for byte, a re-serialized object would not (key order, number format, whitespace) |
+| `model.config_json_sha256`, `model.generation_config_json_sha256` | the sha256 of those bytes; the engine refuses a v2 whose stored config no longer hashes to it |
+| `model.geo` | the converter's derived geometry (hidden, layers, attention and GDN layer counts, heads, GQA, FFN, vocab, vision widths). Informational: the engine derives its own `Geo` from `config_json` |
+| `model.source.repo`, `model.source.revision` | the Hugging Face repo (`--source-repo`, required) and revision (`--revision`, else the `hf download --local-dir` cache, `.cache/huggingface/trees/<revision>.json`) |
+| `model.source.shards[]` | per source shard: `file`, `size`, `sha256`, `sha256_from` = `hf-lfs` (the LFS sha256 Hugging Face recorded, taken when its size equals the file on disk) or `computed` (hashed during the conversion) |
+| `block_geometry`, `blob_offset`, `tensors` | unchanged from v1 |
+| `sections` | only the sections the container has (a dense model has no `ple`) |
+
+New tensor dtype `f32` (4 B per value, raw LE): the dense recipe's `A_log`, widened exactly
+from the BF16 source. `Cnq::byte_len` and `Cnq::read_f32` know it.
+
+**The v1 rule** (robin, 2026-09-25: the old container stays unchanged). A v1 index carries no
+model block. `engine/src/cnq.rs` accepts one only when the sha256 of its index trailer (the
+`index_len` JSON bytes, without the length word) equals `CNQ45M_INDEX_SHA256` =
+`a21afc43203d983e46be5dd378ac5fb34581ab31fb5a0f6e8093d4730078c4ba` (473,528 B), the trailer of
+`Qwen3.8-Flash-Next-CNQ4.5-M.cnq` (104,727,179,972 B), computed 2026-09-26 by `Cnq::open` on
+the real file and independently with `tail -c 473536 | head -c 473528 | sha256sum`. Any other
+v1 index is refused at `Cnq::open`: "CNQ index v1 is only accepted for the Flash-Next CNQ4.5-M
+container of record", with both hashes. An unknown `format_version`, a v2 without a model
+block and a v2 with an altered config are refused by name too. Overlay containers (#77, #79)
+keep their v1 index: they are read by `Cnq::attach_overlay`, which binds them to the base by
+name and byte size (`overlay_refusal`), not by this rule.
+
+**Accessors** (`Cnq`): `index_version()`, `model()`, `config_json()`,
+`generation_config_json()`, `family()` (`FlashNext` for the v1 container of record). For the
+v1 container `config_json()` is `None` and the boot keeps reading the config from
+`CROW_MODEL_DIR`; for a v2 container the config travels inside it. The boot does not read it
+yet (C7).
+
+**The recipe table.** The family comes from the checkpoint's `config.json`
+(`text_config.model_type`), the key `meta.rs` reads.
+
+| tensor | Flash-Next (`qwen4_exp_text`) | dense Qwen3.5/3.8 (`qwen3_5_text`) |
+|---|---|---|
+| token embedding | BF16 | BF16, host RAM |
+| `lm_head` | BF16 | NVFP4 |
+| MLP `gate/up/down_proj` | routed experts and shared expert NVFP4; router `mlp.gate` and `shared_expert_gate` BF16 | NVFP4 |
+| GDN `in_proj_qkv`, `in_proj_z`, `out_proj` | NVFP4 | NVFP4 |
+| GDN `in_proj_a`, `in_proj_b`, `conv1d` | NVFP4 (see the finding below) | BF16 |
+| attention `q_proj`, `k_proj` | BF16 (the 2026-09-03 amendment) | NVFP4 |
+| attention `v_proj`, `o_proj` | NVFP4 | NVFP4 |
+| norms, `dt_bias`, every 1-D tensor | BF16 | BF16 |
+| `A_log` | BF16 (1-D) | f32 |
+| HC mix `input_mix_weight_down/up` | BF16 | no such tensor |
+| `ple` section (n-gram embedding) | NVFP4 | no such section, refused |
+| `vit` section | the text rules (NVFP4 matrices, BF16 1-D) | BF16 |
+| `mtp` section | the text rules | BF16 |
+| anything else | the catch-all: NVFP4 when a whole number of 64-value blocks, else BF16 | refused by name (the dense row is a whitelist) |
+
+- The Flash-Next row is the pre-C6 keep set verbatim; `recipe::tests` proves it against all
+  1658 tensors of the CNQ4.5-M index (`converter/tests/fixtures/cnq45m-index.tsv`).
+- **Latent finding, recorded, Flash-Next unchanged.** The Flash-Next row lets
+  `linear_attn.in_proj_a/b` (`[48, 2560]`) and `linear_attn.conv1d` (`[10240, 1, 4]`) fall
+  through to its last rule, and both are multiples of 64, so all three are NVFP4 in CNQ4.5-M
+  (108 tensors, the "rest" group of `converter/group91-manifest.md`). A 64-value block of
+  `conv1d` spans the four taps of 16 channels. ModelOpt disables these quantizers
+  (`default_disabled_quantizers.yaml`); Unsloth stores alpha/beta F16/Q8_0 and conv1d F32. The
+  dense row keeps them BF16.
+- A bf16 keep is the source's raw bytes, so a bf16 decision on an F32 or F16 source is refused
+  by name (before C6 it would have written those bytes under a `bf16` label). Neither
+  checkpoint of record has one.
+- The conversion checks the config against the weights (`embed_tokens` = `[vocab, hidden]`,
+  the text layer count) before it writes anything.
+- `layer-rule-overlay` (#91) takes its arm kinds per family: on a dense base the `ffn_down`
+  arms are `mlp.down_proj`; the base's family comes off its index (v1 = Flash-Next).
+
+**`converter plan <model-dir>`**: the dry run. It reads `model.safetensors.index.json`, the
+shard headers and the two config files, never a payload, and prints the family, the recipe,
+the provenance, the derived geometry, the per-tensor decision table, the per-row summary and
+the byte totals. On `Qwen/Qwen3.8-27B` @ `1d4bf0f2`, 2026-09-26 (computed, not measured):
+
+| part | bytes | GiB |
+|---|---|---|
+| GPU, text NVFP4 (MLP 8.965, GDN in/out 2.900, attention 0.879, `lm_head` 0.666) | 14,399,078,400 | 13.410 |
+| GPU, text keeps: BF16 `in_proj_a/b` 0.044, `conv1d` 0.004, norms 0.001, `dt_bias`; f32 `A_log` | 52,481,536 | 0.049 |
+| host RAM, token embedding BF16 | 2,542,796,800 | 2.368 |
+| optional `mtp`, BF16 | 849,398,784 | 0.791 |
+| optional `vit`, BF16 | 921,460,192 | 0.858 |
+| container payload | 18,765,215,712 | 17.476 |
+
+The first two rows equal the #300 computed budget (13.41 GiB NVFP4 + 0.05 GiB BF16 keeps).
+All 18 shard sha256 come from the HF LFS record; `config.json` sha256 `191e0af2…`,
+`generation_config.json` `e70c136c…`, the same files as the engine's test fixture.
+
+<!-- end of the C6 section -->
+
 ---
 
 ## Section 2 — memory layout: residency, PLE window, three-state manager (APPROVED by robin 2026-09-02)
@@ -3937,7 +4041,9 @@ crate. It may not learn about geometry: what a tensor MEANS is `geo`'s and `gen`
 row fetch takes byte offsets and a row length and knows nothing about n-grams. Since #77 it also
 owns the OVERLAY (`attach_overlay`, `Overlay`, `OverlayReport`, `overlay_refusal`, `kind_of`,
 `parse_tensor_index`): a second CNQ1 container whose tensors `find` returns in preference to the
-base ones, so the shadowing is invisible to every reader above it.
+base ones, so the shadowing is invisible to every reader above it. Since Crow #300 C6 it classifies the index
+at `open` (`classify_index`, `IndexKind`, `ModelBlock`): an index v2 hands back the checkpoint's
+config files verbatim, a v1 index is accepted only for the CNQ4.5-M container of record (1.7).
 
 **`geo.rs`** — the model geometry and the runtime `Config`: the probe-pinned constants and
 their derivation chain, `KvDtype`, `Adapt` with `knobs()`, the two policy functions
