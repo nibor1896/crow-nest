@@ -117,6 +117,22 @@ pub struct MtpW {
     pub a: Dev,     // [C][H] f32 scratch: enorm(embed)
     pub b: Dev,     // [C][H] f32 scratch: hnorm(h)
     pub y: Dev,     // [C][H] f32 scratch: fc_h b
+    pub hin: Dev,   // [C][H] f32: the main hidden rows of one prefill chunk's pairs (step 2a)
+    pub hlast: Dev, // [H] f32: the main hidden of the last prompt row, whose pair waits for the next token
+    pub hist: Dev,  // [MTP_MAX_ROWS][H] f32: the main hidden of each verified row (step 2a)
+}
+
+/// crow-nest #95: at most k = 3 drafts, so a verify pass holds at most 4 rows (8 for margin)
+pub const MTP_MAX_ROWS: usize = 8;
+
+/// crow-nest #95 step 2a: what one speculative greedy run did
+#[derive(Default, Debug, Clone)]
+pub struct MtpStats {
+    pub passes: usize,
+    pub tokens: usize,
+    /// proposed[i] / accepted[i]: drafts at chain position i + 1
+    pub proposed: [usize; MTP_MAX_ROWS],
+    pub accepted: [usize; MTP_MAX_ROWS],
 }
 
 /// Projection weight: NVFP4 (dequant on the fly) or BF16 keep (exact bit
@@ -1208,7 +1224,7 @@ impl Engine {
             let m = load_mtp(cnq, &d, cfg.context, cfg.kv.byte_per_value(), cfg.prompt_chunk);
             log(&format!("MTP head loaded (CROW_MTP=1, crow-nest #95): BF16 weights, own KV cache {:.1} MB, scratch {:.1} MB",
                 (2 * d.nkv * cfg.context * d.ahd * cfg.kv.byte_per_value()) as f64 / 1e6,
-                (3 * 4 * cfg.prompt_chunk * d.h) as f64 / 1e6));
+                (4 * 4 * cfg.prompt_chunk * d.h) as f64 / 1e6));
             Some(m)
         } else {
             None
@@ -1767,6 +1783,9 @@ unsafe fn load_mtp(cnq: &mut Cnq, d: &Dims, context: usize, bpv: usize, chunk: u
         a: cuda::alloc_zeroed(4 * chunk * h),
         b: cuda::alloc_zeroed(4 * chunk * h),
         y: cuda::alloc_zeroed(4 * chunk * h),
+        hin: cuda::alloc_zeroed(4 * chunk * h),
+        hlast: cuda::alloc_zeroed(4 * h),
+        hist: cuda::alloc_zeroed(4 * MTP_MAX_ROWS * h),
     }
 }
 
@@ -4843,9 +4862,114 @@ impl Engine {
             launch_v(self.k.f("argmax_k"), 1, 1, 1, 1024, &[
                 self.s.logits as u64, self.s.argmax as u64, self.p.n_vocab as u64]);
             cuda::sync();
+            // crow-nest #95: the MTP head's KV over this chunk's pairs (after the argmax: it
+            // overwrites `mixed_final`); the chunk's last row waits in `hlast` for its token
+            if self.w.mtp.is_some() {
+                self.mtp_prefill_chunk(chunk, pos_base);
+            }
         }
         let tok = cuda::dtoh_i32(self.s.argmax, 1)[0] as usize;
         tok
+    }
+
+    /// crow-nest #95: the MTP pairs of one prefill chunk (`mixed_final` rows 0..t = the main
+    /// hidden after `model.norm`): (h_{p}, t_{p+1}) for every p whose next token is known,
+    /// the previous chunk's last row first (its hidden waited in `hlast`), then this chunk's
+    /// last hidden into `hlast`. A chunk at position 0 has no waiting row.
+    unsafe fn mtp_prefill_chunk(&self, chunk: &[i64], pos_base: usize) {
+        let m = self.w.mtp.as_ref().expect("checked by the caller");
+        let (t, h) = (chunk.len(), self.d.h);
+        let mut next: Vec<i64> = Vec::with_capacity(t);
+        let mut row = 0usize;
+        if pos_base > 0 {
+            cuda::d2d_async(m.hin, m.hlast, 4 * h);
+            next.push(chunk[0]);
+            row = 1;
+        }
+        if t > 1 {
+            cuda::d2d_async(m.hin + (4 * row * h) as u64, self.s.mixed_final, 4 * (t - 1) * h);
+            next.extend_from_slice(&chunk[1..]);
+        }
+        cuda::d2d_async(m.hlast, self.s.mixed_final + (4 * (t - 1) * h) as u64, 4 * h);
+        if !next.is_empty() {
+            self.mtp_rows(m.hin, &next, pos_base - row);
+        }
+        cuda::sync();
+    }
+
+    /// the greedy draft of `mixed_final` row `row` through the shared lm_head
+    unsafe fn mtp_argmax_row(&self, row: usize) -> i64 {
+        self.lm_head_row(row);
+        launch_v(self.k.f("argmax_k"), 1, 1, 1, 1024, &[self.s.logits, self.s.argmax, self.p.n_vocab]);
+        cuda::sync();
+        cuda::dtoh_i32(self.s.argmax, 1)[0] as i64
+    }
+
+    /// crow-nest #95 step 2a: greedy speculative decoding with the MTP head, verified ROW BY
+    /// ROW through `decode_step` (no batched verify yet, so no speed-up and no state
+    /// rollback: the verify stops at the first draft the main model does not produce). The
+    /// output is therefore the plain greedy output by construction; what this measures is the
+    /// head's acceptance inside the engine. `first` is the token the prefill produced; returns
+    /// `n` generated tokens (`first` included) and the draft counters.
+    ///
+    /// # Safety
+    ///
+    /// As `decode_step`; the prompt was prefilled with the MTP head loaded.
+    pub unsafe fn mtp_spec_greedy(&mut self, cnq: &mut Cnq, first: i64, n: usize, k: usize) -> (Vec<i64>, MtpStats) {
+        assert!((1..MTP_MAX_ROWS).contains(&k), "k in 1..{MTP_MAX_ROWS}");
+        let (hlast, hist, h) = {
+            let m = self.w.mtp.as_ref().expect("mtp_spec_greedy without the MTP head (CROW_MTP=1)");
+            (m.hlast, m.hist, self.d.h)
+        };
+        let mut st = MtpStats::default();
+        let mut out = vec![first];
+        let mut x = first;
+        // the pair (h_{pos-1}, x) drafts the first token after x
+        self.mtp_rows(hlast, &[x], self.pos - 1);
+        let mut d1 = self.mtp_argmax_row(0);
+        let mut last_row = 0usize;
+        while out.len() < n {
+            let pos = self.pos;
+            // the chain: pair (MTP output, draft) at MTP position pos + j - 2
+            let mut drafts = vec![d1];
+            for j in 2..=k {
+                self.mtp_rows(self.s.mixed_final + (4 * last_row * h) as u64, &[drafts[j - 2]], pos + j - 2);
+                drafts.push(self.mtp_argmax_row(0));
+                last_row = 0;
+            }
+            st.passes += 1;
+            let mut ys: Vec<i64> = Vec::with_capacity(k + 1);
+            // row i verifies drafts[i - 1]; the last row (i = k) has no draft left to check
+            let mut xi = x;
+            let mut i = 0usize;
+            loop {
+                let y = self.decode_step(cnq, xi) as i64;
+                cuda::d2d_async(hist + (4 * i * h) as u64, self.s.mixed_final, 4 * h);
+                ys.push(y);
+                out.push(y);
+                let Some(&d) = drafts.get(i) else { break };
+                st.proposed[i] += 1;
+                if y != d {
+                    break;
+                }
+                st.accepted[i] += 1;
+                xi = d;
+                i += 1;
+                if out.len() >= n {
+                    break;
+                }
+            }
+            cuda::sync();
+            // the MTP catch-up over the verified rows: pairs (h_{pos+i}, y_i); its last row is
+            // the pair (h_{pos'-1}, x') of the next pass, so its output is the next d1
+            self.mtp_rows(hist, &ys, pos);
+            last_row = ys.len() - 1;
+            d1 = self.mtp_argmax_row(last_row);
+            x = *ys.last().unwrap();
+        }
+        out.truncate(n);
+        st.tokens = out.len();
+        (out, st)
     }
 
     /// single decode step; returns the greedy token. Host touches: embedding
@@ -5765,7 +5889,7 @@ impl Drop for Weights {
                     cuda::free_dev(qn);
                     cuda::free_dev(kn);
                 }
-                for dv in [&mut m.enorm, &mut m.hnorm, &mut m.norm, &mut m.ln1, &mut m.ln2, &mut m.kc, &mut m.vc, &mut m.a, &mut m.b, &mut m.y] {
+                for dv in [&mut m.enorm, &mut m.hnorm, &mut m.norm, &mut m.ln1, &mut m.ln2, &mut m.kc, &mut m.vc, &mut m.a, &mut m.b, &mut m.y, &mut m.hin, &mut m.hlast, &mut m.hist] {
                     cuda::free_dev(dv);
                 }
             }

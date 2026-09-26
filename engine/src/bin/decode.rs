@@ -557,6 +557,41 @@ fn main() {
                     "layercheck3 stepwise: max_abs={s_max:.4} rel_L2={s_rel:.4} NaN={s_nan} (batched==stepped pin, p11/p12 pattern)"
                 );
             }
+            "mtpspec" => {
+                // crow-nest #95 step 2a: greedy with the MTP head (verified row by row) against
+                // plain greedy on the same engine: the token ids must be identical (PREREG C2)
+                // and the draft counters give the head's acceptance inside the engine.
+                // mtpspec <ids.json> [n = 128] [k = 3]; needs CROW_MTP=1.
+                let ids = read_ids(&args[2]);
+                let n: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(128);
+                let k: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(3);
+                crow_nest_engine::geo::apply_chunk_policy(&mut cfg, ids.len());
+                let mut eng = Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
+                let first = eng.prefill(&mut cnq, &ids, None) as i64;
+                let t0 = std::time::Instant::now();
+                let mut plain = vec![first];
+                while plain.len() < n {
+                    let y = eng.decode_step(&mut cnq, *plain.last().unwrap()) as i64;
+                    plain.push(y);
+                }
+                let plain_s = t0.elapsed().as_secs_f64();
+                eng.reset_to_zero();
+                let first2 = eng.prefill(&mut cnq, &ids, None) as i64;
+                assert_eq!(first, first2, "the prefill is deterministic");
+                let t1 = std::time::Instant::now();
+                let (spec, st) = eng.mtp_spec_greedy(&mut cnq, first2, n, k);
+                let spec_s = t1.elapsed().as_secs_f64();
+                let diverge = plain.iter().zip(&spec).position(|(a, b)| a != b);
+                println!("mtpspec: {} prompt tokens, {n} generated, k {k}", ids.len());
+                println!("mtpspec: C2 greedy ids identical: {}{}", diverge.is_none(),
+                    diverge.map(|i| format!(" (first difference at token {i}: plain {} spec {})", plain[i], spec[i])).unwrap_or_default());
+                let acc: Vec<String> = (0..k).map(|i| format!("{:.3} ({}/{})", st.accepted[i] as f64 / st.proposed[i].max(1) as f64, st.accepted[i], st.proposed[i])).collect();
+                println!("mtpspec: passes {}, tokens per pass {:.3}, acceptance per chain position [{}]",
+                    st.passes, (st.tokens - 1) as f64 / st.passes.max(1) as f64, acc.join(", "));
+                println!("mtpspec: plain {:.1} tok/s, spec (row-by-row verify, no speed-up by design) {:.1} tok/s",
+                    (n - 1) as f64 / plain_s, (n - 1) as f64 / spec_s);
+                println!("trace-plain: {plain:?}");
+            }
             "mtpgolden" => {
                 // crow-nest #95 step 1 (decode_out/p2-mtp/PREREG.md C1): the MTP head's draft
                 // logits of every pair of <dir>/gen-sequence.json, teacher-forced in one chunk, to
