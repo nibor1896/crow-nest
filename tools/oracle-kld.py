@@ -71,6 +71,7 @@ import argparse
 import array
 import json
 import math
+from fractions import Fraction
 import os
 import sys
 
@@ -170,7 +171,8 @@ def sign_test(diffs, eps=0.0):
         return (pos, neg, tie, 1.0)
     k = min(pos, neg)
     tail = sum(math.comb(n, i) for i in range(k + 1))
-    return (pos, neg, tie, min(1.0, 2.0 * tail / (1 << n)))
+    # exact in rationals: tail / 2**n as a float overflows past n ~ 1,023 (the 3,470-row p2-lh set)
+    return (pos, neg, tie, min(1.0, float(Fraction(2 * tail, 1 << n))))
 
 
 # ------------------------------------------------------------------------------ arm rows

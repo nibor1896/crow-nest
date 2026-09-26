@@ -43,11 +43,17 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 )
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--weights", default="cnq", help="cnq | bf16 | r1 | only-mlp | only-lmhead | only-gdn | only-attn")
+ap.add_argument("--weights", default="cnq", help="cnq | bf16 | r1 | x126 | diag | lh | only-mlp | only-lmhead | only-gdn | only-attn")
+ap.add_argument("--device", default="cpu", help="cpu (the reference of record) | cuda (TF32 off; decode_out/p2-lh check 1)")
+ap.add_argument("--attn", default="eager", help="eager | sdpa")
 ap.add_argument("--threads", type=int, default=int(os.environ.get("ORACLE_THREADS", "16")))
 ap.add_argument("--lm-head-chunk", type=int, default=16384, help="lm_head rows dequantized per step")
 args = ap.parse_args()
 torch.set_num_threads(args.threads)
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.set_float32_matmul_precision("highest")
+dev = torch.device(args.device)
 
 
 def rss_gb():
@@ -64,20 +70,21 @@ T = len(ids)
 assert rows == T - row0, f"logit rows {rows} != processed tokens {T} - row0 {row0}"
 
 tc = text_config()
+tc._attn_implementation = args.attn
 ws = WeightSource(args.weights)
 print(f"qwen35 ref: weights={args.weights} T={T} rows {row0}..{T - 1} prompt_len={seq.get('prompt_len')} ids={ids if T <= 256 else '[' + str(T) + ' ids]'}")
 t_start = time.time()
 
 with torch.no_grad():
     E = f"{LM}embed_tokens.weight"
-    h = torch.stack([ws.rows(E, i, i + 1)[0] for i in ids]).unsqueeze(0)      # [1,T,5120]
-    rotary = Qwen3_5TextRotaryEmbedding(config=tc).float().eval()
-    cos, sin = rotary(h, torch.arange(T).view(1, T))
-    mask = causal_mask(T)
+    h = torch.stack([ws.rows(E, i, i + 1)[0] for i in ids]).unsqueeze(0).to(dev)  # [1,T,5120]
+    rotary = Qwen3_5TextRotaryEmbedding(config=tc).float().eval().to(dev)
+    cos, sin = rotary(h, torch.arange(T, device=dev).view(1, T))
+    mask = causal_mask(T).to(dev) if args.attn == "eager" else None
 
     for i in range(tc.num_hidden_layers):
         t0 = time.time()
-        layer = ws.load(build_meta(Qwen3_5DecoderLayer, tc, i), f"{LM}layers.{i}.")
+        layer = ws.load(build_meta(Qwen3_5DecoderLayer, tc, i), f"{LM}layers.{i}.").to(dev)
         t1 = time.time()
         full = layer.block_type == "full_attention"
         # the GDN takes a 2-D padding mask only; a single unpadded sequence needs none
@@ -88,7 +95,7 @@ with torch.no_grad():
         print(f"  layer {i:2d} {'attn' if full else 'gdn '} load {t1 - t0:5.1f}s run {time.time() - t1:5.2f}s "
               f"|h|max {h.abs().max():9.2f}  peak RSS {rss_gb():.1f} GB", flush=True)
 
-    norm = ws.load(build_meta(Qwen3_5RMSNorm, tc.hidden_size, tc.rms_norm_eps), f"{LM}norm.")
+    norm = ws.load(build_meta(Qwen3_5RMSNorm, tc.hidden_size, tc.rms_norm_eps), f"{LM}norm.").to(dev)
     h = norm(h)[0]                                                           # [T,5120]
     # Crow #300 phase 2: `row0_pos` (decode parity with CROW_PARITY_TAIL) - the engine collected
     # logits for positions row0_pos..T only; the head runs on those rows (8k x 248k f32 = 8 GB)
@@ -97,7 +104,7 @@ with torch.no_grad():
     logits = torch.empty(T - row0, V, dtype=torch.float32)
     for r0 in range(0, V, args.lm_head_chunk):
         r1 = min(V, r0 + args.lm_head_chunk)
-        logits[:, r0:r1] = h @ ws.rows("lm_head.weight", r0, r1).t()
+        logits[:, r0:r1] = (h @ ws.rows("lm_head.weight", r0, r1).to(dev).t()).cpu()
 
 ref = logits.contiguous().numpy()
 ref.astype("<f4").tofile(os.path.join(OUT, "ref-logits.f32"))

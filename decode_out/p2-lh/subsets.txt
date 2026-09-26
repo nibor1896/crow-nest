@@ -1,0 +1,13 @@
+paired gain KLD_CNQ - KLD_arm per subset (mean +- SE), and the arm's own mean
+== code (tf298+t2b): rows 905, CNQ mean 0.5715
+  X126  mean 0.5613 +- 0.0810 | gain +0.0102 +- 0.0505 (+0.2 SE, +1.8 %)
+  DIAG  mean 0.4435 +- 0.0704 | gain +0.1280 +- 0.0547 (+2.3 SE, +22.4 %)
+  LH    mean 0.4622 +- 0.0745 | gain +0.1093 +- 0.0538 (+2.0 SE, +19.1 %)
+== prose (5 books): rows 2565, CNQ mean 0.1910
+  X126  mean 0.1593 +- 0.0058 | gain +0.0317 +- 0.0053 (+6.0 SE, +16.6 %)
+  DIAG  mean 0.1456 +- 0.0057 | gain +0.0454 +- 0.0058 (+7.8 SE, +23.8 %)
+  LH    mean 0.1479 +- 0.0058 | gain +0.0431 +- 0.0056 (+7.6 SE, +22.6 %)
+== all: rows 3470, CNQ mean 0.2903
+  X126  mean 0.2642 +- 0.0217 | gain +0.0261 +- 0.0137 (+1.9 SE, +9.0 %)
+  DIAG  mean 0.2233 +- 0.0190 | gain +0.0670 +- 0.0149 (+4.5 SE, +23.1 %)
+  LH    mean 0.2299 +- 0.0200 | gain +0.0604 +- 0.0146 (+4.1 SE, +20.8 %)

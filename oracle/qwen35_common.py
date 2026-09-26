@@ -73,10 +73,35 @@ def fp8_per_tensor(w):
     return (w / s).to(torch.float8_e4m3fn).to(torch.float32) * s
 
 
+# calibrated-scale arms (decode_out/p2-lh/PREREG.md): every NVFP4 tensor of the container
+# re-quantized from the BF16 originals by nvfp4_sim.search with this objective, the rest as CNQ
+SIM_KINDS = ("x126", "diag", "lh")
+# the NVFP4 projection -> its calibration statistic (calib_qwen35_stats.py GROUP_OF)
+_SIM_GROUP = re.compile(r"layers\.(\d+)\.(self_attn\.(q|k|v|o)_proj|linear_attn\.(in_proj_qkv|in_proj_z|out_proj)|mlp\.(gate|up|down)_proj)\.weight$")
+_GROUP_OF = {"q": "attn_in", "k": "attn_in", "v": "attn_in", "o": "o_in", "in_proj_qkv": "gdn_in",
+             "in_proj_z": "gdn_in", "out_proj": "gdn_out_in", "gate": "mlp_in", "up": "mlp_in", "down": "down_in"}
+
+
+def stat_key(name):
+    if name == "lm_head.weight":
+        return "head_in"
+    m = _SIM_GROUP.search(name)
+    assert m, f"no calibration statistic for {name}"
+    return f"layers.{m.group(1)}.{_GROUP_OF[m.group(3) or m.group(4) or m.group(5)]}"
+
+
 class WeightSource:
     def __init__(self, kind, cnq_path=CNQ_PATH, model_dir=MODEL_DIR):
-        assert kind in ("cnq", "bf16", "r1") or (kind.startswith("only-") and kind[5:] in GROUPS), kind
+        assert kind in ("cnq", "bf16", "r1") or kind in SIM_KINDS or (kind.startswith("only-") and kind[5:] in GROUPS), kind
         self.kind = kind
+        if kind in SIM_KINDS:
+            self.cnq_src = WeightSource("cnq", cnq_path, model_dir)
+            self.bf16_src = WeightSource("bf16", cnq_path, model_dir)
+            self.stats_path = os.environ.get("CROW_LH_STATS", os.path.join(ROOT, "decode_out", "p2-lh", "stats-H.pt"))
+            self.cache = os.environ.get("CROW_LH_CACHE")  # a directory for the searched bytes (tmpfs)
+            self.stats = torch.load(self.stats_path)["H"] if kind != "x126" else None
+            self.path = f"{kind}: bytes searched from {model_dir}, stats {self.stats_path}, rest {cnq_path}"
+            return
         if kind.startswith("only-"):
             self.group = GROUPS[kind[5:]]
             self.cnq_src = WeightSource("cnq", cnq_path, model_dir)
@@ -103,7 +128,45 @@ class WeightSource:
         # touched page of the 54 GB of shards would stay in this process's RSS
         return safe_open(os.path.join(self.model_dir, self.wm[name]), framework="pt", device="cpu")
 
+    def _sim_bytes(self, name):
+        """(bytes [N, K/16] uint8, global scale) of one NVFP4 tensor under this arm, cached"""
+        import nvfp4_sim as ns
+        if getattr(self, "_memo", (None,))[0] == name:  # lm_head is read in row chunks
+            return self._memo[1]
+        fn = None
+        if self.cache:
+            os.makedirs(os.path.join(self.cache, self.kind), exist_ok=True)
+            fn = os.path.join(self.cache, self.kind, name + ".pt")
+            if os.path.exists(fn):
+                d = torch.load(fn)
+                self._memo = (name, (d["bytes"], d["g"]))
+                return d["bytes"], d["g"]
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        w = self.bf16_src.get(name).to(dev)
+        H = None
+        if self.kind != "x126":
+            H = self.stats[stat_key(name)].to(dev)
+            if self.kind == "diag":
+                H = torch.diagonal(H, dim1=1, dim2=2)
+        by, _ = ns.search(w, self.kind, H)
+        g = ns.global_scale(w).cpu()
+        by = by.cpu()
+        del w, H
+        if fn:
+            torch.save({"bytes": by, "g": g}, fn)
+        self._memo = (name, (by, g))
+        return by, g
+
+    def _sim_rows(self, name, r0, r1):
+        import nvfp4_sim as ns
+        by, g = self._sim_bytes(name)
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        w = self.bf16_src.rows(name, r0, r1).to(dev)
+        return ns.dequant_bytes(w, g.to(dev), by[r0:r1].to(dev)).cpu()
+
     def has(self, name):
+        if self.kind in SIM_KINDS:
+            return self.cnq_src.has(name)
         if self.kind == "r1" or self.kind.startswith("only-"):
             return self.cnq_src.has(name)
         return self.cnq.has(name) if self.kind == "cnq" else name in self.wm
@@ -111,6 +174,10 @@ class WeightSource:
     def get(self, name):
         """the whole tensor, f32, in its checkpoint shape"""
         assert self.has(name), f"{self.kind}: missing {name}"
+        if self.kind in SIM_KINDS:
+            if self.cnq_src.dtype_of(name) == "nvfp4":
+                return self._sim_rows(name, 0, self.cnq_src.n_rows(name))
+            return self.cnq_src.get(name)
         if self.kind.startswith("only-"):
             return (self.cnq_src if self.group.search(name) else self.bf16_src).get(name)
         if self.kind == "r1":
@@ -124,6 +191,10 @@ class WeightSource:
 
     def rows(self, name, r0, r1):
         """rows [r0, r1) of a 2-D tensor, f32 — never the whole table"""
+        if self.kind in SIM_KINDS:
+            if self.cnq_src.dtype_of(name) == "nvfp4":
+                return self._sim_rows(name, r0, r1)
+            return self.cnq_src.rows(name, r0, r1)
         if self.kind.startswith("only-"):
             return (self.cnq_src if self.group.search(name) else self.bf16_src).rows(name, r0, r1)
         if self.kind == "r1":
@@ -134,7 +205,7 @@ class WeightSource:
             return f.get_slice(name)[r0:r1].to(torch.float32).clone()
 
     def n_rows(self, name):
-        if self.kind == "r1" or self.kind.startswith("only-"):
+        if self.kind == "r1" or self.kind.startswith("only-") or self.kind in SIM_KINDS:
             return self.cnq_src.n_rows(name)
         if self.kind == "cnq":
             return self.cnq.tensors[name]["shape"][0]
@@ -142,6 +213,8 @@ class WeightSource:
             return f.get_slice(name).get_shape()[0]
 
     def dtype_of(self, name):
+        if self.kind in SIM_KINDS:
+            return self.cnq_src.dtype_of(name)
         if self.kind == "r1":
             return "fp8-sim" if R1_FP8.search(name) else self.cnq_src.dtype_of(name)
         if self.kind == "cnq":
@@ -158,6 +231,9 @@ class WeightSource:
         return module.float().eval()
 
     def provenance(self):
+        if self.kind in SIM_KINDS:
+            return {"weights": f"{self.kind} (NVFP4 bytes searched by nvfp4_sim from the BF16 originals, rest CNQ)",
+                    "stats": self.stats_path, "cnq": self.cnq_src.provenance()}
         if self.kind.startswith("only-"):
             return {"weights": f"{self.kind} (the group from CNQ, the rest BF16)"}
         if self.kind == "r1":

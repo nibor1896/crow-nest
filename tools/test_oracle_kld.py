@@ -272,6 +272,14 @@ class SignTest(unittest.TestCase):
         self.assertLess(p, 1.0)
         self.assertGreater(p, 0.0)
 
+    def test_a_sample_past_a_thousand_rows_does_not_overflow_the_float(self):
+        # Crow #300 p2-lh (2026-09-26): 3,470 rows raised OverflowError in tail / 2**n
+        pos, neg, tie, p = ok.sign_test([1.0] * 2000 + [-1.0] * 1470)
+        self.assertEqual((pos, neg, tie), (2000, 1470, 0))
+        self.assertGreater(p, 0.0)
+        self.assertLess(p, 1e-15)
+        self.assertAlmostEqual(ok.sign_test([1.0] * 1735 + [-1.0] * 1735)[3], 1.0, places=12)
+
 
 class RowRange(unittest.TestCase):
     def test_a_half_open_range(self):
