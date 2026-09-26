@@ -5058,6 +5058,22 @@ Flash-Next's with the SiLU gate (`CN_GATE_ACT`, C4).
   (`manifests/operating-point.json`, 2026-08-21); the bandwidth ceiling of 14.45 GB per token is
   ~124 tok/s. `gemv_nvfp4_w` reaches ~1.0-1.3 TB/s (gate/up 50 MB in 49 us, lm_head 715 MB in
   548 us, profile timings include one launch latency).
+- **The speed round** (step 4). `gemv_nvfp4_w` walks the staged chunk four blocks per warp
+  step, lane l taking the 32-bit word l % 8 (8 values) of block l / 8 and two float4 of x, with
+  the e2m1 and ue4m3 tables in shared memory; `gemv_nvfp4_gu` computes the gate and the up row
+  of one FFN index in one warp (shared x loads) and writes silu(g) * u (no `silu_mul_n`, no
+  up buffer at one token); `add_rms_1k` does the plain residual's add and the pre-norm that
+  follows it in one 1,024-thread launch (the norm after the FFN is the next layer's
+  input_layernorm, after the last layer `model.norm`: `Engine::next_norm`, so the
+  `FinalNorm::Rms` arm after the loops is empty for a plain residual); `gemv_bf16_ba` runs the
+  GDN's two 48-row BF16 keeps (`in_proj_b`, `in_proj_a`) in one launch. Decode 128 tokens,
+  context 191: 17.4 -> 15.0 (word per lane + gate/up) -> 14.05 (add + norm) -> **13.70 ms,
+  73.0 tok/s**; at context 2,128: 14.6 ms (68.5 tok/s), prefill 2,049 tok/s. Greedy trace
+  identical at every step. Tried and dropped (A/B, alternating runs): a register prefetch of
+  the next chunk (15.57 ms, +0.57), two rows per warp for the 5,120-row matrices (15.21, +0.2),
+  split K over 2 / 4 warps per row (15.27 / 15.63). After the round the GEMVs run at
+  ~1.3-1.45 TB/s once the profile's launch latency is taken out; what remains beside them is
+  roughly 900 small kernels per token (the GDN step and the attention sub-steps).
 - **The 0x7F scale byte.** The mxf4nvf4 MMA instruction turns an NVFP4 scale byte 0x7F (the E4M3
   NaN code; the scalar decode reads it as 480) into NaN. The 27B container carries four
   (layers 11 `o_proj`, 17 `in_proj_z`, 17 `down_proj`, 37 `up_proj`), and through the MMA path each

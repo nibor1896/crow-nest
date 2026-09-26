@@ -10,7 +10,7 @@
 //! `dec_e4m3`) as they are; the Flash-Next source stays `prelude + KERNEL_SRC`.
 
 /// the entries of `P2_SRC`, resolved by `Kernels::add_p2` when the family compiles them
-pub const P2_NAMES: &[&str] = &["attn_full_split", "silu_mul_n", "gemv_nvfp4_w"];
+pub const P2_NAMES: &[&str] = &["attn_full_split", "silu_mul_n", "gemv_nvfp4_w", "gemv_nvfp4_gu", "add_rms_1k", "gemv_bf16_ba"];
 
 /// the phase 2 kernel source, appended after `KERNEL_SRC` (`KernelGeo::source`)
 pub const P2_SRC: &str = r#"
@@ -94,47 +94,165 @@ extern "C" __global__ void attn_full_split(const float* __restrict__ q, const un
 // nibble = even value), on the f32 activation row itself: no activation quantization.
 // One warp per row, 8 rows per 256-thread block. Both streams are read the way Flash-Next's
 // gemv_bf16_w reads its BF16 lm_head (1.67 TB/s, profile 2026-09-26): the row, 32 blocks =
-// 1152 B at a time, with 16-byte loads into shared memory; then the warp walks the 32 blocks,
-// lane l taking pack byte l (values 2l, 2l + 1, sub-block l / 8) and the float2 x pair of
-// those two values, so every x load of the warp is 256 contiguous bytes. The first version
-// (one lane per block: 9 four-byte loads at a 36-byte stride, x pairs 256 bytes apart) ran at
-// ~800 GB/s. grid (ceil(rows / 8)), block 256; k_dim % 256 == 0 (a 32-block chunk is then a
-// whole number of 16-byte words).
-extern "C" __global__ void gemv_nvfp4_w(const unsigned char* __restrict__ w, const float* __restrict__ x,
-                                        const float* __restrict__ gs_ptr, float* __restrict__ y,
-                                        const int* __restrict__ k_dim_p, const int* __restrict__ rows_p) {
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    // e2m1() indexes a local array (a local-memory load per nibble); the table lives here
-    __shared__ float lut[16];
-    __shared__ uint4 stage[8][72]; // one 32-block chunk per warp (1152 B)
-    if (threadIdx.x < 16) lut[threadIdx.x] = e2m1(threadIdx.x);
-    __syncthreads();
-    const int row = blockIdx.x * 8 + warp;
-    if (row >= *rows_p) return; // no block-wide barrier below this line
-    const int bpr = *k_dim_p >> 6;
-    const unsigned char* rowb = w + (size_t)row * bpr * 36;
-    const unsigned char* sb = (const unsigned char*)stage[warp];
-    const int sub = lane >> 3;
-    float acc = 0.0f;
+// 1152 B at a time, with 16-byte loads into shared memory; then the warp walks the chunk four
+// blocks per step, lane l taking the 32-bit word l % 8 (8 values, sub-block (l % 8) / 2) of
+// block l / 8 and the two float4 of x under it, so a warp step reads 1 KB of x contiguously.
+// Both tables live in shared memory: e2m1() indexes a local array (a local-memory load per
+// nibble, 232 ms/token in the first build) and ue4m3() is an exp2f per call.
+// History (decode 128 tokens): one lane per block with 4-byte loads ~800 GB/s; one byte per
+// lane (2 values) 20.8 ms/token with the GDN on the old path.
+// NR rows per warp share every x load: gemv_nvfp4_w (NR 1) and gemv_nvfp4_gu (NR 2: the gate
+// and up rows of one dense-FFN index, silu(gate) * up in the epilogue).
+// grid (ceil(rows / 8)), block 256; k_dim % 256 == 0 (a 32-block chunk is then a whole number
+// of 16-byte words and of 4-block steps).
+template <int NR>
+__device__ __forceinline__ void nvfp4_warp_dot(const unsigned char* const (&rowb)[NR], const float* __restrict__ x,
+                                               int bpr, uint4 (*stage)[72], const float* lut, const float* lut8,
+                                               float (&acc)[NR]) {
+    const int lane = threadIdx.x & 31;
+    const int wi = lane & 7, bi = lane >> 3;
+    #pragma unroll
+    for (int r = 0; r < NR; r++) acc[r] = 0.0f;
     for (int b0 = 0; b0 < bpr; b0 += 32) {
         const int nb = min(32, bpr - b0);
         const int nq = nb * 36 / 16;
-        const uint4* src = (const uint4*)(rowb + (size_t)b0 * 36);
-        for (int q = lane; q < nq; q += 32) stage[warp][q] = __ldg(src + q);
+        #pragma unroll
+        for (int r = 0; r < NR; r++) {
+            const uint4* src = (const uint4*)(rowb[r] + (size_t)b0 * 36);
+            for (int q = lane; q < nq; q += 32) stage[r][q] = __ldg(src + q);
+        }
         __syncwarp();
-        const float2* xp = (const float2*)(x + (size_t)b0 * 64) + lane;
-        #pragma unroll 4
-        for (int j = 0; j < nb; j++) {
-            const unsigned int byte = sb[j * 36 + 4 + lane];
-            const float s = ue4m3(sb[j * 36 + sub]);
-            const float2 xv = __ldg(xp + j * 32);
-            acc += (lut[byte & 0xF] * xv.x + lut[byte >> 4] * xv.y) * s;
+        for (int j = bi; j < nb; j += 4) {
+            const float4* xp = (const float4*)(x + (size_t)(b0 + j) * 64 + wi * 8);
+            const float4 xa = __ldg(xp), xb = __ldg(xp + 1);
+            #pragma unroll
+            for (int r = 0; r < NR; r++) {
+                const unsigned char* blk = (const unsigned char*)stage[r] + j * 36;
+                const unsigned int wd = *(const unsigned int*)(blk + 4 + 4 * wi);
+                const float sc = lut8[blk[wi >> 1]];
+                float part = lut[wd & 0xF] * xa.x;
+                part += lut[(wd >> 4) & 0xF] * xa.y;
+                part += lut[(wd >> 8) & 0xF] * xa.z;
+                part += lut[(wd >> 12) & 0xF] * xa.w;
+                part += lut[(wd >> 16) & 0xF] * xb.x;
+                part += lut[(wd >> 20) & 0xF] * xb.y;
+                part += lut[(wd >> 24) & 0xF] * xb.z;
+                part += lut[wd >> 28] * xb.w;
+                acc[r] += part * sc;
+            }
         }
         __syncwarp(); // the next chunk overwrites the stage
     }
     #pragma unroll
+    for (int r = 0; r < NR; r++) {
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) acc[r] += __shfl_down_sync(0xffffffffu, acc[r], o);
+    }
+}
+// the two tables, filled by the first 256 threads (the block is 256)
+#define NVFP4_TABLES                                              \
+    __shared__ float lut[16];                                     \
+    __shared__ float lut8[256];                                   \
+    if (threadIdx.x < 16) lut[threadIdx.x] = e2m1(threadIdx.x);   \
+    lut8[threadIdx.x] = ue4m3(threadIdx.x);                       \
+    __syncthreads();
+extern "C" __global__ void gemv_nvfp4_w(const unsigned char* __restrict__ w, const float* __restrict__ x,
+                                        const float* __restrict__ gs_ptr, float* __restrict__ y,
+                                        const int* __restrict__ k_dim_p, const int* __restrict__ rows_p) {
+    NVFP4_TABLES
+    __shared__ uint4 stage[8][1][72];
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= *rows_p) return; // no block-wide barrier below this line
+    const int bpr = *k_dim_p >> 6;
+    const unsigned char* const rowb[1] = {w + (size_t)row * bpr * 36};
+    float acc[1];
+    nvfp4_warp_dot<1>(rowb, x, bpr, stage[warp], lut, lut8, acc);
+    if ((threadIdx.x & 31) == 0) y[row] = acc[0] * gs_ptr[0];
+}
+// the dense FFN's gate and up rows of index `row` in one warp: y[row] = silu(g) * u with
+// g = gs_g * <gate row, x>, u = gs_u * <up row, x> (HF Qwen3_5MLP), replacing two GEMVs and
+// silu_mul_n at one token
+extern "C" __global__ void gemv_nvfp4_gu(const unsigned char* __restrict__ wg, const unsigned char* __restrict__ wu,
+                                         const float* __restrict__ x, const float* __restrict__ gs_g,
+                                         const float* __restrict__ gs_u, float* __restrict__ y,
+                                         const int* __restrict__ k_dim_p, const int* __restrict__ rows_p) {
+    NVFP4_TABLES
+    __shared__ uint4 stage[8][2][72];
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= *rows_p) return;
+    const int bpr = *k_dim_p >> 6;
+    const unsigned char* const rowb[2] = {wg + (size_t)row * bpr * 36, wu + (size_t)row * bpr * 36};
+    float acc[2];
+    nvfp4_warp_dot<2>(rowb, x, bpr, stage[warp], lut, lut8, acc);
+    if ((threadIdx.x & 31) == 0) {
+        const float g = acc[0] * gs_g[0];
+        y[row] = (g / (1.0f + expf(-g))) * (acc[1] * gs_u[0]);
+    }
+}
+
+// ---------------- the GDN's two small BF16 projections in one launch ----------------
+// in_proj_b and in_proj_a (48 rows each, BF16 keeps of the dense recipe) over one f32 row:
+// rows 0..n-1 of `wb` into yb, rows n..2n-1 of `wa` into ya, one warp per row with the 16-byte
+// loads of gemv_bf16_w (same per-row math, same order). Two launches of 6 blocks per GDN
+// layer were 96 launches per decode token. grid (ceil(2n / 8)), block 256; k_dim % 256 == 0.
+extern "C" __global__ void gemv_bf16_ba(const unsigned short* __restrict__ wb, const unsigned short* __restrict__ wa,
+                                        const float* __restrict__ x, float* __restrict__ yb, float* __restrict__ ya,
+                                        const int* __restrict__ k_dim_p, const int* __restrict__ n_p) {
+    const int k_dim = *k_dim_p, n = *n_p;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r = blockIdx.x * 8 + warp;
+    if (r >= 2 * n) return;
+    const unsigned short* wp = (r < n) ? wb + (size_t)r * k_dim : wa + (size_t)(r - n) * k_dim;
+    float acc = 0.0f;
+    for (int i = lane * 8; i < k_dim; i += 256) {
+        uint4 v = *(const uint4*)(wp + i);
+        unsigned int u[4] = {v.x, v.y, v.z, v.w};
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float lo = __uint_as_float(u[j] << 16);
+            float hi = __uint_as_float(u[j] & 0xFFFF0000u);
+            acc += lo * x[i + 2 * j] + hi * x[i + 2 * j + 1];
+        }
+    }
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
-    if (lane == 0) y[row] = acc * gs_ptr[0];
+    if (lane == 0) {
+        if (r < n) yb[r] = acc;
+        else ya[r - n] = acc;
+    }
+}
+
+// ---------------- Residual::Plain: the residual add and the next pre-norm ----------------
+// h[row] += y[row] (skipped when y is 0), then out[row] = h * rsqrt(mean(h^2) + eps) * (1 + w),
+// HF Qwen3_5RMSNorm (zero-centred). The plain residual adds every sub-block output and
+// normalizes right after; in one launch that is 128 fewer per decode token (add_flat + rms_group
+// were 257 launches), and 1024 threads per row instead of rms_group's 256.
+// grid (T), block 1024
+extern "C" __global__ void add_rms_1k(float* __restrict__ h, const float* __restrict__ y,
+                                      const float* __restrict__ w, float* __restrict__ out) {
+    __shared__ float red[32];
+    float* hp = h + (size_t)blockIdx.x * CN_H;
+    const float* yp = y ? y + (size_t)blockIdx.x * CN_H : nullptr;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < CN_H; i += 1024) {
+        float v = hp[i];
+        if (yp) {
+            v += yp[i];
+            hp[i] = v;
+        }
+        ss += v * v;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    ss = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) ss += red[i];
+    const float rms = rsqrtf(ss / (float)CN_H + CN_EPS);
+    float* op = out + (size_t)blockIdx.x * CN_H;
+    for (int i = threadIdx.x; i < CN_H; i += 1024) op[i] = hp[i] * rms * (1.0f + w[i]);
 }
 
 // ---------------- Ffn::Dense: the SwiGLU product ----------------

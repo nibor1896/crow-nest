@@ -2809,8 +2809,13 @@ launch_v(k.f("l2norm_repeat"), self.d.gdn_vheads as u32, t as u32, 1, self.d.gd 
         if dense {
             self.dense_proj(qkv, self.d.gdn_conv, p.n_gdn_conv, 1, mixed, s.xq_m, s.mq, p.n2560);
             self.dense_proj(z, self.d.gdn_val, p.n6144, 1, mixed, s.xq_m, s.gz, p.n2560);
-            self.dense_proj(b, self.d.gdn_vheads, p.nr48, 1, mixed, s.xq_m, s.gb, p.n2560);
-            self.dense_proj(a, self.d.gdn_vheads, p.nr48, 1, mixed, s.xq_m, s.ga, p.n2560);
+            if let (PW::Bf16(wb), PW::Bf16(wa)) = (b, a) {
+                // the two 48-row BF16 keeps in one launch
+                launch_v(k.f("gemv_bf16_ba"), (2 * self.d.gdn_vheads).div_ceil(8) as u32, 1, 1, 256, &[*wb, *wa, mixed, s.gb, s.ga, p.n2560, p.nr48]);
+            } else {
+                self.dense_proj(b, self.d.gdn_vheads, p.nr48, 1, mixed, s.xq_m, s.gb, p.n2560);
+                self.dense_proj(a, self.d.gdn_vheads, p.nr48, 1, mixed, s.xq_m, s.ga, p.n2560);
+            }
         } else if mma && in_fp4 {
             if gdn_fuse_in_on() && gdn_split_z_on() {
                 // #71 (62 lever 1): the grouping stays for qkv + b + a
@@ -3278,13 +3283,6 @@ impl Engine {
         self.w.dense.as_ref().expect("a phase 2 arm ran on a family without DenseW (Crow #300)")
     }
 
-    /// Crow #300 phase 2: one zero-centred RMSNorm per row of `[t][H]`, HF `Qwen3_5RMSNorm`
-    /// (`x * rsqrt(mean(x^2) + eps) * (1 + w)`, eps `CN_EPS`). That is `rms_group` with one
-    /// stream (`CN_HCN` = 1 for a plain residual), grid (1, t).
-    unsafe fn rms_rows(&self, x: Dev, w: Dev, out: Dev, t: usize) {
-        launch_v(self.k.f("rms_group"), 1, t as u32, 1, 256, &[x, w, out]);
-    }
-
     /// Crow #300 phase 2: one projection of the dense family over `t` rows of `x` into `y`
     /// (`[t][rows]`). One NVFP4 row (t = 1) takes `gemv_nvfp4_w` on the f32 row. More rows
     /// of an NVFP4 weight under `CROW_MMA=1` take Flash-Next's MMA path
@@ -3320,11 +3318,23 @@ impl Engine {
         }
     }
 
-    /// Crow #300 phase 2: the plain residual add `h += y` over `[t][H]` (`add_flat`; the
-    /// element count is `nt_hct` = t * H, refreshed per chunk and per decode step)
-    unsafe fn residual_add(&self, y: Dev, t: usize) {
-        launch_v(self.k.f("add_flat"), (t * self.d.h).div_ceil(256) as u32, 1, 1, 256, &[
-            y, self.s.h, self.p.nt_hct]);
+    /// Crow #300 phase 2: the plain residual's add and the pre-norm that follows it, one launch.
+    /// Every norm here is zero-centred, HF `Qwen3_5RMSNorm`: `x * rsqrt(mean(x^2) + eps) *
+    /// (1 + w)`, eps `CN_EPS`
+    /// (`add_rms_1k`): `h += y` over `[t][H]` (`y` = 0: no add), then `w` of `h` into `out`
+    unsafe fn add_norm(&self, y: Dev, w: Dev, out: Dev, t: usize) {
+        launch_v(self.k.f("add_rms_1k"), t as u32, 1, 1, 1024, &[self.s.h, y, w, out]);
+    }
+
+    /// the pre-norm after layer `l`'s FFN add: layer `l + 1`'s input_layernorm into `mixed`,
+    /// or after the last layer the final `model.norm` into `mixed_final` (so the
+    /// `FinalNorm::Rms` arm after the loops has nothing left to do for a plain residual)
+    fn next_norm(&self, l: usize) -> (Dev, Dev) {
+        if l + 1 < self.d.layers {
+            (self.dw().ln1[l + 1], self.s.mixed)
+        } else {
+            (self.dw().norm, self.s.mixed_final)
+        }
     }
 
     /// Crow #300 phase 2: `Ffn::Dense`, HF `Qwen3_5MLP`: `down(silu(gate(x)) * up(x))` over
@@ -3333,6 +3343,12 @@ impl Engine {
         let (k, p, s) = (&self.k, &self.p, &self.s);
         let m = &self.dw().mlp[l];
         let inter = self.d.dense_inter;
+        // one token with both NVFP4: gate, up and silu(gate) * up in one warp per index
+        if let (1, PW::Fp4(wg, gg), PW::Fp4(wu, gu)) = (t, &m.gate, &m.up) {
+            launch_v(k.f("gemv_nvfp4_gu"), inter.div_ceil(8) as u32, 1, 1, 256, &[*wg, *wu, x, *gg, *gu, s.dg, p.n2560, p.n_dinter]);
+            self.dense_proj(&m.down, self.d.h, p.n2560, 1, s.dg, s.xq_d, s.moe_out, p.n_dinter);
+            return s.moe_out;
+        }
         self.quant_rows(t, x, s.xq_gu, p.n2560);
         self.dense_proj(&m.gate, inter, p.n_dinter, t, x, s.xq_gu, s.dg, p.n2560);
         self.dense_proj(&m.up, inter, p.n_dinter, t, x, s.xq_gu, s.du, p.n2560);
@@ -4226,7 +4242,9 @@ impl Engine {
         cuda::to_i32_into(self.p.slot1, &[pos_base as i32]);
         let out = match kind {
             "ln1" => {
-                self.rms_rows(self.s.mixed, self.dw().ln1[l], self.s.mixed_m, t);
+                // the production path: the norm of the residual `h` (`add_rms_1k`, no add)
+                cuda::to_f32_into(self.s.h, x_host);
+                self.add_norm(0, self.dw().ln1[l], self.s.mixed_m, t);
                 self.s.mixed_m
             }
             "mlp" => self.dense_ffn(l, self.s.mixed, t),
@@ -4393,7 +4411,9 @@ impl Engine {
                 // C5: the residual arm, attention side (Hc: mix the streams into `mixed`)
                 match self.geo.residual {
                     Residual::Hc { .. } => self.hc_run(&self.w.hc[l], self.s.h, t, mixed, injw),
-                    Residual::Plain => self.rms_rows(self.s.h, self.dw().ln1[l], mixed, t),
+                    // Plain: layer 0 normalizes the embedding; every later layer's input norm ran
+                    // fused with the previous layer's FFN add (`next_norm`)
+                    Residual::Plain => if l == 0 { self.add_norm(0, self.dw().ln1[0], mixed, t) },
                 }
                 let dbg = dbg_sync();
                 if dbg {
@@ -4462,7 +4482,7 @@ impl Engine {
                 match self.geo.residual {
                     Residual::Hc { .. } => launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (t * (self.d.h / 256)) as u32, 1, 256, &[
                         self.s.h as u64, sub as u64, self.s.injw as u64, self.s.x1 as u64]),
-                    Residual::Plain => self.residual_add(sub, t),
+                    Residual::Plain => self.add_norm(sub, self.dw().ln2[l], self.s.mixed_m, t),
                 }
                 if nan_watch && l == 0 {
                     cuda::sync();
@@ -4476,7 +4496,7 @@ impl Engine {
                 // C5: the residual arm, FFN side
                 match self.geo.residual {
                     Residual::Hc { .. } => self.hc_run(&self.w.hc2[l], self.s.x1, t, self.s.mixed_m, self.s.injw),
-                    Residual::Plain => self.rms_rows(self.s.h, self.dw().ln2[l], self.s.mixed_m, t),
+                    Residual::Plain => {} // post_attention_layernorm ran fused with the add above
                 }
                 if nan_watch && l == 0 {
                     cuda::sync();
@@ -4528,7 +4548,10 @@ impl Engine {
                 match self.geo.residual {
                     Residual::Hc { .. } => launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (t * (self.d.h / 256)) as u32, 1, 256, &[
                         self.s.x1 as u64, moe as u64, self.s.injw as u64, self.s.h as u64]),
-                    Residual::Plain => self.residual_add(moe, t),
+                    Residual::Plain => {
+                        let (w, out) = self.next_norm(l);
+                        self.add_norm(moe, w, out, t);
+                    }
                 }
                 // CROW_DUMP_H=<dir>: per-layer residual-stream dump (determinism bisect)
                 if let Some(dir) = dump_h() {
@@ -4574,7 +4597,8 @@ impl Engine {
             // C5: the final-norm arm (HcMixer: the model-level hyper-connection mixer)
             match self.geo.final_norm {
                 FinalNorm::HcMixer => self.head_run(t),
-                FinalNorm::Rms => self.rms_rows(self.s.h, self.dw().norm, self.s.mixed_final, t),
+                // Rms: `model.norm` ran fused with the last layer's add (`next_norm`)
+                FinalNorm::Rms => {}
             }
             if let Some(out) = collect_logits.as_deref_mut() {
                 for i in 0..t {
@@ -4728,7 +4752,7 @@ impl Engine {
             // C5: the residual arm, attention side
             match self.geo.residual {
                 Residual::Hc { .. } => self.hc_run(&self.w.hc[l], self.s.h, 1, self.s.mixed, self.s.injw),
-                Residual::Plain => self.rms_rows(self.s.h, self.dw().ln1[l], self.s.mixed, 1),
+                Residual::Plain => if l == 0 { self.add_norm(0, self.dw().ln1[0], self.s.mixed, 1) },
             }
             let d_hc = t_hc.elapsed().as_micros() as u64;
             if prof {
@@ -4767,10 +4791,7 @@ impl Engine {
                         self.s.h as u64, sub as u64, self.s.injw as u64, self.s.x1 as u64]);
                     self.hc_run(&self.w.hc2[l], self.s.x1, 1, self.s.mixed_m, self.s.injw);
                 }
-                Residual::Plain => {
-                    self.residual_add(sub, 1);
-                    self.rms_rows(self.s.h, self.dw().ln2[l], self.s.mixed_m, 1);
-                }
+                Residual::Plain => self.add_norm(sub, self.dw().ln2[l], self.s.mixed_m, 1),
             }
             let t_moe = std::time::Instant::now();
             let moe = match self.geo.ffn {
@@ -4789,14 +4810,17 @@ impl Engine {
             match self.geo.residual {
                 Residual::Hc { .. } => launch_v(self.k.f("inject_residual"), self.d.hcn as u32, (self.d.h / 256) as u32, 1, 256, &[
                     self.s.x1 as u64, moe as u64, self.s.injw as u64, self.s.h as u64]),
-                Residual::Plain => self.residual_add(moe, 1),
+                Residual::Plain => {
+                    let (w, out) = self.next_norm(l);
+                    self.add_norm(moe, w, out, 1);
+                }
             }
         }
         t_head = std::time::Instant::now();
         // C5: the final-norm arm
         match self.geo.final_norm {
             FinalNorm::HcMixer => self.head_run(1),
-            FinalNorm::Rms => self.rms_rows(self.s.h, self.dw().norm, self.s.mixed_final, 1),
+            FinalNorm::Rms => {} // fused with the last layer's add (`next_norm`)
         }
         self.lm_head_row(0);
         launch_v(self.k.f("argmax_k"), 1, 1, 1, 1024, &[
