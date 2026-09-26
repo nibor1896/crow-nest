@@ -120,6 +120,24 @@ pub struct MtpW {
     pub hin: Dev,   // [C][H] f32: the main hidden rows of one prefill chunk's pairs (step 2a)
     pub hlast: Dev, // [H] f32: the main hidden of the last prompt row, whose pair waits for the next token
     pub hist: Dev,  // [MTP_MAX_ROWS][H] f32: the main hidden of each verified row (step 2a)
+    pub vb: VerifyBufs,
+}
+
+/// crow-nest #95 step 2b: rows of one batched verify (the `gemv_nvfp4_wm` limit, NVFP4_MMAX)
+pub const MTP_VERIFY_MAX: usize = 4;
+
+/// crow-nest #95 step 2b: the device side of a batched verify
+pub struct VerifyBufs {
+    pub logits: Dev, // [MTP_VERIFY_MAX][V] f32
+    pub argmax: Dev, // [MTP_VERIFY_MAX] i32
+    pub pos: Dev,    // [MTP_VERIFY_MAX] i32: the position of each row (the per-row kernels' pos_base / slot)
+    pub m: Dev,      // i32: the row count M of the M-row GEMVs
+    /// per slot j (the state after verify row j, j < M - 1): every GDN layer's recurrent state
+    /// S back to back, then every layer's conv state
+    pub slot_s: Vec<Dev>,
+    pub slot_conv: Vec<Dev>,
+    pub s_bytes: usize,
+    pub conv_bytes: usize,
 }
 
 /// crow-nest #95: at most k = 3 drafts, so a verify pass holds at most 4 rows (8 for margin)
@@ -1221,7 +1239,7 @@ impl Engine {
         }
         let dense = head_rms.map(|(norm, lm_head)| DenseW { ln1, ln2, mlp, norm, lm_head });
         let mtp = if dense.is_some() && mtp_on() {
-            let m = load_mtp(cnq, &d, cfg.context, cfg.kv.byte_per_value(), cfg.prompt_chunk);
+            let m = load_mtp(cnq, &d, &geo, cfg.context, cfg.kv.byte_per_value(), cfg.prompt_chunk);
             log(&format!("MTP head loaded (CROW_MTP=1, crow-nest #95): BF16 weights, own KV cache {:.1} MB, scratch {:.1} MB",
                 (2 * d.nkv * cfg.context * d.ahd * cfg.kv.byte_per_value()) as f64 / 1e6,
                 (4 * 4 * cfg.prompt_chunk * d.h) as f64 / 1e6));
@@ -1744,8 +1762,11 @@ pub fn split_fc_halves(raw: &[u8], h: usize) -> (Vec<u8>, Vec<u8>) {
 /// crow-nest #95: the MTP head from the container's `mtp` section (all BF16 in the dense
 /// recipe), its own KV cache (`context` rows per KV head, `bpv` bytes a value) and three
 /// `[chunk][H]` f32 scratch rows
-unsafe fn load_mtp(cnq: &mut Cnq, d: &Dims, context: usize, bpv: usize, chunk: usize) -> MtpW {
+unsafe fn load_mtp(cnq: &mut Cnq, d: &Dims, geo: &Geo, context: usize, bpv: usize, chunk: usize) -> MtpW {
     let sec = "mtp";
+    let n_gdn = (0..d.layers).filter(|&l| !d.is_attn(l)).count();
+    let s_bytes = 4 * crate::manager::gdn_s_state_len(geo);
+    let conv_bytes = 4 * crate::manager::gdn_conv_state_len(geo);
     let h = d.h;
     let t = cnq.find("mtp.fc.weight", sec).clone();
     assert_eq!(t.dtype, "bf16", "mtp.fc.weight: the dense recipe keeps the MTP head BF16");
@@ -1786,6 +1807,16 @@ unsafe fn load_mtp(cnq: &mut Cnq, d: &Dims, context: usize, bpv: usize, chunk: u
         hin: cuda::alloc_zeroed(4 * chunk * h),
         hlast: cuda::alloc_zeroed(4 * h),
         hist: cuda::alloc_zeroed(4 * MTP_MAX_ROWS * h),
+        vb: VerifyBufs {
+            logits: cuda::alloc_zeroed(4 * MTP_VERIFY_MAX * d.v),
+            argmax: cuda::alloc_zeroed(4 * MTP_VERIFY_MAX),
+            pos: cuda::alloc_zeroed(4 * MTP_VERIFY_MAX),
+            m: cuda::alloc_zeroed(4),
+            slot_s: (0..MTP_VERIFY_MAX - 1).map(|_| cuda::alloc_zeroed(n_gdn * s_bytes)).collect(),
+            slot_conv: (0..MTP_VERIFY_MAX - 1).map(|_| cuda::alloc_zeroed(n_gdn * conv_bytes)).collect(),
+            s_bytes,
+            conv_bytes,
+        },
     }
 }
 
@@ -4905,6 +4936,238 @@ impl Engine {
         cuda::dtoh_i32(self.s.argmax, 1)[0] as i64
     }
 
+    /// crow-nest #95 step 2b: one projection over the verify's `m` rows of `x` (row stride
+    /// `k`) into `y` (row stride `rows`): an NVFP4 weight takes `gemv_nvfp4_wm` (one weight read,
+    /// bit-identical per row to the decode's `gemv_nvfp4_w`), a BF16 weight its decode GEMV once
+    /// per row
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn proj_m(&self, w: &PW, rows: usize, rows_p: Dev, m: usize, x: Dev, y: Dev, k_p: Dev, k: usize) {
+        let vb = &self.w.mtp.as_ref().expect("verify without the MTP head").vb;
+        match w {
+            PW::Fp4(wp, gs) => launch_v(self.k.f("gemv_nvfp4_wm"), rows.div_ceil(8) as u32, 1, 1, 256, &[*wp, x, *gs, y, k_p, rows_p, vb.m]),
+            PW::Bf16(_) => {
+                for i in 0..m {
+                    self.dense_proj(w, rows, rows_p, 1, x + (4 * i * k) as u64, 0, y + (4 * i * rows) as u64, k_p);
+                }
+            }
+        }
+    }
+
+    /// crow-nest #95 step 2b: the GDN sub-block of layer `l` over the verify's `m` rows of
+    /// `s.mixed`: the projections batched, the recurrence row by row with `gdn_step`'s own
+    /// kernels (so each row sees exactly the decode's arithmetic), the state after row j < m-1
+    /// saved to slot j for the rollback. Returns `s.gout` ([m][H]).
+    unsafe fn gdn_verify(&self, l: usize, m: usize) -> Dev {
+        let (k, p, s) = (&self.k, &self.p, &self.s);
+        let vb = &self.w.mtp.as_ref().expect("verify without the MTP head").vb;
+        let gi = self.d.gdn_index(l);
+        let SubW::Gdn { qkv, conv, z, b, a, alog, dt, norm, out } = &self.w.sub[l] else {
+            panic!("layer {l} is not GDN");
+        };
+        let (h, nv) = (self.d.h, self.d.gdn_vheads);
+        self.proj_m(qkv, self.d.gdn_conv, p.n_gdn_conv, m, s.mixed, s.mq, p.n2560, h);
+        self.proj_m(z, self.d.gdn_val, p.n6144, m, s.mixed, s.gz, p.n2560, h);
+        for i in 0..m {
+            let x = s.mixed + (4 * i * h) as u64;
+            let (gb, ga) = (s.gb + (4 * i * nv) as u64, s.ga + (4 * i * nv) as u64);
+            if let (PW::Bf16(wb), PW::Bf16(wa)) = (b, a) {
+                launch_v(k.f("gemv_bf16_ba"), (2 * nv).div_ceil(8) as u32, 1, 1, 256, &[*wb, *wa, x, gb, ga, p.n2560, p.nr48]);
+            } else {
+                self.dense_proj(b, nv, p.nr48, 1, x, 0, gb, p.n2560);
+                self.dense_proj(a, nv, p.nr48, 1, x, 0, ga, p.n2560);
+            }
+        }
+        for i in 0..m {
+            let mq = s.mq + (4 * i * self.d.gdn_conv) as u64;
+            let (gb, ga) = (s.gb + (4 * i * nv) as u64, s.ga + (4 * i * nv) as u64);
+            let gz = s.gz + (4 * i * self.d.gdn_val) as u64;
+            let gnorm = s.gnorm + (4 * i * self.d.gdn_val) as u64;
+            launch_v(k.f("conv_step"), (self.d.gdn_conv as u32).div_ceil(256), 1, 1, 256, &[mq, *conv, self.st.gdn_conv[gi], s.cout_t]);
+            let (q_p, k_p, v_p) = (s.cout_t, s.cout_t + (self.d.gdn_key * 4) as u64, s.cout_t + (2 * self.d.gdn_key * 4) as u64);
+            launch_v(k.f("beta_g"), 1, 1, 1, nv as u32, &[gb, ga, *alog, *dt, s.gbeta, s.gg, p.t]);
+            launch_v(k.f("l2norm_repeat"), nv as u32, 1, 1, self.d.gd as u32, &[q_p, k_p, s.gqr, s.gkr]);
+            launch_v(k.f(if gdn_reg_mode() & 2 != 0 { "delta_rule_step_r" } else { "delta_rule_step" }), nv as u32, 1, 1, self.d.gdv as u32, &[
+                self.st.gdn_s[gi], s.gqr, s.gkr, v_p, s.gg, s.gbeta, s.gcore]);
+            if qfuse_on() {
+                launch_v(k.f("rmsnorm_gated_q"), nv as u32, 1, 1, self.d.gdv as u32, &[s.gcore, gz, *norm, gnorm, s.xq_v]);
+            } else {
+                launch_v(k.f("rmsnorm_gated"), nv as u32, 1, 1, self.d.gdv as u32, &[s.gcore, gz, *norm, gnorm]);
+            }
+            if i + 1 < m {
+                cuda::d2d_async(vb.slot_s[i] + (gi * vb.s_bytes) as u64, self.st.gdn_s[gi], vb.s_bytes);
+                cuda::d2d_async(vb.slot_conv[i] + (gi * vb.conv_bytes) as u64, self.st.gdn_conv[gi], vb.conv_bytes);
+            }
+        }
+        self.proj_m(out, h, p.n2560, m, s.gnorm, s.gout, p.n6144, self.d.gdn_val);
+        s.gout
+    }
+
+    /// crow-nest #95 step 2b: `Attn::Full` of layer `l` over the verify's `m` rows at positions
+    /// `vb.pos[i]`: q / k / v / o batched, everything between row by row with
+    /// `attn_full_step`'s own kernels and launch shapes (row i stores its K / V before it
+    /// attends, so it sees rows 0..=i). Returns `s.ay` ([m][H]).
+    unsafe fn attn_verify(&self, l: usize, m: usize) -> Dev {
+        let (k, p, s) = (&self.k, &self.p, &self.s);
+        let vb = &self.w.mtp.as_ref().expect("verify without the MTP head").vb;
+        let SubW::Attn { q, k: kk, v, o, qn, kn, .. } = &self.w.sub[l] else {
+            panic!("layer {l} is not attention");
+        };
+        assert!(std::env::var("CROW_P2_FA").as_deref() != Ok("0"), "the verify runs the tiled attention only (CROW_P2_FA=0 is an A/B knob of the plain path)");
+        let (kc, vc, _, _) = self.layer_cache_ptrs(l);
+        let (cos, sin) = (self.cos_tbl(), self.sin_tbl());
+        let h = self.d.h;
+        self.proj_m(q, self.d.q_rows, p.n12288, m, s.mixed, s.qg, p.n2560, h);
+        self.proj_m(kk, self.d.kv_rows, p.nr512, m, s.mixed, s.ak, p.n2560, h);
+        self.proj_m(v, self.d.kv_rows, p.nr512, m, s.mixed, s.av, p.n2560, h);
+        for i in 0..m {
+            let pi = vb.pos + (4 * i) as u64;
+            let qg = s.qg + (4 * i * self.d.q_rows) as u64;
+            let ak = s.ak + (4 * i * self.d.kv_rows) as u64;
+            let av = s.av + (4 * i * self.d.kv_rows) as u64;
+            let agated = s.agated + (4 * i * self.d.core) as u64;
+            launch_v(k.f("split_qg"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[qg, s.aq, s.agate]);
+            launch_v(k.f("rmsnorm_1pw"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[s.aq, *qn, s.aqn]);
+            launch_v(k.f("rope_p"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[s.aqn, cos, sin, s.aqr, pi]);
+            launch_v(k.f("rmsnorm_1pw"), self.d.nkv as u32, 1, 1, self.d.ahd as u32, &[ak, *kn, s.akn]);
+            launch_v(k.f("rope_p"), self.d.nkv as u32, 1, 1, self.d.ahd as u32, &[s.akn, cos, sin, s.akr, pi]);
+            launch_v(k.f("store_kv"), (2 * self.d.nkv) as u32, 1, 1, self.d.ahd as u32, &[s.akr, av, kc, vc, pi, p.tmax, p.mode]);
+            launch_v(k.f("attn_full_fa"), self.d.nkv as u32, 1, FA_DECODE_SPLITS as u32, (32 * self.d.nq / self.d.nkv) as u32, &[
+                s.aqr, kc, vc, pi, p.one, p.tmax, p.mode, s.fa_part_o, s.fa_part_ml]);
+            launch_v(k.f("attn_merge"), self.d.nq as u32, 1, 1, self.d.ahd as u32, &[s.fa_part_o, s.fa_part_ml, s.aout, p.n_splits_fa]);
+            launch_v(k.f("gate_mul"), self.d.core.div_ceil(256) as u32, 1, 1, 256, &[s.aout, s.agate, agated]);
+        }
+        self.proj_m(o, h, p.n2560, m, s.agated, s.ay, p.n_core, self.d.core);
+        s.ay
+    }
+
+    /// crow-nest #95 step 2b: the main model over `toks` (the last accepted token and the
+    /// drafts) at positions pos.., ONE weight read per projection for all rows, every row
+    /// bit-identical to a `decode_step` of it (PREREG C2). Leaves the rows' hidden after
+    /// `model.norm` in `mixed_final` rows 0..m, the K / V of all rows in the cache, the GDN state
+    /// after the last row in place and after row j in slot j; returns the greedy token of each
+    /// row. `self.pos` does not move: `mtp_accept` settles it.
+    ///
+    /// # Safety
+    ///
+    /// A CUDA context must be current; the MTP head is loaded; `toks.len()` in 1..=MTP_VERIFY_MAX.
+    pub unsafe fn verify_rows(&self, toks: &[i64]) -> Vec<i64> {
+        let m = toks.len();
+        assert!((1..=MTP_VERIFY_MAX).contains(&m), "verify of {m} rows");
+        let vb = &self.w.mtp.as_ref().expect("verify without the MTP head (CROW_MTP=1)").vb;
+        let (h, p) = (self.d.h, &self.p);
+        let pos = self.pos;
+        cuda::to_i32_into(p.t, &[1]);
+        cuda::to_i32_into(p.init, &[0]);
+        cuda::to_i32_into(vb.m, &[m as i32]);
+        cuda::to_i32_into(vb.pos, &(0..m).map(|i| (pos + i) as i32).collect::<Vec<_>>());
+        let mut e = vec![0f32; m * h];
+        for (i, &id) in toks.iter().enumerate() {
+            let row = &self.w.embed_host[id as usize * h..(id as usize + 1) * h];
+            for (dst, &b) in e[i * h..(i + 1) * h].iter_mut().zip(row) {
+                *dst = f32::from_bits((b as u32) << 16);
+            }
+        }
+        cuda::to_f32_into(self.s.h, &e);
+        for l in 0..self.d.layers {
+            if l == 0 {
+                self.add_norm(0, self.dw().ln1[0], self.s.mixed, m);
+            }
+            let sub = match &self.w.sub[l] {
+                SubW::Gdn { .. } => self.gdn_verify(l, m),
+                SubW::Attn { .. } => self.attn_verify(l, m),
+            };
+            self.add_norm(sub, self.dw().ln2[l], self.s.mixed_m, m);
+            let mw = &self.dw().mlp[l];
+            let (PW::Fp4(wg, gg), PW::Fp4(wu, gu)) = (&mw.gate, &mw.up) else {
+                panic!("the verify's FFN expects NVFP4 gate / up (the dense recipe)");
+            };
+            launch_v(self.k.f("gemv_nvfp4_gum"), self.d.dense_inter.div_ceil(8) as u32, 1, 1, 256, &[
+                *wg, *wu, self.s.mixed_m, *gg, *gu, self.s.dg, p.n2560, p.n_dinter, vb.m]);
+            self.proj_m(&mw.down, h, p.n2560, m, self.s.dg, self.s.moe_out, p.n_dinter, self.d.dense_inter);
+            let (w, out) = self.next_norm(l);
+            self.add_norm(self.s.moe_out, w, out, m);
+        }
+        self.proj_m(&self.dw().lm_head, self.d.v, p.n_vocab, m, self.s.mixed_final, vb.logits, p.n2560, h);
+        for i in 0..m {
+            launch_v(self.k.f("argmax_k"), 1, 1, 1, 1024, &[vb.logits + (4 * i * self.d.v) as u64, vb.argmax + (4 * i) as u64, p.n_vocab]);
+        }
+        cuda::sync();
+        cuda::dtoh_i32(vb.argmax, m).into_iter().map(|t| t as i64).collect()
+    }
+
+    /// crow-nest #95 step 2b: settle a verify of `rows` rows of which the first `keep` are
+    /// accepted (1 <= keep <= rows): the GDN state goes back to slot keep-1 when a row after it
+    /// was rejected; the position and history move by `keep` (K / V rows past them are stale and
+    /// overwritten later: attention reads rows 0..=pos only)
+    ///
+    /// # Safety
+    ///
+    /// Right after `verify_rows` of `rows` rows.
+    pub unsafe fn mtp_accept(&mut self, toks: &[i64], keep: usize) {
+        let rows = toks.len();
+        assert!(keep >= 1 && keep <= rows);
+        if keep < rows {
+            let vb = &self.w.mtp.as_ref().expect("checked").vb;
+            for gi in 0..self.st.gdn_s.len() {
+                cuda::d2d_async(self.st.gdn_s[gi], vb.slot_s[keep - 1] + (gi * vb.s_bytes) as u64, vb.s_bytes);
+                cuda::d2d_async(self.st.gdn_conv[gi], vb.slot_conv[keep - 1] + (gi * vb.conv_bytes) as u64, vb.conv_bytes);
+            }
+        }
+        self.pos += keep;
+        self.history.extend_from_slice(&toks[..keep]);
+    }
+
+    /// crow-nest #95 step 2b: greedy speculative decoding with a BATCHED verify: per pass the
+    /// k drafts of the MTP chain, one `verify_rows` over [x, d1..dk], the longest prefix of
+    /// drafts equal to the main model's own tokens accepted, the GDN state rolled back to it,
+    /// the MTP KV caught up. The output equals plain greedy iff every verify row is bit-identical
+    /// to its decode step (PREREG C2, checked by `decode mtpspec`).
+    ///
+    /// # Safety
+    ///
+    /// As `mtp_spec_greedy`.
+    pub unsafe fn mtp_spec_greedy_batched(&mut self, first: i64, n: usize, k: usize) -> (Vec<i64>, MtpStats) {
+        assert!((1..MTP_VERIFY_MAX).contains(&k), "k in 1..{MTP_VERIFY_MAX}");
+        let (hlast, h) = (self.w.mtp.as_ref().expect("mtp_spec_greedy_batched without the MTP head").hlast, self.d.h);
+        let mut st = MtpStats::default();
+        let mut out = vec![first];
+        let mut x = first;
+        self.mtp_rows(hlast, &[x], self.pos - 1);
+        let mut d1 = self.mtp_argmax_row(0);
+        let mut last_row = 0usize;
+        while out.len() < n {
+            let pos = self.pos;
+            let mut toks = vec![x, d1];
+            for j in 2..=k {
+                self.mtp_rows(self.s.mixed_final + (4 * last_row * h) as u64, &[toks[j - 1]], pos + j - 2);
+                toks.push(self.mtp_argmax_row(0));
+                last_row = 0;
+            }
+            st.passes += 1;
+            let ys = self.verify_rows(&toks);
+            // accept drafts while they equal the main model's token of the row before
+            let mut keep = 1usize;
+            while keep < toks.len() {
+                st.proposed[keep - 1] += 1;
+                if ys[keep - 1] != toks[keep] {
+                    break;
+                }
+                st.accepted[keep - 1] += 1;
+                keep += 1;
+            }
+            self.mtp_accept(&toks, keep);
+            out.extend_from_slice(&ys[..keep]);
+            // the MTP catch-up over the accepted rows: pairs (h_{pos+i}, y_i), i < keep
+            self.mtp_rows(self.s.mixed_final, &ys[..keep], pos);
+            last_row = keep - 1;
+            d1 = self.mtp_argmax_row(last_row);
+            x = ys[keep - 1];
+        }
+        out.truncate(n);
+        st.tokens = out.len();
+        (out, st)
+    }
+
     /// crow-nest #95 step 2a: greedy speculative decoding with the MTP head, verified ROW BY
     /// ROW through `decode_step` (no batched verify yet, so no speed-up and no state
     /// rollback: the verify stops at the first draft the main model does not produce). The
@@ -5889,7 +6152,11 @@ impl Drop for Weights {
                     cuda::free_dev(qn);
                     cuda::free_dev(kn);
                 }
-                for dv in [&mut m.enorm, &mut m.hnorm, &mut m.norm, &mut m.ln1, &mut m.ln2, &mut m.kc, &mut m.vc, &mut m.a, &mut m.b, &mut m.y, &mut m.hin, &mut m.hlast, &mut m.hist] {
+                for dv in [&mut m.enorm, &mut m.hnorm, &mut m.norm, &mut m.ln1, &mut m.ln2, &mut m.kc, &mut m.vc, &mut m.a, &mut m.b, &mut m.y, &mut m.hin, &mut m.hlast, &mut m.hist,
+                    &mut m.vb.logits, &mut m.vb.argmax, &mut m.vb.pos, &mut m.vb.m] {
+                    cuda::free_dev(dv);
+                }
+                for dv in m.vb.slot_s.iter_mut().chain(m.vb.slot_conv.iter_mut()) {
                     cuda::free_dev(dv);
                 }
             }

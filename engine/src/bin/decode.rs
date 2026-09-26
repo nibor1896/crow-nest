@@ -590,6 +590,19 @@ fn main() {
                     st.passes, (st.tokens - 1) as f64 / st.passes.max(1) as f64, acc.join(", "));
                 println!("mtpspec: plain {:.1} tok/s, spec (row-by-row verify, no speed-up by design) {:.1} tok/s",
                     (n - 1) as f64 / plain_s, (n - 1) as f64 / spec_s);
+                // step 2b: the batched verify (one weight read for the k + 1 rows)
+                eng.reset_to_zero();
+                let first3 = eng.prefill(&mut cnq, &ids, None) as i64;
+                assert_eq!(first, first3, "the prefill is deterministic");
+                let t2 = std::time::Instant::now();
+                let (bat, sb) = eng.mtp_spec_greedy_batched(first3, n, k);
+                let bat_s = t2.elapsed().as_secs_f64();
+                let dv = plain.iter().zip(&bat).position(|(a, b)| a != b);
+                println!("mtpspec-batched: C2 greedy ids identical: {}{}", dv.is_none(),
+                    dv.map(|i| format!(" (first difference at token {i}: plain {} batched {})", plain[i], bat[i])).unwrap_or_default());
+                let accb: Vec<String> = (0..k).map(|i| format!("{:.3} ({}/{})", sb.accepted[i] as f64 / sb.proposed[i].max(1) as f64, sb.accepted[i], sb.proposed[i])).collect();
+                println!("mtpspec-batched: passes {}, tokens per pass {:.3}, acceptance [{}], {:.1} tok/s (plain {:.1})",
+                    sb.passes, (sb.tokens - 1) as f64 / sb.passes.max(1) as f64, accb.join(", "), (n - 1) as f64 / bat_s, (n - 1) as f64 / plain_s);
                 println!("trace-plain: {plain:?}");
             }
             "mtpgolden" => {
