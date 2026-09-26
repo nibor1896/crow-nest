@@ -179,7 +179,7 @@ and which indexes the engine accepts.
 | `model.source.repo`, `model.source.revision` | the Hugging Face repo (`--source-repo`, required) and revision (`--revision`, else the `hf download --local-dir` cache, `.cache/huggingface/trees/<revision>.json`) |
 | `model.source.shards[]` | per source shard: `file`, `size`, `sha256`, `sha256_from` = `hf-lfs` (the LFS sha256 Hugging Face recorded, taken when its size equals the file on disk) or `computed` (hashed during the conversion) |
 | `block_geometry`, `blob_offset`, `tensors` | unchanged from v1 |
-| `sections` | only the sections the container has (a dense model has no `ple`) |
+| `sections` | only the sections the container has (a dense model has no `ple`, and no `vit`: the dense recipe omits the vision tower, the 27B uses `mmproj-F16.gguf`) |
 
 New tensor dtype `f32` (4 B per value, raw LE): the dense recipe's `A_log`, widened exactly
 from the BF16 source. `Cnq::byte_len` and `Cnq::read_f32` know it.
