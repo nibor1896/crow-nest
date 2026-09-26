@@ -284,6 +284,11 @@ SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
 TESTS="431"
 CLIPPY="1516"
+#   tests 431 / clippy 1516 (both unchanged)   Crow #300 phase 1 C4c (2026-09-26, on `ebb68f4`): `rmsnorm_1pw` reads
+#                              CN_AHD (PTX of record unchanged, `tests_300_c4` green); the synthetic probes read
+#                              `Geo::FLASH_NEXT.dims()` instead of the consts (kcheck, rope_table_probe,
+#                              attn_path_probe, qsa_tie_probe, router_probe, qsa_probe, mma_gate run once: PASS).
+#                              No test added or removed. Measured 2026-09-26: 431 / 0 (6 ignored); clippy 1516.
 #   tests 427 -> 431 / clippy 1517 -> 1516   Crow #300 phase 1 C4b (2026-09-26, on `f6df9ec`): the kernel source reads
 #                              its geometry from a per-boot `#define CN_*` prelude (`kernels::KernelGeo`, 27 macros from
 #                              the runtime `Geo`); the Flash-Next PTX of all 130 entries stays byte-identical to the

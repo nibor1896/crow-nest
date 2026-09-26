@@ -22,7 +22,11 @@
 use crow_nest_engine::cuda;
 use crow_nest_engine::gen::{launch_qsa_par_e, QSA_PAR_BINS};
 use crow_nest_engine::kernels::launch_v;
-use crow_nest_engine::geo::QSA_SEL_MAX;
+use crow_nest_engine::geo::{Dims, Geo};
+// Crow #300 C4: this probe loads no model; its synthetic shapes are Flash-Next's,
+// read from Geo::FLASH_NEXT's Dims, and the kernels compile with that Geo's prelude
+const G: Dims = Geo::FLASH_NEXT.dims();
+const QSA_SEL_MAX: usize = G.qsa_sel_max;
 /// deterministic xorshift64*: the same rows on every machine and every run
 use crow_nest_engine::sample::Rng;
 

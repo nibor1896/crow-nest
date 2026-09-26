@@ -21,9 +21,16 @@
 //! usage: attn_path_probe
 use crow_nest_engine::cuda;
 use crow_nest_engine::kernels::launch_v;
-use crow_nest_engine::geo::{AHD, NKV, NQ, QSA_SEL_MAX};
+use crow_nest_engine::geo::{Dims, Geo};
 use crow_nest_engine::sample::Rng;
 
+// Crow #300 C4: this probe loads no model; its synthetic shapes are Flash-Next's,
+// read from Geo::FLASH_NEXT's Dims, and the kernels compile with that Geo's prelude
+const G: Dims = Geo::FLASH_NEXT.dims();
+const AHD: usize = G.ahd;
+const NKV: usize = G.nkv;
+const NQ: usize = G.nq;
+const QSA_SEL_MAX: usize = G.qsa_sel_max;
 const TMAX: usize = 4096; // cache rows per kv head (> QSA_SEL_MAX)
 const MODE: i32 = 1; // bf16 KV: host can emit exact bf16 bytes by truncation
 

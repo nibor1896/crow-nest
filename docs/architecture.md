@@ -3864,7 +3864,7 @@ seed 1118, `reasoning_effort none`, card non-thinking row; main = an 8,640-token
 | output | the main turn's answer byte-identical with and without the side request, for a 2-token and a 32-token answer |
 | long side request | 12,087 tokens (longer than the held conversation): the snapshots are dropped, the old rule |
 
-## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18; 8.11 added 2026-09-26 with Crow #300 C1/C2)
+## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18; 8.11 added 2026-09-26 with Crow #300 C1/C2, C4 kernel rule amended in 8.2)
 
 Sections 0 to 7 say what the engine must do. This section says how the crate is put together,
 so a reader who opens `engine/src` knows which file to open and what it may reach for. It was
@@ -3884,7 +3884,7 @@ graph LR
   subgraph L0[leaves]; log[log.rs: tracing + rotation + boot/routing lines]; cuda[cuda.rs]; cnq[cnq.rs]; geo[geo.rs]; tokenizer[tokenizer.rs]; toolcall[toolcall.rs]; end
   subgraph L1[on the leaves]; kernels[kernels.rs: kernel table + launch_v + kprof]; manager[manager.rs]; sample[sample.rs]; weights[weights.rs: tensor loaders + Fp4]; boot[boot.rs]; end
   residency[residency.rs]; vit[vit.rs]; gen[gen.rs]; cache[cache.rs]; reset[reset.rs]; slot[slot.rs]
-  kernels --> cuda; manager --> cuda & geo; sample --> geo; weights --> cnq & cuda; boot --> cnq & cuda & geo
+  kernels --> cuda & geo; manager --> cuda & geo; sample --> geo; weights --> cnq & cuda; boot --> cnq & cuda & geo
   residency --> cnq & cuda & geo & kernels & manager; vit --> cnq & cuda & geo & kernels & weights
   gen --> cnq & cuda & geo & kernels & manager & residency & sample & vit & weights
   cache --> cuda & gen & geo; reset --> cuda & gen & geo; slot --> cache & cuda & gen & geo
@@ -3954,13 +3954,27 @@ identical to `tools/tokenize_ids.py --chat`; process-wide `OnceLock` instance. S
 is unit-tested in the library. Surface: 7 `pub fn` plus `ToolStream`, `Emit`. Leaf, used by
 `bin/serve` only.
 
-**`kernels.rs`** — `KERNEL_SRC`, the frozen CUDA source (lines 15 to 4479 of the file; the
-Rust host shell around it is the remaining ~180), the kernel table (`Kernels::new`, `f`), the
-two launch shims every kernel goes through (`launch_v`, `launch_sync`), the per-kernel profile
-(`kprof_init`, `kprof_add`, `kprof_report`, `CROW_KPROF`), and `define_u32`, which parses a
-`#define` out of the frozen source so the Rust twin can be asserted against it. Depends on
-`cuda` only. It may not depend on `gen`: that was the cycle `bb9d2ca` broke. `KERNEL_SRC` is
-byte-frozen — a refactor may not touch one character of it.
+**`kernels.rs`** — `KERNEL_SRC`, the CUDA source (lines 15 to ~4990 of the file at `ebb68f4`),
+`KernelGeo`, which builds the per-boot `#define CN_*` prelude the source compiles behind (Crow
+#300 C4, 8.11), the kernel table (`Kernels::new`, `f`), the two launch shims every kernel goes
+through (`launch_v`, `launch_sync`), the per-kernel profile (`kprof_init`, `kprof_add`,
+`kprof_report`, `CROW_KPROF`), and `define_u32`, which parses a `#define` out of the source so
+the Rust twin can be asserted against it. Depends on `cuda`, `geo` (the `Dims` the prelude is
+built from) and `meta` (#96's `boot_rope_scaling`, read in `Kernels::new`). It may not depend on `gen`: that was the cycle `bb9d2ca` broke.
+
+**The kernel rule is the PTX of record** (amended by robin 2026-09-25, applied in Crow #300 C4 on
+2026-09-26). Until then the rule read: "`KERNEL_SRC` is byte-frozen — a refactor may not touch one
+character of it." Reason for the change: model-agnostic kernels. The engine JITs the source with
+NVRTC on every boot anyway, so the kernel geometry can come from the checkpoint through a
+`#define` prelude instead of Flash-Next literals, which a second model family needs. The rule now:
+the SOURCE may change (macros, compile-time `#if` branches for another family), but for Flash-Next
+the NVRTC output of every kernel entry must stay byte-identical to the PTX compiled from the frozen
+pre-C4 source. The frozen source is `engine/tests/fixtures/kernels-3154b3b.cu` (cut byte-exact out
+of `3154b3b`); `engine/tests/fixtures/ptx-manifest-3154b3b.txt` records its sha256, the NVRTC
+version (13.3) and one sha256 per `.entry` (130 entries) plus the whole module. `kernels::tests_300_c4`
+compiles both with the engine's option set and fails with a table of every differing entry. A
+change that moves the Flash-Next PTX is a numerics change, never a refactor: it needs its own
+measurement and the gate values of record.
 
 **`manager.rs`** — the three-state memory manager: `StateSizes::plan` derives every state byte
 count from `geo` and the context, `ThreeStates::allocate` is the planner with the two-sided
@@ -4115,7 +4129,7 @@ not line numbers — the files move.
       Linux since #103, 2026-09-23; 8.8 point 7), one ascending sweep per expert tensor, the
       slot tables.
    10. the prefetch ring and its non-blocking stream.
-   11. `kernels::kprof_init`, `cuda::compile(KERNEL_SRC)` (NVRTC, `--gpu-architecture=compute_120a`),
+   11. `kernels::kprof_init`, `cuda::compile(KernelGeo::of(&geo).source())` (NVRTC, `--gpu-architecture=compute_120a`; the C4 prelude, then `KERNEL_SRC`),
        `Kernels::new`, `assert_kernel_defines` (8.6), `Params::setup`.
 7. `PrefixCache::new` — the three snapshot slots, the `[serve] prefix cache` line.
 8. `TcpListener::bind("127.0.0.1:<port>")`, then `serve_one` per connection, blocking, one
@@ -4173,7 +4187,7 @@ asserted against it.
   the stream trickle AND the chunk `serve` pins — `bin/serve.rs::SERVE_CHUNK` derives from it,
   which is the lesson of `42e2b67` written into the code. `MIB` / `GIB` replace 54 inline
   divisors, `DEFAULT_CNQ` / `DEFAULT_HOTSETS` / `from_engine_dir` replace 12 path literals.
-- **The four kernel `#define`s** are read out of the frozen `KERNEL_SRC` by
+- **The four kernel `#define`s** are read out of `KERNEL_SRC` by
   `kernels::define_u32` and compared with their Rust twins by `gen::assert_kernel_defines()`,
   once per `Engine::load`: `QSA_PAR_BINS`, `SAMPLE_MAXK`, `SAMPLE_PARTS`, `SAMPLE_THREADS`. The
   sampler's `cand_v` / `cand_i` allocation and both sampler launches read the Rust twins, so a
@@ -4536,7 +4550,7 @@ is the documented bit-identical twin of the cascade `mix_streams_q` fuses and th
 `max_abs` 0.4475 / `corr` 0.99180 all along, at HEAD and before the fix, which is what pinned the
 cause to the cascade and not to the kernels, the ring or the selection.
 
-### 8.11 Model families and the runtime `Geo` (Crow #300 phase 1, C1 + C2 + C3, 2026-09-26)
+### 8.11 Model families and the runtime `Geo` (Crow #300 phase 1, C1 + C2 + C3 + C4, 2026-09-26)
 
 crow-nest serves one model today, and every shape was a `geo.rs` const. Phase 1 of Crow #300 makes
 the shapes come from the checkpoint. C1 and C2 build the reader and the runtime geometry and
@@ -4659,12 +4673,84 @@ embedding dim at load), the PLE conv's 4 taps x dilation 3 = 9 state rows (`mana
 (a pure header check with no `Geo` in reach; the loaded model's compress ratio is 4). On purpose: `meta.rs` (the Flash-Next expected-values row is the
 pin), the tests that pin a const against its `Geo` field or feed a Flash-Next fixture, and the
 synthetic kernel probes (`mma_gate`, `attn_path_probe`, `qsa_probe`, `qsa_tie_probe`,
-`gdn_chunk_probe`, `rope_table_probe`, `router_probe`): they load no model and exercise the
-kernels at the Flash-Next shapes the kernel source pins, so they move with C4. The kernels
-(`kernels.rs` source text, `head / 12`, `2560`, `1e-6f`) are C4. Container facts that are not
-model geometry stay consts: `PLE_ROWS_PER_SHARD` (the converter's shard layout, C6),
-`HOST_PINNED_CAP`, the chunk policy; `sample::EOS_IDS` stays as the Flash-Next pin the
-metadata gate checks.
+`gdn_chunk_probe`, `rope_table_probe`, `router_probe`) until C4: since C4 they read
+`Geo::FLASH_NEXT.dims()` (`const G: Dims`, the old const names kept as local aliases) and compile
+`KernelGeo::flash_next().source()`; they load no model, so Flash-Next is their only shape. The
+kernels moved in C4 (below). Container facts that are not model geometry stay consts:
+`PLE_ROWS_PER_SHARD` (the converter's shard layout, C6), `HOST_PINNED_CAP`, the chunk policy;
+`sample::EOS_IDS` stays as the Flash-Next pin the metadata gate checks.
+
+**C4: the kernel prelude** (2026-09-26; C4a `f6df9ec`, C4b `ebb68f4`, C4c). The engine JITs `KERNEL_SRC` with NVRTC
+on every boot. Since C4 it compiles `kernels::KernelGeo::of(&geo).source()`: a prelude of 27
+`#define CN_*` lines built from the runtime `Geo` (through `Dims`, plus `rms_eps` and `gate_act`),
+then `KERNEL_SRC`. The bare source refuses to compile (`#error ... KernelGeo::prelude()`). The
+same builder serves the probes, `kcheck`, the ViT GEMM test and the cuTile pilot
+(`KernelGeo::flash_next()`). The rule this rests on is the 8.2 amendment: the PTX of record.
+
+| macro | from | Flash-Next | Qwen3.8-27B (derived) | read by |
+|---|---|---|---|---|
+| `CN_H` | `d.h` | 2560 | 5120 | HC norms and mixes, MoE accumulators, the PLE gate kernels, `bpr = CN_H / 64` |
+| `CN_HCN`, `CN_HCT` | `d.hcn`, `d.hct` | 4, 10240 | (`Plain`: none) | HC kernels, `1.0f / CN_HCN` (HF `/ hc_count`, `.mean`), the PLE conv width |
+| `CN_E`, `CN_TOPK`, `CN_INTER` | `d.e`, `d.topk`, `d.inter` | 512, 10, 640 | (`Dense`: none) | `router_top10`, `moe_plan`, the combo kernels, the silu·mul chain (`2 * CN_INTER`), `bpr = CN_INTER / 64` |
+| `CN_GDN_KHEADS`, `CN_GDN_VHEADS`, `CN_GD`, `CN_GDV` | `d.gdn_*`, `d.gd`, `d.gdv` | 16, 48, 128, 128 | same | l2norm/repeat, `beta_g`, the delta rules, the gated norms |
+| `CN_GDN_KEY`, `CN_GDN_VAL`, `CN_GDN_CONV` | `d.gdn_key`, `d.gdn_val`, `d.gdn_conv` | 2048, 6144, 10240 | same | `split_qkv`, `conv_step`, `bpr = CN_GDN_VAL / 64` |
+| `CN_NQ`, `CN_NKV`, `CN_GQA`, `CN_AHD` | `d.nq`, `d.nkv`, `d.nq / d.nkv`, `d.ahd` | 24, 2, 12, 256 | 24, 4, 6, 256 | `store_kv`, `split_qg`, rope, `rmsnorm_1pw`, every attention variant (`head / CN_GQA`), `attn_merge` |
+| `CN_Q_ROWS`, `CN_CORE` | `d.q_rows`, `d.core` | 12288, 6144 | 12288, 6144 | `split_qg`, `gate_mul_q` |
+| `CN_ATTN_SCALE` | `1 / sqrt(d.ahd)` as an f32 literal | `6.25e-2f` | same | `attn_scale_src<0>`, the `d_attn_scale` initializer (#96) |
+| `CN_ROPE_PAIRS` | `d.rope_pairs` | 32 | 32 | `rope`, `rope_p`, `rope64` |
+| `CN_QSA_HEADS`, `CN_QSA_HD`, `CN_QSA_QK_ROWS`, `CN_QSA_SEL_MAX` | `d.qsa_*` | 4, 128, 640, 2051 | (`Full`: none) | the indexer (`rms128`, `rope64`, `qk_k_append`, `qsa_scores`), the list attention's `p[CN_QSA_SEL_MAX]` |
+| `CN_EPS` | `geo.rms_eps` as an f32 literal | `1e-6f` | `1e-6f` | the five RMSNorms (HC group, q/k norm, both GDN gated norms, indexer norm) |
+| `CN_GATE_ACT` | `geo.gate_act` | 0 (sigmoid) | 1 (swish) | `rmsnorm_gated`, `rmsnorm_gated_q` |
+
+- **What a macro replaced**: a literal the kernel is correct for at any value of it (a stride, a
+  loop bound, a row width, an index expression, a shared array length). Every replacement is a
+  token the frontend folds to the same constant, which is why the PTX does not move.
+- **`CN_GATE_ACT` is the GDN gated-norm activation**, not the attention output gate. HF
+  `qwen4_exp` builds `RMSNormGated(activation=config.output_gate_type)` (sigmoid for Flash-Next);
+  `qwen3_5` hard-codes silu; the attention output gate is `sigmoid(gate)` in both (`gate_mul`,
+  unchanged). The swish branch is a compile-time `#if` (`zg / (1.0f + expf(-zg))`, the silu form
+  the source already uses), so the sigmoid PTX is untouched. C4 corrected `geo::GateAct`'s doc,
+  which called it the attention gate.
+- **The proof.** `kernels::tests_300_c4`: all 130 entries and the whole module are byte-identical
+  to the frozen `3154b3b` source and to the recorded manifest (red with `CN_QSA_SEL_MAX + 1`: 18 of
+  130 entries differ, the 18 list-attention variants). A geometry change moves exactly the
+  kernels that read it: swish moves `rmsnorm_gated` and `rmsnorm_gated_q` and nothing else; 4 KV
+  heads (GQA 6) move `store_kv` and the 20 attention variants and nothing else. Two ignored GPU
+  tests (`tests_300_c4_gpu`) run the swish gate, and `store_kv` + `attn_sel` at 4 KV heads / GQA 6,
+  on synthetic data against a CPU reference (max rel err 3.4e-7; attention max abs err 3.0e-7, and
+  the Flash-Next `head / 12` mapping would be off by 3.8). The gate is ALL GREEN with the values of
+  record, and all 125 `[budget]` / `[residency]` / `[diet]` / `[vit]` / `[stage]` / `meta:` boot
+  lines per run are identical to `gate-c3e` (host free RAM masked).
+
+**What the kernels still assume** (Flash-Next-only or shared by both families, at `kernels.rs`
+after C4c; each is a kernel-shape fact, not a literal a macro can replace):
+
+- one thread per head-dim element: the attention kernels run `blockDim = CN_AHD = 256` with the
+  block-size literals `red[256]`, `j += 256`, `lut[256]` (`:3914`), the register tile `qr[8]`
+  (`:2053`, `:2239`, `:2406`, = 256 / 32) and `sh = mode ? 5 : 4` (`:2233`, `:2401`, log2 of a
+  256-wide row in uint4). The 27B's head dim is also 256.
+- `attn_sel_g` (`:2476`) runs 32 x `CN_GQA` threads, but its fetch loop wants 256 of them
+  (`ld = tid < 256`, `:2404`): correct only for GQA >= 8. At the 27B's GQA 6 it is wrong; it is
+  the opt-in grouped variant, not the default decode path.
+- the list attention holds at most `CN_QSA_SEL_MAX` scores in shared memory (`p[...]`): the 27B's
+  full attention over a long context needs its own kernel (phase 2).
+- QSA: compress 4 in shift form (`ncb = (pos + 1) >> 2`, `:2603`, `:3856`), the 4-tap pool
+  (`:2568`, `:2571`), the 65,536-block bitmap (`:2654`, `:2801`), `qsa_scores_par`'s unrolled
+  4 heads x 128 (`:3859`).
+- GDN: conv kernel 4 (`conv_silu` `:1611`, `conv_state_update`, `conv_step` `:1731`, unrolled);
+  the delta rules load the key with the value thread index (`ks[d] = kt[d]`, `:1790`), so
+  `GD == GDV`; `vhead / (VHEADS / KHEADS)` (`:1672`) wants an integer ratio. The 27B matches all
+  three.
+- HC: `inject_residual` tiles the row in 256-wide blocks (`:1550`), so `H % 256 == 0`.
+- MoE: `router_top10` runs one thread per expert with a tree over `CN_E / 2` (E a power of two,
+  at most 1024) and a 32-bit cold mask (`1u << e`, `:3176`: top-k <= 32); `moe_plan`'s 8-combo
+  tiles (`:3365`).
+- PLE: the NVFP4 row cache is 108 B = 160 values (`:4129`), 16 slots per token (`:4125`), the
+  conv 4 taps x dilation 3 = 9 state rows (`:4209`): container layout, C6.
+- formula constants that are not the config's `rms_eps` stay literals: the l2norm `1e-6f`
+  (`:1677`, HF `l2norm(eps=1e-6)`), the PLE sign-sqrt clamp (`:4159`, HF `clamp_min(1e-6)`), the
+  ViT LayerNorm (`vit_ln`, HF `eps=1e-6`). The ViT kernels carry the vision tower's own shape
+  (1152 hidden, `:4612`), which is not part of the text `Geo`.
 
 ## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
 

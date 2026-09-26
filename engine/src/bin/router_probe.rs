@@ -118,8 +118,10 @@ fn main() {
         let f_g8 = module.get("gemm_bf16_dense");
         let f_g32 = module.get("gemm_bf16_dense_b");
 
-        const ROWS: usize = 512; // E, the router row count (nr512)
-        const K: usize = 2560; // H, the router input width (n2560)
+        // Crow #300 C4: Flash-Next's shapes, read from its Dims (no model loaded)
+        const G: crow_nest_engine::geo::Dims = crow_nest_engine::geo::Geo::FLASH_NEXT.dims();
+        const ROWS: usize = G.e; // E, the router row count (nr512)
+        const K: usize = G.h; // H, the router input width (n2560)
 
         // the production launch shapes of gen.rs moe_run (gemv_b grid
         // (E, t) block 256; the dense helper grid (rows/64, ceil(t/8 or 32))

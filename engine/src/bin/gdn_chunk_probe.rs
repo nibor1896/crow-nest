@@ -21,8 +21,14 @@
 //!
 //! usage: gdn_chunk_probe [dumpdir]   (default /tmp/crow-gdn-p2)
 use crow_nest_engine::cuda;
-use crow_nest_engine::geo::{GDN_VHEADS as H, GD as D};
+use crow_nest_engine::geo::{Dims, Geo};
 use crow_nest_engine::kernels::launch_v;
+
+// Crow #300 C4: this probe loads no model; its synthetic shapes are Flash-Next's,
+// read from Geo::FLASH_NEXT's Dims, and the kernels compile with that Geo's prelude
+const G: Dims = Geo::FLASH_NEXT.dims();
+const H: usize = G.gdn_vheads;
+const D: usize = G.gd;
 
 fn read_f32(path: &std::path::Path) -> Vec<f32> {
     let b = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));

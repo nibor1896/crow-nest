@@ -17,9 +17,23 @@
 
 use crow_nest_engine::cnq;
 use crow_nest_engine::cuda::{self, CUdeviceptr, Pinned};
-use crow_nest_engine::geo::*;
+use crow_nest_engine::geo::{Dims, Geo};
 use crow_nest_engine::sample::Rng;
 use crow_nest_engine::kernels::{act_cascade::{self, xq_row_bytes}, launch_sync, launch_v, Kernels};
+
+// Crow #300 C4: this probe loads no model; its synthetic shapes are Flash-Next's,
+// read from Geo::FLASH_NEXT's Dims, and the kernels compile with that Geo's prelude
+const G: Dims = Geo::FLASH_NEXT.dims();
+const H: usize = G.h;
+const HCN: usize = G.hcn;
+const HCT: usize = G.hct;
+const INTER: usize = G.inter;
+const TOPK: usize = G.topk;
+const GDN_VAL: usize = G.gdn_val;
+const GDN_VHEADS: usize = G.gdn_vheads;
+const GDN_CONV: usize = G.gdn_conv;
+const KV_ROWS: usize = G.kv_rows;
+const QSA_QK_ROWS: usize = G.qsa_qk_rows;
 
 // ---------------- Rust twins of the device math ----------------
 

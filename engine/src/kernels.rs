@@ -1503,16 +1503,16 @@ extern "C" __global__ void rmsnorm_1pw(const float* __restrict__ x, const float*
     int head = blockIdx.x;
     int t = blockIdx.y;
     int d = threadIdx.x;
-    const float* xp = x + (t * gridDim.x + head) * 256;
-    __shared__ float red[256];
+    const float* xp = x + (t * gridDim.x + head) * CN_AHD;
+    __shared__ float red[CN_AHD];
     red[d] = xp[d] * xp[d];
     __syncthreads();
-    for (int st = 128; st > 0; st >>= 1) {
+    for (int st = CN_AHD / 2; st > 0; st >>= 1) {
         if (d < st) red[d] += red[d + st];
         __syncthreads();
     }
-    float rms = rsqrtf(red[0] / 256.0f + CN_EPS);
-    out[(t * gridDim.x + head) * 256 + d] = xp[d] * rms * (1.0f + w[d]);
+    float rms = rsqrtf(red[0] / (float)CN_AHD + CN_EPS);
+    out[(t * gridDim.x + head) * CN_AHD + d] = xp[d] * rms * (1.0f + w[d]);
 }
 
 extern "C" __global__ void silu_div4(const float* __restrict__ x, float* __restrict__ out,
