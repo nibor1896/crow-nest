@@ -73,6 +73,9 @@ pub struct Weights {
     /// Crow #300 phase 2: the plain-residual / dense-FFN / RMS-final-norm parts;
     /// `None` on Flash-Next (whose head, hc and moe fields are the ones above)
     pub dense: Option<DenseW>,
+    /// crow-nest #95: the MTP head, loaded under `CROW_MTP=1` for a dense container with an
+    /// `mtp` section (`None` otherwise)
+    pub mtp: Option<MtpW>,
 }
 
 /// Crow #300 phase 2: one dense SwiGLU, `down(silu(gate(x)) * up(x))` (HF `Qwen3_5MLP`)
@@ -92,6 +95,28 @@ pub struct DenseW {
     pub mlp: Vec<MlpW>,
     pub norm: Dev,     // f32 [H] model.norm
     pub lm_head: PW,   // [V][H], NVFP4 in the dense recipe
+}
+
+/// crow-nest #95: the dense 27B's MTP head, BF16 as converted (vLLM `qwen3_5_mtp.py`,
+/// decode_out/p2-mtp/PREREG.md): x = fc(cat[enorm(embed(t_{p+1})), hnorm(h_p)]) -> one gated
+/// full-attention decoder layer with its own KV cache -> `mtp.norm` -> the shared lm_head.
+/// `fc` [H][2H] is split at load into its two column halves, so no concat is needed:
+/// fc(cat[a, b]) = fc_e a + fc_h b.
+pub struct MtpW {
+    pub fc_e: PW,   // [H][H] fc columns 0..H (the normed embedding)
+    pub fc_h: PW,   // [H][H] fc columns H..2H (the normed hidden)
+    pub enorm: Dev, // f32 [H] pre_fc_norm_embedding
+    pub hnorm: Dev, // f32 [H] pre_fc_norm_hidden
+    pub norm: Dev,  // f32 [H] mtp.norm
+    pub ln1: Dev,   // f32 [H] mtp.layers.0.input_layernorm
+    pub ln2: Dev,   // f32 [H] mtp.layers.0.post_attention_layernorm
+    pub attn: SubW, // mtp.layers.0.self_attn (the `Attn::Full` shape)
+    pub mlp: MlpW,  // mtp.layers.0.mlp
+    pub kc: Dev,    // own K cache, the main cache's layout [NKV][context][AHD] in the KV dtype
+    pub vc: Dev,    // own V cache
+    pub a: Dev,     // [C][H] f32 scratch: enorm(embed)
+    pub b: Dev,     // [C][H] f32 scratch: hnorm(h)
+    pub y: Dev,     // [C][H] f32 scratch: fc_h b
 }
 
 /// Projection weight: NVFP4 (dequant on the fly) or BF16 keep (exact bit
@@ -1179,6 +1204,15 @@ impl Engine {
             }
         }
         let dense = head_rms.map(|(norm, lm_head)| DenseW { ln1, ln2, mlp, norm, lm_head });
+        let mtp = if dense.is_some() && mtp_on() {
+            let m = load_mtp(cnq, &d, cfg.context, cfg.kv.byte_per_value(), cfg.prompt_chunk);
+            log(&format!("MTP head loaded (CROW_MTP=1, crow-nest #95): BF16 weights, own KV cache {:.1} MB, scratch {:.1} MB",
+                (2 * d.nkv * cfg.context * d.ahd * cfg.kv.byte_per_value()) as f64 / 1e6,
+                (3 * 4 * cfg.prompt_chunk * d.h) as f64 / 1e6));
+            Some(m)
+        } else {
+            None
+        };
         if let Some(n) = sf {
             log(&format!("NVFP4 scale bytes 0x7F (the E4M3 NaN code) rewritten to 0x7E: {n} (the MMA path reads 0x7F as NaN; the same rule as the expert slabs)"));
         }
@@ -1562,6 +1596,7 @@ impl Engine {
             sub,
             moe,
             dense,
+            mtp,
         };
 
         // ---- #72: the post-plan ledger ----
@@ -1679,6 +1714,62 @@ fn st_res_n(rep: &crate::manager::AllocReport, target: usize) -> usize {
 
 // the one loader that stays here: PW carries a launch policy (env switches,
 // tile forms), not just bytes - see weights.rs for the rest
+/// crow-nest #95: the column halves of a row-major BF16 `[H][2H]` matrix as two `[H][H]`
+/// matrices (the `mtp.fc` split: fc(cat[a, b]) = fc_e a + fc_h b)
+pub fn split_fc_halves(raw: &[u8], h: usize) -> (Vec<u8>, Vec<u8>) {
+    let (mut fe, mut fh) = (Vec::with_capacity(raw.len() / 2), Vec::with_capacity(raw.len() / 2));
+    for row in raw.chunks_exact(4 * h) {
+        fe.extend_from_slice(&row[..2 * h]);
+        fh.extend_from_slice(&row[2 * h..]);
+    }
+    (fe, fh)
+}
+
+/// crow-nest #95: the MTP head from the container's `mtp` section (all BF16 in the dense
+/// recipe), its own KV cache (`context` rows per KV head, `bpv` bytes a value) and three
+/// `[chunk][H]` f32 scratch rows
+unsafe fn load_mtp(cnq: &mut Cnq, d: &Dims, context: usize, bpv: usize, chunk: usize) -> MtpW {
+    let sec = "mtp";
+    let h = d.h;
+    let t = cnq.find("mtp.fc.weight", sec).clone();
+    assert_eq!(t.dtype, "bf16", "mtp.fc.weight: the dense recipe keeps the MTP head BF16");
+    let raw = cnq.read_bytes(&t);
+    assert_eq!(raw.len(), h * 2 * h * 2, "mtp.fc.weight is [H][2H] BF16");
+    let (fe, fh) = split_fc_halves(&raw, h);
+    let pfx = |s: &str| format!("mtp.layers.0.{s}");
+    let cache = d.nkv * context * d.ahd * bpv;
+    MtpW {
+        fc_e: PW::Bf16(cuda::upload_dev(&fe)),
+        fc_h: PW::Bf16(cuda::upload_dev(&fh)),
+        enorm: load_f32(cnq, "mtp.pre_fc_norm_embedding.weight", sec),
+        hnorm: load_f32(cnq, "mtp.pre_fc_norm_hidden.weight", sec),
+        norm: load_f32(cnq, "mtp.norm.weight", sec),
+        ln1: load_f32(cnq, &pfx("input_layernorm.weight"), sec),
+        ln2: load_f32(cnq, &pfx("post_attention_layernorm.weight"), sec),
+        attn: SubW::Attn {
+            q: load_pw(cnq, &pfx("self_attn.q_proj.weight"), sec),
+            k: load_pw(cnq, &pfx("self_attn.k_proj.weight"), sec),
+            v: load_pw(cnq, &pfx("self_attn.v_proj.weight"), sec),
+            o: load_pw(cnq, &pfx("self_attn.o_proj.weight"), sec),
+            qn: load_f32(cnq, &pfx("self_attn.q_norm.weight"), sec),
+            kn: load_f32(cnq, &pfx("self_attn.k_norm.weight"), sec),
+            iqk: PW::Bf16(0),
+            iqln: 0,
+            ikln: 0,
+        },
+        mlp: MlpW {
+            gate: load_pw(cnq, &pfx("mlp.gate_proj.weight"), sec),
+            up: load_pw(cnq, &pfx("mlp.up_proj.weight"), sec),
+            down: load_pw(cnq, &pfx("mlp.down_proj.weight"), sec),
+        },
+        kc: cuda::alloc_zeroed(cache),
+        vc: cuda::alloc_zeroed(cache),
+        a: cuda::alloc_zeroed(4 * chunk * h),
+        b: cuda::alloc_zeroed(4 * chunk * h),
+        y: cuda::alloc_zeroed(4 * chunk * h),
+    }
+}
+
 /// dtype-agnostic loader: nvfp4 → FP4 GEMV, bf16 keep → BF16 GEMV
 /// Crow #300 phase 2: `load_pw`, or - with `sf` = `Some(count)` - the same weight with every
 /// NVFP4 scale byte 0x7F rewritten to 0x7E (`residency::sanitize_sf_slab`, the rule of the expert
@@ -2335,6 +2426,11 @@ pub unsafe fn launch_qsa_par_e(
         "qsa_select_par_e is written for exactly 1024 threads = 32 warps (qsa_par_scan tmp[32])"
     );
     launch_v(f, nq, 1, 1, QSA_PAR_E_THREADS, vals);
+}
+
+/// crow-nest #95: `CROW_MTP=1` loads the dense family's MTP head (step 1: the forward only)
+pub fn mtp_on() -> bool {
+    std::env::var("CROW_MTP").as_deref() == Ok("1")
 }
 
 fn dense_mma_on() -> bool {
@@ -3367,8 +3463,12 @@ impl Engine {
     /// Crow #300 phase 2: `Ffn::Dense`, HF `Qwen3_5MLP`: `down(silu(gate(x)) * up(x))` over
     /// `[t][H]` rows of `x`; returns `s.moe_out` ([t][H]).
     unsafe fn dense_ffn(&self, l: usize, x: Dev, t: usize) -> Dev {
+        self.dense_ffn_w(&self.dw().mlp[l], x, t)
+    }
+
+    /// `dense_ffn` on the given weights (crow-nest #95: the MTP layer's MLP)
+    unsafe fn dense_ffn_w(&self, m: &MlpW, x: Dev, t: usize) -> Dev {
         let (k, p, s) = (&self.k, &self.p, &self.s);
-        let m = &self.dw().mlp[l];
         let inter = self.d.dense_inter;
         // one token with both NVFP4: gate, up and silu(gate) * up in one warp per index
         if let (1, PW::Fp4(wg, gg), PW::Fp4(wu, gu)) = (t, &m.gate, &m.up) {
@@ -3393,11 +3493,16 @@ impl Engine {
     /// 0..=pos_base+i for query row i), the sigmoid output gate and o_proj. Returns
     /// `s.ay` ([t][H]).
     unsafe fn attn_full_prompt(&self, l: usize, mixed: Dev, t: usize, pos_base: usize) -> Dev {
-        let (k, p, s) = (&self.k, &self.p, &self.s);
-        let SubW::Attn { q, k: kk, v, o, qn, kn, .. } = &self.w.sub[l] else {
-            panic!("layer {l} is not attention");
-        };
         let (kc, vc, _, _) = self.layer_cache_ptrs(l);
+        self.attn_full_prompt_w(&self.w.sub[l], kc, vc, mixed, t, pos_base)
+    }
+
+    /// `attn_full_prompt` on the given weights and K / V caches (crow-nest #95: the MTP layer)
+    unsafe fn attn_full_prompt_w(&self, w: &SubW, kc: u64, vc: u64, mixed: Dev, t: usize, pos_base: usize) -> Dev {
+        let (k, p, s) = (&self.k, &self.p, &self.s);
+        let SubW::Attn { q, k: kk, v, o, qn, kn, .. } = w else {
+            panic!("attn_full_prompt_w: not an attention block");
+        };
         let cos = self.cos_tbl() + (pos_base * self.d.rope_pairs * 4) as u64;
         let sin = self.sin_tbl() + (pos_base * self.d.rope_pairs * 4) as u64;
         self.quant_rows(t, mixed, s.xq_m, p.n2560);
@@ -3434,11 +3539,16 @@ impl Engine {
     /// scalars only, so the decode graph replays it): rope_p, store_kv at `p.slot1`,
     /// `attn_full_split` over `attn_splits()` blocks per head + `attn_merge`.
     unsafe fn attn_full_step(&self, l: usize, mixed: Dev) -> Dev {
-        let (k, p, s) = (&self.k, &self.p, &self.s);
-        let SubW::Attn { q, k: kk, v, o, qn, kn, .. } = &self.w.sub[l] else {
-            panic!("layer {l} is not attention");
-        };
         let (kc, vc, _, _) = self.layer_cache_ptrs(l);
+        self.attn_full_step_w(&self.w.sub[l], kc, vc, mixed)
+    }
+
+    /// `attn_full_step` on the given weights and K / V caches (crow-nest #95: the MTP layer)
+    unsafe fn attn_full_step_w(&self, w: &SubW, kc: u64, vc: u64, mixed: Dev) -> Dev {
+        let (k, p, s) = (&self.k, &self.p, &self.s);
+        let SubW::Attn { q, k: kk, v, o, qn, kn, .. } = w else {
+            panic!("attn_full_step_w: not an attention block");
+        };
         let (cos, sin) = (self.cos_tbl(), self.sin_tbl());
         self.quant_rows(1, mixed, s.xq_m, p.n2560);
         self.dense_proj(q, self.d.q_rows, p.n12288, 1, mixed, s.xq_m, s.qg, p.n2560);
@@ -4259,6 +4369,61 @@ impl Engine {
         } else {
             raw.iter().map(|&b| crate::cnq::e4m3_to_f32(b)).collect()
         }
+    }
+
+    /// crow-nest #95 step 1: the MTP head over `next_ids.len()` pairs (h_p, t_{p+1}), p =
+    /// pos_base.., with `h_rows` the main model's hidden after `model.norm` ([t][H], device).
+    /// Writes the head's output after `mtp.norm` into `s.mixed_final` rows 0..t (so
+    /// `lm_head_row(i)` gives the draft logits of pair i) and the pairs' K / V into the MTP
+    /// cache at pos_base.. (RoPE at p: the vLLM convention). `h_rows` is read before
+    /// `mixed_final` is written, so it may be `mixed_final` itself.
+    ///
+    /// # Safety
+    ///
+    /// A CUDA context must be current; `t` <= the prompt chunk; the MTP head is loaded.
+    pub unsafe fn mtp_rows(&self, h_rows: Dev, next_ids: &[i64], pos_base: usize) {
+        let m = self.w.mtp.as_ref().expect("mtp_rows without the MTP head (CROW_MTP=1, crow-nest #95)");
+        let (t, h, p) = (next_ids.len(), self.d.h, &self.p);
+        assert!(t >= 1 && t <= self.cfg.prompt_chunk, "mtp_rows: {t} rows, chunk {}", self.cfg.prompt_chunk);
+        let mut e = vec![0f32; t * h];
+        for (i, &id) in next_ids.iter().enumerate() {
+            let row = &self.w.embed_host[id as usize * h..(id as usize + 1) * h];
+            for (dst, &b) in e[i * h..(i + 1) * h].iter_mut().zip(row) {
+                *dst = f32::from_bits((b as u32) << 16);
+            }
+        }
+        self.upload_chunk_scalars(t, pos_base, false, ScalarSet::Full);
+        cuda::to_f32_into(self.s.h, &e);
+        self.add_norm(0, m.enorm, m.a, t); // a = enorm(embed(t_{p+1}))
+        cuda::d2d_async(self.s.h, h_rows, 4 * t * h);
+        self.add_norm(0, m.hnorm, m.b, t); // b = hnorm(h_p)
+        self.dense_proj(&m.fc_e, h, p.n2560, t, m.a, 0, self.s.h, p.n2560); // h = fc_e a
+        self.dense_proj(&m.fc_h, h, p.n2560, t, m.b, 0, m.y, p.n2560);
+        self.add_norm(m.y, m.ln1, self.s.mixed, t); // h = fc(cat[a, b]); mixed = ln1(h)
+        let ay = self.attn_full_prompt_w(&m.attn, m.kc, m.vc, self.s.mixed, t, pos_base);
+        self.add_norm(ay, m.ln2, self.s.mixed, t);
+        let f = self.dense_ffn_w(&m.mlp, self.s.mixed, t);
+        self.add_norm(f, m.norm, self.s.mixed_final, t);
+    }
+
+    /// crow-nest #95 step 1 (PREREG C1): the MTP draft logits of every pair of `ids`,
+    /// teacher-forced: prefill `ids` in one chunk, then `mtp_rows` over (h_p, ids[p + 1]) for
+    /// p = 0..len-2. Returns [len-1][V] f32 row-major.
+    ///
+    /// # Safety
+    ///
+    /// As `prefill`; the engine is fresh (position 0) and its chunk holds all of `ids`.
+    pub unsafe fn mtp_teacher_forced(&mut self, cnq: &mut Cnq, ids: &[i64]) -> Vec<f32> {
+        assert!(ids.len() >= 2 && ids.len() <= self.cfg.prompt_chunk, "mtp_teacher_forced: one chunk");
+        self.prefill(cnq, ids, None);
+        self.mtp_rows(self.s.mixed_final, &ids[1..], 0);
+        let mut out = Vec::with_capacity((ids.len() - 1) * self.d.v);
+        for i in 0..ids.len() - 1 {
+            self.lm_head_row(i);
+            cuda::sync();
+            out.extend(cuda::dtoh(self.s.logits, self.d.v));
+        }
+        out
     }
 
     /// Crow #300 phase 2: one sub-block of a dense layer over host rows, for the goldens of
@@ -5589,6 +5754,21 @@ impl Drop for Weights {
                 cuda::free_dev(&mut dw.norm);
                 free_pw(&mut dw.lm_head);
             }
+            if let Some(m) = self.mtp.as_mut() {
+                for w in [&mut m.fc_e, &mut m.fc_h, &mut m.mlp.gate, &mut m.mlp.up, &mut m.mlp.down] {
+                    free_pw(w);
+                }
+                if let SubW::Attn { q, k, v, o, qn, kn, .. } = &mut m.attn {
+                    for w in [q, k, v, o] {
+                        free_pw(w);
+                    }
+                    cuda::free_dev(qn);
+                    cuda::free_dev(kn);
+                }
+                for dv in [&mut m.enorm, &mut m.hnorm, &mut m.norm, &mut m.ln1, &mut m.ln2, &mut m.kc, &mut m.vc, &mut m.a, &mut m.b, &mut m.y] {
+                    cuda::free_dev(dv);
+                }
+            }
             for m in self.moe.iter_mut() {
                 cuda::free_dev(&mut m.router);
                 // #18: the bf16 router twin (2.62 MB x 48 layers = 125.8 MB) was never
@@ -5787,5 +5967,29 @@ mod vit_tower_line {
         assert!(out.contains("INFO"), "not an INFO event: {out:?}");
         assert!(out.contains("vit:"), "not target vit: {out:?}");
         assert!(out.contains("[vit] visual tower loaded: mode f16"), "line missing: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests_95_mtp {
+    #[test]
+    fn the_fc_split_gives_each_half_its_own_columns_row_by_row() {
+        // crow-nest #95: [H][2H] BF16 -> fc_e = columns 0..H, fc_h = columns H..2H; checked with
+        // H = 3 on values that name their (row, column)
+        let h = 3usize;
+        let mut raw = Vec::new();
+        for r in 0..h {
+            for c in 0..2 * h {
+                raw.extend_from_slice(&((r * 100 + c) as u16).to_le_bytes());
+            }
+        }
+        let (fe, fh) = super::split_fc_halves(&raw, h);
+        let at = |v: &[u8], r: usize, c: usize| u16::from_le_bytes([v[2 * (r * h + c)], v[2 * (r * h + c) + 1]]) as usize;
+        for r in 0..h {
+            for c in 0..h {
+                assert_eq!(at(&fe, r, c), r * 100 + c);
+                assert_eq!(at(&fh, r, c), r * 100 + h + c);
+            }
+        }
     }
 }

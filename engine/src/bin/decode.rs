@@ -557,6 +557,21 @@ fn main() {
                     "layercheck3 stepwise: max_abs={s_max:.4} rel_L2={s_rel:.4} NaN={s_nan} (batched==stepped pin, p11/p12 pattern)"
                 );
             }
+            "mtpgolden" => {
+                // crow-nest #95 step 1 (decode_out/p2-mtp/PREREG.md C1): the MTP head's draft
+                // logits of every pair of <dir>/gen-sequence.json, teacher-forced in one chunk, to
+                // <dir>/mtp-gpu-logits.f32 [T-1][V]; the reference is oracle/ref_qwen35_mtp.py's
+                // <dir>/mtp-logits.f32. Needs CROW_MTP=1.
+                let dir = args[2].clone();
+                let seq: serde_json::Value = serde_json::from_slice(&std::fs::read(format!("{dir}/gen-sequence.json")).unwrap()).unwrap();
+                let rows = seq["rows"].as_u64().unwrap() as usize;
+                let ids: Vec<i64> = seq["all_ids"].as_array().unwrap()[..rows].iter().map(|v| v.as_i64().unwrap()).collect();
+                cfg.prompt_chunk = ids.len();
+                let mut eng = Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
+                let lg = eng.mtp_teacher_forced(&mut cnq, &ids);
+                crow_nest_engine::cuda::write_le(&format!("{dir}/mtp-gpu-logits.f32"), &lg).unwrap();
+                println!("mtpgolden: {} draft rows -> {dir}/mtp-gpu-logits.f32", ids.len() - 1);
+            }
             "kvstats" => {
                 // Crow #300 phase 2: why the raw FP8 KV costs so much at long context. Boot with
                 // CROW_KV=bf16 (the exact values), prefill the prompt, read every attention

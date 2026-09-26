@@ -282,8 +282,10 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="451"
+TESTS="452"
 CLIPPY="1510"
+#   tests 451 -> 452 / clippy 1510 (unchanged)   crow-nest #95 MTP step 1 (2026-09-27): +1
+#                              `gen::tests_95_mtp::the_fc_split_gives_each_half_its_own_columns_row_by_row`.
 #   tests 450 -> 451 / clippy 1510 (unchanged)   Crow #300 phase 2, BF16 KV default of the dense family (2026-09-26): +1
 #                              `geo::tests_300_c5::an_unset_crow_kv_is_fp8_on_flash_next_and_bf16_on_the_dense_family`
 #                              (red with the old FP8 default: left Fp8E4m3, right Bf16).
