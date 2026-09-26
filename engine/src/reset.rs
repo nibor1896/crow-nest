@@ -86,6 +86,13 @@ impl Engine {
             cuda::graph_exec_destroy(self.graph_exec as cudarc::driver::sys::CUgraphExec);
             self.graph_exec = 0;
         }
+        // crow-nest #95: the verify graphs were captured on the same stream
+        for g in self.vgraph.iter_mut() {
+            if *g != 0 {
+                cuda::graph_exec_destroy(*g as cudarc::driver::sys::CUgraphExec);
+                *g = 0;
+            }
+        }
         if self.cap_stream != 0 {
             cuda::set_stream(0);
             cuda::stream_destroy(self.cap_stream as cudarc::driver::sys::CUstream);

@@ -527,6 +527,8 @@ pub struct Engine {
     sel_counts: Dev, // [48][512] u64 per-expert routing counts
     // ---- CUDA Graphs (CROW_GRAPH=1) ----
     pub(crate) graph_exec: u64, // CUgraphExec handle, 0 = not instantiated
+    /// crow-nest #95: the batched verify's graph per row count m (index m), 0 = not captured
+    pub(crate) vgraph: [u64; MTP_VERIFY_MAX + 1],
     pub(crate) cap_stream: u64, // capture stream handle, 0 = not created
     scalar_stage: cuda::Pinned, // pinned [16] i32 staging for scalar refreshes
     embed_buf: Vec<f32>,        // persistent embedding staging (async HtoD source)
@@ -1730,6 +1732,7 @@ impl Engine {
             mrope_rows,
             mrope_active: false,
             graph_exec: 0,
+            vgraph: [0; MTP_VERIFY_MAX + 1],
             cap_stream: 0,
             scalar_stage: unsafe { cuda::Pinned::alloc(16 * 4) },
             embed_buf: vec![0f32; d.hct],
@@ -4944,7 +4947,7 @@ impl Engine {
     unsafe fn proj_m(&self, w: &PW, rows: usize, rows_p: Dev, m: usize, x: Dev, y: Dev, k_p: Dev, k: usize) {
         let vb = &self.w.mtp.as_ref().expect("verify without the MTP head").vb;
         match w {
-            PW::Fp4(wp, gs) => launch_v(self.k.f("gemv_nvfp4_wm"), rows.div_ceil(8) as u32, 1, 1, 256, &[*wp, x, *gs, y, k_p, rows_p, vb.m]),
+            PW::Fp4(wp, gs) => launch_v(self.k.f("gemv_nvfp4_wm"), rows.div_ceil(16) as u32, 1, 1, 256, &[*wp, x, *gs, y, k_p, rows_p, vb.m]),
             PW::Bf16(_) => {
                 for i in 0..m {
                     self.dense_proj(w, rows, rows_p, 1, x + (4 * i * k) as u64, 0, y + (4 * i * rows) as u64, k_p);
@@ -5050,9 +5053,14 @@ impl Engine {
     /// # Safety
     ///
     /// A CUDA context must be current; the MTP head is loaded; `toks.len()` in 1..=MTP_VERIFY_MAX.
-    pub unsafe fn verify_rows(&self, toks: &[i64]) -> Vec<i64> {
+    pub unsafe fn verify_rows(&mut self, toks: &[i64]) -> Vec<i64> {
         let m = toks.len();
         assert!((1..=MTP_VERIFY_MAX).contains(&m), "verify of {m} rows");
+        let graph = graph_on();
+        if graph && self.cap_stream == 0 {
+            self.cap_stream = cuda::stream_create_non_blocking() as u64;
+            cuda::set_stream(self.cap_stream);
+        }
         let vb = &self.w.mtp.as_ref().expect("verify without the MTP head (CROW_MTP=1)").vb;
         let (h, p) = (self.d.h, &self.p);
         let pos = self.pos;
@@ -5068,6 +5076,30 @@ impl Engine {
             }
         }
         cuda::to_f32_into(self.s.h, &e);
+        let (argmax, stream) = (vb.argmax, self.cap_stream as cudarc::driver::sys::CUstream);
+        // graph mode: one capture per row count m, replayed after (the kernel sequence reads its
+        // positions and m from device scalars, so it is the same for every pass)
+        if graph && self.vgraph[m] != 0 {
+            cuda::launch_graph(self.vgraph[m] as cudarc::driver::sys::CUgraphExec, stream);
+        } else {
+            if graph {
+                cuda::begin_capture(stream);
+            }
+            self.verify_kernels(m);
+            if graph {
+                self.vgraph[m] = cuda::end_capture_instantiate(stream) as u64;
+                cuda::launch_graph(self.vgraph[m] as cudarc::driver::sys::CUgraphExec, stream);
+            }
+        }
+        cuda::sync();
+        cuda::dtoh_i32(argmax, m).into_iter().map(|t| t as i64).collect()
+    }
+
+    /// crow-nest #95 step 2b: the kernel sequence of `verify_rows` (no host work, no sync:
+    /// graph-capturable)
+    unsafe fn verify_kernels(&self, m: usize) {
+        let vb = &self.w.mtp.as_ref().expect("checked by verify_rows").vb;
+        let (h, p) = (self.d.h, &self.p);
         for l in 0..self.d.layers {
             if l == 0 {
                 self.add_norm(0, self.dw().ln1[0], self.s.mixed, m);
@@ -5081,7 +5113,7 @@ impl Engine {
             let (PW::Fp4(wg, gg), PW::Fp4(wu, gu)) = (&mw.gate, &mw.up) else {
                 panic!("the verify's FFN expects NVFP4 gate / up (the dense recipe)");
             };
-            launch_v(self.k.f("gemv_nvfp4_gum"), self.d.dense_inter.div_ceil(8) as u32, 1, 1, 256, &[
+            launch_v(self.k.f("gemv_nvfp4_gum"), self.d.dense_inter.div_ceil(16) as u32, 1, 1, 256, &[
                 *wg, *wu, self.s.mixed_m, *gg, *gu, self.s.dg, p.n2560, p.n_dinter, vb.m]);
             self.proj_m(&mw.down, h, p.n2560, m, self.s.dg, self.s.moe_out, p.n_dinter, self.d.dense_inter);
             let (w, out) = self.next_norm(l);
@@ -5091,8 +5123,6 @@ impl Engine {
         for i in 0..m {
             launch_v(self.k.f("argmax_k"), 1, 1, 1, 1024, &[vb.logits + (4 * i * self.d.v) as u64, vb.argmax + (4 * i) as u64, p.n_vocab]);
         }
-        cuda::sync();
-        cuda::dtoh_i32(vb.argmax, m).into_iter().map(|t| t as i64).collect()
     }
 
     /// crow-nest #95 step 2b: settle a verify of `rows` rows of which the first `keep` are
@@ -5135,8 +5165,11 @@ impl Engine {
         self.mtp_rows(hlast, &[x], self.pos - 1);
         let mut d1 = self.mtp_argmax_row(0);
         let mut last_row = 0usize;
+        let timing = std::env::var("CROW_MTP_TIME").is_ok();
+        let (mut t_draft, mut t_verify, mut t_catch) = (0f64, 0f64, 0f64);
         while out.len() < n {
             let pos = self.pos;
+            let ta = std::time::Instant::now();
             let mut toks = vec![x, d1];
             for j in 2..=k {
                 self.mtp_rows(self.s.mixed_final + (4 * last_row * h) as u64, &[toks[j - 1]], pos + j - 2);
@@ -5144,7 +5177,9 @@ impl Engine {
                 last_row = 0;
             }
             st.passes += 1;
+            let tb = std::time::Instant::now();
             let ys = self.verify_rows(&toks);
+            let tc = std::time::Instant::now();
             // accept drafts while they equal the main model's token of the row before
             let mut keep = 1usize;
             while keep < toks.len() {
@@ -5162,6 +5197,15 @@ impl Engine {
             last_row = keep - 1;
             d1 = self.mtp_argmax_row(last_row);
             x = ys[keep - 1];
+            if timing {
+                t_draft += (tb - ta).as_secs_f64();
+                t_verify += (tc - tb).as_secs_f64();
+                t_catch += tc.elapsed().as_secs_f64();
+            }
+        }
+        if timing {
+            let per = |t: f64| t * 1e3 / st.passes.max(1) as f64;
+            println!("[mtp-time] per pass: drafts {:.2} ms, verify {:.2} ms, accept + catch-up {:.2} ms", per(t_draft), per(t_verify), per(t_catch));
         }
         out.truncate(n);
         st.tokens = out.len();

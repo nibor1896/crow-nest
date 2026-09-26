@@ -594,9 +594,16 @@ fn main() {
                 eng.reset_to_zero();
                 let first3 = eng.prefill(&mut cnq, &ids, None) as i64;
                 assert_eq!(first, first3, "the prefill is deterministic");
+                // CROW_KPROF=1 (with CROW_GRAPH=0): the per-kernel profile of the batched run only
+                if let Ok(mut g) = crow_nest_engine::kernels::KPROF.lock() {
+                    *g = None;
+                }
                 let t2 = std::time::Instant::now();
                 let (bat, sb) = eng.mtp_spec_greedy_batched(first3, n, k);
                 let bat_s = t2.elapsed().as_secs_f64();
+                if std::env::var("CROW_KPROF").is_ok() {
+                    crow_nest_engine::kernels::kprof_report(sb.passes as u64);
+                }
                 let dv = plain.iter().zip(&bat).position(|(a, b)| a != b);
                 println!("mtpspec-batched: C2 greedy ids identical: {}{}", dv.is_none(),
                     dv.map(|i| format!(" (first difference at token {i}: plain {} batched {})", plain[i], bat[i])).unwrap_or_default());

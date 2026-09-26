@@ -395,6 +395,10 @@ extern "C" __global__ void gemv_nvfp4_gu(const unsigned char* __restrict__ wg, c
 // `part` chain, same `acc += part * sc`, same shuffle tree), so y[m] is bit-identical to a
 // one-row launch on x row m - the batch invariance the greedy contract of the verify needs.
 #define NVFP4_MMAX 4
+// Each warp takes NR weight rows over the same M activation slices (x traffic per weight byte
+// divided by NR; per warp and row the x slices came from L2 again, ~28x the weight bytes at
+// M = 4: kprof 2026-09-27). Staging x in shared memory per block was slower (the block barriers,
+// 32.3 vs 28.7 ms per verify), so x is read per warp and shared across its rows.
 template <int NR>
 __device__ __forceinline__ void nvfp4_warp_dot_m(const unsigned char* const (&rowb)[NR], const float* __restrict__ x,
                                                  int bpr, int M, int k_dim, uint4 (*stage)[72], const float* lut,
@@ -416,30 +420,43 @@ __device__ __forceinline__ void nvfp4_warp_dot_m(const unsigned char* const (&ro
         }
         __syncwarp();
         for (int j = bi; j < nb; j += 4) {
+            // the M activation slices under this lane's 8 values, loaded once for the NR rows
+            float4 xa[NVFP4_MMAX], xb[NVFP4_MMAX];
             #pragma unroll
             for (int m = 0; m < NVFP4_MMAX; m++) {
                 if (m < M) {
                     const float4* xp = (const float4*)(x + (size_t)m * k_dim + (size_t)(b0 + j) * 64 + wi * 8);
-                    const float4 xa = __ldg(xp), xb = __ldg(xp + 1);
-                    #pragma unroll
-                    for (int r = 0; r < NR; r++) {
-                        const unsigned char* blk = (const unsigned char*)stage[r] + j * 36;
-                        const unsigned int wd = *(const unsigned int*)(blk + 4 + 4 * wi);
-                        const float sc = lut8[blk[wi >> 1]];
-                        float part = lut[wd & 0xF] * xa.x;
-                        part += lut[(wd >> 4) & 0xF] * xa.y;
-                        part += lut[(wd >> 8) & 0xF] * xa.z;
-                        part += lut[(wd >> 12) & 0xF] * xa.w;
-                        part += lut[(wd >> 16) & 0xF] * xb.x;
-                        part += lut[(wd >> 20) & 0xF] * xb.y;
-                        part += lut[(wd >> 24) & 0xF] * xb.z;
-                        part += lut[wd >> 28] * xb.w;
+                    xa[m] = __ldg(xp);
+                    xb[m] = __ldg(xp + 1);
+                }
+            }
+            #pragma unroll
+            for (int r = 0; r < NR; r++) {
+                // the 8 weights and the sub-block scale decoded ONCE for all M rows (the table
+                // values the one-row kernel multiplies: each row's products and sums are the
+                // same operations in the same order)
+                const unsigned char* blk = (const unsigned char*)stage[r] + j * 36;
+                const unsigned int wd = *(const unsigned int*)(blk + 4 + 4 * wi);
+                const float sc = lut8[blk[wi >> 1]];
+                const float w0 = lut[wd & 0xF], w1 = lut[(wd >> 4) & 0xF], w2 = lut[(wd >> 8) & 0xF], w3 = lut[(wd >> 12) & 0xF];
+                const float w4 = lut[(wd >> 16) & 0xF], w5 = lut[(wd >> 20) & 0xF], w6 = lut[(wd >> 24) & 0xF], w7 = lut[wd >> 28];
+                #pragma unroll
+                for (int m = 0; m < NVFP4_MMAX; m++) {
+                    if (m < M) {
+                        float part = w0 * xa[m].x;
+                        part += w1 * xa[m].y;
+                        part += w2 * xa[m].z;
+                        part += w3 * xa[m].w;
+                        part += w4 * xb[m].x;
+                        part += w5 * xb[m].y;
+                        part += w6 * xb[m].z;
+                        part += w7 * xb[m].w;
                         acc[r][m] += part * sc;
                     }
                 }
             }
         }
-        __syncwarp();
+        __syncwarp(); // the next chunk overwrites the stage
     }
     #pragma unroll
     for (int r = 0; r < NR; r++) {
@@ -450,49 +467,63 @@ __device__ __forceinline__ void nvfp4_warp_dot_m(const unsigned char* const (&ro
         }
     }
 }
-// grid (ceil(rows / 8)), block 256; M = *m_p in 1..=4
+// two rows per warp: grid (ceil(rows / 16)), block 256; M = *m_p in 1..=4. A warp whose second
+// row is past the end computes it on row 0's bytes and does not write it.
 extern "C" __global__ void gemv_nvfp4_wm(const unsigned char* __restrict__ w, const float* __restrict__ x,
                                          const float* __restrict__ gs_ptr, float* __restrict__ y,
                                          const int* __restrict__ k_dim_p, const int* __restrict__ rows_p,
                                          const int* __restrict__ m_p) {
     NVFP4_TABLES
-    __shared__ uint4 stage[8][1][72];
+    __shared__ uint4 stage[8][2][72];
     const int warp = threadIdx.x >> 5;
-    const int row = blockIdx.x * 8 + warp;
+    const int row = (blockIdx.x * 8 + warp) * 2;
     const int rows = *rows_p;
     if (row >= rows) return; // no block-wide barrier below this line
     const int k_dim = *k_dim_p, M = *m_p;
     const int bpr = k_dim >> 6;
-    const unsigned char* const rowb[1] = {w + (size_t)row * bpr * 36};
-    float acc[1][NVFP4_MMAX];
-    nvfp4_warp_dot_m<1>(rowb, x, bpr, M, k_dim, stage[warp], lut, lut8, acc);
-    if ((threadIdx.x & 31) == 0) {
-        #pragma unroll
-        for (int m = 0; m < NVFP4_MMAX; m++) if (m < M) y[(size_t)m * rows + row] = acc[0][m] * gs_ptr[0];
-    }
-}
-extern "C" __global__ void gemv_nvfp4_gum(const unsigned char* __restrict__ wg, const unsigned char* __restrict__ wu,
-                                          const float* __restrict__ x, const float* __restrict__ gs_g,
-                                          const float* __restrict__ gs_u, float* __restrict__ y,
-                                          const int* __restrict__ k_dim_p, const int* __restrict__ rows_p,
-                                          const int* __restrict__ m_p) {
-    NVFP4_TABLES
-    __shared__ uint4 stage[8][2][72];
-    const int warp = threadIdx.x >> 5;
-    const int row = blockIdx.x * 8 + warp;
-    const int rows = *rows_p;
-    if (row >= rows) return;
-    const int k_dim = *k_dim_p, M = *m_p;
-    const int bpr = k_dim >> 6;
-    const unsigned char* const rowb[2] = {wg + (size_t)row * bpr * 36, wu + (size_t)row * bpr * 36};
+    const bool two = row + 1 < rows;
+    const unsigned char* const rowb[2] = {w + (size_t)row * bpr * 36, w + (size_t)(two ? row + 1 : row) * bpr * 36};
     float acc[2][NVFP4_MMAX];
     nvfp4_warp_dot_m<2>(rowb, x, bpr, M, k_dim, stage[warp], lut, lut8, acc);
     if ((threadIdx.x & 31) == 0) {
         #pragma unroll
         for (int m = 0; m < NVFP4_MMAX; m++) {
             if (m < M) {
-                const float g = acc[0][m] * gs_g[0];
-                y[(size_t)m * rows + row] = (g / (1.0f + expf(-g))) * (acc[1][m] * gs_u[0]);
+                y[(size_t)m * rows + row] = acc[0][m] * gs_ptr[0];
+                if (two) y[(size_t)m * rows + row + 1] = acc[1][m] * gs_ptr[0];
+            }
+        }
+    }
+}
+// two FFN indices per warp (gate and up of each): grid (ceil(rows / 16)), block 256
+extern "C" __global__ void gemv_nvfp4_gum(const unsigned char* __restrict__ wg, const unsigned char* __restrict__ wu,
+                                          const float* __restrict__ x, const float* __restrict__ gs_g,
+                                          const float* __restrict__ gs_u, float* __restrict__ y,
+                                          const int* __restrict__ k_dim_p, const int* __restrict__ rows_p,
+                                          const int* __restrict__ m_p) {
+    NVFP4_TABLES
+    __shared__ uint4 stage[8][4][72];
+    const int warp = threadIdx.x >> 5;
+    const int row = (blockIdx.x * 8 + warp) * 2;
+    const int rows = *rows_p;
+    if (row >= rows) return;
+    const int k_dim = *k_dim_p, M = *m_p;
+    const int bpr = k_dim >> 6;
+    const bool two = row + 1 < rows;
+    const size_t o0 = (size_t)row * bpr * 36, o1 = (size_t)(two ? row + 1 : row) * bpr * 36;
+    const unsigned char* const rowb[4] = {wg + o0, wu + o0, wg + o1, wu + o1};
+    float acc[4][NVFP4_MMAX];
+    nvfp4_warp_dot_m<4>(rowb, x, bpr, M, k_dim, stage[warp], lut, lut8, acc);
+    if ((threadIdx.x & 31) == 0) {
+        #pragma unroll
+        for (int m = 0; m < NVFP4_MMAX; m++) {
+            if (m < M) {
+                const float g0 = acc[0][m] * gs_g[0];
+                y[(size_t)m * rows + row] = (g0 / (1.0f + expf(-g0))) * (acc[1][m] * gs_u[0]);
+                if (two) {
+                    const float g1 = acc[2][m] * gs_g[0];
+                    y[(size_t)m * rows + row + 1] = (g1 / (1.0f + expf(-g1))) * (acc[3][m] * gs_u[0]);
+                }
             }
         }
     }
