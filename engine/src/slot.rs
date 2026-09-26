@@ -348,12 +348,14 @@ impl Header {
         // gen.rs:1648 and gen.rs:2696 both set done_blocks = floor(pos / 4), so this is an
         // equality, not a bound. It is the ONLY thing between a crafted header and a device
         // write past `qsa_pooled`, which holds ceil(n_ctx / 4) blocks (manager.rs:216-219).
-        if self.done_blocks != self.pos / 4 {
+        // Crow #300 phase 2: a model without pooled blocks (full attention, pooled_row_bytes 0)
+        // keeps done_blocks at 0
+        let want = if live.pooled_row_bytes == 0 { 0 } else { self.pos / 4 };
+        if self.done_blocks != want {
             return Err(format!(
-                "file done blocks {}, position {} needs exactly {} (floor of pos/4, gen.rs:1648)",
+                "file done blocks {}, position {} needs exactly {want} (floor of pos/4, gen.rs:1648; 0 without pooled blocks)",
                 self.done_blocks,
                 self.pos,
-                self.pos / 4
             ));
         }
         if self.history_len != self.pos {
@@ -468,7 +470,7 @@ pub fn live_header(eng: &Engine, cache: &PrefixCache, model_path: &str) -> Heade
         attn_layers: shape.attn_layers as u64,
         kv_groups: (shape.attn_layers * 2 * geo.kv_heads) as u64,
         kv_row_bytes: (geo.head_dim * eng.st.kv.byte_per_value()) as u64,
-        pooled_row_bytes: (geo.qsa().hidd() * 4) as u64,
+        pooled_row_bytes: crate::cache::pooled_row_bytes(geo) as u64,
         state_bytes: shape.snapshot_bytes() as u64,
         pos: 0,
         done_blocks: 0,
@@ -606,7 +608,8 @@ pub unsafe fn save(
         put(&mut w, &kv_row, &mut n_written, &tmp)?;
     }
     let mut pooled = vec![0u8; done_blocks * h.pooled_row_bytes as usize];
-    for layer in 0..h.attn_layers as usize {
+    // full attention pools nothing (pooled_row_bytes 0, no `qsa_pooled` buffers)
+    for layer in 0..if h.pooled_row_bytes == 0 { 0 } else { h.attn_layers as usize } {
         dtoh_bytes(&mut pooled, eng.st.qsa_pooled[layer]);
         put(&mut w, &pooled, &mut n_written, &tmp)?;
     }
@@ -708,7 +711,8 @@ pub unsafe fn restore(
         cuda::upload_into(eng.st.kv_row_ptr(layer, is_k, kvh, 0), &buf);
     }
     let pooled_bytes = h.done_blocks as usize * h.pooled_row_bytes as usize;
-    for layer in 0..h.attn_layers as usize {
+    // full attention pools nothing (pooled_row_bytes 0, no `qsa_pooled` buffers)
+    for layer in 0..if h.pooled_row_bytes == 0 { 0 } else { h.attn_layers as usize } {
         fill(&mut f, &mut buf, pooled_bytes, &mut n_payload)?;
         cuda::upload_into(eng.st.qsa_pooled[layer], &buf);
     }
@@ -957,6 +961,31 @@ mod tests {
             let e = h.check_content(&live()).unwrap_err();
             assert!(e.contains(name), "case {name}: message was {e:?}");
         }
+    }
+
+    /// Crow #300 phase 2: a model without pooled blocks (full attention: pooled_row_bytes 0)
+    /// keeps done_blocks at 0; the file's pooled payload is empty and the KV groups count
+    /// the Geo's attention layers (`Shape::of`), not the QSA buffers (of which it has none)
+    #[test]
+    fn a_full_attention_slot_has_no_pooled_blocks_and_keeps_its_kv_rows() {
+        let g = crate::meta::dense_fixture_geo();
+        assert_eq!(crate::cache::pooled_row_bytes(&g), 0);
+        assert_eq!(crate::cache::pooled_row_bytes(&Geo::FLASH_NEXT), 512, "the QSA raw key width x 4");
+        let mut live = live();
+        live.pooled_row_bytes = 0;
+        live.attn_layers = g.attn_layers as u64;
+        live.kv_groups = (g.attn_layers * 2 * g.kv_heads) as u64;
+        let mut h = live;
+        h.pos = 12;
+        h.history_len = 12;
+        h.done_blocks = 0;
+        assert_eq!(h.check_content(&live), Ok(()));
+        h.done_blocks = 3;
+        assert!(h.check_content(&live).unwrap_err().contains("0 without pooled blocks"));
+        h.done_blocks = 0;
+        // KV rows of every attention layer are in the payload; pooled rows are not
+        let kv = h.pos * h.kv_row_bytes * h.kv_groups;
+        assert_eq!(h.payload_bytes(), h.state_bytes + kv + h.history_len * 8);
     }
 
     /// the review finding: `done_blocks` is a device upload length for a buffer sized

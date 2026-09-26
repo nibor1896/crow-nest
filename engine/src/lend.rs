@@ -214,13 +214,16 @@ pub const PLAN_GRANULARITY: u64 = 2 << 20;
 pub fn tier1_plan(geo: &crate::geo::Geo, chunk: usize, vit_cap: Option<usize>, context: usize, stage_slots: usize, gu_bytes: usize, dn_bytes: usize) -> Vec<(&'static str, u64)> {
     let (persist, union) = crate::gen::Scratch::diet_region_bytes(&geo.dims(), chunk);
     let cap_blocks = 65536usize;
+    // Crow #300 phase 2: full attention allocates no QSA temps (`Scratch::alloc`)
+    let hidd = crate::cache::pooled_row_bytes(geo) / 4;
+    let scores = if hidd > 0 { chunk.clamp(1, crate::gen::ATTN_SB) * cap_blocks * 4 } else { 0 };
     let mut v: Vec<(&'static str, usize)> = vec![
         ("scratch persist region", persist),
         ("scratch union region", union),
-        ("qsa pool_raw", cap_blocks * geo.qsa().hidd()),
-        ("qsa pool_nrm", cap_blocks * geo.qsa().hidd()),
-        ("qsa pool_rot", cap_blocks * geo.qsa().hidd()),
-        ("qsa scores", chunk.clamp(1, crate::gen::ATTN_SB) * cap_blocks * 4),
+        ("qsa pool_raw", cap_blocks * hidd),
+        ("qsa pool_nrm", cap_blocks * hidd),
+        ("qsa pool_rot", cap_blocks * hidd),
+        ("qsa scores", scores),
         ("stage gate_up", stage_slots * gu_bytes),
         ("stage down", stage_slots * dn_bytes),
     ];

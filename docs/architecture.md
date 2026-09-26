@@ -5086,9 +5086,19 @@ Flash-Next's with the SiLU gate (`CN_GATE_ACT`, C4).
   them. The oracle reads the same rule (`CnqReader(sanitize_sf=True)` in `qwen35_common.py`).
   Regression check: golden `l17-mlp` (layer 17's `down_proj`), NaN without the rule under
   `CROW_MMA=1`, 1.5e-3 with it.
-- **Not yet.** `serve` is not wired for the family (the slot file, the prefix-cache park and the
-  lend listing read `Geo::qsa`). The F16 projector, the MTP head and the per-card planner above
-  the context floor are open.
+- **serve** (step 5). `serve` boots the 27B unchanged; four places counted the attention layers
+  as the number of QSA buffers (`qsa_keys.len()` / `qsa_pooled.len()`), which is 0 for full
+  attention: `cache::Shape::of` (and through it the slot file's `kv_groups`), the park and the
+  unpark (`kv_row_order`), and the park planning line in `gen.rs`. A park then copied no KV row,
+  a slot file carried none, both without an error; they read `Geo::attn_layers` now. Pooled
+  blocks are the QSA arm only (`cache::pooled_row_bytes`: 0 for full attention; the slot check
+  wants `done_blocks` 0 there, the park and the slot payload skip them; `lend::tier1_plan` lists
+  no QSA temps), and the prefix cache holds a QSA ring per layer only when there is one.
+  Checked live on 2026-09-26 (`CROW_MMA=1 CROW_GRAPH=1`, FP8 KV): a conversation, a short
+  unrelated request (park), the conversation continued (unpark: 25 of 62 prompt tokens cached,
+  right answer), slot save (158,925,432 B, 30 ms) and restore (23 ms; the continuation reuses 62
+  of 82 tokens), VRAM lend and return (602 MiB). The F16 projector, the MTP head and the
+  per-card planner above the context floor are open.
 
 ## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
 

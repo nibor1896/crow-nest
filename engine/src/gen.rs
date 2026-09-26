@@ -570,7 +570,7 @@ impl Engine {
     pub fn qsa_ring_rows(&self) -> usize { self.st.qsa_ring_rows }
     /// #118: host bytes a park of `rows` KV rows takes (`cache::park_host_bytes`)
     pub fn park_host_bytes(&self, rows: usize) -> usize {
-        crate::cache::park_host_bytes(&self.geo, rows, self.st.context, self.st.qsa_pooled.len(), self.st.kv.byte_per_value())
+        crate::cache::park_host_bytes(&self.geo, rows, self.st.context, self.geo.attn_layers, self.st.kv.byte_per_value())
     }
     /// #13: the operating point of this process, for the ONE structured boot
     /// line (`log::boot`). Reporting only — it reads the loaded state and the

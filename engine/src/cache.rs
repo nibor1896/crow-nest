@@ -272,6 +272,15 @@ pub fn park_blocks(rows: usize, n_ctx: usize, compress: usize) -> usize {
     (rows / compress + 1).min(n_ctx.div_ceil(compress))
 }
 
+/// bytes of one pooled QSA block row (the raw indexer key width in f32); 0 for full
+/// attention, which pools nothing (Crow #300 phase 2)
+pub fn pooled_row_bytes(geo: &Geo) -> usize {
+    match geo.attn {
+        Attn::Qsa { .. } => geo.qsa().hidd() * 4,
+        Attn::Full => 0,
+    }
+}
+
 /// - #118: host RAM of a park of `rows` rows: the KV rows of every attention layer (K and
 ///   V, `Geo::kv_heads` heads of `Geo::head_dim` values at `kv_value_bytes`) plus
 ///   `park_blocks` pooled QSA blocks of the QSA raw key width in f32 per attention layer
@@ -415,7 +424,10 @@ pub struct Shape {
 impl Shape {
     /// read off the loaded states, never assumed
     pub fn of(eng: &Engine) -> Shape {
-        Shape::with_geo(&eng.geo, eng.st.gdn_s.len(), eng.st.qsa_keys.len(), eng.st.qsa_ring_rows)
+        // Crow #300 phase 2: the attention layer count is the Geo's, not the number of QSA
+        // rings (equal on Flash-Next; full attention has no rings, and 0 here would make the
+        // slot file carry no KV rows at all)
+        Shape::with_geo(&eng.geo, eng.st.gdn_s.len(), eng.geo.attn_layers, eng.st.qsa_ring_rows)
     }
 
     /// the shape of `gdn_layers` / `attn_layers` loaded state buffers and a ring of
@@ -512,7 +524,8 @@ impl Snapshot {
             gdn_s: (0..shape.gdn_layers).map(|_| faulted(shape.gdn_s_len)).collect(),
             gdn_conv: (0..shape.gdn_layers).map(|_| faulted(shape.gdn_conv_len)).collect(),
             ple_state: faulted(shape.ple_len),
-            qsa_ring: (0..shape.attn_layers)
+            // one raw-key ring per QSA layer; full attention has none (qsa_ring_len 0)
+            qsa_ring: (0..if shape.qsa_ring_len > 0 { shape.attn_layers } else { 0 })
                 .map(|_| faulted(shape.qsa_ring_len))
                 .collect(),
             logits: faulted(vocab),
@@ -852,17 +865,23 @@ impl PrefixCache {
         let mut blocks = 0;
         if let ColdPlan::Park { rows } = plan {
             let t0 = std::time::Instant::now();
-            blocks = park_blocks(rows, eng.st.context, eng.geo.qsa().compress);
+            // C5/Crow #300 phase 2: pooled blocks are the Attn::Qsa arm; full attention parks KV rows only
+            blocks = match eng.geo.attn {
+                Attn::Qsa { .. } => park_blocks(rows, eng.st.context, eng.geo.qsa().compress),
+                Attn::Full => 0,
+            };
             // whatever the last request left in flight must land before the copies read it
             cuda::sync();
             let row_bytes = eng.geo.head_dim * eng.st.kv.byte_per_value();
             let n = rows * row_bytes;
-            let groups: Vec<_> = crate::slot::kv_row_order(eng.st.qsa_pooled.len(), eng.geo.kv_heads).collect();
+            // the Geo's attention layer count: `qsa_pooled.len()` is 0 for full attention, and
+            // the park then copied no KV row at all
+            let groups: Vec<_> = crate::slot::kv_row_order(eng.geo.attn_layers, eng.geo.kv_heads).collect();
             self.park_kv.resize(groups.len() * n, 0);
             for (g, (layer, is_k, kvh)) in groups.into_iter().enumerate() {
                 crate::slot::dtoh_bytes(&mut self.park_kv[g * n..(g + 1) * n], eng.st.kv_row_ptr(layer, is_k, kvh, 0));
             }
-            let pb = blocks * eng.geo.qsa().hidd() * 4;
+            let pb = blocks * pooled_row_bytes(&eng.geo);
             self.park_pooled.resize(eng.st.qsa_pooled.len() * pb, 0);
             for (layer, &src) in eng.st.qsa_pooled.iter().enumerate() {
                 crate::slot::dtoh_bytes(&mut self.park_pooled[layer * pb..(layer + 1) * pb], src);
@@ -906,10 +925,10 @@ impl PrefixCache {
         eng.drop_decode_graph();
         let row_bytes = eng.geo.head_dim * eng.st.kv.byte_per_value();
         let n = pk.rows * row_bytes;
-        for (g, (layer, is_k, kvh)) in crate::slot::kv_row_order(eng.st.qsa_pooled.len(), eng.geo.kv_heads).enumerate() {
+        for (g, (layer, is_k, kvh)) in crate::slot::kv_row_order(eng.geo.attn_layers, eng.geo.kv_heads).enumerate() {
             cuda::upload_into(eng.st.kv_row_ptr(layer, is_k, kvh, 0), &self.park_kv[g * n..(g + 1) * n]);
         }
-        let pb = pk.blocks * eng.geo.qsa().hidd() * 4;
+        let pb = pk.blocks * pooled_row_bytes(&eng.geo);
         for (layer, &dst) in eng.st.qsa_pooled.iter().enumerate() {
             cuda::upload_into(dst, &self.park_pooled[layer * pb..(layer + 1) * pb]);
         }
