@@ -3476,6 +3476,11 @@ impl Engine {
             PW::Fp4(wp, gs) if dense_mma_on() => {
                 launch_mma_d(&self.k, rows.div_ceil(64) as u32, t, self.p.t, &[*wp, xq, *gs, y, k_p, rows_p, rows_p]);
             }
+            // crow-nest #95: 2..=4 rows of a BF16 weight (the MTP head's catch-up) read the
+            // weight once for all rows; `p.t` holds t on every path that passes t > 1
+            PW::Bf16(wb) if (2..=4).contains(&t) => {
+                launch_v(self.k.f("gemv_bf16_wm"), rows.div_ceil(8) as u32, 1, 1, 256, &[*wb, x, y, k_p, rows_p, self.p.t]);
+            }
             _ => w.launch_gemv(&self.k, rows, rows_p, t, self.p.t, x, y, k_p),
         }
     }

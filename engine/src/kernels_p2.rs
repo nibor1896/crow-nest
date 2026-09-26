@@ -10,7 +10,7 @@
 //! `dec_e4m3`) as they are; the Flash-Next source stays `prelude + KERNEL_SRC`.
 
 /// the entries of `P2_SRC`, resolved by `Kernels::add_p2` when the family compiles them
-pub const P2_NAMES: &[&str] = &["attn_full_split", "silu_mul_n", "gemv_nvfp4_w", "gemv_nvfp4_gu", "add_rms_1k", "gemv_bf16_ba", "attn_full_fa", "gemv_nvfp4_wm", "gemv_nvfp4_gum"];
+pub const P2_NAMES: &[&str] = &["attn_full_split", "silu_mul_n", "gemv_nvfp4_w", "gemv_nvfp4_gu", "add_rms_1k", "gemv_bf16_ba", "attn_full_fa", "gemv_nvfp4_wm", "gemv_nvfp4_gum", "gemv_bf16_wm"];
 
 /// the phase 2 kernel source, appended after `KERNEL_SRC` (`KernelGeo::source`)
 pub const P2_SRC: &str = r#"
@@ -526,6 +526,46 @@ extern "C" __global__ void gemv_nvfp4_gum(const unsigned char* __restrict__ wg, 
                 }
             }
         }
+    }
+}
+
+// gemv_bf16_w over M <= 4 activation rows (x row m at x + m * k_dim, y row m at y + m * rows),
+// the weight row read ONCE for all rows (crow-nest #95: the MTP head's catch-up rows; the
+// one-row form read the 0.79 GB of BF16 MTP weights once per row). grid (ceil(rows / 8)),
+// block 256; M = *m_p.
+extern "C" __global__ void gemv_bf16_wm(const unsigned short* __restrict__ w, const float* __restrict__ x,
+                                        float* __restrict__ y, const int* __restrict__ k_dim_p,
+                                        const int* __restrict__ rows_p, const int* __restrict__ m_p) {
+    const int k_dim = *k_dim_p, rows = *rows_p, M = *m_p;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= rows) return;
+    const unsigned short* wp = w + (size_t)row * k_dim;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int i = lane * 8; i < k_dim; i += 256) {
+        const uint4 v = *(const uint4*)(wp + i);
+        const unsigned int u[4] = {v.x, v.y, v.z, v.w};
+        #pragma unroll
+        for (int m = 0; m < 4; m++) {
+            if (m < M) {
+                const float* xp = x + (size_t)m * k_dim + i;
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const float lo = __uint_as_float(u[j] << 16);
+                    const float hi = __uint_as_float(u[j] & 0xFFFF0000u);
+                    acc[m] += lo * xp[2 * j] + hi * xp[2 * j + 1];
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int m = 0; m < 4; m++) {
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) acc[m] += __shfl_down_sync(0xffffffffu, acc[m], o);
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int m = 0; m < 4; m++) if (m < M) y[(size_t)m * rows + row] = acc[m];
     }
 }
 
