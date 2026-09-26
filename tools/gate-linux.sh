@@ -282,8 +282,11 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="452"
-CLIPPY="1510"
+TESTS="454"
+CLIPPY="1494"
+#   tests 452 -> 454 / clippy 1510 -> 1494   crow-nest #95 MTP steps 2-5 (2026-09-27): +2
+#                              `gen::tests_95_mtp::adaptive_k_*`; clippy -16: `launch_sample` lost its sixteen
+#                              same-type `as u64` casts when it became `launch_sample_at`.
 #   tests 451 -> 452 / clippy 1510 (unchanged)   crow-nest #95 MTP step 1 (2026-09-27): +1
 #                              `gen::tests_95_mtp::the_fc_split_gives_each_half_its_own_columns_row_by_row`.
 #   tests 450 -> 451 / clippy 1510 (unchanged)   Crow #300 phase 2, BF16 KV default of the dense family (2026-09-26): +1

@@ -5113,6 +5113,15 @@ Flash-Next's with the SiLU gate (`CN_GATE_ACT`, C4).
   (`Engine::kv_rows_host`): |x| quantiles, the subnormal share, and the relative error of three e4m3
   encodings (the raw cast of `store_kv`, one scale per head, one per row). Results of 2026-09-26 in the
   CHANGELOG (Measured).
+- **MTP speculative decoding** (crow-nest #95, `CROW_MTP=1`). The BF16 head (`MtpW`, `load_mtp`) runs
+  over pairs (h_p, t_{p+1}) (`mtp_rows`: `fc` split into column halves, one gated full-attention layer with its
+  own KV cache; 1..=4 rows take the verify's per-row split-K attention). The prefill writes its KV over every
+  chunk (`mtp_prefill_chunk`). `spec_step` is `decode_step`'s drop-in: drafts (chain) -> `verify_rows` (projections
+  through `gemv_nvfp4_wm` / `gum` / `gemv_bf16_wm`, one weight read for M <= 4 rows and the one-row operation order
+  per row; GDN recurrence and attention row by row with the decode kernels; state slot per row; one CUDA graph per
+  M) -> rows drawn lazily while the fed token equals the draft -> `spec_settle` (GDN slot, position, history, the
+  head's catch-up). `AdaptiveK` picks k. The weights, slots and scratch are lendable (#117), the weights refilled
+  from host copies after a return (`mtp_refill`). Output identical to plain decoding, greedy and sampled.
 - **Scales.** The 27B container is converted with `--scales diag` (calibrated, activation-weighted
   sub-block scales; `decode_out/p2-lh`), KLD 0.223 against BF16 (was 0.290 with `--scales mse`).
 - **KV dtype.** An unset `CROW_KV` takes `Family::default_kv`: BF16 for the dense family (FP8 failed

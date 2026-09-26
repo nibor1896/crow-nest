@@ -121,6 +121,9 @@ pub struct MtpW {
     pub hlast: Dev, // [H] f32: the main hidden of the last prompt row, whose pair waits for the next token
     pub hist: Dev,  // [MTP_MAX_ROWS][H] f32: the main hidden of each verified row (step 2a)
     pub vb: VerifyBufs,
+    /// crow-nest #95 (PREREG V): the BF16 weights live in lendable memory (#117), so an image
+    /// lend can take them; these host copies refill them after the return (`mtp_refill`)
+    pub host: Vec<(Dev, Vec<u8>)>,
 }
 
 /// crow-nest #95 step 2b: rows of one batched verify (the `gemv_nvfp4_wm` limit, NVFP4_MMAX)
@@ -690,6 +693,27 @@ impl Engine {
     pub fn weights(&self) -> &Weights { &self.w }
     /// the [V] f32 row the last `prefill` / `decode_step` scored
     pub fn logits(&self) -> Dev { self.s.logits }
+    /// crow-nest #95 (PREREG V): after a VRAM lend returned (#117: the lent regions come back
+    /// zeroed), upload the MTP head's BF16 weights again from their host copies. Returns the
+    /// bytes uploaded (0 without the head).
+    ///
+    /// # Safety
+    ///
+    /// A CUDA context must be current; the lend has returned (every region mapped again).
+    pub unsafe fn mtp_refill(&self) -> usize {
+        let Some(m) = self.w.mtp.as_ref() else { return 0 };
+        let mut n = 0;
+        for (dv, bytes) in &m.host {
+            cuda::upload_into(*dv, bytes);
+            n += bytes.len();
+        }
+        cuda::sync();
+        n
+    }
+
+    /// crow-nest #95: whether the MTP head is loaded (`CROW_MTP=1`), so `spec_step` can stand in
+    /// for `decode_step`
+    pub fn mtp_loaded(&self) -> bool { self.w.mtp.is_some() }
     /// the PLE row cache (its `req` / `miss` counters and slot count)
     /// C5: `None` for a model without PLE
     pub fn ple(&self) -> Option<&Ple> { self.ple.as_ref() }
@@ -1852,6 +1876,16 @@ pub fn split_fc_halves(raw: &[u8], h: usize) -> (Vec<u8>, Vec<u8>) {
     (fe, fh)
 }
 
+/// crow-nest #95: a BF16 weight into lendable memory (#117), its bytes kept in `host` for the
+/// refill after a lend
+unsafe fn lend_upload(host: &mut Vec<(Dev, Vec<u8>)>, what: &'static str, bytes: Vec<u8>) -> PW {
+    let dv = cuda::alloc_lendable(what, bytes.len());
+    cuda::upload_into(dv, &bytes);
+    cuda::sync();
+    host.push((dv, bytes));
+    PW::Bf16(dv)
+}
+
 /// crow-nest #95: the MTP head from the container's `mtp` section (all BF16 in the dense
 /// recipe), its own KV cache (`context` rows per KV head, `bpv` bytes a value) and three
 /// `[chunk][H]` f32 scratch rows
@@ -1868,48 +1902,63 @@ unsafe fn load_mtp(cnq: &mut Cnq, d: &Dims, geo: &Geo, context: usize, bpv: usiz
     let (fe, fh) = split_fc_halves(&raw, h);
     let pfx = |s: &str| format!("mtp.layers.0.{s}");
     let cache = d.nkv * context * d.ahd * bpv;
+    // the BF16 weights in lendable memory, each with its host copy for the refill
+    let mut host: Vec<(Dev, Vec<u8>)> = Vec::new();
+    let bf = |cnq: &mut Cnq, host: &mut Vec<(Dev, Vec<u8>)>, what: &'static str, name: &str| -> PW {
+        let t = cnq.find(name, sec).clone();
+        assert_eq!(t.dtype, "bf16", "{name}: the dense recipe keeps the MTP head BF16");
+        lend_upload(host, what, cnq.read_bytes(&t))
+    };
+    let fc_e = lend_upload(&mut host, "the MTP fc_e weight", fe);
+    let fc_h = lend_upload(&mut host, "the MTP fc_h weight", fh);
+    let q = bf(cnq, &mut host, "the MTP q_proj weight", &pfx("self_attn.q_proj.weight"));
+    let k = bf(cnq, &mut host, "the MTP k_proj weight", &pfx("self_attn.k_proj.weight"));
+    let v = bf(cnq, &mut host, "the MTP v_proj weight", &pfx("self_attn.v_proj.weight"));
+    let o = bf(cnq, &mut host, "the MTP o_proj weight", &pfx("self_attn.o_proj.weight"));
+    let gate = bf(cnq, &mut host, "the MTP gate_proj weight", &pfx("mlp.gate_proj.weight"));
+    let up = bf(cnq, &mut host, "the MTP up_proj weight", &pfx("mlp.up_proj.weight"));
+    let down = bf(cnq, &mut host, "the MTP down_proj weight", &pfx("mlp.down_proj.weight"));
     MtpW {
-        fc_e: PW::Bf16(cuda::upload_dev(&fe)),
-        fc_h: PW::Bf16(cuda::upload_dev(&fh)),
+        fc_e,
+        fc_h,
         enorm: load_f32(cnq, "mtp.pre_fc_norm_embedding.weight", sec),
         hnorm: load_f32(cnq, "mtp.pre_fc_norm_hidden.weight", sec),
         norm: load_f32(cnq, "mtp.norm.weight", sec),
         ln1: load_f32(cnq, &pfx("input_layernorm.weight"), sec),
         ln2: load_f32(cnq, &pfx("post_attention_layernorm.weight"), sec),
         attn: SubW::Attn {
-            q: load_pw(cnq, &pfx("self_attn.q_proj.weight"), sec),
-            k: load_pw(cnq, &pfx("self_attn.k_proj.weight"), sec),
-            v: load_pw(cnq, &pfx("self_attn.v_proj.weight"), sec),
-            o: load_pw(cnq, &pfx("self_attn.o_proj.weight"), sec),
+            q,
+            k,
+            v,
+            o,
             qn: load_f32(cnq, &pfx("self_attn.q_norm.weight"), sec),
             kn: load_f32(cnq, &pfx("self_attn.k_norm.weight"), sec),
             iqk: PW::Bf16(0),
             iqln: 0,
             ikln: 0,
         },
-        mlp: MlpW {
-            gate: load_pw(cnq, &pfx("mlp.gate_proj.weight"), sec),
-            up: load_pw(cnq, &pfx("mlp.up_proj.weight"), sec),
-            down: load_pw(cnq, &pfx("mlp.down_proj.weight"), sec),
-        },
+        mlp: MlpW { gate, up, down },
+        // the MTP head's own KV holds state between requests: not lendable
         kc: cuda::alloc_zeroed(cache),
         vc: cuda::alloc_zeroed(cache),
-        a: cuda::alloc_zeroed(4 * chunk * h),
-        b: cuda::alloc_zeroed(4 * chunk * h),
-        y: cuda::alloc_zeroed(4 * chunk * h),
-        hin: cuda::alloc_zeroed(4 * chunk * h),
+        // scratch: no state between requests (`spec_finish` settled every pass)
+        a: cuda::alloc_lendable("the MTP scratch a", 4 * chunk * h),
+        b: cuda::alloc_lendable("the MTP scratch b", 4 * chunk * h),
+        y: cuda::alloc_lendable("the MTP scratch y", 4 * chunk * h),
+        hin: cuda::alloc_lendable("the MTP scratch hin", 4 * chunk * h),
         hlast: cuda::alloc_zeroed(4 * h),
         hist: cuda::alloc_zeroed(4 * MTP_MAX_ROWS * h),
         vb: VerifyBufs {
-            logits: cuda::alloc_zeroed(4 * MTP_VERIFY_MAX * d.v),
+            logits: cuda::alloc_lendable("the MTP verify logits", 4 * MTP_VERIFY_MAX * d.v),
             argmax: cuda::alloc_zeroed(4 * MTP_VERIFY_MAX),
             pos: cuda::alloc_zeroed(4 * MTP_VERIFY_MAX),
             m: cuda::alloc_zeroed(4),
-            slot_s: (0..MTP_VERIFY_MAX - 1).map(|_| cuda::alloc_zeroed(n_gdn * s_bytes)).collect(),
-            slot_conv: (0..MTP_VERIFY_MAX - 1).map(|_| cuda::alloc_zeroed(n_gdn * conv_bytes)).collect(),
+            slot_s: (0..MTP_VERIFY_MAX - 1).map(|_| cuda::alloc_lendable("an MTP GDN state slot", n_gdn * s_bytes)).collect(),
+            slot_conv: (0..MTP_VERIFY_MAX - 1).map(|_| cuda::alloc_lendable("an MTP GDN conv slot", n_gdn * conv_bytes)).collect(),
             s_bytes,
             conv_bytes,
         },
+        host,
     }
 }
 

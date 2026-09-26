@@ -4360,6 +4360,9 @@ fn chat_generate(
     // first; loop index `i` here names the same token, so the guard is the same `i > 0`.
     let (adapt_stream, adapt_every, adapt_max) = srv.eng.cfg.adapt.knobs();
     let tick_trickle = adapt_stream && adapt_every > 0 && trickle_ready(srv.eng);
+    // crow-nest #95: speculative decoding with the MTP head; its counters before this request
+    let mtp = srv.eng.mtp_loaded();
+    let mtp0 = srv.eng.spec_stats.clone();
     let mut trickle_swaps = 0usize;
     // #81: THE THINKING BUDGET, and the shape it takes here. The mechanism llama-server
     // ships as `--reasoning-budget` (its PRs #13771/#17750) and Qwen's docs describe as
@@ -4582,7 +4585,15 @@ fn chat_generate(
                 trickle_swaps += unsafe { srv.eng.trickle_tick(i % adapt_every == 0, adapt_max) };
             }
             let t = *t_dec.get_or_insert_with(Instant::now);
-            next = unsafe { srv.eng.decode_step(srv.cnq, next as i64) };
+            // crow-nest #95: with the MTP head loaded (CROW_MTP=1) `spec_step` stands in for
+            // `decode_step` - the same contract (the next token, its row in the engine's logits
+            // buffer), so the forced ids, the grammar redraw, the host draw and the logprobs
+            // above work unchanged; a replaced token only ends the verify pass early
+            next = if mtp {
+                unsafe { srv.eng.spec_step(next as i64) }
+            } else {
+                unsafe { srv.eng.decode_step(srv.cnq, next as i64) }
+            };
             // #86: a biased request re-draws the step on the host. `decode_step`
             // returned the plain argmax (the device sampler is parked), the row it
             // left is this position's distribution, and the biased draw replaces
@@ -4598,6 +4609,21 @@ fn chat_generate(
         }
     }
 
+    // crow-nest #95: settle the last verify pass, so the engine stands exactly where plain
+    // decoding would after this answer's ids (the prefix cache, park and slot files read it)
+    if mtp {
+        // unsafe: the same GPU state `decode_step` touches, one sync
+        unsafe { srv.eng.spec_finish() };
+        let st = &srv.eng.spec_stats;
+        let passes = st.passes - mtp0.passes;
+        let tokens = st.tokens - mtp0.tokens;
+        let acc: Vec<String> = (0..3)
+            .map(|i| format!("{}/{}", st.accepted[i] - mtp0.accepted[i], st.proposed[i] - mtp0.proposed[i]))
+            .collect();
+        tracing::info!(target: "chat",
+            "[chat] mtp (#95): {passes} verify passes, {tokens} tokens ({:.2} per pass), drafts accepted per chain position [{}], adaptive k {:?}",
+            tokens as f64 / passes.max(1) as f64, acc.join(", "), srv.eng.spec_k.acc);
+    }
     // #93: one line per request whose grammar ever checked an id
     if let Some(gt) = gate.as_ref() {
         let st = gt.stats;
@@ -5404,6 +5430,15 @@ fn vram_return(srv: &mut Srv, why: &str) -> (&'static str, serde_json::Value) {
     match unsafe { crow_nest_engine::cuda::lend_remap() } {
         Ok(out) => {
             let (bytes, lent_for) = srv.lend.returned(Instant::now()).unwrap_or_default();
+            // crow-nest #95: the MTP head's weights were lendable; they came back zeroed
+            let t_refill = Instant::now();
+            // SAFETY: every lent region is mapped again (lend_remap returned Ok)
+            let refilled = unsafe { srv.eng.mtp_refill() };
+            if refilled > 0 {
+                tracing::info!(target: "lend",
+                    "[lend] MTP head weights uploaded again: {:.0} MiB in {:.1} ms",
+                    refilled as f64 / MIB_F, t_refill.elapsed().as_secs_f64() * 1e3);
+            }
             let free = unsafe { crow_nest_engine::cuda::free_vram_bytes() };
             tracing::info!(target: "lend",
                 "[lend] returned {:.0} MiB in {:.1} ms ({} region(s) remapped at the same addresses and zeroed) after {:.1} s lent ({why}), free VRAM {:.0} MiB, {} parked request(s) next",
