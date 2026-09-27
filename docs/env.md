@@ -188,8 +188,8 @@ Helpers used by the read sites:
 
 | Name | Read at | Values / default | Effect | Mode | Notes |
 |---|---|---|---|---|---|
-| `CROW_TOKENIZER` | `engine/src/tokenizer.rs:352` | path; default `DEFAULT_TOKENIZER` = `models/Qwen3.8-Flash-Next-original/tokenizer.json` | HF tokenizer file, repository relative | operating | table at `tokenizer.rs:13` |
-| `CROW_TOKENIZER_CONFIG` | `engine/src/tokenizer.rs:353` | path; default the sibling `tokenizer_config.json` of the tokenizer | source of the `chat_template` field | operating | table at `tokenizer.rs:14` |
+| `CROW_TOKENIZER` | `engine/src/tokenizer.rs:517` (`default_source`) | path; unset: resolved by `resolve_tokenizer` (#121, 2026-09-27) - `CROW_MODEL_DIR/tokenizer.json` if present, else `models/<model>/tokenizer.json` beside the container (`<model>` = the index v2's source repo name, e.g. `models/Qwen3.8-27B/`) if present, else `DEFAULT_TOKENIZER` = `models/Qwen3.8-Flash-Next-original/tokenizer.json` | HF tokenizer file, repository relative; the boot line `[serve] tokenizer source: ...` names which rule chose it | operating | table at `tokenizer.rs:13`. Before #121 the dense 27B was served with Flash-Next's files (byte-identical today, so no failure) |
+| `CROW_TOKENIZER_CONFIG` | `engine/src/tokenizer.rs:526` (`default_source`) | path; default the sibling `tokenizer_config.json` of the tokenizer | source of the `chat_template` field | operating | table at `tokenizer.rs:14` |
 
 ## Dumps and profiling (8 rows)
 

@@ -10,7 +10,7 @@
 //!
 //! | file | default | env override |
 //! |---|---|---|
-//! | HF tokenizer | `models/Qwen3.8-Flash-Next-original/tokenizer.json` | `CROW_TOKENIZER` |
+//! | HF tokenizer | the model's own `tokenizer.json` ([`resolve_tokenizer`], #121), else `models/Qwen3.8-Flash-Next-original/tokenizer.json` | `CROW_TOKENIZER` |
 //! | chat template | sibling `tokenizer_config.json`, field `chat_template` | `CROW_TOKENIZER_CONFIG` |
 //!
 //! Python semantics reproduced (`tools/tokenize_ids.py:26-45`):
@@ -458,11 +458,79 @@ pub fn user_message(text: &str) -> Value {
     serde_json::json!([{ "role": "user", "content": text }])
 }
 
-/// - `CROW_TOKENIZER` or `DEFAULT_TOKENIZER`
+/// the HF file name inside a model directory
+pub const TOKENIZER_FILE: &str = "tokenizer.json";
+
+/// #121: which `tokenizer.json` this process loads, and why (the boot line says it).
+/// In this order, the first that applies wins:
+///
+/// 1. `CROW_TOKENIZER` (`env`), as given - a missing file is the load's named refusal;
+/// 2. `CROW_MODEL_DIR/tokenizer.json` (`model_dir`), when the file is there;
+/// 3. `models/<model>/tokenizer.json` beside the container, `<model>` = the source repo's
+///    name from the index v2 (`Qwen/Qwen3.8-27B` -> `Qwen3.8-27B`), the same directory
+///    `vit::resolve_mmproj` looks in first (#122), when the file is there;
+/// 4. `DEFAULT_TOKENIZER` (Flash-Next's). When 3 was tried and missed, the reason names it.
+///
+/// `exists` is the file test, injected so the unit test runs without the files.
+pub fn resolve_tokenizer(
+    env: Option<&str>,
+    model_dir: Option<&str>,
+    cnq_path: &str,
+    model: Option<&str>,
+    exists: &dyn Fn(&str) -> bool,
+) -> (String, String) {
+    if let Some(p) = env.filter(|p| !p.is_empty()) {
+        return (p.to_string(), "CROW_TOKENIZER".to_string());
+    }
+    if let Some(d) = model_dir.filter(|d| !d.is_empty()) {
+        let p = std::path::Path::new(d).join(TOKENIZER_FILE).to_string_lossy().into_owned();
+        if exists(&p) {
+            return (p, "CROW_MODEL_DIR".to_string());
+        }
+    }
+    let mut missed = None;
+    if let Some(m) = model.filter(|m| !m.is_empty()) {
+        let root = std::path::Path::new(cnq_path).parent().and_then(|d| d.parent());
+        let p = root
+            .unwrap_or_else(|| std::path::Path::new(""))
+            .join("models")
+            .join(m)
+            .join(TOKENIZER_FILE)
+            .to_string_lossy()
+            .into_owned();
+        if exists(&p) {
+            return (p, format!("the container's model directory ({m})"));
+        }
+        missed = Some(p);
+    }
+    let why = match missed {
+        Some(p) => format!("{p} is missing - Flash-Next's default instead"),
+        None => "default (the container names no model of its own)".to_string(),
+    };
+    (DEFAULT_TOKENIZER.to_string(), why)
+}
+
+/// the process's choice: `CROW_TOKENIZER`, `CROW_MODEL_DIR` and the index v2 of `CROW_CNQ`
+/// (else `geo::DEFAULT_CNQ`), peeked without mapping. An unreadable container gives no
+/// model here; the boot door refuses it later by name. Returns (tokenizer, config, why).
+pub fn default_source() -> (String, String, String) {
+    let env = std::env::var("CROW_TOKENIZER").ok();
+    let model_dir = std::env::var("CROW_MODEL_DIR").ok();
+    let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| crate::geo::DEFAULT_CNQ.to_string());
+    let model = crate::cnq::Cnq::peek_index(&cnq_path)
+        .ok()
+        .and_then(|peek| peek.model().map(|m| m.source_repo.rsplit('/').next().unwrap_or_default().to_string()));
+    let (t, why) = resolve_tokenizer(env.as_deref(), model_dir.as_deref(), &cnq_path, model.as_deref(), &|p| {
+        std::path::Path::new(p).is_file()
+    });
+    let c = std::env::var("CROW_TOKENIZER_CONFIG").unwrap_or_else(|_| sibling_config(&t));
+    (t, c, why)
+}
+
+/// - the tokenizer from [`default_source`]
 /// - `CROW_TOKENIZER_CONFIG` or the sibling `tokenizer_config.json`
 pub fn default_paths() -> (String, String) {
-    let t = std::env::var("CROW_TOKENIZER").unwrap_or_else(|_| DEFAULT_TOKENIZER.to_string());
-    let c = std::env::var("CROW_TOKENIZER_CONFIG").unwrap_or_else(|_| sibling_config(&t));
+    let (t, c, _) = default_source();
     (t, c)
 }
 
@@ -488,6 +556,64 @@ mod tests {
         // tests run from engine/, the model lives at the repository root
         let t = format!("../{DEFAULT_TOKENIZER}");
         ChatTokenizer::load(&t, &sibling_config(&t)).expect("tokenizer loads")
+    }
+
+    /// #121: the resolution order, with no files and no environment
+    #[test]
+    fn the_tokenizer_comes_from_the_models_own_directory() {
+        let all = |_: &str| true;
+        let none = |_: &str| false;
+        let dense = "converter/Qwen3.8-27B-CNQ4.5.cnq";
+        // the dense 27B: its own directory beside the container, not Flash-Next's
+        let (t, why) = resolve_tokenizer(None, None, dense, Some("Qwen3.8-27B"), &all);
+        assert_eq!(t, "models/Qwen3.8-27B/tokenizer.json");
+        assert!(why.contains("Qwen3.8-27B"), "{why}");
+        assert_eq!(sibling_config(&t), "models/Qwen3.8-27B/tokenizer_config.json");
+        // an absolute container path keeps its root
+        let (t, _) = resolve_tokenizer(None, None, "/r/crow-nest/converter/x.cnq", Some("M"), &all);
+        assert_eq!(t, "/r/crow-nest/models/M/tokenizer.json");
+        // CROW_TOKENIZER wins, even over a present model directory, and is not tested for existence
+        let (t, why) = resolve_tokenizer(Some("/x/tokenizer.json"), Some("/d"), dense, Some("Qwen3.8-27B"), &none);
+        assert_eq!((t.as_str(), why.as_str()), ("/x/tokenizer.json", "CROW_TOKENIZER"));
+        // CROW_MODEL_DIR comes next, only when its file is there
+        let (t, why) = resolve_tokenizer(None, Some("/d"), dense, Some("Qwen3.8-27B"), &all);
+        assert_eq!((t.as_str(), why.as_str()), ("/d/tokenizer.json", "CROW_MODEL_DIR"));
+        let only_model = |p: &str| p.starts_with("models/");
+        let (t, _) = resolve_tokenizer(None, Some("/d"), dense, Some("Qwen3.8-27B"), &only_model);
+        assert_eq!(t, "models/Qwen3.8-27B/tokenizer.json");
+        // the Flash-Next container of record (index v1, no model block): the default, as before
+        let (t, why) = resolve_tokenizer(None, None, crate::geo::DEFAULT_CNQ, None, &all);
+        assert_eq!(t, DEFAULT_TOKENIZER);
+        assert!(why.starts_with("default"), "{why}");
+        // the model's directory is missing: the default, and the reason names the missed file
+        let (t, why) = resolve_tokenizer(None, None, dense, Some("Qwen3.8-27B"), &none);
+        assert_eq!(t, DEFAULT_TOKENIZER);
+        assert!(why.contains("models/Qwen3.8-27B/tokenizer.json is missing"), "{why}");
+    }
+
+    /// #121, the real container when this machine has it: its index v2 names the
+    /// dense 27B and the tokenizer resolves to that model's directory (reads the
+    /// index trailer only, no tensor data)
+    #[test]
+    fn the_dense_27b_container_resolves_its_own_tokenizer() {
+        let cnq = "../converter/Qwen3.8-27B-CNQ4.5.cnq";
+        let Ok(peek) = crate::cnq::Cnq::peek_index(cnq) else {
+            eprintln!("no 27B container on this machine - skipped");
+            return;
+        };
+        let model = peek.model().map(|m| m.source_repo.rsplit('/').next().unwrap_or_default().to_string());
+        assert_eq!(model.as_deref(), Some("Qwen3.8-27B"));
+        let (t, _) = resolve_tokenizer(None, None, cnq, model.as_deref(), &|p| std::path::Path::new(p).is_file());
+        if !std::path::Path::new(&t).is_file() {
+            panic!("resolved {t}, which does not exist");
+        }
+        assert_eq!(t, "../models/Qwen3.8-27B/tokenizer.json");
+        // and it loads, template included
+        ChatTokenizer::load(&t, &sibling_config(&t)).expect("the 27B tokenizer loads");
+        // the Flash-Next container of record (index v1) names no model: its default is unchanged
+        if let Ok(fnx) = crate::cnq::Cnq::peek_index(&format!("../{}", crate::geo::DEFAULT_CNQ)) {
+            assert!(fnx.model().is_none());
+        }
     }
 
     #[test]
