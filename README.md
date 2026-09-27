@@ -52,6 +52,7 @@ crow --base-url http://127.0.0.1:8099/v1
 <p align="center"><sub>
 Apache-2.0 · <a href="https://github.com/nibor1896/crow-nest">nibor1896/crow-nest</a> ·
 Model: <a href="https://huggingface.co/nibor1896/Qwen3.8-Flash-Next-CNQ4.5-M">Qwen3.8-Flash-Next CNQ4.5-M</a> (Qwen Community License 1.0) ·
+<a href="https://huggingface.co/Qwen/Qwen3.8-27B">Qwen3.8-27B</a> (Apache-2.0) ·
 Client: <a href="https://github.com/nibor1896/Crow">Crow</a>
 </sub></p>
 
