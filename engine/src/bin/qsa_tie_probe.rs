@@ -34,10 +34,14 @@
 use crow_nest_engine::cuda;
 use crow_nest_engine::gen::{launch_qsa_par_e, QSA_PAR_BINS};
 use crow_nest_engine::kernels::launch_v;
-use crow_nest_engine::geo::{QSA_BLOCK_TOPK, QSA_SEL_MAX};
+use crow_nest_engine::geo::{Dims, Geo};
 use crow_nest_engine::sample::Rng;
 
-const K: usize = QSA_BLOCK_TOPK; // 512, the production budget in blocks
+// Crow #300 C4: this probe loads no model; its synthetic shapes are Flash-Next's,
+// read from Geo::FLASH_NEXT's Dims, and the kernels compile with that Geo's prelude
+const G: Dims = Geo::FLASH_NEXT.dims();
+const QSA_SEL_MAX: usize = G.qsa_sel_max;
+const K: usize = G.qsa_block_topk; // 512, the production budget in blocks
 const CAP: usize = 65536; // the production score-cap (262k-context ceiling)
 const POISON: i32 = -559038737; // 0xDEADBEEF as i32
 
@@ -107,7 +111,7 @@ fn main() {
     let mut ok = true;
     unsafe {
         let _ctx = cuda::Ctx::init();
-        let module = cuda::compile(crow_nest_engine::kernels::KERNEL_SRC);
+        let module = cuda::compile(&crow_nest_engine::kernels::KernelGeo::flash_next().source());
         let f_sel = module.get("qsa_select");
         let f_fast = module.get("qsa_select_fast");
         let f_par_h = module.get("qsa_select_par_h");

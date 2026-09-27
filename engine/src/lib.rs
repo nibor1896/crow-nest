@@ -71,6 +71,7 @@ pub mod cuda;
 pub mod cnq;
 pub mod geo;
 pub mod kernels;
+pub mod kernels_p2;
 pub mod manager;
 pub mod residency;
 // the container tensor -> device loaders and the NVFP4 pair (no launch policy):

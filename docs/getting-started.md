@@ -109,6 +109,8 @@ tools/gate-linux.sh
 - On 2026-09-25 the four numeric items got new values of record (`decc3e9`, #94 phase 2 C0: measured twice at `eb0913f`,
   byte-identical) and `CLIPPY=1522`. At v0.6.0 (`0263990`) the pinned count is `TESTS=413` (284 lib + 118 serve + 6 parity
   + 5 decode, 3 lib tests ignored), and all nine items are GREEN (`decode_out/gate-0925-release`, 2026-09-25).
+- At v0.7.0 (2026-09-27) the pins are `TESTS=458` and `CLIPPY=1494` (the dense 27B, MTP, #122, #123), and all items are
+  GREEN on the release head (`decode_out/gate-2026-09-27`); the four numeric values of record are unchanged.
 - Engine runs are sequential on purpose: before every engine start the gate asks the engine's own
   `ramcheck --need` (`free_for_pin`, issue #103, `tools/pin-room.sh`) whether the pinned tier fits.
 

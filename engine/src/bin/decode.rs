@@ -42,7 +42,7 @@ fn main() {
     // (e.g. a sidecar warmed on real traffic via `decode warmup`)
     // defaults (#48): the production -M container and the id-sorted rectangular
     // sidecar serve.rs loads, both relative to engine/, the cwd of `decode`
-    let (mut cnq, _ctx, mut cfg, cnq_path, sidecar) = unsafe {
+    let (mut cnq, _ctx, mut cfg, cnq_path, sidecar, geo) = unsafe {
         boot::open_model(from_engine_dir(DEFAULT_CNQ), from_engine_dir(DEFAULT_HOTSETS))
     };
 
@@ -71,22 +71,29 @@ fn main() {
                 // ids[n..] teacher-forced through decode_step (one logits row per step) —
                 // decode-path rows against prefill-path rows under the same context
                 let tf_split: usize = env_parse("CROW_PARITY_PREFILL").unwrap_or(ids.len()).clamp(1, ids.len());
+                // Crow #300 phase 2: CROW_PARITY_TAIL=<n> - the long-context form: prefill ids[..T-n]
+                // WITHOUT collecting logits (T rows x 248,320 f32 would be 8 GB at 8k tokens), then
+                // the last n ids teacher-forced through decode_step, one logits row each; the
+                // reference (`oracle/ref_qwen35_logits.py`) scores the same rows (`row0_pos`)
+                let tail: Option<usize> = env_parse::<usize>("CROW_PARITY_TAIL").map(|n| n.clamp(1, ids.len() - 1));
+                let tf_split = tail.map_or(tf_split, |n| ids.len() - n);
                 if tf_split < ids.len() {
-                    cfg.prompt_chunk = tf_split;
+                    // the tail form prefills in serve's chunks (2048), the path a long session takes
+                    cfg.prompt_chunk = if tail.is_some() { tf_split.min(2048) } else { tf_split };
                 }
                 std::fs::create_dir_all(&out).unwrap();
                 let mut eng =
-                    Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
                 println!("decode/parity: {} prompt tokens ({} prefilled, {} teacher-forced), collecting all logits …",
                     ids.len(), tf_split, ids.len() - tf_split);
                 let mut logits = Vec::new();
                 let t0 = std::time::Instant::now();
-                let mut tok = eng.prefill(&mut cnq, &ids[..tf_split], Some(&mut logits));
+                let mut tok = eng.prefill(&mut cnq, &ids[..tf_split], if tail.is_some() { None } else { Some(&mut logits) });
                 println!("prefill+logits in {:.1} s", t0.elapsed().as_secs_f64());
                 let mut tf_trace: Vec<usize> = vec![tok];
                 for &fed in &ids[tf_split..] {
                     tok = eng.decode_step(&mut cnq, fed);
-                    logits.push(crow_nest_engine::cuda::dtoh(eng.logits(), V));
+                    logits.push(crow_nest_engine::cuda::dtoh(eng.logits(), eng.geo.vocab));
                     tf_trace.push(tok);
                 }
                 if tf_split < ids.len() {
@@ -107,7 +114,7 @@ fn main() {
                     println!("  decode pos {pos} → {next} ({:.1} ms)", t0.elapsed().as_secs_f64() * 1e3);
                     // recompute logits row for this position (decode wrote row 0)
                     // — captured via head_run inside decode_step; read it back:
-                    let lg = crow_nest_engine::cuda::dtoh(eng.logits(), V);
+                    let lg = crow_nest_engine::cuda::dtoh(eng.logits(), eng.geo.vocab);
                     logits.push(lg);
                 }
                 all_ids.push(next as i64);
@@ -126,6 +133,8 @@ fn main() {
                     &serde_json::json!({
                         "prompt_len": ids.len(),
                         "prefill_len": tf_split,
+                        // the position of logits row 0 (0 unless CROW_PARITY_TAIL collected the tail only)
+                        "row0_pos": if tail.is_some() { tf_split } else { 0 },
                         "tf_trace": tf_trace,
                         "all_ids": all_ids,
                         "rows": logits.len(),
@@ -144,7 +153,7 @@ fn main() {
                 crow_nest_engine::geo::apply_chunk_policy(&mut cfg, ids.len());
                 std::fs::create_dir_all("decode_out").unwrap();
                 let mut eng =
-                    Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
                 println!("decode/run: {} prompt tokens → {gen} steps", ids.len());
                 // #13: the operating point as ONE structured line on target `boot`
                 // (stderr + the log file), so every number this run prints has the
@@ -154,7 +163,7 @@ fn main() {
                 crow_nest_engine::log::boot(&eng.boot_point(
                     "decode run",
                     &cnq_path,
-                    &sidecar,
+                    sidecar.as_deref().unwrap_or("none (no routed experts)"),
                     "zero-copy read from the pinned tier; the trickle policy of the [policy] line",
                     false,
                 ));
@@ -175,7 +184,7 @@ fn main() {
                 // overridable) - on the device (sample_k behind argmax_k, captured
                 // with the graph, so it must be enabled before the warm-up step)
                 // unless CROW_SAMPLE_HOST=1 keeps the host path (logits readback)
-                let mut sampler = crow_nest_engine::sample::Sampler::from_env();
+                let mut sampler = crow_nest_engine::sample::Sampler::from_env(Some(eng.geo.vocab));
                 // #85/#92: a host-only knob (DRY, the #92 tier) takes the host path too
                 let sample_host = crow_nest_engine::sample::host_forced()
                     || sampler.as_ref().is_some_and(|s| s.host_route());
@@ -194,9 +203,9 @@ fn main() {
                 // counter baseline AFTER prefill + warm-up: cold/token below is per
                 // timed decode token (the counters are cumulative since load)
                 let c0 = eng.drain_counters();
-                let (ple_r0, ple_m0) = (eng.ple().req, eng.ple().miss);
+                let (ple_r0, ple_m0) = eng.ple_counts();
                 println!("ple rows during prefill+warm-up: {} requested, {} misses ({:.1} %), cache slots {}",
-                    ple_r0, ple_m0, 100.0 * ple_m0 as f64 / ple_r0.max(1) as f64, eng.ple().n_slots);
+                    ple_r0, ple_m0, 100.0 * ple_m0 as f64 / ple_r0.max(1) as f64, eng.ple().map_or(0, |p| p.n_slots));
                 {
                     let (s0, k0): (u64, u64) = (c0.iter().map(|x| x[0]).sum(), c0.iter().map(|x| x[1]).sum());
                     println!("cold experts during prefill+warm-up: {:.1} per token of {:.0} selections ({} tokens)",
@@ -208,14 +217,14 @@ fn main() {
                 // CROW_STOP_EOS=1 ends the run at EOS
                 if sample_host {
                     if let Some(s) = &mut sampler {
-                        let lg = crow_nest_engine::cuda::dtoh(eng.logits(), V);
+                        let lg = crow_nest_engine::cuda::dtoh(eng.logits(), eng.geo.vocab);
                         next = s.sample(&lg);
                         s.observe(next);
                         trace[0] = next;
                     }
                 }
                 let stop_eos = crow_nest_engine::sample::stop_on_eos();
-                let mut stopped_eos = stop_eos && crow_nest_engine::sample::EOS_IDS.contains(&next);
+                let mut stopped_eos = stop_eos && geo.eos_ids.contains(&next);
                 // CROW_ADAPT_EVERY=K: re-cut the hot set from the cumulative routing
                 // every K decode tokens (<= CROW_ADAPT_MAX swaps per layer, default 8);
                 // the swap time is charged to that token's latency (amortized cost)
@@ -242,14 +251,14 @@ fn main() {
                     next = eng.decode_step(&mut cnq, next as i64);
                     if sample_host {
                         if let Some(s) = &mut sampler {
-                            let lg = crow_nest_engine::cuda::dtoh(eng.logits(), V);
+                            let lg = crow_nest_engine::cuda::dtoh(eng.logits(), eng.geo.vocab);
                             next = s.sample(&lg);
                             s.observe(next);
                         }
                     }
                     lat.push(t0.elapsed().as_secs_f64() * 1e3);
                     trace.push(next);
-                    if stop_eos && crow_nest_engine::sample::EOS_IDS.contains(&next) {
+                    if stop_eos && geo.eos_ids.contains(&next) {
                         stopped_eos = true;
                     }
                 }
@@ -273,7 +282,7 @@ fn main() {
                 );
                 let gen_timed = (gen - 1).max(1) as f64;
                 {
-                    let (r, m) = (eng.ple().req - ple_r0, eng.ple().miss - ple_m0);
+                    let (r, m) = (eng.ple_counts().0 - ple_r0, eng.ple_counts().1 - ple_m0);
                     println!("ple rows per timed decode token: {:.1} requested, {:.2} misses ({:.1} %)",
                         r as f64 / gen_timed, m as f64 / gen_timed, 100.0 * m as f64 / r.max(1) as f64);
                 }
@@ -322,7 +331,7 @@ fn main() {
                 std::env::set_var("CROW_ROUTE_DUMP", "1");
                 std::env::set_var("CROW_GRAPH", "0");
                 let mut eng =
-                    Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
                 let t0 = std::time::Instant::now();
                 let mut next = eng.prefill(&mut cnq, &ids, None);
                 println!("routestats: prefill {} tokens in {:.1} s", ids.len(), t0.elapsed().as_secs_f64());
@@ -332,7 +341,7 @@ fn main() {
                     next = eng.decode_step(&mut cnq, next as i64);
                     trace.push(next as i64);
                 }
-                let routes: Vec<Vec<[i32; 10]>> = eng.route_log().to_vec();
+                let routes: Vec<Vec<Vec<i32>>> = eng.route_log().to_vec();
                 serde_json::to_writer(
                     std::fs::File::create(&out).unwrap(),
                     &serde_json::json!({
@@ -356,9 +365,9 @@ fn main() {
                 assert!(!std::path::Path::new(&out).exists(), "warmup: {out} exists - refusing to overwrite");
                 let ids = read_ids(&ids_path);
                 cfg.n_hot = n;
-                let even: [[u64; E]; LAYERS] = [[1u64; E]; LAYERS];
+                let even = vec![vec![1u64; geo.moe().experts]; geo.layers];
                 let mut eng =
-                    Engine::load(&mut cnq, cfg, Some(&even), &out, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, Some(&even[..]), Some(&out), false, &mut |m| println!("[load] {m}"));
                 println!("warmup: prefill over {} real tokens (chunk {}) …", ids.len(), cfg.prompt_chunk);
                 let t0 = std::time::Instant::now();
                 let _ = eng.prefill(&mut cnq, &ids, None);
@@ -367,7 +376,7 @@ fn main() {
                 let sets: Vec<Vec<u32>> = counts
                     .iter()
                     .map(|c| {
-                        let mut ord: Vec<u32> = (0..E as u32).collect();
+                        let mut ord: Vec<u32> = (0..geo.moe().experts as u32).collect();
                         ord.sort_by(|&a, &b| c[b as usize].cmp(&c[a as usize]).then(a.cmp(&b)));
                         ord.truncate(n);
                         ord // frequency order (truncate-safe)
@@ -380,7 +389,7 @@ fn main() {
                     tot += c.iter().sum::<u64>();
                     hit += sets[l].iter().map(|&e| c[e as usize]).sum::<u64>();
                 }
-                let slabs = crow_nest_engine::residency::expert_slab_info(&cnq, 0, "text");
+                let slabs = crow_nest_engine::residency::expert_slab_info(&cnq, 0, "text", geo.moe().experts);
                 crow_nest_engine::residency::persist_sidecar(
                     &out, n, &sets, &slabs,
                     &format!("decode warmup, {} real tokens from {}, top-{n}/layer, frequency order", ids.len(), ids_path),
@@ -398,7 +407,7 @@ fn main() {
                 println!("reloadcheck: free VRAM before any load {:.1} MB", f0 as f64 / 1e6);
                 for i in 0..n {
                     let mut eng =
-                        Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |_| {});
+                        Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |_| {});
                     let ids = [760i64, 3841, 13477, 37550, 33075, 888, 279, 15217];
                     let mut next = eng.prefill(&mut cnq, &ids, None);
                     for _ in 0..3 {
@@ -417,11 +426,12 @@ fn main() {
                 // oracle/golden/layer0-input.f32, run layer 0, compare to
                 // oracle/golden/layer0-golden-output.f32
                 let mut eng =
-                    Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
                 let inp = std::fs::read("../oracle/golden/layer0-input.f32").unwrap();
                 let gold = std::fs::read("../oracle/golden/layer0-golden-output.f32").unwrap();
                 let t = 8usize;
-                assert_eq!(inp.len(), t * HCT * 4);
+                let hct = geo.residual_width();
+                assert_eq!(inp.len(), t * hct * 4);
                 let to_f32 = |b: &[u8]| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>();
                 let x = to_f32(&inp);
                 let g = to_f32(&gold);
@@ -430,7 +440,7 @@ fn main() {
                 let out = eng.run_layer0_with_stage_dumps(&h_in, t, "../probes/engine-p8debug");
                 let mut nan = 0usize;
                 let mut max_abs = 0f32;
-                for i in 0..t * HCT {
+                for i in 0..t * hct {
                     if out[i].is_nan() { nan += 1; }
                     max_abs = max_abs.max((out[i] - g[i]).abs());
                 }
@@ -445,13 +455,14 @@ fn main() {
                 // Reference marks (p16, all-proj FP4 vs this golden): rel_L2
                 // 0.165, max_abs 0.582 — the "expected bad" FP4 attention delta.
                 let mut eng =
-                    Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
                 let to_f32 = |b: &[u8]| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>();
                 let inp = std::fs::read("../oracle/golden/layer3-attn-input.f32").unwrap();
                 let gold = std::fs::read("../oracle/golden/layer3-attn-output.f32").unwrap();
                 let t = 8usize;
-                assert_eq!(inp.len(), t * H * 4, "golden input shape [8][2560] f32");
-                assert_eq!(gold.len(), t * H * 4, "golden output shape [8][2560] f32");
+                let h = geo.hidden;
+                assert_eq!(inp.len(), t * h * 4, "golden input shape [8][2560] f32");
+                assert_eq!(gold.len(), t * h * 4, "golden output shape [8][2560] f32");
                 let x = to_f32(&inp);
                 let g = to_f32(&gold);
                 match &eng.weights().sub[3] {
@@ -528,10 +539,10 @@ fn main() {
                 let mut s_sg = 0f64;
                 let mut s_nan = 0usize;
                 for i in 0..t {
-                    let row = eng.run_attn_subblock(3, &x[i * H..(i + 1) * H], 1, i);
-                    let gold_row = &g[i * H..(i + 1) * H];
+                    let row = eng.run_attn_subblock(3, &x[i * h..(i + 1) * h], 1, i);
+                    let gold_row = &g[i * h..(i + 1) * h];
                     let mut r_max = 0f32;
-                    for j in 0..H {
+                    for j in 0..h {
                         if row[j].is_nan() { s_nan += 1; }
                         let a = (row[j] - gold_row[j]).abs();
                         r_max = r_max.max(a);
@@ -545,6 +556,244 @@ fn main() {
                 println!(
                     "layercheck3 stepwise: max_abs={s_max:.4} rel_L2={s_rel:.4} NaN={s_nan} (batched==stepped pin, p11/p12 pattern)"
                 );
+            }
+            "mtpspec" => {
+                // crow-nest #95 step 2a: greedy with the MTP head (verified row by row) against
+                // plain greedy on the same engine: the token ids must be identical (PREREG C2)
+                // and the draft counters give the head's acceptance inside the engine.
+                // mtpspec <ids.json> [n = 128] [k = 3]; needs the MTP head (the default; not CROW_MTP=0).
+                let ids = read_ids(&args[2]);
+                let n: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(128);
+                let k: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(3);
+                crow_nest_engine::geo::apply_chunk_policy(&mut cfg, ids.len());
+                let mut eng = Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
+                // CROW_SAMPLE=1 (+ CROW_TEMP / CROW_TOP_P / CROW_TOP_K / CROW_MIN_P / CROW_PRESENCE /
+                // CROW_SEED): every run draws with the device sampler, re-armed per run (same seed),
+                // the first token drawn from the prefill row; C2's identity is then a greedy-only claim
+                let sampler = crow_nest_engine::sample::Sampler::from_env(Some(eng.geo.vocab));
+                if let Some(sm) = &sampler {
+                    println!("{}", sm.describe());
+                    eng.enable_dev_sampler(sm);
+                }
+                let mut first = eng.prefill(&mut cnq, &ids, None) as i64;
+                if sampler.is_some() {
+                    first = eng.sample_last() as i64;
+                }
+                let t0 = std::time::Instant::now();
+                let mut plain = vec![first];
+                // 16 tokens more than the spec runs make: the serve-shaped run hands the rest to
+                // decode_step after spec_finish, which must continue exactly as plain did
+                while plain.len() < n + 16 {
+                    let y = eng.decode_step(&mut cnq, *plain.last().unwrap()) as i64;
+                    plain.push(y);
+                }
+                let plain_s = t0.elapsed().as_secs_f64() * n as f64 / (n + 16) as f64;
+                eng.reset_to_zero();
+                if let Some(sm) = &sampler {
+                    eng.enable_dev_sampler(sm);
+                }
+                let mut first2 = eng.prefill(&mut cnq, &ids, None) as i64;
+                if sampler.is_some() {
+                    first2 = eng.sample_last() as i64;
+                }
+                assert_eq!(first, first2, "the prefill (and the first draw, same seed) is deterministic");
+                let t1 = std::time::Instant::now();
+                let (spec, st) = eng.mtp_spec_greedy(&mut cnq, first2, n, k);
+                let spec_s = t1.elapsed().as_secs_f64();
+                let diverge = plain.iter().zip(&spec).position(|(a, b)| a != b);
+                println!("mtpspec: {} prompt tokens, {n} generated, k {k}", ids.len());
+                println!("mtpspec: C2 greedy ids identical: {}{}", diverge.is_none(),
+                    diverge.map(|i| format!(" (first difference at token {i}: plain {} spec {})", plain[i], spec[i])).unwrap_or_default());
+                let acc: Vec<String> = (0..k).map(|i| format!("{:.3} ({}/{})", st.accepted[i] as f64 / st.proposed[i].max(1) as f64, st.accepted[i], st.proposed[i])).collect();
+                println!("mtpspec: passes {}, tokens per pass {:.3}, acceptance per chain position [{}]",
+                    st.passes, (st.tokens - 1) as f64 / st.passes.max(1) as f64, acc.join(", "));
+                println!("mtpspec: plain {:.1} tok/s, spec (row-by-row verify, no speed-up by design) {:.1} tok/s",
+                    (n - 1) as f64 / plain_s, (n - 1) as f64 / spec_s);
+                // step 2b: the batched verify (one weight read for the k + 1 rows)
+                eng.reset_to_zero();
+                if let Some(sm) = &sampler {
+                    eng.enable_dev_sampler(sm);
+                }
+                let mut first3 = eng.prefill(&mut cnq, &ids, None) as i64;
+                if sampler.is_some() {
+                    first3 = eng.sample_last() as i64;
+                }
+                assert_eq!(first, first3, "the prefill (and the first draw, same seed) is deterministic");
+                // CROW_KPROF=1 (with CROW_GRAPH=0): the per-kernel profile of the batched run only
+                if let Ok(mut g) = crow_nest_engine::kernels::KPROF.lock() {
+                    *g = None;
+                }
+                let t2 = std::time::Instant::now();
+                let (bat, sb) = eng.mtp_spec_greedy_batched(first3, n, k);
+                let bat_s = t2.elapsed().as_secs_f64();
+                if std::env::var("CROW_KPROF").is_ok() {
+                    crow_nest_engine::kernels::kprof_report(sb.passes as u64);
+                }
+                let dv = plain.iter().zip(&bat).position(|(a, b)| a != b);
+                println!("mtpspec-batched: C2 greedy ids identical: {}{}", dv.is_none(),
+                    dv.map(|i| format!(" (first difference at token {i}: plain {} batched {})", plain[i], bat[i])).unwrap_or_default());
+                let accb: Vec<String> = (0..k).map(|i| format!("{:.3} ({}/{})", sb.accepted[i] as f64 / sb.proposed[i].max(1) as f64, sb.accepted[i], sb.proposed[i])).collect();
+                println!("mtpspec-batched: passes {}, tokens per pass {:.3}, acceptance [{}], {:.1} tok/s (plain {:.1})",
+                    sb.passes, (sb.tokens - 1) as f64 / sb.passes.max(1) as f64, accb.join(", "), (n - 1) as f64 / bat_s, (n - 1) as f64 / plain_s);
+                // step 5: the serve-shaped path - spec_step as decode_step's stand-in, spec_finish,
+                // then plain decode_step for 16 tokens (the engine must stand where plain stood)
+                eng.reset_to_zero();
+                if let Some(sm) = &sampler {
+                    eng.enable_dev_sampler(sm);
+                }
+                let mut first4 = eng.prefill(&mut cnq, &ids, None) as i64;
+                if sampler.is_some() {
+                    first4 = eng.sample_last() as i64;
+                }
+                assert_eq!(first, first4, "the prefill (and the first draw, same seed) is deterministic");
+                eng.spec_stats = Default::default();
+                let t3 = std::time::Instant::now();
+                let mut sv = vec![first4];
+                while sv.len() < n {
+                    let y = eng.spec_step(*sv.last().unwrap()) as i64;
+                    sv.push(y);
+                }
+                let sv_s = t3.elapsed().as_secs_f64();
+                eng.spec_finish();
+                while sv.len() < n + 16 {
+                    let y = eng.decode_step(&mut cnq, *sv.last().unwrap()) as i64;
+                    sv.push(y);
+                }
+                let ds = plain.iter().zip(&sv).position(|(a, b)| a != b);
+                let st5 = eng.spec_stats.clone();
+                println!("mtpspec-step: C2 ids identical over {} tokens (spec_step x {n}, spec_finish, decode_step x 16): {}{}", n + 16, ds.is_none(),
+                    ds.map(|i| format!(" (first difference at token {i}: plain {} spec_step {})", plain[i], sv[i])).unwrap_or_default());
+                println!("mtpspec-step: passes {}, tokens per pass {:.3}, k histogram {:?}, {:.1} tok/s (plain {:.1})",
+                    st5.passes, st5.tokens as f64 / st5.passes.max(1) as f64, st5.k_hist, (n - 1) as f64 / sv_s, (n - 1) as f64 / plain_s);
+                println!("trace-plain: {plain:?}");
+            }
+            "mtpgolden" => {
+                // crow-nest #95 step 1 (decode_out/p2-mtp/PREREG.md C1): the MTP head's draft
+                // logits of every pair of <dir>/gen-sequence.json, teacher-forced in one chunk, to
+                // <dir>/mtp-gpu-logits.f32 [T-1][V]; the reference is oracle/ref_qwen35_mtp.py's
+                // <dir>/mtp-logits.f32. Needs the MTP head (the default; not CROW_MTP=0).
+                let dir = args[2].clone();
+                let seq: serde_json::Value = serde_json::from_slice(&std::fs::read(format!("{dir}/gen-sequence.json")).unwrap()).unwrap();
+                let rows = seq["rows"].as_u64().unwrap() as usize;
+                let ids: Vec<i64> = seq["all_ids"].as_array().unwrap()[..rows].iter().map(|v| v.as_i64().unwrap()).collect();
+                cfg.prompt_chunk = ids.len();
+                let mut eng = Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
+                let lg = eng.mtp_teacher_forced(&mut cnq, &ids);
+                crow_nest_engine::cuda::write_le(&format!("{dir}/mtp-gpu-logits.f32"), &lg).unwrap();
+                println!("mtpgolden: {} draft rows -> {dir}/mtp-gpu-logits.f32", ids.len() - 1);
+            }
+            "kvstats" => {
+                // Crow #300 phase 2: why the raw FP8 KV costs so much at long context. Boot with
+                // CROW_KV=bf16 (the exact values), prefill the prompt, read every attention
+                // layer's K and V cache and compare three e4m3 encodings of the same values:
+                // the raw cast `store_kv` does today, one scale per (layer, K/V, KV head) and
+                // one scale per row (token x head, 256 values); scale = amax / 448.
+                let ids = read_ids(&args[2]);
+                cfg.prompt_chunk = ids.len().min(2048);
+                let mut eng = Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
+                eng.prefill(&mut cnq, &ids, None);
+                let rows = eng.pos();
+                let q = |x: f32| crow_nest_engine::cnq::e4m3_to_f32(crow_nest_engine::cnq::f32_to_e4m3(x));
+                let relerr = |v: &[f32], f: &dyn Fn(usize, f32) -> f32| -> f64 {
+                    let (mut e, mut r) = (0f64, 0f64);
+                    for (i, &x) in v.iter().enumerate() {
+                        let d = (f(i, x) - x) as f64;
+                        e += d * d;
+                        r += (x as f64) * (x as f64);
+                    }
+                    (e / r.max(1e-30)).sqrt()
+                };
+                let ahd = eng.geo.head_dim;
+                println!("kvstats: {rows} rows, KV heads {}, head dim {ahd}; rel RMS error of three e4m3 encodings", eng.geo.kv_heads);
+                println!("{:<5} {:<2} {:>10} {:>10} {:>10} {:>9} {:>10} {:>10} {:>10}", "layer", "kv", "p50|x|", "p99|x|", "max|x|", "subnorm%", "raw", "per-head", "per-row");
+                for ai in 0..eng.geo.attn_layers {
+                    for is_k in [true, false] {
+                        let mut v: Vec<f32> = Vec::new();
+                        for kvh in 0..eng.geo.kv_heads {
+                            v.extend(eng.kv_rows_host(ai, is_k, kvh, rows));
+                        }
+                        let mut a: Vec<f32> = v.iter().map(|x| x.abs()).collect();
+                        a.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                        let pct = |p: f64| a[((a.len() - 1) as f64 * p) as usize];
+                        let sub = a.iter().filter(|&&x| x > 0.0 && x < 0.015625).count() as f64 / a.len() as f64 * 100.0;
+                        let per_plane = rows * ahd;
+                        let head_amax: Vec<f32> = (0..eng.geo.kv_heads).map(|h| v[h * per_plane..(h + 1) * per_plane].iter().fold(0f32, |m, x| m.max(x.abs()))).collect();
+                        let row_amax: Vec<f32> = v.chunks(ahd).map(|r| r.iter().fold(0f32, |m, x| m.max(x.abs()))).collect();
+                        let raw = relerr(&v, &|_, x| q(x));
+                        let ph = relerr(&v, &|i, x| { let s = (head_amax[i / per_plane] / 448.0).max(1e-30); q(x / s) * s });
+                        let pr = relerr(&v, &|i, x| { let s = (row_amax[i / ahd] / 448.0).max(1e-30); q(x / s) * s });
+                        println!("{:<5} {:<2} {:>10.4e} {:>10.4e} {:>10.4e} {:>8.2}% {:>10.3e} {:>10.3e} {:>10.3e}",
+                            ai, if is_k { "K" } else { "V" }, pct(0.5), pct(0.99), a[a.len() - 1], sub, raw, ph, pr);
+                    }
+                }
+            }
+            "p2golden" => {
+                // Crow #300 phase 2: the dense sub-blocks against the HF qwen3_5 goldens of
+                // `oracle/export_qwen35_goldens.py` (weights = this container dequantized, so
+                // the difference is engine math). Thresholds of record:
+                // decode_out/p2-golden/PREREG.md (2026-09-26, sha256 b547f8d6…): the engine may
+                // add at most 1/10 of the quantization mark `cnq_vs_bf16.rel_rms`; the norm
+                // (mark 0) 1e-5. Attention is judged with BF16 KV only (the dense default), FP8 is reported.
+                let dir = args.get(2).cloned().unwrap_or_else(|| "../oracle/golden/qwen35-27b".into());
+                let man: serde_json::Value = serde_json::from_slice(&std::fs::read(format!("{dir}/manifest.json")).unwrap()).unwrap();
+                let (tp, td) = (man["T_prompt"].as_u64().unwrap() as usize, man["D_decode"].as_u64().unwrap() as usize);
+                cfg.prompt_chunk = tp;
+                let mut eng = Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
+                let h = eng.geo.hidden;
+                // the dtype the boot chose (CROW_KV, else the family's default: BF16 on the 27B)
+                let kv_bf16 = cfg.kv == KvDtype::Bf16;
+                let read = |f: &str| -> Vec<f32> {
+                    std::fs::read(format!("{dir}/{f}")).unwrap().as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
+                };
+                let rel = |a: &[f32], b: &[f32]| -> (f64, f64) {
+                    let (mut e2, mut r2, mut mx) = (0f64, 0f64, 0f64);
+                    for (x, y) in a.iter().zip(b) {
+                        let d = (*x - *y) as f64;
+                        e2 += d * d;
+                        r2 += (*y as f64) * (*y as f64);
+                        mx = mx.max(d.abs());
+                    }
+                    ((e2 / r2.max(1e-30)).sqrt(), mx)
+                };
+                let mut fails = 0usize;
+                for (name, kind, layer, stepped, judged) in [
+                    ("l0-input-layernorm", "ln1", 0usize, false, true),
+                    ("l0-mlp", "mlp", 0, false, true),
+                    ("l0-gdn", "gdn", 0, true, true),
+                    ("l3-attn", "attn", 3, true, kv_bf16),
+                    // layer 17's down_proj carries a scale byte 0x7F: the check of the load rule
+                    // `gen::load_pw_x` (PREREG amendment 2026-09-26)
+                    ("l17-mlp", "mlp", 17, false, true),
+                ] {
+                    let g = &man["goldens"][name];
+                    let mark = g["cnq_vs_bf16"]["rel_rms"].as_f64().unwrap();
+                    let thr = if mark == 0.0 { 1e-5 } else { mark / 10.0 };
+                    let x = read(g["files"]["input"].as_str().unwrap());
+                    let want = read(g["files"]["output_cnq"].as_str().unwrap());
+                    let rows = x.len() / h;
+                    let prompt = if stepped { tp } else { rows };
+                    let mut got = eng.run_subblock_p2(kind, layer, &x[..prompt * h], prompt, 0);
+                    if stepped {
+                        for r in tp..tp + td {
+                            got.extend(eng.run_subblock_p2(&format!("{kind}_step"), layer, &x[r * h..(r + 1) * h], 1, r));
+                        }
+                    }
+                    let mut groups = vec![("prompt", 0, prompt)];
+                    if stepped {
+                        groups.push(("decode", tp, tp + td));
+                    }
+                    for (gname, a, b) in groups {
+                        let (rr, mx) = rel(&got[a * h..b * h], &want[a * h..b * h]);
+                        let ok = rr <= thr;
+                        let verdict = if !judged { "reported (FP8 KV)" } else if ok { "PASS" } else { "FAIL" };
+                        if judged && !ok {
+                            fails += 1;
+                        }
+                        println!("p2golden {name:<20} {gname:<6} rows {a:>2}..{:<2} rel_rms {rr:.3e}  max_abs {mx:.3e}  threshold {thr:.2e} (quant mark {mark:.4})  {verdict}", b - 1);
+                    }
+                }
+                println!("p2golden: {} (KV {})", if fails == 0 { "ALL PASS" } else { "FAILED" }, if kv_bf16 { "bf16" } else { "fp8, attention not judged" });
+                selftest_failed = fails > 0;
             }
             "selftest" => {
                 // F5 (#64, 2026-09-18): the PACKAGE self-test. The engine runs on the
@@ -569,7 +818,7 @@ fn main() {
                     .unwrap_or_else(|| "unstated".to_string());
                 println!("selftest: crow-nest package self-test (F5, issue #64)");
                 println!("selftest: container  {cnq_path}");
-                println!("selftest: hot sets   {sidecar}");
+                println!("selftest: hot sets   {}", sidecar.as_deref().unwrap_or("none (no routed experts)"));
                 println!(
                     "selftest: golden     {dir}  ({} check{}, manifest formed {formed})",
                     checks.len(),
@@ -601,7 +850,7 @@ fn main() {
                 let dumps = std::env::temp_dir().join("crow-selftest-stage");
                 let dumps = dumps.to_string_lossy().into_owned();
                 let mut eng =
-                    Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| println!("[load] {m}"));
+                    Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| println!("[load] {m}"));
                 let mut pass = 0usize;
                 for c in &checks {
                     let x = read_f32_exact(&format!("{dir}/{}", c.input), c.t, c.input_width)
@@ -613,11 +862,13 @@ fn main() {
                         // (p10 fed it as x0), which is why the width is HCT and not H
                         "decoder_layer" => {
                             assert_eq!(c.layer, 0, "selftest: `decoder_layer` runs layer 0 only, `{}` names layer {}", c.name, c.layer);
-                            assert_eq!(c.input_width, HCT, "selftest: `{}` input width {} is not HCT {HCT}", c.name, c.input_width);
+                            let hct = geo.residual_width();
+                            assert_eq!(c.input_width, hct, "selftest: `{}` input width {} is not HCT {hct}", c.name, c.input_width);
                             eng.run_layer0_with_stage_dumps(&x, c.t, &dumps)
                         }
                         "attn_subblock" => {
-                            assert_eq!(c.input_width, H, "selftest: `{}` input width {} is not H {H}", c.name, c.input_width);
+                            let h = geo.hidden;
+                            assert_eq!(c.input_width, h, "selftest: `{}` input width {} is not H {h}", c.name, c.input_width);
                             eng.run_attn_subblock(c.layer, &x, c.t, 0)
                         }
                         other => panic!("selftest: unknown check kind `{other}` in {mpath}"),

@@ -228,7 +228,7 @@
 
 use crate::cuda;
 use crate::gen::Engine;
-use crate::geo::{GD, GDN_CONV, GDN_VHEADS, V};
+use crate::geo::{Attn, Geo};
 use cudarc::driver::sys;
 
 /// slot of the snapshot taken after the prompt prefill (spec 7.6, point 1)
@@ -267,16 +267,33 @@ pub fn park_rows(top: usize, cap: usize) -> usize {
 ///   step (`gen.rs`, "garbage lands beyond done_blocks"), which is `dirty / 4` for a
 ///   request that ended at `dirty`; with `dirty <= rows` that block is `<= rows / 4`
 /// - capped at the `ceil(n_ctx / 4)` blocks `qsa_pooled` holds (`manager.rs`)
-pub fn park_blocks(rows: usize, n_ctx: usize) -> usize {
-    (rows / 4 + 1).min(n_ctx.div_ceil(4))
+/// - C3: the 4 is the QSA compress ratio, `compress` = `Geo::qsa().compress`
+pub fn park_blocks(rows: usize, n_ctx: usize, compress: usize) -> usize {
+    (rows / compress + 1).min(n_ctx.div_ceil(compress))
+}
+
+/// bytes of one pooled QSA block row (the raw indexer key width in f32); 0 for full
+/// attention, which pools nothing (Crow #300 phase 2)
+pub fn pooled_row_bytes(geo: &Geo) -> usize {
+    match geo.attn {
+        Attn::Qsa { .. } => geo.qsa().hidd() * 4,
+        Attn::Full => 0,
+    }
 }
 
 /// - #118: host RAM of a park of `rows` rows: the KV rows of every attention layer (K and
-///   V, `NKV` heads of `AHD` values at `kv_value_bytes`) plus `park_blocks` pooled QSA
-///   blocks of `QSA_HIDD` f32 per attention layer
-pub fn park_host_bytes(rows: usize, n_ctx: usize, attn_layers: usize, kv_value_bytes: usize) -> usize {
-    rows * attn_layers * 2 * crate::geo::NKV * crate::geo::AHD * kv_value_bytes
-        + attn_layers * park_blocks(rows, n_ctx) * crate::geo::QSA_HIDD * 4
+///   V, `Geo::kv_heads` heads of `Geo::head_dim` values at `kv_value_bytes`) plus
+///   `park_blocks` pooled QSA blocks of the QSA raw key width in f32 per attention layer
+/// - C5: the pooled blocks are the `Attn::Qsa` arm; full attention parks KV rows only
+pub fn park_host_bytes(geo: &Geo, rows: usize, n_ctx: usize, attn_layers: usize, kv_value_bytes: usize) -> usize {
+    let pooled = match geo.attn {
+        Attn::Qsa { .. } => {
+            let q = geo.qsa();
+            attn_layers * park_blocks(rows, n_ctx, q.compress) * q.hidd() * 4
+        }
+        Attn::Full => 0,
+    };
+    rows * attn_layers * 2 * geo.kv_heads * geo.head_dim * kv_value_bytes + pooled
 }
 
 /// - #118: may a parked snapshot at `p` be rolled back onto after other requests wrote
@@ -298,12 +315,6 @@ pub enum ColdPlan {
     Drop,
 }
 
-/// f32 slots of one GDN layer's recurrent state S, `[48][128][128]` (`manager.rs:60`)
-const GDN_S_STATE: usize = GDN_VHEADS * GD * GD;
-/// f32 slots of one GDN layer's causal conv state, `[10240][3]` (`manager.rs:61`)
-const GDN_CONV_STATE: usize = GDN_CONV * 3;
-/// f32 slots of the PLE dilated conv state, `[10240][9]` (`gen.rs:204`)
-const PLE_STATE: usize = GDN_CONV * 9;
 
 // ------------------------------------------------------------------ pure rules
 
@@ -402,22 +413,44 @@ pub struct Shape {
     pub attn_layers: usize,
     /// f32 per QSA layer, `qsa_ring_rows * 128`
     pub qsa_ring_len: usize,
+    /// C3: f32 of one GDN layer's recurrent state S (`manager::gdn_s_state_len`, `[48][128][128]`)
+    pub gdn_s_len: usize,
+    /// C3: f32 of one GDN layer's causal conv state (`manager::gdn_conv_state_len`, `[10240][3]`)
+    pub gdn_conv_len: usize,
+    /// C3: f32 of the PLE dilated conv state (`manager::ple_state_len`, `[10240][9]`)
+    pub ple_len: usize,
 }
 
 impl Shape {
     /// read off the loaded states, never assumed
     pub fn of(eng: &Engine) -> Shape {
+        // Crow #300 phase 2: the attention layer count is the Geo's, not the number of QSA
+        // rings (equal on Flash-Next; full attention has no rings, and 0 here would make the
+        // slot file carry no KV rows at all)
+        Shape::with_geo(&eng.geo, eng.st.gdn_s.len(), eng.geo.attn_layers, eng.st.qsa_ring_rows)
+    }
+
+    /// the shape of `gdn_layers` / `attn_layers` loaded state buffers and a ring of
+    /// `qsa_ring_rows` rows, every per-buffer size from the model's `Geo` (C3). C5:
+    /// no QSA ring for full attention, no PLE state for a model without PLE.
+    pub fn with_geo(geo: &Geo, gdn_layers: usize, attn_layers: usize, qsa_ring_rows: usize) -> Shape {
         Shape {
-            gdn_layers: eng.st.gdn_s.len(),
-            attn_layers: eng.st.qsa_keys.len(),
-            qsa_ring_len: eng.st.qsa_ring_rows * crate::geo::QSA_HIDD,
+            gdn_layers,
+            attn_layers,
+            qsa_ring_len: match geo.attn {
+                Attn::Qsa { .. } => qsa_ring_rows * geo.qsa().hidd(),
+                Attn::Full => 0,
+            },
+            gdn_s_len: crate::manager::gdn_s_state_len(geo),
+            gdn_conv_len: crate::manager::gdn_conv_state_len(geo),
+            ple_len: crate::manager::ple_state_len(geo),
         }
     }
 
     /// bytes one snapshot costs in host RAM (spec 7.7)
     pub fn snapshot_bytes(&self) -> usize {
-        4 * (self.gdn_layers * (GDN_S_STATE + GDN_CONV_STATE)
-            + PLE_STATE
+        4 * (self.gdn_layers * (self.gdn_s_len + self.gdn_conv_len)
+            + self.ple_len
             + self.attn_layers * self.qsa_ring_len)
     }
 }
@@ -488,10 +521,11 @@ impl Snapshot {
             pos: None,
             prefill_clean: false,
             done_blocks: 0,
-            gdn_s: (0..shape.gdn_layers).map(|_| faulted(GDN_S_STATE)).collect(),
-            gdn_conv: (0..shape.gdn_layers).map(|_| faulted(GDN_CONV_STATE)).collect(),
-            ple_state: faulted(PLE_STATE),
-            qsa_ring: (0..shape.attn_layers)
+            gdn_s: (0..shape.gdn_layers).map(|_| faulted(shape.gdn_s_len)).collect(),
+            gdn_conv: (0..shape.gdn_layers).map(|_| faulted(shape.gdn_conv_len)).collect(),
+            ple_state: faulted(shape.ple_len),
+            // one raw-key ring per QSA layer; full attention has none (qsa_ring_len 0)
+            qsa_ring: (0..if shape.qsa_ring_len > 0 { shape.attn_layers } else { 0 })
                 .map(|_| faulted(shape.qsa_ring_len))
                 .collect(),
             logits: faulted(vocab),
@@ -543,7 +577,7 @@ impl PrefixCache {
         let enabled = std::env::var("CROW_PREFIX_CACHE").as_deref() != Ok("0");
         let shape = Shape::of(eng);
         let slots = if enabled {
-            (0..SLOTS).map(|_| Snapshot::new(&shape, V)).collect()
+            (0..SLOTS).map(|_| Snapshot::new(&shape, eng.geo.vocab)).collect()
         } else {
             Vec::new()
         };
@@ -831,17 +865,23 @@ impl PrefixCache {
         let mut blocks = 0;
         if let ColdPlan::Park { rows } = plan {
             let t0 = std::time::Instant::now();
-            blocks = park_blocks(rows, eng.st.context);
+            // C5/Crow #300 phase 2: pooled blocks are the Attn::Qsa arm; full attention parks KV rows only
+            blocks = match eng.geo.attn {
+                Attn::Qsa { .. } => park_blocks(rows, eng.st.context, eng.geo.qsa().compress),
+                Attn::Full => 0,
+            };
             // whatever the last request left in flight must land before the copies read it
             cuda::sync();
-            let row_bytes = crate::geo::AHD * eng.st.kv.byte_per_value();
+            let row_bytes = eng.geo.head_dim * eng.st.kv.byte_per_value();
             let n = rows * row_bytes;
-            let groups: Vec<_> = crate::slot::kv_row_order(eng.st.qsa_pooled.len()).collect();
+            // the Geo's attention layer count: `qsa_pooled.len()` is 0 for full attention, and
+            // the park then copied no KV row at all
+            let groups: Vec<_> = crate::slot::kv_row_order(eng.geo.attn_layers, eng.geo.kv_heads).collect();
             self.park_kv.resize(groups.len() * n, 0);
             for (g, (layer, is_k, kvh)) in groups.into_iter().enumerate() {
                 crate::slot::dtoh_bytes(&mut self.park_kv[g * n..(g + 1) * n], eng.st.kv_row_ptr(layer, is_k, kvh, 0));
             }
-            let pb = blocks * crate::geo::QSA_HIDD * 4;
+            let pb = blocks * pooled_row_bytes(&eng.geo);
             self.park_pooled.resize(eng.st.qsa_pooled.len() * pb, 0);
             for (layer, &src) in eng.st.qsa_pooled.iter().enumerate() {
                 crate::slot::dtoh_bytes(&mut self.park_pooled[layer * pb..(layer + 1) * pb], src);
@@ -883,12 +923,12 @@ impl PrefixCache {
         let Some(pk) = self.adopt_parked() else { return 0.0 };
         cuda::sync();
         eng.drop_decode_graph();
-        let row_bytes = crate::geo::AHD * eng.st.kv.byte_per_value();
+        let row_bytes = eng.geo.head_dim * eng.st.kv.byte_per_value();
         let n = pk.rows * row_bytes;
-        for (g, (layer, is_k, kvh)) in crate::slot::kv_row_order(eng.st.qsa_pooled.len()).enumerate() {
+        for (g, (layer, is_k, kvh)) in crate::slot::kv_row_order(eng.geo.attn_layers, eng.geo.kv_heads).enumerate() {
             cuda::upload_into(eng.st.kv_row_ptr(layer, is_k, kvh, 0), &self.park_kv[g * n..(g + 1) * n]);
         }
-        let pb = pk.blocks * crate::geo::QSA_HIDD * 4;
+        let pb = pk.blocks * pooled_row_bytes(&eng.geo);
         for (layer, &dst) in eng.st.qsa_pooled.iter().enumerate() {
             cuda::upload_into(dst, &self.park_pooled[layer * pb..(layer + 1) * pb]);
         }
@@ -929,7 +969,10 @@ impl PrefixCache {
         for (i, buf) in s.gdn_conv.iter_mut().enumerate() {
             dtoh_into(buf, eng.st.gdn_conv[i]);
         }
-        dtoh_into(&mut s.ple_state, eng.ple.state);
+        // C5: a model without PLE has no PLE state (and a zero-length snapshot row)
+        if let Some(pl) = &eng.ple {
+            dtoh_into(&mut s.ple_state, pl.state);
+        }
         for (i, buf) in s.qsa_ring.iter_mut().enumerate() {
             dtoh_into(buf, eng.st.qsa_keys[i]);
         }
@@ -1047,7 +1090,9 @@ impl PrefixCache {
         for (i, buf) in s.gdn_conv.iter().enumerate() {
             cuda::to_f32_into(eng.st.gdn_conv[i], buf);
         }
-        cuda::to_f32_into(eng.ple.state, &s.ple_state);
+        if let Some(pl) = &eng.ple {
+            cuda::to_f32_into(pl.state, &s.ple_state);
+        }
         for (i, buf) in s.qsa_ring.iter().enumerate() {
             cuda::to_f32_into(eng.st.qsa_keys[i], buf);
         }
@@ -1101,7 +1146,7 @@ mod tests {
 
     /// the shape of no real load: four f32 per QSA layer, so a slot costs nothing
     fn tiny() -> Shape {
-        Shape { gdn_layers: 1, attn_layers: 1, qsa_ring_len: 4 }
+        Shape { qsa_ring_len: 4, ..Shape::with_geo(&Geo::FLASH_NEXT, 1, 1, 0) }
     }
 
     #[test]
@@ -1270,14 +1315,16 @@ mod tests {
     /// spec 7.7, the operating point of this process: chunk 2048 gives ring 2052
     #[test]
     fn the_snapshot_size_is_the_spec_table_row() {
-        let shape = Shape { gdn_layers: 36, attn_layers: 12, qsa_ring_len: 2052 * 128 };
+        let shape = Shape::with_geo(&Geo::FLASH_NEXT, 36, 12, 2052);
+        assert_eq!(shape.qsa_ring_len, 2052 * 128);
         assert_eq!(shape.snapshot_bytes(), 130_646_016);
     }
 
     /// spec 7.7, the `Config` default row of the same table
     #[test]
     fn the_snapshot_size_at_chunk_512_is_the_other_spec_row() {
-        let shape = Shape { gdn_layers: 36, attn_layers: 12, qsa_ring_len: 516 * 128 };
+        let shape = Shape::with_geo(&Geo::FLASH_NEXT, 36, 12, 516);
+        assert_eq!(shape.qsa_ring_len, 516 * 128);
         assert_eq!(shape.snapshot_bytes(), 121_208_832);
     }
 
@@ -1697,7 +1744,7 @@ mod tests {
                     dev.stash = dev.kv[..rows].to_vec();
                 }
                 let blocks = match plan {
-                    ColdPlan::Park { rows } => park_blocks(rows, N_CTX),
+                    ColdPlan::Park { rows } => park_blocks(rows, N_CTX, 4),
                     _ => 0,
                 };
                 let h = std::mem::take(&mut dev.history);
@@ -1880,13 +1927,13 @@ mod tests {
     /// #118: the host RAM of a park, the numbers the docs and the boot line state
     #[test]
     fn the_park_costs_108_mib_at_the_default_cap_with_fp8_kv() {
-        assert_eq!(park_blocks(8_192, N_CTX), 2_049);
-        assert_eq!(park_host_bytes(8_192, N_CTX, 12, 1), 113_252_352);
-        assert_eq!(park_host_bytes(8_192, N_CTX, 12, 2), 213_915_648);
+        assert_eq!(park_blocks(8_192, N_CTX, 4), 2_049);
+        assert_eq!(park_host_bytes(&Geo::FLASH_NEXT, 8_192, N_CTX, 12, 1), 113_252_352);
+        assert_eq!(park_host_bytes(&Geo::FLASH_NEXT, 8_192, N_CTX, 12, 2), 213_915_648);
         // the judge of 17:31 wrote 4,947 rows, the largest of the 37 side requests that day
         assert!(parked_usable(116_900, 4_947, park_rows(116_900, PARK_ROWS_DEFAULT)));
         assert!(!parked_usable(116_900, 8_193, park_rows(116_900, PARK_ROWS_DEFAULT)));
         // the pooled block count never runs past `qsa_pooled` (ceil(n_ctx / 4) blocks)
-        assert_eq!(park_blocks(N_CTX, N_CTX), 50_000);
+        assert_eq!(park_blocks(N_CTX, N_CTX, 4), 50_000);
     }
 }

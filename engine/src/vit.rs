@@ -40,7 +40,7 @@
 use crate::cuda::{self, CUdeviceptr as Dev};
 use crate::weights::{dequant_fp4_dev, load_fp4, Fp4};
 use crate::kernels::{launch_v, Kernels};
-use crate::{cnq::Cnq, geo::{H, MIB}};
+use crate::{cnq::Cnq, geo::{Geo, MIB}};
 
 /// the `<|image_pad|>` token (tokenizer_config.json added_tokens_decoder)
 pub const IMAGE_PAD: i64 = 248056;
@@ -180,13 +180,15 @@ pub const VIT_SCRATCH_BUFFERS: usize = 12;
 
 /// bytes of the tower scratch at a patch cap — the twelve buffers
 /// `ensure_scratch` takes, counted from the same geometry the allocator uses
-/// (58,496 B per patch: 4096 patches = 228.5 MiB, 5120 = 285.6 MiB)
-pub const fn scratch_bytes_for(cap: usize) -> usize {
+/// (58,496 B per patch: 4096 patches = 228.5 MiB, 5120 = 285.6 MiB). C3:
+/// `out_hidden` is the merger's output width, the model's `Geo::vision_out`
+/// (2560 on Flash-Next)
+pub const fn scratch_bytes_for(cap: usize, out_hidden: usize) -> usize {
     let elems = cap * VIT_HIDDEN * 3   // x, normed, attn
         + cap * VIT_QKV
         + cap * VIT_INTER
         + cap / 4 * VIT_MERGED
-        + cap / 4 * H
+        + cap / 4 * out_hidden
         + cap * VIT_IN
         + cap * 8                      // pe_idx + pe_w
         + cap * VIT_ROT * 2;           // cs + sn
@@ -195,7 +197,7 @@ pub const fn scratch_bytes_for(cap: usize) -> usize {
 
 /// #117: the twelve scratch buffers at a patch cap, `(name, bytes)`, in the
 /// order `ensure_scratch_named` takes them; they sum to `scratch_bytes_for`
-pub const fn scratch_buffer_bytes(cap: usize) -> [(&'static str, usize); VIT_SCRATCH_BUFFERS] {
+pub const fn scratch_buffer_bytes(cap: usize, out_hidden: usize) -> [(&'static str, usize); VIT_SCRATCH_BUFFERS] {
     [
         ("vit x", cap * VIT_HIDDEN * 4),
         ("vit normed", cap * VIT_HIDDEN * 4),
@@ -203,7 +205,7 @@ pub const fn scratch_buffer_bytes(cap: usize) -> [(&'static str, usize); VIT_SCR
         ("vit attn", cap * VIT_HIDDEN * 4),
         ("vit mlp", cap * VIT_INTER * 4),
         ("vit m1", cap / 4 * VIT_MERGED * 4),
-        ("vit out", cap / 4 * H * 4),
+        ("vit out", cap / 4 * out_hidden * 4),
         ("vit patches", cap * VIT_IN * 4),
         ("vit pe_idx", cap * 4 * 4),
         ("vit pe_w", cap * 4 * 4),
@@ -213,14 +215,15 @@ pub const fn scratch_buffer_bytes(cap: usize) -> [(&'static str, usize); VIT_SCR
 }
 
 /// the scratch at this process's cap (`budget().max_patches()`)
-pub fn scratch_bytes() -> usize {
-    scratch_bytes_for(budget().max_patches())
+pub fn scratch_bytes(out_hidden: usize) -> usize {
+    scratch_bytes_for(budget().max_patches(), out_hidden)
 }
 
 /// bytes of the interleaved-mrope span tables at their widest: the whole
 /// context, cos and sin, exactly the shape `Engine::begin_vision` allocates
-pub const fn mrope_bytes(context: usize) -> usize {
-    context * crate::geo::ROPE_PAIRS * 2 * 4
+/// (C3: `rope_pairs` = the model's `Geo::rope_pairs`)
+pub const fn mrope_bytes(context: usize, rope_pairs: usize) -> usize {
+    context * rope_pairs * 2 * 4
 }
 
 /// The VRAM the PLANNER sets aside for the image path when the tower is loaded
@@ -238,32 +241,33 @@ pub const fn mrope_bytes(context: usize) -> usize {
 /// `CROW_VIT_RESERVE_MB` replaces the derived value (0 = no reserve, the
 /// pre-TASK-K behaviour, for a measurement that wants the old N back).
 /// `CROW_VIT=0` never calls this at all.
-pub fn reserve_bytes(context: usize) -> u64 {
+pub fn reserve_bytes(geo: &Geo, context: usize) -> u64 {
     if let Some(mb) = crate::geo::env_parse::<u64>("CROW_VIT_RESERVE_MB") {
         return mb << 20;
     }
-    (scratch_bytes() + mrope_bytes(context)) as u64
+    (scratch_bytes(geo.vision_out()) + mrope_bytes(context, geo.rope_pairs)) as u64
 }
 
 /// the `[budget]` line's own words for what `reserve_bytes` covers; with
 /// `CROW_VIT_RESERVE_MB` set it names the override AND what the derived value
 /// would have been, so a log that shows a bigger N still says what paid for it
-pub fn reserve_line(context: usize, held: u64) -> String {
+pub fn reserve_line(geo: &Geo, context: usize, held: u64) -> String {
     let mib = |b: usize| b as f64 / MIB;
-    let derived = (scratch_bytes() + mrope_bytes(context)) as f64 / MIB;
+    let (scratch, mrope) = (scratch_bytes(geo.vision_out()), mrope_bytes(context, geo.rope_pairs));
+    let derived = (scratch + mrope) as f64 / MIB;
     let basis = match crate::geo::env_parse::<u64>("CROW_VIT_RESERVE_MB") {
         Some(_) => format!("CROW_VIT_RESERVE_MB, derived would be {derived:.1} MB"),
         None => format!(
             "tower scratch {:.1} + mrope span {:.1}",
-            mib(scratch_bytes()),
-            mib(mrope_bytes(context))
+            mib(scratch),
+            mib(mrope)
         ),
     };
     // #72: what the planner still has to SET ASIDE, now that the tower scratch and
     // the mrope span are taken at boot. With the derived reserve the two are the
     // same number and nothing is pending; a bigger CROW_VIT_RESERVE_MB pads the
     // plan by the difference, a smaller one is already covered by what is held.
-    let pending = reserve_bytes(context).saturating_sub(held);
+    let pending = reserve_bytes(geo, context).saturating_sub(held);
     let state = if held == 0 {
         "lazy, allocated on the first image request".to_string()
     } else if pending == 0 {
@@ -273,7 +277,7 @@ pub fn reserve_line(context: usize, held: u64) -> String {
     };
     format!(
         "vit reserve {:9.1} MB  ({basis}, CROW_VIT on) — {state}",
-        reserve_bytes(context) as f64 / MIB
+        reserve_bytes(geo, context) as f64 / MIB
     )
 }
 
@@ -331,21 +335,26 @@ pub const MMPROJ_FILE: &str = "mmproj-F16.gguf";
 /// Where the tower's weights come from, decided once at load.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VitSource {
-    /// llama.cpp's F16 projector (the default whenever the file is found)
-    Mmproj(String),
+    /// llama.cpp's F16 projector (the default whenever a file is found): every
+    /// existing candidate in search order; `VitW::load` takes the first that
+    /// passes `validate_mmproj` (#122: another model's file is skipped, not fatal)
+    Mmproj(Vec<String>),
     /// the container's NVFP4 `vit` section; the string says why (the fallback)
     Container(String),
 }
 
 /// `CROW_VIT_MMPROJ` wins: `0` = the container's NVFP4 section, any other
-/// value = that file (missing -> the container, with the reason). Unset: the
-/// first `mmproj-F16.gguf` found in `models/` beside the container (the #94
-/// checkpoint convention), `$CROW_MODELS` (Crow's models root) and
-/// `~/.local/share/crow/models` (Crow's Linux install link). `exists` is the
-/// file test, injected so the unit test runs without the files.
+/// value = that file (missing -> the container, with the reason). Unset: every
+/// `mmproj-F16.gguf` found, in this order: `models/<model>/` beside the
+/// container, `<model>` = the source repo's name from the index v2 (#122: the
+/// dense 27B's own projector), then `models/` (the #94 checkpoint convention),
+/// `$CROW_MODELS` (Crow's models root) and `~/.local/share/crow/models`
+/// (Crow's Linux install link, Flash-Next's file). `exists` is the file test,
+/// injected so the unit test runs without the files.
 pub fn resolve_mmproj(
     env: Option<&str>,
     cnq_path: &str,
+    model: Option<&str>,
     crow_models: Option<&str>,
     home: Option<&str>,
     exists: &dyn Fn(&str) -> bool,
@@ -354,7 +363,7 @@ pub fn resolve_mmproj(
         Some("0") => return VitSource::Container("CROW_VIT_MMPROJ=0".to_string()),
         Some(p) if !p.is_empty() => {
             return if exists(p) {
-                VitSource::Mmproj(p.to_string())
+                VitSource::Mmproj(vec![p.to_string()])
             } else {
                 VitSource::Container(format!("CROW_VIT_MMPROJ={p} does not exist"))
             };
@@ -364,6 +373,9 @@ pub fn resolve_mmproj(
     let mut tried = Vec::new();
     let cnq = std::path::Path::new(cnq_path);
     if let Some(root) = cnq.parent().and_then(|d| d.parent()) {
+        if let Some(m) = model.filter(|m| !m.is_empty()) {
+            tried.push(root.join("models").join(m).join(MMPROJ_FILE));
+        }
         tried.push(root.join("models").join(MMPROJ_FILE));
     }
     if let Some(m) = crow_models.filter(|m| !m.is_empty()) {
@@ -372,24 +384,63 @@ pub fn resolve_mmproj(
     if let Some(h) = home.filter(|h| !h.is_empty()) {
         tried.push(std::path::Path::new(h).join(".local/share/crow/models").join(MMPROJ_FILE));
     }
-    for p in &tried {
-        let s = p.to_string_lossy();
-        if exists(&s) {
-            return VitSource::Mmproj(s.into_owned());
-        }
+    let found: Vec<String> = tried
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| exists(p))
+        .collect();
+    if !found.is_empty() {
+        return VitSource::Mmproj(found);
     }
     let list = tried.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join(", ");
     VitSource::Container(format!("no {MMPROJ_FILE} in {list}"))
 }
 
-/// the process's choice, from the real env and filesystem
-pub fn mmproj_source(cnq_path: &str) -> VitSource {
+/// the process's choice, from the real env and filesystem; `model` = the
+/// container's source repo name (`Qwen/Qwen3.8-27B` -> `Qwen3.8-27B`)
+pub fn mmproj_source(cnq_path: &str, model: Option<&str>) -> VitSource {
     let env = std::env::var("CROW_VIT_MMPROJ").ok();
     let models = std::env::var("CROW_MODELS").ok();
     let home = std::env::var("HOME").ok();
-    resolve_mmproj(env.as_deref(), cnq_path, models.as_deref(), home.as_deref(), &|p| {
+    resolve_mmproj(env.as_deref(), cnq_path, model, models.as_deref(), home.as_deref(), &|p| {
         std::path::Path::new(p).is_file()
     })
+}
+
+/// where the tower's weights come from, once the candidates are tried
+pub enum TowerChoice<G> {
+    /// the first projector that opened and validated, and why the ones before it were skipped
+    Mmproj(G, Vec<String>),
+    /// the container's NVFP4 `vit` section; the string says why
+    Container(String),
+    /// #122: no usable projector and no `vit` section - the tower stays off
+    Off(String),
+}
+
+/// #122: the first candidate that `open` accepts wins; a refused file (another
+/// model's projector, a wrong `projection_dim`) is skipped, not fatal. With no
+/// projector left, the container's `vit` section is the fallback when it has
+/// one, and the tower is off when it has none (the dense recipe).
+pub fn choose_tower<G>(src: VitSource, has_vit: bool, open: &dyn Fn(&str) -> Result<G, String>) -> TowerChoice<G> {
+    let why = match src {
+        VitSource::Mmproj(paths) => {
+            let mut refused = Vec::new();
+            for p in &paths {
+                match open(p) {
+                    Ok(g) => return TowerChoice::Mmproj(g, refused),
+                    Err(why) => refused.push(format!("{p} refused: {why}")),
+                }
+            }
+            tracing::error!(target: "vit", "[vit] the F16 projector is NOT used: {}", refused.join("; "));
+            format!("fallback, {}", refused.join("; "))
+        }
+        VitSource::Container(why) => why,
+    };
+    if has_vit {
+        TowerChoice::Container(why)
+    } else {
+        TowerChoice::Off(format!("no usable {MMPROJ_FILE} and the container has no vit section ({why})"))
+    }
 }
 
 /// the kind of one projector tensor the tower reads
@@ -407,8 +458,8 @@ pub enum MmKind {
 /// `v.post_ln` = merger.norm, `mm.0`/`mm.2` = merger.linear_fc1/fc2, the Conv3d
 /// patch kernel split along its temporal axis into `v.patch_embd.weight`
 /// (t = 0) and `v.patch_embd.weight.1` (t = 1), `v.position_embd.weight` F32.
-pub fn mmproj_plan() -> Vec<(String, Vec<u64>, MmKind, String)> {
-    let (h, i, q, m, o) = (VIT_HIDDEN as u64, VIT_INTER as u64, VIT_QKV as u64, VIT_MERGED as u64, H as u64);
+pub fn mmproj_plan(out_hidden: usize) -> Vec<(String, Vec<u64>, MmKind, String)> {
+    let (h, i, q, m, o) = (VIT_HIDDEN as u64, VIT_INTER as u64, VIT_QKV as u64, VIT_MERGED as u64, out_hidden as u64);
     let p = VIT_PATCH as u64;
     let mut v: Vec<(String, Vec<u64>, MmKind, String)> = vec![
         ("v.patch_embd.weight".into(), vec![p, p, 3, h], MmKind::Linear, "model.visual.patch_embed.proj.weight".into()),
@@ -447,7 +498,7 @@ pub fn mmproj_plan() -> Vec<(String, Vec<u64>, MmKind, String)> {
 /// geometry keys this tower is built for, then every tensor of `mmproj_plan`
 /// present with its exact dims and type (Linear = F16, F32 = F32). A file that
 /// fails any of it is NOT loaded - the boot falls back to the container, loudly.
-pub fn validate_mmproj(g: &crate::gguf::Gguf) -> Result<(), String> {
+pub fn validate_mmproj(g: &crate::gguf::Gguf, out_hidden: usize) -> Result<(), String> {
     use crate::gguf::{GGML_TYPE_F16, GGML_TYPE_F32};
     let want_str = [("clip.projector_type", "qwen3vl_merger")];
     for (k, v) in want_str {
@@ -463,14 +514,14 @@ pub fn validate_mmproj(g: &crate::gguf::Gguf) -> Result<(), String> {
         ("clip.vision.attention.head_count", VIT_HEADS as u64),
         ("clip.vision.patch_size", VIT_PATCH as u64),
         ("clip.vision.spatial_merge_size", VIT_MERGE as u64),
-        ("clip.vision.projection_dim", H as u64),
+        ("clip.vision.projection_dim", out_hidden as u64),
     ];
     for (k, v) in want_u {
         if g.kv_u64(k) != Some(v) {
             return Err(format!("{}: {k} is {:?}, the tower needs {v}", g.path, g.kv_u64(k)));
         }
     }
-    for (name, dims, kind, _) in mmproj_plan() {
+    for (name, dims, kind, _) in mmproj_plan(out_hidden) {
         let t = g.find(&name).ok_or_else(|| format!("{}: tensor {name} missing", g.path))?;
         if t.dims != dims {
             return Err(format!("{}: tensor {name} dims {:?}, expected {dims:?}", g.path, t.dims));
@@ -526,19 +577,24 @@ unsafe fn load_f4(cnq: &mut Cnq, name: &str) -> Lin {
 
 impl VitW {
     /// #108: the tower's weights from the source `mmproj_source` picks -
-    /// llama.cpp's F16 projector when the file is there and passes
+    /// llama.cpp's F16 projector, the first candidate that passes
     /// `validate_mmproj`, else the container's NVFP4 section (the fallback,
-    /// named on the `[vit]` boot line with its reason).
-    pub unsafe fn load(cnq: &mut Cnq) -> VitW {
-        match mmproj_source(&cnq.path) {
-            VitSource::Mmproj(path) => match crate::gguf::Gguf::open(&path).and_then(|g| validate_mmproj(&g).map(|_| g)) {
-                Ok(g) => VitW::load_mmproj(&g),
-                Err(why) => {
-                    tracing::error!(target: "vit", "[vit] the F16 projector is NOT used: {why} - falling back to the container's NVFP4 vit section");
-                    VitW::load_container(cnq, &format!("fallback, {path} refused: {why}"))
+    /// named on the `[vit]` boot line with its reason). #122: a container
+    /// without a `vit` section (the dense recipe) has no fallback - `Err`
+    /// says why, and the engine boots with the tower off.
+    pub unsafe fn load(cnq: &mut Cnq, out_hidden: usize) -> Result<VitW, String> {
+        let model = cnq.model().map(|m| m.source_repo.rsplit('/').next().unwrap_or_default().to_string());
+        let has_vit = cnq.tensors.iter().any(|t| t.section == "vit");
+        let open = |p: &str| crate::gguf::Gguf::open(p).and_then(|g| validate_mmproj(&g, out_hidden).map(|_| g));
+        match choose_tower(mmproj_source(&cnq.path, model.as_deref()), has_vit, &open) {
+            TowerChoice::Mmproj(g, skipped) => {
+                if !skipped.is_empty() {
+                    tracing::warn!(target: "vit", "[vit] skipped {} - {} used", skipped.join("; "), g.path);
                 }
-            },
-            VitSource::Container(why) => VitW::load_container(cnq, &why),
+                Ok(VitW::load_mmproj(&g))
+            }
+            TowerChoice::Container(why) => Ok(VitW::load_container(cnq, &why)),
+            TowerChoice::Off(why) => Err(why),
         }
     }
 
@@ -648,6 +704,8 @@ impl VitW {
 pub struct Vit {
     pub w: VitW,
     pub cap: usize,
+    /// C3: the merger's output width, the model's `Geo::vision_out` (2560 on Flash-Next)
+    pub out_hidden: usize,
     /// #VIT cache: image-bytes hash -> (grid, n_visual, tower embeddings on
     /// the host). A conversation that re-sends its whole history (Crow does,
     /// base64 and all) pays for each picture ONCE per process, not per turn.
@@ -705,11 +763,12 @@ impl Vit {
     /// post-plan allocations, and robin's first image request found 35.7 MiB
     /// free. `Engine::load` now calls `arm_scratch` right after this, so the
     /// reserve is held; the lazy path stays as the fallback (`CROW_VIT_RESERVE_MB=0`).
-    pub unsafe fn new(cnq: &mut Cnq) -> Vit {
-        let w = VitW::load(cnq);
-        Vit {
+    pub unsafe fn new(cnq: &mut Cnq, out_hidden: usize) -> Result<Vit, String> {
+        let w = VitW::load(cnq, out_hidden)?;
+        Ok(Vit {
             w,
             cap: budget().max_patches(),
+            out_hidden,
             x: 0,
             normed: 0,
             qkv: 0,
@@ -727,7 +786,7 @@ impl Vit {
             image_cache: std::collections::HashMap::new(),
             image_lru: Vec::new(),
             image_cache_bytes: 0,
-        }
+        })
     }
 
     /// one-time scratch allocation, called on the first image request; the
@@ -837,7 +896,7 @@ impl Vit {
         self.attn = alloc4("the vit attention output", cap * VIT_HIDDEN, &mut taken);
         self.mlp = alloc4("the vit block MLP scratch", cap * VIT_INTER, &mut taken);
         self.m1 = alloc4("the vit merger fc1 output", cap / 4 * VIT_MERGED, &mut taken);
-        self.out = alloc4("the vit visual embeddings", cap / 4 * H, &mut taken);
+        self.out = alloc4("the vit visual embeddings", cap / 4 * self.out_hidden, &mut taken);
         self.patches = alloc4("the vit patch input", cap * VIT_IN, &mut taken);
         self.pe_idx = alloc4("the vit position taps", cap * 4, &mut taken);
         self.pe_w = alloc4("the vit position tap weights", cap * 4, &mut taken);
@@ -847,10 +906,10 @@ impl Vit {
         cuda::to_i32_into(self.s[S_BIAS_QKV], &[VIT_QKV as i32]);
         cuda::to_i32_into(self.s[S_BIAS_INTER], &[VIT_INTER as i32]);
         cuda::to_i32_into(self.s[S_BIAS_MERGED], &[VIT_MERGED as i32]);
-        cuda::to_i32_into(self.s[S_BIAS_H], &[H as i32]);
+        cuda::to_i32_into(self.s[S_BIAS_H], &[self.out_hidden as i32]);
         cuda::sync();
         self.scratch = true;
-        debug_assert_eq!(bytes, scratch_bytes(), "scratch_bytes() and ensure_scratch disagree");
+        debug_assert_eq!(bytes, scratch_bytes(self.out_hidden), "scratch_bytes() and ensure_scratch disagree");
         tracing::info!(target: "vit", "[vit] tower scratch {how}: {:.1} MiB at cap {} patches ({} buffers + {} scalars)",
             bytes as f64 / MIB, cap, VIT_SCRATCH_BUFFERS, scalars.len());
     }
@@ -980,7 +1039,7 @@ impl Vit {
         self.bias(k, self.w.m_fc1_b, S_BIAS_MERGED, nv, self.m1);
         launch_v(k.f("gelu_erf"), ((nv * VIT_MERGED + 255) / 256) as u32, 1, 1, 256, &[
             self.m1, self.s[S_NMERGE]]);
-        self.gemv(k, &self.w.m_fc2, H, S_KD_MERGED, S_BIAS_H, nv, self.m1, self.out);
+        self.gemv(k, &self.w.m_fc2, self.out_hidden, S_KD_MERGED, S_BIAS_H, nv, self.m1, self.out);
         self.bias(k, self.w.m_fc2_b, S_BIAS_H, nv, self.out);
         // #73: the tower is ASYNC. Every launch above went to `cuda::cur_stream()`,
         // and the only reader of `self.out` is the blocking `cuMemcpyDtoH_v2` in
@@ -1420,10 +1479,14 @@ pub fn expand_ids(ids: &[u32], counts: &[usize]) -> Result<Vec<u32>, String> {
     Ok(out)
 }
 
-/// `get_rope_index` (Qwen4ExpModel) for one sequence: text groups run
-/// arange + current_pos on all three axes; each image group gets
-/// T = current_pos, H = current_pos + hpos, W = current_pos + wpos over its
-/// merged tokens (block-major order), then current_pos += max(hp, wp) / 2.
+/// `get_rope_index` (Qwen4ExpModel / Qwen3_5Model) for one sequence: text
+/// groups run arange + current_pos on all three axes; each image group gets
+/// T = current_pos, H = current_pos + row, W = current_pos + col over its
+/// merged tokens in RASTER order of the merged grid (hp/2 x wp/2,
+/// `get_vision_position_ids`; llama.cpp `MTMD_POS_TYPE_MROPE`), then
+/// current_pos += max(hp, wp) / 2. #123: until 2026-09-27 this decomposed the
+/// merged-token index in the tower's block-major PATCH order (bh, bw, iy, ix),
+/// which put W up to wp - 1 and H only up to ~hp/4.
 /// Returns per-row (T, H, W) and the mrope delta (max + 1 - seq_len).
 pub fn mrope_positions(types: &[u8], grids: &[Grid]) -> (Vec<[i64; 3]>, i64) {
     let mut it = grids.iter();
@@ -1447,17 +1510,10 @@ pub fn mrope_positions(types: &[u8], grids: &[Grid]) -> (Vec<[i64; 3]>, i64) {
             let (_t, hp, wp) = *g;
             let gw = wp / VIT_MERGE;
             for k in 0..len {
-                // block-major token order: bh, bw, iy, ix
-                let bh = k / (gw * VIT_MERGE * VIT_MERGE);
-                let rem = k % (gw * VIT_MERGE * VIT_MERGE);
-                let bw = rem / (VIT_MERGE * VIT_MERGE);
-                let r2 = rem % (VIT_MERGE * VIT_MERGE);
-                let iy = r2 / VIT_MERGE;
-                let ix = r2 % VIT_MERGE;
+                // merged-grid raster order: row-major over (hp/2, wp/2)
+                let (row, col) = (k / gw, k % gw);
                 let t_ax = cur; // arange(t) = 0, + start_position after
-                let h_ax = cur + (bh * VIT_MERGE + iy) as i64;
-                let w_ax = cur + (bw * VIT_MERGE + ix) as i64;
-                out.push([t_ax, h_ax, w_ax]);
+                out.push([t_ax, cur + row as i64, cur + col as i64]);
             }
             cur += (hp.max(wp) / VIT_MERGE) as i64;
         }
@@ -1575,7 +1631,7 @@ impl Vit {
             let p = prep_image(bytes)
                 .map_err(|e| format!("image {i}: {e}"))?;
             let out = self.run(k, &p.patches, &p.pe_idx, &p.pe_w, &p.cs, &p.sn, p.n_patches);
-            let rows = cuda::dtoh(out, p.n_visual * H);
+            let rows = cuda::dtoh(out, p.n_visual * self.out_hidden);
             if let Some(dir) = &dump {
                 f32_file(&format!("{dir}/img{i}.patches.f32"), &p.patches);
                 f32_file(&format!("{dir}/img{i}.pe-w.f32"), &p.pe_w);
@@ -1649,34 +1705,61 @@ mod reserve {
     //! `debug_assert_eq!` at the end of `ensure_scratch` is what keeps `scratch_bytes`
     //! tied to the twelve allocations it counts.
     use super::*;
+    use crate::geo::H;
 
     #[test]
     fn the_scratch_is_the_twelve_buffers_the_allocator_takes() {
         // x + normed + attn: 3 x 4096 x 1152, qkv 4096 x 3456, mlp 4096 x 4304,
         // m1 1024 x 4608, out 1024 x 2560, patches 4096 x 1536, pe_idx + pe_w 2 x 16384,
         // cs + sn 2 x 4096 x 36 - all f32 (the pre-#107 cap, 1024 tokens)
-        assert_eq!(scratch_bytes_for(4096), 239_599_616);
+        assert_eq!(scratch_bytes_for(4096, H), 239_599_616);
         // 58,496 B per patch; the default cap 1280 tokens = 5120 patches = 285.6 MiB
-        assert_eq!(scratch_bytes_for(5120), 299_499_520);
+        assert_eq!(scratch_bytes_for(5120, H), 299_499_520);
         assert_eq!(VitBudget::DEFAULT.max_patches(), 5120);
-        assert_eq!(scratch_bytes(), scratch_bytes_for(budget().max_patches()));
+        assert_eq!(scratch_bytes(H), scratch_bytes_for(budget().max_patches(), H));
     }
 
     /// the span tables are `n_ctx` rows since serve clamps the budget before arming them
     #[test]
+    fn image_positions_are_the_merged_grid_in_raster_order_like_hf() {
+        // #123: hand-computed from transformers 5.16.1 `get_vision_position_ids`
+        // (modeling_qwen3_5.py:1240-1290); 6 text rows, the image, 5 text rows
+        let seq = |n_img: usize| [vec![0u8; 6], vec![1u8; n_img], vec![0u8; 5]].concat();
+        // wide [1,32,58]: 16 rows x 29 cols of merged tokens
+        let (p, delta) = mrope_positions(&seq(464), &[(1, 32, 58)]);
+        assert_eq!(p.len(), 475);
+        assert_eq!(p[5], [5, 5, 5]);
+        assert_eq!(p[6], [6, 6, 6]);
+        assert_eq!(p[6 + 28], [6, 6, 34], "the end of the first merged row");
+        assert_eq!(p[6 + 29], [6, 7, 6], "the second merged row starts at col 0");
+        assert_eq!(p[469], [6, 21, 34], "the last image token");
+        assert_eq!(p[470], [35, 35, 35], "text resumes at cur + max(h, w) / 2");
+        assert_eq!(delta, -435);
+        let img = &p[6..470];
+        assert_eq!(img.iter().map(|r| r[1]).max(), Some(21));
+        assert_eq!(img.iter().map(|r| r[2]).max(), Some(34));
+        // tall [1,58,32]: 29 rows x 16 cols
+        let (p, delta) = mrope_positions(&seq(464), &[(1, 58, 32)]);
+        assert_eq!(p[6 + 16], [6, 7, 6]);
+        assert_eq!(p[469], [6, 34, 21]);
+        assert_eq!(p[470], [35, 35, 35]);
+        assert_eq!(delta, -435);
+    }
+
+    #[test]
     fn the_mrope_span_is_the_whole_context_cos_and_sin() {
-        assert_eq!(mrope_bytes(200_000), 51_200_000);
-        assert_eq!(mrope_bytes(262_144), 67_108_864);
+        assert_eq!(mrope_bytes(200_000, 32), 51_200_000);
+        assert_eq!(mrope_bytes(262_144, 32), 67_108_864);
     }
 
     #[test]
     fn the_reserve_is_the_sum_and_the_budget_line_names_its_parts() {
         let ctx = 200_000;
         assert_eq!(
-            reserve_bytes(ctx),
-            (scratch_bytes() + mrope_bytes(ctx)) as u64
+            reserve_bytes(&Geo::FLASH_NEXT, ctx),
+            (scratch_bytes(H) + mrope_bytes(ctx, 32)) as u64
         );
-        let line = reserve_line(ctx, 0);
+        let line = reserve_line(&Geo::FLASH_NEXT, ctx, 0);
         assert!(line.starts_with("vit reserve"), "the [budget] label moved: {line}");
         assert!(line.contains("334.5 MB"), "the reserve total moved: {line}");
         assert!(line.contains("tower scratch 285.6"), "the scratch part moved: {line}");
@@ -1690,9 +1773,9 @@ mod reserve {
     #[test]
     fn the_held_bytes_are_the_whole_derived_reserve_and_nothing_stays_pending() {
         for ctx in [200_000usize, 262_144] {
-            let held = (scratch_bytes() + mrope_bytes(ctx)) as u64;
-            assert_eq!(held, reserve_bytes(ctx), "ctx {ctx}: the hold is not the reserve");
-            assert_eq!(reserve_bytes(ctx).saturating_sub(held), 0, "ctx {ctx}: bytes left pending");
+            let held = (scratch_bytes(H) + mrope_bytes(ctx, 32)) as u64;
+            assert_eq!(held, reserve_bytes(&Geo::FLASH_NEXT, ctx), "ctx {ctx}: the hold is not the reserve");
+            assert_eq!(reserve_bytes(&Geo::FLASH_NEXT, ctx).saturating_sub(held), 0, "ctx {ctx}: bytes left pending");
         }
         // the twelve buffers, each counted from the geometry ensure_scratch uses
         let cap = budget().max_patches();
@@ -1710,7 +1793,7 @@ mod reserve {
             cap * VIT_ROT,         // cs
             cap * VIT_ROT,         // sn
         ];
-        assert_eq!(buffers.iter().sum::<usize>() * 4, scratch_bytes());
+        assert_eq!(buffers.iter().sum::<usize>() * 4, scratch_bytes(H));
     }
 
     /// #72 gate 2: the `[budget]` line says HELD once the loader holds it, and
@@ -1718,13 +1801,13 @@ mod reserve {
     #[test]
     fn the_budget_line_says_whether_the_reserve_is_held_or_only_planned() {
         let ctx = 200_000;
-        let held = reserve_line(ctx, reserve_bytes(ctx));
+        let held = reserve_line(&Geo::FLASH_NEXT, ctx, reserve_bytes(&Geo::FLASH_NEXT, ctx));
         assert!(held.contains("HELD at boot"), "the held wording moved: {held}");
         assert!(held.contains("nothing left pending"), "the pending clause moved: {held}");
-        let lazy = reserve_line(ctx, 0);
+        let lazy = reserve_line(&Geo::FLASH_NEXT, ctx, 0);
         assert!(lazy.contains("lazy, allocated on the first image request"), "the lazy wording moved: {lazy}");
         // a bigger override pads the plan by the difference, and says so
-        let part = reserve_line(ctx, scratch_bytes() as u64);
+        let part = reserve_line(&Geo::FLASH_NEXT, ctx, scratch_bytes(H) as u64);
         assert!(part.contains("48.8 MB pending"), "the partial-hold wording moved: {part}");
     }
 }
@@ -2175,6 +2258,7 @@ mod budget_and_mmproj {
     //! #107 and #108: the resize window, the projector file
     //! choice and the projector layout, all host-side (no GPU).
     use super::*;
+    use crate::geo::H;
     use crate::gguf::{self, Gguf, GGML_TYPE_F16, GGML_TYPE_F32};
 
     const OLD: VitBudget = VitBudget { min_tokens: 64, max_tokens: 1024 };
@@ -2250,43 +2334,79 @@ mod budget_and_mmproj {
     #[test]
     fn the_projector_file_is_found_by_the_documented_order() {
         let cnq = "/r/crow-nest/converter/x.cnq";
+        let one = |p: &str| VitSource::Mmproj(vec![p.to_string()]);
         // CROW_VIT_MMPROJ wins, 0 forces the container
         assert_eq!(
-            resolve_mmproj(Some("0"), cnq, None, None, &|_| true),
+            resolve_mmproj(Some("0"), cnq, None, None, None, &|_| true),
             VitSource::Container("CROW_VIT_MMPROJ=0".into())
         );
         assert_eq!(
-            resolve_mmproj(Some("/a/p.gguf"), cnq, None, None, &|p| p == "/a/p.gguf"),
-            VitSource::Mmproj("/a/p.gguf".into())
+            resolve_mmproj(Some("/a/p.gguf"), cnq, Some("M"), None, None, &|p| p == "/a/p.gguf"),
+            one("/a/p.gguf")
         );
-        assert!(matches!(resolve_mmproj(Some("/a/p.gguf"), cnq, None, None, &|_| false),
+        assert!(matches!(resolve_mmproj(Some("/a/p.gguf"), cnq, None, None, None, &|_| false),
             VitSource::Container(w) if w.contains("does not exist")));
-        // unset: models/ beside the container, then $CROW_MODELS, then Crow's install link
-        let m = |p: &str| resolve_mmproj(None, cnq, Some("/cm"), Some("/home/u"), &|q| q == p);
-        for hit in [
+        // unset: models/<model>/ beside the container, models/, then $CROW_MODELS, then Crow's install link
+        let m = |p: &str| resolve_mmproj(None, cnq, Some("M"), Some("/cm"), Some("/home/u"), &|q| q == p);
+        let order = [
+            "/r/crow-nest/models/M/mmproj-F16.gguf",
             "/r/crow-nest/models/mmproj-F16.gguf",
             "/cm/mmproj-F16.gguf",
             "/home/u/.local/share/crow/models/mmproj-F16.gguf",
-        ] {
-            assert_eq!(m(hit), VitSource::Mmproj(hit.into()));
+        ];
+        for hit in order {
+            assert_eq!(m(hit), one(hit));
         }
-        // the first hit wins when several exist
+        // #122: every existing file, in order - the model's own first
         assert_eq!(
-            resolve_mmproj(None, cnq, Some("/cm"), Some("/home/u"), &|_| true),
-            VitSource::Mmproj("/r/crow-nest/models/mmproj-F16.gguf".into())
+            resolve_mmproj(None, cnq, Some("M"), Some("/cm"), Some("/home/u"), &|_| true),
+            VitSource::Mmproj(order.iter().map(|p| p.to_string()).collect())
         );
-        match resolve_mmproj(None, cnq, Some("/cm"), Some("/home/u"), &|_| false) {
+        // no model name (an index v1 container): the model folder is not searched
+        assert_eq!(
+            resolve_mmproj(None, cnq, None, Some("/cm"), Some("/home/u"), &|_| true),
+            VitSource::Mmproj(order[1..].iter().map(|p| p.to_string()).collect())
+        );
+        match resolve_mmproj(None, cnq, Some("M"), Some("/cm"), Some("/home/u"), &|_| false) {
             VitSource::Container(w) => assert!(
-                w.contains("/r/crow-nest/models/mmproj-F16.gguf") && w.contains("/cm/") && w.contains("/home/u/"),
+                w.contains("/r/crow-nest/models/M/mmproj-F16.gguf") && w.contains("/cm/") && w.contains("/home/u/"),
                 "{w}"
             ),
             other => panic!("{other:?}"),
         }
     }
 
+    /// #122: another model's projector is skipped, not fatal; without a vit
+    /// section and without a usable projector the tower is off, not a panic
+    #[test]
+    fn a_refused_projector_is_skipped_and_a_dense_container_without_one_boots_without_vision() {
+        let src = || VitSource::Mmproj(vec!["/flash/mmproj-F16.gguf".into(), "/dense/mmproj-F16.gguf".into()]);
+        let open = |p: &str| if p.starts_with("/dense") { Ok(p.to_string()) } else { Err("projection_dim 2560, the tower needs 5120".to_string()) };
+        match choose_tower(src(), false, &open) {
+            TowerChoice::Mmproj(g, skipped) => {
+                assert_eq!(g, "/dense/mmproj-F16.gguf");
+                assert_eq!(skipped.len(), 1);
+                assert!(skipped[0].contains("/flash/") && skipped[0].contains("2560"), "{skipped:?}");
+            }
+            _ => panic!("the valid second candidate must win"),
+        }
+        let none = |_: &str| -> Result<String, String> { Err("refused".into()) };
+        match choose_tower(src(), false, &none) {
+            TowerChoice::Off(why) => assert!(why.contains("no vit section") && why.contains("/flash/"), "{why}"),
+            _ => panic!("a container without a vit section has no fallback"),
+        }
+        assert!(matches!(choose_tower(src(), true, &none), TowerChoice::Container(w) if w.starts_with("fallback")));
+        assert!(matches!(choose_tower(VitSource::Container("x".into()), false, &none), TowerChoice::Off(_)));
+        assert!(matches!(choose_tower(VitSource::Container("x".into()), true, &none), TowerChoice::Container(w) if w == "x"));
+    }
+
     /// a header-only projector image with the given tensor table (no data: the
     /// parser is told the file is big enough, validation reads no bytes)
     fn header(kv_over: Option<(&str, u32)>, drop: Option<&str>, redim: Option<(&str, Vec<u64>)>) -> Gguf {
+        header_for(H, kv_over, drop, redim)
+    }
+
+    fn header_for(out_hidden: usize, kv_over: Option<(&str, u32)>, drop: Option<&str>, redim: Option<(&str, Vec<u64>)>) -> Gguf {
         let u = |v: u32| v.to_le_bytes().to_vec();
         let mut kvs: Vec<(&str, u32, Vec<u8>)> = vec![
             ("clip.projector_type", 8, gguf::tests::str_payload("qwen3vl_merger")),
@@ -2296,7 +2416,7 @@ mod budget_and_mmproj {
             ("clip.vision.attention.head_count", 4, u(16)),
             ("clip.vision.patch_size", 4, u(16)),
             ("clip.vision.spatial_merge_size", 4, u(2)),
-            ("clip.vision.projection_dim", 4, u(2560)),
+            ("clip.vision.projection_dim", 4, u(out_hidden as u32)),
         ];
         if let Some((k, v)) = kv_over {
             for e in kvs.iter_mut() {
@@ -2305,7 +2425,7 @@ mod budget_and_mmproj {
                 }
             }
         }
-        let plan = mmproj_plan();
+        let plan = mmproj_plan(out_hidden);
         let tensors: Vec<(&str, Vec<u64>, u32, Vec<u8>)> = plan
             .iter()
             .filter(|(n, ..)| Some(n.as_str()) != drop)
@@ -2323,21 +2443,34 @@ mod budget_and_mmproj {
 
     #[test]
     fn the_projector_layout_is_checked_before_a_byte_is_loaded() {
-        let plan = mmproj_plan();
+        let plan = mmproj_plan(H);
         assert_eq!(plan.len(), 334, "the unsloth file carries 334 tensors");
         assert_eq!(plan.iter().filter(|e| e.2 == MmKind::Linear).count(), 27 * 4 + 2 + 2);
         let names: std::collections::BTreeSet<_> = plan.iter().map(|e| e.0.clone()).collect();
         assert_eq!(names.len(), 334);
         let targets: std::collections::BTreeSet<_> = plan.iter().map(|e| e.3.clone()).collect();
         assert_eq!(targets.len(), 333, "the container's vit section has 333 tensors");
-        assert_eq!(validate_mmproj(&header(None, None, None)), Ok(()));
-        let e = validate_mmproj(&header(Some(("clip.vision.block_count", 26)), None, None)).unwrap_err();
+        assert_eq!(validate_mmproj(&header(None, None, None), H), Ok(()));
+        let e = validate_mmproj(&header(Some(("clip.vision.block_count", 26)), None, None), H).unwrap_err();
         assert!(e.contains("block_count"), "{e}");
-        let e = validate_mmproj(&header(None, Some("v.blk.13.ffn_down.weight"), None)).unwrap_err();
+        let e = validate_mmproj(&header(None, Some("v.blk.13.ffn_down.weight"), None), H).unwrap_err();
         assert!(e.contains("v.blk.13.ffn_down.weight missing"), "{e}");
         // fc2 stored transposed (rows and k swapped) must not load
-        let e = validate_mmproj(&header(None, None, Some(("v.blk.0.ffn_down.weight", vec![1152, 4304])))).unwrap_err();
+        let e = validate_mmproj(&header(None, None, Some(("v.blk.0.ffn_down.weight", vec![1152, 4304]))), H).unwrap_err();
         assert!(e.contains("dims"), "{e}");
+    }
+
+    /// #122: the dense 27B's projector (merger out 5120) passes at 5120 and is
+    /// refused at Flash-Next's 2560, and the other way round
+    #[test]
+    fn the_dense_projector_is_told_apart_by_its_merger_width() {
+        let dense = header_for(5120, None, None, None);
+        assert_eq!(validate_mmproj(&dense, 5120), Ok(()));
+        assert_eq!(dense.find("mm.2.weight").unwrap().dims, vec![4608, 5120]);
+        let e = validate_mmproj(&dense, H).unwrap_err();
+        assert!(e.contains("projection_dim"), "{e}");
+        let e = validate_mmproj(&header(None, None, None), 5120).unwrap_err();
+        assert!(e.contains("projection_dim"), "{e}");
     }
 
     #[test]
@@ -2364,13 +2497,39 @@ mod budget_and_mmproj {
     /// (reads ~20 KB, no tensor data)
     #[test]
     fn the_projector_on_this_machine_passes_the_header_check() {
-        let VitSource::Mmproj(p) = mmproj_source("../converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq") else {
+        let VitSource::Mmproj(ps) = mmproj_source("../converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq", None) else {
             eprintln!("no mmproj-F16.gguf on this machine - skipped");
             return;
         };
-        let g = Gguf::open(&p).unwrap();
+        let g = Gguf::open(&ps[0]).unwrap();
         assert_eq!(g.tensors.len(), 334);
-        validate_mmproj(&g).unwrap();
+        validate_mmproj(&g, H).unwrap();
+    }
+
+    /// #122, the real files when this machine has them: for the dense 27B the
+    /// model's own projector is found first and validates at 5120, and the
+    /// Flash-Next file further down the list is refused (reads headers only)
+    #[test]
+    fn the_dense_27b_finds_its_own_projector_before_the_flash_next_one() {
+        let VitSource::Mmproj(ps) = mmproj_source("../converter/Qwen3.8-27B-CNQ4.5.cnq", Some("Qwen3.8-27B")) else {
+            eprintln!("no mmproj-F16.gguf on this machine - skipped");
+            return;
+        };
+        if !ps[0].ends_with("models/Qwen3.8-27B/mmproj-F16.gguf") {
+            eprintln!("no 27B projector in models/Qwen3.8-27B/ - skipped ({ps:?})");
+            return;
+        }
+        let open = |p: &str| Gguf::open(p).and_then(|g| validate_mmproj(&g, 5120).map(|_| g));
+        match choose_tower(VitSource::Mmproj(ps.clone()), false, &open) {
+            TowerChoice::Mmproj(g, skipped) => {
+                assert_eq!(g.path, ps[0]);
+                assert!(skipped.is_empty(), "{skipped:?}");
+            }
+            _ => panic!("the 27B projector must validate at 5120"),
+        }
+        for p in &ps[1..] {
+            assert!(open(p).is_err(), "{p} must be refused at 5120");
+        }
     }
 
     /// cos(container NVFP4 dequant, mmproj F16) per tensor: a mapping or
@@ -2381,8 +2540,8 @@ mod budget_and_mmproj {
     #[ignore]
     fn mmproj_matches_the_container_tensor_by_tensor() {
         let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| "../converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq".into());
-        let VitSource::Mmproj(p) = mmproj_source(&cnq_path) else { panic!("no mmproj file") };
-        let g = Gguf::open(&p).unwrap();
+        let VitSource::Mmproj(ps) = mmproj_source(&cnq_path, None) else { panic!("no mmproj file") };
+        let g = Gguf::open(&ps[0]).unwrap();
         let mut cnq = Cnq::open(&cnq_path);
         let cos = |a: &[f32], b: &[f32]| {
             assert_eq!(a.len(), b.len());
@@ -2396,7 +2555,7 @@ mod budget_and_mmproj {
         };
         let raw = |name: &str| g.read_raw(g.find(name).unwrap()).unwrap();
         let mut worst = (1.0f64, String::new());
-        for (gname, dims, kind, cname) in mmproj_plan() {
+        for (gname, dims, kind, cname) in mmproj_plan(H) {
             if gname == "v.patch_embd.weight.1" {
                 continue;
             }
@@ -2497,10 +2656,10 @@ mod gemm_vit {
     fn both_vision_gemms_match_the_host_at_every_tower_shape_and_keep_the_row_tail_in_bounds() {
         unsafe {
             let _ctx = cuda::Ctx::init();
-            let module = cuda::compile(crate::kernels::KERNEL_SRC);
+            let module = cuda::compile(&crate::kernels::KernelGeo::flash_next().source());
             let (f_fp4, f_f16) = (module.get("gemm_fp4_f32x"), module.get("gemm_f16_f32x"));
             // (rows, k): qkv, proj, fc1 (row tail), fc2 (k tail), merger fc1, fc2, patch
-            let shapes = [(3456, 1152), (1152, 1152), (4304, 1152), (1152, 4304), (4608, 4608), (2560, 4608), (1152, 1536)];
+            let shapes = [(3456, 1152), (1152, 1152), (4304, 1152), (1152, 4304), (4608, 4608), (2560, 4608), (5120, 4608), (1152, 1536)];
             let t = 70; // three token tiles, the last one partial
             for (si, &(rows, k)) in shapes.iter().enumerate() {
                 let x = fill_f32(t * k, 0x51 + si as u32);
@@ -2633,12 +2792,13 @@ mod image_identity {
 #[cfg(test)]
 mod tests_117 {
     use super::*;
+    use crate::geo::H;
 
     #[test]
     fn the_twelve_buffers_sum_to_the_scratch_bytes() {
         for cap in [4096usize, 5120] {
-            let sum: usize = scratch_buffer_bytes(cap).iter().map(|&(_, b)| b).sum();
-            assert_eq!(sum, scratch_bytes_for(cap), "cap {cap}");
+            let sum: usize = scratch_buffer_bytes(cap, H).iter().map(|&(_, b)| b).sum();
+            assert_eq!(sum, scratch_bytes_for(cap, H), "cap {cap}");
         }
     }
 }

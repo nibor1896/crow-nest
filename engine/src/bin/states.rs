@@ -12,8 +12,8 @@ use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::geo::*;
 use crow_nest_engine::manager::{ThreeStates, StateSizes};
 
-fn plan_table(context: usize, kv: KvDtype, expert_per_unit: u64, dense_hot: u64, n: usize) {
-    let s = StateSizes::plan(context, kv, 512);
+fn plan_table(geo: &Geo, context: usize, kv: KvDtype, expert_per_unit: u64, dense_hot: u64, n: usize) {
+    let s = StateSizes::plan(geo, context, kv, 512);
     println!("--- plan: context {context}, KV {}, N={n} ---", kv.name());
     println!("KV cache      {:>10.1} MiB", s.kv_bytes as f64 / MIB);
     println!("QSA keys      {:>10.1} MiB", s.qsa_keys_bytes as f64 / MIB);
@@ -25,8 +25,8 @@ fn plan_table(context: usize, kv: KvDtype, expert_per_unit: u64, dense_hot: u64,
         "hot experts   {:>10.1} MiB  ({} x {} layers x {:.2} MiB)",
         n as f64 * expert_per_unit as f64 / MIB,
         n,
-        LAYERS,
-        expert_per_unit as f64 / LAYERS as f64 / MIB
+        geo.layers,
+        expert_per_unit as f64 / geo.layers as f64 / MIB
     );
     let total = s.kv_bytes
         + s.qsa_keys_bytes
@@ -52,9 +52,11 @@ fn main() {
     // record. Read only: it opens the container INDEX, never a weight.
     let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| from_engine_dir(DEFAULT_CNQ));
     println!("states: opening container index for expert geometry … ({cnq_path})");
+    // Crow #300 C3: the model's Geo through the same metadata gate the front door uses
+    let geo = crow_nest_engine::boot::model_geo(&cnq_path);
     let mut cnq = Cnq::open(&cnq_path);
-    let slabs = crow_nest_engine::residency::expert_slab_info(&mut cnq, 0, "text");
-    let expert_per_unit = (slabs.gu_bytes + slabs.dn_bytes) * LAYERS as u64;
+    let slabs = crow_nest_engine::residency::expert_slab_info(&mut cnq, 0, "text", geo.moe().experts);
+    let expert_per_unit = (slabs.gu_bytes + slabs.dn_bytes) * geo.layers as u64;
     println!(
         "expert slab: gate_up {:.2} MiB + down {:.2} MiB = {:.2} MiB per expert per layer (gs {:.3}/{:.3})",
         slabs.gu_bytes as f64 / MIB,
@@ -78,27 +80,27 @@ fn main() {
         dense_bytes as f64 / MIB
     );
 
-    plan_table(262_144, KvDtype::Fp8E4m3, expert_per_unit, dense_bytes, 160);
-    plan_table(262_144, KvDtype::Bf16, expert_per_unit, dense_bytes, 160);
-    plan_table(200_000, KvDtype::Fp8E4m3, expert_per_unit, dense_bytes, 160);
-    plan_table(200_000, KvDtype::Bf16, expert_per_unit, dense_bytes, 160);
+    plan_table(&geo, 262_144, KvDtype::Fp8E4m3, expert_per_unit, dense_bytes, 160);
+    plan_table(&geo, 262_144, KvDtype::Bf16, expert_per_unit, dense_bytes, 160);
+    plan_table(&geo, 200_000, KvDtype::Fp8E4m3, expert_per_unit, dense_bytes, 160);
+    plan_table(&geo, 200_000, KvDtype::Bf16, expert_per_unit, dense_bytes, 160);
 
     unsafe {
         let _ctx = cuda::Ctx::init();
         let cfg = Config::default();
-        let (_, rep) = ThreeStates::allocate(&cfg, dense_bytes, expert_per_unit, expert_per_unit, false, 0);
+        let (_, rep) = ThreeStates::allocate(&cfg, &geo, dense_bytes, expert_per_unit, expert_per_unit, false, 0);
         println!("\n=== measured load @262k FP8-KV (default) ===");
         for l in &rep.lines {
             println!("{l}");
         }
         let cfg192 = Config { n_hot: 192, ..Default::default() };
-        let (_, rep) = ThreeStates::allocate(&cfg192, dense_bytes, expert_per_unit, expert_per_unit, false, 0);
+        let (_, rep) = ThreeStates::allocate(&cfg192, &geo, dense_bytes, expert_per_unit, expert_per_unit, false, 0);
         println!("\n=== forced N=192 @262k (auto-clamp expected, spec 2.6) ===");
         for l in &rep.lines {
             println!("{l}");
         }
         let cfgbf = Config { context: 200_000, kv: KvDtype::Bf16, ..Default::default() };
-        let (_, rep) = ThreeStates::allocate(&cfgbf, dense_bytes, expert_per_unit, expert_per_unit, false, 0);
+        let (_, rep) = ThreeStates::allocate(&cfgbf, &geo, dense_bytes, expert_per_unit, expert_per_unit, false, 0);
         println!("\n=== fallback point 200k BF16-KV ===");
         for l in &rep.lines {
             println!("{l}");
@@ -106,7 +108,7 @@ fn main() {
         println!("\n=== refusing 150k context (must refuse) ===");
         let cfgbad = Config { context: 150_000, ..Default::default() };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ThreeStates::allocate(&cfgbad, dense_bytes, expert_per_unit, expert_per_unit, false, 0)
+            ThreeStates::allocate(&cfgbad, &geo, dense_bytes, expert_per_unit, expert_per_unit, false, 0)
         }));
         match r {
             Ok(_) => {

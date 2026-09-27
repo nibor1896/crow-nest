@@ -202,8 +202,11 @@ impl std::fmt::Debug for Rng {
 }
 
 impl Sampler {
-    /// data-sheet instruct profile; every field overridable by env
-    pub fn from_env() -> Option<Self> {
+    /// data-sheet instruct profile; every field overridable by env. Crow #300 C3:
+    /// `vocab` is the loaded model's vocabulary (`Engine::geo.vocab`) the DRY breaker
+    /// map is built over; `None` builds none (a caller that only reads the profile,
+    /// `parity`'s record header)
+    pub fn from_env(vocab: Option<usize>) -> Option<Self> {
         if std::env::var("CROW_SAMPLE").as_deref() != Ok("1") {
             return None;
         }
@@ -219,9 +222,9 @@ impl Sampler {
         let dry_base = f("CROW_DRY_BASE", 1.75);
         let dry_last_n = u("CROW_DRY_LASTN", 64);
         let dry_armed = dry_multiplier != 0.0 && dry_base >= 1.0 && dry_last_n > 0;
-        let dry_breakers = if dry_armed {
+        let dry_breakers = if let (true, Some(vocab)) = (dry_armed, vocab) {
             match crate::tokenizer::global() {
-                Ok(tk) => dry_breaker_map(crate::geo::V, |id| tk.decode(&[id]).ok(), |s| tk.encode_raw(s).ok()),
+                Ok(tk) => dry_breaker_map(vocab, |id| tk.decode(&[id]).ok(), |s| tk.encode_raw(s).ok()),
                 Err(_) => std::sync::Arc::new(std::collections::HashMap::new()),
             }
         } else {
@@ -1016,6 +1019,10 @@ pub fn pos_logprobs(row: &[f32], chosen: usize, n: usize) -> PosLogprobs {
 /// EOS ids of the checkpoint (generation_config): `<|im_end|>` and
 /// `<|endoftext|>`. The second one is `geo::PLE_EOS` - the PLE shard reader's
 /// end marker and the sampler's stop id are the SAME token, written once.
+///
+/// Crow #300 C3: this is the Flash-Next PIN (the `meta` expected-values row and
+/// `Geo::FLASH_NEXT.eos_ids` are checked against it). The generation loops stop on
+/// the loaded model's own ids, `Engine::geo.eos_ids`, never on this const.
 pub const EOS_IDS: [usize; 2] = [248046, crate::geo::PLE_EOS as usize];
 
 /// the same two ids as i64, for the callers that compare a signed id

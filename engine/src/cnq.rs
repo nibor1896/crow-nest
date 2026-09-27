@@ -5,7 +5,17 @@
 //! by section (mtp carries its own layers.0 copy). dtype "bf16" = keep (raw LE
 //! bytes), "nvfp4" = 36 B per 64 values (4 ue4m3 scales + 32 B LSB-first
 //! nibbles) + one global f32 scale per tensor, rows contiguous without padding,
-//! "i64" = raw metadata tables (never quantized).
+//! "i64" = raw metadata tables (never quantized), "f32" = raw LE f32 (Crow #300 C6: the dense
+//! recipe's `A_log`).
+//!
+//! **Index versions (Crow #300 C6).** An index v2 (`format_version: 2`) carries a `model` block:
+//! the checkpoint's `config.json` and `generation_config.json` VERBATIM (as JSON strings, each
+//! with its sha256, checked here), the family, the recipe, the converter's derived geometry and
+//! the source repo, revision and per-shard sha256. A v1 index (no `format_version`, `version: 1`)
+//! carries no model block, and is accepted for exactly ONE container: the Flash-Next CNQ4.5-M
+//! container of record, recognised by the sha256 of its index trailer
+//! ([`CNQ45M_INDEX_SHA256`]). robin, 2026-09-25: the old container stays unchanged. Any other v1
+//! index is refused by name ([`V1_REFUSAL`]).
 
 use std::io::{Read, Seek, SeekFrom};
 
@@ -51,6 +61,181 @@ pub struct Cnq {
     /// #77: the dense-BF16 overlay, when `CROW_CNQ_OVERLAY` named one. `None` is
     /// today's behaviour exactly - `find` never looks, `read_bytes` never switches.
     pub ov: Option<Overlay>,
+    /// Crow #300 C6: which index this container carries - the v1 container of record, or a v2
+    /// with its `model` block. Read through `model()`, `config_json()`, `family()`.
+    pub index_kind: IndexKind,
+}
+
+/// sha256 of the index trailer of `Qwen3.8-Flash-Next-CNQ4.5-M.cnq`, the one CNQ index v1 the
+/// engine accepts (Crow #300 C6). "Index trailer" = the `index_len` JSON bytes in front of the
+/// last 8 bytes, without the length word.
+///
+/// Provenance: computed 2026-09-26 from the container of record,
+/// `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` (104,727,179,972 B, 2026-09-03; the file the
+/// package ships as `nibor1896/Qwen3.8-Flash-Next-CNQ4.5-M`), reading only its trailer: by
+/// `Cnq::open` itself (the `#[ignore]` test `tests_300_c6::the_container_of_record_opens_as_v1`)
+/// and independently with `tail -c 473536 | head -c 473528 | sha256sum`. Both gave this value.
+pub const CNQ45M_INDEX_SHA256: &str = "a21afc43203d983e46be5dd378ac5fb34581ab31fb5a0f6e8093d4730078c4ba";
+
+/// the byte length of that trailer, for the refusal text and the test
+pub const CNQ45M_INDEX_LEN: u64 = 473_528;
+
+/// The refusal of any CNQ index v1 other than the container of record. The words are the
+/// contract; the message that carries them adds the two hashes.
+pub const V1_REFUSAL: &str = "CNQ index v1 is only accepted for the Flash-Next CNQ4.5-M container of record";
+
+/// The `model` block of an index v2 (Crow #300 C6), as the converter wrote it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelBlock {
+    /// the engine's family name (`meta::Family` `Debug`): `FlashNext`, `Qwen35Dense`
+    pub family: String,
+    /// `text_config.model_type` of the config
+    pub model_type: String,
+    /// the converter's recipe row (`cnq4.5-flash-next`, `cnq4.5-qwen35-dense`); from the index top level
+    pub recipe: String,
+    /// `config.json`, byte for byte as the converter read it
+    pub config_json: String,
+    /// `generation_config.json`, byte for byte
+    pub generation_config_json: String,
+    pub source_repo: String,
+    pub source_revision: String,
+    /// the converter's derived geometry - informational; the engine derives its own `Geo`
+    /// from `config_json` (`meta.rs`)
+    pub geo: serde_json::Value,
+    /// the source shards as recorded (`file`, `size`, `sha256`, `sha256_from`)
+    pub shards: serde_json::Value,
+}
+
+/// Which index a container carries (Crow #300 C6).
+#[derive(Clone, Debug, PartialEq)]
+pub enum IndexKind {
+    /// the Flash-Next CNQ4.5-M container of record: index v1, no model block
+    V1OfRecord,
+    V2(Box<ModelBlock>),
+}
+
+/// What `Cnq::peek_index` reads without mapping the container (Crow #300 C7): the index kind
+/// and the tensor table.
+#[derive(Clone)]
+pub struct IndexPeek {
+    pub kind: IndexKind,
+    pub tensors: Vec<TensorInfo>,
+}
+
+impl IndexPeek {
+    /// the index v2 `model` block; `None` for the v1 container of record
+    pub fn model(&self) -> Option<&ModelBlock> {
+        match &self.kind {
+            IndexKind::V2(m) => Some(m),
+            IndexKind::V1OfRecord => None,
+        }
+    }
+
+    /// the family the container was converted as (`Cnq::family`'s rule)
+    pub fn family(&self) -> &str {
+        self.model().map(|m| m.family.as_str()).unwrap_or("FlashNext")
+    }
+}
+
+/// The index trailer of an open CNQ1 file: `(file length, the raw index bytes, the parsed
+/// index)`. Checks the magic and that the recorded index length fits the file. One reader for
+/// `Cnq::open_checked` and `Cnq::peek_index`, so the two cannot classify differently.
+fn read_index_trailer(f: &mut std::fs::File) -> Result<(u64, Vec<u8>, serde_json::Value), String> {
+    let file_len = f.metadata().map_err(|e| e.to_string())?.len();
+    if file_len < 20 {
+        return Err(format!("{file_len} B is too small to be a CNQ1 container"));
+    }
+    let mut magic = [0u8; 4];
+    f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    f.read_exact(&mut magic).map_err(|e| e.to_string())?;
+    if &magic != b"CNQ1" {
+        return Err(format!("magic is {magic:?}, not CNQ1"));
+    }
+    f.seek(SeekFrom::Start(file_len - 8)).map_err(|e| e.to_string())?;
+    let mut b8 = [0u8; 8];
+    f.read_exact(&mut b8).map_err(|e| e.to_string())?;
+    let idx_len = u64::from_le_bytes(b8) as usize;
+    if idx_len == 0 || idx_len as u64 + 20 > file_len {
+        return Err(format!("index length {idx_len} does not fit a {file_len} B file"));
+    }
+    f.seek(SeekFrom::Start(file_len - 8 - idx_len as u64)).map_err(|e| e.to_string())?;
+    let mut ib = vec![0u8; idx_len];
+    f.read_exact(&mut ib).map_err(|e| e.to_string())?;
+    let index: serde_json::Value = serde_json::from_slice(&ib).map_err(|e| format!("index json: {e}"))?;
+    Ok((file_len, ib, index))
+}
+
+/// hex sha256
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Classify an index trailer: its raw bytes (for the v1 hash) and its parsed JSON.
+pub fn classify_index(index_bytes: &[u8], index: &serde_json::Value) -> Result<IndexKind, String> {
+    classify_index_against(index_bytes, index, CNQ45M_INDEX_SHA256)
+}
+
+/// `classify_index` with the v1 hash of record as a parameter, so the accepting v1 path can be
+/// tested on a synthetic trailer (the real one is 473,528 B inside a 104.7 GB file).
+pub fn classify_index_against(index_bytes: &[u8], index: &serde_json::Value, v1_of_record: &str) -> Result<IndexKind, String> {
+    match index.get("format_version") {
+        None => {
+            // v1: `version: 1` (or, before the converter wrote one, nothing)
+            if let Some(v) = index.get("version") {
+                if v.as_u64() != Some(1) {
+                    return Err(format!("CNQ index `version` {v} without a `format_version` - not an index this engine reads"));
+                }
+            }
+            let got = sha256_hex(index_bytes);
+            if got == v1_of_record {
+                Ok(IndexKind::V1OfRecord)
+            } else {
+                Err(format!(
+                    "{V1_REFUSAL} (index sha256 {got}, {} B; of record {v1_of_record}, {CNQ45M_INDEX_LEN} B) - \
+re-convert the checkpoint: the converter writes index v2, which carries the model's config",
+                    index_bytes.len()
+                ))
+            }
+        }
+        Some(v) if v.as_u64() == Some(2) => parse_model_block(index).map(|m| IndexKind::V2(Box::new(m))),
+        Some(v) => Err(format!("CNQ index format_version {v} is not one this engine reads (it reads 2, and v1 only for the container of record)")),
+    }
+}
+
+/// The index v2 `model` block, every field required, and both config strings checked against
+/// the sha256 the converter recorded beside them.
+fn parse_model_block(index: &serde_json::Value) -> Result<ModelBlock, String> {
+    let m = &index["model"];
+    if !m.is_object() {
+        return Err("CNQ index v2 without a `model` block".into());
+    }
+    let s = |v: &serde_json::Value, what: &str| -> Result<String, String> {
+        v.as_str().map(str::to_string).ok_or_else(|| format!("CNQ index v2: `{what}` missing or not a string"))
+    };
+    let config_json = s(&m["config_json"], "model.config_json")?;
+    let generation_config_json = s(&m["generation_config_json"], "model.generation_config_json")?;
+    for (what, text, sha) in [
+        ("config_json", &config_json, &m["config_json_sha256"]),
+        ("generation_config_json", &generation_config_json, &m["generation_config_json_sha256"]),
+    ] {
+        let want = s(sha, &format!("model.{what}_sha256"))?;
+        let got = sha256_hex(text.as_bytes());
+        if got != want {
+            return Err(format!("CNQ index v2: model.{what} hashes to {got}, the index records {want} - the stored config was altered"));
+        }
+    }
+    Ok(ModelBlock {
+        family: s(&m["family"], "model.family")?,
+        model_type: s(&m["model_type"], "model.model_type")?,
+        recipe: s(&index["recipe"], "recipe")?,
+        config_json,
+        generation_config_json,
+        source_repo: s(&m["source"]["repo"], "model.source.repo")?,
+        source_revision: s(&m["source"]["revision"], "model.source.revision")?,
+        geo: m["geo"].clone(),
+        shards: m["source"]["shards"].clone(),
+    })
 }
 
 /// pending bytes that make `Cnq::fadvise_consumed` issue its DONTNEED call.
@@ -756,22 +941,23 @@ impl Cnq {
         self.ov.as_ref().map(|o| o.tensors.as_slice()).unwrap_or(&[])
     }
 
+    /// Open the container, or die naming why (Crow #300 C6: an index v1 that is not the
+    /// container of record, an unknown `format_version`, an altered model block).
     pub fn open(path: &str) -> Cnq {
+        Cnq::open_checked(path).unwrap_or_else(|why| panic!("[cnq] refused: {path}: {why}"))
+    }
+
+    /// `open` with the refusal as an `Err`. The reads and the mapping are `open`'s of `64c242b`;
+    /// what C6 adds is the index classification before anything is mapped.
+    pub fn open_checked(path: &str) -> Result<Cnq, String> {
         // FILE_FLAG_SEQUENTIAL_SCAN: the cache manager drops container pages
         // behind the read cursor instead of keeping them in the system cache
         // working set (2026-09-06: 3.3 GB stayed "in use" after the engine
         // drop until process exit, and the reload's RAM check refused the tier)
         let mut f = open_sequential(path);
-        let file_len = f.metadata().unwrap().len();
-        f.seek(SeekFrom::Start(file_len - 8)).unwrap();
-        let mut b8 = [0u8; 8];
-        f.read_exact(&mut b8).unwrap();
-        let idx_len = u64::from_le_bytes(b8) as usize;
-        f.seek(SeekFrom::Start(file_len - 8 - idx_len as u64)).unwrap();
-        let mut ib = vec![0u8; idx_len];
-        f.read_exact(&mut ib).unwrap();
-        let index: serde_json::Value = serde_json::from_slice(&ib).unwrap();
-        let blob_offset = index["blob_offset"].as_u64().unwrap();
+        let (file_len, ib, index) = read_index_trailer(&mut f)?;
+        let index_kind = classify_index(&ib, &index)?;
+        let blob_offset = index["blob_offset"].as_u64().ok_or("index has no blob_offset")?;
         let tensors = parse_tensor_index(&index, false);
         let map_len = file_len;
         let (map, map_handle) = map_file(&f);
@@ -792,7 +978,53 @@ impl Cnq {
         if ple_range.0 > ple_range.1 {
             ple_range = (0, 0);
         }
-        Cnq { file: f, blob_offset, tensors, map, map_len, map_handle, path: path.to_string(), fadv: (0, 0), ple_range, ov: None }
+        Ok(Cnq { file: f, blob_offset, tensors, map, map_len, map_handle, path: path.to_string(), fadv: (0, 0), ple_range, ov: None, index_kind })
+    }
+
+    /// Crow #300 C7: the index trailer alone - classified exactly as `open_checked` classifies
+    /// it, plus the tensor table - without mapping the file. The boot door reads it FIRST: an
+    /// index v2 carries the config the metadata gate judges, and the tensor table is what the
+    /// gate holds that config against (`meta::container_mismatch`), all before `Cnq::open` maps
+    /// the container and before any CUDA call. The trailer is read twice per boot (here and in
+    /// `open`); on the container of record that is 473,528 B.
+    pub fn peek_index(path: &str) -> Result<IndexPeek, String> {
+        let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let (_, ib, index) = read_index_trailer(&mut f)?;
+        let kind = classify_index(&ib, &index)?;
+        Ok(IndexPeek { kind, tensors: parse_tensor_index(&index, false) })
+    }
+
+    /// The index v2 `model` block; `None` for the v1 container of record.
+    pub fn model(&self) -> Option<&ModelBlock> {
+        match &self.index_kind {
+            IndexKind::V2(m) => Some(m),
+            IndexKind::V1OfRecord => None,
+        }
+    }
+
+    /// The checkpoint's `config.json`, byte for byte, from an index v2. `None` for the v1
+    /// container of record, which carries none: its boot keeps reading `CROW_MODEL_DIR`.
+    pub fn config_json(&self) -> Option<&str> {
+        self.model().map(|m| m.config_json.as_str())
+    }
+
+    /// The checkpoint's `generation_config.json`, byte for byte, from an index v2.
+    pub fn generation_config_json(&self) -> Option<&str> {
+        self.model().map(|m| m.generation_config_json.as_str())
+    }
+
+    /// The model family the container was converted as: the v2 `model.family`, or `FlashNext`
+    /// for the v1 container of record (the only v1 container `open` accepts).
+    pub fn family(&self) -> &str {
+        self.model().map(|m| m.family.as_str()).unwrap_or("FlashNext")
+    }
+
+    /// The index version: 1 (the container of record) or 2.
+    pub fn index_version(&self) -> u32 {
+        match self.index_kind {
+            IndexKind::V1OfRecord => 1,
+            IndexKind::V2(_) => 2,
+        }
     }
 
     /// the `ple` section as one `[lo, hi)` byte range of the container, or
@@ -840,6 +1072,7 @@ impl Cnq {
         match t.dtype.as_str() {
             "bf16" => t.n_values * 2,
             "i64" => t.n_values * 8,
+            "f32" => t.n_values * 4, // Crow #300 C6: the dense recipe's A_log
             _ => (t.n_values + 63) / 64 * 36, // nvfp4
         }
     }
@@ -977,7 +1210,8 @@ impl Cnq {
         let raw = self.read_bytes(&t);
         match t.dtype.as_str() {
             "bf16" => bf16_bytes_to_f32(&raw),
-            _ => panic!("{name}: read_f32 expects a bf16 keep, got {}", t.dtype),
+            "f32" => f32_bytes_to_f32(&raw),
+            _ => panic!("{name}: read_f32 expects a bf16 or f32 keep, got {}", t.dtype),
         }
     }
 
@@ -995,6 +1229,12 @@ pub fn bf16_bytes_to_f32(raw: &[u8]) -> Vec<f32> {
     raw.chunks_exact(2)
         .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
         .collect()
+}
+
+/// raw little-endian f32 (the `f32` dtype, Crow #300 C6)
+pub fn f32_bytes_to_f32(raw: &[u8]) -> Vec<f32> {
+    let (words, _) = raw.as_chunks::<4>();
+    words.iter().map(|w| f32::from_le_bytes(*w)).collect()
 }
 
 // CPU-side NVFP4 decode — the exact twin of the device decoder (p10 stage A).
@@ -1307,5 +1547,142 @@ mod tests {
             let m = overlay_refusal(&head("base.cnq", 999), &[t], "base.cnq", 999, &base).unwrap();
             assert!(m.contains("global scale"), "{bad}: {m}");
         }
+    }
+}
+
+/// Crow #300 C6: the index v2 reader and the v1-of-record rule.
+#[cfg(test)]
+mod tests_300_c6 {
+    use super::{classify_index, classify_index_against, sha256_hex, Cnq, IndexKind, CNQ45M_INDEX_LEN, CNQ45M_INDEX_SHA256, V1_REFUSAL};
+
+    fn fixture(f: &str) -> String {
+        format!("{}/tests/fixtures/synthetic-v2/{f}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// The round trip across the two crates: `synthetic-v2.cnq` is what the converter writes
+    /// for the synthetic dense model (its test `a_synthetic_v2_container_carries_its_config_
+    /// verbatim_and_is_the_engine_fixture` proves it byte for byte), and this reader hands back
+    /// both config files byte-identical to the files the converter read.
+    #[test]
+    fn a_v2_container_hands_back_its_config_files_byte_for_byte() {
+        let cnq = Cnq::open_checked(&fixture("synthetic-v2.cnq")).unwrap();
+        assert_eq!(cnq.index_version(), 2);
+        assert_eq!(cnq.config_json().unwrap().as_bytes(), std::fs::read(fixture("config.json")).unwrap().as_slice());
+        assert_eq!(cnq.generation_config_json().unwrap().as_bytes(), std::fs::read(fixture("generation_config.json")).unwrap().as_slice());
+        assert_eq!(cnq.family(), "Qwen35Dense");
+        let m = cnq.model().unwrap();
+        assert_eq!((m.model_type.as_str(), m.recipe.as_str()), ("qwen3_5_text", "cnq4.5-qwen35-dense"));
+        assert_eq!((m.source_repo.as_str(), m.source_revision.as_str()), ("crow-nest/synthetic-v2", "c6"));
+        assert_eq!(m.geo["hidden"], 64);
+        assert_eq!(m.shards.as_array().unwrap().len(), 1);
+        // the config parses as the JSON meta.rs will read
+        let cfg: serde_json::Value = serde_json::from_str(cnq.config_json().unwrap()).unwrap();
+        assert_eq!(cfg["text_config"]["model_type"], "qwen3_5_text");
+    }
+
+    /// The f32 dtype (the dense recipe's A_log) is 4 B per value and `read_f32` reads it; every
+    /// tensor of the fixture lies inside the payload.
+    #[test]
+    fn the_f32_dtype_is_four_bytes_per_value_and_read_f32_reads_it() {
+        let mut cnq = Cnq::open_checked(&fixture("synthetic-v2.cnq")).unwrap();
+        let t = cnq.find("model.language_model.layers.0.linear_attn.A_log", "text").clone();
+        assert_eq!((t.dtype.as_str(), Cnq::byte_len(&t)), ("f32", 8));
+        let v = cnq.read_f32("model.language_model.layers.0.linear_attn.A_log", "text");
+        assert_eq!(v.len(), 2);
+        // f32 widened from bf16: the low 16 bits are zero, and the value is in the LCG's range
+        assert!(v.iter().all(|x| x.to_bits() & 0xFFFF == 0 && x.abs() <= 0.25), "{v:?}");
+        let len = std::fs::metadata(fixture("synthetic-v2.cnq")).unwrap().len();
+        for t in &cnq.tensors {
+            assert!(cnq.blob_offset + t.offset + Cnq::byte_len(t) <= len, "{}", t.name);
+        }
+    }
+
+    /// A v1 index is accepted when, and only when, its bytes hash to the container of record.
+    /// The accepting branch runs on a synthetic trailer with its own hash as "of record"; the
+    /// real constant is checked on the real file by the `#[ignore]` test below.
+    #[test]
+    fn a_v1_index_is_accepted_only_as_the_container_of_record() {
+        let bytes = br#"{"format":"crow-nest-quant","version":1,"blob_offset":12,"tensors":[]}"#;
+        let v: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        let own = sha256_hex(bytes);
+        assert_eq!(classify_index_against(bytes, &v, &own).unwrap(), IndexKind::V1OfRecord);
+        // the same bytes against the real hash of record: refused, by name, with both hashes
+        let m = classify_index(bytes, &v).unwrap_err();
+        assert!(m.starts_with(V1_REFUSAL), "{m}");
+        assert!(m.contains(&own) && m.contains(CNQ45M_INDEX_SHA256), "{m}");
+        // one byte different from the record is a different container
+        let mut other = bytes.to_vec();
+        other[2] = b'F';
+        assert!(classify_index_against(&other, &v, &own).unwrap_err().starts_with(V1_REFUSAL));
+        // and the refusal is what `open` says too, on a real file
+        let dir = std::env::temp_dir().join(format!("cnq-c6-v1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("v1.cnq");
+        let mut f = b"CNQ1\0\0\0\0\0\0\0\0".to_vec();
+        f.extend_from_slice(bytes);
+        f.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        std::fs::write(&p, &f).unwrap();
+        let m = Cnq::open_checked(p.to_str().unwrap()).err().unwrap();
+        assert!(m.starts_with(V1_REFUSAL), "{m}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Everything else is refused by name: an unknown format_version, a v2 without its model
+    /// block, a v2 whose stored config no longer hashes to what the converter recorded.
+    #[test]
+    fn an_unknown_version_a_missing_model_block_and_an_altered_config_are_refused() {
+        let b = std::fs::read(fixture("synthetic-v2.cnq")).unwrap();
+        let n = u64::from_le_bytes(b[b.len() - 8..].try_into().unwrap()) as usize;
+        let ib = &b[b.len() - 8 - n..b.len() - 8];
+        let good: serde_json::Value = serde_json::from_slice(ib).unwrap();
+        assert!(matches!(classify_index(ib, &good).unwrap(), IndexKind::V2(_)));
+
+        let mut v3 = good.clone();
+        v3["format_version"] = 3.into();
+        assert!(classify_index(ib, &v3).unwrap_err().contains("format_version 3 is not one this engine reads"));
+
+        let mut no_model = good.clone();
+        no_model.as_object_mut().unwrap().remove("model");
+        assert!(classify_index(ib, &no_model).unwrap_err().contains("without a `model` block"));
+
+        let mut altered = good.clone();
+        let c = altered["model"]["config_json"].as_str().unwrap().replace("\"hidden_size\": 64", "\"hidden_size\": 65");
+        altered["model"]["config_json"] = c.into();
+        let m = classify_index(ib, &altered).unwrap_err();
+        assert!(m.contains("model.config_json hashes to") && m.contains("altered"), "{m}");
+
+        let mut no_repo = good.clone();
+        no_repo["model"]["source"].as_object_mut().unwrap().remove("repo");
+        assert!(classify_index(ib, &no_repo).unwrap_err().contains("model.source.repo"));
+
+        let mut bad_v1 = good.clone();
+        bad_v1.as_object_mut().unwrap().remove("format_version");
+        bad_v1["version"] = 2.into();
+        assert!(classify_index(ib, &bad_v1).unwrap_err().contains("`version` 2 without a `format_version`"));
+    }
+
+    /// The real container of record opens through the v1 path. It reads only the trailer (the
+    /// mapping is lazy), but it needs the 104.7 GB file: `CROW_CNQ` names it, else the default
+    /// `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` beside the engine.
+    #[test]
+    #[ignore = "needs the 104.7 GB container of record: CROW_CNQ=<path> cargo test --release tests_300_c6 -- --ignored"]
+    fn the_container_of_record_opens_as_v1() {
+        let path = std::env::var("CROW_CNQ")
+            .unwrap_or_else(|_| format!("{}/../converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq", env!("CARGO_MANIFEST_DIR")));
+        let cnq = Cnq::open_checked(&path).unwrap();
+        assert_eq!(cnq.index_version(), 1);
+        assert_eq!(cnq.index_kind, IndexKind::V1OfRecord);
+        assert!(cnq.config_json().is_none() && cnq.model().is_none());
+        assert_eq!(cnq.family(), "FlashNext");
+        assert_eq!(cnq.tensors.len(), 1658);
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(len, 104_727_179_972);
+        // the pinned hash, recomputed from the trailer bytes here
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(&path).unwrap();
+        f.seek(SeekFrom::Start(len - 8 - CNQ45M_INDEX_LEN)).unwrap();
+        let mut ib = vec![0u8; CNQ45M_INDEX_LEN as usize];
+        f.read_exact(&mut ib).unwrap();
+        assert_eq!(sha256_hex(&ib), CNQ45M_INDEX_SHA256);
     }
 }

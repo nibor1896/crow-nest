@@ -33,6 +33,7 @@ from cnq_weights import CnqReader  # noqa: E402
 
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
 from transformers.models.qwen4_exp.modeling_qwen4_exp import (
+    Qwen4ExpModel,
     Qwen4ExpTextDecoderLayer,
     Qwen4ExpTextGatedResidual,
     Qwen4ExpTextRotaryEmbedding,
@@ -216,7 +217,12 @@ class PleRef(torch.nn.Module):
         return out.unsqueeze(0)
 
 
-# ---- the interleaved mrope (Qwen4ExpModel.get_rope_index port) ----
+# ---- the interleaved mrope (Qwen4ExpModel.get_rope_index) ----
+# #123: the image positions come from HF's own `Qwen4ExpModel.get_vision_position_ids`
+# (the model method, not `vision_utils.get_vision_position_ids`, which is the
+# tower's patch rotary; the
+# merged grid in raster order), no longer from a mirror of the engine's
+# formula - that mirror copied the engine's block-major bug and hid it.
 def mrope_positions(types, grids):
     it = iter(grids)
     out = []
@@ -232,14 +238,10 @@ def mrope_positions(types, grids):
             out.extend([[cur + k] * 3 for k in range(ln)])
             cur += ln
         else:
-            _, hp, wp = next(it)
-            gw = wp // 2
-            for k in range(ln):
-                bh = k // (gw * 4)
-                rem = k % (gw * 4)
-                bj = rem // 4
-                r2 = rem % 4
-                out.append([cur, cur + bh * 2 + r2 // 2, cur + bj * 2 + r2 % 2])
+            t, hp, wp = next(it)
+            vp = Qwen4ExpModel.get_vision_position_ids(None, cur, torch.tensor([t, hp, wp]), 1, 2)
+            assert vp.shape[1] == ln, f"image group of {ln} rows vs {vp.shape[1]} merged tokens"
+            out.extend(vp.T.tolist())
             cur += max(hp, wp) // 2
     mx = max(max(r) for r in out)
     return out, mx + 1 - len(types)

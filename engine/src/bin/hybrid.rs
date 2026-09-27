@@ -15,7 +15,6 @@
 //!
 //! usage: hybrid <src.cnq> <out.cnq> <K> --counts <routestats.json>... [--levels 0.5,1.5,3,6] [--threads 12]
 use crow_nest_engine::cnq::{self, Cnq};
-use crow_nest_engine::geo::*;
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
@@ -36,6 +35,9 @@ fn main() {
     }
     let src_path = args[1].clone();
     let out_path = args[2].clone();
+    // Crow #300 C3: the MoE shape from the checkpoint's Geo (the metadata gate), not the consts
+    let geo = crow_nest_engine::boot::model_geo(&src_path);
+    let (n_layers, n_exp, inter, hidden) = (geo.layers, geo.moe().experts, geo.moe().expert_inter, geo.hidden);
     let k: usize = args[3].parse().unwrap();
     let mut levels: Vec<f32> = vec![0.5, 1.5, 3.0, 6.0];
     let mut threads = 12usize;
@@ -57,39 +59,39 @@ fn main() {
     for &m in &levels { cb_val.push(-m); cb_nib.push(cnq::mag_index(m) | 8); }
 
     // ---- routing counts [48][512], summed over the given files ----
-    let mut counts = vec![vec![0u64; E]; LAYERS];
+    let mut counts = vec![vec![0u64; n_exp]; n_layers];
     for cf in &count_files {
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(cf).unwrap()).unwrap();
         let arr = if v.get("prefill_counts").is_some() { &v["prefill_counts"] } else { &v };
         let arr = arr.as_array().expect("counts: [48][512] array");
-        assert_eq!(arr.len(), LAYERS);
-        for l in 0..LAYERS {
+        assert_eq!(arr.len(), n_layers);
+        for l in 0..n_layers {
             let row = arr[l].as_array().unwrap();
-            assert_eq!(row.len(), E);
-            for e in 0..E { counts[l][e] += row[e].as_u64().unwrap(); }
+            assert_eq!(row.len(), n_exp);
+            for e in 0..n_exp { counts[l][e] += row[e].as_u64().unwrap(); }
         }
     }
     // rarest K per layer: ascending count, ties by ascending id
-    let mut rare: Vec<Vec<u32>> = Vec::with_capacity(LAYERS);
-    for l in 0..LAYERS {
-        let mut ord: Vec<u32> = (0..E as u32).collect();
+    let mut rare: Vec<Vec<u32>> = Vec::with_capacity(n_layers);
+    for l in 0..n_layers {
+        let mut ord: Vec<u32> = (0..n_exp as u32).collect();
         ord.sort_by(|&a, &b| counts[l][a as usize].cmp(&counts[l][b as usize]).then(a.cmp(&b)));
         ord.truncate(k);
         rare.push(ord);
     }
     let tot_sel: u64 = counts.iter().map(|c| c.iter().sum::<u64>()).sum();
-    let rare_sel: u64 = (0..LAYERS).map(|l| rare[l].iter().map(|&e| counts[l][e as usize]).sum::<u64>()).sum();
+    let rare_sel: u64 = (0..n_layers).map(|l| rare[l].iter().map(|&e| counts[l][e as usize]).sum::<u64>()).sum();
     eprintln!("hybrid: K={k} rarest experts per layer carry {:.3} % of the {} counted selections",
         100.0 * rare_sel as f64 / tot_sel.max(1) as f64, tot_sel);
 
     // ---- output: copy the source once, then patch in place ----
     let manifest_path = format!("{out_path}.hybrid.json");
-    let mut already: Vec<Vec<u32>> = vec![Vec::new(); LAYERS];
+    let mut already: Vec<Vec<u32>> = vec![Vec::new(); n_layers];
     if std::path::Path::new(&out_path).exists() {
         let m: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path).expect("output exists but no manifest")).unwrap();
         assert_eq!(m["source"].as_str().unwrap(), src_path, "manifest source differs");
         assert_eq!(m["levels"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect::<Vec<_>>(), levels, "manifest codebook differs");
-        for l in 0..LAYERS {
+        for l in 0..n_layers {
             already[l] = m["patched"][l].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
         }
         eprintln!("hybrid: extending {out_path} ({} experts already patched in layer 0)", already[0].len());
@@ -115,7 +117,7 @@ fn main() {
         drop(fo);
         eprintln!("hybrid: copy done in {:.0} s", t0.elapsed().as_secs_f64());
     }
-    for l in 0..LAYERS {
+    for l in 0..n_layers {
         for e in &already[l] {
             assert!(rare[l].contains(e), "layer {l}: expert {e} was patched before but is not among the K={k} rarest now - not monotone, refusing");
         }
@@ -124,13 +126,13 @@ fn main() {
     let idx = Cnq::open(&src_path);
     let blob = idx.blob_offset;
     let mut layers = Vec::new();
-    for l in 0..LAYERS {
+    for l in 0..n_layers {
         let gu = idx.find(&format!("model.language_model.layers.{l}.mlp.experts.gate_up_proj"), "text").clone();
         let dn = idx.find(&format!("model.language_model.layers.{l}.mlp.experts.down_proj"), "text").clone();
         layers.push((blob + gu.offset, gu.global_scale, blob + dn.offset, dn.global_scale));
     }
-    let gu_blocks = (2 * INTER * H) / 64;
-    let dn_blocks = (H * INTER) / 64;
+    let gu_blocks = (2 * inter * hidden) / 64;
+    let dn_blocks = (hidden * inter) / 64;
 
     // ---- worker: patch one layer's new rare experts in the output file ----
     let work = |l: usize| -> (f64, f64, u64, usize) {
@@ -188,8 +190,8 @@ fn main() {
     let mut tot_n = 0u64;
     let mut tot_p = 0usize;
     let mut next = 0usize;
-    while next < LAYERS {
-        let batch: Vec<usize> = (next..(next + threads).min(LAYERS)).collect();
+    while next < n_layers {
+        let batch: Vec<usize> = (next..(next + threads).min(n_layers)).collect();
         let results: Vec<(usize, (f64, f64, u64, usize))> = std::thread::scope(|sc| {
             let hs: Vec<_> = batch.iter().map(|&l| { let w = &work; sc.spawn(move || (l, w(l))) }).collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()

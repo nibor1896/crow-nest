@@ -1,7 +1,7 @@
 //! scan real container expert scale bytes for the NaN-encoding 0x7F (ue4m3
 //! e=15,m=7 — hardware NaN per mma_probe2; engine CPU twin decodes 480).
 use crow_nest_engine::cnq::Cnq;
-use crow_nest_engine::geo::*;
+use crow_nest_engine::geo::{from_engine_dir, DEFAULT_CNQ};
 
 fn main() {
     // #13: the logging subscriber of this process. Every library line this bin
@@ -12,6 +12,8 @@ fn main() {
     // #52: the probe defaults to the production -M container, like `decode` and `parity` (#51);
     // read only, no sidecar is written here
     let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| from_engine_dir(DEFAULT_CNQ));
+    // Crow #300 C3: the expert count from the checkpoint's Geo (the metadata gate)
+    let experts = crow_nest_engine::boot::model_geo(&cnq_path).moe().experts;
     let mut cnq = Cnq::open(&cnq_path);
     let sec = "text";
     let layers: Vec<usize> = std::env::args()
@@ -24,7 +26,7 @@ fn main() {
             ("down", format!("model.language_model.layers.{l}.mlp.experts.down_proj")),
         ] {
             let t = cnq.find(&name, sec).clone();
-            let per_expert = Cnq::byte_len(&t) / E as u64;
+            let per_expert = Cnq::byte_len(&t) / experts as u64;
             // scale bytes sit at offsets 0..4 of every 36-byte block; sample the
             // stream and classify (pos % 36 < 4) -- read in 8 MB chunks
             let total = Cnq::byte_len(&t);

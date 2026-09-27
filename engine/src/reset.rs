@@ -68,12 +68,7 @@
 
 use crate::cuda;
 use crate::gen::Engine;
-use crate::geo::GDN_CONV;
-
-/// f32 slots of one GDN layer's causal conv state, `[10240][3]` (`manager.rs:47`)
-const GDN_CONV_STATE: usize = GDN_CONV * 3;
-/// f32 slots of the PLE dilated conv state, `[10240][9]` (`gen.rs:902`)
-const PLE_STATE: usize = GDN_CONV * 9;
+use crate::manager::{gdn_conv_state_len, ple_state_len};
 
 impl Engine {
     /// - drops the captured decode graph and its capture stream, legacy stream made active
@@ -90,6 +85,13 @@ impl Engine {
         if self.graph_exec != 0 {
             cuda::graph_exec_destroy(self.graph_exec as cudarc::driver::sys::CUgraphExec);
             self.graph_exec = 0;
+        }
+        // crow-nest #95: the verify graphs were captured on the same stream
+        for g in self.vgraph.iter_mut() {
+            if *g != 0 {
+                cuda::graph_exec_destroy(*g as cudarc::driver::sys::CUgraphExec);
+                *g = 0;
+            }
         }
         if self.cap_stream != 0 {
             cuda::set_stream(0);
@@ -118,17 +120,25 @@ impl Engine {
         self.drop_decode_graph();
 
         self.pos = 0;
+        // crow-nest #95: a pass of the previous sequence is void (its rows are gone)
+        self.spec = None;
+        self.spec_d1 = None;
         self.history.clear();
         self.history_images.clear();
         self.done_blocks = 0;
         self.route_log.clear();
 
-        let z_conv = vec![0f32; GDN_CONV_STATE];
+        // C3: the two state sizes from the engine's Geo - one GDN layer's causal conv
+        // state `[10240][3]` and the PLE dilated conv state `[10240][9]` on Flash-Next
+        let z_conv = vec![0f32; gdn_conv_state_len(&self.geo)];
         for i in 0..self.st.gdn_conv.len() {
             cuda::to_f32_into(self.st.gdn_conv[i], &z_conv);
         }
-        let z_ple = vec![0f32; PLE_STATE];
-        cuda::to_f32_into(self.ple.state, &z_ple);
+        let z_ple = vec![0f32; ple_state_len(&self.geo)];
+        // C5: a model without PLE has no PLE state
+        if let Some(pl) = &self.ple {
+            cuda::to_f32_into(pl.state, &z_ple);
+        }
 
         // the uploads read `z_conv` / `z_ple`, which die with this frame
         cuda::sync();

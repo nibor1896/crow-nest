@@ -1,0 +1,297 @@
+"""qwen35_common.py — Crow #300 phase 2: shared plumbing for the dense
+Qwen3.8-27B (qwen3_5_text) oracle scripts (export_qwen35_goldens.py,
+ref_qwen35_logits.py).
+
+One weight source, two back ends, same tensor names (the HF names — the
+converter keeps them verbatim):
+
+  cnq   the CNQ4.5 container DEQUANTIZED (cnq_weights.CnqReader): the exact
+        numbers the engine loads, so a comparison isolates engine math
+  bf16  the original BF16 safetensors shards (widened to f32, exact): the
+        quantization-error mark
+
+Modules are built on the meta device and filled with load_state_dict(assign=True,
+strict=True): no random init of the 17408x5120 MLP matrices, and a missing or
+extra tensor is an error, not a silent default.
+"""
+import hashlib
+import json
+import re
+import os
+
+import torch
+from safetensors import safe_open
+
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+from cnq_weights import CnqReader
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, ".."))
+MODEL_DIR = os.path.join(ROOT, "models", "Qwen3.8-27B")
+CNQ_PATH = os.path.join(ROOT, "converter", "Qwen3.8-27B-CNQ4.5.cnq")
+LM = "model.language_model."
+
+
+def text_config():
+    cfg = json.load(open(os.path.join(MODEL_DIR, "config.json")))
+    tc = Qwen3_5TextConfig.from_dict(cfg["text_config"])
+    tc._attn_implementation = "eager"  # deterministic eager path, softmax f32
+    return tc
+
+
+def sha256_file(path, chunk=1 << 22):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+# Crow #300 phase 2, measurement arm R1 (decode_out/p2-kld/PREREG.md): the precision split of
+# nvidia/Qwen3.8-27B-NVFP4 simulated on our container - attention q/k/v/o and GDN in_proj_qkv /
+# in_proj_z / out_proj as FP8 e4m3 with one scale per tensor (amax / 448) from the BF16
+# originals, everything else as the CNQ container
+R1_FP8 = re.compile(r"\.(self_attn\.(q|k|v|o)_proj|linear_attn\.(in_proj_qkv|in_proj_z|out_proj))\.weight$")
+
+
+# attribution arms (decode_out/p2-kld): `only-<group>` = that group from the CNQ container (NVFP4),
+# every other tensor from the BF16 originals
+GROUPS = {
+    "mlp": re.compile(r"\.mlp\.(gate|up|down)_proj\.weight$"),
+    "lmhead": re.compile(r"^lm_head\.weight$"),
+    "gdn": re.compile(r"\.linear_attn\.(in_proj_qkv|in_proj_z|out_proj)\.weight$"),
+    "attn": re.compile(r"\.self_attn\.(q|k|v|o)_proj\.weight$"),
+}
+
+
+def fp8_per_tensor(w):
+    s = w.abs().max().clamp(min=1e-30) / 448.0
+    return (w / s).to(torch.float8_e4m3fn).to(torch.float32) * s
+
+
+# calibrated-scale arms (decode_out/p2-lh/PREREG.md): every NVFP4 tensor of the container
+# re-quantized from the BF16 originals by nvfp4_sim.search with this objective, the rest as CNQ
+SIM_KINDS = ("x126", "diag", "lh")
+# the NVFP4 projection -> its calibration statistic (calib_qwen35_stats.py GROUP_OF)
+_SIM_GROUP = re.compile(r"layers\.(\d+)\.(self_attn\.(q|k|v|o)_proj|linear_attn\.(in_proj_qkv|in_proj_z|out_proj)|mlp\.(gate|up|down)_proj)\.weight$")
+_GROUP_OF = {"q": "attn_in", "k": "attn_in", "v": "attn_in", "o": "o_in", "in_proj_qkv": "gdn_in",
+             "in_proj_z": "gdn_in", "out_proj": "gdn_out_in", "gate": "mlp_in", "up": "mlp_in", "down": "down_in"}
+
+
+def stat_key(name):
+    if name == "lm_head.weight":
+        return "head_in"
+    m = _SIM_GROUP.search(name)
+    assert m, f"no calibration statistic for {name}"
+    return f"layers.{m.group(1)}.{_GROUP_OF[m.group(3) or m.group(4) or m.group(5)]}"
+
+
+class WeightSource:
+    def __init__(self, kind, cnq_path=CNQ_PATH, model_dir=MODEL_DIR):
+        assert kind in ("cnq", "bf16", "r1") or kind in SIM_KINDS or (kind.startswith("only-") and kind[5:] in GROUPS), kind
+        self.kind = kind
+        if kind in SIM_KINDS:
+            self.cnq_src = WeightSource("cnq", cnq_path, model_dir)
+            self.bf16_src = WeightSource("bf16", cnq_path, model_dir)
+            self.stats_path = os.environ.get("CROW_LH_STATS", os.path.join(ROOT, "decode_out", "p2-lh", "stats-H.pt"))
+            self.cache = os.environ.get("CROW_LH_CACHE")  # a directory for the searched bytes (tmpfs)
+            self.stats = torch.load(self.stats_path)["H"] if kind != "x126" else None
+            self.path = f"{kind}: bytes searched from {model_dir}, stats {self.stats_path}, rest {cnq_path}"
+            return
+        if kind.startswith("only-"):
+            self.group = GROUPS[kind[5:]]
+            self.cnq_src = WeightSource("cnq", cnq_path, model_dir)
+            self.bf16_src = WeightSource("bf16", cnq_path, model_dir)
+            self.path = f"{kind}: {cnq_path} for the group, {model_dir} for the rest"
+            return
+        if kind == "r1":
+            self.cnq_src = WeightSource("cnq", cnq_path, model_dir)
+            self.bf16_src = WeightSource("bf16", cnq_path, model_dir)
+            self.path = f"r1: {cnq_path} + FP8 from {model_dir}"
+            return
+        if kind == "cnq":
+            self.path = cnq_path
+            # a container still being written (or cut short) has no index trailer yet
+            assert has_trailer(cnq_path), f"{cnq_path}: no index trailer - conversion unfinished?"
+            self.cnq = CnqReader(cnq_path, sanitize_sf=True)  # the engine's load rule (gen.rs load_pw_x)
+        else:
+            self.model_dir = model_dir
+            self.wm = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))["weight_map"]
+            self.path = model_dir
+
+    def _open(self, name):
+        # opened per call, never cached: a kept handle keeps its mmap, and every
+        # touched page of the 54 GB of shards would stay in this process's RSS
+        return safe_open(os.path.join(self.model_dir, self.wm[name]), framework="pt", device="cpu")
+
+    def _sim_bytes(self, name):
+        """(bytes [N, K/16] uint8, global scale) of one NVFP4 tensor under this arm, cached"""
+        import nvfp4_sim as ns
+        if getattr(self, "_memo", (None,))[0] == name:  # lm_head is read in row chunks
+            return self._memo[1]
+        fn = None
+        if self.cache:
+            os.makedirs(os.path.join(self.cache, self.kind), exist_ok=True)
+            fn = os.path.join(self.cache, self.kind, name + ".pt")
+            if os.path.exists(fn):
+                d = torch.load(fn)
+                self._memo = (name, (d["bytes"], d["g"]))
+                return d["bytes"], d["g"]
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        w = self.bf16_src.get(name).to(dev)
+        H = None
+        if self.kind != "x126":
+            H = self.stats[stat_key(name)].to(dev)
+            if self.kind == "diag":
+                H = torch.diagonal(H, dim1=1, dim2=2)
+        by, _ = ns.search(w, self.kind, H)
+        g = ns.global_scale(w).cpu()
+        by = by.cpu()
+        del w, H
+        if fn:
+            torch.save({"bytes": by, "g": g}, fn)
+        self._memo = (name, (by, g))
+        return by, g
+
+    def _sim_rows(self, name, r0, r1):
+        import nvfp4_sim as ns
+        by, g = self._sim_bytes(name)
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        w = self.bf16_src.rows(name, r0, r1).to(dev)
+        return ns.dequant_bytes(w, g.to(dev), by[r0:r1].to(dev)).cpu()
+
+    def has(self, name):
+        if self.kind in SIM_KINDS:
+            return self.cnq_src.has(name)
+        if self.kind == "r1" or self.kind.startswith("only-"):
+            return self.cnq_src.has(name)
+        return self.cnq.has(name) if self.kind == "cnq" else name in self.wm
+
+    def get(self, name):
+        """the whole tensor, f32, in its checkpoint shape"""
+        assert self.has(name), f"{self.kind}: missing {name}"
+        if self.kind in SIM_KINDS:
+            if self.cnq_src.dtype_of(name) == "nvfp4":
+                return self._sim_rows(name, 0, self.cnq_src.n_rows(name))
+            return self.cnq_src.get(name)
+        if self.kind.startswith("only-"):
+            return (self.cnq_src if self.group.search(name) else self.bf16_src).get(name)
+        if self.kind == "r1":
+            if R1_FP8.search(name):
+                return fp8_per_tensor(self.bf16_src.get(name))
+            return self.cnq_src.get(name)
+        if self.kind == "cnq":
+            return self.cnq.tensor(name)
+        with self._open(name) as f:
+            return f.get_tensor(name).to(torch.float32).clone()
+
+    def rows(self, name, r0, r1):
+        """rows [r0, r1) of a 2-D tensor, f32 — never the whole table"""
+        if self.kind in SIM_KINDS:
+            if self.cnq_src.dtype_of(name) == "nvfp4":
+                return self._sim_rows(name, r0, r1)
+            return self.cnq_src.rows(name, r0, r1)
+        if self.kind.startswith("only-"):
+            return (self.cnq_src if self.group.search(name) else self.bf16_src).rows(name, r0, r1)
+        if self.kind == "r1":
+            return self.cnq_src.rows(name, r0, r1)  # embedding and lm_head: CNQ in R1
+        if self.kind == "cnq":
+            return self.cnq.rows_f32(name, r0, r1)
+        with self._open(name) as f:
+            return f.get_slice(name)[r0:r1].to(torch.float32).clone()
+
+    def n_rows(self, name):
+        if self.kind == "r1" or self.kind.startswith("only-") or self.kind in SIM_KINDS:
+            return self.cnq_src.n_rows(name)
+        if self.kind == "cnq":
+            return self.cnq.tensors[name]["shape"][0]
+        with self._open(name) as f:
+            return f.get_slice(name).get_shape()[0]
+
+    def dtype_of(self, name):
+        if self.kind in SIM_KINDS:
+            return self.cnq_src.dtype_of(name)
+        if self.kind == "r1":
+            return "fp8-sim" if R1_FP8.search(name) else self.cnq_src.dtype_of(name)
+        if self.kind == "cnq":
+            return self.cnq.tensors[name]["dtype"]
+        with self._open(name) as f:
+            return str(f.get_slice(name).get_dtype())
+
+    def load(self, module, prefix):
+        """fill a (meta-built) module from `prefix + param name`, strict"""
+        state = {k: self.get(prefix + k) for k in module.state_dict().keys()}
+        for k, v in module.state_dict().items():
+            assert tuple(v.shape) == tuple(state[k].shape), f"{prefix}{k}: {tuple(state[k].shape)} vs module {tuple(v.shape)}"
+        module.load_state_dict(state, strict=True, assign=True)
+        return module.float().eval()
+
+    def provenance(self):
+        if self.kind in SIM_KINDS:
+            return {"weights": f"{self.kind} (NVFP4 bytes searched by nvfp4_sim from the BF16 originals, rest CNQ)",
+                    "stats": self.stats_path, "cnq": self.cnq_src.provenance()}
+        if self.kind.startswith("only-"):
+            return {"weights": f"{self.kind} (the group from CNQ, the rest BF16)"}
+        if self.kind == "r1":
+            return {"weights": "r1 (CNQ + FP8 per-tensor attention/GDN projections from the BF16 originals)",
+                    "cnq": self.cnq_src.provenance(), "bf16": self.bf16_src.provenance()}
+        if self.kind == "cnq":
+            st = os.stat(self.path)
+            idx = self.cnq.index
+            return {
+                "weights": "cnq (dequantized CNQ4.5 container)",
+                "path": os.path.relpath(self.path, ROOT),
+                "file_size": st.st_size,
+                "file_mtime": int(st.st_mtime),
+                "index_sha256": self.cnq.index_sha256,
+                "index_len": self.cnq.index_len,
+                "format_version": idx.get("format_version"),
+                "recipe": idx.get("recipe"),
+                "scales": idx.get("scales"),
+            }
+        st = os.stat(os.path.join(self.model_dir, "model.safetensors.index.json"))
+        return {
+            "weights": "bf16 (original safetensors shards, widened to f32)",
+            "path": os.path.relpath(self.model_dir, ROOT),
+            "index_json_sha256": sha256_file(os.path.join(self.model_dir, "model.safetensors.index.json")),
+            "config_json_sha256": sha256_file(os.path.join(self.model_dir, "config.json")),
+            "index_json_mtime": int(st.st_mtime),
+        }
+
+
+def has_trailer(path):
+    import struct
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        f.seek(-8, 2)
+        n = struct.unpack("<Q", f.read(8))[0]
+        if not 0 < n < size - 12:
+            return False
+        f.seek(-(8 + n), 2)
+        return f.read(1) == b"{"
+
+
+def build_meta(cls, *args):
+    with torch.device("meta"):
+        return cls(*args)
+
+
+def causal_mask(T, past=0):
+    """additive [1,1,T,past+T] f32 mask: query i sees keys 0..past+i"""
+    min_dtype = torch.finfo(torch.float32).min
+    q = torch.arange(T).view(T, 1) + past
+    k = torch.arange(past + T).view(1, -1)
+    m = torch.zeros(T, past + T, dtype=torch.float32).masked_fill(k > q, min_dtype)
+    return m.view(1, 1, T, past + T)
+
+
+def rope_1d_reference(inv_freq, positions):
+    """plain 1-D NeoX rope over the rotary dims: the text-only reduction of the
+    interleaved mrope (all three position rows equal)"""
+    freqs = positions.float().view(-1, 1) * inv_freq.float().view(1, -1)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    return emb.cos(), emb.sin()

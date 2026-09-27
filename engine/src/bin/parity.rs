@@ -387,14 +387,14 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
     // path to itself. That window is the leading suspect of #65 (engine/README's
     // Windows rule is to wait for 50.5 GiB of free host RAM before a load).
     let ids = tokenize(text);
-    let (mut cnq, _ctx, mut cfg, _cnq_path, sidecar) = unsafe {
+    let (mut cnq, _ctx, mut cfg, _cnq_path, sidecar, geo) = unsafe {
         crow_nest_engine::boot::open_model(DEFAULT_CNQ.into(), DEFAULT_HOTSETS.into())
     };
     unsafe {
         // #16: CROW_CHUNK explicit, else auto by prompt length (geo.rs)
         crow_nest_engine::geo::apply_chunk_policy(&mut cfg, ids.len());
         let mut eng = crow_nest_engine::gen::Engine::load(
-            &mut cnq, cfg, None, &sidecar, false, &mut |_| {},
+            &mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |_| {},
         );
         let t0 = Instant::now();
         let mut next = eng.prefill(&mut cnq, &ids, None);
@@ -409,17 +409,17 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
         let (adapt_stream, adapt_every, adapt_max) = eng.cfg.adapt.knobs();
         let mut trickle_swaps = 0usize;
         let c0 = eng.drain_counters();
-        let (ple_r0, ple_m0) = (eng.ple().req, eng.ple().miss);
+        let (ple_r0, ple_m0) = eng.ple_counts();
         // #20: CROW_SAMPLE=1 -> sampling with the data-sheet profile: on the device
         // (sample_k behind argmax_k) unless CROW_SAMPLE_HOST=1 keeps the host path
-        let mut sampler = crow_nest_engine::sample::Sampler::from_env();
+        let mut sampler = crow_nest_engine::sample::Sampler::from_env(Some(eng.geo.vocab));
         // #85/#92: a host-only knob (DRY, the #92 tier) takes the host path too
         let sample_host = crow_nest_engine::sample::host_forced()
             || sampler.as_ref().is_some_and(|s| s.host_route());
         if let Some(s) = &mut sampler {
             eprintln!("[{}]", s.describe());
             if sample_host {
-                let lg = crow_nest_engine::cuda::dtoh(eng.logits(), crow_nest_engine::geo::V);
+                let lg = crow_nest_engine::cuda::dtoh(eng.logits(), eng.geo.vocab);
                 next = s.sample(&lg);
                 s.observe(next);
             } else {
@@ -427,7 +427,7 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
             }
         }
         let mut answer: Vec<i64> = vec![next as i64];
-        let mut stopped_eos = crow_nest_engine::sample::EOS_IDS_I64.contains(&(next as i64));
+        let mut stopped_eos = geo.eos_ids.contains(&next);
         let t1 = Instant::now();
         let mut steps = 1usize;
         while answer.len() < max_tokens && !stopped_eos {
@@ -440,14 +440,14 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
             next = eng.decode_step(&mut cnq, next as i64);
             if sample_host {
                 if let Some(s) = &mut sampler {
-                    let lg = crow_nest_engine::cuda::dtoh(eng.logits(), crow_nest_engine::geo::V);
+                    let lg = crow_nest_engine::cuda::dtoh(eng.logits(), eng.geo.vocab);
                     next = s.sample(&lg);
                     s.observe(next);
                 }
             }
             answer.push(next as i64);
             steps += 1;
-            if crow_nest_engine::sample::EOS_IDS_I64.contains(&(next as i64)) {
+            if geo.eos_ids.contains(&next) {
                 stopped_eos = true;
             }
             if steps % 10 == 0 || answer.len() >= max_tokens || stopped_eos {
@@ -470,7 +470,7 @@ fn crow_complete(text: &str, max_tokens: usize) -> (f64, f64, String, Vec<i64>) 
                 c.iter().zip(c0.iter()).map(|(x, b)| x[1] - b[1]).sum(),
             );
             let n = (steps as f64 - 1.0).max(1.0);
-            let (r, m) = (eng.ple().req - ple_r0, eng.ple().miss - ple_m0);
+            let (r, m) = (eng.ple_counts().0 - ple_r0, eng.ple_counts().1 - ple_m0);
             eprintln!("[decode-stats] {} tokens: cold experts/token {:.1} of {:.0}, {:.0} MB/token zero-copy; ple misses/token {:.2} of {:.1}; trickle swaps {} (every {}, max {}/layer)",
                 steps - 1, cold as f64 / n, sel as f64 / n, cold as f64 / n * (eng.residency().gu_bytes + eng.residency().dn_bytes) as f64 / 1e6,
                 m as f64 / n, r as f64 / n, trickle_swaps, adapt_every, adapt_max);
@@ -520,7 +520,8 @@ const GREEDY_POINT: &str = "200k floor, -np 1, greedy, temperature 0";
 ///   Latent (no llama record on this branch carries it), and now impossible by
 ///   construction: the arm decides, and `point_for` is pinned by the tests below.
 fn operating_point(arm: &str) -> String {
-    point_for(arm, crow_nest_engine::sample::Sampler::from_env().as_ref())
+    // the header reads the profile only: no DRY breaker map is built for it
+    point_for(arm, crow_nest_engine::sample::Sampler::from_env(None).as_ref())
 }
 
 /// the pure half of `operating_point`: the arm, and the sampler that arm used. No

@@ -32,7 +32,10 @@
 //!   but unparseable / missing a field / a value that differs / a special id
 //!   out of vocab range) is the hard-error class and panics.
 //! - **`CROW_MODEL_DIR`** names the checkpoint dir when it is not the
-//!   `models/` sibling of the container.
+//!   `models/` sibling of the container. Crow #300 C7: that is the index v1
+//!   path (the CNQ4.5-M container of record). An index v2 container carries its
+//!   config in its `model` block and the gate reads it from there; a set
+//!   `CROW_MODEL_DIR` is then only a sha256 cross-check ([`gate`]).
 //! - `sample.rs` keeps its EOS pin; this module READS `sample::EOS_IDS` and
 //!   asserts the config against it (the pin and the truth stay one concept,
 //!   written once in sample, compared once here).
@@ -43,10 +46,296 @@
 //! hard-error class, and the green boot path stashes the scaling + the training
 //! context for the two readers that build the rope table (manager.rs) and
 //! thread the YaRN mscale into the attention scale (kernels.rs).
+//!
+//! Crow #300 phase 1 (C1 + C2) makes the reader family-aware:
+//!
+//! - **family detection** from `text_config.model_type`: `qwen4_exp_text` is
+//!   Flash-Next, `qwen3_5_text` the dense Qwen3.5/3.8 family (Qwen3.8-27B); any
+//!   other string refuses by name.
+//! - **one expected-values row per family** ([`Expected`]): the Flash-Next row
+//!   IS today's pins (read out of `geo` and `sample`, the same 21 checks as
+//!   before); the dense row is the Qwen/Qwen3.8-27B @ 1d4bf0f2 checkpoint.
+//! - **unknown `text_config` keys refuse the parse by name.** Every key is
+//!   either consumed (it feeds a check or the `Geo`), or on a named ignore list
+//!   with the reason it has no effect on inference ([`IGNORED_KEYS`]); keys of
+//!   the other family count as unknown.
+//! - **the runtime [`geo::Geo`]** ([`ModelMeta::geo`]) derived from the config.
+//!   A Flash-Next boot asserts it equal to `Geo::FLASH_NEXT` (a mismatch table
+//!   otherwise); a dense boot prints it and passes it on. C5: the refusal of a
+//!   family moved from here to its first unbuilt block (`Geo::built`, called by
+//!   `boot::model_geo` right after this gate, still before the container and CUDA).
 
 use crate::geo;
+use crate::geo::{Attn, Family, FinalNorm, Ffn, GateAct, Geo, PleGeo, Residual};
+use crate::cnq::{sha256_hex, IndexPeek, ModelBlock};
 use crate::sample;
 use serde_json::Value;
+
+// ---- C1: the family table ----
+
+/// the source of the dense row of [`Expected`]
+pub const QWEN35_DENSE_SOURCE: &str = "Qwen/Qwen3.8-27B @ 1d4bf0f2 config.json";
+
+impl Family {
+    /// family detection: `text_config.model_type` (else the flat top level's)
+    pub fn detect(model_type: &str) -> Result<Family, String> {
+        Family::ALL.into_iter().find(|f| f.model_type() == model_type).ok_or_else(|| {
+            format!(
+                "text_config.model_type '{model_type}' is not a model family this engine knows \
+(known: qwen4_exp_text = Qwen3.8-Flash-Next, qwen3_5_text = dense Qwen3.5/3.8) - refusing (Crow #300)"
+            )
+        })
+    }
+}
+
+/// the expected values of one family: what the config must say for the
+/// engine's pins (Flash-Next) or the family row (dense) to hold
+#[derive(Clone, Copy, Debug)]
+pub struct Expected {
+    pub family: Family,
+    pub rms_norm_eps: f64,
+    pub rope_theta: f64,
+    pub rope_pairs: usize,
+    pub attention_scale: f64,
+    pub gqa_ratio: u64,
+    pub hidden_size: u64,
+    pub head_dim: u64,
+    pub q_heads: u64,
+    pub kv_heads: u64,
+    pub layers: usize,
+    pub attn_layers: usize,
+    pub gdn_layers: usize,
+    pub attn_interval: usize,
+    pub vocab_size: u64,
+    pub max_position_embeddings: u64,
+    pub eos_ids: [usize; 2],
+    /// the PLE shard end marker the text eos must equal (`None` = no PLE)
+    pub ple_eos: Option<i64>,
+    pub rope_type: &'static str,
+    /// the context the boot allocates at least, per family (C5: Flash-Next
+    /// `geo::CONTEXT_FLOOR`, dense `geo::DENSE_CONTEXT_FLOOR`)
+    pub context_floor: usize,
+}
+
+impl Expected {
+    /// the Flash-Next row: today's pins, read out of `geo` and `sample`
+    pub const FLASH_NEXT: Expected = Expected {
+        family: Family::FlashNext,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e7,
+        rope_pairs: geo::ROPE_PAIRS,
+        attention_scale: 0.0625,
+        gqa_ratio: 12,
+        hidden_size: geo::H as u64,
+        head_dim: geo::AHD as u64,
+        q_heads: geo::NQ as u64,
+        kv_heads: geo::NKV as u64,
+        layers: geo::LAYERS,
+        attn_layers: geo::ATTN_LAYERS,
+        gdn_layers: geo::GDN_LAYERS,
+        attn_interval: 4,
+        vocab_size: geo::V as u64,
+        max_position_embeddings: 262_144,
+        eos_ids: sample::EOS_IDS,
+        ple_eos: Some(geo::PLE_EOS),
+        rope_type: "default",
+        context_floor: geo::CONTEXT_FLOOR,
+    };
+
+    /// the dense row: Qwen/Qwen3.8-27B @ 1d4bf0f2 (verified 2026-09-25,
+    /// crow-nest#116): 64 layers = 16 x (3 GDN + 1 attention), H 5120,
+    /// 24 q / 4 kv heads x 256, no PLE
+    pub const QWEN35_DENSE: Expected = Expected {
+        family: Family::Qwen35Dense,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e7,
+        rope_pairs: 32,
+        attention_scale: 0.0625,
+        gqa_ratio: 6,
+        hidden_size: 5120,
+        head_dim: 256,
+        q_heads: 24,
+        kv_heads: 4,
+        layers: 64,
+        attn_layers: 16,
+        gdn_layers: 48,
+        attn_interval: 4,
+        vocab_size: 248_320,
+        max_position_embeddings: 262_144,
+        eos_ids: [248046, 248044],
+        ple_eos: None,
+        rope_type: "default",
+        // C5: the per-family floor; the per-card planner above it is phase 2
+        context_floor: geo::DENSE_CONTEXT_FLOOR,
+    };
+
+    pub fn of(family: Family) -> Expected {
+        match family {
+            Family::FlashNext => Expected::FLASH_NEXT,
+            Family::Qwen35Dense => Expected::QWEN35_DENSE,
+        }
+    }
+
+    /// where a pinned value lives: the engine site on Flash-Next, the family
+    /// row otherwise
+    fn at(&self, flash_site: &str) -> String {
+        match self.family {
+            Family::FlashNext => flash_site.to_string(),
+            Family::Qwen35Dense => format!("qwen3_5_text family row, {QWEN35_DENSE_SOURCE}"),
+        }
+    }
+}
+
+// ---- C1: the text_config key ledger ----
+
+/// keys every family consumes (they feed a check or the `Geo`)
+const COMMON_KEYS: &[&str] = &[
+    "attention_bias",
+    "bos_token_id",
+    "eos_token_id",
+    "full_attention_interval",
+    "head_dim",
+    "hidden_act",
+    "hidden_size",
+    "layer_types",
+    "linear_conv_kernel_dim",
+    "linear_key_head_dim",
+    "linear_num_key_heads",
+    "linear_num_value_heads",
+    "linear_value_head_dim",
+    "mamba_ssm_dtype",
+    "max_position_embeddings",
+    "model_type",
+    "mtp_num_hidden_layers",
+    "num_attention_heads",
+    "num_hidden_layers",
+    "num_key_value_heads",
+    "output_gate_type",
+    "partial_rotary_factor",
+    "rms_norm_eps",
+    "rope_parameters",
+    "rope_scaling",
+    "rope_theta",
+    "rope_type",
+    "tie_word_embeddings",
+    "vocab_size",
+];
+
+/// keys only Flash-Next consumes: hyper-connections, MoE, the QSA indexer, PLE
+const FLASH_NEXT_KEYS: &[&str] = &[
+    "hc_count",
+    "hc_lowrank",
+    "heads_per_ngram",
+    "indexer_budget",
+    "indexer_compress_ratio",
+    "indexer_head_dim",
+    "indexer_kv_heads",
+    "indexer_n_heads",
+    "moe_intermediate_size",
+    "ngram_size",
+    "num_experts",
+    "num_experts_per_tok",
+    "ple_conv_kernel_size",
+    "ple_embed_dim",
+    "ple_layer_ids",
+    "shared_expert_intermediate_size",
+];
+
+/// keys only the dense family consumes
+const QWEN35_DENSE_KEYS: &[&str] = &["attn_output_gate", "intermediate_size"];
+
+/// keys READ AND DROPPED on purpose, per family (`None` = every family), each
+/// with the reason it cannot change a logit of this engine
+pub const IGNORED_KEYS: &[(Option<Family>, &str, &str)] = &[
+    (None, "attention_dropout", "training-only dropout"),
+    (None, "dtype", "checkpoint storage dtype; the container carries its own per-tensor dtypes"),
+    (None, "initializer_range", "training-only initialisation"),
+    (None, "mtp_use_dedicated_embeddings", "MTP is not executed (crow-nest#95)"),
+    (None, "pad_token_id", "the engine never pads a batch"),
+    (None, "use_cache", "HF runtime switch"),
+    (Some(Family::FlashNext), "make_ngram_vocab_size_divisible_by", "PLE table sizing; the container's shard shapes are the truth"),
+    (Some(Family::FlashNext), "mtp", "MTP layer descriptor; MTP is not executed (crow-nest#95)"),
+    (Some(Family::FlashNext), "ngram_vocab_size_base", "PLE table sizing; the container's shard shapes are the truth"),
+    (Some(Family::FlashNext), "output_router_logits", "training-only router loss"),
+    (Some(Family::FlashNext), "router_aux_loss_coef", "training-only router loss"),
+    (Some(Family::FlashNext), "split_ngram_parts", "PLE table sizing; the container's shard shapes are the truth"),
+];
+
+/// the multimodal wrapper keys a FLAT config (no `text_config`) carries beside
+/// the text keys; the vision tower is not part of the text ledger
+const WRAPPER_KEYS: &[&str] = &[
+    "architectures",
+    "image_token_id",
+    "language_model_only",
+    "transformers_version",
+    "video_token_id",
+    "vision_config",
+    "vision_end_token_id",
+    "vision_start_token_id",
+];
+
+/// the keys of `rope_parameters` the reader consumes
+const ROPE_PARAMETER_KEYS: &[&str] = &["mrope_interleaved", "mrope_section", "partial_rotary_factor", "rope_theta", "rope_type"];
+
+/// every key of `tc` (and of its `rope_parameters`) that is neither consumed
+/// nor ignored for `family`, sorted — the unknown-key refusal's list
+pub fn unknown_keys(tc: &Value, family: Family, flat: bool) -> Vec<String> {
+    let family_keys = match family {
+        Family::FlashNext => FLASH_NEXT_KEYS,
+        Family::Qwen35Dense => QWEN35_DENSE_KEYS,
+    };
+    let known = |k: &str| {
+        COMMON_KEYS.contains(&k)
+            || family_keys.contains(&k)
+            || IGNORED_KEYS.iter().any(|(f, key, _)| *key == k && f.is_none_or(|f| f == family))
+            || (flat && WRAPPER_KEYS.contains(&k))
+    };
+    let mut out: Vec<String> = tc
+        .as_object()
+        .into_iter()
+        .flat_map(|o| o.keys())
+        .filter(|k| !known(k))
+        .map(|k| format!("text_config.{k}"))
+        .collect();
+    if let Some(rp) = tc.get("rope_parameters").and_then(Value::as_object) {
+        out.extend(
+            rp.keys()
+                .filter(|k| !ROPE_PARAMETER_KEYS.contains(&k.as_str()))
+                .map(|k| format!("text_config.rope_parameters.{k}")),
+        );
+    }
+    out.sort();
+    out
+}
+
+/// the keys only one family consumes, parsed; which variant is present IS the
+/// family
+#[derive(Debug, Clone, PartialEq)]
+pub enum FamilyKeys {
+    FlashNext {
+        hc_count: u64,
+        hc_lowrank: u64,
+        num_experts: u64,
+        num_experts_per_tok: u64,
+        moe_intermediate_size: u64,
+        shared_expert_intermediate_size: u64,
+        indexer_n_heads: u64,
+        indexer_kv_heads: u64,
+        indexer_head_dim: u64,
+        indexer_compress_ratio: u64,
+        indexer_budget: u64,
+        /// 1-based, as the config writes them
+        ple_layer_ids: Vec<u64>,
+        ngram_size: u64,
+        heads_per_ngram: u64,
+        ple_embed_dim: u64,
+        ple_conv_kernel_size: u64,
+    },
+    Qwen35Dense {
+        intermediate_size: u64,
+        attn_output_gate: bool,
+    },
+}
 
 /// one constant of the gate: the pinned engine value against the value derived
 /// from the checkpoint config, `ok` when they are equal. The name is stable —
@@ -125,6 +414,24 @@ pub struct ModelMeta {
     /// which means no scaling anywhere: the boot table, the kernel scale and
     /// every logit stay byte-identical
     pub rope_scaling: Option<RopeScaling>,
+    // ---- Crow #300 C1: the family and the keys the Geo is derived from ----
+    pub family: Family,
+    pub hidden_act: String,
+    pub attention_bias: bool,
+    pub mamba_ssm_dtype: String,
+    pub output_gate_type: String,
+    pub mrope_interleaved: Option<bool>,
+    pub linear_num_key_heads: u64,
+    pub linear_num_value_heads: u64,
+    pub linear_key_head_dim: u64,
+    pub linear_value_head_dim: u64,
+    pub linear_conv_kernel_dim: u64,
+    pub tie_word_embeddings: bool,
+    pub mtp_num_hidden_layers: u64,
+    /// `vision_config.out_hidden_size` (the merger's output width), when the
+    /// config carries a vision tower
+    pub vision_out_hidden: Option<u64>,
+    pub family_keys: FamilyKeys,
 }
 
 // ---- #96: rope scaling ----
@@ -306,8 +613,25 @@ impl ModelMeta {
     /// field is a hard, named error, never a defaulted guess.
     pub fn from_config_files(config_path: &str, generation_config_path: Option<&str>) -> Result<ModelMeta, String> {
         let config_text = std::fs::read_to_string(config_path).map_err(|e| format!("{config_path}: {e}"))?;
+        let generation = match generation_config_path {
+            Some(p) => Some((std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?, p)),
+            None => None,
+        };
+        ModelMeta::from_config_texts(&config_text, config_path, generation.as_ref().map(|(t, p)| (t.as_str(), *p)))
+    }
+
+    /// `from_config_files` on the two files' TEXTS (Crow #300 C7: an index v2 container carries
+    /// them verbatim in its `model` block). `config_path` and the generation label are what the
+    /// log lines and the refusals name as the source: a file path, or the container's
+    /// `<cnq> [index v2 model.config_json]`.
+    pub fn from_config_texts(
+        config_text: &str,
+        config_path: &str,
+        generation_config: Option<(&str, &str)>,
+    ) -> Result<ModelMeta, String> {
+        let generation_config_path = generation_config.map(|(_, p)| p);
         let config: Value =
-            serde_json::from_str(&config_text).map_err(|e| format!("{config_path}: not valid json: {e}"))?;
+            serde_json::from_str(config_text).map_err(|e| format!("{config_path}: not valid json: {e}"))?;
         let tc = text_config(&config);
 
         // rope fields nest in `rope_parameters` in this checkpoint; a flat
@@ -339,11 +663,8 @@ impl ModelMeta {
 
         // generation_config.json is the source of record for the stop ids; the
         // text config's own eos/bos is the fallback and the cross-check
-        let generation = match generation_config_path {
-            Some(p) => {
-                let s = std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?;
-                Some(serde_json::from_str::<Value>(&s).map_err(|e| format!("{p}: not valid json: {e}"))?)
-            }
+        let generation = match generation_config {
+            Some((s, p)) => Some(serde_json::from_str::<Value>(s).map_err(|e| format!("{p}: not valid json: {e}"))?),
             None => None,
         };
         let eos_from_generation = generation.as_ref().and_then(|g| ids_of(g, "eos_token_id")).is_some();
@@ -383,9 +704,109 @@ impl ModelMeta {
         need(u64_of(tc, "max_position_embeddings").is_some(), "text_config.max_position_embeddings");
         need(!rope_type_source.is_empty(), "text_config.rope_parameters.rope_type (or text_config.rope_type)");
         need(eos_token_ids.as_ref().is_some_and(|v| !v.is_empty()), "generation_config.json eos_token_id (or text_config.eos_token_id)");
+
+        // Crow #300 C1: the family, then the keys it requires. An unknown
+        // model_type refuses here, by name, before anything else is judged.
+        let model_type = tc.get("model_type").and_then(Value::as_str);
+        let family = match model_type {
+            Some(mt) => Some(Family::detect(mt).map_err(|why| format!("{config_path}: {why}"))?),
+            None => None,
+        };
+        need(model_type.is_some(), "text_config.model_type");
+        let str_of = |key: &str| tc.get(key).and_then(Value::as_str).map(str::to_string);
+        let bool_of = |key: &str| tc.get(key).and_then(Value::as_bool);
+        for key in [
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_conv_kernel_dim",
+            "mtp_num_hidden_layers",
+        ] {
+            need(u64_of(tc, key).is_some(), &format!("text_config.{key}"));
+        }
+        for key in ["hidden_act", "mamba_ssm_dtype", "output_gate_type"] {
+            need(str_of(key).is_some(), &format!("text_config.{key}"));
+        }
+        for key in ["attention_bias", "tie_word_embeddings"] {
+            need(bool_of(key).is_some(), &format!("text_config.{key}"));
+        }
+        match family {
+            Some(Family::FlashNext) => {
+                for key in FLASH_NEXT_KEYS.iter().filter(|k| **k != "ple_layer_ids") {
+                    need(u64_of(tc, key).is_some(), &format!("text_config.{key}"));
+                }
+                need(tc.get("ple_layer_ids").and_then(Value::as_array).is_some(), "text_config.ple_layer_ids");
+            }
+            Some(Family::Qwen35Dense) => {
+                need(u64_of(tc, "intermediate_size").is_some(), "text_config.intermediate_size");
+                need(bool_of("attn_output_gate").is_some(), "text_config.attn_output_gate");
+            }
+            None => {}
+        }
         if !missing.is_empty() {
             return Err(format!("{config_path}: missing required key(s): {}", missing.join(", ")));
         }
+        let family = family.unwrap();
+
+        // Crow #300 C1: every text_config key is consumed or ignored by name
+        let flat = !config.get("text_config").is_some_and(Value::is_object);
+        let unknown = unknown_keys(tc, family, flat);
+        if !unknown.is_empty() {
+            return Err(format!(
+                "{config_path}: key(s) this engine does not know for family {family:?} ({}): {} - refusing rather than \
+silently ignoring them (Crow #300); each must be consumed or put on the ignore list in meta.rs with its reason",
+                family.model_type(),
+                unknown.join(", ")
+            ));
+        }
+        // formula facts with exactly one implemented value, refused by name
+        let unsupported = |key: &str, got: &str, have: &[&str]| -> Result<(), String> {
+            if have.contains(&got) {
+                Ok(())
+            } else {
+                Err(format!("{config_path}: text_config.{key} '{got}' is not implemented (implemented: {}) - refusing (Crow #300)", have.join(", ")))
+            }
+        };
+        let hidden_act = str_of("hidden_act").unwrap();
+        let mamba_ssm_dtype = str_of("mamba_ssm_dtype").unwrap();
+        let output_gate_type = str_of("output_gate_type").unwrap();
+        unsupported("hidden_act", &hidden_act, &["silu"])?;
+        unsupported("mamba_ssm_dtype", &mamba_ssm_dtype, &["float32"])?;
+        unsupported("output_gate_type", &output_gate_type, &["sigmoid", "swish", "silu"])?;
+        let tie_word_embeddings = bool_of("tie_word_embeddings").unwrap();
+        if let Some(top) = config.get("tie_word_embeddings").and_then(Value::as_bool) {
+            if top != tie_word_embeddings {
+                return Err(format!(
+                    "{config_path}: tie_word_embeddings {top} (top level) disagrees with text_config.tie_word_embeddings {tie_word_embeddings} - refusing (Crow #300)"
+                ));
+            }
+        }
+        let u = |key: &str| u64_of(tc, key).unwrap();
+        let family_keys = match family {
+            Family::FlashNext => FamilyKeys::FlashNext {
+                hc_count: u("hc_count"),
+                hc_lowrank: u("hc_lowrank"),
+                num_experts: u("num_experts"),
+                num_experts_per_tok: u("num_experts_per_tok"),
+                moe_intermediate_size: u("moe_intermediate_size"),
+                shared_expert_intermediate_size: u("shared_expert_intermediate_size"),
+                indexer_n_heads: u("indexer_n_heads"),
+                indexer_kv_heads: u("indexer_kv_heads"),
+                indexer_head_dim: u("indexer_head_dim"),
+                indexer_compress_ratio: u("indexer_compress_ratio"),
+                indexer_budget: u("indexer_budget"),
+                ple_layer_ids: tc["ple_layer_ids"].as_array().unwrap().iter().filter_map(Value::as_u64).collect(),
+                ngram_size: u("ngram_size"),
+                heads_per_ngram: u("heads_per_ngram"),
+                ple_embed_dim: u("ple_embed_dim"),
+                ple_conv_kernel_size: u("ple_conv_kernel_size"),
+            },
+            Family::Qwen35Dense => FamilyKeys::Qwen35Dense {
+                intermediate_size: u("intermediate_size"),
+                attn_output_gate: bool_of("attn_output_gate").unwrap(),
+            },
+        };
 
         // #96: rope_scaling, after the required-key pass so the fallback context
         // is known. Absent (the checkpoint of record) = None = no scaling; a
@@ -401,7 +822,7 @@ impl ModelMeta {
         Ok(ModelMeta {
             config_path: config_path.to_string(),
             generation_config_path: generation_config_path.map(str::to_string),
-            model_type: tc.get("model_type").and_then(Value::as_str).unwrap_or("?").to_string(),
+            model_type: family.model_type().to_string(),
             rms_norm_eps: f64_of(tc, "rms_norm_eps").unwrap(),
             rope_theta,
             rope_theta_source,
@@ -424,41 +845,195 @@ impl ModelMeta {
             rope_type,
             rope_type_source,
             rope_scaling,
+            family,
+            hidden_act,
+            attention_bias: bool_of("attention_bias").unwrap(),
+            mamba_ssm_dtype,
+            output_gate_type,
+            mrope_interleaved: rp.and_then(|r| r.get("mrope_interleaved")).and_then(Value::as_bool),
+            linear_num_key_heads: u("linear_num_key_heads"),
+            linear_num_value_heads: u("linear_num_value_heads"),
+            linear_key_head_dim: u("linear_key_head_dim"),
+            linear_value_head_dim: u("linear_value_head_dim"),
+            linear_conv_kernel_dim: u("linear_conv_kernel_dim"),
+            tie_word_embeddings,
+            mtp_num_hidden_layers: u("mtp_num_hidden_layers"),
+            vision_out_hidden: config.get("vision_config").and_then(|v| u64_of(v, "out_hidden_size")),
+            family_keys,
+        })
+    }
+
+    // ---- C2: the runtime geometry ----
+
+    /// Derive the runtime [`Geo`] from the parsed config and the family table.
+    /// `Err` names the value that has no `Geo` form (a non-integral rope pair
+    /// count, an eos list that is not two ids, a malformed mrope section).
+    pub fn geo(&self) -> Result<Geo, String> {
+        let e = Expected::of(self.family);
+        let pairs = self.partial_rotary_factor * self.head_dim as f64 / 2.0;
+        if pairs.fract() != 0.0 || pairs <= 0.0 {
+            return Err(format!("rope pairs {pairs} (partial_rotary_factor x head_dim / 2) is not a whole number"));
+        }
+        let eos_ids: [usize; 2] = match self.eos_token_ids.as_slice() {
+            [a, b] if *a >= 0 && *b >= 0 => [*a as usize, *b as usize],
+            other => return Err(format!("eos_token_id {other:?}: the Geo holds exactly two stop ids (sample::EOS_IDS)")),
+        };
+        let mrope_section: [usize; 3] = match self.mrope_section.as_deref() {
+            Some([a, b, c]) => [*a as usize, *b as usize, *c as usize],
+            other => return Err(format!("text_config.rope_parameters.mrope_section {other:?}: the Geo needs three sections")),
+        };
+        let attn_layers = self.layer_types.iter().filter(|t| t.as_str() == "full_attention").count();
+        let gdn_layers = self.layer_types.iter().filter(|t| t.as_str() == "linear_attention").count();
+        // the interval the config names, else the first full-attention slot + 1
+        let attn_interval = match self.full_attention_interval {
+            Some(i) => i as usize,
+            None => self.layer_types.iter().position(|t| t == "full_attention").map_or(0, |p| p + 1),
+        };
+        let gate_act = match self.output_gate_type.as_str() {
+            "sigmoid" => GateAct::Sigmoid,
+            _ => GateAct::Silu, // "swish" / "silu", the parse refused anything else
+        };
+        let z = |v: u64| v as usize;
+        let (residual, ffn, attn, ple, final_norm, attn_output_gate) = match &self.family_keys {
+            FamilyKeys::FlashNext {
+                hc_count,
+                hc_lowrank,
+                num_experts,
+                num_experts_per_tok,
+                moe_intermediate_size,
+                shared_expert_intermediate_size,
+                indexer_n_heads,
+                indexer_kv_heads,
+                indexer_head_dim,
+                indexer_compress_ratio,
+                indexer_budget,
+                ple_layer_ids,
+                ngram_size,
+                heads_per_ngram,
+                ple_embed_dim,
+                ple_conv_kernel_size,
+            } => {
+                let ple_layer = match ple_layer_ids.as_slice() {
+                    [one] if *one >= 1 => z(*one) - 1,
+                    other => return Err(format!("text_config.ple_layer_ids {other:?}: the Geo holds exactly one 1-based PLE layer")),
+                };
+                if *indexer_compress_ratio == 0 || indexer_budget % indexer_compress_ratio != 0 {
+                    return Err(format!(
+                        "text_config.indexer_budget {indexer_budget} is not a multiple of indexer_compress_ratio {indexer_compress_ratio}"
+                    ));
+                }
+                (
+                    Residual::Hc { streams: z(*hc_count), lowrank: z(*hc_lowrank) },
+                    Ffn::Moe {
+                        experts: z(*num_experts),
+                        topk: z(*num_experts_per_tok),
+                        expert_inter: z(*moe_intermediate_size),
+                        shared_inter: z(*shared_expert_intermediate_size),
+                    },
+                    Attn::Qsa {
+                        heads: z(*indexer_n_heads),
+                        kv_heads: z(*indexer_kv_heads),
+                        head_dim: z(*indexer_head_dim),
+                        compress: z(*indexer_compress_ratio),
+                        block_topk: z(indexer_budget / indexer_compress_ratio),
+                    },
+                    Some(PleGeo {
+                        layer: ple_layer,
+                        ngram: z(*ngram_size),
+                        heads_per_ngram: z(*heads_per_ngram),
+                        embed: z(*ple_embed_dim),
+                        conv_kernel: z(*ple_conv_kernel_size),
+                        eos: self.text_eos_token_id.unwrap_or(-1),
+                    }),
+                    FinalNorm::HcMixer,
+                    // Flash-Next names only the gate's activation; the gate is always there
+                    true,
+                )
+            }
+            FamilyKeys::Qwen35Dense { intermediate_size, attn_output_gate } => (
+                Residual::Plain,
+                Ffn::Dense { inter: z(*intermediate_size) },
+                Attn::Full,
+                None,
+                FinalNorm::Rms,
+                *attn_output_gate,
+            ),
+        };
+        Ok(Geo {
+            family: self.family,
+            hidden: z(self.hidden_size),
+            residual,
+            layers: z(self.num_hidden_layers),
+            gdn_layers,
+            attn_layers,
+            attn_interval,
+            q_heads: z(self.num_attention_heads),
+            kv_heads: z(self.num_key_value_heads),
+            head_dim: z(self.head_dim),
+            attn,
+            attn_output_gate,
+            gate_act,
+            attention_bias: self.attention_bias,
+            rope_pairs: pairs as usize,
+            rope_theta: self.rope_theta,
+            mrope_section,
+            mrope_interleaved: self.mrope_interleaved.unwrap_or(false),
+            gdn_key_heads: z(self.linear_num_key_heads),
+            gdn_value_heads: z(self.linear_num_value_heads),
+            gdn_key_dim: z(self.linear_key_head_dim),
+            gdn_value_dim: z(self.linear_value_head_dim),
+            conv_kernel: z(self.linear_conv_kernel_dim),
+            ffn,
+            ple,
+            final_norm,
+            // both families' RMSNorm is the zero-centred (1 + w) form
+            norm_one_plus_w: true,
+            rms_eps: self.rms_norm_eps,
+            vocab: z(self.vocab_size),
+            tie_word_embeddings: self.tie_word_embeddings,
+            context_max: z(self.max_position_embeddings),
+            context_floor: e.context_floor,
+            eos_ids,
+            mtp_layers: z(self.mtp_num_hidden_layers),
+            vision_out_hidden: self.vision_out_hidden.map(z),
         })
     }
 
     // ---- the comparisons ----
 
-    /// every check, green and red, in table order. The count is what the boot
-    /// INFO line reports as "N constants verified".
+    /// every check, green and red, in table order, against the family's
+    /// [`Expected`] row. The count is what the boot INFO line reports as "N
+    /// constants verified" (21 on Flash-Next, whose row is today's pins; the
+    /// dense row has no PLE, so no `ple_eos`).
     pub fn checks(&self) -> Vec<Check> {
+        let e = Expected::of(self.family);
         let mut c = Vec::with_capacity(20);
-        c.push(Check::cmp("rms_norm_eps", 1e-6f64, self.rms_norm_eps, "kernels.rs, every rms + LayerNorm site", "text_config.rms_norm_eps"));
-        c.push(Check::cmp("rope_theta", 1e7f64, self.rope_theta, "manager.rs boot RoPE table", &self.rope_theta_source));
+        c.push(Check::cmp("rms_norm_eps", e.rms_norm_eps, self.rms_norm_eps, &e.at("kernels.rs, every rms + LayerNorm site"), "text_config.rms_norm_eps"));
+        c.push(Check::cmp("rope_theta", e.rope_theta, self.rope_theta, &e.at("manager.rs boot RoPE table"), &self.rope_theta_source));
         // partial rotary: factor x head_dim rotary dims, ROPE_PAIRS of them
         let pairs = self.partial_rotary_factor * self.head_dim as f64 / 2.0;
         c.push(Check {
             name: "rope_pairs",
-            pinned: format!("{:?} (geo::ROPE_PAIRS)", geo::ROPE_PAIRS),
+            pinned: format!("{:?} ({})", e.rope_pairs, e.at("geo::ROPE_PAIRS")),
             config: format!("{pairs}"),
             source: format!("{} x head_dim {} / 2", self.partial_rotary_factor, self.head_dim),
-            ok: pairs == geo::ROPE_PAIRS as f64,
+            ok: pairs == e.rope_pairs as f64,
         });
         // the attention scale every variant hardcodes is 1/sqrt(head_dim)
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        c.push(Check::cmp("attention_scale", 0.0625f64, scale, "kernels.rs, 5 attention variants", "1/sqrt(text_config.head_dim)"));
+        c.push(Check::cmp("attention_scale", e.attention_scale, scale, &e.at("kernels.rs, 5 attention variants"), "1/sqrt(text_config.head_dim)"));
         // GQA: the kernels derive kvh from the head count with a pinned divisor
         let gqa = if self.num_key_value_heads > 0 && self.num_attention_heads % self.num_key_value_heads == 0 {
             self.num_attention_heads / self.num_key_value_heads
         } else {
             0
         };
-        c.push(Check::cmp("gqa_ratio", 12u64, gqa, "kernels.rs `head / 12`", "num_attention_heads / num_key_value_heads"));
-        c.push(Check::cmp("hidden_size", geo::H as u64, self.hidden_size, "geo::H", "text_config.hidden_size"));
-        c.push(Check::cmp("head_dim", geo::AHD as u64, self.head_dim, "geo::AHD", "text_config.head_dim"));
-        c.push(Check::cmp("q_heads", geo::NQ as u64, self.num_attention_heads, "geo::NQ", "text_config.num_attention_heads"));
-        c.push(Check::cmp("kv_heads", geo::NKV as u64, self.num_key_value_heads, "geo::NKV", "text_config.num_key_value_heads"));
-        c.push(Check::cmp("num_hidden_layers", geo::LAYERS as u64, self.num_hidden_layers, "geo::LAYERS", "text_config.num_hidden_layers"));
+        c.push(Check::cmp("gqa_ratio", e.gqa_ratio, gqa, &e.at("kernels.rs `head / 12`"), "num_attention_heads / num_key_value_heads"));
+        c.push(Check::cmp("hidden_size", e.hidden_size, self.hidden_size, &e.at("geo::H"), "text_config.hidden_size"));
+        c.push(Check::cmp("head_dim", e.head_dim, self.head_dim, &e.at("geo::AHD"), "text_config.head_dim"));
+        c.push(Check::cmp("q_heads", e.q_heads, self.num_attention_heads, &e.at("geo::NQ"), "text_config.num_attention_heads"));
+        c.push(Check::cmp("kv_heads", e.kv_heads, self.num_key_value_heads, &e.at("geo::NKV"), "text_config.num_key_value_heads"));
+        c.push(Check::cmp("num_hidden_layers", e.layers as u64, self.num_hidden_layers, &e.at("geo::LAYERS"), "text_config.num_hidden_layers"));
         // the hybrid layout: geo dispatches on `layer % 4 == 3`; the config's
         // layer_types must be exactly that layout, with the pinned layer counts
         let unknown: Vec<&str> = self
@@ -474,17 +1049,22 @@ impl ModelMeta {
             .filter(|(_, t)| t.as_str() == "full_attention")
             .map(|(i, _)| i)
             .collect();
-        let pinned_at: Vec<usize> = (0..geo::LAYERS).filter(|i| geo::is_attn(*i)).collect();
-        let layout_ok = self.layer_types.len() == geo::LAYERS
+        let pinned_at: Vec<usize> = (0..e.layers).filter(|i| i % e.attn_interval == e.attn_interval - 1).collect();
+        let layout_ok = self.layer_types.len() == e.layers
             && full_at == pinned_at
-            && full_at.len() == geo::ATTN_LAYERS
-            && self.layer_types.len() - full_at.len() == geo::GDN_LAYERS
+            && full_at.len() == e.attn_layers
+            && self.layer_types.len() - full_at.len() == e.gdn_layers
             && unknown.is_empty();
         c.push(Check {
             name: "layer_layout",
             pinned: format!(
-                "layer % 4 == 3 is full attention: {} attn + {} gdn of {} (geo::is_attn, ATTN_LAYERS, GDN_LAYERS)",
-                geo::ATTN_LAYERS, geo::GDN_LAYERS, geo::LAYERS
+                "layer % {} == {} is full attention: {} attn + {} gdn of {} ({})",
+                e.attn_interval,
+                e.attn_interval - 1,
+                e.attn_layers,
+                e.gdn_layers,
+                e.layers,
+                e.at("geo::is_attn, ATTN_LAYERS, GDN_LAYERS")
             ),
             config: format!(
                 "{} layers, {} full_attention at {:?}, {} other{}",
@@ -498,47 +1078,49 @@ impl ModelMeta {
             ok: layout_ok,
         });
         if let Some(interval) = self.full_attention_interval {
-            c.push(Check::cmp("full_attention_interval", 4u64, interval, "geo::is_attn `layer % 4`", "text_config.full_attention_interval"));
+            c.push(Check::cmp("full_attention_interval", e.attn_interval as u64, interval, &e.at("geo::is_attn `layer % 4`"), "text_config.full_attention_interval"));
         }
-        c.push(Check::cmp("vocab_size", geo::V as u64, self.vocab_size, "geo::V", "text_config.vocab_size"));
+        c.push(Check::cmp("vocab_size", e.vocab_size, self.vocab_size, &e.at("geo::V"), "text_config.vocab_size"));
         // Config::default().context is the checkpoint's context budget; the
         // 200_000 floor is an engine policy, not a model constant
         c.push(Check::cmp(
             "max_position_embeddings",
-            geo::Config::default().context as u64,
+            e.max_position_embeddings,
             self.max_position_embeddings,
-            "geo::Config::default().context",
+            &e.at("geo::Config::default().context"),
             "text_config.max_position_embeddings",
         ));
         // the sampler's stop ids — sample.rs keeps the pin, this reads it live
         let config_eos: Vec<usize> = self.eos_token_ids.iter().map(|id| *id as usize).collect();
         c.push(Check {
             name: "eos_ids",
-            pinned: format!("{:?} (sample::EOS_IDS)", sample::EOS_IDS),
+            pinned: format!("{:?} ({})", e.eos_ids, e.at("sample::EOS_IDS")),
             config: format!("{:?}", self.eos_token_ids),
             source: if self.eos_from_generation {
                 "generation_config.json eos_token_id".to_string()
             } else {
                 "text_config.eos_token_id".to_string()
             },
-            ok: config_eos == sample::EOS_IDS.to_vec(),
+            ok: config_eos == e.eos_ids.to_vec(),
         });
         // 248044 doubles as the PLE shard end marker (geo::PLE_EOS): the text
         // config's own eos must BE that id, or the PLE reader and the sampler
-        // disagree about what "end" means
-        c.push(Check {
-            name: "ple_eos",
-            pinned: format!("{:?} (geo::PLE_EOS, the PLE shard end marker / gen.rs filler)", geo::PLE_EOS),
-            config: format!("{:?}", self.text_eos_token_id),
-            source: "text_config.eos_token_id".to_string(),
-            ok: self.text_eos_token_id == Some(geo::PLE_EOS),
-        });
+        // disagree about what "end" means (a family without PLE has no marker)
+        if let Some(ple_eos) = e.ple_eos {
+            c.push(Check {
+                name: "ple_eos",
+                pinned: format!("{:?} (geo::PLE_EOS, the PLE shard end marker / gen.rs filler)", ple_eos),
+                config: format!("{:?}", self.text_eos_token_id),
+                source: "text_config.eos_token_id".to_string(),
+                ok: self.text_eos_token_id == Some(ple_eos),
+            });
+        }
         // llama.cpp special-id discipline: every stop/start id inside the vocab
         let vocab = self.vocab_size as i64;
         let eos_in = !self.eos_token_ids.is_empty() && self.eos_token_ids.iter().all(|id| *id >= 0 && *id < vocab);
         c.push(Check {
             name: "eos_ids_in_vocab",
-            pinned: format!("0 <= id < {}", geo::V),
+            pinned: format!("0 <= id < {}", e.vocab_size),
             config: format!("{:?} against vocab {}", self.eos_token_ids, self.vocab_size),
             source: "generation_config.json eos_token_id vs text_config.vocab_size".to_string(),
             ok: eos_in,
@@ -546,7 +1128,7 @@ impl ModelMeta {
         if let Some(bos) = self.bos_token_id {
             c.push(Check {
                 name: "bos_id_in_vocab",
-                pinned: format!("0 <= id < {}", geo::V),
+                pinned: format!("0 <= id < {}", e.vocab_size),
                 config: format!("{bos} against vocab {}", self.vocab_size),
                 source: "generation_config.json bos_token_id vs text_config.vocab_size".to_string(),
                 ok: bos >= 0 && bos < vocab,
@@ -559,7 +1141,7 @@ impl ModelMeta {
         // the vit mrope sections sum to the SAME pair count the rope table builds
         if let Some(sec) = &self.mrope_section {
             let sum: u64 = sec.iter().sum();
-            c.push(Check::cmp("mrope_section_pairs", geo::ROPE_PAIRS as u64, sum, "geo::ROPE_PAIRS (manager.rs table)", "text_config.rope_parameters.mrope_section sum"));
+            c.push(Check::cmp("mrope_section_pairs", e.rope_pairs as u64, sum, &e.at("geo::ROPE_PAIRS (manager.rs table)"), "text_config.rope_parameters.mrope_section sum"));
         }
         // #96: the rope_type token must say "default" — the scaling this engine
         // reads lives in the rope_scaling object, parsed separately; a different
@@ -567,9 +1149,9 @@ impl ModelMeta {
         // nothing reads (and any scaling it meant must come as rope_scaling)
         c.push(Check::cmp(
             "rope_type",
-            "default",
+            e.rope_type,
             self.rope_type.as_str(),
-            "manager.rs boot RoPE table (no scaling path taken)",
+            &e.at("manager.rs boot RoPE table (no scaling path taken)"),
             &self.rope_type_source,
         ));
         c
@@ -591,13 +1173,15 @@ impl ModelMeta {
 
 // ---- locating the checkpoint's config next to the container ----
 
-/// `CROW_MODEL_DIR` wins; otherwise `models/` beside the container (the
-/// container lives in `<repo>/converter/`, so the repo root is its parent
-/// directory's parent — the same convention both cwd forms of the bins give:
-/// `converter/x.cnq` from the repo root, `../converter/x.cnq` from `engine/`).
-/// `Ok(None)` = no config found (the selftest package): the caller warns.
-pub fn from_container(cnq_path: &str) -> Result<Option<ModelMeta>, String> {
-    let config_dir = if let Ok(dir) = std::env::var("CROW_MODEL_DIR") {
+/// The index v1 path (the CNQ4.5-M container of record, which carries no
+/// config): `CROW_MODEL_DIR` (`model_dir`, read by the caller) wins; otherwise
+/// `models/` beside the container (the container lives in `<repo>/converter/`,
+/// so the repo root is its parent directory's parent — the same convention both
+/// cwd forms of the bins give: `converter/x.cnq` from the repo root,
+/// `../converter/x.cnq` from `engine/`). `Ok(None)` = no config found (the
+/// selftest package): the caller warns.
+pub fn from_container(cnq_path: &str, model_dir: Option<&str>) -> Result<Option<ModelMeta>, String> {
+    let config_dir = if let Some(dir) = model_dir {
         if dir.is_empty() {
             return Err("CROW_MODEL_DIR is set but empty".to_string());
         }
@@ -664,20 +1248,221 @@ fn config_dir_in_root(root: &std::path::Path, hint: &str) -> Option<std::path::P
     }
 }
 
+// ---- Crow #300 C7: which config the gate judges, and the container it must fit ----
+
+/// the log / refusal label of an index v2 config: the container, and the block key
+pub fn v2_config_label(cnq_path: &str, key: &str) -> String {
+    format!("{cnq_path} [index v2 model.{key}]")
+}
+
+/// The config the gate judges, by the container's index kind:
+///
+/// - **index v2**: the `model` block's `config_json` / `generation_config_json`,
+///   the bytes the converter read (their sha256 were checked by
+///   `cnq::classify_index`). The container's config wins: neither `models/`
+///   beside the container nor `CROW_MODEL_DIR` is read for it
+///   ([`check_model_dir_override`] only compares a set `CROW_MODEL_DIR`).
+/// - **index v1** (the CNQ4.5-M container of record, no config inside):
+///   [`from_container`], the pre-C7 path: `CROW_MODEL_DIR`, else `models/`.
+pub fn config_for_container(cnq_path: &str, peek: &IndexPeek, model_dir: Option<&str>) -> Result<Option<ModelMeta>, String> {
+    match peek.model() {
+        None => from_container(cnq_path, model_dir),
+        Some(m) => {
+            let label = v2_config_label(cnq_path, "config_json");
+            let glabel = v2_config_label(cnq_path, "generation_config_json");
+            ModelMeta::from_config_texts(&m.config_json, &label, Some((m.generation_config_json.as_str(), glabel.as_str()))).map(Some)
+        }
+    }
+}
+
+/// Crow #300 C7: `CROW_MODEL_DIR` beside an index v2 container. The container's
+/// config wins, so the variable is only a cross-check: its `config.json` (and its
+/// `generation_config.json`, when the directory has one) must hash to the bytes
+/// the container carries, or the boot is refused by name. A caller that points
+/// the variable at one checkpoint and the container at another is told so,
+/// instead of one of the two being silently ignored.
+pub fn check_model_dir_override(dir: &str, m: &ModelBlock) -> Result<(), String> {
+    if dir.is_empty() {
+        return Err("CROW_MODEL_DIR is set but empty".to_string());
+    }
+    let d = std::path::Path::new(dir);
+    for (file, carried, key, required) in [
+        ("config.json", m.config_json.as_str(), "config_json", true),
+        ("generation_config.json", m.generation_config_json.as_str(), "generation_config_json", false),
+    ] {
+        let p = d.join(file);
+        let bytes = match std::fs::read(&p) {
+            Ok(b) => b,
+            Err(_) if !required => continue,
+            Err(e) => return Err(format!("CROW_MODEL_DIR {dir}: {file}: {e} - refusing (Crow #300 C7)")),
+        };
+        let (got, want) = (sha256_hex(&bytes), sha256_hex(carried.as_bytes()));
+        if got != want {
+            return Err(format!(
+                "[meta] CROW_MODEL_DIR {} sha256 {got} differs from the container's model.{key} sha256 {want} \
+(family {}, {} @ {}) - an index v2 container carries its own config; unset CROW_MODEL_DIR or point it at the \
+checkpoint this container was converted from - refusing to boot (Crow #300)",
+                p.display(),
+                m.family,
+                m.source_repo,
+                m.source_revision
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The container facts a config must fit, read off the index trailer: the
+/// family it was converted as, the token embedding's `[vocab, hidden]`, and the
+/// number of text layers. A config of another model passes its own family row
+/// (`verdict`), so this is what catches it, before `Cnq::open` and before any
+/// CUDA work: `Err` is a table with one row per differing fact, `container X,
+/// config Y`. Crow #300 phase 1 acceptance: "a container with the other model's
+/// config dies at boot with a named mismatch table".
+pub fn container_mismatch(geo: &Geo, peek: &IndexPeek, cnq_path: &str, config_label: &str) -> Result<(), String> {
+    let text = || peek.tensors.iter().filter(|t| t.section == "text");
+    let embed = text()
+        .find(|t| t.name.ends_with("embed_tokens.weight"))
+        .map(|t| format!("{:?}", t.shape))
+        .unwrap_or_else(|| "no embed_tokens tensor".to_string());
+    let layers = text()
+        .filter_map(|t| t.name.split(".layers.").nth(1)?.split('.').next()?.parse::<usize>().ok())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let family = format!("{:?}", geo.family);
+    let rows = [
+        ("family", format!("{} (index v{})", peek.family(), if peek.model().is_some() { 2 } else { 1 }), family.clone(), peek.family() == family),
+        ("embed_tokens [vocab, hidden]", embed.clone(), format!("{:?}", [geo.vocab, geo.hidden]), embed == format!("{:?}", [geo.vocab, geo.hidden])),
+        ("text layers", layers.to_string(), geo.layers.to_string(), layers == geo.layers),
+    ];
+    let bad: Vec<_> = rows.iter().filter(|r| !r.3).collect();
+    if bad.is_empty() {
+        return Ok(());
+    }
+    let table = bad.iter().map(|(n, c, g, _)| format!("  {n}: container {c}, config {g}")).collect::<Vec<_>>().join("\n");
+    Err(format!(
+        "[meta] {} of {} container facts differ from the config - the container and its config describe different models, \
+refusing to boot (Crow #300):\n{table}\n[meta]   container: {cnq_path}\n[meta]   config: {config_label}",
+        bad.len(),
+        rows.len()
+    ))
+}
+
+/// Why the gate refused: a config it could not read (the #94 "unreadable truth
+/// source" class), or a config it read and refused (a table, a named reason).
+#[derive(Debug)]
+pub enum GateRefusal {
+    Unreadable(String),
+    Refused(String),
+}
+
+/// The metadata gate, pure (no panic, no log, no stash), so every branch is
+/// unit-tested on a container's peeked index: the `CROW_MODEL_DIR` cross-check
+/// of an index v2, the config by index kind ([`config_for_container`]), the
+/// family row and the `Geo` ([`verdict`]), then the container facts
+/// ([`container_mismatch`]). `Ok(None)` = an index v1 with no config found (the
+/// selftest package).
+pub fn gate(cnq_path: &str, peek: &IndexPeek, model_dir: Option<&str>) -> Result<Option<(ModelMeta, Geo)>, GateRefusal> {
+    if let (Some(m), Some(dir)) = (peek.model(), model_dir) {
+        check_model_dir_override(dir, m).map_err(GateRefusal::Refused)?;
+    }
+    let Some(meta) = config_for_container(cnq_path, peek, model_dir).map_err(GateRefusal::Unreadable)? else {
+        return Ok(None);
+    };
+    let geo = verdict(&meta).map_err(GateRefusal::Refused)?;
+    container_mismatch(&geo, peek, cnq_path, &meta.config_path).map_err(GateRefusal::Refused)?;
+    Ok(Some((meta, geo)))
+}
+
 // ---- the boot door ----
 
-/// The gate `boot::open_model` calls FIRST, before the container is mapped and
-/// the CUDA context created:
+/// Crow #300 C5: the 27B fixture's derived `Geo` (engine/tests/fixtures/Qwen3.8-27B),
+/// for the tests of the modules that plan per family
+#[cfg(test)]
+pub(crate) fn dense_fixture_geo() -> Geo {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/Qwen3.8-27B");
+    ModelMeta::from_config_files(&format!("{dir}/config.json"), Some(&format!("{dir}/generation_config.json")))
+        .and_then(|m| m.geo())
+        .unwrap()
+}
+
+/// the geometry as the boot prints it, one `[meta]` row per `Geo` field
+pub fn geo_table(g: &Geo) -> String {
+    g.rows().iter().map(|(n, v)| format!("[meta]   {n:<20} {v}")).collect::<Vec<_>>().join("\n")
+}
+
+/// The boot decision on a parsed config, pure (no panic, no stash), so every
+/// branch is unit-tested:
 ///
-/// - config.json found and every check green → one INFO line, the meta returned
-///   for the later phases;
+/// - any check of the family row red → `Err`, the #94 table;
+/// - the `Geo` not derivable → `Err`, the named reason;
+/// - Flash-Next whose `Geo` differs from `Geo::FLASH_NEXT` → `Err`, a table of
+///   every differing field (derived vs pinned);
+/// - Flash-Next, everything equal → `Ok(geo)`;
+/// - dense → `Ok(geo)` (C5: the family's first unbuilt block refuses it next,
+///   `Geo::built` in `boot::model_geo`).
+pub fn verdict(meta: &ModelMeta) -> Result<Geo, String> {
+    let all = meta.checks();
+    let bad: Vec<&Check> = all.iter().filter(|c| !c.ok).collect();
+    if !bad.is_empty() {
+        let table = bad.iter().map(|c| format!("  {}", c.line())).collect::<Vec<_>>().join("\n");
+        return Err(format!(
+            "[meta] {} of {} constants differ from the engine pins - refusing to boot (issue #94):\n{}\n\
+[meta]   config: {}\n\
+[meta] a different checkpoint must be ported consciously, not silently - see docs/acceptance/issue-94.md",
+            bad.len(),
+            all.len(),
+            table,
+            meta.config_path
+        ));
+    }
+    let geo = meta.geo().map_err(|why| format!("[meta] {why} - refusing to boot (Crow #300) [{}]", meta.config_path))?;
+    match meta.family {
+        Family::FlashNext => {
+            let diff = geo.diff(&Geo::FLASH_NEXT);
+            if diff.is_empty() {
+                return Ok(geo);
+            }
+            let table = diff
+                .iter()
+                .map(|(name, got, want)| format!("  {name}: config derives {got}, Geo::FLASH_NEXT pins {want}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(format!(
+                "[meta] {} of {} runtime Geo fields differ from Geo::FLASH_NEXT - refusing to boot (Crow #300):\n{}\n\
+[meta]   config: {}",
+                diff.len(),
+                geo.rows().len(),
+                table,
+                meta.config_path
+            ))
+        }
+        Family::Qwen35Dense => Ok(geo),
+    }
+}
+
+/// The gate `boot::open_model` calls FIRST, before the container is mapped and
+/// the CUDA context created ([`gate`], plus the log lines, the panic and the #96
+/// stash). Since Crow #300 C7 it judges the config the container's index names:
+/// an index v2 container's own `model` block, or for the index v1 container of
+/// record `CROW_MODEL_DIR` / `models/` (`model_dir` is the variable, read by the
+/// caller):
+///
+/// - config.json found, every check green and (Flash-Next) the runtime `Geo`
+///   equal to `Geo::FLASH_NEXT` → one INFO line, the meta and the `Geo`
+///   returned for the later phases;
+/// - a dense checkpoint, every check green → the INFO line and the derived
+///   geometry, returned the same way (C5: `boot::model_geo` refuses it next, at
+///   its first unbuilt block);
 /// - config.json found and anything red or unreadable → a panic carrying the
-///   whole table (llama.cpp-style loud failure);
+///   whole table (llama.cpp-style loud failure); since C7 that includes a
+///   config that does not fit the container (`container_mismatch`) and, for an
+///   index v2, a `CROW_MODEL_DIR` whose config is not the container's;
 /// - no config.json anywhere next to the container → one WARN line, boot
 ///   continues (the selftest package ships without `models/` on purpose).
-pub fn assert_pinned(cnq_path: &str) -> Option<ModelMeta> {
-    let meta = match from_container(cnq_path) {
-        Ok(Some(meta)) => meta,
+pub fn assert_pinned(cnq_path: &str, peek: &IndexPeek, model_dir: Option<&str>) -> Option<(ModelMeta, Geo)> {
+    let (meta, geo) = match gate(cnq_path, peek, model_dir) {
+        Ok(Some(pair)) => pair,
         Ok(None) => {
             tracing::warn!(
                 target: "meta",
@@ -686,28 +1471,40 @@ pub fn assert_pinned(cnq_path: &str) -> Option<ModelMeta> {
             );
             return None;
         }
-        Err(why) => panic!("{why} - the #94 metadata gate refuses to boot on an unreadable truth source"),
+        Err(GateRefusal::Unreadable(why)) => panic!("{why} - the #94 metadata gate refuses to boot on an unreadable truth source"),
+        Err(GateRefusal::Refused(refusal)) => {
+            // the table goes to the log too, not only to the panic text
+            for line in refusal.lines() {
+                tracing::error!(target: "meta", "{line}");
+            }
+            panic!("{refusal}")
+        }
     };
-    let all = meta.checks();
-    let bad: Vec<&Check> = all.iter().filter(|c| !c.ok).collect();
-    if !bad.is_empty() {
-        let table = bad.iter().map(|c| format!("  {}", c.line())).collect::<Vec<_>>().join("\n");
-        panic!(
-            "[meta] {} of {} constants differ from the engine pins - refusing to boot (issue #94):\n{}\n\
-[meta]   config: {}\n\
-[meta] a different checkpoint must be ported consciously, not silently - see docs/acceptance/issue-94.md",
-            bad.len(),
-            all.len(),
-            table,
-            meta.config_path
-        );
+    match meta.family {
+        Family::FlashNext => tracing::info!(
+            target: "meta",
+            "meta: {} constants verified against config.json (zero numeric change) [{}]; family {:?} ({}), runtime Geo == Geo::FLASH_NEXT ({} fields)",
+            meta.checks().len(),
+            meta.config_path,
+            meta.family,
+            meta.family.model_type(),
+            geo.rows().len()
+        ),
+        Family::Qwen35Dense => {
+            tracing::info!(
+                target: "meta",
+                "meta: {} constants verified against config.json ({QWEN35_DENSE_SOURCE}) [{}]; family {:?} ({}), runtime Geo derived ({} fields):",
+                meta.checks().len(),
+                meta.config_path,
+                meta.family,
+                meta.family.model_type(),
+                geo.rows().len()
+            );
+            for line in geo_table(&geo).lines() {
+                tracing::info!(target: "meta", "{line}");
+            }
+        }
     }
-    tracing::info!(
-        target: "meta",
-        "meta: {} constants verified against config.json (zero numeric change) [{}]",
-        all.len(),
-        meta.config_path
-    );
     // #96: stash the rope truth for the two boot-time readers that cannot be
     // handed it as a parameter (ThreeStates::allocate builds the table,
     // Kernels::new threads the mscale). Set only on the green path: a red
@@ -715,7 +1512,7 @@ pub fn assert_pinned(cnq_path: &str) -> Option<ModelMeta> {
     // `None` default in force, which is the byte-identical behavior.
     let _ = BOOT_ROPE_SCALING.set(meta.rope_scaling);
     let _ = BOOT_TRAINING_CONTEXT.set(meta.training_context());
-    Some(meta)
+    Some((meta, geo))
 }
 
 #[cfg(test)]
@@ -733,8 +1530,13 @@ mod tests {
     /// write a doctored copy of the real config (+ generation config) into a
     /// temp dir and parse it — every red test below doctors the truth, never the pin
     fn doctored(mutate: impl FnOnce(&mut Value, &mut Value)) -> ModelMeta {
-        let mut config: Value = serde_json::from_str(&std::fs::read_to_string(format!("{REAL_DIR}/config.json")).unwrap()).unwrap();
-        let mut generation: Value = serde_json::from_str(&std::fs::read_to_string(format!("{REAL_DIR}/generation_config.json")).unwrap()).unwrap();
+        doctored_from(REAL_DIR, mutate).unwrap()
+    }
+
+    /// `doctored` on any checkpoint dir, the parse result handed back as is
+    fn doctored_from(src: &str, mutate: impl FnOnce(&mut Value, &mut Value)) -> Result<ModelMeta, String> {
+        let mut config: Value = serde_json::from_str(&std::fs::read_to_string(format!("{src}/config.json")).unwrap()).unwrap();
+        let mut generation: Value = serde_json::from_str(&std::fs::read_to_string(format!("{src}/generation_config.json")).unwrap()).unwrap();
         mutate(&mut config, &mut generation);
         // tests run in parallel threads of ONE process, so the pid alone is not
         // a unique dir: every doctored copy gets its own counter slot
@@ -744,7 +1546,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
         std::fs::write(dir.join("generation_config.json"), generation.to_string()).unwrap();
-        let m = ModelMeta::from_config_files(&dir.join("config.json").to_string_lossy(), Some(&dir.join("generation_config.json").to_string_lossy())).unwrap();
+        let m = ModelMeta::from_config_files(&dir.join("config.json").to_string_lossy(), Some(&dir.join("generation_config.json").to_string_lossy()));
         std::fs::remove_dir_all(&dir).ok();
         m
     }
@@ -985,5 +1787,138 @@ mod tests {
         let err = ModelMeta::from_config_files(&dir.join("config.json").to_string_lossy(), None).unwrap_err();
         std::fs::remove_dir_all(&dir).ok();
         assert!(err.contains("rope_scaling.factor"), "the error must name the key: {err}");
+    }
+
+    // ---- Crow #300 phase 1: C1 family table + key ledger, C2 runtime Geo ----
+
+    /// the dense fixture: Qwen/Qwen3.8-27B @ 1d4bf0f2 (revision
+    /// 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0), config.json sha256 191e0af2…,
+    /// generation_config.json sha256 e70c136c… (byte-identical to Flash-Next's),
+    /// copied from models/Qwen3.8-27B/ (sha256-checked 2026-09-25)
+    const DENSE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/Qwen3.8-27B");
+
+    fn dense_meta() -> ModelMeta {
+        ModelMeta::from_config_files(&format!("{DENSE_DIR}/config.json"), Some(&format!("{DENSE_DIR}/generation_config.json"))).unwrap()
+    }
+
+    #[test]
+    fn family_detection_names_both_families_and_refuses_an_unknown_one() {
+        assert_eq!(real_meta().family, Family::FlashNext);
+        assert_eq!(dense_meta().family, Family::Qwen35Dense);
+        assert_eq!(dense_meta().model_type, "qwen3_5_text");
+        let err = doctored_from(DENSE_DIR, |c, _| c["text_config"]["model_type"] = json!("qwen3_5_moe_text")).unwrap_err();
+        assert!(err.contains("'qwen3_5_moe_text' is not a model family"), "{err}");
+        assert!(err.contains("Crow #300"), "{err}");
+    }
+
+    /// the 27B fixture parses, is all green against its own family row, and
+    /// derives the geometry of crow-nest#116 / Crow #300
+    #[test]
+    fn the_27b_fixture_parses_and_derives_its_geo() {
+        let m = dense_meta();
+        for c in m.checks() {
+            assert!(c.ok, "expected green against the dense row: {}", c.line());
+        }
+        assert!(!m.checks().iter().any(|c| c.name == "ple_eos"), "no PLE, no PLE end marker check");
+        let g = m.geo().unwrap();
+        assert_eq!(g.family, Family::Qwen35Dense);
+        assert_eq!((g.layers, g.gdn_layers, g.attn_layers, g.attn_interval), (64, 48, 16, 4));
+        assert_eq!(g.hidden, 5120);
+        assert_eq!(g.ffn, Ffn::Dense { inter: 17408 });
+        assert_eq!((g.q_heads, g.kv_heads, g.head_dim, g.gqa()), (24, 4, 256, 6));
+        assert_eq!(g.gate_act, GateAct::Silu, "output_gate_type swish");
+        assert!(g.attn_output_gate);
+        assert_eq!((g.q_rows(), g.kv_rows(), g.core()), (12288, 1024, 6144));
+        assert_eq!(g.vocab, 248_320);
+        assert!(!g.tie_word_embeddings, "untied lm_head");
+        assert_eq!(g.mtp_layers, 1);
+        assert_eq!((g.residual, g.attn, g.ple, g.final_norm), (Residual::Plain, Attn::Full, None, FinalNorm::Rms));
+        assert_eq!(g.attn.sel_max(), None, "uncapped causal attention");
+        assert_eq!((g.gdn_key_heads, g.gdn_value_heads, g.gdn_key_dim, g.gdn_value_dim, g.conv_kernel), (16, 48, 128, 128, 4));
+        assert_eq!((g.rope_pairs, g.rope_theta, g.rms_eps), (32, 1e7, 1e-6));
+        assert_eq!(g.eos_ids, [248046, 248044]);
+        assert_eq!(g.context_max, 262_144);
+        assert_eq!(g.vision_out_hidden, Some(5120));
+        for l in 0..64 {
+            assert_eq!(g.is_attn(l), m.layer_types[l] == "full_attention", "layer {l}");
+        }
+    }
+
+    /// the checkpoint of record derives exactly `Geo::FLASH_NEXT`, and its
+    /// check table is still today's 21 constants (#94 phase 1 + #96 rope_type)
+    #[test]
+    fn the_flash_next_config_derives_geo_flash_next() {
+        let m = real_meta();
+        assert_eq!(m.checks().len(), 21, "the 20 of #94 phase 1 + rope_type of #96");
+        let g = m.geo().unwrap();
+        assert_eq!(g.diff(&Geo::FLASH_NEXT), vec![]);
+        assert_eq!(g, Geo::FLASH_NEXT);
+        assert_eq!(verdict(&m), Ok(Geo::FLASH_NEXT));
+    }
+
+    /// an unknown text_config key refuses the parse BY NAME; so does a key of
+    /// the other family and an unknown rope_parameters key; a key on the
+    /// ignore list does not
+    #[test]
+    fn an_unknown_text_config_key_is_refused_by_name() {
+        let err = doctored_from(REAL_DIR, |c, _| c["text_config"]["sliding_window"] = json!(4096)).unwrap_err();
+        assert!(err.contains("text_config.sliding_window"), "{err}");
+        assert!(err.contains("Crow #300"), "{err}");
+        let err = doctored_from(REAL_DIR, |c, _| c["text_config"]["intermediate_size"] = json!(17408)).unwrap_err();
+        assert!(err.contains("text_config.intermediate_size") && err.contains("FlashNext"), "{err}");
+        let err = doctored_from(DENSE_DIR, |c, _| c["text_config"]["num_experts"] = json!(512)).unwrap_err();
+        assert!(err.contains("text_config.num_experts") && err.contains("Qwen35Dense"), "{err}");
+        let err = doctored_from(DENSE_DIR, |c, _| c["text_config"]["rope_parameters"]["mrope_scale"] = json!(2)).unwrap_err();
+        assert!(err.contains("text_config.rope_parameters.mrope_scale"), "{err}");
+        // on the ignore list: read and dropped, no refusal
+        assert!(doctored_from(DENSE_DIR, |c, _| c["text_config"]["initializer_range"] = json!(0.01)).is_ok());
+        assert!(IGNORED_KEYS.iter().all(|(_, _, why)| !why.is_empty()));
+    }
+
+    /// formula facts with one implemented value refuse other values by name
+    #[test]
+    fn an_unimplemented_formula_value_is_refused_by_name() {
+        let err = doctored_from(DENSE_DIR, |c, _| c["text_config"]["hidden_act"] = json!("gelu")).unwrap_err();
+        assert!(err.contains("text_config.hidden_act 'gelu' is not implemented"), "{err}");
+        let err = doctored_from(REAL_DIR, |c, _| c["text_config"]["output_gate_type"] = json!("tanh")).unwrap_err();
+        assert!(err.contains("text_config.output_gate_type 'tanh'"), "{err}");
+        let err = doctored_from(REAL_DIR, |c, _| c["tie_word_embeddings"] = json!(true)).unwrap_err();
+        assert!(err.contains("tie_word_embeddings true (top level) disagrees"), "{err}");
+    }
+
+    /// a Flash-Next config that passes every one of the 21 checks but derives a
+    /// different runtime Geo refuses the boot with a table naming the fields
+    #[test]
+    fn a_geo_mismatch_refuses_with_a_table() {
+        let m = doctored(|c, _| {
+            c["text_config"]["num_experts"] = json!(256);
+            c["text_config"]["output_gate_type"] = json!("swish");
+        });
+        assert!(m.verify().is_empty(), "the 21 checks stay green");
+        let err = verdict(&m).unwrap_err();
+        assert!(err.contains("2 of 35 runtime Geo fields differ from Geo::FLASH_NEXT"), "{err}");
+        assert!(err.contains("  ffn: config derives Moe { experts: 256"), "{err}");
+        assert!(err.contains("  gate_act: config derives Silu, Geo::FLASH_NEXT pins Sigmoid"), "{err}");
+    }
+
+    /// C5: a dense checkpoint passes the metadata gate with its derived geometry
+    /// (the table the boot prints) and the family check (`Geo::built`, which
+    /// `boot::model_geo` calls before the container and the GPU; Crow #300 phase 2
+    /// built the dense arms)
+    #[test]
+    fn a_dense_checkpoint_passes_the_gate_and_the_family_check() {
+        let geo = verdict(&dense_meta()).unwrap();
+        assert_eq!(geo, dense_fixture_geo());
+        let table = geo_table(&geo);
+        assert!(table.contains("[meta]   hidden               5120"), "{table}");
+        assert!(table.contains("[meta]   ffn                  Dense { inter: 17408 }"), "{table}");
+        assert_eq!(dense_meta().checks().len(), 20);
+        assert_eq!(geo.built(), Ok(()));
+        // the per-family floor: 64k (the image stack's point, Crow #300 2026-09-27), Flash-Next keeps 200k
+        assert_eq!((geo.context_floor, Geo::FLASH_NEXT.context_floor), (65_536, 200_000));
+        // a doctored dense config is refused by the dense row, not by the pins
+        let m = doctored_from(DENSE_DIR, |c, _| c["text_config"]["hidden_size"] = json!(4096)).unwrap();
+        let err = verdict(&m).unwrap_err();
+        assert!(err.contains("hidden_size: pinned 5120 (qwen3_5_text family row"), "{err}");
     }
 }

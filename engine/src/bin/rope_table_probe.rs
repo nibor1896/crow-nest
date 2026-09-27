@@ -38,7 +38,10 @@
 //! pairing arithmetic computed on the table's own f32 cos/sin.
 //!
 //! usage: rope_table_probe
-use crow_nest_engine::geo::ROPE_PAIRS;
+use crow_nest_engine::geo::Geo;
+
+// Crow #300 C4: the rope pair count of Flash-Next, read from its Dims (no model loaded)
+const ROPE_PAIRS: usize = Geo::FLASH_NEXT.dims().rope_pairs;
 
 /// monotone map of an f32 onto the u32 line (the kernel-side `ordkey` trick):
 /// ulp distance = |ord(a) - ord(b)|

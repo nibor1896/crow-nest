@@ -282,8 +282,118 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="413"
-CLIPPY="1522"
+TESTS="458"
+CLIPPY="1494"
+#   tests 457 -> 458 / clippy 1494 (unchanged)   crow-nest #123, image mrope positions (2026-09-27): +1
+#                              `vit::reserve::image_positions_are_the_merged_grid_in_raster_order_like_hf`
+#                              (red with the old block-major formula: [6, 6, 20] where HF gives [6, 6, 34]).
+#   tests 454 -> 457 / clippy 1494 (unchanged)   crow-nest #122, the dense 27B's F16 projector (2026-09-27): +3
+#                              `vit::budget_and_mmproj::a_refused_projector_is_skipped_and_a_dense_container_without_one_boots_without_vision`
+#                              (red with the old first-file-wins / always-fall-back rule), `..::the_dense_projector_is_told_apart_by_its_merger_width`,
+#                              `..::the_dense_27b_finds_its_own_projector_before_the_flash_next_one` (real files, headers only).
+#   tests 452 -> 454 / clippy 1510 -> 1494   crow-nest #95 MTP steps 2-5 (2026-09-27): +2
+#                              `gen::tests_95_mtp::adaptive_k_*`; clippy -16: `launch_sample` lost its sixteen
+#                              same-type `as u64` casts when it became `launch_sample_at`.
+#   tests 451 -> 452 / clippy 1510 (unchanged)   crow-nest #95 MTP step 1 (2026-09-27): +1
+#                              `gen::tests_95_mtp::the_fc_split_gives_each_half_its_own_columns_row_by_row`.
+#   tests 450 -> 451 / clippy 1510 (unchanged)   Crow #300 phase 2, BF16 KV default of the dense family (2026-09-26): +1
+#                              `geo::tests_300_c5::an_unset_crow_kv_is_fp8_on_flash_next_and_bf16_on_the_dense_family`
+#                              (red with the old FP8 default: left Fp8E4m3, right Bf16).
+#   tests 449 -> 450 / clippy 1510 (unchanged)   Crow #300 phase 2 (2026-09-26): +1
+#                              `boot::tests_300_c7::crow_context_takes_a_value_between_the_floor_and_the_max`.
+#   tests 448 -> 449 / clippy 1510 (unchanged)   Crow #300 phase 2, serve for the dense family (2026-09-26): +1
+#                              `slot::tests::a_full_attention_slot_has_no_pooled_blocks_and_keeps_its_kv_rows` (red with
+#                              the old `done_blocks == pos / 4` rule, green with the full-attention arm).
+#   tests 446 -> 448 / clippy 1512 -> 1510   Crow #300 phase 2, the dense 27B path (2026-09-26): +1
+#                              `kernels_p2::tests_300_p2` (the dense kernel source compiles, carries the phase 2 entries,
+#                              Flash-Next's source is unchanged) and +1 `manager::tests_300_c5` (the dense plan fits,
+#                              grants the reserve best-effort, refuses by name); three C5 refusal tests were rewritten
+#                              now that the dense arms are built. Clippy -2: `layer_cache_ptrs` lost two same-type casts
+#                              when its QSA lookups became `get(ai)`; no warning points into the new code.
+#   tests 436 -> 446 / clippy 1512 (unchanged)   Crow #300 phase 1 C6 + C7 (2026-09-26, on `1580320`): the merge of
+#                              `c6-converter-index` (`4dcf664`) brought +4 `cnq::tests_300_c6` (the v2 fixture round
+#                              trip, the f32 dtype, the v1-of-record rule, the refusals; +1 ignored, the real-container
+#                              v1 test, run once green) = 440 / 0 / 7 ignored. C7 adds +6: `boot::tests_300_c7` (a v2
+#                              container boots its gate from its own model block; the other model's config dies with
+#                              the named mismatch table, v2 and v1; a dense v2 reaches `Geo::built` and refuses at
+#                              `Residual::Plain`; CROW_MODEL_DIR is a sha-checked cross-check beside a v2; the v1
+#                              container of record reads CROW_MODEL_DIR) and `weights::tests_300_c7` (an f32 tensor
+#                              loads as f32, not as an NVFP4 dequant). Each shown red with its hunk reverted, e.g.
+#                              "expected the mismatch table, got Ok(Some(FlashNext))" and "left: [0.0, 0.0] right:
+#                              [-0.15136719, 0.19238281]". No clippy warning in the new code (1512 = C5b's count).
+#                              Measured 2026-09-26: lib 317 / 0 / 7 ignored, serve 118, decode 5, parity 6 = 446 / 0;
+#                              clippy 1512.
+#   tests 436 / clippy 1512 (both unchanged)   Crow #300 phase 1 C5b (2026-09-26, on `6762df8`): the prefill and
+#                              decode layer loops and the head match per family block (residual, attention, FFN,
+#                              final norm); the loops read `d.layers` / `d.hcn` instead of LAYERS / HCN. No test added
+#                              or removed (the dense arms are unreachable behind `Engine::load`'s `Geo::built`).
+#                              Measured 2026-09-26: 436 / 0 (6 ignored); clippy 1512.
+#   tests 431 -> 436 / clippy 1516 -> 1512   Crow #300 phase 1 C5a (2026-09-26, on `64c242b`): the family switches in
+#                              the boot door, the state plan and the loader. `Geo::built` refuses a family at its first
+#                              unbuilt arm (the dense refusal moved there from the metadata gate); QSA ring / pool, PLE
+#                              state and the hot-set sidecar are per-family arms. +2 `geo::tests_300_c5` (Flash-Next
+#                              passes and PLE is optional; each unbuilt arm refuses by name in forward order), +1
+#                              `boot::tests` (CROW_HOTSETS required for a MoE family only), +2 `manager::tests_300_c5`
+#                              (Flash-Next selects the plan of record incl. the 121,208,832 B snapshot; the 27B fixture's
+#                              Geo plans no PLE / QSA / hot-set parts and refuses by name); the meta dense test was
+#                              rewritten (count unchanged). Each shown red with its hunk reverted. Clippy -4: clippy no
+#                              longer reports the four manual `is_multiple_of` on the `% 4096 == 0` slab asserts in
+#                              `Engine::load` (old gen.rs:1133/1137, lib + lib test) since `slabs` comes out of the
+#                              `Ffn` match; no warning added (diffed by message and file). Measured 2026-09-26:
+#                              lib 307 / 0 / 6 ignored, serve 118, decode 5, parity 6 = 436 / 0; clippy 1512.
+#   tests 431 / clippy 1516 (both unchanged)   Crow #300 phase 1 C4c (2026-09-26, on `ebb68f4`): `rmsnorm_1pw` reads
+#                              CN_AHD (PTX of record unchanged, `tests_300_c4` green); the synthetic probes read
+#                              `Geo::FLASH_NEXT.dims()` instead of the consts (kcheck, rope_table_probe,
+#                              attn_path_probe, qsa_tie_probe, router_probe, qsa_probe, mma_gate run once: PASS).
+#                              No test added or removed. Measured 2026-09-26: 431 / 0 (6 ignored); clippy 1516.
+#   tests 427 -> 431 / clippy 1517 -> 1516   Crow #300 phase 1 C4b (2026-09-26, on `f6df9ec`): the kernel source reads
+#                              its geometry from a per-boot `#define CN_*` prelude (`kernels::KernelGeo`, 27 macros from
+#                              the runtime `Geo`); the Flash-Next PTX of all 130 entries stays byte-identical to the
+#                              frozen `3154b3b` source (`tests_300_c4`, shown red with CN_QSA_SEL_MAX + 1: 18 of 130
+#                              entries differ). +4 `kernels::tests_300_c4`: the prelude defines exactly the macros the
+#                              source reads; the bare source refuses to compile; the Flash-Next prelude text of record;
+#                              a geometry change moves exactly the kernels that read it (swish -> the two GDN gated
+#                              norms, 4 KV heads -> store_kv + the 20 attention variants). +2 ignored GPU tests
+#                              (`tests_300_c4_gpu`, swish gate and store_kv/attn_sel at 4 KV heads / GQA 6 against a
+#                              CPU reference; run once 2026-09-26, green). Each shown red with its hunk reverted.
+#                              Clippy -1: the needless borrow `cuda::compile(&KERNEL_SRC)` in gen.rs is gone.
+#                              Measured 2026-09-26: lib 302 / 0 / 6 ignored, serve 118, decode 5, parity 6 = 431 / 0;
+#                              clippy 1516.
+#   tests 425 -> 427 / clippy 1517 (unchanged)   Crow #300 phase 1 C4a (2026-09-26, on `3154b3b`): the PTX of record.
+#                              `engine/tests/fixtures/kernels-3154b3b.cu` is KERNEL_SRC cut byte-exact out of `3154b3b`,
+#                              `ptx-manifest-3154b3b.txt` its NVRTC 13.3 PTX: 130 `.entry` rows (sha256 each) plus the
+#                              whole module. +2 `kernels::tests_300_c4` (the fixture is the source of record; every
+#                              entry of today's source compiles to the recorded PTX), +1 ignored (the manifest printer).
+#                              Shown red with rms_group's eps set to 1e-5f: "1 of 130 kernel entries differ ... rms_group
+#                              of record 9c023f971aaa now 7aa96e681e9d". Measured 2026-09-26: 427 / 0; clippy 1517.
+#   tests 425 / clippy 1519 -> 1517   Crow #300 phase 1 C3c..C3e (2026-09-26, on `f2a26f6`): gen.rs reads the runtime
+#                              `Geo` through `Dims` (loader and buffers, layer primitives, loops). The `geo::tests_300`
+#                              accessor test gained the `Dims` block (shown red with `hct` mutated); no test added.
+#                              Clippy -2: two manual `div_ceil` (`(context + 3) / 4`) in the QSA block bookkeeping
+#                              became `div_ceil(qsa_compress)`. Measured 2026-09-26: lib 296 / 0 / 3 ignored, serve
+#                              118, decode 5, parity 6 = 425 / 0; clippy 1517.
+#   tests 424 -> 425 / clippy 1519 (unchanged)   Crow #300 phase 1 C3b (2026-09-26, on `3e14d2f`): residency.rs,
+#                              cache.rs (`Shape`, the park), the serve / decode / parity bins and the container-reading
+#                              tools (coldtier, hybrid, sf_scan, residency, states) read the runtime `Geo`. +1
+#                              `residency::tests` (the sidecar is checked against the model shape it is given); the
+#                              serve logit_bias test gained the runtime-vocabulary bound (count unchanged). Both were
+#                              shown red with their hunk reverted. Measured 2026-09-26: lib 296 / 0 / 3 ignored, serve
+#                              118, decode 5, parity 6 = 425 / 0; clippy 1519, no warning added or removed.
+#   tests 421 -> 424 / clippy 1522 -> 1519   Crow #300 phase 1 C3a (2026-09-26, on `f7ca9f5`): the runtime `Geo`
+#                              threaded from `boot::open_model` into `Engine::load` (manager, reset, vit, slot, the EOS
+#                              ids of the generation loops). +1 `geo::tests_300` (the C3 accessors reproduce the consts,
+#                              refuse by name on a family without the block, the Flash-Next fingerprint of record) and
+#                              +2 `slot::tests` (a format 1 slot file and a slot file of another model are refused by
+#                              name). Each was shown red with its hunk reverted. Measured 2026-09-26: lib 295 / 0 / 3
+#                              ignored, serve 118, decode 5, parity 6 = 424 / 0. Clippy -3: two same-type `usize`
+#                              casts and one manual `div_ceil` in `manager.rs` went with the consts they wrapped.
+#   tests 413 -> 421 / clippy 1522 (unchanged)   Crow #300 phase 1 C1+C2 (2026-09-26, on `07d9340`): one
+#                              `geo::tests_300` test (Geo::FLASH_NEXT derives every pinned const) and seven
+#                              `meta::tests` (family detection, the 27B fixture parse + its Geo, the Flash-Next
+#                              Geo == Geo::FLASH_NEXT, the unknown-key refusal, the unimplemented-value refusal,
+#                              the Geo mismatch table, the dense refusal). Each was shown red with its hunk
+#                              reverted. Measured 2026-09-26: lib 292 / 0 / 3 ignored, serve 118, decode 5,
+#                              parity 6 = 421 / 0; clippy 1522 (the one meta.rs warning moved, none added).
 #   v0.6.0 release gate (2026-09-25, `0263990`, decode_out/gate-0925-release): all nine items GREEN against the
 #                              values of record below - #110 (reserve default 0), #117 (VMM, same bytes) and #118
 #                              (serve only) moved no numerics. No value re-recorded.

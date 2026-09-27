@@ -2,10 +2,10 @@
   <source media="(max-width: 700px) and (prefers-color-scheme: dark)" srcset="docs/images/readme/crow-nest-mobile-dark.svg">
   <source media="(max-width: 700px)" srcset="docs/images/readme/crow-nest-mobile-light.svg">
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme/crow-nest-dark.svg">
-  <img src="docs/images/readme/crow-nest-light.svg" width="100%" alt="crow-nest: one model, one GPU, its own quant. An inference engine in Rust and CUDA for Qwen3.8-Flash-Next as CNQ4.5-M, OpenAI-compatible, the engine behind Crow.">
+  <img src="docs/images/readme/crow-nest-light.svg" width="100%" alt="crow-nest: one GPU, its own quant, two model families. An inference engine in Rust and CUDA for Qwen3.8-Flash-Next as CNQ4.5-M and the dense Qwen3.8-27B as CNQ4.5 with MTP and its own F16 vision projector, OpenAI-compatible, the engine behind Crow.">
 </picture>
 
-**Build** (container: 104.7 GB from Hugging Face)
+**Build** (Flash-Next container: 104.7 GB from Hugging Face)
 
 ```bash
 git clone https://github.com/nibor1896/crow-nest && cd crow-nest
@@ -17,6 +17,12 @@ cd engine && cargo build --release --bin serve && cd ..
 
 ```bash
 tools/serve-linux.sh --port 8099
+```
+
+**Run the 27B, Linux** (container built with the [converter](converter/README.md), not on Hugging Face; images: `models/Qwen3.8-27B/mmproj-F16.gguf`)
+
+```bash
+CROW_CNQ=converter/Qwen3.8-27B-CNQ4.5.cnq tools/serve-linux.sh --port 8099
 ```
 
 **Run, Windows**
@@ -46,6 +52,7 @@ crow --base-url http://127.0.0.1:8099/v1
 <p align="center"><sub>
 Apache-2.0 · <a href="https://github.com/nibor1896/crow-nest">nibor1896/crow-nest</a> ·
 Model: <a href="https://huggingface.co/nibor1896/Qwen3.8-Flash-Next-CNQ4.5-M">Qwen3.8-Flash-Next CNQ4.5-M</a> (Qwen Community License 1.0) ·
+<a href="https://huggingface.co/Qwen/Qwen3.8-27B">Qwen3.8-27B</a> (Apache-2.0) ·
 Client: <a href="https://github.com/nibor1896/Crow">Crow</a>
 </sub></p>
 

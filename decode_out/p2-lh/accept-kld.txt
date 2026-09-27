@@ -1,0 +1,64 @@
+reference        /tmp/claude-1000/-home-nibor1896-Projects/a03e3558-3213-41f7-86d5-af26034e21d3/scratchpad/lh/acc/bf16.f32
+rows             0..3469 (3470)
+support          natural log p_ref > -16.0  (llama.cpp perplexity.cpp:222)
+direction        KL(P_reference || Q_arm), natural log, nats
+
+== all rows
+arm                     rows  same top-1 as ref    mean KLD                   median      p90      p99    p99.9       max
+CNQDIAG                 3470   86.05 +- 0.59 %   0.223276 +- 0.018951   0.03254   0.3455   2.9230  16.5099   20.2634
+E2                      3470   86.17 +- 0.59 %   0.222972 +- 0.018874   0.03265   0.3445   2.9182  16.3735   19.8448
+
+== code (905 rows)
+arm                     rows  same top-1 as ref    mean KLD                   median      p90      p99    p99.9       max
+CNQDIAG                  905   89.83 +- 1.01 %   0.443514 +- 0.070353   0.00696   0.2431  12.9267  19.8471   20.2634
+E2                       905   90.06 +- 1.00 %   0.442340 +- 0.070049   0.00689   0.2511  12.8637  19.7368   19.8448
+
+== prose (2565 rows)
+arm                     rows  same top-1 as ref    mean KLD                   median      p90      p99    p99.9       max
+CNQDIAG                 2565   84.72 +- 0.71 %   0.145570 +- 0.005708   0.04353   0.3789   1.4574   2.7291    3.4290
+E2                      2565   84.80 +- 0.71 %   0.145574 +- 0.005714   0.04363   0.3772   1.4761   2.7477    3.4289
+
+== tf298 (298 rows)
+arm                     rows  same top-1 as ref    mean KLD                   median      p90      p99    p99.9       max
+CNQDIAG                  298   92.28 +- 1.55 %   0.170516 +- 0.072203   0.00622   0.1231   2.7712  15.4788   16.5466
+E2                       298   92.62 +- 1.52 %   0.171225 +- 0.072497   0.00609   0.1236   2.7948  15.5193   16.5737
+
+== t2b (607 rows)
+arm                     rows  same top-1 as ref    mean KLD                   median      p90      p99    p99.9       max
+CNQDIAG                  607   88.63 +- 1.29 %   0.577539 +- 0.098306   0.00751   0.3805  14.2142  19.9843   20.2634
+E2                       607   88.80 +- 1.28 %   0.575440 +- 0.097776   0.00751   0.4081  14.2412  19.7724   19.8448
+
+== moby-dick (513 rows)
+arm                     rows  same top-1 as ref    mean KLD                   median      p90      p99    p99.9       max
+CNQDIAG                  513   88.89 +- 1.39 %   0.037709 +- 0.001797   0.02709   0.0826   0.1845   0.3167    0.3313
+E2                       513   88.89 +- 1.39 %   0.037659 +- 0.001789   0.02702   0.0824   0.1834   0.3153    0.3307
+
+== pride-prejudice (513 rows)
+arm                     rows  same top-1 as ref    mean KLD                   median      p90      p99    p99.9       max
+CNQDIAG                  513   82.26 +- 1.69 %   0.191763 +- 0.013642   0.07594   0.4963   1.3736   2.4804    2.5269
+E2                       513   82.26 +- 1.69 %   0.191933 +- 0.013688   0.07574   0.4968   1.3773   2.4934    2.5485
+
+== frankenstein (513 rows)
+arm                     rows  same top-1 as ref    mean KLD                   median      p90      p99    p99.9       max
+CNQDIAG                  513   85.96 +- 1.54 %   0.218620 +- 0.020110   0.03313   0.6941   2.1139   3.2617    3.4290
+E2                       513   86.16 +- 1.53 %   0.218634 +- 0.020128   0.03329   0.6878   2.1170   3.2695    3.4289
+
+== huckleberry-finn (513 rows)
+arm                     rows  same top-1 as ref    mean KLD                   median      p90      p99    p99.9       max
+CNQDIAG                  513   80.70 +- 1.74 %   0.198786 +- 0.012234   0.09523   0.5023   1.4218   1.9899    2.0310
+E2                       513   80.90 +- 1.74 %   0.198700 +- 0.012226   0.09762   0.5005   1.4234   1.9928    2.0340
+
+== dracula (513 rows)
+arm                     rows  same top-1 as ref    mean KLD                   median      p90      p99    p99.9       max
+CNQDIAG                  513   85.77 +- 1.54 %   0.080970 +- 0.004618   0.04308   0.1995   0.4297   0.8953    1.0278
+E2                       513   85.77 +- 1.54 %   0.080943 +- 0.004610   0.04282   0.1989   0.4292   0.8932    1.0284
+
+== the reference's top-1 probability, and what the arm does to it (dp = q_arm(ref top-1) - p_ref(ref top-1))
+arm                    mean dp                  lost > 10 pp lost > 50 pp
+CNQDIAG                  -3.913 +-  0.245 %     643 =  18.5 %     64 =   1.8 %
+E2                       -3.908 +-  0.245 %     642 =  18.5 %     65 =   1.9 %
+
+== paired, per row: KLD(A) - KLD(B) on the SAME row
+A - B                           rows mean difference              median    A worse  sign test p
+E2 - CNQDIAG                    3470 -0.000303 +-  0.000683   0.000000  1761/3470        0.387
+

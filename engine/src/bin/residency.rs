@@ -50,20 +50,23 @@ fn main() {
     // CROW_HOTSETS_OUT overrides; the default is under decode_out, next to the gate inputs.
     let sidecar = std::env::var("CROW_HOTSETS_OUT")
         .unwrap_or_else(|_| "../decode_out/residency-warmup.hotsets.json".into());
+    // Crow #300 C3: this probe maps the container without `boot::open_model`, so it
+    // asks the same metadata gate for the model's Geo
+    let geo = crow_nest_engine::boot::model_geo(&cnq_path);
     let mut cnq = Cnq::open(&cnq_path);
 
     unsafe {
         let _ctx = crow_nest_engine::cuda::Ctx::init();
         let mut cfg = Config::default();
-        cfg.context = CONTEXT_FLOOR;
+        cfg.context = geo.context_floor;
         cfg.n_hot = n_requested;
 
         if std::path::Path::new(&sidecar).exists() {
             println!("residency: sidecar exists — skipping warm-up ({sidecar})");
         } else {
             println!("residency: warm-up phase on {warm_tokens} demo tokens …");
-            let even: [[u64; E]; LAYERS] = [[1u64; E]; LAYERS];
-            let mut eng0 = Engine::load(&mut cnq, cfg, Some(&even), &sidecar, false, &mut |m| {
+            let even = vec![vec![1u64; geo.moe().experts]; geo.layers];
+            let mut eng0 = Engine::load(&mut cnq, geo, cfg, Some(&even[..]), Some(&sidecar), false, &mut |m| {
                 eprintln!("[load0] {m}");
             });
             let warm_ids = demo_tokenize(WARMUP, warm_tokens);
@@ -78,7 +81,7 @@ fn main() {
             let sets: Vec<Vec<u32>> = counts
                 .iter()
                 .map(|c| {
-                    let mut ord: Vec<u32> = (0..E as u32).collect();
+                    let mut ord: Vec<u32> = (0..geo.moe().experts as u32).collect();
                     ord.sort_by(|&a, &b| c[b as usize].cmp(&c[a as usize]).then(a.cmp(&b)));
                     ord.truncate(cfg.n_hot);
                     // keep FREQUENCY order (matches the residency.rs writer fix
@@ -87,7 +90,7 @@ fn main() {
                     ord
                 })
                 .collect();
-            let slabs = crow_nest_engine::residency::expert_slab_info(&cnq, 0, "text");
+            let slabs = crow_nest_engine::residency::expert_slab_info(&cnq, 0, "text", geo.moe().experts);
             crow_nest_engine::residency::persist_sidecar(
                 &sidecar,
                 cfg.n_hot,
@@ -100,7 +103,7 @@ fn main() {
         }
 
         let mut eng =
-            Engine::load(&mut cnq, cfg, None, &sidecar, false, &mut |m| eprintln!("[load] {m}"));
+            Engine::load(&mut cnq, geo, cfg, None, Some(&sidecar), false, &mut |m| eprintln!("[load] {m}"));
         println!(
             "residency ready: N={} ({}) — pinned cold tier {:.2} GiB",
             eng.residency().n,
@@ -135,8 +138,8 @@ fn main() {
             let bytes = cold as f64 * (eng.residency().gu_bytes + eng.residency().dn_bytes) as f64 / MIB;
             println!(
                 "decode {i}: {dt:7.2} ms  selections {sel:3}  cold {cold:3}  cold-bytes {bytes:6.1} MB  layers fully resident {}/{}",
-                LAYERS - layers_cold,
-                LAYERS
+                geo.layers - layers_cold,
+                geo.layers
             );
             cum.0 += sel;
             cum.1 += cold;

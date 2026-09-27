@@ -13,6 +13,12 @@
 //! per-kernel profile that shim feeds.
 
 pub const KERNEL_SRC: &str = r#"
+// Crow #300 C4: the model geometry (CN_*) comes from the per-boot prelude,
+// kernels::KernelGeo::prelude(), built from the runtime Geo. The PTX of record
+// (Flash-Next) is byte-identical to the pre-C4 source: kernels::tests_300_c4.
+#ifndef CN_H
+#error "KERNEL_SRC compiles only behind kernels::KernelGeo::prelude() (Crow #300 C4)"
+#endif
 // ---------------- decode helpers (p2/p10-verified) ----------------
 __device__ __forceinline__ float e2m1(unsigned int nib) {
     const float mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
@@ -1477,9 +1483,9 @@ extern "C" __global__ void rms_group(const float* __restrict__ x, const float* _
     int g = blockIdx.x;
     int t = blockIdx.y;
     int d = threadIdx.x;
-    const float* xp = x + (t * 4 + g) * 2560;
+    const float* xp = x + (t * CN_HCN + g) * CN_H;
     float part = 0.0f;
-    for (int i = d; i < 2560; i += 256) part += xp[i] * xp[i];
+    for (int i = d; i < CN_H; i += 256) part += xp[i] * xp[i];
     __shared__ float red[256];
     red[d] = part;
     __syncthreads();
@@ -1487,9 +1493,9 @@ extern "C" __global__ void rms_group(const float* __restrict__ x, const float* _
         if (d < st) red[d] += red[d + st];
         __syncthreads();
     }
-    float rms = rsqrtf(red[0] / 2560.0f + 1e-6f);
-    for (int i = d; i < 2560; i += 256)
-        out[(t * 4 + g) * 2560 + i] = xp[i] * rms * (1.0f + w[g * 2560 + i]);
+    float rms = rsqrtf(red[0] / (float)CN_H + CN_EPS);
+    for (int i = d; i < CN_H; i += 256)
+        out[(t * CN_HCN + g) * CN_H + i] = xp[i] * rms * (1.0f + w[g * CN_H + i]);
 }
 
 extern "C" __global__ void rmsnorm_1pw(const float* __restrict__ x, const float* __restrict__ w,
@@ -1497,23 +1503,23 @@ extern "C" __global__ void rmsnorm_1pw(const float* __restrict__ x, const float*
     int head = blockIdx.x;
     int t = blockIdx.y;
     int d = threadIdx.x;
-    const float* xp = x + (t * gridDim.x + head) * 256;
-    __shared__ float red[256];
+    const float* xp = x + (t * gridDim.x + head) * CN_AHD;
+    __shared__ float red[CN_AHD];
     red[d] = xp[d] * xp[d];
     __syncthreads();
-    for (int st = 128; st > 0; st >>= 1) {
+    for (int st = CN_AHD / 2; st > 0; st >>= 1) {
         if (d < st) red[d] += red[d + st];
         __syncthreads();
     }
-    float rms = rsqrtf(red[0] / 256.0f + 1e-6f);
-    out[(t * gridDim.x + head) * 256 + d] = xp[d] * rms * (1.0f + w[d]);
+    float rms = rsqrtf(red[0] / (float)CN_AHD + CN_EPS);
+    out[(t * gridDim.x + head) * CN_AHD + d] = xp[d] * rms * (1.0f + w[d]);
 }
 
 extern "C" __global__ void silu_div4(const float* __restrict__ x, float* __restrict__ out,
                                      const int* __restrict__ n_p) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= *n_p) return;
-    float v = x[i] * 0.25f;
+    float v = x[i] * (1.0f / CN_HCN);
     out[i] = v / (1.0f + expf(-v));
 }
 extern "C" __global__ void sigmoid_el(float* __restrict__ x, const int* __restrict__ n_p) {
@@ -1525,49 +1531,49 @@ extern "C" __global__ void sig2_div4(const float* __restrict__ x, float* __restr
                                      const int* __restrict__ n_p) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= *n_p) return;
-    out[i] = 2.0f / (1.0f + expf(-x[i] * 0.25f));
+    out[i] = 2.0f / (1.0f + expf(-x[i] * (1.0f / CN_HCN)));
 }
 extern "C" __global__ void mix_streams(const float* __restrict__ mixw, const float* __restrict__ normed,
                                        float* __restrict__ out) {
     int c = blockIdx.x * 256 + threadIdx.x;
     int t = blockIdx.y;
     float acc = 0.0f;
-    for (int g = 0; g < 4; g++)
-        acc += mixw[t * 10240 + g * 2560 + c] * normed[t * 10240 + g * 2560 + c];
-    out[t * 2560 + c] = acc * 0.25f;
+    for (int g = 0; g < CN_HCN; g++)
+        acc += mixw[t * CN_HCT + g * CN_H + c] * normed[t * CN_HCT + g * CN_H + c];
+    out[t * CN_H + c] = acc * (1.0f / CN_HCN);
 }
 extern "C" __global__ void inject_residual(const float* __restrict__ base, const float* __restrict__ mix,
                                            const float* __restrict__ injw, float* __restrict__ out) {
     int g = blockIdx.x;
     int tc = blockIdx.y;
-    int t = tc / 10;
-    int c = (tc % 10) * 256 + threadIdx.x;
-    out[(t * 4 + g) * 2560 + c] =
-        base[(t * 4 + g) * 2560 + c] + mix[t * 2560 + c] * injw[t * 4 + g];
+    int t = tc / (CN_H / 256);
+    int c = (tc % (CN_H / 256)) * 256 + threadIdx.x;
+    out[(t * CN_HCN + g) * CN_H + c] =
+        base[(t * CN_HCN + g) * CN_H + c] + mix[t * CN_H + c] * injw[t * CN_HCN + g];
 }
 extern "C" __global__ void silu_mul640(const float* __restrict__ h1, float* __restrict__ h2) {
     int j = blockIdx.x * 256 + threadIdx.x;
     int t = blockIdx.y;
-    if (j >= 640) return;
-    float gate = h1[t * 1280 + j];
-    h2[t * 640 + j] = (gate / (1.0f + expf(-gate))) * h1[t * 1280 + 640 + j];
+    if (j >= CN_INTER) return;
+    float gate = h1[t * (2 * CN_INTER) + j];
+    h2[t * CN_INTER + j] = (gate / (1.0f + expf(-gate))) * h1[t * (2 * CN_INTER) + CN_INTER + j];
 }
 // combo-major silu·gate over [C][1280] -> [C][640], full-flat guard
 extern "C" __global__ void silu_mul_combo(const float* __restrict__ h1, float* __restrict__ h2,
                                           const int* __restrict__ n640_p) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= *n640_p) return;
-    int c = i / 640;
-    int j = i % 640;
-    float gate = h1[(size_t)c * 1280 + j];
-    h2[i] = (gate / (1.0f + expf(-gate))) * h1[(size_t)c * 1280 + 640 + j];
+    int c = i / CN_INTER;
+    int j = i % CN_INTER;
+    float gate = h1[(size_t)c * (2 * CN_INTER) + j];
+    h2[i] = (gate / (1.0f + expf(-gate))) * h1[(size_t)c * (2 * CN_INTER) + CN_INTER + j];
 }
 // y[t][c] += (*w)·x[t][c]  (w pointer INTO the routing-weight row, p13)
 extern "C" __global__ void acc_scale(const float* __restrict__ x, const float* __restrict__ w,
                                      float* __restrict__ y) {
     int c = blockIdx.x * 256 + threadIdx.x;
     int t = blockIdx.y;
-    y[t * 2560 + c] += (*w) * x[t * 2560 + c];
+    y[t * CN_H + c] += (*w) * x[t * CN_H + c];
 }
 // batched ranks: y[t][c] += rw[t*10+j] · x[(t*10+j)][c], grid (10, T)
 // deterministic per-token reduction over the 10 routed ranks (fixed order,
@@ -1579,17 +1585,17 @@ extern "C" __global__ void acc_combo(const float* __restrict__ x, const float* _
     int c = blockIdx.x * 256 + threadIdx.x;
     int t = blockIdx.y;
     float acc = 0.0f;
-    for (int j = 0; j < 10; j++) {
-        acc += rw[t * 10 + j] * x[((size_t)t * 10 + j) * 2560 + c];
+    for (int j = 0; j < CN_TOPK; j++) {
+        acc += rw[t * CN_TOPK + j] * x[((size_t)t * CN_TOPK + j) * CN_H + c];
     }
-    y[t * 2560 + c] += acc;
+    y[t * CN_H + c] += acc;
 }
 extern "C" __global__ void gate_shared(const float* __restrict__ s, const float* __restrict__ sg,
                                        float* __restrict__ y) {
     int c = blockIdx.x * 256 + threadIdx.x;
     int t = blockIdx.y;
     float g = sg[t];
-    y[t * 2560 + c] = (1.0f / (1.0f + expf(-g))) * s[t * 2560 + c]; // ASSIGN: first writer of moe_out (no memset, graph-capturable)
+    y[t * CN_H + c] = (1.0f / (1.0f + expf(-g))) * s[t * CN_H + c]; // ASSIGN: first writer of moe_out (no memset, graph-capturable)
 }
 
 // ---------------- GDN (p6/p11/p13-verified) ----------------
@@ -1645,17 +1651,17 @@ extern "C" __global__ void split_qkv(const float* __restrict__ src, float* __res
                                      const int* __restrict__ t_p) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int tt = *t_p;
-    if (i < tt * 2048) {
-        int t = i / 2048, j = i % 2048;
-        q[(size_t)t * 2048 + j] = src[(size_t)j * tt + t];
-    } else if (i < tt * 4096) {
-        int r = i - tt * 2048;
-        int t = r / 2048, j = r % 2048;
-        k[(size_t)t * 2048 + j] = src[(size_t)(2048 + j) * tt + t];
-    } else if (i < tt * 10240) {
-        int r = i - tt * 4096;
-        int t = r / 6144, j = r % 6144;
-        v[(size_t)t * 6144 + j] = src[(size_t)(4096 + j) * tt + t];
+    if (i < tt * CN_GDN_KEY) {
+        int t = i / CN_GDN_KEY, j = i % CN_GDN_KEY;
+        q[(size_t)t * CN_GDN_KEY + j] = src[(size_t)j * tt + t];
+    } else if (i < tt * (2 * CN_GDN_KEY)) {
+        int r = i - tt * CN_GDN_KEY;
+        int t = r / CN_GDN_KEY, j = r % CN_GDN_KEY;
+        k[(size_t)t * CN_GDN_KEY + j] = src[(size_t)(CN_GDN_KEY + j) * tt + t];
+    } else if (i < tt * CN_GDN_CONV) {
+        int r = i - tt * (2 * CN_GDN_KEY);
+        int t = r / CN_GDN_VAL, j = r % CN_GDN_VAL;
+        v[(size_t)t * CN_GDN_VAL + j] = src[(size_t)(2 * CN_GDN_KEY + j) * tt + t];
     }
 }
 extern "C" __global__ void l2norm_repeat(const float* __restrict__ q_in, const float* __restrict__ k_in,
@@ -1663,14 +1669,14 @@ extern "C" __global__ void l2norm_repeat(const float* __restrict__ q_in, const f
     int vhead = blockIdx.x;
     int t = blockIdx.y;
     int d = threadIdx.x;
-    int khead = vhead / 3;
-    const float* qp = q_in + (t * 16 + khead) * 128;
-    const float* kp = k_in + (t * 16 + khead) * 128;
+    int khead = vhead / (CN_GDN_VHEADS / CN_GDN_KHEADS);
+    const float* qp = q_in + (t * CN_GDN_KHEADS + khead) * CN_GD;
+    const float* kp = k_in + (t * CN_GDN_KHEADS + khead) * CN_GD;
     float qn = 0.0f, kn = 0.0f;
-    for (int i = 0; i < 128; i++) { qn += qp[i] * qp[i]; kn += kp[i] * kp[i]; }
+    for (int i = 0; i < CN_GD; i++) { qn += qp[i] * qp[i]; kn += kp[i] * kp[i]; }
     qn = rsqrtf(qn + 1e-6f); kn = rsqrtf(kn + 1e-6f);
-    q_out[((size_t)t * 48 + vhead) * 128 + d] = qp[d] * qn * rsqrtf(128.0f);
-    k_out[((size_t)t * 48 + vhead) * 128 + d] = kp[d] * kn;
+    q_out[((size_t)t * CN_GDN_VHEADS + vhead) * CN_GD + d] = qp[d] * qn * rsqrtf((float)CN_GD);
+    k_out[((size_t)t * CN_GDN_VHEADS + vhead) * CN_GD + d] = kp[d] * kn;
 }
 extern "C" __global__ void beta_g(const float* __restrict__ b_pr, const float* __restrict__ a_pr,
                                   const float* __restrict__ a_log, const float* __restrict__ dt_bias,
@@ -1680,12 +1686,12 @@ extern "C" __global__ void beta_g(const float* __restrict__ b_pr, const float* _
     // guard: t*48 is not a multiple of the block size - without it the prompt
     // path wrote past gbeta/gg (found 2026-09-04: chunk-size-dependent
     // nondeterminism, C=8 parity runs differed from row 1 on)
-    if (i >= *t_p * 48) return;
+    if (i >= *t_p * CN_GDN_VHEADS) return;
     float beta = 1.0f / (1.0f + expf(-b_pr[i]));
-    float a = a_pr[i] + dt_bias[i % 48];
+    float a = a_pr[i] + dt_bias[i % CN_GDN_VHEADS];
     float sp = logf(1.0f + expf(a));
     beta_out[i] = beta;
-    g_out[i] = -expf(a_log[i % 48]) * sp;
+    g_out[i] = -expf(a_log[i % CN_GDN_VHEADS]) * sp;
 }
 // batched prompt recurrence with persistent state; init_p=1 zeroes S first
 extern "C" __global__ void delta_rule_persist(const float* __restrict__ q, const float* __restrict__ k,
@@ -1695,29 +1701,29 @@ extern "C" __global__ void delta_rule_persist(const float* __restrict__ q, const
                                               const int* __restrict__ init_p) {
     int steps = *steps_p;
     int head = blockIdx.x;
-    float* S = s_global + head * 128 * 128;
+    float* S = s_global + head * CN_GD * CN_GDV;
     int d = threadIdx.x;
-    if (*init_p) for (int dk = 0; dk < 128; dk++) S[dk * 128 + d] = 0.0f;
+    if (*init_p) for (int dk = 0; dk < CN_GD; dk++) S[dk * CN_GDV + d] = 0.0f;
     for (int t = 0; t < steps; t++) {
-        float g_t = expf(g[t * 48 + head]);
-        float beta_t = beta[t * 48 + head];
-        const float* qt = q + (t * 48 + head) * 128;
-        const float* kt = k + (t * 48 + head) * 128;
-        const float* vt = v + (t * 48 + head) * 128;
-        for (int dk = 0; dk < 128; dk++) S[dk * 128 + d] *= g_t;
+        float g_t = expf(g[t * CN_GDN_VHEADS + head]);
+        float beta_t = beta[t * CN_GDN_VHEADS + head];
+        const float* qt = q + (t * CN_GDN_VHEADS + head) * CN_GD;
+        const float* kt = k + (t * CN_GDN_VHEADS + head) * CN_GD;
+        const float* vt = v + (t * CN_GDN_VHEADS + head) * CN_GDV;
+        for (int dk = 0; dk < CN_GD; dk++) S[dk * CN_GDV + d] *= g_t;
         float kv = 0.0f;
-        for (int dk = 0; dk < 128; dk++) kv += S[dk * 128 + d] * kt[dk];
+        for (int dk = 0; dk < CN_GD; dk++) kv += S[dk * CN_GDV + d] * kt[dk];
         float delta = (vt[d] - kv) * beta_t;
-        for (int dk = 0; dk < 128; dk++) S[dk * 128 + d] += kt[dk] * delta;
+        for (int dk = 0; dk < CN_GD; dk++) S[dk * CN_GDV + d] += kt[dk] * delta;
         float o = 0.0f;
-        for (int dk = 0; dk < 128; dk++) o += S[dk * 128 + d] * qt[dk];
-        out[(t * 48 + head) * 128 + d] = o;
+        for (int dk = 0; dk < CN_GD; dk++) o += S[dk * CN_GDV + d] * qt[dk];
+        out[(t * CN_GDN_VHEADS + head) * CN_GDV + d] = o;
     }
 }
 extern "C" __global__ void conv_step(const float* __restrict__ mq1, const float* __restrict__ w,
                                      float* __restrict__ cs, float* __restrict__ cout) {
     int ch = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ch >= 10240) return;
+    if (ch >= CN_GDN_CONV) return;
     const float* wv = w + ch * 4;
     float acc = wv[0] * cs[ch * 3 + 0] + wv[1] * cs[ch * 3 + 1]
               + wv[2] * cs[ch * 3 + 2] + wv[3] * mq1[ch];
@@ -1731,21 +1737,21 @@ extern "C" __global__ void delta_rule_step(float* __restrict__ s_global, const f
                                            const float* __restrict__ g, const float* __restrict__ beta,
                                            float* __restrict__ core) {
     int head = blockIdx.x;
-    float* S = s_global + head * 128 * 128;
+    float* S = s_global + head * CN_GD * CN_GDV;
     int d = threadIdx.x;
     float g_t = expf(g[head]);
     float beta_t = beta[head];
-    const float* qt = q + head * 128;
-    const float* kt = k + head * 128;
-    const float* vt = v + head * 128;
-    for (int dk = 0; dk < 128; dk++) S[dk * 128 + d] *= g_t;
+    const float* qt = q + head * CN_GD;
+    const float* kt = k + head * CN_GD;
+    const float* vt = v + head * CN_GDV;
+    for (int dk = 0; dk < CN_GD; dk++) S[dk * CN_GDV + d] *= g_t;
     float kv = 0.0f;
-    for (int dk = 0; dk < 128; dk++) kv += S[dk * 128 + d] * kt[dk];
+    for (int dk = 0; dk < CN_GD; dk++) kv += S[dk * CN_GDV + d] * kt[dk];
     float delta = (vt[d] - kv) * beta_t;
-    for (int dk = 0; dk < 128; dk++) S[dk * 128 + d] += kt[dk] * delta;
+    for (int dk = 0; dk < CN_GD; dk++) S[dk * CN_GDV + d] += kt[dk] * delta;
     float o = 0.0f;
-    for (int dk = 0; dk < 128; dk++) o += S[dk * 128 + d] * qt[dk];
-    core[head * 128 + d] = o;
+    for (int dk = 0; dk < CN_GD; dk++) o += S[dk * CN_GDV + d] * qt[dk];
+    core[head * CN_GDV + d] = o;
 }
 // Register-resident delta rule (2026-09-04): the 128x128 head state lives in
 // registers (one column per thread) for the whole chunk instead of being
@@ -1763,84 +1769,89 @@ extern "C" __global__ void delta_rule_persist_r(const float* __restrict__ q, con
                                                 const int* __restrict__ init_p) {
     int steps = *steps_p;
     int head = blockIdx.x;
-    float* S = s_global + head * 128 * 128;
+    float* S = s_global + head * CN_GD * CN_GDV;
     int d = threadIdx.x;
-    __shared__ float ks[128];
-    __shared__ float qs[128];
-    float sr[128];
+    __shared__ float ks[CN_GD];
+    __shared__ float qs[CN_GD];
+    float sr[CN_GD];
     if (*init_p) {
 #pragma unroll
-        for (int dk = 0; dk < 128; dk++) sr[dk] = 0.0f;
+        for (int dk = 0; dk < CN_GD; dk++) sr[dk] = 0.0f;
     } else {
 #pragma unroll
-        for (int dk = 0; dk < 128; dk++) sr[dk] = S[dk * 128 + d];
+        for (int dk = 0; dk < CN_GD; dk++) sr[dk] = S[dk * CN_GDV + d];
     }
     for (int t = 0; t < steps; t++) {
-        float g_t = expf(g[t * 48 + head]);
-        float beta_t = beta[t * 48 + head];
-        const float* qt = q + (t * 48 + head) * 128;
-        const float* kt = k + (t * 48 + head) * 128;
-        const float* vt = v + (t * 48 + head) * 128;
+        float g_t = expf(g[t * CN_GDN_VHEADS + head]);
+        float beta_t = beta[t * CN_GDN_VHEADS + head];
+        const float* qt = q + (t * CN_GDN_VHEADS + head) * CN_GD;
+        const float* kt = k + (t * CN_GDN_VHEADS + head) * CN_GD;
+        const float* vt = v + (t * CN_GDN_VHEADS + head) * CN_GDV;
         ks[d] = kt[d];
         qs[d] = qt[d];
         __syncthreads();
         float kv = 0.0f;
 #pragma unroll
-        for (int dk = 0; dk < 128; dk++) { sr[dk] = __fmul_rn(sr[dk], g_t); kv = __fmaf_rn(sr[dk], ks[dk], kv); }
+        for (int dk = 0; dk < CN_GD; dk++) { sr[dk] = __fmul_rn(sr[dk], g_t); kv = __fmaf_rn(sr[dk], ks[dk], kv); }
         float delta = (vt[d] - kv) * beta_t;
         float o = 0.0f;
 #pragma unroll
-        for (int dk = 0; dk < 128; dk++) { sr[dk] = __fmaf_rn(ks[dk], delta, sr[dk]); o = __fmaf_rn(sr[dk], qs[dk], o); }
-        out[(t * 48 + head) * 128 + d] = o;
+        for (int dk = 0; dk < CN_GD; dk++) { sr[dk] = __fmaf_rn(ks[dk], delta, sr[dk]); o = __fmaf_rn(sr[dk], qs[dk], o); }
+        out[(t * CN_GDN_VHEADS + head) * CN_GDV + d] = o;
         __syncthreads();
     }
 #pragma unroll
-    for (int dk = 0; dk < 128; dk++) S[dk * 128 + d] = sr[dk];
+    for (int dk = 0; dk < CN_GD; dk++) S[dk * CN_GDV + d] = sr[dk];
 }
 extern "C" __global__ void delta_rule_step_r(float* __restrict__ s_global, const float* __restrict__ q,
                                              const float* __restrict__ k, const float* __restrict__ v,
                                              const float* __restrict__ g, const float* __restrict__ beta,
                                              float* __restrict__ core) {
     int head = blockIdx.x;
-    float* S = s_global + head * 128 * 128;
+    float* S = s_global + head * CN_GD * CN_GDV;
     int d = threadIdx.x;
-    __shared__ float ks[128];
-    __shared__ float qs[128];
+    __shared__ float ks[CN_GD];
+    __shared__ float qs[CN_GD];
     float g_t = expf(g[head]);
     float beta_t = beta[head];
-    ks[d] = k[head * 128 + d];
-    qs[d] = q[head * 128 + d];
+    ks[d] = k[head * CN_GD + d];
+    qs[d] = q[head * CN_GD + d];
     __syncthreads();
-    float sr[128];
+    float sr[CN_GD];
 #pragma unroll
-    for (int dk = 0; dk < 128; dk++) sr[dk] = S[dk * 128 + d];
+    for (int dk = 0; dk < CN_GD; dk++) sr[dk] = S[dk * CN_GDV + d];
     float kv = 0.0f;
 #pragma unroll
-    for (int dk = 0; dk < 128; dk++) { sr[dk] = __fmul_rn(sr[dk], g_t); kv = __fmaf_rn(sr[dk], ks[dk], kv); }
-    float delta = (v[head * 128 + d] - kv) * beta_t;
+    for (int dk = 0; dk < CN_GD; dk++) { sr[dk] = __fmul_rn(sr[dk], g_t); kv = __fmaf_rn(sr[dk], ks[dk], kv); }
+    float delta = (v[head * CN_GDV + d] - kv) * beta_t;
     float o = 0.0f;
 #pragma unroll
-    for (int dk = 0; dk < 128; dk++) { sr[dk] = __fmaf_rn(ks[dk], delta, sr[dk]); o = __fmaf_rn(sr[dk], qs[dk], o); }
+    for (int dk = 0; dk < CN_GD; dk++) { sr[dk] = __fmaf_rn(ks[dk], delta, sr[dk]); o = __fmaf_rn(sr[dk], qs[dk], o); }
 #pragma unroll
-    for (int dk = 0; dk < 128; dk++) S[dk * 128 + d] = sr[dk];
-    core[head * 128 + d] = o;
+    for (int dk = 0; dk < CN_GD; dk++) S[dk * CN_GDV + d] = sr[dk];
+    core[head * CN_GDV + d] = o;
 }
 extern "C" __global__ void rmsnorm_gated(const float* __restrict__ x, const float* __restrict__ z,
                                          const float* __restrict__ w, float* __restrict__ out) {
     int vhead = blockIdx.x;
     int t = blockIdx.y;
     int d = threadIdx.x;
-    const float* xp = x + ((size_t)t * 48 + vhead) * 128;
-    __shared__ float red[128];
+    const float* xp = x + ((size_t)t * CN_GDN_VHEADS + vhead) * CN_GDV;
+    __shared__ float red[CN_GDV];
     red[d] = xp[d] * xp[d];
     __syncthreads();
-    for (int st = 64; st > 0; st >>= 1) {
+    for (int st = CN_GDV / 2; st > 0; st >>= 1) {
         if (d < st) red[d] += red[d + st];
         __syncthreads();
     }
-    float rms = rsqrtf(red[0] / 128.0f + 1e-6f);
-    float gate = 1.0f / (1.0f + expf(-z[((size_t)t * 48 + vhead) * 128 + d]));
-    out[((size_t)t * 48 + vhead) * 128 + d] = w[d] * xp[d] * rms * gate;
+    float rms = rsqrtf(red[0] / (float)CN_GDV + CN_EPS);
+#if CN_GATE_ACT == 0 // sigmoid (Flash-Next `output_gate_type` sigmoid)
+    float gate = 1.0f / (1.0f + expf(-z[((size_t)t * CN_GDN_VHEADS + vhead) * CN_GDV + d]));
+#else // swish = x * sigmoid(x) (the dense Qwen3.5 family: `swish` / `silu`)
+    float zg = z[((size_t)t * CN_GDN_VHEADS + vhead) * CN_GDV + d];
+    float gate = zg / (1.0f + expf(-zg));
+#endif
+    out[((size_t)t * CN_GDN_VHEADS + vhead) * CN_GDV + d] = w[d] * xp[d] * rms * gate;
 }
 
 // ---------------- attention (p7/p12/p16-verified + QSA lists) ----------------
@@ -1849,25 +1860,25 @@ extern "C" __global__ void split_qg(const float* __restrict__ qg, float* __restr
     int head = blockIdx.x;
     int t = blockIdx.y;
     int d = threadIdx.x;
-    int src = t * 12288 + head * 512 + d;
-    q[(t * 24 + head) * 256 + d] = qg[src];
-    gate[t * 6144 + head * 256 + d] = qg[src + 256];
+    int src = t * CN_Q_ROWS + head * (2 * CN_AHD) + d;
+    q[(t * CN_NQ + head) * CN_AHD + d] = qg[src];
+    gate[t * CN_CORE + head * CN_AHD + d] = qg[src + CN_AHD];
 }
 extern "C" __global__ void rope(const float* __restrict__ x, const float* __restrict__ cos_,
                                 const float* __restrict__ sin_, float* __restrict__ out) {
     int head = blockIdx.x;
     int t = blockIdx.y;
     int d = threadIdx.x;
-    const float* xp = x + (t * gridDim.x + head) * 256;
-    float* op = out + (t * gridDim.x + head) * 256;
-    if (d >= 32) {
-        if (d >= 64) op[d] = xp[d];
+    const float* xp = x + (t * gridDim.x + head) * CN_AHD;
+    float* op = out + (t * gridDim.x + head) * CN_AHD;
+    if (d >= CN_ROPE_PAIRS) {
+        if (d >= 2 * CN_ROPE_PAIRS) op[d] = xp[d];
         return;
     }
-    float a = xp[d], b = xp[d + 32];
-    float c = cos_[t * 32 + d], s = sin_[t * 32 + d];
+    float a = xp[d], b = xp[d + CN_ROPE_PAIRS];
+    float c = cos_[t * CN_ROPE_PAIRS + d], s = sin_[t * CN_ROPE_PAIRS + d];
     op[d] = a * c - b * s;
-    op[d + 32] = b * c + a * s;
+    op[d + CN_ROPE_PAIRS] = b * c + a * s;
 }
 // rope with a DEVICE position scalar (graph-replay safe: no host-computed
 // table offset baked into the kernel args). Decode path, t = blockIdx.y.
@@ -1878,16 +1889,16 @@ extern "C" __global__ void rope_p(const float* __restrict__ x, const float* __re
     int t = blockIdx.y;
     int d = threadIdx.x;
     int pt = *pos_base_p + t;
-    const float* xp = x + (t * gridDim.x + head) * 256;
-    float* op = out + (t * gridDim.x + head) * 256;
-    if (d >= 32) {
-        if (d >= 64) op[d] = xp[d];
+    const float* xp = x + (t * gridDim.x + head) * CN_AHD;
+    float* op = out + (t * gridDim.x + head) * CN_AHD;
+    if (d >= CN_ROPE_PAIRS) {
+        if (d >= 2 * CN_ROPE_PAIRS) op[d] = xp[d];
         return;
     }
-    float a = xp[d], b = xp[d + 32];
-    float c = cos_[pt * 32 + d], s = sin_[pt * 32 + d];
+    float a = xp[d], b = xp[d + CN_ROPE_PAIRS];
+    float c = cos_[pt * CN_ROPE_PAIRS + d], s = sin_[pt * CN_ROPE_PAIRS + d];
     op[d] = a * c - b * s;
-    op[d + 32] = b * c + a * s;
+    op[d + CN_ROPE_PAIRS] = b * c + a * s;
 }
 // KV cache append with on-store cast (e4m3 default; bf16 keep path).
 // grid (4, T): slot = slot_base + blockIdx.y (chunked prompt or single token)
@@ -1897,15 +1908,15 @@ extern "C" __global__ void store_kv(const float* __restrict__ kr, const float* _
                                     const int* __restrict__ mode_p) {
     int h = blockIdx.x;
     int d = threadIdx.x;
-    if (d >= 256) return;
+    if (d >= CN_AHD) return;
     int slot = *slot_p + (int)blockIdx.y;
     int tmax = *tmax_p;
     int mode = *mode_p;
-    int bh = (h < 2) ? h : h - 2;
-    size_t rowb = (size_t)(bh * tmax + slot) * 256 * (mode ? 2 : 1);
-    const float* src = (h < 2) ? kr + (size_t)(blockIdx.y * 2 + bh) * 256
-                               : vr + (size_t)(blockIdx.y * 2 + bh) * 256;
-    unsigned char* dst = (h < 2) ? kcache + rowb : vcache + rowb;
+    int bh = (h < CN_NKV) ? h : h - CN_NKV;
+    size_t rowb = (size_t)(bh * tmax + slot) * CN_AHD * (mode ? 2 : 1);
+    const float* src = (h < CN_NKV) ? kr + (size_t)(blockIdx.y * CN_NKV + bh) * CN_AHD
+                               : vr + (size_t)(blockIdx.y * CN_NKV + bh) * CN_AHD;
+    unsigned char* dst = (h < CN_NKV) ? kcache + rowb : vcache + rowb;
     if (mode == 0) dst[d] = enc_e4m3(src[d]);
     else ((unsigned short*)dst)[d] = f32_bf16_bits(src[d]);
 }
@@ -1918,9 +1929,9 @@ extern "C" __global__ void store_kv(const float* __restrict__ kr, const float* _
 // once at boot when the checkpoint config carries a rope_scaling whose mscale
 // differs from 1. The value is the same 0.0625f either way (a power of two:
 // the multiply is exact), so default-path logits are bit-identical.
-extern "C" __device__ float d_attn_scale = 0.0625f; // 1/sqrt(256) unless YaRN rewrites it at boot (extern "C" keeps the plain PTX name the #96 test greps)
+extern "C" __device__ float d_attn_scale = CN_ATTN_SCALE; // 1/sqrt(256) unless YaRN rewrites it at boot (extern "C" keeps the plain PTX name the #96 test greps)
 template <int RT> __device__ __forceinline__ float attn_scale_src();
-template <> __device__ __forceinline__ float attn_scale_src<0>() { return 0.0625f; } // 1/sqrt(256)
+template <> __device__ __forceinline__ float attn_scale_src<0>() { return CN_ATTN_SCALE; } // 1/sqrt(256)
 template <> __device__ __forceinline__ float attn_scale_src<1>() { return d_attn_scale; } // #96 YaRN mscale path
 // one boot-time write of the runtime scale (scalars live in device buffers - the p5 rule)
 extern "C" __global__ void set_attn_scale(const float* __restrict__ v) {
@@ -1939,13 +1950,13 @@ __device__ __forceinline__ void attn_sel_body(const float* __restrict__ q, const
     int head = blockIdx.x;
     int t = blockIdx.y;
     int d = threadIdx.x;
-    int kvh = head / 12;
+    int kvh = head / CN_GQA;
     int n = sel_n[t];
     if (n < 0) n = 0;
     if (n > *sel_max_p) n = *sel_max_p;
     const int* list = sel + (size_t)t * *sel_max_p;
-    const float* qt = q + ((size_t)t * 24 + head) * 256;
-    __shared__ float p[2051];
+    const float* qt = q + ((size_t)t * CN_NQ + head) * CN_AHD;
+    __shared__ float p[CN_QSA_SEL_MAX];
     __shared__ float red[256];
     int mode = *mode_p;
     int warp = d >> 5, lane = d & 31;
@@ -1956,9 +1967,9 @@ __device__ __forceinline__ void attn_sel_body(const float* __restrict__ q, const
             int tok = list[j];
             if (tok < 0) tok = 0;
             if (tok >= *tmax_p) tok = *tmax_p - 1;
-            const unsigned char* kp = kc + (size_t)(kvh * *tmax_p + tok) * 256 * (mode ? 2 : 1);
+            const unsigned char* kp = kc + (size_t)(kvh * *tmax_p + tok) * CN_AHD * (mode ? 2 : 1);
             float acc = 0.0f;
-            for (int e = lane; e < 256; e += 32) acc += qt[e] * kv_load(kp, e, mode);
+            for (int e = lane; e < CN_AHD; e += 32) acc += qt[e] * kv_load(kp, e, mode);
             for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
             if (lane == 0) p[j] = acc * scale;
         }
@@ -1988,10 +1999,10 @@ __device__ __forceinline__ void attn_sel_body(const float* __restrict__ q, const
         int tok = list[j];
         if (tok < 0) tok = 0;
         if (tok >= *tmax_p) tok = *tmax_p - 1;
-        const unsigned char* vp = vc + (size_t)(kvh * *tmax_p + tok) * 256 * (mode ? 2 : 1);
+        const unsigned char* vp = vc + (size_t)(kvh * *tmax_p + tok) * CN_AHD * (mode ? 2 : 1);
         o += (p[j] / sum) * kv_load(vp, d, mode);
     }
-    out[((size_t)t * 24 + head) * 256 + d] = o;
+    out[((size_t)t * CN_NQ + head) * CN_AHD + d] = o;
 }
 extern "C" __global__ void attn_sel(const float* __restrict__ q, const unsigned char* __restrict__ kc,
                                     const unsigned char* __restrict__ vc, const int* __restrict__ sel,
@@ -2024,15 +2035,15 @@ __device__ __forceinline__ void attn_sel_r_body(const float* __restrict__ q, con
     int head = blockIdx.x;
     int t = blockIdx.y;
     int d = threadIdx.x;
-    int kvh = head / 12;
+    int kvh = head / CN_GQA;
     int n = sel_n[t];
     if (n < 0) n = 0;
     const int sel_max = *sel_max_p;
     if (n > sel_max) n = sel_max;
     const int tmax = *tmax_p;
     const int* list = sel + (size_t)t * sel_max;
-    const float* qt = q + ((size_t)t * 24 + head) * 256;
-    __shared__ float p[2051];
+    const float* qt = q + ((size_t)t * CN_NQ + head) * CN_AHD;
+    __shared__ float p[CN_QSA_SEL_MAX];
     __shared__ float red[256];
     const int mode = *mode_p;
     const int esz = mode ? 2 : 1;
@@ -2051,7 +2062,7 @@ __device__ __forceinline__ void attn_sel_r_body(const float* __restrict__ q, con
                 int tok = list[j];
                 if (tok < 0) tok = 0;
                 if (tok >= tmax) tok = tmax - 1;
-                const unsigned char* kp = kc + (kvbase + tok) * 256 * esz;
+                const unsigned char* kp = kc + (kvbase + tok) * CN_AHD * esz;
                 float acc = 0.0f;
 #pragma unroll
                 for (int k = 0; k < 8; k++) acc += qr[k] * kv_load(kp, lane + 32 * k, mode);
@@ -2087,7 +2098,7 @@ __device__ __forceinline__ void attn_sel_r_body(const float* __restrict__ q, con
     if (R == 9) {
         o = sum; // DIAGNOSTIC: no V loop
     } else {
-        const unsigned char* vb = vc + kvbase * 256 * esz;
+        const unsigned char* vb = vc + kvbase * CN_AHD * esz;
         int j = 0;
         for (; j + 4 <= n; j += 4) {
             int t0 = list[j], t1 = list[j + 1], t2 = list[j + 2], t3 = list[j + 3];
@@ -2095,10 +2106,10 @@ __device__ __forceinline__ void attn_sel_r_body(const float* __restrict__ q, con
             t1 = t1 < 0 ? 0 : (t1 >= tmax ? tmax - 1 : t1);
             t2 = t2 < 0 ? 0 : (t2 >= tmax ? tmax - 1 : t2);
             t3 = t3 < 0 ? 0 : (t3 >= tmax ? tmax - 1 : t3);
-            float v0 = kv_load(vb + (size_t)t0 * 256 * esz, d, mode);
-            float v1 = kv_load(vb + (size_t)t1 * 256 * esz, d, mode);
-            float v2 = kv_load(vb + (size_t)t2 * 256 * esz, d, mode);
-            float v3 = kv_load(vb + (size_t)t3 * 256 * esz, d, mode);
+            float v0 = kv_load(vb + (size_t)t0 * CN_AHD * esz, d, mode);
+            float v1 = kv_load(vb + (size_t)t1 * CN_AHD * esz, d, mode);
+            float v2 = kv_load(vb + (size_t)t2 * CN_AHD * esz, d, mode);
+            float v3 = kv_load(vb + (size_t)t3 * CN_AHD * esz, d, mode);
             o += p[j] * v0;
             o += p[j + 1] * v1;
             o += p[j + 2] * v2;
@@ -2108,10 +2119,10 @@ __device__ __forceinline__ void attn_sel_r_body(const float* __restrict__ q, con
             int tok = list[j];
             if (tok < 0) tok = 0;
             if (tok >= tmax) tok = tmax - 1;
-            o += p[j] * kv_load(vb + (size_t)tok * 256 * esz, d, mode);
+            o += p[j] * kv_load(vb + (size_t)tok * CN_AHD * esz, d, mode);
         }
     }
-    out[((size_t)t * 24 + head) * 256 + d] = o;
+    out[((size_t)t * CN_NQ + head) * CN_AHD + d] = o;
 }
 extern "C" __global__ void attn_sel_r(const float* __restrict__ q, const unsigned char* __restrict__ kc,
                                       const unsigned char* __restrict__ vc, const int* __restrict__ sel,
@@ -2203,22 +2214,22 @@ __device__ __forceinline__ void attn_sel_s_body(const float* __restrict__ q, con
     int head = blockIdx.x;
     int t = blockIdx.y;
     int d = threadIdx.x;
-    int kvh = head / 12;
+    int kvh = head / CN_GQA;
     int n = sel_n[t];
     if (n < 0) n = 0;
     const int sel_max = *sel_max_p;
     if (n > sel_max) n = sel_max;
     const int tmax = *tmax_p;
     const int* list = sel + (size_t)t * sel_max;
-    const float* qt = q + ((size_t)t * 24 + head) * 256;
-    __shared__ float p[2051];
+    const float* qt = q + ((size_t)t * CN_NQ + head) * CN_AHD;
+    __shared__ float p[CN_QSA_SEL_MAX];
     __shared__ float red[256];
     __shared__ __align__(16) unsigned char kb[CHB];
     __shared__ float lut[256];
     if (LUT) lut[threadIdx.x] = dec_e4m3((unsigned char)threadIdx.x); // read only after the first __syncthreads
     const int mode = *mode_p;
     const int esz = mode ? 2 : 1;
-    const int rb = 256 * esz;           // bytes per K/V row
+    const int rb = CN_AHD * esz;           // bytes per K/V row
     const int sh = mode ? 5 : 4;        // log2(uint4 per row)
     const int KB = CHB / rb;            // keys per chunk
     constexpr int NV = CHB / 16 / 256;  // uint4 per thread per chunk
@@ -2285,7 +2296,7 @@ __device__ __forceinline__ void attn_sel_s_body(const float* __restrict__ q, con
         for (int j = j0; j < jend; j++) o += p[j] * kv_ld<LUT>(kb + (j - j0) * rb, d, mode, lut);
         __syncthreads();
     }
-    out[((size_t)t * 24 + head) * 256 + d] = o;
+    out[((size_t)t * CN_NQ + head) * CN_AHD + d] = o;
 }
 extern "C" __global__ void attn_sel_s(const float* __restrict__ q, const unsigned char* __restrict__ kc,
                                       const unsigned char* __restrict__ vc, const int* __restrict__ sel,
@@ -2373,20 +2384,20 @@ __device__ __forceinline__ void attn_sel_g_body(const float* __restrict__ q, con
     const int t = blockIdx.y;
     const int tid = threadIdx.x;
     const int warp = tid >> 5, lane = tid & 31;
-    const int head = kvh * 12 + warp;
+    const int head = kvh * CN_GQA + warp;
     int n = sel_n[t];
     if (n < 0) n = 0;
     const int sel_max = *sel_max_p;
     if (n > sel_max) n = sel_max;
     const int tmax = *tmax_p;
     const int* list = sel + (size_t)t * sel_max;
-    const float* qt = q + ((size_t)t * 24 + head) * 256;
+    const float* qt = q + ((size_t)t * CN_NQ + head) * CN_AHD;
     __shared__ float lut[256];
     __shared__ __align__(16) unsigned char kb[4096];
     __shared__ __align__(16) unsigned char vb[4096];
     const int mode = *mode_p;
     const int esz = mode ? 2 : 1;
-    const int rb = 256 * esz;      // bytes per K/V row
+    const int rb = CN_AHD * esz;      // bytes per K/V row
     const int sh = mode ? 5 : 4;   // log2(uint4 per row)
     const int KG = 4096 / rb;      // keys per chunk
     const size_t kvbase = (size_t)kvh * tmax;
@@ -2460,16 +2471,16 @@ __device__ __forceinline__ void attn_sel_g_body(const float* __restrict__ q, con
         __syncthreads();
     }
 #pragma unroll
-    for (int k = 0; k < 8; k++) out[((size_t)t * 24 + head) * 256 + lane + 32 * k] = o[k];
+    for (int k = 0; k < 8; k++) out[((size_t)t * CN_NQ + head) * CN_AHD + lane + 32 * k] = o[k];
 }
-extern "C" __global__ void __launch_bounds__(384) attn_sel_g(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+extern "C" __global__ void __launch_bounds__(32 * CN_GQA) attn_sel_g(const float* __restrict__ q, const unsigned char* __restrict__ kc,
                                       const unsigned char* __restrict__ vc, const int* __restrict__ sel,
                                       const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
                                       const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
                                       float* __restrict__ out) {
     attn_sel_g_body<0>(q, kc, vc, sel, sel_n, tmax_p, mode_p, sel_max_p, out);
 }
-extern "C" __global__ void __launch_bounds__(384) attn_sel_g_y(const float* __restrict__ q, const unsigned char* __restrict__ kc,
+extern "C" __global__ void __launch_bounds__(32 * CN_GQA) attn_sel_g_y(const float* __restrict__ q, const unsigned char* __restrict__ kc,
                                       const unsigned char* __restrict__ vc, const int* __restrict__ sel,
                                       const int* __restrict__ sel_n, const int* __restrict__ tmax_p,
                                       const int* __restrict__ mode_p, const int* __restrict__ sel_max_p,
@@ -2512,16 +2523,16 @@ extern "C" __global__ void rms128(const float* __restrict__ x, const float* __re
     int head = blockIdx.x;
     int t = blockIdx.y;
     int d = threadIdx.x;
-    const float* xp = x + (size_t)t * stride + head * 128;
-    __shared__ float red[128];
+    const float* xp = x + (size_t)t * stride + head * CN_QSA_HD;
+    __shared__ float red[CN_QSA_HD];
     red[d] = xp[d] * xp[d];
     __syncthreads();
-    for (int st = 64; st > 0; st >>= 1) {
+    for (int st = CN_QSA_HD / 2; st > 0; st >>= 1) {
         if (d < st) red[d] += red[d + st];
         __syncthreads();
     }
-    float rms = rsqrtf(red[0] / 128.0f + 1e-6f);
-    out[((size_t)t * heads + head) * 128 + d] = xp[d] * rms * (1.0f + w[d]);
+    float rms = rsqrtf(red[0] / (float)CN_QSA_HD + CN_EPS);
+    out[((size_t)t * heads + head) * CN_QSA_HD + d] = xp[d] * rms * (1.0f + w[d]);
 }
 // partial rotary 64 dims; p = (pos_base + t) * pos_mul (pos_base for chunked rows)
 extern "C" __global__ void rope64(const float* __restrict__ x, const float* __restrict__ cos_,
@@ -2534,17 +2545,17 @@ extern "C" __global__ void rope64(const float* __restrict__ x, const float* __re
     int head = blockIdx.x;
     int t = blockIdx.y;
     int d = threadIdx.x;
-    const float* xp = x + (size_t)t * stride + head * 128;
-    float* op = out + ((size_t)t * heads + head) * 128;
+    const float* xp = x + (size_t)t * stride + head * CN_QSA_HD;
+    float* op = out + ((size_t)t * heads + head) * CN_QSA_HD;
     int p = (*pos_base_p + t) * pos_mul;
-    if (d >= 32) {
-        if (d >= 64) op[d] = xp[d];
+    if (d >= CN_ROPE_PAIRS) {
+        if (d >= 2 * CN_ROPE_PAIRS) op[d] = xp[d];
         return;
     }
-    float a = xp[d], b = xp[d + 32];
-    float c = cos_[p * 32 + d], s = sin_[p * 32 + d];
+    float a = xp[d], b = xp[d + CN_ROPE_PAIRS];
+    float c = cos_[p * CN_ROPE_PAIRS + d], s = sin_[p * CN_ROPE_PAIRS + d];
     op[d] = a * c - b * s;
-    op[d + 32] = b * c + a * s;
+    op[d + CN_ROPE_PAIRS] = b * c + a * s;
 }
 // pool a block of 4 raw keys from the compact [Tmax][128] indexer cache
 extern "C" __global__ void pool4_cache(const float* __restrict__ keys, float* __restrict__ pooled,
@@ -2556,7 +2567,7 @@ extern "C" __global__ void pool4_cache(const float* __restrict__ keys, float* __
     // raw-key ring (row = pos % ring, ring % 4 == 0: a block's 4 rows never wrap)
     int row0 = (int)(((long long)(*block_base_p + b) * 4) % *ring_p);
     const float* kp = keys + (size_t)row0 * *stride_p + d;
-    pooled[(size_t)b * 128 + d] =
+    pooled[(size_t)b * CN_QSA_HD + d] =
         (kp[0] + kp[*stride_p] + kp[2 * *stride_p] + kp[3 * *stride_p]) * 0.25f;
 }
 // append the k-part (columns 512..640) of a [T][640] qk matrix to the cache
@@ -2564,11 +2575,11 @@ extern "C" __global__ void qk_k_append(const float* __restrict__ qk, float* __re
                                        const int* __restrict__ row_base_p, const int* __restrict__ n_rows_p,
                                        const int* __restrict__ ring_p) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= *n_rows_p * 128) return;
-    int t = i / 128;
-    int d = i % 128;
+    if (i >= *n_rows_p * CN_QSA_HD) return;
+    int t = i / CN_QSA_HD;
+    int d = i % CN_QSA_HD;
     int row = (int)(((long long)*row_base_p + t) % *ring_p);
-    keys[(size_t)row * 128 + d] = qk[(size_t)t * 640 + 512 + d];
+    keys[(size_t)row * CN_QSA_HD + d] = qk[(size_t)t * CN_QSA_QK_ROWS + CN_QSA_HEADS * CN_QSA_HD + d];
 }
 // copy hd staging values into pooled[block_base] — graph-safe dynamic offset
 // (the offset is read from the device buffer, which is refreshed per token by
@@ -2591,24 +2602,24 @@ extern "C" __global__ void qsa_scores(const float* __restrict__ q, const float* 
     int pos = *pos_base_p + tq;
     int ncb = (pos + 1) >> 2;
     if (ncb > *cap_p) ncb = *cap_p;
-    __shared__ float qs[4 * 128];
-    __shared__ float red[128];
-    for (int h = 0; h < 4; h++) qs[h * 128 + d] = q[((size_t)tq * 4 + h) * 128 + d];
+    __shared__ float qs[CN_QSA_HEADS * CN_QSA_HD];
+    __shared__ float red[CN_QSA_HD];
+    for (int h = 0; h < CN_QSA_HEADS; h++) qs[h * CN_QSA_HD + d] = q[((size_t)tq * CN_QSA_HEADS + h) * CN_QSA_HD + d];
     __syncthreads();
     for (int b = 0; b < ncb; b++) {
-        const float* pk = pooled + (size_t)b * 128;
+        const float* pk = pooled + (size_t)b * CN_QSA_HD;
         float ssum = 0.0f;
-        for (int h = 0; h < 4; h++) {
-            red[d] = qs[h * 128 + d] * pk[d];
+        for (int h = 0; h < CN_QSA_HEADS; h++) {
+            red[d] = qs[h * CN_QSA_HD + d] * pk[d];
             __syncthreads();
-            for (int st = 64; st > 0; st >>= 1) {
+            for (int st = CN_QSA_HD / 2; st > 0; st >>= 1) {
                 if (d < st) red[d] += red[d + st];
                 __syncthreads();
             }
             ssum += fmaxf(red[0], 0.0f);
             __syncthreads();
         }
-        if (d == 0) scores[(size_t)tq * *cap_p + b] = ssum * rsqrtf(128.0f);
+        if (d == 0) scores[(size_t)tq * *cap_p + b] = ssum * rsqrtf((float)CN_QSA_HD);
     }
 }
 __device__ __forceinline__ unsigned int ordkey(float v) {
@@ -3106,16 +3117,16 @@ extern "C" __global__ void router_top10(const float* __restrict__ logits,
                                         unsigned long long* __restrict__ sel_counts) {
     int t = blockIdx.x;
     int e = threadIdx.x;
-    __shared__ float p[512];
-    __shared__ float red[512];
-    __shared__ int s_ids[10];
-    __shared__ float s_ws[10];
+    __shared__ float p[CN_E];
+    __shared__ float red[CN_E];
+    __shared__ int s_ids[CN_TOPK];
+    __shared__ float s_ws[CN_TOPK];
     __shared__ float s_sum;
     __shared__ unsigned int s_cold;
-    float l = logits[(size_t)t * 512 + e];
+    float l = logits[(size_t)t * CN_E + e];
     red[e] = l;
     __syncthreads();
-    for (int st = 256; st > 0; st >>= 1) {
+    for (int st = CN_E / 2; st > 0; st >>= 1) {
         if (e < st) red[e] = fmaxf(red[e], red[e + st]);
         __syncthreads();
     }
@@ -3129,18 +3140,18 @@ extern "C" __global__ void router_top10(const float* __restrict__ logits,
     p[e] = ex;
     red[e] = ex;
     __syncthreads();
-    for (int st = 256; st > 0; st >>= 1) {
+    for (int st = CN_E / 2; st > 0; st >>= 1) {
         if (e < st) red[e] += red[e + st];
         __syncthreads();
     }
     p[e] = ex / red[0];
     if (e == 0) { s_sum = 0.0f; s_cold = 0; }
-    for (int j = 0; j < 10; j++) {
-        if (e == 0) s_ids[j] = 512;
+    for (int j = 0; j < CN_TOPK; j++) {
+        if (e == 0) s_ids[j] = CN_E;
         __syncthreads();
         red[e] = p[e];
         __syncthreads();
-        for (int st = 256; st > 0; st >>= 1) {
+        for (int st = CN_E / 2; st > 0; st >>= 1) {
             if (e < st) red[e] = fmaxf(red[e], red[e + st]);
             __syncthreads();
         }
@@ -3154,12 +3165,12 @@ extern "C" __global__ void router_top10(const float* __restrict__ logits,
         if (e == pick) p[e] = -1.0f;
         __syncthreads();
     }
-    if (e < 10) {
+    if (e < CN_TOPK) {
         int id = s_ids[e];
-        wts[t * 10 + e] = s_ws[e] / s_sum;
-        ids[t * 10 + e] = id;
-        gu_ptrs[t * 10 + e] = table[id * 2];
-        dn_ptrs[t * 10 + e] = table[id * 2 + 1];
+        wts[t * CN_TOPK + e] = s_ws[e] / s_sum;
+        ids[t * CN_TOPK + e] = id;
+        gu_ptrs[t * CN_TOPK + e] = table[id * 2];
+        dn_ptrs[t * CN_TOPK + e] = table[id * 2 + 1];
         atomicAdd(&sel_counts[id], 1ull);
         unsigned int bit = (bitmap[id >> 5] >> (id & 31)) & 1u;
         if (!bit) atomicOr(&s_cold, 1u << e);
@@ -3167,7 +3178,7 @@ extern "C" __global__ void router_top10(const float* __restrict__ logits,
     __syncthreads();
     if (e == 0) {
         cold_mask[t] = s_cold;
-        atomicAdd(&counters[0], 10ull);
+        atomicAdd(&counters[0], (unsigned long long)CN_TOPK);
         atomicAdd(&counters[1], (unsigned long long)__popc(s_cold));
     }
 }
@@ -3195,7 +3206,7 @@ extern "C" __global__ void stage_cold(const unsigned long long* __restrict__ gu_
     int which = blockIdx.y;
     int split = gridDim.z;
     int part = blockIdx.z;
-    int t = combo / 10, j = combo % 10;
+    int t = combo / CN_TOPK, j = combo % CN_TOPK;
     bool cold = (cold_mask[t] >> j) & 1u;
     size_t bytes = (size_t)(which ? *dn_bytes_p : *gu_bytes_p);
     const unsigned char* src = (const unsigned char*)(which ? dn_ptrs[combo] : gu_ptrs[combo]);
@@ -3268,7 +3279,7 @@ extern "C" __global__ void stage_cold_ca(const unsigned long long* __restrict__ 
         const size_t bytes = (size_t)(which ? *dn_bytes_p : *gu_bytes_p);
         const size_t ntile = bytes >> 12;      // host asserts bytes % 4096 == 0
         for (int combo = 0; combo < n_combo; ++combo) {
-            int tk = combo / 10, j = combo % 10;
+            int tk = combo / CN_TOPK, j = combo % CN_TOPK;
             bool cold = (cold_mask[tk] >> j) & 1u;
             const unsigned char* src = (const unsigned char*)(which ? dn_ptrs[combo] : gu_ptrs[combo]);
             unsigned char* dst = (which ? stage_dn : stage_gu) + (size_t)combo * bytes;
@@ -3335,15 +3346,15 @@ extern "C" __global__ void moe_plan(unsigned int* __restrict__ counts, int* __re
                                     int4* __restrict__ tiles, int* __restrict__ n_tiles,
                                     unsigned int* __restrict__ cursor, const int* __restrict__ tg_p,
                                     const int* __restrict__ max_tiles_p) {
-    __shared__ int s_off[513];
+    __shared__ int s_off[CN_E + 1];
     if (threadIdx.x == 0) {
         int run = 0;
-        for (int e = 0; e < 512; e++) { s_off[e] = run; run += (int)counts[e]; }
-        s_off[512] = run;
+        for (int e = 0; e < CN_E; e++) { s_off[e] = run; run += (int)counts[e]; }
+        s_off[CN_E] = run;
         int tg = *tg_p;
         int nt = 0, slot = 0, group_start = 0;
         int last_e = -1;
-        for (int e = 0; e < 512; e++) {
+        for (int e = 0; e < CN_E; e++) {
             int cnt = (int)counts[e];
             for (int s = 0; s < cnt; s += 8) {
                 if (nt >= *max_tiles_p) break;
@@ -3358,8 +3369,8 @@ extern "C" __global__ void moe_plan(unsigned int* __restrict__ counts, int* __re
         *n_tiles = nt;
     }
     __syncthreads();
-    for (int e = threadIdx.x; e < 513; e += blockDim.x) offsets[e] = s_off[e];
-    for (int e = threadIdx.x; e < 512; e += blockDim.x) { cursor[e] = 0u; counts[e] = 0u; }
+    for (int e = threadIdx.x; e < CN_E + 1; e += blockDim.x) offsets[e] = s_off[e];
+    for (int e = threadIdx.x; e < CN_E; e += blockDim.x) { cursor[e] = 0u; counts[e] = 0u; }
 }
 // perm[offsets[e] + k] = combo for the k-th combo routed to expert e
 extern "C" __global__ void moe_scatter(const int* __restrict__ ids, const int* __restrict__ offsets,
@@ -3506,9 +3517,9 @@ extern "C" __global__ void silu_tiles(const float* __restrict__ h1, float* __res
     int j = blockIdx.y;
     if (j >= tl.z) return;
     size_t c = (size_t)perm[tl.y + j];
-    for (int i = threadIdx.x; i < 640; i += blockDim.x) {
-        float gate = h1[c * 1280 + i];
-        h2[c * 640 + i] = (gate / (1.0f + expf(-gate))) * h1[c * 1280 + 640 + i];
+    for (int i = threadIdx.x; i < CN_INTER; i += blockDim.x) {
+        float gate = h1[c * (2 * CN_INTER) + i];
+        h2[c * CN_INTER + i] = (gate / (1.0f + expf(-gate))) * h1[c * (2 * CN_INTER) + CN_INTER + i];
     }
 }
 // per-combo activation quant (k=640) for the combos of tile group `group`:
@@ -3523,8 +3534,8 @@ extern "C" __global__ void quant_tiles(const float* __restrict__ h2, unsigned ch
     int j = blockIdx.y;
     if (j >= tl.z) return;
     size_t c = (size_t)perm[tl.y + j];
-    const int bpr = 10;
-    const float* xp = h2 + c * 640;
+    const int bpr = CN_INTER / 64;
+    const float* xp = h2 + c * CN_INTER;
     unsigned char* op = xq + c * XQ_ROW(bpr);
     quant_row_prescaled(xp, op, bpr); // whole-block early returns above are uniform
 }
@@ -3571,11 +3582,11 @@ extern "C" __global__ void mix_streams_q(const float* __restrict__ mixw, const f
     int c = blockIdx.x * 256 + threadIdx.x;
     int t = blockIdx.y;
     float acc = 0.0f;
-    for (int g = 0; g < 4; g++)
-        acc += mixw[t * 10240 + g * 2560 + c] * normed[t * 10240 + g * 2560 + c];
-    float v = acc * 0.25f;
-    out[t * 2560 + c] = v;
-    const int bpr = 40;
+    for (int g = 0; g < CN_HCN; g++)
+        acc += mixw[t * CN_HCT + g * CN_H + c] * normed[t * CN_HCT + g * CN_H + c];
+    float v = acc * (1.0f / CN_HCN);
+    out[t * CN_H + c] = v;
+    const int bpr = CN_H / 64;
     unsigned char* row = xq + (size_t)t * XQ_ROW(bpr);
     qf_store(v, row, bpr, c);
     if (c == 0) xq_set_rs(row, bpr, 1.0f); // unscaled row (fused producer)
@@ -3586,20 +3597,25 @@ extern "C" __global__ void rmsnorm_gated_q(const float* __restrict__ x, const fl
     int vhead = blockIdx.x;
     int t = blockIdx.y;
     int d = threadIdx.x;
-    const float* xp = x + ((size_t)t * 48 + vhead) * 128;
-    __shared__ float red[128];
+    const float* xp = x + ((size_t)t * CN_GDN_VHEADS + vhead) * CN_GDV;
+    __shared__ float red[CN_GDV];
     red[d] = xp[d] * xp[d];
     __syncthreads();
-    for (int st = 64; st > 0; st >>= 1) {
+    for (int st = CN_GDV / 2; st > 0; st >>= 1) {
         if (d < st) red[d] += red[d + st];
         __syncthreads();
     }
-    float rms = rsqrtf(red[0] / 128.0f + 1e-6f);
-    float gate = 1.0f / (1.0f + expf(-z[((size_t)t * 48 + vhead) * 128 + d]));
+    float rms = rsqrtf(red[0] / (float)CN_GDV + CN_EPS);
+#if CN_GATE_ACT == 0 // sigmoid (Flash-Next `output_gate_type` sigmoid)
+    float gate = 1.0f / (1.0f + expf(-z[((size_t)t * CN_GDN_VHEADS + vhead) * CN_GDV + d]));
+#else // swish = x * sigmoid(x) (the dense Qwen3.5 family: `swish` / `silu`)
+    float zg = z[((size_t)t * CN_GDN_VHEADS + vhead) * CN_GDV + d];
+    float gate = zg / (1.0f + expf(-zg));
+#endif
     float v = w[d] * xp[d] * rms * gate;
-    out[((size_t)t * 48 + vhead) * 128 + d] = v;
-    const int bpr = 96;
-    int e = vhead * 128 + d;
+    out[((size_t)t * CN_GDN_VHEADS + vhead) * CN_GDV + d] = v;
+    const int bpr = CN_GDN_VAL / 64;
+    int e = vhead * CN_GDV + d;
     unsigned char* row = xq + (size_t)t * XQ_ROW(bpr);
     qf_store(v, row, bpr, e);
     if (e == 0) xq_set_rs(row, bpr, 1.0f); // unscaled row (fused producer)
@@ -3610,8 +3626,8 @@ extern "C" __global__ void gate_mul_q(const float* __restrict__ core, const floa
     float g = gate[i];
     float v = core[i] / (1.0f + expf(-g));
     out[i] = v;
-    const int bpr = 96;
-    int t = i / 6144, e = i % 6144;
+    const int bpr = CN_CORE / 64;
+    int t = i / CN_CORE, e = i % CN_CORE;
     unsigned char* row = xq + (size_t)t * XQ_ROW(bpr);
     qf_store(v, row, bpr, e);
     if (e == 0) xq_set_rs(row, bpr, 1.0f); // unscaled row (fused producer)
@@ -3620,11 +3636,11 @@ extern "C" __global__ void silu_mul640_q(const float* __restrict__ h1, float* __
                                          unsigned char* __restrict__ xq) {
     int j = blockIdx.x * 256 + threadIdx.x;
     int t = blockIdx.y;
-    if (j >= 640) return; // whole warps (640 = 20 warps)
-    float gate = h1[t * 1280 + j];
-    float v = (gate / (1.0f + expf(-gate))) * h1[t * 1280 + 640 + j];
-    h2[t * 640 + j] = v;
-    const int bpr = 10;
+    if (j >= CN_INTER) return; // whole warps (640 = 20 warps)
+    float gate = h1[t * (2 * CN_INTER) + j];
+    float v = (gate / (1.0f + expf(-gate))) * h1[t * (2 * CN_INTER) + CN_INTER + j];
+    h2[t * CN_INTER + j] = v;
+    const int bpr = CN_INTER / 64;
     unsigned char* row = xq + (size_t)t * XQ_ROW(bpr);
     qf_store(v, row, bpr, j);
     if (j == 0) xq_set_rs(row, bpr, 1.0f); // unscaled row (fused producer)
@@ -3730,8 +3746,8 @@ extern "C" __global__ void sh_gate_up_q(const unsigned char* __restrict__ wg,
         if (j < rows) {
             float gate = sg_sh[j - tile];
             float v = (gate / (1.0f + expf(-gate))) * su_sh[j - tile];
-            h2[(size_t)tok * 640 + j] = v;
-            const int bprq = 10;
+            h2[(size_t)tok * CN_INTER + j] = v;
+            const int bprq = CN_INTER / 64;
             unsigned char* row = xq_s + (size_t)tok * XQ_ROW(bprq);
             qf_store(v, row, bprq, j);
             if (j == 0) xq_set_rs(row, bprq, 1.0f); // unscaled row (fused producer)
@@ -3818,12 +3834,12 @@ extern "C" __global__ void silu_mul_combo_q(const float* __restrict__ h1, float*
                                             const int* __restrict__ n640_p, unsigned char* __restrict__ xq) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= *n640_p) return; // n640 is a multiple of 640 -> whole warps
-    int c = i / 640;
-    int j = i % 640;
-    float gate = h1[(size_t)c * 1280 + j];
-    float v = (gate / (1.0f + expf(-gate))) * h1[(size_t)c * 1280 + 640 + j];
+    int c = i / CN_INTER;
+    int j = i % CN_INTER;
+    float gate = h1[(size_t)c * (2 * CN_INTER) + j];
+    float v = (gate / (1.0f + expf(-gate))) * h1[(size_t)c * (2 * CN_INTER) + CN_INTER + j];
     h2[i] = v;
-    const int bpr = 10;
+    const int bpr = CN_INTER / 64;
     unsigned char* row = xq + (size_t)c * XQ_ROW(bpr);
     qf_store(v, row, bpr, j);
     if (j == 0) xq_set_rs(row, bpr, 1.0f); // unscaled row (fused producer)
@@ -3884,7 +3900,7 @@ __device__ __forceinline__ void attn_sel_split_body(const float* __restrict__ q,
     int t = blockIdx.y;
     int split = blockIdx.z, S = gridDim.z;
     int d = threadIdx.x;
-    int kvh = head / 12;
+    int kvh = head / CN_GQA;
     int n = sel_n[t];
     if (n < 0) n = 0;
     if (n > *sel_max_p) n = *sel_max_p;
@@ -3892,8 +3908,8 @@ __device__ __forceinline__ void attn_sel_split_body(const float* __restrict__ q,
     int j_lo = split * per, j_hi = min(n, j_lo + per);
     int cnt = max(0, j_hi - j_lo);
     const int* list = sel + (size_t)t * *sel_max_p + j_lo;
-    const float* qt = q + ((size_t)t * 24 + head) * 256;
-    __shared__ float p[2051];
+    const float* qt = q + ((size_t)t * CN_NQ + head) * CN_AHD;
+    __shared__ float p[CN_QSA_SEL_MAX];
     __shared__ float red[256];
     __shared__ float lut[LUT ? 256 : 1];
     int mode = *mode_p;
@@ -3911,9 +3927,9 @@ __device__ __forceinline__ void attn_sel_split_body(const float* __restrict__ q,
             int tok = list[j];
             if (tok < 0) tok = 0;
             if (tok >= *tmax_p) tok = *tmax_p - 1;
-            const unsigned char* kp = kc + (size_t)(kvh * *tmax_p + tok) * 256 * (mode ? 2 : 1);
+            const unsigned char* kp = kc + (size_t)(kvh * *tmax_p + tok) * CN_AHD * (mode ? 2 : 1);
             float acc = 0.0f;
-            for (int e = lane; e < 256; e += 32) acc += qt[e] * kv_ld<LUT>(kp, e, mode, lut);
+            for (int e = lane; e < CN_AHD; e += 32) acc += qt[e] * kv_ld<LUT>(kp, e, mode, lut);
             for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
             if (lane == 0) p[j] = acc * scale;
         }
@@ -3943,11 +3959,11 @@ __device__ __forceinline__ void attn_sel_split_body(const float* __restrict__ q,
         int tok = list[j];
         if (tok < 0) tok = 0;
         if (tok >= *tmax_p) tok = *tmax_p - 1;
-        const unsigned char* vp = vc + (size_t)(kvh * *tmax_p + tok) * 256 * (mode ? 2 : 1);
+        const unsigned char* vp = vc + (size_t)(kvh * *tmax_p + tok) * CN_AHD * (mode ? 2 : 1);
         o += p[j] * kv_ld<LUT>(vp, d, mode, lut);
     }
-    size_t pi = ((size_t)t * 24 + head) * S + split;
-    part_o[pi * 256 + d] = o;
+    size_t pi = ((size_t)t * CN_NQ + head) * S + split;
+    part_o[pi * CN_AHD + d] = o;
     if (d == 0) { part_ml[pi * 2] = (cnt > 0) ? mx : -3.0e38f; part_ml[pi * 2 + 1] = (cnt > 0) ? sum : 0.0f; }
 }
 extern "C" __global__ void attn_sel_split(const float* __restrict__ q, const unsigned char* __restrict__ kc,
@@ -3984,16 +4000,16 @@ extern "C" __global__ void attn_merge(const float* __restrict__ part_o, const fl
     int t = blockIdx.y;
     int d = threadIdx.x;
     int S = *s_p;
-    size_t base = ((size_t)t * 24 + head) * S;
+    size_t base = ((size_t)t * CN_NQ + head) * S;
     float m = -3.0e38f;
     for (int s = 0; s < S; s++) m = fmaxf(m, part_ml[(base + s) * 2]);
     float L = 0.0f, o = 0.0f;
     for (int s = 0; s < S; s++) {
         float w = expf(part_ml[(base + s) * 2] - m);
         L += w * part_ml[(base + s) * 2 + 1];
-        o += w * part_o[(base + s) * 256 + d];
+        o += w * part_o[(base + s) * CN_AHD + d];
     }
-    out[((size_t)t * 24 + head) * 256 + d] = o / L;
+    out[((size_t)t * CN_NQ + head) * CN_AHD + d] = o / L;
 }
 
 // ---------------- low-bit cold tier expanders (CROW_COLD_TIER, A-P2) ----------------
@@ -4043,7 +4059,7 @@ extern "C" __global__ void stage_cold_lb(const unsigned long long* __restrict__ 
     int which = blockIdx.y;
     int split = gridDim.z;
     int part = blockIdx.z;
-    int t = combo / 10, j = combo % 10;
+    int t = combo / CN_TOPK, j = combo % CN_TOPK;
     bool cold = (cold_mask[t] >> j) & 1u;
     size_t bytes = (size_t)(which ? *dn_bytes_p : *gu_bytes_p); // NVFP4 bytes of the slab
     const unsigned char* src = (const unsigned char*)(which ? dn_ptrs[combo] : gu_ptrs[combo]);
@@ -4120,10 +4136,10 @@ extern "C" __global__ void gate_dot(const float* __restrict__ key, const float* 
     int s = blockIdx.x;
     int t = blockIdx.y;
     int d = threadIdx.x;
-    const float* kp = key + ((size_t)t * 4 + s) * 2560;
-    const float* qp = query + ((size_t)t * 4 + s) * 2560;
+    const float* kp = key + ((size_t)t * CN_HCN + s) * CN_H;
+    const float* qp = query + ((size_t)t * CN_HCN + s) * CN_H;
     float acc = 0.0f;
-    for (int i = d; i < 2560; i += 256) acc += kp[i] * qp[i];
+    for (int i = d; i < CN_H; i += 256) acc += kp[i] * qp[i];
     __shared__ float red[256];
     red[d] = acc;
     __syncthreads();
@@ -4131,7 +4147,7 @@ extern "C" __global__ void gate_dot(const float* __restrict__ key, const float* 
         if (d < st) red[d] += red[d + st];
         __syncthreads();
     }
-    if (d == 0) gate[t * 4 + s] = red[0] * rsqrtf(2560.0f);
+    if (d == 0) gate[t * CN_HCN + s] = red[0] * rsqrtf((float)CN_H);
 }
 extern "C" __global__ void gate_apply(const float* __restrict__ gate, const float* __restrict__ value,
                                       float* __restrict__ gate_signed, float* __restrict__ gated) {
@@ -4139,13 +4155,13 @@ extern "C" __global__ void gate_apply(const float* __restrict__ gate, const floa
     int t = blockIdx.y;
     int d = threadIdx.x;
     if (d == 0) {
-        float g = gate[t * 4 + s];
-        gate_signed[t * 4 + s] = sqrtf(fmaxf(fabsf(g), 1e-6f)) * ((g > 0.0f) - (g < 0.0f));
+        float g = gate[t * CN_HCN + s];
+        gate_signed[t * CN_HCN + s] = sqrtf(fmaxf(fabsf(g), 1e-6f)) * ((g > 0.0f) - (g < 0.0f));
     }
     __syncthreads();
-    float sg = 1.0f / (1.0f + expf(-gate_signed[t * 4 + s]));
-    for (int i = d; i < 2560; i += 256)
-        gated[((size_t)t * 4 + s) * 2560 + i] = sg * value[(size_t)t * 2560 + i];
+    float sg = 1.0f / (1.0f + expf(-gate_signed[t * CN_HCN + s]));
+    for (int i = d; i < CN_H; i += 256)
+        gated[((size_t)t * CN_HCN + s) * CN_H + i] = sg * value[(size_t)t * CN_H + i];
 }
 // dilated conv (k=4, dil=3, left state 9) with cross-chunk state + silu + add
 extern "C" __global__ void ple_conv(const float* __restrict__ gn, const float* __restrict__ w,
@@ -4158,18 +4174,18 @@ extern "C" __global__ void ple_conv(const float* __restrict__ gn, const float* _
         for (int k = 0; k < 4; k++) {
             int src = t + k * 3 - 9;
             float v;
-            if (src >= 0) v = gn[(size_t)src * 10240 + c];
+            if (src >= 0) v = gn[(size_t)src * CN_HCT + c];
             else v = state[(size_t)c * 9 + (9 + src)];
             acc += w[c * 4 + k] * v;
         }
-        out[(size_t)t * 10240 + c] =
-            gated[(size_t)t * 10240 + c] + acc / (1.0f + expf(-acc));
+        out[(size_t)t * CN_HCT + c] =
+            gated[(size_t)t * CN_HCT + c] + acc / (1.0f + expf(-acc));
     }
 }
 extern "C" __global__ void ple_state_update(const float* __restrict__ gn, float* __restrict__ state,
                                             const int* __restrict__ t_p) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= 10240) return;
+    if (c >= CN_HCT) return;
     int tt = *t_p;
     for (int j = 0; j < 9; j++) {
         int src = tt - 9 + j;
@@ -4177,7 +4193,7 @@ extern "C" __global__ void ple_state_update(const float* __restrict__ gn, float*
         // resume with a short suffix): the old row j + tt shifts down to j, what
         // ple_conv_step does after tt single steps. Ascending j reads slot j + tt
         // before it is overwritten.
-        state[c * 9 + j] = (src >= 0) ? gn[(size_t)src * 10240 + c] : state[c * 9 + j + tt];
+        state[c * 9 + j] = (src >= 0) ? gn[(size_t)src * CN_HCT + c] : state[c * 9 + j + tt];
     }
 }
 extern "C" __global__ void ple_conv_step(const float* __restrict__ gn_row,
@@ -4185,7 +4201,7 @@ extern "C" __global__ void ple_conv_step(const float* __restrict__ gn_row,
                                          const float* __restrict__ w, float* __restrict__ state,
                                          float* __restrict__ out_row) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= 10240) return;
+    if (c >= CN_HCT) return;
     float acc = w[c * 4 + 0] * state[c * 9 + 0] + w[c * 4 + 1] * state[c * 9 + 3]
               + w[c * 4 + 2] * state[c * 9 + 6] + w[c * 4 + 3] * gn_row[c];
     out_row[c] = gated_row[c] + acc / (1.0f + expf(-acc));
@@ -4977,8 +4993,8 @@ use crate::cuda;
 use cudarc::driver::sys::CUfunction;
 use std::collections::HashMap;
 
-/// Read `#define <name> <integer>` out of the FROZEN `KERNEL_SRC`.
-/// The CUDA source cannot change, so the Rust twins of its four `#define`s
+/// Read `#define <name> <integer>` out of `KERNEL_SRC` (the source itself, not
+/// the C4 geometry prelude). The Rust twins of its four `#define`s
 /// (`QSA_PAR_BINS`, `SAMPLE_MAXK`, `SAMPLE_PARTS`, `SAMPLE_THREADS`) are
 /// checked against it at boot instead of being trusted to a comment.
 pub fn define_u32(name: &str) -> u32 {
@@ -4993,14 +5009,123 @@ pub fn define_u32(name: &str) -> u32 {
         .unwrap_or_else(|_| panic!("{name}: #define is not a plain integer"))
 }
 
+/// Crow #300 C4: the model geometry the kernel source compiles with. The
+/// engine JITs `KERNEL_SRC` with NVRTC on every boot; `prelude()` puts one
+/// `#define CN_*` per shape in front of it, built from the runtime `Geo`.
+/// `docs/architecture.md` 8.2 (robin, 2026-09-25): for Flash-Next the PTX of
+/// every entry is byte-identical to the frozen pre-C4 source
+/// (`tests_300_c4`). The fields are public so a test can compile a shape no
+/// checkpoint of record has (the NKV 4 / GQA 6 and swish probes below).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KernelGeo {
+    pub d: crate::geo::Dims,
+    /// RMSNorm epsilon (`rms_norm_eps`); the l2norm, PLE clamp and ViT
+    /// LayerNorm `1e-6f` are formula constants and stay literals
+    pub eps: f32,
+    /// the GDN gated-norm activation (`output_gate_type`, HF
+    /// `RMSNormGated(activation=...)`); the attention output gate is sigmoid
+    /// in every family and stays a literal
+    pub gate_act: crate::geo::GateAct,
+    /// Crow #300 phase 2: append `kernels_p2::P2_SRC` (a family with a block
+    /// Flash-Next does not have: plain residual, full attention, dense FFN)
+    pub p2: bool,
+}
+
+impl KernelGeo {
+    /// panics by name (the `Geo` accessors, "Crow #300 C5") on a family whose
+    /// structure the engine does not build yet
+    pub fn of(geo: &crate::geo::Geo) -> KernelGeo {
+        let p2 = !matches!(
+            (geo.residual, geo.attn, geo.ffn),
+            (crate::geo::Residual::Hc { .. }, crate::geo::Attn::Qsa { .. }, crate::geo::Ffn::Moe { .. })
+        );
+        KernelGeo { d: geo.dims(), eps: geo.rms_eps as f32, gate_act: geo.gate_act, p2 }
+    }
+
+    pub fn flash_next() -> KernelGeo {
+        KernelGeo::of(&crate::geo::Geo::FLASH_NEXT)
+    }
+
+    /// the `#define`s, in prelude order: (name, C token)
+    pub fn defines(&self) -> Vec<(&'static str, String)> {
+        let d = &self.d;
+        let int = |v: usize| v.to_string();
+        // Crow #300 phase 2: a block the family does not have (no experts, no QSA
+        // indexer) is 0 in `Dims`; its kernels are still compiled (one KERNEL_SRC for
+        // every family) but never launched, and their shared arrays and divisors need
+        // a value > 0. Compile-only 1; on Flash-Next every such field is > 0, so its
+        // prelude is unchanged
+        let cpl = |v: usize| v.max(1).to_string();
+        let f32_lit = |v: f32| {
+            // shortest round-trip form, always with an exponent or a point
+            let s = format!("{v:e}");
+            format!("{s}f")
+        };
+        vec![
+            ("CN_H", int(d.h)),
+            ("CN_HCN", int(d.hcn)),
+            ("CN_HCT", int(d.hct)),
+            ("CN_E", cpl(d.e)),
+            ("CN_TOPK", cpl(d.topk)),
+            ("CN_INTER", cpl(d.inter)),
+            ("CN_GDN_KHEADS", int(d.gdn_kheads)),
+            ("CN_GDN_VHEADS", int(d.gdn_vheads)),
+            ("CN_GD", int(d.gd)),
+            ("CN_GDV", int(d.gdv)),
+            ("CN_GDN_KEY", int(d.gdn_key)),
+            ("CN_GDN_VAL", int(d.gdn_val)),
+            ("CN_GDN_CONV", int(d.gdn_conv)),
+            ("CN_NQ", int(d.nq)),
+            ("CN_NKV", int(d.nkv)),
+            ("CN_GQA", int(d.nq / d.nkv)),
+            ("CN_AHD", int(d.ahd)),
+            ("CN_Q_ROWS", int(d.q_rows)),
+            ("CN_CORE", int(d.core)),
+            ("CN_ATTN_SCALE", f32_lit(1.0 / (d.ahd as f32).sqrt())),
+            ("CN_ROPE_PAIRS", int(d.rope_pairs)),
+            ("CN_QSA_HEADS", cpl(d.qsa_heads)),
+            ("CN_QSA_HD", cpl(d.qsa_hd)),
+            ("CN_QSA_QK_ROWS", cpl(d.qsa_qk_rows)),
+            ("CN_QSA_SEL_MAX", cpl(d.qsa_sel_max)),
+            ("CN_EPS", f32_lit(self.eps)),
+            (
+                "CN_GATE_ACT",
+                match self.gate_act {
+                    crate::geo::GateAct::Sigmoid => "0".into(),
+                    crate::geo::GateAct::Silu => "1".into(),
+                },
+            ),
+        ]
+    }
+
+    /// the `#define` block `source()` puts in front of `KERNEL_SRC`
+    pub fn prelude(&self) -> String {
+        let mut s = String::from("// Crow #300 C4: kernels::KernelGeo::prelude()\n");
+        for (name, v) in self.defines() {
+            s.push_str(&format!("#define {name} {v}\n"));
+        }
+        s
+    }
+
+    /// the text NVRTC compiles: the prelude, then `KERNEL_SRC` (then, for a
+    /// phase 2 family, `kernels_p2::P2_SRC`; Flash-Next's text is unchanged)
+    pub fn source(&self) -> String {
+        if self.p2 {
+            format!("{}{}{}", self.prelude(), KERNEL_SRC, crate::kernels_p2::P2_SRC)
+        } else {
+            format!("{}{}", self.prelude(), KERNEL_SRC)
+        }
+    }
+}
+
 pub struct Kernels {
     map: HashMap<&'static str, CUfunction>,
 }
 
 impl Kernels {
-    /// Every kernel the host LAUNCHES, resolved once. The frozen KERNEL_SRC defines
+    /// Every kernel the host LAUNCHES, resolved once. KERNEL_SRC defines
     /// more (six of them have no launch site left); this list is the launched set.
-    pub unsafe fn new(module: &crate::cuda::Module) -> Kernels {
+    pub unsafe fn new(module: &crate::cuda::Module, p2: bool) -> Kernels {
         let names: &[&'static str] = &[
             "gemv_b", "gemv_fp4", "gemv_fp4_b", "gemv_fp4_bs", "gemv_fp4_ptrb", "gemv_bf16",
             "rms_group", "rmsnorm_1pw", "silu_div4",
@@ -5022,6 +5147,13 @@ impl Kernels {
         let mut map = HashMap::new();
         for n in names {
             map.insert(*n, module.get(n));
+        }
+        // Crow #300 phase 2: a family whose source carries `P2_SRC` resolves its entries
+        // too; `Module::get` of a missing entry fails, so the Flash-Next module is never asked
+        if p2 {
+            for n in crate::kernels_p2::P2_NAMES {
+                map.insert(*n, module.get(n));
+            }
         }
         // #96: arm the YaRN runtime attention scale. With no rope_scaling (the
         // checkpoint of record) nothing below runs — no upload, no substitution,
@@ -5307,12 +5439,11 @@ pub mod act_cascade {
 #[cfg(test)]
 mod tests_96 {
     //! #96: the kernel-source gate. NVRTC is a HOST-side compiler: this parses
-    //! and compiles the frozen KERNEL_SRC to PTX with no CUDA context, no GPU
+    //! and compiles KERNEL_SRC (behind the Flash-Next prelude, C4) to PTX with no CUDA context, no GPU
     //! and no pinned allocation — the earliest possible gate on a CUDA error in
     //! the runtime-scale twins. The PTX text then carries the two byte-identity
     //! claims of the issue: every kernel of record folds the 0.0625f immediate
     //! and never touches the runtime global; the _y twins load it.
-    use super::KERNEL_SRC;
 
     /// the PTX text of one entry, from its `.entry <name>(` to the closing
     /// brace at column 0 (inner braces are indented in PTX)
@@ -5333,7 +5464,7 @@ mod tests_96 {
             options: vec!["--gpu-architecture=compute_120a".into()],
             ..Default::default()
         };
-        let ptx = cudarc::nvrtc::compile_ptx_with_opts(KERNEL_SRC, opts)
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(super::KernelGeo::flash_next().source(), opts)
             .expect("nvrtc compile")
             .to_src();
         assert!(ptx.contains(".entry set_attn_scale"), "the #96 boot setter must exist");
@@ -5562,5 +5693,441 @@ mod tests_act_prescale {
         // no kernel outside these reads xq rows (the stride literal is gone)
         assert!(!KERNEL_SRC.contains("* bpr * 108"));
         assert!(!KERNEL_SRC.contains("* bprq * 108"));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_300_c4 {
+    //! Crow #300 phase 1 C4: the PTX of record. `docs/architecture.md` 8.2
+    //! (robin, 2026-09-25): the kernel SOURCE may take its geometry from a
+    //! per-boot prelude, but for Flash-Next the NVRTC output of every kernel
+    //! entry must stay byte-identical to the PTX of the frozen pre-C4 source.
+    //! `tests/fixtures/kernels-3154b3b.cu` is that source, cut byte-exact out of
+    //! `kernels.rs` at `3154b3b`; `tests/fixtures/ptx-manifest-3154b3b.txt`
+    //! records its sha256, the NVRTC version, the whole-module PTX sha256 and one
+    //! `<entry> <sha256>` row per `.entry`, as compiled on 2026-09-26.
+    //! Both sides are compiled here with the engine's one option set
+    //! (`cuda::compile`), no CUDA context and no GPU: NVRTC is a host compiler.
+    use sha2::{Digest, Sha256};
+
+    pub(crate) const FROZEN: &str = include_str!("../tests/fixtures/kernels-3154b3b.cu");
+    const MANIFEST: &str = include_str!("../tests/fixtures/ptx-manifest-3154b3b.txt");
+
+    pub(crate) fn sha(s: &str) -> String {
+        Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// the engine's option set, the one `cuda::compile` passes
+    pub(crate) fn ptx(src: &str) -> String {
+        let opts = cudarc::nvrtc::CompileOptions {
+            options: vec!["--gpu-architecture=compute_120a".into()],
+            ..Default::default()
+        };
+        cudarc::nvrtc::compile_ptx_with_opts(src, opts).expect("nvrtc compile").to_src()
+    }
+
+    pub(crate) fn nvrtc_version() -> String {
+        let (mut a, mut b) = (0, 0);
+        let r = unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut a, &mut b) };
+        assert_eq!(r, cudarc::nvrtc::sys::nvrtcResult::NVRTC_SUCCESS);
+        format!("{a}.{b}")
+    }
+
+    /// every `.entry` of a PTX module, in module order: (name, body from the
+    /// `.entry` line to the closing brace at column 0)
+    pub(crate) fn entries(ptx: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while let Some(i) = ptx[at..].find(".entry ") {
+            let start = at + i;
+            let name_end = start + ptx[start..].find('(').expect("an .entry has a parameter list");
+            let name = ptx[start + ".entry ".len()..name_end].trim().to_string();
+            let end = ptx[start..].find("\n}\n").map(|e| start + e + 3).unwrap_or(ptx.len());
+            out.push((name, ptx[start..end].to_string()));
+            at = end;
+        }
+        out
+    }
+
+    /// the manifest rows: (key, value) for `source`, `nvrtc`, `module`, then
+    /// `entry <name> <sha256>`
+    fn manifest() -> (String, String, String, Vec<(String, String)>) {
+        let (mut source, mut nvrtc, mut module, mut rows) = (String::new(), String::new(), String::new(), Vec::new());
+        for l in MANIFEST.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()) {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            match f[0] {
+                "source" => source = f[1].to_string(),
+                "nvrtc" => nvrtc = f[1].to_string(),
+                "module" => module = f[1].to_string(),
+                "entry" => rows.push((f[1].to_string(), f[2].to_string())),
+                k => panic!("unknown manifest row {k}"),
+            }
+        }
+        (source, nvrtc, module, rows)
+    }
+
+    /// the table of differing entries between two PTX modules; empty = identical
+    pub(crate) fn diff_table(of_record: &[(String, String)], now: &[(String, String)]) -> Vec<String> {
+        let mut bad = Vec::new();
+        let names_r: Vec<&str> = of_record.iter().map(|(n, _)| n.as_str()).collect();
+        let names_n: Vec<&str> = now.iter().map(|(n, _)| n.as_str()).collect();
+        if names_r != names_n {
+            bad.push(format!("entry list differs: {} of record, {} now", names_r.len(), names_n.len()));
+        }
+        for (n, h) in of_record {
+            match now.iter().find(|(m, _)| m == n) {
+                None => bad.push(format!("{n:<24} of record {}  now MISSING", &h[..12])),
+                Some((_, g)) if g != h => bad.push(format!("{n:<24} of record {}  now {}", &h[..12], &g[..12])),
+                _ => {}
+            }
+        }
+        bad
+    }
+
+    /// the source the engine compiles for Flash-Next: the prelude of
+    /// `Geo::FLASH_NEXT`, then `KERNEL_SRC`
+    pub(crate) fn flash_next_source() -> String {
+        super::KernelGeo::flash_next().source()
+    }
+
+    #[test]
+    fn the_frozen_fixture_is_the_source_of_record() {
+        let (source, _, _, rows) = manifest();
+        assert_eq!(sha(FROZEN), source, "tests/fixtures/kernels-3154b3b.cu is not the frozen pre-C4 source");
+        assert_eq!(rows.len(), 130, "the manifest must carry every .entry of the frozen source");
+    }
+
+    #[test]
+    fn the_ptx_of_record_is_byte_identical_for_every_entry() {
+        let frozen = ptx(FROZEN);
+        let now = ptx(&flash_next_source());
+        let hash = |p: &str| entries(p).into_iter().map(|(n, b)| (n, sha(&b))).collect::<Vec<_>>();
+        let (fr, nw) = (hash(&frozen), hash(&now));
+        assert_eq!(fr.len(), 130, "the frozen source compiles to 130 entries");
+        let bad = diff_table(&fr, &nw);
+        assert!(
+            bad.is_empty(),
+            "{} of {} kernel entries differ from the PTX of record (Flash-Next prelude vs kernels-3154b3b.cu):\n{}",
+            bad.len(),
+            fr.len(),
+            bad.join("\n")
+        );
+        assert_eq!(sha(&frozen), sha(&now), "the whole PTX module differs outside the entries");
+        // the recorded manifest, when this machine runs the NVRTC it was recorded with
+        let (_, nvrtc, module, rows) = manifest();
+        if nvrtc_version() == nvrtc {
+            let bad = diff_table(&rows, &nw);
+            assert!(bad.is_empty(), "{} entries differ from the recorded manifest:\n{}", bad.len(), bad.join("\n"));
+            assert_eq!(sha(&now), module, "the whole-module PTX differs from the recorded manifest");
+        } else {
+            println!("NVRTC {} != manifest NVRTC {nvrtc}: the recorded hashes are not comparable; the frozen-source comparison above still holds", nvrtc_version());
+        }
+    }
+
+    /// every `CN_*` token the source reads, in first-use order
+    fn macros_used(src: &str) -> Vec<String> {
+        let b = src.as_bytes();
+        let mut out: Vec<String> = Vec::new();
+        let mut i = 0;
+        while let Some(k) = src[i..].find("CN_") {
+            let s = i + k;
+            let mut e = s + 3;
+            while e < b.len() && (b[e].is_ascii_uppercase() || b[e].is_ascii_digit() || b[e] == b'_') {
+                e += 1;
+            }
+            let word_start = s == 0 || !(b[s - 1].is_ascii_alphanumeric() || b[s - 1] == b'_');
+            if e > s + 3 && word_start && !out.iter().any(|m| m == &src[s..e]) {
+                out.push(src[s..e].to_string());
+            }
+            i = e;
+        }
+        out
+    }
+
+    #[test]
+    fn the_prelude_defines_exactly_the_macros_the_source_reads() {
+        let mut used = macros_used(super::KERNEL_SRC);
+        let mut defined: Vec<String> = super::KernelGeo::flash_next().defines().into_iter().map(|(n, _)| n.to_string()).collect();
+        used.sort();
+        defined.sort();
+        assert_eq!(used, defined, "a CN_ macro the source reads is not defined, or a define is dead");
+        assert_eq!(defined.len(), 27);
+    }
+
+    #[test]
+    fn the_bare_source_refuses_to_compile() {
+        let opts = cudarc::nvrtc::CompileOptions {
+            options: vec!["--gpu-architecture=compute_120a".into()],
+            ..Default::default()
+        };
+        let err = cudarc::nvrtc::compile_ptx_with_opts(super::KERNEL_SRC, opts).expect_err("KERNEL_SRC without the prelude must not compile");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("KERNEL_SRC compiles only behind kernels::KernelGeo::prelude()"), "{msg}");
+    }
+
+    #[test]
+    fn the_flash_next_prelude_is_the_geometry_of_record() {
+        let want = "\
+// Crow #300 C4: kernels::KernelGeo::prelude()
+#define CN_H 2560
+#define CN_HCN 4
+#define CN_HCT 10240
+#define CN_E 512
+#define CN_TOPK 10
+#define CN_INTER 640
+#define CN_GDN_KHEADS 16
+#define CN_GDN_VHEADS 48
+#define CN_GD 128
+#define CN_GDV 128
+#define CN_GDN_KEY 2048
+#define CN_GDN_VAL 6144
+#define CN_GDN_CONV 10240
+#define CN_NQ 24
+#define CN_NKV 2
+#define CN_GQA 12
+#define CN_AHD 256
+#define CN_Q_ROWS 12288
+#define CN_CORE 6144
+#define CN_ATTN_SCALE 6.25e-2f
+#define CN_ROPE_PAIRS 32
+#define CN_QSA_HEADS 4
+#define CN_QSA_HD 128
+#define CN_QSA_QK_ROWS 640
+#define CN_QSA_SEL_MAX 2051
+#define CN_EPS 1e-6f
+#define CN_GATE_ACT 0
+";
+        assert_eq!(super::KernelGeo::flash_next().prelude(), want);
+    }
+
+    /// the entries whose PTX differs between two geometries
+    fn moved(a: &super::KernelGeo, b: &super::KernelGeo) -> Vec<String> {
+        let (pa, pb) = (ptx(&a.source()), ptx(&b.source()));
+        let (ea, eb) = (entries(&pa), entries(&pb));
+        assert_eq!(ea.len(), eb.len());
+        ea.iter().zip(eb.iter()).filter(|(x, y)| x.1 != y.1).map(|(x, _)| x.0.clone()).collect()
+    }
+
+    /// The two C4 generalisations change the PTX of exactly the kernels that
+    /// read them, and of nothing else: the swish branch moves the two GDN
+    /// gated norms (and would move nothing if the `#if CN_GATE_ACT` hunk were
+    /// missing), and 4 KV heads (GQA 6, the dense 27B shape) move `store_kv`
+    /// plus every attention variant that maps a query head to its KV head.
+    #[test]
+    fn a_geometry_change_moves_exactly_the_kernels_that_read_it() {
+        let base = super::KernelGeo::flash_next();
+        let swish = super::KernelGeo { gate_act: crate::geo::GateAct::Silu, ..base };
+        assert_eq!(moved(&base, &swish), ["rmsnorm_gated", "rmsnorm_gated_q"]);
+        let mut kv4 = base;
+        kv4.d.nkv = 4;
+        kv4.d.kv_rows = 4 * kv4.d.ahd;
+        let want: Vec<&str> = vec![
+            "store_kv", "attn_sel", "attn_sel_y", "attn_sel_r", "attn_sel_r_y", "attn_sel_d8", "attn_sel_d8_y",
+            "attn_sel_d9", "attn_sel_d9_y", "attn_sel_s", "attn_sel_s_y", "attn_sel_s8", "attn_sel_s8_y",
+            "attn_sel_s8l", "attn_sel_s8l_y", "attn_sel_g", "attn_sel_g_y",
+            "attn_sel_split", "attn_sel_split_y", "attn_sel_split_l", "attn_sel_split_l_y",
+        ];
+        let mut got = moved(&base, &kv4);
+        got.sort();
+        let mut want: Vec<String> = want.into_iter().map(String::from).collect();
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    /// prints the manifest rows; the fixture was written from this once, at
+    /// `3154b3b`. Never regenerate it to make the test above pass.
+    #[test]
+    #[ignore]
+    fn print_the_manifest_of_the_frozen_source() {
+        let p = ptx(FROZEN);
+        println!("source {}", sha(FROZEN));
+        println!("nvrtc {}", nvrtc_version());
+        println!("module {}", sha(&p));
+        for (n, b) in entries(&p) {
+            println!("entry {n} {}", sha(&b));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_300_c4_gpu {
+    //! Crow #300 C4: the two generalisations no Flash-Next gate exercises, run
+    //! on synthetic data against a CPU reference (the qsa_probe pattern: no
+    //! model, no container). `#[ignore]`: CI has no GPU and the gate counts the
+    //! host tests. Run with
+    //! `cargo test --release tests_300_c4_gpu -- --ignored --nocapture`.
+    use super::{launch_sync, KernelGeo};
+    use crate::cuda;
+    use crate::geo::GateAct;
+    use crate::sample::Rng;
+
+    fn fill(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut r = Rng::new(seed);
+        (0..n).map(|_| ((r.next_f64() * 2.0 - 1.0) as f32) * scale).collect()
+    }
+
+    fn sigmoid(x: f64) -> f64 {
+        1.0 / (1.0 + (-x).exp())
+    }
+
+    /// the GDN gated RMSNorm: w * x * rms(x) * act(z), per value head
+    fn gated_norm_ref(x: &[f32], z: &[f32], w: &[f32], gdv: usize, eps: f64, act: GateAct) -> Vec<f64> {
+        let mut out = vec![0f64; x.len()];
+        for (row, (xr, zr)) in x.chunks(gdv).zip(z.chunks(gdv)).enumerate() {
+            let ms = xr.iter().map(|&v| v as f64 * v as f64).sum::<f64>() / gdv as f64;
+            let rms = 1.0 / (ms + eps).sqrt();
+            for d in 0..gdv {
+                let zg = zr[d] as f64;
+                let gate = match act {
+                    GateAct::Sigmoid => sigmoid(zg),
+                    GateAct::Silu => zg * sigmoid(zg),
+                };
+                out[row * gdv + d] = w[d] as f64 * xr[d] as f64 * rms * gate;
+            }
+        }
+        out
+    }
+
+    fn max_rel(got: &[f32], want: &[f64]) -> f64 {
+        got.iter().zip(want).map(|(&g, &w)| (g as f64 - w).abs() / w.abs().max(1e-3)).fold(0.0, f64::max)
+    }
+
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release tests_300_c4_gpu -- --ignored --nocapture"]
+    fn the_swish_gate_matches_the_cpu_reference_and_the_sigmoid_one_is_unchanged() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let base = KernelGeo::flash_next();
+            let (vh, gdv, t) = (base.d.gdn_vheads, base.d.gdv, 3usize);
+            let n = t * vh * gdv;
+            let (x, z, w) = (fill(n, 0xC4A1, 3.0), fill(n, 0xC4A2, 6.0), fill(gdv, 0xC4A3, 1.5));
+            let (xd, zd, wd) = (cuda::to_f32_dev(&x), cuda::to_f32_dev(&z), cuda::to_f32_dev(&w));
+            let mut outs = Vec::new();
+            for act in [GateAct::Sigmoid, GateAct::Silu] {
+                let kg = KernelGeo { gate_act: act, ..base };
+                let module = cuda::compile(&kg.source());
+                let want = gated_norm_ref(&x, &z, &w, gdv, kg.eps as f64, act);
+                // the plain kernel and the fused-quant twin write the same f32 row
+                let out = cuda::alloc_zeroed(n * 4);
+                launch_sync(module.get("rmsnorm_gated"), vh as u32, t as u32, 1, gdv as u32, &[xd, zd, wd, out]);
+                let got = cuda::dtoh(out, n);
+                let e = max_rel(&got, &want);
+                let outq = cuda::alloc_zeroed(n * 4);
+                let bpr = base.d.gdn_val / 64;
+                let xq = cuda::alloc_zeroed(t * super::act_cascade::xq_row_bytes(bpr));
+                launch_sync(module.get("rmsnorm_gated_q"), vh as u32, t as u32, 1, gdv as u32, &[xd, zd, wd, outq, xq]);
+                let gotq = cuda::dtoh(outq, n);
+                let eq = max_rel(&gotq, &want);
+                println!("{act:?}: rmsnorm_gated max rel err {e:.3e}, rmsnorm_gated_q {eq:.3e}");
+                assert!(e < 1e-5 && eq < 1e-5, "{act:?}: {e:.3e} / {eq:.3e} against the CPU reference");
+                assert_eq!(got, gotq, "{act:?}: the fused twin writes the same f32");
+                outs.push(got);
+            }
+            // the swish path is a different function: not a relabelled sigmoid
+            let diff = outs[0].iter().zip(&outs[1]).filter(|(a, b)| a != b).count();
+            assert!(diff > n / 2, "swish and sigmoid agree on {} of {n} values", n - diff);
+        }
+    }
+
+    /// bf16 round-to-nearest-even, the kernel's `f32_bf16_bits`
+    fn bf16(v: f32) -> u16 {
+        let x = v.to_bits();
+        (x.wrapping_add(0x7FFF + ((x >> 16) & 1)) >> 16) as u16
+    }
+
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release tests_300_c4_gpu -- --ignored --nocapture"]
+    fn store_kv_and_attention_at_4_kv_heads_gqa_6_match_the_cpu_reference() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut kg = KernelGeo::flash_next();
+            kg.d.nkv = 4; // the dense 27B shape: 24 q heads / 4 kv heads = GQA 6
+            kg.d.kv_rows = kg.d.nkv * kg.d.ahd;
+            let (nq, nkv, ahd) = (kg.d.nq, kg.d.nkv, kg.d.ahd);
+            let gqa = nq / nkv;
+            assert_eq!(gqa, 6);
+            let module = cuda::compile(&kg.source());
+            let (t, tmax, slot0, sel_max) = (5usize, 16usize, 3usize, 8usize);
+            let kr = fill(t * nkv * ahd, 0xC4B1, 2.0);
+            let vr = fill(t * nkv * ahd, 0xC4B2, 2.0);
+            let q = fill(t * nq * ahd, 0xC4B3, 1.0);
+            let (krd, vrd, qd) = (cuda::to_f32_dev(&kr), cuda::to_f32_dev(&vr), cuda::to_f32_dev(&q));
+            // token t attends to the rows written so far: slots slot0 ..= slot0 + t
+            let mut sel = vec![0i32; t * sel_max];
+            let mut sel_n = vec![0i32; t];
+            for ti in 0..t {
+                for j in 0..=ti {
+                    sel[ti * sel_max + j] = (slot0 + j) as i32;
+                }
+                sel_n[ti] = ti as i32 + 1;
+            }
+            let (seld, seln) = (cuda::to_i32_dev(&sel), cuda::to_i32_dev(&sel_n));
+            let (slot_p, tmax_p, selmax_p) =
+                (cuda::to_i32_dev(&[slot0 as i32]), cuda::to_i32_dev(&[tmax as i32]), cuda::to_i32_dev(&[sel_max as i32]));
+            for mode in [0usize, 1] {
+                let esz = if mode == 0 { 1 } else { 2 };
+                let bytes = nkv * tmax * ahd * esz;
+                let (kc, vc) = (cuda::alloc_zeroed(bytes), cuda::alloc_zeroed(bytes));
+                let mode_p = cuda::to_i32_dev(&[mode as i32]);
+                // store_kv: grid (2 * NKV, T), block AHD (the gen.rs launch)
+                launch_sync(module.get("store_kv"), (2 * nkv) as u32, t as u32, 1, ahd as u32, &[krd, vrd, kc, vc, slot_p, tmax_p, mode_p]);
+                let (kb, vb): (Vec<u8>, Vec<u8>) = (cuda::dtoh_t(kc, bytes), cuda::dtoh_t(vc, bytes));
+                // the CPU layout: cache[kvh][slot][AHD], source row [t][kvh][AHD]
+                let dec = |c: &[u8], kvh: usize, slot: usize, e: usize| -> f32 {
+                    let i = (kvh * tmax + slot) * ahd + e;
+                    if mode == 0 { crate::cnq::e4m3_to_f32(c[i]) } else { f32::from_bits((u16::from_le_bytes([c[2 * i], c[2 * i + 1]]) as u32) << 16) }
+                };
+                let mut stored = 0;
+                for (cache, src) in [(&kb, &kr), (&vb, &vr)] {
+                    for slot in 0..tmax {
+                        for kvh in 0..nkv {
+                            for e in 0..ahd {
+                                let i = (kvh * tmax + slot) * ahd + e;
+                                let want: Vec<u8> = if (slot0..slot0 + t).contains(&slot) {
+                                    let v = src[((slot - slot0) * nkv + kvh) * ahd + e];
+                                    stored += 1;
+                                    if mode == 0 { vec![crate::cnq::f32_to_e4m3(v)] } else { bf16(v).to_le_bytes().to_vec() }
+                                } else {
+                                    vec![0; esz]
+                                };
+                                assert_eq!(&cache[i * esz..(i + 1) * esz], &want[..], "mode {mode}: kvh {kvh} slot {slot} e {e}");
+                            }
+                        }
+                    }
+                }
+                assert_eq!(stored, 2 * t * nkv * ahd);
+                // attn_sel: grid (NQ, T), block AHD; query head h reads KV head h / GQA
+                let out = cuda::alloc_zeroed(t * nq * ahd * 4);
+                launch_sync(module.get("attn_sel"), nq as u32, t as u32, 1, ahd as u32, &[qd, kc, vc, seld, seln, tmax_p, mode_p, selmax_p, out]);
+                let got = cuda::dtoh(out, t * nq * ahd);
+                let reference = |ratio: usize| -> Vec<f64> {
+                    let mut o = vec![0f64; t * nq * ahd];
+                    for ti in 0..t {
+                        for h in 0..nq {
+                            let kvh = h / ratio;
+                            let qh = &q[(ti * nq + h) * ahd..(ti * nq + h + 1) * ahd];
+                            let toks: Vec<usize> = (0..=ti).map(|j| slot0 + j).collect();
+                            let s: Vec<f64> = toks
+                                .iter()
+                                .map(|&tok| (0..ahd).map(|e| qh[e] as f64 * dec(&kb, kvh, tok, e) as f64).sum::<f64>() * 0.0625)
+                                .collect();
+                            let mx = s.iter().cloned().fold(f64::MIN, f64::max);
+                            let p: Vec<f64> = s.iter().map(|v| (v - mx).exp()).collect();
+                            let z: f64 = p.iter().sum();
+                            for e in 0..ahd {
+                                o[(ti * nq + h) * ahd + e] =
+                                    toks.iter().zip(&p).map(|(&tok, pj)| pj / z * dec(&vb, kvh, tok, e) as f64).sum();
+                            }
+                        }
+                    }
+                    o
+                };
+                let err = |r: &[f64]| got.iter().zip(r).map(|(&g, &w)| (g as f64 - w).abs()).fold(0.0, f64::max);
+                let (e6, e12) = (err(&reference(gqa)), err(&reference(12)));
+                println!("mode {mode}: store_kv {stored} values exact; attn_sel max abs err {e6:.3e} at GQA 6 (the Flash-Next head / 12 mapping would be off by {e12:.3e})");
+                assert!(e6 < 1e-4, "mode {mode}: attn_sel at GQA 6 off by {e6:.3e}");
+                assert!(e12 > 1e-2, "mode {mode}: the reference cannot tell GQA 6 from 12 ({e12:.3e})");
+            }
+        }
     }
 }

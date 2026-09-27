@@ -157,6 +157,107 @@ ModelOpt's `--calib_all_experts` idea with real traffic instead of synthetic sam
   VRAM; the hard hot-set ceiling drops from ~177 to ~169 experts/layer (default 160
   unchanged, loader auto-clamps).
 
+### 1.7 Container index v2 and the per-model recipe (Crow #300 phase 1, C6, 2026-09-26)
+
+The container layout of 1.2 is unchanged: magic `CNQ1`, 8 reserved bytes, the streamed
+payload, the index JSON as a trailer, the `u64` LE index length. What changed is the index,
+and which indexes the engine accepts.
+
+**Index v2** (`converter/src/main.rs` `index_v2`, `converter/src/recipe.rs`):
+
+| key | content |
+|---|---|
+| `format` | `crow-nest-quant`, as in v1 |
+| `format_version` | `2`. Replaces v1's `version: 1`; its presence is what makes an index v2 |
+| `recipe` | the family row that decided every tensor's dtype: `cnq4.5-flash-next` or `cnq4.5-qwen35-dense` |
+| `scales` | the sub-block scale policy, `ceil` or `mse` |
+| `model.family` | the engine's family name (`meta::Family`): `FlashNext` or `Qwen35Dense` |
+| `model.model_type` | `text_config.model_type` of the config |
+| `model.config_json`, `model.generation_config_json` | the checkpoint's two files **verbatim**, as JSON strings: a string survives the round trip byte for byte, a re-serialized object would not (key order, number format, whitespace) |
+| `model.config_json_sha256`, `model.generation_config_json_sha256` | the sha256 of those bytes; the engine refuses a v2 whose stored config no longer hashes to it |
+| `model.geo` | the converter's derived geometry (hidden, layers, attention and GDN layer counts, heads, GQA, FFN, vocab, vision widths). Informational: the engine derives its own `Geo` from `config_json` |
+| `model.source.repo`, `model.source.revision` | the Hugging Face repo (`--source-repo`, required) and revision (`--revision`, else the `hf download --local-dir` cache, `.cache/huggingface/trees/<revision>.json`) |
+| `model.source.shards[]` | per source shard: `file`, `size`, `sha256`, `sha256_from` = `hf-lfs` (the LFS sha256 Hugging Face recorded, taken when its size equals the file on disk) or `computed` (hashed during the conversion) |
+| `block_geometry`, `blob_offset`, `tensors` | unchanged from v1 |
+| `sections` | only the sections the container has (a dense model has no `ple`, and no `vit`: the dense recipe omits the vision tower, the 27B uses `mmproj-F16.gguf`) |
+
+New tensor dtype `f32` (4 B per value, raw LE): the dense recipe's `A_log`, widened exactly
+from the BF16 source. `Cnq::byte_len` and `Cnq::read_f32` know it.
+
+**The v1 rule** (robin, 2026-09-25: the old container stays unchanged). A v1 index carries no
+model block. `engine/src/cnq.rs` accepts one only when the sha256 of its index trailer (the
+`index_len` JSON bytes, without the length word) equals `CNQ45M_INDEX_SHA256` =
+`a21afc43203d983e46be5dd378ac5fb34581ab31fb5a0f6e8093d4730078c4ba` (473,528 B), the trailer of
+`Qwen3.8-Flash-Next-CNQ4.5-M.cnq` (104,727,179,972 B), computed 2026-09-26 by `Cnq::open` on
+the real file and independently with `tail -c 473536 | head -c 473528 | sha256sum`. Any other
+v1 index is refused at `Cnq::open`: "CNQ index v1 is only accepted for the Flash-Next CNQ4.5-M
+container of record", with both hashes. An unknown `format_version`, a v2 without a model
+block and a v2 with an altered config are refused by name too. Overlay containers (#77, #79)
+keep their v1 index: they are read by `Cnq::attach_overlay`, which binds them to the base by
+name and byte size (`overlay_refusal`), not by this rule.
+
+**Accessors** (`Cnq`): `index_version()`, `model()`, `config_json()`,
+`generation_config_json()`, `family()` (`FlashNext` for the v1 container of record). For the
+v1 container `config_json()` is `None` and the boot keeps reading the config from
+`CROW_MODEL_DIR` (else `models/`); for a v2 container the config travels inside it, and since C7
+the boot reads it from there: `Cnq::peek_index` classifies the trailer and hands the `model`
+block to the metadata gate before the container is mapped (8.4, 8.11 "C7").
+
+**The recipe table.** The family comes from the checkpoint's `config.json`
+(`text_config.model_type`), the key `meta.rs` reads.
+
+| tensor | Flash-Next (`qwen4_exp_text`) | dense Qwen3.5/3.8 (`qwen3_5_text`) |
+|---|---|---|
+| token embedding | BF16 | BF16, host RAM |
+| `lm_head` | BF16 | NVFP4 |
+| MLP `gate/up/down_proj` | routed experts and shared expert NVFP4; router `mlp.gate` and `shared_expert_gate` BF16 | NVFP4 |
+| GDN `in_proj_qkv`, `in_proj_z`, `out_proj` | NVFP4 | NVFP4 |
+| GDN `in_proj_a`, `in_proj_b`, `conv1d` | NVFP4 (see the finding below) | BF16 |
+| attention `q_proj`, `k_proj` | BF16 (the 2026-09-03 amendment) | NVFP4 |
+| attention `v_proj`, `o_proj` | NVFP4 | NVFP4 |
+| norms, `dt_bias`, every 1-D tensor | BF16 | BF16 |
+| `A_log` | BF16 (1-D) | f32 |
+| HC mix `input_mix_weight_down/up` | BF16 | no such tensor |
+| `ple` section (n-gram embedding) | NVFP4 | no such section, refused |
+| `vit` section | the text rules (NVFP4 matrices, BF16 1-D) | BF16 |
+| `mtp` section | the text rules | BF16 |
+| anything else | the catch-all: NVFP4 when a whole number of 64-value blocks, else BF16 | refused by name (the dense row is a whitelist) |
+
+- The Flash-Next row is the pre-C6 keep set verbatim; `recipe::tests` proves it against all
+  1658 tensors of the CNQ4.5-M index (`converter/tests/fixtures/cnq45m-index.tsv`).
+- **Latent finding, recorded, Flash-Next unchanged.** The Flash-Next row lets
+  `linear_attn.in_proj_a/b` (`[48, 2560]`) and `linear_attn.conv1d` (`[10240, 1, 4]`) fall
+  through to its last rule, and both are multiples of 64, so all three are NVFP4 in CNQ4.5-M
+  (108 tensors, the "rest" group of `converter/group91-manifest.md`). A 64-value block of
+  `conv1d` spans the four taps of 16 channels. ModelOpt disables these quantizers
+  (`default_disabled_quantizers.yaml`); Unsloth stores alpha/beta F16/Q8_0 and conv1d F32. The
+  dense row keeps them BF16.
+- A bf16 keep is the source's raw bytes, so a bf16 decision on an F32 or F16 source is refused
+  by name (before C6 it would have written those bytes under a `bf16` label). Neither
+  checkpoint of record has one.
+- The conversion checks the config against the weights (`embed_tokens` = `[vocab, hidden]`,
+  the text layer count) before it writes anything.
+- `layer-rule-overlay` (#91) takes its arm kinds per family: on a dense base the `ffn_down`
+  arms are `mlp.down_proj`; the base's family comes off its index (v1 = Flash-Next).
+
+**`converter plan <model-dir>`**: the dry run. It reads `model.safetensors.index.json`, the
+shard headers and the two config files, never a payload, and prints the family, the recipe,
+the provenance, the derived geometry, the per-tensor decision table, the per-row summary and
+the byte totals. On `Qwen/Qwen3.8-27B` @ `1d4bf0f2`, 2026-09-26 (computed, not measured):
+
+| part | bytes | GiB |
+|---|---|---|
+| GPU, text NVFP4 (MLP 8.965, GDN in/out 2.900, attention 0.879, `lm_head` 0.666) | 14,399,078,400 | 13.410 |
+| GPU, text keeps: BF16 `in_proj_a/b` 0.044, `conv1d` 0.004, norms 0.001, `dt_bias`; f32 `A_log` | 52,481,536 | 0.049 |
+| host RAM, token embedding BF16 | 2,542,796,800 | 2.368 |
+| optional `mtp`, BF16 | 849,398,784 | 0.791 |
+| optional `vit`, BF16 | 921,460,192 | 0.858 |
+| container payload | 18,765,215,712 | 17.476 |
+
+The first two rows equal the #300 computed budget (13.41 GiB NVFP4 + 0.05 GiB BF16 keeps).
+All 18 shard sha256 come from the HF LFS record; `config.json` sha256 `191e0af2…`,
+`generation_config.json` `e70c136c…`, the same files as the engine's test fixture.
+
 ---
 
 ## Section 2 — memory layout: residency, PLE window, three-state manager (APPROVED by robin 2026-09-02)
@@ -3496,7 +3597,7 @@ markup after the fact (`toolcall.rs`) and could only report what went wrong (#99
 
 - The container's `vit` section (27 vision blocks x 12 tensors + patch embed + learned position table + merger; 112 NVFP4 + 221 bf16 keeps) loads beside the text sections when `CROW_VIT` is unset (default ON); `CROW_VIT=0` is the text-only placeholder of record. Weights resident at load; the cap-sized scratch (228.5 MiB at 4,096 patches = 1,024 visual tokens - corrected 2026-09-24, this line said 16,384 patches = 4,096 tokens; 285.6 MiB at the #107 default of 5,120 patches = 1,280 tokens; `vit::scratch_bytes_for(4096)` = 239,599,616 B, pinned by the test at `vit.rs:1084`) allocates lazily on the first image request, so text-only boots keep the full planner budget.
 - Serve accepts Crow's image wire exactly (`image_url` data-URL blocks, `crow_core.py image_part`), decodes the five client formats (the `image` crate, decode features), preprocesses per the HF fast processor (smart_resize factor 32, min 65,536 / max 16,777,216 px, antialiased bicubic, 0.5/0.5 normalize, spatial-merge-block patch order), and runs the tower in f32 on the NVFP4 weights (`engine/src/vit.rs`).
-- The visual embeddings splice into the text stream at the expanded `<|image_pad|>` rows (host-side, pre-upload), and the rope kernels read a per-request INTERLEAVED-mrope cos/sin span table (section [11, 11, 10], partial rotary 0.25, theta 1e7 — the `get_rope_index` positions) instead of the load-time table while an image conversation is live. All physical indexing (KV rows, QSA rings, pooled blocks) stays sequential; only the table content changes.
+- The visual embeddings splice into the text stream at the expanded `<|image_pad|>` rows (host-side, pre-upload), and the rope kernels read a per-request INTERLEAVED-mrope cos/sin span table (section [11, 11, 10], partial rotary 0.25, theta 1e7 — the `get_rope_index` positions: an image's merged tokens in raster order over the `h/2 x w/2` grid, T = cur, H = cur + row, W = cur + col, then cur += max(h, w) / 2; before #123, 2026-09-27, the engine used the tower's block-major patch order here) instead of the load-time table while an image conversation is live. All physical indexing (KV rows, QSA rings, pooled blocks) stays sequential; only the table content changes.
 - Measured (RTX 5090, 2026-09-14, `decode_out/srv-vit.log`): ViT embeddings vs the f32 container-dequant oracle max_abs 3.43e-06 at cos 1.000000; text parity with the tower loaded AND with `CROW_VIT=0` byte-identical to `d211ab52ad2b` at the 61b sha256 values of record including the PX teacher-forced 16,064-row form `f217e1c55926` under the > 26 GiB VRAM headroom gate (23 of 23 subchecks); ten tasks 10 of 10 identical to final4; image-prompt pairs (text-only 26-token prompt vs the 224-token image prompt, fresh process per run): text prefill 406.1 ms vs 1,626.2 ms, pair delta mean +1,220.1 ms, plus the vision window of 35.3 s per request (`[vit-chat]`) — the tower GEMVs run the text-style per-token shape and are the known optimization lever.
 - **What that measurement did NOT cover (`#73`, 2026-09-18).** Every figure in the bullet above was taken with ONE image per process, and that is the only case the visual path got right. `Vit::run` handed its device buffer back with the tower still in flight, so `build_plan`'s blocking D2H (legacy null stream, not ordered against a non-blocking one) read the PREVIOUS image's embeddings: from the second image of a process on, the model answered for the image before it, and the wrong rows were then cached under the new image's hash. The oracle cos of 1.000000 was therefore true and blind at the same time. `Vit::run` now synchronizes before it returns; the end-to-end guard is the probe set in `tools/vit-colorprobe.py` / `vit-lag.py` / `vit-imgprobe.py` (a colour or shape claim about this path needs one of them, not a single-image oracle run), and the host-side layout tests in `vit.rs` pin the patch, channel, merge-block, position-tap and rotary order that the symptom imitated.
 - **The attention was the tower's cost, not the GEMVs (`#98`, 2026-09-22).** `vit_attn` (one query row per block, online softmax) gave every one of its 72 active threads the whole `acc[72]`, so the P·V product ran 72 times over: n² · 72 · 72 FMAs per head and layer. The time grew with the square of the patch count (912 patches 1.6 s, 3,520 patches 19.9 s, 4,000 patches 25.3 s of `[vit-chat] vision`; 402 s of tower on 2026-09-22 with the single-slot engine blocked). Step 1: thread t < 72 carries ONE accumulator, for output dim t, and the V row of one key is one coalesced 288-byte read. Per output dim the operations and their order are unchanged, so the output is **bit-identical** to the kernel it replaced: `vit::attn_98` (GPU, `#[ignore]`d for CI; `cargo test --release attn_98 -- --ignored --nocapture`) runs the pre-#98 kernel, kept verbatim in the test, against the shipped one on synthetic q/k/v at n = 1, 255, 256, 257, 512, 912, 1,000 (twice) and 3,520 / 4,000 and requires every output bit to match. Kernel time per layer, RTX 5090, cuEvent: 912 patches 46.0 -> 2.29 ms, 3,520 patches 664.3 -> 33.7 ms, 4,000 patches 849.6 -> 43.7 ms (x19-20); over the 27 blocks that is 17.9 s -> 0.91 s at 3,520 patches, i.e. the old kernel alone was ~90 % of the logged 19.9 s. A deliberate unfused-FMA mutation of the new kernel fails the test (41 % of outputs at n = 255), so the test does see a changed reduction. Step 2, the same day: a block owns a tile of 16 query rows of one head (`VIT_ATTN_ROWS`, grid (ceil(n/16), 16), block 256, 47 KiB static smem), K and V are staged in 64-key chunks at a padded stride of 73 and reused by all 16 rows, and all 256 threads work in both phases. It is **still bit-identical** by construction, not within a tolerance: the key tile stays 256 wide, each score is the same sequential 72-term fma chain, the tile max is `fmaxf` (exact, order-free), the tile sum is the same 256-leaf pairwise tree (levels 128/64/32 in smem, 16..1 as `shfl_down`, which pairs lane k with k + off exactly as `red[k] += red[k + off]` did), and `l = l*r + ln`, `acc *= r`, the ascending-jj fma walk and the final divide are the old expressions in the old order. The same test holds it (every bit, all ten shapes; a mutation that pairs the sum tree's first level differently fails it at 126,183 of 293,760 outputs). Per layer: 912 patches 0.40 ms, 3,520 patches 5.38 ms, 4,000 patches 6.99 ms, i.e. x6 over step 1 and x120 over the pre-#98 kernel; the 27 blocks' attention at 3,520 patches is 0.145 s (was 17.96 s). No tensor cores and no reassociation: an `mma.sync` path would be faster again, but would leave bit-identity and need the #73 visual oracle with a stated band. The #73 oracle record and the parity records stand without re-measuring.
@@ -3864,7 +3965,7 @@ seed 1118, `reasoning_effort none`, card non-thinking row; main = an 8,640-token
 | output | the main turn's answer byte-identical with and without the side request, for a 2-token and a 32-token answer |
 | long side request | 12,087 tokens (longer than the held conversation): the snapshots are dropped, the old rule |
 
-## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18)
+## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18; 8.11 added 2026-09-26 with Crow #300 C1/C2, C4 kernel rule amended in 8.2, C5 family switches in 8.11, 8.12 the dense path with Crow #300 phase 2)
 
 Sections 0 to 7 say what the engine must do. This section says how the crate is put together,
 so a reader who opens `engine/src` knows which file to open and what it may reach for. It was
@@ -3884,7 +3985,7 @@ graph LR
   subgraph L0[leaves]; log[log.rs: tracing + rotation + boot/routing lines]; cuda[cuda.rs]; cnq[cnq.rs]; geo[geo.rs]; tokenizer[tokenizer.rs]; toolcall[toolcall.rs]; end
   subgraph L1[on the leaves]; kernels[kernels.rs: kernel table + launch_v + kprof]; manager[manager.rs]; sample[sample.rs]; weights[weights.rs: tensor loaders + Fp4]; boot[boot.rs]; end
   residency[residency.rs]; vit[vit.rs]; gen[gen.rs]; cache[cache.rs]; reset[reset.rs]; slot[slot.rs]
-  kernels --> cuda; manager --> cuda & geo; sample --> geo; weights --> cnq & cuda; boot --> cnq & cuda & geo
+  kernels --> cuda & geo; manager --> cuda & geo; sample --> geo; weights --> cnq & cuda; boot --> cnq & cuda & geo
   residency --> cnq & cuda & geo & kernels & manager; vit --> cnq & cuda & geo & kernels & weights
   gen --> cnq & cuda & geo & kernels & manager & residency & sample & vit & weights
   cache --> cuda & gen & geo; reset --> cuda & gen & geo; slot --> cache & cuda & gen & geo
@@ -3937,12 +4038,18 @@ crate. It may not learn about geometry: what a tensor MEANS is `geo`'s and `gen`
 row fetch takes byte offsets and a row length and knows nothing about n-grams. Since #77 it also
 owns the OVERLAY (`attach_overlay`, `Overlay`, `OverlayReport`, `overlay_refusal`, `kind_of`,
 `parse_tensor_index`): a second CNQ1 container whose tensors `find` returns in preference to the
-base ones, so the shadowing is invisible to every reader above it.
+base ones, so the shadowing is invisible to every reader above it. Since Crow #300 C6 it classifies the index
+at `open` (`classify_index`, `IndexKind`, `ModelBlock`): an index v2 hands back the checkpoint's
+config files verbatim, a v1 index is accepted only for the CNQ4.5-M container of record (1.7).
+Since C7 `Cnq::peek_index` gives the same classification and the tensor table without mapping
+the file (`IndexPeek`); `open_checked` and `peek_index` share one trailer reader
+(`read_index_trailer`), so the boot door and the mapping cannot disagree.
 
 **`geo.rs`** — the model geometry and the runtime `Config`: the probe-pinned constants and
 their derivation chain, `KvDtype`, `Adapt` with `knobs()`, the two policy functions
 (`apply_chunk_policy`, `apply_adapt_policy`) and `env_parse::<T>`. Surface: 10 `pub fn`, 3
-types, 51 `pub const`. Depends on nothing. It is the one place a number that two modules must
+types, 51 `pub const`; since Crow #300 C2 also the runtime `Geo` with `Geo::FLASH_NEXT` and
+its family enums (`Family`, `Residual`, `Ffn`, `Attn`, `PleGeo`, `GateAct`, `FinalNorm`), 8.11. Depends on nothing. It is the one place a number that two modules must
 agree on is allowed to live (8.6).
 
 **`tokenizer.rs`** — the in-engine HF tokenizer and the minijinja chat template, producing ids
@@ -3953,13 +4060,27 @@ identical to `tools/tokenize_ids.py --chat`; process-wide `OnceLock` instance. S
 is unit-tested in the library. Surface: 7 `pub fn` plus `ToolStream`, `Emit`. Leaf, used by
 `bin/serve` only.
 
-**`kernels.rs`** — `KERNEL_SRC`, the frozen CUDA source (lines 15 to 4479 of the file; the
-Rust host shell around it is the remaining ~180), the kernel table (`Kernels::new`, `f`), the
-two launch shims every kernel goes through (`launch_v`, `launch_sync`), the per-kernel profile
-(`kprof_init`, `kprof_add`, `kprof_report`, `CROW_KPROF`), and `define_u32`, which parses a
-`#define` out of the frozen source so the Rust twin can be asserted against it. Depends on
-`cuda` only. It may not depend on `gen`: that was the cycle `bb9d2ca` broke. `KERNEL_SRC` is
-byte-frozen — a refactor may not touch one character of it.
+**`kernels.rs`** — `KERNEL_SRC`, the CUDA source (lines 15 to ~4990 of the file at `ebb68f4`),
+`KernelGeo`, which builds the per-boot `#define CN_*` prelude the source compiles behind (Crow
+#300 C4, 8.11), the kernel table (`Kernels::new`, `f`), the two launch shims every kernel goes
+through (`launch_v`, `launch_sync`), the per-kernel profile (`kprof_init`, `kprof_add`,
+`kprof_report`, `CROW_KPROF`), and `define_u32`, which parses a `#define` out of the source so
+the Rust twin can be asserted against it. Depends on `cuda`, `geo` (the `Dims` the prelude is
+built from) and `meta` (#96's `boot_rope_scaling`, read in `Kernels::new`). It may not depend on `gen`: that was the cycle `bb9d2ca` broke.
+
+**The kernel rule is the PTX of record** (amended by robin 2026-09-25, applied in Crow #300 C4 on
+2026-09-26). Until then the rule read: "`KERNEL_SRC` is byte-frozen — a refactor may not touch one
+character of it." Reason for the change: model-agnostic kernels. The engine JITs the source with
+NVRTC on every boot anyway, so the kernel geometry can come from the checkpoint through a
+`#define` prelude instead of Flash-Next literals, which a second model family needs. The rule now:
+the SOURCE may change (macros, compile-time `#if` branches for another family), but for Flash-Next
+the NVRTC output of every kernel entry must stay byte-identical to the PTX compiled from the frozen
+pre-C4 source. The frozen source is `engine/tests/fixtures/kernels-3154b3b.cu` (cut byte-exact out
+of `3154b3b`); `engine/tests/fixtures/ptx-manifest-3154b3b.txt` records its sha256, the NVRTC
+version (13.3) and one sha256 per `.entry` (130 entries) plus the whole module. `kernels::tests_300_c4`
+compiles both with the engine's option set and fails with a table of every differing entry. A
+change that moves the Flash-Next PTX is a numerics change, never a refactor: it needs its own
+measurement and the gate values of record.
 
 **`manager.rs`** — the three-state memory manager: `StateSizes::plan` derives every state byte
 count from `geo` and the context, `ThreeStates::allocate` is the planner with the two-sided
@@ -3998,12 +4119,12 @@ tested without a GPU. Surface: 18 `pub fn` plus `Residency`, `PendingSwap`, `Low
 `ExpertSlabs`. Depends on `cnq`, `cuda`, `geo`, `kernels`, `manager`. It may not depend on `gen`
 any more.
 
-**`vit.rs`** — the #VIT visual tower: `VitW::load` / `Vit::new` (27 blocks from the container's
-`vit` section), the lazy cap-sized scratch, `Vit::run`, image decode and the hand-rolled HF
+**`vit.rs`** — the #VIT visual tower: `VitW::load` / `Vit::new` (27 blocks from the model's F16
+projector, `choose_tower` picking the first valid candidate, or the container's `vit` section; #108, #122), the lazy cap-sized scratch, `Vit::run`, image decode and the hand-rolled HF
 preprocessing (`decode_rgb`, `prep_image`, smart_resize), `expand_ids`, `mrope_positions`,
 `mrope_tables`, the bounded image-embedding LRU, `build_plan` → `VisionPlan`, and the planner's
-reserve (`reserve_bytes`, `reserve_line`, `CROW_VIT_RESERVE_MB`). Surface: 17
-`pub fn` plus `VitW`, `Vit`, `VitBlockW`, `ImagePrep`, `VisionPlan`, `Grid`, 16 `pub const`.
+reserve (`reserve_bytes`, `reserve_line`, `CROW_VIT_RESERVE_MB`). Surface (2026-09-27, #122): 25
+`pub fn` plus 13 types (`VitBudget`, `Lin`, `VitBlockW`, `VitW`, `VitSource`, `TowerChoice`, `MmKind`, `Vit`, `ImagePrep`, `Grid`, `ImageSpan`, `ImageKey`, `VisionPlan`), 25 `pub const`.
 Depends on `cnq`, `cuda`, `geo`, `kernels`, `weights`. It may not depend on `gen`: `gen` calls
 IT, through `Engine::build_vision_plan` and `begin_vision`.
 
@@ -4078,8 +4199,12 @@ not line numbers — the files move.
    (#102, 2026-09-23: `bf16` / `fp8` / `fp8_e4m3`, anything else — the empty string included —
    panics `[boot] refused` before the container is mapped; until then only `decode parity` read
    it, so `serve` booted FP8 under `CROW_KV=bf16`), one WARN per `CROW_*` name in the environment
-   that has no row in `docs/env.md` (compiled in, names only), the #94 metadata gate, then
-   `Cnq::open` (trailer index, whole-file mapping), then `CROW_CNQ_OVERLAY` →
+   that has no row in `docs/env.md` (compiled in, names only), then `boot::model_geo`: the index
+   trailer (`Cnq::peek_index`, no mapping; since Crow #300 C7, with the `[boot] container index v1|v2`
+   line that names where the config comes from), the #94 metadata gate on that config (since
+   Crow #300 C1/C2 also the family, the key ledger and the `Geo == Geo::FLASH_NEXT` assert; since C7
+   the container check, 8.11), `Geo::built` (C5), then `Cnq::open` (trailer index, whole-file
+   mapping), then `CROW_CNQ_OVERLAY` →
    `Cnq::attach_overlay` when it is set AND non-empty (#77: the bf16 dense overlay, with its
    refusal table and the `[overlay]` lines; unset or empty attaches nothing — the engine
    default; what the launcher sets is 8.8 point 6),
@@ -4113,7 +4238,7 @@ not line numbers — the files move.
       Linux since #103, 2026-09-23; 8.8 point 7), one ascending sweep per expert tensor, the
       slot tables.
    10. the prefetch ring and its non-blocking stream.
-   11. `kernels::kprof_init`, `cuda::compile(KERNEL_SRC)` (NVRTC, `--gpu-architecture=compute_120a`),
+   11. `kernels::kprof_init`, `cuda::compile(KernelGeo::of(&geo).source())` (NVRTC, `--gpu-architecture=compute_120a`; the C4 prelude, then `KERNEL_SRC`),
        `Kernels::new`, `assert_kernel_defines` (8.6), `Params::setup`.
 7. `PrefixCache::new` — the three snapshot slots, the `[serve] prefix cache` line.
 8. `TcpListener::bind("127.0.0.1:<port>")`, then `serve_one` per connection, blocking, one
@@ -4171,7 +4296,7 @@ asserted against it.
   the stream trickle AND the chunk `serve` pins — `bin/serve.rs::SERVE_CHUNK` derives from it,
   which is the lesson of `42e2b67` written into the code. `MIB` / `GIB` replace 54 inline
   divisors, `DEFAULT_CNQ` / `DEFAULT_HOTSETS` / `from_engine_dir` replace 12 path literals.
-- **The four kernel `#define`s** are read out of the frozen `KERNEL_SRC` by
+- **The four kernel `#define`s** are read out of `KERNEL_SRC` by
   `kernels::define_u32` and compared with their Rust twins by `gen::assert_kernel_defines()`,
   once per `Engine::load`: `QSA_PAR_BINS`, `SAMPLE_MAXK`, `SAMPLE_PARTS`, `SAMPLE_THREADS`. The
   sampler's `cand_v` / `cand_i` allocation and both sampler launches read the Rust twins, so a
@@ -4533,6 +4658,476 @@ is the documented bit-identical twin of the cascade `mix_streams_q` fuses and th
 `attn_prompt` makes itself when the fusion is off. With `CROW_MMA` unset the same golden read
 `max_abs` 0.4475 / `corr` 0.99180 all along, at HEAD and before the fix, which is what pinned the
 cause to the cascade and not to the kernels, the ring or the selection.
+
+### 8.11 Model families and the runtime `Geo` (Crow #300 phase 1, C1 to C7, 2026-09-26)
+
+crow-nest serves one model today, and every shape was a `geo.rs` const. Phase 1 of Crow #300 makes
+the shapes come from the checkpoint. C1 and C2 build the reader and the runtime geometry and
+assert them at boot. C3 moves the host call sites onto that `Geo` (see "C3: how the `Geo` is
+threaded" at the end of this section). No kernel, buffer size, allocation order, loader or
+numeric changed: the gate values of record hold after every C3 step.
+
+**Families.** `meta::ModelMeta` detects the family from `text_config.model_type`. Any other string
+refuses the parse by name.
+
+| family | `model_type` | residual | FFN | attention | PLE | gate act | final norm | boot |
+|---|---|---|---|---|---|---|---|---|
+| `FlashNext` | `qwen4_exp_text` | `Hc` (4 streams, low rank 320) | `Moe` (512 experts, top 10, 640, shared 640) | `Qsa` (4 heads, 1 kv, 128, ratio 4, 512 blocks) | layer 1 | sigmoid | `HcMixer` | runs; `Geo` must equal `Geo::FLASH_NEXT` |
+| `Qwen35Dense` | `qwen3_5_text` | `Plain` | `Dense` (17408) | `Full` (uncapped) | none | swish (= silu) | `Rms` | runs since phase 2 (8.12); until then it was refused at its first unbuilt block (C5) |
+
+**Expected values per family** (`meta::Expected`). The Flash-Next row is today's pins, read out of
+`geo` and `sample`, and gives the same 21 checks as before (the 20 of #94 phase 1 plus #96's
+`rope_type`). The check table text is byte-identical to `07d9340` on the real config and on a
+doctored one. The dense row is `Qwen/Qwen3.8-27B` @ `1d4bf0f2`: H 5120, 24 q / 4 kv heads x 256,
+GQA 6, 64 layers = 48 GDN + 16 attention (`layer % 4 == 3`), vocab 248,320, eos `[248046, 248044]`,
+theta 1e7, eps 1e-6, 32 rope pairs. It has no `ple_eos` check, so 20 checks.
+
+**The key ledger.** Every `text_config` key is consumed (it feeds a check or the `Geo`) or ignored by
+name, with the reason it cannot change a logit (`meta::IGNORED_KEYS`: dropout, init, `dtype`,
+`use_cache`, `pad_token_id`, the MTP descriptor while crow-nest#95 is open, router-loss terms, PLE
+table sizing that the container's shard shapes already fix). An unknown key, a key of the other
+family, or an unknown `rope_parameters` key refuses the parse and names every such key. A
+flat config (no `text_config`) may also carry the multimodal wrapper keys. Formula facts with one
+implemented value refuse any other value by name: `hidden_act` silu, `mamba_ssm_dtype` float32,
+`output_gate_type` sigmoid/swish/silu. The top-level and text `tie_word_embeddings` must agree.
+
+**`geo::Geo`**, 35 fields, derived by `ModelMeta::geo`:
+
+| field group | Flash-Next (`Geo::FLASH_NEXT`, from the consts) | Qwen3.8-27B (derived from the fixture) |
+|---|---|---|
+| hidden, residual | 2560, `Hc { 4, 320 }` | 5120, `Plain` |
+| layers / gdn / attn / interval | 48 / 36 / 12 / 4 | 64 / 48 / 16 / 4 |
+| q / kv heads, head dim, GQA | 24 / 2, 256, 12 | 24 / 4, 256, 6 |
+| attention, output gate, gate act, bias | `Qsa` (sel max 2051), true, `Sigmoid`, false | `Full`, true, `Silu`, false |
+| rope pairs, theta, mrope | 32, 1e7, [11, 11, 10] interleaved | same |
+| GDN key/value heads x dims, conv | 16 / 48 x 128 / 128, 4 | same |
+| FFN | `Moe { 512, 10, 640, 640 }` | `Dense { 17408 }` |
+| PLE | `{ layer 1, ngram 3, 8 heads/ngram, embed 2560, conv 4, eos 248044 }` | none |
+| final norm, (1 + w) norm, eps | `HcMixer`, true, 1e-6 | `Rms`, true, 1e-6 |
+| vocab, tied lm_head, context max / floor | 248,320, false, 262,144 / 200,000 | 248,320, false, 262,144 / 100,000 (C5: `geo::DENSE_CONTEXT_FLOOR`, the 16 GB point of the phase 2 plan) |
+| eos, MTP layers, vision out | [248046, 248044], 1, 2560 | [248046, 248044], 1, 5120 |
+
+`Geo` carries the derivation chain of the consts (`residual_width` = `HCT`, `q_rows`, `kv_rows`,
+`core`, `gqa`, `gdn_key`, `gdn_val`, `gdn_conv`, `Attn::sel_max` = `QSA_SEL_MAX`, `PleGeo::nheads` /
+`emb_dim`, `is_attn`). `geo::tests_300` asserts that each one reproduces its const on
+`Geo::FLASH_NEXT`.
+
+**The boot door** (`meta::verdict`, pure; `meta::assert_pinned` panics on its `Err`):
+
+1. a red check of the family row gives the #94 table;
+2. no `Geo` form for a value (a fractional rope pair count, not two eos ids, not three mrope sections, not one PLE layer) gives a named refusal;
+3. Flash-Next whose `Geo` differs from `Geo::FLASH_NEXT` gives `[meta] N of 35 runtime Geo fields differ from Geo::FLASH_NEXT` with one row per field, `config derives X, Geo::FLASH_NEXT pins Y`;
+4. dense passes with its 35-row geometry on the log (C5; before C5 it was refused here by one blanket message), and `boot::model_geo` refuses it right after at its first unbuilt block (`Geo::built`, below);
+5. Flash-Next with everything equal logs `meta: 21 constants verified against config.json (zero numeric change) [...]; family FlashNext (qwen4_exp_text), runtime Geo == Geo::FLASH_NEXT (35 fields)`.
+6. (C7, `meta::gate`) a config that does not fit the container gives `[meta] N of 3 container facts differ from the config` with one row per fact (below, "C7").
+
+All six, and the C5 family check after them, are before `Cnq::open` and before the CUDA context. `assert_pinned` returns
+`Option<(ModelMeta, Geo)>`; since C3 `boot::open_model` hands the `Geo` to its caller.
+
+The 27B fixture is `engine/tests/fixtures/Qwen3.8-27B/{config.json, generation_config.json}`,
+copied from `models/Qwen3.8-27B/` (revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`,
+sha256-checked 2026-09-25). Since C7 the Flash-Next config is tracked too,
+`engine/tests/fixtures/Qwen3.8-Flash-Next/` (byte copies of `models/Qwen3.8-Flash-Next-original/`:
+`config.json` sha256 `889658f2…`, `generation_config.json` `e70c136c…`, the same bytes as the 27B's),
+for the C7 boot-door tests; the `meta::tests` still read the checkpoint of record in `models/`.
+
+**C3: how the `Geo` is threaded** (2026-09-26).
+
+- **Owner.** `boot::open_model` returns the `Geo` as the sixth element of its tuple
+  (`boot::model_geo`: the metadata gate's `Geo`, or `Geo::FLASH_NEXT` after the gate's WARN when no
+  config.json sits beside the container, the selftest package). The caller passes it to
+  `Engine::load(cnq, geo, cfg, ..)`, and the engine owns it as `Engine::geo`, the way llama.cpp's
+  `llama_model` owns its `hparams`. Everything the engine builds is shaped from that field or
+  from a copy handed down at construction: `ThreeStates::geo`, `Vit::out_hidden`.
+- **Free functions take it as a parameter**, never from a global: `StateSizes::plan(geo, ..)`,
+  `build_rope_table(geo, ..)`, `vit::reserve_bytes(geo, ..)` / `reserve_line`,
+  `vit::scratch_bytes_for(cap, out_hidden)`, `vit::mrope_bytes(context, rope_pairs)`,
+  `lend::tier1_plan(geo, ..)`, `slot::kv_row_order(layers, kv_heads)`,
+  `Residency::build(cnq, geo, ..)`, `residency::sidecar_sets(txt, n, layers, experts)`,
+  `expert_slab_info(.., experts)`, `cache::Shape::with_geo`, `cache::park_host_bytes(geo, ..)`,
+  serve's `parse_chat_vocab(body, vocab)` and `tool_gate(req, tk, geo, on)`,
+  `Sampler::from_env(Some(vocab))`. There is no process-wide `OnceLock<Geo>`: every site found so
+  far has an engine handle or a caller that has one. The tools that map a container without the
+  front door (`residency`, `states`, `coldtier`, `hybrid`, `sf_scan`) ask `boot::model_geo` for it.
+- **`Dims`, the flat view `gen.rs` computes with.** `Geo::dims()` flattens the `Geo` into one
+  `Copy` value with one field per const it replaces, the const's name in lower case (`H` -> `h`,
+  `QSA_SEL_MAX` -> `qsa_sel_max`, plus `is_attn` / `attn_index` / `gdn_index`). `Engine::load`
+  builds it once (`let d = geo.dims()`) and keeps it as `Engine::d`; `Ple` keeps a copy, and the
+  buffer builders take it as a parameter (`Params::setup(cfg, d, ..)`, `Scratch::diet_sets(d, c)`,
+  `Scratch::alloc(d, chunk)`, `Ple::load(cnq, d, ..)`). It is a cache of the `Geo`, never a second
+  source, and it keeps the per-launch host code at one field read instead of a family match.
+  `geo::tests_300` pins every field to its const.
+- **Accessors.** C3 still assumed the Flash-Next STRUCTURE (the family switches came with C5), so
+  it reads the family-specific numbers through `Geo::moe()`, `qsa()` (`QsaGeo`: `qk_rows`,
+  `sel_max`, `hidd`), `ple_geo()`, `hc_lowrank()`, `vision_out()`, `attn_index` / `gdn_index`. On a
+  family without that block each one panics with `Geo::<name>: ... (Crow #300 phase 2 builds that path)`;
+  a dense boot never reaches them, because it dies at `Geo::built` in the boot door (C5).
+  `geo::tests_300::c3_accessors_reproduce_the_consts_they_replace` pins every accessor to the const
+  it replaced.
+- **The slot file names its model** (format 2): `model_family` (`Family::code`) and `geo_hash`
+  (`Geo::fingerprint`, fnv1a-64 over the `rows` rendering; `0x7191_8a73_24c6_5fdd` for Flash-Next,
+  pinned by the same test). `Header::shape_matches` checks both first and names the two models; a
+  format 1 file is refused by name, never parsed.
+- **Byte identity.** Every buffer is allocated in the same order with the same size: the migrated
+  expressions are the const expressions with the const replaced by the `Geo` field that
+  `Geo::FLASH_NEXT` fills from it. Checked per step against the gate's boot logs: every
+  `[budget]`, `[residency]`, `[diet]` and `scratch + staging` line is identical to `f7ca9f5`
+  (host-measured free RAM / VRAM masked).
+
+**What still reads the consts** (C3e, 2026-09-26): no host site of the engine. `gen.rs`,
+`manager.rs`, `residency.rs`, `cache.rs`, `slot.rs`, `reset.rs`, `vit.rs`, `lend.rs` and the
+`serve` / `decode` / `parity` bins read the `Geo` (or its `Dims`). Host literals that stay, because
+they describe a kernel's own launch contract rather than the model: the 256 / 128 / 1024 block
+sizes, `qsa_scores_par`'s `(ncb + 3) / 4` grid and its `QSA_SCORES_BLOCKS` cap, the NVFP4 block
+bytes (36), the PLE cache row (108 B, `PLE_ROW_VALUES` 160, asserted equal to the model's PLE
+embedding dim at load), the PLE conv's 4 taps x dilation 3 = 9 state rows (`manager::ple_state_len`),
+`CROW_CHUNK_BALANCE`'s rounding to 4, and `slot::Header::check_content`'s `done_blocks == pos / 4`
+(a pure header check with no `Geo` in reach; the loaded model's compress ratio is 4). On purpose: `meta.rs` (the Flash-Next expected-values row is the
+pin), the tests that pin a const against its `Geo` field or feed a Flash-Next fixture, and the
+synthetic kernel probes (`mma_gate`, `attn_path_probe`, `qsa_probe`, `qsa_tie_probe`,
+`gdn_chunk_probe`, `rope_table_probe`, `router_probe`) until C4: since C4 they read
+`Geo::FLASH_NEXT.dims()` (`const G: Dims`, the old const names kept as local aliases) and compile
+`KernelGeo::flash_next().source()`; they load no model, so Flash-Next is their only shape. The
+kernels moved in C4 (below). Container facts that are not model geometry stay consts:
+`PLE_ROWS_PER_SHARD` (the converter's shard layout, C6), `HOST_PINNED_CAP`, the chunk policy;
+`sample::EOS_IDS` stays as the Flash-Next pin the metadata gate checks.
+
+**C4: the kernel prelude** (2026-09-26; C4a `f6df9ec`, C4b `ebb68f4`, C4c). The engine JITs `KERNEL_SRC` with NVRTC
+on every boot. Since C4 it compiles `kernels::KernelGeo::of(&geo).source()`: a prelude of 27
+`#define CN_*` lines built from the runtime `Geo` (through `Dims`, plus `rms_eps` and `gate_act`),
+then `KERNEL_SRC`. The bare source refuses to compile (`#error ... KernelGeo::prelude()`). The
+same builder serves the probes, `kcheck`, the ViT GEMM test and the cuTile pilot
+(`KernelGeo::flash_next()`). The rule this rests on is the 8.2 amendment: the PTX of record.
+
+| macro | from | Flash-Next | Qwen3.8-27B (derived) | read by |
+|---|---|---|---|---|
+| `CN_H` | `d.h` | 2560 | 5120 | HC norms and mixes, MoE accumulators, the PLE gate kernels, `bpr = CN_H / 64` |
+| `CN_HCN`, `CN_HCT` | `d.hcn`, `d.hct` | 4, 10240 | (`Plain`: none) | HC kernels, `1.0f / CN_HCN` (HF `/ hc_count`, `.mean`), the PLE conv width |
+| `CN_E`, `CN_TOPK`, `CN_INTER` | `d.e`, `d.topk`, `d.inter` | 512, 10, 640 | (`Dense`: none) | `router_top10`, `moe_plan`, the combo kernels, the silu·mul chain (`2 * CN_INTER`), `bpr = CN_INTER / 64` |
+| `CN_GDN_KHEADS`, `CN_GDN_VHEADS`, `CN_GD`, `CN_GDV` | `d.gdn_*`, `d.gd`, `d.gdv` | 16, 48, 128, 128 | same | l2norm/repeat, `beta_g`, the delta rules, the gated norms |
+| `CN_GDN_KEY`, `CN_GDN_VAL`, `CN_GDN_CONV` | `d.gdn_key`, `d.gdn_val`, `d.gdn_conv` | 2048, 6144, 10240 | same | `split_qkv`, `conv_step`, `bpr = CN_GDN_VAL / 64` |
+| `CN_NQ`, `CN_NKV`, `CN_GQA`, `CN_AHD` | `d.nq`, `d.nkv`, `d.nq / d.nkv`, `d.ahd` | 24, 2, 12, 256 | 24, 4, 6, 256 | `store_kv`, `split_qg`, rope, `rmsnorm_1pw`, every attention variant (`head / CN_GQA`), `attn_merge` |
+| `CN_Q_ROWS`, `CN_CORE` | `d.q_rows`, `d.core` | 12288, 6144 | 12288, 6144 | `split_qg`, `gate_mul_q` |
+| `CN_ATTN_SCALE` | `1 / sqrt(d.ahd)` as an f32 literal | `6.25e-2f` | same | `attn_scale_src<0>`, the `d_attn_scale` initializer (#96) |
+| `CN_ROPE_PAIRS` | `d.rope_pairs` | 32 | 32 | `rope`, `rope_p`, `rope64` |
+| `CN_QSA_HEADS`, `CN_QSA_HD`, `CN_QSA_QK_ROWS`, `CN_QSA_SEL_MAX` | `d.qsa_*` | 4, 128, 640, 2051 | (`Full`: none) | the indexer (`rms128`, `rope64`, `qk_k_append`, `qsa_scores`), the list attention's `p[CN_QSA_SEL_MAX]` |
+| `CN_EPS` | `geo.rms_eps` as an f32 literal | `1e-6f` | `1e-6f` | the five RMSNorms (HC group, q/k norm, both GDN gated norms, indexer norm) |
+| `CN_GATE_ACT` | `geo.gate_act` | 0 (sigmoid) | 1 (swish) | `rmsnorm_gated`, `rmsnorm_gated_q` |
+
+- **What a macro replaced**: a literal the kernel is correct for at any value of it (a stride, a
+  loop bound, a row width, an index expression, a shared array length). Every replacement is a
+  token the frontend folds to the same constant, which is why the PTX does not move.
+- **`CN_GATE_ACT` is the GDN gated-norm activation**, not the attention output gate. HF
+  `qwen4_exp` builds `RMSNormGated(activation=config.output_gate_type)` (sigmoid for Flash-Next);
+  `qwen3_5` hard-codes silu; the attention output gate is `sigmoid(gate)` in both (`gate_mul`,
+  unchanged). The swish branch is a compile-time `#if` (`zg / (1.0f + expf(-zg))`, the silu form
+  the source already uses), so the sigmoid PTX is untouched. C4 corrected `geo::GateAct`'s doc,
+  which called it the attention gate.
+- **The proof.** `kernels::tests_300_c4`: all 130 entries and the whole module are byte-identical
+  to the frozen `3154b3b` source and to the recorded manifest (red with `CN_QSA_SEL_MAX + 1`: 18 of
+  130 entries differ, the 18 list-attention variants). A geometry change moves exactly the
+  kernels that read it: swish moves `rmsnorm_gated` and `rmsnorm_gated_q` and nothing else; 4 KV
+  heads (GQA 6) move `store_kv` and the 20 attention variants and nothing else. Two ignored GPU
+  tests (`tests_300_c4_gpu`) run the swish gate, and `store_kv` + `attn_sel` at 4 KV heads / GQA 6,
+  on synthetic data against a CPU reference (max rel err 3.4e-7; attention max abs err 3.0e-7, and
+  the Flash-Next `head / 12` mapping would be off by 3.8). The gate is ALL GREEN with the values of
+  record, and all 125 `[budget]` / `[residency]` / `[diet]` / `[vit]` / `[stage]` / `meta:` boot
+  lines per run are identical to `gate-c3e` (host free RAM masked).
+
+**What the kernels still assume** (Flash-Next-only or shared by both families, at `kernels.rs`
+after C4c; each is a kernel-shape fact, not a literal a macro can replace):
+
+- one thread per head-dim element: the attention kernels run `blockDim = CN_AHD = 256` with the
+  block-size literals `red[256]`, `j += 256`, `lut[256]` (`:3914`), the register tile `qr[8]`
+  (`:2053`, `:2239`, `:2406`, = 256 / 32) and `sh = mode ? 5 : 4` (`:2233`, `:2401`, log2 of a
+  256-wide row in uint4). The 27B's head dim is also 256.
+- `attn_sel_g` (`:2476`) runs 32 x `CN_GQA` threads, but its fetch loop wants 256 of them
+  (`ld = tid < 256`, `:2404`): correct only for GQA >= 8. At the 27B's GQA 6 it is wrong; it is
+  the opt-in grouped variant, not the default decode path.
+- the list attention holds at most `CN_QSA_SEL_MAX` scores in shared memory (`p[...]`): the 27B's
+  full attention over a long context needs its own kernel (phase 2).
+- QSA: compress 4 in shift form (`ncb = (pos + 1) >> 2`, `:2603`, `:3856`), the 4-tap pool
+  (`:2568`, `:2571`), the 65,536-block bitmap (`:2654`, `:2801`), `qsa_scores_par`'s unrolled
+  4 heads x 128 (`:3859`).
+- GDN: conv kernel 4 (`conv_silu` `:1611`, `conv_state_update`, `conv_step` `:1731`, unrolled);
+  the delta rules load the key with the value thread index (`ks[d] = kt[d]`, `:1790`), so
+  `GD == GDV`; `vhead / (VHEADS / KHEADS)` (`:1672`) wants an integer ratio. The 27B matches all
+  three.
+- HC: `inject_residual` tiles the row in 256-wide blocks (`:1550`), so `H % 256 == 0`.
+- MoE: `router_top10` runs one thread per expert with a tree over `CN_E / 2` (E a power of two,
+  at most 1024) and a 32-bit cold mask (`1u << e`, `:3176`: top-k <= 32); `moe_plan`'s 8-combo
+  tiles (`:3365`).
+- PLE: the NVFP4 row cache is 108 B = 160 values (`:4129`), 16 slots per token (`:4125`), the
+  conv 4 taps x dilation 3 = 9 state rows (`:4209`): container layout, C6.
+- formula constants that are not the config's `rms_eps` stay literals: the l2norm `1e-6f`
+  (`:1677`, HF `l2norm(eps=1e-6)`), the PLE sign-sqrt clamp (`:4159`, HF `clamp_min(1e-6)`), the
+  ViT LayerNorm (`vit_ln`, HF `eps=1e-6`). The ViT kernels carry the vision tower's own shape
+  (1152 hidden, `:4612`), which is not part of the text `Geo`.
+
+**C5: the family switches** (2026-09-26). The engine `match`es on the `Geo`'s family enums where
+it used to assume Flash-Next. Each Flash-Next arm is the code of record, moved verbatim; each
+dense arm was not built and refused by name until phase 2 built all four (8.12). `Geo::built`
+now returns `Ok` for every arm; `not_built` / `unbuilt_arm` stay as the form a future unbuilt
+arm refuses with, and the `geo::Block` names are gone with the arms they named.
+
+- **The refusal.** `Geo::built` (`geo.rs`) walks the blocks in forward order (the residual stream
+  the embedding writes, then per layer the PLE add, the attention and the FFN, then the final
+  norm) and returns the first arm this engine has not built as
+  `<block> for family <F> not built yet (Crow #300 phase 2)` (`geo::not_built`, the block names are
+  the `geo::Block` constants). `boot::model_geo` calls it right after the metadata gate, before
+  `Cnq::open` and before `cuda::Ctx::init`, and panics with `[boot] refused: ...`; every bin and
+  probe that asks for a `Geo` goes through it. `Engine::load` calls it again before its first
+  allocation (`[load] refused: ...`). So a dense model still dies before any CUDA work, but at
+  the block that is missing, not at a blanket family refusal: as phase 2 builds arms, a
+  checkpoint gets exactly as far as the engine supports. The metadata gate no longer refuses
+  the dense family; it logs its geometry (`meta: 20 constants verified ... runtime Geo derived
+  (35 fields):` plus the table) and passes it on. Smoke, 2026-09-26:
+  `CROW_MODEL_DIR=engine/tests/fixtures/Qwen3.8-27B decode run ...` prints the table and dies
+  with `[boot] refused: Residual::Plain (one pre-norm residual stream) for family Qwen35Dense not
+  built yet (Crow #300 phase 2)`, before the `[boot] kv cache dtype` line (which follows the CUDA
+  context).
+- **The arms.**
+
+  | block | built (Flash-Next) | not built: refusal (`Geo::built`, `geo.rs:900-915`) | switch sites (C5a: boot, plan, loader; C5b: layer loops, head) |
+  |---|---|---|---|
+  | residual | `Residual::Hc` | `Residual::Plain (one pre-norm residual stream)` | loader: both per-layer HC bundles (`gen.rs:1012`, `:1071`); `[hc]` boot line; prefill and decode: both HC mixes and both `inject_residual` (`:4029`, `:4098`, `:4112`, `:4164`; `:4359`, `:4398`, `:4417`) |
+  | PLE | `Some`: `Ple::load`, the step at its layer; `None`: skipped, `Engine::ple` is `None` and `cfg.ple` off | (both built) | loader; `ple_state_len`; `cache::Shape`; reset; the snapshot copies; the loops' `cfg.ple` step |
+  | attention | `Attn::Qsa` | `Attn::Full (uncapped causal attention)` | loader (attention + indexer weights, `:1028`); `StateSizes::plan`; `ThreeStates::allocate` (ring + pool); `cache::Shape`; `park_host_bytes`; `[qsa]` boot line; `attn_prompt` / `attn_step` (`:4051`, `:4380`) |
+  | FFN | `Ffn::Moe` | `Ffn::Dense (one SwiGLU per layer)` | loader (router + shared expert `:1054`, expert slabs and residency `:1174`); the hot-set clamp (`manager.rs:349`); `boot::hot_set_sidecar`; `moe_run` (`:4130`, `:4403`) |
+  | final norm | `FinalNorm::HcMixer` | `FinalNorm::Rms (one RMSNorm before lm_head)` | loader (the mixer weights, `:995`); `head_run` (`:4207`, `:4424`) |
+
+  Behind the boot check each dense arm in the loader and the planner is `geo::unbuilt_arm`, which
+  panics with the same message plus `- reached past the boot check`: a guard for a `Geo` that did
+  not come through `boot::model_geo`, never a path a request can take. `Engine::load` refuses
+  before its first allocation, so every `Engine` that exists holds only built arms; the
+  per-layer matches in the loops cost one discriminant compare each, outside the replayed
+  decode graph. The layer loops also count `0..d.layers` and replicate the embedding over
+  `d.hcn` streams now; C3 had left `LAYERS` / `HCN` at twelve `gen.rs` sites (two loader loops, C5a). The stage-dump probes
+  (`run_layer0_with_stage_dumps`, `run_attn_subblock`) stay Flash-Next probes.
+- **Hot sets are the MoE arm.** `boot::hot_set_sidecar(geo, CROW_HOTSETS, default)` is `Some` for
+  `Ffn::Moe` and `None` otherwise, so `CROW_HOTSETS` is required for a MoE family only; a family
+  without routed experts that has it set gets one `[boot] ... ignored` WARN line. `open_model`
+  returns `Option<String>`, `Engine::load` takes `Option<&str>` and unwraps it inside the MoE arm,
+  before `Residency::build`.
+- **The state plan per family.** `StateSizes::plan`, `ThreeStates::allocate`, `cache::Shape::with_geo`
+  and `cache::park_host_bytes` plan the QSA raw-key ring and the pooled blocks only for
+  `Attn::Qsa` (full attention: zero bytes, zero rows, no `QSA` budget lines); `manager::ple_state_len`
+  is zero without PLE, so the snapshot carries no PLE row. `Geo::dims` gives zero PLE fields
+  without PLE instead of panicking. On Flash-Next the plan is the plan of record:
+  `manager::tests_300_c5` pins every byte count of the gate's `[budget]` lines, the 121,208,832 B
+  snapshot and the 113,252,352 B park; on the 27B fixture it plans KV 3,276,800,000 B at the
+  100k floor, GDN 150,994,944 + 5,898,240 B, and no QSA, PLE or hot-set part.
+- **Per-family context floor.** Flash-Next keeps `CONTEXT_FLOOR` 200,000. The dense floor is
+  `DENSE_CONTEXT_FLOOR` 100,000, the smallest point of the phase 2 plan (16 GB: 100k with a 4-bit
+  KV cache; 20-24 GB: 200k FP8 KV; 32 GB: 200k FP8 plus vision and MTP; the planner picks from
+  free VRAM). The planner is a TODO naming phase 2; nothing reads the dense floor until the dense
+  arms exist.
+- **Byte identity.** Every Flash-Next allocation keeps its order and size: the matches wrap the
+  existing expressions, and the arms that print boot lines print them unchanged. Checked per
+  step against the gate's boot logs (`decode_out/gate-c5*` vs `gate-c4`, host free RAM / VRAM
+  masked).
+
+**C7: the boot reads the container's config** (2026-09-26; merge `4dcf664` of C6, then C7). C6
+put the checkpoint's config into the container (index v2, 1.7). C7 makes the boot door read it,
+and hold every config against the container it is meant for.
+
+- **The boot order** (`boot::model_geo`, called by `open_model` and by every tool that maps a
+  container):
+  1. `Cnq::peek_index(cnq_path)`: the index trailer, classified exactly as `Cnq::open` classifies
+     it (a v1 that is not the container of record, an unknown `format_version`, an altered model
+     block: `[cnq] refused: ...`), plus the tensor table. Nothing is mapped.
+  2. The `[boot] container index` line. v1: `[boot] container index v1 (the Flash-Next CNQ4.5-M
+     container of record, index sha256 a21afc43203d…): config from CROW_MODEL_DIR=<dir>` or `...
+     config from models/ beside the container (CROW_MODEL_DIR unset)`. v2: `[boot] container index
+     v2 (family F, recipe R, repo @ revision): config from its model block (config.json sha256
+     …)`, plus `, CROW_MODEL_DIR sha-checked against it` when the variable is set.
+  3. `meta::assert_pinned` → `meta::gate` (pure; `boot::geo_for` is the whole door without the
+     process, for the tests): the `CROW_MODEL_DIR` cross-check of a v2, the config by index kind,
+     `verdict` (the family row, the `Geo`), `container_mismatch`.
+  4. `Geo::built` (C5): the first unbuilt block refuses, `[boot] refused: ...`.
+  5. `Cnq::open` (the mapping), the overlay, `cuda::Ctx::init`, `Config`.
+- **Which config.** Index v2: the `model` block's `config_json` and `generation_config_json`,
+  parsed by `ModelMeta::from_config_texts` (the text half of `from_config_files`) and named
+  `<cnq> [index v2 model.config_json]` in the `meta:` line and in every refusal. `models/` beside
+  a v2 container is never read. Index v1 (only the CNQ4.5-M container of record): the pre-C7 path,
+  `meta::from_container(cnq, CROW_MODEL_DIR)`: the variable, else `models/`, else the selftest
+  WARN and `Geo::FLASH_NEXT`. `CROW_MODEL_DIR` is read once in `model_geo` and handed down; no
+  function under it reads the process environment.
+- **`CROW_MODEL_DIR` beside a v2** (`meta::check_model_dir_override`): the container's config
+  wins, the variable is a cross-check. Its `config.json`, and its `generation_config.json` when
+  the directory has one, must hash to the container's bytes, else `[meta] CROW_MODEL_DIR
+  <dir>/config.json sha256 X differs from the container's model.config_json sha256 Y (family F,
+  repo @ revision) - an index v2 container carries its own config; unset CROW_MODEL_DIR or point
+  it at the checkpoint this container was converted from - refusing to boot (Crow #300)`.
+- **The container check** (`meta::container_mismatch`). A config of the other family passes its
+  own family row, so `verdict` alone cannot catch the swap. The gate holds the config's `Geo`
+  against three facts of the index: the family the container was converted as (`model.family`,
+  `FlashNext` for the v1 container of record), `embed_tokens` = `[vocab, hidden]`, and the
+  number of distinct text layers. The refusal is one row per differing fact:
+
+  ```
+  [meta] 3 of 3 container facts differ from the config - the container and its config describe different models, refusing to boot (Crow #300):
+    family: container FlashNext (index v1), config Qwen35Dense
+    embed_tokens [vocab, hidden]: container [248320, 2560], config [248320, 5120]
+    text layers: container 48, config 64
+  [meta]   container: converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq
+  [meta]   config: engine/tests/fixtures/Qwen3.8-27B/config.json
+  ```
+
+  That is the release `decode run` on the container of record with
+  `CROW_MODEL_DIR=engine/tests/fixtures/Qwen3.8-27B`, 2026-09-26. A synthetic dense v2 container
+  whose model block is Flash-Next's dies with 2 of 3 (embedding, layers). A synthetic dense v2
+  container with the 27B's own config passes the gate (`meta: 20 constants verified ... runtime
+  Geo derived (35 fields)`) and dies at `Residual::Plain`. None of the three reached the CUDA
+  context (no `[boot] kv cache dtype` line).
+- **The `f32` dtype in the loaders.** `weights::host_f32` is the one host decode of
+  `load_small_f32` and `dequant_fp4_dev`: `bf16` widened, `f32` as stored, `nvfp4` dequantized.
+  Without the `f32` arm the dense recipe's `A_log` (8 bytes in the synthetic fixture) fell into
+  the 36-byte NVFP4 walk and came back as zeros with the length assert passing.
+- **Byte identity.** The gate container is index v1, so the gate runs the pre-C7 config path; its
+  boot differs from C5b by the one `[boot] container index v1 ... config from models/ beside the
+  container (CROW_MODEL_DIR unset)` line, and every `[budget]` / `[residency]` / `[diet]` / `[vit]`
+  / `[stage]` / `meta:` line is identical (`decode_out/gate-c7` vs `gate-c5b`, host free RAM /
+  VRAM masked).
+- **Phase 1 status.** One binary reads the model's shape from the container and refuses a
+  foreign config by name; Flash-Next is byte-identical at the gate values of record. At the end of
+  phase 1 the 27B did not run (no container, and a dense container stopped at `Residual::Plain`);
+  phase 2 built the dense arms, 8.12.
+
+### 8.12 The dense path (Crow #300 phase 2, 2026-09-26)
+
+The dense Qwen3.5/3.8 family (`Qwen35Dense`, the 27B) runs through the same `Engine`, `prefill`
+and `decode_step` as Flash-Next; each family arm of 8.11 now has a dense side. The forward pass is
+HF `modeling_qwen3_5.py` (transformers 5.16.1; the research with citations is a Crow #300
+comment): every norm but the GDN one is zero-centred `(1 + w)`, eps 1e-6, which `rms_group` and
+`rmsnorm_1pw` already compute; the attention is Flash-Next's without the QSA indexer; the GDN is
+Flash-Next's with the SiLU gate (`CN_GATE_ACT`, C4).
+
+| block | dense arm | code |
+|---|---|---|
+| residual | `Plain`: `rms_group` with one stream (grid (1, t)) into `mixed`, the sub-block, `h += sub` (`add_flat`); the same for the FFN | `Engine::rms_rows`, `residual_add`; `DenseW::ln1` / `ln2` |
+| attention | `Full`: q\|gate split, per-head q/k norms, partial RoPE, `store_kv` (unchanged kernels), then `attn_full_split`: rows `0..=pos` per query, online softmax over 64-row tiles, no row cap. Prefill S = 1 (one block per query row and head, normalized in place); decode S = `attn_splits()` + `attn_merge`, device scalars only, so the decode graph replays it | `attn_full_prompt`, `attn_full_step` |
+| FFN | `Dense`: gate and up GEMV, `silu_mul_n` (runtime width), down GEMV | `dense_ffn`; `MlpW` |
+| final norm | `Rms`: `rms_group` with `model.norm`, lm_head a `PW` (NVFP4 in the dense recipe) | `lm_head_row`; `DenseW::norm` / `lm_head` |
+| planner | no hot set: states + pending + `SAFETY` must fit the free VRAM, else a named refusal; the render reserve is granted from the rest | `manager::dense_fit` |
+| MoE machinery | `Residency::none`, `Stage::none`, no slabs, no sidecar; the adaptation entry points return at once | `residency.rs`, `gen.rs` |
+
+- **Kernels.** The two new kernels (`attn_full_split`, `silu_mul_n`) are in their own source,
+  `kernels_p2::P2_SRC`. A family that needs them compiles `prelude + KERNEL_SRC + P2_SRC`
+  (`KernelGeo::p2`); Flash-Next's text stays `prelude + KERNEL_SRC`, so its PTX of record (8.2,
+  C4) is untouched by construction. The fields of a block a family does not have are 0 in `Dims`;
+  `KernelGeo::defines` gives the kernels that are compiled but never launched a compile-only 1
+  (`CN_E`, `CN_TOPK`, `CN_INTER`, `CN_QSA_*`), which leaves Flash-Next's prelude unchanged.
+- **A latent C3 alias, fixed.** The GDN launches passed `p.n10240` as the conv channel count
+  (qkv rows, `transpose_rt`), and C3 had made `n10240` = `d.hct`, the residual width. On
+  Flash-Next both are 10240; on the 27B `hct` is 5120 and `gdn_conv` 10240. The GDN sites read
+  `p.n_gdn_conv` now.
+- **The vision tower.** The dense recipe writes none; since #122 (2026-09-27) the 27B reads
+  images through its own F16 projector (`models/<model>/mmproj-F16.gguf`, found by
+  `resolve_mmproj`, the first candidate that passes `validate_mmproj`). Without a usable
+  projector a container with no `vit` section boots with the tower off (`/props` vision false).
+- **Verified.** Sub-block goldens (`oracle/export_qwen35_goldens.py`: the HF modules on the
+  container's own dequantized weights, T = 40 prompt rows + 4 decode rows; `decode p2golden`;
+  thresholds in `decode_out/p2-golden/PREREG.md`), rel_rms engine vs golden with BF16 KV:
+  input norm 5.7e-8, MLP 1.9e-7, GDN 2.2e-6 / 2.8e-6 (prompt / decode), attention 2.0e-3 / 2.0e-3;
+  under FP8 KV the attention is 3.1e-2 / 3.2e-2. End to end (`decode parity` on a 63-token prompt
+  + 4 decode steps against `oracle/ref_qwen35_logits.py`, f32, same weights): argmax 67 / 67; with
+  FP8 KV mean KL 1.3e-4, max 1.5e-3, worst |Δlogit| 14.3 (one tail token); with BF16 KV mean KL
+  5.5e-7, max 4.6e-6, worst |Δlogit| 0.066.
+- **The MMA path** (step 2). Under `CROW_MMA=1` every NVFP4 projection of the dense arms
+  (q/k/v/o, gate/up/down, lm_head) runs Flash-Next's MMA kernels through `Engine::dense_proj`:
+  the activation rows are quantized once per input (`quant_rows`: `mixed` -> `xq_m`, `mixed_m`
+  -> `xq_gu`, the gated attention output -> `xq_o`, silu(gate)·up -> `xq_d`), then
+  `launch_mma_d` (the 8-token tile GEMM at t >= 8, `gemv_fp4_mma_d` below). Without the switch
+  and for a BF16 weight the plain GEMV of step 1 runs. `xq_o` and `xq_d` are new scratch entries,
+  0 B on Flash-Next. RTX 5090, `CROW_MMA=1 CROW_GRAPH=1`, FP8 KV: decode 36.1 ms mean over 128
+  tokens (27.7 tok/s), prefill 1,364 tok/s on a 63-token prompt; step 1 was 265 ms / 18 tok/s.
+- **The decode GEMV** (step 3). The per-kernel profile (`CROW_KPROF=1 CROW_PROFILE=1`, graph
+  off) put the 36 ms in two places the Flash-Next kernels were never built for: `quant_x_fp4`,
+  one 128-thread block per 5,120 / 17,408-wide row, 257 calls at 49 us per token (27.5 %), and
+  `gemv_fp4_mma_d` at ~640 GB/s on the 17,408 x 5,120 matrices (it computes 8 tokens per MMA and
+  gets 80-272 blocks for 170 SMs). Flash-Next's own profile beside it: 39 % `stage_cold_ca` (the
+  PCIe expert copy), its MMA GEMVs on 10-40-block matrices at 11 us. One token (t = 1) now takes
+  `gemv_nvfp4_w` (`kernels_p2`): one warp per row, the row staged 32 blocks at a time through
+  shared memory with 16-byte loads, then one pack byte and one coalesced float2 of x per lane,
+  on the f32 activation row (no quantization; exact like `gemv_fp4`). The GDN decode projections
+  of the dense family take it too (`gdn_step`: a `dense` arm before Flash-Next's, which is
+  unchanged). The prompt quantization runs one 1,024-thread block per row (the bytes of the
+  128-thread launch: `quant_row_prescaled` reads `blockDim` only as its stride). Decode 128
+  tokens: 36.1 -> 30.5 (1,024-thread quant) -> 24.1 (first `gemv_nvfp4_w`, one lane per block)
+  -> 20.8 (coalesced) -> **17.4 ms, 57.5 tok/s** (GDN too); the greedy trace is identical at
+  every step. llama.cpp on the same card, 27B `UD-Q4_K_XL` without MTP: 66.5 tok/s
+  (`manifests/operating-point.json`, 2026-08-21); the bandwidth ceiling of 14.45 GB per token is
+  ~124 tok/s. `gemv_nvfp4_w` reaches ~1.0-1.3 TB/s (gate/up 50 MB in 49 us, lm_head 715 MB in
+  548 us, profile timings include one launch latency).
+- **The speed round** (step 4). `gemv_nvfp4_w` walks the staged chunk four blocks per warp
+  step, lane l taking the 32-bit word l % 8 (8 values) of block l / 8 and two float4 of x, with
+  the e2m1 and ue4m3 tables in shared memory; `gemv_nvfp4_gu` computes the gate and the up row
+  of one FFN index in one warp (shared x loads) and writes silu(g) * u (no `silu_mul_n`, no
+  up buffer at one token); `add_rms_1k` does the plain residual's add and the pre-norm that
+  follows it in one 1,024-thread launch (the norm after the FFN is the next layer's
+  input_layernorm, after the last layer `model.norm`: `Engine::next_norm`, so the
+  `FinalNorm::Rms` arm after the loops is empty for a plain residual); `gemv_bf16_ba` runs the
+  GDN's two 48-row BF16 keeps (`in_proj_b`, `in_proj_a`) in one launch. Decode 128 tokens,
+  context 191: 17.4 -> 15.0 (word per lane + gate/up) -> 14.05 (add + norm) -> **13.70 ms,
+  73.0 tok/s**; at context 2,128: 14.6 ms (68.5 tok/s), prefill 2,049 tok/s. Greedy trace
+  identical at every step. Tried and dropped (A/B, alternating runs): a register prefetch of
+  the next chunk (15.57 ms, +0.57), two rows per warp for the 5,120-row matrices (15.21, +0.2),
+  split K over 2 / 4 warps per row (15.27 / 15.63). After the round the GEMVs run at
+  ~1.3-1.45 TB/s once the profile's launch latency is taken out; what remains beside them is
+  roughly 900 small kernels per token (the GDN step and the attention sub-steps).
+- **The 0x7F scale byte.** The mxf4nvf4 MMA instruction turns an NVFP4 scale byte 0x7F (the E4M3
+  NaN code; the scalar decode reads it as 480) into NaN. The 27B container carries four
+  (layers 11 `o_proj`, 17 `in_proj_z`, 17 `down_proj`, 37 `up_proj`), and through the MMA path each
+  one made the whole residual stream NaN (the MMA lm_head then wrote all-zero logits). Every
+  NVFP4 weight of a non-Flash-Next container is loaded through `load_pw_x`, which rewrites 0x7F to
+  0x7E (448), the rule `residency` applies to expert slabs, and logs the count
+  (`NVFP4 scale bytes 0x7F ... rewritten to 0x7E: 4`). Flash-Next loads its bytes untouched: its
+  dense weights carry four such bytes too (three `conv1d`, dequantized on the CPU, and layer 24's
+  `mlp_hyper_connection.block_inject_weight`), and the gate values of record are computed with
+  them. The oracle reads the same rule (`CnqReader(sanitize_sf=True)` in `qwen35_common.py`).
+  Regression check: golden `l17-mlp` (layer 17's `down_proj`), NaN without the rule under
+  `CROW_MMA=1`, 1.5e-3 with it.
+- **Long context** (step 6). `attn_full_fa` replaces the untiled attention in both forms (FlashAttention-2, f16
+  `mma.m16n8k16`, one block per KV head and 16 query rows, one warp per query head of the GQA group sharing each
+  K / V tile of 16 keys staged once as f16 via `cvt.rn.f16x2.e4m3x2`; decode split-K, `FA_DECODE_SPLITS` = 128 per KV
+  head into `fa_part_o` / `fa_part_ml`, then `attn_merge`), and the dense family runs the 32-token prefill GEMM tiles
+  (`DENSE_PF_GEMM_B`, set at load; Flash-Next keeps the 8-token form of record). 30k-token prompt: prefill
+  337 -> 1,279 tok/s, decode 26.2 -> 16.6 ms. `CROW_P2_FA=0` keeps the untiled kernels (A/B).
+- **serve** (step 5). `serve` boots the 27B unchanged; four places counted the attention layers
+  as the number of QSA buffers (`qsa_keys.len()` / `qsa_pooled.len()`), which is 0 for full
+  attention: `cache::Shape::of` (and through it the slot file's `kv_groups`), the park and the
+  unpark (`kv_row_order`), and the park planning line in `gen.rs`. A park then copied no KV row,
+  a slot file carried none, both without an error; they read `Geo::attn_layers` now. Pooled
+  blocks are the QSA arm only (`cache::pooled_row_bytes`: 0 for full attention; the slot check
+  wants `done_blocks` 0 there, the park and the slot payload skip them; `lend::tier1_plan` lists
+  no QSA temps), and the prefix cache holds a QSA ring per layer only when there is one.
+  Checked live on 2026-09-26 (`CROW_MMA=1 CROW_GRAPH=1`, FP8 KV): a conversation, a short
+  unrelated request (park), the conversation continued (unpark: 25 of 62 prompt tokens cached,
+  right answer), slot save (158,925,432 B, 30 ms) and restore (23 ms; the continuation reuses 62
+  of 82 tokens), VRAM lend and return (602 MiB). The F16 projector, the MTP head and the
+  per-card planner above the context floor are open.
+- **Quality instruments.** `oracle/ref_qwen35_logits.py --weights` takes `cnq`, `bf16`, `r1` (attention
+  and GDN projections through FP8 e4m3 per-tensor, NVIDIA's split for this model, the rest CNQ) and
+  `only-mlp` / `only-gdn` / `only-attn` / `only-lmhead` (that group from the container, the rest BF16),
+  so the KLD of each weight group is measured on its own (`qwen35_common.WeightSource`). `decode kvstats
+  <ids.json>` boots with `CROW_KV=bf16`, prefills and reads every attention layer's K / V cache
+  (`Engine::kv_rows_host`): |x| quantiles, the subnormal share, and the relative error of three e4m3
+  encodings (the raw cast of `store_kv`, one scale per head, one per row). Results of 2026-09-26 in the
+  CHANGELOG (Measured).
+- **MTP speculative decoding** (crow-nest #95; on by default, `CROW_MTP=0` off). Context: the dense floor and default is 65,536 (was 100,000). The BF16 head (`MtpW`, `load_mtp`) runs
+  over pairs (h_p, t_{p+1}) (`mtp_rows`: `fc` split into column halves, one gated full-attention layer with its
+  own KV cache; 1..=4 rows take the verify's per-row split-K attention). The prefill writes its KV over every
+  chunk (`mtp_prefill_chunk`). `spec_step` is `decode_step`'s drop-in: drafts (chain) -> `verify_rows` (projections
+  through `gemv_nvfp4_wm` / `gum` / `gemv_bf16_wm`, one weight read for M <= 4 rows and the one-row operation order
+  per row; GDN recurrence and attention row by row with the decode kernels; state slot per row; one CUDA graph per
+  M) -> rows drawn lazily while the fed token equals the draft -> `spec_settle` (GDN slot, position, history, the
+  head's catch-up). `AdaptiveK` picks k. The weights, slots and scratch are lendable (#117), the weights refilled
+  from host copies after a return (`mtp_refill`). Output identical to plain decoding, greedy and sampled.
+- **Scales.** The 27B container is converted with `--scales diag` (calibrated, activation-weighted
+  sub-block scales; `decode_out/p2-lh`), KLD 0.223 against BF16 (was 0.290 with `--scales mse`).
+- **KV dtype.** An unset `CROW_KV` takes `Family::default_kv`: BF16 for the dense family (FP8 failed
+  the long-context KLD criterion, 5 of 6 anchors), FP8 e4m3 for Flash-Next (values of record).
 
 ## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
 

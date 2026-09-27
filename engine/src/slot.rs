@@ -33,26 +33,34 @@
 //! | `decode_step` | one row at the current `pos`, always `>= snapshot pos` | `kernels.rs:1190-1207` |
 //! | pooled blocks | `done_blocks .. (pos_base + t) / 4`, appended only | `gen.rs:1647-1661` |
 //!
-//! Header layout (little endian, fixed 120 bytes, x86_64 native f32 and i64):
+//! Header layout (little endian, fixed 136 bytes, x86_64 native f32 and i64):
 //!
 //! ```text
 //! offset  size  field
 //!      0     8  magic "CROWSLT\x01"
-//!      8     8  format_version
-//!     16     8  load_id      (fnv1a-64 of the container path, mixed with n_hot)
-//!     24     8  n_ctx
-//!     32     8  prompt_chunk
-//!     40     8  qsa_ring_rows
-//!     48     8  gdn_layers
-//!     56     8  attn_layers
-//!     64     8  kv_groups        (attn_layers * 2 * NKV)
-//!     72     8  kv_row_bytes     (AHD * bytes per KV value)
-//!     80     8  pooled_row_bytes (QSA_HIDD * 4)
-//!     88     8  state_bytes      (Shape::snapshot_bytes, the four recurrent buffers)
-//!     96     8  pos
-//!    104     8  done_blocks
-//!    112     8  history_len
+//!      8     8  format_version   (2 since Crow #300 C3; 1 had no model fingerprint)
+//!     16     8  model_family     (geo::Family::code of the model that wrote it)
+//!     24     8  geo_hash         (geo::Geo::fingerprint of the model that wrote it)
+//!     32     8  load_id      (fnv1a-64 of the container path, mixed with n_hot)
+//!     40     8  n_ctx
+//!     48     8  prompt_chunk
+//!     56     8  qsa_ring_rows
+//!     64     8  gdn_layers
+//!     72     8  attn_layers
+//!     80     8  kv_groups        (attn_layers * 2 * Geo::kv_heads)
+//!     88     8  kv_row_bytes     (Geo::head_dim * bytes per KV value)
+//!     96     8  pooled_row_bytes (the QSA raw key width * 4)
+//!    104     8  state_bytes      (Shape::snapshot_bytes, the four recurrent buffers)
+//!    112     8  pos
+//!    120     8  done_blocks
+//!    128     8  history_len
 //! ```
+//!
+//! Crow #300 C3, the model fingerprint (format 2): `model_family` and `geo_hash` name
+//! the MODEL, not only the buffer shape. A slot file of another model family, or of the
+//! same family with any other geometry, is refused by name before a byte is read past
+//! the header - even where every buffer size happens to agree. A format 1 file (no
+//! fingerprint) is refused by name too, never guessed at: save the slot again.
 //!
 //! Payload, in this order, immediately after the header:
 //!
@@ -76,6 +84,8 @@
 //! | `filename` naming a Windows device (`NUL`, `CON`, `COM1`, `LPT1`, any extension) | 400 |
 //! | file absent or unreadable | 400 |
 //! | magic, format version or any shape field differs from this load | 400, engine untouched |
+//! | a format 1 file (written before the model fingerprint, Crow #300 C3) | 400, engine untouched |
+//! | model family or geometry fingerprint differs from the loaded model | 400, engine untouched |
 //! | file length not exactly header + payload (truncated or padded) | 400, engine untouched |
 //! | `pos` 0, `pos > n_ctx`, or `history_len != pos` | 400, engine untouched |
 //! | `done_blocks != pos / 4` | 400, engine untouched |
@@ -121,21 +131,28 @@
 use crate::cache::PrefixCache;
 use crate::cuda;
 use crate::gen::Engine;
-use crate::geo::{AHD, NKV, QSA_HIDD};
+use crate::geo::Family;
 use cudarc::driver::sys;
 use std::io::{Read, Write};
 
 /// first eight bytes of every slot file
 pub const MAGIC: [u8; 8] = *b"CROWSLT\x01";
 /// bumped whenever the payload order or the header layout changes
-pub const FORMAT_VERSION: u64 = 1;
-/// magic plus fourteen little endian u64
-pub const HEADER_BYTES: usize = 8 + 14 * 8;
+/// (2: Crow #300 C3 added `model_family` and `geo_hash`)
+pub const FORMAT_VERSION: u64 = 2;
+/// the last format without a model fingerprint; refused by name
+pub const FORMAT_VERSION_NO_FINGERPRINT: u64 = 1;
+/// magic plus sixteen little endian u64
+pub const HEADER_BYTES: usize = 8 + 16 * 8;
 
 /// the shape and the position one slot file carries (see the module doc for the layout)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     pub format_version: u64,
+    /// `geo::Family::code` of the model that wrote the file
+    pub model_family: u64,
+    /// `geo::Geo::fingerprint` of the model that wrote the file
+    pub geo_hash: u64,
     pub load_id: u64,
     pub n_ctx: u64,
     pub prompt_chunk: u64,
@@ -152,10 +169,12 @@ pub struct Header {
 }
 
 impl Header {
-    /// the fourteen u64 of the header, in file order
-    fn words(&self) -> [u64; 14] {
+    /// the sixteen u64 of the header, in file order
+    fn words(&self) -> [u64; 16] {
         [
             self.format_version,
+            self.model_family,
+            self.geo_hash,
             self.load_id,
             self.n_ctx,
             self.prompt_chunk,
@@ -172,7 +191,7 @@ impl Header {
         ]
     }
 
-    /// the fixed 120 byte head of the file
+    /// the fixed 136 byte head of the file
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(HEADER_BYTES);
         b.extend_from_slice(&MAGIC);
@@ -197,21 +216,32 @@ impl Header {
             let a = 8 + i * 8;
             u64::from_le_bytes(bytes[a..a + 8].try_into().unwrap())
         };
+        // the version decides the layout of everything after it, so it is read and
+        // judged first; a format 1 file is refused by NAME (Crow #300 C3), not parsed
+        let version = w(0);
+        if version == FORMAT_VERSION_NO_FINGERPRINT {
+            return Err(format!(
+                "slot file format version {version} carries no model fingerprint (written before Crow #300 C3); \
+                 this build writes {FORMAT_VERSION} and refuses to guess which model wrote it - save the slot again"
+            ));
+        }
         let h = Header {
-            format_version: w(0),
-            load_id: w(1),
-            n_ctx: w(2),
-            prompt_chunk: w(3),
-            qsa_ring_rows: w(4),
-            gdn_layers: w(5),
-            attn_layers: w(6),
-            kv_groups: w(7),
-            kv_row_bytes: w(8),
-            pooled_row_bytes: w(9),
-            state_bytes: w(10),
-            pos: w(11),
-            done_blocks: w(12),
-            history_len: w(13),
+            format_version: version,
+            model_family: w(1),
+            geo_hash: w(2),
+            load_id: w(3),
+            n_ctx: w(4),
+            prompt_chunk: w(5),
+            qsa_ring_rows: w(6),
+            gdn_layers: w(7),
+            attn_layers: w(8),
+            kv_groups: w(9),
+            kv_row_bytes: w(10),
+            pooled_row_bytes: w(11),
+            state_bytes: w(12),
+            pos: w(13),
+            done_blocks: w(14),
+            history_len: w(15),
         };
         if h.format_version != FORMAT_VERSION {
             return Err(format!(
@@ -248,9 +278,32 @@ impl Header {
         self.file_bytes_checked().unwrap_or(u64::MAX)
     }
 
-    /// - every field that describes the LOAD must agree; `pos` and its two friends may not
+    /// - the MODEL first (Crow #300 C3): family, then the geometry fingerprint, each
+    ///   refusal naming both sides
+    /// - then every field that describes the LOAD must agree; `pos` and its two friends may not
     /// - `Err` names the first field that differs, with both values
     pub fn shape_matches(&self, live: &Header) -> Result<(), String> {
+        let family = |code: u64| match Family::from_code(code) {
+            Some(f) => format!("{f:?} ({})", f.model_type()),
+            None => format!("unknown family code {code}"),
+        };
+        if self.model_family != live.model_family {
+            return Err(format!(
+                "slot file model family {}, this engine runs {}; a slot file is only valid for the \
+                 model that wrote it (Crow #300)",
+                family(self.model_family),
+                family(live.model_family)
+            ));
+        }
+        if self.geo_hash != live.geo_hash {
+            return Err(format!(
+                "slot file model geometry fingerprint {:#018x}, this engine's {} geometry is {:#018x}; \
+                 a slot file is only valid for the model that wrote it (Crow #300)",
+                self.geo_hash,
+                family(live.model_family),
+                live.geo_hash
+            ));
+        }
         let rows: [(&str, u64, u64); 10] = [
             ("load id", self.load_id, live.load_id),
             ("n_ctx", self.n_ctx, live.n_ctx),
@@ -295,12 +348,14 @@ impl Header {
         // gen.rs:1648 and gen.rs:2696 both set done_blocks = floor(pos / 4), so this is an
         // equality, not a bound. It is the ONLY thing between a crafted header and a device
         // write past `qsa_pooled`, which holds ceil(n_ctx / 4) blocks (manager.rs:216-219).
-        if self.done_blocks != self.pos / 4 {
+        // Crow #300 phase 2: a model without pooled blocks (full attention, pooled_row_bytes 0)
+        // keeps done_blocks at 0
+        let want = if live.pooled_row_bytes == 0 { 0 } else { self.pos / 4 };
+        if self.done_blocks != want {
             return Err(format!(
-                "file done blocks {}, position {} needs exactly {} (floor of pos/4, gen.rs:1648)",
+                "file done blocks {}, position {} needs exactly {want} (floor of pos/4, gen.rs:1648; 0 without pooled blocks)",
                 self.done_blocks,
                 self.pos,
-                self.pos / 4
             ));
         }
         if self.history_len != self.pos {
@@ -402,17 +457,20 @@ pub struct Restored {
 /// the geometry of THIS load, with `pos`, `done_blocks` and `history_len` of the held slot
 pub fn live_header(eng: &Engine, cache: &PrefixCache, model_path: &str) -> Header {
     let shape = cache.shape();
+    let geo = &eng.geo;
     Header {
         format_version: FORMAT_VERSION,
+        model_family: geo.family.code(),
+        geo_hash: geo.fingerprint(),
         load_id: load_id(model_path, eng.cfg.n_hot),
         n_ctx: eng.st.context as u64,
         prompt_chunk: eng.cfg.prompt_chunk as u64,
         qsa_ring_rows: eng.st.qsa_ring_rows as u64,
         gdn_layers: shape.gdn_layers as u64,
         attn_layers: shape.attn_layers as u64,
-        kv_groups: (shape.attn_layers * 2 * NKV) as u64,
-        kv_row_bytes: (AHD * eng.st.kv.byte_per_value()) as u64,
-        pooled_row_bytes: (QSA_HIDD * 4) as u64,
+        kv_groups: (shape.attn_layers * 2 * geo.kv_heads) as u64,
+        kv_row_bytes: (geo.head_dim * eng.st.kv.byte_per_value()) as u64,
+        pooled_row_bytes: crate::cache::pooled_row_bytes(geo) as u64,
         state_bytes: shape.snapshot_bytes() as u64,
         pos: 0,
         done_blocks: 0,
@@ -439,11 +497,12 @@ fn bytes_into_f32(src: &[u8], dst: &mut [f32]) {
 /// - a CUDA context must be current and `src` must hold at least `dst.len()` bytes
 /// The KV row groups in file order - layer, then K before V, then kv head:
 /// this sequence IS the payload layout, so save and restore both walk it here.
-pub(crate) fn kv_row_order(attn_layers: usize) -> impl Iterator<Item = (usize, bool, usize)> {
-    (0..attn_layers).flat_map(|layer| {
+pub(crate) fn kv_row_order(attn_layers: usize, kv_heads: usize) -> impl Iterator<Item = (usize, bool, usize)> {
+    // C3: `kv_heads` is the model's `Geo::kv_heads` (2 on Flash-Next)
+    (0..attn_layers).flat_map(move |layer| {
         [true, false]
             .into_iter()
-            .flat_map(move |is_k| (0..NKV).map(move |kvh| (layer, is_k, kvh)))
+            .flat_map(move |is_k| (0..kv_heads).map(move |kvh| (layer, is_k, kvh)))
     })
 }
 
@@ -544,12 +603,13 @@ pub unsafe fn save(
     // whatever the last request left in flight must land before the copies read it
     cuda::sync();
     let mut kv_row = vec![0u8; pos * h.kv_row_bytes as usize];
-    for (layer, is_k, kvh) in kv_row_order(h.attn_layers as usize) {
+    for (layer, is_k, kvh) in kv_row_order(h.attn_layers as usize, eng.geo.kv_heads) {
         dtoh_bytes(&mut kv_row, eng.st.kv_row_ptr(layer, is_k, kvh, 0));
         put(&mut w, &kv_row, &mut n_written, &tmp)?;
     }
     let mut pooled = vec![0u8; done_blocks * h.pooled_row_bytes as usize];
-    for layer in 0..h.attn_layers as usize {
+    // full attention pools nothing (pooled_row_bytes 0, no `qsa_pooled` buffers)
+    for layer in 0..if h.pooled_row_bytes == 0 { 0 } else { h.attn_layers as usize } {
         dtoh_bytes(&mut pooled, eng.st.qsa_pooled[layer]);
         put(&mut w, &pooled, &mut n_written, &tmp)?;
     }
@@ -646,12 +706,13 @@ pub unsafe fn restore(
     }
 
     let kv_bytes = h.pos as usize * h.kv_row_bytes as usize;
-    for (layer, is_k, kvh) in kv_row_order(h.attn_layers as usize) {
+    for (layer, is_k, kvh) in kv_row_order(h.attn_layers as usize, eng.geo.kv_heads) {
         fill(&mut f, &mut buf, kv_bytes, &mut n_payload)?;
         cuda::upload_into(eng.st.kv_row_ptr(layer, is_k, kvh, 0), &buf);
     }
     let pooled_bytes = h.done_blocks as usize * h.pooled_row_bytes as usize;
-    for layer in 0..h.attn_layers as usize {
+    // full attention pools nothing (pooled_row_bytes 0, no `qsa_pooled` buffers)
+    for layer in 0..if h.pooled_row_bytes == 0 { 0 } else { h.attn_layers as usize } {
         fill(&mut f, &mut buf, pooled_bytes, &mut n_payload)?;
         cuda::upload_into(eng.st.qsa_pooled[layer], &buf);
     }
@@ -685,6 +746,44 @@ pub unsafe fn restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geo::{Geo, NKV};
+
+    /// Crow #300 C3: a format 1 slot file (120 bytes of header, no model fingerprint)
+    /// is refused by NAME - it is never parsed with the format 2 layout
+    #[test]
+    fn a_format_one_slot_file_is_refused_by_name() {
+        // the pre-C3 layout: magic, then fourteen u64 starting with version 1
+        let mut b = MAGIC.to_vec();
+        for w in [1u64, 0x0123_4567_89ab_cdef, 200_000, 2048, 2052, 36, 12, 48, 256, 512, 130_646_016, 16_064, 4016, 16_064] {
+            b.extend_from_slice(&w.to_le_bytes());
+        }
+        b.resize(HEADER_BYTES, 0); // the restore reads a full format 2 head
+        let e = Header::decode(&b).unwrap_err();
+        assert!(e.contains("format version 1") && e.contains("no model fingerprint"), "{e}");
+    }
+
+    /// Crow #300 C3: a slot file written by another model is refused by name even
+    /// when every buffer size agrees - the family first, then the geometry
+    #[test]
+    fn a_slot_file_of_another_model_is_refused_by_name() {
+        let mut h = live();
+        h.model_family = Family::Qwen35Dense.code();
+        let e = h.shape_matches(&live()).unwrap_err();
+        assert!(e.contains("Qwen35Dense (qwen3_5_text)") && e.contains("FlashNext (qwen4_exp_text)"), "{e}");
+        // same family, any other geometry: the fingerprint catches it
+        let mut other = Geo::FLASH_NEXT;
+        other.rope_theta = 1e6;
+        assert_ne!(other.fingerprint(), Geo::FLASH_NEXT.fingerprint());
+        let mut h = live();
+        h.geo_hash = other.fingerprint();
+        let e = h.shape_matches(&live()).unwrap_err();
+        assert!(e.contains("geometry fingerprint") && e.contains("FlashNext"), "{e}");
+        // and a header that encodes a family no build knows names the code
+        let mut h = live();
+        h.model_family = 99;
+        let e = h.shape_matches(&live()).unwrap_err();
+        assert!(e.contains("unknown family code 99"), "{e}");
+    }
 
     /// the file layout: kv_groups groups, layer-major, K before V, kv head ascending.
     /// A save and the restore that reads it back walk this same sequence, so a
@@ -692,7 +791,7 @@ mod tests {
     #[test]
     fn kv_row_order_is_the_file_layout() {
         let h = live();
-        let got: Vec<(usize, bool, usize)> = kv_row_order(h.attn_layers as usize).collect();
+        let got: Vec<(usize, bool, usize)> = kv_row_order(h.attn_layers as usize, NKV).collect();
         assert_eq!(got.len() as u64, h.kv_groups, "one group per (layer, k/v, kv head)");
         assert_eq!(&got[..4], &[(0, true, 0), (0, true, 1), (0, false, 0), (0, false, 1)]);
         let last = h.attn_layers as usize - 1;
@@ -708,6 +807,8 @@ mod tests {
     fn live() -> Header {
         Header {
             format_version: FORMAT_VERSION,
+            model_family: Family::FlashNext.code(),
+            geo_hash: Geo::FLASH_NEXT.fingerprint(),
             load_id: 0x0123_4567_89ab_cdef,
             n_ctx: 200_000,
             prompt_chunk: 2048,
@@ -725,8 +826,8 @@ mod tests {
     }
 
     #[test]
-    fn a_header_is_exactly_one_hundred_and_twenty_bytes() {
-        assert_eq!(HEADER_BYTES, 120);
+    fn a_header_is_exactly_one_hundred_and_thirty_six_bytes() {
+        assert_eq!(HEADER_BYTES, 136);
         assert_eq!(live().encode().len(), HEADER_BYTES);
     }
 
@@ -801,6 +902,8 @@ mod tests {
     #[test]
     fn every_shape_field_is_checked() {
         let fields: Vec<(&str, fn(&mut Header))> = vec![
+            ("model family", |h| h.model_family = Family::Qwen35Dense.code()),
+            ("geometry fingerprint", |h| h.geo_hash ^= 1),
             ("load", |h| h.load_id ^= 1),
             ("n_ctx", |h| h.n_ctx += 1),
             ("prompt chunk", |h| h.prompt_chunk = 512),
@@ -858,6 +961,31 @@ mod tests {
             let e = h.check_content(&live()).unwrap_err();
             assert!(e.contains(name), "case {name}: message was {e:?}");
         }
+    }
+
+    /// Crow #300 phase 2: a model without pooled blocks (full attention: pooled_row_bytes 0)
+    /// keeps done_blocks at 0; the file's pooled payload is empty and the KV groups count
+    /// the Geo's attention layers (`Shape::of`), not the QSA buffers (of which it has none)
+    #[test]
+    fn a_full_attention_slot_has_no_pooled_blocks_and_keeps_its_kv_rows() {
+        let g = crate::meta::dense_fixture_geo();
+        assert_eq!(crate::cache::pooled_row_bytes(&g), 0);
+        assert_eq!(crate::cache::pooled_row_bytes(&Geo::FLASH_NEXT), 512, "the QSA raw key width x 4");
+        let mut live = live();
+        live.pooled_row_bytes = 0;
+        live.attn_layers = g.attn_layers as u64;
+        live.kv_groups = (g.attn_layers * 2 * g.kv_heads) as u64;
+        let mut h = live;
+        h.pos = 12;
+        h.history_len = 12;
+        h.done_blocks = 0;
+        assert_eq!(h.check_content(&live), Ok(()));
+        h.done_blocks = 3;
+        assert!(h.check_content(&live).unwrap_err().contains("0 without pooled blocks"));
+        h.done_blocks = 0;
+        // KV rows of every attention layer are in the payload; pooled rows are not
+        let kv = h.pos * h.kv_row_bytes * h.kv_groups;
+        assert_eq!(h.payload_bytes(), h.state_bytes + kv + h.history_len * 8);
     }
 
     /// the review finding: `done_blocks` is a device upload length for a buffer sized
