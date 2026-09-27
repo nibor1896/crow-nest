@@ -282,8 +282,11 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="457"
+TESTS="458"
 CLIPPY="1494"
+#   tests 457 -> 458 / clippy 1494 (unchanged)   crow-nest #123, image mrope positions (2026-09-27): +1
+#                              `vit::reserve::image_positions_are_the_merged_grid_in_raster_order_like_hf`
+#                              (red with the old block-major formula: [6, 6, 20] where HF gives [6, 6, 34]).
 #   tests 454 -> 457 / clippy 1494 (unchanged)   crow-nest #122, the dense 27B's F16 projector (2026-09-27): +3
 #                              `vit::budget_and_mmproj::a_refused_projector_is_skipped_and_a_dense_container_without_one_boots_without_vision`
 #                              (red with the old first-file-wins / always-fall-back rule), `..::the_dense_projector_is_told_apart_by_its_merger_width`,

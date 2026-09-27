@@ -1479,10 +1479,14 @@ pub fn expand_ids(ids: &[u32], counts: &[usize]) -> Result<Vec<u32>, String> {
     Ok(out)
 }
 
-/// `get_rope_index` (Qwen4ExpModel) for one sequence: text groups run
-/// arange + current_pos on all three axes; each image group gets
-/// T = current_pos, H = current_pos + hpos, W = current_pos + wpos over its
-/// merged tokens (block-major order), then current_pos += max(hp, wp) / 2.
+/// `get_rope_index` (Qwen4ExpModel / Qwen3_5Model) for one sequence: text
+/// groups run arange + current_pos on all three axes; each image group gets
+/// T = current_pos, H = current_pos + row, W = current_pos + col over its
+/// merged tokens in RASTER order of the merged grid (hp/2 x wp/2,
+/// `get_vision_position_ids`; llama.cpp `MTMD_POS_TYPE_MROPE`), then
+/// current_pos += max(hp, wp) / 2. #123: until 2026-09-27 this decomposed the
+/// merged-token index in the tower's block-major PATCH order (bh, bw, iy, ix),
+/// which put W up to wp - 1 and H only up to ~hp/4.
 /// Returns per-row (T, H, W) and the mrope delta (max + 1 - seq_len).
 pub fn mrope_positions(types: &[u8], grids: &[Grid]) -> (Vec<[i64; 3]>, i64) {
     let mut it = grids.iter();
@@ -1506,17 +1510,10 @@ pub fn mrope_positions(types: &[u8], grids: &[Grid]) -> (Vec<[i64; 3]>, i64) {
             let (_t, hp, wp) = *g;
             let gw = wp / VIT_MERGE;
             for k in 0..len {
-                // block-major token order: bh, bw, iy, ix
-                let bh = k / (gw * VIT_MERGE * VIT_MERGE);
-                let rem = k % (gw * VIT_MERGE * VIT_MERGE);
-                let bw = rem / (VIT_MERGE * VIT_MERGE);
-                let r2 = rem % (VIT_MERGE * VIT_MERGE);
-                let iy = r2 / VIT_MERGE;
-                let ix = r2 % VIT_MERGE;
+                // merged-grid raster order: row-major over (hp/2, wp/2)
+                let (row, col) = (k / gw, k % gw);
                 let t_ax = cur; // arange(t) = 0, + start_position after
-                let h_ax = cur + (bh * VIT_MERGE + iy) as i64;
-                let w_ax = cur + (bw * VIT_MERGE + ix) as i64;
-                out.push([t_ax, h_ax, w_ax]);
+                out.push([t_ax, cur + row as i64, cur + col as i64]);
             }
             cur += (hp.max(wp) / VIT_MERGE) as i64;
         }
@@ -1723,6 +1720,32 @@ mod reserve {
     }
 
     /// the span tables are `n_ctx` rows since serve clamps the budget before arming them
+    #[test]
+    fn image_positions_are_the_merged_grid_in_raster_order_like_hf() {
+        // #123: hand-computed from transformers 5.16.1 `get_vision_position_ids`
+        // (modeling_qwen3_5.py:1240-1290); 6 text rows, the image, 5 text rows
+        let seq = |n_img: usize| [vec![0u8; 6], vec![1u8; n_img], vec![0u8; 5]].concat();
+        // wide [1,32,58]: 16 rows x 29 cols of merged tokens
+        let (p, delta) = mrope_positions(&seq(464), &[(1, 32, 58)]);
+        assert_eq!(p.len(), 475);
+        assert_eq!(p[5], [5, 5, 5]);
+        assert_eq!(p[6], [6, 6, 6]);
+        assert_eq!(p[6 + 28], [6, 6, 34], "the end of the first merged row");
+        assert_eq!(p[6 + 29], [6, 7, 6], "the second merged row starts at col 0");
+        assert_eq!(p[469], [6, 21, 34], "the last image token");
+        assert_eq!(p[470], [35, 35, 35], "text resumes at cur + max(h, w) / 2");
+        assert_eq!(delta, -435);
+        let img = &p[6..470];
+        assert_eq!(img.iter().map(|r| r[1]).max(), Some(21));
+        assert_eq!(img.iter().map(|r| r[2]).max(), Some(34));
+        // tall [1,58,32]: 29 rows x 16 cols
+        let (p, delta) = mrope_positions(&seq(464), &[(1, 58, 32)]);
+        assert_eq!(p[6 + 16], [6, 7, 6]);
+        assert_eq!(p[469], [6, 34, 21]);
+        assert_eq!(p[470], [35, 35, 35]);
+        assert_eq!(delta, -435);
+    }
+
     #[test]
     fn the_mrope_span_is_the_whole_context_cos_and_sin() {
         assert_eq!(mrope_bytes(200_000, 32), 51_200_000);
