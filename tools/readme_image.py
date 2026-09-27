@@ -50,7 +50,7 @@ def section(y, title, acc, sub=""):
     lx = 80 + len(title) * 10.4
     if sub:
         t(lx, y + 16, sub, 12.5, C["dim"])
-        lx += len(sub) * 6.0 + 16
+        lx += len(sub) * 6.4 + 16
     o.append(f'<line x1="{lx:.0f}" y1="{y+11}" x2="{X1}" y2="{y+11}" stroke="{C["line"]}"/>')
     return y + 40
 
@@ -78,7 +78,7 @@ card(X0, y, 800, 300, r=14)
 o.append(f'<svg x="48" y="44" width="280" height="280" viewBox="0 0 1024 1024">{mark()}</svg>')
 t(340, 146, "CROW-NEST", 50, C["text"], weight=300, ls=12)
 t(344, 182, "INFERENCE ENGINE", 13, C["faint"], ls=5)
-o.append(f'<text x="342" y="226" font-family="{UI}" font-size="20" fill="{C["soft"]}">One model, one GPU, its own quant.'
+o.append(f'<text x="342" y="226" font-family="{UI}" font-size="20" fill="{C["soft"]}">One GPU, its own quant, two model families.'
          f'<tspan fill="{C["mark"]}">▍<animate attributeName="opacity" values="1;1;0;0" keyTimes="0;.5;.5;1" '
          f'dur="1.1s" repeatCount="indefinite"/></tspan></text>')
 x = 342
@@ -89,38 +89,44 @@ for label, acc in (("v" + VERSION, "mark"), ("Apache-2.0", "faint"), ("Linux · 
 # ---------------------------------------------------------------- intro text
 y = 364
 for i, line in enumerate((
-        "An inference engine for one model on one GPU: its own quantization, its own container,",
-        "thin CUDA kernels in Rust. OpenAI-compatible HTTP, and the engine behind Crow.",
-        "Qwen3.8-Flash-Next as CNQ4.5-M, converted from the original safetensors.")):
+        "An inference engine for one GPU: its own quantization, its own container, thin CUDA",
+        "kernels in Rust. OpenAI-compatible HTTP, and the engine behind Crow. Two models from the",
+        "original safetensors: Qwen3.8-Flash-Next as CNQ4.5-M and the dense Qwen3.8-27B as CNQ4.5.")):
     t(W / 2, y + i * 24, line, 15.5, C["soft"], anchor="middle")
 
 # ---------------------------------------------------------------- stats
 y = 452
-STATS = [("45.1", "tok/s decode"), ("771", "tok/s prefill, 16k prompt"), ("104.7 GB", "one container file"),
-         ("4.5 bpw", "NVFP4, CNQ4.5-M"), ("200k", "context, one slot"), ("1.7 GiB", "VRAM lent to Crow while idle")]
+STATS = [("45.1", "tok/s decode, Flash-Next"), ("771", "tok/s prefill, 16k prompt"), ("104.7 GB", "Flash-Next container file"),
+         ("4.5 bpw", "NVFP4, CNQ4.5-M"), ("200k", "context, one slot"), ("1.7 GiB", "VRAM lent to Crow while idle"),
+         ("120", "tok/s decode, 27B with MTP"), ("17.8 GB", "27B container file"), ("8.48 GiB", "free beside the 27B, 64k context")]
+STATS_NOTE = ("Flash-Next: decode and prefill v0.3.0, one RTX 5090, Windows, 2026-09-13/14; VRAM loan #117, 2026-09-25.",
+              "27B: one RTX 5090, Linux, CROW_MMA=1 CROW_GRAPH=1, BF16 KV, 2026-09-27 (#95, #122). Conditions: docs/measurements.md, CHANGELOG.md")
 for i, (v, l) in enumerate(STATS):
     sx, sy = X0 + (i % 3) * 270, y + (i // 3) * 86
     card(sx, sy, 260, 76, C["raised"], C["raised"])
     t(sx + 18, sy + 36, v, 26, C["text"], MONO, 600)
     t(sx + 18, sy + 59, l, 12.5, C["faint"])
-t(W / 2, y + 190, "Decode and prefill: v0.3.0, one RTX 5090, Windows, 2026-09-13/14. VRAM loan: #117, 2026-09-25. Conditions: docs/measurements.md",
-  11, C["dim"], anchor="middle")
+SROWS = len(STATS) // 3
+for k, line in enumerate(STATS_NOTE):
+    t(W / 2, y + SROWS * 86 + 18 + k * 16, line, 11, C["dim"], anchor="middle")
 
 # ---------------------------------------------------------------- features
-y = section(686, "Features", "ok")
+y = section(y + SROWS * 86 + 62, "Features", "ok")
 FEATURES = [
- ("Own quantization", "CNQ4.5-M: NVFP4 at 4.5 bits per weight", "ok"),
+ ("Own quantization", "CNQ4.5: NVFP4 at 4.5 bits per weight", "ok"),
  ("Own container", "one .cnq file with a verification sidecar", "gold"),
  ("Rust + CUDA", "thin kernels via NVRTC, Blackwell sm_120", "sub"),
  ("OpenAI-compatible", "HTTP API, Crow is the client", "ok"),
- ("Vision", "1,024 to 1,280 visual tokens per image", "gold"),
- ("Hot set", "calibrated on real Crow traffic (#106)", "sub"),
- ("Prefix cache", "a side request parks the main conversation", "ok"),
- ("GPU sharing", "lends ~1.7 GiB VRAM to Crow's renderer", "gold"),
+ ("Two model families", "MoE Qwen3.8-Flash-Next, dense Qwen3.8-27B", "gold"),
+ ("MTP on the 27B", "speculative decode, output identical to plain", "sub"),
+ ("Vision", "both models, 1,024 to 1,280 tokens per image", "ok"),
+ ("Hot set", "Flash-Next, calibrated on Crow traffic (#106)", "gold"),
+ ("Prefix cache", "a side request parks the main conversation", "sub"),
+ ("GPU sharing", "lends VRAM to Crow's renderer while idle", "ok"),
+ ("Image generation", "the 27B at 64k leaves room for Qwen-Image 2.1", "gold"),
  ("Sampling", "the model card's row, never greedy (#111)", "sub"),
- ("Requests", "max_completion_tokens, bodies up to 100 MiB", "ok"),
- ("Output integrity", "#91 fixed 2026-09-23: 60 to 0 corrupt tokens", "gold"),
- ("Linux + Windows", "a memory-bounded scope on Linux", "sub"),
+ ("Output integrity", "#91 fixed 2026-09-23: 60 to 0 corrupt tokens", "ok"),
+ ("Linux + Windows", "Flash-Next on both, the 27B measured on Linux", "gold"),
 ]
 for i, (ti, d, acc) in enumerate(FEATURES):
     fx, fy = X0 + (i % 2) * 405, y + (i // 2) * 80
@@ -128,31 +134,38 @@ for i, (ti, d, acc) in enumerate(FEATURES):
     o.append(f'<circle cx="{fx+22}" cy="{fy+26}" r="4" fill="{C[acc]}"/>')
     t(fx + 36, fy + 31, ti, 16, C["text"], weight=600)
     t(fx + 36, fy + 53, escape(d), 12.5, C["faint"])
-y += 6 * 80 + 20
+y += (len(FEATURES) + 1) // 2 * 80 + 20
 
 # ---------------------------------------------------------------- measured
 y = section(y, "Measured, not claimed.", "gold")
-card(X0, y, 800, 160)
 MEAS = [("60 → 0", C["ok"], "corrupt tokens, live agent|run 2026-09-23 (#91)"),
         ("4/23", C["gold"], "corruption set 2026-09-23,|was 15/23; llama.cpp 4/23"),
         ("45.1 / 44.9", C["sub"], "tok/s decode vs llama.cpp,|same prompt, 2026-09-13/14"),
-        ("bit-identical", C["mark"], "greedy ids against|llama.cpp, 2026-09-13/14")]
+        ("bit-identical", C["mark"], "greedy ids against|llama.cpp, 2026-09-13/14"),
+        ("0.290 → 0.223", C["ok"], "27B KLD vs BF16, calibrated|scales, 2026-09-26"),
+        ("120 / 123.05", C["gold"], "27B MTP decode vs llama.cpp|MTP, 2026-09-27 (#95)"),
+        ("byte-identical", C["sub"], "27B MTP output against|plain decode, 2026-09-27"),
+        ("11 / 11", C["mark"], "27B colour probe, own F16|projector, 2026-09-27 (#122)")]
+MROWS = (len(MEAS) + 3) // 4
+card(X0, y, 800, 60 + MROWS * 100)
 for i, (v, col, d) in enumerate(MEAS):
-    mx = X0 + 24 + i * 194
-    t(mx, y + 46, v, 19, col, MONO, 600)
+    mx, my = X0 + 24 + (i % 4) * 194, y + (i // 4) * 100
+    t(mx, my + 46, v, 19, col, MONO, 600)
     for k, part in enumerate(d.split("|")):
-        t(mx, y + 74 + k * 18, escape(part), 12.5, C["faint"])
-t(X0 + 24, y + 128, "Every figure has an issue or a release note behind it. Full table: docs/status.md", 13, C["soft"])
-y += 200
+        t(mx, my + 74 + k * 18, escape(part), 12.5, C["faint"])
+t(X0 + 24, y + MROWS * 100 + 28, "Every figure has an issue or a release note behind it. Full table: docs/status.md", 13, C["soft"])
+y += MROWS * 100 + 100
 
 # ---------------------------------------------------------------- requirements
-y = section(y, "Requirements", "sub", "one model, one GPU")
+y = section(y, "Requirements", "sub", "one GPU, either model")
 REQ = [("GPU", "NVIDIA Blackwell sm_120, RTX 5090 32 GB"),
        ("Host RAM", "64 GB"),
        ("CUDA", "13.3 runtime (NVRTC)"),
        ("Rust", "stable"),
-       ("OS", "Linux, Windows"),
-       ("Container", "Qwen3.8-Flash-Next-CNQ4.5-M.cnq, 104.7 GB, Hugging Face")]
+       ("OS", "Linux, Windows; the 27B measured on Linux only"),
+       ("Container", "Qwen3.8-Flash-Next-CNQ4.5-M.cnq, 104.7 GB, Hugging Face"),
+       ("27B container", "Qwen3.8-27B-CNQ4.5.cnq, 17.8 GB, built with the converter"),
+       ("27B vision", "models/Qwen3.8-27B/mmproj-F16.gguf, the F16 projector")]
 card(X0, y, 800, 24 + len(REQ) * 34)
 for i, (g, v) in enumerate(REQ):
     ry = y + 20 + i * 34
@@ -163,12 +176,17 @@ for i, (g, v) in enumerate(REQ):
 y += 24 + len(REQ) * 34 + 40
 
 # ---------------------------------------------------------------- against llama.cpp
-y = section(y, "Against llama.cpp", "mark", "same card, same model family")
-OPS = [("Decode, Windows", "45.1", "44.9", "tok/s, same prompt"),
-       ("Prefill, Windows", "771", "922.5", "tok/s, 16k reference prompt"),
-       ("Prefill, Linux", "968", "", "tok/s, cold, same 16k prompt"),
-       ("Decode, Linux", "36.8", "", "tok/s at 16k context")]
-card(X0, y, 800, 40 + len(OPS) * 44 + 44)
+y = section(y, "Against llama.cpp", "mark", "same card, same models")
+OPS = [("Flash-Next decode, Windows", "45.1", "44.9", "tok/s, same prompt"),
+       ("Flash-Next prefill, Windows", "771", "922.5", "tok/s, 16k reference prompt"),
+       ("Flash-Next prefill, Linux", "968", "", "tok/s, cold, same 16k prompt"),
+       ("Flash-Next decode, Linux", "36.8", "", "tok/s at 16k context"),
+       ("27B decode, Linux", "72.3", "66.5", "tok/s, plain"),
+       ("27B decode + MTP, Linux", "120.2", "123.05", "tok/s, speculative"),
+       ("27B decode at 30k, Linux", "58.9", "", "tok/s plain; 72.1 with MTP")]
+OPS_NOTE = ("crow-nest v0.3.0, one RTX 5090: Windows 2026-09-13/14 (#62, #10), Linux 2026-09-17 (v0.3.0 notes). CROW_PF_GEMM_B=1: 871.",
+            "27B: 2026-09-27 (#95), median of 3, 512 tokens; llama.cpp = Crow's 27B UD-Q4_K_XL point on its own Crow turn (Crow #118).")
+card(X0, y, 800, 40 + len(OPS) * 44 + 60)
 for hx, h in ((64, "measure"), (300, "crow-nest"), (430, "llama.cpp"), (560, "unit")):
     t(hx, y + 26, h, 11.5, C["dim"], ls=1)
 for i, (a, cn, lc, u) in enumerate(OPS):
@@ -178,17 +196,19 @@ for i, (a, cn, lc, u) in enumerate(OPS):
     t(300, ry + 28, cn, 15, C["mark"], MONO, 600)
     t(430, ry + 28, lc or "—", 15, C["soft"], MONO, 600)
     t(560, ry + 28, u, 13, C["faint"])
-t(X0 + 24, y + 40 + len(OPS) * 44 + 26, "crow-nest v0.3.0, one RTX 5090: Windows 2026-09-13/14 (#62, #10), Linux 2026-09-17 (v0.3.0 notes). CROW_PF_GEMM_B=1: 871.", 11.5, C["dim"])
-y += 40 + len(OPS) * 44 + 40 + 30
+for k, line in enumerate(OPS_NOTE):
+    t(X0 + 24, y + 40 + len(OPS) * 44 + 26 + k * 16, line, 11.5, C["dim"])
+y += 40 + len(OPS) * 44 + 60 + 40
 
 # ---------------------------------------------------------------- run pointer
 y = section(y, "Build and run", "ok")
-card(X0, y, 800, 118, C["term"], C["bevel"], 12)
+card(X0, y, 800, 140, C["term"], C["bevel"], 12)
 t(X0 + 24, y + 38, "Build, run and ask. Copy it right below this picture.", 16, C["text"], weight=600)
 t(X0 + 24, y + 66, "cargo build, then serve on port 8099. Crow connects with --base-url.", 13, C["faint"])
-t(X0 + 24, y + 90, "The 104.7 GB container downloads from Hugging Face.", 13, C["faint"])
+t(X0 + 24, y + 90, "The 104.7 GB Flash-Next container downloads from Hugging Face.", 13, C["faint"])
+t(X0 + 24, y + 114, "The 17.8 GB 27B container is built locally with the converter.", 13, C["faint"])
 t(X1 - 30, y + 66, "↓", 40, C["ok"], anchor="end")
-y += 158
+y += 180
 
 
 def wrap(text, n):
@@ -219,7 +239,7 @@ def mobile():
     t(W / 2, y + 222, "CROW-NEST", 40, C["text"], weight=300, anchor="middle", ls=8)
     t(W / 2, y + 248, "INFERENCE ENGINE", 12.5, C["faint"], anchor="middle", ls=5)
     o.append(f'<text x="{W/2}" y="{y + 284}" text-anchor="middle" font-family="{UI}" font-size="18" fill="{C["soft"]}">'
-             f'One model, one GPU, its own quant.<tspan fill="{C["mark"]}">▍<animate attributeName="opacity" values="1;1;0;0" '
+             f'One GPU, its own quant, two model families.<tspan fill="{C["mark"]}">▍<animate attributeName="opacity" values="1;1;0;0" '
              f'keyTimes="0;.5;.5;1" dur="1.1s" repeatCount="indefinite"/></tspan></text>')
     pills = (("v" + VERSION, "mark"), ("Apache-2.0", "faint"), ("Linux · Windows · sm_120", "sub"))
     tot = sum(22 + len(l) * 7.6 for l, _ in pills) + 10 * (len(pills) - 1)
@@ -228,20 +248,21 @@ def mobile():
         x = pill(x, y + 304, label, C[acc])
     y += 350 + 26
 
-    intro = ("An inference engine for one model on one GPU: its own quantization, its own container, thin CUDA "
-             "kernels in Rust. OpenAI-compatible HTTP, and the engine behind Crow. Qwen3.8-Flash-Next as "
-             "CNQ4.5-M, converted from the original safetensors.")
+    intro = ("An inference engine for one GPU: its own quantization, its own container, thin CUDA kernels in "
+             "Rust. OpenAI-compatible HTTP, and the engine behind Crow. Two models from the original "
+             "safetensors: Qwen3.8-Flash-Next as CNQ4.5-M and the dense Qwen3.8-27B as CNQ4.5.")
     for i, line in enumerate(wrap(intro, 46)):
         t(W / 2, y + i * 23, line, 16, C["soft"], anchor="middle")
     y += len(wrap(intro, 46)) * 23 + 14
 
     for i, (v, l) in enumerate(STATS):
         sx, sy = X0 + (i % 2) * 214, y + (i // 2) * 84
-        card(sx, sy, 206, 76, C["raised"], C["raised"])
+        last = i == len(STATS) - 1 and i % 2 == 0  # an odd card out spans both columns
+        card(sx, sy, CW if last else 206, 76, C["raised"], C["raised"])
         t(sx + 16, sy + 36, v, 24, C["text"], MONO, 600)
         t(sx + 16, sy + 59, escape(l), 13, C["faint"])
-    y += 3 * 84 + 8
-    note = "Decode and prefill: v0.3.0, one RTX 5090, Windows, 2026-09-13/14. VRAM loan: #117, 2026-09-25. Conditions: docs/measurements.md"
+    y += (len(STATS) + 1) // 2 * 84 + 8
+    note = " ".join(STATS_NOTE)
     for i, line in enumerate(wrap(note, 62)):
         t(W / 2, y + i * 16, line, 11.5, C["dim"], anchor="middle")
     y += len(wrap(note, 62)) * 16 + 30
@@ -256,15 +277,16 @@ def mobile():
     y += len(FEATURES) * 74 + 26
 
     y = msection(y, "Measured, not claimed.", "gold")
-    card(X0, y, CW, 262)
+    mh = (len(MEAS) + 1) // 2 * 104
+    card(X0, y, CW, mh + 54)
     for i, (v, col, d) in enumerate(MEAS):
         mx, my = X0 + 18 + (i % 2) * 206, y + 16 + (i // 2) * 104
         t(mx, my + 24, v, 18, col, MONO, 600)
         for k, part in enumerate(d.split("|")):
             t(mx, my + 50 + k * 19, escape(part), 13, C["faint"])
     for k, line in enumerate(wrap("Every figure has an issue or a release note behind it. Full table: docs/status.md", 52)):
-        t(X0 + 18, y + 230 + k * 19, line, 13.5, C["soft"])
-    y += 262 + 30
+        t(X0 + 18, y + mh + 22 + k * 19, line, 13.5, C["soft"])
+    y += mh + 54 + 30
 
     y = msection(y, "Requirements", "sub")
     lines = []
@@ -284,7 +306,8 @@ def mobile():
     y += h + 30
 
     y = msection(y, "Against llama.cpp", "mark")
-    card(X0, y, CW, 20 + len(OPS) * 62 + 80)
+    nl = [l for n in OPS_NOTE for l in wrap(n, 60)]
+    card(X0, y, CW, 20 + len(OPS) * 62 + 16 + len(nl) * 16)
     for i, (a, cn, lc, u) in enumerate(OPS):
         ry = y + 14 + i * 62
         if i:
@@ -293,14 +316,14 @@ def mobile():
         t(X1 - 18, ry + 26, cn + (" vs " + lc if lc else ""), 15.5, C["mark"], MONO, 600, anchor="end")
         t(X0 + 18, ry + 49, u, 13.5, C["faint"])
         t(X1 - 18, ry + 49, "crow-nest" + (" vs llama.cpp" if lc else ""), 13, C["dim"], anchor="end")
-    note = "crow-nest v0.3.0, one RTX 5090: Windows 2026-09-13/14 (#62, #10), Linux 2026-09-17 (v0.3.0 notes). CROW_PF_GEMM_B=1: 871."
     ny = y + 20 + len(OPS) * 62 + 8
-    for k, line in enumerate(wrap(note, 60)):
+    for k, line in enumerate(nl):
         t(X0 + 18, ny + k * 16, line, 11.5, C["dim"])
-    y += 20 + len(OPS) * 62 + 80 + 30
+    y += 20 + len(OPS) * 62 + 16 + len(nl) * 16 + 30
 
     y = msection(y, "Build and run", "ok")
-    body = wrap("cargo build, then serve on port 8099. Crow connects with --base-url. The 104.7 GB container downloads from Hugging Face.", 50)
+    body = wrap("cargo build, then serve on port 8099. Crow connects with --base-url. The 104.7 GB Flash-Next container "
+                "downloads from Hugging Face; the 17.8 GB 27B container is built locally with the converter.", 50)
     ih = 58 + len(body) * 20 + 14
     card(X0, y, CW, ih, C["term"], C["bevel"], 12)
     t(X0 + 18, y + 34, "Copy it right below this picture.", 17, C["text"], weight=600)
@@ -315,6 +338,6 @@ if MOBILE:
 H = y - 20
 
 svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" '
-       f'aria-label="crow-nest: one model, one GPU, its own quant. Features, measurements, requirements.">'
+       f'aria-label="crow-nest: one GPU, its own quant, two model families. Features, measurements, requirements.">'
        + "".join(o) + "</svg>\n")
 (OUT / ("crow-nest-" + ("mobile-" if MOBILE else "") + VARIANT + ".svg")).write_text(svg)
