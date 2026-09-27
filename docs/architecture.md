@@ -5022,8 +5022,10 @@ Flash-Next's with the SiLU gate (`CN_GATE_ACT`, C4).
   (qkv rows, `transpose_rt`), and C3 had made `n10240` = `d.hct`, the residual width. On
   Flash-Next both are 10240; on the 27B `hct` is 5120 and `gdn_conv` 10240. The GDN sites read
   `p.n_gdn_conv` now.
-- **The vision tower.** The dense recipe writes none (the 27B reads images through the F16
-  projector, not built yet), so the loader only loads `vit` when the container carries it.
+- **The vision tower.** The dense recipe writes none; since #122 (2026-09-27) the 27B reads
+  images through its own F16 projector (`models/<model>/mmproj-F16.gguf`, found by
+  `resolve_mmproj`, the first candidate that passes `validate_mmproj`). Without a usable
+  projector a container with no `vit` section boots with the tower off (`/props` vision false).
 - **Verified.** Sub-block goldens (`oracle/export_qwen35_goldens.py`: the HF modules on the
   container's own dequantized weights, T = 40 prompt rows + 4 decode rows; `decode p2golden`;
   thresholds in `decode_out/p2-golden/PREREG.md`), rel_rms engine vs golden with BF16 KV:
