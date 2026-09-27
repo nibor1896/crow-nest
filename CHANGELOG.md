@@ -6,6 +6,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The dense 27B loads its own tokenizer and chat template** (crow-nest #121, 2026-09-27). `serve` took `tokenizer.json` and `tokenizer_config.json` from `models/Qwen3.8-Flash-Next-original/` for every container, so the 27B ran on Flash-Next's files (byte-identical today, so no wrong answer was measured) and could not boot on a machine without that directory (exit 3). `tokenizer::resolve_tokenizer` now picks, in order: `CROW_TOKENIZER`, `CROW_MODEL_DIR/tokenizer.json`, `models/<model>/tokenizer.json` beside the container (`<model>` = the index v2's source repo name, the directory the #122 projector search already uses), then Flash-Next's default. A new boot line `[serve] tokenizer source: ...` names the rule; a missed model directory is named there instead of falling back silently. Checked 2026-09-27, RTX 5090, `e01e34b` + this change: the 27B `serve` with `models/Qwen3.8-Flash-Next-original/` moved away boots, logs `chat template models/Qwen3.8-27B/tokenizer_config.json` and answers ("Paris"). The Flash-Next container (index v1, no model block) keeps the default path. Not run: the Flash-Next gate.
+
+### Changed
+
+- **`tools/gate-linux.sh` pins `TESTS=460`** (2026-09-27, crow-nest #121; was 458): +2 `tokenizer::tests` for the resolution order and the real 27B container, each shown red with the fix reverted. `CLIPPY=1494` is unchanged.
+
 ## 2026-09-27 — v0.7.0: the dense Qwen3.8-27B as a second model family, MTP speculative decoding, its own vision projector, and image positions fixed
 
 **crow-nest serves a second model: the dense Qwen3.8-27B.** The engine reads the model family and a runtime geometry

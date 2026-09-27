@@ -5696,7 +5696,10 @@ fn main() {
 
     // #25 A3: warm up the tokenizer BEFORE the CUDA context and before Engine::load.
     // A missing or broken tokenizer must fail in a second, not after the engine is pinned.
-    let (tok_path, tok_cfg) = crow_nest_engine::tokenizer::default_paths();
+    // #121: the model's own tokenizer and template (the index v2's source repo), the
+    // source named in the log, so a fallback to Flash-Next's files is never silent
+    let (tok_path, tok_cfg, tok_why) = crow_nest_engine::tokenizer::default_source();
+    tracing::info!(target: "serve", "[serve] tokenizer source: {tok_why}");
     match crow_nest_engine::tokenizer::global() {
         Ok(tk) => {
             let (tp, cp) = tk.paths();
