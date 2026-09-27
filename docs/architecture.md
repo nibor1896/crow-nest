@@ -4119,12 +4119,12 @@ tested without a GPU. Surface: 18 `pub fn` plus `Residency`, `PendingSwap`, `Low
 `ExpertSlabs`. Depends on `cnq`, `cuda`, `geo`, `kernels`, `manager`. It may not depend on `gen`
 any more.
 
-**`vit.rs`** — the #VIT visual tower: `VitW::load` / `Vit::new` (27 blocks from the container's
-`vit` section), the lazy cap-sized scratch, `Vit::run`, image decode and the hand-rolled HF
+**`vit.rs`** — the #VIT visual tower: `VitW::load` / `Vit::new` (27 blocks from the model's F16
+projector, `choose_tower` picking the first valid candidate, or the container's `vit` section; #108, #122), the lazy cap-sized scratch, `Vit::run`, image decode and the hand-rolled HF
 preprocessing (`decode_rgb`, `prep_image`, smart_resize), `expand_ids`, `mrope_positions`,
 `mrope_tables`, the bounded image-embedding LRU, `build_plan` → `VisionPlan`, and the planner's
-reserve (`reserve_bytes`, `reserve_line`, `CROW_VIT_RESERVE_MB`). Surface: 17
-`pub fn` plus `VitW`, `Vit`, `VitBlockW`, `ImagePrep`, `VisionPlan`, `Grid`, 16 `pub const`.
+reserve (`reserve_bytes`, `reserve_line`, `CROW_VIT_RESERVE_MB`). Surface (2026-09-27, #122): 25
+`pub fn` plus 13 types (`VitBudget`, `Lin`, `VitBlockW`, `VitW`, `VitSource`, `TowerChoice`, `MmKind`, `Vit`, `ImagePrep`, `Grid`, `ImageSpan`, `ImageKey`, `VisionPlan`), 25 `pub const`.
 Depends on `cnq`, `cuda`, `geo`, `kernels`, `weights`. It may not depend on `gen`: `gen` calls
 IT, through `Engine::build_vision_plan` and `begin_vision`.
 

@@ -335,21 +335,26 @@ pub const MMPROJ_FILE: &str = "mmproj-F16.gguf";
 /// Where the tower's weights come from, decided once at load.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VitSource {
-    /// llama.cpp's F16 projector (the default whenever the file is found)
-    Mmproj(String),
+    /// llama.cpp's F16 projector (the default whenever a file is found): every
+    /// existing candidate in search order; `VitW::load` takes the first that
+    /// passes `validate_mmproj` (#122: another model's file is skipped, not fatal)
+    Mmproj(Vec<String>),
     /// the container's NVFP4 `vit` section; the string says why (the fallback)
     Container(String),
 }
 
 /// `CROW_VIT_MMPROJ` wins: `0` = the container's NVFP4 section, any other
-/// value = that file (missing -> the container, with the reason). Unset: the
-/// first `mmproj-F16.gguf` found in `models/` beside the container (the #94
-/// checkpoint convention), `$CROW_MODELS` (Crow's models root) and
-/// `~/.local/share/crow/models` (Crow's Linux install link). `exists` is the
-/// file test, injected so the unit test runs without the files.
+/// value = that file (missing -> the container, with the reason). Unset: every
+/// `mmproj-F16.gguf` found, in this order: `models/<model>/` beside the
+/// container, `<model>` = the source repo's name from the index v2 (#122: the
+/// dense 27B's own projector), then `models/` (the #94 checkpoint convention),
+/// `$CROW_MODELS` (Crow's models root) and `~/.local/share/crow/models`
+/// (Crow's Linux install link, Flash-Next's file). `exists` is the file test,
+/// injected so the unit test runs without the files.
 pub fn resolve_mmproj(
     env: Option<&str>,
     cnq_path: &str,
+    model: Option<&str>,
     crow_models: Option<&str>,
     home: Option<&str>,
     exists: &dyn Fn(&str) -> bool,
@@ -358,7 +363,7 @@ pub fn resolve_mmproj(
         Some("0") => return VitSource::Container("CROW_VIT_MMPROJ=0".to_string()),
         Some(p) if !p.is_empty() => {
             return if exists(p) {
-                VitSource::Mmproj(p.to_string())
+                VitSource::Mmproj(vec![p.to_string()])
             } else {
                 VitSource::Container(format!("CROW_VIT_MMPROJ={p} does not exist"))
             };
@@ -368,6 +373,9 @@ pub fn resolve_mmproj(
     let mut tried = Vec::new();
     let cnq = std::path::Path::new(cnq_path);
     if let Some(root) = cnq.parent().and_then(|d| d.parent()) {
+        if let Some(m) = model.filter(|m| !m.is_empty()) {
+            tried.push(root.join("models").join(m).join(MMPROJ_FILE));
+        }
         tried.push(root.join("models").join(MMPROJ_FILE));
     }
     if let Some(m) = crow_models.filter(|m| !m.is_empty()) {
@@ -376,24 +384,63 @@ pub fn resolve_mmproj(
     if let Some(h) = home.filter(|h| !h.is_empty()) {
         tried.push(std::path::Path::new(h).join(".local/share/crow/models").join(MMPROJ_FILE));
     }
-    for p in &tried {
-        let s = p.to_string_lossy();
-        if exists(&s) {
-            return VitSource::Mmproj(s.into_owned());
-        }
+    let found: Vec<String> = tried
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| exists(p))
+        .collect();
+    if !found.is_empty() {
+        return VitSource::Mmproj(found);
     }
     let list = tried.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join(", ");
     VitSource::Container(format!("no {MMPROJ_FILE} in {list}"))
 }
 
-/// the process's choice, from the real env and filesystem
-pub fn mmproj_source(cnq_path: &str) -> VitSource {
+/// the process's choice, from the real env and filesystem; `model` = the
+/// container's source repo name (`Qwen/Qwen3.8-27B` -> `Qwen3.8-27B`)
+pub fn mmproj_source(cnq_path: &str, model: Option<&str>) -> VitSource {
     let env = std::env::var("CROW_VIT_MMPROJ").ok();
     let models = std::env::var("CROW_MODELS").ok();
     let home = std::env::var("HOME").ok();
-    resolve_mmproj(env.as_deref(), cnq_path, models.as_deref(), home.as_deref(), &|p| {
+    resolve_mmproj(env.as_deref(), cnq_path, model, models.as_deref(), home.as_deref(), &|p| {
         std::path::Path::new(p).is_file()
     })
+}
+
+/// where the tower's weights come from, once the candidates are tried
+pub enum TowerChoice<G> {
+    /// the first projector that opened and validated, and why the ones before it were skipped
+    Mmproj(G, Vec<String>),
+    /// the container's NVFP4 `vit` section; the string says why
+    Container(String),
+    /// #122: no usable projector and no `vit` section - the tower stays off
+    Off(String),
+}
+
+/// #122: the first candidate that `open` accepts wins; a refused file (another
+/// model's projector, a wrong `projection_dim`) is skipped, not fatal. With no
+/// projector left, the container's `vit` section is the fallback when it has
+/// one, and the tower is off when it has none (the dense recipe).
+pub fn choose_tower<G>(src: VitSource, has_vit: bool, open: &dyn Fn(&str) -> Result<G, String>) -> TowerChoice<G> {
+    let why = match src {
+        VitSource::Mmproj(paths) => {
+            let mut refused = Vec::new();
+            for p in &paths {
+                match open(p) {
+                    Ok(g) => return TowerChoice::Mmproj(g, refused),
+                    Err(why) => refused.push(format!("{p} refused: {why}")),
+                }
+            }
+            tracing::error!(target: "vit", "[vit] the F16 projector is NOT used: {}", refused.join("; "));
+            format!("fallback, {}", refused.join("; "))
+        }
+        VitSource::Container(why) => why,
+    };
+    if has_vit {
+        TowerChoice::Container(why)
+    } else {
+        TowerChoice::Off(format!("no usable {MMPROJ_FILE} and the container has no vit section ({why})"))
+    }
 }
 
 /// the kind of one projector tensor the tower reads
@@ -530,19 +577,24 @@ unsafe fn load_f4(cnq: &mut Cnq, name: &str) -> Lin {
 
 impl VitW {
     /// #108: the tower's weights from the source `mmproj_source` picks -
-    /// llama.cpp's F16 projector when the file is there and passes
+    /// llama.cpp's F16 projector, the first candidate that passes
     /// `validate_mmproj`, else the container's NVFP4 section (the fallback,
-    /// named on the `[vit]` boot line with its reason).
-    pub unsafe fn load(cnq: &mut Cnq, out_hidden: usize) -> VitW {
-        match mmproj_source(&cnq.path) {
-            VitSource::Mmproj(path) => match crate::gguf::Gguf::open(&path).and_then(|g| validate_mmproj(&g, out_hidden).map(|_| g)) {
-                Ok(g) => VitW::load_mmproj(&g),
-                Err(why) => {
-                    tracing::error!(target: "vit", "[vit] the F16 projector is NOT used: {why} - falling back to the container's NVFP4 vit section");
-                    VitW::load_container(cnq, &format!("fallback, {path} refused: {why}"))
+    /// named on the `[vit]` boot line with its reason). #122: a container
+    /// without a `vit` section (the dense recipe) has no fallback - `Err`
+    /// says why, and the engine boots with the tower off.
+    pub unsafe fn load(cnq: &mut Cnq, out_hidden: usize) -> Result<VitW, String> {
+        let model = cnq.model().map(|m| m.source_repo.rsplit('/').next().unwrap_or_default().to_string());
+        let has_vit = cnq.tensors.iter().any(|t| t.section == "vit");
+        let open = |p: &str| crate::gguf::Gguf::open(p).and_then(|g| validate_mmproj(&g, out_hidden).map(|_| g));
+        match choose_tower(mmproj_source(&cnq.path, model.as_deref()), has_vit, &open) {
+            TowerChoice::Mmproj(g, skipped) => {
+                if !skipped.is_empty() {
+                    tracing::warn!(target: "vit", "[vit] skipped {} - {} used", skipped.join("; "), g.path);
                 }
-            },
-            VitSource::Container(why) => VitW::load_container(cnq, &why),
+                Ok(VitW::load_mmproj(&g))
+            }
+            TowerChoice::Container(why) => Ok(VitW::load_container(cnq, &why)),
+            TowerChoice::Off(why) => Err(why),
         }
     }
 
@@ -711,9 +763,9 @@ impl Vit {
     /// post-plan allocations, and robin's first image request found 35.7 MiB
     /// free. `Engine::load` now calls `arm_scratch` right after this, so the
     /// reserve is held; the lazy path stays as the fallback (`CROW_VIT_RESERVE_MB=0`).
-    pub unsafe fn new(cnq: &mut Cnq, out_hidden: usize) -> Vit {
-        let w = VitW::load(cnq, out_hidden);
-        Vit {
+    pub unsafe fn new(cnq: &mut Cnq, out_hidden: usize) -> Result<Vit, String> {
+        let w = VitW::load(cnq, out_hidden)?;
+        Ok(Vit {
             w,
             cap: budget().max_patches(),
             out_hidden,
@@ -734,7 +786,7 @@ impl Vit {
             image_cache: std::collections::HashMap::new(),
             image_lru: Vec::new(),
             image_cache_bytes: 0,
-        }
+        })
     }
 
     /// one-time scratch allocation, called on the first image request; the
@@ -2259,43 +2311,79 @@ mod budget_and_mmproj {
     #[test]
     fn the_projector_file_is_found_by_the_documented_order() {
         let cnq = "/r/crow-nest/converter/x.cnq";
+        let one = |p: &str| VitSource::Mmproj(vec![p.to_string()]);
         // CROW_VIT_MMPROJ wins, 0 forces the container
         assert_eq!(
-            resolve_mmproj(Some("0"), cnq, None, None, &|_| true),
+            resolve_mmproj(Some("0"), cnq, None, None, None, &|_| true),
             VitSource::Container("CROW_VIT_MMPROJ=0".into())
         );
         assert_eq!(
-            resolve_mmproj(Some("/a/p.gguf"), cnq, None, None, &|p| p == "/a/p.gguf"),
-            VitSource::Mmproj("/a/p.gguf".into())
+            resolve_mmproj(Some("/a/p.gguf"), cnq, Some("M"), None, None, &|p| p == "/a/p.gguf"),
+            one("/a/p.gguf")
         );
-        assert!(matches!(resolve_mmproj(Some("/a/p.gguf"), cnq, None, None, &|_| false),
+        assert!(matches!(resolve_mmproj(Some("/a/p.gguf"), cnq, None, None, None, &|_| false),
             VitSource::Container(w) if w.contains("does not exist")));
-        // unset: models/ beside the container, then $CROW_MODELS, then Crow's install link
-        let m = |p: &str| resolve_mmproj(None, cnq, Some("/cm"), Some("/home/u"), &|q| q == p);
-        for hit in [
+        // unset: models/<model>/ beside the container, models/, then $CROW_MODELS, then Crow's install link
+        let m = |p: &str| resolve_mmproj(None, cnq, Some("M"), Some("/cm"), Some("/home/u"), &|q| q == p);
+        let order = [
+            "/r/crow-nest/models/M/mmproj-F16.gguf",
             "/r/crow-nest/models/mmproj-F16.gguf",
             "/cm/mmproj-F16.gguf",
             "/home/u/.local/share/crow/models/mmproj-F16.gguf",
-        ] {
-            assert_eq!(m(hit), VitSource::Mmproj(hit.into()));
+        ];
+        for hit in order {
+            assert_eq!(m(hit), one(hit));
         }
-        // the first hit wins when several exist
+        // #122: every existing file, in order - the model's own first
         assert_eq!(
-            resolve_mmproj(None, cnq, Some("/cm"), Some("/home/u"), &|_| true),
-            VitSource::Mmproj("/r/crow-nest/models/mmproj-F16.gguf".into())
+            resolve_mmproj(None, cnq, Some("M"), Some("/cm"), Some("/home/u"), &|_| true),
+            VitSource::Mmproj(order.iter().map(|p| p.to_string()).collect())
         );
-        match resolve_mmproj(None, cnq, Some("/cm"), Some("/home/u"), &|_| false) {
+        // no model name (an index v1 container): the model folder is not searched
+        assert_eq!(
+            resolve_mmproj(None, cnq, None, Some("/cm"), Some("/home/u"), &|_| true),
+            VitSource::Mmproj(order[1..].iter().map(|p| p.to_string()).collect())
+        );
+        match resolve_mmproj(None, cnq, Some("M"), Some("/cm"), Some("/home/u"), &|_| false) {
             VitSource::Container(w) => assert!(
-                w.contains("/r/crow-nest/models/mmproj-F16.gguf") && w.contains("/cm/") && w.contains("/home/u/"),
+                w.contains("/r/crow-nest/models/M/mmproj-F16.gguf") && w.contains("/cm/") && w.contains("/home/u/"),
                 "{w}"
             ),
             other => panic!("{other:?}"),
         }
     }
 
+    /// #122: another model's projector is skipped, not fatal; without a vit
+    /// section and without a usable projector the tower is off, not a panic
+    #[test]
+    fn a_refused_projector_is_skipped_and_a_dense_container_without_one_boots_without_vision() {
+        let src = || VitSource::Mmproj(vec!["/flash/mmproj-F16.gguf".into(), "/dense/mmproj-F16.gguf".into()]);
+        let open = |p: &str| if p.starts_with("/dense") { Ok(p.to_string()) } else { Err("projection_dim 2560, the tower needs 5120".to_string()) };
+        match choose_tower(src(), false, &open) {
+            TowerChoice::Mmproj(g, skipped) => {
+                assert_eq!(g, "/dense/mmproj-F16.gguf");
+                assert_eq!(skipped.len(), 1);
+                assert!(skipped[0].contains("/flash/") && skipped[0].contains("2560"), "{skipped:?}");
+            }
+            _ => panic!("the valid second candidate must win"),
+        }
+        let none = |_: &str| -> Result<String, String> { Err("refused".into()) };
+        match choose_tower(src(), false, &none) {
+            TowerChoice::Off(why) => assert!(why.contains("no vit section") && why.contains("/flash/"), "{why}"),
+            _ => panic!("a container without a vit section has no fallback"),
+        }
+        assert!(matches!(choose_tower(src(), true, &none), TowerChoice::Container(w) if w.starts_with("fallback")));
+        assert!(matches!(choose_tower(VitSource::Container("x".into()), false, &none), TowerChoice::Off(_)));
+        assert!(matches!(choose_tower(VitSource::Container("x".into()), true, &none), TowerChoice::Container(w) if w == "x"));
+    }
+
     /// a header-only projector image with the given tensor table (no data: the
     /// parser is told the file is big enough, validation reads no bytes)
     fn header(kv_over: Option<(&str, u32)>, drop: Option<&str>, redim: Option<(&str, Vec<u64>)>) -> Gguf {
+        header_for(H, kv_over, drop, redim)
+    }
+
+    fn header_for(out_hidden: usize, kv_over: Option<(&str, u32)>, drop: Option<&str>, redim: Option<(&str, Vec<u64>)>) -> Gguf {
         let u = |v: u32| v.to_le_bytes().to_vec();
         let mut kvs: Vec<(&str, u32, Vec<u8>)> = vec![
             ("clip.projector_type", 8, gguf::tests::str_payload("qwen3vl_merger")),
@@ -2305,7 +2393,7 @@ mod budget_and_mmproj {
             ("clip.vision.attention.head_count", 4, u(16)),
             ("clip.vision.patch_size", 4, u(16)),
             ("clip.vision.spatial_merge_size", 4, u(2)),
-            ("clip.vision.projection_dim", 4, u(2560)),
+            ("clip.vision.projection_dim", 4, u(out_hidden as u32)),
         ];
         if let Some((k, v)) = kv_over {
             for e in kvs.iter_mut() {
@@ -2314,7 +2402,7 @@ mod budget_and_mmproj {
                 }
             }
         }
-        let plan = mmproj_plan(H);
+        let plan = mmproj_plan(out_hidden);
         let tensors: Vec<(&str, Vec<u64>, u32, Vec<u8>)> = plan
             .iter()
             .filter(|(n, ..)| Some(n.as_str()) != drop)
@@ -2349,6 +2437,19 @@ mod budget_and_mmproj {
         assert!(e.contains("dims"), "{e}");
     }
 
+    /// #122: the dense 27B's projector (merger out 5120) passes at 5120 and is
+    /// refused at Flash-Next's 2560, and the other way round
+    #[test]
+    fn the_dense_projector_is_told_apart_by_its_merger_width() {
+        let dense = header_for(5120, None, None, None);
+        assert_eq!(validate_mmproj(&dense, 5120), Ok(()));
+        assert_eq!(dense.find("mm.2.weight").unwrap().dims, vec![4608, 5120]);
+        let e = validate_mmproj(&dense, H).unwrap_err();
+        assert!(e.contains("projection_dim"), "{e}");
+        let e = validate_mmproj(&header(None, None, None), 5120).unwrap_err();
+        assert!(e.contains("projection_dim"), "{e}");
+    }
+
     #[test]
     fn the_patch_kernel_halves_interleave_into_the_conv3d_row_order() {
         let pp = VIT_PATCH * VIT_PATCH;
@@ -2373,13 +2474,39 @@ mod budget_and_mmproj {
     /// (reads ~20 KB, no tensor data)
     #[test]
     fn the_projector_on_this_machine_passes_the_header_check() {
-        let VitSource::Mmproj(p) = mmproj_source("../converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq") else {
+        let VitSource::Mmproj(ps) = mmproj_source("../converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq", None) else {
             eprintln!("no mmproj-F16.gguf on this machine - skipped");
             return;
         };
-        let g = Gguf::open(&p).unwrap();
+        let g = Gguf::open(&ps[0]).unwrap();
         assert_eq!(g.tensors.len(), 334);
         validate_mmproj(&g, H).unwrap();
+    }
+
+    /// #122, the real files when this machine has them: for the dense 27B the
+    /// model's own projector is found first and validates at 5120, and the
+    /// Flash-Next file further down the list is refused (reads headers only)
+    #[test]
+    fn the_dense_27b_finds_its_own_projector_before_the_flash_next_one() {
+        let VitSource::Mmproj(ps) = mmproj_source("../converter/Qwen3.8-27B-CNQ4.5.cnq", Some("Qwen3.8-27B")) else {
+            eprintln!("no mmproj-F16.gguf on this machine - skipped");
+            return;
+        };
+        if !ps[0].ends_with("models/Qwen3.8-27B/mmproj-F16.gguf") {
+            eprintln!("no 27B projector in models/Qwen3.8-27B/ - skipped ({ps:?})");
+            return;
+        }
+        let open = |p: &str| Gguf::open(p).and_then(|g| validate_mmproj(&g, 5120).map(|_| g));
+        match choose_tower(VitSource::Mmproj(ps.clone()), false, &open) {
+            TowerChoice::Mmproj(g, skipped) => {
+                assert_eq!(g.path, ps[0]);
+                assert!(skipped.is_empty(), "{skipped:?}");
+            }
+            _ => panic!("the 27B projector must validate at 5120"),
+        }
+        for p in &ps[1..] {
+            assert!(open(p).is_err(), "{p} must be refused at 5120");
+        }
     }
 
     /// cos(container NVFP4 dequant, mmproj F16) per tensor: a mapping or
@@ -2390,8 +2517,8 @@ mod budget_and_mmproj {
     #[ignore]
     fn mmproj_matches_the_container_tensor_by_tensor() {
         let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| "../converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq".into());
-        let VitSource::Mmproj(p) = mmproj_source(&cnq_path) else { panic!("no mmproj file") };
-        let g = Gguf::open(&p).unwrap();
+        let VitSource::Mmproj(ps) = mmproj_source(&cnq_path, None) else { panic!("no mmproj file") };
+        let g = Gguf::open(&ps[0]).unwrap();
         let mut cnq = Cnq::open(&cnq_path);
         let cos = |a: &[f32], b: &[f32]| {
             assert_eq!(a.len(), b.len());
@@ -2509,7 +2636,7 @@ mod gemm_vit {
             let module = cuda::compile(&crate::kernels::KernelGeo::flash_next().source());
             let (f_fp4, f_f16) = (module.get("gemm_fp4_f32x"), module.get("gemm_f16_f32x"));
             // (rows, k): qkv, proj, fc1 (row tail), fc2 (k tail), merger fc1, fc2, patch
-            let shapes = [(3456, 1152), (1152, 1152), (4304, 1152), (1152, 4304), (4608, 4608), (2560, 4608), (1152, 1536)];
+            let shapes = [(3456, 1152), (1152, 1152), (4304, 1152), (1152, 4304), (4608, 4608), (2560, 4608), (5120, 4608), (1152, 1536)];
             let t = 70; // three token tiles, the last one partial
             for (si, &(rows, k)) in shapes.iter().enumerate() {
                 let x = fill_f32(t * k, 0x51 + si as u32);

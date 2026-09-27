@@ -282,8 +282,12 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="454"
+TESTS="457"
 CLIPPY="1494"
+#   tests 454 -> 457 / clippy 1494 (unchanged)   crow-nest #122, the dense 27B's F16 projector (2026-09-27): +3
+#                              `vit::budget_and_mmproj::a_refused_projector_is_skipped_and_a_dense_container_without_one_boots_without_vision`
+#                              (red with the old first-file-wins / always-fall-back rule), `..::the_dense_projector_is_told_apart_by_its_merger_width`,
+#                              `..::the_dense_27b_finds_its_own_projector_before_the_flash_next_one` (real files, headers only).
 #   tests 452 -> 454 / clippy 1510 -> 1494   crow-nest #95 MTP steps 2-5 (2026-09-27): +2
 #                              `gen::tests_95_mtp::adaptive_k_*`; clippy -16: `launch_sample` lost its sixteen
 #                              same-type `as u64` casts when it became `launch_sample_at`.

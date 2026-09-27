@@ -1397,32 +1397,35 @@ impl Engine {
         }
         let vit_hold = crate::vit::reserve_bytes(&geo, cfg.context) > 0;
         let mut vit_scratch_held = 0u64;
-        // Crow #300: the dense recipe writes no vision tower (its images go through the F16
-        // projector, not built yet), so the tower loads only when the container has it
-        let vit_in_cnq = cnq.tensors.iter().any(|t| t.section == "vit");
-        let vit = if crate::vit::vit_on() && vit_in_cnq {
-            log("loading the vit section (27 vision blocks + patch embed + merger) …");
+        // Crow #300: the dense recipe writes no vision tower; #122: its images go
+        // through the model's own F16 projector, and without one the tower is off
+        let vit = if crate::vit::vit_on() {
+            log("loading the vision tower (27 vision blocks + patch embed + merger) …");
             let before = cuda::total_vram_bytes() - cuda::free_vram_bytes();
-            let mut vt = crate::vit::Vit::new(cnq, geo.vision_out());
-            let vit_bytes = cuda::total_vram_bytes() - cuda::free_vram_bytes() - before;
-            if vit_hold {
-                vt.arm_scratch();
-                vit_scratch_held = crate::vit::scratch_bytes(geo.vision_out()) as u64;
+            match crate::vit::Vit::new(cnq, geo.vision_out()) {
+                Ok(mut vt) => {
+                    let vit_bytes = cuda::total_vram_bytes() - cuda::free_vram_bytes() - before;
+                    if vit_hold {
+                        vt.arm_scratch();
+                        vit_scratch_held = crate::vit::scratch_bytes(geo.vision_out()) as u64;
+                    }
+                    log_vit_tower(&format!("[vit] visual tower loaded: mode {} (f32 tower math), CROW_VIT {} (0 = the text-only placeholder), {}, vit weights {:.0} MiB ({})",
+                        vt.w.mode,
+                        env_or_unset("CROW_VIT"),
+                        crate::vit::budget_words(&crate::vit::budget()),
+                        vit_bytes as f64 / MIB,
+                        if vit_hold {
+                            format!("scratch held at boot, {:.1} MiB at the patch cap", vit_scratch_held as f64 / MIB)
+                        } else {
+                            "scratch lazy, allocated on the first image request (CROW_VIT_RESERVE_MB=0)".to_string()
+                        }));
+                    Some(vt)
+                }
+                Err(why) => {
+                    log_vit_tower(&format!("[vit] visual tower NOT loaded: {why}, /props vision false"));
+                    None
+                }
             }
-            log_vit_tower(&format!("[vit] visual tower loaded: mode {} (f32 tower math), CROW_VIT {} (0 = the text-only placeholder), {}, vit weights {:.0} MiB ({})",
-                vt.w.mode,
-                env_or_unset("CROW_VIT"),
-                crate::vit::budget_words(&crate::vit::budget()),
-                vit_bytes as f64 / MIB,
-                if vit_hold {
-                    format!("scratch held at boot, {:.1} MiB at the patch cap", vit_scratch_held as f64 / MIB)
-                } else {
-                    "scratch lazy, allocated on the first image request (CROW_VIT_RESERVE_MB=0)".to_string()
-                }));
-            Some(vt)
-        } else if !vit_in_cnq {
-            log_vit_tower("[vit] visual tower NOT loaded: the container has no vit section (Crow #300: the dense recipe omits it; the F16 projector path is not built yet), /props vision false");
-            None
         } else {
             log_vit_tower("[vit] visual tower NOT loaded, CROW_VIT 0 (the text-only placeholder of record, /props vision false)");
             None
