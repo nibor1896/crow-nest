@@ -111,6 +111,7 @@ tools/gate-linux.sh
   + 5 decode, 3 lib tests ignored), and all nine items are GREEN (`decode_out/gate-0925-release`, 2026-09-25).
 - At v0.7.0 (2026-09-27) the pins are `TESTS=458` and `CLIPPY=1494` (the dense 27B, MTP, #122, #123), and all items are
   GREEN on the release head (`decode_out/gate-2026-09-27`); the four numeric values of record are unchanged.
+- At v0.7.1 (2026-09-27) `TESTS=460` (+2 `tokenizer::tests`, #121) and `CLIPPY=1494`; gate `decode_out/gate-2026-09-27-v071`.
 - Engine runs are sequential on purpose: before every engine start the gate asks the engine's own
   `ramcheck --need` (`free_for_pin`, issue #103, `tools/pin-room.sh`) whether the pinned tier fits.
 
