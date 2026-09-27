@@ -6,6 +6,16 @@
 
 ## Unreleased
 
+## 2026-09-27 — v0.7.0: the dense Qwen3.8-27B as a second model family, MTP speculative decoding, its own vision projector, and image positions fixed
+
+**crow-nest serves a second model: the dense Qwen3.8-27B.** The engine reads the model family and a runtime geometry
+from the container's config (Crow #300 phase 1), and the dense arms (plain residual, uncapped causal attention, dense
+SwiGLU) run the 27B from a 17.8 GB CNQ4.5 container with calibrated NVFP4 scales (KLD vs BF16 0.290 -> 0.223). MTP
+speculative decoding takes it to 120 tok/s at short context with output byte-identical to plain decoding (#95); it
+sees images through its own F16 projector (#122), and image tokens now get the mrope positions HF and llama.cpp use,
+on both models (#123). Default boot: 64k context, BF16 KV, MTP on, 8.48 GiB free after load for Qwen-Image 2.1
+beside it. Flash-Next's values of record are unchanged (gate `decode_out/gate-2026-09-27` ALL GREEN).
+
 ### Added
 
 - **The dense 27B sees images** (crow-nest #122, 2026-09-27; PREREG and results `decode_out/p3-vit27b/`). The 27B container has no `vit` section, so `/props` reported `vision: false` and Crow's `read_image` failed. The tower now loads the model's own llama.cpp F16 projector: `resolve_mmproj` first searches `models/<model>/mmproj-F16.gguf` beside the container (`<model>` = the source repo name from the index v2, here `models/Qwen3.8-27B/`), then the generic places as before. Every file found is tried in order, and one that fails `validate_mmproj` is skipped (before, the first file won, so the 27B would have picked Flash-Next's 2560-wide projector through Crow's install link). A container without a `vit` section and without a usable projector now boots with the tower off, where the fallback to the container would have panicked. Measured, RTX 5090, `CROW_MMA=1 CROW_GRAPH=1`, 64k context, BF16 KV, MTP on:
