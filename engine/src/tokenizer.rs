@@ -614,7 +614,9 @@ mod tests {
         if !std::path::Path::new(&t).is_file() {
             panic!("resolved {t}, which does not exist");
         }
-        assert_eq!(t, "../models/Qwen3.8-27B/tokenizer.json");
+        // #126: joined like the code joins it (`..\models\...` on Windows, the same string on Linux)
+        let own: std::path::PathBuf = ["..", "models", "Qwen3.8-27B", "tokenizer.json"].iter().collect();
+        assert_eq!(t, own.to_string_lossy());
         // and it loads, template included
         ChatTokenizer::load(&t, &sibling_config(&t)).expect("the 27B tokenizer loads");
         // the Flash-Next container of record (index v1) names no model: its default is unchanged

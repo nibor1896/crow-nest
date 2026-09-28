@@ -6,6 +6,10 @@
 
 ## Unreleased
 
+## 2026-09-28 — v0.7.2: serve builds on Windows again, CI on both systems
+
+**`serve.exe` builds and boots on Windows again.** v0.7.1 did not compile on Windows (27 errors, Unix-only code since 2026-09-18) and CI had built only on Linux since 2026-09-17. Every CI job now runs on Ubuntu and Windows. Linux compiles the same code as v0.7.1; no kernel, weight or decode path changed.
+
 ### Fixed
 
 - **`serve` builds on Windows again** (crow-nest #126, 2026-09-28). `cargo build --release --bin serve` at v0.7.1 stopped with 27 errors on Windows: the #82 signal-mask shutdown and the #117 accept-loop `poll` were Unix-only, and CI had built only on Linux since 2026-09-17. Both now sit behind `cfg(unix)`, with `WSAPoll` for the accept-loop wait on Windows; Ctrl+C on Windows keeps its default action as before #82. `pin_return_probe` builds to a one-line "Linux only" refusal elsewhere. Linux compiles the same `poll` call as before.
@@ -14,7 +18,15 @@
 ### Changed
 
 - **CI runs every job on `ubuntu-latest` and `windows-latest`** (crow-nest #126, 2026-09-28), `fail-fast: false`, the OS in each job name, so a Windows-only break is a red check instead of a silent one. The converter's `clippy -D warnings` call counts instead of failing the job, as `2de3398` meant for both calls (it had put both fallbacks on the engine line); the clippy job stays non-blocking with the counts in the step summary.
-- **Four tests no longer assume Linux** (crow-nest #126, 2026-09-28, robin's approval). The tokenizer and projector path tests build their expected paths with `Path::join` (on Linux the same strings as before); the #54 loopback probe test runs where the probe exists (`target_os = "linux"`, as `poll_peer`); the PTX-manifest comparison needs the recording OS and the full NVRTC build from the PTX header, not only `13.3`. Measured on Windows with NVRTC 13.3.33, the build of the manifest: `quant_tiles` differs from Linux's PTX of record (`0a96be405b1e` there, `9cd36324e1ba` here), every other entry and the frozen-vs-current comparison agree; the cause is open in #126.
+- **Five tests no longer assume Linux** (crow-nest #126, 2026-09-28, robin's approval). The tokenizer, the real-27B tokenizer and the projector path tests build their expected paths with `Path::join` (on Linux the same strings as before); the #54 loopback probe test runs where the probe exists (`target_os = "linux"`, as `poll_peer`); the PTX-manifest comparison needs the recording OS and the full NVRTC build from the PTX header, not only `13.3`. Measured on Windows with NVRTC 13.3.33, the build of the manifest: `quant_tiles` differs from Linux's PTX of record (`0a96be405b1e` there, `9cd36324e1ba` here), every other entry and the frozen-vs-current comparison agree; the cause is open in #126.
+
+### Measured
+
+- **`serve.exe` boots the dense 27B on Windows** (crow-nest #126, 2026-09-28, robin's Windows machine, RTX 5090): `Qwen3.8-27B-CNQ4.5.cnq`, default boot, healthy in 10 s, tokenizer from `models/Qwen3.8-27B/`, MTP and the vision tower loaded, 24,020 MiB on the card after boot. Beside it Crow 2.8.2 made 3 of 3 images (Crow #320). Linux gate ALL GREEN at `97b4e05` (2026-09-28, RTX 5090, Arch Linux, `tools/gate-linux.sh decode_out/gate-2026-09-28-pr127`): parity8 `148cb72e8e44`, parity512 `6e9cb25fff43`, p8tf `8f5e5ce8dcec`, run32 32 ids of record, cargo test 460/0, clippy 1494; since then only one test line in `engine/src/tokenizer.rs` changed.
+
+### Known limitations
+
+- **`quant_tiles` PTX differs between Windows and Linux with the same NVRTC 13.3.33** (crow-nest #126, measured 2026-09-28): `9cd36324e1ba` on Windows against `0a96be405b1e` of record on Linux; the other 129 entries and the frozen-vs-current comparison agree. The PTX-manifest check now runs on Linux only. Whether Windows decode numerics differ is not measured.
 
 ## 2026-09-27 — v0.7.1: the dense 27B reads its own tokenizer and chat template
 
