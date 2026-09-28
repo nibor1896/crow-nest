@@ -1,3 +1,7 @@
 # F1 (#57): the checksum file and its log stay LF on every checkout, sha256sum -c reads them byte for byte
 SHA256SUMS text eol=lf
 SHA256SUMS.log text eol=lf
+# Test fixtures are compared byte for byte (sha256 of config files, the frozen kernel source and
+# its PTX of record): a Windows checkout with core.autocrlf=true must not turn them into CRLF
+# (#126, 2026-09-28: 4 engine tests and 1 converter test red on Windows for that alone)
+engine/tests/fixtures/** -text

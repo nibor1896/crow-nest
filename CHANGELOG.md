@@ -6,6 +6,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`serve` builds on Windows again** (crow-nest #126, 2026-09-28). `cargo build --release --bin serve` at v0.7.1 stopped with 27 errors on Windows: the #82 signal-mask shutdown and the #117 accept-loop `poll` were Unix-only, and CI had built only on Linux since 2026-09-17. Both now sit behind `cfg(unix)`, with `WSAPoll` for the accept-loop wait on Windows; Ctrl+C on Windows keeps its default action as before #82. `pin_return_probe` builds to a one-line "Linux only" refusal elsewhere. Linux compiles the same `poll` call as before.
+- **Test fixtures are checked out byte for byte on Windows** (crow-nest #126, 2026-09-28). `.gitattributes` marks `engine/tests/fixtures/**` `-text`; with `core.autocrlf=true` they were CRLF and 4 engine tests plus 1 converter test failed on Windows for that alone.
+
+### Changed
+
+- **CI runs every job on `ubuntu-latest` and `windows-latest`** (crow-nest #126, 2026-09-28), `fail-fast: false`, the OS in each job name, so a Windows-only break is a red check instead of a silent one.
+
 ## 2026-09-27 — v0.7.1: the dense 27B reads its own tokenizer and chat template
 
 **`serve` takes the tokenizer and chat template from the model's own directory.** The dense 27B no longer

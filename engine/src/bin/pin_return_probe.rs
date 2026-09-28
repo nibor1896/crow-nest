@@ -24,6 +24,24 @@
 //!
 //! Every step prints the `cuda::HostRam` view (free_for_pin, MemAvailable,
 //! the driver-held estimate) so an outside reader sees what the engine sees.
+//!
+//! LINUX ONLY (#126): /proc, anonymous mmap and SIGKILL are the
+//! questions this probe asks. Elsewhere it builds to a one-line refusal, so the
+//! workspace builds on Windows.
+
+#[cfg(target_os = "linux")]
+fn main() {
+    linux::main()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("pin_return_probe: Linux only (#103 reads /proc and pins anonymous mmap)");
+    std::process::exit(2);
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
 use crow_nest_engine::cuda;
 use crow_nest_engine::geo::GIB;
 use crow_nest_engine::kernels::launch_v;
@@ -271,7 +289,7 @@ unsafe fn bw(kinds: &[Kind]) {
     }
 }
 
-fn main() {
+pub fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let cmd = a.first().map(|s| s.as_str()).unwrap_or("snap");
     if cmd == "snap" {
@@ -376,4 +394,5 @@ fn main() {
             _ => panic!("command is snap | hold | bw"),
         }
     }
+}
 }
