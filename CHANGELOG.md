@@ -22,7 +22,7 @@
 
 ### Measured
 
-- **`serve.exe` boots the dense 27B on Windows** (crow-nest #126, 2026-09-28, robin's Windows machine, RTX 5090): `Qwen3.8-27B-CNQ4.5.cnq`, default boot, healthy in 10 s, tokenizer from `models/Qwen3.8-27B/`, MTP and the vision tower loaded, 24,020 MiB on the card after boot. Beside it Crow 2.8.2 made 3 of 3 images (Crow #320). Linux gate not run for this release: the change is host-side build code only.
+- **`serve.exe` boots the dense 27B on Windows** (crow-nest #126, 2026-09-28, robin's Windows machine, RTX 5090): `Qwen3.8-27B-CNQ4.5.cnq`, default boot, healthy in 10 s, tokenizer from `models/Qwen3.8-27B/`, MTP and the vision tower loaded, 24,020 MiB on the card after boot. Beside it Crow 2.8.2 made 3 of 3 images (Crow #320). Linux gate ALL GREEN at `97b4e05` (2026-09-28, RTX 5090, Arch Linux, `tools/gate-linux.sh decode_out/gate-2026-09-28-pr127`): parity8 `148cb72e8e44`, parity512 `6e9cb25fff43`, p8tf `8f5e5ce8dcec`, run32 32 ids of record, cargo test 460/0, clippy 1494; since then only one test line in `engine/src/tokenizer.rs` changed.
 
 ### Known limitations
 
