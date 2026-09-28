@@ -18,6 +18,11 @@
 # The runner moved from windows-latest to ubuntu-latest with the Linux port (2026-09-17): the step
 # bodies were already `shell: bash` and needed no change, only the four `runs-on:` values.
 #
+# Both systems, every job (#126, 2026-09-28): the move above left Windows unbuilt,
+# and serve.rs stopped compiling there the next day (20bc121, 7586234) without a red check. The
+# matrix runs each job on ubuntu-latest AND windows-latest; the build and test jobs of both are
+# meant to be required status checks on main.
+#
 # Local proof, 2026-09-11, rustc 1.97.0 (2d8144b78 2026-07-07), x86_64-pc-windows-msvc:
 # - build engine exit 0, build converter exit 0
 # - test engine: lib 72 passed of 80 (8 filtered), bin serve 55 passed of 57 (2 filtered), other bins 0
@@ -41,8 +46,12 @@ concurrency:
 
 jobs:
   build:
-    name: build (no GPU)
-    runs-on: ubuntu-latest
+    name: build (no GPU, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -61,7 +70,7 @@ jobs:
           {
             echo "### build"
             echo ""
-            echo "- runner: ubuntu-latest, no GPU"
+            echo "- runner: ${{ matrix.os }}, no GPU"
             echo "- $(cargo --version)"
             echo "- $(rustc --version)"
             echo "- target: $(rustc -vV | grep '^host:' | cut -d' ' -f2)"
@@ -76,8 +85,12 @@ jobs:
         run: cargo build --release --target-dir target_ci
 
   test:
-    name: test (host side only)
-    runs-on: ubuntu-latest
+    name: test (host side only, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -140,13 +153,25 @@ jobs:
           a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d merges.txt
           ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003 vocab.json
           SUMS
-          python3 -m pip install --quiet "nvidia-cuda-nvrtc==13.*"
-          loc=$(python3 -m pip show nvidia-cuda-nvrtc | awk '/^Location:/{print $2}')
-          so=$(find "$loc/nvidia" -name 'libnvrtc.so*' | head -1)
-          test -n "$so"
-          lib=$(dirname "$so")
-          ls "$lib"
-          echo "LD_LIBRARY_PATH=$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          # windows-latest has `python`, not `python3`; the wheel ships nvrtc64_*.dll there
+          # and the loader finds a DLL through PATH instead of LD_LIBRARY_PATH
+          py=python3; command -v python3 >/dev/null || py=python
+          $py -m pip install --quiet "nvidia-cuda-nvrtc==13.*"
+          loc=$($py -m pip show nvidia-cuda-nvrtc | awk '/^Location:/{print $2}' | tr -d '\r')
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            loc=$(cygpath -u "$loc")
+            so=$(find "$loc/nvidia" -iname 'nvrtc64_*.dll' | head -1)
+            test -n "$so"
+            lib=$(dirname "$so")
+            ls "$lib"
+            echo "$(cygpath -w "$lib")" >> "$GITHUB_PATH"
+          else
+            so=$(find "$loc/nvidia" -name 'libnvrtc.so*' | head -1)
+            test -n "$so"
+            lib=$(dirname "$so")
+            ls "$lib"
+            echo "LD_LIBRARY_PATH=$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          fi
       - name: engine tests
         working-directory: engine
         shell: bash
@@ -213,8 +238,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   clippy:
-    name: clippy (non-blocking, see count)
-    runs-on: ubuntu-latest
+    name: clippy (non-blocking, see count, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     # Non-blocking by decision of 2026-09-11: the measured count is 1314 warnings
     # (engine 1303, converter 11), so -D warnings cannot gate anything yet.
     # Flip continue-on-error to false once the count is 0. No source change in #50.
@@ -245,7 +274,7 @@ jobs:
           total=$(grep -cE '^warning: ' target_ci/clippy-engine.txt || :)
           summ=$(grep -cE '^warning: .crow-nest-engine.' target_ci/clippy-engine.txt || :); total=${total:-0}; summ=${summ:-0}
           echo "- engine clippy warnings: $((total - summ)) (local 2026-09-11: 1303)" >> "$GITHUB_STEP_SUMMARY"
-          cargo clippy --release --target-dir target_ci --all-targets -- -D warnings || echo "clippy non-blocking: above the 2026-09-11 baseline (11), see the count above" || echo "clippy non-blocking: above the 2026-09-11 baseline (1303), see the count above"
+          cargo clippy --release --target-dir target_ci --all-targets -- -D warnings || echo "clippy non-blocking: above the 2026-09-11 baseline (1303), see the count above"
       - name: converter clippy
         working-directory: converter
         shell: bash
@@ -255,11 +284,17 @@ jobs:
           total=$(grep -cE '^warning: ' target_ci/clippy-converter.txt || :)
           summ=$(grep -cE '^warning: .converter.' target_ci/clippy-converter.txt || :); total=${total:-0}; summ=${summ:-0}
           echo "- converter clippy warnings: $((total - summ)) (local 2026-09-11: 11)" >> "$GITHUB_STEP_SUMMARY"
-          cargo clippy --release --target-dir target_ci --all-targets -- -D warnings
+          # #126: 2de3398 meant both -D warnings calls to count, not fail; its edit put both
+          # fallbacks on the engine line and left this one failing the job on every run
+          cargo clippy --release --target-dir target_ci --all-targets -- -D warnings || echo "clippy non-blocking: above the 2026-09-11 baseline (11), see the count above"
 
   guards:
-    name: doc guards
-    runs-on: ubuntu-latest
+    name: doc guards (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

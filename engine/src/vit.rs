@@ -2348,13 +2348,18 @@ mod budget_and_mmproj {
             VitSource::Container(w) if w.contains("does not exist")));
         // unset: models/<model>/ beside the container, models/, then $CROW_MODELS, then Crow's install link
         let m = |p: &str| resolve_mmproj(None, cnq, Some("M"), Some("/cm"), Some("/home/u"), &|q| q == p);
+        // #126: joined the way resolve_mmproj joins them, so the separator is the
+        // platform's; on Linux these are the same strings as the literals they replace
+        let j = |base: &str, parts: &[&str]| {
+            parts.iter().fold(std::path::PathBuf::from(base), |b, p| b.join(p)).to_string_lossy().into_owned()
+        };
         let order = [
-            "/r/crow-nest/models/M/mmproj-F16.gguf",
-            "/r/crow-nest/models/mmproj-F16.gguf",
-            "/cm/mmproj-F16.gguf",
-            "/home/u/.local/share/crow/models/mmproj-F16.gguf",
+            j("/r/crow-nest", &["models", "M", "mmproj-F16.gguf"]),
+            j("/r/crow-nest", &["models", "mmproj-F16.gguf"]),
+            j("/cm", &["mmproj-F16.gguf"]),
+            j("/home/u", &[".local/share/crow/models", "mmproj-F16.gguf"]),
         ];
-        for hit in order {
+        for hit in &order {
             assert_eq!(m(hit), one(hit));
         }
         // #122: every existing file, in order - the model's own first
@@ -2369,7 +2374,7 @@ mod budget_and_mmproj {
         );
         match resolve_mmproj(None, cnq, Some("M"), Some("/cm"), Some("/home/u"), &|_| false) {
             VitSource::Container(w) => assert!(
-                w.contains("/r/crow-nest/models/M/mmproj-F16.gguf") && w.contains("/cm/") && w.contains("/home/u/"),
+                w.contains(order[0].as_str()) && w.contains(order[2].as_str()) && w.contains(order[3].as_str()),
                 "{w}"
             ),
             other => panic!("{other:?}"),

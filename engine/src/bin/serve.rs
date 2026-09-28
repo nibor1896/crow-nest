@@ -5611,8 +5611,16 @@ fn dispatch(stream: &mut TcpStream, srv: &mut Srv, head: Head) {
 // engine" remains the one way to leak (documented, not fixed - a watchdog that
 // TERMs first is the answer there, not this file).
 static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
 static LISTENER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+// #126: Windows has no signal mask; Ctrl+C keeps its default action
+// there, which is what every Windows serve did before #82 (the uvm leak #82 fixes
+// was measured on Linux). A console-control handler is the Windows follow-up.
+#[cfg(windows)]
+fn install_shutdown_watch() {}
+
+#[cfg(unix)]
 fn install_shutdown_watch() {
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
@@ -5644,6 +5652,37 @@ fn install_shutdown_watch() {
             // the Ctx all Drop, and the caller of this process gets its RAM back
         }
     });
+}
+
+// #117: wait up to `ms` for a connection on the listener, so the accept loop wakes
+// for the lend ttl. > 0 readable, 0 timeout, < 0 error or EINTR (the caller retries).
+#[cfg(unix)]
+fn listener_wait(listener: &TcpListener, ms: i32) -> i32 {
+    use std::os::fd::AsRawFd;
+    let mut pfd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    // SAFETY: one valid pollfd for the listener's open descriptor
+    unsafe { libc::poll(&mut pfd, 1, ms) }
+}
+
+// #126: WSAPoll is Winsock's poll (ws2_32, which std links already);
+// POLLRDNORM is the readable bit for a listening socket.
+#[cfg(windows)]
+fn listener_wait(listener: &TcpListener, ms: i32) -> i32 {
+    use std::os::windows::io::AsRawSocket;
+    #[repr(C)]
+    struct WsaPollFd {
+        fd: usize,
+        events: i16,
+        revents: i16,
+    }
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn WSAPoll(fds: *mut WsaPollFd, n: u32, timeout: i32) -> i32;
+    }
+    const POLLRDNORM: i16 = 0x0100;
+    let mut p = WsaPollFd { fd: listener.as_raw_socket() as usize, events: POLLRDNORM, revents: 0 };
+    // SAFETY: one valid WSAPOLLFD for the listener's open socket
+    unsafe { WSAPoll(&mut p, 1, ms) }
 }
 
 fn main() {
@@ -5799,8 +5838,11 @@ fn main() {
         }
     };
     // #82: the watcher shuts this socket down to break the accept below
-    use std::os::fd::AsRawFd;
-    LISTENER_FD.store(listener.as_raw_fd(), std::sync::atomic::Ordering::SeqCst);
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        LISTENER_FD.store(listener.as_raw_fd(), std::sync::atomic::Ordering::SeqCst);
+    }
     tracing::info!(target: "serve", "[serve] listening on http://{addr} (blocking, one request at a time)");
 
     let mut eng = eng;
@@ -5854,7 +5896,6 @@ fn main() {
         parked: crow_nest_engine::lend::Parked::default(),
     };
     tracing::info!(target: "serve", "[serve] {}", vram_boot_line());
-    let lfd = listener.as_raw_fd();
     loop {
         // #117: while VRAM is lent the loop must wake up for the ttl even when no
         // client connects: poll the listener with the time left, then accept
@@ -5868,10 +5909,8 @@ fn main() {
             continue;
         }
         if let Some(w) = srv.lend.wait(Instant::now()) {
-            let ms = w.as_millis().clamp(1, 1000) as libc::c_int;
-            let mut pfd = libc::pollfd { fd: lfd, events: libc::POLLIN, revents: 0 };
-            // SAFETY: one valid pollfd for the listener's open descriptor
-            let r = unsafe { libc::poll(&mut pfd, 1, ms) };
+            let ms = w.as_millis().clamp(1, 1000) as i32;
+            let r = listener_wait(&listener, ms);
             if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
@@ -8964,6 +9003,10 @@ Red is #FF0000."), "{off}");
     /// The point of the third case is the one the design turns on: a client that closed the
     /// connection and a client that only shut its WRITE side down are the same wire event,
     /// so the probe reports `Eof` for both and only the baseline tells them apart.
+    ///
+    /// #126: Linux only, like `poll_peer` itself: elsewhere there is no `POLLRDHUP` and the
+    /// probe is inert by design (`poll_peer` answers `Open`), so there is nothing to test.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_probe_sees_a_closed_peer_and_not_a_live_one() {
         use std::sync::mpsc;
