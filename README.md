@@ -19,10 +19,24 @@ cd engine && cargo build --release --bin serve && cd ..
 tools/serve-linux.sh --port 8099
 ```
 
-**Run the 27B, Linux** (container built with the [converter](converter/README.md), not on Hugging Face; images: `models/Qwen3.8-27B/mmproj-F16.gguf`)
+**The 27B** (container, tokenizer, vision projector)
+
+```bash
+hf download nibor1896/Qwen3.8-27B-CNQ4.5 Qwen3.8-27B-CNQ4.5.cnq --local-dir converter
+hf download Qwen/Qwen3.8-27B tokenizer.json tokenizer_config.json --local-dir models/Qwen3.8-27B
+hf download unsloth/Qwen3.8-27B-GGUF mmproj-F16.gguf --local-dir models/Qwen3.8-27B
+```
+
+**Run the 27B, Linux**
 
 ```bash
 CROW_CNQ=converter/Qwen3.8-27B-CNQ4.5.cnq tools/serve-linux.sh --port 8099
+```
+
+**Run the 27B, Windows**
+
+```powershell
+$env:CROW_CNQ = "converter\Qwen3.8-27B-CNQ4.5.cnq"; engine\target\release\serve.exe --port 8099
 ```
 
 **Run, Windows**
