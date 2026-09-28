@@ -157,7 +157,7 @@ jobs:
           # and the loader finds a DLL through PATH instead of LD_LIBRARY_PATH
           py=python3; command -v python3 >/dev/null || py=python
           $py -m pip install --quiet "nvidia-cuda-nvrtc==13.*"
-          loc=$($py -m pip show nvidia-cuda-nvrtc | awk '/^Location:/{print $2}' | tr -d '')
+          loc=$($py -m pip show nvidia-cuda-nvrtc | awk '/^Location:/{print $2}' | tr -d '\r')
           if [ "$RUNNER_OS" = "Windows" ]; then
             loc=$(cygpath -u "$loc")
             so=$(find "$loc/nvidia" -iname 'nvrtc64_*.dll' | head -1)
