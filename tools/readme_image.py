@@ -126,7 +126,7 @@ FEATURES = [
  ("Image generation", "the 27B at 64k leaves room for Qwen-Image 2.1", "gold"),
  ("Sampling", "the model card's row, never greedy (#111)", "sub"),
  ("Output integrity", "#91 fixed 2026-09-23: 60 to 0 corrupt tokens", "ok"),
- ("Linux + Windows", "Flash-Next on both, the 27B measured on Linux", "gold"),
+ ("Linux + Windows", "both models run on both; 27B speed measured on Linux", "gold"),
 ]
 for i, (ti, d, acc) in enumerate(FEATURES):
     fx, fy = X0 + (i % 2) * 405, y + (i // 2) * 80
@@ -162,9 +162,9 @@ REQ = [("GPU", "NVIDIA Blackwell sm_120, RTX 5090 32 GB"),
        ("Host RAM", "64 GB"),
        ("CUDA", "13.3 runtime (NVRTC)"),
        ("Rust", "stable"),
-       ("OS", "Linux, Windows; the 27B measured on Linux only"),
+       ("OS", "Linux, Windows; 27B speed measured on Linux"),
        ("Container", "Qwen3.8-Flash-Next-CNQ4.5-M.cnq, 104.7 GB, Hugging Face"),
-       ("27B container", "Qwen3.8-27B-CNQ4.5.cnq, 17.8 GB, built with the converter"),
+       ("27B container", "Qwen3.8-27B-CNQ4.5.cnq, 17.8 GB, Hugging Face"),
        ("27B vision", "models/Qwen3.8-27B/mmproj-F16.gguf, the F16 projector")]
 card(X0, y, 800, 24 + len(REQ) * 34)
 for i, (g, v) in enumerate(REQ):
@@ -206,7 +206,7 @@ card(X0, y, 800, 140, C["term"], C["bevel"], 12)
 t(X0 + 24, y + 38, "Build, run and ask. Copy it right below this picture.", 16, C["text"], weight=600)
 t(X0 + 24, y + 66, "cargo build, then serve on port 8099. Crow connects with --base-url.", 13, C["faint"])
 t(X0 + 24, y + 90, "The 104.7 GB Flash-Next container downloads from Hugging Face.", 13, C["faint"])
-t(X0 + 24, y + 114, "The 17.8 GB 27B container is built locally with the converter.", 13, C["faint"])
+t(X0 + 24, y + 114, "The 17.8 GB 27B container downloads from Hugging Face too.", 13, C["faint"])
 t(X1 - 30, y + 66, "↓", 40, C["ok"], anchor="end")
 y += 180
 
@@ -323,7 +323,7 @@ def mobile():
 
     y = msection(y, "Build and run", "ok")
     body = wrap("cargo build, then serve on port 8099. Crow connects with --base-url. The 104.7 GB Flash-Next container "
-                "downloads from Hugging Face; the 17.8 GB 27B container is built locally with the converter.", 50)
+                "downloads from Hugging Face; the 17.8 GB 27B container downloads from Hugging Face too.", 50)
     ih = 58 + len(body) * 20 + 14
     card(X0, y, CW, ih, C["term"], C["bevel"], 12)
     t(X0 + 18, y + 34, "Copy it right below this picture.", 17, C["text"], weight=600)
