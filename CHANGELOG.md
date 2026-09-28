@@ -14,6 +14,7 @@
 ### Changed
 
 - **CI runs every job on `ubuntu-latest` and `windows-latest`** (crow-nest #126, 2026-09-28), `fail-fast: false`, the OS in each job name, so a Windows-only break is a red check instead of a silent one.
+- **Four tests no longer assume Linux** (crow-nest #126, 2026-09-28, robin's approval). The tokenizer and projector path tests build their expected paths with `Path::join` (on Linux the same strings as before); the #54 loopback probe test runs where the probe exists (`target_os = "linux"`, as `poll_peer`); the PTX-manifest comparison needs the recording OS and the full NVRTC build from the PTX header, not only `13.3`. Measured on Windows with NVRTC 13.3.33, the build of the manifest: `quant_tiles` differs from Linux's PTX of record (`0a96be405b1e` there, `9cd36324e1ba` here), every other entry and the frozen-vs-current comparison agree; the cause is open in #126.
 
 ## 2026-09-27 — v0.7.1: the dense 27B reads its own tokenizer and chat template
 

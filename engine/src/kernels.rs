@@ -5813,15 +5813,48 @@ pub(crate) mod tests_300_c4 {
             bad.join("\n")
         );
         assert_eq!(sha(&frozen), sha(&now), "the whole PTX module differs outside the entries");
-        // the recorded manifest, when this machine runs the NVRTC it was recorded with
+        // the recorded manifest, when this machine runs the NVRTC it was recorded with,
+        // on the OS it was recorded on.
+        // #126: nvrtcVersion() says only major.minor, so the full build comes from the
+        // PTX header (`V13.3.33`) and the manifest's header comment. And the manifest is
+        // LINUX's PTX: on Windows the same NVRTC build 13.3.33 gives a different
+        // `quant_tiles` entry (measured 2026-09-28: 0a96be405b1e of record, 9cd36324e1ba
+        // there), while every other entry and the frozen-vs-current comparison above
+        // agree. Why is open in #126; until then the recorded hashes are Linux-only.
         let (_, nvrtc, module, rows) = manifest();
-        if nvrtc_version() == nvrtc {
+        let same_nvrtc = cfg!(target_os = "linux")
+            && match (ptx_build(&now), manifest_build()) {
+                (Some(here), Some(recorded)) => here == recorded,
+                _ => nvrtc_version() == nvrtc,
+            };
+        if same_nvrtc {
             let bad = diff_table(&rows, &nw);
             assert!(bad.is_empty(), "{} entries differ from the recorded manifest:\n{}", bad.len(), bad.join("\n"));
             assert_eq!(sha(&now), module, "the whole-module PTX differs from the recorded manifest");
         } else {
-            println!("NVRTC {} != manifest NVRTC {nvrtc}: the recorded hashes are not comparable; the frozen-source comparison above still holds", nvrtc_version());
+            println!(
+                "NVRTC {} (build {:?}) != manifest NVRTC {nvrtc} (build {:?}): the recorded hashes are not comparable; the frozen-source comparison above still holds",
+                nvrtc_version(),
+                ptx_build(&now),
+                manifest_build()
+            );
         }
+    }
+
+    /// #126: the full NVRTC build from a PTX header line
+    /// `// Cuda compilation tools, release 13.3, V13.3.33`, e.g. `13.3.33`
+    pub(crate) fn ptx_build(ptx: &str) -> Option<String> {
+        let line = ptx.lines().take(12).find(|l| l.contains("Cuda compilation tools"))?;
+        let v = line.rsplit(", V").next()?.trim();
+        (v.split('.').count() == 3).then(|| v.to_string())
+    }
+
+    /// #126: the build the manifest was recorded with, from its header comment
+    /// (`... NVRTC 13.3.33 (CUDA 13.3.1 ...`)
+    fn manifest_build() -> Option<String> {
+        let rest = MANIFEST.lines().filter(|l| l.starts_with('#')).find_map(|l| l.split("NVRTC ").nth(1))?;
+        let v = rest.split_whitespace().next()?;
+        (v.split('.').count() == 3).then(|| v.to_string())
     }
 
     /// every `CN_*` token the source reads, in first-use order

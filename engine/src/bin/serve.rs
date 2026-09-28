@@ -9003,6 +9003,10 @@ Red is #FF0000."), "{off}");
     /// The point of the third case is the one the design turns on: a client that closed the
     /// connection and a client that only shut its WRITE side down are the same wire event,
     /// so the probe reports `Eof` for both and only the baseline tells them apart.
+    ///
+    /// #126: Linux only, like `poll_peer` itself: elsewhere there is no `POLLRDHUP` and the
+    /// probe is inert by design (`poll_peer` answers `Open`), so there is nothing to test.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_probe_sees_a_closed_peer_and_not_a_live_one() {
         use std::sync::mpsc;

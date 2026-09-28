@@ -563,24 +563,31 @@ mod tests {
     fn the_tokenizer_comes_from_the_models_own_directory() {
         let all = |_: &str| true;
         let none = |_: &str| false;
+        // #126: the expected paths are joined the way the code joins them, so the
+        // separator is the platform's (`\` on Windows); on Linux these are the same
+        // strings as the literals they replace
+        let j = |base: &str, parts: &[&str]| {
+            parts.iter().fold(std::path::PathBuf::from(base), |b, p| b.join(p)).to_string_lossy().into_owned()
+        };
+        let own = j("", &["models", "Qwen3.8-27B", "tokenizer.json"]);
         let dense = "converter/Qwen3.8-27B-CNQ4.5.cnq";
         // the dense 27B: its own directory beside the container, not Flash-Next's
         let (t, why) = resolve_tokenizer(None, None, dense, Some("Qwen3.8-27B"), &all);
-        assert_eq!(t, "models/Qwen3.8-27B/tokenizer.json");
+        assert_eq!(t, own);
         assert!(why.contains("Qwen3.8-27B"), "{why}");
         assert_eq!(sibling_config(&t), "models/Qwen3.8-27B/tokenizer_config.json");
         // an absolute container path keeps its root
         let (t, _) = resolve_tokenizer(None, None, "/r/crow-nest/converter/x.cnq", Some("M"), &all);
-        assert_eq!(t, "/r/crow-nest/models/M/tokenizer.json");
+        assert_eq!(t, j("/r/crow-nest", &["models", "M", "tokenizer.json"]));
         // CROW_TOKENIZER wins, even over a present model directory, and is not tested for existence
         let (t, why) = resolve_tokenizer(Some("/x/tokenizer.json"), Some("/d"), dense, Some("Qwen3.8-27B"), &none);
         assert_eq!((t.as_str(), why.as_str()), ("/x/tokenizer.json", "CROW_TOKENIZER"));
         // CROW_MODEL_DIR comes next, only when its file is there
         let (t, why) = resolve_tokenizer(None, Some("/d"), dense, Some("Qwen3.8-27B"), &all);
-        assert_eq!((t.as_str(), why.as_str()), ("/d/tokenizer.json", "CROW_MODEL_DIR"));
-        let only_model = |p: &str| p.starts_with("models/");
+        assert_eq!((t.as_str(), why.as_str()), (j("/d", &["tokenizer.json"]).as_str(), "CROW_MODEL_DIR"));
+        let only_model = |p: &str| std::path::Path::new(p).starts_with("models");
         let (t, _) = resolve_tokenizer(None, Some("/d"), dense, Some("Qwen3.8-27B"), &only_model);
-        assert_eq!(t, "models/Qwen3.8-27B/tokenizer.json");
+        assert_eq!(t, own);
         // the Flash-Next container of record (index v1, no model block): the default, as before
         let (t, why) = resolve_tokenizer(None, None, crate::geo::DEFAULT_CNQ, None, &all);
         assert_eq!(t, DEFAULT_TOKENIZER);
@@ -588,7 +595,7 @@ mod tests {
         // the model's directory is missing: the default, and the reason names the missed file
         let (t, why) = resolve_tokenizer(None, None, dense, Some("Qwen3.8-27B"), &none);
         assert_eq!(t, DEFAULT_TOKENIZER);
-        assert!(why.contains("models/Qwen3.8-27B/tokenizer.json is missing"), "{why}");
+        assert!(why.contains(&format!("{own} is missing")), "{why}");
     }
 
     /// #121, the real container when this machine has it: its index v2 names the
