@@ -6,6 +6,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **The replay probe builds today's Crow body and keeps what a no-call round wrote** (Crow #245, 2026-09-30). `tools/corruption-replay-probe.py --served-name NAME|auto` passes the /props name as Crow's `served_name` (Crow #220), so the manifest's sampling row, `reasoning_fixed` and `reasoning_budget` with its message travel as they do from the window; unset, the 2026-09-22 body is unchanged. Every round records `reasoning_chunks` and `budget_closed` (serve's injected budget message found in the reasoning; checked on robin's Windows machine against serve's `reasoning budget 16 spent` line: 34 chunks = 16 + the 18-token sentence); a round without a call keeps its full `content` and the last 2,000 reasoning characters. Probe tests 16 -> 19; on Windows 16 / 19, the 3 filesystem-confirmed `digit_near_miss` cases need POSIX paths and were red there before the change.
+
 ## 2026-09-28 — v0.7.2: serve builds on Windows again, CI on both systems
 
 **`serve.exe` builds and boots on Windows again.** v0.7.1 did not compile on Windows (27 errors, Unix-only code since 2026-09-18) and CI had built only on Linux since 2026-09-17. Every CI job now runs on Ubuntu and Windows. Linux compiles the same code as v0.7.1; no kernel, weight or decode path changed.
