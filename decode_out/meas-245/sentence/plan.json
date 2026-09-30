@@ -1,0 +1,67 @@
+{
+ "series": "sentence",
+ "started_utc": "2026-09-30T13:22:07.556Z",
+ "session": "C:\\Users\\robin\\dev\\crow-nest\\decode_out\\meas-245\\session-0915.json",
+ "session_sha256": "6ee99879f3982c78e5a5e9118ef50e57834d89201d6393bec15c76fc0f46a834",
+ "crow_core_sha256": "ca5e8e761da7aa51cfa098a441f705eb041fcc854bc582812a5d04d85591fdff",
+ "probe_sha256": "f075229d2683d0d83227bf6882c5571aa871ecf6c8943da29fcb87f1bb354c80",
+ "processes_before": [
+  "serve 7888"
+ ],
+ "points": {
+  "10": {
+   "in": true,
+   "prompt_tokens": 19172
+  },
+  "45": {
+   "in": true,
+   "prompt_tokens": 41254
+  }
+ },
+ "arms": {
+  "SA1024": {},
+  "SB1024": {
+   "reasoning_budget_message": "\n\nThat is enough analysis. I will now act on it.\n"
+  }
+ },
+ "seeds": [
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23,
+  24,
+  25,
+  26,
+  27,
+  28,
+  29,
+  30,
+  31,
+  "greedy"
+ ],
+ "finished_utc": "2026-09-30T14:04:47.989Z",
+ "processes_after": [
+  "serve 7888"
+ ],
+ "engine_log_lines": 2814
+}
