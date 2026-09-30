@@ -23,15 +23,18 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 PROBE = os.path.join(REPO, "tools", "corruption-replay-probe.py")
-HEAD = os.path.join(REPO, "tools", "corpora", "91-replay-diorama-0922-head.txt")
-SESSION = os.path.join(HERE, "session-0922.json")
-SESSION_SHA = "559bb1ed8e17ec4beecfc9ed2aba33f2538e1b53df446921160019441b3729a8"
+# PREREG Amendment 1: the Windows session of 2026-09-15, its own head, Windows home
+SESSION = os.path.join(HERE, "session-0915.json")
+SESSION_SHA = "6ee99879f3982c78e5a5e9118ef50e57834d89201d6393bec15c76fc0f46a834"
+HEAD = None
+HOME = "C:/Users/robin"
 CROW_CORE = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Crow", "cli", "crow_core.py")
 ENGINE_LOG = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Crow", "logs", "engine.log")
-POINTS = [26, 69, 71, 109, 139]
 ARMS = {"A1024": {}, "B2048": {"reasoning_budget_tokens": 2048}}
 N_CTX, MAX_TOKENS = 65536, 16384
+FIT = N_CTX - MAX_TOKENS
 SEEDS = list(range(8)) + ["greedy"]
+SCREEN_SEED, SCREEN_MIN_K, MAX_POINTS = 100, 5, 5
 
 
 def now():
@@ -60,10 +63,12 @@ def probe(session, k, seed, extra, label, out_dir, rounds_json=True):
     else:
         seed0 = seed
     js = os.path.join(out_dir, label + ".json")
-    cmd = [sys.executable, PROBE, "--session", session, "--head-file", HEAD, "--at", str(k),
+    cmd = [sys.executable, PROBE, "--session", session, "--at", str(k),
            "--rounds", "1", "--seed0", str(seed0), "--served-name", "auto",
-           "--crow-core", CROW_CORE, "--home", "/home/nibor1896", "--label", label,
+           "--crow-core", CROW_CORE, "--home", HOME, "--label", label,
            "--sampling", json.dumps(sampling), "--json", js]
+    if HEAD:
+        cmd[4:4] = ["--head-file", HEAD]
     with open(os.path.join(out_dir, label + ".err"), "w", encoding="utf-8") as err:
         rc = subprocess.run(cmd, stdout=err, stderr=err).returncode
     if rc != 0 or not os.path.exists(js):
@@ -83,6 +88,50 @@ def engine_slice(t0, t1, out_dir):
     return kept
 
 
+def candidates(session, min_k):
+    """PREREG Amendment 1, screening step 1: K with a user/tool turn before and an assistant
+    turn WITH tool calls at K, ascending."""
+    with open(session, encoding="utf-8") as fh:
+        m = json.load(fh)["messages"]
+    return [k for k in range(max(1, min_k), len(m))
+            if m[k - 1]["role"] in ("user", "tool") and m[k]["role"] == "assistant"
+            and m[k].get("tool_calls")]
+
+
+def spread(ks, n=MAX_POINTS):
+    """PREREG Amendment 1, step 4: n points evenly over the closers, indices round(i(N-1)/(n-1))."""
+    if len(ks) <= n:
+        return list(ks)
+    return [ks[round(i * (len(ks) - 1) / (n - 1))] for i in range(n)]
+
+
+def screen(session, out_dir, limit=None):
+    """Steps 2-4: warm-up per candidate for its prompt size (the first that does not fit ends
+    the list), one arm-A round at SCREEN_SEED, the points = the rounds the budget closed."""
+    rows, closers = [], []
+    for k in candidates(session, SCREEN_MIN_K)[:limit]:
+        warm = probe(session, k, 0, {"max_tokens": 1}, "warm-K%d" % k, out_dir)
+        rd = (warm.get("rounds_detail") or [{}])[0] if "error" not in warm else {}
+        ptok = rd.get("prompt_tokens")
+        if ptok is None or ptok > FIT:
+            rows.append({"k": k, "prompt_tokens": ptok, "end": True,
+                         "why": warm.get("error") or rd.get("error") or "prompt > %d" % FIT})
+            print("screen K=%d: prompt %s tok - list ends" % (k, ptok), flush=True)
+            break
+        r = probe(session, k, SCREEN_SEED, ARMS["A1024"], "scr-A1024-K%d-s%d" % (k, SCREEN_SEED), out_dir)
+        d = (r.get("rounds_detail") or [{}])[0] if "error" not in r else {"error": r["error"]}
+        row = {"k": k, "prompt_tokens": ptok, "n_calls": d.get("n_calls"), "finish": d.get("finish"),
+               "reasoning_chunks": d.get("reasoning_chunks"), "budget_closed": d.get("budget_closed"),
+               "seconds": d.get("seconds"), "error": d.get("error")}
+        rows.append(row)
+        if d.get("budget_closed"):
+            closers.append(k)
+        print("screen K=%d: prompt %d, calls %s, reasoning %s, closed %s, %.1f s" % (
+            k, ptok, row["n_calls"], row["reasoning_chunks"], row["budget_closed"],
+            row["seconds"] or 0), flush=True)
+    return rows, closers, spread(closers)
+
+
 def run(args):
     out_dir = args.out
     os.makedirs(out_dir, exist_ok=True)
@@ -98,6 +147,14 @@ def run(args):
             "crow_core_sha256": sha256(CROW_CORE), "probe_sha256": sha256(PROBE),
             "processes_before": procs, "points": {}, "arms": ARMS, "seeds": seeds}
     print("series start %s, processes %s" % (plan["started_utc"], procs), flush=True)
+    if args.points is None:
+        rows, closers, points = screen(session, out_dir, args.screen_limit)
+        plan["screening"] = {"seed": SCREEN_SEED, "rows": rows, "closers": closers, "points": points}
+        print("screening: %d rounds, %d closed %s -> points %s" % (
+            sum(1 for r in rows if not r.get("end")), len(closers), closers, points), flush=True)
+        if not points:
+            print("PREREG Amendment 1 step 4: 1024 does not bind on the 27B in this session", flush=True)
+        args.points = points
     for k in args.points:
         warm = probe(session, k, 0, {"max_tokens": 1}, "warm-K%d" % k, out_dir)
         if "error" in warm:
@@ -154,7 +211,7 @@ def median(xs):
 def report(out_dir):
     rows = {}
     for name in sorted(os.listdir(out_dir)):
-        if not name.endswith(".json") or name.startswith(("warm-", "plan")):
+        if not name.endswith(".json") or name.startswith(("warm-", "plan", "scr-")):
             continue
         arm, kk, _ = name[:-5].split("-", 2)
         with open(os.path.join(out_dir, name), encoding="utf-8") as fh:
@@ -211,18 +268,18 @@ def main():
     ap.add_argument("--selftest", default=None, metavar="SESSION")
     ap.add_argument("--points", type=int, nargs="*", default=None)
     ap.add_argument("--rounds-per-arm", type=int, default=None)
+    ap.add_argument("--screen-limit", type=int, default=None, help="--selftest only: screen the first N candidates")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     if args.report:
         return report(args.out or HERE)
     if args.selftest:
         args.session, args.out = args.selftest, args.out or os.path.join(HERE, "selftest")
-        args.points = args.points or []
     else:
         args.session, args.out = SESSION, args.out or HERE
-        args.points = args.points or POINTS
-        if args.rounds_per_arm:
-            sys.exit("--rounds-per-arm is for --selftest only (PREREG: 8 seeds + greedy)")
+        if args.rounds_per_arm or args.screen_limit or args.points is not None:
+            sys.exit("--rounds-per-arm / --screen-limit / --points are for --selftest only "
+                     "(PREREG: screening picks the points, 8 seeds + greedy)")
     run(args)
 
 

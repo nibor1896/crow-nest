@@ -85,3 +85,45 @@ Schema-wrong calls and budget closes are reported, not judged.
 ## Follow-on
 If 2048 passes the rule, 4096 is measured the same way against 2048 — written down as an
 amendment to this file before its first round. If it fails, the series ends.
+
+---
+
+# AMENDMENT 1 — 2026-09-30 ~13:45 CEST, before any round on the new data
+
+Cause: the 2026-09-22 diorama session (sha256 `559bb1ed…`) exists only on the Linux
+installation of this dual-boot machine; robin will not boot Linux for it (2026-09-30). No
+request of the series has been sent on any data. Seen so far: only the plumbing selftest
+(`selftest/`, K=4 of the session below, seed 0, one round per arm: both 1 call, 41 reasoning
+chunks, no close, 1.7 / 1.6 s) — K=4 is excluded from selection for that reason.
+
+## Data (replaces "Data" above)
+- Replay session: `decode_out/meas-245/session-0915.json`, a byte copy of
+  `%LOCALAPPDATA%\Crow\session\rollover-20260915-092436.json`, sha256
+  `6ee99879f3982c78e5a5e9118ef50e57834d89201d6393bec15c76fc0f46a834`: robin's Windows work
+  session of 2026-09-15 after a rollover, 274 messages, 122 assistant turns with tool calls.
+  Chosen by rule, not by content: the most recent Windows session file larger than 100 kB.
+  Head: the session's own messages[0] (no head file). History written by another model than
+  the 27B — as in MEAS-0923's replay.
+- Nothing is known about where the budget binds in it, so the points are SELECTED by a
+  screening pass whose rounds are never counted.
+
+## Screening (new, before the counted rounds)
+1. Candidates: every K with messages[K-1] a user or tool turn and messages[K] an assistant turn
+   with tool calls, K >= 5, ascending.
+2. Per candidate: a warm-up (arm A body, max_tokens 1) gives prompt_tokens; the first candidate
+   with prompt > 49,152 ends the list (prompts grow with K).
+3. Per fitting candidate: ONE screening round, arm A (1024), seed 100 (not a counted seed).
+4. Points = the candidates whose screening round has `budget_closed` True. More than 5: take 5
+   spread evenly over them in K order (indices round(i x (n-1) / 4), i = 0..4). 1 to 5: all.
+   0: the result is "1024 does not bind on the 27B in this session"; no counted rounds, 1024
+   stays with that as its evidence, and the ticket gets that sentence with the screening table.
+5. Screening rounds are reported (count, closes, no-call) but never enter the decision.
+Selection is by arm A's own close at a seed outside the counted ones, so it favours points where
+1024 binds — the question the ticket asks — without looking at any arm B round.
+
+## Grader on this session (stated limit)
+The paths are Windows paths (`C:\Users\robin\…`). The probe's path checks read POSIX paths
+only, so `home_mismatch` and `digit_near_miss` cannot fire here; "corrupt" is json_invalid,
+placeholder and control_char only. `--home C:/Users/robin`.
+
+Design, arms, metrics, decision rule, limits and follow-on above are unchanged.
