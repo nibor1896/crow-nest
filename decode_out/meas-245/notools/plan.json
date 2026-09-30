@@ -1,0 +1,770 @@
+{
+ "series": "notools",
+ "started_utc": "2026-09-30T14:18:59.848Z",
+ "head_session_sha256": "6ee99879f3982c78e5a5e9118ef50e57834d89201d6393bec15c76fc0f46a834",
+ "prompts_sha256": "75f3a1667077da627c31519597d2ddfd49e9c09da7c4a4afb2d74cf4d8e03f52",
+ "crow_core_sha256": "ca5e8e761da7aa51cfa098a441f705eb041fcc854bc582812a5d04d85591fdff",
+ "probe_sha256": "f075229d2683d0d83227bf6882c5571aa871ecf6c8943da29fcb87f1bb354c80",
+ "processes_before": [
+  "serve 7888"
+ ],
+ "seeds": [
+  0,
+  1,
+  2
+ ],
+ "rounds": [
+  {
+   "prompt": "de-prose-plakat",
+   "seed": 0,
+   "SA1024": {
+    "kind": "call",
+    "head": "write_file",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 52.0,
+    "reasoning_chunks": 1042,
+    "content_chars": 0
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "run_command",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 47.2,
+    "reasoning_chunks": 1038,
+    "content_chars": 8466
+   }
+  },
+  {
+   "prompt": "de-prose-plakat",
+   "seed": 1,
+   "SA1024": {
+    "kind": "answer",
+    "head": "Das Plakat für eine Ausstellung kunstgewerblicher Sammlungen des neunzehnten Jah",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 45.2,
+    "reasoning_chunks": 1042,
+    "content_chars": 8140
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "write_file",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 44.8,
+    "reasoning_chunks": 1038,
+    "content_chars": 0
+   }
+  },
+  {
+   "prompt": "de-prose-plakat",
+   "seed": 2,
+   "SA1024": {
+    "kind": "call",
+    "head": "write_file",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 44.5,
+    "reasoning_chunks": 1042,
+    "content_chars": 0
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "write_file",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 42.2,
+    "reasoning_chunks": 1038,
+    "content_chars": 0
+   }
+  },
+  {
+   "prompt": "de-prose-speicher",
+   "seed": 0,
+   "SA1024": {
+    "kind": "answer",
+    "head": "Der Fachtext zum Thema Speicherhierarchie moderner Grafikprozessoren:  ---  Wer ",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 57.6,
+    "reasoning_chunks": 1042,
+    "content_chars": 10321
+   },
+   "SB1024": {
+    "kind": "answer",
+    "head": "Der Fachtext ist unten. Wortzählung: rund 990 Wörter, innerhalb des geforderten ",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 47.7,
+    "reasoning_chunks": 1038,
+    "content_chars": 9399
+   }
+  },
+  {
+   "prompt": "de-prose-speicher",
+   "seed": 1,
+   "SA1024": {
+    "kind": "answer",
+    "head": "Die Speicherhierarchie moderner Grafikprozessoren  Ein moderner Grafikbeschleuni",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 43.4,
+    "reasoning_chunks": 1042,
+    "content_chars": 8153
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "write_file",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 37.0,
+    "reasoning_chunks": 1038,
+    "content_chars": 0
+   }
+  },
+  {
+   "prompt": "de-prose-speicher",
+   "seed": 2,
+   "SA1024": {
+    "kind": "answer",
+    "head": "Grafikprozessoren sind seit einigen Jahren zu den leistungsfähigsten Rechenarchi",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 47.8,
+    "reasoning_chunks": 1042,
+    "content_chars": 9770
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "write_file",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 41.9,
+    "reasoning_chunks": 1038,
+    "content_chars": 0
+   }
+  },
+  {
+   "prompt": "de-prose-buchbinderei",
+   "seed": 0,
+   "SA1024": {
+    "kind": "answer",
+    "head": "**Der Weg des Einbands: Zur Geschichte der Buchbinderei zwischen 1850 und 1930**",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 58.5,
+    "reasoning_chunks": 1042,
+    "content_chars": 9308
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "run_command",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 40.5,
+    "reasoning_chunks": 1038,
+    "content_chars": 4447
+   }
+  },
+  {
+   "prompt": "de-prose-buchbinderei",
+   "seed": 1,
+   "SA1024": {
+    "kind": "call",
+    "head": "web_search",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 16.5,
+    "reasoning_chunks": 1042,
+    "content_chars": 0
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "goal_set",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 17.0,
+    "reasoning_chunks": 1038,
+    "content_chars": 0
+   }
+  },
+  {
+   "prompt": "de-prose-buchbinderei",
+   "seed": 2,
+   "SA1024": {
+    "kind": "call",
+    "head": "write_file",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 61.3,
+    "reasoning_chunks": 1042,
+    "content_chars": 7107
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "write_file",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 42.6,
+    "reasoning_chunks": 1038,
+    "content_chars": 0
+   }
+  },
+  {
+   "prompt": "de-prose-wasserwerk",
+   "seed": 0,
+   "SA1024": {
+    "kind": "call",
+    "head": "write_file",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 42.8,
+    "reasoning_chunks": 1042,
+    "content_chars": 0
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "list_dir",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 14.8,
+    "reasoning_chunks": 1038,
+    "content_chars": 0
+   }
+  },
+  {
+   "prompt": "de-prose-wasserwerk",
+   "seed": 1,
+   "SA1024": {
+    "kind": "call",
+    "head": "run_command",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 42.0,
+    "reasoning_chunks": 1042,
+    "content_chars": 7618
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "write_file",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 52.5,
+    "reasoning_chunks": 1038,
+    "content_chars": 0
+   }
+  },
+  {
+   "prompt": "de-prose-wasserwerk",
+   "seed": 2,
+   "SA1024": {
+    "kind": "answer",
+    "head": "Die Wasserversorgung einer mittelgroßen Stadt ist eines der komplexesten technis",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 47.9,
+    "reasoning_chunks": 1042,
+    "content_chars": 8793
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "write_file",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 44.5,
+    "reasoning_chunks": 1038,
+    "content_chars": 0
+   }
+  },
+  {
+   "prompt": "en-prose-foundry",
+   "seed": 0,
+   "SA1024": {
+    "kind": "answer",
+    "head": "A small grey iron foundry in the first decades of the twentieth century turned o",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 43.3,
+    "reasoning_chunks": 1042,
+    "content_chars": 5254
+   },
+   "SB1024": {
+    "kind": "answer",
+    "head": "A small iron foundry of the early twentieth century ran, in its essentials, on t",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 43.4,
+    "reasoning_chunks": 1038,
+    "content_chars": 7751
+   }
+  },
+  {
+   "prompt": "en-prose-foundry",
+   "seed": 1,
+   "SA1024": {
+    "kind": "answer",
+    "head": "The day in a small iron foundry began before the cupola was lit, in the pattern ",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 34.6,
+    "reasoning_chunks": 1042,
+    "content_chars": 6097
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "run_command",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 47.8,
+    "reasoning_chunks": 1038,
+    "content_chars": 6268
+   }
+  },
+  {
+   "prompt": "en-prose-foundry",
+   "seed": 2,
+   "SA1024": {
+    "kind": "answer",
+    "head": "In a small iron foundry at the beginning of the twentieth century, the pattern s",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 41.9,
+    "reasoning_chunks": 1042,
+    "content_chars": 7491
+   },
+   "SB1024": {
+    "kind": "answer",
+    "head": "A small iron foundry at the beginning of the twentieth century was a place where",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 39.5,
+    "reasoning_chunks": 1038,
+    "content_chars": 6711
+   }
+  },
+  {
+   "prompt": "en-prose-archive",
+   "seed": 0,
+   "SA1024": {
+    "kind": "answer",
+    "head": "The first act of keeping paper alive for two centuries is the building, and the ",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 47.2,
+    "reasoning_chunks": 1042,
+    "content_chars": 7143
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "run_command",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 16.9,
+    "reasoning_chunks": 1038,
+    "content_chars": 0
+   }
+  },
+  {
+   "prompt": "en-prose-archive",
+   "seed": 1,
+   "SA1024": {
+    "kind": "answer",
+    "head": "The first decision a municipal archive makes about its paper is architectural, b",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 40.5,
+    "reasoning_chunks": 1042,
+    "content_chars": 7559
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "run_command",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 17.6,
+    "reasoning_chunks": 1038,
+    "content_chars": 0
+   }
+  },
+  {
+   "prompt": "en-prose-archive",
+   "seed": 2,
+   "SA1024": {
+    "kind": "answer",
+    "head": "# Municipal Paper Preservation: Two Centuries of Legibility  A municipal archive",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 47.2,
+    "reasoning_chunks": 1042,
+    "content_chars": 9364
+   },
+   "SB1024": {
+    "kind": "answer",
+    "head": "The question of how a municipal archive keeps its paper legible for two hundred ",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 39.6,
+    "reasoning_chunks": 1038,
+    "content_chars": 7673
+   }
+  },
+  {
+   "prompt": "lit-farbpalette",
+   "seed": 0,
+   "SA1024": {
+    "kind": "answer",
+    "head": "Für das Ausstellungsplakat sind vier Farben festgelegt, die einander nicht im We",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 39.7,
+    "reasoning_chunks": 1042,
+    "content_chars": 4379
+   },
+   "SB1024": {
+    "kind": "answer",
+    "head": "Hier ist der Text – anschließend ein paar Stichpunkte zur Selbstkontrolle der Vo",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 34.9,
+    "reasoning_chunks": 1038,
+    "content_chars": 5177
+   }
+  },
+  {
+   "prompt": "lit-farbpalette",
+   "seed": 1,
+   "SA1024": {
+    "kind": "call",
+    "head": "goal_set",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 14.9,
+    "reasoning_chunks": 1042,
+    "content_chars": 0
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "list_dir, run_command",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 14.4,
+    "reasoning_chunks": 1038,
+    "content_chars": 0
+   }
+  },
+  {
+   "prompt": "lit-farbpalette",
+   "seed": 2,
+   "SA1024": {
+    "kind": "answer",
+    "head": "Der Hintergrundton #D7FFE0 ist die stillste und zugleich die arbeitssamste der v",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 37.7,
+    "reasoning_chunks": 1042,
+    "content_chars": 5235
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "read_file",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 14.0,
+    "reasoning_chunks": 1038,
+    "content_chars": 0
+   }
+  },
+  {
+   "prompt": "lit-releasenote",
+   "seed": 0,
+   "SA1024": {
+    "kind": "answer",
+    "head": "This release note documents build 0xB7A31F, carrying the tag release-2026-09-18a",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 33.7,
+    "reasoning_chunks": 1042,
+    "content_chars": 3675
+   },
+   "SB1024": {
+    "kind": "answer",
+    "head": "CNQ4.5-M release notes, build 0xB7A31F  This note describes build 0xB7A31F, publ",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 27.7,
+    "reasoning_chunks": 1038,
+    "content_chars": 4334
+   }
+  },
+  {
+   "prompt": "lit-releasenote",
+   "seed": 1,
+   "SA1024": {
+    "kind": "answer",
+    "head": "Release note for CNQ4.5-M  CNQ4.5-M, build 0xB7A31F, ships under the tag release",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 22.9,
+    "reasoning_chunks": 1042,
+    "content_chars": 2814
+   },
+   "SB1024": {
+    "kind": "answer",
+    "head": "Release note — CNQ4.5-M, build 0xB7A31F, tag release-2026-09-18a  CNQ4.5-M, buil",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 26.3,
+    "reasoning_chunks": 1038,
+    "content_chars": 3719
+   }
+  },
+  {
+   "prompt": "lit-releasenote",
+   "seed": 2,
+   "SA1024": {
+    "kind": "answer",
+    "head": "The CNQ4.5-M release lands as build 0xB7A31F, tagged release-2026-09-18a, and it",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 22.2,
+    "reasoning_chunks": 1042,
+    "content_chars": 3154
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "run_command",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 27.4,
+    "reasoning_chunks": 1038,
+    "content_chars": 2531
+   }
+  },
+  {
+   "prompt": "json-tensorplan",
+   "seed": 0,
+   "SA1024": {
+    "kind": "call",
+    "head": "memory",
+    "finish": "tool_calls",
+    "budget_closed": false,
+    "seconds": 11.7,
+    "reasoning_chunks": 226,
+    "content_chars": 0
+   }
+  },
+  {
+   "prompt": "json-tensorplan",
+   "seed": 1,
+   "SA1024": {
+    "kind": "answer",
+    "head": "{\"quant\":\"CNQ4.5-M\",\"build\":\"0xB7A31F\",\"rows\":248320,\"strict\":true,\"layers\":[{\"i",
+    "finish": "stop",
+    "budget_closed": false,
+    "seconds": 5.3,
+    "reasoning_chunks": 352,
+    "content_chars": 336
+   }
+  },
+  {
+   "prompt": "json-tensorplan",
+   "seed": 2,
+   "SA1024": {
+    "kind": "call",
+    "head": "goal_set",
+    "finish": "tool_calls",
+    "budget_closed": false,
+    "seconds": 5.6,
+    "reasoning_chunks": 498,
+    "content_chars": 0
+   }
+  },
+  {
+   "prompt": "json-schritte",
+   "seed": 0,
+   "SA1024": {
+    "kind": "answer",
+    "head": "{   \"vorhaben\": \"Umzug eines Archivs in ein neues Magazin\",   \"dauer_tage\": 21, ",
+    "finish": "stop",
+    "budget_closed": false,
+    "seconds": 20.5,
+    "reasoning_chunks": 583,
+    "content_chars": 1290
+   }
+  },
+  {
+   "prompt": "json-schritte",
+   "seed": 1,
+   "SA1024": {
+    "kind": "answer",
+    "head": "{   \"vorhaben\": \"Umzug eines Archivs in ein neues Magazin\",   \"dauer_tage\": 6,  ",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 16.2,
+    "reasoning_chunks": 1042,
+    "content_chars": 1033
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "goal_set",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 13.8,
+    "reasoning_chunks": 1038,
+    "content_chars": 0
+   }
+  },
+  {
+   "prompt": "json-schritte",
+   "seed": 2,
+   "SA1024": {
+    "kind": "call",
+    "head": "run_command",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 18.1,
+    "reasoning_chunks": 1042,
+    "content_chars": 0
+   },
+   "SB1024": {
+    "kind": "answer",
+    "head": "{\"vorhaben\":\"Umzug des Archivs in das neue Magazin\",\"dauer_tage\":14,\"fertig\":fal",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 16.9,
+    "reasoning_chunks": 1038,
+    "content_chars": 884
+   }
+  },
+  {
+   "prompt": "de-agent-umzug",
+   "seed": 0,
+   "SA1024": {
+    "kind": "answer",
+    "head": "1. Erstellen Sie eine vollständige Bestandserfassung mit Signaturen, Formaten un",
+    "finish": "stop",
+    "budget_closed": false,
+    "seconds": 22.6,
+    "reasoning_chunks": 271,
+    "content_chars": 2903
+   }
+  },
+  {
+   "prompt": "de-agent-umzug",
+   "seed": 1,
+   "SA1024": {
+    "kind": "answer",
+    "head": "1. Erstellen Sie eine vollständige Inventarliste aller Objekte, Kisten und Medie",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 22.8,
+    "reasoning_chunks": 1042,
+    "content_chars": 2674
+   },
+   "SB1024": {
+    "kind": "answer",
+    "head": "1. Erstellen Sie eine vollständige Inventarliste aller Objekte, Kisten und Medie",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 22.3,
+    "reasoning_chunks": 1038,
+    "content_chars": 2540
+   }
+  },
+  {
+   "prompt": "de-agent-umzug",
+   "seed": 2,
+   "SA1024": {
+    "kind": "answer",
+    "head": "1. Der Archivar erfasst den gesamten Bestand mit eindeutigen Inventarnummern und",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 22.1,
+    "reasoning_chunks": 1042,
+    "content_chars": 2412
+   },
+   "SB1024": {
+    "kind": "answer",
+    "head": "1. Der Archivar erfasst den gesamten Bestand mit einer eindeutigen Inventarnumme",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 22.2,
+    "reasoning_chunks": 1038,
+    "content_chars": 2473
+   }
+  },
+  {
+   "prompt": "de-agent-fehlersuche",
+   "seed": 0,
+   "SA1024": {
+    "kind": "call",
+    "head": "read_file",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 39.4,
+    "reasoning_chunks": 1042,
+    "content_chars": 4001
+   },
+   "SB1024": {
+    "kind": "answer",
+    "head": "1. Reproduziere das Muster quantitativ: Führe z. B. `curl -s -o /dev/null -w \"%{",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 30.3,
+    "reasoning_chunks": 1038,
+    "content_chars": 3872
+   }
+  },
+  {
+   "prompt": "de-agent-fehlersuche",
+   "seed": 1,
+   "SA1024": {
+    "kind": "answer",
+    "head": "1. Reproduziere das Muster systematisch: Schicke in einer Schleife 20–30 Anfrage",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 32.9,
+    "reasoning_chunks": 1042,
+    "content_chars": 4609
+   },
+   "SB1024": {
+    "kind": "call",
+    "head": "goal_step, goal_step, goal_step, goal_step, goal_step, goal_step",
+    "finish": "tool_calls",
+    "budget_closed": true,
+    "seconds": 17.9,
+    "reasoning_chunks": 1038,
+    "content_chars": 11
+   }
+  },
+  {
+   "prompt": "de-agent-fehlersuche",
+   "seed": 2,
+   "SA1024": {
+    "kind": "answer",
+    "head": "1. Prüfe, ob der Dienst heute Morgen neu gestartet wurde oder ob ein geplantes J",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 29.6,
+    "reasoning_chunks": 1042,
+    "content_chars": 3839
+   },
+   "SB1024": {
+    "kind": "answer",
+    "head": "1. Prüfe, ob der Dienst heute Morgen neu gestartet wurde oder ob ein geplanter J",
+    "finish": "stop",
+    "budget_closed": true,
+    "seconds": 28.0,
+    "reasoning_chunks": 1038,
+    "content_chars": 3351
+   }
+  }
+ ],
+ "finished_utc": "2026-09-30T14:56:15.252Z",
+ "processes_after": [
+  "serve 7888"
+ ],
+ "engine_log_lines": 1499
+}

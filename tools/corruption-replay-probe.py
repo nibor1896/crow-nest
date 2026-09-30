@@ -110,7 +110,8 @@ Usage: corruption-replay-probe.py --preset diorama-0922 --session SNAPSHOT [--ro
            [--port 8099] [--seed0 0] [--label arm] [--json OUT]
        corruption-replay-probe.py --session S --at K [--at K2 ...] [...]
 Options: --top-logprobs N, --no-stream, --sampling JSON (merged over Crow's), --tools-json FILE, --head-file FILE,
-         --wire-model NAME,
+         --wire-model NAME, --served-name NAME|auto (Crow #245: the body today's window builds
+         for the model the server has open, budget fields included),
          --crow-core PATH (default the INSTALLED ~/.local/share/crow/cli/crow_core.py, the
          file the live GUI ran), --home DIR (default ~), --base-url URL (default
          http://127.0.0.1:<port>/v1, Crow's local endpoint), --live-only (grade the stored
@@ -185,14 +186,20 @@ class _Captured(Exception):
     pass
 
 
-def crow_body(crow, messages, model, wire_model, base_url):
+def crow_body(crow, messages, model, wire_model, base_url, served_name=None):
     """The body crow_core.stream_reply builds for this history -- captured, never sent.
 
     TWO MODEL NAMES, as in the window (crow_gui.py): sampling is resolved from the model the
     server reports (`sampling_for(self._model)`, the display name the session stores), while
     the request's `model` field is the endpoint's (`provider_endpoint(..., args.model)`, whose
     default is DEFAULT_MODEL "crow"). The reasoning budget is resolved inside stream_reply from
-    the WIRE name, so "crow" sends no budget fields -- which is what the live bodies measure."""
+    the WIRE name, so "crow" sends no budget fields -- which is what the live bodies measure.
+
+    `served_name` (Crow #245): the window since Crow #220 passes what /props reported as
+    stream_reply's `served_name`, and the manifest is asked about THAT name -- sampling row,
+    `reasoning_fixed`, `reasoning_budget` and the budget message all travel. Given, it replaces
+    the session's model for sampling_for too, so the body is the one today's window builds for
+    the model the server has open. None keeps the 2026-09-22 body above byte for byte."""
     got = {}
 
     def capture(url, body, api_key, timeout, extra=None):
@@ -204,12 +211,13 @@ def crow_body(crow, messages, model, wire_model, base_url):
     try:
         conv = crow.Conversation()
         conv._messages = copy.deepcopy(messages)
-        s = crow.sampling_for(model)
+        s = crow.sampling_for(served_name or model)
+        named = {"served_name": served_name} if served_name else {}
         try:
             crow.stream_reply(conv, base_url=base_url, model=wire_model, api_key="",
                               temperature=s["temperature"], top_p=s["top_p"],
                               min_p=s["min_p"], top_k=s.get("top_k"),
-                              presence_penalty=s.get("presence_penalty"), timeout=10)
+                              presence_penalty=s.get("presence_penalty"), timeout=10, **named)
         except _Captured:
             pass
     finally:
@@ -219,13 +227,18 @@ def crow_body(crow, messages, model, wire_model, base_url):
     return got["url"], got["body"]
 
 
-def post(url, body, timeout=3600):
+def post(url, body, timeout=3600, out=None):
     """(content, tool_calls, finish, usage, logprobs). Streamed like Crow: `index` picks a slot,
     id/name only on a truthy value, `arguments` concatenated raw (crow_core.stream_reply).
     `logprobs` is the concatenation of every `choices[0].logprobs.content` (#91), [] when the
-    body did not ask for them."""
+    body did not ask for them.
+
+    `out` (Crow #245), a dict: filled with `reasoning` (the concatenated `reasoning_content`)
+    and `reasoning_chunks` (how many deltas carried it -- serve sends one per thinking token,
+    the `reasoning chunks N` of its [chat] line; the document form has no chunks: None)."""
     req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
                                  headers={"Content-Type": "application/json"})
+    out = {} if out is None else out
     with urllib.request.urlopen(req, timeout=timeout) as r:
         if not body.get("stream"):
             ans = json.loads(r.read())
@@ -235,8 +248,10 @@ def post(url, body, timeout=3600):
                       "arguments": (c.get("function") or {}).get("arguments") or ""}
                      for c in msg.get("tool_calls") or []]
             lps = list(((ch.get("logprobs") or {}).get("content")) or [])
+            out.update(reasoning=msg.get("reasoning_content") or "", reasoning_chunks=None)
             return msg.get("content") or "", calls, ch.get("finish_reason"), ans.get("usage") or {}, lps
         content, slots, finish, usage, lps = [], {}, None, {}, []
+        reasoning = []
         for raw in r:
             line = raw.decode("utf-8", "replace").strip()
             if not line.startswith("data: ") or line == "data: [DONE]":
@@ -263,6 +278,9 @@ def post(url, body, timeout=3600):
                         slot["arguments"] += fn["arguments"]
                 if delta.get("content"):
                     content.append(delta["content"])
+                if delta.get("reasoning_content"):
+                    reasoning.append(delta["reasoning_content"])
+        out.update(reasoning="".join(reasoning), reasoning_chunks=len(reasoning))
         return "".join(content), [slots[i] for i in sorted(slots)], finish, usage, lps
 
 
@@ -613,6 +631,17 @@ def stored_answer(msg):
     return msg.get("content") or "", calls
 
 
+def budget_closed(reasoning, message):
+    """Crow #245: did serve close this think block at the budget? serve injects the request's
+    `reasoning_budget_message` into the block when the cap is spent (#81, serve.rs
+    `build_injection`), so it streams as reasoning; the model never writes Crow's sentence on its
+    own. None when the body carried no budget message (nothing to recognise)."""
+    msg = (message or "").strip()
+    if not msg:
+        return None
+    return msg in (reasoning or "")
+
+
 def _short(calls):
     return [{"name": c["name"], "arguments": c["arguments"][:400] +
              ("...(%d chars)" % len(c["arguments"]) if len(c["arguments"]) > 400 else "")}
@@ -651,6 +680,10 @@ def main():
                     help="system text to send as messages[0] instead of the stored one (a preset names its own)")
     ap.add_argument("--wire-model", default=None,
                     help="the request's `model` field (default: crow_core.DEFAULT_MODEL, the window's --model default)")
+    ap.add_argument("--served-name", default=None,
+                    help="the /props model name stream_reply gets as served_name (Crow #220/#245): "
+                         "sampling, reasoning_fixed and reasoning_budget come from its manifest entry; "
+                         "'auto' asks the server like the window does; unset = the 2026-09-22 body")
     ap.add_argument("--home", default=os.path.expanduser("~"))
     ap.add_argument("--no-stream", action="store_true")
     ap.add_argument("--top-logprobs", type=int, default=None, metavar="N",
@@ -717,9 +750,15 @@ def main():
         with open(args.tools_json) as fh:
             tools_override = json.load(fh)
     extra = json.loads(args.sampling)
+    served_name = args.served_name
+    if served_name == "auto":
+        served_name = crow.fetch_model_name(base_url)
+        if not served_name:
+            sys.exit("--served-name auto: %s/props named no model" % base_url)
     with open(args.crow_core, "rb") as fh:
         crow_sha = hashlib.sha256(fh.read()).hexdigest()
     info = {"session": session, "session_sha256": sha, "model": model, "wire_model": wire_model,
+            "served_name": served_name,
             "head_file": head_file, "head_sha256": head_sha, "home": args.home,
             "crow_core": args.crow_core,
             "crow_core_sha256": crow_sha,
@@ -731,7 +770,7 @@ def main():
     for p in points:
         k = p["at"]
         hist = messages[:k]
-        url, body = crow_body(crow, hist, model, wire_model, base_url)
+        url, body = crow_body(crow, hist, model, wire_model, base_url, served_name)
         if tools_override is not None:
             body["tools"] = tools_override
         body.update(extra)
@@ -754,7 +793,9 @@ def main():
                   "tools": len(tools),
                   "tools_sha256": hashlib.sha256(json.dumps(tools, sort_keys=True).encode()).hexdigest()[:16],
                   "sampling": {f: body.get(f) for f in ("temperature", "top_p", "min_p", "top_k",
-                                                        "presence_penalty", "max_tokens")}})
+                                                        "presence_penalty", "max_tokens",
+                                                        "reasoning_effort", "reasoning_budget_tokens",
+                                                        "reasoning_budget_message")}})
         if k < len(messages) and messages[k]["role"] == "assistant":
             c, calls = stored_answer(messages[k])
             live = grade_answer(c, calls, None, tools, ctx, args.home)
@@ -770,8 +811,9 @@ def main():
             seed = args.seed0 + r
             b = dict(body, seed=seed)
             t0 = time.time()
+            got = {}
             try:
-                content, calls, finish, usage, lps = post(url, b)
+                content, calls, finish, usage, lps = post(url, b, out=got)
             except urllib.error.HTTPError as exc:
                 rounds.append({"at": k, "seed": seed, "error": "HTTP %d: %s" % (exc.code, exc.read()[:300])})
                 continue
@@ -786,7 +828,17 @@ def main():
                       "completion_tokens": usage.get("completion_tokens"),
                       "prompt_tokens_delta_vs_live": (ptok - p["live_prompt_tokens"])
                       if ptok is not None and p.get("live_prompt_tokens") else None,
-                      "content_chars": len(content), "reply": _short(calls)})
+                      "content_chars": len(content), "reply": _short(calls),
+                      # Crow #245: the think block's length and whether the budget closed it
+                      "reasoning_chunks": got.get("reasoning_chunks"),
+                      "reasoning_chars": len(got.get("reasoning") or ""),
+                      "budget_closed": budget_closed(got.get("reasoning"),
+                                                     b.get("reasoning_budget_message"))})
+            if not calls:
+                # Crow #245 probe change 1: a round without a call keeps what it WROTE --
+                # MEAS-0923's one no-call round (K=69 seed 2) could not be read afterwards
+                g["content"] = content
+                g["reasoning_tail"] = (got.get("reasoning") or "")[-2000:]
             if args.top_logprobs is not None:
                 g["logprobs"] = logprob_report(lps, g, args.home)
             if args.dump_lp:
@@ -795,10 +847,12 @@ def main():
                               "forced": len(force or []),
                               "ids": [e.get("crow_id") for e in lps], "entries": lps})
             rounds.append(g)
-            print("at %d seed %d: %d call(s), %d corrupt %s, prompt %s tok (%s cached), %.0f s" % (
-                k, seed, g["n_calls"], g["calls_with_error"],
-                sorted({e["kind"] for c in g["calls"] for e in c["errors"]}), ptok,
-                g["cached_tokens"], g["seconds"]), file=sys.stderr)
+            print("at %d seed %d: %d call(s), %d corrupt %s, prompt %s tok (%s cached), %.0f s, "
+                  "finish %s, reasoning %s chunks, budget closed %s" % (
+                      k, seed, g["n_calls"], g["calls_with_error"],
+                      sorted({e["kind"] for c in g["calls"] for e in c["errors"]}), ptok,
+                      g["cached_tokens"], g["seconds"], finish, g["reasoning_chunks"],
+                      g["budget_closed"]), file=sys.stderr)
             if "logprobs" in g:
                 print_report(g["logprobs"], k, seed)
 
@@ -813,7 +867,11 @@ def main():
         p.update({"rounds_ok": len(pr), "calls": sum(x["n_calls"] for x in pr),
                   "calls_with_error": sum(x["calls_with_error"] for x in pr),
                   "calls_with_schema_error": sum(x["calls_with_schema_error"] for x in pr),
-                  "rounds_with_error": sum(1 for x in pr if x["calls_with_error"])})
+                  "rounds_with_error": sum(1 for x in pr if x["calls_with_error"]),
+                  "rounds_without_call": sum(1 for x in pr if not x["n_calls"]),
+                  "budget_closed": sum(1 for x in pr if x.get("budget_closed")),
+                  "seconds": [x["seconds"] for x in pr],
+                  "reasoning_chunks": [x.get("reasoning_chunks") for x in pr]})
     calls_total = sum(x["n_calls"] for x in ok)
     bad = sum(x["calls_with_error"] for x in ok)
     expected = 0 if args.live_only else args.rounds * len(points)
@@ -827,6 +885,7 @@ def main():
         "char_error_rate": None,
         "rounds_with_error": sum(1 for x in ok if x["calls_with_error"]),
         "schema_calls_with_error": sum(x["calls_with_schema_error"] for x in ok),
+        "budget_closed": sum(1 for x in ok if x.get("budget_closed")),
         "error_kinds": kinds,
         **info,
         "points": per_point,
@@ -845,10 +904,11 @@ def main():
         with open(args.json, "w") as fh:
             fh.write(out + "\n")
     print("%s replay @ %s: %d/%d calls corrupt (line_error_rate=%s), %d digit near-miss, "
-          "%d schema-wrong, %d rounds without a call, kinds %s (%d rounds)" % (
+          "%d schema-wrong, %d rounds without a call, %d budget-closed, kinds %s (%d rounds)" % (
               args.label, ",".join(str(p["at"]) for p in points), bad, calls_total,
               summary["line_error_rate"], summary["hex_char_errors"],
-              summary["schema_calls_with_error"], summary["missing"], kinds, len(ok)), file=sys.stderr if args.json == "-" else sys.stdout)
+              summary["schema_calls_with_error"], summary["missing"], summary["budget_closed"],
+              kinds, len(ok)), file=sys.stderr if args.json == "-" else sys.stdout)
 
 
 if __name__ == "__main__":

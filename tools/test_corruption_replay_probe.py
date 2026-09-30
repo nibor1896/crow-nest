@@ -274,6 +274,97 @@ class Logprobs(unittest.TestCase):
 
 
 
+BUDGET_MSG = "\n\nThat is enough analysis. I will now write the final answer for the user.\n"
+
+
+class _ReasoningStub(http.server.BaseHTTPRequestHandler):
+    """Crow #245: serve's wire form of a think block the budget closed, then a text answer."""
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.server.bodies.append(body)
+        base = {"id": "chatcmpl-2", "object": "chat.completion.chunk", "created": 1, "model": "crow"}
+        think = ["Let", " me", " think"] + ([BUDGET_MSG] if body.get("reasoning_budget_tokens") else [])
+        frames = [dict(base, choices=[{"index": 0, "delta": {"reasoning_content": t}, "finish_reason": None}])
+                  for t in think]
+        frames.append(dict(base, choices=[{"index": 0, "delta": {"content": "Done, no call."},
+                                           "finish_reason": None}]))
+        frames.append(dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                           usage={"prompt_tokens": 24410}))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        for f in frames:
+            self.wfile.write(b"data: " + json.dumps(f).encode() + b"\n\n")
+        self.wfile.write(b"data: [DONE]\n\n")
+
+
+class ReasoningBudget(unittest.TestCase):
+    """Crow #245: reasoning is counted, a budget close is recognised, served_name reaches Crow."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = http.server.HTTPServer(("127.0.0.1", 0), _ReasoningStub)
+        cls.srv.bodies = []
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.url = "http://127.0.0.1:%d/v1/chat/completions" % cls.srv.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def test_post_counts_reasoning_and_keeps_its_five_values(self):
+        got = {}
+        content, calls, finish, usage, lps = rp.post(
+            self.url, {"stream": True, "reasoning_budget_tokens": 2048,
+                       "reasoning_budget_message": BUDGET_MSG}, out=got)
+        self.assertEqual((content, calls, finish), ("Done, no call.", [], "stop"))
+        self.assertEqual(got["reasoning_chunks"], 4)
+        self.assertTrue(rp.budget_closed(got["reasoning"], BUDGET_MSG))
+        rp.post(self.url, {"stream": True}, out=got)
+        self.assertEqual(got["reasoning_chunks"], 3)
+        self.assertFalse(rp.budget_closed(got["reasoning"], BUDGET_MSG))
+
+    def test_budget_closed_without_a_message_is_unknown(self):
+        self.assertIsNone(rp.budget_closed("anything", None))
+        self.assertIsNone(rp.budget_closed("anything", "  "))
+
+    def test_served_name_picks_the_sampling_and_reaches_stream_reply(self):
+        seen = {}
+
+        class FakeCrow:
+            class Conversation:
+                _messages = []
+
+            @staticmethod
+            def sampling_for(name):
+                seen["sampling_for"] = name
+                return {"temperature": 1.0, "top_p": 0.95, "min_p": 0.0, "top_k": 20}
+
+            @staticmethod
+            def stream_reply(conv, **kw):
+                seen["kw"] = kw
+                FakeCrow._post_stream(kw["base_url"] + "/chat/completions",
+                                      {"model": kw["model"], "served": kw.get("served_name")}, "", 10)
+
+            @staticmethod
+            def _post_stream(url, body, api_key, timeout, extra=None):
+                raise AssertionError("replaced by crow_body")
+
+        _, body = rp.crow_body(FakeCrow, [], "Qwen3.8-Flash-Next-CNQ4.5-M", "crow",
+                               "http://x/v1", "Qwen3.8-27B-CNQ4.5.cnq")
+        self.assertEqual(seen["sampling_for"], "Qwen3.8-27B-CNQ4.5.cnq")
+        self.assertEqual(body["served"], "Qwen3.8-27B-CNQ4.5.cnq")
+        # unset: the 2026-09-22 call, no served_name keyword at all
+        _, body = rp.crow_body(FakeCrow, [], "Qwen3.8-Flash-Next-CNQ4.5-M", "crow", "http://x/v1")
+        self.assertEqual(seen["sampling_for"], "Qwen3.8-Flash-Next-CNQ4.5-M")
+        self.assertNotIn("served_name", seen["kw"])
+
+
 TFSPEC = importlib.util.spec_from_file_location("tf_compare", TOOLS / "teacher-forced-compare.py")
 tfc = importlib.util.module_from_spec(TFSPEC)
 TFSPEC.loader.exec_module(tfc)
