@@ -211,7 +211,8 @@ def median(xs):
 def report(out_dir):
     rows = {}
     for name in sorted(os.listdir(out_dir)):
-        if not name.endswith(".json") or name.startswith(("warm-", "plan", "scr-")):
+        # only round files: <arm>-K<k>-s<seed>.json (session-0915.json, plan.json, warm-/scr- are not)
+        if not name.endswith(".json") or not name.startswith(tuple(a + "-K" for a in ARMS)):
             continue
         arm, kk, _ = name[:-5].split("-", 2)
         with open(os.path.join(out_dir, name), encoding="utf-8") as fh:

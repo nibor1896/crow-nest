@@ -1,0 +1,231 @@
+{
+ "started_utc": "2026-09-30T11:31:41.131Z",
+ "session": "C:\\Users\\robin\\dev\\crow-nest\\decode_out\\meas-245\\session-0915.json",
+ "session_sha256": "6ee99879f3982c78e5a5e9118ef50e57834d89201d6393bec15c76fc0f46a834",
+ "crow_core_sha256": "ca5e8e761da7aa51cfa098a441f705eb041fcc854bc582812a5d04d85591fdff",
+ "probe_sha256": "f075229d2683d0d83227bf6882c5571aa871ecf6c8943da29fcb87f1bb354c80",
+ "processes_before": [
+  "serve 7888"
+ ],
+ "points": {
+  "10": {
+   "in": true,
+   "prompt_tokens": 19172
+  },
+  "45": {
+   "in": true,
+   "prompt_tokens": 41254
+  }
+ },
+ "arms": {
+  "A1024": {},
+  "B2048": {
+   "reasoning_budget_tokens": 2048
+  }
+ },
+ "seeds": [
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  "greedy"
+ ],
+ "screening": {
+  "seed": 100,
+  "rows": [
+   {
+    "k": 10,
+    "prompt_tokens": 19172,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 1042,
+    "budget_closed": true,
+    "seconds": 20.7,
+    "error": null
+   },
+   {
+    "k": 13,
+    "prompt_tokens": 20004,
+    "n_calls": 3,
+    "finish": "tool_calls",
+    "reasoning_chunks": 830,
+    "budget_closed": false,
+    "seconds": 14.5,
+    "error": null
+   },
+   {
+    "k": 16,
+    "prompt_tokens": 20980,
+    "n_calls": 2,
+    "finish": "tool_calls",
+    "reasoning_chunks": 290,
+    "budget_closed": false,
+    "seconds": 6.7,
+    "error": null
+   },
+   {
+    "k": 18,
+    "prompt_tokens": 22583,
+    "n_calls": 2,
+    "finish": "tool_calls",
+    "reasoning_chunks": 265,
+    "budget_closed": false,
+    "seconds": 5.7,
+    "error": null
+   },
+   {
+    "k": 21,
+    "prompt_tokens": 25186,
+    "n_calls": 2,
+    "finish": "tool_calls",
+    "reasoning_chunks": 155,
+    "budget_closed": false,
+    "seconds": 4.8,
+    "error": null
+   },
+   {
+    "k": 23,
+    "prompt_tokens": 26266,
+    "n_calls": 2,
+    "finish": "tool_calls",
+    "reasoning_chunks": 274,
+    "budget_closed": false,
+    "seconds": 6.0,
+    "error": null
+   },
+   {
+    "k": 25,
+    "prompt_tokens": 27203,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 226,
+    "budget_closed": false,
+    "seconds": 5.6,
+    "error": null
+   },
+   {
+    "k": 27,
+    "prompt_tokens": 27887,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 327,
+    "budget_closed": false,
+    "seconds": 7.2,
+    "error": null
+   },
+   {
+    "k": 30,
+    "prompt_tokens": 29245,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 39,
+    "budget_closed": false,
+    "seconds": 1.7,
+    "error": null
+   },
+   {
+    "k": 32,
+    "prompt_tokens": 35361,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 484,
+    "budget_closed": false,
+    "seconds": 12.5,
+    "error": null
+   },
+   {
+    "k": 34,
+    "prompt_tokens": 35908,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 106,
+    "budget_closed": false,
+    "seconds": 3.5,
+    "error": null
+   },
+   {
+    "k": 36,
+    "prompt_tokens": 36435,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 56,
+    "budget_closed": false,
+    "seconds": 2.6,
+    "error": null
+   },
+   {
+    "k": 38,
+    "prompt_tokens": 37068,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 28,
+    "budget_closed": false,
+    "seconds": 1.7,
+    "error": null
+   },
+   {
+    "k": 40,
+    "prompt_tokens": 37236,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 232,
+    "budget_closed": false,
+    "seconds": 6.5,
+    "error": null
+   },
+   {
+    "k": 42,
+    "prompt_tokens": 37703,
+    "n_calls": 2,
+    "finish": "tool_calls",
+    "reasoning_chunks": 470,
+    "budget_closed": false,
+    "seconds": 11.2,
+    "error": null
+   },
+   {
+    "k": 45,
+    "prompt_tokens": 41254,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 1042,
+    "budget_closed": true,
+    "seconds": 21.3,
+    "error": null
+   },
+   {
+    "k": 47,
+    "prompt_tokens": 42822,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 145,
+    "budget_closed": false,
+    "seconds": 4.5,
+    "error": null
+   },
+   {
+    "k": 50,
+    "prompt_tokens": 51199,
+    "end": true,
+    "why": "prompt > 49152"
+   }
+  ],
+  "closers": [
+   10,
+   45
+  ],
+  "points": [
+   10,
+   45
+  ]
+ },
+ "finished_utc": "2026-09-30T11:52:33.714Z",
+ "processes_after": [
+  "serve 7888"
+ ],
+ "engine_log_lines": 1482
+}
