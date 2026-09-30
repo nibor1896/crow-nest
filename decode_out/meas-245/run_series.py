@@ -35,6 +35,15 @@ N_CTX, MAX_TOKENS = 65536, 16384
 FIT = N_CTX - MAX_TOKENS
 SEEDS = list(range(8)) + ["greedy"]
 SCREEN_SEED, SCREEN_MIN_K, MAX_POINTS = 100, 5, 5
+# PREREG Amendment 2: the closing sentence at 1024 -- sentence B of Crow #245
+SENT_B = "\n\nThat is enough analysis. I will now act on it.\n"
+SERIES = {
+    # arm names carry no "-": report() splits file names on it
+    "budget": {"arms": ARMS, "seeds": SEEDS, "points": None, "out": HERE, "decide": "decide_budget"},
+    "sentence": {"arms": {"SA1024": {}, "SB1024": {"reasoning_budget_message": SENT_B}},
+                 "seeds": list(range(32)) + ["greedy"], "points": [10, 45],
+                 "out": os.path.join(HERE, "sentence"), "decide": "decide_sentence"},
+}
 
 
 def now():
@@ -142,10 +151,14 @@ def run(args):
     procs = gpu_processes()
     if len([p for p in procs if p.startswith("serve ")]) != 1 or len(procs) != 1:
         sys.exit("PREREG: exactly one serve.exe and nothing else - found %s" % procs)
-    seeds = SEEDS[:args.rounds_per_arm] if args.rounds_per_arm else SEEDS
-    plan = {"started_utc": now(), "session": session, "session_sha256": sha,
+    series = SERIES[args.series]
+    arms, names = series["arms"], list(series["arms"])
+    seeds = series["seeds"][:args.rounds_per_arm] if args.rounds_per_arm else series["seeds"]
+    if args.points is None:
+        args.points = series["points"]
+    plan = {"series": args.series, "started_utc": now(), "session": session, "session_sha256": sha,
             "crow_core_sha256": sha256(CROW_CORE), "probe_sha256": sha256(PROBE),
-            "processes_before": procs, "points": {}, "arms": ARMS, "seeds": seeds}
+            "processes_before": procs, "points": {}, "arms": arms, "seeds": seeds}
     print("series start %s, processes %s" % (plan["started_utc"], procs), flush=True)
     if args.points is None:
         rows, closers, points = screen(session, out_dir, args.screen_limit)
@@ -171,10 +184,10 @@ def run(args):
         plan["points"][k] = {"in": True, "prompt_tokens": ptok}
         print("K=%d IN: prompt %d tok" % (k, ptok), flush=True)
         for i, seed in enumerate(seeds):
-            order = ["A1024", "B2048"] if (seed == "greedy" or seed % 2 == 0) else ["B2048", "A1024"]
+            order = names if (seed == "greedy" or seed % 2 == 0) else names[::-1]
             for arm in order:
                 label = "%s-K%d-s%s" % (arm, k, seed)
-                r = probe(session, k, seed, ARMS[arm], label, out_dir)
+                r = probe(session, k, seed, arms[arm], label, out_dir)
                 d = (r.get("rounds_detail") or [{}])[0] if "error" not in r else {}
                 print("  %-20s calls %s finish %s reasoning %s closed %s %.1f s%s" % (
                     label, d.get("n_calls"), d.get("finish"), d.get("reasoning_chunks"),
@@ -187,7 +200,7 @@ def run(args):
     with open(os.path.join(out_dir, "plan.json"), "w", encoding="utf-8") as fh:
         json.dump(plan, fh, indent=1)
     print("series end %s, processes %s" % (plan["finished_utc"], plan["processes_after"]), flush=True)
-    report(out_dir)
+    report(out_dir, args.series)
 
 
 def wilson(x, n, z=1.96):
@@ -208,11 +221,72 @@ def median(xs):
     return xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2
 
 
-def report(out_dir):
+def fisher_fewer(x_b, n_b, x_a, n_a):
+    """One-sided Fisher exact p that B has so few events: P(X <= x_b), X hypergeometric with
+    n_a + n_b rounds, x_a + x_b events, n_b drawn."""
+    tot, ev = n_a + n_b, x_a + x_b
+    if not n_b or not tot:
+        return None
+    den = math.comb(tot, n_b)
+    return round(sum(math.comb(ev, i) * math.comb(tot - ev, n_b - i)
+                     for i in range(0, min(x_b, ev) + 1)) / den, 4)
+
+
+def decide_budget(tot, names):
+    a, b = tot.get("A1024"), tot.get("B2048")
+    if not (a and b and median(a["sec"])):
+        return None
+    rule = {"a_no_call": b["nc"] <= a["nc"], "b_corrupt": b["corrupt"] <= a["corrupt"],
+            "c_wall_clock": median(b["sec"]) <= 1.5 * median(a["sec"])}
+    return "PREREG decision rule: %s -> %s" % (rule, "2048 replaces 1024" if all(rule.values()) else "1024 stays")
+
+
+def decide_sentence(tot, names):
+    """PREREG Amendment 2: B only if strictly fewer no-call rounds, not worse on corrupt and
+    schema, wall clock <= 1.5x; a pass is a PROPOSAL (one constant for every model)."""
+    a, b = tot.get("SA1024"), tot.get("SB1024")
+    if not (a and b and median(a["sec"])):
+        return None
+    rule = {"a_fewer_no_call": b["nc"] < a["nc"],
+            "b_corrupt_schema": b["corrupt"] <= a["corrupt"] and b["schema"] <= a["schema"],
+            "c_wall_clock": median(b["sec"]) <= 1.5 * median(a["sec"])}
+    p = fisher_fewer(b["nc_closed"], b["closed"], a["nc_closed"], a["closed"])
+    return ("closed rounds only: no call A %d/%d, B %d/%d, one-sided Fisher p (B fewer) %s\n\n"
+            "PREREG decision rule: %s -> %s" % (
+                a["nc_closed"], a["closed"], b["nc_closed"], b["closed"], p, rule,
+                "sentence B is PROPOSED (robin decides; one constant for every model)"
+                if all(rule.values()) else "sentence A stays"))
+
+
+def determinism(out_dir):
+    """PREREG Amendment 2: SA1024 at seeds 0..7 + greedy repeats the budget series' A1024 body."""
+    same, n, diff = 0, 0, []
+    for name in sorted(os.listdir(out_dir)):
+        if not (name.startswith("SA1024-K") and name.endswith(".json")):
+            continue
+        old = os.path.join(HERE, "A1024-" + name[len("SA1024-"):])
+        if not os.path.exists(old):
+            continue
+        with open(os.path.join(out_dir, name), encoding="utf-8") as fh:
+            new_d = json.load(fh)["rounds_detail"][0]
+        with open(old, encoding="utf-8") as fh:
+            old_d = json.load(fh)["rounds_detail"][0]
+        key = lambda d: (d.get("finish"), d.get("n_calls"), d.get("reasoning_chunks"))
+        n += 1
+        if key(new_d) == key(old_d):
+            same += 1
+        else:
+            diff.append("%s %s vs %s" % (name[:-5], key(new_d), key(old_d)))
+    return "determinism vs the budget series' A1024: %d of %d rounds identical (finish, calls, reasoning chunks)%s" % (
+        same, n, (": differ " + "; ".join(diff)) if diff else "")
+
+
+def report(out_dir, series="budget"):
+    names = list(SERIES[series]["arms"])
     rows = {}
     for name in sorted(os.listdir(out_dir)):
         # only round files: <arm>-K<k>-s<seed>.json (session-0915.json, plan.json, warm-/scr- are not)
-        if not name.endswith(".json") or not name.startswith(tuple(a + "-K" for a in ARMS)):
+        if not name.endswith(".json") or not name.startswith(tuple(a + "-K" for a in names)):
             continue
         arm, kk, _ = name[:-5].split("-", 2)
         with open(os.path.join(out_dir, name), encoding="utf-8") as fh:
@@ -229,10 +303,11 @@ def report(out_dir):
         rc = [d.get("reasoning_chunks") for d in ds if d.get("reasoning_chunks") is not None]
         sec = [d["seconds"] for d in ds]
         t = tot.setdefault(arm, {"n": 0, "nc": 0, "corrupt": 0, "schema": 0, "closed": 0, "sec": [],
-                                 "failed": 0})
+                                 "failed": 0, "nc_closed": 0})
         t["n"] += len(ds)
         t["failed"] += len(rows[(arm, k)]) - len(ds)
         t["nc"] += nc
+        t["nc_closed"] += sum(1 for d in ds if not d["n_calls"] and d.get("budget_closed"))
         t["corrupt"] += sum(d["calls_with_error"] for d in ds)
         t["schema"] += sum(d["calls_with_schema_error"] for d in ds)
         t["closed"] += sum(1 for d in ds if d.get("budget_closed"))
@@ -250,13 +325,11 @@ def report(out_dir):
         lines.append("| %s | %d | %d | %d %s | %d | %d | %d | %s |" % (
             arm, t["n"], t["failed"], t["nc"], wilson(t["nc"], t["n"]), t["corrupt"], t["schema"],
             t["closed"], median(t["sec"])))
-    a, b = tot.get("A1024"), tot.get("B2048")
-    if a and b and median(a["sec"]):
-        rule = {"a_no_call": b["nc"] <= a["nc"], "b_corrupt": b["corrupt"] <= a["corrupt"],
-                "c_wall_clock": median(b["sec"]) <= 1.5 * median(a["sec"])}
-        lines.append("")
-        lines.append("PREREG decision rule: %s -> %s" % (
-            rule, "2048 replaces 1024" if all(rule.values()) else "1024 stays"))
+    verdict = globals()[SERIES[series]["decide"]](tot, names)
+    if verdict:
+        lines += ["", verdict]
+    if series == "sentence":
+        lines += ["", determinism(out_dir)]
     text = "\n".join(lines) + "\n"
     with open(os.path.join(out_dir, "TABLE.md"), "w", encoding="utf-8") as fh:
         fh.write(text)
@@ -270,14 +343,16 @@ def main():
     ap.add_argument("--points", type=int, nargs="*", default=None)
     ap.add_argument("--rounds-per-arm", type=int, default=None)
     ap.add_argument("--screen-limit", type=int, default=None, help="--selftest only: screen the first N candidates")
+    ap.add_argument("--series", choices=sorted(SERIES), default="budget",
+                    help="budget = 1024 vs 2048 (PREREG + Amendment 1); sentence = A vs B at 1024 (Amendment 2)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     if args.report:
-        return report(args.out or HERE)
+        return report(args.out or SERIES[args.series]["out"], args.series)
     if args.selftest:
         args.session, args.out = args.selftest, args.out or os.path.join(HERE, "selftest")
     else:
-        args.session, args.out = SESSION, args.out or HERE
+        args.session, args.out = SESSION, args.out or SERIES[args.series]["out"]
         if args.rounds_per_arm or args.screen_limit or args.points is not None:
             sys.exit("--rounds-per-arm / --screen-limit / --points are for --selftest only "
                      "(PREREG: screening picks the points, 8 seeds + greedy)")

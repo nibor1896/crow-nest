@@ -127,3 +127,54 @@ only, so `home_mismatch` and `digit_near_miss` cannot fire here; "corrupt" is js
 placeholder and control_char only. `--home C:/Users/robin`.
 
 Design, arms, metrics, decision rule, limits and follow-on above are unchanged.
+
+---
+
+# AMENDMENT 2 — 2026-09-30, the closing sentence at 1024, before any round of it
+
+Cause: robin, 2026-09-30, after the 1024/2048 result (1024 stays; its one no-call round,
+K=45 seed 0, followed the cut + sentence A with a written "final answer" and no call): "mach
+satz B test bei 1024". The ticket's second question. Seen so far of this question: that one
+round and MEAS-0923's K=69 seed 2 — nothing with sentence B.
+
+## Arms (one variable: the sentence; budget 1024 in both)
+- A: Crow's REASONING_BUDGET_MESSAGE, sent as is:
+  `"\n\nThat is enough analysis. I will now write the final answer for the user.\n"`
+- B: the ticket's sentence B, via `--sampling '{"reasoning_budget_message": ...}'`:
+  `"\n\nThat is enough analysis. I will now act on it.\n"`
+
+## Data and points
+Same session (`session-0915.json`, sha256 `6ee99879…`), same two points the 1024/2048 screening
+selected: K=10 (19,172 prompt tokens, 1024 closed 6 of 9 there) and K=45 (41,254, 9 of 9). No
+new screening.
+
+## Design
+Seeds 0..31 + greedy per arm and point (33 x 2 x 2 = 132 counted rounds), ABBA by seed as
+before, a warm-up per point, `serve.exe` alone. Arm A at seeds 0..7 + greedy repeats the
+1024/2048 series' A rounds with the same body: serve is seed-deterministic (crow-nest
+docs/acceptance/issue-87.md), so the repeats are a determinism check (reported: how many of
+the 18 match the earlier round's finish, call count and reasoning chunks) and are counted like
+every other round. Output: `decode_out/meas-245/sentence/`.
+
+## Metrics
+As above; the one that decides is rounds without a tool call. Rounds where the budget did NOT
+close carry no sentence and are the same prompt and seed in both arms — so the comparison that
+matters is among the CLOSED rounds; both are reported (all rounds, and closed rounds only).
+
+## Decision rule
+B is proposed as Crow's REASONING_BUDGET_MESSAGE only if ALL hold, summed over both points:
+- a. no-call(B) < no-call(A) — strictly fewer (the ticket: "change the sentence only if B
+  reduces no-call rounds at 1024")
+- b. corrupt(B) <= corrupt(A) and schema-wrong(B) <= schema-wrong(A)
+- c. median s/round(B) <= 1.5 x median(A)
+Otherwise sentence A stays. Even if B passes, the change is PROPOSED, not made: the sentence is
+one constant for every model and every turn (text answers too, where #176 chose A to stop
+mid-word cuts, 2 of 9 -> 0 of 6), and this series measures the 27B's tool turns only. A
+one-sided Fisher exact p on no-call among closed rounds is reported beside the counts, not used
+as a gate.
+
+## Stated limits, before the result
+- Base rate from the 1024/2048 series: 1 no-call in 15 closed 1024 rounds. At ~50 closed
+  rounds per arm, A expects roughly 3; a difference of one or two rounds is not a rate.
+- One session, two turns, one model, one day; the effect on answers without tools is not
+  measured here.
