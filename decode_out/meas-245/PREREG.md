@@ -178,3 +178,59 @@ as a gate.
   rounds per arm, A expects roughly 3; a difference of one or two rounds is not a rate.
 - One session, two turns, one model, one day; the effect on answers without tools is not
   measured here.
+
+---
+
+# AMENDMENT 3 — 2026-09-30, sentence B on turns that need no tool, before any round of it
+
+Cause: Amendment 2's rule passed (B: 0 of 49 cut rounds without a call, A: 4 of 49), and B is
+only PROPOSED because the sentence is one constant for every turn. #176 chose sentence A for
+turns that end in a written answer (mid-word starts 2 of 9 -> 0 of 6 without/with it,
+2026-08-31, llama arm). robin, 2026-09-30: "mach die kurze prüfung ohne tools". Seen so far on
+this question: nothing.
+
+## Data
+The 12 prompts of crow-nest `tools/quality-probe-prompts.json` (6 prose de/en, 2 literal-format,
+2 JSON, 2 agent-style questions), each as a two-message conversation: messages[0] = the head
+Crow sent in `session-0915.json` (its messages[0], unchanged), messages[1] = the prompt's `user`
+text. The prompt's own `system` line is NOT sent (a Crow user types only the question). Crow's
+tools travel as always (`--served-name auto`); nothing forbids a call.
+
+## Design (paired by determinism)
+- Budget 1024 in both arms; arms = Amendment 2's A and B sentences.
+- Seeds 0, 1, 2 per prompt (no greedy). Arm A runs first for every (prompt, seed).
+- Arm B runs ONLY where arm A's round closed at the budget: where A did not close, the sentence
+  was never injected, so B's request would generate the same ids (determinism 18 of 18,
+  Amendment 2) and adds nothing. Uncut A rounds are reported as uncut, not as pairs.
+- `serve.exe` alone, as before. Output `decode_out/meas-245/notools/`.
+
+## Metrics, on the CUT pairs
+1. empty answer: no call and content without a non-space character
+2. mid-word start: the answer's first non-space character is a lowercase letter or one of
+   `, . ; : ) ]` (a word or sentence the think block was in the middle of) — mechanical; the
+   first 80 characters of every answer are listed for the eye as well
+3. `finish length` (the answer ran into max_tokens 16,384)
+4. a tool call instead of a written answer, per arm; and the discordant pairs: B called where
+   A wrote the answer, A called where B wrote it
+5. wall clock per round
+
+## Decision rule (all must hold, summed over the cut pairs)
+- a. empty(B) <= empty(A)
+- b. mid-word(B) <= mid-word(A)
+- c. finish length(B) <= finish length(A)
+- d. pairs "B called, A wrote the answer" <= pairs "A called, B wrote it" + 1
+- e. median s/round(B) <= 1.5 x median(A)
+All hold -> "no measured harm on turns without tools"; the proposal from Amendment 2 stands and
+robin decides. Any fails -> reported with the pairs; B is not proposed as the global constant.
+0 cut pairs -> "1024 did not cut on these prompts": no statement about B on text turns.
+
+## Stated limits, before the result
+12 prompts x 3 seeds, one model, Crow's head from one session; "no measured harm" is not
+"no harm". The prompts' own quality metrics (nonword, repetition, foreign) are not scored here.
+
+## Seen before this amendment was committed (disclosed, rule above NOT changed)
+The runner's selftest, written after the rule and before the commit: head of ANOTHER session
+(rollover-20260915-081727), prompt de-prose-plakat, seed 0, one pair. A cut and wrote the answer
+("Ein Plakat, das eine Ausstellung …", 56.1 s); B cut and called `write_file` (46.4 s). Not
+counted (different head, selftest directory). It is the harm criterion d exists for; the +1
+allowance in d was written before it was seen and stays.

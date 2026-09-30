@@ -336,6 +336,129 @@ def report(out_dir, series="budget"):
     print(text)
 
 
+# ------------------------------------------------------------------ Amendment 3: turns without tools
+
+PROMPTS = os.path.join(REPO, "tools", "quality-probe-prompts.json")
+NOTOOLS_SEEDS = [0, 1, 2]
+MIDWORD = set(",.;:)]")
+
+
+def notools_sessions(out_dir, head_session):
+    """One two-message conversation per prompt: Crow's head from `head_session`, the prompt's user text."""
+    with open(PROMPTS, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    items = [p for v in doc.values() if isinstance(v, list) for p in v if isinstance(p, dict) and p.get("user")]
+    with open(head_session, encoding="utf-8") as fh:
+        head = json.load(fh)["messages"][0]
+    sdir = os.path.join(out_dir, "sessions")
+    os.makedirs(sdir, exist_ok=True)
+    out = []
+    for p in items:
+        path = os.path.join(sdir, p["id"] + ".json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"messages": [head, {"role": "user", "content": p["user"]}]}, fh, ensure_ascii=False)
+        out.append((p["id"], path))
+    return out
+
+
+def answer_view(d):
+    """(kind, first 80 chars): kind = call / empty / midword / answer."""
+    if d.get("n_calls"):
+        return "call", ", ".join(r["name"] for r in d.get("reply") or [])
+    text = (d.get("content") or "").lstrip()
+    if not text:
+        return "empty", ""
+    first = text[0]
+    kind = "midword" if (first.islower() or first in MIDWORD) else "answer"
+    return kind, text[:80].replace("\n", " ")
+
+
+def run_notools(args):
+    out_dir = args.out
+    os.makedirs(out_dir, exist_ok=True)
+    sha = sha256(args.session)
+    if not args.selftest and sha != SESSION_SHA:
+        sys.exit("%s has sha256 %s, PREREG pins %s" % (args.session, sha[:16], SESSION_SHA[:16]))
+    procs = gpu_processes()
+    if len([p for p in procs if p.startswith("serve ")]) != 1 or len(procs) != 1:
+        sys.exit("PREREG: exactly one serve.exe and nothing else - found %s" % procs)
+    arms = SERIES["sentence"]["arms"]
+    sessions = notools_sessions(out_dir, args.session)[:args.prompt_limit]
+    seeds = NOTOOLS_SEEDS[:args.rounds_per_arm] if args.rounds_per_arm else NOTOOLS_SEEDS
+    plan = {"series": "notools", "started_utc": now(), "head_session_sha256": sha,
+            "prompts_sha256": sha256(PROMPTS), "crow_core_sha256": sha256(CROW_CORE),
+            "probe_sha256": sha256(PROBE), "processes_before": procs, "seeds": seeds, "rounds": []}
+    print("notools start %s, %d prompts, processes %s" % (plan["started_utc"], len(sessions), procs), flush=True)
+    for pid, path in sessions:
+        for seed in seeds:
+            row = {"prompt": pid, "seed": seed}
+            for arm in ("SA1024", "SB1024"):
+                if arm == "SB1024" and not row.get("SA1024", {}).get("budget_closed"):
+                    break
+                label = "%s-%s-s%d" % (arm, pid, seed)
+                r = probe(path, 2, seed, arms[arm], label, out_dir)
+                d = (r.get("rounds_detail") or [{}])[0] if "error" not in r else {"error": r["error"]}
+                kind, head = answer_view(d) if "error" not in d else ("error", d["error"])
+                row[arm] = {"kind": kind, "head": head, "finish": d.get("finish"),
+                            "budget_closed": d.get("budget_closed"), "seconds": d.get("seconds"),
+                            "reasoning_chunks": d.get("reasoning_chunks"), "content_chars": d.get("content_chars")}
+                print("  %-34s %-7s finish %-10s reasoning %-5s closed %-5s %5.1f s  %s" % (
+                    label, kind, d.get("finish"), d.get("reasoning_chunks"), d.get("budget_closed"),
+                    d.get("seconds") or 0, head[:60]), flush=True)
+            plan["rounds"].append(row)
+    plan["finished_utc"] = now()
+    plan["processes_after"] = gpu_processes()
+    plan["engine_log_lines"] = engine_slice(plan["started_utc"], plan["finished_utc"], out_dir)
+    with open(os.path.join(out_dir, "plan.json"), "w", encoding="utf-8") as fh:
+        json.dump(plan, fh, indent=1, ensure_ascii=False)
+    print("notools end %s, processes %s" % (plan["finished_utc"], plan["processes_after"]), flush=True)
+    report_notools(out_dir)
+
+
+def report_notools(out_dir):
+    with open(os.path.join(out_dir, "plan.json"), encoding="utf-8") as fh:
+        rows = json.load(fh)["rounds"]
+    pairs = [r for r in rows if "SB1024" in r]
+    uncut = [r for r in rows if "SB1024" not in r]
+    lines = ["A rounds %d, cut by the budget %d (pairs), uncut %d" % (len(rows), len(pairs), len(uncut)), "",
+             "| prompt | seed | A kind | B kind | A finish | B finish | A s | B s | A first 80 | B first 80 |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
+    for r in pairs:
+        a, b = r["SA1024"], r["SB1024"]
+        lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+            r["prompt"], r["seed"], a["kind"], b["kind"], a["finish"], b["finish"], a["seconds"], b["seconds"],
+            a["head"].replace("|", "/"), b["head"].replace("|", "/")))
+    cnt = lambda arm, k: sum(1 for r in pairs if r[arm]["kind"] == k)
+    length = lambda arm: sum(1 for r in pairs if r[arm]["finish"] == "length")
+    b_call_a_wrote = sum(1 for r in pairs if r["SB1024"]["kind"] == "call" and r["SA1024"]["kind"] != "call")
+    a_call_b_wrote = sum(1 for r in pairs if r["SA1024"]["kind"] == "call" and r["SB1024"]["kind"] != "call")
+    sec = lambda arm: median([r[arm]["seconds"] for r in pairs])
+    lines += ["", "| arm | pairs | empty | mid-word | answer | call | finish length | s/round median |",
+              "|---|---|---|---|---|---|---|---|"]
+    for arm in ("SA1024", "SB1024"):
+        lines.append("| %s | %d | %d | %d | %d | %d | %d | %s |" % (
+            arm, len(pairs), cnt(arm, "empty"), cnt(arm, "midword"), cnt(arm, "answer"), cnt(arm, "call"),
+            length(arm), sec(arm)))
+    lines.append("")
+    lines.append("discordant: B called where A wrote the answer %d, A called where B wrote it %d" % (
+        b_call_a_wrote, a_call_b_wrote))
+    if not pairs:
+        lines.append("PREREG Amendment 3: 1024 did not cut on these prompts - no statement about B on text turns")
+    else:
+        rule = {"a_empty": cnt("SB1024", "empty") <= cnt("SA1024", "empty"),
+                "b_midword": cnt("SB1024", "midword") <= cnt("SA1024", "midword"),
+                "c_length": length("SB1024") <= length("SA1024"),
+                "d_calls": b_call_a_wrote <= a_call_b_wrote + 1,
+                "e_wall_clock": (sec("SB1024") or 0) <= 1.5 * (sec("SA1024") or 0)}
+        lines.append("PREREG Amendment 3 rule: %s -> %s" % (
+            rule, "no measured harm on turns without tools" if all(rule.values())
+            else "harm measured: B is not proposed as the global constant"))
+    text = "\n".join(lines) + "\n"
+    with open(os.path.join(out_dir, "TABLE.md"), "w", encoding="utf-8") as fh:
+        fh.write(text)
+    print(text)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--report", action="store_true")
@@ -343,10 +466,22 @@ def main():
     ap.add_argument("--points", type=int, nargs="*", default=None)
     ap.add_argument("--rounds-per-arm", type=int, default=None)
     ap.add_argument("--screen-limit", type=int, default=None, help="--selftest only: screen the first N candidates")
-    ap.add_argument("--series", choices=sorted(SERIES), default="budget",
-                    help="budget = 1024 vs 2048 (PREREG + Amendment 1); sentence = A vs B at 1024 (Amendment 2)")
+    ap.add_argument("--series", choices=sorted(SERIES) + ["notools"], default="budget",
+                    help="budget = 1024 vs 2048 (PREREG + Amendment 1); sentence = A vs B at 1024 "
+                         "(Amendment 2); notools = A vs B on turns that need no tool (Amendment 3)")
+    ap.add_argument("--prompt-limit", type=int, default=None, help="--selftest only (notools)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    if args.series == "notools":
+        if args.report:
+            return report_notools(args.out or os.path.join(HERE, "notools"))
+        if args.selftest:
+            args.session, args.out = args.selftest, args.out or os.path.join(HERE, "selftest4")
+        else:
+            if args.rounds_per_arm or args.prompt_limit:
+                sys.exit("--rounds-per-arm / --prompt-limit are for --selftest only (PREREG Amendment 3)")
+            args.session, args.out = SESSION, args.out or os.path.join(HERE, "notools")
+        return run_notools(args)
     if args.report:
         return report(args.out or SERIES[args.series]["out"], args.series)
     if args.selftest:
