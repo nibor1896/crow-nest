@@ -88,7 +88,7 @@ amendment to this file before its first round. If it fails, the series ends.
 
 ---
 
-# AMENDMENT 1 — 2026-09-30 ~13:45 CEST, before any round on the new data
+# AMENDMENT 1 — 2026-09-30 ~13:30 CEST (committed d477684, 13:31), before any round on the new data
 
 Cause: the 2026-09-22 diorama session (sha256 `559bb1ed…`) exists only on the Linux
 installation of this dual-boot machine; robin will not boot Linux for it (2026-09-30). No
