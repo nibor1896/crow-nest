@@ -43,7 +43,8 @@
 #
 # MACHINE RULES, the same ones every chain in this repository runs under
 #   One engine at a time: before every start `pgrep` must find no serve/decode/parity, the GPU
-#   must be back under 900 MiB, and `engine/.engine.lock` must be absent - a lock whose pid is
+#   must be back under 900 MiB, and the engine lock (`$XDG_STATE_HOME/crow-nest/engine.lock`, else
+#   `~/.local/state/crow-nest/engine.lock`, or `CROW_LOCK`; #131) must be absent - a lock whose pid is
 #   dead is removed and the removal is logged. Every serve is stopped BY PID and the chain waits
 #   for the process to be gone and the GPU to fall back before the next load.
 #   Both arms run inside the same transient scope as tools/serve-linux.sh
@@ -76,7 +77,11 @@ CNQ="${CROW_CNQ:-converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq}"
 HOTSETS="${CROW_HOTSETS:-decode_out/hotsets-M-longctx2100-n160.json}"
 cuda_lib="${CUDA_LIB:-$HOME/.local/share/crow/cuda/lib}"
 decode_bin="$root/engine/target/release/decode"
-lock="$root/engine/.engine.lock"
+# #131: the engine's own lock path (gen.rs engine_lock_path): CROW_LOCK=0 none, CROW_LOCK=<path>
+# that path, else the per-user state dir - no longer engine/.engine.lock of the checkout
+if [ "${CROW_LOCK:-}" = "0" ]; then lock=""
+elif [ -n "${CROW_LOCK:-}" ]; then lock="$CROW_LOCK"
+else lock="${XDG_STATE_HOME:-$HOME/.local/state}/crow-nest/engine.lock"; fi
 
 for f in "$decode_bin" "$root/engine/target/release/serve" "$IDS" "$TASKS" "$root/tools/serve-linux.sh"; do
     [ -e "$f" ] || { echo "drift-chain.sh: missing $f" >&2; exit 2; }
@@ -136,10 +141,10 @@ quiet() {
     [ -z "$procs" ] || { say "  precheck: an engine is alive ($procs)"; return 1; }
     procs=$(pgrep -a -x 'serve|decode|parity' | tr '\n' ' ')
     [ -z "$procs" ] || { say "  precheck: an engine is alive by name ($procs)"; return 1; }
-    if [ -f "$lock" ]; then
+    if [ -n "$lock" ] && [ -f "$lock" ]; then
         pid=$(tr -dc '0-9' < "$lock")
-        if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then say "  precheck: .engine.lock held by LIVE pid $pid"; return 1; fi
-        say "  precheck: .engine.lock is stale (pid ${pid:-none} is dead) - removed"
+        if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then say "  precheck: $lock held by LIVE pid $pid"; return 1; fi
+        say "  precheck: $lock is stale (pid ${pid:-none} is dead) - removed"
         rm -f "$lock"
     fi
     used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')
@@ -329,10 +334,10 @@ done
 
 # the last serve of a chain leaves its lock behind (no SIGTERM handler, machine rules): the
 # next run's precheck would remove it, and there is no next run, so the chain does it here
-if [ -f "$lock" ]; then
+if [ -n "$lock" ] && [ -f "$lock" ]; then
     lpid=$(tr -dc '0-9' < "$lock")
-    if [ -n "$lpid" ] && [ -d "/proc/$lpid" ]; then say "  .engine.lock still held by LIVE pid $lpid - left in place"
-    else say "  .engine.lock of the last run (pid ${lpid:-none}, dead) removed"; rm -f "$lock"; fi
+    if [ -n "$lpid" ] && [ -d "/proc/$lpid" ]; then say "  $lock still held by LIVE pid $lpid - left in place"
+    else say "  $lock of the last run (pid ${lpid:-none}, dead) removed"; rm -f "$lock"; fi
 fi
 
 # the table, the within-arm spreads (max over min, the #37 comment's form) and the ids gate

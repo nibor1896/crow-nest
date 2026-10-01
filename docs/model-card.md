@@ -198,7 +198,7 @@ The two arms run different weights, and every comparison names both: llama.cpp r
 | CUDA | CUDA 13.3 toolkit. Windows: `nvrtc64_133_0.dll` needs the toolkit bin directory on `PATH`. Linux: `libnvrtc.so.13` and the runtime on `LD_LIBRARY_PATH` (never the `lib/stubs` directory); the driver's own `libcuda.so.1` | `docs/system-landscape.md` of the engine repo |
 | container placement | the engine default path is `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` inside the engine repo, or `CROW_CNQ` names any path | `geo.rs` `DEFAULT_CNQ` and `boot.rs` of the engine, `docs/env.md`, row `CROW_CNQ` |
 | hot-set manifest placement | the engine default path is `decode_out/hotsets-M-longctx2100-n160.json`, or `CROW_HOTSETS` names any path | `geo.rs` `DEFAULT_HOTSETS` and `boot.rs` of the engine, `docs/env.md`, row `CROW_HOTSETS` |
-| server | binds `127.0.0.1`, default port 8099, one request at a time, one engine per machine via `engine/.engine.lock` | `serve.rs:445` of the engine, engine README |
+| server | binds `127.0.0.1`, default port 8099, one request at a time, one engine per machine via the engine lock (`%LOCALAPPDATA%\crow-nest\engine.lock` on Windows, `$XDG_STATE_HOME/crow-nest/engine.lock` else `~/.local/state/crow-nest/engine.lock` on Linux; #131) | `serve.rs:445` of the engine, engine README |
 
 ## Self-test
 

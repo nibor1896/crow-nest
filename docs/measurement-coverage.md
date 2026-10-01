@@ -91,7 +91,7 @@ alternating as adjacent pairs the way the #37 chains ran them: **S** = `serve` t
 prompt as a single user message, `max_tokens` 256, `temperature` 0, `stream` false; **D** =
 `decode run decode_out/srv-a5-t1read-ids.json 256`, the arm #37 called D1. Both arms generate
 256 tokens and time 255 steps. No warmup run is discarded: the question IS whether run 1
-differs from run 4. One fresh process per run, `pgrep` clean and `engine/.engine.lock` absent
+differs from run 4. One fresh process per run, `pgrep` clean and the engine lock absent (`engine/.engine.lock` at the time; the per-user state dir since #131)
 before every start, every `serve` stopped by PID and the GPU back under 900 MiB before the next
 load. The prompt is the 16,064 ids of record in both arms — serve renders the chat template
 itself, and `serve tokenize --chat` on the same text reproduces
