@@ -516,13 +516,15 @@ pub fn resolve_tokenizer(
 pub fn default_source() -> (String, String, String) {
     let env = std::env::var("CROW_TOKENIZER").ok();
     let model_dir = std::env::var("CROW_MODEL_DIR").ok();
-    let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| crate::geo::DEFAULT_CNQ.to_string());
+    // #131: an unset default resolves as serve's own (`geo::resolve_default`)
+    let cnq_path = std::env::var("CROW_CNQ").unwrap_or_else(|_| crate::geo::resolve_default(crate::geo::DEFAULT_CNQ));
     let model = crate::cnq::Cnq::peek_index(&cnq_path)
         .ok()
         .and_then(|peek| peek.model().map(|m| m.source_repo.rsplit('/').next().unwrap_or_default().to_string()));
     let (t, why) = resolve_tokenizer(env.as_deref(), model_dir.as_deref(), &cnq_path, model.as_deref(), &|p| {
         std::path::Path::new(p).is_file()
     });
+    let t = if t == DEFAULT_TOKENIZER { crate::geo::resolve_default(&t) } else { t };
     let c = std::env::var("CROW_TOKENIZER_CONFIG").unwrap_or_else(|_| sibling_config(&t));
     (t, c, why)
 }

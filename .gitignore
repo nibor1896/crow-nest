@@ -85,3 +85,6 @@ hf-package/
 hf-upstream-cards/
 hf-package-27b/
 hf-package-flash-next-card/
+
+# #131: tools/pack-engine.ps1 stages and zips the engine here
+/dist/

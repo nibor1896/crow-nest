@@ -6380,12 +6380,16 @@ fn free_pw(p: &mut PW) {
 /// 2 x 45 GiB on a 64 GB host and froze the machine twice on 2026-09-04. The
 /// lock file carries the owner's PID; a stale lock (dead PID) is taken over,
 /// a live one refuses the start BEFORE anything is pinned. CROW_LOCK=0 disables,
-/// CROW_LOCK=<path> relocates (default: engine/.engine.lock next to the exe's crate).
+/// CROW_LOCK=<path> relocates. Default (#131): the per-user state dir,
+/// `%LOCALAPPDATA%\crow-nest\engine.lock` on Windows, `$XDG_STATE_HOME/crow-nest/engine.lock`
+/// else `~/.local/state/crow-nest/engine.lock` on Linux (`log::state_base`). It was
+/// `engine/.engine.lock` of the BUILD checkout, compiled in, so a copied serve.exe
+/// panicked writing it and carried the builder's path.
 fn engine_lock_path() -> Option<std::path::PathBuf> {
     match std::env::var("CROW_LOCK").as_deref() {
         Ok("0") => None,
         Ok(p) if !p.is_empty() => Some(std::path::PathBuf::from(p)),
-        _ => Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".engine.lock")),
+        _ => Some(crate::log::state_base().join("crow-nest").join("engine.lock")),
     }
 }
 
@@ -6418,8 +6422,17 @@ fn engine_lock_acquire() {
             }
         }
     }
-    std::fs::write(&path, format!("{me}
-")).expect("engine lock file");
+    // #131: a lock that cannot be written (a read-only or missing state dir) is a WARN, not a
+    // panic; the live-PID refusal above is the guard and it stays exactly as it was
+    let written = match path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        Some(dir) => std::fs::create_dir_all(dir),
+        None => Ok(()),
+    }
+    .and_then(|_| std::fs::write(&path, format!("{me}
+")));
+    if let Err(e) = written {
+        tracing::warn!(target: "load", "[load] engine lock not written ({}): {e} - continuing without it", path.display());
+    }
 }
 
 fn engine_lock_release() {
@@ -6834,5 +6847,48 @@ mod tests_95_mtp {
                 assert_eq!(at(&fh, r, c), r * 100 + h + c);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_131_lock {
+    use std::path::{Path, PathBuf};
+
+    /// #131: the default lock is the per-user state dir, not the build checkout's
+    /// `engine/.engine.lock`; `CROW_LOCK` keeps both meanings; an unwritable lock
+    /// path is a WARN, not a panic. One test, because all three set `CROW_LOCK`.
+    #[test]
+    fn the_default_lock_lives_in_the_per_user_state_dir_and_crow_lock_still_wins() {
+        let saved = std::env::var_os("CROW_LOCK");
+        std::env::remove_var("CROW_LOCK");
+        let got = super::engine_lock_path().expect("unset CROW_LOCK gives a default lock");
+        let build_checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join(".engine.lock");
+        assert_ne!(got, build_checkout, "the default lock is still the build checkout's engine/.engine.lock");
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty()).map(PathBuf::from);
+        let base = if cfg!(windows) {
+            var("LOCALAPPDATA").or_else(|| var("USERPROFILE").map(|p| p.join("AppData").join("Local")))
+        } else {
+            var("XDG_STATE_HOME").or_else(|| var("HOME").map(|p| p.join(".local").join("state")))
+        }
+        .unwrap_or_else(std::env::temp_dir);
+        assert_eq!(got, base.join("crow-nest").join("engine.lock"));
+
+        std::env::set_var("CROW_LOCK", "0");
+        assert_eq!(super::engine_lock_path(), None, "CROW_LOCK=0 disables the lock");
+        let elsewhere = std::env::temp_dir().join("crow-nest-131-elsewhere.lock");
+        std::env::set_var("CROW_LOCK", &elsewhere);
+        assert_eq!(super::engine_lock_path(), Some(elsewhere), "CROW_LOCK=<path> relocates it");
+
+        // a parent that is a FILE: neither the dir nor the lock can be created
+        let blocker = std::env::temp_dir().join(format!("crow-nest-131-blocker-{}", std::process::id()));
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        std::env::set_var("CROW_LOCK", blocker.join("sub").join("engine.lock"));
+        let r = std::panic::catch_unwind(super::engine_lock_acquire);
+        let _ = std::fs::remove_file(&blocker);
+        match saved {
+            Some(v) => std::env::set_var("CROW_LOCK", v),
+            None => std::env::remove_var("CROW_LOCK"),
+        }
+        assert!(r.is_ok(), "an unwritable lock path panicked instead of logging a WARN");
     }
 }
