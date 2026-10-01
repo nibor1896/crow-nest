@@ -8,13 +8,15 @@
 
 ### Added
 
-- **`tools/pack-engine.ps1` packs a portable Windows engine** (#131, 2026-10-01). It builds `serve` with `--remap-path-prefix` for `%USERPROFILE%` and the repo root and `-C target-feature=+crt-static` (through `CARGO_ENCODED_RUSTFLAGS`), refuses when `serve.exe` still imports the VC++ runtime (`dumpbin /dependents`), and stages `serve.exe`, `nvrtc64_130_0.dll` and `nvrtc-builtins64_133.dll` from `$env:CUDA_PATH\bin\x64` plus `LICENSE`. Before zipping it scans every staged file as UTF-8 and UTF-16LE for the profile path, any `\Users\<name>\`, the user name as a path segment and the computer name, and refuses on any hit. Then it writes `MANIFEST.json` (`path`, `bytes`, `sha256` upper-case hex, Crow's `pack-release.ps1` shape) and `dist\crow-nest-engine-<version>-win-x64.zip` (`dist/` is gitignored). `-Selftest` runs 19 checks on synthetic inputs without building: 19 ok.
+- **`tools/pack-engine.ps1` packs a portable Windows engine** (#131, 2026-10-01). It builds `serve` with `--remap-path-prefix` for `%USERPROFILE%` and the repo root and `-C target-feature=+crt-static` (through `CARGO_ENCODED_RUSTFLAGS`), refuses when `serve.exe` still imports the VC++ runtime (`dumpbin /dependents`), and stages `serve.exe`, `nvrtc64_130_0.dll` and `nvrtc-builtins64_133.dll` from `$env:CUDA_PATH\bin\x64` plus `LICENSE`. Before zipping it scans every staged file as UTF-8 and UTF-16LE for the profile path, any `\Users\<name>\`, the bare user name (any context, case-insensitive) and the computer name, and refuses on any hit. Then it writes `MANIFEST.json` (`path`, `bytes`, `sha256` upper-case hex, Crow's `pack-release.ps1` shape) and `dist\crow-nest-engine-<version>-win-x64.zip` (`dist/` is gitignored). `-Selftest` runs 22 checks on synthetic inputs without building: 22 ok. The two bare-name cases fail on a gate that matched the user name only as a path segment.
 
 ### Changed
 
 - **The replay probe builds today's Crow body and keeps what a no-call round wrote** (Crow #245, 2026-09-30). `tools/corruption-replay-probe.py --served-name NAME|auto` passes the /props name as Crow's `served_name` (Crow #220), so the manifest's sampling row, `reasoning_fixed` and `reasoning_budget` with its message travel as they do from the window; unset, the 2026-09-22 body is unchanged. Every round records `reasoning_chunks` and `budget_closed` (serve's injected budget message found in the reasoning; checked on robin's Windows machine against serve's `reasoning budget 16 spent` line: 34 chunks = 16 + the 18-token sentence); a round without a call keeps its full `content` and the last 2,000 reasoning characters. Probe tests 16 -> 19; on Windows 16 / 19, the 3 filesystem-confirmed `digit_near_miss` cases need POSIX paths and were red there before the change.
 - **`serve`'s relative defaults also resolve beside the exe** (#131, 2026-10-01). `geo::resolve_default` looks an unset default up against the working directory first, as before and with the string unchanged, then against the checkout root above the exe (`<root>\engine\target\release\serve.exe` -> `<root>`), then against the exe's own folder. This covers the container (`CROW_CNQ`), the hot sets (`CROW_HOTSETS`) and Flash-Next's tokenizer default. Which files are the defaults did not change. Test `geo::tests_131_defaults` pins the order.
-- **Docs match the code** (#131, 2026-10-01). `docs/getting-started.md` names CUDA 13.3's NVRTC files (`nvrtc64_130_0.dll`, `nvrtc-builtins64_133.dll`; there is no `nvrtc64_133_0.dll`) and how to run from an install folder. In `docs/env.md`, the `CROW_LOCK` row has the new default. The `CROW_HOTSETS` row named `hotsets-M-longctx2100-n160.json` as the `decode` and `parity` default, while all three bins default to `geo::DEFAULT_HOTSETS` = `hotsets-M-crow0924-n160.json` since 2026-09-24. longctx2100 is the value the gates set explicitly.
+- **Docs match the code** (#131, 2026-10-01). `docs/getting-started.md` names CUDA 13.3's NVRTC files (`nvrtc64_130_0.dll`, `nvrtc-builtins64_133.dll`; there is no `nvrtc64_133_0.dll`) and how to run from an install folder. In `docs/env.md`, the `CROW_LOCK` row has the new default. The `CROW_HOTSETS` row named `hotsets-M-longctx2100-n160.json` as the `decode` and `parity` default, while all three bins default to `geo::DEFAULT_HOTSETS` = `hotsets-M-crow0924-n160.json` since 2026-09-24. longctx2100 is the value the gates set explicitly. `docs/architecture.md`, `engine/README.md`, `docs/model-card.md`, `docs/long-context-goalmode.md` and `docs/measurement-coverage.md` name the new lock path; where they describe a past run, they keep the old path as history.
+- **The lock prechecks of the Linux chains find the new lock** (#131, 2026-10-01). `tools/drift-chain.sh` and `tools/oracle_longctx_engine_arm.sh` checked `engine/.engine.lock`, which the engine no longer writes, so they would have missed a live engine. They now resolve the lock as the engine does: `CROW_LOCK=0` means none, `CROW_LOCK=<path>` is that path, else `$XDG_STATE_HOME/crow-nest/engine.lock` or `~/.local/state/crow-nest/engine.lock`.
+- **No user name in what ships** (#131, 2026-10-01). `docs/env.md` is compiled into `serve.exe` (`boot.rs`, `include_str!`) and named the owner by first name 11 times ("<name>'s decision", "<name>'s call"). It now says "owner decision" or "the owner's"; content and dates are unchanged.
 
 ### Fixed
 
@@ -22,12 +24,12 @@
 
 ### Measured
 
-- **The packed `serve.exe` carries no builder path and no VC++ runtime** (#131, 2026-10-01, Windows box, RTX 5090, CUDA 13.3, pack of `dad66ce`):
-  - zip 48,906,746 B, holding 4 manifest entries plus `MANIFEST.json`;
-  - the script's privacy scan finds 0 hits. As a negative control, the same scan on the 2026-09-28 `serve.exe` finds 405;
-  - `Users\robin` occurs 405 times in the 2026-09-28 build and 0 times in the pack. The 404 dependency panic locations now read `~\.cargo\registry\...`;
+- **The packed `serve.exe` carries no builder path and no VC++ runtime** (#131, 2026-10-01, Windows box, RTX 5090, CUDA 13.3, pack of `ba499ae`):
+  - zip 48,906,769 B, holding 4 manifest entries plus `MANIFEST.json`;
+  - the script's privacy scan finds 0 hits. As negative controls, the same scan finds 405 hits on the 2026-09-28 `serve.exe`, and 11 hits on the bare name in the `dad66ce` pack's `serve.exe`, from before the `docs/env.md` rewording;
+  - `Users\robin` occurs 405 times in the 2026-09-28 build and 0 times in the pack. The bare first name occurs 11 times in the `dad66ce` pack's `serve.exe` and 0 times in this one, in UTF-8 and in UTF-16LE. The 404 dependency panic locations now read `~\.cargo\registry\...`;
   - `dumpbin /dependents` lists `WS2_32`, `kernel32`, `bcryptprimitives`, `api-ms-win-core-synch-l1-2-0` and `ntdll`. There is no `VCRUNTIME140.dll` and no `api-ms-win-crt-*`, where the 2026-09-28 build had `VCRUNTIME140.dll` and six `api-ms-win-crt-*`.
-- **The pack boots the 27B from an empty folder** (#131, 2026-10-01, same machine, pack of `7726c37`; `serve.exe` differs from `dad66ce`'s only in the compiled-in `docs/env.md`). Setup: unzipped under `%TEMP%`, with no CUDA directory on `PATH`, `CUDA_PATH` unset, absolute `CROW_CNQ` / `CROW_TOKENIZER` / `CROW_TOKENIZER_CONFIG` / `CROW_VIT_MMPROJ`, and no `CROW_LOCK`. Results:
+- **The pack boots the 27B from an empty folder** (#131, 2026-10-01, same machine, pack of `7726c37`; `serve.exe` differs from `ba499ae`'s only in the compiled-in `docs/env.md`). Setup: unzipped under `%TEMP%`, with no CUDA directory on `PATH`, `CUDA_PATH` unset, absolute `CROW_CNQ` / `CROW_TOKENIZER` / `CROW_TOKENIZER_CONFIG` / `CROW_VIT_MMPROJ`, and no `CROW_LOCK`. Results:
   - `/health` ok after 19.0 s;
   - `/props` shows the absolute `model_path`, `modalities.vision` true and `n_ctx` 65536;
   - `%LOCALAPPDATA%\crow-nest\engine.lock` held the PID;
@@ -40,8 +42,6 @@
 ### Known limitations
 
 - **Not run on a second machine** (#131). The boot test removed CUDA from `PATH` but ran on the build machine with the toolkit installed. The Linux lock path is only checked by the unit test, which on this box runs the Windows branch.
-- **The first name `robin` remains 11 times in `serve.exe`** (#131): it is prose of `docs/env.md`, which `boot.rs` compiles in (`include_str!`), e.g. "robin's decision". It is not a path. The scan flags the user name only as a path segment.
-- **Scripts and docs that still name `engine/.engine.lock`** (#131, not changed here). `tools/drift-chain.sh` and `tools/oracle_longctx_engine_arm.sh` precheck that file, so they no longer see a live lock. `docs/architecture.md`, `engine/README.md`, `docs/model-card.md`, `docs/long-context-goalmode.md` and `docs/measurement-coverage.md` still name the old path.
 
 ## 2026-09-28 — v0.7.2: serve builds on Windows again, CI on both systems
 
