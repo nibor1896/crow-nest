@@ -78,6 +78,40 @@ pub const DEFAULT_CNQ: &str = "converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq";
 // pinning hotsets-M-longctx2100-n160.json through CROW_HOTSETS (tools/gate-linux.sh).
 pub const DEFAULT_HOTSETS: &str = "decode_out/hotsets-M-crow0924-n160.json";
 
+/// #131: a repo-relative default as `serve` finds it. In this order, the first that
+/// exists wins:
+///
+/// 1. the path as written, against the working directory (the behavior before #131);
+/// 2. the checkout root above the exe, `<root>/engine/target/release/serve.exe` -> `<root>`;
+/// 3. the exe's own folder.
+///
+/// An absolute path, or one found nowhere, comes back as written, so a missing file
+/// is refused by the same name as before. Only used where the default applies; a set
+/// `CROW_*` variable is taken as given.
+pub fn resolve_default(rel: &str) -> String {
+    resolve_default_in(rel, std::env::current_exe().ok().as_deref(), &|p| p.exists())
+}
+
+/// [`resolve_default`] with the exe path and the file test injected, so the unit test
+/// runs without the files
+pub fn resolve_default_in(rel: &str, exe: Option<&std::path::Path>, exists: &dyn Fn(&std::path::Path) -> bool) -> String {
+    let p = std::path::Path::new(rel);
+    if p.is_absolute() || exists(p) {
+        return rel.to_string();
+    }
+    if let Some(dir) = exe.and_then(std::path::Path::parent) {
+        // release -> target -> engine -> <root>
+        let root = dir.parent().and_then(std::path::Path::parent).and_then(std::path::Path::parent);
+        for base in root.into_iter().chain(std::iter::once(dir)) {
+            let c = base.join(p);
+            if exists(&c) {
+                return c.to_string_lossy().into_owned();
+            }
+        }
+    }
+    rel.to_string()
+}
+
 /// a repo-root-relative path as seen from `engine/` (where `cargo run`,
 /// `cargo test` and the probe bins start)
 pub fn from_engine_dir(p: &str) -> String {
@@ -1116,5 +1150,43 @@ mod tests_300_c5 {
         let e = std::panic::catch_unwind(|| unbuilt_arm("X::Y (a block)", f)).unwrap_err();
         let msg = e.downcast_ref::<String>().cloned().unwrap();
         assert!(msg.starts_with("X::Y (a block) for family Qwen35Dense not built yet (Crow #300 phase 2)"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod tests_131_defaults {
+    use super::{resolve_default_in, DEFAULT_CNQ, DEFAULT_HOTSETS};
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    /// #131: a relative default resolves against the working directory first, then the
+    /// checkout root above the exe, then the exe's own folder; found nowhere, as written
+    #[test]
+    fn a_relative_default_falls_back_from_the_cwd_to_the_exe_root_and_the_exe_folder() {
+        let root = std::env::temp_dir().join("crow-nest-131-root");
+        let exe = root.join("engine").join("target").join("release").join("serve.exe");
+        let install = std::env::temp_dir().join("crow-nest-131-install");
+        let installed_exe = install.join("serve.exe");
+        let have = |set: &[PathBuf]| -> HashSet<PathBuf> { set.iter().cloned().collect() };
+        let on = |files: HashSet<PathBuf>| move |p: &Path| files.contains(p);
+
+        // 1. the cwd wins, as before #131: the string stays exactly as written
+        let cwd = on(have(&[PathBuf::from(DEFAULT_CNQ), root.join(DEFAULT_CNQ)]));
+        assert_eq!(resolve_default_in(DEFAULT_CNQ, Some(&exe), &cwd), DEFAULT_CNQ);
+
+        // 2. a moved checkout started from elsewhere: the root above engine/target/release
+        let moved = on(have(&[root.join(DEFAULT_HOTSETS)]));
+        assert_eq!(resolve_default_in(DEFAULT_HOTSETS, Some(&exe), &moved), root.join(DEFAULT_HOTSETS).to_string_lossy());
+
+        // 3. an install folder: the exe's own folder
+        let flat = on(have(&[install.join(DEFAULT_CNQ)]));
+        assert_eq!(resolve_default_in(DEFAULT_CNQ, Some(&installed_exe), &flat), install.join(DEFAULT_CNQ).to_string_lossy());
+
+        // found nowhere, no exe, or absolute: as written, so the refusal names the default
+        let none = on(HashSet::new());
+        assert_eq!(resolve_default_in(DEFAULT_CNQ, Some(&exe), &none), DEFAULT_CNQ);
+        assert_eq!(resolve_default_in(DEFAULT_CNQ, None, &none), DEFAULT_CNQ);
+        let abs = root.join("x.cnq").to_string_lossy().into_owned();
+        assert_eq!(resolve_default_in(&abs, Some(&installed_exe), &flat), abs);
     }
 }

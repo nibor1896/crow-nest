@@ -283,7 +283,8 @@ themselves rewritten for a 100k context with recorded expectations — a series,
 ## 7. How to reproduce, in order
 
 ```bash
-# one engine at a time: no serve/decode/parity alive, engine/.engine.lock absent
+# one engine at a time: no serve/decode/parity alive, the engine lock absent
+# (${XDG_STATE_HOME:-~/.local/state}/crow-nest/engine.lock since #131; engine/.engine.lock before)
 tools/serve-linux.sh --port 8099 > decode_out/68/serve.log 2>&1 &
 
 # the three rows over the same ~121k prefix, then the live tail twice
@@ -312,7 +313,7 @@ tools/longctx-gate.py --target-tokens 100000 --out decode_out/68/longctx-100k.js
 tools/longctx-gate.py --target-tokens 170000 --out decode_out/68/longctx-170k.json
 
 # stop by PID, then remove the lock a kill leaves behind, then the byte gate
-kill <serve pid>; rm -f engine/.engine.lock
+kill <serve pid>; rm -f "${XDG_STATE_HOME:-$HOME/.local/state}/crow-nest/engine.lock"
 tools/gate-linux.sh decode_out/gate-68
 ```
 

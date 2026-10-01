@@ -141,7 +141,7 @@ fi
 log="${SELFTEST_LOG:-$pkg/selftest/selftest.log}"
 t0=$(date +%s%3N)
 # cwd is the PACKAGE, the way a downloader would run it; every path handed to the engine is
-# absolute anyway, and the lock stays the engine crate's own `.engine.lock`
+# absolute anyway, and the lock is the engine's per-user state-dir lock (#131)
 ( cd "$pkg" && "${runner[@]}" CROW_CNQ="$cnq" CROW_HOTSETS="$hot" CROW_GRAPH=1 CROW_MMA=1 \
     "LD_LIBRARY_PATH=$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
     "$bin" selftest "$pkg/selftest" ) > "$log" 2>&1

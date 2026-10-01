@@ -26,7 +26,7 @@ Full build, run and check instructions, moved out of the README on 2026-09-23. T
 | GPU | NVIDIA GeForce RTX 5090, `sm_120`, 170 SMs (measured 2026-09-02), 32,607 MiB VRAM | `docs/system-landscape.md:12` |
 | host RAM | 64 GB on the Windows box: a chain waits for more than 50.5 GiB free before it starts an engine (the Windows gate, rule since 2026-09-10, issue #38). 62.17 GiB on the Linux box, where that gate does not apply and stays replaced by the derived pinned budget the engine prints on its `[budget]` boot line (issue #15, 2026-09-17; robin kept the replacement on 2026-09-18) | `docs/system-landscape.md:14` |
 | OS | Windows, or Linux since 2026-09-17 (measured on Arch Linux, kernel 7.2.3-arch1-3) | `docs/system-landscape.md:15`, second environment block |
-| CUDA toolkit | CUDA 13.3 (nvcc, NVRTC, ptxas); on Windows `nvrtc64_133_0.dll` needs the toolkit bin directory on `PATH`, on Linux the runtime directory needs to be on `LD_LIBRARY_PATH` (never the `lib/stubs` sibling) | `docs/system-landscape.md:22` |
+| CUDA toolkit | CUDA 13.3 (nvcc, NVRTC, ptxas); on Windows `nvrtc64_130_0.dll` and `nvrtc-builtins64_133.dll` (CUDA 13.3's file names, in the toolkit's `bin\x64`; there is no `nvrtc64_133_0.dll`) are found beside `serve.exe` or through `PATH`, on Linux the runtime directory needs to be on `LD_LIBRARY_PATH` (never the `lib/stubs` sibling) | `docs/system-landscape.md:22` |
 | Rust | Rust 1.97.0, cargo 1.97.0 on the Windows box; rustc 1.98.1 from rustup stable on the Linux box | `docs/system-landscape.md:23` |
 | cudarc | 0.19.9, features `cuda-13030`, `dynamic-loading`, `nvrtc` | `docs/system-landscape.md:24` |
 | container | `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq`, 104,727,179,972 B, not in the repository, produced by `converter` | `engine/src/geo.rs:71` |
@@ -48,6 +48,27 @@ cargo build --release --bin serve
 ```
 engine/target/release/serve.exe --port 8099
 ```
+
+### Run on Windows, from an install folder
+
+`tools/pack-engine.ps1` builds `serve.exe` without builder paths and with the C runtime linked in (no VC++ redistributable), and zips it with the two NVRTC DLLs, `LICENSE` and a `MANIFEST.json` (`path`, `bytes`, `sha256`) into `dist\crow-nest-engine-<version>-win-x64.zip` (#131, 2026-10-01). It refuses to zip when any packed file holds the builder's profile path, a `\Users\<name>\` path, the user name as a path segment or the computer name; `-Selftest` runs those checks on synthetic inputs.
+
+```
+powershell -ExecutionPolicy Bypass -File tools\pack-engine.ps1
+```
+
+Unzipped anywhere, `serve.exe` runs from that folder. The weights are not in the zip, so give their paths absolute:
+
+```
+set CROW_CNQ=D:\models\Qwen3.8-27B-CNQ4.5.cnq
+set CROW_TOKENIZER=D:\models\Qwen3.8-27B\tokenizer.json
+set CROW_TOKENIZER_CONFIG=D:\models\Qwen3.8-27B\tokenizer_config.json
+set CROW_VIT_MMPROJ=D:\models\Qwen3.8-27B\mmproj-F16.gguf
+serve.exe --port 8099
+```
+
+- An unset relative default (`CROW_CNQ`, `CROW_HOTSETS`, the tokenizer) is looked up against the working directory first, then the checkout root above the exe (`<root>\engine\target\release\serve.exe` -> `<root>`), then the exe's own folder (#131).
+- The engine lock is `%LOCALAPPDATA%\crow-nest\engine.lock` (`$XDG_STATE_HOME/crow-nest/engine.lock`, else `~/.local/state/crow-nest/engine.lock` on Linux), `CROW_LOCK` relocates or disables it.
 
 ### Run on Linux, from the repository root
 
@@ -154,8 +175,8 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 - `max_completion_tokens` is the same budget since 2026-09-24 (#112); both fields with different values are a 400.
 - A request without `temperature` samples at the model card row of its thinking mode (thinking 1.0 / 0.95 / 20 / 0, non-thinking 0.7 / 0.8 / 20 / 0 for `temperature` / `top_p` / `top_k` / `min_p`), never greedy, since 2026-09-24 (#111). Greedy is `temperature` 0 sent explicitly. The full table of request defaults is in `docs/env.md`.
 - The request body cap is 100 MiB since 2026-09-24 (#113; 16 MiB before), llama-server's cap: a body over it is a 413.
-- It must be started from the repository root: container and hot-set paths are repository relative.
-- One engine per machine: `Engine::load` takes `engine/.engine.lock`, a second `serve` exits non zero.
+- Container, hot-set and tokenizer defaults are repository relative: found from the repository root, from the checkout the exe was built in, or beside the exe (#131); from anywhere else set them absolute.
+- One engine per machine: `Engine::load` takes `%LOCALAPPDATA%\crow-nest\engine.lock` (Linux: `$XDG_STATE_HOME/crow-nest/engine.lock`, else `~/.local/state/crow-nest/engine.lock`; #131, was `engine/.engine.lock`), a second `serve` exits non zero.
 - It is blocking: one request at a time, a second connection waits in the accept queue. The one `503` it answers is a CUDA allocation refused inside a request: the body names the allocation, its byte count and the free VRAM, the request is dropped and the engine stays up (measured 2026-09-17, issue-less, commit 8ff2055). It answered one live on 2026-09-18 — `[vit] scratch allocation refused after 23 buffer(s)`, free VRAM 35.7 MiB — which is the symptom issue #72 fixed that day; the engine stayed up through it.
 - The planner HOLDS the vision path's VRAM at boot — `[budget] vit reserve 277.3 MB (tower scratch 228.5 + mrope span 48.8)` at `n_ctx` 200,000, measured 2026-09-17; 334.5 MiB since the 1,280-token cap of #107 (tower scratch 285.6 MiB, 2026-09-24) — so an image request allocates no per-request VRAM at all and the image count per request is bounded by the context, not by VRAM. Until issue #72 (fixed 2026-09-18, commit `74970b5`) the reserve was only PLANNED: the scratch stayed lazy, everything allocated after the plan spent the slack, and robin's first image request of that day found 35.7 MiB free and got the named 503. `Engine::load` allocates the tower scratch and the two mrope span tables before the budget verify now, and a `[budget] post-plan allocations held at boot` line names every one of them with its side of the bus (277.6 MB of VRAM, plus the 256.0 MB image cache that is host RAM and never on the card) against a free-VRAM floor of 0.25 GiB. Live at the full operating point on 2026-09-18: free VRAM 551 MiB after load, 544.1 MiB at both an image request and a four-image request, `engine live allocs` unchanged at 2243 across them.
 - The planner also keeps a **render reserve** FREE for a co-resident GPU client, Crow's `render_page` first (issue #110, 2026-09-25): `CROW_RENDER_RESERVE_MB`, default 0 (off, #110 follow-up), granted best-effort against the VRAM and the host pinned budget and named by one `[budget] render reserve: requested X MiB, granted Y MiB — ...` line; it never refuses the boot. Each granted hot-set unit (126.6 MiB) costs one hot expert per layer. Crow borrows VRAM per render instead (#117). With it off, serve left 73-185 MiB free and every Crow capture fell back to SwiftShader (2026-09-23/24).

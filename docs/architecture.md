@@ -2691,7 +2691,7 @@ C:/x/y.md
 | prompt ids `>= n_ctx` | 413 before any GPU work | `serve.rs:1363` (`clamped_max_tokens`) |
 | `/slots/0` save with no prefill-clean position held | 409 | `serve.rs:2723`, `slot.rs` |
 | `/slots/0` bad filename, missing file, shape or content mismatch | 400, engine untouched | `slot.rs:342`, `slot.rs:288` (`check_content`) |
-| a second `serve` process | non-zero exit on `engine/.engine.lock` | `serve.rs` module doc, `Engine::load` |
+| a second `serve` process | non-zero exit on the engine lock (`%LOCALAPPDATA%\crow-nest\engine.lock` on Windows, `$XDG_STATE_HOME/crow-nest/engine.lock` else `~/.local/state/crow-nest/engine.lock` on Linux; #131) | `serve.rs` module doc, `Engine::load` |
 | read or write timeout (10 s per connection) | one stderr line, that connection closed, accept loop continues | `serve.rs:499` |
 | a client that sent nothing | closed silently, no response | `serve.rs:2563` (`read_head_from`) |
 | `top_logprobs` without `logprobs: true`, over 20 or not a non-negative integer; a non-boolean `logprobs`; `post_sampling_probs: true` | 400 JSON naming the field (#91, 7.11.22) | `parse_chat` |
@@ -2701,7 +2701,7 @@ C:/x/y.md
 | an image over `CROW_VIT_MAX_TOKENS` (default 1,280 visual tokens) | not refused: downscaled into the cap (`vit::resized_dims`; corrected 2026-09-24, this row said 413 and named a `VIT_MAX_PATCHES` that never refused) | `vit.rs` module doc |
 | a CUDA allocation refused INSIDE a request (tower scratch, mrope tables, a state buffer) | **503 JSON naming the allocation, its byte count and the free VRAM**; the request is dropped, the engine is reset and stays up. An SSE error frame instead when the head is already out. The only 503 this server answers; any other panic still ends the process (TASK K, 2026-09-17) | `serve.rs:2678` (`guarded`), `:2684` (`cuda::RequestScope`), `:2691` (`AllocFailed` downcast), `:2716` |
 
-- Measured (A2, #24): `engine/.engine.lock` is held for the process life and is **left
+- Measured (A2, #24): the engine lock (`engine/.engine.lock` then, the per-user state dir since #131) is held for the process life and is **left
   behind by a `Stop-Process` kill**; it must be removed by hand before the next engine run.
 
 **7.11.9 What is deliberately NOT built**
@@ -2742,7 +2742,7 @@ C:/x/y.md
 | gate | ids identical to the Python oracle on **10 of 10** prompts, plus a 6 of 6 docs file | `decode_out/srv-a3-tok.log`, `srv-a3-rust-ids.json`, `srv-a3-oracle-ids.json` |
 | tools render | byte-identical to the oracle at **322 ids**, but ONLY with `preserve_order` on serde_json AND on minijinja | A3 #25 |
 | warm-up | the tokenizer loads right after argument parsing, BEFORE `cuda::Ctx::init`; failure exits 3 in a second | `serve.rs` module doc |
-| subcommand | `serve tokenize --chat\|--raw` runs without CUDA and without `engine/.engine.lock` | `serve.rs` module doc |
+| subcommand | `serve tokenize --chat\|--raw` runs without CUDA and without the engine lock (per-user state dir, #131) | `serve.rs` module doc |
 | harness trap | the Python oracle decodes STDIN as cp1252 unless `PYTHONIOENCODING=utf-8` is set; 4 of 10 prompts are affected when it is bare | issue #34 |
 
 **7.11.12 Open items for M2 (not decided here)**
@@ -4215,7 +4215,7 @@ not line numbers — the files move.
    0. the `CROW_KPROF` x `CROW_GRAPH=1` refusal (`gen.rs:717-720`, since 2026-09-17): a sync inside
       an open decode-graph capture is `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`, so the pair is
       refused before anything is allocated, with one message naming both switches and the escape.
-   1. `engine_lock_acquire` — `engine/.engine.lock`, `pid_alive` via `/proc/<pid>` on unix and
+   1. `engine_lock_acquire` — the engine lock (`%LOCALAPPDATA%\crow-nest\engine.lock` on Windows, `$XDG_STATE_HOME/crow-nest/engine.lock` else `~/.local/state/crow-nest/engine.lock` on Linux; #131), `pid_alive` via `/proc/<pid>` on unix and
       `tasklist` on Windows; a second engine on the machine dies here.
    2. `manager::derive_host_pinned_budget` — the `[budget]` line, before anything is pinned (8.8).
    3. embeddings and `lm_head`, then the 48 dense layer bundles through `weights::load_f32` /

@@ -189,8 +189,35 @@ pub fn keep_count(raw: Option<&str>) -> usize {
         .clamp(1, 10_000)
 }
 
-/// The per-OS default log directory, as a pure function of the four variables
+/// The per-OS per-user state base, as a pure function of the four variables
 /// that decide it — so the Windows rule is tested on Linux and the reverse.
+/// [`log_dir_from`] joins `crow/logs` to it; the engine lock (#131) joins
+/// `crow-nest/engine.lock`.
+///
+/// Windows: `%LOCALAPPDATA%`, else `%USERPROFILE%\AppData\Local`, the convention
+/// for per-user state. Unix: `$XDG_STATE_HOME`, else `$HOME/.local/state` (the
+/// XDG default). Else the system temp directory, which always exists.
+pub fn state_base_from(
+    windows: bool,
+    localappdata: Option<&str>,
+    userprofile: Option<&str>,
+    xdg_state: Option<&str>,
+    home: Option<&str>,
+    temp: &Path,
+) -> PathBuf {
+    let ok = |v: Option<&str>| v.filter(|s| !s.trim().is_empty()).map(PathBuf::from);
+    if windows {
+        ok(localappdata)
+            .or_else(|| ok(userprofile).map(|p| p.join("AppData").join("Local")))
+            .unwrap_or_else(|| temp.to_path_buf())
+    } else {
+        ok(xdg_state)
+            .or_else(|| ok(home).map(|p| p.join(".local").join("state")))
+            .unwrap_or_else(|| temp.to_path_buf())
+    }
+}
+
+/// The per-OS default log directory: [`state_base_from`] plus `crow/logs`.
 ///
 /// Windows: `%LOCALAPPDATA%\crow\logs`, the convention for per-user state.
 /// Unix: `$XDG_STATE_HOME/crow/logs`, else `$HOME/.local/state/crow/logs` (the
@@ -203,21 +230,11 @@ pub fn log_dir_from(
     home: Option<&str>,
     temp: &Path,
 ) -> PathBuf {
-    let ok = |v: Option<&str>| v.filter(|s| !s.trim().is_empty()).map(PathBuf::from);
-    let base = if windows {
-        ok(localappdata)
-            .or_else(|| ok(userprofile).map(|p| p.join("AppData").join("Local")))
-            .unwrap_or_else(|| temp.to_path_buf())
-    } else {
-        ok(xdg_state)
-            .or_else(|| ok(home).map(|p| p.join(".local").join("state")))
-            .unwrap_or_else(|| temp.to_path_buf())
-    };
-    base.join("crow").join("logs")
+    state_base_from(windows, localappdata, userprofile, xdg_state, home, temp).join("crow").join("logs")
 }
 
-/// [`log_dir_from`] on this process's environment and this OS.
-pub fn default_log_dir() -> PathBuf {
+/// [`state_base_from`] on this process's environment and this OS.
+pub fn state_base() -> PathBuf {
     let g = |k: &str| std::env::var(k).ok();
     let (la, up, xs, ho) = (
         g("LOCALAPPDATA"),
@@ -225,7 +242,7 @@ pub fn default_log_dir() -> PathBuf {
         g("XDG_STATE_HOME"),
         g("HOME"),
     );
-    log_dir_from(
+    state_base_from(
         cfg!(windows),
         la.as_deref(),
         up.as_deref(),
@@ -233,6 +250,11 @@ pub fn default_log_dir() -> PathBuf {
         ho.as_deref(),
         &std::env::temp_dir(),
     )
+}
+
+/// [`log_dir_from`] on this process's environment and this OS.
+pub fn default_log_dir() -> PathBuf {
+    state_base().join("crow").join("logs")
 }
 
 /// The whole configuration off the environment: `CROW_LOG`, `CROW_LOG_DIR`,

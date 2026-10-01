@@ -91,7 +91,7 @@
 //!
 //! One engine per machine:
 //!
-//! - `Engine::load` takes `engine/.engine.lock` before anything is pinned.
+//! - `Engine::load` takes the engine lock (per-user state dir, `%LOCALAPPDATA%\crow-nest\engine.lock` on Windows, #131) before anything is pinned.
 //! - A second `serve` therefore exits non zero with the lock message.
 //! - The engine loads BEFORE the socket binds, so the lock speaks first.
 //!
@@ -121,7 +121,7 @@
 //! - `<prompts.json>` is read as `{id: text}` or as `[{"id": ..., "text": ...}]`.
 //! - `<ids.json>` is written as `{task_id: [ids]}`.
 //! - Per task the id count goes to stderr, so the gate log carries the ten lengths.
-//! - The subcommand returns before `cuda::Ctx::init`, so no CUDA context and no `.engine.lock`.
+//! - The subcommand returns before `cuda::Ctx::init`, so no CUDA context and no engine lock.
 //! - No Python process is started; `crow_nest_engine::tokenizer` is the whole path.
 //!
 //! Exit codes of `serve tokenize`:
@@ -608,7 +608,7 @@ use crow_nest_engine::cache::{ColdPlan, PrefixCache, SLOTS};
 use crow_nest_engine::boot;
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::gen::{DevSampler, Engine};
-use crow_nest_engine::geo::{apply_adapt_policy, Geo, DEFAULT_CNQ, DEFAULT_HOTSETS, TRICKLE_CHUNK_THRESHOLD};
+use crow_nest_engine::geo::{apply_adapt_policy, resolve_default, Geo, DEFAULT_CNQ, DEFAULT_HOTSETS, TRICKLE_CHUNK_THRESHOLD};
 use crow_nest_engine::sample::{pos_logprobs, PosLogprobs, Sampler, MAX_TOP_LOGPROBS};
 use crow_nest_engine::slot;
 use crow_nest_engine::stopstr::StopStrings;
@@ -4085,7 +4085,7 @@ fn chat_generate(
     let snaps = srv.cache.positions();
     let reusable = srv.cache.reuse_candidates();
     let parked_before = srv.cache.parked_positions();
-    // unsafe: engine kernels; the CUDA context and engine/.engine.lock are this process's
+    // unsafe: engine kernels; the CUDA context and the engine lock are this process's
     let t_reset = Instant::now();
     let mut park_note = String::new();
     let cached_n = match plan.reuse {
@@ -5696,7 +5696,7 @@ fn main() {
     let _log = crow_nest_engine::log::init();
     let args: Vec<String> = std::env::args().collect();
     // A3: the tokenize arm returns HERE, before the CUDA context and before Engine::load
-    // takes engine/.engine.lock; it never starts a Python process
+    // takes the engine lock; it never starts a Python process
     if args.get(1).map(|s| s.as_str()) == Some("tokenize") {
         let rc = tokenize_main(&args[2..]);
         crow_nest_engine::log::shutdown();
@@ -5775,13 +5775,15 @@ fn main() {
 
     // unsafe: creates the CUDA context; it must outlive every device allocation
     let (mut cnq, _ctx, mut cfg, cnq_path, sidecar, geo) = unsafe {
-        boot::open_model(DEFAULT_CNQ.into(), DEFAULT_HOTSETS.into())
+        // #131: the defaults resolve against the cwd, then the checkout root above the exe,
+        // then the exe's folder (`geo::resolve_default`)
+        boot::open_model(resolve_default(DEFAULT_CNQ), resolve_default(DEFAULT_HOTSETS))
     };
     // M1: chunk pinned for the process, no per prompt policy
     cfg.prompt_chunk = SERVE_CHUNK;
     apply_adapt_policy(&mut cfg);
 
-    // unsafe: pins device and host memory; takes engine/.engine.lock, a second serve dies here
+    // unsafe: pins device and host memory; takes the engine lock, a second serve dies here
     let eng = unsafe {
         Engine::load(&mut cnq, geo, cfg, None, sidecar.as_deref(), false, &mut |m| tracing::info!(target: "load", "[load] {m}"))
     };

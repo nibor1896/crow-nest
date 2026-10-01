@@ -38,6 +38,11 @@ PLAN=decode_out/oracle-longctx/row-plan.json
 CROW_CNQ=$PWD/converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq
 HOTSETS=$PWD/decode_out/hotsets-M-longctx2100-n160.json
 LD_LIB=$HOME/.local/share/crow/cuda/lib
+# #131: the engine's own lock path (gen.rs engine_lock_path): CROW_LOCK=0 none, CROW_LOCK=<path>
+# that path, else the per-user state dir - no longer engine/.engine.lock of the checkout
+if [ "${CROW_LOCK:-}" = "0" ]; then lock=""
+elif [ -n "${CROW_LOCK:-}" ]; then lock="$CROW_LOCK"
+else lock="${XDG_STATE_HOME:-$HOME/.local/state}/crow-nest/engine.lock"; fi
 
 for a in $ANCHORS; do
   if (( a > 2564 )); then
@@ -100,12 +105,12 @@ while (( $(pending) > 0 )) && (( $(date +%s) < DEADLINE )); do
     exec 9>/tmp/crow-gpu.lock
     flock -w 1800 9 || { echo "no GPU flock inside 30 min - retrying later"; exit 0; }
     echo "gpu flock acquired $(date -Is)"
-    while [[ -f engine/.engine.lock ]]; do
+    while [[ -n $lock && -f $lock ]]; do
       if ! pgrep -f "engine/target/release/(serve|decode)" >/dev/null; then
-        echo "engine/.engine.lock is stale (no engine process) - removing"
-        rm -f engine/.engine.lock
+        echo "$lock is stale (no engine process) - removing"
+        rm -f "$lock"
       else
-        echo "an engine is alive; waiting for engine/.engine.lock"; sleep 30
+        echo "an engine is alive; waiting for $lock"; sleep 30
       fi
     done
     for a in $ANCHORS; do
