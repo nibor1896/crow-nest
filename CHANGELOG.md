@@ -6,7 +6,7 @@
 
 ## Unreleased
 
-## 2026-10-01 — v0.8.0: serve.exe runs off the build machine, the Windows engine pack
+## 2026-10-01 — v0.8.0
 
 **`serve.exe` runs on a machine that did not build it.** The engine lock moved from the build checkout into the per-user state folder, relative defaults also resolve beside the exe, and `tools/pack-engine.ps1` packs `serve.exe` with the two NVRTC DLLs into `crow-nest-engine-<version>-win-x64.zip`, free of builder paths and of the VC++ runtime. This release attaches that zip; Crow's `CrowSetup.exe` installs it (Crow #196). No kernel, weight or decode path changed. The Linux GPU gate was not run for this release (Windows only, owner decision 2026-10-01).
 
