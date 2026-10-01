@@ -18,8 +18,8 @@ VCRUNTIME140.dll. This script:
    $env:CUDA_PATH\bin\x64 (the CUDA 13.3 names; there is no nvrtc64_133_0.dll)
    and LICENSE;
 4. scans every staged file, as UTF-8 and as UTF-16LE at both byte alignments, for
-   the builder's profile path, any `\Users\<name>\`, the user name as a path
-   segment and the computer name, and REFUSES on any hit;
+   the builder's profile path, any `\Users\<name>\`, the bare user name (any
+   context, case-insensitive) and the computer name, and REFUSES on any hit;
 5. writes MANIFEST.json ({path, bytes, sha256}, sha256 upper-case hex, backslash
    paths - the shape of nibor1896/Crow tools/pack-release.ps1) and zips the stage as
    crow-nest-engine-<version>-win-x64.zip.
@@ -69,7 +69,8 @@ function Get-PrivacyNeedles {
     # any \Users\<name>\ - another builder's profile is as much a leak as this one's
     $n += [pscustomobject]@{ label = '\Users\<name>\'; regex = '[\\/]Users[\\/][^\\/\x00-\x1f"<>|:*?]{1,64}[\\/]' }
     if ($UserName) {
-        $n += [pscustomobject]@{ label = "USERNAME $UserName as a path segment"; regex = '[\\/]' + [regex]::Escape($UserName) + '[\\/]' }
+        # the bare name, anywhere (prose like "<name>'s decision" too, not only a path segment)
+        $n += [pscustomobject]@{ label = "USERNAME $UserName (bare)"; regex = [regex]::Escape($UserName) }
     }
     if ($ComputerName) {
         $n += [pscustomobject]@{ label = "COMPUTERNAME $ComputerName"; regex = [regex]::Escape($ComputerName) }
@@ -172,7 +173,10 @@ function Invoke-Selftest {
     Check "UTF-16LE at an odd offset is a hit" ((& $scan $odd).Count -gt 0)
     Check "ANOTHER user's \Users\<name>\ is a hit" ((& $scan (& $u8 "D:\Users\someone\src\lib.rs")).Count -gt 0)
     Check "the user name as a path segment is a hit" ((& $scan (& $u8 "/home/builder/.cargo")).Count -gt 0)
-    Check "the user name inside a word is NOT a hit" ((& $scan (& $u8 "rebuilder and builders")).Count -eq 0)
+    Check "the user name inside a word is a hit too (bare-name rule)" ((& $scan (& $u8 "rebuilder and builders")).Count -gt 0)
+    Check "text without the user name is NOT a hit" ((& $scan (& $u8 "the owner's decision 2026-09-25")).Count -eq 0)
+    Check "the bare user name in prose is a hit (UTF-8)" ((& $scan (& $u8 "default since 2026-09-09 (Builder's decision)")).Count -gt 0)
+    Check "the bare user name in prose is a hit (UTF-16LE)" ((& $scan (& $u16 "decided by BUILDER")).Count -gt 0)
     Check "the computer name is a hit" ((& $scan (& $u8 "host=buildbox.local")).Count -gt 0)
     Check "an empty file has no hit" ((& $scan ([byte[]]@())).Count -eq 0)
 
