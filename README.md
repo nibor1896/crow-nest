@@ -45,6 +45,13 @@ $env:CROW_CNQ = "converter\Qwen3.8-27B-CNQ4.5.cnq"; engine\target\release\serve.
 engine/target/release/serve.exe --port 8099
 ```
 
+**Windows engine without building** (`serve.exe` + NVRTC from the release, run in the checkout)
+
+```powershell
+irm https://github.com/nibor1896/crow-nest/releases/download/v0.8.0/crow-nest-engine-0.8.0-win-x64.zip -OutFile engine.zip; Expand-Archive engine.zip crow-nest-engine
+$env:CROW_CNQ = "converter\Qwen3.8-27B-CNQ4.5.cnq"; crow-nest-engine\serve.exe --port 8099
+```
+
 **Use from Crow**
 
 ```bash
