@@ -6,6 +6,10 @@
 
 ## Unreleased
 
+## 2026-10-02 — v0.9.0
+
+**A portable Linux engine.** `tools/pack-engine.sh` packs `serve` with NVRTC into `crow-nest-engine-<version>-linux-x64.tar.gz`, free of builder paths, with a glibc floor of 2.34. This release attaches that tarball; Crow's `CrowSetup-linux-x64` installs it (Crow #342). No kernel, weight or decode path changed.
+
 ### Added
 
 - **`tools/pack-engine.sh` packs a portable Linux engine** (#133, 2026-10-02). The Linux twin of `pack-engine.ps1`: it builds `serve` with `--remap-path-prefix` for `$HOME` and the repo root (through `CARGO_ENCODED_RUSTFLAGS`), refuses when `serve`'s highest `GLIBC_` symbol version is above the recorded floor 2.34, and stages `serve`, `libnvrtc.so` (the bytes of `$CUDA_LIB/libnvrtc.so.13`; cudarc tries the unversioned name first, so a system CUDA's `libnvrtc.so` would beat `libnvrtc.so.13`, measured in Crow #341) and `libnvrtc-builtins.so.13.3` (real files, no symlinks) and `LICENSE`. It scans every staged file as UTF-8 and UTF-16LE for `$HOME`, any `/home/<name>/`, the bare `$USER` (any context, case-insensitive) and the host name, and refuses on any hit. `MANIFEST.json` is `{"glibc_min", "files": [{path, bytes, sha256}]}`; the output is `dist/crow-nest-engine-<version>-linux-x64.tar.gz`. The consumer puts the unpacked folder on `LD_LIBRARY_PATH`. `--selftest` runs 27 checks on synthetic inputs without building (one fails if the staged NVRTC is not named `libnvrtc.so`): 27 ok; dropping the bare-name needle turns 3 red, dropping the `/home/<name>/` needle turns 1 red.

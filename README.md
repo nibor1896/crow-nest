@@ -52,6 +52,14 @@ irm https://github.com/nibor1896/crow-nest/releases/download/v0.8.0/crow-nest-en
 $env:CROW_CNQ = "converter\Qwen3.8-27B-CNQ4.5.cnq"; crow-nest-engine\serve.exe --port 8099
 ```
 
+**Linux engine without building** (`serve` + NVRTC from the release, glibc 2.34+)
+
+```bash
+curl -LO https://github.com/nibor1896/crow-nest/releases/download/v0.9.0/crow-nest-engine-0.9.0-linux-x64.tar.gz
+mkdir crow-nest-engine && tar -xzf crow-nest-engine-0.9.0-linux-x64.tar.gz -C crow-nest-engine
+CROW_CNQ=converter/Qwen3.8-27B-CNQ4.5.cnq LD_LIBRARY_PATH=$PWD/crow-nest-engine crow-nest-engine/serve --port 8099
+```
+
 **Use from Crow**
 
 ```bash
