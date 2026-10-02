@@ -83,7 +83,7 @@ engine/target/release/serve --port 8099
 
 ### Run on Linux, from the engine pack
 
-`tools/pack-engine.sh` builds `dist/crow-nest-engine-<version>-linux-x64.tar.gz` (#133): `serve`, `libnvrtc.so.13`, `libnvrtc-builtins.so.13.3`, `LICENSE` and `MANIFEST.json` (`{"glibc_min": "2.34", "files": [{path, bytes, sha256}]}`). It needs glibc 2.34 or newer and no toolkit; the NVRTC files are in the pack.
+`tools/pack-engine.sh` builds `dist/crow-nest-engine-<version>-linux-x64.tar.gz` (#133): `serve`, `libnvrtc.so`, `libnvrtc-builtins.so.13.3`, `LICENSE` and `MANIFEST.json` (`{"glibc_min": "2.34", "files": [{path, bytes, sha256}]}`). It needs glibc 2.34 or newer and no toolkit; the NVRTC files are in the pack. NVRTC is staged as `libnvrtc.so` (the bytes of CUDA's `libnvrtc.so.13`) because cudarc tries the unversioned name first, so a system CUDA's `libnvrtc.so` would otherwise win over the bundled library; the builtins keep `libnvrtc-builtins.so.13.3`, the exact name libnvrtc opens.
 
 ```
 tools/pack-engine.sh --selftest        # checks on synthetic inputs, no build
