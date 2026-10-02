@@ -6,6 +6,18 @@
 
 ## Unreleased
 
+### Added
+
+- **`tools/pack-engine.sh` packs a portable Linux engine** (#133, 2026-10-02). The Linux twin of `pack-engine.ps1`: it builds `serve` with `--remap-path-prefix` for `$HOME` and the repo root (through `CARGO_ENCODED_RUSTFLAGS`), refuses when `serve`'s highest `GLIBC_` symbol version is above the recorded floor 2.34, and stages `serve`, `libnvrtc.so.13`, `libnvrtc-builtins.so.13.3` (real files from `$CUDA_LIB`) and `LICENSE`. It scans every staged file as UTF-8 and UTF-16LE for `$HOME`, any `/home/<name>/`, the bare `$USER` (any context, case-insensitive) and the host name, and refuses on any hit. `MANIFEST.json` is `{"glibc_min", "files": [{path, bytes, sha256}]}`; the output is `dist/crow-nest-engine-<version>-linux-x64.tar.gz`. The consumer puts the unpacked folder on `LD_LIBRARY_PATH`. `--selftest` runs 24 checks on synthetic inputs without building: 24 ok; dropping the bare-name needle turns 3 red, dropping the `/home/<name>/` needle turns 1 red.
+
+### Measured
+
+- **The packed Linux `serve` has no builder path** (#133, 2026-10-02, 65ce4d4 + this change). The privacy scan finds 0 hits in all 5 files of the pack; the old local build `engine/target/release/serve` has 255 occurrences of `/home/<user>` (765 needle hits). Highest glibc symbol version of the packed `serve`: GLIBC_2.34.
+
+### Known limitations
+
+- **The Linux pack was built and started on one box** (#133, 2026-10-02). It is verified on this Arch machine (glibc 2.44); no older distribution was tried, so 2.34 is the symbol floor, not a tested distro list.
+
 ## 2026-10-01 — v0.8.0
 
 **`serve.exe` runs on a machine that did not build it.** The engine lock moved from the build checkout into the per-user state folder, relative defaults also resolve beside the exe, and `tools/pack-engine.ps1` packs `serve.exe` with the two NVRTC DLLs into `crow-nest-engine-<version>-win-x64.zip`, free of builder paths and of the VC++ runtime. This release attaches that zip; Crow's `CrowSetup.exe` installs it (Crow #196). No kernel, weight or decode path changed. The Linux GPU gate was not run for this release (Windows only, owner decision 2026-10-01).
