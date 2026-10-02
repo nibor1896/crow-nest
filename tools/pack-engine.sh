@@ -13,8 +13,12 @@
 #     inside $HOME, comes second;
 #  2. refuses when serve's highest GLIBC_ symbol version is above GLIBC_FLOOR (2.34,
 #     measured 2026-10-02); the floor is written into MANIFEST.json;
-#  3. stages serve, libnvrtc.so.13 and libnvrtc-builtins.so.13.3 (the real files,
-#     not symlinks, from $CUDA_LIB) and LICENSE;
+#  3. stages serve, libnvrtc.so (the bytes of $CUDA_LIB/libnvrtc.so.13) and
+#     libnvrtc-builtins.so.13.3 (real files, not symlinks, no duplicates) and LICENSE.
+#     NVRTC is staged as the unversioned `libnvrtc.so` because cudarc tries that name
+#     FIRST over all search paths: a system CUDA providing libnvrtc.so would beat a
+#     bundled libnvrtc.so.13 (#133, Crow #341). libnvrtc dlopens the builtins by the
+#     exact name libnvrtc-builtins.so.13.3 (strings), so that one keeps its name;
 #  4. scans every staged file, as UTF-8 and as UTF-16LE at both byte alignments, for
 #     $HOME, any `/home/<name>/`, the bare $USER (any context, case-insensitive) and
 #     the host name, and REFUSES on any hit (no override);
@@ -36,7 +40,9 @@
 set -euo pipefail
 
 GLIBC_FLOOR="2.34"
-NVRTC_LIBS=(libnvrtc.so.13 libnvrtc-builtins.so.13.3)
+# source name in $CUDA_LIB : name in the pack
+NVRTC_LIBS=(libnvrtc.so.13:libnvrtc.so libnvrtc-builtins.so.13.3:libnvrtc-builtins.so.13.3)
+nvrtc_staged_names() { local e; for e in "${NVRTC_LIBS[@]}"; do echo "${e#*:}"; done; }
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------------------
@@ -167,6 +173,9 @@ selftest() {
   check_true "2.9 is within the 2.34 floor (version order, not text)" "$(version_le 2.9 2.34 && echo 1 || echo 0)"
   check_true "2.35 is above the 2.34 floor" "$(version_le 2.35 2.34 && echo 0 || echo 1)"
   check_true "the highest of 2.2.5, 2.34, 2.17 is 2.34" "$([ "$(printf '2.2.5\n2.34\n2.17\n' | sort -V | tail -1)" = 2.34 ] && echo 1 || echo 0)"
+  check_true "NVRTC is staged as libnvrtc.so (cudarc tries that name first)" "$(nvrtc_staged_names | grep -qx 'libnvrtc.so' && echo 1 || echo 0)"
+  check_true "no versioned libnvrtc.so.<n> is staged (it would be a duplicate)" "$(nvrtc_staged_names | grep -qE '^libnvrtc\.so\.' && echo 0 || echo 1)"
+  check_true "the builtins keep the name libnvrtc dlopens" "$(nvrtc_staged_names | grep -qx 'libnvrtc-builtins.so.13.3' && echo 1 || echo 0)"
   check_true "the pack name" "$([ "$(pack_name 0.8.0)" = crow-nest-engine-0.8.0-linux-x64.tar.gz ] && echo 1 || echo 0)"
 
   echo "selftest: $ok ok, $red failed"
@@ -234,10 +243,11 @@ fi
 stage="$out/crow-nest-engine-$version-linux-x64"
 rm -rf "$stage"; mkdir -p "$stage"
 cp "$serve" "$stage/serve"; chmod 755 "$stage/serve"
-for lib in "${NVRTC_LIBS[@]}"; do
+for ent in "${NVRTC_LIBS[@]}"; do
+  lib="${ent%%:*}"; dst="${ent#*:}"
   src="$cuda_lib/$lib"
   [ -f "$src" ] || { echo "missing $src (nvrtc files there: $(ls "$cuda_lib" 2>/dev/null | grep nvrtc | tr '\n' ' '))" >&2; exit 1; }
-  cp -L "$src" "$stage/$lib"   # the real file under the soname, never a symlink
+  cp -L "$src" "$stage/$dst"   # the real file, never a symlink
 done
 cp "$repo/LICENSE" "$stage/LICENSE"
 
@@ -254,6 +264,7 @@ if [ "$total" -gt 0 ]; then
 fi
 echo "  privacy scan: 0 hits in $(ls "$stage" | wc -l) files (4 needle classes, UTF-8 and UTF-16LE)"
 
+[ -f "$stage/libnvrtc.so" ] && [ ! -L "$stage/libnvrtc.so" ] || { echo "REFUSED: staged NVRTC is not a real file named libnvrtc.so" >&2; exit 1; }
 manifest_json "$stage" > "$stage/MANIFEST.json"
 tarball="$out/$(pack_name "$version")"
 rm -f "$tarball"
