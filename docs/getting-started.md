@@ -81,6 +81,26 @@ export LD_LIBRARY_PATH=$HOME/.local/share/crow/cuda/lib
 engine/target/release/serve --port 8099
 ```
 
+### Run on Linux, from the engine pack
+
+`tools/pack-engine.sh` builds `dist/crow-nest-engine-<version>-linux-x64.tar.gz` (#133): `serve`, `libnvrtc.so`, `libnvrtc-builtins.so.13.3`, `LICENSE` and `MANIFEST.json` (`{"glibc_min": "2.34", "files": [{path, bytes, sha256}]}`). It needs glibc 2.34 or newer and no toolkit; the NVRTC files are in the pack. NVRTC is staged as `libnvrtc.so` (the bytes of CUDA's `libnvrtc.so.13`) because cudarc tries the unversioned name first, so a system CUDA's `libnvrtc.so` would otherwise win over the bundled library; the builtins keep `libnvrtc-builtins.so.13.3`, the exact name libnvrtc opens.
+
+```
+tools/pack-engine.sh --selftest        # checks on synthetic inputs, no build
+tools/pack-engine.sh                   # build, privacy gate, pack (CUDA_LIB for the NVRTC source)
+
+mkdir engine && tar -xzf crow-nest-engine-<version>-linux-x64.tar.gz -C engine
+export LD_LIBRARY_PATH=$PWD/engine     # the pack folder: libnvrtc loads libnvrtc-builtins from here
+export CROW_CNQ=/models/Qwen3.8-27B-CNQ4.5.cnq
+export CROW_TOKENIZER=/models/Qwen3.8-27B/tokenizer.json
+export CROW_TOKENIZER_CONFIG=/models/Qwen3.8-27B/tokenizer_config.json
+export CROW_VIT_MMPROJ=/models/Qwen3.8-27B/mmproj-F16.gguf
+engine/serve --port 8099
+```
+
+- The pack folder takes the place of `CUDA_LIB` on `LD_LIBRARY_PATH`; `serve` has no rpath. Started this way, `serve` runs outside `tools/serve-linux.sh`'s memory scope (see below).
+- The packer refuses to pack when any staged file contains `$HOME`, a `/home/<name>/` path, the bare `$USER` (any context, case-insensitive) or the host name (UTF-8 and UTF-16LE), or when `serve` needs a glibc symbol above the floor. There is no override.
+
 - The cold expert tier is pinned host memory: unevictable, unswappable, and on this box most
   of the machine. The kernel's only reclaim target left is the page cache, and `systemd-oomd`
   fires on memory pressure rather than on exhaustion, so a machine-wide spike takes the

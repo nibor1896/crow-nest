@@ -282,8 +282,12 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="460"
+TESTS="462"
 CLIPPY="1494"
+#   tests 460 -> 462 / clippy 1494 (unchanged)   crow-nest #131, serve off the build machine (2026-10-01, 7726c37): +2
+#                              `the_default_lock_lives_in_the_per_user_state_dir_and_crow_lock_still_wins`,
+#                              `a_relative_default_falls_back_from_the_cwd_to_the_exe_root_and_the_exe_folder`.
+#                              v0.8.0 shipped without the Linux gate; first measured here, 2026-10-02 at 5694660.
 #   tests 457 -> 458 / clippy 1494 (unchanged)   crow-nest #123, image mrope positions (2026-09-27): +1
 #                              `vit::reserve::image_positions_are_the_merged_grid_in_raster_order_like_hf`
 #                              (red with the old block-major formula: [6, 6, 20] where HF gives [6, 6, 34]).
