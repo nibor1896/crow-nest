@@ -22,7 +22,7 @@ section 0.
 | CUDA toolkit | 13.3, V13.3.73 (nvcc, NVRTC, ptxas) |
 | Rust | 1.97.0 (2026-06-30), cargo 1.97.0 |
 | cudarc | 0.19.9, features `cuda-13030` + `dynamic-loading` + `nvrtc` (repo now `chelsea0x3b/cudarc`) |
-| runtime DLLs | `nvrtc64_133_0.dll` needs the toolkit bin dir on PATH; `nvcuda.dll` comes from the driver (System32) |
+| runtime DLLs | `nvrtc64_130_0.dll` and `nvrtc-builtins64_133.dll` (CUDA 13.3's names; there is no `nvrtc64_133_0.dll`) need the toolkit bin dir on PATH; `nvcuda.dll` comes from the driver (System32) |
 
 ## Hardware facts pinned by probe 2 (`dev/crow-nest/probes/RESULTS.md`)
 

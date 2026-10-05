@@ -154,7 +154,7 @@ wrote converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq: 1658 tensors (843 nvfp4, 815 bf
 
 <!-- NUMBERS-OF-RECORD refresh before upload -->
 
-Current numbers: crow-nest v0.3.1 (2026-09-18), one RTX 5090, Arch Linux, driver 610.57.04, CUDA 13.3.1, this container. llama.cpp runs the same model as `Qwen3.8-Flash-Next-UD-Q2_K_XL` (GGUF, 2.4 bpw, 73 GB); its latest numbers are Crow's Linux placement and the paired Windows prefill (17.41 s = 922.5 tok/s, 2026-09-11; no Linux prefill number exists for it).
+The table below is the v0.3.1 reading (2026-09-18), **measured before the PLE fix of 2026-09-23** (engine commit `85a48e7`); the figures after the fix follow the table. One RTX 5090, Arch Linux, driver 610.57.04, CUDA 13.3.1, this container. llama.cpp runs the same model as `Qwen3.8-Flash-Next-UD-Q2_K_XL` (GGUF, 2.4 bpw, 73 GB); its latest numbers are Crow's Linux placement and the paired Windows prefill (17.41 s = 922.5 tok/s, 2026-09-11; no Linux prefill number exists for it).
 
 | metric | crow-nest CNQ4.5-M | llama.cpp UD-Q2_K_XL | form | source |
 |---|---|---|---|---|
@@ -167,8 +167,12 @@ Current numbers: crow-nest v0.3.1 (2026-09-18), one RTX 5090, Arch Linux, driver
 
 <!-- end of the numbers of record -->
 
-- The rows above were measured on the engine as it was before 2026-09-23. On 2026-09-23 the engine changed in three ways: the PLE row read was fixed (engine commit `85a48e7`, issue #91), activations gained a per-row pre-scale (`488a840`), and `CROW_QFUSE` fusions became opt-in. None of the rows was re-measured after that (2026-09-23). The fusions' cost of record is 19f -0.98 ms and 19h -0.23 ms per token, and the unfused default's decode speed is not measured (2026-09-23).
-- Operating point after those changes (robin's live Crow session, evening of 2026-09-23): bare container, fixed engine, the shipped hot-set manifest, decode 24 to 27 tok/s. See Known limitations.
+- The rows above are pre-fix numbers: they were measured on the engine as it was before 2026-09-23. On 2026-09-23 the engine changed in three ways: the PLE row read was fixed (engine commit `85a48e7`, issue #91), activations gained a per-row pre-scale (`488a840`), and `CROW_QFUSE` fusions became opt-in. None of the rows above was re-measured as such; what exists after the fix is listed next. The fusions' cost of record is 19f -0.98 ms and 19h -0.23 ms per token, and the unfused default's decode speed is not measured (2026-09-23).
+- Decode after the PLE fix, Linux, RTX 5090 (not a pair with the pre-fix 42.5 and 36.8 tok/s above: a different engine, and 122k or live contexts instead of 16k):
+  - Operating point after those changes (robin's live Crow session, evening of 2026-09-23): bare container, fixed engine, the shipped hot-set manifest `longctx2100`, decode 24 to 37 tok/s (the first notes of that day wrote 24 to 27; engine issue #106 and `CHANGELOG.md` read 24 to 37). See Known limitations.
+  - Hot-set A/B, 2026-09-24 (`decode_out/hotset-0924/speed.log`): `decode run`, context 122,019, three runs per hot set, alternating. `longctx2100` 32.5 / 32.4 / 32.5 tok/s, `crow0924` 35.6 / 35.8 / 35.8 tok/s ([hot-set calibration](hotset-calibration.md)).
+  - Live `serve` on `crow0924`, 2026-09-24 (engine issue #106): median 38.0 tok/s at 100k to 150k context (n = 50), 37.4 tok/s above 150k (n = 22). A sampled goal run, not an A/B against the rows above.
+  - Windows has not been re-measured since the fix; no Windows number in this card describes the fixed engine.
 - crow-nest moves about 1.9x the expert bytes per token of the 2.4 bpw GGUF.
 - The 972 tok/s prefill and 42 tok/s decode figures of the engine's decision record are targets (spec section 0.1, approved 2026-09-02); prefill is above that target on Linux since v0.3.0, and decode at 16k context reads above it since 2026-09-18 — but the decode target names a session filled to the 200,000 token floor, which has no Linux reading, so neither row is the target met.
 - Earlier numbers (Windows, v0.2.0) are in the engine's `CHANGELOG.md` and its v0.2.0 release notes.
@@ -195,9 +199,9 @@ The two arms run different weights, and every comparison names both: llama.cpp r
 | OS | Linux (x86_64, tested on Arch Linux, kernel 7.2, driver 610.57.04) and Windows x64. Linux needs the CUDA 13.3 runtime libraries on `LD_LIBRARY_PATH` and the container on a path WITHOUT filesystem compression (`chattr +m` on btrfs `compress=` mounts); `tools/serve-linux.sh` of the engine starts `serve` inside a memory-bounded `systemd-run` scope | engine README, Platform and Run on Linux; engine issue #15, closed 2026-09-17 |
 | GPU | one NVIDIA Blackwell GPU, `sm_120`, `compute_120a` target; every measured number here is one RTX 5090 | `docs/system-landscape.md:12` of the engine repo |
 | host RAM | 62 to 64 GB class: the engine pins up to 46 GiB of host memory for the cold expert tier, sized at boot from the RAM that can be pinned (on Linux the NVIDIA driver's freed pinned-page pool and the page cache count as free; another live CUDA process makes the gate conservative); the chain gate (engine issue #38) still applies to measurements; the budget as built was measured 2026-09-17. On Linux the cold tier has been allocated as `register` by default since 2026-09-23: anonymous memory registered with the driver, charged to the serve scope (engine issue #103, `CROW_PINNED_ALLOC`) | `docs/system-landscape.md` and `docs/architecture.md` 2.1 of the engine repo |
-| CUDA | CUDA 13.3 toolkit. Windows: `nvrtc64_133_0.dll` needs the toolkit bin directory on `PATH`. Linux: `libnvrtc.so.13` and the runtime on `LD_LIBRARY_PATH` (never the `lib/stubs` directory); the driver's own `libcuda.so.1` | `docs/system-landscape.md` of the engine repo |
+| CUDA | CUDA 13.3 toolkit. Windows: `nvrtc64_130_0.dll` and `nvrtc-builtins64_133.dll` (CUDA 13.3's file names; there is no `nvrtc64_133_0.dll`) need the toolkit bin directory on `PATH`, or sit beside `serve.exe`. Linux: `libnvrtc.so.13` and the runtime on `LD_LIBRARY_PATH` (never the `lib/stubs` directory); the driver's own `libcuda.so.1` | `docs/system-landscape.md` of the engine repo |
 | container placement | the engine default path is `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` inside the engine repo, or `CROW_CNQ` names any path | `geo.rs` `DEFAULT_CNQ` and `boot.rs` of the engine, `docs/env.md`, row `CROW_CNQ` |
-| hot-set manifest placement | the engine default path is `decode_out/hotsets-M-longctx2100-n160.json`, or `CROW_HOTSETS` names any path | `geo.rs` `DEFAULT_HOTSETS` and `boot.rs` of the engine, `docs/env.md`, row `CROW_HOTSETS` |
+| hot-set manifest placement | the engine default path is `decode_out/hotsets-M-crow0924-n160.json` (since 2026-09-24; `longctx2100` was the default before, and the gates of record still pin it), or `CROW_HOTSETS` names any path | `geo.rs` `DEFAULT_HOTSETS` and `boot.rs` of the engine, `docs/env.md`, row `CROW_HOTSETS` |
 | server | binds `127.0.0.1`, default port 8099, one request at a time, one engine per machine via the engine lock (`%LOCALAPPDATA%\crow-nest\engine.lock` on Windows, `$XDG_STATE_HOME/crow-nest/engine.lock` else `~/.local/state/crow-nest/engine.lock` on Linux; #131) | `serve.rs:445` of the engine, engine README |
 
 ## Self-test
@@ -246,7 +250,7 @@ Recalibrated on 2026-09-24 as `hotsets-M-crow0924-n160.json`: held-out hit rate 
 
 #### 2026-09-23
 
-`hotsets-M-longctx2100-n160.json` was calibrated on the engine with the PLE read bug. The wrong n-gram embeddings changed the routing, so the manifest keeps the wrong experts resident for the fixed engine. robin's live session on the evening of 2026-09-23 measured a hot-set hit rate of 0.52 to 0.70, against 0.77 to 0.80 before the fix, and decode of 24 to 27 tok/s. A recalibrated manifest has not been made (2026-09-23). Until it exists, the manifest in the Files table is the only one, and the decode numbers of record above do not describe the fixed engine.
+`hotsets-M-longctx2100-n160.json` was calibrated on the engine with the PLE read bug. The wrong n-gram embeddings changed the routing, so the manifest keeps the wrong experts resident for the fixed engine. robin's live session on the evening of 2026-09-23 measured a hot-set hit rate of 0.52 to 0.70, against 0.77 to 0.80 before the fix, and decode of 24 to 37 tok/s (first written as 24 to 27). A recalibrated manifest has not been made (2026-09-23). Until it exists, the manifest in the Files table is the only one, and the decode numbers of record above do not describe the fixed engine.
 
 ### Other open items (2026-09-23)
 
