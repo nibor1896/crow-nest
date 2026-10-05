@@ -945,6 +945,46 @@ pub fn free_physical_ram() -> u64 {
     free_physical_ram_parts().free_for_pin
 }
 
+/// Windows commit: (free, limit) in bytes, from GlobalMemoryStatusEx
+/// `ullAvailPageFile` / `ullTotalPageFile`; the limit is RAM + page file. Under
+/// WDDM every device allocation is charged against it as well as every pinned
+/// host block (measured 2026-10-05: 20 x 1 GiB `cuMemAlloc` took exactly 20 GiB
+/// of commit, 41 x 1 GiB `cuMemHostAlloc` exactly 41 GiB). (0, 0) when the
+/// query fails; unix has no such limit and answers (0, 0) too.
+#[cfg(windows)]
+pub fn commit_bytes() -> (u64, u64) {
+    #[repr(C)]
+    struct MemStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page: u64,
+        avail_page: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_ext_virtual: u64,
+    }
+    type FnGms = unsafe extern "system" fn(*mut MemStatusEx) -> i32;
+    unsafe {
+        let Ok(lib) = libloading::Library::new("kernel32.dll") else { return (0, 0) };
+        let Ok(f) = lib.get::<FnGms>(b"GlobalMemoryStatusEx\0") else { return (0, 0) };
+        let mut st = MemStatusEx {
+            length: std::mem::size_of::<MemStatusEx>() as u32,
+            memory_load: 0, total_phys: 0, avail_phys: 0, total_page: 0,
+            avail_page: 0, total_virtual: 0, avail_virtual: 0, avail_ext_virtual: 0,
+        };
+        if f(&mut st) == 0 { return (0, 0) }
+        (st.avail_page, st.total_page)
+    }
+}
+
+/// unix twin: no commit limit to check
+#[cfg(unix)]
+pub fn commit_bytes() -> (u64, u64) {
+    (0, 0)
+}
+
 // ---------- pinned host memory (zero-copy cold tier, probe 3/4/5 pattern) ----------
 
 pub struct Pinned {
