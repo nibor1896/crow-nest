@@ -1206,10 +1206,16 @@ pub fn from_container(cnq_path: &str, model_dir: Option<&str>) -> Result<Option<
 }
 
 /// the `models/<name>` dir of the checkpoint this container was built from, or
-/// `None` when the tree holds no candidate. When several checkpoints sit under
-/// `models/`, the one whose directory name carries the container's model name
-/// (the file stem up to `-CNQ…`) wins; a lone candidate needs no hint.
+/// `None` when the tree holds no candidate. Only a checkpoint whose directory
+/// name carries the container's model name (the file stem up to `-CNQ…`) is a
+/// candidate, also when it is the only one under `models/`.
 pub fn config_dir_for_container(cnq_path: &str) -> Option<std::path::PathBuf> {
+    config_dir_beside(cnq_path, std::path::Path::new("."))
+}
+
+/// [`config_dir_for_container`] with the cwd fallback root passed in (the unit
+/// test builds the install layout in a temp dir instead of changing the cwd)
+fn config_dir_beside(cnq_path: &str, cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     let hint = std::path::Path::new(cnq_path)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -1222,7 +1228,7 @@ pub fn config_dir_for_container(cnq_path: &str) -> Option<std::path::PathBuf> {
         .unwrap_or_default();
     let p = std::path::Path::new(cnq_path);
     // `…/repo/converter/x.cnq` -> `…/repo`; `../converter/x.cnq` -> `..`
-    for root in p.parent().and_then(|d| d.parent()).into_iter().chain([std::path::Path::new(".")]) {
+    for root in p.parent().and_then(|d| d.parent()).into_iter().chain([cwd]) {
         if let Some(dir) = config_dir_in_root(root, &hint) {
             return Some(dir);
         }
@@ -1230,22 +1236,23 @@ pub fn config_dir_for_container(cnq_path: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+/// only a checkpoint whose directory name starts with the container's model
+/// name, a lone candidate included: Crow's install keeps every model under
+/// `models/`, so a lone `models/whisper-small/` is another model, not this
+/// container's truth source. No match (or no name to match) -> `None`.
 fn config_dir_in_root(root: &std::path::Path, hint: &str) -> Option<std::path::PathBuf> {
+    if hint.is_empty() {
+        return None;
+    }
     let read = std::fs::read_dir(root.join("models")).ok()?;
     let mut cands: Vec<std::path::PathBuf> = read
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.join("config.json").is_file())
+        .filter(|c| c.file_name().map(|n| n.to_string_lossy().starts_with(hint)).unwrap_or(false))
         .collect();
     cands.sort();
-    match cands.len() {
-        0 => None,
-        1 => Some(cands[0].clone()),
-        // several checkpoints: take the one the container's name names
-        _ => cands
-            .into_iter()
-            .find(|c| c.file_name().map(|n| n.to_string_lossy().starts_with(hint)).unwrap_or(false)),
-    }
+    cands.into_iter().next()
 }
 
 // ---- Crow #300 C7: which config the gate judges, and the container it must fit ----
@@ -1582,6 +1589,31 @@ mod tests {
             let dir = config_dir_for_container(&cnq).expect("the repo layout must resolve");
             assert!(dir.join("config.json").is_file(), "{dir:?}");
         }
+    }
+
+    /// Crow's install (cwd `%LOCALAPPDATA%\Crow`, the container in
+    /// `models/Qwen3.8-Flash-Next-CNQ4.5-M/` with no config.json): a lone
+    /// unrelated checkpoint under `models/` (whisper-small, 2026-10-01) must not
+    /// become the truth source - the lookup finds nothing and boot warns
+    #[test]
+    fn a_lone_unrelated_checkpoint_is_not_the_containers_config() {
+        let t = std::env::temp_dir().join(format!("crow-meta-cfgdir-{}", std::process::id()));
+        std::fs::remove_dir_all(&t).ok();
+        let whisper = t.join("models").join("whisper-small");
+        let own = t.join("models").join("Qwen3.8-Flash-Next-CNQ4.5-M");
+        std::fs::create_dir_all(&whisper).unwrap();
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(whisper.join("config.json"), "{}").unwrap();
+        let cnq = own.join("Qwen3.8-Flash-Next-CNQ4.5-M.cnq").to_string_lossy().into_owned();
+        let none = config_dir_beside(&cnq, &t);
+        // the checkpoint the name names is still found beside the unrelated one
+        let original = t.join("models").join("Qwen3.8-Flash-Next-original");
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::write(original.join("config.json"), "{}").unwrap();
+        let found = config_dir_beside(&cnq, &t);
+        std::fs::remove_dir_all(&t).ok();
+        assert_eq!(none, None, "an unrelated lone checkpoint was taken");
+        assert_eq!(found, Some(original));
     }
 
     #[test]

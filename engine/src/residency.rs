@@ -264,6 +264,14 @@ file, so the overlay would reach the hot experts only",
         // ---- VRAM hot slabs + pinned cold slabs ----
         let hot_gu_bytes = (layers * n_slots) as u64 * slabs.gu_bytes;
         let hot_dn_bytes = (layers * n_slots) as u64 * slabs.dn_bytes;
+        // Windows charges both the hot slabs (VRAM, WDDM) and the pinned cold tier
+        // against commit = RAM + page file. Without a page file that limit is the
+        // RAM alone and the tier ran out at layer 11 of 48 with a bare
+        // CUDA_ERROR_OUT_OF_MEMORY (2026-10-05); refuse here instead, by name.
+        let (commit_free, commit_limit) = cuda::commit_bytes();
+        if let Some(why) = commit_refusal(cold_total, hot_gu_bytes + hot_dn_bytes, margin, commit_free, commit_limit) {
+            panic!("{why}");
+        }
         let hot_gu = cuda::alloc_zeroed(hot_gu_bytes as usize);
         let hot_dn = cuda::alloc_zeroed(hot_dn_bytes as usize);
         let mut cold_gu = Vec::with_capacity(layers);
@@ -895,10 +903,58 @@ impl Drop for Residency {
     }
 }
 
+/// The Windows commit check before the hot slabs and the pinned tier are
+/// allocated: `None` when they fit (or when there is no commit figure, unix or a
+/// failed query), else the refusal text. Needed = cold tier + hot slabs + margin;
+/// the page file the refusal asks for is the shortfall rounded up to whole GiB,
+/// since the commit limit is RAM + page file.
+pub fn commit_refusal(cold: u64, hot: u64, margin: u64, commit_free: u64, commit_limit: u64) -> Option<String> {
+    if commit_free == 0 || commit_limit == 0 {
+        return None;
+    }
+    let need = cold + hot + margin;
+    if need <= commit_free {
+        return None;
+    }
+    let short_gib = (need - commit_free).div_ceil(1 << 30);
+    Some(format!(
+        "refusing to pin {:.2} GiB and place {:.2} GiB of hot slabs: Windows commit has {:.2} GiB free of a {:.2} GiB limit \
+(RAM + page file), and both count against it (WDDM charges VRAM to commit too; margin {:.0} GiB). \
+Add a page file of at least {short_gib} GiB (System > Advanced > Performance > Virtual memory) and restart",
+        cold as f64 / GIB, hot as f64 / GIB, commit_free as f64 / GIB, commit_limit as f64 / GIB, margin as f64 / GIB
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::geo::{E, LAYERS};
+
+    const G: u64 = 1 << 30;
+
+    /// 2026-10-05, robin's Windows box without a page file: commit limit 63.38
+    /// GiB, the tier 45.48 GiB, the hot slabs of N=151 ~18.7 GiB; the old loader
+    /// found out at layer 11 with a bare CUDA_ERROR_OUT_OF_MEMORY
+    #[test]
+    fn a_tier_past_the_commit_limit_is_refused_and_names_the_page_file() {
+        let why = commit_refusal(45 * G + G / 2, 18 * G + 7 * G / 10, G, 30 * G, 63 * G + 4 * G / 10)
+            .expect("the tier cannot fit in 30 GiB of commit");
+        assert!(why.contains("page file of at least 36 GiB"), "{why}");
+        assert!(why.contains("30.00 GiB free of a 63.40 GiB limit"), "{why}");
+    }
+
+    #[test]
+    fn a_tier_inside_the_commit_limit_passes() {
+        assert_eq!(commit_refusal(45 * G, 18 * G, G, 70 * G, 103 * G), None);
+        // exactly at the edge still fits
+        assert_eq!(commit_refusal(45 * G, 18 * G, G, 64 * G, 103 * G), None);
+    }
+
+    /// unix (and a failed query) answers (0, 0): no commit figure, no refusal
+    #[test]
+    fn no_commit_figure_is_no_refusal() {
+        assert_eq!(commit_refusal(45 * G, 18 * G, G, 0, 0), None);
+    }
 
     /// `lens` for a file whose rows are all `k` long
     fn uniform(k: usize, rows: usize) -> Vec<usize> {

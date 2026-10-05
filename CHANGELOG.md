@@ -6,6 +6,37 @@
 
 ## Unreleased
 
+## 2026-10-05 — v0.9.1
+
+**Flash-Next boots on a Windows install again, or says why it cannot.** A lone unrelated checkpoint under `models\` was taken as the container's config, a tool call written inside a think block ran as a real call, and a cold tier past the Windows commit limit ran out mid-load with a bare out-of-memory. Windows engine only; the Linux pack stays at v0.9.0. No kernel, weight or decode path changed. The engine package now carries its third-party notices.
+
+### Added
+
+- **The engine package carries `NOTICE` and the compiled-in crates' licence texts** (`d79bffb`, 2026-10-05). v0.8.0 and v0.9.0 shipped `serve` with 127 statically linked crates and NVIDIA's NVRTC files but only crow-nest's own `LICENSE`. `tools/engine_notices.py` generates `THIRD-PARTY-NOTICES.txt` from `cargo tree -p crow-nest-engine -e normal` on the Windows and Linux targets (127 crates, 89 distinct texts; MIT, Apache-2.0, BSD-2/3-Clause, ISC, 0BSD, Zlib, Unlicense, Unicode-3.0, BSL-1.0; no copyleft, no MPL-2.0) plus Oniguruma's `COPYING`, which `onig_sys` compiles in, and checks it. `NOTICE` names crow-nest's licence, that file, and the NVRTC files with the CUDA EULA clauses they are redistributed under (1.1.1, 1.1.2, 1.2, 2.3, Attachment A; read 2026-10-05). `pack-engine.ps1` and `pack-engine.sh` stage both files and refuse when the check fails; the Windows package is 7 files.
+
+### Fixed
+
+- **The `models\` lookup takes only the checkpoint the container names** (`2db87b9`, 2026-10-05). The Flash-Next container of record (index v1) carries no config, so `serve` looks for one under `models\`; a lone candidate was taken without a name check. On robin's Crow 3.2.2 install that was `models\whisper-small\config.json` (a speech model installed 2026-10-01), and the #94 metadata gate refused the boot with exit 101. Now a directory counts only when its name starts with the container's model name (the stem before `-CNQ`); with none, the boot warns and continues as before whisper arrived. Regression test `a_lone_unrelated_checkpoint_is_not_the_containers_config` fails without the fix.
+- **A `<tool_call>` inside a think block is reasoning, not a call** (`c6d1530`, 2026-10-05). The tool-call parser and the lazy tool grammar (#93) were armed by the token id before the think filter ran, so a call the model only thought about became an OpenAI `tool_calls` entry and the text after it was dropped. `admit_id` now arms neither while the generation is inside `<think>`; after `</think>` or with thinking off nothing changed. Three tests: a call inside think emits no `tool_calls` and stays in `reasoning_content`; a call after think is one call as before; the grammar stays idle inside think (auto and required). Found by code reading, not observed live.
+- **A cold tier past the Windows commit limit is refused before it is allocated, by name** (`8905e3e`, 2026-10-05). Windows charges both the pinned cold tier and every WDDM device allocation against commit (RAM + page file). On robin's machine without a page file (commit limit 63.38 GiB) the tier ran out at layer 11 of 48 with `CUDA_ERROR_OUT_OF_MEMORY`. `residency` now checks cold tier + hot slabs + margin against free commit first and names the page file size it needs. Three tests on `commit_refusal`.
+
+### Changed
+
+- **Docs carry the post-fix Flash-Next figures and mark the older ones** (`0d34fb6`, 2026-10-05). `docs/model-card.md`, `docs/measurements.md`, `docs/architecture.md` and the README image label every crow-nest speed from before the PLE fix (`85a48e7`, 2026-09-23) as such and add the measurements after it. The default hot set is `crow0924`, and the shipped DLL is `nvrtc64_130_0.dll` (also in `probes/README.md`).
+
+### Measured
+
+- **Windows commit is charged 1:1 for pinned host memory and for VRAM** (2026-10-05, robin's Windows machine, RTX 5090, 63.38 GiB RAM, no page file): 41 × 1 GiB `cuMemHostAlloc(PORTABLE|DEVICEMAP|WRITECOMBINED)` lowered free commit by exactly 41 GiB; 20 × 1 GiB `cuMemAlloc` lowered it by exactly 20 GiB. Flash-Next's Windows boot therefore needs about 95 GiB of commit (Windows and apps ~18, VRAM ~29, cold tier 45.5, engine ~2): a page file of about 40 GiB on a 64 GB machine.
+- **The newest Flash-Next decode is post-fix, on Linux** (2026-09-24, `decode_out/hotset-0924/speed.log`, decode run, context 122,019): 35.6 / 35.8 / 35.8 tok/s with `crow0924`, 32.5 / 32.4 / 32.5 with `longctx2100`. Windows has not been measured since the fix.
+
+### Known limitations
+
+- **Windows only, gate not run** (owner decision 2026-10-05). `tools/gate-linux.sh` did not run on this head and the Linux pack was not rebuilt. The full Windows suite passed: 464 tests, 0 failed. Seven tests are new (meta 1, serve 3, residency 3), so the gate's `TESTS=462` pin must be raised when the next Linux gate measures it.
+- **Flash-Next on Windows needs a page file of about 40 GiB** on a 64 GB machine (see Measured). The boot now says so, by name.
+- **Three CUDA EULA conditions on the NVRTC files are open** (2026-10-05, owner decision to ship as since v0.8.0): whether distributing under Apache-2.0 is "consistent with the terms of this Agreement" (1.1.2), that the distributable portions "shall only be accessed by your application" while the DLLs sit in the package folder (1.1.2), and that the SDK must not become "subject to an open source software license" (1.2). `NOTICE` quotes them; robin decides.
+- **`tools/pack-engine.sh --selftest` was not run on Linux**; under Git Bash it reports 38 ok, 1 failed, and that one check fails the same way on v0.9.0 (it reads `/proc`).
+- **The Windows boot of Flash-Next after the page file is not yet verified live** (2026-10-05). With the page file still absent, robin's boot went through the config-dir fix and stopped at the pinned tier.
+
 ## 2026-10-02 — v0.9.0
 
 **A portable Linux engine.** `tools/pack-engine.sh` packs `serve` with NVRTC into `crow-nest-engine-<version>-linux-x64.tar.gz`, free of builder paths, with a glibc floor of 2.34. This release attaches that tarball; Crow's `CrowSetup-linux-x64` installs it (Crow #342). No kernel, weight or decode path changed.
