@@ -388,6 +388,8 @@
 //! - A second call gets `index` 1, a third `index` 2; each has its own `call_<index>`.
 //! - `finish_reason` is `tool_calls` when at least one call was CLOSED.
 //! - `<tool_call>` is matched by TOKEN ID (248058, `ToolStream::arm`), `</tool_call>` by TEXT.
+//! - That id INSIDE a think block opens nothing (`admit_id`): neither the parser nor the
+//!   lazy grammar, the markup is `reasoning_content` like the rest of the block.
 //! - Text before the first `<tool_call>` streams as `delta.content`, unchanged from A4.
 //! - Text after it is DROPPED and counted in one stderr line (the template forbids it).
 //! - EOS or `max_tokens` after `</function>` but before `</tool_call>`: the call is COMPLETE,
@@ -3595,6 +3597,32 @@ fn accumulate_args(pieces: &[Emit], acc: &mut Vec<String>) {
     }
 }
 
+/// - #29 A7 / #93: the ONE place a KEPT id reaches the tool-call parser and the lazy
+///   grammar: the `<tool_call>` id arms `ts` and opens the grammar, every id advances it.
+/// - A `<tool_call>` id written while the think filter is `Inside` a block is REASONING
+///   text: it arms neither, so its markup streams as `reasoning_content` like the rest of
+///   the block (Qwen's template puts calls AFTER `</think>`; vLLM runs its reasoning parser
+///   before the tool parser). Before this it became a real `tool_calls` entry the client
+///   ran, and the text after it was dropped as text after a call.
+/// - `think` must be the filter as it stands BEFORE this id's text is fed: every earlier
+///   piece went through it (`ts` holds back only a `<tool_call>` prefix, never a `</think>`).
+/// - After `</think>`, and with thinking off, nothing changes: same arm, same grammar.
+/// - `false`: a forced id (#81) the grammar refused, it stepped aside (the caller logs it)
+fn admit_id(id: u32, tool_open: Option<u32>, think: &ThinkFilter, ts: &mut ToolStream, gate: Option<&mut Gate<'_>>) -> bool {
+    let opener = Some(id) == tool_open;
+    let reasoning = think.is_inside();
+    let mut kept = true;
+    if let Some(gt) = gate {
+        if !(opener && reasoning) {
+            kept = gt.accept(id);
+        }
+    }
+    if opener && !reasoning {
+        ts.arm();
+    }
+    kept
+}
+
 /// - #67: the reasoning filter runs HERE, between the tool-call parser and the sink, on
 ///   `Emit::Content` alone. Arguments fragments are never touched: a `</think>` inside a
 ///   tool parameter value is that value's business, and the `arguments` contract of 7.11.14
@@ -4478,13 +4506,14 @@ fn chat_generate(
             // it). Only a FORCED id (#81 injection) can be refused here: the grammar then
             // steps aside for the rest of the answer, the force wins, as it does over the
             // sampler.
-            if let Some(gt) = gate.as_mut() {
-                let phase = gt.phase();
-                if !gt.accept(next as u32) {
-                    tracing::warn!(target: "chat",
-                        "[chat] tool grammar: the forced id {next} is outside the grammar ({phase}); \
-                         the grammar steps aside for the rest of this answer");
-                }
+            // #29 A7: the ID is what opens a tool call, never the text (spec of the task);
+            // `admit_id` arms the parser and the grammar together, and neither inside a
+            // think block: `think` has seen every piece before this id's text
+            let phase = gate.as_ref().map_or("idle", |g| g.phase());
+            if !admit_id(next as u32, tool_open, &think, &mut ts, gate.as_mut()) {
+                tracing::warn!(target: "chat",
+                    "[chat] tool grammar: the forced id {next} is outside the grammar ({phase}); \
+                     the grammar steps aside for the rest of this answer");
             }
             // #91: the logprobs of THIS position, read off the row that produced `next`.
             // `s.logits` still holds it: the prefill (or the last `decode_step`) wrote it,
@@ -4508,10 +4537,6 @@ fn chat_generate(
                     aborted = true;
                     break;
                 }
-            }
-            // #29 A7: the ID is what opens a tool call, never the text (spec of the task)
-            if Some(next as u32) == tool_open {
-                ts.arm();
             }
             let full = match tk.decode(&out) {
                 Ok(t) => t,
@@ -9475,5 +9500,128 @@ Red is #FF0000."), "{off}");
             out.push(next);
         }
         assert_eq!(out, bad);
+    }
+
+    // ------------------------------- a `<tool_call>` inside a think block is reasoning
+
+    /// a call the template would write, everything after the `<tool_call>` id
+    const THINK_CALL: &str =
+        "\n<function=read_file>\n<parameter=path>\na.md\n</parameter>\n</function>\n</tool_call>";
+
+    /// - the text side of `chat_generate`'s loop over scripted pieces, one id per piece:
+    ///   `admit_id`, `ts.feed`, `send_emits`, then the end-of-generation flushes
+    /// - the vocabulary is the script's own pieces, id 0 the `<tool_call>` opener, so the
+    ///   lazy grammar sees exactly the ids the parser sees, without a tokenizer file
+    /// - out: the document sink, the grammar phase after every id, calls closed under the
+    ///   grammar, and ids the grammar refused
+    fn think_script(pieces: &[&str], enable_thinking: bool) -> (CollectSink, Vec<&'static str>, usize, usize) {
+        let mut vocab: Vec<&str> = vec![TOOL_OPEN];
+        for p in pieces {
+            if !vocab.contains(p) {
+                vocab.push(p);
+            }
+        }
+        let eos = vocab.len() as u32;
+        let v = Vocab::build(
+            vocab.len() + 1,
+            |id| vocab.get(id as usize).map_or(Vec::new(), |s| s.as_bytes().to_vec()),
+            |id| id == eos,
+            &[eos],
+            0,
+        );
+        let tools: serde_json::Value = serde_json::from_str(TOOLS_3DBC015).unwrap();
+        let g = ToolGrammar::build(&tools, toolgrammar::Mode::Auto, true, None).unwrap();
+        let mut gate = Gate::new(g, &v);
+        let mut ts = ToolStream::new(Some(&tools));
+        let mut think = ThinkFilter::for_request(enable_thinking);
+        let mut stops = StopStrings::new(&[]);
+        let mut counts = Chunks::default();
+        let mut col = CollectSink::default();
+        let cx = ChunkCtx::new("i", 1, "m");
+        let (mut phases, mut refused) = (Vec::new(), 0);
+        for p in pieces {
+            let id = vocab.iter().position(|s| s == p).unwrap() as u32;
+            if !admit_id(id, Some(0), &think, &mut ts, Some(&mut gate)) {
+                refused += 1;
+            }
+            phases.push(gate.phase());
+            let emits = ts.feed(p);
+            assert!(send_emits(&mut col, &cx, &emits, &mut think, &mut stops, &mut counts));
+        }
+        let mut emits = Vec::new();
+        ts.finish(&mut emits);
+        assert!(send_emits(&mut col, &cx, &emits, &mut think, &mut stops, &mut counts));
+        let tail = think.flush();
+        assert!(send_split(&mut col, &cx, &tail, &mut stops, &mut counts));
+        (col, phases, gate.stats.calls_closed, refused)
+    }
+
+    /// the defect: a whole `<tool_call>` written INSIDE the reasoning became a real
+    /// `tool_calls` entry the client ran, and the answer after it was dropped as text after
+    /// a call. It is reasoning text, on both doors into a block: the prompt's (thinking on)
+    /// and the model's own `<think>` (thinking off)
+    #[test]
+    fn a_tool_call_inside_a_think_block_is_reasoning_and_runs_nothing() {
+        let (col, phases, closed, refused) = think_script(
+            &["I could ", TOOL_OPEN, THINK_CALL, " but first", "</think>", "\n\n", "The answer."],
+            true,
+        );
+        assert!(col.calls.is_empty(), "no tool_calls entry: {:?}", col.calls);
+        assert_eq!(col.reasoning, format!("I could <tool_call>{THINK_CALL} but first"));
+        assert_eq!(col.content, "The answer.");
+        assert_eq!((closed, refused), (0, 0));
+        assert!(phases.iter().all(|p| *p == "idle"), "{phases:?}");
+
+        let (col, _, closed, _) = think_script(
+            &["<think>", "plan ", TOOL_OPEN, THINK_CALL, "</think>", "\n\n", "Done."],
+            false,
+        );
+        assert!(col.calls.is_empty(), "no tool_calls entry: {:?}", col.calls);
+        assert_eq!(col.reasoning, format!("plan <tool_call>{THINK_CALL}"));
+        assert_eq!(col.content, "Done.");
+        assert_eq!(closed, 0);
+    }
+
+    /// the template's own shape, unchanged: the reasoning closes, THEN the call - exactly
+    /// one call, under the grammar, the same call a request without thinking gets
+    #[test]
+    fn a_tool_call_after_the_think_block_is_one_call_as_before() {
+        let (col, phases, closed, refused) =
+            think_script(&["plan", "</think>", "\n\n", TOOL_OPEN, THINK_CALL], true);
+        assert_eq!(col.calls.len(), 1, "{:?}", col.calls);
+        assert_eq!(col.calls[0].name, "read_file");
+        let args: serde_json::Value = serde_json::from_str(&col.calls[0].arguments).unwrap();
+        assert_eq!(args, serde_json::json!({"path": "a.md"}));
+        assert_eq!((col.reasoning.as_str(), col.content.as_str()), ("plan", ""));
+        assert_eq!((closed, refused), (1, 0));
+        assert_eq!(phases[3], "markup", "the `<tool_call>` id opened the grammar");
+
+        let (plain, _, closed, refused) = think_script(&[TOOL_OPEN, THINK_CALL], false);
+        assert_eq!(plain.calls, col.calls, "thinking off: the same call");
+        assert_eq!((plain.reasoning.as_str(), plain.content.as_str()), ("", ""));
+        assert_eq!((closed, refused), (1, 0));
+    }
+
+    /// the lazy grammar (#93) idles on a `<tool_call>` id inside a think block, so no
+    /// reasoning token is ever checked or redrawn against the call frame; after `</think>`
+    /// the same id opens it, in `auto` and in `required`
+    #[test]
+    fn the_tool_grammar_is_not_armed_by_a_tool_call_inside_think() {
+        let tools: serde_json::Value = serde_json::from_str(TOOLS_3DBC015).unwrap();
+        let v = Vocab::build(2, |id| if id == 0 { TOOL_OPEN.as_bytes().to_vec() } else { Vec::new() }, |id| id == 1, &[1], 0);
+        for mode in [toolgrammar::Mode::Auto, toolgrammar::Mode::Required] {
+            let mut gate = Gate::new(ToolGrammar::build(&tools, mode, true, None).unwrap(), &v);
+            let mut ts = ToolStream::new(Some(&tools));
+            let mut think = ThinkFilter::inside();
+            assert!(admit_id(0, Some(0), &think, &mut ts, Some(&mut gate)));
+            assert_eq!(gate.phase(), "idle", "{mode:?}");
+            assert_eq!(gate.armed(), mode == toolgrammar::Mode::Required, "{mode:?}: only `required`'s EOS rule");
+            assert_eq!(ts.feed(TOOL_OPEN), vec![Emit::Content(TOOL_OPEN.to_string())], "the parser is not armed");
+            think.push("</think>\n\n");
+            assert!(admit_id(0, Some(0), &think, &mut ts, Some(&mut gate)));
+            assert_eq!(gate.phase(), "markup", "{mode:?}");
+            assert!(gate.armed());
+            assert!(ts.feed(TOOL_OPEN).is_empty(), "the parser is armed: the opener is consumed");
+        }
     }
 }
