@@ -14,7 +14,10 @@
 #  2. refuses when serve's highest GLIBC_ symbol version is above GLIBC_FLOOR (2.34,
 #     measured 2026-10-02); the floor is written into MANIFEST.json;
 #  3. stages serve, libnvrtc.so (the bytes of $CUDA_LIB/libnvrtc.so.13) and
-#     libnvrtc-builtins.so.13.3 (real files, not symlinks, no duplicates) and LICENSE.
+#     libnvrtc-builtins.so.13.3 (real files, not symlinks, no duplicates) and LICENSE,
+#     NOTICE and THIRD-PARTY-NOTICES.txt (the crates' licence texts and the NVRTC
+#     terms), refusing first when tools/engine_notices.py says THIRD-PARTY-NOTICES.txt
+#     is not what engine/Cargo.lock produces.
 #     NVRTC is staged as the unversioned `libnvrtc.so` because cudarc tries that name
 #     FIRST over all search paths: a system CUDA providing libnvrtc.so would beat a
 #     bundled libnvrtc.so.13 (#133, Crow #341). libnvrtc dlopens the builtins by the
@@ -43,6 +46,10 @@ GLIBC_FLOOR="2.34"
 # source name in $CUDA_LIB : name in the pack
 NVRTC_LIBS=(libnvrtc.so.13:libnvrtc.so libnvrtc-builtins.so.13.3:libnvrtc-builtins.so.13.3)
 nvrtc_staged_names() { local e; for e in "${NVRTC_LIBS[@]}"; do echo "${e#*:}"; done; }
+# from the repo root: crow-nest's licence, NOTICE (NVRTC terms) and the crates' texts
+SHIP_FILES=(LICENSE NOTICE THIRD-PARTY-NOTICES.txt)
+# the files a package holds, MANIFEST.json aside
+package_files() { echo serve; nvrtc_staged_names; printf '%s\n' "${SHIP_FILES[@]}"; }
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------------------
@@ -178,6 +185,26 @@ selftest() {
   check_true "the builtins keep the name libnvrtc dlopens" "$(nvrtc_staged_names | grep -qx 'libnvrtc-builtins.so.13.3' && echo 1 || echo 0)"
   check_true "the pack name" "$([ "$(pack_name 0.8.0)" = crow-nest-engine-0.8.0-linux-x64.tar.gz ] && echo 1 || echo 0)"
 
+  # the notices travel in the package and the privacy scan covers them
+  local f
+  for f in LICENSE NOTICE THIRD-PARTY-NOTICES.txt; do
+    check_true "the package carries $f" "$(package_files | grep -qx "$f" && echo 1 || echo 0)"
+  done
+  check_true "the package is 6 distinct files + MANIFEST.json" "$([ "$(package_files | sort -u | wc -l)" -eq 6 ] && [ "$(package_files | wc -l)" -eq 6 ] && echo 1 || echo 0)"
+  w NOTICE "see /home/builder/dev/NOTICE"
+  check "the scan finds a leak in a NOTICE" hit "$t/NOTICE"
+  printf '%s' "built on buildbox" | iconv -f UTF-8 -t UTF-16LE > "$t/THIRD-PARTY-NOTICES.txt"
+  check "the scan finds a leak in THIRD-PARTY-NOTICES.txt (UTF-16LE)" hit "$t/THIRD-PARTY-NOTICES.txt"
+
+  # the repo's real texts, scanned with THIS machine's identity, as the build will
+  local repo_root; repo_root="$(cd "$SELF_DIR/.." && pwd)"
+  for f in "${SHIP_FILES[@]}"; do
+    check_true "$f exists in the repo root" "$([ -f "$repo_root/$f" ] && echo 1 || echo 0)"
+    if [ -f "$repo_root/$f" ]; then
+      check_true "$f passes this machine's privacy scan" "$(scan_file "$repo_root/$f" "${HOME%/}" "${USER:-$(id -un)}" "$(host_name)" >/dev/null && echo 1 || echo 0)"
+    fi
+  done
+
   echo "selftest: $ok ok, $red failed"
   [ "$red" -eq 0 ]
 }
@@ -204,7 +231,7 @@ while [ $# -gt 0 ]; do
     --version) version="$2"; shift 2 ;;
     --out) out="$2"; shift 2 ;;
     --cuda-lib) cuda_lib="$2"; shift 2 ;;
-    -h|--help) sed -n 2,36p "$0"; exit 0 ;;
+    -h|--help) sed -n 2,39p "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -221,6 +248,10 @@ mkdir -p "$out"; out="$(cd "$out" && pwd)"
 home="${HOME%/}"
 user="${USER:-$(id -un)}"
 host="$(host_name)"
+
+# the crates' licence texts must be the ones this Cargo.lock compiles in
+python3 "$repo/tools/engine_notices.py" "$repo" || {
+  echo "REFUSED: tools/engine_notices.py failed - THIRD-PARTY-NOTICES.txt or NOTICE is stale; nothing was built" >&2; exit 1; }
 
 echo "packing crow-nest engine $version"
 echo "  repo   : $repo"
@@ -249,7 +280,10 @@ for ent in "${NVRTC_LIBS[@]}"; do
   [ -f "$src" ] || { echo "missing $src (nvrtc files there: $(ls "$cuda_lib" 2>/dev/null | grep nvrtc | tr '\n' ' '))" >&2; exit 1; }
   cp -L "$src" "$stage/$dst"   # the real file, never a symlink
 done
-cp "$repo/LICENSE" "$stage/LICENSE"
+for f in "${SHIP_FILES[@]}"; do cp "$repo/$f" "$stage/$f"; done
+if [ "$(ls -A "$stage" | sort)" != "$(package_files | sort)" ]; then
+  echo "REFUSED: the stage holds $(ls -A "$stage" | tr '\n' ' ')- expected $(package_files | tr '\n' ' ')" >&2; exit 1
+fi
 
 # privacy scan: refuse before anything is packed
 total=0

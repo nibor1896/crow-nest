@@ -16,8 +16,10 @@ VCRUNTIME140.dll. This script:
 2. refuses when serve.exe still imports the VC++ runtime (dumpbin /dependents);
 3. stages serve.exe, nvrtc64_130_0.dll and nvrtc-builtins64_133.dll from
    $env:CUDA_PATH\bin\x64 (the CUDA 13.3 names; there is no nvrtc64_133_0.dll)
-   and LICENSE;
-4. scans every staged file, as UTF-8 and as UTF-16LE at both byte alignments, for
+   and LICENSE, NOTICE and THIRD-PARTY-NOTICES.txt (the crates' licence texts and
+   the NVRTC terms), refusing first when `tools/engine_notices.py` says
+   THIRD-PARTY-NOTICES.txt is not what engine/Cargo.lock produces;
+4. scans every staged file (the notices included), as UTF-8 and as UTF-16LE at both byte alignments, for
    the builder's profile path, any `\Users\<name>\`, the bare user name (any
    context, case-insensitive) and the computer name, and REFUSES on any hit;
 5. writes MANIFEST.json ({path, bytes, sha256}, sha256 upper-case hex, backslash
@@ -48,6 +50,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 $NVRTC_DLLS = @('nvrtc64_130_0.dll', 'nvrtc-builtins64_133.dll')
+# from the repo root: crow-nest's licence, NOTICE (NVRTC terms) and the crates' texts
+$SHIP_FILES = @('LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.txt')
 # the C runtime that +crt-static links in; any of these in the imports means it did not
 $VC_RUNTIME = @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'ucrtbase.dll')
 
@@ -102,6 +106,21 @@ function Find-PrivacyHits {
         }
     }
     return $hits
+}
+
+# Every hit in every file of a stage directory (recursive): what the build refuses on.
+function Find-StageHits {
+    param([string] $Stage, [object[]] $Needles)
+    $hits = @()
+    foreach ($f in Get-ChildItem -LiteralPath $Stage -Recurse -File) {
+        $hits += @(Find-PrivacyHits -Bytes ([IO.File]::ReadAllBytes($f.FullName)) -Needles $Needles -Name $f.Name)
+    }
+    return $hits
+}
+
+# The files a package holds, MANIFEST.json aside.
+function Get-PackageFiles {
+    return @(@('serve.exe') + $NVRTC_DLLS + $SHIP_FILES)
 }
 
 function Get-Manifest {
@@ -201,6 +220,36 @@ function Invoke-Selftest {
     Check "a static-CRT import list is not flagged" ((Get-VcRuntimeImports -Imports @('KERNEL32.dll', 'ntdll.dll', 'WS2_32.dll')).Count -eq 0)
     Check "the zip name" ((Get-ZipName -Ver '0.7.2') -eq 'crow-nest-engine-0.7.2-win-x64.zip')
 
+    # the notices travel in the package and the privacy scan covers them
+    $pf = Get-PackageFiles
+    Check "the package carries LICENSE" ($pf -contains 'LICENSE')
+    Check "the package carries NOTICE" ($pf -contains 'NOTICE')
+    Check "the package carries THIRD-PARTY-NOTICES.txt" ($pf -contains 'THIRD-PARTY-NOTICES.txt')
+    Check "the package is 6 distinct files + MANIFEST.json" ($pf.Count -eq 6 -and @($pf | Sort-Object -Unique).Count -eq 6)
+    $st = Join-Path ([IO.Path]::GetTempPath()) ("crow-nest-pack-selftest-" + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $st | Out-Null
+    try {
+        [IO.File]::WriteAllBytes((Join-Path $st 'NOTICE'), [byte[]](& $u8 "see C:\Users\builder\dev\NOTICE"))
+        [IO.File]::WriteAllBytes((Join-Path $st 'THIRD-PARTY-NOTICES.txt'), [byte[]](& $u16 "built on BUILDBOX"))
+        [IO.File]::WriteAllBytes((Join-Path $st 'LICENSE'), [byte[]](& $u8 "Apache License"))
+        $sh = @(Find-StageHits -Stage $st -Needles $nd)
+        Check "the stage scan finds a leak in NOTICE" (@($sh | Where-Object file -eq 'NOTICE').Count -gt 0)
+        Check "the stage scan finds a leak in THIRD-PARTY-NOTICES.txt (UTF-16LE)" (@($sh | Where-Object file -eq 'THIRD-PARTY-NOTICES.txt').Count -gt 0)
+        Check "the stage scan leaves a clean LICENSE alone" (@($sh | Where-Object file -eq 'LICENSE').Count -eq 0)
+    } finally { Remove-Item -LiteralPath $st -Recurse -Force }
+
+    # the repo's real texts, scanned with THIS machine's identity, as the build will
+    $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+    $real = Get-PrivacyNeedles -UserProfile $env:USERPROFILE -UserName $env:USERNAME -ComputerName $env:COMPUTERNAME
+    foreach ($f in $SHIP_FILES) {
+        $p = Join-Path $repoRoot $f
+        $present = Test-Path -LiteralPath $p
+        Check "$f exists in the repo root" $present
+        if ($present) {
+            Check "$f passes this machine's privacy scan" (@(Find-PrivacyHits -Bytes ([IO.File]::ReadAllBytes($p)) -Needles $real -Name $f).Count -eq 0)
+        }
+    }
+
     Write-Host ("selftest: {0} ok, {1} failed" -f $script:ok, $script:red)
     if ($script:red -gt 0) { exit 1 }
     exit 0
@@ -223,6 +272,11 @@ if (-not $CudaBin) {
     $CudaBin = Join-Path $env:CUDA_PATH 'bin\x64'
 }
 if (-not $OutDir) { $OutDir = Join-Path $repo 'dist' }
+# the crates' licence texts must be the ones this Cargo.lock compiles in
+$py = Get-Command python -ErrorAction SilentlyContinue
+if (-not $py) { throw "python not found - tools/engine_notices.py cannot check THIRD-PARTY-NOTICES.txt" }
+& $py.Source (Join-Path $repo 'tools\engine_notices.py') $repo
+if ($LASTEXITCODE -ne 0) { throw "tools/engine_notices.py failed (exit $LASTEXITCODE) - THIRD-PARTY-NOTICES.txt or NOTICE is stale; nothing was built" }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $OutDir = (Resolve-Path $OutDir).Path.TrimEnd('\')
 if (-not $env:USERPROFILE) { throw "USERPROFILE is not set - the remap and the privacy scan need it" }
@@ -279,17 +333,17 @@ foreach ($dll in $NVRTC_DLLS) {
     }
     Copy-Item -LiteralPath $src -Destination $stage
 }
-Copy-Item -LiteralPath (Join-Path $repo 'LICENSE') -Destination $stage
+foreach ($f in $SHIP_FILES) { Copy-Item -LiteralPath (Join-Path $repo $f) -Destination $stage }
+$staged = @(Get-ChildItem -LiteralPath $stage -File | ForEach-Object Name | Sort-Object)
+$want = @(Get-PackageFiles | Sort-Object)
+if (Compare-Object $staged $want) { throw ("the stage holds " + ($staged -join ', ') + " - expected " + ($want -join ', ')) }
 
 # ---------------------------------------------------------------------------
 # Privacy scan: refuse before anything is zipped
 # ---------------------------------------------------------------------------
 
 $needles = Get-PrivacyNeedles -UserProfile $profileDir -UserName $env:USERNAME -ComputerName $env:COMPUTERNAME
-$hits = @()
-foreach ($f in Get-ChildItem -LiteralPath $stage -Recurse -File) {
-    $hits += @(Find-PrivacyHits -Bytes ([IO.File]::ReadAllBytes($f.FullName)) -Needles $needles -Name $f.Name)
-}
+$hits = @(Find-StageHits -Stage $stage -Needles $needles)
 if ($hits.Count -gt 0) {
     $hits | Format-Table file, encoding, needle, count, first -AutoSize | Out-String | Write-Host
     throw ("privacy scan: {0} hit(s) in the staged files - nothing was zipped" -f ($hits | Measure-Object count -Sum).Sum)

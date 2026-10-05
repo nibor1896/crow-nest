@@ -5,3 +5,6 @@ SHA256SUMS.log text eol=lf
 # its PTX of record): a Windows checkout with core.autocrlf=true must not turn them into CRLF
 # (#126, 2026-09-28: 4 engine tests and 1 converter test red on Windows for that alone)
 engine/tests/fixtures/** -text
+# The engine package's licence texts (tools/engine_notices.py): THIRD-PARTY-NOTICES.txt is
+# compared to a fresh build byte for byte, so a Windows checkout must not turn it into CRLF
+THIRD-PARTY-NOTICES.txt -text
