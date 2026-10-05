@@ -32,5 +32,5 @@ cargo run --release --bin p1_cudarc_context
 cargo run --release --bin p2_nvfp4_mma
 ```
 
-The PATH entry is needed so cudarc's dynamic loading finds `nvrtc64_133_0.dll`
+The PATH entry is needed so cudarc's dynamic loading finds `nvrtc64_130_0.dll`
 (`nvcuda.dll` comes from the driver, in System32).
