@@ -6,6 +6,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **`serve` stages cold experts on a side stream by default: Flash-Next decode +6.7 % on Windows** (#19j, 2026-10-06). `serve` sets `CROW_STAGE_PAR=1` when unset, like `CROW_GRAPH` / `CROW_MMA` / `CROW_ADAPT_WINDOW`; an explicit value still wins, other bins keep it off. Measured in serve on Windows (`298f7cd`, Flash-Next CNQ4.5-M, crow0924, 31,827-token prompt, greedy, reasoning high, 1,024 tokens; 2 boots x 3 warm runs per arm, arms alternated, `crow-lab/runs/fn-flags-win-20261006`): 43.08 -> 45.97 tok/s mean (min 42.75 / 45.38, max 44.16 / 47.04); the same answer text in all 24 warm runs of all arms. `CROW_GDN_SPLIT_Z` in the same series: 42.93 tok/s, no gain, stays off.
+
 ### Fixed
 
 - **The f32 oracles normalize the PLE layer per stream, like the model** (#138, 2026-10-06). `PleRef.rms` in `oracle/ref_engine_logits.py`, `ref_image_prompt_logits.py` and `ref_longctx_logits.py` took one RMS over all 10,240 values of norm_key / norm_query / norm_conv; transformers 5.16.1 (`Qwen4ExpTextRMSNorm(group_size=hidden_size)`) and the engine (`rms_group`) take one per 2,560-value stream. Every oracle-KLD number so far was measured against references with this error, among them the 0.461 of `docs/oracle-kld.md`; the corrected references need the original checkpoint, which is not on this machine (not re-measured). `tools/test_oracle_ple_norm.py` compares each script's norm with transformers' class, no checkpoint needed: red without the fix (max_abs 4.53), green with it; `ref_longctx_logits.py self-test` PASS.
