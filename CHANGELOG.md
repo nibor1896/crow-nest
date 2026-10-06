@@ -6,6 +6,8 @@
 
 ## Unreleased
 
+## 2026-10-06 — v0.9.2
+
 **The engine package carries no NVIDIA file.** NVRTC comes from NVIDIA's own wheel, fetched by a script that ships beside `serve`; the three open CUDA EULA conditions of v0.9.1 no longer apply, because crow-nest redistributes nothing of NVIDIA's.
 
 ### Added
@@ -15,6 +17,17 @@
 ### Changed
 
 - **`pack-engine.ps1` / `pack-engine.sh` stage no NVRTC** (`acc6e5b`). The Windows zip is `serve.exe`, `LICENSE`, `NOTICE`, `THIRD-PARTY-NOTICES.txt`, `fetch-nvrtc.ps1` and `MANIFEST.json`: 3.5 MB zipped, measured 2026-10-06 with a real build. Both scripts refuse a staged NVIDIA-named file. `-CudaBin` / `--cuda-lib` are gone. `NOTICE` says crow-nest distributes no NVIDIA file; `tools/engine_notices.py` checks that and that `NOTICE` names every file the fetch scripts place.
+- **The README's Windows quick start downloads v0.9.2 and runs `fetch-nvrtc.ps1` from the unpacked folder** (2026-10-06).
+
+### Measured
+
+- **Flash-Next boots and answers on Windows with v0.9.1 and a page file** (2026-10-06, `crow-lab/runs/fn-livecheck-win-20261006-b`, RTX 5090, 40 GiB page file, commit limit 103.38 GiB). Boot 106 s; commit 93.14 GiB at ready. One cold image request (1,106 prompt tokens, 800×450 test image described correctly): decode 40.91 tok/s, 473 tokens. One cold text request (73 prompt tokens): 36.24 tok/s. Single runs, short prompts, not an operating-point figure. A first boot with 48.31 GiB free RAM refused at `manager.rs:368` (pinned budget 45.31 GiB < 45.48 GiB cold tier, margin 3 GiB); with ≥ ~48.5 GiB free it boots. This closes v0.9.1's "not yet verified live".
+
+### Known limitations
+
+- **No Linux package.** The v0.9.0 Linux tarball carried NVRTC and is withdrawn; a tarball from `pack-engine.sh` needs a build on Linux. `fetch-nvrtc.sh` is selftested under Git Bash only (20/20); `pack-engine.sh --selftest` 45 ok, 1 failed under Git Bash (the `/proc` check, same as v0.9.0).
+- **Windows only, gate not run** (owner decision, as v0.8.0–v0.9.1). No engine source changed since v0.9.1 (`git diff v0.9.1 -- engine/` is empty).
+- **Older release assets are deleted** (owner decision 2026-10-06): every earlier engine package carried NVRTC.
 
 ## 2026-10-05 — v0.9.1
 
