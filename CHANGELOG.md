@@ -6,6 +6,27 @@
 
 ## Unreleased
 
+## 2026-10-06 — v0.10.0
+
+**The dense 27B gets an opt-in 8.5-bit KV cache, `CROW_KV=q8`, whose quality gate is still open.** Unset `CROW_KV` compiles, maps and launches the kernels of v0.9.5; the #90 engine arm reaches the anchors above 2564.
+
+### Added
+
+- **`CROW_KV=q8`: an opt-in 8.5-bit KV cache for the dense 27B** (#88, 2026-10-06). int8 values with one f16 scale per 32 values (llama.cpp q8_0 numerics), 272 B per KV row against 512 for BF16; full attention only, a Flash-Next boot with it is refused at the boot door before the container is mapped. Computed for the 27B at 200,000 context: states 6.68 GiB against 12.40 GiB with BF16 (refused with 12.17 GiB free, 2026-10-01). Unset `CROW_KV` keeps BF16 on the 27B and FP8 on Flash-Next with the kernel source, kernel map and launches of v0.9.5: the q8 kernels live in their own `Q8KV_SRC`, appended only under `CROW_KV=q8`, and `KERNEL_SRC` / `P2_SRC` are byte-identical to v0.9.5. Five host tests (planner fit at 200k, parse and boot-door refusal, module text and per-entry PTX, f16 encoder, q8 row codec); two GPU tests (`#[ignore]`, store bytes and q8 attention against a CPU reference and the q8_0 error bound) green on the RTX 5090 with synthetic data, no model (2026-10-06).
+
+### Changed
+
+- **The #90 engine arm runs the deep anchors in the `CROW_PARITY_TAIL` form** (#90, 2026-10-06). `tools/oracle_longctx_engine_arm.sh` no longer refuses anchors above 2564: they run `decode parity` with `CROW_PARITY_TAIL` set to the plan block's 64 rows, accepted only when those rows are the last rows of the anchor's prefix ids; the trim reads `row0_pos` from `gen-sequence.json` and carves the rows with the new `tools/oracle_longctx_rows.py subset --row0`. Anchors up to 2564 and the default `--anchors "1000 2564"` keep their command. `--dry-run` prints the `decode parity` command of every anchor and arm without the lock, the engine or the GPU; on the real `row-plan.json` it prints `CROW_PARITY_TAIL=64` for 50000 and 178553 (2026-10-06). The real deep-anchor run is a GPU job and has not been run.
+
+### Fixed
+
+- **The #90 engine arm script writes its manifest and no longer deletes a dump after a failed trim** (#90, 2026-10-06). The manifest step sorted dicts, a `TypeError` with two or more runs, so `manifest.json` was never written and the script exited 1 after the dumps; it now sorts by anchor and arm. `run_one` runs under `if`, where `set -e` is off, so a failed trim, hash or plan lookup still hashed and deleted the dump and printed "plan rows written"; every step now stops the run, keeps the dump and removes a partial `plan-rows.f32`. `tools/oracle_longctx_test_engine_arm.py`, 12 tests with a stub `decode`, no GPU: 4 red before the fix, 12 of 12 green after.
+
+### Known limitations
+
+- **`CROW_KV=q8` has not passed its quality gate** (#88). KL(BF16 ‖ q8) ≤ 0.073 at six anchors, the BF16 goldens, decode tok/s and the 200k boot are a GPU job pending robin's Go (`decode_out/q8-kld/PREREG.md`, gates G1–G5, committed before any model result); not measured on the model. No test covers the MTP head and verify with q8, or the park / unpark and slot save / restore of q8 rows. Crow's 27B point stays at 131,072.
+- **Windows only, gate not run** (as v0.8.0–v0.9.5). `tools/gate-linux.sh` is not run on this release; the default path's identity rests on the kernel source and the host arithmetic, not yet on a logits hash (#88 G1).
+
 ## 2026-10-06 — v0.9.5
 
 **v0.9.4 halved Flash-Next in Crow; v0.9.5 takes `CROW_STAGE_PAR` back out of `serve`'s defaults.**
