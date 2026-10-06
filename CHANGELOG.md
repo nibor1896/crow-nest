@@ -6,6 +6,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **`CROW_RAM_MARGIN_GB` defaults to 2 GiB, was 3** (2026-10-06, `manager::RAM_MARGIN_DEFAULT_GB`). Measured on Windows with a 40 GiB page file, engine v0.9.2, Flash-Next, three cold prompts of 32,278–38,235 tokens per arm, max_tokens 1024 (`crow-lab/runs/fn-ram-margin-win-20261006`): with margin 1 and a 2.5 GiB active ballast standing in for Discord + Chrome, the boot passed at 48.24 GiB free and decode ran 40.69 / 40.26 / 41.12 tok/s, against 39.40 / 39.02 / 39.87 at margin 3 with no ballast (one run per arm, A first, so the order is not controlled); prefill 702–728 against 697–726. Free RAM fell to 59 MB in the margin-1 arm, against 1,693 MB at margin 3. At margin 3 the same desktop refused the boot (48.31 GiB free, 45.48 GiB cold tier). 2 GiB is the unmeasured middle: it boots at that desktop and keeps about 1 GiB more than margin 1. Linux is not measured with the new default.
+
 ## 2026-10-06 — v0.9.2
 
 **The engine package carries no NVIDIA file.** NVRTC comes from NVIDIA's own wheel, fetched by a script that ships beside `serve`; the three open CUDA EULA conditions of v0.9.1 no longer apply, because crow-nest redistributes nothing of NVIDIA's.

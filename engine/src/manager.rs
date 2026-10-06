@@ -137,11 +137,20 @@ pub fn planner_refusal_msg(free0: u64, host_pinned_budget: u64) -> String {
     )
 }
 
+/// The default of `CROW_RAM_MARGIN_GB`. 2 GiB since 2026-10-06 (was 3):
+/// on Windows with a page file, Flash-Next boots at 1 GiB with a loaded
+/// desktop and decodes as fast as at 3 GiB (39.0-39.9 vs 40.3-41.1 tok/s,
+/// three ~30k-token prompts per arm), but free RAM fell to 59 MB, while 3 GiB
+/// refused a boot at 48.31 GiB free. 2 GiB is the middle (crow-lab/runs/
+/// fn-ram-margin-win-20261006).
+pub const RAM_MARGIN_DEFAULT_GB: u64 = 2;
+
 /// physical RAM that must stay free after the cold tier is pinned
-/// (`CROW_RAM_MARGIN_GB`, default 3 GiB). One number for both readers: the
-/// budget derived below and the pre-pin gate in `residency::build`.
+/// (`CROW_RAM_MARGIN_GB`, default [`RAM_MARGIN_DEFAULT_GB`]). One number for
+/// both readers: the budget derived below and the pre-pin gate in
+/// `residency::build`.
 pub fn ram_margin_bytes() -> u64 {
-    env_parse::<u64>("CROW_RAM_MARGIN_GB").unwrap_or(3) << 30
+    env_parse::<u64>("CROW_RAM_MARGIN_GB").unwrap_or(RAM_MARGIN_DEFAULT_GB) << 30
 }
 
 /// The host pinned budget, DERIVED at boot instead of assumed (issue #15).
@@ -1494,5 +1503,20 @@ mod tests_300_c5 {
         assert!(lines[1].contains("binds"), "{}", lines[1]);
         let why = dense_fit(8 * G, 7 * G, G, 0, 200_000).unwrap_err();
         assert!(why.starts_with("refusing config: context 200000 needs 7.00 GiB of states"), "{why}");
+    }
+}
+
+#[cfg(test)]
+mod tests_ram_margin {
+    use super::*;
+
+    /// 2026-10-06: the default margin is 2 GiB (was 3). Without the env var the
+    /// two readers (budget, pre-pin gate) get 2 GiB.
+    #[test]
+    fn the_default_ram_margin_is_two_gib() {
+        assert_eq!(RAM_MARGIN_DEFAULT_GB, 2);
+        if std::env::var_os("CROW_RAM_MARGIN_GB").is_none() {
+            assert_eq!(ram_margin_bytes(), 2u64 << 30);
+        }
     }
 }
