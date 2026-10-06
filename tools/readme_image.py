@@ -96,10 +96,10 @@ for i, line in enumerate((
 
 # ---------------------------------------------------------------- stats
 y = 452
-STATS = [("46.0", "tok/s decode, Flash-Next, 32k"), ("780", "tok/s prefill, 100k–175k"), ("104.7 GB", "Flash-Next container file"),
+STATS = [("40", "tok/s decode in Crow, 8k"), ("780", "tok/s prefill, 100k–175k"), ("104.7 GB", "Flash-Next container file"),
          ("4.5 bpw", "NVFP4, CNQ4.5-M"), ("200k", "context, one slot"), ("1.7 GiB", "VRAM lent to Crow while idle"),
          ("120", "tok/s decode, 27B with MTP"), ("17.8 GB", "27B container file"), ("8.48 GiB", "free beside the 27B, 64k context")]
-STATS_NOTE = ("Flash-Next, one RTX 5090, Windows 2026-10-06, after the PLE fix: decode serve, greedy, CROW_STAGE_PAR; prefill cold; VRAM loan #117.",
+STATS_NOTE = ("Flash-Next, one RTX 5090, Windows 2026-10-06, after the PLE fix: decode in a live Crow session; prefill cold, 100k–175k; VRAM loan #117.",
               "27B: one RTX 5090, Linux, CROW_MMA=1 CROW_GRAPH=1, BF16 KV, 2026-09-27 (#95, #122). Conditions: docs/measurements.md, CHANGELOG.md")
 for i, (v, l) in enumerate(STATS):
     sx, sy = X0 + (i % 3) * 270, y + (i // 3) * 86
@@ -140,8 +140,8 @@ y += (len(FEATURES) + 1) // 2 * 80 + 20
 y = section(y, "Measured, not claimed.", "gold")
 MEAS = [("60 → 0", C["ok"], "corrupt tokens, live agent|run 2026-09-23 (#91)"),
         ("4/23", C["gold"], "corruption set 2026-09-23,|was 15/23; llama.cpp 4/23"),
-        ("+6.7 %", C["sub"], "decode from CROW_STAGE_PAR,|Windows serve, 2026-10-06"),
-        ("bit-identical", C["mark"], "greedy text, 24 runs in|four arms, 2026-10-06"),
+        ("37.9", C["sub"], "tok/s over a 52-request|Crow task, 2026-10-06"),
+        ("53 / 53", C["mark"], "tests green in the app|Crow built, 2026-10-06"),
         ("0.290 → 0.223", C["ok"], "27B KLD vs BF16, calibrated|scales, 2026-09-26"),
         ("120 / 123.05", C["gold"], "27B MTP decode vs llama.cpp|MTP, 2026-09-27 (#95)"),
         ("byte-identical", C["sub"], "27B MTP output against|plain decode, 2026-09-27"),
@@ -177,7 +177,7 @@ y += 24 + len(REQ) * 34 + 40
 
 # ---------------------------------------------------------------- against llama.cpp
 y = section(y, "Against llama.cpp", "mark", "same card, same models")
-OPS = [("Flash-Next decode, Windows", "46.0‡", "44.9", "tok/s"),
+OPS = [("Flash-Next decode, Windows", "43.1‡", "44.9", "tok/s"),
        ("Flash-Next prefill, Windows", "775‡", "922.5", "tok/s, cold"),
        ("Flash-Next prefill, Linux", "968†", "", "tok/s, cold, same 16k prompt"),
        ("Flash-Next decode, Linux", "35.8", "", "tok/s at 122k, after the fix"),
