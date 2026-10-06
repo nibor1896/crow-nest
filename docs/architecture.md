@@ -413,6 +413,21 @@ units, about 12 hot experts per layer), and the post-plan check below requires
   pinned cold tier grows and the 46 GiB default cap refuses the bare container (N 155 -> 136
   needs 47.3 GiB); `CROW_PINNED_BUDGET_GB` 48 bare / 52 with the dense overlay — computed from
   the MEAS-0923 boots, not measured; no serve has booted with bf16 KV yet (2026-09-23).
+  **`q8`** (#88, 2026-10-06, opt-in): llama.cpp q8_0 numerics — per 32 values d = amax / 127,
+  q = round(x / d) as int8, d stored as f16 (round to nearest even), read back as q · d. A cache row
+  (one token of one KV head, K or V) is the `AHD` int8 values followed by the `AHD / 32` f16 scales:
+  272 B at head dim 256 (`KvDtype::row_bytes`; fp8 256 B, bf16 512 B), rows in the order of the
+  other dtypes, so `kv_row_ptr`, the park stash and the slot files take it unchanged. The scale
+  sits after the values rather than in front of each block (llama.cpp's 34-byte `block_q8_0`) so the
+  value bytes keep their alignment. Full attention only: `KvDtype::kv_for` refuses it at the boot
+  door on a model with QSA attention (Flash-Next's `attn_sel*` have no q8 path). The kernels
+  `store_kv_q8`, `attn_full_split_q8` and `attn_full_fa_q8` (`kernels_p2::Q8KV_SRC`; the FA stage
+  converts int8 · scale to f16 where the e4m3 / bf16 forms convert their bytes) are compiled only
+  into a `CROW_KV=q8` module (`KernelGeo::q8kv`) and swapped in by `Kernels::arm_q8_kv` — without
+  it the module text, the kernel map and every launch are those of before #88
+  (`kernels_p2::tests_88_q8kv`). Computed for the 27B at 200,000: KV 6.49 GiB against 12.21 GiB for
+  bf16. The long-context quality gate (KL(BF16 ‖ q8) ≤ 0.073 at the six anchors) and the decode
+  speed are not measured yet.
 - **GDN recurrent state**: 36 layers, f32 (16 K / 48 V heads at 128, conv kernel 4) —
   fixed size, context-independent.
 - **QSA indexer cache**: budget 2,048 tokens, compress ratio 4 — third state kind,
@@ -2336,7 +2351,7 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
 | `qsa_ring_rows` | `ring`, which follows from the chunk |
 | `gdn_layers`, `attn_layers` | the geometry |
 | `kv_groups` (`attn_layers * 2 * NKV`) | the KV fan-out |
-| `kv_row_bytes` | `AHD * bytes per KV value`, so the KV dtype by size |
+| `kv_row_bytes` | `KvDtype::row_bytes(AHD)`: `AHD` (fp8), `2 * AHD` (bf16), `AHD + AHD / 16` (q8, #88), so the KV dtype by size |
 | `pooled_row_bytes` (`QSA_HIDD * 4`) | the pooled block row |
 | `state_bytes` | `Shape::snapshot_bytes`, the four recurrent buffers |
 | `pos` | the saved prefill-clean position, and `n_saved` on the wire |
@@ -4208,7 +4223,8 @@ not line numbers — the files move.
 3. `CROW_GRAPH`, `CROW_MMA`, `CROW_ADAPT_WINDOW` forced to `1` if unset, single-threaded,
    before the context exists; one `[serve]` line each.
 4. `boot::open_model(DEFAULT_CNQ, DEFAULT_HOTSETS)` → `CROW_KV` parsed once for all three bins
-   (#102, 2026-09-23: `bf16` / `fp8` / `fp8_e4m3`, anything else — the empty string included —
+   (#102, 2026-09-23: `bf16` / `fp8` / `fp8_e4m3`, since #88 `q8`, which `KvDtype::kv_for` refuses
+   right after `boot::model_geo` on a model without full attention; anything else — the empty string included —
    panics `[boot] refused` before the container is mapped; until then only `decode parity` read
    it, so `serve` booted FP8 under `CROW_KV=bf16`), one WARN per `CROW_*` name in the environment
    that has no row in `docs/env.md` (compiled in, names only), then `boot::model_geo`: the index
@@ -5141,6 +5157,8 @@ Flash-Next's with the SiLU gate (`CN_GATE_ACT`, C4).
   sub-block scales; `decode_out/p2-lh`), KLD 0.223 against BF16 (was 0.290 with `--scales mse`).
 - **KV dtype.** An unset `CROW_KV` takes `Family::default_kv`: BF16 for the dense family (FP8 failed
   the long-context KLD criterion, 5 of 6 anchors), FP8 e4m3 for Flash-Next (values of record).
+  `CROW_KV=q8` (#88) is the opt-in 8.5-bit cache for the dense family (section 2.5), meant to carry
+  the 27B to 200,000 context once its long-context gate passes; not measured on the model yet.
 
 ## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
 
