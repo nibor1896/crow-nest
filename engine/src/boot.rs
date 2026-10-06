@@ -46,6 +46,9 @@ pub unsafe fn open_model(
     // `hparams`) and every host site reads its numbers from it.
     // C5: the same door refuses a family at its first unbuilt block (`Geo::built`).
     let geo = model_geo(&cnq_path);
+    // #88: the dtype this model takes; CROW_KV=q8 exists for full attention only and a boot of
+    // any other model dies here, by name, before the container is mapped and before any CUDA work
+    let kv_dtype = KvDtype::kv_for(&geo, kv).unwrap_or_else(|why| panic!("[boot] refused: {why}"));
     // C5: the hot-set sidecar belongs to the MoE arm; a family without routed
     // experts reads none, so CROW_HOTSETS is not required there (a set one is named
     // and ignored)
@@ -96,8 +99,8 @@ pub unsafe fn open_model(
         .unwrap_or_else(|why| panic!("[boot] refused: {why}"));
     let ctx = cuda::Ctx::init();
     // Crow #300 phase 2: unset CROW_KV takes the family's default (Flash-Next FP8, the dense
-    // family BF16, `Family::default_kv`)
-    let cfg = Config { context, kv: kv.unwrap_or(geo.family.default_kv()), ..Config::default() };
+    // family BF16, `Family::default_kv`; resolved above by `KvDtype::kv_for`)
+    let cfg = Config { context, kv: kv_dtype, ..Config::default() };
     tracing::info!(target: "boot", "[boot] kv cache dtype {} ({})", cfg.kv.name(),
         if kv.is_some() { "CROW_KV".to_string() } else { format!("default of family {:?}, CROW_KV unset", geo.family) });
     (cnq, ctx, cfg, cnq_path, sidecar, geo)

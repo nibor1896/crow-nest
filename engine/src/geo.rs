@@ -131,31 +131,61 @@ pub const QSA_HIDD: usize = 128; // indexer raw key width
 pub enum KvDtype {
     Fp8E4m3,
     Bf16,
+    /// #88: q8_0 numerics (llama.cpp `block_q8_0`): int8 values with one f16 scale per
+    /// 32 values, 8.5 bit per value. Opt-in (`CROW_KV=q8`), full attention only
+    /// (`kv_for`); the row layout is `kernels_p2::Q8KV_SRC`'s
+    Q8Block,
 }
 
 impl KvDtype {
-    pub fn byte_per_value(self) -> usize {
+    /// the bytes of one KV cache row (one token of one KV head, K or V) of
+    /// `head_dim` values: `head_dim` x 1 (fp8) or x 2 (bf16); #88 q8: the
+    /// `head_dim` int8 values, then one f16 scale per 32 of them (272 B at 256)
+    pub fn row_bytes(self, head_dim: usize) -> usize {
         match self {
-            KvDtype::Fp8E4m3 => 1,
-            KvDtype::Bf16 => 2,
+            KvDtype::Fp8E4m3 => head_dim,
+            KvDtype::Bf16 => head_dim * 2,
+            KvDtype::Q8Block => head_dim + head_dim / 32 * 2,
         }
     }
     pub fn name(self) -> &'static str {
         match self {
             KvDtype::Fp8E4m3 => "fp8_e4m3",
             KvDtype::Bf16 => "bf16",
+            KvDtype::Q8Block => "q8",
         }
     }
 
     /// The one parser of a KV dtype word (#102). `bf16`, `fp8` and `fp8_e4m3`
-    /// (the `name()` spelling, so a logged value round-trips), ASCII case
+    /// (the `name()` spelling, so a logged value round-trips), #88 `q8`, ASCII case
     /// ignored. Anything else, the empty string included, is an error that
     /// names the accepted words: a typo must not silently fall back to FP8.
     pub fn parse(s: &str) -> Result<KvDtype, String> {
         match s.to_ascii_lowercase().as_str() {
             "bf16" => Ok(KvDtype::Bf16),
             "fp8" | "fp8_e4m3" => Ok(KvDtype::Fp8E4m3),
-            _ => Err(format!("CROW_KV={s:?} is not a KV dtype; accepted: bf16, fp8, fp8_e4m3 (unset = the family's default, Family::default_kv)")),
+            "q8" => Ok(KvDtype::Q8Block),
+            _ => Err(format!("CROW_KV={s:?} is not a KV dtype; accepted: bf16, fp8, fp8_e4m3, q8 (unset = the family's default, Family::default_kv)")),
+        }
+    }
+
+    /// #88: the KV dtype a boot of `geo` takes: `CROW_KV` if set (`from_env_value`), else
+    /// the family's default. `q8` is refused on a model whose attention is not
+    /// `Attn::Full`: its kernels exist for the full-attention path only, and Flash-Next's
+    /// `attn_sel*` read the cache by `mode` with no q8 arm. Pure, so the rule is tested
+    /// without the process environment.
+    pub fn kv_for(geo: &Geo, kv: Option<KvDtype>) -> Result<KvDtype, String> {
+        match kv {
+            None => Ok(geo.family.default_kv()),
+            Some(KvDtype::Q8Block) if !matches!(geo.attn, Attn::Full) => Err(format!(
+                "CROW_KV=q8 is built for full attention only (the dense family); family {:?} reads its KV cache through the QSA attention kernels, which have no q8 path - use bf16 or fp8",
+                geo.family
+            )),
+            Some(KvDtype::Q8Block) if !geo.head_dim.is_multiple_of(32) => Err(format!(
+                "CROW_KV=q8 needs a head dim that is a multiple of 32 (one f16 scale per 32 values); this model's is {}",
+                geo.head_dim
+            )),
+            Some(k) => Ok(k),
         }
     }
 

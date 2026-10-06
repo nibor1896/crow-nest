@@ -48,7 +48,7 @@
 //!     64     8  gdn_layers
 //!     72     8  attn_layers
 //!     80     8  kv_groups        (attn_layers * 2 * Geo::kv_heads)
-//!     88     8  kv_row_bytes     (Geo::head_dim * bytes per KV value)
+//!     88     8  kv_row_bytes     (KvDtype::row_bytes(Geo::head_dim): head_dim x 1 fp8, x 2 bf16, #88 q8 + head_dim / 16)
 //!     96     8  pooled_row_bytes (the QSA raw key width * 4)
 //!    104     8  state_bytes      (Shape::snapshot_bytes, the four recurrent buffers)
 //!    112     8  pos
@@ -469,7 +469,7 @@ pub fn live_header(eng: &Engine, cache: &PrefixCache, model_path: &str) -> Heade
         gdn_layers: shape.gdn_layers as u64,
         attn_layers: shape.attn_layers as u64,
         kv_groups: (shape.attn_layers * 2 * geo.kv_heads) as u64,
-        kv_row_bytes: (geo.head_dim * eng.st.kv.byte_per_value()) as u64,
+        kv_row_bytes: eng.st.kv.row_bytes(geo.head_dim) as u64,
         pooled_row_bytes: crate::cache::pooled_row_bytes(geo) as u64,
         state_bytes: shape.snapshot_bytes() as u64,
         pos: 0,
