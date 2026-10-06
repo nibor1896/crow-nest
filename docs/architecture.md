@@ -2075,7 +2075,9 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
   re-send rolls back onto it and prefills nothing. A slot filled from a slot file has no row
   and keeps the guard. #101: a rollback onto `P` forgets every slot above `P`, and a snapshot
   at a held position replaces that slot instead of adding a duplicate (`cache.rs` module doc,
-  "Slot bookkeeping").
+  "Slot bookkeeping"). A parked slot (#118) names another history and is not forgotten.
+  `tools/cache_stale_rollbacks.py` replays `engine.log` files for a slot that outlived its
+  rollback; it reads the `reusable` list, not `snapshots`, so parked slots do not count.
 
 **Images (#114, 2026-09-24):**
 

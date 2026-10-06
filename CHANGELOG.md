@@ -6,6 +6,14 @@
 
 ## Unreleased
 
+### Added
+
+- **`tools/cache_stale_rollbacks.py`** (#101, 2026-10-06): replays `engine.log` files (a log, a folder with its rotated `.gz` files) and reports every prefix-cache snapshot a later request still lists or restores after a rollback below it. It reads `reusable`, so the slots of a parked conversation (#118) are not counted. Six unit tests, among them the 2026-09-22 defect from #101 (found) and a parked conversation from 2026-10-02 (not counted).
+
+### Measured
+
+- **No stale rollback in the Windows logs, and none possible to see there** (#101, 2026-10-06): the replay over robin's six engine logs of 2026-10-02 to 2026-10-06 (`%LOCALAPPDATA%\Crow\logs`, 106 decisions, 82 WARM; the Flash-Next Todo-CLI run, 52 decisions, 51 WARM) finds 0 violations, but also 0 rollbacks below the newest reusable snapshot, the only case #101 changes. The fix (`9e46fc1`, since v0.4.0) stays verified by `cache::tests::a_rollback_forgets_every_snapshot_above_its_point` alone: red without the forgetting loop, green with it, at `b812d9e`.
+
 ### Changed
 
 - **`CROW_RAM_MARGIN_GB` defaults to 2 GiB, was 3** (2026-10-06, `manager::RAM_MARGIN_DEFAULT_GB`). Measured on Windows with a 40 GiB page file, engine v0.9.2, Flash-Next, three cold prompts of 32,278–38,235 tokens per arm, max_tokens 1024 (`crow-lab/runs/fn-ram-margin-win-20261006`): with margin 1 and a 2.5 GiB active ballast standing in for Discord + Chrome, the boot passed at 48.24 GiB free and decode ran 40.69 / 40.26 / 41.12 tok/s, against 39.40 / 39.02 / 39.87 at margin 3 with no ballast (one run per arm, A first, so the order is not controlled); prefill 702–728 against 697–726. Free RAM fell to 59 MB in the margin-1 arm, against 1,693 MB at margin 3. At margin 3 the same desktop refused the boot (48.31 GiB free, 45.48 GiB cold tier). 2 GiB is the unmeasured middle: it boots at that desktop and keeps about 1 GiB more than margin 1. Linux is not measured with the new default.
