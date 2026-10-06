@@ -234,3 +234,47 @@ The runner's selftest, written after the rule and before the commit: head of ANO
 ("Ein Plakat, das eine Ausstellung …", 56.1 s); B cut and called `write_file` (46.4 s). Not
 counted (different head, selftest directory). It is the harm criterion d exists for; the +1
 allowance in d was written before it was seen and stays.
+
+---
+
+# AMENDMENT 4 — 2026-10-06, Flash-Next's 1024, before any round of it
+
+Cause: every result above is the 27B's and says so ("Flash-Next's 1024 is not decided by this
+series"). The 2026-10-06 handover names it as measurement c of the Flash-Next operating point;
+robin chose it on 2026-10-06 ("Weiter mit c, dann b"). Seen so far on Flash-Next with this
+session: nothing.
+
+## Operating point
+- Qwen3.8-Flash-Next CNQ4.5-M via `%LOCALAPPDATA%\Crow\bin\serve.exe` (crow-nest build
+  `298f7cd`, code-equal on Windows to v0.9.3), the installed container and sidecar crow0924,
+  `CROW_RAM_MARGIN_GB` unset (1 GiB default), n_ctx 200,000 (serve's default for this model),
+  tool grammar on, robin's Windows machine (RTX 5090), `serve.exe` the only GPU process.
+- The body the installed Crow builds (`%LOCALAPPDATA%\Crow\cli\crow_core.py`, sha256 in
+  plan.json), `--served-name auto` -> manifest entry `flash-next-cnq45-m`
+  (reasoning_budget 1024, reasoning_fixed high). That crow_core carries Crow `12b88fb`'s rule:
+  the budget sentence follows the last message (after a tool result B, otherwise A).
+
+## Data and design
+- Same session as Amendment 1 (`session-0915.json`, sha256 pinned above), same arms
+  (A1024 = manifest 1024, B2048 = `reasoning_budget_tokens` 2048), same seeds 0..7 + greedy,
+  ABBA by seed, a warm-up per point.
+- Screening: the SAME 17 candidate turns the 27B screened (K = 10 ... 47), one A1024 round at
+  seed 100 each; the points = the turns the budget closed, at most 5, spread as in Amendment 1.
+  The list is cut at K 47 (not at Flash-Next's larger window) so the two models are screened on
+  the same turns and the series stays under ~2 h. Zero closes -> "1024 does not bind on
+  Flash-Next in this session", no counted rounds.
+- `max_tokens` 16,384 as Crow sends it; a point is IN when prompt + 16,384 <= 200,000.
+- Output `decode_out/meas-245/flashnext/`.
+
+## Metrics and decision rule
+Unchanged from the PREREG and Amendment 1 (no-call, corrupt, schema-wrong, budget closes,
+reasoning chunks, s/round). 2048 replaces 1024 in `flash-next-cnq45-m` only if, summed over
+the points: no-call(2048) <= no-call(1024), corrupt(2048) <= corrupt(1024), median
+s/round(2048) <= 1.5 x median(1024). Otherwise 1024 stays, with this series as its
+`_reasoning_budget_status`. Changing the manifest is robin's decision either way.
+
+## Stated limits, before the result
+n = 9 per point and arm; one session (robin's 27B-era work of 2026-09-15, replayed on
+Flash-Next), one day, one machine; Windows paths, so home_mismatch / digit_near_miss cannot
+fire. The installed Crow (3.2.4) differs from v2.8.4 in more than the sentence rule; its
+crow_core sha256 is recorded.
