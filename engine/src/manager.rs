@@ -137,13 +137,15 @@ pub fn planner_refusal_msg(free0: u64, host_pinned_budget: u64) -> String {
     )
 }
 
-/// The default of `CROW_RAM_MARGIN_GB`. 2 GiB since 2026-10-06 (was 3):
-/// on Windows with a page file, Flash-Next boots at 1 GiB with a loaded
-/// desktop and decodes as fast as at 3 GiB (39.0-39.9 vs 40.3-41.1 tok/s,
-/// three ~30k-token prompts per arm), but free RAM fell to 59 MB, while 3 GiB
-/// refused a boot at 48.31 GiB free. 2 GiB is the middle (crow-lab/runs/
-/// fn-ram-margin-win-20261006).
-pub const RAM_MARGIN_DEFAULT_GB: u64 = 2;
+/// The default of `CROW_RAM_MARGIN_GB`. 1 GiB since 2026-10-06 (was 3),
+/// robin's decision: on Windows with a page file, Flash-Next boots at 1 GiB
+/// with a loaded desktop and decodes as fast as at 3 GiB (40.3-41.1 vs
+/// 39.0-39.9 tok/s, three ~30k-token prompts per arm; free RAM fell to 59 MB),
+/// while 3 GiB refused a boot at 48.31 GiB free and 2 GiB refused three boots
+/// at 12:23-12:29 the same day (46.97-48.13 GiB free at the start; the load
+/// itself takes ~1.4 GiB after the budget check). crow-lab/runs/fn-ram-margin-win-20261006,
+/// fn-boot-refusals-win-20261006.
+pub const RAM_MARGIN_DEFAULT_GB: u64 = 1;
 
 /// physical RAM that must stay free after the cold tier is pinned
 /// (`CROW_RAM_MARGIN_GB`, default [`RAM_MARGIN_DEFAULT_GB`]). One number for
@@ -1510,13 +1512,13 @@ mod tests_300_c5 {
 mod tests_ram_margin {
     use super::*;
 
-    /// 2026-10-06: the default margin is 2 GiB (was 3). Without the env var the
-    /// two readers (budget, pre-pin gate) get 2 GiB.
+    /// 2026-10-06: the default margin is 1 GiB (was 3; 2 for a few hours).
+    /// Without the env var the two readers (budget, pre-pin gate) get 1 GiB.
     #[test]
-    fn the_default_ram_margin_is_two_gib() {
-        assert_eq!(RAM_MARGIN_DEFAULT_GB, 2);
+    fn the_default_ram_margin_is_one_gib() {
+        assert_eq!(RAM_MARGIN_DEFAULT_GB, 1);
         if std::env::var_os("CROW_RAM_MARGIN_GB").is_none() {
-            assert_eq!(ram_margin_bytes(), 2u64 << 30);
+            assert_eq!(ram_margin_bytes(), 1u64 << 30);
         }
     }
 }
