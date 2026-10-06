@@ -56,8 +56,9 @@
 //! |---|---|
 //! | `CROW_GRAPH`, `CROW_MMA` | default 1 in serve (the gated configuration); env overrides |
 //! | `CROW_ADAPT_WINDOW` | default 1 in serve (the trickle's ranking signal); env overrides |
+//! | `CROW_STAGE_PAR` | default 1 in serve (cold staging on a side stream, 2026-10-06: +6.7 % decode on Windows, text bit-identical); env overrides |
 //!
-//! - All three are set in `main` BEFORE `cuda::Ctx::init` and before the first kernel call.
+//! - All four are set in `main` BEFORE `cuda::Ctx::init` and before the first kernel call.
 //! - `gen.rs` reads graph and mma once through a `OnceLock`, so the order is the whole contract.
 //! - `CROW_ADAPT_WINDOW` is read per tick (`gen.rs:3048`, `gen.rs:3066`), always after this point.
 //! - Only an unset variable is set; an explicit `CROW_GRAPH=0` still turns graphs off.
@@ -71,7 +72,7 @@
 //! - The tick runs only when the policy asked for the stream trickle with `every > 0`.
 //! - #37 fix round 1: `serve` sets `CROW_ADAPT_WINDOW=1` when unset, so the tick ranks swaps
 //!   by the decayed selections since the last tick, not by the prefill-dominated cumulative count.
-//! - The three variables `serve` sets when unset: `CROW_GRAPH`, `CROW_MMA`, `CROW_ADAPT_WINDOW`.
+//! - The four variables `serve` sets when unset: `CROW_GRAPH`, `CROW_MMA`, `CROW_ADAPT_WINDOW`, `CROW_STAGE_PAR`.
 //! - Two `trickle_tick` preconditions (`gen.rs:3128-3129`) are checked ONCE at start, not per token.
 //! - One stderr line after the policy line says whether this process ticks and why.
 //! - Per request the swaps go to the `[chat]` line as `crow_trickle_swaps`; the wire is untouched.
@@ -5791,7 +5792,12 @@ fn main() {
     // run inside a request, long after this point. Unset it ranks the trickle's swaps by
     // `drain_sel_counts`, the count CUMULATIVE since process start, which a 16,064 token prefill
     // dominates; the measured cost was -19.2 % against the adjacent `decode run` D1 (#37 block B).
-    for key in ["CROW_GRAPH", "CROW_MMA", "CROW_ADAPT_WINDOW"] {
+    //
+    // #19j, 2026-10-06: CROW_STAGE_PAR joins them. It issues `stage_cold_ca` on a side stream so the
+    // shared-expert chain overlaps the PCIe copy; the copy is pure, so the ids do not change. Measured
+    // in serve on Windows (Flash-Next, 32k prompt, greedy, 1024 tokens, 2 boots x 3 warm runs per arm,
+    // `crow-lab/runs/fn-flags-win-20261006`): 43.08 -> 45.97 tok/s mean, same text in all 24 runs.
+    for key in ["CROW_GRAPH", "CROW_MMA", "CROW_ADAPT_WINDOW", "CROW_STAGE_PAR"] {
         if std::env::var_os(key).is_none() {
             std::env::set_var(key, "1");
         }

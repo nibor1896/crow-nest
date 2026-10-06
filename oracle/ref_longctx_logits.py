@@ -250,7 +250,10 @@ class PleRef(torch.nn.Module):
         self.streams = self.key_proj.shape[0] // self.hidden  # key: [streams*hidden, ...]
 
     def rms(self, x, w):
-        return torch.nn.functional.rms_norm(x, (x.shape[-1],), (1 + w), eps=1e-6)
+        # #138: Qwen4ExpTextRMSNorm(group_size=hidden_size) - one RMS per stream (2,560 values
+        # in the real checkpoint), not one over all streams (tools/test_oracle_ple_norm.py)
+        xg = x.reshape(*x.shape[:-1], -1, self.hidden)
+        return (xg * torch.rsqrt(xg.pow(2).mean(-1, keepdim=True) + 1e-6)).flatten(-2) * (1 + w)
 
     def gather_rows(self, uids_chunk):
         """[chunk, 16] uids -> [chunk, 16, emb] rows, read from the shards on demand."""

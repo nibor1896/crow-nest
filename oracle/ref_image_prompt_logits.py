@@ -186,7 +186,10 @@ class PleRef(torch.nn.Module):
         self.conv1d = fetch(P + "conv1d.weight", 4, 2560, 4).float()
 
     def rms(self, x, w):
-        return torch.nn.functional.rms_norm(x, (x.shape[-1],), (1 + w), eps=1e-6)
+        # #138: Qwen4ExpTextRMSNorm(group_size=hidden_size) - one RMS per 2,560-value stream,
+        # not one over all four streams (tools/test_oracle_ple_norm.py)
+        xg = x.reshape(*x.shape[:-1], -1, 2560)
+        return (xg * torch.rsqrt(xg.pow(2).mean(-1, keepdim=True) + 1e-6)).flatten(-2) * (1 + w)
 
     def forward(self, hidden, ids_in):
         T = hidden.shape[1]

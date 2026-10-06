@@ -43,6 +43,9 @@ SERIES = {
     "sentence": {"arms": {"SA1024": {}, "SB1024": {"reasoning_budget_message": SENT_B}},
                  "seeds": list(range(32)) + ["greedy"], "points": [10, 45],
                  "out": os.path.join(HERE, "sentence"), "decide": "decide_sentence"},
+    # PREREG Amendment 4: Flash-Next CNQ4.5-M, n_ctx 200,000, the 27B's 17 screening turns (K <= 47)
+    "fnbudget": {"arms": ARMS, "seeds": SEEDS, "points": None, "out": os.path.join(HERE, "flashnext"),
+                 "decide": "decide_budget", "n_ctx": 200000, "screen_max_k": 47, "model": "Flash-Next"},
 }
 
 
@@ -114,11 +117,12 @@ def spread(ks, n=MAX_POINTS):
     return [ks[round(i * (len(ks) - 1) / (n - 1))] for i in range(n)]
 
 
-def screen(session, out_dir, limit=None):
+def screen(session, out_dir, limit=None, max_k=None):
     """Steps 2-4: warm-up per candidate for its prompt size (the first that does not fit ends
     the list), one arm-A round at SCREEN_SEED, the points = the rounds the budget closed."""
     rows, closers = [], []
-    for k in candidates(session, SCREEN_MIN_K)[:limit]:
+    ks = [k for k in candidates(session, SCREEN_MIN_K) if max_k is None or k <= max_k]
+    for k in ks[:limit]:
         warm = probe(session, k, 0, {"max_tokens": 1}, "warm-K%d" % k, out_dir)
         rd = (warm.get("rounds_detail") or [{}])[0] if "error" not in warm else {}
         ptok = rd.get("prompt_tokens")
@@ -142,6 +146,10 @@ def screen(session, out_dir, limit=None):
 
 
 def run(args):
+    global N_CTX, FIT
+    series = SERIES[args.series]
+    N_CTX = series.get("n_ctx", N_CTX)
+    FIT = N_CTX - MAX_TOKENS
     out_dir = args.out
     os.makedirs(out_dir, exist_ok=True)
     session = args.session
@@ -151,22 +159,21 @@ def run(args):
     procs = gpu_processes()
     if len([p for p in procs if p.startswith("serve ")]) != 1 or len(procs) != 1:
         sys.exit("PREREG: exactly one serve.exe and nothing else - found %s" % procs)
-    series = SERIES[args.series]
     arms, names = series["arms"], list(series["arms"])
     seeds = series["seeds"][:args.rounds_per_arm] if args.rounds_per_arm else series["seeds"]
     if args.points is None:
         args.points = series["points"]
-    plan = {"series": args.series, "started_utc": now(), "session": session, "session_sha256": sha,
+    plan = {"series": args.series, "n_ctx": N_CTX, "started_utc": now(), "session": session, "session_sha256": sha,
             "crow_core_sha256": sha256(CROW_CORE), "probe_sha256": sha256(PROBE),
             "processes_before": procs, "points": {}, "arms": arms, "seeds": seeds}
     print("series start %s, processes %s" % (plan["started_utc"], procs), flush=True)
     if args.points is None:
-        rows, closers, points = screen(session, out_dir, args.screen_limit)
+        rows, closers, points = screen(session, out_dir, args.screen_limit, series.get("screen_max_k"))
         plan["screening"] = {"seed": SCREEN_SEED, "rows": rows, "closers": closers, "points": points}
         print("screening: %d rounds, %d closed %s -> points %s" % (
             sum(1 for r in rows if not r.get("end")), len(closers), closers, points), flush=True)
         if not points:
-            print("PREREG Amendment 1 step 4: 1024 does not bind on the 27B in this session", flush=True)
+            print("PREREG step 4: 1024 does not bind on the %s in this session" % series.get("model", "27B"), flush=True)
         args.points = points
     for k in args.points:
         warm = probe(session, k, 0, {"max_tokens": 1}, "warm-K%d" % k, out_dir)
@@ -468,7 +475,8 @@ def main():
     ap.add_argument("--screen-limit", type=int, default=None, help="--selftest only: screen the first N candidates")
     ap.add_argument("--series", choices=sorted(SERIES) + ["notools"], default="budget",
                     help="budget = 1024 vs 2048 (PREREG + Amendment 1); sentence = A vs B at 1024 "
-                         "(Amendment 2); notools = A vs B on turns that need no tool (Amendment 3)")
+                         "(Amendment 2); notools = A vs B on turns that need no tool (Amendment 3); "
+                         "fnbudget = 1024 vs 2048 on Flash-Next (Amendment 4)")
     ap.add_argument("--prompt-limit", type=int, default=None, help="--selftest only (notools)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()

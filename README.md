@@ -48,7 +48,7 @@ engine/target/release/serve.exe --port 8099
 **Windows engine without building** (`serve.exe` from the release, NVRTC from NVIDIA's own wheel)
 
 ```powershell
-irm https://github.com/nibor1896/crow-nest/releases/download/v0.9.3/crow-nest-engine-0.9.3-win-x64.zip -OutFile engine.zip; Expand-Archive engine.zip crow-nest-engine
+irm https://github.com/nibor1896/crow-nest/releases/download/v0.9.4/crow-nest-engine-0.9.4-win-x64.zip -OutFile engine.zip; Expand-Archive engine.zip crow-nest-engine
 powershell -ExecutionPolicy Bypass -File crow-nest-engine\fetch-nvrtc.ps1 -Target crow-nest-engine   # NVRTC 13.3.33 from NVIDIA's PyPI wheel, verified; the zip holds no NVIDIA file
 $env:CROW_CNQ = "converter\Qwen3.8-27B-CNQ4.5.cnq"; crow-nest-engine\serve.exe --port 8099
 ```

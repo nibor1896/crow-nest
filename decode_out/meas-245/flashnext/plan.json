@@ -1,0 +1,239 @@
+{
+ "series": "fnbudget",
+ "n_ctx": 200000,
+ "started_utc": "2026-10-06T12:15:49.085Z",
+ "session": "C:\\Users\\robin\\dev\\crow-nest\\decode_out\\meas-245\\session-0915.json",
+ "session_sha256": "6ee99879f3982c78e5a5e9118ef50e57834d89201d6393bec15c76fc0f46a834",
+ "crow_core_sha256": "d91214a34e03c0cf9e2cfd4028738b0e06f9ea2d0b792cd6ec2643cac36a3fd0",
+ "probe_sha256": "f075229d2683d0d83227bf6882c5571aa871ecf6c8943da29fcb87f1bb354c80",
+ "processes_before": [
+  "serve 13168"
+ ],
+ "points": {
+  "10": {
+   "in": true,
+   "prompt_tokens": 16875
+  },
+  "13": {
+   "in": true,
+   "prompt_tokens": 17707
+  },
+  "32": {
+   "in": true,
+   "prompt_tokens": 33064
+  },
+  "45": {
+   "in": true,
+   "prompt_tokens": 38957
+  }
+ },
+ "arms": {
+  "A1024": {},
+  "B2048": {
+   "reasoning_budget_tokens": 2048
+  }
+ },
+ "seeds": [
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  "greedy"
+ ],
+ "screening": {
+  "seed": 100,
+  "rows": [
+   {
+    "k": 10,
+    "prompt_tokens": 16875,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 1042,
+    "budget_closed": true,
+    "seconds": 34.1,
+    "error": null
+   },
+   {
+    "k": 13,
+    "prompt_tokens": 17707,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 1038,
+    "budget_closed": true,
+    "seconds": 43.4,
+    "error": null
+   },
+   {
+    "k": 16,
+    "prompt_tokens": 18683,
+    "n_calls": 2,
+    "finish": "tool_calls",
+    "reasoning_chunks": 359,
+    "budget_closed": false,
+    "seconds": 13.2,
+    "error": null
+   },
+   {
+    "k": 18,
+    "prompt_tokens": 20286,
+    "n_calls": 2,
+    "finish": "tool_calls",
+    "reasoning_chunks": 186,
+    "budget_closed": false,
+    "seconds": 8.2,
+    "error": null
+   },
+   {
+    "k": 21,
+    "prompt_tokens": 22889,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 295,
+    "budget_closed": false,
+    "seconds": 9.0,
+    "error": null
+   },
+   {
+    "k": 23,
+    "prompt_tokens": 23969,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 113,
+    "budget_closed": false,
+    "seconds": 4.5,
+    "error": null
+   },
+   {
+    "k": 25,
+    "prompt_tokens": 24906,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 278,
+    "budget_closed": false,
+    "seconds": 9.3,
+    "error": null
+   },
+   {
+    "k": 27,
+    "prompt_tokens": 25590,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 602,
+    "budget_closed": false,
+    "seconds": 18.1,
+    "error": null
+   },
+   {
+    "k": 30,
+    "prompt_tokens": 26948,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 198,
+    "budget_closed": false,
+    "seconds": 7.9,
+    "error": null
+   },
+   {
+    "k": 32,
+    "prompt_tokens": 33064,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 1038,
+    "budget_closed": true,
+    "seconds": 27.8,
+    "error": null
+   },
+   {
+    "k": 34,
+    "prompt_tokens": 33611,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 336,
+    "budget_closed": false,
+    "seconds": 10.7,
+    "error": null
+   },
+   {
+    "k": 36,
+    "prompt_tokens": 34138,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 35,
+    "budget_closed": false,
+    "seconds": 2.9,
+    "error": null
+   },
+   {
+    "k": 38,
+    "prompt_tokens": 34771,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 90,
+    "budget_closed": false,
+    "seconds": 5.4,
+    "error": null
+   },
+   {
+    "k": 40,
+    "prompt_tokens": 34939,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 330,
+    "budget_closed": false,
+    "seconds": 11.8,
+    "error": null
+   },
+   {
+    "k": 42,
+    "prompt_tokens": 35406,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 752,
+    "budget_closed": false,
+    "seconds": 25.1,
+    "error": null
+   },
+   {
+    "k": 45,
+    "prompt_tokens": 38957,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 1038,
+    "budget_closed": true,
+    "seconds": 28.6,
+    "error": null
+   },
+   {
+    "k": 47,
+    "prompt_tokens": 40525,
+    "n_calls": 1,
+    "finish": "tool_calls",
+    "reasoning_chunks": 217,
+    "budget_closed": false,
+    "seconds": 7.6,
+    "error": null
+   }
+  ],
+  "closers": [
+   10,
+   13,
+   32,
+   45
+  ],
+  "points": [
+   10,
+   13,
+   32,
+   45
+  ]
+ },
+ "finished_utc": "2026-10-06T12:59:21.018Z",
+ "processes_after": [
+  "serve 13168"
+ ],
+ "engine_log_lines": 1904
+}

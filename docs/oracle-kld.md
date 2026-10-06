@@ -22,6 +22,12 @@ GGUF this project keeps comparing itself against — on the SAME reference rows.
 >    ue4m3 NaN encoder fix (`5c6891a`).
 > 3. `CROW_QFUSE` became opt-in (exact `1`).
 >
+> 4. **The references themselves carry an error (#138, found 2026-10-06).** `PleRef` in
+>    `oracle/ref_engine_logits.py` normalized the PLE layer's three RMS norms over all 10,240
+>    values instead of per 2,560-value stream (transformers `group_size=hidden_size`). Every
+>    reference in this document was produced with that error; the fixed script has not been
+>    re-run, because the original checkpoint is not on this machine.
+>
 > The `none` arm below is therefore the OLD default. The tables are records of that engine, not
 > of the current one. What they rule in or out is restated in 7.3 and 7.4.
 
