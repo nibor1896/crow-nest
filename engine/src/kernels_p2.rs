@@ -1176,12 +1176,17 @@ mod tests_88_q8kv_gpu {
     /// at std 0.01). The run read 3.643e-2 (mean 1.416e-3) while both q8 kernels matched their
     /// CPU reference over the stored values (8.1e-4 / 4.9e-7): the q8_0 format's own error on
     /// rows whose 32-value K block holds a 20.0 outlier (a 10x coarser step for the other 31
-    /// values), which the guess underestimated. The check is now the format's exact error
-    /// bound per output, against the f64 attention over the ORIGINAL f32 K / V: with
-    /// M = max_j |s'_j - s_j| (scores of the q8 K minus those of the f32 K), every softmax
-    /// weight moves by at most a factor e^(+-2M), so |o' - o| <= max_j |V'_j - V_j| +
-    /// (e^(2M) - 1) * (max_j V_j - min_j V_j) / 2 per output, plus the kernel's 5e-3. The q8
-    /// against bf16 difference is printed, not judged.
+    /// values), which the guess underestimated. The check is now the worst case the q8_0
+    /// format guarantees, per output, against the f64 attention over the ORIGINAL f32 K / V,
+    /// computed from the original values alone: a stored value is off by at most
+    /// d(a) = a * (0.5 / 127 + 1e-3) for its block's amax a (half a step plus the f16 rounding
+    /// of the scale, the bound `store_kv_q8_writes_the_cpu_reference_bytes_and_nothing_else`
+    /// holds the bytes to), so a score moves by at most M = 0.0625 * sum_blocks d(a_K) *
+    /// sum |q| over the block, every softmax weight by at most a factor e^(+-2M), and
+    /// |o' - o| <= max_j d(a_V) + (e^(2M) - 1) * (max_j V_j - min_j V_j) / 2, plus the
+    /// kernel's 5e-3. Loose by design (it catches a broken format - a wrapped int8, a wrong
+    /// scale - while the two checks above judge the kernels tightly); the q8 against bf16
+    /// difference is printed, not judged. Every error measure counts a NaN as infinite.
     #[test]
     #[ignore = "needs the GPU: cargo test --release tests_88_q8kv_gpu -- --ignored --nocapture"]
     fn q8_attention_matches_the_cpu_reference_and_the_q8_format_bound() {
@@ -1230,13 +1235,18 @@ mod tests_88_q8kv_gpu {
                 let z: f64 = p.iter().sum();
                 p.into_iter().map(|v| v / z).collect()
             };
+            // the q8_0 guarantee of one stored value, per 32-value block of an original row
+            let delta = |row: &[f32]| -> Vec<f64> {
+                row.chunks(32).map(|b| b.iter().fold(0f32, |m, v| m.max(v.abs())) as f64 * (0.5 / 127.0 + 1e-3)).collect()
+            };
+            let (dk, dvb): (Vec<Vec<f64>>, Vec<Vec<f64>>) = (ko.iter().map(|r| delta(r)).collect(), vo.iter().map(|r| delta(r)).collect());
             for kvh in 0..nkv {
-                // running over the keys 0..=i: max |V' - V|, max V, min V per dim
+                // running over the keys 0..=i: the largest guaranteed V error, max V, min V per dim
                 let (mut dv, mut vmax, mut vmin) = (vec![0f64; ahd], vec![f64::MIN; ahd], vec![f64::MAX; ahd]);
                 for i in 0..n {
                     for e in 0..ahd {
-                        let (v, v8) = (vo[kvh * n + i][e] as f64, vd[kvh * n + i][e] as f64);
-                        dv[e] = dv[e].max((v8 - v).abs());
+                        let v = vo[kvh * n + i][e] as f64;
+                        dv[e] = dv[e].max(dvb[kvh * n + i][e / 32]);
                         vmax[e] = vmax[e].max(v);
                         vmin[e] = vmin[e].min(v);
                     }
@@ -1245,7 +1255,11 @@ mod tests_88_q8kv_gpu {
                         let dot = |k: &[f32]| k.iter().zip(qh).map(|(&k, &x)| k as f64 * x as f64).sum::<f64>() * 0.0625;
                         let s8: Vec<f64> = (0..=i).map(|j| dot(&kd[kvh * n + j])).collect();
                         let s: Vec<f64> = (0..=i).map(|j| dot(&ko[kvh * n + j])).collect();
-                        let m = s8.iter().zip(&s).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+                        // the largest score shift the format allows: sum over blocks of d(a_K) * sum |q|
+                        let qabs: Vec<f64> = qh.chunks(32).map(|b| b.iter().map(|x| x.abs() as f64).sum()).collect();
+                        let m = (0..=i)
+                            .map(|j| dk[kvh * n + j].iter().zip(&qabs).map(|(d, a)| d * a).sum::<f64>() * 0.0625)
+                            .fold(0.0, f64::max);
                         let (p8, p) = (softmax(&s8), softmax(&s));
                         let o = (i * nq + h) * ahd;
                         for j in 0..=i {
@@ -1260,7 +1274,9 @@ mod tests_88_q8kv_gpu {
                     }
                 }
             }
-            let err = |got: &[f32], want: &[f64]| got.iter().zip(want).map(|(&g, &w)| (g as f64 - w).abs()).fold(0.0, f64::max);
+            // a NaN output must fail, not vanish in f64::max
+            let nan_inf = |d: f64| if d.is_nan() { f64::INFINITY } else { d };
+            let err = |got: &[f32], want: &[f64]| got.iter().zip(want).map(|(&g, &w)| nan_inf((g as f64 - w).abs())).fold(0.0, f64::max);
             let rows = n * nq * ahd;
             let last = &reference[(n - 1) * nq * ahd..];
             // prefill form, all n rows at pos_base 0: FA grid (NKV, ceil(T / 16), 1), block 32 * GQA; split grid (NQ, T, 1), block AHD
@@ -1289,7 +1305,7 @@ mod tests_88_q8kv_gpu {
             let sp_dec = merged("attn_full_split_q8", 8, false);
             let (e_fa, e_sp, e_fad, e_spd) = (err(&fa_pre, &reference), err(&sp_pre, &reference), err(&fa_dec, last), err(&sp_dec, last));
             let stats = |a: &[f32], b: &[f64]| -> (f64, f64) {
-                let d: Vec<f64> = a.iter().zip(b).map(|(&x, &y)| (x as f64 - y).abs()).collect();
+                let d: Vec<f64> = a.iter().zip(b).map(|(&x, &y)| nan_inf((x as f64 - y).abs())).collect();
                 (d.iter().cloned().fold(0.0, f64::max), d.iter().sum::<f64>() / d.len() as f64)
             };
             let bf_pre64: Vec<f64> = bf_pre.iter().map(|&v| v as f64).collect();
@@ -1297,7 +1313,7 @@ mod tests_88_q8kv_gpu {
             // the worst output relative to its own bound (<= 1 passes)
             let (mut worst, mut at) = (0f64, 0usize);
             for (i, ((&g, &x), &bd)) in fa_pre.iter().zip(&exact).zip(&bound).enumerate() {
-                let r = (g as f64 - x).abs() / (bd + 5e-3);
+                let r = nan_inf((g as f64 - x).abs()) / (bd + 5e-3);
                 if r > worst {
                     (worst, at) = (r, i);
                 }
