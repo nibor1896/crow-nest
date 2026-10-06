@@ -2075,7 +2075,9 @@ operating points of section 0. "Done" is recorded on the ticket, board follows.
   re-send rolls back onto it and prefills nothing. A slot filled from a slot file has no row
   and keeps the guard. #101: a rollback onto `P` forgets every slot above `P`, and a snapshot
   at a held position replaces that slot instead of adding a duplicate (`cache.rs` module doc,
-  "Slot bookkeeping").
+  "Slot bookkeeping"). A parked slot (#118) names another history and is not forgotten.
+  `tools/cache_stale_rollbacks.py` replays `engine.log` files for a slot that outlived its
+  rollback; it reads the `reusable` list, not `snapshots`, so parked slots do not count.
 
 **Images (#114, 2026-09-24):**
 
@@ -2703,6 +2705,11 @@ C:/x/y.md
 
 - Measured (A2, #24): the engine lock (`engine/.engine.lock` then, the per-user state dir since #131) is held for the process life and is **left
   behind by a `Stop-Process` kill**; it must be removed by hand before the next engine run.
+- Since 2026-10-06 the lock is an OS file lock on an open handle (`take_engine_lock`, `File::try_lock`): the OS drops it with
+  the process however it ends, so a killed engine leaves the file but no lock, and nothing is removed by hand. The PID-only
+  lock refused every start on 2026-10-06 11:40: a `taskkill /F` had left PID 29192 in the file and Windows had given 29192
+  to a `conhost.exe`. The PID is still written; a live PID refuses only when its process is an engine program
+  (`serve*` or this program, `is_engine_image`), for engines built before the OS lock.
 
 **7.11.9 What is deliberately NOT built**
 
@@ -4215,8 +4222,9 @@ not line numbers — the files move.
    0. the `CROW_KPROF` x `CROW_GRAPH=1` refusal (`gen.rs:717-720`, since 2026-09-17): a sync inside
       an open decode-graph capture is `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`, so the pair is
       refused before anything is allocated, with one message naming both switches and the escape.
-   1. `engine_lock_acquire` — the engine lock (`%LOCALAPPDATA%\crow-nest\engine.lock` on Windows, `$XDG_STATE_HOME/crow-nest/engine.lock` else `~/.local/state/crow-nest/engine.lock` on Linux; #131), `pid_alive` via `/proc/<pid>` on unix and
-      `tasklist` on Windows; a second engine on the machine dies here.
+   1. `engine_lock_acquire` — the engine lock (`%LOCALAPPDATA%\crow-nest\engine.lock` on Windows, `$XDG_STATE_HOME/crow-nest/engine.lock` else `~/.local/state/crow-nest/engine.lock` on Linux; #131), an OS file lock on an open handle
+      (`take_engine_lock`, released by the OS with the process); a PID left by an older build refuses only when that process is an
+      engine program (`pid_image` via `/proc/<pid>/comm` on unix, `tasklist` on Windows); a second engine on the machine dies here.
    2. `manager::derive_host_pinned_budget` — the `[budget]` line, before anything is pinned (8.8).
    3. embeddings and `lm_head`, then the 48 dense layer bundles through `weights::load_f32` /
       `load_fp4` / `load_bf16_twin` / `dequant_fp4_dev` / `load_small_f32` and `gen`'s own

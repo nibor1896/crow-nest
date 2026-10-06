@@ -137,11 +137,22 @@ pub fn planner_refusal_msg(free0: u64, host_pinned_budget: u64) -> String {
     )
 }
 
+/// The default of `CROW_RAM_MARGIN_GB`. 1 GiB since 2026-10-06 (was 3),
+/// robin's decision: on Windows with a page file, Flash-Next boots at 1 GiB
+/// with a loaded desktop and decodes as fast as at 3 GiB (40.3-41.1 vs
+/// 39.0-39.9 tok/s, three ~30k-token prompts per arm; free RAM fell to 59 MB),
+/// while 3 GiB refused a boot at 48.31 GiB free and 2 GiB refused three boots
+/// at 12:23-12:29 the same day (46.97-48.13 GiB free at the start; the load
+/// itself takes ~1.4 GiB after the budget check). crow-lab/runs/fn-ram-margin-win-20261006,
+/// fn-boot-refusals-win-20261006.
+pub const RAM_MARGIN_DEFAULT_GB: u64 = 1;
+
 /// physical RAM that must stay free after the cold tier is pinned
-/// (`CROW_RAM_MARGIN_GB`, default 3 GiB). One number for both readers: the
-/// budget derived below and the pre-pin gate in `residency::build`.
+/// (`CROW_RAM_MARGIN_GB`, default [`RAM_MARGIN_DEFAULT_GB`]). One number for
+/// both readers: the budget derived below and the pre-pin gate in
+/// `residency::build`.
 pub fn ram_margin_bytes() -> u64 {
-    env_parse::<u64>("CROW_RAM_MARGIN_GB").unwrap_or(3) << 30
+    env_parse::<u64>("CROW_RAM_MARGIN_GB").unwrap_or(RAM_MARGIN_DEFAULT_GB) << 30
 }
 
 /// The host pinned budget, DERIVED at boot instead of assumed (issue #15).
@@ -1494,5 +1505,20 @@ mod tests_300_c5 {
         assert!(lines[1].contains("binds"), "{}", lines[1]);
         let why = dense_fit(8 * G, 7 * G, G, 0, 200_000).unwrap_err();
         assert!(why.starts_with("refusing config: context 200000 needs 7.00 GiB of states"), "{why}");
+    }
+}
+
+#[cfg(test)]
+mod tests_ram_margin {
+    use super::*;
+
+    /// 2026-10-06: the default margin is 1 GiB (was 3; 2 for a few hours).
+    /// Without the env var the two readers (budget, pre-pin gate) get 1 GiB.
+    #[test]
+    fn the_default_ram_margin_is_one_gib() {
+        assert_eq!(RAM_MARGIN_DEFAULT_GB, 1);
+        if std::env::var_os("CROW_RAM_MARGIN_GB").is_none() {
+            assert_eq!(ram_margin_bytes(), 1u64 << 30);
+        }
     }
 }
