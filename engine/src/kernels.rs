@@ -5205,6 +5205,11 @@ impl Kernels {
     /// entry each. Called once at load, only when the module was compiled with
     /// `KernelGeo::q8kv` (a missing entry fails in `Module::get`); never otherwise, so the map
     /// of every other boot is the one of before #88.
+    ///
+    /// # Safety
+    ///
+    /// `module` is the module this map was built from, compiled from a `KernelGeo` with
+    /// `q8kv` set, and its CUDA context is current.
     pub unsafe fn arm_q8_kv(&mut self, module: &crate::cuda::Module) {
         for &(n, q) in crate::kernels_p2::Q8KV_SWAP {
             self.map.insert(n, module.get(q));

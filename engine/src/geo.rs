@@ -181,7 +181,7 @@ impl KvDtype {
                 "CROW_KV=q8 is built for full attention only (the dense family); family {:?} reads its KV cache through the QSA attention kernels, which have no q8 path - use bf16 or fp8",
                 geo.family
             )),
-            Some(KvDtype::Q8Block) if geo.head_dim % 32 != 0 => Err(format!(
+            Some(KvDtype::Q8Block) if !geo.head_dim.is_multiple_of(32) => Err(format!(
                 "CROW_KV=q8 needs a head dim that is a multiple of 32 (one f16 scale per 32 values); this model's is {}",
                 geo.head_dim
             )),
