@@ -6992,12 +6992,61 @@ mod tests_lock_pid_reuse {
 
     /// A live process that is no engine (2026-10-06: a killed serve left pid 29192 in
     /// the lock, Windows gave 29192 to a conhost.exe, and every start was refused).
+    ///
+    /// Linux: returned only after the bystander printed a line (#141). `spawn` goes through
+    /// glibc `posix_spawnp` (vfork), which returns once the child has released this
+    /// process's memory in `exec_mmap`, before the child's own image is in place; while the
+    /// child waits there for this process's mmap lock, `/proc/<pid>/exe` still names this
+    /// test binary (CI 2026-10-06: `crow_nest_engine-<hash>`, refused as an engine). The line
+    /// is printed by `sh`, so from then on the image is `sh` or, after its `exec`, `sleep`.
     fn bystander() -> std::process::Child {
         #[cfg(windows)]
         let c = std::process::Command::new("cmd").args(["/c", "ping -n 30 127.0.0.1 >nul"]).spawn();
         #[cfg(unix)]
-        let c = std::process::Command::new("sleep").arg("30").spawn();
+        let c = std::process::Command::new("sh")
+            .args(["-c", "echo up; exec sleep 30"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map(|mut c| {
+                let mut line = String::new();
+                let out = c.stdout.as_mut().expect("the bystander's stdout is piped");
+                std::io::BufRead::read_line(&mut std::io::BufReader::new(out), &mut line)
+                    .expect("the bystander prints its line");
+                assert_eq!(line.trim(), "up", "the bystander's line");
+                c
+            });
         c.expect("spawn a bystander process")
+    }
+
+    /// `true`: run the test body here. `false`: the body ran in a test process of its own
+    /// and passed there.
+    ///
+    /// For a test that drops a lock and takes it again (#141). On Linux `File::try_lock` is
+    /// `flock`, whose lock belongs to the open file description; a spawn copies this
+    /// process's descriptor table into the child, which holds the copy until its `exec`
+    /// closes the O_CLOEXEC ones. A handle dropped while another test thread spawns (the
+    /// bystander above) still holds the lock in that child, and the retake is refused (CI
+    /// 2026-10-06: `another engine (pid 1) holds`). Alone, no other thread spawns.
+    fn alone(test: &str) -> bool {
+        const ALONE: &str = "TESTS_LOCK_PID_REUSE_ALONE";
+        if std::env::var_os(ALONE).is_some() {
+            return true;
+        }
+        let module = module_path!().split_once("::").map_or(module_path!(), |(_, m)| m);
+        let name = format!("{module}::{test}");
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([name.as_str(), "--exact", "--test-threads=1"])
+            .env(ALONE, "1")
+            .output()
+            .expect("run the test in a process of its own");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{name} in a process of its own: {}\n{stdout}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        false
     }
 
     #[test]
@@ -7014,6 +7063,9 @@ mod tests_lock_pid_reuse {
 
     #[test]
     fn a_held_lock_refuses_and_a_dropped_one_is_taken() {
+        if !alone("a_held_lock_refuses_and_a_dropped_one_is_taken") {
+            return;
+        }
         let path = tmp("held");
         let first = take_engine_lock(&path, 1).expect("the first engine takes the lock");
         assert!(first.is_some(), "the lock is a held handle, not only a pid in a file");
