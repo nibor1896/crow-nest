@@ -19,9 +19,10 @@ VCRUNTIME140.dll. This script:
    licence texts), refusing first when `tools/engine_notices.py` says
    THIRD-PARTY-NOTICES.txt is not what engine/Cargo.lock produces, and refusing when
    the stage holds any NVIDIA file (nvrtc, nvidia, cuda, cublas, cudart in a name) or
-   anything else than those four. NVRTC (nvrtc64_130_0.dll and
-   nvrtc-builtins64_133.dll, the CUDA 13.3 names) is placed beside serve.exe by
-   tools\fetch-nvrtc.ps1;
+   anything else than those four plus tools\fetch-nvrtc.ps1, which is staged beside
+   serve.exe so that a user without a checkout can run it. NVRTC (nvrtc64_130_0.dll and
+   nvrtc-builtins64_133.dll, the CUDA 13.3 names) is placed beside serve.exe by that
+   script;
 4. scans every staged file (the notices included), as UTF-8 and as UTF-16LE at both byte alignments, for
    the builder's profile path, any `\Users\<name>\`, the bare user name (any
    context, case-insensitive) and the computer name, and REFUSES on any hit;
@@ -51,6 +52,8 @@ $ErrorActionPreference = "Stop"
 # from the repo root: crow-nest's licence, NOTICE and the crates' texts. The package holds no
 # NVIDIA file: nothing is staged from a CUDA install.
 $SHIP_FILES = @('LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.txt')
+# crow-nest's own script that fetches NVRTC from NVIDIA; staged from tools\ beside serve.exe
+$TOOL_FILES = @('fetch-nvrtc.ps1')
 # the C runtime that +crt-static links in; any of these in the imports means it did not
 $VC_RUNTIME = @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'ucrtbase.dll')
 
@@ -119,14 +122,14 @@ function Find-StageHits {
 
 # The files a package holds, MANIFEST.json aside.
 function Get-PackageFiles {
-    return @(@('serve.exe') + $SHIP_FILES)
+    return @(@('serve.exe') + $TOOL_FILES + $SHIP_FILES)
 }
 
 # Every file under a directory whose name looks like NVIDIA's (nvrtc, nvidia, cuda, cublas,
-# cudart; any case): what the build refuses on.
+# cudart; any case), except crow-nest's own fetch script: what the build refuses on.
 function Find-NvidiaFiles {
     param([string] $Dir)
-    return @(Get-ChildItem -LiteralPath $Dir -Recurse -File -Force | Where-Object { $_.Name -match '(?i)nvrtc|nvidia|cuda|cublas|cudart' })
+    return @(Get-ChildItem -LiteralPath $Dir -Recurse -File -Force | Where-Object { $TOOL_FILES -notcontains $_.Name -and $_.Name -match '(?i)nvrtc|nvidia|cuda|cublas|cudart' })
 }
 
 function Get-Manifest {
@@ -233,13 +236,14 @@ function Invoke-Selftest {
     Check "the package carries THIRD-PARTY-NOTICES.txt" ($pf -contains 'THIRD-PARTY-NOTICES.txt')
     Check "the package is 6 distinct files + MANIFEST.json" ($pf.Count -eq 6 -and @($pf | Sort-Object -Unique).Count -eq 6)
     # the package holds no NVIDIA file
-    Check "the package list names no NVIDIA file (nvrtc, nvidia, cuda in a name)" (@($pf | Where-Object { $_ -match '(?i)nvrtc|nvidia|cuda' }).Count -eq 0)
-    Check "the package is exactly serve.exe, LICENSE, NOTICE, THIRD-PARTY-NOTICES.txt (+ MANIFEST.json)" ((($pf | Sort-Object) -join ',') -ceq 'LICENSE,NOTICE,serve.exe,THIRD-PARTY-NOTICES.txt')
+    Check "the package list names no NVIDIA file (nvrtc, nvidia, cuda in a name, fetch-nvrtc.ps1 aside)" (@($pf | Where-Object { $_ -ne 'fetch-nvrtc.ps1' -and $_ -match '(?i)nvrtc|nvidia|cuda' }).Count -eq 0)
+    Check "the package is exactly serve.exe, fetch-nvrtc.ps1, LICENSE, NOTICE, THIRD-PARTY-NOTICES.txt (+ MANIFEST.json)" ((($pf | Sort-Object) -join ',') -ceq 'fetch-nvrtc.ps1,LICENSE,NOTICE,serve.exe,THIRD-PARTY-NOTICES.txt')
+    Check "the package carries fetch-nvrtc.ps1" ($pf -contains 'fetch-nvrtc.ps1')
     $nv = Join-Path ([IO.Path]::GetTempPath()) ("crow-nest-pack-selftest-" + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $nv | Out-Null
     try {
         foreach ($n in $pf) { [IO.File]::WriteAllBytes((Join-Path $nv $n), [byte[]]@()) }
-        Check "the stage check passes the four package files" ((Find-NvidiaFiles -Dir $nv).Count -eq 0)
+        Check "the stage check passes the five package files (fetch-nvrtc.ps1 included)" ((Find-NvidiaFiles -Dir $nv).Count -eq 0)
         foreach ($bad in @('nvrtc64_130_0.dll', 'nvrtc-builtins64_133.dll', 'NVRTC64_130_0.DLL', 'libnvrtc.so', 'cudart64_13.dll')) {
             [IO.File]::WriteAllBytes((Join-Path $nv $bad), [byte[]]@())
             Check "the stage check refuses a staged $bad" ((Find-NvidiaFiles -Dir $nv).Count -ge 1)
@@ -270,6 +274,15 @@ function Invoke-Selftest {
         Check "$f exists in the repo root" $present
         if ($present) {
             Check "$f passes this machine's privacy scan" (@(Find-PrivacyHits -Bytes ([IO.File]::ReadAllBytes($p)) -Needles $real -Name $f).Count -eq 0)
+        }
+    }
+
+    foreach ($f in $TOOL_FILES) {
+        $p = Join-Path $repoRoot "tools\$f"
+        $present = Test-Path -LiteralPath $p
+        Check "tools\$f exists" $present
+        if ($present) {
+            Check "tools\$f passes this machine's privacy scan" (@(Find-PrivacyHits -Bytes ([IO.File]::ReadAllBytes($p)) -Needles $real -Name $f).Count -eq 0)
         }
     }
 
@@ -344,6 +357,7 @@ if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -F
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 Copy-Item -LiteralPath $serve -Destination $stage
 foreach ($f in $SHIP_FILES) { Copy-Item -LiteralPath (Join-Path $repo $f) -Destination $stage }
+foreach ($f in $TOOL_FILES) { Copy-Item -LiteralPath (Join-Path $repo "tools\$f") -Destination $stage }
 $nvidia = @(Find-NvidiaFiles -Dir $stage)
 if ($nvidia.Count -gt 0) { throw ("the stage holds an NVIDIA file (" + (($nvidia | ForEach-Object Name) -join ', ') + ") - crow-nest does not distribute NVRTC; tools\fetch-nvrtc.ps1 fetches it from NVIDIA") }
 $staged = @(Get-ChildItem -LiteralPath $stage -File | ForEach-Object Name | Sort-Object)

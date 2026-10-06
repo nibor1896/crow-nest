@@ -49,7 +49,7 @@ engine/target/release/serve.exe --port 8099
 
 ```powershell
 irm https://github.com/nibor1896/crow-nest/releases/download/v0.8.0/crow-nest-engine-0.8.0-win-x64.zip -OutFile engine.zip; Expand-Archive engine.zip crow-nest-engine
-powershell -ExecutionPolicy Bypass -File tools\fetch-nvrtc.ps1 -Target crow-nest-engine   # NVRTC 13.3.33 from NVIDIA's PyPI wheel, verified; the zip holds no NVIDIA file
+powershell -ExecutionPolicy Bypass -File crow-nest-engine\fetch-nvrtc.ps1 -Target crow-nest-engine   # NVRTC 13.3.33 from NVIDIA's PyPI wheel, verified; the zip holds no NVIDIA file
 $env:CROW_CNQ = "converter\Qwen3.8-27B-CNQ4.5.cnq"; crow-nest-engine\serve.exe --port 8099
 ```
 
@@ -58,7 +58,7 @@ $env:CROW_CNQ = "converter\Qwen3.8-27B-CNQ4.5.cnq"; crow-nest-engine\serve.exe -
 ```bash
 curl -LO https://github.com/nibor1896/crow-nest/releases/download/v0.9.0/crow-nest-engine-0.9.0-linux-x64.tar.gz
 mkdir crow-nest-engine && tar -xzf crow-nest-engine-0.9.0-linux-x64.tar.gz -C crow-nest-engine
-tools/fetch-nvrtc.sh --target crow-nest-engine   # NVRTC 13.3.33 from NVIDIA's PyPI wheel, verified; the tarball holds no NVIDIA file
+crow-nest-engine/fetch-nvrtc.sh --target crow-nest-engine   # NVRTC 13.3.33 from NVIDIA's PyPI wheel, verified; the tarball holds no NVIDIA file
 CROW_CNQ=converter/Qwen3.8-27B-CNQ4.5.cnq LD_LIBRARY_PATH=$PWD/crow-nest-engine crow-nest-engine/serve --port 8099
 ```
 

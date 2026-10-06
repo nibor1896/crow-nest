@@ -34,14 +34,15 @@ NVIDIA NVRTC -- the CUDA runtime compiler (NOT part of this package)
 
 crow-nest does not distribute any NVIDIA file. The engine package holds serve
 (serve.exe), LICENSE, NOTICE and THIRD-PARTY-NOTICES.txt, and nothing from
-NVIDIA; tools/pack-engine.ps1 and tools/pack-engine.sh refuse to build a
-package that holds one.
+NVIDIA, apart from crow-nest's own script fetch-nvrtc.ps1 / fetch-nvrtc.sh
+(see below); tools/pack-engine.ps1 and tools/pack-engine.sh refuse to build a
+package that holds an NVIDIA file.
 
 At run time serve loads NVIDIA's runtime compilation library (NVRTC) to compile
 its CUDA kernels, and needs NVRTC 13.3.33, the build the engine's PTX manifest
 was recorded with. You obtain it from NVIDIA yourself: NVIDIA publishes NVRTC as
-the `nvidia-cuda-nvrtc` 13.3.33 wheel on PyPI, and tools/fetch-nvrtc.ps1
-(Windows) or tools/fetch-nvrtc.sh (Linux) downloads that wheel straight from
+the `nvidia-cuda-nvrtc` 13.3.33 wheel on PyPI, and fetch-nvrtc.ps1 (Windows)
+or fetch-nvrtc.sh (Linux), in this package and in tools/, downloads that wheel straight from
 files.pythonhosted.org, checks it against the pinned size and sha256 and
 against the wheel's own RECORD, and places these files beside serve:
 
