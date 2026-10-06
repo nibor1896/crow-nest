@@ -25,7 +25,8 @@ The file is generated, never written by hand:
 Checked here: the file is what the current engine/Cargo.lock produces, every
 crate has at least one text and its SPDX expression is covered by them ("A AND
 B" needs both texts), every MPL-2.0 crate gets a source line (MPL 3.2(a)), NOTICE
-points at the file, and NOTICE names every NVRTC file the pack scripts stage.
+points at the file, the pack scripts stage no NVRTC file (the package holds no NVIDIA
+file), and NOTICE names every NVRTC file tools/fetch-nvrtc.* places beside serve.
 
 Usage:  engine_notices.py [--write] [REPO]
 Exit 0 = all green (or written).  1 = at least one check failed.  2 = setup error.
@@ -296,8 +297,8 @@ def build(repo):
         "Where a crate offers a choice (\"A OR B\"), crow-nest takes it under any one",
         "of them; every text the crate ships is reproduced.",
         "",
-        "The NVIDIA NVRTC libraries in the package are not compiled in and are not",
-        "covered here; see NOTICE.",
+        "The package holds no NVIDIA file; NVIDIA's NVRTC, which serve loads at run",
+        "time, is not compiled in and is not covered here; see NOTICE.",
         "",
         "=" * 80,
         "COMPONENTS",
@@ -329,15 +330,31 @@ def build(repo):
     return body, checks, summary
 
 
+def read_tool(repo, name):
+    with open(os.path.join(repo, "tools", name), encoding="utf-8") as fh:
+        return fh.read()
+
+
 def staged_nvrtc_names(repo):
-    """The NVRTC file names the pack scripts put into the package."""
+    """The NVRTC file names the pack scripts still put into the package: the old
+    $NVRTC_DLLS / NVRTC_LIBS lists. There must be none."""
     names = []
-    with open(os.path.join(repo, "tools", "pack-engine.ps1"), encoding="utf-8") as fh:
-        m = re.search(r"^\$NVRTC_DLLS\s*=\s*@\(([^)]*)\)", fh.read(), re.M)
+    m = re.search(r"^\$NVRTC_DLLS\s*=\s*@\(([^)]*)\)", read_tool(repo, "pack-engine.ps1"), re.M)
     if m:
         names += re.findall(r"'([^']+)'", m.group(1))
-    with open(os.path.join(repo, "tools", "pack-engine.sh"), encoding="utf-8") as fh:
-        m = re.search(r"^NVRTC_LIBS=\(([^)]*)\)", fh.read(), re.M)
+    m = re.search(r"^NVRTC_LIBS=\(([^)]*)\)", read_tool(repo, "pack-engine.sh"), re.M)
+    if m:
+        names += [e.split(":", 1)[1] for e in m.group(1).split() if ":" in e]
+    return names
+
+
+def fetched_nvrtc_names(repo):
+    """The file names tools/fetch-nvrtc.ps1 / .sh place beside serve."""
+    names = []
+    m = re.search(r"^\$NVRTC_MEMBERS\s*=\s*\[ordered\]@\{(.*?)^\}", read_tool(repo, "fetch-nvrtc.ps1"), re.M | re.S)
+    if m:
+        names += re.findall(r"=\s*'([^']+)'", m.group(1))
+    m = re.search(r"^MEMBERS='([^']*)'", read_tool(repo, "fetch-nvrtc.sh"), re.M)
     if m:
         names += [e.split(":", 1)[1] for e in m.group(1).split() if ":" in e]
     return names
@@ -352,7 +369,8 @@ def main(argv):
         return 2
     try:
         body, checks, summary = build(repo)
-        nvrtc = staged_nvrtc_names(repo)
+        staged = staged_nvrtc_names(repo)
+        fetched = fetched_nvrtc_names(repo)
     except (OSError, ValueError, RuntimeError) as exc:
         print("SETUP ERROR: %s" % exc)
         return 2
@@ -376,11 +394,15 @@ def main(argv):
         notice = ""
         checks.append(("NOTICE readable", False, str(exc)))
     checks.append(("NOTICE points at %s" % OUT, OUT in notice, "NOTICE"))
-    checks.append(("the pack scripts' NVRTC file names were found", len(nvrtc) >= 4,
-                   "tools/pack-engine.ps1 $NVRTC_DLLS / tools/pack-engine.sh NVRTC_LIBS: %s" % nvrtc))
-    absent = [n for n in nvrtc if n not in notice]
-    checks.append(("NOTICE names every NVRTC file the pack scripts stage", not absent,
+    checks.append(("the pack scripts stage no NVRTC file",
+                   not staged, "tools/pack-engine.ps1 $NVRTC_DLLS / tools/pack-engine.sh NVRTC_LIBS still list: %s" % staged))
+    checks.append(("the fetch scripts' NVRTC file names were found", len(fetched) >= 4,
+                   "tools/fetch-nvrtc.ps1 $NVRTC_MEMBERS / tools/fetch-nvrtc.sh MEMBERS: %s" % fetched))
+    absent = [n for n in fetched if n not in notice]
+    checks.append(("NOTICE names every NVRTC file the fetch scripts place", not absent,
                    "missing from NOTICE: %s" % ", ".join(absent)))
+    checks.append(("NOTICE says crow-nest distributes no NVIDIA file",
+                   "does not distribute any NVIDIA file" in notice, "NOTICE"))
     failed = 0
     for name, ok, detail in checks:
         if ok:

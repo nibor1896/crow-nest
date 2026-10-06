@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Builds `serve` for shipping and packs it with the NVRTC runtime it loads, then
-# proves the package carries no trace of the machine it was built on (#133).
+# Builds `serve` for shipping and packs it, then proves the package carries no trace of
+# the machine it was built on (#133) and no NVIDIA file. NVRTC is NOT in the package:
+# the user fetches it from NVIDIA's own PyPI wheel with tools/fetch-nvrtc.sh.
 # Linux twin of tools/pack-engine.ps1 (#131).
 #
 # A plain `cargo build` serve is not portable (#133, measured 2026-10-02 at 65ce4d4):
@@ -13,15 +14,15 @@
 #     inside $HOME, comes second;
 #  2. refuses when serve's highest GLIBC_ symbol version is above GLIBC_FLOOR (2.34,
 #     measured 2026-10-02); the floor is written into MANIFEST.json;
-#  3. stages serve, libnvrtc.so (the bytes of $CUDA_LIB/libnvrtc.so.13) and
-#     libnvrtc-builtins.so.13.3 (real files, not symlinks, no duplicates) and LICENSE,
-#     NOTICE and THIRD-PARTY-NOTICES.txt (the crates' licence texts and the NVRTC
-#     terms), refusing first when tools/engine_notices.py says THIRD-PARTY-NOTICES.txt
-#     is not what engine/Cargo.lock produces.
-#     NVRTC is staged as the unversioned `libnvrtc.so` because cudarc tries that name
-#     FIRST over all search paths: a system CUDA providing libnvrtc.so would beat a
-#     bundled libnvrtc.so.13 (#133, Crow #341). libnvrtc dlopens the builtins by the
-#     exact name libnvrtc-builtins.so.13.3 (strings), so that one keeps its name;
+#  3. stages serve and LICENSE, NOTICE and THIRD-PARTY-NOTICES.txt (the crates' licence
+#     texts), refusing first when tools/engine_notices.py says THIRD-PARTY-NOTICES.txt
+#     is not what engine/Cargo.lock produces, and refusing when the stage holds any
+#     NVIDIA file (nvrtc, nvidia, cuda, cublas, cudart in a name) or anything else
+#     than those four plus tools/fetch-nvrtc.sh, which is staged beside serve so that a
+#     user without a checkout can run it. NVRTC (libnvrtc.so, the bytes of NVIDIA's
+#     libnvrtc.so.13, and libnvrtc-builtins.so.13.3) is placed beside serve by that
+#     script, which keeps the naming reasons (cudarc dlopens the bare libnvrtc.so first:
+#     #133, Crow #341);
 #  4. scans every staged file, as UTF-8 and as UTF-16LE at both byte alignments, for
 #     $HOME, any `/home/<name>/`, the bare $USER (any context, case-insensitive) and
 #     the host name, and REFUSES on any hit (no override);
@@ -31,25 +32,33 @@
 # `files` is the Windows array (path with forward slashes, sha256 upper-case hex,
 # MANIFEST.json itself not listed); the object wraps it to carry the glibc floor.
 #
-# The consumer puts the unpacked folder on LD_LIBRARY_PATH (libnvrtc-builtins is
-# loaded by libnvrtc and has no RUNPATH, so serve itself needs no rpath).
+# The consumer unpacks, runs ./fetch-nvrtc.sh --target . in that folder and puts the
+# folder on LD_LIBRARY_PATH (libnvrtc-builtins is loaded by libnvrtc and has no RUNPATH,
+# so serve itself needs no rpath).
 #
-# Usage:  tools/pack-engine.sh [--version V] [--out DIR] [--cuda-lib DIR]
+# Usage:  tools/pack-engine.sh [--version V] [--out DIR]
 #         tools/pack-engine.sh --scan FILE...   scan files with this machine's identity
 #         tools/pack-engine.sh --selftest       checks on synthetic inputs, no build
-# Environment: CUDA_LIB (default ~/.local/share/crow/cuda/lib).
 # Default version: `git describe --tags --always --dirty` without the leading `v`
 # (engine/Cargo.toml carries 0.1.0, which is not a release number).
 set -euo pipefail
 
 GLIBC_FLOOR="2.34"
-# source name in $CUDA_LIB : name in the pack
-NVRTC_LIBS=(libnvrtc.so.13:libnvrtc.so libnvrtc-builtins.so.13.3:libnvrtc-builtins.so.13.3)
-nvrtc_staged_names() { local e; for e in "${NVRTC_LIBS[@]}"; do echo "${e#*:}"; done; }
-# from the repo root: crow-nest's licence, NOTICE (NVRTC terms) and the crates' texts
+# The package holds no NVIDIA file: nothing is staged from a CUDA install.
+# from the repo root: crow-nest's licence, NOTICE and the crates' texts
 SHIP_FILES=(LICENSE NOTICE THIRD-PARTY-NOTICES.txt)
+# crow-nest's own script that fetches NVRTC from NVIDIA; staged from tools/ beside serve
+TOOL_FILES=(fetch-nvrtc.sh)
 # the files a package holds, MANIFEST.json aside
-package_files() { echo serve; nvrtc_staged_names; printf '%s\n' "${SHIP_FILES[@]}"; }
+package_files() { echo serve; printf '%s\n' "${TOOL_FILES[@]}" "${SHIP_FILES[@]}"; }
+# stage_nvidia_files DIR: every file under DIR whose name looks like NVIDIA's (nvrtc,
+# nvidia, cuda, cublas, cudart; any case), except crow-nest's own fetch script; prints
+# them, exit 0 if there is any
+stage_nvidia_files() {
+  local hits; hits="$(find "$1" \( -type f -o -type l \) | grep -vE '/fetch-nvrtc\.sh$' | grep -iE '(nvrtc|nvidia|cuda|cublas|cudart)[^/]*$' || true)"
+  if [ -n "$hits" ]; then echo "$hits"; return 0; fi
+  return 1
+}
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------------------
@@ -180,17 +189,31 @@ selftest() {
   check_true "2.9 is within the 2.34 floor (version order, not text)" "$(version_le 2.9 2.34 && echo 1 || echo 0)"
   check_true "2.35 is above the 2.34 floor" "$(version_le 2.35 2.34 && echo 0 || echo 1)"
   check_true "the highest of 2.2.5, 2.34, 2.17 is 2.34" "$([ "$(printf '2.2.5\n2.34\n2.17\n' | sort -V | tail -1)" = 2.34 ] && echo 1 || echo 0)"
-  check_true "NVRTC is staged as libnvrtc.so (cudarc tries that name first)" "$(nvrtc_staged_names | grep -qx 'libnvrtc.so' && echo 1 || echo 0)"
-  check_true "no versioned libnvrtc.so.<n> is staged (it would be a duplicate)" "$(nvrtc_staged_names | grep -qE '^libnvrtc\.so\.' && echo 0 || echo 1)"
-  check_true "the builtins keep the name libnvrtc dlopens" "$(nvrtc_staged_names | grep -qx 'libnvrtc-builtins.so.13.3' && echo 1 || echo 0)"
   check_true "the pack name" "$([ "$(pack_name 0.8.0)" = crow-nest-engine-0.8.0-linux-x64.tar.gz ] && echo 1 || echo 0)"
+
+  # the package holds no NVIDIA file
+  check_true "the package list names no NVIDIA file (nvrtc, nvidia, cuda in a name, fetch-nvrtc.sh aside)" "$(package_files | grep -vx 'fetch-nvrtc.sh' | grep -qiE 'nvrtc|nvidia|cuda' && echo 0 || echo 1)"
+  check_true "the package is exactly serve, fetch-nvrtc.sh, LICENSE, NOTICE, THIRD-PARTY-NOTICES.txt (+ MANIFEST.json)" "$([ "$(package_files | sort | tr '\n' ' ')" = 'LICENSE NOTICE THIRD-PARTY-NOTICES.txt fetch-nvrtc.sh serve ' ] && echo 1 || echo 0)"
+  check_true "the package carries fetch-nvrtc.sh" "$(package_files | grep -qx 'fetch-nvrtc.sh' && echo 1 || echo 0)"
+  mkdir -p "$t/nv_ok" "$t/nv_bad"
+  : > "$t/nv_ok/serve"; : > "$t/nv_ok/LICENSE"; : > "$t/nv_ok/NOTICE"; : > "$t/nv_ok/THIRD-PARTY-NOTICES.txt"
+  : > "$t/nv_ok/fetch-nvrtc.sh"
+  check_true "the stage check passes the five package files (fetch-nvrtc.sh included)" "$(stage_nvidia_files "$t/nv_ok" >/dev/null && echo 0 || echo 1)"
+  : > "$t/nv_bad/libnvrtc.so"
+  check_true "the stage check refuses a staged libnvrtc.so" "$(stage_nvidia_files "$t/nv_bad" >/dev/null && echo 1 || echo 0)"
+  rm -f "$t/nv_bad/libnvrtc.so"; : > "$t/nv_bad/libnvrtc-builtins.so.13.3"
+  check_true "the stage check refuses a staged libnvrtc-builtins.so.13.3" "$(stage_nvidia_files "$t/nv_bad" >/dev/null && echo 1 || echo 0)"
+  rm -f "$t/nv_bad/libnvrtc-builtins.so.13.3"; : > "$t/nv_bad/NVRTC64_130_0.DLL"
+  check_true "the stage check refuses a Windows NVRTC DLL in any case" "$(stage_nvidia_files "$t/nv_bad" >/dev/null && echo 1 || echo 0)"
+  rm -f "$t/nv_bad/NVRTC64_130_0.DLL"; : > "$t/nv_bad/libcudart.so.13"
+  check_true "the stage check refuses another CUDA runtime file" "$(stage_nvidia_files "$t/nv_bad" >/dev/null && echo 1 || echo 0)"
 
   # the notices travel in the package and the privacy scan covers them
   local f
   for f in LICENSE NOTICE THIRD-PARTY-NOTICES.txt; do
     check_true "the package carries $f" "$(package_files | grep -qx "$f" && echo 1 || echo 0)"
   done
-  check_true "the package is 6 distinct files + MANIFEST.json" "$([ "$(package_files | sort -u | wc -l)" -eq 6 ] && [ "$(package_files | wc -l)" -eq 6 ] && echo 1 || echo 0)"
+  check_true "the package is 5 distinct files + MANIFEST.json (NVRTC naming lives in fetch-nvrtc.sh --selftest)" "$([ "$(package_files | sort -u | wc -l)" -eq 5 ] && [ "$(package_files | wc -l)" -eq 5 ] && echo 1 || echo 0)"
   w NOTICE "see /home/builder/dev/NOTICE"
   check "the scan finds a leak in a NOTICE" hit "$t/NOTICE"
   printf '%s' "built on buildbox" | iconv -f UTF-8 -t UTF-16LE > "$t/THIRD-PARTY-NOTICES.txt"
@@ -205,6 +228,13 @@ selftest() {
     fi
   done
 
+  for f in "${TOOL_FILES[@]}"; do
+    check_true "tools/$f exists" "$([ -f "$repo_root/tools/$f" ] && echo 1 || echo 0)"
+    if [ -f "$repo_root/tools/$f" ]; then
+      check_true "tools/$f passes this machine's privacy scan" "$(scan_file "$repo_root/tools/$f" "${HOME%/}" "${USER:-$(id -un)}" "$(host_name)" >/dev/null && echo 1 || echo 0)"
+    fi
+  done
+
   echo "selftest: $ok ok, $red failed"
   [ "$red" -eq 0 ]
 }
@@ -213,7 +243,7 @@ selftest() {
 # Main
 # ---------------------------------------------------------------------------
 
-version=""; out=""; cuda_lib="${CUDA_LIB:-$HOME/.local/share/crow/cuda/lib}"
+version=""; out=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --selftest) selftest; exit $? ;;
@@ -230,8 +260,7 @@ while [ $# -gt 0 ]; do
       exit $rc ;;
     --version) version="$2"; shift 2 ;;
     --out) out="$2"; shift 2 ;;
-    --cuda-lib) cuda_lib="$2"; shift 2 ;;
-    -h|--help) sed -n 2,39p "$0"; exit 0 ;;
+    -h|--help) sed -n 2,41p "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -255,7 +284,6 @@ python3 "$repo/tools/engine_notices.py" "$repo" || {
 
 echo "packing crow-nest engine $version"
 echo "  repo   : $repo"
-echo "  nvrtc  : $cuda_lib"
 echo "  out    : $out"
 
 target="$repo/engine/target_pack"
@@ -274,13 +302,11 @@ fi
 stage="$out/crow-nest-engine-$version-linux-x64"
 rm -rf "$stage"; mkdir -p "$stage"
 cp "$serve" "$stage/serve"; chmod 755 "$stage/serve"
-for ent in "${NVRTC_LIBS[@]}"; do
-  lib="${ent%%:*}"; dst="${ent#*:}"
-  src="$cuda_lib/$lib"
-  [ -f "$src" ] || { echo "missing $src (nvrtc files there: $(ls "$cuda_lib" 2>/dev/null | grep nvrtc | tr '\n' ' '))" >&2; exit 1; }
-  cp -L "$src" "$stage/$dst"   # the real file, never a symlink
-done
 for f in "${SHIP_FILES[@]}"; do cp "$repo/$f" "$stage/$f"; done
+for f in "${TOOL_FILES[@]}"; do cp "$repo/tools/$f" "$stage/$f"; chmod 755 "$stage/$f"; done
+if nvidia="$(stage_nvidia_files "$stage")"; then
+  echo "REFUSED: the stage holds an NVIDIA file ($(echo "$nvidia" | tr '\n' ' ')) - crow-nest does not distribute NVRTC; tools/fetch-nvrtc.sh fetches it from NVIDIA" >&2; exit 1
+fi
 if [ "$(ls -A "$stage" | sort)" != "$(package_files | sort)" ]; then
   echo "REFUSED: the stage holds $(ls -A "$stage" | tr '\n' ' ')- expected $(package_files | tr '\n' ' ')" >&2; exit 1
 fi
@@ -298,7 +324,6 @@ if [ "$total" -gt 0 ]; then
 fi
 echo "  privacy scan: 0 hits in $(ls "$stage" | wc -l) files (4 needle classes, UTF-8 and UTF-16LE)"
 
-[ -f "$stage/libnvrtc.so" ] && [ ! -L "$stage/libnvrtc.so" ] || { echo "REFUSED: staged NVRTC is not a real file named libnvrtc.so" >&2; exit 1; }
 manifest_json "$stage" > "$stage/MANIFEST.json"
 tarball="$out/$(pack_name "$version")"
 rm -f "$tarball"

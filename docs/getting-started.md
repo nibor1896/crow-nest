@@ -17,7 +17,7 @@ Full build, run and check instructions, moved out of the README on 2026-09-23. T
 - CUDA on Linux (stable Rust from rustup, the `libc` crate, the CUDA runtime directory on `LD_LIBRARY_PATH`, bash measurement chains) and CUDA on Windows (MSVC toolchain, PowerShell measurement chains).
 - The FP4 path needs the arch-specific target `compute_120a`; plain `sm_120` is rejected by ptxas (`docs/system-landscape.md:29-30`).
 - Blackwell only: the Ampere and Ada fallback stage is not planned (issue #12).
-- The numeric contract is per platform, because the NVRTC and the driver JIT differ (Windows NVRTC 13.3.73 with driver 616.56, Linux NVRTC 13.3.33 with driver 610.57, both measured 2026-09-17): the 8-row parity form is byte-identical on both, and the 512-row and 1024-row forms have their own Linux values of record. The drift never flipped an argmax on the 512-row form; over a long generation it does (`docs/architecture.md` section 8.7).
+- The numeric contract is per platform, because the NVRTC and the driver JIT differ (Windows NVRTC 13.3.73, the file-version label of the same `nvrtc64_130_0.dll` that NVIDIA's 13.3.33 wheel carries, with driver 616.56, Linux NVRTC 13.3.33 with driver 610.57, both measured 2026-09-17): the 8-row parity form is byte-identical on both, and the 512-row and 1024-row forms have their own Linux values of record. The drift never flipped an argmax on the 512-row form; over a long generation it does (`docs/architecture.md` section 8.7).
 
 ## Requirements
 
@@ -26,7 +26,7 @@ Full build, run and check instructions, moved out of the README on 2026-09-23. T
 | GPU | NVIDIA GeForce RTX 5090, `sm_120`, 170 SMs (measured 2026-09-02), 32,607 MiB VRAM | `docs/system-landscape.md:12` |
 | host RAM | 64 GB on the Windows box: a chain waits for more than 50.5 GiB free before it starts an engine (the Windows gate, rule since 2026-09-10, issue #38). 62.17 GiB on the Linux box, where that gate does not apply and stays replaced by the derived pinned budget the engine prints on its `[budget]` boot line (issue #15, 2026-09-17; robin kept the replacement on 2026-09-18) | `docs/system-landscape.md:14` |
 | OS | Windows, or Linux since 2026-09-17 (measured on Arch Linux, kernel 7.2.3-arch1-3) | `docs/system-landscape.md:15`, second environment block |
-| CUDA toolkit | CUDA 13.3 (nvcc, NVRTC, ptxas); on Windows `nvrtc64_130_0.dll` and `nvrtc-builtins64_133.dll` (CUDA 13.3's file names, in the toolkit's `bin\x64`; there is no `nvrtc64_133_0.dll`) are found beside `serve.exe` or through `PATH`, on Linux the runtime directory needs to be on `LD_LIBRARY_PATH` (never the `lib/stubs` sibling) | `docs/system-landscape.md:22` |
+| CUDA toolkit | CUDA 13.3 (nvcc, NVRTC, ptxas); on Windows `nvrtc64_130_0.dll` and `nvrtc-builtins64_133.dll` (CUDA 13.3's file names, in the toolkit's `bin\x64` or fetched with `tools\fetch-nvrtc.ps1`; there is no `nvrtc64_133_0.dll`) are found beside `serve.exe` or through `PATH`, on Linux the runtime directory needs to be on `LD_LIBRARY_PATH` (never the `lib/stubs` sibling) | `docs/system-landscape.md:22` |
 | Rust | Rust 1.97.0, cargo 1.97.0 on the Windows box; rustc 1.98.1 from rustup stable on the Linux box | `docs/system-landscape.md:23` |
 | cudarc | 0.19.9, features `cuda-13030`, `dynamic-loading`, `nvrtc` | `docs/system-landscape.md:24` |
 | container | `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq`, 104,727,179,972 B, not in the repository, produced by `converter` | `engine/src/geo.rs:71` |
@@ -51,13 +51,20 @@ engine/target/release/serve.exe --port 8099
 
 ### Run on Windows, from an install folder
 
-`tools/pack-engine.ps1` builds `serve.exe` without builder paths and with the C runtime linked in (no VC++ redistributable), and zips it with the two NVRTC DLLs, `LICENSE` and a `MANIFEST.json` (`path`, `bytes`, `sha256`) into `dist\crow-nest-engine-<version>-win-x64.zip` (#131, 2026-10-01). It refuses to zip when any packed file holds the builder's profile path, a `\Users\<name>\` path, the user name as a path segment or the computer name; `-Selftest` runs those checks on synthetic inputs.
+`tools/pack-engine.ps1` builds `serve.exe` without builder paths and with the C runtime linked in (no VC++ redistributable), and zips it with `fetch-nvrtc.ps1`, `LICENSE`, `NOTICE`, `THIRD-PARTY-NOTICES.txt` and a `MANIFEST.json` (`path`, `bytes`, `sha256`) into `dist\crow-nest-engine-<version>-win-x64.zip` (#131, 2026-10-01). The zip holds no NVIDIA file: NVRTC is not redistributed, you fetch it from NVIDIA (below). It refuses to zip when any packed file holds the builder's profile path, a `\Users\<name>\` path, the user name as a path segment or the computer name, or when the stage holds an NVIDIA file; `-Selftest` runs those checks on synthetic inputs.
 
 ```
 powershell -ExecutionPolicy Bypass -File tools\pack-engine.ps1
 ```
 
-Unzipped anywhere, `serve.exe` runs from that folder. The weights are not in the zip, so give their paths absolute:
+Unzipped anywhere, put NVIDIA's NVRTC beside `serve.exe` first. `fetch-nvrtc.ps1`, which the zip carries (it is crow-nest's own script, not an NVIDIA file), downloads NVIDIA's own `nvidia-cuda-nvrtc` 13.3.33 wheel from files.pythonhosted.org (the exact NVRTC build the PTX manifest was recorded with), refuses unless the wheel's size and sha256 are the pinned ones and each DLL matches the wheel's own `RECORD`, and writes only `nvrtc64_130_0.dll` and `nvrtc-builtins64_133.dll` (`-Selftest` runs offline on a synthetic wheel):
+
+```
+cd C:\path\to\crow-nest-engine
+powershell -ExecutionPolicy Bypass -File .\fetch-nvrtc.ps1 -Target .
+```
+
+Then `serve.exe` runs from that folder. The weights are not in the zip, so give their paths absolute:
 
 ```
 set CROW_CNQ=D:\models\Qwen3.8-27B-CNQ4.5.cnq
@@ -83,13 +90,15 @@ engine/target/release/serve --port 8099
 
 ### Run on Linux, from the engine pack
 
-`tools/pack-engine.sh` builds `dist/crow-nest-engine-<version>-linux-x64.tar.gz` (#133): `serve`, `libnvrtc.so`, `libnvrtc-builtins.so.13.3`, `LICENSE` and `MANIFEST.json` (`{"glibc_min": "2.34", "files": [{path, bytes, sha256}]}`). It needs glibc 2.34 or newer and no toolkit; the NVRTC files are in the pack. NVRTC is staged as `libnvrtc.so` (the bytes of CUDA's `libnvrtc.so.13`) because cudarc tries the unversioned name first, so a system CUDA's `libnvrtc.so` would otherwise win over the bundled library; the builtins keep `libnvrtc-builtins.so.13.3`, the exact name libnvrtc opens.
+`tools/pack-engine.sh` builds `dist/crow-nest-engine-<version>-linux-x64.tar.gz` (#133): `serve`, `fetch-nvrtc.sh`, `LICENSE`, `NOTICE`, `THIRD-PARTY-NOTICES.txt` and `MANIFEST.json` (`{"glibc_min": "2.34", "files": [{path, bytes, sha256}]}`). It needs glibc 2.34 or newer and no toolkit. The tarball holds no NVIDIA file: NVRTC is not redistributed, `fetch-nvrtc.sh` (crow-nest's own script, carried in the tarball) fetches it from NVIDIA's own `nvidia-cuda-nvrtc` 13.3.33 wheel (size and sha256 pinned, each file checked against the wheel's `RECORD`, nothing written on a mismatch). It writes `libnvrtc.so` (the bytes of the wheel's `libnvrtc.so.13`) because cudarc tries the unversioned name first, so a system CUDA's `libnvrtc.so` would otherwise win over the fetched library; the builtins keep `libnvrtc-builtins.so.13.3`, the exact name libnvrtc opens.
 
 ```
 tools/pack-engine.sh --selftest        # checks on synthetic inputs, no build
-tools/pack-engine.sh                   # build, privacy gate, pack (CUDA_LIB for the NVRTC source)
+tools/pack-engine.sh                   # build, privacy gate, pack (no NVIDIA file in the tarball)
+tools/fetch-nvrtc.sh --selftest        # offline, on a synthetic wheel
 
 mkdir engine && tar -xzf crow-nest-engine-<version>-linux-x64.tar.gz -C engine
+engine/fetch-nvrtc.sh --target engine   # NVRTC from NVIDIA's wheel, verified, beside serve
 export LD_LIBRARY_PATH=$PWD/engine     # the pack folder: libnvrtc loads libnvrtc-builtins from here
 export CROW_CNQ=/models/Qwen3.8-27B-CNQ4.5.cnq
 export CROW_TOKENIZER=/models/Qwen3.8-27B/tokenizer.json

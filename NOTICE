@@ -29,74 +29,30 @@ lock.
 
 
 ================================================================================
-NVIDIA NVRTC -- the CUDA runtime compiler
+NVIDIA NVRTC -- the CUDA runtime compiler (NOT part of this package)
 ================================================================================
 
-The package ships NVIDIA's runtime compilation library, which serve loads at
-run time to compile its CUDA kernels:
+crow-nest does not distribute any NVIDIA file. The engine package holds serve
+(serve.exe), LICENSE, NOTICE and THIRD-PARTY-NOTICES.txt, and nothing from
+NVIDIA, apart from crow-nest's own script fetch-nvrtc.ps1 / fetch-nvrtc.sh
+(see below); tools/pack-engine.ps1 and tools/pack-engine.sh refuse to build a
+package that holds an NVIDIA file.
+
+At run time serve loads NVIDIA's runtime compilation library (NVRTC) to compile
+its CUDA kernels, and needs NVRTC 13.3.33, the build the engine's PTX manifest
+was recorded with. You obtain it from NVIDIA yourself: NVIDIA publishes NVRTC as
+the `nvidia-cuda-nvrtc` 13.3.33 wheel on PyPI, and fetch-nvrtc.ps1 (Windows)
+or fetch-nvrtc.sh (Linux), in this package and in tools/, downloads that wheel straight from
+files.pythonhosted.org, checks it against the pinned size and sha256 and
+against the wheel's own RECORD, and places these files beside serve:
 
     Windows   nvrtc64_130_0.dll, nvrtc-builtins64_133.dll
-              (copied unchanged from the CUDA 13.3 toolkit, bin\x64)
-    Linux     libnvrtc.so (the bytes of the toolkit's libnvrtc.so.13, under
-              the unversioned name), libnvrtc-builtins.so.13.3
+    Linux     libnvrtc.so (the bytes of the wheel's libnvrtc.so.13, under the
+              unversioned name cudarc loads first), libnvrtc-builtins.so.13.3
 
-They are NVIDIA's software, unmodified (MANIFEST.json in the package records
-each file's sha256), and are NOT covered by the Apache-2.0 grant in LICENSE.
-They are redistributed under the NVIDIA Software License Agreement and CUDA
-Supplement to Software License Agreement (the CUDA Toolkit EULA):
-
-    https://docs.nvidia.com/cuda/eula/index.html
-    ("Last updated: January 26, 2026"; read 2026-10-05)
-
-The clauses this redistribution rests on, quoted from that page:
-
-  1.1.1 License Grant -- NVIDIA grants a licence to "Distribute those portions
-  of the SDK that are identified in this Agreement as distributable, as
-  incorporated in object code format into a software application that meets
-  the distribution requirements indicated in this Agreement."
-
-  1.1.2 Distribution Requirements -- "These are the distribution requirements
-  for you to exercise the distribution grant:
-    Your application must have material additional functionality, beyond the
-    included portions of the SDK.
-    The distributable portions of the SDK shall only be accessed by your
-    application.
-    [...]
-    The terms under which you distribute your application must be consistent
-    with the terms of this Agreement, including (without limitation) terms
-    relating to the license grant and license restrictions and protection of
-    NVIDIA’s intellectual property rights. Additionally, you agree that you
-    will protect the privacy, security and legal rights of your application
-    users."
-
-  1.2 Limitations -- "For clarity, you may not distribute or sublicense the SDK
-  as a stand-alone product."
-
-  2.2 Distribution -- "The portions of the SDK that are distributable under the
-  Agreement are listed in Attachment A."
-
-  2.3 Operating Systems -- "Those portions of the SDK designed exclusively for
-  use on the Linux or FreeBSD operating systems, or other operating systems
-  derived from the source code to these operating systems, may be copied and
-  redistributed for use in accordance with this Agreement, provided that the
-  object code files are not modified in any way (except for unzipping of
-  compressed files)."
-
-  2.6 Attachment A -- "The following CUDA Toolkit files may be distributed with
-  applications developed by you, including certain variations of these files
-  that have version number or architecture specific information embedded in
-  the file name - as an example only, for release version 9.0 of the 64-bit
-  Windows software, the file cudart64_90.dll is redistributable."
-  Its entry for NVRTC:
-    Component: NVIDIA Runtime Compilation Library and Header
-      All       nvrtc.h
-      Windows   nvrtc.dll, nvrtc-builtins.dll
-      Mac OSX   libnvrtc.dylib, libnvrtc-builtins.dylib
-      Linux     libnvrtc.so, libnvrtc-builtins.so, libnvrtc_static.a,
-                libnvrtc-builtins_static.a
-
-  2.1 License Scope -- "The SDK is licensed for you to develop applications
-  only for use in systems with NVIDIA GPUs."
-
-Questions about these terms go to NVIDIA (EULA 2.5):
-nvidia-compute-license-questions@nvidia.com.
+NVRTC is NVIDIA's software. It is not covered by the Apache-2.0 grant in
+LICENSE, and your use of it is under the licence terms NVIDIA ships with it
+(the wheel and the NVIDIA Software License Agreement and CUDA Supplement to
+Software License Agreement, the CUDA Toolkit EULA,
+https://docs.nvidia.com/cuda/eula/index.html). Questions about those terms go
+to NVIDIA.

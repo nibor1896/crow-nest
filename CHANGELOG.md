@@ -6,6 +6,29 @@
 
 ## Unreleased
 
+## 2026-10-06 — v0.9.2
+
+**The engine package carries no NVIDIA file.** NVRTC comes from NVIDIA's own wheel, fetched by a script that ships beside `serve`; the three open CUDA EULA conditions of v0.9.1 no longer apply, because crow-nest redistributes nothing of NVIDIA's.
+
+### Added
+
+- **`fetch-nvrtc.ps1` / `fetch-nvrtc.sh` fetch NVRTC from NVIDIA** (`acc6e5b`, `882a49f`, 2026-10-06). They download `nvidia-cuda-nvrtc` 13.3.33 from files.pythonhosted.org (Windows `win_amd64` 45,319,163 B, Linux `manylinux2010_x86_64` 51,110,910 B, sha256 and size pinned), extract only `nvrtc64_130_0.dll` + `nvrtc-builtins64_133.dll` (Linux: `libnvrtc.so.13` as `libnvrtc.so` + `libnvrtc-builtins.so.13.3`), check each against the wheel's `RECORD` and refuse on any mismatch or path escape. The script is in the package; `-Selftest` / `--selftest` run offline on a synthetic wheel (16 and 20 checks). Measured 2026-10-06 on Windows from an unpacked 0.9.2-pre zip: both DLLs match the wheel's `RECORD`, and they are byte-identical to the toolkit DLLs v0.8.0–v0.9.1 shipped (`nvrtc64_130_0.dll` sha256 `c7af6b5d…`, `nvrtc-builtins64_133.dll` `82c70380…`). "NVRTC 13.3.73" in older Windows notes is that DLL's file-version label, not another build.
+
+### Changed
+
+- **`pack-engine.ps1` / `pack-engine.sh` stage no NVRTC** (`acc6e5b`). The Windows zip is `serve.exe`, `LICENSE`, `NOTICE`, `THIRD-PARTY-NOTICES.txt`, `fetch-nvrtc.ps1` and `MANIFEST.json`: 3.5 MB zipped, measured 2026-10-06 with a real build. Both scripts refuse a staged NVIDIA-named file. `-CudaBin` / `--cuda-lib` are gone. `NOTICE` says crow-nest distributes no NVIDIA file; `tools/engine_notices.py` checks that and that `NOTICE` names every file the fetch scripts place.
+- **The README's Windows quick start downloads v0.9.2 and runs `fetch-nvrtc.ps1` from the unpacked folder** (2026-10-06).
+
+### Measured
+
+- **Flash-Next boots and answers on Windows with v0.9.1 and a page file** (2026-10-06, `crow-lab/runs/fn-livecheck-win-20261006-b`, RTX 5090, 40 GiB page file, commit limit 103.38 GiB). Boot 106 s; commit 93.14 GiB at ready. One cold image request (1,106 prompt tokens, 800×450 test image described correctly): decode 40.91 tok/s, 473 tokens. One cold text request (73 prompt tokens): 36.24 tok/s. Single runs, short prompts, not an operating-point figure. A first boot with 48.31 GiB free RAM refused at `manager.rs:368` (pinned budget 45.31 GiB < 45.48 GiB cold tier, margin 3 GiB); with ≥ ~48.5 GiB free it boots. This closes v0.9.1's "not yet verified live".
+
+### Known limitations
+
+- **No Linux package.** The v0.9.0 Linux tarball carried NVRTC and is withdrawn; a tarball from `pack-engine.sh` needs a build on Linux. `fetch-nvrtc.sh` is selftested under Git Bash only (20/20); `pack-engine.sh --selftest` 45 ok, 1 failed under Git Bash (the `/proc` check, same as v0.9.0).
+- **Windows only, gate not run** (owner decision, as v0.8.0–v0.9.1). No engine source changed since v0.9.1 (`git diff v0.9.1 -- engine/` is empty).
+- **Older release assets are deleted** (owner decision 2026-10-06): every earlier engine package carried NVRTC.
+
 ## 2026-10-05 — v0.9.1
 
 **Flash-Next boots on a Windows install again, or says why it cannot.** A lone unrelated checkpoint under `models\` was taken as the container's config, a tool call written inside a think block ran as a real call, and a cold tier past the Windows commit limit ran out mid-load with a bare out-of-memory. Windows engine only; the Linux pack stays at v0.9.0. No kernel, weight or decode path changed. The engine package now carries its third-party notices.

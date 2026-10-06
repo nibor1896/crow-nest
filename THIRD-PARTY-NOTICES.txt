@@ -10,8 +10,8 @@ library, whose own licence is listed with it. Each keeps its own terms.
 Where a crate offers a choice ("A OR B"), crow-nest takes it under any one
 of them; every text the crate ships is reproduced.
 
-The NVIDIA NVRTC libraries in the package are not compiled in and are not
-covered here; see NOTICE.
+The package holds no NVIDIA file; NVIDIA's NVRTC, which serve loads at run
+time, is not compiled in and is not covered here; see NOTICE.
 
 ================================================================================
 COMPONENTS

@@ -45,20 +45,15 @@ $env:CROW_CNQ = "converter\Qwen3.8-27B-CNQ4.5.cnq"; engine\target\release\serve.
 engine/target/release/serve.exe --port 8099
 ```
 
-**Windows engine without building** (`serve.exe` + NVRTC from the release, run in the checkout)
+**Windows engine without building** (`serve.exe` from the release, NVRTC from NVIDIA's own wheel)
 
 ```powershell
-irm https://github.com/nibor1896/crow-nest/releases/download/v0.8.0/crow-nest-engine-0.8.0-win-x64.zip -OutFile engine.zip; Expand-Archive engine.zip crow-nest-engine
+irm https://github.com/nibor1896/crow-nest/releases/download/v0.9.2/crow-nest-engine-0.9.2-win-x64.zip -OutFile engine.zip; Expand-Archive engine.zip crow-nest-engine
+powershell -ExecutionPolicy Bypass -File crow-nest-engine\fetch-nvrtc.ps1 -Target crow-nest-engine   # NVRTC 13.3.33 from NVIDIA's PyPI wheel, verified; the zip holds no NVIDIA file
 $env:CROW_CNQ = "converter\Qwen3.8-27B-CNQ4.5.cnq"; crow-nest-engine\serve.exe --port 8099
 ```
 
-**Linux engine without building** (`serve` + NVRTC from the release, glibc 2.34+)
-
-```bash
-curl -LO https://github.com/nibor1896/crow-nest/releases/download/v0.9.0/crow-nest-engine-0.9.0-linux-x64.tar.gz
-mkdir crow-nest-engine && tar -xzf crow-nest-engine-0.9.0-linux-x64.tar.gz -C crow-nest-engine
-CROW_CNQ=converter/Qwen3.8-27B-CNQ4.5.cnq LD_LIBRARY_PATH=$PWD/crow-nest-engine crow-nest-engine/serve --port 8099
-```
+**Linux engine without building**: no Linux package at the moment (the v0.9.0 tarball carried NVRTC and is withdrawn); build from source as above, then `tools/fetch-nvrtc.sh --target engine/target/release`.
 
 **Use from Crow**
 

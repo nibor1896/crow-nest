@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
-Builds serve.exe for shipping and packs it with the NVRTC runtime it loads, then
-proves the package carries no trace of the machine it was built on (#131).
+Builds serve.exe for shipping and packs it, then proves the package carries no trace of
+the machine it was built on (#131) and no NVIDIA file. NVRTC is NOT in the package: the
+user fetches it from NVIDIA's own PyPI wheel with tools\fetch-nvrtc.ps1.
 
 .DESCRIPTION
 A plain `cargo build` serve.exe is not portable (#131, measured 2026-10-01 at f4a3bd8):
@@ -14,11 +15,14 @@ VCRUNTIME140.dll. This script:
    comes second) and `-C target-feature=+crt-static`, through
    CARGO_ENCODED_RUSTFLAGS so a path with spaces stays one argument;
 2. refuses when serve.exe still imports the VC++ runtime (dumpbin /dependents);
-3. stages serve.exe, nvrtc64_130_0.dll and nvrtc-builtins64_133.dll from
-   $env:CUDA_PATH\bin\x64 (the CUDA 13.3 names; there is no nvrtc64_133_0.dll)
-   and LICENSE, NOTICE and THIRD-PARTY-NOTICES.txt (the crates' licence texts and
-   the NVRTC terms), refusing first when `tools/engine_notices.py` says
-   THIRD-PARTY-NOTICES.txt is not what engine/Cargo.lock produces;
+3. stages serve.exe and LICENSE, NOTICE and THIRD-PARTY-NOTICES.txt (the crates'
+   licence texts), refusing first when `tools/engine_notices.py` says
+   THIRD-PARTY-NOTICES.txt is not what engine/Cargo.lock produces, and refusing when
+   the stage holds any NVIDIA file (nvrtc, nvidia, cuda, cublas, cudart in a name) or
+   anything else than those four plus tools\fetch-nvrtc.ps1, which is staged beside
+   serve.exe so that a user without a checkout can run it. NVRTC (nvrtc64_130_0.dll and
+   nvrtc-builtins64_133.dll, the CUDA 13.3 names) is placed beside serve.exe by that
+   script;
 4. scans every staged file (the notices included), as UTF-8 and as UTF-16LE at both byte alignments, for
    the builder's profile path, any `\Users\<name>\`, the bare user name (any
    context, case-insensitive) and the computer name, and REFUSES on any hit;
@@ -30,9 +34,6 @@ VCRUNTIME140.dll. This script:
 The version in the zip name. Default: `git describe --tags --always --dirty`
 without the leading `v` (exactly `0.7.2` on the tag, `0.7.2-N-g<sha>` after it).
 
-.PARAMETER CudaBin
-Where the NVRTC DLLs are taken from. Default: $env:CUDA_PATH\bin\x64.
-
 .PARAMETER OutDir
 Where the stage and the zip go. Default: dist\ in the repo root (gitignored).
 
@@ -42,16 +43,17 @@ Run the checks on synthetic inputs, including ones that must fail, without build
 [CmdletBinding()]
 param(
     [string] $Version = "",
-    [string] $CudaBin = "",
     [string] $OutDir  = "",
     [switch] $Selftest
 )
 
 $ErrorActionPreference = "Stop"
 
-$NVRTC_DLLS = @('nvrtc64_130_0.dll', 'nvrtc-builtins64_133.dll')
-# from the repo root: crow-nest's licence, NOTICE (NVRTC terms) and the crates' texts
+# from the repo root: crow-nest's licence, NOTICE and the crates' texts. The package holds no
+# NVIDIA file: nothing is staged from a CUDA install.
 $SHIP_FILES = @('LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.txt')
+# crow-nest's own script that fetches NVRTC from NVIDIA; staged from tools\ beside serve.exe
+$TOOL_FILES = @('fetch-nvrtc.ps1')
 # the C runtime that +crt-static links in; any of these in the imports means it did not
 $VC_RUNTIME = @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'ucrtbase.dll')
 
@@ -120,7 +122,14 @@ function Find-StageHits {
 
 # The files a package holds, MANIFEST.json aside.
 function Get-PackageFiles {
-    return @(@('serve.exe') + $NVRTC_DLLS + $SHIP_FILES)
+    return @(@('serve.exe') + $TOOL_FILES + $SHIP_FILES)
+}
+
+# Every file under a directory whose name looks like NVIDIA's (nvrtc, nvidia, cuda, cublas,
+# cudart; any case), except crow-nest's own fetch script: what the build refuses on.
+function Find-NvidiaFiles {
+    param([string] $Dir)
+    return @(Get-ChildItem -LiteralPath $Dir -Recurse -File -Force | Where-Object { $TOOL_FILES -notcontains $_.Name -and $_.Name -match '(?i)nvrtc|nvidia|cuda|cublas|cudart' })
 }
 
 function Get-Manifest {
@@ -225,7 +234,25 @@ function Invoke-Selftest {
     Check "the package carries LICENSE" ($pf -contains 'LICENSE')
     Check "the package carries NOTICE" ($pf -contains 'NOTICE')
     Check "the package carries THIRD-PARTY-NOTICES.txt" ($pf -contains 'THIRD-PARTY-NOTICES.txt')
-    Check "the package is 6 distinct files + MANIFEST.json" ($pf.Count -eq 6 -and @($pf | Sort-Object -Unique).Count -eq 6)
+    Check "the package is 5 distinct files + MANIFEST.json" ($pf.Count -eq 5 -and @($pf | Sort-Object -Unique).Count -eq 5)
+    # the package holds no NVIDIA file
+    Check "the package list names no NVIDIA file (nvrtc, nvidia, cuda in a name, fetch-nvrtc.ps1 aside)" (@($pf | Where-Object { $_ -ne 'fetch-nvrtc.ps1' -and $_ -match '(?i)nvrtc|nvidia|cuda' }).Count -eq 0)
+    Check "the package is exactly serve.exe, fetch-nvrtc.ps1, LICENSE, NOTICE, THIRD-PARTY-NOTICES.txt (+ MANIFEST.json)" ((($pf | Sort-Object) -join ',') -ceq 'fetch-nvrtc.ps1,LICENSE,NOTICE,serve.exe,THIRD-PARTY-NOTICES.txt')
+    Check "the package carries fetch-nvrtc.ps1" ($pf -contains 'fetch-nvrtc.ps1')
+    $nv = Join-Path ([IO.Path]::GetTempPath()) ("crow-nest-pack-selftest-" + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $nv | Out-Null
+    try {
+        foreach ($n in $pf) { [IO.File]::WriteAllBytes((Join-Path $nv $n), [byte[]]@()) }
+        Check "the stage check passes the five package files (fetch-nvrtc.ps1 included)" ((Find-NvidiaFiles -Dir $nv).Count -eq 0)
+        foreach ($bad in @('nvrtc64_130_0.dll', 'nvrtc-builtins64_133.dll', 'NVRTC64_130_0.DLL', 'libnvrtc.so', 'cudart64_13.dll')) {
+            [IO.File]::WriteAllBytes((Join-Path $nv $bad), [byte[]]@())
+            Check "the stage check refuses a staged $bad" ((Find-NvidiaFiles -Dir $nv).Count -ge 1)
+            Remove-Item -LiteralPath (Join-Path $nv $bad) -Force
+        }
+        New-Item -ItemType Directory -Force -Path (Join-Path $nv 'sub') | Out-Null
+        [IO.File]::WriteAllBytes((Join-Path $nv 'sub\nvrtc64_130_0.dll'), [byte[]]@())
+        Check "the stage check refuses an NVIDIA file in a subfolder" ((Find-NvidiaFiles -Dir $nv).Count -eq 1)
+    } finally { Remove-Item -LiteralPath $nv -Recurse -Force }
     $st = Join-Path ([IO.Path]::GetTempPath()) ("crow-nest-pack-selftest-" + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $st | Out-Null
     try {
@@ -250,6 +277,15 @@ function Invoke-Selftest {
         }
     }
 
+    foreach ($f in $TOOL_FILES) {
+        $p = Join-Path $repoRoot "tools\$f"
+        $present = Test-Path -LiteralPath $p
+        Check "tools\$f exists" $present
+        if ($present) {
+            Check "tools\$f passes this machine's privacy scan" (@(Find-PrivacyHits -Bytes ([IO.File]::ReadAllBytes($p)) -Needles $real -Name $f).Count -eq 0)
+        }
+    }
+
     Write-Host ("selftest: {0} ok, {1} failed" -f $script:ok, $script:red)
     if ($script:red -gt 0) { exit 1 }
     exit 0
@@ -267,10 +303,6 @@ if (-not $Version) {
     if (-not $d) { throw "git describe gave no version - pass -Version" }
     $Version = ($d | Select-Object -First 1).Trim() -replace '^v', ''
 }
-if (-not $CudaBin) {
-    if (-not $env:CUDA_PATH) { throw "CUDA_PATH is not set - pass -CudaBin" }
-    $CudaBin = Join-Path $env:CUDA_PATH 'bin\x64'
-}
 if (-not $OutDir) { $OutDir = Join-Path $repo 'dist' }
 # the crates' licence texts must be the ones this Cargo.lock compiles in
 $py = Get-Command python -ErrorAction SilentlyContinue
@@ -284,7 +316,6 @@ $profileDir = $env:USERPROFILE.TrimEnd('\')
 
 Write-Host "packing crow-nest engine $Version"
 Write-Host "  repo   : $repo"
-Write-Host "  nvrtc  : $CudaBin"
 Write-Host "  out    : $OutDir"
 
 $target = Join-Path $repo 'engine\target_pack'
@@ -325,15 +356,10 @@ $stage = Join-Path $OutDir "crow-nest-engine-$Version-win-x64"
 if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 Copy-Item -LiteralPath $serve -Destination $stage
-foreach ($dll in $NVRTC_DLLS) {
-    $src = Join-Path $CudaBin $dll
-    if (-not (Test-Path -LiteralPath $src)) {
-        $have = (Get-ChildItem -LiteralPath $CudaBin -Filter 'nvrtc*' -ErrorAction SilentlyContinue | ForEach-Object Name) -join ', '
-        throw "missing $src (nvrtc files there: $have)"
-    }
-    Copy-Item -LiteralPath $src -Destination $stage
-}
 foreach ($f in $SHIP_FILES) { Copy-Item -LiteralPath (Join-Path $repo $f) -Destination $stage }
+foreach ($f in $TOOL_FILES) { Copy-Item -LiteralPath (Join-Path $repo "tools\$f") -Destination $stage }
+$nvidia = @(Find-NvidiaFiles -Dir $stage)
+if ($nvidia.Count -gt 0) { throw ("the stage holds an NVIDIA file (" + (($nvidia | ForEach-Object Name) -join ', ') + ") - crow-nest does not distribute NVRTC; tools\fetch-nvrtc.ps1 fetches it from NVIDIA") }
 $staged = @(Get-ChildItem -LiteralPath $stage -File | ForEach-Object Name | Sort-Object)
 $want = @(Get-PackageFiles | Sort-Object)
 if (Compare-Object $staged $want) { throw ("the stage holds " + ($staged -join ', ') + " - expected " + ($want -join ', ')) }
