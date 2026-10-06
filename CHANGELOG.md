@@ -6,6 +6,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The f32 oracles normalize the PLE layer per stream, like the model** (#138, 2026-10-06). `PleRef.rms` in `oracle/ref_engine_logits.py`, `ref_image_prompt_logits.py` and `ref_longctx_logits.py` took one RMS over all 10,240 values of norm_key / norm_query / norm_conv; transformers 5.16.1 (`Qwen4ExpTextRMSNorm(group_size=hidden_size)`) and the engine (`rms_group`) take one per 2,560-value stream. Every oracle-KLD number so far was measured against references with this error, among them the 0.461 of `docs/oracle-kld.md`; the corrected references need the original checkpoint, which is not on this machine (not re-measured). `tools/test_oracle_ple_norm.py` compares each script's norm with transformers' class, no checkpoint needed: red without the fix (max_abs 4.53), green with it; `ref_longctx_logits.py self-test` PASS.
+
+### Measured
+
+- **Oracle-KLD after the PLE fix, against the uncorrected references** (2026-10-06, Windows, `3fe9123`, `decode parity`, `CROW_GRAPH=1 CROW_MMA=1`, `crow-lab/runs/fn-oracle-kld-win-20261006`): 298 rows KLD 0.4298 ± 0.0510, top-1 80.54 % (2026-09-05 engine: 0.3377, 83.22 %); 607 rows 0.5898 ± 0.0632, 79.41 % (0.4646, 81.55 %). Against the same references the 2026-09-05 engine with PLE off reads 0.4148 on 298 rows, so the corrected PLE reads like no PLE (paired +0.015 ± 0.034). Read with #138: these references cannot judge the PLE fix.
+
 ## 2026-10-06 — v0.9.3
 
 **A killed engine no longer blocks the next start, and Flash-Next boots again on a loaded Windows desktop.** The engine lock is an OS file lock that Windows drops with the process, and `CROW_RAM_MARGIN_GB` defaults to 1 GiB.
