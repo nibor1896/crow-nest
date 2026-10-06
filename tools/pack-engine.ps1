@@ -234,7 +234,7 @@ function Invoke-Selftest {
     Check "the package carries LICENSE" ($pf -contains 'LICENSE')
     Check "the package carries NOTICE" ($pf -contains 'NOTICE')
     Check "the package carries THIRD-PARTY-NOTICES.txt" ($pf -contains 'THIRD-PARTY-NOTICES.txt')
-    Check "the package is 6 distinct files + MANIFEST.json" ($pf.Count -eq 6 -and @($pf | Sort-Object -Unique).Count -eq 6)
+    Check "the package is 5 distinct files + MANIFEST.json" ($pf.Count -eq 5 -and @($pf | Sort-Object -Unique).Count -eq 5)
     # the package holds no NVIDIA file
     Check "the package list names no NVIDIA file (nvrtc, nvidia, cuda in a name, fetch-nvrtc.ps1 aside)" (@($pf | Where-Object { $_ -ne 'fetch-nvrtc.ps1' -and $_ -match '(?i)nvrtc|nvidia|cuda' }).Count -eq 0)
     Check "the package is exactly serve.exe, fetch-nvrtc.ps1, LICENSE, NOTICE, THIRD-PARTY-NOTICES.txt (+ MANIFEST.json)" ((($pf | Sort-Object) -join ',') -ceq 'fetch-nvrtc.ps1,LICENSE,NOTICE,serve.exe,THIRD-PARTY-NOTICES.txt')

@@ -45,7 +45,6 @@ set -euo pipefail
 
 GLIBC_FLOOR="2.34"
 # The package holds no NVIDIA file: nothing is staged from a CUDA install.
-nvrtc_staged_names() { :; }
 # from the repo root: crow-nest's licence, NOTICE and the crates' texts
 SHIP_FILES=(LICENSE NOTICE THIRD-PARTY-NOTICES.txt)
 # crow-nest's own script that fetches NVRTC from NVIDIA; staged from tools/ beside serve
@@ -190,9 +189,6 @@ selftest() {
   check_true "2.9 is within the 2.34 floor (version order, not text)" "$(version_le 2.9 2.34 && echo 1 || echo 0)"
   check_true "2.35 is above the 2.34 floor" "$(version_le 2.35 2.34 && echo 0 || echo 1)"
   check_true "the highest of 2.2.5, 2.34, 2.17 is 2.34" "$([ "$(printf '2.2.5\n2.34\n2.17\n' | sort -V | tail -1)" = 2.34 ] && echo 1 || echo 0)"
-  check_true "NVRTC is staged as libnvrtc.so (cudarc tries that name first)" "$(nvrtc_staged_names | grep -qx 'libnvrtc.so' && echo 1 || echo 0)"
-  check_true "no versioned libnvrtc.so.<n> is staged (it would be a duplicate)" "$(nvrtc_staged_names | grep -qE '^libnvrtc\.so\.' && echo 0 || echo 1)"
-  check_true "the builtins keep the name libnvrtc dlopens" "$(nvrtc_staged_names | grep -qx 'libnvrtc-builtins.so.13.3' && echo 1 || echo 0)"
   check_true "the pack name" "$([ "$(pack_name 0.8.0)" = crow-nest-engine-0.8.0-linux-x64.tar.gz ] && echo 1 || echo 0)"
 
   # the package holds no NVIDIA file
@@ -217,7 +213,7 @@ selftest() {
   for f in LICENSE NOTICE THIRD-PARTY-NOTICES.txt; do
     check_true "the package carries $f" "$(package_files | grep -qx "$f" && echo 1 || echo 0)"
   done
-  check_true "the package is 6 distinct files + MANIFEST.json" "$([ "$(package_files | sort -u | wc -l)" -eq 6 ] && [ "$(package_files | wc -l)" -eq 6 ] && echo 1 || echo 0)"
+  check_true "the package is 5 distinct files + MANIFEST.json (NVRTC naming lives in fetch-nvrtc.sh --selftest)" "$([ "$(package_files | sort -u | wc -l)" -eq 5 ] && [ "$(package_files | wc -l)" -eq 5 ] && echo 1 || echo 0)"
   w NOTICE "see /home/builder/dev/NOTICE"
   check "the scan finds a leak in a NOTICE" hit "$t/NOTICE"
   printf '%s' "built on buildbox" | iconv -f UTF-8 -t UTF-16LE > "$t/THIRD-PARTY-NOTICES.txt"
