@@ -286,6 +286,12 @@ pub fn pooled_row_bytes(geo: &Geo) -> usize {
 ///   `park_blocks` pooled QSA blocks of the QSA raw key width in f32 per attention layer
 /// - C5: the pooled blocks are the `Attn::Qsa` arm; full attention parks KV rows only
 pub fn park_host_bytes(geo: &Geo, rows: usize, n_ctx: usize, attn_layers: usize, kv_value_bytes: usize) -> usize {
+    park_host_bytes_rows(geo, rows, n_ctx, attn_layers, geo.head_dim * kv_value_bytes)
+}
+
+/// - #88: `park_host_bytes` with the KV row size in bytes (`KvDtype::row_bytes`): a q8 row
+///   is not a whole number of bytes per value (272 B for 256 values: int8 + f16 scales)
+pub fn park_host_bytes_rows(geo: &Geo, rows: usize, n_ctx: usize, attn_layers: usize, kv_row_bytes: usize) -> usize {
     let pooled = match geo.attn {
         Attn::Qsa { .. } => {
             let q = geo.qsa();
@@ -293,7 +299,7 @@ pub fn park_host_bytes(geo: &Geo, rows: usize, n_ctx: usize, attn_layers: usize,
         }
         Attn::Full => 0,
     };
-    rows * attn_layers * 2 * geo.kv_heads * geo.head_dim * kv_value_bytes + pooled
+    rows * attn_layers * 2 * geo.kv_heads * kv_row_bytes + pooled
 }
 
 /// - #118: may a parked snapshot at `p` be rolled back onto after other requests wrote
@@ -872,7 +878,7 @@ impl PrefixCache {
             };
             // whatever the last request left in flight must land before the copies read it
             cuda::sync();
-            let row_bytes = eng.geo.head_dim * eng.st.kv.byte_per_value();
+            let row_bytes = eng.st.kv.row_bytes(eng.geo.head_dim);
             let n = rows * row_bytes;
             // the Geo's attention layer count: `qsa_pooled.len()` is 0 for full attention, and
             // the park then copied no KV row at all
@@ -923,7 +929,7 @@ impl PrefixCache {
         let Some(pk) = self.adopt_parked() else { return 0.0 };
         cuda::sync();
         eng.drop_decode_graph();
-        let row_bytes = eng.geo.head_dim * eng.st.kv.byte_per_value();
+        let row_bytes = eng.st.kv.row_bytes(eng.geo.head_dim);
         let n = pk.rows * row_bytes;
         for (g, (layer, is_k, kvh)) in crate::slot::kv_row_order(eng.geo.attn_layers, eng.geo.kv_heads).enumerate() {
             cuda::upload_into(eng.st.kv_row_ptr(layer, is_k, kvh, 0), &self.park_kv[g * n..(g + 1) * n]);

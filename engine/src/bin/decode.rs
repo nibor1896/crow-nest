@@ -785,14 +785,26 @@ fn main() {
                     for (gname, a, b) in groups {
                         let (rr, mx) = rel(&got[a * h..b * h], &want[a * h..b * h]);
                         let ok = rr <= thr;
-                        let verdict = if !judged { "reported (FP8 KV)" } else if ok { "PASS" } else { "FAIL" };
+                        let verdict = if !judged {
+                            if cfg.kv == KvDtype::Q8Block { "reported (q8 KV, #88)" } else { "reported (FP8 KV)" }
+                        } else if ok {
+                            "PASS"
+                        } else {
+                            "FAIL"
+                        };
                         if judged && !ok {
                             fails += 1;
                         }
                         println!("p2golden {name:<20} {gname:<6} rows {a:>2}..{:<2} rel_rms {rr:.3e}  max_abs {mx:.3e}  threshold {thr:.2e} (quant mark {mark:.4})  {verdict}", b - 1);
                     }
                 }
-                println!("p2golden: {} (KV {})", if fails == 0 { "ALL PASS" } else { "FAILED" }, if kv_bf16 { "bf16" } else { "fp8, attention not judged" });
+                println!("p2golden: {} (KV {})", if fails == 0 { "ALL PASS" } else { "FAILED" }, if kv_bf16 {
+                    "bf16"
+                } else if cfg.kv == KvDtype::Q8Block {
+                    "q8, attention not judged (#88: its gate is the long-context KLD against bf16)"
+                } else {
+                    "fp8, attention not judged"
+                });
                 selftest_failed = fails > 0;
             }
             "selftest" => {

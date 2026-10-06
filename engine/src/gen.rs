@@ -747,7 +747,7 @@ impl Engine {
     pub fn qsa_ring_rows(&self) -> usize { self.st.qsa_ring_rows }
     /// #118: host bytes a park of `rows` KV rows takes (`cache::park_host_bytes`)
     pub fn park_host_bytes(&self, rows: usize) -> usize {
-        crate::cache::park_host_bytes(&self.geo, rows, self.st.context, self.geo.attn_layers, self.st.kv.byte_per_value())
+        crate::cache::park_host_bytes_rows(&self.geo, rows, self.st.context, self.geo.attn_layers, self.st.kv.row_bytes(self.geo.head_dim))
     }
     /// #13: the operating point of this process, for the ONE structured boot
     /// line (`log::boot`). Reporting only — it reads the loaded state and the
@@ -1350,9 +1350,9 @@ impl Engine {
         let dense = head_rms.map(|(norm, lm_head)| DenseW { ln1, ln2, mlp, norm, lm_head });
         let has_mtp = cnq.tensors.iter().any(|t| t.name == "mtp.fc.weight" && t.section == "mtp");
         let mtp = if dense.is_some() && has_mtp && mtp_on() {
-            let m = load_mtp(cnq, &d, &geo, cfg.context, cfg.kv.byte_per_value(), cfg.prompt_chunk);
+            let m = load_mtp(cnq, &d, &geo, cfg.context, cfg.kv.row_bytes(d.ahd), cfg.prompt_chunk);
             log(&format!("MTP head loaded (default, CROW_MTP=0 turns it off; crow-nest #95): BF16 weights, own KV cache {:.1} MB, scratch {:.1} MB",
-                (2 * d.nkv * cfg.context * d.ahd * cfg.kv.byte_per_value()) as f64 / 1e6,
+                (2 * d.nkv * cfg.context * cfg.kv.row_bytes(d.ahd)) as f64 / 1e6,
                 (4 * 4 * cfg.prompt_chunk * d.h) as f64 / 1e6));
             Some(m)
         } else {
@@ -1726,9 +1726,15 @@ impl Engine {
         crate::kernels::kprof_init();
         // C4: the kernel source takes its shape from the runtime Geo (a `#define CN_*`
         // prelude); for Flash-Next the PTX is byte-identical to the pre-C4 source
-        let module = cuda::compile(&crate::kernels::KernelGeo::of(&geo).source());
-        let kgeo = crate::kernels::KernelGeo::of(&geo);
-        let k = Kernels::new(&module, kgeo.p2);
+        // #88: CROW_KV=q8 appends the q8 KV twins to the source and swaps the three KV
+        // kernels to them; every other boot compiles and resolves exactly what it did before
+        let kgeo = crate::kernels::KernelGeo { q8kv: cfg.kv == KvDtype::Q8Block, ..crate::kernels::KernelGeo::of(&geo) };
+        let module = cuda::compile(&kgeo.source());
+        let mut k = Kernels::new(&module, kgeo.p2);
+        if kgeo.q8kv {
+            k.arm_q8_kv(&module);
+            log("[kv] #88 q8 KV cache: int8 + one f16 scale per 32 values; store_kv / attn_full_split / attn_full_fa run their q8 twins (opt-in, long-context quality gate pending)");
+        }
         assert_kernel_defines();
         let p = Params::setup(&cfg, &d, &st);
         // routing counts per expert: none without experts (phase 2)
@@ -1891,9 +1897,9 @@ unsafe fn lend_upload(host: &mut Vec<(Dev, Vec<u8>)>, what: &'static str, bytes:
 }
 
 /// crow-nest #95: the MTP head from the container's `mtp` section (all BF16 in the dense
-/// recipe), its own KV cache (`context` rows per KV head, `bpv` bytes a value) and three
+/// recipe), its own KV cache (`context` rows per KV head of `kv_row_bytes`, `KvDtype::row_bytes`) and three
 /// `[chunk][H]` f32 scratch rows
-unsafe fn load_mtp(cnq: &mut Cnq, d: &Dims, geo: &Geo, context: usize, bpv: usize, chunk: usize) -> MtpW {
+unsafe fn load_mtp(cnq: &mut Cnq, d: &Dims, geo: &Geo, context: usize, kv_row_bytes: usize, chunk: usize) -> MtpW {
     let sec = "mtp";
     let n_gdn = (0..d.layers).filter(|&l| !d.is_attn(l)).count();
     let s_bytes = 4 * crate::manager::gdn_s_state_len(geo);
@@ -1905,7 +1911,7 @@ unsafe fn load_mtp(cnq: &mut Cnq, d: &Dims, geo: &Geo, context: usize, bpv: usiz
     assert_eq!(raw.len(), h * 2 * h * 2, "mtp.fc.weight is [H][2H] BF16");
     let (fe, fh) = split_fc_halves(&raw, h);
     let pfx = |s: &str| format!("mtp.layers.0.{s}");
-    let cache = d.nkv * context * d.ahd * bpv;
+    let cache = d.nkv * context * kv_row_bytes;
     // the BF16 weights in lendable memory, each with its host copy for the refill
     let mut host: Vec<(Dev, Vec<u8>)> = Vec::new();
     let bf = |cnq: &mut Cnq, host: &mut Vec<(Dev, Vec<u8>)>, what: &'static str, name: &str| -> PW {
@@ -2654,7 +2660,8 @@ impl Params {
             k_top: cuda::to_i32_dev(&[d.qsa_block_topk as i32]),
             cap: cuda::to_i32_dev(&[cap_blocks as i32]),
             tmax: cuda::to_i32_dev(&[cfg.context as i32]),
-            mode: cuda::to_i32_dev(&[match cfg.kv { KvDtype::Fp8E4m3 => 0, KvDtype::Bf16 => 1 }]),
+            // #88: q8 reads no mode (its kernels are their own entries); 2 names it in a dump
+            mode: cuda::to_i32_dev(&[match cfg.kv { KvDtype::Fp8E4m3 => 0, KvDtype::Bf16 => 1, KvDtype::Q8Block => 2 }]),
             t: cuda::to_i32_dev(&[1]),
             init: cuda::to_i32_dev(&[1]),
             pos_base: cuda::to_i32_dev(&[0]),
@@ -2933,8 +2940,7 @@ impl Engine {
     // (kc, vc, qsa_keys, qsa_pooled) device addresses of a layer's caches
     fn layer_cache_ptrs(&self, layer: usize) -> (u64, u64, u64, u64) {
         let ai = self.d.attn_index(layer);
-        let bpv = self.st.kv.byte_per_value() as u64;
-        let per_layer = (self.d.nkv * self.st.context * self.d.ahd) as u64 * bpv;
+        let per_layer = (self.d.nkv * self.st.context) as u64 * self.st.kv.row_bytes(self.d.ahd) as u64;
         // kv_buf holds ATTN_LAYERS layer slots — index by ATTENTION index,
         // not by the raw layer id (36 GDN layers shift the numbering!)
         let kc = self.st.kv_buf as u64 + (ai * 2) as u64 * per_layer;
@@ -4557,20 +4563,21 @@ impl Engine {
 
     /// Crow #300 phase 2: rows `0..rows` of one KV cache plane (attention layer `ai` by its
     /// attention index, K or V, KV head `kvh`) as f32 `[rows][AHD]`, decoded from the cache's
-    /// dtype (bf16 exactly, e4m3 by `cnq::e4m3_to_f32`) - the measurement door of `decode kvstats`
+    /// dtype (bf16 exactly, e4m3 by `cnq::e4m3_to_f32`, #88 q8 as int8 x its block's f16 scale)
+    /// - the measurement door of `decode kvstats`
     ///
     /// # Safety
     ///
     /// A CUDA context must be current and no kernel of this engine may be in flight.
     pub unsafe fn kv_rows_host(&self, ai: usize, is_k: bool, kvh: usize, rows: usize) -> Vec<f32> {
         cuda::sync();
-        let bpv = self.st.kv.byte_per_value();
-        let mut raw = vec![0u8; rows * self.d.ahd * bpv];
+        let rb = self.st.kv.row_bytes(self.d.ahd);
+        let mut raw = vec![0u8; rows * rb];
         crate::slot::dtoh_bytes(&mut raw, self.st.kv_row_ptr(ai, is_k, kvh, 0));
-        if bpv == 2 {
-            raw.as_chunks::<2>().0.iter().map(|c| f32::from_bits((u16::from_le_bytes(*c) as u32) << 16)).collect()
-        } else {
-            raw.iter().map(|&b| crate::cnq::e4m3_to_f32(b)).collect()
+        match self.st.kv {
+            KvDtype::Bf16 => raw.as_chunks::<2>().0.iter().map(|c| f32::from_bits((u16::from_le_bytes(*c) as u32) << 16)).collect(),
+            KvDtype::Fp8E4m3 => raw.iter().map(|&b| crate::cnq::e4m3_to_f32(b)).collect(),
+            KvDtype::Q8Block => raw.chunks(rb).flat_map(|r| crate::kernels_p2::q8kv::decode_row(r, self.d.ahd)).collect(),
         }
     }
 
