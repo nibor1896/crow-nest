@@ -221,7 +221,8 @@ impl StateSizes {
     /// geometry is the model's `Geo`. C5: the QSA ring and pooled cache are the
     /// `Attn::Qsa` arm; full attention plans none of them (zero bytes, zero rows).
     pub fn plan(geo: &Geo, context: usize, kv: KvDtype, prompt_chunk: usize) -> StateSizes {
-        let bpv = kv.byte_per_value() as u64;
+        // #88: the bytes of one KV row (a q8 row carries its scales: 272 B at head dim 256)
+        let row = kv.row_bytes(geo.head_dim) as u64;
         let (attn_layers, gdn_layers) = (geo.attn_layers, geo.gdn_layers);
         let (qsa_keys_bytes, ring, qsa_pooled_bytes) = match geo.attn {
             Attn::Qsa { .. } => {
@@ -244,7 +245,7 @@ impl StateSizes {
             Attn::Full => (0, 0, 0),
         };
         StateSizes {
-            kv_bytes: (attn_layers * 2 * geo.kv_heads * geo.head_dim * context) as u64 * bpv,
+            kv_bytes: (attn_layers * 2 * geo.kv_heads * context) as u64 * row,
             qsa_keys_bytes,
             qsa_ring_rows: ring,
             qsa_pooled_bytes,
@@ -279,7 +280,8 @@ pub const fn ple_state_len(geo: &Geo) -> usize {
 
 impl StateSizes {
     /// every state byte the planner sets aside before the hot set (KV at the
-    /// config's dtype - bf16 doubles `kv_bytes`, #102 - plus QSA, GDN, rope)
+    /// config's dtype - bf16 doubles `kv_bytes`, #102, q8 is 17/16 of fp8, #88 -
+    /// plus QSA, GDN, rope)
     pub fn total(&self) -> u64 {
         self.kv_bytes + self.qsa_keys_bytes + self.qsa_pooled_bytes
             + self.gdn_s_bytes + self.gdn_conv_bytes + self.rope_bytes
@@ -291,7 +293,7 @@ pub struct ThreeStates {
     pub geo: Geo,
     pub context: usize,
     pub kv: KvDtype,
-    pub kv_buf: CUdeviceptr,      // [12][2][nkv][t][256] — one accounting
+    pub kv_buf: CUdeviceptr,      // [12][2][nkv][t][KvDtype::row_bytes(256)] — one accounting
     pub qsa_keys: Vec<CUdeviceptr>, // [12][ring][128] f32 (row = pos % ring)
     pub qsa_ring_rows: usize,
     pub qsa_pooled: Vec<CUdeviceptr>, // [12][ceil(t/4)][128] f32
@@ -548,13 +550,11 @@ impl ThreeStates {
     }
 
     pub unsafe fn kv_row_ptr(&self, layer: usize, is_k: bool, kvh: usize, slot: usize) -> u64 {
-        let b = (self.kv.byte_per_value()) as u64;
         self.kv_buf as u64
             + ((layer * 2 + if is_k { 0 } else { 1 }) * self.geo.kv_heads * self.context
                 + kvh * self.context
                 + slot) as u64
-            * self.geo.head_dim as u64
-            * b
+            * self.kv.row_bytes(self.geo.head_dim) as u64
     }
 }
 
@@ -1284,6 +1284,74 @@ mod tests_kv_dtype {
         assert_eq!(KvDtype::from_env_value(None), Ok(None));
         assert_eq!(KvDtype::from_env_value(Some("bf16")), Ok(Some(KvDtype::Bf16)));
         assert!(KvDtype::from_env_value(Some("bf61")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests_88_q8kv {
+    //! #88: `CROW_KV=q8` - a KV row of 256 values is 272 B (256 int8 + 8 f16 scales) and the
+    //! planner, the park and the slot header pay exactly that. Pure arithmetic, no GPU.
+    use super::*;
+
+    /// The dense 27B at 200,000 (ticket #88, 2026-10-01: the BF16 boot was refused at
+    /// `dense_fit`, "needs 12.40 GiB of states ... free 12.17 GiB"): q8 KV is 17/32 of BF16
+    /// KV, nothing else in the plan moves, and the same free VRAM holds it.
+    #[test]
+    fn q8_kv_plans_17_32_of_bf16_and_fits_the_27b_at_200k_where_bf16_was_refused() {
+        let g = crate::meta::dense_fixture_geo();
+        assert_eq!((g.attn_layers, g.kv_heads, g.head_dim), (16, 4, 256));
+        assert_eq!((KvDtype::Fp8E4m3.row_bytes(256), KvDtype::Bf16.row_bytes(256), KvDtype::Q8Block.row_bytes(256)), (256, 512, 272));
+        let b = StateSizes::plan(&g, 200_000, KvDtype::Bf16, 2048);
+        let q = StateSizes::plan(&g, 200_000, KvDtype::Q8Block, 2048);
+        // 16 layers x 2 (k, v) x 4 kv-heads x 200,000 rows x 272 B (bf16: x 512 B)
+        assert_eq!(q.kv_bytes, 6_963_200_000);
+        assert_eq!(b.kv_bytes, 13_107_200_000);
+        assert_eq!(q.kv_bytes * 32, b.kv_bytes * 17);
+        assert_eq!(
+            (q.qsa_keys_bytes, q.qsa_pooled_bytes, q.gdn_s_bytes, q.gdn_conv_bytes, q.rope_bytes),
+            (b.qsa_keys_bytes, b.qsa_pooled_bytes, b.gdn_s_bytes, b.gdn_conv_bytes, b.rope_bytes)
+        );
+        let (free, pending) = ((12.17 * GIB) as u64, (0.12 * GIB) as u64);
+        let e = dense_fit(free, b.total(), pending, 0, 200_000).unwrap_err();
+        assert!(e.contains("context 200000 needs 12.40 GiB of states") && e.contains("free 12.17 GiB"), "{e}");
+        let (_, lines) = dense_fit(free, q.total(), pending, 0, 200_000).unwrap();
+        assert!(lines[0].starts_with("dense FFN, no hot set: states 6.68 GiB + pending 0.12 GiB"), "{}", lines[0]);
+        // the park stash and the slot rows take the same row size
+        assert_eq!(
+            crate::cache::park_host_bytes_rows(&g, 8_192, 200_000, 16, KvDtype::Q8Block.row_bytes(g.head_dim)),
+            8_192 * 16 * 2 * 4 * 272
+        );
+    }
+
+    /// `q8` parses and round-trips; it is refused on a model whose attention is not
+    /// `Attn::Full` (Flash-Next's `attn_sel*` have no q8 path) and on a head dim that is not
+    /// whole 32-value blocks; unset and the other words resolve as before
+    #[test]
+    fn crow_kv_q8_parses_and_is_refused_where_the_attention_is_not_full() {
+        assert_eq!(KvDtype::parse("q8"), Ok(KvDtype::Q8Block));
+        assert_eq!(KvDtype::parse("Q8"), Ok(KvDtype::Q8Block));
+        assert_eq!(KvDtype::parse(KvDtype::Q8Block.name()), Ok(KvDtype::Q8Block), "name() must round-trip");
+        for bad in ["q4", "int8", "q8 ", "8"] {
+            let e = KvDtype::parse(bad).unwrap_err();
+            assert!(e.contains("accepted: bf16, fp8, fp8_e4m3, q8"), "{bad:?}: {e}");
+        }
+        let dense = crate::meta::dense_fixture_geo();
+        let fx = Geo::FLASH_NEXT;
+        assert_eq!(KvDtype::kv_for(&dense, Some(KvDtype::Q8Block)), Ok(KvDtype::Q8Block));
+        assert_eq!(KvDtype::kv_for(&dense, None), Ok(KvDtype::Bf16));
+        assert_eq!(KvDtype::kv_for(&fx, None), Ok(KvDtype::Fp8E4m3));
+        for k in [KvDtype::Fp8E4m3, KvDtype::Bf16] {
+            assert_eq!(KvDtype::kv_for(&dense, Some(k)), Ok(k));
+            assert_eq!(KvDtype::kv_for(&fx, Some(k)), Ok(k));
+        }
+        let e = KvDtype::kv_for(&fx, Some(KvDtype::Q8Block)).unwrap_err();
+        assert!(e.contains("full attention only"), "{e}");
+        let odd = Geo { head_dim: 80, ..dense };
+        let e = KvDtype::kv_for(&odd, Some(KvDtype::Q8Block)).unwrap_err();
+        assert!(e.contains("multiple of 32"), "{e}");
+        // the q8 kernel text never reaches a module without the phase 2 kernels
+        let fk = crate::kernels::KernelGeo { q8kv: true, ..crate::kernels::KernelGeo::flash_next() };
+        assert!(std::panic::catch_unwind(|| fk.source()).is_err());
     }
 }
 

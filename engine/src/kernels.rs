@@ -5029,6 +5029,9 @@ pub struct KernelGeo {
     /// Crow #300 phase 2: append `kernels_p2::P2_SRC` (a family with a block
     /// Flash-Next does not have: plain residual, full attention, dense FFN)
     pub p2: bool,
+    /// #88: append `kernels_p2::Q8KV_SRC` after `P2_SRC` (a boot with `CROW_KV=q8`);
+    /// false from `of`, so every other boot compiles the text it compiled before
+    pub q8kv: bool,
 }
 
 impl KernelGeo {
@@ -5039,7 +5042,7 @@ impl KernelGeo {
             (geo.residual, geo.attn, geo.ffn),
             (crate::geo::Residual::Hc { .. }, crate::geo::Attn::Qsa { .. }, crate::geo::Ffn::Moe { .. })
         );
-        KernelGeo { d: geo.dims(), eps: geo.rms_eps as f32, gate_act: geo.gate_act, p2 }
+        KernelGeo { d: geo.dims(), eps: geo.rms_eps as f32, gate_act: geo.gate_act, p2, q8kv: false }
     }
 
     pub fn flash_next() -> KernelGeo {
@@ -5110,7 +5113,11 @@ impl KernelGeo {
     /// the text NVRTC compiles: the prelude, then `KERNEL_SRC` (then, for a
     /// phase 2 family, `kernels_p2::P2_SRC`; Flash-Next's text is unchanged)
     pub fn source(&self) -> String {
-        if self.p2 {
+        if self.q8kv {
+            // #88: the q8 KV twins exist for the full-attention path only (`KvDtype::kv_for`)
+            assert!(self.p2, "#88: CROW_KV=q8 on a family without the phase 2 kernels");
+            format!("{}{}{}{}", self.prelude(), KERNEL_SRC, crate::kernels_p2::P2_SRC, crate::kernels_p2::Q8KV_SRC)
+        } else if self.p2 {
             format!("{}{}{}", self.prelude(), KERNEL_SRC, crate::kernels_p2::P2_SRC)
         } else {
             format!("{}{}", self.prelude(), KERNEL_SRC)
@@ -5191,6 +5198,17 @@ impl Kernels {
             );
         }
         Kernels { map }
+    }
+
+    /// #88 `CROW_KV=q8`: the KV kernels of the full-attention path resolve to their q8 twins
+    /// (`kernels_p2::Q8KV_SWAP`), the #96 pattern: same signatures, same launch sites, one map
+    /// entry each. Called once at load, only when the module was compiled with
+    /// `KernelGeo::q8kv` (a missing entry fails in `Module::get`); never otherwise, so the map
+    /// of every other boot is the one of before #88.
+    pub unsafe fn arm_q8_kv(&mut self, module: &crate::cuda::Module) {
+        for &(n, q) in crate::kernels_p2::Q8KV_SWAP {
+            self.map.insert(n, module.get(q));
+        }
     }
 
     pub fn f(&self, name: &str) -> CUfunction {
