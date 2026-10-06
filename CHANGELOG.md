@@ -16,6 +16,8 @@
 - **README image** shows decode in a live Crow session (≈40 tok/s at 8k), not the A/B figure.
 
 
+## 2026-10-06 — v0.9.4
+
 **Flash-Next decodes 6.7 % faster on Windows, and the f32 oracle computes the PLE layer like the model.** `serve` stages cold experts on a side stream by default; the oracle scripts normalize the PLE layer per stream.
 
 ### Changed
