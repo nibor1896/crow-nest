@@ -6,6 +6,10 @@
 
 ## Unreleased
 
+## 2026-10-06 — v0.9.3
+
+**A killed engine no longer blocks the next start, and Flash-Next boots again on a loaded Windows desktop.** The engine lock is an OS file lock that Windows drops with the process, and `CROW_RAM_MARGIN_GB` defaults to 1 GiB.
+
 ### Added
 
 - **`tools/cache_stale_rollbacks.py`** (#101, 2026-10-06): replays `engine.log` files (a log, a folder with its rotated `.gz` files) and reports every prefix-cache snapshot a later request still lists or restores after a rollback below it. It reads `reusable`, so the slots of a parked conversation (#118) are not counted. Six unit tests, among them the 2026-09-22 defect from #101 (found) and a parked conversation from 2026-10-02 (not counted).
@@ -21,6 +25,11 @@
 ### Measured
 
 - **No stale rollback in the Windows logs, and none possible to see there** (#101, 2026-10-06): the replay over robin's six engine logs of 2026-10-02 to 2026-10-06 (`%LOCALAPPDATA%\Crow\logs`, 106 decisions, 82 WARM; the Flash-Next Todo-CLI run, 52 decisions, 51 WARM) finds 0 violations, but also 0 rollbacks below the newest reusable snapshot, the only case #101 changes. The fix (`9e46fc1`, since v0.4.0) stays verified by `cache::tests::a_rollback_forgets_every_snapshot_above_its_point` alone: red without the forgetting loop, green with it, at `b812d9e`.
+
+### Known limitations
+
+- **Windows only, gate not run** (owner decision, as v0.8.0–v0.9.2). The engine changes touch no numerics: the lock (`gen.rs` `take_engine_lock`, `engine_lock_acquire`, `engine_lock_release`) and the default of `RAM_MARGIN_DEFAULT_GB`. The `#[cfg(unix)]` `pid_image` is not compiled here, and Linux is not measured with margin 1.
+- **The budget check at the start of a load does not count the ~1.4 GiB the load itself takes before the pin** (2026-10-06, three Windows boots: 51.32 → 49.92, 48.13 → 46.73, 48.12 → 46.73 GiB free). A boot that is short of RAM is therefore refused at the pin, about a minute into the load, not at the start.
 
 ## 2026-10-06 — v0.9.2
 
