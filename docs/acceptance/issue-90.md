@@ -157,8 +157,14 @@ Live-acceptance note: the engine arm keeps running overnight via the RAM ladder 
   python3 tools/oracle_longctx_test_engine_arm.py
   tools/oracle_longctx_engine_arm.sh --dry-run --anchors "1000 2564 50000 100000 158000 178553" --arms none
   ```
-  EXPECT: `Ran 8 tests ... OK`; then two `dense form, every row` blocks (1000, 2564) and four `tail form,
+  EXPECT: `Ran 12 tests ... OK`; then two `dense form, every row` blocks (1000, 2564) and four `tail form,
   CROW_PARITY_TAIL=64` blocks, exit 0, nothing written.
+- Two defects of the script's run path fixed in a second commit (tests with a stub `decode` and a stub
+  subset tool in `tools/oracle_longctx_test_engine_arm.py`): the manifest step no longer raises
+  `TypeError` with two or more runs (`sorted()` over dicts; now sorted by anchor and arm), and a failed
+  trim, hash or plan lookup now stops that run with a non-zero status, keeps the dump and leaves no
+  `plan-rows.f32` (inside `if run_one` `set -e` is off, so before the dump was hashed, deleted and
+  "plan rows written" printed).
 - NOT verified: the real run. It is a GPU job (it loads Flash-Next and prefills up to 178k tokens per
   arm) and waits for robin's go. The a2564/kvbf16 VRAM edge above may hit the deep anchors too, and
   `tools/run-90-arm-final.sh` records that the ladder's low rungs (24, 16 GiB) cannot boot `-M`.

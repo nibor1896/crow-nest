@@ -99,7 +99,8 @@ run_one() {  # anchor arm pinned_gb
   local ids=${IDS_PREFIX}${a}-ids.json
   local dir=$OUT/a${a}/${arm}
   [[ -f $dir/plan-rows.f32 ]] && { echo "anchor $a arm $arm: already done"; return 0; }
-  mkdir -p "$dir"
+  # run_one is called under `if`, where set -e is off: every step that can fail says so itself
+  mkdir -p "$dir" || return 1
   local envs
   parity_envs "$a" "$arm" "$pinned"
   echo "== anchor $a arm $arm pinned ${pinned} GiB  ($(date -Is))"
@@ -115,7 +116,7 @@ plan = json.load(open(sys.argv[1]))
 g = [g for g in plan["groups"] if g["anchor"] == int(sys.argv[2])][0]
 print(json.dumps(g["rows"]))
 EOF
-)
+) || { echo "anchor $a arm $arm: no row-plan group - the dump $dir/gpu-logits.f32 is kept" >&2; return 1; }
   # the dense dump starts at row 0, the tail dump at the absolute row `row0_pos` of gen-sequence.json
   local row0=0 kind=dense
   if [[ -n ${TAIL[$a]:-} ]]; then
@@ -129,10 +130,15 @@ print(row0)
 EOF
 ) || { echo "anchor $a arm $arm: the tail dump does not start at the plan's first row" >&2; return 1; }
   fi
+  # a failed trim or hash keeps the dump and leaves no plan-rows.f32: that file is the "done" marker
   python3 tools/oracle_longctx_rows.py subset --source "$dir/gpu-logits.f32" \
-      --out "$dir/plan-rows.f32" --rows-file <(echo "$rows") --row0 "$row0"
-  sha256sum "$dir/gpu-logits.f32" "$dir/plan-rows.f32" "$ids" > "$dir/SHA256SUMS"
-  rm -f "$dir/gpu-logits.f32"     # the plan rows are what the instrument reads
+      --out "$dir/plan-rows.f32" --rows-file <(echo "$rows") --row0 "$row0" || {
+    echo "anchor $a arm $arm: trim FAILED - the dump $dir/gpu-logits.f32 is kept" >&2
+    rm -f "$dir/plan-rows.f32"; return 1; }
+  sha256sum "$dir/gpu-logits.f32" "$dir/plan-rows.f32" "$ids" > "$dir/SHA256SUMS" || {
+    echo "anchor $a arm $arm: hashing FAILED - the dump $dir/gpu-logits.f32 is kept" >&2
+    rm -f "$dir/plan-rows.f32"; return 1; }
+  rm -f "$dir/gpu-logits.f32" || return 1     # the plan rows are what the instrument reads
   echo "anchor $a arm $arm: plan rows written, $kind dump removed after hashing"
 }
 
@@ -213,7 +219,9 @@ for root, dirs, files in os.walk(out):
                      "log": os.path.relpath(os.path.join(root, "parity.log"), out),
                      "done": os.path.exists(os.path.join(root, "plan-rows.f32"))})
 json.dump({"what": "#90 crow-engine longctx arm runs (paired-baseline mode)",
-           "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "runs": sorted(runs)},
+           "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+           # the runs are dicts: sort by (anchor number, arm); a bare sorted() raises TypeError
+           "runs": sorted(runs, key=lambda r: (r["anchor"].lstrip("a").zfill(8), r["arm"]))},
           open(os.path.join(out, "manifest.json"), "w"), indent=1)
 print("manifest written: %d runs" % len(runs))
 EOF

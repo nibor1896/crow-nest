@@ -5,6 +5,8 @@
 command it would run and does nothing else: no flock, no engine, no GPU, no output directory.
 These tests run it in a throwaway repo layout (a copy of the script, a synthetic row plan, ids
 files of the plan's lengths), so they need neither the model nor the real dumps.
+`EngineArmRun` runs the real path of the script in the same layout with stubs for everything heavy
+(`decode`, the subset tool, flock, pgrep, sleep): the manifest step and what a failed step leaves behind.
 
 Run:  python3 tools/oracle_longctx_test_engine_arm.py       (needs bash; no GPU, no engine)
 """
@@ -146,6 +148,95 @@ class EngineArmDryRun(unittest.TestCase):
         p = self.run_script("--anchors", "")
         self.assertEqual(p.returncode, 2)
         self.assertIn("no runnable anchor left", p.stderr)
+
+
+# the subset tool of the throwaway repo: the real one needs 248,320-wide rows; this one writes the
+# files the script looks for, or dies half way when ARM_STUB_SUBSET=fail
+STUB_SUBSET = '''import os, sys
+out = sys.argv[sys.argv.index("--out") + 1]
+if os.environ.get("ARM_STUB_SUBSET") == "fail":
+    open(out, "wb").write(b"partial")
+    sys.exit("stub subset: failing on purpose")
+open(out, "wb").write(b"stub-rows")
+open(out + ".rows.json", "w").write("{}")
+'''
+STUB_DECODE = '#!/bin/sh\nmkdir -p "$3"\nprintf stub-dump > "$3/gpu-logits.f32"\necho "decode/parity: stub"\n'
+
+
+@unittest.skipUnless(BASH, "needs bash")
+class EngineArmRun(unittest.TestCase):
+    """The real run path (no --dry-run) with every heavy part stubbed: `decode` writes a tiny dump,
+    flock and pgrep do nothing (the real flock would take /tmp/crow-gpu.lock), `sleep` records the
+    10-minute backoff and ends the script (a run that cannot finish would retry for 8 hours), and
+    the subset tool is the stub above. No GPU, no engine, no model."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.shim = tempfile.mkdtemp(prefix="arm90-shim-")
+        for name, body in (("python3", 'exec "%s" "$@"' % sys.executable.replace("\\", "/")),
+                           ("flock", "exit 0"), ("pgrep", "exit 1"),
+                           ("sleep", 'echo "$@" >> "$ARM_MARK"\nkill "$PPID"')):
+            f = Path(cls.shim) / name
+            f.write_text("#!/bin/sh\n%s\n" % body)
+            f.chmod(f.stat().st_mode | stat.S_IXUSR)
+
+    def run_script(self, *args, subset_fails=False, before=None):
+        self.root = Path(tempfile.mkdtemp(prefix="arm90-run-"))
+        script = make_repo(self.root)
+        rel = self.root / "engine" / "target" / "release"
+        rel.mkdir(parents=True)
+        (rel / "decode").write_text(STUB_DECODE)
+        (rel / "decode").chmod(0o755)
+        (self.root / "tools" / "oracle_longctx_rows.py").write_text(STUB_SUBSET)
+        self.mark = self.root / "sleeps.txt"
+        if before:
+            before(self.root)
+        env = dict(os.environ, PATH=self.shim + os.pathsep + os.environ["PATH"], CROW_LOCK="0",
+                   ARM_MARK=self.mark.as_posix(), ARM_STUB_SUBSET="fail" if subset_fails else "")
+        return subprocess.run([BASH, str(script), *args], cwd=self.root, env=env, timeout=60,
+                              capture_output=True, text=True)
+
+    def run_dir(self, anchor, arm="none"):
+        return self.root / "decode_out" / "oracle-longctx" / "engine" / ("a%d" % anchor) / arm
+
+    def test_the_manifest_is_written_when_two_or_more_runs_finish(self):
+        p = self.run_script("--anchors", "1000 2564", "--arms", "none kvbf16")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("engine arm complete", p.stdout)
+        doc = json.loads((self.root / "decode_out" / "oracle-longctx" / "engine"
+                          / "manifest.json").read_text())
+        self.assertEqual([(r["anchor"], r["arm"]) for r in doc["runs"]],
+                         [("a1000", "kvbf16"), ("a1000", "none"), ("a2564", "kvbf16"), ("a2564", "none")])
+        self.assertTrue(all(r["done"] for r in doc["runs"]))
+
+    def test_a_failed_trim_keeps_the_dump_and_does_not_claim_success(self):
+        p = self.run_script("--anchors", "1000", "--arms", "none", subset_fails=True)
+        d = self.run_dir(1000)
+        self.assertIn("trim FAILED", p.stderr)
+        self.assertNotIn("plan rows written", p.stdout)
+        self.assertTrue((d / "gpu-logits.f32").exists(), "the dump was deleted after a failed trim")
+        self.assertFalse((d / "plan-rows.f32").exists(), "a partial trim reads as the done marker")
+        self.assertFalse((d / "SHA256SUMS").exists())
+        self.assertTrue(self.mark.exists(), "the run counted as done instead of pending")
+
+    def test_a_failed_hash_keeps_the_dump_and_does_not_claim_success(self):
+        p = self.run_script("--anchors", "1000", "--arms", "none",
+                            before=lambda root: (root / "decode_out" / "oracle-longctx"
+                                                 / "longctx-170k-a1000-ids.json").unlink())
+        d = self.run_dir(1000)
+        self.assertIn("hashing FAILED", p.stderr)
+        self.assertNotIn("plan rows written", p.stdout)
+        self.assertTrue((d / "gpu-logits.f32").exists())
+        self.assertFalse((d / "plan-rows.f32").exists())
+        self.assertTrue(self.mark.exists())
+
+    def test_an_anchor_without_a_plan_group_stops_before_the_trim(self):
+        p = self.run_script("--anchors", "1500", "--arms", "none")   # 1500 is not in the plan
+        d = self.run_dir(1500)
+        self.assertIn("no row-plan group", p.stderr)
+        self.assertNotIn("plan rows written", p.stdout)
+        self.assertTrue((d / "gpu-logits.f32").exists())
+        self.assertFalse((d / "plan-rows.f32").exists())
 
 
 class SubsetRow0(unittest.TestCase):
