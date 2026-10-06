@@ -6393,54 +6393,124 @@ fn engine_lock_path() -> Option<std::path::PathBuf> {
     }
 }
 
+/// - the image name of live process `pid`, `None` when no such process runs
+/// - Windows: `tasklist` CSV (`"serve.exe","29192",...`); Linux: `/proc/<pid>/comm`
+/// - a query that cannot run answers `Some("")`: cannot tell, so the caller stays on the
+///   safe side and refuses
 #[cfg(windows)]
-fn pid_alive(pid: u32) -> bool {
-    // tasklist prints the image line only for a live PID (Windows; no ptrace here)
-    match std::process::Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH"]).output() {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&format!(" {pid} ")),
-        Err(_) => true, // cannot tell: stay on the safe side
-    }
+fn pid_image(pid: u32) -> Option<String> {
+    let out = match std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(_) => return Some(String::new()),
+    };
+    out.lines().find_map(|l| {
+        let mut f = l.split("\",\"");
+        let image = f.next()?.trim_start_matches('"');
+        (f.next()? == pid.to_string()).then(|| image.to_string())
+    })
 }
 
 #[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
-    // /proc/<pid> exists exactly while the process does (a zombie still has it,
-    // and a zombie still holds nothing pinned - same "safe side" as above)
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
+fn pid_image(pid: u32) -> Option<String> {
+    // /proc/<pid> exists exactly while the process does (a zombie still has it)
+    let dir = std::path::PathBuf::from(format!("/proc/{pid}"));
+    if !dir.exists() {
+        return None;
+    }
+    Some(std::fs::read_to_string(dir.join("comm")).map(|c| c.trim().to_string()).unwrap_or_default())
 }
 
-fn engine_lock_acquire() {
-    let Some(path) = engine_lock_path() else { return };
-    let me = std::process::id();
-    if let Ok(txt) = std::fs::read_to_string(&path) {
-        if let Ok(pid) = txt.trim().parse::<u32>() {
-            if pid != me && pid_alive(pid) {
-                panic!(
-                    "refusing to start: another engine (pid {pid}) holds {} — two engines pin 2 x 45 GiB and freeze this 64 GB machine (CROW_LOCK=0 overrides)",
-                    path.display()
-                );
-            }
-        }
-    }
-    // #131: a lock that cannot be written (a read-only or missing state dir) is a WARN, not a
-    // panic; the live-PID refusal above is the guard and it stays exactly as it was
-    let written = match path.parent().filter(|d| !d.as_os_str().is_empty()) {
+/// - a program that can hold an engine: `serve` (any name a copy was given, such as
+///   `serve-0.9.2-release.exe`), or a copy of this very program
+/// - `""` (the query failed) counts as one: the safe side
+fn is_engine_image(image: &str) -> bool {
+    let stem = |n: &str| n.to_ascii_lowercase().trim_end_matches(".exe").to_string();
+    let me = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| stem(&n.to_string_lossy())));
+    let name = stem(image);
+    name.is_empty() || name.starts_with("serve") || Some(&name) == me.as_ref()
+}
+
+/// The lock at `path` for process `me`: `Err` is the refusal, `Ok(Some)` the handle that
+/// holds it for this engine's life, `Ok(None)` a lock that could not be taken (a WARN).
+///
+/// - THE LOCK IS AN OS FILE LOCK on an open handle (`File::try_lock`), not the PID in the
+///   file. Crow stops `serve` with `taskkill /F` / `kill()`, so `Drop` never runs and the
+///   file stays; the OS drops the lock with the process, however it ends.
+/// - THE PID ALONE WAS WRONG (2026-10-06): a killed serve left 29192 in the file, Windows
+///   gave 29192 to a `conhost.exe`, and every start was refused as "another engine".
+/// - The PID is still written, for the message and for engines built before the OS lock:
+///   a live PID refuses only when that process is an engine program (`is_engine_image`).
+fn take_engine_lock(path: &std::path::Path, me: u32) -> Result<Option<std::fs::File>, String> {
+    use std::io::{Read, Seek, Write};
+    let opened = match path.parent().filter(|d| !d.as_os_str().is_empty()) {
         Some(dir) => std::fs::create_dir_all(dir),
         None => Ok(()),
     }
-    .and_then(|_| std::fs::write(&path, format!("{me}
-")));
+    .and_then(|_| std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path));
+    let mut file = match opened {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(target: "load", "[load] engine lock not written ({}): {e} - continuing without it", path.display());
+            return Ok(None);
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            // Windows refuses a read of a locked file; Linux (advisory) shows the PID
+            let pid = std::fs::read_to_string(path).ok().and_then(|t| t.trim().parse::<u32>().ok());
+            let who = pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
+            return Err(format!("another engine{who} holds {}", path.display()));
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            tracing::warn!(target: "load", "[load] engine lock not taken ({}): {e} - continuing without it", path.display());
+            return Ok(None);
+        }
+    }
+    let mut prev = String::new();
+    let _ = file.read_to_string(&mut prev);
+    if let Ok(pid) = prev.trim().parse::<u32>() {
+        if pid != me {
+            if let Some(image) = pid_image(pid).filter(|i| is_engine_image(i)) {
+                return Err(format!(
+                    "another engine (pid {pid}, {image}, a build without the OS lock) holds {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    let written = file.set_len(0).and_then(|_| file.rewind()).and_then(|_| writeln!(file, "{me}"));
     if let Err(e) = written {
-        tracing::warn!(target: "load", "[load] engine lock not written ({}): {e} - continuing without it", path.display());
+        tracing::warn!(target: "load", "[load] engine lock pid not written ({}): {e}", path.display());
+    }
+    Ok(Some(file))
+}
+
+/// The handle that holds the lock while an engine of this process lives.
+static ENGINE_LOCK: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+fn engine_lock_acquire() {
+    let Some(path) = engine_lock_path() else { return };
+    let mut held = ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if held.is_some() {
+        return; // an engine of this process holds it already
+    }
+    match take_engine_lock(&path, std::process::id()) {
+        Ok(file) => *held = file,
+        Err(why) => panic!(
+            "refusing to start: {why} — two engines pin 2 x 45 GiB and freeze this 64 GB machine (CROW_LOCK=0 overrides)"
+        ),
     }
 }
 
 fn engine_lock_release() {
-    let Some(path) = engine_lock_path() else { return };
-    if let Ok(txt) = std::fs::read_to_string(&path) {
-        if txt.trim().parse::<u32>().ok() == Some(std::process::id()) {
-            let _ = std::fs::remove_file(&path);
-        }
+    let held = ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(file) = held {
+        let _ = file.set_len(0); // no PID left behind for a later start to weigh
+        drop(file); // closes the handle, which releases the OS lock
     }
 }
 
@@ -6890,5 +6960,72 @@ mod tests_131_lock {
             None => std::env::remove_var("CROW_LOCK"),
         }
         assert!(r.is_ok(), "an unwritable lock path panicked instead of logging a WARN");
+    }
+}
+
+#[cfg(test)]
+mod tests_lock_pid_reuse {
+    use super::take_engine_lock;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("crow-nest-lock-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("engine.lock")
+    }
+
+    /// A live process that is no engine (2026-10-06: a killed serve left pid 29192 in
+    /// the lock, Windows gave 29192 to a conhost.exe, and every start was refused).
+    fn bystander() -> std::process::Child {
+        #[cfg(windows)]
+        let c = std::process::Command::new("cmd").args(["/c", "ping -n 30 127.0.0.1 >nul"]).spawn();
+        #[cfg(unix)]
+        let c = std::process::Command::new("sleep").arg("30").spawn();
+        c.expect("spawn a bystander process")
+    }
+
+    #[test]
+    fn a_stale_pid_now_owned_by_another_program_does_not_refuse() {
+        let path = tmp("reuse");
+        let mut other = bystander();
+        std::fs::write(&path, format!("{}
+", other.id())).unwrap();
+        let got = take_engine_lock(&path, std::process::id());
+        let _ = other.kill();
+        let _ = other.wait();
+        assert!(got.is_ok(), "refused over a pid that is no engine: {got:?}");
+    }
+
+    #[test]
+    fn a_held_lock_refuses_and_a_dropped_one_is_taken() {
+        let path = tmp("held");
+        let first = take_engine_lock(&path, 1).expect("the first engine takes the lock");
+        assert!(first.is_some(), "the lock is a held handle, not only a pid in a file");
+        let second = take_engine_lock(&path, 2);
+        assert!(second.is_err(), "a second engine started while the first holds the lock");
+        drop(first); // what the OS does when the first engine is killed
+        assert!(take_engine_lock(&path, 3).expect("taken after the holder is gone").is_some());
+    }
+
+    /// An engine built before the OS lock leaves only its PID: a live engine program
+    /// behind it still refuses. This test process stands in for that engine (its image
+    /// is this very program), seen from an engine with another PID.
+    #[test]
+    fn a_live_engine_without_the_os_lock_still_refuses() {
+        let path = tmp("legacy");
+        std::fs::write(&path, format!("{}
+", std::process::id())).unwrap();
+        let got = take_engine_lock(&path, std::process::id() + 1);
+        assert!(got.as_ref().is_err_and(|e| e.contains("a build without the OS lock")), "{got:?}");
+    }
+
+    #[test]
+    fn serve_under_any_name_is_an_engine_and_conhost_is_not() {
+        assert!(super::is_engine_image("serve.exe"));
+        assert!(super::is_engine_image("serve-0.9.2-release.exe"));
+        assert!(super::is_engine_image("serve"));
+        assert!(super::is_engine_image(""), "a failed query stays on the safe side");
+        assert!(!super::is_engine_image("conhost.exe"));
+        assert!(!super::is_engine_image("cmd.exe"));
     }
 }
