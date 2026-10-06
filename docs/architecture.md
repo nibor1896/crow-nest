@@ -507,7 +507,7 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
   load and `gen.rs:2048` again at the launch site; both panic messages name
   `CROW_STAGE_KERNEL=1` as the fallback. This container: `gate_up` 1843200 B = 450 tiles,
   `down` 921600 B = 225 tiles.
-- **`CROW_STAGE_PAR=1` (#19j, 2026-09-18, default off)**: the same kernel, the same
+- **`CROW_STAGE_PAR=1` (#19j, 2026-09-18; `serve` default since v0.9.4, 2026-10-06, other bins off)**: the same kernel, the same
   bytes, issued on a side stream with an event pair — `cuEventRecord` on the compute
   stream, `cuStreamWaitEvent` on the side stream, the launch, and the join immediately
   before the routed gate|up GEMV, the first reader of the pointers the kernel rewrites.
@@ -1494,7 +1494,12 @@ size of the overlap window**, and 4.8.1 takes 0.88 of it.
   PCIe and keeps the GPU's compute. At 4.5 bpw and N 142 the bill is 11.4 ms per token, which is 45 %
   of the step — and it is the price of the residency model, not a kernel that is doing it wrong.
 
-#### 4.8.1 `CROW_STAGE_PAR` — the staging copy on a side stream, joined before the routed GEMV (#19j, opt-in)
+#### 4.8.1 `CROW_STAGE_PAR` — the staging copy on a side stream, joined before the routed GEMV (#19j; `serve` default since v0.9.4)
+
+**2026-10-06, `serve` on Windows** (Flash-Next, `298f7cd`, 31,827-token prompt, greedy, reasoning high, 1,024
+tokens, 2 boots x 3 warm runs per arm, arms alternated, `crow-lab/runs/fn-flags-win-20261006`): 43.08 ->
+45.97 tok/s mean (+6.7 %), the same answer text in all 24 warm runs of four arms. `serve` sets it when unset
+since v0.9.4. The Linux `decode run` pairs below are the first measurement.
 
 `CROW_STAGE_PAR=1` issues `stage_cold_ca` on a **side stream** instead of the compute stream
 (`gen.rs`, the `stage_par` branch in `moe_run`): `cuEventRecord` on the compute stream,

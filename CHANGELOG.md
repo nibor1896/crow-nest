@@ -6,6 +6,10 @@
 
 ## Unreleased
 
+## 2026-10-06 — v0.9.4
+
+**Flash-Next decodes 6.7 % faster on Windows, and the f32 oracle computes the PLE layer like the model.** `serve` stages cold experts on a side stream by default; the oracle scripts normalize the PLE layer per stream.
+
 ### Changed
 
 - **`serve` stages cold experts on a side stream by default: Flash-Next decode +6.7 % on Windows** (#19j, 2026-10-06). `serve` sets `CROW_STAGE_PAR=1` when unset, like `CROW_GRAPH` / `CROW_MMA` / `CROW_ADAPT_WINDOW`; an explicit value still wins, other bins keep it off. Measured in serve on Windows (`298f7cd`, Flash-Next CNQ4.5-M, crow0924, 31,827-token prompt, greedy, reasoning high, 1,024 tokens; 2 boots x 3 warm runs per arm, arms alternated, `crow-lab/runs/fn-flags-win-20261006`): 43.08 -> 45.97 tok/s mean (min 42.75 / 45.38, max 44.16 / 47.04); the same answer text in all 24 warm runs of all arms. `CROW_GDN_SPLIT_Z` in the same series: 42.93 tok/s, no gain, stays off.
@@ -16,7 +20,14 @@
 
 ### Measured
 
+- **Flash-Next's reasoning budget: 1024 stays** (Crow #245, PREREG Amendment 4, 2026-10-06, `decode_out/meas-245/flashnext/`). Windows, `serve` `298f7cd`, the 2026-09-15 session replayed at four turns, 36 rounds per arm: no-call 0 / 0, corrupt 0 / 0, median 26.5 s per round at 1024 against 34.7 s at 2048. 2048 passed the pre-set rule but is 31 % slower and fixes nothing; owner decision: 1024 stays.
+- **Flash-Next on Windows from 100k to 175k context** (2026-10-06, `serve` `298f7cd`, without `CROW_STAGE_PAR`, `crow-lab/runs/fn-c-b-win-20261006`): cold prefill 778.6 / 788.5 / 785.9 / 775.6 tok/s at 100,115 / 124,861 / 149,569 / 175,400 prompt tokens; decode 39.3–48.1 tok/s over 12 runs of 1,024 tokens; no failure.
 - **Oracle-KLD after the PLE fix, against the uncorrected references** (2026-10-06, Windows, `3fe9123`, `decode parity`, `CROW_GRAPH=1 CROW_MMA=1`, `crow-lab/runs/fn-oracle-kld-win-20261006`): 298 rows KLD 0.4298 ± 0.0510, top-1 80.54 % (2026-09-05 engine: 0.3377, 83.22 %); 607 rows 0.5898 ± 0.0632, 79.41 % (0.4646, 81.55 %). Against the same references the 2026-09-05 engine with PLE off reads 0.4148 on 298 rows, so the corrected PLE reads like no PLE (paired +0.015 ± 0.034). Read with #138: these references cannot judge the PLE fix.
+
+### Known limitations
+
+- **Windows only, gate not run** (owner decision, as v0.8.0–v0.9.3). `CROW_STAGE_PAR` moves a copy to a side stream and changes no number (same answer text in all 24 runs); in `serve` it is measured on Windows only (Linux `decode run` 2026-09-18: -3.47 %).
+- **The oracle references are not regenerated** (#138): the original checkpoint (~360 GB) is not on this machine, so every oracle-KLD number stays one against references with the PLE norm error.
 
 ## 2026-10-06 — v0.9.3
 
