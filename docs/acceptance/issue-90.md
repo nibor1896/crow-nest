@@ -112,10 +112,11 @@ Expected wall time: ~2 minutes total, no GPU, no server, no checkpoint needed fo
 ## Honest gaps (what this acceptance does NOT claim)
 
 - No f32 reference rows at any depth exist yet (checkpoint gap; options A/B/C above).
-- No engine or llama dump exists above anchor 2564: `decode parity` and
-  `llama-row-probs.py` both write rows 0..last contiguously (50 GB at anchor 50000);
-  both need a row-window write mode — an engine/tools change outside this issue's
-  ownership, documented here as the follow-up.
+- No engine or llama dump exists above anchor 2564. Engine arm: since 2026-10-06 the
+  script runs the deeper anchors in the `CROW_PARITY_TAIL` form (addendum 2026-10-06
+  below) - wired and checked without a GPU, NOT RUN. Llama arm: `llama-row-probs.py`
+  still writes rows 0..last contiguously (50 GB at anchor 50000) and needs a
+  row-window write mode; unchanged.
 - The llama arm has not run: GGUF shard 1 is broken; `tools/oracle_longctx_llama.sh`
   is the one command for when it is whole.
 - No KLD number at 100k+ is quoted anywhere, because none has been measured.
@@ -143,3 +144,32 @@ Live-acceptance note: the engine arm keeps running overnight via the RAM ladder 
 - The clean engine-side fix (follow-up, not tonight): parity mode should respect a context cap for short prompts (states sized to the prompt, not CONTEXT_FLOOR) — one config line, gate re-run, byte-identity trivially held (states beyond the prompt are never read).
 - The instrument is USABLE now: the paired-baseline at anchor 1000 has both arms, anchor 2564 has the none arm; the missing cell only narrows the bf16-vs-fp8 comparison at the sparse-QSA boundary, it blocks nothing else.
 - Run evidence: `/tmp/90-arm*.log` (robin's terminal) + `decode_out/oracle-longctx/engine/*/SHA256SUMS`.
+
+## Addendum 2026-10-06 — the engine arm's deep anchors: wired, not run
+
+- `tools/oracle_longctx_engine_arm.sh` no longer refuses anchors above 2564. They run in the
+  `CROW_PARITY_TAIL` form (`engine/src/bin/decode.rs`, `docs/env.md`) with n = the 64 rows of the
+  anchor's plan block; the trim hands the dump's `row0_pos` to the new `oracle_longctx_rows.py
+  subset --row0`. Anchors up to 2564 keep their command as it was (`--dry-run` prints it); the
+  default `--anchors` is still "1000 2564".
+- Checks, no GPU (need bash and python3):
+  ```
+  python3 tools/oracle_longctx_test_engine_arm.py
+  tools/oracle_longctx_engine_arm.sh --dry-run --anchors "1000 2564 50000 100000 158000 178553" --arms none
+  ```
+  EXPECT: `Ran 12 tests ... OK`; then two `dense form, every row` blocks (1000, 2564) and four `tail form,
+  CROW_PARITY_TAIL=64` blocks, exit 0, nothing written.
+- Two defects of the script's run path fixed in a second commit (tests with a stub `decode` and a stub
+  subset tool in `tools/oracle_longctx_test_engine_arm.py`): the manifest step no longer raises
+  `TypeError` with two or more runs (`sorted()` over dicts; now sorted by anchor and arm), and a failed
+  trim, hash or plan lookup now stops that run with a non-zero status, keeps the dump and leaves no
+  `plan-rows.f32` (inside `if run_one` `set -e` is off, so before the dump was hashed, deleted and
+  "plan rows written" printed).
+- NOT verified: the real run. It is a GPU job (it loads Flash-Next and prefills up to 178k tokens per
+  arm) and waits for robin's go. The a2564/kvbf16 VRAM edge above may hit the deep anchors too, and
+  `tools/run-90-arm-final.sh` records that the ladder's low rungs (24, 16 GiB) cannot boot `-M`.
+- Live recipe, after the go: one anchor first,
+  `nohup tools/oracle_longctx_engine_arm.sh --anchors "50000" --arms none > decode_out/oracle-longctx/engine-arm-50k.log 2>&1 &`.
+  EXPECT `decode/parity: 50001 prompt tokens (49937 prefilled, 64 teacher-forced)`, then
+  `anchor 50000 arm none: plan rows written, tail dump removed after hashing`, and
+  `decode_out/oracle-longctx/engine/a50000/none/plan-rows.f32.rows.json` listing rows 49937..50000.

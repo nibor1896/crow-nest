@@ -156,22 +156,39 @@ decide: whether a quality-touching change (#T6/#T7/#T9) moves the engine's
 distributions at depth, relative to its own default, beyond the floor. What it
 cannot: absolute distance to f32 - that waits for the checkpoint (options A/B).
 
-**The crow arm has the same collect-all ceiling as the oracle had.** `decode parity`
-writes EVERY row of its ids file, so anchor 50000 would be a 50 GB dump;
-`tools/oracle_longctx_engine_arm.sh` therefore runs the two feasible anchors
-(1000 and 2564 - the dense control and the FIRST SPARSE rows), refuses the deep
-anchors with the reason, and trims every dump to the plan's 64 rows (the dense file
-is hashed then deleted; `SHA256SUMS` records it). The deep-anchor engine arm needs a
-`--rows` flag in `decode parity` - an engine/ change outside this issue's file
-ownership. The script takes the GPU flock (`/tmp/crow-gpu.lock`), waits out any live
-engine, and retries a ladder of pinned budgets with a 10-minute backoff for up to 8
-hours, because the fleet shares this machine's RAM (2026-09-20: 10-14 GiB free
-against a loader that wants 16-44 GiB pinned).
+**The crow arm writes two forms of dump.** `decode parity` collects EVERY row of its
+ids file: rows x 248,320 x 4 B, 1.0 GB at anchor 1000, 2.5 GB at 2564, 50 GB at 50000.
+`tools/oracle_longctx_engine_arm.sh` keeps that dense form for the anchors up to 2564
+(the dense control and the FIRST SPARSE rows). Every deeper anchor runs, since
+2026-10-06, in the TAIL form `CROW_PARITY_TAIL=64` (`docs/env.md`): the ids before the
+plan's block are prefilled in 2,048-token chunks without logits and the block's 64 ids
+go teacher-forced through `decode_step`, so the dump is 64 + 4 rows (about 68 MB) at
+any depth. The 64 is read from the plan, and accepted only when the plan's rows are
+the last rows of the anchor's prefix ids file (otherwise the anchor is refused). The
+trim carves the plan rows with `oracle_longctx_rows.py subset --row0 <row0_pos>`,
+`row0_pos` (from the dump's `gen-sequence.json`) being the absolute row of the dump's
+first row. Every dump is trimmed to the plan's 64 rows (the full file is hashed then
+deleted; `SHA256SUMS` records it).
+
+The default `--anchors` is still "1000 2564"; the deep anchors are named
+(`--anchors "50000 100000 158000 178553"`). `--dry-run` prints the `decode parity`
+command of every anchor and arm and exits, without the lock, the engine or the GPU.
+Tail rows come from the decode path and dense rows from the prefill path
+(`CROW_PARITY_PREFILL`, `docs/env.md`), so a paired reading stays within one anchor,
+and a KLD-vs-position curve across the 2564/2565 line crosses that change. NOT RUN yet
+with Flash-Next at a deep anchor (a GPU job; `docs/acceptance/issue-90.md`, addendum
+2026-10-06); the same tail form ran on the dense 27B at all six anchors (CHANGELOG,
+Crow #300 phase 2, 2026-09-26).
+
+The script takes the GPU flock (`/tmp/crow-gpu.lock`), waits out any live engine, and
+retries a ladder of pinned budgets with a 10-minute backoff for up to 8 hours, because
+the fleet shares this machine's RAM (2026-09-20: 10-14 GiB free against a loader that
+wants 16-44 GiB pinned).
 
 **The llama arm is a harness, not a run**: shard 1 of the Unsloth UD-Q2_K_XL GGUF is
 broken tonight. `tools/oracle_longctx_llama.sh` is the one command for when it is
 whole - round-trip check, then `llama-row-probs --no-cache-prompt` over the block,
-then the sparse trim. It carries the same >2564-row ceiling
+then the sparse trim. It still has the >2564-row ceiling the engine arm had
 (`llama-row-probs.py` writes rows 0..last contiguously).
 
 ## 4. The English long-prose corpus
@@ -211,7 +228,8 @@ summary.
     --plan decode_out/oracle-longctx/row-plan.json \
     --out decode_out/oracle-longctx/ref/gpu-logits.f32 --chunk 2048
 
-# the crow engine arm (GPU flock; feasible anchors only tonight)
+# the crow engine arm (GPU flock; default anchors 1000 2564, the deep ones by --anchors;
+# --dry-run prints the commands and runs nothing)
 nohup tools/oracle_longctx_engine_arm.sh > decode_out/oracle-longctx/engine-arm.log 2>&1 &
 
 # the llama arm (when the GGUF is whole)
@@ -239,7 +257,8 @@ new: sparse equivalence, row groups, the curve, the subset tool) are both green.
 - The instrument covers the failure REGIME in form: rows at 158k and 178k exist as
   a plan, the runner exists and is proven equivalent at short T, and every arm has
   a one-command path. What does NOT exist yet, honestly: f32 reference rows at
-  depth (checkpoint gone), engine/llama dumps at depth (collect-all designs), and
+  depth (checkpoint gone), engine dumps at depth (the tail form is wired, not run) and
+  llama dumps at depth (collect-all design), and
   therefore any KLD number at 100k+. No number in this document is invented to
   fill that gap.
 - The first sparse-QSA rows (anchor 2564) are within reach of TONIGHT's engine arm

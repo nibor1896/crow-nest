@@ -183,7 +183,11 @@ def cmd_plan(args):
 
 def cmd_subset(args):
     """dense dump -> sparse dump: the form oracle-kld.py's sparse reader and
-    ref_longctx_logits.py's writer share (`<path>` + `<path>.rows.json`)."""
+    ref_longctx_logits.py's writer share (`<path>` + `<path>.rows.json`).
+
+    `--row0 N`: row 0 of the source is the ABSOLUTE row N - a `decode parity` dump written
+    with CROW_PARITY_TAIL starts at `row0_pos` (its gen-sequence.json), not at row 0. The
+    row ids asked for stay absolute, and so do the ones the sidecar records."""
     import array
 
     rows = []
@@ -201,8 +205,12 @@ def cmd_subset(args):
     vocab = args.vocab
     stride = vocab * 4
     total = os.path.getsize(args.source) // stride
-    if rows[-1] >= total:
-        raise SystemExit("row %d is beyond the %d rows of %s" % (rows[-1], total, args.source))
+    row0 = args.row0
+    if rows[0] < row0:
+        raise SystemExit("row %d is before row0 %d of %s" % (rows[0], row0, args.source))
+    if rows[-1] - row0 >= total:
+        raise SystemExit("row %d is beyond the %d rows of %s%s" % (
+            rows[-1], total, args.source, " (row 0 of it is row %d)" % row0 if row0 else ""))
     done = 0
     if os.path.exists(args.out) and os.path.exists(args.out + ".rows.json"):
         with open(args.out + ".rows.json", encoding="utf-8") as fh:
@@ -211,7 +219,7 @@ def cmd_subset(args):
     with open(args.source, "rb") as src, open(args.out, "r+b" if done else "wb") as dst:
         dst.seek(done * stride)
         for r in rows[done:]:
-            src.seek(r * stride)
+            src.seek((r - row0) * stride)
             a = array.array("f")
             a.fromfile(src, vocab)
             if sys.byteorder != "little":
@@ -252,6 +260,9 @@ def main(argv=None):
     p_sub.add_argument("--rows-file", default=None, help="a JSON array of absolute row ids")
     p_sub.add_argument("--from-plan", default=None,
                        help="a row-plan / row-groups JSON with a \"groups\" list")
+    p_sub.add_argument("--row0", type=int, default=0,
+                       help="the absolute row id of row 0 of --source (a CROW_PARITY_TAIL dump "
+                            "starts at its gen-sequence.json `row0_pos`); default 0 = a dense dump")
     p_sub.add_argument("--vocab", type=int, default=248320)
     p_sub.set_defaults(fn=cmd_subset)
 
