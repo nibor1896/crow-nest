@@ -6420,7 +6420,16 @@ fn pid_image(pid: u32) -> Option<String> {
     if !dir.exists() {
         return None;
     }
-    Some(std::fs::read_to_string(dir.join("comm")).map(|c| c.trim().to_string()).unwrap_or_default())
+    // the executable's own file name first: `comm` is cut at 15 bytes, so a test binary
+    // (`crow_nest_engine-<hash>`) or a long copy name would never match `is_engine_image`
+    // (CI, 2026-10-06); `comm` only where the link cannot be read (another user's process)
+    let exe = std::fs::read_link(dir.join("exe")).ok().and_then(|p| {
+        let name = p.file_name()?.to_string_lossy().into_owned();
+        Some(name.trim_end_matches(" (deleted)").to_string())
+    });
+    Some(exe.unwrap_or_else(|| {
+        std::fs::read_to_string(dir.join("comm")).map(|c| c.trim().to_string()).unwrap_or_default()
+    }))
 }
 
 /// - a program that can hold an engine: `serve` (any name a copy was given, such as
