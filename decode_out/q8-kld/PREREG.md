@@ -85,3 +85,9 @@ Crow's `stack.json` flips to `CROW_CONTEXT=200000 CROW_KV=q8` only after G1-G4 p
 - **Replacement:** the tolerance became the worst case the q8_0 format guarantees, per output, against the f64 attention over the original f32 K / V. It is computed from the original values alone: a value is off by at most amax · (0.5/127 + 1e-3), and that bound is propagated through the softmax. The kernel's 5e-3 is added on top.
 - **Result:** the run sits at 0.547 of that bound. The q8 against bf16 figure is printed, not judged.
 - **Scope:** this amendment changes a synthetic unit test only. It does not touch the 0.073 criterion of G3, which no run has read.
+
+## Amendment 2 (2026-10-07, before any G1-G5 run)
+
+- **G1, the second build:** `cfbf7ba` (the v0.10.0 release merge, which contains `a45cf4c`) instead of `a45cf4c`. Reason: G1 judges the default path of the code that ships. `9cb57e7` is built in a separate worktree with its own target dir, so the main `engine/target/release` is not overwritten. robin agreed on 2026-10-07.
+- **Container:** the installed `%LOCALAPPDATA%\Crow\models\Qwen3.8-27B-CNQ4.5\Qwen3.8-27B-CNQ4.5.cnq`, the file Crow's 27B point boots, for every gate.
+- **Unchanged:** the G3 criterion (mean KL ≤ 0.073 at each of the six anchors), the anchors, the rows, the arms and the order. No result of G1-G5 exists at the time of writing.
