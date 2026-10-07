@@ -6,6 +6,31 @@
 
 ## Unreleased
 
+### Added
+
+- **PREREG for the GLM-5.3-Flash series** (#145, 2026-10-08): `runs/glm53-flash/PREREG.md` (sha256 `375de4d8…` over the committed bytes) fixes gates G1–G7, their thresholds (robin: G5 decode ≥ 40 tok/s) and the abort rules before any row of the series exists.
+- **NVMe read-rate harness for PREREG step 3** (#146, 2026-10-08): `tools/nvme_read_rate.py` reads 14,155,776-B blocks (one expert) at 4096-aligned random offsets with `FILE_FLAG_NO_BUFFERING`, at 1, 2 and 4 readers, ≥ 3 interleaved repetitions, plus three sequential passes, and prints the median per reader count, the spread (≤ 1.15 to count), m* = B / 190.3 GB/s and the prefill bound 39.9 × B. A run with a second process on the disk, a download beside the shards among them, is VOID. Tested on a synthetic file only; no B is measured yet. `docs/nvme-read-rate.md`.
+- **GLM-5.3-Flash downloader** (#154, 2026-10-08): `tools/fetch-glm.py` fetches `zai-org/GLM-5.3-Flash` @ `eb9eb208` resumably with curl and checks every file's size and hash against the HF API of that revision (`lfs.sha256`, else the git blob id); a mismatch is deleted and fetched again, three stop the run. Whole files have one retry layer: curl's own retry is off (it truncates instead of resuming), an outer loop resumes with `-C -` and backoff until the byte count matches, and a watchdog kills a curl that has not grown for 600 s. A shard that would leave less than 20 GB free is refused (exit 4). Modes `--small`, `--headers`, `--shards`, `--for-layers` (with `--plan`), `--status`. Measured: 62 shard headers = 10,684,096 B, headers + tensor bytes = 328,337,455,672 B, exactly the shard total. `docs/glm-download.md`.
+- **glm5_next layer recipe** (#153, 2026-10-08): `docs/glm5-next-recipe.md` names, for every GLM-5.3-Flash building block, the checkpoint tensors, shapes, FP8/BF16 split, norms, clamps and op order with HF `file:line`, the cache sizes per token per layer (MLA latent 1,024 B, HF-layout indexer 514 B at BF16, KDA state 4 MiB per layer per sequence) and the eleven differences between HF and llama.cpp `649dcb103`. Read from source; nothing measured.
+- **Layerwise HF reference for GLM-5.3-Flash** (#158, 2026-10-08): `oracle/glm5_layerwise.py` runs glm5_next one decoder layer at a time from the FP8 originals (E4M3 with 128×128 `weight_scale_inv`) and writes per layer the 4-stream states, the top-8 routing and the DSA top-k, and the logits at anchor rows. Selftest on a synthetic 8-layer config with the real per-block shapes: every layer bit-identical to HF `Glm5NextForConditionalGeneration`, logits within 4.3e-6 (CPU, torch 2.13.0+cpu, transformers 5.16.1, 104 s, peak RSS 27.5 GiB). The CNQ container back end is a stub (exit 2). Not yet run on the real weights. `docs/glm5-reference-runner.md`.
+- **The converter reads the GLM-5.3-Flash FP8 originals** (#155, 2026-10-08): `F8_E4M3` with one 128×128 `weight_scale_inv` per tile dequantizes to f32 bit-identical to DeepSeek `weight_dequant` and transformers `Fp8Dequantize`. New recipe row `cnq4.5-glm5-next` (`glm5_next_text`), a whitelist; the vision tower and the MTP block (layer 45) are skipped by name. `converter/README.md`, `docs/architecture.md` 1.7.
+- **Code histograms and exact static-coder sizes in the converter sidecar** (#155, 2026-10-08): every NVFP4 row carries `h_codes` / `h_scales`; `code_summary` rows give the canonical-Huffman bytes including the code tables per class, per layer and per routed expert block (the PREREG G2 metric). Not yet measured on real weights.
+- **Staged conversion** (#155, #154, 2026-10-08): `--headers` plans from the shard-header cache without a shard on disk; `--consume` reads a shard only after the downloader's `.verified` and writes `.done` when it is finished with it; a killed conversion resumes from `<out>.cnq.journal.jsonl` and writes the same bytes as an uninterrupted run. GLM routed-expert blocks start on 4096-B boundaries.
+- **GLM-5.3-Flash prompt side in the engine library** (#160, 2026-10-08): tokenizer and chat template byte-identical to transformers 5.16.1 for rev `eb9eb208` (10 encode cases incl. German, emoji and a tool transcript; 16 renders with sha256; 16 Jinja feature cases). `tojson` takes `ensure_ascii`. GLM's tool-call markup has its own parser (`Markup::Glm`) and grammar. Reasoning words: `low` → low; `high` / `xhigh` → high; absent / `max` → max; `none` and `medium` are refused by name, because the template cannot render "off". Qwen renders are unchanged. Not wired into `serve` yet; no GPU run. `docs/glm5-tokenizer.md`.
+
+### Changed
+
+- **The chat template comes from `chat_template.jinja` when the model directory has one** (#160, 2026-10-08), as in transformers 5.16.1; else from the `chat_template` field of `tokenizer_config.json`. Both Qwen directories carry both, byte-equal, so Qwen renders do not move. `CROW_TOKENIZER` also finds `models/<model>-original/tokenizer.json`, and a non-Qwen container without its own tokenizer is refused by name instead of falling back to Flash-Next's. `docs/env.md`.
+- **The converter refuses an unknown source dtype by name** (#154, 2026-10-08); before, it skipped the tensor with a line on stderr.
+
+### Measured
+
+- **GLM-5.3-Flash conversion dry run on the 62 real shard headers** (#154, 2026-10-08, `7e5815d`, Windows, `converter plan --headers`, no shard and no GPU): 0.66 s; byte balance exact (328,337,455,672 B over 76,108 tensors); 37,534 tensors written; dense resident part 5,981,546,744 B (5.982 GB, text without routed experts and token embedding); container without index trailer 178,478,618,624 B; every write unit reads one shard.
+
+### Known limitations
+
+- **GLM-5.3-Flash does not run yet.** The engine knows no `glm5_next_text` family and refuses such a config by name; no GLM container is converted; `serve` does not use the GLM tokenizer, template or tool-call grammar; the NVMe rate B and the layerwise reference on real weights are not measured.
+
 ## 2026-10-07 — v0.10.1
 
 **The opt-in `CROW_KV=q8` failed its quality gate, so the 27B stays at 131,072; the engine is the v0.10.0 engine.** No engine source changed since v0.10.0 (`git diff v0.10.0..HEAD -- engine converter` is empty). This release carries the gate's result, its two PREREGs and the docs.
