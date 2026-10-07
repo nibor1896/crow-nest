@@ -10,7 +10,7 @@ No engine code was changed; probes listed in §3 were added as new `engine/src/b
 - **llama.cpp** — shallow clone at `/tmp/llamacpp` (master, 2026-09): `src/models/qwen4exp.cpp` (this arch **is** implemented there, including the QSA indexer), `src/models/qwen3next.cpp`, `src/models/models.h`, `src/models/delta-net-base.cpp`, `src/llama-graph.cpp`, `src/llama-memory-hybrid-idx.cpp`.
 - **config** — `models/Qwen3.8-Flash-Next-original/config.json` (text_config).
 
-**Verdict summary: 17 MATCH / 0 MISMATCH / 3 UNVERIFIABLE** (tie-break order vs `torch.topk`; GGUF-side +1 weight fold; RoPE table bit-provenance). Details and severities below. Every pinned constant checked against `config.json` agrees (see §4).
+**Verdict summary (24 rows): 23 MATCH / 0 MISMATCH / 1 UNVERIFIABLE** (row 19, tie-break order vs `torch.topk`). §2 keeps three open points: U1 is row 19; U2 (llama.cpp's GGUF-side +1 weight fold) and U3 (RoPE table bit-provenance) are notes inside rows 1 and 10, whose formula verdict is MATCH. Status after the 2026-09-21 follow-up: U3 closed by P3, U1 empirically aligned on CUDA by P1b (torch documents no tie order), U2 unchanged. Every pinned constant checked against `config.json` agrees (see §4). Correction 2026-10-07: see the tally under §1.
 
 > **Scope note, 2026-09-23 (#91).** This diff compared FORMULAS on the GDN / QSA / dense path, and its verdict stands for those formulas. It did not cover the NVFP4 activation encoding or how rows are READ from the container. Two engine defects outside that scope were found on 2026-09-23 and are fixed on branch `release-2026-09-23`: the ue4m3 activation floor (`488a840`, with the encoder NaN fix `5c6891a`) and the PLE row-offset read (`85a48e7`). See §7. "0 MISMATCH" therefore does not mean "the engine computes what the model should compute".
 
@@ -19,6 +19,8 @@ No engine code was changed; probes listed in §3 were added as new `engine/src/b
 ## 1. Diff table
 
 Verdicts: **MATCH** = formula and constants identical (fp reduction order may differ — noted); **MISMATCH** = different formula/constant; **UNVERIFIABLE** = cannot be decided from the sources read, with reason.
+
+Every crow-nest `file:line` in this table and in §2 is at commit `08ae3c8` (2026-09-20), the commit this diff was written at; the code has moved since (`l2norm_repeat` row 2: kernels.rs:1589 then, :1667 at `cfbf7ba`). Read them with `git show 08ae3c8:engine/src/kernels.rs`.
 
 | # | check item | crow-nest | HF reference | llama.cpp | VERDICT |
 |---|---|---|---|---|---|
@@ -49,7 +51,9 @@ Verdicts: **MATCH** = formula and constants identical (fp reduction order may di
 
 ### Verdict tally
 
-**17 MATCH, 0 MISMATCH, 3 UNVERIFIABLE** (U1 tie-break order, U2 GGUF +1 fold, U3 RoPE table bits — all minor; see §2).
+**24 rows: 23 MATCH, 0 MISMATCH, 1 UNVERIFIABLE** (row 19 = U1). The open points U2 (row 1) and U3 (row 10) sit in MATCH rows; all three are minor, see §2.
+
+Correction 2026-10-07: until this date the summary and this tally read "17 MATCH, 0 MISMATCH, 3 UNVERIFIABLE". That counted U1–U3 as verdicts and does not add up to the 24 rows; the 17 cannot be reconstructed from the table. Found in robin's live check (#89 comment of 2026-10-07). No row verdict was changed, only the count.
 
 Two systematic, engine-wide observations that are **not** mismatches but bound every comparison:
 

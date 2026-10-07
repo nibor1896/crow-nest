@@ -6,6 +6,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The #89 numerics diff counts its own table right** (#89, 2026-10-07). `docs/numerics-diff.md` said "17 MATCH / 0 MISMATCH / 3 UNVERIFIABLE"; its 24 rows count 23 MATCH / 0 MISMATCH / 1 UNVERIFIABLE (row 19). The old count took the three open points U1–U3 as verdicts, two of which sit inside MATCH rows. No verdict changed. The table now says that its `file:line` references are at `08ae3c8`. The v0.4.0 item below keeps its old count as released.
+
 ## 2026-10-06 — v0.10.0
 
 **The dense 27B gets an opt-in 8.5-bit KV cache, `CROW_KV=q8`, whose quality gate is still open.** Unset `CROW_KV` compiles, maps and launches the kernels of v0.9.5; the #90 engine arm reaches the anchors above 2564.
