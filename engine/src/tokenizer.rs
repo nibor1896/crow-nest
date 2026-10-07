@@ -11,7 +11,13 @@
 //! | file | default | env override |
 //! |---|---|---|
 //! | HF tokenizer | the model's own `tokenizer.json` ([`resolve_tokenizer`], #121), else `models/Qwen3.8-Flash-Next-original/tokenizer.json` | `CROW_TOKENIZER` |
-//! | chat template | sibling `tokenizer_config.json`, field `chat_template` | `CROW_TOKENIZER_CONFIG` |
+//! | chat template | `chat_template.jinja` beside the config file when it exists (#160), else the config's field `chat_template` | `CROW_TOKENIZER_CONFIG` (the config file; its directory is where `chat_template.jinja` is looked for) |
+//! | config file | sibling `tokenizer_config.json` of the tokenizer | `CROW_TOKENIZER_CONFIG` |
+//!
+//! #160: the template file wins over the config field, as in transformers 5.16.1
+//! (`tokenization_utils_base.py:1785-1798`: `chat_template.jinja` is read and REPLACES
+//! `init_kwargs["chat_template"]`). Both Qwen directories carry both, byte-equal (8,952 B, read
+//! 2026-10-08), so their bytes do not move; GLM-5.3-Flash carries only the file.
 //!
 //! Python semantics reproduced (`tools/tokenize_ids.py:26-45`):
 //!
@@ -34,7 +40,7 @@
 //! | `lstrip_blocks` | true | same call |
 //! | `keep_trailing_newline` | false | jinja2 default, minijinja default |
 //! | `raise_exception` | function | jinja_env.globals, raises a template error |
-//! | `tojson` | filter | jinja_env.filters, `json.dumps` defaults, separators `", "` and `": "` |
+//! | `tojson` | filter | jinja_env.filters, `json.dumps` defaults, separators `", "` and `": "`; #160: keywords `ensure_ascii` (bool, default False) and `indent=None`; any other keyword is an error that names it (`chat_template_utils.py:481-484` also takes `indent` > None, `separators`, `sort_keys`; no template of record uses them) |
 //! | unknown method callback | `py_method` | jinja2 runs on Python objects, minijinja does not |
 //!
 //! Python methods the callback answers (jinja2 gets them for free, minijinja does not):
@@ -68,7 +74,7 @@
 //! - `tokenizer.json` is 12.8 MB; `global()` loads it once per process (`OnceLock`).
 //! - The chat template is compiled once into the owned `Environment`.
 
-use minijinja::value::{from_args, ValueKind};
+use minijinja::value::{from_args, Kwargs, ValueKind};
 use minijinja::{Environment, Error as JErr, ErrorKind as JErrKind, State, Value as JVal};
 use serde_json::Value;
 use std::sync::OnceLock;
@@ -85,6 +91,8 @@ pub struct ChatTokenizer {
     env: Environment<'static>,
     tokenizer_path: String,
     config_path: String,
+    /// #160: the file the template was read from (`chat_template.jinja` or the config)
+    template_path: String,
 }
 
 // ------------------------------------------------------------ jinja plumbing
@@ -97,7 +105,17 @@ pub struct ChatTokenizer {
 /// - key order is INSERTION order, from `serde_json`'s `preserve_order` feature.
 /// - without that feature the `Map` is a `BTreeMap` and `tools` would render sorted.
 /// - minijinja's own `tojson` is compact, so it is replaced.
+/// - #160: the product path calls `py_json_opts` (the filter takes `ensure_ascii`); this
+///   name stays for the tests that pinned it
+#[cfg(test)]
 fn py_json(v: &Value, out: &mut String) {
+    py_json_opts(v, false, out)
+}
+
+/// - #160: `py_json` with Python's `ensure_ascii`: `true` escapes every non ASCII character
+///   as `\uXXXX` (lower case hex, a character above U+FFFF as its UTF-16 surrogate pair),
+///   which is `json.dumps(..., ensure_ascii=True)`; `false` is `py_json`
+fn py_json_opts(v: &Value, ascii: bool, out: &mut String) {
     match v {
         Value::Array(a) => {
             out.push('[');
@@ -105,7 +123,7 @@ fn py_json(v: &Value, out: &mut String) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                py_json(x, out);
+                py_json_opts(x, ascii, out);
             }
             out.push(']');
         }
@@ -115,13 +133,32 @@ fn py_json(v: &Value, out: &mut String) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                out.push_str(&Value::String(k.clone()).to_string());
+                py_json_scalar(&Value::String(k.clone()), ascii, out);
                 out.push_str(": ");
-                py_json(x, out);
+                py_json_opts(x, ascii, out);
             }
             out.push('}');
         }
-        other => out.push_str(&other.to_string()),
+        other => py_json_scalar(other, ascii, out),
+    }
+}
+
+/// one scalar as `serde_json` writes it, non ASCII escaped when `ascii`
+fn py_json_scalar(v: &Value, ascii: bool, out: &mut String) {
+    let t = v.to_string();
+    if !ascii || t.is_ascii() {
+        out.push_str(&t);
+        return;
+    }
+    for ch in t.chars() {
+        if ch.is_ascii() {
+            out.push(ch);
+        } else {
+            let mut units = [0u16; 2];
+            for u in ch.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{u:04x}"));
+            }
+        }
     }
 }
 
@@ -217,6 +254,30 @@ fn py_method(state: &State, value: &JVal, method: &str, args: &[JVal]) -> Result
     ))
 }
 
+/// - the `tojson` filter: `json.dumps` with Python's separators (`py_json`)
+/// - #160: keywords as transformers' own filter takes them, the subset a template of record
+///   uses: `ensure_ascii` (GLM writes `tojson(ensure_ascii=False)`) and `indent=None`
+/// - `indent` other than none, `separators`, `sort_keys` and any unknown keyword are an
+///   error NAMING the keyword: a silently ignored keyword would render other bytes than Python
+fn py_tojson(v: JVal, kw: Kwargs) -> Result<JVal, JErr> {
+    let ascii: Option<bool> = kw.get("ensure_ascii")?;
+    let indent: Option<JVal> = kw.get("indent")?;
+    if indent.as_ref().is_some_and(|i| !i.is_none() && !i.is_undefined()) {
+        return Err(JErr::new(
+            JErrKind::InvalidOperation,
+            "tojson: indent other than None is not implemented (Python would pretty-print)",
+        ));
+    }
+    kw.assert_all_used().map_err(|e| {
+        JErr::new(JErrKind::TooManyArguments, format!("tojson: {}", e.detail().unwrap_or("unknown keyword")))
+    })?;
+    let j: Value = serde_json::to_value(&v)
+        .map_err(|e| JErr::new(JErrKind::InvalidOperation, format!("tojson: {e}")))?;
+    let mut s = String::new();
+    py_json_opts(&j, ascii.unwrap_or(false), &mut s);
+    Ok(JVal::from_safe_string(s))
+}
+
 /// the environment `render_chat` renders in; template is owned, so it outlives the call
 fn build_env(template: String) -> Result<Environment<'static>, String> {
     let mut env = Environment::new();
@@ -227,19 +288,51 @@ fn build_env(template: String) -> Result<Environment<'static>, String> {
     env.add_function("raise_exception", |msg: String| -> Result<JVal, JErr> {
         Err(JErr::new(JErrKind::InvalidOperation, msg))
     });
-    env.add_filter("tojson", |v: JVal| -> Result<JVal, JErr> {
-        let j: Value = serde_json::to_value(&v)
-            .map_err(|e| JErr::new(JErrKind::InvalidOperation, format!("tojson: {e}")))?;
-        let mut s = String::new();
-        py_json(&j, &mut s);
-        Ok(JVal::from_safe_string(s))
-    });
+    env.add_filter("tojson", py_tojson);
     env.add_template_owned(TEMPLATE_NAME, template)
         .map_err(|e| format!("chat template does not compile: {e:#}"))?;
     Ok(env)
 }
 
 // ------------------------------------------------------------- construction
+
+/// #160: the HF file a template may live in instead of `tokenizer_config.json`
+pub const TEMPLATE_FILE: &str = "chat_template.jinja";
+
+/// #160: `chat_template.jinja` in the directory of `config_path`
+pub fn sibling_template(config_path: &str) -> String {
+    let p = config_path.replace('\\', "/");
+    match p.rfind('/') {
+        Some(i) => format!("{}/{TEMPLATE_FILE}", &p[..i]),
+        None => TEMPLATE_FILE.to_string(),
+    }
+}
+
+/// - #160: the chat template and the file it came from
+/// - `chat_template.jinja` beside the config wins when it exists (transformers 5.16.1 reads it
+///   and REPLACES the config's field, `tokenization_utils_base.py:1785-1798`)
+/// - else the config's string field `chat_template`, the only source before #160
+/// - `exists`/`read` are injected so the unit test runs without files
+fn template_source(
+    config_path: &str,
+    exists: &dyn Fn(&str) -> bool,
+    read: &dyn Fn(&str) -> Result<Vec<u8>, String>,
+) -> Result<(String, String), String> {
+    let jinja = sibling_template(config_path);
+    if exists(&jinja) {
+        let raw = read(&jinja)?;
+        let t = String::from_utf8(raw).map_err(|e| format!("{jinja} is not UTF-8: {e}"))?;
+        return Ok((t, jinja));
+    }
+    let raw = read(config_path)?;
+    let cfg: Value = serde_json::from_slice(&raw).map_err(|e| format!("{config_path} is not JSON: {e}"))?;
+    let t = cfg
+        .get("chat_template")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("{config_path} has no string field chat_template and there is no {jinja}"))?
+        .to_string();
+    Ok((t, config_path.to_string()))
+}
 
 /// sibling `tokenizer_config.json` of a `tokenizer.json` path
 pub fn sibling_config(tokenizer_path: &str) -> String {
@@ -252,30 +345,34 @@ pub fn sibling_config(tokenizer_path: &str) -> String {
 
 impl ChatTokenizer {
     /// - `tokenizer_path` is an HF `tokenizer.json`
-    /// - `config_path` is the `tokenizer_config.json` carrying `chat_template`
+    /// - `config_path` is the `tokenizer_config.json`; the template is `chat_template.jinja`
+    ///   beside it when that file exists, else its field `chat_template` (#160)
     /// - `Err` carries the operator message, no panic
     pub fn load(tokenizer_path: &str, config_path: &str) -> Result<Self, String> {
         let tok = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| format!("cannot load {tokenizer_path}: {e}"))?;
-        let raw = std::fs::read(config_path).map_err(|e| format!("cannot read {config_path}: {e}"))?;
-        let cfg: Value =
-            serde_json::from_slice(&raw).map_err(|e| format!("{config_path} is not JSON: {e}"))?;
-        let template = cfg
-            .get("chat_template")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("{config_path} has no string field chat_template"))?
-            .to_string();
+        let (template, template_path) = template_source(
+            config_path,
+            &|p| std::path::Path::new(p).is_file(),
+            &|p| std::fs::read(p).map_err(|e| format!("cannot read {p}: {e}")),
+        )?;
         Ok(ChatTokenizer {
             tok,
             env: build_env(template)?,
             tokenizer_path: tokenizer_path.to_string(),
             config_path: config_path.to_string(),
+            template_path,
         })
     }
 
     /// paths this instance was built from, for the `/props` document and the gate log
     pub fn paths(&self) -> (&str, &str) {
         (&self.tokenizer_path, &self.config_path)
+    }
+
+    /// #160: the file the chat template came from
+    pub fn template_path(&self) -> &str {
+        &self.template_path
     }
 
     /// `tok(text, add_special_tokens=False)["input_ids"]`
@@ -339,6 +436,60 @@ impl ChatTokenizer {
         };
         tmpl.render(ctx)
             .map_err(|e| format!("chat template render failed: {e:#}"))
+    }
+
+    /// - #160: the render with the template variables `vars` (a JSON object) DEFINED beside
+    ///   `messages`, `tools`, `documents` (none) and `add_generation_prompt` - what
+    ///   `apply_chat_template(..., **vars)` passes; a variable not in `vars` stays UNDEFINED
+    /// - GLM-5.3-Flash's template reads `reasoning_effort` and `clear_thinking`, never
+    ///   `enable_thinking`; the Qwen renders above keep their own entry points and bytes
+    /// - a key of `vars` that names one of the four fixed variables is an error, so a caller
+    ///   cannot shadow them by accident
+    pub fn render_chat_with(
+        &self,
+        messages: &Value,
+        tools: Option<&Value>,
+        add_generation_prompt: bool,
+        vars: &Value,
+    ) -> Result<String, String> {
+        let extra = match vars {
+            Value::Null => serde_json::Map::new(),
+            Value::Object(m) => m.clone(),
+            other => return Err(format!("template vars must be a JSON object, got {other}")),
+        };
+        for k in ["messages", "tools", "documents", "add_generation_prompt"] {
+            if extra.contains_key(k) {
+                return Err(format!("template var {k} is fixed by the call, not by vars"));
+            }
+        }
+        let tmpl = self
+            .env
+            .get_template(TEMPLATE_NAME)
+            .map_err(|e| format!("chat template missing: {e:#}"))?;
+        let ctx = minijinja::context! {
+            messages => JVal::from_serialize(messages),
+            tools => match tools {
+                Some(t) => JVal::from_serialize(t),
+                None => JVal::from(()),
+            },
+            documents => JVal::from(()),
+            add_generation_prompt => add_generation_prompt,
+            ..JVal::from_serialize(&extra)
+        };
+        tmpl.render(ctx)
+            .map_err(|e| format!("chat template render failed: {e:#}"))
+    }
+
+    /// #160: `render_chat_with` then the same encode
+    pub fn encode_chat_with(
+        &self,
+        messages: &Value,
+        tools: Option<&Value>,
+        add_generation_prompt: bool,
+        vars: &Value,
+    ) -> Result<Vec<u32>, String> {
+        let s = self.render_chat_with(messages, tools, add_generation_prompt, vars)?;
+        self.encode_raw(&s)
     }
 
     /// `render_chat` then `encode(..., add_special_tokens=False)`, as `apply_chat_template` does
@@ -468,8 +619,15 @@ pub const TOKENIZER_FILE: &str = "tokenizer.json";
 /// 2. `CROW_MODEL_DIR/tokenizer.json` (`model_dir`), when the file is there;
 /// 3. `models/<model>/tokenizer.json` beside the container, `<model>` = the source repo's
 ///    name from the index v2 (`Qwen/Qwen3.8-27B` -> `Qwen3.8-27B`), the same directory
-///    `vit::resolve_mmproj` looks in first (#122), when the file is there;
-/// 4. `DEFAULT_TOKENIZER` (Flash-Next's). When 3 was tried and missed, the reason names it.
+///    `vit::resolve_mmproj` looks in first (#122), when the file is there; #160: then
+///    `models/<model>-original/tokenizer.json`, the directory the original download lands in
+///    (`models/GLM-5.3-Flash-original/`, as `Qwen3.8-Flash-Next-original` before it);
+/// 4. `DEFAULT_TOKENIZER` (Flash-Next's), ONLY for a container that names no model or names
+///    a Qwen model (`Qwen*`): the fallback is legal only for the family it belongs to. When 3
+///    was tried and missed, the reason names it.
+/// 5. #160: any other model (GLM-5.3-Flash) whose own file is missing gets its OWN missing
+///    path back, so the load refuses it by name (`cannot load ...`) instead of encoding a
+///    GLM prompt with Qwen's vocabulary.
 ///
 /// `exists` is the file test, injected so the unit test runs without the files.
 pub fn resolve_tokenizer(
@@ -491,15 +649,28 @@ pub fn resolve_tokenizer(
     let mut missed = None;
     if let Some(m) = model.filter(|m| !m.is_empty()) {
         let root = std::path::Path::new(cnq_path).parent().and_then(|d| d.parent());
-        let p = root
-            .unwrap_or_else(|| std::path::Path::new(""))
-            .join("models")
-            .join(m)
-            .join(TOKENIZER_FILE)
-            .to_string_lossy()
-            .into_owned();
+        let dir = |d: &str| {
+            root.unwrap_or_else(|| std::path::Path::new(""))
+                .join("models")
+                .join(d)
+                .join(TOKENIZER_FILE)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let p = dir(m);
         if exists(&p) {
             return (p, format!("the container's model directory ({m})"));
+        }
+        let orig = dir(&format!("{m}-original"));
+        if exists(&orig) {
+            return (orig, format!("the container's original download directory ({m}-original)"));
+        }
+        if !m.starts_with("Qwen") {
+            let why = format!(
+                "{p} and {orig} are missing - {m} has no fallback tokenizer (Flash-Next's is Qwen's \
+                 vocabulary), so the load refuses it by name"
+            );
+            return (p, why);
         }
         missed = Some(p);
     }
@@ -957,5 +1128,124 @@ mod tests {
         let im_end = t.token_id("<|im_end|>").unwrap();
         assert_eq!(t.token_bytes(im_end), b"<|im_end|>");
         assert!(t.token_bytes(u32::MAX).is_empty());
+    }
+
+    // ------------------------------------------------------------------ #160
+
+    const GLM_GOLDENS: &str = include_str!("../tests/fixtures/GLM-5.3-Flash/tokenizer-goldens.json");
+
+    /// #160: every Jinja construct GLM-5.3-Flash's template uses, rendered alone in this
+    /// environment, equals transformers' render of the same source (goldens,
+    /// `oracle/export_glm5_tokenizer_goldens.py`, `jinja_features`)
+    #[test]
+    fn glm_jinja_features_match_transformers() {
+        let g: Value = serde_json::from_str(GLM_GOLDENS).unwrap();
+        let cases = g["jinja_features"].as_array().unwrap();
+        assert_eq!(cases.len(), 16);
+        let mut bad = Vec::new();
+        for c in cases {
+            let name = c["name"].as_str().unwrap();
+            let env = build_env(c["template"].as_str().unwrap().to_string()).expect("compiles");
+            let got = env
+                .get_template(TEMPLATE_NAME)
+                .unwrap()
+                .render(JVal::from_serialize(&c["context"]))
+                .map_err(|e| format!("{e:#}"));
+            if got.as_deref() != Ok(c["render"].as_str().unwrap()) {
+                bad.push(format!("{name}: got {got:?}, transformers {:?}", c["render"]));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// #160: `tojson` keywords - `ensure_ascii` both ways, `indent=None`, anything else is
+    /// an error that names the keyword (Python would render other bytes)
+    #[test]
+    fn tojson_takes_ensure_ascii_and_names_any_other_keyword() {
+        let render = |src: &str| -> Result<String, String> {
+            let env = build_env(src.to_string()).expect("compiles");
+            env.get_template(TEMPLATE_NAME)
+                .unwrap()
+                .render(minijinja::context! { v => JVal::from_serialize(serde_json::json!({"k": "\u{fc}\u{1f985}"})) })
+                .map_err(|e| format!("{e:#}"))
+        };
+        assert_eq!(render("{{ v | tojson }}").unwrap(), "{\"k\": \"\u{fc}\u{1f985}\"}");
+        assert_eq!(render("{{ v | tojson(ensure_ascii=False) }}").unwrap(), "{\"k\": \"\u{fc}\u{1f985}\"}");
+        // Python: json.dumps({"k": "\u00fc\U0001F985"}, ensure_ascii=True)
+        assert_eq!(render("{{ v | tojson(ensure_ascii=True) }}").unwrap(), "{\"k\": \"\\u00fc\\ud83e\\udd85\"}");
+        assert_eq!(render("{{ v | tojson(indent=None) }}").unwrap(), "{\"k\": \"\u{fc}\u{1f985}\"}");
+        let e = render("{{ v | tojson(indent=2) }}").unwrap_err();
+        assert!(e.contains("indent"), "{e}");
+        for kw in ["sort_keys=True", "separators=none", "bogus=1"] {
+            let e = render(&format!("{{{{ v | tojson({kw}) }}}}")).unwrap_err();
+            let name = kw.split('=').next().unwrap();
+            assert!(e.contains(&format!("'{name}'")), "{kw}: {e}");
+        }
+    }
+
+    /// #160: `chat_template.jinja` beside the config wins over the config's field, as in
+    /// transformers; the field is the fallback; neither is a named refusal
+    #[test]
+    fn the_template_file_wins_over_the_config_field() {
+        let files = |jinja: bool, field: bool| {
+            move |p: &str| -> Result<Vec<u8>, String> {
+                if p.ends_with(TEMPLATE_FILE) && jinja {
+                    return Ok(b"FILE".to_vec());
+                }
+                if p.ends_with("tokenizer_config.json") {
+                    return Ok(if field { br#"{"chat_template": "FIELD"}"#.to_vec() } else { br#"{"eos_token": "x"}"#.to_vec() });
+                }
+                Err(format!("cannot read {p}"))
+            }
+        };
+        let cfg = "m/GLM/tokenizer_config.json";
+        assert_eq!(sibling_template(cfg), "m/GLM/chat_template.jinja");
+        assert_eq!(sibling_template("C:\\m\\x\\tokenizer_config.json"), "C:/m/x/chat_template.jinja");
+        let has = |p: &str| p.ends_with(TEMPLATE_FILE);
+        let none = |_: &str| false;
+        assert_eq!(template_source(cfg, &has, &files(true, true)).unwrap(), ("FILE".to_string(), "m/GLM/chat_template.jinja".to_string()));
+        assert_eq!(template_source(cfg, &has, &files(true, false)).unwrap().0, "FILE");
+        assert_eq!(template_source(cfg, &none, &files(false, true)).unwrap(), ("FIELD".to_string(), cfg.to_string()));
+        let e = template_source(cfg, &none, &files(false, false)).unwrap_err();
+        assert!(e.contains("no string field chat_template") && e.contains("chat_template.jinja"), "{e}");
+    }
+
+    /// #160: the Qwen directories carry both sources, byte-equal, so the file that now wins
+    /// renders what the field rendered: the Qwen bytes of every test above are unchanged
+    #[test]
+    fn the_flash_next_template_now_comes_from_its_jinja_file_with_the_same_bytes() {
+        let t = tk();
+        assert!(t.template_path().ends_with("chat_template.jinja"), "{}", t.template_path());
+        let raw = std::fs::read(sibling_config(&format!("../{DEFAULT_TOKENIZER}"))).unwrap();
+        let cfg: Value = serde_json::from_slice(&raw).unwrap();
+        let file = std::fs::read_to_string(t.template_path()).unwrap();
+        assert_eq!(cfg["chat_template"].as_str().unwrap(), file);
+    }
+
+    /// #160: a GLM container whose own tokenizer is missing is NOT given Flash-Next's (a
+    /// silent wrong vocabulary); it gets its own missing path, which the load refuses by name.
+    /// The download directory `<model>-original` is found; the Qwen fallback is unchanged.
+    #[test]
+    fn a_glm_container_never_falls_back_to_the_qwen_tokenizer() {
+        let none = |_: &str| false;
+        let j = |base: &str, parts: &[&str]| {
+            parts.iter().fold(std::path::PathBuf::from(base), |b, p| b.join(p)).to_string_lossy().into_owned()
+        };
+        let cnq = "converter/GLM-5.3-Flash-CNQ.cnq";
+        let own = j("", &["models", "GLM-5.3-Flash", "tokenizer.json"]);
+        let orig = j("", &["models", "GLM-5.3-Flash-original", "tokenizer.json"]);
+        let (t, why) = resolve_tokenizer(None, None, cnq, Some("GLM-5.3-Flash"), &none);
+        assert_eq!(t, own);
+        assert_ne!(t, DEFAULT_TOKENIZER);
+        assert!(why.contains("no fallback tokenizer"), "{why}");
+        assert!(ChatTokenizer::load(&t, &sibling_config(&t)).is_err_and(|e| e.contains("cannot load")));
+        // the original download directory is found when the plain one is missing
+        let only_orig = |p: &str| p == orig;
+        let (t, why) = resolve_tokenizer(None, None, cnq, Some("GLM-5.3-Flash"), &only_orig);
+        assert_eq!(t, orig);
+        assert!(why.contains("GLM-5.3-Flash-original"), "{why}");
+        // a Qwen model keeps today's fallback
+        let (t, _) = resolve_tokenizer(None, None, cnq, Some("Qwen3.8-27B"), &none);
+        assert_eq!(t, DEFAULT_TOKENIZER);
     }
 }

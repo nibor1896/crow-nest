@@ -84,6 +84,38 @@
 //!   `Malformed::raw_as_content` says which. `bin/serve.rs` puts the records on the wire as
 //!   `crow_malformed_calls` and logs one WARN per record.
 //!
+//! #160, the second markup (`Markup::Glm`, GLM-5.3-Flash's `chat_template.jinja`):
+//!
+//! ```text
+//! <tool_call>read_file<arg_key>path</arg_key><arg_value>C:/x/y.md</arg_value><arg_key>start_line</arg_key><arg_value>1</arg_value></tool_call>
+//! ```
+//!
+//! - The template renders it TIGHT: no newline anywhere in the frame; a string value is
+//!   written raw (`v`), any other value as `v | tojson(ensure_ascii=False)`.
+//! - Same `ToolStream`, same `arm()` on the `<tool_call>` token id, same fragments, same
+//!   abandon / `Malformed` / `dropped` rules; only the states between the two markers differ:
+//!
+//! | state | reads | on | goes to |
+//! |---|---|---|---|
+//! | `GName` | the name, up to the first `<arg_key>` or `</tool_call>` | `<arg_key>` | `Emit::Call`, `GKey` |
+//! | | | `</tool_call>` | `Emit::Call` + `{}`, call closed (llama.cpp's `<tool_call>name</tool_call>`, no arguments) |
+//! | `GKey` | the key, up to `</arg_key>` | `</arg_key>` | `GAwaitVal` |
+//! | `GAwaitVal` | anything up to `<arg_value>` (the template writes nothing there) | `<arg_value>` | `{"k":` (+ `"` for a declared string), `GVal` |
+//! | | | `</tool_call>` | malformed `bad-param-name`: a key without its value |
+//! | `GVal` | the value, up to the FIRST `</arg_value>` | `</arg_value>` | value closed, `GAfter` |
+//! | | | `</tool_call>` | value, arguments and call closed (as Qwen's `</tool_call>` inside a value) |
+//! | `GAfter` | anything up to the next marker | `<arg_key>` / `</tool_call>` | `GKey` / `}` and call closed |
+//!
+//! - A string value is kept VERBATIM, newlines included (Qwen's `\n` separators do not exist
+//!   here); `<arg_value>`, `</arg_key>` and `<arg_key>` text inside a value are value bytes.
+//! - A value cannot contain `</arg_value>`: it ends at the first one (the grammar refuses the
+//!   marker inside a string value, as it refuses `</parameter>` for Qwen); the rest of what the
+//!   model meant as value is then markup the parser skips in `GAfter`.
+//! - The name is trimmed and must be 1..=`MAX_TOOL_NAME` bytes without `<`, `>` or a newline,
+//!   else `bad-name`; a key the same, else `bad-param-name`.
+//! - The end of generation inside any `G*` state is `end-in-call` (GLM has no `</function>`,
+//!   so there is no `Tail`: only `</tool_call>` completes a call).
+//!
 //! Byte accounting:
 //!
 //! - `dropped()` counts every content or markup byte the parser swallowed without emitting it.
@@ -128,6 +160,25 @@ const PARAM_OPEN: &str = "<parameter=";
 const PARAM_CLOSE: &str = "</parameter>";
 /// a function name longer than this is markup that never closed, not a name
 const MAX_TOOL_NAME: usize = 128;
+/// #160 GLM: opens a key
+const ARG_KEY_OPEN: &str = "<arg_key>";
+/// #160 GLM: closes a key
+const ARG_KEY_CLOSE: &str = "</arg_key>";
+/// #160 GLM: opens a value
+const ARG_VALUE_OPEN: &str = "<arg_value>";
+/// #160 GLM: closes a value; the FIRST one ends it
+const ARG_VALUE_CLOSE: &str = "</arg_value>";
+
+/// - #160: which tool-call markup the model writes; one per tokenizer / template
+/// - `Qwen`: `<tool_call>\n<function=NAME>\n<parameter=P>\nV\n</parameter>\n</function>\n</tool_call>`
+///   (Flash-Next, the 27B), the only markup before #160, byte-identical
+/// - `Glm`: `<tool_call>NAME<arg_key>P</arg_key><arg_value>V</arg_value></tool_call>` (GLM-5.3-Flash)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Markup {
+    #[default]
+    Qwen,
+    Glm,
+}
 /// TASK J: the key a TRUNCATED call's `arguments` object carries, and the only key in it
 /// that no tool declares; `pub` because `bin/serve.rs` names it in its contract table test
 pub const TRUNCATED_KEY: &str = "_truncated";
@@ -207,6 +258,16 @@ enum TState {
     ParamValue,
     /// after `</function>`, looking for `</tool_call>`
     Tail,
+    /// #160 GLM: after `<tool_call>`, collecting the name up to `<arg_key>` / `</tool_call>`
+    GName,
+    /// #160 GLM: collecting a key, until `</arg_key>`
+    GKey,
+    /// #160 GLM: after `</arg_key>`, looking for `<arg_value>`
+    GAwaitVal,
+    /// #160 GLM: collecting a value, until the first `</arg_value>`
+    GVal,
+    /// #160 GLM: after `</arg_value>`, looking for `<arg_key>` or `</tool_call>`
+    GAfter,
 }
 
 /// - one JSON string literal, quotes included, exactly as `serde_json` writes it
@@ -446,6 +507,8 @@ fn tool_param_types(
 ///   when no call was named yet, else it is dropped (#99).
 /// - Every abandoned call leaves one `Malformed` record (#99), whichever path gave it up.
 pub struct ToolStream {
+    /// #160: the markup this stream reads
+    markup: Markup,
     /// declared parameter types, from the request's `tools`
     types: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     state: TState,
@@ -488,8 +551,15 @@ pub struct ToolStream {
 }
 
 impl ToolStream {
+    /// the Qwen markup, the stream of every request before #160
     pub fn new(tools: Option<&serde_json::Value>) -> Self {
+        Self::with_markup(tools, Markup::Qwen)
+    }
+
+    /// #160: a stream that reads `markup`
+    pub fn with_markup(tools: Option<&serde_json::Value>, markup: Markup) -> Self {
         ToolStream {
+            markup,
             types: tool_param_types(tools),
             state: TState::Text,
             buf: String::new(),
@@ -510,6 +580,11 @@ impl ToolStream {
             dropped: 0,
             malformed: Vec::new(),
         }
+    }
+
+    /// #160: the markup this stream reads
+    pub fn markup(&self) -> Markup {
+        self.markup
     }
 
     /// the decode loop saw the `<tool_call>` token ID; only this permits entering a call
@@ -764,7 +839,7 @@ impl ToolStream {
         if !self.named {
             return;
         }
-        if self.state == TState::ParamValue {
+        if matches!(self.state, TState::ParamValue | TState::GVal) {
             self.close_param(out);
         }
         let frag = if self.open_brace {
@@ -842,7 +917,10 @@ impl ToolStream {
                             self.named = false;
                             self.name.clear();
                             self.open_brace = false;
-                            self.state = TState::Func;
+                            self.state = match self.markup {
+                                Markup::Qwen => TState::Func,
+                                Markup::Glm => TState::GName,
+                            };
                         }
                         Some((at, _)) => {
                             let take = at + TOOL_OPEN.len();
@@ -989,9 +1067,162 @@ impl ToolStream {
                         }
                     }
                 }
+                TState::GName => {
+                    let (hit, _) = find_marker(&self.buf, &[ARG_KEY_OPEN, TOOL_CLOSE]);
+                    match hit {
+                        Some((at, i)) => {
+                            let s = self.eat(at + if i == 0 { ARG_KEY_OPEN.len() } else { TOOL_CLOSE.len() });
+                            let Some(name) = glm_name(&s[..at]) else {
+                                self.give_up(MalformedKind::BadName, out);
+                                continue;
+                            };
+                            self.name = name.clone();
+                            self.named = true;
+                            out.push(Emit::Call { index: self.index, id: format!("call_{}", self.index), name });
+                            if i == 0 {
+                                self.pname.clear();
+                                self.state = TState::GKey;
+                            } else {
+                                self.close_args(out);
+                                self.close_call();
+                            }
+                        }
+                        None => {
+                            // a name has no `<`: past the longest name and a whole marker,
+                            // this is not a name that will ever close
+                            if self.buf.len() > MAX_TOOL_NAME + TOOL_CLOSE.len() || glm_name_broken(&self.buf) {
+                                // as Qwen's `read_name_to_gt`: the unread text stays for `Text`
+                                self.give_up(MalformedKind::BadName, out);
+                                continue;
+                            }
+                            return;
+                        }
+                    }
+                }
+                TState::GKey => {
+                    let (hit, _) = find_marker(&self.buf, &[ARG_KEY_CLOSE]);
+                    match hit {
+                        Some((at, _)) => {
+                            let s = self.eat(at + ARG_KEY_CLOSE.len());
+                            let Some(k) = glm_name(&s[..at]) else {
+                                self.give_up(MalformedKind::BadParamName, out);
+                                continue;
+                            };
+                            self.pname = k;
+                            self.state = TState::GAwaitVal;
+                        }
+                        None => {
+                            if self.buf.len() > MAX_TOOL_NAME + ARG_KEY_CLOSE.len() || glm_name_broken(&self.buf) {
+                                // as Qwen's `read_name_to_gt`: the unread text stays for `Text`
+                                self.give_up(MalformedKind::BadParamName, out);
+                                continue;
+                            }
+                            return;
+                        }
+                    }
+                }
+                TState::GAwaitVal => {
+                    let (hit, safe) = find_marker(&self.buf, &[ARG_VALUE_OPEN, TOOL_CLOSE]);
+                    match hit {
+                        Some((at, 0)) => {
+                            self.eat(at + ARG_VALUE_OPEN.len());
+                            self.open_glm_value(out);
+                            self.state = TState::GVal;
+                        }
+                        Some((at, _)) => {
+                            // a key whose value never opened: nothing of it went out yet
+                            self.eat(at + TOOL_CLOSE.len());
+                            self.give_up(MalformedKind::BadParamName, out);
+                        }
+                        None => {
+                            self.eat(safe);
+                            return;
+                        }
+                    }
+                }
+                TState::GVal => {
+                    let (hit, safe) = find_marker(&self.buf, &[ARG_VALUE_CLOSE, TOOL_CLOSE]);
+                    match hit {
+                        Some((at, i)) => {
+                            let s = self.eat(at + if i == 0 { ARG_VALUE_CLOSE.len() } else { TOOL_CLOSE.len() });
+                            self.glm_value(&s[..at], out);
+                            self.close_param(out);
+                            if i == 0 {
+                                self.state = TState::GAfter;
+                            } else {
+                                self.close_args(out);
+                                self.close_call();
+                            }
+                        }
+                        None => {
+                            if safe == 0 {
+                                return;
+                            }
+                            let s = self.eat(safe);
+                            self.glm_value(&s, out);
+                            return;
+                        }
+                    }
+                }
+                TState::GAfter => {
+                    let (hit, safe) = find_marker(&self.buf, &[ARG_KEY_OPEN, TOOL_CLOSE]);
+                    match hit {
+                        Some((at, 0)) => {
+                            self.eat(at + ARG_KEY_OPEN.len());
+                            self.pname.clear();
+                            self.state = TState::GKey;
+                        }
+                        Some((at, _)) => {
+                            self.eat(at + TOOL_CLOSE.len());
+                            self.close_args(out);
+                            self.close_call();
+                        }
+                        None => {
+                            self.eat(safe);
+                            return;
+                        }
+                    }
+                }
             }
         }
     }
+
+    /// - #160 GLM: `<arg_value>` opened, the key's fragment goes out: `{"k":` or `,"k":`,
+    ///   plus `"` for a declared string, exactly `open_param`
+    /// - GLM writes no separator newline, so nothing is skipped or held
+    fn open_glm_value(&mut self, out: &mut Vec<Emit>) {
+        self.open_param(out);
+        self.skip_nl = false;
+        self.held_nl = false;
+    }
+
+    /// #160 GLM: value bytes, VERBATIM - a string streams escaped, any other value buffers
+    fn glm_value(&mut self, text: &str, out: &mut Vec<Emit>) {
+        if self.vstring {
+            if !text.is_empty() {
+                out.push(Emit::Args { index: self.index, text: json_escape(text) });
+            }
+        } else {
+            self.vbuf.push_str(text);
+        }
+    }
+}
+
+/// - #160 GLM: a name or key out of the text between two markers: trimmed, 1..=`MAX_TOOL_NAME`
+///   bytes, no `<`, `>` or line break inside; `None` is malformed
+fn glm_name(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() || t.len() > MAX_TOOL_NAME || t.contains(['<', '>', '\n', '\r']) {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+/// - #160 GLM: a name still being read can no longer become one: a `>`, or a line break
+///   after non-blank text (a held `<` may still open a marker)
+fn glm_name_broken(buf: &str) -> bool {
+    let lead = buf.trim_start();
+    lead.contains('>') || lead.trim_end_matches(['\n', '\r', ' ', '\t']).contains(['\n', '\r'])
 }
 
 #[cfg(test)]
@@ -1892,5 +2123,350 @@ mod arguments_contract {
             }
         }
         assert_eq!(bad, 0, "{bad} random arguments strings did not parse as an object");
+    }
+}
+
+#[cfg(test)]
+mod glm_tests {
+    //! #160: `Markup::Glm`, GLM-5.3-Flash's `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`.
+    //! The expectations of llama.cpp's GLM-4.7-Flash parser tests (`tests/test-chat.cpp:4258-4370`
+    //! at `11924d4c1`, read, not run) are reproduced on the same inputs: one call, two parallel
+    //! calls, `{"arg1": 1}` typed from the raw `1` for an integer schema, a call with no
+    //! arguments. The round trips through Python's own render come from the goldens.
+    use super::*;
+
+    const GOLDENS: &str = include_str!("../tests/fixtures/GLM-5.3-Flash/tokenizer-goldens.json");
+
+    struct Run {
+        es: Vec<Emit>,
+        bad: bool,
+        closed: usize,
+        malformed: Vec<Malformed>,
+        dropped: usize,
+    }
+
+    fn drive(tools: Option<&serde_json::Value>, arms: usize, pieces: &[&str]) -> Run {
+        let mut ts = ToolStream::with_markup(tools, Markup::Glm);
+        for _ in 0..arms {
+            ts.arm();
+        }
+        let mut es = Vec::new();
+        for p in pieces {
+            es.extend(ts.feed(p));
+        }
+        let bad = ts.finish(&mut es);
+        Run { es, bad, closed: ts.closed(), malformed: ts.malformed().to_vec(), dropped: ts.dropped() }
+    }
+
+    fn args_of(es: &[Emit], index: usize) -> String {
+        es.iter()
+            .filter_map(|e| match e {
+                Emit::Args { index: i, text } if *i == index => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn names(es: &[Emit]) -> Vec<(usize, String)> {
+        es.iter()
+            .filter_map(|e| match e {
+                Emit::Call { index, name, .. } => Some((*index, name.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn content_of(es: &[Emit]) -> String {
+        es.iter()
+            .filter_map(|e| match e {
+                Emit::Content(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn cut(s: &str, n: usize) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < s.len() {
+            let mut j = (i + n).min(s.len());
+            while !s.is_char_boundary(j) {
+                j -= 1;
+            }
+            if j == i {
+                // a piece smaller than the character: take the whole character
+                j = i + s[i..].chars().next().map_or(1, char::len_utf8);
+            }
+            out.push(&s[i..j]);
+            i = j;
+        }
+        out
+    }
+
+    fn json(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap_or_else(|e| panic!("{s:?} does not parse: {e}"))
+    }
+
+    const GLM_CALL: &str = "<tool_call>read_file<arg_key>path</arg_key><arg_value>C:/Users/robin/dev/crow-nest/docs/ten-tasks.md</arg_value><arg_key>start_line</arg_key><arg_value>1</arg_value></tool_call>";
+
+    #[test]
+    fn the_default_stream_is_still_qwen() {
+        assert_eq!(ToolStream::new(None).markup(), Markup::Qwen);
+        assert_eq!(Markup::default(), Markup::Qwen);
+        assert_eq!(ToolStream::with_markup(None, Markup::Glm).markup(), Markup::Glm);
+    }
+
+    /// the GLM call through the QWEN stream: what serve would do without the markup switch
+    /// (the reason `Markup::Glm` exists - no call, the markup is abandoned)
+    #[test]
+    fn the_qwen_stream_cannot_read_glm_markup() {
+        let tools = a7_tools_fixture();
+        let mut ts = ToolStream::new(Some(&tools));
+        ts.arm();
+        let mut es = ts.feed(GLM_CALL);
+        ts.finish(&mut es);
+        assert!(names(&es).is_empty());
+        assert_eq!(ts.malformed()[0].kind, MalformedKind::CloseBeforeFunction);
+    }
+
+    #[test]
+    fn one_glm_call_becomes_a_name_and_typed_arguments_at_every_split() {
+        let tools = a7_tools_fixture();
+        for n in [1usize, 2, 3, 5, 7, 11, 13, 1000] {
+            let r = drive(Some(&tools), 1, &cut(GLM_CALL, n));
+            assert!(!r.bad, "split {n}");
+            assert_eq!(r.closed, 1, "split {n}");
+            assert_eq!(names(&r.es), vec![(0, "read_file".to_string())], "split {n}");
+            assert_eq!(
+                args_of(&r.es, 0),
+                "{\"path\":\"C:/Users/robin/dev/crow-nest/docs/ten-tasks.md\",\"start_line\":1}",
+                "split {n}"
+            );
+            assert_eq!(content_of(&r.es), "", "split {n}");
+            assert!(r.malformed.is_empty(), "split {n}");
+        }
+    }
+
+    /// llama.cpp's GLM-4.7-Flash cases: `{"arg1": 1}` from the raw `1` for an integer
+    /// schema, a call without arguments, two parallel calls
+    #[test]
+    fn the_llama_cpp_glm_cases_parse_the_same() {
+        let tools = serde_json::json!([
+            {"type": "function", "function": {"name": "special_function",
+                "parameters": {"type": "object", "properties": {"arg1": {"type": "integer"}}, "required": ["arg1"]}}},
+            {"type": "function", "function": {"name": "empty_args", "parameters": {"type": "object", "properties": {}}}}
+        ]);
+        let r = drive(Some(&tools), 1, &["<tool_call>special_function<arg_key>arg1</arg_key><arg_value>1</arg_value></tool_call>"]);
+        assert_eq!(json(&args_of(&r.es, 0)), serde_json::json!({"arg1": 1}));
+        assert_eq!(args_of(&r.es, 0), "{\"arg1\":1}");
+        // no arguments: `<tool_call>name</tool_call>` (llama.cpp #20650)
+        let r = drive(Some(&tools), 1, &["<tool_call>empty_args</tool_call>"]);
+        assert_eq!((r.closed, r.bad), (1, false));
+        assert_eq!(names(&r.es), vec![(0, "empty_args".to_string())]);
+        assert_eq!(args_of(&r.es, 0), "{}");
+        // two parallel calls, tight as the template renders them
+        let two = "<tool_call>special_function<arg_key>arg1</arg_key><arg_value>1</arg_value></tool_call>\
+                   <tool_call>special_function<arg_key>arg1</arg_key><arg_value>2</arg_value></tool_call>";
+        for n in [1usize, 4, 1000] {
+            let r = drive(Some(&tools), 2, &cut(two, n));
+            assert_eq!(r.closed, 2, "split {n}");
+            assert_eq!(names(&r.es), vec![(0, "special_function".to_string()), (1, "special_function".to_string())]);
+            assert_eq!(args_of(&r.es, 0), "{\"arg1\":1}");
+            assert_eq!(args_of(&r.es, 1), "{\"arg1\":2}");
+        }
+    }
+
+    /// every tool call Python's template rendered (goldens) parses back to the arguments
+    /// object it was rendered from: string, number, bool, list, object, and a string that
+    /// carries `<arg_value>` and `</arg_key>` as text
+    #[test]
+    fn every_golden_tool_call_parses_back_to_its_arguments() {
+        let g: serde_json::Value = serde_json::from_str(GOLDENS).unwrap();
+        let mut seen = 0;
+        for case in g["render"].as_array().unwrap() {
+            let render = case["render"].as_str().unwrap();
+            let Some(asst) = case["messages"].as_array().unwrap().iter().find(|m| m.get("tool_calls").is_some()) else {
+                continue;
+            };
+            let calls = asst["tool_calls"].as_array().unwrap();
+            // every golden has ONE assistant turn with calls: its calls, as rendered
+            // (after the first assistant header: the tools prompt carries an example call)
+            let asst_at = render.find("<|assistant|>").unwrap();
+            let from = asst_at + render[asst_at..].find(TOOL_OPEN).unwrap();
+            let to = render.rfind("</tool_call>").unwrap() + "</tool_call>".len();
+            let text = &render[from..to];
+            assert_eq!(text.matches(TOOL_OPEN).count(), calls.len(), "{}", case["name"]);
+            for t in [Some(&case["tools"]), None] {
+                for n in [1usize, 3, 1000] {
+                    let r = drive(t, calls.len(), &cut(text, n));
+                    assert_eq!(r.closed, calls.len(), "{} split {n}", case["name"]);
+                    for (i, c) in calls.iter().enumerate() {
+                        assert_eq!(names(&r.es)[i], (i, c["function"]["name"].as_str().unwrap().to_string()));
+                        assert_eq!(
+                            json(&args_of(&r.es, i)),
+                            c["function"]["arguments"],
+                            "{} call {i} split {n} tools {}",
+                            case["name"],
+                            t.is_some()
+                        );
+                    }
+                }
+            }
+            seen += calls.len();
+        }
+        assert_eq!(seen, 6, "goldens with tool calls: 1 + 2 + 2 + 1");
+    }
+
+    /// the plan's failure mode: a value that itself carries argument markup
+    #[test]
+    fn a_value_with_arg_value_text_is_kept_verbatim() {
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "write_file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}}]);
+        let v = "x = \"<arg_value>\"; y = '</arg_key>'; <arg_key>z</arg_key>\n<tool_call> stays text\n";
+        let call = format!(
+            "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.py</arg_value><arg_key>content</arg_key><arg_value>{v}</arg_value></tool_call>"
+        );
+        for t in [Some(&tools), None] {
+            for n in [1usize, 2, 5, 9, 1000] {
+                let r = drive(t, 1, &cut(&call, n));
+                assert!(!r.bad && r.malformed.is_empty(), "split {n}");
+                assert_eq!(r.closed, 1);
+                let a = json(&args_of(&r.es, 0));
+                assert_eq!(a["content"], v, "split {n}, tools {}", t.is_some());
+                assert_eq!(a["path"], "a.py");
+            }
+        }
+    }
+
+    /// without the grammar, a value ends at the FIRST `</arg_value>`; what the model meant
+    /// as the rest of it is skipped up to the next marker, and the call still closes as JSON
+    #[test]
+    fn a_value_ends_at_the_first_close_marker() {
+        let tools = a7_tools_fixture();
+        let call = "<tool_call>read_file<arg_key>path</arg_key><arg_value>a</arg_value>b</arg_value></tool_call>";
+        for n in [1usize, 3, 1000] {
+            let r = drive(Some(&tools), 1, &cut(call, n));
+            assert_eq!(r.closed, 1);
+            assert_eq!(args_of(&r.es, 0), "{\"path\":\"a\"}", "split {n}");
+            assert_eq!(content_of(&r.es), "");
+        }
+    }
+
+    #[test]
+    fn string_values_keep_their_newlines_and_spaces() {
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "w",
+            "parameters": {"type": "object", "properties": {"c": {"type": "string"}, "n": {"type": "integer"}}}}}]);
+        let call = "<tool_call>w<arg_key>c</arg_key><arg_value>\n  line1\nline2\n</arg_value><arg_key>n</arg_key><arg_value> 7\n</arg_value></tool_call>";
+        let r = drive(Some(&tools), 1, &cut(call, 2));
+        let a = json(&args_of(&r.es, 0));
+        assert_eq!(a["c"], "\n  line1\nline2\n");
+        assert_eq!(a["n"], 7);
+    }
+
+    #[test]
+    fn prose_before_a_call_is_content_and_after_it_is_dropped() {
+        let tools = a7_tools_fixture();
+        let r = drive(Some(&tools), 1, &["Ich lese die Datei.", GLM_CALL, "danach"]);
+        assert_eq!(content_of(&r.es), "Ich lese die Datei.");
+        assert_eq!(r.closed, 1);
+        assert_eq!(r.dropped, "danach".len());
+        // the name and the key tolerate blank space around them
+        let r = drive(
+            Some(&tools),
+            1,
+            &["<tool_call>\n read_file \n<arg_key> path </arg_key>  <arg_value>p</arg_value>\n</tool_call>"],
+        );
+        assert_eq!(names(&r.es), vec![(0, "read_file".to_string())]);
+        assert_eq!(args_of(&r.es, 0), "{\"path\":\"p\"}");
+    }
+
+    /// every abandoned GLM call leaves one record and a parseable, marked arguments object
+    #[test]
+    fn malformed_glm_calls_are_recorded_and_stay_json() {
+        let tools = a7_tools_fixture();
+        // truncated inside a value
+        let r = drive(Some(&tools), 1, &["<tool_call>read_file<arg_key>path</arg_key><arg_value>C:/x"]);
+        assert!(r.bad);
+        assert_eq!(args_of(&r.es, 0), "{\"path\":\"C:/x\",\"_truncated\":true}");
+        assert_eq!(r.malformed, vec![Malformed { kind: MalformedKind::EndInCall, index: Some(0), raw_as_content: false }]);
+        // truncated after a complete value: GLM has no `</function>`, only `</tool_call>` completes
+        let r = drive(Some(&tools), 1, &["<tool_call>read_file<arg_key>path</arg_key><arg_value>p</arg_value>"]);
+        assert!(r.bad);
+        assert_eq!(json(&args_of(&r.es, 0)), serde_json::json!({"path": "p", "_truncated": true}));
+        // a key whose value never opened
+        let r = drive(Some(&tools), 1, &["<tool_call>read_file<arg_key>path</arg_key></tool_call>"]);
+        assert_eq!(r.malformed[0].kind, MalformedKind::BadParamName);
+        assert_eq!(args_of(&r.es, 0), "{\"_truncated\":true}");
+        // an empty name, and Qwen's markup in a GLM stream: never named, the raw markup is content
+        for m in [
+            "<tool_call><arg_key>a</arg_key>",
+            "<tool_call>\n<function=read_file>\n<parameter=path>\nx\n</parameter>\n</function>\n</tool_call>",
+        ] {
+            for n in [1usize, 4, 1000] {
+                let r = drive(Some(&tools), 1, &cut(m, n));
+                assert_eq!(r.malformed[0].kind, MalformedKind::BadName, "{m:?} split {n}");
+                assert!(r.malformed[0].raw_as_content);
+                assert!(names(&r.es).is_empty());
+                assert_eq!(content_of(&r.es), m, "{m:?} split {n}");
+            }
+        }
+    }
+
+    fn lcg(st: &mut u64) -> u64 {
+        *st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *st >> 33
+    }
+
+    /// the arguments invariant (TASK J) for the GLM markup: random markups built from the
+    /// marker fragments, truncated anywhere, always concatenate to a JSON object per index
+    #[test]
+    fn random_glm_markup_always_concatenates_to_an_object() {
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "write_file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "n": {"type": "integer"}, "tags": {"type": "array"}}}}}]);
+        let atoms = [
+            "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>", "</tool_call>", "<", "/", ">", "\"", "\\", "\n", " ",
+            "path", "n", "tags", "1", "[1,", "]", "{", "}", "\u{1f426}", "\u{0}", "\u{7f}", "<tool_call>", "write_file", "x",
+        ];
+        let mut st = 160u64;
+        let mut bad = 0usize;
+        for case in 0..3000u32 {
+            let mut m = String::from("<tool_call>");
+            if !lcg(&mut st).is_multiple_of(5) {
+                m.push_str("write_file");
+            }
+            for _ in 0..(lcg(&mut st) % 4) {
+                let k = ["path", "n", "tags", "zz"][(lcg(&mut st) % 4) as usize];
+                m.push_str(&format!("<arg_key>{k}</arg_key><arg_value>"));
+                for _ in 0..(lcg(&mut st) % 12) {
+                    m.push_str(atoms[(lcg(&mut st) % atoms.len() as u64) as usize]);
+                }
+                if !lcg(&mut st).is_multiple_of(6) {
+                    m.push_str("</arg_value>");
+                }
+            }
+            if !lcg(&mut st).is_multiple_of(4) {
+                m.push_str("</tool_call>");
+            }
+            for piece in [1usize, 3, 100_000] {
+                for t in [Some(&tools), None] {
+                    let r = drive(t, m.matches(TOOL_OPEN).count(), &cut(&m, piece));
+                    let max = r
+                        .es
+                        .iter()
+                        .filter_map(|e| if let Emit::Args { index, .. } = e { Some(*index) } else { None })
+                        .max();
+                    for i in 0..max.map_or(0, |x| x + 1) {
+                        let a = args_of(&r.es, i);
+                        if !matches!(serde_json::from_str::<serde_json::Value>(&a), Ok(serde_json::Value::Object(_))) {
+                            bad += 1;
+                            if bad < 6 {
+                                eprintln!("case {case} piece {piece}: call {i} {a:?} from {m:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(bad, 0);
     }
 }
