@@ -10,6 +10,7 @@
 //! |---|---|---|---|
 //! | `FlashNext` | `qwen4_exp_text` | `cnq4.5-flash-next` | [`decide_flash_next`]: the pre-C6 keep set, verbatim |
 //! | `Qwen35Dense` | `qwen3_5_text` | `cnq4.5-qwen35-dense` | [`decide_qwen35_dense`]: the phase 2 recipe (#300 "Phase 2", research brief) |
+//! | `Glm5Next` | `glm5_next_text` | `cnq4.5-glm5-next` | [`decide_glm5_next`]: GLM-5.3-Flash, FP8 originals (crow-nest #154/#155), a whitelist |
 //!
 //! The Flash-Next row is today's behaviour exactly. It is proved against every one of the 1658
 //! tensors of the CNQ4.5-M index trailer (`tests/fixtures/cnq45m-index.tsv`), not against a
@@ -39,15 +40,17 @@ use std::path::{Path, PathBuf};
 pub enum Family {
     FlashNext,
     Qwen35Dense,
+    Glm5Next,
 }
 
 impl Family {
-    pub const ALL: [Family; 2] = [Family::FlashNext, Family::Qwen35Dense];
+    pub const ALL: [Family; 3] = [Family::FlashNext, Family::Qwen35Dense, Family::Glm5Next];
 
     pub fn name(self) -> &'static str {
         match self {
             Family::FlashNext => "FlashNext",
             Family::Qwen35Dense => "Qwen35Dense",
+            Family::Glm5Next => "Glm5Next",
         }
     }
 
@@ -55,6 +58,7 @@ impl Family {
         match self {
             Family::FlashNext => "qwen4_exp_text",
             Family::Qwen35Dense => "qwen3_5_text",
+            Family::Glm5Next => "glm5_next_text",
         }
     }
 
@@ -63,6 +67,7 @@ impl Family {
         match self {
             Family::FlashNext => "cnq4.5-flash-next",
             Family::Qwen35Dense => "cnq4.5-qwen35-dense",
+            Family::Glm5Next => "cnq4.5-glm5-next",
         }
     }
 
@@ -79,7 +84,7 @@ impl Family {
         Family::ALL.into_iter().find(|f| f.model_type() == mt).ok_or_else(|| {
             format!(
                 "text_config.model_type '{mt}' is not a model family this converter has a recipe for \
-(known: qwen4_exp_text = Qwen3.8-Flash-Next, qwen3_5_text = dense Qwen3.5/3.8) - refusing (Crow #300 C6)"
+(known: qwen4_exp_text = Qwen3.8-Flash-Next, qwen3_5_text = dense Qwen3.5/3.8, glm5_next_text = GLM-5.3-Flash) - refusing (Crow #300 C6)"
             )
         })
     }
@@ -151,6 +156,8 @@ pub const OMIT_VIT_DENSE: &str = "vision tower not written: the 27B sees images 
 pub fn omitted(family: Family, name: &str) -> Option<&'static str> {
     match family {
         Family::Qwen35Dense if section_of(name) == "vit" => Some(OMIT_VIT_DENSE),
+        Family::Glm5Next if section_of(name) == "vit" => Some(OMIT_VIT_GLM),
+        Family::Glm5Next if glm_parts(name).and_then(|p| p.0).is_some_and(|l| l >= GLM5_NEXT_TEXT_LAYERS) => Some(OMIT_MTP_GLM),
         _ => None,
     }
 }
@@ -161,6 +168,7 @@ pub fn decide(family: Family, name: &str, shape: &[usize], src_dtype: &str) -> R
     let d = match family {
         Family::FlashNext => decide_flash_next(name, shape, src_dtype),
         Family::Qwen35Dense => decide_qwen35_dense(name, shape, src_dtype)?,
+        Family::Glm5Next => decide_glm5_next(name, shape, src_dtype)?,
     };
     // A bf16 keep is written as the source's raw bytes (the pre-C6 write path, kept). That is
     // only a bf16 tensor when the source IS bf16: an F32 or F16 source would land in the
@@ -174,6 +182,9 @@ pub fn decide(family: Family, name: &str, shape: &[usize], src_dtype: &str) -> R
 the source's raw bytes - refusing rather than writing {src_dtype} bytes under a bf16 label",
             family.recipe()
         ));
+    }
+    if d.dtype != DtypeOut::Nvfp4 && src_dtype == "F8_E4M3" {
+        return Err(format!("{name}: an F8_E4M3 source is only read through its weight_scale_inv into NVFP4; the {} recipe keeps it {} - refusing", family.recipe(), d.dtype.as_str()));
     }
     if d.dtype == DtypeOut::F32 && !(src_dtype == "BF16" || src_dtype == "F32") {
         return Err(format!("{name}: source dtype {src_dtype} cannot be carried as f32 by this converter"));
@@ -284,6 +295,261 @@ pub fn decide_qwen35_dense(name: &str, shape: &[usize], src_dtype: &str) -> Resu
 add a row with a reason, do not let it fall through)",
         Family::Qwen35Dense.recipe()
     ))
+}
+
+// ---------------------------------------------------------------------------------------------
+// GLM-5.3-Flash (crow-nest #154 step 4, #155 step 5; plan of record: vault
+// `glm-5-3-flash-laeuft-nur-auf-crow-nest-...`, PREREG `runs/glm53-flash/PREREG.md`)
+// ---------------------------------------------------------------------------------------------
+
+/// The text layers the `cnq4.5-glm5-next` row was written for (`num_hidden_layers` of revision
+/// `eb9eb208`). Layer 45 of the checkpoint is the MTP block (`num_nextn_predict_layers` 1; HF
+/// ignores `layers.45.` on load, `modeling_glm5_next.py:1359`). [`check_family_config`] refuses a
+/// config with another count, so this constant cannot silently disagree with the checkpoint.
+pub const GLM5_NEXT_TEXT_LAYERS: u64 = 45;
+
+/// Plan of record, "Was bewusst NICHT gebaut wird": no vision tower in v1.
+pub const OMIT_VIT_GLM: &str = "vision tower not converted in v1 (GLM-5.3-Flash plan: no vision tower and no MTP in v1)";
+/// Plan of record, same line: the MTP block (layer 45: its experts, attention, eh_proj, enorm,
+/// hnorm, shared_head) is not converted in v1; step 21 would add it on its own trigger.
+pub const OMIT_MTP_GLM: &str = "MTP block (layer 45) not converted in v1 (GLM-5.3-Flash plan: no vision tower and no MTP in v1; step 21)";
+
+/// `(layer, the name below the layer)` of a GLM text tensor: `model.language_model.layers.N.x`
+/// -> `(Some(N), "x")`, `model.language_model.x` -> `(None, "x")`, `lm_head.weight` -> `(None,
+/// "lm_head.weight")`. `None` for anything else (the vision tower).
+pub fn glm_parts(name: &str) -> Option<(Option<u64>, &str)> {
+    if name == "lm_head.weight" {
+        return Some((None, name));
+    }
+    let rest = name.strip_prefix("model.language_model.")?;
+    if let Some(r) = rest.strip_prefix("layers.") {
+        let (l, x) = r.split_once('.')?;
+        return Some((Some(l.parse().ok()?), x));
+    }
+    Some((None, rest))
+}
+
+/// `(layer, expert, projection)` of a routed-expert weight `...layers.L.mlp.experts.E.P_proj.weight`.
+pub fn glm_expert(name: &str) -> Option<(u64, u64, &str)> {
+    let (l, r) = glm_parts(name)?;
+    let r = r.strip_prefix("mlp.experts.")?;
+    let (e, p) = r.split_once('.')?;
+    let p = p.strip_suffix("_proj.weight")?;
+    if !matches!(p, "gate" | "up" | "down") {
+        return None;
+    }
+    Some((l?, e.parse().ok()?, p))
+}
+
+/// The GLM-5.3-Flash row, a WHITELIST. Keep set = the plan's step 4 (PREREG "Fixed for the
+/// whole series"): embeddings, `lm_head`, router, `e_score_correction_bias`, norms, 1-D, mHC
+/// `hc_*`, indexer, KDA gates, anything not a whole 64-value block. Keeps carry the source
+/// dtype (BF16 as BF16, F32 as F32: `e_score_correction_bias`, `A_log`, `dt_bias`, `hc_*_base`,
+/// `hc_*_scale` are F32 in the checkpoint). Everything else is NVFP4: routed and shared experts,
+/// the dense MLP of layers 0-2, MLA attention, KDA q/k/v/o and the KDA short convolutions.
+/// The rule names say which of these had a BF16 source (the checkpoint's own
+/// `modules_to_not_convert`) so the plan's table shows what that costs. Vision and the MTP
+/// block never reach this row ([`omitted`]); `weight_scale_inv` never does either (it is read
+/// with its weight). Any other tensor is refused by name.
+pub fn decide_glm5_next(name: &str, shape: &[usize], src_dtype: &str) -> Result<Decision, String> {
+    let refuse = |why: &str| -> Result<Decision, String> {
+        Err(format!(
+            "{name} {shape:?} {src_dtype}: {why} - refusing (the {} row is a whitelist; add a row with a reason, do not let it fall through)",
+            Family::Glm5Next.recipe()
+        ))
+    };
+    if name.ends_with("_scale_inv") {
+        return refuse("a weight_scale_inv is read with its FP8 weight, never decided on its own");
+    }
+    let Some((layer, r)) = glm_parts(name) else {
+        return refuse("not a text tensor of GLM-5.3-Flash (vision and MTP are omitted before the row)");
+    };
+    if layer.is_some_and(|l| l >= GLM5_NEXT_TEXT_LAYERS) {
+        return refuse("an MTP-block tensor (omitted in v1)");
+    }
+    let section = "text";
+    // a keep is bf16: `decide` refuses a non-BF16 source under that label (a norm in F32 would be
+    // a surprise worth a refusal). Only the tensors the checkpoint stores in F32 on purpose
+    // (HF `_keep_in_fp32_modules_strict`, `modeling_glm5_next.py:1358`, plus the mHC base/scale)
+    // are carried in their source dtype.
+    let keep = |rule: &'static str| -> Result<Decision, String> { Ok(Decision { dtype: DtypeOut::Bf16, section, rule }) };
+    let carry = |rule: &'static str| -> Result<Decision, String> {
+        let dtype = if src_dtype == "F32" { DtypeOut::F32 } else { DtypeOut::Bf16 };
+        Ok(Decision { dtype, section, rule })
+    };
+    let nv = |rule: &'static str| -> Result<Decision, String> { Ok(Decision { dtype: DtypeOut::Nvfp4, section, rule }) };
+    let n: usize = shape.iter().product();
+    match (layer, r) {
+        (None, "embed_tokens.weight") => return keep("token embedding BF16 (host RAM)"),
+        (None, "lm_head.weight") => return keep("lm_head BF16"),
+        (None, "norm.weight") => return keep("norm BF16"),
+        (None, _) => return refuse("matches no row of the model-level tensors"),
+        _ => {}
+    }
+    if r.starts_with("hc_") {
+        return carry("mHC hc_* keep (fn BF16, base/scale F32)");
+    }
+    if r.contains("norm.") {
+        return keep("norm BF16");
+    }
+    if r == "mlp.gate.weight" {
+        return keep("router BF16");
+    }
+    if r == "mlp.gate.e_score_correction_bias" {
+        return carry("e_score_correction_bias f32 carry");
+    }
+    if r.starts_with("self_attn.indexer.") {
+        return keep("DSA indexer keep (BF16)");
+    }
+    if matches!(r, "self_attn.f_a_proj.weight" | "self_attn.f_b_proj.weight" | "self_attn.g_a_proj.weight" | "self_attn.g_b_proj.weight" | "self_attn.b_proj.weight") {
+        return keep("KDA gates f_a/f_b/g_a/g_b/b_proj BF16");
+    }
+    if matches!(r, "self_attn.A_log" | "self_attn.dt_bias") {
+        return carry("KDA A_log/dt_bias f32 carry");
+    }
+    if shape.len() == 1 {
+        return keep("1-D keep");
+    }
+    if n % 64 != 0 || n < 64 {
+        return keep("not a whole 64-value block");
+    }
+    if glm_expert(name).is_some() {
+        return nv("routed expert gate/up/down NVFP4 (FP8 source)");
+    }
+    if matches!(r, "mlp.shared_experts.gate_proj.weight" | "mlp.shared_experts.up_proj.weight" | "mlp.shared_experts.down_proj.weight") {
+        return nv("shared expert NVFP4 (FP8 source)");
+    }
+    if matches!(r, "mlp.gate_proj.weight" | "mlp.up_proj.weight" | "mlp.down_proj.weight") {
+        return nv("dense MLP layers 0-2 NVFP4 (FP8 source)");
+    }
+    if matches!(r, "self_attn.q_a_proj.weight" | "self_attn.q_b_proj.weight" | "self_attn.kv_a_proj_with_mqa.weight") {
+        return nv("MLA q_a/q_b/kv_a NVFP4 (FP8 source)");
+    }
+    if r == "self_attn.kv_b_proj.weight" {
+        return nv("MLA kv_b NVFP4 (BF16 source)");
+    }
+    if r == "self_attn.o_proj.weight" {
+        return if src_dtype == "F8_E4M3" { nv("MLA o_proj NVFP4 (FP8 source)") } else { nv("KDA o_proj NVFP4 (BF16 source)") };
+    }
+    if matches!(r, "self_attn.q_proj.weight" | "self_attn.k_proj.weight" | "self_attn.v_proj.weight") {
+        return nv("KDA q/k/v NVFP4 (BF16 source)");
+    }
+    if matches!(r, "self_attn.q_conv1d.weight" | "self_attn.k_conv1d.weight" | "self_attn.v_conv1d.weight") {
+        return nv("KDA short conv q/k/v_conv1d NVFP4 (BF16 source, not in the step-4 keep set)");
+    }
+    refuse("matches no row")
+}
+
+/// The tensor class of the code histograms (#155 (b)) and the layer and expert it belongs to.
+/// GLM classes: `expert_gate`, `expert_up`, `expert_down`, `shared_expert`, `attn_mla`,
+/// `attn_kda`, `dense_mlp`, `indexer`, `rest`; KDA vs MLA from `text_config.layer_types`.
+/// The other families get the same names where the tensor names allow (`expert` for a fused
+/// expert tensor, `attn`, `attn_linear`), so their sidecar carries a histogram too.
+pub fn tensor_class(family: Family, name: &str, config: &serde_json::Value) -> (&'static str, Option<u64>, Option<u64>) {
+    let layer = name.split("layers.").nth(1).and_then(|r| r.split('.').next()).and_then(|s| s.parse::<u64>().ok());
+    if family == Family::Glm5Next {
+        if let Some((l, e, p)) = glm_expert(name) {
+            let c = match p {
+                "gate" => "expert_gate",
+                "up" => "expert_up",
+                _ => "expert_down",
+            };
+            return (c, Some(l), Some(e));
+        }
+        let kda = layer.and_then(|l| config["text_config"]["layer_types"][l as usize].as_str()) == Some("linear_attention");
+        let c = if name.contains(".mlp.shared_experts.") {
+            "shared_expert"
+        } else if name.contains(".self_attn.indexer.") {
+            "indexer"
+        } else if name.contains(".self_attn.") {
+            if kda { "attn_kda" } else { "attn_mla" }
+        } else if name.contains(".mlp.") && !name.contains(".mlp.gate.") {
+            "dense_mlp"
+        } else {
+            "rest"
+        };
+        return (c, layer, None);
+    }
+    let c = if name.contains(".mlp.experts.") {
+        "expert"
+    } else if name.contains("shared_expert") {
+        "shared_expert"
+    } else if name.contains(".linear_attn.") {
+        "attn_linear"
+    } else if name.contains(".self_attn.") {
+        "attn"
+    } else if name.contains(".mlp.") {
+        "dense_mlp"
+    } else {
+        "rest"
+    };
+    (c, layer, None)
+}
+
+/// Family-specific checks of `config.json` that the recipe row relies on. GLM: 45 text layers
+/// + 1 MTP layer ([`GLM5_NEXT_TEXT_LAYERS`]) and FP8 E4M3 with 128x128 block scales (what
+/// `fp8.rs` decodes). The other families: nothing.
+pub fn check_family_config(family: Family, config: &serde_json::Value) -> Result<(), String> {
+    if family != Family::Glm5Next {
+        return Ok(());
+    }
+    let t = &config["text_config"];
+    if t["num_hidden_layers"].as_u64() != Some(GLM5_NEXT_TEXT_LAYERS) || t["num_nextn_predict_layers"].as_u64() != Some(1) {
+        return Err(format!(
+            "config.json: num_hidden_layers {} / num_nextn_predict_layers {}, the {} row was written for 45 + 1 (GLM-5.3-Flash rev eb9eb208)",
+            t["num_hidden_layers"],
+            t["num_nextn_predict_layers"],
+            family.recipe()
+        ));
+    }
+    let q = &config["quantization_config"];
+    if q["quant_method"] != "fp8" || q["fmt"] != "e4m3" || q["weight_block_size"] != serde_json::json!([128, 128]) {
+        let mut q = q.clone();
+        if let Some(o) = q.as_object_mut() {
+            o.remove("modules_to_not_convert");
+        }
+        return Err(format!("config.json: quantization_config {q} - the converter reads FP8 e4m3 with 128x128 block scales only"));
+    }
+    Ok(())
+}
+
+/// The Hugging Face model-info JSON saved beside the originals (`hf-revision.json`: the API's
+/// `/api/models/<repo>/revision/<rev>` with `sha` and `siblings[].lfs.sha256/size`) or a tree
+/// listing (`hf-tree.json`: `[{path, size, lfs: {oid, size}}]`, no revision). Per LFS file:
+/// (sha256, size). `None` when neither file is there.
+pub struct HfApiInfo {
+    pub revision: Option<String>,
+    pub lfs: BTreeMap<String, (String, u64)>,
+    pub source: &'static str,
+}
+
+pub fn read_hf_api_info(model_dir: &Path) -> Result<Option<HfApiInfo>, String> {
+    let rd = |f: &str| -> Result<Option<serde_json::Value>, String> {
+        let p = model_dir.join(f);
+        match std::fs::read(&p) {
+            Ok(b) => serde_json::from_slice(&b).map(Some).map_err(|e| format!("{}: {e}", p.display())),
+            Err(_) => Ok(None),
+        }
+    };
+    if let Some(v) = rd("hf-revision.json")? {
+        let mut lfs = BTreeMap::new();
+        for s in v["siblings"].as_array().ok_or("hf-revision.json: no siblings[]")? {
+            if let (Some(f), Some(sha), Some(size)) = (s["rfilename"].as_str(), s["lfs"]["sha256"].as_str(), s["lfs"]["size"].as_u64()) {
+                lfs.insert(f.to_string(), (sha.to_string(), size));
+            }
+        }
+        return Ok(Some(HfApiInfo { revision: v["sha"].as_str().map(String::from), lfs, source: "hf-revision.json" }));
+    }
+    if let Some(v) = rd("hf-tree.json")? {
+        let mut lfs = BTreeMap::new();
+        for s in v.as_array().ok_or("hf-tree.json: not a tree listing (array)")? {
+            if let (Some(f), Some(sha), Some(size)) = (s["path"].as_str(), s["lfs"]["oid"].as_str(), s["lfs"]["size"].as_u64()) {
+                lfs.insert(f.to_string(), (sha.to_string(), size));
+            }
+        }
+        return Ok(Some(HfApiInfo { revision: None, lfs, source: "hf-tree.json" }));
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -419,6 +685,29 @@ pub fn derive_geo(family: Family, config: &serde_json::Value) -> serde_json::Val
         Family::Qwen35Dense => {
             g["ffn"] = serde_json::json!("dense");
             g["inter"] = t["intermediate_size"].clone();
+        }
+        Family::Glm5Next => {
+            let o = g.as_object_mut().unwrap();
+            for k in ["gdn_layers", "gdn_k_heads", "gdn_v_heads", "gdn_k_dim", "gdn_v_dim", "conv_kernel"] {
+                o.remove(k);
+            }
+            g["attn_layers"] = serde_json::json!(layer_types.iter().filter(|s| **s == "deepseek_sparse_attention").count());
+            g["kda_layers"] = serde_json::json!(layer_types.iter().filter(|s| **s == "linear_attention").count());
+            g["kda_heads"] = t["linear_attn_config"]["num_heads"].clone();
+            g["kda_head_dim"] = t["linear_attn_config"]["head_dim"].clone();
+            g["conv_kernel"] = t["linear_attn_config"]["short_conv_kernel_size"].clone();
+            g["mtp_layers"] = t["num_nextn_predict_layers"].clone();
+            g["ffn"] = serde_json::json!("moe");
+            g["dense_layers"] = t["first_k_dense_replace"].clone();
+            g["inter"] = t["intermediate_size"].clone();
+            g["experts"] = t["n_routed_experts"].clone();
+            g["experts_per_tok"] = t["num_experts_per_tok"].clone();
+            g["moe_inter"] = t["moe_intermediate_size"].clone();
+            g["shared_experts"] = t["n_shared_experts"].clone();
+            g["kv_lora_rank"] = t["kv_lora_rank"].clone();
+            g["q_lora_rank"] = t["q_lora_rank"].clone();
+            g["hc_mult"] = t["hc_mult"].clone();
+            g["index_topk"] = t["index_topk"].clone();
         }
     }
     if let (Some(q), Some(kv)) = (t["num_attention_heads"].as_u64(), t["num_key_value_heads"].as_u64()) {
@@ -701,5 +990,138 @@ mod tests {
         let m = shard_record(&dir.join("c.safetensors"), Some(&t), true).unwrap_err();
         assert!(m.contains("Hugging Face recorded 4 B"), "{m}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The GLM-5.3-Flash tensor table (crow-nest #154), expanded: (name, dtype, shape, shard,
+    /// bytes) per tensor, plus the shard records (data_start, size).
+    fn glm53_table() -> (Vec<(String, String, Vec<usize>, u32, u64)>, Vec<(u64, u64)>) {
+        let tsv = include_str!("../tests/fixtures/glm53-flash-tensors.tsv");
+        let (mut rows, mut shards) = (Vec::new(), Vec::new());
+        for line in tsv.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f[0] == "# shard" {
+                shards.push((f[2].parse().unwrap(), f[3].parse().unwrap()));
+                continue;
+            }
+            if line.starts_with('#') {
+                continue;
+            }
+            let (dt, sh, nr, b) = (f[1].to_string(), shape(f[2]), f[3].parse().unwrap(), f[4].parse().unwrap());
+            match f[0].split_once('{') {
+                Some((pre, rest)) => {
+                    let (range, post) = rest.split_once('}').unwrap();
+                    let (a, z) = range.split_once("..").unwrap();
+                    for e in a.parse::<u32>().unwrap()..=z.parse().unwrap() {
+                        rows.push((format!("{pre}{e}{post}"), dt.clone(), sh.clone(), nr, b));
+                    }
+                }
+                None => rows.push((f[0].to_string(), dt, sh, nr, b)),
+            }
+        }
+        (rows, shards)
+    }
+
+    /// Step 4's abort criterion on the real headers: 76,108 tensors whose bytes plus the 62
+    /// headers are the 328,337,455,672 B of the shards; every tensor is omitted (vision, MTP),
+    /// a block scale paired with an FP8 weight (128x128 grid), or decided by a named row of the
+    /// whitelist, never refused; the per-row counts are the recipe.
+    #[test]
+    fn the_glm_row_decides_every_tensor_of_glm53_flash() {
+        let (rows, shards) = glm53_table();
+        assert_eq!(rows.len(), 76_108);
+        assert_eq!(shards.len(), 62);
+        let tensor_bytes: u64 = rows.iter().map(|r| r.4).sum();
+        let header_bytes: u64 = shards.iter().map(|s| s.0).sum();
+        assert_eq!(tensor_bytes + header_bytes, 328_337_455_672);
+        assert_eq!(shards.iter().map(|s| s.1).sum::<u64>(), 328_337_455_672);
+        let by_name: BTreeMap<&str, &(String, String, Vec<usize>, u32, u64)> = rows.iter().map(|r| (r.0.as_str(), r)).collect();
+        let mut per: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+        let (mut omit_vit, mut omit_mtp, mut scales) = (0, 0, 0);
+        for (name, dt, sh, _, _) in &rows {
+            match omitted(Family::Glm5Next, name) {
+                Some(OMIT_VIT_GLM) => {
+                    omit_vit += 1;
+                    continue;
+                }
+                Some(OMIT_MTP_GLM) => {
+                    omit_mtp += 1;
+                    continue;
+                }
+                Some(other) => panic!("{name}: {other}"),
+                None => {}
+            }
+            if let Some(w) = name.strip_suffix("_scale_inv") {
+                let wr = by_name.get(w).unwrap_or_else(|| panic!("{name}: no weight"));
+                assert_eq!((wr.1.as_str(), dt.as_str()), ("F8_E4M3", "F32"), "{name}");
+                assert_eq!(sh.as_slice(), [wr.2[0].div_ceil(128), wr.2[1].div_ceil(128)], "{name}: grid");
+                scales += 1;
+                continue;
+            }
+            if dt == "F8_E4M3" {
+                assert!(by_name.contains_key(format!("{name}_scale_inv").as_str()), "{name}: FP8 without its scale");
+            }
+            let d = decide(Family::Glm5Next, name, sh, dt).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(d.section, "text", "{name}");
+            *per.entry((d.dtype.as_str(), d.rule)).or_default() += 1;
+        }
+        assert_eq!((omit_vit, omit_mtp, scales), (347, 1760, 36_467));
+        let want = BTreeMap::from([
+            (("bf16", "DSA indexer keep (BF16)"), 55),
+            (("bf16", "KDA gates f_a/f_b/g_a/g_b/b_proj BF16"), 170),
+            (("bf16", "lm_head BF16"), 1),
+            (("bf16", "mHC hc_* keep (fn BF16, base/scale F32)"), 90),
+            (("bf16", "norm BF16"), 169),
+            (("bf16", "router BF16"), 42),
+            (("bf16", "token embedding BF16 (host RAM)"), 1),
+            (("f32", "KDA A_log/dt_bias f32 carry"), 68),
+            (("f32", "e_score_correction_bias f32 carry"), 42),
+            (("f32", "mHC hc_* keep (fn BF16, base/scale F32)"), 180),
+            (("nvfp4", "KDA o_proj NVFP4 (BF16 source)"), 34),
+            (("nvfp4", "KDA q/k/v NVFP4 (BF16 source)"), 102),
+            (("nvfp4", "KDA short conv q/k/v_conv1d NVFP4 (BF16 source, not in the step-4 keep set)"), 102),
+            (("nvfp4", "MLA kv_b NVFP4 (BF16 source)"), 11),
+            (("nvfp4", "MLA o_proj NVFP4 (FP8 source)"), 11),
+            (("nvfp4", "MLA q_a/q_b/kv_a NVFP4 (FP8 source)"), 33),
+            (("nvfp4", "dense MLP layers 0-2 NVFP4 (FP8 source)"), 9),
+            (("nvfp4", "routed expert gate/up/down NVFP4 (FP8 source)"), 36_288),
+            (("nvfp4", "shared expert NVFP4 (FP8 source)"), 126),
+        ]);
+        assert_eq!(per, want);
+    }
+
+    /// The GLM row is a whitelist: a tensor it has no row for is refused BY NAME, and so are a
+    /// stray block scale, an FP8 weight it would keep, and a model-level tensor it does not know.
+    #[test]
+    fn the_glm_row_refuses_an_unknown_tensor_by_name() {
+        let m = decide(Family::Glm5Next, "model.language_model.layers.7.self_attn.mystery_proj.weight", &[128, 128], "BF16").unwrap_err();
+        assert!(m.contains("model.language_model.layers.7.self_attn.mystery_proj.weight") && m.contains("whitelist"), "{m}");
+        let m = decide(Family::Glm5Next, "model.language_model.mystery.weight", &[128, 128], "BF16").unwrap_err();
+        assert!(m.contains("model.language_model.mystery.weight"), "{m}");
+        let m = decide(Family::Glm5Next, "model.language_model.layers.3.mlp.gate_proj.weight_scale_inv", &[1, 1], "F32").unwrap_err();
+        assert!(m.contains("read with its FP8 weight"), "{m}");
+        let m = decide(Family::Glm5Next, "model.language_model.layers.3.mlp.gate.weight", &[288, 4096], "F8_E4M3").unwrap_err();
+        assert!(m.contains("F8_E4M3"), "{m}");
+        let m = decide(Family::Glm5Next, "model.language_model.layers.45.mlp.experts.0.up_proj.weight", &[2048, 4096], "F8_E4M3").unwrap_err();
+        assert!(m.contains("MTP"), "{m}");
+        assert_eq!(omitted(Family::Glm5Next, "model.language_model.layers.45.eh_proj.weight"), Some(OMIT_MTP_GLM));
+        assert_eq!(omitted(Family::Glm5Next, "model.language_model.layers.44.eh_proj.weight"), None);
+        assert_eq!(omitted(Family::Glm5Next, "model.visual.blocks.0.attn.qkv.weight"), Some(OMIT_VIT_GLM));
+        assert_eq!(omitted(Family::FlashNext, "model.language_model.layers.45.mlp.experts.gate_up_proj"), None);
+    }
+
+    #[test]
+    fn the_glm_config_is_checked_before_the_row_is_trusted() {
+        let mut c = serde_json::json!({
+            "text_config": { "model_type": "glm5_next_text", "num_hidden_layers": 45, "num_nextn_predict_layers": 1 },
+            "quantization_config": { "quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128] },
+        });
+        assert_eq!(Family::detect(&c).unwrap(), Family::Glm5Next);
+        check_family_config(Family::Glm5Next, &c).unwrap();
+        c["quantization_config"]["weight_block_size"] = serde_json::json!([1, 32]);
+        assert!(check_family_config(Family::Glm5Next, &c).unwrap_err().contains("128x128"));
+        c["quantization_config"]["weight_block_size"] = serde_json::json!([128, 128]);
+        c["text_config"]["num_hidden_layers"] = serde_json::json!(46);
+        assert!(check_family_config(Family::Glm5Next, &c).unwrap_err().contains("45 + 1"));
+        check_family_config(Family::FlashNext, &c).unwrap();
     }
 }
