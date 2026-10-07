@@ -169,9 +169,9 @@ and which indexes the engine accepts.
 |---|---|
 | `format` | `crow-nest-quant`, as in v1 |
 | `format_version` | `2`. Replaces v1's `version: 1`; its presence is what makes an index v2 |
-| `recipe` | the family row that decided every tensor's dtype: `cnq4.5-flash-next` or `cnq4.5-qwen35-dense` |
+| `recipe` | the family row that decided every tensor's dtype: `cnq4.5-flash-next`, `cnq4.5-qwen35-dense` or (converter only, #155) `cnq4.5-glm5-next` |
 | `scales` | the sub-block scale policy, `ceil` or `mse` |
-| `model.family` | the engine's family name (`meta::Family`): `FlashNext` or `Qwen35Dense` |
+| `model.family` | the engine's family name (`meta::Family`): `FlashNext` or `Qwen35Dense`; the converter also writes `Glm5Next`, a family the engine does not know yet |
 | `model.model_type` | `text_config.model_type` of the config |
 | `model.config_json`, `model.generation_config_json` | the checkpoint's two files **verbatim**, as JSON strings: a string survives the round trip byte for byte, a re-serialized object would not (key order, number format, whitespace) |
 | `model.config_json_sha256`, `model.generation_config_json_sha256` | the sha256 of those bytes; the engine refuses a v2 whose stored config no longer hashes to it |
@@ -239,6 +239,27 @@ block to the metadata gate before the container is mapped (8.4, 8.11 "C7").
   the text layer count) before it writes anything.
 - `layer-rule-overlay` (#91) takes its arm kinds per family: on a dense base the `ffn_down`
   arms are `mlp.down_proj`; the base's family comes off its index (v1 = Flash-Next).
+
+**GLM-5.3-Flash (`glm5_next_text`), row `cnq4.5-glm5-next`** (#154/#155, 2026-10-08, converter
+only: the engine refuses this `model_type` by name). Its tensors (mHC, KDA, MLA, DSA indexer)
+have no counterpart in the table above, so the row stands on its own; the source is FP8 E4M3
+with 128×128 `weight_scale_inv`, dequantized to f32 before NVFP4 (`converter/src/fp8.rs`). Rule
+names are those of `recipe.rs` `decide_glm5_next`; the per-block tensors, shapes, FP8/BF16
+split and op order are in [glm5-next-recipe.md](glm5-next-recipe.md), the converter side in
+`converter/README.md`.
+
+| tensor | `cnq4.5-glm5-next` |
+|---|---|
+| token embedding | BF16, host RAM |
+| `lm_head`, final norm | BF16 |
+| routed experts, shared expert, dense MLP (layers 0-2) | NVFP4 (FP8 source) |
+| MLA `q_a/q_b/kv_a_proj_with_mqa`, `o_proj` | NVFP4 (FP8 source) |
+| MLA `kv_b_proj` | NVFP4 (BF16 source) |
+| KDA `q/k/v/o_proj`, `q/k/v_conv1d` | NVFP4 (BF16 source) |
+| KDA gates `f_a/f_b/g_a/g_b/b_proj`, router `mlp.gate`, DSA indexer, norms, mHC `hc_*_fn`, every 1-D tensor, anything not a whole 64-value block | BF16 |
+| `e_score_correction_bias`, KDA `A_log` / `dt_bias`, mHC `hc_*_base` / `hc_*_scale` | f32, as stored |
+| vision tower (`model.visual.*`), MTP block (layer 45) | omitted by name in v1 |
+| anything else | refused by name (a whitelist) |
 
 **`converter plan <model-dir>`**: the dry run. It reads `model.safetensors.index.json`, the
 shard headers and the two config files, never a payload, and prints the family, the recipe,
@@ -2767,7 +2788,7 @@ C:/x/y.md
 | item | as built | evidence |
 |---|---|---|
 | tokenizer | in-engine (`crow_nest_engine::tokenizer`), no Python process is started | A3 #25 |
-| template | minijinja, the model's own `tokenizer_config.json` chat template | A3 #25 |
+| template | minijinja, the model's own chat template: `chat_template.jinja` beside `tokenizer_config.json` when that file exists, else the config's `chat_template` field (#160, 2026-10-08, as transformers 5.16.1; the Qwen directories carry both, byte-equal) | A3 #25, `tokenizer.rs` (`sibling_template`), [glm5-tokenizer.md](glm5-tokenizer.md) |
 | template variables | `messages`, `tools`, `documents`, `add_generation_prompt`, `enable_thinking`, and since #74 `reasoning_effort` — all of them variables, never string surgery | `tokenizer.rs` (`render_chat_effort`) |
 | gate | ids identical to the Python oracle on **10 of 10** prompts, plus a 6 of 6 docs file | `decode_out/srv-a3-tok.log`, `srv-a3-rust-ids.json`, `srv-a3-oracle-ids.json` |
 | tools render | byte-identical to the oracle at **322 ids**, but ONLY with `preserve_order` on serde_json AND on minijinja | A3 #25 |
