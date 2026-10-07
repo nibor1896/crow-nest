@@ -185,10 +185,12 @@ retries a ladder of pinned budgets with a 10-minute backoff for up to 8 hours, b
 the fleet shares this machine's RAM (2026-09-20: 10-14 GiB free against a loader that
 wants 16-44 GiB pinned).
 
-**The llama arm is a harness, not a run**: shard 1 of the Unsloth UD-Q2_K_XL GGUF is
-broken tonight. `tools/oracle_longctx_llama.sh` is the one command for when it is
-whole - round-trip check, then `llama-row-probs --no-cache-prompt` over the block,
-then the sparse trim. It still has the >2564-row ceiling the engine arm had
+**The llama arm is a harness, not yet a run.** On 2026-09-20 shard 1 of the Unsloth
+UD-Q2_K_XL GGUF was broken. On 2026-09-23 llama-server served that GGUF again (CHANGELOG
+v0.4.0, #91 multi-site probe), but this arm has not been run since.
+`tools/oracle_longctx_llama.sh` is the one command against a running llama-server: the
+round-trip check, then `llama-row-probs --no-cache-prompt` over the block, then the
+sparse trim. It still has the >2564-row ceiling the engine arm had
 (`llama-row-probs.py` writes rows 0..last contiguously).
 
 ## 4. The English long-prose corpus

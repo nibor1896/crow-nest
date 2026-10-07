@@ -47,4 +47,4 @@ Load-bearing findings: (1) the 16k deficit is budget exhaustion into thinking (3
 
 ## Remainder of #87 (phase 2 — NOT accepted here)
 
-After #83 (min_p) and #84 (penalties) land: Crow sends the complete identical sampler row to BOTH arms (incl. `min_p`, `reasoning_budget_tokens`), new record at the real operating point, multi-seed, blind grading round 2. Blocked on: engine build of wave 1 + llama GGUF shard 1 (currently incomplete on disk).
+After #83 (min_p) and #84 (penalties) land: Crow sends the complete identical sampler row to BOTH arms (incl. `min_p`, `reasoning_budget_tokens`), new record at the real operating point, multi-seed, blind grading round 2. Neither former blocker holds any more. Wave 1 (#83, #84) landed on 2026-09-20 (CHANGELOG v0.4.0) and was live-accepted on 2026-10-07. llama-server served the UD-Q2_K_XL GGUF again on 2026-09-23 (CHANGELOG v0.4.0, #91 multi-site probe); the shard-1 defect of 2026-09-20 is past. Phase 2 now waits on the owner's go.
