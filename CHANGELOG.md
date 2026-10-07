@@ -6,6 +6,18 @@
 
 ## Unreleased
 
+## 2026-10-07 — v0.10.1
+
+**The opt-in `CROW_KV=q8` failed its quality gate, so the 27B stays at 131,072; the engine is the v0.10.0 engine.** No engine source changed since v0.10.0 (`git diff v0.10.0..HEAD -- engine converter` is empty). This release carries the gate's result, its two PREREGs and the docs.
+
+### Measured
+
+- **`CROW_KV=q8` fails the long-context quality gate** (#88, 2026-10-07, Windows, RTX 5090, `decode.exe` at `cfbf7ba`, the installed 27B container, `CROW_MMA=1 CROW_GRAPH=1`). G1: the default path is byte-identical between the `9cb57e7` and `cfbf7ba` builds (gpu-logits sha256 `4f17f42d…`, 12 rows). G2: the BF16 goldens pass, 7 of 7. G3 fails: KL(BF16 ‖ q8) ≤ 0.073 holds at 4 of 6 anchors, with 1.963 at 1k and 0.532 at 2.5k (0.0431, 0.00267, 0.00068 and 0.000049 at 50k, 100k, 158k and 178k; 64 rows each). BF16 against BF16 with another attention kernel (`CROW_P2_FA=0`) already reads 0.836 at 1k. So a second form was fixed by the owner before its run (`decode_out/q8-kld2/PREREG.md`, `3fa75ba`): KL ≤ max(0.073, 3 × that noise) at six new anchors. It also holds at only 4 of 6: 0.469 > 0.390 at 1.5k, 0.229 > 0.073 at 75k. G4 and G5 were not run. `CROW_KV=q8` stays shipped as opt-in. Crow's 27B point stays at 131,072. `docs/env.md`, `docs/architecture.md` and `docs/status.md` say so.
+
+### Fixed
+
+- **The #89 numerics diff counts its own table right** (#89, 2026-10-07). `docs/numerics-diff.md` said "17 MATCH / 0 MISMATCH / 3 UNVERIFIABLE"; its 24 rows count 23 MATCH / 0 MISMATCH / 1 UNVERIFIABLE (row 19). The old count took the three open points U1–U3 as verdicts, two of which sit inside MATCH rows. No verdict changed. The table now says that its `file:line` references are at `08ae3c8`. The v0.4.0 item below keeps its old count as released.
+
 ## 2026-10-06 — v0.10.0
 
 **The dense 27B gets an opt-in 8.5-bit KV cache, `CROW_KV=q8`, whose quality gate is still open.** Unset `CROW_KV` compiles, maps and launches the kernels of v0.9.5; the #90 engine arm reaches the anchors above 2564.

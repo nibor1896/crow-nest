@@ -426,8 +426,11 @@ units, about 12 hot experts per layer), and the post-plan check below requires
   into a `CROW_KV=q8` module (`KernelGeo::q8kv`) and swapped in by `Kernels::arm_q8_kv` — without
   it the module text, the kernel map and every launch are those of before #88
   (`kernels_p2::tests_88_q8kv`). Computed for the 27B at 200,000: KV 6.49 GiB against 12.21 GiB for
-  bf16. The long-context quality gate (KL(BF16 ‖ q8) ≤ 0.073 at the six anchors) and the decode
-  speed are not measured yet.
+  bf16. The long-context quality gate failed on 2026-10-07 (#88; `decode_out/q8-kld/PREREG.md`,
+  `decode_out/q8-kld2/PREREG.md`). KL(BF16 ‖ q8) ≤ 0.073 held at 4 of 6 anchors (1.963 at 1k,
+  0.532 at 2.5k). The second form, KL ≤ max(0.073, 3 × the BF16-against-BF16 noise of another
+  attention kernel), also held at only 4 of 6. BF16 against BF16 alone reads 0.836 at 1k. The
+  decode speed is not measured.
 - **GDN recurrent state**: 36 layers, f32 (16 K / 48 V heads at 128, conv kernel 4) —
   fixed size, context-independent.
 - **QSA indexer cache**: budget 2,048 tokens, compress ratio 4 — third state kind,
@@ -5158,7 +5161,8 @@ Flash-Next's with the SiLU gate (`CN_GATE_ACT`, C4).
 - **KV dtype.** An unset `CROW_KV` takes `Family::default_kv`: BF16 for the dense family (FP8 failed
   the long-context KLD criterion, 5 of 6 anchors), FP8 e4m3 for Flash-Next (values of record).
   `CROW_KV=q8` (#88) is the opt-in 8.5-bit cache for the dense family (section 2.5), meant to carry
-  the 27B to 200,000 context once its long-context gate passes; not measured on the model yet.
+  the 27B to 200,000 context once its long-context gate passes. It failed that gate on 2026-10-07
+  (4 of 6 anchors, both forms, #88), so the 27B stays at 131,072.
 
 ## Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)
 

@@ -14,7 +14,7 @@
 
 ## Verdict
 
-**17 MATCH / 0 MISMATCH / 3 UNVERIFIABLE.** The engine-numerics suspect (expert-requant.md §8) is acquitted on every line compared. Highlights:
+**17 MATCH / 0 MISMATCH / 3 UNVERIFIABLE** (as written 2026-09-20; the 24 rows count 23 / 0 / 1, see the amendment of 2026-10-07 below). The engine-numerics suspect (expert-requant.md §8) is acquitted on every line compared. Highlights:
 
 - The llama.cpp #28068 bug class (GDN norm max instead of rsqrt) is NOT present — `l2norm_repeat` (kernels.rs:1589-1602) is exactly HF's rsqrt form; llama.cpp's post-fix form is algebraically identical.
 - Attention scale 0.0625 applied pre-max-subtraction in all three engines (positive scale commutes — MATCH).
@@ -42,6 +42,11 @@ Open (issue stays open): U1/P1b torch-side tie order, P2 GDN recurrent-vs-chunke
 | 3 | the verdict table | open `docs/numerics-diff.md` §1 | 24 rows, verdict column, 17 MATCH / 0 MISMATCH / 3 UNVERIFIABLE in §1 tally |
 | 4 | spot-check one formula against the code | e.g. row 2: `sed -n '1589,1602p' engine/src/kernels.rs` vs the quoted rsqrt form | identical |
 | 5 | the config pin table | `docs/numerics-diff.md` §4 | all 17 rows agree with `models/Qwen3.8-Flash-Next-original/config.json` |
+
+**Amendment 2026-10-07** (robin's live check, run 2026-10-07, `crow-lab/runs/fn-live-accept-win-20261007/`; the criteria are corrected, not the results they judge):
+- Case 3: the §1 verdict column counts **23 MATCH / 0 MISMATCH / 1 UNVERIFIABLE** over 24 rows. "17 / 0 / 3" counted the open points U1–U3 as verdicts; U2 and U3 sit inside MATCH rows 1 and 10. The doc's tally is corrected; no row verdict changed. Verification step 1 above ("tallies match (17/0/3)") did not count the column.
+- Case 4: the table's `file:line` references are at `08ae3c8`. Use `git show 08ae3c8:engine/src/kernels.rs | sed -n '1589,1602p'`; at `cfbf7ba` the same kernel starts at kernels.rs:1667.
+- Case 5: §4 has **15** rows, not 17.
 
 ## Consequences for the fleet
 
