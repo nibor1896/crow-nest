@@ -200,12 +200,22 @@ class Pure(unittest.TestCase):
         self.assertEqual(fg.parse_write_out("206 2 262144 0"), {"http": 206, "retries": 2, "bytes": 262144, "exit": 0})
         self.assertEqual(fg.parse_write_out(""), {"http": 0, "retries": 0, "bytes": 0, "exit": 0})
 
-    def test_curl_argv_carries_the_owner_flags(self):
-        argv = fg.curl_file_argv("curl", "https://x/f", "f.part")
-        s = " ".join(argv)
-        for flag in ("-L", "-f", "-C -", "--retry 20", "--retry-all-errors", "--retry-delay 10",
-                     "--speed-limit", "--speed-time"):
+    def test_curl_file_argv_resumes_and_aborts_stalls(self):
+        s = " ".join(fg.curl_file_argv("curl", "https://x/f", "f.part"))
+        for flag in ("-L", "-f", "-C -", "--speed-limit", "--speed-time"):
             self.assertIn(flag, s)
+
+    def test_curl_file_argv_has_no_rewinding_retry(self):
+        # curl's own --retry truncates back to where the run started (curl docs/TODO.md,
+        # "--retry should resume"): a drop late in a 5.4 GB shard would throw the shard away.
+        # The outer -C - loop is the only retry for whole files.
+        argv = fg.curl_file_argv("curl", "https://x/f", "f.part")
+        self.assertIn("--retry", argv)
+        self.assertEqual(argv[argv.index("--retry") + 1], "0")
+        self.assertEqual(argv.count("--retry"), 1)
+        self.assertNotIn("--retry-all-errors", argv)
+
+    def test_curl_range_argv(self):
         r = fg.curl_range_argv("curl", "https://x/f", "o", 100, 300)
         self.assertIn("100-299", r)
         self.assertEqual(r[r.index("--max-filesize") + 1], "200")

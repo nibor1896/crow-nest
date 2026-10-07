@@ -17,13 +17,15 @@ a mismatch deletes the file and fetches it again (at most `MAX_MISMATCHES` times
 
 Hugging Face drops long transfers (TLS resets, WinError 10054, curl exit 35), so every whole file
 goes through two retry layers:
-  1. curl itself: `-L -f -C - --retry 20 --retry-all-errors --retry-delay 10`, plus stall
-     detection `--speed-limit`/`--speed-time`. NOTE: curl's own retry does not resume - it
-     truncates the output back to where that curl run started (curl docs/TODO.md, "--retry
-     should resume"), so a drop costs the bytes of the current curl run.
-  2. this script: an outer loop that restarts curl with `-C -` (which DOES resume from the
-     bytes on disk) with backoff 10 s -> 300 s, until the byte count equals the API size; plus a
-     watchdog that kills a curl whose file has not grown for `STALL_SEC`.
+  1. curl itself: `-L -f -C - --retry 0`, plus stall detection `--speed-limit`/`--speed-time`.
+     curl's own retry is OFF on purpose: it does not resume, it truncates the output back to
+     where that curl run started (curl docs/TODO.md, "--retry should resume"), so every drop
+     would cost the bytes of the current run - up to a whole shard.
+  2. this script: the ONLY retry for whole files - an unlimited outer loop that restarts curl
+     with `-C -` (which DOES resume from the bytes on disk) with backoff 10 s -> 300 s, until the
+     byte count equals the API size, one log line per restart; plus a watchdog that kills a
+     curl whose file has not grown for `STALL_SEC`. Small range requests (headers, API) keep
+     curl's `--retry 20 --retry-all-errors`, where a rewind costs at most 256 KiB.
 Before each shard the free space is checked: a shard that would leave less than 20 GB free on
 the destination volume is refused and the run stops.
 
@@ -76,7 +78,10 @@ MIN_FREE_AFTER = 20 * GB          # owner rule: never leave less than 20 GB free
 HEADER_PROBE = 256 * 1024         # first range request of a shard header
 MAX_HEADER = 100 * 1000 * 1000    # safetensors caps the header at 100 MB
 
-CURL_RETRY = ["--retry", "20", "--retry-all-errors", "--retry-delay", "10"]
+CURL_RETRY = ["--retry", "20", "--retry-all-errors", "--retry-delay", "10"]   # small range requests only
+# whole files: curl must never retry by itself - its retry rewinds to the start of the run
+# (curl docs/TODO.md, "--retry should resume"); the outer `-C -` loop is the only retry
+CURL_FILE_RETRY = ["--retry", "0"]
 SPEED_LIMIT = 256 * 1024          # B/s; below this for SPEED_TIME s curl aborts (and retries)
 SPEED_TIME = 120
 CONNECT_TIMEOUT = 30
@@ -310,8 +315,9 @@ def parse_write_out(text):
 
 
 def curl_file_argv(curl, url, out):
-    """One whole-file curl run: resume from the bytes on disk, retry, abort on a stall."""
-    return [curl, "-L", "-f", "-sS", "-C", "-", *CURL_RETRY,
+    """One whole-file curl run: resume from the bytes on disk, no curl-internal retry (it would
+    rewind the file to where this run started), abort on a stall."""
+    return [curl, "-L", "-f", "-sS", "-C", "-", *CURL_FILE_RETRY,
             "--connect-timeout", str(CONNECT_TIMEOUT),
             "--speed-limit", str(SPEED_LIMIT), "--speed-time", str(SPEED_TIME),
             "-w", WRITE_OUT, "-o", str(out), url]

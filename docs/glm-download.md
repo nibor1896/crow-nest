@@ -45,19 +45,26 @@ refuses an answer for another revision, a shard without `lfs.sha256`, or a shard
 
 ## Retry, stall and disk rules
 
-Hugging Face drops long transfers (TLS resets, WinError 10054, curl exit 35). Two layers:
+Hugging Face drops long transfers (TLS resets, WinError 10054, curl exit 35). Whole files have
+exactly one retry layer, and it resumes:
 
-1. **curl:** `-L -f -C - --retry 20 --retry-all-errors --retry-delay 10 --connect-timeout 30
-   --speed-limit 262144 --speed-time 120` (a transfer slower than 256 KiB/s for 120 s aborts and
-   is retried).
-2. **Outer loop:** restarts curl with `-C -` (resume from the bytes on disk) with backoff
-   10 s → 300 s (reset after progress) until the byte count equals the API size; a size above
-   it deletes the `.part`. A watchdog kills a curl whose file has not grown for 600 s.
-   HTTP 401/403/404/410 stop the file at once (wrong repo, revision or access).
+1. **curl, no own retry:** `-L -f -C - --retry 0 --connect-timeout 30 --speed-limit 262144
+   --speed-time 120` (a transfer slower than 256 KiB/s for 120 s aborts). curl's own `--retry`
+   is off on purpose: it does not resume but truncates the file back to where that curl run
+   started (curl `docs/TODO.md`, "--retry should resume"), so a drop late in a shard would throw
+   up to ≈ 5.4 GB away.
+2. **Outer loop, the only retry:** unlimited; restarts curl with `-C -` (resume from the bytes on
+   disk) with backoff 10 s → 300 s (reset after progress) until the byte count equals the API
+   size, one `restart` line per attempt in `fetch.log`. A size above it deletes the `.part`. A
+   watchdog kills a curl whose file has not grown for 600 s. HTTP 401/403/404/410 stop the file at
+   once (wrong repo, revision or access).
 
-Known limitation: curl's own `--retry` does **not** resume — it truncates the file back to where
-that curl run started (curl `docs/TODO.md`, "--retry should resume"). A drop inside one curl run
-therefore costs the bytes of that run (≤ one shard, ≈ 5.4 GB); only the outer loop resumes.
+Small range requests (headers, the API record) keep curl's `--retry 20 --retry-all-errors
+--retry-delay 10`; a rewind there costs at most the 256 KiB probe.
+
+The step-6 download started 2026-10-08 01:33:54 (PID 2352) still runs the first version of the
+tool (`fa7312c`, curl `--retry 20 --retry-all-errors` per whole file); every run started after
+the change uses `--retry 0`.
 
 **Disk:** before each shard the free space of the destination volume is checked; a shard that
 would leave less than 20 GB free is refused and the run stops (exit 4). One run per destination:
@@ -83,6 +90,6 @@ for disk space, 130 interrupted.
 
 ## Tests
 
-`python -I tools/test_fetch_glm.py` — the pure parts and the outer loop against a fake curl
-(resume to the exact size, mismatch deleted and refetched, 3 mismatches stop, overlong deleted,
+`python -I tools/test_fetch_glm.py` — the pure parts (incl. no rewinding curl retry on whole files) and the
+outer loop against a fake curl (resume to the exact size, mismatch deleted and refetched, 3 mismatches stop, overlong deleted,
 permanent HTTP error stops, 20 GB floor refuses, an unmarked file is rehashed). No network.
