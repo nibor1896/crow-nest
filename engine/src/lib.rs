@@ -94,6 +94,8 @@ pub mod toolcall;
 // #93: the lazy tool-call grammar (llama.cpp qwen3_coder semantics) and the
 // vocabulary trie its token masks walk; `bin/serve.rs` owns the redraw
 pub mod toolgrammar;
+// #160: GLM-5.3-Flash prompt side - family test, reasoning words, stop tokens, goldens
+pub mod glm5_template;
 // #86: the OpenAI stop-string filter of `bin/serve.rs`, the same tail-hold
 // `toolcall::find_marker` gives `<tool_call>`, on arbitrary strings
 pub mod stopstr;
