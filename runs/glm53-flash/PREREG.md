@@ -160,3 +160,10 @@ Written on crow-nest `f4f54e4` (branch `glm-step8`) before any routing dump of s
 ### Amendment 2 — 2026-10-08 ~07:30 CEST (administrative, no criterion changed)
 
 robin asked on 2026-10-08 morning for a GLM-5.3-Flash measurement book of its own. From now on every row of this series goes to https://claude.ai/artifact/MpmBA5NTAguy8EyHcRgoV4 ("GLM-5.3-Flash Messbuch") instead of the Flash-Next book named in "Fixed for the whole series" (`EcRQo5otLHnPqPUJXtZ9Xr`); the 14 rows written there on 2026-10-08 were moved. No threshold, metric, data set or method changes.
+
+### Amendment 3 — 2026-10-08 ~09:20 CEST (owner confirmations, before any G1 routing row)
+
+robin confirmed on 2026-10-08, before any routing dump or G1 row exists:
+1. **Recipe as committed.** KDA q/k/v/o projections, KDA short conv and MLA `kv_a`/`kv_b` stay NVFP4 in the container (the plan's step-4 keep set, "everything else NVFP4"), although the checkpoint keeps them BF16 and llama.cpp leaves them unquantized. A BF16 variant for exactly these tensors stays an option: fetched by HTTP range from the originals (~6.6 GB) and loaded as a dense BF16 overlay (`CROW_CNQ_OVERLAY`, #77) instead of a re-conversion; it is measured only if G3 or G6 point at these tensors, as its own arm through the same gates.
+2. **G1 as amendment 1 set it:** judged at N = 25 static hot experts per layer and NVMe window W = 0 (strict case); W > 0 is reported, not judged.
+No threshold changes.
