@@ -111,6 +111,9 @@ pub enum DtypeOut {
     F32,
     /// raw integer metadata (the Flash-Next PLE tables), never quantized
     I64,
+    /// crow-nest #182: a GLM routed-expert projection stored as a MUL1 K = 3 trellis inside its
+    /// expert's record (`mul1.rs`, `--experts-mul1`); only [`mul1_expert_decision`] gives it
+    Mul1,
 }
 
 impl DtypeOut {
@@ -120,10 +123,13 @@ impl DtypeOut {
             DtypeOut::Bf16 => "bf16",
             DtypeOut::F32 => "f32",
             DtypeOut::I64 => "i64",
+            DtypeOut::Mul1 => crate::mul1::DTYPE,
         }
     }
 
     /// Bytes this tensor takes in the container, the twin of `engine/src/cnq.rs::Cnq::byte_len`.
+    /// `Mul1`: the trellis at K = 3 (3/8 B per value); the record adds the six fp16 scale vectors
+    /// and the zeros to 4096, which the conversion counts per record (`mul1::RecordLayout::size`).
     pub fn bytes(self, n: usize) -> u64 {
         let n = n as u64;
         match self {
@@ -131,6 +137,7 @@ impl DtypeOut {
             DtypeOut::Bf16 => n * 2,
             DtypeOut::F32 => n * 4,
             DtypeOut::I64 => n * 8,
+            DtypeOut::Mul1 => n * 3 / 8,
         }
     }
 }
@@ -351,6 +358,21 @@ pub fn glm_expert(name: &str) -> Option<(u64, u64, &str)> {
         return None;
     }
     Some((l?, e.parse().ok()?, p))
+}
+
+/// crow-nest #182: the decision for a routed-expert weight of GLM-5.3-Flash when the experts go
+/// to MUL1 trellis records (`--experts-mul1`): the trunk's experts (layers 3-44) in `text`, the
+/// MTP block's (layer 45, which [`omitted`] otherwise drops whole) in `mtp`. The rest of the MTP
+/// block stays omitted, every other tensor keeps its `cnq4.5-glm5-next` decision. `None` for a
+/// name that is not a routed-expert projection.
+pub fn mul1_expert_decision(name: &str) -> Option<Decision> {
+    let (l, _, _) = glm_expert(name)?;
+    let (section, rule) = if l >= GLM5_NEXT_TEXT_LAYERS {
+        ("mtp", "MTP routed expert gate/up/down MUL1 K=3 trellis (exllamav3 quantizer, #182)")
+    } else {
+        ("text", "routed expert gate/up/down MUL1 K=3 trellis (exllamav3 quantizer, #182)")
+    };
+    Some(Decision { dtype: DtypeOut::Mul1, section, rule })
 }
 
 /// The GLM-5.3-Flash row, a WHITELIST. Keep set = the plan's step 4 (PREREG "Fixed for the

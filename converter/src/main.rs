@@ -89,6 +89,7 @@ mod imatrix;
 mod dequant;
 mod layer_rule_overlay;
 mod mul1;
+mod mul1_store;
 mod partial;
 mod recipe;
 mod requant_check;
@@ -662,7 +663,7 @@ fn quantize_nvfp4_cap(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], us
     (out, global, stats, sse_ceil)
 }
 
-const HELP: &str = "usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>] <model-dir | file.safetensors> <out.cnq>\n  writes an index v2 container: config.json + generation_config.json verbatim, the family's recipe, source repo/revision/shard sha256\n  (--revision defaults to the Hugging Face cache in the model dir; Crow #300 C6)\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n  --scales diag --diag-stats <f.json>  all 126 ue4m3 steps scored by the activation-weighted error (Crow #300 p2-lh)\n  --headers <dir>  read the shard headers from a header cache (<dir>/<shard>.json) (crow-nest #154)\n  --consume <shard-dir>  convert while shards come and go: wait for <shard>.verified, write <shard>.done, never delete; needs --headers (crow-nest #155)\n  an interrupted conversion resumes from <out>.cnq.journal.jsonl (crow-nest #155)\n  --layers <spec> [--with-embed-head]  a partial container: text layers <spec> only (0-3, 0,3) [+ token embedding, lm_head, final norm]; the rest is filtered and the index says so (crow-nest #156)\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dequant <container.cnq> (<name>[:<r0>:<r1>] ... | --names -)\n  writes the named tensors (rows r0..r1) to stdout as f32 little endian, decoded as gate 0 decodes them (crow-nest #156)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter layer-rule-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) --arm attn-v-out|ffn-down-rule|ffn-down-all\n  builds a bf16 overlay container for one llama.cpp-shaped layer-rule arm (#91 phase 1)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)\n       converter plan [--headers <dir>] [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  the dry run: family, recipe, per-tensor dtype/section table, GPU / host byte totals (Crow #300 C6)";
+const HELP: &str = "usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>] <model-dir | file.safetensors> <out.cnq>\n  writes an index v2 container: config.json + generation_config.json verbatim, the family's recipe, source repo/revision/shard sha256\n  (--revision defaults to the Hugging Face cache in the model dir; Crow #300 C6)\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n  --scales diag --diag-stats <f.json>  all 126 ue4m3 steps scored by the activation-weighted error (Crow #300 p2-lh)\n  --headers <dir>  read the shard headers from a header cache (<dir>/<shard>.json) (crow-nest #154)\n  --consume <shard-dir>  convert while shards come and go: wait for <shard>.verified, write <shard>.done, never delete; needs --headers (crow-nest #155)\n  an interrupted conversion resumes from <out>.cnq.journal.jsonl (crow-nest #155)\n  --layers <spec> [--with-embed-head]  a partial container: text layers <spec> only (0-3, 0,3) [+ token embedding, lm_head, final norm]; the rest is filtered and the index says so (crow-nest #156)\n  --experts-mul1 <store> [--mul1-wait] [--disk-reserve-gib N]  GLM-5.3-Flash: the routed experts (MTP layer 45 incl.) as MUL1 K=3 trellis records from a tools/glm_mul1_quantize.py store, after the dense part; --mul1-wait waits for records still being quantized; refused when free disk < bytes to write + N GiB (default 16) (crow-nest #182)\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dequant <container.cnq> (<name>[:<r0>:<r1>] ... | --names -)\n  writes the named tensors (rows r0..r1) to stdout as f32 little endian, decoded as gate 0 decodes them (crow-nest #156)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter layer-rule-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) --arm attn-v-out|ffn-down-rule|ffn-down-all\n  builds a bf16 overlay container for one llama.cpp-shaped layer-rule arm (#91 phase 1)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)\n       converter plan [--headers <dir>] [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  the dry run: family, recipe, per-tensor dtype/section table, GPU / host byte totals (Crow #300 C6)";
 
 /// `converter imatrix-show <imatrix.gguf> [tensor ...]` — #79. Read-only: the kv block, the
 /// tensor count, and for every named tensor its dims, its data offset, its first eight values,
@@ -842,6 +843,15 @@ fn main() {
             "--consume" => opts.consume = argv.next().map(std::path::PathBuf::from),
             "--layers" => layers_spec = argv.next(),
             "--with-embed-head" => with_embed_head = true,
+            "--experts-mul1" => opts.mul1 = argv.next().map(std::path::PathBuf::from),
+            "--mul1-wait" => opts.mul1_wait = true,
+            "--disk-reserve-gib" => match argv.next().and_then(|v| v.parse::<u64>().ok()) {
+                Some(g) => opts.disk_reserve = g << 30,
+                None => {
+                    eprintln!("--disk-reserve-gib needs a whole number of GiB\n{HELP}");
+                    std::process::exit(2);
+                }
+            },
             a if a.starts_with("--") => {
                 eprintln!("unknown flag {a}\n{HELP}");
                 std::process::exit(2);
@@ -956,6 +966,14 @@ fn build_manifest(input: &std::path::Path) -> Result<Manifest, String> {
 }
 
 fn build_manifest_from(input: &std::path::Path, headers: Option<&std::path::Path>) -> Result<Manifest, String> {
+    build_manifest_with(input, headers, false)
+}
+
+/// `mul1` (#182, `--experts-mul1`): every GLM routed-expert weight gets
+/// [`recipe::mul1_expert_decision`], and the MTP block's routed experts (layer 45, with their
+/// block scales) stay in the manifest instead of being omitted; the rest of the MTP block is
+/// omitted as before. Without it the manifest is the one of record.
+fn build_manifest_with(input: &std::path::Path, headers: Option<&std::path::Path>, mul1: bool) -> Result<Manifest, String> {
     let single_file = input.is_file();
     let model_dir = if single_file { input.parent().map(|p| p.to_path_buf()).unwrap_or_default() } else { input.to_path_buf() };
     let model_dir = if model_dir.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { model_dir };
@@ -1014,7 +1032,8 @@ fn build_manifest_from(input: &std::path::Path, headers: Option<&std::path::Path
                 let begin = info["data_offsets"][0].as_u64().unwrap();
                 let end = info["data_offsets"][1].as_u64().unwrap();
                 assert_eq!(end - begin, (n * es) as u64, "{name}: length mismatch");
-                if let Some(why) = recipe::omitted(family, name) {
+                let mul1_expert = mul1 && family == recipe::Family::Glm5Next && recipe::glm_expert(name.strip_suffix("_scale_inv").unwrap_or(name)).is_some();
+                if let Some(why) = recipe::omitted(family, name).filter(|_| !mul1_expert) {
                     let e = omitted.entry(why).or_default();
                     e.0 += 1;
                     e.1 += end - begin;
@@ -1028,7 +1047,11 @@ fn build_manifest_from(input: &std::path::Path, headers: Option<&std::path::Path
                     );
                     continue;
                 }
-                let decision = match recipe::decide(family, name, &shape, dt) {
+                let decided = match recipe::mul1_expert_decision(name).filter(|_| mul1_expert) {
+                    Some(d) => Ok(d),
+                    None => recipe::decide(family, name, &shape, dt),
+                };
+                let decision = match decided {
                     Ok(d) => d,
                     Err(why) => {
                         refusals.push(why);
@@ -1080,7 +1103,8 @@ fn build_manifest_from(input: &std::path::Path, headers: Option<&std::path::Path
     }
     tensors.sort_by(|a, b| a.shard.cmp(&b.shard).then(a.data_begin.cmp(&b.data_begin)));
     let geo = recipe::derive_geo(family, &config);
-    let named: Vec<(String, Vec<usize>)> = tensors.iter().map(|t| (t.name.clone(), t.shape.clone())).collect();
+    // #182: the MTP block's experts (decision section `mtp`) are no text layer of the config
+    let named: Vec<(String, Vec<usize>)> = tensors.iter().filter(|t| !mul1 || t.decision.section != "mtp").map(|t| (t.name.clone(), t.shape.clone())).collect();
     recipe::check_geo_against_tensors(&geo, &named)?;
     Ok(Manifest {
         family,
@@ -1183,6 +1207,14 @@ fn write_units(m: &Manifest) -> Vec<Unit> {
             };
             groups.entry((l, e)).or_default()[slot] = Some(i);
         }
+    }
+    // #182: MUL1 experts (records from the store, no shard read) come after the whole dense part,
+    // one 4096-aligned record per expert in (layer, expert) order, so the converter can write each
+    // record as the quantizer journals it and record i of a layer follows record i - 1
+    if m.tensors.iter().any(|t| t.decision.dtype == recipe::DtypeOut::Mul1) {
+        let mut units: Vec<Unit> = (0..m.tensors.len()).filter(|&i| recipe::glm_expert(&m.tensors[i].name).is_none()).map(|i| Unit { tensors: vec![i], align: 0 }).collect();
+        units.extend(groups.values().map(|g| Unit { tensors: g.iter().flatten().copied().collect(), align: EXPERT_ALIGN }));
+        return units;
     }
     let mut emitted = vec![false; m.tensors.len()];
     let mut units = Vec::new();
@@ -1442,11 +1474,33 @@ struct ConvertOpts {
     poll: std::time::Duration,
     /// #156: `--layers <spec> [--with-embed-head]`, a partial container (`partial.rs`)
     filter: Option<partial::LayerFilter>,
+    /// #182: `--experts-mul1 <store>`: GLM routed experts as MUL1 K = 3 records from the store
+    /// (`mul1_store.rs`), written after the dense part in (layer, expert) order
+    mul1: Option<std::path::PathBuf>,
+    /// #182: `--mul1-wait`: wait for a record the quantizer has not journalled yet (else refused)
+    mul1_wait: bool,
+    /// #182: `--disk-reserve-gib`: free bytes that must remain after a MUL1 conversion
+    disk_reserve: u64,
+    /// tests only: the free bytes the disk check sees
+    disk_free: Option<u64>,
 }
+
+/// #182: the default `--disk-reserve-gib` of a MUL1 conversion.
+const MUL1_DISK_RESERVE: u64 = 16 << 30;
 
 impl Default for ConvertOpts {
     fn default() -> Self {
-        ConvertOpts { headers: None, consume: None, stop_after: None, poll: std::time::Duration::from_secs(2), filter: None }
+        ConvertOpts {
+            headers: None,
+            consume: None,
+            stop_after: None,
+            poll: std::time::Duration::from_secs(2),
+            filter: None,
+            mul1: None,
+            mul1_wait: false,
+            disk_reserve: MUL1_DISK_RESERVE,
+            disk_free: None,
+        }
     }
 }
 
@@ -1571,6 +1625,8 @@ fn encode_tensor(
 struct Totals {
     nvfp4_count: usize,
     bf16_count: usize,
+    /// #182: MUL1 expert projections (three per record)
+    mul1_count: usize,
     total_violations: u64,
     section_agg: BTreeMap<String, SectAgg>,
     hists: Vec<entropy::TensorHist>,
@@ -1601,6 +1657,8 @@ impl Totals {
                     hist: h,
                 });
             }
+        } else if acc["mul1"] == true {
+            self.mul1_count += 1;
         } else {
             self.bf16_count += 1;
         }
@@ -1713,6 +1771,10 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
         eprintln!("conversion refused: --consume reads the shard headers from --headers <dir>; the shards are not all there to read them from\n{HELP}");
         return 2;
     }
+    if opts.mul1.is_some() && opts.consume.is_some() {
+        eprintln!("conversion refused: --experts-mul1 takes the experts from its store and the quantizer reads the shards; it does not run beside --consume\n{HELP}");
+        return 2;
+    }
     let scales_mode_str = match mode {
         ScalesMode::Ceil => "ceil",
         ScalesMode::Mse => "mse",
@@ -1721,7 +1783,7 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
     let t_start = std::time::Instant::now();
 
     // ---- manifest: scan headers only (fast), collect every tensor's location ----
-    let mut m = match build_manifest_from(input, opts.headers.as_deref()) {
+    let mut m = match build_manifest_with(input, opts.headers.as_deref(), opts.mul1.is_some()) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("conversion refused: {e}");
@@ -1798,6 +1860,17 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
         }
     }
     let unit_pad_at: Vec<bool> = unit_start.iter().map(|a| a.is_some_and(|x| x > 0)).collect();
+    // ---- #182: the MUL1 store, and every expert unit checked against it before a byte is written ----
+    let mut mul1 = match &opts.mul1 {
+        None => None,
+        Some(dir) => match mul1_open(&m, &units, dir, opts.mul1_wait) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("conversion refused: {e}");
+                return 2;
+            }
+        },
+    };
     // the last write position that reads each shard: `<shard>.done` once it is journalled
     let mut last_reader: BTreeMap<&str, usize> = BTreeMap::new();
     for (k, t) in order.iter().enumerate() {
@@ -1822,6 +1895,9 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
     if let Some(f) = &opts.filter {
         head["partial"] = serde_json::Value::from(f.describe());
     }
+    if let Some(s) = &mul1 {
+        head["experts"] = serde_json::json!({ "codec": mul1::DTYPE, "k": mul1_store::K, "record_bytes": s.layout.size, "store_sha256": s.head_sha256 });
+    }
 
     // ---- write container: magic, streamed blob, index trailer; resume from the journal ----
     let journal_path = out_path.with_extension("cnq.journal.jsonl");
@@ -1839,6 +1915,13 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
         Resumed { records: vec![], journal_len: 0 }
     };
     let mut blob_len: u64 = resumed.records.last().map(|r| r["entry"]["offset"].as_u64().unwrap() + r["entry"]["len"].as_u64().unwrap()).unwrap_or(0);
+    // ---- #182: the disk check of a MUL1 conversion, before the output is created or grown ----
+    if let Some(s) = &mul1 {
+        if let Err(e) = mul1_disk_check(&m, &units, &s.layout, blob_len, out_path, opts) {
+            eprintln!("conversion refused: {e}");
+            return 2;
+        }
+    }
     let (mut out, mut journal) = if resumed.journal_len > 0 {
         eprintln!("resume: {} of {} tensors journalled and re-hashed, container truncated to {} B", resumed.records.len(), order.len(), blob_start + blob_len);
         let mut out = std::fs::OpenOptions::new().read(true).write(true).open(out_path).expect("open output");
@@ -1860,7 +1943,7 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
 
     let mut index_tensors: Vec<serde_json::Value> = Vec::new();
     let mut sidecar = std::io::BufWriter::new(std::fs::File::create(&sidecar_path).expect("sidecar"));
-    let mut tot = Totals { nvfp4_count: 0, bf16_count: 0, total_violations: 0, section_agg: BTreeMap::new(), hists: Vec::new() };
+    let mut tot = Totals { nvfp4_count: 0, bf16_count: 0, mul1_count: 0, total_violations: 0, section_agg: BTreeMap::new(), hists: Vec::new() };
     for r in &resumed.records {
         tot.absorb(&r["acc"], &r["sidecar"]);
         write_line(&mut sidecar, &r["sidecar"]).expect("sidecar line");
@@ -1898,6 +1981,8 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
 
     let src_dir = opts.consume.clone().unwrap_or_else(|| input.to_path_buf());
     let single = if m.single_file { Some(input) } else { None };
+    // #182: the record of the expert unit being written: (layer, expert), its sha256, its bytes
+    let mut cur_record: Option<((u64, u64), String, Vec<u8>)> = None;
     for k in resumed.records.len()..order.len() {
         let t = order[k];
         let fail = |e: String| -> i32 {
@@ -1915,23 +2000,37 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
                 verified.insert(s.to_string());
             }
         }
-        let raw = match read_source(&src_dir, single, &t.shard, t.data_begin, t.data_end) {
-            Ok(r) => r,
-            Err(e) => return fail(e),
-        };
-        let scale_raw = match &t.scale {
-            Some(s) => match read_source(&src_dir, single, &s.shard, s.data_begin, s.data_end) {
-                Ok(r) => Some(r),
-                Err(e) => return fail(e),
-            },
-            None => None,
-        };
         let pad = pad_for(blob_len, unit_start[k].unwrap_or(0));
-        let enc = match encode_tensor(&m, t, raw, scale_raw, blob_len + pad, mode, scales_mode_str, diag) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("conversion refused: {e}");
-                return 2;
+        // #182: a MUL1 expert projection is its slice of the expert's record from the store; the
+        // FP8 shard is not read (the quantizer read it)
+        let mul1_part = recipe::glm_expert(&t.name).filter(|_| t.decision.dtype == recipe::DtypeOut::Mul1);
+        let enc = if let (Some((l, e, p)), Some(store)) = (mul1_part, mul1.as_mut()) {
+            if cur_record.as_ref().map(|c| c.0) != Some((l, e)) {
+                match mul1_fetch(store, l, e, opts) {
+                    Ok(r) => cur_record = Some(((l, e), recipe::sha256_hex(&r), r)),
+                    Err(e) => return fail(e),
+                }
+            }
+            let (_, sha, rec) = cur_record.as_ref().unwrap();
+            mul1_encode(&m, t, &store.layout, rec, sha, p, blob_len + pad)
+        } else {
+            let raw = match read_source(&src_dir, single, &t.shard, t.data_begin, t.data_end) {
+                Ok(r) => r,
+                Err(e) => return fail(e),
+            };
+            let scale_raw = match &t.scale {
+                Some(s) => match read_source(&src_dir, single, &s.shard, s.data_begin, s.data_end) {
+                    Ok(r) => Some(r),
+                    Err(e) => return fail(e),
+                },
+                None => None,
+            };
+            match encode_tensor(&m, t, raw, scale_raw, blob_len + pad, mode, scales_mode_str, diag) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("conversion refused: {e}");
+                    return 2;
+                }
             }
         };
         if pad > 0 {
@@ -1952,6 +2051,12 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
         index_tensors.push(rec["entry"].clone());
         if let Err(e) = mark_done(Some(k), &mut done) {
             return fail(e);
+        }
+        // #182: the record's last projection is journalled: the store may let its file go
+        if let (Some((l, e, "down")), Some(store)) = (mul1_part, mul1.as_ref()) {
+            if let Err(e) = store.mark_done(l, e, out_path) {
+                return fail(e);
+            }
         }
         if k % 100 == 0 {
             eprintln!(
@@ -2050,6 +2155,9 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
     if let Some(f) = &opts.filter {
         index["partial"] = f.index_block(tensors.len(), filtered.len());
     }
+    if let Some(s) = &mul1 {
+        index["expert_codec"] = mul1_index_block(s, &m, &units);
+    }
     let index_json = serde_json::to_vec_pretty(&index).expect("index json");
     out.write_all(&index_json).expect("index");
     out.write_all(&(index_json.len() as u64).to_le_bytes()).expect("index len");
@@ -2059,12 +2167,13 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
     std::fs::remove_file(&journal_path).ok();
 
     println!(
-        "wrote {}: {} tensors ({} nvfp4, {} bf16-keep), payload {:.2} GB, alignment zeros {pad_total} B, scales {scales_mode_str}, \
+        "wrote {}: {} tensors ({} nvfp4, {} bf16-keep{}), payload {:.2} GB, alignment zeros {pad_total} B, scales {scales_mode_str}, \
 violations {}, elapsed {:.0} s",
         out_path.display(),
         tensors.len(),
         tot.nvfp4_count,
         tot.bf16_count,
+        if tot.mul1_count > 0 { format!(", {} mul1 in {} records", tot.mul1_count, tot.mul1_count / 3) } else { String::new() },
         blob_len as f64 / 1e9,
         tot.total_violations,
         t_start.elapsed().as_secs_f64()
@@ -2084,6 +2193,145 @@ expected under --scales mse, see the MSE report"
         }
     }
     0
+}
+
+/// #182: a write unit of MUL1 expert projections (one record).
+fn is_mul1_unit(m: &Manifest, u: &Unit) -> bool {
+    u.tensors.first().is_some_and(|&i| m.tensors[i].decision.dtype == recipe::DtypeOut::Mul1)
+}
+
+/// #182: open the MUL1 store of a conversion and check every expert unit against it before a byte
+/// is written: GLM only; gate, up and down present with the shapes of the store's record (torch
+/// `[out, in]`: gate/up `[inter, hidden]`, down `[hidden, inter]`); without `--mul1-wait` every
+/// record journalled by the quantizer.
+fn mul1_open(m: &Manifest, units: &[Unit], dir: &std::path::Path, wait: bool) -> Result<mul1_store::Store, String> {
+    if m.family != recipe::Family::Glm5Next {
+        return Err(format!("--experts-mul1: MUL1 expert records are GLM-5.3-Flash's (glm5_next), this checkpoint is {}", m.family.name()));
+    }
+    let tc = &m.config["text_config"];
+    let (Some(hidden), Some(inter)) = (tc["hidden_size"].as_u64(), tc["moe_intermediate_size"].as_u64()) else {
+        return Err("config.json: text_config lacks hidden_size or moe_intermediate_size".into());
+    };
+    let (hidden, inter) = (hidden as usize, inter as usize);
+    let store = mul1_store::Store::open(dir, hidden, inter)?;
+    let want = [("gate", vec![inter, hidden]), ("up", vec![inter, hidden]), ("down", vec![hidden, inter])];
+    let (mut records, mut missing) = (0usize, Vec::new());
+    for u in units.iter().filter(|u| is_mul1_unit(m, u)) {
+        let ts: Vec<&TensorEntry> = u.tensors.iter().map(|&i| &m.tensors[i]).collect();
+        let (l, e, _) = recipe::glm_expert(&ts[0].name).expect("a MUL1 unit holds routed-expert projections");
+        let fits = ts.len() == 3 && ts.iter().zip(&want).all(|(t, (p, s))| recipe::glm_expert(&t.name).map(|x| x.2) == Some(*p) && t.shape == *s);
+        if !fits {
+            let got: Vec<(&str, &Vec<usize>)> = ts.iter().map(|t| (t.name.as_str(), &t.shape)).collect();
+            return Err(format!("layer {l} expert {e}: {got:?}; a MUL1 record needs gate and up {:?} and down {:?}", want[0].1, want[2].1));
+        }
+        records += 1;
+        if !store.has(l, e) {
+            missing.push((l, e));
+        }
+    }
+    if let (Some(&(l, e)), false) = (missing.first(), wait) {
+        return Err(format!(
+            "MUL1 store {}: {} of {records} expert records are not journalled (first: layer {l} expert {e}); run tools/glm_mul1_quantize.py quantize first, or pass --mul1-wait to convert while it runs",
+            dir.display(),
+            missing.len()
+        ));
+    }
+    eprintln!(
+        "mul1 store {}: {records} records of {} B (K = {}, hidden {hidden}, inter {inter}), {} journalled, {} to wait for",
+        dir.display(),
+        store.layout.size,
+        mul1_store::K,
+        records - missing.len(),
+        missing.len()
+    );
+    Ok(store)
+}
+
+/// #182: the record of one expert, waiting for the quantizer's journal line under `--mul1-wait`.
+fn mul1_fetch(store: &mut mul1_store::Store, l: u64, e: u64, opts: &ConvertOpts) -> Result<Vec<u8>, String> {
+    let mut said = false;
+    while !store.has(l, e) {
+        if !opts.mul1_wait {
+            return Err(format!("MUL1 store {}: no record for layer {l} expert {e}", store.dir.display()));
+        }
+        if !said {
+            eprintln!("mul1: waiting for layer {l} expert {e} in {}", store.dir.display());
+            said = true;
+        }
+        std::thread::sleep(opts.poll);
+        store.refresh()?;
+    }
+    store.record(l, e)
+}
+
+/// #182: one projection of a MUL1 record. The record `[gate.trellis][up.trellis][down.trellis]
+/// [six scale vectors][zeros]` is split at the trellis starts (`RecordLayout::tensor_offsets`):
+/// gate `[0, T)`, up `[T, 2T)`, down `[2T, size)`, so the entries are back to back, each index
+/// offset is a trellis start, and the engine's "next offset - gate offset" is the record size.
+fn mul1_encode(m: &Manifest, t: &TensorEntry, lay: &mul1::RecordLayout, rec: &[u8], rec_sha: &str, proj: &str, offset: u64) -> Encoded {
+    let tb = lay.trellis_bytes;
+    let [g, u, d] = lay.tensor_offsets();
+    let (a, b) = match proj {
+        "gate" => (g, u),
+        "up" => (u, d),
+        _ => (d, lay.size),
+    };
+    debug_assert_eq!((g, u, d), (0, tb, 2 * tb));
+    let entry = serde_json::json!({
+        "name": t.name, "shape": t.shape, "section": t.decision.section,
+        "n_values": t.n_values, "offset": offset, "dtype": mul1::DTYPE, "len": b - a,
+        "mul1": { "k": mul1_store::K, "record_offset": offset - a, "record_bytes": lay.size },
+    });
+    let (class, layer, expert) = recipe::tensor_class(m.family, &t.name, &m.config);
+    let sidecar = serde_json::json!({
+        "name": t.name, "section": t.decision.section, "dtype": mul1::DTYPE, "n": t.n_values,
+        "class": class, "layer": layer, "expert": expert, "record_sha256": rec_sha,
+    });
+    Encoded { bytes: rec[a as usize..b as usize].to_vec(), entry, sidecar, acc: serde_json::json!({ "nvfp4": false, "mul1": true }) }
+}
+
+/// #182: refuse a MUL1 conversion that would leave less than `opts.disk_reserve` free: the bytes
+/// still to write (the container's blob as the units lay it out, minus what a resume keeps, plus
+/// an over-estimate of the index trailer: 1 KiB per tensor + 1 MiB) against the free space of the
+/// output's volume.
+fn mul1_disk_check(m: &Manifest, units: &[Unit], lay: &mul1::RecordLayout, written: u64, out_path: &std::path::Path, opts: &ConvertOpts) -> Result<(), String> {
+    let mut blob = 0u64;
+    for u in units {
+        blob += pad_for(blob, u.align);
+        blob += if is_mul1_unit(m, u) { lay.size } else { u.tensors.iter().map(|&i| m.tensors[i].decision.dtype.bytes(m.tensors[i].n_values)).sum() };
+    }
+    let total = 12 + blob + 1024 * m.tensors.len() as u64 + (1 << 20);
+    let need = total.saturating_sub(written);
+    let dir = out_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let free = match opts.disk_free {
+        Some(f) => f,
+        None => mul1_store::free_bytes(dir)?,
+    };
+    let g = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let line = format!(
+        "disk check: the container is {total} B ({:.1} GiB) with its index, {need} B ({:.1} GiB) still to write, reserve {:.1} GiB (--disk-reserve-gib), {} has {free} B ({:.1} GiB) free",
+        g(total),
+        g(need),
+        g(opts.disk_reserve),
+        dir.display(),
+        g(free)
+    );
+    if free < need + opts.disk_reserve {
+        return Err(line);
+    }
+    eprintln!("{line}: ok");
+    Ok(())
+}
+
+/// #182: the index's `expert_codec` block of a MUL1 container.
+fn mul1_index_block(s: &mul1_store::Store, m: &Manifest, units: &[Unit]) -> serde_json::Value {
+    serde_json::json!({
+        "dtype": mul1::DTYPE, "k": mul1_store::K, "hidden": s.layout.hidden, "inter": s.layout.inter,
+        "trellis_bytes": s.layout.trellis_bytes, "record_bytes": s.layout.size,
+        "records": units.iter().filter(|u| is_mul1_unit(m, u)).count(),
+        "layout": "[gate.trellis][up.trellis][down.trellis][gate.suh][gate.svh][up.suh][up.svh][down.suh][down.svh][zeros to 4096 B] (converter/src/mul1.rs, #181)",
+        "store_sha256": s.head_sha256, "quantizer": s.head["quantizer"], "calibration": s.head["calibration"],
+    })
 }
 
 /// The index v2 trailer (Crow #300 C6). What changed against v1 (`64c242b`):
@@ -2581,6 +2829,12 @@ mod tests {
     /// model index, `hf-revision.json` (sha256 and size per shard) and the header cache
     /// `headers/<shard>.json`.
     fn write_glm_synth(dir: &std::path::Path, shard_dir: &std::path::Path) {
+        write_glm_synth_with(dir, shard_dir, false)
+    }
+
+    /// The miniature; `mtp_expert` (#182) adds gate and down of the MTP block's expert 0 to shard
+    /// 1, so layer 45 holds one whole routed expert (the miniature of record has its up only).
+    fn write_glm_synth_with(dir: &std::path::Path, shard_dir: &std::path::Path, mtp_expert: bool) {
         std::fs::create_dir_all(dir.join("headers")).unwrap();
         std::fs::create_dir_all(shard_dir).unwrap();
         let l = |n: &str| format!("model.language_model.layers.{n}");
@@ -2590,6 +2844,12 @@ mod tests {
         ];
         let (w, s) = fp8_pair(&l("45.mlp.experts.0.up_proj.weight"), &[256, 128], 3);
         s1.extend([s, w]);
+        if mtp_expert {
+            let (w, s) = fp8_pair(&l("45.mlp.experts.0.gate_proj.weight"), &[256, 128], 14);
+            s1.extend([w, s]);
+            let (w, s) = fp8_pair(&l("45.mlp.experts.0.down_proj.weight"), &[128, 256], 15);
+            s1.extend([w, s]);
+        }
         let mut s2 = vec![
             synth_tensor(&l("0.input_layernorm.weight"), "BF16", &[128], 4),
             synth_tensor(&l("0.self_attn.q_proj.weight"), "BF16", &[128, 128], 5),
@@ -3095,6 +3355,395 @@ mod tests {
         assert!(dequant::decode(&mut f, 12, &e, None).unwrap() == bytes_to_f32(&body(&e), "BF16"));
         let c = get("model.language_model.layers.3.mlp.gate.e_score_correction_bias");
         assert!(dequant::decode(&mut f, 12, &c, None).unwrap() == bytes_to_f32(&body(&c), "F32"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- crow-nest #182: routed experts as MUL1 K = 3 records from a quantizer store ----
+
+    /// The miniature's experts: hidden 128, inter 256 (gate/up [256, 128], down [128, 256]).
+    const MINI_HIDDEN: usize = 128;
+    const MINI_INTER: usize = 256;
+    /// The miniature's whole experts with `write_glm_synth_with(.., true)`: layer 3 experts 0 and 1
+    /// and the MTP block's expert 0 (the stand-in for GLM-5.3-Flash's 42 x 288 + 288).
+    const MINI_RECORDS: [(u64, u64); 3] = [(3, 0), (3, 1), (45, 0)];
+
+    fn mini_layout() -> mul1::RecordLayout {
+        mul1::RecordLayout::new(MINI_HIDDEN, MINI_INTER, mul1::Bitrate::from_k(3.0).unwrap()).unwrap()
+    }
+
+    /// Synthetic exllamav3 output for one expert (what `quantize_exl3` returns: trellis words,
+    /// suh, svh), seeded by (layer, expert).
+    fn synth_linears(l: u64, e: u64) -> [mul1::Linear; 3] {
+        let lay = mini_layout();
+        let wpt = lay.bitrate.words_per_tile();
+        let words = |n: usize, seed: u64| -> Vec<u16> {
+            let mut x = (seed as u32).wrapping_mul(2654435761).wrapping_add(12345);
+            (0..n)
+                .map(|_| {
+                    x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (x >> 13) as u16
+                })
+                .collect()
+        };
+        let s = l * 1000 + e * 10;
+        let m: Vec<mul1::Linear> = lay
+            .shapes()
+            .iter()
+            .enumerate()
+            .map(|(i, &(k, n))| mul1::Linear { k, n, trellis: words(k / 16 * (n / 16) * wpt, s + 3 * i as u64), suh: words(k, s + 3 * i as u64 + 1), svh: words(n, s + 3 * i as u64 + 2) })
+            .collect();
+        m.try_into().unwrap()
+    }
+
+    /// One expert file as `tools/glm_mul1_quantize.py` writes it (9 tensors, I16 / F16).
+    fn write_expert_file(path: &std::path::Path, mats: &[mul1::Linear; 3]) {
+        let le = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let mut ts: Vec<SynthTensor> = Vec::new();
+        for (p, m) in ["gate", "up", "down"].iter().zip(mats) {
+            ts.push((format!("{p}.trellis"), "I16", vec![m.k / 16, m.n / 16, m.trellis.len() / (m.k / 16 * (m.n / 16))], le(&m.trellis)));
+            ts.push((format!("{p}.suh"), "F16", vec![m.k], le(&m.suh)));
+            ts.push((format!("{p}.svh"), "F16", vec![m.n], le(&m.svh)));
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_st(path, &ts);
+    }
+
+    fn write_store_head(store: &std::path::Path) {
+        std::fs::create_dir_all(store).unwrap();
+        let head = serde_json::json!({
+            "format": mul1_store::FORMAT, "version": 1, "k": 3, "hidden": MINI_HIDDEN, "inter": MINI_INTER,
+            "record_bytes": mini_layout().size, "quantizer": { "name": "synthetic (converter tests)" },
+            "calibration": { "files": [], "tokens": 0 },
+        });
+        std::fs::write(store.join(mul1_store::STORE_FILE), serde_json::to_vec_pretty(&head).unwrap()).unwrap();
+    }
+
+    /// Append one expert to a store: its file, then its journal line (the quantizer's order).
+    fn store_add(store: &std::path::Path, l: u64, e: u64) {
+        let rel = mul1_store::rel_path(l, e);
+        write_expert_file(&store.join(&rel), &synth_linears(l, e));
+        let sha = recipe::sha256_file(&store.join(&rel)).unwrap();
+        let line = serde_json::json!({ "layer": l, "expert": e, "file": rel, "sha256": sha });
+        let mut j = std::fs::OpenOptions::new().create(true).append(true).open(store.join(mul1_store::JOURNAL_FILE)).unwrap();
+        writeln!(j, "{}", serde_json::to_string(&line).unwrap()).unwrap();
+    }
+
+    fn write_store(store: &std::path::Path, recs: &[(u64, u64)]) {
+        write_store_head(store);
+        for &(l, e) in recs {
+            store_add(store, l, e);
+        }
+    }
+
+    fn mul1_opts(store: &std::path::Path) -> ConvertOpts {
+        ConvertOpts { mul1: Some(store.to_path_buf()), ..ConvertOpts::default() }
+    }
+
+    /// A MUL1 conversion of the miniature with a complete MTP expert: (container, sidecar).
+    fn mul1_reference() -> (Vec<u8>, Vec<u8>) {
+        let dir = tmp("mul1-ref");
+        write_glm_synth_with(&dir, &dir, true);
+        write_store(&dir.join("store"), &MINI_RECORDS);
+        let out = dir.join("glm3.cnq");
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &mul1_opts(&dir.join("store"))), 0);
+        let r = (std::fs::read(&out).unwrap(), std::fs::read(dir.join("glm3.cnq.sidecar.jsonl")).unwrap());
+        let idx = trailer(&r.0);
+        assert_eq!(idx["expert_codec"]["records"], 3, "the reference holds the three MUL1 records");
+        assert_eq!(entries(&idx).iter().filter(|t| t["dtype"] == "mul1").count(), 9);
+        std::fs::remove_dir_all(&dir).ok();
+        r
+    }
+
+    fn entries(idx: &serde_json::Value) -> Vec<serde_json::Value> {
+        idx["tensors"].as_array().unwrap().clone()
+    }
+
+    fn body_of(b: &[u8], t: &serde_json::Value) -> Vec<u8> {
+        let o = 12 + t["offset"].as_u64().unwrap() as usize;
+        b[o..o + t["len"].as_u64().unwrap() as usize].to_vec()
+    }
+
+    /// #182: every routed expert (layer 3's and the MTP block's) is one record of exactly
+    /// `RecordLayout::size` B on a 4096-B file offset, equal to `mul1::write_record` of the store's
+    /// tensors; its index entries are dtype `mul1` at the trellis starts (record + 0 / T / 2T) with
+    /// lengths T / T / size - 2T, so the engine's rule (next offset after down - gate offset) gives
+    /// the record size; the records follow the whole dense part in (layer, expert) order; the MTP
+    /// experts are section `mtp`; the index names the codec; each record gets its `.done`.
+    #[test]
+    fn a_mul1_conversion_writes_one_aligned_record_per_expert() {
+        let dir = tmp("mul1-e2e");
+        write_glm_synth_with(&dir, &dir, true);
+        let store = dir.join("store");
+        write_store(&store, &MINI_RECORDS);
+        let out = dir.join("glm3.cnq");
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &mul1_opts(&store)), 0);
+        let bytes = std::fs::read(&out).unwrap();
+        let idx = trailer(&bytes);
+        let ts = entries(&idx);
+        assert_eq!(ts.len(), 20 + 3, "the 4.5 miniature's 20 tensors + the MTP expert's three");
+        let lay = mini_layout();
+        assert_eq!((lay.trellis_bytes, lay.size), (12_288, 40_960));
+        let get = |n: String| ts.iter().find(|t| t["name"] == n).unwrap_or_else(|| panic!("{n}")).clone();
+        let mut offsets: Vec<u64> = ts.iter().map(|t| t["offset"].as_u64().unwrap()).collect();
+        offsets.sort_unstable();
+        let dense_end = ts.iter().filter(|t| t["dtype"] != "mul1").map(|t| t["offset"].as_u64().unwrap() + t["len"].as_u64().unwrap()).max().unwrap();
+        let mut prev = 0u64;
+        for (l, e) in MINI_RECORDS {
+            let p = |w: &str| get(format!("model.language_model.layers.{l}.mlp.experts.{e}.{w}_proj.weight"));
+            let (g, u, d) = (p("gate"), p("up"), p("down"));
+            let off = |t: &serde_json::Value| t["offset"].as_u64().unwrap();
+            let len = |t: &serde_json::Value| t["len"].as_u64().unwrap();
+            for t in [&g, &u, &d] {
+                assert_eq!(t["dtype"], "mul1", "{}", t["name"]);
+                assert_eq!(t["section"], if l == 45 { "mtp" } else { "text" }, "{}", t["name"]);
+                assert_eq!(t["mul1"]["record_offset"].as_u64(), Some(off(&g)));
+                assert_eq!(t["mul1"]["record_bytes"].as_u64(), Some(lay.size));
+            }
+            let [o0, o1, o2] = lay.tensor_offsets();
+            assert_eq!((off(&g) - off(&g), off(&u) - off(&g), off(&d) - off(&g)), (o0, o1, o2), "layer {l} expert {e}");
+            assert_eq!((len(&g), len(&u), len(&d)), (lay.trellis_bytes, lay.trellis_bytes, lay.size - 2 * lay.trellis_bytes));
+            assert_eq!((12 + off(&g)) % 4096, 0, "layer {l} expert {e}: record at file offset {}", 12 + off(&g));
+            assert!(off(&g) >= dense_end && off(&g) > prev, "records after the dense part, in (layer, expert) order");
+            prev = off(&g);
+            // the engine's rule (nvme_source::glm5_record_from_index): next offset after down - gate
+            let next = offsets.iter().copied().find(|&o| o > off(&d)).unwrap_or((bytes.len() - 8 - trailer_len(&bytes) - 12) as u64);
+            assert_eq!(next - off(&g), lay.size, "layer {l} expert {e}");
+            let m = synth_linears(l, e);
+            let want = mul1::write_record(&lay, [&m[0], &m[1], &m[2]]).unwrap();
+            let at = 12 + off(&g) as usize;
+            assert!(bytes[at..at + lay.size as usize] == want[..], "layer {l} expert {e}: not mul1::write_record of the store tensors");
+            assert!(store.join(mul1_store::rel_path(l, e)).with_extension("done").exists(), "layer {l} expert {e}: no .done");
+        }
+        assert_eq!(idx["expert_codec"]["dtype"], "mul1");
+        assert_eq!(idx["expert_codec"]["records"], 3);
+        assert_eq!(idx["expert_codec"]["record_bytes"].as_u64(), Some(lay.size));
+        assert_eq!(idx["sections"]["mtp"]["optional_to_load"], true);
+        assert!(ts.iter().all(|t| t["dtype"] != "nvfp4" || !t["name"].as_str().unwrap().contains(".mlp.experts.")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn trailer_len(bytes: &[u8]) -> usize {
+        u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize
+    }
+
+    /// #182: the dense part of a MUL1 container is what `cnq4.5-glm5-next` writes: every tensor
+    /// that is not a routed expert has the same bytes and the same index record but its offset,
+    /// and the same sidecar line, as in the plain conversion of the same miniature.
+    #[test]
+    fn the_mul1_dense_part_is_byte_identical_to_the_nvfp4_recipe() {
+        let (plain, plain_side) = glm_reference(ScalesMode::Mse);
+        let (m1, m1_side) = mul1_reference();
+        let (pi, mi) = (trailer(&plain), trailer(&m1));
+        let dense: Vec<serde_json::Value> = entries(&pi).into_iter().filter(|t| recipe::glm_expert(t["name"].as_str().unwrap()).is_none()).collect();
+        assert_eq!(dense.len(), 14);
+        let mut n = 0;
+        for p in &dense {
+            let q = entries(&mi).into_iter().find(|t| t["name"] == p["name"]).unwrap_or_else(|| panic!("{} missing", p["name"]));
+            assert!(body_of(&plain, p) == body_of(&m1, &q), "{}: other bytes than cnq4.5-glm5-next", p["name"]);
+            let (mut a, mut b) = (p.clone(), q.clone());
+            a["offset"] = serde_json::Value::Null;
+            b["offset"] = serde_json::Value::Null;
+            assert_eq!(a, b);
+            n += 1;
+        }
+        assert_eq!(n, 14);
+        let lines = |s: &[u8]| -> Vec<serde_json::Value> { String::from_utf8(s.to_vec()).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect() };
+        let ms = lines(&m1_side);
+        for p in lines(&plain_side).iter().filter(|v| v.get("record").is_none() && recipe::glm_expert(v["name"].as_str().unwrap()).is_none()) {
+            assert!(ms.contains(p), "sidecar line of {} differs", p["name"]);
+        }
+        // shard 1 of the MUL1 miniature holds the MTP expert's gate and down too, so only the
+        // checkpoint description is compared, not the shard hashes
+        for k in ["config_json", "family", "geo"] {
+            assert_eq!(pi["model"][k], mi["model"][k], "{k}");
+        }
+        assert_eq!((pi["recipe"].as_str(), pi["scales"].as_str()), (mi["recipe"].as_str(), mi["scales"].as_str()));
+    }
+
+    /// #182: a MUL1 conversion killed after k tensors (inside the dense part, at its end, after a
+    /// record's gate, inside a record, between records, before the last tensor; odd k with a torn
+    /// tail on container and journal) and run again writes the bytes of an uninterrupted one. A
+    /// journal of another store is refused.
+    #[test]
+    fn a_mul1_conversion_killed_and_resumed_is_byte_identical() {
+        let (want, want_side) = mul1_reference();
+        for k in [1usize, 14, 15, 16, 17, 22] {
+            let dir = tmp(&format!("mul1-kill-{k}"));
+            write_glm_synth_with(&dir, &dir, true);
+            let store = dir.join("store");
+            write_store(&store, &MINI_RECORDS);
+            let out = dir.join("glm3.cnq");
+            let opts = ConvertOpts { stop_after: Some(k), ..mul1_opts(&store) };
+            assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &opts), 4, "k {k}");
+            assert_eq!(store.join(mul1_store::rel_path(3, 0)).with_extension("done").exists(), k >= 17, "k {k}: .done only once the record is journalled");
+            if k % 2 == 1 {
+                std::fs::OpenOptions::new().append(true).open(&out).unwrap().write_all(&[0xCD; 4097]).unwrap();
+                std::fs::OpenOptions::new().append(true).open(dir.join("glm3.cnq.journal.jsonl")).unwrap().write_all(b"{\"seq\": 77, \"pa").unwrap();
+            }
+            assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &mul1_opts(&store)), 0, "k {k}");
+            assert!(std::fs::read(&out).unwrap() == want, "k {k}: container differs from the uninterrupted run");
+            assert!(std::fs::read(dir.join("glm3.cnq.sidecar.jsonl")).unwrap() == want_side, "k {k}: sidecar differs");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+        // another store (another store.json) under the same journal: refused, not mixed
+        let dir = tmp("mul1-kill-other");
+        write_glm_synth_with(&dir, &dir, true);
+        let store = dir.join("store");
+        write_store(&store, &MINI_RECORDS);
+        let out = dir.join("glm3.cnq");
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &ConvertOpts { stop_after: Some(16), ..mul1_opts(&store) }), 4);
+        let sj = store.join(mul1_store::STORE_FILE);
+        let mut h: serde_json::Value = serde_json::from_slice(&std::fs::read(&sj).unwrap()).unwrap();
+        h["quantizer"]["name"] = serde_json::json!("another run");
+        std::fs::write(&sj, serde_json::to_vec_pretty(&h).unwrap()).unwrap();
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &mul1_opts(&store)), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #182 refusals, each by exit 2: a record the store has not journalled (before the output
+    /// exists), a record file changed after its journal line, a store for other expert shapes or
+    /// another record size, a tensor of another dtype, `--consume` beside `--experts-mul1`, and a
+    /// volume with less free space than the bytes to write plus the reserve (before the output
+    /// exists).
+    #[test]
+    fn mul1_refusals_name_the_cause() {
+        let fresh = |tag: &str, recs: &[(u64, u64)]| -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+            let dir = tmp(tag);
+            write_glm_synth_with(&dir, &dir, true);
+            write_store(&dir.join("store"), recs);
+            let out = dir.join("glm3.cnq");
+            (dir.clone(), dir.join("store"), out)
+        };
+        let run = |dir: &std::path::Path, out: &std::path::Path, opts: &ConvertOpts| convert_with(dir, out, ScalesMode::Mse, &glm_prov(), None, opts);
+        // a record missing: refused before a byte is written
+        let (dir, store, out) = fresh("mul1-missing", &MINI_RECORDS[..2]);
+        assert_eq!(run(&dir, &out, &mul1_opts(&store)), 2);
+        assert!(!out.exists());
+        std::fs::remove_dir_all(&dir).ok();
+        // a record file changed after its journal line: the conversion stops there
+        let (dir, store, out) = fresh("mul1-sha", &MINI_RECORDS);
+        let f = store.join(mul1_store::rel_path(3, 1));
+        let mut b = std::fs::read(&f).unwrap();
+        let n = b.len();
+        b[n - 3] ^= 0x40;
+        std::fs::write(&f, &b).unwrap();
+        assert_eq!(run(&dir, &out, &mul1_opts(&store)), 2);
+        assert!(dir.join("glm3.cnq.journal.jsonl").exists(), "no trailer: the container is not complete");
+        std::fs::remove_dir_all(&dir).ok();
+        // a store of other shapes, and one with a record size that is not its layout's
+        for (field, v) in [("hidden", serde_json::json!(256)), ("record_bytes", serde_json::json!(40_960 - 4096)), ("k", serde_json::json!(4))] {
+            let (dir, store, out) = fresh(&format!("mul1-head-{field}"), &MINI_RECORDS);
+            let sj = store.join(mul1_store::STORE_FILE);
+            let mut h: serde_json::Value = serde_json::from_slice(&std::fs::read(&sj).unwrap()).unwrap();
+            h[field] = v;
+            std::fs::write(&sj, serde_json::to_vec(&h).unwrap()).unwrap();
+            assert_eq!(run(&dir, &out, &mul1_opts(&store)), 2, "{field}");
+            assert!(!out.exists(), "{field}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+        // a tensor of another dtype (suh as F32 bits under an F16 label is caught by its length;
+        // here the label itself)
+        let (dir, store, out) = fresh("mul1-dtype", &MINI_RECORDS[..2]);
+        let rel = mul1_store::rel_path(45, 0);
+        let m = synth_linears(45, 0);
+        let mut ts: Vec<SynthTensor> = Vec::new();
+        for (p, x) in ["gate", "up", "down"].iter().zip(&m) {
+            let le = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+            ts.push((format!("{p}.trellis"), "I16", vec![x.k / 16, x.n / 16, 48], le(&x.trellis)));
+            ts.push((format!("{p}.suh"), "BF16", vec![x.k], le(&x.suh)));
+            ts.push((format!("{p}.svh"), "F16", vec![x.n], le(&x.svh)));
+        }
+        std::fs::create_dir_all(store.join("L45")).unwrap();
+        write_st(&store.join(&rel), &ts);
+        let sha = recipe::sha256_file(&store.join(&rel)).unwrap();
+        let mut j = std::fs::OpenOptions::new().append(true).open(store.join(mul1_store::JOURNAL_FILE)).unwrap();
+        writeln!(j, "{}", serde_json::json!({ "layer": 45, "expert": 0, "file": rel, "sha256": sha })).unwrap();
+        drop(j);
+        assert_eq!(run(&dir, &out, &mul1_opts(&store)), 2);
+        assert!(mul1_store::parse_expert(&std::fs::read(store.join(&rel)).unwrap(), &mini_layout()).unwrap_err().contains("gate.suh: \"BF16\""));
+        std::fs::remove_dir_all(&dir).ok();
+        // --consume beside --experts-mul1
+        let (dir, store, out) = fresh("mul1-consume", &MINI_RECORDS);
+        let opts = ConvertOpts { headers: Some(dir.join("headers")), consume: Some(dir.clone()), ..mul1_opts(&store) };
+        assert_eq!(run(&dir, &out, &opts), 2);
+        // the disk check: 1 MiB free is refused before the output exists; enough free space passes
+        let opts = ConvertOpts { disk_free: Some(1 << 20), disk_reserve: 0, ..mul1_opts(&store) };
+        assert_eq!(run(&dir, &out, &opts), 2);
+        assert!(!out.exists());
+        let opts = ConvertOpts { disk_free: Some(200_000), disk_reserve: 1 << 30, ..mul1_opts(&store) };
+        assert_eq!(run(&dir, &out, &opts), 2, "the reserve counts");
+        let opts = ConvertOpts { disk_free: Some(64 << 20), disk_reserve: 0, ..mul1_opts(&store) };
+        assert_eq!(run(&dir, &out, &opts), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #182: GLM-5.3-Flash's store (hidden 4096, inter 2048) takes exactly 9,474,048 B per record;
+    /// a store.json claiming another size is refused.
+    #[test]
+    fn a_glm_store_takes_records_of_9474048_bytes_only() {
+        let dir = tmp("mul1-glm-head");
+        let head = |rb: u64| serde_json::json!({ "format": mul1_store::FORMAT, "version": 1, "k": 3, "hidden": 4096, "inter": 2048, "record_bytes": rb });
+        std::fs::write(dir.join(mul1_store::STORE_FILE), serde_json::to_vec(&head(9_474_048)).unwrap()).unwrap();
+        let s = mul1_store::Store::open(&dir, 4096, 2048).unwrap();
+        assert_eq!((s.layout.size, s.layout.size % 4096, s.layout.tensor_offsets()), (9_474_048, 0, [0, 3_145_728, 6_291_456]));
+        std::fs::write(dir.join(mul1_store::STORE_FILE), serde_json::to_vec(&head(9_474_000)).unwrap()).unwrap();
+        assert!(mul1_store::Store::open(&dir, 4096, 2048).err().unwrap().contains("is 9474048 B"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #182 `--mul1-wait`: the converter writes the dense part, then each record as the quantizer
+    /// journals it, and ends with the container of an uninterrupted conversion.
+    #[test]
+    fn mul1_wait_converts_while_the_quantizer_journals() {
+        let (want, _) = mul1_reference();
+        let dir = tmp("mul1-wait");
+        write_glm_synth_with(&dir, &dir, true);
+        let store = dir.join("store");
+        write_store_head(&store);
+        let quantizer = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                for (l, e) in MINI_RECORDS {
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                    store_add(&store, l, e);
+                }
+            })
+        };
+        let opts = ConvertOpts { mul1_wait: true, poll: std::time::Duration::from_millis(5), ..mul1_opts(&store) };
+        assert_eq!(convert_with(&dir, &dir.join("glm3.cnq"), ScalesMode::Mse, &glm_prov(), None, &opts), 0);
+        quantizer.join().unwrap();
+        assert!(std::fs::read(dir.join("glm3.cnq")).unwrap() == want);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #182 with #156's filter (plan step 11): `--layers 3` writes layer 3's dense tensors and its
+    /// two records, with the bytes of the full MUL1 conversion; the MTP expert is filtered, so the
+    /// store needs no record for it.
+    #[test]
+    fn a_partial_mul1_conversion_writes_the_named_layers_records() {
+        let (full, _) = mul1_reference();
+        let fi = trailer(&full);
+        let dir = tmp("mul1-partial");
+        write_glm_synth_with(&dir, &dir, true);
+        let store = dir.join("store");
+        write_store(&store, &MINI_RECORDS[..2]);
+        let out = dir.join("glm3-l3.cnq");
+        let opts = ConvertOpts { filter: Some(partial::LayerFilter::parse("3", false).unwrap()), ..mul1_opts(&store) };
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &opts), 0);
+        let bytes = std::fs::read(&out).unwrap();
+        let idx = trailer(&bytes);
+        let ts = entries(&idx);
+        assert!(ts.iter().all(|t| partial::LayerFilter::layer_of(t["name"].as_str().unwrap()) == Some(3)));
+        assert_eq!(ts.iter().filter(|t| t["dtype"] == "mul1").count(), 6);
+        assert_eq!(idx["expert_codec"]["records"], 2);
+        assert_eq!(idx["partial"]["layers"], serde_json::json!([3]));
+        for t in &ts {
+            let f = entries(&fi).into_iter().find(|x| x["name"] == t["name"]).unwrap();
+            assert!(body_of(&bytes, t) == body_of(&full, &f), "{}", t["name"]);
+            if t["dtype"] == "mul1" && t["name"].as_str().unwrap().ends_with("gate_proj.weight") {
+                assert_eq!((12 + t["offset"].as_u64().unwrap()) % 4096, 0);
+            }
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }
