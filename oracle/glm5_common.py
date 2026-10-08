@@ -9,9 +9,12 @@ One weight source, module-side names on the way out, CHECKPOINT names on disk:
         `X.weight` with a sibling `X.weight_scale_inv` is E4M3 with one f32 scale
         per 128x128 block (quantization_config.weight_block_size); every other
         tensor (BF16 / F32) is widened to f32 exactly.
-  cnq   a CNQ container of glm5_next, dequantized. STUB: the glm5_next converter
-        has not landed, so the container layout of its FP8 / per-expert records is
-        not defined yet; WeightSource("cnq", ...) raises ContainerNotReady.
+  cnq   a CNQ container of glm5_next written by the converter (crow-nest #156), also a
+        partial one (`--layers 0-3 --with-embed-head`). ContainerSource reads every
+        weight through `converter dequant`: the converter's own decode, the one gate 0
+        (the sidecar) measures the written encoding with, so the reference sees exactly
+        what the converter wrote. Checkpoint names are kept in the container, so the
+        name table below serves both back ends. `open_weights(kind, path)` picks one.
 
 Checkpoint names differ from module names (conversion_mapping.py "glm5_next"):
   self_attn.{f_a_proj,f_b_proj}.weight, self_attn.{dt_bias,A_log}  -> self_attn.forget_gate.*
@@ -33,7 +36,11 @@ import json
 import math
 import os
 import re
+import struct
+import subprocess
+import sys
 
+import numpy as np
 import torch
 from safetensors import safe_open
 
@@ -45,7 +52,11 @@ FP8_BLOCK = 128  # quantization_config.weight_block_size [128, 128] of rev eb9eb
 FP8_MAX = 448.0  # largest finite E4M3 (fn) value
 
 
-class ContainerNotReady(RuntimeError):
+CONVERTER = os.environ.get("CROW_CONVERTER") or os.path.join(
+    ROOT, "converter", "target", "release", "converter.exe" if sys.platform == "win32" else "converter")
+
+
+class ContainerError(RuntimeError):
     pass
 
 
@@ -158,20 +169,40 @@ def module_to_ckpt(key, t):
 
 # ---------------------------------------------------------------- weight source
 
+def load_plan(module, prefix):
+    """the checkpoint names a module reads, in load order: [(module key, shape, recipe, [names])].
+    Both back ends fill a module in exactly this order (`WeightSource.load`)."""
+    items = []
+    for k, v in module.state_dict().items():
+        shp = tuple(v.shape)
+        r = ckpt_recipe(k)
+        if r[0] == "one":
+            names = [prefix + r[1]]
+        elif r[0] == "cat0":
+            names = [prefix + n for n in r[1]]
+        elif r[0] == "experts_gate_up":
+            names = [f"{prefix}mlp.experts.{e}.{p}_proj.weight" for e in range(shp[0]) for p in ("gate", "up")]
+        else:
+            names = [f"{prefix}mlp.experts.{e}.down_proj.weight" for e in range(shp[0])]
+        items.append((k, shp, r, names))
+    return items
+
+
 class WeightSource:
+    """the FP8 originals (`fp8`); `ContainerSource` below is the `cnq` back end"""
+
     def __init__(self, kind, path=MODEL_DIR):
-        assert kind in ("fp8", "cnq"), kind
+        assert kind == "fp8", f"WeightSource reads the FP8 originals; use open_weights('{kind}', ...)"
         self.kind = kind
         self.path = path
-        if kind == "cnq":
-            raise ContainerNotReady(
-                f"--weights container {path}: the glm5_next CNQ converter has not landed, so the container "
-                "layout of its FP8 and per-expert records is not defined yet. Use --weights fp8-originals <dir>; "
-                "this back end gets its reader (cnq_weights.CnqReader + the glm5 name table) with the converter.")
         idx = os.path.join(path, "model.safetensors.index.json")
         assert os.path.exists(idx), f"{idx}: missing (expected the FP8 originals of zai-org/GLM-5.3-Flash)"
         with open(idx) as f:
             self.wm = json.load(f)["weight_map"]
+
+    def config_dict(self):
+        with open(os.path.join(self.path, "config.json")) as f:
+            return json.load(f)
 
     def _open(self, name):
         # opened per call, never cached: a kept handle keeps its mmap, and every
@@ -205,6 +236,11 @@ class WeightSource:
         assert w.dtype != torch.float8_e4m3fn, f"{name}: E4M3 without a weight_scale_inv"
         return w.to(torch.float32).clone()
 
+    def get_many(self, names):
+        """the tensors of `names`, in that order, one at a time (a generator)"""
+        for n in names:
+            yield self.get(n)
+
     def rows(self, name, r0, r1):
         """rows [r0, r1) of a 2-D tensor, f32 — the embedding lookup and the chunked
         lm_head never hold the whole table. FP8 rows are read in whole 128-row blocks."""
@@ -231,15 +267,16 @@ class WeightSource:
     def load(self, module, prefix):
         """fill a (meta-built) module from the checkpoint names under `prefix`, strict;
         the routed experts are written into one preallocated [E, ...] tensor so a
-        288-expert layer never holds a second copy"""
-        shapes = {k: tuple(v.shape) for k, v in module.state_dict().items()}
+        288-expert layer never holds a second copy. The names are requested in
+        `load_plan` order through `get_many` (one converter call per module for `cnq`)."""
+        plan = load_plan(module, prefix)
+        it = self.get_many([n for _, _, _, names in plan for n in names])
         state = {}
-        for k, shp in shapes.items():
-            r = ckpt_recipe(k)
+        for k, shp, r, names in plan:
             if r[0] == "one":
-                t = self.get(prefix + r[1])
+                t = next(it)
             elif r[0] == "cat0":
-                t = torch.cat([self.get(prefix + n) for n in r[1]], dim=0)
+                t = torch.cat([next(it) for _ in names], dim=0)
                 assert t.numel() == math.prod(shp), f"{prefix}{k}: {tuple(t.shape)} vs module {shp}"
                 t = t.reshape(shp)
             else:
@@ -247,14 +284,15 @@ class WeightSource:
                 I = shp[1] // 2
                 for e in range(shp[0]):
                     if r[0] == "experts_gate_up":
-                        t[e, :I] = self.get(f"{prefix}mlp.experts.{e}.gate_proj.weight")
-                        t[e, I:] = self.get(f"{prefix}mlp.experts.{e}.up_proj.weight")
+                        t[e, :I] = next(it)
+                        t[e, I:] = next(it)
                     else:
-                        t[e] = self.get(f"{prefix}mlp.experts.{e}.down_proj.weight")
+                        t[e] = next(it)
                 assert not self.has(f"{prefix}mlp.experts.{shp[0]}.down_proj.weight"), \
                     f"{prefix}: the checkpoint has more than {shp[0]} routed experts"
             assert tuple(t.shape) == shp, f"{prefix}{k}: {tuple(t.shape)} vs module {shp}"
             state[k] = t
+        assert next(it, None) is None, f"{prefix}: load_plan and load disagree"
         module.load_state_dict(state, strict=True, assign=True)
         return module.float().eval()
 
@@ -277,6 +315,141 @@ class WeightSource:
         }
 
 
+class ContainerSource(WeightSource):
+    """`--weights container <file.cnq>`: a glm5_next CNQ container (crow-nest #156), whole or
+    partial. Every tensor comes out of `converter dequant` (`converter/src/dequant.rs`): NVFP4
+    decoded by the same `nvfp4_scale` / `nvfp4_value` gate 0 measures the written encoding with,
+    BF16 widened exactly, F32 as stored. The index trailer is read here only for names, shapes
+    and the checkpoint's config.json (carried verbatim in `model.config_json`)."""
+
+    def __init__(self, path, converter=None):
+        self.kind = "cnq"
+        self.path = path
+        self.converter = converter or CONVERTER
+        if not os.path.isfile(path):
+            raise ContainerError(f"--weights container {path}: no such file")
+        if not os.path.isfile(self.converter):
+            raise ContainerError(f"{self.converter}: the converter binary is missing (cd converter && cargo build "
+                                 "--release, or set CROW_CONVERTER); the container is decoded by it, not here")
+        with open(path, "rb") as f:
+            if f.read(4) != b"CNQ1":
+                raise ContainerError(f"{path}: not a CNQ1 container")
+            f.seek(-8, 2)
+            n = struct.unpack("<Q", f.read(8))[0]
+            f.seek(-(8 + n), 2)
+            raw = f.read(n)
+        self.index_sha256 = hashlib.sha256(raw).hexdigest()
+        self.index = json.loads(raw)
+        if self.index.get("format_version") != 2 or self.index.get("recipe") != "cnq4.5-glm5-next":
+            raise ContainerError(f"{path}: index format {self.index.get('format_version')} recipe "
+                                 f"{self.index.get('recipe')}, expected an index v2 of the cnq4.5-glm5-next row")
+        self.tensors = {t["name"]: t for t in self.index["tensors"]}
+        self.partial = self.index.get("partial")
+
+    def config_dict(self):
+        return json.loads(self.index["model"]["config_json"])
+
+    def has(self, name):
+        return name in self.tensors
+
+    def is_fp8(self, name):
+        return False
+
+    def dtype_of(self, name):
+        return self.tensors[name]["dtype"]
+
+    def shape_of(self, name):
+        return list(self.tensors[name]["shape"])
+
+    def _missing(self, name):
+        part = f" (a PARTIAL container: {self.partial['filter']})" if self.partial else ""
+        return ContainerError(f"{name}: not in {self.path}{part}")
+
+    def _dequant(self, specs):
+        """[(spec, n_values, shape)] -> generator of f32 tensors, one converter process"""
+        if not specs:
+            return
+        p = subprocess.Popen([self.converter, "dequant", self.path, "--names", "-"], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            p.stdin.write(("\n".join(s for s, _, _ in specs) + "\n").encode())
+            p.stdin.close()
+            for spec, n, shape in specs:
+                buf = p.stdout.read(4 * n)
+                if len(buf) != 4 * n:
+                    p.wait()
+                    raise ContainerError(f"converter dequant {spec}: {len(buf)} of {4 * n} B, rc {p.returncode}: "
+                                         f"{p.stderr.read().decode(errors='replace').strip()}")
+                yield torch.from_numpy(np.frombuffer(buf, dtype="<f4").copy()).reshape(shape)
+            if p.stdout.read(1):
+                raise ContainerError("converter dequant wrote more than was asked for")
+            if p.wait() != 0:
+                raise ContainerError(f"converter dequant: rc {p.returncode}: {p.stderr.read().decode(errors='replace')}")
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+            p.stdout.close()
+            p.stderr.close()
+
+    def get_many(self, names):
+        for n in names:
+            if n not in self.tensors:
+                raise self._missing(n)
+        return self._dequant([(n, self.tensors[n]["n_values"], self.tensors[n]["shape"]) for n in names])
+
+    def get(self, name):
+        return next(self.get_many([name]))
+
+    def rows(self, name, r0, r1):
+        if name not in self.tensors:
+            raise self._missing(name)
+        cols = self.tensors[name]["shape"][1]
+        return next(self._dequant([(f"{name}:{r0}:{r1}", (r1 - r0) * cols, [r1 - r0, cols])]))
+
+    def embed(self, ids, name=LM + "embed_tokens.weight"):
+        if name not in self.tensors:
+            raise self._missing(name)
+        cols = self.tensors[name]["shape"][1]
+        uniq = sorted(set(int(i) for i in ids))
+        got = self._dequant([(f"{name}:{i}:{i + 1}", cols, [cols]) for i in uniq])
+        rows = dict(zip(uniq, got))
+        return torch.stack([rows[int(i)] for i in ids])
+
+    def provenance(self):
+        st = os.stat(self.path)
+        try:
+            rel = os.path.relpath(self.path, ROOT)
+        except ValueError:
+            rel = self.path
+        m = self.index["model"]
+        dts = [t["dtype"] for t in self.index["tensors"]]
+        return {
+            "weights": "cnq (CNQ container, decoded by `converter dequant`, the converter's gate-0 decode)",
+            "path": rel,
+            "index_json_sha256": self.index_sha256,
+            "config_json_sha256": m.get("config_json_sha256"),
+            "container_bytes": st.st_size,
+            "container_mtime": int(st.st_mtime),
+            "recipe": self.index.get("recipe"),
+            "scales": self.index.get("scales"),
+            "source": {"repo": m["source"]["repo"], "revision": m["source"]["revision"]},
+            "partial": self.partial,
+            "converter": {"path": self.converter, "sha256": sha256_file(self.converter)},
+            "n_tensors": len(dts),
+            "n_nvfp4": dts.count("nvfp4"),
+        }
+
+
+def open_weights(kind, path):
+    """`fp8` -> WeightSource over the FP8 originals, `cnq` -> ContainerSource"""
+    if kind == "fp8":
+        return WeightSource("fp8", path)
+    if kind == "cnq":
+        return ContainerSource(path)
+    raise ValueError(kind)
+
+
 # ---------------------------------------------------------------- synthetic checkpoints (the proof)
 
 # the FP8 split observed in the index of rev eb9eb208 (HF web view, 2026-10-08): dense and
@@ -288,12 +461,20 @@ SYN_FP8 = re.compile(
     r"\.(mlp\.(gate|up|down)_proj|mlp\.shared_experts\.(gate|up|down)_proj|mlp\.experts\.\d+\.(gate|up|down)_proj"
     r"|self_attn\.(q_a_proj|q_b_proj|kv_a_proj_with_mqa|o_proj|b_proj))\.weight$")
 SYN_F32 = re.compile(r"(e_score_correction_bias|\.A_log|\.dt_bias|_conv1d\.weight)$")
+# crow-nest #156: the dtypes the shard headers of rev eb9eb208 carry (headers/, read 2026-10-08),
+# which the converter's cnq4.5-glm5-next whitelist accepts: b_proj and the conv weights BF16,
+# A_log / dt_bias / e_score_correction_bias / hc_*_base / hc_*_scale F32. (o_proj is FP8 for DSA
+# layers only on disk; the row converts either source, so FP8 everywhere is kept here.)
+CNQ_FP8 = re.compile(
+    r"\.(mlp\.(gate|up|down)_proj|mlp\.shared_experts\.(gate|up|down)_proj|mlp\.experts\.\d+\.(gate|up|down)_proj"
+    r"|self_attn\.(q_a_proj|q_b_proj|kv_a_proj_with_mqa|o_proj))\.weight$")
+CNQ_F32 = re.compile(r"(e_score_correction_bias|\.A_log|\.dt_bias|\.hc_(attn|ffn)_(base|scale))$")
 
 
-def write_synthetic_checkpoint(model, out_dir, config_dict, shard_bytes=2 << 30):
+def write_synthetic_checkpoint(model, out_dir, config_dict, shard_bytes=2 << 30, fp8_re=SYN_FP8, f32_re=SYN_F32):
     """model: a Glm5NextForConditionalGeneration (f32). Writes its text model + lm_head in the
     ORIGINAL naming and format (per-expert tensors, hc_*, q/k/v_conv1d, E4M3 + weight_scale_inv
-    for SYN_FP8, BF16 for the rest, F32 for SYN_F32) plus index and config. The vision tower
+    for `fp8_re`, BF16 for the rest, F32 for `f32_re`) plus index and config. The vision tower
     is not written. Returns the number of tensors."""
     from safetensors.torch import save_file
     os.makedirs(out_dir, exist_ok=True)
@@ -320,10 +501,10 @@ def write_synthetic_checkpoint(model, out_dir, config_dict, shard_bytes=2 << 30)
             shard, size = {}, 0
 
     for name, t in items:
-        if SYN_FP8.search(name):
+        if fp8_re.search(name):
             q, s = fp8_quant(t.float())
             add = {name: q.contiguous(), name + "_scale_inv": s.contiguous()}
-        elif SYN_F32.search(name):
+        elif f32_re.search(name):
             add = {name: t.float().contiguous()}
         else:
             add = {name: t.to(torch.bfloat16).contiguous()}

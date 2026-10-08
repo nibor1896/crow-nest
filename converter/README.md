@@ -21,13 +21,16 @@ usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>]
   --headers <dir>  read the shard headers from a header cache (<dir>/<shard>.json) (crow-nest #154)
   --consume <shard-dir>  convert while shards come and go: wait for <shard>.verified, write <shard>.done, never delete; needs --headers (crow-nest #155)
   an interrupted conversion resumes from <out>.cnq.journal.jsonl (crow-nest #155)
+  --layers <spec> [--with-embed-head]  a partial container: text layers <spec> only (0-3, 0,3) [+ token embedding, lm_head, final norm]; the rest is filtered and the index says so (crow-nest #156)
        converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>
   re-quantizes fetched originals and compares them with the container's own bytes (#76)
+       converter dequant <container.cnq> (<name>[:<r0>:<r1>] ... | --names -)
+  writes the named tensors (rows r0..r1) to stdout as f32 little endian, decoded as gate 0 decodes them (crow-nest #156)
        converter plan [--headers <dir>] [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>
   the dry run: family, recipe, per-tensor dtype/section table, GPU / host byte totals (Crow #300 C6)
 ```
 
-- The usage text above is the `HELP` constant verbatim (`src/main.rs:612`), without the overlay and `imatrix-show` lines.
+- The usage text above is the `HELP` constant verbatim (`src/main.rs:653`), without the overlay and `imatrix-show` lines.
 - Input is a directory with `model.safetensors.index.json`, or a single `.safetensors` file.
 - Two positional arguments are required; anything else exits 2.
 - `config.json` and `generation_config.json` must sit in the model directory (or beside the single file): the index v2 carries them, and `text_config.model_type` picks the recipe. `--source-repo` is required; a missing one exits 2 before anything is written.
@@ -105,6 +108,13 @@ Source (read 2026-10-08): `zai-org/GLM-5.3-Flash` rev `eb9eb208eb0d988989d07a6a1
 - `--headers <dir>`: the headers come from `<dir>/<shard>.json` (`{"shard", "size", "data_start", "header"}`); `plan` then needs no shard. Provenance comes from `hf-revision.json` beside the configs (HF model info: `sha`, `siblings[].lfs.sha256/size`) as `sha256_from: hf-lfs`, without reading a shard; a shard that is on disk must have the recorded size (2026-10-08).
 - `--consume <shard-dir>` (needs `--headers`): tensors in index order; before reading a shard the converter waits for `<shard>.verified` (written by the downloader after size and sha256), checks the shard's size and the marker's `sha256` against the HF record, and refuses on a mismatch. When every tensor that reads a shard is written and synced it writes `<shard>.done`. Deleting shards is the driver's job, never the converter's. On GLM-5.3-Flash every write unit reads exactly one shard, so the converter needs one shard at a time; the driver keeps a shard until its `.done` (2026-10-08).
 - **Resume**: every conversion keeps `<out>.cnq.journal.jsonl`: line 1 names the recipe, the scale policy and the sha256 of the write order; then one record per tensor, appended after the container bytes are synced, and synced itself. Run the same command again after a kill: records whose bytes re-hash correctly are kept (in order, up to the first that does not), the container is truncated behind the last one, the sidecar is rewritten from them, and the run goes on. The journal is removed after the index trailer is written; a container without trailer is invalid. A journal of another plan (other scale policy, other tensors) is refused. A resumed run writes the same container and sidecar bytes as an uninterrupted one (test `a_glm_conversion_killed_and_resumed_is_byte_identical`); for that `serde_json` is built with `float_roundtrip` (2026-10-08).
+
+### Partial container and `dequant` (crow-nest #156, plan step 6)
+
+- `--layers <spec> [--with-embed-head]` (`src/partial.rs`): keeps the text decoder layers of `<spec>` (`0-3`, `0,3`, `0-2,7`) and, with the second flag, `embed_tokens`, `lm_head` and the final `norm`. The manifest is built over every tensor first (whitelist, FP8 pairing, config-vs-weights geometry), then filtered. A layer in `<spec>` without a written tensor is refused (exit 2).
+- The coverage check counts the dropped names (weights and their block scales) as filtered, not missing: `coverage check (PARTIAL container, --layers 0-3 --with-embed-head): … filtered by the flags, … 0 missing`. The index trailer gets `"partial": {"layers", "embed_head_norm", "filter", "tensors_written", "tensors_filtered"}`; the journal head names the filter.
+- `converter dequant <container.cnq> (<name>[:<r0>:<r1>] ... | --names -)` (`src/dequant.rs`, 2026-10-08): writes the named tensors, or rows of a 2-D tensor, to stdout as f32 little endian, no header, in the order asked. NVFP4 goes through `dequant_nvfp4`, which uses `nvfp4_scale` / `nvfp4_value`, the two functions gate 0 (`quantize_nvfp4_w`) decodes the written encoding with; BF16 is widened exactly, F32 read as stored. The oracle's `--weights container` back end reads every weight through it (`../docs/glm5-reference-runner.md` section 3).
+- Step 6 run (2026-10-08, `--scales mse --headers … --layers 0-3 --with-embed-head` over the 7 step-6 shards): 972 tensors (902 NVFP4, 70 BF16/F32), payload 7.22 GB, 244 s, coverage 0 missing; numbers in `../runs/glm53-flash/step06/`.
 
 ## BF16 keep set (the Flash-Next row)
 
@@ -184,4 +194,5 @@ cargo test --release
 - Seven `#[test]` functions in `src/main.rs`, counted 2026-09-17, plus five in `src/requant_check.rs` added on 2026-09-18 (issue #76), so `cargo test --release` in this crate reads 12 passed, 0 failed on 2026-09-18.
 - 2026-09-26 (Crow #300 C6): `cargo test` reads 57 passed, 0 failed (46 before C6; the eleven new ones cover the recipe rows, the index v2 round trip against `../engine/tests/fixtures/synthetic-v2/`, provenance and the per-family layer-rule arms).
 - 2026-10-08 (crow-nest #154/#155): `cargo test --release` reads 77 passed, 0 failed (61 at `7c749d2`; the sixteen new ones cover the FP8 table against torch `float8_e4m3fn`, the dequant against DeepSeek's formula and transformers `Fp8Dequantize` (`tests/fixtures/fp8_fixtures.py`, oracle venv), the GLM row on all 76,108 tensors, the whitelist refusals, Huffman sizes, histogram sums, expert alignment, kill and resume, `--consume` and `--headers`).
+- 2026-10-08 (crow-nest #156): `cargo test --release` reads 83 passed, 0 failed (77 before; the six new ones cover the `--layers` spec and its keep rule, a partial conversion of the miniature (named layers only, bytes equal to the full conversion, layer 44 filtered not missing, absent layers refused), `dequant_nvfp4` against gate 0's error sums bit for bit with a swapped-nibble and a swapped-scale control, and `dequant` on container records incl. row ranges).
 - They are not part of the engine's count: `cd engine && cargo test --release` reads 165 passed, 0 failed on 2026-09-17 and covers `crow_nest_engine` and `bin/serve` only. `tools/gate-linux.sh` pins THAT count, not this one, so a test added here moves no gate value.

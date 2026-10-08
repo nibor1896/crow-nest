@@ -86,7 +86,9 @@ mod expert_overlay;
 mod expert_requant;
 mod fp8;
 mod imatrix;
+mod dequant;
 mod layer_rule_overlay;
+mod partial;
 mod recipe;
 mod requant_check;
 
@@ -172,6 +174,39 @@ fn decode_ue4m3(byte: u32) -> f32 {
     } else {
         (1.0 + (m as f32) / 8.0) * 2.0f32.powi(e as i32 - 7)
     }
+}
+
+/// The f32 scale of one NVFP4 sub-block: its ue4m3 byte times the tensor's global scale.
+/// crow-nest #156: gate 0 (the sidecar, `quantize_nvfp4_w`) and `converter dequant`
+/// (`dequant_nvfp4`) share this and [`nvfp4_value`], so both see the same f32 per value.
+#[inline]
+fn nvfp4_scale(byte: u32, global: f32) -> f32 {
+    decode_ue4m3(byte) * global
+}
+
+/// One decoded NVFP4 value: the E2M1 code times its sub-block scale.
+#[inline]
+fn nvfp4_value(nib: u32, dec: f32) -> f32 {
+    decode_e2m1(nib) * dec
+}
+
+/// Decode whole 36-byte NVFP4 blocks (4 ue4m3 sub-block scales, then 32 bytes of E2M1 codes,
+/// value 2k in the low nibble of byte k, 2k+1 in the high one) to f32, exactly as gate 0
+/// decodes the written encoding.
+fn dequant_nvfp4(blocks: &[u8], global: f32) -> Vec<f32> {
+    assert!(blocks.len() % 36 == 0, "{} B is not whole 36-byte NVFP4 blocks", blocks.len());
+    let mut out = Vec::with_capacity(blocks.len() / 36 * 64);
+    for b in blocks.chunks_exact(36) {
+        for sb in 0..4 {
+            let dec = nvfp4_scale(b[sb] as u32, global);
+            for j in 0..16 {
+                let byte_idx = sb * 16 + j;
+                let nib = (b[4 + byte_idx / 2] as u32 >> (4 * (byte_idx % 2))) & 0xF;
+                out.push(nvfp4_value(nib, dec));
+            }
+        }
+    }
+    out
 }
 
 // ---------------- manifest ----------------
@@ -563,7 +598,7 @@ fn quantize_nvfp4_w(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], usiz
                 }
             };
             scales[sb] = stored;
-            let dec = decode_ue4m3(stored) * global;
+            let dec = nvfp4_scale(stored, global);
             let inv = 1.0 / dec;
             for (j, v) in sub.iter().enumerate() {
                 let nib = e2m1_index(v.abs() * inv) as u32 | (((*v < 0.0) as u32) << 3);
@@ -576,7 +611,7 @@ fn quantize_nvfp4_w(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], usiz
             for (j, v) in sub.iter().enumerate() {
                 let byte_idx = sb * 16 + j;
                 let nib = (nibbles[byte_idx / 2] >> (4 * (byte_idx % 2))) & 0xF;
-                let d = decode_e2m1(nib) * dec;
+                let d = nvfp4_value(nib, dec);
                 let err = (d - *v).abs();
                 sb_stats.sum_abs_err += err as f64;
                 sb_stats.sum_sq_err += (err as f64) * (err as f64);
@@ -615,7 +650,7 @@ fn quantize_nvfp4_w(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], usiz
     (out, global, stats, sse_ceil)
 }
 
-const HELP: &str = "usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>] <model-dir | file.safetensors> <out.cnq>\n  writes an index v2 container: config.json + generation_config.json verbatim, the family's recipe, source repo/revision/shard sha256\n  (--revision defaults to the Hugging Face cache in the model dir; Crow #300 C6)\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n  --scales diag --diag-stats <f.json>  all 126 ue4m3 steps scored by the activation-weighted error (Crow #300 p2-lh)\n  --headers <dir>  read the shard headers from a header cache (<dir>/<shard>.json) (crow-nest #154)\n  --consume <shard-dir>  convert while shards come and go: wait for <shard>.verified, write <shard>.done, never delete; needs --headers (crow-nest #155)\n  an interrupted conversion resumes from <out>.cnq.journal.jsonl (crow-nest #155)\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter layer-rule-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) --arm attn-v-out|ffn-down-rule|ffn-down-all\n  builds a bf16 overlay container for one llama.cpp-shaped layer-rule arm (#91 phase 1)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)\n       converter plan [--headers <dir>] [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  the dry run: family, recipe, per-tensor dtype/section table, GPU / host byte totals (Crow #300 C6)";
+const HELP: &str = "usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>] <model-dir | file.safetensors> <out.cnq>\n  writes an index v2 container: config.json + generation_config.json verbatim, the family's recipe, source repo/revision/shard sha256\n  (--revision defaults to the Hugging Face cache in the model dir; Crow #300 C6)\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n  --scales diag --diag-stats <f.json>  all 126 ue4m3 steps scored by the activation-weighted error (Crow #300 p2-lh)\n  --headers <dir>  read the shard headers from a header cache (<dir>/<shard>.json) (crow-nest #154)\n  --consume <shard-dir>  convert while shards come and go: wait for <shard>.verified, write <shard>.done, never delete; needs --headers (crow-nest #155)\n  an interrupted conversion resumes from <out>.cnq.journal.jsonl (crow-nest #155)\n  --layers <spec> [--with-embed-head]  a partial container: text layers <spec> only (0-3, 0,3) [+ token embedding, lm_head, final norm]; the rest is filtered and the index says so (crow-nest #156)\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dequant <container.cnq> (<name>[:<r0>:<r1>] ... | --names -)\n  writes the named tensors (rows r0..r1) to stdout as f32 little endian, decoded as gate 0 decodes them (crow-nest #156)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter layer-rule-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) --arm attn-v-out|ffn-down-rule|ffn-down-all\n  builds a bf16 overlay container for one llama.cpp-shaped layer-rule arm (#91 phase 1)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)\n       converter plan [--headers <dir>] [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  the dry run: family, recipe, per-tensor dtype/section table, GPU / host byte totals (Crow #300 C6)";
 
 /// `converter imatrix-show <imatrix.gguf> [tensor ...]` — #79. Read-only: the kv block, the
 /// tensor count, and for every named tensor its dims, its data offset, its first eight values,
@@ -748,6 +783,17 @@ fn main() {
         std::process::exit(imatrix_show(&all[1..]));
     }
 
+    // crow-nest #156: the read-only decoder of a written container (the oracle's `--weights
+    // container` back end reads its weights through it). Same additive rule: its own word as
+    // argument zero, and it never reaches the conversion path.
+    if let Some(at) = all.iter().position(|a| a == "dequant") {
+        if at != 0 {
+            eprintln!("unexpected argument {} before dequant\n{}", all[0], dequant::HELP);
+            std::process::exit(2);
+        }
+        std::process::exit(dequant::run(&all[1..]));
+    }
+
     // Crow #300 C6: the read-only plan. Same additive rule as every subcommand above: its own
     // word as argument zero, and it reads the index, the shard headers and the config only.
     if let Some(at) = all.iter().position(|a| a == "plan") {
@@ -763,6 +809,8 @@ fn main() {
     let mut prov = Provenance::default();
     let mut diag_path: Option<String> = None;
     let mut opts = ConvertOpts::default();
+    let mut layers_spec: Option<String> = None;
+    let mut with_embed_head = false;
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         match arg.as_str() {
@@ -780,6 +828,8 @@ fn main() {
             "--revision" => prov.revision = argv.next(),
             "--headers" => opts.headers = argv.next().map(std::path::PathBuf::from),
             "--consume" => opts.consume = argv.next().map(std::path::PathBuf::from),
+            "--layers" => layers_spec = argv.next(),
+            "--with-embed-head" => with_embed_head = true,
             a if a.starts_with("--") => {
                 eprintln!("unknown flag {a}\n{HELP}");
                 std::process::exit(2);
@@ -790,6 +840,20 @@ fn main() {
     if positional.len() != 2 {
         eprintln!("{HELP}");
         std::process::exit(2);
+    }
+    match (layers_spec, with_embed_head) {
+        (Some(spec), e) => match partial::LayerFilter::parse(&spec, e) {
+            Ok(f) => opts.filter = Some(f),
+            Err(e) => {
+                eprintln!("conversion refused: {e}\n{HELP}");
+                std::process::exit(2);
+            }
+        },
+        (None, true) => {
+            eprintln!("conversion refused: --with-embed-head belongs to a partial container and needs --layers <spec>\n{HELP}");
+            std::process::exit(2);
+        }
+        (None, false) => {}
     }
     let input = std::path::PathBuf::from(&positional[0]);
     let out_path = std::path::PathBuf::from(&positional[1]);
@@ -1364,11 +1428,13 @@ struct ConvertOpts {
     /// tests only: stop after this many tensors are journalled, as a kill would (no trailer)
     stop_after: Option<usize>,
     poll: std::time::Duration,
+    /// #156: `--layers <spec> [--with-embed-head]`, a partial container (`partial.rs`)
+    filter: Option<partial::LayerFilter>,
 }
 
 impl Default for ConvertOpts {
     fn default() -> Self {
-        ConvertOpts { headers: None, consume: None, stop_after: None, poll: std::time::Duration::from_secs(2) }
+        ConvertOpts { headers: None, consume: None, stop_after: None, poll: std::time::Duration::from_secs(2), filter: None }
     }
 }
 
@@ -1642,13 +1708,38 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
     let t_start = std::time::Instant::now();
 
     // ---- manifest: scan headers only (fast), collect every tensor's location ----
-    let m = match build_manifest_from(input, opts.headers.as_deref()) {
+    let mut m = match build_manifest_from(input, opts.headers.as_deref()) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("conversion refused: {e}");
             return 2;
         }
     };
+    // ---- #156: a partial container keeps the filtered tensors only. The manifest above saw
+    // every tensor (recipe whitelist, FP8 pairing, geometry); what the filter drops is named
+    // as filtered, weight and block scale, never as missing ----
+    let mut filtered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(f) = &opts.filter {
+        let before = m.tensors.len();
+        for t in m.tensors.iter().filter(|t| !f.keeps(&t.name)) {
+            filtered.insert(t.name.clone());
+            if let Some(s) = &t.scale {
+                filtered.insert(s.name.clone());
+            }
+        }
+        m.tensors.retain(|t| f.keeps(&t.name));
+        for l in &f.layers {
+            if !m.tensors.iter().any(|t| partial::LayerFilter::layer_of(&t.name) == Some(*l)) {
+                eprintln!("conversion refused: {}: layer {l} has no tensor the {} recipe writes", f.describe(), m.family.recipe());
+                return 2;
+            }
+        }
+        if f.embed_head_norm && !m.tensors.iter().any(|t| partial::LayerFilter::is_embed_head_norm(&t.name)) {
+            eprintln!("conversion refused: {}: no token embedding, lm_head or final norm among the tensors", f.describe());
+            return 2;
+        }
+        eprintln!("partial container {}: {} of {before} tensors kept, {} weight_map names filtered (block scales included)", f.describe(), m.tensors.len(), filtered.len());
+    }
     // ---- the index v2 `model` block: provenance first, so a missing flag costs nothing ----
     let (repo, revision, shards, _) = match provenance(&m, prov, true) {
         Ok(p) => p,
@@ -1711,10 +1802,13 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
         }
         recipe::sha256_hex(s.as_bytes())
     };
-    let head = serde_json::json!({
+    let mut head = serde_json::json!({
         "journal": "crow-nest converter", "version": 1, "recipe": m.family.recipe(), "scales": scales_mode_str,
         "tensors": order.len(), "order_sha256": plan_sha,
     });
+    if let Some(f) = &opts.filter {
+        head["partial"] = serde_json::Value::from(f.describe());
+    }
 
     // ---- write container: magic, streamed blob, index trailer; resume from the journal ----
     let journal_path = out_path.with_extension("cnq.journal.jsonl");
@@ -1908,11 +2002,15 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
     if let Some(wm) = &m.weight_map {
         let mut covered: std::collections::HashSet<&str> = tensors.iter().map(|t| t.name.as_str()).collect();
         covered.extend(tensors.iter().filter_map(|t| t.scale.as_ref().map(|s| s.name.as_str())));
-        let (mut missing, mut omitted) = (0usize, 0usize);
+        let (mut missing, mut omitted, mut n_filtered) = (0usize, 0usize, 0usize);
         for name in wm.keys() {
             if !covered.contains(name.as_str()) {
                 if recipe::omitted(m.family, name).is_some() {
                     omitted += 1;
+                    continue;
+                }
+                if filtered.contains(name) {
+                    n_filtered += 1;
                     continue;
                 }
                 eprintln!("MISSING from output: {name}");
@@ -1923,10 +2021,22 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
             eprintln!("coverage check FAILED: {missing} tensors missing");
             return 3;
         }
-        eprintln!("coverage check: all {} weight_map tensors present ({omitted} omitted by the {} recipe)", wm.len(), m.family.recipe());
+        match &opts.filter {
+            None => eprintln!("coverage check: all {} weight_map tensors present ({omitted} omitted by the {} recipe)", wm.len(), m.family.recipe()),
+            Some(f) => eprintln!(
+                "coverage check (PARTIAL container, {}): {} of {} weight_map tensors present, {n_filtered} filtered by the flags, {omitted} omitted by the {} recipe, 0 missing",
+                f.describe(),
+                wm.len() - n_filtered - omitted,
+                wm.len(),
+                m.family.recipe()
+            ),
+        }
     }
 
-    let index = index_v2(&model, scales_mode_str, blob_start, index_tensors);
+    let mut index = index_v2(&model, scales_mode_str, blob_start, index_tensors);
+    if let Some(f) = &opts.filter {
+        index["partial"] = f.index_block(tensors.len(), filtered.len());
+    }
     let index_json = serde_json::to_vec_pretty(&index).expect("index json");
     out.write_all(&index_json).expect("index");
     out.write_all(&(index_json.len() as u64).to_le_bytes()).expect("index len");
@@ -2799,5 +2909,127 @@ mod tests {
         let bad = (s.0.clone(), "F32", vec![1, 1], vec![0u8; 4]);
         let e = case("grid", vec![w, bad]);
         assert!(e.contains("the 128x128 grid of [256, 128] is [2, 1]"), "{e}");
+    }
+
+    /// crow-nest #156: `--layers 0,3 --with-embed-head` on the miniature writes exactly layers 0
+    /// and 3 plus embedding, lm_head and final norm, each with the bytes the full conversion
+    /// writes for it; layer 44 is filtered (not missing: exit 0, not 3); the index says
+    /// `partial`. A layer the checkpoint does not have is refused.
+    #[test]
+    fn a_partial_conversion_writes_the_named_layers_with_the_full_bytes() {
+        let (full, _) = glm_reference(ScalesMode::Mse);
+        let fidx = trailer(&full);
+        let dir = tmp("partial");
+        write_glm_synth(&dir, &dir);
+        let out = dir.join("glm-l03.cnq");
+        let f = partial::LayerFilter::parse("0,3", true).unwrap();
+        let opts = ConvertOpts { headers: Some(dir.join("headers")), filter: Some(f), ..ConvertOpts::default() };
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &opts), 0);
+        let bytes = std::fs::read(&out).unwrap();
+        let idx = trailer(&bytes);
+        let ts = idx["tensors"].as_array().unwrap();
+        let names: Vec<&str> = ts.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.iter().all(|n| !n.contains("layers.44.")), "{names:?}");
+        assert_eq!(ts.len(), fidx["tensors"].as_array().unwrap().len() - 1, "only layer 44's norm is filtered");
+        for n in ["lm_head.weight", "model.language_model.embed_tokens.weight", "model.language_model.norm.weight"] {
+            assert!(names.contains(&n), "{n}");
+        }
+        assert_eq!(idx["partial"]["layers"], serde_json::json!([0, 3]));
+        assert_eq!(idx["partial"]["embed_head_norm"], true);
+        assert_eq!(idx["partial"]["tensors_filtered"], 1);
+        let body = |b: &[u8], t: &serde_json::Value| {
+            let o = 12 + t["offset"].as_u64().unwrap() as usize;
+            b[o..o + t["len"].as_u64().unwrap() as usize].to_vec()
+        };
+        for t in ts {
+            let ft = fidx["tensors"].as_array().unwrap().iter().find(|x| x["name"] == t["name"]).unwrap();
+            assert!(body(&bytes, t) == body(&full, ft), "{}: other bytes than the full conversion", t["name"]);
+            assert_eq!(t["global_scale"], ft["global_scale"]);
+        }
+        // without --with-embed-head: no embedding, head or final norm
+        let out2 = dir.join("glm-l03-noeh.cnq");
+        let opts = ConvertOpts { headers: Some(dir.join("headers")), filter: Some(partial::LayerFilter::parse("0,3", false).unwrap()), ..ConvertOpts::default() };
+        assert_eq!(convert_with(&dir, &out2, ScalesMode::Mse, &glm_prov(), None, &opts), 0);
+        let idx2 = trailer(&std::fs::read(&out2).unwrap());
+        assert!(idx2["tensors"].as_array().unwrap().iter().all(|t| !partial::LayerFilter::is_embed_head_norm(t["name"].as_str().unwrap())));
+        // layers 1 and 2 do not exist in the miniature: refused before a byte is written
+        let out3 = dir.join("glm-l0-3.cnq");
+        let opts = ConvertOpts { headers: Some(dir.join("headers")), filter: Some(partial::LayerFilter::parse("0-3", true).unwrap()), ..ConvertOpts::default() };
+        assert_eq!(convert_with(&dir, &out3, ScalesMode::Mse, &glm_prov(), None, &opts), 2);
+        assert!(!out3.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// crow-nest #156: `converter dequant` decodes what gate 0 measured. Re-decoding the written
+    /// blocks reproduces the sidecar's squared-error sum and max error bit for bit; a decode with
+    /// the nibble order or the scale order swapped does not.
+    #[test]
+    fn dequant_reproduces_gate_zero_bit_for_bit() {
+        let vals: Vec<f32> = (0..64 * 40).map(|i| ((i as f32 * 0.37).sin() * 3.0 + if i % 29 == 0 { 9.0 } else { 0.0 }) * 1e-2).collect();
+        for mode in [ScalesMode::Ceil, ScalesMode::Mse] {
+            let (blocks, global, st, _) = quantize_nvfp4(&vals, mode);
+            let d = dequant_nvfp4(&blocks, global);
+            assert_eq!(d.len(), vals.len());
+            // summed per 16-value sub-block, then over sub-blocks: gate 0's order (`QuantStats::absorb`)
+            let (mut sse, mut max) = (0.0f64, 0.0f32);
+            for (ds, vs) in d.chunks(16).zip(vals.chunks(16)) {
+                let mut sub = 0.0f64;
+                for (a, b) in ds.iter().zip(vs) {
+                    let e = (a - b).abs();
+                    sub += (e as f64) * (e as f64);
+                    max = max.max(e);
+                }
+                sse += sub;
+            }
+            assert_eq!(sse.to_bits(), st.sum_sq_err.to_bits(), "mode {}: the decode is not gate 0's", mode == ScalesMode::Mse);
+            assert_eq!(max.to_bits(), st.max_abs_err.to_bits());
+            // the controls: a swapped nibble order and a swapped scale order are seen
+            let mut swapped = blocks.clone();
+            for b in swapped.chunks_exact_mut(36) {
+                for k in 4..36 {
+                    b[k] = b[k].rotate_left(4);
+                }
+            }
+            assert_ne!(dequant_nvfp4(&swapped, global), d);
+            let mut sc = blocks.clone();
+            for b in sc.chunks_exact_mut(36) {
+                b[..4].reverse();
+            }
+            assert_ne!(dequant_nvfp4(&sc, global), d);
+        }
+    }
+
+    /// crow-nest #156: the subcommand's decode on a written container: a whole NVFP4 tensor, a row
+    /// range of it, and a BF16 and an F32 tensor, against the bytes in the file.
+    #[test]
+    fn dequant_reads_the_container_records() {
+        let dir = tmp("dequant");
+        write_glm_synth(&dir, &dir);
+        let out = dir.join("glm.cnq");
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &ConvertOpts::default()), 0);
+        let bytes = std::fs::read(&out).unwrap();
+        let idx = trailer(&bytes);
+        let get = |n: &str| idx["tensors"].as_array().unwrap().iter().find(|t| t["name"] == n).unwrap().clone();
+        let body = |t: &serde_json::Value| {
+            let o = 12 + t["offset"].as_u64().unwrap() as usize;
+            bytes[o..o + t["len"].as_u64().unwrap() as usize].to_vec()
+        };
+        let mut f = std::fs::File::open(&out).unwrap();
+        let q = get("model.language_model.layers.3.self_attn.q_a_proj.weight"); // [192, 200], nvfp4
+        assert_eq!(q["dtype"], "nvfp4");
+        let want = dequant_nvfp4(&body(&q), q["global_scale"].as_f64().unwrap() as f32);
+        let all = dequant::decode(&mut f, 12, &q, None).unwrap();
+        assert!(all == want[..192 * 200]);
+        // row 1 of a 200-wide tensor is not whole 64-value blocks: refused
+        assert!(dequant::decode(&mut f, 12, &q, Some((1, 2))).is_err());
+        let g = get("model.language_model.layers.3.mlp.experts.0.gate_proj.weight"); // [256, 128]
+        let gall = dequant::decode(&mut f, 12, &g, None).unwrap();
+        assert!(dequant::decode(&mut f, 12, &g, Some((5, 9))).unwrap() == gall[5 * 128..9 * 128]);
+        let e = get("lm_head.weight");
+        assert_eq!(e["dtype"], "bf16");
+        assert!(dequant::decode(&mut f, 12, &e, None).unwrap() == bytes_to_f32(&body(&e), "BF16"));
+        let c = get("model.language_model.layers.3.mlp.gate.e_score_correction_bias");
+        assert!(dequant::decode(&mut f, 12, &c, None).unwrap() == bytes_to_f32(&body(&c), "F32"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

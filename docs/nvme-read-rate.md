@@ -6,9 +6,9 @@ at which this machine's NVMe delivers expert-sized blocks through unbuffered IO.
 the verdict are fixed by `runs/glm53-flash/PREREG.md`, section "Step 3"; G1 (step 8) consumes B.
 The tool changes nothing in the engine, the converter or the container.
 
-> **No B exists yet.** The tool is built and tested on a synthetic temp file (2026-10-08). The
-> measurement on the GLM shards has not been run: the shards were still downloading, and a run
-> with a second process on the disk is void.
+> **First run on the GLM shards (2026-10-08, `runs/glm53-flash/step03/20261008T001819Z.{json,md}`):** valid
+> (no foreign disk IO), medians 6.994 / 9.765 / 7.811 GB/s at 1 / 2 / 4 readers, spreads 1.003 / 1.232 / 1.430.
+> The best count (2) misses the 1.15 spread rule, so `G1 input` is "not answered" and no B for G1 exists yet.
 
 ## What it reads, and how
 

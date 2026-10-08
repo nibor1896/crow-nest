@@ -1,0 +1,6 @@
+{
+ "text": "Step 6 of the GLM-5.3-Flash series checks the converter on real weights: layers 0 to 3 are read from the FP8 originals and from the partial CNQ container, and each layer output is compared. Zwei Wege, ein Ergebnis: Kosinus und maximale Abweichung pro Schicht.\ndef mean(xs):\n    return sum(xs) / len(xs)  # 4.5 bits per weight",
+ "tokenizer": "models/GLM-5.3-Flash-original/tokenizer.json (rev eb9eb208, sha256 19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d), tokenizers Tokenizer.encode(add_special_tokens=False)",
+ "n": 90,
+ "decode_rows": 4
+}
