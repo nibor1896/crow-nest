@@ -476,10 +476,95 @@ pub const GLM5_NEXT_DENSE_BYTES: u64 = 5_981_546_744;
 pub const GLM5_NEXT_EXPERT_BLOCKS: u64 = 12_096;
 /// the same dry run: one routed expert block (gate + up + down of one expert of one layer,
 /// NVFP4 at 36 B per 64 values, on a 4096-B boundary); [`Glm5Geo::expert_block_bytes`]
-/// derives the same number from the config
+/// derives the same number from the config. The CNQ4.5 (NVFP4) record only: it is no default
+/// for a container of another expert codec, whose record comes from its own index
+/// (`nvme_source::glm5_record_of_container`) or from `states --plan --expert-bytes`
 pub const GLM5_NEXT_EXPERT_BLOCK_BYTES: u64 = 14_155_776;
 /// bytes of one stored NVFP4 block of 64 values (CNQ4.5)
 pub const NVFP4_BLOCK_BYTES: usize = 36;
+
+// ---- #159 / #176 / #149: the glm5_next routed-expert record, a parameter of the container ----
+//
+// A glm5_next container writes each routed expert of each layer (gate, up, down) as one unit,
+// back to back, starting on a 4096-B file offset (the converter's `write_units`). How many bytes
+// that unit holds depends on the expert codec: 14,155,776 B at NVFP4 (CNQ4.5), 9,474,048 B in the
+// plan's 3.05-bpw MUL1-trellis figure (plan step 9; the codec's exact record is not known yet).
+// The planner (VRAM / pinned / NVMe capacities), the staging slots and the NVMe backend all take
+// the record from an [`ExpertRecordSpec`], never from the NVFP4 constant above.
+
+/// the alignment of every glm5_next routed-expert record: the converter's `EXPERT_ALIGN` and the
+/// NVMe tier's sector (`nvme_source::ALIGN`)
+pub const EXPERT_RECORD_ALIGN: u64 = 4096;
+
+/// the codec of a glm5_next routed-expert record, named by the expert tensors' index `dtype`
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExpertCodec {
+    /// CNQ4.5: 36 B per 64 values with ue4m3 scale bytes (dtype `nvfp4`)
+    Nvfp4,
+    /// the ~3-bit MUL1 trellis of plan step 9 (dtype `mul1`); no ue4m3 scale bytes
+    Mul1,
+}
+
+impl ExpertCodec {
+    pub const ALL: [ExpertCodec; 2] = [ExpertCodec::Nvfp4, ExpertCodec::Mul1];
+
+    /// the index `dtype` string of the codec's expert tensors
+    pub const fn dtype(&self) -> &'static str {
+        match self {
+            ExpertCodec::Nvfp4 => "nvfp4",
+            ExpertCodec::Mul1 => "mul1",
+        }
+    }
+
+    /// the codec an index `dtype` names; any other dtype is refused by name
+    pub fn from_dtype(dtype: &str) -> Result<ExpertCodec, String> {
+        ExpertCodec::ALL.into_iter().find(|c| c.dtype() == dtype).ok_or_else(|| {
+            format!(
+                "refusing expert codec {dtype:?}: the glm5_next expert record knows {} (#149)",
+                ExpertCodec::ALL.map(|c| c.dtype()).join(", ")
+            )
+        })
+    }
+
+    /// NVFP4 records carry ue4m3 scale bytes that `residency::sanitize_sf_slab` caps at 0x7E
+    /// before a record is published; a MUL1 record has none and is delivered as stored
+    pub const fn sanitizes_scales(&self) -> bool {
+        matches!(self, ExpertCodec::Nvfp4)
+    }
+}
+
+/// The refusal of a routed-expert record size: 0 B, or not a multiple of
+/// [`EXPERT_RECORD_ALIGN`]. `None` = accepted.
+pub fn expert_record_refusal(bytes: u64) -> Option<String> {
+    if bytes == 0 {
+        return Some("refusing expert record of 0 B (#159)".to_string());
+    }
+    if !bytes.is_multiple_of(EXPERT_RECORD_ALIGN) {
+        return Some(format!(
+            "refusing expert record of {bytes} B: not a multiple of {EXPERT_RECORD_ALIGN} B (glm5_next records are {EXPERT_RECORD_ALIGN}-B aligned units for the unbuffered NVMe read, #149; {} B over the last boundary)",
+            bytes % EXPERT_RECORD_ALIGN
+        ));
+    }
+    None
+}
+
+/// one routed expert of one MoE layer as the container stores it: its codec and its record
+/// bytes (gate + up + down, one 4096-B aligned unit)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExpertRecordSpec {
+    pub codec: ExpertCodec,
+    pub bytes: u64,
+}
+
+impl ExpertRecordSpec {
+    /// a record of `bytes` in `codec`; refused by name when [`expert_record_refusal`] says so
+    pub fn new(codec: ExpertCodec, bytes: u64) -> Result<ExpertRecordSpec, String> {
+        match expert_record_refusal(bytes) {
+            Some(why) => Err(why),
+            None => Ok(ExpertRecordSpec { codec, bytes }),
+        }
+    }
+}
 
 /// #159: the geometry of a glm5_next checkpoint, derived from its config by
 /// `meta::ModelMeta::glm5_geo` and asserted equal to [`Glm5Geo::GLM_5_3_FLASH`]. Its own struct
@@ -596,7 +681,8 @@ impl Glm5Geo {
         3 * self.expert_inter * self.hidden
     }
     /// bytes of one routed expert block of one layer at NVFP4 (36 B per 64 values), rounded up
-    /// to the container's 4096-B boundary
+    /// to the container's 4096-B boundary. NVFP4 only: a container's own record (any codec) is
+    /// an [`ExpertRecordSpec`]; for an NVFP4 container the two must agree
     pub const fn expert_block_bytes(&self) -> u64 {
         ((self.expert_values() / 64 * NVFP4_BLOCK_BYTES) as u64).div_ceil(4096) * 4096
     }
@@ -689,6 +775,15 @@ impl StageSlots {
     /// the slots the decode staging buffers hold (`Stage::max`)
     pub fn held(&self) -> usize {
         if self.shared { self.decode.max(self.prefill) } else { self.decode }
+    }
+    /// every slot the model holds: one shared set, or the decode and the prefill set apart (#176)
+    pub fn total(&self) -> usize {
+        if self.shared { self.held() } else { self.decode + self.prefill }
+    }
+    /// the staging bytes for expert records of `record_bytes`: [`StageSlots::total`] slots of
+    /// one record each, so they scale with the container's record (#159)
+    pub fn bytes(&self, record_bytes: u64) -> u64 {
+        self.total() as u64 * record_bytes
     }
 }
 
@@ -1631,5 +1726,54 @@ mod tests_159 {
         assert_eq!(crate::expert_cache::policy_for(&format!("{f:?}"), None, false), Ok(Some(crate::expert_cache::Policy::Lru)));
         assert_eq!(Family::ALL, [Family::FlashNext, Family::Qwen35Dense]);
         assert_eq!(Family::KNOWN, [Family::FlashNext, Family::Qwen35Dense, Family::Glm5Next]);
+    }
+}
+
+#[cfg(test)]
+mod tests_rec_size {
+    //! #159 / #176 / #149: the glm5_next routed-expert record is a parameter (codec + bytes),
+    //! refused by name when it is not a whole number of 4096-B sectors.
+    use super::*;
+
+    /// the plan's 3.05-bpw MUL1 figure (2313 x 4096; `docs/nvme-read-rate.md`, `docs/glm-tier-simulation.md`)
+    const MUL1_PLAN: u64 = 9_474_048;
+
+    #[test]
+    fn a_record_that_is_not_a_whole_number_of_sectors_is_refused_by_name() {
+        assert_eq!(ExpertRecordSpec::new(ExpertCodec::Nvfp4, GLM5_NEXT_EXPERT_BLOCK_BYTES), Ok(ExpertRecordSpec { codec: ExpertCodec::Nvfp4, bytes: 14_155_776 }));
+        assert_eq!(ExpertRecordSpec::new(ExpertCodec::Mul1, MUL1_PLAN).map(|r| r.bytes), Ok(MUL1_PLAN));
+        let why = ExpertRecordSpec::new(ExpertCodec::Mul1, MUL1_PLAN - 48).unwrap_err();
+        assert!(why.starts_with("refusing expert record of 9474000 B: not a multiple of 4096 B"), "{why}");
+        let why = ExpertRecordSpec::new(ExpertCodec::Mul1, 0).unwrap_err();
+        assert!(why.contains("0 B"), "{why}");
+        assert_eq!(expert_record_refusal(4096), None);
+        assert!(expert_record_refusal(4095).is_some());
+    }
+
+    #[test]
+    fn the_expert_codec_comes_from_the_index_dtype_and_only_nvfp4_is_sanitized() {
+        assert_eq!(ExpertCodec::from_dtype("nvfp4"), Ok(ExpertCodec::Nvfp4));
+        assert_eq!(ExpertCodec::from_dtype("mul1"), Ok(ExpertCodec::Mul1));
+        for bad in ["bf16", "q3k", "MUL1", ""] {
+            let why = ExpertCodec::from_dtype(bad).unwrap_err();
+            assert!(why.starts_with(&format!("refusing expert codec {bad:?}")) && why.contains("nvfp4, mul1"), "{why}");
+        }
+        assert!(ExpertCodec::Nvfp4.sanitizes_scales());
+        assert!(!ExpertCodec::Mul1.sanitizes_scales());
+    }
+
+    /// #176: the glm5_next staging (32 decode + 128 prefill slots, apart) scales with the record:
+    /// 14,155,776 B gives today's 2,264,924,160 B, 9,474,048 B gives 1,515,847,680 B
+    #[test]
+    fn glm_staging_bytes_scale_with_the_record() {
+        let st = Stability::of(Family::Glm5Next).stage_slots(8, 64, true);
+        assert_eq!((st.total(), st.held()), (160, 32));
+        assert_eq!(st.bytes(GLM5_NEXT_EXPERT_BLOCK_BYTES), 2_264_924_160);
+        assert_eq!(st.bytes(MUL1_PLAN), 1_515_847_680);
+        assert_eq!(st.held() as u64 * MUL1_PLAN, 303_169_536, "the decode set at 9,474,048 B");
+        // the shared set of record: total == held, bytes == held x record
+        let rec = Stability::OF_RECORD.stage_slots(10, 64, true);
+        assert_eq!(rec.total(), rec.held());
+        assert_eq!(rec.bytes(7), 7 * rec.held() as u64);
     }
 }

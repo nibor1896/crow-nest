@@ -25,7 +25,7 @@ Near the card limit the Windows driver moves allocations to system memory withou
 | VRAM kept free on top of the reserves | 0 | 2 GiB (`GLM5_NEXT_VRAM_HEADROOM`) |
 | VRAM cap | the card | 31.9 GiB = 34,252,364,185 B (`GLM5_NEXT_VRAM_CAP`, G4 of `runs/glm53-flash/PREREG.md`) |
 | plan ceiling on a 32,607 MiB card | 34,190,917,632 B | 32,043,433,984 B |
-| cold staging | one set: max(2 x topk, PF_TG x (1 + async)) = 128 slots | decode 4 x 8 = 32 slots = 452,984,832 B, prefill 128 slots apart |
+| cold staging | one set: max(2 x topk, PF_TG x (1 + async)) = 128 slots | decode 4 x 8 = 32 slots, prefill 128 slots apart; one expert record per slot (`StageSlots::bytes`): 160 x 14,155,776 = 2,264,924,160 B at NVFP4, 160 x 9,474,048 = 1,515,847,680 B at the plan's 3.05-bpw MUL1 record (decode set 452,984,832 / 303,169,536 B) |
 
 - `Stability::of(Family)` gives `OF_RECORD` for Flash-Next and the 27B and `GLM5_NEXT` for `Family::Glm5Next`
   (#159); `Stability::for_model_type("glm5_next_text")` gives the same. `manager::planner_pending_for` adds
@@ -34,6 +34,8 @@ Near the card limit the Windows driver moves allocations to system memory withou
 - `gen.rs` sizes `Stage::max` through `stage_slots(..).held()`; for `OF_RECORD` that is the old expression bit
   for bit. A policy with decode slots apart is refused there until the GLM arm allocates the prefill set.
 - On GLM the shared formula would hold 128 x 14,155,776 B = 1.8 GB of staging through every decode step.
+- The slot bytes are the container's routed-expert record (`geo::ExpertRecordSpec`, from the container index or
+  `states --plan --expert-bytes`), never the NVFP4 constant: a 3-bit container stages 9,474,048-B slots (#159).
 
 ## The converter cap (`converter/src/recipe.rs`, `Family::scale_byte_max`)
 

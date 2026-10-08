@@ -382,8 +382,18 @@ units, about 12 hot experts per layer), and the post-plan check below requires
 > `FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED` with one I/O completion port per reader, every read of a
 > fetch issued before the first completion is drained; on Linux `O_DIRECT` + `pread`. Offsets, lengths and
 > destinations must be multiples of 4096 B and are refused by name otherwise (no rounding out: an expert
-> slab at the format's default 12 mod 4096 is refused). `residency::sanitize_sf_slab` runs on both slabs in
-> the destination before `wait` returns. Reader count (default 1, PREREG amendment 5) and per-reader CPU
+> slab at the format's default 12 mod 4096 is refused). `residency::sanitize_sf_slab` runs on both slabs of
+> an NVFP4 record in the destination before `wait` returns.
+>
+> **The glm5_next record is the container's (#159/#176/#149, 2026-10-08).** A glm5_next container stores
+> each routed expert of each layer as one unit (gate, up, down back to back on a 4096-B offset).
+> `nvme_source::glm5_record_of_container` reads only the index trailer: the codec is the expert tensors'
+> `dtype` (`nvfp4` or `mul1`; a mix or another dtype is refused by name), the record is the units' extent
+> in the index offsets (for NVFP4 also checked against the format's byte rule), every record the same size
+> and a whole number of 4096-B sectors, else refused by name. `ExpertRecord::locate_glm5` reads such a
+> record as one span; a MUL1 record is delivered as stored (no ue4m3 scales, no sanitize). Unit tests
+> read a 9,474,048-B MUL1 record and a 14,155,776-B NVFP4 record from synthetic containers, byte-identical
+> to `Cnq::read_range` (+ sanitize for NVFP4). Reader count (default 1, PREREG amendment 5) and per-reader CPU
 > affinity are `NvmeConfig` fields. Boot refuses `CROW_COLD_TIER` together with `CROW_NVME_TIER`. The RAM
 > tier is not behind the trait yet, no decode path calls the backend, and IoRing is not built. The
 > in-graph hand-off it needs is probe `p9_job_ring` stage C (`cuStreamWaitValue64_v2` captured as a
@@ -4791,7 +4801,13 @@ their kernels (steps 13a-13e). `states --plan` prints the family's three-tier pl
 (`manager::plan_glm5_next`: VRAM holds the dense part, the latent and indexer caches at the boot
 context, the KDA state, the 32 + 128 staging slots of `Stability::GLM5_NEXT` and the reserves, then N
 experts per MoE layer under the 2 GiB headroom; pinned RAM P under `HOST_PINNED_CAP`; NVMe the rest).
-On the RTX 5090 at 200,000 tokens: N 32, P 83, NVMe 173 of 288, planner numbers, not measured.
+The routed-expert record is a parameter (`geo::ExpertRecordSpec`: codec + bytes, refused by name unless a
+whole number of 4096-B sectors): `states --plan --cnq <container>` takes it from the container index,
+`states --plan --expert-bytes N [--expert-codec nvfp4|mul1]` plans without a container; one of the two is
+required, there is no default. The staging slots and the unit (42 x record) scale with it.
+On the RTX 5090 at 200,000 tokens: N 32, P 83, NVMe 173 of 288 at the 14,155,776-B NVFP4 record; N 51,
+P 124, NVMe 113 at the plan's 9,474,048-B 3.05-bpw MUL1 record (unit 397,910,016 B, staging
+1,515,847,680 B). Planner numbers, not measured.
 
 **`geo::Geo`**, 35 fields, derived by `ModelMeta::geo`:
 

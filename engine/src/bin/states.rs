@@ -7,13 +7,16 @@
 //! State allocations are REAL; expert/dense sizes come from the container
 //! index (the decode binary does the full measured load).
 //!
-//! #159: `states --plan [--vram-mib N]` is the dry plan of a glm5_next checkpoint: it reads
-//! the checkpoint's config.json + generation_config.json (`CROW_MODEL_DIR`, else
-//! `models/GLM-5.3-Flash-original`), runs them through the metadata gate's glm5_next arm and
-//! prints the three-tier plan (`manager::glm5_plan_table`). No CUDA context, no container
-//! mapping, no allocation: the card is `--vram-mib` (default the RTX 5090's 32,607 MiB), the
-//! pinned budget `CROW_PINNED_BUDGET_GB` or `HOST_PINNED_CAP`, the context `CROW_CONTEXT` or
-//! the family floor, the dense part and the expert block the converter dry run's.
+//! #159: `states --plan (--cnq PATH | --expert-bytes N [--expert-codec nvfp4|mul1]) [--vram-mib N]`
+//! is the dry plan of a glm5_next checkpoint: it reads the checkpoint's config.json +
+//! generation_config.json (`CROW_MODEL_DIR`, else `models/GLM-5.3-Flash-original`), runs them
+//! through the metadata gate's glm5_next arm and prints the three-tier plan
+//! (`manager::glm5_plan_table`). No CUDA context, no container mapping, no allocation: the card
+//! is `--vram-mib` (default the RTX 5090's 32,607 MiB), the pinned budget
+//! `CROW_PINNED_BUDGET_GB` or `HOST_PINNED_CAP`, the context `CROW_CONTEXT` or the family floor,
+//! the dense part the converter dry run's. The routed-expert record (codec + bytes) is the
+//! container's (`--cnq`: only its index trailer is read) or the explicit `--expert-bytes`; one of
+//! the two is required, there is no default (`manager::glm5_plan_record`).
 
 use crow_nest_engine::cuda;
 use crow_nest_engine::cnq::Cnq;
@@ -52,7 +55,7 @@ const CARD_MIB_OF_RECORD: u64 = 32_607;
 
 /// #159: the dry glm5_next plan; exits 1 with the refusal on any gate or planner refusal
 fn plan_only(args: &[String]) {
-    use crow_nest_engine::manager::{glm5_plan_table, plan_glm5_next};
+    use crow_nest_engine::manager::{glm5_plan_record, glm5_plan_table, plan_glm5_next};
     use crow_nest_engine::meta::ModelMeta;
     let fail = |why: String| -> ! {
         eprintln!("states --plan: {why}");
@@ -62,6 +65,10 @@ fn plan_only(args: &[String]) {
         Some(i) => args.get(i + 1).and_then(|v| v.parse::<u64>().ok()).unwrap_or_else(|| fail("--vram-mib needs a whole number of MiB".into())),
         None => CARD_MIB_OF_RECORD,
     };
+    let flag = |name: &str| -> Option<&str> {
+        args.iter().position(|a| a == name).map(|i| args.get(i + 1).map(String::as_str).unwrap_or_else(|| fail(format!("{name} needs a value"))))
+    };
+    let (cnq, expert_bytes, expert_codec) = (flag("--cnq"), flag("--expert-bytes"), flag("--expert-codec"));
     let dir = std::env::var("CROW_MODEL_DIR").unwrap_or_else(|_| from_engine_dir("models/GLM-5.3-Flash-original"));
     let config = format!("{dir}/config.json");
     let generation = format!("{dir}/generation_config.json");
@@ -77,6 +84,7 @@ fn plan_only(args: &[String]) {
 ")));
     }
     let g = meta.glm5_geo().unwrap_or_else(|why| fail(why));
+    let record = glm5_plan_record(&g, cnq, expert_bytes, expert_codec).unwrap_or_else(|why| fail(why));
     let context = crow_nest_engine::boot::context_from_env(std::env::var("CROW_CONTEXT").ok().as_deref(), g.context_floor, g.context_max)
         .unwrap_or_else(|why| fail(why));
     let (pinned, pinned_src) = match env_parse::<u64>("CROW_PINNED_BUDGET_GB") {
@@ -84,14 +92,15 @@ fn plan_only(args: &[String]) {
         None => (HOST_PINNED_CAP, "HOST_PINNED_CAP; the boot takes min(cap, free RAM - CROW_RAM_MARGIN_GB 1 GiB), free RAM not read here".to_string()),
     };
     let (states, input, plan) = plan_glm5_next(
-        &g, context, vram_mib << 20, pinned, GLM5_NEXT_DENSE_BYTES, GLM5_NEXT_EXPERT_BLOCK_BYTES,
+        &g, context, vram_mib << 20, pinned, GLM5_NEXT_DENSE_BYTES, record.bytes,
         crow_nest_engine::gen::pf_tg(), crow_nest_engine::gen::pf_async_on(),
     )
     .unwrap_or_else(|why| fail(why));
-    println!("states --plan: {config} ({} constants verified against {GLM5_NEXT_SOURCE}); no CUDA, no container read", meta.checks().len());
+    let read = if cnq.is_some() { "container index trailer read, no weight" } else { "no container read" };
+    println!("states --plan: {config} ({} constants verified against {GLM5_NEXT_SOURCE}); no CUDA, {read}", meta.checks().len());
     let sources = [
         ("dense", "converter dry run, GLM measurement book".to_string()),
-        ("expert", format!("converter dry run; config derives {} B", g.expert_block_bytes())),
+        ("expert", format!("{}; config derives {} B at nvfp4", record.source, g.expert_block_bytes())),
         ("vram", if vram_mib == CARD_MIB_OF_RECORD { "RTX 5090 of record, docs/system-landscape.md:12; not free VRAM".to_string() } else { "--vram-mib".to_string() }),
         ("pinned", pinned_src),
     ];
