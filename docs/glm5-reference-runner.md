@@ -69,6 +69,13 @@ shows what each choice changes. Threads: `ORACLE_THREADS` (default 16).
 .venv-oracle/Scripts/python.exe -I tools/test_glm_route_passes.py
 ```
 
+- **Why `.venv-oracle`.** The runner imports `transformers.models.glm5_next` and subclasses
+  `transformers.cache_utils.DynamicIndexedLayer` for its in-place DSA slot (`glm5_layerwise.py:58-59`,
+  `:101`). Both are in the venv's transformers 5.16.1, the oracle of record. The system Python's
+  transformers (5.5.4 on the owner's machine, 2026-10-08) has neither. Under the system Python the
+  runner and everything that imports it fail at import: `tools/test_glm_route_passes.py` runs 8 tests
+  with 1 error (`ImportError: cannot import name 'DynamicIndexedLayer'`), against 10 OK in the venv.
+
 - `--ids`: a JSON list of token ids. The last `--decode D` of them are decode rows: teacher-forced,
   one call each, against the cache the prompt left. Rows `0..T-1` are the prompt.
 - `--layers A:B` runs layers `A..B-1`. For `A > 0` the input is `l<A-1>-output.*` in `--out`, and the
