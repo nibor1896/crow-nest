@@ -38,6 +38,7 @@
 - **glm5_next stability policy** (#176, 2026-10-08): `geo::Stability` keeps 2 GiB VRAM free under a 31.9 GiB cap and sizes decode staging at 32 slots (453 MB) apart from the 128-slot prefill set (1.8 GB). Not wired into a planner until #159; Flash-Next and the 27B are unchanged (tested). Not measured. `docs/glm-stability.md`.
 - **glm5_next containers stop scale bytes at 0x7E** (#177, 2026-10-08): the converter caps every NVFP4 sub-block scale below the E4M3 NaN code before choosing the codes. Flash-Next and 27B conversions are byte-identical (tested).
 - **glm5_next at the metadata gate and in the planner** (#159, 2026-10-08): a GLM-5.3-Flash config (`glm5_next_text`) parses through its own key ledger into `Glm5Geo` (38 checks against zai-org/GLM-5.3-Flash @ eb9eb208); the boot refuses it by name at its first unbuilt arm (mHC residual, step 13a). `states --plan` prints its three-tier plan without CUDA: RTX 5090, 200,000 tokens, 46 GiB pinned cap -> 32 experts per MoE layer in VRAM, 83 pinned, 173 on NVMe (planner numbers, not measured; step-3 G1d capacities pending). Flash-Next and the 27B plan exactly as before.
+- **MUL1 trellis expert codec** (#181, 2026-10-09): `converter/src/mul1.rs` stores exllamav3 1.6.0's mul1 quantizer output as one 4096-aligned record per routed expert and decodes it byte-identical to exllamav3's CUDA decode (21 matrices incl. GLM's [4096,2048] and [2048,4096]). One GLM-5.3-Flash expert at K=3 is 9,474,048 B (3 × 3,145,728 B trellis + 36,864 B suh/svh). Not wired into the conversion yet (step 12).
 
 ### Changed
 
