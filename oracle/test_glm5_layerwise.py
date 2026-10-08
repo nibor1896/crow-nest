@@ -7,7 +7,11 @@ Run: .venv-oracle/Scripts/python.exe -I -m unittest discover -s oracle -p "test_
 - the proof can go red: a collapsed mHC hand-over and decode rows without the layer cache both fail it;
 - FP8 unpack == HF's Fp8Dequantize on whole blocks and one-block partial tensors;
 - the CLI: --weights fp8-originals with a layer split (0:3 then 3:8) writes the same files as one run;
-  --state-dtype bf16; --weights container exits 2 with a clear error.
+  --state-dtype bf16; --weights container exits 2 with a clear error;
+- crow-nest #147: the prompt in calls of C rows routes as one call (vs HF and vs the one-call run;
+  differing DSA rows only at recorded exact ties); a DSA cache slot that drops its history fails that
+  proof; the DSA slot is allocated once (HF's DynamicIndexedLayer grows per call); --delete-states-behind
+  keeps the routing and resumes; --layers L: computes only the logits.
 """
 import io
 import json
@@ -75,6 +79,115 @@ class Proof(unittest.TestCase):
         rows = tables[32]
         self.assertEqual(rows[0]["max_abs_prompt"], 0.0)  # the prompt rows need no cache
         self.assertGreater(rows[0]["max_abs_decode"], 1e-3)
+
+
+class Chunked(unittest.TestCase):
+    """crow-nest #147: the prompt in calls of C rows against the layer cache routes every row as one call does"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.wd = tempfile.mkdtemp(prefix="glm5-chunk-")
+        cls.ck = os.path.join(cls.wd, "fp8")
+        _silent(LW.make_synthetic, "small", cls.ck)
+        cls.tc = G.text_config(cls.ck)
+        cls.ws = G.WeightSource("fp8", cls.ck)
+        g = torch.Generator().manual_seed(7)
+        cls.ids = torch.randint(1, 1000, (150,), generator=g).tolist()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.wd, ignore_errors=True)
+
+    def _run(self, name, chunk, **kw):
+        out = os.path.join(self.wd, name)
+        man = LW.run_layerwise(self.ws, self.tc, self.ids, 2, out, anchors=[147, 148, 149], log=quiet,
+                               prompt_chunk=chunk, **kw)
+        return out, man
+
+    def test_chunked_prompt_matches_hf_and_the_one_call_run(self):
+        ok, tables = _silent(LW.selftest, "small", prompt_chunk=40, log=quiet)
+        self.assertTrue(ok, tables)
+        for k in (32, 2048):
+            for label in (f"{k} chunked vs HF", f"{k} chunked vs unchunked"):
+                layers = [r for r in tables[label] if r["layer"] != "logits"]
+                self.assertEqual(len(layers), 8)
+                for r in layers:
+                    self.assertLessEqual(r["max_abs_prompt"], LW.TOL, (label, r))
+                    self.assertEqual(r.get("route_ids_mismatch_tokens", 0), 0, (label, r))
+                    self.assertEqual(r.get("dsa_topk_mismatch_rows", 0), 0, (label, r))
+
+    def test_every_chunk_size_routes_as_one_call(self):
+        """1 (every prompt row its own call), 7 (KDA's 64-row blocks cut mid-block), 40, 64 (aligned), 100.
+        Up to the first DSA layer where a selected set differs, every layer is within TOL with identical
+        routing ids; the rows where the set differs are rows whose selection boundary is an exact tie
+        (torch.topk's tie order depends on the call shape; the small config's 4 indexer heads with ReLU
+        give all-zero pool scores). Measured 2026-10-08: 40 and 100 identical everywhere; 1, 7, 64 differ
+        on one row of layer 7, a recorded tie (scores 0.0 = 0.0 at the boundary)."""
+        one, m1 = self._run("one", 0)
+        ref = LW.ref_from_run(one, m1, self.tc)
+        identical = []
+        for c in (1, 7, 40, 64, 100):
+            out, man = self._run(f"c{c}", c)
+            self.assertEqual(len(man["per_layer"][0]["prompt_call_s"]), math.ceil(148 / c))
+            rows, ok = LW.compare(ref, out, man, self.tc, 148, raw_layout=False)
+            if ok:
+                identical.append(c)
+                continue
+            flip = next(r["layer"] for r in rows if r.get("dsa_topk_mismatch_rows", 0) != 0)
+            for r in rows[:flip]:
+                self.assertTrue(r["ok"], (c, r))
+            self.assertEqual(rows[flip].get("route_ids_mismatch_tokens", 0), 0, c)
+            a = LW.canon_topk(LW.load_file(one, m1, f"l{flip}-dsa-topk.i32"))
+            b = LW.canon_topk(LW.load_file(out, man, f"l{flip}-dsa-topk.i32"))
+            differ = set((a != b).any(1).nonzero().flatten().tolist())
+            ties = set()
+            for m in (m1, man):
+                ties |= set(next(p for p in m["per_layer"] if p["layer"] == flip)["dsa_tie_rows"])
+            self.assertTrue(differ and differ <= ties, (c, flip, differ, ties))
+        self.assertIn(40, identical)
+        self.assertIn(100, identical)
+
+    def test_a_cache_that_drops_the_history_fails_the_chunk_proof(self):
+        def no_history(self, key_states, value_states, *a, **k):  # every call starts at row 0 again
+            self.n_kv = 0
+            return real(self, key_states, value_states, *a, **k)
+
+        real = LW._AppendIndexedLayer.update
+        with mock.patch.object(LW._AppendIndexedLayer, "update", no_history):
+            ok, tables = _silent(LW.selftest, "small", topks=(32,), prompt_chunk=40, log=quiet)
+        self.assertFalse(ok)
+        rows = tables["32 chunked vs unchunked"]
+        self.assertTrue(all(r["ok"] for r in rows[:3]))  # KDA layers 0-2 do not use the DSA slot
+        self.assertGreater(rows[3]["max_abs_prompt"], 1e-3)  # the first DSA layer loses rows 0..39
+
+    def _dsa_layer_calls(self, chunk):
+        """run DSA layer 3 alone with the prompt in calls of `chunk`; returns (y, the byte size of the
+        storage behind the K the cache hands back, per call)"""
+        from transformers.cache_utils import Cache
+        from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextDecoderLayer
+        layer = G.build_meta(Glm5NextTextDecoderLayer, self.tc, 3)
+        self.ws.load(layer, f"{G.LM}layers.3.")
+        x = torch.randn(150, 4, self.tc.hidden_size, generator=torch.Generator().manual_seed(3))
+        ptrs, real = [], Cache.update
+
+        def spy(cache, k, v, layer_idx, *a, **kw):
+            out = real(cache, k, v, layer_idx, *a, **kw)
+            ptrs.append(out[0].untyped_storage().nbytes())
+            return out
+
+        with mock.patch.object(Cache, "update", spy):
+            y, _, _ = LW.run_layer(layer, self.tc, 3, x, 148, chunk)
+        return y, ptrs
+
+    def test_the_dsa_cache_is_allocated_once(self):
+        y, sizes = self._dsa_layer_calls(16)
+        self.assertEqual(len(sizes), 10 + 2)  # 148 rows in calls of 16, then 2 decode rows
+        full = 150 * self.tc.num_attention_heads * (self.tc.qk_nope_head_dim + self.tc.qk_rope_head_dim) * 4
+        self.assertEqual(set(sizes), {full})  # one buffer of all 150 rows from the first call: no torch.cat
+        with mock.patch.object(LW, "append_in_place", lambda cache, tc, n: cache):  # HF's DynamicIndexedLayer
+            y_cat, sizes_cat = self._dsa_layer_calls(16)
+        self.assertEqual(len(set(sizes_cat)), 12)  # a new, longer K tensor per call
+        self.assertLessEqual(float((y - y_cat).abs().max()), LW.TOL)
 
 
 class Fp8(unittest.TestCase):
@@ -167,6 +280,51 @@ class Cli(unittest.TestCase):
         y32 = LW.load_file(f32, a, "l0-output.f32")
         y16 = LW.load_file(bf, b, "l0-output.bf16")
         self.assertTrue(torch.equal(y16, y32.to(torch.bfloat16).float()))  # same input, rounded output
+
+    def test_delete_states_behind_keeps_routing_and_resumes(self):
+        keep, dele = os.path.join(self.wd, "keep"), os.path.join(self.wd, "del")
+        self.assertEqual(self._run("--out", keep, "--prompt-chunk", "4"), 0)
+        self.assertEqual(self._run("--out", dele, "--prompt-chunk", "4", "--delete-states-behind",
+                                   "--layers", "0:3"), 0)
+        states = sorted(f for f in os.listdir(dele) if "-output." in f)
+        self.assertEqual(states, ["l2-output.f32"])  # the one a resume needs
+        self.assertEqual(self._run("--out", dele, "--prompt-chunk", "4", "--delete-states-behind",
+                                   "--layers", "3:"), 0)
+        self.assertEqual([f for f in os.listdir(dele) if "-output." in f], [])
+        with open(os.path.join(keep, "manifest.json")) as f:
+            a = json.load(f)
+        with open(os.path.join(dele, "manifest.json")) as f:
+            b = json.load(f)
+        self.assertEqual(b["deleted_states"], [f"l{k}-output.f32" for k in range(8)])
+        self.assertTrue(b["complete"] and b["delete_states_behind"])
+        self.assertEqual(b["prompt_chunk"], 4)
+        self.assertEqual(set(b["files"]), {n for n in a["files"] if "-output." not in n})
+        for n in b["files"]:
+            self.assertEqual(a["files"][n]["sha256"], b["files"][n]["sha256"], n)
+            self.assertTrue(os.path.exists(os.path.join(dele, n)), n)
+
+    def test_logits_only_resume(self):
+        # a pass that stopped after its last layer, before the logits: --layers 8: computes only them
+        full, cut = os.path.join(self.wd, "full"), os.path.join(self.wd, "cut")
+        self.assertEqual(self._run("--out", full), 0)
+        shutil.copytree(full, cut)
+        with open(os.path.join(cut, "manifest.json")) as f:
+            m = json.load(f)
+        for n in [n for n in m["files"] if n.startswith("logits-")]:
+            os.remove(os.path.join(cut, n))
+            del m["files"][n]
+        m["complete"] = False
+        with open(os.path.join(cut, "manifest.json"), "w") as f:
+            json.dump(m, f)
+        self.assertEqual(self._run("--out", cut, "--layers", "8:"), 0)
+        with open(os.path.join(full, "manifest.json")) as f:
+            a = json.load(f)
+        with open(os.path.join(cut, "manifest.json")) as f:
+            b = json.load(f)
+        self.assertTrue(b["complete"])
+        self.assertEqual(b["layers"], [0, 8])
+        self.assertEqual({n: v["sha256"] for n, v in a["files"].items()},
+                         {n: v["sha256"] for n, v in b["files"].items()})
 
     def test_a_missing_container_is_a_clear_error(self):
         # crow-nest #156: the stub this test pinned (#158) is replaced by the container back end
