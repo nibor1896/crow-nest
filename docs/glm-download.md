@@ -16,13 +16,15 @@ checkout (a worktree) pass `--dest C:/Users/robin/dev/crow-nest/models/GLM-5.3-F
 | `python -I tools/fetch-glm.py --small` | the 9 small files (28,715,382 B): `config.json`, `generation_config.json`, `model.safetensors.index.json`, `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `processor_config.json`, `README.md`, `LICENSE` |
 | `python -I tools/fetch-glm.py --headers` | the 62 shard headers by HTTP range → `headers/<shard>.json` (`{"shard", "size", "data_start", "header"}`) |
 | `python -I tools/fetch-glm.py --shards 1,31-32` | whole shards by number (1-based) or file name |
+| `python -I tools/fetch-glm.py --shards 1-62 --wait-for-space` | all 62 shards for the staged full conversion (#157): already verified shards and shards with a `.deleted` marker are skipped; a shard without room parks at the 20 GB reserve instead of stopping the run — see [glm-staged-conversion.md](glm-staged-conversion.md) |
 | `python -I tools/fetch-glm.py --for-layers 0-3 --with-embed-head` | the shards holding any tensor of those language-model layers, plus `embed_tokens`, `lm_head` and the final norm, resolved from the verified index |
 | `… --for-layers 0-3 --with-embed-head --plan` | print that shard set with sizes; fetch nothing |
-| `python -I tools/fetch-glm.py --status` | one line per file: bytes on disk / expected, verified yes/no; header cache count; no network |
+| `python -I tools/fetch-glm.py --status` | one line per file: bytes on disk / expected, verified yes/no, `(converted, deleted)`; header cache count; no network |
 
 Every action is logged with a timestamp to `models/GLM-5.3-Flash-original/fetch.log`; a run ends
 with one `run end:` line (bytes added, curl runs, range requests, curl-internal retries, outer
-restarts, hash mismatches) — the raw material for the measurement-book row.
+restarts, hash mismatches, space waits, low-space kills, shards skipped as deleted) — the raw
+material for the measurement-book row.
 
 ## Reference and verification
 
@@ -70,8 +72,20 @@ the change uses `--retry 0`.
 would leave less than 20 GB free is refused and the run stops (exit 4). One run per destination:
 `fetch.lock` with a heartbeat (stale after 120 s); `--status` works while a run holds it.
 
+**`--wait-for-space` (#157):** the shard is not refused; the run parks — polls the free space every
+30 s, keeps `fetch.lock` alive, writes one `WAIT <shard>: needs … B more, … B free would leave … GB
+< 20 GB -> parked` line per 10 minutes — and goes on with a `space back for <shard>` line once the
+rest of the file fits above 20 GB. While a curl runs in this mode, the free space is also checked
+every 10 s: below 20 GB curl is killed (`LOW SPACE <shard>: …`), the `.part` stays, and the shard
+parks and later resumes with `-C -`. The floor binds the downloader's own bytes; the converter's
+writes can take the volume below it (see [glm-staged-conversion.md](glm-staged-conversion.md), disk).
+
+**`<shard>.deleted`:** written by `tools/glm-stage.py` before it deletes a converted shard. A
+`--shards`/`--for-layers` run skips such a shard (`skip <shard>: converted and deleted`) and never
+fetches it again; to fetch it anyway, remove its `.deleted`, `.done` and `.verified` markers.
+
 Exit codes: 0 ok, 3 a file failed (permanent HTTP error, 3 mismatches, header sum off), 4 refused
-for disk space, 130 interrupted.
+for disk space (never with `--wait-for-space`), 130 interrupted.
 
 ## Step 6 shard set (#156)
 
@@ -92,4 +106,6 @@ for disk space, 130 interrupted.
 
 `python -I tools/test_fetch_glm.py` — the pure parts (incl. no rewinding curl retry on whole files) and the
 outer loop against a fake curl (resume to the exact size, mismatch deleted and refetched, 3 mismatches stop, overlong deleted,
-permanent HTTP error stops, 20 GB floor refuses, an unmarked file is rehashed). No network.
+permanent HTTP error stops, 20 GB floor refuses, an unmarked file is rehashed); `--wait-for-space` parks
+instead of refusing, a curl process is killed below the floor and the shard resumes from its bytes, a
+shard with `.deleted` is never fetched again (#157). No network. 2026-10-08: 37 tests, OK.

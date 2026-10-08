@@ -8,7 +8,9 @@ parsing, resume decision, disk verdict, lock staleness, curl argv) are tested di
 outer download loop is tested against a fake curl that writes bytes into the `.part` file the
 way a dropping connection does - what has to hold is the contract: resume until the byte count
 equals the API size, never keep a file whose hash differs, delete an overlong file, refuse a
-shard that would leave less than 20 GB, stop on a permanent HTTP error.
+shard that would leave less than 20 GB, stop on a permanent HTTP error; with `--wait-for-space`
+park instead of refusing, kill a transfer below the floor and resume it, never fetch a shard
+with a `.deleted` marker (#157).
 
 The module is loaded by path because the tool's file name carries a hyphen.
 """
@@ -331,6 +333,113 @@ class OuterLoop(unittest.TestCase):
         self.assertTrue(self.run_with(wrapped))
         self.assertEqual(self.ctx["stats"].mismatches, 1)
         self.assertEqual((self.dest / "f.safetensors").read_bytes(), self.payload)
+
+
+class WaitForSpace(unittest.TestCase):
+    """#157: the full download runs ahead of the conversion and parks at the 20 GB reserve."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dest = Path(self.tmp.name)
+        self.logs = []
+        self.ctx = {"log": self.logs.append, "lock": mock.Mock(), "stats": fg.Stats(), "curl": "curl",
+                    "disk_check": True, "wait_space": True}
+        self.payload = bytes(range(256)) * 40
+        self.meta = {"size": len(self.payload), "blob": None,
+                     "sha256": hashlib.sha256(self.payload).hexdigest()}
+        self.sleeps = []
+        p = mock.patch.object(fg.time, "sleep", self.sleeps.append)
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def free_seq(self, *values):
+        """disk_usage answering `values` in turn, then the last one forever."""
+        it = iter(values)
+        last = {"v": values[-1]}
+
+        def usage(_):
+            last["v"] = next(it, last["v"])
+            return mock.Mock(free=last["v"])
+        return mock.patch.object(fg.shutil, "disk_usage", usage)
+
+    def test_a_shard_without_room_parks_until_the_space_is_back(self):
+        low = fg.MIN_FREE_AFTER + len(self.payload) - 1
+        high = fg.MIN_FREE_AFTER + len(self.payload)
+        fake = FakeCurl(self.payload, step=len(self.payload))
+        seen = {}
+
+        def curl(*a, **k):
+            seen.update(k)
+            return fake(*a[:6])
+        with self.free_seq(low, low, low, high), mock.patch.object(fg, "run_curl", curl):
+            self.assertTrue(fg.fetch_file("f.safetensors", self.meta, self.dest, self.ctx))
+        self.assertEqual(fake.calls, 1)
+        self.assertNotIn("refused", self.ctx)
+        self.assertEqual(self.ctx["stats"].space_waits, 1)
+        self.assertEqual(self.sleeps, [fg.SPACE_POLL_SEC] * 3)
+        self.assertEqual(self.ctx["lock"].beat.call_count, 3)
+        self.assertEqual(sum(l.startswith("WAIT f.safetensors") for l in self.logs), 1)
+        self.assertTrue(any(l.startswith("space back for f.safetensors") for l in self.logs))
+        self.assertEqual(seen.get("floor"), fg.MIN_FREE_AFTER)   # the transfer itself is watched too
+        self.assertTrue(fg.is_verified(self.dest / "f.safetensors", self.meta))
+
+    def test_without_the_flag_the_shard_is_still_refused(self):
+        self.ctx["wait_space"] = False
+        fake = FakeCurl(self.payload, step=len(self.payload))
+        with self.free_seq(fg.MIN_FREE_AFTER), mock.patch.object(fg, "run_curl", fake):
+            self.assertFalse(fg.fetch_file("f.safetensors", self.meta, self.dest, self.ctx))
+        self.assertEqual(fake.calls, 0)
+        self.assertTrue(self.ctx["refused"])
+
+    def test_a_low_space_kill_parks_and_resumes_from_the_bytes_on_disk(self):
+        half = len(self.payload) // 2
+        calls = []
+
+        def curl(argv, watch, log, lock, label, expected=None, floor=None):
+            calls.append(watch.stat().st_size if watch.exists() else 0)
+            have = calls[-1]
+            if len(calls) == 1:   # half the file, then the floor is crossed
+                with open(watch, "ab") as f:
+                    f.write(self.payload[:half])
+                return fg.LOW_SPACE_RC, {"http": 200, "retries": 0, "bytes": half, "exit": 0}, ""
+            with open(watch, "ab") as f:
+                f.write(self.payload[have:])
+            return 0, {"http": 206, "retries": 0, "bytes": len(self.payload) - have, "exit": 0}, ""
+        high = fg.MIN_FREE_AFTER + len(self.payload)
+        with self.free_seq(high, fg.MIN_FREE_AFTER, high), mock.patch.object(fg, "run_curl", curl):
+            self.assertTrue(fg.fetch_file("f.safetensors", self.meta, self.dest, self.ctx))
+        self.assertEqual(calls, [0, half])          # resumed, not restarted from zero
+        self.assertEqual(self.ctx["stats"].space_parks, 1)
+        self.assertEqual(self.ctx["stats"].space_waits, 1)
+        self.assertEqual(self.ctx["stats"].restarts, 0)
+        self.assertEqual((self.dest / "f.safetensors").read_bytes(), self.payload)
+
+    def test_run_curl_kills_a_transfer_when_the_free_space_falls_below_the_floor(self):
+        import sys
+        import time as _time
+        watch = self.dest / "x.part"
+        argv = [sys.executable, "-I", "-c", "import time; time.sleep(60)"]
+        with mock.patch.object(fg, "POLL_SEC", 0.1), mock.patch.object(fg, "STALL_SEC", 5), \
+                mock.patch.object(fg.shutil, "disk_usage", return_value=mock.Mock(free=fg.MIN_FREE_AFTER - 1)):
+            t0 = _time.monotonic()
+            rc, wo, _ = fg.run_curl(argv, watch, self.logs.append, mock.Mock(), "x", floor=fg.MIN_FREE_AFTER)
+            secs = _time.monotonic() - t0
+        self.assertEqual(rc, fg.LOW_SPACE_RC)
+        self.assertLess(secs, 4)
+        self.assertTrue(any(l.startswith("LOW SPACE x") for l in self.logs))
+
+    def test_a_shard_converted_and_deleted_is_never_fetched_again(self):
+        name = "model-00001-of-00062.safetensors"
+        fg.deleted_marker_of(self.dest / name).write_text("{}", encoding="utf-8")
+        fake = FakeCurl(self.payload, step=len(self.payload))
+        with mock.patch.object(fg, "run_curl", lambda *a, **k: fake(*a[:6])):
+            rc = fg.mode_shards(self.dest, {name: self.meta}, [name], self.ctx)
+        self.assertEqual(rc, 0)
+        self.assertEqual(fake.calls, 0)
+        self.assertFalse((self.dest / name).exists())
+        self.assertEqual(self.ctx["stats"].skipped_deleted, 1)
+        self.assertTrue(any(l.startswith(f"skip {name}: converted and deleted") for l in self.logs))
 
 
 if __name__ == "__main__":

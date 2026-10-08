@@ -4,6 +4,7 @@
   python -I tools/fetch-glm.py --small                          # the 9 small files (config, index, tokenizer, ...)
   python -I tools/fetch-glm.py --headers                        # 62 shard headers by HTTP range -> headers/
   python -I tools/fetch-glm.py --shards 1,2,61-62               # whole shards (numbers or file names)
+  python -I tools/fetch-glm.py --shards 1-62 --wait-for-space   # all shards; park at the 20 GB reserve (#157)
   python -I tools/fetch-glm.py --for-layers 0-3 --with-embed-head          # shards that hold those tensors
   python -I tools/fetch-glm.py --for-layers 0-3 --with-embed-head --plan   # only print that shard set
   python -I tools/fetch-glm.py --status                         # one line per file, no network
@@ -27,7 +28,12 @@ goes through two retry layers:
      curl whose file has not grown for `STALL_SEC`. Small range requests (headers, API) keep
      curl's `--retry 20 --retry-all-errors`, where a rewind costs at most 256 KiB.
 Before each shard the free space is checked: a shard that would leave less than 20 GB free on
-the destination volume is refused and the run stops.
+the destination volume is refused and the run stops. With `--wait-for-space` (#157, the staged
+full conversion) the shard is not refused: the run waits, polling and logging, until the space is
+back (the delete-behind supervisor `tools/glm-stage.py` frees it shard by shard), and a curl run
+is killed and parked when the free space drops below 20 GB while it transfers. A shard with a
+`<shard>.deleted` marker (converted and deleted by `tools/glm-stage.py`) is skipped, never
+fetched again.
 
 Everything is logged with a timestamp to `models/GLM-5.3-Flash-original/fetch.log`.
 Standard library only; downloaded files are only read as data (run with `python -I`).
@@ -92,6 +98,9 @@ BACKOFF_START = 10
 BACKOFF_MAX = 300
 MAX_MISMATCHES = 3
 LOCK_TTL = 120                    # a lock whose heartbeat is older than this is stale
+SPACE_POLL_SEC = 30               # --wait-for-space: free-space poll while parked
+SPACE_LOG_SEC = 600               # --wait-for-space: one WAIT line per 10 minutes while parked
+LOW_SPACE_RC = -28                # run_curl: killed because the free space fell below the floor
 PERMANENT_HTTP = {401, 403, 404, 410}
 WRITE_OUT = "%{http_code} %{num_retries} %{size_download} %{exitcode}"
 
@@ -407,6 +416,9 @@ class Stats:
         self.mismatches = 0
         self.bytes_added = 0
         self.requests = 0
+        self.space_waits = 0
+        self.space_parks = 0
+        self.skipped_deleted = 0
 
 
 def file_chunks(path, chunk=8 << 20):
@@ -441,6 +453,12 @@ def marker_of(path):
     return Path(str(path) + ".verified")
 
 
+def deleted_marker_of(path):
+    """`<shard>.deleted`: written by tools/glm-stage.py after the converter's `.done` and the
+    journal check, before it deletes the shard. Such a shard is never fetched again."""
+    return Path(str(path) + ".deleted")
+
+
 def is_verified(path, meta):
     """Cheap check (no hashing): final file of the right size with a matching marker."""
     path = Path(path)
@@ -465,10 +483,12 @@ def which_curl(arg):
     return curl
 
 
-def run_curl(argv, watch, log, lock, label, expected=None):
+def run_curl(argv, watch, log, lock, label, expected=None, floor=None):
     """Run one curl, watching `watch` grow. Returns (exit code, write-out dict, stderr tail).
 
     Logs progress every PROGRESS_SEC; kills curl when the file has not grown for STALL_SEC.
+    With `floor` (bytes; --wait-for-space) it also kills curl when the free space of the
+    destination volume falls below it, and returns LOW_SPACE_RC: the bytes stay, `-C -` resumes.
     """
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags)
@@ -476,6 +496,7 @@ def run_curl(argv, watch, log, lock, label, expected=None):
     size0 = last_size = prog_size = watch.stat().st_size if watch.exists() else 0
     out = err = b""
     killed = False
+    low_space = False
     try:
         while True:
             try:
@@ -493,6 +514,15 @@ def run_curl(argv, watch, log, lock, label, expected=None):
                 tot = f" / {fmt_bytes(expected)}" if expected else ""
                 log(f"progress {label}: {fmt_bytes(size)}{tot} B, {rate:.1f} MB/s over the last {now - last_prog:.0f} s")
                 last_prog, prog_size = now, size
+            if floor is not None:
+                free = shutil.disk_usage(watch.parent).free
+                if free < floor:
+                    log(f"LOW SPACE {label}: {fmt_bytes(free)} B free < {floor / GB:.0f} GB at {fmt_bytes(size)} B "
+                        f"-> kill curl pid {proc.pid}, park until the space is back")
+                    proc.kill()
+                    killed = low_space = True
+                    out, err = proc.communicate()
+                    break
             if now - last_grow >= STALL_SEC:
                 log(f"STALL {label}: no growth for {now - last_grow:.0f} s at {fmt_bytes(size)} B -> kill curl pid {proc.pid}")
                 proc.kill()
@@ -505,7 +535,7 @@ def run_curl(argv, watch, log, lock, label, expected=None):
             proc.communicate()
     wo = parse_write_out(out.decode("ascii", "replace"))
     tail = " | ".join(err.decode("utf-8", "replace").strip().splitlines()[-3:])
-    rc = proc.returncode if not killed else -9
+    rc = LOW_SPACE_RC if low_space else (proc.returncode if not killed else -9)
     size = watch.stat().st_size if watch.exists() else 0
     secs = time.monotonic() - t0
     log(f"curl {label}: exit {rc}, http {wo['http']}, curl-retries {wo['retries']}, "
@@ -559,25 +589,23 @@ def fetch_file(name, meta, dest, ctx, final=None):
             how = "lfs.sha256" if meta["sha256"] else "git blobId"
             log(f"VERIFIED {name}: {fmt_bytes(meta['size'])} B, sha256 {sha256} ({how} match, hashed in {time.monotonic() - t0:.0f} s)")
             return True
-        if ctx.get("disk_check"):
-            free = shutil.disk_usage(final.parent).free
-            ok, left = disk_verdict(free, meta["size"] - have)
-            if not ok:
-                log(f"REFUSED {name}: needs {fmt_bytes(meta['size'] - have)} B more, {fmt_bytes(free)} B free "
-                    f"would leave {left / GB:.1f} GB < {MIN_FREE_AFTER / GB:.0f} GB")
-                ctx["refused"] = True
-                return False
+        if ctx.get("disk_check") and not wait_for_space(name, meta["size"] - have, final.parent, ctx):
+            return False
         if have:
             log(f"resume {name} at {fmt_bytes(have)} / {fmt_bytes(meta['size'])} B")
         else:
             log(f"start {name}: {fmt_bytes(meta['size'])} B")
         stats.curl_runs += 1
-        rc, wo, _ = run_curl(curl_file_argv(ctx["curl"], url, part), part, log, ctx["lock"], name, meta["size"])
+        kw = {"floor": MIN_FREE_AFTER} if ctx.get("wait_space") else {}
+        rc, wo, _ = run_curl(curl_file_argv(ctx["curl"], url, part), part, log, ctx["lock"], name, meta["size"], **kw)
         stats.curl_retries += wo["retries"]
         now_have = part.stat().st_size if part.exists() else 0
         stats.bytes_added += max(0, now_have - have)
         if rc == 0 and now_have == meta["size"]:
             continue  # -> verify
+        if rc == LOW_SPACE_RC:
+            stats.space_parks += 1
+            continue  # -> the space check parks until there is room for the rest of the file
         if wo["http"] in PERMANENT_HTTP:
             log(f"STOP {name}: HTTP {wo['http']} is permanent (wrong repo/revision/access), no retry")
             return False
@@ -589,6 +617,40 @@ def fetch_file(name, meta, dest, ctx, final=None):
         log(f"restart {name} in {backoff} s (outer loop; {fmt_bytes(now_have)} / {fmt_bytes(meta['size'])} B)")
         time.sleep(backoff)
         backoff = next_backoff(backoff)
+
+
+def wait_for_space(name, need, where, ctx):
+    """True once `need` more bytes leave at least MIN_FREE_AFTER free on `where`'s volume.
+
+    Without `wait_space` a shortfall refuses the file (ctx["refused"], False). With it the run
+    parks: polls every SPACE_POLL_SEC, keeps the lock alive, logs a WAIT line every SPACE_LOG_SEC.
+    """
+    log = ctx["log"]
+    t0 = time.monotonic()
+    said = None
+    while True:
+        free = shutil.disk_usage(where).free
+        ok, left = disk_verdict(free, need)
+        if ok:
+            if said is not None:
+                log(f"space back for {name}: {fmt_bytes(free)} B free, {left / GB:.1f} GB left after it "
+                    f"(parked {time.monotonic() - t0:.0f} s)")
+            return True
+        if not ctx.get("wait_space"):
+            log(f"REFUSED {name}: needs {fmt_bytes(need)} B more, {fmt_bytes(free)} B free "
+                f"would leave {left / GB:.1f} GB < {MIN_FREE_AFTER / GB:.0f} GB")
+            ctx["refused"] = True
+            return False
+        now = time.monotonic()
+        if said is None or now - said >= SPACE_LOG_SEC:
+            if said is None:
+                ctx["stats"].space_waits += 1
+            log(f"WAIT {name}: needs {fmt_bytes(need)} B more, {fmt_bytes(free)} B free would leave "
+                f"{left / GB:.1f} GB < {MIN_FREE_AFTER / GB:.0f} GB -> parked, polling every {SPACE_POLL_SEC} s "
+                f"(waited {now - t0:.0f} s)")
+            said = now
+        ctx["lock"].beat()
+        time.sleep(SPACE_POLL_SEC)
 
 
 def fetch_range(name, begin, end, tmp, ctx, tries=5):
@@ -701,10 +763,16 @@ def mode_shards(dest, table, names, ctx):
     log(f"shards: {len(names)} to fetch, {fmt_bytes(total)} B: {', '.join(names)}")
     ctx["disk_check"] = True
     for name in names:
+        if deleted_marker_of(dest / name).exists():
+            ctx["stats"].skipped_deleted += 1
+            log(f"skip {name}: converted and deleted ({deleted_marker_of(dest / name).name})")
+            continue
         if not fetch_file(name, table[name], dest, ctx):
             log(f"shards: stopped at {name}")
             return 4 if ctx.get("refused") else 3
-    log(f"shards: {sum(is_verified(dest / n, table[n]) for n in names)}/{len(names)} verified")
+    nver = sum(is_verified(dest / n, table[n]) for n in names)
+    ndel = sum(deleted_marker_of(dest / n).exists() for n in names)
+    log(f"shards: {nver}/{len(names)} verified on disk, {ndel} converted and deleted")
     return 0
 
 
@@ -718,7 +786,7 @@ def resolve_layers(dest, table, layers, with_embed_head):
 
 def mode_status(dest, table, shards):
     lines = []
-    done = expected = nver = 0
+    done = expected = nver = ndel = 0
     for name in list(SMALL_FILES) + shards:
         meta = table[name]
         final = dest / name
@@ -728,11 +796,14 @@ def mode_status(dest, table, shards):
         nver += ver
         done += have
         expected += meta["size"]
-        lines.append(status_line(name, have, meta["size"], ver))
+        gone = deleted_marker_of(final).exists() and not final.exists()
+        ndel += gone
+        lines.append(status_line(name, have, meta["size"], ver) + ("  (converted, deleted)" if gone else ""))
     hdir = dest / HEADER_DIR
     nh = sum((hdir / (s + ".json")).exists() for s in shards)
     lines.append(f"headers cached: {nh}/{len(shards)}")
-    lines.append(f"total: {fmt_bytes(done)} / {fmt_bytes(expected)} B, {nver}/{len(SMALL_FILES) + len(shards)} files verified")
+    lines.append(f"total: {fmt_bytes(done)} / {fmt_bytes(expected)} B, {nver}/{len(SMALL_FILES) + len(shards)} files verified"
+                 f", {ndel} shards converted and deleted")
     print("\n".join(lines))
     return 0
 
@@ -746,6 +817,8 @@ def main(argv=None):
     ap.add_argument("--with-embed-head", action="store_true", help="with --for-layers: add embed_tokens, lm_head, final norm")
     ap.add_argument("--plan", action="store_true", help="with --for-layers: print the shard set, fetch nothing")
     ap.add_argument("--status", action="store_true", help="one line per file, no network")
+    ap.add_argument("--wait-for-space", action="store_true",
+                    help="with --shards/--for-layers: park at the 20 GB reserve instead of refusing (#157)")
     ap.add_argument("--dest", default=str(DEFAULT_DEST))
     ap.add_argument("--curl", help="curl binary (default: curl on PATH)")
     ap.add_argument("--refresh-api", action="store_true", help="re-read the API record instead of hf-revision.json")
@@ -776,7 +849,7 @@ def main(argv=None):
     lock = Lock(dest / LOCK_FILE, log)
     lock.acquire()
     stats = Stats()
-    ctx = {"log": log, "lock": lock, "stats": stats, "curl": which_curl(args.curl)}
+    ctx = {"log": log, "lock": lock, "stats": stats, "curl": which_curl(args.curl), "wait_space": args.wait_for_space}
     t0 = time.monotonic()
     rc = 0
     mode = " ".join(a for a in (argv if argv is not None else sys.argv[1:]))
@@ -805,7 +878,9 @@ def main(argv=None):
         secs = time.monotonic() - t0
         log(f"run end: rc {rc}, {secs:.0f} s, +{fmt_bytes(stats.bytes_added)} B, {stats.curl_runs} curl runs "
             f"({stats.requests} range requests), {stats.curl_retries} curl-internal retries, "
-            f"{stats.restarts} outer restarts, {stats.mismatches} hash mismatches")
+            f"{stats.restarts} outer restarts, {stats.mismatches} hash mismatches, "
+            f"{stats.space_waits} space waits, {stats.space_parks} low-space kills, "
+            f"{stats.skipped_deleted} skipped as deleted")
         lock.release()
     return rc
 
