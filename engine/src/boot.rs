@@ -30,6 +30,11 @@ pub unsafe fn open_model(
         Err(why) => panic!("[boot] refused: {why}"),
     };
     warn_unknown_crow_env();
+    // #149: the NVMe expert tier and the lossy low-bit cold tier fill the same cold experts from
+    // two different sources; the pair dies here, by name, before the container is mapped
+    if let Some(why) = nvme_tier_refusal(std::env::var("CROW_COLD_TIER").ok().as_deref(), std::env::var("CROW_NVME_TIER").ok().as_deref()) {
+        panic!("[boot] refused: {why}");
+    }
     let cnq_path = std::env::var("CROW_CNQ").unwrap_or(cnq_default);
     // #94 phase 1 — the metadata gate, FIRST: the checkpoint's config.json is
     // parsed and every formula constant asserted equal to the pinned value
@@ -235,6 +240,18 @@ pub fn unknown_crow_names<'a>(
     v
 }
 
+/// #149: `CROW_NVME_TIER` (opt-in; unset, empty or `0` is off) together with `CROW_COLD_TIER`
+/// (any non-empty path) is refused by name. The low-bit cold tier is lossy and kept off for
+/// `serve` (`docs/architecture.md` 7.5 condition 2); the NVMe tier exists to keep the exact NVFP4
+/// bytes, and the two would fill the same cold experts from different files. `None` = boot on.
+pub fn nvme_tier_refusal(cold_tier: Option<&str>, nvme_tier: Option<&str>) -> Option<String> {
+    let cold = cold_tier.map(str::trim).filter(|v| !v.is_empty())?;
+    let nvme = nvme_tier.map(str::trim).filter(|v| !v.is_empty() && *v != "0")?;
+    Some(format!(
+        "CROW_COLD_TIER={cold} and CROW_NVME_TIER={nvme} together: the NVMe expert tier reads the exact NVFP4 slabs from the container, the low-bit cold tier replaces them with a lossy copy - set one of the two"
+    ))
+}
+
 /// #102: one WARN per `CROW_*` variable in the environment that no engine code
 /// reads, so a misspelt or wrong-binary switch (the MEAS-0923 `CROW_KV` arm) is
 /// on the boot log instead of silently ignored. Names only, never values: a
@@ -254,6 +271,19 @@ fn warn_unknown_crow_env() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #149: CROW_COLD_TIER and CROW_NVME_TIER together are refused by both names; either one
+    /// alone, an empty value and CROW_NVME_TIER=0 boot
+    #[test]
+    fn the_nvme_tier_and_the_low_bit_cold_tier_are_refused_together() {
+        let why = nvme_tier_refusal(Some("x.cold3.bin"), Some("1")).expect("the pair booted");
+        assert!(why.contains("CROW_COLD_TIER=x.cold3.bin") && why.contains("CROW_NVME_TIER=1"), "{why}");
+        assert_eq!(nvme_tier_refusal(Some("x.cold3.bin"), None), None);
+        assert_eq!(nvme_tier_refusal(None, Some("1")), None);
+        assert_eq!(nvme_tier_refusal(Some(""), Some("1")), None);
+        assert_eq!(nvme_tier_refusal(Some("x.cold3.bin"), Some("0")), None);
+        assert_eq!(nvme_tier_refusal(Some("x.cold3.bin"), Some(" ")), None);
+    }
 
     #[test]
     fn the_env_doc_rows_are_the_names_the_engine_reads() {

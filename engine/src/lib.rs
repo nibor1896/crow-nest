@@ -74,6 +74,8 @@ pub mod kernels;
 pub mod kernels_p2;
 pub mod manager;
 pub mod residency;
+// #149 (plan step 17b): the stager's ColdSource interface and its NVMe backend; opt-in, wired nowhere
+pub mod nvme_source;
 // the container tensor -> device loaders and the NVFP4 pair (no launch policy):
 // what `gen` and `vit` both need, so neither has to reach into the other
 pub mod weights;
