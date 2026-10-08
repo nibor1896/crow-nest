@@ -536,6 +536,16 @@ fn quantize_nvfp4(values: &[f32], mode: ScalesMode) -> (Vec<u8>, f32, QuantStats
 /// `quantize_nvfp4` with the `--scales diag` weights: `diag` = (d over the input columns, the
 /// row length); a sub-block is 16 consecutive columns of one row (row length % 16 == 0)
 fn quantize_nvfp4_w(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], usize)>) -> (Vec<u8>, f32, QuantStats, f64) {
+    quantize_nvfp4_cap(values, mode, diag, 0x7F)
+}
+
+/// #177: `quantize_nvfp4_w` with every sub-block scale byte capped at `max_byte`
+/// (`recipe::Family::scale_byte_max`). The cap is applied BEFORE the E2M1 codes are chosen, so
+/// the codes round against the scale that is written and the statistics describe the written
+/// bytes. `0x7F` is no cap (the families of record, byte-identical to before); `0x7E` keeps the
+/// E4M3 NaN code out of a container. In `ceil` mode the "ceiling reference" is then the capped
+/// ceiling, the encoding that is written.
+fn quantize_nvfp4_cap(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], usize)>, max_byte: u32) -> (Vec<u8>, f32, QuantStats, f64) {
     assert!(values.len() % 64 == 0);
     assert_eq!(mode == ScalesMode::Diag, diag.is_some(), "--scales diag needs its weights, and only it");
     if let Some((d, cols)) = diag {
@@ -597,6 +607,7 @@ fn quantize_nvfp4_w(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], usiz
                     diag_bytes[b * 4 + sb]
                 }
             };
+            let stored = stored.min(max_byte);
             scales[sb] = stored;
             let dec = nvfp4_scale(stored, global);
             let inv = 1.0 / dec;
@@ -1503,7 +1514,8 @@ fn encode_tensor(
             }
             _ => None,
         };
-        let (blocks, global, stats, sse_ceil) = quantize_nvfp4_w(&values, mode, w);
+        // #177: the family's scale cap (0x7E for glm5_next: no E4M3 NaN code in its containers)
+        let (blocks, global, stats, sse_ceil) = quantize_nvfp4_cap(&values, mode, w, m.family.scale_byte_max());
         let mse = stats.sum_sq_err / t.n_values as f64;
         let mse_ceil = sse_ceil / t.n_values as f64;
         let mse_ratio = if mse_ceil > 0.0 { mse / mse_ceil } else { 1.0 };
@@ -2744,6 +2756,58 @@ mod tests {
             }
             let h = entropy::Hist::of_blocks(&blocks);
             assert_eq!((h.n_codes(), h.n_scales()), (vals.len() as u64, vals.len() as u64 / 16));
+        }
+    }
+
+    /// #177: a tensor whose largest sub-block scale lands above 448 in f32 (`max_scale /
+    /// (max_scale / 448)` rounds up) gets scale byte 0x7F, the E4M3 NaN code, from the ceiling
+    /// rule. The glm5_next rule writes no 0x7F, and its codes are rounded against the 448 that is
+    /// written (not the engine's byte-only rewrite, which would shrink the block max by 6.7 %).
+    /// The rule of the families of record writes the same bytes as before, 0x7F included.
+    #[test]
+    fn the_glm_rule_keeps_the_e4m3_nan_code_out_of_the_scales() {
+        let v = (0..100_000)
+            .map(|k| 1.0f32 + k as f32 * 1e-4)
+            .find(|v| {
+                let s = *v / 6.0;
+                s / (s / UE4M3_MAX) > UE4M3_MAX
+            })
+            .expect("a block max whose divided scale rounds above 448");
+        // block 0, sub-block 0 is the tensor max (16 x +-v, so `mse` has nothing to clip);
+        // everything else is smaller
+        let vals: Vec<f32> = (0..256).map(|i| if i < 16 { if i % 2 == 0 { v } else { -v } } else { ((i % 13) as f32 - 6.0) * 0.05 }).collect();
+        let scale_bytes = |b: &[u8]| b.chunks_exact(36).flat_map(|blk| blk[..4].to_vec()).collect::<Vec<u8>>();
+        let (old, _, _, _) = quantize_nvfp4(&vals, ScalesMode::Ceil);
+        assert_eq!(old[0], 0x7F, "the fixture must hit the NaN code under the ceiling rule (v = {v})");
+        for mode in [ScalesMode::Ceil, ScalesMode::Mse] {
+            let mn = if mode == ScalesMode::Mse { "mse" } else { "ceil" };
+            // the families of record: byte-identical to `quantize_nvfp4`
+            for f in [recipe::Family::FlashNext, recipe::Family::Qwen35Dense] {
+                let (want, wg, _, _) = quantize_nvfp4(&vals, mode);
+                let (got, gg, _, _) = quantize_nvfp4_cap(&vals, mode, None, f.scale_byte_max());
+                assert_eq!((got, gg), (want, wg), "{f:?} {mn}");
+            }
+            // glm5_next: no 0x7F, and the block max decodes within 1 % (a byte-only rewrite: 6.7 %)
+            let (blocks, global, _, _) = quantize_nvfp4_cap(&vals, mode, None, recipe::Family::Glm5Next.scale_byte_max());
+            assert!(!scale_bytes(&blocks).contains(&0x7F), "{mn}: a glm5_next scale byte is 0x7F");
+            let d = dequant_nvfp4(&blocks, global);
+            assert!((d[0] - v).abs() / v < 0.01, "{mn}: block max {v} decodes to {}", d[0]);
+        }
+    }
+
+    /// #177 end to end: the GLM miniature's container carries no scale byte 0x7F, read from the
+    /// written histograms (`h_scales[0x7F]`) of every NVFP4 sidecar line, in both scale modes.
+    #[test]
+    fn a_glm_container_carries_no_scale_byte_0x7f() {
+        for mode in [ScalesMode::Ceil, ScalesMode::Mse] {
+            let mn = if mode == ScalesMode::Mse { "mse" } else { "ceil" };
+            let (_, sidecar) = glm_reference(mode);
+            let lines: Vec<serde_json::Value> = String::from_utf8(sidecar).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+            let nv: Vec<&serde_json::Value> = lines.iter().filter(|v| v["dtype"] == "nvfp4" && v.get("record").is_none()).collect();
+            assert_eq!(nv.len(), 10);
+            for v in nv {
+                assert_eq!(v["h_scales"][0x7F], 0, "{mn} {}", v["name"]);
+            }
         }
     }
 

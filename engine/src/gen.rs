@@ -1477,7 +1477,13 @@ impl Engine {
         let per_expert_unit = (slabs.gu_bytes + slabs.dn_bytes) * d.layers as u64;
         let s = Scratch::alloc(&d, cfg.prompt_chunk);
         // cold staging: decode-sized batches only (t*TOPK <= stage_max)
-        let stage_max = (2 * d.topk).max(pf_tg() * if pf_async_on() { 2 } else { 1 }); // 2 x 64 slots x 2.76 MB = 354 MB (default since 2026-09-09; CROW_PF_ASYNC=0 CROW_PF_TG=32 = 88 MB)
+        // #176: sized by the model's stability policy; `OF_RECORD` (Flash-Next, the 27B) is one
+        // shared set, max(2 x topk, PF_TG x (1 + async)) = 2 x 64 slots x 2.76 MB = 354 MB (default
+        // since 2026-09-09; CROW_PF_ASYNC=0 CROW_PF_TG=32 = 88 MB). A policy with decode slots apart
+        // needs a prefill set of its own, which only the glm5_next arm will allocate (#149/#159).
+        let stage_slots = crate::geo::Stability::of(geo.family).stage_slots(d.topk, pf_tg(), pf_async_on());
+        assert!(stage_slots.shared, "decode staging sized apart from prefill needs the prefill slot set of the glm5_next arm (#149/#159), not built");
+        let stage_max = stage_slots.held();
         // #19e fix C4 of 19d: CROW_STAGE_SPLIT shapes the stage_cold grid only, so its
         // assert gates the kernel 1 fallback only. Kernel 2, the default, carries no
         // tail tile and needs 4 KB multiples instead, asserted here at load and again
