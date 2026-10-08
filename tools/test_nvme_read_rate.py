@@ -10,6 +10,12 @@ the prefill bound, and the foreign-IO arithmetic on the disk counters. The Windo
 tool end to end on a synthetic temp file it deletes afterwards (a functional test, never a
 measurement row), and checks the void paths: --disk-busy, a writer running beside it, a file still
 held open for writing.
+
+#171 adds the queue-depth grid (FILE_FLAG_OVERLAPPED, depth per reader, IOCP or IoRing). Its pure
+parts are tested with a fake backend and a fake clock (the in-flight loop keeps exactly `depth`
+reads outstanding, counts only completions inside the window, drains after the deadline), plus the
+block presets, the depth list, the B(depth, readers) table and the drive-temperature parser. On
+Windows a 32 MiB synthetic file runs the grid end to end.
 """
 
 import contextlib
@@ -17,6 +23,7 @@ import io
 import json
 import os
 import random
+import struct
 import sys
 import tempfile
 import threading
@@ -125,6 +132,206 @@ class Verdict(unittest.TestCase):
         for bad in ("", "0,1", "1,1", "a"):
             with self.assertRaises(nr.Refused):
                 nr.parse_readers(bad)
+
+
+class BlockPresets(unittest.TestCase):
+    def test_presets_are_the_two_record_sizes_and_sector_multiples(self):
+        self.assertEqual(nr.BLOCK_PRESETS, {"3.05bit": 9_474_048, "4.5bit": 14_155_776})
+        self.assertEqual(nr.BLOCK_PRESETS["4.5bit"], nr.EXPERT_BLOCK)
+        for size in nr.BLOCK_PRESETS.values():
+            self.assertEqual(size % nr.ALIGN, 0)
+            nr.check_geometry(size, nr.ALIGN, 512, 4096)
+        self.assertEqual(nr.BLOCK_PRESETS["3.05bit"], 2313 * 4096)
+
+    def test_parse_block(self):
+        self.assertEqual(nr.parse_block("3.05bit"), 9_474_048)
+        self.assertEqual(nr.parse_block("4.5bit"), 14_155_776)
+        self.assertEqual(nr.parse_block("1048576"), 1 << 20)
+        self.assertEqual(nr.parse_block("1_048_576"), 1 << 20)
+        self.assertEqual(nr.parse_block(nr.EXPERT_BLOCK), nr.EXPERT_BLOCK)     # the argparse default
+        for bad in ("", "0", "-4096", "5bit", "3.05", "x"):
+            with self.assertRaises(nr.Refused, msg=bad):
+                nr.parse_block(bad)
+
+
+class Depths(unittest.TestCase):
+    def test_parse_depths(self):
+        self.assertEqual(nr.parse_depths("1,4,8,16"), [1, 4, 8, 16])
+        for bad in ("", "0,1", "4,4", "a", "-1"):
+            with self.assertRaises(nr.Refused, msg=bad) as cm:
+                nr.parse_depths(bad)
+            self.assertIn("--depths", str(cm.exception))
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+class FakeBackend:
+    """FIFO device: reap() advances the clock by `step` and completes the oldest read."""
+
+    def __init__(self, clock, block, step=1.0, short_at=()):
+        self.clock, self.block, self.step, self.short_at = clock, block, step, set(short_at)
+        self.queue, self.submitted, self.reaped, self.max_inflight = [], [], [], 0
+
+    def submit(self, slot, file_index, offset):
+        assert slot not in self.queue, "slot submitted twice while in flight"
+        self.queue.append(slot)
+        self.submitted.append((slot, file_index, offset, self.clock()))
+        self.max_inflight = max(self.max_inflight, len(self.queue))
+
+    def reap(self):
+        self.clock.now += self.step
+        slot = self.queue.pop(0)
+        n = self.block - 4096 if len(self.reaped) in self.short_at else self.block
+        self.reaped.append(slot)
+        return [(slot, n)]
+
+
+class QueueLoop(unittest.TestCase):
+    BLOCK = 8192
+
+    def run_loop(self, depth, t_meas=2.0, t_end=6.0, **kw):
+        clock = FakeClock()
+        be = FakeBackend(clock, self.BLOCK, **kw)
+        count = iter(range(10_000))
+        r = nr.run_queue(be, depth, lambda: (next(count) % 2, 4096 * next(count)), self.BLOCK, clock, t_meas, t_end)
+        return be, r
+
+    def test_keeps_exactly_depth_in_flight_and_drains(self):
+        for depth in (1, 2, 4):
+            be, r = self.run_loop(depth)
+            self.assertEqual(be.max_inflight, depth)
+            self.assertEqual(be.queue, [])                              # drained
+            self.assertEqual(len(be.submitted), len(be.reaped))
+            self.assertEqual(r["issued"], len(be.reaped) * self.BLOCK)
+
+    def test_no_submit_at_or_after_the_deadline(self):
+        be, _ = self.run_loop(2)
+        self.assertTrue(all(t < 6.0 for *_, t in be.submitted), be.submitted)
+        self.assertEqual(len(be.submitted), 7)                          # at t = 0, 0, 1, 2, 3, 4, 5
+
+    def test_only_completions_inside_the_window_count(self):
+        be, r = self.run_loop(2)
+        # completions land at t = 1..7; the window is [2, 6): t = 2, 3, 4, 5 count
+        self.assertEqual(r["counted"], 4 * self.BLOCK)
+        self.assertEqual(len(r["lat"]), 4)
+        self.assertEqual(r["lat"], [2.0] * 4)                           # submit to reap, per block
+        self.assertEqual(r["issued"], 7 * self.BLOCK)                   # warm-up and drain are still own IO
+        self.assertEqual(r["short"], 0)
+
+    def test_depth_one_is_the_synchronous_case(self):
+        be, r = self.run_loop(1, t_meas=1.0, t_end=4.0)
+        self.assertEqual(be.max_inflight, 1)
+        self.assertEqual(r["lat"], [1.0] * 3)                           # completions at t = 1, 2, 3
+
+    def test_offsets_come_from_pick_unchanged(self):
+        be, _ = self.run_loop(2)
+        self.assertTrue(all(off % 4096 == 0 for _, _, off, _ in be.submitted))
+        self.assertEqual(len({off for _, _, off, _ in be.submitted}), len(be.submitted))
+
+    def test_short_read_is_not_counted_but_is_own_io(self):
+        be, r = self.run_loop(2, short_at={2})
+        self.assertEqual(r["short"], 1)
+        self.assertEqual(r["counted"], 3 * self.BLOCK)
+        self.assertEqual(r["issued"], 7 * self.BLOCK - 4096)
+
+    def test_backend_error_propagates(self):
+        class Boom(FakeBackend):
+            def reap(self):
+                raise OSError(5, "boom")
+        with self.assertRaises(OSError):
+            nr.run_queue(Boom(FakeClock(), 8192), 2, lambda: (0, 0), 8192, FakeClock(), 0.0, 1.0)
+
+
+def gcells(table):
+    """{(depth, readers): [(gbps, p50, p99), ...]} -> grid cells."""
+    return [{"depth": d, "readers": r, "gbps": g, "lat_p50_ms": p50, "lat_p99_ms": p99, "blocks": 100}
+            for (d, r), reps in table.items() for g, p50, p99 in reps]
+
+
+class GridTable(unittest.TestCase):
+    TABLE = {(1, 1): [(5.0, 2.0, 3.0), (5.1, 2.1, 3.5), (4.9, 1.9, 3.2)],
+             (1, 2): [(9.0, 3.0, 5.0), (9.4, 3.1, 4.0), (9.2, 3.2, 4.5)],
+             (4, 1): [(8.0, 8.0, 11.0), (8.2, 8.1, 12.5), (8.1, 8.2, 12.0)],
+             (4, 2): [(9.5, 15.0, 30.0), (7.0, 16.0, 31.0), (9.4, 14.0, 29.0)]}
+
+    def summary(self):
+        return nr.grid_summary(gcells(self.TABLE), [1, 4], [1, 2])
+
+    def test_one_row_per_depth_and_readers_in_grid_order(self):
+        s = self.summary()
+        self.assertEqual([(x["depth"], x["readers"]) for x in s], [(1, 1), (1, 2), (4, 1), (4, 2)])
+
+    def test_median_spread_and_latency_per_cell(self):
+        x = {(c["depth"], c["readers"]): c for c in self.summary()}
+        c = x[(1, 1)]
+        self.assertEqual(c["rates_gbps"], [5.0, 5.1, 4.9])
+        self.assertEqual(c["median_gbps"], 5.0)
+        self.assertAlmostEqual(c["spread"], 5.1 / 4.9)
+        self.assertTrue(c["spread_ok"])
+        self.assertEqual(c["lat_p50_ms"], 2.0)                          # median of the reps' p50
+        self.assertEqual(c["lat_p99_ms"], 3.5)                          # worst rep's p99
+        self.assertFalse(x[(4, 2)]["spread_ok"])                        # 9.5 / 7.0 = 1.357
+
+    def test_matrix_is_depth_rows_by_reader_columns_of_medians(self):
+        self.assertEqual(nr.grid_matrix(self.summary(), [1, 4], [1, 2]), [[5.0, 9.2], [8.1, 9.4]])
+
+    def test_missing_cell_is_none_not_zero(self):
+        s = nr.grid_summary(gcells({(1, 1): [(5.0, 1.0, 2.0)] * 3}), [1, 4], [1, 2])
+        self.assertEqual(nr.grid_matrix(s, [1, 4], [1, 2]), [[5.0, None], [None, None]])
+
+    def test_format_prints_the_matrix_spread_and_latency(self):
+        text = "\n".join(nr.format_grid(self.summary(), [1, 4], [1, 2], True, "iocp", 9_474_048))
+        for key in ("queue-depth grid", "backend iocp", "9,474,048", "depth", "readers", "9.200", "p50", "p99",
+                    "spread", "<= 1.15?", "NO"):
+            self.assertIn(key, text)
+        self.assertNotIn("VOID", text)
+
+    def test_format_labels_a_void_run(self):
+        text = "\n".join(nr.format_grid(self.summary(), [1, 4], [1, 2], False, "iocp", 9_474_048))
+        self.assertIn("VOID", text)
+
+    def test_grid_only_verdict_claims_no_g1_input(self):
+        v = nr.grid_only_verdict([])
+        self.assertTrue(v["valid"])
+        self.assertIsNone(v["b_for_g1"])
+        self.assertEqual(v["per_readers"], {})
+        self.assertIn("--no-sync-arm", v["g1_input"])
+        v = nr.grid_only_verdict(["grid rep 0 depth 4 readers 2: disk writes 9.0 MB/s > 4.0 MB/s"])
+        self.assertFalse(v["valid"])
+        self.assertTrue(v["g1_input"].startswith("VOID"))
+
+
+def temp_blob(sensors, critical=87, warning=84, size=None):
+    head = struct.pack("<IIhhH2x8x", 24, size or 24 + 16 * len(sensors), critical, warning, len(sensors))
+    return head + b"".join(struct.pack("<HhhhBBBBI", i, t, 0, 0, 0, 0, 0, 0, 0) for i, t in enumerate(sensors))
+
+
+class Temperature(unittest.TestCase):
+    def test_parse_one_and_several_sensors(self):
+        t = nr.parse_temperature(temp_blob([41]))
+        self.assertEqual((t["readable"], t["celsius"], t["critical_c"], t["warning_c"]), (True, 41, 87, 84))
+        t = nr.parse_temperature(temp_blob([41, 55, 38]))
+        self.assertEqual(t["celsius"], 55)                              # the hottest sensor
+        self.assertEqual([s["celsius"] for s in t["sensors"]], [41, 55, 38])
+
+    def test_unreadable_shapes_raise(self):
+        for bad in (b"", temp_blob([41])[:20], temp_blob([]), temp_blob([41, 42])[:30],
+                    temp_blob([300]), temp_blob([-90])):
+            with self.assertRaises(ValueError, msg=bad):
+                nr.parse_temperature(bad)
+
+    def test_text(self):
+        self.assertEqual(nr.temperature_text(nr.parse_temperature(temp_blob([41]))),
+                         "41 C (warning 84 C, critical 87 C)")
+        self.assertEqual(nr.temperature_text({"readable": False, "error": "Win32 error 5"}),
+                         "not readable (Win32 error 5)")
+        self.assertEqual(nr.temperature_text(None), "not readable")
 
 
 class DownloadSigns(unittest.TestCase):
@@ -284,6 +491,70 @@ class Functional(unittest.TestCase):
         rc, _, err = self.run_tool("--block", str(64 * MiB), "--reps", "1", self.file)
         self.assertEqual(rc, nr.EXIT_REFUSED)
         self.assertIn("smaller than one block", err)
+
+    GRID = ["--no-sync-arm", "--seq-passes", "0", "--allow-void"]
+
+    def test_grid_iocp_end_to_end(self):
+        js = self.dir / "grid.json"
+        rc, out, err = self.run_tool(*self.FAST, "--depths", "1,4", "--readers", "1,2", "--reps", "2",
+                                     *self.GRID, "--json", js, self.file, self.dir / "tail.bin")
+        self.assertIn(rc, (nr.EXIT_OK, nr.EXIT_VOID), err)
+        r = json.loads(js.read_text(encoding="utf-8"))
+        g = r["grid"]
+        self.assertEqual(g["backend"], "iocp")
+        self.assertEqual([(c["depth"], c["readers"]) for c in g["cells"]], [(1, 1), (1, 2), (4, 1), (4, 2)] * 2)
+        for c in g["cells"]:
+            self.assertGreater(c["gbps"], 0)
+            self.assertEqual(c["short_reads"], 0)
+            self.assertEqual(c["bytes"] % MiB, 0)
+            self.assertGreater(c["blocks"], 0)
+            self.assertGreater(c["lat_p99_ms"], 0)
+        self.assertEqual(len(g["summary"]), 4)
+        self.assertEqual(set(g["temperature"]), {"before", "after"})
+        self.assertEqual(r["cells"], [])                                  # --no-sync-arm: no PREREG cells
+        self.assertEqual(r["verdict"]["per_readers"], {})
+        self.assertEqual(rc == nr.EXIT_OK, r["verdict"]["valid"])
+        for key in ("queue-depth grid", "backend iocp", "temperature", "<= 1.15?"):
+            self.assertIn(key, out)
+
+    def test_grid_ioring_when_the_system_has_it(self):
+        js = self.dir / "ring.json"
+        rc, out, err = self.run_tool(*self.FAST, "--depths", "1,4", "--readers", "1", "--reps", "1",
+                                     "--backend", "ioring", *self.GRID, "--json", js, self.file)
+        if rc == nr.EXIT_REFUSED and "IoRing" in err:
+            self.skipTest(err.strip())
+        self.assertIn(rc, (nr.EXIT_OK, nr.EXIT_VOID), err)
+        g = json.loads(js.read_text(encoding="utf-8"))["grid"]
+        self.assertEqual(g["backend"], "ioring")
+        for c in g["cells"]:
+            self.assertGreater(c["gbps"], 0)
+            self.assertEqual(c["short_reads"], 0)
+
+    def test_grid_block_preset_and_void_label(self):
+        js = self.dir / "preset.json"
+        rc, out, _ = self.run_tool("--block", "3.05bit", "--depths", "2", "--readers", "1", "--reps", "1",
+                                   "--secs", "0.3", "--warmup", "0.05", "--idle-check", "0.2", "--disk-busy",
+                                   *self.GRID, "--json", js, self.file)
+        self.assertEqual(rc, nr.EXIT_VOID)                                # --disk-busy voids the grid too
+        r = json.loads(js.read_text(encoding="utf-8"))
+        self.assertEqual(r["env"]["block"], 9_474_048)
+        self.assertFalse(r["verdict"]["valid"])
+        self.assertIn("VOID", out)
+
+    def test_no_depths_means_no_grid(self):
+        js = self.dir / "plain.json"
+        rc, out, err = self.run_tool(*self.FAST, "--readers", "1", "--reps", "1", "--seq-passes", "0",
+                                     "--allow-void", "--json", js, self.file)
+        self.assertIn(rc, (nr.EXIT_OK, nr.EXIT_VOID), err)
+        r = json.loads(js.read_text(encoding="utf-8"))
+        self.assertNotIn("grid", r)
+        self.assertEqual(len(r["cells"]), 1)
+        self.assertNotIn("queue-depth grid", out)
+
+    def test_grid_refusals(self):
+        for argv in (["--depths", "0"], ["--depths", "1,1"], ["--block", "5bit"]):
+            rc, _, err = self.run_tool(*self.FAST, *argv, "--reps", "1", self.file)
+            self.assertEqual(rc, nr.EXIT_REFUSED, (argv, err))
 
 
 if __name__ == "__main__":

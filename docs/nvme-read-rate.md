@@ -6,6 +6,10 @@ at which this machine's NVMe delivers expert-sized blocks through unbuffered IO.
 the verdict are fixed by `runs/glm53-flash/PREREG.md`, section "Step 3"; G1 (step 8) consumes B.
 The tool changes nothing in the engine, the converter or the container.
 
+Issue #171 (plan step 6, child of #169) adds a second, optional arm: B per queue depth and reader
+count for the two record sizes, with latency per block and the drive temperature. It is off unless
+`--depths` is given and is described in "Queue-depth grid" below; the PREREG arm and its verdict are unchanged.
+
 > **First run on the GLM shards (2026-10-08, `runs/glm53-flash/step03/20261008T001819Z.{json,md}`):** valid
 > (no foreign disk IO), medians 6.994 / 9.765 / 7.811 GB/s at 1 / 2 / 4 readers, spreads 1.003 / 1.232 / 1.430.
 > The best count (2) misses the 1.15 spread rule, so `G1 input` is "not answered". PREREG amendment 5 (robin, 2026-10-08)
@@ -49,6 +53,47 @@ MB/s. Then the verdict per reader count:
 `--json PATH` writes every cell, the environment (UTC date, crow-nest commit, drive model and
 firmware, physical disk, volume, free bytes, sector sizes, all arguments, file sizes) and the
 verdict. Run directories belong under `runs/glm53-flash/step03/` (ignored by git).
+
+## Queue-depth grid (#171)
+
+```
+python -I tools/nvme_read_rate.py --block 3.05bit --depths 1,4,8,16 --readers 1,2,4 --reps 3 --secs 20 \
+    --backend iocp --no-sync-arm --seq-passes 0 --json runs/glm53-flash/c1-s6-nvme/<UTC stamp>-3.05bit.json <shard> [<shard> ...]
+```
+
+| Flag | Meaning |
+|---|---|
+| `--block` | bytes per read, or a preset: `3.05bit` = 9,474,048 B (2313 × 4096), `4.5bit` = 14,155,776 B (3456 × 4096, the default). Offsets and buffers are 4096-aligned; the sector-multiple check applies as before. The 9,474,048 B figure is the plan's 3.05-bit record size; it is not derived in this repo. |
+| `--depths` | queue depths per reader, distinct positive integers, e.g. `1,4,8,16`. Turns the grid on. |
+| `--readers` | reader counts of the grid (and of the PREREG arm), default `1,2,4`. |
+| `--backend` | `iocp` (default): one completion port per reader, `GetQueuedCompletionStatusEx`. `ioring`: Windows 11 `CreateIoRing` / `BuildIoRingReadFile` / `SubmitIoRing` / `PopIoRingCompletion` over ctypes; refuses with exit 2 ("IoRing unavailable") if the system has none. |
+| `--no-sync-arm` | skip the PREREG synchronous arm (grid only). `G1 input` then says "not measured". Needs `--depths`. |
+
+Per cell, `readers` threads each own their handles (one per file, opened `FILE_FLAG_NO_BUFFERING |
+FILE_FLAG_OVERLAPPED`, sharing read only) and `depth` `VirtualAlloc` buffers, and keep `depth` random
+reads in flight at uniform 4096-aligned offsets until the deadline, then drain. The window, the
+counting rule (a block counts when it completes whole inside the measured window) and the offset
+sampler are the random arm's. The latency of a block is the time from its submit to the moment the
+reader reaps it (a Python reader, so it includes the reaper's scheduling). At depth 1 the cell is the
+random arm's synchronous case through the overlapped path. Memory: `readers × depth × block` bytes of
+buffers (4 × 16 × 14,155,776 B = 0.9 GB at the largest cell).
+
+Output per cell: repetition, depth, readers, GB/s, blocks, p50 / p99 ms, short reads, foreign r/w MB/s.
+Then a matrix B(depth, readers) of medians, and per (depth, readers): median, min, max, spread max/min with
+"≤ 1.15?", p50 (median of the repetitions' p50) and p99 (the worst repetition's p99) per block. `--json`
+adds a `grid` object (`backend`, `block`, `depths`, `readers`, every `cells` entry, `summary`,
+`temperature.before` / `.after`). Repetitions are interleaved (depth-major, then readers, then again).
+The grid claims no `G1 input`; whether a cell's spread is ≤ 1.15 is printed, not enforced.
+
+Drive temperature is read before the first and after the last grid cell with `IOCTL_STORAGE_QUERY_PROPERTY`
+(`StorageDeviceTemperatureProperty`), hottest sensor in °C with the drive's warning and critical limits;
+if the query fails the text is "not readable (<error>)". On this machine it is readable without admin
+rights (smoke run 2026-10-08: 68 C before, 76 C after a 10 s run on a 200 MiB temp file, warning 87 C,
+critical 89 C; a functional check, not a measurement row).
+
+Void: the rule of the next section is applied to every grid cell (foreign reads, any writes, download
+signs, a changing directory, a changing measured file, a file open for writing); the reasons are named
+`grid rep R depth D readers N: ...`.
 
 ## Void: a second process on the disk
 
@@ -107,6 +152,14 @@ without `--allow-void`, a writer thread doing `fsync` beside the run, a `.part` 
 shard, a file appearing beside the shard during the run, a file held open for writing, the
 unbuffered self-check, and the refusals.
 
+#171 adds, on every platform: the block presets and `--depths` parsing; the in-flight loop (`run_queue`)
+against a fake FIFO backend and a fake clock (exactly `depth` reads outstanding, no submit at or after
+the deadline, drain, only completions inside the window count, short reads, latency submit to reap,
+backend errors propagate); the B(depth, readers) summary, matrix and printout; the grid-only verdict;
+and the temperature parser. On Windows, a 32 MiB synthetic file runs the grid end to end with `iocp`
+and `ioring` (the latter skips itself when the system refuses with "IoRing unavailable"), with the
+block preset, with the void label, and without `--depths` (no `grid` key).
+
 ## Not covered
 
 - The ticket's sketch also named a cache-blindness control (buffered pass, then a direct pass
@@ -117,3 +170,7 @@ unbuffered self-check, and the refusals.
 - This is a Python harness over `ReadFile`, not the NVMe tier backend of step 14; whether that
   backend reaches the same B is step 14's question.
 - Linux (`O_DIRECT`) is not implemented.
+- The queue-depth grid is not yet measured on the GLM shards (#171 builds the tool; the 328 GB download
+  on C: must be finished and robin must give the go first). No B(depth, readers) number exists yet.
+- The grid reaps in Python threads: its latency includes the reaper's scheduling, and it is a harness
+  figure, not the NVMe tier backend's of step 14.
