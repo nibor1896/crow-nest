@@ -429,6 +429,96 @@ impl Family {
     }
 }
 
+// ---- #176: the VRAM stability policy of a model (GLM measurement book F, lever 6) ----
+//
+// Crow 2026-08-11 (RTX 5090, `docs/archive/README-v0.5.1-deepseek.md` of Crow): with 593 MiB
+// left free the same prefill ran 3.83 to 33.29 tok/s (spread 8.69x) because WDDM silently moved
+// allocations into system memory; with 2,059 MiB free the spread was 1.013x. The engine has no
+// `glm5_next` family yet (#159 owns the door), so the GLM policy is keyed by the model type the
+// converter writes, and the GLM planner (#159) and stager (#149) read it. Flash-Next and the 27B
+// take `Stability::OF_RECORD`, whose numbers are today's code bit for bit.
+
+/// `text_config.model_type` of GLM-5.3-Flash (the converter's `recipe::Family::Glm5Next`)
+pub const GLM5_NEXT_MODEL_TYPE: &str = "glm5_next_text";
+/// VRAM a glm5_next plan leaves free on the card, on top of the planner's own reserves
+/// (`manager::SAFETY`, `manager::POST_PLAN_FLOOR`): the ~2 GiB of the stable August row
+pub const GLM5_NEXT_VRAM_HEADROOM: u64 = 2 << 30;
+/// G4 (`runs/glm53-flash/PREREG.md:89-90`): VRAM after the turn below 31.9 GiB
+pub const GLM5_NEXT_VRAM_CAP: u64 = 319 * (1 << 30) / 10;
+/// rows a decode-shaped batch stages on glm5_next: one token or one MTP verify batch
+/// (`gen::MTP_VERIFY_MAX`, a test pins the two equal)
+pub const GLM5_NEXT_DECODE_STAGE_ROWS: usize = 4;
+
+/// how much of the card a model's plan may fill, and how its cold staging is sized
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Stability {
+    /// VRAM kept free on the card on top of the planner's reserves; 0 = the reserves only
+    pub vram_headroom: u64,
+    /// the most VRAM the model may use; `None` = the card
+    pub vram_cap: Option<u64>,
+    /// `Some(rows)`: decode staging holds `rows x topk` slots, sized apart from the prefill
+    /// set; `None`: one set shared by decode and prefill (the formula of record)
+    pub decode_stage_rows: Option<usize>,
+}
+
+/// the cold-staging slot counts of a model (`gen::Stage::max` is `held`)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StageSlots {
+    /// slots a decode step can use (`t * topk <= decode`)
+    pub decode: usize,
+    /// slots one prefill group set needs (`PF_TG`, doubled with `CROW_PF_ASYNC`)
+    pub prefill: usize,
+    /// one set for both (true) or two sets (false: the prefill set is allocated apart)
+    pub shared: bool,
+}
+
+impl StageSlots {
+    /// the slots the decode staging buffers hold (`Stage::max`)
+    pub fn held(&self) -> usize {
+        if self.shared { self.decode.max(self.prefill) } else { self.decode }
+    }
+}
+
+impl Stability {
+    /// Flash-Next and the 27B: no extra headroom, no cap, one shared staging set
+    pub const OF_RECORD: Stability = Stability { vram_headroom: 0, vram_cap: None, decode_stage_rows: None };
+    /// GLM-5.3-Flash (#176)
+    pub const GLM5_NEXT: Stability = Stability {
+        vram_headroom: GLM5_NEXT_VRAM_HEADROOM,
+        vram_cap: Some(GLM5_NEXT_VRAM_CAP),
+        decode_stage_rows: Some(GLM5_NEXT_DECODE_STAGE_ROWS),
+    };
+
+    /// the policy of an engine family; both are `OF_RECORD`
+    pub fn of(family: Family) -> Stability {
+        match family {
+            Family::FlashNext | Family::Qwen35Dense => Stability::OF_RECORD,
+        }
+    }
+    /// the policy of a `text_config.model_type` (the GLM arm reads it before it has a `Family`)
+    pub fn for_model_type(model_type: &str) -> Stability {
+        if model_type == GLM5_NEXT_MODEL_TYPE { Stability::GLM5_NEXT } else { Stability::OF_RECORD }
+    }
+    /// the most VRAM a plan may fill on a card of `total` bytes: `total - headroom`, never
+    /// above the cap
+    pub fn vram_ceiling(&self, total: u64) -> u64 {
+        total.saturating_sub(self.vram_headroom).min(self.vram_cap.unwrap_or(u64::MAX))
+    }
+    /// the bytes the planner books as pending so the plan stays at `vram_ceiling` (0 = none)
+    pub fn planner_reserve(&self, total: u64) -> u64 {
+        total - self.vram_ceiling(total)
+    }
+    /// the staging slot counts for `topk` routed experts, `pf_tg` tiles per prefill group and
+    /// the prefill side stream (`CROW_PF_ASYNC` >= 1: two group sets)
+    pub fn stage_slots(&self, topk: usize, pf_tg: usize, pf_async: bool) -> StageSlots {
+        let prefill = pf_tg * if pf_async { 2 } else { 1 };
+        match self.decode_stage_rows {
+            None => StageSlots { decode: 2 * topk, prefill, shared: true },
+            Some(rows) => StageSlots { decode: rows * topk, prefill, shared: false },
+        }
+    }
+}
+
 /// the residual stream: hyper-connection streams (mixed in and out of every
 /// sub-block) or one plain pre-norm residual
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1218,5 +1308,73 @@ mod tests_131_defaults {
         assert_eq!(resolve_default_in(DEFAULT_CNQ, None, &none), DEFAULT_CNQ);
         let abs = root.join("x.cnq").to_string_lossy().into_owned();
         assert_eq!(resolve_default_in(&abs, Some(&installed_exe), &flat), abs);
+    }
+}
+
+#[cfg(test)]
+mod tests_176 {
+    use super::*;
+
+    /// the old `gen.rs` staging expression, kept here as the reference the policy must equal
+    fn stage_max_of_record(topk: usize, pf_tg: usize, pf_async: bool) -> usize {
+        (2 * topk).max(pf_tg * if pf_async { 2 } else { 1 })
+    }
+
+    /// #176: Flash-Next and the 27B keep today's numbers: no headroom, no cap, and the shared
+    /// staging set of the old expression for every (topk, PF_TG, PF_ASYNC) tried
+    #[test]
+    fn the_families_of_record_keep_their_staging_and_their_whole_card() {
+        for f in Family::ALL {
+            let s = Stability::of(f);
+            assert_eq!(s, Stability::OF_RECORD, "{f:?}");
+            assert_eq!(Stability::for_model_type(f.model_type()), Stability::OF_RECORD, "{f:?}");
+            let card = 32_607u64 << 20;
+            assert_eq!((s.vram_ceiling(card), s.planner_reserve(card)), (card, 0), "{f:?}");
+            for topk in [8, 10] {
+                for pf_tg in [8, 32, 64, 512] {
+                    for pf_async in [false, true] {
+                        let st = s.stage_slots(topk, pf_tg, pf_async);
+                        assert!(st.shared);
+                        assert_eq!(st.held(), stage_max_of_record(topk, pf_tg, pf_async), "{f:?} {topk} {pf_tg} {pf_async}");
+                    }
+                }
+            }
+        }
+        // the Flash-Next default of record: 128 slots
+        assert_eq!(Stability::of(Family::FlashNext).stage_slots(TOPK, 64, true).held(), 128);
+    }
+
+    /// #176 (a): a glm5_next plan keeps 2 GiB free on the RTX 5090 (32,607 MiB) and stays
+    /// below the G4 cap of 31.9 GiB; on a larger card the cap binds
+    #[test]
+    fn a_glm_plan_keeps_two_gib_free_and_stays_under_the_g4_cap() {
+        let s = Stability::for_model_type(GLM5_NEXT_MODEL_TYPE);
+        let rtx5090 = 32_607u64 << 20;
+        assert_eq!(s.vram_ceiling(rtx5090), 32_043_433_984);
+        assert_eq!(rtx5090 - s.vram_ceiling(rtx5090), 2 << 30);
+        assert_eq!(s.planner_reserve(rtx5090), 2 << 30);
+        assert!(s.vram_ceiling(rtx5090) < GLM5_NEXT_VRAM_CAP);
+        let big = 48u64 << 30;
+        assert_eq!(s.vram_ceiling(big), GLM5_NEXT_VRAM_CAP);
+        assert_eq!(GLM5_NEXT_VRAM_CAP, 34_252_364_185); // 31.9 GiB
+    }
+
+    /// #176 (b): glm5_next decode staging is decode-sized (one MTP verify batch x top-8 =
+    /// 32 slots = 452,984,832 B of 14,155,776 B expert blocks), apart from the 128-slot
+    /// prefill set (1,811,939,328 B) the shared formula would hold through every decode step
+    #[test]
+    fn glm_decode_staging_is_sized_apart_from_prefill() {
+        const GLM_TOPK: usize = 8;
+        const GLM_BLOCK: u64 = 14_155_776; // runs/glm53-flash/PREREG.md:14
+        assert_eq!(GLM5_NEXT_DECODE_STAGE_ROWS, crate::gen::MTP_VERIFY_MAX);
+        let st = Stability::for_model_type(GLM5_NEXT_MODEL_TYPE).stage_slots(GLM_TOPK, 64, true);
+        assert_eq!(st, StageSlots { decode: 32, prefill: 128, shared: false });
+        assert_eq!(st.held(), 32);
+        assert_eq!(st.held() as u64 * GLM_BLOCK, 452_984_832);
+        assert_eq!(stage_max_of_record(GLM_TOPK, 64, true) as u64 * GLM_BLOCK, 1_811_939_328);
+        // the decode set does not move with the prefill knobs
+        for pf_tg in [8, 32, 512] {
+            assert_eq!(Stability::for_model_type(GLM5_NEXT_MODEL_TYPE).stage_slots(GLM_TOPK, pf_tg, false).held(), 32);
+        }
     }
 }
