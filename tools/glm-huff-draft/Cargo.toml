@@ -1,0 +1,14 @@
+[package]
+name = "glm-huff-draft"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "crow-nest #148 (GLM-5.3-Flash step 10, PREREG G2): decoder draft for a static Huffman-coded NVFP4 expert block, CPU staging path; a measurement tool, not engine code"
+
+# standalone: not part of any workspace, no dependencies
+[workspace]
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
