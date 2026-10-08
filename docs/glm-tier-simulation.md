@@ -17,18 +17,24 @@ the full container (step 9). The current step-3 run has no valid B, so `sim` pri
 .venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py corpus --model models/GLM-5.3-Flash-original \
     --out decode_out/glm-step8/corpus --cap 32768 --held <name> --file <name> <task> <session.json> [--file ...]
 
-# routing, one runner pass per corpus file (the dump plan of PREREG amendment 1)
-.venv-oracle/Scripts/python.exe -I oracle/glm5_layerwise.py run --weights container <full.cnq> \
-    --ids decode_out/glm-step8/corpus/<name>-ids.json --anchors 32767 --state-dtype bf16 \
-    --out decode_out/glm-step8/runs/<name> ...
+# routing: the five runner passes of PREREG amendment 1 on the full container, resumable per file
+# (docs/glm5-reference-runner.md section 8; --dry-run checks and prints the five commands)
+.venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py [--dry-run]
 
 # simulation, every report row, and the G1 verdict fields
 .venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py sim --corpus decode_out/glm-step8/corpus/corpus.json \
     --runs decode_out/glm-step8/runs --step3 runs/glm53-flash/step03/<run>.json [--windows 0,8,16,32] [--json out.json]
 
-# the tests (about 7 s, no GPU, no weights)
-python -I tools/test_glm_tier_sim.py
+# the tests (no GPU, no weights): the sim about 7 s, the route passes about 45 s
+.venv-oracle/Scripts/python.exe -I tools/test_glm_tier_sim.py
+.venv-oracle/Scripts/python.exe -I tools/test_glm_route_passes.py
 ```
+
+Step 8 runs under `.venv-oracle` (transformers 5.16.1). The system Python's transformers (5.5.4 on the
+owner's machine, 2026-10-08) lacks `transformers.cache_utils.DynamicIndexedLayer`, which the runner's
+in-place DSA cache subclasses: `tools/test_glm_route_passes.py` fails there in `setUpClass` of its
+end-to-end test (8 tests run, 1 error), and `corpus` needs GLM's tokenizer from the same venv.
+`tools/test_glm_tier_sim.py` alone passes under either (26 tests, OK under both).
 
 `corpus` uses `messages` and `render` of `tools/session_ids.py` and swaps in GLM's tokenizer, so the
 generated spans are cut the same way as in the Flash-Next calibration (`docs/hotset-calibration.md`).
@@ -126,10 +132,13 @@ included. It checks the tool only; no number from it describes GLM.
 
 ## 6. Limits
 
-- **Not run on GLM routing.** The routing passes wait for step 9. As built, the runner can do a
-  32,768-token file only as 4,096 prompt rows plus 28,672 single-row calls. That takes about 16 h per
-  pass (derived): HF's `DynamicCache` concatenates the expanded MLA K/V on every row. A prompt-chunk
-  option in the runner brings this to about 1.4 h per pass (derived; PREREG amendment 1).
+- **Not run on GLM routing.** The routing passes wait for the full container (step 9). The runner
+  takes the prompt in 512-row calls against an in-place DSA cache (`--prompt-chunk`, crow-nest #147);
+  `tools/glm_route_passes.py` drives the five passes. About 1.8 h per pass, about 9 h for the corpus
+  (derived, not measured; the first pass measures it), against about 16 h per pass for the runner
+  before the chunk option, which had to feed 28,672 of the 32,768 rows one at a time while HF's
+  `DynamicCache` concatenated the expanded MLA K/V on every row. Amendment 1 derived 1.4 h; the
+  difference is KDA's chunk form (`docs/glm5-reference-runner.md` section 8).
 - **Teacher-forced order.** The routing follows a teacher-forced order, not free generation, and other
   models wrote the sessions. Step 14 measures m in the engine (G4); this tool does not assume it.
 - **Shape.** The tool reads the runner's per-layer files. The engine's `CROW_ROUTE_DUMP_PREFILL`

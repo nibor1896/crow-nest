@@ -8,7 +8,7 @@
       --file <name> <task> <session.json> [--file ...]
 
   # 2. routing (step 7 runner on the dequantised FULL container, one out dir per corpus name):
-  #    oracle/glm5_layerwise.py run --weights container <full.cnq> --ids <dir>/<name>-ids.json ... --out <runs>/<name>
+  #    .venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py [--dry-run]  (the five passes, #147)
 
   # 3. simulation and the G1 verdict fields
   .venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py sim --corpus <dir>/corpus.json --runs <runs> \
