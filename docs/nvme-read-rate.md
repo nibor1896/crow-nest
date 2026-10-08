@@ -63,7 +63,7 @@ python -I tools/nvme_read_rate.py --block 3.05bit --depths 1,4,8,16 --readers 1,
 
 | Flag | Meaning |
 |---|---|
-| `--block` | bytes per read, or a preset: `3.05bit` = 9,474,048 B (2313 × 4096), `4.5bit` = 14,155,776 B (3456 × 4096, the default). Offsets and buffers are 4096-aligned; the sector-multiple check applies as before. The 9,474,048 B figure is the plan's 3.05-bit record size; it is not derived in this repo. |
+| `--block` | bytes per read, or a preset: `3.05bit` = 9,474,048 B (2313 × 4096), `4.5bit` = 14,155,776 B (3456 × 4096, the default). Offsets and buffers are 4096-aligned; the sector-multiple check applies as before. The 9,474,048 B figure is one GLM-5.3-Flash expert record in the MUL1 trellis codec at K = 3 (the expert bitrate of the 3.05 bpw EXL3 checkpoint): 3 × 3,145,728 B trellis + 36,864 B fp16 suh/svh, no padding (`converter/src/mul1.rs` `glm_record_size_at_3_bit`, #181). |
 | `--depths` | queue depths per reader, distinct positive integers, e.g. `1,4,8,16`. Turns the grid on. |
 | `--readers` | reader counts of the grid (and of the PREREG arm), default `1,2,4`. |
 | `--backend` | `iocp` (default): one completion port per reader, `GetQueuedCompletionStatusEx`. `ioring`: Windows 11 `CreateIoRing` / `BuildIoRingReadFile` / `SubmitIoRing` / `PopIoRingCompletion` over ctypes; refuses with exit 2 ("IoRing unavailable") if the system has none. |
