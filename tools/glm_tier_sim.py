@@ -7,8 +7,9 @@
       --model models/GLM-5.3-Flash-original --out <dir> --cap 32768 --held <name> \
       --file <name> <task> <session.json> [--file ...]
 
-  # 2. routing (step 7 runner on the dequantised FULL container, one out dir per corpus name):
-  #    .venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py [--dry-run]  (the five passes, #147)
+  # 2. routing (step 7 runner, one out dir per corpus name; G1 ran on the 4.5-bit container, #147; G1d runs on
+  #    the FP8 originals, #179, PREREG-dyn amendment 1):
+  #    .venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py --fp8 models/GLM-5.3-Flash-original [--dry-run]
 
   # 3. simulation and the G1 verdict fields
   .venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py sim --corpus <dir>/corpus.json --runs <runs> \
@@ -143,6 +144,75 @@ def source_reasons(man):
     return out
 
 
+# PREREG-dyn amendment 1 (2026-10-09, #179): the G1d routing comes from the FP8 originals of zai-org/GLM-5.3-Flash at
+# this revision; tools/glm_route_passes.py --fp8 writes their identity to weights.json in every pass dir and to each
+# passes.jsonl row. The G1 record (`sim`, source_reasons) is not changed by it.
+FP8_REVISION = "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a"
+FP8_SHARDS = 62
+
+
+def identity_sha256(ident):
+    """sha256 of an identity's canonical JSON without its own identity_sha256, as tools/glm_route_passes.py
+    identity_sha256 computes it (that module imports this one, so the two lines are repeated, not imported)."""
+    body = {k: v for k, v in ident.items() if k != "identity_sha256"}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def g1d_source_reasons(man, out_dir):
+    """PREREG-dyn amendment 1, check 2, for one pass dir -> (reasons it is not the G1d source, identity sha256).
+    It replaces source_reasons' "not CNQ" reason for G1d only: FP8 weights, not partial, complete over every layer,
+    --state-dtype bf16 --prompt-chunk 512, and a weights.json of kind fp8-originals at FP8_REVISION with 62 shards,
+    its identity sha256 matching its content and its index sha256 the runner manifest's."""
+    out = []
+    w = man.get("weights") or {}
+    if str(w.get("weights", "")).split(" ")[0] != "fp8":
+        out.append("routing not from the FP8 originals (G1d source, PREREG-dyn amendment 1)")
+    if w.get("partial"):
+        out.append("partial weights (%s)" % (w["partial"].get("filter") or "partial"))
+    if not man.get("complete") or list(man.get("layers", [])) != [0, man.get("num_hidden_layers", -1)]:
+        out.append("runner pass not complete over layers 0..%s" % man.get("num_hidden_layers"))
+    if man.get("state_dtype") != "bf16" or man.get("prompt_chunk") != 512:
+        out.append("runner pass not --state-dtype bf16 --prompt-chunk 512 (%s, %s)"
+                   % (man.get("state_dtype"), man.get("prompt_chunk")))
+    wp = os.path.join(out_dir, "weights.json")
+    if not os.path.exists(wp):
+        return out + ["no weights.json (the FP8 identity tools/glm_route_passes.py --fp8 writes)"], None
+    ident = jload(wp)
+    if ident.get("kind") != "fp8-originals" or ident.get("revision") != FP8_REVISION:
+        out.append("weights.json is %s at %s, not fp8-originals at %s"
+                   % (ident.get("kind"), ident.get("revision"), FP8_REVISION[:8]))
+    if len(ident.get("shards") or {}) != FP8_SHARDS:
+        out.append("weights.json names %d shards, not %d" % (len(ident.get("shards") or {}), FP8_SHARDS))
+    if ident.get("identity_sha256") != identity_sha256(ident):
+        out.append("weights.json identity_sha256 does not match its content")
+    if ident.get("index_json_sha256") != w.get("index_json_sha256"):
+        out.append("runner manifest index sha256 %s is not weights.json's %s"
+                   % (w.get("index_json_sha256"), ident.get("index_json_sha256")))
+    return out, ident.get("identity_sha256")
+
+
+def g1d_book_reasons(runs_dir, names, identity):
+    """Every passes.jsonl row of a corpus file carries the identity, and each file has an ok row."""
+    book = os.path.join(runs_dir, "passes.jsonl")
+    if not os.path.exists(book):
+        return ["no passes.jsonl in %s (the pass rows of tools/glm_route_passes.py)" % runs_dir]
+    out, ok = [], set()
+    with open(book, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if row.get("name") not in names:
+                continue
+            if row.get("weights_identity_sha256") != identity:
+                out.append("passes.jsonl row of %s carries identity %s, not %s"
+                           % (row["name"], row.get("weights_identity_sha256"), identity))
+            if row.get("ok"):
+                ok.add(row["name"])
+    out += ["passes.jsonl has no ok row for %s" % n for n in names if n not in ok]
+    return out
+
+
 def gen_mask(path, n):
     m = jload(path)
     if m["tokens"] != n:
@@ -193,16 +263,19 @@ def b_from_step3(path, readers=None):
 
 
 class Run:
-    def __init__(self, name, task, routes, gen, man=None):
+    def __init__(self, name, task, routes, gen, man=None, identity=None):
         self.name, self.task, self.routes, self.gen, self.man = name, task, routes, gen, man
+        self.identity = identity
 
 
-def load_corpus(corpus_path, runs_dir, shape=SHAPE):
-    """corpus.json + one runner out dir per name -> (held Run, [cal Run], [reasons the source is not of record])."""
+def load_corpus(corpus_path, runs_dir, shape=SHAPE, source="g1"):
+    """corpus.json + one runner out dir per name -> (held Run, [cal Run], [reasons the source is not of record]).
+    source "g1": the G1 record's rule (source_reasons, CNQ container); "g1d": PREREG-dyn amendment 1 (FP8 originals,
+    g1d_source_reasons, one identity in every dir and in passes.jsonl), the identity on every Run."""
     c = jload(corpus_path)
     base = os.path.dirname(os.path.abspath(corpus_path))
     check_corpus(c)
-    runs, reasons = {}, []
+    runs, reasons, idents = {}, [], {}
     for f in c["files"]:
         man, routes = load_runner(os.path.join(runs_dir, f["name"]), shape)
         ids = jload(os.path.join(base, f["name"] + "-ids.json"))
@@ -211,10 +284,20 @@ def load_corpus(corpus_path, runs_dir, shape=SHAPE):
         if sha256_ids(ids) != f["ids_sha256"]:
             raise SimError("%s-ids.json does not match corpus.json (sha256)" % f["name"])
         gen = gen_mask(os.path.join(base, f["name"] + "-mask.json"), len(routes))
-        reasons += ["%s: %s" % (f["name"], r) for r in source_reasons(man)]
-        runs[f["name"]] = Run(f["name"], f["task"], routes, gen, man)
+        if source == "g1d":
+            why, idents[f["name"]] = g1d_source_reasons(man, os.path.join(runs_dir, f["name"]))
+        else:
+            why = source_reasons(man)
+        reasons += ["%s: %s" % (f["name"], r) for r in why]
+        runs[f["name"]] = Run(f["name"], f["task"], routes, gen, man, idents.get(f["name"]))
         print("self-test %-24s positions %7d generated %6d  routing files == manifest sha256: True"
               % (f["name"], len(routes), gen.sum()))
+    if source == "g1d":
+        found = sorted(set(x for x in idents.values() if x))
+        if len(found) > 1:
+            reasons.append("weights.json differs between the pass dirs (%d identities)" % len(found))
+        elif found:
+            reasons += g1d_book_reasons(runs_dir, list(idents), found[0])
     held = runs[c["held"]]
     cal = [runs[f["name"]] for f in c["files"] if f["role"] == "cal"]
     return held, cal, reasons
@@ -884,12 +967,15 @@ def dyn_simulate(held, configs, policies=POLICIES, arena="layer", admit_max=None
     L, K = routes.shape[1], routes.shape[2]
     res = {"held": held.name, "positions": int(len(g)), "generated": int(g.sum()), "arena": arena,
            "admit_max": admit_max, "pf_budget": pf_budget, "lfu_halflife": halflife, "B": b, "B_source": b_reason,
-           "rates": rates, "rates_source": rates_reason, "source_reasons": list(reasons), "rows": []}
+           "rates": rates, "rates_source": rates_reason, "source": "FP8 originals, PREREG-dyn amendment 1",
+           "weights_identity_sha256": getattr(held, "identity", None), "source_reasons": list(reasons), "rows": []}
     out("\nheld-out %s (%s): %d positions, %d generated; arena %s, admission %s, prefetch budget %s per token"
         % (held.name, held.task, len(g), g.sum(), arena,
            "always" if admit_max is None else "at <= %d picks per step" % admit_max,
            "none" if pf_budget is None else pf_budget))
     out("B: %s;  rates: %s" % (b_reason, rates_reason))
+    out("routing source (G1d, PREREG-dyn amendment 1: FP8 originals): %s, weights identity %s"
+        % ("ok" if not reasons else "NOT the G1d source", getattr(held, "identity", None) or "-"))
     for r in reasons:
         out("  source: %s" % r)
     for bpw, eb, cv, cp in configs:
@@ -945,7 +1031,7 @@ def dyn_configs(a, layers=SHAPE[0]):
 
 def dyn_cmd(a):
     configs = dyn_configs(a)
-    held, _cal, reasons = load_corpus(a.corpus, a.runs)
+    held, _cal, reasons = load_corpus(a.corpus, a.runs, source="g1d")
     b, why = b_from_step3(a.step3, a.readers)
     rates, rwhy = rates_from_file(a.rates)
     pfs = tuple(None if x == "none" else x if x == "oracle" else float(x) for x in a.prefetch.split(","))

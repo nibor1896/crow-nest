@@ -6,8 +6,10 @@ would fall on the NVMe with a VRAM hot set, a pinned tier and an NVMe window, an
 and the NVMe rate B carry 40 tok/s. It reads the routing that the layerwise runner writes
 (`docs/glm5-reference-runner.md` §5). It changes nothing in `engine/`, the converter or a container.
 
-No GLM routing exists yet. The corpus is fixed (PREREG amendment 1, 2026-10-08); the routing passes need
-the full container (step 9). Step 3's statistic gives no B on this machine; PREREG amendment 5 (robin,
+The corpus is fixed (PREREG amendment 1, 2026-10-08). G1 was judged on routing from the 4.5-bit container
+(`runs/glm53-flash/step08/20261008-g1.md`, G1 failed). That container and its dumps were deleted on 2026-10-08.
+The routing for G1d comes from the FP8 originals instead (`runs/glm53-flash/PREREG-dyn.md` amendment 1, #179);
+no such dumps exist yet. Step 3's statistic gives no B on this machine; PREREG amendment 5 (robin,
 2026-10-08, #146) fixes B = 6.994 GB/s, the 1-reader median of run `20261008T001819Z`, passed as `--readers 1`.
 
 ## 1. Commands
@@ -17,13 +19,16 @@ the full container (step 9). Step 3's statistic gives no B on this machine; PRER
 .venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py corpus --model models/GLM-5.3-Flash-original \
     --out decode_out/glm-step8/corpus --cap 32768 --held <name> --file <name> <task> <session.json> [--file ...]
 
-# routing: the five runner passes of PREREG amendment 1 on the full container, resumable per file
-# (docs/glm5-reference-runner.md section 8; --dry-run checks and prints the five commands)
-.venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py [--dry-run]
+# routing: the five runner passes of PREREG amendment 1, resumable per file (docs/glm5-reference-runner.md
+# section 8; --dry-run checks and prints the five commands). G1d: the FP8 originals, verified by
+# tools/fetch-glm.py (#179, PREREG-dyn amendment 1); each pass dir gets weights.json, the weights' identity.
+# --container was G1's source; that container is deleted.
+.venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py --fp8 models/GLM-5.3-Flash-original [--dry-run]
 
 # simulation, every report row, and the G1 verdict fields
 .venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py sim --corpus decode_out/glm-step8/corpus/corpus.json \
-    --runs decode_out/glm-step8/runs --step3 runs/glm53-flash/step03/<run>.json [--readers 1] [--windows 0,8,16,32] \n    [--json out.json]
+    --runs decode_out/glm-step8/runs --step3 runs/glm53-flash/step03/<run>.json [--readers 1] [--windows 0,8,16,32] \
+    [--json out.json]
 # G1 under amendment 5: --step3 runs/glm53-flash/step03/20261008T001819Z.json --readers 1
 
 # dynamic expert-cache policies (#178, section 7)
@@ -32,7 +37,7 @@ the full container (step 9). Step 3's statistic gives no B on this machine; PRER
     [--arena layer|global] [--policies lru,clock,lfu] [--admit-max 64] [--prefetch none,oracle,0.5,0.7,0.9] \
     [--depths 1,2,3] [--pf-budget N] [--step3 <run>.json --readers 1] [--rates rates.json] [--json out.json]
 
-# the tests (no GPU, no weights): the sim about 18 s, the route passes about 45 s
+# the tests (no GPU, no weights): the sim about 19 s, the route passes about 80 s (2026-10-09)
 .venv-oracle/Scripts/python.exe -I tools/test_glm_tier_sim.py
 .venv-oracle/Scripts/python.exe -I tools/test_glm_route_passes.py
 ```
@@ -40,8 +45,9 @@ the full container (step 9). Step 3's statistic gives no B on this machine; PRER
 Step 8 runs under `.venv-oracle` (transformers 5.16.1). The system Python's transformers (5.5.4 on the
 owner's machine, 2026-10-08) lacks `transformers.cache_utils.DynamicIndexedLayer`, which the runner's
 in-place DSA cache subclasses: `tools/test_glm_route_passes.py` fails there in `setUpClass` of its
-end-to-end test (8 tests run, 1 error), and `corpus` needs GLM's tokenizer from the same venv.
-`tools/test_glm_tier_sim.py` alone passes under either (41 tests, OK under both on 2026-10-08, about 18 s).
+end-to-end test (14 tests run, 1 error; under `.venv-oracle` 17 tests, OK, 80 s; both 2026-10-09), and `corpus`
+needs GLM's tokenizer from the same venv. `tools/test_glm_tier_sim.py` alone passes under either (43 tests, OK
+under both on 2026-10-09, about 19 s).
 
 `corpus` uses `messages` and `render` of `tools/session_ids.py` and swaps in GLM's tokenizer, so the
 generated spans are cut the same way as in the Flash-Next calibration (`docs/hotset-calibration.md`).
@@ -108,7 +114,8 @@ The shape is from `config.json` (rev `eb9eb208`): 42 MoE layers (3–44), 288 ro
   6.994 GB/s at 1 reader, spread 1.003.
 - **Wrong routing source.** The routing does not come from the dequantised full container: the runner
   ran on the FP8 originals or on a partial container (`--layers`), or the pass is incomplete. Such a
-  number is plausibility only (PREREG G1).
+  number is plausibility only (PREREG G1). This is `sim`'s rule for the G1 record; `dyn` judges its source by
+  PREREG-dyn amendment 1 instead (section 7).
 - **Too few positions.** The held-out has fewer than two blocks of generated positions, so there is no CI.
 
 Refusals exit with code 2 and print the reason: a corpus guard, a self-test failure, or ids that are
@@ -116,8 +123,8 @@ not the corpus file's.
 
 ## 5. Tests
 
-`tools/test_glm_tier_sim.py` has 41 tests on synthetic dumps in the runner's own layout, each with a
-known answer (the 13 of `dyn` are in section 7):
+`tools/test_glm_tier_sim.py` has 43 tests on synthetic dumps in the runner's own layout, each with a
+known answer (the 15 of `dyn` are in section 7):
 
 - shares of exactly 0.25 / 0.25 / 0.5 at every N;
 - generated positions alone set the rank;
@@ -160,7 +167,20 @@ included. It checks the tool only; no number from it describes GLM.
 `dyn` is step 2 of the dynamic-tier plan (#169). It replays the held-out file's routing, in token order over
 every position, through an elastic cache instead of the static cut, and scores the generated positions as
 `sim` does. It reuses `sim`'s corpus loading, held-out guard, routing self-test and B rule. It decides nothing:
-the G1d verdict is step 3 and needs its own PREREG (step 1).
+the G1d verdict is step 3 under `runs/glm53-flash/PREREG-dyn.md`.
+
+**Routing source (PREREG-dyn amendment 1, 2026-10-09).** G1d's routing comes from the FP8 originals of
+`zai-org/GLM-5.3-Flash` at `eb9eb208`, run by `tools/glm_route_passes.py --fp8` (#179). `dyn` checks each pass dir
+(`g1d_source_reasons`, check 2 of the amendment):
+- the runner manifest's weights are `fp8`, not partial, and the pass is complete over every layer;
+- the pass ran with `--state-dtype bf16 --prompt-chunk 512`;
+- `weights.json` is kind `fp8-originals` at that revision with 62 shards;
+- its `identity_sha256` matches its content, and its index sha256 is the manifest's.
+
+Across the run: all five dirs carry one identity, and every `passes.jsonl` row of a corpus file carries it, with
+an ok row per file. Any failed check prints `NOT the G1d source` with the reason and lands in `source_reasons` of
+the JSON; the identity sha256 is printed and stored as `weights_identity_sha256`. `sim` keeps G1's rule: FP8 routing
+stays "plausibility only" there and G1 "not answered" on it.
 
 **The model.**
 
@@ -236,6 +256,8 @@ never a default.
 | PCIe accounting | zero-copy + admissions = visits - VRAM hits; a hand trace of admissions and write-backs |
 | cost model, rates file | ceilings and serial bound; a bad rate is refused |
 | CLI | an end-to-end run with JSON; refusals exit 2 |
+| G1d source | FP8 routing with `weights.json` and `passes.jsonl`: no source reason in `dyn`, while `sim` still says "plausibility only" and G1 "not answered" |
+| G1d source refusals | CNQ weights, prompt chunk, index sha256, a tampered or foreign `weights.json`, a missing one, two identities, a missing book, a book row with another identity |
 
 Removing a hunk turns its test red (checked 2026-10-08):
 
@@ -248,18 +270,28 @@ Removing a hunk turns its test red (checked 2026-10-08):
 | write-back count | PCIe hand trace |
 | prefetch reads counted | MIN bounds every policy |
 | LRU demotion to pinned | LRU = window |
+| `dyn` on the G1d rule (2026-10-09) | G1d source |
+| identity content check | G1d source refusals |
+| `passes.jsonl` check | G1d source refusals |
 
 **Speed** on synthetic uniform routing at full shape (4,096 positions, Windows, 2026-10-08), per config:
 LRU 0.7 s, CLOCK 1.0 s, LFU 2.8 s, LRU with prefetch 1.8 s, MIN 0.5 s (layer) and 0.9 s (global).
 For a 32,768-position file that is about 8x (derived, not measured).
 
-**Reproduction, pending.** The routing dumps `decode_out/glm-step8/runs/` were deleted on 2026-10-08 and will be
-regenerated. Once they are back, this command must give LRU m 0.278 / 0.185 / 0.060 and MIN 0.122 / 0.072 / 0.019
-on `todo-1006`, within +-0.5 pp (plan step 2). Otherwise #178 records why:
+**Side-by-side control, pending.** This replaces the old +-0.5 pp reproduction (PREREG-dyn amendment 1, #178
+comment of 2026-10-09). The scratch numbers came from 4.5-container routing; FP8 routing differs from it (step 6,
+layer 3: top-8 overlap 0.911), so a tolerance would test the quantisation, not the tool. Once the FP8 dumps exist,
+and before the first G1d row:
+1. the self-test on all five dumps (required);
+2. `sim` at N 25, W 0: held-out m next to G1's 0.5217, with dm;
+3. `dyn` LRU and MIN at 108 / 122 / 130 / 145 / 216 slots on `todo-1006`, next to the scratch numbers (LRU 0.278 /
+   0.240 / 0.220 / 0.185 / 0.060, MIN 0.122 / 0.100 / 0.090 / 0.072 / 0.019), with the difference per cell.
+
+These are descriptive, have no threshold, and can neither pass nor fail G1d.
 
 ```
 .venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py dyn --corpus decode_out/glm-step8/corpus/corpus.json \
-    --runs decode_out/glm-step8/runs --slots 108:0,145:0,216:0 --policies lru \
+    --runs decode_out/glm-step8/runs --slots 108:0,122:0,130:0,145:0,216:0 --policies lru \
     --step3 runs/glm53-flash/step03/20261008T001819Z.json --readers 1 --json <out.json>
 ```
 

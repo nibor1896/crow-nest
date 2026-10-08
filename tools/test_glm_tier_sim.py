@@ -10,6 +10,7 @@ gives "G1 not answered", never a verdict.
 """
 import copy
 import hashlib
+import json
 import math
 import os
 import sys
@@ -28,7 +29,8 @@ STEP3 = REPO / "runs" / "glm53-flash" / "step03" / "20261008T001819Z.json"
 KINDS = ["kda+dense"] * 3 + ["dsa+moe" if l % 4 == 3 else "kda+moe" for l in range(3, 45)]
 
 
-def write_run(d, routes, ids=None, weights="cnq (CNQ container)", partial=None, complete=True):
+def write_run(d, routes, ids=None, weights="cnq (CNQ container)", partial=None, complete=True, index_sha=None,
+              extra=None):
     """A runner out dir: manifest + one routing file per MoE layer, sha256 recorded as the runner does."""
     os.makedirs(d, exist_ok=True)
     n = len(routes)
@@ -41,8 +43,11 @@ def write_run(d, routes, ids=None, weights="cnq (CNQ container)", partial=None, 
     w = {"weights": weights}
     if partial:
         w["partial"] = partial
+    if index_sha:
+        w["index_json_sha256"] = index_sha
     man = {"ids": ids, "T": n, "D": 0, "layers": [0, 45], "num_hidden_layers": 45, "layer_kinds": KINDS,
            "files": files, "weights": w, "complete": complete}
+    man.update(extra or {})
     ts.jdump(man, os.path.join(d, "manifest.json"))
     return man
 
@@ -582,6 +587,106 @@ class TestDynCli(unittest.TestCase):
             self.assertEqual(ts.main(["dyn", "--corpus", c.path, "--runs", c.rdir]), 2)   # no capacity
             self.assertEqual(ts.main(["dyn", "--corpus", c.path, "--runs", c.rdir, "--slots", "8:8",
                                       "--policies", "fifo"]), 2)
+
+
+FP8_WORD = "fp8 (FP8 E4M3 originals, 128x128 weight_scale_inv blocks, dequantized to f32; BF16/F32 widened)"
+FP8_INDEX = "ab" * 32
+FP8_PASS = {"state_dtype": "bf16", "prompt_chunk": 512}
+
+
+def fp8_identity(index_sha=FP8_INDEX, shards=62):
+    """weights.json as tools/glm_route_passes.py fp8_identity writes it (#179)."""
+    ident = {"kind": "fp8-originals", "repo": "zai-org/GLM-5.3-Flash", "revision": ts.FP8_REVISION,
+             "index_json_sha256": index_sha, "config_json_sha256": "cd" * 32,
+             "shards": {"model-%05d-of-00062.safetensors" % i: "%064x" % i for i in range(1, shards + 1)}}
+    ident["identity_sha256"] = ts.identity_sha256(ident)
+    return ident
+
+
+def fp8_corpus(root, held, cal, ident=None, book=True):
+    """A corpus whose five-pass dirs are FP8-original routing with weights.json and passes.jsonl rows (#179)."""
+    ident = ident or fp8_identity()
+    c = Corpus(root, held, cal, weights=FP8_WORD, index_sha=FP8_INDEX, extra=FP8_PASS)
+    with open(os.path.join(c.rdir, "passes.jsonl"), "w", encoding="utf-8") as bk:
+        for f in c.doc["files"]:
+            ts.jdump(ident, os.path.join(c.rdir, f["name"], "weights.json"))
+            if book:
+                bk.write(json.dumps({"name": f["name"], "ok": True, "weights": "fp8-originals",
+                                        "weights_identity_sha256": ident["identity_sha256"]}) + "\n")
+    return c, ident
+
+
+class TestG1dSource(unittest.TestCase):
+    """#178 / PREREG-dyn amendment 1: `dyn` takes FP8-original routing as the G1d source; G1's `sim` rule stays."""
+
+    def test_dyn_takes_fp8_routing_and_sim_keeps_g1(self):
+        with tempfile.TemporaryDirectory() as d:
+            c, ident = fp8_corpus(d, rows(3000, HELD_PICKS), [rows(500, CAL_PICKS)])
+            out = os.path.join(d, "dyn.json")
+            self.assertEqual(ts.main(["dyn", "--corpus", c.path, "--runs", c.rdir, "--slots", "8:8",
+                                      "--policies", "lru", "--json", out]), 0)
+            doc = ts.jload(out)
+            self.assertEqual(doc["source_reasons"], [])
+            self.assertEqual(doc["weights_identity_sha256"], ident["identity_sha256"])
+            # the G1 record's rule is unchanged: FP8 routing is plausibility only there, G1 is not answered
+            held, cal, reasons = ts.load_corpus(c.path, c.rdir)
+            self.assertEqual(len(reasons), 2)
+            self.assertTrue(all("plausibility only" in r for r in reasons), reasons)
+            p = os.path.join(d, "s3.json")
+            ts.jdump(step3_doc({1: [7.0, 7.1, 6.9]}), p)
+            b, why = ts.b_from_step3(p)
+            v = ts.simulate(held, cal, b, why, reasons, windows=(0,), out=quiet)["g1"]["verdict"]
+            self.assertTrue(v.startswith("G1 not answered: held: routing not from the CNQ container"), v)
+
+    def test_g1d_source_refusals(self):
+        with tempfile.TemporaryDirectory() as d:
+            c, ident = fp8_corpus(os.path.join(d, "ok"), rows(100, HELD_PICKS), [rows(100, CAL_PICKS)])
+            held_dir = os.path.join(c.rdir, "held")
+            man = ts.jload(os.path.join(held_dir, "manifest.json"))
+            self.assertEqual(ts.g1d_source_reasons(man, held_dir), ([], ident["identity_sha256"]))
+
+            def why(m, ide=None):
+                if ide is not None:
+                    ts.jdump(ide, os.path.join(held_dir, "weights.json"))
+                return " | ".join(ts.g1d_source_reasons(m, held_dir)[0])
+
+            cnq = copy.deepcopy(man)
+            cnq["weights"]["weights"] = "cnq (CNQ container)"
+            self.assertIn("not from the FP8 originals", why(cnq))
+            chunk = dict(man, prompt_chunk=0)
+            self.assertIn("--prompt-chunk 512", why(chunk))
+            idx = copy.deepcopy(man)
+            idx["weights"]["index_json_sha256"] = "ef" * 32
+            self.assertIn("is not weights.json's", why(idx))
+            tampered = fp8_identity()
+            del tampered["shards"]["model-00062-of-00062.safetensors"]   # identity not resealed
+            r = why(man, tampered)
+            self.assertIn("61 shards", r)
+            self.assertIn("does not match its content", r)
+            other = fp8_identity()
+            other["revision"] = "0" * 40
+            other["identity_sha256"] = ts.identity_sha256(other)
+            self.assertIn("not fp8-originals at eb9eb208", why(man, other))
+            os.remove(os.path.join(held_dir, "weights.json"))
+            self.assertIn("no weights.json", why(man))
+            # across dirs and the book
+            c2, _ = fp8_corpus(os.path.join(d, "mixed"), rows(100, HELD_PICKS), [rows(100, CAL_PICKS)])
+            alt = fp8_identity()
+            alt["config_json_sha256"] = "00" * 32
+            alt["identity_sha256"] = ts.identity_sha256(alt)
+            ts.jdump(alt, os.path.join(c2.rdir, "cal0", "weights.json"))
+            self.assertIn("weights.json differs between the pass dirs", " | ".join(ts.load_corpus(
+                c2.path, c2.rdir, source="g1d")[2]))
+            c3, _ = fp8_corpus(os.path.join(d, "nobook"), rows(100, HELD_PICKS), [rows(100, CAL_PICKS)], book=False)
+            os.remove(os.path.join(c3.rdir, "passes.jsonl"))
+            self.assertIn("no passes.jsonl", " | ".join(ts.load_corpus(c3.path, c3.rdir, source="g1d")[2]))
+            c4, _ = fp8_corpus(os.path.join(d, "badrow"), rows(100, HELD_PICKS), [rows(100, CAL_PICKS)],
+                               ident=fp8_identity(), book=False)
+            with open(os.path.join(c4.rdir, "passes.jsonl"), "w", encoding="utf-8") as bk:
+                bk.write(json.dumps({"name": "held", "ok": True, "weights_identity_sha256": "12" * 32}) + "\n")
+            r = " | ".join(ts.load_corpus(c4.path, c4.rdir, source="g1d")[2])
+            self.assertIn("passes.jsonl row of held carries identity", r)
+            self.assertIn("passes.jsonl has no ok row for cal0", r)
 
 
 if __name__ == "__main__":
