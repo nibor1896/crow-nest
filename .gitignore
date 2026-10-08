@@ -6,7 +6,7 @@ converter/*.hotsets.json
 # the converter's resume journal of a staged run (crow-nest #155/#157); the converter removes it
 # once the index trailer is written. The <out>.cnq.sidecar.jsonl beside it is NOT ignored: like the
 # Flash-Next sidecars it is the per-tensor error record of its container, committed once the
-# conversion has finished and published beside the container.
+# conversion has finished (GLM-5.3-Flash's on 2026-10-08, #157; .gitattributes keeps its bytes).
 converter/*.cnq.journal.jsonl
 # build trees (every Cargo target directory, present and future)
 **/target*/
