@@ -71,6 +71,18 @@ impl Family {
         }
     }
 
+    /// #177: the largest ue4m3 sub-block scale byte the family's containers may carry. 0x7F
+    /// decodes as 480 in this converter and the engine's scalar path, but it is the E4M3 NaN
+    /// code (S.1111.111, arXiv:2209.05433 Table 1) and the mxf4nvf4 MMA instruction reads it as
+    /// NaN (`engine/src/residency.rs` `sanitize_sf_slab`). A `cnq4.5-glm5-next` container stops
+    /// at 0x7E (448); Flash-Next and the 27B keep 0x7F, so their containers stay byte-identical.
+    pub fn scale_byte_max(self) -> u32 {
+        match self {
+            Family::FlashNext | Family::Qwen35Dense => 0x7F,
+            Family::Glm5Next => 0x7E,
+        }
+    }
+
     pub fn from_name(name: &str) -> Option<Family> {
         Family::ALL.into_iter().find(|f| f.name() == name)
     }
@@ -1107,6 +1119,14 @@ mod tests {
         assert_eq!(omitted(Family::Glm5Next, "model.language_model.layers.44.eh_proj.weight"), None);
         assert_eq!(omitted(Family::Glm5Next, "model.visual.blocks.0.attn.qkv.weight"), Some(OMIT_VIT_GLM));
         assert_eq!(omitted(Family::FlashNext, "model.language_model.layers.45.mlp.experts.gate_up_proj"), None);
+    }
+
+    /// #177: only the glm5_next recipe caps the scale byte below the E4M3 NaN code
+    #[test]
+    fn only_the_glm_recipe_caps_the_scale_byte_at_0x7e() {
+        assert_eq!(Family::Glm5Next.scale_byte_max(), 0x7E);
+        assert_eq!(Family::FlashNext.scale_byte_max(), 0x7F);
+        assert_eq!(Family::Qwen35Dense.scale_byte_max(), 0x7F);
     }
 
     #[test]
