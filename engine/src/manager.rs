@@ -855,7 +855,10 @@ pub fn plan_three_tiers(i: &TierInput) -> Result<TierPlan, String> {
 
 /// #159: the glm5_next plan from its geometry: the states at `context`, the staging of its
 /// stability policy (`pf_tg` tiles per prefill group, `pf_async` = two group sets), the three
-/// tiers. `dense_bytes` and `expert_block_bytes` are the container's.
+/// tiers. `dense_bytes` and `expert_block_bytes` are the container's: the record of one routed
+/// expert of one MoE layer in the container's codec (`ExpertRecordSpec::bytes`; 14,155,776 B at
+/// NVFP4, the plan's 9,474,048 B at 3.05-bpw MUL1). A record that is not a whole number of
+/// 4096-B sectors is refused by name (`geo::expert_record_refusal`).
 #[allow(clippy::too_many_arguments)]
 pub fn plan_glm5_next(
     g: &Glm5Geo,
@@ -867,17 +870,19 @@ pub fn plan_glm5_next(
     pf_tg: usize,
     pf_async: bool,
 ) -> Result<(Glm5States, TierInput, TierPlan), String> {
+    if let Some(why) = expert_record_refusal(expert_block_bytes) {
+        return Err(why);
+    }
     let stability = Stability::of(Family::Glm5Next);
     let states = Glm5States::plan(g, context);
     let slots = stability.stage_slots(g.topk, pf_tg, pf_async);
-    // decode and prefill sets apart (#176): both are held
-    let staging_slots = if slots.shared { slots.held() } else { slots.decode + slots.prefill };
     let input = TierInput {
         vram_total,
         stability,
         dense_bytes,
         states_bytes: states.total(),
-        staging_bytes: staging_slots as u64 * expert_block_bytes,
+        // decode and prefill sets apart (#176): both are held, one record per slot
+        staging_bytes: slots.bytes(expert_block_bytes),
         launch_slack: LAUNCH_SLACK,
         expert_block_bytes,
         moe_layers: g.moe_layers(),
@@ -886,6 +891,61 @@ pub fn plan_glm5_next(
     };
     let plan = plan_three_tiers(&input)?;
     Ok((states, input, plan))
+}
+
+/// #159: the expert record `states --plan` plans with, and where it came from
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanRecord {
+    /// the codec; `None` when `--expert-bytes` came without `--expert-codec` (the plan needs
+    /// the bytes only)
+    pub codec: Option<ExpertCodec>,
+    pub bytes: u64,
+    /// the printout's source line for the record
+    pub source: String,
+}
+
+/// #159: the expert record of `states --plan`, from exactly one of: a container (`--cnq PATH`:
+/// its index names codec and record, `nvme_source::glm5_record_of_container`) or an explicit
+/// override for planning without one (`--expert-bytes N [--expert-codec nvfp4|mul1]`). There is
+/// no default: neither, or both, is refused by name, so a 3-bit plan can never silently take
+/// the 4.5-bit 14,155,776 B. An NVFP4 record must equal what the config derives
+/// (`Glm5Geo::expert_block_bytes`).
+pub fn glm5_plan_record(g: &Glm5Geo, cnq: Option<&str>, expert_bytes: Option<&str>, expert_codec: Option<&str>) -> Result<PlanRecord, String> {
+    let nvfp4_check = |codec: Option<ExpertCodec>, bytes: u64, what: &str| -> Result<(), String> {
+        if codec == Some(ExpertCodec::Nvfp4) && bytes != g.expert_block_bytes() {
+            return Err(format!("{what}: an nvfp4 record of {bytes} B, the config derives {} B at nvfp4 - not this model's record", g.expert_block_bytes()));
+        }
+        Ok(())
+    };
+    match (cnq, expert_bytes) {
+        (Some(_), Some(_)) => Err("give the expert record once: --cnq <container> or --expert-bytes N, not both".into()),
+        (None, None) => Err(
+            "the glm5_next plan needs the routed-expert record: --cnq <container> (its index names codec and record) or --expert-bytes N [--expert-codec nvfp4|mul1] (planning without a container); there is no default (#159)"
+                .into(),
+        ),
+        (Some(path), None) => {
+            if expert_codec.is_some() {
+                return Err("--expert-codec goes with --expert-bytes; a container names its own codec".into());
+            }
+            let (spec, n) = crate::nvme_source::glm5_record_of_container(path)?;
+            nvfp4_check(Some(spec.codec), spec.bytes, path)?;
+            Ok(PlanRecord {
+                codec: Some(spec.codec),
+                bytes: spec.bytes,
+                source: format!("container index {path}: codec {}, {n} records of {} B", spec.codec.dtype(), spec.bytes),
+            })
+        }
+        (None, Some(b)) => {
+            let bytes: u64 = b.trim().parse().map_err(|_| format!("--expert-bytes {b:?} is not a whole number of bytes"))?;
+            if let Some(why) = expert_record_refusal(bytes) {
+                return Err(format!("--expert-bytes: {why}"));
+            }
+            let codec = expert_codec.map(ExpertCodec::from_dtype).transpose()?;
+            nvfp4_check(codec, bytes, "--expert-bytes")?;
+            let c = codec.map_or("not given (--expert-codec; the plan needs the bytes only)".to_string(), |c| c.dtype().to_string());
+            Ok(PlanRecord { codec, bytes, source: format!("--expert-bytes, no container read; codec {c}") })
+        }
+    }
 }
 
 /// #159: the plan as `states --plan` prints it: every input with its source, then the three
@@ -1961,5 +2021,90 @@ mod tests_159_glm_plan {
         ] {
             assert!(t.contains(want), "{want:?} missing:\n{t}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_rec_size {
+    //! #159 / #176 / #149: the glm5_next plan takes the routed-expert record as a parameter.
+    //! The 14,155,776-B plan of record stays golden in `tests_159_glm_plan` (unchanged); this
+    //! module plans the 3.05-bpw MUL1 figure of 9,474,048 B and the refusals.
+    use super::*;
+
+    const CARD: u64 = 32_607 << 20; // RTX 5090, docs/system-landscape.md:12
+    /// the plan's 3.05-bpw MUL1 record (2313 x 4096)
+    const MUL1_PLAN: u64 = 9_474_048;
+
+    fn plan(rec: u64, pinned: u64) -> Result<(Glm5States, TierInput, TierPlan), String> {
+        plan_glm5_next(&Glm5Geo::GLM_5_3_FLASH, 200_000, CARD, pinned, GLM5_NEXT_DENSE_BYTES, rec, 64, true)
+    }
+
+    /// at 9,474,048 B per record on the RTX 5090, 200,000 tokens, the 46 GiB cap: the unit is
+    /// 42 x 9,474,048 = 397,910,016 B, the staging 160 x 9,474,048 = 1,515,847,680 B, and the
+    /// tiers per MoE layer are N 51 in VRAM, P 124 pinned, 113 on NVMe (4.5 bit: 32 / 83 / 173)
+    #[test]
+    fn the_glm_plan_at_the_3bit_record_is_n51_p124_nvme113() {
+        let (s, i, p) = plan(MUL1_PLAN, HOST_PINNED_CAP).unwrap();
+        assert_eq!(i.expert_block_bytes, MUL1_PLAN);
+        assert_eq!(i.staging_bytes, 1_515_847_680, "32 decode + 128 prefill slots of 9,474,048 B (#176)");
+        assert_eq!(p.unit_bytes, 397_910_016);
+        assert_eq!((p.hot, p.pinned, p.nvme), (51, 124, 113));
+        assert_eq!(p.fixed_bytes, GLM5_NEXT_DENSE_BYTES + s.total() + i.staging_bytes + LAUNCH_SLACK + SAFETY);
+        assert!(p.fixed_bytes + p.hot_bytes() <= p.vram_ceiling && p.fixed_bytes + p.hot_bytes() + p.unit_bytes > p.vram_ceiling);
+        assert!(p.pinned_bytes() <= HOST_PINNED_CAP && p.pinned_bytes() + p.unit_bytes > HOST_PINNED_CAP);
+        let t = glm5_plan_table(&Glm5Geo::GLM_5_3_FLASH, &s, &i, &p, &[]);
+        for want in [
+            format!("  expert block         {:>16} B", MUL1_PLAN),
+            format!("  cold staging         {:>16} B", 1_515_847_680u64),
+            "unit = 397910016 B = 42 layers x one block".to_string(),
+            "VRAM    N =  51".to_string(),
+            "pinned  P = 124".to_string(),
+            "NVMe        113".to_string(),
+        ] {
+            assert!(t.contains(&want), "{want:?} missing:\n{t}");
+        }
+    }
+
+    /// the staging and the unit scale with the record; with the same inputs the 14,155,776-B
+    /// plan is the one of record
+    #[test]
+    fn staging_and_capacities_follow_the_record() {
+        let (_, i45, p45) = plan(GLM5_NEXT_EXPERT_BLOCK_BYTES, HOST_PINNED_CAP).unwrap();
+        let (_, i3, p3) = plan(MUL1_PLAN, HOST_PINNED_CAP).unwrap();
+        assert_eq!((p45.hot, p45.pinned, p45.nvme), (32, 83, 173));
+        assert_eq!(i45.staging_bytes / GLM5_NEXT_EXPERT_BLOCK_BYTES, i3.staging_bytes / MUL1_PLAN);
+        assert_eq!(p3.unit_bytes * GLM5_NEXT_EXPERT_BLOCK_BYTES, p45.unit_bytes * MUL1_PLAN);
+        assert!(p3.hot > p45.hot && p3.pinned > p45.pinned && p3.nvme < p45.nvme);
+    }
+
+    /// a record that is not a whole number of 4096-B sectors, or 0 B, is refused by name
+    #[test]
+    fn the_planner_refuses_a_record_off_the_sector_grid() {
+        let why = plan(MUL1_PLAN - 48, HOST_PINNED_CAP).unwrap_err();
+        assert!(why.starts_with("refusing expert record of 9474000 B: not a multiple of 4096 B"), "{why}");
+        assert!(plan(0, HOST_PINNED_CAP).unwrap_err().contains("0 B"));
+    }
+
+    /// `states --plan` takes the record from exactly one source; no default
+    #[test]
+    fn the_plan_record_has_one_source_and_no_default() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let why = glm5_plan_record(&g, None, None, None).unwrap_err();
+        assert!(why.contains("--cnq <container>") && why.contains("--expert-bytes N") && why.contains("there is no default"), "{why}");
+        assert!(glm5_plan_record(&g, Some("x.cnq"), Some("9474048"), None).unwrap_err().contains("not both"));
+        assert!(glm5_plan_record(&g, Some("x.cnq"), None, Some("mul1")).unwrap_err().contains("--expert-codec goes with --expert-bytes"));
+        let r = glm5_plan_record(&g, None, Some("9474048"), Some("mul1")).unwrap();
+        assert_eq!((r.codec, r.bytes), (Some(ExpertCodec::Mul1), MUL1_PLAN));
+        assert!(r.source.contains("codec mul1"), "{}", r.source);
+        let r = glm5_plan_record(&g, None, Some("9474048"), None).unwrap();
+        assert_eq!((r.codec, r.bytes), (None, MUL1_PLAN));
+        assert!(glm5_plan_record(&g, None, Some("9474000"), Some("mul1")).unwrap_err().contains("not a multiple of 4096 B"));
+        assert!(glm5_plan_record(&g, None, Some("9.4e6"), None).unwrap_err().contains("not a whole number of bytes"));
+        assert!(glm5_plan_record(&g, None, Some("9474048"), Some("q3k")).unwrap_err().starts_with("refusing expert codec \"q3k\""));
+        // nvfp4 is the config's own record or nothing
+        assert_eq!(glm5_plan_record(&g, None, Some("14155776"), Some("nvfp4")).unwrap().bytes, GLM5_NEXT_EXPERT_BLOCK_BYTES);
+        assert!(glm5_plan_record(&g, None, Some("9474048"), Some("nvfp4")).unwrap_err().contains("the config derives 14155776 B at nvfp4"));
+        // a container that is not there is a named error, not a fallback
+        assert!(glm5_plan_record(&g, Some("no-such-container.cnq"), None, None).is_err());
     }
 }
