@@ -19,11 +19,12 @@ see section 3).
 
 ```
 cd engine
-CARGO_BUILD_JOBS=4 cargo test --release --lib cpu_mul1                       # 7 tests, no GPU
+CARGO_BUILD_JOBS=4 cargo test --release --lib cpu_mul1                       # 8 tests, no GPU
 CARGO_BUILD_JOBS=4 cargo test --release --lib tests_mul1_src                 # 1 test, NVRTC only
 CARGO_BUILD_JOBS=4 cargo test --release --lib mul1_gpu -- --ignored --nocapture --test-threads 1 --skip bench
 CARGO_BUILD_JOBS=4 cargo test --release --lib cpu_mul1_bench -- --ignored --nocapture
 CARGO_BUILD_JOBS=4 cargo test --release --lib mul1_gpu_bench -- --ignored --nocapture
+CARGO_BUILD_JOBS=4 cargo test --release --lib mul1_gpu_read_bench -- --ignored --nocapture
 ```
 
 The GPU tests are `#[ignore]` (CI has no GPU) and need the RTX 5090. The CPU tests read the #181
@@ -50,10 +51,11 @@ fixtures from `converter/tests/fixtures` at compile time.
 | path | step | what |
 |---|---|---|
 | GPU | `mul1_had_in` | grid (k/128, T, E), one warp per 128-block: x * suh, FWHT |
-| GPU | `mul1_gemv` | grid (n/128, S, E), 256 threads: warp = one tile column over k/S, lane = trellis lane; tile words staged through warp-private shared memory (one coalesced read per byte, also over PCIe) |
+| GPU | `mul1_gemv` | grid (n/128, S, E), 256 threads: warp = one tile column over k/S, lane = trellis lane; the block loads the contiguous run of its 8 tiles per tile row (32 n32 bytes, whole 128-byte lines) with 16-byte loads into a two-deep shared ring, the next stage in flight while the warps compute (#183) |
+| GPU | `mul1_gemv_warp` | the first kernel of #180, reference arm only (`Kernels::use_warp_gemv`): each warp loads its own tile, 96 B per warp request at K = 3; same f32 order (`mul1_tile_fma`), same bits |
 | GPU | `mul1_had_out` | sums the S partials left to right, FWHT, / 128, * svh |
 | GPU | `mul1_act_had_in` | gate and up finished, `silu(g) * u` (also stored in `FfnPlan::h`), down's x * suh and FWHT |
-| CPU | `gemv` / `expert_ffn` | input transform on the caller, output columns split over `threads` in units of 4 tile columns, k-major walk with prefetch; the FFN has two barriers (gate/up, then worker 0 finishes and prepares down, then down) |
+| CPU | `gemv` / `expert_ffn` | input transform on the caller, units of 4 tile columns handed to `threads` workers by an atomic counter (#183; `Impl::V1`, test only, keeps the first static split), k-major walk with prefetch, lane states by one byte shuffle + shift + mask; the FFN has two barriers (gate/up, then worker 0 finishes and prepares down, then down) |
 
 ## 3. Order of operations and the bound
 
@@ -107,9 +109,11 @@ held to the exllamav3 `reconstruct` digests #181 holds.
 | `cpu_mul1_avx2_equals_scalar_bits` | T 1, 2, 3, 5, 8 x threads 1, 3, 8, 16 on the 4 quantizer experts; FFN of a full GLM expert | bit-identical |
 | `cpu_mul1_activation_within_8_roundings` | f32 activation within gamma(8) | 1.88e-7 (gamma(8) = 4.77e-7) |
 | `cpu_mul1_expert_ffn_matches_reference` | fused == staged bits, down stage bound, chain bound, every thread count and path | 0.0013 x chain bound |
-| `tests_mul1_src::mul1_source_compiles_with_every_entry` | `MUL1_SRC` compiles (NVRTC, compute_120a) with its 5 entries; GPU n constants; record offsets | - |
+| `cpu_mul1_decode_and_schedule_equal_v1_bits` (#183) | shuffle decoder == first decoder for every lane, bitrates 1..8, 1.5, 2.5, 3.5; counter schedule == static split: GEMV T 1, 2, 3, 5, 8 x threads 1, 3, 8, 16 on 9 experts, GLM FFN T 1, 4 x threads 1, 8, 16, 24 | bit-identical |
+| `tests_mul1_src::mul1_source_compiles_with_every_entry` | `MUL1_SRC` compiles (NVRTC, compute_120a) with its 6 entries; GPU n constants; record offsets | - |
 | `mul1_gpu_decode_is_the_codec` (GPU) | GPU weight == codec for all 65,536 states | - |
 | `mul1_gpu_gemv_holds_the_bound_in_vram_and_pinned` (GPU) | VRAM == pinned bits; ticket and rigorous bound; GPU vs CPU | 0.039 x bound, 3.3e-4 x rigorous; GPU vs CPU 0.018 x summed bound |
+| `mul1_gpu_gemv_block_equals_warp_bits` (GPU, #183) | `mul1_gemv` == `mul1_gemv_warp`: 12 bitrate cases x gate/up/down x T 1, 3, 8, two slots, VRAM / pinned / trellis base 4 B off 16-byte alignment; GLM FFN from pinned RAM | bit-identical, 324 GEMV cases + 1 FFN |
 | `mul1_gpu_ffn_matches_reference` (GPU) | VRAM == pinned; fused down == public GEMV on the FFN's own h; down stage and chain bound; GPU vs CPU; 2 slots in one launch == 1 slot | 0.0021 x chain bound, down stage 0.063 x bound |
 
 Every test was run once with its piece removed and failed (#180 implementation comment).
@@ -138,10 +142,31 @@ after one warm-up, min..max):
 | pinned | GEMV gate | 7.1 GB/s, 440 us (6.8..7.4) | 5.7 GB/s, 552 us (4.6..6.7) |
 | pinned | FFN | 8.1 GB/s, 1171 us (7.6..8.2) | 6.1 GB/s, 1553 us (6.0..7.1) |
 
-Reading (not analysed further here): both GPU lanes are far below their links (the pinned stage
-pattern measured 51.6 GB/s, `cuda.rs` `alloc_registered` doc; VRAM peak ~1.8 TB/s), and the CPU
-peaks at 8 threads, below the 27.96 GB/s of the NVFP4 FFN (docs/cpu-nvfp4.md section 6), so the
-first kernels look bound by decode work and memory-level parallelism, not by DRAM or PCIe
-(unverified attribution). By #180's failure mode these numbers stand in the ticket before plan
-step 16 or 19 is built. The clean table of #180 item 5 (no download, n >= 20, boot-to-boot spread,
-compared with #170 and plan step 5) is open.
+#183 (2026-10-08 23:41 UTC, the same machine, release, **alongside a running download, not
+clean**; one binary, the old and new kernels as alternating arms; GPU 5 rounds x 64 calls per arm,
+CPU median of 24 calls per arm; NVFP4 `cpu_nvfp4_bench` right after in the same session):
+
+| lane | T | first kernel (#180) | #183 | ratio |
+|---|---|---|---|---|
+| pinned GEMV gate | 1 | 8.0 GB/s | **36.2** | 4.5 x |
+| pinned FFN | 1 | 9.4 GB/s | **35.9** | 3.8 x |
+| pinned FFN | 4 | 9.1 GB/s | 31.5 | 3.5 x |
+| VRAM FFN | 1 / 4 | 143.7 / 144.8 GB/s | 150.8 / 152.8 | 1.05 x |
+| CPU FFN, 1 thread | 1 | 1.27 GB/s (7.445 ms) | 1.69 (5.593 ms) | 1.33 x |
+| CPU FFN, 8 threads | 1 | 7.07 GB/s (1.339 ms) | **9.12** (1.039 ms) | 1.29 x |
+| CPU FFN, 16 / 24 threads | 1 | 5.79 / 5.94 GB/s | 9.68 / 9.42 | 1.67 / 1.59 x |
+| CPU FFN, 8 / 24 threads | 4 | 4.42 / 3.90 GB/s | 4.96 / 5.24 | 1.12 / 1.34 x |
+
+Causes (#183): from pinned RAM the first kernel's load shape alone (`rd_warp96`, one warp per tile,
+96 B per request) reads 7.8-8.0 GB/s, the same bytes as 128-byte-aligned block runs (`rd_block16`)
+39.9-41.5 GB/s, a plain 16 B sweep 28.9-34.9 GB/s on this Windows box (`mul1_gpu_read_bench`;
+the Linux device-issued ceiling of record is 51.6 GB/s); the pinned FFN now runs at 70 % of 51.6 and
+~90 % of the best local read shape. On the CPU the lane decode is ~94 % of one thread (decode alone
+1.66 of 1.76 ms per gate GEMV), and the static split made 16 threads slower than 8.
+
+**CPU target not reached**: #183 asked for the MUL1 FFN at >= 50 % of the NVFP4 FFN's GB/s at the same
+thread count (8 threads: >= 14.01 of 28.02 GB/s); measured 9.12 (33 %). Both formats run the same
+25.2 M weights, so the target needs MUL1 within 1.34 x NVFP4's time per expert; one thread takes
+5.593 ms against NVFP4's 2.104 (2.66 x), and even perfect scaling over 8 P-cores (0.70 ms, 13.5 GB/s)
+stays under the target. Starting 8 scoped threads and joining them costs 171 us per call on this
+Windows box (measured with empty work), for both formats; a persistent pool is plan step 19.

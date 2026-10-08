@@ -18,7 +18,9 @@
 //!   at `151539c7`; #181 `mul1_decode`). `s * k_inv - 3.453125` is exact in f32, so `w` is one RNE
 //!   rounding to fp16, held exactly in f32 (the scalar path reads a 1021-entry table, the AVX2 path
 //!   rounds with sybil's magic add, `ft_core.h:218-246`; both tested against the codec for every
-//!   state).
+//!   state). The AVX2 path gets a lane's 8 states with one byte shuffle of a 16-byte window, one
+//!   variable shift and a mask (#183, sybil `ft_core.h:129-160, 175-191`, exllamav3
+//!   `moe_mul1.cpp:1004-1030`), the same states as the scalar windows.
 //! - `y = x W`, `W = diag(suh) H W_hat H diag(svh) / 128`, H the 128-wide Sylvester Hadamard:
 //!   exllamav3 `LinearEXL3.get_weight_tensor` / `reconstruct_hgemm` (`exl3.py:193-249`). The
 //!   kernel computes `xh = H (x * suh)`, `y' = xh W_hat` (decoding W_hat in the inner loop) and
@@ -45,10 +47,14 @@
 //! `151539c7`, MIT) and sybil-solutions/glm53-flash-offload `kernels/cpu_avx2/ft_core.h`
 //! (`df0b439`, MIT, Copyright (c) 2026 0xSero): the decode identity, the k-major tile walk over a
 //! band of output tiles and the stream-order accumulator layout. Code is not copied; both are MIT.
-//! API and threading are those of `cpu_nvfp4` (#173): rows (here output columns) split over
-//! `threads` scoped workers, one barrier between the FFN phases.
+//! API and threading are those of `cpu_nvfp4` (#173): `threads` scoped workers per call, one
+//! barrier between the FFN phases; the work units (4 tile columns each) are handed out by an
+//! atomic counter (#183), so on a hybrid CPU a P-core takes more units than an E-core. A unit is
+//! computed by one worker with the same operations whichever it is, so the bits do not depend on
+//! the thread count.
 
 pub use crate::cpu_nvfp4::{avx2_available, Path};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Barrier;
 
 /// GLM-5.3-Flash `hidden_size`
@@ -203,9 +209,18 @@ fn state_at(tile: &[u8], n32: usize, lo: usize) -> u32 {
     (((a << 32 | b) >> (48 - o)) & 0xffff) as u32
 }
 
-/// the AVX2 view of one trellis lane: a 4-word window and, per position, the two words and the shift
+/// The AVX2 view of one trellis lane: a 16-byte window of 4 words from `w0` (circular) and, per
+/// position j, a byte shuffle that puts the window bytes holding stream bytes `Q0, Q0 + 1, Q0 + 2`
+/// (`Q0 = rel / 8`) into bytes 3, 2, 1 of 32-bit lane j (byte 0 zero), so the lane reads the
+/// stream MSB first, and the right shift `16 - rel % 8` that leaves the 16-bit state in the low
+/// half (sybil `ft_core.h:129-160, 188-207`, generalised from K = 3 to every bitrate).
+/// `ia`, `ib`, `sh`, `shr` are the two-word form of the first #180 decoder (`avx2::decode8_v1`,
+/// test reference only).
 #[derive(Clone, Copy, Debug)]
+#[repr(C, align(32))]
 struct Group {
+    ctrl: [u8; 32],
+    shv: [i32; 8],
     w0: usize,
     wrap: bool,
     ia: [i32; 8],
@@ -231,7 +246,7 @@ impl Tables {
         for (p, l) in lo.iter_mut().enumerate() {
             *l = (b.end_bit(p) + s - 16) % s;
         }
-        let mut groups = [Group { w0: 0, wrap: false, ia: [0; 8], ib: [0; 8], sh: [0; 8], shr: [0; 8] }; 32];
+        let mut groups = [Group { ctrl: [0x80; 32], shv: [0; 8], w0: 0, wrap: false, ia: [0; 8], ib: [0; 8], sh: [0; 8], shr: [0; 8] }; 32];
         for (g, gr) in groups.iter_mut().enumerate() {
             let w0 = lo[8 * g] / 32;
             gr.w0 = w0;
@@ -244,6 +259,13 @@ impl Tables {
                 gr.ib[j] = ia as i32 + 1;
                 gr.sh[j] = (rel % 32) as i32;
                 gr.shr[j] = 32 - (rel % 32) as i32;
+                // stream byte q of the window sits at window byte 4 (q / 4) + 3 - q % 4 (LE words)
+                let q0 = rel / 8;
+                assert!(q0 + 2 < 16, "cpu_mul1: K = {} lane {g} position {j} leaves the 16-byte window", b.k());
+                for (lb, q) in [(3, q0), (2, q0 + 1), (1, q0 + 2)] {
+                    gr.ctrl[4 * (j % 4) + 16 * (j / 4) + lb] = (4 * (q / 4) + 3 - q % 4) as u8;
+                }
+                gr.shv[j] = 16 - (rel % 8) as i32;
             }
         }
         Tables { n32, lo, groups }
@@ -469,6 +491,7 @@ mod avx2 {
     use std::arch::x86_64::*;
 
     pub(super) struct Consts {
+        m16: __m256i,
         mul: __m256i,
         one8: __m256i,
         one16: __m256i,
@@ -483,6 +506,7 @@ mod avx2 {
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn consts() -> Consts {
         Consts {
+            m16: _mm256_set1_epi32(0xffff),
             mul: _mm256_set1_epi32(MUL1 as i32),
             one8: _mm256_set1_epi8(1),
             one16: _mm256_set1_epi16(1),
@@ -508,6 +532,45 @@ mod avx2 {
             unsafe { _mm_loadu_si128(tile.add(4 * g.w0) as *const __m128i) }
         };
         let win = _mm256_broadcastsi128_si256(win128);
+        // SAFETY: Group is 32-byte aligned (repr align 32), ctrl and shv are its first 64 bytes
+        let (ctrl, shv) = unsafe { (_mm256_load_si256(g.ctrl.as_ptr() as *const __m256i), _mm256_load_si256(g.shv.as_ptr() as *const __m256i)) };
+        // lane j = stream bytes Q0, Q0 + 1, Q0 + 2 MSB first; >> (16 - rel % 8), low 16 bits
+        let st = _mm256_and_si256(_mm256_srlv_epi32(_mm256_shuffle_epi8(win, ctrl), shv), k.m16);
+        weights(st, k)
+    }
+
+    /// the codec weight of eight 16-bit states, one per 32-bit lane
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn weights(st: __m256i, k: &Consts) -> __m256 {
+        let x = _mm256_mullo_epi32(st, k.mul);
+        // byte sum: u8 x 1 into i16 pairs (<= 510), then i16 x 1 into i32
+        let s = _mm256_madd_epi16(_mm256_maddubs_epi16(x, k.one8), k.one16);
+        // exact in f32, then one RNE rounding to fp16 precision: c = 1.5 * 2^(e + 13) from v's
+        // exponent e, (v + c) - c rounds v to 2^(e - 10), the fp16 ulp (ft_core.h:224-232);
+        // every v lies in the fp16 normal range (|v| >= 0.0018)
+        let v = _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(s), k.kinv), k.caff);
+        let c = _mm256_castsi256_ps(_mm256_add_epi32(_mm256_and_si256(_mm256_castps_si256(v), k.expm), k.magic));
+        _mm256_sub_ps(_mm256_add_ps(v, c), c)
+    }
+
+    /// The first #180 lane decoder (two `permutevar8x32` word selects and a funnel shift), kept as
+    /// the reference of `cpu_mul1_decode_and_schedule_equal_v1_bits` and the benchmark arms.
+    ///
+    /// # Safety
+    /// The CPU must have AVX2; `tile` points at `4 * n32` readable bytes.
+    #[cfg(test)]
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn decode8_v1(tile: *const u8, n32: usize, g: &Group, k: &Consts) -> __m256 {
+        // SAFETY (all loads): word indices are < n32 (wrap taken modulo, else w0 + 3 < n32)
+        let win128 = if g.wrap {
+            let rd = |i: usize| unsafe { (tile.add(4 * ((g.w0 + i) % n32)) as *const i32).read_unaligned() };
+            _mm_setr_epi32(rd(0), rd(1), rd(2), rd(3))
+        } else {
+            unsafe { _mm_loadu_si128(tile.add(4 * g.w0) as *const __m128i) }
+        };
+        let win = _mm256_broadcastsi128_si256(win128);
         let (ia, ib, sh, shr) = unsafe {
             (
                 _mm256_loadu_si256(g.ia.as_ptr() as *const __m256i),
@@ -520,15 +583,20 @@ mod avx2 {
         let b = _mm256_permutevar8x32_epi32(win, ib);
         // (a << o | b >> (32 - o)) >> 16: the 16 bits from o, MSB first (srlv by 32 gives 0)
         let st = _mm256_srli_epi32::<16>(_mm256_or_si256(_mm256_sllv_epi32(a, sh), _mm256_srlv_epi32(b, shr)));
-        let x = _mm256_mullo_epi32(st, k.mul);
-        // byte sum: u8 x 1 into i16 pairs (<= 510), then i16 x 1 into i32
-        let s = _mm256_madd_epi16(_mm256_maddubs_epi16(x, k.one8), k.one16);
-        // exact in f32, then one RNE rounding to fp16 precision: c = 1.5 * 2^(e + 13) from v's
-        // exponent e, (v + c) - c rounds v to 2^(e - 10), the fp16 ulp (ft_core.h:224-232);
-        // every v lies in the fp16 normal range (|v| >= 0.0018)
-        let v = _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(s), k.kinv), k.caff);
-        let c = _mm256_castsi256_ps(_mm256_add_epi32(_mm256_and_si256(_mm256_castps_si256(v), k.expm), k.magic));
-        _mm256_sub_ps(_mm256_add_ps(v, c), c)
+        weights(st, k)
+    }
+
+    /// `decode8`, or under test with `V1` the first #180 decoder `decode8_v1` (same states)
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dec<const V1: bool>(tile: *const u8, n32: usize, g: &Group, k: &Consts) -> __m256 {
+        #[cfg(test)]
+        if V1 {
+            // SAFETY: as decode8
+            return unsafe { decode8_v1(tile, n32, g, k) };
+        }
+        // SAFETY: the caller's contract
+        unsafe { decode8(tile, n32, g, k) }
     }
 
     /// The AVX2 twin of `unit_scalar`, operation for operation.
@@ -536,7 +604,7 @@ mod avx2 {
     /// # Safety
     /// The CPU must have AVX2.
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn unit<const NT: usize>(m: &Mul1Matrix, tab: &Tables, xp: &[f32], t0: usize, nb0: usize, ntc: usize, raw: Out) {
+    pub(super) unsafe fn unit<const NT: usize, const V1: bool>(m: &Mul1Matrix, tab: &Tables, xp: &[f32], t0: usize, nb0: usize, ntc: usize, raw: Out) {
         let (tk, tn, tb) = (m.k / 16, m.n / 16, m.bitrate.tile_bytes());
         assert!(ntc <= UNIT_TILES && nb0 + ntc <= tn && xp.len() >= (t0 + NT) * tk * 32);
         let k = unsafe { consts() };
@@ -561,7 +629,7 @@ mod avx2 {
                     let mut a = *acc_c;
                     for q in 0..4 {
                         // SAFETY: AVX2 (caller), the tile has 4 * n32 bytes
-                        let w = unsafe { decode8(tile, tab.n32, &tab.groups[4 * c + q], &k) };
+                        let w = unsafe { dec::<V1>(tile, tab.n32, &tab.groups[4 * c + q], &k) };
                         for (t, at) in a.iter_mut().enumerate() {
                             // SAFETY: ((t0 + t) * tk + kb) * 32 + q * 8 + 8 <= xp.len() (asserted)
                             let xv = unsafe { _mm256_loadu_ps(xp.as_ptr().add(((t0 + t) * tk + kb) * 32 + q * 8)) };
@@ -588,8 +656,41 @@ mod avx2 {
     }
 }
 
+/// How the work is done: `NEW` (the shuffle decoder, units handed out by an atomic counter); under
+/// test also `V1`, the first #180 kernel (two-word decoder, units split statically by worker), the
+/// reference arm of the bit-identity test and the benchmark (#183). Both give the same bits:
+/// the same states and the same f32 operations per output column, and a unit is computed by
+/// exactly one worker whichever it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Impl {
+    v1: bool,
+}
+
+impl Impl {
+    pub(crate) const NEW: Impl = Impl { v1: false };
+    #[cfg(test)]
+    pub(crate) const V1: Impl = Impl { v1: true };
+}
+
+/// Worker `w` of `k` runs `f(u)` on its units of `0 .. units`: taken one at a time from `next`
+/// (a P-core takes more units than an E-core), or under `V1` the static block of `split`.
+fn for_units(im: Impl, next: &AtomicUsize, units: usize, k: usize, w: usize, mut f: impl FnMut(usize)) {
+    if im.v1 {
+        let (u0, u1) = split(units, k, w);
+        (u0..u1).for_each(f);
+        return;
+    }
+    loop {
+        let u = next.fetch_add(1, Ordering::Relaxed);
+        if u >= units {
+            break;
+        }
+        f(u);
+    }
+}
+
 /// One work unit (tile columns `UNIT_TILES u ..`) for every token of `xp`.
-fn unit_into(avx2: bool, m: &Mul1Matrix, tab: &Tables, xp: &[f32], tokens: usize, u: usize, raw: Out) {
+fn unit_into(avx2: bool, im: Impl, m: &Mul1Matrix, tab: &Tables, xp: &[f32], tokens: usize, u: usize, raw: Out) {
     let tn = m.n / 16;
     let nb0 = u * UNIT_TILES;
     let ntc = UNIT_TILES.min(tn - nb0);
@@ -600,17 +701,28 @@ fn unit_into(avx2: bool, m: &Mul1Matrix, tab: &Tables, xp: &[f32], tokens: usize
         if avx2 {
             // SAFETY: `avx2` is true only after `use_avx2` saw the feature on this CPU
             unsafe {
+                #[cfg(test)]
+                if im.v1 {
+                    match nt {
+                        1 => avx2::unit::<1, true>(m, tab, xp, t0, nb0, ntc, raw),
+                        2 => avx2::unit::<2, true>(m, tab, xp, t0, nb0, ntc, raw),
+                        3 => avx2::unit::<3, true>(m, tab, xp, t0, nb0, ntc, raw),
+                        _ => avx2::unit::<4, true>(m, tab, xp, t0, nb0, ntc, raw),
+                    }
+                    t0 += nt;
+                    continue;
+                }
                 match nt {
-                    1 => avx2::unit::<1>(m, tab, xp, t0, nb0, ntc, raw),
-                    2 => avx2::unit::<2>(m, tab, xp, t0, nb0, ntc, raw),
-                    3 => avx2::unit::<3>(m, tab, xp, t0, nb0, ntc, raw),
-                    _ => avx2::unit::<4>(m, tab, xp, t0, nb0, ntc, raw),
+                    1 => avx2::unit::<1, false>(m, tab, xp, t0, nb0, ntc, raw),
+                    2 => avx2::unit::<2, false>(m, tab, xp, t0, nb0, ntc, raw),
+                    3 => avx2::unit::<3, false>(m, tab, xp, t0, nb0, ntc, raw),
+                    _ => avx2::unit::<4, false>(m, tab, xp, t0, nb0, ntc, raw),
                 }
             }
             t0 += nt;
             continue;
         }
-        let _ = avx2;
+        let _ = (avx2, im);
         match nt {
             1 => unit_scalar::<1>(m, tab, xp, t0, nb0, ntc, raw),
             2 => unit_scalar::<2>(m, tab, xp, t0, nb0, ntc, raw),
@@ -645,8 +757,12 @@ fn scoped(k: usize, work: &(dyn Fn(usize) + Sync)) {
     }
 }
 
-/// `y[t] = x[t] W` for `x` `[T][k]`, `y` `[T][n]`, output columns split over `threads` workers.
+/// `y[t] = x[t] W` for `x` `[T][k]`, `y` `[T][n]`, output columns in units over `threads` workers.
 pub fn gemv(m: &Mul1Matrix, x: &[f32], y: &mut [f32], threads: usize, path: Path) {
+    gemv_with(Impl::NEW, m, x, y, threads, path)
+}
+
+pub(crate) fn gemv_with(im: Impl, m: &Mul1Matrix, x: &[f32], y: &mut [f32], threads: usize, path: Path) {
     assert!(x.len() % m.k == 0, "cpu_mul1::gemv: x is not [T][{}]", m.k);
     let tokens = x.len() / m.k;
     assert_eq!(y.len(), tokens * m.n, "cpu_mul1::gemv: y is not [T][{}]", m.n);
@@ -657,12 +773,8 @@ pub fn gemv(m: &Mul1Matrix, x: &[f32], y: &mut [f32], threads: usize, path: Path
     let out = Out(raw.as_mut_ptr(), raw.len());
     let units = units_of(m);
     let k = threads.clamp(1, units);
-    scoped(k, &|w| {
-        let (u0, u1) = split(units, k, w);
-        for u in u0..u1 {
-            unit_into(avx2, m, &tab, &xp, tokens, u, out);
-        }
-    });
+    let next = AtomicUsize::new(0);
+    scoped(k, &|w| for_units(im, &next, units, k, w, |u| unit_into(avx2, im, m, &tab, &xp, tokens, u, out)));
     had_out(&raw, m, y);
 }
 
@@ -672,6 +784,10 @@ pub fn gemv(m: &Mul1Matrix, x: &[f32], y: &mut [f32], threads: usize, path: Path
 /// activation and prepares down's input, a barrier, phase 2 splits the down units; the caller
 /// finishes down. Bit for bit `gemv(down, silu(gemv(gate, x)) * gemv(up, x))`.
 pub fn expert_ffn(e: &Mul1Expert, x: &[f32], y: &mut [f32], threads: usize, path: Path) {
+    expert_ffn_with(Impl::NEW, e, x, y, threads, path)
+}
+
+pub(crate) fn expert_ffn_with(im: Impl, e: &Mul1Expert, x: &[f32], y: &mut [f32], threads: usize, path: Path) {
     let (h, i) = (e.hidden, e.inter);
     assert!(x.len() % h == 0, "cpu_mul1::expert_ffn: x is not [T][{h}]");
     let tokens = x.len() / h;
@@ -689,15 +805,15 @@ pub fn expert_ffn(e: &Mul1Expert, x: &[f32], y: &mut [f32], threads: usize, path
     let (ug, ud) = (units_of(&e.gate), units_of(&e.down));
     let k = threads.clamp(1, (2 * ug).min(ud));
     let barrier = Barrier::new(k);
+    let (next1, next2) = (AtomicUsize::new(0), AtomicUsize::new(0));
     scoped(k, &|w| {
-        let (u0, u1) = split(2 * ug, k, w);
-        for u in u0..u1 {
+        for_units(im, &next1, 2 * ug, k, w, |u| {
             if u < ug {
-                unit_into(avx2, &e.gate, &tab, &xp_g, tokens, u, og);
+                unit_into(avx2, im, &e.gate, &tab, &xp_g, tokens, u, og);
             } else {
-                unit_into(avx2, &e.up, &tab, &xp_u, tokens, u - ug, ou);
+                unit_into(avx2, im, &e.up, &tab, &xp_u, tokens, u - ug, ou);
             }
-        }
+        });
         barrier.wait();
         if w == 0 {
             // SAFETY: every write to raw_g / raw_u happened before the barrier; read only here
@@ -714,10 +830,7 @@ pub fn expert_ffn(e: &Mul1Expert, x: &[f32], y: &mut [f32], threads: usize, path
         barrier.wait();
         // SAFETY: worker 0 wrote xp_d before the second barrier; read only from here on
         let xd = unsafe { std::slice::from_raw_parts(oxd.0 as *const f32, oxd.1) };
-        let (d0, d1) = split(ud, k, w);
-        for u in d0..d1 {
-            unit_into(avx2, &e.down, &tab_d, xd, tokens, u, od);
-        }
+        for_units(im, &next2, ud, k, w, |u| unit_into(avx2, im, &e.down, &tab_d, xd, tokens, u, od));
     });
     drop((raw_g, raw_u, xp_d));
     had_out(&raw_d, &e.down, y);
@@ -1298,6 +1411,76 @@ mod tests {
         assert_eq!(bits(&ffn(&e, &x, 3, Path::Avx2)), s, "full GLM expert FFN, 3 threads");
     }
 
+    /// #183: the shuffle decoder and the counter scheduler give the bits of the first
+    /// #180 kernel (`Impl::V1`): every lane decode of every bitrate (random tiles, wrap included),
+    /// GEMV of the 4 quantizer experts and of synthetic K = 1, 1.5, 2.5, 5, 8 at T 1, 2, 3, 5, 8 x
+    /// threads 1, 3, 8, 16, and the FFN of a full GLM expert at T 1 and 4 x threads 1, 8, 16, 24.
+    #[test]
+    fn cpu_mul1_decode_and_schedule_equal_v1_bits() {
+        if !avx2_available() {
+            eprintln!("cpu_mul1: no AVX2 on this CPU, the AVX2 path is not exercised");
+            return;
+        }
+        let mut rng = Rng(0xD1CE);
+        for k in [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 7.0, 8.0] {
+            let b = Bitrate::from_k(k).unwrap();
+            let tab = Tables::new(b);
+            for _ in 0..64 {
+                let tile: Vec<u8> = (0..b.tile_bytes()).map(|_| rng.next() as u8).collect();
+                for g in 0..32 {
+                    let (mut new, mut old) = ([0f32; 8], [0f32; 8]);
+                    // SAFETY: AVX2 checked; the tile holds 4 * n32 bytes
+                    unsafe {
+                        let kc = avx2::consts();
+                        std::arch::x86_64::_mm256_storeu_ps(new.as_mut_ptr(), avx2::decode8(tile.as_ptr(), tab.n32, &tab.groups[g], &kc));
+                        std::arch::x86_64::_mm256_storeu_ps(old.as_mut_ptr(), avx2::decode8_v1(tile.as_ptr(), tab.n32, &tab.groups[g], &kc));
+                    }
+                    assert_eq!(bits(&new), bits(&old), "K = {k} lane {g}");
+                }
+            }
+        }
+        let mut all = quant_cases();
+        for (i, k) in [1.0, 1.5, 2.5, 5.0, 8.0].into_iter().enumerate() {
+            all.push(Case {
+                name: format!("synth K = {k}"),
+                source: format!("synth:{}", 60 + i),
+                bitrate: Bitrate::from_k(k).unwrap(),
+                hidden: 512,
+                inter: 256,
+                want: [String::new(), String::new(), String::new()],
+            });
+        }
+        for c in &all {
+            let rec = record(c);
+            let e = Mul1Expert::from_record(&rec, c.hidden, c.inter, c.bitrate).unwrap();
+            for m in [e.gate, e.down] {
+                for t in [1usize, 2, 3, 5, 8] {
+                    let x = xs(t * m.k, &mut rng);
+                    let mut want = vec![0f32; t * m.n];
+                    gemv_with(Impl::V1, &m, &x, &mut want, 1, Path::Avx2);
+                    for th in [1usize, 3, 8, 16] {
+                        let mut y = vec![0f32; t * m.n];
+                        gemv_with(Impl::NEW, &m, &x, &mut y, th, Path::Avx2);
+                        assert_eq!(bits(&y), bits(&want), "{} [{}, {}] T {t} threads {th}", c.name, m.k, m.n);
+                    }
+                }
+            }
+        }
+        let c = &glm_cases()[0];
+        let rec = record(c);
+        let e = Mul1Expert::from_record(&rec, c.hidden, c.inter, c.bitrate).unwrap();
+        for t in [1usize, 4] {
+            let x = xs(t * GLM_HIDDEN, &mut rng);
+            let mut want = vec![0f32; x.len()];
+            expert_ffn_with(Impl::V1, &e, &x, &mut want, 8, Path::Avx2);
+            for th in [1usize, 8, 16, 24] {
+                let mut y = vec![0f32; x.len()];
+                expert_ffn_with(Impl::NEW, &e, &x, &mut y, th, Path::Avx2);
+                assert_eq!(bits(&y), bits(&want), "GLM FFN T {t} threads {th}");
+            }
+        }
+    }
+
     /// The activation assumption of the FFN bound: the f32 `g / (1 + exp(-g)) * u` is within
     /// gamma32(8) relative of the exact value, over g in [-40, 40].
     #[test]
@@ -1355,7 +1538,8 @@ mod tests {
 
     /// Micro-benchmark, not a gate: one FFN over GLM-shaped K = 3 records rotated across 8 distinct
     /// records (76 MB, more than the L3), T 1 and 4, threads 1, 4, 8, 16, 24. Trellis + scale
-    /// bytes / wall time.
+    /// bytes / wall time. Two arms alternating call by call (#183): `Impl::V1` (the first
+    /// #180 kernel) on even calls, `Impl::NEW` on odd calls; median of 24 calls per arm.
     /// `cargo test --release -p crow-nest-engine cpu_mul1_bench -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -1381,23 +1565,27 @@ mod tests {
             let mut y = vec![0f32; t * GLM_HIDDEN];
             for &th in &[1usize, 4, 8, 16, 24] {
                 for e in &experts {
-                    expert_ffn(e, &x, &mut y, th, path);
+                    expert_ffn_with(Impl::V1, e, &x, &mut y, th, path);
+                    expert_ffn_with(Impl::NEW, e, &x, &mut y, th, path);
                 }
-                let mut ms = Vec::new();
-                for rep in 0..24 {
+                let mut ms = [Vec::new(), Vec::new()];
+                for rep in 0..48 {
+                    let im = if rep % 2 == 0 { Impl::V1 } else { Impl::NEW };
                     let t0 = std::time::Instant::now();
-                    expert_ffn(&experts[rep % experts.len()], &x, &mut y, th, path);
-                    ms.push(t0.elapsed().as_secs_f64() * 1e3);
+                    expert_ffn_with(im, &experts[(rep / 2) % experts.len()], &x, &mut y, th, path);
+                    ms[rep % 2].push(t0.elapsed().as_secs_f64() * 1e3);
                 }
-                ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let med = ms[ms.len() / 2];
-                eprintln!(
-                    "  T {t} threads {th:2}: median {med:.3} ms per expert ({:.2} GB/s of record bytes), min {:.3} max {:.3} ms, n {}",
-                    bytes as f64 / (med * 1e-3) / 1e9,
-                    ms[0],
-                    ms[ms.len() - 1],
-                    ms.len()
-                );
+                for (arm, ms) in ["v1 ", "new"].iter().zip(ms.iter_mut()) {
+                    ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let med = ms[ms.len() / 2];
+                    eprintln!(
+                        "  T {t} threads {th:2} {arm}: median {med:.3} ms per expert ({:.2} GB/s of record bytes), min {:.3} max {:.3} ms, n {}",
+                        bytes as f64 / (med * 1e-3) / 1e9,
+                        ms[0],
+                        ms[ms.len() - 1],
+                        ms.len()
+                    );
+                }
             }
         }
     }
