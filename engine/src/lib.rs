@@ -105,6 +105,8 @@ pub mod glm5_template;
 pub mod stopstr;
 pub mod reset;
 pub mod cpu_nvfp4;
+// #180: the MUL1 trellis expert GEMV / FFN on the CPU (AVX2 + scalar); the GPU half is kernels::mul1
+pub mod cpu_mul1;
 // #31 A9: the prefix cache (spec section 7) - snapshot, rollback and the id prefix rule
 pub mod cache;
 // #32 A10: the slot file behind POST /slots/0?action=save|restore (spec section 7)

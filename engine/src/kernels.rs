@@ -6187,3 +6187,520 @@ mod tests_300_c4_gpu {
         }
     }
 }
+
+// ---------------- #180: MUL1 trellis expert kernels ----------------
+
+/// #180: the MUL1 trellis expert GEMV / FFN source (`kernels_mul1.cu`). Its own NVRTC module,
+/// compiled alone by `mul1::Kernels::new`: one more `.entry` in `KERNEL_SRC` would break the PTX
+/// of record (`tests_300_c4`), and these kernels use none of its helpers.
+pub const MUL1_SRC: &str = include_str!("kernels_mul1.cu");
+
+/// #180: the host side of `MUL1_SRC`. A plan holds the per-launch parameter buffers and the
+/// scratch of one shape; `run` queues the launches on the current stream. A slot's record base
+/// (`ptrs[e]`) is a VRAM address or a pinned-host UVA address, residency is invisible to the
+/// kernels (the `gemv_fp4_ptrb` pattern). Nothing in the engine calls this yet (plan step 16).
+pub mod mul1 {
+    use super::launch_v;
+    use crate::cuda;
+    use cudarc::driver::sys::{CUdeviceptr, CUfunction};
+
+    /// every entry of `MUL1_SRC`
+    pub const NAMES: &[&str] = &["mul1_had_in", "mul1_gemv", "mul1_had_out", "mul1_act_had_in", "mul1_decode_states"];
+    /// tokens per slot (`MUL1_MAXT`)
+    pub const MAXT: usize = 8;
+    /// activation rows one k-split stages in shared memory (`MUL1_XROWS`)
+    pub const XROWS: usize = 512;
+
+    /// The k-split S of a GEMV with input width `k`: the largest power of two <= 16 that divides
+    /// the `k / 16` tile rows (k is a multiple of 128, so S >= 8).
+    pub fn ksplit(k: usize) -> usize {
+        assert!(k > 0 && k % 128 == 0, "mul1: k = {k} is not a positive multiple of 128");
+        let tk = k / 16;
+        let mut s = 16;
+        while tk % s != 0 {
+            s /= 2;
+        }
+        assert!(k / s <= XROWS, "mul1: k = {k} with S = {s} stages {} rows > {XROWS}", k / s);
+        s
+    }
+
+    /// The f32 rounding count of one GPU GEMV with input width `k` (`kernels_mul1.cu` header):
+    /// `k / (4 S) + S + 17`.
+    pub fn rounding_steps(k: usize) -> usize {
+        let s = ksplit(k);
+        k / (4 * s) + s + 17
+    }
+
+    /// One linear of a record: shape `[k = in, n = out]`, bitrate, byte offsets of its trellis,
+    /// suh and svh from the record base.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MatSpec {
+        pub k: usize,
+        pub n: usize,
+        pub bits: u32,
+        pub half: bool,
+        pub tr_off: usize,
+        pub suh_off: usize,
+        pub svh_off: usize,
+    }
+
+    impl MatSpec {
+        /// u32 words per tile
+        pub fn n32(&self) -> usize {
+            (16 * self.bits as usize + if self.half { 8 } else { 0 }) / 2
+        }
+        pub fn trellis_bytes(&self) -> usize {
+            self.k / 16 * (self.n / 16) * self.n32() * 4
+        }
+    }
+
+    /// gate, up, down of one #181 record (`converter/src/mul1.rs` `write_record`)
+    pub fn record_specs(hidden: usize, inter: usize, bits: u32, half: bool) -> [MatSpec; 3] {
+        let n32 = (16 * bits as usize + if half { 8 } else { 0 }) / 2;
+        let tb = hidden / 16 * (inter / 16) * n32 * 4;
+        let (b, h2, i2) = (3 * tb, 2 * hidden, 2 * inter);
+        let m = |k, n, tr_off, suh_off, svh_off| MatSpec { k, n, bits, half, tr_off, suh_off, svh_off };
+        [
+            m(hidden, inter, 0, b, b + h2),
+            m(hidden, inter, tb, b + h2 + i2, b + 2 * h2 + i2),
+            m(inter, hidden, 2 * tb, b + 2 * h2 + 2 * i2, b + 2 * h2 + 3 * i2),
+        ]
+    }
+
+    /// the compiled module and its entries
+    pub struct Kernels {
+        pub module: cuda::Module,
+        had_in: CUfunction,
+        gemv: CUfunction,
+        had_out: CUfunction,
+        act: CUfunction,
+        pub decode_states: CUfunction,
+    }
+
+    impl Kernels {
+        /// # Safety
+        /// A CUDA context is current.
+        pub unsafe fn new() -> Kernels {
+            let module = cuda::compile(super::MUL1_SRC);
+            Kernels {
+                had_in: module.get("mul1_had_in"),
+                gemv: module.get("mul1_gemv"),
+                had_out: module.get("mul1_had_out"),
+                act: module.get("mul1_act_had_in"),
+                decode_states: module.get("mul1_decode_states"),
+                module,
+            }
+        }
+    }
+
+    fn i32s(v: &[usize]) -> Vec<i32> {
+        v.iter().map(|&x| i32::try_from(x).expect("mul1: parameter beyond i32")).collect()
+    }
+
+    /// One GEMV shape for `slots` experts x `tokens` rows each: x `[E][T][k]` -> y `[E][T][n]`.
+    pub struct GemvPlan {
+        pub spec: MatSpec,
+        pub slots: usize,
+        pub tokens: usize,
+        pub s: usize,
+        prm_in: CUdeviceptr,
+        prm_gemv: CUdeviceptr,
+        prm_out: CUdeviceptr,
+        /// `[E][T][k]` transformed activations
+        pub xh: CUdeviceptr,
+        /// `[E][S][T][n]` raw partials
+        pub part: CUdeviceptr,
+    }
+
+    impl GemvPlan {
+        /// # Safety
+        /// A CUDA context is current.
+        pub unsafe fn new(spec: MatSpec, slots: usize, tokens: usize) -> GemvPlan {
+            assert!((1..=MAXT).contains(&tokens), "mul1: {tokens} tokens per slot (1..={MAXT})");
+            assert!(spec.n % 128 == 0 && slots > 0);
+            let s = ksplit(spec.k);
+            let (k, n, t) = (spec.k, spec.n, tokens);
+            GemvPlan {
+                spec,
+                slots,
+                tokens,
+                s,
+                prm_in: cuda::to_i32_dev(&i32s(&[k, t, spec.suh_off])),
+                prm_gemv: cuda::to_i32_dev(&i32s(&[k, n, s, spec.tr_off, spec.n32(), spec.bits as usize, spec.half as usize, t])),
+                prm_out: cuda::to_i32_dev(&i32s(&[n, s, t, spec.svh_off])),
+                xh: cuda::alloc_zeroed(slots * t * k * 4),
+                part: cuda::alloc_zeroed(slots * s * t * n * 4),
+            }
+        }
+
+        unsafe fn launch_in(&self, kn: &Kernels, ptrs: CUdeviceptr, x: CUdeviceptr) {
+            launch_v(kn.had_in, (self.spec.k / 128) as u32, self.tokens as u32, self.slots as u32, 32, &[ptrs, x, self.xh, self.prm_in]);
+        }
+
+        unsafe fn launch_gemv(&self, kn: &Kernels, ptrs: CUdeviceptr) {
+            launch_v(kn.gemv, (self.spec.n / 128) as u32, self.s as u32, self.slots as u32, 256, &[ptrs, self.xh, self.part, self.prm_gemv]);
+        }
+
+        unsafe fn launch_out(&self, kn: &Kernels, ptrs: CUdeviceptr, y: CUdeviceptr) {
+            launch_v(kn.had_out, (self.spec.n / 128) as u32, self.tokens as u32, self.slots as u32, 32, &[ptrs, self.part, y, self.prm_out]);
+        }
+
+        /// queue `y = x W` for every slot (three launches on the current stream)
+        ///
+        /// # Safety
+        /// `ptrs` holds `slots` record bases that stay readable until the launches finished;
+        /// `x`, `y` are `[E][T][k]` / `[E][T][n]` f32 device buffers.
+        pub unsafe fn run(&self, kn: &Kernels, ptrs: CUdeviceptr, x: CUdeviceptr, y: CUdeviceptr) {
+            self.launch_in(kn, ptrs, x);
+            self.launch_gemv(kn, ptrs);
+            self.launch_out(kn, ptrs, y);
+        }
+
+        /// # Safety
+        /// No launch of this plan is pending.
+        pub unsafe fn free(&mut self) {
+            for d in [&mut self.prm_in, &mut self.prm_gemv, &mut self.prm_out, &mut self.xh, &mut self.part] {
+                cuda::free_dev(d);
+            }
+        }
+    }
+
+    /// The expert FFN `y = down(silu(gate(x)) * up(x))` for `slots` experts x `tokens` rows:
+    /// x, y `[E][T][hidden]`; `h` keeps the activation `[E][T][inter]` the down GEMV read.
+    pub struct FfnPlan {
+        pub gate: GemvPlan,
+        pub up: GemvPlan,
+        pub down: GemvPlan,
+        prm_act: CUdeviceptr,
+        pub h: CUdeviceptr,
+    }
+
+    impl FfnPlan {
+        /// # Safety
+        /// A CUDA context is current.
+        pub unsafe fn new(hidden: usize, inter: usize, bits: u32, half: bool, slots: usize, tokens: usize) -> FfnPlan {
+            let [g, u, d] = record_specs(hidden, inter, bits, half);
+            let (gate, up, down) = (GemvPlan::new(g, slots, tokens), GemvPlan::new(u, slots, tokens), GemvPlan::new(d, slots, tokens));
+            assert_eq!(gate.s, up.s);
+            let prm_act = cuda::to_i32_dev(&i32s(&[inter, gate.s, tokens, g.svh_off, u.svh_off, d.suh_off]));
+            let h = cuda::alloc_zeroed(slots * tokens * inter * 4);
+            FfnPlan { gate, up, down, prm_act, h }
+        }
+
+        /// queue the FFN for every slot (seven launches on the current stream)
+        ///
+        /// # Safety
+        /// As `GemvPlan::run`, `x` and `y` `[E][T][hidden]`.
+        pub unsafe fn run(&self, kn: &Kernels, ptrs: CUdeviceptr, x: CUdeviceptr, y: CUdeviceptr) {
+            self.gate.launch_in(kn, ptrs, x);
+            self.up.launch_in(kn, ptrs, x);
+            self.gate.launch_gemv(kn, ptrs);
+            self.up.launch_gemv(kn, ptrs);
+            let (inter, t, e) = (self.gate.spec.n, self.gate.tokens, self.gate.slots);
+            launch_v(kn.act, (inter / 128) as u32, t as u32, e as u32, 32, &[ptrs, self.gate.part, self.up.part, self.h, self.down.xh, self.prm_act]);
+            self.down.launch_gemv(kn, ptrs);
+            self.down.launch_out(kn, ptrs, y);
+        }
+
+        /// # Safety
+        /// No launch of this plan is pending.
+        pub unsafe fn free(&mut self) {
+            self.gate.free();
+            self.up.free();
+            self.down.free();
+            cuda::free_dev(&mut self.prm_act);
+            cuda::free_dev(&mut self.h);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_mul1_src {
+    //! #180: `MUL1_SRC` compiles with the engine's option set to one PTX module carrying every
+    //! entry `mul1::NAMES` lists; host only (NVRTC), no GPU.
+    #[test]
+    fn mul1_source_compiles_with_every_entry() {
+        let ptx = super::tests_300_c4::ptx(super::MUL1_SRC);
+        let names: Vec<String> = super::tests_300_c4::entries(&ptx).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names.len(), super::mul1::NAMES.len(), "{names:?}");
+        for n in super::mul1::NAMES {
+            assert!(names.iter().any(|m| m == n), "{n} missing from {names:?}");
+        }
+        assert_eq!(super::mul1::rounding_steps(4096), 97);
+        assert_eq!(super::mul1::rounding_steps(2048), 65);
+        let [g, u, d] = super::mul1::record_specs(4096, 2048, 3, false);
+        assert_eq!((g.trellis_bytes(), u.tr_off, d.tr_off, d.svh_off + 2 * 4096), (3_145_728, 3_145_728, 6_291_456, 9_474_048));
+    }
+}
+
+#[cfg(test)]
+mod tests_mul1_gpu {
+    //! #180 acceptance on the GPU (RTX 5090, sm_120): the decode, the GEMV and the FFN against the
+    //! f64 evaluation of the #181-decoded tensor (`cpu_mul1::testkit`), the VRAM and the pinned
+    //! lane bit-identical, GPU vs CPU within both bounds. `#[ignore]`: CI has no GPU. Run with
+    //! `cargo test --release --lib mul1_gpu -- --ignored --nocapture --test-threads 1`.
+    use super::launch_sync;
+    use super::mul1::{self, FfnPlan, GemvPlan, Kernels};
+    use crate::cpu_mul1::{self, testkit::*, Mul1Expert, Path};
+    use crate::cuda;
+
+    /// records resident twice: in VRAM and in pinned host memory (UVA); one pointer table each
+    struct Lanes {
+        vram: u64,
+        pinned: cuda::Pinned,
+        ptr_v: u64,
+        ptr_p: u64,
+    }
+
+    unsafe fn lanes(recs: &[&[u8]]) -> Lanes {
+        let all: Vec<u8> = recs.iter().flat_map(|r| r.iter().copied()).collect();
+        let vram = cuda::upload_dev(&all);
+        let mut pinned = cuda::Pinned::alloc_cold(all.len());
+        pinned.write_bytes(0, &all);
+        let mut off = 0u64;
+        let (mut pv, mut pp) = (Vec::new(), Vec::new());
+        for r in recs {
+            pv.push(vram + off);
+            pp.push(pinned.dev + off);
+            off += r.len() as u64;
+        }
+        Lanes { vram, ptr_v: cuda::to_u64_dev(&pv), ptr_p: cuda::to_u64_dev(&pp), pinned }
+    }
+
+    unsafe fn drop_lanes(mut l: Lanes) {
+        cuda::free_dev(&mut l.vram);
+        cuda::free_dev(&mut l.ptr_v);
+        cuda::free_dev(&mut l.ptr_p);
+        l.pinned.free();
+    }
+
+    fn spec_of(c: &Case) -> [mul1::MatSpec; 3] {
+        mul1::record_specs(c.hidden, c.inter, c.bitrate.bits, c.bitrate.half)
+    }
+
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib mul1_gpu -- --ignored --nocapture --test-threads 1"]
+    fn mul1_gpu_decode_is_the_codec() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Kernels::new();
+            let mut out = cuda::alloc_zeroed(65536 * 4);
+            launch_sync(kn.decode_states, 256, 1, 1, 256, &[out]);
+            let got = cuda::dtoh(out, 65536);
+            for (s, g) in got.iter().enumerate() {
+                assert_eq!(g.to_bits(), (f16_to_f64(mul1_decode(s as u16)) as f32).to_bits(), "state {s:#06x}");
+            }
+            cuda::free_dev(&mut out);
+        }
+    }
+
+    /// Acceptance 1 and 3 (GPU): every GEMV output within the amended bound, the same bits from
+    /// the VRAM slot and from pinned RAM, and GPU vs CPU within the sum of both bounds.
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib mul1_gpu -- --ignored --nocapture --test-threads 1"]
+    fn mul1_gpu_gemv_holds_the_bound_in_vram_and_pinned() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Kernels::new();
+            let mut rng = Rng(0x5090);
+            for c in cases() {
+                let rec = record(&c);
+                let e = Mul1Expert::from_record(&rec, c.hidden, c.inter, c.bitrate).unwrap();
+                let l = lanes(&[&rec]);
+                let sp = spec_of(&c);
+                for (name, m, spec) in [("gate", e.gate, sp[0]), ("up", e.up, sp[1]), ("down", e.down, sp[2])] {
+                    let r = RefLinear::new(&m);
+                    for t in [1usize, 2, 4] {
+                        let x = xs(t * m.k, &mut rng);
+                        let mut plan = GemvPlan::new(spec, 1, t);
+                        let (mut xd, mut yd) = (cuda::to_f32_dev(&x), cuda::alloc_zeroed(t * m.n * 4));
+                        plan.run(&kn, l.ptr_v, xd, yd);
+                        cuda::sync();
+                        let yv = cuda::dtoh(yd, t * m.n);
+                        plan.run(&kn, l.ptr_p, xd, yd);
+                        cuda::sync();
+                        let yp = cuda::dtoh(yd, t * m.n);
+                        assert_eq!(bits(&yv), bits(&yp), "{} {name} T {t}: VRAM and pinned lanes differ", c.name);
+                        let (yr, a, mm) = r.eval(&f64s(&x));
+                        let ng = mul1::rounding_steps(m.k);
+                        let (w, wr) = ratios(&yv, &yr, &a, &mm, m.k, ng);
+                        assert!(w <= 1.0 && wr <= 1.0, "{} {name} T {t}: {w:.3} x bound ({wr:.2e} x rigorous)", c.name);
+                        let mut yc = vec![0f32; t * m.n];
+                        cpu_mul1::gemv(&m, &x, &mut yc, 8, Path::Auto);
+                        let gb = gamma32(ng) + gamma32(cpu_mul1::rounding_steps(m.k));
+                        let wc = yv.iter().zip(&yc).zip(&a).map(|((&g, &c), &s)| (g as f64 - c as f64).abs() / (gb * s)).fold(0.0, f64::max);
+                        assert!(wc <= 1.0, "{} {name} T {t}: GPU vs CPU {wc:.3} x the summed bound", c.name);
+                        if t == 1 {
+                            eprintln!("{} {name} [{}, {}]: GPU {w:.4} x bound ({wr:.2e} x rigorous), GPU vs CPU {wc:.4} x summed bound", c.name, m.k, m.n);
+                        }
+                        cuda::free_dev(&mut xd);
+                        cuda::free_dev(&mut yd);
+                        plan.free();
+                    }
+                }
+                drop_lanes(l);
+            }
+        }
+    }
+
+    /// Acceptance 4 (GPU): the FFN's down stage equals the public GEMV on the FFN's own
+    /// activation bit for bit and holds the GEMV bound on it, the whole FFN holds the chain bound
+    /// against all-f64, VRAM == pinned, GPU vs CPU within the sum of both chain bounds; two slots
+    /// in one launch give the bits of one slot each.
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib mul1_gpu -- --ignored --nocapture --test-threads 1"]
+    fn mul1_gpu_ffn_matches_reference() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Kernels::new();
+            let mut rng = Rng(0xFFA);
+            let mut all = quant_cases();
+            all.push(glm_cases().remove(0));
+            for c in all {
+                let rec = record(&c);
+                let e = Mul1Expert::from_record(&rec, c.hidden, c.inter, c.bitrate).unwrap();
+                let (rg, ru, rd) = (RefLinear::new(&e.gate), RefLinear::new(&e.up), RefLinear::new(&e.down));
+                let (h, i) = (c.hidden, c.inter);
+                let sp = spec_of(&c);
+                let l = lanes(&[&rec, &rec]);
+                for t in [1usize, 2, 4] {
+                    let x = xs(t * h, &mut rng);
+                    let mut plan = FfnPlan::new(h, i, c.bitrate.bits, c.bitrate.half, 1, t);
+                    let (xd, yd) = (cuda::to_f32_dev(&x), cuda::alloc_zeroed(t * h * 4));
+                    plan.run(&kn, l.ptr_p, xd, yd);
+                    cuda::sync();
+                    let yp = cuda::dtoh(yd, t * h);
+                    plan.run(&kn, l.ptr_v, xd, yd);
+                    cuda::sync();
+                    let y = cuda::dtoh(yd, t * h);
+                    assert_eq!(bits(&y), bits(&yp), "{} T {t}: VRAM and pinned FFN differ", c.name);
+                    let hk = cuda::dtoh(plan.h, t * i);
+                    // staged: the public GEMV of down on the FFN's own activation
+                    let mut pd = GemvPlan::new(sp[2], 1, t);
+                    let (hd, ys) = (cuda::to_f32_dev(&hk), cuda::alloc_zeroed(t * h * 4));
+                    pd.run(&kn, l.ptr_v, hd, ys);
+                    cuda::sync();
+                    assert_eq!(bits(&cuda::dtoh(ys, t * h)), bits(&y), "{} T {t}: fused != staged", c.name);
+                    let (yr, a, mm) = rd.eval(&f64s(&hk));
+                    let (w, _) = ratios(&y, &yr, &a, &mm, i, mul1::rounding_steps(i));
+                    assert!(w <= 1.0, "{} T {t}: down stage {w:.3} x bound", c.name);
+                    // the up output the activation read: the public GEMV of up (the same launches)
+                    let mut pu = GemvPlan::new(sp[1], 1, t);
+                    let ud = cuda::alloc_zeroed(t * i * 4);
+                    pu.run(&kn, l.ptr_v, xd, ud);
+                    cuda::sync();
+                    let u = cuda::dtoh(ud, t * i);
+                    let (yr, bound) = ffn_bound(&rg, &ru, &rd, &x, &u, &hk, mul1::rounding_steps(h), mul1::rounding_steps(i));
+                    let worst = y.iter().zip(&yr).zip(&bound).map(|((&a, &b), &s)| (a as f64 - b).abs() / s).fold(0.0, f64::max);
+                    assert!(worst <= 1.0, "{} T {t}: FFN {worst:.3} x chain bound", c.name);
+                    // GPU vs CPU: within the sum of the two chain bounds
+                    let mut yc = vec![0f32; t * h];
+                    cpu_mul1::expert_ffn(&e, &x, &mut yc, 8, Path::Auto);
+                    let (mut gc, mut uc) = (vec![0f32; t * i], vec![0f32; t * i]);
+                    cpu_mul1::gemv(&e.gate, &x, &mut gc, 8, Path::Auto);
+                    cpu_mul1::gemv(&e.up, &x, &mut uc, 8, Path::Auto);
+                    let hc: Vec<f32> = gc.iter().zip(&uc).map(|(&g, &u)| cpu_mul1::silu_mul(g, u)).collect();
+                    let (_, bc) = ffn_bound(&rg, &ru, &rd, &x, &uc, &hc, cpu_mul1::rounding_steps(h), cpu_mul1::rounding_steps(i));
+                    let wc = y
+                        .iter()
+                        .zip(&yc)
+                        .zip(bound.iter().zip(&bc))
+                        .map(|((&g, &c), (&b1, &b2))| (g as f64 - c as f64).abs() / (b1 + b2))
+                        .fold(0.0, f64::max);
+                    assert!(wc <= 1.0, "{} T {t}: GPU vs CPU FFN {wc:.3} x summed chain bound", c.name);
+                    if t == 1 {
+                        eprintln!("{} FFN H {h} I {i}: GPU {worst:.4} x chain bound, down stage {w:.4} x bound, GPU vs CPU {wc:.4}", c.name);
+                    }
+                    // two slots (the same record twice) in one launch: each slot gives one slot's bits
+                    let x2: Vec<f32> = x.iter().chain(x.iter()).copied().collect();
+                    let mut p2 = FfnPlan::new(h, i, c.bitrate.bits, c.bitrate.half, 2, t);
+                    let (x2d, y2d) = (cuda::to_f32_dev(&x2), cuda::alloc_zeroed(2 * t * h * 4));
+                    p2.run(&kn, l.ptr_p, x2d, y2d);
+                    cuda::sync();
+                    let y2 = cuda::dtoh(y2d, 2 * t * h);
+                    assert_eq!(bits(&y2[..t * h]), bits(&y), "{} T {t}: slot 0 of 2", c.name);
+                    assert_eq!(bits(&y2[t * h..]), bits(&y), "{} T {t}: slot 1 of 2", c.name);
+                    for mut d in [xd, yd, hd, ys, ud, x2d, y2d] {
+                        cuda::free_dev(&mut d);
+                    }
+                    plan.free();
+                    pd.free();
+                    pu.free();
+                    p2.free();
+                }
+                drop_lanes(l);
+            }
+        }
+    }
+
+    /// Micro-benchmark, not a gate (#180 item 5, short form): GB/s of record bytes the GPU reads
+    /// per second from VRAM and zero-copy from pinned RAM, GEMV (gate trellis bytes) and FFN
+    /// (whole record), T 1 and 4, 16 distinct GLM-shaped K = 3 records rotated (152 MB, more than
+    /// the 96 MB L2). Each row: 5 timed rounds (after one warm-up) of 64 calls queued back to back
+    /// with one sync; median, min, max over the rounds.
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib mul1_gpu_bench -- --ignored --nocapture"]
+    fn mul1_gpu_bench() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Kernels::new();
+            let c = &glm_cases()[0];
+            let base = record(c);
+            let tb = cpu_mul1::Mul1Matrix::trellis_bytes(c.hidden, c.inter, c.bitrate);
+            let recs: Vec<Vec<u8>> = (0..16u32)
+                .map(|i| {
+                    let mut r = base.clone();
+                    r[..3 * tb].iter_mut().for_each(|b| *b = b.rotate_left(i % 8) ^ (i as u8));
+                    r
+                })
+                .collect();
+            let refs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
+            let l = lanes(&refs);
+            let rec_bytes = (3 * tb + 6 * (c.hidden + c.inter)) as f64;
+            let gate_bytes = tb as f64;
+            eprintln!("mul1 GPU bench: K = 3, record {rec_bytes} B, gate trellis {gate_bytes} B, 16 records rotated");
+            for t in [1usize, 4] {
+                let x = xs(16 * t * c.hidden, &mut Rng(7));
+                let (mut xd, mut yd) = (cuda::to_f32_dev(&x), cuda::alloc_zeroed(t * c.hidden * 4));
+                let mut gp = GemvPlan::new(spec_of(c)[0], 1, t);
+                let mut fp = FfnPlan::new(c.hidden, c.inter, c.bitrate.bits, c.bitrate.half, 1, t);
+                for (lane, pbase) in [("VRAM", l.ptr_v), ("pinned", l.ptr_p)] {
+                    for (what, bytes) in [("gemv gate", gate_bytes), ("ffn", rec_bytes)] {
+                        let mut gbs = Vec::new();
+                        for round in 0..6 {
+                            cuda::sync();
+                            let t0 = std::time::Instant::now();
+                            for call in 0..64usize {
+                                let e = call % 16;
+                                let (pe, xe) = (pbase + 8 * e as u64, xd + (e * t * c.hidden * 4) as u64);
+                                if what == "ffn" {
+                                    fp.run(&kn, pe, xe, yd);
+                                } else {
+                                    gp.run(&kn, pe, xe, yd);
+                                }
+                            }
+                            cuda::sync();
+                            let s = t0.elapsed().as_secs_f64();
+                            if round > 0 {
+                                gbs.push(64.0 * bytes / s / 1e9);
+                            }
+                        }
+                        gbs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        eprintln!(
+                            "  {lane:6} {what:9} T {t}: median {:.1} GB/s (min {:.1}, max {:.1}), {:.1} us per call, 5 rounds x 64 calls",
+                            gbs[2],
+                            gbs[0],
+                            gbs[4],
+                            bytes / (gbs[2] * 1e9) * 1e6
+                        );
+                    }
+                }
+                cuda::free_dev(&mut xd);
+                cuda::free_dev(&mut yd);
+                gp.free();
+                fp.free();
+            }
+            drop_lanes(l);
+        }
+    }
+}
