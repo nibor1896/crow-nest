@@ -43,6 +43,9 @@
 
 - **The chat template comes from `chat_template.jinja` when the model directory has one** (#160, 2026-10-08), as in transformers 5.16.1; else from the `chat_template` field of `tokenizer_config.json`. Both Qwen directories carry both, byte-equal, so Qwen renders do not move. `CROW_TOKENIZER` also finds `models/<model>-original/tokenizer.json`, and a non-Qwen container without its own tokenizer is refused by name instead of falling back to Flash-Next's. `docs/env.md`.
 - **The converter refuses an unknown source dtype by name** (#154, 2026-10-08); before, it skipped the tensor with a line on stderr.
+- **Routing passes on the FP8 originals** (#179, 2026-10-09): `tools/glm_route_passes.py --fp8 <dir>` runs the five amendment-1 passes on zai-org/GLM-5.3-Flash @ eb9eb208, only when `tools/fetch-glm.py` verified all 62 shards, and records the weights' identity per pass; PREREG-dyn amendment 1 makes FP8 the G1d routing source and 3.05 bpw the primary cell. No pass run yet; ~1.3 h per pass is derived, not measured.
+- **glm5_next expert record is the container's** (#159 #176 #149, 2026-10-09): codec and record size come from the container index (`states --plan --cnq`) or `--expert-bytes N [--expert-codec nvfp4|mul1]`, no default; records not a multiple of 4096 B are refused by name; staging scales with the record; the NVMe backend reads a glm5_next record as one span and sanitizes only NVFP4. RTX 5090, 200k, 46 GiB: 14,155,776 B -> N 32 / P 83 / NVMe 173 (unchanged); 9,474,048 B (plan's 3.05-bpw figure) -> N 51 / P 124 / NVMe 113. Planner numbers, not measured.
+- **Tier simulator takes FP8-original routing for G1d** (#178, 2026-10-09): `glm_tier_sim.py dyn` accepts the FP8-original pass dirs of #179 (one `weights.json` identity in every dir and `passes.jsonl` row) per PREREG-dyn amendment 1; `sim` keeps G1's container rule. Not run: no FP8 dumps yet.
 
 ### Fixed
 
