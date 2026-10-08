@@ -11,6 +11,7 @@ next layer. Same HF modules and call sequence as Glm5NextTextModel.forward
 
   run       python -I oracle/glm5_layerwise.py run --weights fp8-originals <dir> --ids ids.json
                 --decode D --out <dir> [--layers A:B] [--anchors P,..] [--state-dtype f32|bf16]
+                [--prompt-chunk C (default 512; 0 = one call)] [--delete-states-behind]
             python -I oracle/glm5_layerwise.py run --weights container <file.cnq> ...   (crow-nest #156:
                 the container's weights as `converter dequant` decodes them; a partial container
                 runs only the layers it holds)
@@ -31,7 +32,12 @@ the format is documented in docs/glm5-reference-runner.md):
   l<k>-dsa-topk.i32         [N][W]          DSA layers: the indexer's token selection, -1 = empty,
                                             W = index_topk + index_kpool - 1
   logits-anchor-<p>.f32     [V]             logits of row p (only when the last layer was run)
-Rows 0..T-1 are the prompt (one batched call), rows T..N-1 the decode steps (teacher-forced).
+Rows 0..T-1 are the prompt, rows T..N-1 the decode steps (teacher-forced, one row per call).
+The prompt runs in calls of --prompt-chunk rows against the layer's cache (crow-nest #147): KDA carries
+its conv and recurrent state, the DSA slot appends K/V and indexer keys in place into N preallocated
+rows (_AppendIndexedLayer), and causal attention gives every row the same context as in one call.
+With --delete-states-behind, l<k-1>-output.* goes once l<k>-output.* is written and recorded
+(manifest `deleted_states`), so a pass holds at most two states on disk and resumes from the last.
 """
 import argparse
 import gc
@@ -49,7 +55,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import glm5_common as G  # noqa: E402
 
 import transformers  # noqa: E402
-from transformers.cache_utils import DynamicCache  # noqa: E402
+from transformers.cache_utils import DynamicCache, DynamicIndexedLayer  # noqa: E402
 from transformers.models.glm5_next.modeling_glm5_next import (  # noqa: E402
     Glm5NextTextDecoderLayer,
     Glm5NextTextRMSNorm,
@@ -57,6 +63,11 @@ from transformers.models.glm5_next.modeling_glm5_next import (  # noqa: E402
 
 SEED = 20261008
 TOL = 1e-5
+# chunked vs one prompt call (crow-nest #147): another call split is another f32 summation order (matmul
+# row counts, KDA's 64-row blocks cut elsewhere), not another computation. Measured on the real-shape
+# selftest 2026-10-08 (T 96 in calls of 40): <= 5.2e-5 absolute at residual RMS 2.9-5.3 (<= 1.1e-5
+# relative), every routing id and DSA set identical. A cache defect is > 1e-3 (test_glm5_layerwise).
+CHUNK_TOL = 1e-4
 LM_HEAD_CHUNK = 16384
 
 torch.set_num_threads(int(os.environ.get("ORACLE_THREADS", "16")))
@@ -87,16 +98,110 @@ def read_state(path, shape):
     return torch.from_numpy(np.fromfile(path, dtype="<f4").reshape(shape).copy())
 
 
+class _AppendIndexedLayer(DynamicIndexedLayer):
+    """The DSA slot of the layer cache (crow-nest #147): HF's DynamicIndexedLayer `torch.cat`s the whole
+    expanded MLA K/V (128 KiB per token at GLM's shapes) and the indexer keys on every call
+    (cache_utils.py:144-145, :350). This one allocates `capacity` rows once, on the first call, and
+    writes each call's rows in place behind the previous ones. `keys` / `values` / `indexer_keys` are
+    views of the rows written so far, so everything HF reads from the layer (shape[-2] as the kv length,
+    get_seq_length) is what the DynamicIndexedLayer would hold, value for value."""
+
+    def __init__(self, capacity):
+        super().__init__()
+        self.capacity = int(capacity)
+        self._kv = None   # (K buffer, V buffer) [B][heads][capacity][d]
+        self._ix = None   # indexer buffer [B][capacity][d]
+        self.n_kv = 0
+        self.n_ix = 0
+
+    def update(self, key_states, value_states, *args, **kwargs):
+        s = key_states.shape[-2]
+        if self._kv is None:
+            self.lazy_initialization(key_states, value_states)
+            self._kv = tuple(t.new_empty(*t.shape[:-2], self.capacity, t.shape[-1]) for t in (key_states, value_states))
+        if self.n_kv + s > self.capacity:
+            raise RuntimeError(f"layer cache: {self.n_kv} + {s} rows > capacity {self.capacity}")
+        self._kv[0][..., self.n_kv:self.n_kv + s, :].copy_(key_states)
+        self._kv[1][..., self.n_kv:self.n_kv + s, :].copy_(value_states)
+        self.n_kv += s
+        self.keys = self._kv[0][..., :self.n_kv, :]
+        self.values = self._kv[1][..., :self.n_kv, :]
+        return self.keys, self.values
+
+    def update_indexer(self, indexer_key_states):
+        s = indexer_key_states.shape[1]
+        if self._ix is None:
+            self.lazy_initialization_indexer(indexer_key_states)
+            t = indexer_key_states
+            self._ix = t.new_empty(t.shape[0], self.capacity, *t.shape[2:])
+        if self.n_ix + s > self.capacity:
+            raise RuntimeError(f"indexer cache: {self.n_ix} + {s} rows > capacity {self.capacity}")
+        self._ix[:, self.n_ix:self.n_ix + s].copy_(indexer_key_states)
+        self.n_ix += s
+        self.indexer_keys = self._ix[:, :self.n_ix]
+        return self.indexer_keys
+
+
 def new_layer_cache(tc):
     # one DynamicCache per layer: only slot `layer_idx` is ever touched (KDA conv +
     # recurrent state, MLA K/V, indexer packed keys); the other slots stay empty
     return DynamicCache(config=tc)
 
 
+def append_in_place(cache, tc, n_rows):
+    """the DSA slots of `cache` append in place into n_rows preallocated rows (_AppendIndexedLayer)
+    instead of torch.cat over the history per call; the KDA slots hold fixed-size conv / recurrent
+    states and need no change"""
+    if cache is not None:
+        for i, t in enumerate(tc.layer_types):
+            if t == "deepseek_sparse_attention" and i < len(cache.layers):
+                cache.layers[i] = _AppendIndexedLayer(n_rows)
+    return cache
+
+
+def call_plan(N, T, prompt_chunk):
+    """the calls of one layer: prompt rows 0..T-1 in calls of `prompt_chunk` rows (0 / None = one call),
+    then rows T..N-1 one by one (the decode rows)"""
+    c = int(prompt_chunk or 0) or T
+    return [(r0, min(r0 + c, T)) for r0 in range(0, T, c)] + [(r, r + 1) for r in range(T, N)]
+
+
 # ---------------------------------------------------------------- one layer
 
-def run_layer(layer, tc, l, x, T):
-    """x: [N][hc][H] f32. Prompt rows 0..T-1 in one call, then rows T..N-1 one by one.
+def _watch_index_ties(indexer, rec):
+    """Record the rows whose DSA selection boundary is an exact tie: the select_k-th and the next
+    pool score are equal (and valid). torch.topk breaks exact ties in an order that depends on the
+    tensor's shape, so on such a row the selected SET can differ between call splits (HF's own as
+    well); on every other row it cannot. The indexer's ReLU makes all-zero pool scores possible
+    (modeling_glm5_next.py, Glm5NextTextIndexer.forward). Only index_scores.topk runs inside the
+    indexer's forward, so Tensor.topk is wrapped for that call only."""
+    rec["ties"], rec["r0"] = [], 0
+    orig = type(indexer).forward
+
+    def forward(*a, **kw):
+        real_topk = torch.Tensor.topk
+
+        def topk(t, k, *ta, **tk):
+            if t.dim() == 3 and k < t.shape[-1]:
+                v = real_topk(t, k + 1, dim=-1).values  # descending
+                tie = (v[..., k - 1] == v[..., k]) & (v[..., k - 1] > torch.finfo(t.dtype).min)
+                rec["ties"] += (tie[0].nonzero().flatten() + rec["r0"]).tolist()
+            return real_topk(t, k, *ta, **tk)
+
+        torch.Tensor.topk = topk
+        try:
+            return orig(indexer, *a, **kw)
+        finally:
+            torch.Tensor.topk = real_topk
+
+    indexer.forward = forward
+
+
+def run_layer(layer, tc, l, x, T, prompt_chunk=None, timings=None, stats=None):
+    """x: [N][hc][H] f32. Prompt rows 0..T-1 in calls of `prompt_chunk` rows against this layer's cache
+    (None / 0 = one call), then rows T..N-1 one by one. Causal attention, so a row sees rows 0..itself
+    in every split. `timings`, a list, gets the seconds of each prompt call; `stats`, a dict, gets
+    "dsa_tie_rows" (DSA layers: rows whose selection boundary is an exact tie, _watch_index_ties).
     Returns (y [N][hc][H], routing (ids, weights) or None, dsa topk [N][W] or None)."""
     N = x.shape[0]
     rec = {"route": [], "topk": []}
@@ -111,13 +216,15 @@ def run_layer(layer, tc, l, x, T):
                 "rev eb9eb208 has 'full' on all 45 layers")
         hooks.append(layer.self_attn.indexer.register_forward_hook(
             lambda m, i, o: rec["topk"].append(o.detach().clone())))
-    cache = new_layer_cache(tc)
-    outs = []
+        _watch_index_ties(layer.self_attn.indexer, rec)
+    cache = append_in_place(new_layer_cache(tc), tc, N)
+    y = torch.empty_like(x)
     try:
         with torch.no_grad():
-            calls = [(0, T)] + [(r, r + 1) for r in range(T, N)]
-            for r0, r1 in calls:
-                y, _ = layer(
+            for r0, r1 in call_plan(N, T, prompt_chunk):
+                tc0 = time.perf_counter()
+                rec["r0"] = r0
+                out, _ = layer(
                     x[None, r0:r1].contiguous(),
                     attention_mask=torch.ones(1, r1 - r0, dtype=torch.bool),
                     position_ids=torch.arange(r0, r1)[None],
@@ -126,11 +233,18 @@ def run_layer(layer, tc, l, x, T):
                     position_embeddings=None,
                     prev_topk_indices=None,
                 )
-                outs.append(y[0])
+                y[r0:r1] = out[0]
+                del out
+                if timings is not None and r1 <= T:
+                    timings.append(time.perf_counter() - tc0)
     finally:
         for h in hooks:
             h.remove()
-    y = torch.cat(outs, 0)
+        if "ties" in rec:
+            del layer.self_attn.indexer.forward  # back to the class method
+    del cache
+    if stats is not None and "ties" in rec:
+        stats["dsa_tie_rows"] = rec["ties"]
     routing = None
     if rec["route"]:
         ids = torch.cat([r[0] for r in rec["route"]], 0)
@@ -158,15 +272,19 @@ def _rss():
 
 
 def run_layerwise(ws, tc, ids, n_decode, out_dir, start=0, stop=None, anchors=None, state_dtype="f32",
-                  log=print, extra=None):
+                  log=print, extra=None, prompt_chunk=None, delete_states_behind=False):
     """ids: list[int] of N tokens, the last n_decode run as decode rows. Writes the files of the
-    module docstring into out_dir and returns the manifest dict."""
+    module docstring into out_dir and returns the manifest dict.
+    prompt_chunk: prompt rows per call (None / 0 = all T rows in one call).
+    delete_states_behind: once layer k's state is on disk and recorded, delete layer k-1's state (and the
+    last layer's after the pass); routing, DSA top-k, embed, logits and the manifest stay."""
     assert state_dtype in ("f32", "bf16"), state_dtype
     L, H, hc = tc.num_hidden_layers, tc.hidden_size, tc.hc_mult
     stop = L if stop is None else stop
     N = len(ids)
     T = N - n_decode
-    assert T >= 1 and 0 <= start < stop <= L, (T, start, stop, L)
+    # start == stop == L: no layer, only the logits from l<L-1>-output (a pass that stopped after its last layer)
+    assert T >= 1 and 0 <= start <= stop <= L and (start < stop or stop == L), (T, start, stop, L)
     anchors = sorted(set(anchors if anchors is not None else [T - 1] + list(range(T, N))))
     assert all(0 <= p < N for p in anchors), anchors
     os.makedirs(out_dir, exist_ok=True)
@@ -180,7 +298,8 @@ def run_layerwise(ws, tc, ids, n_decode, out_dir, start=0, stop=None, anchors=No
         "layers": [start, stop], "num_hidden_layers": L, "state_dtype": state_dtype,
         "anchors": anchors if stop == L else [], "hidden_size": H, "hc_mult": hc,
         "layer_kinds": [layer_kind(tc, l) for l in range(L)], "files": files, "per_layer": [],
-        "complete": False,
+        "prompt_chunk": int(prompt_chunk or 0), "delete_states_behind": bool(delete_states_behind),
+        "deleted_states": [], "complete": False,
     }
     if extra:
         man.update(extra)
@@ -214,7 +333,19 @@ def run_layerwise(ws, tc, ids, n_decode, out_dir, start=0, stop=None, anchors=No
             files.update({k: v for k, v in old["files"].items() if not k.startswith("logits-")})
             man["per_layer"] = [r for r in old["per_layer"] if r["layer"] < start]
             man["layers"] = [old["layers"][0], stop]
+            man["deleted_states"] = [d for d in old.get("deleted_states", [])
+                                     if int(d[1:].split("-")[0]) < start - 1]
     save_manifest()
+
+    def delete_state(k):
+        for ext in ("f32", "bf16"):
+            nm = f"l{k}-output.{ext}"
+            p = os.path.join(out_dir, nm)
+            if os.path.exists(p):
+                os.remove(p)
+                files.pop(nm, None)
+                man["deleted_states"].append(nm)
+        save_manifest()
 
     for l in range(start, stop):
         t0 = time.time()
@@ -222,7 +353,8 @@ def run_layerwise(ws, tc, ids, n_decode, out_dir, start=0, stop=None, anchors=No
         ws.load(layer, f"{G.LM}layers.{l}.")
         t1 = time.time()
         rss_load, _ = _rss()
-        y, routing, topk = run_layer(layer, tc, l, x, T)
+        call_s, stats = [], {}
+        y, routing, topk = run_layer(layer, tc, l, x, T, prompt_chunk, call_s, stats)
         t2 = time.time()
         del layer
         gc.collect()
@@ -242,9 +374,16 @@ def run_layerwise(ws, tc, ids, n_decode, out_dir, start=0, stop=None, anchors=No
         _, peak = _rss()
         man["per_layer"].append({"layer": l, "kind": layer_kind(tc, l), "load_s": round(t1 - t0, 3),
                                  "compute_s": round(t2 - t1, 3), "rss_after_load_gib": rss_load,
-                                 "peak_wset_gib": peak})
-        save_manifest()
+                                 "peak_wset_gib": peak, "prompt_chunk": int(prompt_chunk or 0),
+                                 "prompt_call_s": [round(s, 3) for s in call_s]})
+        if "dsa_tie_rows" in stats:
+            ties = stats["dsa_tie_rows"]
+            man["per_layer"][-1].update({"dsa_tie_rows_n": len(ties), "dsa_tie_rows": ties[:1000]})
+        save_manifest()  # layer l is recorded before the state behind it goes
+        if delete_states_behind and l > 0:
+            delete_state(l - 1)
         log(f"layer {l:2d} {layer_kind(tc, l):9s} load {t1 - t0:7.2f} s  compute {t2 - t1:7.2f} s"
+            + (f"  ({len(call_s)} prompt calls)" if len(call_s) > 1 else "")
             + (f"  rss {rss_load:.2f} GiB" if rss_load else ""))
 
     if stop == L and anchors:
@@ -261,6 +400,8 @@ def run_layerwise(ws, tc, ids, n_decode, out_dir, start=0, stop=None, anchors=No
             nm = f"logits-anchor-{p}.f32"
             write_raw(os.path.join(out_dir, nm), logits[i])
             record(nm, (V,), "f32")
+    if delete_states_behind and stop == L:
+        delete_state(L - 1)  # nothing reads the last state after the logits
     man["complete"] = True
     save_manifest()
     return man
@@ -407,8 +548,19 @@ def hf_reference(model, ids, n_decode):
     return ref
 
 
-def compare(ref, out_dir, man, tc, T):
-    """one row per layer + one logits row; ok = every number within TOL and every id identical"""
+def canon_topk(t):
+    """DSA top-k rows as sets: valid ids ascending, -1 behind. The indexer's row LAYOUT depends on the
+    call split (select_k = min(index_topk / kpool, pools in the cache), the tail behind it), the set
+    of selected tokens does not, and the attention mask is built from the set (scatter)."""
+    big = torch.iinfo(torch.int32).max
+    s = torch.where(t < 0, torch.full_like(t, big), t).sort(dim=1).values
+    return torch.where(s == big, torch.full_like(s, -1), s)
+
+
+def compare(ref, out_dir, man, tc, T, raw_layout=True, tol=TOL):
+    """one row per layer + one logits row; ok = every number within `tol` and every id identical.
+    DSA top-k: the selected set per row must be identical; with raw_layout also the row layout
+    (only meaningful when both sides split the prompt into the same calls)."""
     rows, ok = [], True
     for l in range(tc.num_hidden_layers):
         y = load_file(out_dir, man, f"l{l}-output.f32")
@@ -424,18 +576,25 @@ def compare(ref, out_dir, man, tc, T):
         if l in ref["topk"]:
             tk = load_file(out_dir, man, f"l{l}-dsa-topk.i32")
             same_shape = tuple(tk.shape) == tuple(ref["topk"][l].shape)
-            row["dsa_topk_mismatch_rows"] = int((tk != ref["topk"][l]).any(dim=1).sum()) if same_shape else -1
+            row["dsa_topk_mismatch_rows"] = (int((canon_topk(tk) != canon_topk(ref["topk"][l])).any(dim=1).sum())
+                                             if same_shape else -1)
+            if raw_layout:
+                row["dsa_topk_layout_mismatch_rows"] = (int((tk != ref["topk"][l]).any(dim=1).sum())
+                                                        if same_shape else -1)
             row["dsa_selected_per_row"] = float((ref["topk"][l] >= 0).sum(1).float().mean())
-        row["ok"] = (row["finite"] and row["max_abs_prompt"] <= TOL and row["max_abs_decode"] <= TOL
-                     and row.get("route_ids_mismatch_tokens", 0) == 0 and row.get("route_w_max_abs", 0) <= TOL
-                     and row.get("dsa_topk_mismatch_rows", 0) == 0)
+            pl = [p for p in man.get("per_layer", []) if p["layer"] == l]
+            row["dsa_tie_rows_n"] = pl[0].get("dsa_tie_rows_n", 0) if pl else 0
+        row["ok"] = (row["finite"] and row["max_abs_prompt"] <= tol and row["max_abs_decode"] <= tol
+                     and row.get("route_ids_mismatch_tokens", 0) == 0 and row.get("route_w_max_abs", 0) <= tol
+                     and row.get("dsa_topk_mismatch_rows", 0) == 0
+                     and row.get("dsa_topk_layout_mismatch_rows", 0) == 0)
         ok &= row["ok"]
         rows.append(row)
     dl = 0.0
     for p in man["anchors"]:
         lg = load_file(out_dir, man, f"logits-anchor-{p}.f32")
         dl = max(dl, float((lg - ref["logits"][p]).abs().max()))
-    lrow = {"layer": "logits", "max_abs": dl, "anchors": len(man["anchors"]), "ok": dl <= TOL and len(man["anchors"]) > 0}
+    lrow = {"layer": "logits", "max_abs": dl, "anchors": len(man["anchors"]), "ok": dl <= tol and len(man["anchors"]) > 0}
     ok &= lrow["ok"]
     rows.append(lrow)
     return rows, ok
@@ -444,18 +603,19 @@ def compare(ref, out_dir, man, tc, T):
 def print_table(rows, index_topk, log=print):
     log(f"index_topk {index_topk}")
     log(f"{'layer':>6} {'kind':9} {'max|d| prompt':>13} {'max|d| decode':>13} {'ref rms':>9} "
-        f"{'route ids':>9} {'route w':>9} {'dsa topk':>8} {'sel/row':>7}  ok")
+        f"{'route ids':>9} {'route w':>9} {'dsa topk':>8} {'sel/row':>7} {'ties':>4}  ok")
     for r in rows:
         if r["layer"] == "logits":
-            log(f"{'logits':>6} {'':9} {r['max_abs']:13.3e} {'':13} {'':9} {'':9} {'':9} {'':8} {'':7}  "
+            log(f"{'logits':>6} {'':9} {r['max_abs']:13.3e} {'':13} {'':9} {'':9} {'':9} {'':8} {'':7} {'':4}  "
                 f"{'yes' if r['ok'] else 'NO'}  ({r['anchors']} anchors)")
             continue
         rid = "" if "route_ids_mismatch_tokens" not in r else f"{r['route_ids_mismatch_tokens']} bad"
         rw = "" if "route_w_max_abs" not in r else f"{r['route_w_max_abs']:.1e}"
         tk = "" if "dsa_topk_mismatch_rows" not in r else f"{r['dsa_topk_mismatch_rows']} bad"
         sel = "" if "dsa_selected_per_row" not in r else f"{r['dsa_selected_per_row']:.1f}"
+        ties = "" if "dsa_tie_rows_n" not in r else str(r["dsa_tie_rows_n"])
         log(f"{r['layer']:>6} {r['kind']:9} {r['max_abs_prompt']:13.3e} {r['max_abs_decode']:13.3e} "
-            f"{r['ref_rms']:9.3e} {rid:>9} {rw:>9} {tk:>8} {sel:>7}  {'yes' if r['ok'] else 'NO'}")
+            f"{r['ref_rms']:9.3e} {rid:>9} {rw:>9} {tk:>8} {sel:>7} {ties:>4}  {'yes' if r['ok'] else 'NO'}")
 
 
 def make_synthetic(shapes, fp8_dir, seed=SEED, index_topk=32):
@@ -472,11 +632,30 @@ def make_synthetic(shapes, fp8_dir, seed=SEED, index_topk=32):
     return text, vision, n
 
 
+def ref_from_run(out_dir, man, tc):
+    """a runner output dir as a reference for compare() (the chunked-vs-unchunked check)"""
+    ref = {"y": {}, "route": {}, "topk": {}, "logits": {}}
+    for l in range(tc.num_hidden_layers):
+        ref["y"][l] = load_file(out_dir, man, f"l{l}-output.f32")
+        if f"l{l}-routing-ids.i32" in man["files"]:
+            ref["route"][l] = (load_file(out_dir, man, f"l{l}-routing-ids.i32"),
+                               load_file(out_dir, man, f"l{l}-routing-weights.f32"))
+        if f"l{l}-dsa-topk.i32" in man["files"]:
+            ref["topk"][l] = load_file(out_dir, man, f"l{l}-dsa-topk.i32")
+    for p in man["anchors"]:
+        ref["logits"][p] = load_file(out_dir, man, f"logits-anchor-{p}.f32")
+    return ref
+
+
 def selftest(shapes="small", T=96, D=4, topks=(32, 2048), seed=SEED, workdir=None, keep=False, log=print,
-             hf_experts="eager"):
+             hf_experts="eager", prompt_chunk=None):
     """the proof of the runner; returns (ok, {index_topk: rows}). The HF side runs eager attention
     (the runner's path; from_pretrained would pick sdpa) and `hf_experts` ("eager" = the runner's
-    per-expert loop, "grouped_mm" = HF's default kernel when it can dispatch)."""
+    per-expert loop, "grouped_mm" = HF's default kernel when it can dispatch).
+    prompt_chunk C: the runner also runs the prompt in calls of C rows (crow-nest #147); that run is
+    compared with HF's full model (one prompt call) and with the runner's own one-call run, under the
+    rule CHUNK_TOL per value, routing ids identical, DSA top-k identical as a set per row; the extra
+    rows are in tables["<k> chunked vs HF"] and tables["<k> chunked vs unchunked"]."""
     from transformers import Glm5NextForConditionalGeneration
     wd = workdir or tempfile.mkdtemp(prefix="glm5-selftest-")
     os.makedirs(wd, exist_ok=True)
@@ -507,31 +686,56 @@ def selftest(shapes="small", T=96, D=4, topks=(32, 2048), seed=SEED, workdir=Non
     ws = G.WeightSource("fp8", fp8_dir)
     ok_all, tables = True, {}
     try:
-        for k in topks:
+        refs, hf_s = {}, {}
+        for k in topks:  # every HF reference first, then the HF model goes before the runner passes
             for m in hf.modules():
                 if type(m).__name__ == "Glm5NextTextIndexer":
                     m.index_topk = k
             hf.config.text_config.index_topk = k
             t1 = time.time()
-            ref = hf_reference(hf, ids, D)
-            t2 = time.time()
+            refs[k] = hf_reference(hf, ids, D)
+            hf_s[k] = time.time() - t1
+        del hf
+        gc.collect()
+        for k in topks:
+            ref = refs.pop(k)
             cfg = _config_dict(dict(text, index_topk=k), vision)
             tc = G.text_config_from_dict(cfg)
+            sel = {"selftest": {"shapes": shapes, "seed": seed, "index_topk": k}}
+            t2 = time.time()
             out_dir = os.path.join(wd, f"run-topk{k}")
             man = run_layerwise(ws, tc, ids, D, out_dir, anchors=list(range(T + D)), log=lambda *_: None,
-                                extra={"selftest": {"shapes": shapes, "seed": seed, "index_topk": k}})
+                                extra=sel)
             t3 = time.time()
             rows, ok = compare(ref, out_dir, man, tc, T)
             print_table(rows, k, log)
-            log(f"  T {T} prompt + D {D} decode rows; HF full model {t2 - t1:.1f} s, layerwise {t3 - t2:.1f} s")
+            log(f"  T {T} prompt (one call) + D {D} decode rows; HF full model {hf_s[k]:.1f} s, "
+                f"layerwise {t3 - t2:.1f} s")
             ok_all &= ok
             tables[k] = rows
+            if prompt_chunk:
+                ch_dir = os.path.join(wd, f"run-topk{k}-chunk{prompt_chunk}")
+                ch = run_layerwise(ws, tc, ids, D, ch_dir, anchors=list(range(T + D)), log=lambda *_: None,
+                                   extra=sel, prompt_chunk=prompt_chunk)
+                t4 = time.time()
+                for label, r, raw in ((f"{k} chunked vs HF", ref, False),
+                                      (f"{k} chunked vs unchunked", ref_from_run(out_dir, man, tc), False)):
+                    rows, ok = compare(r, ch_dir, ch, tc, T, raw_layout=raw, tol=CHUNK_TOL)
+                    print_table(rows, f"{k}, runner with --prompt-chunk {prompt_chunk}: {label.split(' ', 1)[1]}",
+                                log)
+                    ok_all &= ok
+                    tables[label] = rows
+                calls = [len(p["prompt_call_s"]) for p in ch["per_layer"]]
+                log(f"  T {T} prompt in {calls[0]} calls of <= {prompt_chunk} rows + D {D} decode rows; "
+                    f"layerwise {t4 - t3:.1f} s")
             del ref
             gc.collect()
     finally:
         if not keep and workdir is None:
             shutil.rmtree(wd, ignore_errors=True)
-    log(f"selftest {shapes}: {'PASS' if ok_all else 'FAIL'} (tolerance {TOL:g} absolute, f32), {time.time() - t0:.1f} s")
+    log(f"selftest {shapes}: {'PASS' if ok_all else 'FAIL'} (tolerance {TOL:g} absolute, f32"
+        + (f"; chunked vs one call {CHUNK_TOL:g}, every routing id and DSA set identical" if prompt_chunk else "")
+        + f"), {time.time() - t0:.1f} s")
     return ok_all, tables
 
 
@@ -546,9 +750,14 @@ def main(argv=None):
     r.add_argument("--ids", required=True, help="JSON list of token ids (prompt + decode rows)")
     r.add_argument("--decode", type=int, default=0, help="the last D ids run as decode rows")
     r.add_argument("--out", required=True)
-    r.add_argument("--layers", default=None, help="A:B runs layers A..B-1 (input: l<A-1>-output.* in --out)")
+    r.add_argument("--layers", default=None, help="A:B runs layers A..B-1 (input: l<A-1>-output.* in --out); L: (L = last layer + 1) only the logits")
     r.add_argument("--anchors", default=None, help="comma list of rows for logits (default: last prompt row + decode rows)")
     r.add_argument("--state-dtype", choices=("f32", "bf16"), default="f32")
+    r.add_argument("--prompt-chunk", type=int, default=512,
+                   help="prompt rows per call against the layer cache (0 = all prompt rows in one call)")
+    r.add_argument("--delete-states-behind", action="store_true",
+                   help="delete layer k-1's hand-over state once layer k's is written (and the last one after "
+                        "the pass); routing, DSA top-k, logits and the manifest stay")
     s = sub.add_parser("selftest", help="the proof of the runner on a synthetic mini config")
     s.add_argument("--shapes", choices=("small", "real"), default="small")
     s.add_argument("--T", type=int, default=96)
@@ -557,12 +766,17 @@ def main(argv=None):
     s.add_argument("--workdir", default=None, help="keep the synthetic checkpoint and runs here")
     s.add_argument("--hf-experts", choices=("eager", "grouped_mm"), default="eager",
                    help="experts kernel of the HF full model (the runner always runs eager)")
+    s.add_argument("--prompt-chunk", type=int, default=0,
+                   help="also run the runner with the prompt in calls of this many rows and compare it with HF "
+                        "and with the one-call run (0 = off)")
     a = ap.parse_args(argv)
 
     if a.cmd == "selftest":
         ok, _ = selftest(a.shapes, a.T, a.D, tuple(int(k) for k in a.topks.split(",")), workdir=a.workdir,
-                         keep=a.workdir is not None, hf_experts=a.hf_experts)
+                         keep=a.workdir is not None, hf_experts=a.hf_experts, prompt_chunk=a.prompt_chunk or None)
         return 0 if ok else 1
+    if a.prompt_chunk < 0:
+        ap.error("--prompt-chunk must be >= 0")
 
     kind, path = a.weights
     kinds = {"fp8-originals": "fp8", "container": "cnq"}
@@ -586,7 +800,8 @@ def main(argv=None):
               f"it holds layers {part['layers']} only", file=sys.stderr)
         return 2
     anchors = [int(p) for p in a.anchors.split(",")] if a.anchors else None
-    man = run_layerwise(ws, tc, ids, a.decode, a.out, start, stop, anchors, a.state_dtype)
+    man = run_layerwise(ws, tc, ids, a.decode, a.out, start, stop, anchors, a.state_dtype,
+                        prompt_chunk=a.prompt_chunk, delete_states_behind=a.delete_states_behind)
     print(f"wrote {len(man['files'])} files to {a.out}")
     return 0
 
