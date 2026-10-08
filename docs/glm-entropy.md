@@ -82,8 +82,8 @@ decode time → `not answered`.
 What a cold visit costs on the CPU path is the decode time against the NVMe read of the same block at
 the step-3 one-reader rate, 6.994 GB/s (spread 1.003; `runs/glm53-flash/step03/20261008T001819Z.md`):
 14,155,776 B read in 2.024 ms. That rate is not the G1 B: step 3's best reader count (2) failed the
-1.15 spread rule, so the G1 input stays "not answered", and 6.994 GB/s is used here only as the measured
-one-reader rate. The pinned-RAM path (`stage_cold`, kernel ceiling 31.5 GB/s, `engine/src/gen.rs`) would
+1.15 spread rule, so the step-3 statistic gave no B; PREREG amendment 5 (robin, 2026-10-08) later fixed
+B for G1 at this same 6.994 GB/s. The pinned-RAM path (`stage_cold`, kernel ceiling 31.5 GB/s, `engine/src/gen.rs`) would
 need a GPU decoder; none is drafted or measured here.
 
 Measured numbers, conditions and the comparison: `runs/glm53-flash/step10/README.md`.

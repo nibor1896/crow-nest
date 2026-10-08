@@ -7,8 +7,8 @@ and the NVMe rate B carry 40 tok/s. It reads the routing that the layerwise runn
 (`docs/glm5-reference-runner.md` §5). It changes nothing in `engine/`, the converter or a container.
 
 No GLM routing exists yet. The corpus is fixed (PREREG amendment 1, 2026-10-08); the routing passes need
-the full container (step 9). The current step-3 run has no valid B, so `sim` prints
-`G1 not answered` until a step-3 run of record exists.
+the full container (step 9). Step 3's statistic gives no B on this machine; PREREG amendment 5 (robin,
+2026-10-08, #146) fixes B = 6.994 GB/s, the 1-reader median of run `20261008T001819Z`, passed as `--readers 1`.
 
 ## 1. Commands
 
@@ -23,7 +23,8 @@ the full container (step 9). The current step-3 run has no valid B, so `sim` pri
 
 # simulation, every report row, and the G1 verdict fields
 .venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py sim --corpus decode_out/glm-step8/corpus/corpus.json \
-    --runs decode_out/glm-step8/runs --step3 runs/glm53-flash/step03/<run>.json [--windows 0,8,16,32] [--json out.json]
+    --runs decode_out/glm-step8/runs --step3 runs/glm53-flash/step03/<run>.json [--readers 1] [--windows 0,8,16,32] \n    [--json out.json]
+# G1 under amendment 5: --step3 runs/glm53-flash/step03/20261008T001819Z.json --readers 1
 
 # the tests (no GPU, no weights): the sim about 7 s, the route passes about 45 s
 .venv-oracle/Scripts/python.exe -I tools/test_glm_tier_sim.py
@@ -34,7 +35,7 @@ Step 8 runs under `.venv-oracle` (transformers 5.16.1). The system Python's tran
 owner's machine, 2026-10-08) lacks `transformers.cache_utils.DynamicIndexedLayer`, which the runner's
 in-place DSA cache subclasses: `tools/test_glm_route_passes.py` fails there in `setUpClass` of its
 end-to-end test (8 tests run, 1 error), and `corpus` needs GLM's tokenizer from the same venv.
-`tools/test_glm_tier_sim.py` alone passes under either (26 tests, OK under both).
+`tools/test_glm_tier_sim.py` alone passes under either (27 tests, OK under both).
 
 `corpus` uses `messages` and `render` of `tools/session_ids.py` and swaps in GLM's tokenizer, so the
 generated spans are cut the same way as in the Flash-Next calibration (`docs/hotset-calibration.md`).
@@ -95,7 +96,9 @@ The shape is from `config.json` (rev `eb9eb208`): 42 MoE layers (3–44), 288 ro
   run must be valid (not VOID), and its best reader count, the one with the best median, must hold the
   1.15 spread. That spread is re-computed here from the raw repetitions, so a `b_for_g1` written into
   a run with a wider spread is refused. The run of 2026-10-08 00:18 UTC has the best count at 2 readers
-  with spread 1.232, so it gives no B.
+  with spread 1.232, so it gives no B. With `--readers N` (the count a PREREG amendment fixes; amendment 5:
+  1) B is that count's median instead, under the same validity and 1.15 spread checks; that run gives
+  6.994 GB/s at 1 reader, spread 1.003.
 - **Wrong routing source.** The routing does not come from the dequantised full container: the runner
   ran on the FP8 originals or on a partial container (`--layers`), or the pass is incomplete. Such a
   number is plausibility only (PREREG G1).

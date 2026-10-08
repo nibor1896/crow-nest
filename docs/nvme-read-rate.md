@@ -8,7 +8,8 @@ The tool changes nothing in the engine, the converter or the container.
 
 > **First run on the GLM shards (2026-10-08, `runs/glm53-flash/step03/20261008T001819Z.{json,md}`):** valid
 > (no foreign disk IO), medians 6.994 / 9.765 / 7.811 GB/s at 1 / 2 / 4 readers, spreads 1.003 / 1.232 / 1.430.
-> The best count (2) misses the 1.15 spread rule, so `G1 input` is "not answered" and no B for G1 exists yet.
+> The best count (2) misses the 1.15 spread rule, so `G1 input` is "not answered". PREREG amendment 5 (robin, 2026-10-08)
+> sets B for G1 = 6.994 GB/s, this run's 1-reader median; the binding reader count for step 14 is 1.
 
 ## What it reads, and how
 

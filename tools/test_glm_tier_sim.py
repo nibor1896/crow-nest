@@ -180,6 +180,15 @@ class TestB(unittest.TestCase):
         self.assertIsNone(b)
         self.assertIn("spread 1.232 > 1.15", why)
 
+    def test_amendment5_fixed_reader_count(self):
+        b, why = ts.b_from_step3(str(STEP3), readers=1)   # PREREG amendment 5 (#146)
+        self.assertAlmostEqual(b, 6.9936611328)
+        self.assertIn("spread 1.003", why)
+        b, why = ts.b_from_step3(str(STEP3), readers=2)   # a fixed count still holds the spread rule
+        self.assertIsNone(b)
+        self.assertIn("spread 1.232 > 1.15", why)
+        self.assertIsNone(ts.b_from_step3(str(STEP3), readers=8)[0])
+
     def test_missing_void_and_valid(self):
         self.assertIsNone(ts.b_from_step3(None)[0])
         with tempfile.TemporaryDirectory() as t:

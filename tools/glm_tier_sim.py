@@ -143,9 +143,11 @@ def gen_mask(path, n):
     return mask
 
 
-def b_from_step3(path):
+def b_from_step3(path, readers=None):
     """(B in GB/s or None, reason). B only from a valid step-3 run whose best reader count (best median)
-    holds the 1.15 spread, re-checked here from the raw repetitions."""
+    holds the 1.15 spread, re-checked here from the raw repetitions. With `readers` (the count a PREREG
+    amendment fixes; amendment 5: 1, #146) B is that count's median under the same validity and spread
+    checks, and the run's own b_for_g1 is not used."""
     if not path:
         return None, "no step-3 run given"
     d = jload(path)
@@ -156,6 +158,16 @@ def b_from_step3(path):
     if not per:
         return None, "step-3 run has no reader counts"
     med = {r: statistics.median(p["rates_gbps"]) for r, p in per.items()}
+    if readers is not None:
+        r = str(readers)
+        if r not in per:
+            return None, "step-3 run has no %s-reader cell" % r
+        rates = per[r]["rates_gbps"]
+        spread = max(rates) / min(rates) if min(rates) > 0 else math.inf
+        if spread > SPREAD_MAX:
+            return None, "spread %.3f > %.2f at the fixed reader count %s" % (spread, SPREAD_MAX, r)
+        return med[r], "B = %.3f GB/s at %s reader(s), fixed by PREREG amendment, spread %.3f (%s)" % (
+            med[r], r, spread, os.path.basename(path))
     best = max(med, key=lambda r: med[r])
     rates = per[best]["rates_gbps"]
     spread = max(rates) / min(rates) if min(rates) > 0 else math.inf
@@ -553,6 +565,7 @@ def main(argv=None):
     s.add_argument("--corpus", required=True)
     s.add_argument("--runs", required=True)
     s.add_argument("--step3")
+    s.add_argument("--readers", type=int, help="reader count fixed by a PREREG amendment (amendment 5: 1)")
     s.add_argument("--windows", default="0,8,16,32")
     s.add_argument("--gate-window", type=int, default=0)
     s.add_argument("--json")
@@ -561,7 +574,7 @@ def main(argv=None):
         if a.cmd == "corpus":
             return corpus_cmd(a)
         held, cal, reasons = load_corpus(a.corpus, a.runs)
-        b, why = b_from_step3(a.step3)
+        b, why = b_from_step3(a.step3, a.readers)
         res = simulate(held, cal, b, why, reasons, tuple(int(x) for x in a.windows.split(",")), a.gate_window)
         if a.json:
             jdump(res, a.json, indent=1, default=float)
