@@ -14,6 +14,12 @@
   .venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py sim --corpus <dir>/corpus.json --runs <runs> \
       [--step3 runs/glm53-flash/step03/<run>.json] [--windows 0,8,16,32] [--json <out.json>]
 
+  # 4. dynamic expert-cache policies (#178, plan step 2; docs/glm-tier-simulation.md section 7)
+  .venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py dyn --corpus <dir>/corpus.json --runs <runs> \
+      (--slots V:P[,...] | --vram 25.6GB --pinned 46GiB) [--bpw 4.5,3.05,3.5] [--arena layer|global] \
+      [--policies lru,clock,lfu] [--admit-max 64] [--prefetch none,oracle,0.5,0.7,0.9] [--depths 1,2,3] \
+      [--pf-budget N] [--step3 <run>.json --readers 1] [--rates <rates.json>] [--json <out.json>]
+
 Policy per MoE layer (PREREG G1, ticket #147): the experts are ranked by their routed count over the
 GENERATED positions of the calibration files (the `G` rule of #106: frequency order, ties lower id);
 ranks 0..N-1 are the VRAM hot set, the next 83 the pinned tier, the rest live on the NVMe. With a
@@ -36,6 +42,7 @@ import importlib.util
 import json
 import math
 import os
+import random
 import statistics
 import sys
 from collections import OrderedDict
@@ -308,35 +315,42 @@ def min_reads(routes, nvme, w):
     reads[:] = 0
     for l in range(L):
         pos, k = np.nonzero(nvme[:, l, :])
-        ids = routes[pos, l, k].tolist()
-        m = len(ids)
-        nxt, last = [0] * m, {}
-        for i in range(m - 1, -1, -1):
-            nxt[i] = last.get(ids[i], m + i)          # never again: beyond the end, unique per access
-            last[ids[i]] = i
-        cache, heap = {}, []
-        miss = np.zeros(m, bool)
-        for i, e in enumerate(ids):
-            nu = nxt[i]
-            if e in cache:
-                cache[e] = nu
-                heapq.heappush(heap, (-nu, e))
-                continue
-            miss[i] = True
-            if len(cache) < w:
-                cache[e] = nu
-                heapq.heappush(heap, (-nu, e))
-                continue
-            while cache.get(heap[0][1]) != -heap[0][0]:
-                heapq.heappop(heap)
-            far = -heap[0][0]
-            if nu >= far:
-                continue                              # bypass: needed no sooner than anything held
-            del cache[heapq.heappop(heap)[1]]
-            cache[e] = nu
-            heapq.heappush(heap, (-nu, e))
+        miss = _min_miss(routes[pos, l, k].tolist(), w)
         np.add.at(reads, pos[miss], 1)
     return reads
+
+
+def _min_miss(ids, w):
+    """Belady's MIN with bypass over one access sequence and w slots -> miss flag per access."""
+    m = len(ids)
+    nxt, last = [0] * m, {}
+    for i in range(m - 1, -1, -1):
+        nxt[i] = last.get(ids[i], m + i)          # never again: beyond the end, unique per access
+        last[ids[i]] = i
+    cache, heap = {}, []
+    miss = np.zeros(m, bool)
+    for i, e in enumerate(ids):
+        nu = nxt[i]
+        if e in cache:
+            cache[e] = nu
+            heapq.heappush(heap, (-nu, e))
+            continue
+        miss[i] = True
+        if w <= 0:
+            continue
+        if len(cache) < w:
+            cache[e] = nu
+            heapq.heappush(heap, (-nu, e))
+            continue
+        while cache.get(heap[0][1]) != -heap[0][0]:
+            heapq.heappop(heap)
+        far = -heap[0][0]
+        if nu >= far:
+            continue                              # bypass: needed no sooner than anything held
+        del cache[heapq.heappop(heap)[1]]
+        cache[e] = nu
+        heapq.heappush(heap, (-nu, e))
+    return miss
 
 
 # ------------------------------------------------------------------ statistics
@@ -490,6 +504,459 @@ def simulate(held, cal, b=None, b_reason="no step-3 run given", reasons=(), wind
     return res
 
 
+# ------------------------------------------------------------------ dynamic expert cache (#178, plan step 2)
+
+# Expert record bytes per bpw. 4.5: the NVFP4 record of the CNQ container (EXPERT_BYTES). 3.05: the EXL3 record of
+# sybil-solutions/glm53-flash-offload (plan record, external). 3.5: the 3.05 record scaled by 3.5 / 3.05 (derived,
+# not measured; same codec family).
+BPW_BYTES = {"4.5": EXPERT_BYTES, "3.05": 9_474_048, "3.5": round(9_474_048 * 3.5 / 3.05)}
+POLICIES = ("lru", "clock", "lfu")
+DYN_COUNTERS = ("vram_hits", "pinned_hits", "zero_copy", "admissions", "write_backs", "nvme_demand", "nvme_prefetch")
+_UNITS = {"": 1, "B": 1, "KB": 10 ** 3, "MB": 10 ** 6, "GB": 10 ** 9, "KIB": 2 ** 10, "MIB": 2 ** 20, "GIB": 2 ** 30}
+
+
+def parse_bytes(s):
+    """'46GiB', '25.6GB', '1000' -> bytes (int)."""
+    t = str(s).strip()
+    i = len(t)
+    while i and t[i - 1].isalpha():
+        i -= 1
+    unit = t[i:].upper()
+    if unit not in _UNITS or not t[:i]:
+        raise SimError("cannot read %r as bytes (units B, KB, MB, GB, KiB, MiB, GiB)" % s)
+    try:
+        v = float(t[:i]) * _UNITS[unit]
+    except ValueError:
+        raise SimError("cannot read %r as bytes" % s) from None
+    if v < 0:
+        raise SimError("negative byte budget %r" % s)
+    return int(v)
+
+
+def capacity(vram_bytes, pinned_bytes, expert_bytes, arena, layers=SHAPE[0]):
+    """Slots (VRAM, pinned) from byte budgets: per layer floor(budget / expert / layers), global
+    floor(budget / expert)."""
+    div = expert_bytes * (layers if arena == "layer" else 1)
+    return int(vram_bytes // div), int(pinned_bytes // div)
+
+
+class LruTier:
+    def __init__(self, cap):
+        self.cap, self.d = cap, OrderedDict()
+
+    def __contains__(self, k):
+        return k in self.d
+
+    def touch(self, k):
+        self.d.move_to_end(k)
+
+    def remove(self, k):
+        del self.d[k]
+
+    def insert(self, k, protect=()):
+        """-> (stored, victim). LRU ignores `protect`, as lru_reads does (equal to it at every capacity)."""
+        if self.cap <= 0:
+            return False, None
+        v = self.d.popitem(last=False)[0] if len(self.d) >= self.cap else None
+        self.d[k] = None
+        return True, v
+
+
+class ClockTier:
+    """CLOCK as sybil-solutions/glm53-flash-offload glm53/expert_cache.py ec_step_k (df0b439): a hit sets the ref
+    bit; an insert sweeps from the hand, skips slots that hold one of the current step's picks, clears set ref bits,
+    takes the first slot with a clear bit, sets the new entry's bit and leaves the hand behind it; no victim within
+    2 x cap steps -> not stored. An empty slot (never filled, or freed by a move to the other tier, which sybil's
+    VRAM-only cache has not) is taken first, in slot order, without a sweep."""
+
+    def __init__(self, cap):
+        self.cap, self.owner, self.ref, self.slot, self.hand = cap, [None] * cap, [0] * cap, {}, 0
+        self.free = list(range(cap - 1, -1, -1))
+
+    def __contains__(self, k):
+        return k in self.slot
+
+    def touch(self, k):
+        self.ref[self.slot[k]] = 1
+
+    def remove(self, k):
+        s = self.slot.pop(k)
+        self.owner[s], self.ref[s] = None, 0
+        self.free.append(s)
+
+    def insert(self, k, protect=()):
+        cap, owner, ref, h = self.cap, self.owner, self.ref, self.hand
+        if cap <= 0:
+            return False, None
+        if self.free:
+            s = self.free.pop()
+            owner[s], ref[s], self.slot[k] = k, 1, s
+            return True, None
+        found = -1
+        for _ in range(2 * cap):
+            s = h
+            h = h + 1 if h + 1 < cap else 0
+            o = owner[s]
+            if o is not None and o in protect:
+                continue
+            if ref[s]:
+                ref[s] = 0
+                continue
+            found = s
+            break
+        self.hand = h
+        if found < 0:
+            return False, None
+        o = owner[found]
+        if o is not None:
+            del self.slot[o]
+        owner[found], ref[found], self.slot[k] = k, 1, found
+        return True, o
+
+
+class LfuTier:
+    """LFU with exponential decay: the score of an expert is the sum over its accesses of 2^-(age in tokens /
+    half-life), kept for every expert (also after eviction); the victim is the resident with the lowest score (ties:
+    lower key), never one of the current step's picks. Scores live in a dict shared by both tiers."""
+
+    def __init__(self, cap, score):
+        self.cap, self.score, self.res, self.heap = cap, score, set(), []
+
+    def __contains__(self, k):
+        return k in self.res
+
+    def _push(self, k):
+        heapq.heappush(self.heap, (self.score.get(k, 0.0), k))
+        if len(self.heap) > 4 * self.cap + 64:
+            self.rebuild()
+
+    def touch(self, k):
+        self._push(k)
+
+    def remove(self, k):
+        self.res.discard(k)
+
+    def rebuild(self):
+        self.heap = [(self.score.get(k, 0.0), k) for k in self.res]
+        heapq.heapify(self.heap)
+
+    def insert(self, k, protect=()):
+        if self.cap <= 0:
+            return False, None
+        v = None
+        if len(self.res) >= self.cap:
+            held = []
+            while self.heap:
+                s, x = heapq.heappop(self.heap)
+                if x not in self.res or self.score.get(x, 0.0) != s:
+                    continue                          # stale entry
+                if x in protect:
+                    held.append((s, x))
+                    continue
+                v = x
+                break
+            for e in held:
+                heapq.heappush(self.heap, e)
+            if v is None:
+                return False, None
+            self.res.discard(v)
+        self.res.add(k)
+        self._push(k)
+        return True, v
+
+
+def _put(tier, k, protect, pending):
+    """Insert k into a tier -> (stored, 1 if the victim was a prefetched expert never used)."""
+    ok, v = tier.insert(k, protect)
+    if v is not None and v in pending:
+        pending.discard(v)
+        return ok, 1
+    return ok, 0
+
+
+def _predict(true, p, n_experts, rnd):
+    """A router prediction of precision p: each true expert is kept with probability p, else replaced by a wrong
+    expert of the same layer (uniform over the experts not routed and not yet predicted)."""
+    out, taken = [], set(true)
+    for e in true:
+        if rnd.random() < p:
+            out.append(e)
+            continue
+        while True:
+            w = rnd.randrange(n_experts)
+            if w not in taken:
+                break
+        taken.add(w)
+        out.append(w)
+    return out
+
+
+def dyn_run(routes, cv, cp, policy="lru", arena="layer", admit_max=None, prefetch=None, depth=1, pf_budget=None,
+            halflife=64.0, n_experts=SHAPE[1], seed=SEED):
+    """One dynamic-cache run over a file's routing, token order over every position.
+
+    Two exclusive tiers per arena (one per layer, or one for all layers): VRAM with cv slots and pinned RAM with cp
+    slots, the rest on the NVMe. A visit is a VRAM hit; or a pinned hit, admitted to VRAM (one PCIe copy) when
+    admission is on, else read zero-copy (one PCIe read); or an NVMe read, admitted to VRAM or landed in pinned and
+    read zero-copy. A VRAM victim moves to pinned (one PCIe write-back), a pinned victim is dropped (its record stays
+    on the NVMe). Admission is on when the step's picks per layer (K for one token) are <= admit_max, the gate of
+    sybil's GLM53_EC_ADMIT_MAX (None: always). Prefetch (None, "oracle" or a precision p): after layer j, the
+    experts predicted for layer j + depth (into the next token past the last layer) are read from the NVMe into
+    pinned, at most pf_budget reads per token. Returns per-position counters (DYN_COUNTERS) and the prefetch totals.
+    """
+    n, L, K = routes.shape
+    E = n_experts
+    if policy not in POLICIES:
+        raise SimError("policy %r: one of %s" % (policy, ", ".join(POLICIES)))
+    if arena not in ("layer", "global"):
+        raise SimError("arena %r: layer or global" % arena)
+    if prefetch is not None and prefetch != "oracle" and not 0.0 < float(prefetch) <= 1.0:
+        raise SimError("prefetch precision %r outside (0, 1]" % prefetch)
+    if not 1 <= depth <= L:
+        raise SimError("look-ahead %d outside 1..%d layers" % (depth, L))
+    score = {}
+
+    def mk(c):
+        return LruTier(c) if policy == "lru" else ClockTier(c) if policy == "clock" else LfuTier(c, score)
+
+    if arena == "layer":
+        V, P = [mk(cv) for _ in range(L)], [mk(cp) for _ in range(L)]
+    else:
+        v1, p1 = mk(cv), mk(cp)
+        V, P = [v1] * L, [p1] * L
+    admit = cv > 0 and (admit_max is None or K <= admit_max)
+    do_pf = prefetch is not None and cp > 0
+    rnd = random.Random(seed)
+    lfu = policy == "lfu"
+    grow, inc = 2.0 ** (1.0 / halflife), 1.0
+    pending, useful, wasted = set(), 0, 0
+    out = {c: [0] * n for c in DYN_COUNTERS}
+    R = routes.tolist()
+    for t in range(n):
+        vh = ph = zc = adm = wb = nd = npf = 0
+        row = R[t]
+        for j in range(L):
+            Vj, Pj, base = V[j], P[j], j * E
+            keys = [base + e for e in row[j]]
+            protect = set(keys)
+            for k in keys:
+                if lfu:
+                    score[k] = score.get(k, 0.0) + inc
+                if k in Vj:
+                    Vj.touch(k)
+                    vh += 1
+                    continue
+                if k in Pj:
+                    ph += 1
+                    if k in pending:
+                        pending.discard(k)
+                        useful += 1
+                    ok, v = Vj.insert(k, protect) if admit else (False, None)
+                    if not ok:
+                        Pj.touch(k)
+                        zc += 1
+                        continue
+                    Pj.remove(k)
+                else:
+                    nd += 1
+                    ok, v = Vj.insert(k, protect) if admit else (False, None)
+                    if not ok:
+                        zc += 1
+                        if cp:
+                            wasted += _put(Pj, k, protect, pending)[1]
+                        continue
+                adm += 1
+                if v is not None and cp:
+                    ok2, w = _put(Pj, v, protect, pending)
+                    wasted += w
+                    wb += ok2
+            if do_pf:
+                jj, tt = j + depth, t
+                if jj >= L:
+                    jj, tt = jj - L, t + 1
+                if tt < n and (pf_budget is None or npf < pf_budget):
+                    true = R[tt][jj]
+                    preds = true if prefetch == "oracle" else _predict(true, float(prefetch), E, rnd)
+                    Vt, Pt, b2 = V[jj], P[jj], jj * E
+                    pkeys = [b2 + e for e in preds]
+                    prot = set(pkeys)
+                    for k in pkeys:
+                        if k in Vt or k in Pt:
+                            continue
+                        if pf_budget is not None and npf >= pf_budget:
+                            break
+                        ok, w = _put(Pt, k, prot, pending)
+                        wasted += w
+                        if ok:
+                            npf += 1
+                            pending.add(k)
+        for c, x in zip(DYN_COUNTERS, (vh, ph, zc, adm, wb, nd, npf)):
+            out[c][t] = x
+        if lfu:
+            inc *= grow
+            if inc > 1e100:                           # renormalise: same order, no overflow
+                for k in score:
+                    score[k] /= inc
+                inc = 1.0
+                for tier in set(V) | set(P):
+                    tier.rebuild()
+    res = {c: np.asarray(x, np.int64) for c, x in out.items()}
+    res["prefetch_useful"], res["prefetch_wasted"] = useful, wasted + len(pending)
+    return res
+
+
+def dyn_min(routes, cap, arena="layer", n_experts=SHAPE[1]):
+    """Belady's MIN with bypass at the total capacity (VRAM + pinned slots) of the arena -> NVMe reads per position:
+    the fewest reads any policy, prefetching ones included, can reach with that many slots."""
+    n, L, K = routes.shape
+    if arena == "layer":
+        return min_reads(routes, np.ones(routes.shape, bool), cap)
+    keys = (routes.astype(np.int64) + (np.arange(L, dtype=np.int64) * n_experts)[None, :, None]).reshape(-1)
+    return _min_miss(keys.tolist(), cap).reshape(n, L * K).sum(1).astype(np.int64)
+
+
+def rates_from_file(path):
+    """R_PCIe and R_DRAM (GB/s) from a JSON file {"R_pcie_gbps": x, "R_dram_gbps": y, "source": "..."}; either may be
+    missing (that stage is then not given), a present value must be a positive number."""
+    if not path:
+        return {}, "no rates file given"
+    d = jload(path)
+    out = {}
+    for key in ("R_pcie_gbps", "R_dram_gbps"):
+        if key in d:
+            x = d[key]
+            if isinstance(x, bool) or not isinstance(x, (int, float)) or not x > 0:
+                raise SimError("%s: %s = %r is not a positive number" % (path, key, x))
+            out[key] = float(x)
+    if not out:
+        raise SimError("%s: neither R_pcie_gbps nor R_dram_gbps" % path)
+    return out, "%s (%s)" % (os.path.basename(path), d.get("source", "no source named"))
+
+
+def dyn_cost(row, expert_bytes, b, rates, visits=SHAPE[0] * SHAPE[2]):
+    """Per-stage bytes per token and tok/s ceilings: NVMe = m (prefetch reads included) at B, PCIe = zero-copy +
+    admissions + write-backs at R_PCIe, DRAM = NVMe data landed + every PCIe transfer at R_DRAM. The binding ceiling
+    is the lowest given one (perfect overlap); the serial bound adds the stage times (no overlap), only when all
+    three rates are given."""
+    per = visits * expert_bytes
+    out, ceil, serial = {}, [], 0.0
+    for name, share, rate in (("nvme", row["m"]["mean"], b), ("pcie", row["pcie"], rates.get("R_pcie_gbps")),
+                              ("dram", row["dram"], rates.get("R_dram_gbps"))):
+        by = share * per
+        c = None if rate is None else (math.inf if by == 0 else rate * 1e9 / by)
+        out[name] = {"bytes_per_token": by, "rate_gbps": rate, "ceiling_tok_s": c}
+        if c is not None:
+            ceil.append((c, name))
+        if serial is not None:
+            serial = None if rate is None else serial + by / (rate * 1e9)
+    out["binding"] = min(ceil)[1] if ceil else None
+    out["ceiling_tok_s"] = min(ceil)[0] if ceil else None
+    out["serial_tok_s"] = (math.inf if serial == 0 else 1.0 / serial) if serial is not None else None
+    return out
+
+
+def dyn_summary(res, gen, visits=SHAPE[0] * SHAPE[2]):
+    """Shares of the visits per token on the generated positions; m (all NVMe reads) with the block-bootstrap CI."""
+    sh = {c: res[c][gen] / visits for c in DYN_COUNTERS}
+    pcie = sh["zero_copy"] + sh["admissions"] + sh["write_backs"]
+    nv = sh["nvme_demand"] + sh["nvme_prefetch"]
+    row = {"m": stat(nv), "m_demand": float(sh["nvme_demand"].mean()), "pcie": float(pcie.mean()),
+           "dram": float((nv + pcie).mean())}
+    row.update({c: float(sh[c].mean()) for c in DYN_COUNTERS})
+    row["prefetch_useful"], row["prefetch_wasted"] = res["prefetch_useful"], res["prefetch_wasted"]
+    return row
+
+
+def dyn_check_min(name, res, mn):
+    """A policy below MIN over the whole file is a simulator defect (MIN bounds total reads, not a subset's)."""
+    got = int(res["nvme_demand"].sum() + res["nvme_prefetch"].sum())
+    if got < int(mn.sum()):
+        raise SimError("simulator defect: %s reads %d < Belady MIN %d at the same capacity"
+                       % (name, got, int(mn.sum())))
+
+
+def dyn_simulate(held, configs, policies=POLICIES, arena="layer", admit_max=None, prefetches=(None,), depths=(1,),
+                 pf_budget=None, halflife=64.0, b=None, b_reason="no step-3 run given", rates=None,
+                 rates_reason="no rates file given", reasons=(), out=print):
+    """Every `dyn` row: configs = [(bpw, expert_bytes, cv, cp)]; returns the --json document."""
+    rates = rates or {}
+    routes, g = held.routes, held.gen
+    L, K = routes.shape[1], routes.shape[2]
+    res = {"held": held.name, "positions": int(len(g)), "generated": int(g.sum()), "arena": arena,
+           "admit_max": admit_max, "pf_budget": pf_budget, "lfu_halflife": halflife, "B": b, "B_source": b_reason,
+           "rates": rates, "rates_source": rates_reason, "source_reasons": list(reasons), "rows": []}
+    out("\nheld-out %s (%s): %d positions, %d generated; arena %s, admission %s, prefetch budget %s per token"
+        % (held.name, held.task, len(g), g.sum(), arena,
+           "always" if admit_max is None else "at <= %d picks per step" % admit_max,
+           "none" if pf_budget is None else pf_budget))
+    out("B: %s;  rates: %s" % (b_reason, rates_reason))
+    for r in reasons:
+        out("  source: %s" % r)
+    for bpw, eb, cv, cp in configs:
+        mn = dyn_min(routes, cv + cp, arena)
+        mrow = {"bpw": bpw, "expert_bytes": eb, "vram_slots": cv, "pinned_slots": cp, "policy": "min",
+                "m": stat(mn[g] / (L * K))}
+        res["rows"].append(mrow)
+        out("\nbpw %s (%d B per expert), slots VRAM %d + pinned %d %s; MIN ceiling m %.4f [%.4f, %.4f]"
+            % (bpw, eb, cv, cp, "per layer" if arena == "layer" else "in all", mrow["m"]["mean"], *mrow["m"]["ci"]))
+        pfs = prefetches if cp > 0 else tuple(x for x in prefetches if x is None)
+        if len(pfs) < len(prefetches):
+            out("  prefetch rows skipped: prefetch lands in pinned and this config has no pinned slots")
+        for pol in policies:
+            for pf in pfs:
+                for d in (depths if pf is not None else (None,)):
+                    r = dyn_run(routes, cv, cp, pol, arena, admit_max, pf, d or 1, pf_budget, halflife)
+                    dyn_check_min("%s/%s/d%s" % (pol, pf, d), r, mn)
+                    row = {"bpw": bpw, "expert_bytes": eb, "vram_slots": cv, "pinned_slots": cp, "policy": pol,
+                           "prefetch": pf, "depth": d}
+                    row.update(dyn_summary(r, g, L * K))
+                    row["cost"] = c = dyn_cost(row, eb, b, rates, L * K)
+                    res["rows"].append(row)
+                    out("  %-5s prefetch %-6s d %-2s m %.4f [%.4f, %.4f] (demand %.4f)  VRAM %.4f pinned %.4f  "
+                        "PCIe %.4f (zero-copy %.4f adm %.4f wb %.4f)  DRAM %.4f  prefetch useful %d wasted %d"
+                        % (pol, "none" if pf is None else pf, "-" if d is None else d, row["m"]["mean"],
+                           *row["m"]["ci"], row["m_demand"], row["vram_hits"], row["pinned_hits"], row["pcie"],
+                           row["zero_copy"], row["admissions"], row["write_backs"], row["dram"],
+                           row["prefetch_useful"], row["prefetch_wasted"]))
+                    out("        ceilings tok/s: %s;  binding %s;  serial %s"
+                        % (", ".join("%s %s" % (s, "-" if c[s]["ceiling_tok_s"] is None
+                                                else "%.1f" % c[s]["ceiling_tok_s"]) for s in ("nvme", "pcie", "dram")),
+                           c["binding"] or "-", "-" if c["serial_tok_s"] is None else "%.1f" % c["serial_tok_s"]))
+    return res
+
+
+def dyn_configs(a, layers=SHAPE[0]):
+    """[(bpw, expert_bytes, vram slots, pinned slots)] from --bpw with --slots or --vram/--pinned."""
+    out = []
+    for bpw in a.bpw.split(","):
+        if bpw not in BPW_BYTES:
+            raise SimError("bpw %s: one of %s" % (bpw, ", ".join(BPW_BYTES)))
+        eb = BPW_BYTES[bpw]
+        if a.slots:
+            for s in a.slots.split(","):
+                v, _, p = s.partition(":")
+                out.append((bpw, eb, int(v), int(p or 0)))
+        elif a.vram is not None and a.pinned is not None:
+            out.append((bpw, eb) + capacity(parse_bytes(a.vram), parse_bytes(a.pinned), eb, a.arena, layers))
+        else:
+            raise SimError("dyn needs --slots V:P[,...] or both --vram and --pinned")
+    return out
+
+
+def dyn_cmd(a):
+    configs = dyn_configs(a)
+    held, _cal, reasons = load_corpus(a.corpus, a.runs)
+    b, why = b_from_step3(a.step3, a.readers)
+    rates, rwhy = rates_from_file(a.rates)
+    pfs = tuple(None if x == "none" else x if x == "oracle" else float(x) for x in a.prefetch.split(","))
+    res = dyn_simulate(held, configs, tuple(a.policies.split(",")), a.arena, a.admit_max, pfs,
+                       tuple(int(x) for x in a.depths.split(",")), a.pf_budget, a.lfu_halflife, b, why, rates, rwhy,
+                       reasons)
+    if a.json:
+        jdump(res, a.json, indent=1, default=float)
+    return 0
+
+
 # ------------------------------------------------------------------ corpus
 
 def _session_ids():
@@ -572,10 +1039,31 @@ def main(argv=None):
     s.add_argument("--windows", default="0,8,16,32")
     s.add_argument("--gate-window", type=int, default=0)
     s.add_argument("--json")
+    d = sub.add_parser("dyn", help="dynamic expert-cache policies over the held-out routing (#178)")
+    d.add_argument("--corpus", required=True)
+    d.add_argument("--runs", required=True)
+    d.add_argument("--step3")
+    d.add_argument("--readers", type=int, help="reader count fixed by a PREREG amendment (amendment 5: 1)")
+    d.add_argument("--rates", help='JSON {"R_pcie_gbps": x, "R_dram_gbps": y, "source": "..."}')
+    d.add_argument("--bpw", default="4.5", help="comma list of %s" % ", ".join(BPW_BYTES))
+    d.add_argument("--vram", help="VRAM budget for experts, e.g. 25.6GB")
+    d.add_argument("--pinned", help="pinned budget for experts, e.g. 46GiB")
+    d.add_argument("--slots", help="V:P[,V:P...] slots per layer (arena layer) or in all (arena global), "
+                                   "instead of --vram/--pinned")
+    d.add_argument("--arena", choices=("layer", "global"), default="layer")
+    d.add_argument("--policies", default="lru,clock,lfu")
+    d.add_argument("--admit-max", type=int, help="admission only at <= this many picks per step (sybil: 64)")
+    d.add_argument("--lfu-halflife", type=float, default=64.0, help="LFU decay half-life in tokens")
+    d.add_argument("--prefetch", default="none", help="comma list of none, oracle, precision in (0, 1]")
+    d.add_argument("--depths", default="1", help="look-ahead in layers, comma list")
+    d.add_argument("--pf-budget", type=int, help="prefetch NVMe reads per token")
+    d.add_argument("--json")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "corpus":
             return corpus_cmd(a)
+        if a.cmd == "dyn":
+            return dyn_cmd(a)
         held, cal, reasons = load_corpus(a.corpus, a.runs)
         b, why = b_from_step3(a.step3, a.readers)
         res = simulate(held, cal, b, why, reasons, tuple(int(x) for x in a.windows.split(",")), a.gate_window)

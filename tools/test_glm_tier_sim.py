@@ -397,5 +397,192 @@ class TestStageCeilingDefault(unittest.TestCase):
                          % m.group(1))
 
 
+def uniform_routes(n, seed, layers=L):
+    """[n][layers][K]: every position and layer routes a uniform random set of K distinct experts of E."""
+    rng = np.random.default_rng(seed)
+    return np.sort(rng.random((n, layers, E)).argsort(axis=2)[:, :, :K], axis=2).astype(np.uint16)
+
+
+def one_layer(seq):
+    return np.array(seq, np.uint16).reshape(-1, 1, 1)
+
+
+class TestDynPolicies(unittest.TestCase):
+    """#178: the `dyn` simulator's policies against hand sequences, MIN, the static path and uniform routing."""
+
+    SEQ = [0, 1, 2, 1, 0, 3, 2, 1, 4, 3]                 # A B C B A D C B E D, one layer, one pick per token
+
+    def reads(self, res):
+        return (res["nvme_demand"] + res["nvme_prefetch"]).tolist()
+
+    def test_clock_hand_sequence(self):
+        # 3 slots: A B C fill (bit set); B, A hit; D sweeps A, B, C (bits cleared), evicts A, hand at B; C, B hit
+        # (bits set); E sweeps B, C, D (D's bit was set on insert) and evicts B; D hits
+        r = one_layer(self.SEQ)
+        want = [1, 1, 1, 0, 0, 1, 0, 0, 1, 0]
+        self.assertEqual(self.reads(ts.dyn_run(r, 3, 0, "clock", n_experts=8)), want)
+        self.assertEqual(self.reads(ts.dyn_run(r, 0, 3, "clock", n_experts=8)), want)
+        self.assertEqual(self.reads(ts.dyn_run(r, 3, 0, "lru", n_experts=8)), [1, 1, 1, 0, 0, 1, 1, 1, 1, 1])
+
+    def test_clock_never_evicts_the_step_picks(self):
+        # 2 slots holding 0 and 1; the step picks 0, 1, 2: no victim outside the picks -> 2 is not stored
+        t = ts.ClockTier(2)
+        t.insert(10), t.insert(11)
+        self.assertEqual(t.insert(12, protect={10, 11, 12}), (False, None))
+        self.assertEqual(t.insert(12, protect={10, 12}), (True, 11))
+
+    def test_lru_is_the_window_and_capacity_0_is_static(self):
+        routes = uniform_routes(300, 5)
+        every = np.ones(routes.shape, bool)
+        static = ts.lru_reads(routes, every, 0)          # the static path at W = 0: every visit an NVMe read
+        self.assertTrue(np.array_equal(ts.dyn_run(routes, 0, 0, "lru")["nvme_demand"], static))
+        self.assertTrue((static == L * K).all())
+        for cv, cp in ((8, 0), (0, 8), (108, 0), (25, 83), (83, 25)):
+            got = ts.dyn_run(routes, cv, cp, "lru")["nvme_demand"]
+            self.assertTrue(np.array_equal(got, ts.lru_reads(routes, every, cv + cp)), (cv, cp))
+
+    def test_min_bounds_every_policy(self):
+        routes = uniform_routes(150, 6, layers=4)
+        for arena, (cv, cp) in (("layer", (10, 30)), ("global", (40, 120))):
+            mn = ts.dyn_min(routes, cv + cp, arena).sum()
+            for pol in ts.POLICIES:
+                for pf, d in ((None, 1), ("oracle", 1), (0.5, 2), (0.9, 3)):
+                    for adm in (None, 4):
+                        r = ts.dyn_run(routes, cv, cp, pol, arena, adm, pf, d)
+                        self.assertGreaterEqual(int((r["nvme_demand"] + r["nvme_prefetch"]).sum()), int(mn),
+                                                (arena, pol, pf, d, adm))
+        self.assertEqual(ts.dyn_min(one_layer(self.SEQ), 3).tolist(), [1, 1, 1, 0, 0, 1, 0, 0, 1, 0])
+
+    def test_min_guard_refuses_a_policy_below_min(self):
+        fake = {"nvme_demand": np.array([1, 0]), "nvme_prefetch": np.array([0, 0])}
+        with self.assertRaisesRegex(ts.SimError, "simulator defect"):
+            ts.dyn_check_min("x", fake, np.array([1, 1]))
+
+    def test_precision_one_is_the_oracle(self):
+        routes = uniform_routes(200, 7, layers=6)
+        for pol, arena, cv, cp in (("lru", "layer", 4, 12), ("clock", "global", 20, 60), ("lfu", "layer", 4, 12)):
+            a = ts.dyn_run(routes, cv, cp, pol, arena, prefetch="oracle", depth=2)
+            b = ts.dyn_run(routes, cv, cp, pol, arena, prefetch=1.0, depth=2)
+            for c in ts.DYN_COUNTERS:
+                self.assertTrue(np.array_equal(a[c], b[c]), (pol, c))
+            self.assertEqual((a["prefetch_useful"], a["prefetch_wasted"]), (b["prefetch_useful"], b["prefetch_wasted"]))
+            low = ts.dyn_run(routes, cv, cp, pol, arena, prefetch=0.5, depth=2)
+            self.assertGreater(low["prefetch_wasted"], 0)
+
+    def test_oracle_prefetch_per_layer_hides_every_later_read(self):
+        # per-layer arena, policies that protect the step's picks: nothing touches layer j + d's arena between the
+        # prefetch and the use, so only the first d layers of token 0 stall and nothing is wasted
+        routes = uniform_routes(100, 8, layers=6)
+        for pol in ("clock", "lfu"):
+            for d in (1, 2, 3):
+                pf = ts.dyn_run(routes, 4, 12, pol, prefetch="oracle", depth=d)
+                self.assertEqual(int(pf["nvme_demand"].sum()), d * K, (pol, d))
+                self.assertEqual(pf["prefetch_wasted"], 0)
+                self.assertEqual(pf["prefetch_useful"], int(pf["nvme_prefetch"].sum()))
+        for pol in ts.POLICIES:                          # a budget of 0 reads per token is no prefetch
+            base = ts.dyn_run(routes, 4, 12, pol)
+            capped = ts.dyn_run(routes, 4, 12, pol, prefetch="oracle", depth=1, pf_budget=0)
+            self.assertTrue(all(np.array_equal(capped[c], base[c]) for c in ts.DYN_COUNTERS), pol)
+
+    def test_uniform_routing_matches_the_analytic_m(self):
+        routes = uniform_routes(1200, 9)
+        gen = np.arange(1200) >= 200                     # past the cold start
+        c = 108
+        lru = sum((E - c) / (E - k) for k in range(K)) / K   # per pick in order: 0.63273
+        protect = (E - c) / E                                # the step's picks protected: 0.625
+        self.assertAlmostEqual(lru, 0.63273, places=5)
+        for pol, cv, cp, want in (("lru", 108, 0, lru), ("lru", 25, 83, lru), ("clock", 25, 83, protect),
+                                  ("lfu", 25, 83, protect)):
+            m = ts.dyn_run(routes, cv, cp, pol)["nvme_demand"][gen].mean() / (L * K)
+            self.assertAlmostEqual(m, want, delta=0.004, msg=(pol, cv, cp, m, want))
+
+
+class TestDynTraffic(unittest.TestCase):
+    def test_capacity_from_bytes(self):
+        pinned = ts.parse_bytes("46GiB")
+        self.assertEqual(pinned, 46 * 2 ** 30)
+        self.assertEqual(ts.capacity(0, pinned, ts.BPW_BYTES["4.5"], "layer"), (0, 83))
+        self.assertEqual(ts.capacity(0, pinned, ts.BPW_BYTES["3.05"], "layer"), (0, 124))
+        self.assertEqual(ts.capacity(ts.parse_bytes("25.6GB"), 0, ts.BPW_BYTES["3.05"], "layer"), (64, 0))
+        self.assertEqual(ts.capacity(ts.parse_bytes("25.6GB"), 0, ts.BPW_BYTES["3.05"], "global"), (2702, 0))
+        self.assertEqual(ts.BPW_BYTES["3.5"], 10_871_858)
+        with self.assertRaises(ts.SimError):
+            ts.parse_bytes("12 parsecs")
+
+    def test_pcie_is_zero_copy_admissions_write_backs(self):
+        routes = uniform_routes(200, 10, layers=4)
+        for adm in (None, 4):
+            r = ts.dyn_run(routes, 6, 20, "clock", admit_max=adm)
+            visits = 4 * K
+            # every visit that is not a VRAM hit crosses PCIe once (copy or zero-copy read); write-backs on top
+            self.assertTrue(np.array_equal(r["zero_copy"] + r["admissions"], visits - r["vram_hits"]))
+            self.assertTrue((r["write_backs"] <= r["admissions"]).all())
+        off = ts.dyn_run(routes, 6, 20, "lru", admit_max=4)     # 8 picks per step > 4: admission off
+        self.assertEqual(int(off["admissions"].sum() + off["vram_hits"].sum() + off["write_backs"].sum()), 0)
+        on = ts.dyn_run(routes, 6, 20, "lru", admit_max=64)
+        ref = ts.dyn_run(routes, 6, 20, "lru")
+        self.assertTrue(all(np.array_equal(on[c], ref[c]) for c in ts.DYN_COUNTERS))
+
+    def test_hand_traffic(self):
+        # VRAM 1 slot, pinned 1 slot, one layer: A (NVMe, admitted) B (NVMe, admitted, A written back)
+        # A (pinned hit, admitted, B written back) C (NVMe, admitted, A written back, B dropped)
+        r = ts.dyn_run(one_layer([0, 1, 0, 2]), 1, 1, "lru", n_experts=4)
+        self.assertEqual(r["nvme_demand"].tolist(), [1, 1, 0, 1])
+        self.assertEqual(r["pinned_hits"].tolist(), [0, 0, 1, 0])
+        self.assertEqual(r["admissions"].tolist(), [1, 1, 1, 1])
+        self.assertEqual(r["write_backs"].tolist(), [0, 1, 1, 1])
+        z = ts.dyn_run(one_layer([0, 1, 0, 2]), 0, 1, "lru", n_experts=4)   # no VRAM: zero-copy from pinned
+        self.assertEqual(z["zero_copy"].tolist(), [1, 1, 1, 1])
+        self.assertEqual(z["nvme_demand"].tolist(), [1, 1, 1, 1])
+
+    def test_cost_model_and_rates_file(self):
+        row = {"m": {"mean": 0.1}, "pcie": 0.4, "dram": 0.5}
+        eb = ts.BPW_BYTES["3.05"]
+        c = ts.dyn_cost(row, eb, 6.994, {"R_pcie_gbps": 51.6, "R_dram_gbps": 89.6})
+        per = 336 * eb
+        self.assertAlmostEqual(c["nvme"]["ceiling_tok_s"], 6.994e9 / (0.1 * per))
+        self.assertAlmostEqual(c["pcie"]["ceiling_tok_s"], 51.6e9 / (0.4 * per))
+        self.assertEqual(c["binding"], "nvme")
+        self.assertAlmostEqual(1 / c["serial_tok_s"], 0.1 * per / 6.994e9 + 0.4 * per / 51.6e9 + 0.5 * per / 89.6e9)
+        bare = ts.dyn_cost(row, eb, None, {})
+        self.assertIsNone(bare["ceiling_tok_s"])
+        self.assertIsNone(bare["serial_tok_s"])
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "rates.json")
+            ts.jdump({"R_pcie_gbps": 47.78, "source": "docs/architecture.md:610"}, p)
+            rates, why = ts.rates_from_file(p)
+            self.assertEqual(rates, {"R_pcie_gbps": 47.78})
+            self.assertIn("architecture.md:610", why)
+            ts.jdump({"R_pcie_gbps": -1}, p)
+            with self.assertRaises(ts.SimError):
+                ts.rates_from_file(p)
+        self.assertEqual(ts.rates_from_file(None), ({}, "no rates file given"))
+
+
+class TestDynCli(unittest.TestCase):
+    def test_dyn_end_to_end_and_refusals(self):
+        with tempfile.TemporaryDirectory() as d:
+            held = uniform_routes(2500, 11)
+            c = Corpus(d, held, [rows(100, CAL_PICKS)])
+            out = os.path.join(d, "dyn.json")
+            rc = ts.main(["dyn", "--corpus", c.path, "--runs", c.rdir, "--slots", "108:0,25:83", "--policies",
+                          "lru,clock", "--prefetch", "none,0.7", "--depths", "1", "--step3", str(STEP3),
+                          "--readers", "1", "--json", out])
+            self.assertEqual(rc, 0)
+            doc = ts.jload(out)
+            self.assertEqual(doc["held"], "held")
+            self.assertAlmostEqual(doc["B"], 6.9936611328)
+            lru = [r for r in doc["rows"] if r["policy"] == "lru" and r["prefetch"] is None]
+            want = ts.lru_reads(held, np.ones(held.shape, bool), 108).mean() / 336
+            self.assertAlmostEqual(lru[0]["m"]["mean"], want)
+            # 108:0 has no pinned slots, so no prefetch rows: MIN + 2 policies; 25:83: MIN + 2 policies x 2 prefetch
+            self.assertEqual(len(doc["rows"]), (1 + 2) + (1 + 2 * 2))
+            self.assertIsNotNone(lru[0]["cost"]["nvme"]["ceiling_tok_s"])
+            self.assertIsNone(lru[0]["cost"]["pcie"]["ceiling_tok_s"])   # no rates file: no R_PCIe
+            self.assertEqual(ts.main(["dyn", "--corpus", c.path, "--runs", c.rdir]), 2)   # no capacity
+            self.assertEqual(ts.main(["dyn", "--corpus", c.path, "--runs", c.rdir, "--slots", "8:8",
+                                      "--policies", "fifo"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
