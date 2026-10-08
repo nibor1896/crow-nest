@@ -6205,7 +6205,7 @@ pub mod mul1 {
     use cudarc::driver::sys::{CUdeviceptr, CUfunction};
 
     /// every entry of `MUL1_SRC`
-    pub const NAMES: &[&str] = &["mul1_had_in", "mul1_gemv", "mul1_had_out", "mul1_act_had_in", "mul1_decode_states"];
+    pub const NAMES: &[&str] = &["mul1_had_in", "mul1_gemv", "mul1_gemv_warp", "mul1_had_out", "mul1_act_had_in", "mul1_decode_states"];
     /// tokens per slot (`MUL1_MAXT`)
     pub const MAXT: usize = 8;
     /// activation rows one k-split stages in shared memory (`MUL1_XROWS`)
@@ -6272,6 +6272,8 @@ pub mod mul1 {
         pub module: cuda::Module,
         had_in: CUfunction,
         gemv: CUfunction,
+        gemv_block: CUfunction,
+        gemv_warp: CUfunction,
         had_out: CUfunction,
         act: CUfunction,
         pub decode_states: CUfunction,
@@ -6285,11 +6287,20 @@ pub mod mul1 {
             Kernels {
                 had_in: module.get("mul1_had_in"),
                 gemv: module.get("mul1_gemv"),
+                gemv_block: module.get("mul1_gemv"),
+                gemv_warp: module.get("mul1_gemv_warp"),
                 had_out: module.get("mul1_had_out"),
                 act: module.get("mul1_act_had_in"),
                 decode_states: module.get("mul1_decode_states"),
                 module,
             }
+        }
+
+        /// Run every later GEMV launch on the reference kernel `mul1_gemv_warp` (the first #180
+        /// kernel, bit-identical, ~8 GB/s from pinned RAM) instead of `mul1_gemv`: the second
+        /// arm of `mul1_gpu_gemv_block_equals_warp_bits` and of the benchmarks (#183).
+        pub fn use_warp_gemv(&mut self, on: bool) {
+            self.gemv = if on { self.gemv_warp } else { self.gemv_block };
         }
     }
 
@@ -6439,7 +6450,7 @@ mod tests_mul1_gpu {
     //! f64 evaluation of the #181-decoded tensor (`cpu_mul1::testkit`), the VRAM and the pinned
     //! lane bit-identical, GPU vs CPU within both bounds. `#[ignore]`: CI has no GPU. Run with
     //! `cargo test --release --lib mul1_gpu -- --ignored --nocapture --test-threads 1`.
-    use super::launch_sync;
+    use super::{launch_sync, launch_v};
     use super::mul1::{self, FfnPlan, GemvPlan, Kernels};
     use crate::cpu_mul1::{self, testkit::*, Mul1Expert, Path};
     use crate::cuda;
@@ -6633,17 +6644,232 @@ mod tests_mul1_gpu {
         }
     }
 
+    /// #183: the block-run GEMV `mul1_gemv` gives the bits of the first kernel
+    /// `mul1_gemv_warp` for every bitrate (the 7 cases plus synthetic K = 1, 1.5, 2.5, 5, 8),
+    /// gate / up / down, T 1, 3, 8, two slots, from VRAM, from pinned RAM and from a trellis base
+    /// that is not 16-byte aligned (the 4-byte fallback); and the FFN of a GLM expert from pinned RAM.
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib mul1_gpu -- --ignored --nocapture --test-threads 1"]
+    fn mul1_gpu_gemv_block_equals_warp_bits() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut kn = Kernels::new();
+            let mut rng = Rng(0xB10C);
+            let mut all = cases();
+            for (i, k) in [1.0, 1.5, 2.5, 5.0, 8.0].into_iter().enumerate() {
+                all.push(Case {
+                    name: format!("synth K = {k}"),
+                    source: format!("synth:{}", 50 + i),
+                    bitrate: cpu_mul1::Bitrate::from_k(k).unwrap(),
+                    hidden: 512,
+                    inter: 256,
+                    want: [String::new(), String::new(), String::new()],
+                });
+            }
+            let mut checked = 0;
+            for c in &all {
+                let rec = record(c);
+                let l = lanes(&[&rec, &rec]);
+                // the same record 4 bytes off 16-byte alignment, in VRAM
+                let mut shifted = vec![0u8; 4];
+                shifted.extend_from_slice(&rec);
+                let mut vs = cuda::upload_dev(&shifted);
+                let mut ptr_s = cuda::to_u64_dev(&[vs + 4, vs + 4]);
+                let sp = spec_of(c);
+                for (name, spec) in [("gate", sp[0]), ("up", sp[1]), ("down", sp[2])] {
+                    for t in [1usize, 3, 8] {
+                        let x = xs(2 * t * spec.k, &mut rng);
+                        let mut plan = GemvPlan::new(spec, 2, t);
+                        let (mut xd, mut yd) = (cuda::to_f32_dev(&x), cuda::alloc_zeroed(2 * t * spec.n * 4));
+                        let out = |kn: &Kernels, ptrs: u64| {
+                            plan.run(kn, ptrs, xd, yd);
+                            cuda::sync();
+                            bits(&cuda::dtoh(yd, 2 * t * spec.n))
+                        };
+                        kn.use_warp_gemv(true);
+                        let want = out(&kn, l.ptr_v);
+                        kn.use_warp_gemv(false);
+                        for (lane, ptrs) in [("VRAM", l.ptr_v), ("pinned", l.ptr_p), ("VRAM + 4 B", ptr_s)] {
+                            assert_eq!(out(&kn, ptrs), want, "{} {name} T {t} {lane}: mul1_gemv != mul1_gemv_warp", c.name);
+                            checked += 1;
+                        }
+                        cuda::free_dev(&mut xd);
+                        cuda::free_dev(&mut yd);
+                        plan.free();
+                    }
+                }
+                cuda::free_dev(&mut vs);
+                cuda::free_dev(&mut ptr_s);
+                drop_lanes(l);
+            }
+            // the FFN of one GLM expert, T 2, from pinned RAM
+            let c = &glm_cases()[0];
+            let rec = record(c);
+            let l = lanes(&[&rec]);
+            let x = xs(2 * c.hidden, &mut rng);
+            let mut plan = FfnPlan::new(c.hidden, c.inter, c.bitrate.bits, c.bitrate.half, 1, 2);
+            let (mut xd, mut yd) = (cuda::to_f32_dev(&x), cuda::alloc_zeroed(2 * c.hidden * 4));
+            let mut ys = Vec::new();
+            for warp in [true, false] {
+                kn.use_warp_gemv(warp);
+                plan.run(&kn, l.ptr_p, xd, yd);
+                cuda::sync();
+                ys.push(bits(&cuda::dtoh(yd, 2 * c.hidden)));
+            }
+            assert_eq!(ys[0], ys[1], "GLM FFN: block-run GEMV != warp GEMV");
+            eprintln!("mul1_gemv == mul1_gemv_warp bit for bit: {checked} GEMV cases + 1 GLM FFN");
+            cuda::free_dev(&mut xd);
+            cuda::free_dev(&mut yd);
+            plan.free();
+            drop_lanes(l);
+        }
+    }
+
+    /// Read-only kernels over the gate trellis of a record, for the read-pattern rows of
+    /// `mul1_gpu_read_bench` (no decode, no math): `rd_warp96` is the load shape of the
+    /// warp-per-tile `mul1_gemv_warp` (lane i < n32 loads word i of its tile, 4 tiles, then the
+    /// warp consumes), `rd_block16` the shape of the block-run `mul1_gemv` (16 B per thread over
+    /// the contiguous run of the block's 8 tiles per tile row), `rd_linear` a plain 16 B per
+    /// thread sweep of the same bytes (the device-issued ceiling form of `pcie_probe`).
+    /// p: [0] k, [1] n, [2] S, [3] tr_off, [4] n32, [5] bytes.
+    const READ_SRC: &str = r#"
+extern "C" __global__ void rd_warp96(const unsigned long long* __restrict__ ptrs, unsigned int* __restrict__ sink, const int* __restrict__ p) {
+    const int k = p[0], n = p[1], S = p[2], n32 = p[4];
+    const unsigned int* tr = (const unsigned int*)(ptrs[0] + (unsigned long long)p[3]);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, tiles_n = n >> 4, tps = (k >> 4) / S;
+    const int nb = blockIdx.x * 8 + warp, kb0 = blockIdx.y * tps;
+    __shared__ unsigned int tw[8][4][64];
+    unsigned int acc = 0;
+    for (int kt = 0; kt < tps; kt += 4) {
+        for (int u = 0; u < 4; u++) {
+            if (kt + u < tps) {
+                const unsigned int* tp = tr + ((size_t)(kb0 + kt + u) * tiles_n + nb) * n32;
+                tw[warp][u][lane] = lane < n32 ? tp[lane] : 0u;
+                tw[warp][u][lane + 32] = lane + 32 < n32 ? tp[lane + 32] : 0u;
+            }
+        }
+        __syncwarp();
+        for (int u = 0; u < 4; u++) acc ^= tw[warp][u][(lane * 7) & 63];
+        __syncwarp();
+    }
+    if (acc == 0x9e3779b9u) sink[0] = acc;
+}
+extern "C" __global__ void rd_block16(const unsigned long long* __restrict__ ptrs, unsigned int* __restrict__ sink, const int* __restrict__ p) {
+    const int k = p[0], n = p[1], S = p[2], n32 = p[4];
+    const uint4* tr = (const uint4*)(ptrs[0] + (unsigned long long)p[3]);
+    const int tiles_n = n >> 4, tps = (k >> 4) / S, kb0 = blockIdx.y * tps, run4 = 2 * n32;
+    unsigned int acc = 0;
+    for (int kt = 0; kt < tps; kt += 4) {
+        for (int i = threadIdx.x; i < 4 * run4; i += blockDim.x) {
+            int u = i / run4, c = i - u * run4;
+            if (kt + u < tps) {
+                uint4 v = tr[((size_t)(kb0 + kt + u) * tiles_n + blockIdx.x * 8) * n32 / 4 + c];
+                acc ^= v.x ^ v.y ^ v.z ^ v.w;
+            }
+        }
+        __syncthreads();
+    }
+    if (acc == 0x9e3779b9u) sink[0] = acc;
+}
+extern "C" __global__ void rd_linear(const unsigned long long* __restrict__ ptrs, unsigned int* __restrict__ sink, const int* __restrict__ p) {
+    const uint4* b = (const uint4*)(ptrs[0] + (unsigned long long)p[3]);
+    const size_t n = (size_t)p[5] / 16;
+    unsigned int acc = 0;
+    size_t i0 = (size_t)blockIdx.x * blockDim.x * 4 + threadIdx.x;
+    uint4 v[4];
+    for (int j = 0; j < 4; j++) v[j] = i0 + j * blockDim.x < n ? b[i0 + j * blockDim.x] : make_uint4(0, 0, 0, 0);
+    for (int j = 0; j < 4; j++) acc ^= v[j].x ^ v[j].y ^ v[j].z ^ v[j].w;
+    if (acc == 0x9e3779b9u) sink[0] = acc;
+}
+"#;
+
+    /// Micro-benchmark, not a gate (#183): the read shapes alone, GB/s of gate trellis
+    /// bytes from VRAM and zero-copy from pinned RAM; 16 GLM-shaped K = 3 records rotated, 5 timed
+    /// rounds of 64 calls after one warm-up, median (min..max).
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib mul1_gpu_read_bench -- --ignored --nocapture"]
+    fn mul1_gpu_read_bench() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let m = cuda::compile(READ_SRC);
+            let fns = [("rd_warp96", m.get("rd_warp96")), ("rd_block16", m.get("rd_block16")), ("rd_linear", m.get("rd_linear"))];
+            let c = &glm_cases()[0];
+            let base = record(c);
+            let recs: Vec<Vec<u8>> = (0..16u8).map(|i| base.iter().map(|b| b ^ i).collect()).collect();
+            let refs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
+            let l = lanes(&refs);
+            let g = spec_of(c)[0];
+            let s = mul1::ksplit(g.k);
+            let tb = g.trellis_bytes();
+            let mut prm = cuda::to_i32_dev(&[g.k as i32, g.n as i32, s as i32, 0, g.n32() as i32, tb as i32]);
+            let mut sink = cuda::alloc_zeroed(64);
+            eprintln!("mul1 read bench: gate trellis {tb} B per call, 16 records rotated");
+            for round_pair in 0..2 {
+                for (lane, pbase) in [("VRAM", l.ptr_v), ("pinned", l.ptr_p)] {
+                    for (name, f) in fns {
+                        let mut gbs = Vec::new();
+                        for round in 0..6 {
+                            cuda::sync();
+                            let t0 = std::time::Instant::now();
+                            for call in 0..64u64 {
+                                let pe = pbase + 8 * (call % 16);
+                                if name == "rd_linear" {
+                                    launch_v(f, (tb / 16).div_ceil(1024) as u32, 1, 1, 256, &[pe, sink, prm]);
+                                } else {
+                                    launch_v(f, (g.n / 128) as u32, s as u32, 1, 256, &[pe, sink, prm]);
+                                }
+                            }
+                            cuda::sync();
+                            if round > 0 {
+                                gbs.push(64.0 * tb as f64 / t0.elapsed().as_secs_f64() / 1e9);
+                            }
+                        }
+                        gbs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        eprintln!("  pass {round_pair} {lane:6} {name:10}: median {:.1} GB/s (min {:.1}, max {:.1})", gbs[2], gbs[0], gbs[4]);
+                    }
+                }
+            }
+            // the device-issued ceiling of this box: one linear sweep over all 16 records per call
+            let all = 16 * base.len();
+            let mut pa = cuda::to_i32_dev(&[0, 0, 0, 0, 0, i32::try_from(all).unwrap()]);
+            for (lane, b) in [("VRAM", l.vram), ("pinned", l.pinned.dev)] {
+                let mut tab = cuda::to_u64_dev(&[b]);
+                let f = fns[2].1;
+                let mut gbs = Vec::new();
+                for round in 0..6 {
+                    cuda::sync();
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..4 {
+                        launch_v(f, (all / 16).div_ceil(1024) as u32, 1, 1, 256, &[tab, sink, pa]);
+                    }
+                    cuda::sync();
+                    if round > 0 {
+                        gbs.push(4.0 * all as f64 / t0.elapsed().as_secs_f64() / 1e9);
+                    }
+                }
+                gbs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                eprintln!("  {lane:6} rd_linear over {all} B: median {:.1} GB/s (min {:.1}, max {:.1})", gbs[2], gbs[0], gbs[4]);
+                cuda::free_dev(&mut tab);
+            }
+            cuda::free_dev(&mut pa);
+            cuda::free_dev(&mut prm);
+            cuda::free_dev(&mut sink);
+            drop_lanes(l);
+        }
+    }
+
     /// Micro-benchmark, not a gate (#180 item 5, short form): GB/s of record bytes the GPU reads
     /// per second from VRAM and zero-copy from pinned RAM, GEMV (gate trellis bytes) and FFN
     /// (whole record), T 1 and 4, 16 distinct GLM-shaped K = 3 records rotated (152 MB, more than
-    /// the 96 MB L2). Each row: 5 timed rounds (after one warm-up) of 64 calls queued back to back
-    /// with one sync; median, min, max over the rounds.
+    /// the 96 MB L2). Each row: the two GEMV kernels as alternating arms (#183: round r
+    /// runs `mul1_gemv_warp` for even r, `mul1_gemv` for odd r), one warm-up round per arm, then 5
+    /// timed rounds per arm of 64 calls queued back to back with one sync; median, min, max.
     #[test]
     #[ignore = "needs the GPU: cargo test --release --lib mul1_gpu_bench -- --ignored --nocapture"]
     fn mul1_gpu_bench() {
         unsafe {
             let _ctx = cuda::Ctx::init();
-            let kn = Kernels::new();
+            let mut kn = Kernels::new();
             let c = &glm_cases()[0];
             let base = record(c);
             let tb = cpu_mul1::Mul1Matrix::trellis_bytes(c.hidden, c.inter, c.bitrate);
@@ -6666,8 +6892,9 @@ mod tests_mul1_gpu {
                 let mut fp = FfnPlan::new(c.hidden, c.inter, c.bitrate.bits, c.bitrate.half, 1, t);
                 for (lane, pbase) in [("VRAM", l.ptr_v), ("pinned", l.ptr_p)] {
                     for (what, bytes) in [("gemv gate", gate_bytes), ("ffn", rec_bytes)] {
-                        let mut gbs = Vec::new();
-                        for round in 0..6 {
+                        let mut gbs = [Vec::new(), Vec::new()];
+                        for round in 0..12 {
+                            kn.use_warp_gemv(round % 2 == 0);
                             cuda::sync();
                             let t0 = std::time::Instant::now();
                             for call in 0..64usize {
@@ -6681,18 +6908,20 @@ mod tests_mul1_gpu {
                             }
                             cuda::sync();
                             let s = t0.elapsed().as_secs_f64();
-                            if round > 0 {
-                                gbs.push(64.0 * bytes / s / 1e9);
+                            if round > 1 {
+                                gbs[round % 2].push(64.0 * bytes / s / 1e9);
                             }
                         }
-                        gbs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                        eprintln!(
-                            "  {lane:6} {what:9} T {t}: median {:.1} GB/s (min {:.1}, max {:.1}), {:.1} us per call, 5 rounds x 64 calls",
-                            gbs[2],
-                            gbs[0],
-                            gbs[4],
-                            bytes / (gbs[2] * 1e9) * 1e6
-                        );
+                        for (arm, g) in ["warp (old)", "block (new)"].iter().zip(gbs.iter_mut()) {
+                            g.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            eprintln!(
+                                "  {lane:6} {what:9} T {t} {arm:11}: median {:.1} GB/s (min {:.1}, max {:.1}), {:.1} us per call, 5 rounds x 64 calls",
+                                g[2],
+                                g[0],
+                                g[4],
+                                bytes / (g[2] * 1e9) * 1e6
+                            );
+                        }
                     }
                 }
                 cuda::free_dev(&mut xd);
