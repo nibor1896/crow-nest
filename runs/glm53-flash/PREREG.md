@@ -168,7 +168,7 @@ robin confirmed on 2026-10-08, before any routing dump or G1 row exists:
 2. **G1 as amendment 1 set it:** judged at N = 25 static hot experts per layer and NVMe window W = 0 (strict case); W > 0 is reported, not judged.
 No threshold changes.
 
-### Amendment 4 — 2026-10-08 ~09:50 CEST: data for the step-3 re-run (crow-nest #146)
+### Amendment 4 — 2026-10-08 ~09:43 CEST: data for the step-3 re-run (crow-nest #146)
 
 Written on crow-nest `e476bd6` before the re-run of step 3 exists. Seen when written: the first step-3 run (`runs/glm53-flash/step03/20261008T001819Z.md`: valid, medians 6.994 / 9.765 / 7.811 GB/s at 1 / 2 / 4 readers, spreads 1.003 / 1.232 / 1.430, so no B for G1), and the finished step-9 container (#157: 62/62 shards verified, index v2, sha256 below). Reason: step 3's data clause names "the GLM shards that step 6 needs anyway"; those seven shards were converted and deleted by the staged conversion (`models/GLM-5.3-Flash-original/stage.log`, all 62 shards deleted by 09:38:36). Fetching them again (33.4 GB) would read a file no later step reads; the container is the same model and the file step 14's NVMe tier reads.
 
