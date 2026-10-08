@@ -156,3 +156,7 @@ Written on crow-nest `f4f54e4` (branch `glm-step8`) before any routing dump of s
 - RAM per pass: 28.0 GiB RSS after a MoE layer's load (step 6, layer 3) + 2 × 2 GiB of f32 hand-over state ([32,768][4][4096], in and out) + 4 GiB of expanded MLA K/V in a DSA layer at 32,768 tokens + ≈ 13.0 GB (12.1 GiB) in the largest attention call ≈ 48 GiB of 63.38 GiB.
 - Disk per pass: the runner keeps every layer's hand-over state, 45 × 1 GiB in BF16 (`--state-dtype bf16`, the runner's mode for long routing runs; f32 would be 90 GiB). Kept after a pass: the routing files (≈ 88 MB per file) and the manifest. BF16 hand-over rounds every layer's input against an f32 reference; its effect on routing is not measured here and is covered by the engine re-measure of step 14 (G4).
 - Every pass, also an aborted one, is a row in the Flash-Next measurement book.
+
+### Amendment 2 — 2026-10-08 ~07:30 CEST (administrative, no criterion changed)
+
+robin asked on 2026-10-08 morning for a GLM-5.3-Flash measurement book of its own. From now on every row of this series goes to https://claude.ai/artifact/MpmBA5NTAguy8EyHcRgoV4 ("GLM-5.3-Flash Messbuch") instead of the Flash-Next book named in "Fixed for the whole series" (`EcRQo5otLHnPqPUJXtZ9Xr`); the 14 rows written there on 2026-10-08 were moved. No threshold, metric, data set or method changes.
