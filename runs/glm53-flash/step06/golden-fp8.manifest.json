@@ -1,0 +1,272 @@
+{
+ "runner": "oracle/glm5_layerwise.py (crow-nest #158)",
+ "torch": "2.13.0+cpu",
+ "transformers": "5.16.1",
+ "threads": 16,
+ "attn_implementation": "eager",
+ "experts_implementation": "eager",
+ "weights": {
+  "weights": "fp8 (FP8 E4M3 originals, 128x128 weight_scale_inv blocks, dequantized to f32; BF16/F32 widened)",
+  "path": "..\\crow-nest\\models\\GLM-5.3-Flash-original",
+  "index_json_sha256": "3c3f40366a53c3fd7974b4eab7881a365a98c2a4329150befebab99fe7c18b05",
+  "config_json_sha256": "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f",
+  "index_json_mtime": 1791415966,
+  "n_tensors": 76108,
+  "n_fp8": 37338
+ },
+ "ids": [
+  8303,
+  220,
+  21,
+  315,
+  279,
+  5588,
+  44,
+  12,
+  20,
+  13,
+  18,
+  12,
+  23809,
+  4013,
+  12335,
+  279,
+  26970,
+  389,
+  1931,
+  14314,
+  25,
+  13608,
+  220,
+  15,
+  311,
+  220,
+  18,
+  525,
+  1349,
+  504,
+  279,
+  33389,
+  23,
+  84885,
+  323,
+  504,
+  279,
+  7130,
+  24796,
+  48,
+  5476,
+  11,
+  323,
+  1817,
+  6193,
+  2550,
+  374,
+  7707,
+  13,
+  141136,
+  150300,
+  11,
+  4368,
+  140490,
+  25,
+  36914,
+  70324,
+  2030,
+  29910,
+  1574,
+  3680,
+  896,
+  713,
+  2185,
+  462,
+  5016,
+  4865,
+  624,
+  750,
+  3076,
+  52968,
+  982,
+  262,
+  470,
+  2629,
+  52968,
+  8,
+  608,
+  2422,
+  52968,
+  8,
+  220,
+  671,
+  220,
+  19,
+  13,
+  20,
+  9468,
+  817,
+  4680
+ ],
+ "T": 86,
+ "D": 4,
+ "layers": [
+  0,
+  4
+ ],
+ "num_hidden_layers": 45,
+ "state_dtype": "f32",
+ "anchors": [],
+ "hidden_size": 4096,
+ "hc_mult": 4,
+ "layer_kinds": [
+  "kda+dense",
+  "kda+dense",
+  "kda+dense",
+  "dsa+moe",
+  "kda+moe",
+  "kda+moe",
+  "kda+moe",
+  "dsa+moe",
+  "kda+moe",
+  "kda+moe",
+  "kda+moe",
+  "dsa+moe",
+  "kda+moe",
+  "kda+moe",
+  "kda+moe",
+  "dsa+moe",
+  "kda+moe",
+  "kda+moe",
+  "kda+moe",
+  "dsa+moe",
+  "kda+moe",
+  "kda+moe",
+  "kda+moe",
+  "dsa+moe",
+  "kda+moe",
+  "kda+moe",
+  "kda+moe",
+  "dsa+moe",
+  "kda+moe",
+  "kda+moe",
+  "kda+moe",
+  "dsa+moe",
+  "kda+moe",
+  "kda+moe",
+  "kda+moe",
+  "dsa+moe",
+  "kda+moe",
+  "kda+moe",
+  "kda+moe",
+  "dsa+moe",
+  "kda+moe",
+  "kda+moe",
+  "kda+moe",
+  "dsa+moe",
+  "kda+moe"
+ ],
+ "files": {
+  "embed.f32": {
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "0b7ec9285445222fc6ef5c41ebacf630acd40e4900917649d853edfd2baa7721"
+  },
+  "l0-output.f32": {
+   "shape": [
+    90,
+    4,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "3db55f30c8e65f0f04d151f1ddc33a09a06542043104bb8bddc43dcc7d11936d"
+  },
+  "l1-output.f32": {
+   "shape": [
+    90,
+    4,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "bb4ea09f895611e57795eca183b181bf72e0b756c660df5d7714317566f3afc1"
+  },
+  "l2-output.f32": {
+   "shape": [
+    90,
+    4,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "4a8c30b0d24348fe938209e4f6b966d2f02e51ae5d0e56a61258f7f5c0d6ea2f"
+  },
+  "l3-output.f32": {
+   "shape": [
+    90,
+    4,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "960c649dcc15e48d858045d2cb47d3d280635c377da857780cab7da8bd153925"
+  },
+  "l3-routing-ids.i32": {
+   "shape": [
+    90,
+    8
+   ],
+   "dtype": "i32",
+   "sha256": "1d96742da88c91dede7f8ec42ab027635fbdae8cab874b18ae6d312d9889db8c"
+  },
+  "l3-routing-weights.f32": {
+   "shape": [
+    90,
+    8
+   ],
+   "dtype": "f32",
+   "sha256": "7d9667e86bd65b191542d00a364a5bb6c446c12476c692cef7acbcbf295d89c8"
+  },
+  "l3-dsa-topk.i32": {
+   "shape": [
+    90,
+    2051
+   ],
+   "dtype": "i32",
+   "sha256": "26df8b9ab18e43165d3a58279647897b10ad9d58fa707cbe9316f7d0287c3eb9"
+  }
+ },
+ "per_layer": [
+  {
+   "layer": 0,
+   "kind": "kda+dense",
+   "load_s": 0.194,
+   "compute_s": 0.32,
+   "rss_after_load_gib": 1.93,
+   "peak_wset_gib": 2.495
+  },
+  {
+   "layer": 1,
+   "kind": "kda+dense",
+   "load_s": 0.281,
+   "compute_s": 0.247,
+   "rss_after_load_gib": 1.95,
+   "peak_wset_gib": 2.661
+  },
+  {
+   "layer": 2,
+   "kind": "kda+dense",
+   "load_s": 0.282,
+   "compute_s": 0.315,
+   "rss_after_load_gib": 1.915,
+   "peak_wset_gib": 2.661
+  },
+  {
+   "layer": 3,
+   "kind": "dsa+moe",
+   "load_s": 7.795,
+   "compute_s": 0.69,
+   "rss_after_load_gib": 28.127,
+   "peak_wset_gib": 28.164
+  }
+ ],
+ "complete": true
+}

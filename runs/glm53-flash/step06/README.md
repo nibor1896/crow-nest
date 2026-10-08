@@ -1,0 +1,92 @@
+# Step 6 — partial container layers 0–3 and layer goldens (crow-nest #156), 2026-10-08
+
+Plan step 6 of the GLM-5.3-Flash series, PREREG `runs/glm53-flash/PREREG.md` (blob sha256 375de4d8…).
+Machine: Windows 11, 63.38 GiB RAM, CPU only (torch 2.13.0+cpu, transformers 5.16.1, 16 threads), crow-nest
+`e1d6b7e` + branch `glm-step6`. Large outputs live under `models/GLM-5.3-Flash-step06/` (git-ignored); this
+directory keeps the small records.
+
+## Inputs
+
+- Shards 01, 02, 03, 17, 31, 32, 62 of `zai-org/GLM-5.3-Flash` rev `eb9eb208`, 33,403,348,264 B, each
+  `VERIFIED` (size + lfs.sha256) by `fetch.log` (run 01:33:54–02:17:28 CEST, `run end: rc 0`).
+- Ids: `ids.json` (sha256 `56e2037e…29bb7`), 90 tokens = 86 prompt rows + 4 decode rows, from the text in
+  `ids-source.json` with the checkpoint's `tokenizer.json` (no special tokens). Not a PREREG anchor: G3's
+  anchors are not fixed yet (PREREG G3, "dated amendment before the first parity row").
+
+## Partial container (`convert.log.txt`)
+
+```
+converter --scales mse --source-repo zai-org/GLM-5.3-Flash --revision eb9eb208eb0d988989d07a6a12d0fdeb5f52574a \
+  --headers models/GLM-5.3-Flash-original/headers --layers 0-3 --with-embed-head \
+  models/GLM-5.3-Flash-original models/GLM-5.3-Flash-step06/GLM-5.3-Flash-CNQ4.5-L0-3.cnq
+```
+
+| item | value |
+|---|---|
+| output | `GLM-5.3-Flash-CNQ4.5-L0-3.cnq`, 7,220,714,871 B, sha256 `1d22f669…901df2`; sidecar sha256 `d8f8f37d…e9cf35` |
+| tensors | 972 written (902 NVFP4, 70 BF16/F32) of 37,534; 72,149 weight_map names filtered, 2,107 omitted by the recipe (vision, MTP), 0 missing |
+| payload | 7.22 GB, 5,140 B alignment zeros, 244 s (rc 0) |
+| recipe | `cnq4.5-glm5-next` as committed, `--scales mse` |
+
+## Gate 0 — FP8 → NVFP4 error per tensor (`weight-check.json`, sidecar)
+
+`oracle/glm5_weight_check.py`, 92 s. Every container tensor against the FP8 originals:
+
+- BF16/F32 keeps: 70 / 70 equal to the originals, exactly.
+- FP8 sources: 880 / 880 tensors with `glm5_common.fp8_dequant` == transformers `Fp8Dequantize._dequantize_one`, bit for bit.
+- Converter f32 vs oracle f32 (indirect): `mean((W_cnq − W_fp8)²)` recomputed from the oracle's FP8 decode equals the
+  sidecar's `mse` (computed by the converter against its own FP8 decode) on all 902 NVFP4 tensors, worst relative
+  difference 3.2e-13. A different scale order or block size on either side would show here; the converter's f32 itself
+  is not dumped, so this is not a bit-for-bit proof.
+
+| class | tensors | rel RMS error median [min, max] | MSE / MSE(ceil) | clipped (share) | old-bound violations |
+|---|---|---|---|---|---|
+| attn_kda (q/k/v/o_proj, q/k/v_conv1d, layers 0–2) | 21 | 0.0884 [0.0862, 0.0913] | 0.8005 | 7,626,948 (1.893 %) | 21,492 |
+| attn_mla (layer 3) | 5 | 0.0860 [0.0853, 0.0886] | 0.7870 | 2,213,766 (1.885 %) | 10,016 |
+| dense_mlp (layers 0–2) | 9 | 0.0850 [0.0840, 0.0883] | 0.7737 | 8,326,365 (1.838 %) | 43,159 |
+| expert_down (layer 3) | 288 | 0.0841 [0.0835, 0.0859] | 0.7788 | 41,023,590 (1.698 %) | 61,814 |
+| expert_gate | 288 | 0.0842 [0.0836, 0.0873] | 0.7819 | 41,801,340 (1.730 %) | 147,355 |
+| expert_up | 288 | 0.0844 [0.0838, 0.0860] | 0.7794 | 42,496,632 (1.759 %) | 165,917 |
+| shared_expert | 3 | 0.0875 [0.0866, 0.0876] | 0.7864 | 485,726 (1.930 %) | 1,569 |
+| **all (section text)** | **902** | | **0.7810** | **143,974,367** | **451,322** |
+
+The old relative bound (`max_rel ≤ 1.08` per element) is void under `--scales mse` by design (clipping allowed,
+`converter/README.md` "Scale policy"); 901 of 902 NVFP4 tensors carry violations of it, every one named in
+`weight-check.json` → `gate0_violations`. Under `mse` gate 0 is the MSE report: MSE 2.80e-6 vs 3.58e-6 with ceiling
+scales on the same weights (ratio 0.781). No tensor was refused, no NaN.
+
+## Layer goldens, both back ends (`golden-*.manifest.json`, `compare-fp8-vs-cnq.json`)
+
+```
+.venv-oracle/Scripts/python.exe -I oracle/glm5_layerwise.py run --weights fp8-originals models/GLM-5.3-Flash-original \
+  --ids runs/glm53-flash/step06/ids.json --decode 4 --out models/GLM-5.3-Flash-step06/ref-fp8 --layers 0:4
+.venv-oracle/Scripts/python.exe -I oracle/glm5_layerwise.py run --weights container models/GLM-5.3-Flash-step06/GLM-5.3-Flash-CNQ4.5-L0-3.cnq \
+  --ids runs/glm53-flash/step06/ids.json --decode 4 --out models/GLM-5.3-Flash-step06/ref-cnq --layers 0:4
+.venv-oracle/Scripts/python.exe -I oracle/glm5_compare.py models/GLM-5.3-Flash-step06/ref-fp8 models/GLM-5.3-Flash-step06/ref-cnq
+```
+
+| back end | wall | layer 3 load / compute | peak RSS (layer 3) |
+|---|---|---|---|
+| A: FP8 originals | 19.6 s | 7.8 s / 0.69 s | 28.13 GiB after load, peak working set 28.16 GiB |
+| B: container via `converter dequant` | 68.2 s | 52.1 s / 0.60 s | 28.00 GiB after load, peak working set 28.06 GiB |
+
+Quantisation error, container vs FP8 originals (each back end's own chain; layer k of B reads B's layer k−1;
+all 4 streams × 90 rows × 4096 flattened). Reported, not gated (PREREG G3 robustness: "reported separately").
+
+| layer | kind | cosine | max \|Δ\| (prompt / decode rows) | rel RMS | output RMS (A) |
+|---|---|---|---|---|---|
+| 0 | KDA + dense | 0.99307936 | 6.99e-3 (6.99e-3 / 5.25e-3) | 0.1177 | 5.86e-3 |
+| 1 | KDA + dense | 0.99402281 | 6.04e-3 (6.04e-3 / 4.55e-3) | 0.1104 | 5.40e-3 |
+| 2 | KDA + dense | 0.99805944 | 2.33e-2 (2.33e-2 / 1.62e-2) | 0.0644 | 3.08e-2 |
+| 3 | DSA + MoE | 0.99788674 | 1.98e-1 (1.98e-1 / 4.42e-2) | 0.0714 | 6.83e-2 |
+
+Layer 3: routed top-8 sets per token overlap 0.911 on average (min 0.625), 40 of 90 rows identical; DSA indexer
+selections identical on 90 / 90 rows (T = 86 < 2052: every pool is selected, the layer is dense causal attention).
+Golden sha256 per file: the two manifests (embed.f32 identical on both sides: the embedding is a BF16 keep).
+
+## G3 for step 6: not answered
+
+PREREG G3 per layer compares the ENGINE's layer output with the golden on the container-dequantised weights
+(cosine ≥ 0.9999). The engine has no glm5_next layer math yet (kernels are plan step 13, after G1), so that half
+cannot run; the goldens of back B above are its reference when it can. The cosines in the table are the
+quantisation error (container vs FP8), not the G3 metric.

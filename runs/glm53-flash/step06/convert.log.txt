@@ -1,0 +1,29 @@
+partial container --layers 0-3 --with-embed-head: 972 of 37534 tensors kept, 72149 weight_map names filtered (block scales included)
+manifest: 972 tensors from 62 shard file(s), 11.2 GB to read — family Glm5Next, recipe cnq4.5-glm5-next
+[    1/972] lm_head.weight (text) — 1.27 GB written, 2 s
+[  101/972] model.language_model.layers.3.mlp.experts.101.up_proj.weight (text) — 3.11 GB written, 35 s
+[  201/972] model.language_model.layers.3.mlp.experts.131.down_proj.weight (text) — 3.58 GB written, 59 s
+[  301/972] model.language_model.layers.3.mlp.experts.162.gate_proj.weight (text) — 4.06 GB written, 83 s
+[  401/972] model.language_model.layers.3.mlp.experts.192.up_proj.weight (text) — 4.53 GB written, 107 s
+[  501/972] model.language_model.layers.3.mlp.experts.221.down_proj.weight (text) — 5.00 GB written, 130 s
+[  601/972] model.language_model.layers.3.mlp.experts.252.gate_proj.weight (text) — 5.47 GB written, 154 s
+[  701/972] model.language_model.layers.3.mlp.experts.279.gate_proj.weight (text) — 5.91 GB written, 175 s
+[  801/972] model.language_model.layers.3.mlp.experts.5.up_proj.weight (text) — 6.38 GB written, 199 s
+[  901/972] model.language_model.layers.3.mlp.experts.8.down_proj.weight (text) — 6.85 GB written, 223 s
+section text: 902 nvfp4 tensors — MSE 2.7993e-6 vs ceil 3.5844e-6 (ratio 0.7810), clipped 143974367
+code class         attn_kda       raw 226658304 B, coded 215118619 B incl. 136 B tables: saving   5.091 % (order-0 entropy bound 6.030 %)
+code class         attn_mla       raw 66060288 B, coded 62226619 B incl. 136 B tables: saving   5.803 % (order-0 entropy bound 6.748 %)
+code class         dense_mlp      raw 254803968 B, coded 240461367 B incl. 136 B tables: saving   5.629 % (order-0 entropy bound 6.507 %)
+code class         expert_down    raw 1358954496 B, coded 1267987817 B incl. 136 B tables: saving   6.694 % (order-0 entropy bound 7.515 %)
+code class         expert_gate    raw 1358954496 B, coded 1270172075 B incl. 136 B tables: saving   6.533 % (order-0 entropy bound 7.408 %)
+code class         expert_up      raw 1358954496 B, coded 1270542842 B incl. 136 B tables: saving   6.506 % (order-0 entropy bound 7.379 %)
+code class         shared_expert  raw 14155776 B, coded 13385717 B incl. 136 B tables: saving   5.440 % (order-0 entropy bound 6.352 %)
+code expert_blocks all routed     raw 4076863488 B, coded 3803962857 B incl. 39168 B tables: saving   6.694 % (order-0 entropy bound 7.533 %)
+coverage check (PARTIAL container, --layers 0-3 --with-embed-head): 1852 of 76108 weight_map tensors present, 72149 filtered by the flags, 2107 omitted by the cnq4.5-glm5-next recipe, 0 missing
+wrote models/GLM-5.3-Flash-step06/GLM-5.3-Flash-CNQ4.5-L0-3.cnq: 972 tensors (902 nvfp4, 70 bf16-keep), payload 7.22 GB, alignment zeros 5140 B, scales mse, violations 451322, elapsed 244 s
+NOTE: 451322 elements exceed the old max-rel bound — expected under --scales mse, see the MSE report
+
+real	4m4.172s
+user	0m0.000s
+sys	0m0.015s
+rc 0

@@ -168,15 +168,17 @@ class Cli(unittest.TestCase):
         y16 = LW.load_file(bf, b, "l0-output.bf16")
         self.assertTrue(torch.equal(y16, y32.to(torch.bfloat16).float()))  # same input, rounded output
 
-    def test_container_is_a_clear_stub(self):
+    def test_a_missing_container_is_a_clear_error(self):
+        # crow-nest #156: the stub this test pinned (#158) is replaced by the container back end
+        # (test_glm5_container.py); a missing file still exits 2 with a clear error
         err = io.StringIO()
         with redirect_stderr(err), redirect_stdout(io.StringIO()):
             rc = LW.main(["run", "--weights", "container", os.path.join(self.wd, "x.cnq"), "--ids", self.ids,
                           "--out", os.path.join(self.wd, "c")])
         self.assertEqual(rc, 2)
-        self.assertIn("converter has not landed", err.getvalue())
-        with self.assertRaises(G.ContainerNotReady):
-            G.WeightSource("cnq", "x.cnq")
+        self.assertIn("no such file", err.getvalue())
+        with self.assertRaises(G.ContainerError):
+            G.open_weights("cnq", "x.cnq")
 
 
 if __name__ == "__main__":

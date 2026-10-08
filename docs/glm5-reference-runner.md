@@ -41,8 +41,16 @@ shows what each choice changes. Threads: `ORACLE_THREADS` (default 16).
     --ids ids.json --decode 4 --out runs/glm53-flash/ref-<name> \
     [--layers 0:4] [--anchors 95,96,97,98,99] [--state-dtype f32|bf16]
 
-# the CNQ container back end: a stub until the glm5_next converter lands (exit 2, says why)
-.venv-oracle/Scripts/python.exe -I oracle/glm5_layerwise.py run --weights container <file.cnq> ...
+# the CNQ container back end (crow-nest #156): weights as `converter dequant` decodes them;
+# a partial container (converter --layers 0-3 --with-embed-head) runs only the layers it holds
+.venv-oracle/Scripts/python.exe -I oracle/glm5_layerwise.py run --weights container <file.cnq> \
+    --ids ids.json --decode 4 --out <dir> --layers 0:4
+
+# per-layer agreement of two runs over the same ids (cosine, max |d|, routing and DSA overlap)
+.venv-oracle/Scripts/python.exe -I oracle/glm5_compare.py <run A> <run B> [--json out.json]
+
+# every container tensor against the FP8 originals + the gate-0 summary of its sidecar
+.venv-oracle/Scripts/python.exe -I oracle/glm5_weight_check.py <file.cnq> models/GLM-5.3-Flash-original --json out.json
 
 # the proof of the runner (section 4)
 .venv-oracle/Scripts/python.exe -I oracle/glm5_layerwise.py selftest [--shapes small|real] [--hf-experts eager|grouped_mm]
@@ -84,7 +92,8 @@ FP8 tensor of glm5_next. `test_partial_blocks_follow_the_128_grid` pins the 128 
 
 Shards are opened per tensor and never cached, so no mmap stays resident. The routed experts of a
 layer are dequantized one expert at a time into one preallocated `[E, 2I, H]` / `[E, H, I]` tensor.
-For 288 experts that is 19.3 GB + 9.7 GB in f32. This size is computed, not measured.
+For 288 experts that is 19.3 GB + 9.7 GB in f32 (computed); a real layer 3 peaked at 28.1 GiB RSS
+after load (section 7).
 
 **Checkpoint names → module names** (`conversion_mapping.py:535-579`, applied in reverse by
 `glm5_common.ckpt_recipe`):
@@ -101,9 +110,17 @@ For 288 experts that is 19.3 GB + 9.7 GB in f32. This size is computed, not meas
 `embed_tokens.weight` and `norm.weight` sit under `model.language_model.`, `lm_head.weight` at the
 top. The embedding is read row by row for the ids used, and `lm_head` in 16,384-row chunks.
 
-**CNQ container** (`--weights container <file.cnq>`): a stub. The glm5_next converter has not
-landed, so the container layout of its FP8 and per-expert records is not defined. The run exits
-with code 2 and says so. The back end gets its reader together with the converter.
+**CNQ container** (`--weights container <file.cnq>`, crow-nest #156): `glm5_common.ContainerSource`.
+The container keeps the checkpoint names, so the name table above serves both back ends. The index
+trailer is read for names, shapes and `config.json` (carried verbatim in `model.config_json`); the
+values come from `converter dequant <file.cnq> --names -` (`converter/src/dequant.rs`), one converter
+process per module, streamed into the same preallocated tensors as the FP8 path (`load_plan` fixes
+the order for both). NVFP4 is decoded by `nvfp4_scale` / `nvfp4_value`, the arithmetic gate 0 (the
+sidecar) measures the written encoding with; BF16 keeps are widened exactly, F32 carries are read as
+stored. So the reference sees exactly what the converter wrote, decoded by the converter's own code.
+The binary is `converter/target/release/converter[.exe]` (or `CROW_CONVERTER`); without it the run
+exits 2. A partial container (`partial` block in the index) refuses `--layers` outside the layers
+it holds, before anything runs (exit 2).
 
 ## 4. The proof (abort criterion of plan step 7)
 
@@ -199,9 +216,8 @@ with them.
 
 ## 6. Limits
 
-- Nothing has run on the real weights yet: they are not on disk. The run time and peak RSS of one
-  real layer on this CPU are **not measured**. The f32 size of one MoE layer's experts (29 GB) is
-  computed.
+- On the real weights only layers 0–3 have run (step 6, section 7). Layers 4–44, the logits and the
+  run time of a whole pass are **not measured**.
 - `indexer_types` `"shared"` (cross-layer top-k reuse) is not supported: the runner raises. The
   config of rev `eb9eb208` sets `"full"` on all 45 layers. Supporting it would mean feeding the
   previous layer's `l<k>-dsa-topk.i32` back into `prev_topk_indices`.
@@ -209,3 +225,17 @@ with them.
   CUDA build of torch is installed.
 - Batch 1, no padding: the attention mask is all ones, as the HF text model builds it when none is
   given.
+
+## 7. Step 6 on the real weights (crow-nest #156, 2026-10-08)
+
+Layers 0–3 over 90 fixed ids (86 prompt + 4 decode rows, `runs/glm53-flash/step06/ids.json`), both back ends,
+CPU, 16 threads. Full record: `runs/glm53-flash/step06/README.md`.
+
+| back end | wall | layer 3 load / compute | RSS after layer-3 load |
+|---|---|---|---|
+| FP8 originals | 19.6 s | 7.8 s / 0.69 s | 28.13 GiB |
+| partial container (`converter dequant`) | 68.2 s | 52.1 s / 0.60 s | 28.00 GiB |
+
+Container vs FP8 (the quantisation error, reported, not gated): cosine 0.99308 / 0.99402 / 0.99806 / 0.99789 for
+layers 0 / 1 / 2 / 3, max |Δ| 7.0e-3 / 6.0e-3 / 2.3e-2 / 0.198; layer 3 routing overlap 0.911 (40 / 90 rows with the
+same top-8), DSA selection identical on 90 / 90 rows. The engine side of G3 needs the glm5_next kernels (plan step 13).

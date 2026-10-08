@@ -11,8 +11,9 @@ next layer. Same HF modules and call sequence as Glm5NextTextModel.forward
 
   run       python -I oracle/glm5_layerwise.py run --weights fp8-originals <dir> --ids ids.json
                 --decode D --out <dir> [--layers A:B] [--anchors P,..] [--state-dtype f32|bf16]
-            python -I oracle/glm5_layerwise.py run --weights container <file.cnq> ...   (stub: exits 2
-                until the glm5_next converter lands)
+            python -I oracle/glm5_layerwise.py run --weights container <file.cnq> ...   (crow-nest #156:
+                the container's weights as `converter dequant` decodes them; a partial container
+                runs only the layers it holds)
   selftest  python -I oracle/glm5_layerwise.py selftest [--shapes small|real]
             the proof of the runner (abort criterion of plan step 7): a synthetic mini config,
             written as a checkpoint in the ORIGINAL naming and FP8 format, run by this runner
@@ -568,17 +569,22 @@ def main(argv=None):
     if kind not in kinds:
         ap.error(f"--weights {kind}: expected one of {', '.join(kinds)}")
     try:
-        ws = G.WeightSource(kinds[kind], path)
-    except G.ContainerNotReady as e:
+        ws = G.open_weights(kinds[kind], path)
+    except G.ContainerError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    tc = G.text_config(path)
+    tc = G.text_config_from_dict(ws.config_dict())
     with open(a.ids) as f:
         ids = json.load(f)
     start, stop = 0, tc.num_hidden_layers
     if a.layers:
         s0, s1 = a.layers.split(":")
         start, stop = int(s0 or 0), int(s1 or tc.num_hidden_layers)
+    part = getattr(ws, "partial", None)
+    if part and not set(range(start, stop)) <= set(part["layers"]):
+        print(f"error: --layers {start}:{stop}: {path} is a PARTIAL container ({part['filter']}); "
+              f"it holds layers {part['layers']} only", file=sys.stderr)
+        return 2
     anchors = [int(p) for p in a.anchors.split(",")] if a.anchors else None
     man = run_layerwise(ws, tc, ids, a.decode, a.out, start, stop, anchors, a.state_dtype)
     print(f"wrote {len(man['files'])} files to {a.out}")
