@@ -5255,7 +5255,8 @@ both were already in the tree.
 
 `log.rs` is an L0 leaf with no in-crate dependency, and the one module every other module reaches
 (8.1). The 23 targets are listed in the module doc of `engine/src/log.rs`; the spec's names map to
-them as `scheduler` → `residency` + `adapt`, `kv` → `prefill` + `decode`, `loader` → `load` + `budget`;
+them as `scheduler` → the `residency` module (targets `residency` + `adapt`; `adapt` is a target only, there is no `adapt` module),
+`kv` → `prefill` + `decode`, `loader` → `load` + `budget`;
 `converter` is a separate crate with no engine log site, and `ring` and `stager` have no code in this tree
 (#167: the job ring exists only as the probe `probes/src/bin/p9_job_ring.rs`).
 
