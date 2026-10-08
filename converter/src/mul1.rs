@@ -33,7 +33,8 @@
 //! (`df0b439`), so record i of a store starts at `i * size`, a multiple of 4096. gate and up are
 //! `[hidden, inter]`, down is `[inter, hidden]` (exllamav3 stores `[in, out]`).
 //!
-//! Not yet wired into the conversion (plan step 12); the tests below are its only callers.
+//! The conversion writes these records from a quantizer store (`mul1_store.rs`, `--experts-mul1`,
+//! plan step 12, #182); the decoder (`decode_tile`, `reconstruct`) has only its tests as callers.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::EXPERT_ALIGN;
