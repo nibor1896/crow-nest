@@ -27,9 +27,10 @@ Near the card limit the Windows driver moves allocations to system memory withou
 | plan ceiling on a 32,607 MiB card | 34,190,917,632 B | 32,043,433,984 B |
 | cold staging | one set: max(2 x topk, PF_TG x (1 + async)) = 128 slots | decode 4 x 8 = 32 slots = 452,984,832 B, prefill 128 slots apart |
 
-- `Stability::of(Family)` gives `OF_RECORD` for both engine families; `Stability::for_model_type("glm5_next_text")`
-  gives `GLM5_NEXT`. The engine has no `glm5_next` family yet: #159 (planner) adds `planner_reserve(total)` to
-  the planner's pending bytes, #149 (stager) allocates the separate prefill set.
+- `Stability::of(Family)` gives `OF_RECORD` for Flash-Next and the 27B and `GLM5_NEXT` for `Family::Glm5Next`
+  (#159); `Stability::for_model_type("glm5_next_text")` gives the same. `manager::planner_pending_for` adds
+  `planner_reserve(total)` to the planner's pending bytes (0 B for `OF_RECORD`); the glm5_next plan
+  (`states --plan`) books it, #149 (stager) allocates the separate prefill set.
 - `gen.rs` sizes `Stage::max` through `stage_slots(..).held()`; for `OF_RECORD` that is the old expression bit
   for bit. A policy with decode slots apart is refused there until the GLM arm allocates the prefill set.
 - On GLM the shared formula would hold 128 x 14,155,776 B = 1.8 GB of staging through every decode step.

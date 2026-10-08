@@ -174,7 +174,7 @@ and which indexes the engine accepts.
 | `format_version` | `2`. Replaces v1's `version: 1`; its presence is what makes an index v2 |
 | `recipe` | the family row that decided every tensor's dtype: `cnq4.5-flash-next`, `cnq4.5-qwen35-dense` or (converter only, #155) `cnq4.5-glm5-next` |
 | `scales` | the sub-block scale policy, `ceil` or `mse` |
-| `model.family` | the engine's family name (`meta::Family`): `FlashNext` or `Qwen35Dense`; the converter also writes `Glm5Next`, a family the engine does not know yet |
+| `model.family` | the engine's family name (`meta::Family`): `FlashNext`, `Qwen35Dense` or `Glm5Next` (#159: the gate parses it, the boot refuses it at its first unbuilt arm) |
 | `model.model_type` | `text_config.model_type` of the config |
 | `model.config_json`, `model.generation_config_json` | the checkpoint's two files **verbatim**, as JSON strings: a string survives the round trip byte for byte, a re-serialized object would not (key order, number format, whitespace) |
 | `model.config_json_sha256`, `model.generation_config_json_sha256` | the sha256 of those bytes; the engine refuses a v2 whose stored config no longer hashes to it |
@@ -4756,6 +4756,7 @@ refuses the parse by name.
 |---|---|---|---|---|---|---|---|---|
 | `FlashNext` | `qwen4_exp_text` | `Hc` (4 streams, low rank 320) | `Moe` (512 experts, top 10, 640, shared 640) | `Qsa` (4 heads, 1 kv, 128, ratio 4, 512 blocks) | layer 1 | sigmoid | `HcMixer` | runs; `Geo` must equal `Geo::FLASH_NEXT` |
 | `Qwen35Dense` | `qwen3_5_text` | `Plain` | `Dense` (17408) | `Full` (uncapped) | none | swish (= silu) | `Rms` | runs since phase 2 (8.12); until then it was refused at its first unbuilt block (C5) |
+| `Glm5Next` (#159) | `glm5_next_text` | mHC (4 streams, Sinkhorn 20) | 3 dense (12288), then `Moe` (288 experts, top 8, 2048, 1 shared) | MLA without RoPE (64 heads, latent 512) + DSA indexer (32 x 128, k-pool 4, top 2048) | none | - | stream mean + RMSNorm | gate and planner only: `Glm5Geo`, not a `Geo`; the boot refuses at the mHC residual (step 13a) |
 
 **Expected values per family** (`meta::Expected`). The Flash-Next row is today's pins, read out of
 `geo` and `sample`, and gives the same 21 checks as before (the 20 of #94 phase 1 plus #96's
@@ -4772,6 +4773,25 @@ family, or an unknown `rope_parameters` key refuses the parse and names every su
 flat config (no `text_config`) may also carry the multimodal wrapper keys. Formula facts with one
 implemented value refuse any other value by name: `hidden_act` silu, `mamba_ssm_dtype` float32,
 `output_gate_type` sigmoid/swish/silu. The top-level and text `tie_word_embeddings` must agree.
+
+**glm5_next (#159).** Its config shares almost no key with the Qwen families (no RoPE keys, no GDN
+keys, KDA in `linear_attn_config`), so `ModelMeta::from_glm5_next` parses it through its own ledger
+(`GLM5_NEXT_*_KEYS`): every key is required with its type and one error names every missing key,
+the Qwen `COMMON_KEYS` count as unknown, unknown `linear_attn_config` keys refuse by name, four keys
+are ignored with their reason (MTP sharing, indexer RoPE interleave, two router-loss terms). One-form
+facts refuse any other value by name: sigmoid `noaux_tc` router in float32, `n_group` = `topk_group`
+= 1, `norm_topk_prob`, `mhc`, `mla_use_nope`, `qk_rope_head_dim` 0, k-pool compress and tail,
+`index_topk` a multiple of `index_kpool`, every `indexer_types` entry `full`, `layer_types` equal to
+`linear_attn_config`'s two lists, the dense MLP layers exactly the first `first_k_dense_replace`.
+The result is a `geo::Glm5Geo` (37 fields), checked row by row against `Glm5Geo::GLM_5_3_FLASH`
+(zai-org/GLM-5.3-Flash @ eb9eb208) plus the stop ids in the vocab: 38 checks. `verdict` then refuses
+the boot with `meta::glm5_not_built`, before the container is mapped. `Glm5Geo` is not a `Geo`: no
+engine arm of the family exists, so no `gen.rs` site can read it; the arms move into `Geo` with
+their kernels (steps 13a-13e). `states --plan` prints the family's three-tier plan from it
+(`manager::plan_glm5_next`: VRAM holds the dense part, the latent and indexer caches at the boot
+context, the KDA state, the 32 + 128 staging slots of `Stability::GLM5_NEXT` and the reserves, then N
+experts per MoE layer under the 2 GiB headroom; pinned RAM P under `HOST_PINNED_CAP`; NVMe the rest).
+On the RTX 5090 at 200,000 tokens: N 32, P 83, NVMe 173 of 288, planner numbers, not measured.
 
 **`geo::Geo`**, 35 fields, derived by `ModelMeta::geo`:
 
