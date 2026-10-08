@@ -343,6 +343,7 @@ mod imp {
 
     // ---- main -------------------------------------------------------------------------------
 
+    #[derive(Debug)]
     struct Args {
         mib: usize,
         reps: usize,
@@ -359,6 +360,11 @@ mod imp {
 
     fn parse_args() -> Args {
         let raw: Vec<String> = std::env::args().skip(1).collect();
+        parse_args_from(&raw).unwrap_or_else(|e| refuse(&e))
+    }
+
+    /// Pure argument parsing and validation; `Err` carries the refusal message (exit 2).
+    fn parse_args_from(raw: &[String]) -> Result<Args, String> {
         let selftest = raw.iter().any(|a| a == "--selftest");
         let mut a = Args {
             mib: if selftest { 256 } else { MIN_FULL_MIB },
@@ -370,33 +376,48 @@ mod imp {
         };
         let mut it = raw.iter();
         while let Some(k) = it.next() {
-            let mut val = || it.next().unwrap_or_else(|| refuse(&format!("{k} needs a value"))).clone();
+            let mut val = || it.next().cloned().ok_or_else(|| format!("{k} needs a value"));
             match k.as_str() {
                 "--selftest" => {}
-                "--gib" => a.mib = val().parse::<usize>().unwrap_or_else(|_| refuse("--gib: integer")) << 10,
-                "--mib" => a.mib = val().parse().unwrap_or_else(|_| refuse("--mib: integer")),
-                "--reps" => a.reps = val().parse().unwrap_or_else(|_| refuse("--reps: integer")),
-                "--passes" => a.passes = val().parse().unwrap_or_else(|_| refuse("--passes: integer")),
-                "--nominal-gbs" => a.nominal = val().parse().unwrap_or_else(|_| refuse("--nominal-gbs: number")),
-                "--out" => a.out = Some(val()),
-                other => refuse(&format!("unknown argument {other}")),
+                "--gib" => a.mib = val()?.parse::<usize>().map_err(|_| "--gib: integer".to_string())? << 10,
+                "--mib" => a.mib = val()?.parse().map_err(|_| "--mib: integer".to_string())?,
+                "--reps" => a.reps = val()?.parse().map_err(|_| "--reps: integer".to_string())?,
+                "--passes" => a.passes = val()?.parse().map_err(|_| "--passes: integer".to_string())?,
+                "--nominal-gbs" => {
+                    a.nominal = val()?.parse().map_err(|_| "--nominal-gbs: number".to_string())?
+                }
+                "--out" => a.out = Some(val()?),
+                other => return Err(format!("unknown argument {other}")),
             }
         }
         if a.mib == 0 || a.mib % 4 != 0 {
-            refuse("buffer must be a non-zero multiple of 4 MiB");
+            return Err("buffer must be a non-zero multiple of 4 MiB".into());
         }
         if a.passes == 0 || a.reps == 0 {
-            refuse("--passes and --reps must be >= 1");
+            return Err("--passes and --reps must be >= 1".into());
         }
         if !a.selftest {
             if a.mib < MIN_FULL_MIB {
-                refuse("buffer below 8 GiB would measure cache; use --selftest for a small buffer");
+                return Err("buffer below 8 GiB would measure cache; use --selftest for a small buffer".into());
             }
             if a.reps < 3 {
-                refuse("--reps must be >= 3 (median and spread need three runs)");
+                return Err("--reps must be >= 3 (median and spread need three runs)".into());
             }
         }
-        a
+        Ok(a)
+    }
+
+    /// Pure RAM guard: the buffer plus the 1 GiB margin must fit in available physical RAM.
+    fn check_ram(avail_phys: u64, buffer_bytes: u64) -> Result<(), String> {
+        if avail_phys < buffer_bytes + RAM_MARGIN {
+            Err(format!(
+                "available physical RAM {} MiB is below buffer {} MiB + 1 GiB margin",
+                avail_phys >> 20,
+                buffer_bytes >> 20
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     pub fn main() {
@@ -420,13 +441,7 @@ mod imp {
         if unsafe { GlobalMemoryStatusEx(&mut ms) } == 0 {
             refuse("GlobalMemoryStatusEx failed");
         }
-        if ms.avail_phys < bytes as u64 + RAM_MARGIN {
-            refuse(&format!(
-                "available physical RAM {} MiB is below buffer {} MiB + 1 GiB margin",
-                ms.avail_phys >> 20,
-                args.mib
-            ));
-        }
+        check_ram(ms.avail_phys, bytes as u64).unwrap_or_else(|e| refuse(&e));
 
         let (cpus, logical) = detect_cpus().unwrap_or_else(|e| refuse(&e));
         let configs = build_configs(&cpus);
@@ -560,6 +575,59 @@ mod imp {
             assert_eq!(verdict(&[60.0, 70.0, 62.0], true, 89.6), "void_spread");
             assert_eq!(verdict(&[60.0, 90.0, 61.0], true, 89.6), "invalid_above_nominal");
             assert_eq!(verdict(&[60.0, 61.0, 62.0], false, 89.6), "invalid_checksum");
+        }
+
+        fn args(v: &[&str]) -> Result<Args, String> {
+            parse_args_from(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        }
+
+        #[test]
+        fn refuses_buffer_below_8_gib_outside_selftest() {
+            assert!(args(&["--gib", "1"]).unwrap_err().contains("8 GiB"));
+            assert!(args(&["--mib", "8188"]).unwrap_err().contains("8 GiB")); // 8 GiB - 4 MiB
+            assert_eq!(args(&["--gib", "8"]).unwrap().mib, 8192);
+            assert_eq!(args(&[]).unwrap().mib, 8192); // default is the full size
+            assert_eq!(args(&["--selftest"]).unwrap().mib, 256); // selftest may be small
+        }
+
+        #[test]
+        fn refuses_fewer_than_3_reps_outside_selftest() {
+            assert!(args(&["--gib", "8", "--reps", "2"]).unwrap_err().contains("--reps must be >= 3"));
+            assert!(args(&["--gib", "8", "--reps", "1"]).is_err());
+            assert_eq!(args(&["--gib", "8", "--reps", "3"]).unwrap().reps, 3);
+            assert_eq!(args(&["--selftest", "--reps", "1"]).unwrap().reps, 1);
+        }
+
+        #[test]
+        fn refuses_malformed_arguments() {
+            assert!(args(&["--mib", "10"]).is_err()); // not a multiple of 4 MiB
+            assert!(args(&["--mib", "0"]).is_err());
+            assert!(args(&["--gib", "8", "--passes", "0"]).is_err());
+            assert!(args(&["--gib"]).unwrap_err().contains("needs a value"));
+            assert!(args(&["--bogus"]).unwrap_err().contains("unknown argument"));
+        }
+
+        #[test]
+        fn ram_margin_is_one_gib_on_top_of_the_buffer() {
+            let buf = 8u64 << 30;
+            assert!(check_ram(buf + (1 << 30) - 1, buf).unwrap_err().contains("below buffer"));
+            assert!(check_ram(buf, buf).is_err());
+            assert!(check_ram(buf + (1 << 30), buf).is_ok());
+        }
+
+        #[test]
+        fn run_above_nominal_is_invalid_even_when_stable() {
+            // all runs within spread, one just above 89.6 -> invalid, not valid
+            assert_eq!(verdict(&[89.7, 89.7, 89.7], true, 89.6), "invalid_above_nominal");
+            assert_eq!(verdict(&[89.6, 89.6, 89.6], true, 89.6), "valid"); // at the ceiling is allowed
+            // above-nominal wins over a void spread
+            assert_eq!(verdict(&[40.0, 95.0, 41.0], true, 89.6), "invalid_above_nominal");
+        }
+
+        #[test]
+        fn spread_above_1_15_is_void() {
+            assert_eq!(verdict(&[60.0, 69.0, 61.0], true, 89.6), "valid"); // 69/60 = 1.15 exactly
+            assert_eq!(verdict(&[60.0, 69.1, 61.0], true, 89.6), "void_spread");
         }
     }
 }
