@@ -26,7 +26,13 @@ the full container (step 9). Step 3's statistic gives no B on this machine; PRER
     --runs decode_out/glm-step8/runs --step3 runs/glm53-flash/step03/<run>.json [--readers 1] [--windows 0,8,16,32] \n    [--json out.json]
 # G1 under amendment 5: --step3 runs/glm53-flash/step03/20261008T001819Z.json --readers 1
 
-# the tests (no GPU, no weights): the sim about 7 s, the route passes about 45 s
+# dynamic expert-cache policies (#178, section 7)
+.venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py dyn --corpus decode_out/glm-step8/corpus/corpus.json \
+    --runs decode_out/glm-step8/runs (--slots V:P[,...] | --vram 25.6GB --pinned 46GiB) [--bpw 4.5,3.05,3.5] \
+    [--arena layer|global] [--policies lru,clock,lfu] [--admit-max 64] [--prefetch none,oracle,0.5,0.7,0.9] \
+    [--depths 1,2,3] [--pf-budget N] [--step3 <run>.json --readers 1] [--rates rates.json] [--json out.json]
+
+# the tests (no GPU, no weights): the sim about 18 s, the route passes about 45 s
 .venv-oracle/Scripts/python.exe -I tools/test_glm_tier_sim.py
 .venv-oracle/Scripts/python.exe -I tools/test_glm_route_passes.py
 ```
@@ -35,7 +41,7 @@ Step 8 runs under `.venv-oracle` (transformers 5.16.1). The system Python's tran
 owner's machine, 2026-10-08) lacks `transformers.cache_utils.DynamicIndexedLayer`, which the runner's
 in-place DSA cache subclasses: `tools/test_glm_route_passes.py` fails there in `setUpClass` of its
 end-to-end test (8 tests run, 1 error), and `corpus` needs GLM's tokenizer from the same venv.
-`tools/test_glm_tier_sim.py` alone passes under either (27 tests, OK under both).
+`tools/test_glm_tier_sim.py` alone passes under either (41 tests, OK under both on 2026-10-08, about 18 s).
 
 `corpus` uses `messages` and `render` of `tools/session_ids.py` and swaps in GLM's tokenizer, so the
 generated spans are cut the same way as in the Flash-Next calibration (`docs/hotset-calibration.md`).
@@ -110,8 +116,8 @@ not the corpus file's.
 
 ## 5. Tests
 
-`tools/test_glm_tier_sim.py` has 26 tests on synthetic dumps in the runner's own layout, each with a
-known answer:
+`tools/test_glm_tier_sim.py` has 41 tests on synthetic dumps in the runner's own layout, each with a
+known answer (the 13 of `dyn` are in section 7):
 
 - shares of exactly 0.25 / 0.25 / 0.5 at every N;
 - generated positions alone set the rank;
@@ -148,3 +154,114 @@ included. It checks the tool only; no number from it describes GLM.
 - **Shape.** The tool reads the runner's per-layer files. The engine's `CROW_ROUTE_DUMP_PREFILL`
   format and the Flash-Next tools (`hotset-eval.py`, `coverage-curve.py`, 48 × 512 × 10) are
   unchanged; they are not needed for G1.
+
+## 7. Dynamic expert-cache policies (`dyn`, #178)
+
+`dyn` is step 2 of the dynamic-tier plan (#169). It replays the held-out file's routing, in token order over
+every position, through an elastic cache instead of the static cut, and scores the generated positions as
+`sim` does. It reuses `sim`'s corpus loading, held-out guard, routing self-test and B rule. It decides nothing:
+the G1d verdict is step 3 and needs its own PREREG (step 1).
+
+**The model.**
+
+| element | rule |
+|---|---|
+| arena | `--arena layer`: one cache per MoE layer; `--arena global`: one cache for all layers (sybil's VRAM arena) |
+| tiers | VRAM (V slots) and pinned RAM (P slots), exclusive; the rest on the NVMe |
+| VRAM hit | no transfer |
+| pinned hit | admitted to VRAM (1 PCIe copy) when admission is on, else read zero-copy (1 PCIe read) |
+| NVMe read | admitted to VRAM, or landed in pinned and read zero-copy |
+| victims | a VRAM victim moves to pinned (1 PCIe write-back); a pinned victim is dropped (its record stays on the NVMe) |
+| admission | on unless `--admit-max N` and a step has more than N picks (sybil's `GLM53_EC_ADMIT_MAX`, default 64) |
+| capacity | `--vram`, `--pinned` (B, KB, MB, GB, KiB, MiB, GiB) / expert bytes, per layer also / 42; or `--slots V:P` |
+| expert bytes | 4.5 bpw 14,155,776 (CNQ record); 3.05 bpw 9,474,048 (sybil record, external); 3.5 bpw 10,871,858 (the 3.05 record x 3.5 / 3.05, derived) |
+
+Example: 46 GiB pinned is 83 slots per layer at 4.5 bpw and 124 at 3.05 bpw; 25.6 GB of VRAM is 64 per layer
+at 3.05 bpw.
+
+**Policies.**
+- **LRU** handles the picks one at a time, in order. It is exactly `lru_reads` with every visit on the
+  NVMe tier and W = V + P, for every split of V and P. That holds because an exclusive two-level LRU with
+  promotion and demotion acts as one LRU of the summed size (Mattson et al. 1970). So `--slots C:0`
+  reproduces the scratch numbers of #169.
+- **CLOCK** follows sybil-solutions/glm53-flash-offload `glm53/expert_cache.py` `ec_step_k` (`df0b439`). A
+  hit sets the ref bit. An insert sweeps from the hand, skips slots that hold one of the step's picks, clears
+  set bits and takes the first clear slot. The new entry gets its bit set. Empty slots are taken first.
+- **LFU** decays exponentially. The score is the sum of 2^-(age / half-life) over an expert's accesses, with
+  `--lfu-halflife` in tokens (default 64, an unmeasured choice). The victim is the lowest score, never one of
+  the step's picks.
+- **Belady MIN with bypass** at V + P slots is the ceiling, never a policy. A policy with fewer NVMe reads
+  than MIN over the whole file is refused as a simulator defect (exit 2).
+
+sybil's 64 is a batch gate, not a per-token budget. It switches admission off for steps with more picks
+(prefill). In this one-token-per-step replay a step has 8 picks, so any `--admit-max` of 8 or more leaves
+admission on.
+
+**Prefetch.** `--prefetch oracle` or a precision p. After layer j, the experts predicted for layer j + d
+(`--depths`, crossing into the next token after the last layer) are read from the NVMe into pinned, at most
+`--pf-budget` reads per token. A predictor of precision p keeps each true expert with probability p and
+otherwise names a wrong expert of that layer (seed 20261008). Wrong reads cost NVMe bytes and pinned slots.
+This follows Eliseev & Mazur, arXiv:2312.17238 §3.2, and sybil's layer-ahead prefetch. A config without
+pinned slots prints no prefetch rows.
+
+**What it prints**, per bpw and capacity, on the generated positions:
+- MIN m;
+- per policy and prefetch setting:
+  - m with the 95 % block bootstrap CI. m counts every NVMe read, prefetch reads included;
+  - m_demand, the stalling reads;
+  - VRAM and pinned hit shares;
+  - PCIe = zero-copy + admissions + write-backs;
+  - DRAM = NVMe data landed + every PCIe transfer;
+  - useful and wasted prefetches;
+  - per-stage ceilings: NVMe at B, PCIe at R_PCIe, DRAM at R_DRAM;
+  - the binding ceiling (perfect overlap) and the serial bound (no overlap).
+
+B comes from the step-3 JSON exactly as in `sim` (`--step3`, `--readers`). R_PCIe and R_DRAM come from
+`--rates`, a JSON file `{"R_pcie_gbps": x, "R_dram_gbps": y, "source": "..."}`. A missing rate prints "-",
+never a default.
+
+**Tests** (in `tools/test_glm_tier_sim.py`, known answers, red without the change, 2026-10-08):
+
+| test | known answer |
+|---|---|
+| CLOCK hand sequence | A B C B A D C B E D, 3 slots: reads 1 1 1 0 0 1 0 0 1 0 (LRU 1 1 1 0 0 1 1 1 1 1) |
+| CLOCK step picks | no victim outside the step's picks: the entry is not stored |
+| LRU = window, capacity 0 = static | `dyn` LRU at V:P equals `lru_reads` at W = V + P; at 0:0 every visit is an NVMe read (the W = 0 path) |
+| MIN bounds every policy | LRU, CLOCK, LFU, both arenas, with and without prefetch and admission gate |
+| MIN guard | a policy below MIN is refused |
+| precision 1.0 = oracle | identical counters for LRU, CLOCK (global), LFU |
+| oracle prefetch | per layer, CLOCK and LFU: only the first d layers of token 0 stall, nothing wasted; budget 0 = no prefetch |
+| uniform routing | LRU m = (1/8) sum_{k=0..7} (288 - C) / (288 - k) = 0.6327 at C 108; CLOCK and LFU (step picks protected) m = (288 - C) / 288 = 0.625; both within 0.004 |
+| capacity from bytes | 83 / 124 slots per layer for 46 GiB at 4.5 / 3.05 bpw |
+| PCIe accounting | zero-copy + admissions = visits - VRAM hits; a hand trace of admissions and write-backs |
+| cost model, rates file | ceilings and serial bound; a bad rate is refused |
+| CLI | an end-to-end run with JSON; refusals exit 2 |
+
+Removing a hunk turns its test red (checked 2026-10-08):
+
+| removed hunk | failing test |
+|---|---|
+| CLOCK ref bit on insert | CLOCK hand sequence |
+| CLOCK step-pick protection | CLOCK step picks |
+| LFU step-pick protection | uniform routing |
+| precision draws | precision 1.0 = oracle |
+| write-back count | PCIe hand trace |
+| prefetch reads counted | MIN bounds every policy |
+| LRU demotion to pinned | LRU = window |
+
+**Speed** on synthetic uniform routing at full shape (4,096 positions, Windows, 2026-10-08), per config:
+LRU 0.7 s, CLOCK 1.0 s, LFU 2.8 s, LRU with prefetch 1.8 s, MIN 0.5 s (layer) and 0.9 s (global).
+For a 32,768-position file that is about 8x (derived, not measured).
+
+**Reproduction, pending.** The routing dumps `decode_out/glm-step8/runs/` were deleted on 2026-10-08 and will be
+regenerated. Once they are back, this command must give LRU m 0.278 / 0.185 / 0.060 and MIN 0.122 / 0.072 / 0.019
+on `todo-1006`, within +-0.5 pp (plan step 2). Otherwise #178 records why:
+
+```
+.venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py dyn --corpus decode_out/glm-step8/corpus/corpus.json \
+    --runs decode_out/glm-step8/runs --slots 108:0,145:0,216:0 --policies lru \
+    --step3 runs/glm53-flash/step03/20261008T001819Z.json --readers 1 --json <out.json>
+```
+
+**Not modelled:** prefetch from pinned into VRAM, batched prefill steps, kernel time, and the latency a
+demand read stalls for (only bytes).
