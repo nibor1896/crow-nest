@@ -1635,10 +1635,9 @@ impl Engine {
         let ring_reserve = if pf_dma_on() && mma_on() && pf_gemm_on() {
             2 * (d.e - cfg.n_hot.saturating_sub(24).min(d.e)) as u64 * (slabs.gu_bytes + slabs.dn_bytes)
         } else { 0 };
-        // VRAM the planner must leave free for launch/param plumbing. Sibling
-        // of `manager::SAFETY` (512 MiB), which covers the clamp loop's own
-        // pools + scratch + telemetry: two reserves, two sums, two numbers.
-        const LAUNCH_SLACK: u64 = 128 << 20;
+        // VRAM the planner must leave free for launch/param plumbing (`manager::LAUNCH_SLACK`,
+        // sibling of `manager::SAFETY`)
+        use crate::manager::LAUNCH_SLACK;
         // + TASK K: the image path's VRAM, when the tower is loaded. Everything
         // the #VIT path takes lazily inside a request (the cap-sized tower
         // scratch, the per-request splice buffer, the interleaved-mrope span
@@ -1656,7 +1655,9 @@ impl Engine {
         //   counts the GRANTED part as pending, which leaves it on the card.
         //   #110 follow-up: it is granted best-effort inside `allocate`
         //   (`grant_render_reserve`), so it is NOT in `pending` here.
-        let pending = crate::manager::planner_pending(LAUNCH_SLACK, ring_reserve, vit_reserve, 0);
+        // #159: plus the VRAM the family's stability policy keeps off the plan (`OF_RECORD`: 0 B)
+        let pending = crate::manager::planner_pending_for(
+            &crate::geo::Stability::of(geo.family), cuda::total_vram_bytes(), LAUNCH_SLACK, ring_reserve, vit_reserve, 0);
         // pinned-side sizing follows the cold tier actually used (record size
         // of a low-bit tier, full tier = constant; see residency::build)
         let (cold_unit, cold_fixed) = match std::env::var("CROW_COLD_TIER").ok() {

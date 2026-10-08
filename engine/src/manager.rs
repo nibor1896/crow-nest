@@ -652,6 +652,10 @@ pub fn clamp_hot_n(c: &ClampInput) -> Result<(usize, Vec<String>), String> {
 }
 
 pub const SAFETY: u64 = 512 << 20; // launch pools, scratch, telemetry slack
+/// VRAM the planner leaves free for launch/param plumbing, booked as pending (`planner_pending`).
+/// Sibling of `SAFETY`: two reserves, two sums, two numbers. #159: one constant for
+/// `Engine::load` and the glm5_next plan (it was a local const of `Engine::load`).
+pub const LAUNCH_SLACK: u64 = 128 << 20;
 pub const N_MIN: usize = 32;
 
 /// #72: VRAM that must STILL be free once every boot allocation is resident.
@@ -712,6 +716,213 @@ pub fn render_reserve_bytes() -> u64 {
 /// including it here is what keeps it free after the load.
 pub fn planner_pending(launch_slack: u64, ring_reserve: u64, vit_reserve: u64, render_reserve: u64) -> u64 {
     launch_slack + ring_reserve + vit_reserve + render_reserve
+}
+
+/// #159: `planner_pending` plus the VRAM a family's stability policy keeps off the plan
+/// (`Stability::planner_reserve`: glm5_next 2 GiB of headroom on a 32,607 MiB card, capped at
+/// 31.9 GiB; Flash-Next and the 27B `OF_RECORD`, 0 B, so their pending is unchanged)
+pub fn planner_pending_for(
+    stability: &Stability,
+    vram_total: u64,
+    launch_slack: u64,
+    ring_reserve: u64,
+    vit_reserve: u64,
+    render_reserve: u64,
+) -> u64 {
+    planner_pending(launch_slack, ring_reserve, vit_reserve, render_reserve) + stability.planner_reserve(vram_total)
+}
+
+// ---------------- #159: the glm5_next plan (VRAM, pinned RAM, NVMe) ----------------
+
+/// #159: the state bytes of a glm5_next model at `context` tokens, from its `Glm5Geo`
+/// (`docs/glm5-next-recipe.md` section 13). The MTP block (checkpoint layer 45) is not
+/// executed (plan step 21), so it books nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Glm5States {
+    pub context: usize,
+    /// MLA latent per token per DSA layer (BF16, 1,024 B) and the indexer row (HF layout, 514 B)
+    pub latent_per_token: u64,
+    pub indexer_per_token: u64,
+    /// the two caches over every DSA layer at `context` tokens
+    pub latent_bytes: u64,
+    pub indexer_bytes: u64,
+    /// per sequence, independent of the context: KDA state (4 MiB per layer) and conv window
+    pub kda_state_bytes: u64,
+    pub kda_conv_bytes: u64,
+}
+
+impl Glm5States {
+    pub fn plan(g: &Glm5Geo, context: usize) -> Glm5States {
+        let dsa = g.dsa_layers as u64;
+        let kda = g.kda_layers as u64;
+        Glm5States {
+            context,
+            latent_per_token: g.latent_bytes_per_token(),
+            indexer_per_token: g.indexer_bytes_per_token(),
+            latent_bytes: dsa * context as u64 * g.latent_bytes_per_token(),
+            indexer_bytes: dsa * context as u64 * g.indexer_bytes_per_token(),
+            kda_state_bytes: kda * g.kda_state_bytes(),
+            kda_conv_bytes: kda * g.kda_conv_bytes(),
+        }
+    }
+    /// the cache bytes of one token over every DSA layer
+    pub fn per_token(&self, g: &Glm5Geo) -> u64 {
+        g.dsa_layers as u64 * (self.latent_per_token + self.indexer_per_token)
+    }
+    pub fn total(&self) -> u64 {
+        self.latent_bytes + self.indexer_bytes + self.kda_state_bytes + self.kda_conv_bytes
+    }
+}
+
+/// #159: the inputs of the three-tier expert plan, every one of them named in the printout
+#[derive(Clone, Copy, Debug)]
+pub struct TierInput {
+    /// the card's VRAM (the boot replaces it by the measured free VRAM)
+    pub vram_total: u64,
+    /// the family's policy: headroom and cap (`Stability::planner_reserve`)
+    pub stability: Stability,
+    /// VRAM-resident bytes that are not routed experts (the container's dense part)
+    pub dense_bytes: u64,
+    /// `Glm5States::total` at the boot context
+    pub states_bytes: u64,
+    /// the cold staging slots (`Stability::stage_slots`) times one expert block
+    pub staging_bytes: u64,
+    /// `LAUNCH_SLACK`
+    pub launch_slack: u64,
+    /// one routed expert of one MoE layer
+    pub expert_block_bytes: u64,
+    pub moe_layers: usize,
+    /// routed experts per MoE layer
+    pub experts: usize,
+    /// the pinned host budget: `HOST_PINNED_CAP`, or what the boot derives below it
+    pub host_pinned_budget: u64,
+}
+
+/// #159: where the routed experts of every MoE layer live: N in VRAM, P in pinned host RAM,
+/// the rest read from NVMe (#149). One unit is one expert in every MoE layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TierPlan {
+    /// `Stability::vram_ceiling(vram_total)`
+    pub vram_ceiling: u64,
+    /// dense + states + staging + pending (with the policy reserve) + `SAFETY`
+    pub fixed_bytes: u64,
+    /// `expert_block_bytes x moe_layers`
+    pub unit_bytes: u64,
+    pub hot: usize,
+    pub pinned: usize,
+    pub nvme: usize,
+}
+
+impl TierPlan {
+    pub fn hot_bytes(&self) -> u64 {
+        self.hot as u64 * self.unit_bytes
+    }
+    pub fn pinned_bytes(&self) -> u64 {
+        self.pinned as u64 * self.unit_bytes
+    }
+    pub fn nvme_bytes(&self) -> u64 {
+        self.nvme as u64 * self.unit_bytes
+    }
+}
+
+/// #159: the three-tier plan. VRAM takes the dense part, the states, the staging, the launch
+/// slack and `SAFETY`, then as many expert units as fit under the family's VRAM ceiling
+/// (`hot`, at most `experts`); pinned RAM takes as many of the rest as fit the host budget
+/// (`pinned`); NVMe holds what is left (`nvme`). `Err` when the dense part and the states do
+/// not fit the ceiling with no expert at all: no expert tier changes that.
+pub fn plan_three_tiers(i: &TierInput) -> Result<TierPlan, String> {
+    let gib = |b: u64| b as f64 / GIB;
+    let vram_ceiling = i.stability.vram_ceiling(i.vram_total);
+    // the clamp's own sum (`clamp_hot_n`): what must fit the card, the policy reserve inside pending
+    let pending = planner_pending_for(&i.stability, i.vram_total, i.launch_slack, 0, 0, 0);
+    let need = i.dense_bytes + i.states_bytes + i.staging_bytes + pending + SAFETY;
+    // the same sum without the reserve: what lands below the ceiling
+    let fixed_bytes = need - i.stability.planner_reserve(i.vram_total);
+    if need > i.vram_total {
+        return Err(format!(
+            "refusing config: family Glm5Next needs {:.2} GiB before any expert (dense part {:.2} + states {:.2} + staging {:.2} + launch slack {:.2} + safety {:.2}) against a VRAM plan ceiling of {:.2} GiB (card {:.2} GiB - headroom {:.2} GiB, cap {}) - the dense part does not fit, no expert tier changes that (#159)",
+            gib(fixed_bytes), gib(i.dense_bytes), gib(i.states_bytes), gib(i.staging_bytes), gib(i.launch_slack), gib(SAFETY),
+            gib(vram_ceiling), gib(i.vram_total), gib(i.stability.vram_headroom),
+            i.stability.vram_cap.map_or("none".to_string(), |c| format!("{:.2} GiB", gib(c)))
+        ));
+    }
+    let unit_bytes = i.expert_block_bytes * i.moe_layers as u64;
+    let unit = unit_bytes.max(1);
+    let hot = (((i.vram_total - need) / unit) as usize).min(i.experts);
+    let pinned = ((i.host_pinned_budget / unit) as usize).min(i.experts - hot);
+    Ok(TierPlan { vram_ceiling, fixed_bytes, unit_bytes, hot, pinned, nvme: i.experts - hot - pinned })
+}
+
+/// #159: the glm5_next plan from its geometry: the states at `context`, the staging of its
+/// stability policy (`pf_tg` tiles per prefill group, `pf_async` = two group sets), the three
+/// tiers. `dense_bytes` and `expert_block_bytes` are the container's.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_glm5_next(
+    g: &Glm5Geo,
+    context: usize,
+    vram_total: u64,
+    host_pinned_budget: u64,
+    dense_bytes: u64,
+    expert_block_bytes: u64,
+    pf_tg: usize,
+    pf_async: bool,
+) -> Result<(Glm5States, TierInput, TierPlan), String> {
+    let stability = Stability::of(Family::Glm5Next);
+    let states = Glm5States::plan(g, context);
+    let slots = stability.stage_slots(g.topk, pf_tg, pf_async);
+    // decode and prefill sets apart (#176): both are held
+    let staging_slots = if slots.shared { slots.held() } else { slots.decode + slots.prefill };
+    let input = TierInput {
+        vram_total,
+        stability,
+        dense_bytes,
+        states_bytes: states.total(),
+        staging_bytes: staging_slots as u64 * expert_block_bytes,
+        launch_slack: LAUNCH_SLACK,
+        expert_block_bytes,
+        moe_layers: g.moe_layers(),
+        experts: g.experts,
+        host_pinned_budget,
+    };
+    let plan = plan_three_tiers(&input)?;
+    Ok((states, input, plan))
+}
+
+/// #159: the plan as `states --plan` prints it: every input with its source, then the three
+/// tiers per MoE layer and in bytes. `sources` names where the dense part, the expert block,
+/// the card and the pinned budget came from.
+pub fn glm5_plan_table(g: &Glm5Geo, s: &Glm5States, i: &TierInput, p: &TierPlan, sources: &[(&str, String)]) -> String {
+    let gib = |b: u64| b as f64 / GIB;
+    let src = |k: &str| sources.iter().find(|(n, _)| *n == k).map_or(String::new(), |(_, v)| format!(" ({v})"));
+    let slots = i.staging_bytes / i.expert_block_bytes.max(1);
+    let mut o = Vec::new();
+    o.push(format!("--- glm5_next plan (#159): context {}, three expert tiers ---", s.context));
+    o.push("inputs".to_string());
+    o.push(format!("  dense part           {:>16} B  {:>7.2} GiB{}", i.dense_bytes, gib(i.dense_bytes), src("dense")));
+    o.push(format!("  expert block         {:>16} B  {:>7.2} MiB  one expert of one MoE layer{}", i.expert_block_bytes, i.expert_block_bytes as f64 / MIB, src("expert")));
+    o.push(format!("  MoE layers x experts {:>16}    {} x {} (top-{}), MTP layer 45 not executed (step 21): no cache, no experts", "", i.moe_layers, i.experts, g.topk));
+    o.push(format!("  KV per token         {:>16} B  {} DSA layers x (MLA latent {} B BF16 + indexer {} B HF layout)", s.per_token(g), g.dsa_layers, s.latent_per_token, s.indexer_per_token));
+    o.push(format!("  card VRAM            {:>16} B  {:>7.2} GiB{}", i.vram_total, gib(i.vram_total), src("vram")));
+    o.push(format!("  pinned budget        {:>16} B  {:>7.2} GiB{}", i.host_pinned_budget, gib(i.host_pinned_budget), src("pinned")));
+    o.push("VRAM".to_string());
+    o.push(format!("  plan ceiling         {:>16} B  {:>7.2} GiB  card - headroom {:.2} GiB, cap {} (Stability::GLM5_NEXT, #176)", p.vram_ceiling, gib(p.vram_ceiling), gib(i.stability.vram_headroom),
+        i.stability.vram_cap.map_or("none".to_string(), |c| format!("{:.2} GiB", gib(c)))));
+    o.push(format!("  dense part           {:>16} B  {:>7.2} GiB", i.dense_bytes, gib(i.dense_bytes)));
+    o.push(format!("  MLA latent           {:>16} B  {:>7.2} GiB  {} x {} tokens x {} B", s.latent_bytes, gib(s.latent_bytes), g.dsa_layers, s.context, s.latent_per_token));
+    o.push(format!("  indexer cache        {:>16} B  {:>7.2} GiB  {} x {} tokens x {} B", s.indexer_bytes, gib(s.indexer_bytes), g.dsa_layers, s.context, s.indexer_per_token));
+    o.push(format!("  KDA state + conv     {:>16} B  {:>7.2} GiB  {} layers x ({} + {} B) per sequence", s.kda_state_bytes + s.kda_conv_bytes, gib(s.kda_state_bytes + s.kda_conv_bytes), g.kda_layers, g.kda_state_bytes(), g.kda_conv_bytes()));
+    o.push(format!("  cold staging         {:>16} B  {:>7.2} GiB  {} slots (decode and prefill sets apart, #176)", i.staging_bytes, gib(i.staging_bytes), slots));
+    o.push(format!("  launch slack + safety{:>16} B  {:>7.2} GiB", i.launch_slack + SAFETY, gib(i.launch_slack + SAFETY)));
+    o.push("  activations/scratch  not measured (GLM widths; the step-14 boot measures them against free VRAM)".to_string());
+    o.push(format!("  room for experts     {:>16} B  {:>7.2} GiB", p.vram_ceiling - p.fixed_bytes, gib(p.vram_ceiling - p.fixed_bytes)));
+    o.push(format!("expert tiers per MoE layer (unit = {} B = {} layers x one block)", p.unit_bytes, i.moe_layers));
+    let share = |n: usize| 100.0 * n as f64 / i.experts.max(1) as f64;
+    o.push(format!("  VRAM    N = {:>3}  {:>5.1} %  {:>16} B  {:>7.2} GiB", p.hot, share(p.hot), p.hot_bytes(), gib(p.hot_bytes())));
+    o.push(format!("  pinned  P = {:>3}  {:>5.1} %  {:>16} B  {:>7.2} GiB", p.pinned, share(p.pinned), p.pinned_bytes(), gib(p.pinned_bytes())));
+    o.push(format!("  NVMe        {:>3}  {:>5.1} %  {:>16} B  {:>7.2} GiB  (CROW_NVME_TIER, #149)", p.nvme, share(p.nvme), p.nvme_bytes(), gib(p.nvme_bytes())));
+    o.push(format!("  resident (N + P) / {} = {:.1} %; expert cache policy default lru (CROW_EXPERT_CACHE, #175)", i.experts, share(p.hot + p.pinned)));
+    o.push("  G1d capacities (plan step 3): not measured yet - these are the planner's own numbers".to_string());
+    o.join("\n")
 }
 
 /// #110: what must still be free once the load is done: the #72 floor for the
@@ -1587,6 +1798,168 @@ mod tests_ram_margin {
         assert_eq!(RAM_MARGIN_DEFAULT_GB, 1);
         if std::env::var_os("CROW_RAM_MARGIN_GB").is_none() {
             assert_eq!(ram_margin_bytes(), 1u64 << 30);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_159_record_plan {
+    //! #159: the plan of Flash-Next and the 27B, rendered as text and pinned. The text was
+    //! captured at 0c90901 (before the glm5_next family existed) with exactly this test body;
+    //! the family, its planner and its Stability wiring must leave every number unchanged.
+    use super::*;
+
+    /// one hot-set unit of Flash-Next: 48 layers x 2,764,800 B per expert (tests_110)
+    const UNIT: u64 = 48 * 2_764_800;
+
+    fn render(geo: &Geo) -> String {
+        let mut out = format!("family {:?} code {}\n", geo.family, geo.family.code());
+        for context in [geo.context_floor, 262_144] {
+            for kv in [KvDtype::Fp8E4m3, KvDtype::Bf16, KvDtype::Q8Block] {
+                for chunk in [512, 4096] {
+                    let s = StateSizes::plan(geo, context, kv, chunk);
+                    out += &format!(
+                        "ctx {context} {} chunk {chunk}: kv {} qsa_keys {} ring {} pooled {} gdn_s {} gdn_conv {} rope {} total {}\n",
+                        kv.name(), s.kv_bytes, s.qsa_keys_bytes, s.qsa_ring_rows, s.qsa_pooled_bytes,
+                        s.gdn_s_bytes, s.gdn_conv_bytes, s.rope_bytes, s.total()
+                    );
+                }
+            }
+        }
+        let card = 32_607u64 << 20;
+        let st = Stability::of(geo.family);
+        let slots = st.stage_slots(geo.dims().topk, 64, true);
+        out += &format!(
+            "stability {:?} ceiling {} reserve {} slots {:?} held {} pending {}\n",
+            st, st.vram_ceiling(card), st.planner_reserve(card), slots, slots.held(),
+            planner_pending(128 << 20, 0, 0, 0)
+        );
+        let states = StateSizes::plan(geo, geo.context_floor, geo.family.default_kv(), 2048).total();
+        match geo.ffn {
+            Ffn::Moe { experts, .. } => {
+                for (free0, budget) in [(30u64 << 30, 46u64 << 30), (31 << 30, 40 << 30), (28 << 30, 46 << 30)] {
+                    let c = ClampInput {
+                        n_hot: 160,
+                        experts,
+                        states_bytes: states,
+                        pending_bytes: planner_pending(128 << 20, 0, 0, 0),
+                        expert_bytes_per_n_unit: UNIT,
+                        cold_bytes_per_n_unit: UNIT,
+                        cold_fixed: false,
+                        spare: 7,
+                        free0,
+                        host_pinned_budget: budget,
+                    };
+                    out += &format!("clamp free0 {free0} budget {budget}: {:?}\n", clamp_hot_n(&c).map(|(n, _)| n));
+                }
+            }
+            Ffn::Dense { .. } => {
+                for free0 in [20u64 << 30, 30 << 30] {
+                    out += &format!("dense_fit free0 {free0}: {:?}\n", dense_fit(free0, states, 128 << 20, 0, geo.context_floor).map(|(g, _)| g));
+                }
+            }
+        }
+        out
+    }
+
+    const FLASH_NEXT_PLAN: &str = "family FlashNext code 1\nctx 200000 fp8_e4m3 chunk 512: kv 2457600000 qsa_keys 3170304 ring 516 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 2936840192\nctx 200000 fp8_e4m3 chunk 4096: kv 2457600000 qsa_keys 25190400 ring 4100 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 2958860288\nctx 200000 bf16 chunk 512: kv 4915200000 qsa_keys 3170304 ring 516 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 5394440192\nctx 200000 bf16 chunk 4096: kv 4915200000 qsa_keys 25190400 ring 4100 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 5416460288\nctx 200000 q8 chunk 512: kv 2611200000 qsa_keys 3170304 ring 516 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 3090440192\nctx 200000 q8 chunk 4096: kv 2611200000 qsa_keys 25190400 ring 4100 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 3112460288\nctx 262144 fp8_e4m3 chunk 512: kv 3221225472 qsa_keys 3170304 ring 516 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 3811827712\nctx 262144 fp8_e4m3 chunk 4096: kv 3221225472 qsa_keys 25190400 ring 4100 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 3833847808\nctx 262144 bf16 chunk 512: kv 6442450944 qsa_keys 3170304 ring 516 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 7033053184\nctx 262144 bf16 chunk 4096: kv 6442450944 qsa_keys 25190400 ring 4100 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 7055073280\nctx 262144 q8 chunk 512: kv 3422552064 qsa_keys 3170304 ring 516 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 4013154304\nctx 262144 q8 chunk 4096: kv 3422552064 qsa_keys 25190400 ring 4100 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 4035174400\nstability Stability { vram_headroom: 0, vram_cap: None, decode_stage_rows: None } ceiling 34190917632 reserve 0 slots StageSlots { decode: 20, prefill: 128, shared: true } held 128 pending 134217728\nclamp free0 32212254720 budget 49392123904: Ok(160)\nclamp free0 33285996544 budget 42949672960: Ok(196)\nclamp free0 30064771072 budget 49392123904: Ok(160)\n";
+    const DENSE_27B_PLAN: &str = "family Qwen35Dense code 2\nctx 65536 fp8_e4m3 chunk 512: kv 2147483648 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 2321154048\nctx 65536 fp8_e4m3 chunk 4096: kv 2147483648 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 2321154048\nctx 65536 bf16 chunk 512: kv 4294967296 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 4468637696\nctx 65536 bf16 chunk 4096: kv 4294967296 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 4468637696\nctx 65536 q8 chunk 512: kv 2281701376 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 2455371776\nctx 65536 q8 chunk 4096: kv 2281701376 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 2455371776\nctx 262144 fp8_e4m3 chunk 512: kv 8589934592 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 8813936640\nctx 262144 fp8_e4m3 chunk 4096: kv 8589934592 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 8813936640\nctx 262144 bf16 chunk 512: kv 17179869184 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 17403871232\nctx 262144 bf16 chunk 4096: kv 17179869184 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 17403871232\nctx 262144 q8 chunk 512: kv 9126805504 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 9350807552\nctx 262144 q8 chunk 4096: kv 9126805504 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 9350807552\nstability Stability { vram_headroom: 0, vram_cap: None, decode_stage_rows: None } ceiling 34190917632 reserve 0 slots StageSlots { decode: 0, prefill: 128, shared: true } held 128 pending 134217728\ndense_fit free0 21474836480: Ok(0)\ndense_fit free0 32212254720: Ok(0)\n";
+
+    #[test]
+    fn flash_next_and_the_27b_plan_exactly_as_before_159() {
+        assert_eq!(render(&Geo::FLASH_NEXT), FLASH_NEXT_PLAN);
+        assert_eq!(render(&crate::meta::dense_fixture_geo()), DENSE_27B_PLAN);
+    }
+}
+
+
+#[cfg(test)]
+mod tests_159_glm_plan {
+    //! #159: the glm5_next plan: states from the recipe's per-token and per-layer bytes, the
+    //! #176 policy through `planner_pending_for`, three expert tiers. Pure arithmetic, no GPU.
+    use super::*;
+
+    const CARD: u64 = 32_607 << 20; // RTX 5090, docs/system-landscape.md:12
+
+    fn plan(card: u64, pinned: u64, context: usize) -> Result<(Glm5States, TierInput, TierPlan), String> {
+        plan_glm5_next(&Glm5Geo::GLM_5_3_FLASH, context, card, pinned, GLM5_NEXT_DENSE_BYTES, GLM5_NEXT_EXPERT_BLOCK_BYTES, 64, true)
+    }
+
+    /// the plan of record at the boot context 200,000 on the RTX 5090 with the 46 GiB cap:
+    /// N 32 in VRAM, P 83 pinned, 173 on NVMe per MoE layer; KV from the latent, not per head
+    #[test]
+    fn the_glm_plan_at_the_boot_context_is_n32_p83_nvme173() {
+        let (s, i, p) = plan(CARD, HOST_PINNED_CAP, 200_000).unwrap();
+        assert_eq!((s.latent_bytes, s.indexer_bytes), (2_252_800_000, 1_130_800_000));
+        assert_eq!((s.kda_state_bytes, s.kda_conv_bytes), (142_606_336, 10_027_008));
+        assert_eq!(s.per_token(&Glm5Geo::GLM_5_3_FLASH), 16_918);
+        // the per-head K/V form the ticket names as the failure mode: 11 x 2 x 64 x 200k x 256 B
+        assert_ne!(s.latent_bytes, 72_089_600_000);
+        assert_eq!(i.staging_bytes, 160 * GLM5_NEXT_EXPERT_BLOCK_BYTES, "32 decode + 128 prefill slots (#176)");
+        assert_eq!(p.vram_ceiling, 32_043_433_984);
+        assert_eq!(p.unit_bytes, 594_542_592);
+        assert_eq!((p.hot, p.pinned, p.nvme), (32, 83, 173));
+        assert_eq!(p.fixed_bytes, GLM5_NEXT_DENSE_BYTES + s.total() + i.staging_bytes + LAUNCH_SLACK + SAFETY);
+        assert!(p.fixed_bytes + p.hot_bytes() <= p.vram_ceiling && p.fixed_bytes + p.hot_bytes() + p.unit_bytes > p.vram_ceiling);
+        assert!(p.pinned_bytes() <= HOST_PINNED_CAP);
+        assert_eq!(p.hot_bytes() + p.pinned_bytes() + p.nvme_bytes(), GLM5_NEXT_EXPERT_BLOCKS * GLM5_NEXT_EXPERT_BLOCK_BYTES);
+    }
+
+    /// a card that cannot hold the dense part and the states is refused by name; the
+    /// smallest card that holds them plans N 0 and puts every other expert below VRAM
+    #[test]
+    fn a_budget_that_cannot_hold_the_dense_part_is_refused() {
+        let why = plan(8 << 30, HOST_PINNED_CAP, 200_000).unwrap_err();
+        assert!(why.starts_with("refusing config: family Glm5Next needs"), "{why}");
+        assert!(why.contains("the dense part does not fit, no expert tier changes that (#159)"), "{why}");
+        let (_, i, p) = plan(CARD, HOST_PINNED_CAP, 200_000).unwrap();
+        let tight = p.fixed_bytes + i.stability.vram_headroom;
+        let (_, _, q) = plan(tight, HOST_PINNED_CAP, 200_000).unwrap();
+        assert_eq!((q.hot, q.pinned, q.nvme), (0, 83, 205));
+        assert!(plan(tight - 1, HOST_PINNED_CAP, 200_000).is_err());
+    }
+
+    /// the tiers follow their inputs: no pinned budget sends the rest to NVMe, a long context
+    /// takes VRAM from N, the 31.9 GiB cap binds on a larger card
+    #[test]
+    fn the_glm_tiers_follow_the_budget_the_context_and_the_cap() {
+        let (_, _, p) = plan(CARD, 0, 200_000).unwrap();
+        assert_eq!((p.hot, p.pinned, p.nvme), (32, 0, 256));
+        let (s, _, p) = plan(CARD, HOST_PINNED_CAP, 1_048_576).unwrap();
+        assert_eq!(s.latent_bytes, 11 * 1_048_576 * 1_024);
+        assert!(p.hot < 32, "N {}", p.hot);
+        let (_, _, p) = plan(48 << 30, HOST_PINNED_CAP, 200_000).unwrap();
+        assert_eq!(p.vram_ceiling, GLM5_NEXT_VRAM_CAP);
+    }
+
+    /// `planner_pending_for` adds the policy reserve: 0 B for Flash-Next and the 27B (their
+    /// pending unchanged), 2 GiB for glm5_next on the RTX 5090
+    #[test]
+    fn planner_pending_for_adds_only_the_glm_reserve() {
+        for f in Family::ALL {
+            assert_eq!(planner_pending_for(&Stability::of(f), CARD, LAUNCH_SLACK, 7, 11, 13), planner_pending(LAUNCH_SLACK, 7, 11, 13), "{f:?}");
+        }
+        assert_eq!(planner_pending_for(&Stability::of(Family::Glm5Next), CARD, LAUNCH_SLACK, 0, 0, 0), LAUNCH_SLACK + (2 << 30));
+        assert_eq!(LAUNCH_SLACK, 128 << 20);
+    }
+
+    /// the printout names its inputs and the three tiers, and says step 3 is pending
+    #[test]
+    fn the_glm_plan_table_names_its_inputs_and_the_three_tiers() {
+        let (s, i, p) = plan(CARD, HOST_PINNED_CAP, 200_000).unwrap();
+        let t = glm5_plan_table(&Glm5Geo::GLM_5_3_FLASH, &s, &i, &p, &[("dense", "converter dry run".into())]);
+        for want in [
+            "context 200000",
+            "dense part                 5981546744 B     5.57 GiB (converter dry run)",
+            "expert block                 14155776 B",
+            "KV per token                    16918 B  11 DSA layers x (MLA latent 1024 B BF16 + indexer 514 B HF layout)",
+            "plan ceiling              32043433984 B",
+            "VRAM    N =  32",
+            "pinned  P =  83",
+            "NVMe        173",
+            "G1d capacities (plan step 3): not measured yet",
+        ] {
+            assert!(t.contains(want), "{want:?} missing:\n{t}");
         }
     }
 }

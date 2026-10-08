@@ -391,6 +391,12 @@ pub enum Family {
     /// pre-norm residual, dense SwiGLU, full causal attention; runs since Crow #300
     /// phase 2
     Qwen35Dense,
+    /// `glm5_next_text`: GLM-5.3-Flash (#159) - mHC residual, MLA + DSA indexer without
+    /// RoPE, KDA linear attention, 288-expert sigmoid MoE after three dense layers. The
+    /// metadata gate accepts it into [`Glm5Geo`] and the planner plans it
+    /// (`manager::plan_glm5_next`, `states --plan`); the boot refuses it at its first
+    /// unbuilt arm (`meta::glm5_not_built`, plan steps 13a-13e and 14)
+    Glm5Next,
 }
 
 impl Family {
@@ -399,21 +405,28 @@ impl Family {
         match self {
             Family::FlashNext => "qwen4_exp_text",
             Family::Qwen35Dense => "qwen3_5_text",
+            Family::Glm5Next => GLM5_NEXT_MODEL_TYPE,
         }
     }
     /// Crow #300 phase 2: the KV cache dtype a boot takes when `CROW_KV` is unset. Flash-Next
     /// keeps FP8 e4m3 (its gate values of record are computed with it). The dense family takes
     /// BF16: on the 27B the raw FP8 cast failed the pre-registered long-context criterion at
     /// 5 of 6 anchors (KL(BF16 || FP8) 0.04 to 4.4 against the limit 0.073,
-    /// `decode_out/p2-kld/PREREG.md`), while BF16 KV tracks the f32 reference (median KL 4e-5)
+    /// `decode_out/p2-kld/PREREG.md`), while BF16 KV tracks the f32 reference (median KL 4e-5). #159: glm5_next caches the BF16 MLA
+    /// latent (nothing lossy; an FP8 latent would need its own gate, the 27B lesson above)
     pub fn default_kv(self) -> KvDtype {
         match self {
             Family::FlashNext => KvDtype::Fp8E4m3,
-            Family::Qwen35Dense => KvDtype::Bf16,
+            Family::Qwen35Dense | Family::Glm5Next => KvDtype::Bf16,
         }
     }
-    /// every family, in table order
+    /// every family the engine RUNS, in table order (#159: glm5_next is in [`Family::KNOWN`]
+    /// only, until its arms exist)
     pub const ALL: [Family; 2] = [Family::FlashNext, Family::Qwen35Dense];
+    /// every family the metadata gate accepts: the ones the engine runs, then glm5_next (#159),
+    /// which the gate parses and the planner plans, and whose boot refuses at its first
+    /// unbuilt arm
+    pub const KNOWN: [Family; 3] = [Family::FlashNext, Family::Qwen35Dense, Family::Glm5Next];
 
     /// Crow #300 C3: the family's number in a slot file header (`slot::Header::model_family`);
     /// 0 is never written, so a zeroed field reads as no family
@@ -421,11 +434,12 @@ impl Family {
         match self {
             Family::FlashNext => 1,
             Family::Qwen35Dense => 2,
+            Family::Glm5Next => 3,
         }
     }
     /// the family a slot-file code names, `None` for a code no family carries
     pub fn from_code(code: u64) -> Option<Family> {
-        Family::ALL.into_iter().find(|f| f.code() == code)
+        Family::KNOWN.into_iter().find(|f| f.code() == code)
     }
 }
 
@@ -433,10 +447,10 @@ impl Family {
 //
 // Crow 2026-08-11 (RTX 5090, `docs/archive/README-v0.5.1-deepseek.md` of Crow): with 593 MiB
 // left free the same prefill ran 3.83 to 33.29 tok/s (spread 8.69x) because WDDM silently moved
-// allocations into system memory; with 2,059 MiB free the spread was 1.013x. The engine has no
-// `glm5_next` family yet (#159 owns the door), so the GLM policy is keyed by the model type the
-// converter writes, and the GLM planner (#159) and stager (#149) read it. Flash-Next and the 27B
-// take `Stability::OF_RECORD`, whose numbers are today's code bit for bit.
+// allocations into system memory; with 2,059 MiB free the spread was 1.013x. #159 added the
+// `glm5_next` family: `Stability::of(Family::Glm5Next)` is the GLM policy, which the GLM planner
+// books through `manager::planner_pending_for`; the model-type key stays for the stager (#149).
+// Flash-Next and the 27B take `Stability::OF_RECORD`, whose numbers are today's code bit for bit.
 
 /// `text_config.model_type` of GLM-5.3-Flash (the converter's `recipe::Family::Glm5Next`)
 pub const GLM5_NEXT_MODEL_TYPE: &str = "glm5_next_text";
@@ -448,6 +462,205 @@ pub const GLM5_NEXT_VRAM_CAP: u64 = 319 * (1 << 30) / 10;
 /// rows a decode-shaped batch stages on glm5_next: one token or one MTP verify batch
 /// (`gen::MTP_VERIFY_MAX`, a test pins the two equal)
 pub const GLM5_NEXT_DECODE_STAGE_ROWS: usize = 4;
+
+// ---- #159: the glm5_next family row and the container bytes the planner plans with ----
+
+/// the checkpoint the glm5_next family row ([`Glm5Geo::GLM_5_3_FLASH`]) was written from
+pub const GLM5_NEXT_SOURCE: &str = "zai-org/GLM-5.3-Flash @ eb9eb208 config.json";
+/// the converter dry run of the full CNQ4.5 container (`converter plan --headers`, GLM
+/// measurement book, 2026-10-08): the container without its index trailer
+pub const GLM5_NEXT_CONTAINER_BYTES: u64 = 178_478_618_624;
+/// the same dry run: the dense part, the bytes the planner books as VRAM-resident
+pub const GLM5_NEXT_DENSE_BYTES: u64 = 5_981_546_744;
+/// the same dry run: routed expert blocks in the container (42 MoE layers x 288 experts)
+pub const GLM5_NEXT_EXPERT_BLOCKS: u64 = 12_096;
+/// the same dry run: one routed expert block (gate + up + down of one expert of one layer,
+/// NVFP4 at 36 B per 64 values, on a 4096-B boundary); [`Glm5Geo::expert_block_bytes`]
+/// derives the same number from the config
+pub const GLM5_NEXT_EXPERT_BLOCK_BYTES: u64 = 14_155_776;
+/// bytes of one stored NVFP4 block of 64 values (CNQ4.5)
+pub const NVFP4_BLOCK_BYTES: usize = 36;
+
+/// #159: the geometry of a glm5_next checkpoint, derived from its config by
+/// `meta::ModelMeta::glm5_geo` and asserted equal to [`Glm5Geo::GLM_5_3_FLASH`]. Its own struct
+/// and not new `Geo` arms: no engine arm of this family exists yet (plan steps 13a-13e), so no
+/// `gen.rs` site may read it; the planner (`manager::Glm5States`, `manager::plan_glm5_next`) and
+/// `states --plan` do. The arms move into `Geo` with the kernels that compute them.
+/// Sources: `docs/glm5-next-recipe.md` sections 1, 5-10, 13.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Glm5Geo {
+    pub hidden: usize,
+    /// trunk layers (`num_hidden_layers`); the MTP block is checkpoint layer 45, apart
+    pub layers: usize,
+    /// layer % interval == interval - 1 is MLA + DSA, every other layer KDA
+    pub attn_interval: usize,
+    pub dsa_layers: usize,
+    pub kda_layers: usize,
+    /// mHC: residual streams, Sinkhorn iterations, eps
+    pub hc_streams: usize,
+    pub hc_sinkhorn_iters: usize,
+    pub hc_eps: f64,
+    /// MLA (no RoPE): heads, low-rank q and kv widths, per-head key (nope) and value dims
+    pub mla_heads: usize,
+    pub q_lora: usize,
+    pub kv_lora: usize,
+    pub nope_dim: usize,
+    pub v_dim: usize,
+    /// the DSA indexer: heads, head dim, k-pool, selection budget in tokens
+    pub index_heads: usize,
+    pub index_head_dim: usize,
+    pub index_kpool: usize,
+    pub index_topk: usize,
+    /// KDA: heads, head dim, short conv kernel, forget-gate lower bound
+    pub kda_heads: usize,
+    pub kda_head_dim: usize,
+    pub kda_conv: usize,
+    pub kda_lower_bound: f64,
+    /// the dense SwiGLU layers before the first MoE layer, and their width
+    pub dense_prefix: usize,
+    pub dense_inter: usize,
+    /// routed experts per MoE layer, top-k, shared experts, expert width
+    pub experts: usize,
+    pub topk: usize,
+    pub shared_experts: usize,
+    pub expert_inter: usize,
+    pub routed_scaling: f64,
+    pub swiglu_limit: f64,
+    pub rms_eps: f64,
+    pub vocab: usize,
+    pub tie_word_embeddings: bool,
+    pub context_max: usize,
+    /// the context the boot plans at least (`CONTEXT_FLOOR`, the 200k boot of plan step 14)
+    pub context_floor: usize,
+    pub eos_ids: [usize; 3],
+    pub mtp_layers: usize,
+    pub vision_out_hidden: Option<usize>,
+}
+
+impl Glm5Geo {
+    /// the family row: zai-org/GLM-5.3-Flash @ eb9eb208 config.json ([`GLM5_NEXT_SOURCE`])
+    pub const GLM_5_3_FLASH: Glm5Geo = Glm5Geo {
+        hidden: 4096,
+        layers: 45,
+        attn_interval: 4,
+        dsa_layers: 11,
+        kda_layers: 34,
+        hc_streams: 4,
+        hc_sinkhorn_iters: 20,
+        hc_eps: 1e-6,
+        mla_heads: 64,
+        q_lora: 1536,
+        kv_lora: 512,
+        nope_dim: 256,
+        v_dim: 256,
+        index_heads: 32,
+        index_head_dim: 128,
+        index_kpool: 4,
+        index_topk: 2048,
+        kda_heads: 64,
+        kda_head_dim: 128,
+        kda_conv: 4,
+        kda_lower_bound: -5.0,
+        dense_prefix: 3,
+        dense_inter: 12_288,
+        experts: 288,
+        topk: 8,
+        shared_experts: 1,
+        expert_inter: 2048,
+        routed_scaling: 2.5,
+        swiglu_limit: 10.0,
+        rms_eps: 1e-5,
+        vocab: 154_880,
+        tie_word_embeddings: false,
+        context_max: 1_048_576,
+        context_floor: CONTEXT_FLOOR,
+        eos_ids: [154_820, 154_827, 154_829],
+        mtp_layers: 1,
+        vision_out_hidden: Some(4096),
+    };
+
+    /// MoE layers (42): the trunk minus the dense prefix
+    pub const fn moe_layers(&self) -> usize {
+        self.layers - self.dense_prefix
+    }
+    /// layer `layer` is an MLA + DSA layer (else KDA)
+    pub const fn is_dsa(&self, layer: usize) -> bool {
+        layer % self.attn_interval == self.attn_interval - 1
+    }
+    /// the most rows one query attends: `index_topk / kpool` pools + the 3-row tail (2051)
+    pub const fn sel_max(&self) -> usize {
+        self.index_topk + self.index_kpool - 1
+    }
+    /// values of one routed expert: gate + up `[expert_inter, hidden]` and down `[hidden, expert_inter]`
+    pub const fn expert_values(&self) -> usize {
+        3 * self.expert_inter * self.hidden
+    }
+    /// bytes of one routed expert block of one layer at NVFP4 (36 B per 64 values), rounded up
+    /// to the container's 4096-B boundary
+    pub const fn expert_block_bytes(&self) -> u64 {
+        ((self.expert_values() / 64 * NVFP4_BLOCK_BYTES) as u64).div_ceil(4096) * 4096
+    }
+    /// MLA latent cache per token per DSA layer: `kv_lora` values at BF16 (1,024 B)
+    pub const fn latent_bytes_per_token(&self) -> u64 {
+        (self.kv_lora * 2) as u64
+    }
+    /// indexer cache per token per DSA layer, HF layout `[key | gate | valid]` at BF16 (514 B)
+    pub const fn indexer_bytes_per_token(&self) -> u64 {
+        ((2 * self.index_head_dim + 1) * 2) as u64
+    }
+    /// KDA recurrent state per layer per sequence, f32 `[heads][head dim][head dim]` (4 MiB)
+    pub const fn kda_state_bytes(&self) -> u64 {
+        (self.kda_heads * self.kda_head_dim * self.kda_head_dim * 4) as u64
+    }
+    /// KDA conv window per layer per sequence, f32 `[3 x heads x head dim][conv - 1]` (288 KiB)
+    pub const fn kda_conv_bytes(&self) -> u64 {
+        (3 * self.kda_heads * self.kda_head_dim * (self.kda_conv - 1) * 4) as u64
+    }
+
+    /// every field as (name, rendered value), in declaration order: the gate's checks are
+    /// this list against the family row
+    pub fn rows(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("hidden", self.hidden.to_string()),
+            ("layers", self.layers.to_string()),
+            ("attn_interval", self.attn_interval.to_string()),
+            ("dsa_layers", self.dsa_layers.to_string()),
+            ("kda_layers", self.kda_layers.to_string()),
+            ("hc_streams", self.hc_streams.to_string()),
+            ("hc_sinkhorn_iters", self.hc_sinkhorn_iters.to_string()),
+            ("hc_eps", format!("{:?}", self.hc_eps)),
+            ("mla_heads", self.mla_heads.to_string()),
+            ("q_lora", self.q_lora.to_string()),
+            ("kv_lora", self.kv_lora.to_string()),
+            ("nope_dim", self.nope_dim.to_string()),
+            ("v_dim", self.v_dim.to_string()),
+            ("index_heads", self.index_heads.to_string()),
+            ("index_head_dim", self.index_head_dim.to_string()),
+            ("index_kpool", self.index_kpool.to_string()),
+            ("index_topk", self.index_topk.to_string()),
+            ("kda_heads", self.kda_heads.to_string()),
+            ("kda_head_dim", self.kda_head_dim.to_string()),
+            ("kda_conv", self.kda_conv.to_string()),
+            ("kda_lower_bound", format!("{:?}", self.kda_lower_bound)),
+            ("dense_prefix", self.dense_prefix.to_string()),
+            ("dense_inter", self.dense_inter.to_string()),
+            ("experts", self.experts.to_string()),
+            ("topk", self.topk.to_string()),
+            ("shared_experts", self.shared_experts.to_string()),
+            ("expert_inter", self.expert_inter.to_string()),
+            ("routed_scaling", format!("{:?}", self.routed_scaling)),
+            ("swiglu_limit", format!("{:?}", self.swiglu_limit)),
+            ("rms_eps", format!("{:?}", self.rms_eps)),
+            ("vocab", self.vocab.to_string()),
+            ("tie_word_embeddings", self.tie_word_embeddings.to_string()),
+            ("context_max", self.context_max.to_string()),
+            ("context_floor", self.context_floor.to_string()),
+            ("eos_ids", format!("{:?}", self.eos_ids)),
+            ("mtp_layers", self.mtp_layers.to_string()),
+            ("vision_out_hidden", format!("{:?}", self.vision_out_hidden)),
+        ]
+    }
+}
 
 /// how much of the card a model's plan may fill, and how its cold staging is sized
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -489,10 +702,11 @@ impl Stability {
         decode_stage_rows: Some(GLM5_NEXT_DECODE_STAGE_ROWS),
     };
 
-    /// the policy of an engine family; both are `OF_RECORD`
+    /// the policy of a family: Flash-Next and the 27B `OF_RECORD`, glm5_next `GLM5_NEXT` (#159)
     pub fn of(family: Family) -> Stability {
         match family {
             Family::FlashNext | Family::Qwen35Dense => Stability::OF_RECORD,
+            Family::Glm5Next => Stability::GLM5_NEXT,
         }
     }
     /// the policy of a `text_config.model_type` (the GLM arm reads it before it has a `Family`)
@@ -1376,5 +1590,46 @@ mod tests_176 {
         for pf_tg in [8, 32, 512] {
             assert_eq!(Stability::for_model_type(GLM5_NEXT_MODEL_TYPE).stage_slots(GLM_TOPK, pf_tg, false).held(), 32);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_159 {
+    use super::*;
+
+    /// #159: the family row derives the container's bytes and the recipe's cache sizes
+    /// (docs/glm5-next-recipe.md section 13) from the config numbers alone
+    #[test]
+    fn the_glm_family_row_derives_the_container_bytes_and_the_cache_sizes() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        assert_eq!(g.expert_values(), 25_165_824);
+        assert_eq!(g.expert_block_bytes(), GLM5_NEXT_EXPERT_BLOCK_BYTES);
+        assert_eq!(GLM5_NEXT_EXPERT_BLOCK_BYTES % 4096, 0, "a block sits on a 4096-B boundary");
+        assert_eq!((g.moe_layers() * g.experts) as u64, GLM5_NEXT_EXPERT_BLOCKS);
+        assert_eq!((g.dsa_layers + g.kda_layers, g.dsa_layers), (g.layers, (0..g.layers).filter(|l| g.is_dsa(*l)).count()));
+        assert_eq!(g.sel_max(), QSA_SEL_MAX, "512 pools + 3 tail = 2051");
+        assert_eq!((g.latent_bytes_per_token(), g.indexer_bytes_per_token()), (1_024, 514));
+        assert_eq!((g.kda_state_bytes(), g.kda_conv_bytes()), (4 << 20, 294_912));
+        assert_eq!(g.context_floor, CONTEXT_FLOOR);
+        // the dry run's container: dense part + every expert block + the rest (derived, not asserted to a tensor)
+        assert!(GLM5_NEXT_DENSE_BYTES + GLM5_NEXT_EXPERT_BLOCKS * GLM5_NEXT_EXPERT_BLOCK_BYTES < GLM5_NEXT_CONTAINER_BYTES);
+        assert_eq!(g.rows().len(), 37, "one row per Glm5Geo field");
+    }
+
+    /// #159: the family's identity and its hooks: model type, slot code 3, BF16 latent by
+    /// default, the #176 stability policy, the #175 expert cache's family string; the
+    /// families the engine runs stay the two of record
+    #[test]
+    fn glm5_next_is_a_known_family_with_its_own_policy() {
+        let f = Family::Glm5Next;
+        assert_eq!(f.model_type(), "glm5_next_text");
+        assert_eq!((f.code(), Family::from_code(3)), (3, Some(f)));
+        assert_eq!(f.default_kv(), KvDtype::Bf16);
+        assert_eq!(Stability::of(f), Stability::GLM5_NEXT);
+        assert_eq!(Stability::of(f), Stability::for_model_type(f.model_type()));
+        assert_eq!(format!("{f:?}"), crate::expert_cache::GLM5_NEXT_FAMILY);
+        assert_eq!(crate::expert_cache::policy_for(&format!("{f:?}"), None, false), Ok(Some(crate::expert_cache::Policy::Lru)));
+        assert_eq!(Family::ALL, [Family::FlashNext, Family::Qwen35Dense]);
+        assert_eq!(Family::KNOWN, [Family::FlashNext, Family::Qwen35Dense, Family::Glm5Next]);
     }
 }

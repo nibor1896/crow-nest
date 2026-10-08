@@ -6,6 +6,14 @@
 //!   * refusal of configurations below the 200k context floor.
 //! State allocations are REAL; expert/dense sizes come from the container
 //! index (the decode binary does the full measured load).
+//!
+//! #159: `states --plan [--vram-mib N]` is the dry plan of a glm5_next checkpoint: it reads
+//! the checkpoint's config.json + generation_config.json (`CROW_MODEL_DIR`, else
+//! `models/GLM-5.3-Flash-original`), runs them through the metadata gate's glm5_next arm and
+//! prints the three-tier plan (`manager::glm5_plan_table`). No CUDA context, no container
+//! mapping, no allocation: the card is `--vram-mib` (default the RTX 5090's 32,607 MiB), the
+//! pinned budget `CROW_PINNED_BUDGET_GB` or `HOST_PINNED_CAP`, the context `CROW_CONTEXT` or
+//! the family floor, the dense part and the expert block the converter dry run's.
 
 use crow_nest_engine::cuda;
 use crow_nest_engine::cnq::Cnq;
@@ -39,7 +47,64 @@ fn plan_table(geo: &Geo, context: usize, kv: KvDtype, expert_per_unit: u64, dens
     println!("TOTAL         {:>10.2} GiB  of 32.00 GiB VRAM", total as f64 / GIB);
 }
 
+/// the RTX 5090 of record (`docs/system-landscape.md:12`): 32,607 MiB
+const CARD_MIB_OF_RECORD: u64 = 32_607;
+
+/// #159: the dry glm5_next plan; exits 1 with the refusal on any gate or planner refusal
+fn plan_only(args: &[String]) {
+    use crow_nest_engine::manager::{glm5_plan_table, plan_glm5_next};
+    use crow_nest_engine::meta::ModelMeta;
+    let fail = |why: String| -> ! {
+        eprintln!("states --plan: {why}");
+        std::process::exit(1)
+    };
+    let vram_mib = match args.iter().position(|a| a == "--vram-mib") {
+        Some(i) => args.get(i + 1).and_then(|v| v.parse::<u64>().ok()).unwrap_or_else(|| fail("--vram-mib needs a whole number of MiB".into())),
+        None => CARD_MIB_OF_RECORD,
+    };
+    let dir = std::env::var("CROW_MODEL_DIR").unwrap_or_else(|_| from_engine_dir("models/GLM-5.3-Flash-original"));
+    let config = format!("{dir}/config.json");
+    let generation = format!("{dir}/generation_config.json");
+    let generation = std::path::Path::new(&generation).is_file().then_some(generation);
+    let meta = ModelMeta::from_config_files(&config, generation.as_deref()).unwrap_or_else(|why| fail(why));
+    if meta.family != Family::Glm5Next {
+        fail(format!("{config}: family {:?}; --plan is the glm5_next dry plan (#159), `states` without it measures the families that run", meta.family));
+    }
+    let bad: Vec<String> = meta.verify().iter().map(|c| format!("  {}", c.line())).collect();
+    if !bad.is_empty() {
+        fail(format!("{} of {} constants differ from the glm5_next family row:
+{}", bad.len(), meta.checks().len(), bad.join("
+")));
+    }
+    let g = meta.glm5_geo().unwrap_or_else(|why| fail(why));
+    let context = crow_nest_engine::boot::context_from_env(std::env::var("CROW_CONTEXT").ok().as_deref(), g.context_floor, g.context_max)
+        .unwrap_or_else(|why| fail(why));
+    let (pinned, pinned_src) = match env_parse::<u64>("CROW_PINNED_BUDGET_GB") {
+        Some(gb) => (gb << 30, "CROW_PINNED_BUDGET_GB".to_string()),
+        None => (HOST_PINNED_CAP, "HOST_PINNED_CAP; the boot takes min(cap, free RAM - CROW_RAM_MARGIN_GB 1 GiB), free RAM not read here".to_string()),
+    };
+    let (states, input, plan) = plan_glm5_next(
+        &g, context, vram_mib << 20, pinned, GLM5_NEXT_DENSE_BYTES, GLM5_NEXT_EXPERT_BLOCK_BYTES,
+        crow_nest_engine::gen::pf_tg(), crow_nest_engine::gen::pf_async_on(),
+    )
+    .unwrap_or_else(|why| fail(why));
+    println!("states --plan: {config} ({} constants verified against {GLM5_NEXT_SOURCE}); no CUDA, no container read", meta.checks().len());
+    let sources = [
+        ("dense", "converter dry run, GLM measurement book".to_string()),
+        ("expert", format!("converter dry run; config derives {} B", g.expert_block_bytes())),
+        ("vram", if vram_mib == CARD_MIB_OF_RECORD { "RTX 5090 of record, docs/system-landscape.md:12; not free VRAM".to_string() } else { "--vram-mib".to_string() }),
+        ("pinned", pinned_src),
+    ];
+    println!("{}", glm5_plan_table(&g, &states, &input, &plan, &sources));
+}
+
 fn main() {
+    // #159: the dry plan touches no GPU and no container, so it runs before the log and CUDA
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--plan") {
+        plan_only(&args);
+        return;
+    }
     // #13: the logging subscriber of this process. Every library line this bin
     // triggers (`[prefill]`, `[load]`, `[budget]`, `[ple]`, ...) is a `tracing`
     // event now, so without this call they go nowhere. The guard drains the two
