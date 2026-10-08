@@ -88,6 +88,7 @@ mod fp8;
 mod imatrix;
 mod dequant;
 mod layer_rule_overlay;
+mod mul1;
 mod partial;
 mod recipe;
 mod requant_check;

@@ -1,0 +1,4 @@
+# matrix	trellis shape	trellis bytes	suh bytes	svh bytes   (exllamav3 1.6.0 quantize_exl3, mul1, K = 3, identity Hessian, NVIDIA GeForce RTX 5090)
+gate	[256, 128, 48]	3145728	8192	4096
+up	[256, 128, 48]	3145728	8192	4096
+down	[128, 256, 48]	3145728	4096	8192
