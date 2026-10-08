@@ -314,27 +314,45 @@ same top-8), DSA selection identical on 90 / 90 rows. The engine side of G3 need
 ## 8. Step 8: the routing passes (crow-nest #147)
 
 `tools/glm_route_passes.py` runs the five corpus files of PREREG amendment 1 one after another
-through this runner on the full container. Each pass covers 32,768 tokens; the files hold exactly
-the routed prefix. It writes the routing dumps that `tools/glm_tier_sim.py sim` reads.
+through this runner, on the full container or (#179) on the FP8 originals. Each pass covers 32,768
+tokens; the files hold exactly the routed prefix. It writes the routing dumps that
+`tools/glm_tier_sim.py sim` reads. Since 2026-10-08 the passes of record for G1d run on the FP8
+originals (`runs/glm53-flash/PREREG-dyn.md`, amendment 1): the 4.5-bit container was deleted.
 
 ```
+# FP8 originals (#179), after tools/fetch-glm.py has verified all 62 shards
+.venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py --fp8 models/GLM-5.3-Flash-original --dry-run
+.venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py --fp8 models/GLM-5.3-Flash-original
+# the container
 .venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py --dry-run   # checks + the five commands, runs nothing
 .venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py             # the passes
 ```
 
-Defaults: `--container converter/GLM-5.3-Flash-CNQ4.5.cnq`, `--corpus decode_out/glm-step8/corpus`,
-`--runs decode_out/glm-step8/runs`, `--prompt-chunk 512`, and `ORACLE_THREADS` from the environment
-(16 if unset). `--only <name>,...` limits the run to some files.
+Defaults: `--container converter/GLM-5.3-Flash-CNQ4.5.cnq` (when `--fp8` is not given; the two are
+mutually exclusive), `--corpus decode_out/glm-step8/corpus`, `--runs decode_out/glm-step8/runs`,
+`--prompt-chunk 512`, and `ORACLE_THREADS` from the environment (16 if unset). `--only <name>,...`
+limits the run to some files.
 
 **Before anything runs** (exit 2 with the reason):
 - **Container complete.** No `<cnq>.journal.jsonl` lies beside it; the converter deletes its journal
   only after writing the index trailer (`converter/src/main.rs:2042-2046`). The file has the CNQ1
   magic and an index trailer that parses: index v2, recipe `cnq4.5-glm5-next`, not partial, source
   rev `eb9eb208`. Every layer 0..L−1, `embed_tokens`, `norm` and `lm_head` are in the index.
+- **Or FP8 originals verified** (`--fp8`). `tools/fetch-glm.py`'s record `hf-revision.json` is that of
+  rev `eb9eb208` and lists 62 shards. `config.json`, `model.safetensors.index.json` and all 62 shards
+  each have a `.verified` marker equal to that record (size and sha256, fetch-glm.py's own
+  `is_verified`) and of that revision. The index and config still have their markers' sha256. The
+  refusal names the first files that fail. The shards are only stat'ed, never read or hashed here.
 - **Corpus matches amendment 1.** `corpus.json` and each file's ids and mask have the amendment's
   sha256 (the table is pinned in the tool; the tests check it against `PREREG.md`). Each ids file
   holds 32,768 ids.
-- **Run dirs.** No run dir may hold another container's or another file's run.
+- **Run dirs.** No run dir may hold another file's run, or a run of other weights: another identity in
+  its `weights.json`, another index sha256 in its manifest, or another weights kind (`cnq` / `fp8`).
+
+**Weights identity** (#179). Before the runner starts, each pass dir gets `weights.json`: kind,
+revision, sha256 of the index (and, for FP8, of `config.json` and of each of the 62 verified shards),
+and `identity_sha256`, the sha256 of that record. Each `passes.jsonl` row carries
+`weights_identity_sha256` and `revision`.
 
 **Per file**, in the amendment's order (held-out first), the amendment's command plus the two new
 options:
@@ -344,11 +362,16 @@ oracle/glm5_layerwise.py run --weights container <cnq> --ids <corpus>/<name>-ids
     --state-dtype bf16 --prompt-chunk 512 --delete-states-behind --out <runs>/<name>
 ```
 
+With `--fp8 <dir>` the same command reads `--weights fp8-originals <dir>`.
+
 - **Resumable per file.** A pass complete over every layer is skipped. An interrupted pass continues
   with `--layers k+1:` from the last recorded state `l<k>-output.bf16`. A pass with no state to
   continue from starts again at layer 0.
 - **Checked after each pass** with the sim's own self-test (routing sha256 against the manifest,
-  `[N][8]`, ids 0..287 ascending) and its source check (CNQ, not partial, complete).
+  `[N][8]`, ids 0..287 ascending) and the source check: for the container the sim's (CNQ, not
+  partial, complete); for `--fp8` the manifest's weights are `fp8` and the pass is complete. The sim
+  itself still calls FP8 routing "plausibility only" (`tools/glm_tier_sim.py:133`); for G1d,
+  PREREG-dyn amendment 1 replaces that one reason.
 - **Logged.** The runner's output goes to `<runs>/<name>/runner.log`. One JSON line per pass, failed
   passes included, goes to `<runs>/passes.jsonl`: start, wall seconds, rc, the layer it resumed from,
   load and compute seconds, peak working set, commit, threads. That line is the measurement-book row.
@@ -375,3 +398,10 @@ Amendment 1 derived 1.4 h; the difference is KDA's chunk form, which is slower p
 28 GiB of f32 weights for a MoE layer, 2 + 2 GiB of f32 state in and out, 4 GiB of K/V allocated once,
 and up to about 12 GiB in the last 512-row attention call. HF's cache would also have needed a second
 4 GiB copy at each `torch.cat`; the in-place slot removes it. Run no other heavy job beside a pass.
+
+**On the FP8 originals (derived, not measured):** the load row becomes about 334 s (42 MoE layers at
+7.8 s, the FP8 layer-3 load of step 6, one measurement, plus 3 dense layers at the container's 2.0 s,
+because step 6 did not split out an FP8 dense load). That gives about 4,650 s (≈ 1.3 h) per pass and
+≈ 6.5 h for five. RAM stays about 48 GiB of 63.38. The layer is the same f32 tensors (step 6 RSS after
+the layer-3 load: 28.13 GiB FP8, 28.00 GiB container). The FP8 source opens a shard per tensor and
+closes it again (`oracle/glm5_common.py:207-210`), so no mapped shard pages stay in the working set.
