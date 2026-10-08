@@ -22,6 +22,19 @@
 //!   mode 2 with 1 MiB staged H2D before the done flag, 300 reps
 //!   baseline: empty-kernel launch+sync per rep for context.
 //!
+//! Stage C (crow-nest #149, plan step 17a, 2026-10-08): `cuStreamWaitValue64_v2` inside a CUDA
+//! graph under WDDM. Two builds of the same wait, each instantiated and replayed:
+//!   C1 stream capture: begin capture, `cuStreamWaitValue64_v2` (EQ 1 on a device flag), the
+//!      consumer kernel, end capture; the graph's node types are printed and the wait must be
+//!      a BATCH_MEM_OP node (type 12);
+//!   C2 explicit node: `cuGraphAddBatchMemOpNode` with one WAIT_VALUE_64 op, the consumer
+//!      launched behind the graph on the same stream.
+//! Per build: a hold check (graph launched with the flag at 0, 20 ms later `cuStreamQuery` must
+//! say NOT_READY, i.e. the replayed wait really holds the stream), then 1000 replays, each:
+//! params H2D, graph launch, host raises the flag (8 B H2D on the copy stream), sync; the
+//! consumer resets the flag in-graph. Every result is checked; p50/p95/p99 per replay printed.
+//! A wait that never releases is reported after 5 s and the probe exits 1.
+//!
 //! Scalars travel in device buffers (p5 lesson); HtoD async + sync (WDDM rule).
 
 use std::ffi::CString;
@@ -49,6 +62,63 @@ fn load_memops() -> Memops {
     Memops { write32, wait32 }
 }
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+
+// stage C: the graph entry points, loaded out of the driver DLL the same way the engine does
+// (`engine/src/cuda.rs` graph_sym: cudarc's bindings were not usable for them there)
+type FnBeginCapture = unsafe extern "system" fn(sys::CUstream, sys::CUstreamCaptureMode) -> CUresult;
+type FnEndCapture = unsafe extern "system" fn(sys::CUstream, *mut sys::CUgraph) -> CUresult;
+type FnGraphCreate = unsafe extern "system" fn(*mut sys::CUgraph, u32) -> CUresult;
+type FnGraphGetNodes = unsafe extern "system" fn(sys::CUgraph, *mut sys::CUgraphNode, *mut usize) -> CUresult;
+type FnNodeGetType = unsafe extern "system" fn(sys::CUgraphNode, *mut u32) -> CUresult;
+type FnAddBatchMemOp = unsafe extern "system" fn(
+    *mut sys::CUgraphNode,
+    sys::CUgraph,
+    *const sys::CUgraphNode,
+    usize,
+    *const sys::CUDA_BATCH_MEM_OP_NODE_PARAMS,
+) -> CUresult;
+type FnInstantiate = unsafe extern "system" fn(*mut sys::CUgraphExec, sys::CUgraph, u64) -> CUresult;
+type FnGraphLaunch = unsafe extern "system" fn(sys::CUgraphExec, sys::CUstream) -> CUresult;
+type FnGraphDestroy = unsafe extern "system" fn(sys::CUgraph) -> CUresult;
+type FnExecDestroy = unsafe extern "system" fn(sys::CUgraphExec) -> CUresult;
+
+struct GraphApi {
+    begin_capture: FnBeginCapture,
+    end_capture: FnEndCapture,
+    create: FnGraphCreate,
+    get_nodes: FnGraphGetNodes,
+    node_type: FnNodeGetType,
+    add_batch_memop: FnAddBatchMemOp,
+    instantiate: FnInstantiate,
+    launch: FnGraphLaunch,
+    destroy: FnGraphDestroy,
+    exec_destroy: FnExecDestroy,
+}
+
+fn load_graph_api() -> GraphApi {
+    let lib = Box::leak(Box::new(unsafe { libloading::Library::new("nvcuda.dll").expect("open nvcuda.dll") }));
+    unsafe fn sym<T: Copy>(lib: &libloading::Library, n: &[u8]) -> T {
+        unsafe { *lib.get::<T>(n).unwrap_or_else(|e| panic!("nvcuda.dll {}: {e}", String::from_utf8_lossy(n))) }
+    }
+    unsafe {
+        GraphApi {
+            begin_capture: sym(lib, b"cuStreamBeginCapture_v2\0"),
+            end_capture: sym(lib, b"cuStreamEndCapture\0"),
+            create: sym(lib, b"cuGraphCreate\0"),
+            get_nodes: sym(lib, b"cuGraphGetNodes\0"),
+            node_type: sym(lib, b"cuGraphNodeGetType\0"),
+            add_batch_memop: sym(lib, b"cuGraphAddBatchMemOpNode\0"),
+            instantiate: sym(lib, b"cuGraphInstantiateWithFlags\0"),
+            launch: sym(lib, b"cuGraphLaunch\0"),
+            destroy: sym(lib, b"cuGraphDestroy\0"),
+            exec_destroy: sym(lib, b"cuGraphExecDestroy\0"),
+        }
+    }
+}
+
+/// CU_GRAPH_NODE_TYPE_BATCH_MEM_OP
+const NODE_BATCH_MEM_OP: u32 = 12;
+const REPS_GRAPH: usize = 1000;
 
 const SLOTS: usize = 256;
 const DESC_U32: usize = 16; // 64 B per descriptor slot
@@ -113,6 +183,20 @@ extern "C" __global__ void consumer_memop(const float* __restrict__ payload,
     unsigned int seq = prm[4];
     if (threadIdx.x == 0) {
         result[slot] = payload[0] + (float)seq;
+    }
+}
+
+// stage C consumer: runs behind the graph's WaitValue64 node, then re-arms the flag
+// in-graph (EQ 1 -> 0), so the next replay holds again until the host raises it
+extern "C" __global__ void consumer_graph(unsigned long long* __restrict__ done_g,
+                                          const float* __restrict__ payload,
+                                          float* __restrict__ result,
+                                          const unsigned int* __restrict__ prm) {
+    if (threadIdx.x == 0) {
+        unsigned int slot = prm[0];
+        result[slot] = payload[0] + (float)prm[4];
+        *done_g = 0ull;
+        __threadfence_system();
     }
 }
 
@@ -334,6 +418,7 @@ fn main() {
         let f_consumer = get_fn("consumer_poll");
         let f_consumer_memop = get_fn("consumer_memop");
         let f_noop = get_fn("noop");
+        let f_consumer_graph = get_fn("consumer_graph");
 
         let launch1 = |f: CUfunction, args: &mut [*mut std::ffi::c_void]| {
             ck(sys::cuLaunchKernel(
@@ -609,9 +694,203 @@ fn main() {
 
         println!("p9: baseline launch+sync p50 = {:.1} µs", pct(&mut baseline, 0.50));
 
+        // ================= Stage C — WaitValue64_v2 inside a CUDA graph (crow-nest #149, step 17a) =================
+        let stage_c = if !memops64 {
+            println!("p9: stage C skipped — 64-bit _v2 memops unavailable on this device");
+            "skipped (no 64-bit memops)".to_string()
+        } else {
+            let g = load_graph_api();
+            let done_g = alloc_zeroed(8); // the stage-C flag: device u64, EQ 1 releases
+            // copies of the device addresses: the closures below hold no borrow of the stage A/B state
+            let (pd, rs, pm) = (payload_dst, result, params);
+            let graph_launch = g.launch;
+            let eq = sys::CUstreamWaitValue_flags::CU_STREAM_WAIT_VALUE_EQ as u32;
+            let raise = move |copy_stream: sys::CUstream| {
+                let one: u64 = 1;
+                ck(sys::cuMemcpyHtoDAsync_v2(done_g, &one as *const u64 as *const std::ffi::c_void, 8, copy_stream));
+                ck(sys::cuStreamSynchronize(copy_stream));
+            };
+            // sync with a deadline: a wait that never releases must not hang the probe silently
+            let sync_or_die = move |what: &str| {
+                let t0 = Instant::now();
+                loop {
+                    let q = sys::cuStreamQuery(compute);
+                    if q == CUresult::CUDA_SUCCESS {
+                        return;
+                    }
+                    if q != CUresult::CUDA_ERROR_NOT_READY {
+                        panic!("p9: stage C {what}: cuStreamQuery {q:?}");
+                    }
+                    if t0.elapsed().as_secs_f64() > 5.0 {
+                        println!("p9: stage C FAIL — {what}: the graph's wait did not release within 5 s after the flag was raised");
+                        std::process::exit(1);
+                    }
+                    std::hint::spin_loop();
+                }
+            };
+            // one hold check + REPS_GRAPH replays of an instantiated graph; `tail_consumer` launches
+            // the consumer behind the graph (C2: the graph holds the wait node only)
+            let replay = move |label: &str, exec: sys::CUgraphExec, tail_consumer: bool| -> bool {
+                let launch_one = |seq: u32| {
+                    job_params(pm, compute, 0, 0, 1, 1, seq);
+                    ck(graph_launch(exec, compute));
+                    if tail_consumer {
+                        let mut a = [done_g, pd, rs, pm];
+                        launch1s(f_consumer_graph, compute, &mut [
+                            &mut a[0] as *mut _ as *mut _,
+                            &mut a[1] as *mut _ as *mut _,
+                            &mut a[2] as *mut _ as *mut _,
+                            &mut a[3] as *mut _ as *mut _,
+                        ]);
+                    }
+                };
+                let check = |seq: u32, what: &str| {
+                    let mut rv = 0f32;
+                    ck(sys::cuMemcpyDtoH_v2(&mut rv as *mut f32 as *mut std::ffi::c_void, rs, 4));
+                    assert_eq!(rv, seq as f32, "p9: stage C {label} {what}: consumer result wrong");
+                };
+                // hold check: flag at 0, the stream must still be blocked 20 ms after the launch
+                launch_one(1);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let q = sys::cuStreamQuery(compute);
+                let held = q == CUresult::CUDA_ERROR_NOT_READY;
+                println!(
+                    "p9:   {label}: hold check — cuStreamQuery 20 ms after launch, flag 0: {q:?} ({})",
+                    if held { "the replayed wait holds the stream" } else { "NOT held: the wait node did not block" }
+                );
+                raise(copy_stream);
+                sync_or_die(&format!("{label} hold check"));
+                check(1, "hold check");
+                let mut lat = Vec::with_capacity(REPS_GRAPH);
+                for r in 0..REPS_GRAPH {
+                    let seq = (r + 2) as u32;
+                    let t0 = Instant::now();
+                    launch_one(seq);
+                    raise(copy_stream);
+                    sync_or_die(&format!("{label} replay {r}"));
+                    lat.push(t0.elapsed().as_secs_f64() * 1e6);
+                    check(seq, &format!("replay {r}"));
+                }
+                println!(
+                    "p9:   {label}: {REPS_GRAPH} replays, results verified  p50={:8.1} µs  p95={:8.1} µs  p99={:8.1} µs  max={:8.1} µs",
+                    pct(&mut lat, 0.50),
+                    pct(&mut lat, 0.95),
+                    pct(&mut lat, 0.99),
+                    lat.last().unwrap()
+                );
+                held
+            };
+
+            println!("p9: stage C — cuStreamWaitValue64_v2 inside a CUDA graph (WDDM), hold check + {REPS_GRAPH} replays per build");
+            // ---- C1: stream capture ----
+            let c1;
+            let r_begin = (g.begin_capture)(compute, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+            if r_begin != CUresult::CUDA_SUCCESS {
+                c1 = format!("cuStreamBeginCapture_v2 {r_begin:?}");
+            } else {
+                let r_wait = sys::cuStreamWaitValue64_v2(compute, done_g, 1, eq);
+                let mut a = [done_g, pd, rs, pm];
+                let mut kargs: [*mut std::ffi::c_void; 4] = [
+                    &mut a[0] as *mut _ as *mut std::ffi::c_void,
+                    &mut a[1] as *mut _ as *mut std::ffi::c_void,
+                    &mut a[2] as *mut _ as *mut std::ffi::c_void,
+                    &mut a[3] as *mut _ as *mut std::ffi::c_void,
+                ];
+                let r_kernel = sys::cuLaunchKernel(
+                    f_consumer_graph,
+                    1,
+                    1,
+                    1,
+                    32,
+                    1,
+                    1,
+                    0,
+                    compute,
+                    kargs.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                );
+                let mut graph: sys::CUgraph = std::ptr::null_mut();
+                let r_end = (g.end_capture)(compute, &mut graph); // always end, also after a failed op
+                println!("p9:   C1 capture: begin {r_begin:?}, WaitValue64_v2 {r_wait:?}, consumer {r_kernel:?}, end {r_end:?}");
+                if r_wait == CUresult::CUDA_SUCCESS && r_kernel == CUresult::CUDA_SUCCESS && r_end == CUresult::CUDA_SUCCESS {
+                    let mut n = 0usize;
+                    ck((g.get_nodes)(graph, std::ptr::null_mut(), &mut n));
+                    let mut nodes: Vec<sys::CUgraphNode> = vec![std::ptr::null_mut(); n];
+                    ck((g.get_nodes)(graph, nodes.as_mut_ptr(), &mut n));
+                    let types: Vec<u32> = nodes
+                        .iter()
+                        .map(|&nd| {
+                            let mut t = u32::MAX;
+                            ck((g.node_type)(nd, &mut t));
+                            t
+                        })
+                        .collect();
+                    let memop_node = types.contains(&NODE_BATCH_MEM_OP);
+                    println!(
+                        "p9:   C1 graph: {n} nodes, types {types:?} (12 = BATCH_MEM_OP, 0 = KERNEL) — wait captured as a batch mem-op node: {}",
+                        if memop_node { "YES" } else { "NO" }
+                    );
+                    let mut exec: sys::CUgraphExec = std::ptr::null_mut();
+                    let r_inst = (g.instantiate)(&mut exec, graph, 0);
+                    println!("p9:   C1 instantiate: {r_inst:?}");
+                    if r_inst == CUresult::CUDA_SUCCESS {
+                        let held = replay("C1 captured", exec, false);
+                        c1 = format!(
+                            "captured {} node, instantiated, hold {}, {REPS_GRAPH} replays verified",
+                            if memop_node { "as BATCH_MEM_OP" } else { "WITHOUT a BATCH_MEM_OP" },
+                            if held { "yes" } else { "NO" }
+                        );
+                        ck((g.exec_destroy)(exec));
+                    } else {
+                        c1 = format!("captured, instantiate {r_inst:?}");
+                    }
+                } else {
+                    c1 = format!("capture failed (wait {r_wait:?}, consumer {r_kernel:?}, end {r_end:?})");
+                }
+                if !graph.is_null() {
+                    let _ = (g.destroy)(graph);
+                }
+            }
+            // ---- C2: explicit batch mem-op node ----
+            let c2 = {
+                let mut op: sys::CUstreamBatchMemOpParams = std::mem::zeroed();
+                op.waitValue.operation = sys::CUstreamBatchMemOpType::CU_STREAM_MEM_OP_WAIT_VALUE_64;
+                op.waitValue.address = done_g;
+                op.waitValue.__bindgen_anon_1.value64 = 1;
+                op.waitValue.flags = eq;
+                let prm = sys::CUDA_BATCH_MEM_OP_NODE_PARAMS { ctx, count: 1, paramArray: &mut op, flags: 0 };
+                let mut graph: sys::CUgraph = std::ptr::null_mut();
+                ck((g.create)(&mut graph, 0));
+                let mut node: sys::CUgraphNode = std::ptr::null_mut();
+                let r_add = (g.add_batch_memop)(&mut node, graph, std::ptr::null(), 0, &prm);
+                println!("p9:   C2 cuGraphAddBatchMemOpNode (WAIT_VALUE_64, EQ 1): {r_add:?}");
+                let out = if r_add != CUresult::CUDA_SUCCESS {
+                    format!("cuGraphAddBatchMemOpNode {r_add:?}")
+                } else {
+                    let mut exec: sys::CUgraphExec = std::ptr::null_mut();
+                    let r_inst = (g.instantiate)(&mut exec, graph, 0);
+                    println!("p9:   C2 instantiate: {r_inst:?}");
+                    if r_inst == CUresult::CUDA_SUCCESS {
+                        let held = replay("C2 explicit", exec, true);
+                        ck((g.exec_destroy)(exec));
+                        format!("instantiated, hold {}, {REPS_GRAPH} replays verified", if held { "yes" } else { "NO" })
+                    } else {
+                        format!("instantiate {r_inst:?}")
+                    }
+                };
+                let _ = (g.destroy)(graph);
+                out
+            };
+            ck(sys::cuMemFree_v2(done_g));
+            let line = format!("C1 stream capture: {c1}; C2 explicit node: {c2}");
+            println!("p9: stage C — {line}");
+            line
+        };
+
         println!(
             "p9: reference points — swapped barrier 4–6 ms (#186); WDDM ring round trips 3.1–3.4 ms/layer (measured 2026-09-01, retired variant A)"
         );
         println!("p9: PASS — job ring + stream memops verified end to end on Windows (stage A mechanics + stage B timing)");
+        println!("p9: stage C (WaitValue64_v2 in a CUDA graph) — {stage_c}");
     }
 }

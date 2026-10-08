@@ -374,6 +374,20 @@ units, about 12 hot experts per layer), and the post-plan check below requires
 > **Status: not built in the engine. Only `probes/src/bin/p9_job_ring.rs` (#7) exists; the decode path
 > uses zero-copy/`CROW_STAGE` staging and the residency counters are drained by the host between
 > tokens (`residency.rs`). The text below is the approved design (2026-09-02), kept as design.**
+>
+> **Built since (#149, plan step 17b, 2026-10-08): the stager's source interface and its NVMe backend,
+> opt-in and wired nowhere.** `engine/src/nvme_source.rs` holds the `ColdSource` trait (`fetch` at most 8
+> expert records of one layer into caller-provided destinations, `wait`) and `NvmeSource`. One container
+> handle per reader thread (1.01× shared vs 2.22× per thread, llama.cpp fork `66f40bc`); on Windows
+> `FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED` with one I/O completion port per reader, every read of a
+> fetch issued before the first completion is drained; on Linux `O_DIRECT` + `pread`. Offsets, lengths and
+> destinations must be multiples of 4096 B and are refused by name otherwise (no rounding out: an expert
+> slab at the format's default 12 mod 4096 is refused). `residency::sanitize_sf_slab` runs on both slabs in
+> the destination before `wait` returns. Reader count (default 1, PREREG amendment 5) and per-reader CPU
+> affinity are `NvmeConfig` fields. Boot refuses `CROW_COLD_TIER` together with `CROW_NVME_TIER`. The RAM
+> tier is not behind the trait yet, no decode path calls the backend, and IoRing is not built. The
+> in-graph hand-off it needs is probe `p9_job_ring` stage C (`cuStreamWaitValue64_v2` captured as a
+> batch mem-op node, built 2026-10-08, not run yet).
 
 - GPU publishes cold jobs (expert IDs per layer) into the pinned job ring via
   `cuStreamWriteValue32`; the stager gathers weights (RAM tier) into pinned staging
