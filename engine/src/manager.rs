@@ -1590,3 +1590,73 @@ mod tests_ram_margin {
         }
     }
 }
+
+#[cfg(test)]
+mod tests_159_record_plan {
+    //! #159: the plan of Flash-Next and the 27B, rendered as text and pinned. The text was
+    //! captured at 0c90901 (before the glm5_next family existed) with exactly this test body;
+    //! the family, its planner and its Stability wiring must leave every number unchanged.
+    use super::*;
+
+    /// one hot-set unit of Flash-Next: 48 layers x 2,764,800 B per expert (tests_110)
+    const UNIT: u64 = 48 * 2_764_800;
+
+    fn render(geo: &Geo) -> String {
+        let mut out = format!("family {:?} code {}\n", geo.family, geo.family.code());
+        for context in [geo.context_floor, 262_144] {
+            for kv in [KvDtype::Fp8E4m3, KvDtype::Bf16, KvDtype::Q8Block] {
+                for chunk in [512, 4096] {
+                    let s = StateSizes::plan(geo, context, kv, chunk);
+                    out += &format!(
+                        "ctx {context} {} chunk {chunk}: kv {} qsa_keys {} ring {} pooled {} gdn_s {} gdn_conv {} rope {} total {}\n",
+                        kv.name(), s.kv_bytes, s.qsa_keys_bytes, s.qsa_ring_rows, s.qsa_pooled_bytes,
+                        s.gdn_s_bytes, s.gdn_conv_bytes, s.rope_bytes, s.total()
+                    );
+                }
+            }
+        }
+        let card = 32_607u64 << 20;
+        let st = Stability::of(geo.family);
+        let slots = st.stage_slots(geo.dims().topk, 64, true);
+        out += &format!(
+            "stability {:?} ceiling {} reserve {} slots {:?} held {} pending {}\n",
+            st, st.vram_ceiling(card), st.planner_reserve(card), slots, slots.held(),
+            planner_pending(128 << 20, 0, 0, 0)
+        );
+        let states = StateSizes::plan(geo, geo.context_floor, geo.family.default_kv(), 2048).total();
+        match geo.ffn {
+            Ffn::Moe { experts, .. } => {
+                for (free0, budget) in [(30u64 << 30, 46u64 << 30), (31 << 30, 40 << 30), (28 << 30, 46 << 30)] {
+                    let c = ClampInput {
+                        n_hot: 160,
+                        experts,
+                        states_bytes: states,
+                        pending_bytes: planner_pending(128 << 20, 0, 0, 0),
+                        expert_bytes_per_n_unit: UNIT,
+                        cold_bytes_per_n_unit: UNIT,
+                        cold_fixed: false,
+                        spare: 7,
+                        free0,
+                        host_pinned_budget: budget,
+                    };
+                    out += &format!("clamp free0 {free0} budget {budget}: {:?}\n", clamp_hot_n(&c).map(|(n, _)| n));
+                }
+            }
+            Ffn::Dense { .. } => {
+                for free0 in [20u64 << 30, 30 << 30] {
+                    out += &format!("dense_fit free0 {free0}: {:?}\n", dense_fit(free0, states, 128 << 20, 0, geo.context_floor).map(|(g, _)| g));
+                }
+            }
+        }
+        out
+    }
+
+    const FLASH_NEXT_PLAN: &str = "family FlashNext code 1\nctx 200000 fp8_e4m3 chunk 512: kv 2457600000 qsa_keys 3170304 ring 516 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 2936840192\nctx 200000 fp8_e4m3 chunk 4096: kv 2457600000 qsa_keys 25190400 ring 4100 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 2958860288\nctx 200000 bf16 chunk 512: kv 4915200000 qsa_keys 3170304 ring 516 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 5394440192\nctx 200000 bf16 chunk 4096: kv 4915200000 qsa_keys 25190400 ring 4100 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 5416460288\nctx 200000 q8 chunk 512: kv 2611200000 qsa_keys 3170304 ring 516 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 3090440192\nctx 200000 q8 chunk 4096: kv 2611200000 qsa_keys 25190400 ring 4100 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 3112460288\nctx 262144 fp8_e4m3 chunk 512: kv 3221225472 qsa_keys 3170304 ring 516 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 3811827712\nctx 262144 fp8_e4m3 chunk 4096: kv 3221225472 qsa_keys 25190400 ring 4100 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 3833847808\nctx 262144 bf16 chunk 512: kv 6442450944 qsa_keys 3170304 ring 516 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 7033053184\nctx 262144 bf16 chunk 4096: kv 6442450944 qsa_keys 25190400 ring 4100 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 7055073280\nctx 262144 q8 chunk 512: kv 3422552064 qsa_keys 3170304 ring 516 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 4013154304\nctx 262144 q8 chunk 4096: kv 3422552064 qsa_keys 25190400 ring 4100 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 4035174400\nstability Stability { vram_headroom: 0, vram_cap: None, decode_stage_rows: None } ceiling 34190917632 reserve 0 slots StageSlots { decode: 20, prefill: 128, shared: true } held 128 pending 134217728\nclamp free0 32212254720 budget 49392123904: Ok(160)\nclamp free0 33285996544 budget 42949672960: Ok(196)\nclamp free0 30064771072 budget 49392123904: Ok(160)\n";
+    const DENSE_27B_PLAN: &str = "family Qwen35Dense code 2\nctx 65536 fp8_e4m3 chunk 512: kv 2147483648 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 2321154048\nctx 65536 fp8_e4m3 chunk 4096: kv 2147483648 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 2321154048\nctx 65536 bf16 chunk 512: kv 4294967296 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 4468637696\nctx 65536 bf16 chunk 4096: kv 4294967296 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 4468637696\nctx 65536 q8 chunk 512: kv 2281701376 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 2455371776\nctx 65536 q8 chunk 4096: kv 2281701376 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 2455371776\nctx 262144 fp8_e4m3 chunk 512: kv 8589934592 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 8813936640\nctx 262144 fp8_e4m3 chunk 4096: kv 8589934592 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 8813936640\nctx 262144 bf16 chunk 512: kv 17179869184 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 17403871232\nctx 262144 bf16 chunk 4096: kv 17179869184 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 17403871232\nctx 262144 q8 chunk 512: kv 9126805504 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 9350807552\nctx 262144 q8 chunk 4096: kv 9126805504 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 9350807552\nstability Stability { vram_headroom: 0, vram_cap: None, decode_stage_rows: None } ceiling 34190917632 reserve 0 slots StageSlots { decode: 0, prefill: 128, shared: true } held 128 pending 134217728\ndense_fit free0 21474836480: Ok(0)\ndense_fit free0 32212254720: Ok(0)\n";
+
+    #[test]
+    fn flash_next_and_the_27b_plan_exactly_as_before_159() {
+        assert_eq!(render(&Geo::FLASH_NEXT), FLASH_NEXT_PLAN);
+        assert_eq!(render(&crate::meta::dense_fixture_geo()), DENSE_27B_PLAN);
+    }
+}
