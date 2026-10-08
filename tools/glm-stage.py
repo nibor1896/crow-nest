@@ -14,7 +14,7 @@ this script deletes a shard after that - and only then:
 
   1. `<shard>.done` exists and names this conversion's container (`out`),
   2. the shard is verified (`.verified` record == the HF record, file size == the record),
-  3. the conversion's journal `<out>.journal.jsonl` holds every tensor of the shard that the
+  3. the conversion's journal `<out>.cnq.journal.jsonl` holds every tensor of the shard that the
      `cnq4.5-glm5-next` recipe writes (the shard's header from `headers/<shard>.json`, minus the
      omitted vision tower and MTP layers >= `text_config.num_hidden_layers`; an FP8
      `X.weight_scale_inv` counts through its `X.weight`), inside the journal's verified prefix:
@@ -53,7 +53,7 @@ _SPEC.loader.exec_module(fg)
 STAGE_LOG = "stage.log"
 STAGE_LOCK = "stage.lock"
 JOURNAL_HEAD = "crow-nest converter"
-POLL_SEC = 30
+POLL_SEC = 10                     # pass interval; the converter writes ~37-54 MB/s (Flash-Next mse/ceil, derived)
 STATUS_SEC = 1500                 # the owner's 25-minute size check (#157)
 SCALE_SUFFIX = "_scale_inv"
 MAGIC = b"CNQ1"

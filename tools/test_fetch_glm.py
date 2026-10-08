@@ -8,7 +8,9 @@ parsing, resume decision, disk verdict, lock staleness, curl argv) are tested di
 outer download loop is tested against a fake curl that writes bytes into the `.part` file the
 way a dropping connection does - what has to hold is the contract: resume until the byte count
 equals the API size, never keep a file whose hash differs, delete an overlong file, refuse a
-shard that would leave less than 20 GB, stop on a permanent HTTP error.
+shard that would leave less than 20 GB, stop on a permanent HTTP error; with `--wait-for-space`
+park instead of refusing, kill a transfer below the floor and resume it, never fetch a shard
+with a `.deleted` marker (#157).
 
 The module is loaded by path because the tool's file name carries a hyphen.
 """
