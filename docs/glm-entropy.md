@@ -6,6 +6,9 @@ routed expert block shrink the expert bytes by at least 8 % including its code t
 plan)? `tools/glm-huff-draft/` is the decoder draft the gate also asks for. Neither changes `engine/`,
 the converter or a container. Results of record: `runs/glm53-flash/step10/README.md`.
 
+**Verdict of record (2026-10-08, 07:41 UTC, full container):** G2 failed, saving 6.688 % < 8 % incl. tables
+(order-0 entropy bound 7.522 %); option B stays unbuilt.
+
 ## 1. Commands
 
 ```
