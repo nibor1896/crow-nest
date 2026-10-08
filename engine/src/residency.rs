@@ -10,7 +10,7 @@
 //!   at all; the counters respond to exactly that (§3.3/§3.6 reporting).
 //! - No host in the decode hot loop: pointers/ids/weights never leave the GPU;
 //!   per-layer u64 counters [selections, cold] are drained by the control
-//!   plane BETWEEN tokens (the job ring's control-plane role, spec 3.4).
+//!   plane BETWEEN tokens (the control-plane role spec 3.4 gives the job ring, which is not built).
 //!
 //! The expert FFN math itself lives in gen.rs (gate_up → silu·up → down), the
 //! p5-verified chain over per-combo device pointer tables.

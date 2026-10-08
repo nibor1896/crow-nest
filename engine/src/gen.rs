@@ -1122,7 +1122,8 @@ fn stage_on() -> bool { env_flag!("CROW_STAGE", on) }
 /// CROW_STAGE_DMA (default off, measurement, #19b): the cold combos of a layer are
 /// staged by the COPY ENGINE (one cuMemcpyDtoDAsync per cold combo and matrix from the
 /// mapped host pointer, pcie_probe variant f = 55.0 GB/s) instead of the stage_cold
-/// kernel (31.5 GB/s SM-read ceiling). The routed pointers are known on the HOST only
+/// kernel (31.5 GB/s SM-read ceiling; the default stage_cold_ca reaches 51.1 to 52.4 GB/s,
+/// docs/architecture.md:1414, the pcie_probe ceilings of #19e). The routed pointers are known on the HOST only
 /// after router_top10 of that layer, so the path needs the decode graph off:
 /// graph_on() forces CROW_GRAPH off when this switch is on.
 pub fn stage_dma_on() -> bool { env_flag!("CROW_STAGE_DMA", exact1) }

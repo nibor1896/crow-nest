@@ -382,5 +382,20 @@ class TestCorpusSpans(unittest.TestCase):
         self.assertEqual(ts.clip(spans, 13), [[6, 9], [12, 13]])
 
 
+class TestStageCeilingDefault(unittest.TestCase):
+    """#167: the kernel the report calls "default" is the one engine/src/gen.rs documents as the default."""
+
+    def test_default_kernel_matches_gen_rs(self):
+        import re
+        src = (REPO / "engine" / "src" / "gen.rs").read_text(encoding="utf-8")
+        m = re.search(r"CROW_STAGE_KERNEL \(default (\d+) = (\w+)", src)
+        self.assertIsNotNone(m, "gen.rs no longer documents the CROW_STAGE_KERNEL default as 'default N = name'")
+        defaults = [lab for lab, _ in ts.STAGE_CEILINGS if lab.endswith(", default")]
+        self.assertEqual(len(defaults), 1, ts.STAGE_CEILINGS)
+        self.assertEqual(defaults[0].split(" kernel")[0], m.group(2),
+                         "STAGE_CEILINGS names a different default kernel than gen.rs (CROW_STAGE_KERNEL default %s)"
+                         % m.group(1))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

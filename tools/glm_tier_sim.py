@@ -55,7 +55,10 @@ TOKEN_BYTES = 336 * EXPERT_BYTES            # 4,756,340,736 B if every visit cam
 TOKEN_GBPS = 190.3                          # 40 tok/s x 4.7563 GB (PREREG G1)
 PREFILL_FACTOR, PREFILL_LINE = 39.9, 150.0  # PREREG G1 / G5 cold-prefill line
 SPREAD_MAX = 1.15                           # PREREG step 3
-STAGE_CEILINGS = (("stage_cold kernel, default", 31.5), ("copy engine, opt-in", 55.0))
+# Device-issued ceiling 51.6 GB/s and copy engine 54.6 GB/s: docs/architecture.md:1414. The default staging
+# kernel is stage_cold_ca (CROW_STAGE_KERNEL default 2, engine/src/gen.rs); stage_cold (31.5 GB/s) is the
+# CROW_STAGE_KERNEL=1 fallback. #167
+STAGE_CEILINGS = (("stage_cold_ca kernel, default", 51.6), ("copy engine, opt-in", 54.6))
 VRAM, PIN, NVME = 0, 1, 2
 
 

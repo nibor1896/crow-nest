@@ -56,6 +56,9 @@ is a pass/fail gate.
 - **Mean inter-token latency** is implied by the decode goal: 42 tok/s ⇔ ~23.8 ms.
 - "Minimal latency" as a design constraint is already decided and needs no number: no
   host in the hot loop, no kernel launch for synchronization (job ring, stream memops).
+  *Status (#167, 2026-10-08): the job ring and the stream memops are not built in the engine; only
+  `probes/src/bin/p9_job_ring.rs` (#7) exists. The decode path uses zero-copy/`CROW_STAGE` staging and the
+  residency counters are drained by the host between tokens (`residency.rs`).*
 
 ### 0.5 Measurement discipline (binding)
 
@@ -368,6 +371,10 @@ units, about 12 hot experts per layer), and the post-plan check below requires
 
 ### 2.3 Cold path (variant A; stager built for C from day 1)
 
+> **Status: not built in the engine. Only `probes/src/bin/p9_job_ring.rs` (#7) exists; the decode path
+> uses zero-copy/`CROW_STAGE` staging and the residency counters are drained by the host between
+> tokens (`residency.rs`). The text below is the approved design (2026-09-02), kept as design.**
+
 - GPU publishes cold jobs (expert IDs per layer) into the pinned job ring via
   `cuStreamWriteValue32`; the stager gathers weights (RAM tier) into pinned staging
   blocks and streams H2D; the GPU waits on per-job flags via `cuStreamWaitValue32`.
@@ -484,6 +491,10 @@ experts via the job ring → `shared_expert_gate` combine.
 
 ### 3.2 Job ring (the handoff)
 
+> **Status: not built in the engine. Only `probes/src/bin/p9_job_ring.rs` (#7) exists; the decode path
+> uses zero-copy/`CROW_STAGE` staging and the residency counters are drained by the host between
+> tokens (`residency.rs`). The text below is the approved design (2026-09-02), kept as design.**
+
 - Pinned host-memory ring, job descriptors 64-byte aligned (exl3 `moe_handoff.h`
   pattern): layer id, job kind, cold expert ids (≤ 10), sequence number, flag slots.
 - The **descriptor is written by device-side mapped writes** from a small GPU kernel
@@ -521,6 +532,10 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
   NVMe-tier staging (variant C), refresh, telemetry — off the decode critical path.
   Variant B (CPU compute) stays reserved; variant A (stream-weights) is retired from
   the primary path (kept behind the ring interface for tier transitions).
+  **Status (#167, 2026-10-08): the job ring and the stager are not built in the engine.** Only
+  `probes/src/bin/p9_job_ring.rs` (#7) exists; the decode path uses zero-copy/`CROW_STAGE` staging and the
+  residency counters are drained by the host between tokens (`residency.rs`). The bullet above is the
+  approved design for the control plane, not a description of the engine.
 - Policy is still per layer, chosen at load, fixed per session.
 - **Decode staging as built (`CROW_STAGE`, default on)**: after `router_top10` the
   staging kernel pulls every COLD combo of the layer into a VRAM staging slot and
@@ -5240,8 +5255,9 @@ both were already in the tree.
 
 `log.rs` is an L0 leaf with no in-crate dependency, and the one module every other module reaches
 (8.1). The 23 targets are listed in the module doc of `engine/src/log.rs`; the spec's names map to
-them as `scheduler`/`stager` → `residency` + `adapt`, `ring`/`kv` → `prefill` + `decode`,
-`loader` → `load` + `budget`, and `converter` is a separate crate with no engine log site.
+them as `scheduler` → `residency` + `adapt`, `kv` → `prefill` + `decode`, `loader` → `load` + `budget`;
+`converter` is a separate crate with no engine log site, and `ring` and `stager` have no code in this tree
+(#167: the job ring exists only as the probe `probes/src/bin/p9_job_ring.rs`).
 
 **Levels.** Everything that printed unconditionally before prints unconditionally now, so the
 default `info` is the behaviour of record. Failure lines became `warn!` / `error!` — the bind
