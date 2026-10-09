@@ -151,3 +151,51 @@ fn glm5_int_gpu_the_global_arena_serves_the_controller_and_the_prefetch() {
         assert_eq!(o.nvme_reads, outs[1].nvme_reads, "{}: NVMe reads of the global arena", a.name);
     }
 }
+
+/// Cross-wiring 1: under the NVMe piece pool (`CROW_NVME_POOL=1`) the prefetch store's reads
+/// (`Prefetch::issue`) join the pool's `Prefetch` queue, so a demand read overtakes them. One
+/// pool worker in 4 KiB pieces, a store of 8 records of 1 MiB issued first, then one 8 KiB
+/// demand read: it completes while the store's last record has not landed (the store's reads
+/// queued as `Demand` would be one FIFO with it). Without the pool the store reads as before
+/// (the per-reader backends have one FIFO each and ignore the queue).
+#[test]
+#[ignore = "needs the GPU (pinned store): cargo test --release --lib glm5_int_gpu -- --ignored --test-threads 1"]
+fn glm5_int_gpu_prefetch_reads_wait_behind_demand_in_the_piece_pool() {
+    use crate::geo::ExpertCodec;
+    use crate::nvme_source::{ColdSource, ExpertRecord, NvmeConfig, NvmeSource, PoolAsk, PoolConfig, ReadPriority, RecordDst, RecordLayout, Span};
+    const LEN: usize = 16 << 20;
+    let dir = std::env::temp_dir().join(format!("crow-int-prio-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("raw.bin");
+    let bytes: Vec<u8> = (0..LEN).map(|i| (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17) as u8).collect();
+    std::fs::write(&path, &bytes).unwrap();
+    let rec = |id: u32, off: u64, len: usize| ExpertRecord { layer: 0, id, gu: Span { off, len }, dn: Span { off: 0, len: 0 }, codec: ExpertCodec::Mul1, layout: RecordLayout::OneUnit };
+    let recs: Vec<ExpertRecord> = (0..8).map(|k| rec(k, (k as u64) << 20, 1 << 20)).collect();
+    let mut cfg = NvmeConfig::new(&path);
+    cfg.pool = PoolAsk::On(PoolConfig { threads: 1, piece: 4096 });
+    let src = NvmeSource::open(&cfg).unwrap();
+    assert_eq!(crate::glm5_flags::prefetch_priority(&src), ReadPriority::Prefetch);
+    unsafe {
+        let _ctx = cuda::Ctx::init();
+        let mut pf = crate::glm5_flags::Prefetch::new(8, 1 << 20);
+        let want: Vec<u32> = (0..8).collect();
+        assert_eq!(pf.issue(&src, &recs, 0, &[], &want).unwrap(), 8);
+        let layout = std::alloc::Layout::from_size_align(8192, 4096).unwrap();
+        let b = std::alloc::alloc(layout);
+        let t = src.fetch_prio(&[(rec(99, 12 << 20, 8192), RecordDst { gu: b, dn: std::ptr::null_mut() })], None, ReadPriority::Demand).unwrap();
+        src.wait(t).unwrap();
+        let last = pf.landed_value(7);
+        assert!(std::slice::from_raw_parts(b, 8192) == &bytes[12 << 20..(12 << 20) + 8192]);
+        std::alloc::dealloc(b, layout);
+        pf.free(&src).unwrap();
+        assert!(!last, "the store's last record had landed when the demand read completed: the prefetch reads did not queue as Prefetch");
+    }
+    drop(src);
+    // without the pool the store keeps its former read (Demand; one FIFO per reader)
+    let mut cfg = NvmeConfig::new(&path);
+    cfg.pool = PoolAsk::Off;
+    let off = NvmeSource::open(&cfg).unwrap();
+    assert_eq!(crate::glm5_flags::prefetch_priority(&off), ReadPriority::Demand);
+    drop(off);
+    let _ = std::fs::remove_dir_all(&dir);
+}

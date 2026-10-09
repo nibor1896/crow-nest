@@ -657,6 +657,17 @@ pub fn take_hint() -> Option<Hint> {
 /// `CU_STREAM_WAIT_VALUE_GEQ`
 const WAIT_GEQ: u32 = 0;
 
+/// `CROW_GLM_PREFETCH` with `CROW_NVME_POOL=1`: the store's reads join the piece pool's
+/// `Prefetch` queue (every queued demand piece first, as nv2's two queues); the per-reader
+/// backends have one FIFO each and keep `Demand`, the read of record
+pub fn prefetch_priority(src: &crate::nvme_source::NvmeSource) -> crate::nvme_source::ReadPriority {
+    if src.pool().is_some() {
+        crate::nvme_source::ReadPriority::Prefetch
+    } else {
+        crate::nvme_source::ReadPriority::Demand
+    }
+}
+
 /// `CROW_GLM_PREFETCH`: the pinned bytes of the store (2 x `topk` records + the flag page), the
 /// bytes `glm5_tiers::plan_for_rows` takes off the pinned budget
 pub fn prefetch_pinned_bytes(topk: usize, record_bytes: u64) -> u64 {
@@ -827,7 +838,8 @@ impl Prefetch {
             let flag = crate::nvme_source::Landed { flag: (self.flags.host as *mut u64).add(i), value: self.seq };
             // SAFETY: the destination is store slot i (`rb` bytes, nothing reads it until its
             // flag / ticket), the flag its own word, written only by this read until retired
-            self.ticket[i] = Some(src.fetch_landed(&[(rec, dst)], &[flag])?);
+            // under the piece pool behind every queued demand piece (`prefetch_priority`)
+            self.ticket[i] = Some(src.fetch_prio(&[(rec, dst)], Some(&[flag]), prefetch_priority(src))?);
             self.key[i] = Some((l, e));
             self.bytes[i] = bytes;
             self.stats.issued += 1;
@@ -835,6 +847,12 @@ impl Prefetch {
             n += 1;
         }
         Ok(n)
+    }
+
+    /// the landed flag of slot `i` holds the value of its latest read (that read has landed)
+    pub fn landed_value(&self, i: usize) -> bool {
+        // SAFETY: slot i's word of the store's flag page, written by its reader
+        unsafe { std::ptr::read_volatile((self.flags.host as *const u64).add(i)) == self.value[i] }
     }
 
     /// empty the store (every read reports; unused records count as wasted)
