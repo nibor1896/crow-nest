@@ -1,0 +1,1077 @@
+//! crow-nest #163 (GLM-5.3-Flash plan step 14, MLA/DSA part): the glm5_next MLA attention over a
+//! BF16 latent cache and its DSA indexer with learned 4-token pooling, on the GPU.
+//!
+//! What one DSA layer computes is `docs/glm5-next-recipe.md` sections 7 and 8 (HF
+//! `modeling_glm5_next.py:736-1256`); how this module computes it, its state and its evidence are
+//! `docs/glm5-mla.md`. In short, per call of `t` rows at positions `pos0 .. pos0 + t`:
+//!
+//! - the latent `c = rms(kv_a x)` goes into the latent cache, BF16, `kv_lora` values per token
+//!   (1,024 B, `Glm5Geo::latent_bytes_per_token`); K and V are never expanded: `kv_b` is absorbed into
+//!   the query (`q~_h = W_k,h^T q_h`) and applied after attention (`o_h = W_v,h u_h`);
+//! - the indexer row `[LayerNorm(wk x) | gate x | 1]` goes into the indexer cache in the HF layout,
+//!   BF16, 257 values (514 B, `Glm5Geo::indexer_bytes_per_token`); pooled keys are recomputed from it
+//!   (HF does the same, `:899-972`);
+//! - the pool scores feed `qsa_select_fast` of `KERNEL_SRC` (pools of 4 from position 0, the tail
+//!   appended, ties to the lowest pool index), at most `sel_max` = 2051 rows per query;
+//! - split-K attention over the selected latent rows, then `W_v`, then `o_proj`.
+//!
+//! The projections run on `gm_gemm` (BF16 weights, f32 activations and accumulation) through
+//! [`MlaScratch::linear`]; an integrator with other weight codecs replaces those calls and keeps the
+//! stages ([`MlaScratch::store_latent`], [`MlaScratch::store_index`], [`MlaScratch::select`],
+//! [`MlaScratch::attend`]). Nothing in the engine calls this module yet (the lead wires it into
+//! `gen.rs`); it depends on `cuda`, `geo` and `kernels` only.
+
+use crate::cuda;
+use crate::geo::Glm5Geo;
+use crate::kernels::launch_v;
+use cudarc::driver::sys::{CUdeviceptr, CUfunction};
+
+/// every entry of `kernels::GLM5_MLA_SRC`
+pub const NAMES: &[&str] = &[
+    "gm_gemm",
+    "gm_rmsnorm",
+    "gm_latent_store",
+    "gm_idx_store",
+    "gm_idx_scores",
+    "gm_sel_prep",
+    "gm_absorb",
+    "gm_attn",
+    "gm_attn_merge",
+    "gm_out_v",
+];
+
+/// the pool size the selection kernel (`qsa_select_fast`) is built for
+pub const KPOOL: usize = 4;
+/// the most pools `qsa_select_fast` can rank (its shared bitmap holds 65,536 bits): 262,144 tokens
+pub const MAX_POOLS: usize = 65_536;
+/// RMSNorm eps (`rms_norm_eps`) and the indexer LayerNorm eps (`modeling_glm5_next.py:763`)
+pub const RMS_EPS: f32 = 1e-5;
+pub const LN_EPS: f32 = 1e-6;
+
+/// The shapes of one MLA + DSA layer, compiled into the kernels as `GM_*` defines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MlaDims {
+    pub hidden: usize,
+    pub heads: usize,
+    /// per-head key width (`qk_nope_head_dim`; no RoPE part) and value width
+    pub nope: usize,
+    pub v: usize,
+    /// the latent width (`kv_lora_rank`) and the query low rank (`q_lora_rank`)
+    pub kv_lora: usize,
+    pub q_lora: usize,
+    /// the indexer: heads, head dim, pool size, selection budget in tokens
+    pub idx_heads: usize,
+    pub idx_dim: usize,
+    pub kpool: usize,
+    pub topk: usize,
+}
+
+impl MlaDims {
+    /// the DSA layer of a glm5_next geometry
+    pub const fn of(g: &Glm5Geo) -> MlaDims {
+        MlaDims {
+            hidden: g.hidden,
+            heads: g.mla_heads,
+            nope: g.nope_dim,
+            v: g.v_dim,
+            kv_lora: g.kv_lora,
+            q_lora: g.q_lora,
+            idx_heads: g.index_heads,
+            idx_dim: g.index_head_dim,
+            kpool: g.index_kpool,
+            topk: g.index_topk,
+        }
+    }
+    /// pools selected per query (`index_topk / kpool`, 512)
+    pub const fn sel_pools(&self) -> usize {
+        self.topk / self.kpool
+    }
+    /// the most rows one query attends (`index_topk + kpool - 1`, 2051)
+    pub const fn sel_max(&self) -> usize {
+        self.topk + self.kpool - 1
+    }
+    /// values of one indexer cache row, HF layout `[key | gate | valid]` (257)
+    pub const fn idx_row(&self) -> usize {
+        2 * self.idx_dim + 1
+    }
+    /// rows of the concatenated x-side indexer projection `[wk | compress_gate | weights_proj]` (288)
+    pub const fn idx_proj(&self) -> usize {
+        2 * self.idx_dim + self.idx_heads
+    }
+    /// latent cache bytes per token (BF16, 1,024)
+    pub const fn latent_bytes_per_token(&self) -> u64 {
+        (self.kv_lora * 2) as u64
+    }
+    /// indexer cache bytes per token (BF16, 514)
+    pub const fn indexer_bytes_per_token(&self) -> u64 {
+        (self.idx_row() * 2) as u64
+    }
+    /// the kernels' preconditions, by name
+    pub fn check(&self) -> Result<(), String> {
+        let mut bad = Vec::new();
+        if self.kpool != KPOOL {
+            bad.push(format!("kpool {} (qsa_select_fast pools {KPOOL} tokens)", self.kpool));
+        }
+        if self.topk % self.kpool != 0 || self.topk == 0 {
+            bad.push(format!("index_topk {} is not a positive multiple of kpool", self.topk));
+        }
+        if self.kv_lora % 32 != 0 || self.kv_lora == 0 {
+            bad.push(format!("kv_lora {} (gm_attn / gm_out_v split it over 32 lanes)", self.kv_lora));
+        }
+        for (n, v) in [("hidden", self.hidden), ("q_lora", self.q_lora), ("heads*v", self.heads * self.v), ("kv_lora", self.kv_lora)] {
+            if v % 32 != 0 {
+                bad.push(format!("{n} {v} (gm_gemm reads k in steps of 32)"));
+            }
+        }
+        if self.idx_heads * self.idx_dim * 4 + 32 * (self.idx_dim + 1) * 4 > 48 * 1024 {
+            bad.push(format!("indexer {} x {} does not fit gm_idx_scores' 48 KiB of shared memory", self.idx_heads, self.idx_dim));
+        }
+        if self.nope * 8 * 4 > 48 * 1024 || self.kv_lora * 8 * 4 > 48 * 1024 {
+            bad.push("nope / kv_lora too wide for the 8-token shared tiles".into());
+        }
+        if bad.is_empty() { Ok(()) } else { Err(bad.join("; ")) }
+    }
+    /// the `#define` block in front of `kernels::GLM5_MLA_SRC`
+    pub fn prelude(&self) -> String {
+        let f = |v: f64| format!("{:e}f", v as f32);
+        let defs: [(&str, String); 13] = [
+            ("GM_HEADS", self.heads.to_string()),
+            ("GM_NOPE", self.nope.to_string()),
+            ("GM_V", self.v.to_string()),
+            ("GM_LAT", self.kv_lora.to_string()),
+            ("GM_IH", self.idx_heads.to_string()),
+            ("GM_ID", self.idx_dim.to_string()),
+            ("GM_ROW", self.idx_row().to_string()),
+            ("GM_SEL_MAX", self.sel_max().to_string()),
+            ("GM_EPS", f(RMS_EPS as f64)),
+            ("GM_LN_EPS", f(LN_EPS as f64)),
+            // HF: scaling = qk_head_dim^-0.5 (:1128), indexer softmax_scale = head_dim^-0.5 and
+            // weights * n_heads^-0.5 (:825-830), each a Python float applied to an f32 tensor
+            ("GM_SCALE", f((self.nope as f64).powf(-0.5))),
+            ("GM_ISCALE", f((self.idx_dim as f64).powf(-0.5))),
+            ("GM_WSCALE", f((self.idx_heads as f64).powf(-0.5))),
+        ];
+        let mut s = String::from("// crow-nest #163: glm5_mla::MlaDims::prelude()\n");
+        for (n, v) in defs {
+            s.push_str(&format!("#define {n} {v}\n"));
+        }
+        s
+    }
+    /// the text NVRTC compiles
+    pub fn source(&self) -> String {
+        format!("{}{}", self.prelude(), crate::kernels::GLM5_MLA_SRC)
+    }
+}
+
+/// The compiled module, its entries and the selection kernel of the engine's main module.
+pub struct MlaKernels {
+    pub module: cuda::Module,
+    pub dims: MlaDims,
+    gemm: CUfunction,
+    rmsnorm: CUfunction,
+    latent_store: CUfunction,
+    idx_store: CUfunction,
+    idx_scores: CUfunction,
+    sel_prep: CUfunction,
+    absorb: CUfunction,
+    attn: CUfunction,
+    merge: CUfunction,
+    out_v: CUfunction,
+    select: CUfunction,
+}
+
+impl MlaKernels {
+    /// `select` is `qsa_select_fast` of a module compiled from `KERNEL_SRC` (any `KernelGeo`: the
+    /// entry reads no `CN_*` define).
+    ///
+    /// # Safety
+    /// A CUDA context is current and `select` belongs to a module loaded in it.
+    pub unsafe fn new(dims: MlaDims, select: CUfunction) -> MlaKernels {
+        if let Err(e) = dims.check() {
+            panic!("glm5_mla: {e}");
+        }
+        let module = crate::kernels::glm5_mla_module(&dims.prelude());
+        MlaKernels {
+            gemm: module.get("gm_gemm"),
+            rmsnorm: module.get("gm_rmsnorm"),
+            latent_store: module.get("gm_latent_store"),
+            idx_store: module.get("gm_idx_store"),
+            idx_scores: module.get("gm_idx_scores"),
+            sel_prep: module.get("gm_sel_prep"),
+            absorb: module.get("gm_absorb"),
+            attn: module.get("gm_attn"),
+            merge: module.get("gm_attn_merge"),
+            out_v: module.get("gm_out_v"),
+            select,
+            module,
+            dims,
+        }
+    }
+}
+
+/// The per-sequence state of one DSA layer: the latent cache `[cap][kv_lora]` BF16 and the indexer
+/// cache `[cap][2 idx_dim + 1]` BF16, both indexed by absolute position.
+pub struct MlaCache {
+    pub latent: CUdeviceptr,
+    pub index: CUdeviceptr,
+    pub cap: usize,
+}
+
+impl MlaCache {
+    /// device bytes of a cache of `cap` tokens
+    pub const fn bytes(d: &MlaDims, cap: usize) -> u64 {
+        (d.latent_bytes_per_token() + d.indexer_bytes_per_token()) * cap as u64
+    }
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn new(d: &MlaDims, cap: usize) -> MlaCache {
+        assert!(cap / KPOOL <= MAX_POOLS, "glm5_mla: a cache of {cap} tokens has more than {MAX_POOLS} pools");
+        MlaCache {
+            latent: cuda::alloc_named("glm5 MLA latent cache", cap * d.latent_bytes_per_token() as usize),
+            index: cuda::alloc_named("glm5 DSA indexer cache", cap * d.indexer_bytes_per_token() as usize),
+            cap,
+        }
+    }
+    /// # Safety
+    /// No launch that reads the cache is pending.
+    pub unsafe fn free(&mut self) {
+        cuda::free_dev(&mut self.latent);
+        cuda::free_dev(&mut self.index);
+    }
+}
+
+/// Device pointers of one layer's weights. Matrices BF16 row-major `[out][in]` (the checkpoint
+/// layout), vectors f32.
+#[derive(Clone, Copy, Debug)]
+pub struct MlaWeights {
+    /// `[q_lora][hidden]`, norm `[q_lora]`
+    pub q_a: CUdeviceptr,
+    pub q_a_norm: CUdeviceptr,
+    /// `[heads * nope][q_lora]`
+    pub q_b: CUdeviceptr,
+    /// `[kv_lora][hidden]`, norm `[kv_lora]`
+    pub kv_a: CUdeviceptr,
+    pub kv_a_norm: CUdeviceptr,
+    /// `[heads * (nope + v)][kv_lora]`, read by `gm_absorb` and `gm_out_v` (always BF16)
+    pub kv_b: CUdeviceptr,
+    /// `[hidden][heads * v]`
+    pub o_proj: CUdeviceptr,
+    /// `[idx_heads * idx_dim][q_lora]`
+    pub idx_wq_b: CUdeviceptr,
+    /// `[wk; index_kpool_compress_gate; weights_proj]` stacked: `[2 idx_dim + idx_heads][hidden]`
+    pub idx_x: CUdeviceptr,
+    /// LayerNorm weight and bias `[idx_dim]`, `index_kpool_compress_ape` `[kpool][idx_dim]`
+    pub idx_k_norm_w: CUdeviceptr,
+    pub idx_k_norm_b: CUdeviceptr,
+    pub idx_ape: CUdeviceptr,
+}
+
+/// split count of the decode-shaped attention: enough blocks for a few rows, one split from 16 rows
+pub fn attn_splits(t: usize) -> usize {
+    (16 / t.max(1)).max(1)
+}
+
+/// The scratch of one call shape (at most `max_t` rows against caches of `cap` tokens) and the
+/// stage launches. Every stage queues on the current stream and reads the call set by [`begin`].
+///
+/// [`begin`]: MlaScratch::begin
+pub struct MlaScratch {
+    pub max_t: usize,
+    pub cap: usize,
+    t: usize,
+    pos0: usize,
+    /// the call `(pos0, t)` on the device; `prm` = `[sel_pools, cap / 4, sel_max]`
+    st: CUdeviceptr,
+    prm: CUdeviceptr,
+    /// `[t][q_lora]`: q_a output, normed in place into q_resid
+    pub qa: CUdeviceptr,
+    /// `[t][heads][nope]`
+    pub q: CUdeviceptr,
+    /// `[t][kv_lora]`: kv_a output (the latent before its norm)
+    pub kva: CUdeviceptr,
+    /// `[t][2 idx_dim + idx_heads]`, `[t][idx_heads][idx_dim]`
+    pub ip: CUdeviceptr,
+    pub iq: CUdeviceptr,
+    /// `[t][cap / 4]` pool scores
+    pub scores: CUdeviceptr,
+    pub ncb: CUdeviceptr,
+    pub pos: CUdeviceptr,
+    /// `[t][sel_max]` selected token ids, `[t]` their counts
+    pub sel: CUdeviceptr,
+    pub sel_n: CUdeviceptr,
+    /// `[t][heads][kv_lora]` absorbed queries, attention partials, latent mix
+    pub qt: CUdeviceptr,
+    pub part_o: CUdeviceptr,
+    pub part_ml: CUdeviceptr,
+    pub u: CUdeviceptr,
+    /// `[t][heads * v]`, the input of o_proj
+    pub o: CUdeviceptr,
+}
+
+impl MlaScratch {
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn new(d: &MlaDims, max_t: usize, cap: usize) -> MlaScratch {
+        assert!(max_t > 0 && cap / KPOOL <= MAX_POOLS);
+        let slots = max_t.max(16); // t * attn_splits(t) <= max(t, 16)
+        let a = |what: &str, n: usize| cuda::alloc_named(what, n * 4);
+        let prm = cuda::to_i32_dev(&[d.sel_pools() as i32, (cap / KPOOL) as i32, d.sel_max() as i32]);
+        MlaScratch {
+            max_t,
+            cap,
+            t: 0,
+            pos0: 0,
+            st: cuda::to_i32_dev(&[0i32, 0]),
+            prm,
+            qa: a("glm5 mla q_a", max_t * d.q_lora),
+            q: a("glm5 mla q", max_t * d.heads * d.nope),
+            kva: a("glm5 mla kv_a", max_t * d.kv_lora),
+            ip: a("glm5 idx x-proj", max_t * d.idx_proj()),
+            iq: a("glm5 idx q", max_t * d.idx_heads * d.idx_dim),
+            scores: a("glm5 idx scores", max_t * (cap / KPOOL).max(1)),
+            ncb: a("glm5 idx ncb", max_t),
+            pos: a("glm5 idx pos", max_t),
+            sel: a("glm5 idx selection", max_t * d.sel_max()),
+            sel_n: a("glm5 idx selection n", max_t),
+            qt: a("glm5 mla q~", max_t * d.heads * d.kv_lora),
+            part_o: a("glm5 mla partials", slots * d.heads * d.kv_lora),
+            part_ml: a("glm5 mla partial m/l", slots * d.heads * 2),
+            u: a("glm5 mla latent mix", max_t * d.heads * d.kv_lora),
+            o: a("glm5 mla o", max_t * d.heads * d.v),
+        }
+    }
+
+    /// rows of the current call
+    pub fn t(&self) -> usize {
+        self.t
+    }
+
+    /// Set the call: `t` rows at absolute positions `pos0 .. pos0 + t`.
+    ///
+    /// # Safety
+    /// No launch of the previous call that reads `st` is pending on another stream.
+    pub unsafe fn begin(&mut self, pos0: usize, t: usize) {
+        assert!((1..=self.max_t).contains(&t), "glm5_mla: {t} rows per call (1..={})", self.max_t);
+        assert!(pos0 + t <= self.cap, "glm5_mla: rows {pos0}..{} beyond the cache of {}", pos0 + t, self.cap);
+        self.t = t;
+        self.pos0 = pos0;
+        cuda::to_i32_into(self.st, &[pos0 as i32, t as i32]);
+    }
+
+    /// `y[tok][0..n]` (row stride `ldy`) `= W x[tok]` (row stride `ldx`), W BF16 `[n][k]`
+    ///
+    /// # Safety
+    /// The buffers hold the current call's rows.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn linear(&self, kn: &MlaKernels, w: CUdeviceptr, k: usize, n: usize, x: CUdeviceptr, ldx: usize, y: CUdeviceptr, ldy: usize) {
+        assert!(k % 32 == 0, "gm_gemm: k = {k}");
+        launch_v(kn.gemm, n.div_ceil(64) as u32, self.t.div_ceil(16) as u32, 1, 256, &[w, x, y, k as u64, n as u64, ldx as u64, ldy as u64, self.st]);
+    }
+
+    /// the query side up to q_resid and q: `qa = rms(q_a x)`, `q = q_b qa` (x `[t][hidden]`)
+    ///
+    /// # Safety
+    /// As [`MlaScratch::linear`].
+    pub unsafe fn query(&self, kn: &MlaKernels, w: &MlaWeights, x: CUdeviceptr) {
+        let d = &kn.dims;
+        self.linear(kn, w.q_a, d.hidden, d.q_lora, x, d.hidden, self.qa, d.q_lora);
+        launch_v(kn.rmsnorm, self.t as u32, 1, 1, 256, &[self.qa, w.q_a_norm, d.q_lora as u64, self.st]);
+        self.linear(kn, w.q_b, d.q_lora, d.heads * d.nope, self.qa, d.q_lora, self.q, d.heads * d.nope);
+    }
+
+    /// `kva` (kv_a output, `[t][kv_lora]`) -> RMSNorm -> BF16 latent rows `pos0..pos0 + t`
+    ///
+    /// # Safety
+    /// `kva` holds the call's rows; `c` is this sequence's cache of this layer.
+    pub unsafe fn store_latent(&self, kn: &MlaKernels, w: &MlaWeights, c: &MlaCache) {
+        assert_eq!(c.cap, self.cap);
+        launch_v(kn.latent_store, self.t as u32, 1, 1, 256, &[self.kva, w.kv_a_norm, c.latent, self.st]);
+    }
+
+    /// `ip` (`[t][2 idx_dim + idx_heads]`) -> indexer rows `pos0..pos0 + t`
+    ///
+    /// # Safety
+    /// As [`MlaScratch::store_latent`].
+    pub unsafe fn store_index(&self, kn: &MlaKernels, w: &MlaWeights, c: &MlaCache) {
+        assert_eq!(c.cap, self.cap);
+        launch_v(kn.idx_store, self.t as u32, 1, 1, 256, &[self.ip, w.idx_k_norm_w, w.idx_k_norm_b, c.index, self.st]);
+    }
+
+    /// pool scores from `iq` and `ip` against the indexer rows `0..pos0 + t`, then the selection
+    /// (`sel`, `sel_n`). The call's own rows must be stored ([`MlaScratch::store_index`]) first.
+    ///
+    /// # Safety
+    /// As [`MlaScratch::store_latent`].
+    pub unsafe fn select(&self, kn: &MlaKernels, w: &MlaWeights, c: &MlaCache) {
+        let ncb_hi = (self.pos0 + self.t) / KPOOL;
+        if ncb_hi > 0 {
+            launch_v(kn.idx_scores, ncb_hi.div_ceil(32) as u32, self.t.div_ceil(16) as u32, 1, 256, &[
+                self.iq, self.ip, c.index, w.idx_ape, self.scores, (self.cap / KPOOL) as u64, self.st]);
+        }
+        launch_v(kn.sel_prep, self.t.div_ceil(256) as u32, 1, 1, 256, &[self.ncb, self.pos, self.st]);
+        launch_v(kn.select, self.t as u32, 1, 1, 256, &[
+            self.scores, self.ncb, self.sel, self.sel_n, self.prm, self.prm + 4, self.prm + 8, self.pos]);
+    }
+
+    /// absorbed attention: `q~ = W_k^T q`, split-K softmax over the selected latent rows, `o = W_v u`
+    ///
+    /// # Safety
+    /// `q`, `sel`, `sel_n` hold the call's rows and the call's latent rows are stored.
+    pub unsafe fn attend(&self, kn: &MlaKernels, w: &MlaWeights, c: &MlaCache) {
+        let d = &kn.dims;
+        let t = self.t as u32;
+        launch_v(kn.absorb, d.heads as u32, t.div_ceil(8), 1, 256, &[self.q, w.kv_b, self.qt, self.st]);
+        let ns = attn_splits(self.t) as u64;
+        launch_v(kn.attn, d.heads.div_ceil(8) as u32, t, ns as u32, 256, &[self.qt, c.latent, self.sel, self.sel_n, self.part_o, self.part_ml, ns, self.st]);
+        launch_v(kn.merge, d.heads as u32, t, 1, 256, &[self.part_o, self.part_ml, self.u, ns, self.st]);
+        launch_v(kn.out_v, d.heads as u32, t.div_ceil(8), 1, 256, &[self.u, w.kv_b, self.o, self.st]);
+    }
+
+    /// The whole sub-block for `t` rows at `pos0..pos0 + t`: x `[t][hidden]` (the output of
+    /// `input_layernorm`) -> y `[t][hidden]`, caches updated. Projections on `gm_gemm`.
+    ///
+    /// # Safety
+    /// `x`, `y` hold `t` rows; `c` is this sequence's cache of this layer, rows `0..pos0` written by
+    /// earlier calls.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward(&mut self, kn: &MlaKernels, w: &MlaWeights, c: &MlaCache, x: CUdeviceptr, y: CUdeviceptr, pos0: usize, t: usize) {
+        let d = kn.dims;
+        self.begin(pos0, t);
+        self.query(kn, w, x);
+        self.linear(kn, w.kv_a, d.hidden, d.kv_lora, x, d.hidden, self.kva, d.kv_lora);
+        self.store_latent(kn, w, c);
+        self.linear(kn, w.idx_x, d.hidden, d.idx_proj(), x, d.hidden, self.ip, d.idx_proj());
+        self.store_index(kn, w, c);
+        self.linear(kn, w.idx_wq_b, d.q_lora, d.idx_heads * d.idx_dim, self.qa, d.q_lora, self.iq, d.idx_heads * d.idx_dim);
+        self.select(kn, w, c);
+        self.attend(kn, w, c);
+        self.linear(kn, w.o_proj, d.heads * d.v, d.hidden, self.o, d.heads * d.v, y, d.hidden);
+    }
+
+    /// # Safety
+    /// No launch of this scratch is pending.
+    pub unsafe fn free(&mut self) {
+        for p in [
+            &mut self.st, &mut self.prm, &mut self.qa, &mut self.q, &mut self.kva, &mut self.ip, &mut self.iq, &mut self.scores,
+            &mut self.ncb, &mut self.pos, &mut self.sel, &mut self.sel_n, &mut self.qt, &mut self.part_o, &mut self.part_ml,
+            &mut self.u, &mut self.o,
+        ] {
+            cuda::free_dev(p);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- test kit
+
+/// The synthetic weights of `oracle/export_glm5_mla_golden.py`, value for value: a counter-based
+/// generator (splitmix64 of seed, stream and index), every weight rounded to BF16.
+#[cfg(test)]
+pub(crate) mod synth {
+    use super::MlaDims;
+
+    pub fn splitmix64(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// value `i` of a stream, in [-1, 1) and exact in f32: (top 24 bits of
+    /// splitmix64(((stream << 32) | i) ^ seed * 0xD1B54A32D192ED03) - 2^23) / 2^23
+    pub fn uniform_at(seed: u64, stream: u64, i: u64) -> f32 {
+        let z = splitmix64(((stream << 32) | i) ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
+        ((z >> 40) as i64 - (1 << 23)) as f32 / (1u32 << 23) as f32
+    }
+
+    pub fn uniform(seed: u64, stream: u64, n: usize) -> Vec<f32> {
+        (0..n as u64).map(|i| uniform_at(seed, stream, i)).collect()
+    }
+
+    /// f32 -> nearest BF16 (ties to even) as f32
+    pub fn bf16_round(v: f32) -> f32 {
+        let b = v.to_bits() as u64;
+        f32::from_bits(((b + 0x7FFF + ((b >> 16) & 1)) & 0xFFFF_0000) as u32)
+    }
+
+    pub fn bf16_bits(v: f32) -> u16 {
+        (bf16_round(v).to_bits() >> 16) as u16
+    }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    pub enum Kind {
+        /// uniform * sqrt(3 / fan_in)
+        Lin,
+        /// 1 + p * uniform
+        One(f32),
+        /// p * uniform
+        Lin0(f32),
+    }
+
+    /// (stream, HF module key, rows, cols, kind): the table of the Python generator (`STREAMS`)
+    pub fn streams(d: &MlaDims) -> Vec<(u64, &'static str, usize, usize, Kind)> {
+        use Kind::*;
+        vec![
+            (1, "q_a_proj.weight", d.q_lora, d.hidden, Lin),
+            (2, "q_a_layernorm.weight", d.q_lora, 1, One(0.1)),
+            (3, "q_b_proj.weight", d.heads * d.nope, d.q_lora, Lin),
+            (4, "kv_a_proj_with_mqa.weight", d.kv_lora, d.hidden, Lin),
+            (5, "kv_a_layernorm.weight", d.kv_lora, 1, One(0.1)),
+            (6, "kv_b_proj.weight", d.heads * (d.nope + d.v), d.kv_lora, Lin),
+            (7, "o_proj.weight", d.hidden, d.heads * d.v, Lin),
+            (8, "indexer.wq_b.weight", d.idx_heads * d.idx_dim, d.q_lora, Lin),
+            (9, "indexer.wk.weight", d.idx_dim, d.hidden, Lin),
+            (10, "indexer.k_norm.weight", d.idx_dim, 1, One(0.1)),
+            (11, "indexer.k_norm.bias", d.idx_dim, 1, Lin0(0.1)),
+            (12, "indexer.weights_proj.weight", d.idx_heads, d.hidden, Lin),
+            (13, "indexer.index_kpool_compress_gate", d.idx_dim, d.hidden, Lin),
+            (14, "indexer.index_kpool_compress_ape", d.kpool, d.idx_dim, Lin0(0.8)),
+        ]
+    }
+    pub const X_STREAM: u64 = 100;
+
+    /// value `i` of a tensor with `cols` columns
+    pub fn value(seed: u64, stream: u64, i: usize, cols: usize, kind: Kind) -> f32 {
+        let u = uniform_at(seed, stream, i as u64);
+        match kind {
+            Kind::Lin => bf16_round(u * (3.0f64 / cols as f64).sqrt() as f32),
+            Kind::One(p) => bf16_round(1.0f32 + p * u),
+            Kind::Lin0(p) => bf16_round(p * u),
+        }
+    }
+
+    pub fn tensor(seed: u64, stream: u64, rows: usize, cols: usize, kind: Kind) -> Vec<f32> {
+        (0..rows * cols).map(|i| value(seed, stream, i, cols, kind)).collect()
+    }
+
+    /// input rows `[n][hidden]`: uniform * sqrt(3), plain f32
+    pub fn x(seed: u64, n: usize, hidden: usize) -> Vec<f32> {
+        let s = 3.0f64.sqrt() as f32;
+        uniform(seed, X_STREAM, n * hidden).iter().map(|&v| v * s).collect()
+    }
+
+    /// one layer's weights on the host, f32 (BF16-representable)
+    pub struct HostWeights {
+        pub d: MlaDims,
+        pub q_a: Vec<f32>,
+        pub q_a_norm: Vec<f32>,
+        pub q_b: Vec<f32>,
+        pub kv_a: Vec<f32>,
+        pub kv_a_norm: Vec<f32>,
+        pub kv_b: Vec<f32>,
+        pub o_proj: Vec<f32>,
+        pub wq_b: Vec<f32>,
+        /// `[wk; gate; weights_proj]` stacked
+        pub idx_x: Vec<f32>,
+        pub k_norm_w: Vec<f32>,
+        pub k_norm_b: Vec<f32>,
+        pub ape: Vec<f32>,
+    }
+
+    pub fn weights(d: &MlaDims, seed: u64) -> HostWeights {
+        let mut t: Vec<Vec<f32>> = streams(d).into_iter().map(|(s, _, r, c, k)| tensor(seed, s, r, c, k)).collect();
+        let mut take = |i: usize| std::mem::take(&mut t[i]);
+        let (q_a, q_a_norm, q_b, kv_a, kv_a_norm, kv_b, o_proj, wq_b) = (take(0), take(1), take(2), take(3), take(4), take(5), take(6), take(7));
+        let (wk, k_norm_w, k_norm_b, wproj, gate, ape) = (take(8), take(9), take(10), take(11), take(12), take(13));
+        let idx_x = [wk, gate, wproj].concat();
+        HostWeights { d: *d, q_a, q_a_norm, q_b, kv_a, kv_a_norm, kv_b, o_proj, wq_b, idx_x, k_norm_w, k_norm_b, ape }
+    }
+}
+
+/// The host reference of one sub-block in f64, with the caches stored as the engine stores them
+/// (BF16) or in f32, the attention in the absorbed (latent) or in HF's expanded order.
+#[cfg(test)]
+pub(crate) mod host {
+    use super::synth::{bf16_round, HostWeights};
+    use super::{MlaDims, LN_EPS, RMS_EPS};
+
+    pub fn matvec(w: &[f32], rows: usize, k: usize, x: &[f64]) -> Vec<f64> {
+        (0..rows).map(|r| w[r * k..(r + 1) * k].iter().zip(x).map(|(&a, &b)| a as f64 * b).sum()).collect()
+    }
+
+    pub fn rms(x: &[f64], w: &[f32]) -> Vec<f64> {
+        let r = 1.0 / (x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64 + RMS_EPS as f64).sqrt();
+        x.iter().zip(w).map(|(v, &g)| g as f64 * (v * r)).collect()
+    }
+
+    fn store(v: f64, bf16: bool) -> f64 {
+        if bf16 { bf16_round(v as f32) as f64 } else { v as f32 as f64 }
+    }
+
+    /// `pk[c] = sum_j softmax_j(gate_j[c] + ape[j][c]) * key_j[c]` (`modeling_glm5_next.py:961-967`)
+    pub fn pool(keys: &[&[f64]], gates: &[&[f64]], ape: &[f32], dim: usize) -> Vec<f64> {
+        (0..dim)
+            .map(|c| {
+                let g: Vec<f64> = (0..keys.len()).map(|j| gates[j][c] + ape[j * dim + c] as f64).collect();
+                let m = g.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let e: Vec<f64> = g.iter().map(|v| (v - m).exp()).collect();
+                let s: f64 = e.iter().sum();
+                (0..keys.len()).map(|j| e[j] / s * keys[j][c]).sum()
+            })
+            .collect()
+    }
+
+    /// the token set of a query at `p` from its pool scores (`scores[P]`, P < (p+1)/4): every pool
+    /// while there are at most `sel_pools`, else the `sel_pools` best (ties: lowest pool), then the tail
+    pub fn select(scores: &[f64], p: usize, d: &MlaDims) -> Vec<usize> {
+        let ncb = (p + 1) / d.kpool;
+        let mut pools: Vec<usize> = (0..ncb).collect();
+        if ncb > d.sel_pools() {
+            pools.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap().then(a.cmp(&b)));
+            pools.truncate(d.sel_pools());
+            pools.sort();
+        }
+        let mut s: Vec<usize> = pools.iter().flat_map(|&q| (0..d.kpool).map(move |j| q * d.kpool + j)).collect();
+        s.extend(ncb * d.kpool..=p);
+        s
+    }
+
+    pub struct Out {
+        /// `[n][hidden]`
+        pub y: Vec<f64>,
+        /// per row: the selected token ids, ascending
+        pub sel: Vec<Vec<usize>>,
+    }
+
+    /// every row of `x` (`[n][hidden]`) as a causal sequence from position 0
+    pub fn forward(w: &HostWeights, x: &[f32], bf16_cache: bool, absorbed: bool) -> Out {
+        let d = &w.d;
+        let n = x.len() / d.hidden;
+        let (id, ih, lat) = (d.idx_dim, d.idx_heads, d.kv_lora);
+        let mut q = Vec::new();
+        let mut lat_c = Vec::new();
+        let mut keys = Vec::new();
+        let mut gates = Vec::new();
+        let mut iq = Vec::new();
+        let mut wts = Vec::new();
+        for r in 0..n {
+            let xr: Vec<f64> = x[r * d.hidden..(r + 1) * d.hidden].iter().map(|&v| v as f64).collect();
+            let qr = rms(&matvec(&w.q_a, d.q_lora, d.hidden, &xr), &w.q_a_norm);
+            q.push(matvec(&w.q_b, d.heads * d.nope, d.q_lora, &qr));
+            iq.push(matvec(&w.wq_b, ih * id, d.q_lora, &qr));
+            let c = rms(&matvec(&w.kv_a, lat, d.hidden, &xr), &w.kv_a_norm);
+            lat_c.push(c.iter().map(|&v| store(v, bf16_cache)).collect::<Vec<f64>>());
+            let ip = matvec(&w.idx_x, d.idx_proj(), d.hidden, &xr);
+            let k = &ip[..id];
+            let mean = k.iter().sum::<f64>() / id as f64;
+            let var = k.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / id as f64;
+            let rr = 1.0 / (var + LN_EPS as f64).sqrt();
+            keys.push((0..id).map(|c| store((k[c] - mean) * rr * w.k_norm_w[c] as f64 + w.k_norm_b[c] as f64, bf16_cache)).collect::<Vec<f64>>());
+            gates.push(ip[id..2 * id].iter().map(|&v| store(v, bf16_cache)).collect::<Vec<f64>>());
+            wts.push(ip[2 * id..].iter().map(|v| v * (ih as f64).powf(-0.5)).collect::<Vec<f64>>());
+        }
+        let pooled: Vec<Vec<f64>> = (0..n / d.kpool)
+            .map(|pp| {
+                let kr: Vec<&[f64]> = (0..d.kpool).map(|j| &keys[pp * d.kpool + j][..]).collect();
+                let gr: Vec<&[f64]> = (0..d.kpool).map(|j| &gates[pp * d.kpool + j][..]).collect();
+                pool(&kr, &gr, &w.ape, id)
+            })
+            .collect();
+        let row = d.nope + d.v;
+        let scale = (d.nope as f64).powf(-0.5);
+        let mut y = vec![0.0; n * d.hidden];
+        let mut sel = Vec::new();
+        for p in 0..n {
+            let ncb = (p + 1) / d.kpool;
+            let scores: Vec<f64> = (0..ncb)
+                .map(|pp| {
+                    (0..ih)
+                        .map(|h| {
+                            let dot: f64 = (0..id).map(|c| iq[p][h * id + c] * pooled[pp][c]).sum();
+                            wts[p][h] * (dot * (id as f64).powf(-0.5)).max(0.0)
+                        })
+                        .sum()
+                })
+                .collect();
+            let s = select(&scores, p, d);
+            let mut o = vec![0.0; d.heads * d.v];
+            for h in 0..d.heads {
+                let wk = |i: usize, j: usize| w.kv_b[(h * row + i) * lat + j] as f64;
+                let wv = |i: usize, j: usize| w.kv_b[(h * row + d.nope + i) * lat + j] as f64;
+                let qh = &q[p][h * d.nope..(h + 1) * d.nope];
+                let logits: Vec<f64> = if absorbed {
+                    let qt: Vec<f64> = (0..lat).map(|j| (0..d.nope).map(|i| qh[i] * wk(i, j)).sum()).collect();
+                    s.iter().map(|&t| (0..lat).map(|j| qt[j] * lat_c[t][j]).sum::<f64>() * scale).collect()
+                } else {
+                    s.iter()
+                        .map(|&t| (0..d.nope).map(|i| qh[i] * (0..lat).map(|j| wk(i, j) * lat_c[t][j]).sum::<f64>()).sum::<f64>() * scale)
+                        .collect()
+                };
+                let m = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let e: Vec<f64> = logits.iter().map(|v| (v - m).exp()).collect();
+                let z: f64 = e.iter().sum();
+                if absorbed {
+                    let u: Vec<f64> = (0..lat).map(|j| s.iter().zip(&e).map(|(&t, &a)| a / z * lat_c[t][j]).sum()).collect();
+                    for i in 0..d.v {
+                        o[h * d.v + i] = (0..lat).map(|j| wv(i, j) * u[j]).sum();
+                    }
+                } else {
+                    for i in 0..d.v {
+                        o[h * d.v + i] = s.iter().zip(&e).map(|(&t, &a)| a / z * (0..lat).map(|j| wv(i, j) * lat_c[t][j]).sum::<f64>()).sum();
+                    }
+                }
+            }
+            y[p * d.hidden..(p + 1) * d.hidden].copy_from_slice(&matvec(&w.o_proj, d.hidden, d.heads * d.v, &o));
+            sel.push(s);
+        }
+        Out { y, sel }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Host tests: the family row's shapes, the generator against the oracle's probes, the exact ops
+    //! of the host reference and the NVRTC build. No GPU.
+    use super::host;
+    use super::synth;
+    use super::*;
+
+    /// a small layer with the real structure (pools of 4, a sparse regime from position 19)
+    pub(crate) const TINY: MlaDims = MlaDims { hidden: 128, heads: 4, nope: 32, v: 32, kv_lora: 64, q_lora: 64, idx_heads: 4, idx_dim: 32, kpool: 4, topk: 16 };
+
+    pub(crate) fn fixture_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5/mla")
+    }
+
+    pub(crate) fn manifest() -> serde_json::Value {
+        let p = fixture_dir().join("manifest.json");
+        serde_json::from_str(&std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))).unwrap()
+    }
+
+    #[test]
+    fn the_glm_5_3_flash_layer_has_the_planned_shapes_and_cache_bytes() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let d = MlaDims::of(&g);
+        assert_eq!((d.heads, d.nope, d.v, d.kv_lora, d.q_lora), (64, 256, 256, 512, 1536));
+        assert_eq!((d.idx_heads, d.idx_dim, d.kpool, d.topk), (32, 128, 4, 2048));
+        assert_eq!((d.sel_pools(), d.sel_max(), d.idx_row(), d.idx_proj()), (512, 2051, 257, 288));
+        assert_eq!(d.sel_max(), g.sel_max());
+        // the #159 planner's per-token bytes are this module's cache rows
+        assert_eq!((d.latent_bytes_per_token(), d.indexer_bytes_per_token()), (g.latent_bytes_per_token(), g.indexer_bytes_per_token()));
+        assert_eq!(MlaCache::bytes(&d, 200_000), 307_600_000);
+        assert_eq!(d.check(), Ok(()));
+        let p = d.prelude();
+        for line in ["#define GM_LAT 512\n", "#define GM_ROW 257\n", "#define GM_SEL_MAX 2051\n", "#define GM_SCALE 6.25e-2f\n"] {
+            assert!(p.contains(line), "{line:?} not in\n{p}");
+        }
+        assert!(MlaDims { kpool: 16, ..d }.check().unwrap_err().contains("kpool 16"));
+        assert_eq!((attn_splits(1), attn_splits(3), attn_splits(16), attn_splits(512)), (16, 5, 1, 1));
+    }
+
+    /// the Rust generator is the oracle's: the probe values the golden's manifest recorded
+    #[test]
+    fn the_generator_reproduces_the_oracle_probes() {
+        let m = manifest();
+        let seed = m["seed"].as_u64().unwrap();
+        let d = MlaDims::of(&Glm5Geo::GLM_5_3_FLASH);
+        let mut n = 0;
+        for (s, key, rows, cols, kind) in synth::streams(&d) {
+            let probes = m["probes"][key].as_array().unwrap_or_else(|| panic!("{key}: no probes"));
+            assert_eq!(probes[3][0].as_u64().unwrap() as usize, rows * cols - 1, "{key}: shape");
+            for pr in probes {
+                let (i, bits) = (pr[0].as_u64().unwrap() as usize, pr[1].as_u64().unwrap() as u32);
+                let v = synth::value(seed, s, i, cols, kind);
+                assert_eq!(v.to_bits(), bits, "{key}[{i}]: {v} vs oracle {}", f32::from_bits(bits));
+                n += 1;
+            }
+        }
+        let x = synth::x(seed, 8, d.hidden);
+        for pr in m["probes"]["x"].as_array().unwrap() {
+            let (i, bits) = (pr[0].as_u64().unwrap() as usize, pr[1].as_u64().unwrap() as u32);
+            assert_eq!(x[i].to_bits(), bits, "x[{i}]");
+            n += 1;
+        }
+        assert_eq!(n, 15 * 4);
+    }
+
+    #[test]
+    fn bf16_rounding_is_round_to_nearest_even() {
+        assert_eq!(synth::bf16_round(1.0), 1.0);
+        // 1 + 2^-8 is the midpoint of 1 and 1 + 2^-7: ties to the even mantissa (1.0)
+        assert_eq!(synth::bf16_round(1.0 + 1.0 / 256.0), 1.0);
+        assert_eq!(synth::bf16_round(1.0 + 3.0 / 256.0), 1.0 + 4.0 / 256.0);
+        assert_eq!(synth::bf16_round(-1.0 - 1.0 / 512.0), -1.0);
+        assert_eq!(synth::bf16_bits(1.0), 0x3F80);
+    }
+
+    /// pooling is the learned softmax mix, not the mean: equal gates give the mean, a dominant gate
+    /// picks its row, and the ape is added per (position, channel)
+    #[test]
+    fn the_pooled_key_is_the_softmax_gate_mix_of_four_rows() {
+        let k: [Vec<f64>; 4] = [vec![1.0, 10.0], vec![2.0, 20.0], vec![3.0, 30.0], vec![4.0, 40.0]];
+        let kr: Vec<&[f64]> = k.iter().map(|v| &v[..]).collect();
+        let zero = [vec![0.0; 2], vec![0.0; 2], vec![0.0; 2], vec![0.0; 2]];
+        let zr: Vec<&[f64]> = zero.iter().map(|v| &v[..]).collect();
+        let no_ape = [0.0f32; 8];
+        assert_eq!(host::pool(&kr, &zr, &no_ape, 2), vec![2.5, 25.0]);
+        let big = [vec![0.0; 2], vec![0.0; 2], vec![60.0, 0.0], vec![0.0; 2]];
+        let br: Vec<&[f64]> = big.iter().map(|v| &v[..]).collect();
+        let p = host::pool(&kr, &br, &no_ape, 2);
+        assert!((p[0] - 3.0).abs() < 1e-20 && p[1] == 25.0, "{p:?}");
+        // ape [4][2]: channel 1 of position 0 gets ln 3 -> weights 3/6, 1/6, 1/6, 1/6
+        let mut ape = [0.0f32; 8];
+        ape[1] = 3.0f32.ln();
+        let p = host::pool(&kr, &zr, &ape, 2);
+        let want = (3.0 * 10.0 + 20.0 + 30.0 + 40.0) / 6.0;
+        assert!((p[1] - want).abs() < 1e-5, "{} vs {want}", p[1]);
+    }
+
+    /// the selection: dense below the budget, top pools + tail above it, ties to the lowest pool
+    #[test]
+    fn the_selection_is_the_top_pools_plus_the_tail() {
+        let d = TINY; // 4 pools budget
+        // p = 9: 2 complete pools, tail 8, 9 -> dense, 0..=9
+        assert_eq!(host::select(&[0.0, 0.0], 9, &d), (0..=9).collect::<Vec<_>>());
+        // p = 22: 5 complete pools, tail 20..=22; pool 1 has the lowest score and is dropped
+        let s = host::select(&[5.0, -1.0, 3.0, 4.0, 2.0], 22, &d);
+        let want: Vec<usize> = [0usize, 2, 3, 4].iter().flat_map(|&q| q * 4..q * 4 + 4).chain(20..=22).collect();
+        assert_eq!(s, want);
+        // an exact tie at the boundary: pools 1 and 4 both 1.0, the lower index stays
+        let s = host::select(&[5.0, 1.0, 3.0, 4.0, 1.0], 19, &d);
+        assert_eq!(s, (0..16).collect::<Vec<_>>());
+        assert_eq!(s.len(), d.topk);
+        assert!(host::select(&[0.0; 512], 2050, &MlaDims::of(&Glm5Geo::GLM_5_3_FLASH)).len() == 2051);
+    }
+
+    /// the absorbed (latent) attention equals HF's expanded K/V order on the same weights: the
+    /// algebra of `q~_h = W_k,h^T q_h` and `o_h = W_v,h u_h` (recipe section 7), sparse rows included
+    #[test]
+    fn absorbed_attention_equals_the_expanded_form() {
+        let w = synth::weights(&TINY, 7);
+        let x = synth::x(7, 26, TINY.hidden);
+        let a = host::forward(&w, &x, true, true);
+        let e = host::forward(&w, &x, true, false);
+        assert_eq!(a.sel, e.sel);
+        assert!(a.sel[25].len() == TINY.topk + 2, "row 25 is sparse: {} rows", a.sel[25].len());
+        let rmsy = (e.y.iter().map(|v| v * v).sum::<f64>() / e.y.len() as f64).sqrt();
+        let worst = a.y.iter().zip(&e.y).map(|(p, q)| (p - q).abs()).fold(0.0, f64::max);
+        assert!(worst < 1e-12 * rmsy.max(1.0), "absorbed vs expanded: max |d| {worst:e} at rms {rmsy:e}");
+    }
+
+    /// the module source compiles with the engine's option set into one PTX module with every entry
+    /// of `NAMES`, at the real and at the tiny shapes (host only, NVRTC)
+    #[test]
+    fn the_source_compiles_with_every_entry() {
+        for d in [MlaDims::of(&Glm5Geo::GLM_5_3_FLASH), TINY] {
+            let ptx = crate::kernels::tests_300_c4::ptx(&d.source());
+            let names: Vec<String> = crate::kernels::tests_300_c4::entries(&ptx).into_iter().map(|e| e.0).collect();
+            assert_eq!(names.len(), NAMES.len(), "{names:?}");
+            for n in NAMES {
+                assert!(names.iter().any(|e| e == n), "{n} missing in {names:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_gpu {
+    //! #163 acceptance on the GPU: the kernels against the host reference at small shapes, and the
+    //! whole sub-block against the HF golden (`oracle/export_glm5_mla_golden.py`) at the real shapes on
+    //! synthetic weights. `#[ignore]`: CI has no GPU. Run with
+    //! `cargo test --release --lib glm5_mla::tests_gpu -- --ignored --nocapture --test-threads 1`.
+    use super::host;
+    use super::synth::{self, HostWeights};
+    use super::tests::{fixture_dir, manifest, TINY};
+    use super::*;
+
+    unsafe fn bf16_dev(v: &[f32]) -> CUdeviceptr {
+        cuda::to_dev(&v.iter().map(|&x| synth::bf16_bits(x)).collect::<Vec<u16>>())
+    }
+
+    unsafe fn upload(w: &HostWeights) -> MlaWeights {
+        for v in [&w.q_a, &w.q_b, &w.kv_a, &w.kv_b, &w.o_proj, &w.wq_b, &w.idx_x] {
+            assert!(v.iter().all(|&x| synth::bf16_round(x) == x), "a weight is not BF16-representable");
+        }
+        MlaWeights {
+            q_a: bf16_dev(&w.q_a),
+            q_a_norm: cuda::to_f32_dev(&w.q_a_norm),
+            q_b: bf16_dev(&w.q_b),
+            kv_a: bf16_dev(&w.kv_a),
+            kv_a_norm: cuda::to_f32_dev(&w.kv_a_norm),
+            kv_b: bf16_dev(&w.kv_b),
+            o_proj: bf16_dev(&w.o_proj),
+            idx_wq_b: bf16_dev(&w.wq_b),
+            idx_x: bf16_dev(&w.idx_x),
+            idx_k_norm_w: cuda::to_f32_dev(&w.k_norm_w),
+            idx_k_norm_b: cuda::to_f32_dev(&w.k_norm_b),
+            idx_ape: cuda::to_f32_dev(&w.ape),
+        }
+    }
+
+    unsafe fn free_weights(w: &mut MlaWeights) {
+        for p in [&mut w.q_a, &mut w.q_a_norm, &mut w.q_b, &mut w.kv_a, &mut w.kv_a_norm, &mut w.kv_b, &mut w.o_proj, &mut w.idx_wq_b, &mut w.idx_x, &mut w.idx_k_norm_w, &mut w.idx_k_norm_b, &mut w.idx_ape] {
+            cuda::free_dev(p);
+        }
+    }
+
+    /// `qsa_select_fast` from the engine's main module (Flash-Next prelude; the entry reads no define)
+    unsafe fn main_select() -> (cuda::Module, CUfunction) {
+        let m = cuda::compile(&crate::kernels::KernelGeo::flash_next().source());
+        let f = m.get("qsa_select_fast");
+        (m, f)
+    }
+
+    /// One run: prompt rows `0..t_prompt` in calls of `chunk`, then one row per call. Returns the
+    /// output rows `[n][hidden]` and every row's selection (ascending token ids).
+    unsafe fn run(kn: &MlaKernels, w: &MlaWeights, x: &[f32], t_prompt: usize, chunk: usize) -> (Vec<f32>, Vec<Vec<usize>>) {
+        let d = kn.dims;
+        let n = x.len() / d.hidden;
+        let mut cache = MlaCache::new(&d, n);
+        let mut s = MlaScratch::new(&d, chunk, n);
+        let xd = cuda::alloc_zeroed(chunk * d.hidden * 4);
+        let yd = cuda::alloc_zeroed(chunk * d.hidden * 4);
+        let mut y = vec![0f32; n * d.hidden];
+        let mut sel = Vec::with_capacity(n);
+        let mut calls: Vec<(usize, usize)> = (0..t_prompt).step_by(chunk).map(|r| (r, (r + chunk).min(t_prompt))).collect();
+        calls.extend((t_prompt..n).map(|r| (r, r + 1)));
+        for (r0, r1) in calls {
+            let t = r1 - r0;
+            cuda::to_f32_into(xd, &x[r0 * d.hidden..r1 * d.hidden]);
+            s.forward(kn, w, &cache, xd, yd, r0, t);
+            cuda::sync();
+            y[r0 * d.hidden..r1 * d.hidden].copy_from_slice(&cuda::dtoh(yd, t * d.hidden));
+            let sn = cuda::dtoh_i32(s.sel_n, t);
+            let sl = cuda::dtoh_i32(s.sel, t * d.sel_max());
+            for (i, &k) in sn.iter().enumerate() {
+                let mut v: Vec<usize> = sl[i * d.sel_max()..i * d.sel_max() + k as usize].iter().map(|&e| e as usize).collect();
+                v.sort();
+                sel.push(v);
+            }
+        }
+        s.free();
+        cache.free();
+        let (mut xd, mut yd) = (xd, yd);
+        cuda::free_dev(&mut xd);
+        cuda::free_dev(&mut yd);
+        (y, sel)
+    }
+
+    fn cosine(a: &[f32], b: &[f64]) -> f64 {
+        let (mut ab, mut aa, mut bb) = (0.0, 0.0, 0.0);
+        for (&p, &q) in a.iter().zip(b) {
+            ab += p as f64 * q;
+            aa += p as f64 * p as f64;
+            bb += q * q;
+        }
+        ab / (aa.sqrt() * bb.sqrt())
+    }
+
+    /// the kernels at small shapes against the f64 host reference with the same BF16 caches:
+    /// prefill in calls of 12 rows, then decode rows; dense rows 0..18, sparse rows from 19 on
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_mla::tests_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mla_gpu_small_shapes_match_the_host_reference() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let (_m, select) = main_select();
+            let kn = MlaKernels::new(TINY, select);
+            let hw = synth::weights(&TINY, 11);
+            let (t_prompt, n) = (40, 46);
+            let x = synth::x(11, n, TINY.hidden);
+            let r = host::forward(&hw, &x, true, true);
+            let mut w = upload(&hw);
+            let (y, sel) = run(&kn, &w, &x, t_prompt, 12);
+            let mut worst_cos: f64 = 1.0;
+            for p in 0..n {
+                assert_eq!(sel[p], r.sel[p], "row {p}: selection");
+                let h = TINY.hidden;
+                let c = cosine(&y[p * h..(p + 1) * h], &r.y[p * h..(p + 1) * h]);
+                worst_cos = worst_cos.min(c);
+                let rms = (r.y[p * h..(p + 1) * h].iter().map(|v| v * v).sum::<f64>() / h as f64).sqrt();
+                let md = y[p * h..(p + 1) * h].iter().zip(&r.y[p * h..(p + 1) * h]).map(|(&a, &b)| (a as f64 - b).abs()).fold(0.0, f64::max);
+                assert!(md <= 1e-4 * rms, "row {p}: max |d| {md:e} at rms {rms:e}");
+            }
+            assert!(sel[45].len() == TINY.topk + 2 && sel[18].len() == 19, "{} {}", sel[45].len(), sel[18].len());
+            println!("small shapes: {n} rows, every selection identical, worst cosine {worst_cos:.9}");
+            free_weights(&mut w);
+        }
+    }
+
+    fn read_f32(name: &str) -> Vec<f32> {
+        let b = std::fs::read(fixture_dir().join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    }
+
+    fn read_u16(name: &str) -> Vec<u16> {
+        let b = std::fs::read(fixture_dir().join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+    }
+
+    /// Gate G3 of the plan on synthetic weights with the real block shapes: the sub-block output at
+    /// every anchor row (prompt and decode) has cosine >= 0.9999 against the HF golden with the
+    /// engine's cache precision (`bf16kv`), and every row's selection equals the golden's (dense
+    /// rows: the causal set; sparse rows p >= 2051: the same 512 pools), ties excepted and counted.
+    /// The engine runs the prompt in calls of 384 rows (the golden: 512), then 8 decode rows.
+    /// The cost of the BF16 cache against HF in f32 is printed, not gated (docs/glm5-mla.md).
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_mla::tests_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mla_gpu_matches_the_hf_golden_at_real_shapes() {
+        let m = manifest();
+        let d = MlaDims::of(&Glm5Geo::GLM_5_3_FLASH);
+        let (seed, t_prompt, n) = (m["seed"].as_u64().unwrap(), m["T"].as_u64().unwrap() as usize, m["N"].as_u64().unwrap() as usize);
+        let anchors: Vec<usize> = m["anchors"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
+        let sp = m["sparse_rows"].as_array().unwrap();
+        let (s0, s1) = (sp[0].as_u64().unwrap() as usize, sp[1].as_u64().unwrap() as usize);
+        assert_eq!((s0, s1), (2051, n - 1));
+        let gold = read_f32("golden-bf16kv-anchors.f32");
+        let gold32 = read_f32("golden-f32-anchors.f32");
+        let tk = read_u16("topk-bf16kv-sparse.u16");
+        let tk32 = read_u16("topk-f32-sparse.u16");
+        let ties: Vec<usize> = m["tie_rows"]["bf16kv"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
+        let hw = synth::weights(&d, seed);
+        let x = synth::x(seed, n, d.hidden);
+        let (y, sel) = unsafe {
+            let _ctx = cuda::Ctx::init();
+            let (_m, select) = main_select();
+            let kn = MlaKernels::new(d, select);
+            let mut w = upload(&hw);
+            let out = run(&kn, &w, &x, t_prompt, 384);
+            free_weights(&mut w);
+            out
+        };
+        drop(hw);
+        // selections, every row
+        let (mut bad, mut tie_skips, mut vs_f32) = (Vec::new(), 0, 0);
+        for p in 0..n {
+            let ncb = (p + 1) / 4;
+            if ncb <= d.sel_pools() {
+                if sel[p] != (0..=p).collect::<Vec<_>>() {
+                    bad.push(p);
+                }
+                continue;
+            }
+            let pools: Vec<usize> = sel[p].iter().filter(|&&t| t < 4 * ncb).step_by(4).map(|&t| t / 4).collect();
+            let tail: Vec<usize> = sel[p].iter().cloned().filter(|&t| t >= 4 * ncb).collect();
+            let i = p - s0;
+            let want: Vec<usize> = tk[i * 512..(i + 1) * 512].iter().map(|&v| v as usize).collect();
+            let want32: Vec<usize> = tk32[i * 512..(i + 1) * 512].iter().map(|&v| v as usize).collect();
+            assert_eq!(tail, (4 * ncb..=p).collect::<Vec<_>>(), "row {p}: tail");
+            assert_eq!(sel[p].len(), 2048 + tail.len(), "row {p}: whole pools");
+            if pools != want {
+                if ties.contains(&p) { tie_skips += 1 } else { bad.push(p) }
+            }
+            if pools != want32 {
+                vs_f32 += 1;
+            }
+        }
+        assert!(bad.is_empty(), "selection differs from the bf16kv golden on rows {bad:?}");
+        // outputs at the anchors
+        let h = d.hidden;
+        let mut worst = (1.0f64, 0usize);
+        let mut worst32 = (1.0f64, 0usize);
+        for (k, &p) in anchors.iter().enumerate() {
+            let g: Vec<f64> = gold[k * h..(k + 1) * h].iter().map(|&v| v as f64).collect();
+            let g32: Vec<f64> = gold32[k * h..(k + 1) * h].iter().map(|&v| v as f64).collect();
+            let c = cosine(&y[p * h..(p + 1) * h], &g);
+            let c32 = cosine(&y[p * h..(p + 1) * h], &g32);
+            let md = y[p * h..(p + 1) * h].iter().zip(&g).map(|(&a, &b)| (a as f64 - b).abs()).fold(0.0, f64::max);
+            let rms = (g.iter().map(|v| v * v).sum::<f64>() / h as f64).sqrt();
+            println!("anchor {p:5} {}: cosine {c:.9}  max|d| {md:.3e}  rms {rms:.3e}  | vs f32 golden {c32:.9}",
+                if p < t_prompt { "prompt" } else { "decode" });
+            if c < worst.0 { worst = (c, p) }
+            if c32 < worst32.0 { worst32 = (c32, p) }
+        }
+        println!("selection: {} rows, sparse rows {s0}..={s1}, 0 differ from bf16kv (tie rows skipped {tie_skips}); {vs_f32} sparse rows differ from the f32 golden", n);
+        println!("worst anchor cosine vs bf16kv {:.9} (row {}), vs f32 {:.9} (row {})", worst.0, worst.1, worst32.0, worst32.1);
+        assert!(worst.0 >= 0.9999, "G3: anchor {} cosine {:.9} < 0.9999", worst.1, worst.0);
+    }
+}

@@ -104,6 +104,9 @@ pub mod glm5_template;
 pub mod glm5_mhc;
 // #162: GLM-5.3-Flash KDA sub-block (conv, gates, state) on the GPU; wired nowhere yet
 pub mod glm5_kda;
+
+// #163: GLM-5.3-Flash MLA over a BF16 latent cache + the DSA indexer (own NVRTC module); wired nowhere yet
+pub mod glm5_mla;
 // #86: the OpenAI stop-string filter of `bin/serve.rs`, the same tail-hold
 // `toolcall::find_marker` gives `<tool_call>`, on arbitrary strings
 pub mod stopstr;

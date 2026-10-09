@@ -6430,6 +6430,22 @@ pub mod mul1 {
     }
 }
 
+// ---------------- #163: glm5_next MLA + DSA indexer kernels ----------------
+
+/// #163: the glm5_next MLA (BF16 latent cache, absorbed kv_b) and DSA indexer (learned 4-token
+/// pooling, pool scores) source (`kernels_glm5_mla.cu`). Its own NVRTC module behind the `GM_*`
+/// prelude of `glm5_mla::MlaDims`, the `MUL1_SRC` pattern: no entry of `KERNEL_SRC` changes. The
+/// host side and its tests are `crate::glm5_mla`.
+pub const GLM5_MLA_SRC: &str = include_str!("kernels_glm5_mla.cu");
+
+/// #163: compile `GLM5_MLA_SRC` behind `prelude` (`glm5_mla::MlaDims::prelude`)
+///
+/// # Safety
+/// A CUDA context is current.
+pub unsafe fn glm5_mla_module(prelude: &str) -> cuda::Module {
+    cuda::compile(&format!("{prelude}{GLM5_MLA_SRC}"))
+}
+
 // ---------------- #164: glm5_next FFN kernels ----------------
 
 /// #164: the glm5_next router / SwiGLU-clamp / combine source (`kernels_glm5_moe.cu`). Its own
