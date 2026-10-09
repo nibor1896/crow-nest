@@ -133,6 +133,9 @@ pub mod glm5_flags;
 pub mod glm5_graph;
 // #182: the glm5_next MTP (NextN) block - eh glue, MLA + DSA, MoE, shared head norm
 pub mod glm5_mtp;
+// the glm-flash-lite integration: GPU tests of the switches of several branches together
+#[cfg(test)]
+mod glm5_int_tests;
 // #31 A9: the prefix cache (spec section 7) - snapshot, rollback and the id prefix rule
 pub mod cache;
 // #32 A10: the slot file behind POST /slots/0?action=save|restore (spec section 7)

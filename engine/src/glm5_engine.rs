@@ -132,6 +132,15 @@ pub trait Rows {
     /// cumulative `[vram, pinned, nvme]` expert accesses over every MoE layer, and the NVMe
     /// bytes read, since boot (never reset)
     fn counters(&self) -> ([u64; 3], u64);
+
+    /// `CROW_GLM_LA`: drop a row enqueued ahead (the state back to the last returned row);
+    /// everything that reads or replaces the sequence's state calls this first
+    ///
+    /// # Safety
+    /// As [`Rows::row`].
+    unsafe fn settle_ahead(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------- the device
@@ -252,6 +261,10 @@ impl Rows for Glm5Device {
         if self.run.mtp_drafts() > 0 {
             return self.run.spec_decode(&mut self.o.cnq, &mut self.tiers, tok, pos);
         }
+        // CROW_GLM_LA: the next row goes ahead on the device's id before this one is read
+        if self.run.switches().la {
+            return self.run.decode_la(&mut self.o.cnq, &mut self.tiers, tok, pos);
+        }
         self.row(tok, pos, true)?.ok_or_else(|| format!("glm5: the head row at {pos} gave no id"))
     }
     fn mtp_drafts(&self) -> usize {
@@ -261,6 +274,11 @@ impl Rows for Glm5Device {
         self.run.mtp_take_stats().map(|s| s.summary())
     }
     unsafe fn logits(&self) -> Vec<f32> {
+        // CROW_GLM_LA: a row may be running ahead; the stream first (a blocking pageable copy
+        // issued while a controlled row waits on the device faulted, WDDM, 2026-10-10)
+        if self.run.has_ahead() {
+            cuda::sync();
+        }
         cuda::dtoh(self.run.logits_dev(), self.o.g.vocab)
     }
     unsafe fn set_logits(&mut self, row: &[f32]) {
@@ -307,6 +325,9 @@ impl Rows for Glm5Device {
         }
         self.run.spec_level();
     }
+    unsafe fn settle_ahead(&mut self) -> Result<(), String> {
+        self.run.settle_ahead(&mut self.tiers)
+    }
     fn counters(&self) -> ([u64; 3], u64) {
         let a = self.tiers.cache.counters().iter().fold([0u64; 3], |a, c| [a[0] + c[0], a[1] + c[1], a[2] + c[2]]);
         (a, self.tiers.nvme_bytes)
@@ -318,6 +339,7 @@ impl Drop for Glm5Device {
         // SAFETY: the context `boot::open_glm5` made is still current (the caller drops the
         // engine before it), and no launch is pending between requests
         unsafe {
+            let _ = self.run.settle_ahead(&mut self.tiers);
             self.tiers.free();
             self.run.free();
         }
@@ -431,6 +453,7 @@ impl<R: Rows> Glm5Engine<R> {
     /// # Safety
     /// As [`Rows::row`].
     pub unsafe fn rollback(&mut self, p: usize) -> Result<f64, String> {
+        self.rows.settle_ahead()?;
         if self.snap.pos != Some(p) || p > self.history.len() {
             return Err(format!("glm5: no snapshot at {p} (held {:?}, history {})", self.snap.pos, self.history.len()));
         }
@@ -456,6 +479,8 @@ impl<R: Rows> Glm5Engine<R> {
     /// As [`Rows::row`].
     pub unsafe fn reset(&mut self) -> f64 {
         let t = std::time::Instant::now();
+        // a failed drop leaves nothing to keep: the state is zeroed next
+        let _ = self.rows.settle_ahead();
         self.rows.zero_state();
         self.history.clear();
         self.snap.pos = None;
@@ -471,6 +496,10 @@ impl<R: Rows> Glm5Engine<R> {
         let pos0 = self.history.len();
         if chunk.is_empty() || pos0 + chunk.len() > self.rows.n_ctx() {
             return Err(format!("glm5: prefill of {} ids at {pos0} with n_ctx {}", chunk.len(), self.rows.n_ctx()));
+        }
+        if let Err(e) = self.rows.settle_ahead() {
+            self.reset();
+            return Err(e);
         }
         match self.rows.prefill_chunk(chunk, pos0) {
             Ok(id) => {
@@ -525,6 +554,9 @@ impl<R: Rows> Glm5Engine<R> {
             return 0.0;
         }
         let t = std::time::Instant::now();
+        if self.rows.settle_ahead().is_err() {
+            return 0.0;
+        }
         let n = self.rows.state_floats();
         if self.snap.state.len() != n {
             self.snap.state = vec![0.0; n];
