@@ -2338,6 +2338,554 @@ impl ExpertTiers {
     }
 }
 
+#[cfg(test)]
+mod arena_tests {
+    //! `CROW_GLM_ARENA=global`: the host policy ([`GlobalArena`]), its execution ([`serve_global`])
+    //! on a memory twin, the switches, the ring book, and a replay on recorded routing (ignored).
+    use super::*;
+    use crate::expert_cache::Policy;
+
+    /// the xorshift64 trace of `docs/expert-cache.md` (`expert_cache` tests, the same generator in
+    /// Python): `k` distinct ascending ids per token per layer, a hot set drifting every 200 tokens
+    fn trace(tokens: usize, layers: usize, experts: u64, k: usize) -> Vec<Vec<Vec<u32>>> {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..tokens)
+            .map(|t| {
+                let base = (t as u64 / 200) * 16;
+                (0..layers as u64)
+                    .map(|l| {
+                        let mut got: Vec<u32> = Vec::with_capacity(k);
+                        while got.len() < k {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            let e = if (x >> 32) % 10 < 7 { (base + l * 7 + x % 48) % experts } else { (x >> 8) % experts } as u32;
+                            if !got.contains(&e) {
+                                got.push(e);
+                            }
+                        }
+                        got.sort_unstable();
+                        got
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn keys(a: &GlobalArena, p: impl Fn(Place) -> bool) -> Vec<(usize, u32)> {
+        (0..a.layers).flat_map(|l| (0..a.experts as u32).map(move |e| (l, e))).filter(|&(l, e)| p(a.place(l, e))).collect()
+    }
+
+    #[test]
+    fn the_arena_switch_defaults_to_the_per_layer_path() {
+        assert_eq!(arena_kind(None), Ok(ArenaKind::Layer));
+        assert_eq!(arena_kind(Some("")), Ok(ArenaKind::Layer));
+        assert_eq!(arena_kind(Some("layer")), Ok(ArenaKind::Layer));
+        assert_eq!(arena_kind(Some(" global ")), Ok(ArenaKind::Global));
+        for bad in ["Global", "1", "lru"] {
+            assert!(arena_kind(Some(bad)).unwrap_err().contains(ARENA_ENV), "{bad}");
+        }
+        let none = |_: &str| None;
+        assert_eq!(arena_config(&none).unwrap(), ArenaConfig::default());
+        assert_eq!(ArenaConfig::default(), ArenaConfig { admit_max: 64, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512 });
+        let set = |k: &str| match k {
+            ARENA_ADMIT_MAX_ENV => Some("16".to_string()),
+            ARENA_NOADMIT_ENV => Some("1".to_string()),
+            ARENA_WARM_ENV => Some("w.json".to_string()),
+            ARENA_VRING_ENV => Some("0".to_string()),
+            ARENA_ELASTIC_ENV => Some("10".to_string()),
+            ARENA_STAGE_ENV => Some("2.5".to_string()),
+            ARENA_STAGE_MIN_ENV => Some("256".to_string()),
+            _ => None,
+        };
+        let c = arena_config(&set).unwrap();
+        assert_eq!(c, ArenaConfig { admit_max: 16, noadmit: true, warm: Some("w.json".into()), vring: 0, elastic_bytes: 10 << 30, stage_bytes: 5 << 29, stage_min: 256 });
+        for (k, v) in [(ARENA_ADMIT_MAX_ENV, "x"), (ARENA_NOADMIT_ENV, "yes"), (ARENA_VRING_ENV, "-1"), (ARENA_ELASTIC_ENV, "nan"), (ARENA_STAGE_MIN_ENV, "0")] {
+            let one = |q: &str| (q == k).then(|| v.to_string());
+            assert!(arena_config(&one).unwrap_err().contains(k), "{k}={v}");
+        }
+    }
+
+    #[test]
+    fn admission_is_for_decode_sized_calls_only() {
+        assert!(arena_admits(8, false, 64));
+        assert!(arena_admits(64, false, 64));
+        assert!(!arena_admits(65, false, 64));
+        assert!(!arena_admits(8, true, 64), "a prompt call never admits");
+        assert!(!arena_admits(1, false, 0));
+    }
+
+    /// no quota per layer: one layer may hold every VRAM slot, the next layer's miss takes one
+    #[test]
+    fn one_layer_can_hold_every_vram_slot() {
+        let mut a = GlobalArena::new(3, 16, 4, 0).unwrap();
+        a.step(0, &[0, 1, 2, 3], true);
+        assert_eq!(keys(&a, |p| matches!(p, Place::Vram(_))), vec![(0, 0), (0, 1), (0, 2), (0, 3)]);
+        let ch = a.step(1, &[5], true);
+        // every bit set: the hand clears all four and takes slot 0 (expert 0 of layer 0)
+        assert_eq!(ch, vec![(0, Place::Vram(0), Place::Nvme), (16 + 5, Place::Nvme, Place::Vram(0))]);
+        a.check().unwrap();
+    }
+
+    /// a slot pinned by the call (a hit or an admission of the same call) is never a victim; with
+    /// none left the call's remaining misses are not admitted
+    #[test]
+    fn clock_never_evicts_a_slot_the_call_uses() {
+        let mut a = GlobalArena::new(1, 16, 2, 4).unwrap();
+        a.step(0, &[1, 2], true);
+        let ch = a.step(0, &[1, 3, 4], true);
+        assert_eq!(a.place(0, 1), Place::Vram(0), "the hit stays");
+        assert_eq!(a.place(0, 3), Place::Vram(1), "3 takes 2's slot");
+        assert_eq!(a.place(0, 2), Place::Ram(0), "the victim is written back to pinned");
+        assert_eq!(a.place(0, 4), Place::Ram(1), "no victim left: 4 lands in pinned, not admitted");
+        assert_eq!(a.stats.no_victim, 1);
+        assert_eq!(ch.len(), 3);
+        a.check().unwrap();
+    }
+
+    /// exclusive tiers: an admission frees the pinned copy, the VRAM victim is written back into
+    /// pinned as the most recent; the pinned LRU victim is the oldest expert the call does not route
+    #[test]
+    fn tiers_are_exclusive_and_victims_are_written_back() {
+        let mut a = GlobalArena::new(2, 8, 1, 2).unwrap();
+        a.step(0, &[0], true);
+        a.step(0, &[1], true);
+        assert_eq!((a.place(0, 0), a.place(0, 1)), (Place::Ram(0), Place::Vram(0)));
+        a.step(0, &[0], true);
+        assert_eq!((a.place(0, 0), a.place(0, 1)), (Place::Vram(0), Place::Ram(0)), "0 promoted, 1 written back into the freed slot");
+        a.step(1, &[3], true);
+        a.step(1, &[4], true);
+        // pinned holds 2: (0,1) is the oldest, written back slots are newest
+        let ram = keys(&a, |p| matches!(p, Place::Ram(_)));
+        assert_eq!(ram.len(), 2);
+        assert!(!ram.contains(&(0, 1)), "the oldest pinned expert dropped to the NVMe: {ram:?}");
+        assert_eq!(a.stats.ram_evictions, 1);
+        a.check().unwrap();
+        // protected: a call's own pinned expert is never the LRU victim
+        let mut b = GlobalArena::new(1, 8, 0, 1).unwrap();
+        b.step(0, &[1], false);
+        b.step(0, &[1, 2], false);
+        assert_eq!((b.place(0, 1), b.place(0, 2)), (Place::Ram(0), Place::Nvme), "2 cannot evict the call's own 1");
+    }
+
+    /// a prompt call (no admission) reads its misses where they lie: NVMe misses land in pinned,
+    /// VRAM is untouched
+    #[test]
+    fn a_call_without_admission_moves_nothing_into_vram() {
+        let mut a = GlobalArena::new(1, 16, 4, 8).unwrap();
+        a.step(0, &[0, 1], true);
+        let ch = a.step(0, &[0, 1, 2, 3, 4], false);
+        assert!(ch.iter().all(|c| c.2 != Place::Vram(2) && !matches!(c.2, Place::Vram(_))), "{ch:?}");
+        assert_eq!(keys(&a, |p| matches!(p, Place::Vram(_))), vec![(0, 0), (0, 1)]);
+        assert_eq!(keys(&a, |p| matches!(p, Place::Ram(_))), vec![(0, 2), (0, 3), (0, 4)]);
+    }
+
+    /// `NV_NOADMIT`: NVMe picks land in pinned, pinned hits are still admitted;
+    /// `zerocopy` (pin stay): pinned hits stay, NVMe picks are admitted
+    #[test]
+    fn noadmit_and_pinned_stays() {
+        let mut a = GlobalArena::new(1, 16, 4, 8).unwrap();
+        a.set_noadmit(true);
+        a.step(0, &[5], true);
+        assert_eq!(a.place(0, 5), Place::Ram(0));
+        a.step(0, &[5], true);
+        assert_eq!(a.place(0, 5), Place::Vram(0), "a pinned hit is admitted");
+        let mut b = GlobalArena::new(1, 16, 4, 8).unwrap();
+        b.step(0, &[5], false);
+        b.set_pin_stay(true);
+        b.step(0, &[5, 6], true);
+        assert_eq!((b.place(0, 5), b.place(0, 6)), (Place::Ram(0), Place::Vram(0)));
+    }
+
+    /// disabled slots (ring, a handed-back elastic chunk) are never victims; disabling writes the
+    /// owners back; enabling brings the slots back empty; reset keeps them disabled
+    #[test]
+    fn disabled_slots_are_never_used() {
+        let mut a = GlobalArena::new(1, 32, 4, 8).unwrap();
+        a.step(0, &[0, 1, 2, 3], true);
+        let ch = a.disable(2..4);
+        assert_eq!(ch, vec![(2, Place::Vram(2), Place::Ram(0)), (3, Place::Vram(3), Place::Ram(1))]);
+        assert_eq!(a.enabled_vram(), 2);
+        for t in 0..20u32 {
+            a.step(0, &[4 + t % 8], true);
+            assert!(keys(&a, |p| matches!(p, Place::Vram(2) | Place::Vram(3))).is_empty());
+        }
+        a.check().unwrap();
+        a.reset();
+        assert_eq!(a.enabled_vram(), 2, "reset keeps the disabled slots");
+        a.enable(2..4);
+        a.add_slots(2);
+        assert_eq!((a.enabled_vram(), a.vram_slots()), (6, 6));
+        a.step(0, &[0, 1, 2, 3, 4, 5], true);
+        assert_eq!(keys(&a, |p| matches!(p, Place::Vram(_))).len(), 6);
+        a.check().unwrap();
+    }
+
+    /// The VRAM hits of the global CLOCK arena are sybil's `ec_step_k` as `tools/glm_tier_sim.py`
+    /// `dyn_run(.., "clock", "global", 64)` replays it (its pinned tier does not change VRAM):
+    /// 600 tokens of the shared trace, 42 x 288 experts, top-8; the figures are the sim's.
+    #[test]
+    fn vram_hits_equal_glm_tier_sim_global_clock() {
+        let tr = trace(600, 42, 288, 8);
+        assert_eq!(&tr[0][0], &[6, 9, 31, 36, 42, 44, 45, 66], "the generator drifted from the Python one");
+        for (cv, cp, hits, admitted) in [(25 * 42, 83 * 42, 46_635u64, 154_965u64), (46 * 42, 124 * 42, 88_748, 112_852), (8 * 42, 0, 16_712, 184_888)] {
+            let mut a = GlobalArena::new(42, 288, cv, cp).unwrap();
+            for tok in &tr {
+                for (l, ids) in tok.iter().enumerate() {
+                    a.step(l, ids, arena_admits(ids.len(), false, 64));
+                }
+            }
+            let v: u64 = a.counters().iter().map(|c| c[0]).sum();
+            assert_eq!((v, a.stats.admitted), (hits, admitted), "V {cv} P {cp}");
+            a.check().unwrap();
+        }
+    }
+
+    #[test]
+    fn warm_plan_and_warm_files() {
+        let a = GlobalArena::new(2, 6, 4, 4).unwrap();
+        let s = vec![vec![0.0, 5.0, 1.0, 5.0, 3.0, 2.0], vec![]];
+        let (v, p) = a.warm_plan(&s);
+        assert_eq!(v, vec![vec![1, 3], vec![]], "top 2 by score, ties the lower id");
+        assert_eq!(p, vec![vec![4, 5], vec![]]);
+        let obj = r#"{"model.language_model.layers.3.mlp": [1,2,3], "4": [3,2,1]}"#;
+        assert_eq!(parse_warm(obj, 2, 3, 3).unwrap(), vec![vec![1.0, 2.0, 3.0], vec![3.0, 2.0, 1.0]]);
+        assert_eq!(parse_warm("[[1,2,3],[0,0,1]]", 2, 3, 3).unwrap()[1], vec![0.0, 0.0, 1.0]);
+        for bad in ["[[1,2,3]]", r#"{"9": [1,2,3]}"#, r#"{"3": [1,2]}"#, "nope"] {
+            assert!(parse_warm(bad, 2, 3, 3).unwrap_err().contains(ARENA_WARM_ENV), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_ring_book_reuses_landed_entries_and_waits_for_busy_ones() {
+        let mut b = RingBook::new(2);
+        let mut none = |_: usize| false;
+        assert_eq!(b.take(&mut none), (0, false));
+        b.q[0] = 7;
+        assert_eq!(b.take(&mut none), (1, false));
+        b.q[1] = 9;
+        assert_eq!(b.take(&mut none), (0, true), "both busy: the next one, after its D2H");
+        b.q[0] = 11;
+        assert_eq!(b.pending(9, &mut none), vec![1]);
+        assert_eq!(b.pending(9, &mut |r| r == 1), Vec::<usize>::new(), "landed: freed");
+        assert_eq!(b.q[1], NONE);
+        assert_eq!(b.take(&mut |_| false), (1, false));
+    }
+
+    /// The host twin of the device (as `tests::Sim`, over global slots): every slot holds the key
+    /// (`layer x experts + expert`) of the record in it; the container "reads" a record as its key.
+    struct GSim {
+        experts: usize,
+        layer: usize,
+        vram: Vec<u32>,
+        pinned: Vec<u32>,
+        stage: Vec<u32>,
+        landing: Vec<u32>,
+        pending_reads_pinned: Vec<u32>,
+        ops: Moves,
+    }
+
+    const EMPTY: u32 = u32::MAX - 1;
+
+    impl GSim {
+        fn new(experts: usize, vram: usize, pinned: usize, stage: usize) -> GSim {
+            GSim { experts, layer: 0, vram: vec![EMPTY; vram], pinned: vec![EMPTY; pinned], stage: vec![EMPTY; stage], landing: vec![EMPTY; stage], pending_reads_pinned: Vec::new(), ops: Moves::default() }
+        }
+    }
+
+    impl Mover for GSim {
+        fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
+            assert!(jobs.len() <= MAX_IN_FLIGHT);
+            for &(e, d) in jobs {
+                let key = (self.layer * self.experts) as u32 + e;
+                match d {
+                    Dst::Landing(i) => {
+                        self.landing[i as usize] = key;
+                        self.ops.nvme_to_landing += 1;
+                    }
+                    Dst::Pinned(q) => {
+                        assert!(!self.pending_reads_pinned.contains(&q), "NVMe wrote pinned slot {q} while a queued copy still reads it");
+                        self.pinned[q as usize] = key;
+                        self.ops.nvme_to_pinned += 1;
+                    }
+                }
+            }
+            Ok(jobs.len() as u64)
+        }
+        fn landing_to_stage(&mut self, i: u32) {
+            self.ops.landing_to_stage += 1;
+            self.stage[i as usize] = self.landing[i as usize];
+        }
+        fn pinned_to_stage(&mut self, q: u32, s: u32) {
+            self.ops.pinned_to_stage += 1;
+            self.pending_reads_pinned.push(q);
+            self.stage[s as usize] = self.pinned[q as usize];
+        }
+        fn vram_to_stage(&mut self, v: u32, s: u32) {
+            self.ops.vram_to_stage += 1;
+            self.stage[s as usize] = self.vram[v as usize];
+        }
+        fn barrier(&mut self) {
+            self.pending_reads_pinned.clear();
+        }
+        fn vram_to_pinned(&mut self, v: u32, q: u32) {
+            self.ops.vram_to_pinned += 1;
+            self.pinned[q as usize] = self.vram[v as usize];
+        }
+        fn stage_to_vram(&mut self, s: u32, v: u32) {
+            self.ops.stage_to_vram += 1;
+            self.vram[v as usize] = self.stage[s as usize];
+        }
+    }
+
+    fn holds(sim: &GSim, l: usize, e: u32, loc: Loc) -> bool {
+        let key = (l * sim.experts) as u32 + e;
+        key == match loc {
+            Loc::Vram(v) => sim.vram[v as usize],
+            Loc::Pinned(q) => sim.pinned[q as usize],
+            Loc::Stage(s) => sim.stage[s as usize],
+        }
+    }
+
+    /// Every call of a trace over three layers, at capacities from all-NVMe to roomy, with
+    /// admission on and off, `zerocopy`, NOADMIT and slots disabled and enabled on the way: every
+    /// selected id is read from a slot that holds its record, the locations come back for exactly
+    /// the selected ids in the order the per-layer path returns them, the twin saw the moves
+    /// `serve_global` counts, and the arena's invariants hold.
+    #[test]
+    fn every_location_holds_its_record() {
+        let (nl, ex, k) = (3usize, 24u64, 6usize);
+        let tr = trace(160, nl, ex, k);
+        for (v, p) in [(0, 0), (0, 9), (3, 0), (6, 6), (9, 30), (24, 12)] {
+            for variant in 0..4 {
+                let mut a = GlobalArena::new(nl, ex as usize, v, p).unwrap();
+                a.set_pin_stay(variant == 1);
+                a.set_noadmit(variant == 2);
+                let mut sim = GSim::new(ex as usize, v, p, 2 * k);
+                let mut cache = ExpertCache::new(Policy::Lru, Scope::PerLayer, nl, ex as usize, v / nl, p / nl).unwrap();
+                let mut slots: Vec<LayerSlots> = (0..nl).map(|_| LayerSlots::new(ex as usize, TierSizes { vram: v / nl, pinned: p / nl })).collect();
+                let mut psim = tests_sim_free::PSim::default();
+                for (t, tok) in tr.iter().enumerate() {
+                    if variant == 3 && v >= 6 && t == 60 {
+                        let ch = a.disable(v - 3..v);
+                        write_back(&ch, &mut sim).unwrap();
+                        sim.barrier();
+                    }
+                    if variant == 3 && v >= 6 && t == 120 {
+                        a.enable(v - 3..v);
+                    }
+                    for (l, ids) in tok.iter().enumerate() {
+                        let admit = arena_admits(ids.len() * if t % 7 == 3 { 20 } else { 1 }, false, 64);
+                        sim.layer = l;
+                        let before = sim.ops;
+                        let served = serve_global(&mut a, l, ids, admit, 2 * k, &mut sim).unwrap();
+                        sim.barrier();
+                        for &(e, loc) in &served.locs {
+                            assert!(holds(&sim, l, e, loc), "V {v} P {p} variant {variant} token {t} layer {l}: expert {e} at {loc:?}");
+                        }
+                        let ops = sim.ops.since(&before);
+                        let m = served.moves;
+                        assert_eq!(
+                            (ops.nvme_to_landing, ops.nvme_to_pinned, ops.landing_to_stage, ops.pinned_to_stage, ops.vram_to_stage, ops.vram_to_pinned, ops.stage_to_vram),
+                            (m.nvme_to_landing, m.nvme_to_pinned, m.landing_to_stage, m.pinned_to_stage, m.vram_to_stage, m.vram_to_pinned, m.stage_to_vram),
+                            "V {v} P {p} variant {variant} token {t} layer {l}: moves"
+                        );
+                        // ids identical: the per-layer path serves the same ids in the same order
+                        let per = serve(&mut cache, l, &mut slots[l], ids, 2 * k, &mut psim).unwrap();
+                        assert_eq!(per.locs.iter().map(|x| x.0).collect::<Vec<_>>(), served.locs.iter().map(|x| x.0).collect::<Vec<_>>());
+                        assert_eq!(served.locs.iter().map(|x| x.0).collect::<Vec<_>>(), *ids);
+                    }
+                    a.check().unwrap_or_else(|e| panic!("V {v} P {p} variant {variant} token {t}: {e}"));
+                }
+            }
+        }
+    }
+
+    mod tests_sim_free {
+        use super::super::*;
+        /// a mover that records nothing (the per-layer path's ids only)
+        #[derive(Default)]
+        pub struct PSim;
+        impl Mover for PSim {
+            fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
+                Ok(jobs.len() as u64)
+            }
+            fn landing_to_stage(&mut self, _: u32) {}
+            fn pinned_to_stage(&mut self, _: u32, _: u32) {}
+            fn vram_to_stage(&mut self, _: u32, _: u32) {}
+            fn barrier(&mut self) {}
+            fn vram_to_pinned(&mut self, _: u32, _: u32) {}
+            fn stage_to_vram(&mut self, _: u32, _: u32) {}
+        }
+    }
+
+    /// a prompt call through the global arena: row sub-batches that fit the staging slots, every
+    /// row's ids read from slots that hold them, nothing admitted
+    #[test]
+    fn a_prompt_call_is_served_in_sub_batches_without_admission() {
+        let (ex, k) = (32usize, 4usize);
+        let mut a = GlobalArena::new(2, ex, 4, 0).unwrap();
+        a.step(1, &[0, 1, 2, 3], true);
+        let mut sim = GSim::new(ex, 4, 0, 8);
+        sim.layer = 1;
+        // warm the twin's VRAM like the arena (the step above moved no bytes)
+        for e in 0..4u32 {
+            if let Place::Vram(v) = a.place(1, e) {
+                sim.vram[v as usize] = ex as u32 + e;
+            }
+        }
+        let sel: Vec<i32> = (0..8).flat_map(|r| (0..k as i32).map(move |j| (r * 3 + j * 5) % ex as i32)).collect();
+        let mut rows_seen = Vec::new();
+        let mut each = |r0: usize, rows: usize, s: &Served| -> Result<(), String> {
+            rows_seen.push((r0, rows));
+            assert_eq!(s.moves.n2v + s.moves.p2v, 0, "no admission in a prompt call");
+            Ok(())
+        };
+        let n = serve_chunk_global(&mut a, 1, &sel, k, 8, &mut sim, &mut each).unwrap();
+        assert!(n > 1, "the 8 rows do not fit 8 staging slots at once");
+        assert_eq!(rows_seen.iter().map(|x| x.1).sum::<usize>(), 8);
+        assert_eq!(keys(&a, |p| matches!(p, Place::Vram(_))), vec![(1, 0), (1, 1), (1, 2), (1, 3)]);
+        assert!(fitting_rows_global(&a, 1, &sel[..3], k, 8).unwrap_err().contains("no [rows]"));
+    }
+
+    /// the chunk mover addresses global slot `g` as slot `g % per` of chunk `g / per`
+    #[test]
+    fn the_chunk_mover_maps_global_slots_onto_the_chunks() {
+        #[derive(Default)]
+        struct Rec {
+            vram: Dev,
+            pinned: u64,
+            log: Vec<(&'static str, u64, u32, u64, u32)>,
+        }
+        impl Mover for Rec {
+            fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
+                for &(_, d) in jobs {
+                    if let Dst::Pinned(q) = d {
+                        self.log.push(("nvme", 0, 0, self.pinned, q));
+                    }
+                }
+                Ok(0)
+            }
+            fn landing_to_stage(&mut self, _: u32) {}
+            fn pinned_to_stage(&mut self, q: u32, _: u32) {
+                self.log.push(("p2s", 0, 0, self.pinned, q));
+            }
+            fn vram_to_stage(&mut self, v: u32, _: u32) {
+                self.log.push(("v2s", self.vram, v, 0, 0));
+            }
+            fn barrier(&mut self) {}
+            fn vram_to_pinned(&mut self, v: u32, q: u32) {
+                self.log.push(("v2p", self.vram, v, self.pinned, q));
+            }
+            fn stage_to_vram(&mut self, _: u32, v: u32) {
+                self.log.push(("s2v", self.vram, v, 0, 0));
+            }
+        }
+        impl<'a> Rebase<'a> for Rec {
+            fn set_vram(&mut self, base: Dev) {
+                self.vram = base;
+            }
+            fn set_pinned(&mut self, p: Option<&'a Pinned>) {
+                self.pinned = p.map_or(0, |p| p.dev);
+            }
+            fn stream(&self) -> sys::CUstream {
+                std::ptr::null_mut()
+            }
+        }
+        let pinned: Vec<Pinned> = (0..3).map(|i| { let mut p: Pinned = unsafe { std::mem::zeroed() }; p.dev = 1000 * (i + 1); p }).collect();
+        let vram = [10u64, 20, 30];
+        let mut m = ChunkMover { inner: Rec::default(), vram: &vram, pinned: &pinned, vpl: 4, ppl: 5, rb: 1, ring: None };
+        m.vram_to_pinned(9, 7);
+        m.stage_to_vram(0, 4);
+        m.pinned_to_stage(14, 0);
+        m.nvme(&[(1, Dst::Pinned(0)), (2, Dst::Pinned(12)), (3, Dst::Pinned(13))]).unwrap();
+        assert_eq!(
+            m.inner.log,
+            vec![("v2p", 30, 1, 2000, 2), ("s2v", 20, 0, 0, 0), ("p2s", 0, 0, 3000, 4), ("nvme", 0, 0, 1000, 0), ("nvme", 0, 0, 3000, 2), ("nvme", 0, 0, 3000, 3)]
+        );
+        std::mem::forget(pinned);
+    }
+
+    /// The replay of recorded routing (the held-out file of `tools/glm_tier_sim.py`, exported as
+    /// `routes.u16` `[n][42][8]` and `mask.u8` `[n]`, 1 = generated, into `$ARENA_REPLAY_DIR`):
+    /// token by token from an empty cache, the per-layer LRU of the path of record against the
+    /// global arena at the same slots (`$ARENA_REPLAY_SLOTS` = V:P per layer, default 46:124),
+    /// counted over the generated positions. `$ARENA_REPLAY_WARM` = a warm-start file for the arena.
+    #[test]
+    #[ignore = "needs exported routing: ARENA_REPLAY_DIR=<dir> cargo test --release --lib arena_replay -- --ignored --nocapture"]
+    fn arena_replay_on_recorded_routing() {
+        let dir = std::env::var("ARENA_REPLAY_DIR").expect("ARENA_REPLAY_DIR");
+        let r = std::fs::read(format!("{dir}/routes.u16")).unwrap();
+        let mask = std::fs::read(format!("{dir}/mask.u8")).unwrap();
+        let (nl, ex, k) = (42usize, 288usize, 8usize);
+        let n = mask.len();
+        assert_eq!(r.len(), n * nl * k * 2);
+        let id = |t: usize, l: usize, j: usize| u16::from_le_bytes([r[((t * nl + l) * k + j) * 2], r[((t * nl + l) * k + j) * 2 + 1]]) as u32;
+        let slots = std::env::var("ARENA_REPLAY_SLOTS").unwrap_or("46:124".into());
+        let (v, p) = slots.split_once(':').map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap())).unwrap();
+        let warm = std::env::var("ARENA_REPLAY_WARM").ok().map(|f| parse_warm(&std::fs::read_to_string(f).unwrap(), nl, 3, ex).unwrap());
+        let gen = mask.iter().filter(|&&m| m == 1).count() as f64;
+        let visits = gen * (nl * k) as f64;
+        let report = |name: &str, c: [u64; 3]| {
+            println!(
+                "{name:<40} VRAM hit {:6.2} %  VRAM hits/token {:6.1}  pinned/token {:6.1}  NVMe reads/token {:6.2}",
+                100.0 * c[0] as f64 / visits,
+                c[0] as f64 / gen,
+                c[1] as f64 / gen,
+                c[2] as f64 / gen
+            );
+        };
+        println!("replay: {n} positions, {gen} generated, V {v} P {p} per layer");
+        for stay in [false, true] {
+            let mut c = ExpertCache::new(Policy::Lru, Scope::PerLayer, nl, ex, v, p).unwrap();
+            c.set_pinned_stays(stay);
+            let mut tot = [0u64; 3];
+            for t in 0..n {
+                let before: [u64; 3] = c.counters().iter().fold([0; 3], |a, x| [a[0] + x[0], a[1] + x[1], a[2] + x[2]]);
+                for l in 0..nl {
+                    let ids: Vec<u32> = (0..k).map(|j| id(t, l, j)).collect();
+                    c.observe_token(l, &ids);
+                }
+                if mask[t] == 1 {
+                    let after: [u64; 3] = c.counters().iter().fold([0; 3], |a, x| [a[0] + x[0], a[1] + x[1], a[2] + x[2]]);
+                    (0..3).for_each(|i| tot[i] += after[i] - before[i]);
+                }
+            }
+            report(&format!("per-layer LRU {}", if stay { "zerocopy" } else { "promote" }), tot);
+        }
+        for (stay, noadmit, vring) in [(false, false, 0), (false, false, 24), (true, false, 24), (false, true, 24)] {
+            let mut a = GlobalArena::new(nl, ex, nl * v, nl * p).unwrap();
+            if vring > 0 {
+                a.disable(nl * v - vring..nl * v);
+            }
+            a.set_pin_stay(stay);
+            a.set_noadmit(noadmit);
+            if let Some(w) = &warm {
+                let (vr, pr) = a.warm_plan(w);
+                for l in 0..nl {
+                    a.step(l, &vr[l], true);
+                    a.step(l, &pr[l], false);
+                }
+                a.clear_counters();
+            }
+            let mut tot = [0u64; 3];
+            for t in 0..n {
+                let before: [u64; 3] = a.counters().iter().fold([0; 3], |a, x| [a[0] + x[0], a[1] + x[1], a[2] + x[2]]);
+                for l in 0..nl {
+                    let ids: Vec<u32> = (0..k).map(|j| id(t, l, j)).collect();
+                    a.step(l, &ids, arena_admits(k, false, 64));
+                }
+                if mask[t] == 1 {
+                    let after: [u64; 3] = a.counters().iter().fold([0; 3], |a, x| [a[0] + x[0], a[1] + x[1], a[2] + x[2]]);
+                    (0..3).for_each(|i| tot[i] += after[i] - before[i]);
+                }
+            }
+            a.check().unwrap();
+            report(&format!("global CLOCK{}{}{} ring {vring}", if stay { " zerocopy" } else { "" }, if noadmit { " noadmit" } else { "" }, if warm.is_some() { " warm" } else { "" }), tot);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- the device store
 
 /// a 4096-aligned host buffer (the NVMe landing of the staging slots; pageable, not pinned, so
