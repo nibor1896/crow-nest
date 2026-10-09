@@ -69,6 +69,7 @@ pub enum Tier {
 }
 
 /// one exclusive pool (a layer, or every layer under `Scope::Global`)
+#[derive(Clone)]
 struct Pool {
     tier: Vec<Tier>,
     stamp: Vec<u64>,
@@ -267,6 +268,7 @@ impl Pool {
 }
 
 /// The cache: policy, scope, per-layer capacities, the pools and the counters.
+#[derive(Clone)]
 pub struct ExpertCache {
     pub policy: Policy,
     pub scope: Scope,
@@ -443,6 +445,32 @@ impl ExpertCache {
         for &e in ids {
             self.access(l, e, 1);
         }
+    }
+
+    /// #186: the tier of every expert of layer `l` after `observe_token(l, ids)`, the cache left
+    /// as it is (a dry run on a copy: under `Scope::PerLayer` the copy holds only layer `l`'s pool)
+    pub fn tiers_after(&self, l: usize, ids: &[u32]) -> Vec<Tier> {
+        let (mut c, at) = match self.scope {
+            Scope::PerLayer => (
+                ExpertCache {
+                    policy: self.policy,
+                    scope: self.scope,
+                    layers: 1,
+                    experts: self.experts,
+                    vram: self.vram,
+                    pinned: self.pinned,
+                    pools: vec![self.pools[l].clone()],
+                    now: self.now,
+                    counters: vec![[0; 3]],
+                    admitted: vec![self.admitted[l]],
+                    last: vec![Vec::new()],
+                },
+                0,
+            ),
+            Scope::Global => (self.clone(), l),
+        };
+        c.observe_token(at, ids);
+        (0..self.experts as u32).map(|e| c.tier(at, e)).collect()
     }
 
     /// One tick of layer `l` from CUMULATIVE per-expert counts (`Gen::drain_sel_counts`): every
@@ -805,5 +833,44 @@ mod tests {
         let e = policy_for("Glm5Next", None, true).unwrap_err();
         assert!(e.contains("CROW_ADAPT_WINDOW=1"), "{e}");
         assert_eq!(policy_for("FlashNext", None, true), Ok(None), "off stays off under the window");
+    }
+
+    /// #186: the dry run is the real step. Every policy, both scopes, three capacities, a drifting
+    /// trace of three ids per token over two layers: before each `observe_token`,
+    /// `tiers_after` gives exactly the tiers the step leaves, and changes neither tiers nor counters.
+    #[test]
+    fn tiers_after_is_the_observe_step_without_the_step() {
+        let policies = [Policy::Lru, Policy::Clock { admit: None }, Policy::Clock { admit: Some(2) }, Policy::Lfu { decay: 0.7 }];
+        for p in policies {
+            for scope in [Scope::PerLayer, Scope::Global] {
+                for (v, pin) in [(0, 0), (2, 3), (5, 1)] {
+                    let mut c = ExpertCache::new(p, scope, 2, 16, v, pin).unwrap();
+                    let mut x: u64 = 0x186;
+                    for tok in 0..60u64 {
+                        for l in 0..2 {
+                            let mut ids: Vec<u32> = Vec::new();
+                            while ids.len() < 3 {
+                                x ^= x << 13;
+                                x ^= x >> 7;
+                                x ^= x << 17;
+                                let e = ((tok / 10 + x % 6) % 16) as u32;
+                                if !ids.contains(&e) {
+                                    ids.push(e);
+                                }
+                            }
+                            ids.sort_unstable();
+                            let before: Vec<Tier> = (0..16).map(|e| c.tier(l, e)).collect();
+                            let counters = c.counters().to_vec();
+                            let dry = c.tiers_after(l, &ids);
+                            assert_eq!((0..16).map(|e| c.tier(l, e)).collect::<Vec<_>>(), before, "{p:?} {scope:?}: the dry run moved an expert");
+                            assert_eq!(c.counters(), &counters[..], "{p:?} {scope:?}: the dry run counted");
+                            c.observe_token(l, &ids);
+                            let after: Vec<Tier> = (0..16).map(|e| c.tier(l, e)).collect();
+                            assert_eq!(dry, after, "{p:?} {scope:?} V {v} P {pin} token {tok} layer {l}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
