@@ -35,8 +35,11 @@ the real shards yet; every runtime is derived.
 - **converter** (`converter/src/mul1_store.rs`, `src/main.rs` `mul1_*`): the dense part through the
   unchanged `encode_tensor`, then one record per expert in (layer, expert) order, built by
   `mul1::write_record` from the expert file after its sha256 matched the store journal. `--mul1-wait`
-  waits for records still being quantized; without it a missing record is refused before a byte is
-  written.
+  waits for `store.json` (the quantizer writes it once the capture's `calibration.json` exists) and for records
+  still being quantized; without it a missing `store.json` or record is refused before a byte is written.
+  `quantize --wait` likewise waits for `calibration.json` and for each layer's `capture.json`, polling every
+  30 s with no timeout, so all three terminals of (b) can be started at once; without `--wait` a missing
+  capture is refused.
 
 ## Calibration set
 
@@ -114,15 +117,15 @@ converter/target/release/converter.exe --scales mse --source-repo zai-org/GLM-5.
 ## Tests
 
 ```
-cd converter && cargo test --release                                   # 98 passed, 1 ignored (2026-10-09)
-python -I tools/test_glm_mul1_quantize.py                              # pure: 8 passed, 4 skipped
-.venv-oracle/Scripts/python.exe -I tools/test_glm_mul1_quantize.py     # + capture vs HF: 10 passed, 2 skipped
-.venv-exl3/Scripts/python.exe -I tools/test_glm_mul1_quantize.py       # + quantize on the GPU and the converter: 10 passed, 2 skipped
+cd converter && cargo test --release                                   # 100 passed, 1 ignored (2026-10-09)
+python -I tools/test_glm_mul1_quantize.py                              # pure: 10 passed, 4 skipped
+.venv-oracle/Scripts/python.exe -I tools/test_glm_mul1_quantize.py     # + capture vs HF: 12 passed, 2 skipped
+.venv-exl3/Scripts/python.exe -I tools/test_glm_mul1_quantize.py       # + quantize on the GPU and the converter: 12 passed, 2 skipped
 ```
 
 - Converter (miniature: hidden 128, inter 256, layer 3 experts 0-1 and the MTP expert 0): record layout
   and alignment, index entries under the engine's rule, dense part identical to `cnq4.5-glm5-next`,
-  kill-and-resume byte identity at six points, `--mul1-wait`, `--layers 3`, and the refusals (missing
+  kill-and-resume byte identity at six points, `--mul1-wait` (also started before `store.json` exists), `--layers 3`, and the refusals (missing
   record, sha256 mismatch, other shapes / record size / K, wrong dtype, `--consume`, disk).
 - Tool: capture equals HF's full model's MoE input and routing on every row of the runner's synthetic
   small checkpoint; quantize writes exllamav3's tensors, resumes without duplicates, uses the identity

@@ -10,6 +10,8 @@
 - the record size (9,474,048 B for GLM-5.3-Flash) and the expert count (43 x 288);
 - the layer spec, the held-out file, a work or store dir inside the FP8 originals, and the disk check refuse;
 - a torn journal line is cut; pruning deletes only records whose `.done` names the given container;
+- `quantize --wait` started before the capture's `calibration.json` exists waits for it and goes on, without `--wait` it
+  still refuses (the capture and the quantizer are started together, docs/glm-mul1-conversion.md);
 - `plan` prints the partial (layers 0-3) and the full commands;
 - capture: the dumped MoE inputs equal HF's full model's `mlp` input on every row (BF16 rounding), the routed
   ids its router's; a capture interrupted after a layer resumes to the same files;
@@ -19,6 +21,7 @@
   then frees exactly those records.
 """
 import hashlib
+import io
 import importlib.util
 import json
 import math
@@ -28,8 +31,11 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -131,6 +137,45 @@ class Pure(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(os.path.join(store, "L03"))),
                          ["E000.done", "E001.done", "E001.safetensors", "E002.safetensors"])
         self.assertEqual(os.listdir(fp8), ["model-00001-of-00062.safetensors"])
+
+    def quantize_args(self, *extra):
+        return ["quantize", "--fp8", os.path.join(self.d, "fp8"), "--work", os.path.join(self.d, "work"),
+                "--store", os.path.join(self.d, "store"), "--dry-run", *extra]
+
+    def run_quantize(self, args, delay=None):
+        """Q.main(args) with the FP8 checks stubbed (identity "mine"); `delay`: seconds until a calibration.json
+        of another identity appears in the work dir. Returns (exit code, stderr, seconds the call took)."""
+        work = os.path.join(self.d, "work")
+        os.makedirs(work, exist_ok=True)
+        writer = None
+        if delay is not None:
+            writer = threading.Timer(delay, Q.write_json_atomic, (os.path.join(work, "calibration.json"),
+                                                                  {"fp8_identity_sha256": "theirs"}))
+            writer.start()
+        err = io.StringIO()
+        t0 = time.time()
+        try:
+            with mock.patch.object(Q, "_fp8_checks", return_value={"identity_sha256": "mine"}),                     mock.patch.object(Q, "POLL_S", 0.02), mock.patch("sys.stderr", err), mock.patch("sys.stdout", io.StringIO()):
+                code = Q.main(args)
+        finally:
+            if writer:
+                writer.join()
+        return code, err.getvalue(), time.time() - t0
+
+    def test_quantize_wait_starts_before_the_capture_and_goes_on_once_calibration_json_exists(self):
+        # #182: capture and quantize are started together; calibration.json appears 0.3 s later. The call gets
+        # past the wait (it then refuses the weights of the stub: "captured from other weights").
+        code, err, secs = self.run_quantize(self.quantize_args("--wait"), delay=0.3)
+        self.assertIn("captured from other weights", err)
+        self.assertNotIn("no capture in this work dir", err)
+        self.assertEqual(code, 2)
+        self.assertGreaterEqual(secs, 0.3)
+
+    def test_quantize_without_wait_still_refuses_a_missing_calibration_json(self):
+        code, err, secs = self.run_quantize(self.quantize_args())
+        self.assertEqual(code, 2)
+        self.assertIn("no capture in this work dir", err)
+        self.assertLess(secs, 0.3)
 
     def test_plan_prints_both_commands(self):
         t = Q.plan_text(free=168 * Q.GIB)

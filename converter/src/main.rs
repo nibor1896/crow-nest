@@ -663,7 +663,7 @@ fn quantize_nvfp4_cap(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], us
     (out, global, stats, sse_ceil)
 }
 
-const HELP: &str = "usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>] <model-dir | file.safetensors> <out.cnq>\n  writes an index v2 container: config.json + generation_config.json verbatim, the family's recipe, source repo/revision/shard sha256\n  (--revision defaults to the Hugging Face cache in the model dir; Crow #300 C6)\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n  --scales diag --diag-stats <f.json>  all 126 ue4m3 steps scored by the activation-weighted error (Crow #300 p2-lh)\n  --headers <dir>  read the shard headers from a header cache (<dir>/<shard>.json) (crow-nest #154)\n  --consume <shard-dir>  convert while shards come and go: wait for <shard>.verified, write <shard>.done, never delete; needs --headers (crow-nest #155)\n  an interrupted conversion resumes from <out>.cnq.journal.jsonl (crow-nest #155)\n  --layers <spec> [--with-embed-head]  a partial container: text layers <spec> only (0-3, 0,3) [+ token embedding, lm_head, final norm]; the rest is filtered and the index says so (crow-nest #156)\n  --experts-mul1 <store> [--mul1-wait] [--disk-reserve-gib N]  GLM-5.3-Flash: the routed experts (MTP layer 45 incl.) as MUL1 K=3 trellis records from a tools/glm_mul1_quantize.py store, after the dense part; --mul1-wait waits for records still being quantized; refused when free disk < bytes to write + N GiB (default 16) (crow-nest #182)\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dequant <container.cnq> (<name>[:<r0>:<r1>] ... | --names -)\n  writes the named tensors (rows r0..r1) to stdout as f32 little endian, decoded as gate 0 decodes them (crow-nest #156)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter layer-rule-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) --arm attn-v-out|ffn-down-rule|ffn-down-all\n  builds a bf16 overlay container for one llama.cpp-shaped layer-rule arm (#91 phase 1)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)\n       converter plan [--headers <dir>] [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  the dry run: family, recipe, per-tensor dtype/section table, GPU / host byte totals (Crow #300 C6)";
+const HELP: &str = "usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>] <model-dir | file.safetensors> <out.cnq>\n  writes an index v2 container: config.json + generation_config.json verbatim, the family's recipe, source repo/revision/shard sha256\n  (--revision defaults to the Hugging Face cache in the model dir; Crow #300 C6)\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n  --scales diag --diag-stats <f.json>  all 126 ue4m3 steps scored by the activation-weighted error (Crow #300 p2-lh)\n  --headers <dir>  read the shard headers from a header cache (<dir>/<shard>.json) (crow-nest #154)\n  --consume <shard-dir>  convert while shards come and go: wait for <shard>.verified, write <shard>.done, never delete; needs --headers (crow-nest #155)\n  an interrupted conversion resumes from <out>.cnq.journal.jsonl (crow-nest #155)\n  --layers <spec> [--with-embed-head]  a partial container: text layers <spec> only (0-3, 0,3) [+ token embedding, lm_head, final norm]; the rest is filtered and the index says so (crow-nest #156)\n  --experts-mul1 <store> [--mul1-wait] [--disk-reserve-gib N]  GLM-5.3-Flash: the routed experts (MTP layer 45 incl.) as MUL1 K=3 trellis records from a tools/glm_mul1_quantize.py store, after the dense part; --mul1-wait waits for store.json and for records still being quantized; refused when free disk < bytes to write + N GiB (default 16) (crow-nest #182)\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dequant <container.cnq> (<name>[:<r0>:<r1>] ... | --names -)\n  writes the named tensors (rows r0..r1) to stdout as f32 little endian, decoded as gate 0 decodes them (crow-nest #156)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter layer-rule-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) --arm attn-v-out|ffn-down-rule|ffn-down-all\n  builds a bf16 overlay container for one llama.cpp-shaped layer-rule arm (#91 phase 1)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)\n       converter plan [--headers <dir>] [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  the dry run: family, recipe, per-tensor dtype/section table, GPU / host byte totals (Crow #300 C6)";
 
 /// `converter imatrix-show <imatrix.gguf> [tensor ...]` — #79. Read-only: the kv block, the
 /// tensor count, and for every named tensor its dims, its data offset, its first eight values,
@@ -1863,7 +1863,7 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
     // ---- #182: the MUL1 store, and every expert unit checked against it before a byte is written ----
     let mut mul1 = match &opts.mul1 {
         None => None,
-        Some(dir) => match mul1_open(&m, &units, dir, opts.mul1_wait) {
+        Some(dir) => match mul1_open(&m, &units, dir, opts.mul1_wait, opts.poll) {
             Ok(s) => Some(s),
             Err(e) => {
                 eprintln!("conversion refused: {e}");
@@ -2203,8 +2203,10 @@ fn is_mul1_unit(m: &Manifest, u: &Unit) -> bool {
 /// #182: open the MUL1 store of a conversion and check every expert unit against it before a byte
 /// is written: GLM only; gate, up and down present with the shapes of the store's record (torch
 /// `[out, in]`: gate/up `[inter, hidden]`, down `[hidden, inter]`); without `--mul1-wait` every
-/// record journalled by the quantizer.
-fn mul1_open(m: &Manifest, units: &[Unit], dir: &std::path::Path, wait: bool) -> Result<mul1_store::Store, String> {
+/// record journalled by the quantizer. Under `--mul1-wait` a `store.json` the quantizer has not
+/// written yet is waited for as well (polling every `poll`, no timeout: the quantizer waits for the
+/// capture, which runs for hours); without it a missing `store.json` is refused.
+fn mul1_open(m: &Manifest, units: &[Unit], dir: &std::path::Path, wait: bool, poll: std::time::Duration) -> Result<mul1_store::Store, String> {
     if m.family != recipe::Family::Glm5Next {
         return Err(format!("--experts-mul1: MUL1 expert records are GLM-5.3-Flash's (glm5_next), this checkpoint is {}", m.family.name()));
     }
@@ -2213,6 +2215,16 @@ fn mul1_open(m: &Manifest, units: &[Unit], dir: &std::path::Path, wait: bool) ->
         return Err("config.json: text_config lacks hidden_size or moe_intermediate_size".into());
     };
     let (hidden, inter) = (hidden as usize, inter as usize);
+    if wait {
+        // #182: started together with the quantizer, the converter is ready before store.json exists
+        let head = dir.join(mul1_store::STORE_FILE);
+        if !head.exists() {
+            eprintln!("mul1: waiting for {}", head.display());
+            while !head.exists() {
+                std::thread::sleep(poll);
+            }
+        }
+    }
     let store = mul1_store::Store::open(dir, hidden, inter)?;
     let want = [("gate", vec![inter, hidden]), ("up", vec![inter, hidden]), ("down", vec![hidden, inter])];
     let (mut records, mut missing) = (0usize, Vec::new());
@@ -3713,6 +3725,55 @@ mod tests {
         assert_eq!(convert_with(&dir, &dir.join("glm3.cnq"), ScalesMode::Mse, &glm_prov(), None, &opts), 0);
         quantizer.join().unwrap();
         assert!(std::fs::read(dir.join("glm3.cnq")).unwrap() == want);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #182 `--mul1-wait`, started together with the quantizer (docs/glm-mul1-conversion.md): the store
+    /// directory and its store.json do not exist yet when the converter starts (the quantizer waits for
+    /// the capture's calibration first). The converter waits for store.json, then converts as the
+    /// quantizer journals, and ends with the container of an uninterrupted conversion.
+    #[test]
+    fn mul1_wait_waits_for_a_store_json_the_quantizer_has_not_written_yet() {
+        let (want, _) = mul1_reference();
+        let dir = tmp("mul1-wait-head");
+        write_glm_synth_with(&dir, &dir, true);
+        let store = dir.join("store");
+        assert!(!store.exists());
+        let quantizer = {
+            let (dir, store) = (dir.clone(), store.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                // store.json appears whole (the tool writes it by rename), then the records
+                let staging = dir.join("staging");
+                write_store_head(&staging);
+                std::fs::create_dir_all(&store).unwrap();
+                std::fs::rename(staging.join(mul1_store::STORE_FILE), store.join(mul1_store::STORE_FILE)).unwrap();
+                for (l, e) in MINI_RECORDS {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    store_add(&store, l, e);
+                }
+            })
+        };
+        let opts = ConvertOpts { mul1_wait: true, poll: std::time::Duration::from_millis(5), ..mul1_opts(&store) };
+        let t0 = std::time::Instant::now();
+        assert_eq!(convert_with(&dir, &dir.join("glm3.cnq"), ScalesMode::Mse, &glm_prov(), None, &opts), 0);
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(300), "the converter did not wait for store.json");
+        quantizer.join().unwrap();
+        assert!(std::fs::read(dir.join("glm3.cnq")).unwrap() == want);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #182: without `--mul1-wait` a missing store.json is still refused at once (exit 2, no output file).
+    #[test]
+    fn without_mul1_wait_a_missing_store_json_is_refused() {
+        let dir = tmp("mul1-no-head");
+        write_glm_synth_with(&dir, &dir, true);
+        let store = dir.join("store");
+        let out = dir.join("glm3.cnq");
+        let t0 = std::time::Instant::now();
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &mul1_opts(&store)), 2);
+        assert!(t0.elapsed() < std::time::Duration::from_millis(300));
+        assert!(!out.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

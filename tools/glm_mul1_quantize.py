@@ -62,6 +62,7 @@ STORE = os.path.join(ROOT, "decode_out", "glm-mul1", "store")
 OUT_FULL = os.path.join(ROOT, "converter", "GLM-5.3-Flash-MUL1K3.cnq")
 OUT_PARTIAL = os.path.join(ROOT, "converter", "GLM-5.3-Flash-MUL1K3-L0-3.cnq")
 RESERVE_GIB = 16
+POLL_S = 30.0  # seconds between looks for a file the capture has not written yet (--wait)
 
 GIB = 1 << 30
 
@@ -666,13 +667,27 @@ def cmd_capture(a):
     return 0
 
 
+def await_calibration(cj, wait, log=print, poll=None):
+    """crow-nest #182: `calibration.json` is the capture's first file. Without --wait a missing one is
+    refused; with --wait the quantizer, started beside the capture as the docs say, polls for it (no
+    timeout, as for the layers: the capture may run for hours)."""
+    poll = POLL_S if poll is None else poll
+    said = False
+    while not os.path.exists(cj):
+        if not wait:
+            raise Refusal("%s: no capture in this work dir; run `capture` first (or pass --wait)" % cj)
+        if not said:
+            log("quantize: waiting for %s" % cj)
+            said = True
+        time.sleep(poll)
+
+
 def cmd_quantize(a):
     layers = parse_layers(a.layers)
     check_outside(a.fp8, a.work, a.store)
     ident = _fp8_checks(a.fp8)
     cj = os.path.join(a.work, "calibration.json")
-    if not os.path.exists(cj):
-        raise Refusal("%s: no capture in this work dir; run `capture` first" % cj)
+    await_calibration(cj, a.wait)
     calib = jload(cj)
     if calib["fp8_identity_sha256"] != ident["identity_sha256"]:
         raise Refusal("%s: captured from other weights" % cj)
@@ -715,7 +730,7 @@ def main(argv=None):
     q.add_argument("--store", default=STORE)
     q.add_argument("--layers", default=None)
     q.add_argument("--hessian-tokens", choices=("all", "routed"), default="all")
-    q.add_argument("--wait", action="store_true", help="wait for layers the capture has not dumped yet")
+    q.add_argument("--wait", action="store_true", help="wait for what the capture has not written yet: calibration.json, then each layer (polls, no timeout)")
     q.add_argument("--keep-capture", action="store_true", help="keep a layer's MoE-input dump after its records")
     q.add_argument("--prune-consumed", default=None, metavar="CONTAINER",
                    help="delete record files the converter has journalled into CONTAINER (their .done names it)")
