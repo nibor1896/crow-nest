@@ -127,6 +127,8 @@ pub mod glm5_model;
 // #175 + #149 (plan steps 16-17): the glm5_next experts in VRAM / pinned / NVMe tiers, all
 // layers resident, token by token (`bin/glm5_run.rs`)
 pub mod glm5_tiers;
+// #149 path B / #189: the glm5_next decode switches (CROW_GLM_FLAGS, CROW_GLM_LOOKAHEAD)
+pub mod glm5_flags;
 // #182: the glm5_next MTP (NextN) block - eh glue, MLA + DSA, MoE, shared head norm
 pub mod glm5_mtp;
 // #31 A9: the prefix cache (spec section 7) - snapshot, rollback and the id prefix rule

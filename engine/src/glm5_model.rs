@@ -756,6 +756,10 @@ pub struct Glm5Pass {
     moe_plans: Vec<GpuMoePlan>,
     dense_plans: Vec<GpuFfnPlan>,
     last_ffn_t: usize,
+    /// #149 path B (`CROW_GLM_FLAGS=1`, set by `Glm5Run`): the router ids of a MoE call reach the
+    /// host through mapped memory behind a flag instead of a stream sync + blocking copy; `None`
+    /// (every other user of the pass) is the sync
+    pub routed: Option<crate::glm5_flags::Routed>,
 }
 
 impl Glm5Pass {
@@ -786,6 +790,7 @@ impl Glm5Pass {
             moe_plans: Vec::new(),
             dense_plans: Vec::new(),
             last_ffn_t: 0,
+            routed: None,
             kn,
         }
     }
@@ -829,7 +834,8 @@ impl Glm5Pass {
 
     /// #175: [`Glm5Pass::call`] for a layer loaded without its expert records
     /// ([`load_layer_without_experts`]). In a MoE layer the router runs first; the host reads the
-    /// selected ids (`[t][topk]` i32, pick order; synchronizes) and hands them with the layer
+    /// selected ids (`[t][topk]` i32, pick order; synchronizes, or with [`Glm5Pass::routed`] waits
+    /// for their flag in mapped memory) and hands them with the layer
     /// index to `experts`, which puts those records where the MUL1 kernels can read them and
     /// returns the device `[E]` u64 table of record bases; the experts then run through that
     /// table. The launches are those of `call`, in the same order: only the table differs.
@@ -936,8 +942,16 @@ impl Glm5Pass {
                     }
                     Some(hook) => {
                         p.route(&self.kn.k, &self.kn.moe, w, self.collapsed);
-                        cuda::sync();
-                        let ids = cuda::dtoh_i32(p.ids, t * self.moe.topk);
+                        let ids = match self.routed.as_mut() {
+                            None => {
+                                cuda::sync();
+                                cuda::dtoh_i32(p.ids, t * self.moe.topk)
+                            }
+                            Some(r) => {
+                                r.publish(p.ids, t * self.moe.topk);
+                                r.wait().map_err(|e| format!("layer {}: {e}", lw.layer))?
+                            }
+                        };
                         let tb = hook(lw.layer, &ids)?;
                         p.experts(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub);
                     }
@@ -997,6 +1011,9 @@ impl Glm5Pass {
         }
         for p in self.dense_plans.iter_mut() {
             p.free();
+        }
+        if let Some(r) = self.routed.as_mut() {
+            r.free();
         }
         for d in [&mut self.ints.dev, &mut self.st2, &mut self.collapsed, &mut self.sub] {
             cuda::free_dev(d);

@@ -161,6 +161,7 @@ R, #174). The layer math is section 1 unchanged; what changes is where an expert
 - **One MoE call** (`Glm5Pass::call_with_experts`): `GpuMoePlan::route` (router GEMV + top-8),
   host sync, the 8 ids to `ExpertTiers::table_for`, then `GpuMoePlan::experts` (gather, MUL1
   gate/up/act/down, shared expert, combine). `route` + `experts` are exactly the launches of `run`.
+  With `CROW_GLM_FLAGS=1` the ids come through mapped memory instead of the sync (section 6.2).
 - **The moves** (`serve`): the cache observes the ids (one tick, ascending order like
   `glm_tier_sim`); then, per tier change, in three phases so no slot is overwritten before it is
   read: (A) every expert entering VRAM and every selected expert the policy leaves on NVMe goes to
@@ -193,7 +194,7 @@ Without `--ids` / `--prompt` / `--prompt-ids` the prompt is the tokenizer golden
 (31 ids). Per row: position, phase, rep, greedy id, seconds, NVMe reads (count, MB), the summed and
 the per-layer `v/p/n` accesses; then per rep the ids (the text with `--tokenizer`), the prefill and
 decode lines and the summary over the reps (section 6.1). The times are those of this synchronous
-path: every MoE layer syncs for its routing.
+path: every MoE layer syncs for its routing (switches off; section 6.2 for the two decode switches).
 
 ### 6.1 Measuring with `glm5_run` (#187)
 
@@ -297,6 +298,54 @@ criterion, `docs/architecture.md` A9; not run yet) and
 plan's V/P, rep 1 cold, rep 2 warm, `reset_cache`, rep 3: ids and logits bit-identical, rep 3's
 per-row moves = rep 1's; not run yet).
 
+### 6.2 Decode switches (#149 path B, #189)
+
+Two switches of `Glm5Run` (`glm5_flags`), both default off; off, `generate` runs every row through
+`Glm5Run::row` (one row body) and the path is call for call the one before them. `glm5_run` prints
+`[glm5_run] decode switches: ...` at load when one is on.
+
+- **`CROW_GLM_FLAGS=1`** (#149 path B, the routing half): after `route`, a one-block kernel copies
+  the 8 selected ids into mapped pinned host memory, `__threadfence_system`, then raises a 64-bit
+  sequence flag there (the device-side publication of `docs/architecture.md` 3.2; a kernel-side
+  mapped write, no memop on the legacy stream); the stream is submitted (`cuStreamQuery`). The host
+  spins on the flag (30 s, then refused by name) instead of `cuStreamSynchronize` plus a blocking
+  pageable `cuMemcpyDtoH`. **What the host still waits for:** the flag, i.e. every launch up to and
+  including the router (the GPU work the stream sync waited for), and inside
+  `ExpertTiers::table_for` its own waits: the phase-A barrier (a stream sync), the NVMe reads, the
+  synchronous landing and table uploads. Applies to `generate` and to `row` (serve).
+  **Not built: the "landed" half** (the GPU waiting on a host-raised flag before `experts`, so the
+  host could queue ahead of the staging): `serve`'s mover queues its copies on the current stream and
+  syncs it, and the table goes up from a transient host vector, so experts queued ahead would run
+  before their copies or deadlock the barrier. It needs the mover on its own stream with persistent
+  pinned sources (`serve` / `GpuMover`, not this change).
+- **`CROW_GLM_LOOKAHEAD=1`** (#189, `generate` only): a row with a head that is not the last queues
+  the next row before the host reads its id. The greedy id stays on the GPU; `Feed::gather` writes
+  its embedding row (BF16 widened exactly, as `embed_rows` + `trunk_input`) into the four streams;
+  the id (and the logits when kept) go to pinned memory by an async copy and are read at the next
+  row's first MoE layer, after its routing sync or flag. The embedding table goes to VRAM at load
+  (154,880 x 4096 BF16 = 1,268,776,960 B; the #159 plan does not book it: `glm5_run` plans before the
+  load, so the tier sizes do not change, free VRAM after setup is that much lower). Clock: a decode
+  row's `secs` and its report callback end when its id is read, inside the next row (after that
+  row's dense prefix and first router); the decode phase rate from the callback times stays
+  comparable, the per-row latency does not. `row` (serve) does not look ahead (serve needs token k
+  for its end-of-turn check before step k+1).
+- **PUBFAST** (the reference's `GLM53_NV_PUBFAST`): not built, no variable. The reference's warp-ballot publish
+  (sybil-solutions/glm-flash-lite `kernels/nv2/nv2_dev.cu` `nv_pub_fast_k`) replaces two serial
+  thread-0 scans over the experts inside its publish kernel; here the publish kernel copies the raw
+  top-8 and the host dedups 8 values (`distinct_ids`), so there is no scan to replace.
+
+Tests: host `glm5_flags::tests::only_1_turns_a_switch_on`. GPU (`cargo test --release --lib
+glm5_flags_gpu -- --ignored --nocapture --test-threads 1`, 17 s, passed 2026-10-09):
+`glm5_flags_gpu_the_feed_is_the_host_feed_bit_for_bit` (64-id table with NaN, +-Inf, -0,
+denormals), `glm5_flags_gpu_routed_ids_arrive_with_their_flag` (a kernel holding the stream 0 /
+0.3 / 2 ms before it writes the ids, 300 calls), `glm5_flags_gpu_the_switches_are_invisible_in_ids_logits_and_reports`
+(a synthetic 4-layer glm5_next container with the real layer shapes, layers 0-2 KDA + dense, layer 3
+DSA + MoE with 16 MUL1 records, vocab 2048, 5 + 6 ids, V 3 + P 4: flags, lookahead and both give
+the switch-off ids, logits bit for bit and row reports except the clock; `row` with the flags too).
+Each was shown red against a broken mechanism: the host not waiting for the flag (ids `[0, ..]`,
+then `CUDA_ERROR_ILLEGAL_ADDRESS`), the id read before a sync point (ids shifted by one row), the
+gather writing one stream (12,285 of 16,384 values differ).
+
 ## 7. Not verified
 
 - Whether the `--chain` drift (routing flips compounding f32 rounding over depth) is the size HF's own
@@ -307,3 +356,4 @@ per-row moves = rep 1's; not run yet).
 - `glm5_run` and the cache-size logits test on the real container (section 6): built, not run.
 - `glm5_run`'s timings and counters on the real container and the reps/reset logits test (section
   6.1, #187): built, not run; no baseline figure exists.
+- The decode switches (section 6.2) on the real container: built, not run; no speed figure.
