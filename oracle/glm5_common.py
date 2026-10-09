@@ -319,8 +319,11 @@ class ContainerSource(WeightSource):
     """`--weights container <file.cnq>`: a glm5_next CNQ container (crow-nest #156), whole or
     partial. Every tensor comes out of `converter dequant` (`converter/src/dequant.rs`): NVFP4
     decoded by the same `nvfp4_scale` / `nvfp4_value` gate 0 measures the written encoding with,
-    BF16 widened exactly, F32 as stored. The index trailer is read here only for names, shapes
-    and the checkpoint's config.json (carried verbatim in `model.config_json`)."""
+    BF16 widened exactly, F32 as stored, MUL1 K=3 routed-expert records (the 3-bit container,
+    #181/#182) decoded by the #181 reference decoder to the original-basis weight
+    `diag(suh) H W_hat H diag(svh) / 128` in the checkpoint's [out, in] layout. The index trailer is
+    read here only for names, shapes, the expert codec block and the checkpoint's config.json
+    (carried verbatim in `model.config_json`)."""
 
     def __init__(self, path, converter=None):
         self.kind = "cnq"
@@ -438,7 +441,19 @@ class ContainerSource(WeightSource):
             "converter": {"path": self.converter, "sha256": sha256_file(self.converter)},
             "n_tensors": len(dts),
             "n_nvfp4": dts.count("nvfp4"),
+            "n_mul1": dts.count("mul1"),
+            "expert_codec": self._expert_codec(),
         }
+
+    def _expert_codec(self):
+        """the index's MUL1 block (#182) without its per-file calibration hashes, or None"""
+        c = self.index.get("expert_codec")
+        if not c:
+            return None
+        keep = ("dtype", "k", "hidden", "inter", "record_bytes", "records", "store_sha256")
+        q = c.get("quantizer") or {}
+        return dict({k: c.get(k) for k in keep},
+                    quantizer={k: q.get(k) for k in ("name", "version", "commit", "codebook")})
 
 
 def open_weights(kind, path):

@@ -663,7 +663,8 @@ fn quantize_nvfp4_cap(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], us
     (out, global, stats, sse_ceil)
 }
 
-const HELP: &str = "usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>] <model-dir | file.safetensors> <out.cnq>\n  writes an index v2 container: config.json + generation_config.json verbatim, the family's recipe, source repo/revision/shard sha256\n  (--revision defaults to the Hugging Face cache in the model dir; Crow #300 C6)\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n  --scales diag --diag-stats <f.json>  all 126 ue4m3 steps scored by the activation-weighted error (Crow #300 p2-lh)\n  --headers <dir>  read the shard headers from a header cache (<dir>/<shard>.json) (crow-nest #154)\n  --consume <shard-dir>  convert while shards come and go: wait for <shard>.verified, write <shard>.done, never delete; needs --headers (crow-nest #155)\n  an interrupted conversion resumes from <out>.cnq.journal.jsonl (crow-nest #155)\n  --layers <spec> [--with-embed-head]  a partial container: text layers <spec> only (0-3, 0,3) [+ token embedding, lm_head, final norm]; the rest is filtered and the index says so (crow-nest #156)\n  --experts-mul1 <store> [--mul1-wait] [--disk-reserve-gib N]  GLM-5.3-Flash: the routed experts (MTP layer 45 incl.) as MUL1 K=3 trellis records from a tools/glm_mul1_quantize.py store, after the dense part; --mul1-wait waits for store.json and for records still being quantized; refused when free disk < bytes to write + N GiB (default 16) (crow-nest #182)\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dequant <container.cnq> (<name>[:<r0>:<r1>] ... | --names -)\n  writes the named tensors (rows r0..r1) to stdout as f32 little endian, decoded as gate 0 decodes them (crow-nest #156)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter layer-rule-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) --arm attn-v-out|ffn-down-rule|ffn-down-all\n  builds a bf16 overlay container for one llama.cpp-shaped layer-rule arm (#91 phase 1)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)\n       converter plan [--headers <dir>] [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  the dry run: family, recipe, per-tensor dtype/section table, GPU / host byte totals (Crow #300 C6)";
+const HELP: &str = "usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>] <model-dir | file.safetensors> <out.cnq>\n  writes an index v2 container: config.json + generation_config.json verbatim, the family's recipe, source repo/revision/shard sha256\n  (--revision defaults to the Hugging Face cache in the model dir; Crow #300 C6)\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n  --scales diag --diag-stats <f.json>  all 126 ue4m3 steps scored by the activation-weighted error (Crow #300 p2-lh)\n  --headers <dir>  read the shard headers from a header cache (<dir>/<shard>.json) (crow-nest #154)\n  --consume <shard-dir>  convert while shards come and go: wait for <shard>.verified, write <shard>.done, never delete; needs --headers (crow-nest #155)\n  an interrupted conversion resumes from <out>.cnq.journal.jsonl (crow-nest #155)\n  --layers <spec> [--with-embed-head]  a partial container: text layers <spec> only (0-3, 0,3) [+ token embedding, lm_head, final norm]; the rest is filtered and the index says so (crow-nest #156)\n  --experts-mul1 <store> [--mul1-wait] [--disk-reserve-gib N]  GLM-5.3-Flash: the routed experts (MTP layer 45 incl.) as MUL1 K=3 trellis records from a tools/glm_mul1_quantize.py store, after the dense part; --mul1-wait waits for store.json and for records still being quantized; refused when free disk < bytes to write + N GiB (default 16) (crow-nest #182)\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dequant <container.cnq> (<name>[:<r0>:<r1>] ... | --names -)\n  writes the named tensors (rows r0..r1) to stdout as f32 little endian, decoded as gate 0 decodes them (crow-nest #156);
+  MUL1 K=3 expert records as their original-basis weight diag(suh) H W_hat H diag(svh) / 128 (#181 decoder, f64, one f32 rounding)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter layer-rule-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) --arm attn-v-out|ffn-down-rule|ffn-down-all\n  builds a bf16 overlay container for one llama.cpp-shaped layer-rule arm (#91 phase 1)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)\n       converter plan [--headers <dir>] [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  the dry run: family, recipe, per-tensor dtype/section table, GPU / host byte totals (Crow #300 C6)";
 
 /// `converter imatrix-show <imatrix.gguf> [tensor ...]` — #79. Read-only: the kv block, the
 /// tensor count, and for every named tensor its dims, its data offset, its first eight values,
@@ -3432,8 +3433,12 @@ mod tests {
 
     /// Append one expert to a store: its file, then its journal line (the quantizer's order).
     fn store_add(store: &std::path::Path, l: u64, e: u64) {
+        store_add_mats(store, l, e, &synth_linears(l, e));
+    }
+
+    fn store_add_mats(store: &std::path::Path, l: u64, e: u64, mats: &[mul1::Linear; 3]) {
         let rel = mul1_store::rel_path(l, e);
-        write_expert_file(&store.join(&rel), &synth_linears(l, e));
+        write_expert_file(&store.join(&rel), mats);
         let sha = recipe::sha256_file(&store.join(&rel)).unwrap();
         let line = serde_json::json!({ "layer": l, "expert": e, "file": rel, "sha256": sha });
         let mut j = std::fs::OpenOptions::new().create(true).append(true).open(store.join(mul1_store::JOURNAL_FILE)).unwrap();
@@ -3481,6 +3486,102 @@ mod tests {
     /// lengths T / T / size - 2T, so the engine's rule (next offset after down - gate offset) gives
     /// the record size; the records follow the whole dense part in (layer, expert) order; the MTP
     /// experts are section `mtp`; the index names the codec; each record gets its `.done`.
+    /// `synth_linears` with finite scales: suh / svh fp16 of random sign and magnitude
+    /// (1 + m/1024) 2^-4, as exllamav3's quantizer writes them (the trellis words stay synthetic).
+    fn finite_linears(l: u64, e: u64) -> [mul1::Linear; 3] {
+        let mut m = synth_linears(l, e);
+        for lin in m.iter_mut() {
+            for v in lin.suh.iter_mut().chain(lin.svh.iter_mut()) {
+                *v = (*v & 0x8000) | (11 << 10) | (*v & 0x3ff);
+            }
+        }
+        m
+    }
+
+    /// The original-basis weight of one exllamav3 linear in the checkpoint's `[out, in]` layout,
+    /// written out as a matrix product: `W = diag(suh) H W_hat H diag(svh) / 128` (`[in, out]`,
+    /// exllamav3 `LinearEXL3.get_weight_tensor` with `had_k = had_n = 128`), H the 128 x 128
+    /// Sylvester matrix built by its recursion (exllamav3 `util/hadamard.py`), W_hat from the #181
+    /// reference `mul1::reconstruct`, every sum in f64, rounded to f32 once.
+    fn mul1_weight_reference(lin: &mul1::Linear, b: mul1::Bitrate) -> Vec<f32> {
+        let mut h = vec![1.0f64];
+        let mut d = 1;
+        while d < 128 {
+            let mut s = vec![0.0f64; 4 * d * d];
+            for i in 0..d {
+                for j in 0..d {
+                    let v = h[i * d + j];
+                    s[i * 2 * d + j] = v;
+                    s[i * 2 * d + j + d] = v;
+                    s[(i + d) * 2 * d + j] = v;
+                    s[(i + d) * 2 * d + j + d] = -v;
+                }
+            }
+            h = s;
+            d *= 2;
+        }
+        let (k, n) = (lin.k, lin.n);
+        let w_hat: Vec<f64> = mul1::reconstruct(&lin.trellis, k, n, b).into_iter().map(mul1::f16_to_f64).collect();
+        // H W_hat (row blocks), then (H W_hat) H (column blocks)
+        let mut hw = vec![0.0f64; k * n];
+        for i in 0..k {
+            let (blk, a0) = (i / 128 * 128, i % 128);
+            for c in 0..n {
+                hw[i * n + c] = (0..128).map(|a| h[a0 * 128 + a] * w_hat[(blk + a) * n + c]).sum();
+            }
+        }
+        let mut out = vec![0.0f32; n * k];
+        for i in 0..k {
+            let suh = mul1::f16_to_f64(lin.suh[i]);
+            for j in 0..n {
+                let (blk, b0) = (j / 128 * 128, j % 128);
+                let v: f64 = (0..128).map(|c| hw[i * n + blk + c] * h[c * 128 + b0]).sum();
+                out[j * k + i] = (v * suh * mul1::f16_to_f64(lin.svh[j]) / 128.0) as f32;
+            }
+        }
+        out
+    }
+
+    /// crow-nest #156: `converter dequant` decodes a MUL1 expert projection of a written
+    /// container to its original-basis weight in the checkpoint's `[out, in]` layout, bit for bit
+    /// the matrix-product reference above, for gate, up and down of a trunk and the MTP expert;
+    /// a row range is that slice of the whole tensor.
+    #[test]
+    fn dequant_decodes_mul1_records_to_the_original_basis() {
+        let dir = tmp("dequant-mul1");
+        write_glm_synth_with(&dir, &dir, true);
+        let store = dir.join("store");
+        write_store_head(&store);
+        for (l, e) in MINI_RECORDS {
+            store_add_mats(&store, l, e, &finite_linears(l, e));
+        }
+        let out = dir.join("glm3.cnq");
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &mul1_opts(&store)), 0);
+        let idx = trailer(&std::fs::read(&out).unwrap());
+        let ts = entries(&idx);
+        let b = mini_layout().bitrate;
+        let mut f = std::fs::File::open(&out).unwrap();
+        for (l, e) in MINI_RECORDS {
+            let mats = finite_linears(l, e);
+            for (p, lin) in ["gate", "up", "down"].iter().zip(&mats) {
+                let n = format!("model.language_model.layers.{l}.mlp.experts.{e}.{p}_proj.weight");
+                let t = ts.iter().find(|t| t["name"] == n).unwrap();
+                assert_eq!(t["dtype"], "mul1");
+                let want = mul1_weight_reference(lin, b);
+                assert!(want.iter().all(|v| v.is_finite() && *v != 0.0), "{n}: a reference of finite non-zero weights");
+                let got = dequant::decode(&mut f, 12, t, None).unwrap_or_else(|e| panic!("{n}: {e}"));
+                assert_eq!(got.len(), lin.k * lin.n, "{n}");
+                let bad = got.iter().zip(&want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                assert_eq!(bad, 0, "{n}: {bad} of {} values differ from the reference (first: {:?} vs {:?})", want.len(), got[0], want[0]);
+                let rows = dequant::decode(&mut f, 12, t, Some((37, 101))).unwrap();
+                assert!(rows == got[37 * lin.k..101 * lin.k], "{n}: rows 37..101");
+                let one = dequant::mul1_original_basis(lin, b, 0, lin.n, 1);
+                assert!(one.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()), "{n}: 1 thread vs many");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_mul1_conversion_writes_one_aligned_record_per_expert() {
         let dir = tmp("mul1-e2e");

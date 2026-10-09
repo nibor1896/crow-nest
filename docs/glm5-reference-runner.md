@@ -150,7 +150,11 @@ values come from `converter dequant <file.cnq> --names -` (`converter/src/dequan
 process per module, streamed into the same preallocated tensors as the FP8 path (`load_plan` fixes
 the order for both). NVFP4 is decoded by `nvfp4_scale` / `nvfp4_value`, the arithmetic gate 0 (the
 sidecar) measures the written encoding with; BF16 keeps are widened exactly, F32 carries are read as
-stored. So the reference sees exactly what the converter wrote, decoded by the converter's own code.
+stored. MUL1 K=3 routed-expert records (the 3-bit container, #181/#182) come out as their original-basis
+weight: the #181 decoder's W_hat (byte-identical to exllamav3 v1.6.0 `reconstruct`), then
+`diag(suh) H W_hat H diag(svh) / 128` (exllamav3 `get_weight_tensor`, H the 128-wide Sylvester Hadamard) in f64,
+rounded to f32 once, in the checkpoint's `[out, in]` layout (2026-10-09). The provenance names `n_mul1` and the
+index's `expert_codec`. So the reference sees exactly what the converter wrote, decoded by the converter's own code.
 The binary is `converter/target/release/converter[.exe]` (or `CROW_CONVERTER`); without it the run
 exits 2. A partial container (`partial` block in the index) refuses `--layers` outside the layers
 it holds, before anything runs (exit 2).
@@ -330,6 +334,13 @@ same top-8), DSA selection identical on 90 / 90 rows. The engine side of G3 need
 with `--capture-subblocks`, 48 files, 19.8 s, RSS after the layer-3 load 28.13 GiB. The 8 files the first
 run had are byte-identical to it (sha256 of `runs/glm53-flash/step06/golden-fp8.manifest.json`). Record:
 `runs/glm53-flash/step06/golden-fp8-regen.json`.
+
+**3-bit goldens 2026-10-09** (`ref-mul1`, crow-nest #156): the same ids and flags (`--layers 0:4 --capture-subblocks`)
+on the full 3-bit container `converter/GLM-5.3-Flash-MUL1K3.cnq` (routed experts MUL1 K=3, dense part NVFP4), the
+reference for `decode glmgolden models/GLM-5.3-Flash-step06/ref-mul1` (the golden dir is its positional argument).
+48 files, 68 s wall, layer 3 load / compute 50.6 / 0.58 s, RSS after the layer-3 load 28.84 GiB (peak working set
+28.88 GiB). Against the FP8 goldens (the quantisation error, reported, not gated): cosine 0.99308 / 0.99402 / 0.99806 / 0.99777 for layers 0 / 1 / 2 / 3, max |Δ| 7.0e-3 / 6.0e-3 / 2.3e-2 / 0.178, rel RMS 0.118 / 0.110 / 0.064 / 0.076; layer 3 routing top-8 overlap 0.910 (min 0.625, 39 / 90 rows the same set), DSA selection identical on 90 / 90 rows.
+Record: `runs/glm53-flash/step06/golden-mul1.json`.
 
 ## 8. Step 8: the routing passes (crow-nest #147)
 

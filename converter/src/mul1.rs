@@ -34,7 +34,9 @@
 //! `[hidden, inter]`, down is `[inter, hidden]` (exllamav3 stores `[in, out]`).
 //!
 //! The conversion writes these records from a quantizer store (`mul1_store.rs`, `--experts-mul1`,
-//! plan step 12, #182); the decoder (`decode_tile`, `reconstruct`) has only its tests as callers.
+//! plan step 12, #182). `converter dequant` (`dequant.rs`, #156) decodes them with `decode_tile`
+//! and applies the Hadamard step above in f64, so the oracle reads the original-basis weight;
+//! `reconstruct` is the whole-matrix form its tests hold against exllamav3.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::EXPERT_ALIGN;
@@ -90,7 +92,7 @@ impl Bitrate {
     }
 }
 
-fn f16_to_f64(h: u16) -> f64 {
+pub(crate) fn f16_to_f64(h: u16) -> f64 {
     let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let e = ((h >> 10) & 0x1f) as i32;
     let m = (h & 0x3ff) as f64;

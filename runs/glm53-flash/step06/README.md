@@ -106,3 +106,36 @@ rc 0, 19.8 s wall, layer 3 load / compute 8.81 / 0.58 s, RSS after the layer-3 l
 28.18 GiB). 48 files: the 8 of the first run, each byte-identical to it (sha256 of `golden-fp8.manifest.json`), plus
 40 sub-block files (10 per layer). Record with every file's sha256, the weights identity and the command:
 `golden-fp8-regen.json` (a copy lies in the golden dir as `evidence.json`). Back end B (container) was not regenerated.
+
+## 3-bit goldens on the MUL1 container (2026-10-09)
+
+G3 compares the engine on the 3-bit container against goldens computed on the same dequantized weights, so back end
+B was run on `converter/GLM-5.3-Flash-MUL1K3.cnq` (124,591,634,567 B, sha256 `9ce11456…0213e`, index sha256
+`56741348…61612`; routed experts MUL1 K=3, 12,384 records, store sha256 `95c76f56…f9fef`; dense part NVFP4
+`cnq4.5-glm5-next --scales mse`). `converter dequant` decodes the MUL1 records since `eb1d92d` (#181 decoder, then
+`diag(suh) H W_hat H diag(svh) / 128` in f64, one f32 rounding). Same ids and flags as the FP8 run of record:
+
+```
+ORACLE_THREADS=16 .venv-oracle/Scripts/python.exe -I oracle/glm5_layerwise.py run --weights container converter/GLM-5.3-Flash-MUL1K3.cnq \
+  --ids runs/glm53-flash/step06/ids.json --decode 4 --out models/GLM-5.3-Flash-step06/ref-mul1 --layers 0:4 --capture-subblocks
+```
+
+rc 0, 68 s wall, layer 3 load / compute 50.56 / 0.58 s (layers 0-2 about 2.0 s load each), RSS after the layer-3 load
+28.84 GiB (peak working set 28.88 GiB; the `converter dequant` child processes not included). 48 files, manifest sha256
+`31b7966f…38b77`; `post*y + comb^T*x` recomputed in f64 equals the expanded output to 1.1e-7, `attn_hc-in` of l0 is the
+embedding broadcast and of l1..3 the previous output, bit-exact. Identical to the FP8 goldens: `embed.f32` and the
+four l0 attn hyper-connection files before the first quantized matmul. Record with every file's sha256:
+`golden-mul1.json` (a copy lies in the golden dir as `evidence.json`).
+
+Quantisation error, 3-bit container vs FP8 originals (`oracle/glm5_compare.py ref-fp8 ref-mul1`, each run's own chain,
+all 4 streams x 90 rows x 4096). Reported, not gated:
+
+| layer | kind | cosine | max \|Δ\| (prompt / decode rows) | rel RMS |
+|---|---|---|---|---|
+| 0 | KDA + dense | 0.99307566 | 6.98e-3 (6.98e-3 / 5.25e-3) | 0.1178 |
+| 1 | KDA + dense | 0.99402332 | 6.05e-3 (6.05e-3 / 4.55e-3) | 0.1104 |
+| 2 | KDA + dense | 0.99805874 | 2.33e-2 (2.33e-2 / 1.62e-2) | 0.0644 |
+| 3 | DSA + MoE | 0.99776613 | 1.78e-1 (1.78e-1 / 4.44e-2) | 0.0759 |
+
+Layer 3: routed top-8 overlap 0.910 on average (min 0.625), 39 of 90 rows the same set; DSA selections identical on
+90 / 90 rows. G3 itself (`decode glmgolden models/GLM-5.3-Flash-step06/ref-mul1`) needs the GPU and was not run.
