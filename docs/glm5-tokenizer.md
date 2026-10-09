@@ -12,7 +12,9 @@ tokenizer, parser, grammar and `serve` test is unchanged and green.
 - `engine/src/toolgrammar.rs` — the GLM frame (`ToolGrammar::build_markup`).
 - `oracle/export_glm5_tokenizer_goldens.py` → `engine/tests/fixtures/GLM-5.3-Flash/tokenizer-goldens.json`.
 
-Nothing here is wired into `bin/serve.rs` yet; see [What serve still needs](#what-serve-still-needs).
+#185 part 1 wired the request side into `bin/serve.rs`; see [Wired into serve](#wired-into-serve-185-part-1).
+The glm5_next engine behind it (`glm5_engine::Glm5Engine`) still refuses to boot until the expert tiers
+of #175/#149 exist (#185 part 2).
 
 ## Inputs
 
@@ -225,25 +227,60 @@ Results on 2026-10-08, Windows, CPU only:
 The GLM tokenizer tests skip with a line when `models/GLM-5.3-Flash-original/` is missing. The
 parser and grammar tests do not need the files.
 
-## What serve still needs
+## Wired into serve (#185 part 1)
 
-The pieces are in the library. `bin/serve.rs` is outside this step and is untouched:
+The five items #160 left for `bin/serve.rs` are wired (2026-10-09). `serve` chooses the request
+family once at boot and every GLM request follows it:
 
-1. Choose the family once, with `glm5_template::markup_of(tk)`, or the family `Geo` of step 11.
-2. GLM request:
-   - render with `tk.encode_chat_with(messages, tools, true, &glm5_template::template_vars(level, clear_thinking))`;
-   - `level` = `glm5_template::reasoning_level(request word)?`, a 400 on `Err`;
-   - `chat_template_kwargs.enable_thinking: false` is a 400 too, because off cannot be expressed.
-3. `ToolStream::with_markup(tools, Markup::Glm)` and `ToolGrammar::build_markup(.., Markup::Glm)`.
-   The `<tool_call>` id lookup by text already finds 154843.
-4. `ThinkFilter` starts `Inside` for every GLM request: the prompt ends in `<think>`, with no newline.
-   The `[chat]` tag is the rendered level (`low`, `high`, `max`), never `off`.
-5. The stop ids are `glm5_template::EOS_IDS`; step 11 owns the type change of `sample::EOS_IDS`.
+1. **Family.** `serve` reads the container's family before the CUDA context (`container_meta`,
+   `engine_kind`): Flash-Next and the 27B boot `Engine` as before, glm5_next boots
+   `glm5_engine::Glm5Engine`. The request family is `glm5_template::markup_of(tk)` on the loaded
+   tokenizer and must equal the engine's (`EngineKind::markup`), else the boot is refused by name.
+   It rides on every request as `ChatReq::markup`.
+2. **Render.** A GLM request renders with
+   `tk.encode_chat_with(messages, tools, true, &glm5_template::template_vars(level, clear_thinking))`
+   (`render_ids`). `level` is `glm5_template::reasoning_level` of the request's `reasoning_effort`
+   (top level, else `chat_template_kwargs`); `clear_thinking` is `chat_template_kwargs.clear_thinking`
+   (a boolean, else a 400). 400s, by name and before any render: `none`, `medium` and every unknown
+   word, a non-string `reasoning_effort` (naming `low, high, xhigh, max`), and
+   `chat_template_kwargs.enable_thinking: false`, because off cannot be expressed. `enable_thinking: true`
+   is accepted; it is what renders anyway.
+   - The #67 strip of a stored `<think>…</think>` in an assistant `content` is the Qwen template's
+     repair and is NOT applied to GLM: GLM's template splits that block itself (line 146) and
+     renders it as the turn's reasoning. The `arguments` repairs apply to both families.
+3. **Tools.** `ToolStream::with_markup(tools, req.markup)` (`tool_stream`) and
+   `ToolGrammar::build_markup(.., req.markup)` (`tool_gate`). `<tool_call>` arms both by its id
+   (154843), found by text as for Qwen.
+4. **Reasoning filter.** A GLM request has `enable_thinking` true, so `ThinkFilter::for_request`
+   starts `Inside`. The `[chat]` line names the rendered level (`low`, `high`, `max`), never `off`.
+5. **Stop ids.** The loop and the tool trie take their stop ids from the engine through the
+   `ServeEngine` seam: `Geo::eos_ids` for Flash-Next and the 27B, `glm5_template::EOS_IDS` for
+   `Glm5Engine`. `sample::EOS_IDS` keeps its type and value.
+
+Tests (`cargo test --release --bin serve`, CPU only, 2026-10-09; the GLM ones need
+`models/GLM-5.3-Flash-original/`):
+
+- `a_glm_request_renders_the_golden_ids_of_160`: 12 golden renders (5 with tools) go through
+  serve's parse, normaliser, message check and `render_ids` and give transformers' ids; the three
+  goldens the template cannot honour (`medium`, `none`, `enable_thinking: false`) are 400s.
+- `glm_thinking_off_and_unknown_levels_are_400s_by_name`, and the same bodies on the Qwen family
+  keep their meaning of record.
+- `glm_tool_markup_streams_as_openai_tool_calls_deltas`: reasoning, `</think>` and one GLM call
+  (real tokenizer ids) through `tool_stream`, `admit_id`, the think filter, `send_emits` and the SSE
+  sink: one `tool_calls` entry `read_file` with arguments `{"path":"README.md"}`, the reasoning as
+  `reasoning_content`, no content, the GLM grammar refuses no id, `<|observation|>` stops.
+- `the_dispatch_keeps_flash_next_and_the_27b_on_their_path`.
+
+What part 2 adds: the `Glm5Engine` body on the generator of #175/#149 (boot at 200k with the #159
+plan, prefill, decode step, logits, snapshot / restore, reset), the request loop on it, and the
+prefix-cache snapshots (KDA recurrent + conv states; MLA latent and DSA indexer rows truncate).
+Not decided here: GLM's sampling card row (a GLM request takes `card_row(true)`, whose
+temperature 1.0 and top_p 0.95 equal GLM's `generation_config.json`; its top_k 20 is Qwen's card).
 
 ## Known limitations
 
 - `tojson(indent=n)` for n > none is not implemented. It is an error by name; no template of record uses it.
 - A boolean printed raw renders `true`, where jinja2 renders `True`. The GLM template prints none.
-- Not measured live: no GLM model is booted (step 14). Robin's live check: in Crow, with tools on,
+- Not measured live: no GLM model is booted (step 14, #185 part 2). Robin's live check: in Crow, with tools on,
   ask for a file read. The GUI should show one `read_file` call with the right `path`, and the turn
   continues after the tool result.

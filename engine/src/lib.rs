@@ -100,6 +100,9 @@ pub mod toolcall;
 pub mod toolgrammar;
 // #160: GLM-5.3-Flash prompt side - family test, reasoning words, stop tokens, goldens
 pub mod glm5_template;
+// #185: the glm5_next engine `bin/serve` dispatches to; part 1 is the seam, its boot refuses
+// by name until the expert tiers of #175/#149 give it a body
+pub mod glm5_engine;
 // #165: GLM-5.3-Flash head - stream mean, final RMSNorm, lm_head (wired nowhere yet)
 pub mod glm5_head;
 // #161: GLM-5.3-Flash mHC residual (Sinkhorn stream mixer) - CPU twin and kernels_glm5_mhc.cu
