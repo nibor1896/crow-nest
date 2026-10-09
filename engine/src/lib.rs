@@ -129,6 +129,8 @@ pub mod glm5_model;
 pub mod glm5_tiers;
 // #149 path B / #189: the glm5_next decode switches (CROW_GLM_FLAGS, CROW_GLM_LOOKAHEAD)
 pub mod glm5_flags;
+// #190: the glm5_next decode row as piecewise CUDA graphs (CROW_GLM_GRAPH)
+pub mod glm5_graph;
 // #182: the glm5_next MTP (NextN) block - eh glue, MLA + DSA, MoE, shared head norm
 pub mod glm5_mtp;
 // #31 A9: the prefix cache (spec section 7) - snapshot, rollback and the id prefix rule

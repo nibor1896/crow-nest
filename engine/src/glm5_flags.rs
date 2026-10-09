@@ -317,7 +317,7 @@ pub fn host_feed(raw: &[u8], g: &Glm5Geo, id: usize) -> Vec<f32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::glm5_model::{self as gm, Take};
     use crate::glm5_moe::MoeGeo;
@@ -444,9 +444,9 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
     }
 
     /// a synthetic glm5_next container, removed on drop
-    struct Synth {
+    pub(crate) struct Synth {
         dir: std::path::PathBuf,
-        path: String,
+        pub(crate) path: String,
     }
 
     impl Drop for Synth {
@@ -470,7 +470,7 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
     /// scale of 0.2 / sqrt(cols), BF16 matrices uniform in +-1 / sqrt(cols) (the embedding +-0.5),
     /// f32 norms 1 +- 0.05 and other vectors +-0.05, MUL1 records with random trellis words and
     /// fp16 suh / svh of magnitude 0.06-0.12.
-    fn synth_model(g: &Glm5Geo, rec: u64) -> Synth {
+    pub(crate) fn synth_model(g: &Glm5Geo, rec: u64) -> Synth {
         use std::io::Write;
         let dir = std::env::temp_dir().join(format!("crow-glm5-flags-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -567,7 +567,7 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
     }
 
     /// a report without its clock (the only field the switches may change)
-    fn unclocked(r: &TokenReport) -> TokenReport {
+    pub(crate) fn unclocked(r: &TokenReport) -> TokenReport {
         TokenReport { secs: 0.0, ..r.clone() }
     }
 

@@ -804,6 +804,27 @@ impl Glm5Pass {
         self.kda_st.reset();
     }
 
+    /// #190: make the FFN plans of `t`-row calls now (`call_inner` makes them on first use; a
+    /// `CROW_GLM_GRAPH` capture may not allocate)
+    ///
+    /// # Safety
+    /// A CUDA context is current; no capture is open.
+    pub unsafe fn ensure_plans(&mut self, t: usize) {
+        let g = self.g;
+        let has = |k: FfnKind| (0..g.layers).any(|l| ffn_kind(&g, l) == k);
+        if has(FfnKind::Dense) && !self.dense_plans.iter().any(|p| p.tokens == t) {
+            self.dense_plans.push(GpuFfnPlan::new(g.hidden, g.dense_inter, t, g.swiglu_limit as f32));
+        }
+        if has(FfnKind::Moe) && !self.moe_plans.iter().any(|p| p.tokens == t) {
+            self.moe_plans.push(GpuMoePlan::new(&self.moe, t));
+        }
+    }
+
+    /// #190: the device `[pos0, t]` every MLA call of this pass reads (`CROW_GLM_GRAPH` stages it)
+    pub fn mla_st(&self) -> Dev {
+        self.mla_sc.st_dev()
+    }
+
     /// One call of layer `lw`: rows `pos0 .. pos0 + t` of the sequence, `x` `[t][4][hidden]` f32
     /// updated in place. `decode` takes KDA's recurrent single-row step (t = 1); a prompt call
     /// takes its chunk path. Queued on the current stream, no host sync.
@@ -942,17 +963,10 @@ impl Glm5Pass {
                     }
                     Some(hook) => {
                         p.route(&self.kn.k, &self.kn.moe, w, self.collapsed);
-                        let ids = match self.routed.as_mut() {
-                            None => {
-                                cuda::sync();
-                                cuda::dtoh_i32(p.ids, t * self.moe.topk)
-                            }
-                            Some(r) => {
-                                r.publish(p.ids, t * self.moe.topk);
-                                r.wait().map_err(|e| format!("layer {}: {e}", lw.layer))?
-                            }
-                        };
+                        crate::glm5_graph::seam_end(lw.layer, p.ids, t * self.moe.topk)?;
+                        let ids = router_ids(self.routed.as_mut(), p.ids, t * self.moe.topk, lw.layer)?;
                         let tb = hook(lw.layer, &ids)?;
+                        crate::glm5_graph::seam_begin(tb);
                         p.experts(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub);
                     }
                 }
@@ -1017,6 +1031,25 @@ impl Glm5Pass {
         }
         for d in [&mut self.ints.dev, &mut self.st2, &mut self.collapsed, &mut self.sub] {
             cuda::free_dev(d);
+        }
+    }
+}
+
+/// #190: a MoE call's `n` router ids (`[t][topk]` i32 at `ids`, pick order) to the host: a stream
+/// sync + blocking copy, or with `routed` (`CROW_GLM_FLAGS`) the publish and its flag. The one
+/// hand-off of `Glm5Pass::call_with_experts` and of the `CROW_GLM_GRAPH` replay.
+///
+/// # Safety
+/// A CUDA context is current; `ids` holds `n` i32 written by work queued before; no capture is open.
+pub unsafe fn router_ids(routed: Option<&mut crate::glm5_flags::Routed>, ids: Dev, n: usize, layer: usize) -> Result<Vec<i32>, String> {
+    match routed {
+        None => {
+            cuda::sync();
+            Ok(cuda::dtoh_i32(ids, n))
+        }
+        Some(r) => {
+            r.publish(ids, n);
+            r.wait().map_err(|e| format!("layer {layer}: {e}"))
         }
     }
 }
