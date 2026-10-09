@@ -167,6 +167,30 @@ class Corpus(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.d, "runs")))
 
 
+class FilesFlag(unittest.TestCase):
+    """PREREG-dyn amendment 2: `--files todo-1006` checks and runs the held-out pass only (the calibration files'
+    routing comes from the conversion's capture); `--only` stays its alias; the amendment's order is kept."""
+
+    def main(self, *argv):
+        ident = {"kind": "fp8-originals", "index_json_sha256": "ab" * 32, "shards": {}, "identity_sha256": "cd" * 32}
+        with mock.patch.object(R, "fp8_identity", return_value=ident), \
+                mock.patch.object(R, "check_corpus", side_effect=lambda d, names: {n: n for n in names}) as cc, \
+                mock.patch.object(R, "plan", return_value=("fresh", None)) as pl, \
+                mock.patch.object(R.ts, "jload", return_value=[]), \
+                mock.patch.object(R, "run_passes", return_value=0) as rp, \
+                mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            rc = R.main(["--fp8", "x", "--dry-run"] + list(argv))
+        return rc, (cc.call_args[0][1] if cc.called else None), pl.call_count, (rp.call_args[0][0] if rp.called else None)
+
+    def test_files_runs_only_the_named_passes(self):
+        self.assertEqual(self.main("--files", "todo-1006"), (0, ["todo-1006"], 1, ["todo-1006"]))
+        self.assertEqual(self.main("--only", "zetalab-0829,todo-1006"),
+                         (0, ["todo-1006", "zetalab-0829"], 2, ["todo-1006", "zetalab-0829"]))
+        five = [r[0] for r in R.AMENDMENT_1]
+        self.assertEqual(self.main(), (0, five, 5, five))
+        self.assertEqual(self.main("--files", "todo-1006,nope")[0], 2)
+
+
 def mark_verified(d, revision=R.REVISION):
     """hf-revision.json over the files in d (plus the small files fetch-glm.py requires, recorded but
     absent), and a `.verified` marker beside each present file, as tools/fetch-glm.py writes them"""

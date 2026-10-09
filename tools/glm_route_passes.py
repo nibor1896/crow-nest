@@ -5,8 +5,12 @@ the FP8 originals.
 
   .venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py [--dry-run]
       [--container converter/GLM-5.3-Flash-CNQ4.5.cnq | --fp8 models/GLM-5.3-Flash-original]
-      [--corpus decode_out/glm-step8/corpus] [--runs decode_out/glm-step8/runs] [--only <name>,...]
+      [--corpus decode_out/glm-step8/corpus] [--runs decode_out/glm-step8/runs] [--files <name>,...]
       [--prompt-chunk 512]
+
+--files (alias --only) runs only the named files, in the amendment's order. PREREG-dyn amendment 2: the four
+calibration files' routing comes from the conversion's capture (#182, `tools/glm_tier_sim.py dyn --capture`),
+so G1d needs one pass: --fp8 models/GLM-5.3-Flash-original --files todo-1006.
 
 Before anything runs (exit 2 with the reason otherwise):
   - the container is complete: no `<cnq>.journal.jsonl` beside it (the converter deletes it only after
@@ -388,7 +392,9 @@ def main(argv=None):
                          FP8, ROOT))
     ap.add_argument("--corpus", default=CORPUS)
     ap.add_argument("--runs", default=RUNS)
-    ap.add_argument("--only", default=None, help="comma list of corpus names (default: all five, amendment order)")
+    ap.add_argument("--files", "--only", dest="only", default=None,
+                    help="comma list of corpus names (default: all five, amendment order); PREREG-dyn amendment 2: "
+                         "--files todo-1006, the calibration files' routing comes from the conversion's capture")
     ap.add_argument("--prompt-chunk", type=int, default=512)
     ap.add_argument("--python", default=sys.executable, help="the oracle venv's python (default: this one)")
     ap.add_argument("--dry-run", action="store_true", help="check everything and print the passes, run nothing")
@@ -421,7 +427,8 @@ def main(argv=None):
         print("refused: %s" % e, file=sys.stderr)
         return 2
     print(seen)
-    print("corpus %s: corpus.json and %d files match amendment 1" % (a.corpus, len(names)))
+    print("corpus %s: corpus.json and %d files match amendment 1 (passes: %s)" % (a.corpus, len(names),
+                                                                                ", ".join(names)))
     return run_passes(names, ids_paths, weights, a.runs, index_sha, prompt_chunk=a.prompt_chunk,
                       python=a.python, dry_run=a.dry_run, identity=identity)
 

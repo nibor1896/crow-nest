@@ -330,8 +330,32 @@ originals (`runs/glm53-flash/PREREG-dyn.md`, amendment 1): the 4.5-bit container
 
 Defaults: `--container converter/GLM-5.3-Flash-CNQ4.5.cnq` (when `--fp8` is not given; the two are
 mutually exclusive), `--corpus decode_out/glm-step8/corpus`, `--runs decode_out/glm-step8/runs`,
-`--prompt-chunk 512`, and `ORACLE_THREADS` from the environment (16 if unset). `--only <name>,...`
-limits the run to some files.
+`--prompt-chunk 512`, and `ORACLE_THREADS` from the environment (16 if unset). `--files <name>,...`
+(alias `--only`) limits the run to some files, in the amendment's order.
+
+**One pass for G1d (PREREG-dyn amendment 2, 2026-10-09).** The MUL1 conversion (#182) already computes the four
+calibration files' routing, with the same `run_layer` on the same FP8 originals. Its per-layer `ids.i32` and
+`capture.json` are kept in `decode_out/glm-step8/capture-ids/` and read by `tools/glm_tier_sim.py --capture`
+(`docs/glm-tier-simulation.md` section 7). So only the held-out needs a pass, about 1.3 h instead of about 6.5 h:
+
+```
+.venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py --fp8 models/GLM-5.3-Flash-original --files todo-1006
+```
+
+Layer 3's ids were pruned before the copier started. `capture` recomputes them in a separate work dir: it
+advances the four files through layers 0-3, with one layer load for all four, and captures layer 3. `capture`
+itself never deletes `ids.i32`; only `quantize` does (`--keep-capture` is a `quantize` option). A runner call per
+file would load layers 0-3 four times and write another layout.
+
+```
+.venv-oracle/Scripts/python.exe -I tools/glm_mul1_quantize.py capture --fp8 models/GLM-5.3-Flash-original \
+    --work decode_out/glm-step8/capture-l3 --layers 3 --max-ahead 0
+# then copy decode_out/glm-step8/capture-l3/L03/ids.i32 and capture.json to decode_out/glm-step8/capture-ids/L03/
+```
+
+In the conversion, layers 0-3 of the four files took 20.5 min: `capture` started at 04:55:15 and wrote
+`L03/capture.json` at 05:15:46 on 2026-10-09. The conversion's own `L03/capture.json` still records `ids_sha256`
+`4b46267e...`; the recomputed value is reported against it.
 
 **Before anything runs** (exit 2 with the reason):
 - **Container complete.** No `<cnq>.journal.jsonl` lies beside it; the converter deletes its journal
