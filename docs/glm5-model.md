@@ -171,7 +171,11 @@ R, #174). The layer math is section 1 unchanged; what changes is where an expert
   slots. The `[288]` table points each selected id at its VRAM slot, its pinned slot (UVA, read
   zero-copy by the MUL1 kernels) or its staging slot; every other entry is 0.
 - **NVMe**: `NvmeSource`, one handle per reader, `FILE_FLAG_NO_BUFFERING` + IOCP, 1 reader
-  (`--readers`, PREREG amendment 5), records located once (`ExpertRecord::glm5_table`). A record is
+  (`--readers`, PREREG amendment 5), records located once (`ExpertRecord::glm5_table`). The
+  reader backend is `CROW_NVME_BACKEND`: `iocp` (unset, default; one completion port per reader)
+  or `ioring` (Windows 11 I/O ring per reader, refused by name where the system has none, never a
+  silent fall-back; same bytes, same checks, `nvme_source::both_backends_read_records_byte_identical_to_a_plain_read`).
+  `ioring` with 2 readers is the candidate default, pending an engine A/B (#149). A record is
   read when no tier held it at the start of the call; the cache's NVMe counter can be higher (LRU
   may evict a later id of the same call before its turn; its record is staged from its old slot).
 - **Memory beyond the plan**: 8 staging records in VRAM (75.8 MB; the plan books 160) and 8 landing

@@ -19,17 +19,21 @@
 //! - deals the records round-robin to the reader threads. **Each reader owns its own file
 //!   handle** (robin's llama.cpp fork `66f40bc`, 2026-08-03: one handle per thread 2.22x, one
 //!   shared handle at queue depth 8 1.01x). On Windows a reader opens the container with
-//!   `FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED`, binds it to its own I/O completion port,
-//!   issues EVERY read of its share before it drains the first completion, so all slabs of a
-//!   fetch are in flight at once. On Linux a reader opens it `O_DIRECT` and reads with `pread`
-//!   (synchronous per reader; no io_uring here);
+//!   `FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED` and issues EVERY read of its share before it
+//!   drains the first completion, so all slabs of a fetch are in flight at once. The completion
+//!   mechanism is the reader's backend ([`NvmeBackend`], `NvmeConfig::backend` or
+//!   `CROW_NVME_BACKEND`): `iocp` (default) binds the handle to the reader's own I/O completion
+//!   port; `ioring` gives the reader its own Windows 11 I/O ring (`CreateIoRing`,
+//!   `BuildIoRingReadFile`, `SubmitIoRing`, `PopIoRingCompletion`; the API use of
+//!   `tools/nvme_read_rate.py` `IoRingReader`, #171). On Linux a reader opens it `O_DIRECT` and
+//!   reads with `pread` (synchronous per reader; no io_uring here; `ioring` is refused by name);
 //! - runs `residency::sanitize_sf_slab` (scale byte 0x7F -> 0x7E) on both slabs of an NVFP4
 //!   record in the destination before [`ColdSource::wait`] returns, exactly as the load path does
 //!   (`residency.rs`, every slab), so no NVFP4 record is ever published unsanitized.
 //!
-//! Not built here: IoRing (optional per plan step 17), the three-tier split, the RAM tier behind
-//! the trait, and the boot wiring beyond the refusal in `boot.rs` (`CROW_NVME_TIER` together
-//! with `CROW_COLD_TIER`).
+//! Not built here: the RAM tier behind the trait, and the boot wiring beyond the refusal in
+//! `boot.rs` (`CROW_NVME_TIER` together with `CROW_COLD_TIER`). The three-tier split that uses
+//! this backend is `glm5_tiers`.
 //!
 //! The record is a parameter of the container (#159 / #176 / #149, 2026-10-08): a glm5_next
 //! container stores each routed expert of each layer as ONE unit (gate, up, down back to back,
@@ -412,6 +416,50 @@ pub trait ColdSource {
     fn wait(&self, t: Ticket) -> Result<FetchReport, String>;
 }
 
+/// The environment variable that picks the reader backend when [`NvmeConfig::backend`] is `None`.
+pub const BACKEND_ENV: &str = "CROW_NVME_BACKEND";
+
+/// How a reader learns that its reads completed (#149). Both read the same spans into the same
+/// destinations with the same checks; only the completion mechanism differs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NvmeBackend {
+    /// Windows: one I/O completion port per reader. The default. Off Windows this is the
+    /// platform's own path (Linux: `O_DIRECT` + `pread`).
+    #[default]
+    Iocp,
+    /// Windows 11 (build 22000+): one I/O ring per reader. Refused by name where the system has
+    /// none; never a silent fall-back to `Iocp`.
+    IoRing,
+}
+
+impl NvmeBackend {
+    /// `iocp` or `ioring`; anything else is refused by name.
+    pub fn parse(s: &str) -> Result<NvmeBackend, String> {
+        match s {
+            "iocp" => Ok(NvmeBackend::Iocp),
+            "ioring" => Ok(NvmeBackend::IoRing),
+            other => Err(format!("{BACKEND_ENV}={other:?}: unknown NVMe reader backend, one of iocp (default), ioring")),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            NvmeBackend::Iocp => "iocp",
+            NvmeBackend::IoRing => "ioring",
+        }
+    }
+}
+
+/// The backend a source opens with: the config's field if set, else `env` (the value of
+/// [`BACKEND_ENV`]; unset or empty = [`NvmeBackend::Iocp`]). An unknown value is refused by name.
+pub fn resolve_backend(field: Option<NvmeBackend>, env: Option<&str>) -> Result<NvmeBackend, String> {
+    match (field, env.map(str::trim)) {
+        (Some(b), _) => Ok(b),
+        (None, None) | (None, Some("")) => Ok(NvmeBackend::default()),
+        (None, Some(v)) => NvmeBackend::parse(v),
+    }
+}
+
 /// The NVMe backend's knobs. Opt-in: nothing builds one by default.
 #[derive(Clone, Debug)]
 pub struct NvmeConfig {
@@ -423,11 +471,13 @@ pub struct NvmeConfig {
     /// CPU index per reader (reader i pins to `affinity[i % len]`); `None` leaves placement to
     /// the OS scheduler
     pub affinity: Option<Vec<usize>>,
+    /// the reader backend; `None` (default) = [`BACKEND_ENV`], unset = [`NvmeBackend::Iocp`]
+    pub backend: Option<NvmeBackend>,
 }
 
 impl NvmeConfig {
     pub fn new(path: impl AsRef<Path>) -> Self {
-        NvmeConfig { path: path.as_ref().to_path_buf(), readers: 1, affinity: None }
+        NvmeConfig { path: path.as_ref().to_path_buf(), readers: 1, affinity: None, backend: None }
     }
 }
 
@@ -447,12 +497,15 @@ struct Batch {
 pub struct NvmeSource {
     tx: Vec<mpsc::Sender<Batch>>,
     threads: Vec<std::thread::JoinHandle<()>>,
+    backend: NvmeBackend,
 }
 
 impl NvmeSource {
     /// Open the container once per reader (unbuffered, overlapped on Windows; `O_DIRECT` on
-    /// Linux) and start the readers. Any open or affinity failure is returned by name.
+    /// Linux) with the backend of [`resolve_backend`] and start the readers. Any open, backend or
+    /// affinity failure is returned by name.
     pub fn open(cfg: &NvmeConfig) -> Result<NvmeSource, String> {
+        let backend = resolve_backend(cfg.backend, std::env::var(BACKEND_ENV).ok().as_deref())?;
         if cfg.readers == 0 || cfg.readers > MAX_IN_FLIGHT {
             return Err(format!("NVMe tier: readers {} outside 1..={MAX_IN_FLIGHT}", cfg.readers));
         }
@@ -465,7 +518,7 @@ impl NvmeSource {
         let mut threads = Vec::new();
         for i in 0..cfg.readers {
             let cpu = cfg.affinity.as_ref().map(|a| a[i % a.len()]);
-            let reader = Reader::open(&cfg.path)?;
+            let mut reader = Reader::open(&cfg.path, backend)?;
             let (btx, brx) = mpsc::channel::<Batch>();
             let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
             let h = std::thread::Builder::new()
@@ -491,11 +544,16 @@ impl NvmeSource {
             tx.push(btx);
             threads.push(h);
         }
-        Ok(NvmeSource { tx, threads })
+        Ok(NvmeSource { tx, threads, backend })
     }
 
     pub fn readers(&self) -> usize {
         self.tx.len()
+    }
+
+    /// the backend every reader of this source runs
+    pub fn backend(&self) -> NvmeBackend {
+        self.backend
     }
 }
 
@@ -592,13 +650,14 @@ mod win {
         _lib: libloading::Library,
     }
 
+    fn sym<T: Copy>(lib: &libloading::Library, n: &[u8]) -> Result<T, String> {
+        unsafe { lib.get::<T>(n).map(|s| *s).map_err(|e| format!("kernel32 {}: {e}", String::from_utf8_lossy(&n[..n.len() - 1]))) }
+    }
+
     pub fn k32() -> Result<&'static K32, String> {
         static K: std::sync::OnceLock<Result<K32, String>> = std::sync::OnceLock::new();
         K.get_or_init(|| unsafe {
             let lib = libloading::Library::new("kernel32.dll").map_err(|e| format!("kernel32.dll: {e}"))?;
-            fn sym<T: Copy>(lib: &libloading::Library, n: &[u8]) -> Result<T, String> {
-                unsafe { lib.get::<T>(n).map(|s| *s).map_err(|e| format!("kernel32 {}: {e}", String::from_utf8_lossy(n))) }
-            }
             Ok(K32 {
                 create_iocp: sym(&lib, b"CreateIoCompletionPort\0")?,
                 read_file: sym(&lib, b"ReadFile\0")?,
@@ -612,41 +671,177 @@ mod win {
         .as_ref()
         .map_err(|e| e.clone())
     }
+
+    // ---- ioringapi.h (Windows 11, build 22000+), learn.microsoft.com/windows/win32/api/ioringapi,
+    // read 2026-10-09; the same layouts `tools/nvme_read_rate.py` passes through ctypes (#171) ----
+
+    pub type HIoRing = *mut c_void;
+    pub const IORING_VERSION_1: i32 = 1;
+    /// `IORING_REF_RAW`: the handle / buffer is a raw `HANDLE` / address, not a registered index
+    pub const IORING_REF_RAW: i32 = 0;
+    pub const S_OK: i32 = 0;
+    /// `PopIoRingCompletion`: the completion queue is empty
+    pub const S_FALSE: i32 = 1;
+    /// `HRESULT_FROM_NT(STATUS_END_OF_FILE)`, a read at or past the end of the file
+    pub const HRESULT_EOF: i32 = 0xD000_0011u32 as i32;
+
+    /// `IORING_CREATE_FLAGS { Required, Advisory }`, both 0 = none
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct IoRingCreateFlags {
+        pub required: i32,
+        pub advisory: i32,
+    }
+
+    /// `IORING_HANDLE_REF { Kind; union { HANDLE Handle; UINT32 Index; } }`, the raw-handle arm
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct IoRingHandleRef {
+        pub kind: i32,
+        pub handle: Handle,
+    }
+
+    /// `IORING_BUFFER_REF { Kind; union { void *Address; IORING_REGISTERED_BUFFER } }`, the address arm
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct IoRingBufferRef {
+        pub kind: i32,
+        pub address: *mut c_void,
+    }
+
+    /// `IORING_CQE { UINT_PTR UserData; HRESULT ResultCode; ULONG_PTR Information; }`
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct IoRingCqe {
+        pub user_data: usize,
+        pub result_code: i32,
+        pub information: usize,
+    }
+
+    type FnCreateIoRing = unsafe extern "system" fn(i32, IoRingCreateFlags, u32, u32, *mut HIoRing) -> i32;
+    type FnBuildIoRingReadFile = unsafe extern "system" fn(HIoRing, IoRingHandleRef, IoRingBufferRef, u32, u64, usize, i32) -> i32;
+    type FnSubmitIoRing = unsafe extern "system" fn(HIoRing, u32, u32, *mut u32) -> i32;
+    type FnPopIoRingCompletion = unsafe extern "system" fn(HIoRing, *mut IoRingCqe) -> i32;
+    type FnCloseIoRing = unsafe extern "system" fn(HIoRing) -> i32;
+
+    /// the IoRing entry points, loaded apart from [`K32`] so the IOCP backend keeps running on a
+    /// Windows that has none
+    pub struct IoRingApi {
+        pub create: FnCreateIoRing,
+        pub build_read: FnBuildIoRingReadFile,
+        pub submit: FnSubmitIoRing,
+        pub pop: FnPopIoRingCompletion,
+        pub close: FnCloseIoRing,
+        _lib: libloading::Library,
+    }
+
+    /// The IoRing API, or the refusal naming why this system has none.
+    pub fn ioring() -> Result<&'static IoRingApi, String> {
+        static R: std::sync::OnceLock<Result<IoRingApi, String>> = std::sync::OnceLock::new();
+        R.get_or_init(|| unsafe {
+            let lib = libloading::Library::new("kernel32.dll").map_err(|e| format!("kernel32.dll: {e}"))?;
+            let un = |e: String| format!("IoRing unavailable ({e}; Windows 11, build 22000+, has it)");
+            Ok(IoRingApi {
+                create: sym(&lib, b"CreateIoRing\0").map_err(un)?,
+                build_read: sym(&lib, b"BuildIoRingReadFile\0").map_err(un)?,
+                submit: sym(&lib, b"SubmitIoRing\0").map_err(un)?,
+                pop: sym(&lib, b"PopIoRingCompletion\0").map_err(un)?,
+                close: sym(&lib, b"CloseIoRing\0").map_err(un)?,
+                _lib: lib,
+            })
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+    }
+
+    /// an HRESULT as Windows prints it
+    pub fn hr(h: i32) -> String {
+        format!("HRESULT {:#010x}", h as u32)
+    }
 }
 
-/// One reader's own handle to the container (and, on Windows, its own completion port).
+/// The completion side of one Windows reader.
+#[cfg(windows)]
+enum WinIo {
+    /// the reader's own I/O completion port, bound to its handle
+    Iocp { port: usize },
+    /// the reader's own I/O ring; `ring` 0 = closed after a failed submission (`broken` says why)
+    IoRing { ring: usize, broken: Option<String> },
+}
+
+/// One reader's own handle to the container (and, on Windows, its own completion port or ring).
 struct Reader {
     file: std::fs::File,
     #[cfg(windows)]
-    port: usize,
+    io: WinIo,
 }
+
+/// Submission-queue entries per ring: every slab of the largest share one reader can get (all
+/// [`MAX_IN_FLIGHT`] records of a fetch, two slabs each), so a fetch never waits for a free entry.
+#[cfg(windows)]
+const RING_SQ: u32 = 2 * MAX_IN_FLIGHT as u32;
 
 #[cfg(windows)]
 impl Reader {
-    fn open(path: &Path) -> Result<Reader, String> {
+    fn open(path: &Path, backend: NvmeBackend) -> Result<Reader, String> {
         use std::os::windows::fs::OpenOptionsExt;
         use std::os::windows::io::AsRawHandle;
         let k = win::k32()?;
-        let file = std::fs::OpenOptions::new()
+        // the ring first: on a system without IoRing the refusal names that, not the file
+        let ring = match backend {
+            NvmeBackend::Iocp => None,
+            NvmeBackend::IoRing => {
+                let api = win::ioring().map_err(|e| format!("NVMe tier: {BACKEND_ENV}=ioring refused: {e}"))?;
+                let mut ring: win::HIoRing = std::ptr::null_mut();
+                let flags = win::IoRingCreateFlags { required: 0, advisory: 0 };
+                let h = unsafe { (api.create)(win::IORING_VERSION_1, flags, RING_SQ, 2 * RING_SQ, &mut ring) };
+                if h < 0 || ring.is_null() {
+                    return Err(format!("NVMe tier: {BACKEND_ENV}=ioring refused: IoRing unavailable, CreateIoRing returned {}", win::hr(h)));
+                }
+                Some(ring as usize)
+            }
+        };
+        let file = match std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(win::FILE_FLAG_NO_BUFFERING | win::FILE_FLAG_OVERLAPPED)
             .open(path)
-            .map_err(|e| format!("NVMe tier: {}: {e}", path.display()))?;
-        let port = unsafe { (k.create_iocp)(file.as_raw_handle() as win::Handle, std::ptr::null_mut(), 1, 1) };
-        if port.is_null() {
-            return Err(format!("NVMe tier: CreateIoCompletionPort: {}", std::io::Error::last_os_error()));
+        {
+            Ok(f) => f,
+            Err(e) => {
+                if let (Some(r), Ok(api)) = (ring, win::ioring()) {
+                    unsafe { (api.close)(r as win::HIoRing) };
+                }
+                return Err(format!("NVMe tier: {}: {e}", path.display()));
+            }
+        };
+        let io = match ring {
+            Some(ring) => WinIo::IoRing { ring, broken: None },
+            None => {
+                let port = unsafe { (k.create_iocp)(file.as_raw_handle() as win::Handle, std::ptr::null_mut(), 1, 1) };
+                if port.is_null() {
+                    return Err(format!("NVMe tier: CreateIoCompletionPort: {}", std::io::Error::last_os_error()));
+                }
+                WinIo::Iocp { port: port as usize }
+            }
+        };
+        Ok(Reader { file, io })
+    }
+
+    fn run(&mut self, jobs: &[Job]) -> Result<FetchReport, String> {
+        match self.io {
+            WinIo::Iocp { port } => self.run_iocp(port, jobs),
+            WinIo::IoRing { .. } => self.run_ioring(jobs),
         }
-        Ok(Reader { file, port: port as usize })
     }
 
     /// Issue every read of `jobs`, then drain exactly as many completions as were issued (a read
     /// still in flight writes into the caller's buffer, so the function never returns before the
     /// last one is back), then sanitize.
-    fn run(&self, jobs: &[Job]) -> Result<FetchReport, String> {
+    fn run_iocp(&self, port: usize, jobs: &[Job]) -> Result<FetchReport, String> {
         use std::os::windows::io::AsRawHandle;
         let k = win::k32()?;
         let h = self.file.as_raw_handle() as win::Handle;
-        let port = self.port as win::Handle;
+        let port = port as win::Handle;
         let mut ovs: Vec<Box<win::Overlapped>> = Vec::with_capacity(jobs.len() * 2);
         let mut lens: Vec<usize> = Vec::with_capacity(jobs.len() * 2);
         let mut err: Option<String> = None;
@@ -697,21 +892,131 @@ impl Reader {
         let clamped = unsafe { sanitize_jobs(jobs) };
         Ok(FetchReport { records: jobs.len(), bytes, clamped })
     }
+
+    /// The IoRing twin of [`Reader::run_iocp`]: build one read entry per span (user data = the
+    /// span's index), submit them all in one `SubmitIoRing`, then pop exactly as many completions
+    /// as were submitted, waiting in `SubmitIoRing` whenever the completion queue is empty (a read
+    /// still in flight writes into the caller's buffer, so the function never returns before the
+    /// last one is back), then sanitize. A failed read and a short read are errors by name.
+    fn run_ioring(&mut self, jobs: &[Job]) -> Result<FetchReport, String> {
+        use std::os::windows::io::AsRawHandle;
+        let h = self.file.as_raw_handle() as win::Handle;
+        let WinIo::IoRing { ring, broken } = &mut self.io else { unreachable!("run_ioring on an IOCP reader") };
+        if let Some(why) = broken {
+            return Err(why.clone());
+        }
+        let api = win::ioring()?;
+        let r = *ring as win::HIoRing;
+        let mut spans: Vec<(u32, u32, Span)> = Vec::with_capacity(jobs.len() * 2);
+        let mut err: Option<String> = None;
+        'build: for j in jobs {
+            for (_, s, p) in j.rec.parts(&j.dst) {
+                let file = win::IoRingHandleRef { kind: win::IORING_REF_RAW, handle: h };
+                let buf = win::IoRingBufferRef { kind: win::IORING_REF_RAW, address: p as *mut _ };
+                let e = unsafe { (api.build_read)(r, file, buf, s.len as u32, s.off, spans.len(), 0) };
+                if e < 0 {
+                    err = Some(format!("NVMe tier (ioring): BuildIoRingReadFile layer {} expert {} at {}: {}", j.rec.layer, j.rec.id, s.off, win::hr(e)));
+                    break 'build;
+                }
+                spans.push((j.rec.layer, j.rec.id, s));
+            }
+        }
+        if spans.is_empty() {
+            return match err {
+                Some(e) => Err(e),
+                None => Ok(FetchReport::default()),
+            };
+        }
+        let mut submitted = 0u32;
+        let e = unsafe { (api.submit)(r, 0, 0, &mut submitted) };
+        if e < 0 {
+            // learn.microsoft.com SubmitIoRing, Remarks: on an error other than a wait timeout
+            // every entry stays in the submission queue - nothing is in flight, but the next
+            // submission would send these entries (into this fetch's buffers) again. The ring is
+            // closed and the reader refuses every later fetch by name.
+            unsafe { (api.close)(r) };
+            let why = format!("NVMe tier (ioring): SubmitIoRing of {} reads failed: {}; this reader's ring is closed", spans.len(), win::hr(e));
+            *ring = 0;
+            *broken = Some(why.clone());
+            return Err(why);
+        }
+        let in_flight = (submitted as usize).min(spans.len());
+        let mut done = vec![false; spans.len()];
+        let mut left = in_flight;
+        let mut bytes = 0u64;
+        while left > 0 {
+            let mut cqe = win::IoRingCqe::default();
+            let p = unsafe { (api.pop)(r, &mut cqe) };
+            if p == win::S_FALSE {
+                let w = unsafe { (api.submit)(r, 1, win::INFINITE, std::ptr::null_mut()) };
+                if w < 0 {
+                    // reads are in flight into caller memory and the ring cannot be waited on:
+                    // nothing safe to return (the IOCP twin panics on the same condition)
+                    panic!("NVMe tier (ioring): SubmitIoRing wait failed with {left} reads in flight: {}", win::hr(w));
+                }
+                continue;
+            }
+            if p != win::S_OK {
+                panic!("NVMe tier (ioring): PopIoRingCompletion failed with {left} reads in flight: {}", win::hr(p));
+            }
+            let i = cqe.user_data;
+            assert!(i < spans.len() && !done[i], "NVMe tier (ioring): completion {i} this reader did not issue");
+            done[i] = true;
+            left -= 1;
+            let (layer, id, s) = spans[i];
+            if cqe.result_code < 0 && cqe.result_code != win::HRESULT_EOF {
+                err.get_or_insert(format!("NVMe tier (ioring): read layer {layer} expert {id} at {} failed: {}", s.off, win::hr(cqe.result_code)));
+            } else {
+                let n = if cqe.result_code < 0 { 0 } else { cqe.information };
+                if n != s.len {
+                    err.get_or_insert(format!("NVMe tier (ioring): short read layer {layer} expert {id} at {}, {n} of {} B (past the end of the file?)", s.off, s.len));
+                }
+                bytes += n as u64;
+            }
+        }
+        if in_flight < spans.len() {
+            // S_OK promises every entry submitted; should it not hold, the rest still sits in the
+            // submission queue - what was in flight is drained, the ring is not trusted again
+            unsafe { (api.close)(r) };
+            let why = format!("NVMe tier (ioring): SubmitIoRing sent {in_flight} of {} reads; this reader's ring is closed", spans.len());
+            *ring = 0;
+            *broken = Some(why.clone());
+            err.get_or_insert(why);
+        }
+        if let Some(e) = err {
+            return Err(e);
+        }
+        let clamped = unsafe { sanitize_jobs(jobs) };
+        Ok(FetchReport { records: jobs.len(), bytes, clamped })
+    }
 }
 
 #[cfg(windows)]
 impl Drop for Reader {
     fn drop(&mut self) {
-        if let Ok(k) = win::k32() {
-            unsafe { (k.close)(self.port as win::Handle) };
+        // `run` never returns with a read in flight, so nothing is pending here
+        match self.io {
+            WinIo::Iocp { port } => {
+                if let Ok(k) = win::k32() {
+                    unsafe { (k.close)(port as win::Handle) };
+                }
+            }
+            WinIo::IoRing { ring, .. } => {
+                if let (true, Ok(api)) = (ring != 0, win::ioring()) {
+                    unsafe { (api.close)(ring as win::HIoRing) };
+                }
+            }
         }
     }
 }
 
 #[cfg(unix)]
 impl Reader {
-    fn open(path: &Path) -> Result<Reader, String> {
+    fn open(path: &Path, backend: NvmeBackend) -> Result<Reader, String> {
         use std::os::unix::fs::OpenOptionsExt;
+        if backend == NvmeBackend::IoRing {
+            return Err(format!("NVMe tier: {BACKEND_ENV}=ioring refused: IoRing is a Windows 11 API; this platform reads with O_DIRECT + pread (leave {BACKEND_ENV} unset)"));
+        }
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT)
@@ -721,7 +1026,7 @@ impl Reader {
     }
 
     /// `pread` every slab of `jobs` on this reader's own descriptor, then sanitize.
-    fn run(&self, jobs: &[Job]) -> Result<FetchReport, String> {
+    fn run(&mut self, jobs: &[Job]) -> Result<FetchReport, String> {
         use std::os::unix::fs::FileExt;
         let mut bytes = 0u64;
         for j in jobs {
@@ -976,6 +1281,132 @@ mod tests {
         assert!(g.bytes().iter().all(|&b| b == 0) && d.bytes().iter().all(|&b| b == 0));
         drop(src);
         drop(cnq);
+    }
+
+    // ---- #149: the reader backend, IOCP (default) or IoRing ----
+
+    /// `iocp` unless asked otherwise: the config's field wins over the variable, unset or empty
+    /// is the default, and a name that is not a backend is refused naming the variable and the
+    /// values it takes (never a silent default).
+    #[test]
+    fn the_backend_is_iocp_unless_asked_and_an_unknown_name_is_refused() {
+        assert_eq!(NvmeBackend::default(), NvmeBackend::Iocp);
+        assert_eq!(NvmeConfig::new("x").backend, None);
+        assert_eq!(resolve_backend(None, None), Ok(NvmeBackend::Iocp));
+        assert_eq!(resolve_backend(None, Some("")), Ok(NvmeBackend::Iocp));
+        assert_eq!(resolve_backend(None, Some("iocp")), Ok(NvmeBackend::Iocp));
+        assert_eq!(resolve_backend(None, Some("ioring")), Ok(NvmeBackend::IoRing));
+        assert_eq!(resolve_backend(Some(NvmeBackend::IoRing), Some("iocp")), Ok(NvmeBackend::IoRing));
+        assert_eq!(resolve_backend(Some(NvmeBackend::Iocp), Some("bogus")), Ok(NvmeBackend::Iocp));
+        for bad in ["IoRing", "io_ring", "uring", "1"] {
+            let e = resolve_backend(None, Some(bad)).unwrap_err();
+            assert!(e.contains("CROW_NVME_BACKEND") && e.contains("unknown NVMe reader backend") && e.contains("iocp (default), ioring"), "{e}");
+        }
+        for b in [NvmeBackend::Iocp, NvmeBackend::IoRing] {
+            assert_eq!(NvmeBackend::parse(b.name()), Ok(b));
+        }
+    }
+
+    /// Off Windows an explicit `ioring` is refused by name at open, not run as `pread`.
+    #[cfg(not(windows))]
+    #[test]
+    fn ioring_off_windows_is_refused_by_name() {
+        let dir = std::env::temp_dir().join(format!("crow-nvme-ioring-off-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.bin");
+        std::fs::write(&path, vec![0u8; 8192]).unwrap();
+        let mut cfg = NvmeConfig::new(&path);
+        cfg.backend = Some(NvmeBackend::IoRing);
+        let e = NvmeSource::open(&cfg).err().expect("ioring opened off Windows");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(e.contains("CROW_NVME_BACKEND=ioring refused"), "{e}");
+    }
+
+    /// A plain file of `len` xorshift bytes in its own temp dir, removed on drop.
+    #[cfg(windows)]
+    fn raw_file(tag: &str, len: usize) -> (Synth, Vec<u8>) {
+        let dir = std::env::temp_dir().join(format!("crow-nvme-raw-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("raw.bin");
+        let mut x = 0x5851_F42D_4C95_7F2Du64;
+        let mut bytes = vec![0u8; len];
+        for w in bytes.chunks_exact_mut(8) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            w.copy_from_slice(&x.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        (Synth { dir, path }, bytes)
+    }
+
+    /// a record of `len` B at `off`, one unit, a codec that is not sanitized (bytes as stored)
+    #[cfg(windows)]
+    fn raw_rec(id: u32, off: u64, len: usize) -> ExpertRecord {
+        ExpertRecord { layer: 0, id, gu: Span { off, len }, dn: Span { off: 0, len: 0 }, codec: ExpertCodec::Mul1, layout: RecordLayout::OneUnit }
+    }
+
+    /// Eight records (one 3-bit record of 9,474,048 B, the rest of other sector-whole sizes, one
+    /// of them two slabs), out of file order, read from a 48 MiB temp file by every backend at 1
+    /// and 2 readers, twice per source (the ring is reused): each destination is the plain read
+    /// of its span, byte for byte, and the source reports the backend it was asked for.
+    #[cfg(windows)]
+    #[test]
+    fn both_backends_read_records_byte_identical_to_a_plain_read() {
+        const LEN: usize = 48 << 20;
+        let (f, want) = raw_file("ident", LEN);
+        let lens = [MUL1_REC as usize, 4096, 1 << 20, 2_813_952, 409_600, 3 << 20, 8192, 5_005_312];
+        let offs = [36u64 << 20, 0, 12 << 20, 20 << 20, 4096, 28 << 20, (48 << 20) - 8192, 16 << 20];
+        let mut recs: Vec<ExpertRecord> = (0..8).map(|k| raw_rec(k as u32, offs[k], lens[k])).collect();
+        // record 3 as two slabs: its first 1 MiB and the 1 MiB at 44 MiB
+        recs[3].layout = RecordLayout::TwoSlabs;
+        recs[3].gu.len = 1 << 20;
+        recs[3].dn = Span { off: 44 << 20, len: 1 << 20 };
+        let total: u64 = recs.iter().map(|r| if r.layout == RecordLayout::TwoSlabs { r.gu.len + r.dn.len } else { r.gu.len } as u64).sum();
+        for backend in [NvmeBackend::Iocp, NvmeBackend::IoRing] {
+            for readers in [1, 2] {
+                let mut cfg = NvmeConfig::new(&f.path);
+                cfg.readers = readers;
+                cfg.backend = Some(backend);
+                let src = NvmeSource::open(&cfg).unwrap_or_else(|e| panic!("{} x {readers}: {e}", backend.name()));
+                assert_eq!((src.backend(), src.readers()), (backend, readers));
+                for round in 0..2 {
+                    let bufs: Vec<(Aligned, Aligned)> = recs.iter().map(|r| (Aligned::new(r.gu.len), Aligned::new(r.dn.len.max(4096)))).collect();
+                    let jobs: Vec<(ExpertRecord, RecordDst)> = recs.iter().zip(&bufs).map(|(r, (g, d))| (*r, RecordDst { gu: g.p, dn: d.p })).collect();
+                    let rep = src.wait(unsafe { src.fetch(&jobs) }.unwrap()).unwrap_or_else(|e| panic!("{} x {readers} round {round}: {e}", backend.name()));
+                    assert_eq!((rep.records, rep.bytes, rep.clamped), (8, total, 0), "{} x {readers} round {round}", backend.name());
+                    for (r, (g, d)) in recs.iter().zip(&bufs) {
+                        for (what, s, buf) in [("gu", r.gu, g), ("dn", r.dn, d)] {
+                            let at = s.off as usize;
+                            assert!(buf.bytes()[..s.len] == want[at..at + s.len], "{} x {readers} round {round}: record {} {what} differs from the plain read", backend.name(), r.id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A span that runs past the end of the file is a short read, an error by name on both
+    /// backends, and the source keeps working: the next fetch on the same reader (the same ring)
+    /// reads its record byte-identical.
+    #[cfg(windows)]
+    #[test]
+    fn a_short_read_is_an_error_by_name_on_both_backends() {
+        const LEN: usize = 1 << 20;
+        let (f, want) = raw_file("short", LEN);
+        for backend in [NvmeBackend::Iocp, NvmeBackend::IoRing] {
+            let mut cfg = NvmeConfig::new(&f.path);
+            cfg.backend = Some(backend);
+            let src = NvmeSource::open(&cfg).unwrap();
+            let b = Aligned::new(8192);
+            let past = raw_rec(7, (LEN - 4096) as u64, 8192);
+            let e = src.wait(unsafe { src.fetch(&[(past, RecordDst { gu: b.p, dn: std::ptr::null_mut() })]) }.unwrap()).unwrap_err();
+            assert!(e.contains("short read") && e.contains("4096 of 8192 B"), "{}: {e}", backend.name());
+            let ok = raw_rec(8, 8192, 8192);
+            let rep = src.wait(unsafe { src.fetch(&[(ok, RecordDst { gu: b.p, dn: std::ptr::null_mut() })]) }.unwrap()).unwrap();
+            assert_eq!(rep.bytes, 8192, "{}", backend.name());
+            assert!(b.bytes() == &want[8192..16384], "{}: the read after the short read differs", backend.name());
+        }
     }
 
     // ---- #159 / #176 / #149: the glm5_next record is the container's, not 14,155,776 B ----
