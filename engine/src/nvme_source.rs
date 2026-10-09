@@ -37,6 +37,15 @@
 //!   flag (`cuStreamWaitValue64`) while the host goes on; a failed read raises it too (no device
 //!   wait hangs on it) and its error comes from the ticket.
 //!
+//! - the piece pool (`CROW_NVME_POOL=1`, [`PoolConfig`], off by default): 0xSero's nv2 reader
+//!   (sybil-solutions/glm53-flash-offload 6769b27, `kernels/nv2/nv2_host.cpp`) on Windows. Each
+//!   record is split into pieces (`CROW_NVME_POOL_PIECE_KB`, 1024) read by `CROW_NVME_POOL_THREADS`
+//!   (48) workers, each with its own synchronous `FILE_FLAG_NO_BUFFERING` handle (`O_DIRECT`
+//!   pread on Linux), so that many pieces are in flight. Two queues ([`ReadPriority`],
+//!   [`NvmeSource::fetch_prio`]): a worker takes a `Demand` piece whenever one is queued, so a
+//!   demand read overtakes queued prefetch pieces (not one already being read). A record's last
+//!   piece sanitizes it and raises its landed flag; the fetch's last record completes the ticket.
+//!
 //! Not built here: the RAM tier behind the trait, and the boot wiring beyond the refusal in
 //! `boot.rs` (`CROW_NVME_TIER` together with `CROW_COLD_TIER`). The three-tier split that uses
 //! this backend is `glm5_tiers`.
@@ -53,8 +62,10 @@
 use crate::cnq::{Cnq, TensorInfo};
 use crate::geo::{expert_record_refusal, ExpertCodec, ExpertRecordSpec, EXPERT_RECORD_ALIGN, GLM5_NEXT_MODEL_TYPE};
 use crate::residency::sanitize_sf_slab;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 
 /// Alignment of every offset, length and destination address the backend accepts: 4096 B, the
 /// physical sector of this machine's NVMe (`docs/nvme-read-rate.md`: 512 B logical / 4096 B
@@ -473,18 +484,119 @@ pub struct NvmeConfig {
     pub path: PathBuf,
     /// reader threads, each with its own handle; 1..=MAX_IN_FLIGHT. Default 1: PREREG amendment 5
     /// (robin, 2026-10-08) makes 1 reader binding for step 14 (`docs/nvme-read-rate.md`).
+    /// Not used by the piece pool ([`PoolConfig::threads`] is its count).
     pub readers: usize,
     /// CPU index per reader (reader i pins to `affinity[i % len]`); `None` leaves placement to
-    /// the OS scheduler
+    /// the OS scheduler. The pool's workers pin the same way.
     pub affinity: Option<Vec<usize>>,
     /// the reader backend; `None` (default) = [`BACKEND_ENV`], unset = [`NvmeBackend::Iocp`]
     pub backend: Option<NvmeBackend>,
+    /// the piece pool; [`PoolAsk::Env`] (default) = [`POOL_ENV`], unset = off
+    pub pool: PoolAsk,
 }
 
 impl NvmeConfig {
     pub fn new(path: impl AsRef<Path>) -> Self {
-        NvmeConfig { path: path.as_ref().to_path_buf(), readers: 1, affinity: None, backend: None }
+        NvmeConfig { path: path.as_ref().to_path_buf(), readers: 1, affinity: None, backend: None, pool: PoolAsk::Env }
     }
+}
+
+// ---- the piece pool (0xSero's nv2 reader, sybil-solutions/glm53-flash-offload 6769b27,
+// kernels/nv2/nv2_host.cpp `struct Reader`): N workers, each record split into pieces, one high
+// and one low queue; a worker takes the high queue's front whenever it is non-empty, so a demand
+// read overtakes every queued prefetch piece (never a read already running). The Windows port
+// gives every worker its own `FILE_FLAG_NO_BUFFERING` handle and reads synchronously (the
+// `O_DIRECT` pread of the original; a synchronous handle shared by 48 threads would serialize). ----
+
+/// `1` turns the piece pool on; unset, empty or `0` is off (the default); anything else refused.
+pub const POOL_ENV: &str = "CROW_NVME_POOL";
+/// pool workers = pieces in flight; unset/empty = [`POOL_THREADS_DEFAULT`]
+pub const POOL_THREADS_ENV: &str = "CROW_NVME_POOL_THREADS";
+/// piece size in KiB, a multiple of 4 (one 4096-B sector); unset/empty = [`POOL_PIECE_KB_DEFAULT`]
+pub const POOL_PIECE_KB_ENV: &str = "CROW_NVME_POOL_PIECE_KB";
+/// 0xSero's `GLM53_NV_THREADS` default
+pub const POOL_THREADS_DEFAULT: usize = 48;
+/// 0xSero's `GLM53_NV_PIECE_KB` default
+pub const POOL_PIECE_KB_DEFAULT: usize = 1024;
+pub const POOL_THREADS_MAX: usize = 256;
+/// 64 MiB: one piece is one `ReadFile` (u32 length)
+pub const POOL_PIECE_KB_MAX: usize = 64 * 1024;
+
+/// The pool's shape: worker threads (each one read in flight) and piece size in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolConfig {
+    pub threads: usize,
+    pub piece: usize,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        PoolConfig { threads: POOL_THREADS_DEFAULT, piece: POOL_PIECE_KB_DEFAULT * 1024 }
+    }
+}
+
+impl PoolConfig {
+    /// `None` = accepted; else the refusal by name
+    pub fn refusal(&self) -> Option<String> {
+        if self.threads == 0 || self.threads > POOL_THREADS_MAX {
+            return Some(format!("NVMe pool: {} threads outside 1..={POOL_THREADS_MAX} ({POOL_THREADS_ENV})", self.threads));
+        }
+        if self.piece == 0 || !(self.piece as u64).is_multiple_of(ALIGN) || self.piece > POOL_PIECE_KB_MAX * 1024 {
+            return Some(format!(
+                "NVMe pool: piece {} B is not a positive multiple of {ALIGN} B up to {POOL_PIECE_KB_MAX} KiB ({POOL_PIECE_KB_ENV}, KiB, a multiple of 4)",
+                self.piece
+            ));
+        }
+        None
+    }
+}
+
+/// Whether a source runs the piece pool: from the environment (default), off, or this shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PoolAsk {
+    #[default]
+    Env,
+    Off,
+    On(PoolConfig),
+}
+
+/// The pool a source opens with: `Off` / `On` as asked (`On` checked), `Env` from the values of
+/// [`POOL_ENV`], [`POOL_THREADS_ENV`] and [`POOL_PIECE_KB_ENV`]. Every value that is not one of
+/// theirs is refused by name; `None` = no pool (the per-reader backends).
+pub fn resolve_pool(ask: PoolAsk, on: Option<&str>, threads: Option<&str>, piece_kb: Option<&str>) -> Result<Option<PoolConfig>, String> {
+    let c = match ask {
+        PoolAsk::Off => return Ok(None),
+        PoolAsk::On(c) => c,
+        PoolAsk::Env => {
+            match on.map(str::trim) {
+                None | Some("") | Some("0") => return Ok(None),
+                Some("1") => {}
+                Some(v) => return Err(format!("{POOL_ENV}={v:?}: 1 turns the NVMe piece pool on, unset/empty/0 leaves it off")),
+            }
+            let num = |name: &str, v: Option<&str>, dflt: usize| -> Result<usize, String> {
+                match v.map(str::trim) {
+                    None | Some("") => Ok(dflt),
+                    Some(s) => s.parse::<usize>().map_err(|_| format!("{name}={s:?} is not a whole number")),
+                }
+            };
+            let t = num(POOL_THREADS_ENV, threads, POOL_THREADS_DEFAULT)?;
+            let kb = num(POOL_PIECE_KB_ENV, piece_kb, POOL_PIECE_KB_DEFAULT)?;
+            PoolConfig { threads: t, piece: kb.saturating_mul(1024) }
+        }
+    };
+    match c.refusal() {
+        Some(why) => Err(why),
+        None => Ok(Some(c)),
+    }
+}
+
+/// Which queue a fetch's pieces join. The piece pool serves every queued `Demand` piece before
+/// any `Prefetch` piece; the per-reader backends have one FIFO per reader and ignore it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadPriority {
+    #[default]
+    Demand,
+    Prefetch,
 }
 
 struct Job {
@@ -501,26 +613,39 @@ struct Batch {
     reply: mpsc::Sender<Result<FetchReport, String>>,
 }
 
-/// The NVMe backend: `readers` threads, one container handle each.
+/// The NVMe backend: `readers` threads, one container handle each, or the piece pool.
 pub struct NvmeSource {
     tx: Vec<mpsc::Sender<Batch>>,
     threads: Vec<std::thread::JoinHandle<()>>,
     backend: NvmeBackend,
+    pool: Option<Pool>,
 }
 
 impl NvmeSource {
     /// Open the container once per reader (unbuffered, overlapped on Windows; `O_DIRECT` on
-    /// Linux) with the backend of [`resolve_backend`] and start the readers. Any open, backend or
-    /// affinity failure is returned by name.
+    /// Linux) with the backend of [`resolve_backend`] and start the readers; or, with the pool of
+    /// [`resolve_pool`] on, once per pool worker (unbuffered, synchronous). Any open, backend,
+    /// pool or affinity failure is returned by name.
     pub fn open(cfg: &NvmeConfig) -> Result<NvmeSource, String> {
         let backend = resolve_backend(cfg.backend, std::env::var(BACKEND_ENV).ok().as_deref())?;
-        if cfg.readers == 0 || cfg.readers > MAX_IN_FLIGHT {
-            return Err(format!("NVMe tier: readers {} outside 1..={MAX_IN_FLIGHT}", cfg.readers));
-        }
+        let env = |k: &str| std::env::var(k).ok();
+        let pool = resolve_pool(cfg.pool, env(POOL_ENV).as_deref(), env(POOL_THREADS_ENV).as_deref(), env(POOL_PIECE_KB_ENV).as_deref())?;
         if let Some(a) = &cfg.affinity {
             if a.is_empty() {
                 return Err("NVMe tier: empty affinity list".into());
             }
+        }
+        if let Some(pc) = pool {
+            if backend == NvmeBackend::IoRing {
+                return Err(format!(
+                    "NVMe tier: {POOL_ENV}=1 with {BACKEND_ENV}=ioring refused: the piece pool reads with one synchronous unbuffered handle per worker, not a ring (leave {BACKEND_ENV} unset)"
+                ));
+            }
+            let p = Pool::open(&cfg.path, pc, cfg.affinity.as_deref())?;
+            return Ok(NvmeSource { tx: Vec::new(), threads: Vec::new(), backend, pool: Some(p) });
+        }
+        if cfg.readers == 0 || cfg.readers > MAX_IN_FLIGHT {
+            return Err(format!("NVMe tier: readers {} outside 1..={MAX_IN_FLIGHT}", cfg.readers));
         }
         let mut tx = Vec::new();
         let mut threads = Vec::new();
@@ -556,11 +681,20 @@ impl NvmeSource {
             tx.push(btx);
             threads.push(h);
         }
-        Ok(NvmeSource { tx, threads, backend })
+        Ok(NvmeSource { tx, threads, backend, pool: None })
     }
 
+    /// threads that issue reads: the readers, or the pool's workers
     pub fn readers(&self) -> usize {
-        self.tx.len()
+        match &self.pool {
+            Some(p) => p.cfg.threads,
+            None => self.tx.len(),
+        }
+    }
+
+    /// the piece pool's shape, `None` = the per-reader backends
+    pub fn pool(&self) -> Option<PoolConfig> {
+        self.pool.as_ref().map(|p| p.cfg)
     }
 
     /// the backend every reader of this source runs
@@ -618,13 +752,26 @@ impl NvmeSource {
     /// [`ColdSource::fetch`]'s, and every flag is a live, 8-B aligned u64 that only this fetch
     /// writes until the ticket has been waited on (or dropped).
     pub unsafe fn fetch_landed(&self, jobs: &[(ExpertRecord, RecordDst)], landed: &[Landed]) -> Result<Ticket, String> {
-        if landed.len() != jobs.len() {
-            return Err(format!("NVMe tier: {} landed flags for {} records", landed.len(), jobs.len()));
-        }
-        self.fetch_with(jobs, Some(landed))
+        self.fetch_prio(jobs, Some(landed), ReadPriority::Demand)
     }
 
-    unsafe fn fetch_with(&self, jobs: &[(ExpertRecord, RecordDst)], landed: Option<&[Landed]>) -> Result<Ticket, String> {
+    /// [`ColdSource::fetch`] (`landed` = `None`) or [`NvmeSource::fetch_landed`] with a queue:
+    /// under the piece pool a `Prefetch` fetch waits behind every queued `Demand` piece; the
+    /// per-reader backends ignore `prio`.
+    ///
+    /// # Safety
+    ///
+    /// [`NvmeSource::fetch_landed`]'s.
+    pub unsafe fn fetch_prio(&self, jobs: &[(ExpertRecord, RecordDst)], landed: Option<&[Landed]>, prio: ReadPriority) -> Result<Ticket, String> {
+        if let Some(l) = landed {
+            if l.len() != jobs.len() {
+                return Err(format!("NVMe tier: {} landed flags for {} records", l.len(), jobs.len()));
+            }
+        }
+        self.fetch_with(jobs, landed, prio)
+    }
+
+    unsafe fn fetch_with(&self, jobs: &[(ExpertRecord, RecordDst)], landed: Option<&[Landed]>, prio: ReadPriority) -> Result<Ticket, String> {
         if jobs.len() > MAX_IN_FLIGHT {
             return Err(format!("NVMe tier: {} records in one fetch, at most {MAX_IN_FLIGHT} (the misses of one layer)", jobs.len()));
         }
@@ -633,6 +780,10 @@ impl NvmeSource {
                 return Err(format!("NVMe tier refused: {why}"));
             }
         }
+        if let Some(p) = &self.pool {
+            return Ok(p.submit(jobs, landed, prio));
+        }
+        let _ = prio; // one FIFO per reader
         let n = self.tx.len().min(jobs.len());
         let mut share: Vec<Vec<Job>> = (0..n).map(|_| Vec::new()).collect();
         for (k, (rec, dst)) in jobs.iter().enumerate() {
@@ -650,11 +801,264 @@ impl NvmeSource {
 
 impl ColdSource for NvmeSource {
     unsafe fn fetch(&self, jobs: &[(ExpertRecord, RecordDst)]) -> Result<Ticket, String> {
-        self.fetch_with(jobs, None)
+        self.fetch_with(jobs, None, ReadPriority::Demand)
     }
 
     fn wait(&self, mut t: Ticket) -> Result<FetchReport, String> {
         t.drain()
+    }
+}
+
+/// One fetch of the pool: its records left, the sum of their reports, the ticket's sender.
+struct PoolFetch {
+    left: AtomicUsize,
+    sum: Mutex<(FetchReport, Option<String>)>,
+    reply: Mutex<Option<mpsc::Sender<Result<FetchReport, String>>>>,
+}
+
+/// One record of a pool fetch: its pieces left, the bytes they read, the first error.
+struct PoolRecord {
+    job: Job,
+    left: AtomicUsize,
+    bytes: AtomicU64,
+    err: Mutex<Option<String>>,
+    fetch: Arc<PoolFetch>,
+}
+// `job` holds the caller's destination and flag, valid until the ticket is waited on (`fetch`'s
+// contract); the workers write disjoint pieces of it and only the last one reads it whole
+unsafe impl Send for PoolRecord {}
+unsafe impl Sync for PoolRecord {}
+
+/// One read of at most [`PoolConfig::piece`] bytes into its record's destination.
+struct Piece {
+    off: u64,
+    dst: *mut u8,
+    len: usize,
+    rec: Arc<PoolRecord>,
+}
+unsafe impl Send for Piece {}
+
+#[derive(Default)]
+struct PoolQueues {
+    hi: VecDeque<Piece>,
+    lo: VecDeque<Piece>,
+    closed: bool,
+}
+
+struct PoolShared {
+    q: Mutex<PoolQueues>,
+    cv: Condvar,
+}
+
+/// The piece pool: `threads` workers, one unbuffered handle each.
+struct Pool {
+    cfg: PoolConfig,
+    shared: Arc<PoolShared>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Pool {
+    fn open(path: &Path, cfg: PoolConfig, affinity: Option<&[usize]>) -> Result<Pool, String> {
+        if let Some(why) = cfg.refusal() {
+            return Err(why);
+        }
+        let shared = Arc::new(PoolShared { q: Mutex::new(PoolQueues::default()), cv: Condvar::new() });
+        // built up in place: a failure below drops it, which closes the queue and joins the
+        // workers already started
+        let mut pool = Pool { cfg, shared, workers: Vec::with_capacity(cfg.threads) };
+        for i in 0..cfg.threads {
+            let file = open_unbuffered_sync(path)?;
+            let cpu = affinity.map(|a| a[i % a.len()]);
+            let sh = pool.shared.clone();
+            let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+            let h = std::thread::Builder::new()
+                .name(format!("nvme-pool-{i}"))
+                .spawn(move || {
+                    if let Some(c) = cpu {
+                        if let Err(e) = pin_current_thread(c) {
+                            let _ = ready_tx.send(Err(e));
+                            return;
+                        }
+                    }
+                    let _ = ready_tx.send(Ok(()));
+                    pool_worker(&file, &sh);
+                })
+                .map_err(|e| format!("NVMe pool: spawning worker {i}: {e}"))?;
+            pool.workers.push(h);
+            match ready_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(format!("NVMe pool: worker {i} died at start")),
+            }
+        }
+        Ok(pool)
+    }
+
+    /// Split every record into pieces and queue them (`Demand` -> high, `Prefetch` -> low), in
+    /// record order, under one lock. The jobs are checked already.
+    fn submit(&self, jobs: &[(ExpertRecord, RecordDst)], landed: Option<&[Landed]>, prio: ReadPriority) -> Ticket {
+        if jobs.is_empty() {
+            return Ticket { parts: Vec::new() };
+        }
+        let (reply, rx) = mpsc::channel();
+        let fetch = Arc::new(PoolFetch { left: AtomicUsize::new(jobs.len()), sum: Mutex::new(Default::default()), reply: Mutex::new(Some(reply)) });
+        let piece = self.cfg.piece;
+        let mut pieces = Vec::new();
+        for (k, (rec, dst)) in jobs.iter().enumerate() {
+            let job = Job { rec: *rec, dst: *dst, landed: landed.map(|l| l[k]) };
+            let parts = rec.parts(dst);
+            let n: usize = parts.iter().map(|(_, s, _)| s.len.div_ceil(piece)).sum();
+            let r = Arc::new(PoolRecord { job, left: AtomicUsize::new(n), bytes: AtomicU64::new(0), err: Mutex::new(None), fetch: fetch.clone() });
+            for (_, s, p) in parts {
+                let mut at = 0;
+                while at < s.len {
+                    let len = piece.min(s.len - at);
+                    pieces.push(Piece { off: s.off + at as u64, dst: unsafe { p.add(at) }, len, rec: r.clone() });
+                    at += len;
+                }
+            }
+        }
+        {
+            let mut q = self.shared.q.lock().unwrap();
+            let dq = match prio {
+                ReadPriority::Demand => &mut q.hi,
+                ReadPriority::Prefetch => &mut q.lo,
+            };
+            dq.extend(pieces);
+        }
+        self.shared.cv.notify_all();
+        Ticket { parts: vec![rx] }
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        // the workers drain both queues before they leave: an outstanding ticket still completes
+        self.shared.q.lock().unwrap().closed = true;
+        self.shared.cv.notify_all();
+        for h in self.workers.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+/// A worker: the high queue's front whenever there is one, else the low queue's; one read at a
+/// time; the worker that finishes a record's last piece finishes the record.
+fn pool_worker(file: &std::fs::File, sh: &PoolShared) {
+    loop {
+        let p = {
+            let mut q = sh.q.lock().unwrap();
+            loop {
+                if let Some(p) = q.hi.pop_front() {
+                    break p;
+                }
+                if let Some(p) = q.lo.pop_front() {
+                    break p;
+                }
+                if q.closed {
+                    return;
+                }
+                q = sh.cv.wait(q).unwrap();
+            }
+        };
+        match read_piece(file, &p) {
+            Ok(n) => {
+                p.rec.bytes.fetch_add(n, Ordering::Relaxed);
+            }
+            Err(e) => {
+                p.rec.err.lock().unwrap().get_or_insert(e);
+            }
+        }
+        // AcqRel: the last decrement sees every other worker's bytes of this record
+        if p.rec.left.fetch_sub(1, Ordering::AcqRel) == 1 {
+            finish_record(&p.rec);
+        }
+    }
+}
+
+/// Read one piece; an unbuffered read that ends short of the piece is the end of the file and an
+/// error by name.
+fn read_piece(file: &std::fs::File, p: &Piece) -> Result<u64, String> {
+    // SAFETY: the piece is a disjoint part of a destination valid until the ticket is waited on
+    let buf = unsafe { std::slice::from_raw_parts_mut(p.dst, p.len) };
+    let (layer, id) = (p.rec.job.rec.layer, p.rec.job.rec.id);
+    let mut done = 0usize;
+    while done < p.len {
+        match read_at(file, &mut buf[done..], p.off + done as u64) {
+            Ok(0) => break,
+            Ok(n) => {
+                done += n;
+                if !(n as u64).is_multiple_of(ALIGN) {
+                    break; // the unaligned tail of the file: nothing can follow
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(format!("NVMe pool: read layer {layer} expert {id} at {}: {e}", p.off + done as u64)),
+        }
+    }
+    if done != p.len {
+        return Err(format!("NVMe pool: short read layer {layer} expert {id} at {}, {done} of {} B (past the end of the file?)", p.off, p.len));
+    }
+    Ok(done as u64)
+}
+
+#[cfg(windows)]
+fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(f, buf, off)
+}
+
+#[cfg(unix)]
+fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(f, buf, off)
+}
+
+/// The container for one pool worker: unbuffered and synchronous (`FILE_FLAG_NO_BUFFERING` /
+/// `O_DIRECT`).
+fn open_unbuffered_sync(path: &Path) -> Result<std::fs::File, String> {
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        o.custom_flags(win::FILE_FLAG_NO_BUFFERING);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_DIRECT);
+    }
+    o.open(path).map_err(|e| format!("NVMe pool: {}: {e}", path.display()))
+}
+
+/// A record's last piece is in: sanitize (NVFP4, only when every piece read), raise its landed
+/// flag (also on a failure, see [`raise_landed`]), add it to its fetch, and send the fetch's
+/// report when it was the fetch's last record.
+fn finish_record(r: &PoolRecord) {
+    let err = r.err.lock().unwrap().take();
+    let bytes = r.bytes.load(Ordering::Relaxed);
+    let jobs = std::slice::from_ref(&r.job);
+    // SAFETY: every piece of the record has been read (left reached 0 with AcqRel)
+    let clamped = if err.is_none() { unsafe { sanitize_jobs(jobs) } } else { 0 };
+    // SAFETY: `fetch_landed`'s contract, the flag lives until the ticket is waited on
+    unsafe { raise_landed(jobs) };
+    let f = &r.fetch;
+    {
+        let mut s = f.sum.lock().unwrap();
+        s.0.records += 1;
+        s.0.bytes += bytes;
+        s.0.clamped += clamped;
+        if let Some(e) = err {
+            s.1.get_or_insert(e);
+        }
+    }
+    if f.left.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let (rep, err) = std::mem::take(&mut *f.sum.lock().unwrap());
+        if let Some(tx) = f.reply.lock().unwrap().take() {
+            let _ = tx.send(match err {
+                Some(e) => Err(e),
+                None => Ok(rep),
+            });
+        }
     }
 }
 
@@ -1524,6 +1928,350 @@ mod tests {
                 let e = unsafe { src.fetch_landed(&[(past, RecordDst { gu: b.p, dn: std::ptr::null_mut() })], &[]) }.err().unwrap();
                 assert!(e.contains("0 landed flags for 1 records"), "{e}");
             }
+        }
+    }
+
+    // ---- the piece pool (CROW_NVME_POOL, 0xSero's nv2 reader) ----
+
+    fn pool_cfg(path: &Path, threads: usize, piece: usize) -> NvmeConfig {
+        let mut cfg = NvmeConfig::new(path);
+        cfg.pool = PoolAsk::On(PoolConfig { threads, piece });
+        cfg
+    }
+
+    /// Off unless asked: unset, empty and `0` are off, `1` is 48 workers x 1024 KiB, the knobs
+    /// override that, every value that is not theirs is refused by name, and an explicit ask
+    /// wins over the variables.
+    #[test]
+    fn the_pool_is_off_unless_asked_and_bad_values_are_refused_by_name() {
+        assert_eq!(NvmeConfig::new("x").pool, PoolAsk::Env);
+        for off in [None, Some(""), Some("0"), Some(" 0 ")] {
+            assert_eq!(resolve_pool(PoolAsk::Env, off, Some("7"), Some("8")), Ok(None));
+        }
+        let d = PoolConfig { threads: 48, piece: 1 << 20 };
+        assert_eq!(PoolConfig::default(), d);
+        assert_eq!(resolve_pool(PoolAsk::Env, Some("1"), None, None), Ok(Some(d)));
+        assert_eq!(resolve_pool(PoolAsk::Env, Some("1"), Some(""), Some("")), Ok(Some(d)));
+        assert_eq!(resolve_pool(PoolAsk::Env, Some("1"), Some("16"), Some("256")), Ok(Some(PoolConfig { threads: 16, piece: 256 << 10 })));
+        assert_eq!(resolve_pool(PoolAsk::Off, Some("1"), None, None), Ok(None));
+        assert_eq!(resolve_pool(PoolAsk::On(PoolConfig { threads: 2, piece: 8192 }), None, None, None), Ok(Some(PoolConfig { threads: 2, piece: 8192 })));
+        let e = resolve_pool(PoolAsk::Env, Some("yes"), None, None).unwrap_err();
+        assert!(e.contains("CROW_NVME_POOL=\"yes\""), "{e}");
+        for (t, kb, name) in [(Some("0"), None, "CROW_NVME_POOL_THREADS"), (Some("257"), None, "CROW_NVME_POOL_THREADS"), (Some("x"), None, "CROW_NVME_POOL_THREADS"),
+            (None, Some("6"), "CROW_NVME_POOL_PIECE_KB"), (None, Some("0"), "CROW_NVME_POOL_PIECE_KB"), (None, Some("65540"), "CROW_NVME_POOL_PIECE_KB"), (None, Some("1.5"), "CROW_NVME_POOL_PIECE_KB")]
+        {
+            let e = resolve_pool(PoolAsk::Env, Some("1"), t, kb).unwrap_err();
+            assert!(e.contains(name), "{t:?} {kb:?}: {e}");
+        }
+        assert!(resolve_pool(PoolAsk::On(PoolConfig { threads: 4, piece: 6000 }), None, None, None).unwrap_err().contains("piece 6000 B"));
+    }
+
+    /// The pool with an explicit `ioring` backend is refused by both names, not run as either.
+    #[test]
+    fn the_pool_with_ioring_is_refused_by_name() {
+        let mut cfg = pool_cfg(Path::new("does-not-matter.cnq"), 2, 4096);
+        cfg.backend = Some(NvmeBackend::IoRing);
+        let e = NvmeSource::open(&cfg).err().expect("pool + ioring opened");
+        assert!(e.contains("CROW_NVME_POOL=1") && e.contains("CROW_NVME_BACKEND=ioring refused"), "{e}");
+    }
+
+    /// The eight records of the backend identity test (one of them two slabs), read by the pool at
+    /// 1, 3 and 48 workers and pieces of one sector, 20 KiB (a short tail piece on most records)
+    /// and 1 MiB, twice per source: each destination is the plain read of its span.
+    #[test]
+    fn the_pool_reads_records_byte_identical_to_a_plain_read() {
+        const LEN: usize = 48 << 20;
+        let (f, want) = pool_raw_file("ident", LEN);
+        let lens = [MUL1_REC as usize, 4096, 1 << 20, 2_813_952, 409_600, 3 << 20, 8192, 5_005_312];
+        let offs = [36u64 << 20, 0, 12 << 20, 20 << 20, 4096, 28 << 20, (48 << 20) - 8192, 16 << 20];
+        let mut recs: Vec<ExpertRecord> = (0..8).map(|k| pool_rec(k as u32, offs[k], lens[k])).collect();
+        recs[3].layout = RecordLayout::TwoSlabs;
+        recs[3].gu.len = 1 << 20;
+        recs[3].dn = Span { off: 44 << 20, len: 1 << 20 };
+        let total: u64 = recs.iter().map(|r| if r.layout == RecordLayout::TwoSlabs { r.gu.len + r.dn.len } else { r.gu.len } as u64).sum();
+        for threads in [1, 3, 48] {
+            for piece in [4096, 20 << 10, 1 << 20] {
+                let src = NvmeSource::open(&pool_cfg(&f.path, threads, piece)).unwrap();
+                assert_eq!((src.readers(), src.pool()), (threads, Some(PoolConfig { threads, piece })));
+                for round in 0..2 {
+                    let bufs: Vec<(Aligned, Aligned)> = recs.iter().map(|r| (Aligned::new(r.gu.len), Aligned::new(r.dn.len.max(4096)))).collect();
+                    let jobs: Vec<(ExpertRecord, RecordDst)> = recs.iter().zip(&bufs).map(|(r, (g, d))| (*r, RecordDst { gu: g.p, dn: d.p })).collect();
+                    let rep = src.wait(unsafe { src.fetch(&jobs) }.unwrap()).unwrap();
+                    assert_eq!((rep.records, rep.bytes, rep.clamped), (8, total, 0), "{threads} x {piece} round {round}");
+                    for (r, (g, d)) in recs.iter().zip(&bufs) {
+                        for (what, s, buf) in [("gu", r.gu, g), ("dn", r.dn, d)] {
+                            let at = s.off as usize;
+                            assert!(buf.bytes()[..s.len] == want[at..at + s.len], "{threads} x {piece} round {round}: record {} {what} differs", r.id);
+                        }
+                    }
+                }
+                let empty = src.wait(unsafe { src.fetch(&[]) }.unwrap()).unwrap();
+                assert_eq!(empty, FetchReport::default());
+            }
+        }
+    }
+
+    /// NVFP4 through the pool is the load path's bytes: read_range + sanitize per slab, with the
+    /// clamp count, pieces of 20 KiB (so a record's sanitize waits for pieces of many workers).
+    #[test]
+    fn an_nvfp4_record_through_the_pool_is_the_load_paths_bytes() {
+        let s = synth("pool-nvfp4", 4084);
+        let mut cnq = Cnq::open_checked(s.path.to_str().unwrap()).unwrap();
+        let (gt, dt) = tensors(&cnq);
+        let ids = [9u32, 0, 3, 7, 1, 8, 5, 2];
+        let recs: Vec<ExpertRecord> = ids.iter().map(|&id| ExpertRecord::locate(&cnq, &gt, &dt, 0, id, GU, DN).unwrap()).collect();
+        let bufs: Vec<(Aligned, Aligned)> = ids.iter().map(|_| (Aligned::new(GU as usize), Aligned::new(DN as usize))).collect();
+        let jobs: Vec<(ExpertRecord, RecordDst)> = recs.iter().zip(&bufs).map(|(r, (g, d))| (*r, RecordDst { gu: g.p, dn: d.p })).collect();
+        let src = NvmeSource::open(&pool_cfg(&s.path, 16, 20 << 10)).unwrap();
+        let rep = src.wait(unsafe { src.fetch(&jobs) }.unwrap()).unwrap();
+        assert_eq!((rep.records, rep.bytes), (8, 8 * (GU + DN)));
+        let mut want_clamped = 0;
+        for (k, &id) in ids.iter().enumerate() {
+            for (t, slab, buf) in [(&gt, GU, &bufs[k].0), (&dt, DN, &bufs[k].1)] {
+                let mut want = cnq.read_range(t, id as u64 * slab, slab as usize);
+                want_clamped += sanitize_sf_slab(&mut want);
+                assert!(buf.bytes() == want.as_slice(), "expert {id} {}: pool bytes differ from read_range + sanitize", t.name);
+            }
+        }
+        assert!(want_clamped > 0);
+        assert_eq!(rep.clamped, want_clamped);
+        drop(src);
+        drop(cnq);
+    }
+
+    /// A record past the end of the file is a short read by name; the pool keeps working.
+    #[test]
+    fn a_short_read_through_the_pool_is_an_error_by_name() {
+        const LEN: usize = 1 << 20;
+        let (f, want) = pool_raw_file("short", LEN);
+        let src = NvmeSource::open(&pool_cfg(&f.path, 4, 1 << 20)).unwrap();
+        let b = Aligned::new(8192);
+        let past = pool_rec(7, (LEN - 4096) as u64, 8192);
+        let e = src.wait(unsafe { src.fetch(&[(past, RecordDst { gu: b.p, dn: std::ptr::null_mut() })]) }.unwrap()).unwrap_err();
+        assert!(e.contains("NVMe pool: short read layer 0 expert 7") && e.contains("4096 of 8192 B"), "{e}");
+        let ok = pool_rec(8, 8192, 8192);
+        let rep = src.wait(unsafe { src.fetch(&[(ok, RecordDst { gu: b.p, dn: std::ptr::null_mut() })]) }.unwrap()).unwrap();
+        assert_eq!(rep.bytes, 8192);
+        assert!(b.bytes() == &want[8192..16384]);
+    }
+
+    /// Landed flags through the pool: a flag shows its value only once its record equals the
+    /// plain read (the host spins without waiting on the ticket); a short read raises its flag.
+    #[test]
+    fn a_landed_flag_through_the_pool_rises_after_its_record() {
+        const LEN: usize = 48 << 20;
+        let (f, want) = pool_raw_file("landed", LEN);
+        let lens = [MUL1_REC as usize, 4096, 1 << 20, 2_813_952, 409_600, 3 << 20, 8192, 5_005_312];
+        let offs = [36u64 << 20, 0, 12 << 20, 20 << 20, 4096, 28 << 20, (48 << 20) - 8192, 16 << 20];
+        let recs: Vec<ExpertRecord> = (0..8).map(|k| pool_rec(k as u32, offs[k], lens[k])).collect();
+        let src = NvmeSource::open(&pool_cfg(&f.path, 8, 256 << 10)).unwrap();
+        let flags: Vec<u64> = vec![0; 8];
+        for round in 1..=3u64 {
+            let bufs: Vec<Aligned> = recs.iter().map(|r| Aligned::new(r.gu.len)).collect();
+            let jobs: Vec<(ExpertRecord, RecordDst)> = recs.iter().zip(&bufs).map(|(r, b)| (*r, RecordDst { gu: b.p, dn: std::ptr::null_mut() })).collect();
+            let landed: Vec<Landed> = (0..8).map(|k| Landed { flag: &flags[k] as *const u64 as *mut u64, value: round * 100 + k as u64 }).collect();
+            let t = unsafe { src.fetch_landed(&jobs, &landed) }.unwrap();
+            let mut seen = [false; 8];
+            let t0 = std::time::Instant::now();
+            while seen.iter().any(|s| !s) {
+                for k in 0..8 {
+                    if !seen[k] && unsafe { std::ptr::read_volatile(&flags[k]) } == landed[k].value {
+                        std::sync::atomic::fence(Ordering::Acquire);
+                        let at = offs[k] as usize;
+                        assert!(bufs[k].bytes()[..lens[k]] == want[at..at + lens[k]], "round {round}: record {k}'s flag rose before its bytes");
+                        seen[k] = true;
+                    }
+                }
+                assert!(t0.elapsed().as_secs() < 30, "round {round}: flags {seen:?} never rose");
+                std::hint::spin_loop();
+            }
+            src.wait(t).unwrap();
+        }
+        let b = Aligned::new(8192);
+        let flag = 0u64;
+        let past = pool_rec(7, (LEN - 4096) as u64, 8192);
+        let t = unsafe { src.fetch_landed(&[(past, RecordDst { gu: b.p, dn: std::ptr::null_mut() })], &[Landed { flag: &flag as *const u64 as *mut u64, value: 9 }]) }.unwrap();
+        assert!(src.wait(t).unwrap_err().contains("short read"));
+        assert_eq!(unsafe { std::ptr::read_volatile(&flag) }, 9, "a failed read must still raise its flag");
+    }
+
+    /// The two queues: one worker, a prefetch of 8 records of 1 MiB in 4 KiB pieces (2048
+    /// pieces) queued first, then one 8 KiB record. As `Demand` it completes while the last
+    /// prefetch record has not landed; as `Prefetch` it waits behind all of them (one FIFO).
+    #[test]
+    fn a_demand_read_overtakes_queued_prefetch_pieces() {
+        const LEN: usize = 16 << 20;
+        let (f, want) = pool_raw_file("prio", LEN);
+        let src = NvmeSource::open(&pool_cfg(&f.path, 1, 4096)).unwrap();
+        for (prio, overtakes) in [(ReadPriority::Demand, true), (ReadPriority::Prefetch, false)] {
+            let pf: Vec<ExpertRecord> = (0..8).map(|k| pool_rec(k, (k as u64) << 20, 1 << 20)).collect();
+            let pf_bufs: Vec<Aligned> = pf.iter().map(|_| Aligned::new(1 << 20)).collect();
+            let pf_jobs: Vec<(ExpertRecord, RecordDst)> = pf.iter().zip(&pf_bufs).map(|(r, b)| (*r, RecordDst { gu: b.p, dn: std::ptr::null_mut() })).collect();
+            let flags: Vec<u64> = vec![0; 8];
+            let landed: Vec<Landed> = (0..8).map(|k| Landed { flag: &flags[k] as *const u64 as *mut u64, value: 1 }).collect();
+            let tp = unsafe { src.fetch_prio(&pf_jobs, Some(&landed), ReadPriority::Prefetch) }.unwrap();
+            let b = Aligned::new(8192);
+            let d = pool_rec(99, 12 << 20, 8192);
+            let td = unsafe { src.fetch_prio(&[(d, RecordDst { gu: b.p, dn: std::ptr::null_mut() })], None, prio) }.unwrap();
+            src.wait(td).unwrap();
+            let last = unsafe { std::ptr::read_volatile(&flags[7]) };
+            assert!(b.bytes() == &want[12 << 20..(12 << 20) + 8192]);
+            src.wait(tp).unwrap();
+            assert_eq!(last == 0, overtakes, "{prio:?}: the last prefetch record had {}landed when the 8 KiB read completed", if last == 0 { "not " } else { "" });
+        }
+    }
+
+    /// a plain file of xorshift bytes (the backend tests' `raw_file`, on every platform)
+    fn pool_raw_file(tag: &str, len: usize) -> (Synth, Vec<u8>) {
+        let dir = std::env::temp_dir().join(format!("crow-nvme-pool-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("raw.bin");
+        let mut x = 0x5851_F42D_4C95_7F2Du64;
+        let mut bytes = vec![0u8; len];
+        for w in bytes.chunks_exact_mut(8) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            w.copy_from_slice(&x.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        (Synth { dir, path }, bytes)
+    }
+
+    fn pool_rec(id: u32, off: u64, len: usize) -> ExpertRecord {
+        ExpertRecord { layer: 0, id, gu: Span { off, len }, dn: Span { off: 0, len: 0 }, codec: ExpertCodec::Mul1, layout: RecordLayout::OneUnit }
+    }
+
+    /// Read micro-bench on a real glm5_next container (`CROW_NVME_BENCH_CNQ`, read-only, about a
+    /// minute): every routed-expert record in a shuffled order, GB/s of the per-reader backends
+    /// (fetch of 8, waited one at a time - the engine's pattern) and of the pool at 1/8/16/48
+    /// workers (1 MiB pieces; 1 and 8 fetches of 8 outstanding), then the latency of a demand
+    /// fetch of 8 records every 3 ms under a prefetch load of 4 outstanding fetches, as Demand
+    /// and as Prefetch. `cargo test --release --lib nvme_source::tests::bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_pool_on_container() {
+        let Ok(path) = std::env::var("CROW_NVME_BENCH_CNQ") else {
+            eprintln!("CROW_NVME_BENCH_CNQ unset: nothing to measure");
+            return;
+        };
+        let per = std::env::var("CROW_NVME_BENCH_RECORDS").ok().and_then(|v| v.parse().ok()).unwrap_or(640usize);
+        let (spec, n) = glm5_record_of_container(&path).unwrap();
+        let cnq = Cnq::open_checked(&path).unwrap();
+        let mut recs: Vec<ExpertRecord> = cnq
+            .tensors
+            .iter()
+            .filter(|t| t.section == "text" && !t.overlay)
+            .filter_map(|t| match glm5_expert_parts(&t.name) {
+                Some((l, e, 0)) => Some(ExpertRecord { layer: l, id: e, gu: Span { off: cnq.abs_offset(t, 0), len: spec.bytes as usize }, dn: Span { off: 0, len: 0 }, codec: spec.codec, layout: RecordLayout::OneUnit }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recs.len(), n);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for i in (1..recs.len()).rev() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            recs.swap(i, (x % (i as u64 + 1)) as usize);
+        }
+        drop(cnq);
+        eprintln!("{path}: {n} records of {} B ({}), {per} records per point", spec.bytes, spec.codec.dtype());
+        let bufs: Vec<Aligned> = (0..72).map(|_| Aligned::new(spec.bytes as usize)).collect();
+        let addr: Vec<usize> = bufs.iter().map(|b| b.p as usize).collect();
+        let mut cursor = 0usize;
+        let next8 = |cursor: &mut usize| -> Vec<ExpertRecord> {
+            (0..8).map(|_| {
+                let r = recs[*cursor % recs.len()];
+                *cursor += 1;
+                r
+            }).collect()
+        };
+        // GB/s with `depth` fetches of 8 outstanding
+        let rate = |src: &NvmeSource, depth: usize, cursor: &mut usize| -> f64 {
+            let fetches = per / 8;
+            let mut q: VecDeque<Ticket> = VecDeque::new();
+            let t0 = std::time::Instant::now();
+            let mut bytes = 0u64;
+            for i in 0..fetches {
+                if q.len() == depth {
+                    bytes += src.wait(q.pop_front().unwrap()).unwrap().bytes;
+                }
+                let slot = i % depth;
+                let jobs: Vec<(ExpertRecord, RecordDst)> = next8(cursor).into_iter().enumerate().map(|(k, r)| (r, RecordDst { gu: addr[slot * 8 + k] as *mut u8, dn: std::ptr::null_mut() })).collect();
+                q.push_back(unsafe { src.fetch(&jobs) }.unwrap());
+            }
+            while let Some(t) = q.pop_front() {
+                bytes += src.wait(t).unwrap().bytes;
+            }
+            bytes as f64 / t0.elapsed().as_secs_f64() / 1e9
+        };
+        let mut line = Vec::new();
+        for (backend, readers) in [(NvmeBackend::Iocp, 1), (NvmeBackend::IoRing, 2)] {
+            let mut cfg = NvmeConfig::new(&path);
+            cfg.readers = readers;
+            cfg.backend = Some(backend);
+            cfg.pool = PoolAsk::Off;
+            let src = NvmeSource::open(&cfg).unwrap();
+            let g = rate(&src, 1, &mut cursor);
+            eprintln!("{} x {readers} depth 1: {g:.2} GB/s", backend.name());
+            line.push(format!("{}x{readers} d1 {g:.2}", backend.name()));
+        }
+        for threads in [1, 8, 16, 48] {
+            let src = NvmeSource::open(&pool_cfg(Path::new(&path), threads, 1 << 20)).unwrap();
+            for depth in [1, 8] {
+                let g = rate(&src, depth, &mut cursor);
+                eprintln!("pool {threads} x 1 MiB, {depth} fetch(es) of 8 outstanding: {g:.2} GB/s");
+                line.push(format!("pool{threads} d{depth} {g:.2}"));
+            }
+        }
+        eprintln!("GB/s: {}", line.join(" | "));
+        // latency of a demand fetch of 8 under a prefetch load
+        let src = NvmeSource::open(&pool_cfg(Path::new(&path), 48, 1 << 20)).unwrap();
+        let pf_recs: Vec<ExpertRecord> = (0..4096).flat_map(|_| next8(&mut cursor)).collect();
+        let fg_recs: Vec<ExpertRecord> = (0..1024).flat_map(|_| next8(&mut cursor)).collect();
+        let pct = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (v[v.len() / 2], v[(v.len() * 99 / 100).min(v.len() - 1)], v[v.len() - 1])
+        };
+        for (what, load, prio) in [("idle", false, ReadPriority::Demand), ("load+Demand", true, ReadPriority::Demand), ("load+Prefetch", true, ReadPriority::Prefetch)] {
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let bg_bytes = AtomicU64::new(0);
+            let mut lat = Vec::new();
+            let t_all = std::time::Instant::now();
+            std::thread::scope(|sc| {
+                if load {
+                    sc.spawn(|| {
+                        let mut q: VecDeque<Ticket> = VecDeque::new();
+                        let mut i = 0usize;
+                        while !stop.load(Ordering::Relaxed) {
+                            if q.len() == 4 {
+                                bg_bytes.fetch_add(src.wait(q.pop_front().unwrap()).unwrap().bytes, Ordering::Relaxed);
+                            }
+                            let slot = i % 4;
+                            let jobs: Vec<(ExpertRecord, RecordDst)> = (0..8).map(|k| (pf_recs[(i * 8 + k) % pf_recs.len()], RecordDst { gu: addr[slot * 8 + k] as *mut u8, dn: std::ptr::null_mut() })).collect();
+                            q.push_back(unsafe { src.fetch_prio(&jobs, None, ReadPriority::Prefetch) }.unwrap());
+                            i += 1;
+                        }
+                        while let Some(t) = q.pop_front() {
+                            bg_bytes.fetch_add(src.wait(t).unwrap().bytes, Ordering::Relaxed);
+                        }
+                    });
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                for i in 0..60 {
+                    std::thread::sleep(std::time::Duration::from_millis(3));
+                    let jobs: Vec<(ExpertRecord, RecordDst)> = (0..8).map(|k| (fg_recs[(i * 8 + k) % fg_recs.len()], RecordDst { gu: addr[64 + k] as *mut u8, dn: std::ptr::null_mut() })).collect();
+                    let t0 = std::time::Instant::now();
+                    let t = unsafe { src.fetch_prio(&jobs, None, prio) }.unwrap();
+                    src.wait(t).unwrap();
+                    lat.push(t0.elapsed().as_secs_f64() * 1e3);
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+            let (p50, p99, max) = pct(&mut lat);
+            let bg = bg_bytes.load(Ordering::Relaxed) as f64 / t_all.elapsed().as_secs_f64() / 1e9;
+            eprintln!("latency of 8 records ({:.1} MB) {what}: p50 {p50:.2} ms, p99 {p99:.2} ms, max {max:.2} ms; prefetch load {bg:.2} GB/s", 8.0 * spec.bytes as f64 / 1e6);
         }
     }
 
