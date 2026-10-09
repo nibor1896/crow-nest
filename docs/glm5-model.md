@@ -180,14 +180,94 @@ R, #174). The layer math is section 1 unchanged; what changes is where an expert
 ```
 cd engine
 CARGO_BUILD_JOBS=4 cargo build --release --bin glm5_run
-target/release/glm5_run -n 16 [--cnq PATH] [--ids a,b,c | --prompt TEXT --tokenizer tokenizer.json]
+target/release/glm5_run -n 16 [--cnq PATH] [--ids a,b,c | --prompt TEXT --tokenizer tokenizer.json | --prompt-ids PATH]
+                        [--prompt-tokens N] [--reps N] [--cold] [--json PATH]
                         [--vram-slots N] [--pinned-slots N] [--readers N]
 ```
 
-Without `--ids` / `--prompt` the prompt is the tokenizer golden `sys_user_default` (38 ids). Per
-row: position, greedy id, seconds, NVMe reads (count, MB), the summed and the per-layer `v/p/n`
-accesses; then the ids (the text with `--tokenizer`) and the totals. The seconds are no speed
-figure: every MoE layer syncs for its routing.
+Without `--ids` / `--prompt` / `--prompt-ids` the prompt is the tokenizer golden `sys_user_default`
+(31 ids). Per row: position, phase, rep, greedy id, seconds, NVMe reads (count, MB), the summed and
+the per-layer `v/p/n` accesses; then per rep the ids (the text with `--tokenizer`), the prefill and
+decode lines and the summary over the reps (section 6.1). The times are those of this synchronous
+path: every MoE layer syncs for its routing.
+
+### 6.1 Measuring with `glm5_run` (#187)
+
+The lever A/B instrument: prefill and decode timed and counted apart on one loaded model. It is not
+G5 (#151 judges speed only in Crow's window); it gives the baseline a lever (#186 prefill chunks,
+router prefetch, reader count) is compared against. No flag changes what `generate` computes: the
+counters are host integers in `serve`, the clocks sit behind syncs the path already has.
+
+| flag | effect |
+|---|---|
+| `--reps N` | `generate` N times on the loaded model (default 1). Rep 1 starts cold (cache empty); later reps start with the cache the previous rep left (warm) |
+| `--cold` | empty the cache before every rep (`ExpertTiers::reset_cache`: new `ExpertCache`, slot maps reset, arenas kept, no allocation) |
+| `--prompt-tokens N` | the base prompt (golden, `--ids`, `--prompt` or `--prompt-ids`) repeated cyclically and cut to N ids: synthetic, deterministic, chat markers repeat |
+| `--prompt-ids PATH` | ids from a file, separated by commas, blanks or newlines (`[ ]` ignored) |
+| `--json PATH` | everything below per rep, phase and MoE layer, plus args, `CROW_*` env, machine state, setup times; rewritten after every rep |
+
+**Phases.** Prefill = the prompt rows; the last prompt row runs the head and yields the first id.
+Decode = every later row, one generated id each (`-n N` gives N - 1 decode rows).
+
+**Clocks** (no sync added):
+- Row seconds = `TokenReport::secs`: `Instant` at the row's start in `Glm5Run::generate` (before
+  the embedding), read after the row's closing `cuda::sync()` and the greedy id's `dtoh`. They
+  include the 42 routing syncs and the tier moves (NVMe reads are synchronous inside `serve`); they
+  exclude the host counter diff and the report callback.
+- TTFT and the phase wall times are read in the bin on entry of the report callback (after that
+  sync), from an `Instant` taken right before the `generate` call. TTFT = the callback of the last
+  prompt row; decode wall = the last row's callback - TTFT. Both include the per-row print of the
+  rows before (one line per row).
+- Prefill tok/s = prompt ids / TTFT. Decode: tok/s per token = 1 / row seconds, median over the
+  decode rows with min / max; the phase rate = decode rows / decode wall; latency p50 / p99 by
+  nearest rank over the row seconds.
+- Load: `open` (container index and checks), `load` (dense part + head), `tiers` (arenas, pinned
+  allocation, record table) printed apart on the `glm5_run setup:` line; the rep wall is the
+  `generate` call.
+
+**Counters per phase, per token** (host, `glm5_tiers::Moves`, counted where `serve` issues the
+moves): visits (distinct selected ids, 336 per decode token); hits per tier `[vram, pinned, nvme]`
+(the cache's counters) and their rates; r = NVMe reads per token (records no tier held at the start
+of the call; PREREG-dyn's bar r_hi <= 18.4 at 3.05 bpw is on a bootstrap CI, so no verdict is
+printed) and NVMe GB per token; m = NVMe-served visits / visits (can exceed r / visits when LRU
+evicts a later id of the same call, section 6); H2D = landing and pinned records copied to staging;
+zero-copy = selected ids the kernels read from their pinned slot; host DRAM -> GPU = H2D +
+zero-copy; D2H = VRAM records demoted into pinned; promotions (NVMe -> VRAM, pinned -> VRAM, NVMe
+-> pinned) and evictions (VRAM -> pinned, VRAM -> NVMe, pinned -> NVMe). Bytes = records x the
+record size (9,474,048 B at 3 bit); for zero-copy this assumes a decode visit reads the whole
+record (not measured). Prefetch: not built; `issued`, `used`, `wasted` print 0 and `demand misses
+uncovered` = r (without prefetch every demand miss is uncovered); the fields are in place for the
+router-prefetch lever. Per MoE layer: in the JSON; the text gives the lowest and highest layer by
+NVMe reads per token and by VRAM hit rate.
+
+**Machine state** after setup and after every rep: VRAM used / free (`cuMemGetInfo`), the process's
+working set, peak working set and private commit (Windows `K32GetProcessMemoryInfo`; unix `VmRSS`,
+`VmHWM`), free RAM and system commit (`GlobalMemoryStatusEx`), the store's pinned bytes; once:
+`git rev-parse HEAD` of the checkout (`-dirty` with tracked changes; the binary's path and mtime in
+the JSON), container path and size, tier sizes, readers, policy.
+
+**Summary over the reps:** median and spread max / min of TTFT, prefill tok/s, decode tok/s
+(median per rep), decode phase rate, decode p50 / p99, rep wall and decode r; the spread rule
+<= 1.15 of the gates (`runs/glm53-flash/PREREG.md`) is named per metric (`within` / `above for
+...`), not a gate verdict; whether the ids are identical across reps; cold / warm per rep.
+
+Stable grep prefixes: `glm5_run row`, `glm5_run setup:`, `glm5_run machine after`, `glm5_run rep
+K/N cache cold|warm` + `ids` / `prefill:` / `decode:` / `prefill counters` / `decode counters` /
+`prefill layers` / `decode layers` / `wall`, `glm5_run summary`, `glm5_run json`. Shape (values
+from the unit test's synthetic rows, not a measurement):
+
+```
+glm5_run rep 1/3 cache cold prefill: 3 tok, TTFT 1.030 s, 2.91 tok/s, row latency p50 0.2500 s p99 0.5000 s
+glm5_run rep 1/3 cache cold decode: 2 tok, 7.50 tok/s median over tokens (min 5.00, max 10.00), wall 0.320 s = 6.25 tok/s, latency p50 0.1000 s p99 0.2000 s
+glm5_run rep 1/3 cache cold decode counters per token: visits 16.0, hits vram 25.0 % pinned 62.5 % nvme 12.5 %, r 2.00 NVMe reads (0.000 GB), m 0.1250, H2D 0.019 GB, zero-copy 0.038 GB, host DRAM->GPU 0.057 GB, D2H 0.000 GB, promotions 2.00, evictions 2.00, prefetch none (issued 0, used 0, wasted 0, demand misses uncovered 2.00)
+glm5_run rep 1/3 cache cold decode layers: NVMe reads/tok min l3 1.00 median 1.00 max l3 1.00; VRAM hit min l3 25.0 % max l3 25.0 %
+glm5_run summary over 2 reps (median, spread max/min): ttft_s 1.0300 (spread 1.000); prefill_tok_s 2.9126 (spread 1.000); decode_tok_s_median 7.5000 (spread 1.000); ...
+glm5_run summary spread rule <= 1.15: every metric within; ids identical across reps: yes; cache per rep: cold warm
+```
+
+Baseline recipe (the lead's, after robin's go for the GPU run): `target/release/glm5_run -n 64
+--reps 3 --json ../runs/glm53-flash/glm5-run-baseline.json`, then the same with `--cold`. No
+figure from this tool exists yet.
 
 **Tests.** Host: `the_moves_put_every_record_where_the_table_points` (a twin of the device store
 whose slots hold expert ids: LRU, CLOCK, CLOCK admit 2, LFU 0.7 at V/P 0/0, 0/8, 8/0, 1/7, 2/3,
@@ -195,12 +275,23 @@ whose slots hold expert ids: LRU, CLOCK, CLOCK admit 2, LFU 0.7 at V/P 0/0, 0/8,
 cached record in its slot, NVMe reads exactly the records no tier held, no NVMe write into a pinned
 slot a queued copy still reads), `lru_by_hand_three_way_exchange`, the sizes against the plan,
 staging overflow and out-of-range ids refused by name; `nvme_source::the_record_table_is_locate_glm5_record_by_record`.
+#187: `the_move_counters_equal_the_twins_calls_and_the_tier_diff` (the same policies and capacities:
+per call visits = distinct ids = the cache's accesses, every mover count = the twin's calls, the six
+transitions = the before/after tier diff, zero-copy = the pinned-served ids; all-NVMe: visits = r,
+no promotion or eviction) and `reset_cache_replays_the_cold_pass_and_warm_reads_less`; the bin's
+own tests (`cargo test --release --bin glm5_run`: phase split, TTFT, percentiles, spread, summary,
+prompt length, ids file, the working-set query).
 GPU (`cargo test --release --lib glm5_tiers_gpu -- --ignored --nocapture --test-threads 1`):
 `glm5_tiers_gpu_every_table_entry_holds_its_record` (synthetic container, 16 records, 7
-capacities: the bytes at every entry are `read_range` of the record; 54 s, passed 2026-10-09) and
+capacities: the bytes at every entry are `read_range` of the record; 54 s, passed 2026-10-09; since
+#187 also the device path's visits and NVMe reads per call, and after `reset_cache` the first
+selection read from NVMe again with the right bytes; 51 s, passed 2026-10-09),
 `glm5_tiers_gpu_cache_size_is_invisible_in_the_logits` (the real container, the fixed prompt, 6
 ids at the plan's V/P, 1 + 7 and 0 + 0: ids and logits bit-identical; plan step 16 abort
-criterion, `docs/architecture.md` A9; not run yet).
+criterion, `docs/architecture.md` A9; not run yet) and
+`glm5_tiers_gpu_reps_and_reset_are_invisible_in_the_logits` (#187: the real container at the
+plan's V/P, rep 1 cold, rep 2 warm, `reset_cache`, rep 3: ids and logits bit-identical, rep 3's
+per-row moves = rep 1's; not run yet).
 
 ## 7. Not verified
 
@@ -210,3 +301,5 @@ criterion, `docs/architecture.md` A9; not run yet).
   only (runner doc section 7). `pre` is not compared. MTP (layer 45, step 21), vision (step 20).
 - Speed, graph capture, the boot (#175, #149, step 14): the taps synchronize.
 - `glm5_run` and the cache-size logits test on the real container (section 6): built, not run.
+- `glm5_run`'s timings and counters on the real container and the reps/reset logits test (section
+  6.1, #187): built, not run; no baseline figure exists.

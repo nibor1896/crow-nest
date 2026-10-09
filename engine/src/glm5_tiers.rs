@@ -139,6 +139,119 @@ pub struct Served {
     pub locs: Vec<(u32, Loc)>,
     pub nvme_reads: usize,
     pub nvme_bytes: u64,
+    /// #187: the moves and tier changes of this call, counted on the host
+    pub moves: Moves,
+}
+
+/// #187: host-side counts of what [`serve`] did, one record each (bytes = count x record
+/// bytes). Counted where the moves are issued; no GPU call. Summed per MoE layer in
+/// [`ExpertTiers::moves`] and per row in [`TokenReport::moves`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Moves {
+    /// distinct selected ids (expert visits) of the call(s)
+    pub visits: u64,
+    /// selected ids the kernels read zero-copy from their pinned slot (over PCIe from host DRAM)
+    pub zero_copy: u64,
+    /// NVMe reads into the pageable landing buffer (then H2D to staging)
+    pub nvme_to_landing: u64,
+    /// NVMe reads straight into a pinned slot
+    pub nvme_to_pinned: u64,
+    /// H2D: landing -> staging
+    pub landing_to_stage: u64,
+    /// H2D: pinned slot -> staging
+    pub pinned_to_stage: u64,
+    /// D2D: VRAM slot -> staging
+    pub vram_to_stage: u64,
+    /// D2H: VRAM slot -> pinned slot
+    pub vram_to_pinned: u64,
+    /// D2D: staging -> VRAM slot
+    pub stage_to_vram: u64,
+    /// tier transitions of the policy (any expert, selected or not): NVMe -> VRAM, pinned ->
+    /// VRAM, NVMe -> pinned (promotions); VRAM -> pinned, VRAM -> NVMe, pinned -> NVMe (evictions)
+    pub n2v: u64,
+    pub p2v: u64,
+    pub n2p: u64,
+    pub v2p: u64,
+    pub v2n: u64,
+    pub p2n: u64,
+}
+
+impl Moves {
+    /// field names in the order of [`Moves::fields`] (the JSON keys of `glm5_run`)
+    pub const NAMES: [&'static str; 15] =
+        ["visits", "zero_copy", "nvme_to_landing", "nvme_to_pinned", "landing_to_stage", "pinned_to_stage", "vram_to_stage", "vram_to_pinned", "stage_to_vram", "n2v", "p2v", "n2p", "v2p", "v2n", "p2n"];
+
+    pub fn fields(&self) -> [u64; 15] {
+        [
+            self.visits,
+            self.zero_copy,
+            self.nvme_to_landing,
+            self.nvme_to_pinned,
+            self.landing_to_stage,
+            self.pinned_to_stage,
+            self.vram_to_stage,
+            self.vram_to_pinned,
+            self.stage_to_vram,
+            self.n2v,
+            self.p2v,
+            self.n2p,
+            self.v2p,
+            self.v2n,
+            self.p2n,
+        ]
+    }
+
+    fn fields_mut(&mut self) -> [&mut u64; 15] {
+        [
+            &mut self.visits,
+            &mut self.zero_copy,
+            &mut self.nvme_to_landing,
+            &mut self.nvme_to_pinned,
+            &mut self.landing_to_stage,
+            &mut self.pinned_to_stage,
+            &mut self.vram_to_stage,
+            &mut self.vram_to_pinned,
+            &mut self.stage_to_vram,
+            &mut self.n2v,
+            &mut self.p2v,
+            &mut self.n2p,
+            &mut self.v2p,
+            &mut self.v2n,
+            &mut self.p2n,
+        ]
+    }
+
+    pub fn add(&mut self, o: &Moves) {
+        for (x, y) in self.fields_mut().into_iter().zip(o.fields()) {
+            *x += y;
+        }
+    }
+
+    /// `self - o` field by field (a later snapshot minus an earlier one)
+    pub fn since(&self, o: &Moves) -> Moves {
+        let mut d = *self;
+        for (x, y) in d.fields_mut().into_iter().zip(o.fields()) {
+            *x -= y;
+        }
+        d
+    }
+
+    pub fn nvme_reads(&self) -> u64 {
+        self.nvme_to_landing + self.nvme_to_pinned
+    }
+
+    pub fn promotions(&self) -> u64 {
+        self.n2v + self.p2v + self.n2p
+    }
+
+    pub fn evictions(&self) -> u64 {
+        self.v2p + self.v2n + self.p2n
+    }
+
+    /// records the mover copies host -> device (landing and pinned slots into staging)
+    pub fn h2d(&self) -> u64 {
+        self.landing_to_stage + self.pinned_to_stage
+    }
 }
 
 /// One call of MoE layer `l` (the cache's layer index): `ids` the distinct selected experts,
@@ -157,12 +270,31 @@ pub fn serve(cache: &mut ExpertCache, l: usize, slots: &mut LayerSlots, ids: &[u
         return Err(format!("expert tiers: layer {l} stages {} records in one call, {stage_cap} staging slots", staged.len()));
     }
     let mut out = Served::default();
+    out.moves.visits = ids.len() as u64;
+    for (b, a) in before.iter().zip(&after) {
+        let mv = &mut out.moves;
+        match (b, a) {
+            (Tier::Nvme, Tier::Vram) => mv.n2v += 1,
+            (Tier::Pinned, Tier::Vram) => mv.p2v += 1,
+            (Tier::Nvme, Tier::Pinned) => mv.n2p += 1,
+            (Tier::Vram, Tier::Pinned) => mv.v2p += 1,
+            (Tier::Vram, Tier::Nvme) => mv.v2n += 1,
+            (Tier::Pinned, Tier::Nvme) => mv.p2n += 1,
+            _ => {}
+        }
+    }
     // phase A: into staging, from pinned / VRAM (queued) or the container (via the landing buffer)
     let mut from_nvme = Vec::new();
     for (s, &e) in staged.iter().enumerate() {
         match before[e as usize] {
-            Tier::Vram => m.vram_to_stage(slots.vram_of[e as usize], s as u32),
-            Tier::Pinned => m.pinned_to_stage(slots.pin_of[e as usize], s as u32),
+            Tier::Vram => {
+                m.vram_to_stage(slots.vram_of[e as usize], s as u32);
+                out.moves.vram_to_stage += 1;
+            }
+            Tier::Pinned => {
+                m.pinned_to_stage(slots.pin_of[e as usize], s as u32);
+                out.moves.pinned_to_stage += 1;
+            }
             Tier::Nvme => from_nvme.push((e, Dst::Landing(s as u32))),
         }
     }
@@ -172,6 +304,7 @@ pub fn serve(cache: &mut ExpertCache, l: usize, slots: &mut LayerSlots, ids: &[u
     for &(_, d) in &from_nvme {
         if let Dst::Landing(i) = d {
             m.landing_to_stage(i);
+            out.moves.landing_to_stage += 1;
         }
     }
     m.barrier();
@@ -189,7 +322,10 @@ pub fn serve(cache: &mut ExpertCache, l: usize, slots: &mut LayerSlots, ids: &[u
             let q = slots.free_pin.pop().ok_or_else(|| format!("expert tiers: layer {l} has no free pinned slot for expert {e}"))?;
             slots.pin_of[e] = q;
             match before[e] {
-                Tier::Vram => m.vram_to_pinned(slots.vram_of[e], q),
+                Tier::Vram => {
+                    m.vram_to_pinned(slots.vram_of[e], q);
+                    out.moves.vram_to_pinned += 1;
+                }
                 _ => to_pinned.push((e as u32, Dst::Pinned(q))),
             }
         }
@@ -209,9 +345,13 @@ pub fn serve(cache: &mut ExpertCache, l: usize, slots: &mut LayerSlots, ids: &[u
             let v = slots.free_vram.pop().ok_or_else(|| format!("expert tiers: layer {l} has no free VRAM slot for expert {e}"))?;
             slots.vram_of[e as usize] = v;
             m.stage_to_vram(s as u32, v);
+            out.moves.stage_to_vram += 1;
         }
     }
     out.nvme_reads = from_nvme.len() + to_pinned.len();
+    out.moves.nvme_to_landing = from_nvme.len() as u64;
+    out.moves.nvme_to_pinned = to_pinned.len() as u64;
+    out.moves.zero_copy = ids.iter().filter(|&&e| after[e as usize] == Tier::Pinned).count() as u64;
     out.locs = ids
         .iter()
         .map(|&e| {
@@ -224,6 +364,17 @@ pub fn serve(cache: &mut ExpertCache, l: usize, slots: &mut LayerSlots, ids: &[u
         })
         .collect();
     Ok(out)
+}
+
+/// #187: a cache and its slot maps as new: every expert on NVMe, every slot free. The bytes
+/// left in the arenas are referenced by no table entry afterwards (the table of a call is built
+/// from the slot maps), so the next call of a layer reads its selection as a cold one.
+pub fn reset_cache(cache: &mut ExpertCache, slots: &mut [LayerSlots], sizes: TierSizes) -> Result<(), String> {
+    *cache = ExpertCache::new(cache.policy, cache.scope, cache.layers, cache.experts, cache.vram, cache.pinned)?;
+    for s in slots.iter_mut() {
+        *s = LayerSlots::new(cache.experts, sizes);
+    }
+    Ok(())
 }
 
 /// the distinct ids of a `[t][k]` selection, ascending (the order `glm_tier_sim` replays)
@@ -295,6 +446,8 @@ pub struct ExpertTiers {
     /// since construction
     pub nvme_reads: u64,
     pub nvme_bytes: u64,
+    /// #187: the [`Moves`] of every MoE layer since construction (host counters)
+    pub moves: Vec<Moves>,
 }
 
 struct GpuMover<'a> {
@@ -398,6 +551,7 @@ impl ExpertTiers {
             src,
             nvme_reads: 0,
             nvme_bytes: 0,
+            moves: vec![Moves::default(); nl],
         })
     }
 
@@ -443,7 +597,15 @@ impl ExpertTiers {
         cuda::to_u64_into(self.tables[l], &table);
         self.nvme_reads += served.nvme_reads as u64;
         self.nvme_bytes += served.nvme_bytes;
+        self.moves[l].add(&served.moves);
         Ok((self.tables[l], served))
+    }
+
+    /// #187 (`glm5_run --cold`): empty the cache again, as after [`ExpertTiers::new`] (see
+    /// [`reset_cache`]). The arenas stay allocated; no allocation, no GPU call. `nvme_reads`,
+    /// `nvme_bytes` and `moves` keep counting; the cache's own counters restart at 0.
+    pub fn reset_cache(&mut self) -> Result<(), String> {
+        reset_cache(&mut self.cache, &mut self.slots, self.sizes)
     }
 
     /// # Safety
@@ -505,6 +667,8 @@ pub struct TokenReport {
     pub nvme_bytes: u64,
     /// `[vram, pinned, nvme]` accesses of this row per MoE layer
     pub tiers: Vec<[u64; 3]>,
+    /// #187: the [`Moves`] of this row per MoE layer (host counters)
+    pub moves: Vec<Moves>,
 }
 
 /// what a run generated
@@ -603,6 +767,7 @@ impl Glm5Run {
             let e = gm::embed_rows(cnq, &g, &[tok]);
             cuda::to_f32_into(self.x, &gm::trunk_input(&e, h, g.hc_streams));
             let c0: Vec<[u64; 3]> = tiers.cache.counters().to_vec();
+            let m0: Vec<Moves> = tiers.moves.clone();
             let mut tick = TierTick::default();
             for l in 0..g.layers {
                 if let Some(s) = self.kda[l].as_mut() {
@@ -640,8 +805,10 @@ impl Glm5Run {
             } else {
                 cuda::sync();
             }
+            let secs = t0.elapsed().as_secs_f64();
             let tiers_row: Vec<[u64; 3]> = tiers.cache.counters().iter().zip(&c0).map(|(a, b)| [a[0] - b[0], a[1] - b[1], a[2] - b[2]]).collect();
-            report(&TokenReport { pos, prompt: pos < prompt.len(), next, secs: t0.elapsed().as_secs_f64(), nvme_reads: tick.nvme_reads, nvme_bytes: tick.nvme_bytes, tiers: tiers_row });
+            let moves: Vec<Moves> = tiers.moves.iter().zip(&m0).map(|(a, b)| a.since(b)).collect();
+            report(&TokenReport { pos, prompt: pos < prompt.len(), next, secs, nvme_reads: tick.nvme_reads, nvme_bytes: tick.nvme_bytes, tiers: tiers_row, moves });
         }
         Ok(out)
     }
@@ -673,7 +840,7 @@ pub fn moe_layers(g: &Glm5Geo) -> usize {
 }
 
 /// the fixed prompt of the cache-size test and the default smoke: the tokenizer golden
-/// `sys_user_default` (system + user message, generation prompt; 38 ids, rendered by
+/// `sys_user_default` (system + user message, generation prompt; 31 ids, rendered by
 /// transformers 5.16.1 from rev `eb9eb208`)
 pub fn fixed_prompt() -> Vec<i64> {
     const GOLDENS: &str = include_str!("../tests/fixtures/GLM-5.3-Flash/tokenizer-goldens.json");
@@ -701,13 +868,15 @@ mod tests {
         /// barrier is the race the GPU would have
         pending_reads_pinned: Vec<u32>,
         reads: usize,
+        /// #187: the mover calls the twin saw, counted independently of `serve`'s own counts
+        ops: Moves,
     }
 
     const EMPTY: u32 = u32::MAX - 1;
 
     impl Sim {
         fn new(s: TierSizes, stage: usize) -> Sim {
-            Sim { vram: vec![EMPTY; s.vram], pinned: vec![EMPTY; s.pinned], stage: vec![EMPTY; stage], landing: vec![EMPTY; stage], pending_reads_pinned: Vec::new(), reads: 0 }
+            Sim { vram: vec![EMPTY; s.vram], pinned: vec![EMPTY; s.pinned], stage: vec![EMPTY; stage], landing: vec![EMPTY; stage], pending_reads_pinned: Vec::new(), reads: 0, ops: Moves::default() }
         }
     }
 
@@ -716,10 +885,14 @@ mod tests {
             assert!(jobs.len() <= MAX_IN_FLIGHT);
             for &(e, d) in jobs {
                 match d {
-                    Dst::Landing(i) => self.landing[i as usize] = e,
+                    Dst::Landing(i) => {
+                        self.landing[i as usize] = e;
+                        self.ops.nvme_to_landing += 1;
+                    }
                     Dst::Pinned(q) => {
                         assert!(!self.pending_reads_pinned.contains(&q), "NVMe wrote pinned slot {q} while a queued copy still reads it (no barrier)");
                         self.pinned[q as usize] = e;
+                        self.ops.nvme_to_pinned += 1;
                     }
                 }
                 self.reads += 1;
@@ -727,22 +900,27 @@ mod tests {
             Ok(jobs.len() as u64 * 100)
         }
         fn landing_to_stage(&mut self, i: u32) {
+            self.ops.landing_to_stage += 1;
             self.stage[i as usize] = self.landing[i as usize];
         }
         fn pinned_to_stage(&mut self, q: u32, s: u32) {
+            self.ops.pinned_to_stage += 1;
             self.pending_reads_pinned.push(q);
             self.stage[s as usize] = self.pinned[q as usize];
         }
         fn vram_to_stage(&mut self, v: u32, s: u32) {
+            self.ops.vram_to_stage += 1;
             self.stage[s as usize] = self.vram[v as usize];
         }
         fn barrier(&mut self) {
             self.pending_reads_pinned.clear();
         }
         fn vram_to_pinned(&mut self, v: u32, q: u32) {
+            self.ops.vram_to_pinned += 1;
             self.pinned[q as usize] = self.vram[v as usize];
         }
         fn stage_to_vram(&mut self, s: u32, v: u32) {
+            self.ops.stage_to_vram += 1;
             self.vram[v as usize] = self.stage[s as usize];
         }
     }
@@ -890,6 +1068,107 @@ mod tests {
         assert_eq!(&p[..3], &[154822, 154824, 154826]);
     }
 
+    /// #187: the host counters of `serve`, against what the twin saw and the cache's tiers, under
+    /// every policy and capacity of the trace test. Per call: visits = distinct ids = the cache's
+    /// `vram + pinned + nvme` accesses; every mover count = the twin's calls of that kind; NVMe
+    /// reads = `Served::nvme_reads`; the six transitions = the before/after tier diff counted
+    /// here; zero-copy = the ids served from their pinned slot. All-NVMe: visits = NVMe reads,
+    /// no promotion, no eviction.
+    #[test]
+    fn the_move_counters_equal_the_twins_calls_and_the_tier_diff() {
+        let (layers, experts, k) = (3, 64, 8);
+        let tr = trace(150, layers, experts as u64, k, 0x187);
+        let policies = [Policy::Lru, Policy::Clock { admit: None }, Policy::Clock { admit: Some(2) }, Policy::Lfu { decay: 0.7 }];
+        for p in policies {
+            for (v, pin) in [(0, 0), (0, 8), (8, 0), (1, 7), (2, 3), (3, 12), (16, 40), (24, 40)] {
+                let sizes = TierSizes { vram: v, pinned: pin };
+                let mut c = ExpertCache::new(p, Scope::PerLayer, layers, experts, v, pin).unwrap();
+                let mut slots: Vec<LayerSlots> = (0..layers).map(|_| LayerSlots::new(experts, sizes)).collect();
+                let mut sims: Vec<Sim> = (0..layers).map(|_| Sim::new(sizes, k)).collect();
+                let mut total = Moves::default();
+                for tok in &tr {
+                    for (l, ids) in tok.iter().enumerate() {
+                        let before: Vec<Tier> = (0..experts as u32).map(|e| c.tier(l, e)).collect();
+                        let c0 = c.counters()[l];
+                        let ops0 = sims[l].ops;
+                        let s = serve(&mut c, l, &mut slots[l], ids, k, &mut sims[l]).unwrap();
+                        let after: Vec<Tier> = (0..experts as u32).map(|e| c.tier(l, e)).collect();
+                        let m = s.moves;
+                        let what = format!("{p:?} V {v} P {pin} layer {l}");
+                        let acc: u64 = (0..3).map(|i| c.counters()[l][i] - c0[i]).sum();
+                        assert_eq!((m.visits, acc), (ids.len() as u64, ids.len() as u64), "{what}: visits");
+                        let ops = sims[l].ops.since(&ops0);
+                        assert_eq!(
+                            [m.nvme_to_landing, m.nvme_to_pinned, m.landing_to_stage, m.pinned_to_stage, m.vram_to_stage, m.vram_to_pinned, m.stage_to_vram],
+                            [ops.nvme_to_landing, ops.nvme_to_pinned, ops.landing_to_stage, ops.pinned_to_stage, ops.vram_to_stage, ops.vram_to_pinned, ops.stage_to_vram],
+                            "{what}: mover calls"
+                        );
+                        assert_eq!(m.nvme_reads(), s.nvme_reads as u64, "{what}: NVMe reads");
+                        let tr = |a: Tier, b: Tier| before.iter().zip(&after).filter(|(x, y)| **x == a && **y == b).count() as u64;
+                        assert_eq!(
+                            [m.n2v, m.p2v, m.n2p, m.v2p, m.v2n, m.p2n],
+                            [
+                                tr(Tier::Nvme, Tier::Vram),
+                                tr(Tier::Pinned, Tier::Vram),
+                                tr(Tier::Nvme, Tier::Pinned),
+                                tr(Tier::Vram, Tier::Pinned),
+                                tr(Tier::Vram, Tier::Nvme),
+                                tr(Tier::Pinned, Tier::Nvme)
+                            ],
+                            "{what}: transitions"
+                        );
+                        assert_eq!(m.zero_copy, s.locs.iter().filter(|x| matches!(x.1, Loc::Pinned(_))).count() as u64, "{what}: zero-copy");
+                        total.add(&m);
+                    }
+                }
+                assert_eq!(total.visits, (150 * layers * k) as u64);
+                if v + pin == 0 {
+                    assert_eq!((total.nvme_reads(), total.promotions(), total.evictions()), (total.visits, 0, 0), "{p:?}: all-NVMe");
+                }
+            }
+        }
+    }
+
+    /// #187 (`glm5_run --cold`): after `reset_cache` the same trace moves exactly as the first
+    /// pass did (call by call); without it the second pass starts warm and reads no more from
+    /// NVMe than the first (fewer at every capacity that holds anything).
+    #[test]
+    fn reset_cache_replays_the_cold_pass_and_warm_reads_less() {
+        let (layers, experts, k) = (3, 64, 8);
+        let tr = trace(120, layers, experts as u64, k, 0x188);
+        for (v, pin) in [(0, 0), (1, 7), (8, 0), (3, 12), (16, 40)] {
+            let sizes = TierSizes { vram: v, pinned: pin };
+            let mut c = ExpertCache::new(Policy::Lru, Scope::PerLayer, layers, experts, v, pin).unwrap();
+            let mut slots: Vec<LayerSlots> = (0..layers).map(|_| LayerSlots::new(experts, sizes)).collect();
+            let mut sims: Vec<Sim> = (0..layers).map(|_| Sim::new(sizes, k)).collect();
+            let mut pass = |c: &mut ExpertCache, slots: &mut Vec<LayerSlots>| -> Vec<Served> {
+                let mut out = Vec::new();
+                for tok in &tr {
+                    for (l, ids) in tok.iter().enumerate() {
+                        let nv = c.counters()[l][2];
+                        let cold = ids.iter().filter(|&&e| c.tier(l, e) == Tier::Nvme).count();
+                        let s = serve(c, l, &mut slots[l], ids, k, &mut sims[l]).unwrap();
+                        check(c, l, &slots[l], &sims[l], &s, ids, cold, nv);
+                        out.push(s);
+                    }
+                }
+                out
+            };
+            let first = pass(&mut c, &mut slots);
+            let warm = pass(&mut c, &mut slots);
+            reset_cache(&mut c, &mut slots, sizes).unwrap();
+            assert!((0..layers).all(|l| (0..experts as u32).all(|e| c.tier(l, e) == Tier::Nvme)), "V {v} P {pin}: reset leaves a cached expert");
+            assert!(c.counters().iter().all(|x| *x == [0, 0, 0]));
+            let cold = pass(&mut c, &mut slots);
+            let reads = |x: &[Served]| x.iter().map(|s| s.nvme_reads).sum::<usize>();
+            assert_eq!(cold.iter().map(|s| (s.locs.clone(), s.moves)).collect::<Vec<_>>(), first.iter().map(|s| (s.locs.clone(), s.moves)).collect::<Vec<_>>(), "V {v} P {pin}: cold pass");
+            assert!(reads(&warm) <= reads(&first), "V {v} P {pin}");
+            if v + pin > 0 {
+                assert!(reads(&warm) < reads(&first), "V {v} P {pin}: a warm pass reads less");
+            }
+        }
+    }
+
     /// more selected-and-uncached records than staging slots is refused by name, not overrun
     #[test]
     fn staging_overflow_is_refused_by_name() {
@@ -988,6 +1267,8 @@ mod tests {
                 for tok in &tr {
                     let sel: Vec<i32> = tok[0].iter().rev().map(|&e| e as i32).collect();
                     let (tb, served) = t.table_for(3, &sel).unwrap();
+                    assert_eq!(served.moves.visits as usize, tok[0].len(), "V {v} P {p}: visits");
+                    assert_eq!(served.moves.nvme_reads() as usize, served.nvme_reads, "V {v} P {p}: NVMe reads");
                     cuda::sync();
                     let table = cuda::dtoh_u64(tb, 16);
                     for e in 0..16u32 {
@@ -1001,6 +1282,19 @@ mod tests {
                 }
                 let tot: [u64; 3] = t.cache.counters().iter().fold([0; 3], |a, x| [a[0] + x[0], a[1] + x[1], a[2] + x[2]]);
                 eprintln!("glm5_tiers synthetic V {v} P {p}: accesses {tot:?}, NVMe reads {}", t.nvme_reads);
+                assert_eq!(t.moves[0].visits, tot.iter().sum::<u64>(), "V {v} P {p}: visits = accesses");
+                assert_eq!(t.moves[0].nvme_reads(), t.nvme_reads, "V {v} P {p}: NVMe reads");
+                // #187 --cold: after the reset the first call reads every selected record again
+                t.reset_cache().unwrap();
+                let sel: Vec<i32> = tr[0][0].iter().map(|&e| e as i32).collect();
+                let (tb, served) = t.table_for(3, &sel).unwrap();
+                cuda::sync();
+                assert_eq!(served.nvme_reads, tr[0][0].len(), "V {v} P {p}: a reset cache reads the first selection from NVMe");
+                let table = cuda::dtoh_u64(tb, 16);
+                for &e in &tr[0][0] {
+                    let got: Vec<u8> = cuda::dtoh_t(table[e as usize], rb);
+                    assert!(got == want[e as usize], "V {v} P {p}: after reset_cache expert {e} differs from read_range");
+                }
                 t.free();
             }
         }
@@ -1048,6 +1342,50 @@ mod tests {
                     assert_eq!(diff, 0, "generated position {i}: {diff} logits differ in bits, V {} P {} vs V {} P {}", s.vram, s.pinned, s0.vram, s0.pinned);
                 }
             }
+        }
+    }
+
+    /// #187 (`glm5_run --reps`, `--cold`): repetitions on one loaded model are invisible in the
+    /// output. The real 3-bit container, the fixed prompt, 6 greedy ids at the #159 plan's tiers:
+    /// rep 1 (cold), rep 2 (warm), `reset_cache`, rep 3 (cold). Ids and logits bit-identical
+    /// across the three; rep 3 moves row by row exactly as rep 1 (the same per-layer `Moves`).
+    #[test]
+    #[ignore = "needs the GPU and the real 3-bit container (as glm5_tiers_gpu_cache_size_is_invisible_in_the_logits): cargo test --release --lib glm5_tiers_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_tiers_gpu_reps_and_reset_are_invisible_in_the_logits() {
+        let path = std::env::var("CROW_CNQ").unwrap_or_else(|_| crate::geo::from_engine_dir(gm::GLM5_MUL1K3_CNQ));
+        let mut o = open_container(&path).unwrap();
+        let prompt = fixed_prompt();
+        let n = 6;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let free = cuda::free_vram_bytes();
+            let budget = crate::manager::derive_host_pinned_budget(crate::geo::HOST_PINNED_CAP, &mut |s| eprintln!("{s}"));
+            let (_, _, plan) = crate::manager::plan_glm5_next(&o.g, o.g.context_floor, free, budget, crate::geo::GLM5_NEXT_DENSE_BYTES, o.spec.bytes, crate::gen::pf_tg(), crate::gen::pf_async_on()).unwrap();
+            let mut run = Glm5Run::load(&mut o.cnq, &o.g, &o.moe, prompt.len() + n, &mut |s| eprintln!("{s}"));
+            let sizes = tier_sizes(&plan, None, None).unwrap();
+            let mut tiers = ExpertTiers::new(&o.cnq, &o.path, &o.g, &o.moe, sizes, 1, o.g.topk).unwrap();
+            let mut reps = Vec::new();
+            for rep in 0..3 {
+                if rep == 2 {
+                    tiers.reset_cache().unwrap();
+                }
+                let mut rows: Vec<Vec<Moves>> = Vec::new();
+                let gen = run.generate(&mut o.cnq, &mut tiers, &prompt, n, true, &mut |r| rows.push(r.moves.clone())).unwrap();
+                let reads: u64 = rows.iter().flatten().map(|m| m.nvme_reads()).sum();
+                eprintln!("glm5_tiers rep {}: ids {:?}, NVMe reads {reads}", rep + 1, gen.ids);
+                reps.push((gen, rows));
+            }
+            tiers.free();
+            run.free();
+            let (g0, r0) = &reps[0];
+            for (i, (gx, _)) in reps.iter().enumerate().skip(1) {
+                assert_eq!(gx.ids, g0.ids, "rep {} ids differ from rep 1", i + 1);
+                for (j, (a, b)) in gx.logits.iter().zip(&g0.logits).enumerate() {
+                    let diff = a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+                    assert_eq!(diff, 0, "rep {} generated position {j}: {diff} logits differ in bits", i + 1);
+                }
+            }
+            assert_eq!(&reps[2].1, r0, "rep 3 after reset_cache moves differently from rep 1");
         }
     }
 }
