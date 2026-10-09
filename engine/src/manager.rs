@@ -863,6 +863,10 @@ pub fn plan_three_tiers(i: &TierInput) -> Result<TierPlan, String> {
     Ok(TierPlan { vram_ceiling, fixed_bytes, unit_bytes, hot, pinned, nvme: i.experts - hot - pinned })
 }
 
+/// the records of the pinned NVMe landing ring of glm5_next prompt calls: prefill NVMe reads land
+/// there and the copy engine moves them into the staging slots (two `MAX_IN_FLIGHT` batches)
+pub const GLM5_PREFILL_RING: usize = 2 * crate::nvme_source::MAX_IN_FLIGHT;
+
 /// #186: the dense FFN plan sizes of a glm5_next prompt phase at `chunk` rows per call besides
 /// the one-row decode call: every power of two above 1 and below `chunk`, then `chunk`. A call's
 /// dense FFN runs in power-of-two row pieces (`glm5_model::dense_rows`); its MoE runs on one
@@ -928,10 +932,10 @@ pub fn plan_glm5_next(
 
 /// #186: [`plan_glm5_next`] for a prompt phase in calls of up to `chunk` rows (`CROW_CHUNK`,
 /// `glm5_tiers::prompt_chunk_from_env`). Above chunk 1 the plan also books the prompt phase's
-/// device bytes ([`glm5_chunk_scratch_bytes`], in VRAM before any expert) and takes the pageable
-/// landing of the prefill staging set (one record per prefill slot, allocated next to the
-/// pinned arenas) off the pinned budget. Chunk 1 is `plan_glm5_next` byte for byte. A chunk
-/// whose bytes do not fit is refused by name (`plan_three_tiers`).
+/// device bytes ([`glm5_chunk_scratch_bytes`], in VRAM before any expert) and takes the pinned
+/// NVMe landing ring of prompt calls ([`GLM5_PREFILL_RING`] records, the async H2D source of
+/// `glm5_tiers::PrefillMover`) off the pinned budget. Chunk 1 is `plan_glm5_next` byte for byte.
+/// A chunk whose bytes do not fit is refused by name (`plan_three_tiers`).
 #[allow(clippy::too_many_arguments)]
 pub fn plan_glm5_next_chunk(
     g: &Glm5Geo,
@@ -951,7 +955,7 @@ pub fn plan_glm5_next_chunk(
     let stability = Stability::of(Family::Glm5Next);
     let states = Glm5States::plan(g, context);
     let slots = stability.stage_slots(g.topk, pf_tg, pf_async);
-    let landing = if chunk > 1 { slots.prefill as u64 * expert_block_bytes } else { 0 };
+    let landing = if chunk > 1 { GLM5_PREFILL_RING as u64 * expert_block_bytes } else { 0 };
     let input = TierInput {
         vram_total,
         stability,
@@ -2236,13 +2240,13 @@ mod tests_186_chunk_plan {
         let mut last = 0;
         // the prompt phase books one expert-major MoE plan of `chunk` rows (about 0.3 MB per row),
         // so chunk 8192 (glm53-flash-offload's chunk_size) plans on the card
-        for chunk in [2, 16, 32, 128, 4096, 8192] {
+        for chunk in [2, 16, 32, 128, 1024, 2048, 4096, 8192] {
             let (_, i, p) = plan(chunk).unwrap();
             let b = glm5_chunk_scratch_bytes(&g, chunk, 200_000);
             assert!(b > last, "chunk {chunk}: {b} B, not above {last}");
             last = b;
             assert_eq!((i.chunk, i.chunk_scratch_bytes), (chunk, b));
-            assert_eq!(i.host_pinned_budget, HOST_PINNED_CAP - 128 * MUL1_PLAN, "the 128-record prefill landing comes off the pinned budget");
+            assert_eq!(i.host_pinned_budget, HOST_PINNED_CAP - GLM5_PREFILL_RING as u64 * MUL1_PLAN, "the pinned prefill landing ring comes off the pinned budget");
             assert_eq!(p.fixed_bytes, p0.fixed_bytes + b, "the chunk's bytes are booked before any expert");
             assert!(p.hot <= p0.hot && p.hot + p.pinned + p.nvme == g.experts);
             let t = glm5_plan_table(&g, &s0, &i, &p, &[]);

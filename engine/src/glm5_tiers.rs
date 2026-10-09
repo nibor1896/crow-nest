@@ -222,6 +222,11 @@ pub trait Mover {
     fn barrier(&mut self);
     fn vram_to_pinned(&mut self, v: u32, q: u32);
     fn stage_to_vram(&mut self, s: u32, v: u32);
+    /// [`serve_chunk_prefill`]: sub-batch `j` of a prompt call starts its moves (default: nothing)
+    fn begin_batch(&mut self, _j: usize) {}
+    /// [`serve_chunk_prefill`]: the moves of the current sub-batch are all issued; the kernels
+    /// queued after this read them (default: nothing, the moves are on the compute stream)
+    fn end_batch(&mut self) {}
 }
 
 /// The slot of every expert of one MoE layer in its tier, and the free slots.
@@ -585,12 +590,14 @@ pub fn serve_prefill(cache: &mut ExpertCache, l: usize, slots: &LayerSlots, ids:
             _ => from_nvme.push((e, Dst::Landing(s as u32))),
         }
     }
+    // each read batch goes on to staging before the next lands (a landing ring may be smaller
+    // than the sub-batch)
     for c in from_nvme.chunks(MAX_IN_FLIGHT) {
         out.nvme_bytes += m.nvme(c)?;
-    }
-    for &(_, d) in &from_nvme {
-        if let Dst::Landing(i) = d {
-            m.landing_to_stage(i);
+        for &(_, d) in c {
+            if let Dst::Landing(i) = d {
+                m.landing_to_stage(i);
+            }
         }
     }
     out.nvme_reads = from_nvme.len();
@@ -669,7 +676,9 @@ pub fn serve_chunk_prefill(
             fitting_rows_by(c, l, &sel[r0 * k..], k, cap, &|ids| ids.iter().filter(|&&e| c.tier(l, e) != Tier::Vram).count())?
         };
         let ids = distinct_ids(&sel[r0 * k..(r0 + rows) * k], cache.experts)?;
+        m.begin_batch(batches);
         let served = serve_prefill(cache, l, slots, &ids, cap, m)?;
+        m.end_batch();
         each(r0, rows, &served)?;
         batches += 1;
         r0 += rows;
@@ -778,7 +787,8 @@ pub struct ExpertTiers {
     /// #186: the prefill staging set of prompt calls (0 slots until [`ExpertTiers::alloc_prefill_stage`])
     pf_cap: usize,
     pf_stage: Dev,
-    pf_landing: Landing,
+    /// the prompt calls' pinned landing ring and copy stream ([`PrefillMover`])
+    pf_ring: Option<PfRing>,
     /// #188: `CROW_GLM_PINNED` / `CROW_GLM_CPU_LANE` as read at construction
     pub pinned_use: PinnedUse,
     /// the pinned arenas are write-combined (`CROW_PINNED_ALLOC`)
@@ -845,6 +855,127 @@ impl Mover for GpuMover<'_> {
     }
 }
 
+/// The copy machinery of prompt calls (template: glm53-flash-offload's prefill NVMe reads land in
+/// pinned RAM and the copy engine moves them): a [`crate::manager::GLM5_PREFILL_RING`]-record
+/// pinned NVMe landing ring, a non-blocking copy stream, one event per ring record (its last
+/// H2D), per staging half the event "the kernels of its last sub-batch are done", and the event
+/// "the current sub-batch's copies are done". Allocated with the prefill staging set.
+struct PfRing {
+    ring: Pinned,
+    ring_ev: Vec<sys::CUevent>,
+    cs: sys::CUstream,
+    free_ev: [sys::CUevent; 2],
+    ready_ev: sys::CUevent,
+    cursor: usize,
+}
+
+impl PfRing {
+    unsafe fn new(rb: u64) -> PfRing {
+        let n = crate::manager::GLM5_PREFILL_RING;
+        PfRing {
+            ring: Pinned::alloc(n * rb as usize),
+            ring_ev: (0..n).map(|_| cuda::event_create()).collect(),
+            cs: cuda::stream_create_non_blocking(),
+            free_ev: [cuda::event_create(), cuda::event_create()],
+            ready_ev: cuda::event_create(),
+            cursor: 0,
+        }
+    }
+
+    unsafe fn free(&mut self) {
+        cuda::stream_sync(self.cs);
+        for &e in self.ring_ev.iter().chain(self.free_ev.iter()).chain([&self.ready_ev]) {
+            cuda::event_destroy(e);
+        }
+        cuda::stream_destroy(self.cs);
+        self.ring.free();
+    }
+}
+
+/// The [`Mover`] of prompt calls ([`serve_prefill`] issues only `nvme`, `landing_to_stage` and
+/// `pinned_to_stage`): every H2D is a `cuMemcpyHtoDAsync` from pinned memory on the copy stream,
+/// so the copies of sub-batch `j` run while the compute stream runs sub-batch `j - 1`. Sub-batch
+/// `j` uses staging half `j % halves`; its copies wait until the kernels of the last sub-batch on
+/// that half are done, and the compute stream waits for its copies. An NVMe read lands in the
+/// next ring record once that record's previous H2D finished (the host waits on its event).
+struct PrefillMover<'a> {
+    pinned: Option<&'a Pinned>,
+    stage: Dev,
+    half: usize,
+    halves: usize,
+    base: Dev,
+    rb: u64,
+    src: &'a NvmeSource,
+    recs: &'a [ExpertRecord],
+    pf: &'a mut PfRing,
+    /// staging slot of the current sub-batch -> the ring record its NVMe read landed in
+    landed: Vec<(u32, usize)>,
+}
+
+impl Mover for PrefillMover<'_> {
+    fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
+        let (rb, n) = (self.rb as usize, self.pf.ring_ev.len());
+        assert!(jobs.len() <= n, "prefill ring: {} reads, {n} ring records", jobs.len());
+        let mut v = Vec::with_capacity(jobs.len());
+        for &(e, d) in jobs {
+            let Dst::Landing(i) = d else { panic!("a prompt call reads no record into a pinned slot") };
+            let r = self.pf.cursor;
+            self.pf.cursor = (r + 1) % n;
+            // the record's previous H2D is done before the read overwrites it
+            unsafe { cuda::ck(sys::cuEventSynchronize(self.pf.ring_ev[r])) };
+            self.landed.retain(|&(s, _)| s != i);
+            self.landed.push((i, r));
+            let gu = unsafe { (self.pf.ring.host as *mut u8).add(r * rb) };
+            v.push((self.recs[e as usize], RecordDst { gu, dn: std::ptr::null_mut() }));
+        }
+        // SAFETY: the destinations are ring records no queued copy reads any more
+        let t = unsafe { self.src.fetch(&v) }?;
+        Ok(self.src.wait(t)?.bytes)
+    }
+    fn landing_to_stage(&mut self, i: u32) {
+        let r = self.landed.iter().find(|&&(s, _)| s == i).expect("a landing is staged after its read").1;
+        unsafe {
+            let src = (self.pf.ring.host as *const u8).add(r * self.rb as usize);
+            cuda::ck(sys::cuMemcpyHtoDAsync_v2(self.base + i as u64 * self.rb, src as *const _, self.rb as usize, self.pf.cs));
+            cuda::event_record(self.pf.ring_ev[r], self.pf.cs);
+        }
+    }
+    fn pinned_to_stage(&mut self, q: u32, s: u32) {
+        let p = self.pinned.expect("a pinned source without a pinned arena");
+        unsafe {
+            let src = (p.host as *const u8).add(q as usize * self.rb as usize);
+            cuda::ck(sys::cuMemcpyHtoDAsync_v2(self.base + s as u64 * self.rb, src as *const _, self.rb as usize, self.pf.cs));
+        }
+    }
+    fn vram_to_stage(&mut self, _: u32, _: u32) {
+        unreachable!("a prompt call stages no VRAM record")
+    }
+    fn barrier(&mut self) {
+        unreachable!("a prompt call has no barrier")
+    }
+    fn vram_to_pinned(&mut self, _: u32, _: u32) {
+        unreachable!("a prompt call admits nothing")
+    }
+    fn stage_to_vram(&mut self, _: u32, _: u32) {
+        unreachable!("a prompt call admits nothing")
+    }
+    fn begin_batch(&mut self, j: usize) {
+        let h = j % self.halves;
+        self.base = self.stage + (h * self.half) as u64 * self.rb;
+        self.landed.clear();
+        // the copies into this half wait for the kernels of its last sub-batch
+        unsafe { cuda::stream_wait_event(self.pf.cs, self.pf.free_ev[h]) };
+    }
+    fn end_batch(&mut self) {
+        unsafe {
+            cuda::event_record(self.pf.ready_ev, self.pf.cs);
+            // WDDM: submit the copy stream's batch now
+            cuda::stream_query(self.pf.cs);
+            cuda::stream_wait_event(cuda::cur_stream(), self.pf.ready_ev);
+        }
+    }
+}
+
 impl ExpertTiers {
     /// Allocate the tiers of every MoE layer of `g` (cache empty, G1d: no seed) and open the
     /// container `path` for unbuffered reads with `readers` threads (1 = PREREG amendment 5).
@@ -898,7 +1029,7 @@ impl ExpertTiers {
             sub_batches: 0,
             pf_cap: 0,
             pf_stage: 0,
-            pf_landing: Landing::new(0),
+            pf_ring: None,
             pinned_use: PinnedUse::default(),
             pinned_wc,
             topk: g.topk,
@@ -1003,7 +1134,7 @@ impl ExpertTiers {
             return Err(format!("expert tiers: a prefill staging set of {slots} slots holds less than one row's top-{}", self.topk));
         }
         self.pf_stage = cuda::alloc_named("glm5 expert prefill staging slots", slots * self.rb as usize);
-        self.pf_landing = Landing::new(slots * self.rb as usize);
+        self.pf_ring = Some(PfRing::new(self.rb));
         self.pf_cap = slots;
         Ok(())
     }
@@ -1017,7 +1148,9 @@ impl ExpertTiers {
     /// [`serve_chunk_prefill`] through the prefill staging set (allocated here on first use; no
     /// admission, the cache's tiers stay as decode left them), the device table rewritten per row
     /// sub-batch; `run(row0, rows, table)` queues that sub-batch's experts. One routing sync for
-    /// the call; no stream sync between sub-batches beyond the ordered uploads.
+    /// the call. The staging copies go through [`PrefillMover`] (pinned landing ring, copy
+    /// stream, two staging halves), so a sub-batch's NVMe reads and H2D run while the previous
+    /// one computes.
     ///
     /// # Safety
     /// A CUDA context is current; no launch reading this layer's slots, its table or the prefill
@@ -1034,24 +1167,36 @@ impl ExpertTiers {
         crate::glm5_moe::lane::post(None);
         let (rb, k, experts) = (self.rb, self.topk, self.cache.experts);
         let (vram, pin_dev, stage, table_dev) = (self.vram[l], self.pinned.get(l).map_or(0, |p| p.dev), self.pf_stage, self.tables[l]);
-        let mut m = GpuMover { vram, pinned: self.pinned.get(l), stage, landing: self.pf_landing.p, rb, src: &self.src, recs: &self.records[l] };
-        let (mut reads, mut bytes, mut moves) = (0u64, 0u64, Moves::default());
+        // two staging halves when each holds a row's top-k: sub-batch j fills half j % 2
+        // while the kernels of sub-batch j - 1 read the other
+        let halves = if self.pf_cap >= 2 * k { 2 } else { 1 };
+        let half = self.pf_cap / halves;
+        let pf = self.pf_ring.as_mut().expect("the prefill ring is allocated with the staging set");
+        let free_ev = pf.free_ev;
+        let mut m = PrefillMover { pinned: self.pinned.get(l), stage, half, halves, base: stage, rb, src: &self.src, recs: &self.records[l], pf, landed: Vec::new() };
+        let (mut reads, mut bytes, mut moves, mut j) = (0u64, 0u64, Moves::default(), 0usize);
         let mut each = |r0: usize, rows: usize, served: &Served| -> Result<(), String> {
+            let h = j % halves;
+            let base = stage + (h * half) as u64 * rb;
             let mut table = vec![0u64; experts];
             for &(e, loc) in &served.locs {
                 table[e as usize] = match loc {
                     Loc::Vram(v) => vram + v as u64 * rb,
                     Loc::Pinned(q) => pin_dev + q as u64 * rb,
-                    Loc::Stage(s) => stage + s as u64 * rb,
+                    Loc::Stage(s) => base + s as u64 * rb,
                 };
             }
             cuda::to_u64_into(table_dev, &table);
             reads += served.nvme_reads as u64;
             bytes += served.nvme_bytes;
             moves.add(&served.moves);
-            run(r0, rows, table_dev)
+            let r = run(r0, rows, table_dev);
+            // the half is free again once these kernels are done
+            cuda::event_record(free_ev[h], cuda::cur_stream());
+            j += 1;
+            r
         };
-        let r = serve_chunk_prefill(&mut self.cache, l, &self.slots[l], sel, k, self.pf_cap, &mut m, &mut each);
+        let r = serve_chunk_prefill(&mut self.cache, l, &self.slots[l], sel, k, half, &mut m, &mut each);
         self.nvme_reads += reads;
         self.nvme_bytes += bytes;
         self.moves[l].add(&moves);
@@ -1093,6 +1238,9 @@ impl ExpertTiers {
             p.free();
         }
         cuda::free_dev(&mut self.stage);
+        if let Some(mut r) = self.pf_ring.take() {
+            r.free();
+        }
         cuda::free_dev(&mut self.pf_stage);
         self.pf_cap = 0;
     }
@@ -3231,6 +3379,8 @@ mod tests_186 {
                 ("V 3 + P 4", TierSizes { vram: 3, pinned: 4 }, None),
                 ("V 0 + P 0, 8 prefill slots", TierSizes { vram: 0, pinned: 0 }, Some(8)),
                 ("V 16 + P 0", TierSizes { vram: 16, pinned: 0 }, None),
+                // two staging halves of 8 slots: the sub-batches alternate halves on the copy stream
+                ("V 0 + P 0, 16 prefill slots", TierSizes { vram: 0, pinned: 0 }, Some(16)),
             ];
             let mut chunked = Vec::new();
             for (name, sizes, pf) in arms {
@@ -3309,6 +3459,7 @@ mod tests_186 {
             let sub = |reps: &[TokenReport]| reps.iter().filter(|r| r.prompt).map(|r| r.sub_batches).sum::<u64>();
             assert_eq!(sub(rb), want.len() as u64, "V 3 + P 4 with 128 prefill slots: no call splits");
             assert!(sub(&chunked[1].2) > want.len() as u64, "8 prefill slots must split the calls into row sub-batches");
+            assert!(sub(&chunked[3].2) > want.len() as u64, "two halves of 8 slots must split the calls into sub-batches");
             // the chain computes the same bits
             let d = bits_differ(&b.logits, &chain);
             assert!(d.iter().all(|&v| v == 0), "chunked tiered run vs layer-at-a-time chain: logits differ in bits per generated position {d:?}");
