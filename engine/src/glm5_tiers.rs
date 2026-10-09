@@ -744,6 +744,2517 @@ pub fn prefill_stage_slots(topk: usize) -> usize {
     crate::geo::Stability::of(crate::geo::Family::Glm5Next).stage_slots(topk, crate::gen::pf_tg(), crate::gen::pf_async_on()).prefill
 }
 
+// ---------------------------------------------------------------- the global arena (CROW_GLM_ARENA=global)
+
+/// `layer` (default) | `global`
+pub const ARENA_ENV: &str = "CROW_GLM_ARENA";
+
+/// How the VRAM and pinned slots of the plan are shared by the MoE layers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ArenaKind {
+    /// `vram` + `pinned` slots per MoE layer under the #175 cache (the path of record)
+    #[default]
+    Layer,
+    /// [`GlobalArena`]: the same slots in one VRAM pool (CLOCK) and one pinned pool (LRU), shared
+    /// by every MoE layer, no quota per layer
+    Global,
+}
+
+/// Parse `CROW_GLM_ARENA`: unset, empty or `layer` = [`ArenaKind::Layer`]; `global` =
+/// [`ArenaKind::Global`]; anything else refused by name.
+pub fn arena_kind(v: Option<&str>) -> Result<ArenaKind, String> {
+    match v.map(str::trim) {
+        None | Some("") | Some("layer") => Ok(ArenaKind::Layer),
+        Some("global") => Ok(ArenaKind::Global),
+        Some(x) => Err(format!("{ARENA_ENV}={x:?}: accepted layer (default), global")),
+    }
+}
+
+/// whether a call admits its misses into the global arena's VRAM: a call of at most `admit_max`
+/// routed picks (rows x top-k, sybil's `GLM53_EC_ADMIT_MAX`, [`ArenaConfig::admit_max`]), never a
+/// prompt call (prefill reads its misses where they lie, the decode working set survives)
+pub fn arena_admits(picks: usize, prompt: bool, admit_max: usize) -> bool {
+    !prompt && picks <= admit_max
+}
+
+/// sybil's `GLM53_EC_ADMIT_MAX` (default 64): admission only for calls of at most this many picks
+pub const ARENA_ADMIT_MAX_ENV: &str = "CROW_GLM_ARENA_ADMIT_MAX";
+/// sybil's `GLM53_NV_NOADMIT`: `1` = NVMe picks are never admitted into VRAM; `0` (default)
+pub const ARENA_NOADMIT_ENV: &str = "CROW_GLM_ARENA_NOADMIT";
+/// sybil's `GLM53_EC_WARM`: a JSON file of routing scores per MoE layer; the arena starts filled
+pub const ARENA_WARM_ENV: &str = "CROW_GLM_ARENA_WARM";
+/// sybil's `GLM53_NV_VRING`: VRAM victims written back through a ring of N VRAM slots and a copy
+/// stream (default 24; 0 = the D2H on the call's stream)
+pub const ARENA_VRING_ENV: &str = "CROW_GLM_ARENA_VRING";
+/// sybil's `GLM53_EC_ELASTIC_GB`: an elastic VRAM part of the arena beyond the plan, from free VRAM
+pub const ARENA_ELASTIC_ENV: &str = "CROW_GLM_ARENA_ELASTIC_GB";
+/// sybil's `GLM53_EC_STAGE_GB`: two staging buffers of this size for large prompt calls
+pub const ARENA_STAGE_ENV: &str = "CROW_GLM_ARENA_STAGE_GB";
+/// sybil's `GLM53_EC_STAGE_MIN`: a prompt call of at least this many picks runs staged (default 512)
+pub const ARENA_STAGE_MIN_ENV: &str = "CROW_GLM_ARENA_STAGE_MIN";
+/// the free VRAM the elastic part leaves (sybil's `GLM53_EC_RESERVE_GB` default 2.5)
+pub const ARENA_RESERVE_BYTES: u64 = 5 << 29;
+const GIB: f64 = (1u64 << 30) as f64;
+
+/// The switches of the global arena (all read with [`arena_config`]; only under `CROW_GLM_ARENA=global`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArenaConfig {
+    pub admit_max: usize,
+    pub noadmit: bool,
+    pub warm: Option<String>,
+    pub vring: usize,
+    pub elastic_bytes: u64,
+    pub stage_bytes: u64,
+    pub stage_min: usize,
+}
+
+impl Default for ArenaConfig {
+    fn default() -> ArenaConfig {
+        ArenaConfig { admit_max: expert_cache::ADMIT_MAX, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512 }
+    }
+}
+
+/// Parse the arena switches from `get` (the environment): unset or empty = the default of
+/// [`ArenaConfig::default`]; a malformed value is refused by name.
+pub fn arena_config(get: &dyn Fn(&str) -> Option<String>) -> Result<ArenaConfig, String> {
+    let mut c = ArenaConfig::default();
+    let val = |k: &str| get(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let int = |k: &str, lo: usize, hi: usize| -> Result<Option<usize>, String> {
+        match val(k) {
+            None => Ok(None),
+            Some(v) => match v.parse::<usize>() {
+                Ok(n) if (lo..=hi).contains(&n) => Ok(Some(n)),
+                _ => Err(format!("{k}={v:?}: a whole number in {lo}..={hi}")),
+            },
+        }
+    };
+    let gb = |k: &str| -> Result<Option<u64>, String> {
+        match val(k) {
+            None => Ok(None),
+            Some(v) => match v.parse::<f64>() {
+                Ok(x) if x.is_finite() && (0.0..=1024.0).contains(&x) => Ok(Some((x * GIB) as u64)),
+                _ => Err(format!("{k}={v:?}: GiB in 0..=1024")),
+            },
+        }
+    };
+    if let Some(n) = int(ARENA_ADMIT_MAX_ENV, 0, 1024)? {
+        c.admit_max = n;
+    }
+    c.noadmit = match val(ARENA_NOADMIT_ENV).as_deref() {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(v) => return Err(format!("{ARENA_NOADMIT_ENV}={v:?}: accepted 0 (default), 1")),
+    };
+    c.warm = val(ARENA_WARM_ENV);
+    if let Some(n) = int(ARENA_VRING_ENV, 0, 256)? {
+        c.vring = n;
+    }
+    if let Some(b) = gb(ARENA_ELASTIC_ENV)? {
+        c.elastic_bytes = b;
+    }
+    if let Some(b) = gb(ARENA_STAGE_ENV)? {
+        c.stage_bytes = b;
+    }
+    if let Some(n) = int(ARENA_STAGE_MIN_ENV, 1, 1 << 20)? {
+        c.stage_min = n;
+    }
+    Ok(c)
+}
+
+/// The routing scores of a warm-start file (sybil's `GLM53_EC_WARM`, `data/stats_own_dec.json`
+/// format): a JSON object whose keys end in the decoder layer index (`"3"`, or
+/// `"model.language_model.layers.3.mlp"`), each an array of `experts` scores (keys starting with
+/// `_` are notes), or a JSON array of one such array per MoE layer. Returns the scores per MoE layer (empty = not warmed).
+pub fn parse_warm(text: &str, layers: usize, first_moe: usize, experts: usize) -> Result<Vec<Vec<f64>>, String> {
+    let v: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("{ARENA_WARM_ENV}: not JSON: {e}"))?;
+    let row = |x: &serde_json::Value, what: &str| -> Result<Vec<f64>, String> {
+        let a = x.as_array().ok_or_else(|| format!("{ARENA_WARM_ENV}: {what} is no array"))?;
+        if a.len() != experts {
+            return Err(format!("{ARENA_WARM_ENV}: {what} holds {} scores, {experts} experts", a.len()));
+        }
+        a.iter().map(|s| s.as_f64().ok_or_else(|| format!("{ARENA_WARM_ENV}: {what} holds a non-number"))).collect()
+    };
+    let mut out = vec![Vec::new(); layers];
+    match &v {
+        serde_json::Value::Array(a) => {
+            if a.len() != layers {
+                return Err(format!("{ARENA_WARM_ENV}: {} layers, {layers} MoE layers", a.len()));
+            }
+            for (l, x) in a.iter().enumerate() {
+                out[l] = row(x, &format!("MoE layer {l}"))?;
+            }
+        }
+        serde_json::Value::Object(m) => {
+            for (k, x) in m.iter().filter(|(k, _)| !k.starts_with('_')) {
+                let digits: String = k.split(|c: char| !c.is_ascii_digit()).filter(|d| !d.is_empty()).last().unwrap_or("").to_string();
+                let dl: usize = digits.parse().map_err(|_| format!("{ARENA_WARM_ENV}: key {k:?} names no layer"))?;
+                let l = dl.checked_sub(first_moe).filter(|&l| l < layers).ok_or_else(|| format!("{ARENA_WARM_ENV}: key {k:?} is no MoE layer"))?;
+                out[l] = row(x, k)?;
+            }
+        }
+        _ => return Err(format!("{ARENA_WARM_ENV}: a JSON object or array")),
+    }
+    Ok(out)
+}
+
+fn arena_lane_refusal() -> String {
+    format!("{ARENA_ENV}=global and {CPU_LANE_ENV}=1: the CPU lane addresses the pinned slots of one layer; turn one of them off")
+}
+
+/// Where one record of the global arena lies. The slots are global: VRAM slot `v` is slot
+/// `v % vram` of the VRAM allocation of MoE layer `v / vram` (`vram` = the plan's slots per
+/// layer), pinned slot `q` likewise; the allocations are the per-layer path's, unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    Vram(u32),
+    Ram(u32),
+    Nvme,
+}
+
+impl Place {
+    fn tier(self) -> Tier {
+        match self {
+            Place::Vram(_) => Tier::Vram,
+            Place::Ram(_) => Tier::Pinned,
+            Place::Nvme => Tier::Nvme,
+        }
+    }
+}
+
+/// host counts of the global arena since construction (or [`GlobalArena::reset`])
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ArenaStats {
+    /// misses admitted into VRAM
+    pub admitted: u64,
+    /// VRAM victims written back into the pinned tier
+    pub write_backs: u64,
+    /// VRAM victims dropped to the NVMe (no pinned slot free of the call's own experts)
+    pub wb_dropped: u64,
+    /// pinned LRU victims dropped to the NVMe
+    pub ram_evictions: u64,
+    /// calls whose admissions stopped because every VRAM slot was pinned by the call
+    pub no_victim: u64,
+}
+
+/// sybil-solutions/glm53-flash-offload 6769b27 (`glm53/expert_cache.py` `ec_step_k`,
+/// `kernels/nv2/nv2_host.cpp` RAM LRU), on the host, over every MoE layer of the store:
+///
+/// - **VRAM**: ONE ring of `layers x vram` slots shared by all MoE layers, CLOCK: a hit sets the
+///   slot's reference bit and pins it for the call (epoch); an admitted miss takes the slot the
+///   hand stops at (a clear bit, never a slot pinned in this call; at most 2 x slots steps, else
+///   the call's remaining misses are not admitted) and enters with its bit set.
+/// - **Admission**: only for calls of at most 64 picks ([`arena_admits`]); a prompt call never
+///   admits.
+/// - **Pinned (RAM)**: ONE LRU of `layers x pinned` slots, exclusive with VRAM: an admission frees
+///   the expert's pinned copy, a VRAM victim is written back into it as the most recent; a miss
+///   that is not admitted lands there from the NVMe (or is staged when no slot is free of the
+///   call's own experts). The LRU victim is the oldest expert not routed in the call.
+/// - **NVMe**: everything else.
+///
+/// [`GlobalArena::step`] decides one call and returns the net change of every expert it moved;
+/// [`serve_global`] executes it through the [`Mover`] of the per-layer path.
+#[derive(Clone, Debug)]
+pub struct GlobalArena {
+    pub layers: usize,
+    pub experts: usize,
+    /// key = MoE layer x experts + expert
+    place: Vec<Place>,
+    vowner: Vec<u32>,
+    refb: Vec<bool>,
+    /// the epoch (call) that pinned the slot
+    vpin: Vec<u64>,
+    hand: usize,
+    epoch: u64,
+    rowner: Vec<u32>,
+    /// the pinned LRU: a doubly linked list over the pinned slots, `oldest` .. `newest`
+    prev: Vec<u32>,
+    next: Vec<u32>,
+    oldest: u32,
+    newest: u32,
+    rfree: Vec<u32>,
+    /// the epoch in which a key was routed (never a pinned LRU victim in that call)
+    prot: Vec<u64>,
+    /// the epoch in which a key's place before the call was recorded
+    seen: Vec<u64>,
+    touched: Vec<(u32, Place)>,
+    pin_stay: bool,
+    /// sybil's `NV_NOADMIT`: an NVMe pick is never admitted into VRAM (it lands in pinned)
+    noadmit: bool,
+    /// bumped by every call that may move an expert (staged prefetches are valid for one generation)
+    gen: u64,
+    counters: Vec<[u64; 3]>,
+    pub stats: ArenaStats,
+}
+
+/// `vpin` of a disabled VRAM slot (the write-back ring, an elastic chunk handed back): never a victim
+const DISABLED: u64 = u64::MAX;
+
+impl GlobalArena {
+    /// An empty arena: every expert on the NVMe, `vram` VRAM slots and `ram` pinned slots in all.
+    pub fn new(layers: usize, experts: usize, vram: usize, ram: usize) -> Result<GlobalArena, String> {
+        let keys = layers * experts;
+        if keys == 0 || keys >= NONE as usize || vram >= NONE as usize || ram >= NONE as usize {
+            return Err(format!("global arena: {layers} layers x {experts} experts, {vram} VRAM / {ram} pinned slots is no arena"));
+        }
+        Ok(GlobalArena {
+            layers,
+            experts,
+            place: vec![Place::Nvme; keys],
+            vowner: vec![NONE; vram],
+            refb: vec![false; vram],
+            vpin: vec![0; vram],
+            hand: 0,
+            epoch: 0,
+            rowner: vec![NONE; ram],
+            prev: vec![NONE; ram],
+            next: vec![NONE; ram],
+            oldest: NONE,
+            newest: NONE,
+            // popped from the back: slot 0 first
+            rfree: (0..ram as u32).rev().collect(),
+            prot: vec![0; keys],
+            seen: vec![0; keys],
+            touched: Vec::new(),
+            pin_stay: false,
+            noadmit: false,
+            gen: 0,
+            counters: vec![[0; 3]; layers],
+            stats: ArenaStats::default(),
+        })
+    }
+
+    /// empty again (as [`GlobalArena::new`]); the switches and the disabled slots are kept
+    pub fn reset(&mut self) {
+        let (stay, noadmit, gen) = (self.pin_stay, self.noadmit, self.gen);
+        let off: Vec<bool> = self.vpin.iter().map(|&p| p == DISABLED).collect();
+        *self = GlobalArena::new(self.layers, self.experts, self.vowner.len(), self.rowner.len()).expect("the same shape");
+        (self.pin_stay, self.noadmit, self.gen) = (stay, noadmit, gen + 1);
+        for (p, off) in self.vpin.iter_mut().zip(off) {
+            if off {
+                *p = DISABLED;
+            }
+        }
+    }
+
+    /// sybil's `NV_NOADMIT`: NVMe picks are never admitted into VRAM (they land in pinned and
+    /// are read zero-copy); pinned hits keep the admission rule
+    pub fn set_noadmit(&mut self, on: bool) {
+        self.noadmit = on;
+    }
+
+    /// the placement generation: changes whenever a call or a slot switch may have moved an expert
+    pub fn generation(&self) -> u64 {
+        self.gen
+    }
+
+    /// VRAM slots a victim may be taken from (not disabled)
+    pub fn enabled_vram(&self) -> usize {
+        self.vpin.iter().filter(|&&p| p != DISABLED).count()
+    }
+
+    /// `n` more VRAM slots (an elastic chunk), empty and enabled, after the existing ones
+    pub fn add_slots(&mut self, n: usize) {
+        let m = self.vowner.len() + n;
+        self.vowner.resize(m, NONE);
+        self.refb.resize(m, false);
+        self.vpin.resize(m, 0);
+        self.gen += 1;
+    }
+
+    /// Disable the VRAM slots `r` (never victims from now on): their experts go to pinned as the
+    /// most recent (a write-back) or, without a free-able pinned slot, to the NVMe. Returns the net
+    /// changes as [`GlobalArena::step`] does.
+    pub fn disable(&mut self, r: std::ops::Range<usize>) -> Vec<(u32, Place, Place)> {
+        self.epoch += 1;
+        self.gen += 1;
+        self.touched.clear();
+        for s in r {
+            self.vpin[s] = DISABLED;
+            self.refb[s] = false;
+            let v = std::mem::replace(&mut self.vowner[s], NONE);
+            if v != NONE {
+                let v = v as usize;
+                self.record(v);
+                self.place[v] = Place::Nvme;
+                if self.ram_insert(v).is_some() {
+                    self.stats.write_backs += 1;
+                } else {
+                    self.stats.wb_dropped += 1;
+                }
+            }
+        }
+        let mut ch: Vec<(u32, Place, Place)> = self.touched.iter().filter(|&&(k, b)| self.place[k as usize] != b).map(|&(k, b)| (k, b, self.place[k as usize])).collect();
+        ch.sort_unstable_by_key(|c| c.0);
+        ch
+    }
+
+    /// enable the (empty) VRAM slots `r` again
+    pub fn enable(&mut self, r: std::ops::Range<usize>) {
+        for s in r {
+            debug_assert_eq!(self.vowner[s], NONE, "an enabled slot comes back empty");
+            self.vpin[s] = 0;
+            self.refb[s] = false;
+        }
+        self.gen += 1;
+    }
+
+    /// A staged call (sybil's `_ec_hits`): the routed experts of layer `l` are counted and the VRAM
+    /// hits get their reference bit; nothing is admitted, nothing moves. Returns each id's place.
+    pub fn mark(&mut self, l: usize, ids: &[u32]) -> Vec<Place> {
+        ids.iter()
+            .map(|&e| {
+                let p = self.place(l, e);
+                match p {
+                    Place::Vram(s) => {
+                        self.refb[s as usize] = true;
+                        self.counters[l][0] += 1;
+                    }
+                    Place::Ram(_) => self.counters[l][1] += 1,
+                    Place::Nvme => self.counters[l][2] += 1,
+                }
+                p
+            })
+            .collect()
+    }
+
+    /// sybil's `warm`: per MoE layer the top `enabled VRAM / layers` experts by score for VRAM,
+    /// the next `pinned / layers` for pinned (descending score, ties the lower id; a layer
+    /// without scores is not warmed). Returns `(vram ids, pinned ids)` per layer, ascending.
+    pub fn warm_plan(&self, scores: &[Vec<f64>]) -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
+        let (k, r) = (self.enabled_vram() / self.layers, self.rowner.len() / self.layers);
+        let mut vr = Vec::with_capacity(self.layers);
+        let mut pr = Vec::with_capacity(self.layers);
+        for l in 0..self.layers {
+            let sc = scores.get(l).filter(|s| s.len() == self.experts);
+            let Some(sc) = sc else {
+                vr.push(Vec::new());
+                pr.push(Vec::new());
+                continue;
+            };
+            let mut ord: Vec<u32> = (0..self.experts as u32).collect();
+            ord.sort_by(|&a, &b| sc[b as usize].partial_cmp(&sc[a as usize]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+            let k = k.min(ord.len());
+            let r = r.min(ord.len() - k);
+            let mut v = ord[..k].to_vec();
+            let mut p = ord[k..k + r].to_vec();
+            v.sort_unstable();
+            p.sort_unstable();
+            vr.push(v);
+            pr.push(p);
+        }
+        (vr, pr)
+    }
+
+    /// counters and stats to 0 (after a warm start)
+    pub fn clear_counters(&mut self) {
+        for c in &mut self.counters {
+            *c = [0; 3];
+        }
+        self.stats = ArenaStats::default();
+    }
+
+    /// #188 `CROW_GLM_PINNED=zerocopy`: a pinned hit stays in pinned (its LRU place is
+    /// refreshed) instead of being admitted into VRAM; NVMe misses keep the admission rule
+    pub fn set_pin_stay(&mut self, on: bool) {
+        self.pin_stay = on;
+    }
+
+    pub fn vram_slots(&self) -> usize {
+        self.vowner.len()
+    }
+
+    pub fn ram_slots(&self) -> usize {
+        self.rowner.len()
+    }
+
+    pub fn place(&self, l: usize, e: u32) -> Place {
+        assert!(l < self.layers && (e as usize) < self.experts, "global arena: layer {l} expert {e} outside the shape");
+        self.place[l * self.experts + e as usize]
+    }
+
+    /// `[vram, pinned, nvme]` per MoE layer: the tier each routed access was served from
+    pub fn counters(&self) -> &[[u64; 3]] {
+        &self.counters
+    }
+
+    /// keep the place of `k` before this call (once per call)
+    fn record(&mut self, k: usize) {
+        if self.seen[k] != self.epoch {
+            self.seen[k] = self.epoch;
+            self.touched.push((k as u32, self.place[k]));
+        }
+    }
+
+    fn ram_unlink(&mut self, q: u32) {
+        let (p, n) = (self.prev[q as usize], self.next[q as usize]);
+        if p != NONE {
+            self.next[p as usize] = n;
+        } else {
+            self.oldest = n;
+        }
+        if n != NONE {
+            self.prev[n as usize] = p;
+        } else {
+            self.newest = p;
+        }
+        self.prev[q as usize] = NONE;
+        self.next[q as usize] = NONE;
+    }
+
+    fn ram_push_newest(&mut self, q: u32) {
+        self.prev[q as usize] = self.newest;
+        self.next[q as usize] = NONE;
+        if self.newest != NONE {
+            self.next[self.newest as usize] = q;
+        } else {
+            self.oldest = q;
+        }
+        self.newest = q;
+    }
+
+    fn ram_touch(&mut self, q: u32) {
+        if self.newest != q {
+            self.ram_unlink(q);
+            self.ram_push_newest(q);
+        }
+    }
+
+    /// `k` (on the NVMe now) into the pinned tier as the most recent: a free slot, else the
+    /// oldest expert not routed in this call drops to the NVMe. `None` = no such slot.
+    fn ram_insert(&mut self, k: usize) -> Option<u32> {
+        let q = match self.rfree.pop() {
+            Some(q) => q,
+            None => {
+                let mut x = self.oldest;
+                while x != NONE && self.prot[self.rowner[x as usize] as usize] == self.epoch {
+                    x = self.next[x as usize];
+                }
+                if x == NONE {
+                    return None;
+                }
+                let o = self.rowner[x as usize] as usize;
+                self.record(o);
+                self.place[o] = Place::Nvme;
+                self.ram_unlink(x);
+                self.stats.ram_evictions += 1;
+                x
+            }
+        };
+        self.rowner[q as usize] = k as u32;
+        self.ram_push_newest(q);
+        self.place[k] = Place::Ram(q);
+        Some(q)
+    }
+
+    /// CLOCK: the VRAM slot the hand stops at (skipping slots pinned in this call, clearing set
+    /// reference bits), at most 2 x slots steps
+    fn victim(&mut self) -> Option<usize> {
+        let n = self.vowner.len();
+        for _ in 0..2 * n {
+            let s = self.hand;
+            self.hand = if s + 1 == n { 0 } else { s + 1 };
+            if self.vpin[s] == self.epoch || self.vpin[s] == DISABLED {
+                continue;
+            }
+            if self.refb[s] {
+                self.refb[s] = false;
+                continue;
+            }
+            return Some(s);
+        }
+        None
+    }
+
+    /// One call of MoE layer `l` with the distinct routed experts `ids` (ascending); `admit` =
+    /// [`arena_admits`]. Returns `(key, before, after)` of every expert whose place changed,
+    /// ascending key (key = `l x experts + expert`; a write-back or a pinned eviction may be of
+    /// any layer, an admission or an NVMe landing only of `l`).
+    pub fn step(&mut self, l: usize, ids: &[u32], admit: bool) -> Vec<(u32, Place, Place)> {
+        assert!(l < self.layers, "global arena: layer {l} outside 0..{}", self.layers);
+        self.epoch += 1;
+        self.gen += 1;
+        let ep = self.epoch;
+        self.touched.clear();
+        let base = l * self.experts;
+        let mut misses = Vec::with_capacity(ids.len());
+        for &e in ids {
+            assert!((e as usize) < self.experts, "global arena: expert {e} outside 0..{}", self.experts);
+            let k = base + e as usize;
+            self.prot[k] = ep;
+            match self.place[k] {
+                Place::Vram(s) => {
+                    self.refb[s as usize] = true;
+                    self.vpin[s as usize] = ep;
+                    self.counters[l][0] += 1;
+                }
+                Place::Ram(_) => {
+                    self.counters[l][1] += 1;
+                    misses.push(k);
+                }
+                Place::Nvme => {
+                    self.counters[l][2] += 1;
+                    misses.push(k);
+                }
+            }
+        }
+        if admit && !self.vowner.is_empty() {
+            for &k in &misses {
+                if (self.pin_stay && matches!(self.place[k], Place::Ram(_))) || (self.noadmit && self.place[k] == Place::Nvme) {
+                    continue;
+                }
+                let Some(s) = self.victim() else {
+                    self.stats.no_victim += 1;
+                    break;
+                };
+                let v = self.vowner[s];
+                self.record(k);
+                // exclusive: the admitted expert's pinned copy goes (its slot is free for the write-back)
+                if let Place::Ram(q) = self.place[k] {
+                    self.ram_unlink(q);
+                    self.rowner[q as usize] = NONE;
+                    self.rfree.push(q);
+                }
+                self.vowner[s] = k as u32;
+                self.place[k] = Place::Vram(s as u32);
+                self.refb[s] = true;
+                self.vpin[s] = ep;
+                self.stats.admitted += 1;
+                if v != NONE {
+                    let v = v as usize;
+                    self.record(v);
+                    self.place[v] = Place::Nvme;
+                    if self.ram_insert(v).is_some() {
+                        self.stats.write_backs += 1;
+                    } else {
+                        self.stats.wb_dropped += 1;
+                    }
+                }
+            }
+        }
+        for &k in &misses {
+            match self.place[k] {
+                Place::Vram(_) => {}
+                Place::Ram(q) => self.ram_touch(q),
+                Place::Nvme => {
+                    self.record(k);
+                    self.ram_insert(k);
+                }
+            }
+        }
+        let mut ch: Vec<(u32, Place, Place)> = self.touched.iter().filter(|&&(k, b)| self.place[k as usize] != b).map(|&(k, b)| (k, b, self.place[k as usize])).collect();
+        ch.sort_unstable_by_key(|c| c.0);
+        ch
+    }
+
+    /// the invariants: every expert in at most one slot, the slot owners and the places agree,
+    /// the pinned LRU list holds exactly the pinned experts, the free list the rest
+    pub fn check(&self) -> Result<(), String> {
+        for (s, &k) in self.vowner.iter().enumerate() {
+            if k != NONE && self.place[k as usize] != Place::Vram(s as u32) {
+                return Err(format!("VRAM slot {s} owner {k} is at {:?}", self.place[k as usize]));
+            }
+        }
+        for (q, &k) in self.rowner.iter().enumerate() {
+            if k != NONE && self.place[k as usize] != Place::Ram(q as u32) {
+                return Err(format!("pinned slot {q} owner {k} is at {:?}", self.place[k as usize]));
+            }
+        }
+        for (k, p) in self.place.iter().enumerate() {
+            match *p {
+                Place::Vram(s) if self.vowner[s as usize] != k as u32 => return Err(format!("key {k} at VRAM {s}, owner {}", self.vowner[s as usize])),
+                Place::Ram(q) if self.rowner[q as usize] != k as u32 => return Err(format!("key {k} at pinned {q}, owner {}", self.rowner[q as usize])),
+                _ => {}
+            }
+        }
+        let (mut n, mut x, mut last) = (0usize, self.oldest, NONE);
+        while x != NONE {
+            if self.rowner[x as usize] == NONE || self.prev[x as usize] != last || n > self.rowner.len() {
+                return Err(format!("pinned LRU broken at slot {x}"));
+            }
+            n += 1;
+            last = x;
+            x = self.next[x as usize];
+        }
+        let res = self.rowner.iter().filter(|&&k| k != NONE).count();
+        if last != self.newest || n != res || res + self.rfree.len() != self.rowner.len() {
+            return Err(format!("pinned LRU holds {n}, {res} resident, {} free of {}", self.rfree.len(), self.rowner.len()));
+        }
+        Ok(())
+    }
+}
+
+/// One call of MoE layer `l` through the global arena: `ids` the distinct selected experts
+/// (ascending), `admit` = [`arena_admits`]. The arena decides ([`GlobalArena::step`]); the moves
+/// run in [`serve`]'s phases over the global slots, so no slot is overwritten before it is read:
+/// (A) every expert entering VRAM (from pinned or the NVMe) and every selected expert left on the
+/// NVMe into a staging slot; barrier; (B) every expert entering pinned (a VRAM victim by D2H, an
+/// NVMe miss read straight into its slot); (C) the VRAM entrants from staging into their slots.
+/// Returns where each selected record is (global slots).
+pub fn serve_global(a: &mut GlobalArena, l: usize, ids: &[u32], admit: bool, stage_cap: usize, m: &mut dyn Mover) -> Result<Served, String> {
+    let n = a.experts;
+    let before: Vec<Place> = ids.iter().map(|&e| a.place(l, e)).collect();
+    let changes = a.step(l, ids, admit);
+    let after: Vec<Place> = ids.iter().map(|&e| a.place(l, e)).collect();
+    let own = |k: u32| -> Result<u32, String> {
+        let (kl, e) = (k as usize / n, k as usize % n);
+        if kl != l {
+            return Err(format!("global arena: a call of layer {l} reads expert {e} of layer {kl} from the NVMe"));
+        }
+        Ok(e as u32)
+    };
+    // the VRAM entrants (all selected, ascending), then the selected experts left on the NVMe
+    let mut staged: Vec<(u32, Place)> = changes.iter().filter(|c| matches!(c.2, Place::Vram(_)) && !matches!(c.1, Place::Vram(_))).map(|c| (c.0, c.1)).collect();
+    let entrants = staged.len();
+    staged.extend(ids.iter().zip(before.iter().zip(&after)).filter(|(_, (_, a))| **a == Place::Nvme).map(|(&e, (&b, _))| ((l * n) as u32 + e, b)));
+    if staged.len() > stage_cap {
+        return Err(format!("expert tiers: layer {l} stages {} records in one call, {stage_cap} staging slots", staged.len()));
+    }
+    let mut out = Served::default();
+    out.moves.visits = ids.len() as u64;
+    for &(_, b, af) in &changes {
+        let mv = &mut out.moves;
+        match (b.tier(), af.tier()) {
+            (Tier::Nvme, Tier::Vram) => mv.n2v += 1,
+            (Tier::Pinned, Tier::Vram) => mv.p2v += 1,
+            (Tier::Nvme, Tier::Pinned) => mv.n2p += 1,
+            (Tier::Vram, Tier::Pinned) => mv.v2p += 1,
+            (Tier::Vram, Tier::Nvme) => mv.v2n += 1,
+            (Tier::Pinned, Tier::Nvme) => mv.p2n += 1,
+            _ => {}
+        }
+    }
+    // phase A
+    let mut from_nvme = Vec::new();
+    for (s, &(k, b)) in staged.iter().enumerate() {
+        match b {
+            Place::Vram(v) => {
+                m.vram_to_stage(v, s as u32);
+                out.moves.vram_to_stage += 1;
+            }
+            Place::Ram(q) => {
+                m.pinned_to_stage(q, s as u32);
+                out.moves.pinned_to_stage += 1;
+            }
+            Place::Nvme => from_nvme.push((own(k)?, Dst::Landing(s as u32))),
+        }
+    }
+    for c in from_nvme.chunks(MAX_IN_FLIGHT) {
+        out.nvme_bytes += m.nvme(c)?;
+    }
+    for &(_, d) in &from_nvme {
+        if let Dst::Landing(i) = d {
+            m.landing_to_stage(i);
+            out.moves.landing_to_stage += 1;
+        }
+    }
+    m.barrier();
+    // phase B: a pinned slot an entrant takes was left by an expert staged in A or dropped
+    let mut to_pinned = Vec::new();
+    for &(k, b, af) in &changes {
+        let Place::Ram(q) = af else { continue };
+        match b {
+            Place::Vram(v) => {
+                m.vram_to_pinned(v, q);
+                out.moves.vram_to_pinned += 1;
+            }
+            Place::Nvme => to_pinned.push((own(k)?, Dst::Pinned(q))),
+            Place::Ram(_) => return Err(format!("global arena: key {k} moved between pinned slots")),
+        }
+    }
+    for c in to_pinned.chunks(MAX_IN_FLIGHT) {
+        out.nvme_bytes += m.nvme(c)?;
+    }
+    // phase C: a VRAM slot an entrant takes was left by a victim read in B or dropped
+    for (s, &(k, _)) in staged.iter().enumerate().take(entrants) {
+        let Place::Vram(v) = a.place[k as usize] else { unreachable!("an entrant is in VRAM") };
+        m.stage_to_vram(s as u32, v);
+        out.moves.stage_to_vram += 1;
+    }
+    out.nvme_reads = from_nvme.len() + to_pinned.len();
+    out.moves.nvme_to_landing = from_nvme.len() as u64;
+    out.moves.nvme_to_pinned = to_pinned.len() as u64;
+    out.moves.zero_copy = after.iter().filter(|p| matches!(p, Place::Ram(_))).count() as u64;
+    out.locs = ids
+        .iter()
+        .zip(&after)
+        .map(|(&e, &p)| {
+            let loc = match p {
+                Place::Vram(v) => Loc::Vram(v),
+                Place::Ram(q) => Loc::Pinned(q),
+                Place::Nvme => Loc::Stage(staged.iter().position(|x| x.0 as usize == l * n + e as usize).expect("a selected NVMe expert is staged") as u32),
+            };
+            (e, loc)
+        })
+        .collect();
+    Ok(out)
+}
+
+/// the records one [`serve_global`] of `ids` in layer `l` would stage; the arena is left as it is
+pub fn staged_count_global(a: &GlobalArena, l: usize, ids: &[u32], admit: bool) -> usize {
+    let mut c = a.clone();
+    let ch = c.step(l, ids, admit);
+    ch.iter().filter(|x| matches!(x.2, Place::Vram(_)) && !matches!(x.1, Place::Vram(_))).count() + ids.iter().filter(|&&e| c.place(l, e) == Place::Nvme).count()
+}
+
+/// [`fitting_rows`] for the global arena (a prompt call: no admission)
+pub fn fitting_rows_global(a: &GlobalArena, l: usize, sel: &[i32], k: usize, cap: usize) -> Result<usize, String> {
+    let t = sel.len() / k;
+    if t == 0 || sel.len() != t * k {
+        return Err(format!("expert tiers: layer {l}: a selection of {} ids is no [rows][{k}]", sel.len()));
+    }
+    let fits = |r: usize| -> Result<bool, String> { Ok(staged_count_global(a, l, &distinct_ids(&sel[..r * k], a.experts)?, false) <= cap) };
+    if fits(t)? {
+        return Ok(t);
+    }
+    let mut r = 1usize << (usize::BITS - 1 - t.leading_zeros());
+    if r == t {
+        r /= 2;
+    }
+    while r >= 1 {
+        if fits(r)? {
+            return Ok(r);
+        }
+        r /= 2;
+    }
+    let one = staged_count_global(a, l, &distinct_ids(&sel[..k], a.experts)?, false);
+    Err(format!("expert tiers: layer {l}: one row stages {one} records, {cap} staging slots"))
+}
+
+/// [`serve_chunk`] for the global arena: a prompt call's `[t][k]` selection in row sub-batches,
+/// each one [`serve_global`] without admission
+#[allow(clippy::too_many_arguments)]
+pub fn serve_chunk_global(
+    a: &mut GlobalArena,
+    l: usize,
+    sel: &[i32],
+    k: usize,
+    cap: usize,
+    m: &mut dyn Mover,
+    each: &mut dyn FnMut(usize, usize, &Served) -> Result<(), String>,
+) -> Result<usize, String> {
+    let t = sel.len() / k;
+    let (mut r0, mut batches) = (0, 0);
+    while r0 < t {
+        if r0 > 0 {
+            m.barrier();
+        }
+        let rows = fitting_rows_global(a, l, &sel[r0 * k..], k, cap)?;
+        let ids = distinct_ids(&sel[r0 * k..(r0 + rows) * k], a.experts)?;
+        let served = serve_global(a, l, &ids, false, cap, m)?;
+        each(r0, rows, &served)?;
+        batches += 1;
+        r0 += rows;
+    }
+    Ok(batches)
+}
+
+/// a mover whose VRAM and pinned bases can be pointed at another allocation, and the stream its
+/// copies run on
+trait Rebase<'a> {
+    fn set_vram(&mut self, base: Dev);
+    fn set_pinned(&mut self, p: Option<&'a Pinned>);
+    fn stream(&self) -> sys::CUstream;
+}
+
+impl<'a> Rebase<'a> for GpuMover<'a> {
+    fn set_vram(&mut self, base: Dev) {
+        self.vram = base;
+    }
+    fn set_pinned(&mut self, p: Option<&'a Pinned>) {
+        self.pinned = p;
+    }
+    fn stream(&self) -> sys::CUstream {
+        cuda::cur_stream()
+    }
+}
+
+impl<'a> Rebase<'a> for StagerMover<'a> {
+    fn set_vram(&mut self, base: Dev) {
+        self.vram = base;
+    }
+    fn set_pinned(&mut self, p: Option<&'a Pinned>) {
+        self.pinned = p;
+    }
+    fn stream(&self) -> sys::CUstream {
+        self.s
+    }
+}
+
+/// The host book of the VRAM write-back ring (sybil's `vfree` / `kvr`): ring entry `r` holds the
+/// pinned slot its D2H writes (`NONE` = free). `done(r)` says whether entry `r`'s D2H has landed.
+#[derive(Clone, Debug)]
+struct RingBook {
+    q: Vec<u32>,
+    next: usize,
+}
+
+impl RingBook {
+    fn new(n: usize) -> RingBook {
+        RingBook { q: vec![NONE; n], next: 0 }
+    }
+
+    /// the entry for the next write-back: the first free or landed one from `next`; else the
+    /// entry at `next`, whose D2H the caller must wait for first (`true`)
+    fn take(&mut self, done: &mut dyn FnMut(usize) -> bool) -> (usize, bool) {
+        let n = self.q.len();
+        for i in 0..n {
+            let r = (self.next + i) % n;
+            if self.q[r] == NONE || done(r) {
+                self.q[r] = NONE;
+                self.next = (r + 1) % n;
+                return (r, false);
+            }
+        }
+        let r = self.next;
+        self.next = (r + 1) % n;
+        (r, true)
+    }
+
+    /// the entries whose D2H into pinned slot `q` may still run (landed ones are freed)
+    fn pending(&mut self, q: u32, done: &mut dyn FnMut(usize) -> bool) -> Vec<usize> {
+        let mut v = Vec::new();
+        for r in 0..self.q.len() {
+            if self.q[r] == q {
+                if done(r) {
+                    self.q[r] = NONE;
+                } else {
+                    v.push(r);
+                }
+            }
+        }
+        v
+    }
+}
+
+/// sybil's `GLM53_NV_VRING` on the device: `slots` VRAM slots of the arena (disabled for the
+/// CLOCK) as a ring. A VRAM victim is copied D2D into a ring entry on the call's stream (its slot
+/// is free for the entrant right after), then D2H into its pinned slot on the ring's own
+/// non-blocking stream (a copy engine), off the call's critical path. Every later reader of that
+/// pinned slot waits for the D2H: a queued copy or the kernels through an event on their stream,
+/// an NVMe write into the slot on the host.
+struct WbRing {
+    book: RingBook,
+    slots: Vec<u32>,
+    d2d: Vec<sys::CUevent>,
+    wb: Vec<sys::CUevent>,
+    stream: sys::CUstream,
+    /// write-backs through the ring, and those that waited for a busy entry
+    issued: u64,
+    waited: u64,
+}
+
+/// an event that never ran or has completed
+fn event_done(e: sys::CUevent) -> bool {
+    unsafe { sys::cuEventQuery(e) == sys::CUresult::CUDA_SUCCESS }
+}
+
+impl WbRing {
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn new(slots: Vec<u32>) -> WbRing {
+        let n = slots.len();
+        WbRing {
+            book: RingBook::new(n),
+            d2d: (0..n).map(|_| cuda::event_create()).collect(),
+            wb: (0..n).map(|_| cuda::event_create()).collect(),
+            slots,
+            stream: cuda::stream_create_non_blocking(),
+            issued: 0,
+            waited: 0,
+        }
+    }
+
+    /// every write-back landed; the book empty
+    unsafe fn sync_all(&mut self) {
+        cuda::stream_sync(self.stream);
+        self.book.q.fill(NONE);
+    }
+
+    unsafe fn free(&mut self) {
+        self.sync_all();
+        for e in self.d2d.drain(..).chain(self.wb.drain(..)) {
+            cuda::event_destroy(e);
+        }
+        cuda::stream_destroy(self.stream);
+    }
+}
+
+/// The global arena's slots over the VRAM chunks and the per-layer pinned allocations (sybil's
+/// `cbase[s / spc] + s % spc`): global VRAM slot `v` -> slot `v % vpl` of `vram[v / vpl]`, pinned
+/// slot `q` -> `q % ppl` of `pinned[q / ppl]`; every move is the inner mover's, on its base for
+/// that slot, except a VRAM -> pinned write-back with the ring ([`WbRing`]).
+struct ChunkMover<'a, 'r, M> {
+    inner: M,
+    vram: &'a [Dev],
+    pinned: &'a [Pinned],
+    vpl: usize,
+    ppl: usize,
+    rb: u64,
+    ring: Option<&'r mut WbRing>,
+}
+
+impl<'a, M: Mover + Rebase<'a>> ChunkMover<'a, '_, M> {
+    fn v(&mut self, v: u32) -> u32 {
+        self.inner.set_vram(self.vram[v as usize / self.vpl]);
+        (v as usize % self.vpl) as u32
+    }
+    fn q(&mut self, q: u32) -> u32 {
+        self.inner.set_pinned(Some(&self.pinned[q as usize / self.ppl]));
+        (q as usize % self.ppl) as u32
+    }
+    fn vram_addr(&self, v: u32) -> Dev {
+        self.vram[v as usize / self.vpl] + (v as usize % self.vpl) as u64 * self.rb
+    }
+    fn pinned_host(&self, q: u32) -> *mut u8 {
+        unsafe { (self.pinned[q as usize / self.ppl].host as *mut u8).add((q as usize % self.ppl) * self.rb as usize) }
+    }
+    /// the ring entries still writing pinned slot `q`
+    fn pending(&mut self, q: u32) -> Vec<usize> {
+        match self.ring.as_deref_mut() {
+            Some(WbRing { book, wb, .. }) => book.pending(q, &mut |r| event_done(wb[r])),
+            None => Vec::new(),
+        }
+    }
+    /// the mover's stream waits for every write-back into `q`
+    fn wait_gpu(&mut self, q: u32) {
+        let s = self.inner.stream();
+        for r in self.pending(q) {
+            let e = self.ring.as_ref().expect("pending entries come from the ring").wb[r];
+            unsafe { cuda::stream_wait_event(s, e) };
+        }
+    }
+    /// the kernels of this call read the pinned slots of `locs`: their stream waits for the
+    /// write-backs into them
+    fn settle_locs(&mut self, locs: &[(u32, Loc)]) {
+        if self.ring.is_none() {
+            return;
+        }
+        for &(_, loc) in locs {
+            if let Loc::Pinned(q) = loc {
+                self.wait_gpu(q);
+            }
+        }
+    }
+}
+
+impl<'a, M: Mover + Rebase<'a>> Mover for ChunkMover<'a, '_, M> {
+    fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
+        let ppl = self.ppl;
+        let chunk = |d: Dst| match d {
+            Dst::Landing(_) => None,
+            Dst::Pinned(q) => Some(q as usize / ppl),
+        };
+        // a host write into a pinned slot waits for a write-back still landing there
+        for &(_, d) in jobs {
+            if let Dst::Pinned(q) = d {
+                for r in self.pending(q) {
+                    let e = self.ring.as_ref().expect("pending entries come from the ring").wb[r];
+                    unsafe { cuda::ck(sys::cuEventSynchronize(e)) };
+                }
+            }
+        }
+        let (mut bytes, mut i) = (0, 0);
+        while i < jobs.len() {
+            let c = chunk(jobs[i].1);
+            let mut local = Vec::new();
+            while i < jobs.len() && chunk(jobs[i].1) == c {
+                let (e, d) = jobs[i];
+                local.push((e, if let Dst::Pinned(q) = d { Dst::Pinned((q as usize % ppl) as u32) } else { d }));
+                i += 1;
+            }
+            if let Some(c) = c {
+                self.inner.set_pinned(Some(&self.pinned[c]));
+            }
+            bytes += self.inner.nvme(&local)?;
+        }
+        Ok(bytes)
+    }
+    fn landing_to_stage(&mut self, i: u32) {
+        self.inner.landing_to_stage(i);
+    }
+    fn pinned_to_stage(&mut self, q: u32, s: u32) {
+        self.wait_gpu(q);
+        let q = self.q(q);
+        self.inner.pinned_to_stage(q, s);
+    }
+    fn vram_to_stage(&mut self, v: u32, s: u32) {
+        let v = self.v(v);
+        self.inner.vram_to_stage(v, s);
+    }
+    fn barrier(&mut self) {
+        self.inner.barrier();
+    }
+    fn vram_to_pinned(&mut self, v: u32, q: u32) {
+        let (src, dst, rb, s) = (self.vram_addr(v), self.pinned_host(q), self.rb as usize, self.inner.stream());
+        let Some(ring) = self.ring.as_deref_mut() else {
+            let (v, q) = (self.v(v), self.q(q));
+            self.inner.vram_to_pinned(v, q);
+            return;
+        };
+        let WbRing { book, wb, .. } = ring;
+        let (r, wait) = book.take(&mut |r| event_done(wb[r]));
+        let ra = self.vram[ring.slots[r] as usize / self.vpl] + (ring.slots[r] as usize % self.vpl) as u64 * self.rb;
+        unsafe {
+            if wait {
+                // the entry's previous D2H must have read it before the D2D overwrites it
+                cuda::stream_wait_event(s, ring.wb[r]);
+                ring.waited += 1;
+            }
+            cuda::memcpy_async_on(ra, src, rb, s);
+            cuda::event_record(ring.d2d[r], s);
+            cuda::stream_wait_event(ring.stream, ring.d2d[r]);
+            cuda::ck(sys::cuMemcpyDtoHAsync_v2(dst as *mut _, ra, rb, ring.stream));
+            cuda::event_record(ring.wb[r], ring.stream);
+            cuda::stream_query(ring.stream);
+        }
+        ring.book.q[r] = q;
+        ring.issued += 1;
+    }
+    fn stage_to_vram(&mut self, s: u32, v: u32) {
+        let v = self.v(v);
+        self.inner.stage_to_vram(s, v);
+    }
+}
+
+/// the device address of a [`Loc`] of the global arena
+fn arena_addr(vram: &[Dev], pinned: &[Pinned], vpl: usize, ppl: usize, stage: Dev, rb: u64, loc: Loc) -> Dev {
+    match loc {
+        Loc::Vram(v) => vram[v as usize / vpl] + (v as usize % vpl) as u64 * rb,
+        Loc::Pinned(q) => pinned[q as usize / ppl].dev + (q as usize % ppl) as u64 * rb,
+        Loc::Stage(s) => stage + s as u64 * rb,
+    }
+}
+
+/// the moves of [`GlobalArena::disable`]'s changes: every VRAM expert that went to pinned is
+/// written back (D2H); one that went to the NVMe is dropped
+fn write_back(changes: &[(u32, Place, Place)], m: &mut dyn Mover) -> Result<u64, String> {
+    let mut n = 0;
+    for &(k, b, a) in changes {
+        match (b, a) {
+            (Place::Vram(v), Place::Ram(q)) => {
+                m.vram_to_pinned(v, q);
+                n += 1;
+            }
+            (Place::Vram(_), Place::Nvme) | (Place::Ram(_), Place::Nvme) => {}
+            _ => return Err(format!("global arena: disabling slots moved key {k} from {b:?} to {a:?}")),
+        }
+    }
+    Ok(n)
+}
+
+/// the elastic part of the global arena (sybil's `GLM53_EC_ELASTIC_GB`), since construction
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ElasticStats {
+    /// elastic chunks allocated at construction (`vram` slots each)
+    pub chunks: usize,
+    /// hand-backs (staged prompt calls, or free VRAM below the reserve) and regrowths
+    pub enter: u64,
+    pub exit: u64,
+    /// chunks that could not be allocated again (their slots stay disabled until the next try)
+    pub realloc_fail: u64,
+    /// experts written back to pinned at a hand-back
+    pub write_backs: u64,
+}
+
+/// the staging buffers of large prompt calls (sybil's `GLM53_EC_STAGE_GB` / `GLM53_EC_STAGE_MIN`)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageStats {
+    /// staged calls (prompt calls of at least `stage_min` picks)
+    pub calls: u64,
+    /// layers staged one layer ahead on the copy stream, and those whose prefetch was used
+    pub prefetched: u64,
+    pub prefetch_used: u64,
+    /// calls staged synchronously (no valid prefetch) and calls that fell back to sub-batches
+    pub restaged: u64,
+    pub fallbacks: u64,
+    /// records copied into a buffer from their pinned slot, and read from the NVMe
+    pub from_pinned: u64,
+    pub from_nvme: u64,
+}
+
+/// two staging buffers of `nst` records and the copy stream that fills them one layer ahead
+struct StageSet {
+    bufs: [Dev; 2],
+    nst: usize,
+    /// allocated at construction (no elastic part), else for one staged forward
+    permanent: bool,
+    stream: sys::CUstream,
+    ready: [sys::CUevent; 2],
+    used: [sys::CUevent; 2],
+    /// the experts in each buffer, its MoE layer (`usize::MAX` none) and the placement generation
+    content: [Vec<u32>; 2],
+    layer: [usize; 2],
+    gen: [u64; 2],
+    in_forward: bool,
+    stats: StageStats,
+}
+
+/// The global arena on the device: the host policy, its switches, the VRAM chunks its slots live
+/// in, the write-back ring, the elastic part and the staging buffers.
+struct ArenaDev {
+    a: GlobalArena,
+    cfg: ArenaConfig,
+    /// VRAM chunks of `vram` (per layer) slots: the per-layer allocations, then the elastic ones
+    /// (0 = handed back)
+    chunks: Vec<Dev>,
+    base_chunks: usize,
+    ring: Option<WbRing>,
+    stage: Option<StageSet>,
+    elastic: ElasticStats,
+}
+
+impl ArenaDev {
+    fn new(a: GlobalArena, cfg: ArenaConfig) -> ArenaDev {
+        ArenaDev { a, cfg, chunks: Vec::new(), base_chunks: 0, ring: None, stage: None, elastic: ElasticStats::default() }
+    }
+
+    fn reset(&mut self) {
+        // pinned slots still landing a write-back are free in the new arena: let them land first
+        if let Some(r) = self.ring.as_mut() {
+            unsafe { r.sync_all() };
+        }
+        self.a.reset();
+    }
+
+    /// the elastic chunks (index into `chunks`)
+    fn flex(&self) -> std::ops::Range<usize> {
+        self.base_chunks..self.chunks.len()
+    }
+}
+
+impl ExpertTiers {
+    /// how the slots are shared (`CROW_GLM_ARENA` as read at construction)
+    pub fn arena_kind(&self) -> ArenaKind {
+        if self.arena.is_some() {
+            ArenaKind::Global
+        } else {
+            ArenaKind::Layer
+        }
+    }
+
+    /// the global arena's policy (`None` on the per-layer path)
+    pub fn arena(&self) -> Option<&GlobalArena> {
+        self.arena.as_ref().map(|d| &d.a)
+    }
+
+    /// the global arena's switches (`None` on the per-layer path)
+    pub fn arena_config(&self) -> Option<&ArenaConfig> {
+        self.arena.as_ref().map(|d| &d.cfg)
+    }
+
+    /// the write-back ring: entries, write-backs through it, write-backs that waited for an entry
+    pub fn arena_ring_stats(&self) -> Option<(usize, u64, u64)> {
+        self.arena.as_ref().and_then(|d| d.ring.as_ref()).map(|r| (r.slots.len(), r.issued, r.waited))
+    }
+
+    pub fn arena_elastic_stats(&self) -> Option<ElasticStats> {
+        self.arena.as_ref().map(|d| d.elastic)
+    }
+
+    /// the staging buffers' counters and their size in records (`None` = no staging)
+    pub fn arena_stage_stats(&self) -> Option<(StageStats, usize)> {
+        self.arena.as_ref().and_then(|d| d.stage.as_ref()).map(|s| (s.stats, s.nst))
+    }
+
+    /// `[vram, pinned, nvme]` per MoE layer: the tier each access was served from (the #175
+    /// cache's counters, or the global arena's)
+    pub fn tier_counters(&self) -> &[[u64; 3]] {
+        match &self.arena {
+            Some(d) => d.a.counters(),
+            None => self.cache.counters(),
+        }
+    }
+
+    /// VRAM the global arena holds beyond the per-layer allocations (elastic chunks, staging)
+    fn arena_extra_vram_bytes(&self) -> u64 {
+        let Some(d) = self.arena.as_ref() else { return 0 };
+        let flex = d.chunks[d.base_chunks..].iter().filter(|&&c| c != 0).count() as u64 * self.sizes.vram as u64 * self.rb;
+        let stage = d.stage.as_ref().map_or(0, |s| if s.bufs[0] != 0 { 2 * s.nst as u64 * self.rb } else { 0 });
+        flex + stage
+    }
+
+    /// The device side of `CROW_GLM_ARENA=global`, after the per-layer allocations: the ring's
+    /// slots carved from the end of the arena (off when it holds fewer than 2 x N slots or there
+    /// is no pinned tier to write back into), the
+    /// elastic chunks from free VRAM above [`ARENA_RESERVE_BYTES`], the staging buffers (at once
+    /// without an elastic part, else per staged forward), the warm start.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn arena_boot(&mut self) -> Result<(), String> {
+        let (rb, vpl, nl, topk) = (self.rb, self.sizes.vram, self.slots.len(), self.topk);
+        let d = self.arena.as_mut().expect("arena_boot without the global arena");
+        d.chunks = if vpl > 0 { self.vram.clone() } else { Vec::new() };
+        d.base_chunks = d.chunks.len();
+        d.a.set_noadmit(d.cfg.noadmit);
+        let base = nl * vpl;
+        if d.cfg.vring > 0 && base >= 2 * d.cfg.vring && d.a.ram_slots() > 0 {
+            let r = base - d.cfg.vring..base;
+            let ch = d.a.disable(r.clone());
+            debug_assert!(ch.is_empty(), "an empty arena moves nothing");
+            d.ring = Some(WbRing::new(r.map(|s| s as u32).collect()));
+        }
+        if d.cfg.elastic_bytes > 0 && vpl > 0 {
+            let cb = vpl as u64 * rb;
+            let want = d.cfg.elastic_bytes.div_ceil(cb);
+            for _ in 0..want {
+                if cuda::free_vram_bytes() < cb + ARENA_RESERVE_BYTES {
+                    break;
+                }
+                match cuda::try_alloc_zeroed("glm5 elastic VRAM expert slots", cb as usize) {
+                    Ok(c) => {
+                        d.chunks.push(c);
+                        d.a.add_slots(vpl);
+                        d.elastic.chunks += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        if d.cfg.stage_bytes > 0 {
+            let nst = (d.cfg.stage_bytes / rb) as usize;
+            if nst < topk {
+                return Err(format!("{ARENA_STAGE_ENV}: {:.2} GiB holds {nst} records, less than one row's top-{topk}", d.cfg.stage_bytes as f64 / GIB));
+            }
+            let permanent = d.elastic.chunks == 0;
+            let mut bufs = [0; 2];
+            if permanent {
+                for b in &mut bufs {
+                    *b = cuda::try_alloc_zeroed("glm5 arena staging buffer", nst * rb as usize).map_err(|e| format!("{ARENA_STAGE_ENV}: the staging buffers do not fit: {e:?}"))?;
+                }
+            }
+            d.stage = Some(StageSet {
+                bufs,
+                nst,
+                permanent,
+                stream: cuda::stream_create_non_blocking(),
+                ready: [cuda::event_create(), cuda::event_create()],
+                used: [cuda::event_create(), cuda::event_create()],
+                content: [Vec::new(), Vec::new()],
+                layer: [usize::MAX; 2],
+                gen: [0; 2],
+                in_forward: false,
+                stats: StageStats::default(),
+            });
+        }
+        if let Some(path) = d.cfg.warm.clone() {
+            let text = std::fs::read_to_string(&path).map_err(|e| format!("{ARENA_WARM_ENV}={path}: {e}"))?;
+            let scores = parse_warm(&text, nl, self.first_moe, self.cache.experts)?;
+            self.arena_warm(&scores)?;
+        }
+        Ok(())
+    }
+
+    /// sybil's `warm`: fill the arena from per-layer scores ([`GlobalArena::warm_plan`]) through
+    /// the admission path (VRAM, in groups of the staging slots) and NVMe landings (pinned); the
+    /// counters of the arena and of the store restart at 0 afterwards.
+    ///
+    /// # Safety
+    /// A CUDA context is current; nothing reads the store.
+    unsafe fn arena_warm(&mut self, scores: &[Vec<f64>]) -> Result<(), String> {
+        let (rb, vpl, ppl, stage) = (self.rb, self.sizes.vram, self.sizes.pinned, self.stage);
+        let d = self.arena.as_mut().expect("arena_warm without the global arena");
+        let (vr, pr) = d.a.warm_plan(scores);
+        for (l, (v, p)) in vr.iter().zip(&pr).enumerate() {
+            let inner = GpuMover { vram: 0, pinned: None, stage, landing: self.landing.p, rb, src: &self.src, recs: &self.records[l] };
+            let mut m = ChunkMover { inner, vram: &d.chunks, pinned: &self.pinned, vpl, ppl, rb, ring: None };
+            for g in v.chunks(self.stage_cap.max(1)) {
+                serve_global(&mut d.a, l, g, true, self.stage_cap, &mut m)?;
+                m.barrier();
+            }
+            for g in p.chunks(MAX_IN_FLIGHT) {
+                serve_global(&mut d.a, l, g, false, self.stage_cap, &mut m)?;
+            }
+        }
+        cuda::sync();
+        d.a.check()?;
+        d.a.clear_counters();
+        self.nvme_reads = 0;
+        self.nvme_bytes = 0;
+        self.moves.iter_mut().for_each(|m| *m = Moves::default());
+        Ok(())
+    }
+
+    /// Hand the elastic chunks back: their experts written back to pinned (or dropped), their
+    /// slots disabled, their memory freed.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading the arena is pending.
+    unsafe fn elastic_enter(&mut self) -> Result<(), String> {
+        let (rb, vpl, ppl, stage) = (self.rb, self.sizes.vram, self.sizes.pinned, self.stage);
+        let d = self.arena.as_mut().expect("elastic_enter without the global arena");
+        let live: Vec<usize> = d.flex().filter(|&c| d.chunks[c] != 0).collect();
+        if live.is_empty() {
+            return Ok(());
+        }
+        cuda::sync();
+        if let Some(r) = d.ring.as_mut() {
+            r.sync_all();
+        }
+        let mut ch = Vec::new();
+        for &c in &live {
+            ch.extend(d.a.disable(c * vpl..(c + 1) * vpl));
+        }
+        let inner = GpuMover { vram: 0, pinned: None, stage, landing: self.landing.p, rb, src: &self.src, recs: &self.records[0] };
+        let mut m = ChunkMover { inner, vram: &d.chunks, pinned: &self.pinned, vpl, ppl, rb, ring: None };
+        d.elastic.write_backs += write_back(&ch, &mut m)?;
+        cuda::sync();
+        for c in live {
+            cuda::free_dev(&mut d.chunks[c]);
+            d.chunks[c] = 0;
+        }
+        d.elastic.enter += 1;
+        Ok(())
+    }
+
+    /// Grow the elastic part back: every handed-back chunk that fits above the reserve is
+    /// allocated again and its (empty) slots enabled.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn elastic_exit(&mut self) {
+        let (rb, vpl) = (self.rb, self.sizes.vram);
+        let d = self.arena.as_mut().expect("elastic_exit without the global arena");
+        let down: Vec<usize> = d.flex().filter(|&c| d.chunks[c] == 0).collect();
+        if down.is_empty() {
+            return;
+        }
+        let cb = vpl as u64 * rb;
+        for c in down {
+            let ok = cuda::free_vram_bytes() >= cb + ARENA_RESERVE_BYTES;
+            match ok.then(|| cuda::try_alloc_zeroed("glm5 elastic VRAM expert slots", cb as usize)) {
+                Some(Ok(p)) => {
+                    d.chunks[c] = p;
+                    d.a.enable(c * vpl..(c + 1) * vpl);
+                }
+                _ => d.elastic.realloc_fail += 1,
+            }
+        }
+        d.elastic.exit += 1;
+    }
+
+    /// end a staged forward: the copy stream drained, per-forward buffers freed, the elastic part
+    /// grown back
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading a staging buffer is pending.
+    unsafe fn stage_end(&mut self) {
+        let Some(d) = self.arena.as_mut() else { return };
+        let Some(st) = d.stage.as_mut() else { return };
+        if !st.in_forward {
+            return;
+        }
+        cuda::stream_sync(st.stream);
+        st.layer = [usize::MAX; 2];
+        st.in_forward = false;
+        if !st.permanent {
+            cuda::sync();
+            for b in &mut st.bufs {
+                cuda::free_dev(b);
+                *b = 0;
+            }
+        }
+        self.elastic_exit();
+    }
+
+    /// [`ExpertTiers::table_for`] through the global arena (decode-sized calls admit), with the
+    /// synchronous mover or the stager
+    ///
+    /// # Safety
+    /// As [`ExpertTiers::table_for`].
+    unsafe fn table_global(&mut self, l: usize, sel: &[i32], ids: &[u32]) -> Result<(Dev, Served), String> {
+        if self.pinned_use.cpu_lane {
+            return Err(arena_lane_refusal());
+        }
+        // a decode call ends a staged forward; the elastic part grows back when it can
+        self.stage_end();
+        if l == 0 && self.arena.as_ref().is_some_and(|d| d.flex().any(|c| d.chunks[c] == 0)) {
+            self.elastic_exit();
+        }
+        let (rb, experts, vpl, ppl, stage) = (self.rb, self.cache.experts, self.sizes.vram, self.sizes.pinned, self.stage);
+        let d = self.arena.as_mut().expect("table_global without the global arena");
+        let admit = arena_admits(sel.len(), false, d.cfg.admit_max);
+        d.a.set_pin_stay(self.pinned_use.stay);
+        let served = match self.stager.as_mut() {
+            None => {
+                let inner = GpuMover { vram: 0, pinned: None, stage, landing: self.landing.p, rb, src: &self.src, recs: &self.records[l] };
+                let mut m = ChunkMover { inner, vram: &d.chunks, pinned: &self.pinned, vpl, ppl, rb, ring: d.ring.as_mut() };
+                let served = serve_global(&mut d.a, l, ids, admit, self.stage_cap, &mut m)?;
+                m.settle_locs(&served.locs);
+                let mut table = vec![0u64; experts];
+                for &(e, loc) in &served.locs {
+                    table[e as usize] = arena_addr(&d.chunks, &self.pinned, vpl, ppl, stage, rb, loc);
+                }
+                cuda::to_u64_into(self.tables[l], &table);
+                served
+            }
+            Some(st) => {
+                st.settle(&self.src)?;
+                st.seq += 1;
+                st.stats.calls += 1;
+                let row = l * experts;
+                let inner = StagerMover {
+                    s: st.stream,
+                    vram: 0,
+                    pinned: None,
+                    stage,
+                    landing: st.landing.host as *mut u8,
+                    rb,
+                    src: &self.src,
+                    recs: &self.records[l],
+                    landed_host: (st.landed.host as *mut u64).add(row),
+                    landed_dev: st.landed.dev + (row * 8) as u64,
+                    seq: st.seq,
+                    read_pinned: Vec::new(),
+                    pending: &mut st.pending,
+                    stats: &mut st.stats,
+                };
+                let mut m = ChunkMover { inner, vram: &d.chunks, pinned: &self.pinned, vpl, ppl, rb, ring: d.ring.as_mut() };
+                let served = serve_global(&mut d.a, l, ids, admit, self.stage_cap, &mut m)?;
+                m.settle_locs(&served.locs);
+                // as `table_staged`: the table into this layer's pinned row, up on the stager
+                let host = std::slice::from_raw_parts_mut((st.tables.host as *mut u64).add(row), experts);
+                host.fill(0);
+                for &(e, loc) in &served.locs {
+                    host[e as usize] = arena_addr(&d.chunks, &self.pinned, vpl, ppl, stage, rb, loc);
+                }
+                cuda::ck(sys::cuMemcpyHtoDAsync_v2(self.tables[l], host.as_ptr() as *const _, experts * 8, st.stream));
+                cuda::event_record(st.event, st.stream);
+                cuda::stream_query(st.stream);
+                cuda::stream_wait_event(cuda::cur_stream(), st.event);
+                served
+            }
+        };
+        crate::glm5_moe::lane::post(None);
+        self.nvme_reads += served.nvme_reads as u64;
+        self.nvme_bytes += served.nvme_bytes;
+        self.moves[l].add(&served.moves);
+        self.routing_syncs += 1;
+        self.sub_batches += 1;
+        Ok((self.tables[l], served))
+    }
+
+    /// [`ExpertTiers::tables_for_chunk`] through the global arena (a prompt call never admits):
+    /// staged ([`ExpertTiers::stage_call`]) at `stage_min` picks or more with staging on, else in
+    /// row sub-batches through the prefill staging set as on the per-layer path
+    ///
+    /// # Safety
+    /// As [`ExpertTiers::tables_for_chunk`].
+    unsafe fn tables_for_chunk_global(&mut self, l: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<(), String> {
+        if self.pinned_use.cpu_lane {
+            return Err(arena_lane_refusal());
+        }
+        if self.pf_cap == 0 {
+            self.alloc_prefill_stage(prefill_stage_slots(self.topk))?;
+        }
+        self.settle()?;
+        crate::glm5_moe::lane::post(None);
+        let d = self.arena.as_ref().expect("tables_for_chunk_global without the global arena");
+        if d.stage.is_some() && sel.len() >= d.cfg.stage_min {
+            if self.stage_call(l, sel, run)? {
+                return Ok(());
+            }
+        } else {
+            self.stage_end();
+            // shrink with free VRAM: once per prompt call (its first MoE layer)
+            if l == 0 && self.arena.as_ref().is_some_and(|d| d.flex().any(|c| d.chunks[c] != 0)) && cuda::free_vram_bytes() < ARENA_RESERVE_BYTES {
+                self.elastic_enter()?;
+            }
+        }
+        let (rb, k, experts, vpl, ppl) = (self.rb, self.topk, self.cache.experts, self.sizes.vram, self.sizes.pinned);
+        let (stage, table_dev) = (self.pf_stage, self.tables[l]);
+        let d = self.arena.as_mut().expect("tables_for_chunk_global without the global arena");
+        d.a.set_pin_stay(self.pinned_use.stay);
+        // prompt calls admit nothing, so write no ring entry: let the pending ones land first
+        if let Some(r) = d.ring.as_mut() {
+            r.sync_all();
+        }
+        let (vram, pinned) = (&d.chunks, &self.pinned);
+        let inner = GpuMover { vram: 0, pinned: None, stage, landing: self.pf_landing.p, rb, src: &self.src, recs: &self.records[l] };
+        let mut m = ChunkMover { inner, vram, pinned, vpl, ppl, rb, ring: None };
+        let (mut reads, mut bytes, mut moves) = (0u64, 0u64, Moves::default());
+        let mut each = |r0: usize, rows: usize, served: &Served| -> Result<(), String> {
+            let mut table = vec![0u64; experts];
+            for &(e, loc) in &served.locs {
+                table[e as usize] = arena_addr(vram, pinned, vpl, ppl, stage, rb, loc);
+            }
+            cuda::to_u64_into(table_dev, &table);
+            reads += served.nvme_reads as u64;
+            bytes += served.nvme_bytes;
+            moves.add(&served.moves);
+            run(r0, rows, table_dev)
+        };
+        let r = serve_chunk_global(&mut d.a, l, sel, k, self.pf_cap, &mut m, &mut each);
+        self.nvme_reads += reads;
+        self.nvme_bytes += bytes;
+        self.moves[l].add(&moves);
+        self.routing_syncs += 1;
+        self.sub_batches += *r.as_ref().unwrap_or(&0) as u64;
+        r.map(|_| ())
+    }
+
+    /// Copy the records `ids` of MoE layer `l` into staging buffer `b` on the copy stream (behind
+    /// the buffer's last reader): from their pinned slot, or read from the NVMe through the
+    /// prefill landing. Counted as layer `l`'s moves. Every id is in pinned or on the NVMe.
+    ///
+    /// # Safety
+    /// A CUDA context is current; the buffers are allocated; no write-back is pending.
+    unsafe fn stage_issue(&mut self, l: usize, b: usize, ids: Vec<u32>) -> Result<(), String> {
+        let (rb, ppl) = (self.rb, self.sizes.pinned);
+        let d = self.arena.as_mut().expect("stage_issue without the global arena");
+        let st = d.stage.as_mut().expect("stage_issue without staging");
+        cuda::stream_wait_event(st.stream, st.used[b]);
+        let buf = st.bufs[b];
+        let mut nv = Vec::new();
+        let mut mv = Moves::default();
+        for (i, &e) in ids.iter().enumerate() {
+            match d.a.place(l, e) {
+                Place::Ram(q) => {
+                    let host = (self.pinned[q as usize / ppl].host as *const u8).add((q as usize % ppl) * rb as usize);
+                    cuda::ck(sys::cuMemcpyHtoDAsync_v2(buf + i as u64 * rb, host as *const _, rb as usize, st.stream));
+                    mv.pinned_to_stage += 1;
+                    st.stats.from_pinned += 1;
+                }
+                Place::Nvme => nv.push((e, i)),
+                Place::Vram(_) => return Err(format!("global arena: staging layer {l} expert {e}, which is in VRAM")),
+            }
+        }
+        let cap = self.pf_cap.clamp(1, MAX_IN_FLIGHT);
+        for g in nv.chunks(cap) {
+            let jobs: Vec<(ExpertRecord, RecordDst)> =
+                g.iter().enumerate().map(|(j, &(e, _))| (self.records[l][e as usize], RecordDst { gu: self.pf_landing.p.add(j * rb as usize), dn: std::ptr::null_mut() })).collect();
+            let t = self.src.fetch(&jobs)?;
+            self.nvme_bytes += self.src.wait(t)?.bytes;
+            for (j, &(_, i)) in g.iter().enumerate() {
+                // pageable source: the call returns once the bytes are taken, so the landing is free again
+                cuda::ck(sys::cuMemcpyHtoDAsync_v2(buf + i as u64 * rb, self.pf_landing.p.add(j * rb as usize) as *const _, rb as usize, st.stream));
+            }
+            mv.nvme_to_landing += g.len() as u64;
+            mv.landing_to_stage += g.len() as u64;
+            st.stats.from_nvme += g.len() as u64;
+        }
+        self.nvme_reads += nv.len() as u64;
+        cuda::event_record(st.ready[b], st.stream);
+        cuda::stream_query(st.stream);
+        st.content[b] = ids;
+        st.layer[b] = l;
+        st.gen[b] = d.a.generation();
+        self.moves[l].add(&mv);
+        Ok(())
+    }
+
+    /// sybil's staged prefill: one prompt call of MoE layer `l` with at least `stage_min` picks.
+    /// The VRAM hits are read in place (reference bit only, nothing admitted, nothing moves);
+    /// every other selected record is read from staging buffer `l % 2`, filled one layer ahead
+    /// (every non-VRAM expert of the layer, up to the buffer) or now when that prefetch is stale
+    /// or misses a selected id. One `run` for all rows; then the next MoE layer is prefetched into
+    /// the other buffer while this one computes. `false` = more selected records than a buffer
+    /// holds: the caller serves the call in sub-batches.
+    ///
+    /// # Safety
+    /// As [`ExpertTiers::tables_for_chunk`].
+    unsafe fn stage_call(&mut self, l: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<bool, String> {
+        let (experts, rb, vpl, ppl, nl) = (self.cache.experts, self.rb, self.sizes.vram, self.sizes.pinned, self.slots.len());
+        let ids = distinct_ids(sel, experts)?;
+        let nst = self.arena.as_ref().and_then(|d| d.stage.as_ref()).expect("stage_call without staging").nst;
+        // a staged forward begins: per-forward buffers come from the elastic part's memory (its
+        // hand-back moves VRAM experts, so the staged set is taken after it)
+        let begin = !self.arena.as_ref().and_then(|d| d.stage.as_ref()).expect("staging").in_forward;
+        if begin {
+            if let Some(r) = self.arena.as_mut().and_then(|d| d.ring.as_mut()) {
+                r.sync_all();
+            }
+            let permanent = self.arena.as_ref().and_then(|d| d.stage.as_ref()).expect("staging").permanent;
+            if !permanent {
+                self.elastic_enter()?;
+                let st = self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging");
+                for i in 0..2 {
+                    st.bufs[i] = cuda::try_alloc_zeroed("glm5 arena staging buffer", nst * rb as usize).map_err(|e| format!("{ARENA_STAGE_ENV}: a staging buffer does not fit after the elastic hand-back: {e:?}"))?;
+                }
+            }
+            self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging").in_forward = true;
+        }
+        let need: Vec<u32> = {
+            let d = self.arena.as_ref().expect("stage_call without the global arena");
+            ids.iter().copied().filter(|&e| !matches!(d.a.place(l, e), Place::Vram(_))).collect()
+        };
+        if need.len() > nst {
+            let st = self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging");
+            st.stats.fallbacks += 1;
+            return Ok(false);
+        }
+        let b = l % 2;
+        let fresh = {
+            let d = self.arena.as_ref().expect("arena");
+            let st = d.stage.as_ref().expect("staging");
+            st.layer[b] == l && st.gen[b] == d.a.generation() && need.iter().all(|e| st.content[b].contains(e))
+        };
+        {
+            let st = self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging");
+            st.stats.calls += 1;
+            if fresh {
+                st.stats.prefetch_used += 1;
+            } else {
+                st.stats.restaged += 1;
+            }
+        }
+        if !fresh {
+            self.stage_issue(l, b, need.clone())?;
+        }
+        let d = self.arena.as_mut().expect("arena");
+        let places = d.a.mark(l, &ids);
+        let st = d.stage.as_ref().expect("staging");
+        cuda::stream_wait_event(cuda::cur_stream(), st.ready[b]);
+        let mut table = vec![0u64; experts];
+        let mv = Moves { visits: ids.len() as u64, ..Moves::default() };
+        for (&e, &p) in ids.iter().zip(&places) {
+            table[e as usize] = match p {
+                Place::Vram(v) => arena_addr(&d.chunks, &self.pinned, vpl, ppl, 0, rb, Loc::Vram(v)),
+                _ => {
+                    st.bufs[b] + st.content[b].iter().position(|&x| x == e).expect("a selected staged id is in the buffer") as u64 * rb
+                }
+            };
+        }
+        cuda::to_u64_into(self.tables[l], &table);
+        let rows = sel.len() / self.topk;
+        run(0, rows, self.tables[l])?;
+        cuda::event_record(st.used[b], cuda::cur_stream());
+        self.moves[l].add(&mv);
+        self.routing_syncs += 1;
+        self.sub_batches += 1;
+        // the next MoE layer into the other buffer while this one computes
+        if l + 1 < nl {
+            let d = self.arena.as_ref().expect("arena");
+            let next: Vec<u32> = (0..experts as u32).filter(|&e| !matches!(d.a.place(l + 1, e), Place::Vram(_))).take(nst).collect();
+            self.stage_issue(l + 1, (l + 1) % 2, next)?;
+            self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging").stats.prefetched += 1;
+        }
+        Ok(true)
+    }
+
+    /// free the global arena's own device memory, streams and events
+    ///
+    /// # Safety
+    /// No launch reading the store is pending.
+    unsafe fn free_arena(&mut self) {
+        let Some(d) = self.arena.as_mut() else { return };
+        if let Some(mut r) = d.ring.take() {
+            r.free();
+        }
+        if let Some(mut st) = d.stage.take() {
+            cuda::stream_sync(st.stream);
+            for b in &mut st.bufs {
+                if *b != 0 {
+                    cuda::free_dev(b);
+                }
+            }
+            for e in st.ready.into_iter().chain(st.used) {
+                cuda::event_destroy(e);
+            }
+            cuda::stream_destroy(st.stream);
+        }
+        let flex = d.flex();
+        for c in flex {
+            if d.chunks[c] != 0 {
+                cuda::free_dev(&mut d.chunks[c]);
+            }
+        }
+        d.chunks.truncate(d.base_chunks);
+    }
+}
+
+#[cfg(test)]
+mod arena_tests {
+    //! `CROW_GLM_ARENA=global`: the host policy ([`GlobalArena`]), its execution ([`serve_global`])
+    //! on a memory twin, the switches, the ring book, and a replay on recorded routing (ignored).
+    use super::*;
+    use crate::expert_cache::Policy;
+
+    /// the xorshift64 trace of `docs/expert-cache.md` (`expert_cache` tests, the same generator in
+    /// Python): `k` distinct ascending ids per token per layer, a hot set drifting every 200 tokens
+    fn trace(tokens: usize, layers: usize, experts: u64, k: usize) -> Vec<Vec<Vec<u32>>> {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..tokens)
+            .map(|t| {
+                let base = (t as u64 / 200) * 16;
+                (0..layers as u64)
+                    .map(|l| {
+                        let mut got: Vec<u32> = Vec::with_capacity(k);
+                        while got.len() < k {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            let e = if (x >> 32) % 10 < 7 { (base + l * 7 + x % 48) % experts } else { (x >> 8) % experts } as u32;
+                            if !got.contains(&e) {
+                                got.push(e);
+                            }
+                        }
+                        got.sort_unstable();
+                        got
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn keys(a: &GlobalArena, p: impl Fn(Place) -> bool) -> Vec<(usize, u32)> {
+        (0..a.layers).flat_map(|l| (0..a.experts as u32).map(move |e| (l, e))).filter(|&(l, e)| p(a.place(l, e))).collect()
+    }
+
+    #[test]
+    fn the_arena_switch_defaults_to_the_per_layer_path() {
+        assert_eq!(arena_kind(None), Ok(ArenaKind::Layer));
+        assert_eq!(arena_kind(Some("")), Ok(ArenaKind::Layer));
+        assert_eq!(arena_kind(Some("layer")), Ok(ArenaKind::Layer));
+        assert_eq!(arena_kind(Some(" global ")), Ok(ArenaKind::Global));
+        for bad in ["Global", "1", "lru"] {
+            assert!(arena_kind(Some(bad)).unwrap_err().contains(ARENA_ENV), "{bad}");
+        }
+        let none = |_: &str| None;
+        assert_eq!(arena_config(&none).unwrap(), ArenaConfig::default());
+        assert_eq!(ArenaConfig::default(), ArenaConfig { admit_max: 64, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512 });
+        let set = |k: &str| match k {
+            ARENA_ADMIT_MAX_ENV => Some("16".to_string()),
+            ARENA_NOADMIT_ENV => Some("1".to_string()),
+            ARENA_WARM_ENV => Some("w.json".to_string()),
+            ARENA_VRING_ENV => Some("0".to_string()),
+            ARENA_ELASTIC_ENV => Some("10".to_string()),
+            ARENA_STAGE_ENV => Some("2.5".to_string()),
+            ARENA_STAGE_MIN_ENV => Some("256".to_string()),
+            _ => None,
+        };
+        let c = arena_config(&set).unwrap();
+        assert_eq!(c, ArenaConfig { admit_max: 16, noadmit: true, warm: Some("w.json".into()), vring: 0, elastic_bytes: 10 << 30, stage_bytes: 5 << 29, stage_min: 256 });
+        for (k, v) in [(ARENA_ADMIT_MAX_ENV, "x"), (ARENA_NOADMIT_ENV, "yes"), (ARENA_VRING_ENV, "-1"), (ARENA_ELASTIC_ENV, "nan"), (ARENA_STAGE_MIN_ENV, "0")] {
+            let one = |q: &str| (q == k).then(|| v.to_string());
+            assert!(arena_config(&one).unwrap_err().contains(k), "{k}={v}");
+        }
+    }
+
+    #[test]
+    fn admission_is_for_decode_sized_calls_only() {
+        assert!(arena_admits(8, false, 64));
+        assert!(arena_admits(64, false, 64));
+        assert!(!arena_admits(65, false, 64));
+        assert!(!arena_admits(8, true, 64), "a prompt call never admits");
+        assert!(!arena_admits(1, false, 0));
+    }
+
+    /// no quota per layer: one layer may hold every VRAM slot, the next layer's miss takes one
+    #[test]
+    fn one_layer_can_hold_every_vram_slot() {
+        let mut a = GlobalArena::new(3, 16, 4, 0).unwrap();
+        a.step(0, &[0, 1, 2, 3], true);
+        assert_eq!(keys(&a, |p| matches!(p, Place::Vram(_))), vec![(0, 0), (0, 1), (0, 2), (0, 3)]);
+        let ch = a.step(1, &[5], true);
+        // every bit set: the hand clears all four and takes slot 0 (expert 0 of layer 0)
+        assert_eq!(ch, vec![(0, Place::Vram(0), Place::Nvme), (16 + 5, Place::Nvme, Place::Vram(0))]);
+        a.check().unwrap();
+    }
+
+    /// a slot pinned by the call (a hit or an admission of the same call) is never a victim; with
+    /// none left the call's remaining misses are not admitted
+    #[test]
+    fn clock_never_evicts_a_slot_the_call_uses() {
+        let mut a = GlobalArena::new(1, 16, 2, 4).unwrap();
+        a.step(0, &[1, 2], true);
+        let ch = a.step(0, &[1, 3, 4], true);
+        assert_eq!(a.place(0, 1), Place::Vram(0), "the hit stays");
+        assert_eq!(a.place(0, 3), Place::Vram(1), "3 takes 2's slot");
+        assert_eq!(a.place(0, 2), Place::Ram(0), "the victim is written back to pinned");
+        assert_eq!(a.place(0, 4), Place::Ram(1), "no victim left: 4 lands in pinned, not admitted");
+        assert_eq!(a.stats.no_victim, 1);
+        assert_eq!(ch.len(), 3);
+        a.check().unwrap();
+    }
+
+    /// exclusive tiers: an admission frees the pinned copy, the VRAM victim is written back into
+    /// pinned as the most recent; the pinned LRU victim is the oldest expert the call does not route
+    #[test]
+    fn tiers_are_exclusive_and_victims_are_written_back() {
+        let mut a = GlobalArena::new(2, 8, 1, 2).unwrap();
+        a.step(0, &[0], true);
+        a.step(0, &[1], true);
+        assert_eq!((a.place(0, 0), a.place(0, 1)), (Place::Ram(0), Place::Vram(0)));
+        a.step(0, &[0], true);
+        assert_eq!((a.place(0, 0), a.place(0, 1)), (Place::Vram(0), Place::Ram(0)), "0 promoted, 1 written back into the freed slot");
+        a.step(1, &[3], true);
+        a.step(1, &[4], true);
+        // pinned holds 2: (0,1) is the oldest, written back slots are newest
+        let ram = keys(&a, |p| matches!(p, Place::Ram(_)));
+        assert_eq!(ram.len(), 2);
+        assert!(!ram.contains(&(0, 1)), "the oldest pinned expert dropped to the NVMe: {ram:?}");
+        assert_eq!(a.stats.ram_evictions, 1);
+        a.check().unwrap();
+        // protected: a call's own pinned expert is never the LRU victim
+        let mut b = GlobalArena::new(1, 8, 0, 1).unwrap();
+        b.step(0, &[1], false);
+        b.step(0, &[1, 2], false);
+        assert_eq!((b.place(0, 1), b.place(0, 2)), (Place::Ram(0), Place::Nvme), "2 cannot evict the call's own 1");
+    }
+
+    /// a prompt call (no admission) reads its misses where they lie: NVMe misses land in pinned,
+    /// VRAM is untouched
+    #[test]
+    fn a_call_without_admission_moves_nothing_into_vram() {
+        let mut a = GlobalArena::new(1, 16, 4, 8).unwrap();
+        a.step(0, &[0, 1], true);
+        let ch = a.step(0, &[0, 1, 2, 3, 4], false);
+        assert!(ch.iter().all(|c| c.2 != Place::Vram(2) && !matches!(c.2, Place::Vram(_))), "{ch:?}");
+        assert_eq!(keys(&a, |p| matches!(p, Place::Vram(_))), vec![(0, 0), (0, 1)]);
+        assert_eq!(keys(&a, |p| matches!(p, Place::Ram(_))), vec![(0, 2), (0, 3), (0, 4)]);
+    }
+
+    /// `NV_NOADMIT`: NVMe picks land in pinned, pinned hits are still admitted;
+    /// `zerocopy` (pin stay): pinned hits stay, NVMe picks are admitted
+    #[test]
+    fn noadmit_and_pinned_stays() {
+        let mut a = GlobalArena::new(1, 16, 4, 8).unwrap();
+        a.set_noadmit(true);
+        a.step(0, &[5], true);
+        assert_eq!(a.place(0, 5), Place::Ram(0));
+        a.step(0, &[5], true);
+        assert_eq!(a.place(0, 5), Place::Vram(0), "a pinned hit is admitted");
+        let mut b = GlobalArena::new(1, 16, 4, 8).unwrap();
+        b.step(0, &[5], false);
+        b.set_pin_stay(true);
+        b.step(0, &[5, 6], true);
+        assert_eq!((b.place(0, 5), b.place(0, 6)), (Place::Ram(0), Place::Vram(0)));
+    }
+
+    /// disabled slots (ring, a handed-back elastic chunk) are never victims; disabling writes the
+    /// owners back; enabling brings the slots back empty; reset keeps them disabled
+    #[test]
+    fn disabled_slots_are_never_used() {
+        let mut a = GlobalArena::new(1, 32, 4, 8).unwrap();
+        a.step(0, &[0, 1, 2, 3], true);
+        let ch = a.disable(2..4);
+        assert_eq!(ch, vec![(2, Place::Vram(2), Place::Ram(0)), (3, Place::Vram(3), Place::Ram(1))]);
+        assert_eq!(a.enabled_vram(), 2);
+        for t in 0..20u32 {
+            a.step(0, &[4 + t % 8], true);
+            assert!(keys(&a, |p| matches!(p, Place::Vram(2) | Place::Vram(3))).is_empty());
+        }
+        a.check().unwrap();
+        a.reset();
+        assert_eq!(a.enabled_vram(), 2, "reset keeps the disabled slots");
+        a.enable(2..4);
+        a.add_slots(2);
+        assert_eq!((a.enabled_vram(), a.vram_slots()), (6, 6));
+        a.step(0, &[0, 1, 2, 3, 4, 5], true);
+        assert_eq!(keys(&a, |p| matches!(p, Place::Vram(_))).len(), 6);
+        a.check().unwrap();
+    }
+
+    /// The VRAM hits of the global CLOCK arena are sybil's `ec_step_k` as `tools/glm_tier_sim.py`
+    /// `dyn_run(.., "clock", "global", 64)` replays it (its pinned tier does not change VRAM):
+    /// 600 tokens of the shared trace, 42 x 288 experts, top-8; the figures are the sim's.
+    #[test]
+    fn vram_hits_equal_glm_tier_sim_global_clock() {
+        let tr = trace(600, 42, 288, 8);
+        assert_eq!(&tr[0][0], &[6, 9, 31, 36, 42, 44, 45, 66], "the generator drifted from the Python one");
+        for (cv, cp, hits, admitted) in [(25 * 42, 83 * 42, 46_635u64, 154_965u64), (46 * 42, 124 * 42, 88_748, 112_852), (8 * 42, 0, 16_712, 184_888)] {
+            let mut a = GlobalArena::new(42, 288, cv, cp).unwrap();
+            for tok in &tr {
+                for (l, ids) in tok.iter().enumerate() {
+                    a.step(l, ids, arena_admits(ids.len(), false, 64));
+                }
+            }
+            let v: u64 = a.counters().iter().map(|c| c[0]).sum();
+            assert_eq!((v, a.stats.admitted), (hits, admitted), "V {cv} P {cp}");
+            a.check().unwrap();
+        }
+    }
+
+    #[test]
+    fn warm_plan_and_warm_files() {
+        let a = GlobalArena::new(2, 6, 4, 4).unwrap();
+        let s = vec![vec![0.0, 5.0, 1.0, 5.0, 3.0, 2.0], vec![]];
+        let (v, p) = a.warm_plan(&s);
+        assert_eq!(v, vec![vec![1, 3], vec![]], "top 2 by score, ties the lower id");
+        assert_eq!(p, vec![vec![4, 5], vec![]]);
+        let obj = r#"{"_source": "notes", "model.language_model.layers.3.mlp": [1,2,3], "4": [3,2,1]}"#;
+        assert_eq!(parse_warm(obj, 2, 3, 3).unwrap(), vec![vec![1.0, 2.0, 3.0], vec![3.0, 2.0, 1.0]]);
+        assert_eq!(parse_warm("[[1,2,3],[0,0,1]]", 2, 3, 3).unwrap()[1], vec![0.0, 0.0, 1.0]);
+        for bad in ["[[1,2,3]]", r#"{"9": [1,2,3]}"#, r#"{"3": [1,2]}"#, "nope"] {
+            assert!(parse_warm(bad, 2, 3, 3).unwrap_err().contains(ARENA_WARM_ENV), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_ring_book_reuses_landed_entries_and_waits_for_busy_ones() {
+        let mut b = RingBook::new(2);
+        let mut none = |_: usize| false;
+        assert_eq!(b.take(&mut none), (0, false));
+        b.q[0] = 7;
+        assert_eq!(b.take(&mut none), (1, false));
+        b.q[1] = 9;
+        assert_eq!(b.take(&mut none), (0, true), "both busy: the next one, after its D2H");
+        b.q[0] = 11;
+        assert_eq!(b.pending(9, &mut none), vec![1]);
+        assert_eq!(b.pending(9, &mut |r| r == 1), Vec::<usize>::new(), "landed: freed");
+        assert_eq!(b.q[1], NONE);
+        assert_eq!(b.take(&mut |_| false), (1, false));
+    }
+
+    /// The host twin of the device (as `tests::Sim`, over global slots): every slot holds the key
+    /// (`layer x experts + expert`) of the record in it; the container "reads" a record as its key.
+    struct GSim {
+        experts: usize,
+        layer: usize,
+        vram: Vec<u32>,
+        pinned: Vec<u32>,
+        stage: Vec<u32>,
+        landing: Vec<u32>,
+        pending_reads_pinned: Vec<u32>,
+        ops: Moves,
+    }
+
+    const EMPTY: u32 = u32::MAX - 1;
+
+    impl GSim {
+        fn new(experts: usize, vram: usize, pinned: usize, stage: usize) -> GSim {
+            GSim { experts, layer: 0, vram: vec![EMPTY; vram], pinned: vec![EMPTY; pinned], stage: vec![EMPTY; stage], landing: vec![EMPTY; stage], pending_reads_pinned: Vec::new(), ops: Moves::default() }
+        }
+    }
+
+    impl Mover for GSim {
+        fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
+            assert!(jobs.len() <= MAX_IN_FLIGHT);
+            for &(e, d) in jobs {
+                let key = (self.layer * self.experts) as u32 + e;
+                match d {
+                    Dst::Landing(i) => {
+                        self.landing[i as usize] = key;
+                        self.ops.nvme_to_landing += 1;
+                    }
+                    Dst::Pinned(q) => {
+                        assert!(!self.pending_reads_pinned.contains(&q), "NVMe wrote pinned slot {q} while a queued copy still reads it");
+                        self.pinned[q as usize] = key;
+                        self.ops.nvme_to_pinned += 1;
+                    }
+                }
+            }
+            Ok(jobs.len() as u64)
+        }
+        fn landing_to_stage(&mut self, i: u32) {
+            self.ops.landing_to_stage += 1;
+            self.stage[i as usize] = self.landing[i as usize];
+        }
+        fn pinned_to_stage(&mut self, q: u32, s: u32) {
+            self.ops.pinned_to_stage += 1;
+            self.pending_reads_pinned.push(q);
+            self.stage[s as usize] = self.pinned[q as usize];
+        }
+        fn vram_to_stage(&mut self, v: u32, s: u32) {
+            self.ops.vram_to_stage += 1;
+            self.stage[s as usize] = self.vram[v as usize];
+        }
+        fn barrier(&mut self) {
+            self.pending_reads_pinned.clear();
+        }
+        fn vram_to_pinned(&mut self, v: u32, q: u32) {
+            self.ops.vram_to_pinned += 1;
+            self.pinned[q as usize] = self.vram[v as usize];
+        }
+        fn stage_to_vram(&mut self, s: u32, v: u32) {
+            self.ops.stage_to_vram += 1;
+            self.vram[v as usize] = self.stage[s as usize];
+        }
+    }
+
+    fn holds(sim: &GSim, l: usize, e: u32, loc: Loc) -> bool {
+        let key = (l * sim.experts) as u32 + e;
+        key == match loc {
+            Loc::Vram(v) => sim.vram[v as usize],
+            Loc::Pinned(q) => sim.pinned[q as usize],
+            Loc::Stage(s) => sim.stage[s as usize],
+        }
+    }
+
+    /// Every call of a trace over three layers, at capacities from all-NVMe to roomy, with
+    /// admission on and off, `zerocopy`, NOADMIT and slots disabled and enabled on the way: every
+    /// selected id is read from a slot that holds its record, the locations come back for exactly
+    /// the selected ids in the order the per-layer path returns them, the twin saw the moves
+    /// `serve_global` counts, and the arena's invariants hold.
+    #[test]
+    fn every_location_holds_its_record() {
+        let (nl, ex, k) = (3usize, 24u64, 6usize);
+        let tr = trace(160, nl, ex, k);
+        for (v, p) in [(0, 0), (0, 9), (3, 0), (6, 6), (9, 30), (24, 12)] {
+            for variant in 0..4 {
+                let mut a = GlobalArena::new(nl, ex as usize, v, p).unwrap();
+                a.set_pin_stay(variant == 1);
+                a.set_noadmit(variant == 2);
+                let mut sim = GSim::new(ex as usize, v, p, 2 * k);
+                let mut cache = ExpertCache::new(Policy::Lru, Scope::PerLayer, nl, ex as usize, v / nl, p / nl).unwrap();
+                let mut slots: Vec<LayerSlots> = (0..nl).map(|_| LayerSlots::new(ex as usize, TierSizes { vram: v / nl, pinned: p / nl })).collect();
+                let mut psim = tests_sim_free::PSim::default();
+                for (t, tok) in tr.iter().enumerate() {
+                    if variant == 3 && v >= 6 && t == 60 {
+                        let ch = a.disable(v - 3..v);
+                        write_back(&ch, &mut sim).unwrap();
+                        sim.barrier();
+                    }
+                    if variant == 3 && v >= 6 && t == 120 {
+                        a.enable(v - 3..v);
+                    }
+                    for (l, ids) in tok.iter().enumerate() {
+                        let admit = arena_admits(ids.len() * if t % 7 == 3 { 20 } else { 1 }, false, 64);
+                        sim.layer = l;
+                        let before = sim.ops;
+                        let served = serve_global(&mut a, l, ids, admit, 2 * k, &mut sim).unwrap();
+                        sim.barrier();
+                        for &(e, loc) in &served.locs {
+                            assert!(holds(&sim, l, e, loc), "V {v} P {p} variant {variant} token {t} layer {l}: expert {e} at {loc:?}");
+                        }
+                        let ops = sim.ops.since(&before);
+                        let m = served.moves;
+                        assert_eq!(
+                            (ops.nvme_to_landing, ops.nvme_to_pinned, ops.landing_to_stage, ops.pinned_to_stage, ops.vram_to_stage, ops.vram_to_pinned, ops.stage_to_vram),
+                            (m.nvme_to_landing, m.nvme_to_pinned, m.landing_to_stage, m.pinned_to_stage, m.vram_to_stage, m.vram_to_pinned, m.stage_to_vram),
+                            "V {v} P {p} variant {variant} token {t} layer {l}: moves"
+                        );
+                        // ids identical: the per-layer path serves the same ids in the same order
+                        let per = serve(&mut cache, l, &mut slots[l], ids, 2 * k, &mut psim).unwrap();
+                        assert_eq!(per.locs.iter().map(|x| x.0).collect::<Vec<_>>(), served.locs.iter().map(|x| x.0).collect::<Vec<_>>());
+                        assert_eq!(served.locs.iter().map(|x| x.0).collect::<Vec<_>>(), *ids);
+                    }
+                    a.check().unwrap_or_else(|e| panic!("V {v} P {p} variant {variant} token {t}: {e}"));
+                }
+            }
+        }
+    }
+
+    mod tests_sim_free {
+        use super::super::*;
+        /// a mover that records nothing (the per-layer path's ids only)
+        #[derive(Default)]
+        pub struct PSim;
+        impl Mover for PSim {
+            fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
+                Ok(jobs.len() as u64)
+            }
+            fn landing_to_stage(&mut self, _: u32) {}
+            fn pinned_to_stage(&mut self, _: u32, _: u32) {}
+            fn vram_to_stage(&mut self, _: u32, _: u32) {}
+            fn barrier(&mut self) {}
+            fn vram_to_pinned(&mut self, _: u32, _: u32) {}
+            fn stage_to_vram(&mut self, _: u32, _: u32) {}
+        }
+    }
+
+    /// a prompt call through the global arena: row sub-batches that fit the staging slots, every
+    /// row's ids read from slots that hold them, nothing admitted
+    #[test]
+    fn a_prompt_call_is_served_in_sub_batches_without_admission() {
+        let (ex, k) = (32usize, 4usize);
+        let mut a = GlobalArena::new(2, ex, 4, 0).unwrap();
+        a.step(1, &[0, 1, 2, 3], true);
+        let mut sim = GSim::new(ex, 4, 0, 8);
+        sim.layer = 1;
+        // warm the twin's VRAM like the arena (the step above moved no bytes)
+        for e in 0..4u32 {
+            if let Place::Vram(v) = a.place(1, e) {
+                sim.vram[v as usize] = ex as u32 + e;
+            }
+        }
+        let sel: Vec<i32> = (0..8).flat_map(|r| (0..k as i32).map(move |j| (r * 3 + j * 5) % ex as i32)).collect();
+        let mut rows_seen = Vec::new();
+        let mut each = |r0: usize, rows: usize, s: &Served| -> Result<(), String> {
+            rows_seen.push((r0, rows));
+            assert_eq!(s.moves.n2v + s.moves.p2v, 0, "no admission in a prompt call");
+            Ok(())
+        };
+        let n = serve_chunk_global(&mut a, 1, &sel, k, 8, &mut sim, &mut each).unwrap();
+        assert!(n > 1, "the 8 rows do not fit 8 staging slots at once");
+        assert_eq!(rows_seen.iter().map(|x| x.1).sum::<usize>(), 8);
+        assert_eq!(keys(&a, |p| matches!(p, Place::Vram(_))), vec![(1, 0), (1, 1), (1, 2), (1, 3)]);
+        assert!(fitting_rows_global(&a, 1, &sel[..3], k, 8).unwrap_err().contains("no [rows]"));
+    }
+
+    /// the chunk mover addresses global slot `g` as slot `g % per` of chunk `g / per`
+    #[test]
+    fn the_chunk_mover_maps_global_slots_onto_the_chunks() {
+        #[derive(Default)]
+        struct Rec {
+            vram: Dev,
+            pinned: u64,
+            log: Vec<(&'static str, u64, u32, u64, u32)>,
+        }
+        impl Mover for Rec {
+            fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
+                for &(_, d) in jobs {
+                    if let Dst::Pinned(q) = d {
+                        self.log.push(("nvme", 0, 0, self.pinned, q));
+                    }
+                }
+                Ok(0)
+            }
+            fn landing_to_stage(&mut self, _: u32) {}
+            fn pinned_to_stage(&mut self, q: u32, _: u32) {
+                self.log.push(("p2s", 0, 0, self.pinned, q));
+            }
+            fn vram_to_stage(&mut self, v: u32, _: u32) {
+                self.log.push(("v2s", self.vram, v, 0, 0));
+            }
+            fn barrier(&mut self) {}
+            fn vram_to_pinned(&mut self, v: u32, q: u32) {
+                self.log.push(("v2p", self.vram, v, self.pinned, q));
+            }
+            fn stage_to_vram(&mut self, _: u32, v: u32) {
+                self.log.push(("s2v", self.vram, v, 0, 0));
+            }
+        }
+        impl<'a> Rebase<'a> for Rec {
+            fn set_vram(&mut self, base: Dev) {
+                self.vram = base;
+            }
+            fn set_pinned(&mut self, p: Option<&'a Pinned>) {
+                self.pinned = p.map_or(0, |p| p.dev);
+            }
+            fn stream(&self) -> sys::CUstream {
+                std::ptr::null_mut()
+            }
+        }
+        let pinned: Vec<Pinned> = (0..3).map(|i| { let mut p: Pinned = unsafe { std::mem::zeroed() }; p.dev = 1000 * (i + 1); p }).collect();
+        let vram = [10u64, 20, 30];
+        let mut m = ChunkMover { inner: Rec::default(), vram: &vram, pinned: &pinned, vpl: 4, ppl: 5, rb: 1, ring: None };
+        m.vram_to_pinned(9, 7);
+        m.stage_to_vram(0, 4);
+        m.pinned_to_stage(14, 0);
+        m.nvme(&[(1, Dst::Pinned(0)), (2, Dst::Pinned(12)), (3, Dst::Pinned(13))]).unwrap();
+        assert_eq!(
+            m.inner.log,
+            vec![("v2p", 30, 1, 2000, 2), ("s2v", 20, 0, 0, 0), ("p2s", 0, 0, 3000, 4), ("nvme", 0, 0, 1000, 0), ("nvme", 0, 0, 3000, 2), ("nvme", 0, 0, 3000, 3)]
+        );
+        std::mem::forget(pinned);
+    }
+
+    /// The replay of recorded routing (the held-out file of `tools/glm_tier_sim.py`, exported as
+    /// `routes.u16` `[n][42][8]` and `mask.u8` `[n]`, 1 = generated, into `$ARENA_REPLAY_DIR`):
+    /// token by token from an empty cache, the per-layer LRU of the path of record against the
+    /// global arena at the same slots (`$ARENA_REPLAY_SLOTS` = V:P per layer, default 46:124),
+    /// counted over the generated positions. `$ARENA_REPLAY_WARM` = a warm-start file for the arena.
+    #[test]
+    #[ignore = "needs exported routing: ARENA_REPLAY_DIR=<dir> cargo test --release --lib arena_replay -- --ignored --nocapture"]
+    fn arena_replay_on_recorded_routing() {
+        let dir = std::env::var("ARENA_REPLAY_DIR").expect("ARENA_REPLAY_DIR");
+        let r = std::fs::read(format!("{dir}/routes.u16")).unwrap();
+        let mask = std::fs::read(format!("{dir}/mask.u8")).unwrap();
+        let (nl, ex, k) = (42usize, 288usize, 8usize);
+        let n = mask.len();
+        assert_eq!(r.len(), n * nl * k * 2);
+        let id = |t: usize, l: usize, j: usize| u16::from_le_bytes([r[((t * nl + l) * k + j) * 2], r[((t * nl + l) * k + j) * 2 + 1]]) as u32;
+        let slots = std::env::var("ARENA_REPLAY_SLOTS").unwrap_or("46:124".into());
+        let (v, p) = slots.split_once(':').map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap())).unwrap();
+        let warm = std::env::var("ARENA_REPLAY_WARM").ok().map(|f| parse_warm(&std::fs::read_to_string(f).unwrap(), nl, 3, ex).unwrap());
+        let gen = mask.iter().filter(|&&m| m == 1).count() as f64;
+        let visits = gen * (nl * k) as f64;
+        let report = |name: &str, c: [u64; 3]| {
+            println!(
+                "{name:<40} VRAM hit {:6.2} %  VRAM hits/token {:6.1}  pinned/token {:6.1}  NVMe reads/token {:6.2}",
+                100.0 * c[0] as f64 / visits,
+                c[0] as f64 / gen,
+                c[1] as f64 / gen,
+                c[2] as f64 / gen
+            );
+        };
+        println!("replay: {n} positions, {gen} generated, V {v} P {p} per layer");
+        for stay in [false, true] {
+            let mut c = ExpertCache::new(Policy::Lru, Scope::PerLayer, nl, ex, v, p).unwrap();
+            c.set_pinned_stays(stay);
+            let mut tot = [0u64; 3];
+            for t in 0..n {
+                let before: [u64; 3] = c.counters().iter().fold([0; 3], |a, x| [a[0] + x[0], a[1] + x[1], a[2] + x[2]]);
+                for l in 0..nl {
+                    let ids: Vec<u32> = (0..k).map(|j| id(t, l, j)).collect();
+                    c.observe_token(l, &ids);
+                }
+                if mask[t] == 1 {
+                    let after: [u64; 3] = c.counters().iter().fold([0; 3], |a, x| [a[0] + x[0], a[1] + x[1], a[2] + x[2]]);
+                    (0..3).for_each(|i| tot[i] += after[i] - before[i]);
+                }
+            }
+            report(&format!("per-layer LRU {}", if stay { "zerocopy" } else { "promote" }), tot);
+        }
+        for (stay, noadmit, vring) in [(false, false, 0), (false, false, 24), (true, false, 24), (false, true, 24)] {
+            let mut a = GlobalArena::new(nl, ex, nl * v, nl * p).unwrap();
+            if vring > 0 {
+                a.disable(nl * v - vring..nl * v);
+            }
+            a.set_pin_stay(stay);
+            a.set_noadmit(noadmit);
+            if let Some(w) = &warm {
+                let (vr, pr) = a.warm_plan(w);
+                for l in 0..nl {
+                    a.step(l, &vr[l], true);
+                    a.step(l, &pr[l], false);
+                }
+                a.clear_counters();
+            }
+            let mut tot = [0u64; 3];
+            for t in 0..n {
+                let before: [u64; 3] = a.counters().iter().fold([0; 3], |a, x| [a[0] + x[0], a[1] + x[1], a[2] + x[2]]);
+                for l in 0..nl {
+                    let ids: Vec<u32> = (0..k).map(|j| id(t, l, j)).collect();
+                    a.step(l, &ids, arena_admits(k, false, 64));
+                }
+                if mask[t] == 1 {
+                    let after: [u64; 3] = a.counters().iter().fold([0; 3], |a, x| [a[0] + x[0], a[1] + x[1], a[2] + x[2]]);
+                    (0..3).for_each(|i| tot[i] += after[i] - before[i]);
+                }
+            }
+            a.check().unwrap();
+            report(&format!("global CLOCK{}{}{} ring {vring}", if stay { " zerocopy" } else { "" }, if noadmit { " noadmit" } else { "" }, if warm.is_some() { " warm" } else { "" }), tot);
+        }
+    }
+}
+
+#[cfg(test)]
+mod arena_gpu_tests {
+    //! `CROW_GLM_ARENA=global` on the device, on a synthetic container of three MoE layers x 16
+    //! experts (455 MB in the temp dir, about 1 GB VRAM). `#[ignore]`: CI has no GPU. Run with
+    //! `cargo test --release --lib glm5_arena_gpu -- --ignored --nocapture --test-threads 1`.
+    use super::*;
+
+    const REC: u64 = 9_474_048;
+
+    struct Synth {
+        dir: std::path::PathBuf,
+        path: String,
+    }
+
+    impl Drop for Synth {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// `layers` MoE layers (decoder layers 3..) of `experts` MUL1 records each, random bytes
+    fn synth(layers: u32, experts: u32) -> Synth {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("crow-glm5-arena-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("synth-arena.cnq");
+        let lead = 4084u64;
+        let mut tensors = vec![serde_json::json!({ "name": "model.language_model.layers.3.mlp.gate.weight", "section": "text",
+            "dtype": "bf16", "offset": 0, "n_values": lead / 2, "shape": [2, lead / 4] })];
+        for l in 0..layers {
+            for e in 0..experts {
+                for (k, p) in ["gate", "up", "down"].into_iter().enumerate() {
+                    tensors.push(serde_json::json!({ "name": crate::nvme_source::glm5_expert_tensor_name(3 + l, e, p), "section": "text", "dtype": "mul1",
+                        "offset": lead + (l * experts + e) as u64 * REC + k as u64 * (REC / 3), "n_values": 2048u64 * 4096, "shape": [2048, 4096] }));
+                }
+            }
+        }
+        let tail = lead + (layers * experts) as u64 * REC;
+        tensors.push(serde_json::json!({ "name": "model.language_model.norm.weight", "section": "text", "dtype": "bf16", "offset": tail, "n_values": 2048, "shape": [2048] }));
+        let sha = |s: &str| crate::cnq::sha256_hex(s.as_bytes());
+        let index = serde_json::json!({
+            "format": "crow-nest-quant", "format_version": 2, "blob_offset": 12, "recipe": "synthetic-glm5-arena",
+            "model": { "family": "Glm5Next", "model_type": "glm5_next_text", "config_json": "{}", "config_json_sha256": sha("{}"),
+                "generation_config_json": "{}", "generation_config_json_sha256": sha("{}"),
+                "source": { "repo": "crow-nest/synthetic-glm5-arena", "revision": "arena", "shards": [] }, "geo": {} },
+            "tensors": tensors
+        });
+        let ib = serde_json::to_vec(&index).unwrap();
+        let mut f = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&path).unwrap());
+        f.write_all(b"CNQ1\0\0\0\0\0\0\0\0").unwrap();
+        let mut x = 0x0A7E_4A5E_1D2C_3B4Fu64;
+        let mut chunk = vec![0u8; 1 << 20];
+        let mut left = tail + 4096;
+        while left > 0 {
+            for w in chunk.chunks_exact_mut(8) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                w.copy_from_slice(&x.to_le_bytes());
+            }
+            let n = left.min(chunk.len() as u64) as usize;
+            f.write_all(&chunk[..n]).unwrap();
+            left -= n as u64;
+        }
+        f.write_all(&ib).unwrap();
+        f.write_all(&(ib.len() as u64).to_le_bytes()).unwrap();
+        f.flush().unwrap();
+        Synth { dir, path: path.to_str().unwrap().to_string() }
+    }
+
+    /// set the arena's variables for one scope, the previous values back on drop
+    struct Env(Vec<(String, Option<String>)>);
+
+    impl Env {
+        fn set(kv: &[(&str, &str)]) -> Env {
+            let names = [ARENA_ENV, ARENA_ADMIT_MAX_ENV, ARENA_NOADMIT_ENV, ARENA_WARM_ENV, ARENA_VRING_ENV, ARENA_ELASTIC_ENV, ARENA_STAGE_ENV, ARENA_STAGE_MIN_ENV];
+            let old = names.iter().map(|n| (n.to_string(), std::env::var(n).ok())).collect();
+            for n in names {
+                std::env::remove_var(n);
+            }
+            for (k, v) in kv {
+                std::env::set_var(k, v);
+            }
+            Env(old)
+        }
+    }
+
+    impl Drop for Env {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// the xorshift routing of `tests::trace` (drifting hot set), `k` distinct ids per layer
+    fn routing(tokens: usize, layers: usize, experts: u64, k: usize, seed: u64) -> Vec<Vec<Vec<u32>>> {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ seed;
+        (0..tokens)
+            .map(|t| {
+                let base = (t as u64 / 10) * 3;
+                (0..layers as u64)
+                    .map(|l| {
+                        let mut got: Vec<u32> = Vec::with_capacity(k);
+                        while got.len() < k {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            let e = if (x >> 32) % 10 < 7 { (base + l * 5 + x % 9) % experts } else { (x >> 8) % experts } as u32;
+                            if !got.contains(&e) {
+                                got.push(e);
+                            }
+                        }
+                        got
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Every decode call (one row; every third call two rows, still admitting) and every prompt
+    /// call (sub-batches, and staged with the staging buffers and the elastic part) of a routing
+    /// trace over three MoE layers, under the arena's switches: each selected id's table entry
+    /// holds the bytes of its layer's record (`Cnq::read_range`), every other entry is 0.
+    #[test]
+    #[ignore = "needs the GPU (about 1 GB VRAM, a 455 MB synthetic container in the temp dir): cargo test --release --lib glm5_arena_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_arena_gpu_every_table_entry_holds_its_record() {
+        let (nl, ex) = (3usize, 16u32);
+        let s = synth(nl as u32, ex);
+        let mut g = Glm5Geo::GLM_5_3_FLASH;
+        (g.layers, g.dense_prefix, g.experts, g.topk) = (3 + nl, 3, ex as usize, 8);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let rb = spec.bytes as usize;
+        let want: Vec<Vec<Vec<u8>>> =
+            (0..nl).map(|l| (0..ex).map(|e| cnq.read_range(&cnq.find(&crate::nvme_source::glm5_expert_tensor_name(3 + l as u32, e, "gate"), "text").clone(), 0, rb)).collect()).collect();
+        let tr = routing(20, nl, ex as u64, 8, 0xA4E);
+        let warm = s.dir.join("warm.json");
+        std::fs::write(&warm, serde_json::to_string(&(0..nl).map(|l| (0..ex).map(|e| ((e as usize * 7 + l) % 16) as f64).collect::<Vec<_>>()).collect::<Vec<_>>()).unwrap()).unwrap();
+        let warm = warm.to_str().unwrap().to_string();
+        let stage_gb = format!("{}", 12.0 * REC as f64 / (1u64 << 30) as f64);
+        let elastic_gb = format!("{}", 2.0 * 3.0 * REC as f64 / (1u64 << 30) as f64);
+        let check = |what: &str, l: usize, tb: Dev, ids: &[u32]| unsafe {
+            cuda::sync();
+            let table = cuda::dtoh_u64(tb, ex as usize);
+            for e in 0..ex {
+                assert_eq!(table[e as usize] != 0, ids.contains(&e), "{what}: layer {l} table entry of expert {e}");
+                if ids.contains(&e) {
+                    let got: Vec<u8> = cuda::dtoh_t(table[e as usize], rb);
+                    assert!(got == want[l][e as usize], "{what}: layer {l} expert {e}: the bytes differ from read_range");
+                }
+            }
+        };
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let cases: Vec<(&str, Vec<(&str, &str)>, bool)> = vec![
+                ("plain", vec![(ARENA_VRING_ENV, "0")], false),
+                ("ring", vec![(ARENA_VRING_ENV, "2")], false),
+                ("ring+stager", vec![(ARENA_VRING_ENV, "2")], true),
+                ("noadmit+admit16", vec![(ARENA_VRING_ENV, "2"), (ARENA_NOADMIT_ENV, "1"), (ARENA_ADMIT_MAX_ENV, "16")], false),
+                ("warm", vec![(ARENA_VRING_ENV, "2"), (ARENA_WARM_ENV, &warm)], false),
+                ("stage", vec![(ARENA_VRING_ENV, "2"), (ARENA_STAGE_ENV, &stage_gb), (ARENA_STAGE_MIN_ENV, "16")], false),
+                ("stage+elastic", vec![(ARENA_VRING_ENV, "2"), (ARENA_STAGE_ENV, &stage_gb), (ARENA_STAGE_MIN_ENV, "16"), (ARENA_ELASTIC_ENV, &elastic_gb)], false),
+            ];
+            for (v, p) in [(0, 0), (2, 3), (3, 8), (6, 0)] {
+                for (name, kv, stager) in &cases {
+                    if v == 0 && *name != "plain" && !name.starts_with("stage") {
+                        continue;
+                    }
+                    let mut kv = kv.clone();
+                    kv.push((ARENA_ENV, "global"));
+                    let _env = Env::set(&kv);
+                    let what = format!("{name} V {v} P {p}");
+                    let sizes = TierSizes { vram: v, pinned: p };
+                    let mut t = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, 16).unwrap();
+                    assert_eq!(t.arena_kind(), ArenaKind::Global);
+                    if *stager {
+                        t.set_stager(true).unwrap();
+                    }
+                    if *name == "warm" && v > 0 {
+                        let a = t.arena().unwrap();
+                        assert!((0..nl).all(|l| (0..ex).any(|e| matches!(a.place(l, e), Place::Vram(_)))), "{what}: every layer warmed into VRAM");
+                    }
+                    for (i, tok) in tr.iter().enumerate() {
+                        for (l, ids) in tok.iter().enumerate() {
+                            // every third call two rows (16 picks), the second row the first reversed
+                            let mut sel: Vec<i32> = ids.iter().map(|&e| e as i32).collect();
+                            if i % 3 == 2 {
+                                sel.extend(ids.iter().rev().map(|&e| e as i32));
+                            }
+                            let (tb, served) = t.table_for(3 + l, &sel).unwrap();
+                            assert_eq!(served.moves.visits as usize, ids.len(), "{what}: visits");
+                            check(&what, l, tb, ids);
+                        }
+                        // every tenth token a prompt call of 4 rows per layer (32 picks: staged at 16)
+                        if i % 10 == 9 {
+                            for l in 0..nl {
+                                let rows: Vec<&Vec<u32>> = (0..4).map(|r| &tr[i - r][l]).collect();
+                                let sel: Vec<i32> = rows.iter().flat_map(|r| r.iter().map(|&e| e as i32)).collect();
+                                let mut calls = Vec::new();
+                                t.tables_for_chunk(3 + l, &sel, &mut |r0, n, tb| {
+                                    let mut ids: Vec<u32> = sel[r0 * 8..(r0 + n) * 8].iter().map(|&e| e as u32).collect();
+                                    ids.sort_unstable();
+                                    ids.dedup();
+                                    check(&what, l, tb, &ids);
+                                    calls.push(n);
+                                    Ok(())
+                                })
+                                .unwrap();
+                                assert_eq!(calls.iter().sum::<usize>(), 4, "{what}: every row served");
+                            }
+                        }
+                    }
+                    let a = t.arena().unwrap();
+                    a.check().unwrap();
+                    let tot: [u64; 3] = t.tier_counters().iter().fold([0; 3], |a, x| [a[0] + x[0], a[1] + x[1], a[2] + x[2]]);
+                    eprintln!(
+                        "glm5_arena synthetic {what}: accesses v/p/n {tot:?}, NVMe reads {}, ring {:?}, elastic {:?}, stage {:?}",
+                        t.nvme_reads,
+                        t.arena_ring_stats(),
+                        t.arena_elastic_stats(),
+                        t.arena_stage_stats()
+                    );
+                    if name.starts_with("stage") && v >= 6 {
+                        let st = t.arena_stage_stats().unwrap().0;
+                        assert!(st.calls > 0 && st.prefetch_used > 0, "{what}: staged calls ran, some on their prefetch: {st:?}");
+                    }
+                    t.reset_cache().unwrap();
+                    let sel: Vec<i32> = tr[0][0].iter().map(|&e| e as i32).collect();
+                    let (tb, served) = t.table_for(3, &sel).unwrap();
+                    assert_eq!(served.nvme_reads, tr[0][0].len(), "{what}: a reset arena reads the first selection from NVMe");
+                    check(&what, 0, tb, &tr[0][0]);
+                    t.free();
+                }
+            }
+        }
+        drop(cnq);
+    }
+}
+
 // ---------------------------------------------------------------- the device store
 
 /// a 4096-aligned host buffer (the NVMe landing of the staging slots; pageable, not pinned, so
@@ -789,6 +3300,8 @@ pub struct ExpertTiers {
     pub rb: u64,
     pub stage_cap: usize,
     slots: Vec<LayerSlots>,
+    /// `CROW_GLM_ARENA=global`: the global arena over the same slots (`None` = per layer)
+    arena: Option<ArenaDev>,
     vram: Vec<Dev>,
     pinned: Vec<Pinned>,
     tables: Vec<Dev>,
@@ -900,6 +3413,11 @@ impl ExpertTiers {
         let lane_threads = lane_threads(std::env::var(LANE_THREADS_ENV).ok().as_deref(), std::env::var(CPU_LANE_ENV).ok().as_deref())?;
         crate::glm5_moe::lane::THREADS.store(lane_threads, std::sync::atomic::Ordering::Relaxed);
         let cache = ExpertCache::new(policy, Scope::PerLayer, nl, g.experts, sizes.vram, sizes.pinned)?;
+        let arena = match arena_kind(std::env::var(ARENA_ENV).ok().as_deref())? {
+            ArenaKind::Layer => None,
+            ArenaKind::Global if pu.cpu_lane => return Err(arena_lane_refusal()),
+            ArenaKind::Global => Some(ArenaDev::new(GlobalArena::new(nl, g.experts, nl * sizes.vram, nl * sizes.pinned)?, arena_config(&|k| std::env::var(k).ok())?)),
+        };
         let records = ExpertRecord::glm5_table(cnq, &moe.record, &layers, g.experts as u32)?;
         let mut cfg = NvmeConfig::new(path);
         cfg.readers = readers;
@@ -922,6 +3440,7 @@ impl ExpertTiers {
             rb,
             stage_cap,
             slots: (0..nl).map(|_| LayerSlots::new(g.experts, sizes)).collect(),
+            arena,
             vram,
             pinned,
             tables,
@@ -946,6 +3465,9 @@ impl ExpertTiers {
             stager: None,
         };
         t.set_pinned_use(pu)?;
+        if t.arena.is_some() {
+            t.arena_boot()?;
+        }
         let env = |k: &str| std::env::var(k).ok();
         if stager_on(env(STAGER_ENV).as_deref(), env(glm5_flags::ENV_FLAGS).as_deref(), env(CPU_LANE_ENV).as_deref())? {
             t.set_stager(true)?;
@@ -974,7 +3496,7 @@ impl ExpertTiers {
     /// the VRAM bytes this store holds (arenas, staging, tables)
     pub fn vram_bytes(&self) -> u64 {
         let nl = self.slots.len() as u64;
-        nl * (self.sizes.vram as u64 * self.rb + self.cache.experts as u64 * 8) + (self.stage_cap + self.pf_cap) as u64 * self.rb
+        nl * (self.sizes.vram as u64 * self.rb + self.cache.experts as u64 * 8) + (self.stage_cap + self.pf_cap) as u64 * self.rb + self.arena_extra_vram_bytes()
     }
 
     /// The record table of decoder layer `layer` for the selection `sel` (`[t][topk]` i32):
@@ -986,6 +3508,9 @@ impl ExpertTiers {
     pub unsafe fn table_for(&mut self, layer: usize, sel: &[i32]) -> Result<(Dev, Served), String> {
         let l = layer.checked_sub(self.first_moe).filter(|&l| l < self.slots.len()).ok_or_else(|| format!("expert tiers: layer {layer} is no MoE layer"))?;
         let ids = distinct_ids(sel, self.cache.experts)?;
+        if self.arena.is_some() {
+            return self.table_global(l, sel, &ids);
+        }
         if self.stager.is_some() {
             return self.table_staged(l, &ids);
         }
@@ -1073,6 +3598,9 @@ impl ExpertTiers {
     /// staging set is pending; `run` queues on the current stream.
     pub unsafe fn tables_for_chunk(&mut self, layer: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<(), String> {
         let l = layer.checked_sub(self.first_moe).filter(|&l| l < self.slots.len()).ok_or_else(|| format!("expert tiers: layer {layer} is no MoE layer"))?;
+        if self.arena.is_some() {
+            return self.tables_for_chunk_global(l, sel, run);
+        }
         if self.pf_cap == 0 {
             self.alloc_prefill_stage(prefill_stage_slots(self.topk))?;
         }
@@ -1138,6 +3666,9 @@ impl ExpertTiers {
     /// `nvme_bytes` and `moves` keep counting; the cache's own counters restart at 0.
     pub fn reset_cache(&mut self) -> Result<(), String> {
         self.settle()?;
+        if let Some(a) = self.arena.as_mut() {
+            a.reset();
+        }
         reset_cache(&mut self.cache, &mut self.slots, self.sizes)
     }
 
@@ -1145,6 +3676,7 @@ impl ExpertTiers {
     /// No launch reading the store is pending.
     pub unsafe fn free(&mut self) {
         cuda::sync();
+        self.free_arena();
         if let Some(mut st) = self.stager.take() {
             st.free();
         }
@@ -1581,7 +4113,7 @@ struct RowBase {
 impl RowBase {
     fn of(t: &ExpertTiers) -> RowBase {
         RowBase {
-            counters: t.cache.counters().to_vec(),
+            counters: t.tier_counters().to_vec(),
             moves: t.moves.clone(),
             nvme_reads: t.nvme_reads,
             nvme_bytes: t.nvme_bytes,
@@ -1598,7 +4130,7 @@ impl RowBase {
             secs: t0.elapsed().as_secs_f64(),
             nvme_reads: t.nvme_reads - self.nvme_reads,
             nvme_bytes: t.nvme_bytes - self.nvme_bytes,
-            tiers: t.cache.counters().iter().zip(&self.counters).map(|(a, b)| [a[0] - b[0], a[1] - b[1], a[2] - b[2]]).collect(),
+            tiers: t.tier_counters().iter().zip(&self.counters).map(|(a, b)| [a[0] - b[0], a[1] - b[1], a[2] - b[2]]).collect(),
             moves: t.moves.iter().zip(&self.moves).map(|(a, b)| a.since(b)).collect(),
             rows: 1,
             routing_syncs: t.routing_syncs - self.routing_syncs,
