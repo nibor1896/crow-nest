@@ -427,7 +427,7 @@ pub fn mtp_overlay_check(
 
 /// The whole MTP block on the device: [`MtpWeights`] (vectors, eh_proj, the BF16 indexer and
 /// `kv_b`, router, shared expert, the 288 records) and the four NVFP4 MLA projections the codec
-/// hook ([`MtpBlock::call`]) runs on `gemv_fp4_b`, as the trunk's `glm5_model::MlaLayer` does.
+/// hook ([`MtpBlock::call`]) runs on `glm5_gemv_fp4` (#191), as the trunk's `glm5_model::MlaLayer` does.
 pub struct MtpBlock {
     /// `attn.q_a`, `attn.q_b`, `attn.kv_a`, `attn.o_proj` are 0: the hook runs them
     pub w: MtpWeights,
@@ -435,7 +435,8 @@ pub struct MtpBlock {
     pub q_b: GpuNvfp4,
     pub kv_a: GpuNvfp4,
     pub o: GpuNvfp4,
-    /// device i32 `[4]`: the `cols` of q_a, q_b, kv_a, o (the GEMV reads its k from the device)
+    /// device i32 `[8]`: the `cols`, then the `rows` of q_a, q_b, kv_a, o (the GEMV reads its k,
+    /// output stride and row count from the device)
     cols: Dev,
     /// bytes uploaded; scale bytes 0x7F rewritten; `kv_b` values BF16 does not hold exactly
     pub bytes: u64,
@@ -533,7 +534,7 @@ pub unsafe fn load_mtp(base: &mut Cnq, overlay: &mut Cnq, g: &Glm5Geo, moe: &Moe
     let (bytes, sanitized) = (ld.bytes, ld.sanitized);
     let (records, table) = load_mtp_records(base, g, moe);
     let i = |v: usize| i32::try_from(v).expect("glm5_mtp: GEMV k beyond i32");
-    let cols = cuda::to_i32_dev(&[i(q_a.cols), i(q_b.cols), i(kv_a.cols), i(o.cols)]);
+    let cols = cuda::to_i32_dev(&[i(q_a.cols), i(q_b.cols), i(kv_a.cols), i(o.cols), i(q_a.rows), i(q_b.rows), i(kv_a.rows), i(o.rows)]);
     Ok(MtpBlock {
         w: MtpWeights { enorm, hnorm, eh_proj, input_norm, post_norm, head_norm, attn, moe: moe_w, records, table },
         q_a,
@@ -548,14 +549,14 @@ pub unsafe fn load_mtp(base: &mut Cnq, overlay: &mut Cnq, g: &Glm5Geo, moe: &Moe
 }
 
 impl MtpBlock {
-    /// One [`MtpPass::call`] with the block's NVFP4 projections on `gemv_fp4_b` (the trunk's MLA
-    /// codec hook, `glm5_model` `fp4_gemv`); `taps` as [`MtpPass::call_tapped`].
+    /// One [`MtpPass::call`] with the block's NVFP4 projections on `glm5_gemv_fp4` (#191,
+    /// bit-identical to the record `gemv_fp4_b`; the trunk's MLA codec hook, `glm5_model`
+    /// `fp4_gemv`); `taps` as [`MtpPass::call_tapped`].
     ///
     /// # Safety
     /// As [`MtpPass::call`].
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn call(&self, pass: &mut MtpPass, kn: &Glm5Kernels, mk: &MtpKernels, e: Dev, h: Dev, pos0: usize, t: usize, zero_pos0: bool, taps: Option<&mut MtpTaps>) {
-        let gemv = kn.k.f("gemv_fp4_b");
         let mut proj = |s: &MlaScratch, p: MlaProj, xi: Dev, yo: Dev| {
             let (m, k) = match p {
                 MlaProj::QA => (&self.q_a, 0u64),
@@ -563,7 +564,10 @@ impl MtpBlock {
                 MlaProj::KVA => (&self.kv_a, 2),
                 MlaProj::O => (&self.o, 3),
             };
-            launch_v(gemv, m.rows as u32, s.t() as u32, 1, 256, &[m.w, xi, m.gs, yo, self.cols + 4 * k]);
+            // k from the device, output stride = row count (dense rows), row count
+            let (blocks, threads) = crate::kernels::glm5_moe::fp4_launch(m.rows, m.cols);
+            let rows = self.cols + 4 * (4 + k);
+            launch_v(kn.moe.fp4, blocks, s.t() as u32, 1, threads, &[m.w, xi, m.gs, yo, self.cols + 4 * k, rows, rows]);
         };
         pass.call_tapped(kn, mk, &self.w, e, h, pos0, t, zero_pos0, Some(&mut proj), taps);
     }
@@ -1024,7 +1028,7 @@ pub(crate) unsafe fn synthetic_block(g: &Glm5Geo, moe: &MoeGeo, seed: u64) -> Mt
         bases.push(base);
     }
     let i = |v: usize| v as i32;
-    let cols = cuda::to_i32_dev(&[i(q_a.cols), i(q_b.cols), i(kv_a.cols), i(o.cols)]);
+    let cols = cuda::to_i32_dev(&[i(q_a.cols), i(q_b.cols), i(kv_a.cols), i(o.cols), i(q_a.rows), i(q_b.rows), i(kv_a.rows), i(o.rows)]);
     MtpBlock {
         w: MtpWeights {
             enorm: norm(&mut r, h),
@@ -1046,6 +1050,77 @@ pub(crate) unsafe fn synthetic_block(g: &Glm5Geo, moe: &MoeGeo, seed: u64) -> Mt
         bytes: 0,
         sanitized: 0,
         kv_b_inexact: 0,
+    }
+}
+
+#[cfg(test)]
+mod spec_gpu_tests {
+    use super::*;
+
+    /// #191 for the block: `MtpBlock::call` (its NVFP4 projections on `glm5_gemv_fp4`) gives the
+    /// bits of the same call with the record kernel `gemv_fp4_b`, real shapes, a synthetic block,
+    /// 3 rows then 1 row. Run with
+    /// `cargo test --release --lib glm5_mtp_spec_gpu -- --ignored --nocapture --test-threads 1`.
+    #[test]
+    #[ignore = "needs the GPU (about 4 GB VRAM): cargo test --release --lib glm5_mtp_spec_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mtp_spec_gpu_block_gemv_is_the_record_kernel() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let moe = MoeGeo::new(&g, crate::geo::ExpertRecordSpec::new(crate::geo::ExpertCodec::Mul1, crate::cpu_mul1::GLM_RECORD_BYTES_K3 as u64).unwrap()).unwrap();
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Glm5Kernels::new(&g);
+            let mk = MtpKernels::new();
+            let mut blk = synthetic_block(&g, &moe, 0x0191);
+            let h = g.hidden;
+            let mut x = 0x5eedu64;
+            let mut rnd = |n: usize, a: f32| -> Vec<f32> {
+                (0..n)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        a * ((x >> 40) as f32 / (1u64 << 23) as f32 - 1.0)
+                    })
+                    .collect()
+            };
+            let (e, hv) = (cuda::to_f32_dev(&rnd(4 * h, 0.035)), cuda::to_f32_dev(&rnd(4 * h, 1.7)));
+            let gemv = kn.k.f("gemv_fp4_b");
+            let mut outs = Vec::new();
+            for record in [false, true] {
+                let mut pass = MtpPass::new(&g, moe, 3, 16);
+                let mut got = Vec::new();
+                for (p0, t) in [(0usize, 3usize), (3, 1)] {
+                    let (eo, ho) = (e + (p0 * h * 4) as u64, hv + (p0 * h * 4) as u64);
+                    if record {
+                        let cols = cuda::to_i32_dev(&[blk.q_a.cols as i32, blk.q_b.cols as i32, blk.kv_a.cols as i32, blk.o.cols as i32]);
+                        let b = &blk;
+                        let mut proj = |s: &MlaScratch, p: MlaProj, xi: Dev, yo: Dev| {
+                            let (m, k) = match p {
+                                MlaProj::QA => (&b.q_a, 0u64),
+                                MlaProj::QB => (&b.q_b, 1),
+                                MlaProj::KVA => (&b.kv_a, 2),
+                                MlaProj::O => (&b.o, 3),
+                            };
+                            launch_v(gemv, m.rows as u32, s.t() as u32, 1, 256, &[m.w, xi, m.gs, yo, cols + 4 * k]);
+                        };
+                        pass.call(&kn, &mk, &blk.w, eo, ho, p0, t, false, Some(&mut proj));
+                        cuda::sync();
+                        let mut c = cols;
+                        cuda::free_dev(&mut c);
+                    } else {
+                        blk.call(&mut pass, &kn, &mk, eo, ho, p0, t, false, None);
+                    }
+                    cuda::sync();
+                    got.extend(cuda::dtoh(pass.normed, t * h).into_iter().map(f32::to_bits));
+                }
+                pass.free();
+                outs.push(got);
+            }
+            let differ = outs[0].iter().zip(&outs[1]).filter(|(a, b)| a != b).count();
+            assert_eq!(differ, 0, "{differ} of {} head-norm values differ between glm5_gemv_fp4 and gemv_fp4_b", outs[0].len());
+            assert!(outs[0].iter().all(|&b| f32::from_bits(b).is_finite()));
+            blk.free();
+        }
     }
 }
 

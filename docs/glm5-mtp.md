@@ -144,17 +144,22 @@ On the GPU against the golden (which used the FP8 originals for these 25 tensors
 eh cosine 1.000000; head norm cosine mean 0.98395, min 0.96957; routing overlap 0.926; DSA selection 89 / 89
 identical; draft top-1 = golden draft on 79 / 89; draft = trunk's next on 57 / 89 (golden 55 / 89).
 
-## 6. Integration (not done here)
+## 6. Integration (#192)
 
-- A glm5 decode loop calls `MtpPass::call` once per verify with `h` = the trunk's `normed` rows of the
-  accepted positions and `e` = the embeddings of the next tokens; chained steps feed `normed` back as
-  `h` and, with `index_share_for_mtp_iteration`, would reuse step 0's selection (not built: the
-  selection buffers are `MlaScratch`'s and `glm5_mla` has no "skip the indexer" entry).
-- The Flash-Next / 27B speculative step (`gen.rs` `spec_step`, `MTP_VERIFY_MAX` 4, `load_mtp`) is the
-  pattern; the glm5 arm is the lead's wiring, as for the trunk (`glm5_model`).
-- The weights: `load_mtp(base, overlay)` -> `MtpBlock`; one step = `MtpBlock::call` then
-  `glm5_head::Head::lm_head` with the trunk's lm_head (as `glm5_mtp_block_on_the_overlay_matches_the_oracle_golden`).
-- `glm5_model.rs`, `bin/decode.rs`, `expert_cache.rs`, `nvme_source.rs`, `manager.rs` are unchanged.
+Built: the speculative decode `CROW_GLM_MTP=N` in `Glm5Run::generate` ([glm5-model.md](glm5-model.md)
+section 6.4: verify call, KDA rollback, counters, tests).
+
+- After each step the block runs once over the accepted rows with `h` = the verify's `normed` rows
+  and `e` = the embeddings of the accepted ids (the prompt likewise, in calls of `MTP_CHUNK` = 16
+  rows); its last row drafts. Chained drafts (N > 1) feed the block's own `normed` back as `h`;
+  `index_share_for_mtp_iteration` is not built (each chained row runs its own indexer: the selection
+  buffers are `MlaScratch`'s and `glm5_mla` has no "skip the indexer" entry). It changes drafts only.
+- The weights: `load_mtp(base, overlay)` -> `MtpBlock` (`Glm5Run::mtp_from_env`); one draft =
+  `MtpBlock::call` then `glm5_head::Head::lm_head` + argmax with the trunk's lm_head. The block's four
+  NVFP4 projections run on `glm5_gemv_fp4` (#191), bit-identical to `gemv_fp4_b`
+  (`glm5_mtp_spec_gpu_block_gemv_is_the_record_kernel`).
+- The block's 288 records sit in VRAM (2,728,525,824 B), outside the tiers; `glm5_run` plans the
+  tiers at free VRAM minus `spec_vram_bytes`.
 
 ## 7. The MTP experts' Hessian (not done here)
 

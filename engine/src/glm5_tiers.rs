@@ -991,7 +991,8 @@ impl Glm5Run {
         }
         let k = glm5_flags::Kernels::new(&self.g);
         if sw.flags {
-            self.pass.routed = Some(Routed::new(&k, self.pass.max_t * self.moe.topk));
+            // one decode row's ids (#192: a verify of more rows reads its ids by a sync)
+            self.pass.routed = Some(Routed::new(&k, self.moe.topk));
         }
         if sw.lookahead {
             self.feed = Some(Feed::load(&k, cnq, &self.g));
@@ -2366,5 +2367,247 @@ impl Glm5Run {
             d.push(id);
         }
         Ok(d)
+    }
+}
+
+#[cfg(test)]
+mod spec_tests {
+    //! #192 on the GPU: the synthetic 8-layer glm5_next model of the `glm5_graph` tests (layers
+    //! 0-2 KDA + dense, 3-7 MoE with 16 MUL1 experts, top-8, DSA at 3 and 7, vocab 2048) and a
+    //! synthetic MTP block. `#[ignore]`: CI has no GPU. Run with
+    //! `cargo test --release --lib glm5_mtp_spec_gpu -- --ignored --nocapture --test-threads 1`.
+    use super::*;
+    use crate::glm5_flags::tests::synth_model;
+    use crate::glm5_flags::Switches;
+    use crate::glm5_mtp::{self as mtp, SpecStats};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    const REC: u64 = 9_474_048;
+
+    fn geo() -> Glm5Geo {
+        let mut g = Glm5Geo::GLM_5_3_FLASH;
+        (g.layers, g.dense_prefix, g.experts, g.topk, g.vocab) = (8, 3, 16, 8, 2048);
+        g
+    }
+
+    fn hash(bs: &[Vec<u8>]) -> u64 {
+        let mut x = 0xcbf2_9ce4_8422_2325u64;
+        for b in bs {
+            for c in b.chunks_exact(8) {
+                x = (x ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        x
+    }
+
+    /// every KDA state's S and conv bytes, then every MLA cache's latent and indexer rows
+    /// `0 ..= last`
+    unsafe fn states(run: &Glm5Run, g: &Glm5Geo, last: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        cuda::sync();
+        let (kd, md) = (KdaDims::of(g), MlaDims::of(g));
+        let kda = run.kda_states().flat_map(|s| [cuda::dtoh_t::<u8>(s.s, kd.state_floats() * 4), cuda::dtoh_t::<u8>(s.conv, kd.conv_floats() * 4)]).collect();
+        let rows = last + 1;
+        let mla = run
+            .mla_caches()
+            .flat_map(|c| [cuda::dtoh_t::<u8>(c.latent, rows * md.latent_bytes_per_token() as usize), cuda::dtoh_t::<u8>(c.index, rows * md.indexer_bytes_per_token() as usize)])
+            .collect();
+        (kda, mla)
+    }
+
+    /// The counters a draft pattern must give: `ok(i)` = the draft that guesses generated id `i`
+    /// is right. `(stats, last valid row of every rollback)`
+    fn simulate(n_draft: usize, pn: usize, n: usize, cap: usize, ok: &dyn Fn(usize) -> bool) -> (SpecStats, Vec<usize>) {
+        let mut s = SpecStats { n: n_draft, hist: vec![0; n_draft + 1], ..SpecStats::default() };
+        let mut restores = Vec::new();
+        let (mut emitted, mut pos) = (1usize, pn);
+        while emitted < n {
+            let k = n_draft.min(n - emitted - 1).min(cap - pos - 1);
+            let mut a = 1;
+            while a <= k && ok(emitted + a - 1) {
+                a += 1;
+            }
+            s.steps += 1;
+            s.tokens += a as u64;
+            s.drafts += k as u64;
+            s.accepted += (a - 1) as u64;
+            s.verify_rows += (k + 1) as u64;
+            s.hist[a - 1] += 1;
+            if a < k + 1 {
+                s.kda_restore_steps += 1;
+                restores.push(pos + a - 1);
+            }
+            emitted += a;
+            pos += a;
+        }
+        (s, restores)
+    }
+
+    /// Lossless and rollback, `CROW_GLM_MTP` on the synthetic model: a 5-id prompt and 70 greedy
+    /// ids, V 3 + P 4 tiers (every kind of move), a fresh store and a fresh block per arm. Arms:
+    /// N = 1 / 2 / 3 with drafts forced right or wrong by a pattern (the draft hook), N = 2 with
+    /// every draft wrong, N = 1 with every draft right under `CROW_GLM_FLAGS` + `CROW_GLM_GRAPH`,
+    /// and N = 2 with the synthetic block's own drafts. Every arm gives the ids and every logit's
+    /// bits of the run without MTP; after every rollback the KDA states (S, conv) equal, bit for
+    /// bit, the states the one-row path has after the same row (`Glm5Run::row`, hashed per row);
+    /// at the end every KDA state and every MLA cache row `0 ..= last` equal the run without
+    /// MTP; the counters equal the host simulation of the pattern.
+    #[test]
+    #[ignore = "needs the GPU (about 3 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_mtp_spec_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mtp_spec_gpu_is_lossless() {
+        let g = geo();
+        let s = synth_model(&g, REC);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let prompt = [3i64, 17, 101, 999, 5];
+        let (pn, n) = (prompt.len(), 70usize);
+        let cap = pn + n;
+        let last = pn + n - 2;
+        let sizes = TierSizes { vram: 3, pinned: 4 };
+        let old = std::env::var(mtp::MTP_ENV).ok();
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            // the pass holds verify calls of 1 + 3 rows
+            std::env::set_var(mtp::MTP_ENV, "3");
+            let mut run = Glm5Run::load(&mut cnq, &g, &moe, cap, &mut |s| eprintln!("{s}"));
+            match &old {
+                Some(o) => std::env::set_var(mtp::MTP_ENV, o),
+                None => std::env::remove_var(mtp::MTP_ENV),
+            }
+            // the run without MTP, and the one-row door's KDA states after every row
+            let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, g.topk).unwrap();
+            let base = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |_| {}).unwrap();
+            let (kda0, mla0) = states(&run, &g, last);
+            tiers.free();
+            let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, g.topk).unwrap();
+            run.kda_states().for_each(|k| k.reset());
+            let mut row_hash: HashMap<usize, u64> = HashMap::new();
+            let mut door = Vec::new();
+            let mut tok = 0i64;
+            for pos in 0..=last {
+                let input = if pos < pn { prompt[pos] } else { tok };
+                if let Some(id) = run.row(&mut cnq, &mut tiers, input, pos, pos + 1 >= pn).unwrap() {
+                    tok = id;
+                    door.push(id);
+                }
+                row_hash.insert(pos, hash(&states(&run, &g, 0).0));
+            }
+            tiers.free();
+            assert_eq!(door, base.ids, "the one-row door gives generate's ids");
+            let finite = base.logits.iter().flatten().filter(|v| v.is_finite()).count();
+            assert_eq!(finite, n * g.vocab, "the synthetic model must stay finite for the comparison to mean something");
+            let gold = base.ids.clone();
+            let vocab = g.vocab as i64;
+            type Pat = fn(usize) -> bool;
+            let arms: Vec<(&str, usize, Option<Pat>, bool)> = vec![
+                ("N 1, right unless i % 3 == 2", 1, Some(|i| i % 3 != 2), false),
+                ("N 2, right unless i % 4 == 1", 2, Some(|i| i % 4 != 1), false),
+                ("N 3, right unless i % 5 == 3", 3, Some(|i| i % 5 != 3), false),
+                ("N 2, every draft wrong", 2, Some(|_| false), false),
+                ("N 1, every draft right, flags + graph", 1, Some(|_| true), true),
+                ("N 2, the block's own drafts", 2, None, false),
+            ];
+            for (seed, (name, nd, pat, sw)) in arms.into_iter().enumerate() {
+                let block = mtp::synthetic_block(&g, &moe, 0x0192_0000 + seed as u64);
+                run.set_mtp(nd, Some(block)).unwrap();
+                if let Some(p) = pat {
+                    let gold = gold.clone();
+                    run.set_mtp_hook(Some(Box::new(move |i, _| if p(i) { gold[i] } else { (gold[i] + 1) % vocab })));
+                }
+                let seen: Arc<Mutex<Vec<(usize, bool)>>> = Arc::default();
+                let rh = row_hash.clone();
+                let seen2 = seen.clone();
+                run.set_mtp_probe(Some(Box::new(move |row, b| seen2.lock().unwrap().push((row, rh.get(&row) == Some(&hash(b)))))));
+                if sw {
+                    run.set_graph(true);
+                    run.set_switches(&mut cnq, Switches { flags: true, lookahead: false });
+                }
+                let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, (1 + nd) * g.topk).unwrap();
+                let mut reps: Vec<TokenReport> = Vec::new();
+                let out = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |r| reps.push(r.clone())).unwrap();
+                tiers.free();
+                if sw {
+                    run.set_graph(false);
+                    run.set_switches(&mut cnq, Switches::default());
+                }
+                let st = run.mtp_stats().unwrap().clone();
+                eprintln!("glm5_mtp spec {name}: {st:?}");
+                assert_eq!(out.ids, base.ids, "{name}: ids");
+                let diff: Vec<usize> = out.logits.iter().zip(&base.logits).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()).collect();
+                assert!(out.logits.len() == n && diff.iter().all(|&d| d == 0), "{name}: logits differ in bits per generated id {diff:?}");
+                let (kda1, mla1) = states(&run, &g, last);
+                assert!(kda1 == kda0, "{name}: the KDA states at the end differ from the run without MTP");
+                assert!(mla1 == mla0, "{name}: the MLA cache rows 0..={last} differ from the run without MTP");
+                // one report per row and id; the decode reports carry the emitted ids in order
+                assert_eq!(reps.iter().map(|r| r.pos).collect::<Vec<_>>(), (0..=last).collect::<Vec<_>>(), "{name}: report positions");
+                assert_eq!(reps.iter().filter_map(|r| r.next).collect::<Vec<_>>(), base.ids, "{name}: report ids");
+                let seen = seen.lock().unwrap().clone();
+                assert!(seen.iter().all(|x| x.1), "{name}: KDA states after a rollback differ from the one-row path at rows {:?}", seen.iter().filter(|x| !x.1).map(|x| x.0).collect::<Vec<_>>());
+                assert_eq!(seen.len() as u64, st.kda_restore_steps, "{name}: probe calls = rollback steps");
+                assert_eq!((st.tokens, st.verify_rows, st.hist.iter().sum::<u64>()), ((n - 1) as u64, st.steps + st.drafts, st.steps), "{name}: counter identities");
+                assert_eq!(st.kda_snapshots, st.drafts * 6, "{name}: one snapshot per KDA layer (6) per draft row");
+                match pat {
+                    Some(p) => {
+                        let (want, restores) = simulate(nd, pn, n, cap, &|i| p(i));
+                        assert_eq!(
+                            (st.steps, st.tokens, st.drafts, st.accepted, st.verify_rows, st.hist.clone(), st.kda_restore_steps),
+                            (want.steps, want.tokens, want.drafts, want.accepted, want.verify_rows, want.hist.clone(), want.kda_restore_steps),
+                            "{name}: counters vs the simulation"
+                        );
+                        assert_eq!(seen.iter().map(|x| x.0).collect::<Vec<_>>(), restores, "{name}: rollback rows");
+                        assert!(want.drafts > 0, "{name}: the arm must draft");
+                    }
+                    None => assert!(st.drafts > 0 && st.accepted <= st.drafts, "{name}: {st:?}"),
+                }
+            }
+            run.set_mtp(0, None).unwrap();
+            run.free();
+        }
+        drop(cnq);
+    }
+
+    /// The CPU lane and too few staging slots are refused by name before any row runs; a model
+    /// loaded for one row refuses `set_mtp(2, ..)`.
+    #[test]
+    #[ignore = "needs the GPU (about 3 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_mtp_spec_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mtp_spec_gpu_refusals() {
+        let g = geo();
+        let s = synth_model(&g, REC);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let old_alloc = std::env::var("CROW_PINNED_ALLOC").ok();
+        std::env::set_var("CROW_PINNED_ALLOC", "host");
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            std::env::remove_var(mtp::MTP_ENV);
+            let mut run = Glm5Run::load(&mut cnq, &g, &moe, 16, &mut |s| eprintln!("{s}"));
+            let e = run.set_mtp(2, Some(mtp::synthetic_block(&g, &moe, 1))).unwrap_err();
+            assert!(e.starts_with("CROW_GLM_MTP=2: the model was loaded for 1 verify rows"), "{e}");
+            run.free();
+            std::env::set_var(mtp::MTP_ENV, "1");
+            let mut run = Glm5Run::load(&mut cnq, &g, &moe, 16, &mut |s| eprintln!("{s}"));
+            std::env::remove_var(mtp::MTP_ENV);
+            run.set_mtp(1, Some(mtp::synthetic_block(&g, &moe, 2))).unwrap();
+            let sizes = TierSizes { vram: 3, pinned: 4 };
+            let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, g.topk).unwrap();
+            let e = run.generate(&mut cnq, &mut tiers, &[3, 4], 4, false, &mut |_| {}).unwrap_err();
+            assert!(e.starts_with("CROW_GLM_MTP=1: the tiers hold 8 staging slots, a verify of 2 rows may stage 16"), "{e}");
+            tiers.free();
+            let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, 2 * g.topk).unwrap();
+            tiers.set_pinned_use(PinnedUse { stay: true, cpu_lane: true }).unwrap();
+            let e = run.generate(&mut cnq, &mut tiers, &[3, 4], 4, false, &mut |_| {}).unwrap_err();
+            assert!(e.starts_with("CROW_GLM_MTP=1 and CROW_GLM_CPU_LANE=1"), "{e}");
+            tiers.free();
+            run.set_mtp(0, None).unwrap();
+            assert_eq!(run.mtp_drafts(), 0);
+            run.free();
+        }
+        match old_alloc {
+            Some(o) => std::env::set_var("CROW_PINNED_ALLOC", o),
+            None => std::env::remove_var("CROW_PINNED_ALLOC"),
+        }
+        drop(cnq);
     }
 }

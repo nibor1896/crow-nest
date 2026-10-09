@@ -466,6 +466,68 @@ selection's 2,051 (`sel_max`), so the pool scores cannot exclude any; inferred, 
 (rows 0-269, score grid 0 to 3): 4 captures in the first, none in the second, ids and logits bit
 for bit as switch-off; red with one kept row (8 captures, 532 replays instead of 4, 536).
 
+### 6.4 Speculative decode with the MTP block (`CROW_GLM_MTP`, #192)
+
+Default off (unset or `0`): `generate` is the path above, bit for bit (the pass keeps `max_t` 1, the
+flags publisher one row's ids). `CROW_GLM_MTP=N` (1..=4) drafts N ids per step with the MTP block
+([glm5-mtp.md](glm5-mtp.md): the container's 288 MUL1 records + the overlay of `CROW_GLM_MTP_OVERLAY`,
+default `converter/GLM-5.3-Flash-MTP-overlay.cnq`) and verifies them in ONE trunk call over 1 + k rows
+(`Glm5Run::generate_spec`, `Glm5Pass::call_verify_with_experts`). `serve` (rows through
+`glm5_engine::Glm5Device`) does not use it.
+
+- **Lossless by construction.** Every verify row's logits are the one-row decode call's bits: mHC,
+  norms, dense FFN, router, MUL1 experts, shared expert, combine and head run over all rows with
+  kernels that compute each row on its own (block or grid y per row, MUL1 slots that never
+  interact); KDA runs the decode step row after row (the prompt path is another operation order);
+  MLA runs one one-row call per row (`attn_splits(t)` changes the split-K partition). A draft is
+  accepted while it equals the trunk's greedy id of the row before; the step emits the accepted
+  drafts plus the trunk's own next id. The router ids of all rows go to the tiers in one
+  `table_for` (the union is staged once; `glm5_run` gives the tiers `(1 + N) x top-k` staging slots).
+  Any launch change in `call_inner` must be mirrored in `call_verify_with_experts`; the GPU test
+  below compares the bits.
+- **Rollback.** KDA is recurrent: after verify row r < t - 1 the layer's state (S 4 MiB + conv
+  window 288 KiB) is copied into snapshot slot r (D2D); on a rejection every KDA state is copied
+  back from the slot of the last accepted row. GLM-5.3-Flash: 34 KDA layers x 4,489,216 B =
+  152,633,344 B (145.6 MiB) of VRAM per slot, N slots, that many bytes copied per draft row and per
+  restore (counted). Chosen over a second trunk pass for the accepted rows (the cost MTP saves) and
+  over buffering the drafts' q/k/v/g/beta to commit only accepted rows (KVBuffer, arXiv 2605.19049:
+  kernel work in `glm5_kda`). MLA / DSA latent and indexer rows, and the block's own cache rows, of
+  rejected positions need nothing: the caches are indexed by absolute position and a row is stored
+  before any later row reads it (pooled keys are recomputed from the rows).
+- **The block's rows.** Row `i` = (embed(t_{i+1}), the trunk's head-norm row `h_i`) at the block's
+  cache position `i` (SGLang pairing). The prompt rows run as in `generate` and each leaves its
+  head-norm row; the block catches up over the prompt in calls of 16 rows (time inside the prompt
+  rows' reports), its last row drafts the first step. After a step it runs once over the accepted
+  rows (true ids, the verify's head-norm rows); its last row drafts the next step; N > 1 chains the
+  block on its own `shared_head.norm` row (each chained row runs its own indexer: no
+  `index_share_for_mtp_iteration`; drafts only). Drafts per step: min(N, ids still wanted - 1,
+  cache rows left).
+- **Switches.** `CROW_GLM_GRAPH`: the prompt rows keep their graphs; the verify and the block run
+  uncaptured (another shape). `CROW_GLM_FLAGS`: one-row calls publish their ids; a verify of more
+  rows reads its ids by a sync. `CROW_GLM_LOOKAHEAD` does not apply under MTP. `CROW_GLM_CPU_LANE=1`
+  is refused by name (its experts have other bits than the verify's GPU kernels, so the ids could
+  differ from the run without MTP).
+- **Counters** (`Glm5Run::mtp_stats`, `glm5_run` line `decode MTP:` and JSON `decode.mtp` per rep):
+  steps, ids, drafts, accepted, acceptance rate, ids per step, verify rows, block rows, accepted
+  drafts per step (histogram), KDA snapshot and restore copies and GB per token. A step's clock is
+  shared by its ids (`secs` = step / ids); its tier counters sit on its first id. `glm5_run` plans
+  the tiers at free VRAM minus `glm5_mtp::spec_vram_bytes` (derived) and prints the measured VRAM
+  the block took next to it.
+
+Tests (`cargo test --release --lib glm5_mtp_spec_gpu -- --ignored --nocapture --test-threads 1`,
+2026-10-09, RTX 5090): `glm5_mtp_spec_gpu_is_lossless` on the synthetic 8-layer model of 6.3 plus
+a synthetic MTP block, 5 prompt + 70 generated ids, V 3 + P 4, six arms: N = 1 / 2 / 3 with drafts
+forced right or wrong by a pattern, N = 2 all wrong, N = 1 all right with `CROW_GLM_FLAGS` +
+`CROW_GLM_GRAPH`, N = 2 with the block's own drafts. Every arm: the ids and every logit's bits of
+the run without MTP; after each of the rollbacks (22, 17, 14, 68, 0, 67 per arm) the KDA states
+equal the one-row path's after the same row (hashed per row); at the end every KDA state and MLA
+cache row 0..=73 bit for bit; counters equal to a host simulation of the pattern (e.g. N = 3:
+28 steps, 79 drafts, 41 accepted, histogram [14, 0, 1, 13]). Red with the restore removed: ids
+diverge from generated id 6 (`[.., 189, 1016, 999, ..]` instead of `[.., 189, 894, 508, ..]`).
+`glm5_mtp_spec_gpu_refusals`: a model loaded for one row, too few staging slots, the CPU lane.
+`glm5_mtp_spec_gpu_block_gemv_is_the_record_kernel`: the block's NVFP4 projections on
+`glm5_gemv_fp4` (#191) give the bits of `gemv_fp4_b`.
+
 ## 7. Not verified
 
 - Whether the `--chain` drift (routing flips compounding f32 rounding over depth) is the size HF's own
@@ -479,6 +541,8 @@ for bit as switch-off; red with one kept row (8 captures, 532 replays instead of
 - The decode switches (section 6.2) on the real container: built, not run; no speed figure.
 - `CROW_GLM_GRAPH` (section 6.3) on the real container: not run (ids, launches per row, speed);
   a position past 2,051 tokens, where a stale `idx_scores` grid would change the selection: not run.
+- `CROW_GLM_MTP` (section 6.4) on the real container: not run (ids against the run without it,
+  acceptance, speed, the VRAM the block takes against `spec_vram_bytes`).
 - #188 `CROW_GLM_PINNED=zerocopy` and `CROW_GLM_CPU_LANE=1` on the real container: not run (speed,
   ids, G3 cosine); how far the CPU lane overlaps the GPU's experts, the idle pool workers' spin
   against the GPU host thread, and the GPU's zero-copy rate from a cacheable pinned tier on Windows:

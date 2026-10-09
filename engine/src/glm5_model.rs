@@ -1110,11 +1110,11 @@ impl Glm5Pass {
                 let cc = kn.kda.d.conv_ch();
                 let mut proj = |p: KdaProj, xi: Dev, yo: Dev, tt: usize| match p {
                     KdaProj::Qkv => {
-                        fp4_gemv(&kn.k, ints, &a.q, xi, yo, tt, Some(cc));
-                        fp4_gemv(&kn.k, ints, &a.k, xi, yo + (w * 4) as u64, tt, Some(cc));
-                        fp4_gemv(&kn.k, ints, &a.v, xi, yo + (2 * w * 4) as u64, tt, Some(cc));
+                        fp4_gemv(kn, ints, &a.q, xi, yo, tt, Some(cc));
+                        fp4_gemv(kn, ints, &a.k, xi, yo + (w * 4) as u64, tt, Some(cc));
+                        fp4_gemv(kn, ints, &a.v, xi, yo + (2 * w * 4) as u64, tt, Some(cc));
                     }
-                    KdaProj::O => fp4_gemv(&kn.k, ints, &a.o, xi, yo, tt, None),
+                    KdaProj::O => fp4_gemv(kn, ints, &a.o, xi, yo, tt, None),
                 };
                 for r in 0..t {
                     glm5_kda::step_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, row(self.collapsed, r), row(self.sub, r), &mut proj);
@@ -1132,7 +1132,7 @@ impl Glm5Pass {
                         MlaProj::KVA => &a.kv_a,
                         MlaProj::O => &a.o,
                     };
-                    fp4_gemv(&kn.k, ints, m, xi, yo, s.t(), None);
+                    fp4_gemv(kn, ints, m, xi, yo, s.t(), None);
                 };
                 for r in 0..t {
                     self.mla_sc.forward_with(&kn.mla, &a.w, &self.mla_c, row(self.collapsed, r), row(self.sub, r), pos0 + r, 1, &mut proj);
@@ -1156,7 +1156,9 @@ impl Glm5Pass {
                 }
                 let p = self.moe_plans.iter().find(|p| p.tokens == t).unwrap();
                 p.route(&self.kn.k, &self.kn.moe, w, self.collapsed);
-                let ids = router_ids(self.routed.as_mut(), p.ids, t * self.moe.topk, lw.layer)?;
+                // `CROW_GLM_FLAGS` publishes one row's ids; more rows read theirs by a sync
+                let routed = if t == 1 { self.routed.as_mut() } else { None };
+                let ids = router_ids(routed, p.ids, t * self.moe.topk, lw.layer)?;
                 let tb = experts(lw.layer, &ids)?;
                 p.experts(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub);
             }
