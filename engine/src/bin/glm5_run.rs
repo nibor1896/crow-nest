@@ -31,6 +31,12 @@
 //!   rows, routing syncs and sub-batches); its seconds are the call's, not a row's
 //! - `--json PATH`: every rep, both phases, per MoE layer, args, env, machine state (rewritten
 //!   after every rep)
+//! - #192 `CROW_GLM_MTP=N` (1..=4): speculative decode with the MTP block (the container's
+//!   section `mtp` + `CROW_GLM_MTP_OVERLAY`, default `converter/GLM-5.3-Flash-MTP-overlay.cnq`);
+//!   the plan runs at free VRAM minus the block's derived bytes, the tiers get `(1 + N) x top-k`
+//!   staging slots, every rep prints and records the MTP counters per decode token. A step's
+//!   clock is shared by the ids it emits (`secs` = step / ids), its tier counters sit on its
+//!   first id.
 //!
 //! Prints the plan, one line per row (row, phase, rep, greedy id, seconds, NVMe reads, the
 //! `[vram pinned nvme]` accesses of every MoE layer), then per rep the prefill and decode lines,
@@ -45,6 +51,7 @@
 use crow_nest_engine::cuda;
 use crow_nest_engine::geo::{from_engine_dir, HOST_PINNED_CAP};
 use crow_nest_engine::glm5_model::GLM5_MUL1K3_CNQ;
+use crow_nest_engine::glm5_mtp::{self as mtp, SpecStats};
 use crow_nest_engine::glm5_tiers::{self as gt, ExpertTiers, Glm5Run, Moves, TokenReport};
 use crow_nest_engine::manager::derive_host_pinned_budget;
 use serde_json::{json, Value};
@@ -240,6 +247,44 @@ fn counters_json(p: &Phase, rb: u64) -> Value {
         "prefetch": { "mode": "none", "issued": 0, "used": 0, "wasted": 0, "demand_misses_uncovered": p.nvme_reads,
                       "demand_misses_uncovered_per_token": p.nvme_reads as f64 / t },
     })
+}
+
+/// #192: the speculative decode's counters of one rep, per decode token (`tokens` = the ids the
+/// verify steps emitted = the decode phase's tokens)
+fn mtp_json(s: &SpecStats) -> Value {
+    let t = s.tokens.max(1) as f64;
+    let steps = s.steps.max(1) as f64;
+    json!({
+        "drafts_per_step_max": s.n, "steps": s.steps, "tokens": s.tokens, "drafts": s.drafts, "accepted": s.accepted,
+        "acceptance_rate": s.acceptance(), "tokens_per_step": s.tokens as f64 / steps,
+        "drafts_per_token": s.drafts as f64 / t, "accepted_per_token": s.accepted as f64 / t,
+        "verify_rows": s.verify_rows, "verify_rows_per_token": s.verify_rows as f64 / t,
+        "accepted_hist": s.hist, "mtp_rows": s.mtp_rows, "mtp_rows_per_token": s.mtp_rows as f64 / t,
+        "kda_snapshots": s.kda_snapshots, "kda_snapshot_gb_per_token": s.kda_snapshot_bytes as f64 / 1e9 / t,
+        "kda_restore_steps": s.kda_restore_steps, "kda_restores": s.kda_restores, "kda_restore_gb_per_token": s.kda_restore_bytes as f64 / 1e9 / t,
+    })
+}
+
+fn mtp_line(s: &SpecStats) -> String {
+    let c = mtp_json(s);
+    let f = |k: &str| c[k].as_f64().unwrap_or(0.0);
+    format!(
+        "N {}, steps {}, tokens/step {:.3}, drafts {} accepted {} (acceptance {}), per token: drafts {:.3} accepted {:.3} verify rows {:.3} MTP rows {:.3}, accepted per step {:?}, KDA snapshots {:.4} GB/token, restores {} steps ({:.4} GB/token)",
+        s.n,
+        s.steps,
+        f("tokens_per_step"),
+        s.drafts,
+        s.accepted,
+        s.acceptance().map_or("-".to_string(), |a| format!("{:.1} %", 100.0 * a)),
+        f("drafts_per_token"),
+        f("accepted_per_token"),
+        f("verify_rows_per_token"),
+        f("mtp_rows_per_token"),
+        s.hist,
+        f("kda_snapshot_gb_per_token"),
+        s.kda_restore_steps,
+        f("kda_restore_gb_per_token")
+    )
 }
 
 fn moves_json(m: &Moves) -> Value {
@@ -500,12 +545,19 @@ fn run(args: &[String]) -> Result<(), String> {
     let commit = commit();
     let exe = std::env::current_exe().ok();
     let exe_mtime = exe.as_ref().and_then(|p| std::fs::metadata(p).ok()).and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
+    // #192: CROW_GLM_MTP=N drafts per step (0 = off); its VRAM comes off the planner's free VRAM
+    let drafts = mtp::draft_rows_from_env()?;
+    let cap = prompt.len() + n;
     unsafe {
         let _ctx = cuda::Ctx::init();
         let free = cuda::free_vram_bytes();
+        let mtp_reserved = if drafts > 0 { mtp::spec_vram_bytes(&o.g, &o.moe, cap, drafts) } else { 0 };
+        if drafts > 0 {
+            println!("[glm5_run] {}={drafts}: the #159 plan runs at free VRAM minus {mtp_reserved} B (the MTP block, its caches, {drafts} KDA snapshot slots; derived)", mtp::MTP_ENV);
+        }
         let budget = derive_host_pinned_budget(HOST_PINNED_CAP, &mut |s| println!("{s}"));
         // #186: the prompt chunk Glm5Run::load takes (CROW_CHUNK, at most the run's rows), booked by the plan
-        let (_, input, plan) = gt::plan_for_rows(&o.g, context, prompt.len() + n, free, budget, o.spec.bytes)?;
+        let (_, input, plan) = gt::plan_for_rows(&o.g, context, prompt.len() + n, free.saturating_sub(mtp_reserved), budget, o.spec.bytes)?;
         let chunk = input.chunk;
         let sizes = gt::tier_sizes(&plan, num("--vram-slots")?, num("--pinned-slots")?)?;
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
@@ -533,12 +585,16 @@ fn run(args: &[String]) -> Result<(), String> {
         } else {
             println!("[glm5_run] #186 prompt chunk 1 (CROW_CHUNK unset or 1): every prompt row one decode call");
         }
-        let cap = prompt.len() + n;
+        if drafts > 0 && chunk > 1 {
+            println!("[glm5_run] {}={drafts}: the prompt rows run one by one (each leaves its head-norm row for the MTP block); CROW_CHUNK does not apply", mtp::MTP_ENV);
+        }
         let t_load = std::time::Instant::now();
         let mut run = Glm5Run::load(&mut o.cnq, &o.g, &o.moe, cap, &mut |s| println!("{s}"));
+        let mtp_n = run.mtp_from_env(&mut o.cnq, &mut |s| println!("{s}"))?;
         let load_s = t_load.elapsed().as_secs_f64();
         let t_tiers = std::time::Instant::now();
-        let mut tiers = ExpertTiers::new(&o.cnq, &o.path, &o.g, &o.moe, sizes, readers, o.g.topk)?;
+        // #192: a verify call stages the experts of 1 + N rows at once
+        let mut tiers = ExpertTiers::new(&o.cnq, &o.path, &o.g, &o.moe, sizes, readers, (1 + mtp_n) * o.g.topk)?;
         if run.prompt_chunk() > 1 {
             // #186: allocated here, so the first prompt call's clock does not hold it
             tiers.alloc_prefill_stage(gt::prefill_stage_slots(o.g.topk))?;
@@ -571,6 +627,7 @@ fn run(args: &[String]) -> Result<(), String> {
                        "prefill_staging_slots": tiers.prefill_cap() },
             "prompt_chunk": { "chunk": run.prompt_chunk(), "calls": gt::prompt_calls(prompt.len(), run.prompt_chunk()).iter().map(|c| c.1).collect::<Vec<_>>(), "plan_chunk_scratch_bytes": input.chunk_scratch_bytes },
             "setup": { "open_s": open_s, "load_s": load_s, "tiers_s": tiers_s },
+            "mtp": { "drafts_per_step": mtp_n, "planner_vram_reserved_bytes": mtp_reserved, "overlay": std::env::var(mtp::OVERLAY_ENV).ok() },
             "machine_after_setup": m_setup,
             "clocks": "row seconds: TokenReport::secs, row start to after the row's closing cuda::sync + greedy-id dtoh; ttft and phase wall: on entry of the report callback, after that sync; no sync added",
             "reps_detail": [],
@@ -650,6 +707,10 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{tag} decode counters per token: {}", counters_line(&dec, rb));
             println!("{tag} prefill layers: {}", layers_line(&pre, first_moe));
             println!("{tag} decode layers: {}", layers_line(&dec, first_moe));
+            let spec = run.mtp_stats().cloned();
+            if let Some(s) = &spec {
+                println!("{tag} decode MTP: {}", mtp_line(s));
+            }
             println!("{tag} wall {wall:.3} s (generate call)");
             let m_rep = machine(&tiers);
             println!("glm5_run machine after rep {rep}: {}", machine_line(&m_rep));
@@ -657,7 +718,8 @@ fn run(args: &[String]) -> Result<(), String> {
                 "rep": rep, "cache": state, "wall_s": wall, "ids": out.ids,
                 "prefill": { "timing": timing_json(&pre, Some(ttft)), "counters": counters_json(&pre, rb), "layers": layers_json(&pre, first_moe),
                              "reports": pre.reports, "routing_syncs": pre.routing_syncs, "sub_batches": pre.sub_batches },
-                "decode": { "timing": timing_json(&dec, None), "counters": counters_json(&dec, rb), "layers": layers_json(&dec, first_moe) },
+                "decode": { "timing": timing_json(&dec, None), "counters": counters_json(&dec, rb), "layers": layers_json(&dec, first_moe),
+                            "mtp": spec.as_ref().map(mtp_json) },
                 "rows": rows.iter().map(|x| json!({ "pos": x.r.pos, "prompt": x.r.prompt, "next": x.r.next, "secs": x.r.secs, "at_s": x.at,
                     "nvme_reads": x.r.nvme_reads, "nvme_bytes": x.r.nvme_bytes, "rows": x.r.rows, "routing_syncs": x.r.routing_syncs, "sub_batches": x.r.sub_batches })).collect::<Vec<_>>(),
                 "machine": m_rep,
@@ -901,6 +963,36 @@ mod tests {
         assert_eq!(parse_ids("[1, 2,3]\n4 5\r\n").unwrap(), vec![1, 2, 3, 4, 5]);
         assert!(parse_ids("1, x").unwrap_err().contains("\"x\" is not a token id"));
         assert!(parse_ids(" \n").is_err());
+    }
+
+    /// #192: the MTP counters per decode token: 10 ids from 6 steps of N = 2 (12 drafts, 4
+    /// accepted), 3 rejected steps restored
+    #[test]
+    fn the_mtp_counters_are_per_decode_token() {
+        let s = SpecStats {
+            n: 2,
+            steps: 6,
+            tokens: 10,
+            drafts: 12,
+            accepted: 4,
+            verify_rows: 18,
+            hist: vec![3, 1, 1],
+            mtp_rows: 20,
+            kda_snapshots: 12 * 34,
+            kda_snapshot_bytes: 12 * 1_000_000_000,
+            kda_restore_steps: 4,
+            kda_restores: 4 * 34,
+            kda_restore_bytes: 4 * 1_000_000_000,
+        };
+        let j = mtp_json(&s);
+        assert_eq!(j["acceptance_rate"].as_f64(), Some(4.0 / 12.0));
+        assert_eq!(j["tokens_per_step"].as_f64(), Some(10.0 / 6.0));
+        assert_eq!((j["drafts_per_token"].as_f64(), j["verify_rows_per_token"].as_f64()), (Some(1.2), Some(1.8)));
+        assert_eq!((j["kda_snapshot_gb_per_token"].as_f64(), j["kda_restore_gb_per_token"].as_f64()), (Some(1.2), Some(0.4)));
+        assert_eq!(j["accepted_hist"], json!([3, 1, 1]));
+        let l = mtp_line(&s);
+        assert!(l.starts_with("N 2, steps 6, tokens/step 1.667, drafts 12 accepted 4 (acceptance 33.3 %), per token: drafts 1.200 accepted 0.400 verify rows 1.800"), "{l}");
+        assert!(mtp_line(&SpecStats::default()).contains("(acceptance -)"));
     }
 
     #[test]
