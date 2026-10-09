@@ -158,6 +158,38 @@ pub fn lane_combos(sel: &[i32], locs: &[(u32, Loc)], gpu_base: impl Fn(u32, Loc)
     (combos, n)
 }
 
+// ---------------------------------------------------------------- #149 path B: the stager switch
+
+/// `1` = the stager ([`ExpertTiers::set_stager`]); unset / anything else = off (default)
+pub const STAGER_ENV: &str = "CROW_GLM_STAGER";
+
+/// Parse `CROW_GLM_STAGER` (`stager`) against the switches it depends on: `1` turns it on (the
+/// repo's `CROW_*` rule), and then it needs `CROW_GLM_FLAGS=1` (`flags`: the host takes a layer's
+/// ids from the router's flag, not from a stream sync that would wait for the stager's copies
+/// anyway) and refuses `CROW_GLM_CPU_LANE=1` (`lane`: the CPU reads the pinned records on the
+/// host at launch time, before a landed flag could hold it back). Both refusals by name.
+pub fn stager_on(stager: Option<&str>, flags: Option<&str>, lane: Option<&str>) -> Result<bool, String> {
+    if stager != Some("1") {
+        return Ok(false);
+    }
+    if flags != Some("1") {
+        return Err(format!("{STAGER_ENV}=1 needs {}=1: the stager replaces the host's waits inside a MoE layer, the router's flag is the one wait it keeps", glm5_flags::ENV_FLAGS));
+    }
+    if lane.map(str::trim) == Some("1") {
+        return Err(format!("{STAGER_ENV}=1 and {CPU_LANE_ENV}=1: the CPU lane reads pinned records on the host while the experts launch, before the stager's records have landed; turn one of them off"));
+    }
+    Ok(true)
+}
+
+/// #149 path B: the pinned bytes the stager holds for `moe_layers` x `experts` with `stage_cap`
+/// staging slots of `record_bytes`: the landing (one record per staging slot) plus the table rows
+/// and the landed flags (`[moe_layers][experts]` u64 each, rounded up to 4096 B). GLM-5.3-Flash,
+/// 3-bit record, top-8: 75,792,384 + 2 x 98,304 = 75,988,992 B. [`plan_for_rows`] takes it off the
+/// pinned budget when the stager is on.
+pub fn stager_pinned_bytes(moe_layers: usize, experts: usize, stage_cap: usize, record_bytes: u64) -> u64 {
+    stage_cap as u64 * record_bytes + 2 * (moe_layers * experts * 8).next_multiple_of(4096) as u64
+}
+
 // ---------------------------------------------------------------- slots and the mover (host)
 
 /// Where a selected record is read from in this call.
@@ -576,6 +608,10 @@ pub fn prompt_chunk_from_env() -> usize {
 /// plan of `glm5_run` and of serve's boot (`glm5_engine::serve_plan`), so both book the same memory.
 pub fn plan_for_rows(g: &Glm5Geo, context: usize, rows: usize, vram_total: u64, pinned_budget: u64, record_bytes: u64) -> Result<(crate::manager::Glm5States, crate::manager::TierInput, TierPlan), String> {
     let chunk = prompt_chunk_from_env().clamp(1, rows.max(1));
+    // #149 path B: the stager's pinned blocks come off the pinned budget (as #186's prefill landing)
+    let env = |k: &str| std::env::var(k).ok();
+    let stager = stager_on(env(STAGER_ENV).as_deref(), env(glm5_flags::ENV_FLAGS).as_deref(), env(CPU_LANE_ENV).as_deref())?;
+    let pinned_budget = if stager { pinned_budget.saturating_sub(stager_pinned_bytes(g.moe_layers(), g.experts, g.topk, record_bytes)) } else { pinned_budget };
     crate::manager::plan_glm5_next_chunk(g, context, vram_total, pinned_budget, crate::geo::GLM5_NEXT_DENSE_BYTES, record_bytes, crate::gen::pf_tg(), crate::gen::pf_async_on(), chunk)
 }
 
@@ -656,6 +692,8 @@ pub struct ExpertTiers {
     pinned_wc: bool,
     topk: usize,
     lane_clock: std::sync::Arc<crate::glm5_moe::lane::Clock>,
+    /// #149 path B (`CROW_GLM_STAGER=1`): the stager stream and its pinned sources (`None` = off)
+    stager: Option<Stager>,
 }
 
 struct GpuMover<'a> {
@@ -772,8 +810,13 @@ impl ExpertTiers {
             pinned_wc,
             topk: g.topk,
             lane_clock: Default::default(),
+            stager: None,
         };
         t.set_pinned_use(pu)?;
+        let env = |k: &str| std::env::var(k).ok();
+        if stager_on(env(STAGER_ENV).as_deref(), env(glm5_flags::ENV_FLAGS).as_deref(), env(CPU_LANE_ENV).as_deref())? {
+            t.set_stager(true)?;
+        }
         Ok(t)
     }
 
@@ -782,6 +825,9 @@ impl ExpertTiers {
     /// write-combined pinned arena. Changes no slot and no record.
     pub fn set_pinned_use(&mut self, u: PinnedUse) -> Result<(), String> {
         lane_on_wc(u, self.pinned_wc)?;
+        if u.cpu_lane && self.stager.is_some() {
+            stager_on(Some("1"), Some("1"), Some("1"))?;
+        }
         self.cache.set_pinned_stays(u.stay);
         self.pinned_use = u;
         Ok(())
@@ -789,7 +835,7 @@ impl ExpertTiers {
 
     /// the pinned bytes this store holds
     pub fn pinned_bytes(&self) -> u64 {
-        self.pinned.iter().map(|p| p.bytes as u64).sum()
+        self.pinned.iter().map(|p| p.bytes as u64).sum::<u64>() + self.stager.as_ref().map_or(0, |st| st.pinned_bytes())
     }
 
     /// the VRAM bytes this store holds (arenas, staging, tables)
@@ -807,6 +853,9 @@ impl ExpertTiers {
     pub unsafe fn table_for(&mut self, layer: usize, sel: &[i32]) -> Result<(Dev, Served), String> {
         let l = layer.checked_sub(self.first_moe).filter(|&l| l < self.slots.len()).ok_or_else(|| format!("expert tiers: layer {layer} is no MoE layer"))?;
         let ids = distinct_ids(sel, self.cache.experts)?;
+        if self.stager.is_some() {
+            return self.table_staged(l, &ids);
+        }
         let rb = self.rb;
         let mut m = GpuMover {
             vram: self.vram[l],
@@ -884,6 +933,9 @@ impl ExpertTiers {
         if self.pf_cap == 0 {
             self.alloc_prefill_stage(prefill_stage_slots(self.topk))?;
         }
+        // #149 path B: the stager's reads of earlier decode calls (landed long ago: this call's
+        // routing synchronized the stream past their experts) report their errors here
+        self.settle()?;
         // a CPU-lane post belongs to a decode call: none for this call's tables
         crate::glm5_moe::lane::post(None);
         let (rb, k, experts) = (self.rb, self.topk, self.cache.experts);
@@ -929,6 +981,7 @@ impl ExpertTiers {
     /// [`reset_cache`]). The arenas stay allocated; no allocation, no GPU call. `nvme_reads`,
     /// `nvme_bytes` and `moves` keep counting; the cache's own counters restart at 0.
     pub fn reset_cache(&mut self) -> Result<(), String> {
+        self.settle()?;
         reset_cache(&mut self.cache, &mut self.slots, self.sizes)
     }
 
@@ -936,6 +989,9 @@ impl ExpertTiers {
     /// No launch reading the store is pending.
     pub unsafe fn free(&mut self) {
         cuda::sync();
+        if let Some(mut st) = self.stager.take() {
+            st.free();
+        }
         for d in self.vram.iter_mut().chain(self.tables.iter_mut()) {
             cuda::free_dev(d);
         }
@@ -945,6 +1001,313 @@ impl ExpertTiers {
         cuda::free_dev(&mut self.stage);
         cuda::free_dev(&mut self.pf_stage);
         self.pf_cap = 0;
+    }
+}
+
+// ---------------------------------------------------------------- #149 path B: the stager
+
+/// `CU_STREAM_WAIT_VALUE_GEQ`: the cyclic greater-or-equal (the flags are monotonic sequences)
+const WAIT_GEQ: u32 = 0;
+
+/// #149 path B, the landed half (`CROW_GLM_STAGER=1`): what [`ExpertTiers::table_for`] moves
+/// records with instead of the synchronous [`GpuMover`].
+///
+/// - **One stager stream** (non-blocking): every copy of [`serve`]'s phases A-C and the record
+///   table's upload are queued there, in `serve`'s order; nothing synchronizes it per call.
+/// - **Persistent pinned sources**: the NVMe landing of the staging slots is pinned (the H2D is a
+///   true async DMA, no pageable bounce), and each MoE layer's record table is written into its
+///   own row of a pinned `[layers][experts]` u64 block and uploaded from there.
+/// - **Landed flags**: one u64 per (MoE layer, expert) in mapped pinned memory. An NVMe read is
+///   issued with [`NvmeSource::fetch_landed`]; the reader raises the record's flag to the call's
+///   sequence number after the bytes are in. The stager stream waits on it
+///   (`cuStreamWaitValue64_v2`, GEQ) before any copy behind it; the host does not wait.
+/// - **The compute stream** waits for the stager's batch through an event (`cuEventRecord` on the
+///   stager, `cuStreamWaitEvent` on the current stream) before the layer's experts. The driver
+///   API says ordering through a stream memop "is not visible to CUDA" and that CUDA tasks it
+///   orders should also have that order expressed with CUDA-visible dependencies such as events
+///   (CUDA Driver API, Stream Memory Operations, `cuStreamWaitValue64`), so the memop waits stay on
+///   the stager (host-raised flags only) and the stream-to-stream order is an event.
+///
+/// Why no host wait is needed per call (the argument the synchronous path's syncs made): the host
+/// enters a call of MoE layer l only after the router flag of l (`CROW_GLM_FLAGS`), and the
+/// compute stream is in order, so every earlier call's experts have run, and with them (they
+/// waited on its event) every earlier stager batch, its landed flags and its reads. So the
+/// staging slots, the landing buffer, the layer's VRAM / pinned slots, its device table and its
+/// pinned table row are free to be rewritten. The one exception is inside a call: an NVMe read
+/// straight into a pinned slot that this call's phase A still copies from (the slot of an expert
+/// promoted to VRAM): the host synchronizes the stager stream first (`gate_syncs`). Under LRU that
+/// needs an NVMe miss that loses VRAM to another pick of the same call, i.e. more picks than VRAM
+/// slots (the synthetic V 3 / top-8 test: 15 of 50 calls); with the plan's 46 VRAM slots an older
+/// victim always exists (derived, not measured).
+struct Stager {
+    stream: sys::CUstream,
+    event: sys::CUevent,
+    /// `stage_cap` records: the NVMe landing of the decode staging slots
+    landing: Pinned,
+    /// `[MoE layers][experts]` u64: the host side of every layer's record table
+    tables: Pinned,
+    /// `[MoE layers][experts]` u64: the landed flags (sequence of the call that read the record)
+    landed: Pinned,
+    /// the last call's sequence number (0 = none yet)
+    seq: u64,
+    /// the NVMe tickets of earlier calls, drained at the next call, [`ExpertTiers::settle`] or free
+    pending: Vec<crate::nvme_source::Ticket>,
+    stats: StagerStats,
+}
+
+/// #149 path B: host-side counts of the stager since it was turned on
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StagerStats {
+    /// decode calls served through the stager
+    pub calls: u64,
+    /// NVMe records read with a landed flag (the stager stream waits on each)
+    pub landed_reads: u64,
+    /// host syncs of the stager stream before an NVMe read into a pinned slot phase A still reads
+    pub gate_syncs: u64,
+}
+
+impl Stager {
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn new(layers: usize, experts: usize, stage_cap: usize, rb: u64) -> Result<Stager, String> {
+        let mut dev: sys::CUdevice = 0;
+        cuda::ck(sys::cuCtxGetDevice(&mut dev));
+        let mut ok = 0i32;
+        cuda::ck(sys::cuDeviceGetAttribute(&mut ok, sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS, dev));
+        if ok == 0 {
+            return Err(format!(
+                "{STAGER_ENV}=1: this device has no 64-bit stream memory operations (CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS = 0); the landed flags need cuStreamWaitValue64"
+            ));
+        }
+        let words = (layers * experts * 8).next_multiple_of(4096);
+        let st = Stager {
+            stream: cuda::stream_create_non_blocking(),
+            event: cuda::event_create(),
+            landing: Pinned::alloc(stage_cap * rb as usize),
+            tables: Pinned::alloc(words),
+            landed: Pinned::alloc(words),
+            seq: 0,
+            pending: Vec::new(),
+            stats: StagerStats::default(),
+        };
+        std::ptr::write_bytes(st.tables.host as *mut u8, 0, st.tables.bytes);
+        std::ptr::write_bytes(st.landed.host as *mut u8, 0, st.landed.bytes);
+        assert_eq!(st.pinned_bytes(), stager_pinned_bytes(layers, experts, stage_cap, rb), "the stager allocates what the plan books");
+        Ok(st)
+    }
+
+    fn pinned_bytes(&self) -> u64 {
+        (self.landing.bytes + self.tables.bytes + self.landed.bytes) as u64
+    }
+
+    /// every pending read's report; the first error by name
+    fn settle(&mut self, src: &NvmeSource) -> Result<(), String> {
+        let mut err = None;
+        for t in self.pending.drain(..) {
+            if let Err(e) = src.wait(t) {
+                err.get_or_insert(format!("{STAGER_ENV}: an NVMe read of an earlier call: {e}"));
+            }
+        }
+        err.map_or(Ok(()), Err)
+    }
+
+    /// # Safety
+    /// A CUDA context is current; nothing on the compute stream waits on this stager any more.
+    unsafe fn free(&mut self) {
+        cuda::stream_sync(self.stream);
+        // the reads are done (the stager waited on their flags); dropping a ticket drains it
+        self.pending.clear();
+        cuda::event_destroy(self.event);
+        cuda::stream_destroy(self.stream);
+        self.landing.free();
+        self.tables.free();
+        self.landed.free();
+    }
+}
+
+/// [`serve`]'s mover on the stager stream (see [`Stager`])
+struct StagerMover<'a> {
+    s: sys::CUstream,
+    vram: Dev,
+    pinned: Option<&'a Pinned>,
+    stage: Dev,
+    landing: *mut u8,
+    rb: u64,
+    src: &'a NvmeSource,
+    recs: &'a [ExpertRecord],
+    /// this layer's row of the landed flags: host and device address
+    landed_host: *mut u64,
+    landed_dev: Dev,
+    seq: u64,
+    /// pinned slots this call's queued copies read (phase A), not yet known to be done
+    read_pinned: Vec<u32>,
+    pending: &'a mut Vec<crate::nvme_source::Ticket>,
+    stats: &'a mut StagerStats,
+}
+
+impl Mover for StagerMover<'_> {
+    fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
+        // a reader writes a pinned slot from the host: not while a queued copy still reads it
+        if jobs.iter().any(|(_, d)| matches!(d, Dst::Pinned(q) if self.read_pinned.contains(q))) {
+            unsafe { cuda::stream_sync(self.s) };
+            self.read_pinned.clear();
+            self.stats.gate_syncs += 1;
+        }
+        let rb = self.rb as usize;
+        let mut v = Vec::with_capacity(jobs.len());
+        let mut landed = Vec::with_capacity(jobs.len());
+        let mut bytes = 0u64;
+        for &(e, d) in jobs {
+            let gu = match d {
+                Dst::Landing(i) => unsafe { self.landing.add(i as usize * rb) },
+                Dst::Pinned(q) => unsafe { (self.pinned.expect("a pinned destination without a pinned arena").host as *mut u8).add(q as usize * rb) },
+            };
+            let dst = RecordDst { gu, dn: std::ptr::null_mut() };
+            let rec = self.recs[e as usize];
+            bytes += rec.parts(&dst).iter().map(|p| p.1.len as u64).sum::<u64>();
+            v.push((rec, dst));
+            landed.push(crate::nvme_source::Landed { flag: unsafe { self.landed_host.add(e as usize) }, value: self.seq });
+        }
+        // SAFETY: the destinations are the stager's pinned landing and this layer's pinned arena,
+        // `rb` bytes each, read only by stager copies queued behind the flags below; the flags
+        // are this layer's row, each written by one read per call
+        let t = unsafe { self.src.fetch_landed(&v, &landed) }?;
+        self.pending.push(t);
+        for &(e, _) in jobs {
+            unsafe { cuda::ck(sys::cuStreamWaitValue64_v2(self.s, self.landed_dev + e as u64 * 8, self.seq, WAIT_GEQ)) };
+        }
+        self.stats.landed_reads += jobs.len() as u64;
+        Ok(bytes)
+    }
+    fn landing_to_stage(&mut self, i: u32) {
+        let rb = self.rb as usize;
+        unsafe { cuda::ck(sys::cuMemcpyHtoDAsync_v2(self.stage + i as u64 * self.rb, self.landing.add(i as usize * rb) as *const _, rb, self.s)) };
+    }
+    fn pinned_to_stage(&mut self, q: u32, s: u32) {
+        let p = self.pinned.expect("a pinned source without a pinned arena");
+        unsafe { cuda::ck(sys::cuMemcpyHtoDAsync_v2(self.stage + s as u64 * self.rb, (p.host as *const u8).add(q as usize * self.rb as usize) as *const _, self.rb as usize, self.s)) };
+        self.read_pinned.push(q);
+    }
+    fn vram_to_stage(&mut self, v: u32, s: u32) {
+        unsafe { cuda::ck(sys::cuMemcpyDtoDAsync_v2(self.stage + s as u64 * self.rb, self.vram + v as u64 * self.rb, self.rb as usize, self.s)) };
+    }
+    /// the stager stream orders phase B's copies behind phase A's; a host write into a pinned
+    /// slot waits in [`StagerMover::nvme`] (the gate)
+    fn barrier(&mut self) {}
+    fn vram_to_pinned(&mut self, v: u32, q: u32) {
+        let p = self.pinned.expect("a pinned destination without a pinned arena");
+        unsafe { cuda::ck(sys::cuMemcpyDtoHAsync_v2((p.host as *mut u8).add(q as usize * self.rb as usize) as *mut _, self.vram + v as u64 * self.rb, self.rb as usize, self.s)) };
+    }
+    fn stage_to_vram(&mut self, s: u32, v: u32) {
+        unsafe { cuda::ck(sys::cuMemcpyDtoDAsync_v2(self.vram + v as u64 * self.rb, self.stage + s as u64 * self.rb, self.rb as usize, self.s)) };
+    }
+}
+
+impl ExpertTiers {
+    /// #149 path B: the stager on or off (`new` takes it from `CROW_GLM_STAGER`, [`stager_on`]).
+    /// On allocates the stager stream, its event and its pinned blocks (landing `stage_cap`
+    /// records, the table rows and the landed flags, `[MoE layers][experts]` u64 each); off frees
+    /// them. Refused by name on a device without 64-bit stream memops and with the CPU lane.
+    /// The cache and the slots stay as they are.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading this store is pending.
+    pub unsafe fn set_stager(&mut self, on: bool) -> Result<(), String> {
+        match (on, self.stager.is_some()) {
+            (true, false) => {
+                if self.pinned_use.cpu_lane {
+                    stager_on(Some("1"), Some("1"), Some("1"))?;
+                }
+                self.stager = Some(Stager::new(self.slots.len(), self.cache.experts, self.stage_cap, self.rb)?);
+            }
+            (false, true) => {
+                cuda::sync();
+                let r = self.settle();
+                if let Some(mut st) = self.stager.take() {
+                    st.free();
+                }
+                r?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// #149 path B: the stager is on
+    pub fn stager_on(&self) -> bool {
+        self.stager.is_some()
+    }
+
+    /// #149 path B: the stager's counters (`None` when it is off)
+    pub fn stager_stats(&self) -> Option<StagerStats> {
+        self.stager.as_ref().map(|st| st.stats)
+    }
+
+    /// #149 path B: the outcome of every NVMe read the stager issued and has not reported yet
+    /// (each raised its flag, also on a failure). Blocks only while such a read still runs, which
+    /// after a stream sync past the last call's experts is none. A no-op with the stager off.
+    pub fn settle(&mut self) -> Result<(), String> {
+        match self.stager.as_mut() {
+            Some(st) => st.settle(&self.src),
+            None => Ok(()),
+        }
+    }
+
+    /// [`ExpertTiers::table_for`] through the stager: the earlier calls' reads report, then
+    /// [`serve`] with a [`StagerMover`], the table into its pinned row and up on the stager, the
+    /// stager's event recorded and waited on by the current stream. The host waits for nothing
+    /// here except the gate of [`StagerMover::nvme`].
+    ///
+    /// # Safety
+    /// As [`ExpertTiers::table_for`]; the host has seen this layer's router finish (its flag).
+    unsafe fn table_staged(&mut self, l: usize, ids: &[u32]) -> Result<(Dev, Served), String> {
+        let rb = self.rb;
+        let experts = self.cache.experts;
+        let st = self.stager.as_mut().expect("table_staged without the stager");
+        st.settle(&self.src)?;
+        st.seq += 1;
+        st.stats.calls += 1;
+        let row = l * experts;
+        let mut m = StagerMover {
+            s: st.stream,
+            vram: self.vram[l],
+            pinned: self.pinned.get(l),
+            stage: self.stage,
+            landing: st.landing.host as *mut u8,
+            rb,
+            src: &self.src,
+            recs: &self.records[l],
+            landed_host: (st.landed.host as *mut u64).add(row),
+            landed_dev: st.landed.dev + (row * 8) as u64,
+            seq: st.seq,
+            read_pinned: Vec::new(),
+            pending: &mut st.pending,
+            stats: &mut st.stats,
+        };
+        let served = serve(&mut self.cache, l, &mut self.slots[l], ids, self.stage_cap, &mut m)?;
+        // the table into this layer's pinned row (its last upload ran before this layer's
+        // previous experts), then up on the stager behind the moves
+        let host = std::slice::from_raw_parts_mut((st.tables.host as *mut u64).add(row), experts);
+        host.fill(0);
+        for &(e, loc) in &served.locs {
+            host[e as usize] = match loc {
+                Loc::Vram(v) => self.vram[l] + v as u64 * rb,
+                Loc::Pinned(q) => self.pinned[l].dev + q as u64 * rb,
+                Loc::Stage(s) => self.stage + s as u64 * rb,
+            };
+        }
+        cuda::ck(sys::cuMemcpyHtoDAsync_v2(self.tables[l], host.as_ptr() as *const _, experts * 8, st.stream));
+        cuda::event_record(st.event, st.stream);
+        // WDDM: submit the stager's batch now (it would otherwise wait for a later query or sync)
+        cuda::stream_query(st.stream);
+        cuda::stream_wait_event(cuda::cur_stream(), st.event);
+        crate::glm5_moe::lane::post(None);
+        self.nvme_reads += served.nvme_reads as u64;
+        self.nvme_bytes += served.nvme_bytes;
+        self.moves[l].add(&served.moves);
+        self.routing_syncs += 1;
+        self.sub_batches += 1;
+        Ok((self.tables[l], served))
     }
 }
 
@@ -1339,6 +1702,7 @@ impl Glm5Run {
                 pending = Some(p);
             } else {
                 cuda::sync();
+                tiers.settle()?;
                 finish(p, tiers, out, report)?;
             }
         }
@@ -2418,10 +2782,12 @@ impl Glm5Run {
         self.layers(tiers, pos, &mut |_| Ok(()))?;
         if !head {
             cuda::sync();
+            tiers.settle()?;
             return Ok(None);
         }
         self.head_row()?;
         cuda::sync();
+        tiers.settle()?;
         Ok(Some(cuda::dtoh_i32(self.next, 1)[0] as i64))
     }
 
