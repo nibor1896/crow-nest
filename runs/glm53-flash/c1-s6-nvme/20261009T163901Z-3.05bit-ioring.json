@@ -1,0 +1,1040 @@
+{
+ "env": {
+  "date_utc": "2026-10-09T16:39:01+00:00",
+  "commit": "d082f20",
+  "python": "3.13.3",
+  "drive": "Phison 2000GB ESO2K0GMLCA0-EP8-420MS",
+  "firmware": "EQFM22.3",
+  "physical_disk": 0,
+  "volume": "C:\\",
+  "free_bytes": 37227319296,
+  "sector_logical": 512,
+  "sector_physical": 4096,
+  "block": 9474048,
+  "align": 4096,
+  "readers": [
+   1,
+   2,
+   4
+  ],
+  "reps": 3,
+  "secs": 20.0,
+  "warmup": 2.0,
+  "seed": 1,
+  "seq_passes": 0,
+  "seq_chunk": 16777216,
+  "foreign_max_mbps": 4.0,
+  "disk_busy_flag": false,
+  "depths": [
+   1,
+   4,
+   8,
+   16
+  ],
+  "backend": "ioring",
+  "no_sync_arm": true,
+  "files": [
+   {
+    "path": "C:\\Users\\robin\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MUL1K3.cnq",
+    "size": 124591634567
+   }
+  ]
+ },
+ "idle": {
+  "foreign_read_bytes": 4096,
+  "write_bytes": 851968,
+  "foreign_read_mbps": 0.0013653333333333332,
+  "write_mbps": 0.2839893333333333,
+  "void_reasons": []
+ },
+ "cells": [],
+ "sequential": [],
+ "verdict": {
+  "valid": true,
+  "void_reasons": [],
+  "per_readers": {},
+  "b_for_g1": null,
+  "g1_input": "not measured: --no-sync-arm (the queue-depth grid is no G1 input)"
+ },
+ "grid": {
+  "backend": "ioring",
+  "block": 9474048,
+  "depths": [
+   1,
+   4,
+   8,
+   16
+  ],
+  "readers": [
+   1,
+   2,
+   4
+  ],
+  "cells": [
+   {
+    "readers": 1,
+    "bytes": 162262020096,
+    "gbps": 8.1131010048,
+    "blocks": 17127,
+    "short_reads": 0,
+    "own_bytes": 178443694080,
+    "lat_p50_ms": 1.1529999901540577,
+    "lat_p99_ms": 1.3065999955870211,
+    "depth": 1,
+    "backend": "ioring",
+    "rep": 0,
+    "foreign": {
+     "foreign_read_bytes": 16384,
+     "write_bytes": 4780032,
+     "foreign_read_mbps": 0.0007446229205936226,
+     "write_mbps": 0.21724373708318942,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 2,
+    "bytes": 209376460800,
+    "gbps": 10.46882304,
+    "blocks": 22100,
+    "short_reads": 0,
+    "own_bytes": 232521560064,
+    "lat_p50_ms": 1.6241999983321875,
+    "lat_p99_ms": 3.8948000001255423,
+    "depth": 1,
+    "backend": "ioring",
+    "rep": 0,
+    "foreign": {
+     "foreign_read_bytes": 65536,
+     "write_bytes": 4460544,
+     "foreign_read_mbps": 0.0029783749870447543,
+     "write_mbps": 0.2027156475557336,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 4,
+    "bytes": 187444039680,
+    "gbps": 9.372201984,
+    "blocks": 19785,
+    "short_reads": 0,
+    "own_bytes": 209812267008,
+    "lat_p50_ms": 3.4343000152148306,
+    "lat_p99_ms": 9.7239000024274,
+    "depth": 1,
+    "backend": "ioring",
+    "rep": 0,
+    "foreign": {
+     "foreign_read_bytes": 69632,
+     "write_bytes": 2514944,
+     "foreign_read_mbps": 0.0031643358410239223,
+     "write_mbps": 0.11428836508168755,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 1,
+    "bytes": 177581555712,
+    "gbps": 8.8790777856,
+    "blocks": 18744,
+    "short_reads": 0,
+    "own_bytes": 200679284736,
+    "lat_p50_ms": 3.3131999953184277,
+    "lat_p99_ms": 9.956800000509247,
+    "depth": 4,
+    "backend": "ioring",
+    "rep": 0,
+    "foreign": {
+     "foreign_read_bytes": 516096,
+     "write_bytes": 4669440,
+     "foreign_read_mbps": 0.023453099758076135,
+     "write_mbps": 0.21219471209687932,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 2,
+    "bytes": 182545956864,
+    "gbps": 9.127297843200001,
+    "blocks": 19268,
+    "short_reads": 0,
+    "own_bytes": 204364689408,
+    "lat_p50_ms": 7.026900013443083,
+    "lat_p99_ms": 22.898600000189617,
+    "depth": 4,
+    "backend": "ioring",
+    "rep": 0,
+    "foreign": {
+     "foreign_read_bytes": 204800,
+     "write_bytes": 8613888,
+     "foreign_read_mbps": 0.009305029390644058,
+     "write_mbps": 0.3913695361704891,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 4,
+    "bytes": 175336206336,
+    "gbps": 8.7668103168,
+    "blocks": 18507,
+    "short_reads": 0,
+    "own_bytes": 191716835328,
+    "lat_p50_ms": 14.724999986356124,
+    "lat_p99_ms": 51.34380000527017,
+    "depth": 4,
+    "backend": "ioring",
+    "rep": 0,
+    "foreign": {
+     "foreign_read_bytes": 57344,
+     "write_bytes": 9129984,
+     "foreign_read_mbps": 0.002602502974842759,
+     "write_mbps": 0.41435565220889364,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 1,
+    "bytes": 178415271936,
+    "gbps": 8.920763596799999,
+    "blocks": 18832,
+    "short_reads": 0,
+    "own_bytes": 201058246656,
+    "lat_p50_ms": 6.609900010516867,
+    "lat_p99_ms": 19.42110000527464,
+    "depth": 8,
+    "backend": "ioring",
+    "rep": 0,
+    "foreign": {
+     "foreign_read_bytes": 20480,
+     "write_bytes": 4001792,
+     "foreign_read_mbps": 0.0009305106293395001,
+     "write_mbps": 0.18182177697293833,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 2,
+    "bytes": 173716144128,
+    "gbps": 8.6858072064,
+    "blocks": 18336,
+    "short_reads": 0,
+    "own_bytes": 196103319552,
+    "lat_p50_ms": 13.95379999303259,
+    "lat_p99_ms": 43.70329997618683,
+    "depth": 8,
+    "backend": "ioring",
+    "rep": 0,
+    "foreign": {
+     "foreign_read_bytes": 65536,
+     "write_bytes": 2322432,
+     "foreign_read_mbps": 0.002976626532504093,
+     "write_mbps": 0.1054842027456138,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 4,
+    "bytes": 183265984512,
+    "gbps": 9.163299225600001,
+    "blocks": 19344,
+    "short_reads": 0,
+    "own_bytes": 205577367552,
+    "lat_p50_ms": 34.94090001913719,
+    "lat_p99_ms": 107.2701999801211,
+    "depth": 8,
+    "backend": "ioring",
+    "rep": 0,
+    "foreign": {
+     "foreign_read_bytes": 0,
+     "write_bytes": 2236416,
+     "foreign_read_mbps": 0.0,
+     "write_mbps": 0.1015157789726178,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 1,
+    "bytes": 181986988032,
+    "gbps": 9.0993494016,
+    "blocks": 19209,
+    "short_reads": 0,
+    "own_bytes": 195667513344,
+    "lat_p50_ms": 13.832599972374737,
+    "lat_p99_ms": 39.73759998916648,
+    "depth": 16,
+    "backend": "ioring",
+    "rep": 0,
+    "foreign": {
+     "foreign_read_bytes": 49152,
+     "write_bytes": 1650688,
+     "foreign_read_mbps": 0.0022306218774745994,
+     "write_mbps": 0.07491171805185529,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 2,
+    "bytes": 183303880704,
+    "gbps": 9.1651940352,
+    "blocks": 19348,
+    "short_reads": 0,
+    "own_bytes": 199078170624,
+    "lat_p50_ms": 28.376400005072355,
+    "lat_p99_ms": 79.712999984622,
+    "depth": 16,
+    "backend": "ioring",
+    "rep": 0,
+    "foreign": {
+     "foreign_read_bytes": 114688,
+     "write_bytes": 1982464,
+     "foreign_read_mbps": 0.005205324092331582,
+     "write_mbps": 0.08997774502458879,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 4,
+    "bytes": 177155223552,
+    "gbps": 8.8577611776,
+    "blocks": 18699,
+    "short_reads": 0,
+    "own_bytes": 199959257088,
+    "lat_p50_ms": 57.629199989605695,
+    "lat_p99_ms": 150.78920000814833,
+    "depth": 16,
+    "backend": "ioring",
+    "rep": 0,
+    "foreign": {
+     "foreign_read_bytes": 16384,
+     "write_bytes": 1650688,
+     "foreign_read_mbps": 0.0007402090334226117,
+     "write_mbps": 0.07457606011732813,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 1,
+    "bytes": 163275743232,
+    "gbps": 8.1637871616,
+    "blocks": 17234,
+    "short_reads": 0,
+    "own_bytes": 177875251200,
+    "lat_p50_ms": 1.1482999834697694,
+    "lat_p99_ms": 1.2916999985463917,
+    "depth": 1,
+    "backend": "ioring",
+    "rep": 1,
+    "foreign": {
+     "foreign_read_bytes": 65536,
+     "write_bytes": 1527808,
+     "foreign_read_mbps": 0.0029785415930311276,
+     "write_mbps": 0.06943725088753816,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 2,
+    "bytes": 192920039424,
+    "gbps": 9.6460019712,
+    "blocks": 20363,
+    "short_reads": 0,
+    "own_bytes": 216216723456,
+    "lat_p50_ms": 1.6352999955415726,
+    "lat_p99_ms": 3.9794000040274113,
+    "depth": 1,
+    "backend": "ioring",
+    "rep": 1,
+    "foreign": {
+     "foreign_read_bytes": 0,
+     "write_bytes": 1601536,
+     "foreign_read_mbps": 0.0,
+     "write_mbps": 0.07278298688961751,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 4,
+    "bytes": 184876572672,
+    "gbps": 9.2438286336,
+    "blocks": 19514,
+    "short_reads": 0,
+    "own_bytes": 196842295296,
+    "lat_p50_ms": 3.4325000015087426,
+    "lat_p99_ms": 9.803099994314834,
+    "depth": 1,
+    "backend": "ioring",
+    "rep": 1,
+    "foreign": {
+     "foreign_read_bytes": 0,
+     "write_bytes": 1732608,
+     "foreign_read_mbps": 0.0,
+     "write_mbps": 0.07873618240570847,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 1,
+    "bytes": 182725963776,
+    "gbps": 9.1362981888,
+    "blocks": 19287,
+    "short_reads": 0,
+    "own_bytes": 205880537088,
+    "lat_p50_ms": 3.2792999991215765,
+    "lat_p99_ms": 9.629100008169189,
+    "depth": 4,
+    "backend": "ioring",
+    "rep": 1,
+    "foreign": {
+     "foreign_read_bytes": 0,
+     "write_bytes": 1159168,
+     "foreign_read_mbps": 0.0,
+     "write_mbps": 0.052676135624043996,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 2,
+    "bytes": 177268912128,
+    "gbps": 8.8634456064,
+    "blocks": 18711,
+    "short_reads": 0,
+    "own_bytes": 199078170624,
+    "lat_p50_ms": 6.902599998284131,
+    "lat_p99_ms": 21.35419999831356,
+    "depth": 4,
+    "backend": "ioring",
+    "rep": 1,
+    "foreign": {
+     "foreign_read_bytes": 84480,
+     "write_bytes": 2027520,
+     "foreign_read_mbps": 0.0038365475780257163,
+     "write_mbps": 0.09207714187261719,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 4,
+    "bytes": 180471140352,
+    "gbps": 9.0235570176,
+    "blocks": 19049,
+    "short_reads": 0,
+    "own_bytes": 200082419712,
+    "lat_p50_ms": 17.199499998241663,
+    "lat_p99_ms": 55.00619998201728,
+    "depth": 4,
+    "backend": "ioring",
+    "rep": 1,
+    "foreign": {
+     "foreign_read_bytes": 10752,
+     "write_bytes": 2109440,
+     "foreign_read_mbps": 0.0004883573708758262,
+     "write_mbps": 0.09581106514325732,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 1,
+    "bytes": 180404822016,
+    "gbps": 9.0202411008,
+    "blocks": 19042,
+    "short_reads": 0,
+    "own_bytes": 203644661760,
+    "lat_p50_ms": 6.704199971864,
+    "lat_p99_ms": 20.424199989065528,
+    "depth": 8,
+    "backend": "ioring",
+    "rep": 1,
+    "foreign": {
+     "foreign_read_bytes": 32768,
+     "write_bytes": 5349376,
+     "foreign_read_mbps": 0.001488816438728945,
+     "write_mbps": 0.24304928362250022,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 2,
+    "bytes": 185511333888,
+    "gbps": 9.2755666944,
+    "blocks": 19581,
+    "short_reads": 0,
+    "own_bytes": 207765872640,
+    "lat_p50_ms": 14.328999997815117,
+    "lat_p99_ms": 45.26199999963865,
+    "depth": 8,
+    "backend": "ioring",
+    "rep": 1,
+    "foreign": {
+     "foreign_read_bytes": 16384,
+     "write_bytes": 6926336,
+     "foreign_read_mbps": 0.0007441417177567185,
+     "write_mbps": 0.31458591118165274,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 4,
+    "bytes": 186667167744,
+    "gbps": 9.3333583872,
+    "blocks": 19703,
+    "short_reads": 0,
+    "own_bytes": 209177505792,
+    "lat_p50_ms": 28.07619998930022,
+    "lat_p99_ms": 77.68940000096336,
+    "depth": 8,
+    "backend": "ioring",
+    "rep": 1,
+    "foreign": {
+     "foreign_read_bytes": 0,
+     "write_bytes": 2805760,
+     "foreign_read_mbps": 0.0,
+     "write_mbps": 0.12735446970773445,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 1,
+    "bytes": 188789354496,
+    "gbps": 9.4394677248,
+    "blocks": 19927,
+    "short_reads": 0,
+    "own_bytes": 201446682624,
+    "lat_p50_ms": 13.750499987509102,
+    "lat_p99_ms": 36.233099992387,
+    "depth": 16,
+    "backend": "ioring",
+    "rep": 1,
+    "foreign": {
+     "foreign_read_bytes": 24576,
+     "write_bytes": 2973696,
+     "foreign_read_mbps": 0.0011153497416781862,
+     "write_mbps": 0.13495731874306052,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 2,
+    "bytes": 186316627968,
+    "gbps": 9.3158313984,
+    "blocks": 19666,
+    "short_reads": 0,
+    "own_bytes": 199997153280,
+    "lat_p50_ms": 28.00069999648258,
+    "lat_p99_ms": 76.77220000186935,
+    "depth": 16,
+    "backend": "ioring",
+    "rep": 1,
+    "foreign": {
+     "foreign_read_bytes": 0,
+     "write_bytes": 1798144,
+     "foreign_read_mbps": 0.0,
+     "write_mbps": 0.08160846757561463,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 4,
+    "bytes": 183483887616,
+    "gbps": 9.1741943808,
+    "blocks": 19367,
+    "short_reads": 0,
+    "own_bytes": 206051069952,
+    "lat_p50_ms": 56.34829998598434,
+    "lat_p99_ms": 146.56470000045374,
+    "depth": 16,
+    "backend": "ioring",
+    "rep": 1,
+    "foreign": {
+     "foreign_read_bytes": 81920,
+     "write_bytes": 1495040,
+     "foreign_read_mbps": 0.0037135167267213416,
+     "write_mbps": 0.06777168026266447,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 1,
+    "bytes": 162224123904,
+    "gbps": 8.1112061952,
+    "blocks": 17123,
+    "short_reads": 0,
+    "own_bytes": 178500538368,
+    "lat_p50_ms": 1.153399993199855,
+    "lat_p99_ms": 1.3123000098858029,
+    "depth": 1,
+    "backend": "ioring",
+    "rep": 2,
+    "foreign": {
+     "foreign_read_bytes": 2223104,
+     "write_bytes": 7254016,
+     "foreign_read_mbps": 0.10103185877213734,
+     "write_mbps": 0.3296682116728793,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 2,
+    "bytes": 194758004736,
+    "gbps": 9.7379002368,
+    "blocks": 20557,
+    "short_reads": 0,
+    "own_bytes": 218007318528,
+    "lat_p50_ms": 1.6339999856427312,
+    "lat_p99_ms": 4.000599990831688,
+    "depth": 1,
+    "backend": "ioring",
+    "rep": 2,
+    "foreign": {
+     "foreign_read_bytes": 1002496,
+     "write_bytes": 1888256,
+     "foreign_read_mbps": 0.045554568235548015,
+     "write_mbps": 0.08580451871945918,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 4,
+    "bytes": 191167340544,
+    "gbps": 9.558367027200001,
+    "blocks": 20178,
+    "short_reads": 0,
+    "own_bytes": 211650232320,
+    "lat_p50_ms": 3.4225000126753002,
+    "lat_p99_ms": 9.864299994660541,
+    "depth": 1,
+    "backend": "ioring",
+    "rep": 2,
+    "foreign": {
+     "foreign_read_bytes": 1177088,
+     "write_bytes": 3805184,
+     "foreign_read_mbps": 0.05348952962342238,
+     "write_mbps": 0.17291613056166816,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 1,
+    "bytes": 184440766464,
+    "gbps": 9.222038323200001,
+    "blocks": 19468,
+    "short_reads": 0,
+    "own_bytes": 207330066432,
+    "lat_p50_ms": 3.2844000088516623,
+    "lat_p99_ms": 9.959499991964549,
+    "depth": 4,
+    "backend": "ioring",
+    "rep": 2,
+    "foreign": {
+     "foreign_read_bytes": 761344,
+     "write_bytes": 6950912,
+     "foreign_read_mbps": 0.034596159687410845,
+     "write_mbps": 0.3158557255657631,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 2,
+    "bytes": 186761908224,
+    "gbps": 9.338095411200001,
+    "blocks": 19713,
+    "short_reads": 0,
+    "own_bytes": 208902758400,
+    "lat_p50_ms": 6.86719999066554,
+    "lat_p99_ms": 21.78849998745136,
+    "depth": 4,
+    "backend": "ioring",
+    "rep": 2,
+    "foreign": {
+     "foreign_read_bytes": 4163072,
+     "write_bytes": 16936960,
+     "foreign_read_mbps": 0.18915152998212179,
+     "write_mbps": 0.7695403531925455,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 4,
+    "bytes": 185880821760,
+    "gbps": 9.294041088,
+    "blocks": 19620,
+    "short_reads": 0,
+    "own_bytes": 208201678848,
+    "lat_p50_ms": 14.063800015719607,
+    "lat_p99_ms": 41.24370001954958,
+    "depth": 4,
+    "backend": "ioring",
+    "rep": 2,
+    "foreign": {
+     "foreign_read_bytes": 757760,
+     "write_bytes": 6971392,
+     "foreign_read_mbps": 0.034417510500734556,
+     "write_mbps": 0.3166410966067579,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 1,
+    "bytes": 187624046592,
+    "gbps": 9.3812023296,
+    "blocks": 19804,
+    "short_reads": 0,
+    "own_bytes": 210693353472,
+    "lat_p50_ms": 6.551300000865012,
+    "lat_p99_ms": 18.90990001265891,
+    "depth": 8,
+    "backend": "ioring",
+    "rep": 2,
+    "foreign": {
+     "foreign_read_bytes": 84480,
+     "write_bytes": 2322432,
+     "foreign_read_mbps": 0.0038367728554697693,
+     "write_mbps": 0.10547637377218712,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 2,
+    "bytes": 192872669184,
+    "gbps": 9.6436334592,
+    "blocks": 20358,
+    "short_reads": 0,
+    "own_bytes": 210087014400,
+    "lat_p50_ms": 13.746899989200756,
+    "lat_p99_ms": 39.19839998707175,
+    "depth": 8,
+    "backend": "ioring",
+    "rep": 2,
+    "foreign": {
+     "foreign_read_bytes": 4923904,
+     "write_bytes": 3522560,
+     "foreign_read_mbps": 0.2236413896538941,
+     "write_mbps": 0.15999300829975993,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 4,
+    "bytes": 193033728000,
+    "gbps": 9.6516864,
+    "blocks": 20375,
+    "short_reads": 0,
+    "own_bytes": 215468273664,
+    "lat_p50_ms": 27.841300005093217,
+    "lat_p99_ms": 76.23530001728795,
+    "depth": 8,
+    "backend": "ioring",
+    "rep": 2,
+    "foreign": {
+     "foreign_read_bytes": 196608,
+     "write_bytes": 4587520,
+     "foreign_read_mbps": 0.008924300589807943,
+     "write_mbps": 0.208233680428852,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 1,
+    "bytes": 187529306112,
+    "gbps": 9.3764653056,
+    "blocks": 19794,
+    "short_reads": 0,
+    "own_bytes": 202659360768,
+    "lat_p50_ms": 13.646499981405213,
+    "lat_p99_ms": 36.1585000064224,
+    "depth": 16,
+    "backend": "ioring",
+    "rep": 2,
+    "foreign": {
+     "foreign_read_bytes": 90112,
+     "write_bytes": 2117632,
+     "foreign_read_mbps": 0.004092543344880907,
+     "write_mbps": 0.09617476860470132,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 2,
+    "bytes": 198443409408,
+    "gbps": 9.9221704704,
+    "blocks": 20946,
+    "short_reads": 0,
+    "own_bytes": 220925325312,
+    "lat_p50_ms": 28.56969999265857,
+    "lat_p99_ms": 90.44849997735582,
+    "depth": 16,
+    "backend": "ioring",
+    "rep": 2,
+    "foreign": {
+     "foreign_read_bytes": 135168,
+     "write_bytes": 4304896,
+     "foreign_read_mbps": 0.006135034400155771,
+     "write_mbps": 0.19539155013829437,
+     "void_reasons": []
+    }
+   },
+   {
+    "readers": 4,
+    "bytes": 186742960128,
+    "gbps": 9.3371480064,
+    "blocks": 19711,
+    "short_reads": 0,
+    "own_bytes": 204525748224,
+    "lat_p50_ms": 59.02960000094026,
+    "lat_p99_ms": 163.11200000927784,
+    "depth": 16,
+    "backend": "ioring",
+    "rep": 2,
+    "foreign": {
+     "foreign_read_bytes": 98304,
+     "write_bytes": 6729728,
+     "foreign_read_mbps": 0.004456032498139384,
+     "write_mbps": 0.305052558101792,
+     "void_reasons": []
+    }
+   }
+  ],
+  "temperature": {
+   "before": {
+    "readable": true,
+    "celsius": 68,
+    "sensors": [
+     {
+      "index": 0,
+      "celsius": 68
+     }
+    ],
+    "critical_c": 89,
+    "warning_c": 87
+   },
+   "after": {
+    "readable": true,
+    "celsius": 79,
+    "sensors": [
+     {
+      "index": 0,
+      "celsius": 79
+     }
+    ],
+    "critical_c": 89,
+    "warning_c": 87
+   }
+  },
+  "summary": [
+   {
+    "rates_gbps": [
+     8.1131010048,
+     8.1637871616,
+     8.1112061952
+    ],
+    "median_gbps": 8.1131010048,
+    "min_gbps": 8.1112061952,
+    "max_gbps": 8.1637871616,
+    "spread": 1.0064825089061498,
+    "spread_ok": true,
+    "depth": 1,
+    "readers": 1,
+    "reps": 3,
+    "blocks": 51484,
+    "lat_p50_ms": 1.1529999901540577,
+    "lat_p99_ms": 1.3123000098858029
+   },
+   {
+    "rates_gbps": [
+     10.46882304,
+     9.6460019712,
+     9.7379002368
+    ],
+    "median_gbps": 9.7379002368,
+    "min_gbps": 9.6460019712,
+    "max_gbps": 10.46882304,
+    "spread": 1.085301772823258,
+    "spread_ok": true,
+    "depth": 1,
+    "readers": 2,
+    "reps": 3,
+    "blocks": 63020,
+    "lat_p50_ms": 1.6339999856427312,
+    "lat_p99_ms": 4.000599990831688
+   },
+   {
+    "rates_gbps": [
+     9.372201984,
+     9.2438286336,
+     9.558367027200001
+    ],
+    "median_gbps": 9.372201984,
+    "min_gbps": 9.2438286336,
+    "max_gbps": 9.558367027200001,
+    "spread": 1.0340268525161425,
+    "spread_ok": true,
+    "depth": 1,
+    "readers": 4,
+    "reps": 3,
+    "blocks": 59477,
+    "lat_p50_ms": 3.4325000015087426,
+    "lat_p99_ms": 9.864299994660541
+   },
+   {
+    "rates_gbps": [
+     8.8790777856,
+     9.1362981888,
+     9.222038323200001
+    ],
+    "median_gbps": 9.1362981888,
+    "min_gbps": 8.8790777856,
+    "max_gbps": 9.222038323200001,
+    "spread": 1.0386256935552711,
+    "spread_ok": true,
+    "depth": 4,
+    "readers": 1,
+    "reps": 3,
+    "blocks": 57499,
+    "lat_p50_ms": 3.2844000088516623,
+    "lat_p99_ms": 9.959499991964549
+   },
+   {
+    "rates_gbps": [
+     9.127297843200001,
+     8.8634456064,
+     9.338095411200001
+    ],
+    "median_gbps": 9.127297843200001,
+    "min_gbps": 8.8634456064,
+    "max_gbps": 9.338095411200001,
+    "spread": 1.0535513868847204,
+    "spread_ok": true,
+    "depth": 4,
+    "readers": 2,
+    "reps": 3,
+    "blocks": 57692,
+    "lat_p50_ms": 6.902599998284131,
+    "lat_p99_ms": 22.898600000189617
+   },
+   {
+    "rates_gbps": [
+     8.7668103168,
+     9.0235570176,
+     9.294041088
+    ],
+    "median_gbps": 9.0235570176,
+    "min_gbps": 8.7668103168,
+    "max_gbps": 9.294041088,
+    "spread": 1.0601394067109744,
+    "spread_ok": true,
+    "depth": 4,
+    "readers": 4,
+    "reps": 3,
+    "blocks": 57176,
+    "lat_p50_ms": 14.724999986356124,
+    "lat_p99_ms": 55.00619998201728
+   },
+   {
+    "rates_gbps": [
+     8.920763596799999,
+     9.0202411008,
+     9.3812023296
+    ],
+    "median_gbps": 9.0202411008,
+    "min_gbps": 8.920763596799999,
+    "max_gbps": 9.3812023296,
+    "spread": 1.0516142735768905,
+    "spread_ok": true,
+    "depth": 8,
+    "readers": 1,
+    "reps": 3,
+    "blocks": 57678,
+    "lat_p50_ms": 6.609900010516867,
+    "lat_p99_ms": 20.424199989065528
+   },
+   {
+    "rates_gbps": [
+     8.6858072064,
+     9.2755666944,
+     9.6436334592
+    ],
+    "median_gbps": 9.2755666944,
+    "min_gbps": 8.6858072064,
+    "max_gbps": 9.6436334592,
+    "spread": 1.1102748691099478,
+    "spread_ok": true,
+    "depth": 8,
+    "readers": 2,
+    "reps": 3,
+    "blocks": 58275,
+    "lat_p50_ms": 13.95379999303259,
+    "lat_p99_ms": 45.26199999963865
+   },
+   {
+    "rates_gbps": [
+     9.163299225600001,
+     9.3333583872,
+     9.6516864
+    ],
+    "median_gbps": 9.3333583872,
+    "min_gbps": 9.163299225600001,
+    "max_gbps": 9.6516864,
+    "spread": 1.0532981803143093,
+    "spread_ok": true,
+    "depth": 8,
+    "readers": 4,
+    "reps": 3,
+    "blocks": 59422,
+    "lat_p50_ms": 28.07619998930022,
+    "lat_p99_ms": 107.2701999801211
+   },
+   {
+    "rates_gbps": [
+     9.0993494016,
+     9.4394677248,
+     9.3764653056
+    ],
+    "median_gbps": 9.3764653056,
+    "min_gbps": 9.0993494016,
+    "max_gbps": 9.4394677248,
+    "spread": 1.0373783122494664,
+    "spread_ok": true,
+    "depth": 16,
+    "readers": 1,
+    "reps": 3,
+    "blocks": 58930,
+    "lat_p50_ms": 13.750499987509102,
+    "lat_p99_ms": 39.73759998916648
+   },
+   {
+    "rates_gbps": [
+     9.1651940352,
+     9.3158313984,
+     9.9221704704
+    ],
+    "median_gbps": 9.3158313984,
+    "min_gbps": 9.1651940352,
+    "max_gbps": 9.9221704704,
+    "spread": 1.0825925160223278,
+    "spread_ok": true,
+    "depth": 16,
+    "readers": 2,
+    "reps": 3,
+    "blocks": 59960,
+    "lat_p50_ms": 28.376400005072355,
+    "lat_p99_ms": 90.44849997735582
+   },
+   {
+    "rates_gbps": [
+     8.8577611776,
+     9.1741943808,
+     9.3371480064
+    ],
+    "median_gbps": 9.1741943808,
+    "min_gbps": 8.8577611776,
+    "max_gbps": 9.3371480064,
+    "spread": 1.054120541205412,
+    "spread_ok": true,
+    "depth": 16,
+    "readers": 4,
+    "reps": 3,
+    "blocks": 57777,
+    "lat_p50_ms": 57.629199989605695,
+    "lat_p99_ms": 163.11200000927784
+   }
+  ]
+ }
+}
