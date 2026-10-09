@@ -364,3 +364,201 @@ extern "C" __global__ void mul1_decode_states(float* __restrict__ out) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < 65536u) out[i] = mul1_w(i);
 }
+
+// ---------------- prefill: the expert-major grouped GEMM (GLM-5.3-Flash prompt calls) ----------------
+// One launch runs every (expert, row tile) work item of a prompt call's sub-batch: the expert's
+// trellis is decoded once per tile of up to MUL1_GT rows routed to it, instead of once per
+// (row, pick) combo as the T = 1 slots of GemvPlan do. Each block is one work item x one 128-wide
+// output block and runs the three steps of the GemvPlan path in-block, per row in the same f32
+// order, so every output row has the bits of the T = 1 slot path:
+//   had_in   the k-split's 128-blocks of H (x * suh) staged straight into shared memory (the
+//            mul1_had_in arithmetic), x read through the row list (no gathered copy)
+//   gemv     the k-splits one after the other, each the tile loop of mul1_gemv (the fmaf chains
+//            of mul1_tile_fma from 0, the two xor-shuffle adds of mul1_store_part), the split's
+//            partial added to a running sum left to right: s = p_0, s = s + p_1, ... (the order
+//            mul1_out_block sums the partials in)
+//   had_out  the 128 sums of a row through mul1_fwht128, * 2^-7, * svh (mul1_out_block)
+// No [E][S][T][n] partial buffer exists: the scratch of a prompt call is its rows only.
+// mode 1 reads the input as glm5_swiglu_clamp(g, u) = silu(min(g, L)) * clamp(u, -L, L) (the
+// kernels_glm5_moe.cu formula and operation order), so the down GEMM needs no h buffer.
+// blockIdx.z picks one of two matrices of the record (gate and up share k, n and the input).
+//
+// grid (n / 128, W, Z), block 256. work [W][3] i32: expert id, first entry in list, rows (1..GT).
+// list: combo indices c, grouped by expert; the input row of entry i is list[i] / p[6] (row
+// stride k), its output row list[i] (row stride n). table [E] u64: record bases (VRAM, pinned
+// UVA or staging). p: [0] k, [1] n, [2] S, [3] n32, [4] bits, [5] half, [6] in_div, [7] mode,
+// [8] limit (f32 bits), [9 + 3 z ..] tr_off, suh_off, svh_off of matrix z. k / S <= MUL1_GXROWS.
+#define MUL1_GT 16
+#define MUL1_GXROWS 256
+
+__device__ __forceinline__ float mul1_clamp_swiglu(float gv, float uv, float L) {
+    gv = gv > L ? L : gv;
+    uv = uv > L ? L : (uv < -L ? -L : uv);
+    const float silu = __fdiv_rn(gv, __fadd_rn(1.0f, expf(-gv)));
+    return __fmul_rn(silu, uv);
+}
+
+// mul1_tile_fma for up to MUL1_GT rows (the same operations per row)
+__device__ __forceinline__ void mul1_tile_fma_g(const unsigned int* w, const int lo[8], int n32, const float* xs, int rows,
+                                                int r0, int T, float acc0[MUL1_GT], float acc1[MUL1_GT]) {
+    float wv[8];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        int i = lo[j] >> 5, o = lo[j] & 31;
+        int i1 = (i + 1 == n32) ? 0 : i + 1;
+        unsigned long long pair = ((unsigned long long)w[i] << 32) | w[i1];
+        wv[j] = mul1_w((unsigned int)(pair >> (48 - o)) & 0xffffu);
+    }
+    #pragma unroll
+    for (int t = 0; t < MUL1_GT; t++) {
+        if (t < T) {
+            const float* xr = xs + t * rows + r0;
+            float x0 = xr[0], x1 = xr[1], x8 = xr[8], x9 = xr[9];
+            float a = acc0[t], b = acc1[t];
+            a = fmaf(wv[0], x0, a);
+            a = fmaf(wv[1], x1, a);
+            a = fmaf(wv[2], x8, a);
+            a = fmaf(wv[3], x9, a);
+            b = fmaf(wv[4], x0, b);
+            b = fmaf(wv[5], x1, b);
+            b = fmaf(wv[6], x8, b);
+            b = fmaf(wv[7], x9, b);
+            acc0[t] = a;
+            acc1[t] = b;
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) mul1_gemm_grp(const unsigned long long* __restrict__ table, const int* __restrict__ work,
+                                                                const int* __restrict__ list, const float* __restrict__ xa,
+                                                                const float* __restrict__ xb, float* __restrict__ y0,
+                                                                float* __restrict__ y1, const int* __restrict__ p) {
+    const int k = p[0], n = p[1], S = p[2], n32 = p[3], bits = p[4], half = p[5], in_div = p[6], mode = p[7];
+    const float L = __int_as_float(p[8]);
+    const int z = blockIdx.z;
+    const int tr_off = p[9 + 3 * z], suh_off = p[10 + 3 * z], svh_off = p[11 + 3 * z];
+    float* __restrict__ y = z ? y1 : y0;
+    const int wi = blockIdx.y;
+    const int e = work[3 * wi], f = work[3 * wi + 1], T = work[3 * wi + 2];
+    const unsigned long long base = table[e];
+    const unsigned long long tbase = base + (unsigned long long)tr_off;
+    const unsigned short* suh = (const unsigned short*)(base + (unsigned long long)suh_off);
+    const unsigned short* svh = (const unsigned short*)(base + (unsigned long long)svh_off);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int tiles_n = n >> 4, tps = (k >> 4) / S, rows = tps * 16, nblk = rows >> 7;
+    const int nb0 = blockIdx.x * 8;
+    __shared__ float xs[MUL1_GT * MUL1_GXROWS];
+    __shared__ __align__(16) unsigned int ring[2][MUL1_U * 8 * MUL1_N32MAX];
+    __shared__ int in_row[MUL1_GT], out_row[MUL1_GT];
+    if (threadIdx.x < MUL1_GT) {
+        const int c = (int)threadIdx.x < T ? list[f + threadIdx.x] : 0;
+        in_row[threadIdx.x] = c / in_div;
+        out_row[threadIdx.x] = c;
+    }
+    const int run4 = 2 * n32;
+    const int stage4 = MUL1_U * run4;
+    const bool vec = (tbase & 15ull) == 0;
+    uint4 rg[MUL1_PIECES];
+    int lo[8];
+    mul1_lane_lo(lo, lane, bits, half, n32);
+    const int rbase = 2 * (lane & 3);
+    float s0[MUL1_GT], s1[MUL1_GT];
+    #pragma unroll
+    for (int t = 0; t < MUL1_GT; t++) {
+        s0[t] = 0.0f;
+        s1[t] = 0.0f;
+    }
+    for (int sp = 0; sp < S; sp++) {
+        const int kb0 = sp * tps;
+        // every read of the previous split's xs and ring is done (its loop ended in a barrier);
+        // the first split waits for in_row
+        __syncthreads();
+        for (int task = warp; task < T * nblk; task += 8) {
+            const int t = task / nblk, b = task - t * nblk;
+            const int c0 = kb0 * 16 + b * 128 + 4 * lane;
+            const size_t ro = (size_t)in_row[t] * k + c0;
+            float v[4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) v[j] = mode ? mul1_clamp_swiglu(xa[ro + j], xb[ro + j], L) : xa[ro + j];
+            mul1_in_block(v, suh, c0, lane);
+            #pragma unroll
+            for (int j = 0; j < 4; j++) xs[t * rows + b * 128 + 4 * lane + j] = v[j];
+        }
+        float acc0[MUL1_GT], acc1[MUL1_GT];
+        #pragma unroll
+        for (int t = 0; t < MUL1_GT; t++) {
+            acc0[t] = 0.0f;
+            acc1[t] = 0.0f;
+        }
+        for (int kt = 0, buf = 0; kt < tps + MUL1_U; kt += MUL1_U, buf ^= 1) {
+            if (kt < tps) {
+                #pragma unroll
+                for (int q = 0; q < MUL1_PIECES; q++) {
+                    const int i = threadIdx.x + q * 256;
+                    const int u = i / run4, c = i - u * run4;
+                    if (i < stage4 && kt + u < tps) {
+                        const size_t w0 = ((size_t)(kb0 + kt + u) * tiles_n + nb0) * n32 + 4 * c;
+                        if (vec) {
+                            rg[q] = ((const uint4*)tbase)[w0 >> 2];
+                        } else {
+                            const unsigned int* s = (const unsigned int*)tbase + w0;
+                            rg[q] = make_uint4(s[0], s[1], s[2], s[3]);
+                        }
+                    }
+                }
+            }
+            if (kt > 0) {
+                const int kp = kt - MUL1_U;
+                #pragma unroll
+                for (int u = 0; u < MUL1_U; u++) {
+                    if (kp + u < tps)
+                        mul1_tile_fma_g(ring[buf ^ 1] + u * (8 * MUL1_N32MAX) + warp * n32, lo, n32, xs, rows, (kp + u) * 16 + rbase, T, acc0, acc1);
+                }
+            }
+            if (kt < tps) {
+                #pragma unroll
+                for (int q = 0; q < MUL1_PIECES; q++) {
+                    const int i = threadIdx.x + q * 256;
+                    const int u = i / run4, c = i - u * run4;
+                    if (i < stage4 && kt + u < tps) ((uint4*)ring[buf])[u * (2 * MUL1_N32MAX) + c] = rg[q];
+                }
+            }
+            __syncthreads();
+        }
+        // mul1_store_part's reduction, then the left-to-right sum of the partials
+        #pragma unroll
+        for (int t = 0; t < MUL1_GT; t++) {
+            if (t < T) {
+                float a = acc0[t], b = acc1[t];
+                a = __fadd_rn(a, __shfl_xor_sync(0xffffffffu, a, 1));
+                b = __fadd_rn(b, __shfl_xor_sync(0xffffffffu, b, 1));
+                a = __fadd_rn(a, __shfl_xor_sync(0xffffffffu, a, 2));
+                b = __fadd_rn(b, __shfl_xor_sync(0xffffffffu, b, 2));
+                s0[t] = sp == 0 ? a : __fadd_rn(s0[t], a);
+                s1[t] = sp == 0 ? b : __fadd_rn(s1[t], b);
+            }
+        }
+    }
+    // the sums of this block's 128 outputs into shared memory (xs is free: the last split ended
+    // in a barrier), then mul1_out_block's FWHT and scaling, one warp per row
+    if ((lane & 3) == 0) {
+        #pragma unroll
+        for (int t = 0; t < MUL1_GT; t++) {
+            if (t < T) {
+                xs[t * 128 + warp * 16 + (lane >> 2)] = s0[t];
+                xs[t * 128 + warp * 16 + (lane >> 2) + 8] = s1[t];
+            }
+        }
+    }
+    __syncthreads();
+    const int c0 = blockIdx.x * 128 + 4 * lane;
+    for (int t = warp; t < T; t += 8) {
+        float v[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) v[j] = xs[t * 128 + 4 * lane + j];
+        mul1_fwht128(v, lane);
+        const size_t o = (size_t)out_row[t] * n + c0;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) y[o + j] = __fmul_rn(__fmul_rn(v[j], 0.0078125f), mul1_h2f(svh[c0 + j]));
+    }
+}

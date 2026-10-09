@@ -34,6 +34,12 @@
 //! - **CPU lane in the GPU layer** (#188, [`lane`]): a decode call's combos posted by the tiers
 //!   are split; the CPU computes its share from the pinned records while the GPU computes the
 //!   rest, the combine is the GPU's (`GpuMoePlan::experts`, one host wait for x).
+//! - **Prefill, expert-major** ([`ExpertMajor`], [`GpuMoeGroupedPlan`]): a prompt call groups
+//!   its combos by expert (0xSero's glm53-flash-offload prefill, exllamav3's grouped MoE); the
+//!   tiers serve each selected expert once for the call, and `mul1_gemm_grp` decodes an expert's
+//!   trellis once per tile of [`GROUP_ROWS`] rows routed to it (had_in, the k-split GEMV and
+//!   had_out in one block, the clamp fused into the down GEMM's input). Every row has the bits
+//!   of the per-combo path; scratch about 0.3 MB per row instead of about 5 MB.
 //!
 //! Ties in the selection go to the lowest expert index (the rule of `router_top10`); torch's
 //! `topk` gives no order among equal values, so routing is compared as a set per token, and the
@@ -412,7 +418,17 @@ impl GpuFfnPlan {
     /// # Safety
     /// The weights match the plan's shape. `_kn` (the engine kernel table) is no longer read.
     pub unsafe fn run(&self, _kn: &kernels::Kernels, gk: &kernels::glm5_moe::Kernels, w: &GpuFfnWeights, x: CUdeviceptr, y: CUdeviceptr) {
-        let (h, i, t) = (self.hidden, self.inter, self.tokens);
+        self.run_rows(gk, w, x, y, self.tokens);
+    }
+
+    /// [`GpuFfnPlan::run`] on the first `t` rows only (every launch is per row or per element,
+    /// so each row has the bits of `run`)
+    ///
+    /// # Safety
+    /// As [`GpuFfnPlan::run`]; `1 <= t <= tokens`.
+    pub unsafe fn run_rows(&self, gk: &kernels::glm5_moe::Kernels, w: &GpuFfnWeights, x: CUdeviceptr, y: CUdeviceptr, t: usize) {
+        assert!((1..=self.tokens).contains(&t), "glm5_moe: FFN rows {t} of a {}-row plan", self.tokens);
+        let (h, i) = (self.hidden, self.inter);
         assert!((w.gate.rows, w.gate.cols, w.up.rows, w.up.cols, w.down.rows, w.down.cols) == (i, h, i, h, h, i), "glm5_moe: FFN weights do not fit the plan");
         let ((gu, bu), (gd, bd)) = (kernels::glm5_moe::fp4_launch(i, h), kernels::glm5_moe::fp4_launch(h, i));
         // [w, x, gs, y, K, ldy, rows]: gate / up K = hidden, ldy = rows = inter; down the reverse
@@ -689,6 +705,298 @@ impl GpuMoePlan {
             b.host.free();
             cuda::event_destroy(b.ev as cudarc::driver::sys::CUevent);
         }
+    }
+}
+
+// ---------------------------------------------------------------- prefill: expert-major
+
+/// rows of one work item of `mul1_gemm_grp` (`MUL1_GT` in `kernels_mul1.cu`)
+pub const GROUP_ROWS: usize = 16;
+/// activation rows one k-split of `mul1_gemm_grp` stages (`MUL1_GXROWS`)
+pub const GROUP_XROWS: usize = 256;
+/// the grouped GEMM's entry in `kernels::MUL1_SRC`
+pub const GROUP_ENTRY: &str = "mul1_gemm_grp";
+
+/// The expert-major schedule of one prompt call, the prefill of 0xSero's glm53-flash-offload
+/// (exllamav3's grouped MoE): every selected expert is fetched once for the call and applied to
+/// all rows routed to it. Built on the host from the call's `[t][topk]` router ids (the routing
+/// sync the prompt call has anyway).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpertMajor {
+    pub topk: usize,
+    /// the distinct selected experts, ascending
+    pub experts: Vec<u32>,
+    /// every combo `c = row * topk + pick` once, grouped by expert in `experts` order, `c`
+    /// ascending within an expert
+    pub list: Vec<i32>,
+    /// work items `[expert, first entry of list, rows]`, `1 <= rows <= tile`, in `experts` order
+    pub work: Vec<[i32; 3]>,
+    /// per expert of `experts`: the end of its work items in `work`
+    work_end: Vec<usize>,
+}
+
+impl ExpertMajor {
+    /// the schedule of `ids` (`[t][topk]` i32, pick order) over `experts` experts in work items
+    /// of up to `tile` rows; refused by name for an id outside the experts or a ragged selection
+    pub fn new(ids: &[i32], topk: usize, experts: usize, tile: usize) -> Result<ExpertMajor, String> {
+        if topk == 0 || tile == 0 || ids.is_empty() || ids.len() % topk != 0 {
+            return Err(format!("glm5_moe: a selection of {} ids is no [rows][{topk}]", ids.len()));
+        }
+        let mut start = vec![0usize; experts + 1];
+        for &e in ids {
+            if e < 0 || e as usize >= experts {
+                return Err(format!("glm5_moe: the router selected id {e}, outside 0..{experts}"));
+            }
+            start[e as usize + 1] += 1;
+        }
+        for e in 0..experts {
+            start[e + 1] += start[e];
+        }
+        let mut fill = start.clone();
+        let mut list = vec![0i32; ids.len()];
+        for (c, &e) in ids.iter().enumerate() {
+            list[fill[e as usize]] = c as i32;
+            fill[e as usize] += 1;
+        }
+        let (mut ex, mut work, mut work_end) = (Vec::new(), Vec::new(), Vec::new());
+        for e in 0..experts {
+            let (mut f, end) = (start[e], start[e + 1]);
+            if f == end {
+                continue;
+            }
+            ex.push(e as u32);
+            while f < end {
+                let r = tile.min(end - f);
+                work.push([e as i32, f as i32, r as i32]);
+                f += r;
+            }
+            work_end.push(work.len());
+        }
+        Ok(ExpertMajor { topk, experts: ex, list, work, work_end })
+    }
+
+    /// pseudo-rows of [`ExpertMajor::sel`]
+    pub fn pseudo_rows(&self) -> usize {
+        self.experts.len().div_ceil(self.topk)
+    }
+
+    /// The selection the tier hook serves (`ExpertTiers::tables_for_chunk`): the distinct experts
+    /// packed `topk` per pseudo-row in `experts` order, the last pseudo-row padded with its own
+    /// first expert. Each expert is in exactly one pseudo-row, so whatever pseudo-row sub-batches
+    /// the tiers split it into, every expert is put in place once for the call.
+    pub fn sel(&self) -> Vec<i32> {
+        let k = self.topk;
+        let mut v = Vec::with_capacity(self.pseudo_rows() * k);
+        for row in self.experts.chunks(k) {
+            v.extend(row.iter().map(|&e| e as i32));
+            v.extend(std::iter::repeat_n(row[0] as i32, k - row.len()));
+        }
+        v
+    }
+
+    /// the work items of the experts in pseudo-rows `r0 .. r0 + rows` (a contiguous range)
+    pub fn work_of_rows(&self, r0: usize, rows: usize) -> std::ops::Range<usize> {
+        let n = self.experts.len();
+        let (a, b) = ((r0 * self.topk).min(n), ((r0 + rows) * self.topk).min(n));
+        if a >= b {
+            return 0..0;
+        }
+        (if a == 0 { 0 } else { self.work_end[a - 1] })..self.work_end[b - 1]
+    }
+}
+
+/// the most work items of a [`GpuMoeGroupedPlan`] call of `tokens` rows over `experts` experts
+/// top-`topk`: every expert's last item may be short
+pub fn grouped_work_cap(experts: usize, topk: usize, tokens: usize) -> usize {
+    let c = tokens * topk;
+    c.div_ceil(GROUP_ROWS) + experts.min(c)
+}
+
+/// The device bytes of a [`GpuMoeGroupedPlan`] of `tokens` rows, without its parameter arrays,
+/// from the model's geometry alone (the planner's booking, `manager::glm5_chunk_scratch_bytes`):
+/// logits, ids, wts, ge / ue, ye, ys, the combo list, the work items, the shared expert's g / u / h.
+pub fn grouped_plan_bytes(hidden: usize, experts: usize, topk: usize, expert_inter: usize, shared_inter: usize, tokens: usize) -> u64 {
+    let (t, c) = (tokens as u64, (tokens * topk) as u64);
+    let (h, e, i, s) = (hidden as u64, experts as u64, expert_inter as u64, shared_inter as u64);
+    4 * (t * e + 2 * c + 2 * c * i + c * h + t * h + c + 3 * grouped_work_cap(experts, topk, tokens) as u64 + 3 * t * s)
+}
+
+/// One MoE layer of a prompt call of up to `tokens` rows, expert-major ([`ExpertMajor`]): the
+/// router as [`GpuMoePlan::route`], then per tier sub-batch two `mul1_gemm_grp` launches (gate
+/// and up in one, down with the clamp fused into its input), then the shared expert and
+/// `glm5_moe_combine` once. Every routed output row `ye[c]` has the bits of [`GpuMoePlan`]'s
+/// T = 1 slot of combo `c`, so `y` has the bits of [`GpuMoePlan::run`]. Scratch: `ge`, `ue`
+/// `[c][inter]` and `ye` `[c][hidden]` for `c = tokens * topk` combos, no per-slot GEMV plans
+/// (about 0.35 MB per row at GLM-5.3-Flash shapes against GpuMoePlan's about 5 MB).
+pub struct GpuMoeGroupedPlan {
+    pub geo: MoeGeo,
+    pub tokens: usize,
+    prm_kh: CUdeviceptr,
+    prm_route: CUdeviceptr,
+    prm_f: CUdeviceptr,
+    prm_kh2: CUdeviceptr,
+    prm_gu: CUdeviceptr,
+    prm_d: CUdeviceptr,
+    /// `[T][E]` router logits
+    pub logits: CUdeviceptr,
+    /// `[T][K]` i32 expert ids, pick order
+    pub ids: CUdeviceptr,
+    /// `[T][K]` f32 routing weights
+    pub wts: CUdeviceptr,
+    ge: CUdeviceptr,
+    ue: CUdeviceptr,
+    /// `[T * K][H]` the routed experts' outputs (unweighted)
+    pub ye: CUdeviceptr,
+    /// `[T][H]` the shared expert's output
+    pub ys: CUdeviceptr,
+    pub shared: GpuFfnPlan,
+    list: CUdeviceptr,
+    work: CUdeviceptr,
+    work_cap: usize,
+    /// `mul1_gemm_grp` (`CUfunction` as an integer, as `LaneBuf::ev`)
+    grp: u64,
+}
+
+impl GpuMoeGroupedPlan {
+    /// the most work items a call of `tokens` rows can have: every expert's last item may be short
+    pub fn work_cap(geo: &MoeGeo, tokens: usize) -> usize {
+        grouped_work_cap(geo.experts, geo.topk, tokens)
+    }
+
+    /// the device bytes [`GpuMoeGroupedPlan::new`] allocates, without its parameter arrays
+    /// ([`grouped_plan_bytes`] of the plan's geometry)
+    pub fn bytes(geo: &MoeGeo, tokens: usize) -> u64 {
+        grouped_plan_bytes(geo.hidden, geo.experts, geo.topk, geo.expert_inter, geo.shared_inter, tokens)
+    }
+
+    /// # Safety
+    /// A CUDA context is current; `mk` is the module the launches run on.
+    pub unsafe fn new(geo: &MoeGeo, tokens: usize, mk: &mul1::Kernels) -> GpuMoeGroupedPlan {
+        let (h, e, k, i) = (geo.hidden, geo.experts, geo.topk, geo.expert_inter);
+        let c = tokens * k;
+        assert!(tokens > 0 && e <= kernels::glm5_moe::ROUTER_THREADS && (1..=kernels::glm5_moe::MAXK).contains(&k) && k <= e);
+        let [sg, su, sd] = geo.record_specs();
+        let (s_gu, s_d) = (mul1::ksplit(h), mul1::ksplit(i));
+        assert!(h / s_gu <= GROUP_XROWS && i / s_d <= GROUP_XROWS && h % 128 == 0 && i % 128 == 0, "glm5_moe: grouped GEMM shapes H {h} I {i}");
+        let work_cap = Self::work_cap(geo, tokens);
+        assert!(work_cap <= 65_535, "glm5_moe: {work_cap} work items exceed the grid");
+        let prm = |v: [usize; 15]| v.map(|x| i32::try_from(x).expect("glm5_moe: parameter beyond i32"));
+        // [k, n, S, n32, bits, half, in_div, mode, limit bits, (tr, suh, svh) x 2]
+        let gu = prm([h, i, s_gu, sg.n32(), sg.bits as usize, sg.half as usize, k, 0, 0, sg.tr_off, sg.suh_off, sg.svh_off, su.tr_off, su.suh_off, su.svh_off]);
+        let mut d = prm([i, h, s_d, sd.n32(), sd.bits as usize, sd.half as usize, 1, 1, 0, sd.tr_off, sd.suh_off, sd.svh_off, 0, 0, 0]);
+        d[8] = geo.swiglu_limit.to_bits() as i32;
+        GpuMoeGroupedPlan {
+            geo: *geo,
+            tokens,
+            prm_kh: i32_dev(&[h]),
+            prm_route: i32_dev(&[e, k]),
+            prm_f: cuda::to_f32_dev(&[geo.routed_scaling, geo.swiglu_limit]),
+            prm_kh2: i32_dev(&[k, h]),
+            prm_gu: cuda::to_i32_dev(&gu),
+            prm_d: cuda::to_i32_dev(&d),
+            logits: cuda::alloc_zeroed(tokens * e * 4),
+            ids: cuda::alloc_zeroed(c * 4),
+            wts: cuda::alloc_zeroed(c * 4),
+            ge: cuda::alloc_zeroed(c * i * 4),
+            ue: cuda::alloc_zeroed(c * i * 4),
+            ye: cuda::alloc_zeroed(c * h * 4),
+            ys: cuda::alloc_zeroed(tokens * h * 4),
+            shared: GpuFfnPlan::new(h, geo.shared_inter, tokens, geo.swiglu_limit),
+            list: cuda::alloc_zeroed(c * 4),
+            work: cuda::alloc_zeroed(work_cap * 3 * 4),
+            work_cap,
+            grp: mk.module.get(GROUP_ENTRY) as u64,
+        }
+    }
+
+    /// the router on the first `t` rows of `x` into `ids` / `wts` (the launches of
+    /// [`GpuMoePlan::route`], `t` rows)
+    ///
+    /// # Safety
+    /// As [`GpuMoePlan::route`]; `1 <= t <= tokens`.
+    pub unsafe fn route(&self, kn: &kernels::Kernels, gk: &kernels::glm5_moe::Kernels, w: &GpuMoeWeights, x: CUdeviceptr, t: usize) {
+        assert!((1..=self.tokens).contains(&t), "glm5_moe: route {t} rows of a {}-row plan", self.tokens);
+        launch_v(kn.f("gemv_bf16_b"), self.geo.experts as u32, t as u32, 1, 256, &[w.router, x, self.logits, self.prm_kh]);
+        launch_v(gk.router, t as u32, 1, 1, kernels::glm5_moe::ROUTER_THREADS as u32, &[self.logits, w.bias, self.ids, self.wts, self.prm_route, self.prm_f]);
+    }
+
+    /// the schedule's combo list and work items to the device (blocking copies)
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading `list` / `work` is pending.
+    pub unsafe fn upload(&self, s: &ExpertMajor) {
+        assert!(s.list.len() <= self.tokens * self.geo.topk && s.work.len() <= self.work_cap, "glm5_moe: a schedule of {} combos / {} items", s.list.len(), s.work.len());
+        cuda::to_i32_into(self.list, &s.list);
+        let flat: Vec<i32> = s.work.iter().flatten().copied().collect();
+        cuda::to_i32_into(self.work, &flat);
+    }
+
+    /// queue the routed experts of work items `items` of the uploaded schedule through `table`:
+    /// `ye[c]` of their combos from rows `c / topk` of `x` (two launches)
+    ///
+    /// # Safety
+    /// `table` points every expert of these items at a readable record until the launches
+    /// finished; `x` holds the call's rows.
+    pub unsafe fn experts_items(&self, table: CUdeviceptr, x: CUdeviceptr, items: std::ops::Range<usize>) {
+        if items.is_empty() {
+            return;
+        }
+        assert!(items.end <= self.work_cap);
+        let (h, i) = (self.geo.hidden, self.geo.expert_inter);
+        let (f, n) = (self.grp as cudarc::driver::sys::CUfunction, items.len() as u32);
+        let work = self.work + (items.start * 12) as u64;
+        launch_v(f, (i / 128) as u32, n, 2, 256, &[table, work, self.list, x, x, self.ge, self.ue, self.prm_gu]);
+        launch_v(f, (h / 128) as u32, n, 1, 256, &[table, work, self.list, self.ge, self.ue, self.ye, self.ye, self.prm_d]);
+    }
+
+    /// queue the shared expert on the first `t` rows of `x` and the combine into `y`
+    ///
+    /// # Safety
+    /// Every combo of the `t` rows has its `ye` row queued before.
+    pub unsafe fn finish(&self, gk: &kernels::glm5_moe::Kernels, w: &GpuMoeWeights, x: CUdeviceptr, y: CUdeviceptr, t: usize) {
+        self.shared.run_rows(gk, &w.shared, x, self.ys, t);
+        launch_v(gk.combine, self.geo.hidden.div_ceil(256) as u32, t as u32, 1, 256, &[self.ye, self.wts, self.ys, y, self.prm_kh2]);
+    }
+
+    /// The whole layer on the first `t` rows with every selected record in `table`: route, one
+    /// host sync for the ids, the schedule, every item, finish. The tiered prompt call
+    /// (`Glm5Pass::call_with_expert_batches`) runs the same steps around its tier sub-batches.
+    ///
+    /// # Safety
+    /// As [`GpuMoePlan::run`]; synchronizes.
+    pub unsafe fn run(&self, kn: &kernels::Kernels, gk: &kernels::glm5_moe::Kernels, w: &GpuMoeWeights, table: CUdeviceptr, x: CUdeviceptr, y: CUdeviceptr, t: usize) -> Result<ExpertMajor, String> {
+        self.route(kn, gk, w, x, t);
+        cuda::sync();
+        let s = ExpertMajor::new(&cuda::dtoh_i32(self.ids, t * self.geo.topk), self.geo.topk, self.geo.experts, GROUP_ROWS)?;
+        self.upload(&s);
+        self.experts_items(table, x, 0..s.work.len());
+        self.finish(gk, w, x, y, t);
+        Ok(s)
+    }
+
+    /// # Safety
+    /// No launch of this plan is pending.
+    pub unsafe fn free(&mut self) {
+        for d in [
+            &mut self.prm_kh,
+            &mut self.prm_route,
+            &mut self.prm_f,
+            &mut self.prm_kh2,
+            &mut self.prm_gu,
+            &mut self.prm_d,
+            &mut self.logits,
+            &mut self.ids,
+            &mut self.wts,
+            &mut self.ge,
+            &mut self.ue,
+            &mut self.ye,
+            &mut self.ys,
+            &mut self.list,
+            &mut self.work,
+        ] {
+            cuda::free_dev(d);
+        }
+        self.shared.free();
     }
 }
 
@@ -1232,6 +1540,139 @@ mod tests {
         eprintln!("wrote {}: {} experts, clamp fractions {}", dir.display(), r.needed().len(), man["clamp_fraction"]);
     }
 
+    // ---------------------------------------------------------------- prefill: expert-major
+
+    /// `t` rows of `k` distinct picks each over `e` experts, skewed toward low ids (`skew` > 1
+    /// concentrates the picks, as a real router's hot experts do)
+    fn skewed_ids(t: usize, k: usize, e: usize, skew: f64, seed: u64) -> Vec<i32> {
+        let mut rng = Rng(seed);
+        let mut ids = Vec::with_capacity(t * k);
+        for _ in 0..t {
+            let mut row: Vec<i32> = Vec::with_capacity(k);
+            while row.len() < k {
+                let u = (rng.next() >> 11) as f64 / (1u64 << 53) as f64;
+                let x = ((u.powf(skew) * e as f64) as usize).min(e - 1) as i32;
+                if !row.contains(&x) {
+                    row.push(x);
+                }
+            }
+            ids.extend(row);
+        }
+        ids
+    }
+
+    /// The prompt call's expert-major schedule (0xSero's prefill): every combo exactly once,
+    /// grouped by expert, work items of at most `GROUP_ROWS` rows covering each expert's rows in
+    /// order; its pseudo-row selection names each selected expert exactly once, and pseudo-row
+    /// sub-batches map to disjoint work ranges covering every item. Served through the tiers' own
+    /// `serve_chunk` (LRU, the RTX 5090 plan's proportions V 50 + P 124 of 288, a 64-slot prefill
+    /// set, cold), every selected expert is visited, and read from NVMe, at most once in the
+    /// call: the prefill fetches each needed expert once. (The token-row selection the prompt
+    /// call handed the tiers before visits experts in many sub-batches; printed for comparison.)
+    #[test]
+    fn glm5_moe_prompt_call_fetches_each_expert_once() {
+        use crate::expert_cache::{ExpertCache, Policy, Scope};
+        use crate::glm5_tiers::{serve_chunk, Dst, LayerSlots, Mover, Served, TierSizes};
+        struct Count(u64);
+        impl Mover for Count {
+            fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
+                self.0 += jobs.len() as u64;
+                Ok(0)
+            }
+            fn landing_to_stage(&mut self, _: u32) {}
+            fn pinned_to_stage(&mut self, _: u32, _: u32) {}
+            fn vram_to_stage(&mut self, _: u32, _: u32) {}
+            fn barrier(&mut self) {}
+            fn vram_to_pinned(&mut self, _: u32, _: u32) {}
+            fn stage_to_vram(&mut self, _: u32, _: u32) {}
+        }
+        let (e, k) = (288usize, 8usize);
+        // the visits of every expert, the sub-batches and the NVMe reads of one call
+        let serve = |sel: &[i32]| -> (Vec<u32>, usize, u64) {
+            let sizes = TierSizes { vram: 50, pinned: 124 };
+            let mut cache = ExpertCache::new(Policy::Lru, Scope::PerLayer, 1, e, sizes.vram, sizes.pinned).unwrap();
+            let mut slots = LayerSlots::new(e, sizes);
+            let mut m = Count(0);
+            let mut visits = vec![0u32; e];
+            let mut each = |_: usize, _: usize, s: &Served| -> Result<(), String> {
+                for &(x, _) in &s.locs {
+                    visits[x as usize] += 1;
+                }
+                Ok(())
+            };
+            let b = serve_chunk(&mut cache, 0, &mut slots, sel, k, 64, &mut m, &mut each).unwrap();
+            (visits, b, m.0)
+        };
+        for (t, skew, seed) in [(1usize, 1.0, 1u64), (5, 1.0, 2), (32, 1.0, 3), (256, 1.0, 4), (256, 3.0, 5), (2048, 2.0, 6)] {
+            let ids = skewed_ids(t, k, e, skew, seed);
+            let s = ExpertMajor::new(&ids, k, e, GROUP_ROWS).unwrap();
+            // the schedule
+            let mut seen = vec![0u32; t * k];
+            for &c in &s.list {
+                seen[c as usize] += 1;
+            }
+            assert!(seen.iter().all(|&n| n == 1), "t {t}: every combo once");
+            let mut want: Vec<u32> = ids.iter().map(|&x| x as u32).collect();
+            want.sort_unstable();
+            want.dedup();
+            assert_eq!(s.experts, want, "t {t}: the distinct experts, ascending");
+            let mut next = 0usize;
+            for (j, &x) in s.experts.iter().enumerate() {
+                let mine: Vec<(usize, [i32; 3])> = s.work.iter().copied().enumerate().filter(|(_, w)| w[0] == x as i32).collect();
+                assert!(!mine.is_empty() && mine.iter().all(|(_, w)| (1..=GROUP_ROWS as i32).contains(&w[2])), "t {t} expert {x}: items");
+                let first = next;
+                for (wi, w) in &mine {
+                    assert!(s.work_of_rows(j / k, 1).contains(wi), "t {t} expert {x}: item {wi} outside its pseudo-row's range");
+                    assert_eq!(w[1] as usize, next, "t {t} expert {x}: items are consecutive runs of the list");
+                    for &c in &s.list[w[1] as usize..(w[1] + w[2]) as usize] {
+                        assert_eq!(ids[c as usize], x as i32, "t {t}: combo {c} is not expert {x}'s");
+                    }
+                    next += w[2] as usize;
+                }
+                let rows: Vec<usize> = s.list[first..next].iter().map(|&c| c as usize / k).collect();
+                assert!(rows.windows(2).all(|r| r[0] < r[1]), "t {t} expert {x}: rows ascending");
+            }
+            assert_eq!(next, t * k);
+            // the pseudo-rows and their work ranges
+            let sel = s.sel();
+            assert_eq!(sel.len(), s.pseudo_rows() * k);
+            for r in 0..s.pseudo_rows() {
+                let mut row = sel[r * k..(r + 1) * k].to_vec();
+                row.sort_unstable();
+                row.dedup();
+                let names: Vec<i32> = s.experts[r * k..((r + 1) * k).min(s.experts.len())].iter().map(|&x| x as i32).collect();
+                assert_eq!(row, names, "t {t} pseudo-row {r}");
+            }
+            for split in [1usize, 2, 3, 7] {
+                let (mut at, mut r0) = (0usize, 0usize);
+                while r0 < s.pseudo_rows() {
+                    let rows = split.min(s.pseudo_rows() - r0);
+                    let w = s.work_of_rows(r0, rows);
+                    assert_eq!(w.start, at, "t {t}: pseudo-row ranges are disjoint and in order");
+                    at = w.end;
+                    r0 += rows;
+                }
+                assert_eq!(at, s.work.len(), "t {t}: the pseudo-rows cover every item");
+            }
+            // through the tiers: each selected expert served, and read from NVMe, at most once
+            let (visits, batches, reads) = serve(&sel);
+            for x in 0..e {
+                assert_eq!(visits[x], u32::from(s.experts.contains(&(x as u32))), "t {t}: expert {x} served {} times in the call", visits[x]);
+            }
+            assert!(reads <= s.experts.len() as u64, "t {t}: {reads} NVMe reads for {} experts", s.experts.len());
+            let (rv, rb, rr) = serve(&ids);
+            eprintln!(
+                "glm5_moe expert-major t {t} skew {skew}: {} experts, {} items; tiers {batches} sub-batches, {reads} NVMe reads, max visits 1 (token rows: {rb} sub-batches, {rr} NVMe reads, max visits {})",
+                s.experts.len(),
+                s.work.len(),
+                rv.iter().max().unwrap()
+            );
+        }
+        // refused by name
+        assert!(ExpertMajor::new(&[0, 1, 2], 2, 8, 16).unwrap_err().contains("no [rows][2]"));
+        assert!(ExpertMajor::new(&[0, 9], 2, 8, 16).unwrap_err().contains("outside 0..8"));
+    }
+
     // ---------------------------------------------------------------- the GPU lane
 
     /// `GLM5_MOE_SRC` compiles to one PTX module with every entry `NAMES` lists (NVRTC, no GPU)
@@ -1537,6 +1978,236 @@ mod tests {
             free_ffn(dw);
             let (mut wr, mut wb) = (w.router, w.bias);
             for d in [&mut vram, &mut tv, &mut tp, &mut xd, &mut yd, &mut xdd, &mut ydd, &mut wr, &mut wb] {
+                cuda::free_dev(d);
+            }
+            pinned.free();
+        }
+    }
+
+    // ---------------------------------------------------------------- prefill: expert-major (GPU)
+
+    fn router_w(s: &Synth) -> (CUdeviceptr, CUdeviceptr) {
+        unsafe { (cuda::upload_dev(&le_u16(&s.router_w)), cuda::to_f32_dev(&s.bias)) }
+    }
+
+    /// The expert-major layer (`GpuMoeGroupedPlan`, `mul1_gemm_grp`) against the per-combo layer
+    /// (`GpuMoePlan`, one T = 1 MUL1 slot per combo), synthetic GLM layer, 6 distinct 3-bit records
+    /// (expert x reads record x % 6). The router of both plans gives the same ids and weights;
+    /// then, for a skewed routing written in place of the router's (up to 64 rows on one expert:
+    /// items of 16 rows and shorter ones), the grouped layer run in pseudo-row sub-batches of 2,
+    /// alternately through a VRAM and a pinned (zero-copy) table, gives every `ye` row and `y`
+    /// bit for bit as the per-combo layer; `GpuMoeGroupedPlan::run` on a larger plan (t of
+    /// `t + 3` rows) gives `GpuMoePlan::run`'s `y` bit for bit. t = 1, 37, 64.
+    #[test]
+    #[ignore = "needs the GPU (about 1 GB VRAM): cargo test --release --lib glm5_moe_gpu_grouped -- --ignored --nocapture --test-threads 1"]
+    fn glm5_moe_gpu_grouped_is_the_per_combo_layer_bit_for_bit() {
+        const NR: usize = 6;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let (_m, kn) = main_kernels();
+            let mk = mul1::Kernels::new();
+            let gk = kernels::glm5_moe::Kernels::new();
+            let (s, g) = (synth(), geo());
+            let (h, k, e) = (g.hidden, g.topk, g.experts);
+            let recs: Vec<u8> = (0..NR as u32).flat_map(record).collect();
+            let rb = cpu_mul1::GLM_RECORD_BYTES_K3 as u64;
+            let mut vram = cuda::upload_dev(&recs);
+            let mut pinned = cuda::Pinned::alloc_cold(recs.len());
+            pinned.write_bytes(0, &recs);
+            let table = |base: u64| -> Vec<u64> { (0..e).map(|x| base + rb * (x % NR) as u64).collect() };
+            let (mut tv, mut tp) = (cuda::to_u64_dev(&table(vram)), cuda::to_u64_dev(&table(pinned.dev)));
+            let (router, bias) = router_w(&s);
+            let w = GpuMoeWeights { router, bias, shared: gpu_ffn(&s.shared) };
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            lane::post(None);
+            for (t, skew, seed) in [(1usize, 1.0, 11u64), (37, 1.0, 12), (64, 6.0, 13)] {
+                let mut rng = Rng(seed);
+                let x: Vec<f32> = (0..t * h).map(|_| rng.f(X_AMP)).collect();
+                let (mut xd, mut ya, mut yb) = (cuda::to_f32_dev(&x), cuda::alloc_zeroed(t * h * 4), cuda::alloc_zeroed(t * h * 4));
+                let mut a = GpuMoePlan::new(&g, t);
+                let before = cuda::live_dev().1;
+                let mut b = GpuMoeGroupedPlan::new(&g, t + 3, &mk);
+                let got = cuda::live_dev().1 - before;
+                assert!(got.abs_diff(GpuMoeGroupedPlan::bytes(&g, t + 3)) <= 4 << 10, "t {t}: the plan allocated {got} B, bytes() says {}", GpuMoeGroupedPlan::bytes(&g, t + 3));
+                a.route(&kn, &gk, &w, xd);
+                b.route(&kn, &gk, &w, xd, t);
+                cuda::sync();
+                assert_eq!(cuda::dtoh_i32(a.ids, t * k), cuda::dtoh_i32(b.ids, t * k), "t {t}: router ids");
+                assert!(bits(&cuda::dtoh(a.wts, t * k)) == bits(&cuda::dtoh(b.wts, t * k)), "t {t}: router weights");
+                // a skewed routing in place of the router's
+                let ids = skewed_ids(t, k, e, skew, seed);
+                cuda::to_i32_into(a.ids, &ids);
+                cuda::to_i32_into(b.ids, &ids);
+                a.experts(&kn, &mk, &gk, &w, tv, xd, ya);
+                let sch = ExpertMajor::new(&ids, k, e, GROUP_ROWS).unwrap();
+                cuda::sync();
+                b.upload(&sch);
+                let (mut r0, mut n) = (0usize, 0usize);
+                while r0 < sch.pseudo_rows() {
+                    let rows = 2.min(sch.pseudo_rows() - r0);
+                    b.experts_items(if n % 2 == 0 { tv } else { tp }, xd, sch.work_of_rows(r0, rows));
+                    r0 += rows;
+                    n += 1;
+                }
+                b.finish(&gk, &w, xd, yb, t);
+                cuda::sync();
+                let (yea, yeb) = (cuda::dtoh(a.ye, t * k * h), cuda::dtoh(b.ye, t * k * h));
+                for c in 0..t * k {
+                    assert!(bits(&yea[c * h..(c + 1) * h]) == bits(&yeb[c * h..(c + 1) * h]), "t {t}: ye of combo {c} (expert {}) differs", ids[c]);
+                }
+                assert!(bits(&cuda::dtoh(ya, t * h)) == bits(&cuda::dtoh(yb, t * h)), "t {t}: y differs");
+                let most = sch.work.iter().fold(std::collections::HashMap::<i32, i32>::new(), |mut m, w| {
+                    *m.entry(w[0]).or_default() += w[2];
+                    m
+                });
+                eprintln!(
+                    "glm5_moe grouped t {t}: {} experts, {} items, {n} sub-batches, at most {} rows on one expert: ye and y bit-identical to the per-combo layer",
+                    sch.experts.len(),
+                    sch.work.len(),
+                    most.values().max().unwrap()
+                );
+                // the whole layer, the router's own ids
+                a.run(&kn, &mk, &gk, &w, tv, xd, ya);
+                b.run(&kn, &gk, &w, tp, xd, yb, t).unwrap();
+                cuda::sync();
+                assert!(bits(&cuda::dtoh(ya, t * h)) == bits(&cuda::dtoh(yb, t * h)), "t {t}: run differs");
+                a.free();
+                b.free();
+                for d in [&mut xd, &mut ya, &mut yb] {
+                    cuda::free_dev(d);
+                }
+            }
+            free_ffn(w.shared);
+            let (mut wr, mut wb) = (w.router, w.bias);
+            for d in [&mut vram, &mut tv, &mut tp, &mut wr, &mut wb] {
+                cuda::free_dev(d);
+            }
+            pinned.free();
+        }
+    }
+
+    /// Bench: the routed experts of one MoE layer, per-combo (`GpuMoePlan::experts`: gather, one
+    /// T = 1 MUL1 slot per combo for gate / up / down, clamp, shared, combine) against
+    /// expert-major (`GpuMoeGroupedPlan::experts_items` + `finish`: two `mul1_gemm_grp`
+    /// launches, shared, combine), one synthetic 3-bit record copied to 288 distinct VRAM slots
+    /// (no L2 sharing between experts). (a) every row picks the same 8 experts, so each expert
+    /// has t rows: expert-rows/s and ms per expert; (b) a uniform routing over 288 experts;
+    /// (c) as (b) with 64 records in pinned RAM (zero-copy, expert x reads record x % 64).
+    /// Median of 9 calls after 2 warm-up calls, host wall around a stream sync.
+    #[test]
+    #[ignore = "bench, needs the GPU (about 5 GB VRAM, 0.6 GB pinned): cargo test --release --lib glm5_moe_gpu_grouped_bench -- --ignored --nocapture --test-threads 1"]
+    fn glm5_moe_gpu_grouped_bench() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let (_m, kn) = main_kernels();
+            let mk = mul1::Kernels::new();
+            let gk = kernels::glm5_moe::Kernels::new();
+            let (s, g) = (synth(), geo());
+            let (h, k, e) = (g.hidden, g.topk, g.experts);
+            let rec = record(3);
+            let rb = rec.len();
+            let one = cuda::upload_dev(&rec);
+            let mut arena = cuda::alloc_named("bench records", e * rb);
+            for x in 0..e {
+                cuda::d2d_async(arena + (x * rb) as u64, one, rb);
+            }
+            cuda::sync();
+            let mut one = one;
+            cuda::free_dev(&mut one);
+            const NP: usize = 64;
+            let mut pinned = cuda::Pinned::alloc_cold(NP * rb);
+            for x in 0..NP {
+                pinned.write_bytes(x * rb, &rec);
+            }
+            let mut tv = cuda::to_u64_dev(&(0..e).map(|x| arena + (x * rb) as u64).collect::<Vec<_>>());
+            let mut tp = cuda::to_u64_dev(&(0..e).map(|x| pinned.dev + ((x % NP) * rb) as u64).collect::<Vec<_>>());
+            let (router, bias) = router_w(&s);
+            let w = GpuMoeWeights { router, bias, shared: gpu_ffn(&s.shared) };
+            lane::post(None);
+            {
+                use cudarc::driver::sys::{cuFuncGetAttribute, CUfunction_attribute as A};
+                let f = mk.module.get(GROUP_ENTRY);
+                let at = |a: A| -> i32 {
+                    let mut v = 0i32;
+                    cuda::ck(cuFuncGetAttribute(&mut v, a, f));
+                    v
+                };
+                eprintln!(
+                    "glm5_moe grouped bench: {GROUP_ENTRY} {} registers, {} B local (spills), {} B static shared",
+                    at(A::CU_FUNC_ATTRIBUTE_NUM_REGS),
+                    at(A::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+                    at(A::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)
+                );
+            }
+            let med = |f: &mut dyn FnMut()| -> f64 {
+                let mut v = Vec::new();
+                for i in 0..11 {
+                    let t0 = std::time::Instant::now();
+                    f();
+                    cuda::sync();
+                    if i >= 2 {
+                        v.push(t0.elapsed().as_secs_f64());
+                    }
+                }
+                v.sort_by(|a, b| a.total_cmp(b));
+                v[v.len() / 2]
+            };
+            let mut rng = Rng(0x9e57);
+            let cases: Vec<(&str, usize, Vec<i32>, bool)> = vec![
+                ("same 8 experts", 1, (0..8).collect(), false),
+                ("same 8 experts", 4, (0..4).flat_map(|_| 0..8).collect(), false),
+                ("same 8 experts", 16, (0..16).flat_map(|_| 0..8).collect(), false),
+                ("same 8 experts", 64, (0..64).flat_map(|_| 0..8).collect(), false),
+                ("same 8 experts", 228, (0..228).flat_map(|_| 0..8).collect(), false),
+                ("uniform over 288", 64, skewed_ids(64, k, e, 1.0, rng.next()), false),
+                ("uniform over 288", 256, skewed_ids(256, k, e, 1.0, rng.next()), false),
+                ("uniform over 288", 2048, skewed_ids(2048, k, e, 1.0, rng.next()), false),
+                ("uniform over 288", 8192, skewed_ids(8192, k, e, 1.0, rng.next()), false),
+                ("uniform over 288, pinned", 64, skewed_ids(64, k, e, 1.0, rng.next()), true),
+                ("uniform over 288, pinned", 256, skewed_ids(256, k, e, 1.0, rng.next()), true),
+                ("uniform over 288, pinned", 2048, skewed_ids(2048, k, e, 1.0, rng.next()), true),
+            ];
+            for (name, t, ids, pin) in cases {
+                let table = if pin { tp } else { tv };
+                let x: Vec<f32> = (0..t * h).map(|_| rng.f(X_AMP)).collect();
+                let (mut xd, mut yd) = (cuda::to_f32_dev(&x), cuda::alloc_zeroed(t * h * 4));
+                let sch = ExpertMajor::new(&ids, k, e, GROUP_ROWS).unwrap();
+                let mut b = GpuMoeGroupedPlan::new(&g, t, &mk);
+                cuda::to_i32_into(b.ids, &ids);
+                b.upload(&sch);
+                let tg = med(&mut || {
+                    b.experts_items(table, xd, 0..sch.work.len());
+                    b.finish(&gk, &w, xd, yd, t);
+                });
+                let yg = cuda::dtoh(yd, t * h);
+                b.free();
+                let combos = (t * k) as f64;
+                let per = if t <= 256 {
+                    let mut a = GpuMoePlan::new(&g, t);
+                    cuda::to_i32_into(a.ids, &ids);
+                    let tc = med(&mut || a.experts(&kn, &mk, &gk, &w, table, xd, yd));
+                    let same = cuda::dtoh(yd, t * h).iter().zip(&yg).all(|(p, q)| p.to_bits() == q.to_bits());
+                    a.free();
+                    assert!(same, "{name} t {t}: the two paths differ");
+                    format!("per-combo {:.3} ms ({:.0} expert-rows/s), speedup {:.1}x", tc * 1e3, combos / tc, tc / tg)
+                } else {
+                    "per-combo not run (its plan needs about 5 MB per row)".to_string()
+                };
+                eprintln!(
+                    "glm5_moe grouped bench {name}, t {t}: {} experts, {} items; grouped {:.3} ms ({:.0} expert-rows/s, {:.1} us per expert); {per}",
+                    sch.experts.len(),
+                    sch.work.len(),
+                    tg * 1e3,
+                    combos / tg,
+                    tg * 1e6 / sch.experts.len() as f64
+                );
+                for d in [&mut xd, &mut yd] {
+                    cuda::free_dev(d);
+                }
+            }
+            free_ffn(w.shared);
+            let (mut wr, mut wb) = (w.router, w.bias);
+            for d in [&mut arena, &mut tv, &mut tp, &mut wr, &mut wb] {
                 cuda::free_dev(d);
             }
             pinned.free();
