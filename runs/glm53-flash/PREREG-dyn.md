@@ -150,3 +150,11 @@ Amendments (dated, below this line, written before the result they judge):
     - Built, all reported without threshold: every grid point on every calibration file, every fold, the held-out row with the chosen point, Belady MIN at C, per-layer r, the depth buckets, the first 1,000 generated positions against the rest, and the reset-at-first-generated variant.
     - Not built, all reported-only: SEED+LRU and IDPF in the global arena, the oracle-prefetch stage row, the stage table against the static cut, and PCIe / DRAM bytes for these policies.
     - None of them decides the gate.
+
+## Amendment 4 (2026-10-09, before any G1d row): robin's confirmation
+
+robin, 2026-10-09 (chat, translated): "I think the thresholds fit, as you said." Confirmed therefore, unchanged:
+1. The bar r_hi x S <= B / 40 tok/s on the upper 95 % CI bound; the deciding cell is 3.05 bpw (S = 9,474,048 B, confirmed by #181): **r_hi <= 18.4 NVMe reads per token** (5.5 % of 336 visits, B 6.994 GB/s, 1 reader). 4.5 and 3.5 bpw are reported without a gate role.
+2. Primary cell: per-layer arena, R 46 GiB (`HOST_PINNED_CAP` unchanged), V25, C 161.
+3. The policy grid s {0, 0.25, 0.5} x P {0, 4, 8, 16} x d {1, 2, 4} and the tie order as written.
+Items 3 and 5 of the original list were settled by amendment 1. Also decided by robin on 2026-10-09: the DSA indexer cache stays in the HF / zai-org layout (257 values, BF16, 514 B per token and layer, #163); the f32 / llama.cpp layouts are not used.
