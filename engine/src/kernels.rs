@@ -6425,6 +6425,49 @@ pub mod mul1 {
     }
 }
 
+// ---------------- #164: glm5_next FFN kernels ----------------
+
+/// #164: the glm5_next router / SwiGLU-clamp / combine source (`kernels_glm5_moe.cu`). Its own
+/// NVRTC module, compiled alone by `glm5_moe::Kernels::new` (the `MUL1_SRC` rule: one more
+/// `.entry` in `KERNEL_SRC` would break the PTX of record). The host side is `crate::glm5_moe`.
+pub const GLM5_MOE_SRC: &str = include_str!("kernels_glm5_moe.cu");
+
+/// #164: the entries of `GLM5_MOE_SRC`, resolved once (the launches live in `crate::glm5_moe`)
+pub mod glm5_moe {
+    use crate::cuda;
+    use cudarc::driver::sys::CUfunction;
+
+    /// every entry of `GLM5_MOE_SRC`
+    pub const NAMES: &[&str] = &["glm5_router_sig_topk", "glm5_moe_gather", "glm5_swiglu_clamp", "glm5_moe_combine"];
+    /// threads of one router block, the most experts the router takes (`GLM5_ROUTER_THREADS`)
+    pub const ROUTER_THREADS: usize = 512;
+    /// the largest top-k the router takes (`GLM5_MAXK`)
+    pub const MAXK: usize = 16;
+
+    pub struct Kernels {
+        pub module: cuda::Module,
+        pub router: CUfunction,
+        pub gather: CUfunction,
+        pub act: CUfunction,
+        pub combine: CUfunction,
+    }
+
+    impl Kernels {
+        /// # Safety
+        /// A CUDA context is current.
+        pub unsafe fn new() -> Kernels {
+            let module = cuda::compile(super::GLM5_MOE_SRC);
+            Kernels {
+                router: module.get("glm5_router_sig_topk"),
+                gather: module.get("glm5_moe_gather"),
+                act: module.get("glm5_swiglu_clamp"),
+                combine: module.get("glm5_moe_combine"),
+                module,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests_mul1_src {
     //! #180: `MUL1_SRC` compiles with the engine's option set to one PTX module carrying every
