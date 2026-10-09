@@ -46,7 +46,7 @@ use crate::glm5_head::{Head, HeadGeo};
 use crate::glm5_kda::{self, KdaDims, KdaKernels, KdaProj, KdaScratch, KdaState, KdaWeights};
 use crate::glm5_mhc::{self, SiteDev, HC, MIX};
 use crate::glm5_mla::{MlaCache, MlaDims, MlaKernels, MlaProj, MlaScratch, MlaWeights};
-use crate::glm5_moe::{GpuFfnPlan, GpuFfnWeights, GpuMoePlan, GpuMoeWeights, GpuNvfp4, MoeGeo, Routing};
+use crate::glm5_moe::{ExpertMajor, GpuFfnPlan, GpuFfnWeights, GpuMoeGroupedPlan, GpuMoePlan, GpuMoeWeights, GpuNvfp4, MoeGeo, Routing, GROUP_ROWS};
 use crate::kernels::{self, launch_v, mul1, KernelGeo};
 use cudarc::driver::sys::CUdeviceptr;
 
@@ -743,10 +743,11 @@ pub struct Taps {
 /// i32)` -> the device `[E]` u64 record table the MUL1 kernels read for this call
 pub type ExpertHook<'a> = dyn FnMut(usize, &[i32]) -> Result<Dev, String> + 'a;
 
-/// #186: the expert hook of [`Glm5Pass::call_with_expert_batches`]: `(layer, selected ids
-/// [t][topk] i32, run)`. The hook puts the records of consecutive row sub-batches in place and
+/// #186: the expert hook of [`Glm5Pass::call_with_expert_batches`]: `(layer, selection
+/// [rows][topk] i32, run)`. The hook puts the records of consecutive row sub-batches in place and
 /// calls `run(row0, rows, table)` for each, in row order, every row exactly once; `run` queues
-/// that sub-batch's experts through the device `[E]` u64 `table`.
+/// that sub-batch's experts through the device `[E]` u64 `table`. The prompt call hands it the
+/// pseudo-rows of its expert-major schedule ([`ExpertMajor::sel`]), not its token rows.
 pub type ExpertBatchHook<'a> = dyn FnMut(usize, &[i32], &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<(), String> + 'a;
 
 /// The per-sequence state and scratch of a layer-at-a-time pass over up to `cap` rows in calls
@@ -771,6 +772,8 @@ pub struct Glm5Pass {
     /// `[max_t][hidden]`: the sublayer output
     pub sub: Dev,
     moe_plans: Vec<GpuMoePlan>,
+    /// the expert-major MoE plan of prompt calls (`call_with_expert_batches`), `max_t` rows
+    grouped: Option<GpuMoeGroupedPlan>,
     dense_plans: Vec<GpuFfnPlan>,
     last_ffn_t: usize,
     /// #149 path B (`CROW_GLM_FLAGS=1`, set by `Glm5Run`): the router ids of a MoE call reach the
@@ -806,6 +809,7 @@ impl Glm5Pass {
             collapsed: cuda::alloc_named("glm5 collapsed", max_t * h * 4),
             sub: cuda::alloc_named("glm5 sublayer out", max_t * h * 4),
             moe_plans: Vec::new(),
+            grouped: None,
             dense_plans: Vec::new(),
             last_ffn_t: 0,
             routed: None,
@@ -1023,8 +1027,14 @@ impl Glm5Pass {
     /// # Safety
     /// The last call ran a MoE layer.
     pub unsafe fn routing(&self) -> Routing {
-        let p = self.moe_plans.iter().find(|p| p.tokens == self.last_ffn_t).expect("glm5_model: no MoE call yet");
-        p.read_routing()
+        if let Some(p) = self.moe_plans.iter().find(|p| p.tokens == self.last_ffn_t) {
+            return p.read_routing();
+        }
+        // a prompt call (`call_with_expert_batches`) routed its `last_ffn_t` rows on the grouped plan
+        let p = self.grouped.as_ref().expect("glm5_model: no MoE call yet");
+        cuda::sync();
+        let c = self.last_ffn_t * self.moe.topk;
+        Routing { topk: self.moe.topk, ids: cuda::dtoh_i32(p.ids, c).into_iter().map(|v| v as u32).collect(), weights: cuda::dtoh(p.wts, c) }
     }
 
     /// # Safety
@@ -1036,6 +1046,9 @@ impl Glm5Pass {
         self.mla_sc.free();
         self.mla_c.free();
         for p in self.moe_plans.iter_mut() {
+            p.free();
+        }
+        if let Some(p) = self.grouped.as_mut() {
             p.free();
         }
         for p in self.dense_plans.iter_mut() {
@@ -1069,17 +1082,18 @@ pub unsafe fn router_ids(routed: Option<&mut crate::glm5_flags::Routed>, ids: De
     }
 }
 
-/// #186: the prompt call with its experts in row sub-batches.
+/// #186: the prompt call with its experts served in sub-batches, expert-major.
 impl Glm5Pass {
-    /// #186: one prompt call (`decode` false) of a layer loaded without its expert records, its
-    /// MoE selection served in row sub-batches. The launches of [`Glm5Pass::call_with_experts`]
-    /// for a prompt call, in the same order, up to the FFN. The FFN plans stay at the sizes the
-    /// plan books (`manager::glm5_prompt_call_sizes`) whatever `t` is: a dense FFN runs in
-    /// descending power-of-two row pieces ([`dense_rows`]); the MoE router runs on the plan of
-    /// `max_t` rows (rows `t ..` of that launch read stale rows and are never used), the host
-    /// reads the `t` rows' ids (one stream sync for the call), and `experts` hands back the
-    /// sub-batches: each one's experts run on its rows only ([`moe_rows`]). Every FFN launch is
-    /// per row or per (row, expert) combo, so each row gets the bits of one `t`-row call.
+    /// #186: one prompt call (`decode` false) of a layer loaded without its expert records. The
+    /// launches of [`Glm5Pass::call_with_experts`] for a prompt call, in the same order, up to the
+    /// FFN. A dense FFN runs in descending power-of-two row pieces ([`dense_rows`]). The MoE runs
+    /// expert-major on the pass's [`GpuMoeGroupedPlan`] of `max_t` rows: the router on the `t`
+    /// rows, the host reads their ids (one stream sync for the call) and builds the
+    /// [`ExpertMajor`] schedule, `experts` serves its pseudo-rows (every selected expert in
+    /// exactly one sub-batch, fetched once for the call) and each sub-batch runs every row routed
+    /// to its experts (`mul1_gemm_grp`, the expert decoded once per tile of 16 rows); the shared
+    /// expert and the combine follow once. Every FFN row has the bits of the per-combo path
+    /// ([`GpuMoePlan`], [`moe_rows`]), so each row gets the bits of one `t`-row call.
     ///
     /// # Safety
     /// As [`Glm5Pass::call`]; every table entry of a sub-batch's selected id is a readable record
@@ -1129,27 +1143,32 @@ impl Glm5Pass {
             }
             FfnW::Moe { w, .. } => w,
         };
-        let mt = self.max_t;
-        if !self.moe_plans.iter().any(|p| p.tokens == mt) {
-            self.moe_plans.push(GpuMoePlan::new(&self.moe, mt));
+        // expert-major (0xSero's glm53-flash-offload prefill): the router on the call's rows, one
+        // routing sync, the call's schedule; the tiers serve its pseudo-rows (each selected expert
+        // in exactly one), and each sub-batch runs every row routed to its experts
+        if self.grouped.is_none() {
+            self.grouped = Some(GpuMoeGroupedPlan::new(&self.moe, self.max_t, &self.kn.mul1));
         }
-        let full = self.moe_plans.iter().position(|p| p.tokens == mt).unwrap();
-        self.moe_plans[full].route(&self.kn.k, &self.kn.moe, w, self.collapsed);
-        let ids = router_ids(None, self.moe_plans[full].ids, t * self.moe.topk, lw.layer)?;
-        let (kn, moe, plans, collapsed, sub) = (&self.kn, self.moe, &mut self.moe_plans, self.collapsed, self.sub);
+        let gp = self.grouped.as_ref().unwrap();
+        gp.route(&self.kn.k, &self.kn.moe, w, self.collapsed, t);
+        let ids = router_ids(None, gp.ids, t * self.moe.topk, lw.layer)?;
+        let s = ExpertMajor::new(&ids, self.moe.topk, self.moe.experts, GROUP_ROWS).map_err(|e| format!("layer {}: {e}", lw.layer))?;
+        gp.upload(&s);
+        let (sel, pr, collapsed) = (s.sel(), s.pseudo_rows(), self.collapsed);
         let mut covered = 0usize;
         let mut run = |r0: usize, rows: usize, table: Dev| -> Result<(), String> {
-            if r0 != covered || rows == 0 || r0 + rows > t {
-                return Err(format!("layer {}: a sub-batch of rows {r0}..{} after {covered} of {t} rows", lw.layer, r0 + rows));
+            if r0 != covered || rows == 0 || r0 + rows > pr {
+                return Err(format!("layer {}: a sub-batch of pseudo-rows {r0}..{} after {covered} of {pr}", lw.layer, r0 + rows));
             }
-            moe_rows(&kn.k, &kn.mul1, &kn.moe, &moe, plans, full, w, table, collapsed, sub, r0, rows);
+            gp.experts_items(table, collapsed, s.work_of_rows(r0, rows));
             covered += rows;
             Ok(())
         };
-        experts(lw.layer, &ids, &mut run)?;
-        if covered != t {
-            return Err(format!("layer {}: the expert hook served {covered} of {t} rows", lw.layer));
+        experts(lw.layer, &sel, &mut run)?;
+        if covered != pr {
+            return Err(format!("layer {}: the expert hook served {covered} of {pr} pseudo-rows", lw.layer));
         }
+        gp.finish(&self.kn.moe, w, self.collapsed, self.sub, t);
         self.last_ffn_t = t;
         self.mhc.expand(&self.kn.mhc, x, self.sub, x, t);
         Ok(())
