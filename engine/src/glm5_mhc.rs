@@ -164,7 +164,7 @@ pub fn site(x: &[f32], fn_: &[u16], base: &[f32; MIX], scale: &[f32; 3], h: usiz
 // ---------------- the GPU half (`kernels_glm5_mhc.cu`) ----------------
 
 /// every entry of `kernels::GLM5_MHC_SRC`
-pub const NAMES: &[&str] = &["glm5_mhc_coeffs", "glm5_mhc_expand", "glm5_mhc_mix"];
+pub const NAMES: &[&str] = &["glm5_mhc_coeffs", "glm5_mhc_expand", "glm5_mhc_mix", "glm5_mhc_mix_norm"];
 
 /// the compiled module and its entries
 pub struct Kernels {
@@ -172,6 +172,8 @@ pub struct Kernels {
     expand: CUfunction,
     /// #191: steps 1-5 over (24, T) blocks, the last block of a row runs 3-5 and the collapse
     mix: CUfunction,
+    /// `CROW_GLM_HCFUSE`: `mix`, then the sublayer RMSNorm over `collapsed`, one launch
+    mix_norm: CUfunction,
 }
 
 impl Kernels {
@@ -182,9 +184,26 @@ impl Kernels {
         Kernels {
             expand: module.get("glm5_mhc_expand"),
             mix: module.get("glm5_mhc_mix"),
+            mix_norm: module.get("glm5_mhc_mix_norm"),
             module,
         }
     }
+}
+
+/// The switch of the fused site (0xSero's `GLM53_K_HCFUSE`, glm53-flash-offload 6769b27
+/// `glm53/k_hcfuse.py`, rebuilt for this engine): [`Plan::coeffs_norm`] in place of
+/// [`Plan::coeffs`] + the driver's `MlaKernels::rmsnorm_rows`, 3 -> 2 launches per site
+/// (`coeffs_norm`, `expand`; his fused site is 2 launches too, his stock one 4), bit-identical.
+/// The tapped path keeps the unfused order: its taps read `collapsed` before the norm.
+pub const HCFUSE_ENV: &str = "CROW_GLM_HCFUSE";
+
+/// `1` turns the switch on; unset or any other value leaves it off (the repo's `CROW_*` rule)
+pub fn hcfuse_parse(v: Option<&str>) -> bool {
+    v == Some("1")
+}
+
+pub fn hcfuse_from_env() -> bool {
+    hcfuse_parse(std::env::var(HCFUSE_ENV).ok().as_deref())
 }
 
 /// The device weights of one site (`layers.L.hc_{attn,ffn}_{fn,base,scale}`): `fn_` `[24][4h]`
@@ -260,6 +279,19 @@ impl Plan {
         assert!((1..=self.max_tokens).contains(&t), "mhc: {t} rows (1..={})", self.max_tokens);
         launch_v(kn.mix, MIX as u32, t as u32, 1, THREADS as u32, &[
             x, w.fn_, w.base, w.scale, self.logits, self.pre, self.post, self.comb, collapsed, self.done, self.prm]);
+    }
+
+    /// `CROW_GLM_HCFUSE`: [`Plan::coeffs`], then the sublayer's weighted RMSNorm (`norm_w` `[h]`
+    /// f32, `input_layernorm` / `post_attention_layernorm`) over `collapsed` in place, in one
+    /// launch (`glm5_mhc_mix_norm`). Bit-identical to `coeffs` followed by
+    /// `MlaKernels::rmsnorm_rows(collapsed, norm_w, h, t, _)`.
+    ///
+    /// # Safety
+    /// As [`Plan::coeffs`]; `norm_w` holds `h` f32.
+    pub unsafe fn coeffs_norm(&self, kn: &Kernels, w: &SiteDev, x: CUdeviceptr, norm_w: CUdeviceptr, collapsed: CUdeviceptr, t: usize) {
+        assert!((1..=self.max_tokens).contains(&t), "mhc: {t} rows (1..={})", self.max_tokens);
+        launch_v(kn.mix_norm, MIX as u32, t as u32, 1, THREADS as u32, &[
+            x, w.fn_, w.base, w.scale, self.logits, self.pre, self.post, self.comb, collapsed, self.done, self.prm, norm_w]);
     }
 
     /// Queue step 6 for `t` rows with the coefficients of the last `coeffs`: `x` `[t][4][h]` (the
@@ -408,6 +440,16 @@ mod tests {
     const EXACT: f64 = 4e-6;
     /// gate G3 (plan, "Tore"): per-layer cosine against the golden
     const G3: f64 = 0.9999;
+
+    #[test]
+    fn glm5_mhc_hcfuse_switch_is_crow_glm_hcfuse_1() {
+        assert_eq!(HCFUSE_ENV, "CROW_GLM_HCFUSE");
+        assert!(hcfuse_parse(Some("1")));
+        for v in [None, Some("0"), Some(""), Some("true"), Some(" 1")] {
+            assert!(!hcfuse_parse(v), "{v:?}");
+        }
+        assert!(NAMES.contains(&"glm5_mhc_mix_norm"));
+    }
 
     #[test]
     fn glm5_mhc_fixture_matches_its_manifest() {
@@ -744,6 +786,151 @@ mod tests_gpu {
             }
             plan.free();
             assert!(p <= COEFFS_US, "the plan's coeffs take {p:.1} us per site (bound {COEFFS_US} us)");
+        }
+    }
+
+    /// the layer driver's sublayer norm (`MlaKernels::rmsnorm_rows`, `gm_rmsnorm` of the MLA
+    /// module at the GLM-5.3-Flash shapes): the launch `CROW_GLM_HCFUSE` folds into the site
+    unsafe fn gm_rmsnorm() -> (cuda::Module, CUfunction) {
+        let d = crate::glm5_mla::MlaDims::of(&crate::geo::Glm5Geo::GLM_5_3_FLASH);
+        let m = crate::kernels::glm5_mla_module(&d.prelude());
+        let f = m.get("gm_rmsnorm");
+        (m, f)
+    }
+
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_mhc_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mhc_gpu_coeffs_norm_is_bit_identical_to_coeffs_then_rmsnorm() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Kernels::new();
+            let (_mm, norm) = gm_rmsnorm();
+            let st = cuda::to_i32_dev(&[0i32, 0]);
+            let f = real();
+            let mut seed = 0x0c0f_fee5_eed5_1dd1u64;
+            let mut cases: Vec<(String, usize, usize, Vec<u16>, [f32; MIX], [f32; 3], Vec<f32>)> =
+                vec![("real".into(), f.h, f.t, f.fn_.clone(), f.base, f.scale, f.x.clone())];
+            for (h, t) in [(4096usize, 1usize), (4096, 5), (4096, 16), (64, 3), (8, 2)] {
+                let fn_ = bf16s(&rnd(MIX * HC * h, &mut seed, 0.05));
+                let base: [f32; MIX] = rnd(MIX, &mut seed, 1.0).try_into().unwrap();
+                let scale: [f32; 3] = rnd(3, &mut seed, 2.0).try_into().unwrap();
+                cases.push((format!("random h {h} t {t}"), h, t, fn_, base, scale, rnd(t * HC * h, &mut seed, 3.0)));
+            }
+            for (name, h, t, fn_, base, scale, x) in &cases {
+                let (h, t) = (*h, *t);
+                let mut w = SiteDev::upload(fn_, base, scale);
+                let mut nw = cuda::to_f32_dev(&rnd(h, &mut seed, 1.5));
+                let (mut pa, mut pb) = (Plan::new(h, t), Plan::new(h, t));
+                let mut xd = cuda::to_f32_dev(x);
+                let nan_h = vec![f32::NAN; t * h];
+                let (mut ca, mut cb) = (cuda::to_f32_dev(&nan_h), cuda::to_f32_dev(&nan_h));
+                // the path of record: the site's one launch, then the driver's norm launch
+                pa.coeffs(&kn, &w, xd, ca, t);
+                launch_v(norm, t as u32, 1, 1, 256, &[ca, nw, h as u64, st]);
+                for rep in 0..3 {
+                    for (d, n) in [(pb.logits, MIX), (pb.pre, HC), (pb.post, HC), (pb.comb, HC * HC), (cb, h)] {
+                        cuda::to_f32_into(d, &vec![f32::NAN; t * n]);
+                    }
+                    pb.coeffs_norm(&kn, &w, xd, nw, cb, t);
+                    cuda::sync();
+                    for (what, a, b, n) in [
+                        ("logits", pa.logits, pb.logits, MIX),
+                        ("pre", pa.pre, pb.pre, HC),
+                        ("post", pa.post, pb.post, HC),
+                        ("comb", pa.comb, pb.comb, HC * HC),
+                        ("normed collapsed", ca, cb, h),
+                    ] {
+                        assert_eq!(bits(&cuda::dtoh(b, t * n)), bits(&cuda::dtoh(a, t * n)), "{name} call {rep}: {what} differs from coeffs + gm_rmsnorm");
+                    }
+                }
+                for d in [&mut xd, &mut ca, &mut cb, &mut nw] {
+                    cuda::free_dev(d);
+                }
+                pa.free();
+                pb.free();
+                w.free();
+            }
+            let mut st = st;
+            cuda::free_dev(&mut st);
+        }
+    }
+
+    /// `CROW_GLM_HCFUSE` per site for one decode row at the GLM width, VRAM-cold `fn`: the site
+    /// of record (`coeffs`, `gm_rmsnorm`, `expand`: 3 launches) against the fused one
+    /// (`coeffs_norm`, `expand`: 2 launches), times the 90 sites of a token (45 layers x 2)
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_mhc_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mhc_gpu_hcfuse_time_per_token() {
+        use cudarc::driver::sys;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Kernels::new();
+            let (_mm, norm) = gm_rmsnorm();
+            let mut st = cuda::to_i32_dev(&[0i32, 0]);
+            let (h, t) = (4096usize, 1usize);
+            let sites_per_token = 2 * crate::geo::Glm5Geo::GLM_5_3_FLASH.layers;
+            let mut seed = 0x5eed_f05eu64;
+            let fn_ = bf16s(&rnd(MIX * HC * h, &mut seed, 0.05));
+            let base: [f32; MIX] = rnd(MIX, &mut seed, 1.0).try_into().unwrap();
+            let scale: [f32; 3] = rnd(3, &mut seed, 2.0).try_into().unwrap();
+            let copies = (256usize << 20).div_ceil(fn_.len() * 2);
+            let mut sites: Vec<SiteDev> = (0..copies).map(|_| SiteDev::upload(&fn_, &base, &scale)).collect();
+            let mut nw = cuda::to_f32_dev(&rnd(h, &mut seed, 1.5));
+            let plan = Plan::new(h, t);
+            let x0 = rnd(t * HC * h, &mut seed, 3.0);
+            let mut xd = cuda::to_f32_dev(&x0);
+            let mut yd = cuda::to_f32_dev(&rnd(t * h, &mut seed, 1.0));
+            let mut cd = cuda::alloc_zeroed(t * h * 4);
+            let time = |f: &mut dyn FnMut(usize)| -> f64 {
+                f(0);
+                cuda::sync();
+                let mk = || {
+                    let mut e: sys::CUevent = std::ptr::null_mut();
+                    cuda::ck(sys::cuEventCreate(&mut e, 0));
+                    e
+                };
+                let (a, b) = (mk(), mk());
+                cuda::event_record(a, cuda::cur_stream());
+                let n = 4 * copies;
+                for i in 0..n {
+                    f(i);
+                }
+                cuda::event_record(b, cuda::cur_stream());
+                cuda::sync();
+                let mut ms = 0f32;
+                cuda::ck(sys::cuEventElapsedTime_v2(&mut ms, a, b));
+                cuda::event_destroy(a);
+                cuda::event_destroy(b);
+                ms as f64 * 1e3 / n as f64
+            };
+            // the expand writes back into x; the streams are re-seeded per arm so both arms run on
+            // the same inputs (the time does not depend on the values)
+            let rec = time(&mut |i| {
+                plan.coeffs(&kn, &sites[i % copies], xd, cd, t);
+                launch_v(norm, t as u32, 1, 1, 256, &[cd, nw, h as u64, st]);
+                plan.expand(&kn, xd, yd, xd, t);
+            });
+            cuda::to_f32_into(xd, &x0);
+            let fused = time(&mut |i| {
+                plan.coeffs_norm(&kn, &sites[i % copies], xd, nw, cd, t);
+                plan.expand(&kn, xd, yd, xd, t);
+            });
+            eprintln!(
+                "mhc site h {h} t {t} ({copies} fn copies): record 3 launches {rec:.2} us, CROW_GLM_HCFUSE 2 launches {fused:.2} us; x {sites_per_token} sites per token: {} -> {} launches, {:.3} -> {:.3} ms",
+                3 * sites_per_token,
+                2 * sites_per_token,
+                sites_per_token as f64 * rec / 1e3,
+                sites_per_token as f64 * fused / 1e3
+            );
+            for d in [&mut xd, &mut yd, &mut cd, &mut nw, &mut st] {
+                cuda::free_dev(d);
+            }
+            for s in sites.iter_mut() {
+                s.free();
+            }
+            let mut plan = plan;
+            plan.free();
+            assert!(fused <= rec, "the fused site takes {fused:.2} us against {rec:.2} us of record");
         }
     }
 }
