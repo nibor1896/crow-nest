@@ -73,8 +73,11 @@ pub const HAD: usize = 128;
 
 /// tokens computed per pass over the trellis (the decoded weights are reused per token)
 const TOK_TILE: usize = 4;
-/// output tile columns per work unit (64 outputs); a thread owns whole units
-const UNIT_TILES: usize = 4;
+/// output tile columns per work unit (128 outputs, one block); a thread owns whole units. 8
+/// since the split planner (2026-10-09): a unit reads 768 contiguous bytes per tile row instead
+/// of 384, the #188 lane's 8 experts at 8 threads 0.490 -> 0.426 ms per expert
+/// (`cpu_mul1_lane_bench`); the bits do not depend on it
+const UNIT_TILES: usize = 8;
 /// tile rows the AVX2 path prefetches ahead
 const PF_ROWS: usize = 6;
 
@@ -587,6 +590,8 @@ mod avx2 {
         sh13: __m256i,
         f1024: __m256i,
         caff1024: __m256,
+        kinv8192: __m256,
+        caff_v: __m256,
     }
 
     /// # Safety
@@ -605,6 +610,8 @@ mod avx2 {
             sh13: _mm256_set1_epi16(1 << 13),
             f1024: _mm256_set1_epi32(0x4480_0000),
             caff1024: _mm256_set1_ps(CAFF - 1024.0 * KINV),
+            kinv8192: _mm256_set1_ps(8192.0 * KINV),
+            caff_v: _mm256_set1_ps(CAFF - 1024.0 * (8192.0 * KINV)),
         }
     }
 
@@ -661,6 +668,26 @@ mod avx2 {
         let s13 = _mm256_madd_epi16(_mm256_maddubs_epi16(x, k.one8), k.sh13);
         let f = _mm256_castsi256_ps(_mm256_add_epi32(s13, k.f1024));
         let v = _mm256_fmadd_ps(f, k.kinv, k.caff1024);
+        let c = _mm256_castsi256_ps(_mm256_add_epi32(_mm256_and_si256(_mm256_castps_si256(v), k.expm), k.magic));
+        _mm256_sub_ps(_mm256_add_ps(v, c), c)
+    }
+
+    /// `weights_fast` with the byte sum in one `vpdpbusd` (AVX-VNNI): the four product bytes
+    /// times 1 summed into the bits of 1024.0 give the f32 `1024 + s 2^-13` exactly (one ulp of
+    /// 1024.0 is 2^-13 and s <= 1020 stays inside its binade), and `f (8192 k_inv) +
+    /// (-3.453125 - 1024 (8192 k_inv))` in one FMA is the exact `s k_inv - 3.453125` (the exact
+    /// sum is a multiple of 2^-18 below 4 in magnitude, so the FMA's one rounding keeps it; both
+    /// constants are exact in f32). One instruction for `vpmaddubsw` + `vpmaddwd` + `vpaddd`; the
+    /// fp16 rounding is unchanged. Same bits as `weights` for every state (tested).
+    ///
+    /// # Safety
+    /// The CPU must have AVX2, FMA and AVX-VNNI.
+    #[inline]
+    #[target_feature(enable = "avx2,fma,avxvnni")]
+    pub(super) unsafe fn weights_vnni(st: __m256i, k: &Consts) -> __m256 {
+        let x = _mm256_mullo_epi32(st, k.mul);
+        let f = _mm256_castsi256_ps(_mm256_dpbusd_avx_epi32(k.f1024, x, k.one8));
+        let v = _mm256_fmadd_ps(f, k.kinv8192, k.caff_v);
         let c = _mm256_castsi256_ps(_mm256_add_epi32(_mm256_and_si256(_mm256_castps_si256(v), k.expm), k.magic));
         _mm256_sub_ps(_mm256_add_ps(v, c), c)
     }
@@ -746,75 +773,141 @@ mod avx2 {
         }
     }
 
-    /// `unit_fast` for K = 3 with the 32 lanes of a tile unrolled over compile-time lane
-    /// constants (sybil `ft_core.h:176-249`, `decode8<g>` / `tile_accum<C>`): the same operations
-    /// in the same order per accumulator, no per-lane table loads or branches.
+    /// `group_k3` with `weights_vnni`: the same weights, products and sums.
     ///
     /// # Safety
-    /// The CPU must have AVX2 and FMA; `m` is a K = 3 matrix.
-    #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn unit_k3<const NT: usize>(m: &Mul1Matrix, xp: &[f32], t0: usize, nb0: usize, ntc: usize, raw: Out) {
-        let (tk, tn, tb) = (m.k / 16, m.n / 16, m.bitrate.tile_bytes());
-        assert!(m.bitrate == K3 && tb == 96);
-        assert!(ntc <= UNIT_TILES && nb0 + ntc <= tn && xp.len() >= (t0 + NT) * tk * 32);
-        assert!(m.trellis.len() >= tk * tn * tb);
-        let k = unsafe { consts() };
-        let mut acc = [[[_mm256_setzero_ps(); NT]; 8]; UNIT_TILES];
-        let base = m.trellis.as_ptr();
-        let xb = xp.as_ptr();
-        let run = ntc * tb;
-        let tk32 = tk * 32;
-        macro_rules! lane4 {
-            ($tile:expr, $xr:expr, $acc:expr, $c:literal, $g0:literal, $g1:literal, $g2:literal, $g3:literal) => {{
-                let mut a = $acc[$c];
-                group_k3::<$g0, NT>($tile, $xr, tk32, &mut a, &k);
-                group_k3::<$g1, NT>($tile, $xr, tk32, &mut a, &k);
-                group_k3::<$g2, NT>($tile, $xr, tk32, &mut a, &k);
-                group_k3::<$g3, NT>($tile, $xr, tk32, &mut a, &k);
-                $acc[$c] = a;
-            }};
-        }
-        for kb in 0..tk {
-            if kb + PF_ROWS < tk {
-                let pf = ((kb + PF_ROWS) * tn + nb0) * tb;
-                let mut o = 0;
-                while o < run + 63 {
-                    // SAFETY: pf + min(o, run - 1) lies inside the trellis (row kb + PF_ROWS exists)
-                    unsafe { _mm_prefetch::<_MM_HINT_T0>(base.add(pf + o.min(run - 1)) as *const i8) };
-                    o += 64;
-                }
-            }
-            // SAFETY: inside xp (asserted)
-            let xr = unsafe { xb.add((t0 * tk + kb) * 32) };
-            for (tc, acc_tc) in acc.iter_mut().enumerate().take(ntc) {
-                // SAFETY: (kb tn + nb0 + tc + 1) tb <= len (asserted); AVX2 + FMA (caller)
-                unsafe {
-                    let tile = base.add((kb * tn + nb0 + tc) * tb);
-                    lane4!(tile, xr, acc_tc, 0, 0, 1, 2, 3);
-                    lane4!(tile, xr, acc_tc, 1, 4, 5, 6, 7);
-                    lane4!(tile, xr, acc_tc, 2, 8, 9, 10, 11);
-                    lane4!(tile, xr, acc_tc, 3, 12, 13, 14, 15);
-                    lane4!(tile, xr, acc_tc, 4, 16, 17, 18, 19);
-                    lane4!(tile, xr, acc_tc, 5, 20, 21, 22, 23);
-                    lane4!(tile, xr, acc_tc, 6, 24, 25, 26, 27);
-                    lane4!(tile, xr, acc_tc, 7, 28, 29, 30, 31);
-                }
-            }
-        }
-        for (tc, acc_tc) in acc.iter().enumerate().take(ntc) {
-            for (c, acc_c) in acc_tc.iter().enumerate() {
-                for (t, a) in acc_c.iter().enumerate() {
-                    let mut lanes = [0f32; 8];
-                    // SAFETY: 8 f32 into an 8-element array
-                    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), *a) };
-                    let (lo, hi) = fold(&lanes);
-                    let col = (nb0 + tc) * 16 + c;
-                    raw.put((t0 + t) * m.n + col, lo);
-                    raw.put((t0 + t) * m.n + col + 8, hi);
-                }
+    /// As `group_k3`; the CPU must also have AVX-VNNI.
+    #[inline]
+    #[target_feature(enable = "avx2,fma,avxvnni")]
+    unsafe fn group_k3_vnni<const G: usize, const NT: usize>(tile: *const u8, xr: *const f32, tk32: usize, a: &mut [__m256; NT], k: &Consts) {
+        // SAFETY: the caller's contract; Lane is 32-byte aligned, ctrl and shv its first 64 bytes
+        unsafe {
+            let ln = &K3_LANES[G];
+            let (ctrl, shv) = (_mm256_load_si256(ln.ctrl.as_ptr() as *const __m256i), _mm256_load_si256(ln.shv.as_ptr() as *const __m256i));
+            let w = weights_vnni(_mm256_and_si256(_mm256_srlv_epi32(_mm256_shuffle_epi8(window(tile, ln), ctrl), shv), k.m16), k);
+            for (t, at) in a.iter_mut().enumerate() {
+                let xv = _mm256_loadu_ps(xr.add(t * tk32 + (G % 4) * 8));
+                *at = _mm256_add_ps(*at, _mm256_mul_ps(w, xv));
             }
         }
     }
+
+    /// Defines `$name`, one K = 3 tile of a unit: the 32 lanes through `$group` in stream order,
+    /// lanes 4 C .. 4 C + 3 into the accumulators of column group C.
+    macro_rules! tile_k3_fn {
+        ($name:ident, $group:ident, $feat:literal) => {
+            /// # Safety
+            /// As the lane function it calls.
+            #[inline]
+            #[target_feature(enable = $feat)]
+            unsafe fn $name<const NT: usize>(tile: *const u8, xr: *const f32, tk32: usize, acc: &mut [[__m256; NT]; 8], k: &Consts) {
+                // SAFETY: the caller's contract
+                unsafe {
+                    $group::<0, NT>(tile, xr, tk32, &mut acc[0], k);
+                    $group::<1, NT>(tile, xr, tk32, &mut acc[0], k);
+                    $group::<2, NT>(tile, xr, tk32, &mut acc[0], k);
+                    $group::<3, NT>(tile, xr, tk32, &mut acc[0], k);
+                    $group::<4, NT>(tile, xr, tk32, &mut acc[1], k);
+                    $group::<5, NT>(tile, xr, tk32, &mut acc[1], k);
+                    $group::<6, NT>(tile, xr, tk32, &mut acc[1], k);
+                    $group::<7, NT>(tile, xr, tk32, &mut acc[1], k);
+                    $group::<8, NT>(tile, xr, tk32, &mut acc[2], k);
+                    $group::<9, NT>(tile, xr, tk32, &mut acc[2], k);
+                    $group::<10, NT>(tile, xr, tk32, &mut acc[2], k);
+                    $group::<11, NT>(tile, xr, tk32, &mut acc[2], k);
+                    $group::<12, NT>(tile, xr, tk32, &mut acc[3], k);
+                    $group::<13, NT>(tile, xr, tk32, &mut acc[3], k);
+                    $group::<14, NT>(tile, xr, tk32, &mut acc[3], k);
+                    $group::<15, NT>(tile, xr, tk32, &mut acc[3], k);
+                    $group::<16, NT>(tile, xr, tk32, &mut acc[4], k);
+                    $group::<17, NT>(tile, xr, tk32, &mut acc[4], k);
+                    $group::<18, NT>(tile, xr, tk32, &mut acc[4], k);
+                    $group::<19, NT>(tile, xr, tk32, &mut acc[4], k);
+                    $group::<20, NT>(tile, xr, tk32, &mut acc[5], k);
+                    $group::<21, NT>(tile, xr, tk32, &mut acc[5], k);
+                    $group::<22, NT>(tile, xr, tk32, &mut acc[5], k);
+                    $group::<23, NT>(tile, xr, tk32, &mut acc[5], k);
+                    $group::<24, NT>(tile, xr, tk32, &mut acc[6], k);
+                    $group::<25, NT>(tile, xr, tk32, &mut acc[6], k);
+                    $group::<26, NT>(tile, xr, tk32, &mut acc[6], k);
+                    $group::<27, NT>(tile, xr, tk32, &mut acc[6], k);
+                    $group::<28, NT>(tile, xr, tk32, &mut acc[7], k);
+                    $group::<29, NT>(tile, xr, tk32, &mut acc[7], k);
+                    $group::<30, NT>(tile, xr, tk32, &mut acc[7], k);
+                    $group::<31, NT>(tile, xr, tk32, &mut acc[7], k);
+                }
+            }
+        };
+    }
+    tile_k3_fn!(tile_k3, group_k3, "avx2,fma");
+    tile_k3_fn!(tile_k3_vnni, group_k3_vnni, "avx2,fma,avxvnni");
+
+    /// Defines `$name`, the K = 3 unit over the tile function `$tile` with the target features
+    /// `$feat`: `unit_k3` and its AVX-VNNI twin `unit_k3_vnni` (same code, one decoder each).
+    macro_rules! unit_k3_fn {
+        ($(#[$doc:meta])* $name:ident, $tile:ident, $feat:literal) => {
+            $(#[$doc])*
+            #[target_feature(enable = $feat)]
+            pub(super) unsafe fn $name<const NT: usize>(m: &Mul1Matrix, xp: &[f32], t0: usize, nb0: usize, ntc: usize, raw: Out) {
+                let (tk, tn, tb) = (m.k / 16, m.n / 16, m.bitrate.tile_bytes());
+                assert!(m.bitrate == K3 && tb == 96);
+                assert!(ntc <= UNIT_TILES && nb0 + ntc <= tn && xp.len() >= (t0 + NT) * tk * 32);
+                assert!(m.trellis.len() >= tk * tn * tb);
+                let k = unsafe { consts() };
+                let mut acc = [[[_mm256_setzero_ps(); NT]; 8]; UNIT_TILES];
+                let base = m.trellis.as_ptr();
+                let xb = xp.as_ptr();
+                let run = ntc * tb;
+                let tk32 = tk * 32;
+                for kb in 0..tk {
+                    if kb + PF_ROWS < tk {
+                        let pf = ((kb + PF_ROWS) * tn + nb0) * tb;
+                        let mut o = 0;
+                        while o < run + 63 {
+                            // SAFETY: pf + min(o, run - 1) lies inside the trellis (row kb + PF_ROWS exists)
+                            unsafe { _mm_prefetch::<_MM_HINT_T0>(base.add(pf + o.min(run - 1)) as *const i8) };
+                            o += 64;
+                        }
+                    }
+                    // SAFETY: inside xp (asserted)
+                    let xr = unsafe { xb.add((t0 * tk + kb) * 32) };
+                    for (tc, acc_tc) in acc.iter_mut().enumerate().take(ntc) {
+                        // SAFETY: (kb tn + nb0 + tc + 1) tb <= len (asserted); the target features (caller)
+                        unsafe { $tile::<NT>(base.add((kb * tn + nb0 + tc) * tb), xr, tk32, acc_tc, &k) };
+                    }
+                }
+                for (tc, acc_tc) in acc.iter().enumerate().take(ntc) {
+                    for (c, acc_c) in acc_tc.iter().enumerate() {
+                        for (t, a) in acc_c.iter().enumerate() {
+                            let mut lanes = [0f32; 8];
+                            // SAFETY: 8 f32 into an 8-element array
+                            unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), *a) };
+                            let (lo, hi) = fold(&lanes);
+                            let col = (nb0 + tc) * 16 + c;
+                            raw.put((t0 + t) * m.n + col, lo);
+                            raw.put((t0 + t) * m.n + col + 8, hi);
+                        }
+                    }
+                }
+            }
+        };
+    }
+    unit_k3_fn!(
+        /// `unit_fast` for K = 3 with the 32 lanes of a tile unrolled over compile-time lane
+        /// constants (sybil `ft_core.h:176-249`, `decode8<g>` / `tile_accum<C>`): the same operations
+        /// in the same order per accumulator, no per-lane table loads or branches.
+        ///
+        /// # Safety
+        /// The CPU must have AVX2 and FMA; `m` is a K = 3 matrix.
+        unit_k3, tile_k3, "avx2,fma"
+    );
+    unit_k3_fn!(
+        /// `unit_k3` with `weights_vnni` (one `vpdpbusd` for the byte sum): the same bits.
+        ///
+        /// # Safety
+        /// The CPU must have AVX2, FMA and AVX-VNNI; `m` is a K = 3 matrix.
+        unit_k3_vnni, tile_k3_vnni, "avx2,fma,avxvnni"
+    );
 
     /// The 8 weights of trellis lane `g` of one tile, in position order j = 0..7.
     ///
@@ -1017,11 +1110,33 @@ fn kern(path: Path) -> Kern {
     Kern::Avx2
 }
 
+/// The K = 3 unit of `Kern::Fast` takes the byte sum from `vpdpbusd` (`avx2::unit_k3_vnni`, the
+/// same bits) on a CPU with AVX-VNNI (Intel since Alder Lake, AMD since Zen 5).
+#[cfg(target_arch = "x86_64")]
+fn vnni() -> bool {
+    std::arch::is_x86_feature_detected!("avxvnni")
+}
+
 /// One chunk (tile columns `nb0 .. nb0 + ntc`, `ntc <= UNIT_TILES`) for every token of `xp`.
 fn unit_new(kern: Kern, m: &Mul1Matrix, tab: &Tables, xp: &[f32], tokens: usize, nb0: usize, ntc: usize, raw: Out) {
     let mut t0 = 0;
     while t0 < tokens {
         let nt = (tokens - t0).min(TOK_TILE);
+        #[cfg(target_arch = "x86_64")]
+        if kern == Kern::Fast && m.bitrate == K3 && vnni() {
+            // SAFETY: `Kern::Fast` is chosen only after AVX2 and FMA were detected on this CPU,
+            // `vnni` checked AVX-VNNI
+            unsafe {
+                match nt {
+                    1 => avx2::unit_k3_vnni::<1>(m, xp, t0, nb0, ntc, raw),
+                    2 => avx2::unit_k3_vnni::<2>(m, xp, t0, nb0, ntc, raw),
+                    3 => avx2::unit_k3_vnni::<3>(m, xp, t0, nb0, ntc, raw),
+                    _ => avx2::unit_k3_vnni::<4>(m, xp, t0, nb0, ntc, raw),
+                }
+            }
+            t0 += nt;
+            continue;
+        }
         #[cfg(target_arch = "x86_64")]
         if kern == Kern::Fast && m.bitrate == K3 {
             // SAFETY: `Kern::Fast` is chosen only after AVX2 and FMA were detected on this CPU
@@ -1346,9 +1461,10 @@ pub(crate) fn expert_ffn_with(im: Impl, e: &Mul1Expert, x: &[f32], y: &mut [f32]
 
 /// #188 CPU lane: the expert FFN of every expert in `es` on the same rows `x` `[T][hidden]`, in
 /// ONE pool run; `ys` `[n][T][hidden]`, expert `j`'s rows at `j T hidden`. The three phases of
-/// [`expert_ffn`] run over the experts side by side (input transforms of every expert, then the
-/// gate / up columns of every expert, then, once every expert's activation is complete, the down
-/// columns of every expert). A column, a block and its finisher do the operations of
+/// [`expert_ffn`] run over the experts as one queue (input transforms of every expert, then the
+/// gate / up columns of every expert, then the down columns of every expert), each unit waiting
+/// only for its own expert's inputs (per-expert counters, sybil `ft_n135.h` v4: expert 0's down
+/// columns start while the last experts' gate / up columns are still running). A column, a block and its finisher do the operations of
 /// `expert_ffn` with `act` in place of `silu_mul`, so with `act = silu_mul` every output is bit
 /// for bit `expert_ffn` of that expert alone, and with any `act` bit for bit
 /// `gemv(down, act(gemv(gate, x), gemv(up, x)))`. Every expert has the shape and bitrate of the
@@ -1395,7 +1511,11 @@ fn experts_ffn_with(im: Impl, es: &[Mul1Expert], x: &[f32], ys: &mut [f32], act:
         let (c1, c2) = (2 * (i / 16), h / 16);
         let (plan1, plan2) = (chunks(n * c1, k), chunks(n * c2, k));
         let (blk1, blk2) = (Blocks::new(n * (i / HAD), 2 * BLOCK_TILES), Blocks::new(n * (h / HAD), BLOCK_TILES));
-        let (prep, acts) = (Phase::new(n * 2 * (h / HAD)), AtomicUsize::new(0));
+        // per expert (sybil `ft_n135.h` v4 item 1, the dataflow queue): its input transforms done,
+        // its activation blocks done; a unit waits for its own expert's inputs only, so one
+        // expert's tail overlaps the next stage of the experts queued before it
+        let prep = Phase::new(n * 2 * (h / HAD));
+        let (preps, acts): (Vec<AtomicUsize>, Vec<AtomicUsize>) = ((0..n).map(|_| AtomicUsize::new(0)).collect(), (0..n).map(|_| AtomicUsize::new(0)).collect());
         let (cols1, cols2) = (AtomicUsize::new(0), AtomicUsize::new(0));
         pool::run(k, &|_| {
             prep.work(|jj| {
@@ -1405,11 +1525,14 @@ fn experts_ffn_with(im: Impl, es: &[Mul1Expert], x: &[f32], ys: &mut [f32], act:
                 } else {
                     prep_block(x, &es[j].up, b - h / HAD, tokens, sub(oxu, nxh, j));
                 }
+                preps[j].fetch_add(1, Ordering::Release);
             });
-            prep.wait();
             while let Some((q0, ntc)) = take(&cols1, &plan1) {
                 let (j, p0) = (q0 / c1, q0 % c1);
-                // SAFETY: every write to xp_g / xp_u is complete (`prep.wait`); read only from here on
+                // expert j's input transforms: every item was taken (this worker left the prep
+                // queue), so the wait is for work in progress, never for a worker
+                wait_for(&preps[j], 2 * (h / HAD));
+                // SAFETY: every write to expert j's xp_g / xp_u is complete (acquire above); read only from here on
                 let (xg, xu) = unsafe {
                     (std::slice::from_raw_parts(oxg.0.add(j * nxh) as *const f32, nxh), std::slice::from_raw_parts(oxu.0.add(j * nxh) as *const f32, nxh))
                 };
@@ -1422,14 +1545,15 @@ fn experts_ffn_with(im: Impl, es: &[Mul1Expert], x: &[f32], ys: &mut [f32], act:
                 }
                 if blk1.complete(j * (i / HAD) + b, ntc) {
                     act_block(&es[j], b, tokens, gj, uj, sub(oxd, nxi, j), act);
-                    acts.fetch_add(1, Ordering::Release);
+                    acts[j].fetch_add(1, Ordering::Release);
                 }
             }
-            // down needs every block of its input: wait for the work, not for the workers
-            wait_for(&acts, n * (i / HAD));
             while let Some((q0, ntc)) = take(&cols2, &plan2) {
                 let (j, nb0) = (q0 / c2, q0 % c2);
-                // SAFETY: every block of xp_d is complete (acquire above); read only from here on
+                // down needs every block of its expert's input: wait for that work (all of it
+                // taken: the gate / up queue is empty), not for the workers
+                wait_for(&acts[j], i / HAD);
+                // SAFETY: every block of expert j's xp_d is complete (acquire above); read only from here on
                 let xd = unsafe { std::slice::from_raw_parts(oxd.0.add(j * nxi) as *const f32, nxi) };
                 let dj = sub(od, nh, j);
                 unit_new(kern, &es[j].down, tab_d, xd, tokens, nb0, ntc, dj);
@@ -2458,7 +2582,8 @@ mod tests {
     /// #183 C1: the production path gives the bits of the #183 kernel (`Impl::V2`): the
     /// division-free lane decoder (`decode8_fast`, every lane of every bitrate on random tiles,
     /// wrapping lanes included) == `decode8`; `weights_fast` == `weights` for all 65,536 states;
-    /// the K = 3 unrolled unit == the table-driven `unit_fast`; GEMV of the 4 quantizer experts
+    /// `weights_vnni` == `weights` and the AVX-VNNI K = 3 unit == `unit_fast` (on a CPU with
+    /// AVX-VNNI); the K = 3 unrolled unit == the table-driven `unit_fast`; GEMV of the 4 quantizer experts
     /// and of synthetic K = 1, 1.5, 2.5, 5, 8 at T 1, 2, 3, 5, 8 x threads 1, 3, 8, 16, 24 and of
     /// the GLM K = 3 gate and down at T 1, 4; the FFN of a full GLM expert at T 1, 2, 4, 5 x
     /// threads 1, 2, 8, 16, 24; and the production path with the #183 unit (`NEW_NO_FMA`, an AVX2
@@ -2479,6 +2604,10 @@ mod tests {
                 _mm256_storeu_ps(a.as_mut_ptr(), avx2::weights_fast(st, &kc));
                 _mm256_storeu_ps(b.as_mut_ptr(), avx2::weights(st, &kc));
                 assert_eq!(bits(&a), bits(&b), "states {s0:#06x}..");
+                if vnni() {
+                    _mm256_storeu_ps(a.as_mut_ptr(), avx2::weights_vnni(st, &kc));
+                    assert_eq!(bits(&a), bits(&b), "states {s0:#06x}.. (VNNI)");
+                }
             }
             let mut rng = Rng(0xC1);
             for k in [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 7.0, 8.0] {
@@ -2516,6 +2645,21 @@ mod tests {
                 }
             }
             assert_eq!(bits(&a), bits(&b), "unit_k3 != unit_fast, T {t}");
+            if vnni() {
+                a.fill(f32::NAN);
+                for (nb0, ntc) in chunks(GLM_INTER / 16, 8) {
+                    // SAFETY: AVX2, FMA and AVX-VNNI checked; e.gate is K = 3
+                    unsafe {
+                        match t {
+                            1 => avx2::unit_k3_vnni::<1>(&e.gate, &xp, 0, nb0, ntc, oa),
+                            2 => avx2::unit_k3_vnni::<2>(&e.gate, &xp, 0, nb0, ntc, oa),
+                            3 => avx2::unit_k3_vnni::<3>(&e.gate, &xp, 0, nb0, ntc, oa),
+                            _ => avx2::unit_k3_vnni::<4>(&e.gate, &xp, 0, nb0, ntc, oa),
+                        }
+                    }
+                }
+                assert_eq!(bits(&a), bits(&b), "unit_k3_vnni != unit_fast, T {t}");
+            }
         }
         let mut all = quant_cases();
         for (i, k) in [1.0, 1.5, 2.5, 5.0, 8.0].into_iter().enumerate() {
@@ -2635,7 +2779,8 @@ mod tests {
     }
 
     /// #183 C1: the bit-built `f16_to_f32` is the former formula for all 65,536 inputs, and the
-    /// guided chunk plan covers every tile column once, in order, in aligned chunks of 4 / 2 / 1
+    /// guided chunk plan covers every tile column once, in order, in aligned chunks of
+    /// `UNIT_TILES` / 2 / 1
     /// that never cross a 128-column block, ending in one-column chunks when k > 1.
     #[test]
     fn cpu_mul1_scales_and_chunk_plan() {
@@ -2656,7 +2801,7 @@ mod tests {
                 let mut at = 0;
                 for &(t0, n) in &plan {
                     assert_eq!(t0, at, "tiles {tiles} k {k}: gap or overlap at {t0}");
-                    assert!(matches!(n, 1 | 2 | 4) && t0 % n == 0 && t0 / BLOCK_TILES == (t0 + n - 1) / BLOCK_TILES, "tiles {tiles} k {k}: chunk ({t0}, {n})");
+                    assert!(matches!(n, 1 | 2 | UNIT_TILES) && t0 % n == 0 && t0 / BLOCK_TILES == (t0 + n - 1) / BLOCK_TILES, "tiles {tiles} k {k}: chunk ({t0}, {n})");
                     at += n;
                 }
                 assert_eq!(at, tiles, "tiles {tiles} k {k}: not covered");
@@ -2873,6 +3018,60 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Micro-benchmark, not a gate (the split planner's CPU cost, `glm5_tiers::SplitCost`): the
+    /// #188 lane's call, `experts_ffn` over n = 1..8 distinct GLM-shaped K = 3 records in one pool
+    /// run, T 1, `swiglu`-free `silu_mul`, records rotated over 32 distinct copies (303 MB, far
+    /// beyond the L3) so every call streams its records from DRAM; threads 8, 12, 16, 20, 24.
+    /// Median of 32 calls per point after 4 warm-up calls, workers warm (spinning between calls, as
+    /// between the MoE layers of a decode step). Prints ms per call, ms per expert and the least
+    /// squares line `a + b n` per thread count (a = the run's fixed cost, b = ms per expert).
+    /// `cargo test --release --lib cpu_mul1_lane_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn cpu_mul1_lane_bench() {
+        super::POISON_SCRATCH.with(|p| p.set(false));
+        let c = &glm_cases()[0];
+        let base = record(c);
+        let tb = 3 * Mul1Matrix::trellis_bytes(c.hidden, c.inter, c.bitrate);
+        let recs: Vec<Vec<u8>> = (0..32u32)
+            .map(|i| {
+                let mut r = base.clone();
+                r[..tb].iter_mut().for_each(|b| *b = b.rotate_left(i % 8) ^ ((i / 8) as u8).wrapping_mul(37));
+                r
+            })
+            .collect();
+        let experts: Vec<Mul1Expert> = recs.iter().map(|r| Mul1Expert::from_record(r, c.hidden, c.inter, c.bitrate).unwrap()).collect();
+        let mut rng = Rng(0x5917);
+        let x = xs(GLM_HIDDEN, &mut rng);
+        let mut ys = vec![0f32; 8 * GLM_HIDDEN];
+        eprintln!("cpu_mul1 lane bench: {:?}, {} threads available, {} B per record", kern(Path::Auto), std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0), recs[0].len());
+        for &th in &[8usize, 12, 16, 20, 24] {
+            let mut pts = Vec::new();
+            for n in 1..=8usize {
+                let mut ms = Vec::new();
+                let mut at = 0usize;
+                for rep in 0..36 {
+                    let es: Vec<Mul1Expert> = (0..n).map(|j| experts[(at + j) % experts.len()]).collect();
+                    at += n;
+                    let t0 = std::time::Instant::now();
+                    experts_ffn(&es, &x, &mut ys[..n * GLM_HIDDEN], &silu_mul, th, Path::Auto);
+                    if rep >= 4 {
+                        ms.push(t0.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
+                ms.sort_by(|a, b| a.total_cmp(b));
+                pts.push((n as f64, ms[ms.len() / 2]));
+            }
+            let m = pts.len() as f64;
+            let (sx, sy) = (pts.iter().map(|p| p.0).sum::<f64>(), pts.iter().map(|p| p.1).sum::<f64>());
+            let (sxx, sxy) = (pts.iter().map(|p| p.0 * p.0).sum::<f64>(), pts.iter().map(|p| p.0 * p.1).sum::<f64>());
+            let b = (m * sxy - sx * sy) / (m * sxx - sx * sx);
+            let a = (sy - b * sx) / m;
+            let row: Vec<String> = pts.iter().map(|&(n, t)| format!("{n:.0}:{t:.3}")).collect();
+            eprintln!("  threads {th:2}: ms per call {}; fit {a:.3} + {b:.3} n ms; 8 experts {:.3} ms per expert", row.join(" "), pts[7].1 / 8.0);
         }
     }
 }

@@ -636,7 +636,7 @@ impl GpuMoePlan {
         let xs = std::slice::from_raw_parts(xh as *const f32, h);
         let ys = std::slice::from_raw_parts_mut(yh, cpu.len() * h);
         let limit = g.swiglu_limit;
-        cpu_mul1::experts_ffn(&es, xs, ys, &move |a, b| swiglu_clamp(a, b, limit), LANE_THREADS, Path::Auto);
+        cpu_mul1::experts_ffn(&es, xs, ys, &move |a, b| swiglu_clamp(a, b, limit), lane::threads(), Path::Auto);
         call.clock.add(t0.elapsed(), cpu.len());
         for (j, &c) in gpu.iter().enumerate().rev() {
             if c != j {
@@ -720,8 +720,20 @@ impl LaneBuf {
 pub mod lane {
     use cudarc::driver::sys::CUdeviceptr;
     use std::cell::RefCell;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// worker threads of the lane's pool run (`CROW_GLM_LANE_THREADS`, stored by
+    /// `glm5_tiers::ExpertTiers::new`); 0 = [`super::LANE_THREADS`]
+    pub static THREADS: AtomicUsize = AtomicUsize::new(0);
+
+    /// the lane's thread count: [`THREADS`], or [`super::LANE_THREADS`] while it is 0
+    pub fn threads() -> usize {
+        match THREADS.load(Ordering::Relaxed) {
+            0 => super::LANE_THREADS,
+            n => n,
+        }
+    }
 
     /// where one combo (pick order) is computed
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
