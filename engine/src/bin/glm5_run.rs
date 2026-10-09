@@ -34,7 +34,8 @@
 //! - #192 `CROW_GLM_MTP=N` (1..=4): speculative decode with the MTP block (the container's
 //!   section `mtp` + `CROW_GLM_MTP_OVERLAY`, default `converter/GLM-5.3-Flash-MTP-overlay.cnq`);
 //!   the plan runs at free VRAM minus the block's derived bytes, the tiers get `(1 + N) x top-k`
-//!   staging slots, every rep prints and records the MTP counters per decode token. A step's
+//!   staging slots, every rep prints and records the MTP counters per decode token. With
+//!   `CROW_CHUNK` the prompt runs in prompt calls and the block follows each call. A step's
 //!   clock is shared by the ids it emits (`secs` = step / ids), its tier counters sit on its
 //!   first id.
 //!
@@ -586,7 +587,7 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("[glm5_run] #186 prompt chunk 1 (CROW_CHUNK unset or 1): every prompt row one decode call");
         }
         if drafts > 0 && chunk > 1 {
-            println!("[glm5_run] {}={drafts}: the prompt rows run one by one (each leaves its head-norm row for the MTP block); CROW_CHUNK does not apply", mtp::MTP_ENV);
+            println!("[glm5_run] {}={drafts}: the prompt runs in the prompt calls above; after each call the MTP block takes its rows' head-norm rows in the windows of the row path ({} rows from position 0)", mtp::MTP_ENV, mtp::MTP_CHUNK);
         }
         let t_load = std::time::Instant::now();
         let mut run = Glm5Run::load(&mut o.cnq, &o.g, &o.moe, cap, &mut |s| println!("{s}"));

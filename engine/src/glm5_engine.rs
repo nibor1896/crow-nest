@@ -26,6 +26,15 @@
 //! `0 .. pos0 + t` only (the pooled keys are recomputed from the rows, `glm5_mla` module doc), so a
 //! prefix of `p` rows is a TRUNCATION: rows `>= p` left by the answer are overwritten before any
 //! call reads them. A cold start writes rows from 0, so it drops the snapshot.
+//!
+//! #192 (`CROW_GLM_MTP=N`): [`Rows::decode`] of the device is the speculative decode
+//! (`Glm5Run::spec_decode`): one verify step emits up to `1 + N` ids, handed out one per
+//! [`Glm5Engine::decode_step`] while the fed id is the verified one (they stream at once); a fed id
+//! that differs (a sampled draw, a forced id, a grammar redraw) rolls the KDA states back to that
+//! row (the verify's snapshot slot). Every emitted id's logits row is the verify's row, the bits of
+//! the one-row decode, so the host sampler draws as without MTP. The block's MLA cache truncates
+//! like the trunk's; its one pending row (the last trunk row's head-norm row, whose next id is not
+//! known yet) is part of the snapshot (`state_floats` + H).
 
 use crate::cuda;
 use crate::geo::{Family, Glm5Geo, HOST_PINNED_CAP};
@@ -86,6 +95,23 @@ pub trait Rows {
         }
         last.ok_or_else(|| "glm5: an empty prefill chunk".to_string())
     }
+    /// One decode step: `tok` at `pos`, the greedy id after it (its logits row through
+    /// [`Rows::logits`]). The default is [`Rows::row`] with the head; #192: the device's
+    /// speculative decode overrides it.
+    ///
+    /// # Safety
+    /// As [`Rows::row`].
+    unsafe fn decode(&mut self, tok: i64, pos: usize) -> Result<i64, String> {
+        self.row(tok, pos, true)?.ok_or_else(|| format!("glm5: the head row at {pos} gave no id"))
+    }
+    /// #192: draft tokens per verify step (`CROW_GLM_MTP`; 0 = off)
+    fn mtp_drafts(&self) -> usize {
+        0
+    }
+    /// #192: the MTP counters since the last call as one line, then zero (`None` when off)
+    fn mtp_report(&mut self) -> Option<String> {
+        None
+    }
     /// # Safety
     /// As [`Rows::row`].
     unsafe fn logits(&self) -> Vec<f32>;
@@ -131,7 +157,14 @@ impl Glm5Device {
     pub unsafe fn load(mut o: Opened, context: usize, log: &mut dyn FnMut(&str)) -> Result<Glm5Device, String> {
         let free = cuda::free_vram_bytes();
         let budget = derive_host_pinned_budget(HOST_PINNED_CAP, &mut |s| log(s));
-        let (states, input, plan) = serve_plan(&o.g, context, free, budget, o.spec.bytes)?;
+        // #192: CROW_GLM_MTP=N; the block, its cache of `context` rows and the KDA snapshot slots
+        // come off the plan's free VRAM, as in glm5_run
+        let drafts = crate::glm5_mtp::draft_rows_from_env()?;
+        let mtp_reserved = if drafts > 0 { crate::glm5_mtp::spec_vram_bytes(&o.g, &o.moe, context, drafts) } else { 0 };
+        if drafts > 0 {
+            log(&format!("[budget] {}={drafts}: the #159 plan runs at free VRAM minus {mtp_reserved} B (the MTP block, its cache, {drafts} KDA snapshot slots; derived)", crate::glm5_mtp::MTP_ENV));
+        }
+        let (states, input, plan) = serve_plan(&o.g, context, free.saturating_sub(mtp_reserved), budget, o.spec.bytes)?;
         let sources = [
             ("dense", "GLM5_NEXT_DENSE_BYTES".to_string()),
             ("expert", format!("{}: {} records, codec {}", o.path, o.records, o.spec.codec.dtype())),
@@ -145,8 +178,23 @@ impl Glm5Device {
         // --vram-slots / --pinned-slots / --readers); unset = the plan and READERS
         let ask = crate::boot::glm5_tier_ask_from_env()?;
         let (sizes, readers) = ask.resolve(&plan, READERS)?;
-        let run = Glm5Run::load(&mut o.cnq, &o.g, &o.moe, context, log);
-        let tiers = ExpertTiers::new(&o.cnq, &o.path, &o.g, &o.moe, sizes, readers, o.g.topk)?;
+        let mut run = Glm5Run::load(&mut o.cnq, &o.g, &o.moe, context, log);
+        let mtp_n = match run.mtp_from_env(&mut o.cnq, log) {
+            Ok(n) => n,
+            Err(e) => {
+                run.free();
+                return Err(e);
+            }
+        };
+        // #192: a verify call stages the experts of 1 + N rows at once; the CPU lane is refused
+        let mut tiers = ExpertTiers::new(&o.cnq, &o.path, &o.g, &o.moe, sizes, readers, (1 + mtp_n) * o.g.topk)?;
+        if mtp_n > 0 {
+            if let Err(e) = Glm5Run::spec_check(mtp_n, &tiers, o.g.topk) {
+                tiers.free();
+                run.free();
+                return Err(e);
+            }
+        }
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         log(&format!(
             "[budget] glm5_next tiers per MoE layer: VRAM {} / pinned {} / NVMe {} x {} MoE layers (plan {} / {} / {}; {}); {:.2} GiB VRAM (slots, {} staging, tables), {:.2} GiB pinned; free VRAM now {:.2} GiB; policy {:?}, cache empty at start, NVMe readers {readers}",
@@ -186,15 +234,31 @@ impl Rows for Glm5Device {
     }
     fn state_floats(&self) -> usize {
         let (s, c) = self.one_state();
-        self.run.kda_states().count() * (s + c)
+        // #192: + the MTP block's pending head-norm row
+        self.run.kda_states().count() * (s + c) + self.run.spec_state_floats()
     }
     unsafe fn row(&mut self, tok: i64, pos: usize, head: bool) -> Result<Option<i64>, String> {
         self.run.row(&mut self.o.cnq, &mut self.tiers, tok, pos, head)
     }
     unsafe fn prefill_chunk(&mut self, ids: &[i64], pos0: usize) -> Result<i64, String> {
         // #186: `CROW_CHUNK` > 1 runs the chunk as prompt calls; 1 (unset) is the row loop of
-        // the trait's default, row for row
+        // the trait's default, row for row. #192: with MTP the block follows the prompt rows
+        if self.run.mtp_drafts() > 0 {
+            return self.run.spec_prefill(&mut self.o.cnq, &mut self.tiers, ids, pos0);
+        }
         self.run.prefill(&mut self.o.cnq, &mut self.tiers, ids, pos0, &mut |_| {})
+    }
+    unsafe fn decode(&mut self, tok: i64, pos: usize) -> Result<i64, String> {
+        if self.run.mtp_drafts() > 0 {
+            return self.run.spec_decode(&mut self.o.cnq, &mut self.tiers, tok, pos);
+        }
+        self.row(tok, pos, true)?.ok_or_else(|| format!("glm5: the head row at {pos} gave no id"))
+    }
+    fn mtp_drafts(&self) -> usize {
+        self.run.mtp_drafts()
+    }
+    fn mtp_report(&mut self) -> Option<String> {
+        self.run.mtp_take_stats().map(|s| s.summary())
     }
     unsafe fn logits(&self) -> Vec<f32> {
         cuda::dtoh(self.run.logits_dev(), self.o.g.vocab)
@@ -214,6 +278,11 @@ impl Rows for Glm5Device {
                 at += n;
             }
         }
+        // #192: the MTP block's pending head-norm row
+        if let Some(hp) = self.run.spec_pending_row() {
+            let n = self.o.g.hidden;
+            cuda::ck(cudarc::driver::sys::cuMemcpyDtoH_v2(into[at..at + n].as_mut_ptr() as *mut std::ffi::c_void, hp, n * 4));
+        }
     }
     unsafe fn load_state(&mut self, from: &[f32]) {
         let (s, c) = self.one_state();
@@ -225,12 +294,18 @@ impl Rows for Glm5Device {
                 at += n;
             }
         }
+        // #192: nothing is ahead of a restored sequence; its pending head-norm row comes back
+        self.run.spec_level();
+        if let Some(hp) = self.run.spec_pending_row() {
+            cuda::to_f32_into(hp, &from[at..at + self.o.g.hidden]);
+        }
         cuda::sync();
     }
     unsafe fn zero_state(&mut self) {
         for k in self.run.kda_states() {
             k.reset();
         }
+        self.run.spec_level();
     }
     fn counters(&self) -> ([u64; 3], u64) {
         let a = self.tiers.cache.counters().iter().fold([0u64; 3], |a, c| [a[0] + c[0], a[1] + c[1], a[2] + c[2]]);
@@ -419,12 +494,12 @@ impl<R: Rows> Glm5Engine<R> {
         if pos >= self.rows.n_ctx() {
             return Err(format!("glm5: decode at {pos}, n_ctx {}", self.rows.n_ctx()));
         }
-        match self.rows.row(id, pos, true) {
-            Ok(Some(next)) => {
+        // #192: with MTP on the device, a verified id comes back without a launch
+        match self.rows.decode(id, pos) {
+            Ok(next) => {
                 self.history.push(id);
                 Ok(next)
             }
-            Ok(None) => unreachable!("a head row returns its id"),
             Err(e) => {
                 self.reset();
                 Err(e)
@@ -697,6 +772,290 @@ mod tests {
             eprintln!("glm5_engine gpu: ids {ids:?}; warm {w:?}; cold {c:?}");
             assert_eq!(w, c, "warm turn vs cold re-prefill");
             drop(e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_192_serve {
+    //! #192 part 2 on the GPU: `Glm5Engine` over a `Glm5Device` of the synthetic 8-layer glm5_next
+    //! model of the `glm5_flags` / `glm5_graph` tests (layers 0-2 KDA + dense, 3-7 MoE with 16
+    //! MUL1 experts, DSA at 3 and 7, vocab 2048), V 3 + P 4 tiers, and a synthetic MTP block.
+    //! `#[ignore]`: CI has no GPU. Run with
+    //! `cargo test --release --lib glm5_mtp_serve_gpu -- --ignored --nocapture --test-threads 1`.
+    use super::*;
+    use crate::cnq::Cnq;
+    use crate::glm5_flags::tests::synth_model;
+    use crate::glm5_moe::MoeGeo;
+    use crate::glm5_mtp as mtp;
+    use crate::glm5_tiers::TierSizes;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    const REC: u64 = 9_474_048;
+
+    fn geo() -> Glm5Geo {
+        let mut g = Glm5Geo::GLM_5_3_FLASH;
+        (g.layers, g.dense_prefix, g.experts, g.topk, g.vocab) = (8, 3, 16, 8, 2048);
+        g
+    }
+
+    /// a device of the synthetic model at `cap` rows: `nd` drafts per step (0 = off) with the
+    /// synthetic block of `seed`
+    unsafe fn device(path: &str, g: &Glm5Geo, nd: usize, cap: usize, seed: u64) -> Glm5Device {
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(path).unwrap();
+        let moe = MoeGeo::new(g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(path).unwrap();
+        let old = std::env::var(mtp::MTP_ENV).ok();
+        std::env::set_var(mtp::MTP_ENV, nd.to_string());
+        let mut run = Glm5Run::load(&mut cnq, g, &moe, cap, &mut |s| eprintln!("{s}"));
+        match old {
+            Some(o) => std::env::set_var(mtp::MTP_ENV, o),
+            None => std::env::remove_var(mtp::MTP_ENV),
+        }
+        if nd > 0 {
+            run.set_mtp(nd, Some(mtp::synthetic_block(g, &moe, seed))).unwrap();
+        }
+        let tiers = ExpertTiers::new(&cnq, path, g, &moe, TierSizes { vram: 3, pinned: 4 }, 1, (1 + nd) * g.topk).unwrap();
+        let o = Opened { cnq, path: path.to_string(), g: *g, moe, spec, records: 0, constants: 0 };
+        let plan = TierPlan { vram_ceiling: 0, fixed_bytes: 0, unit_bytes: 0, hot: 3, pinned: 4, nvme: g.experts - 7 };
+        Glm5Device { o, run, tiers, plan, n_ctx: cap, kd: KdaDims::of(g) }
+    }
+
+    /// how the caller picks the id it feeds back from the logits row (as `glm_generate` does)
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Policy {
+        /// the head's argmax
+        Greedy,
+        /// a draw at temperature 0.7: Gumbel-max with noise seeded by (position, id)
+        Sampled,
+        /// the argmax, but every fifth id forced to another one (an injected / redrawn id)
+        Forced,
+    }
+
+    fn mix(a: u64) -> u64 {
+        let mut x = a.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^= x >> 31;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^ (x >> 29)
+    }
+
+    fn pick(p: Policy, i: usize, pos: usize, row: &[f32], next: i64) -> i64 {
+        match p {
+            Policy::Greedy => next,
+            Policy::Forced if i % 5 == 4 => (next * 7 + 3) % row.len() as i64,
+            Policy::Forced => next,
+            Policy::Sampled => {
+                let mut best = (f64::NEG_INFINITY, 0usize);
+                for (k, &l) in row.iter().enumerate() {
+                    let u = ((mix(((pos as u64) << 20) ^ k as u64) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+                    let v = l as f64 / 0.7 - (-u.ln()).ln();
+                    if v > best.0 {
+                        best = (v, k);
+                    }
+                }
+                best.1 as i64
+            }
+        }
+    }
+
+    /// One request as `glm_generate` drives the engine: the decision, rollback or reset, the
+    /// prefill (or the snapshot's row when the whole prompt is held), the snapshot, then `n` ids
+    /// picked from the logits row and fed back. (fed ids, their logits rows, cached rows)
+    unsafe fn turn<R: Rows>(e: &mut Glm5Engine<R>, prompt: &[i64], n: usize, p: Policy) -> (Vec<i64>, Vec<Vec<f32>>, usize) {
+        let d = e.decide(prompt);
+        let cached = match d.reuse {
+            Some((_, q)) => {
+                e.rollback(q).unwrap();
+                q
+            }
+            None => {
+                e.reset();
+                0
+            }
+        };
+        let mut next = if cached == prompt.len() { e.restore_logits() } else { e.prefill(&prompt[cached..]).unwrap() };
+        e.snapshot(next);
+        let (mut ids, mut rows) = (Vec::new(), Vec::new());
+        for i in 0..n {
+            let row = e.logits();
+            let x = pick(p, i, e.pos(), &row, next);
+            ids.push(x);
+            rows.push(row);
+            if i + 1 == n {
+                break;
+            }
+            next = e.decode_step(x).unwrap();
+        }
+        (ids, rows, cached)
+    }
+
+    fn bits(a: &[Vec<f32>], b: &[Vec<f32>]) -> Vec<usize> {
+        a.iter().zip(b).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()).collect()
+    }
+
+    /// position -> the id fed there, of a turn
+    fn transcript(prompt: &[i64], fed: &[i64]) -> HashMap<usize, i64> {
+        prompt.iter().chain(fed).copied().enumerate().collect()
+    }
+
+    /// Serve with MTP gives the ids and logits rows of serve without it, for greedy, sampled
+    /// (T 0.7) and forced ids, over four requests: T1 cold, T2 warm (rolled back to T1's prompt
+    /// snapshot, a 11-id suffix prefilled), T3 the same prompt again (nothing prefilled, the
+    /// snapshot's row), T4 T2's prompt cold. Engines: MTP off; N = 3 with the drafts taken from
+    /// MTP off's transcript (the id fed at that position), wrong when the position % 4 == 1;
+    /// N = 2 with the block's own drafts. A warm turn equals the cold re-prefill (ids and bits).
+    #[test]
+    #[ignore = "needs the GPU (about 6 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_mtp_serve_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mtp_serve_gpu_turns_are_the_ids_without_mtp() {
+        let g = geo();
+        let s = synth_model(&g, REC);
+        let p1: Vec<i64> = (0..21).map(|i| (i * 97 + 11) % 2048).collect();
+        let n = 20usize;
+        let cap = 21 + 11 + n + 4;
+        let vocab = g.vocab as i64;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let gold: Arc<Mutex<HashMap<usize, i64>>> = Arc::default();
+            let mut e0 = Glm5Engine::new(device(&s.path, &g, 0, cap, 0), true);
+            let mut e1 = Glm5Engine::new(device(&s.path, &g, 3, cap, 0x0192_2001), true);
+            let mut e2 = Glm5Engine::new(device(&s.path, &g, 2, cap, 0x0192_2002), true);
+            assert_eq!((e0.rows().mtp_drafts(), e1.rows().mtp_drafts(), e2.rows().mtp_drafts()), (0, 3, 2));
+            assert_eq!(e1.snapshot_bytes(), e0.snapshot_bytes() + g.hidden * 4, "the snapshot holds the block's pending head-norm row");
+            let gh = gold.clone();
+            e1.rows_mut().run.set_mtp_hook(Some(Box::new(move |pos, d| match gh.lock().unwrap().get(&pos) {
+                Some(&t) if pos % 4 != 1 => t,
+                Some(&t) => (t + 1) % vocab,
+                None => d,
+            })));
+            for p in [Policy::Greedy, Policy::Sampled, Policy::Forced] {
+                // MTP off: the four requests
+                let t1 = turn(&mut e0, &p1, n, p);
+                let mut p2 = p1.clone();
+                p2.extend_from_slice(&t1.0[..6]);
+                p2.extend([5, 77, 1024, 3, 2000]);
+                let t2 = turn(&mut e0, &p2, n, p);
+                let t3 = turn(&mut e0, &p2, n, p);
+                e0.reset();
+                let t4 = turn(&mut e0, &p2, n, p);
+                assert_eq!((t1.2, t2.2, t3.2, t4.2), (0, 21, p2.len(), 0), "{p:?}: cached rows per request");
+                // the sampled and forced ids leave the argmax (else the arm would be greedy)
+                let off: usize = [&t1, &t2, &t3, &t4].iter().map(|t| t.0.iter().zip(&t.1).filter(|(&x, r)| x as usize != r.iter().enumerate().fold((0, f32::NEG_INFINITY), |b, (k, &v)| if v > b.1 { (k, v) } else { b }).0).count()).sum();
+                eprintln!("glm5_mtp serve {p:?}: {off} of {} fed ids are not the argmax of their row", 4 * n);
+                assert_eq!(off == 0, p == Policy::Greedy, "{p:?}: {off} ids off the argmax");
+                assert_eq!(t2.0, t4.0, "{p:?}: MTP off: warm vs cold ids");
+                assert!(bits(&t2.1, &t4.1).iter().all(|&d| d == 0), "{p:?}: MTP off: warm vs cold logits");
+                let want = [(&p1, &t1), (&p2, &t2), (&p2, &t3), (&p2, &t4)];
+                for (name, e) in [("N 3 transcript drafts", &mut e1), ("N 2 own drafts", &mut e2)] {
+                    let _ = e.rows_mut().mtp_report();
+                    for (k, (prompt, w)) in want.iter().enumerate() {
+                        *gold.lock().unwrap() = transcript(prompt, &w.0);
+                        if k == 3 {
+                            e.reset();
+                        }
+                        let got = turn(e, prompt, n, p);
+                        assert_eq!(got.2, w.2, "{name} {p:?} T{}: cached rows", k + 1);
+                        assert_eq!(got.0, w.0, "{name} {p:?} T{}: ids vs MTP off", k + 1);
+                        let d = bits(&got.1, &w.1);
+                        assert!(d.iter().all(|&x| x == 0), "{name} {p:?} T{}: logits rows differ in bits {d:?}", k + 1);
+                    }
+                    let st = e.rows_mut().run.mtp_take_stats().unwrap();
+                    eprintln!("glm5_mtp serve {name} {p:?}: {}", st.summary());
+                    assert!(st.steps > 0 && st.drafts > 0, "{name} {p:?}: the verify ran: {st:?}");
+                    if name.starts_with("N 3") {
+                        assert!(st.accepted > 0 && st.kda_restore_steps > 0, "{name} {p:?}: accepted drafts and rollbacks: {st:?}");
+                        if p == Policy::Greedy {
+                            // 4 requests x 19 decode steps; accepted ids come back without a verify
+                            assert!(st.steps < 4 * 19, "{name} {p:?}: {st:?}");
+                        }
+                    }
+                }
+            }
+            drop((e0, e1, e2));
+        }
+    }
+
+    /// every KDA state, the trunk's MLA rows `0 .. rows`, the block's rows `0 .. rows - 1` and
+    /// its pending row
+    unsafe fn seq_state(d: &Glm5Device, rows: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        cuda::sync();
+        let (kd, md) = (KdaDims::of(&d.o.g), crate::glm5_mla::MlaDims::of(&d.o.g));
+        let kda = d.run.kda_states().flat_map(|s| [cuda::dtoh_t::<u8>(s.s, kd.state_floats() * 4), cuda::dtoh_t::<u8>(s.conv, kd.conv_floats() * 4)]).collect();
+        let mla = d.run.mla_caches().flat_map(|c| [cuda::dtoh_t::<u8>(c.latent, rows * md.latent_bytes_per_token() as usize), cuda::dtoh_t::<u8>(c.index, rows * md.indexer_bytes_per_token() as usize)]).collect();
+        (kda, mla, d.run.mtp_state_bytes(rows - 1))
+    }
+
+    /// The prefix cache with MTP: T1 (21-id prompt, 9 greedy decode steps whose drafts are all
+    /// right, so verified ids are still ahead when the request ends, then a 4-id prefill that
+    /// moves the block's pending row), then T2 rolls back to the prompt snapshot and prefills an
+    /// 11-id suffix. Right after that prefill, every KDA state,
+    /// the trunk's MLA rows, the block's cache rows and its pending row equal, bit for bit, a
+    /// sequence that prefilled the same two pieces without the answer in between; the next 12
+    /// greedy ids equal it and a cold prefill of the whole prompt.
+    #[test]
+    #[ignore = "needs the GPU (about 6 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_mtp_serve_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mtp_serve_gpu_rollback_restores_the_block() {
+        let g = geo();
+        let s = synth_model(&g, REC);
+        let p1: Vec<i64> = (0..21).map(|i| (i * 53 + 29) % 2048).collect();
+        let cap = 64;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut e0 = Glm5Engine::new(device(&s.path, &g, 0, cap, 0), true);
+            let mut e = Glm5Engine::new(device(&s.path, &g, 3, cap, 0x0192_2003), true);
+            let t1 = turn(&mut e0, &p1, 10, Policy::Greedy);
+            let mut p2 = p1.clone();
+            p2.extend_from_slice(&t1.0[..6]);
+            p2.extend([9, 99, 999, 1999, 1]);
+            let gold: Arc<Mutex<HashMap<usize, i64>>> = Arc::new(Mutex::new(transcript(&p1, &t1.0)));
+            let gh = gold.clone();
+            e.rows_mut().run.set_mtp_hook(Some(Box::new(move |pos, d| gh.lock().unwrap().get(&pos).copied().unwrap_or(d))));
+            let w1 = turn(&mut e, &p1, 10, Policy::Greedy);
+            assert_eq!(w1.0, t1.0, "T1 ids vs MTP off");
+            let st = e.rows_mut().run.mtp_take_stats().unwrap();
+            assert!(st.accepted > 0, "T1 must accept drafts: {st:?}");
+            // a prefill after the snapshot moves the pending row (the engine allows it;
+            // `glm_generate` prefills once per request, before its snapshot)
+            e.prefill(&[7, 70, 700, 1700]).unwrap();
+            // T2 warm: rollback to the snapshot at 21, the suffix prefilled
+            assert_eq!(e.decide(&p2).reuse, Some((0, 21)));
+            e.rollback(21).unwrap();
+            let first_w = e.prefill(&p2[21..]).unwrap();
+            let warm = seq_state(e.rows(), p2.len());
+            let mut ids_w = vec![first_w];
+            for _ in 0..12 {
+                ids_w.push(e.decode_step(*ids_w.last().unwrap()).unwrap());
+            }
+            // the same two prefills without the answer in between
+            e.reset();
+            e.prefill(&p1).unwrap();
+            let first_r = e.prefill(&p2[21..]).unwrap();
+            let refs = seq_state(e.rows(), p2.len());
+            assert!(warm.0 == refs.0, "the KDA states after the warm prefill differ");
+            assert!(warm.1 == refs.1, "the trunk's MLA rows after the warm prefill differ");
+            assert!(warm.2[2] == refs.2[2], "the block's pending head-norm row after the warm prefill differs");
+            assert!(warm.2[..2] == refs.2[..2], "the block's cache rows 0..{} after the warm prefill differ", p2.len() - 1);
+            let mut ids_r = vec![first_r];
+            for _ in 0..12 {
+                ids_r.push(e.decode_step(*ids_r.last().unwrap()).unwrap());
+            }
+            assert_eq!(ids_w, ids_r, "warm vs the two prefills: ids");
+            // cold: the whole prompt at once (other block windows)
+            e.reset();
+            let mut ids_c = vec![e.prefill(&p2).unwrap()];
+            let cold = seq_state(e.rows(), p2.len());
+            for _ in 0..12 {
+                ids_c.push(e.decode_step(*ids_c.last().unwrap()).unwrap());
+            }
+            assert_eq!(ids_w, ids_c, "warm vs cold: ids");
+            assert!(warm.0 == cold.0 && warm.1 == cold.1, "warm vs cold: the trunk's states");
+            eprintln!(
+                "glm5_mtp serve rollback: block rows warm vs cold (windows from 0 vs 0+21): latent equal {}, indexer equal {}, pending row equal {}",
+                warm.2[0] == cold.2[0],
+                warm.2[1] == cold.2[1],
+                warm.2[2] == cold.2[2]
+            );
+            drop((e0, e));
         }
     }
 }

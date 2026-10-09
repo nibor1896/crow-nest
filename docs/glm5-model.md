@@ -496,8 +496,9 @@ Default off (unset or `0`): `generate` is the path above, bit for bit (the pass 
 flags publisher one row's ids). `CROW_GLM_MTP=N` (1..=4) drafts N ids per step with the MTP block
 ([glm5-mtp.md](glm5-mtp.md): the container's 288 MUL1 records + the overlay of `CROW_GLM_MTP_OVERLAY`,
 default `converter/GLM-5.3-Flash-MTP-overlay.cnq`) and verifies them in ONE trunk call over 1 + k rows
-(`Glm5Run::generate_spec`, `Glm5Pass::call_verify_with_experts`). `serve` (rows through
-`glm5_engine::Glm5Device`) does not use it.
+(`Glm5Run::generate_spec`, `Glm5Pass::call_verify_with_experts`). `serve` uses it too (since the
+second #192 change, 2026-10-09): see **serve** below and
+[glm5-tokenizer.md](glm5-tokenizer.md#the-engine-behind-it-185-part-2).
 
 - **Lossless by construction.** Every verify row's logits are the one-row decode call's bits: mHC,
   norms, dense FFN, router, MUL1 experts, shared expert, combine and head run over all rows with
@@ -523,17 +524,21 @@ default `converter/GLM-5.3-Flash-MTP-overlay.cnq`) and verifies them in ONE trun
   rejected positions need nothing: the caches are indexed by absolute position and a row is stored
   before any later row reads it (pooled keys are recomputed from the rows).
 - **The block's rows.** Row `i` = (embed(t_{i+1}), the trunk's head-norm row `h_i`) at the block's
-  cache position `i` (SGLang pairing). The prompt rows run as in `generate` and each leaves its
-  head-norm row; the block catches up over the prompt in calls of 16 rows (time inside the prompt
-  rows' reports), its last row drafts the first step. After a step it runs once over the accepted
+  cache position `i` (SGLang pairing). The prompt runs as without MTP (`Glm5Run::prefill_with`: the
+  #186 prompt calls of `CROW_CHUNK` rows, or row by row); after each call the call's rows are still
+  in the residual `x` (`call_with_expert_batches` runs in place over all rows), their head-norm rows
+  (`stream_mean_rms`, one block per row) and the next ids' embeddings go into the block's window, and
+  the block runs over the windows of the row path: `MTP_CHUNK` = 16 rows from position 0, the
+  window of the last prompt row after the first id (time inside the prompt calls' reports). Its
+  last row drafts the first step. After a step it runs once over the accepted
   rows (true ids, the verify's head-norm rows); its last row drafts the next step; N > 1 chains the
   block on its own `shared_head.norm` row (each chained row runs its own indexer: no
   `index_share_for_mtp_iteration`; drafts only). Drafts per step: min(N, ids still wanted - 1,
   cache rows left).
 - **Switches.** `CROW_GLM_GRAPH`: the prompt rows keep their graphs; the verify and the block run
   uncaptured (another shape). `CROW_GLM_FLAGS`: one-row calls publish their ids; a verify of more
-  rows reads its ids by a sync. `CROW_GLM_LOOKAHEAD` and `CROW_CHUNK` (#186) do not apply under MTP
-  (the prompt runs row by row, each row leaving its head-norm row for the block). `CROW_GLM_CPU_LANE=1`
+  rows reads its ids by a sync. `CROW_CHUNK` (#186) applies to the prompt (above). `CROW_GLM_LOOKAHEAD`
+  does not apply under MTP. `CROW_GLM_CPU_LANE=1`
   is refused by name (its experts have other bits than the verify's GPU kernels, so the ids could
   differ from the run without MTP).
 - **Counters** (`Glm5Run::mtp_stats`, `glm5_run` line `decode MTP:` and JSON `decode.mtp` per rep):
@@ -542,6 +547,26 @@ default `converter/GLM-5.3-Flash-MTP-overlay.cnq`) and verifies them in ONE trun
   shared by its ids (`secs` = step / ids); its tier counters sit on its first id. `glm5_run` plans
   the tiers at free VRAM minus `glm5_mtp::spec_vram_bytes` (derived) and prints the measured VRAM
   the block took next to it.
+- **serve** (`glm5_engine::Glm5Device`: `Rows::decode` -> `Glm5Run::spec_decode`, `Rows::prefill_chunk`
+  -> `Glm5Run::spec_prefill`; the boot plans at free VRAM minus `spec_vram_bytes` over the context,
+  `(1 + N) x top-k` staging slots, the CPU lane refused by name). `serve` feeds one id per
+  `decode_step`. A verify at `p` feeds the caller's id and k drafts and keeps all 1 + k rows
+  (`glm5_mtp::Ahead`: fed ids, greedy ids, logits and head-norm rows, KDA slots; no eager
+  rollback). While the caller's next id equals the draft fed at that row, `decode_step` hands out
+  that row's greedy id and logits row without a launch, so accepted ids stream at once. When it
+  differs, `Glm5Run::spec_settle` copies the KDA states back from the slot of the caller's last row,
+  runs the block over the rows the caller reached (their next ids: the drafts reached, then the
+  caller's id), chains new drafts and verifies again. A greedy caller keeps the drafts that equal
+  the argmax. A sampling caller (temperature > 0, host sampler, logit bias, grammar redraw, forced
+  ids) keeps the drafts its draws hit. Every id is drawn from its own row, the one-row decode's
+  bits, with the same draws as without MTP. That is speculative sampling (Leviathan et al.,
+  arXiv:2211.17192, Algorithm 1; Chen et al., arXiv:2302.01318, Algorithm 2) with a point-mass draft
+  q = one-hot(d): accept with probability p(d), else draw from p without d. Drawing x ~ p and keeping
+  d iff x == d is that rule. A trunk row's block row needs the NEXT id, so the block lags one row:
+  the last row's head-norm row waits in `Spec::hp` (H f32) and the prefix snapshot copies it
+  (`state_floats` + H; a rollback restores it and drops `Ahead`). The block's cache truncates like
+  the trunk's. Counters: `[chat] MTP (#192)` per request. `hist` counts a step when the caller leaves
+  it; `accepted` counts the drafts handed out.
 
 Tests (`cargo test --release --lib glm5_mtp_spec_gpu -- --ignored --nocapture --test-threads 1`,
 2026-10-09, RTX 5090): `glm5_mtp_spec_gpu_is_lossless` on the synthetic 8-layer model of 6.3 plus
@@ -554,6 +579,32 @@ cache row 0..=73 bit for bit; counters equal to a host simulation of the pattern
 28 steps, 79 drafts, 41 accepted, histogram [14, 0, 1, 13]). Red with the restore removed: ids
 diverge from generated id 6 (`[.., 189, 1016, 999, ..]` instead of `[.., 189, 894, 508, ..]`).
 `glm5_mtp_spec_gpu_refusals`: a model loaded for one row, too few staging slots, the CPU lane.
+`glm5_mtp_spec_gpu_chunked_prompt_is_lossless` (37-id prompt, 24 ids, pass of 16 rows): N = 3 with
+patterned drafts at prompt chunk 1 and 16, N = 2 with the block's own drafts at chunk 12 (calls
+crossing the block's windows). Each gives the ids of the row path and every logit's bits of MTP off at
+the same chunk; one prompt report per prompt call ([16, 16, 5], [12, 12, 12, 1]); the block's cache
+rows over the prompt equal, bit for bit, the block run in the row path's windows on the same
+chunked trunk's rows. The counters of chunk 16 equal chunk 1's and the simulation (9 steps, 24
+drafts, 14 accepted). Informational: the block's latent rows at chunk 16 vs 1 differ in 95 of 18,944
+BF16 values, because the trunk's chunked rows differ from the row path's (#186). Red with the
+prompt forced row by row (the code before): prompt reports of one row each, and 2,035-2,045 of 2,048
+logits per id differ in bits from MTP off at chunk 16.
+`glm5_engine::tests_192_serve` (`cargo test --release --lib glm5_mtp_serve_gpu -- --ignored
+--nocapture --test-threads 1`): `glm5_mtp_serve_gpu_turns_are_the_ids_without_mtp` drives `Glm5Engine`
+over three synthetic devices (MTP off; N = 3 with drafts from the off engine's transcript, wrong at
+position % 4 == 1; N = 2 with the block's own drafts) as `glm_generate` does. It covers greedy, sampled
+(Gumbel-max at T 0.7: 80 of 80 ids off the argmax) and forced ids (every fifth), and four requests:
+cold, warm (rollback + 11-id suffix), identical (nothing prefilled), cold re-prefill. Every id and
+logits row equals MTP off, warm equals cold, and N = 3 keeps 53 of 69 drafts in 23 verify steps for
+76 ids. `glm5_mtp_serve_gpu_rollback_restores_the_block`: after an answer with verified ids still
+ahead, a rollback and an 11-id suffix, the KDA states, the trunk's MLA rows, the block's cache rows and
+its pending row equal a sequence that prefilled the two pieces without the answer; the next 12 ids
+equal it and a cold prefill of the whole. In between, a 4-id prefill moves the pending row; the snapshot
+brings it back. Red: with serve's decode off the MTP path, "the verify ran" fails (0 steps). Without the
+KDA rollback when the caller leaves the verify's rows, T2's ids differ from MTP off. Without the pending
+row in the snapshot, the block's cache rows after the warm prefill differ. In `glm_generate` nothing
+moves the pending row between the snapshot and a rollback (one prefill per request), so that last case
+is the engine API's, not a measured serve failure.
 `glm5_mtp_spec_gpu_block_gemv_is_the_record_kernel`: the block's NVFP4 projections on
 `glm5_gemv_fp4` (#191) give the bits of `gemv_fp4_b`.
 
@@ -571,7 +622,8 @@ diverge from generated id 6 (`[.., 189, 1016, 999, ..]` instead of `[.., 189, 89
 - `CROW_GLM_GRAPH` (section 6.3) on the real container: not run (ids, launches per row, speed);
   a position past 2,051 tokens, where a stale `idx_scores` grid would change the selection: not run.
 - `CROW_GLM_MTP` (section 6.4) on the real container: not run (ids against the run without it,
-  acceptance, speed, the VRAM the block takes against `spec_vram_bytes`).
+  acceptance, speed, the VRAM the block takes against `spec_vram_bytes`), neither with `CROW_CHUNK`
+  nor under `serve` (boot plan, warm turns, sampled requests).
 - #188 `CROW_GLM_PINNED=zerocopy` and `CROW_GLM_CPU_LANE=1` on the real container: not run (speed,
   ids, G3 cosine); how far the CPU lane overlaps the GPU's experts, the idle pool workers' spin
   against the GPU host thread, and the GPU's zero-copy rate from a cacheable pinned tier on Windows:

@@ -302,13 +302,26 @@ Since 2026-10-09 a glm5_next container boots and serves (`engine/src/glm5_engine
    access, `crow_expert_cold` = the NVMe-served ones, cumulative). Greedy takes the head's argmax,
    the id `glm5_run` takes. A sampled request draws on the host from the logits row read back
    (619,520 B per token): glm5_next has no device sampler.
+   **MTP** (#192, `CROW_GLM_MTP=N`, default off): `decode_step` runs the speculative decode
+   (`Glm5Run::spec_decode`). One verify step feeds the fed id and N drafts. While the next fed id
+   equals the draft at that row, `decode_step` returns that row's id and logits row without a
+   launch, so the ids stream as they are reached. Every id comes from its own row (the one-row
+   decode's bits), so greedy, sampled (temperature > 0), forced and grammar-redrawn ids are the ids
+   without MTP. A sampled request keeps the drafts its draws hit (speculative sampling with a
+   point-mass draft, [glm5-model.md](glm5-model.md) section 6.4). `timings` count the emitted ids
+   (`decode_step` runs once per id). The boot plans the tiers at free VRAM minus the block's derived
+   bytes, gives `(1 + N) x top-k` staging slots and refuses `CROW_GLM_CPU_LANE=1` by name; the
+   `[serve]` boot line names N, and one `[chat] MTP (#192)` line per request carries the
+   counters.
 4. **Prefix cache.** One snapshot after each prompt, as for the other families (#31 A9, #36 M2b,
    #100): the KDA recurrent state and conv window of the 34 KDA layers are copied to host RAM
    (152,633,344 B plus the logits row); the MLA latent and DSA indexer rows are position-indexed
    and every call reads rows `0 .. pos0 + t` only, so a prefix is a truncation. A warm request rolls
    back to the snapshot and prefills the rest; a cold start drops it. `CROW_PREFIX_CACHE=0` turns
-   it off.
-5. **Not on this path.** MTP (#182), vision (plan step 20: image placeholders ride as ids), slot
+   it off. With MTP the snapshot also holds the MTP block's pending head-norm row (H f32: the
+   block's row for the last prompt row waits for the next id); the block's cache truncates like the
+   trunk's.
+5. **Not on this path.** Vision (plan step 20: image placeholders ride as ids), slot
    files (`POST /slots/0` answers 501), VRAM lending (`POST /v1/crow/vram/lend` answers 501), the
    park of #118, the trickle.
 
@@ -320,7 +333,8 @@ snapshot. `serve`'s `glm_serve_streams_timings_and_a_warm_turn_is_a_cold_reprefi
 over that twin: GLM's template renders a second turn as an extension of the first prompt, so it
 reports `cached_tokens` = the first prompt. The device side is the ignored GPU test
 `glm5_engine_gpu_serve_rows_are_glm5_run_rows` (serve rows vs `Glm5Run::generate`: ids and
-logits bits, and warm vs cold), not run yet.
+logits bits, and warm vs cold), not run yet. MTP under serve: the GPU tests
+`glm5_mtp_serve_gpu_*` on a synthetic device ([glm5-model.md](glm5-model.md) section 6.4).
 
 ## Known limitations
 
