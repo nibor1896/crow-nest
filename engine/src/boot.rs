@@ -111,6 +111,44 @@ pub unsafe fn open_model(
     (cnq, ctx, cfg, cnq_path, sidecar, geo)
 }
 
+/// #185 part 2: glm5_next's front door, without the process: the container opened and checked
+/// the way `decode glmgolden` and `glm5_run` check it (`glm5_tiers::open_container`: index v2,
+/// the config passes the glm5_next family row, MUL1 expert records), then the context
+/// (`CROW_CONTEXT`, else the family floor 200,000, up to `max_position_embeddings`). No CUDA
+/// call; a refusal names the container.
+///
+/// [`model_geo`] stays the door of the `Engine` families: glm5_next has no `Geo` (`meta::verdict`),
+/// so `serve` takes this door for it (`bin/serve.rs` `engine_kind`).
+pub fn glm5_door(cnq_path: &str) -> Result<(crate::glm5_tiers::Opened, usize), String> {
+    let o = crate::glm5_tiers::open_container(cnq_path).map_err(|e| format!("glm5_next container {cnq_path}: {e}"))?;
+    let context = context_from_env(std::env::var("CROW_CONTEXT").ok().as_deref(), o.g.context_floor, o.g.context_max)?;
+    Ok((o, context))
+}
+
+/// #185 part 2: [`glm5_door`], then the process's CUDA context. Returned in drop order like
+/// [`open_model`]: the engine loaded from these must drop before the context.
+///
+/// - `CROW_KV` is not read: the MLA latent cache of glm5_next is BF16 by construction
+///   (`docs/glm5-mla.md`); a set value is named and ignored
+/// - unknown `CROW_*` names are warned about as at [`open_model`]
+///
+/// # Safety
+///
+/// - creates the process's CUDA primary context, so no kernel may have run yet
+/// - the caller keeps the context alive for as long as any device allocation lives
+pub unsafe fn open_glm5(cnq_path: &str) -> Result<(crate::glm5_tiers::Opened, cuda::Ctx, usize), String> {
+    warn_unknown_crow_env();
+    if let Some(kv) = std::env::var("CROW_KV").ok().filter(|v| !v.trim().is_empty()) {
+        tracing::warn!(target: "boot", "[boot] CROW_KV={kv} is ignored for glm5_next: its MLA latent cache is BF16 (docs/glm5-mla.md)");
+    }
+    if let Ok(peek) = Cnq::peek_index(cnq_path) {
+        tracing::info!(target: "boot", "{}", index_line(&peek, std::env::var("CROW_MODEL_DIR").ok().as_deref()));
+    }
+    let (o, context) = glm5_door(cnq_path)?;
+    let ctx = cuda::Ctx::init();
+    Ok((o, ctx, context))
+}
+
 /// Crow #300 phase 2: the context the boot allocates. Unset (or empty) is the family's floor
 /// (`Geo::context_floor`: Flash-Next 200,000, the dense family 65,536); a value must be an
 /// integer in `floor..=max` (`Geo::context_max`, the checkpoint's max_position_embeddings).
@@ -514,5 +552,27 @@ mod tests_300_c7 {
         assert!(why.contains("the dynamic expert cache (#175), the NVMe expert tier and the 200k boot (#149, plan step 14) and the vision tower (plan step 20) for family Glm5Next not built yet"), "{why}");
         assert!(why.contains(&format!("[{}]", meta::v2_config_label(&path, "config_json"))), "{why}");
         assert!(matches!(meta::gate(&path, &peek, None), Err(GateRefusal::Refused(_))));
+    }
+
+    /// #185 part 2: the same GLM container takes glm5_next's own door (`glm5_door`), which the
+    /// `Engine` door above refuses: its config passes the family row and the door goes on to the
+    /// expert records, where this synthetic file (no MUL1 records) is refused naming the
+    /// container. A Flash-Next container is refused there too. No CUDA call either way.
+    #[test]
+    fn a_glm_v2_container_takes_the_glm5_door_and_a_flash_next_one_is_refused_there() {
+        const GLM: &str = "GLM-5.3-Flash";
+        let path = v2("glm5-door", &read(GLM, "config.json"), &read(GLM, "generation_config.json"), "Glm5Next", "glm5_next_text", &tensors(4096, 45));
+        let why = match crate::boot::glm5_door(&path) {
+            Err(w) => w,
+            Ok(_) => panic!("a container without expert records opened"),
+        };
+        assert!(why.starts_with(&format!("glm5_next container {path}: ")), "{why}");
+        assert!(why.contains("the index carries no glm5_next routed-expert tensor"), "the family row passed, the records refused: {why}");
+        let fnx = flash_next_v2("glm5-door-fnx");
+        let why = match crate::boot::glm5_door(&fnx) {
+            Err(w) => w,
+            Ok(_) => panic!("a Flash-Next container opened as glm5_next"),
+        };
+        assert!(why.starts_with(&format!("glm5_next container {fnx}: ")) && why.ends_with("family FlashNext has no Glm5Geo"), "{why}");
     }
 }
