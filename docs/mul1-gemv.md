@@ -7,11 +7,11 @@ dequant pass, on two paths:
 - **GPU** (sm_120): `engine/src/kernels_mul1.cu`, host side `kernels::mul1` (`MUL1_SRC`,
   `Kernels`, `GemvPlan`, `FfnPlan`). One pointer table per launch: a record base is a VRAM slot or
   a pinned-host UVA address, the kernels do not know which (the `gemv_fp4_ptrb` pattern).
-- **CPU**: `engine/src/cpu_mul1.rs`, AVX2 with a scalar fallback, API and threading of
-  `cpu_nvfp4` (#173).
+- **CPU**: `engine/src/cpu_mul1.rs`, AVX2 (+ FMA) with a scalar fallback, the API of
+  `cpu_nvfp4` (#173), its own persistent worker pool (#183 C1).
 
-**Status:** kernels and tests only. Nothing in the engine calls them. The GPU launch sites (plan
-step 16), the CPU lane with its hit/miss split and a persistent thread pool (plan step 19) and gate
+**Status:** kernels and tests; `glm5_moe` (#164) calls `cpu_mul1::gemv`, nothing else calls them.
+The GPU launch sites (plan step 16), the CPU lane with its hit/miss split (plan step 19) and gate
 R (#174) are open. The int8-activation fast path of exllamav3's CPU kernel is out of scope (lossy,
 see section 3).
 
@@ -19,10 +19,11 @@ see section 3).
 
 ```
 cd engine
-CARGO_BUILD_JOBS=4 cargo test --release --lib cpu_mul1                       # 8 tests, no GPU
+CARGO_BUILD_JOBS=4 cargo test --release --lib cpu_mul1                       # 11 tests, no GPU
 CARGO_BUILD_JOBS=4 cargo test --release --lib tests_mul1_src                 # 1 test, NVRTC only
 CARGO_BUILD_JOBS=4 cargo test --release --lib mul1_gpu -- --ignored --nocapture --test-threads 1 --skip bench
 CARGO_BUILD_JOBS=4 cargo test --release --lib cpu_mul1_bench -- --ignored --nocapture
+CARGO_BUILD_JOBS=4 cargo test --release --lib cpu_nvfp4_bench -- --ignored --nocapture   # the C1 comparison
 CARGO_BUILD_JOBS=4 cargo test --release --lib mul1_gpu_bench -- --ignored --nocapture
 CARGO_BUILD_JOBS=4 cargo test --release --lib mul1_gpu_read_bench -- --ignored --nocapture
 ```
@@ -55,7 +56,7 @@ fixtures from `converter/tests/fixtures` at compile time.
 | GPU | `mul1_gemv_warp` | the first kernel of #180, reference arm only (`Kernels::use_warp_gemv`): each warp loads its own tile, 96 B per warp request at K = 3; same f32 order (`mul1_tile_fma`), same bits |
 | GPU | `mul1_had_out` | sums the S partials left to right, FWHT, / 128, * svh |
 | GPU | `mul1_act_had_in` | gate and up finished, `silu(g) * u` (also stored in `FfnPlan::h`), down's x * suh and FWHT |
-| CPU | `gemv` / `expert_ffn` | input transform on the caller, units of 4 tile columns handed to `threads` workers by an atomic counter (#183; `Impl::V1`, test only, keeps the first static split), k-major walk with prefetch, lane states by one byte shuffle + shift + mask; the FFN has two barriers (gate/up, then worker 0 finishes and prepares down, then down) |
+| CPU | `gemv` / `expert_ffn` | one run of the persistent pool (`pool`: workers spin ~2 ms after a job, then park; the caller is worker 0; a worker that has not started when worker 0 is done is skipped, not waited for): input transform per 128-block of x, then tile columns in guided chunks of 4, 2, 1 columns from an atomic counter (`chunks`: the last chunk a slow core takes is one column), the worker that completes a 128-column block finishes it (Hadamard out; in the FFN also the activation and down's input transform), later phases wait for completed work, never for workers. K-major walk with prefetch of every line 6 tile rows ahead; lane states by one byte shuffle + shift + mask from a division-free window (`Lane`: one 16-byte load, or `alignr` of the first and last 16 bytes for the lane that wraps), weight via `vpmaddwd` x 8192 + the bits of 1024.0 and one exact FMA; at K = 3 the 32 lanes of a tile are unrolled over compile-time constants (`K3_LANES`, `unit_k3`). Reference arms, test only: `Impl::V2` (#183) and `Impl::V1` (#180) |
 
 ## 3. Order of operations and the bound
 
@@ -109,14 +110,18 @@ held to the exllamav3 `reconstruct` digests #181 holds.
 | `cpu_mul1_avx2_equals_scalar_bits` | T 1, 2, 3, 5, 8 x threads 1, 3, 8, 16 on the 4 quantizer experts; FFN of a full GLM expert | bit-identical |
 | `cpu_mul1_activation_within_8_roundings` | f32 activation within gamma(8) | 1.88e-7 (gamma(8) = 4.77e-7) |
 | `cpu_mul1_expert_ffn_matches_reference` | fused == staged bits, down stage bound, chain bound, every thread count and path | 0.0013 x chain bound |
-| `cpu_mul1_decode_and_schedule_equal_v1_bits` (#183) | shuffle decoder == first decoder for every lane, bitrates 1..8, 1.5, 2.5, 3.5; counter schedule == static split: GEMV T 1, 2, 3, 5, 8 x threads 1, 3, 8, 16 on 9 experts, GLM FFN T 1, 4 x threads 1, 8, 16, 24 | bit-identical |
+| `cpu_mul1_decode_and_schedule_equal_v1_bits` (#183) | shuffle decoder == first decoder for every lane, bitrates 1..8, 1.5, 2.5, 3.5; the production path == `Impl::V1`: GEMV T 1, 2, 3, 5, 8 x threads 1, 3, 8, 16 on 9 experts, GLM FFN T 1, 4 x threads 1, 8, 16, 24 | bit-identical |
+| `cpu_mul1_c1_kernel_equals_v2_bits` (#183 C1) | `weights_fast` == `weights` for all 65,536 states; `decode8_fast` == `decode8` for every lane, bitrates 1..8, 1.5, 2.5, 3.5, 64 random tiles each; `unit_k3` == `unit_fast` (GLM gate, T 1..4); the production path == `Impl::V2`: GEMV T 1, 2, 3, 5, 8 x threads 1, 3, 8, 16, 24 on 9 experts, GLM gate / down T 1, 4, GLM FFN T 1, 2, 4, 5 x threads 1, 2, 8, 16, 24 | bit-identical |
+| `cpu_mul1_scales_and_chunk_plan` (#183 C1) | bit-built `f16_to_f32` == the former `powi` formula for all 65,536 inputs; the chunk plan covers every column once, in aligned chunks of 4 / 2 / 1 inside one 128-block, ending in one-column chunks | - |
+| `cpu_mul1_pool_runs_all_work_once` (#183 C1) | 300 pool runs (n 2, 3, 8, 16, 24): all work done before `run` returns, job(0) once, no worker twice or at or past n; two threads calling at once; a nested call; a worker's panic raised in the caller, the pool usable after | - |
 | `tests_mul1_src::mul1_source_compiles_with_every_entry` | `MUL1_SRC` compiles (NVRTC, compute_120a) with its 6 entries; GPU n constants; record offsets | - |
 | `mul1_gpu_decode_is_the_codec` (GPU) | GPU weight == codec for all 65,536 states | - |
 | `mul1_gpu_gemv_holds_the_bound_in_vram_and_pinned` (GPU) | VRAM == pinned bits; ticket and rigorous bound; GPU vs CPU | 0.039 x bound, 3.3e-4 x rigorous; GPU vs CPU 0.018 x summed bound |
 | `mul1_gpu_gemv_block_equals_warp_bits` (GPU, #183) | `mul1_gemv` == `mul1_gemv_warp`: 12 bitrate cases x gate/up/down x T 1, 3, 8, two slots, VRAM / pinned / trellis base 4 B off 16-byte alignment; GLM FFN from pinned RAM | bit-identical, 324 GEMV cases + 1 FFN |
 | `mul1_gpu_ffn_matches_reference` (GPU) | VRAM == pinned; fused down == public GEMV on the FFN's own h; down stage and chain bound; GPU vs CPU; 2 slots in one launch == 1 slot | 0.0021 x chain bound, down stage 0.063 x bound |
 
-Every test was run once with its piece removed and failed (#180 implementation comment).
+Every test was run once with its piece removed and failed (#180 implementation comment; the #183 C1
+tests with a deliberate fault each, #183 C1 implementation comment).
 
 ## 5. Micro-benchmark
 
@@ -164,9 +169,54 @@ the Linux device-issued ceiling of record is 51.6 GB/s); the pinned FFN now runs
 ~90 % of the best local read shape. On the CPU the lane decode is ~94 % of one thread (decode alone
 1.66 of 1.76 ms per gate GEMV), and the static split made 16 threads slower than 8.
 
-**CPU target not reached**: #183 asked for the MUL1 FFN at >= 50 % of the NVFP4 FFN's GB/s at the same
+**CPU target not reached at `13bea90`** (superseded by the C1 follow-up below): #183 asked for the MUL1 FFN at >= 50 % of the NVFP4 FFN's GB/s at the same
 thread count (8 threads: >= 14.01 of 28.02 GB/s); measured 9.12 (33 %). Both formats run the same
 25.2 M weights, so the target needs MUL1 within 1.34 x NVFP4's time per expert; one thread takes
 5.593 ms against NVFP4's 2.104 (2.66 x), and even perfect scaling over 8 P-cores (0.70 ms, 13.5 GB/s)
 stays under the target. Starting 8 scoped threads and joining them costs 171 us per call on this
 Windows box (measured with empty work), for both formats; a persistent pool is plan step 19.
+
+### #183 C1 follow-up: the CPU target met
+
+2026-10-09 15:56 UTC, the same machine, release, one binary, two sessions (S1 15:56:04, S2 15:56:14);
+total CPU load 0.8-3.3 % before and after each (`typeperf`), no other heavy process. `old` =
+`Impl::V2` (the #183 kernel as at `bd52328`), timed after the pool's workers parked; `new` alternates
+with it and so starts from parked workers every call; `new warm` = 24 calls back to back; median of 24
+per arm; `cpu_nvfp4_bench` right after each session. GB/s of each format's own bytes, S1 / S2:
+
+| T | threads | old (#183) | new | new warm | NVFP4 | new / NVFP4 |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 1.76 / 1.76 (5.382 ms) | 3.02 / 3.02 (3.138 ms) | 3.00 / 3.00 | 6.96 / 7.05 | 43 / 43 % |
+| 1 | 4 | 5.65 / 5.65 | 11.57 / 11.61 | 11.79 / 11.79 | 20.87 / 20.99 | 55 / 55 % |
+| 1 | **8** | 9.66 / 9.71 (0.980 ms) | **19.74 / 21.23** (0.480 / 0.446 ms) | 22.57 / 22.79 | 27.92 / 28.40 (0.507 / 0.498 ms) | **71 / 75 %** |
+| 1 | 16 | 9.75 / 9.69 | 26.31 / 26.66 | 29.35 / 29.51 | 22.09 / 21.94 | 119 / 122 % |
+| 1 | 24 | 9.39 / 9.52 | 31.92 / 32.48 | 35.55 / 34.26 | 17.06 / 17.79 | 187 / 183 % |
+| 4 | 1 | 1.20 / 1.20 (7.902 ms) | 1.89 / 1.89 (5.015 ms) | 1.88 / 1.88 | 4.79 / 4.72 | 39 / 40 % |
+| 4 | 4 | 3.60 / 3.67 | 7.27 / 7.30 | 7.37 / 7.40 | 13.93 / 14.26 | 52 / 51 % |
+| 4 | 8 | 5.68 / 5.78 | 14.20 / 14.29 | 14.32 / 13.54 | 21.62 / 21.55 | 66 / 66 % |
+| 4 | 16 | 5.90 / 5.85 | 18.31 / 18.34 | 18.62 / 18.46 | 17.32 / 17.68 | 106 / 104 % |
+| 4 | 24 | 5.77 / 6.07 | 22.18 / 22.00 | 22.45 / 22.45 | 15.24 / 15.68 | 146 / 140 % |
+
+**C1** (CPU FFN, T 1, 8 threads, `new` >= 0.5 x the NVFP4 FFN of the same session): 19.74 >= 13.96
+(S1) and 21.23 >= 14.20 GB/s (S2): **met**. What changed, and what each step was measured to remove
+(the step measurements ran beside other jobs, not clean; they explain, the table above judges):
+
+- the lane window without a division (the #183 decoder took the wrapping lane's words modulo
+  `n32`, 2 of 32 lanes per tile at K = 3) and, at K = 3, the 32 lanes unrolled over compile-time
+  constants: one-thread gate GEMV 1.27-1.29 ms (table-driven) -> 1.03-1.05 ms (unrolled);
+- the weight from `vpmaddwd` x 8192 + the bits of 1024.0 and one exact FMA: one-thread FFN 3.36 ->
+  3.14 ms (two runs each, back to back, ~1-2 % load; both bit-identical); an AVX2 CPU without FMA
+  keeps the #183 unit;
+- the input transform: 78-94 us serial per FFN at `bd52328` (`f16_to_f32` called `powi` per scale)
+  -> bit-built conversion, and the transform runs per 128-block inside the pool;
+- zeroed per-call buffers (~20 us per FFN) -> a per-thread scratch vector;
+- fixed 4-column units: with 2-5 of 8 workers on slow cores (half the units each) every phase ended
+  with a ~100 us tail -> guided chunks of 4, 2, 1 columns (tail 5-20 us);
+- 8 scoped threads per call (171 us, #183) -> the persistent pool.
+
+Not measured: a re-run by the lead on a machine known to be quiet, Linux, E-cores alone, the CPU
+time the idle workers spin away after a call (up to `pool::SPINS` pauses each). Earlier sessions
+the same day under 5-8 % load (15:45 UTC, the same kernel before the no-FMA fallback and the
+test-only scratch poisoning were added) gave 20.63 / 20.46 GB/s at 8 threads against NVFP4 23.98 / 24.55, and a warm-pool
+median of 0.761 / 1.060 ms at T 4, 24 threads (max 2.2-2.3 ms, the cold arm 0.44 ms; spinning
+workers on every core), not seen in the quiet sessions above.

@@ -1,7 +1,7 @@
 //! crow-nest #180: the CPU MUL1 trellis expert GEMV and FFN (plan step 10, CPU half; the GPU half
 //! is `kernels::mul1` / `kernels_mul1.cu`). A routed GLM-5.3-Flash expert stored as a CNQ MUL1
 //! record (#181, `converter/src/mul1.rs`) is computed where it lies, without a dequant pass.
-//! Nothing in the engine calls this yet (the CPU-lane wiring is plan step 19).
+//! Its one caller so far is `glm5_moe` (#164); the CPU-lane wiring is plan step 19.
 //!
 //! # Format (the #181 record, bit for bit)
 //!
@@ -20,7 +20,8 @@
 //!   rounds with sybil's magic add, `ft_core.h:218-246`; both tested against the codec for every
 //!   state). The AVX2 path gets a lane's 8 states with one byte shuffle of a 16-byte window, one
 //!   variable shift and a mask (#183, sybil `ft_core.h:129-160, 175-191`, exllamav3
-//!   `moe_mul1.cpp:1004-1030`), the same states as the scalar windows.
+//!   `moe_mul1.cpp:1004-1030`), the same states as the scalar windows; since #183 C1 the window
+//!   needs no division ([`Lane`]) and at K = 3 the 32 lanes are compile-time constants.
 //! - `y = x W`, `W = diag(suh) H W_hat H diag(svh) / 128`, H the 128-wide Sylvester Hadamard:
 //!   exllamav3 `LinearEXL3.get_weight_tensor` / `reconstruct_hgemm` (`exl3.py:193-249`). The
 //!   kernel computes `xh = H (x * suh)`, `y' = xh W_hat` (decoding W_hat in the inner loop) and
@@ -47,15 +48,16 @@
 //! `151539c7`, MIT) and sybil-solutions/glm53-flash-offload `kernels/cpu_avx2/ft_core.h`
 //! (`df0b439`, MIT, Copyright (c) 2026 0xSero): the decode identity, the k-major tile walk over a
 //! band of output tiles and the stream-order accumulator layout. Code is not copied; both are MIT.
-//! API and threading are those of `cpu_nvfp4` (#173): `threads` scoped workers per call, one
-//! barrier between the FFN phases; the work units (4 tile columns each) are handed out by an
-//! atomic counter (#183), so on a hybrid CPU a P-core takes more units than an E-core. A unit is
-//! computed by one worker with the same operations whichever it is, so the bits do not depend on
-//! the thread count.
+//! The API is that of `cpu_nvfp4` (#173). Threading (#183 C1, see [`Impl`]): one run of the
+//! persistent [`pool`] per call; tile columns go out in guided chunks from an atomic counter, so on
+//! a hybrid CPU a P-core takes more than an E-core and the last chunk is one column; the worker
+//! that completes a 128-column block finishes it; a phase waits for completed work, never for
+//! workers. A column is computed by one worker with the same operations whichever it is and
+//! whatever chunk holds it, so the bits do not depend on the thread count.
 
 pub use crate::cpu_nvfp4::{avx2_available, Path};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Barrier;
+use std::sync::OnceLock;
 
 /// GLM-5.3-Flash `hidden_size`
 pub const GLM_HIDDEN: usize = 4096;
@@ -111,16 +113,16 @@ impl Bitrate {
     }
 
     /// u16 words per 16x16 tile, `16 K`
-    pub fn words_per_tile(self) -> usize {
+    pub const fn words_per_tile(self) -> usize {
         16 * self.bits as usize + if self.half { 8 } else { 0 }
     }
 
-    pub fn tile_bytes(self) -> usize {
+    pub const fn tile_bytes(self) -> usize {
         2 * self.words_per_tile()
     }
 
     /// exclusive end bit of position `t` in the tile's stream
-    pub fn end_bit(self, t: usize) -> usize {
+    pub const fn end_bit(self, t: usize) -> usize {
         let b = self.bits as usize;
         if !self.half {
             (t + 1) * b
@@ -143,21 +145,23 @@ fn use_avx2(path: Path) -> bool {
     }
 }
 
-/// fp16 bits -> f32 (exact)
+/// fp16 bits -> f32 (exact). A normal value is assembled from its bits (sign, exponent + 112,
+/// mantissa << 13), the same f32 as `sign * (1024 + m) * 2^(e - 25)`; NaN gives `f32::NAN`
+/// (#183 C1: the scales are converted per call, `powi` made the input transform ~80 us).
 pub fn f16_to_f32(h: u16) -> f32 {
     let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
-    let e = ((h >> 10) & 0x1f) as i32;
-    let m = (h & 0x3ff) as f32;
+    let e = ((h >> 10) & 0x1f) as u32;
+    let m = (h & 0x3ff) as u32;
     match e {
-        0 => sign * m * (2f32).powi(-24),
+        0 => sign * m as f32 * (1.0 / 16_777_216.0),
         31 => {
-            if m == 0.0 {
+            if m == 0 {
                 sign * f32::INFINITY
             } else {
                 f32::NAN
             }
         }
-        _ => sign * (1024.0 + m) * (2f32).powi(e - 25),
+        _ => f32::from_bits((h as u32 & 0x8000) << 16 | (e + 112) << 23 | m << 13),
     }
 }
 
@@ -229,6 +233,73 @@ struct Group {
     shr: [i32; 8],
 }
 
+/// The window of one trellis lane as the C1 kernel (#183 follow-up) reads it, with no division
+/// in the inner loop: a plain 16-byte load at byte `off`, or for a lane whose bits run over the
+/// circular end of the stream (`alignr` = 4, 8 or 12) `_mm_alignr_epi8` of the tile's first 16
+/// bytes and its last 16 bytes at `off`, so window word i is stream word `(w0 + i) % n32` (sybil
+/// `ft_core.h:180-185` does this for K = 3 lane 0). `ctrl` and `shv` as in [`Group`], relative to
+/// the window's first word; a lane whose bits end in the tile's last words without wrapping
+/// reads the last 16 bytes instead of running past the tile.
+#[derive(Clone, Copy, Debug)]
+#[repr(C, align(32))]
+struct Lane {
+    ctrl: [u8; 32],
+    shv: [i32; 8],
+    off: usize,
+    alignr: u8,
+}
+
+/// The [`Lane`] table of one bitrate, a `const fn` so the K = 3 table is built (and its window
+/// checks run) at compile time ([`K3_LANES`]).
+const fn lane_table(b: Bitrate) -> [Lane; 32] {
+    let n32 = b.words_per_tile() / 2;
+    let s = 32 * n32;
+    let mut lanes = [Lane { ctrl: [0x80; 32], shv: [0; 8], off: 0, alignr: 0 }; 32];
+    let mut g = 0;
+    while g < 32 {
+        let first = (b.end_bit(8 * g) + s - 16) % s;
+        // bits from the lane's first window start to the end of its last state (circular)
+        let span = ((b.end_bit(8 * g + 7) + s - 16) % s + s - first) % s + 16;
+        let w0 = first / 32;
+        let wraps = w0 + 4 > n32 && first + span > s;
+        let ws = if w0 + 4 <= n32 || wraps { w0 } else { n32 - 4 };
+        lanes[g].off = 4 * if wraps { n32 - 4 } else { ws };
+        lanes[g].alignr = if wraps { (4 * (w0 + 4 - n32)) as u8 } else { 0 };
+        let mut j = 0;
+        while j < 8 {
+            let rel = ((b.end_bit(8 * g + j) + s - 16) % s + s - 32 * ws) % s;
+            let q0 = rel / 8;
+            // a state on a byte boundary needs only Q0, Q0 + 1 (the shift by 16 drops the third
+            // byte): that byte may lie past the window and is zeroed (control 0x80)
+            let need = if rel % 8 == 0 { q0 + 1 } else { q0 + 2 };
+            assert!(need < 16, "cpu_mul1: a trellis lane leaves the 16-byte window");
+            let mut d = 0;
+            while d < 3 {
+                // stream byte q of the window sits at window byte 4 (q / 4) + 3 - q % 4 (LE words)
+                let q = q0 + d;
+                lanes[g].ctrl[4 * (j % 4) + 16 * (j / 4) + 3 - d] = if q < 16 { (4 * (q / 4) + 3 - q % 4) as u8 } else { 0x80 };
+                d += 1;
+            }
+            lanes[g].shv[j] = 16 - (rel % 8) as i32;
+            j += 1;
+        }
+        g += 1;
+    }
+    lanes
+}
+
+/// the GLM experts' bitrate
+const K3: Bitrate = Bitrate { bits: 3, half: false };
+
+/// the K = 3 lane table, built at compile time
+static K3_LANES: [Lane; 32] = lane_table(K3);
+
+/// The tables of bitrate `b`, built once per process.
+fn tables(b: Bitrate) -> &'static Tables {
+    static T: [OnceLock<Tables>; 18] = [const { OnceLock::new() }; 18];
+    T[2 * b.bits as usize + b.half as usize].get_or_init(|| Tables::new(b))
+}
+
 /// per-bitrate position tables
 #[derive(Clone, Debug)]
 struct Tables {
@@ -236,6 +307,7 @@ struct Tables {
     /// window start bit of every trellis position
     lo: [usize; 256],
     groups: [Group; 32],
+    lanes: [Lane; 32],
 }
 
 impl Tables {
@@ -246,29 +318,33 @@ impl Tables {
         for (p, l) in lo.iter_mut().enumerate() {
             *l = (b.end_bit(p) + s - 16) % s;
         }
-        let mut groups = [Group { ctrl: [0x80; 32], shv: [0; 8], w0: 0, wrap: false, ia: [0; 8], ib: [0; 8], sh: [0; 8], shr: [0; 8] }; 32];
-        for (g, gr) in groups.iter_mut().enumerate() {
-            let w0 = lo[8 * g] / 32;
-            gr.w0 = w0;
-            gr.wrap = w0 + 3 >= n32;
-            for j in 0..8 {
-                let rel = (lo[8 * g + j] + s - 32 * w0) % s;
-                let ia = rel / 32;
-                assert!(ia + 1 <= 3, "cpu_mul1: K = {} lane {g} position {j} leaves the 4-word window", b.k());
-                gr.ia[j] = ia as i32;
-                gr.ib[j] = ia as i32 + 1;
-                gr.sh[j] = (rel % 32) as i32;
-                gr.shr[j] = 32 - (rel % 32) as i32;
-                // stream byte q of the window sits at window byte 4 (q / 4) + 3 - q % 4 (LE words)
-                let q0 = rel / 8;
-                assert!(q0 + 2 < 16, "cpu_mul1: K = {} lane {g} position {j} leaves the 16-byte window", b.k());
-                for (lb, q) in [(3, q0), (2, q0 + 1), (1, q0 + 2)] {
-                    gr.ctrl[4 * (j % 4) + 16 * (j / 4) + lb] = (4 * (q / 4) + 3 - q % 4) as u8;
+        let groups = {
+            let mut groups = [Group { ctrl: [0x80; 32], shv: [0; 8], w0: 0, wrap: false, ia: [0; 8], ib: [0; 8], sh: [0; 8], shr: [0; 8] }; 32];
+            for (g, gr) in groups.iter_mut().enumerate() {
+                let w0 = lo[8 * g] / 32;
+                gr.w0 = w0;
+                gr.wrap = w0 + 3 >= n32;
+                for j in 0..8 {
+                    let rel = (lo[8 * g + j] + s - 32 * w0) % s;
+                    let ia = rel / 32;
+                    assert!(ia + 1 <= 3, "cpu_mul1: K = {} lane {g} position {j} leaves the 4-word window", b.k());
+                    gr.ia[j] = ia as i32;
+                    gr.ib[j] = ia as i32 + 1;
+                    gr.sh[j] = (rel % 32) as i32;
+                    gr.shr[j] = 32 - (rel % 32) as i32;
+                    // stream byte q of the window sits at window byte 4 (q / 4) + 3 - q % 4 (LE words)
+                    let q0 = rel / 8;
+                    assert!(q0 + 2 < 16, "cpu_mul1: K = {} lane {g} position {j} leaves the 16-byte window", b.k());
+                    for (lb, q) in [(3, q0), (2, q0 + 1), (1, q0 + 2)] {
+                        gr.ctrl[4 * (j % 4) + 16 * (j / 4) + lb] = (4 * (q / 4) + 3 - q % 4) as u8;
+                    }
+                    gr.shv[j] = 16 - (rel % 8) as i32;
                 }
-                gr.shv[j] = 16 - (rel % 8) as i32;
             }
-        }
-        Tables { n32, lo, groups }
+            groups
+        };
+        let lanes = lane_table(b);
+        Tables { n32, lo, groups, lanes }
     }
 }
 
@@ -375,7 +451,9 @@ pub fn fwht128(v: &mut [f32]) {
     }
 }
 
-/// `xh = H (x * suh)` per 128-block, `x` `[T][k]`
+/// `xh = H (x * suh)` per 128-block, `x` `[T][k]` (the reference arms and tests;
+/// the production path transforms per block, `prep_block`)
+#[cfg(test)]
 fn had_in(x: &[f32], m: &Mul1Matrix) -> Vec<f32> {
     let mut xh = vec![0f32; x.len()];
     for (src, dst) in x.chunks_exact(m.k).zip(xh.chunks_exact_mut(m.k)) {
@@ -389,7 +467,9 @@ fn had_in(x: &[f32], m: &Mul1Matrix) -> Vec<f32> {
     xh
 }
 
-/// `y = (H y') / 128 * svh` per 128-block, `raw`, `y` `[T][n]`
+/// `y = (H y') / 128 * svh` per 128-block, `raw`, `y` `[T][n]` (the reference arms; the production
+/// path applies it per block, `had_out_block`)
+#[cfg(test)]
 fn had_out(raw: &[f32], m: &Mul1Matrix, y: &mut [f32]) {
     for (src, dst) in raw.chunks_exact(m.n).zip(y.chunks_exact_mut(m.n)) {
         dst.copy_from_slice(src);
@@ -403,6 +483,8 @@ fn had_out(raw: &[f32], m: &Mul1Matrix, y: &mut [f32]) {
 }
 
 /// `xh` `[T][k]` into the lane order: `xp[t][kb][q][j] = xh[t][16 kb + 2 q + ROW_OFF[j % 4]]`
+/// (the reference arms and tests; the production path transforms per block, `prep_block`)
+#[cfg(test)]
 fn permute(xh: &[f32], k: usize) -> Vec<f32> {
     let tk = k / 16;
     let mut xp = vec![0f32; xh.len() / k * tk * 32];
@@ -418,12 +500,6 @@ fn permute(xh: &[f32], k: usize) -> Vec<f32> {
     xp
 }
 
-/// columns `n * w / k .. n * (w + 1) / k` of worker `w`
-#[inline]
-fn split(n: usize, k: usize, w: usize) -> (usize, usize) {
-    (n * w / k, n * (w + 1) / k)
-}
-
 /// Raw output pointer shared by the workers; each worker writes disjoint indices only.
 #[derive(Clone, Copy)]
 struct Out(*mut f32, usize);
@@ -437,6 +513,14 @@ impl Out {
         assert!(i < self.1);
         // SAFETY: in bounds (asserted), index owned by exactly one worker
         unsafe { *self.0.add(i) = v };
+    }
+
+    /// read back an index whose writer finished before (block counter or barrier)
+    #[inline]
+    fn get(self, i: usize) -> f32 {
+        assert!(i < self.1);
+        // SAFETY: in bounds (asserted); the write happened before (the callers' contract)
+        unsafe { *self.0.add(i) }
     }
 }
 
@@ -499,6 +583,9 @@ mod avx2 {
         magic: __m256i,
         kinv: __m256,
         caff: __m256,
+        sh13: __m256i,
+        f1024: __m256i,
+        caff1024: __m256,
     }
 
     /// # Safety
@@ -514,6 +601,217 @@ mod avx2 {
             magic: _mm256_set1_epi32(0x06C0_0000),
             kinv: _mm256_set1_ps(KINV),
             caff: _mm256_set1_ps(CAFF),
+            sh13: _mm256_set1_epi16(1 << 13),
+            f1024: _mm256_set1_epi32(0x4480_0000),
+            caff1024: _mm256_set1_ps(CAFF - 1024.0 * KINV),
+        }
+    }
+
+    /// The 16-byte window of lane `ln`, in both 128-bit halves (no division, no scalar loads).
+    ///
+    /// # Safety
+    /// The CPU must have AVX2; `tile` points at `4 * n32` readable bytes of the lane's table.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn window(tile: *const u8, ln: &Lane) -> __m256i {
+        // SAFETY (all loads): `off + 16 <= 4 n32` and `16 <= 4 n32` (n32 >= 8, Tables::new)
+        let w = unsafe {
+            let hi = _mm_loadu_si128(tile.add(ln.off) as *const __m128i);
+            match ln.alignr {
+                0 => hi,
+                4 => _mm_alignr_epi8::<4>(_mm_loadu_si128(tile as *const __m128i), hi),
+                8 => _mm_alignr_epi8::<8>(_mm_loadu_si128(tile as *const __m128i), hi),
+                _ => _mm_alignr_epi8::<12>(_mm_loadu_si128(tile as *const __m128i), hi),
+            }
+        };
+        _mm256_broadcastsi128_si256(w)
+    }
+
+    /// The C1 lane decoder: the states of `decode8` from a division-free window, and the weight
+    /// through `weights_fast`. Same bits as `decode8` (tested for every lane of every bitrate and,
+    /// through `weights_fast`, every state).
+    ///
+    /// # Safety
+    /// The CPU must have AVX2 and FMA; `tile` points at `4 * n32` readable bytes.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn decode8_fast(tile: *const u8, ln: &Lane, k: &Consts) -> __m256 {
+        // SAFETY: the caller's contract; Lane is 32-byte aligned, ctrl and shv its first 64 bytes
+        unsafe {
+            let win = window(tile, ln);
+            let (ctrl, shv) = (_mm256_load_si256(ln.ctrl.as_ptr() as *const __m256i), _mm256_load_si256(ln.shv.as_ptr() as *const __m256i));
+            weights_fast(_mm256_and_si256(_mm256_srlv_epi32(_mm256_shuffle_epi8(win, ctrl), shv), k.m16), k)
+        }
+    }
+
+    /// `weights` with the same value from fewer and shorter steps: the byte sum times 2^13 straight
+    /// from `vpmaddwd` (pairs <= 510 times 8192), added to the bits of 1024.0 gives the f32 `1024 + s`
+    /// exactly (s < 1024 fills the mantissa below 2^10); `(1024 + s) k_inv + (-3.453125 - 1024 k_inv)`
+    /// in one FMA. Both products are exact in f32 ((1024 + s) * 1774 < 2^22, times 2^-18) and the sum
+    /// is a multiple of 2^-18 below 4 in magnitude, so the FMA, the separate mul + add and the
+    /// `s k_inv - 3.453125` of `weights` are one exact value; the fp16 rounding is unchanged.
+    ///
+    /// # Safety
+    /// The CPU must have AVX2 and FMA.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn weights_fast(st: __m256i, k: &Consts) -> __m256 {
+        let x = _mm256_mullo_epi32(st, k.mul);
+        let s13 = _mm256_madd_epi16(_mm256_maddubs_epi16(x, k.one8), k.sh13);
+        let f = _mm256_castsi256_ps(_mm256_add_epi32(s13, k.f1024));
+        let v = _mm256_fmadd_ps(f, k.kinv, k.caff1024);
+        let c = _mm256_castsi256_ps(_mm256_add_epi32(_mm256_and_si256(_mm256_castps_si256(v), k.expm), k.magic));
+        _mm256_sub_ps(_mm256_add_ps(v, c), c)
+    }
+
+    /// The C1 unit: `unit` operation for operation on the products and sums (separate
+    /// `vmulps` + `vaddps`, never fused), with `decode8_fast`, no bounds checks in the k loop
+    /// (asserted once per unit) and every line of the next-but-`PF_ROWS` tile row prefetched.
+    ///
+    /// # Safety
+    /// The CPU must have AVX2 and FMA.
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn unit_fast<const NT: usize>(m: &Mul1Matrix, tab: &Tables, xp: &[f32], t0: usize, nb0: usize, ntc: usize, raw: Out) {
+        let (tk, tn, tb) = (m.k / 16, m.n / 16, m.bitrate.tile_bytes());
+        assert!(ntc <= UNIT_TILES && nb0 + ntc <= tn && xp.len() >= (t0 + NT) * tk * 32);
+        assert!(m.trellis.len() >= tk * tn * tb && tb == 4 * tab.n32);
+        let k = unsafe { consts() };
+        let mut acc = [[[_mm256_setzero_ps(); NT]; 8]; UNIT_TILES];
+        let base = m.trellis.as_ptr();
+        let xb = xp.as_ptr();
+        let run = ntc * tb;
+        for kb in 0..tk {
+            if kb + PF_ROWS < tk {
+                let pf = ((kb + PF_ROWS) * tn + nb0) * tb;
+                // every 64-byte line of the run [pf, pf + run)
+                let mut o = 0;
+                while o < run + 63 {
+                    // SAFETY: pf + min(o, run - 1) lies inside the trellis (row kb + PF_ROWS exists)
+                    unsafe { _mm_prefetch::<_MM_HINT_T0>(base.add(pf + o.min(run - 1)) as *const i8) };
+                    o += 64;
+                }
+            }
+            // SAFETY: token t's lane-ordered row kb starts at ((t0 + t) tk + kb) 32 < xp.len() (asserted)
+            let xr = unsafe { xb.add((t0 * tk + kb) * 32) };
+            for (tc, acc_tc) in acc.iter_mut().enumerate().take(ntc) {
+                // SAFETY: (kb tn + nb0 + tc + 1) tb <= tk tn tb <= len (asserted)
+                let tile = unsafe { base.add((kb * tn + nb0 + tc) * tb) };
+                for (c, acc_c) in acc_tc.iter_mut().enumerate() {
+                    let mut a = *acc_c;
+                    for q in 0..4 {
+                        // SAFETY: AVX2 + FMA (caller), the tile has 4 n32 bytes, 4 c + q < 32
+                        let w = unsafe { decode8_fast(tile, tab.lanes.get_unchecked(4 * c + q), &k) };
+                        for (t, at) in a.iter_mut().enumerate() {
+                            // SAFETY: inside xp (asserted above)
+                            let xv = unsafe { _mm256_loadu_ps(xr.add(t * tk * 32 + q * 8)) };
+                            *at = _mm256_add_ps(*at, _mm256_mul_ps(w, xv));
+                        }
+                    }
+                    *acc_c = a;
+                }
+            }
+        }
+        for (tc, acc_tc) in acc.iter().enumerate().take(ntc) {
+            for (c, acc_c) in acc_tc.iter().enumerate() {
+                for (t, a) in acc_c.iter().enumerate() {
+                    let mut lanes = [0f32; 8];
+                    // SAFETY: 8 f32 into an 8-element array
+                    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), *a) };
+                    let (lo, hi) = fold(&lanes);
+                    let col = (nb0 + tc) * 16 + c;
+                    raw.put((t0 + t) * m.n + col, lo);
+                    raw.put((t0 + t) * m.n + col + 8, hi);
+                }
+            }
+        }
+    }
+
+    /// Lane `G` of a K = 3 tile (its window, control and shifts constants of [`K3_LANES`]):
+    /// decode, then `a[t] = a[t] + w * x[t]` for the NT tokens, as `unit_fast`'s inner step.
+    ///
+    /// # Safety
+    /// The CPU must have AVX2 and FMA; `tile` points at a K = 3 tile (96 bytes), `xr` at token
+    /// 0's 32 lane-ordered inputs of the tile row, token t's at `xr + t tk32`.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn group_k3<const G: usize, const NT: usize>(tile: *const u8, xr: *const f32, tk32: usize, a: &mut [__m256; NT], k: &Consts) {
+        // SAFETY: the caller's contract
+        unsafe {
+            let w = decode8_fast(tile, &K3_LANES[G], k);
+            for (t, at) in a.iter_mut().enumerate() {
+                let xv = _mm256_loadu_ps(xr.add(t * tk32 + (G % 4) * 8));
+                *at = _mm256_add_ps(*at, _mm256_mul_ps(w, xv));
+            }
+        }
+    }
+
+    /// `unit_fast` for K = 3 with the 32 lanes of a tile unrolled over compile-time lane
+    /// constants (sybil `ft_core.h:176-249`, `decode8<g>` / `tile_accum<C>`): the same operations
+    /// in the same order per accumulator, no per-lane table loads or branches.
+    ///
+    /// # Safety
+    /// The CPU must have AVX2 and FMA; `m` is a K = 3 matrix.
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn unit_k3<const NT: usize>(m: &Mul1Matrix, xp: &[f32], t0: usize, nb0: usize, ntc: usize, raw: Out) {
+        let (tk, tn, tb) = (m.k / 16, m.n / 16, m.bitrate.tile_bytes());
+        assert!(m.bitrate == K3 && tb == 96);
+        assert!(ntc <= UNIT_TILES && nb0 + ntc <= tn && xp.len() >= (t0 + NT) * tk * 32);
+        assert!(m.trellis.len() >= tk * tn * tb);
+        let k = unsafe { consts() };
+        let mut acc = [[[_mm256_setzero_ps(); NT]; 8]; UNIT_TILES];
+        let base = m.trellis.as_ptr();
+        let xb = xp.as_ptr();
+        let run = ntc * tb;
+        let tk32 = tk * 32;
+        macro_rules! lane4 {
+            ($tile:expr, $xr:expr, $acc:expr, $c:literal, $g0:literal, $g1:literal, $g2:literal, $g3:literal) => {{
+                let mut a = $acc[$c];
+                group_k3::<$g0, NT>($tile, $xr, tk32, &mut a, &k);
+                group_k3::<$g1, NT>($tile, $xr, tk32, &mut a, &k);
+                group_k3::<$g2, NT>($tile, $xr, tk32, &mut a, &k);
+                group_k3::<$g3, NT>($tile, $xr, tk32, &mut a, &k);
+                $acc[$c] = a;
+            }};
+        }
+        for kb in 0..tk {
+            if kb + PF_ROWS < tk {
+                let pf = ((kb + PF_ROWS) * tn + nb0) * tb;
+                let mut o = 0;
+                while o < run + 63 {
+                    // SAFETY: pf + min(o, run - 1) lies inside the trellis (row kb + PF_ROWS exists)
+                    unsafe { _mm_prefetch::<_MM_HINT_T0>(base.add(pf + o.min(run - 1)) as *const i8) };
+                    o += 64;
+                }
+            }
+            // SAFETY: inside xp (asserted)
+            let xr = unsafe { xb.add((t0 * tk + kb) * 32) };
+            for (tc, acc_tc) in acc.iter_mut().enumerate().take(ntc) {
+                // SAFETY: (kb tn + nb0 + tc + 1) tb <= len (asserted); AVX2 + FMA (caller)
+                unsafe {
+                    let tile = base.add((kb * tn + nb0 + tc) * tb);
+                    lane4!(tile, xr, acc_tc, 0, 0, 1, 2, 3);
+                    lane4!(tile, xr, acc_tc, 1, 4, 5, 6, 7);
+                    lane4!(tile, xr, acc_tc, 2, 8, 9, 10, 11);
+                    lane4!(tile, xr, acc_tc, 3, 12, 13, 14, 15);
+                    lane4!(tile, xr, acc_tc, 4, 16, 17, 18, 19);
+                    lane4!(tile, xr, acc_tc, 5, 20, 21, 22, 23);
+                    lane4!(tile, xr, acc_tc, 6, 24, 25, 26, 27);
+                    lane4!(tile, xr, acc_tc, 7, 28, 29, 30, 31);
+                }
+            }
+        }
+        for (tc, acc_tc) in acc.iter().enumerate().take(ntc) {
+            for (c, acc_c) in acc_tc.iter().enumerate() {
+                for (t, a) in acc_c.iter().enumerate() {
+                    let mut lanes = [0f32; 8];
+                    // SAFETY: 8 f32 into an 8-element array
+                    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), *a) };
+                    let (lo, hi) = fold(&lanes);
+                    let col = (nb0 + tc) * 16 + c;
+                    raw.put((t0 + t) * m.n + col, lo);
+                    raw.put((t0 + t) * m.n + col + 8, hi);
+                }
+            }
         }
     }
 
@@ -542,7 +840,7 @@ mod avx2 {
     /// the codec weight of eight 16-bit states, one per 32-bit lane
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn weights(st: __m256i, k: &Consts) -> __m256 {
+    pub(super) unsafe fn weights(st: __m256i, k: &Consts) -> __m256 {
         let x = _mm256_mullo_epi32(st, k.mul);
         // byte sum: u8 x 1 into i16 pairs (<= 510), then i16 x 1 into i32
         let s = _mm256_madd_epi16(_mm256_maddubs_epi16(x, k.one8), k.one16);
@@ -656,62 +954,105 @@ mod avx2 {
     }
 }
 
-/// How the work is done: `NEW` (the shuffle decoder, units handed out by an atomic counter); under
-/// test also `V1`, the first #180 kernel (two-word decoder, units split statically by worker), the
-/// reference arm of the bit-identity test and the benchmark (#183). Both give the same bits:
-/// the same states and the same f32 operations per output column, and a unit is computed by
-/// exactly one worker whichever it is.
+/// Which kernel runs: `NEW`, the production path (#183 C1 follow-up): `avx2::unit_fast` units
+/// handed out by an atomic counter on the persistent [`pool`], each 128-column block finished
+/// (Hadamard out, activation, down's input transform) by the worker that completes its last unit.
+/// Under test also the two earlier kernels, the reference arms of the bit-identity tests and the
+/// benchmark, kept as they were in [`reference`]: `V2` (#183: `decode8` with the wrap taken
+/// modulo, units from a counter, scoped threads per call, `std::sync::Barrier`, the activation
+/// on worker 0) and `V1` (#180: the two-word decoder, units split statically by worker). All
+/// give the same bits: the same states and f32 operations per output column, and a unit or a
+/// block is computed by exactly one worker whichever it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Impl {
-    v1: bool,
+    arm: u8,
 }
 
 impl Impl {
-    pub(crate) const NEW: Impl = Impl { v1: false };
+    pub(crate) const NEW: Impl = Impl { arm: 0 };
     #[cfg(test)]
-    pub(crate) const V1: Impl = Impl { v1: true };
-}
+    pub(crate) const V1: Impl = Impl { arm: 1 };
+    #[cfg(test)]
+    pub(crate) const V2: Impl = Impl { arm: 2 };
+    /// the production path with `Kern::Avx2`, as on an AVX2 CPU without FMA (test only)
+    #[cfg(test)]
+    pub(crate) const NEW_NO_FMA: Impl = Impl { arm: 3 };
 
-/// Worker `w` of `k` runs `f(u)` on its units of `0 .. units`: taken one at a time from `next`
-/// (a P-core takes more units than an E-core), or under `V1` the static block of `split`.
-fn for_units(im: Impl, next: &AtomicUsize, units: usize, k: usize, w: usize, mut f: impl FnMut(usize)) {
-    if im.v1 {
-        let (u0, u1) = split(units, k, w);
-        (u0..u1).for_each(f);
-        return;
+    /// the reference arms run their own code (test only)
+    #[cfg(test)]
+    fn reference(self) -> bool {
+        self.arm == 1 || self.arm == 2
     }
-    loop {
-        let u = next.fetch_add(1, Ordering::Relaxed);
-        if u >= units {
-            break;
+
+    /// the inner kernel this arm uses on `path`
+    fn kern(self, path: Path) -> Kern {
+        match kern(path) {
+            Kern::Fast if self.arm == 3 => Kern::Avx2,
+            k => k,
         }
-        f(u);
     }
 }
 
-/// One work unit (tile columns `UNIT_TILES u ..`) for every token of `xp`.
-fn unit_into(avx2: bool, im: Impl, m: &Mul1Matrix, tab: &Tables, xp: &[f32], tokens: usize, u: usize, raw: Out) {
-    let tn = m.n / 16;
-    let nb0 = u * UNIT_TILES;
-    let ntc = UNIT_TILES.min(tn - nb0);
+/// the inner kernel of the production path
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kern {
+    Scalar,
+    /// `avx2::unit` with `decode8`, the #183 unit: an AVX2 CPU without FMA
+    Avx2,
+    /// `avx2::unit_k3` / `avx2::unit_fast` (AVX2 + FMA)
+    Fast,
+}
+
+/// `Kern::Fast` needs FMA beside AVX2 (every Intel CPU since Haswell and AMD since Zen has
+/// both); an AVX2 CPU without FMA keeps the #183 AVX2 unit. All three give the same bits.
+fn kern(path: Path) -> Kern {
+    if !use_avx2(path) {
+        return Kern::Scalar;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("fma") {
+        return Kern::Fast;
+    }
+    Kern::Avx2
+}
+
+/// One chunk (tile columns `nb0 .. nb0 + ntc`, `ntc <= UNIT_TILES`) for every token of `xp`.
+fn unit_new(kern: Kern, m: &Mul1Matrix, tab: &Tables, xp: &[f32], tokens: usize, nb0: usize, ntc: usize, raw: Out) {
     let mut t0 = 0;
     while t0 < tokens {
         let nt = (tokens - t0).min(TOK_TILE);
         #[cfg(target_arch = "x86_64")]
-        if avx2 {
-            // SAFETY: `avx2` is true only after `use_avx2` saw the feature on this CPU
+        if kern == Kern::Fast && m.bitrate == K3 {
+            // SAFETY: `Kern::Fast` is chosen only after AVX2 and FMA were detected on this CPU
             unsafe {
-                #[cfg(test)]
-                if im.v1 {
-                    match nt {
-                        1 => avx2::unit::<1, true>(m, tab, xp, t0, nb0, ntc, raw),
-                        2 => avx2::unit::<2, true>(m, tab, xp, t0, nb0, ntc, raw),
-                        3 => avx2::unit::<3, true>(m, tab, xp, t0, nb0, ntc, raw),
-                        _ => avx2::unit::<4, true>(m, tab, xp, t0, nb0, ntc, raw),
-                    }
-                    t0 += nt;
-                    continue;
+                match nt {
+                    1 => avx2::unit_k3::<1>(m, xp, t0, nb0, ntc, raw),
+                    2 => avx2::unit_k3::<2>(m, xp, t0, nb0, ntc, raw),
+                    3 => avx2::unit_k3::<3>(m, xp, t0, nb0, ntc, raw),
+                    _ => avx2::unit_k3::<4>(m, xp, t0, nb0, ntc, raw),
                 }
+            }
+            t0 += nt;
+            continue;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if kern == Kern::Fast {
+            // SAFETY: `Kern::Fast` is chosen only after AVX2 and FMA were detected on this CPU
+            unsafe {
+                match nt {
+                    1 => avx2::unit_fast::<1>(m, tab, xp, t0, nb0, ntc, raw),
+                    2 => avx2::unit_fast::<2>(m, tab, xp, t0, nb0, ntc, raw),
+                    3 => avx2::unit_fast::<3>(m, tab, xp, t0, nb0, ntc, raw),
+                    _ => avx2::unit_fast::<4>(m, tab, xp, t0, nb0, ntc, raw),
+                }
+            }
+            t0 += nt;
+            continue;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if kern == Kern::Avx2 {
+            // SAFETY: `Kern::Avx2` is chosen only after AVX2 was detected on this CPU
+            unsafe {
                 match nt {
                     1 => avx2::unit::<1, false>(m, tab, xp, t0, nb0, ntc, raw),
                     2 => avx2::unit::<2, false>(m, tab, xp, t0, nb0, ntc, raw),
@@ -722,7 +1063,7 @@ fn unit_into(avx2: bool, im: Impl, m: &Mul1Matrix, tab: &Tables, xp: &[f32], tok
             t0 += nt;
             continue;
         }
-        let _ = (avx2, im);
+        let _ = kern;
         match nt {
             1 => unit_scalar::<1>(m, tab, xp, t0, nb0, ntc, raw),
             2 => unit_scalar::<2>(m, tab, xp, t0, nb0, ntc, raw),
@@ -743,17 +1084,201 @@ fn units_of(m: &Mul1Matrix) -> usize {
     (m.n / 16).div_ceil(UNIT_TILES)
 }
 
-/// run `work(w)` on `k` workers, the caller's thread among them
-fn scoped(k: usize, work: &(dyn Fn(usize) + Sync)) {
-    if k == 1 {
-        work(0);
-    } else {
-        std::thread::scope(|s| {
-            for w in 1..k {
-                s.spawn(move || work(w));
+/// tile columns per 128-column block
+const BLOCK_TILES: usize = HAD / 16;
+
+/// Guided chunk sizes (#183 C1): over `tiles` tile columns taken in order by `k` workers,
+/// chunks of `UNIT_TILES` while more than `2 k` of them remain, then of 2, then of 1, so the last
+/// chunk a slow core (an E-core takes ~2.2 x a P-core's time per unit, measured) starts is one
+/// tile column. A chunk starts at a multiple of its size and every size divides `BLOCK_TILES`, so
+/// no chunk crosses a block. A column's sums do not depend on the chunk it is in.
+fn chunks(tiles: usize, k: usize) -> Vec<(usize, usize)> {
+    let mut v = Vec::with_capacity(tiles);
+    let mut t = 0;
+    while t < tiles {
+        let rem = tiles - t;
+        let sz = if k == 1 || rem > 2 * k * UNIT_TILES {
+            UNIT_TILES
+        } else if rem > 2 * k * 2 {
+            2
+        } else {
+            1
+        };
+        let sz = sz.min(rem);
+        debug_assert!(t % sz == 0 && BLOCK_TILES % sz == 0);
+        v.push((t, sz));
+        t += sz;
+    }
+    v
+}
+
+/// the next chunk from the shared counter (a P-core takes more than an E-core)
+#[inline]
+fn take(next: &AtomicUsize, plan: &[(usize, usize)]) -> Option<(usize, usize)> {
+    plan.get(next.fetch_add(1, Ordering::Relaxed)).copied()
+}
+
+/// Tile columns left per 128-column block; the worker whose chunk completes a block finishes it.
+struct Blocks(Vec<AtomicUsize>);
+
+impl Blocks {
+    fn new(blocks: usize, tiles_each: usize) -> Blocks {
+        Blocks((0..blocks).map(|_| AtomicUsize::new(tiles_each)).collect())
+    }
+
+    /// true for exactly one caller per block: the one that hands in its last `ntc` tiles.
+    /// AcqRel: the finisher sees every write of the block's chunks (release sequence).
+    fn complete(&self, b: usize, ntc: usize) -> bool {
+        self.0[b].fetch_sub(ntc, Ordering::AcqRel) == ntc
+    }
+}
+
+/// `had_out` of output block `b` (columns `128 b ..`) for every token: the same operations per
+/// element as `had_out`, written to `y`.
+fn had_out_block(raw: Out, m: &Mul1Matrix, b: usize, tokens: usize, y: Out) {
+    let mut v = [0f32; HAD];
+    for t in 0..tokens {
+        let at = t * m.n + b * HAD;
+        for (i, d) in v.iter_mut().enumerate() {
+            *d = raw.get(at + i);
+        }
+        fwht128(&mut v);
+        for (i, d) in v.iter().enumerate() {
+            y.put(at + i, (*d * (1.0 / 128.0)) * Mul1Matrix::scale(m.svh, b * HAD + i));
+        }
+    }
+}
+
+/// The lane permutation of one 128-block `h` (block `b` of a `[T][k]` input, token `t`) into
+/// `xp`: `permute`'s `xp[t][kb][q][j] = h[16 kb' + 2 q + ROW_OFF[j % 4]]` for its 8 tile rows.
+#[inline]
+fn permute_block(h: &[f32; HAD], k: usize, b: usize, t: usize, xp: Out) {
+    let tk = k / 16;
+    for kl in 0..BLOCK_TILES {
+        for q in 0..4 {
+            for j in 0..8 {
+                xp.put((t * tk + b * BLOCK_TILES + kl) * 32 + q * 8 + j, h[16 * kl + 2 * q + ROW_OFF[j % 4]]);
             }
-            work(0);
-        });
+        }
+    }
+}
+
+/// `had_in` + `permute` of input block `b` (rows `128 b ..` of `m`) for every token: the same
+/// operations per element (`x * suh`, the FWHT of the block, the lane order), written to `xp`.
+fn prep_block(x: &[f32], m: &Mul1Matrix, b: usize, tokens: usize, xp: Out) {
+    let mut v = [0f32; HAD];
+    for t in 0..tokens {
+        for (r, d) in v.iter_mut().enumerate() {
+            *d = x[t * m.k + b * HAD + r] * Mul1Matrix::scale(m.suh, b * HAD + r);
+        }
+        fwht128(&mut v);
+        permute_block(&v, m.k, b, t, xp);
+    }
+}
+
+/// FFN block `b` of the intermediate dimension, for every token: `had_out` of gate and up,
+/// `silu_mul`, `had_in` of down and the lane permutation into `xd`, element for element the
+/// operations of the whole-vector functions (each is local to its 128-block).
+fn act_block(e: &Mul1Expert, b: usize, tokens: usize, rg: Out, ru: Out, xd: Out) {
+    let i = e.inter;
+    let (mut g, mut u) = ([0f32; HAD], [0f32; HAD]);
+    for t in 0..tokens {
+        let at = t * i + b * HAD;
+        for (m, raw, v) in [(&e.gate, rg, &mut g), (&e.up, ru, &mut u)] {
+            for (r, d) in v.iter_mut().enumerate() {
+                *d = raw.get(at + r);
+            }
+            fwht128(v);
+            for (r, d) in v.iter_mut().enumerate() {
+                *d = (*d * (1.0 / 128.0)) * Mul1Matrix::scale(m.svh, b * HAD + r);
+            }
+        }
+        let mut h = [0f32; HAD];
+        for (r, d) in h.iter_mut().enumerate() {
+            *d = silu_mul(g[r], u[r]) * Mul1Matrix::scale(e.down.suh, b * HAD + r);
+        }
+        fwht128(&mut h);
+        permute_block(&h, i, b, t, xd);
+    }
+}
+
+/// Per-call buffers from a per-thread scratch vector, reused across calls (a fresh zeroed
+/// allocation of the FFN's 112 KB at T 1 cost ~20 us per call, measured). Every region is
+/// written before it is read in a call, so stale values never reach an output. A call while the
+/// scratch is in use (nested), or one needing more than `SCRATCH_KEEP` floats, allocates instead.
+#[cfg(test)]
+thread_local! {
+    static POISON_SCRATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+fn with_scratch<R>(len: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
+    const SCRATCH_KEEP: usize = 1 << 20;
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if len > SCRATCH_KEEP {
+        return f(&mut vec![0f32; len]);
+    }
+    SCRATCH.with(|s| match s.try_borrow_mut() {
+        Ok(mut v) => {
+            if v.len() < len {
+                v.resize(len, 0.0);
+            }
+            // under test every call starts from NaN, so a region a call fails to write cannot
+            // pass on the previous call's values (the benchmark switches this off)
+            #[cfg(test)]
+            if POISON_SCRATCH.with(|p| p.get()) {
+                v[..len].fill(f32::NAN);
+            }
+            f(&mut v[..len])
+        }
+        Err(_) => f(&mut vec![0f32; len]),
+    })
+}
+
+/// One phase of a pool run: items `0 .. total` handed out by `next`, each counted in `done`
+/// after it is complete. A later phase waits for the work (`wait`), never for the workers, so a
+/// worker that starts late, or is descheduled between items, holds nobody up.
+struct Phase {
+    next: AtomicUsize,
+    done: AtomicUsize,
+    total: usize,
+}
+
+impl Phase {
+    fn new(total: usize) -> Phase {
+        Phase { next: AtomicUsize::new(0), done: AtomicUsize::new(0), total }
+    }
+
+    /// run `f` on items until none is left
+    fn work(&self, mut f: impl FnMut(usize)) {
+        loop {
+            let j = self.next.fetch_add(1, Ordering::Relaxed);
+            if j >= self.total {
+                return;
+            }
+            f(j);
+            self.done.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// wait until every item is complete
+    fn wait(&self) {
+        wait_for(&self.done, self.total);
+    }
+}
+
+/// Spin (then yield) until `done` reaches `total`. Acquire: each counted piece of work happened
+/// before its release increment, and the load that sees `total` synchronizes with all of them.
+fn wait_for(done: &AtomicUsize, total: usize) {
+    let mut spins = 0u32;
+    while done.load(Ordering::Acquire) < total {
+        if spins < pool::SPINS {
+            spins += 1;
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
     }
 }
 
@@ -763,77 +1288,480 @@ pub fn gemv(m: &Mul1Matrix, x: &[f32], y: &mut [f32], threads: usize, path: Path
 }
 
 pub(crate) fn gemv_with(im: Impl, m: &Mul1Matrix, x: &[f32], y: &mut [f32], threads: usize, path: Path) {
+    #[cfg(test)]
+    if im.reference() {
+        return reference::gemv(im, m, x, y, threads, path);
+    }
     assert!(x.len() % m.k == 0, "cpu_mul1::gemv: x is not [T][{}]", m.k);
     let tokens = x.len() / m.k;
     assert_eq!(y.len(), tokens * m.n, "cpu_mul1::gemv: y is not [T][{}]", m.n);
-    let avx2 = use_avx2(path);
-    let tab = Tables::new(m.bitrate);
-    let xp = permute(&had_in(x, m), m.k);
-    let mut raw = vec![0f32; y.len()];
-    let out = Out(raw.as_mut_ptr(), raw.len());
-    let units = units_of(m);
-    let k = threads.clamp(1, units);
-    let next = AtomicUsize::new(0);
-    scoped(k, &|w| for_units(im, &next, units, k, w, |u| unit_into(avx2, im, m, &tab, &xp, tokens, u, out)));
-    had_out(&raw, m, y);
+    let (kern, tab) = (im.kern(path), tables(m.bitrate));
+    let nxp = tokens * (m.k / 16) * 32;
+    with_scratch(nxp + y.len(), |s| {
+        let (xp, raw) = s.split_at_mut(nxp);
+        let (oxp, out, yo) = (Out(xp.as_mut_ptr(), xp.len()), Out(raw.as_mut_ptr(), raw.len()), Out(y.as_mut_ptr(), y.len()));
+        let k = threads.clamp(1, units_of(m));
+        let plan = chunks(m.n / 16, k);
+        let blocks = Blocks::new(m.n / HAD, BLOCK_TILES);
+        let (prep, cols) = (Phase::new(m.k / HAD), AtomicUsize::new(0));
+        pool::run(k, &|_| {
+            // the input transform, one 128-block of x at a time, then the columns
+            prep.work(|b| prep_block(x, m, b, tokens, oxp));
+            prep.wait();
+            // SAFETY: every write to xp is complete (`prep.wait`); read only from here on
+            let xp = unsafe { std::slice::from_raw_parts(oxp.0 as *const f32, oxp.1) };
+            while let Some((nb0, ntc)) = take(&cols, &plan) {
+                unit_new(kern, m, tab, xp, tokens, nb0, ntc, out);
+                let b = nb0 / BLOCK_TILES;
+                if blocks.complete(b, ntc) {
+                    had_out_block(out, m, b, tokens, yo);
+                }
+            }
+        });
+    });
 }
 
 /// The expert FFN `y = down(silu(gate(x)) * up(x))` for `x`, `y` `[T][hidden]`, with
-/// `silu(g) * u = g / (1 + exp(-g)) * u` (`cpu_nvfp4`, `silu_mul640`). One scope: phase 1 splits
-/// the gate and up units over the workers, a barrier, worker 0 finishes gate and up, applies the
-/// activation and prepares down's input, a barrier, phase 2 splits the down units; the caller
-/// finishes down. Bit for bit `gemv(down, silu(gemv(gate, x)) * gemv(up, x))`.
+/// `silu(g) * u = g / (1 + exp(-g)) * u` (`cpu_nvfp4`, `silu_mul640`). One pool run in three
+/// phases: the input transforms of gate and up per 128-block of x; the gate and up tile columns
+/// block by block in guided chunks, the worker that completes a block applying `had_out`, the
+/// activation and down's input transform to it; the down tile columns, the worker that completes
+/// a block of `y` applying `had_out`. Bit for bit `gemv(down, silu(gemv(gate, x)) * gemv(up, x))`.
 pub fn expert_ffn(e: &Mul1Expert, x: &[f32], y: &mut [f32], threads: usize, path: Path) {
     expert_ffn_with(Impl::NEW, e, x, y, threads, path)
 }
 
 pub(crate) fn expert_ffn_with(im: Impl, e: &Mul1Expert, x: &[f32], y: &mut [f32], threads: usize, path: Path) {
+    #[cfg(test)]
+    if im.reference() {
+        return reference::expert_ffn(im, e, x, y, threads, path);
+    }
     let (h, i) = (e.hidden, e.inter);
     assert!(x.len() % h == 0, "cpu_mul1::expert_ffn: x is not [T][{h}]");
     let tokens = x.len() / h;
     assert_eq!(y.len(), tokens * h, "cpu_mul1::expert_ffn: y is not [T][{h}]");
-    let avx2 = use_avx2(path);
-    let tab = Tables::new(e.gate.bitrate);
-    let tab_d = Tables::new(e.down.bitrate);
-    let (xp_g, xp_u) = (permute(&had_in(x, &e.gate), h), permute(&had_in(x, &e.up), h));
-    let mut raw_g = vec![0f32; tokens * i];
-    let mut raw_u = vec![0f32; tokens * i];
-    let mut xp_d = vec![0f32; tokens * (i / 16) * 32];
-    let mut raw_d = vec![0f32; tokens * h];
-    let (og, ou, od) = (Out(raw_g.as_mut_ptr(), raw_g.len()), Out(raw_u.as_mut_ptr(), raw_u.len()), Out(raw_d.as_mut_ptr(), raw_d.len()));
-    let oxd = Out(xp_d.as_mut_ptr(), xp_d.len());
-    let (ug, ud) = (units_of(&e.gate), units_of(&e.down));
-    let k = threads.clamp(1, (2 * ug).min(ud));
-    let barrier = Barrier::new(k);
-    let (next1, next2) = (AtomicUsize::new(0), AtomicUsize::new(0));
-    scoped(k, &|w| {
-        for_units(im, &next1, 2 * ug, k, w, |u| {
-            if u < ug {
-                unit_into(avx2, im, &e.gate, &tab, &xp_g, tokens, u, og);
-            } else {
-                unit_into(avx2, im, &e.up, &tab, &xp_u, tokens, u - ug, ou);
+    let (kern, tab, tab_d) = (im.kern(path), tables(e.gate.bitrate), tables(e.down.bitrate));
+    // scratch: xp_g, xp_u [T][h/16][32], raw_g, raw_u [T][i], xp_d [T][i/16][32], raw_d [T][h]
+    let (nxh, nxi) = (tokens * (h / 16) * 32, tokens * (i / 16) * 32);
+    with_scratch(2 * nxh + 2 * tokens * i + nxi + tokens * h, |s| {
+        let o = |v: &mut [f32]| Out(v.as_mut_ptr(), v.len());
+        let (xp_g, s) = s.split_at_mut(nxh);
+        let (xp_u, s) = s.split_at_mut(nxh);
+        let (raw_g, s) = s.split_at_mut(tokens * i);
+        let (raw_u, s) = s.split_at_mut(tokens * i);
+        let (xp_d, raw_d) = s.split_at_mut(nxi);
+        let (oxg, oxu, og, ou, oxd, od, yo) = (o(xp_g), o(xp_u), o(raw_g), o(raw_u), o(xp_d), o(raw_d), o(y));
+        let (ug, ud) = (units_of(&e.gate), units_of(&e.down));
+        let k = threads.clamp(1, (2 * ug).min(ud));
+        // the gate/up phase in block order: block b's 8 gate tiles, then its 8 up tiles
+        let (plan1, plan2) = (chunks(2 * (i / 16), k), chunks(h / 16, k));
+        let (blk1, blk2) = (Blocks::new(i / HAD, 2 * BLOCK_TILES), Blocks::new(h / HAD, BLOCK_TILES));
+        let (prep, acts) = (Phase::new(2 * (h / HAD)), AtomicUsize::new(0));
+        let (cols1, cols2) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        pool::run(k, &|_| {
+            prep.work(|j| {
+                if j < h / HAD {
+                    prep_block(x, &e.gate, j, tokens, oxg);
+                } else {
+                    prep_block(x, &e.up, j - h / HAD, tokens, oxu);
+                }
+            });
+            prep.wait();
+            // SAFETY: every write to xp_g / xp_u is complete (`prep.wait`); read only from here on
+            let (xg, xu) = unsafe { (std::slice::from_raw_parts(oxg.0 as *const f32, oxg.1), std::slice::from_raw_parts(oxu.0 as *const f32, oxu.1)) };
+            while let Some((p0, ntc)) = take(&cols1, &plan1) {
+                let (b, r) = (p0 / (2 * BLOCK_TILES), p0 % (2 * BLOCK_TILES));
+                if r < BLOCK_TILES {
+                    unit_new(kern, &e.gate, tab, xg, tokens, b * BLOCK_TILES + r, ntc, og);
+                } else {
+                    unit_new(kern, &e.up, tab, xu, tokens, b * BLOCK_TILES + r - BLOCK_TILES, ntc, ou);
+                }
+                if blk1.complete(b, ntc) {
+                    act_block(e, b, tokens, og, ou, oxd);
+                    acts.fetch_add(1, Ordering::Release);
+                }
+            }
+            // down needs every block of its input: wait for the work, not for the workers
+            wait_for(&acts, i / HAD);
+            // SAFETY: every block of xp_d is complete (acquire above); read only from here on
+            let xd = unsafe { std::slice::from_raw_parts(oxd.0 as *const f32, oxd.1) };
+            while let Some((nb0, ntc)) = take(&cols2, &plan2) {
+                unit_new(kern, &e.down, tab_d, xd, tokens, nb0, ntc, od);
+                let b = nb0 / BLOCK_TILES;
+                if blk2.complete(b, ntc) {
+                    had_out_block(od, &e.down, b, tokens, yo);
+                }
             }
         });
-        barrier.wait();
-        if w == 0 {
-            // SAFETY: every write to raw_g / raw_u happened before the barrier; read only here
-            let (rg, ru) = unsafe { (std::slice::from_raw_parts(og.0 as *const f32, og.1), std::slice::from_raw_parts(ou.0 as *const f32, ou.1)) };
-            let (mut g, mut u) = (vec![0f32; og.1], vec![0f32; ou.1]);
-            had_out(rg, &e.gate, &mut g);
-            had_out(ru, &e.up, &mut u);
-            let act: Vec<f32> = g.iter().zip(&u).map(|(&g, &u)| silu_mul(g, u)).collect();
-            let xp = permute(&had_in(&act, &e.down), i);
-            for (n, v) in xp.into_iter().enumerate() {
-                oxd.put(n, v);
+    });
+}
+
+/// The persistent worker pool of the CPU lane (#183 C1 follow-up). Starting and joining 8 scoped
+/// threads cost 171 us per call on the 285K (#183, empty work); here `run(n, job)` publishes the
+/// job to up to `n - 1` parked or spinning workers and runs `job(0)` on the caller. A worker
+/// spins on one dispatch word for [`SPINS`] pause iterations after its last job, then parks; a
+/// dispatch wakes the parked participants. When `job(0)` returns the dispatch is closed: a worker
+/// that had not started by then skips it, and `run` waits only for the workers that entered, so
+/// one descheduled thread does not stall the call. Jobs must therefore take their work from
+/// shared counters and wait only for work to complete, never for a number of workers.
+/// Written after exllamav3 `moe_mul1.cpp:2050-2170` (`Pool`: generation and participant count in
+/// one word, master = worker 0, a surplus worker neither runs nor acks; turboderp-org/exllamav3 @
+/// `151539c7`, MIT) and sybil `ft_core.h:411-455` (spin, then sleep). No pinning: the OS places the
+/// threads and the shared counters balance P- and E-cores. One run at a time: a call while the
+/// pool is busy (another thread, or a nested call) runs on scoped threads instead.
+mod pool {
+    use std::cell::UnsafeCell;
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::thread::Thread;
+
+    pub(super) type Job<'a> = dyn Fn(usize) + Sync + 'a;
+
+    /// pause iterations an idle worker (or a waiter) spins before it parks (or yields)
+    pub(super) const SPINS: u32 = 1 << 16;
+    const NW_BITS: u32 = 16;
+    /// `gate`: generation in the high 32 bits, bit 31 closed, entered workers below
+    const CLOSED: u64 = 1 << 31;
+
+    struct Shared {
+        /// `generation << NW_BITS | participants`, one word, so a worker never pairs one
+        /// dispatch's generation with another's participant count
+        dispatch: AtomicU64,
+        /// `generation << 32 | CLOSED? | entered`: a worker enters only an open gate of the
+        /// generation it saw (CAS), so it is either waited for or never touches the job
+        gate: AtomicU64,
+        job: UnsafeCell<Option<*const Job<'static>>>,
+        done: AtomicUsize,
+        panicked: AtomicBool,
+    }
+
+    // SAFETY: `job` is written only by the dispatcher, which holds `Pool::inner`, after every
+    // worker that entered the previous dispatch acked and before the release store of `dispatch`;
+    // a worker reads it only after entering the open gate of that generation, and before it acks.
+    unsafe impl Sync for Shared {}
+    unsafe impl Send for Shared {}
+
+    struct Worker {
+        thread: Thread,
+        sleeping: &'static AtomicBool,
+    }
+
+    struct Inner {
+        workers: Vec<Worker>,
+        generation: u64,
+    }
+
+    struct Pool {
+        shared: &'static Shared,
+        inner: Mutex<Inner>,
+    }
+
+    fn pool() -> &'static Pool {
+        static POOL: OnceLock<Pool> = OnceLock::new();
+        POOL.get_or_init(|| Pool {
+            shared: Box::leak(Box::new(Shared {
+                dispatch: AtomicU64::new(0),
+                gate: AtomicU64::new(0),
+                job: UnsafeCell::new(None),
+                done: AtomicUsize::new(0),
+                panicked: AtomicBool::new(false),
+            })),
+            inner: Mutex::new(Inner { workers: Vec::new(), generation: 0 }),
+        })
+    }
+
+    /// enter the open gate of `generation`; false if it is closed or another generation's
+    fn enter(sh: &Shared, generation: u64) -> bool {
+        let mut v = sh.gate.load(Ordering::Acquire);
+        loop {
+            if v >> 32 != generation & 0xffff_ffff || v & CLOSED != 0 {
+                return false;
+            }
+            match sh.gate.compare_exchange_weak(v, v + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(now) => v = now,
             }
         }
-        barrier.wait();
-        // SAFETY: worker 0 wrote xp_d before the second barrier; read only from here on
-        let xd = unsafe { std::slice::from_raw_parts(oxd.0 as *const f32, oxd.1) };
-        for_units(im, &next2, ud, k, w, |u| unit_into(avx2, im, &e.down, &tab_d, xd, tokens, u, od));
-    });
-    drop((raw_g, raw_u, xp_d));
-    had_out(&raw_d, &e.down, y);
+    }
+
+    fn worker_loop(sh: &'static Shared, sleeping: &'static AtomicBool, idx: usize, mut seen: u64) {
+        let mut spins = 0u32;
+        loop {
+            let d = sh.dispatch.load(Ordering::Acquire);
+            if d >> NW_BITS == seen {
+                if spins < SPINS {
+                    spins += 1;
+                    std::hint::spin_loop();
+                    continue;
+                }
+                // SeqCst pairs with the dispatcher's store of `dispatch` and load of `sleeping`:
+                // either this load sees the new generation or the dispatcher sees `sleeping` and
+                // unparks (an unpark before the park is kept as the thread's token)
+                sleeping.store(true, Ordering::SeqCst);
+                if sh.dispatch.load(Ordering::SeqCst) >> NW_BITS == seen {
+                    std::thread::park();
+                }
+                sleeping.store(false, Ordering::SeqCst);
+                continue;
+            }
+            spins = 0;
+            seen = d >> NW_BITS;
+            let nw = (d & ((1 << NW_BITS) - 1)) as usize;
+            if idx < nw && enter(sh, seen) {
+                // SAFETY: published before the dispatch this worker entered (struct comment); the
+                // dispatcher keeps the job alive until this worker acks below
+                let job = unsafe { (*sh.job.get()).expect("cpu_mul1 pool: dispatch without a job") };
+                // SAFETY: as above
+                if catch_unwind(AssertUnwindSafe(|| unsafe { (*job)(idx) })).is_err() {
+                    sh.panicked.store(true, Ordering::Relaxed);
+                }
+                sh.done.fetch_add(1, Ordering::Release);
+            }
+        }
+    }
+
+    /// scoped threads per call (the pool is busy)
+    fn scoped(n: usize, job: &Job<'_>) {
+        std::thread::scope(|s| {
+            for w in 1..n {
+                s.spawn(move || job(w));
+            }
+            job(0);
+        });
+    }
+
+    /// Run `job(0)` on the caller and `job(w)` on each worker w in 1..n that starts before
+    /// `job(0)` returns; return when all of those are done. A panic in any of them is raised
+    /// here after all of them finished.
+    pub(super) fn run(n: usize, job: &Job<'_>) {
+        if n <= 1 {
+            job(0);
+            return;
+        }
+        assert!(n < 1 << NW_BITS, "cpu_mul1 pool: {n} workers");
+        let p = pool();
+        let Ok(mut inner) = p.inner.try_lock() else {
+            return scoped(n, job);
+        };
+        let sh = p.shared;
+        while inner.workers.len() < n - 1 {
+            let idx = inner.workers.len() + 1;
+            let sleeping: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+            let seen = inner.generation;
+            let h = std::thread::Builder::new()
+                .name(format!("cpu_mul1-{idx}"))
+                .spawn(move || worker_loop(sh, sleeping, idx, seen))
+                .expect("cpu_mul1 pool: cannot start a worker thread");
+            inner.workers.push(Worker { thread: h.thread().clone(), sleeping });
+        }
+        // SAFETY: only the lifetime is erased; this function clears the pointer and returns only
+        // after every worker that entered acked, so no worker calls the job after the borrow ends
+        let ptr = unsafe { std::mem::transmute::<*const Job<'_>, *const Job<'static>>(job as *const Job<'_>) };
+        inner.generation += 1;
+        let generation = inner.generation;
+        // SAFETY: no worker reads `job` now (all entered workers acked, the gate of the next
+        // generation is not open yet)
+        unsafe { *sh.job.get() = Some(ptr) };
+        sh.done.store(0, Ordering::Relaxed);
+        sh.gate.store((generation & 0xffff_ffff) << 32, Ordering::Release);
+        sh.dispatch.store(generation << NW_BITS | n as u64, Ordering::SeqCst);
+        for w in &inner.workers[..n - 1] {
+            if w.sleeping.load(Ordering::SeqCst) {
+                w.thread.unpark();
+            }
+        }
+        let mine = catch_unwind(AssertUnwindSafe(|| job(0)));
+        let entered = (sh.gate.fetch_or(CLOSED, Ordering::AcqRel) & (CLOSED - 1)) as usize;
+        let mut spins = 0u32;
+        while sh.done.load(Ordering::Acquire) < entered {
+            if spins < SPINS {
+                spins += 1;
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        // SAFETY: every worker that entered acked; the gate is closed to the others
+        unsafe { *sh.job.get() = None };
+        let theirs = sh.panicked.swap(false, Ordering::Relaxed);
+        drop(inner);
+        if let Err(e) = mine {
+            resume_unwind(e);
+        }
+        assert!(!theirs, "cpu_mul1 pool: a worker panicked");
+    }
+
+    /// Test hook: park every idle worker now (no spinning left), so a reference arm timed next
+    /// does not share the cores with spinning workers (`cpu_mul1_bench`).
+    #[cfg(test)]
+    pub(super) fn park_idle() {
+        let p = pool();
+        let Ok(inner) = p.inner.lock() else { return };
+        // no dispatch can start while the lock is held; wait (at most 50 ms) for every park
+        let t0 = std::time::Instant::now();
+        while inner.workers.iter().any(|w| !w.sleeping.load(Ordering::SeqCst)) && t0.elapsed().as_millis() < 50 {
+            std::thread::yield_now();
+        }
+    }
+
+    /// Test hook: how many workers the pool has started.
+    #[cfg(test)]
+    pub(super) fn workers() -> usize {
+        pool().inner.lock().map(|i| i.workers.len()).unwrap_or(0)
+    }
+}
+
+/// The #180 and #183 kernels as they were, the reference arms of the bit-identity tests and of
+/// `cpu_mul1_bench` (test only).
+#[cfg(test)]
+mod reference {
+    use super::*;
+    use std::sync::Barrier;
+
+    /// columns `n * w / k .. n * (w + 1) / k` of worker `w`
+    #[inline]
+    fn split(n: usize, k: usize, w: usize) -> (usize, usize) {
+        (n * w / k, n * (w + 1) / k)
+    }
+
+    /// Worker `w` of `k` runs `f(u)` on its units of `0 .. units`: taken one at a time from `next`
+    /// (V2), or under `V1` the static block of `split`.
+    fn for_units(im: Impl, next: &AtomicUsize, units: usize, k: usize, w: usize, mut f: impl FnMut(usize)) {
+        if im == Impl::V1 {
+            let (u0, u1) = split(units, k, w);
+            (u0..u1).for_each(f);
+            return;
+        }
+        loop {
+            let u = next.fetch_add(1, Ordering::Relaxed);
+            if u >= units {
+                break;
+            }
+            f(u);
+        }
+    }
+
+    /// One work unit (tile columns `UNIT_TILES u ..`) for every token of `xp`.
+    fn unit_into(avx2: bool, im: Impl, m: &Mul1Matrix, tab: &Tables, xp: &[f32], tokens: usize, u: usize, raw: Out) {
+        let tn = m.n / 16;
+        let nb0 = u * UNIT_TILES;
+        let ntc = UNIT_TILES.min(tn - nb0);
+        let mut t0 = 0;
+        while t0 < tokens {
+            let nt = (tokens - t0).min(TOK_TILE);
+            #[cfg(target_arch = "x86_64")]
+            if avx2 {
+                // SAFETY: `avx2` is true only after `use_avx2` saw the feature on this CPU
+                unsafe {
+                    if im == Impl::V1 {
+                        match nt {
+                            1 => avx2::unit::<1, true>(m, tab, xp, t0, nb0, ntc, raw),
+                            2 => avx2::unit::<2, true>(m, tab, xp, t0, nb0, ntc, raw),
+                            3 => avx2::unit::<3, true>(m, tab, xp, t0, nb0, ntc, raw),
+                            _ => avx2::unit::<4, true>(m, tab, xp, t0, nb0, ntc, raw),
+                        }
+                    } else {
+                        match nt {
+                            1 => avx2::unit::<1, false>(m, tab, xp, t0, nb0, ntc, raw),
+                            2 => avx2::unit::<2, false>(m, tab, xp, t0, nb0, ntc, raw),
+                            3 => avx2::unit::<3, false>(m, tab, xp, t0, nb0, ntc, raw),
+                            _ => avx2::unit::<4, false>(m, tab, xp, t0, nb0, ntc, raw),
+                        }
+                    }
+                }
+                t0 += nt;
+                continue;
+            }
+            let _ = (avx2, im);
+            match nt {
+                1 => unit_scalar::<1>(m, tab, xp, t0, nb0, ntc, raw),
+                2 => unit_scalar::<2>(m, tab, xp, t0, nb0, ntc, raw),
+                3 => unit_scalar::<3>(m, tab, xp, t0, nb0, ntc, raw),
+                _ => unit_scalar::<4>(m, tab, xp, t0, nb0, ntc, raw),
+            }
+            t0 += nt;
+        }
+    }
+
+    /// run `work(w)` on `k` workers, the caller's thread among them
+    fn scoped(k: usize, work: &(dyn Fn(usize) + Sync)) {
+        if k == 1 {
+            work(0);
+        } else {
+            std::thread::scope(|s| {
+                for w in 1..k {
+                    s.spawn(move || work(w));
+                }
+                work(0);
+            });
+        }
+    }
+
+    pub(super) fn gemv(im: Impl, m: &Mul1Matrix, x: &[f32], y: &mut [f32], threads: usize, path: Path) {
+        assert!(x.len() % m.k == 0, "cpu_mul1::gemv: x is not [T][{}]", m.k);
+        let tokens = x.len() / m.k;
+        assert_eq!(y.len(), tokens * m.n, "cpu_mul1::gemv: y is not [T][{}]", m.n);
+        let avx2 = use_avx2(path);
+        let tab = Tables::new(m.bitrate);
+        let xp = permute(&had_in(x, m), m.k);
+        let mut raw = vec![0f32; y.len()];
+        let out = Out(raw.as_mut_ptr(), raw.len());
+        let units = units_of(m);
+        let k = threads.clamp(1, units);
+        let next = AtomicUsize::new(0);
+        scoped(k, &|w| for_units(im, &next, units, k, w, |u| unit_into(avx2, im, m, &tab, &xp, tokens, u, out)));
+        had_out(&raw, m, y);
+    }
+
+    pub(super) fn expert_ffn(im: Impl, e: &Mul1Expert, x: &[f32], y: &mut [f32], threads: usize, path: Path) {
+        let (h, i) = (e.hidden, e.inter);
+        assert!(x.len() % h == 0, "cpu_mul1::expert_ffn: x is not [T][{h}]");
+        let tokens = x.len() / h;
+        assert_eq!(y.len(), tokens * h, "cpu_mul1::expert_ffn: y is not [T][{h}]");
+        let avx2 = use_avx2(path);
+        let tab = Tables::new(e.gate.bitrate);
+        let tab_d = Tables::new(e.down.bitrate);
+        let (xp_g, xp_u) = (permute(&had_in(x, &e.gate), h), permute(&had_in(x, &e.up), h));
+        let mut raw_g = vec![0f32; tokens * i];
+        let mut raw_u = vec![0f32; tokens * i];
+        let mut xp_d = vec![0f32; tokens * (i / 16) * 32];
+        let mut raw_d = vec![0f32; tokens * h];
+        let (og, ou, od) = (Out(raw_g.as_mut_ptr(), raw_g.len()), Out(raw_u.as_mut_ptr(), raw_u.len()), Out(raw_d.as_mut_ptr(), raw_d.len()));
+        let oxd = Out(xp_d.as_mut_ptr(), xp_d.len());
+        let (ug, ud) = (units_of(&e.gate), units_of(&e.down));
+        let k = threads.clamp(1, (2 * ug).min(ud));
+        let barrier = Barrier::new(k);
+        let (next1, next2) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        scoped(k, &|w| {
+            for_units(im, &next1, 2 * ug, k, w, |u| {
+                if u < ug {
+                    unit_into(avx2, im, &e.gate, &tab, &xp_g, tokens, u, og);
+                } else {
+                    unit_into(avx2, im, &e.up, &tab, &xp_u, tokens, u - ug, ou);
+                }
+            });
+            barrier.wait();
+            if w == 0 {
+                // SAFETY: every write to raw_g / raw_u happened before the barrier; read only here
+                let (rg, ru) = unsafe { (std::slice::from_raw_parts(og.0 as *const f32, og.1), std::slice::from_raw_parts(ou.0 as *const f32, ou.1)) };
+                let (mut g, mut u) = (vec![0f32; og.1], vec![0f32; ou.1]);
+                had_out(rg, &e.gate, &mut g);
+                had_out(ru, &e.up, &mut u);
+                let act: Vec<f32> = g.iter().zip(&u).map(|(&g, &u)| silu_mul(g, u)).collect();
+                let xp = permute(&had_in(&act, &e.down), i);
+                for (n, v) in xp.into_iter().enumerate() {
+                    oxd.put(n, v);
+                }
+            }
+            barrier.wait();
+            // SAFETY: worker 0 wrote xp_d before the second barrier; read only from here on
+            let xd = unsafe { std::slice::from_raw_parts(oxd.0 as *const f32, oxd.1) };
+            for_units(im, &next2, ud, k, w, |u| unit_into(avx2, im, &e.down, &tab_d, xd, tokens, u, od));
+        });
+        drop((raw_g, raw_u, xp_d));
+        had_out(&raw_d, &e.down, y);
+    }
 }
 
 /// Test kit shared with `kernels::tests_mul1_gpu`: the #181 decoder (ported), the f64 reference,
@@ -1481,6 +2409,242 @@ mod tests {
         }
     }
 
+    /// #183 C1: the production path gives the bits of the #183 kernel (`Impl::V2`): the
+    /// division-free lane decoder (`decode8_fast`, every lane of every bitrate on random tiles,
+    /// wrapping lanes included) == `decode8`; `weights_fast` == `weights` for all 65,536 states;
+    /// the K = 3 unrolled unit == the table-driven `unit_fast`; GEMV of the 4 quantizer experts
+    /// and of synthetic K = 1, 1.5, 2.5, 5, 8 at T 1, 2, 3, 5, 8 x threads 1, 3, 8, 16, 24 and of
+    /// the GLM K = 3 gate and down at T 1, 4; the FFN of a full GLM expert at T 1, 2, 4, 5 x
+    /// threads 1, 2, 8, 16, 24; and the production path with the #183 unit (`NEW_NO_FMA`, an AVX2
+    /// CPU without FMA) on the same GEMVs and FFNs at 8 threads.
+    #[test]
+    fn cpu_mul1_c1_kernel_equals_v2_bits() {
+        if !avx2_available() || !std::arch::is_x86_feature_detected!("fma") {
+            eprintln!("cpu_mul1: no AVX2 + FMA on this CPU, the C1 kernel is not exercised");
+            return;
+        }
+        use std::arch::x86_64::*;
+        // SAFETY (whole test): AVX2 and FMA checked above; every tile holds 4 * n32 bytes
+        unsafe {
+            let kc = avx2::consts();
+            for s0 in (0..=u16::MAX as i32).step_by(8) {
+                let st = _mm256_setr_epi32(s0, s0 + 1, s0 + 2, s0 + 3, s0 + 4, s0 + 5, s0 + 6, s0 + 7);
+                let (mut a, mut b) = ([0f32; 8], [0f32; 8]);
+                _mm256_storeu_ps(a.as_mut_ptr(), avx2::weights_fast(st, &kc));
+                _mm256_storeu_ps(b.as_mut_ptr(), avx2::weights(st, &kc));
+                assert_eq!(bits(&a), bits(&b), "states {s0:#06x}..");
+            }
+            let mut rng = Rng(0xC1);
+            for k in [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 7.0, 8.0] {
+                let b = Bitrate::from_k(k).unwrap();
+                let tab = Tables::new(b);
+                for _ in 0..64 {
+                    let tile: Vec<u8> = (0..b.tile_bytes()).map(|_| rng.next() as u8).collect();
+                    for g in 0..32 {
+                        let (mut new, mut old) = ([0f32; 8], [0f32; 8]);
+                        _mm256_storeu_ps(new.as_mut_ptr(), avx2::decode8_fast(tile.as_ptr(), &tab.lanes[g], &kc));
+                        _mm256_storeu_ps(old.as_mut_ptr(), avx2::decode8(tile.as_ptr(), tab.n32, &tab.groups[g], &kc));
+                        assert_eq!(bits(&new), bits(&old), "K = {k} lane {g}");
+                    }
+                }
+            }
+        }
+        let mut rng = Rng(0xC1C1);
+        let c = &glm_cases()[0];
+        let rec = record(c);
+        let e = Mul1Expert::from_record(&rec, c.hidden, c.inter, c.bitrate).unwrap();
+        for t in [1usize, 2, 3, 4] {
+            let x = xs(t * GLM_HIDDEN, &mut rng);
+            let xp = permute(&had_in(&x, &e.gate), GLM_HIDDEN);
+            let (mut a, mut b) = (vec![0f32; t * GLM_INTER], vec![0f32; t * GLM_INTER]);
+            let (oa, ob) = (Out(a.as_mut_ptr(), a.len()), Out(b.as_mut_ptr(), b.len()));
+            for (nb0, ntc) in chunks(GLM_INTER / 16, 8) {
+                // SAFETY: AVX2 + FMA checked above; e.gate is K = 3
+                unsafe {
+                    match t {
+                        1 => (avx2::unit_k3::<1>(&e.gate, &xp, 0, nb0, ntc, oa), avx2::unit_fast::<1>(&e.gate, tables(K3), &xp, 0, nb0, ntc, ob)),
+                        2 => (avx2::unit_k3::<2>(&e.gate, &xp, 0, nb0, ntc, oa), avx2::unit_fast::<2>(&e.gate, tables(K3), &xp, 0, nb0, ntc, ob)),
+                        3 => (avx2::unit_k3::<3>(&e.gate, &xp, 0, nb0, ntc, oa), avx2::unit_fast::<3>(&e.gate, tables(K3), &xp, 0, nb0, ntc, ob)),
+                        _ => (avx2::unit_k3::<4>(&e.gate, &xp, 0, nb0, ntc, oa), avx2::unit_fast::<4>(&e.gate, tables(K3), &xp, 0, nb0, ntc, ob)),
+                    };
+                }
+            }
+            assert_eq!(bits(&a), bits(&b), "unit_k3 != unit_fast, T {t}");
+        }
+        let mut all = quant_cases();
+        for (i, k) in [1.0, 1.5, 2.5, 5.0, 8.0].into_iter().enumerate() {
+            all.push(Case {
+                name: format!("synth K = {k}"),
+                source: format!("synth:{}", 70 + i),
+                bitrate: Bitrate::from_k(k).unwrap(),
+                hidden: 512,
+                inter: 256,
+                want: [String::new(), String::new(), String::new()],
+            });
+        }
+        for c in &all {
+            let rec = record(c);
+            let e = Mul1Expert::from_record(&rec, c.hidden, c.inter, c.bitrate).unwrap();
+            for m in [e.gate, e.down] {
+                for t in [1usize, 2, 3, 5, 8] {
+                    let x = xs(t * m.k, &mut rng);
+                    let mut want = vec![0f32; t * m.n];
+                    gemv_with(Impl::V2, &m, &x, &mut want, 3, Path::Avx2);
+                    for th in [1usize, 3, 8, 16, 24] {
+                        let mut y = vec![0f32; t * m.n];
+                        gemv_with(Impl::NEW, &m, &x, &mut y, th, Path::Avx2);
+                        assert_eq!(bits(&y), bits(&want), "{} [{}, {}] T {t} threads {th}", c.name, m.k, m.n);
+                    }
+                    let mut y = vec![0f32; t * m.n];
+                    gemv_with(Impl::NEW_NO_FMA, &m, &x, &mut y, 8, Path::Avx2);
+                    assert_eq!(bits(&y), bits(&want), "{} [{}, {}] T {t} without FMA", c.name, m.k, m.n);
+                }
+            }
+        }
+        for m in [e.gate, e.down] {
+            for t in [1usize, 4] {
+                let x = xs(t * m.k, &mut rng);
+                let (mut want, mut y) = (vec![0f32; t * m.n], vec![0f32; t * m.n]);
+                gemv_with(Impl::V2, &m, &x, &mut want, 8, Path::Avx2);
+                gemv_with(Impl::NEW, &m, &x, &mut y, 8, Path::Avx2);
+                assert_eq!(bits(&y), bits(&want), "GLM [{}, {}] T {t}", m.k, m.n);
+            }
+        }
+        for t in [1usize, 2, 4, 5] {
+            let x = xs(t * GLM_HIDDEN, &mut rng);
+            let mut want = vec![0f32; x.len()];
+            expert_ffn_with(Impl::V2, &e, &x, &mut want, 8, Path::Avx2);
+            for th in [1usize, 2, 8, 16, 24] {
+                let mut y = vec![0f32; x.len()];
+                expert_ffn_with(Impl::NEW, &e, &x, &mut y, th, Path::Avx2);
+                assert_eq!(bits(&y), bits(&want), "GLM FFN T {t} threads {th}");
+            }
+            let mut y = vec![0f32; x.len()];
+            expert_ffn_with(Impl::NEW_NO_FMA, &e, &x, &mut y, 8, Path::Avx2);
+            assert_eq!(bits(&y), bits(&want), "GLM FFN T {t} without FMA");
+        }
+    }
+
+    /// #183 C1: the bit-built `f16_to_f32` is the former formula for all 65,536 inputs, and the
+    /// guided chunk plan covers every tile column once, in order, in aligned chunks of 4 / 2 / 1
+    /// that never cross a 128-column block, ending in one-column chunks when k > 1.
+    #[test]
+    fn cpu_mul1_scales_and_chunk_plan() {
+        for h in 0..=u16::MAX {
+            let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+            let (e, m) = (((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
+            let want = match e {
+                0 => sign * m * (2f32).powi(-24),
+                31 if m == 0.0 => sign * f32::INFINITY,
+                31 => f32::NAN,
+                _ => sign * (1024.0 + m) * (2f32).powi(e - 25),
+            };
+            assert_eq!(f16_to_f32(h).to_bits(), want.to_bits(), "fp16 {h:#06x}");
+        }
+        for tiles in [8usize, 16, 64, 128, 256, 512] {
+            for k in (1..=24).chain([32, 64]) {
+                let plan = chunks(tiles, k);
+                let mut at = 0;
+                for &(t0, n) in &plan {
+                    assert_eq!(t0, at, "tiles {tiles} k {k}: gap or overlap at {t0}");
+                    assert!(matches!(n, 1 | 2 | 4) && t0 % n == 0 && t0 / BLOCK_TILES == (t0 + n - 1) / BLOCK_TILES, "tiles {tiles} k {k}: chunk ({t0}, {n})");
+                    at += n;
+                }
+                assert_eq!(at, tiles, "tiles {tiles} k {k}: not covered");
+                if k > 1 {
+                    assert_eq!(plan.last().unwrap().1, 1, "tiles {tiles} k {k}: the last chunk is not one column");
+                } else {
+                    assert!(plan.iter().all(|&(_, n)| n == UNIT_TILES.min(tiles)), "k 1 takes whole units");
+                }
+            }
+        }
+    }
+
+    /// #183 C1: the pool. Every run does all of its work before it returns (item sums), job(0)
+    /// runs exactly once and no worker index runs twice or at or past n; a phase's `wait` returns
+    /// only after all of its items (timed items); two threads calling at
+    /// once (one falls back to scoped threads) and a nested call complete; a panicking worker is
+    /// raised in the caller and the pool keeps working.
+    #[test]
+    fn cpu_mul1_pool_runs_all_work_once() {
+        use std::sync::atomic::AtomicU64;
+        fn check(n: usize, items: usize) {
+            let seen: Vec<AtomicUsize> = (0..n + 1).map(|_| AtomicUsize::new(0)).collect();
+            let ph = Phase::new(items);
+            let sum = AtomicU64::new(0);
+            pool::run(n, &|w| {
+                seen[w.min(n)].fetch_add(1, Ordering::Relaxed);
+                ph.work(|j| {
+                    sum.fetch_add(j as u64 + 1, Ordering::Relaxed);
+                });
+                ph.wait();
+            });
+            assert_eq!(sum.load(Ordering::Relaxed), (items * (items + 1) / 2) as u64, "n {n}: work missing");
+            assert_eq!(seen[0].load(Ordering::Relaxed), 1, "n {n}: job(0)");
+            assert!(seen[1..n].iter().all(|s| s.load(Ordering::Relaxed) <= 1), "n {n}: a worker ran twice");
+            assert_eq!(seen[n].load(Ordering::Relaxed), 0, "n {n}: a worker index >= n ran");
+        }
+        for rep in 0..300 {
+            check([2, 3, 8, 16, 24][rep % 5], 1 + rep % 97);
+        }
+        // a later phase sees every item of the earlier one: items take 20..60 us, so a worker that
+        // ran out of items while others are inside theirs would pass an early wait
+        for n in [2usize, 4, 8, 16] {
+            let a = Phase::new(4 * n);
+            let flags: Vec<std::sync::atomic::AtomicBool> = (0..4 * n).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+            let early = AtomicUsize::new(0);
+            pool::run(n, &|_| {
+                a.work(|j| {
+                    let t0 = std::time::Instant::now();
+                    while t0.elapsed() < std::time::Duration::from_micros(20 + 10 * (j % 5) as u64) {
+                        std::hint::spin_loop();
+                    }
+                    flags[j].store(true, Ordering::Relaxed);
+                });
+                a.wait();
+                if flags.iter().any(|f| !f.load(Ordering::Relaxed)) {
+                    early.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            assert_eq!(early.load(Ordering::Relaxed), 0, "n {n}: a worker passed Phase::wait before the phase was complete");
+        }
+        assert!(pool::workers() >= 23, "the pool did not grow to 24 workers");
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| {
+                    for rep in 0..100 {
+                        check(1 + rep % 9, 50);
+                    }
+                });
+            }
+        });
+        let outer = AtomicUsize::new(0);
+        pool::run(4, &|w| {
+            if w == 0 {
+                check(4, 64);
+            }
+            outer.fetch_add(1, Ordering::Relaxed);
+        });
+        assert!((1..=4).contains(&outer.load(Ordering::Relaxed)));
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let r = std::panic::catch_unwind(|| {
+            pool::run(8, &|w| {
+                // job(0) waits (at most 2 s) until a worker entered; every other worker panics
+                if w == 0 {
+                    let t0 = std::time::Instant::now();
+                    while !started.load(Ordering::Acquire) && t0.elapsed().as_secs() < 2 {
+                        std::thread::yield_now();
+                    }
+                } else {
+                    started.store(true, Ordering::Release);
+                    panic!("worker {w} fails on purpose");
+                }
+            })
+        });
+        assert!(r.is_err(), "a worker's panic was not raised");
+        check(8, 100);
+    }
+
     /// The activation assumption of the FFN bound: the f32 `g / (1 + exp(-g)) * u` is within
     /// gamma32(8) relative of the exact value, over g in [-40, 40].
     #[test]
@@ -1538,12 +2702,17 @@ mod tests {
 
     /// Micro-benchmark, not a gate: one FFN over GLM-shaped K = 3 records rotated across 8 distinct
     /// records (76 MB, more than the L3), T 1 and 4, threads 1, 4, 8, 16, 24. Trellis + scale
-    /// bytes / wall time. Two arms alternating call by call (#183): `Impl::V1` (the first
-    /// #180 kernel) on even calls, `Impl::NEW` on odd calls; median of 24 calls per arm.
+    /// bytes / wall time. Two arms alternating call by call (#183 C1): `old` = `Impl::V2` (the
+    /// #183 kernel as at `bd52328`) on even calls, timed after the pool's idle workers parked
+    /// (`pool::park_idle`, so no spinning worker shares its cores), `new` = `Impl::NEW` on odd
+    /// calls, which therefore starts from parked workers every time; median of 24 calls per arm.
+    /// Then `new warm`: 24 `NEW` calls back to back (workers spinning between calls, as between
+    /// the MoE layers of a decode step), median.
     /// `cargo test --release -p crow-nest-engine cpu_mul1_bench -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn cpu_mul1_bench() {
+        super::POISON_SCRATCH.with(|p| p.set(false));
         let c = &glm_cases()[0];
         assert_eq!(c.bitrate.k(), 3.0);
         let base = record(c);
@@ -1565,17 +2734,25 @@ mod tests {
             let mut y = vec![0f32; t * GLM_HIDDEN];
             for &th in &[1usize, 4, 8, 16, 24] {
                 for e in &experts {
-                    expert_ffn_with(Impl::V1, e, &x, &mut y, th, path);
+                    expert_ffn_with(Impl::V2, e, &x, &mut y, th, path);
                     expert_ffn_with(Impl::NEW, e, &x, &mut y, th, path);
                 }
-                let mut ms = [Vec::new(), Vec::new()];
+                let mut ms = [Vec::new(), Vec::new(), Vec::new()];
                 for rep in 0..48 {
-                    let im = if rep % 2 == 0 { Impl::V1 } else { Impl::NEW };
+                    let im = if rep % 2 == 0 { Impl::V2 } else { Impl::NEW };
+                    if im == Impl::V2 {
+                        pool::park_idle();
+                    }
                     let t0 = std::time::Instant::now();
                     expert_ffn_with(im, &experts[(rep / 2) % experts.len()], &x, &mut y, th, path);
                     ms[rep % 2].push(t0.elapsed().as_secs_f64() * 1e3);
                 }
-                for (arm, ms) in ["v1 ", "new"].iter().zip(ms.iter_mut()) {
+                for rep in 0..24 {
+                    let t0 = std::time::Instant::now();
+                    expert_ffn_with(Impl::NEW, &experts[rep % experts.len()], &x, &mut y, th, path);
+                    ms[2].push(t0.elapsed().as_secs_f64() * 1e3);
+                }
+                for (arm, ms) in ["old     ", "new     ", "new warm"].iter().zip(ms.iter_mut()) {
                     ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     let med = ms[ms.len() / 2];
                     eprintln!(
