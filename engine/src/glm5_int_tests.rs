@@ -86,22 +86,28 @@ pub(crate) fn bit_diff(a: &[Vec<f32>], b: &[Vec<f32>]) -> Vec<usize> {
     a.iter().zip(b).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()).collect()
 }
 
-/// what one arm produced: the run and the tier store's NVMe reads (the cache's own count)
+/// what one arm produced: the run, the tier store's NVMe reads (the cache's own count) and the
+/// experts the CPU lane computed
 pub(crate) struct Out {
     pub gen: Generated,
     pub nvme_reads: u64,
+    pub lane_experts: u64,
 }
 
 /// `generate` of the 5-id prompt and `n` greedy ids under every arm, a fresh tier store per arm
 /// (VRAM 3 + pinned 4 slots per layer)
 pub(crate) fn run_arms(arms: &[Arm], n: usize) -> Vec<Out> {
+    run_arms_sized(arms, n, TierSizes { vram: 3, pinned: 4 })
+}
+
+/// [`run_arms`] with the tier sizes per layer
+pub(crate) fn run_arms_sized(arms: &[Arm], n: usize, sizes: TierSizes) -> Vec<Out> {
     let g = geo8();
     let s = synth_model(&g, REC);
     let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
     let moe = MoeGeo::new(&g, spec).unwrap();
     let mut cnq = Cnq::open_checked(&s.path).unwrap();
     let prompt = [3i64, 17, 101, 999, 5];
-    let sizes = TierSizes { vram: 3, pinned: 4 };
     let mut outs = Vec::new();
     unsafe {
         let _ctx = cuda::Ctx::init();
@@ -115,8 +121,9 @@ pub(crate) fn run_arms(arms: &[Arm], n: usize) -> Vec<Out> {
             let gen = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |_| {}).unwrap_or_else(|e| panic!("{}: {e}", a.name));
             eprintln!("glm5 int {}: ids {:?}, NVMe reads {}, prefetch {:?}", a.name, gen.ids, tiers.nvme_reads, tiers.prefetch_stats());
             let nvme_reads = tiers.nvme_reads;
+            let lane_experts = tiers.cpu_lane_clock().read().1;
             tiers.free();
-            outs.push(Out { gen, nvme_reads });
+            outs.push(Out { gen, nvme_reads, lane_experts });
         }
         run.free();
     }
@@ -349,4 +356,58 @@ fn glm5_int_decode_hot_set_with_the_borrowed_prompt_scratch() {
     assert_eq!(c1.2, c1.3, "chunk 1 books no prompt scratch");
     assert_eq!(c8.1, 7, "the plan of record at chunk 8192 (#186)");
     assert!(c8.3 > c8.2 + 20.0, "chunk 8192: the borrowed scratch holds experts during decode ({:.1} vs {:.1})", c8.3, c8.2);
+}
+
+/// Cross-wiring 2: the CPU lane (`1` and `split`) with the global arena, the stager, the
+/// controller and its lookahead. The lane's CPU combos have other bits than the GPU's, so a
+/// comparison holds when the same experts go to the CPU: with every expert in pinned (V 0 + P 16
+/// of 16 per layer) `1` gives every pick to the CPU on every path, and `split` plans from the same
+/// heat on every path (every call counts it). Every arm gives the bits of the synchronous
+/// per-layer lane of its mode, and the CPU computed experts in every arm. Then V 3 + P 4: the
+/// controller (with LA and the prefetch) gives the bits of flags + stager with the lane on, per
+/// layer and on the global arena (same placement, same plan).
+#[test]
+#[ignore = "needs the GPU (about 2 GB VRAM, a 2.3 GB synthetic container in the temp dir)"]
+fn glm5_int_gpu_the_cpu_lane_runs_with_the_arena_the_stager_and_the_controller() {
+    let fs = Switches { flags: true, ..Switches::default() };
+    let ctl = Switches { flags: true, controller: true, ..Switches::default() };
+    let la = Switches { la: true, prefetch: true, overlap: true, ..ctl };
+    for mode in ["1", "split"] {
+        let lane: &[(&str, &str)] = &[("CROW_GLM_CPU_LANE", mode), ("CROW_PINNED_ALLOC", "host")];
+        let gl = [lane, &[("CROW_GLM_ARENA", "global"), ("CROW_GLM_ARENA_VRING", "0")]].concat();
+        let arms = [
+            arm("lane", lane, Switches::default(), false),
+            arm("lane global", &gl, Switches::default(), false),
+            arm("lane flags+stager", lane, fs, true),
+            arm("lane global flags+stager", &gl, fs, true),
+            arm("lane ctl", lane, ctl, true),
+            arm("lane ctl+la+prefetch+overlap", lane, la, true),
+            arm("lane global ctl+la+prefetch+overlap", &gl, la, true),
+        ];
+        let outs = run_arms_sized(&arms, 6, TierSizes { vram: 0, pinned: 16 });
+        for (a, o) in arms.iter().zip(&outs) {
+            eprintln!("glm5 int lane {mode} {}: CPU experts {}", a.name, o.lane_experts);
+            assert!(o.lane_experts > 0, "{mode} {}: the CPU lane computed nothing", a.name);
+        }
+        assert_bit_identical(&arms, &outs);
+        if mode == "1" {
+            assert!(outs.iter().all(|o| o.lane_experts == outs[0].lane_experts), "every pick on the CPU on every path");
+        }
+    }
+    // mixed tiers: the controller with the lane against flags + stager with the lane
+    let lane: &[(&str, &str)] = &[("CROW_GLM_CPU_LANE", "split"), ("CROW_PINNED_ALLOC", "host")];
+    let gl = [lane, &[("CROW_GLM_ARENA", "global"), ("CROW_GLM_ARENA_VRING", "2")]].concat();
+    for (what, env) in [("per layer", lane.to_vec()), ("global", gl)] {
+        let arms = [
+            arm("lane flags+stager", &env, fs, true),
+            arm("lane ctl", &env, ctl, true),
+            arm("lane ctl+la+prefetch+overlap", &env, la, true),
+        ];
+        let outs = run_arms(&arms, 6);
+        for (a, o) in arms.iter().zip(&outs) {
+            eprintln!("glm5 int lane split V3 P4 {what} {}: CPU experts {}, ids {:?}", a.name, o.lane_experts, o.gen.ids);
+        }
+        assert!(outs[0].lane_experts > 0, "{what}: the CPU lane computed nothing");
+        assert_bit_identical(&arms, &outs);
+    }
 }

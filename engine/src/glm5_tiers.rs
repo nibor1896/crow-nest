@@ -298,9 +298,9 @@ pub fn stager_on(stager: Option<&str>, flags: Option<&str>, lane: Option<&str>) 
     if flags != Some("1") {
         return Err(format!("{STAGER_ENV}=1 needs {}=1: the stager replaces the host's waits inside a MoE layer, the router's flag is the one wait it keeps", glm5_flags::ENV_FLAGS));
     }
-    if let Some(l @ ("1" | "split")) = lane.map(str::trim) {
-        return Err(format!("{STAGER_ENV}=1 and {CPU_LANE_ENV}={l}: the CPU lane reads pinned records on the host while the experts launch, before the stager's records have landed; turn one of them off"));
-    }
+    // the CPU lane reads its pinned records after the stager's moves of the call are done (the
+    // stager's event, `lane::Call::ready`; under the controller `DevLane::serve` after it)
+    let _ = lane;
     Ok(true)
 }
 
@@ -1032,9 +1032,6 @@ pub fn parse_warm(text: &str, layers: usize, first_moe: usize, experts: usize) -
     Ok(out)
 }
 
-fn arena_lane_refusal() -> String {
-    format!("{ARENA_ENV}=global and {CPU_LANE_ENV}=1: the CPU lane addresses the pinned slots of one layer; turn one of them off")
-}
 
 /// Where one record of the global arena lies. The slots are global: VRAM slot `v` is slot
 /// `v % vram` of the VRAM allocation of MoE layer `v / vram` (`vram` = the plan's slots per
@@ -1858,6 +1855,14 @@ impl<'a, M: Mover + Rebase<'a>> ChunkMover<'a, '_, M> {
             unsafe { cuda::stream_wait_event(s, e) };
         }
     }
+    /// the host reads pinned slot `q` (the CPU lane): every write-back into it landed
+    fn wait_host(&mut self, q: u32) {
+        for r in self.pending(q) {
+            let e = self.ring.as_ref().expect("pending entries come from the ring").wb[r];
+            unsafe { cuda::ck(sys::cuEventSynchronize(e)) };
+        }
+    }
+
     /// the kernels of this call read the pinned slots of `locs`: their stream waits for the
     /// write-backs into them
     fn settle_locs(&mut self, locs: &[(u32, Loc)]) {
@@ -2319,9 +2324,6 @@ impl ExpertTiers {
     /// # Safety
     /// As [`ExpertTiers::table_for`].
     unsafe fn table_global(&mut self, l: usize, sel: &[i32], ids: &[u32], reply: Option<(Dev, u64)>) -> Result<(Dev, Served), String> {
-        if self.pinned_use.cpu_lane {
-            return Err(arena_lane_refusal());
-        }
         // a decode call ends a staged forward; the elastic part grows back when it can
         self.stage_end();
         if l == 0 && self.arena.as_ref().is_some_and(|d| d.flex().any(|c| d.chunks[c] == 0)) {
@@ -2340,12 +2342,20 @@ impl ExpertTiers {
                     None => serve_global(&mut d.a, l, ids, admit, self.stage_cap, &mut m)?,
                 };
                 m.settle_locs(&served.locs);
+                // the CPU lane reads pinned slots on the host: every write-back into them landed
+                if self.pinned_use.cpu_lane {
+                    for &(_, loc) in &served.locs {
+                        if let Loc::Pinned(q) = loc {
+                            m.wait_host(q);
+                        }
+                    }
+                }
                 let mut table = vec![0u64; experts];
                 for &(e, loc) in &served.locs {
                     table[e as usize] = arena_addr(&d.chunks, &self.pinned, vpl, ppl, stage, rb, loc);
                 }
                 cuda::to_u64_into(self.tables[l], &table);
-                served
+                (served, None)
             }
             Some(st) => {
                 st.settle(&self.src)?;
@@ -2374,29 +2384,48 @@ impl ExpertTiers {
                     None => serve_global(&mut d.a, l, ids, admit, self.stage_cap, &mut m)?,
                 };
                 m.settle_locs(&served.locs);
+                if self.pinned_use.cpu_lane {
+                    for &(_, loc) in &served.locs {
+                        if let Loc::Pinned(q) = loc {
+                            m.wait_host(q);
+                        }
+                    }
+                }
                 // as `table_staged`: the table into this layer's pinned row, up on the stager
-                let host = std::slice::from_raw_parts_mut((st.tables.host as *mut u64).add(row), experts);
+                let trow = (st.tables.host as *mut u64).add(row);
+                let host = std::slice::from_raw_parts_mut(trow, experts);
                 host.fill(0);
                 for &(e, loc) in &served.locs {
                     host[e as usize] = arena_addr(&d.chunks, &self.pinned, vpl, ppl, stage, rb, loc);
                 }
-                cuda::ck(sys::cuMemcpyHtoDAsync_v2(self.tables[l], host.as_ptr() as *const _, experts * 8, st.stream));
-                match reply {
-                    None => {
-                        cuda::event_record(st.event, st.stream);
-                        cuda::stream_query(st.stream);
-                        cuda::stream_wait_event(cuda::cur_stream(), st.event);
-                    }
-                    // CROW_GLM_CONTROLLER: the reply word behind the batch, as in `table_staged`
-                    Some((w, q)) => {
-                        cuda::ck(sys::cuStreamWriteValue64_v2(st.stream, w, q, 0));
-                        cuda::stream_query(st.stream);
-                    }
-                }
-                served
+                (served, Some((trow, st.stream, st.event)))
             }
         };
-        crate::glm5_moe::lane::post(None);
+        let (mut served, staged) = served;
+        // the CPU lane: the host addresses of the arena's pinned slots
+        let lane = {
+            let pinned = &self.pinned;
+            let tv: Vec<u64> = match staged {
+                Some((trow, _, _)) => std::slice::from_raw_parts(trow, experts).to_vec(),
+                None => {
+                    let d = self.arena.as_ref().expect("table_global without the global arena");
+                    let mut t = vec![0u64; experts];
+                    for &(e, loc) in &served.locs {
+                        t[e as usize] = arena_addr(&d.chunks, pinned, vpl, ppl, stage, rb, loc);
+                    }
+                    t
+                }
+            };
+            self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| (pinned[q as usize / ppl].host as *const u8).add((q as usize % ppl) * rb as usize))
+        };
+        match staged {
+            Some((trow, stream, event)) => self.finish_staged(l, lane, served.locs.len(), trow, stream, event, reply)?,
+            None => {
+                let post = lane.map(|(combos, _)| crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone(), ready: None });
+                crate::glm5_moe::lane::post(post);
+            }
+        }
+        self.count_heat(l, sel);
         if let Some(pf) = self.prefetch.as_mut() {
             let a = &self.arena.as_ref().expect("table_global without the global arena").a;
             glm5_flags::prefetch_hinted(pf, &self.src, &self.records, experts, &|l, e| a.place(l, e) == Place::Nvme, self.first_moe, self.first_moe + l)?;
@@ -2416,9 +2445,6 @@ impl ExpertTiers {
     /// # Safety
     /// As [`ExpertTiers::tables_for_chunk`].
     unsafe fn tables_for_chunk_global(&mut self, l: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<(), String> {
-        if self.pinned_use.cpu_lane {
-            return Err(arena_lane_refusal());
-        }
         if self.pf_cap == 0 {
             self.alloc_prefill_stage(prefill_stage_slots(self.topk))?;
         }
@@ -2463,6 +2489,9 @@ impl ExpertTiers {
             run(r0, rows, table_dev)
         };
         let r = serve_chunk_global(&mut d.a, l, sel, k, self.pf_cap, &mut m, &mut each);
+        if r.is_ok() {
+            self.count_heat(l, sel);
+        }
         self.nvme_reads += reads;
         self.nvme_bytes += bytes;
         self.moves[l].add(&moves);
@@ -3510,6 +3539,10 @@ pub struct ExpertTiers {
     pinned_wc: bool,
     topk: usize,
     lane_clock: std::sync::Arc<crate::glm5_moe::lane::Clock>,
+    /// the routed-expert geometry (the CPU lane under the controller builds its experts from it)
+    lane_geo: MoeGeo,
+    /// `CROW_GLM_CONTROLLER` with the CPU lane: the lane's device side (lane and stager on)
+    dev_lane: Option<glm5_flags::DevLane>,
     /// `CROW_GLM_CPU_LANE=split` as read at construction: the cost model of [`plan_split`]
     /// (`None` = `1` or off: the lane, if on, takes every pinned id)
     pub split: Option<SplitCost>,
@@ -3720,7 +3753,6 @@ impl ExpertTiers {
         let cache = ExpertCache::new(policy, Scope::PerLayer, nl, g.experts, sizes.vram, sizes.pinned)?;
         let arena = match arena_kind(std::env::var(ARENA_ENV).ok().as_deref())? {
             ArenaKind::Layer => None,
-            ArenaKind::Global if pu.cpu_lane => return Err(arena_lane_refusal()),
             ArenaKind::Global => Some(ArenaDev::new(GlobalArena::new(nl, g.experts, nl * sizes.vram, nl * sizes.pinned)?, arena_config(&|k| std::env::var(k).ok())?)),
         };
         let records = ExpertRecord::glm5_table(cnq, &moe.record, &layers, g.experts as u32)?;
@@ -3766,6 +3798,8 @@ impl ExpertTiers {
             pinned_wc,
             topk: g.topk,
             lane_clock: Default::default(),
+            lane_geo: *moe,
+            dev_lane: None,
             split: lane_split(std::env::var(CPU_LANE_ENV).ok().as_deref()).then(|| SplitCost::for_threads(lane_threads)),
             heat: vec![0; nl * g.experts],
             stager: None,
@@ -3795,11 +3829,10 @@ impl ExpertTiers {
     /// write-combined pinned arena. Changes no slot and no record.
     pub fn set_pinned_use(&mut self, u: PinnedUse) -> Result<(), String> {
         lane_on_wc(u, self.pinned_wc)?;
-        if u.cpu_lane && self.stager.is_some() {
-            stager_on(Some("1"), Some("1"), Some("1"))?;
-        }
         self.cache.set_pinned_stays(u.stay);
         self.pinned_use = u;
+        // SAFETY: construction and the callers hold a current context
+        unsafe { self.sync_dev_lane() };
         Ok(())
     }
 
@@ -3827,7 +3860,7 @@ impl ExpertTiers {
             return self.table_global(l, sel, &ids, None);
         }
         if self.stager.is_some() {
-            return self.table_staged(l, &ids, None);
+            return self.table_staged(l, sel, &ids, None);
         }
         let rb = self.rb;
         let mut m = GpuMover {
@@ -3855,22 +3888,11 @@ impl ExpertTiers {
         // #188: a decode call's pinned ids go to the CPU lane (`GpuMoePlan::experts` takes the
         // post); their table entries stay valid pinned bases. Anything else clears the post.
         // `split`: only the ids `plan_split` gives the CPU (a call it gives none posts nothing)
-        let mut post = None;
-        if self.pinned_use.cpu_lane && sel.len() == self.topk && served.moves.zero_copy > 0 {
-            let host = self.pinned[l].host as *const u8;
-            let heat = &self.heat[l * self.cache.experts..(l + 1) * self.cache.experts];
-            let cpu = self.split.map(|cost| {
-                let hits = served.locs.iter().filter(|x| !matches!(x.1, Loc::Pinned(_))).count();
-                let ram: Vec<(u32, u32)> = served.locs.iter().filter(|x| matches!(x.1, Loc::Pinned(_))).map(|x| (x.0, heat[x.0 as usize])).collect();
-                plan_split(&cost, hits, &ram)
-            });
-            let (combos, n) = lane_combos_where(sel, &served.locs, |e, _| table[e as usize], |q| host.add(q as usize * rb as usize), |e| cpu.as_ref().is_none_or(|v| v.contains(&e)));
-            served.moves.cpu_lane = n as u64;
-            served.moves.zero_copy -= n as u64;
-            if n > 0 {
-                post = Some(crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone() });
-            }
-        }
+        // CROW_GLM_MAX_BATCH: a batched step's rows too (one pool run per row)
+        let host = self.pinned.get(l).map_or(std::ptr::null(), |p| p.host as *const u8);
+        let post = self
+            .lane_plan(l, sel, &mut served, &|e| table[e as usize], &|q| host.add(q as usize * rb as usize))
+            .map(|(combos, _)| crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone(), ready: None });
         crate::glm5_moe::lane::post(post);
         self.count_heat(l, sel);
         if let Some(pf) = self.prefetch.as_mut() {
@@ -4019,6 +4041,9 @@ impl ExpertTiers {
         self.free_arena();
         if let Some(mut st) = self.stager.take() {
             st.free();
+        }
+        if let Some(mut d) = self.dev_lane.take() {
+            d.free();
         }
         if let Some(mut pf) = self.prefetch.take() {
             let _ = pf.free(&self.src);
@@ -4249,9 +4274,6 @@ impl ExpertTiers {
     pub unsafe fn set_stager(&mut self, on: bool) -> Result<(), String> {
         match (on, self.stager.is_some()) {
             (true, false) => {
-                if self.pinned_use.cpu_lane {
-                    stager_on(Some("1"), Some("1"), Some("1"))?;
-                }
                 self.stager = Some(Stager::new(self.slots.len(), self.cache.experts, self.stage_cap, self.rb)?);
             }
             (false, true) => {
@@ -4264,7 +4286,75 @@ impl ExpertTiers {
             }
             _ => {}
         }
+        self.sync_dev_lane();
         Ok(())
+    }
+
+    /// the CPU lane under the controller ([`glm5_flags::DevLane`]) exists exactly while the lane
+    /// and the stager are on (the controller serves through the stager)
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading the lane is pending.
+    unsafe fn sync_dev_lane(&mut self) {
+        let want = self.pinned_use.cpu_lane && self.stager.is_some();
+        match (want, self.dev_lane.is_some()) {
+            (true, false) => self.dev_lane = Some(glm5_flags::DevLane::new(self.topk, self.lane_geo.hidden, self.rb)),
+            (false, true) => {
+                cuda::sync();
+                if let Some(mut d) = self.dev_lane.take() {
+                    d.free();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `CROW_GLM_CONTROLLER` with the CPU lane: the device addresses of a controlled row (`None`
+    /// without the lane)
+    pub fn dev_lane(&self) -> Option<glm5_flags::DevLaneDev> {
+        self.dev_lane.as_ref().map(|d| d.dev())
+    }
+
+    /// `CROW_GLM_CONTROLLER` with the CPU lane: a fresh controller counts from 0 again
+    pub fn dev_lane_reset(&self) {
+        if let Some(d) = self.dev_lane.as_ref() {
+            d.reset();
+        }
+    }
+
+    /// after a failed controller job: every lane wait of the device passes
+    pub fn dev_lane_release(&self) {
+        if let Some(d) = self.dev_lane.as_ref() {
+            d.release();
+        }
+    }
+
+    /// The CPU lane of one decode call of MoE layer `l` (`sel` = `[rows][topk]`, the served
+    /// locations, `table` the record bases by expert, `host(q)` the host address of pinned slot
+    /// `q`): which pinned ids the CPU computes (every one; `split`: those `plan_split` gives it,
+    /// from the layer's heat) and the combos. `None` with the lane off, more rows than a batched
+    /// step holds, or no pinned pick; the counters move the CPU's ids from zero-copy to the lane.
+    fn lane_plan(&self, l: usize, sel: &[i32], served: &mut Served, table: &dyn Fn(u32) -> u64, host: &dyn Fn(u32) -> *const u8) -> Option<(Vec<crate::glm5_moe::lane::Combo>, Vec<u32>)> {
+        let k = self.topk;
+        if !self.pinned_use.cpu_lane || sel.is_empty() || sel.len() % k != 0 || sel.len() / k > MAX_BATCH || served.moves.zero_copy == 0 {
+            return None;
+        }
+        let e = self.cache.experts;
+        let heat = &self.heat[l * e..(l + 1) * e];
+        let pinned: Vec<u32> = served.locs.iter().filter(|x| matches!(x.1, Loc::Pinned(_))).map(|x| x.0).collect();
+        let cpu = match self.split {
+            Some(cost) => {
+                let hits = served.locs.len() - pinned.len();
+                let ram: Vec<(u32, u32)> = pinned.iter().map(|&x| (x, heat[x as usize])).collect();
+                plan_split(&cost, hits, &ram)
+            }
+            None => pinned,
+        };
+        let (combos, n) = lane_combos_where(sel, &served.locs, |e, _| table(e), |q| host(q), |e| cpu.contains(&e));
+        let nd = cpu.len() as u64;
+        served.moves.cpu_lane = nd;
+        served.moves.zero_copy -= nd;
+        (n > 0).then_some((combos, cpu))
     }
 
     /// #149 path B: the stager is on
@@ -4323,7 +4413,7 @@ impl ExpertTiers {
         if self.arena.is_some() {
             return self.table_global(l, sel, &ids, Some((reply, q))).map(|_| ());
         }
-        self.table_staged(l, &ids, Some((reply, q))).map(|_| ())
+        self.table_staged(l, sel, &ids, Some((reply, q))).map(|_| ())
     }
 
     /// `CROW_GLM_CONTROLLER`: wait for the stager stream (after a failure in a controller job)
@@ -4346,6 +4436,70 @@ impl ExpertTiers {
         }
     }
 
+    /// The tail of a stager call (per-layer and global): the record table (its pinned row `trow`)
+    /// up on the stager stream behind the moves, then either the compute stream's event wait and
+    /// the CPU lane's post (`ready` = the stager's event), or, under the controller, the reply
+    /// word behind the batch and the CPU lane served here on the controller thread
+    /// ([`glm5_flags::DevLane::serve`]: the CPU's table entries point at its zeroed record, its
+    /// rows are computed once the stager's moves are done, the lane flag goes to the request's
+    /// number, also with no CPU combo).
+    ///
+    /// # Safety
+    /// As [`ExpertTiers::table_staged`]; `trow` is layer `l`'s pinned table row.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn finish_staged(
+        &mut self,
+        l: usize,
+        lane: Option<(Vec<crate::glm5_moe::lane::Combo>, Vec<u32>)>,
+        _served: usize,
+        trow: *mut u64,
+        stream: sys::CUstream,
+        event: sys::CUevent,
+        reply: Option<(Dev, u64)>,
+    ) -> Result<(), String> {
+        let experts = self.cache.experts;
+        let dev_lane = reply.is_some() && self.dev_lane.is_some();
+        if dev_lane {
+            if let Some((_, cpu)) = lane.as_ref() {
+                let dummy = self.dev_lane.as_ref().expect("dev lane").dummy;
+                for &e in cpu {
+                    *trow.add(e as usize) = dummy;
+                }
+            }
+        }
+        cuda::ck(sys::cuMemcpyHtoDAsync_v2(self.tables[l], trow as *const _, experts * 8, stream));
+        match reply {
+            None => {
+                cuda::event_record(event, stream);
+                // WDDM: submit the stager's batch now (it would otherwise wait for a later query or sync)
+                cuda::stream_query(stream);
+                cuda::stream_wait_event(cuda::cur_stream(), event);
+                let post = lane.map(|(combos, _)| crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone(), ready: Some(event as u64) });
+                crate::glm5_moe::lane::post(post);
+            }
+            // CROW_GLM_CONTROLLER: the reply word behind the batch; the compute stream's device
+            // wait for it was queued long before
+            Some((w, q)) => {
+                cuda::ck(sys::cuStreamWriteValue64_v2(stream, w, q, 0));
+                cuda::stream_query(stream);
+                crate::glm5_moe::lane::post(None);
+                if dev_lane {
+                    let cpu: Vec<(usize, *const u8)> = match lane.as_ref() {
+                        Some((combos, _)) => {
+                            // the CPU reads its records once the moves that put them there ran
+                            cuda::event_record(event, stream);
+                            cuda::ck(sys::cuEventSynchronize(event));
+                            combos.iter().enumerate().filter_map(|(c, x)| if let crate::glm5_moe::lane::Combo::Cpu(r) = *x { Some((c, r)) } else { None }).collect()
+                        }
+                        None => Vec::new(),
+                    };
+                    self.dev_lane.as_ref().expect("dev lane").serve(q, &cpu, &self.lane_geo, &self.lane_clock);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// [`ExpertTiers::table_for`] through the stager: the earlier calls' reads report, then
     /// [`serve`] with a [`StagerMover`], the table into its pinned row and up on the stager, the
     /// stager's event recorded and waited on by the current stream. The host waits for nothing
@@ -4353,7 +4507,7 @@ impl ExpertTiers {
     ///
     /// # Safety
     /// As [`ExpertTiers::table_for`]; the host has seen this layer's router finish (its flag).
-    unsafe fn table_staged(&mut self, l: usize, ids: &[u32], reply: Option<(Dev, u64)>) -> Result<(Dev, Served), String> {
+    unsafe fn table_staged(&mut self, l: usize, sel: &[i32], ids: &[u32], reply: Option<(Dev, u64)>) -> Result<(Dev, Served), String> {
         let rb = self.rb;
         let experts = self.cache.experts;
         let st = self.stager.as_mut().expect("table_staged without the stager");
@@ -4377,13 +4531,14 @@ impl ExpertTiers {
             pending: &mut st.pending,
             stats: &mut st.stats,
         };
-        let served = match self.prefetch.as_mut() {
+        let mut served = match self.prefetch.as_mut() {
             Some(pf) => serve(&mut self.cache, l, &mut self.slots[l], ids, self.stage_cap, &mut glm5_flags::PrefetchMover::new(&mut m, pf, &self.src, l, self.stage, Some(st.stream)))?,
             None => serve(&mut self.cache, l, &mut self.slots[l], ids, self.stage_cap, &mut m)?,
         };
+        let (stream, event, trow) = (st.stream, st.event, (st.tables.host as *mut u64).add(row));
         // the table into this layer's pinned row (its last upload ran before this layer's
         // previous experts), then up on the stager behind the moves
-        let host = std::slice::from_raw_parts_mut((st.tables.host as *mut u64).add(row), experts);
+        let host = std::slice::from_raw_parts_mut(trow, experts);
         host.fill(0);
         for &(e, loc) in &served.locs {
             host[e as usize] = match loc {
@@ -4392,22 +4547,14 @@ impl ExpertTiers {
                 Loc::Stage(s) => self.stage + s as u64 * rb,
             };
         }
-        cuda::ck(sys::cuMemcpyHtoDAsync_v2(self.tables[l], host.as_ptr() as *const _, experts * 8, st.stream));
-        match reply {
-            None => {
-                cuda::event_record(st.event, st.stream);
-                // WDDM: submit the stager's batch now (it would otherwise wait for a later query or sync)
-                cuda::stream_query(st.stream);
-                cuda::stream_wait_event(cuda::cur_stream(), st.event);
-            }
-            // CROW_GLM_CONTROLLER: the reply word behind the batch; the compute stream's device
-            // wait for it was queued long before
-            Some((w, q)) => {
-                cuda::ck(sys::cuStreamWriteValue64_v2(st.stream, w, q, 0));
-                cuda::stream_query(st.stream);
-            }
-        }
-        crate::glm5_moe::lane::post(None);
+        // the CPU lane: its pinned records are read after this call's moves (the stager's event)
+        let pin_host = self.pinned.get(l).map_or(std::ptr::null(), |p| p.host as *const u8);
+        let lane = {
+            let tv: Vec<u64> = host.to_vec();
+            self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| pin_host.add(q as usize * rb as usize))
+        };
+        self.finish_staged(l, lane, served.locs.len(), trow, stream, event, reply)?;
+        self.count_heat(l, sel);
         if let Some(pf) = self.prefetch.as_mut() {
             let cache = &self.cache;
             glm5_flags::prefetch_hinted(pf, &self.src, &self.records, cache.experts, &|l, e| cache.tier(l, e) == Tier::Nvme, self.first_moe, self.first_moe + l)?;
@@ -6123,6 +6270,7 @@ fn ctl_job(t: &mut ExpertTiers, mut rd: glm5_flags::RingReader, n: usize, score:
                 // SAFETY: the stager stream of this store, on the thread that queues on it
                 unsafe { t.stager_idle() };
                 rd.release_all();
+                t.dev_lane_release();
                 return Err(e);
             }
         };
@@ -6136,6 +6284,7 @@ fn ctl_job(t: &mut ExpertTiers, mut rd: glm5_flags::RingReader, n: usize, score:
         if let Err(e) = unsafe { t.table_reply(rq.layer, &rq.ids, rd.reply_dev, rq.seq) } {
             unsafe { t.stager_idle() };
             rd.release_all();
+            t.dev_lane_release();
             return Err(format!("{}: layer {}: {e}", glm5_flags::ENV_CONTROLLER, rq.layer));
         }
     }
@@ -6152,8 +6301,9 @@ impl Glm5Run {
         if !tiers.stager_on() {
             return Err(format!("{c}=1 needs {STAGER_ENV}=1: the controller serves the layers through the stager"));
         }
-        if tiers.pinned_use.cpu_lane {
-            return Err(format!("{c}=1 and {CPU_LANE_ENV}=1: the CPU lane computes on the host inside the layer"));
+        // the CPU lane under the controller: its device side (`DevLane`, made with lane + stager)
+        if tiers.pinned_use.cpu_lane && tiers.dev_lane().is_none() {
+            return Err(format!("{c}=1 and {CPU_LANE_ENV}: the lane's device side is missing (ExpertTiers::set_stager)"));
         }
         if self.spec.is_some() {
             return Err(format!("{c}=1 and {}: the verify calls hand their routing to the host", crate::glm5_mtp::MTP_ENV));
@@ -6177,6 +6327,11 @@ impl Glm5Run {
         let n = moe_layers(&g);
         let ctl = self.pass.ctl.as_mut().expect("glm5_run: a controlled row without the controller");
         ctl.tables = (0..g.layers).map(|l| l.checked_sub(first).and_then(|i| tiers.tables().get(i).copied()).unwrap_or(0)).collect();
+        // the CPU lane: a fresh controller counts its requests from 1 again, so does the lane flag
+        if ctl.fresh() {
+            tiers.dev_lane_reset();
+        }
+        ctl.lane = tiers.dev_lane();
         let rd = ctl.reader(n);
         let score = ctl.score.clone();
         let tp = glm5_flags::SendPtr(tiers as *mut ExpertTiers);
@@ -7881,8 +8036,7 @@ mod split_tests {
         let e = pinned_use(Some("promote"), Some("split")).unwrap_err();
         assert!(e.starts_with("CROW_GLM_CPU_LANE=split reads the selected pinned experts where they lie"), "{e}");
         assert!(pinned_use(None, Some("splitt")).unwrap_err().ends_with("accepted 0 (default), 1, split"));
-        let e = stager_on(Some("1"), Some("1"), Some("split")).unwrap_err();
-        assert!(e.starts_with("CROW_GLM_STAGER=1 and CROW_GLM_CPU_LANE=split"), "{e}");
+        assert_eq!(stager_on(Some("1"), Some("1"), Some("split")), Ok(true), "the split lane runs with the stager");
     }
 
     /// the layer time of `nc` CPU ids out of `n` pinned ids, by the planner's own accounting
@@ -8226,7 +8380,7 @@ mod split_tests {
                         combos.push(if e < nc { lane::Combo::Cpu(phost.add(ps * rb)) } else { lane::Combo::Gpu(*t) });
                     }
                     cuda::to_u64_into(table, &tab);
-                    lane::post((nc > 0).then(|| lane::Call { table, combos, clock: clock.clone() }));
+                    lane::post((nc > 0).then(|| lane::Call { table, combos, clock: clock.clone(), ready: None }));
                     cuda::sync();
                     let t0 = std::time::Instant::now();
                     plan.run(&kn, &mk, &gk, &w, table, xd, yd);
@@ -8489,14 +8643,12 @@ impl Glm5Run {
         Ok(())
     }
 
-    /// the refusals of a batched step of `b` rows, by name: the CPU lane (its experts have other
-    /// bits than the GPU kernels the batch rows take) and too few staging slots
+    /// the refusals of a batched step of `b` rows, by name: too few staging slots. The CPU lane
+    /// runs every row's CPU combos in one pool run per row (`GpuMoePlan::experts_lane`), so a
+    /// row's bits are its solo row's when the same experts go to the CPU.
     pub fn batch_check(b: usize, tiers: &ExpertTiers, topk: usize) -> Result<(), String> {
         if b <= 1 {
             return Ok(());
-        }
-        if tiers.pinned_use.cpu_lane {
-            return Err(format!("{MAX_BATCH_ENV}={b} and {CPU_LANE_ENV}=1: the CPU lane's experts have other bits than the batch rows' GPU kernels, so a sequence's ids could differ from its solo run; turn one of them off"));
         }
         if tiers.stage_cap < b * topk {
             return Err(format!("{MAX_BATCH_ENV}={b}: the tiers hold {} staging slots, a step of {b} rows may stage {}; build ExpertTiers with stage_cap {b} x top-k", tiers.stage_cap, b * topk));

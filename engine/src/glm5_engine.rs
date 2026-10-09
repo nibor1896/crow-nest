@@ -1588,6 +1588,11 @@ mod tests_batch_gpu {
 
     /// a device of the synthetic model at `cap` rows with `slots` sequence slots
     unsafe fn device(path: &str, g: &Glm5Geo, cap: usize, slots: usize) -> Glm5Device {
+        device_sized(path, g, cap, slots, TierSizes { vram: 3, pinned: 4 })
+    }
+
+    /// [`device`] with the tier sizes per layer
+    unsafe fn device_sized(path: &str, g: &Glm5Geo, cap: usize, slots: usize, sizes: TierSizes) -> Glm5Device {
         let (spec, _) = crate::nvme_source::glm5_record_of_container(path).unwrap();
         let moe = MoeGeo::new(g, spec).unwrap();
         let mut cnq = Cnq::open_checked(path).unwrap();
@@ -1599,9 +1604,9 @@ mod tests_batch_gpu {
             None => std::env::remove_var(gt::MAX_BATCH_ENV),
         }
         run.set_slots(slots).unwrap();
-        let tiers = ExpertTiers::new(&cnq, path, g, &moe, TierSizes { vram: 3, pinned: 4 }, 1, slots * g.topk).unwrap();
+        let tiers = ExpertTiers::new(&cnq, path, g, &moe, sizes, 1, slots * g.topk).unwrap();
         let o = Opened { cnq, path: path.to_string(), g: *g, moe, spec, records: 0, constants: 0 };
-        let plan = TierPlan { vram_ceiling: 0, fixed_bytes: 0, unit_bytes: 0, hot: 3, pinned: 4, nvme: g.experts - 7 };
+        let plan = TierPlan { vram_ceiling: 0, fixed_bytes: 0, unit_bytes: 0, hot: sizes.vram, pinned: sizes.pinned, nvme: g.experts - sizes.vram - sizes.pinned };
         Glm5Device { o, run, tiers, plan, n_ctx: cap, kd: KdaDims::of(g) }
     }
 
@@ -1625,6 +1630,18 @@ mod tests_batch_gpu {
     #[ignore = "needs the GPU (about 4 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_batch_gpu -- --ignored --nocapture --test-threads 1"]
     fn glm5_batch_gpu_every_slot_is_its_solo_sequence() {
         batch_is_solo(&[]);
+    }
+
+    /// Cross-wiring 2: the CPU lane in a batched step (one pool run per row). With every expert
+    /// in pinned (V 0 + P 16 of 16) `CROW_GLM_CPU_LANE=1` gives every pick to the CPU in the solo
+    /// runs and in the batch, so every slot's ids and logits rows are its solo lane run's bits;
+    /// the batch's steps ran rows of several slots through the lane.
+    #[test]
+    #[ignore = "needs the GPU (about 4 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_batch_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_batch_gpu_every_slot_is_its_solo_sequence_with_the_cpu_lane() {
+        let lane = [("CROW_GLM_CPU_LANE", "1"), ("CROW_PINNED_ALLOC", "host")];
+        let _all = EnvGuard::set(&lane);
+        batch_is_solo_sized(&[], TierSizes { vram: 0, pinned: 16 }, true);
     }
 
     /// The batch test with the decode switches of the integration on the four-slot device only
@@ -1670,6 +1687,12 @@ mod tests_batch_gpu {
 
     /// the body of the batch tests: `together` is set while the four-slot device is built and runs
     pub(crate) fn batch_is_solo(together: &[(&str, &str)]) {
+        batch_is_solo_sized(together, TierSizes { vram: 3, pinned: 4 }, false);
+    }
+
+    /// [`batch_is_solo`] with the tier sizes; `lane`: the four-slot device's CPU lane must have
+    /// run batched steps
+    pub(crate) fn batch_is_solo_sized(together: &[(&str, &str)], sizes: TierSizes, lane: bool) {
         let g = geo();
         let s = synth_model(&g, REC);
         let prompts: Vec<Vec<i64>> = [5usize, 23, 11, 17].iter().enumerate().map(|(k, &n)| (0..n as i64).map(|i| (i * (31 + 2 * k as i64) + 7 * k as i64 + 1) % 2048).collect()).collect();
@@ -1678,7 +1701,7 @@ mod tests_batch_gpu {
         unsafe {
             let _ctx = cuda::Ctx::init();
             // alone
-            let mut e0 = Glm5Engine::new(device(&s.path, &g, cap, 1), true);
+            let mut e0 = Glm5Engine::new(device_sized(&s.path, &g, cap, 1, sizes), true);
             let mut want: Vec<(Vec<i64>, Vec<Vec<f32>>)> = Vec::new();
             for p in &prompts {
                 e0.reset();
@@ -1695,7 +1718,7 @@ mod tests_batch_gpu {
             drop(e0);
             // together
             let _env = EnvGuard::set(together);
-            let mut e = Glm5Engine::new(device(&s.path, &g, cap, 4), true);
+            let mut e = Glm5Engine::new(device_sized(&s.path, &g, cap, 4, sizes), true);
             assert_eq!(e.slots(), 4);
             let mut next = [0i64; 4];
             let mut got: Vec<(Vec<i64>, Vec<Vec<f32>>)> = vec![Default::default(); 4];
@@ -1724,6 +1747,11 @@ mod tests_batch_gpu {
                 }
             }
             assert_eq!(widest, 4, "a step carried every slot");
+            if lane {
+                let (_, experts, runs) = e.rows().tiers.cpu_lane_clock().read();
+                eprintln!("glm5_batch lane: {experts} CPU experts in {runs} pool runs");
+                assert!(experts > 0, "the CPU lane computed nothing");
+            }
             for k in 0..4 {
                 assert_eq!(got[k].0, want[k].0, "slot {k}: ids vs alone");
                 let bad: Vec<usize> = got[k].1.iter().zip(&want[k].1).enumerate().filter(|(_, (a, b))| !same_bits(a, b)).map(|(i, _)| i).collect();

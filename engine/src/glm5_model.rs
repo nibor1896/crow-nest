@@ -1046,13 +1046,22 @@ impl Glm5Pass {
                             if tb == 0 {
                                 return Err(format!("layer {}: {}: no record table for this layer", lw.layer, crate::glm5_flags::ENV_CONTROLLER));
                             }
+                            // the CPU lane: the MoE input row to the host before the request
+                            let lane = c.lane;
+                            if let Some(dl) = lane.as_ref() {
+                                dl.queue_x(self.collapsed, h);
+                            }
                             c.publish(lw.layer, p.ids, t * self.moe.topk, self.routed.as_ref().and_then(|r| r.guess_bufs()));
                             if self.overlap {
                                 // the shared expert while the controller serves the layer (bit-identical)
                                 p.shared_early(&self.kn.k, &self.kn.moe, w, self.collapsed);
                             }
                             c.wait_reply();
-                            p.experts(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub);
+                            match lane {
+                                // the GPU's combos, then the CPU's rows over theirs, then the combine
+                                Some(dl) => p.experts_merge(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub, &mut |ye| c.merge_lane(&dl, ye, h)),
+                                None => p.experts(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub),
+                            }
                             self.last_ffn_t = t;
                             self.mhc.expand(&self.kn.mhc, x, self.sub, x, t);
                             return Ok(());

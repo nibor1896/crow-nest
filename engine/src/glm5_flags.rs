@@ -247,6 +247,16 @@ extern "C" __global__ void glm5_ctl_publish(const int* __restrict__ ids, int n, 
         __threadfence_system();
     }}
 }}
+// CROW_GLM_CONTROLLER with the CPU lane: after the lane flag reached the request's number, the
+// rows the controller thread computed on the CPU (host-mapped y [k][h], mask [k]) replace their
+// combos' rows of ye; the GPU computed those combos from a dummy record
+extern "C" __global__ void glm5_lane_merge(float* ye, const volatile float* y, const volatile int* mask, long long h)
+{{
+    const int c = blockIdx.y;
+    if (mask[c] == 0) return;
+    for (long long i = blockIdx.x * (long long) blockDim.x + threadIdx.x; i < h; i += (long long) gridDim.x * blockDim.x)
+        ye[c * h + i] = y[c * h + i];
+}}
 // CROW_GLM_CONTROLLER: the stream waits until the reply word reaches the last request's number,
 // at most timeout_ns (then the number goes to the error word and the stream goes on)
 extern "C" __global__ void glm5_ctl_wait(const unsigned long long* ctr, volatile unsigned long long* reply, volatile unsigned long long* err, long long timeout_ns)
@@ -282,6 +292,7 @@ pub struct Kernels {
     pred_tag: CUfunction,
     ctl_publish: CUfunction,
     ctl_wait: CUfunction,
+    lane_merge: CUfunction,
 }
 
 impl Kernels {
@@ -289,7 +300,7 @@ impl Kernels {
     /// A CUDA context is current.
     pub unsafe fn new(g: &Glm5Geo) -> Kernels {
         let module = cuda::compile(&src(g));
-        Kernels { feed: module.get("glm5_feed"), publish: module.get("glm5_publish"), publish_pred: module.get("glm5_publish_pred"), pred_tag: module.get("glm5_pred_tag"), ctl_publish: module.get("glm5_ctl_publish"), ctl_wait: module.get("glm5_ctl_wait"), module }
+        Kernels { feed: module.get("glm5_feed"), publish: module.get("glm5_publish"), publish_pred: module.get("glm5_publish_pred"), pred_tag: module.get("glm5_pred_tag"), ctl_publish: module.get("glm5_ctl_publish"), ctl_wait: module.get("glm5_ctl_wait"), lane_merge: module.get("glm5_lane_merge"), module }
     }
 
     /// # Safety
@@ -1057,9 +1068,12 @@ pub struct Ctl {
     ctr: Dev,
     publish: CUfunction,
     wait: CUfunction,
+    merge: CUfunction,
     k: usize,
     /// per decoder layer: the record table its experts read (0: no MoE layer); set per row
     pub tables: Vec<Dev>,
+    /// the CPU lane under the controller (`ExpertTiers::dev_lane`); set per row, `None` = off
+    pub lane: Option<DevLaneDev>,
     /// rows of the pass go through the controller (set around a controlled row)
     pub active: bool,
     /// requests handed to controller jobs so far (the host's ring position)
@@ -1180,8 +1194,10 @@ impl Ctl {
             ctr,
             publish: kn.ctl_publish,
             wait: kn.ctl_wait,
+            merge: kn.lane_merge,
             k,
             tables: vec![0; layers],
+            lane: None,
             active: false,
             host_seq: 0,
             cancel: Default::default(),
@@ -1212,6 +1228,18 @@ impl Ctl {
         cuda::stream_query(cuda::cur_stream());
     }
 
+    /// The CPU lane under the controller, queued between the layer's GPU experts and its combine:
+    /// the device waits (bounded as [`Ctl::wait_reply`]) until the lane flag reaches the last
+    /// request's number, then the CPU's rows replace their combos' rows of `ye`.
+    ///
+    /// # Safety
+    /// [`Ctl::publish`] was queued before; `ye` is the layer plan's `[k][h]` expert outputs.
+    pub unsafe fn merge_lane(&self, dl: &DevLaneDev, ye: Dev, h: usize) {
+        launch_v(self.wait, 1, 1, 1, 1, &[self.ctr, dl.flag, self.reply.dev + 8, CTL_WAIT_NS]);
+        launch_v(self.merge, h.div_ceil(256) as u32, self.k as u32, 1, 256, &[ye, dl.y, dl.mask, h as u64]);
+        cuda::stream_query(cuda::cur_stream());
+    }
+
     /// the reader of the next `n` requests (the host's ring position moves past them)
     pub fn reader(&mut self, n: usize) -> RingReader {
         self.cancel.store(false, std::sync::atomic::Ordering::Release);
@@ -1225,6 +1253,11 @@ impl Ctl {
         };
         self.host_seq += n as u64;
         r
+    }
+
+    /// no request was handed to a job yet (a controller made by the last `set_switches`)
+    pub fn fresh(&self) -> bool {
+        self.host_seq == 0
     }
 
     /// a row the host enqueued only in part: its job stops waiting
@@ -1244,6 +1277,123 @@ impl Ctl {
         self.ring.free();
         self.reply.free();
         cuda::free_dev(&mut self.ctr);
+    }
+}
+
+/// `CROW_GLM_CONTROLLER` with `CROW_GLM_CPU_LANE`: the device addresses a controlled row's MoE
+/// layer needs (copied into [`Ctl::lane`] per row)
+#[derive(Clone, Copy, Debug)]
+pub struct DevLaneDev {
+    /// host address of the x row (the compute stream copies the MoE input there before publish)
+    pub x_host: u64,
+    /// mapped: the lane flag (u64), the mask (`[k]` i32), the CPU rows (`[k][h]` f32)
+    pub flag: Dev,
+    pub mask: Dev,
+    pub y: Dev,
+}
+
+impl DevLaneDev {
+    /// queue the MoE input row `x` (`h` f32) to the host before the layer's request is published
+    ///
+    /// # Safety
+    /// `x` holds the row; nothing reads the host row until the request is seen.
+    pub unsafe fn queue_x(&self, x: Dev, h: usize) {
+        cuda::ck(sys::cuMemcpyDtoHAsync_v2(self.x_host as *mut std::ffi::c_void, x, h * 4, cuda::cur_stream()));
+    }
+}
+
+const DL_MASK: usize = 64;
+const DL_X: usize = 4096;
+
+/// `CROW_GLM_CONTROLLER` with `CROW_GLM_CPU_LANE`: the CPU lane of a controlled row (sybil's nv2
+/// CPU job: the controller thread hands the lanes out, the device masks the CPU's picks and its
+/// combine waits for the CPU's partial). The host enqueues a whole row without knowing the
+/// routing, so the GPU computes every combo; the controller thread points the table entries of
+/// the CPU's experts at a zeroed VRAM record (no PCIe read), writes the reply, computes the CPU's
+/// experts from their pinned records on the MoE input row the device copied to the host, and
+/// raises the lane flag; the device waits for it before the combine and copies the CPU's rows
+/// over those combos (`Ctl::merge_lane`). Same rows as the host lane (`GpuMoePlan::experts_lane`):
+/// the GPU combos' bits of the GPU path, the CPU combos' of `cpu_mul1::experts_ffn` over the same
+/// list in pick order.
+pub struct DevLane {
+    buf: Pinned,
+    /// one zeroed record in VRAM: the table entry of every combo the CPU computes
+    pub dummy: Dev,
+    k: usize,
+    h: usize,
+}
+
+impl DevLane {
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn new(k: usize, h: usize, record_bytes: u64) -> DevLane {
+        assert!(k * 4 <= DL_X - DL_MASK);
+        let buf = Pinned::alloc(DL_X + h * 4 + k * h * 4);
+        std::ptr::write_bytes(buf.host as *mut u8, 0, buf.bytes);
+        let dummy = cuda::alloc_zeroed(record_bytes as usize);
+        DevLane { buf, dummy, k, h }
+    }
+
+    pub fn dev(&self) -> DevLaneDev {
+        DevLaneDev { x_host: self.buf.host as u64 + DL_X as u64, flag: self.buf.dev, mask: self.buf.dev + DL_MASK as u64, y: self.buf.dev + (DL_X + self.h * 4) as u64 }
+    }
+
+    /// Serve request `q` on the host: the combos `cpu` (combo index in pick order, pinned record)
+    /// through `cpu_mul1::experts_ffn` on the x row, their rows into `y`, the mask, then the flag
+    /// to `q` (also with no CPU combo: the device waits for it on every layer).
+    ///
+    /// # Safety
+    /// The device published request `q` (so the x row is in place and the last merge ran); every
+    /// record is readable (the moves that put it there are done).
+    pub unsafe fn serve(&self, q: u64, cpu: &[(usize, *const u8)], geo: &crate::glm5_moe::MoeGeo, clock: &crate::glm5_moe::lane::Clock) {
+        let (h, k) = (self.h, self.k);
+        let base = self.buf.host as *mut u8;
+        let mask = std::slice::from_raw_parts_mut(base.add(DL_MASK) as *mut i32, k);
+        mask.fill(0);
+        if !cpu.is_empty() {
+            let t0 = std::time::Instant::now();
+            let rb = geo.record.bytes as usize;
+            let es: Vec<crate::cpu_mul1::Mul1Expert> = cpu
+                .iter()
+                .map(|&(c, rec)| {
+                    crate::cpu_mul1::Mul1Expert::from_record(std::slice::from_raw_parts(rec, rb), h, geo.expert_inter, geo.bitrate)
+                        .unwrap_or_else(|e| panic!("glm5 controller CPU lane: combo {c}: {e}"))
+                })
+                .collect();
+            let xs = std::slice::from_raw_parts(base.add(DL_X) as *const f32, h);
+            let mut ys = vec![0f32; cpu.len() * h];
+            let limit = geo.swiglu_limit;
+            crate::cpu_mul1::experts_ffn(&es, xs, &mut ys, &move |a, b| crate::glm5_moe::swiglu_clamp(a, b, limit), crate::glm5_moe::lane::threads(), crate::cpu_mul1::Path::Auto);
+            let y = base.add(DL_X + h * 4) as *mut f32;
+            for (i, &(c, _)) in cpu.iter().enumerate() {
+                std::ptr::copy_nonoverlapping(ys.as_ptr().add(i * h), y.add(c * h), h);
+                mask[c] = 1;
+            }
+            clock.add(t0.elapsed(), cpu.len());
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        std::ptr::write_volatile(base as *mut u64, q);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// after a failure: every lane wait of the device passes from now on
+    pub fn release(&self) {
+        // SAFETY: the live mapped flag word
+        unsafe { std::ptr::write_volatile(self.buf.host as *mut u64, u64::MAX) };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// back to a fresh controller (its counter restarts at 0 with new switches)
+    pub fn reset(&self) {
+        // SAFETY: the live mapped flag word
+        unsafe { std::ptr::write_volatile(self.buf.host as *mut u64, 0) };
+    }
+
+    /// # Safety
+    /// No launch reading the lane is pending.
+    pub unsafe fn free(&mut self) {
+        self.buf.free();
+        cuda::free_dev(&mut self.dummy);
     }
 }
 
@@ -1804,7 +1954,7 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
     // ---------------------------------------------------------------- #149 path B: the stager
 
     #[test]
-    fn the_stager_switch_needs_the_flags_and_refuses_the_cpu_lane() {
+    fn the_stager_switch_needs_the_flags_and_takes_the_cpu_lane() {
         use crate::glm5_tiers::stager_on;
         assert_eq!(stager_on(None, None, None), Ok(false));
         for v in ["0", "", "on", "true", " 1", "2"] {
@@ -1816,8 +1966,9 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
             let e = stager_on(Some("1"), flags, None).unwrap_err();
             assert!(e.starts_with("CROW_GLM_STAGER=1 needs CROW_GLM_FLAGS=1"), "{e}");
         }
-        let e = stager_on(Some("1"), Some("1"), Some("1")).unwrap_err();
-        assert!(e.starts_with("CROW_GLM_STAGER=1 and CROW_GLM_CPU_LANE=1"), "{e}");
+        // the CPU lane reads its records after the stager's moves (integration, cross-wiring 2)
+        assert_eq!(stager_on(Some("1"), Some("1"), Some("1")), Ok(true));
+        assert_eq!(stager_on(Some("1"), Some("1"), Some("split")), Ok(true));
         // what the plan books for the stager: GLM-5.3-Flash, 42 MoE layers x 288, the 3-bit record, top-8
         let g = Glm5Geo::GLM_5_3_FLASH;
         assert_eq!(crate::glm5_tiers::stager_pinned_bytes(g.moe_layers(), g.experts, g.topk, 9_474_048), 75_988_992);
