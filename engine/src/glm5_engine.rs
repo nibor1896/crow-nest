@@ -1269,6 +1269,9 @@ pub mod fake {
         logits: Vec<f32>,
         /// a row at this position fails (an NVMe read error, say)
         pub fail_at: Option<usize>,
+        /// an allocation of a row at this position fails (`cuda::AllocFailed::raise`: inside a
+        /// request scope the `AllocFailed` panic `serve` answers with a 503)
+        pub alloc_fail_at: Option<usize>,
         /// rows run, heads run
         pub rows_run: usize,
         pub heads_run: usize,
@@ -1287,7 +1290,7 @@ pub mod fake {
         /// `slots` sequences (`CROW_GLM_MAX_BATCH`)
         pub fn with_slots(n_ctx: usize, vocab: usize, cands: Vec<u32>, slots: usize) -> FakeRows {
             let parked = (0..slots).map(|i| if i == 0 { (0, Vec::new(), Vec::new()) } else { (0, vec![-1; n_ctx], vec![0.0; vocab]) }).collect();
-            FakeRows { n_ctx, vocab, cands, state: 0, mla: vec![-1; n_ctx], logits: vec![0.0; vocab], fail_at: None, rows_run: 0, heads_run: 0, parked, cur: 0, batches: Vec::new() }
+            FakeRows { n_ctx, vocab, cands, state: 0, mla: vec![-1; n_ctx], logits: vec![0.0; vocab], fail_at: None, alloc_fail_at: None, rows_run: 0, heads_run: 0, parked, cur: 0, batches: Vec::new() }
         }
     }
 
@@ -1314,6 +1317,9 @@ pub mod fake {
         unsafe fn row(&mut self, tok: i64, pos: usize, head: bool) -> Result<Option<i64>, String> {
             if self.fail_at == Some(pos) {
                 return Err(format!("fake: row {pos} failed"));
+            }
+            if self.alloc_fail_at == Some(pos) {
+                crate::cuda::AllocFailed { what: format!("fake: the buffer of row {pos}"), bytes: 1 << 20, free: 0, result: "CUDA_ERROR_OUT_OF_MEMORY".into() }.raise();
             }
             self.rows_run += 1;
             self.mla[pos] = tok;

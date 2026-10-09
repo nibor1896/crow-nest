@@ -6148,17 +6148,37 @@ impl ServeEngine for GlmConsts {
 /// - `CROW_GLM_MAX_BATCH`: a request thread's message to the scheduler (the engine's thread)
 enum GlmCmd {
     /// a free slot (the one whose prompt snapshot serves the prompt best) and its prompt phase
-    Begin { prompt: Vec<i64>, reply: std::sync::mpsc::Sender<Result<(usize, GlmBegun), String>> },
+    Begin { prompt: Vec<i64>, reply: std::sync::mpsc::Sender<Result<(usize, GlmBegun), GlmFail>> },
     /// the slot's logits row of its last head
     Logits { slot: usize, reply: std::sync::mpsc::Sender<Vec<f32>> },
     /// the id fed at the slot's held position; the reply (the next greedy id) comes after the
     /// batched step that carried it
-    Decode { slot: usize, id: i64, reply: std::sync::mpsc::Sender<Result<i64, String>> },
+    Decode { slot: usize, id: i64, reply: std::sync::mpsc::Sender<Result<i64, GlmFail>> },
     Counters { reply: std::sync::mpsc::Sender<([u64; 3], u64)> },
     /// `/slots`: the furthest prompt snapshot of any slot
     SnapPos { reply: std::sync::mpsc::Sender<Option<usize>> },
     /// the request is done with its slot (its ids and snapshot stay for the next prompt)
     End { slot: usize },
+}
+
+/// - `CROW_GLM_MAX_BATCH`: why an engine call on the scheduler's thread failed: an engine
+///   failure (`Err` of the one-sequence path) or an allocation (the one-sequence path's 503;
+///   `GlmSlotSeq` raises it again on the request's thread, where `GlmBatchDoor` answers it)
+#[derive(Clone)]
+enum GlmFail {
+    Engine(String),
+    Alloc(crow_nest_engine::cuda::AllocFailed),
+}
+
+impl GlmFail {
+    /// the request thread's side: an engine failure is an `Err`, an allocation the
+    /// `AllocFailed` panic `glm_guarded` catches in the one-sequence path
+    fn raise(self) -> String {
+        match self {
+            GlmFail::Engine(e) => e,
+            GlmFail::Alloc(af) => std::panic::panic_any(af),
+        }
+    }
 }
 
 /// - `CROW_GLM_MAX_BATCH`: one request's sequence slot, driven over the scheduler's channel
@@ -6196,7 +6216,7 @@ impl GlmSeq for GlmSlotSeq {
             let _ = self.tx.send(GlmCmd::End { slot: s });
         }
         let prompt = prompt.to_vec();
-        let (slot, b) = self.ask(|reply| GlmCmd::Begin { prompt, reply }).ok_or_else(|| GLM_SCHED_GONE.to_string())??;
+        let (slot, b) = self.ask(|reply| GlmCmd::Begin { prompt, reply }).ok_or_else(|| GLM_SCHED_GONE.to_string())?.map_err(GlmFail::raise)?;
         self.slot = Some(slot);
         Ok(b)
     }
@@ -6206,7 +6226,7 @@ impl GlmSeq for GlmSlotSeq {
     }
     unsafe fn decode_step(&mut self, id: i64) -> Result<i64, String> {
         let slot = self.slot.ok_or_else(|| "glm5: a decode step before the prompt phase".to_string())?;
-        self.ask(|reply| GlmCmd::Decode { slot, id, reply }).ok_or_else(|| GLM_SCHED_GONE.to_string())?
+        self.ask(|reply| GlmCmd::Decode { slot, id, reply }).ok_or_else(|| GLM_SCHED_GONE.to_string())?.map_err(GlmFail::raise)
     }
     fn counters(&mut self) -> ([u64; 3], u64) {
         self.ask(|reply| GlmCmd::Counters { reply }).unwrap_or_default()
@@ -6225,17 +6245,17 @@ impl Drop for GlmSlotSeq {
 }
 
 /// - `CROW_GLM_MAX_BATCH`: an engine call on the scheduler's thread, guarded as `glm_guarded`
-///   guards a request: a failed allocation is an `Err` that names it (the caller resets the
-///   slots involved), any other panic is re-raised
-fn glm_sched_guarded<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+///   guards a request: a failed allocation is a `GlmFail::Alloc` (the caller resets the slots
+///   involved, the request answers 503), any other panic is re-raised
+fn glm_sched_guarded<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, GlmFail> {
     let caught = {
         let _scope = crow_nest_engine::cuda::RequestScope::new();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
     };
     match caught {
-        Ok(r) => r,
+        Ok(r) => r.map_err(GlmFail::Engine),
         Err(p) => match p.downcast::<crow_nest_engine::cuda::AllocFailed>() {
-            Ok(af) => Err(format!("{}. The request was dropped and the engine is up; retry with a shorter prompt", af.message())),
+            Ok(af) => Err(GlmFail::Alloc(*af)),
             Err(p) => std::panic::resume_unwind(p),
         },
     }
@@ -6256,8 +6276,8 @@ fn glm_schedule<R: Rows>(eng: &mut Glm5Engine<R>, rx: std::sync::mpsc::Receiver<
     use std::sync::mpsc::RecvTimeoutError;
     let n = eng.slots();
     let mut busy = vec![false; n];
-    let mut waiting: VecDeque<(Vec<i64>, std::sync::mpsc::Sender<Result<(usize, GlmBegun), String>>)> = VecDeque::new();
-    let mut pending: Vec<Option<(i64, std::sync::mpsc::Sender<Result<i64, String>>)>> = (0..n).map(|_| None).collect();
+    let mut waiting: VecDeque<(Vec<i64>, std::sync::mpsc::Sender<Result<(usize, GlmBegun), GlmFail>>)> = VecDeque::new();
+    let mut pending: Vec<Option<(i64, std::sync::mpsc::Sender<Result<i64, GlmFail>>)>> = (0..n).map(|_| None).collect();
     let mut first: Option<Instant> = None;
     let mut stopping: Option<Instant> = None;
     let mut closed = false;
@@ -6290,7 +6310,7 @@ fn glm_schedule<R: Rows>(eng: &mut Glm5Engine<R>, rx: std::sync::mpsc::Receiver<
                         first.get_or_insert_with(Instant::now);
                         pending[slot] = Some((id, reply));
                     } else {
-                        let _ = reply.send(Err(format!("glm5: a decode step on sequence slot {slot}, which no request holds")));
+                        let _ = reply.send(Err(GlmFail::Engine(format!("glm5: a decode step on sequence slot {slot}, which no request holds"))));
                     }
                 }
                 GlmCmd::Counters { reply } => {
@@ -6335,7 +6355,7 @@ fn glm_schedule<R: Rows>(eng: &mut Glm5Engine<R>, rx: std::sync::mpsc::Receiver<
         let active = busy.iter().filter(|&&b| b).count();
         let ready = pending.iter().filter(|p| p.is_some()).count();
         if ready > 0 && (ready == active || first.is_some_and(|t| t.elapsed() >= GLM_BATCH_GATHER)) {
-            let taken: Vec<(usize, i64, std::sync::mpsc::Sender<Result<i64, String>>)> =
+            let taken: Vec<(usize, i64, std::sync::mpsc::Sender<Result<i64, GlmFail>>)> =
                 pending.iter_mut().enumerate().filter_map(|(s, p)| p.take().map(|(id, reply)| (s, id, reply))).collect();
             first = None;
             let steps: Vec<(usize, i64)> = taken.iter().map(|t| (t.0, t.1)).collect();
@@ -6520,10 +6540,30 @@ impl GlmDoor for GlmBatchDoor {
         rx.recv().ok().flatten()
     }
     fn chat(&mut self, stream: &mut TcpStream, body: &[u8]) -> &'static str {
+        let tk = match crow_nest_engine::tokenizer::global() {
+            Ok(t) => t,
+            Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(e)),
+        };
         let sh = &*self.shared;
-        let mut seq = GlmSlotSeq::new(self.tx.clone(), sh.vocab, sh.layers);
-        let mut head_sent = false;
-        glm_chat_on(stream, &mut seq, &sh.book, sh.markup, sh.n_ctx, &mut head_sent, body)
+        glm_batch_guarded(stream, |stream, head_sent| {
+            let mut seq = GlmSlotSeq::new(self.tx.clone(), sh.vocab, sh.layers);
+            glm_chat_on(stream, tk, &mut seq, &sh.book, sh.markup, sh.n_ctx, head_sent, body)
+        })
+    }
+}
+
+/// - `CROW_GLM_MAX_BATCH`: `glm_guarded` for a request thread: an allocation that failed on the
+///   scheduler's thread comes back as the `AllocFailed` panic of `GlmSlotSeq` (the scheduler
+///   reset the slots), and is the 503 of the one-sequence path; any other panic is re-raised
+fn glm_batch_guarded(stream: &mut TcpStream, f: impl FnOnce(&mut TcpStream, &mut bool) -> &'static str) -> &'static str {
+    let mut head_sent = false;
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut *stream, &mut head_sent)));
+    match caught {
+        Ok(status) => status,
+        Err(p) => match p.downcast::<crow_nest_engine::cuda::AllocFailed>() {
+            Ok(af) => glm_alloc_503(stream, head_sent, &af),
+            Err(p) => std::panic::resume_unwind(p),
+        },
     }
 }
 
@@ -6641,13 +6681,20 @@ where
         Ok(af) => *af,
         Err(p) => std::panic::resume_unwind(p),
     };
+    unsafe { srv.eng.reset() };
+    glm_alloc_503(stream, srv.stream_head_sent, &failed)
+}
+
+/// - #185 part 2: the answer to an allocation that failed inside a request (the engine is back
+///   to a cold start): the line, then a 503 that names the allocation (an SSE error frame once
+///   the head left)
+fn glm_alloc_503(stream: &mut TcpStream, head_sent: bool, failed: &crow_nest_engine::cuda::AllocFailed) -> &'static str {
     tracing::info!(target: "serve",
         "[serve] the request was dropped: {} - the engine stays up, the next request is served",
         failed.message()
     );
-    unsafe { srv.eng.reset() };
     let body = error_json(&format!("{}. The request was dropped and the engine is up; retry with a shorter prompt", failed.message()));
-    glm_fail(stream, srv.stream_head_sent, "503 Service Unavailable", body)
+    glm_fail(stream, head_sent, "503 Service Unavailable", body)
 }
 
 /// - #185 part 2: an error after the request was accepted: a JSON answer while no head left the
@@ -6709,14 +6756,20 @@ fn glm_request(
 }
 
 fn glm_chat_route<R: Rows>(stream: &mut TcpStream, srv: &mut GlmSrv<R>, body: &[u8]) -> &'static str {
+    let tk = match crow_nest_engine::tokenizer::global() {
+        Ok(t) => t,
+        Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(e)),
+    };
     let GlmSrv { eng, markup, n_ctx, stream_head_sent, book, .. } = srv;
-    glm_chat_on(stream, &mut **eng, book, *markup, *n_ctx, stream_head_sent, body)
+    glm_chat_on(stream, tk, &mut **eng, book, *markup, *n_ctx, stream_head_sent, body)
 }
 
 /// - #185 part 2: one glm5_next chat request on `seq` (the engine, or a sequence slot of the
 ///   `CROW_GLM_MAX_BATCH` scheduler): the request, the SSE head or the document
+#[allow(clippy::too_many_arguments)]
 fn glm_chat_on(
     stream: &mut TcpStream,
+    tk: &crow_nest_engine::tokenizer::ChatTokenizer,
     seq: &mut dyn GlmSeq,
     book: &std::sync::Mutex<GlmBook>,
     markup: Markup,
@@ -6724,10 +6777,6 @@ fn glm_chat_on(
     stream_head_sent: &mut bool,
     body: &[u8],
 ) -> &'static str {
-    let tk = match crow_nest_engine::tokenizer::global() {
-        Ok(t) => t,
-        Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(e)),
-    };
     let (req, ids) = match glm_request(tk, seq.consts().vocab(), markup, n_ctx, body) {
         Ok(x) => x,
         Err((status, e)) => return respond_json(stream, status, &error_json(&e)),
@@ -11675,5 +11724,59 @@ Red is #FF0000."), "{off}");
         assert_eq!(got2[0].0, w2.0, "the warm turn streams the cold re-prefill's answer");
         assert_eq!(eng.history_of(got2[0].3), w2.3.as_slice());
         assert_eq!(got2[1].0, want[3].0, "request 4 again: the same answer");
+    }
+
+    /// `CROW_GLM_MAX_BATCH`: an allocation that fails on the scheduler's thread is the
+    /// one-sequence path's 503 that names it: in the prompt phase and in a decode step, as a
+    /// JSON document before the head and as an SSE error frame after it; the slot goes cold and
+    /// the next request is served. (Red before: the request thread answered 500.)
+    #[test]
+    fn glm_batch_alloc_failure_is_a_503_and_the_engine_stays_up() {
+        let Some(tk) = glm_tk() else { return };
+        let cands = glm_fake(&tk, 4096).cands;
+        let mut eng = Glm5Engine::new(FakeRows::with_slots(4096, GLM_VOCAB, cands, 2), true);
+        let book = std::sync::Mutex::new(GlmBook::new(eng.counters()));
+        let doc = serde_json::json!({ "messages": [{ "role": "user", "content": "hello" }], "temperature": 0, "max_tokens": 8 });
+        let mut sse = doc.clone();
+        sse["stream"] = serde_json::json!(true);
+        let (_, ids) = glm_request(&tk, GLM_VOCAB, Markup::Glm, 4096, doc.to_string().as_bytes()).unwrap();
+        let p = ids.len();
+        // one request through `glm_batch_guarded` + `glm_chat_on` on a loopback socket: the
+        // status and what the client read
+        let mut one = |fail: Option<usize>, body: &serde_json::Value| -> (&'static str, String) {
+            eng.rows_mut().alloc_fail_at = fail;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+            let (mut server, _) = l.accept().unwrap();
+            let r = std::thread::scope(|sc| {
+                let (tk, book, body) = (&tk, &book, body.to_string());
+                let h = sc.spawn(move || {
+                    let status = glm_batch_guarded(&mut server, |stream, head_sent| {
+                        let mut seq = GlmSlotSeq::new(tx, GLM_VOCAB, 45);
+                        glm_chat_on(stream, tk, &mut seq, book, Markup::Glm, 4096, head_sent, body.as_bytes())
+                    });
+                    let _ = server.shutdown(Shutdown::Write);
+                    status
+                });
+                glm_schedule(&mut eng, rx, &|| false);
+                h.join().unwrap()
+            });
+            let mut text = String::new();
+            client.read_to_string(&mut text).unwrap();
+            (r, text)
+        };
+        for (what, fail, body) in [("prompt phase", 3, &doc), ("decode step", p + 2, &doc)] {
+            let (status, text) = one(Some(fail), body);
+            assert!(status.starts_with("503") && text.starts_with("HTTP/1.1 503"), "{what}: {status} {text}");
+            assert!(text.contains(&format!("fake: the buffer of row {fail}")) && text.contains("the engine is up"), "{what}: {text}");
+        }
+        let (status, text) = one(Some(p + 2), &sse);
+        assert!(status.contains("SSE error frame") && text.starts_with("HTTP/1.1 200"), "{status} {text}");
+        assert!(text.contains("fake: the buffer of row") && text.contains("[DONE]"), "{text}");
+        // the failed request's slot went cold; the engine serves the next one
+        let (status, text) = one(None, &doc);
+        assert!(status.starts_with("200") && text.starts_with("HTTP/1.1 200"), "{status} {text}");
+        assert!(text.contains("\"completion_tokens\":8"), "{text}");
     }
 }
