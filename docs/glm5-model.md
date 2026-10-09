@@ -97,6 +97,13 @@ target/release/decode glmgolden ../models/GLM-5.3-Flash-step06/ref-fp8 [--chain]
 - Both modes print `1 - cos` of the layer output by depth and flag a monotone rise (#161's failure
   mode). When the last layer runs and the golden has `logits-anchor-<p>.f32`, the head's logits are
   compared per anchor, with the greedy id.
+- **Head of every row** (#165): when the golden carries the runner's `--capture-head` files
+  (`head-mean`, `head-norm`, `head-logits.f32`), the head (`run_head`: stream mean + final norm,
+  BF16 lm_head GEMV, argmax) runs over all N rows. Per row group: the final norm and the logits get
+  cosine, max_abs, rel_rms and the G3 verdict; `top-1` counts the rows whose greedy id equals the
+  golden's (first index of the maximum) and lists the others with the golden logit gap. The stream
+  mean is fused into the norm kernel, so its line is the host mean of the head's input against
+  `head-mean.f32`, reported, not judged (golden-fed it checks the golden's own consistency).
 - The taps synchronize after every stage: the seconds printed are no speed figure.
 
 ## 5. Tests (host, no GPU)
@@ -105,6 +112,32 @@ target/release/decode glmgolden ../models/GLM-5.3-Flash-step06/ref-fp8 [--chain]
 refusals by name, the load decodes (NVFP4 -> f32 / BF16 with the inexact count, the 0x7F rewrite),
 the trunk input, the shared compile, the manifest and call split, the metrics and overlaps.
 `manager::tests_159_glm_plan::the_glm_plan_books_kv_b_decoded_to_bf16` holds the planner line.
+
+### G3 on all 45 layers and the head (2026-10-09, RTX 5090)
+
+Goldens `models/GLM-5.3-Flash-step06/ref-mul1-all` (runner on the same 3-bit container, all 45 layers,
+`--capture-subblocks --capture-head`, record `runs/glm53-flash/step06/golden-mul1-all.json`):
+
+```
+target/release/decode glmgolden <crow-nest>/models/GLM-5.3-Flash-step06/ref-mul1-all --cnq <crow-nest>/converter/GLM-5.3-Flash-MUL1K3.cnq [--chain]
+```
+
+- **Golden-fed** (`models/glm-g3-all.txt`, rc 0, 1 m 43 s): `glmgolden: ALL PASS (0 of 549 G3 rows failed)`
+  (45 layers × 2 sites × 3 roles × 2 row groups, head norm and logits × 2 groups, 5 anchors). Every KDA
+  row group (dense and MoE) prints cosine 1.000000000. The only row groups below are the DSA layers'
+  `attn out` and `attn expanded` (22 each); the lowest is l31 attn out, decode rows, 0.999987255
+  (worst row 89 0.999985368, max_abs 4.61e-3), next l31 prompt 0.999988084 and l35 prompt 0.999990027;
+  attributed, not isolated, to the engine's MLA `kv_b` decoded to BF16 (section 2; the golden keeps
+  f32). Routing top-8 overlap
+  1.0000 (90 / 90 rows) on all 42 MoE layers, DSA selection 1.0000 (90 / 90) on all 11 DSA layers.
+  1-cos of the layer output 4.6e-14 … 6.0e-13 at every depth. Head: norm cosine 1.000000000
+  (max_abs 2.86e-6), logits 1.000000000 (max_abs 7.63e-6 prompt, 4.77e-6 decode), top-1 90 / 90.
+- **`--chain`** (`models/glm-g3-all-chain.txt`, reported, not gated): 1-cos of the layer output
+  rises from 1e-11 (l0–l2) to 4.1e-6 (l3), 1.3e-4 (l8), 2.7e-3 (l18), peaks at 3.83e-2 (l32) and is
+  1.26e-2 at l44. Routing overlap falls from 0.9972 (l3) to 0.8833 (l34, 32 / 90 rows the same set);
+  DSA selection stays 90 / 90 on every DSA layer. Head: logits cosine 0.99316 (prompt) / 0.99226
+  (decode), top-1 83 / 90 (the 7 misses are prompt rows, golden logit gaps 0.022–0.179); the 5
+  anchors' greedy ids all equal the golden's.
 
 ## 6. Three tiers, token by token (`glm5_tiers`, `glm5_run`)
 
@@ -171,10 +204,9 @@ criterion, `docs/architecture.md` A9; not run yet).
 
 ## 7. Not verified
 
-- Any GPU run of the path: the per-layer G3 table on layers 0–3 (golden-fed and `--chain`) awaits
-  robin's Go. The goldens come from the FP8 originals, the engine reads the 3-bit container, so the
-  table holds the quantisation error as well (step 6 measured container vs FP8 at cosine
-  0.99308–0.99806 for layers 0–3 on the 4.5-bit container).
-- Layers 4–44 and the logits: no golden yet.
-- Speed, graph capture, the boot (step 14), MTP (step 21), vision (step 20).
+- Whether the `--chain` drift (routing flips compounding f32 rounding over depth) is the size HF's own
+  f32 model shows under a 1e-7 perturbation: no such reference run exists.
+- The goldens hold the 3-bit weights; the quantisation error against FP8 is measured for layers 0–3
+  only (runner doc section 7). `pre` is not compared. MTP (layer 45, step 21), vision (step 20).
+- Speed, graph capture, the boot (#175, #149, step 14): the taps synchronize.
 - `glm5_run` and the cache-size logits test on the real container (section 6): built, not run.

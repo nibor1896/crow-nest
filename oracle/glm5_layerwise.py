@@ -41,6 +41,11 @@ With --capture-subblocks (crow-nest #156, the golden harness of #161), per layer
   l<k>-<s>-out.f32          [N][H]          the sub-layer's output y (self_attn / mlp), the expand's input
 The expanded outputs are not written twice: attn's is l<k>-ffn_hc-in.f32, ffn's is l<k>-output.f32
 (manifest `subblocks`, per layer and site, maps each role to its file).
+With --capture-head (crow-nest #165), when the pass reaches the last layer, the head at EVERY row:
+  head-mean.f32             [N][H]          the final stream collapse (Glm5NextTextHyperHead: the unweighted mean)
+  head-norm.f32             [N][H]          the final RMSNorm of it (the lm_head's input)
+  head-logits.f32           [N][V]          the logits of every row
+(manifest `head` maps mean / norm / logits to these files; the anchor files are written as without it).
 Rows 0..T-1 are the prompt, rows T..N-1 the decode steps (teacher-forced, one row per call).
 The prompt runs in calls of --prompt-chunk rows against the layer's cache (crow-nest #147): KDA carries
 its conv and recurrent state, the DSA slot appends K/V and indexer keys in place into N preallocated
@@ -317,7 +322,8 @@ def _rss():
 
 
 def run_layerwise(ws, tc, ids, n_decode, out_dir, start=0, stop=None, anchors=None, state_dtype="f32",
-                  log=print, extra=None, prompt_chunk=None, delete_states_behind=False, capture_subblocks=False):
+                  log=print, extra=None, prompt_chunk=None, delete_states_behind=False, capture_subblocks=False,
+                  capture_head=False):
     """ids: list[int] of N tokens, the last n_decode run as decode rows. Writes the files of the
     module docstring into out_dir and returns the manifest dict.
     prompt_chunk: prompt rows per call (None / 0 = all T rows in one call).
@@ -325,7 +331,9 @@ def run_layerwise(ws, tc, ids, n_decode, out_dir, start=0, stop=None, anchors=No
     last layer's after the pass); routing, DSA top-k, embed, logits and the manifest stay.
     capture_subblocks (crow-nest #156): also write the mHC sub-block files of every layer run (module
     docstring) and map them in manifest `subblocks`; needs the f32 states it points at, so not with
-    state_dtype bf16 or delete_states_behind."""
+    state_dtype bf16 or delete_states_behind.
+    capture_head (crow-nest #165): when stop == L, also write the head's stream mean, final norm and logits
+    of every row (module docstring) and map them in manifest `head`."""
     assert state_dtype in ("f32", "bf16"), state_dtype
     if capture_subblocks and (state_dtype != "f32" or delete_states_behind):
         raise ValueError("capture_subblocks needs f32 states kept on disk (ffn's expanded output is l<k>-output.f32)")
@@ -382,7 +390,7 @@ def run_layerwise(ws, tc, ids, n_decode, out_dir, start=0, stop=None, anchors=No
             for key in ("ids", "T", "D", "state_dtype", "num_hidden_layers"):
                 assert old[key] == man[key], f"--layers {start}:{stop}: {key} differs from {mp}"
             assert old["weights"]["index_json_sha256"] == man["weights"]["index_json_sha256"],                 f"--layers {start}:{stop}: other weights than {mp}"
-            files.update({k: v for k, v in old["files"].items() if not k.startswith("logits-")})
+            files.update({k: v for k, v in old["files"].items() if not k.startswith(("logits-", "head-"))})
             man["per_layer"] = [r for r in old["per_layer"] if r["layer"] < start]
             man["layers"] = [old["layers"][0], stop]
             man["deleted_states"] = [d for d in old.get("deleted_states", [])
@@ -455,20 +463,38 @@ def run_layerwise(ws, tc, ids, n_decode, out_dir, start=0, stop=None, anchors=No
             + (f"  ({len(call_s)} prompt calls)" if len(call_s) > 1 else "")
             + (f"  rss {rss_load:.2f} GiB" if rss_load else ""))
 
-    if stop == L and anchors:
+    head = capture_head and stop == L
+    if stop == L and (anchors or head):
         norm = G.build_meta(Glm5NextTextRMSNorm, H, tc.rms_norm_eps)
         ws.load(norm, f"{G.LM}norm.")
         with torch.no_grad():
-            h = norm(x[anchors].mean(dim=1))  # hc_head = mean over the streams, then norm (:1493, :298-302)
+            h = norm(x[anchors].mean(dim=1)) if anchors else None  # hc_head = mean over the streams, then norm (:1493, :298-302)
+            if head:  # every row, the same two ops; the anchor rows above stay their own call (byte-identical files)
+                hm = x.mean(dim=1)
+                hn = norm(hm)
             V = ws.n_rows("lm_head.weight")
             logits = torch.empty(len(anchors), V)
+            hl = torch.empty(N, V) if head else None
             for r0 in range(0, V, LM_HEAD_CHUNK):
                 r1 = min(V, r0 + LM_HEAD_CHUNK)
-                logits[:, r0:r1] = h @ ws.rows("lm_head.weight", r0, r1).T
+                w = ws.rows("lm_head.weight", r0, r1)
+                if anchors:
+                    logits[:, r0:r1] = h @ w.T
+                if head:
+                    hl[:, r0:r1] = hn @ w.T
+                del w
         for i, p in enumerate(anchors):
             nm = f"logits-anchor-{p}.f32"
             write_raw(os.path.join(out_dir, nm), logits[i])
             record(nm, (V,), "f32")
+        if head:
+            man["head"] = {}
+            for role, t in (("mean", hm), ("norm", hn), ("logits", hl)):
+                nm = f"head-{role}.f32"
+                write_raw(os.path.join(out_dir, nm), t)
+                record(nm, t.shape, "f32")
+                man["head"][role] = nm
+            del hm, hn, hl
     if delete_states_behind and stop == L:
         delete_state(L - 1)  # nothing reads the last state after the logits
     man["complete"] = True
@@ -830,6 +856,9 @@ def main(argv=None):
     r.add_argument("--capture-subblocks", action="store_true",
                    help="also write each layer's mHC sub-block files (attn_hc / ffn_hc input, post, comb, collapsed, "
                         "the sub-layer output; crow-nest #156 / #161); f32 states only, not with --delete-states-behind")
+    r.add_argument("--capture-head", action="store_true",
+                   help="when the pass reaches the last layer, also write the head of every row: the final stream "
+                        "mean, the final norm and the logits (head-mean / head-norm / head-logits.f32; crow-nest #165)")
     s = sub.add_parser("selftest", help="the proof of the runner on a synthetic mini config")
     s.add_argument("--shapes", choices=("small", "real"), default="small")
     s.add_argument("--T", type=int, default=96)
@@ -877,7 +906,7 @@ def main(argv=None):
     anchors = [int(p) for p in a.anchors.split(",")] if a.anchors else None
     man = run_layerwise(ws, tc, ids, a.decode, a.out, start, stop, anchors, a.state_dtype,
                         prompt_chunk=a.prompt_chunk, delete_states_behind=a.delete_states_behind,
-                        capture_subblocks=a.capture_subblocks)
+                        capture_subblocks=a.capture_subblocks, capture_head=a.capture_head)
     print(f"wrote {len(man['files'])} files to {a.out}")
     return 0
 

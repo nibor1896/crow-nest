@@ -1047,6 +1047,8 @@ pub mod golden {
         pub files: serde_json::Value,
         /// `subblocks[layer][site][role]` -> file (`--capture-subblocks`, #156); `Null` without
         pub subblocks: serde_json::Value,
+        /// `head[role]` -> file, role `mean` / `norm` / `logits` (`--capture-head`, #165); `Null` without
+        pub head: serde_json::Value,
         pub complete: bool,
     }
 
@@ -1088,6 +1090,7 @@ pub mod golden {
                 layers,
                 files,
                 subblocks: m["subblocks"].clone(),
+                head: m["head"].clone(),
                 complete: m["complete"].as_bool().unwrap_or(false),
             })
         }
@@ -1095,6 +1098,11 @@ pub mod golden {
         /// the file of `role` at `site` (`attn` / `ffn`) of layer `l`, `None` without a capture
         pub fn subblock(&self, l: usize, site: &str, role: &str) -> Option<String> {
             self.subblocks[l.to_string()][site][role].as_str().map(str::to_string)
+        }
+
+        /// the file of the head's `role` (`mean`, `norm`, `logits`) at every row, `None` without a capture
+        pub fn head_file(&self, role: &str) -> Option<String> {
+            self.head[role].as_str().map(str::to_string)
         }
 
         /// the declared shape of a file, `None` when the manifest does not list it
@@ -1226,6 +1234,28 @@ pub mod golden {
             }
         }
         (if engine.is_empty() { 1.0 } else { sum / engine.len() as f64 }, same)
+    }
+
+    /// the golden's greedy id of one logits row: the first index of the maximum (NaN never wins)
+    pub fn argmax(row: &[f32]) -> usize {
+        row.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |m, (j, &x)| if x > m.1 { (j, x) } else { m }).0
+    }
+
+    /// #165 top-1 agreement: the engine's greedy ids against the golden logits `[rows][v]`; returns
+    /// the rows (relative to the slice) whose ids differ, with (engine id, golden id, golden logit of
+    /// the engine's id minus the golden maximum) — 0 at an exact golden tie
+    pub fn top1_disagreements(engine: &[i32], golden: &[f32], v: usize) -> Vec<(usize, usize, usize, f32)> {
+        assert_eq!(golden.len(), engine.len() * v, "top1: {} rows vs {} golden logits at vocab {v}", engine.len(), golden.len());
+        engine
+            .iter()
+            .enumerate()
+            .filter_map(|(r, &e)| {
+                let row = &golden[r * v..(r + 1) * v];
+                let g = argmax(row);
+                let e = e as usize;
+                (e != g).then(|| (r, e, g, row.get(e).map_or(f32::NAN, |&x| x - row[g])))
+            })
+            .collect()
     }
 
     /// #161 failure mode: `1 - cosine` rises monotonically over the layers in depth order
@@ -1403,13 +1433,17 @@ mod tests {
             "hidden_size": 4096, "hc_mult": 4, "complete": true,
             "files": {"embed.f32": {"shape": [7, 4096]}, "l0-output.f32": {"shape": [7, 4, 4096]},
                       "l3-output.f32": {"shape": [7, 4, 4096]}, "l3-routing-ids.i32": {"shape": [7, 8]}},
-            "subblocks": {"3": {"attn": {"in": "l3-attn_hc-in.f32", "collapsed": "l3-attn_hc-collapsed.f32", "expanded": "l3-ffn_hc-in.f32"}}}}"#;
+            "subblocks": {"3": {"attn": {"in": "l3-attn_hc-in.f32", "collapsed": "l3-attn_hc-collapsed.f32", "expanded": "l3-ffn_hc-in.f32"}}},
+            "head": {"mean": "head-mean.f32", "norm": "head-norm.f32", "logits": "head-logits.f32"}}"#;
         let m = Manifest::parse(text).unwrap();
         assert_eq!((m.t, m.d, m.n, m.prompt_chunk, m.layers.clone()), (5, 2, 7, 2, vec![0, 3]));
         assert_eq!(m.calls(), vec![(0, 2, false), (2, 2, false), (4, 1, false), (5, 1, true), (6, 1, true)]);
         assert_eq!(m.shape("l3-routing-ids.i32"), Some(vec![7, 8]));
         assert_eq!(m.subblock(3, "attn", "expanded").as_deref(), Some("l3-ffn_hc-in.f32"));
         assert_eq!((m.subblock(3, "attn", "pre"), m.subblock(0, "attn", "in")), (None, None));
+        // #165: the head capture of every row; a manifest without it has none
+        assert_eq!((m.head_file("norm").as_deref(), m.head_file("logits").as_deref()), (Some("head-norm.f32"), Some("head-logits.f32")));
+        assert_eq!(Manifest::parse(r#"{"ids": [1], "T": 1, "D": 0, "hidden_size": 1, "hc_mult": 4, "files": {}}"#).unwrap().head_file("logits"), None);
         assert!(role_is_judged("out") && !role_is_judged("comb") && !SITE_ROLES.contains(&"pre"));
         // a pre-#147 manifest has no prompt_chunk: the prompt in one call
         assert_eq!(calls(86, 4, 0)[0], (0, 86, false));
@@ -1441,6 +1475,11 @@ mod tests {
         let gold = [0, 1, 2, -1, 3, 0, 1, 2];
         assert_eq!(dsa_overlap(&[vec![0, 1, 2], vec![0, 1, 2]], &gold, 4), ((1.0 + 0.75) / 2.0, 1));
         assert!(monotone_rise(&[1e-6, 2e-6, 5e-6]));
+        // #165 top-1: row 0 agrees, row 1 picks id 0 (0.5 below the golden max at id 2), row 2 an exact tie
+        let gold = [3.0f32, 1.0, 2.0, 1.0, 0.5, 1.5, 7.0, 7.0, 0.0];
+        assert_eq!(argmax(&gold[6..9]), 0, "the first index of the maximum");
+        assert_eq!(top1_disagreements(&[0, 0, 1], &gold, 3), vec![(1, 0, 2, -0.5), (2, 1, 0, 0.0)]);
+        assert!(top1_disagreements(&[0, 2, 0], &gold, 3).is_empty());
         assert!(!monotone_rise(&[1e-6, 2e-6, 2e-6]) && !monotone_rise(&[1e-6, 2e-6]));
     }
 }

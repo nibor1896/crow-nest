@@ -983,7 +983,8 @@ struct Check {
 /// `collapsed`, the sub-layer `out` and the `expanded` streams, G3 (cosine >= 0.9999, NaN fails);
 /// `post` / `comb` by max_abs; `pre` not compared (the runner cannot capture it). Routing top-8
 /// overlap against `l<k>-routing-ids.i32`, DSA overlap against `l<k>-dsa-topk.i32`, logits at the
-/// anchors when the last layer runs. `--chain`: layer 0 reads the container's own embedding rows,
+/// anchors when the last layer runs; with the runner's `--capture-head` (#165) the head of every row
+/// (stream mean reported, final norm and logits judged by G3, top-1 agreement). `--chain`: layer 0 reads the container's own embedding rows,
 /// every later layer the engine's output; the same table, reported, not gated. Returns "failed".
 unsafe fn glmgolden(args: &[String]) -> bool {
     use crow_nest_engine::cnq::Cnq;
@@ -1169,38 +1170,96 @@ unsafe fn glmgolden(args: &[String]) -> bool {
             println!("glmgolden l{l:<2} dsa selection overlap {ov:.4} ({same} / {n} rows the same set)");
         }
     }
-    // the head, when the pass reaches the last layer and the golden has logits
+    // the head, when the pass reaches the last layer and the golden has logits: with the runner's
+    // `--capture-head` (#165) over every row (stream mean, norm, logits, top-1), else at the anchors
     let last = *layers.last().unwrap();
     let anchors: Vec<usize> = man.anchors.iter().copied().filter(|p| man.shape(&format!("logits-anchor-{p}.f32")).is_some()).collect();
-    if last + 1 == g.layers && !anchors.is_empty() {
+    let head_all = man.head_file("logits").is_some();
+    if last + 1 == g.layers && (head_all || !anchors.is_empty()) {
         let x_head = if chain { x_host.clone() } else { read(&format!("l{last}-output.f32"), n * row) };
-        let rows: Vec<f32> = anchors.iter().flat_map(|&p| x_head[p * row..(p + 1) * row].iter().copied()).collect();
+        let hrows: Vec<usize> = if head_all { (0..n).collect() } else { anchors.clone() };
+        let rows: Vec<f32> = hrows.iter().flat_map(|&p| x_head[p * row..(p + 1) * row].iter().copied()).collect();
         let mut rep = LoadReport::default();
         let hw = gm::load_head(&mut cnq, &g, &mut rep);
         let head = Head::new(gm::head_geo(&g));
-        let (na, v) = (anchors.len(), g.vocab);
+        let (na, v) = (hrows.len(), g.vocab);
         let xa = cuda::to_f32_dev(&rows);
         let nd = cuda::alloc_named("glmgolden normed", na * h * 4);
         let ld = cuda::alloc_named("glmgolden logits", na * v * 4);
         let idd = cuda::alloc_named("glmgolden ids", na * 4);
         gm::run_head(&pass.kn, &head, &hw, xa, nd, ld, idd, na);
         cuda::sync();
-        let (logits, ids) = (cuda::dtoh(ld, na * v), cuda::dtoh_i32(idd, na));
-        for (i, &p) in anchors.iter().enumerate() {
-            let gold = read(&format!("logits-anchor-{p}.f32"), v);
-            let c = compare(&logits[i * v..(i + 1) * v], &gold, v);
-            let top = gold.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |m, (j, &x)| if x > m.1 { (j, x) } else { m }).0;
-            let verdict = if chain {
+        let (normed, logits, ids) = (cuda::dtoh(nd, na * h), cuda::dtoh(ld, na * v), cuda::dtoh_i32(idd, na));
+        let mut judge = |c: &Cmp| -> &'static str {
+            if chain {
                 "chain"
             } else {
                 judged += 1;
-                if passes(&c) {
+                if passes(c) {
                     "PASS"
                 } else {
                     fails += 1;
                     "FAIL"
                 }
-            };
+            }
+        };
+        if head_all {
+            // the kernel fuses the stream mean into the norm: the mean is the host mean of the head's
+            // input rows (golden-fed: the golden's own l<last>-output), reported, not judged
+            if let Some(f) = man.head_file("mean") {
+                let gold = read(&f, n * h);
+                let hc = g.hc_streams;
+                let mean: Vec<f32> = (0..n)
+                    .flat_map(|r| {
+                        let x = &rows[r * row..(r + 1) * row];
+                        (0..h).map(move |d| ((0..hc).map(|s| x[s * h + d] as f64).sum::<f64>() / hc as f64) as f32)
+                    })
+                    .collect();
+                for &(gname, a, b) in &groups {
+                    let c = compare(&mean[a * h..b * h], &gold[a * h..b * h], h);
+                    println!(
+                        "glmgolden head mean       {gname:<6} rows {a:>4}..{:<4} cosine {:.9}  max_abs {:.3e}  (host mean of the head input, reported)",
+                        b - 1,
+                        c.cosine,
+                        c.max_abs
+                    );
+                }
+            }
+            for (role, eng, w) in [("norm", &normed, h), ("logits", &logits, v)] {
+                let Some(f) = man.head_file(role) else { continue };
+                let gold = read(&f, n * w);
+                for &(gname, a, b) in &groups {
+                    let c = compare(&eng[a * w..b * w], &gold[a * w..b * w], w);
+                    let verdict = judge(&c);
+                    let nf = if c.non_finite > 0 { format!("  {} non-finite", c.non_finite) } else { String::new() };
+                    println!(
+                        "glmgolden head {role:<10} {gname:<6} rows {a:>4}..{:<4} cosine {:.9} (worst row {} {:.9})  max_abs {:.3e}  rel_rms {:.3e}{nf}  {verdict}",
+                        b - 1,
+                        c.cosine,
+                        a + c.worst_row,
+                        c.worst_row_cosine,
+                        c.max_abs,
+                        c.rel_rms
+                    );
+                    if role == "logits" {
+                        let off = top1_disagreements(&ids[a..b], &gold[a * v..b * v], v);
+                        println!(
+                            "glmgolden head top-1      {gname:<6} rows {a:>4}..{:<4} {} / {} rows agree{}",
+                            b - 1,
+                            (b - a) - off.len(),
+                            b - a,
+                            off.iter().map(|&(r, e, gi, gap)| format!("; row {} engine {e} golden {gi} (golden logit gap {gap:.3e})", a + r)).collect::<String>()
+                        );
+                    }
+                }
+            }
+        }
+        for &p in &anchors {
+            let i = hrows.iter().position(|&r| r == p).unwrap();
+            let gold = read(&format!("logits-anchor-{p}.f32"), v);
+            let c = compare(&logits[i * v..(i + 1) * v], &gold, v);
+            let top = argmax(&gold);
+            let verdict = judge(&c);
             println!(
                 "glmgolden logits anchor {p:<5} cosine {:.9}  max_abs {:.3e}  rel_rms {:.3e}  greedy {} (golden {top})  {verdict}",
                 c.cosine, c.max_abs, c.rel_rms, ids[i]

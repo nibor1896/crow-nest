@@ -140,6 +140,17 @@ all 4 streams x 90 rows x 4096). Reported, not gated:
 Layer 3: routed top-8 overlap 0.910 on average (min 0.625), 39 of 90 rows the same set; DSA selections identical on
 90 / 90 rows. G3 itself (`decode glmgolden models/GLM-5.3-Flash-step06/ref-mul1`) needs the GPU and was not run.
 
+## All 45 layers and the head on the MUL1 container (2026-10-09)
+
+```
+ORACLE_THREADS=16 .venv-oracle/Scripts/python.exe -I oracle/glm5_layerwise.py run --weights container converter/GLM-5.3-Flash-MUL1K3.cnq   --ids runs/glm53-flash/step06/ids.json --decode 4 --out models/GLM-5.3-Flash-step06/ref-mul1-all --capture-subblocks --capture-head
+```
+
+rc 0, 2290 s wall, RSS after load ≤ 28.12 GiB (peak working set 28.93 GiB), 599 files (1.13 GB), manifest sha256
+`420494b1…a82a0`; layers 0–3 byte-identical to `ref-mul1`. The head files (`head-mean`, `head-norm`, `head-logits`,
+#165) hold every row. Record: `golden-mul1-all.json`. G3 on it: `docs/glm5-model.md` section 4 (golden-fed ALL PASS,
+0 of 549 rows failed).
+
 ## MTP golden on the 3-bit container (2026-10-09, #182)
 
 The MTP block (checkpoint layer 45) on the same 90 ids: `oracle/glm5_mtp.py` (formula of record and sources in
