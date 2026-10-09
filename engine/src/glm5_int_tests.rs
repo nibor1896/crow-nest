@@ -411,3 +411,119 @@ fn glm5_int_gpu_the_cpu_lane_runs_with_the_arena_the_stager_and_the_controller()
         assert_bit_identical(&arms, &outs);
     }
 }
+
+/// The "all template switches on" arm on the synthetic model, sized for it (the real container's
+/// values are in the integration report): NVMe piece pool, fused mHC, the global arena with warm
+/// start, write-back ring, elastic part and staged prompt calls, prompt calls of 12 rows (the
+/// borrowed scratch), flags + stager + router prefetch (side stream) + shared overlap +
+/// controller + LA, `CROW_GLM_MAX_BATCH=8`. `warm` is the synthetic warm-start file.
+pub(crate) fn full_arm_env(warm: &str) -> Vec<(&'static str, String)> {
+    let gib = |records: f64| format!("{}", records * REC as f64 / (1u64 << 30) as f64);
+    vec![
+        ("CROW_NVME_POOL", "1".into()),
+        ("CROW_GLM_HCFUSE", "1".into()),
+        ("CROW_GLM_ARENA", "global".into()),
+        ("CROW_GLM_ARENA_WARM", warm.into()),
+        ("CROW_GLM_ARENA_VRING", "2".into()),
+        ("CROW_GLM_ARENA_ELASTIC_GB", gib(2.0 * 3.0)),
+        ("CROW_GLM_ARENA_STAGE_GB", gib(12.0)),
+        ("CROW_GLM_ARENA_STAGE_MIN", "16".into()),
+        ("CROW_CHUNK", "12".into()),
+        ("CROW_GLM_FLAGS", "1".into()),
+        ("CROW_GLM_STAGER", "1".into()),
+        ("CROW_GLM_PREFETCH", "1".into()),
+        ("CROW_GLM_PREFETCH_SIDE", "1".into()),
+        ("CROW_GLM_SHARED_OVERLAP", "1".into()),
+        ("CROW_GLM_CONTROLLER", "1".into()),
+        ("CROW_GLM_LA", "1".into()),
+        ("CROW_GLM_MAX_BATCH", "8".into()),
+    ]
+}
+
+/// a warm-start file for the synthetic model's 5 MoE layers x 16 experts
+pub(crate) fn synth_warm(dir: &std::path::Path) -> String {
+    let w = dir.join("int-warm.json");
+    std::fs::write(&w, serde_json::to_string(&(0..5).map(|l| (0..16).map(|e| ((e * 7 + l) % 16) as f64).collect::<Vec<_>>()).collect::<Vec<_>>()).unwrap()).unwrap();
+    w.to_str().unwrap().to_string()
+}
+
+/// `generate` of `prompt` and `n` greedy ids per arm, each arm with its own `Glm5Run::load` (the
+/// prompt chunk, the batch slots and the decode switches are read at load) and tier store
+pub(crate) fn run_loaded_arms(arms: &[(&str, Vec<(&'static str, String)>)], prompt: &[i64], n: usize, sizes: TierSizes) -> Vec<Out> {
+    let g = geo8();
+    let s = synth_model(&g, REC);
+    let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+    let moe = MoeGeo::new(&g, spec).unwrap();
+    let mut cnq = Cnq::open_checked(&s.path).unwrap();
+    let mut outs = Vec::new();
+    unsafe {
+        let _ctx = cuda::Ctx::init();
+        for (name, env) in arms {
+            let env: Vec<(&str, String)> = env.iter().map(|(k, v)| (*k, v.clone())).collect();
+            let _env = Env::set(&env);
+            let mut run = Glm5Run::load(&mut cnq, &g, &moe, prompt.len() + n + 1, &mut |s| eprintln!("{s}"));
+            let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, g.topk).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let gen = run.generate(&mut cnq, &mut tiers, prompt, n, true, &mut |_| {}).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let lane_experts = tiers.cpu_lane_clock().read().1;
+            eprintln!(
+                "glm5 int full {name}: ids {:?}, NVMe reads {}, CPU experts {lane_experts}, prefetch {:?}, elastic {:?}, rows held {}",
+                gen.ids,
+                tiers.nvme_reads,
+                tiers.prefetch_stats(),
+                tiers.elastic_live(),
+                run.rows_held()
+            );
+            let nvme_reads = tiers.nvme_reads;
+            tiers.free();
+            run.free();
+            outs.push(Out { gen, nvme_reads, lane_experts });
+        }
+    }
+    let finite = outs[0].gen.logits.iter().flatten().filter(|v| v.is_finite()).count();
+    assert_eq!(finite, n * g.vocab, "the synthetic model must stay finite for the comparison to mean something");
+    outs
+}
+
+fn assert_same(names: &[&str], outs: &[Out]) {
+    for (name, o) in names.iter().zip(outs) {
+        assert_eq!(o.gen.ids, outs[0].gen.ids, "{name}: ids against {}", names[0]);
+        let d = bit_diff(&o.gen.logits, &outs[0].gen.logits);
+        assert!(d.iter().all(|&x| x == 0), "{name}: logits differ in bits from {} per generated position {d:?}", names[0]);
+    }
+}
+
+/// The full arm against the default path on the synthetic model, a 20-id prompt and 6 greedy ids.
+/// A prompt in calls of 12 rows (`CROW_CHUNK`, #186) has the ids of the row-by-row prompt but not
+/// its bits (documented with #186: bit-identical to a layer-at-a-time chain), so every arm is held
+/// against the default path at the same prompt chunk:
+/// - V 3 + P 4: the full arm without the lane = the default at chunk 12, and without the chunk =
+///   the default row by row; ids equal across all four.
+/// - V 0 + P 16 (every expert pinned) with `CROW_GLM_CPU_LANE=split` (`CROW_PINNED_ALLOC=host`):
+///   the lane's CPU combos have other bits than the GPU's by design (#188), so the full arm with
+///   the lane is held against the default path with the same lane (same CPU set: same heat, no
+///   VRAM hit), at chunk 12 and row by row.
+#[test]
+#[ignore = "needs the GPU (about 3 GB VRAM, a 2.3 GB synthetic container in the temp dir)"]
+fn glm5_int_gpu_the_full_template_arm_is_the_default_path() {
+    let dir = std::env::temp_dir().join(format!("crow-int-full-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let warm = synth_warm(&dir);
+    let full = full_arm_env(&warm);
+    let no_chunk = |v: &[(&'static str, String)]| -> Vec<(&'static str, String)> { v.iter().filter(|(k, _)| *k != "CROW_CHUNK").cloned().collect() };
+    let chunk: Vec<(&'static str, String)> = vec![("CROW_CHUNK", "12".into())];
+    let lane: Vec<(&'static str, String)> = vec![("CROW_GLM_CPU_LANE", "split".into()), ("CROW_PINNED_ALLOC", "host".into())];
+    let plus = |a: &[(&'static str, String)], b: &[(&'static str, String)]| -> Vec<(&'static str, String)> { a.iter().chain(b).cloned().collect() };
+    let prompt: Vec<i64> = (0..20).map(|i| (i * 53 + 11) % 2048).collect();
+    let n = 6;
+    let a = [("default", Vec::new()), ("full without the lane and the chunk", no_chunk(&full)), ("default chunk 12", chunk.clone()), ("full without the lane", full.clone())];
+    let outs = run_loaded_arms(&a, &prompt, n, TierSizes { vram: 3, pinned: 4 });
+    assert_same(&["default V3 P4", "full without the lane and the chunk V3 P4"], &outs[..2]);
+    assert_same(&["default chunk 12 V3 P4", "full without the lane V3 P4"], &outs[2..]);
+    assert!(outs.iter().all(|o| o.gen.ids == outs[0].gen.ids), "ids across the chunk");
+    let b = [("lane split", lane.clone()), ("full with the lane, without the chunk", plus(&no_chunk(&full), &lane)), ("lane split chunk 12", plus(&chunk, &lane)), ("full", plus(&full, &lane))];
+    let outs = run_loaded_arms(&b, &prompt, n, TierSizes { vram: 0, pinned: 16 });
+    assert!(outs.iter().all(|o| o.lane_experts > 0), "the lane ran in every arm");
+    assert_same(&["lane split V0 P16", "full with the lane, without the chunk V0 P16"], &outs[..2]);
+    assert_same(&["lane split chunk 12 V0 P16", "full V0 P16"], &outs[2..]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -2084,6 +2084,25 @@ impl ExpertTiers {
         Some((d.flex().filter(|&c| d.chunks[c] != 0).count(), d.flex().len(), self.sizes.vram))
     }
 
+    /// `CROW_GLM_ARENA=global`: the decode phase begins on the host thread: a staged forward still
+    /// open ends (its copy stream drained, per-forward buffers freed) and the elastic part grows
+    /// back. `table_global` does the same at a decode call, but under `CROW_GLM_CONTROLLER` that
+    /// call runs on the controller thread while the device waits for its reply, where a stream
+    /// sync would wait for the device's own wait; so the host calls this before it enqueues a
+    /// controlled row, and after a prompt phase. A no-op without the global arena.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading a staging buffer is pending.
+    pub unsafe fn decode_ready(&mut self) {
+        if self.arena.is_none() {
+            return;
+        }
+        self.stage_end();
+        if self.arena.as_ref().is_some_and(|d| d.flex().any(|c| d.chunks[c] == 0)) {
+            self.elastic_exit();
+        }
+    }
+
     /// `CROW_GLM_ARENA` elastic: hand the elastic chunks back before the prompt phase borrows
     /// their memory (`Glm5Run::prefill_with`); a staged forward still open ends first. The next
     /// decode call grows them back (`table_global`). A no-op without the global arena.
@@ -6325,6 +6344,8 @@ impl Glm5Run {
     unsafe fn enqueue_ctl(&mut self, tiers: &mut ExpertTiers, pos: usize) -> Result<(), String> {
         let (g, first) = (self.g, tiers.first_moe);
         let n = moe_layers(&g);
+        // the arena's decode phase begins here, not on the controller thread (`decode_ready`)
+        tiers.decode_ready();
         let ctl = self.pass.ctl.as_mut().expect("glm5_run: a controlled row without the controller");
         ctl.tables = (0..g.layers).map(|l| l.checked_sub(first).and_then(|i| tiers.tables().get(i).copied()).unwrap_or(0)).collect();
         // the CPU lane: a fresh controller counts its requests from 1 again, so does the lane flag
@@ -6694,6 +6715,9 @@ impl Glm5Run {
         if borrowed {
             self.return_scratch();
         }
+        // the staged forward ends and the elastic part grows back here, on the host thread
+        cuda::sync();
+        tiers.decode_ready();
         r
     }
 

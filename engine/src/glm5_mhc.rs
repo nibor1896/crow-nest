@@ -206,8 +206,12 @@ pub fn hcfuse_from_env() -> bool {
     hcfuse_parse(std::env::var(HCFUSE_ENV).ok().as_deref())
 }
 
-/// [`hcfuse_from_env`] read once per process (the layer driver asks at every site)
+/// [`hcfuse_from_env`] read once per process (the layer driver asks at every site); test builds
+/// read it at every call, so one test process can run arms with and without it
 pub fn hcfuse() -> bool {
+    if cfg!(test) {
+        return hcfuse_from_env();
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(hcfuse_from_env)
 }

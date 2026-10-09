@@ -1661,6 +1661,23 @@ mod tests_batch_gpu {
         ]);
     }
 
+    /// The batch test under the integration's full template arm (`glm5_int_tests::full_arm_env`,
+    /// `CROW_GLM_MAX_BATCH` as the device sets it), solo runs on the default path; both at prompt
+    /// chunk 12 (`CROW_CHUNK`, whose bits differ from row by row by design, #186): every slot's
+    /// ids and logits rows bit-identical to its solo default run.
+    #[test]
+    #[ignore = "needs the GPU (about 4 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_batch_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_batch_gpu_every_slot_is_its_solo_sequence_under_the_full_arm() {
+        let dir = std::env::temp_dir().join(format!("crow-batch-full-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let warm = crate::glm5_int_tests::synth_warm(&dir);
+        let full: Vec<(&str, String)> = crate::glm5_int_tests::full_arm_env(&warm).into_iter().filter(|(k, _)| !matches!(*k, "CROW_CHUNK" | "CROW_GLM_MAX_BATCH")).collect();
+        let together: Vec<(&str, &str)> = full.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let _chunk = EnvGuard::set(&[("CROW_CHUNK", "12")]);
+        batch_is_solo(&together);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// set `kv` for the life of the guard, the old values back on drop
     pub(crate) struct EnvGuard(Vec<(String, Option<String>)>);
 
