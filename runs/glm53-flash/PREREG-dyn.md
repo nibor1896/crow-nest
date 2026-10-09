@@ -124,3 +124,29 @@ Amendments (dated, below this line, written before the result they judge):
 - **Amendment 1 adjusted, nothing else.** Check 2 covers the held-out pass dir. "`weights.json` is the same in all five dirs" becomes "every layer's capture identity equals the held-out's `weights.json` identity", and only the held-out needs an ok row in `passes.jsonl`. Check 3 for the calibration files is rule 6 above. In check 4, item 1 is the held-out self-test plus these rules. Item 2 runs `glm_tier_sim.py sim --capture`, which adds a "plausibility only" reason, so G1 stays "not answered". Item 3 runs `dyn --capture`. Corpus, held-out, cache model, grid, bar, B, S, V, R and the verdict rules are unchanged.
 - **Why.** The capture is the same routing computation on the same weights, and reusing it saves four of the five passes: about 5.2 h of CPU (4 x 4,650 s, derived in `docs/glm5-reference-runner.md` section 8). What remains is the held-out pass (about 1.3 h, derived) and the layer-3 recompute, which took 20.5 min in the conversion (04:55:15 to 05:15:46).
 - **Limit added.** The calibration routing and the held-out routing come from two runs of the same code. If the CPU's f32 reductions are not bitwise reproducible across runs, near-tied router scores could pick a different top-8 set in a few rows. The layer-3 comparison above measures that once.
+
+
+## Amendment 3 (2026-10-09 ~08:50 CEST, crow-nest `4b706be` + the `g1d` command of #178, before any G1d row)
+
+**How `tools/glm_tier_sim.py g1d` reads the points this file leaves open.** Nothing here changes a threshold, the bar, the grid, the tie order, B, S, V, R, the primary cell or a verdict rule; those stay as written and still await robin's confirmation. Each reading below is fixed now, before any G1d row, and the tool's known-answer tests pin it.
+
+1. **Capacity.** C = floor(floor((V + R) / S) / 42), with S of this file (3.5 bpw: 11,010,048 B; not `dyn`'s derived 10,871,858). This reproduces every entry of the capacity table (108 / 115 / 122, 138 / 148 / 157, 161 / 172 / 183 at V25; 120 / 127 / 134, 154 / 163 / 172, 179 / 190 / 201 at V37).
+2. **Split of C.** Seed slots = floor(s x C), for example 40 and 80 at C 161. Prefetch buffer = P. LRU part = C - seed - P. A point whose LRU part would be negative does not fit C and is skipped. This cannot happen at C >= 108 (at most 54 + 16 = 70 slots).
+3. **Seed.** The floor(s x C) experts of lowest rank under `cut`'s rule (routed count over the generated positions of the statistics files, ties lower id), per layer.
+4. **IDPF.**
+   - The table T[l][a, b] counts the generated positions of the statistics files with a among layer l's ids and b among layer l+d's ids of the same token. The score of expert b for layer l+d is the sum of T[l][a, b] over the eight layer-l ids a.
+   - The P experts with the highest scores among those not resident (seed or LRU part) are read, ties lower id: min(P, non-resident count) reads, each counted at that token.
+   - Only MoE layers are sources, so layers 3 .. 2+d get no prefetch.
+   - In the per-layer arena, the proposal for layer m is made from layer m's state before its visit of that token. That equals issuing it after layer m-d's visit.
+   - A demanded buffered expert joins the LRU part as most recent. The rest of the buffer is dropped after layer m's visit.
+5. **Demand.** A visit to an expert that is neither seeded, in the LRU part nor buffered is one read and joins the LRU part as most recent (with an LRU part of 0 it is not kept). The eight ids of a (token, layer) are visited in ascending order.
+6. **Score and choice.** A file's score is its reads per generated position, replayed alone from an empty arena at position 0. A point's score is the unweighted mean over the files. Equal means are equal floats, and ties follow this file's order: simpler class (LRU < SEED+LRU < SEED+LRU+IDPF), then smaller s, P, d. LRU is s 0, P 0; SEED+LRU is s > 0, P 0; any P > 0 is SEED+LRU+IDPF.
+7. **Statistics per choice.**
+   - The full choice fits seed and table on all four calibration files, and the held-out is scored with those.
+   - Each leave-one-out fold fits them on the other three, chooses on those three and scores the left-out file with that point and those statistics.
+8. **The bar** is evaluated as r_hi <= B / (40 x S) without rounding: 18.455 reads at 3.05 bpw, 12.351 at 4.5 and 15.880 at 3.5, with B 6.9936611328 GB/s. The 18.4 / 12.3 / 15.88 above are its roundings. r_hi is the upper bound of `boot_ci`.
+9. **The book.** Before the held-out is replayed for a cell, the chosen point is appended to `<json>.choices.jsonl` with its UTC time. That line goes to the book.
+10. **Built or not.**
+    - Built, all reported without threshold: every grid point on every calibration file, every fold, the held-out row with the chosen point, Belady MIN at C, per-layer r, the depth buckets, the first 1,000 generated positions against the rest, and the reset-at-first-generated variant.
+    - Not built, all reported-only: SEED+LRU and IDPF in the global arena, the oracle-prefetch stage row, the stage table against the static cut, and PCIe / DRAM bytes for these policies.
+    - None of them decides the gate.
