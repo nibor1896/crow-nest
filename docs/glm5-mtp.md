@@ -54,8 +54,8 @@ verify (this reference, the golden) it changes nothing.
 **DeepSeek-V3 paper** (arXiv 2412.19437v2, section 2.2, eq. 21-23): `h'_i = M_k [RMSNorm(h_i^{k-1});
 RMSNorm(Emb(t_{i+k}))]`, `h_k = TRM_k(h')`, `P_{i+k+1} = OutHead(h_k)`, embedding and output head shared
 with the main model. The written concat order is **h first**; every code base above puts the
-embedding first (vLLM `deepseek_mtp.py:127-128` for DeepSeek itself). Section 4 measures which order
-the GLM weights were trained with.
+embedding first (vLLM `deepseek_mtp.py:127-128` for DeepSeek itself). Section 4 measures it: h first gives
+0 / 89 agreement on the GLM weights.
 
 ## 2. Differences between the sources
 
@@ -97,7 +97,27 @@ Engine: `glm5_mtp_gpu_block_matches_the_host_composition` (RTX 5090, real shapes
 references (glue twin, `glm5_mla::host::forward`, `glm5_moe::moe_cpu`): 1 − cosine ≤ 2.4e-8 per row,
 routing sets identical; red (1 − cosine 0.997) with the concat order swapped in the kernel.
 
-Real weights: see section 6.
+Real weights (2026-10-09, `runs/glm53-flash/step06/README.md` "MTP golden", record `golden-mtp.json`): the
+90 ids of step 6 over the full 45-layer trunk on the 3-bit container (`ref-mul1-all`, #165 `--capture-head`), the
+block's experts from the container, its other 25 tensors from the FP8 originals. Golden
+`models/GLM-5.3-Flash-step06/ref-mul1-mtp/`, 14 files, manifest sha256 `eaffa03a…ffc13d`, 89 s CPU, RSS 28.3 GiB.
+The engine's glue twin on the checkpoint's BF16 `enorm` / `hnorm` / `eh_proj` equals the oracle's `mtp-eh` to
+2.8e-6 absolute (rel RMS 3.6e-7, `glm5_mtp_glue_matches_the_oracle_golden`).
+
+Draft top-1 equal to the trunk's own top-1 for the same id, 89 rows, one step (an acceptance indication, not a gate):
+
+| pairing | agreement |
+|---|---|
+| SGLang (primary) | 55 / 89 = 0.618 |
+| vLLM (row 0 embedding zeroed) | 57 / 89 = 0.640 |
+| llama.cpp (leading `(t_0, 0)` row) | 56 / 89 = 0.629 |
+| paper order `[h; e]` | **0 / 89** |
+| trunk state before the final norm | 52 / 89 = 0.584 |
+
+The paper's order gives no agreement: the weights were trained embedding-first (M2 settled by measurement). The
+three stacks' row-0 rules differ by 1-2 rows of 89, within noise at this size. 4 decode rows only (0 / 4 in every
+variant); the 61.8 % is a first indication on one short text with uncalibrated (identity-Hessian) experts and FP8
+attention, not the engine's acceptance.
 
 ## 5. Weights: what the 3-bit container holds
 
@@ -125,3 +145,16 @@ not built. Proposal in #182.
 - The Flash-Next / 27B speculative step (`gen.rs` `spec_step`, `MTP_VERIFY_MAX` 4, `load_mtp`) is the
   pattern; the glm5 arm is the lead's wiring, as for the trunk (`glm5_model`).
 - `glm5_model.rs`, `bin/decode.rs`, `expert_cache.rs`, `nvme_source.rs`, `manager.rs` are unchanged.
+
+## 7. The MTP experts' Hessian (not done here)
+
+The 288 MTP records were quantized with an identity Hessian because no MTP forward existed
+(`docs/glm-mul1-conversion.md`). With this reference the real one is: per calibration file, the trunk head
+`norm(mean(l44-output))` (the four `decode_out/glm-mul1/work/<file>/l44-output.bf16` FP8-trunk states are on disk,
+`progress.json` `layer_done` 44), the pairing of section 1, the block forward on the FP8 originals, a pre-hook on
+the block's `mlp` (the `capture` hook) for `X` and the routing; then `quantize` the 288 experts with
+`H_gu = X^T X` and `H_down` as for layers 3-44, and replace the 288 records of section `mtp` (same size,
+9,474,048 B each). Derived cost: block forward about 96 s per file (one DSA + MoE layer,
+`docs/glm-mul1-conversion.md` capture row) x 4 = 6.4 min plus a 7.8 s FP8 layer load; quantize 288 x 1.04-1.31 s
+= 5.0-6.3 min (RTX 5090). The converter has no path that swaps one section's records in place; a full rebuild
+from the store is the alternative. Whether it is worth it is the MTP arm's measurement (plan step 23).

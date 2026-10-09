@@ -384,7 +384,7 @@ Activations between layers are 4 streams × 4096 = 16,384 values per token (`M:1
   `index_share_for_mtp_iteration` means. Step 21 needs a source of record before any MTP kernel.
   **Settled 2026-10-09 (crow-nest #182)** from vLLM, SGLang and llama.cpp PR #29928 (`b9acf138`): `eh_proj([enorm(e) |
   hnorm(h)])`, embedding first (the DeepSeek-V3 paper writes h first; every code base puts e
-  first), `h` = the trunk's post-`norm` row, a plain pre-norm residual layer on one stream (no mHC),
+  first, and h first gives 0 / 89 draft agreement on the real weights), `h` = the trunk's post-`norm` row, a plain pre-norm residual layer on one stream (no mHC),
   `shared_head.norm` then the trunk's `lm_head`; `index_share_for_mtp_iteration` = draft steps 1+ reuse step 0's
   top-k of the block's own indexer. Still open: no vendor golden (the reference is `oracle/glm5_mtp.py` over HF's
   blocks); the stacks differ at row 0 (vLLM zeroes its embedding, llama.cpp prepends a `(t_0, 0)` row). Details
