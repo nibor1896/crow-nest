@@ -102,6 +102,8 @@ pub mod toolgrammar;
 pub mod glm5_template;
 // #161: GLM-5.3-Flash mHC residual (Sinkhorn stream mixer) - CPU twin and kernels_glm5_mhc.cu
 pub mod glm5_mhc;
+// #162: GLM-5.3-Flash KDA sub-block (conv, gates, state) on the GPU; wired nowhere yet
+pub mod glm5_kda;
 // #86: the OpenAI stop-string filter of `bin/serve.rs`, the same tail-hold
 // `toolcall::find_marker` gives `<tool_call>`, on arbitrary strings
 pub mod stopstr;
