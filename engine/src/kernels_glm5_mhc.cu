@@ -10,6 +10,14 @@
 //                    fn [24][4H] bf16, base [24] f32, scale [3] f32 ->
 //                    logits [T][24], pre [T][4], post [T][4], comb [T][4][4] (row j = source
 //                    stream, column i = destination stream), collapsed [T][H] = sum_s pre[s] x[s].
+//   glm5_mhc_mix     #191, grid (24, T), block 256: what glm5_mhc_coeffs computes, bit for bit,
+//                    over 24 blocks per row (the record's one block per row left 169 of 170 SMs
+//                    idle at T = 1). Block m: the RMS factor (the record's chain, in every block)
+//                    and mix row m -> logits; the last block of the row: pre, post, comb (the
+//                    record's steps 3-5 on 16 lanes of warp 0, same operations in the same order)
+//                    and collapsed (warps 1-7). done [T] u32 is a zeroed per-row counter the last
+//                    block resets.
+//   glm5_mhc_coeffs  the record (kept for the #191 bit-identity test; no longer launched).
 //   glm5_mhc_expand  grid (ceil(H / 256), T), block 256. out[t][i][d] = post[i] y[t][d]
 //                    + sum_j comb[j][i] x[t][j][d]. out may be x itself (one thread reads the four
 //                    streams of its d before it writes them).
@@ -47,6 +55,72 @@ __device__ __forceinline__ float mhc_block_sum(float v, float* sh) {
     for (int i = 0; i < MHC_THREADS / 32; i++) s = __fadd_rn(s, sh[i]);
     __syncthreads();
     return s;
+}
+
+// #191: steps 3-8 of one row t (pre, post, comb) from its 24 logits m on warp 0 of the last
+// glm5_mhc_mix block of the row, bit-identical to the record's thread-0 tail in glm5_mhc_coeffs: every coefficient gets
+// the record's operations in the record's order, only spread over lanes. Lanes 0-3 take pre[s]
+// and post[s] (s = lane). Lane q = 4 j + i (lanes 16-31 mirror 0-15) holds comb[j][i]; a row or
+// column sum gathers the four values by __shfl_sync and adds them from 0.0f in the record's
+// index order, so each lane computes the very sum the record computes once; the softmax max is
+// the record's sequential fmaxf from -inf. sh_pre gets pre; `store` false (warp-uniform) derives
+// pre only.
+__device__ __forceinline__ void mhc_coeff_tail_warp(const float* m, const float* __restrict__ base,
+                                                    const float* __restrict__ scale, float* sh_pre,
+                                                    float* __restrict__ pre, float* __restrict__ post,
+                                                    float* __restrict__ comb, const int t, const bool store) {
+    const unsigned int full = 0xffffffffu;
+    const int lane = threadIdx.x & 31;
+    const float s0 = scale[0], s1 = scale[1], s2 = scale[2];
+    if (lane < MHC_HC) {
+        const float p = __fadd_rn(mhc_sigmoid(__fadd_rn(__fmul_rn(m[lane], s0), base[lane])), MHC_HC_EPS);
+        sh_pre[lane] = p;
+        if (store) {
+            pre[t * MHC_HC + lane] = p;
+            post[t * MHC_HC + lane] = __fmul_rn(2.0f, mhc_sigmoid(__fadd_rn(__fmul_rn(m[MHC_HC + lane], s1), base[MHC_HC + lane])));
+        }
+    }
+    if (!store) return;
+    const int q = lane & 15;
+    const int i = q & 3;
+    const int row0 = lane & ~3;          // the lanes of row j: row0 + u
+    const int col0 = (lane & 16) + i;    // the lanes of column i: col0 + 4 u
+    // softmax of row j
+    const int qq = 2 * MHC_HC + q;
+    float l = __fadd_rn(__fmul_rn(m[qq], s2), base[qq]);
+    float g[MHC_HC];
+#pragma unroll
+    for (int u = 0; u < MHC_HC; u++) g[u] = __shfl_sync(full, l, row0 + u);
+    float mx = __int_as_float(0xff800000);  // -inf
+#pragma unroll
+    for (int u = 0; u < MHC_HC; u++) mx = fmaxf(mx, g[u]);
+    l = expf(__fadd_rn(l, -mx));
+#pragma unroll
+    for (int u = 0; u < MHC_HC; u++) g[u] = __shfl_sync(full, l, row0 + u);
+    float sum = 0.0f;
+#pragma unroll
+    for (int u = 0; u < MHC_HC; u++) sum = __fadd_rn(sum, g[u]);
+    float c = __fadd_rn(__fdiv_rn(l, sum), MHC_HC_EPS);
+    for (int it = 0; it < MHC_SINKHORN_ITERS; it++) {
+        if (it > 0) {  // rows: sum over the destination i
+#pragma unroll
+            for (int u = 0; u < MHC_HC; u++) g[u] = __shfl_sync(full, c, row0 + u);
+            float s = 0.0f;
+#pragma unroll
+            for (int u = 0; u < MHC_HC; u++) s = __fadd_rn(s, g[u]);
+            s = __fadd_rn(s, MHC_HC_EPS);
+            c = __fdiv_rn(c, s);
+        }
+        // columns: sum over the source j
+#pragma unroll
+        for (int u = 0; u < MHC_HC; u++) g[u] = __shfl_sync(full, c, col0 + 4 * u);
+        float s = 0.0f;
+#pragma unroll
+        for (int u = 0; u < MHC_HC; u++) s = __fadd_rn(s, g[u]);
+        s = __fadd_rn(s, MHC_HC_EPS);
+        c = __fdiv_rn(c, s);
+    }
+    if (lane < MHC_HC * MHC_HC) comb[(size_t)t * MHC_HC * MHC_HC + q] = c;
 }
 
 extern "C" __global__ void glm5_mhc_coeffs(const float* __restrict__ x, const unsigned short* __restrict__ fn,
@@ -175,4 +249,82 @@ extern "C" __global__ void glm5_mhc_expand(const float* x, const float* __restri
     float* orow = out + (size_t)t * MHC_HC * H;
 #pragma unroll
     for (int i = 0; i < MHC_HC; i++) orow[i * H + d] = o[i];
+}
+
+// #191: steps 1-5 + 9 of one site. grid (24, T), block 256. Block m of row t: the record's RMS
+// factor (every block the same chain), then the record's dot chain, xor tree and warp sum for mix
+// row m -> logits[t][m]. The LAST of the 24 blocks of row t to finish (a per-row counter `done`,
+// reset by that block, so the next launch finds 0) reads the row's 24 logits and runs the record's
+// steps 3-5 on warp 0 (pre, post, comb stored; mhc_coeff_tail_warp) while warps 1-7 derive pre
+// themselves (lanes 32-35, the same expression) and write collapsed [t] in the record's order. Only
+// that block reads other blocks' logits: they are published with __threadfence before the counter
+// add and read back with __ldcg (L2, not a stale L1).
+extern "C" __global__ void glm5_mhc_mix(const float* __restrict__ x, const unsigned short* __restrict__ fn,
+                                        const float* __restrict__ base, const float* __restrict__ scale,
+                                        float* logits, float* __restrict__ pre, float* __restrict__ post,
+                                        float* __restrict__ comb, float* __restrict__ collapsed,
+                                        unsigned int* done, const int* __restrict__ prm) {
+    __shared__ float sh_red[MHC_THREADS / 32];
+    __shared__ float sh_part[MHC_THREADS / 32];
+    __shared__ float sh_m[MHC_MIX];
+    __shared__ float sh_pre[MHC_HC];
+    __shared__ float sh_pre1[MHC_HC];
+    __shared__ int sh_last;
+    const int H = prm[0];
+    const int n = MHC_HC * H;
+    const int m = blockIdx.x;
+    const int t = blockIdx.y;
+    const float* xr = x + (size_t)t * n;
+
+    // 1. the record's unweighted RMSNorm factor (every block the same chain, the same r)
+    float ss = 0.0f;
+#pragma unroll 16
+    for (int k = threadIdx.x; k < n; k += MHC_THREADS) ss = fmaf(xr[k], xr[k], ss);
+    ss = mhc_block_sum(ss, sh_red);
+    const float r = __frsqrt_rn(__fadd_rn(__fdiv_rn(ss, (float)n), MHC_RMS_EPS));
+
+    // 2. row m of m = fn . (r x): the record's acc[m] chain, xor tree, sequential warp sum
+    const unsigned short* fm = fn + (size_t)m * n;
+    float acc = 0.0f;
+#pragma unroll 16
+    for (int k = threadIdx.x; k < n; k += MHC_THREADS) {
+        const float xn = __fmul_rn(xr[k], r);
+        acc = fmaf(mhc_bf16(fm[k]), xn, acc);
+    }
+    float v = acc;
+    for (int o = 16; o > 0; o >>= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, o));
+    if ((threadIdx.x & 31) == 0) sh_part[threadIdx.x >> 5] = v;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        for (int i = 0; i < MHC_THREADS / 32; i++) s = __fadd_rn(s, sh_part[i]);
+        logits[(size_t)t * MHC_MIX + m] = s;
+        __threadfence();
+        const unsigned int prev = atomicAdd(&done[t], 1u);
+        sh_last = prev == MHC_MIX - 1;
+        if (sh_last) done[t] = 0u;  // every other block of the row has counted
+    }
+    __syncthreads();
+    if (!sh_last) return;  // block-uniform
+
+    // 3.-5. and 9., the last block of row t only
+    __threadfence();
+    if (threadIdx.x < MHC_MIX) sh_m[threadIdx.x] = __ldcg(logits + (size_t)t * MHC_MIX + threadIdx.x);
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        mhc_coeff_tail_warp(sh_m, base, scale, sh_pre, pre, post, comb, t, true);
+        return;
+    }
+    // warps 1-7: pre for the collapse (the record's expression), then the collapse
+    const int u = threadIdx.x - 32;
+    if (u < MHC_HC) sh_pre1[u] = __fadd_rn(mhc_sigmoid(__fadd_rn(__fmul_rn(sh_m[u], scale[0]), base[u])), MHC_HC_EPS);
+    asm volatile("bar.sync 1, %0;" ::"r"(MHC_THREADS - 32));
+    const float p0 = sh_pre1[0], p1 = sh_pre1[1], p2 = sh_pre1[2], p3 = sh_pre1[3];
+    for (int d = u; d < H; d += MHC_THREADS - 32) {
+        float c = __fmul_rn(p0, xr[d]);
+        c = __fadd_rn(c, __fmul_rn(p1, xr[H + d]));
+        c = __fadd_rn(c, __fmul_rn(p2, xr[2 * H + d]));
+        c = __fadd_rn(c, __fmul_rn(p3, xr[3 * H + d]));
+        collapsed[(size_t)t * H + d] = c;
+    }
 }
