@@ -56,14 +56,14 @@ transformers 5.16.1 `modeling_glm5_next.py`, `docs/glm5-next-recipe.md` sections
 | `ffn_nvfp4_cpu(&ExpertBlock, limit, x, y, ..)` | dense layers 0-2 and the shared expert on the CPU |
 | `GpuMoePlan::new(geo, tokens)`, `run(kn, mk, gk, &GpuMoeWeights, table, x, y)` | GPU lane, 13 launches on the current stream, no host sync (graph-capturable) |
 | `table` | device `[288] u64` of record bases, one per expert: a VRAM slot or a pinned-host UVA address (the residency / #175 cache hook; the kernels do not know which) |
-| `GpuFfnPlan::new(hidden, inter, tokens, limit)`, `run(kn, gk, &GpuFfnWeights, x, y)` | dense layers 0-2 (and the shared expert inside `GpuMoePlan`) on `gemv_fp4_b` |
+| `GpuFfnPlan::new(hidden, inter, tokens, limit)`, `run(kn, gk, &GpuFfnWeights, x, y)` | dense layers 0-2 (and the shared expert inside `GpuMoePlan`) on `glm5_gemv_fp4` (#191, bit-identical to the engine's `gemv_fp4_b`) |
 | `GpuMoePlan::read_routing()` | the last routing (syncs), for the counters and the routing dumps |
 | `lane::post(Some(lane::Call { table, combos, clock }))` (#188) | the CPU lane hand-off: the next `GpuMoePlan::experts` on this thread with this `table`, `t = 1` and at least one `Combo::Cpu` computes those combos on the CPU (`cpu_mul1::experts_ffn` with `swiglu_clamp`, `LANE_THREADS` 8, one pool run) while the GPU computes the rest (`GemvPlan::run_slots`), then the unchanged combine; anything else runs the GPU path. Posted by `glm5_tiers::ExpertTiers::table_for` under `CROW_GLM_CPU_LANE=1`; `docs/glm5-model.md` section 6 |
 
-`kn` is the engine's main `kernels::Kernels` (it needs `gemv_bf16_b`, `gemv_fp4_b`), `mk` the
-`kernels::mul1::Kernels`, `gk` the `kernels::glm5_moe::Kernels`. NVFP4 scale bytes reach
-`gemv_fp4_b` raw (0x7F would read as 480): hand it sanitized bytes, as the residency does for
-experts. The GPU lane runs one MUL1 slot per (token, k) combo (`tokens * 8` slots of one token);
+`kn` is the engine's main `kernels::Kernels` (the router's `gemv_bf16_b`; since #191 the FFN
+GEMVs no longer read it), `mk` the `kernels::mul1::Kernels`, `gk` the
+`kernels::glm5_moe::Kernels`. NVFP4 scale bytes reach `glm5_gemv_fp4` raw (0x7F would read as
+480): hand it sanitized bytes, as the residency does for experts. The GPU lane runs one MUL1 slot per (token, k) combo (`tokens * 8` slots of one token);
 a prefill grouping by expert is a speed question, not part of this step.
 
 ## 4. Acceptance on synthetic weights (G3, plan step 15)
