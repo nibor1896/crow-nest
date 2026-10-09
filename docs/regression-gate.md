@@ -24,6 +24,21 @@ python tools/regression_gate.py compare --session S
 - **`compare`:** pure, no GPU. Writes `compare.json`, prints one GREEN/RED line per check, and writes the R4 protocol if it is missing.
 - **GPU use:** `before` and `after` boot both models many times. On robin's machines they run only after his go.
 
+### Record a reference once, check each merge against it
+
+R2 alone, byte-identical ids and logits, when several changes land one after another. Record the reference from the tree before the changes, then check every later build against that session:
+
+```
+python tools/regression_gate.py before  --session ref-<sha> --root ../crow-nest-r-before --skip r1
+python tools/regression_gate.py after   --session merge-<sha2> --before-session ref-<sha> --root . --skip r1,r3
+python tools/regression_gate.py compare --session merge-<sha2> --before-session ref-<sha>
+```
+
+- **The reference** is `runs/regression-gate/ref-<sha>/before.json`: the commit (`git.head`, `dirty`), the start time (UTC), the sha256 of the snapshot binary, and the sha256 and size of every logits dump, and the ids of every item that yields ids. The raw dumps stay under `decode_out/regression-gate/ref-<sha>/before/`, so a red check can name the first differing row and column.
+- **The check** exits 1 with the first differing id index or logit offset (row, column, both f32 values) per red item. It exits 3 when every item that ran is byte-identical, because R1 and R3 were skipped. It never exits 0 without R1, R3 and R4.
+- **A missing reference** is refused by name, exit 2: `regression_gate: <out>/<session>/before.json not found`.
+- **Same machine, driver and toolchain** as the reference (see Limits); otherwise record a new one.
+
 | option | default | meaning |
 |---|---|---|
 | `--session` | today's date | folder under `--out` and `--raw` |
@@ -89,4 +104,4 @@ The gate is only trusted after it has caught a deliberate change.
 
 - Before and after must run on the same machine, driver and toolchain. A different NVRTC/driver JIT moves logit bytes by itself (`tools/gate-linux.sh` header, the Linux vs Windows 512-row values).
 - The prompts are fixed and short (8 and 512 ids), so long-context paths (QSA at more than 2,048 tokens, the 27B at 30k) are not covered. A change aimed at those needs its own measurement beside the gate.
-- `tools/test_regression_gate.py` covers the comparison logic only, with fixtures. The `decode` calls themselves are exercised by the first real run.
+- `tools/test_regression_gate.py` covers the comparison logic with fixtures, and record → check end to end with a stub `decode` that writes the files and stdout lines of `engine/src/bin/decode.rs` (`StubEngineTests`, no GPU). Whether the real `decode` still writes those forms is checked only by a real run.

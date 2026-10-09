@@ -429,7 +429,8 @@ def report_lines(res):
 def r4_template(session, before, after, models, crow_repo):
     def git(rec):
         g = (rec or {}).get("git", {})
-        return f"`{g.get('head', '?')[:12]}`{' (dirty)' if g.get('dirty') else ''}"
+        head = g.get("head") or "?"  # None when --root is no git checkout (git_info)
+        return f"`{head[:12]}`{' (dirty)' if g.get('dirty') else ''}"
 
     out = [
         f"# R4: Crow's real path - session `{session}`",

@@ -9,12 +9,18 @@ before/after records. What has to hold: one differing logit byte is RED and name
 column; an A/B delta outside the A/A window is RED in both directions; the libtest counts are
 summed per binary and a FAILED binary, a build without any summary line and fewer passes after the
 change are RED; the MTP C2 lines and draft counters must match, the timing in those lines must not.
+StubEngineTests run record (`before`) -> check (`after` + `compare`) end to end with a stub engine.
 """
 
+import contextlib
+import datetime
 import importlib.util
+import io
 import json
 import os
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -344,6 +350,197 @@ class EnvTests(unittest.TestCase):
         self.assertEqual(env["CROW_GRAPH"], "0")
         names = [i["name"] for i in mc["r2"]]
         self.assertEqual(names, ["logits512", "logits512-tf", "greedy512", "mtp512", "mtp-logits"])
+
+
+# A stand-in for engine/target/release/decode: the four modes the gate calls, with the output files
+# and stdout lines of engine/src/bin/decode.rs (parity :143-159, run :318-328, mtpspec :618-681,
+# mtpgolden :689-696 at be4a250), vocab 8. The values depend on the container name and CROW_GRAPH,
+# so the two models and the teacher-forced item differ from each other as the real ones do.
+# MUTATE marks a build whose numerics moved: "id" changes greedy id 300 of `run`, "logit" flips one
+# byte of the teacher-forced parity dump (row 2, column 5).
+STUB_DECODE = r'''
+import json, os, struct, sys
+MUTATE = None
+V = 8
+cnq = os.environ.get("CROW_CNQ")
+if not cnq or "CROW_MTP" in os.environ:
+    sys.exit(3)
+salt = len(os.path.basename(cnq)) + (5 if os.environ.get("CROW_GRAPH") == "0" else 0)
+
+def write_f32(path, rows):
+    data = bytearray(b"".join(struct.pack("<%df" % V, *r) for r in rows))
+    if MUTATE == "logit" and os.path.basename(path) == "gpu-logits.f32" and os.environ.get("CROW_GRAPH") == "0":
+        data[(2 * V + 5) * 4 + 1] ^= 0x01
+    with open(path, "wb") as f:
+        f.write(data)
+
+def logits(rows, extra):
+    return [[((r * V + c) * 31 + salt + extra) % 1000 / 7.0 for c in range(V)] for r in range(rows)]
+
+def trace(n):
+    return [(i * 13 + salt) % 248320 for i in range(n)]
+
+mode = sys.argv[1]
+if mode == "parity":
+    ids = json.load(open(sys.argv[2]))
+    out = sys.argv[3]
+    with open(os.path.join(out, "gen-sequence.json"), "w") as f:
+        json.dump({"all_ids": ids + [(i * 7 + salt) % V for i in range(4)], "rows": len(ids), "nan": 0}, f)
+    write_f32(os.path.join(out, "gpu-logits.f32"), logits(len(ids), 0))
+elif mode == "run":
+    t = trace(int(sys.argv[3]))
+    if MUTATE == "id":
+        t[300] += 1
+    os.makedirs("decode_out", exist_ok=True)
+    with open("decode_out/run.json", "w") as f:
+        json.dump({"warmup_ms": 30.0, "mean_ms": 22.1, "p50_ms": 22.0, "trace": t}, f)
+elif mode == "mtpspec":
+    n = int(sys.argv[3])
+    print("mtpspec: C2 greedy ids identical: true")
+    print("mtpspec: passes 200, tokens per pass 2.560, acceptance per chain position [0.910, 0.740, 0.520]")
+    print("mtpspec-batched: C2 greedy ids identical: true")
+    print("mtpspec-batched: passes 200, tokens per pass 2.560, acceptance [0.910, 0.740, 0.520], 41.3 tok/s (plain 30.2)")
+    print("mtpspec-step: C2 ids identical over %d tokens (spec_step x %d, spec_finish, decode_step x 16): true" % (n + 16, n))
+    print("mtpspec-step: passes 200, tokens per pass 2.560, k histogram [20, 40, 140], 40.9 tok/s (plain 30.2)")
+    print("trace-plain: %s" % json.dumps(trace(n)))
+elif mode == "mtpgolden":
+    d = sys.argv[2]
+    rows = json.load(open(os.path.join(d, "gen-sequence.json")))["rows"]
+    write_f32(os.path.join(d, "mtp-gpu-logits.f32"), logits(rows - 1, 3))
+else:
+    sys.exit(4)
+'''
+
+
+class StubEngineTests(unittest.TestCase):
+    """End to end through main(): `before` records a reference, `after` + `compare` check a build
+    against it. The real path runs (CLI, binary snapshot, child env, every decode mode, the dumps
+    on disk, compare.json); only the engine is the stub above, started through the interpreter."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        self.data = self.d / "data"
+        (self.data / "decode_out").mkdir(parents=True)
+        (self.data / "decode_out" / "real512-ids.json").write_text(json.dumps([11, 12, 13, 14, 15, 16]))
+        (self.data / "decode_out" / "parity-ids.json").write_text(json.dumps([1, 2, 3, 4, 5, 6, 7, 8]))
+        self.out = self.d / "out"
+        self.config = self.d / "config.json"  # the built-in models and items, vocab 8
+        self.config.write_text(json.dumps(dict(rg.DEFAULT_CONFIG, vocab=V)), encoding="utf-8")
+        self.saved = (rg.run_logged, rg.engines_alive, rg.gpu_used_mib)
+        real_run = rg.run_logged
+
+        def via_interpreter(cmd, cwd, env, log, timeout=None):
+            if cmd and str(cmd[0]).endswith(rg.EXE):  # the snapshot of the stub, not a real exe
+                cmd = [sys.executable, "-I", *cmd]
+            return real_run(cmd, cwd, env, log, timeout)
+
+        rg.run_logged = via_interpreter
+        rg.engines_alive = lambda: []  # the host's own engines are not this test's business
+        rg.gpu_used_mib = lambda: None
+
+    def tearDown(self):
+        rg.run_logged, rg.engines_alive, rg.gpu_used_mib = self.saved
+        self.tmp.cleanup()
+
+    def tree(self, name, mutate=None):
+        root = self.d / name
+        exe = root / "engine" / "target" / "release" / rg.EXE
+        exe.parent.mkdir(parents=True)
+        exe.write_text(STUB_DECODE.replace("MUTATE = None", f"MUTATE = {mutate!r}"), encoding="utf-8")
+        return root
+
+    def gate(self, *argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = rg.main([str(a) for a in argv])
+        return rc, buf.getvalue()
+
+    def side(self, cmd, session, root, *extra):
+        return self.gate(cmd, "--session", session, "--root", root, "--data-root", self.data,
+                         "--out", self.out, "--raw", self.d / "raw", "--config", self.config, "--no-build",
+                         "--skip", "r1,r3", "--ram-gate-gib", "0", "--timeout-s", "120", *extra)
+
+    def record(self, root=None):
+        rc, _ = self.side("before", "ref", root or self.tree("ref"))
+        self.assertEqual(rc, 0)
+        return json.loads((self.out / "ref" / "before.json").read_text(encoding="utf-8"))
+
+    def check(self, mutate=None):
+        self.side("after", "chk", self.tree("chk", mutate), "--before-session", "ref")
+        rc, text = self.gate("compare", "--session", "chk", "--before-session", "ref", "--out", self.out,
+                             "--config", self.config)
+        res = json.loads((self.out / "chk" / "compare.json").read_text(encoding="utf-8"))
+        return rc, text, res
+
+    def test_record_holds_binary_sha_commit_date_and_every_item(self):
+        root = self.tree("ref")
+        git = ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t"]
+        if subprocess.run(git + ["init", "-q"]).returncode or \
+                subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "ref"]).returncode:
+            self.skipTest("git cannot make a fixture commit here")
+        head = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        rec = self.record(root)
+        self.assertEqual(rec["git"]["head"], head)
+        self.assertTrue(rec["started"].startswith(str(datetime.date.today().year)))
+        exe = root / "engine" / "target" / "release" / rg.EXE
+        self.assertEqual(rec["binary"]["sha256"], rg.sha256_file(exe))
+        r2 = rec["r2"]
+        self.assertEqual(list(r2), ["flash-next", "qwen27b"])
+        self.assertEqual(list(r2["qwen27b"]), ["logits512", "logits512-tf", "greedy512", "mtp512", "mtp-logits"])
+        for model, items in r2.items():
+            for name, item in items.items():
+                self.assertNotIn("error", item, f"{model}/{name}: {item.get('error')}")
+        self.assertEqual(len(r2["flash-next"]["greedy512"]["ids"]), 512)
+        self.assertEqual(len(r2["qwen27b"]["logits512"]["logits"]["sha256"]), 64)
+        self.assertEqual(r2["qwen27b"]["mtp512"]["mtp"]["c2"], dict.fromkeys(rg.C2_PATHS, True))
+
+    def test_same_build_passes_every_r2_item(self):
+        self.record()
+        rc, text, res = self.check()
+        self.assertEqual(rc, 3, text)  # R1 and R3 skipped: INCOMPLETE, never 0, never 1
+        self.assertEqual(res["overall"], "INCOMPLETE")
+        items = [v for m in res["r2"].values() for v in m.values()]
+        self.assertEqual(len(items), 8)
+        self.assertTrue(all(v["verdict"] == rg.GREEN for v in items), text)
+        self.assertNotIn("RED", text)
+
+    def test_a_changed_greedy_id_fails_with_its_index(self):
+        self.record()
+        rc, text, res = self.check(mutate="id")
+        self.assertEqual(rc, 1, text)
+        for model in ("flash-next", "qwen27b"):
+            v = res["r2"][model]["greedy512"]
+            self.assertEqual(v["verdict"], rg.RED)
+            self.assertIn("first differing id at index 300", v["causes"][0])
+            self.assertEqual(res["r2"][model]["logits512"]["verdict"], rg.GREEN)
+        self.assertIn("RED      R2 qwen27b/greedy512", text)
+
+    def test_a_changed_logit_byte_fails_with_row_and_column(self):
+        self.record()
+        rc, text, res = self.check(mutate="logit")
+        self.assertEqual(rc, 1, text)
+        for model in ("flash-next", "qwen27b"):
+            v = res["r2"][model]["logits512-tf"]
+            self.assertEqual(v["verdict"], rg.RED)
+            self.assertIn(f"first differing byte at offset {(2 * V + 5) * 4 + 1}: row 2, column 5", v["causes"][0])
+            self.assertEqual(res["r2"][model]["logits512"]["verdict"], rg.GREEN)
+            self.assertEqual(res["r2"][model]["greedy512"]["verdict"], rg.GREEN)
+
+    def test_a_missing_reference_is_refused_by_name(self):
+        self.side("after", "chk", self.tree("chk"))
+        missing = self.out.resolve() / "nope" / "before.json"
+        for argv in (["compare", "--session", "chk", "--before-session", "nope", "--out", self.out],
+                     ["after", "--session", "chk2", "--before-session", "nope", "--root", self.d / "chk",
+                      "--data-root", self.data, "--out", self.out, "--raw", self.d / "raw", "--no-build",
+                      "--skip", "r1,r2", "--ram-gate-gib", "0"]):
+            err = io.StringIO()
+            with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(err), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rg.main([str(a) for a in argv])
+            self.assertEqual(cm.exception.code, 2, argv[0])
+            self.assertIn(str(missing), err.getvalue(), argv[0])
+        self.assertFalse((self.out / "chk" / "compare.json").exists())
 
 
 if __name__ == "__main__":
