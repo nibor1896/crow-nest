@@ -394,8 +394,9 @@ pub enum Family {
     /// `glm5_next_text`: GLM-5.3-Flash (#159) - mHC residual, MLA + DSA indexer without
     /// RoPE, KDA linear attention, 288-expert sigmoid MoE after three dense layers. The
     /// metadata gate accepts it into [`Glm5Geo`] and the planner plans it
-    /// (`manager::plan_glm5_next`, `states --plan`); the boot refuses it at its first
-    /// unbuilt arm (`meta::glm5_not_built`, plan steps 13a-13e and 14)
+    /// (`manager::plan_glm5_next`, `states --plan`); its layers run in `glm5_model` (#161,
+    /// `decode glmgolden`), the boot refuses it naming what is left (`meta::glm5_not_built`:
+    /// #175, #149 / plan step 14, plan step 20)
     Glm5Next,
 }
 
@@ -693,6 +694,25 @@ impl Glm5Geo {
     /// indexer cache per token per DSA layer, HF layout `[key | gate | valid]` at BF16 (514 B)
     pub const fn indexer_bytes_per_token(&self) -> u64 {
         ((2 * self.index_head_dim + 1) * 2) as u64
+    }
+    /// #161: values of one DSA layer's `kv_b_proj`, `[heads x (nope + v)][kv_lora]` (16,777,216)
+    pub const fn kv_b_values(&self) -> u64 {
+        (self.mla_heads * (self.nope_dim + self.v_dim) * self.kv_lora) as u64
+    }
+    /// #161: `kv_b_proj` of every DSA layer at BF16, the form `gm_absorb` / `gm_out_v` read
+    /// (`glm5_model` decodes it once at load): 11 x 16,777,216 x 2 = 369,098,752 B
+    pub const fn kv_b_bf16_bytes(&self) -> u64 {
+        self.dsa_layers as u64 * self.kv_b_values() * 2
+    }
+    /// #161: the same tensors as the container stores them, NVFP4 at 36 B per 64 values
+    /// (103,809,024 B), already inside the container's dense part
+    pub const fn kv_b_nvfp4_bytes(&self) -> u64 {
+        self.dsa_layers as u64 * (self.kv_b_values() / 64 * NVFP4_BLOCK_BYTES as u64)
+    }
+    /// #161: the VRAM the BF16 decode of `kv_b` adds on top of the container's dense part
+    /// (265,289,728 B): the #159 planner books it next to the dense part
+    pub const fn kv_b_decode_bytes(&self) -> u64 {
+        self.kv_b_bf16_bytes() - self.kv_b_nvfp4_bytes()
     }
     /// KDA recurrent state per layer per sequence, f32 `[heads][head dim][head dim]` (4 MiB)
     pub const fn kda_state_bytes(&self) -> u64 {

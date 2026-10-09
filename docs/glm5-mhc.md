@@ -12,9 +12,9 @@ step by step.
 - **CPU twin**: `glm5_mhc::{logits, coeffs, collapse, expand, site}`, the reference the GPU is
   tested against.
 
-**Status:** kernels, CPU twin and tests only. Nothing in the engine calls them: the layer driver
-(`Residual::Mhc`, plan step 11), the weight loader for `layers.L.hc_{attn,ffn}_{fn,base,scale}` and
-the `decode glmgolden` harness against the layerwise runner (#158) are the integrator's.
+**Status:** kernels, CPU twin and tests. The layer driver, the loader of
+`layers.L.hc_{attn,ffn}_{fn,base,scale}` and the `decode glmgolden` harness are `glm5_model`
+(#161, [glm5-model.md](glm5-model.md)); its GPU run awaits robin's Go.
 
 ## 1. Commands
 
@@ -98,5 +98,6 @@ except the column normalisation, on the kernel).
 - Speed is not measured. `glm5_mhc_coeffs` runs one block per row and reads the 786,432 B of `fn`
   per row; at decode (T = 1) that is one SM per site, 90 sites per token. A split-K grid is the
   first lever if the layer profile shows it.
-- G3 on the real model (every layer, both sites, against the layerwise runner's goldens at the
-  PREREG anchors) needs the `decode glmgolden` harness of #161's plan.
+- G3 on the real model (every layer, both sites, against the layerwise runner's goldens) is the
+  `decode glmgolden` table ([glm5-model.md](glm5-model.md)); not run yet. `pre` cannot be compared:
+  HF's hyper-connection does not return it.

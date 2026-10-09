@@ -503,7 +503,7 @@ mod tests_300_c7 {
     }
 
     /// #159: an index v2 container that carries the GLM-5.3-Flash config passes the gate's
-    /// family row and is refused at the boot door by its first unbuilt arm: before
+    /// family row and is refused at the boot door naming what its boot lacks (#161): before
     /// `Cnq::open` maps it and before any CUDA call (`geo_for` touches neither)
     #[test]
     fn a_glm_v2_container_is_refused_at_the_boot_door_by_its_first_unbuilt_arm() {
@@ -511,7 +511,7 @@ mod tests_300_c7 {
         let path = v2("glm5-next", &read(GLM, "config.json"), &read(GLM, "generation_config.json"), "Glm5Next", "glm5_next_text", &tensors(4096, 45));
         let peek = Cnq::peek_index(&path).unwrap();
         let why = geo_for(&path, &peek, None).unwrap_err();
-        assert!(why.contains("mHC residual (plan step 13a) for family Glm5Next not built yet"), "{why}");
+        assert!(why.contains("the dynamic expert cache (#175), the NVMe expert tier and the 200k boot (#149, plan step 14) and the vision tower (plan step 20) for family Glm5Next not built yet"), "{why}");
         assert!(why.contains(&format!("[{}]", meta::v2_config_label(&path, "config_json"))), "{why}");
         assert!(matches!(meta::gate(&path, &peek, None), Err(GateRefusal::Refused(_))));
     }

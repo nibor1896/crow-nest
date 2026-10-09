@@ -4,7 +4,9 @@ Plan step 14, the MLA/DSA part (crow-nest #163, parent nibor1896/Crow#362). This
 engine computes the 11 MLA + DSA layers of glm5_next, what state it keeps, how the module is called
 and what was measured. What the layer computes is [glm5-next-recipe.md](glm5-next-recipe.md),
 sections 7 and 8. The code is `engine/src/glm5_mla.rs` and its own NVRTC module
-`engine/src/kernels_glm5_mla.cu`. No `gen.rs` path calls it yet; the lead wires it in.
+`engine/src/kernels_glm5_mla.cu`.
+
+**Wired (#161, 2026-10-09):** `glm5_model` calls it in the decoder order and `decode glmgolden` runs it against the layerwise goldens; see [glm5-model.md](glm5-model.md). No GPU run of the wired path yet.
 
 ## 1. What it computes
 
@@ -65,6 +67,9 @@ s.forward(&kn, &weights, &cache, x, y, pos0, t);         // or the stages below
   plans NVFP4 for q_a, q_b, kv_a, kv_b and o_proj, `converter/src/recipe.rs`) runs its own projections
   into `qa`, `q`, `kva`, `ip`, `iq` and from `o`, and keeps the stages.
 - `kv_b` is read by `gm_absorb` and `gm_out_v` as BF16, whatever the container holds (open question 2).
+- #161: `forward_with` is `forward` stage for stage with q_a, q_b, kv_a and o_proj handed to a
+  closure (`MlaProj`); `glm5_model` runs them on `gemv_fp4_b`. `MlaKernels::rmsnorm_rows` exposes
+  `gm_rmsnorm` for the decoder's two layernorms.
 - Scratch: `[max_t][cap/4]` f32 pool scores dominate for long caches (512 rows × 50,000 pools = 100 MB);
   a prefill chunk bounds `max_t`.
 - Graph capture: the per-call position is device data, but the grid of `gm_idx_scores` grows with the
@@ -119,7 +124,8 @@ red); the first build of the source failed the NVRTC test (`INFINITY` undefined)
 2. **kv_b codec.** The kernels read `kv_b` as BF16 (16.8 M values per layer, 33.6 MB; 369 MB for 11
    layers); the converter recipe writes it NVFP4 from a BF16 source. Either the converter keeps it BF16,
    or the boot decodes NVFP4 into a BF16 buffer (a second rounding unless the decoded values are exact in
-   BF16), or the kernels learn NVFP4.
+   BF16), or the kernels learn NVFP4. #161 took the second (scope comment on #161): decoded once at load,
+   the inexact-value count printed, the BF16 bytes booked by the #159 planner.
 
 ## 6. Not done here
 

@@ -783,6 +783,9 @@ pub struct TierInput {
     pub stability: Stability,
     /// VRAM-resident bytes that are not routed experts (the container's dense part)
     pub dense_bytes: u64,
+    /// #161: what the load adds on top of the container's dense part: `kv_b_proj` decoded from
+    /// NVFP4 to BF16 (`Glm5Geo::kv_b_decode_bytes`, 265,289,728 B on GLM-5.3-Flash)
+    pub decoded_bytes: u64,
     /// `Glm5States::total` at the boot context
     pub states_bytes: u64,
     /// the cold staging slots (`Stability::stage_slots`) times one expert block
@@ -804,7 +807,7 @@ pub struct TierInput {
 pub struct TierPlan {
     /// `Stability::vram_ceiling(vram_total)`
     pub vram_ceiling: u64,
-    /// dense + states + staging + pending (with the policy reserve) + `SAFETY`
+    /// dense + decoded + states + staging + pending (with the policy reserve) + `SAFETY`
     pub fixed_bytes: u64,
     /// `expert_block_bytes x moe_layers`
     pub unit_bytes: u64,
@@ -835,13 +838,13 @@ pub fn plan_three_tiers(i: &TierInput) -> Result<TierPlan, String> {
     let vram_ceiling = i.stability.vram_ceiling(i.vram_total);
     // the clamp's own sum (`clamp_hot_n`): what must fit the card, the policy reserve inside pending
     let pending = planner_pending_for(&i.stability, i.vram_total, i.launch_slack, 0, 0, 0);
-    let need = i.dense_bytes + i.states_bytes + i.staging_bytes + pending + SAFETY;
+    let need = i.dense_bytes + i.decoded_bytes + i.states_bytes + i.staging_bytes + pending + SAFETY;
     // the same sum without the reserve: what lands below the ceiling
     let fixed_bytes = need - i.stability.planner_reserve(i.vram_total);
     if need > i.vram_total {
         return Err(format!(
-            "refusing config: family Glm5Next needs {:.2} GiB before any expert (dense part {:.2} + states {:.2} + staging {:.2} + launch slack {:.2} + safety {:.2}) against a VRAM plan ceiling of {:.2} GiB (card {:.2} GiB - headroom {:.2} GiB, cap {}) - the dense part does not fit, no expert tier changes that (#159)",
-            gib(fixed_bytes), gib(i.dense_bytes), gib(i.states_bytes), gib(i.staging_bytes), gib(i.launch_slack), gib(SAFETY),
+            "refusing config: family Glm5Next needs {:.2} GiB before any expert (dense part {:.2} + kv_b at BF16 {:.2} + states {:.2} + staging {:.2} + launch slack {:.2} + safety {:.2}) against a VRAM plan ceiling of {:.2} GiB (card {:.2} GiB - headroom {:.2} GiB, cap {}) - the dense part does not fit, no expert tier changes that (#159)",
+            gib(fixed_bytes), gib(i.dense_bytes), gib(i.decoded_bytes), gib(i.states_bytes), gib(i.staging_bytes), gib(i.launch_slack), gib(SAFETY),
             gib(vram_ceiling), gib(i.vram_total), gib(i.stability.vram_headroom),
             i.stability.vram_cap.map_or("none".to_string(), |c| format!("{:.2} GiB", gib(c)))
         ));
@@ -880,6 +883,8 @@ pub fn plan_glm5_next(
         vram_total,
         stability,
         dense_bytes,
+        // #161: kv_b is stored NVFP4 and decoded once to BF16 at load (the MLA kernels read BF16)
+        decoded_bytes: g.kv_b_decode_bytes(),
         states_bytes: states.total(),
         // decode and prefill sets apart (#176): both are held, one record per slot
         staging_bytes: slots.bytes(expert_block_bytes),
@@ -968,6 +973,7 @@ pub fn glm5_plan_table(g: &Glm5Geo, s: &Glm5States, i: &TierInput, p: &TierPlan,
     o.push(format!("  plan ceiling         {:>16} B  {:>7.2} GiB  card - headroom {:.2} GiB, cap {} (Stability::GLM5_NEXT, #176)", p.vram_ceiling, gib(p.vram_ceiling), gib(i.stability.vram_headroom),
         i.stability.vram_cap.map_or("none".to_string(), |c| format!("{:.2} GiB", gib(c)))));
     o.push(format!("  dense part           {:>16} B  {:>7.2} GiB", i.dense_bytes, gib(i.dense_bytes)));
+    o.push(format!("  kv_b at BF16         {:>16} B  {:>7.2} GiB  {} DSA layers: kv_b decoded at load, BF16 {} B - container NVFP4 {} B (#161)", i.decoded_bytes, gib(i.decoded_bytes), g.dsa_layers, g.kv_b_bf16_bytes(), g.kv_b_nvfp4_bytes()));
     o.push(format!("  MLA latent           {:>16} B  {:>7.2} GiB  {} x {} tokens x {} B", s.latent_bytes, gib(s.latent_bytes), g.dsa_layers, s.context, s.latent_per_token));
     o.push(format!("  indexer cache        {:>16} B  {:>7.2} GiB  {} x {} tokens x {} B", s.indexer_bytes, gib(s.indexer_bytes), g.dsa_layers, s.context, s.indexer_per_token));
     o.push(format!("  KDA state + conv     {:>16} B  {:>7.2} GiB  {} layers x ({} + {} B) per sequence", s.kda_state_bytes + s.kda_conv_bytes, gib(s.kda_state_bytes + s.kda_conv_bytes), g.kda_layers, g.kda_state_bytes(), g.kda_conv_bytes()));
@@ -1959,10 +1965,26 @@ mod tests_159_glm_plan {
         assert_eq!(p.vram_ceiling, 32_043_433_984);
         assert_eq!(p.unit_bytes, 594_542_592);
         assert_eq!((p.hot, p.pinned, p.nvme), (32, 83, 173));
-        assert_eq!(p.fixed_bytes, GLM5_NEXT_DENSE_BYTES + s.total() + i.staging_bytes + LAUNCH_SLACK + SAFETY);
+        assert_eq!(p.fixed_bytes, GLM5_NEXT_DENSE_BYTES + Glm5Geo::GLM_5_3_FLASH.kv_b_decode_bytes() + s.total() + i.staging_bytes + LAUNCH_SLACK + SAFETY);
         assert!(p.fixed_bytes + p.hot_bytes() <= p.vram_ceiling && p.fixed_bytes + p.hot_bytes() + p.unit_bytes > p.vram_ceiling);
         assert!(p.pinned_bytes() <= HOST_PINNED_CAP);
         assert_eq!(p.hot_bytes() + p.pinned_bytes() + p.nvme_bytes(), GLM5_NEXT_EXPERT_BLOCKS * GLM5_NEXT_EXPERT_BLOCK_BYTES);
+    }
+
+    /// #161: the plan books kv_b decoded to BF16 at load (the MLA kernels read BF16; the container
+    /// stores it NVFP4, inside the dense part): 11 x 16,777,216 values, BF16 369,098,752 B minus
+    /// NVFP4 103,809,024 B = 265,289,728 B more VRAM before any expert, named in the printout
+    #[test]
+    fn the_glm_plan_books_kv_b_decoded_to_bf16() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        assert_eq!((g.kv_b_values(), g.kv_b_bf16_bytes(), g.kv_b_nvfp4_bytes(), g.kv_b_decode_bytes()), (16_777_216, 369_098_752, 103_809_024, 265_289_728));
+        let (s, i, p) = plan(CARD, HOST_PINNED_CAP, 200_000).unwrap();
+        assert_eq!(i.decoded_bytes, 265_289_728);
+        assert_eq!(p.fixed_bytes, GLM5_NEXT_DENSE_BYTES + 265_289_728 + s.total() + i.staging_bytes + LAUNCH_SLACK + SAFETY);
+        let t = glm5_plan_table(&g, &s, &i, &p, &[]);
+        let want = "  kv_b at BF16                265289728 B     0.25 GiB  11 DSA layers: kv_b decoded at load, BF16 369098752 B - container NVFP4 103809024 B (#161)";
+        assert!(t.contains(want), "{want:?} missing:
+{t}");
     }
 
     /// a card that cannot hold the dense part and the states is refused by name; the
@@ -2041,15 +2063,17 @@ mod tests_rec_size {
 
     /// at 9,474,048 B per record on the RTX 5090, 200,000 tokens, the 46 GiB cap: the unit is
     /// 42 x 9,474,048 = 397,910,016 B, the staging 160 x 9,474,048 = 1,515,847,680 B, and the
-    /// tiers per MoE layer are N 51 in VRAM, P 124 pinned, 113 on NVMe (4.5 bit: 32 / 83 / 173)
+    /// tiers per MoE layer are N 50 in VRAM, P 124 pinned, 114 on NVMe (4.5 bit: 32 / 83 / 173).
+    /// #161: was N 51 / NVMe 113 before the plan booked kv_b's BF16 decode (265,289,728 B the
+    /// MLA path allocates on top of the container's dense part): one VRAM unit fewer.
     #[test]
-    fn the_glm_plan_at_the_3bit_record_is_n51_p124_nvme113() {
+    fn the_glm_plan_at_the_3bit_record_is_n50_p124_nvme114() {
         let (s, i, p) = plan(MUL1_PLAN, HOST_PINNED_CAP).unwrap();
         assert_eq!(i.expert_block_bytes, MUL1_PLAN);
         assert_eq!(i.staging_bytes, 1_515_847_680, "32 decode + 128 prefill slots of 9,474,048 B (#176)");
         assert_eq!(p.unit_bytes, 397_910_016);
-        assert_eq!((p.hot, p.pinned, p.nvme), (51, 124, 113));
-        assert_eq!(p.fixed_bytes, GLM5_NEXT_DENSE_BYTES + s.total() + i.staging_bytes + LAUNCH_SLACK + SAFETY);
+        assert_eq!((p.hot, p.pinned, p.nvme), (50, 124, 114));
+        assert_eq!(p.fixed_bytes, GLM5_NEXT_DENSE_BYTES + Glm5Geo::GLM_5_3_FLASH.kv_b_decode_bytes() + s.total() + i.staging_bytes + LAUNCH_SLACK + SAFETY);
         assert!(p.fixed_bytes + p.hot_bytes() <= p.vram_ceiling && p.fixed_bytes + p.hot_bytes() + p.unit_bytes > p.vram_ceiling);
         assert!(p.pinned_bytes() <= HOST_PINNED_CAP && p.pinned_bytes() + p.unit_bytes > HOST_PINNED_CAP);
         let t = glm5_plan_table(&Glm5Geo::GLM_5_3_FLASH, &s, &i, &p, &[]);
@@ -2057,9 +2081,9 @@ mod tests_rec_size {
             format!("  expert block         {:>16} B", MUL1_PLAN),
             format!("  cold staging         {:>16} B", 1_515_847_680u64),
             "unit = 397910016 B = 42 layers x one block".to_string(),
-            "VRAM    N =  51".to_string(),
+            "VRAM    N =  50".to_string(),
             "pinned  P = 124".to_string(),
-            "NVMe        113".to_string(),
+            "NVMe        114".to_string(),
         ] {
             assert!(t.contains(&want), "{want:?} missing:\n{t}");
         }

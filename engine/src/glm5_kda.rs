@@ -126,7 +126,15 @@ impl KdaKernels {
     /// # Safety
     /// A CUDA context is current.
     pub unsafe fn new(g: &Glm5Geo) -> KdaKernels {
-        let base = cuda::compile(&kernel_geo(g).source());
+        KdaKernels::with_base(g, cuda::compile(&kernel_geo(g).source()))
+    }
+
+    /// #161: the KDA kernels on a `KERNEL_SRC` module the caller compiled at [`kernel_geo`] (the
+    /// one shared glm5 compile of `glm5_model::Glm5Kernels`); `base` may be a second handle to
+    /// that module, whose owner unloads it. Compiles `GLM5_KDA_SRC`.
+    /// # Safety
+    /// A CUDA context is current and `base` holds `KERNEL_SRC` at [`kernel_geo`] of `g`.
+    pub unsafe fn with_base(g: &Glm5Geo, base: cuda::Module) -> KdaKernels {
         KdaKernels {
             d: KdaDims::of(g),
             gemm: base.get("gemm_bf16_dense"),
@@ -410,6 +418,66 @@ pub unsafe fn step(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &KdaScrat
     gemv(kk, sc, w.g_b, sc.ga, sc.gate, P_HD, d.width(), P_WIDTH);
     launch_v(kk.gated_norm, heads, 1, 1, hd, &[sc.o, sc.gate, w.o_norm, sc.normed]);
     gemv(kk, sc, w.o_proj, sc.normed, out, P_WIDTH, d.hidden, P_HIDDEN);
+}
+
+/// #161: the two projections of a KDA layer a caller may run in another weight codec (the
+/// container stores them NVFP4, `converter/src/recipe.rs`); the gate projections stay BF16.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KdaProj {
+    /// `x [t][hidden]` -> `y [t][conv_ch]`, q | k | v per row
+    Qkv,
+    /// `x [t][width]` (the gated-normed `o`) -> `y [t][hidden]`
+    O,
+}
+
+/// [`prompt`] with the q|k|v and o_proj projections queued by `proj(which, x, y, t)` instead of
+/// the BF16 `gemm` (`w.qkv` and `w.o_proj` are not read); every other stage is `prompt`'s,
+/// launch for launch. `prompt` itself is unchanged (its G3 evidence of #162).
+/// # Safety
+/// As [`prompt`]; `proj` queues on the current stream and writes `y` in the layout above.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn prompt_with(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &KdaScratch, x: Dev, t: usize, out: Dev, proj: &mut dyn FnMut(KdaProj, Dev, Dev, usize)) {
+    let d = &kk.d;
+    assert!((1..=sc.max_t).contains(&t), "#162: KDA prompt call of {t} rows (scratch holds {})", sc.max_t);
+    cuda::to_i32_into(sc.params, &[t as i32]);
+    let (cc, hd, heads) = (d.conv_ch(), d.head_dim as u32, d.heads as u32);
+    proj(KdaProj::Qkv, x, sc.qkv, t);
+    launch_v(kk.transpose, cc as u32, 1, 1, 256, &[sc.qkv, sc.qkv_t, sc.p(P_T), sc.p(P_CONV)]);
+    launch_v(kk.conv_silu, cc as u32, 1, 1, 256, &[sc.qkv_t, w.conv, sc.conv_t, sc.p(P_T), st.conv]);
+    launch_v(kk.conv_state_update, cc as u32, 1, 1, (d.conv - 1) as u32, &[sc.qkv_t, st.conv, sc.p(P_T)]);
+    launch_v(kk.split_qkv, (t * cc).div_ceil(256) as u32, 1, 1, 256, &[sc.conv_t, sc.q, sc.k, sc.v, sc.p(P_T)]);
+    launch_v(kk.l2norm, heads, t as u32, 1, hd, &[sc.q, sc.k, sc.qn, sc.kn]);
+    gemm(kk, sc, w.f_a, x, sc.fa, P_HIDDEN, d.head_dim, P_HD, t);
+    gemm(kk, sc, w.f_b, sc.fa, sc.f, P_HD, d.width(), P_WIDTH, t);
+    gemm(kk, sc, w.b, x, sc.b, P_HIDDEN, d.heads, P_HEADS, t);
+    launch_v(kk.kda.gate, (t * d.width()).div_ceil(256) as u32, 1, 1, 256, &[
+        sc.f, w.dt_bias, w.a_log, sc.b, sc.g, sc.beta, sc.p(P_T), sc.p(P_HEADS), sc.lb]);
+    launch_v(kk.kda.persist, heads, 1, 1, hd, &[sc.qn, sc.kn, sc.v, sc.g, sc.beta, sc.o, st.s, sc.p(P_T), sc.p(P_ZERO)]);
+    gemm(kk, sc, w.g_a, x, sc.ga, P_HIDDEN, d.head_dim, P_HD, t);
+    gemm(kk, sc, w.g_b, sc.ga, sc.gate, P_HD, d.width(), P_WIDTH, t);
+    launch_v(kk.gated_norm, heads, t as u32, 1, hd, &[sc.o, sc.gate, w.o_norm, sc.normed]);
+    proj(KdaProj::O, sc.normed, out, t);
+}
+
+/// [`step`] with the two projections queued by `proj(which, x, y, 1)`, as [`prompt_with`].
+/// # Safety
+/// As [`step`]; `proj` as in [`prompt_with`].
+pub unsafe fn step_with(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &KdaScratch, x: Dev, out: Dev, proj: &mut dyn FnMut(KdaProj, Dev, Dev, usize)) {
+    let d = &kk.d;
+    let (cc, wb, hd, heads) = (d.conv_ch(), (d.width() * 4) as u64, d.head_dim as u32, d.heads as u32);
+    proj(KdaProj::Qkv, x, sc.qkv, 1);
+    launch_v(kk.conv_step, cc.div_ceil(256) as u32, 1, 1, 256, &[sc.qkv, w.conv, st.conv, sc.conv_t]);
+    launch_v(kk.l2norm, heads, 1, 1, hd, &[sc.conv_t, sc.conv_t + wb, sc.qn, sc.kn]);
+    gemv(kk, sc, w.f_a, x, sc.fa, P_HIDDEN, d.head_dim, P_HD);
+    gemv(kk, sc, w.f_b, sc.fa, sc.f, P_HD, d.width(), P_WIDTH);
+    gemv(kk, sc, w.b, x, sc.b, P_HIDDEN, d.heads, P_HEADS);
+    launch_v(kk.kda.gate, d.width().div_ceil(256) as u32, 1, 1, 256, &[
+        sc.f, w.dt_bias, w.a_log, sc.b, sc.g, sc.beta, sc.p(P_ONE), sc.p(P_HEADS), sc.lb]);
+    launch_v(kk.kda.step, heads, 1, 1, hd, &[st.s, sc.qn, sc.kn, sc.conv_t + 2 * wb, sc.g, sc.beta, sc.o]);
+    gemv(kk, sc, w.g_a, x, sc.ga, P_HIDDEN, d.head_dim, P_HD);
+    gemv(kk, sc, w.g_b, sc.ga, sc.gate, P_HD, d.width(), P_WIDTH);
+    launch_v(kk.gated_norm, heads, 1, 1, hd, &[sc.o, sc.gate, w.o_norm, sc.normed]);
+    proj(KdaProj::O, sc.normed, out, 1);
 }
 
 /// The synthetic KDA layer of the #162 goldens: the counter-based generator of

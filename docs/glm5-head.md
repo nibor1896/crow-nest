@@ -11,8 +11,9 @@ GLM-5.3-Flash holds 4 residual streams per token. The head turns them into logit
 
 The recipe rows are [glm5-next-recipe.md](glm5-next-recipe.md) section 3, rows 4-6.
 
-**Status:** kernel, host side and tests. Nothing in the engine calls them; `gen.rs` gets the
-`StreamMeanRms` arm when the lead integrates the GLM arms (13a-13e).
+**Status:** kernel, host side and tests. `glm5_model::run_head` calls it at the end of a
+`decode glmgolden` pass ([glm5-model.md](glm5-model.md)); `gen.rs` gets the `StreamMeanRms` arm with
+the GLM boot (plan step 14).
 
 ## 1. Code
 
@@ -113,7 +114,6 @@ The GPU tests need about 1.4 GB of VRAM (the synthetic lm_head is 1,268,776,960 
 ## 6. Open
 
 - The input side of the stream trunk is the embedding copied into the 4 streams
-  (`modeling_glm5_next.py:1477`, recipe section 3 row 2). It is not in #165's scope and not in this
-  module. #161 cites it in its Evidence, but no step names it as its own.
+  (`modeling_glm5_next.py:1477`, recipe section 3 row 2): `glm5_model::trunk_input` (#161).
 - The real model runs in BF16, where HF rounds the norm output to BF16 before the weight. The engine
   and the step-7 runner are f32. That difference belongs to the whole-model gate (step 15), not here.

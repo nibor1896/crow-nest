@@ -7,6 +7,10 @@
 //!       trace + per-step timing (the standing-series engine side).
 //!   decode longctx <prompt_ids> <fill> <gen> — QSA sparse regime: fill the
 //!       context past the 2048 budget with real prefill, then decode steps.
+//!   decode glmgolden <dir> [--chain] [--layers A:B] [--cnq PATH] — #161: the
+//!       glm5_next layers (`glm5_model`) on the 3-bit GLM-5.3-Flash container against the
+//!       layerwise runner's goldens, per layer, site and row group; `--chain` feeds each
+//!       layer the engine's own output (drift over depth, not gated).
 //!   decode selftest [<golden_dir>]       — the PACKAGE self-test (F5, #64): the
 //!       engine's layer outputs against the goldens shipped with the package,
 //!       max_abs per layer against the gate, exit 0 or 1. No `models/`, no
@@ -37,6 +41,15 @@ fn main() {
     let _log = crow_nest_engine::log::init();
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("help");
+
+    // #161: glm5_next has no `Engine` / `Geo` path (the boot refuses it, `meta::glm5_not_built`);
+    // its harness opens the container itself, before `boot::open_model` would refuse it
+    if mode == "glmgolden" {
+        let failed = unsafe { glmgolden(&args) };
+        crow_nest_engine::log::shutdown();
+        unsafe { crow_nest_engine::cuda::ctx_hard_reset(); }
+        std::process::exit(failed as i32);
+    }
 
     // CROW_CNQ and CROW_HOTSETS override container and hot-set sidecar
     // (e.g. a sidecar warmed on real traffic via `decode warmup`)
@@ -914,7 +927,7 @@ fn main() {
                 );
             }
             _ => {
-                println!("usage: decode parity <ids.json> <out> | decode run <ids.json> <gen> | decode layercheck | decode layercheck3 | decode selftest [<golden_dir>]");
+                println!("usage: decode parity <ids.json> <out> | decode run <ids.json> <gen> | decode layercheck | decode layercheck3 | decode selftest [<golden_dir>] | decode glmgolden <dir> [--chain] [--layers A:B] [--cnq PATH]");
             }
         }
     }
@@ -958,6 +971,256 @@ struct Check {
 /// the `checks[]` of a self-test manifest, or `Err(<what is wrong, by index and key>)`.
 /// Every field is required: a manifest that leaves the gate out would otherwise be read
 /// as a gate of 0, and a self-test that cannot say what it checks is not evidence.
+/// #161: `decode glmgolden <dir> [--chain] [--layers A:B] [--cnq PATH]`. The glm5_next layers
+/// (`glm5_model::Glm5Pass`) on the container (default the 3-bit `GLM5_MUL1K3_CNQ`, or `CROW_CNQ`)
+/// against the layerwise runner's goldens in `<dir>` (`oracle/glm5_layerwise.py run
+/// --capture-subblocks`, docs/glm5-reference-runner.md section 5), one layer in VRAM at a time,
+/// the runner's call split (prompt in `prompt_chunk` calls, each decode row alone).
+///
+/// Golden-fed (default): layer k reads the golden `l<k-1>-output.f32` (layer 0: `embed.f32` in
+/// the 4 streams), its FFN site the golden `l<k>-ffn_hc-in.f32`, so every site is judged on the
+/// golden's input. Per layer, site and row group (prompt, decode): cosine, max_abs, rel_rms of
+/// `collapsed`, the sub-layer `out` and the `expanded` streams, G3 (cosine >= 0.9999, NaN fails);
+/// `post` / `comb` by max_abs; `pre` not compared (the runner cannot capture it). Routing top-8
+/// overlap against `l<k>-routing-ids.i32`, DSA overlap against `l<k>-dsa-topk.i32`, logits at the
+/// anchors when the last layer runs. `--chain`: layer 0 reads the container's own embedding rows,
+/// every later layer the engine's output; the same table, reported, not gated. Returns "failed".
+unsafe fn glmgolden(args: &[String]) -> bool {
+    use crow_nest_engine::cnq::Cnq;
+    use crow_nest_engine::cuda;
+    use crow_nest_engine::glm5_head::Head;
+    use crow_nest_engine::glm5_model::{self as gm, golden::*, AttnKind, FfnKind, LoadReport, Taps};
+    use crow_nest_engine::glm5_moe::MoeGeo;
+    use crow_nest_engine::meta::{v2_config_label, ModelMeta};
+    use std::path::Path;
+    let refuse = |why: String| -> ! { panic!("[glmgolden] refused: {why}") };
+    let flag = |n: &str| args.iter().position(|a| a == n).and_then(|i| args.get(i + 1)).cloned();
+    let chain = args.iter().any(|a| a == "--chain");
+    let dir = args
+        .get(2)
+        .filter(|a| !a.starts_with("--"))
+        .cloned()
+        .unwrap_or_else(|| refuse("usage: decode glmgolden <golden dir> [--chain] [--layers A:B] [--cnq PATH]".into()));
+    let dirp = Path::new(&dir);
+    let man_text = std::fs::read_to_string(dirp.join("manifest.json")).unwrap_or_else(|e| refuse(format!("{dir}/manifest.json: {e}")));
+    let man = Manifest::parse(&man_text).unwrap_or_else(|e| refuse(e));
+    let cnq_path = flag("--cnq").or_else(|| std::env::var("CROW_CNQ").ok()).unwrap_or_else(|| from_engine_dir(gm::GLM5_MUL1K3_CNQ));
+    // the container: an index v2 whose config is the glm5_next family row, MUL1 expert records
+    let mut cnq = Cnq::open_checked(&cnq_path).unwrap_or_else(|e| refuse(format!("{cnq_path}: {e}")));
+    let config = cnq.config_json().map(str::to_string).unwrap_or_else(|| refuse(format!("{cnq_path}: no index v2 config")));
+    let generation = cnq.generation_config_json().map(str::to_string);
+    let gen_label = v2_config_label(&cnq_path, "generation_config_json");
+    let meta = ModelMeta::from_config_texts(&config, &v2_config_label(&cnq_path, "config_json"), generation.as_deref().map(|t| (t, gen_label.as_str())))
+        .unwrap_or_else(|e| refuse(e));
+    let bad = meta.verify();
+    if !bad.is_empty() {
+        refuse(format!("{} constants differ from the glm5_next family row: {}", bad.len(), bad.iter().map(|c| c.line()).collect::<Vec<_>>().join("; ")));
+    }
+    let g = meta.glm5_geo().unwrap_or_else(|e| refuse(e));
+    let (spec, nrec) = crow_nest_engine::nvme_source::glm5_record_of_container(&cnq_path).unwrap_or_else(|e| refuse(e));
+    let moe = MoeGeo::new(&g, spec).unwrap_or_else(|e| refuse(e));
+    if (man.hidden, man.hc) != (g.hidden, g.hc_streams) {
+        refuse(format!("the golden is hidden {} x {} streams, the container {} x {}", man.hidden, man.hc, g.hidden, g.hc_streams));
+    }
+    let layers = layer_range(flag("--layers").as_deref(), &man.layers, g.layers).unwrap_or_else(|e| refuse(e));
+    if layers.is_empty() {
+        refuse(format!("{dir}: the golden holds no l<k>-output.f32"));
+    }
+    let (n, h, t_p) = (man.n, g.hidden, man.t);
+    let row = g.hc_streams * h;
+    let calls = man.calls();
+    let max_t = calls.iter().map(|c| c.1).max().unwrap_or(1);
+    println!(
+        "[glmgolden] golden {dir}: {} rows (T {} + D {}), prompt in calls of {} ({} calls), layers {:?}, {}",
+        n,
+        man.t,
+        man.d,
+        if man.prompt_chunk == 0 { man.t } else { man.prompt_chunk },
+        calls.len(),
+        layers,
+        if chain { "chain mode (fed by its own output, not gated)" } else { "golden-fed (G3: cosine >= 0.9999 per layer, site and row group)" }
+    );
+    println!(
+        "[glmgolden] container {cnq_path}: {} constants verified, routed experts {} x {} B ({} records, codec {})",
+        meta.checks().len(),
+        g.experts,
+        spec.bytes,
+        nrec,
+        spec.codec.dtype()
+    );
+    let read = |f: &str, nv: usize| read_f32(&dirp.join(f), nv).unwrap_or_else(|e| refuse(e));
+    let _ctx = cuda::Ctx::init();
+    let mut pass = gm::Glm5Pass::new(&g, moe, max_t, n);
+    let xd = cuda::alloc_named("glmgolden residual", n * row * 4);
+    let first = layers[0];
+    let mut x_host: Vec<f32> = if first == 0 {
+        let gold = read("embed.f32", n * h);
+        if chain {
+            let e = gm::embed_rows(&mut cnq, &g, &man.ids);
+            let d = e.iter().zip(&gold).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            println!("[glmgolden] embedding rows from the container vs the golden embed.f32: max_abs {d:.3e}");
+            gm::trunk_input(&e, h, g.hc_streams)
+        } else {
+            gm::trunk_input(&gold, h, g.hc_streams)
+        }
+    } else {
+        read(&format!("l{}-output.f32", first - 1), n * row)
+    };
+    let groups: Vec<(&str, usize, usize)> = [("prompt", 0, t_p), ("decode", t_p, n)].into_iter().filter(|g| g.2 > g.1).collect();
+    let (mut fails, mut judged) = (0usize, 0usize);
+    let mut drift: Vec<(usize, f64)> = Vec::new();
+    for &l in &layers {
+        if !chain && l != first {
+            x_host = read(&format!("l{}-output.f32", l - 1), n * row);
+        }
+        cuda::to_f32_into(xd, &x_host);
+        let t0 = std::time::Instant::now();
+        let mut rep = LoadReport::default();
+        let mut lw = gm::load_layer(&mut cnq, &g, &moe, l, &mut rep);
+        let kv_b = if rep.kv_b_values > 0 { format!(", kv_b to BF16: {} of {} values inexact (RNE)", rep.kv_b_inexact, rep.kv_b_values) } else { String::new() };
+        println!(
+            "[glmgolden] l{l} {} loaded in {:.1} s: {} B to VRAM, {} NVFP4 scale bytes 0x7F -> 0x7E (#177){kv_b}",
+            gm::kind_label(&g, l),
+            t0.elapsed().as_secs_f64(),
+            rep.bytes,
+            rep.sanitized
+        );
+        pass.begin_layer();
+        let ffn_gold = if chain { None } else { man.subblock(l, "ffn", "in").map(|f| read(&f, n * row)) };
+        let mut taps = Taps::default();
+        let (mut sel, mut routes): (Vec<Vec<usize>>, Vec<Vec<u32>>) = (Vec::new(), Vec::new());
+        let t1 = std::time::Instant::now();
+        for &(r0, t, dec) in &calls {
+            taps.ffn_in = ffn_gold.as_ref().map(|v| v[r0 * row..(r0 + t) * row].to_vec());
+            pass.call_tapped(&lw, xd + (r0 * row * 4) as u64, r0, t, dec, Some(&mut taps));
+            if gm::attn_kind(&g, l) == AttnKind::Mla {
+                sel.extend(pass.selection());
+            }
+            if gm::ffn_kind(&g, l) == FfnKind::Moe {
+                let r = pass.routing();
+                routes.extend((0..t).map(|i| r.ids_of(i).to_vec()));
+            }
+        }
+        cuda::sync();
+        let secs = t1.elapsed().as_secs_f64();
+        lw.free();
+        x_host = cuda::dtoh(xd, n * row);
+        println!("[glmgolden] l{l} computed in {secs:.2} s (taps synchronize: not a speed figure)");
+        let mut worst_layer = 1f64;
+        for (site, cap) in [("attn", &taps.attn), ("ffn", &taps.ffn)] {
+            println!("glmgolden l{l:<2} {site:<4} pre        not compared (HF's hyper-connection does not return it)");
+            for &role in SITE_ROLES {
+                let file = man.subblock(l, site, role).or_else(|| (site == "ffn" && role == "expanded").then(|| format!("l{l}-output.f32")));
+                let Some(file) = file else { continue };
+                let (eng, w) = match role {
+                    "post" => (&cap.post, g.hc_streams),
+                    "comb" => (&cap.comb, g.hc_streams * g.hc_streams),
+                    "collapsed" => (&cap.collapsed, h),
+                    "out" => (&cap.out, h),
+                    _ => (&cap.expanded, row),
+                };
+                let gold = read(&file, n * w);
+                for &(gname, a, b) in &groups {
+                    let c = compare(&eng[a * w..b * w], &gold[a * w..b * w], w);
+                    if role_is_judged(role) {
+                        let verdict = if chain {
+                            "chain"
+                        } else {
+                            judged += 1;
+                            if passes(&c) {
+                                "PASS"
+                            } else {
+                                fails += 1;
+                                "FAIL"
+                            }
+                        };
+                        if site == "ffn" && role == "expanded" {
+                            worst_layer = worst_layer.min(if c.cosine.is_nan() { 0.0 } else { c.cosine });
+                        }
+                        let nf = if c.non_finite > 0 { format!("  {} non-finite", c.non_finite) } else { String::new() };
+                        println!(
+                            "glmgolden l{l:<2} {site:<4} {role:<10} {gname:<6} rows {a:>4}..{:<4} cosine {:.9} (worst row {} {:.9})  max_abs {:.3e}  rel_rms {:.3e}{nf}  {verdict}",
+                            b - 1,
+                            c.cosine,
+                            a + c.worst_row,
+                            c.worst_row_cosine,
+                            c.max_abs,
+                            c.rel_rms
+                        );
+                    } else {
+                        println!("glmgolden l{l:<2} {site:<4} {role:<10} {gname:<6} rows {a:>4}..{:<4} max_abs {:.3e}  (coefficients, reported)", b - 1, c.max_abs);
+                    }
+                }
+            }
+        }
+        drift.push((l, 1.0 - worst_layer));
+        let rfile = format!("l{l}-routing-ids.i32");
+        if let (false, Some(shape)) = (routes.is_empty(), man.shape(&rfile)) {
+            let k = shape[1];
+            let gold = read_i32(&dirp.join(&rfile), n * k).unwrap_or_else(|e| refuse(e));
+            let (ov, same) = routing_overlap(&routes, &gold, k);
+            println!("glmgolden l{l:<2} routing top-{k} overlap {ov:.4} ({same} / {n} rows the same set)");
+        }
+        let dfile = format!("l{l}-dsa-topk.i32");
+        if let (false, Some(shape)) = (sel.is_empty(), man.shape(&dfile)) {
+            let w = shape[1];
+            let gold = read_i32(&dirp.join(&dfile), n * w).unwrap_or_else(|e| refuse(e));
+            let (ov, same) = dsa_overlap(&sel, &gold, w);
+            println!("glmgolden l{l:<2} dsa selection overlap {ov:.4} ({same} / {n} rows the same set)");
+        }
+    }
+    // the head, when the pass reaches the last layer and the golden has logits
+    let last = *layers.last().unwrap();
+    let anchors: Vec<usize> = man.anchors.iter().copied().filter(|p| man.shape(&format!("logits-anchor-{p}.f32")).is_some()).collect();
+    if last + 1 == g.layers && !anchors.is_empty() {
+        let x_head = if chain { x_host.clone() } else { read(&format!("l{last}-output.f32"), n * row) };
+        let rows: Vec<f32> = anchors.iter().flat_map(|&p| x_head[p * row..(p + 1) * row].iter().copied()).collect();
+        let mut rep = LoadReport::default();
+        let hw = gm::load_head(&mut cnq, &g, &mut rep);
+        let head = Head::new(gm::head_geo(&g));
+        let (na, v) = (anchors.len(), g.vocab);
+        let xa = cuda::to_f32_dev(&rows);
+        let nd = cuda::alloc_named("glmgolden normed", na * h * 4);
+        let ld = cuda::alloc_named("glmgolden logits", na * v * 4);
+        let idd = cuda::alloc_named("glmgolden ids", na * 4);
+        gm::run_head(&pass.kn, &head, &hw, xa, nd, ld, idd, na);
+        cuda::sync();
+        let (logits, ids) = (cuda::dtoh(ld, na * v), cuda::dtoh_i32(idd, na));
+        for (i, &p) in anchors.iter().enumerate() {
+            let gold = read(&format!("logits-anchor-{p}.f32"), v);
+            let c = compare(&logits[i * v..(i + 1) * v], &gold, v);
+            let top = gold.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |m, (j, &x)| if x > m.1 { (j, x) } else { m }).0;
+            let verdict = if chain {
+                "chain"
+            } else {
+                judged += 1;
+                if passes(&c) {
+                    "PASS"
+                } else {
+                    fails += 1;
+                    "FAIL"
+                }
+            };
+            println!(
+                "glmgolden logits anchor {p:<5} cosine {:.9}  max_abs {:.3e}  rel_rms {:.3e}  greedy {} (golden {top})  {verdict}",
+                c.cosine, c.max_abs, c.rel_rms, ids[i]
+            );
+        }
+    }
+    let rise: Vec<f64> = drift.iter().map(|d| d.1).collect();
+    println!("glmgolden 1-cos of the layer output by depth: {}", drift.iter().map(|(l, d)| format!("l{l} {d:.2e}")).collect::<Vec<_>>().join(", "));
+    if monotone_rise(&rise) {
+        println!("glmgolden finding: 1 - cosine rises monotonically over layers {first}..={last} (#161 failure mode, reported even when every layer passes)");
+    }
+    if chain {
+        println!("glmgolden: chain mode, {} layers reported, not gated", layers.len());
+        false
+    } else {
+        println!("glmgolden: {} ({fails} of {judged} G3 rows failed)", if fails == 0 { "ALL PASS" } else { "FAILED" });
+        fails > 0
+    }
+}
+
 fn parse_manifest(text: &str) -> Result<Vec<Check>, String> {
     let v: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
