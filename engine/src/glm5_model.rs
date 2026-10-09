@@ -1089,11 +1089,11 @@ impl Glm5Pass {
                 let mut proj = |p: KdaProj, xi: Dev, yo: Dev, tt: usize| match p {
                     KdaProj::Qkv => {
                         let cc = kn.kda.d.conv_ch();
-                        fp4_gemv(&kn.k, ints, &a.q, xi, yo, tt, Some(cc));
-                        fp4_gemv(&kn.k, ints, &a.k, xi, yo + (wd * 4) as u64, tt, Some(cc));
-                        fp4_gemv(&kn.k, ints, &a.v, xi, yo + (2 * wd * 4) as u64, tt, Some(cc));
+                        fp4_gemv(kn, ints, &a.q, xi, yo, tt, Some(cc));
+                        fp4_gemv(kn, ints, &a.k, xi, yo + (wd * 4) as u64, tt, Some(cc));
+                        fp4_gemv(kn, ints, &a.v, xi, yo + (2 * wd * 4) as u64, tt, Some(cc));
                     }
-                    KdaProj::O => fp4_gemv(&kn.k, ints, &a.o, xi, yo, tt, None),
+                    KdaProj::O => fp4_gemv(kn, ints, &a.o, xi, yo, tt, None),
                 };
                 glm5_kda::prompt_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, t, self.sub, &mut proj);
             }
@@ -1105,7 +1105,7 @@ impl Glm5Pass {
                         MlaProj::KVA => &a.kv_a,
                         MlaProj::O => &a.o,
                     };
-                    fp4_gemv(&kn.k, ints, m, xi, yo, s.t(), None);
+                    fp4_gemv(kn, ints, m, xi, yo, s.t(), None);
                 };
                 self.mla_sc.forward_with(&kn.mla, &a.w, &self.mla_c, self.collapsed, self.sub, pos0, t, &mut proj);
             }
