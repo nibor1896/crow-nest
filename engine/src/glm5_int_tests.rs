@@ -199,3 +199,50 @@ fn glm5_int_gpu_prefetch_reads_wait_behind_demand_in_the_piece_pool() {
     drop(off);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Cross-wiring 4: `MlaScratch::begin` stages the call's `[pos0, t]` without a host sync, so a
+/// row enqueued ahead (`CROW_GLM_LA`) does not block the host at its first DSA layer. A kernel
+/// holds the stream for 300 ms, then `begin` 48 times (fewer than the ring's entries; a real row
+/// stages 11 DSA calls at most, two rows in flight with LA): the host returns long before the
+/// kernel ends, and the device holds the last call's values once the stream passed. Then 200
+/// more calls wrap the ring three times and the last one is on the device.
+#[test]
+#[ignore = "needs the GPU: cargo test --release --lib glm5_int_gpu -- --ignored --test-threads 1"]
+fn glm5_int_gpu_the_mla_call_scalars_upload_without_a_host_sync() {
+    const SLOW: &str = r#"
+extern "C" __global__ void hold(long long ns)
+{
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); } while ((long long) (t - t0) < ns);
+}
+"#;
+    let g = crate::geo::Glm5Geo::GLM_5_3_FLASH;
+    let d = crate::glm5_mla::MlaDims::of(&g);
+    unsafe {
+        let _ctx = cuda::Ctx::init();
+        let mut m = cuda::compile(SLOW);
+        let hold = m.get("hold");
+        let mut sc = crate::glm5_mla::MlaScratch::new(&d, 4, 1024);
+        crate::kernels::launch_v(hold, 1, 1, 1, 32, &[300_000_000u64]);
+        let t0 = std::time::Instant::now();
+        for i in 0..48usize {
+            sc.begin(i % 900, 1 + i % 4);
+        }
+        let host = t0.elapsed();
+        cuda::sync();
+        let waited = t0.elapsed();
+        let st: Vec<i32> = cuda::dtoh_t(sc.st_dev(), 2);
+        eprintln!("glm5 int mla begin: 48 calls {host:?} on the host, stream done after {waited:?}, st {st:?}");
+        assert_eq!(st, vec![47, 4], "the device holds the last call");
+        assert!(waited.as_millis() >= 250, "the kernel must hold the stream for the check to mean something");
+        assert!(host.as_millis() < 100, "begin waited for the stream: {host:?}");
+        for i in 0..200usize {
+            sc.begin(i, 1 + i % 3);
+        }
+        cuda::sync();
+        assert_eq!(cuda::dtoh_t::<i32>(sc.st_dev(), 2), vec![199, 2], "after the ring wrapped");
+        sc.free();
+        m.unload();
+    }
+}

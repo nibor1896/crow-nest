@@ -355,7 +355,17 @@ pub struct MlaScratch {
     pub u: CUdeviceptr,
     /// `[t][heads * v]`, the input of o_proj
     pub o: CUdeviceptr,
+    /// the pinned sources of `st`'s uploads: [`ST_RING`] entries of `[pos0, t]` i32, each with
+    /// the event of its copy (an entry is rewritten only after its copy ran)
+    st_ring: cuda::Pinned,
+    st_ev: Vec<cudarc::driver::sys::CUevent>,
+    st_used: Vec<bool>,
+    st_cur: usize,
 }
+
+/// entries of the pinned `[pos0, t]` ring of [`MlaScratch::begin`] (a decode row with `CROW_GLM_LA`
+/// has two rows in flight; 64 is never waited on in practice)
+pub const ST_RING: usize = 64;
 
 impl MlaScratch {
     /// # Safety
@@ -387,6 +397,10 @@ impl MlaScratch {
             part_ml: a("glm5 mla partial m/l", slots * d.heads * 2),
             u: a("glm5 mla latent mix", max_t * d.heads * d.kv_lora),
             o: a("glm5 mla o", max_t * d.heads * d.v),
+            st_ring: cuda::Pinned::alloc(ST_RING * 8),
+            st_ev: (0..ST_RING).map(|_| cuda::event_create()).collect(),
+            st_used: vec![false; ST_RING],
+            st_cur: 0,
         }
     }
 
@@ -407,7 +421,23 @@ impl MlaScratch {
         // #190: inside a CROW_GLM_GRAPH capture the row staged `st` already (a host upload would
         // be captured from this stack array and replayed stale)
         if !crate::glm5_graph::capturing() {
-            cuda::to_i32_into(self.st, &[pos0 as i32, t as i32]);
+            // from a pinned ring entry, so the copy is a true async DMA: a pageable (stack)
+            // source made the legacy stream synchronize here, and a row enqueued ahead
+            // (`CROW_GLM_LA`) blocked the host at its first DSA layer. Same values, same stream
+            // order, so every kernel reads what it read before.
+            use cudarc::driver::sys;
+            let i = self.st_cur;
+            self.st_cur = (i + 1) % ST_RING;
+            if self.st_used[i] {
+                cuda::ck(sys::cuEventSynchronize(self.st_ev[i]));
+            }
+            let e = (self.st_ring.host as *mut i32).add(2 * i);
+            e.write(pos0 as i32);
+            e.add(1).write(t as i32);
+            let s = cuda::cur_stream();
+            cuda::ck(sys::cuMemcpyHtoDAsync_v2(self.st, e as *const _, 8, s));
+            cuda::event_record(self.st_ev[i], s);
+            self.st_used[i] = true;
         }
     }
 
@@ -577,6 +607,13 @@ impl MlaScratch {
         ] {
             cuda::free_dev(p);
         }
+        for &e in &self.st_ev {
+            cuda::ck(cudarc::driver::sys::cuEventSynchronize(e));
+            cuda::event_destroy(e);
+        }
+        self.st_ev.clear();
+        self.st_used.clear();
+        self.st_ring.free();
     }
 }
 
