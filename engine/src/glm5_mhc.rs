@@ -206,6 +206,12 @@ pub fn hcfuse_from_env() -> bool {
     hcfuse_parse(std::env::var(HCFUSE_ENV).ok().as_deref())
 }
 
+/// [`hcfuse_from_env`] read once per process (the layer driver asks at every site)
+pub fn hcfuse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(hcfuse_from_env)
+}
+
 /// The device weights of one site (`layers.L.hc_{attn,ffn}_{fn,base,scale}`): `fn_` `[24][4h]`
 /// BF16, `base` `[24]` f32, `scale` `[3]` f32 (the container stores base and scale as F32).
 #[derive(Clone, Copy, Debug)]
