@@ -68,7 +68,8 @@ s.forward(&kn, &weights, &cache, x, y, pos0, t);         // or the stages below
   into `qa`, `q`, `kva`, `ip`, `iq` and from `o`, and keeps the stages.
 - `kv_b` is read by `gm_absorb` and `gm_out_v` as BF16, whatever the container holds (open question 2).
 - #161: `forward_with` is `forward` stage for stage with q_a, q_b, kv_a and o_proj handed to a
-  closure (`MlaProj`); `glm5_model` runs them on `gemv_fp4_b`. `MlaKernels::rmsnorm_rows` exposes
+  closure (`MlaProj`); `glm5_model` runs them on `glm5_gemv_fp4` (#191, bit-identical to
+  `gemv_fp4_b`). `MlaKernels::rmsnorm_rows` exposes
   `gm_rmsnorm` for the decoder's two layernorms.
 - Scratch: `[max_t][cap/4]` f32 pool scores dominate for long caches (512 rows × 50,000 pools = 100 MB);
   a prefill chunk bounds `max_t`.

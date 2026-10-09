@@ -41,9 +41,9 @@ The container stores these as NVFP4 (`converter/src/recipe.rs`, PREREG "Recipe a
 
 | tensor | engine |
 |---|---|
-| KDA `q/k/v_proj`, `o_proj` | `gemv_fp4_bs` (q, k, v strided into the `[t][24576]` row) / `gemv_fp4_b`, through `glm5_kda::prompt_with` / `step_with` (`KdaProj`) |
+| KDA `q/k/v_proj`, `o_proj` | `glm5_gemv_fp4` (q, k, v strided into the `[t][24576]` row), through `glm5_kda::prompt_with` / `step_with` (`KdaProj`) |
 | KDA `q/k/v_conv1d` | decoded once to f32 `[24576][4]` (HF holds the conv in f32) |
-| MLA `q_a`, `q_b`, `kv_a_proj_with_mqa`, `o_proj` | `gemv_fp4_b` through `MlaScratch::forward_with` (`MlaProj`) |
+| MLA `q_a`, `q_b`, `kv_a_proj_with_mqa`, `o_proj` | `glm5_gemv_fp4` through `MlaScratch::forward_with` (`MlaProj`) |
 | MLA `kv_b_proj` | decoded once to BF16 (round to nearest even); the load line prints how many values BF16 does not hold exactly |
 
 Every NVFP4 scale byte 0x7F is rewritten to 0x7E before use (`residency::sanitize_sf_slab`, the
@@ -64,9 +64,16 @@ refused by name. The test runs it against the real container's index, cut to lay
 ## 3. One compile, one layer in VRAM
 
 - `Glm5Kernels::new` compiles `KERNEL_SRC` once at `glm5_kda::kernel_geo` (`p2` off). The KDA GDN
-  kernels (`KdaKernels::with_base`), the engine kernel table of the FFN and the head (`gemv_fp4_b`,
-  `gemv_fp4_bs`, `gemv_bf16_b`, `gemv_bf16_w`, `argmax_k`) and MLA's `qsa_select_fast` all come from
-  it. Its entry set equals the Flash-Next compile's (host test, NVRTC).
+  kernels (`KdaKernels::with_base`), the engine kernel table of the router and the head
+  (`gemv_bf16_b`, `gemv_bf16_w`, `argmax_k`) and MLA's `qsa_select_fast` all come from it. Its
+  entry set equals the Flash-Next compile's (host test, NVRTC).
+- #191: every NVFP4 projection of the path (KDA, MLA, dense FFN, shared expert) runs on
+  `glm5_gemv_fp4` from the glm5 FFN module (`kernels_glm5_moe.cu`), not on the engine's
+  `gemv_fp4_b` / `gemv_fp4_bs`: the same per-thread FMA chains and reduction tree, so the outputs
+  are bit-identical (GPU test `glm5_dense_gpu_fp4_gemv_is_bit_identical_to_the_record_kernels`),
+  without the engine kernel's local-memory decode table and with several rows per block.
+  `KERNEL_SRC` (Flash-Next, 27B) is unchanged. Per-shape times: #191 and
+  `glm5_dense_gpu_fp4_gemv_reads_the_weights_at_vram_rate`.
 - `load_layer` reads one layer: the planned tensors, and for a MoE layer its 288 MUL1 records
   (9,474,048 B each, 2.73 GB) from the gate tensor's offset into one VRAM buffer behind the `[288]`
   record table `GpuMoePlan::run` reads. `LayerW::free` releases all of it after the layer. No

@@ -189,6 +189,11 @@ pub fn decide(family: Family, name: &str, shape: &[usize], src_dtype: &str) -> R
         Family::Qwen35Dense => decide_qwen35_dense(name, shape, src_dtype)?,
         Family::Glm5Next => decide_glm5_next(name, shape, src_dtype)?,
     };
+    check_decision(family, name, shape, src_dtype, d)
+}
+
+/// The checks every decision passes, whichever row made it: what the write path can carry.
+fn check_decision(family: Family, name: &str, shape: &[usize], src_dtype: &str, d: Decision) -> Result<Decision, String> {
     // A bf16 keep is written as the source's raw bytes (the pre-C6 write path, kept). That is
     // only a bf16 tensor when the source IS bf16: an F32 or F16 source would land in the
     // container as 4-byte or f16 values under a `bf16` label, and every reader would take the
@@ -375,6 +380,33 @@ pub fn mul1_expert_decision(name: &str) -> Option<Decision> {
     Some(Decision { dtype: DtypeOut::Mul1, section, rule })
 }
 
+/// The section of an MTP overlay (#182): the MTP block's non-expert tensors, the same section the
+/// 3-bit container gives the block's routed-expert records ([`mul1_expert_decision`]).
+pub const MTP_SECTION: &str = "mtp";
+
+/// crow-nest #182: the decision for a non-expert tensor of GLM-5.3-Flash's MTP block (layer 45) in
+/// an MTP overlay (`converter --mtp-overlay`): the codec the trunk's DSA + MoE layers carry for the
+/// same tensor ([`glm5_layer_row`]: NVFP4 q_a/q_b/kv_a/kv_b/o_proj and shared expert, BF16 norms,
+/// indexer and router, F32 score bias), in section `mtp`. `eh_proj` has no trunk twin and stays
+/// BF16 (llama.cpp keeps `nextn.eh_proj` at Q8_0 or above, `docs/glm5-next-recipe.md` D10).
+/// `None` for a name that is not a non-expert tensor of layer 45 (the routed experts are the 3-bit
+/// container's MUL1 records); the same checks as [`decide`] run on the result.
+pub fn mtp_overlay_decision(name: &str, shape: &[usize], src_dtype: &str) -> Option<Result<Decision, String>> {
+    if name.ends_with("_scale_inv") || glm_expert(name).is_some() {
+        return None;
+    }
+    let (layer, r) = glm_parts(name)?;
+    if layer != Some(GLM5_NEXT_TEXT_LAYERS) {
+        return None;
+    }
+    let d = if r == "eh_proj.weight" {
+        Ok(Decision { dtype: DtypeOut::Bf16, section: MTP_SECTION, rule: "MTP eh_proj BF16 (no trunk twin; llama.cpp keeps nextn.eh_proj >= Q8_0, D10)" })
+    } else {
+        glm5_layer_row(name, layer, r, shape, src_dtype, MTP_SECTION)
+    };
+    Some(d.and_then(|d| check_decision(Family::Glm5Next, name, shape, src_dtype, d)))
+}
+
 /// The GLM-5.3-Flash row, a WHITELIST. Keep set = the plan's step 4 (PREREG "Fixed for the
 /// whole series"): embeddings, `lm_head`, router, `e_score_correction_bias`, norms, 1-D, mHC
 /// `hc_*`, indexer, KDA gates, anything not a whole 64-value block. Keeps carry the source
@@ -401,7 +433,20 @@ pub fn decide_glm5_next(name: &str, shape: &[usize], src_dtype: &str) -> Result<
     if layer.is_some_and(|l| l >= GLM5_NEXT_TEXT_LAYERS) {
         return refuse("an MTP-block tensor (omitted in v1)");
     }
-    let section = "text";
+    glm5_layer_row(name, layer, r, shape, src_dtype, "text")
+}
+
+/// The body of the GLM-5.3-Flash row below the layer check: one tensor `r` of layer `layer` (None:
+/// a model-level tensor), written to `section`. [`decide_glm5_next`] passes `text`; the MTP
+/// overlay ([`mtp_overlay_decision`], #182) passes `mtp`, so the MTP block's attention, router and
+/// shared expert get exactly the codec the trunk's DSA + MoE layers carry.
+fn glm5_layer_row(name: &str, layer: Option<u64>, r: &str, shape: &[usize], src_dtype: &str, section: &'static str) -> Result<Decision, String> {
+    let refuse = |why: &str| -> Result<Decision, String> {
+        Err(format!(
+            "{name} {shape:?} {src_dtype}: {why} - refusing (the {} row is a whitelist; add a row with a reason, do not let it fall through)",
+            Family::Glm5Next.recipe()
+        ))
+    };
     // a keep is bf16: `decide` refuses a non-BF16 source under that label (a norm in F32 would be
     // a surprise worth a refusal). Only the tensors the checkpoint stores in F32 on purpose
     // (HF `_keep_in_fp32_modules_strict`, `modeling_glm5_next.py:1358`, plus the mHC base/scale)
@@ -1121,6 +1166,44 @@ mod tests {
             (("nvfp4", "shared expert NVFP4 (FP8 source)"), 126),
         ]);
         assert_eq!(per, want);
+    }
+
+    /// #182: the MTP overlay row on the real tensor table. Exactly the 25 non-expert tensors of
+    /// layer 45 get a decision (section `mtp`), never a scale or a routed expert; every one with a
+    /// twin in the trunk's DSA + MoE layer 7 gets the twin's codec and rule; `eh_proj` is BF16.
+    #[test]
+    fn the_mtp_overlay_row_gives_layer_45_the_trunks_dsa_moe_codecs() {
+        let (rows, _) = glm53_table();
+        let by_name: BTreeMap<&str, &(String, String, Vec<usize>, u32, u64)> = rows.iter().map(|r| (r.0.as_str(), r)).collect();
+        let mut per: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut twins = 0;
+        for (name, dt, sh, _, _) in &rows {
+            let Some(d) = mtp_overlay_decision(name, sh, dt) else {
+                assert!(!(name.contains(".layers.45.") && !name.ends_with("_scale_inv") && glm_expert(name).is_none()), "{name}: no MTP overlay decision");
+                continue;
+            };
+            let d = d.unwrap_or_else(|e| panic!("{e}"));
+            assert!(name.starts_with("model.language_model.layers.45.") && glm_expert(name).is_none(), "{name}");
+            assert_eq!(d.section, MTP_SECTION, "{name}");
+            *per.entry(d.dtype.as_str()).or_default() += 1;
+            let twin = name.replace(".layers.45.", ".layers.7.");
+            match by_name.get(twin.as_str()) {
+                Some(t) => {
+                    let td = decide(Family::Glm5Next, &t.0, &t.2, &t.1).unwrap();
+                    assert_eq!((d.dtype, d.rule), (td.dtype, td.rule), "{name} vs its trunk twin {twin}");
+                    twins += 1;
+                }
+                None => assert!(["eh_proj.weight", "enorm.weight", "hnorm.weight", "shared_head.norm.weight"].iter().any(|s| name.ends_with(s)), "{name}: no twin in layer 7"),
+            }
+        }
+        assert_eq!(per, BTreeMap::from([("bf16", 16), ("f32", 1), ("nvfp4", 8)]));
+        assert_eq!(twins, 21);
+        let eh = mtp_overlay_decision("model.language_model.layers.45.eh_proj.weight", &[4096, 8192], "BF16").unwrap().unwrap();
+        assert_eq!(eh.dtype, DtypeOut::Bf16);
+        // an F8 eh_proj would be refused by the write-path checks, not written under a bf16 label
+        assert!(mtp_overlay_decision("model.language_model.layers.45.eh_proj.weight", &[4096, 8192], "F8_E4M3").unwrap().is_err());
+        // the trunk's row is unchanged: layer 45 is still refused there
+        assert!(decide(Family::Glm5Next, "model.language_model.layers.45.eh_proj.weight", &[4096, 8192], "BF16").is_err());
     }
 
     /// The GLM row is a whitelist: a tensor it has no row for is refused BY NAME, and so are a

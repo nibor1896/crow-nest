@@ -82,7 +82,9 @@ embedding first (vLLM `deepseek_mtp.py:127-128` for DeepSeek itself). Section 4 
   block's MUL1 records, `mtp_add` residuals, `shared_head.norm` on `gm_rmsnorm`; result `normed`, for
   `glm5_head::Head::lm_head` with the trunk's lm_head. `pair_rows` (with `Pos0` for M1),
   `mtp_tensors` (the plan of layer 45, FP8 split, overlay codec), `missing_in`, `overlay_bytes`,
-  `load_mtp_records` (the container's `mtp` section into one VRAM buffer + `[E]` table).
+  `load_mtp_records` (the container's `mtp` section into one VRAM buffer + `[E]` table),
+  `mtp_overlay_check` + `load_mtp` (container + MTP overlay -> `MtpBlock`, the NVFP4 projections on
+  `gemv_fp4_b`), `MtpPass::call_tapped` / `MtpTaps` (the golden's intermediate rows).
 
 ## 4. Golden and evidence
 
@@ -133,8 +135,14 @@ the engine needs an overlay. Sizes (`glm5_mtp::overlay_bytes`, derived):
 | trunk codecs (NVFP4 for q_a/q_b/kv_a/kv_b/o_proj and the shared expert, BF16 for eh_proj, norms, indexer, router; F32 score bias) | 164,674,208 B (157.0 MiB) | the decisions the trunk's DSA + MoE layers carry; `glm5_mtp::Store`; eh_proj BF16 (llama.cpp keeps `nextn.eh_proj` at Q8_0 or higher, recipe D10) |
 | all BF16 | 369,670,784 B (352.5 MiB) | `MlaScratch::forward` runs it without a hook |
 
-Either is a converter option (an `mtp` section beside the MUL1 records, or a separate overlay file);
-not built. Proposal in #182.
+Built 2026-10-09 (#182): the trunk-codec overlay as a separate index v2 file,
+`converter --mtp-overlay` -> `converter/GLM-5.3-Flash-MTP-overlay.cnq` (164,771,937 B, payload 164,674,176 B,
+sha256 `191d5e18…da962a`; `docs/glm-mul1-conversion.md` "MTP overlay"). `load_mtp(base, overlay)` checks it
+against the container (`mtp_overlay_check`) and loads the whole block; `MtpBlock::call` runs the NVFP4 projections.
+
+On the GPU against the golden (which used the FP8 originals for these 25 tensors, so not bit-equal), 89 rows:
+eh cosine 1.000000; head norm cosine mean 0.98395, min 0.96957; routing overlap 0.926; DSA selection 89 / 89
+identical; draft top-1 = golden draft on 79 / 89; draft = trunk's next on 57 / 89 (golden 55 / 89).
 
 ## 6. Integration (not done here)
 
@@ -144,6 +152,8 @@ not built. Proposal in #182.
   selection buffers are `MlaScratch`'s and `glm5_mla` has no "skip the indexer" entry).
 - The Flash-Next / 27B speculative step (`gen.rs` `spec_step`, `MTP_VERIFY_MAX` 4, `load_mtp`) is the
   pattern; the glm5 arm is the lead's wiring, as for the trunk (`glm5_model`).
+- The weights: `load_mtp(base, overlay)` -> `MtpBlock`; one step = `MtpBlock::call` then
+  `glm5_head::Head::lm_head` with the trunk's lm_head (as `glm5_mtp_block_on_the_overlay_matches_the_oracle_golden`).
 - `glm5_model.rs`, `bin/decode.rs`, `expert_cache.rs`, `nvme_source.rs`, `manager.rs` are unchanged.
 
 ## 7. The MTP experts' Hessian (not done here)

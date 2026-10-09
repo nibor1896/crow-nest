@@ -35,10 +35,10 @@ ORACLE_THREADS=2 .venv-oracle/Scripts/python.exe -I oracle/export_glm5_mhc_golde
 
 | call | does |
 |---|---|
-| `Kernels::new()` | compiles `GLM5_MHC_SRC` (2 entries: `glm5_mhc_coeffs`, `glm5_mhc_expand`) |
+| `Kernels::new()` | compiles `GLM5_MHC_SRC` (3 entries: `glm5_mhc_mix`, `glm5_mhc_expand`, and `glm5_mhc_coeffs`, the record the #191 test compares against) |
 | `SiteDev::upload(fn_, base, scale)` | one site's weights: `fn` `[24][4H]` BF16 bits, `base` `[24]` f32, `scale` `[3]` f32 (the container stores base and scale as F32, `oracle/glm5_common.py` `CNQ_F32`) |
 | `Plan::new(h, max_tokens)` | parameter buffer and coefficient scratch: `logits` `[T][24]`, `pre`/`post` `[T][4]`, `comb` `[T][4][4]` |
-| `plan.coeffs(kn, w, x, collapsed, t)` | one launch, grid (T): steps 1-5 below; `x` `[t][4][H]` f32 -> `collapsed` `[t][H]` f32 |
+| `plan.coeffs(kn, w, x, collapsed, t)` | one launch (#191): `glm5_mhc_mix` grid (24, T), one mix row per block (each block re-derives the RMS factor); the last block of a row (a per-row counter in the plan) runs steps 3-5 on 16 lanes of warp 0 and the collapse on warps 1-7. Steps 1-5 below, bit-identical to the one-block-per-row record `glm5_mhc_coeffs`; `x` `[t][4][H]` f32 -> `collapsed` `[t][H]` f32 |
 | `plan.expand(kn, x, y, out, t)` | one launch, grid (H/256, T): step 6; `out == x` updates the streams in place |
 
 One plan serves both sites of every layer, in the decoder order: `coeffs(attn_hc)` ->
@@ -95,9 +95,10 @@ except the column normalisation, on the kernel).
 
 ## 5. Open
 
-- Speed is not measured. `glm5_mhc_coeffs` runs one block per row and reads the 786,432 B of `fn`
-  per row; at decode (T = 1) that is one SM per site, 90 sites per token. A split-K grid is the
-  first lever if the layer profile shows it.
+- Speed (#191): the record `glm5_mhc_coeffs` ran one block per row (one SM per site at decode,
+  90 sites per token): 177 us per site in the 2026-10-09 `glm5_run` profile, 16 ms per token.
+  `coeffs` now spreads it over (24, T) blocks with the record's per-thread order (no split-K, so
+  the bits stay). Micro-bench numbers: #191 and `glm5_mhc_gpu_coeffs_time_per_site`.
 - G3 on the real model (every layer, both sites, against the layerwise runner's goldens) is the
   `decode glmgolden` table ([glm5-model.md](glm5-model.md)); not run yet. `pre` cannot be compared:
   HF's hyper-connection does not return it.

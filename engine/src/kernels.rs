@@ -6503,7 +6503,16 @@ pub mod glm5_moe {
     use cudarc::driver::sys::CUfunction;
 
     /// every entry of `GLM5_MOE_SRC`
-    pub const NAMES: &[&str] = &["glm5_router_sig_topk", "glm5_moe_gather", "glm5_swiglu_clamp", "glm5_moe_combine"];
+    pub const NAMES: &[&str] = &["glm5_router_sig_topk", "glm5_moe_gather", "glm5_swiglu_clamp", "glm5_moe_combine", "glm5_gemv_fp4"];
+    /// #191: output rows of one `glm5_gemv_fp4` block (`GLM5_FP4_RB`)
+    pub const FP4_ROWS_PER_BLOCK: usize = 2;
+
+    /// #191: the `glm5_gemv_fp4` launch of a `[rows, k]` matrix: (grid x, threads per block); the
+    /// grid's y is the row count T. One thread per 36-byte block of a row, whole warps, at most 256.
+    pub fn fp4_launch(rows: usize, k: usize) -> (u32, u32) {
+        assert!(k % 64 == 0 && rows > 0, "glm5_gemv_fp4: [{rows}, {k}]");
+        ((rows.div_ceil(FP4_ROWS_PER_BLOCK)) as u32, (32 * (k / 64).div_ceil(32).clamp(1, 8)) as u32)
+    }
     /// threads of one router block, the most experts the router takes (`GLM5_ROUTER_THREADS`)
     pub const ROUTER_THREADS: usize = 512;
     /// the largest top-k the router takes (`GLM5_MAXK`)
@@ -6515,6 +6524,8 @@ pub mod glm5_moe {
         pub gather: CUfunction,
         pub act: CUfunction,
         pub combine: CUfunction,
+        /// #191: the dense NVFP4 GEMV of the glm5_next path, bit-identical to `gemv_fp4_b(s)`
+        pub fp4: CUfunction,
     }
 
     impl Kernels {
@@ -6527,6 +6538,7 @@ pub mod glm5_moe {
                 gather: module.get("glm5_moe_gather"),
                 act: module.get("glm5_swiglu_clamp"),
                 combine: module.get("glm5_moe_combine"),
+                fp4: module.get("glm5_gemv_fp4"),
                 module,
             }
         }

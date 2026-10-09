@@ -15,18 +15,18 @@
 //!
 //! - **Codec gap.** The container stores KDA q/k/v/o and the KDA short conv, and MLA
 //!   q_a/q_b/kv_a/kv_b/o as NVFP4 (`converter/src/recipe.rs`, PREREG "Recipe as committed").
-//!   The projections run on the engine's NVFP4 GEMV (`gemv_fp4_b`, `gemv_fp4_bs` for the
-//!   strided q|k|v rows) through the modules' projection hooks (`glm5_kda::prompt_with` /
-//!   `step_with`, `glm5_mla::MlaScratch::forward_with`), with every scale byte 0x7F rewritten to
+//!   The projections run on the glm5 NVFP4 GEMV (`glm5_gemv_fp4` in `kernels_glm5_moe.cu`, #191:
+//!   bit-identical to the engine's `gemv_fp4_b` / `gemv_fp4_bs`, several rows per block and no
+//!   local-memory decode table; a row stride for the strided q|k|v rows) through the modules'
+//!   projection hooks (`glm5_kda::prompt_with` / `step_with`, `glm5_mla::MlaScratch::forward_with`), with every scale byte 0x7F rewritten to
 //!   0x7E first (`residency::sanitize_sf_slab`, the rule of `gen::load_pw_x`, #177). The conv
 //!   weight is decoded once to f32 (HF holds it in f32), `kv_b` once to BF16 (the form
 //!   `gm_absorb` / `gm_out_v` read), its inexact-value count reported ([`LoadReport`], the
 //!   `dense_overlay` control); the #159 planner books the BF16 bytes
 //!   (`Glm5Geo::kv_b_decode_bytes`).
 //! - **One shared glm5 `KernelGeo` compile** ([`Glm5Kernels`]): `KERNEL_SRC` once at
-//!   `glm5_kda::kernel_geo`; the KDA kernels, the engine kernel table of the FFN and the head
-//!   (`gemv_fp4_b`, `gemv_bf16_b`, `gemv_bf16_w`, `argmax_k`) and MLA's `qsa_select_fast` all
-//!   come from it.
+//!   `glm5_kda::kernel_geo`; the KDA kernels, the engine kernel table of the router and the head
+//!   (`gemv_bf16_b`, `gemv_bf16_w`, `argmax_k`) and MLA's `qsa_select_fast` all come from it.
 //! - **Layer-at-a-time weights** ([`load_layer`]): one layer's tensors in VRAM, its 288 MUL1
 //!   expert records in one VRAM buffer behind the `GpuMoePlan` record table, all freed after the
 //!   layer. No cache, no NVMe tier.
@@ -309,7 +309,7 @@ pub fn kernel_geo(g: &Glm5Geo) -> KernelGeo {
 }
 
 /// every `KERNEL_SRC` entry the glm5 path launches from the shared module
-pub const MAIN_NAMES: &[&str] = &["gemv_fp4_b", "gemv_fp4_bs", "gemv_bf16_b", "gemv_bf16_w", "argmax_k", "qsa_select_fast"];
+pub const MAIN_NAMES: &[&str] = &["gemv_bf16_b", "gemv_bf16_w", "argmax_k", "qsa_select_fast"];
 
 /// The modules of the glm5_next path: `KERNEL_SRC` compiled ONCE at [`kernel_geo`] (KDA's GDN
 /// kernels, the engine kernel table, `qsa_select_fast`), plus the blocks' own NVRTC modules
@@ -691,13 +691,13 @@ impl Ints {
     }
 }
 
-/// `y [t][rows] = W x [t][cols]` on the NVFP4 GEMV (`gemv_fp4_b`); with `ldy` the output row
-/// stride is `ldy` (`gemv_fp4_bs`)
-unsafe fn fp4_gemv(k: &kernels::Kernels, ints: &Ints, m: &GpuNvfp4, x: Dev, y: Dev, t: usize, ldy: Option<usize>) {
-    match ldy {
-        None => launch_v(k.f("gemv_fp4_b"), m.rows as u32, t as u32, 1, 256, &[m.w, x, m.gs, y, ints.p(m.cols)]),
-        Some(s) => launch_v(k.f("gemv_fp4_bs"), m.rows as u32, t as u32, 1, 256, &[m.w, x, m.gs, y, ints.p(m.cols), ints.p(s)]),
-    }
+/// `y [t][rows] = W x [t][cols]` on the glm5 NVFP4 GEMV (`glm5_gemv_fp4`, #191: bit-identical
+/// to the record `gemv_fp4_b`); with `ldy` the output row stride is `ldy` (the record's
+/// `gemv_fp4_bs`), else `rows`
+unsafe fn fp4_gemv(kn: &Glm5Kernels, ints: &Ints, m: &GpuNvfp4, x: Dev, y: Dev, t: usize, ldy: Option<usize>) {
+    let (blocks, threads) = kernels::glm5_moe::fp4_launch(m.rows, m.cols);
+    let ld = ldy.unwrap_or(m.rows);
+    launch_v(kn.moe.fp4, blocks, t as u32, 1, threads, &[m.w, x, m.gs, y, ints.p(m.cols), ints.p(ld), ints.p(m.rows)]);
 }
 
 /// What one mHC site of a call produced, appended call by call (`[rows][..]` in row order): the
@@ -789,7 +789,8 @@ impl Glm5Pass {
             kda_st,
             mla_sc: MlaScratch::new(&md, max_t, cap),
             mla_c: MlaCache::new(&md, cap),
-            ints: Ints::new(&[h, kd.width(), kd.conv_ch(), md.q_lora, md.heads * md.v]),
+            // every K, output stride and row count `fp4_gemv` passes (#191: rows too)
+            ints: Ints::new(&[h, kd.width(), kd.conv_ch(), md.q_lora, md.heads * md.v, md.heads * md.nope, md.kv_lora]),
             st2: cuda::to_i32_dev(&[0i32, 0]),
             collapsed: cuda::alloc_named("glm5 collapsed", max_t * h * 4),
             sub: cuda::alloc_named("glm5 sublayer out", max_t * h * 4),
@@ -905,11 +906,11 @@ impl Glm5Pass {
                 let mut proj = |p: KdaProj, xi: Dev, yo: Dev, tt: usize| match p {
                     KdaProj::Qkv => {
                         let cc = kn.kda.d.conv_ch();
-                        fp4_gemv(&kn.k, ints, &a.q, xi, yo, tt, Some(cc));
-                        fp4_gemv(&kn.k, ints, &a.k, xi, yo + (w * 4) as u64, tt, Some(cc));
-                        fp4_gemv(&kn.k, ints, &a.v, xi, yo + (2 * w * 4) as u64, tt, Some(cc));
+                        fp4_gemv(kn, ints, &a.q, xi, yo, tt, Some(cc));
+                        fp4_gemv(kn, ints, &a.k, xi, yo + (w * 4) as u64, tt, Some(cc));
+                        fp4_gemv(kn, ints, &a.v, xi, yo + (2 * w * 4) as u64, tt, Some(cc));
                     }
-                    KdaProj::O => fp4_gemv(&kn.k, ints, &a.o, xi, yo, tt, None),
+                    KdaProj::O => fp4_gemv(kn, ints, &a.o, xi, yo, tt, None),
                 };
                 if decode {
                     glm5_kda::step_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, self.sub, &mut proj);
@@ -925,7 +926,7 @@ impl Glm5Pass {
                         MlaProj::KVA => &a.kv_a,
                         MlaProj::O => &a.o,
                     };
-                    fp4_gemv(&kn.k, ints, m, xi, yo, s.t(), None);
+                    fp4_gemv(kn, ints, m, xi, yo, s.t(), None);
                 };
                 self.mla_sc.forward_with(&kn.mla, &a.w, &self.mla_c, self.collapsed, self.sub, pos0, t, &mut proj);
             }
@@ -1697,5 +1698,247 @@ mod tests {
         assert_eq!(top1_disagreements(&[0, 0, 1], &gold, 3), vec![(1, 0, 2, -0.5), (2, 1, 0, 0.0)]);
         assert!(top1_disagreements(&[0, 2, 0], &gold, 3).is_empty());
         assert!(!monotone_rise(&[1e-6, 2e-6, 2e-6]) && !monotone_rise(&[1e-6, 2e-6]));
+    }
+}
+
+#[cfg(test)]
+mod tests_dense_gpu {
+    //! #191 on the GPU (RTX 5090, sm_120): the glm5_next dense decode launches at the
+    //! GLM-5.3-Flash shapes on synthetic weights: the pass's NVFP4 GEMV dispatch ([`fp4_gemv`],
+    //! the one the KDA / MLA hooks call) and the FFN plan bit-identical to the record kernels of
+    //! `KERNEL_SRC` (`gemv_fp4_b` / `gemv_fp4_bs`), and their time per decode row. Each timed
+    //! launch reads a different copy of its matrix (>= 256 MiB per shape), so the weights come
+    //! from VRAM as in a decode row, not from the L2. `#[ignore]`: CI has no GPU. Run with
+    //! `cargo test --release --lib glm5_dense_gpu -- --ignored --nocapture --test-threads 1`.
+    use super::*;
+    use crate::cpu_mul1::testkit::Rng;
+    use cudarc::driver::sys;
+
+    const G: Glm5Geo = Glm5Geo::GLM_5_3_FLASH;
+
+    /// one dense NVFP4 launch of a decode row: what, rows, cols, output row stride, calls per row
+    struct Shape {
+        what: &'static str,
+        rows: usize,
+        cols: usize,
+        ldy: Option<usize>,
+        per_row: usize,
+    }
+
+    /// the dense NVFP4 GEMVs of one GLM-5.3-Flash decode row (34 KDA, 11 MLA, 3 dense, 42 MoE
+    /// layers), from the geometry
+    fn shapes() -> Vec<Shape> {
+        let (kd, md, h) = (KdaDims::of(&G), MlaDims::of(&G), G.hidden);
+        let (kda, mla, dense, moe) = (G.kda_layers, G.dsa_layers, G.dense_prefix, G.moe_layers());
+        let si = G.expert_inter * G.shared_experts;
+        let s = |what, rows, cols, ldy, per_row| Shape { what, rows, cols, ldy, per_row };
+        vec![
+            s("kda q|k|v", kd.width(), h, Some(kd.conv_ch()), 3 * kda),
+            s("kda o", h, kd.width(), None, kda),
+            s("mla q_a", md.q_lora, h, None, mla),
+            s("mla q_b", md.heads * md.nope, md.q_lora, None, mla),
+            s("mla kv_a", md.kv_lora, h, None, mla),
+            s("mla o", h, md.heads * md.v, None, mla),
+            s("dense gate|up", G.dense_inter, h, None, 2 * dense),
+            s("dense down", h, G.dense_inter, None, dense),
+            s("shared gate|up", si, h, None, 2 * moe),
+            s("shared down", h, si, None, moe),
+        ]
+    }
+
+    /// random NVFP4 bytes: scale bytes in [0x30, 0x3F] (no 0x7F, the sanitized rule), codes
+    /// uniform over all 16 nibbles; with `zeros` every 7th block all +0/-0 codes (the signed-zero
+    /// paths of the reductions)
+    fn nvfp4(rows: usize, cols: usize, rng: &mut Rng, zeros: bool) -> Vec<u8> {
+        let mut b = vec![0u8; rows * cols / 64 * 36];
+        for (k, blk) in b.chunks_exact_mut(36).enumerate() {
+            for (i, v) in blk.iter_mut().enumerate() {
+                *v = if i < 4 {
+                    0x30 + (rng.next() % 16) as u8
+                } else if zeros && k % 7 == 3 {
+                    0x88
+                } else {
+                    rng.next() as u8
+                };
+            }
+        }
+        b
+    }
+
+    fn xs(n: usize, rng: &mut Rng) -> Vec<f32> {
+        (0..n).map(|i| if i % 97 == 5 { -0.0 } else { rng.f(2.0) }).collect()
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// the record launch: `gemv_fp4_b`, or `gemv_fp4_bs` with a stride (the path before #191)
+    unsafe fn record(kn: &Glm5Kernels, ints: &Ints, m: &GpuNvfp4, x: Dev, y: Dev, t: usize, ldy: Option<usize>) {
+        match ldy {
+            None => launch_v(kn.k.f("gemv_fp4_b"), m.rows as u32, t as u32, 1, 256, &[m.w, x, m.gs, y, ints.p(m.cols)]),
+            Some(s) => launch_v(kn.k.f("gemv_fp4_bs"), m.rows as u32, t as u32, 1, 256, &[m.w, x, m.gs, y, ints.p(m.cols), ints.p(s)]),
+        }
+    }
+
+    unsafe fn ints_for(sh: &[Shape]) -> Ints {
+        let mut v: Vec<usize> = sh.iter().flat_map(|s| [s.rows, s.cols, s.ldy.unwrap_or(s.rows)]).collect();
+        v.sort_unstable();
+        v.dedup();
+        Ints::new(&v)
+    }
+
+    /// mean GPU time of one `f(i)` over `n` calls, events around the whole queue (us); when the
+    /// host queues slower than the GPU runs, this is the host's launch rate (`launch_us`)
+    unsafe fn time_us(n: usize, f: impl FnMut(usize)) -> f64 {
+        time2_us(n, f).0
+    }
+
+    /// (`time_us`, mean host time to queue one `f(i)`) in us
+    unsafe fn time2_us(n: usize, mut f: impl FnMut(usize)) -> (f64, f64) {
+        f(0);
+        cuda::sync();
+        let mk = || {
+            let mut e: sys::CUevent = std::ptr::null_mut();
+            cuda::ck(sys::cuEventCreate(&mut e, 0));
+            e
+        };
+        let (a, b) = (mk(), mk());
+        let s = cuda::cur_stream();
+        cuda::event_record(a, s);
+        let t0 = std::time::Instant::now();
+        for i in 0..n {
+            f(i);
+        }
+        let host = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
+        cuda::event_record(b, s);
+        cuda::sync();
+        let mut ms = 0f32;
+        cuda::ck(sys::cuEventElapsedTime_v2(&mut ms, a, b));
+        cuda::event_destroy(a);
+        cuda::event_destroy(b);
+        (ms as f64 * 1e3 / n as f64, host)
+    }
+
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_dense_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_dense_gpu_fp4_gemv_is_bit_identical_to_the_record_kernels() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Glm5Kernels::new(&G);
+            let sh = shapes();
+            let ints = ints_for(&sh);
+            let mut rng = Rng(0x5eed_d3a5e);
+            for s in &sh {
+                for t in [1usize, 3] {
+                    let wb = nvfp4(s.rows, s.cols, &mut rng, true);
+                    let m = GpuNvfp4 { w: cuda::upload_dev(&wb), gs: cuda::to_f32_dev(&[0.37]), rows: s.rows, cols: s.cols };
+                    let x = cuda::to_f32_dev(&xs(t * s.cols, &mut rng));
+                    let ld = s.ldy.unwrap_or(s.rows);
+                    // NaN-filled outputs: an element one path leaves unwritten is a mismatch
+                    let nan = vec![f32::NAN; t * ld];
+                    let (ya, yb) = (cuda::to_f32_dev(&nan), cuda::to_f32_dev(&nan));
+                    record(&kn, &ints, &m, x, ya, t, s.ldy);
+                    fp4_gemv(&kn, &ints, &m, x, yb, t, s.ldy);
+                    cuda::sync();
+                    let (a, b) = (bits(&cuda::dtoh(ya, t * ld)), bits(&cuda::dtoh(yb, t * ld)));
+                    let differ = a.iter().zip(&b).filter(|(p, q)| p != q).count();
+                    assert_eq!(differ, 0, "{} [{} x {}] t {t}: {differ} of {} outputs differ from the record kernel", s.what, s.rows, s.cols, t * ld);
+                    for mut d in [m.w, m.gs, x, ya, yb] {
+                        cuda::free_dev(&mut d);
+                    }
+                }
+            }
+            // the FFN plan (shared expert and dense layers) against record launches of the same math
+            for (inter, t) in [(G.expert_inter, 1usize), (G.dense_inter, 2)] {
+                let h = G.hidden;
+                let up = |rng: &mut Rng, r: usize, c: usize| GpuNvfp4 { w: cuda::upload_dev(&nvfp4(r, c, rng, true)), gs: cuda::to_f32_dev(&[0.21]), rows: r, cols: c };
+                let w = GpuFfnWeights { gate: up(&mut rng, inter, h), up: up(&mut rng, inter, h), down: up(&mut rng, h, inter) };
+                let x = cuda::to_f32_dev(&xs(t * h, &mut rng));
+                let mut plan = GpuFfnPlan::new(h, inter, t, G.swiglu_limit as f32);
+                let y = cuda::alloc_zeroed(t * h * 4);
+                plan.run(&kn.k, &kn.moe, &w, x, y);
+                cuda::sync();
+                let got = bits(&cuda::dtoh(y, t * h));
+                let fints = Ints::new(&[h, inter]);
+                let (g, u, a, r) = (cuda::alloc_zeroed(t * inter * 4), cuda::alloc_zeroed(t * inter * 4), cuda::alloc_zeroed(t * inter * 4), cuda::alloc_zeroed(t * h * 4));
+                record(&kn, &fints, &w.gate, x, g, t, None);
+                record(&kn, &fints, &w.up, x, u, t, None);
+                let prm_n = cuda::to_i32_dev(&[(t * inter) as i32]);
+                let prm_f = cuda::to_f32_dev(&[0.0, G.swiglu_limit as f32]);
+                launch_v(kn.moe.act, (t * inter).div_ceil(256) as u32, 1, 1, 256, &[g, u, a, prm_n, prm_f]);
+                record(&kn, &fints, &w.down, a, r, t, None);
+                cuda::sync();
+                let want = bits(&cuda::dtoh(r, t * h));
+                assert_eq!(got, want, "FFN [{inter}] t {t}: the plan differs from the record launches");
+                plan.free();
+                for mut d in [w.gate.w, w.gate.gs, w.up.w, w.up.gs, w.down.w, w.down.gs, x, y, g, u, a, r, prm_n, prm_f] {
+                    cuda::free_dev(&mut d);
+                }
+            }
+        }
+    }
+
+    /// #191 acceptance bound, fixed in the ticket before the after-measurement: the dense
+    /// NVFP4 GEMVs of one decode row on synthetic VRAM-cold weights take at most this (us)
+    const DENSE_ROW_US: f64 = 6000.0;
+
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_dense_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_dense_gpu_fp4_gemv_reads_the_weights_at_vram_rate() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Glm5Kernels::new(&G);
+            let sh = shapes();
+            let ints = ints_for(&sh);
+            let mut rng = Rng(0xbe4c_0001);
+            // the reference rate: a device-to-device copy of 512 MiB (reads + writes)
+            let cb = 512usize << 20;
+            let (mut c0, mut c1) = (cuda::alloc_zeroed(cb), cuda::alloc_zeroed(cb));
+            let cp = time_us(8, |_| cuda::memcpy_async(c1, c0, cb));
+            eprintln!("dense reference: device copy {cb} B in {cp:.0} us = {:.0} GB/s read + write", 2.0 * cb as f64 / cp / 1e3);
+            cuda::free_dev(&mut c0);
+            cuda::free_dev(&mut c1);
+            let (mut rec_row, mut new_row, mut bytes_row) = (0f64, 0f64, 0f64);
+            for s in &sh {
+                let wb = nvfp4(s.rows, s.cols, &mut rng, false);
+                let bytes = wb.len();
+                let copies = (256usize << 20).div_ceil(bytes).max(2);
+                let first = cuda::upload_dev(&wb);
+                let mut ws = vec![first];
+                for _ in 1..copies {
+                    let d = cuda::alloc_zeroed(bytes);
+                    cuda::memcpy_async(d, first, bytes);
+                    ws.push(d);
+                }
+                let gs = cuda::to_f32_dev(&[0.37]);
+                let x = cuda::to_f32_dev(&xs(s.cols, &mut rng));
+                let y = cuda::alloc_zeroed(s.ldy.unwrap_or(s.rows) * 4);
+                let m = |i: usize| GpuNvfp4 { w: ws[i % copies], gs, rows: s.rows, cols: s.cols };
+                let n = (4 * copies).max(64);
+                let rec = time_us(n, |i| record(&kn, &ints, &m(i), x, y, 1, s.ldy));
+                let (new, host) = time2_us(n, |i| fp4_gemv(&kn, &ints, &m(i), x, y, 1, s.ldy));
+                let gbs = |us: f64| bytes as f64 / us / 1e3;
+                eprintln!(
+                    "dense {:<15} [{:>5} x {:>5}] {:>9} B x {:>3}/row: record {:>7.1} us {:>6.0} GB/s | pass {:>7.1} us {:>6.0} GB/s (host queues one in {:.1} us)",
+                    s.what, s.rows, s.cols, bytes, s.per_row, rec, gbs(rec), new, gbs(new), host
+                );
+                rec_row += rec * s.per_row as f64;
+                new_row += new * s.per_row as f64;
+                bytes_row += (bytes * s.per_row) as f64;
+                for mut d in ws.into_iter().chain([gs, x, y]) {
+                    cuda::free_dev(&mut d);
+                }
+            }
+            eprintln!(
+                "dense NVFP4 GEMVs per decode row: {:.0} MB; record {:.2} ms ({:.0} GB/s), pass {:.2} ms ({:.0} GB/s)",
+                bytes_row / 1e6,
+                rec_row / 1e3,
+                bytes_row / rec_row / 1e3,
+                new_row / 1e3,
+                bytes_row / new_row / 1e3
+            );
+            assert!(new_row <= DENSE_ROW_US, "the pass's dense NVFP4 GEMVs take {:.2} ms per decode row (bound {:.2} ms)", new_row / 1e3, DENSE_ROW_US / 1e3);
+        }
     }
 }
