@@ -164,13 +164,14 @@ pub fn site(x: &[f32], fn_: &[u16], base: &[f32; MIX], scale: &[f32; 3], h: usiz
 // ---------------- the GPU half (`kernels_glm5_mhc.cu`) ----------------
 
 /// every entry of `kernels::GLM5_MHC_SRC`
-pub const NAMES: &[&str] = &["glm5_mhc_coeffs", "glm5_mhc_expand"];
+pub const NAMES: &[&str] = &["glm5_mhc_coeffs", "glm5_mhc_expand", "glm5_mhc_mix"];
 
 /// the compiled module and its entries
 pub struct Kernels {
     pub module: cuda::Module,
-    coeffs: CUfunction,
     expand: CUfunction,
+    /// #191: steps 1-5 over (24, T) blocks, the last block of a row runs 3-5 and the collapse
+    mix: CUfunction,
 }
 
 impl Kernels {
@@ -178,7 +179,11 @@ impl Kernels {
     /// A CUDA context is current.
     pub unsafe fn new() -> Kernels {
         let module = cuda::compile(crate::kernels::GLM5_MHC_SRC);
-        Kernels { coeffs: module.get("glm5_mhc_coeffs"), expand: module.get("glm5_mhc_expand"), module }
+        Kernels {
+            expand: module.get("glm5_mhc_expand"),
+            mix: module.get("glm5_mhc_mix"),
+            module,
+        }
     }
 }
 
@@ -222,6 +227,8 @@ pub struct Plan {
     pub post: CUdeviceptr,
     /// `[T][4][4]` f32, `[j][i]` = source j, destination i
     pub comb: CUdeviceptr,
+    /// #191: `[T]` u32, zero between launches: the blocks of a row that finished `glm5_mhc_mix`
+    done: CUdeviceptr,
 }
 
 impl Plan {
@@ -238,18 +245,21 @@ impl Plan {
             pre: cuda::alloc_zeroed(max_tokens * HC * 4),
             post: cuda::alloc_zeroed(max_tokens * HC * 4),
             comb: cuda::alloc_zeroed(max_tokens * HC * HC * 4),
+            done: cuda::alloc_zeroed(max_tokens * 4),
         }
     }
 
     /// Queue steps 1-5 for `t` rows on the current stream: `x` `[t][4][h]` f32 ->
-    /// `collapsed` `[t][h]` f32; `logits`, `pre`, `post`, `comb` stay in the plan. One launch.
+    /// `collapsed` `[t][h]` f32; `logits`, `pre`, `post`, `comb` stay in the plan. One launch
+    /// (#191: `glm5_mhc_mix` over (24, t) blocks, bit-identical to the record `glm5_mhc_coeffs`,
+    /// which ran one block per row).
     ///
     /// # Safety
     /// `x`, `collapsed` are device buffers of those shapes; `w` is live.
     pub unsafe fn coeffs(&self, kn: &Kernels, w: &SiteDev, x: CUdeviceptr, collapsed: CUdeviceptr, t: usize) {
         assert!((1..=self.max_tokens).contains(&t), "mhc: {t} rows (1..={})", self.max_tokens);
-        launch_v(kn.coeffs, t as u32, 1, 1, THREADS as u32, &[
-            x, w.fn_, w.base, w.scale, self.logits, self.pre, self.post, self.comb, collapsed, self.prm]);
+        launch_v(kn.mix, MIX as u32, t as u32, 1, THREADS as u32, &[
+            x, w.fn_, w.base, w.scale, self.logits, self.pre, self.post, self.comb, collapsed, self.done, self.prm]);
     }
 
     /// Queue step 6 for `t` rows with the coefficients of the last `coeffs`: `x` `[t][4][h]` (the
@@ -267,7 +277,7 @@ impl Plan {
     /// # Safety
     /// No launch of this plan is pending.
     pub unsafe fn free(&mut self) {
-        for d in [&mut self.prm, &mut self.logits, &mut self.pre, &mut self.post, &mut self.comb] {
+        for d in [&mut self.prm, &mut self.logits, &mut self.pre, &mut self.post, &mut self.comb, &mut self.done] {
             cuda::free_dev(d);
         }
     }
@@ -601,6 +611,139 @@ mod tests_gpu {
                 assert!(cc >= 0.9999 && ce >= 0.9999, "row {r}: cosine collapsed {cc} expanded {ce}");
                 assert!(tw[..3].iter().all(|&e| e <= 1e-5), "row {r}: GPU vs CPU twin {tw:?}");
             }
+        }
+    }
+
+    /// the record launch of steps 1-5: `glm5_mhc_coeffs`, one block per row (the path before
+    /// #191); its own scratch so it can run next to [`Plan::coeffs`]
+    unsafe fn record_coeffs(kn: &Kernels, w: &SiteDev, plan: &Plan, x: CUdeviceptr, collapsed: CUdeviceptr, t: usize, out: &[CUdeviceptr; 4]) {
+        let f = kn.module.get("glm5_mhc_coeffs");
+        launch_v(f, t as u32, 1, 1, THREADS as u32, &[x, w.fn_, w.base, w.scale, out[0], out[1], out[2], out[3], collapsed, plan.prm]);
+    }
+
+    fn rnd(n: usize, seed: &mut u64, a: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 7;
+                *seed ^= *seed << 17;
+                if i % 89 == 7 { -0.0 } else { ((*seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * a }
+            })
+            .collect()
+    }
+
+    fn bf16s(v: &[f32]) -> Vec<u16> {
+        v.iter().map(|x| (x.to_bits() >> 16) as u16).collect()
+    }
+
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_mhc_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mhc_gpu_coeffs_are_bit_identical_to_the_record_kernel() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Kernels::new();
+            let f = real();
+            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+            // the real-shape fixture, then random sites and streams at the GLM width and two small ones
+            let mut cases: Vec<(String, usize, usize, Vec<u16>, [f32; MIX], [f32; 3], Vec<f32>)> =
+                vec![("real".into(), f.h, f.t, f.fn_.clone(), f.base, f.scale, f.x.clone())];
+            for (h, t) in [(4096usize, 1usize), (4096, 5), (64, 3), (8, 2)] {
+                let fn_ = bf16s(&rnd(MIX * HC * h, &mut seed, 0.05));
+                let base: [f32; MIX] = rnd(MIX, &mut seed, 1.0).try_into().unwrap();
+                let scale: [f32; 3] = rnd(3, &mut seed, 2.0).try_into().unwrap();
+                cases.push((format!("random h {h} t {t}"), h, t, fn_, base, scale, rnd(t * HC * h, &mut seed, 3.0)));
+            }
+            for (name, h, t, fn_, base, scale, x) in &cases {
+                let (h, t) = (*h, *t);
+                let mut w = SiteDev::upload(fn_, base, scale);
+                let mut plan = Plan::new(h, t);
+                let mut xd = cuda::to_f32_dev(x);
+                let nan_h = vec![f32::NAN; t * h];
+                let (mut ca, mut cb) = (cuda::to_f32_dev(&nan_h), cuda::to_f32_dev(&nan_h));
+                let mut rec = [MIX, HC, HC, HC * HC].map(|k| cuda::to_f32_dev(&vec![f32::NAN; t * k]));
+                record_coeffs(&kn, &w, &plan, xd, ca, t, &rec);
+                let got = [plan.logits, plan.pre, plan.post, plan.comb];
+                // three calls on one plan, the outputs NaN-filled before each: the last-block
+                // counter must be back at 0 after every call
+                for rep in 0..3 {
+                    for (i, d) in got.iter().enumerate() {
+                        cuda::to_f32_into(*d, &vec![f32::NAN; t * [MIX, HC, HC, HC * HC][i]]);
+                    }
+                    cuda::to_f32_into(cb, &nan_h);
+                    plan.coeffs(&kn, &w, xd, cb, t);
+                    cuda::sync();
+                    for (i, what) in ["logits", "pre", "post", "comb"].iter().enumerate() {
+                        let n = t * [MIX, HC, HC, HC * HC][i];
+                        assert_eq!(bits(&cuda::dtoh(got[i], n)), bits(&cuda::dtoh(rec[i], n)), "{name} call {rep}: {what} differs from the record kernel");
+                    }
+                    assert_eq!(bits(&cuda::dtoh(cb, t * h)), bits(&cuda::dtoh(ca, t * h)), "{name} call {rep}: collapsed differs from the record kernel");
+                }
+                for d in rec.iter_mut().chain([&mut xd, &mut ca, &mut cb]) {
+                    cuda::free_dev(d);
+                }
+                plan.free();
+                w.free();
+            }
+        }
+    }
+
+    /// #191 acceptance bound, fixed in the ticket before the after-measurement: steps 1-5
+    /// of one site for one decode row at the GLM width, VRAM-cold `fn` (us)
+    const COEFFS_US: f64 = 20.0;
+
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_mhc_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mhc_gpu_coeffs_time_per_site() {
+        use cudarc::driver::sys;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Kernels::new();
+            let (h, t) = (4096usize, 1usize);
+            let mut seed = 0x51ce_5eedu64;
+            let fn_ = bf16s(&rnd(MIX * HC * h, &mut seed, 0.05));
+            let base: [f32; MIX] = rnd(MIX, &mut seed, 1.0).try_into().unwrap();
+            let scale: [f32; 3] = rnd(3, &mut seed, 2.0).try_into().unwrap();
+            // >= 256 MiB of distinct `fn` copies: every timed launch reads its site from VRAM
+            let copies = (256usize << 20).div_ceil(fn_.len() * 2);
+            let mut sites: Vec<SiteDev> = (0..copies).map(|_| SiteDev::upload(&fn_, &base, &scale)).collect();
+            let mut plan = Plan::new(h, t);
+            let mut xd = cuda::to_f32_dev(&rnd(t * HC * h, &mut seed, 3.0));
+            let mut cd = cuda::alloc_zeroed(t * h * 4);
+            let mut rec = [MIX, HC, HC, HC * HC].map(|k| cuda::alloc_zeroed(t * k * 4));
+            let time = |f: &mut dyn FnMut(usize)| -> f64 {
+                f(0);
+                cuda::sync();
+                let mk = || {
+                    let mut e: sys::CUevent = std::ptr::null_mut();
+                    cuda::ck(sys::cuEventCreate(&mut e, 0));
+                    e
+                };
+                let (a, b) = (mk(), mk());
+                cuda::event_record(a, cuda::cur_stream());
+                let n = 4 * copies;
+                for i in 0..n {
+                    f(i);
+                }
+                cuda::event_record(b, cuda::cur_stream());
+                cuda::sync();
+                let mut ms = 0f32;
+                cuda::ck(sys::cuEventElapsedTime_v2(&mut ms, a, b));
+                cuda::event_destroy(a);
+                cuda::event_destroy(b);
+                ms as f64 * 1e3 / n as f64
+            };
+            let r = time(&mut |i| record_coeffs(&kn, &sites[i % copies], &plan, xd, cd, t, &rec));
+            let p = time(&mut |i| plan.coeffs(&kn, &sites[i % copies], xd, cd, t));
+            let bytes = (MIX * HC * h * 2 + HC * h * 4) as f64;
+            eprintln!("mhc coeffs h {h} t {t} ({copies} fn copies): record {r:.1} us ({:.0} GB/s), plan {p:.1} us ({:.0} GB/s); x 90 sites per row: {:.2} -> {:.2} ms", bytes / r / 1e3, bytes / p / 1e3, 90.0 * r / 1e3, 90.0 * p / 1e3);
+            for d in rec.iter_mut().chain([&mut xd, &mut cd]) {
+                cuda::free_dev(d);
+            }
+            for s in sites.iter_mut() {
+                s.free();
+            }
+            plan.free();
+            assert!(p <= COEFFS_US, "the plan's coeffs take {p:.1} us per site (bound {COEFFS_US} us)");
         }
     }
 }

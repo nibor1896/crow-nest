@@ -27,9 +27,9 @@
 //!   selection on `glm5_router_sig_topk` (`kernels_glm5_moe.cu`, sized by the plan: E <= 512,
 //!   padded to 512 threads with -inf so the power-of-two reduction holds for E = 288), the
 //!   experts on `kernels::mul1::GemvPlan` (gate, up, `glm5_swiglu_clamp`, down) with one slot per
-//!   (token, k) combo, the shared and dense FFN on the engine's `gemv_fp4_b` with the same clamp
-//!   kernel, `glm5_moe_combine` last. The record base of every expert comes from a device table
-//!   `[E] u64` the caller owns: a VRAM slot or a pinned-host UVA address, as `gemv_fp4_ptrb` reads
+//!   (token, k) combo, the shared and dense FFN on `glm5_gemv_fp4` (#191, bit-identical to the
+//!   engine's `gemv_fp4_b`) with the same clamp kernel, `glm5_moe_combine` last. The record base
+//!   of every expert comes from a device table `[E] u64` the caller owns: a VRAM slot or a pinned-host UVA address, as `gemv_fp4_ptrb` reads
 //!   them - the hook for the residency and the dynamic cache (#175). No host sync inside `run`.
 //! - **CPU lane in the GPU layer** (#188, [`lane`]): a decode call's combos posted by the tiers
 //!   are split; the CPU computes its share from the pinned records while the GPU computes the
@@ -406,18 +406,20 @@ impl GpuFfnPlan {
         }
     }
 
-    /// queue `y = ffn(x)`, x, y `[T][hidden]` f32 (four launches on the current stream)
+    /// queue `y = ffn(x)`, x, y `[T][hidden]` f32 (four launches on the current stream); the
+    /// three NVFP4 GEMVs on `glm5_gemv_fp4` (#191, bit-identical to the record `gemv_fp4_b`)
     ///
     /// # Safety
-    /// `kn` comes from a module with `gemv_fp4_b`; the weights match the plan's shape.
-    pub unsafe fn run(&self, kn: &kernels::Kernels, gk: &kernels::glm5_moe::Kernels, w: &GpuFfnWeights, x: CUdeviceptr, y: CUdeviceptr) {
+    /// The weights match the plan's shape.
+    pub unsafe fn run(&self, gk: &kernels::glm5_moe::Kernels, w: &GpuFfnWeights, x: CUdeviceptr, y: CUdeviceptr) {
         let (h, i, t) = (self.hidden, self.inter, self.tokens);
         assert!((w.gate.rows, w.gate.cols, w.up.rows, w.up.cols, w.down.rows, w.down.cols) == (i, h, i, h, h, i), "glm5_moe: FFN weights do not fit the plan");
-        let fp4 = kn.f("gemv_fp4_b");
-        launch_v(fp4, i as u32, t as u32, 1, 256, &[w.gate.w, x, w.gate.gs, self.g, self.prm_kh]);
-        launch_v(fp4, i as u32, t as u32, 1, 256, &[w.up.w, x, w.up.gs, self.u, self.prm_kh]);
+        let ((gu, bu), (gd, bd)) = (kernels::glm5_moe::fp4_launch(i, h), kernels::glm5_moe::fp4_launch(h, i));
+        // [w, x, gs, y, K, ldy, rows]: gate / up K = hidden, ldy = rows = inter; down the reverse
+        launch_v(gk.fp4, gu, t as u32, 1, bu, &[w.gate.w, x, w.gate.gs, self.g, self.prm_kh, self.prm_ki, self.prm_ki]);
+        launch_v(gk.fp4, gu, t as u32, 1, bu, &[w.up.w, x, w.up.gs, self.u, self.prm_kh, self.prm_ki, self.prm_ki]);
         launch_v(gk.act, (t * i).div_ceil(256) as u32, 1, 1, 256, &[self.g, self.u, self.h, self.prm_n, self.prm_f]);
-        launch_v(fp4, h as u32, t as u32, 1, 256, &[w.down.w, self.h, w.down.gs, y, self.prm_ki]);
+        launch_v(gk.fp4, gd, t as u32, 1, bd, &[w.down.w, self.h, w.down.gs, y, self.prm_ki, self.prm_kh, self.prm_kh]);
     }
 
     /// # Safety
@@ -501,7 +503,7 @@ impl GpuMoePlan {
     /// host sync, graph-capturable).
     ///
     /// # Safety
-    /// `kn` comes from a module with `gemv_bf16_b` and `gemv_fp4_b`; `table` is a device `[E]` u64
+    /// `kn` comes from a module with `gemv_bf16_b`; `table` is a device `[E]` u64
     /// array whose every entry is a record base (`geo.record.bytes`, #181 layout) that stays
     /// readable until the launches finished - a VRAM slot or a pinned-host UVA address.
     pub unsafe fn run(
@@ -515,7 +517,7 @@ impl GpuMoePlan {
         y: CUdeviceptr,
     ) {
         self.route(kn, gk, w, x);
-        self.experts(kn, mk, gk, w, table, x, y);
+        self.experts(mk, gk, w, table, x, y);
     }
 
     /// the first two launches of [`GpuMoePlan::run`]: router logits and the top-K selection into
@@ -538,7 +540,6 @@ impl GpuMoePlan {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn experts(
         &self,
-        kn: &kernels::Kernels,
         mk: &mul1::Kernels,
         gk: &kernels::glm5_moe::Kernels,
         w: &GpuMoeWeights,
@@ -547,7 +548,7 @@ impl GpuMoePlan {
         y: CUdeviceptr,
     ) {
         if let Some(call) = lane::take(table, self.tokens, self.geo.topk) {
-            return self.experts_lane(kn, mk, gk, w, table, x, y, call);
+            return self.experts_lane(mk, gk, w, table, x, y, call);
         }
         let (h, t) = (self.geo.hidden, self.tokens);
         let c = t * self.geo.topk;
@@ -556,7 +557,7 @@ impl GpuMoePlan {
         self.up.run(mk, self.ptrs, self.xg, self.ue);
         launch_v(gk.act, (c * self.geo.expert_inter).div_ceil(256) as u32, 1, 1, 256, &[self.ge, self.ue, self.he, self.prm_n, self.prm_f]);
         self.down.run(mk, self.ptrs, self.he, self.ye);
-        self.shared.run(kn, gk, &w.shared, x, self.ys);
+        self.shared.run(gk, &w.shared, x, self.ys);
         launch_v(gk.combine, h.div_ceil(256) as u32, t as u32, 1, 256, &[self.ye, self.wts, self.ys, y, self.prm_kh2]);
     }
 
@@ -579,7 +580,6 @@ impl GpuMoePlan {
     #[allow(clippy::too_many_arguments)]
     unsafe fn experts_lane(
         &self,
-        kn: &kernels::Kernels,
         mk: &mul1::Kernels,
         gk: &kernels::glm5_moe::Kernels,
         w: &GpuMoeWeights,
@@ -620,7 +620,7 @@ impl GpuMoePlan {
             launch_v(gk.act, (k * g.expert_inter).div_ceil(256) as u32, 1, 1, 256, &[self.ge, self.ue, self.he, self.prm_n, self.prm_f]);
             self.down.run_slots(mk, n, self.ptrs, self.he, self.ye);
         }
-        self.shared.run(kn, gk, &w.shared, x, self.ys);
+        self.shared.run(gk, &w.shared, x, self.ys);
         // hand the queued launches to the GPU (WDDM batches them), then wait for x only
         let _ = sys::cuStreamQuery(s);
         cuda::ck(sys::cuEventSynchronize(ev));
@@ -1229,6 +1229,19 @@ mod tests {
         for n in kernels::glm5_moe::NAMES {
             assert!(names.iter().any(|m| m == n), "{n} missing in {names:?}");
         }
+        // #191: the host's grid arithmetic matches the kernel's rows per block
+        let src = crate::kernels::GLM5_MOE_SRC;
+        let def = |name: &str| -> usize {
+            let pat = format!("#define {name} ");
+            let i = src.find(&pat).unwrap_or_else(|| panic!("no #define {name}")) + pat.len();
+            src[i..].split_whitespace().next().unwrap().parse().unwrap()
+        };
+        assert_eq!(def("GLM5_FP4_RB"), kernels::glm5_moe::FP4_ROWS_PER_BLOCK);
+        // one thread per 36-byte block, whole warps, at most the record's 256
+        let rb = kernels::glm5_moe::FP4_ROWS_PER_BLOCK;
+        for (rows, k, threads) in [(2048, 4096, 64), (4096, 2048, 32), (512, 4096, 64), (16384, 1536, 32), (4096, 16384, 256), (1, 64, 32), (4096, 32768, 256)] {
+            assert_eq!(kernels::glm5_moe::fp4_launch(rows, k), (rows.div_ceil(rb) as u32, threads), "[{rows}, {k}]");
+        }
     }
 
     unsafe fn main_kernels() -> (cuda::Module, kernels::Kernels) {
@@ -1495,7 +1508,7 @@ mod tests {
             let dw = gpu_ffn(&s.dense);
             let mut dp = GpuFfnPlan::new(4096, g.dense_inter, TD, g.swiglu_limit);
             let (mut xdd, mut ydd) = (cuda::to_f32_dev(&s.x_dense), cuda::alloc_zeroed(TD * 4096 * 4));
-            dp.run(&kn, &gk, &dw, xdd, ydd);
+            dp.run(&gk, &dw, xdd, ydd);
             cuda::sync();
             let yd2 = cuda::dtoh(ydd, TD * 4096);
             for t in 0..TD {
