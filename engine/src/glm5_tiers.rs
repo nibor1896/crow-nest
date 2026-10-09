@@ -4666,6 +4666,30 @@ mod split_tests {
                 );
             }
 
+            // (5) the lane's hand-off of x as `experts_lane` does it: D2H of the [hidden] row into
+            // pinned RAM, an event, the host waits on the event (from an idle stream)
+            {
+                use cudarc::driver::sys;
+                let mut buf = cuda::Pinned::alloc(h * 4);
+                let ev = cuda::event_create();
+                let s = cuda::cur_stream();
+                let mut us = Vec::new();
+                for rep in 0..210 {
+                    cuda::sync();
+                    let t0 = std::time::Instant::now();
+                    cuda::ck(sys::cuMemcpyDtoHAsync_v2(buf.host, xd, h * 4, s));
+                    cuda::event_record(ev, s);
+                    let _ = sys::cuStreamQuery(s);
+                    cuda::ck(sys::cuEventSynchronize(ev));
+                    if rep >= 10 {
+                        us.push(t0.elapsed().as_secs_f64() * 1e6);
+                    }
+                }
+                eprintln!("  (5) x hand-off (16 KB D2H + event wait): median {:.1} us; lane fixed cost ca {:.3} ms vs solo CPU run {ac:.3} ms", median(us), cost.ca);
+                cuda::event_destroy(ev);
+                buf.free();
+            }
+
             plan.free();
             for p in plans.iter_mut() {
                 p.free();

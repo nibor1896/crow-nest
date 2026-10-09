@@ -1461,9 +1461,10 @@ pub(crate) fn expert_ffn_with(im: Impl, e: &Mul1Expert, x: &[f32], y: &mut [f32]
 
 /// #188 CPU lane: the expert FFN of every expert in `es` on the same rows `x` `[T][hidden]`, in
 /// ONE pool run; `ys` `[n][T][hidden]`, expert `j`'s rows at `j T hidden`. The three phases of
-/// [`expert_ffn`] run over the experts side by side (input transforms of every expert, then the
-/// gate / up columns of every expert, then, once every expert's activation is complete, the down
-/// columns of every expert). A column, a block and its finisher do the operations of
+/// [`expert_ffn`] run over the experts as one queue (input transforms of every expert, then the
+/// gate / up columns of every expert, then the down columns of every expert), each unit waiting
+/// only for its own expert's inputs (per-expert counters, sybil `ft_n135.h` v4: expert 0's down
+/// columns start while the last experts' gate / up columns are still running). A column, a block and its finisher do the operations of
 /// `expert_ffn` with `act` in place of `silu_mul`, so with `act = silu_mul` every output is bit
 /// for bit `expert_ffn` of that expert alone, and with any `act` bit for bit
 /// `gemv(down, act(gemv(gate, x), gemv(up, x)))`. Every expert has the shape and bitrate of the
@@ -1510,7 +1511,11 @@ fn experts_ffn_with(im: Impl, es: &[Mul1Expert], x: &[f32], ys: &mut [f32], act:
         let (c1, c2) = (2 * (i / 16), h / 16);
         let (plan1, plan2) = (chunks(n * c1, k), chunks(n * c2, k));
         let (blk1, blk2) = (Blocks::new(n * (i / HAD), 2 * BLOCK_TILES), Blocks::new(n * (h / HAD), BLOCK_TILES));
-        let (prep, acts) = (Phase::new(n * 2 * (h / HAD)), AtomicUsize::new(0));
+        // per expert (sybil `ft_n135.h` v4 item 1, the dataflow queue): its input transforms done,
+        // its activation blocks done; a unit waits for its own expert's inputs only, so one
+        // expert's tail overlaps the next stage of the experts queued before it
+        let prep = Phase::new(n * 2 * (h / HAD));
+        let (preps, acts): (Vec<AtomicUsize>, Vec<AtomicUsize>) = ((0..n).map(|_| AtomicUsize::new(0)).collect(), (0..n).map(|_| AtomicUsize::new(0)).collect());
         let (cols1, cols2) = (AtomicUsize::new(0), AtomicUsize::new(0));
         pool::run(k, &|_| {
             prep.work(|jj| {
@@ -1520,11 +1525,14 @@ fn experts_ffn_with(im: Impl, es: &[Mul1Expert], x: &[f32], ys: &mut [f32], act:
                 } else {
                     prep_block(x, &es[j].up, b - h / HAD, tokens, sub(oxu, nxh, j));
                 }
+                preps[j].fetch_add(1, Ordering::Release);
             });
-            prep.wait();
             while let Some((q0, ntc)) = take(&cols1, &plan1) {
                 let (j, p0) = (q0 / c1, q0 % c1);
-                // SAFETY: every write to xp_g / xp_u is complete (`prep.wait`); read only from here on
+                // expert j's input transforms: every item was taken (this worker left the prep
+                // queue), so the wait is for work in progress, never for a worker
+                wait_for(&preps[j], 2 * (h / HAD));
+                // SAFETY: every write to expert j's xp_g / xp_u is complete (acquire above); read only from here on
                 let (xg, xu) = unsafe {
                     (std::slice::from_raw_parts(oxg.0.add(j * nxh) as *const f32, nxh), std::slice::from_raw_parts(oxu.0.add(j * nxh) as *const f32, nxh))
                 };
@@ -1537,14 +1545,15 @@ fn experts_ffn_with(im: Impl, es: &[Mul1Expert], x: &[f32], ys: &mut [f32], act:
                 }
                 if blk1.complete(j * (i / HAD) + b, ntc) {
                     act_block(&es[j], b, tokens, gj, uj, sub(oxd, nxi, j), act);
-                    acts.fetch_add(1, Ordering::Release);
+                    acts[j].fetch_add(1, Ordering::Release);
                 }
             }
-            // down needs every block of its input: wait for the work, not for the workers
-            wait_for(&acts, n * (i / HAD));
             while let Some((q0, ntc)) = take(&cols2, &plan2) {
                 let (j, nb0) = (q0 / c2, q0 % c2);
-                // SAFETY: every block of xp_d is complete (acquire above); read only from here on
+                // down needs every block of its expert's input: wait for that work (all of it
+                // taken: the gate / up queue is empty), not for the workers
+                wait_for(&acts[j], i / HAD);
+                // SAFETY: every block of expert j's xp_d is complete (acquire above); read only from here on
                 let xd = unsafe { std::slice::from_raw_parts(oxd.0.add(j * nxi) as *const f32, nxi) };
                 let dj = sub(od, nh, j);
                 unit_new(kern, &es[j].down, tab_d, xd, tokens, nb0, ntc, dj);
