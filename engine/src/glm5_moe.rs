@@ -410,8 +410,8 @@ impl GpuFfnPlan {
     /// three NVFP4 GEMVs on `glm5_gemv_fp4` (#191, bit-identical to the record `gemv_fp4_b`)
     ///
     /// # Safety
-    /// The weights match the plan's shape.
-    pub unsafe fn run(&self, gk: &kernels::glm5_moe::Kernels, w: &GpuFfnWeights, x: CUdeviceptr, y: CUdeviceptr) {
+    /// The weights match the plan's shape. `_kn` (the engine kernel table) is no longer read.
+    pub unsafe fn run(&self, _kn: &kernels::Kernels, gk: &kernels::glm5_moe::Kernels, w: &GpuFfnWeights, x: CUdeviceptr, y: CUdeviceptr) {
         let (h, i, t) = (self.hidden, self.inter, self.tokens);
         assert!((w.gate.rows, w.gate.cols, w.up.rows, w.up.cols, w.down.rows, w.down.cols) == (i, h, i, h, h, i), "glm5_moe: FFN weights do not fit the plan");
         let ((gu, bu), (gd, bd)) = (kernels::glm5_moe::fp4_launch(i, h), kernels::glm5_moe::fp4_launch(h, i));
@@ -517,7 +517,7 @@ impl GpuMoePlan {
         y: CUdeviceptr,
     ) {
         self.route(kn, gk, w, x);
-        self.experts(mk, gk, w, table, x, y);
+        self.experts(kn, mk, gk, w, table, x, y);
     }
 
     /// the first two launches of [`GpuMoePlan::run`]: router logits and the top-K selection into
@@ -540,6 +540,7 @@ impl GpuMoePlan {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn experts(
         &self,
+        kn: &kernels::Kernels,
         mk: &mul1::Kernels,
         gk: &kernels::glm5_moe::Kernels,
         w: &GpuMoeWeights,
@@ -548,7 +549,7 @@ impl GpuMoePlan {
         y: CUdeviceptr,
     ) {
         if let Some(call) = lane::take(table, self.tokens, self.geo.topk) {
-            return self.experts_lane(mk, gk, w, table, x, y, call);
+            return self.experts_lane(kn, mk, gk, w, table, x, y, call);
         }
         let (h, t) = (self.geo.hidden, self.tokens);
         let c = t * self.geo.topk;
@@ -557,7 +558,7 @@ impl GpuMoePlan {
         self.up.run(mk, self.ptrs, self.xg, self.ue);
         launch_v(gk.act, (c * self.geo.expert_inter).div_ceil(256) as u32, 1, 1, 256, &[self.ge, self.ue, self.he, self.prm_n, self.prm_f]);
         self.down.run(mk, self.ptrs, self.he, self.ye);
-        self.shared.run(gk, &w.shared, x, self.ys);
+        self.shared.run(kn, gk, &w.shared, x, self.ys);
         launch_v(gk.combine, h.div_ceil(256) as u32, t as u32, 1, 256, &[self.ye, self.wts, self.ys, y, self.prm_kh2]);
     }
 
@@ -580,6 +581,7 @@ impl GpuMoePlan {
     #[allow(clippy::too_many_arguments)]
     unsafe fn experts_lane(
         &self,
+        kn: &kernels::Kernels,
         mk: &mul1::Kernels,
         gk: &kernels::glm5_moe::Kernels,
         w: &GpuMoeWeights,
@@ -620,7 +622,7 @@ impl GpuMoePlan {
             launch_v(gk.act, (k * g.expert_inter).div_ceil(256) as u32, 1, 1, 256, &[self.ge, self.ue, self.he, self.prm_n, self.prm_f]);
             self.down.run_slots(mk, n, self.ptrs, self.he, self.ye);
         }
-        self.shared.run(gk, &w.shared, x, self.ys);
+        self.shared.run(kn, gk, &w.shared, x, self.ys);
         // hand the queued launches to the GPU (WDDM batches them), then wait for x only
         let _ = sys::cuStreamQuery(s);
         cuda::ck(sys::cuEventSynchronize(ev));
@@ -1508,7 +1510,7 @@ mod tests {
             let dw = gpu_ffn(&s.dense);
             let mut dp = GpuFfnPlan::new(4096, g.dense_inter, TD, g.swiglu_limit);
             let (mut xdd, mut ydd) = (cuda::to_f32_dev(&s.x_dense), cuda::alloc_zeroed(TD * 4096 * 4));
-            dp.run(&gk, &dw, xdd, ydd);
+            dp.run(&kn, &gk, &dw, xdd, ydd);
             cuda::sync();
             let yd2 = cuda::dtoh(ydd, TD * 4096);
             for t in 0..TD {

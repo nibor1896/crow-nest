@@ -929,7 +929,7 @@ impl Glm5Pass {
                     self.dense_plans.push(GpuFfnPlan::new(h, self.g.dense_inter, t, self.g.swiglu_limit as f32));
                 }
                 let p = self.dense_plans.iter().find(|p| p.tokens == t).unwrap();
-                p.run(&self.kn.moe, w, self.collapsed, self.sub);
+                p.run(&self.kn.k, &self.kn.moe, w, self.collapsed, self.sub);
             }
             FfnW::Moe { w, table, .. } => {
                 if !self.moe_plans.iter().any(|p| p.tokens == t) {
@@ -954,7 +954,7 @@ impl Glm5Pass {
                             }
                         };
                         let tb = hook(lw.layer, &ids)?;
-                        p.experts(&self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub);
+                        p.experts(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub);
                     }
                 }
             }
@@ -1658,7 +1658,7 @@ mod tests_dense_gpu {
                 let x = cuda::to_f32_dev(&xs(t * h, &mut rng));
                 let mut plan = GpuFfnPlan::new(h, inter, t, G.swiglu_limit as f32);
                 let y = cuda::alloc_zeroed(t * h * 4);
-                plan.run(&kn.moe, &w, x, y);
+                plan.run(&kn.k, &kn.moe, &w, x, y);
                 cuda::sync();
                 let got = bits(&cuda::dtoh(y, t * h));
                 let fints = Ints::new(&[h, inter]);
