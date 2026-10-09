@@ -1,0 +1,791 @@
+{
+ "held": "todo-1006",
+ "cal": [
+  "omarchy-0915a",
+  "lenis-0830",
+  "ctx7-0830",
+  "zetalab-0829"
+ ],
+ "arena": "layer",
+ "B": 6.9936611328,
+ "B_source": "B = 6.994 GB/s at 1 reader(s), fixed by PREREG amendment, spread 1.003 (20261008T001819Z.json)",
+ "source_reasons": [],
+ "status": "bar, primary cell, bpw scenarios, grid and tie order are 'proposed, awaiting robin's confirmation' (PREREG-dyn, Awaiting confirmation 1-4); no G1d row may be taken before he confirms them",
+ "grid": [
+  "LRU s 0.00 P 0 d -",
+  "SEED+LRU s 0.25 P 0 d -",
+  "SEED+LRU s 0.50 P 0 d -",
+  "SEED+LRU+IDPF s 0.00 P 4 d 1",
+  "SEED+LRU+IDPF s 0.00 P 4 d 2",
+  "SEED+LRU+IDPF s 0.00 P 4 d 4",
+  "SEED+LRU+IDPF s 0.00 P 8 d 1",
+  "SEED+LRU+IDPF s 0.00 P 8 d 2",
+  "SEED+LRU+IDPF s 0.00 P 8 d 4",
+  "SEED+LRU+IDPF s 0.00 P 16 d 1",
+  "SEED+LRU+IDPF s 0.00 P 16 d 2",
+  "SEED+LRU+IDPF s 0.00 P 16 d 4",
+  "SEED+LRU+IDPF s 0.25 P 4 d 1",
+  "SEED+LRU+IDPF s 0.25 P 4 d 2",
+  "SEED+LRU+IDPF s 0.25 P 4 d 4",
+  "SEED+LRU+IDPF s 0.25 P 8 d 1",
+  "SEED+LRU+IDPF s 0.25 P 8 d 2",
+  "SEED+LRU+IDPF s 0.25 P 8 d 4",
+  "SEED+LRU+IDPF s 0.25 P 16 d 1",
+  "SEED+LRU+IDPF s 0.25 P 16 d 2",
+  "SEED+LRU+IDPF s 0.25 P 16 d 4",
+  "SEED+LRU+IDPF s 0.50 P 4 d 1",
+  "SEED+LRU+IDPF s 0.50 P 4 d 2",
+  "SEED+LRU+IDPF s 0.50 P 4 d 4",
+  "SEED+LRU+IDPF s 0.50 P 8 d 1",
+  "SEED+LRU+IDPF s 0.50 P 8 d 2",
+  "SEED+LRU+IDPF s 0.50 P 8 d 4",
+  "SEED+LRU+IDPF s 0.50 P 16 d 1",
+  "SEED+LRU+IDPF s 0.50 P 16 d 2",
+  "SEED+LRU+IDPF s 0.50 P 16 d 4"
+ ],
+ "cells": [
+  {
+   "bpw": "3.05",
+   "R_GiB": 46,
+   "V": "V25",
+   "C": 161,
+   "S": 9474048,
+   "primary": true,
+   "chosen": "LRU s 0.00 P 0 d -",
+   "point": [
+    0,
+    0.0,
+    0,
+    null
+   ],
+   "grid": [
+    {
+     "point": [
+      0,
+      0.0,
+      0,
+      null
+     ],
+     "name": "LRU s 0.00 P 0 d -",
+     "score": 37.916185015086796,
+     "per_file": {
+      "omarchy-0915a": 34.238559088402866,
+      "lenis-0830": 37.03251121076233,
+      "ctx7-0830": 40.50708133971292,
+      "zetalab-0829": 39.88658842146908
+     }
+    },
+    {
+     "point": [
+      1,
+      0.25,
+      0,
+      null
+     ],
+     "name": "SEED+LRU s 0.25 P 0 d -",
+     "score": 38.98983232148238,
+     "per_file": {
+      "omarchy-0915a": 35.45432824848373,
+      "lenis-0830": 37.45291479820628,
+      "ctx7-0830": 41.614066985645934,
+      "zetalab-0829": 41.438019253593566
+     }
+    },
+    {
+     "point": [
+      1,
+      0.5,
+      0,
+      null
+     ],
+     "name": "SEED+LRU s 0.50 P 0 d -",
+     "score": 40.10092827805025,
+     "per_file": {
+      "omarchy-0915a": 36.44826318691417,
+      "lenis-0830": 38.22239349775785,
+      "ctx7-0830": 43.25435406698565,
+      "zetalab-0829": 42.47870236054332
+     }
+    },
+    {
+     "point": [
+      2,
+      0.0,
+      4,
+      1
+     ],
+     "name": "SEED+LRU+IDPF s 0.00 P 4 d 1",
+     "score": 194.4616335767419,
+     "per_file": {
+      "omarchy-0915a": 191.20896893953318,
+      "lenis-0830": 193.55563340807174,
+      "ctx7-0830": 197.10593301435406,
+      "zetalab-0829": 195.97599894500857
+     }
+    },
+    {
+     "point": [
+      2,
+      0.0,
+      4,
+      2
+     ],
+     "name": "SEED+LRU+IDPF s 0.00 P 4 d 2",
+     "score": 191.66882317093976,
+     "per_file": {
+      "omarchy-0915a": 188.4739937511487,
+      "lenis-0830": 190.67628923766816,
+      "ctx7-0830": 194.29607655502392,
+      "zetalab-0829": 193.22893313991824
+     }
+    },
+    {
+     "point": [
+      2,
+      0.0,
+      4,
+      4
+     ],
+     "name": "SEED+LRU+IDPF s 0.00 P 4 d 4",
+     "score": 185.3555254059665,
+     "per_file": {
+      "omarchy-0915a": 182.1099062672303,
+      "lenis-0830": 184.27620515695068,
+      "ctx7-0830": 187.91684210526316,
+      "zetalab-0829": 187.11914809442175
+     }
+    },
+    {
+     "point": [
+      2,
+      0.0,
+      8,
+      1
+     ],
+     "name": "SEED+LRU+IDPF s 0.00 P 8 d 1",
+     "score": 355.8039950150602,
+     "per_file": {
+      "omarchy-0915a": 352.87888255835327,
+      "lenis-0830": 354.76681614349775,
+      "ctx7-0830": 358.399043062201,
+      "zetalab-0829": 357.17123829618885
+     }
+    },
+    {
+     "point": [
+      2,
+      0.0,
+      8,
+      2
+     ],
+     "name": "SEED+LRU+IDPF s 0.00 P 8 d 2",
+     "score": 349.4686681075244,
+     "per_file": {
+      "omarchy-0915a": 346.57011578753907,
+      "lenis-0830": 348.3668721973094,
+      "ctx7-0830": 352.0423923444976,
+      "zetalab-0829": 350.8952921007517
+     }
+    },
+    {
+     "point": [
+      2,
+      0.0,
+      8,
+      4
+     ],
+     "name": "SEED+LRU+IDPF s 0.00 P 8 d 4",
+     "score": 335.8843181780238,
+     "per_file": {
+      "omarchy-0915a": 332.93530600992466,
+      "lenis-0830": 334.68119394618833,
+      "ctx7-0830": 338.43626794258375,
+      "zetalab-0829": 337.4845048133984
+     }
+    },
+    {
+     "point": [
+      2,
+      0.0,
+      16,
+      1
+     ],
+     "name": "SEED+LRU+IDPF s 0.00 P 16 d 1",
+     "score": 681.1485215253474,
+     "per_file": {
+      "omarchy-0915a": 678.6500643264106,
+      "lenis-0830": 679.9880885650224,
+      "ctx7-0830": 683.7098564593301,
+      "zetalab-0829": 682.2460767506265
+     }
+    },
+    {
+     "point": [
+      2,
+      0.0,
+      16,
+      2
+     ],
+     "name": "SEED+LRU+IDPF s 0.00 P 16 d 2",
+     "score": 667.394480214141,
+     "per_file": {
+      "omarchy-0915a": 664.8838448814556,
+      "lenis-0830": 666.1329876681615,
+      "ctx7-0830": 669.9863157894737,
+      "zetalab-0829": 668.5747725174733
+     }
+    },
+    {
+     "point": [
+      2,
+      0.0,
+      16,
+      4
+     ],
+     "name": "SEED+LRU+IDPF s 0.00 P 16 d 4",
+     "score": 638.7253142156053,
+     "per_file": {
+      "omarchy-0915a": 636.1619187649329,
+      "lenis-0830": 637.3586042600897,
+      "ctx7-0830": 641.3414354066986,
+      "zetalab-0829": 640.0392984307002
+     }
+    },
+    {
+     "point": [
+      2,
+      0.25,
+      4,
+      1
+     ],
+     "name": "SEED+LRU+IDPF s 0.25 P 4 d 1",
+     "score": 193.58122914011255,
+     "per_file": {
+      "omarchy-0915a": 190.63039882374562,
+      "lenis-0830": 192.27284192825113,
+      "ctx7-0830": 196.4692822966507,
+      "zetalab-0829": 194.9523935118027
+     }
+    },
+    {
+     "point": [
+      2,
+      0.25,
+      4,
+      2
+     ],
+     "name": "SEED+LRU+IDPF s 0.25 P 4 d 2",
+     "score": 190.84394765403553,
+     "per_file": {
+      "omarchy-0915a": 187.88696930711265,
+      "lenis-0830": 189.44632847533632,
+      "ctx7-0830": 193.75157894736842,
+      "zetalab-0829": 192.29091388632466
+     }
+    },
+    {
+     "point": [
+      2,
+      0.25,
+      4,
+      4
+     ],
+     "name": "SEED+LRU+IDPF s 0.25 P 4 d 4",
+     "score": 184.6391681383608,
+     "per_file": {
+      "omarchy-0915a": 181.67763278809042,
+      "lenis-0830": 183.125,
+      "ctx7-0830": 187.57904306220095,
+      "zetalab-0829": 186.17499670315178
+     }
+    },
+    {
+     "point": [
+      2,
+      0.25,
+      8,
+      1
+     ],
+     "name": "SEED+LRU+IDPF s 0.25 P 8 d 1",
+     "score": 354.91673982648797,
+     "per_file": {
+      "omarchy-0915a": 352.24407278073886,
+      "lenis-0830": 353.61056614349775,
+      "ctx7-0830": 357.79636363636365,
+      "zetalab-0829": 356.01595674535145
+     }
+    },
+    {
+     "point": [
+      2,
+      0.25,
+      8,
+      2
+     ],
+     "name": "SEED+LRU+IDPF s 0.25 P 8 d 2",
+     "score": 348.6487299755898,
+     "per_file": {
+      "omarchy-0915a": 345.9625068921154,
+      "lenis-0830": 347.22351457399105,
+      "ctx7-0830": 351.54842105263157,
+      "zetalab-0829": 349.86047738362123
+     }
+    },
+    {
+     "point": [
+      2,
+      0.25,
+      8,
+      4
+     ],
+     "name": "SEED+LRU+IDPF s 0.25 P 8 d 4",
+     "score": 335.1527690704832,
+     "per_file": {
+      "omarchy-0915a": 332.4627825767322,
+      "lenis-0830": 333.61785313901345,
+      "ctx7-0830": 338.10086124401914,
+      "zetalab-0829": 336.429579322168
+     }
+    },
+    {
+     "point": [
+      2,
+      0.25,
+      16,
+      1
+     ],
+     "name": "SEED+LRU+IDPF s 0.25 P 16 d 1",
+     "score": 680.3703446341217,
+     "per_file": {
+      "omarchy-0915a": 678.0290387796362,
+      "lenis-0830": 679.0114910313902,
+      "ctx7-0830": 683.1897607655502,
+      "zetalab-0829": 681.2510879599104
+     }
+    },
+    {
+     "point": [
+      2,
+      0.25,
+      16,
+      2
+     ],
+     "name": "SEED+LRU+IDPF s 0.25 P 16 d 2",
+     "score": 666.6964686068593,
+     "per_file": {
+      "omarchy-0915a": 664.2760521962874,
+      "lenis-0830": 665.229119955157,
+      "ctx7-0830": 669.6244976076555,
+      "zetalab-0829": 667.6562046683371
+     }
+    },
+    {
+     "point": [
+      2,
+      0.25,
+      16,
+      4
+     ],
+     "name": "SEED+LRU+IDPF s 0.25 P 16 d 4",
+     "score": 638.1200841818079,
+     "per_file": {
+      "omarchy-0915a": 635.6886601727624,
+      "lenis-0830": 636.510369955157,
+      "ctx7-0830": 641.0848803827752,
+      "zetalab-0829": 639.196426216537
+     }
+    },
+    {
+     "point": [
+      2,
+      0.5,
+      4,
+      1
+     ],
+     "name": "SEED+LRU+IDPF s 0.50 P 4 d 1",
+     "score": 194.08925929337138,
+     "per_file": {
+      "omarchy-0915a": 190.8540709428414,
+      "lenis-0830": 192.55969730941703,
+      "ctx7-0830": 197.4604784688995,
+      "zetalab-0829": 195.48279045232758
+     }
+    },
+    {
+     "point": [
+      2,
+      0.5,
+      4,
+      2
+     ],
+     "name": "SEED+LRU+IDPF s 0.50 P 4 d 2",
+     "score": 191.40037314792983,
+     "per_file": {
+      "omarchy-0915a": 188.16559455982357,
+      "lenis-0830": 189.7882567264574,
+      "ctx7-0830": 194.79837320574163,
+      "zetalab-0829": 192.8492680996967
+     }
+    },
+    {
+     "point": [
+      2,
+      0.5,
+      4,
+      4
+     ],
+     "name": "SEED+LRU+IDPF s 0.50 P 4 d 4",
+     "score": 185.30823958610557,
+     "per_file": {
+      "omarchy-0915a": 182.04208785149788,
+      "lenis-0830": 183.57665358744396,
+      "ctx7-0830": 188.7824880382775,
+      "zetalab-0829": 186.83172886720294
+     }
+    },
+    {
+     "point": [
+      2,
+      0.5,
+      8,
+      1
+     ],
+     "name": "SEED+LRU+IDPF s 0.50 P 8 d 1",
+     "score": 355.33424178456875,
+     "per_file": {
+      "omarchy-0915a": 352.40323469950374,
+      "lenis-0830": 353.8185257847534,
+      "ctx7-0830": 358.63511961722486,
+      "zetalab-0829": 356.48008703679284
+     }
+    },
+    {
+     "point": [
+      2,
+      0.5,
+      8,
+      2
+     ],
+     "name": "SEED+LRU+IDPF s 0.50 P 8 d 2",
+     "score": 349.1197699204908,
+     "per_file": {
+      "omarchy-0915a": 346.14427494945784,
+      "lenis-0830": 347.5106502242152,
+      "ctx7-0830": 352.4909090909091,
+      "zetalab-0829": 350.33324541738097
+     }
+    },
+    {
+     "point": [
+      2,
+      0.5,
+      8,
+      4
+     ],
+     "name": "SEED+LRU+IDPF s 0.50 P 8 d 4",
+     "score": 335.74800011534103,
+     "per_file": {
+      "omarchy-0915a": 332.74967836794707,
+      "lenis-0830": 334.0166760089686,
+      "ctx7-0830": 339.14803827751194,
+      "zetalab-0829": 337.07760780693656
+     }
+    },
+    {
+     "point": [
+      2,
+      0.5,
+      16,
+      1
+     ],
+     "name": "SEED+LRU+IDPF s 0.50 P 16 d 1",
+     "score": 680.7672164411538,
+     "per_file": {
+      "omarchy-0915a": 678.1652269803345,
+      "lenis-0830": 679.2246356502242,
+      "ctx7-0830": 683.9749282296651,
+      "zetalab-0829": 681.7040749043914
+     }
+    },
+    {
+     "point": [
+      2,
+      0.5,
+      16,
+      2
+     ],
+     "name": "SEED+LRU+IDPF s 0.50 P 16 d 2",
+     "score": 667.1585520856913,
+     "per_file": {
+      "omarchy-0915a": 664.4995405256386,
+      "lenis-0830": 665.5357343049327,
+      "ctx7-0830": 670.4500478468899,
+      "zetalab-0829": 668.148885665304
+     }
+    },
+    {
+     "point": [
+      2,
+      0.5,
+      16,
+      4
+     ],
+     "name": "SEED+LRU+IDPF s 0.50 P 16 d 4",
+     "score": 638.7274191821847,
+     "per_file": {
+      "omarchy-0915a": 635.9987134717883,
+      "lenis-0830": 636.9517937219731,
+      "ctx7-0830": 642.0603827751196,
+      "zetalab-0829": 639.8987867598576
+     }
+    }
+   ],
+   "skipped_points": [],
+   "folds": [
+    {
+     "left_out": "omarchy-0915a",
+     "chosen": "LRU s 0.00 P 0 d -",
+     "point": [
+      0,
+      0.0,
+      0,
+      null
+     ],
+     "score_on_rest": 39.14206032398144,
+     "left_out_r": 34.238559088402866,
+     "equals_full_choice": true
+    },
+    {
+     "left_out": "lenis-0830",
+     "chosen": "LRU s 0.00 P 0 d -",
+     "point": [
+      0,
+      0.0,
+      0,
+      null
+     ],
+     "score_on_rest": 38.21074294986162,
+     "left_out_r": 37.03251121076233,
+     "equals_full_choice": true
+    },
+    {
+     "left_out": "ctx7-0830",
+     "chosen": "LRU s 0.00 P 0 d -",
+     "point": [
+      0,
+      0.0,
+      0,
+      null
+     ],
+     "score_on_rest": 37.052552906878084,
+     "left_out_r": 40.50708133971292,
+     "equals_full_choice": true
+    },
+    {
+     "left_out": "zetalab-0829",
+     "chosen": "LRU s 0.00 P 0 d -",
+     "point": [
+      0,
+      0.0,
+      0,
+      null
+     ],
+     "score_on_rest": 37.259383879626036,
+     "left_out_r": 39.88658842146908,
+     "equals_full_choice": true
+    }
+   ],
+   "held_out": {
+    "r": {
+     "mean": 49.79758637542765,
+     "ci": [
+      47.11661923076923,
+      52.342832692307695
+     ],
+     "n": 26599
+    },
+    "per_layer_r": [
+     2.4434377232226776,
+     2.4983270047746156,
+     2.4846422797849543,
+     2.3037708184518215,
+     1.6805519004473852,
+     1.8210083085830295,
+     1.9251099665400955,
+     1.92886950637242,
+     1.7132598969886086,
+     1.328245422760254,
+     1.2260611301176736,
+     1.2153464415955486,
+     1.2397458551073348,
+     1.2027143877589384,
+     0.9208240911312455,
+     0.6546110756043461,
+     0.5796082559494717,
+     0.7918718748825144,
+     0.7912327531110193,
+     0.8650701154178728,
+     0.9833828339411256,
+     0.902966276927704,
+     0.682506861160194,
+     0.7806308507838641,
+     0.7094627617579609,
+     0.8110455280273694,
+     0.8790931989924433,
+     0.9093574946426557,
+     0.9885709989097334,
+     1.0155268995075002,
+     0.8832662882063236,
+     0.8174743411406444,
+     0.9655626151359074,
+     0.9720290236475055,
+     0.977781119590962,
+     0.922741456445731,
+     0.9071769615399076,
+     1.0580096996127675,
+     0.9581563216662281,
+     0.8751456821685025,
+     1.034775743449002,
+     1.1486146095717884
+    ],
+    "prefetch_issued_per_token": 0.0,
+    "prefetch_used_per_token": 0.0,
+    "depth": [
+     {
+      "from": 0,
+      "to": 32000,
+      "r": {
+       "mean": 49.69692758993361,
+       "ci": [
+        46.67025900000001,
+        51.395151
+       ],
+       "n": 25908
+      }
+     },
+     {
+      "from": 32000,
+      "to": 100000,
+      "r": {
+       "mean": 53.57163531114327,
+       "ci": [
+        NaN,
+        NaN
+       ],
+       "n": 691
+      }
+     },
+     {
+      "from": 100000,
+      "to": null,
+      "r": {
+       "mean": NaN,
+       "ci": [
+        NaN,
+        NaN
+       ],
+       "n": 0
+      }
+     }
+    ],
+    "first_1000_generated": {
+     "mean": 36.535,
+     "ci": [
+      NaN,
+      NaN
+     ],
+     "n": 1000
+    },
+    "after_first_1000": {
+     "mean": 50.315676393609124,
+     "ci": [
+      47.880655000000004,
+      52.90432499999999
+     ],
+     "n": 25599
+    },
+    "reset_at_first_generated": {
+     "mean": 49.93507274709575,
+     "ci": [
+      47.43481826923077,
+      52.408728846153835
+     ],
+     "n": 26599
+    }
+   },
+   "min_r": 18.572653107259672,
+   "verdict": {
+    "r": 49.79758637542765,
+    "r_ci": [
+     47.11661923076923,
+     52.342832692307695
+    ],
+    "r_hi": 52.342832692307695,
+    "generated": 26599,
+    "S": 9474048,
+    "B": 6.9936611328,
+    "B_source": "B = 6.994 GB/s at 1 reader(s), fixed by PREREG amendment, spread 1.003 (20261008T001819Z.json)",
+    "bar_reads": 18.454785992217897,
+    "bar_bytes": 174841528.32,
+    "r_hi_bytes": 495898509.3828923,
+    "gate": "G1d",
+    "status": "bar, primary cell, bpw scenarios, grid and tie order are 'proposed, awaiting robin's confirmation' (PREREG-dyn, Awaiting confirmation 1-4); no G1d row may be taken before he confirms them",
+    "verdict": "G1d failed: r_hi 52.343 > 18.455 reads per token (r_hi x S 495.90 MB > B / 40 174.84 MB)"
+   }
+  }
+ ],
+ "calibration_routing": {
+  "from": "capture (PREREG-dyn amendment 2)",
+  "dir": "decode_out/glm-step8/capture-ids",
+  "files": [
+   "omarchy-0915a",
+   "lenis-0830",
+   "ctx7-0830",
+   "zetalab-0829"
+  ],
+  "ids_sha256": {
+   "L03": "4b46267eb5658e21d5e97ab55a5577de6192af2a4e4193206e29ccdfc320a23a",
+   "L04": "30100c63aa84f3f24711d04e5e83d61274371174344e18a97693e81e0a8842d9",
+   "L05": "41e20e2128438bc382bffa7d5d5d72320172a92dfca177655384baf699ce38cc",
+   "L06": "d1c4e95e100288923b08b8e323f4cc769fb0790847c4c7e809b9c27968ff9609",
+   "L07": "5aecc9273533a4c8bfa7f95c12ee1b65ddc092339d6c87a5fdb762865e598f6d",
+   "L08": "005dc5e49357da8129bde987c3cc0d1a8b6b9c0e052e891673765ee6068ae7db",
+   "L09": "7db1f2e79d669a3cab395ba6529b2c326c7b0fd139cc3da7e42770e2dcdbd42f",
+   "L10": "1c370297c7e407d84c4c040275b7aaa54b3ab0ab2eafcdef6afd105a8f035f60",
+   "L11": "033c01fdde211f1fa9f09270ace3ba79554cbd68605dbee35e6609a60cae3d02",
+   "L12": "49e553be80d7a2cab0480f7dafbb11a84e902a812bcb9aef876ccb45258ea4d7",
+   "L13": "da8de55ae48ff6973208161e4182b12e1a5b531917ab73c8509ea073e3c22dcf",
+   "L14": "95e76badc1a1e386ba0ea622917eff5850cc7b9bafe7a43100aa86049a71b8a7",
+   "L15": "0ccdb94ed68dbf48aaa7c41954b1ccb90393c227db32f4f44b0434ce202f5a19",
+   "L16": "4e674c2d42a83414669509ae6a002f9e867c8d3a0b0fe5193c458de51c0d50c9",
+   "L17": "c0d6766ced52e377f68d056b016f64c6dbe6f79df628341c1e67af0304dec6fb",
+   "L18": "84dd311b1d0599167b7f5fc6fa35c48ddc60bc7ecc190962efbebdc1843c9d0b",
+   "L19": "7dcb47e41b19842ff1e377278bd2db17656af9bb66d533403ff936542a037e5a",
+   "L20": "77dac5ff7fc96e0a26736406a687ee1628ff02afee16a3b715f4decd5cfce03d",
+   "L21": "05f67de2cd3f974fa64cf39846489b90cb83b3d282d2b2ec81032995fb9f25a9",
+   "L22": "3225f2db43da313ee8277f4352d9bd4aafeae973cb8d7b25d0f620be9787f35a",
+   "L23": "0fedcced417e28bab5f9d666eda143ffda29112308d43a5aac758fb5796294f8",
+   "L24": "f83fd82ec5cbfac169dd718d2b68dab0048ba0d404862e7d814ebfd7ebf00dc6",
+   "L25": "61422828948da5611f79816c8d84373c412cc82aa309c6bec03cfe4c0b231502",
+   "L26": "f10669fcde35d75ef00003931f9868a615aa155bf4cc29c570a7d8f03e512fa9",
+   "L27": "1da2923138ea4f4b50bbe43244b22f61efb6a48be917143f5d0c6a643393d24f",
+   "L28": "e17ef96d088132cdc402f5ac6def8ae80bffecf3c035524a578c33b476266af9",
+   "L29": "4a4ad2081c2154a5497fe6bc0114cf386eb8cf42134046a6ac3fca41069ae36b",
+   "L30": "9d426e3ad7f788d6e478ad5f34b9aa940688594654cdebdda00160015560e277",
+   "L31": "6e836c20840185ea825d656b1b46f70bd6a4d88477eec302129cd61555dbd0f7",
+   "L32": "072e28edd67da13ee4bf5101f4ab3a1d17eea78aa7deca7fe507a4fca5f4826d",
+   "L33": "79e027f27f1dd58a9c52e0117f4783cc712baa444b8d8f048165f748c8fcaa34",
+   "L34": "ed297363d7c5b2b86a80bba137168aa25ab019a4c156366bc285065ce4d43533",
+   "L35": "e64683514899b8ec0f63ec0d3f3f051ba301d9db07b31caec9dd1beef0f659e8",
+   "L36": "55768132b5c004f599d263ae58db4c871990551739d45e1bfaecb70d583afbd4",
+   "L37": "28dda1368566618e678a0e54f75fb29249ab6d4f1c93c2624fc1a8d61e31c88b",
+   "L38": "046570d218cb6b2f939732db18bb4b85df4db248a094065c663dabaaaa3aa181",
+   "L39": "f4d94b71104db34c5603373f2aac513670de96c96c97a24b91fe6b369158e984",
+   "L40": "143619cdcf6281a637f44a68ca4f66fe1f68fadf393a1e11fac960af90850c8e",
+   "L41": "742eb779e58b751a3eb8f1d4e2c9d5c0edba3d6a290d5a50874c7614ac35eb82",
+   "L42": "d059ecf002f199b404e0e130e1d55a7e263f4829b96b5be45b228cb461f18c1a",
+   "L43": "a084b707e6189fe9c027afaeaa9c2a52fe0c0218dc035a004eb37be6e5fff0be",
+   "L44": "df58248d55cfea88ac542a0de52602dc3b049fa1278a4c2c66d78135b253868c"
+  }
+ }
+}
