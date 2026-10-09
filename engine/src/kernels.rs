@@ -6503,7 +6503,7 @@ pub mod glm5_moe {
     use cudarc::driver::sys::CUfunction;
 
     /// every entry of `GLM5_MOE_SRC`
-    pub const NAMES: &[&str] = &["glm5_router_sig_topk", "glm5_moe_gather", "glm5_swiglu_clamp", "glm5_moe_combine", "glm5_gemv_fp4"];
+    pub const NAMES: &[&str] = &["glm5_router_sig_topk", "glm5_moe_gather", "glm5_swiglu_clamp", "glm5_moe_combine", "glm5_gemv_fp4", "glm5_gemv_fp4_x3"];
     /// #191: output rows of one `glm5_gemv_fp4` block (`GLM5_FP4_RB`)
     pub const FP4_ROWS_PER_BLOCK: usize = 2;
 
@@ -6526,6 +6526,9 @@ pub mod glm5_moe {
         pub combine: CUfunction,
         /// #191: the dense NVFP4 GEMV of the glm5_next path, bit-identical to `gemv_fp4_b(s)`
         pub fp4: CUfunction,
+        /// `fp4` over three matrices of one shape in one launch (the KDA q|k|v projections),
+        /// grid x `3 *` [`fp4_launch`]'s
+        pub fp4_x3: CUfunction,
     }
 
     impl Kernels {
@@ -6539,6 +6542,7 @@ pub mod glm5_moe {
                 act: module.get("glm5_swiglu_clamp"),
                 combine: module.get("glm5_moe_combine"),
                 fp4: module.get("glm5_gemv_fp4"),
+                fp4_x3: module.get("glm5_gemv_fp4_x3"),
                 module,
             }
         }

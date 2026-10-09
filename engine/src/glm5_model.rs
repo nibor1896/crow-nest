@@ -700,6 +700,17 @@ unsafe fn fp4_gemv(kn: &Glm5Kernels, ints: &Ints, m: &GpuNvfp4, x: Dev, y: Dev, 
     launch_v(kn.moe.fp4, blocks, t as u32, 1, threads, &[m.w, x, m.gs, y, ints.p(m.cols), ints.p(ld), ints.p(m.rows)]);
 }
 
+/// [`fp4_gemv`] of three `[rows, cols]` matrices on one `x` in ONE launch (`glm5_gemv_fp4_x3`):
+/// matrix `m` writes the columns `m * rows ..` of `y` (row stride `ldy`), each output bit-identical
+/// to its own `fp4_gemv`. The KDA q|k|v projections of a call.
+unsafe fn fp4_gemv_x3(kn: &Glm5Kernels, ints: &Ints, ms: [&GpuNvfp4; 3], x: Dev, y: Dev, t: usize, ldy: usize) {
+    let (rows, cols) = (ms[0].rows, ms[0].cols);
+    assert!(ms.iter().all(|m| m.rows == rows && m.cols == cols), "glm5_model: q|k|v of different shapes");
+    let (blocks, threads) = kernels::glm5_moe::fp4_launch(rows, cols);
+    let [a, b, c] = ms;
+    launch_v(kn.moe.fp4_x3, 3 * blocks, t as u32, 1, threads, &[a.w, b.w, c.w, a.gs, b.gs, c.gs, x, y, ints.p(cols), ints.p(ldy), ints.p(rows)]);
+}
+
 /// What one mHC site of a call produced, appended call by call (`[rows][..]` in row order): the
 /// harness's taps on the sub-block boundaries the runner captures (`--capture-subblocks`).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -902,13 +913,10 @@ impl Glm5Pass {
         kn.mla.rmsnorm_rows(self.collapsed, lw.input_norm, h, t, self.st2);
         match &lw.attn {
             AttnW::Kda(a) => {
-                let w = kn.kda.d.width();
                 let mut proj = |p: KdaProj, xi: Dev, yo: Dev, tt: usize| match p {
                     KdaProj::Qkv => {
                         let cc = kn.kda.d.conv_ch();
-                        fp4_gemv(kn, ints, &a.q, xi, yo, tt, Some(cc));
-                        fp4_gemv(kn, ints, &a.k, xi, yo + (w * 4) as u64, tt, Some(cc));
-                        fp4_gemv(kn, ints, &a.v, xi, yo + (2 * w * 4) as u64, tt, Some(cc));
+                        fp4_gemv_x3(kn, ints, [&a.q, &a.k, &a.v], xi, yo, tt, cc);
                     }
                     KdaProj::O => fp4_gemv(kn, ints, &a.o, xi, yo, tt, None),
                 };
@@ -1085,13 +1093,10 @@ impl Glm5Pass {
         kn.mla.rmsnorm_rows(self.collapsed, lw.input_norm, h, t, self.st2);
         match &lw.attn {
             AttnW::Kda(a) => {
-                let wd = kn.kda.d.width();
                 let mut proj = |p: KdaProj, xi: Dev, yo: Dev, tt: usize| match p {
                     KdaProj::Qkv => {
                         let cc = kn.kda.d.conv_ch();
-                        fp4_gemv(kn, ints, &a.q, xi, yo, tt, Some(cc));
-                        fp4_gemv(kn, ints, &a.k, xi, yo + (wd * 4) as u64, tt, Some(cc));
-                        fp4_gemv(kn, ints, &a.v, xi, yo + (2 * wd * 4) as u64, tt, Some(cc));
+                        fp4_gemv_x3(kn, ints, [&a.q, &a.k, &a.v], xi, yo, tt, cc);
                     }
                     KdaProj::O => fp4_gemv(kn, ints, &a.o, xi, yo, tt, None),
                 };
@@ -1939,6 +1944,143 @@ mod tests_dense_gpu {
                 bytes_row / new_row / 1e3
             );
             assert!(new_row <= DENSE_ROW_US, "the pass's dense NVFP4 GEMVs take {:.2} ms per decode row (bound {:.2} ms)", new_row / 1e3, DENSE_ROW_US / 1e3);
+        }
+    }
+
+    /// the KDA q, k, v matrices of one layer (`[width, hidden]` each) from `wb`, uploaded
+    unsafe fn qkv(wb: [&[u8]; 3], gs: [f32; 3]) -> [GpuNvfp4; 3] {
+        let (kd, h) = (KdaDims::of(&G), G.hidden);
+        [0, 1, 2].map(|i| GpuNvfp4 { w: cuda::upload_dev(wb[i]), gs: cuda::to_f32_dev(&[gs[i]]), rows: kd.width(), cols: h })
+    }
+
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_dense_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_dense_gpu_kda_qkv_in_one_launch_is_bit_identical_to_three() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Glm5Kernels::new(&G);
+            let (kd, h) = (KdaDims::of(&G), G.hidden);
+            let (w, cc) = (kd.width(), kd.conv_ch());
+            let ints = Ints::new(&[h, w, cc]);
+            let mut rng = Rng(0x05ee_d0e3);
+            for t in [1usize, 3] {
+                let wb: Vec<Vec<u8>> = (0..3).map(|_| nvfp4(w, h, &mut rng, true)).collect();
+                let m = qkv([&wb[0], &wb[1], &wb[2]], [0.37, 0.21, 0.53]);
+                let x = cuda::to_f32_dev(&xs(t * h, &mut rng));
+                let nan = vec![f32::NAN; t * cc];
+                let (ya, yb) = (cuda::to_f32_dev(&nan), cuda::to_f32_dev(&nan));
+                for (i, mi) in m.iter().enumerate() {
+                    fp4_gemv(&kn, &ints, mi, x, ya + (i * w * 4) as u64, t, Some(cc));
+                }
+                fp4_gemv_x3(&kn, &ints, [&m[0], &m[1], &m[2]], x, yb, t, cc);
+                cuda::sync();
+                let (a, b) = (bits(&cuda::dtoh(ya, t * cc)), bits(&cuda::dtoh(yb, t * cc)));
+                let differ = a.iter().zip(&b).filter(|(p, q)| p != q).count();
+                assert_eq!(differ, 0, "kda q|k|v t {t}: {differ} of {} outputs differ from three fp4_gemv launches", t * cc);
+                for mut d in m.iter().flat_map(|mi| [mi.w, mi.gs]).chain([x, ya, yb]) {
+                    cuda::free_dev(&mut d);
+                }
+            }
+        }
+    }
+
+    /// acceptance bound, fixed before the after-measurement (ticket comment): the one q|k|v launch
+    /// of a KDA layer takes at most this share of the three `fp4_gemv` launches it replaces
+    const QKV_ONE_VS_THREE: f64 = 1.02;
+
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_dense_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_dense_gpu_kda_qkv_one_launch_is_not_slower_than_three() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Glm5Kernels::new(&G);
+            let (kd, h) = (KdaDims::of(&G), G.hidden);
+            let (w, cc) = (kd.width(), kd.conv_ch());
+            let ints = Ints::new(&[h, w, cc]);
+            let mut rng = Rng(0x0be4_c0e3);
+            let wb = nvfp4(w, h, &mut rng, false);
+            let bytes = wb.len();
+            // >= 256 MiB of copies, three matrices per launch
+            let sets = (256usize << 20).div_ceil(3 * bytes).max(2);
+            let ms: Vec<[GpuNvfp4; 3]> = (0..sets).map(|_| qkv([&wb, &wb, &wb], [0.37, 0.21, 0.53])).collect();
+            let x = cuda::to_f32_dev(&xs(h, &mut rng));
+            let y = cuda::alloc_zeroed(cc * 4);
+            let n = (4 * sets).max(64);
+            let (three, host3) = time2_us(n, |i| {
+                for (j, m) in ms[i % sets].iter().enumerate() {
+                    fp4_gemv(&kn, &ints, m, x, y + (j * w * 4) as u64, 1, Some(cc));
+                }
+            });
+            let (one, host1) = time2_us(n, |i| {
+                let m = &ms[i % sets];
+                fp4_gemv_x3(&kn, &ints, [&m[0], &m[1], &m[2]], x, y, 1, cc);
+            });
+            let gbs = |us: f64| 3.0 * bytes as f64 / us / 1e3;
+            eprintln!(
+                "kda q|k|v [3 x {w} x {h}] {} B per layer, x {} per row: three launches {three:.1} us {:.0} GB/s (host {host3:.1} us) | one launch {one:.1} us {:.0} GB/s (host {host1:.1} us)",
+                3 * bytes,
+                G.kda_layers,
+                gbs(three),
+                gbs(one)
+            );
+            for m in ms {
+                for mut d in m.iter().flat_map(|mi| [mi.w, mi.gs]) {
+                    cuda::free_dev(&mut d);
+                }
+            }
+            for mut d in [x, y] {
+                cuda::free_dev(&mut d);
+            }
+            assert!(one <= QKV_ONE_VS_THREE * three, "one q|k|v launch {one:.1} us vs three {three:.1} us (bound x{QKV_ONE_VS_THREE})");
+        }
+    }
+
+    /// the kernel launches `f` queues: captured into a graph on a non-blocking stream, nodes counted
+    unsafe fn kernel_launches(f: impl FnOnce()) -> usize {
+        type FnBegin = unsafe extern "system" fn(sys::CUstream, u32) -> sys::CUresult;
+        type FnEnd = unsafe extern "system" fn(sys::CUstream, *mut sys::CUgraph) -> sys::CUresult;
+        type FnNodes = unsafe extern "system" fn(sys::CUgraph, *mut sys::CUgraphNode, *mut usize) -> sys::CUresult;
+        type FnGraph = unsafe extern "system" fn(sys::CUgraph) -> sys::CUresult;
+        type FnStream = unsafe extern "system" fn(sys::CUstream) -> sys::CUresult;
+        let s = cuda::stream_create_non_blocking();
+        cuda::set_stream(s as u64);
+        let begin: FnBegin = cuda::graph_sym(b"cuStreamBeginCapture_v2\0");
+        cuda::ck(begin(s, 1)); // CU_STREAM_CAPTURE_MODE_THREAD_LOCAL
+        f();
+        let end: FnEnd = cuda::graph_sym(b"cuStreamEndCapture\0");
+        let mut g: sys::CUgraph = std::ptr::null_mut();
+        let r = end(s, &mut g);
+        cuda::set_stream(0);
+        cuda::ck(r);
+        let nodes: FnNodes = cuda::graph_sym(b"cuGraphGetNodes\0");
+        let mut n = 0usize;
+        cuda::ck(nodes(g, std::ptr::null_mut(), &mut n));
+        let destroy: FnGraph = cuda::graph_sym(b"cuGraphDestroy\0");
+        cuda::ck(destroy(g));
+        let sdestroy: FnStream = cuda::graph_sym(b"cuStreamDestroy_v2\0");
+        cuda::ck(sdestroy(s));
+        n
+    }
+
+    /// the KDA q|k|v projections of a call are ONE kernel launch (34 per decode row, not 102)
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_dense_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_dense_gpu_kda_qkv_is_one_launch() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Glm5Kernels::new(&G);
+            let (kd, h) = (KdaDims::of(&G), G.hidden);
+            let (w, cc) = (kd.width(), kd.conv_ch());
+            let ints = Ints::new(&[h, w, cc]);
+            let mut rng = Rng(0x00e3_01aa);
+            let wb = nvfp4(w, h, &mut rng, false);
+            let m = qkv([&wb, &wb, &wb], [0.37, 0.21, 0.53]);
+            let (x, y) = (cuda::alloc_zeroed(h * 4), cuda::alloc_zeroed(cc * 4));
+            let n = kernel_launches(|| fp4_gemv_x3(&kn, &ints, [&m[0], &m[1], &m[2]], x, y, 1, cc));
+            for mut d in m.iter().flat_map(|mi| [mi.w, mi.gs]).chain([x, y]) {
+                cuda::free_dev(&mut d);
+            }
+            assert_eq!(n, 1, "the KDA q|k|v projections of a call take {n} kernel launches");
         }
     }
 }

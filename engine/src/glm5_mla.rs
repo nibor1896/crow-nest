@@ -15,7 +15,8 @@
 //!   appended, ties to the lowest pool index), at most `sel_max` = 2051 rows per query;
 //! - split-K attention over the selected latent rows, then `W_v`, then `o_proj`.
 //!
-//! The projections run on `gm_gemm` (BF16 weights, f32 activations and accumulation) through
+//! The projections run on `gm_gemm` (BF16 weights, f32 activations and accumulation; `gm_gemv`,
+//! bit-identical, for calls of at most [`DECODE_T`] rows) through
 //! [`MlaScratch::linear`]; an integrator with other weight codecs replaces those calls and keeps the
 //! stages ([`MlaScratch::store_latent`], [`MlaScratch::store_index`], [`MlaScratch::select`],
 //! [`MlaScratch::attend`]). Nothing in the engine calls this module yet (the lead wires it into
@@ -38,7 +39,17 @@ pub const NAMES: &[&str] = &[
     "gm_attn",
     "gm_attn_merge",
     "gm_out_v",
+    "gm_gemv",
+    "gm_absorb1",
+    "gm_out_v1",
 ];
+
+/// the most rows a call may have to run on the decode kernels `gm_gemv`, `gm_absorb1`,
+/// `gm_out_v1` (`GM_DT`); larger calls run on the tiled `gm_gemm`, `gm_absorb`, `gm_out_v`. Each
+/// decode kernel keeps the summation chain of its tiled twin: bit-identical outputs.
+pub const DECODE_T: usize = 4;
+/// output rows of one `gm_gemv` block (`GM_GV_R`)
+pub const GEMV_ROWS: usize = 8;
 
 /// the pool size the selection kernel (`qsa_select_fast`) is built for
 pub const KPOOL: usize = 4;
@@ -177,6 +188,9 @@ pub struct MlaKernels {
     attn: CUfunction,
     merge: CUfunction,
     out_v: CUfunction,
+    gemv: CUfunction,
+    absorb1: CUfunction,
+    out_v1: CUfunction,
     select: CUfunction,
 }
 
@@ -202,6 +216,9 @@ impl MlaKernels {
             attn: module.get("gm_attn"),
             merge: module.get("gm_attn_merge"),
             out_v: module.get("gm_out_v"),
+            gemv: module.get("gm_gemv"),
+            absorb1: module.get("gm_absorb1"),
+            out_v1: module.get("gm_out_v1"),
             select,
             module,
             dims,
@@ -406,6 +423,10 @@ impl MlaScratch {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn linear(&self, kn: &MlaKernels, w: CUdeviceptr, k: usize, n: usize, x: CUdeviceptr, ldx: usize, y: CUdeviceptr, ldy: usize) {
         assert!(k % 32 == 0, "gm_gemm: k = {k}");
+        if self.t <= DECODE_T && w.is_multiple_of(16) && x.is_multiple_of(16) && ldx.is_multiple_of(4) {
+            launch_v(kn.gemv, n.div_ceil(GEMV_ROWS) as u32, 1, 1, 128, &[w, x, y, k as u64, n as u64, ldx as u64, ldy as u64, self.st]);
+            return;
+        }
         launch_v(kn.gemm, n.div_ceil(64) as u32, self.t.div_ceil(16) as u32, 1, 256, &[w, x, y, k as u64, n as u64, ldx as u64, ldy as u64, self.st]);
     }
 
@@ -461,11 +482,33 @@ impl MlaScratch {
     pub unsafe fn attend(&self, kn: &MlaKernels, w: &MlaWeights, c: &MlaCache) {
         let d = &kn.dims;
         let t = self.t as u32;
-        launch_v(kn.absorb, d.heads as u32, t.div_ceil(8), 1, 256, &[self.q, w.kv_b, self.qt, self.st]);
+        self.absorb(kn, w.kv_b);
         let ns = attn_splits(self.t) as u64;
         launch_v(kn.attn, d.heads.div_ceil(8) as u32, t, ns as u32, 256, &[self.qt, c.latent, self.sel, self.sel_n, self.part_o, self.part_ml, ns, self.st]);
         launch_v(kn.merge, d.heads as u32, t, 1, 256, &[self.part_o, self.part_ml, self.u, ns, self.st]);
-        launch_v(kn.out_v, d.heads as u32, t.div_ceil(8), 1, 256, &[self.u, w.kv_b, self.o, self.st]);
+        self.out_v(kn, w.kv_b);
+    }
+
+    /// `qt = W_k^T q` per head: `gm_absorb1` for calls of at most [`DECODE_T`] rows, else the
+    /// tiled `gm_absorb` (bit-identical)
+    unsafe fn absorb(&self, kn: &MlaKernels, kv_b: CUdeviceptr) {
+        let d = &kn.dims;
+        if self.t <= DECODE_T {
+            launch_v(kn.absorb1, d.heads as u32, d.kv_lora.div_ceil(128) as u32, 1, 64, &[self.q, kv_b, self.qt, self.st]);
+        } else {
+            launch_v(kn.absorb, d.heads as u32, self.t.div_ceil(8) as u32, 1, 256, &[self.q, kv_b, self.qt, self.st]);
+        }
+    }
+
+    /// `o = W_v u` per head: `gm_out_v1` for calls of at most [`DECODE_T`] rows (its 16-byte loads
+    /// need `kv_b` 16-byte aligned), else the tiled `gm_out_v` (bit-identical)
+    unsafe fn out_v(&self, kn: &MlaKernels, kv_b: CUdeviceptr) {
+        let d = &kn.dims;
+        if self.t <= DECODE_T && (kv_b.is_multiple_of(16) || !(d.kv_lora / 32).is_multiple_of(8)) {
+            launch_v(kn.out_v1, d.heads as u32, d.v.div_ceil(32) as u32, 1, 256, &[self.u, kv_b, self.o, self.st]);
+        } else {
+            launch_v(kn.out_v, d.heads as u32, self.t.div_ceil(8) as u32, 1, 256, &[self.u, kv_b, self.o, self.st]);
+        }
     }
 
     /// The whole sub-block for `t` rows at `pos0..pos0 + t`: x `[t][hidden]` (the output of
@@ -935,6 +978,20 @@ mod tests {
                 assert!(names.iter().any(|e| e == n), "{n} missing in {names:?}");
             }
         }
+        // the decode-kernel constants the host routes and launches by
+        let src = crate::kernels::GLM5_MLA_SRC;
+        assert!(src.contains(&format!("#define GM_DT {DECODE_T} ")), "GM_DT != DECODE_T");
+        assert!(src.contains(&format!("#define GM_GV_R {GEMV_ROWS} ")), "GM_GV_R != GEMV_ROWS");
+        // the decode kernels keep their staging arrays in registers (#191: a run-time-indexed
+        // local array was the dense GEMVs' bottleneck)
+        for d in [MlaDims::of(&Glm5Geo::GLM_5_3_FLASH), TINY] {
+            let ptx = crate::kernels::tests_300_c4::ptx(&d.source());
+            for (n, body) in crate::kernels::tests_300_c4::entries(&ptx) {
+                if ["gm_gemv", "gm_absorb1", "gm_out_v1"].contains(&n.as_str()) {
+                    assert!(!body.contains(".local"), "{n} uses local memory");
+                }
+            }
+        }
     }
 }
 
@@ -1149,5 +1206,225 @@ mod tests_gpu {
         println!("selection: {} rows, sparse rows {s0}..={s1}, 0 differ from bf16kv (tie rows skipped {tie_skips}); {vs_f32} sparse rows differ from the f32 golden", n);
         println!("worst anchor cosine vs bf16kv {:.9} (row {}), vs f32 {:.9} (row {})", worst.0, worst.1, worst32.0, worst32.1);
         assert!(worst.0 >= 0.9999, "G3: anchor {} cosine {:.9} < 0.9999", worst.1, worst.0);
+    }
+}
+
+#[cfg(test)]
+mod tests_decode_gpu {
+    //! Follow-up of #191 on the GPU (RTX 5090, sm_120): the decode kernels `gm_gemv`,
+    //! `gm_absorb1`, `gm_out_v1` (calls of at most `DECODE_T` rows) bit-identical to the tiled
+    //! `gm_gemm`, `gm_absorb`, `gm_out_v` they replace there, and their time per decode row at
+    //! the GLM-5.3-Flash shapes on synthetic BF16 weights. Each timed launch reads a different
+    //! copy of its matrix (>= 256 MiB per shape), so the weights come from VRAM as in a decode
+    //! row, not from the L2. `#[ignore]`: CI has no GPU. Run with
+    //! `cargo test --release --lib glm5_mla_decode_gpu -- --ignored --nocapture --test-threads 1`.
+    use super::tests::TINY;
+    use super::*;
+    use crate::cpu_mul1::testkit::Rng;
+    use cudarc::driver::sys;
+
+    unsafe fn kernels(d: MlaDims) -> (cuda::Module, MlaKernels) {
+        let m = cuda::compile(&crate::kernels::KernelGeo::flash_next().source());
+        let f = m.get("qsa_select_fast");
+        (m, MlaKernels::new(d, f))
+    }
+
+    /// random BF16 weights: finite values, every 13th +0 or -0 (the signed-zero paths)
+    fn bf16s(n: usize, rng: &mut Rng) -> Vec<u16> {
+        (0..n)
+            .map(|i| match i % 13 {
+                4 => 0x0000,
+                9 => 0x8000,
+                _ => synth::bf16_bits(rng.f(0.5)),
+            })
+            .collect()
+    }
+
+    fn f32s(n: usize, rng: &mut Rng) -> Vec<f32> {
+        (0..n).map(|i| if i % 97 == 5 { -0.0 } else { rng.f(2.0) }).collect()
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    unsafe fn nan_dev(n: usize) -> CUdeviceptr {
+        cuda::to_f32_dev(&vec![f32::NAN; n])
+    }
+
+    unsafe fn same(what: &str, a: CUdeviceptr, b: CUdeviceptr, n: usize) {
+        cuda::sync();
+        let (p, q) = (bits(&cuda::dtoh(a, n)), bits(&cuda::dtoh(b, n)));
+        let differ = p.iter().zip(&q).filter(|(x, y)| x != y).count();
+        assert_eq!(differ, 0, "{what}: {differ} of {n} outputs differ from the tiled kernel");
+    }
+
+    /// the tiled `gm_gemm` launch of `MlaScratch::linear` (the path before the decode kernels)
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn gemm_tiled(kn: &MlaKernels, s: &MlaScratch, w: CUdeviceptr, k: usize, n: usize, x: CUdeviceptr, ldx: usize, y: CUdeviceptr, ldy: usize) {
+        launch_v(kn.gemm, n.div_ceil(64) as u32, s.t().div_ceil(16) as u32, 1, 256, &[w, x, y, k as u64, n as u64, ldx as u64, ldy as u64, s.st]);
+    }
+
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_mla_decode_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mla_decode_gpu_kernels_are_bit_identical_to_the_tiled_kernels() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut rng = Rng(0x6d1a_dec0);
+            for d in [MlaDims::of(&Glm5Geo::GLM_5_3_FLASH), TINY] {
+                let (_m, kn) = kernels(d);
+                let mut s = MlaScratch::new(&d, DECODE_T, 64);
+                // (k, n, ldx, ldy): the indexer x-side and q-side projections, the MTP eh_proj,
+                // a row tail with padded strides
+                let shapes = [
+                    (d.hidden, d.idx_proj(), d.hidden, d.idx_proj()),
+                    (d.q_lora, d.idx_heads * d.idx_dim, d.q_lora, d.idx_heads * d.idx_dim),
+                    (2 * d.hidden, d.hidden, 2 * d.hidden, d.hidden),
+                    (d.hidden, 13, d.hidden + 4, 17),
+                ];
+                for t in 1..=DECODE_T {
+                    s.begin(0, t);
+                    for &(k, n, ldx, ldy) in &shapes {
+                        let w = cuda::to_dev(&bf16s(n * k, &mut rng));
+                        let x = cuda::to_f32_dev(&f32s(t * ldx, &mut rng));
+                        let (ya, yb) = (nan_dev(t * ldy), nan_dev(t * ldy));
+                        gemm_tiled(&kn, &s, w, k, n, x, ldx, ya, ldy);
+                        s.linear(&kn, w, k, n, x, ldx, yb, ldy);
+                        same(&format!("gemv [{n} x {k}] t {t} (heads {})", d.heads), ya, yb, t * ldy);
+                        for mut p in [w, x, ya, yb] {
+                            cuda::free_dev(&mut p);
+                        }
+                    }
+                    // absorb and out_v on one kv_b
+                    let kvb = cuda::to_dev(&bf16s(d.heads * (d.nope + d.v) * d.kv_lora, &mut rng));
+                    cuda::to_f32_into(s.q, &f32s(t * d.heads * d.nope, &mut rng));
+                    cuda::to_f32_into(s.u, &f32s(t * d.heads * d.kv_lora, &mut rng));
+                    let nq = t * d.heads * d.kv_lora;
+                    let ref_qt = nan_dev(nq);
+                    launch_v(kn.absorb, d.heads as u32, t.div_ceil(8) as u32, 1, 256, &[s.q, kvb, ref_qt, s.st]);
+                    cuda::to_f32_into(s.qt, &vec![f32::NAN; nq]);
+                    s.absorb(&kn, kvb);
+                    same(&format!("absorb t {t} (heads {})", d.heads), ref_qt, s.qt, nq);
+                    let no = t * d.heads * d.v;
+                    let ref_o = nan_dev(no);
+                    launch_v(kn.out_v, d.heads as u32, t.div_ceil(8) as u32, 1, 256, &[s.u, kvb, ref_o, s.st]);
+                    cuda::to_f32_into(s.o, &vec![f32::NAN; no]);
+                    s.out_v(&kn, kvb);
+                    same(&format!("out_v t {t} (heads {})", d.heads), ref_o, s.o, no);
+                    for mut p in [kvb, ref_qt, ref_o] {
+                        cuda::free_dev(&mut p);
+                    }
+                }
+                s.free();
+            }
+        }
+    }
+
+    /// (mean GPU time of one `f(i)` over `n` calls, events around the whole queue, us; mean host
+    /// time to queue one, us)
+    unsafe fn time2_us(n: usize, mut f: impl FnMut(usize)) -> (f64, f64) {
+        f(0);
+        cuda::sync();
+        let mk = || {
+            let mut e: sys::CUevent = std::ptr::null_mut();
+            cuda::ck(sys::cuEventCreate(&mut e, 0));
+            e
+        };
+        let (a, b) = (mk(), mk());
+        let st = cuda::cur_stream();
+        cuda::event_record(a, st);
+        let t0 = std::time::Instant::now();
+        for i in 0..n {
+            f(i);
+        }
+        let host = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
+        cuda::event_record(b, st);
+        cuda::sync();
+        let mut ms = 0f32;
+        cuda::ck(sys::cuEventElapsedTime_v2(&mut ms, a, b));
+        cuda::event_destroy(a);
+        cuda::event_destroy(b);
+        (ms as f64 * 1e3 / n as f64, host)
+    }
+
+    /// acceptance bound, fixed before the after-measurement (ticket comment): the four decode
+    /// launches (indexer x-side and q-side projections, absorb, out_v) of the 11 DSA layers of one
+    /// decode row on synthetic VRAM-cold weights take at most this (us); before: ~8,600 us (Nsight)
+    const MLA_ROW_US: f64 = 1000.0;
+
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_mla_decode_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mla_decode_gpu_kernels_read_the_weights_at_vram_rate() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let g = Glm5Geo::GLM_5_3_FLASH;
+            let d = MlaDims::of(&g);
+            let (_m, kn) = kernels(d);
+            let mut rng = Rng(0x6d1a_7173);
+            let mut s = MlaScratch::new(&d, DECODE_T, 64);
+            let layers = g.dsa_layers as f64;
+            let (mut tiled_row, mut new_row, mut bytes_row) = (0f64, 0f64, 0f64);
+            // (what, rows, cols): the two gm_gemm launches of a decode row, then kv_b (absorb, out_v)
+            let kvb_n = d.heads * (d.nope + d.v) * d.kv_lora;
+            let launches = [
+                ("idx x-side", d.idx_proj(), d.hidden),
+                ("idx q-side", d.idx_heads * d.idx_dim, d.q_lora),
+                ("absorb kv_b", 0, 0),
+                ("out_v kv_b", 0, 0),
+            ];
+            for (what, rows, cols) in launches {
+                let kvb = rows == 0;
+                let elems = if kvb { kvb_n } else { rows * cols };
+                // absorb reads the W_k half of kv_b, out_v the W_v half
+                let bytes = if kvb { elems } else { elems * 2 };
+                let copies = (256usize << 20).div_ceil(elems * 2).max(2);
+                let first = cuda::to_dev(&bf16s(elems, &mut rng));
+                let mut ws = vec![first];
+                for _ in 1..copies {
+                    let p = cuda::alloc_zeroed(elems * 2);
+                    cuda::memcpy_async(p, first, elems * 2);
+                    ws.push(p);
+                }
+                let x = cuda::to_f32_dev(&f32s(DECODE_T * cols.max(1), &mut rng));
+                let y = cuda::alloc_zeroed(DECODE_T * rows.max(1) * 4);
+                cuda::to_f32_into(s.q, &f32s(DECODE_T * d.heads * d.nope, &mut rng));
+                cuda::to_f32_into(s.u, &f32s(DECODE_T * d.heads * d.kv_lora, &mut rng));
+                let n = (4 * copies).max(64);
+                for t in 1..=DECODE_T {
+                    s.begin(0, t);
+                    let (tiled, new) = if kvb && what.starts_with("absorb") {
+                        let a = time2_us(n, |i| launch_v(kn.absorb, d.heads as u32, t.div_ceil(8) as u32, 1, 256, &[s.q, ws[i % copies], s.qt, s.st])).0;
+                        (a, time2_us(n, |i| s.absorb(&kn, ws[i % copies])).0)
+                    } else if kvb {
+                        let a = time2_us(n, |i| launch_v(kn.out_v, d.heads as u32, t.div_ceil(8) as u32, 1, 256, &[s.u, ws[i % copies], s.o, s.st])).0;
+                        (a, time2_us(n, |i| s.out_v(&kn, ws[i % copies])).0)
+                    } else {
+                        let a = time2_us(n, |i| gemm_tiled(&kn, &s, ws[i % copies], cols, rows, x, cols, y, rows)).0;
+                        (a, time2_us(n, |i| s.linear(&kn, ws[i % copies], cols, rows, x, cols, y, rows)).0)
+                    };
+                    let gbs = |us: f64| bytes as f64 / us / 1e3;
+                    eprintln!("mla decode {what:<12} {bytes:>9} B t {t}: tiled {tiled:>7.1} us {:>5.0} GB/s | decode {new:>6.1} us {:>5.0} GB/s", gbs(tiled), gbs(new));
+                    if t == 1 {
+                        tiled_row += tiled * layers;
+                        new_row += new * layers;
+                        bytes_row += bytes as f64 * layers;
+                    }
+                }
+                for mut p in ws.into_iter().chain([x, y]) {
+                    cuda::free_dev(&mut p);
+                }
+            }
+            s.free();
+            eprintln!(
+                "mla decode launches per decode row ({} DSA layers): {:.0} MB; tiled {:.3} ms ({:.0} GB/s), decode {:.3} ms ({:.0} GB/s)",
+                g.dsa_layers,
+                bytes_row / 1e6,
+                tiled_row / 1e3,
+                bytes_row / tiled_row / 1e3,
+                new_row / 1e3,
+                bytes_row / new_row / 1e3
+            );
+            assert!(new_row <= MLA_ROW_US, "the MLA decode launches take {:.3} ms per decode row (bound {:.3} ms)", new_row / 1e3, MLA_ROW_US / 1e3);
+        }
     }
 }
