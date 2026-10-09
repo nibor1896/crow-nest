@@ -4474,6 +4474,29 @@ pub struct Glm5Run {
     /// `CROW_GLM_LA`: the row `decode_la` enqueued ahead, and the KDA states of its start
     ahead: Option<Ahead>,
     kda_bak: Vec<(Dev, Dev)>,
+    /// `CROW_GLM_MAX_BATCH`: the sequence slots ([`Glm5Run::set_slots`]); empty = the one
+    /// sequence of `kda` / `mla` / `logits`. Slot `cur`'s state is in those fields and
+    /// `seqs[cur]` is an empty placeholder; every other slot's state is parked in `seqs`.
+    seqs: Vec<SeqSlot>,
+    cur: usize,
+    /// `CROW_GLM_MAX_BATCH`: the head buffers of a batched decode step (`None` with one slot)
+    bat: Option<BatchHead>,
+}
+
+/// `CROW_GLM_MAX_BATCH`: one parked sequence: a KDA state per KDA layer, an MLA cache per DSA
+/// layer, the logits row of its last head
+#[derive(Default)]
+struct SeqSlot {
+    kda: Vec<Option<KdaState>>,
+    mla: Vec<Option<MlaCache>>,
+    logits: Dev,
+}
+
+/// `CROW_GLM_MAX_BATCH`: `normed [B][hidden]`, `logits [B][vocab]`, `ids [B]` i32
+struct BatchHead {
+    normed: Dev,
+    logits: Dev,
+    ids: Dev,
 }
 
 /// #189: a row whose greedy id the host has not read yet (`CROW_GLM_LOOKAHEAD`)
@@ -4554,6 +4577,8 @@ impl Glm5Run {
         let chunk = prompt_chunk_from_env().clamp(1, cap.max(1));
         // #192: the pass and the residual also hold a verify call of 1 + CROW_GLM_MTP rows
         let max_t = chunk.max((1 + crate::glm5_mtp::draft_rows_from_env().unwrap_or(0)).min(cap.max(1)));
+        // CROW_GLM_MAX_BATCH: and a batched decode step of one row per sequence slot
+        let max_t = max_t.max(max_batch_from_env().unwrap_or(1).min(cap.max(1)));
         let mut run = Glm5Run {
             g: *g,
             moe: *moe,
@@ -4579,6 +4604,9 @@ impl Glm5Run {
             worker: None,
             ahead: None,
             kda_bak: Vec::new(),
+            seqs: Vec::new(),
+            cur: 0,
+            bat: None,
         };
         let sw = Switches::from_env();
         if sw != Switches::default() {
@@ -4996,6 +5024,8 @@ impl Glm5Run {
             cuda::free_dev(b);
         }
         self.kda_bak.clear();
+        // CROW_GLM_MAX_BATCH: the parked sequences and the batch head
+        self.free_slots();
     }
 }
 
@@ -8214,5 +8244,285 @@ mod split_tests {
             }
             pinned.free();
         }
+    }
+}
+
+// ---------------------------------------------------------------- CROW_GLM_MAX_BATCH: sequence slots
+
+/// `CROW_GLM_MAX_BATCH=N` (serve): the sequences the model holds at once and one batched decode
+/// step carries (unset = 1: the one sequence, the path of record)
+pub const MAX_BATCH_ENV: &str = "CROW_GLM_MAX_BATCH";
+/// the most sequence slots (the template's `--max-batch-size 8`)
+pub const MAX_BATCH: usize = 8;
+
+/// `CROW_GLM_MAX_BATCH`'s value: unset or empty = 1; `1 ..= MAX_BATCH`; anything else by name
+pub fn max_batch_of(v: Option<&str>) -> Result<usize, String> {
+    match v.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(1),
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) if (1..=MAX_BATCH).contains(&n) => Ok(n),
+            _ => Err(format!("{MAX_BATCH_ENV}={s}: the sequences one decode step carries, 1 ..= {MAX_BATCH} (unset = 1, one sequence)")),
+        },
+    }
+}
+
+/// [`max_batch_of`] on the environment
+pub fn max_batch_from_env() -> Result<usize, String> {
+    max_batch_of(std::env::var(MAX_BATCH_ENV).ok().as_deref())
+}
+
+/// Device bytes `n` sequence slots add to the one sequence of `Glm5Run::load` (derived, as
+/// `glm5_mtp::spec_vram_bytes`): per further slot a KDA state per KDA layer, an MLA cache of
+/// `cap` rows per DSA layer and a logits row; the batch head (`[n]` normed, logits and ids
+/// rows); the residual, collapsed and sublayer rows of an `n`-row call; the MoE plan of an
+/// `n`-row call. 0 for `n <= 1`.
+pub fn batch_vram_bytes(g: &Glm5Geo, cap: usize, n: usize) -> u64 {
+    if n <= 1 {
+        return 0;
+    }
+    let (kd, md) = (KdaDims::of(g), MlaDims::of(g));
+    let kda = (0..g.layers).filter(|&l| gm::attn_kind(g, l) == AttnKind::Kda).count() as u64;
+    let mla = (0..g.layers).filter(|&l| gm::attn_kind(g, l) == AttnKind::Mla).count() as u64;
+    let (h, v, b) = (g.hidden as u64, g.vocab as u64, n as u64);
+    let slot = kda * ((kd.state_floats() + kd.conv_floats()) * 4) as u64 + mla * MlaCache::bytes(&md, cap) + 4 * v;
+    let head = 4 * b * (h + v + 1);
+    let rows = 4 * b * (g.hc_streams as u64 * h + 2 * h);
+    let plan = 4 * b * g.topk as u64 * (2 * h + 3 * g.expert_inter as u64) * 2;
+    (b - 1) * slot + head + rows + plan
+}
+
+/// `CROW_GLM_MAX_BATCH` (serve): sequence slots and the batched decode step. Slot `cur` is the
+/// sequence every one-sequence path of the run acts on (`row`, `prefill`, the KDA states and
+/// MLA caches, the logits row); [`Glm5Run::use_slot`] parks it and brings another in by
+/// swapping the device pointers (no copy). [`Glm5Run::decode_batch`] runs one decode row of
+/// several slots in one trunk pass, each row the bits of that slot's one-row decode.
+impl Glm5Run {
+    /// `n` sequence slots from now on (1 = the one sequence; the others' states are freed and
+    /// slot 0 stays). Refused by name: more than the pass's `max_t` rows (`CROW_GLM_MAX_BATCH`
+    /// sizes it at `load`), MTP (`CROW_GLM_MTP`: its block and drafts are one sequence's) and
+    /// the graphs (`CROW_GLM_GRAPH`: a captured row holds slot 0's state pointers).
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch of this run is pending.
+    pub unsafe fn set_slots(&mut self, n: usize) -> Result<(), String> {
+        if n == 0 || n > MAX_BATCH {
+            return Err(format!("{MAX_BATCH_ENV}={n}: 1 ..= {MAX_BATCH} sequence slots"));
+        }
+        self.use_slot(0)?;
+        cuda::sync();
+        self.free_slots();
+        if n == 1 {
+            return Ok(());
+        }
+        if self.spec.is_some() {
+            return Err(format!("{MAX_BATCH_ENV}={n} and {}={}: the MTP block, its cache and drafts are one sequence's; turn one of them off", crate::glm5_mtp::MTP_ENV, self.mtp_drafts()));
+        }
+        if self.graph.is_some() {
+            return Err(format!("{MAX_BATCH_ENV}={n} and {}=1: a captured row holds slot 0's KDA states and MLA caches; turn one of them off", glm5_graph::ENV));
+        }
+        if n > self.pass.max_t {
+            return Err(format!("{MAX_BATCH_ENV}={n}: the model was loaded for calls of {} rows; set {MAX_BATCH_ENV} before Glm5Run::load", self.pass.max_t));
+        }
+        let (g, kd, md) = (self.g, KdaDims::of(&self.g), MlaDims::of(&self.g));
+        // slot 0 is the run's own sequence: its entry is the placeholder while it is current
+        self.seqs.push(SeqSlot::default());
+        for _ in 1..n {
+            let kda = self.kda.iter().map(|k| k.as_ref().map(|_| KdaState::alloc(&kd))).collect();
+            let mla = self.mla.iter().map(|c| c.as_ref().map(|_| MlaCache::new(&md, self.cap))).collect();
+            let logits = cuda::alloc_named("glm5_run slot logits", g.vocab * 4);
+            self.seqs.push(SeqSlot { kda, mla, logits });
+        }
+        self.bat = Some(BatchHead {
+            normed: cuda::alloc_named("glm5_run batch normed", n * g.hidden * 4),
+            logits: cuda::alloc_named("glm5_run batch logits", n * g.vocab * 4),
+            ids: cuda::alloc_named("glm5_run batch greedy ids", n * 4),
+        });
+        Ok(())
+    }
+
+    /// the sequence slots (1 without `CROW_GLM_MAX_BATCH`)
+    pub fn slots(&self) -> usize {
+        self.seqs.len().max(1)
+    }
+
+    /// the slot every one-sequence path acts on
+    pub fn slot(&self) -> usize {
+        self.cur
+    }
+
+    /// Make slot `s` the one every one-sequence path acts on: the current slot's KDA states,
+    /// MLA caches and logits row are parked, `s`'s come in (pointer swaps, no copy, no launch).
+    pub fn use_slot(&mut self, s: usize) -> Result<(), String> {
+        if s >= self.slots() {
+            return Err(format!("glm5_run: sequence slot {s}, the run holds {} ({MAX_BATCH_ENV})", self.slots()));
+        }
+        if s == self.cur {
+            return Ok(());
+        }
+        if self.ahead.is_some() {
+            return Err(format!("glm5_run: sequence slot {s} while a row of slot {} is ahead ({}); settle_ahead first", self.cur, glm5_flags::ENV_LA));
+        }
+        let c = self.cur;
+        for i in [c, s] {
+            let p = &mut self.seqs[i];
+            std::mem::swap(&mut self.kda, &mut p.kda);
+            std::mem::swap(&mut self.mla, &mut p.mla);
+            std::mem::swap(&mut self.logits, &mut p.logits);
+        }
+        self.cur = s;
+        Ok(())
+    }
+
+    /// the refusals of a batched step of `b` rows, by name: the CPU lane (its experts have other
+    /// bits than the GPU kernels the batch rows take) and too few staging slots
+    pub fn batch_check(b: usize, tiers: &ExpertTiers, topk: usize) -> Result<(), String> {
+        if b <= 1 {
+            return Ok(());
+        }
+        if tiers.pinned_use.cpu_lane {
+            return Err(format!("{MAX_BATCH_ENV}={b} and {CPU_LANE_ENV}=1: the CPU lane's experts have other bits than the batch rows' GPU kernels, so a sequence's ids could differ from its solo run; turn one of them off"));
+        }
+        if tiers.stage_cap < b * topk {
+            return Err(format!("{MAX_BATCH_ENV}={b}: the tiers hold {} staging slots, a step of {b} rows may stage {}; build ExpertTiers with stage_cap {b} x top-k", tiers.stage_cap, b * topk));
+        }
+        Ok(())
+    }
+
+    /// One decode row per entry `(slot, tok, pos)`, every slot at most once: `tok` at `pos` of
+    /// that slot's sequence through every layer with the experts from `tiers` (ONE trunk pass,
+    /// `Glm5Pass::call_slots_with_experts`), the head over the rows; the greedy id of each row,
+    /// and each slot's logits row (read it after [`Glm5Run::use_slot`] through
+    /// [`Glm5Run::logits_dev`]). Every row is the bits of that slot's one-row decode
+    /// ([`Glm5Run::row`]); one row IS that call. The current slot does not change for more rows.
+    ///
+    /// # Safety
+    /// A CUDA context is current; `tiers` belongs to this model.
+    pub unsafe fn decode_batch(&mut self, cnq: &mut Cnq, tiers: &mut ExpertTiers, rows: &[(usize, i64, usize)]) -> Result<Vec<i64>, String> {
+        let (g, h, v) = (self.g, self.g.hidden, self.g.vocab);
+        let b = rows.len();
+        if b == 0 {
+            return Err("glm5_run: a batched decode step of no rows".into());
+        }
+        for (i, &(s, tok, pos)) in rows.iter().enumerate() {
+            if s >= self.slots() {
+                return Err(format!("glm5_run: sequence slot {s}, the run holds {} ({MAX_BATCH_ENV})", self.slots()));
+            }
+            if rows[..i].iter().any(|r| r.0 == s) {
+                return Err(format!("glm5_run: sequence slot {s} twice in one decode step"));
+            }
+            if pos >= self.cap {
+                return Err(format!("glm5_run: row {pos} of slot {s} is outside the caches of {} rows", self.cap));
+            }
+            if !(0..v as i64).contains(&tok) {
+                return Err(format!("glm5_run: token id {tok} outside the vocab of {v}"));
+            }
+        }
+        if b == 1 {
+            let (s, tok, pos) = rows[0];
+            self.use_slot(s)?;
+            let id = self.row(cnq, tiers, tok, pos, true)?.ok_or_else(|| format!("glm5_run: the head row at {pos} gave no id"))?;
+            return Ok(vec![id]);
+        }
+        if b > self.pass.max_t {
+            return Err(format!("glm5_run: a decode step of {b} rows, the pass holds calls of {} ({MAX_BATCH_ENV} at load)", self.pass.max_t));
+        }
+        if self.spec.is_some() || self.graph.is_some() {
+            return Err(format!("glm5_run: a batched decode step with {} or {} on", crate::glm5_mtp::MTP_ENV, glm5_graph::ENV));
+        }
+        Self::batch_check(b, tiers, g.topk)?;
+        let (bn, bl, bi) = match self.bat.as_ref() {
+            Some(bh) => (bh.normed, bh.logits, bh.ids),
+            None => return Err(format!("glm5_run: a batched decode step without sequence slots ({MAX_BATCH_ENV})")),
+        };
+        let toks: Vec<i64> = rows.iter().map(|r| r.1).collect();
+        let pos: Vec<usize> = rows.iter().map(|r| r.2).collect();
+        cuda::to_f32_into(self.x, &gm::trunk_input(&gm::embed_rows(cnq, &g, &toks), h, g.hc_streams));
+        {
+            let Glm5Run { pass, layers, kda, mla, seqs, cur, x, .. } = self;
+            let (cur, x) = (*cur, *x);
+            for l in 0..g.layers {
+                let ks: Vec<&KdaState> = match kda[l] {
+                    Some(_) => rows.iter().map(|r| if r.0 == cur { kda[l].as_ref() } else { seqs[r.0].kda[l].as_ref() }.expect("glm5_run: a slot without its KDA state")).collect(),
+                    None => Vec::new(),
+                };
+                let ms: Vec<&MlaCache> = match mla[l] {
+                    Some(_) => rows.iter().map(|r| if r.0 == cur { mla[l].as_ref() } else { seqs[r.0].mla[l].as_ref() }.expect("glm5_run: a slot without its MLA cache")).collect(),
+                    None => Vec::new(),
+                };
+                let mut hook = |layer: usize, sel: &[i32]| -> Result<Dev, String> { tiers.table_for(layer, sel).map(|(tb, _)| tb) };
+                pass.call_slots_with_experts(&layers[l], x, &pos, &ks, &ms, &mut hook).map_err(|e| format!("glm5_run: batch rows {pos:?} layer {l}: {e}"))?;
+            }
+        }
+        gm::run_head(&self.pass.kn, &self.head, &self.hw, self.x, bn, bl, bi, b);
+        cuda::sync();
+        let ids: Vec<i64> = cuda::dtoh_i32(bi, b).into_iter().map(i64::from).collect();
+        if let Some(&bad) = ids.iter().find(|&&id| !(0..v as i64).contains(&id)) {
+            return Err(format!("glm5_run: batch rows {pos:?}: the greedy id {bad} is outside the vocab of {v}"));
+        }
+        // every slot's logits row of its last head
+        for (i, r) in rows.iter().enumerate() {
+            let dst = if r.0 == self.cur { self.logits } else { self.seqs[r.0].logits };
+            cuda::d2d_async(dst, bl + (i * v * 4) as u64, v * 4);
+        }
+        cuda::sync();
+        tiers.settle()?;
+        Ok(ids)
+    }
+
+    /// free every parked slot and the batch head (slot `cur`'s state is in the run's own fields
+    /// and stays, as slot 0)
+    ///
+    /// # Safety
+    /// No launch of this run is pending.
+    unsafe fn free_slots(&mut self) {
+        let cur = self.cur;
+        for (i, sl) in self.seqs.iter_mut().enumerate() {
+            if i == cur {
+                continue;
+            }
+            for s in sl.kda.iter_mut().flatten() {
+                s.free();
+            }
+            for c in sl.mla.iter_mut().flatten() {
+                c.free();
+            }
+            cuda::free_dev(&mut sl.logits);
+        }
+        self.seqs.clear();
+        self.cur = 0;
+        if let Some(mut bh) = self.bat.take() {
+            for d in [&mut bh.normed, &mut bh.logits, &mut bh.ids] {
+                cuda::free_dev(d);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod batch_env_tests {
+    use super::*;
+
+    #[test]
+    fn max_batch_is_one_unset_and_refused_out_of_range_by_name() {
+        assert_eq!(max_batch_of(None), Ok(1));
+        assert_eq!(max_batch_of(Some(" ")), Ok(1));
+        assert_eq!(max_batch_of(Some("1")), Ok(1));
+        assert_eq!(max_batch_of(Some("8")), Ok(8));
+        for bad in ["0", "9", "-1", "four"] {
+            let e = max_batch_of(Some(bad)).unwrap_err();
+            assert!(e.contains(MAX_BATCH_ENV) && e.contains(bad), "{e}");
+        }
+    }
+
+    #[test]
+    fn batch_vram_is_the_further_slots_and_nothing_for_one() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        assert_eq!(batch_vram_bytes(&g, 4096, 1), 0);
+        let (b2, b3) = (batch_vram_bytes(&g, 4096, 2), batch_vram_bytes(&g, 4096, 3));
+        // one more slot: at least its caches of 4096 rows
+        let md = MlaDims::of(&g);
+        assert!(b3 - b2 > MlaCache::bytes(&md, 4096), "{b2} {b3}");
+        // the caches scale with the rows
+        assert!(batch_vram_bytes(&g, 8192, 2) > b2);
     }
 }

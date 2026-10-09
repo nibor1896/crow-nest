@@ -141,6 +141,38 @@ pub trait Rows {
     unsafe fn settle_ahead(&mut self) -> Result<(), String> {
         Ok(())
     }
+    /// `CROW_GLM_MAX_BATCH`: the sequence slots the model holds (1 = the one sequence)
+    fn slots(&self) -> usize {
+        1
+    }
+    /// `CROW_GLM_MAX_BATCH`: make slot `s` the sequence every other call of this trait acts on
+    /// (its recurrent state, its rows, its logits row)
+    ///
+    /// # Safety
+    /// As [`Rows::row`].
+    unsafe fn use_slot(&mut self, s: usize) -> Result<(), String> {
+        if s == 0 {
+            Ok(())
+        } else {
+            Err(format!("glm5: sequence slot {s}, the model holds one sequence ({})", gt::MAX_BATCH_ENV))
+        }
+    }
+    /// `CROW_GLM_MAX_BATCH`: one decode row per entry `(slot, tok, pos)`, every slot at most
+    /// once: the greedy id after each, each slot's logits row readable after
+    /// [`Rows::use_slot`]. Every row is the bits of that slot's [`Rows::decode`] without MTP.
+    /// The default is that call, slot after slot; the device runs the rows in one trunk pass.
+    /// The current slot afterwards is not specified: the caller selects the one it needs.
+    ///
+    /// # Safety
+    /// As [`Rows::row`].
+    unsafe fn decode_batch(&mut self, rows: &[(usize, i64, usize)]) -> Result<Vec<i64>, String> {
+        let mut ids = Vec::with_capacity(rows.len());
+        for &(s, tok, pos) in rows {
+            self.use_slot(s)?;
+            ids.push(self.decode(tok, pos)?);
+        }
+        Ok(ids)
+    }
 }
 
 // ---------------------------------------------------------------- the device
@@ -173,7 +205,14 @@ impl Glm5Device {
         if drafts > 0 {
             log(&format!("[budget] {}={drafts}: the #159 plan runs at free VRAM minus {mtp_reserved} B (the MTP block, its cache, {drafts} KDA snapshot slots; derived)", crate::glm5_mtp::MTP_ENV));
         }
-        let (states, input, plan) = serve_plan(&o.g, context, free.saturating_sub(mtp_reserved), budget, o.spec.bytes)?;
+        // CROW_GLM_MAX_BATCH=N: the further sequence slots and the N-row step come off the plan's
+        // free VRAM the same way
+        let batch = gt::max_batch_from_env()?;
+        let batch_reserved = gt::batch_vram_bytes(&o.g, context, batch);
+        if batch > 1 {
+            log(&format!("[budget] {}={batch}: the #159 plan runs at free VRAM minus {batch_reserved} B ({} further sequence slots of {context} rows, the {batch}-row step; derived)", gt::MAX_BATCH_ENV, batch - 1));
+        }
+        let (states, input, plan) = serve_plan(&o.g, context, free.saturating_sub(mtp_reserved + batch_reserved), budget, o.spec.bytes)?;
         let sources = [
             ("dense", "GLM5_NEXT_DENSE_BYTES".to_string()),
             ("expert", format!("{}: {} records, codec {}", o.path, o.records, o.spec.codec.dtype())),
@@ -195,14 +234,28 @@ impl Glm5Device {
                 return Err(e);
             }
         };
+        // CROW_GLM_MAX_BATCH: the sequence slots (refused by name with MTP or the graphs)
+        if let Err(e) = run.set_slots(batch) {
+            run.free();
+            return Err(e);
+        }
         // #192: a verify call stages the experts of 1 + N rows at once; the CPU lane is refused
-        let mut tiers = ExpertTiers::new(&o.cnq, &o.path, &o.g, &o.moe, sizes, readers, (1 + mtp_n) * o.g.topk)?;
+        // (CROW_GLM_MAX_BATCH: a batched step those of N rows)
+        let mut tiers = ExpertTiers::new(&o.cnq, &o.path, &o.g, &o.moe, sizes, readers, (1 + mtp_n).max(batch) * o.g.topk)?;
         if mtp_n > 0 {
             if let Err(e) = Glm5Run::spec_check(mtp_n, &tiers, o.g.topk) {
                 tiers.free();
                 run.free();
                 return Err(e);
             }
+        }
+        if let Err(e) = Glm5Run::batch_check(batch, &tiers, o.g.topk) {
+            tiers.free();
+            run.free();
+            return Err(e);
+        }
+        if batch > 1 {
+            log(&format!("[glm5_run] {}={batch}: {batch} sequence slots, a decode step carries one row of each active sequence in one trunk pass", gt::MAX_BATCH_ENV));
         }
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         log(&format!(
@@ -332,6 +385,21 @@ impl Rows for Glm5Device {
         let a = self.tiers.cache.counters().iter().fold([0u64; 3], |a, c| [a[0] + c[0], a[1] + c[1], a[2] + c[2]]);
         (a, self.tiers.nvme_bytes)
     }
+    fn slots(&self) -> usize {
+        self.run.slots()
+    }
+    unsafe fn use_slot(&mut self, s: usize) -> Result<(), String> {
+        // CROW_GLM_LA: a row ahead belongs to the current slot's KDA states (and their backup);
+        // it is dropped before another slot's states come in
+        if s != self.run.slot() {
+            self.run.settle_ahead(&mut self.tiers)?;
+        }
+        self.run.use_slot(s)
+    }
+    unsafe fn decode_batch(&mut self, rows: &[(usize, i64, usize)]) -> Result<Vec<i64>, String> {
+        self.run.settle_ahead(&mut self.tiers)?;
+        self.run.decode_batch(&mut self.o.cnq, &mut self.tiers, rows)
+    }
 }
 
 impl Drop for Glm5Device {
@@ -367,12 +435,24 @@ pub struct Glm5Engine<R: Rows = Glm5Device> {
     history: Vec<i64>,
     cache_on: bool,
     snap: Snapshot,
+    /// `CROW_GLM_MAX_BATCH`: the current sequence slot (`history` and `snap` are its books) and
+    /// the parked books of every slot (`parked[slot]` is empty while `slot` is current)
+    slot: usize,
+    parked: Vec<SlotBooks>,
+}
+
+/// `CROW_GLM_MAX_BATCH`: a parked slot's held ids and prompt snapshot
+#[derive(Default)]
+struct SlotBooks {
+    history: Vec<i64>,
+    snap: Snapshot,
 }
 
 impl<R: Rows> Glm5Engine<R> {
     /// `cache_on` is `CROW_PREFIX_CACHE != 0` in `serve`; off, every request is a cold start
     pub fn new(rows: R, cache_on: bool) -> Glm5Engine<R> {
-        Glm5Engine { rows, history: Vec::new(), cache_on, snap: Snapshot::default() }
+        let parked = (0..rows.slots()).map(|_| SlotBooks::default()).collect();
+        Glm5Engine { rows, history: Vec::new(), cache_on, snap: Snapshot::default(), slot: 0, parked }
     }
 
     pub fn rows(&self) -> &R {
@@ -566,6 +646,122 @@ impl<R: Rows> Glm5Engine<R> {
         self.snap.greedy = greedy;
         self.snap.pos = Some(self.history.len());
         t.elapsed().as_secs_f64() * 1e3
+    }
+}
+
+/// `CROW_GLM_MAX_BATCH`: several sequences, each with its own books (held ids, prompt
+/// snapshot) and device state (the model's slot), and the batched decode step. Every call of
+/// the one-sequence API above acts on the selected slot ([`Glm5Engine::select`]).
+impl<R: Rows> Glm5Engine<R> {
+    /// the sequence slots (1 without `CROW_GLM_MAX_BATCH`)
+    pub fn slots(&self) -> usize {
+        self.parked.len().max(1)
+    }
+
+    /// the selected slot
+    pub fn slot(&self) -> usize {
+        self.slot
+    }
+
+    /// Select slot `s`: its held ids, its snapshot and its device state are what every call of
+    /// the one-sequence API acts on from now on (the model's slot follows).
+    ///
+    /// # Safety
+    /// As [`Rows::row`].
+    pub unsafe fn select(&mut self, s: usize) -> Result<(), String> {
+        if s >= self.slots() {
+            return Err(format!("glm5: sequence slot {s}, the engine holds {} ({})", self.slots(), gt::MAX_BATCH_ENV));
+        }
+        self.rows.use_slot(s)?;
+        if s == self.slot {
+            return Ok(());
+        }
+        for i in [self.slot, s] {
+            let p = &mut self.parked[i];
+            std::mem::swap(&mut self.history, &mut p.history);
+            std::mem::swap(&mut self.snap, &mut p.snap);
+        }
+        self.slot = s;
+        Ok(())
+    }
+
+    fn books(&self, s: usize) -> (&[i64], &Snapshot) {
+        if s == self.slot {
+            (&self.history, &self.snap)
+        } else {
+            (&self.parked[s].history, &self.parked[s].snap)
+        }
+    }
+
+    /// slot `s`'s held ids
+    pub fn history_of(&self, s: usize) -> &[i64] {
+        self.books(s).0
+    }
+
+    /// the position of slot `s`'s prompt snapshot, `None` while it holds none
+    pub fn snapshot_pos_of(&self, s: usize) -> Option<usize> {
+        self.books(s).1.pos
+    }
+
+    /// [`Glm5Engine::decide`] on slot `s`'s books (serve picks the slot whose snapshot serves
+    /// the prompt best)
+    pub fn decide_in(&self, s: usize, prompt: &[i64]) -> crate::cache::Decision {
+        if !self.cache_on {
+            return crate::cache::Decision { l: 0, reuse: None, parked: false };
+        }
+        let (history, snap) = self.books(s);
+        let l = crate::cache::common_prefix_len(history, prompt);
+        let reuse = crate::cache::reuse_slot_with_logits(&[snap.pos], &[snap.pos.is_some()], l, prompt.len());
+        crate::cache::Decision { l, reuse, parked: false }
+    }
+
+    /// One decode step of several sequences: per `(slot, id)` (every slot at most once) `id`
+    /// is fed at that slot's held position, all rows in one [`Rows::decode_batch`]; the next
+    /// greedy id of each, each slot's logits row readable after [`Glm5Engine::select`]. Each
+    /// slot's ids and logits are those of its own [`Glm5Engine::decode_step`]s. A failure resets
+    /// every slot of the step (their states are part-advanced), so their next requests start
+    /// cold. The selected slot stays selected on success.
+    ///
+    /// # Safety
+    /// As [`Rows::row`].
+    pub unsafe fn decode_batch(&mut self, steps: &[(usize, i64)]) -> Result<Vec<i64>, String> {
+        let n_ctx = self.rows.n_ctx();
+        let mut rows = Vec::with_capacity(steps.len());
+        for (i, &(s, id)) in steps.iter().enumerate() {
+            if s >= self.slots() {
+                return Err(format!("glm5: sequence slot {s}, the engine holds {} ({})", self.slots(), gt::MAX_BATCH_ENV));
+            }
+            if steps[..i].iter().any(|x| x.0 == s) {
+                return Err(format!("glm5: sequence slot {s} twice in one decode step"));
+            }
+            let pos = self.history_of(s).len();
+            if pos >= n_ctx {
+                return Err(format!("glm5: decode at {pos} of slot {s}, n_ctx {n_ctx}"));
+            }
+            rows.push((s, id, pos));
+        }
+        let r = self.rows.decode_batch(&rows);
+        let back = self.rows.use_slot(self.slot);
+        match r.and_then(|ids| back.map(|_| ids)) {
+            Ok(next) => {
+                for &(s, id, _) in &rows {
+                    if s == self.slot {
+                        self.history.push(id);
+                    } else {
+                        self.parked[s].history.push(id);
+                    }
+                }
+                Ok(next)
+            }
+            Err(e) => {
+                for &(s, _, _) in &rows {
+                    if self.select(s).is_ok() {
+                        self.reset();
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1111,14 +1307,28 @@ pub mod fake {
         logits: Vec<f32>,
         /// a row at this position fails (an NVMe read error, say)
         pub fail_at: Option<usize>,
+        /// an allocation of a row at this position fails (`cuda::AllocFailed::raise`: inside a
+        /// request scope the `AllocFailed` panic `serve` answers with a 503)
+        pub alloc_fail_at: Option<usize>,
         /// rows run, heads run
         pub rows_run: usize,
         pub heads_run: usize,
+        /// `CROW_GLM_MAX_BATCH`: the parked sequences (state, rows, logits; the current slot's
+        /// entry is empty), the current slot, and the rows of every `decode_batch` call
+        parked: Vec<(u64, Vec<i64>, Vec<f32>)>,
+        cur: usize,
+        pub batches: Vec<usize>,
     }
 
     impl FakeRows {
         pub fn new(n_ctx: usize, vocab: usize, cands: Vec<u32>) -> FakeRows {
-            FakeRows { n_ctx, vocab, cands, state: 0, mla: vec![-1; n_ctx], logits: vec![0.0; vocab], fail_at: None, rows_run: 0, heads_run: 0 }
+            FakeRows::with_slots(n_ctx, vocab, cands, 1)
+        }
+
+        /// `slots` sequences (`CROW_GLM_MAX_BATCH`)
+        pub fn with_slots(n_ctx: usize, vocab: usize, cands: Vec<u32>, slots: usize) -> FakeRows {
+            let parked = (0..slots).map(|i| if i == 0 { (0, Vec::new(), Vec::new()) } else { (0, vec![-1; n_ctx], vec![0.0; vocab]) }).collect();
+            FakeRows { n_ctx, vocab, cands, state: 0, mla: vec![-1; n_ctx], logits: vec![0.0; vocab], fail_at: None, alloc_fail_at: None, rows_run: 0, heads_run: 0, parked, cur: 0, batches: Vec::new() }
         }
     }
 
@@ -1145,6 +1355,9 @@ pub mod fake {
         unsafe fn row(&mut self, tok: i64, pos: usize, head: bool) -> Result<Option<i64>, String> {
             if self.fail_at == Some(pos) {
                 return Err(format!("fake: row {pos} failed"));
+            }
+            if self.alloc_fail_at == Some(pos) {
+                crate::cuda::AllocFailed { what: format!("fake: the buffer of row {pos}"), bytes: 1 << 20, free: 0, result: "CUDA_ERROR_OUT_OF_MEMORY".into() }.raise();
             }
             self.rows_run += 1;
             self.mla[pos] = tok;
@@ -1184,6 +1397,342 @@ pub mod fake {
         }
         fn counters(&self) -> ([u64; 3], u64) {
             ([self.rows_run as u64 * 8, 0, 0], 0)
+        }
+        fn slots(&self) -> usize {
+            self.parked.len().max(1)
+        }
+        unsafe fn use_slot(&mut self, s: usize) -> Result<(), String> {
+            if s >= self.slots() {
+                return Err(format!("fake: sequence slot {s} of {}", self.slots()));
+            }
+            if s == self.cur {
+                return Ok(());
+            }
+            for i in [self.cur, s] {
+                let p = &mut self.parked[i];
+                std::mem::swap(&mut self.state, &mut p.0);
+                std::mem::swap(&mut self.mla, &mut p.1);
+                std::mem::swap(&mut self.logits, &mut p.2);
+            }
+            self.cur = s;
+            Ok(())
+        }
+        unsafe fn decode_batch(&mut self, rows: &[(usize, i64, usize)]) -> Result<Vec<i64>, String> {
+            self.batches.push(rows.len());
+            let mut ids = Vec::with_capacity(rows.len());
+            for &(s, tok, pos) in rows {
+                self.use_slot(s)?;
+                ids.push(self.decode(tok, pos)?);
+            }
+            Ok(ids)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_batch {
+    //! `CROW_GLM_MAX_BATCH` on the host twin: sequence slots and the batched decode step
+    use super::fake::FakeRows;
+    use super::*;
+
+    const CANDS: std::ops::Range<u32> = 10..40;
+
+    /// the id fed after `next` at generated index `i`: the argmax, every fifth one forced to
+    /// another id (a sampled draw / an injected id)
+    fn feed(i: usize, next: i64) -> i64 {
+        if i % 5 == 4 {
+            10 + (next * 7 + 3) % 30
+        } else {
+            next
+        }
+    }
+
+    /// one sequence alone: prefill `prompt`, then `n` ids fed back; (fed ids, logits rows)
+    unsafe fn solo(prompt: &[i64], n: usize) -> (Vec<i64>, Vec<Vec<f32>>) {
+        let mut e = Glm5Engine::new(FakeRows::new(256, 64, CANDS.collect()), true);
+        let mut next = e.prefill(prompt).unwrap();
+        let (mut ids, mut rows) = (Vec::new(), vec![e.logits()]);
+        for i in 0..n {
+            let x = feed(i, next);
+            ids.push(x);
+            next = e.decode_step(x).unwrap();
+            rows.push(e.logits());
+        }
+        (ids, rows)
+    }
+
+    /// Three sequences in three slots, joining at steps 0, 2 and 5 and running different
+    /// lengths: every slot's fed ids, held ids and logits rows (after its prompt and after every
+    /// step) are its solo run's; the steps carried 1, 2 and 3 rows.
+    #[test]
+    fn batched_slots_are_their_solo_sequences() {
+        let prompts: Vec<Vec<i64>> = vec![(0..9).map(|i| 10 + i * 3 % 30).collect(), (0..14).map(|i| 11 + (i * 7) % 29).collect(), vec![12, 13, 14]];
+        let (join, len) = ([0usize, 2, 5], [12usize, 9, 10]);
+        unsafe {
+            let want: Vec<_> = (0..3).map(|k| solo(&prompts[k], len[k])).collect();
+            let mut e = Glm5Engine::new(FakeRows::with_slots(256, 64, CANDS.collect(), 3), true);
+            assert_eq!(e.slots(), 3);
+            let mut next = [0i64; 3];
+            let mut got: Vec<(Vec<i64>, Vec<Vec<f32>>)> = vec![Default::default(); 3];
+            for step in 0..20 {
+                for k in 0..3 {
+                    if join[k] == step {
+                        e.select(k).unwrap();
+                        e.reset();
+                        next[k] = e.prefill(&prompts[k]).unwrap();
+                        e.snapshot(next[k]);
+                        got[k].1.push(e.logits());
+                    }
+                }
+                let active: Vec<usize> = (0..3).filter(|&k| join[k] <= step && got[k].0.len() < len[k]).collect();
+                if active.is_empty() {
+                    continue;
+                }
+                let steps: Vec<(usize, i64)> = active.iter().map(|&k| (k, feed(got[k].0.len(), next[k]))).collect();
+                let ids = e.decode_batch(&steps).unwrap();
+                for (j, &(k, x)) in steps.iter().enumerate() {
+                    got[k].0.push(x);
+                    next[k] = ids[j];
+                    e.select(k).unwrap();
+                    got[k].1.push(e.logits());
+                }
+            }
+            for k in 0..3 {
+                assert_eq!(got[k].0, want[k].0, "slot {k}: fed ids vs solo");
+                assert!(got[k].1.iter().zip(&want[k].1).all(|(a, b)| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())), "slot {k}: logits rows vs solo");
+                assert_eq!(got[k].1.len(), want[k].1.len());
+                let held: Vec<i64> = prompts[k].iter().chain(&got[k].0).copied().collect();
+                assert_eq!(e.history_of(k), held.as_slice(), "slot {k}: held ids");
+            }
+            let b = &e.rows().batches;
+            assert!(b.contains(&1) && b.contains(&2) && b.contains(&3), "step sizes {b:?}");
+        }
+    }
+
+    /// Each slot keeps its own prompt snapshot: a request that extends slot 1's prompt is warm
+    /// in slot 1 only, and a turn there equals the cold re-prefill
+    #[test]
+    fn every_slot_keeps_its_own_prefix_cache() {
+        let (p0, p1): (Vec<i64>, Vec<i64>) = ((10..20).collect(), (20..35).collect());
+        unsafe {
+            let mut e = Glm5Engine::new(FakeRows::with_slots(256, 64, CANDS.collect(), 2), true);
+            for (k, p) in [(0, &p0), (1, &p1)] {
+                e.select(k).unwrap();
+                let n = e.prefill(p).unwrap();
+                e.snapshot(n);
+                e.decode_batch(&[(k, n)]).unwrap();
+            }
+            let mut p2 = p1.clone();
+            p2.extend([11, 12, 13]);
+            assert_eq!(e.decide_in(0, &p2).reuse, None);
+            assert_eq!(e.decide_in(1, &p2).reuse.map(|r| r.1), Some(p1.len()));
+            assert_eq!((e.snapshot_pos_of(0), e.snapshot_pos_of(1)), (Some(p0.len()), Some(p1.len())));
+            e.select(1).unwrap();
+            e.rollback(p1.len()).unwrap();
+            let warm = e.prefill(&p2[p1.len()..]).unwrap();
+            let mut cold = Glm5Engine::new(FakeRows::new(256, 64, CANDS.collect()), true);
+            assert_eq!(warm, cold.prefill(&p2).unwrap());
+            assert_eq!(e.logits(), cold.logits());
+            // slot 0 untouched
+            assert_eq!(e.history_of(0).len(), p0.len() + 1);
+        }
+    }
+
+    /// A failed step resets the slots it carried (their next requests are cold); a slot outside
+    /// the step keeps its sequence. Refusals: a slot twice, a slot the engine does not hold.
+    #[test]
+    fn a_failed_batch_step_resets_its_slots_only() {
+        unsafe {
+            let mut e = Glm5Engine::new(FakeRows::with_slots(256, 64, CANDS.collect(), 3), true);
+            let mut next = [0i64; 3];
+            for k in 0..3 {
+                e.select(k).unwrap();
+                next[k] = e.prefill(&[10 + k as i64, 20, 30, 15]).unwrap();
+                e.snapshot(next[k]);
+            }
+            assert!(e.decode_batch(&[(0, next[0]), (0, next[0])]).unwrap_err().contains("twice"));
+            assert!(e.decode_batch(&[(3, next[0])]).is_err());
+            e.rows_mut().fail_at = Some(4);
+            let err = e.decode_batch(&[(0, next[0]), (1, next[1])]).unwrap_err();
+            assert!(err.contains("failed"), "{err}");
+            assert_eq!((e.history_of(0).len(), e.snapshot_pos_of(0)), (0, None));
+            assert_eq!((e.history_of(1).len(), e.snapshot_pos_of(1)), (0, None));
+            assert_eq!((e.history_of(2).len(), e.snapshot_pos_of(2)), (4, Some(4)));
+            // one slot without CROW_GLM_MAX_BATCH
+            let mut one = Glm5Engine::new(FakeRows::new(256, 64, CANDS.collect()), true);
+            assert_eq!(one.slots(), 1);
+            assert!(one.select(1).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_batch_gpu {
+    //! `CROW_GLM_MAX_BATCH` on the GPU: `Glm5Engine` over a `Glm5Device` of the synthetic
+    //! 8-layer glm5_next model of `tests_192_serve` (layers 0-2 KDA + dense, 3-7 MoE with 16
+    //! MUL1 experts, DSA at 3 and 7, vocab 2048), V 3 + P 4 tiers. `#[ignore]`: CI has no GPU.
+    //! Run with `cargo test --release --lib glm5_batch_gpu -- --ignored --nocapture --test-threads 1`.
+    use super::*;
+    use crate::cnq::Cnq;
+    use crate::glm5_flags::tests::synth_model;
+    use crate::glm5_moe::MoeGeo;
+    use crate::glm5_tiers::TierSizes;
+
+    const REC: u64 = 9_474_048;
+
+    fn geo() -> Glm5Geo {
+        let mut g = Glm5Geo::GLM_5_3_FLASH;
+        (g.layers, g.dense_prefix, g.experts, g.topk, g.vocab) = (8, 3, 16, 8, 2048);
+        g
+    }
+
+    /// a device of the synthetic model at `cap` rows with `slots` sequence slots
+    unsafe fn device(path: &str, g: &Glm5Geo, cap: usize, slots: usize) -> Glm5Device {
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(path).unwrap();
+        let moe = MoeGeo::new(g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(path).unwrap();
+        let old = std::env::var(gt::MAX_BATCH_ENV).ok();
+        std::env::set_var(gt::MAX_BATCH_ENV, slots.to_string());
+        let mut run = Glm5Run::load(&mut cnq, g, &moe, cap, &mut |s| eprintln!("{s}"));
+        match old {
+            Some(o) => std::env::set_var(gt::MAX_BATCH_ENV, o),
+            None => std::env::remove_var(gt::MAX_BATCH_ENV),
+        }
+        run.set_slots(slots).unwrap();
+        let tiers = ExpertTiers::new(&cnq, path, g, &moe, TierSizes { vram: 3, pinned: 4 }, 1, slots * g.topk).unwrap();
+        let o = Opened { cnq, path: path.to_string(), g: *g, moe, spec, records: 0, constants: 0 };
+        let plan = TierPlan { vram_ceiling: 0, fixed_bytes: 0, unit_bytes: 0, hot: 3, pinned: 4, nvme: g.experts - 7 };
+        Glm5Device { o, run, tiers, plan, n_ctx: cap, kd: KdaDims::of(g) }
+    }
+
+    fn feed(i: usize, next: i64) -> i64 {
+        if i % 5 == 4 {
+            (next * 7 + 3) % 2048
+        } else {
+            next
+        }
+    }
+
+    fn same_bits(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    /// Four sequences in four slots, joining at steps 0, 1, 3 and 6 with prompts of 5 .. 23
+    /// ids, 14 fed ids each (every fifth forced): every slot's greedy ids and logits rows (after
+    /// its prompt and after every step) are, bit for bit, those of the same sequence alone on a
+    /// one-slot device; the steps carried up to 4 rows in one trunk pass.
+    #[test]
+    #[ignore = "needs the GPU (about 4 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_batch_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_batch_gpu_every_slot_is_its_solo_sequence() {
+        batch_is_solo(&[]);
+    }
+
+    /// The batch test with the decode switches of the integration on the four-slot device only
+    /// (the solo runs stay on the default path): flags + stager + controller + LA + prefetch +
+    /// overlap. A solo step of the batch goes through the lookahead (`decode_la`), a wider one
+    /// through `decode_batch`; the row ahead must be dropped before another slot comes in.
+    #[test]
+    #[ignore = "needs the GPU (about 4 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_batch_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_batch_gpu_every_slot_is_its_solo_sequence_under_the_controller_and_la() {
+        batch_is_solo(&[
+            ("CROW_GLM_FLAGS", "1"),
+            ("CROW_GLM_STAGER", "1"),
+            ("CROW_GLM_CONTROLLER", "1"),
+            ("CROW_GLM_LA", "1"),
+            ("CROW_GLM_PREFETCH", "1"),
+            ("CROW_GLM_SHARED_OVERLAP", "1"),
+        ]);
+    }
+
+    /// set `kv` for the life of the guard, the old values back on drop
+    pub(crate) struct EnvGuard(Vec<(String, Option<String>)>);
+
+    impl EnvGuard {
+        pub(crate) fn set(kv: &[(&str, &str)]) -> EnvGuard {
+            let old = kv.iter().map(|(k, _)| (k.to_string(), std::env::var(k).ok())).collect();
+            for (k, v) in kv {
+                std::env::set_var(k, v);
+            }
+            EnvGuard(old)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// the body of the batch tests: `together` is set while the four-slot device is built and runs
+    pub(crate) fn batch_is_solo(together: &[(&str, &str)]) {
+        let g = geo();
+        let s = synth_model(&g, REC);
+        let prompts: Vec<Vec<i64>> = [5usize, 23, 11, 17].iter().enumerate().map(|(k, &n)| (0..n as i64).map(|i| (i * (31 + 2 * k as i64) + 7 * k as i64 + 1) % 2048).collect()).collect();
+        let (join, n) = ([0usize, 1, 3, 6], 14usize);
+        let cap = 23 + n + 4;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            // alone
+            let mut e0 = Glm5Engine::new(device(&s.path, &g, cap, 1), true);
+            let mut want: Vec<(Vec<i64>, Vec<Vec<f32>>)> = Vec::new();
+            for p in &prompts {
+                e0.reset();
+                let mut next = e0.prefill(p).unwrap();
+                let (mut ids, mut rows) = (Vec::new(), vec![e0.logits()]);
+                for i in 0..n {
+                    let x = feed(i, next);
+                    ids.push(x);
+                    next = e0.decode_step(x).unwrap();
+                    rows.push(e0.logits());
+                }
+                want.push((ids, rows));
+            }
+            drop(e0);
+            // together
+            let _env = EnvGuard::set(together);
+            let mut e = Glm5Engine::new(device(&s.path, &g, cap, 4), true);
+            assert_eq!(e.slots(), 4);
+            let mut next = [0i64; 4];
+            let mut got: Vec<(Vec<i64>, Vec<Vec<f32>>)> = vec![Default::default(); 4];
+            let mut widest = 0;
+            for step in 0..(6 + n) {
+                for k in 0..4 {
+                    if join[k] == step {
+                        e.select(k).unwrap();
+                        e.reset();
+                        next[k] = e.prefill(&prompts[k]).unwrap();
+                        got[k].1.push(e.logits());
+                    }
+                }
+                let active: Vec<usize> = (0..4).filter(|&k| join[k] <= step && got[k].0.len() < n).collect();
+                if active.is_empty() {
+                    continue;
+                }
+                widest = widest.max(active.len());
+                let steps: Vec<(usize, i64)> = active.iter().map(|&k| (k, feed(got[k].0.len(), next[k]))).collect();
+                let ids = e.decode_batch(&steps).unwrap();
+                for (j, &(k, x)) in steps.iter().enumerate() {
+                    got[k].0.push(x);
+                    next[k] = ids[j];
+                    e.select(k).unwrap();
+                    got[k].1.push(e.logits());
+                }
+            }
+            assert_eq!(widest, 4, "a step carried every slot");
+            for k in 0..4 {
+                assert_eq!(got[k].0, want[k].0, "slot {k}: ids vs alone");
+                let bad: Vec<usize> = got[k].1.iter().zip(&want[k].1).enumerate().filter(|(_, (a, b))| !same_bits(a, b)).map(|(i, _)| i).collect();
+                assert!(bad.is_empty() && got[k].1.len() == want[k].1.len(), "slot {k}: logits rows {bad:?} differ in bits from the solo run");
+                let held: Vec<i64> = prompts[k].iter().chain(&got[k].0).copied().collect();
+                assert_eq!(e.history_of(k), held.as_slice(), "slot {k}: held ids");
+            }
+            eprintln!("glm5_batch {together:?}: 4 slots, {n} ids each, ids and logits rows bit-identical to the solo runs");
+            drop(e);
         }
     }
 }
