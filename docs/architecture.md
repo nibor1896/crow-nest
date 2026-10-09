@@ -398,6 +398,19 @@ units, about 12 hot experts per layer), and the post-plan check below requires
 > tier is not behind the trait yet, no decode path calls the backend, and IoRing is not built. The
 > in-graph hand-off it needs is probe `p9_job_ring` stage C (`cuStreamWaitValue64_v2` captured as a
 > batch mem-op node, built 2026-10-08, not run yet).
+>
+> **Wired into the glm5_next path (#175 + #149, plan steps 16–17, 2026-10-09), not into the stager.**
+> `engine/src/glm5_tiers.rs` (bin `glm5_run`) runs all 45 glm5_next layers token by token with the
+> routed experts in three tiers: a per-layer VRAM arena and a per-layer pinned arena sized by the #159
+> plan (RTX 5090, 200,000 tokens, 3-bit record: 50 + 124 per MoE layer, 114 on NVMe), placed by
+> `ExpertCache` (LRU, G1d's choice), misses read by `NvmeSource` (1 reader) into a 4096-aligned landing
+> buffer or straight into a freed pinned slot. The hand-off is host-synchronous: after each MoE layer's
+> router the host reads the 8 ids, moves the records (staging, pinned entrants, VRAM entrants, in that
+> order) and writes the layer's `[288]` record table; the MUL1 kernels read VRAM records or pinned
+> records zero-copy. No job ring, no `cuStreamWaitValue`, no graph. Flash-Next and the 27B do not reach
+> it (gate R). The A9 requirement for this path is that the cache size never changes the output:
+> `glm5_tiers_gpu_cache_size_is_invisible_in_the_logits` (ids and logits bit-identical at the plan's
+> sizes, 1 + 7 and 0 + 0), built, not run on the real container yet. `docs/glm5-model.md` section 6.
 
 - GPU publishes cold jobs (expert IDs per layer) into the pinned job ring via
   `cuStreamWriteValue32`; the stager gathers weights (RAM tier) into pinned staging

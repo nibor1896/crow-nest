@@ -11,6 +11,10 @@ plan step 20).
 robin's Go. The goldens are `models/GLM-5.3-Flash-step06/ref-fp8/` (#156, FP8 originals, layers
 0–3, `--capture-subblocks`).
 
+**Since #175 / #149 (2026-10-09):** `engine/src/glm5_tiers.rs` and `bin/glm5_run` run all 45 layers
+token by token with the routed experts in VRAM, pinned RAM and the container (NVMe), section 6.
+Host- and synthetic-GPU-tested; no run on the real container yet (the lead's smoke).
+
 ## 1. The layer
 
 Per call of `t` rows (`Glm5Pass::call`), `docs/glm5-next-recipe.md` sections 3–4:
@@ -66,7 +70,7 @@ refused by name. The test runs it against the real container's index, cut to lay
 - `load_layer` reads one layer: the planned tensors, and for a MoE layer its 288 MUL1 records
   (9,474,048 B each, 2.73 GB) from the gate tensor's offset into one VRAM buffer behind the `[288]`
   record table `GpuMoePlan::run` reads. `LayerW::free` releases all of it after the layer. No
-  expert cache, no pinned or NVMe tier.
+  expert cache, no pinned or NVMe tier on this path (`glm5_tiers`, section 6, has them).
 
 ## 4. `decode glmgolden`
 
@@ -102,11 +106,75 @@ refusals by name, the load decodes (NVFP4 -> f32 / BF16 with the inexact count, 
 the trunk input, the shared compile, the manifest and call split, the metrics and overlaps.
 `manager::tests_159_glm_plan::the_glm_plan_books_kv_b_decoded_to_bf16` holds the planner line.
 
-## 6. Not verified
+## 6. Three tiers, token by token (`glm5_tiers`, `glm5_run`)
+
+#175 + #149, plan steps 16–17. glm5_next only: nothing on the `Engine` / `Geo` path of Flash-Next
+or the 27B constructs or calls it, and no default, flag or manifest of those families changed (gate
+R, #174). The layer math is section 1 unchanged; what changes is where an expert record is read.
+
+- **Resident model** (`Glm5Run::load`): `load_layer_without_experts` for all 45 layers (the dense
+  part, `FfnW::Moe` with no records and no table) and the head. One `KdaState` per KDA layer and
+  one `MlaCache` per DSA layer; `Glm5Pass::swap_kda_state` / `swap_mla_cache` put them in around
+  the layer's call. Every row, prompt and generated, is one decode call (`t = 1`, KDA's recurrent
+  step); no chunked prefill here. Greedy head after the last prompt row.
+- **Sizes** (`tier_sizes`): VRAM and pinned slots per MoE layer are the #159 plan's `hot` and
+  `pinned` at the measured free VRAM, `CROW_CONTEXT` (floor 200,000) and the derived pinned budget
+  (`HOST_PINNED_CAP` 46 GiB or less: free RAM − `CROW_RAM_MARGIN_GB`). RTX 5090 of record: 50 +
+  124, 114 on NVMe; 124 × 42 × 9,474,048 B = 45.95 GiB pinned, 50 × 42 records = 19.9 GB VRAM.
+  `--vram-slots` / `--pinned-slots` may ask for less; more is refused by name.
+- **Policy**: `ExpertCache` per MoE layer (G1d's arena `layer`), LRU (the policy G1d chose, `LRU s
+  0.00 P 0`: no seed, the cache starts empty); `CROW_EXPERT_CACHE` picks another policy, `off` is
+  refused (ask for 0 + 0 instead). Counters `[vram, pinned, nvme]` per MoE layer.
+- **One MoE call** (`Glm5Pass::call_with_experts`): `GpuMoePlan::route` (router GEMV + top-8),
+  host sync, the 8 ids to `ExpertTiers::table_for`, then `GpuMoePlan::experts` (gather, MUL1
+  gate/up/act/down, shared expert, combine). `route` + `experts` are exactly the launches of `run`.
+- **The moves** (`serve`): the cache observes the ids (one tick, ascending order like
+  `glm_tier_sim`); then, per tier change, in three phases so no slot is overwritten before it is
+  read: (A) every expert entering VRAM and every selected expert the policy leaves on NVMe goes to
+  a VRAM staging slot (H2D from its pinned slot, D2D from its old VRAM slot, or read from the
+  container through `nvme_source` into a 4096-aligned pageable landing buffer, then H2D);
+  barrier; (B) experts entering pinned take a freed pinned slot (D2H from their VRAM slot, or read
+  from the container straight into the slot); (C) VRAM entrants go from staging into freed VRAM
+  slots. The `[288]` table points each selected id at its VRAM slot, its pinned slot (UVA, read
+  zero-copy by the MUL1 kernels) or its staging slot; every other entry is 0.
+- **NVMe**: `NvmeSource`, one handle per reader, `FILE_FLAG_NO_BUFFERING` + IOCP, 1 reader
+  (`--readers`, PREREG amendment 5), records located once (`ExpertRecord::glm5_table`). A record is
+  read when no tier held it at the start of the call; the cache's NVMe counter can be higher (LRU
+  may evict a later id of the same call before its turn; its record is staged from its old slot).
+- **Memory beyond the plan**: 8 staging records in VRAM (75.8 MB; the plan books 160) and 8 landing
+  records in pageable RAM (75.8 MB, not pinned).
+
+```
+cd engine
+CARGO_BUILD_JOBS=4 cargo build --release --bin glm5_run
+target/release/glm5_run -n 16 [--cnq PATH] [--ids a,b,c | --prompt TEXT --tokenizer tokenizer.json]
+                        [--vram-slots N] [--pinned-slots N] [--readers N]
+```
+
+Without `--ids` / `--prompt` the prompt is the tokenizer golden `sys_user_default` (38 ids). Per
+row: position, greedy id, seconds, NVMe reads (count, MB), the summed and the per-layer `v/p/n`
+accesses; then the ids (the text with `--tokenizer`) and the totals. The seconds are no speed
+figure: every MoE layer syncs for its routing.
+
+**Tests.** Host: `the_moves_put_every_record_where_the_table_points` (a twin of the device store
+whose slots hold expert ids: LRU, CLOCK, CLOCK admit 2, LFU 0.7 at V/P 0/0, 0/8, 8/0, 1/7, 2/3,
+3/12, 16/40, 24/40 over 150 tokens × 3 layers: every selected id where its entry points, every
+cached record in its slot, NVMe reads exactly the records no tier held, no NVMe write into a pinned
+slot a queued copy still reads), `lru_by_hand_three_way_exchange`, the sizes against the plan,
+staging overflow and out-of-range ids refused by name; `nvme_source::the_record_table_is_locate_glm5_record_by_record`.
+GPU (`cargo test --release --lib glm5_tiers_gpu -- --ignored --nocapture --test-threads 1`):
+`glm5_tiers_gpu_every_table_entry_holds_its_record` (synthetic container, 16 records, 7
+capacities: the bytes at every entry are `read_range` of the record; 54 s, passed 2026-10-09) and
+`glm5_tiers_gpu_cache_size_is_invisible_in_the_logits` (the real container, the fixed prompt, 6
+ids at the plan's V/P, 1 + 7 and 0 + 0: ids and logits bit-identical; plan step 16 abort
+criterion, `docs/architecture.md` A9; not run yet).
+
+## 7. Not verified
 
 - Any GPU run of the path: the per-layer G3 table on layers 0–3 (golden-fed and `--chain`) awaits
   robin's Go. The goldens come from the FP8 originals, the engine reads the 3-bit container, so the
   table holds the quantisation error as well (step 6 measured container vs FP8 at cosine
   0.99308–0.99806 for layers 0–3 on the 4.5-bit container).
 - Layers 4–44 and the logits: no golden yet.
-- Speed, graph capture, the boot (#175, #149, step 14), MTP (step 21), vision (step 20).
+- Speed, graph capture, the boot (step 14), MTP (step 21), vision (step 20).
+- `glm5_run` and the cache-size logits test on the real container (section 6): built, not run.

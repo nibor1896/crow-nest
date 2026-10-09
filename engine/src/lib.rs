@@ -121,6 +121,9 @@ pub mod glm5_moe;
 // #161-#165: the glm5_next decoder layers wired in order (layer driver, NVFP4 projections,
 // one shared compile, layer-at-a-time loader) and the host side of `decode glmgolden`
 pub mod glm5_model;
+// #175 + #149 (plan steps 16-17): the glm5_next experts in VRAM / pinned / NVMe tiers, all
+// layers resident, token by token (`bin/glm5_run.rs`)
+pub mod glm5_tiers;
 // #31 A9: the prefix cache (spec section 7) - snapshot, rollback and the id prefix rule
 pub mod cache;
 // #32 A10: the slot file behind POST /slots/0?action=save|restore (spec section 7)

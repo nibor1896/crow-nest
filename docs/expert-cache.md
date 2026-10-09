@@ -153,6 +153,9 @@ it turned them green again:
 
 - **No NVMe reads.** `Residency` has no NVMe tier (#149). With the cache attached today, P is
   `experts - n`, so no miss ever reaches NVMe.
+  The glm5_next path is the exception (2026-10-09): `engine/src/glm5_tiers.rs` (`glm5_run`) uses
+  this cache per MoE layer with the #159 plan's V and P and executes its decisions, NVMe misses
+  included (`docs/glm5-model.md` section 6).
 - **Not replayed in the engine.** That the engine reaches the simulated m on a GLM replay is a
   later GPU step of #169. Nothing here has run on a GPU or booted a model.
 - **Feed granularity.** The feed is the counter rise per tick. Ticks span one token at decode and
