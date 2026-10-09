@@ -8,6 +8,7 @@
 
 ### Added
 
+- **MTP overlay for GLM-5.3-Flash** (#182, 2026-10-09): `converter --mtp-overlay` writes the MTP block's 25 non-expert tensors (164.8 MB, trunk codecs) beside the 3-bit container; `glm5_mtp::load_mtp` loads the whole block; draft top-1 equals the FP8-golden draft on 79 / 89 rows, head-norm cosine mean 0.984. Not wired into decode.
 - **serve on glm5_next takes glm5_run's tier options** (#185, 2026-10-09): `CROW_GLM_VRAM_SLOTS`, `CROW_GLM_PINNED_SLOTS` (at most the #159 plan) and `CROW_GLM_NVME_READERS` (1..=8); unset = the plan and one reader, as before. The `[budget]` tiers line names the tiers in force, the plan's, and each source. Not run on the real container.
 - **glm5 decode rows as CUDA graphs** (#190, 2026-10-09): `CROW_GLM_GRAPH=1` (default off) captures a decode row into one graph per MoE router + 1 and the head, replayed per row, up to 8 captured rows cached by key; synthetic 8-layer model per decode row: 269 kernel launches -> 7 graph launches, 19 -> 17 stream syncs (12 with `CROW_GLM_FLAGS`); ids and logits bit-identical; real container and speed not measured.
 - **Regression gate R checks a build against a recorded reference** (#174, 2026-10-09): host tests run record → check end to end with a stub engine; `compare` no longer crashes on a tree without git; docs/regression-gate.md has the record/check recipe. No real-model run yet.
