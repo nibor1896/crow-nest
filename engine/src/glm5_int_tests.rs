@@ -31,6 +31,15 @@ pub(crate) const KEYS: &[&str] = &[
     "CROW_NVME_POOL_THREADS",
     "CROW_NVME_POOL_PIECE_KB",
     "CROW_GLM_HCFUSE",
+    "CROW_CHUNK",
+    "CROW_GLM_FLAGS",
+    "CROW_GLM_STAGER",
+    "CROW_GLM_CONTROLLER",
+    "CROW_GLM_LA",
+    "CROW_GLM_PREFETCH",
+    "CROW_GLM_PREFETCH_SIDE",
+    "CROW_GLM_SHARED_OVERLAP",
+    "CROW_GLM_MAX_BATCH",
 ];
 
 pub(crate) struct Env(Vec<(String, Option<String>)>);
@@ -245,4 +254,99 @@ extern "C" __global__ void hold(long long ns)
         sc.free();
         m.unload();
     }
+}
+
+/// Cross-wiring 3: with `CROW_GLM_ARENA=global` + `CROW_GLM_ARENA_ELASTIC_GB` the prompt phase
+/// borrows its scratch. `Glm5Run::load` holds the decode rows only (1); `prefill` hands the elastic
+/// chunks back, runs its prompt calls at `CROW_CHUNK` rows and gives the scratch back (the pass
+/// holds 1 row again, no elastic chunk is live); the next decode row grows every chunk back. Ids
+/// and logits of a prompt + greedy run equal, bit for bit, the same chunk without the borrow on
+/// the per-layer path and on the global arena without an elastic part.
+#[test]
+#[ignore = "needs the GPU (about 2 GB VRAM, a 2.3 GB synthetic container in the temp dir)"]
+fn glm5_int_gpu_the_prompt_borrows_its_scratch_from_the_elastic_arena() {
+    let g = geo8();
+    let s = synth_model(&g, REC);
+    let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+    let moe = MoeGeo::new(&g, spec).unwrap();
+    let mut cnq = Cnq::open_checked(&s.path).unwrap();
+    let prompt: Vec<i64> = (0..11).map(|i| (i * 37 + 5) % 2048).collect();
+    let n = 6;
+    let sizes = TierSizes { vram: 3, pinned: 4 };
+    let elastic = format!("{}", 4.0 * 3.0 * REC as f64 / (1u64 << 30) as f64);
+    let arms: [(&str, Vec<(&str, String)>, bool); 3] = [
+        ("chunk 4", vec![("CROW_CHUNK", "4".into())], false),
+        ("chunk 4 global", vec![("CROW_CHUNK", "4".into()), ("CROW_GLM_ARENA", "global".into())], false),
+        ("chunk 4 global elastic", vec![("CROW_CHUNK", "4".into()), ("CROW_GLM_ARENA", "global".into()), ("CROW_GLM_ARENA_ELASTIC_GB", elastic.clone())], true),
+    ];
+    let mut outs: Vec<Generated> = Vec::new();
+    unsafe {
+        let _ctx = cuda::Ctx::init();
+        for (name, env, borrow) in &arms {
+            let _env = Env::set(env);
+            let mut run = Glm5Run::load(&mut cnq, &g, &moe, prompt.len() + n + 1, &mut |s| eprintln!("{s}"));
+            assert_eq!(run.rows_held(), if *borrow { 1 } else { 4 }, "{name}: rows held at load");
+            let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, g.topk).unwrap();
+            if *borrow {
+                let (live, all, v) = tiers.elastic_live().unwrap();
+                assert!(all >= 2 && live == all && v == 3, "{name}: the elastic part at construction ({live} of {all} chunks)");
+                // the prompt alone: scratch back, chunks handed back; then one decode row
+                let id = run.prefill(&mut cnq, &mut tiers, &prompt, 0, &mut |_| {}).unwrap();
+                assert_eq!(run.rows_held(), 1, "{name}: the prompt's scratch went back");
+                assert_eq!(tiers.elastic_live().unwrap().0, 0, "{name}: the prompt handed the elastic chunks back");
+                run.row(&mut cnq, &mut tiers, id, prompt.len(), true).unwrap();
+                assert_eq!(tiers.elastic_live().unwrap().0, all, "{name}: the decode row grew the elastic part back");
+                eprintln!("glm5 int borrow: elastic {all} chunks x {v} slots handed back for the prompt, grown back at the first decode row");
+                tiers.reset_cache().unwrap();
+                for k in run.kda_states() {
+                    k.reset();
+                }
+            }
+            let gen = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |_| {}).unwrap();
+            eprintln!("glm5 int {name}: ids {:?}, NVMe reads {}", gen.ids, tiers.nvme_reads);
+            assert_eq!(run.rows_held(), if *borrow { 1 } else { 4 }, "{name}: rows held after the run");
+            tiers.free();
+            run.free();
+            outs.push(gen);
+        }
+    }
+    for (i, (name, _, _)) in arms.iter().enumerate() {
+        assert_eq!(outs[i].ids, outs[0].ids, "{name}: ids");
+        let d = bit_diff(&outs[i].logits, &outs[0].logits);
+        assert!(d.iter().all(|&x| x == 0), "{name}: logits differ in bits per generated position {d:?}");
+    }
+}
+
+/// Cross-wiring 3, the plan: the VRAM hot set per MoE layer during decode on the RTX 5090 at
+/// 200,000 rows (the #186 planner test's card), chunk 1 / 2048 / 8192, with the prompt scratch
+/// booked (the plan of record: chunk 8192 leaves 7 slots per layer) and borrowed from the elastic
+/// part (`decode_hot_per_layer`, on the plan's numbers: the scratch under the plan's ceiling turns
+/// into elastic chunks above the 2.5 GiB reserve), elastic part unbounded and at 10 GiB (the
+/// template's serving setting).
+#[test]
+fn glm5_int_decode_hot_set_with_the_borrowed_prompt_scratch() {
+    use crate::glm5_tiers::decode_hot_per_layer;
+    use crate::geo::HOST_PINNED_CAP;
+    use crate::manager::{glm5_chunk_scratch_bytes, plan_glm5_next_chunk};
+    const CARD: u64 = 32_607 << 20;
+    const MUL1: u64 = 9_474_048;
+    let g = crate::geo::Glm5Geo::GLM_5_3_FLASH;
+    let ml = g.moe_layers();
+    let mut rows = Vec::new();
+    for chunk in [1usize, 2048, 8192] {
+        let (_, _, p) = plan_glm5_next_chunk(&g, 200_000, CARD, HOST_PINNED_CAP, crate::geo::GLM5_NEXT_DENSE_BYTES, MUL1, 64, true, chunk).unwrap();
+        let sc = glm5_chunk_scratch_bytes(&g, chunk, 200_000);
+        let booked = decode_hot_per_layer(&p, sc, false, MUL1, ml, u64::MAX);
+        let borrowed = decode_hot_per_layer(&p, sc, true, MUL1, ml, u64::MAX);
+        let borrowed10 = decode_hot_per_layer(&p, sc, true, MUL1, ml, 10 << 30);
+        eprintln!(
+            "glm5 decode hot set per layer, chunk {chunk}: plan {} ; scratch {:.2} GiB booked: {:.1} ({} elastic chunks) ; borrowed: {:.1} ({} chunks), at 10 GiB elastic {:.1} ({} chunks)",
+            p.hot, sc as f64 / (1u64 << 30) as f64, booked.1, booked.0, borrowed.1, borrowed.0, borrowed10.1, borrowed10.0
+        );
+        rows.push((chunk, p.hot, booked.1, borrowed.1));
+    }
+    let (c1, c8) = (rows[0], rows[2]);
+    assert_eq!(c1.2, c1.3, "chunk 1 books no prompt scratch");
+    assert_eq!(c8.1, 7, "the plan of record at chunk 8192 (#186)");
+    assert!(c8.3 > c8.2 + 20.0, "chunk 8192: the borrowed scratch holds experts during decode ({:.1} vs {:.1})", c8.3, c8.2);
 }

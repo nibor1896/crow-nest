@@ -825,6 +825,46 @@ impl Glm5Pass {
         }
     }
 
+    /// Calls of up to `max_t` rows from now on: the row-sized scratch (mHC, KDA chunk, MLA call,
+    /// `collapsed` / `sub`) freed and allocated again at `max_t` rows, the FFN plans of larger
+    /// calls and the expert-major plan dropped (made again on first use). The KDA state, the MLA
+    /// cache and every weight stay. `CROW_GLM_ARENA` elastic: the prompt phase borrows its scratch
+    /// this way (`Glm5Run::prefill_with`) and gives it back after the prompt.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading the scratch is pending (it synchronizes);
+    /// no capture is open.
+    pub unsafe fn set_max_t(&mut self, max_t: usize) {
+        assert!(max_t >= 1 && self.cap >= max_t, "glm5_model: calls of {max_t} rows over {}", self.cap);
+        if max_t == self.max_t {
+            return;
+        }
+        cuda::sync();
+        let (kd, md, h) = (KdaDims::of(&self.g), MlaDims::of(&self.g), self.g.hidden);
+        self.mhc.free();
+        self.kda_sc.free();
+        self.mla_sc.free();
+        cuda::free_dev(&mut self.collapsed);
+        cuda::free_dev(&mut self.sub);
+        if let Some(mut p) = self.grouped.take() {
+            p.free();
+        }
+        for p in self.moe_plans.iter_mut().filter(|p| p.tokens > max_t) {
+            p.free();
+        }
+        self.moe_plans.retain(|p| p.tokens <= max_t);
+        for p in self.dense_plans.iter_mut().filter(|p| p.tokens > max_t) {
+            p.free();
+        }
+        self.dense_plans.retain(|p| p.tokens <= max_t);
+        self.mhc = glm5_mhc::Plan::new(h, max_t);
+        self.kda_sc = KdaScratch::alloc(&kd, max_t);
+        self.mla_sc = MlaScratch::new(&md, max_t, self.cap);
+        self.collapsed = cuda::alloc_named("glm5 collapsed", max_t * h * 4);
+        self.sub = cuda::alloc_named("glm5 sublayer out", max_t * h * 4);
+        self.max_t = max_t;
+    }
+
     /// a new layer of the same sequence: the KDA state and conv window back to zero (each layer
     /// has its own; the MLA cache rows are rewritten by the layer's calls before they are read)
     ///

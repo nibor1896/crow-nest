@@ -812,6 +812,28 @@ pub fn serve_chunk_prefill(
 /// #186: the calls of a prompt phase of `n` rows at up to `chunk` rows per call, `(first row,
 /// rows)`: full chunks, then the remainder as one call (its FFN runs in the plan's sizes,
 /// `Glm5Pass::call_with_expert_batches`). Chunk 1: one row each.
+/// `CROW_GLM_ARENA` elastic, on the plan's own numbers: the VRAM expert slots per MoE layer during
+/// decode. The plan's hot set `plan.hot` plus the elastic chunks (one layer's `plan.hot` slots,
+/// `record` bytes each, shared by every layer in the global arena) that fit the VRAM the plan
+/// leaves under its ceiling (`vram_ceiling - fixed_bytes - hot_bytes`), plus the prompt scratch
+/// `scratch` when the prompt borrows it instead of keeping it booked, above
+/// [`ARENA_RESERVE_BYTES`], at most `elastic_cap` bytes (`CROW_GLM_ARENA_ELASTIC_GB`).
+/// Returns (elastic chunks, slots per layer).
+pub fn decode_hot_per_layer(plan: &crate::manager::TierPlan, scratch: u64, borrowed: bool, record: u64, moe_layers: usize, elastic_cap: u64) -> (u64, f64) {
+    let left = plan.vram_ceiling.saturating_sub(plan.fixed_bytes + plan.hot_bytes()) + if borrowed { scratch } else { 0 };
+    let cb = plan.hot as u64 * record;
+    let n = if cb == 0 { 0 } else { left.saturating_sub(ARENA_RESERVE_BYTES).min(elastic_cap) / cb };
+    (n, plan.hot as f64 + (n * plan.hot as u64) as f64 / moe_layers as f64)
+}
+
+/// `CROW_GLM_ARENA` elastic: the prompt phase borrows its scratch (`Glm5Run::prefill_with`) when
+/// the arena is global with an elastic part (`CROW_GLM_ARENA_ELASTIC_GB` above 0) and the prompt
+/// chunk is above the decode calls' rows; `get` reads the environment. A malformed value reads as
+/// no borrow (`ExpertTiers::new` refuses it by name).
+pub fn prompt_borrow_from_env(get: &dyn Fn(&str) -> Option<String>, chunk: usize, decode_t: usize) -> bool {
+    chunk > decode_t && arena_kind(get(ARENA_ENV).as_deref()) == Ok(ArenaKind::Global) && arena_config(get).is_ok_and(|c| c.elastic_bytes > 0)
+}
+
 pub fn prompt_calls(n: usize, chunk: usize) -> Vec<(usize, usize)> {
     let c = chunk.max(1);
     let mut v: Vec<(usize, usize)> = (0..n / c).map(|i| (i * c, c)).collect();
@@ -2048,6 +2070,27 @@ impl ExpertTiers {
     /// the global arena's policy (`None` on the per-layer path)
     pub fn arena(&self) -> Option<&GlobalArena> {
         self.arena.as_ref().map(|d| &d.a)
+    }
+
+    /// `CROW_GLM_ARENA` elastic: (elastic chunks allocated now, chunks of the elastic part, VRAM
+    /// slots per chunk); `None` without the global arena
+    pub fn elastic_live(&self) -> Option<(usize, usize, usize)> {
+        let d = self.arena.as_ref()?;
+        Some((d.flex().filter(|&c| d.chunks[c] != 0).count(), d.flex().len(), self.sizes.vram))
+    }
+
+    /// `CROW_GLM_ARENA` elastic: hand the elastic chunks back before the prompt phase borrows
+    /// their memory (`Glm5Run::prefill_with`); a staged forward still open ends first. The next
+    /// decode call grows them back (`table_global`). A no-op without the global arena.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading the arena is pending.
+    pub unsafe fn elastic_hand_back(&mut self) -> Result<(), String> {
+        if self.arena.is_none() {
+            return Ok(());
+        }
+        self.stage_end();
+        self.elastic_enter()
     }
 
     /// the global arena's switches (`None` on the per-layer path)
@@ -4449,6 +4492,11 @@ pub struct Glm5Run {
     /// #186: prompt rows per prompt call (1 = every prompt row one decode call); at most the
     /// pass's `max_t` (`CROW_CHUNK` at `load`, [`Glm5Run::set_prompt_chunk`])
     prompt_chunk: usize,
+    /// `CROW_GLM_ARENA=global` with `CROW_GLM_ARENA_ELASTIC_GB` and a prompt chunk above the
+    /// decode calls: the pass and the residual hold `decode_t` rows; a prompt phase borrows
+    /// `prompt_t` rows of scratch from the elastic part and gives it back after the prompt
+    /// ([`Glm5Run::prefill_with`]); `None` = the scratch of `max_t` rows stays allocated
+    borrow: Option<(usize, usize)>,
     pub load: LoadReport,
     pass: Glm5Pass,
     layers: Vec<LayerW>,
@@ -4579,11 +4627,20 @@ impl Glm5Run {
         let max_t = chunk.max((1 + crate::glm5_mtp::draft_rows_from_env().unwrap_or(0)).min(cap.max(1)));
         // CROW_GLM_MAX_BATCH: and a batched decode step of one row per sequence slot
         let max_t = max_t.max(max_batch_from_env().unwrap_or(1).min(cap.max(1)));
+        // CROW_GLM_ARENA elastic: the prompt scratch is borrowed per prompt phase
+        let decode_t = (1 + crate::glm5_mtp::draft_rows_from_env().unwrap_or(0)).max(max_batch_from_env().unwrap_or(1)).min(cap.max(1));
+        let borrow = prompt_borrow_from_env(&|k| std::env::var(k).ok(), chunk, decode_t).then_some((decode_t, max_t));
+        let held_t = borrow.map_or(max_t, |b| b.0);
+        if let Some((d, p)) = borrow {
+            log(&format!("[glm5_run] prompt scratch of {p} rows borrowed from the elastic arena per prompt phase; {d} rows held"));
+        }
+        let max_t = held_t;
         let mut run = Glm5Run {
             g: *g,
             moe: *moe,
             cap,
             prompt_chunk: chunk,
+            borrow,
             load,
             pass: Glm5Pass::new(g, *moe, max_t, cap),
             layers,
@@ -6424,8 +6481,9 @@ impl Glm5Run {
     /// Prompt rows per prompt call from now on, 1 ..= the `max_t` the pass was built with at
     /// `load` (`CROW_CHUNK`); a larger ask is refused by name.
     pub fn set_prompt_chunk(&mut self, chunk: usize) -> Result<(), String> {
-        if chunk == 0 || chunk > self.pass.max_t {
-            return Err(format!("glm5_run: a prompt chunk of {chunk} rows, the pass holds calls of 1 ..= {} rows (CROW_CHUNK at load)", self.pass.max_t));
+        let most = self.borrow.map_or(self.pass.max_t, |b| b.1);
+        if chunk == 0 || chunk > most {
+            return Err(format!("glm5_run: a prompt chunk of {chunk} rows, the pass holds calls of 1 ..= {most} rows (CROW_CHUNK at load)"));
         }
         self.prompt_chunk = chunk;
         Ok(())
@@ -6472,6 +6530,64 @@ impl Glm5Run {
             }
             return last.ok_or_else(|| "glm5_run: the last prompt row gave no id".to_string());
         }
+        // CROW_GLM_ARENA elastic: borrow the prompt scratch, give it back whatever happens
+        let borrowed = self.borrow.is_some_and(|b| self.prompt_chunk > b.0);
+        if borrowed {
+            self.borrow_scratch(tiers)?;
+        }
+        let r = self.prompt_calls_with(cnq, tiers, ids, pos0, report, rows);
+        if borrowed {
+            self.return_scratch();
+        }
+        r
+    }
+
+    /// `CROW_GLM_ARENA` elastic: the elastic chunks handed back, the pass and the residual at the
+    /// prompt's rows; captured row graphs dropped (they hold the old buffers)
+    ///
+    /// # Safety
+    /// As [`Glm5Run::prefill`].
+    unsafe fn borrow_scratch(&mut self, tiers: &mut ExpertTiers) -> Result<(), String> {
+        let (_, p) = self.borrow.expect("borrow_scratch without the borrow");
+        tiers.elastic_hand_back()?;
+        self.resize_rows(p);
+        Ok(())
+    }
+
+    /// the prompt's scratch back to the decode rows; the elastic part grows back at the next
+    /// decode call
+    ///
+    /// # Safety
+    /// As [`Glm5Run::prefill`].
+    unsafe fn return_scratch(&mut self) {
+        let (d, _) = self.borrow.expect("return_scratch without the borrow");
+        self.resize_rows(d);
+    }
+
+    unsafe fn resize_rows(&mut self, t: usize) {
+        if self.pass.max_t == t {
+            return;
+        }
+        self.pass.set_max_t(t);
+        cuda::free_dev(&mut self.x);
+        self.x = cuda::alloc_named("glm5_run residual", t * self.g.hc_streams * self.g.hidden * 4);
+        if self.graph.is_some() {
+            self.set_graph(false);
+            self.set_graph(true);
+        }
+    }
+
+    /// rows the pass holds now (`CROW_GLM_ARENA` elastic: the decode rows between prompts)
+    pub fn rows_held(&self) -> usize {
+        self.pass.max_t
+    }
+
+    /// the prompt calls of [`Glm5Run::prefill_with`] above prompt chunk 1
+    ///
+    /// # Safety
+    /// As [`Glm5Run::prefill_with`].
+    unsafe fn prompt_calls_with(&mut self, cnq: &mut Cnq, tiers: &mut ExpertTiers, ids: &[i64], pos0: usize, report: &mut dyn FnMut(&TokenReport), rows: &mut PromptRows) -> Result<i64, String> {
+        let n = ids.len();
         let (g, h) = (self.g, self.g.hidden);
         let row = g.hc_streams * h;
         let mut next = None;
