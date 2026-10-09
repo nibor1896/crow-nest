@@ -602,14 +602,16 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         let tiers_s = t_tiers.elapsed().as_secs_f64();
         println!(
-            "[glm5_run] tiers: {:.2} GiB VRAM (slots, {} decode + {} prefill staging, tables), {:.2} GiB pinned; free VRAM now {:.2} GiB; policy {:?}, cache empty at start; pinned {:?}",
+            "[glm5_run] tiers: {:.2} GiB VRAM (slots, {} decode + {} prefill staging, tables), {:.2} GiB pinned; free VRAM now {:.2} GiB; policy {:?}, cache empty at start; pinned {:?}; arena {:?} {:?}",
             gib(tiers.vram_bytes()),
             tiers.stage_cap,
             tiers.prefill_cap(),
             gib(tiers.pinned_bytes()),
             gib(cuda::free_vram_bytes()),
             tiers.cache.policy,
-            tiers.pinned_use
+            tiers.pinned_use,
+            tiers.arena_kind(),
+            tiers.arena_config()
         );
         println!("glm5_run setup: open {open_s:.2} s, load {load_s:.2} s (dense part + head), tiers {tiers_s:.2} s; commit {commit}");
         let m_setup = machine(&tiers);
@@ -624,7 +626,7 @@ fn run(args: &[String]) -> Result<(), String> {
             "generate": n, "reps": reps, "cold": cold, "context": context,
             "tiers": { "plan": { "vram": plan.hot, "pinned": plan.pinned, "nvme": plan.nvme }, "vram_slots": sizes.vram, "pinned_slots": sizes.pinned,
                        "nvme": o.g.experts - sizes.vram - sizes.pinned, "moe_layers": moe_layers, "first_moe_layer": first_moe, "readers": readers,
-                       "policy": format!("{:?}", tiers.cache.policy), "pinned_use": format!("{:?}", tiers.pinned_use), "staging_slots": tiers.stage_cap, "pinned_budget_bytes": budget, "free_vram_at_plan_bytes": free,
+                       "policy": format!("{:?}", tiers.cache.policy), "pinned_use": format!("{:?}", tiers.pinned_use), "arena": format!("{:?}", tiers.arena_kind()), "arena_config": tiers.arena_config().map(|c| format!("{c:?}")), "staging_slots": tiers.stage_cap, "pinned_budget_bytes": budget, "free_vram_at_plan_bytes": free,
                        "prefill_staging_slots": tiers.prefill_cap() },
             "prompt_chunk": { "chunk": run.prompt_chunk(), "calls": gt::prompt_calls(prompt.len(), run.prompt_chunk()).iter().map(|c| c.1).collect::<Vec<_>>(), "plan_chunk_scratch_bytes": input.chunk_scratch_bytes },
             "setup": { "open_s": open_s, "load_s": load_s, "tiers_s": tiers_s },

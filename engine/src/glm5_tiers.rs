@@ -740,8 +740,8 @@ pub fn arena_config(get: &dyn Fn(&str) -> Option<String>) -> Result<ArenaConfig,
 
 /// The routing scores of a warm-start file (sybil's `GLM53_EC_WARM`, `data/stats_own_dec.json`
 /// format): a JSON object whose keys end in the decoder layer index (`"3"`, or
-/// `"model.language_model.layers.3.mlp"`), each an array of `experts` scores, or a JSON array of
-/// one such array per MoE layer. Returns the scores per MoE layer (empty = not warmed).
+/// `"model.language_model.layers.3.mlp"`), each an array of `experts` scores (keys starting with
+/// `_` are notes), or a JSON array of one such array per MoE layer. Returns the scores per MoE layer (empty = not warmed).
 pub fn parse_warm(text: &str, layers: usize, first_moe: usize, experts: usize) -> Result<Vec<Vec<f64>>, String> {
     let v: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("{ARENA_WARM_ENV}: not JSON: {e}"))?;
     let row = |x: &serde_json::Value, what: &str| -> Result<Vec<f64>, String> {
@@ -762,7 +762,7 @@ pub fn parse_warm(text: &str, layers: usize, first_moe: usize, experts: usize) -
             }
         }
         serde_json::Value::Object(m) => {
-            for (k, x) in m {
+            for (k, x) in m.iter().filter(|(k, _)| !k.starts_with('_')) {
                 let digits: String = k.split(|c: char| !c.is_ascii_digit()).filter(|d| !d.is_empty()).last().unwrap_or("").to_string();
                 let dl: usize = digits.parse().map_err(|_| format!("{ARENA_WARM_ENV}: key {k:?} names no layer"))?;
                 let l = dl.checked_sub(first_moe).filter(|&l| l < layers).ok_or_else(|| format!("{ARENA_WARM_ENV}: key {k:?} is no MoE layer"))?;
@@ -1851,7 +1851,8 @@ impl ExpertTiers {
     }
 
     /// The device side of `CROW_GLM_ARENA=global`, after the per-layer allocations: the ring's
-    /// slots carved from the end of the arena (off when it holds fewer than 2 x N slots), the
+    /// slots carved from the end of the arena (off when it holds fewer than 2 x N slots or there
+    /// is no pinned tier to write back into), the
     /// elastic chunks from free VRAM above [`ARENA_RESERVE_BYTES`], the staging buffers (at once
     /// without an elastic part, else per staged forward), the warm start.
     ///
@@ -1864,7 +1865,7 @@ impl ExpertTiers {
         d.base_chunks = d.chunks.len();
         d.a.set_noadmit(d.cfg.noadmit);
         let base = nl * vpl;
-        if d.cfg.vring > 0 && base >= 2 * d.cfg.vring {
+        if d.cfg.vring > 0 && base >= 2 * d.cfg.vring && d.a.ram_slots() > 0 {
             let r = base - d.cfg.vring..base;
             let ch = d.a.disable(r.clone());
             debug_assert!(ch.is_empty(), "an empty arena moves nothing");
@@ -2232,17 +2233,9 @@ impl ExpertTiers {
     unsafe fn stage_call(&mut self, l: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<bool, String> {
         let (experts, rb, vpl, ppl, nl) = (self.cache.experts, self.rb, self.sizes.vram, self.sizes.pinned, self.slots.len());
         let ids = distinct_ids(sel, experts)?;
-        let need: Vec<u32> = {
-            let d = self.arena.as_ref().expect("stage_call without the global arena");
-            ids.iter().copied().filter(|&e| !matches!(d.a.place(l, e), Place::Vram(_))).collect()
-        };
         let nst = self.arena.as_ref().and_then(|d| d.stage.as_ref()).expect("stage_call without staging").nst;
-        if need.len() > nst {
-            let st = self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging");
-            st.stats.fallbacks += 1;
-            return Ok(false);
-        }
-        // a staged forward begins: per-forward buffers come from the elastic part's memory
+        // a staged forward begins: per-forward buffers come from the elastic part's memory (its
+        // hand-back moves VRAM experts, so the staged set is taken after it)
         let begin = !self.arena.as_ref().and_then(|d| d.stage.as_ref()).expect("staging").in_forward;
         if begin {
             if let Some(r) = self.arena.as_mut().and_then(|d| d.ring.as_mut()) {
@@ -2257,6 +2250,15 @@ impl ExpertTiers {
                 }
             }
             self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging").in_forward = true;
+        }
+        let need: Vec<u32> = {
+            let d = self.arena.as_ref().expect("stage_call without the global arena");
+            ids.iter().copied().filter(|&e| !matches!(d.a.place(l, e), Place::Vram(_))).collect()
+        };
+        if need.len() > nst {
+            let st = self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging");
+            st.stats.fallbacks += 1;
+            return Ok(false);
         }
         let b = l % 2;
         let fresh = {
@@ -2548,7 +2550,7 @@ mod arena_tests {
         let (v, p) = a.warm_plan(&s);
         assert_eq!(v, vec![vec![1, 3], vec![]], "top 2 by score, ties the lower id");
         assert_eq!(p, vec![vec![4, 5], vec![]]);
-        let obj = r#"{"model.language_model.layers.3.mlp": [1,2,3], "4": [3,2,1]}"#;
+        let obj = r#"{"_source": "notes", "model.language_model.layers.3.mlp": [1,2,3], "4": [3,2,1]}"#;
         assert_eq!(parse_warm(obj, 2, 3, 3).unwrap(), vec![vec![1.0, 2.0, 3.0], vec![3.0, 2.0, 1.0]]);
         assert_eq!(parse_warm("[[1,2,3],[0,0,1]]", 2, 3, 3).unwrap()[1], vec![0.0, 0.0, 1.0]);
         for bad in ["[[1,2,3]]", r#"{"9": [1,2,3]}"#, r#"{"3": [1,2]}"#, "nope"] {
@@ -2883,6 +2885,250 @@ mod arena_tests {
             a.check().unwrap();
             report(&format!("global CLOCK{}{}{} ring {vring}", if stay { " zerocopy" } else { "" }, if noadmit { " noadmit" } else { "" }, if warm.is_some() { " warm" } else { "" }), tot);
         }
+    }
+}
+
+#[cfg(test)]
+mod arena_gpu_tests {
+    //! `CROW_GLM_ARENA=global` on the device, on a synthetic container of three MoE layers x 16
+    //! experts (455 MB in the temp dir, about 1 GB VRAM). `#[ignore]`: CI has no GPU. Run with
+    //! `cargo test --release --lib glm5_arena_gpu -- --ignored --nocapture --test-threads 1`.
+    use super::*;
+
+    const REC: u64 = 9_474_048;
+
+    struct Synth {
+        dir: std::path::PathBuf,
+        path: String,
+    }
+
+    impl Drop for Synth {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// `layers` MoE layers (decoder layers 3..) of `experts` MUL1 records each, random bytes
+    fn synth(layers: u32, experts: u32) -> Synth {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("crow-glm5-arena-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("synth-arena.cnq");
+        let lead = 4084u64;
+        let mut tensors = vec![serde_json::json!({ "name": "model.language_model.layers.3.mlp.gate.weight", "section": "text",
+            "dtype": "bf16", "offset": 0, "n_values": lead / 2, "shape": [2, lead / 4] })];
+        for l in 0..layers {
+            for e in 0..experts {
+                for (k, p) in ["gate", "up", "down"].into_iter().enumerate() {
+                    tensors.push(serde_json::json!({ "name": crate::nvme_source::glm5_expert_tensor_name(3 + l, e, p), "section": "text", "dtype": "mul1",
+                        "offset": lead + (l * experts + e) as u64 * REC + k as u64 * (REC / 3), "n_values": 2048u64 * 4096, "shape": [2048, 4096] }));
+                }
+            }
+        }
+        let tail = lead + (layers * experts) as u64 * REC;
+        tensors.push(serde_json::json!({ "name": "model.language_model.norm.weight", "section": "text", "dtype": "bf16", "offset": tail, "n_values": 2048, "shape": [2048] }));
+        let sha = |s: &str| crate::cnq::sha256_hex(s.as_bytes());
+        let index = serde_json::json!({
+            "format": "crow-nest-quant", "format_version": 2, "blob_offset": 12, "recipe": "synthetic-glm5-arena",
+            "model": { "family": "Glm5Next", "model_type": "glm5_next_text", "config_json": "{}", "config_json_sha256": sha("{}"),
+                "generation_config_json": "{}", "generation_config_json_sha256": sha("{}"),
+                "source": { "repo": "crow-nest/synthetic-glm5-arena", "revision": "arena", "shards": [] }, "geo": {} },
+            "tensors": tensors
+        });
+        let ib = serde_json::to_vec(&index).unwrap();
+        let mut f = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&path).unwrap());
+        f.write_all(b"CNQ1\0\0\0\0\0\0\0\0").unwrap();
+        let mut x = 0x0A7E_4A5E_1D2C_3B4Fu64;
+        let mut chunk = vec![0u8; 1 << 20];
+        let mut left = tail + 4096;
+        while left > 0 {
+            for w in chunk.chunks_exact_mut(8) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                w.copy_from_slice(&x.to_le_bytes());
+            }
+            let n = left.min(chunk.len() as u64) as usize;
+            f.write_all(&chunk[..n]).unwrap();
+            left -= n as u64;
+        }
+        f.write_all(&ib).unwrap();
+        f.write_all(&(ib.len() as u64).to_le_bytes()).unwrap();
+        f.flush().unwrap();
+        Synth { dir, path: path.to_str().unwrap().to_string() }
+    }
+
+    /// set the arena's variables for one scope, the previous values back on drop
+    struct Env(Vec<(String, Option<String>)>);
+
+    impl Env {
+        fn set(kv: &[(&str, &str)]) -> Env {
+            let names = [ARENA_ENV, ARENA_ADMIT_MAX_ENV, ARENA_NOADMIT_ENV, ARENA_WARM_ENV, ARENA_VRING_ENV, ARENA_ELASTIC_ENV, ARENA_STAGE_ENV, ARENA_STAGE_MIN_ENV];
+            let old = names.iter().map(|n| (n.to_string(), std::env::var(n).ok())).collect();
+            for n in names {
+                std::env::remove_var(n);
+            }
+            for (k, v) in kv {
+                std::env::set_var(k, v);
+            }
+            Env(old)
+        }
+    }
+
+    impl Drop for Env {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// the xorshift routing of `tests::trace` (drifting hot set), `k` distinct ids per layer
+    fn routing(tokens: usize, layers: usize, experts: u64, k: usize, seed: u64) -> Vec<Vec<Vec<u32>>> {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ seed;
+        (0..tokens)
+            .map(|t| {
+                let base = (t as u64 / 10) * 3;
+                (0..layers as u64)
+                    .map(|l| {
+                        let mut got: Vec<u32> = Vec::with_capacity(k);
+                        while got.len() < k {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            let e = if (x >> 32) % 10 < 7 { (base + l * 5 + x % 9) % experts } else { (x >> 8) % experts } as u32;
+                            if !got.contains(&e) {
+                                got.push(e);
+                            }
+                        }
+                        got
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Every decode call (one row; every third call two rows, still admitting) and every prompt
+    /// call (sub-batches, and staged with the staging buffers and the elastic part) of a routing
+    /// trace over three MoE layers, under the arena's switches: each selected id's table entry
+    /// holds the bytes of its layer's record (`Cnq::read_range`), every other entry is 0.
+    #[test]
+    #[ignore = "needs the GPU (about 1 GB VRAM, a 455 MB synthetic container in the temp dir): cargo test --release --lib glm5_arena_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_arena_gpu_every_table_entry_holds_its_record() {
+        let (nl, ex) = (3usize, 16u32);
+        let s = synth(nl as u32, ex);
+        let mut g = Glm5Geo::GLM_5_3_FLASH;
+        (g.layers, g.dense_prefix, g.experts, g.topk) = (3 + nl, 3, ex as usize, 8);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let rb = spec.bytes as usize;
+        let want: Vec<Vec<Vec<u8>>> =
+            (0..nl).map(|l| (0..ex).map(|e| cnq.read_range(&cnq.find(&crate::nvme_source::glm5_expert_tensor_name(3 + l as u32, e, "gate"), "text").clone(), 0, rb)).collect()).collect();
+        let tr = routing(20, nl, ex as u64, 8, 0xA4E);
+        let warm = s.dir.join("warm.json");
+        std::fs::write(&warm, serde_json::to_string(&(0..nl).map(|l| (0..ex).map(|e| ((e as usize * 7 + l) % 16) as f64).collect::<Vec<_>>()).collect::<Vec<_>>()).unwrap()).unwrap();
+        let warm = warm.to_str().unwrap().to_string();
+        let stage_gb = format!("{}", 12.0 * REC as f64 / (1u64 << 30) as f64);
+        let elastic_gb = format!("{}", 2.0 * 3.0 * REC as f64 / (1u64 << 30) as f64);
+        let check = |what: &str, l: usize, tb: Dev, ids: &[u32]| unsafe {
+            cuda::sync();
+            let table = cuda::dtoh_u64(tb, ex as usize);
+            for e in 0..ex {
+                assert_eq!(table[e as usize] != 0, ids.contains(&e), "{what}: layer {l} table entry of expert {e}");
+                if ids.contains(&e) {
+                    let got: Vec<u8> = cuda::dtoh_t(table[e as usize], rb);
+                    assert!(got == want[l][e as usize], "{what}: layer {l} expert {e}: the bytes differ from read_range");
+                }
+            }
+        };
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let cases: Vec<(&str, Vec<(&str, &str)>, bool)> = vec![
+                ("plain", vec![(ARENA_VRING_ENV, "0")], false),
+                ("ring", vec![(ARENA_VRING_ENV, "2")], false),
+                ("ring+stager", vec![(ARENA_VRING_ENV, "2")], true),
+                ("noadmit+admit16", vec![(ARENA_VRING_ENV, "2"), (ARENA_NOADMIT_ENV, "1"), (ARENA_ADMIT_MAX_ENV, "16")], false),
+                ("warm", vec![(ARENA_VRING_ENV, "2"), (ARENA_WARM_ENV, &warm)], false),
+                ("stage", vec![(ARENA_VRING_ENV, "2"), (ARENA_STAGE_ENV, &stage_gb), (ARENA_STAGE_MIN_ENV, "16")], false),
+                ("stage+elastic", vec![(ARENA_VRING_ENV, "2"), (ARENA_STAGE_ENV, &stage_gb), (ARENA_STAGE_MIN_ENV, "16"), (ARENA_ELASTIC_ENV, &elastic_gb)], false),
+            ];
+            for (v, p) in [(0, 0), (2, 3), (3, 8), (6, 0)] {
+                for (name, kv, stager) in &cases {
+                    if v == 0 && *name != "plain" && !name.starts_with("stage") {
+                        continue;
+                    }
+                    let mut kv = kv.clone();
+                    kv.push((ARENA_ENV, "global"));
+                    let _env = Env::set(&kv);
+                    let what = format!("{name} V {v} P {p}");
+                    let sizes = TierSizes { vram: v, pinned: p };
+                    let mut t = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, 16).unwrap();
+                    assert_eq!(t.arena_kind(), ArenaKind::Global);
+                    if *stager {
+                        t.set_stager(true).unwrap();
+                    }
+                    if *name == "warm" && v > 0 {
+                        let a = t.arena().unwrap();
+                        assert!((0..nl).all(|l| (0..ex).any(|e| matches!(a.place(l, e), Place::Vram(_)))), "{what}: every layer warmed into VRAM");
+                    }
+                    for (i, tok) in tr.iter().enumerate() {
+                        for (l, ids) in tok.iter().enumerate() {
+                            // every third call two rows (16 picks), the second row the first reversed
+                            let mut sel: Vec<i32> = ids.iter().map(|&e| e as i32).collect();
+                            if i % 3 == 2 {
+                                sel.extend(ids.iter().rev().map(|&e| e as i32));
+                            }
+                            let (tb, served) = t.table_for(3 + l, &sel).unwrap();
+                            assert_eq!(served.moves.visits as usize, ids.len(), "{what}: visits");
+                            check(&what, l, tb, ids);
+                        }
+                        // every tenth token a prompt call of 4 rows per layer (32 picks: staged at 16)
+                        if i % 10 == 9 {
+                            for l in 0..nl {
+                                let rows: Vec<&Vec<u32>> = (0..4).map(|r| &tr[i - r][l]).collect();
+                                let sel: Vec<i32> = rows.iter().flat_map(|r| r.iter().map(|&e| e as i32)).collect();
+                                let mut calls = Vec::new();
+                                t.tables_for_chunk(3 + l, &sel, &mut |r0, n, tb| {
+                                    let mut ids: Vec<u32> = sel[r0 * 8..(r0 + n) * 8].iter().map(|&e| e as u32).collect();
+                                    ids.sort_unstable();
+                                    ids.dedup();
+                                    check(&what, l, tb, &ids);
+                                    calls.push(n);
+                                    Ok(())
+                                })
+                                .unwrap();
+                                assert_eq!(calls.iter().sum::<usize>(), 4, "{what}: every row served");
+                            }
+                        }
+                    }
+                    let a = t.arena().unwrap();
+                    a.check().unwrap();
+                    let tot: [u64; 3] = t.tier_counters().iter().fold([0; 3], |a, x| [a[0] + x[0], a[1] + x[1], a[2] + x[2]]);
+                    eprintln!(
+                        "glm5_arena synthetic {what}: accesses v/p/n {tot:?}, NVMe reads {}, ring {:?}, elastic {:?}, stage {:?}",
+                        t.nvme_reads,
+                        t.arena_ring_stats(),
+                        t.arena_elastic_stats(),
+                        t.arena_stage_stats()
+                    );
+                    if name.starts_with("stage") && v >= 6 {
+                        let st = t.arena_stage_stats().unwrap().0;
+                        assert!(st.calls > 0 && st.prefetch_used > 0, "{what}: staged calls ran, some on their prefetch: {st:?}");
+                    }
+                    t.reset_cache().unwrap();
+                    let sel: Vec<i32> = tr[0][0].iter().map(|&e| e as i32).collect();
+                    let (tb, served) = t.table_for(3, &sel).unwrap();
+                    assert_eq!(served.nvme_reads, tr[0][0].len(), "{what}: a reset arena reads the first selection from NVMe");
+                    check(&what, 0, tb, &tr[0][0]);
+                    t.free();
+                }
+            }
+        }
+        drop(cnq);
     }
 }
 
