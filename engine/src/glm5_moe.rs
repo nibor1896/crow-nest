@@ -805,6 +805,22 @@ impl ExpertMajor {
     }
 }
 
+/// the most work items of a [`GpuMoeGroupedPlan`] call of `tokens` rows over `experts` experts
+/// top-`topk`: every expert's last item may be short
+pub fn grouped_work_cap(experts: usize, topk: usize, tokens: usize) -> usize {
+    let c = tokens * topk;
+    c.div_ceil(GROUP_ROWS) + experts.min(c)
+}
+
+/// The device bytes of a [`GpuMoeGroupedPlan`] of `tokens` rows, without its parameter arrays,
+/// from the model's geometry alone (the planner's booking, `manager::glm5_chunk_scratch_bytes`):
+/// logits, ids, wts, ge / ue, ye, ys, the combo list, the work items, the shared expert's g / u / h.
+pub fn grouped_plan_bytes(hidden: usize, experts: usize, topk: usize, expert_inter: usize, shared_inter: usize, tokens: usize) -> u64 {
+    let (t, c) = (tokens as u64, (tokens * topk) as u64);
+    let (h, e, i, s) = (hidden as u64, experts as u64, expert_inter as u64, shared_inter as u64);
+    4 * (t * e + 2 * c + 2 * c * i + c * h + t * h + c + 3 * grouped_work_cap(experts, topk, tokens) as u64 + 3 * t * s)
+}
+
 /// One MoE layer of a prompt call of up to `tokens` rows, expert-major ([`ExpertMajor`]): the
 /// router as [`GpuMoePlan::route`], then per tier sub-batch two `mul1_gemm_grp` launches (gate
 /// and up in one, down with the clamp fused into its input), then the shared expert and
@@ -844,16 +860,13 @@ pub struct GpuMoeGroupedPlan {
 impl GpuMoeGroupedPlan {
     /// the most work items a call of `tokens` rows can have: every expert's last item may be short
     pub fn work_cap(geo: &MoeGeo, tokens: usize) -> usize {
-        let c = tokens * geo.topk;
-        c.div_ceil(GROUP_ROWS) + geo.experts.min(c)
+        grouped_work_cap(geo.experts, geo.topk, tokens)
     }
 
     /// the device bytes [`GpuMoeGroupedPlan::new`] allocates, without its parameter arrays
+    /// ([`grouped_plan_bytes`] of the plan's geometry)
     pub fn bytes(geo: &MoeGeo, tokens: usize) -> u64 {
-        let (t, c) = (tokens as u64, (tokens * geo.topk) as u64);
-        let (h, e, i, s) = (geo.hidden as u64, geo.experts as u64, geo.expert_inter as u64, geo.shared_inter as u64);
-        // logits, ids, wts, ge / ue, ye, ys, list, work, the shared expert's g / u / h
-        4 * (t * e + 2 * c + 2 * c * i + c * h + t * h + c + 3 * Self::work_cap(geo, tokens) as u64 + 3 * t * s)
+        grouped_plan_bytes(geo.hidden, geo.experts, geo.topk, geo.expert_inter, geo.shared_inter, tokens)
     }
 
     /// # Safety
