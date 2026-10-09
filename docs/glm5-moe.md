@@ -58,6 +58,7 @@ transformers 5.16.1 `modeling_glm5_next.py`, `docs/glm5-next-recipe.md` sections
 | `table` | device `[288] u64` of record bases, one per expert: a VRAM slot or a pinned-host UVA address (the residency / #175 cache hook; the kernels do not know which) |
 | `GpuFfnPlan::new(hidden, inter, tokens, limit)`, `run(kn, gk, &GpuFfnWeights, x, y)` | dense layers 0-2 (and the shared expert inside `GpuMoePlan`) on `gemv_fp4_b` |
 | `GpuMoePlan::read_routing()` | the last routing (syncs), for the counters and the routing dumps |
+| `lane::post(Some(lane::Call { table, combos, clock }))` (#188) | the CPU lane hand-off: the next `GpuMoePlan::experts` on this thread with this `table`, `t = 1` and at least one `Combo::Cpu` computes those combos on the CPU (`cpu_mul1::experts_ffn` with `swiglu_clamp`, `LANE_THREADS` 8, one pool run) while the GPU computes the rest (`GemvPlan::run_slots`), then the unchanged combine; anything else runs the GPU path. Posted by `glm5_tiers::ExpertTiers::table_for` under `CROW_GLM_CPU_LANE=1`; `docs/glm5-model.md` section 6 |
 
 `kn` is the engine's main `kernels::Kernels` (it needs `gemv_bf16_b`, `gemv_fp4_b`), `mk` the
 `kernels::mul1::Kernels`, `gk` the `kernels::glm5_moe::Kernels`. NVFP4 scale bytes reach

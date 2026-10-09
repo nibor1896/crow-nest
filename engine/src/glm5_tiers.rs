@@ -20,6 +20,10 @@
 //!   VRAM slot, or read from the container straight into the slot); (C) the VRAM entrants go
 //!   from staging into freed VRAM slots. The `[E]` record table then points every selected id at
 //!   its VRAM slot, its pinned slot (zero-copy) or its staging slot.
+//! - **Pinned hits** (#188, [`PinnedUse`]): `CROW_GLM_PINNED=zerocopy` keeps a pinned hit in
+//!   pinned (no promotion, the kernels read it zero-copy); `CROW_GLM_CPU_LANE=1` also computes a
+//!   decode call's pinned ids on the CPU (`glm5_moe::lane`, posted by [`ExpertTiers::table_for`]).
+//!   Both off by default: the exchange rule above, bit for bit.
 //! - **NVMe** (#149): [`NvmeSource`], one handle per reader, `FILE_FLAG_NO_BUFFERING`, 1 reader by
 //!   default (B = 6.994 GB/s, PREREG amendment 5); every record (9,474,048 B at 3 bit) is located
 //!   once at setup ([`ExpertRecord::glm5_table`]).
@@ -75,6 +79,78 @@ pub fn tier_sizes(plan: &TierPlan, vram: Option<usize>, pinned: Option<usize>) -
         }
     };
     Ok(TierSizes { vram: pick("--vram-slots", vram, plan.hot)?, pinned: pick("--pinned-slots", pinned, plan.pinned)? })
+}
+
+// ---------------------------------------------------------------- #188: how the pinned tier is read
+
+/// `promote` (default) | `zerocopy`
+pub const PINNED_ENV: &str = "CROW_GLM_PINNED";
+/// `1` = the CPU lane; unset / `0` = off (default)
+pub const CPU_LANE_ENV: &str = "CROW_GLM_CPU_LANE";
+
+/// #188: what happens to a selected expert the cache holds in pinned. Default (both false): it
+/// is promoted into VRAM (staged H2D, its VRAM victim back to pinned by D2H), today's rule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PinnedUse {
+    /// `CROW_GLM_PINNED=zerocopy` (or implied by the CPU lane): a pinned hit stays in pinned
+    /// ([`ExpertCache::set_pinned_stays`]); the GPU kernels read it zero-copy from its slot
+    pub stay: bool,
+    /// `CROW_GLM_CPU_LANE=1`: in a decode call the selected ids in pinned are computed by the
+    /// CPU from their slot (`glm5_moe::lane`), the others on the GPU
+    pub cpu_lane: bool,
+}
+
+/// Parse the two #188 switches (`pinned` = `CROW_GLM_PINNED`, `lane` = `CROW_GLM_CPU_LANE`).
+/// The CPU lane implies `zerocopy` (a promoted expert is no longer in pinned); asking for the
+/// lane with an explicit `promote` is refused by name, as is any other value.
+pub fn pinned_use(pinned: Option<&str>, lane: Option<&str>) -> Result<PinnedUse, String> {
+    let promote_explicit = match pinned.map(str::trim) {
+        None | Some("") => None,
+        Some("promote") => Some(true),
+        Some("zerocopy") => Some(false),
+        Some(v) => return Err(format!("{PINNED_ENV}={v:?}: accepted promote (default), zerocopy")),
+    };
+    let cpu_lane = match lane.map(str::trim) {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(v) => return Err(format!("{CPU_LANE_ENV}={v:?}: accepted 0 (default), 1")),
+    };
+    if cpu_lane && promote_explicit == Some(true) {
+        return Err(format!("{CPU_LANE_ENV}=1 reads the selected pinned experts where they lie, {PINNED_ENV}=promote moves them to VRAM first: unset {PINNED_ENV} or set it to zerocopy"));
+    }
+    Ok(PinnedUse { stay: cpu_lane || promote_explicit == Some(false), cpu_lane })
+}
+
+/// the CPU lane reads the pinned records on the CPU: refused by name on a write-combined arena
+fn lane_on_wc(u: PinnedUse, wc: bool) -> Result<(), String> {
+    if u.cpu_lane && wc {
+        return Err(format!(
+            "{CPU_LANE_ENV}=1: the pinned tier is write-combined (CROW_PINNED_ALLOC unset on Windows, or wc), which most CPUs cannot read efficiently (CUDA Driver API, cuMemHostAlloc, CU_MEMHOSTALLOC_WRITECOMBINED); set CROW_PINNED_ALLOC=host"
+        ));
+    }
+    Ok(())
+}
+
+/// #188: the combos of one decode call for the CPU lane, pick order: a selected id served from
+/// its pinned slot goes to the CPU (its host record), every other to the GPU (its table entry).
+/// Returns the combos and the number on the CPU.
+pub fn lane_combos(sel: &[i32], locs: &[(u32, Loc)], gpu_base: impl Fn(u32, Loc) -> u64, cpu_host: impl Fn(u32) -> *const u8) -> (Vec<crate::glm5_moe::lane::Combo>, usize) {
+    use crate::glm5_moe::lane::Combo;
+    let mut n = 0;
+    let combos = sel
+        .iter()
+        .map(|&e| {
+            let loc = locs.iter().find(|x| x.0 == e as u32).expect("every selected id has a location").1;
+            match loc {
+                Loc::Pinned(q) => {
+                    n += 1;
+                    Combo::Cpu(cpu_host(q))
+                }
+                _ => Combo::Gpu(gpu_base(e as u32, loc)),
+            }
+        })
+        .collect();
+    (combos, n)
 }
 
 // ---------------------------------------------------------------- slots and the mover (host)
@@ -152,6 +228,9 @@ pub struct Moves {
     pub visits: u64,
     /// selected ids the kernels read zero-copy from their pinned slot (over PCIe from host DRAM)
     pub zero_copy: u64,
+    /// #188 (`CROW_GLM_CPU_LANE=1`): selected ids computed by the CPU lane from their pinned
+    /// slot (not counted in `zero_copy`; no PCIe read of the record)
+    pub cpu_lane: u64,
     /// NVMe reads into the pageable landing buffer (then H2D to staging)
     pub nvme_to_landing: u64,
     /// NVMe reads straight into a pinned slot
@@ -178,13 +257,14 @@ pub struct Moves {
 
 impl Moves {
     /// field names in the order of [`Moves::fields`] (the JSON keys of `glm5_run`)
-    pub const NAMES: [&'static str; 15] =
-        ["visits", "zero_copy", "nvme_to_landing", "nvme_to_pinned", "landing_to_stage", "pinned_to_stage", "vram_to_stage", "vram_to_pinned", "stage_to_vram", "n2v", "p2v", "n2p", "v2p", "v2n", "p2n"];
+    pub const NAMES: [&'static str; 16] =
+        ["visits", "zero_copy", "cpu_lane", "nvme_to_landing", "nvme_to_pinned", "landing_to_stage", "pinned_to_stage", "vram_to_stage", "vram_to_pinned", "stage_to_vram", "n2v", "p2v", "n2p", "v2p", "v2n", "p2n"];
 
-    pub fn fields(&self) -> [u64; 15] {
+    pub fn fields(&self) -> [u64; 16] {
         [
             self.visits,
             self.zero_copy,
+            self.cpu_lane,
             self.nvme_to_landing,
             self.nvme_to_pinned,
             self.landing_to_stage,
@@ -201,10 +281,11 @@ impl Moves {
         ]
     }
 
-    fn fields_mut(&mut self) -> [&mut u64; 15] {
+    fn fields_mut(&mut self) -> [&mut u64; 16] {
         [
             &mut self.visits,
             &mut self.zero_copy,
+            &mut self.cpu_lane,
             &mut self.nvme_to_landing,
             &mut self.nvme_to_pinned,
             &mut self.landing_to_stage,
@@ -370,7 +451,9 @@ pub fn serve(cache: &mut ExpertCache, l: usize, slots: &mut LayerSlots, ids: &[u
 /// left in the arenas are referenced by no table entry afterwards (the table of a call is built
 /// from the slot maps), so the next call of a layer reads its selection as a cold one.
 pub fn reset_cache(cache: &mut ExpertCache, slots: &mut [LayerSlots], sizes: TierSizes) -> Result<(), String> {
+    let stays = cache.pinned_stays();
     *cache = ExpertCache::new(cache.policy, cache.scope, cache.layers, cache.experts, cache.vram, cache.pinned)?;
+    cache.set_pinned_stays(stays);
     for s in slots.iter_mut() {
         *s = LayerSlots::new(cache.experts, sizes);
     }
@@ -448,6 +531,12 @@ pub struct ExpertTiers {
     pub nvme_bytes: u64,
     /// #187: the [`Moves`] of every MoE layer since construction (host counters)
     pub moves: Vec<Moves>,
+    /// #188: `CROW_GLM_PINNED` / `CROW_GLM_CPU_LANE` as read at construction
+    pub pinned_use: PinnedUse,
+    /// the pinned arenas are write-combined (`CROW_PINNED_ALLOC`)
+    pinned_wc: bool,
+    topk: usize,
+    lane_clock: std::sync::Arc<crate::glm5_moe::lane::Clock>,
 }
 
 struct GpuMover<'a> {
@@ -519,6 +608,9 @@ impl ExpertTiers {
             .ok_or_else(|| format!("{}=off: the glm5_next three-tier path reads every expert through the cache; ask for --vram-slots 0 --pinned-slots 0 for an all-NVMe run", expert_cache::ENV))?;
         let layers: Vec<u32> = (g.dense_prefix..g.layers).map(|l| l as u32).collect();
         let nl = layers.len();
+        let pu = pinned_use(std::env::var(PINNED_ENV).ok().as_deref(), std::env::var(CPU_LANE_ENV).ok().as_deref())?;
+        let pinned_wc = sizes.pinned > 0 && cuda::pin_alloc_mode() == cuda::PinAlloc::Wc;
+        lane_on_wc(pu, pinned_wc)?;
         let cache = ExpertCache::new(policy, Scope::PerLayer, nl, g.experts, sizes.vram, sizes.pinned)?;
         let records = ExpertRecord::glm5_table(cnq, &moe.record, &layers, g.experts as u32)?;
         let mut cfg = NvmeConfig::new(path);
@@ -535,7 +627,7 @@ impl ExpertTiers {
             }
             tables.push(cuda::alloc_named("glm5 expert record table", g.experts * 8));
         }
-        Ok(ExpertTiers {
+        let mut t = ExpertTiers {
             sizes,
             cache,
             first_moe: g.dense_prefix,
@@ -552,7 +644,23 @@ impl ExpertTiers {
             nvme_reads: 0,
             nvme_bytes: 0,
             moves: vec![Moves::default(); nl],
-        })
+            pinned_use: PinnedUse::default(),
+            pinned_wc,
+            topk: g.topk,
+            lane_clock: Default::default(),
+        };
+        t.set_pinned_use(pu)?;
+        Ok(t)
+    }
+
+    /// #188: how selected pinned experts are read from now on ([`PinnedUse`]; `new` sets it
+    /// from `CROW_GLM_PINNED` / `CROW_GLM_CPU_LANE`). The CPU lane is refused on a
+    /// write-combined pinned arena. Changes no slot and no record.
+    pub fn set_pinned_use(&mut self, u: PinnedUse) -> Result<(), String> {
+        lane_on_wc(u, self.pinned_wc)?;
+        self.cache.set_pinned_stays(u.stay);
+        self.pinned_use = u;
+        Ok(())
     }
 
     /// the pinned bytes this store holds
@@ -585,7 +693,7 @@ impl ExpertTiers {
             src: &self.src,
             recs: &self.records[l],
         };
-        let served = serve(&mut self.cache, l, &mut self.slots[l], &ids, self.stage_cap, &mut m)?;
+        let mut served = serve(&mut self.cache, l, &mut self.slots[l], &ids, self.stage_cap, &mut m)?;
         let mut table = vec![0u64; self.cache.experts];
         for &(e, loc) in &served.locs {
             table[e as usize] = match loc {
@@ -595,10 +703,27 @@ impl ExpertTiers {
             };
         }
         cuda::to_u64_into(self.tables[l], &table);
+        // #188: a decode call's pinned ids go to the CPU lane (`GpuMoePlan::experts` takes the
+        // post); their table entries stay valid pinned bases. Anything else clears the post.
+        let mut post = None;
+        if self.pinned_use.cpu_lane && sel.len() == self.topk && served.moves.zero_copy > 0 {
+            let host = self.pinned[l].host as *const u8;
+            let (combos, n) = lane_combos(sel, &served.locs, |e, _| table[e as usize], |q| host.add(q as usize * rb as usize));
+            served.moves.cpu_lane = n as u64;
+            served.moves.zero_copy -= n as u64;
+            post = Some(crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone() });
+        }
+        crate::glm5_moe::lane::post(post);
         self.nvme_reads += served.nvme_reads as u64;
         self.nvme_bytes += served.nvme_bytes;
         self.moves[l].add(&served.moves);
         Ok((self.tables[l], served))
+    }
+
+    /// #188: the CPU lane's clock (wall time of its pool runs, experts, runs) since construction,
+    /// shared: a report callback reads it while `generate` holds the tiers
+    pub fn cpu_lane_clock(&self) -> std::sync::Arc<crate::glm5_moe::lane::Clock> {
+        self.lane_clock.clone()
     }
 
     /// #187 (`glm5_run --cold`): empty the cache again, as after [`ExpertTiers::new`] (see
@@ -1180,6 +1305,111 @@ mod tests {
         assert!(e.contains("stages 9 records in one call, 8 staging slots"), "{e}");
     }
 
+    /// #188 `CROW_GLM_PINNED=zerocopy`: under every policy and capacity of the trace test, with
+    /// pinned hits staying in pinned:
+    /// - one id per call (no other access of the call can move it): no promotion pinned -> VRAM,
+    ///   no H2D of a pinned record, every id that sat in pinned is served from its slot;
+    /// - top-8 per call: an id the call's earlier misses push out of pinned before its own access
+    ///   is an NVMe access by the policy's rule (it may enter VRAM, staged from its old slot):
+    ///   every pinned -> VRAM transition is such a selected id, every pinned record staged is a
+    ///   selected id that left pinned, the moves still put every record where the table points
+    ///   (`check`), and at P >= top-k there are fewer pinned -> VRAM transitions over the trace
+    ///   than under `promote` (below that the in-call churn dominates either way).
+    ///
+    /// Under `promote` the one-id traces do promote pinned hits (so the test can fail), and
+    /// `reset_cache` keeps the option.
+    #[test]
+    fn zerocopy_pinned_hits_stay_and_are_read_in_place() {
+        let (layers, experts) = (3, 64);
+        let policies = [Policy::Lru, Policy::Clock { admit: None }, Policy::Clock { admit: Some(2) }, Policy::Lfu { decay: 0.7 }];
+        for k in [1usize, 8] {
+            let tr = trace(150, layers, experts as u64, k, 0x188);
+            for p in policies {
+                for (v, pin) in [(0, 0), (0, 8), (8, 0), (1, 7), (2, 3), (3, 12), (16, 40), (24, 40)] {
+                    let sizes = TierSizes { vram: v, pinned: pin };
+                    let mut promoted = 0u64;
+                    for stay in [false, true] {
+                        let mut c = ExpertCache::new(p, Scope::PerLayer, layers, experts, v, pin).unwrap();
+                        c.set_pinned_stays(stay);
+                        let mut slots: Vec<LayerSlots> = (0..layers).map(|_| LayerSlots::new(experts, sizes)).collect();
+                        let mut sims: Vec<Sim> = (0..layers).map(|_| Sim::new(sizes, k)).collect();
+                        let mut total = Moves::default();
+                        for tok in &tr {
+                            for (l, ids) in tok.iter().enumerate() {
+                                let what = format!("k {k} {p:?} V {v} P {pin} stay {stay} layer {l}");
+                                let was_pinned: Vec<u32> = ids.iter().copied().filter(|&e| c.tier(l, e) == Tier::Pinned).collect();
+                                let (nv, hits0) = (c.counters()[l][2], c.counters()[l][1]);
+                                let cold = ids.iter().filter(|&&e| c.tier(l, e) == Tier::Nvme).count();
+                                let s = serve(&mut c, l, &mut slots[l], ids, k, &mut sims[l]).unwrap_or_else(|e| panic!("{what}: {e}"));
+                                check(&c, l, &slots[l], &sims[l], &s, ids, cold, nv);
+                                assert_eq!(s.moves.zero_copy, s.locs.iter().filter(|x| matches!(x.1, Loc::Pinned(_))).count() as u64, "{what}: zero-copy");
+                                if stay {
+                                    let hits = c.counters()[l][1] - hits0;
+                                    let left: u64 = was_pinned.iter().filter(|&&e| c.tier(l, e) != Tier::Pinned).count() as u64;
+                                    let up: u64 = was_pinned.iter().filter(|&&e| c.tier(l, e) == Tier::Vram).count() as u64;
+                                    assert_eq!(s.moves.p2v, up, "{what}: an unselected pinned expert entered VRAM");
+                                    assert_eq!(s.moves.pinned_to_stage, left, "{what}: H2D of pinned records = selected pinned ids that left pinned");
+                                    if k == 1 {
+                                        assert_eq!((s.moves.p2v, s.moves.pinned_to_stage, hits), (0, 0, was_pinned.len() as u64), "{what}");
+                                        for &e in &was_pinned {
+                                            assert!(matches!(s.locs.iter().find(|x| x.0 == e).unwrap().1, Loc::Pinned(_)), "{what}: pinned hit {e} not read in place");
+                                        }
+                                    }
+                                }
+                                total.add(&s.moves);
+                            }
+                        }
+                        if stay {
+                            if v > 0 && pin >= k && promoted > 0 {
+                                assert!(total.p2v < promoted, "k {k} {p:?} V {v} P {pin}: {} pinned -> VRAM under zerocopy, {promoted} under promote", total.p2v);
+                            }
+                            reset_cache(&mut c, &mut slots, sizes).unwrap();
+                            assert!(c.pinned_stays(), "k {k} {p:?} V {v} P {pin}: reset_cache dropped the option");
+                        } else {
+                            promoted = total.p2v;
+                        }
+                    }
+                    if k == 1 && v > 0 && pin > 0 && p != (Policy::Clock { admit: Some(2) }) {
+                        assert!(promoted > 0, "{p:?} V {v} P {pin}: promote never promoted a pinned hit (the test would prove nothing)");
+                    }
+                }
+            }
+        }
+    }
+
+    /// #188: the two switches. Unset = today (promote, no lane); `zerocopy` = stay; the lane
+    /// implies stay; lane + an explicit `promote`, and any other value, refused by name; the
+    /// lane refused on a write-combined pinned arena.
+    #[test]
+    fn the_pinned_switches_parse_and_refuse_by_name() {
+        assert_eq!(pinned_use(None, None), Ok(PinnedUse::default()));
+        assert_eq!(pinned_use(Some("promote"), Some("0")), Ok(PinnedUse::default()));
+        assert_eq!(pinned_use(Some(""), Some("")), Ok(PinnedUse::default()));
+        assert_eq!(pinned_use(Some("zerocopy"), None), Ok(PinnedUse { stay: true, cpu_lane: false }));
+        assert_eq!(pinned_use(None, Some("1")), Ok(PinnedUse { stay: true, cpu_lane: true }));
+        assert_eq!(pinned_use(Some("zerocopy"), Some("1")), Ok(PinnedUse { stay: true, cpu_lane: true }));
+        let e = pinned_use(Some("promote"), Some("1")).unwrap_err();
+        assert!(e.starts_with("CROW_GLM_CPU_LANE=1 reads the selected pinned experts where they lie"), "{e}");
+        assert!(pinned_use(Some("zero-copy"), None).unwrap_err().starts_with("CROW_GLM_PINNED=\"zero-copy\""));
+        assert!(pinned_use(None, Some("yes")).unwrap_err().starts_with("CROW_GLM_CPU_LANE=\"yes\""));
+        assert!(lane_on_wc(PinnedUse { stay: true, cpu_lane: true }, true).unwrap_err().ends_with("set CROW_PINNED_ALLOC=host"));
+        assert_eq!(lane_on_wc(PinnedUse { stay: true, cpu_lane: false }, true), Ok(()));
+        assert_eq!(lane_on_wc(PinnedUse { stay: true, cpu_lane: true }, false), Ok(()));
+    }
+
+    /// #188: the lane's combos follow the pick order of the selection; a pinned location goes to
+    /// the CPU with its host record, every other to the GPU with its table entry.
+    #[test]
+    fn lane_combos_follow_the_pick_order() {
+        use crate::glm5_moe::lane::Combo;
+        let sel = [7, 3, 250, 0];
+        let locs = [(0u32, Loc::Vram(2)), (3, Loc::Pinned(5)), (7, Loc::Stage(1)), (250, Loc::Pinned(0))];
+        let host = 0x1000 as *const u8;
+        let (c, n) = lane_combos(&sel, &locs, |e, _| 100 + e as u64, |q| host.wrapping_add(q as usize * 10));
+        assert_eq!(n, 2);
+        assert_eq!(c, vec![Combo::Gpu(107), Combo::Cpu(host.wrapping_add(50)), Combo::Cpu(host), Combo::Gpu(100)]);
+    }
+
     /// A synthetic glm5_next container (index v2, `glm5_next_text`): `experts` MUL1 records of
     /// 9,474,048 B for layer 3, each on a 4096-B file offset, random bytes. Removed on drop.
     struct SynthGlm {
@@ -1297,6 +1527,88 @@ mod tests {
                 }
                 t.free();
             }
+        }
+        drop(cnq);
+    }
+
+    /// #188 on the synthetic container (as `glm5_tiers_gpu_every_table_entry_holds_its_record`,
+    /// with `CROW_PINNED_ALLOC=host` for this test so the CPU lane may read the arena): under
+    /// `promote`, `zerocopy` and the CPU lane, at four capacities, every selected id's table
+    /// entry holds its record; `zerocopy` serves at least as many visits zero-copy as `promote`
+    /// and promotes fewer pinned hits; the lane posts the call's combos in pick order, every CPU
+    /// combo a host pointer to the record's bytes, every GPU combo the id's table entry, and
+    /// counts them as `cpu_lane` (zero-copy 0); `promote` and `zerocopy` post nothing.
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_tiers_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_tiers_gpu_zerocopy_and_cpu_lane_tables_hold_their_records() {
+        use crate::glm5_moe::lane::{self, Combo};
+        let s = synth_glm(16);
+        let mut g = Glm5Geo::GLM_5_3_FLASH;
+        (g.layers, g.dense_prefix, g.experts, g.topk) = (4, 3, 16, 8);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let rb = spec.bytes as usize;
+        let want: Vec<Vec<u8>> = (0..16).map(|e| cnq.read_range(&cnq.find(&crate::nvme_source::glm5_expert_tensor_name(3, e, "gate"), "text").clone(), 0, rb)).collect();
+        let tr = trace(24, 1, 16, 8, 0x188);
+        let old = std::env::var("CROW_PINNED_ALLOC").ok();
+        std::env::set_var("CROW_PINNED_ALLOC", "host");
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            for (v, p) in [(1, 7), (3, 4), (4, 12), (0, 16)] {
+                let sizes = TierSizes { vram: v, pinned: p };
+                let mut tot = Vec::new();
+                for (name, pu) in [("promote", PinnedUse::default()), ("zerocopy", PinnedUse { stay: true, cpu_lane: false }), ("lane", PinnedUse { stay: true, cpu_lane: true })] {
+                    let mut t = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, 8).unwrap();
+                    t.set_pinned_use(pu).unwrap();
+                    for tok in &tr {
+                        let sel: Vec<i32> = tok[0].iter().rev().map(|&e| e as i32).collect();
+                        let (tb, served) = t.table_for(3, &sel).unwrap();
+                        let what = format!("{name} V {v} P {p}");
+                        let pinned_locs = served.locs.iter().filter(|x| matches!(x.1, Loc::Pinned(_))).count() as u64;
+                        let posted = lane::take(tb, 1, 8);
+                        cuda::sync();
+                        let table = cuda::dtoh_u64(tb, 16);
+                        for &e in &tok[0] {
+                            let got: Vec<u8> = cuda::dtoh_t(table[e as usize], rb);
+                            assert!(got == want[e as usize], "{what}: expert {e}: the table entry's bytes differ from read_range");
+                        }
+                        if pu.cpu_lane {
+                            assert_eq!((served.moves.cpu_lane, served.moves.zero_copy), (pinned_locs, 0), "{what}: lane counters");
+                            match posted {
+                                None => assert_eq!(pinned_locs, 0, "{what}: pinned ids but no lane post"),
+                                Some(call) => {
+                                    assert_eq!(call.combos.len(), 8);
+                                    for (c, combo) in call.combos.iter().enumerate() {
+                                        let e = sel[c] as usize;
+                                        match *combo {
+                                            Combo::Cpu(ptr) => assert!(std::slice::from_raw_parts(ptr, rb) == &want[e][..], "{what}: CPU combo {c} (expert {e}) reads other bytes"),
+                                            Combo::Gpu(base) => assert_eq!(base, table[e], "{what}: GPU combo {c} (expert {e})"),
+                                        }
+                                    }
+                                    assert_eq!(call.combos.iter().filter(|x| matches!(x, Combo::Cpu(_))).count() as u64, pinned_locs, "{what}: CPU combos");
+                                }
+                            }
+                        } else {
+                            assert!(posted.is_none(), "{what}: a post without the lane");
+                            assert_eq!((served.moves.cpu_lane, served.moves.zero_copy), (0, pinned_locs), "{what}: counters");
+                        }
+                    }
+                    let m = t.moves[0];
+                    eprintln!("glm5_tiers #188 {name} V {v} P {p}: zero-copy {} cpu_lane {} p2v {} pinned_to_stage {} vram_to_pinned {} NVMe reads {}", m.zero_copy, m.cpu_lane, m.p2v, m.pinned_to_stage, m.vram_to_pinned, m.nvme_reads());
+                    tot.push(m);
+                    t.free();
+                }
+                let (pr, zc, ln) = (tot[0], tot[1], tot[2]);
+                assert_eq!((zc.zero_copy, zc.p2v, zc.pinned_to_stage), (ln.cpu_lane, ln.p2v, ln.pinned_to_stage), "V {v} P {p}: the lane moves as zerocopy");
+                if v > 0 && p >= 8 {
+                    assert!(zc.zero_copy >= pr.zero_copy && zc.p2v < pr.p2v, "V {v} P {p}: zerocopy {zc:?} vs promote {pr:?}");
+                }
+            }
+        }
+        match old {
+            Some(o) => std::env::set_var("CROW_PINNED_ALLOC", o),
+            None => std::env::remove_var("CROW_PINNED_ALLOC"),
         }
         drop(cnq);
     }

@@ -93,6 +93,8 @@ fn prompt_of_len(base: &[i64], n: usize) -> Result<Vec<i64>, String> {
 struct Row {
     r: TokenReport,
     at: f64,
+    /// #188: seconds the CPU lane's pool runs took in this row (`ExpertTiers::cpu_lane_clock`)
+    lane_s: f64,
 }
 
 fn median(v: &[f64]) -> Option<f64> {
@@ -139,6 +141,8 @@ struct Phase {
     moves: Vec<Moves>,
     nvme_reads: u64,
     nvme_bytes: u64,
+    /// #188: CPU lane pool-run seconds summed over the rows
+    lane_s: f64,
 }
 
 impl Phase {
@@ -148,6 +152,7 @@ impl Phase {
             p.lat.push(row.r.secs);
             p.nvme_reads += row.r.nvme_reads;
             p.nvme_bytes += row.r.nvme_bytes;
+            p.lane_s += row.lane_s;
             for (a, b) in p.tiers.iter_mut().zip(&row.r.tiers) {
                 for i in 0..3 {
                     a[i] += b[i];
@@ -217,6 +222,8 @@ fn counters_json(p: &Phase, rb: u64) -> Value {
         "d2d_gb_per_token": gb(m.vram_to_stage + m.stage_to_vram),
         "promotions_per_token": m.promotions() as f64 / t,
         "evictions_per_token": m.evictions() as f64 / t,
+        "cpu_lane_per_token": m.cpu_lane as f64 / t,
+        "cpu_lane_s_per_token": p.lane_s / t,
         "moves": moves_json(&m),
         "prefetch": { "mode": "none", "issued": 0, "used": 0, "wasted": 0, "demand_misses_uncovered": p.nvme_reads,
                       "demand_misses_uncovered_per_token": p.nvme_reads as f64 / t },
@@ -263,7 +270,7 @@ fn counters_line(p: &Phase, rb: u64) -> String {
     let f = |k: &str| c[k].as_f64().unwrap_or(0.0);
     let h = |k: &str| 100.0 * c["hit_rate"][k].as_f64().unwrap_or(0.0);
     format!(
-        "visits {:.1}, hits vram {:.1} % pinned {:.1} % nvme {:.1} %, r {:.2} NVMe reads ({:.3} GB), m {:.4}, H2D {:.3} GB, zero-copy {:.3} GB, host DRAM->GPU {:.3} GB, D2H {:.3} GB, promotions {:.2}, evictions {:.2}, prefetch none (issued 0, used 0, wasted 0, demand misses uncovered {:.2})",
+        "visits {:.1}, hits vram {:.1} % pinned {:.1} % nvme {:.1} %, r {:.2} NVMe reads ({:.3} GB), m {:.4}, H2D {:.3} GB, zero-copy {:.3} GB, host DRAM->GPU {:.3} GB, D2H {:.3} GB, promotions {:.2}, evictions {:.2}, prefetch none (issued 0, used 0, wasted 0, demand misses uncovered {:.2}), CPU lane {:.2} experts {:.4} s",
         f("visits_per_token"),
         h("vram"),
         h("pinned"),
@@ -277,7 +284,9 @@ fn counters_line(p: &Phase, rb: u64) -> String {
         f("d2h_gb_per_token"),
         f("promotions_per_token"),
         f("evictions_per_token"),
-        c["prefetch"]["demand_misses_uncovered_per_token"].as_f64().unwrap_or(0.0)
+        c["prefetch"]["demand_misses_uncovered_per_token"].as_f64().unwrap_or(0.0),
+        f("cpu_lane_per_token"),
+        f("cpu_lane_s_per_token")
     )
 }
 
@@ -507,12 +516,13 @@ fn run(args: &[String]) -> Result<(), String> {
         let mut tiers = ExpertTiers::new(&o.cnq, &o.path, &o.g, &o.moe, sizes, readers, o.g.topk)?;
         let tiers_s = t_tiers.elapsed().as_secs_f64();
         println!(
-            "[glm5_run] tiers: {:.2} GiB VRAM (slots, {} staging, tables), {:.2} GiB pinned; free VRAM now {:.2} GiB; policy {:?}, cache empty at start",
+            "[glm5_run] tiers: {:.2} GiB VRAM (slots, {} staging, tables), {:.2} GiB pinned; free VRAM now {:.2} GiB; policy {:?}, cache empty at start; pinned {:?}",
             gib(tiers.vram_bytes()),
             tiers.stage_cap,
             gib(tiers.pinned_bytes()),
             gib(cuda::free_vram_bytes()),
-            tiers.cache.policy
+            tiers.cache.policy,
+            tiers.pinned_use
         );
         println!("glm5_run setup: open {open_s:.2} s, load {load_s:.2} s (dense part + head), tiers {tiers_s:.2} s; commit {commit}");
         let m_setup = machine(&tiers);
@@ -527,12 +537,13 @@ fn run(args: &[String]) -> Result<(), String> {
             "generate": n, "reps": reps, "cold": cold, "context": context,
             "tiers": { "plan": { "vram": plan.hot, "pinned": plan.pinned, "nvme": plan.nvme }, "vram_slots": sizes.vram, "pinned_slots": sizes.pinned,
                        "nvme": o.g.experts - sizes.vram - sizes.pinned, "moe_layers": moe_layers, "first_moe_layer": first_moe, "readers": readers,
-                       "policy": format!("{:?}", tiers.cache.policy), "staging_slots": tiers.stage_cap, "pinned_budget_bytes": budget, "free_vram_at_plan_bytes": free },
+                       "policy": format!("{:?}", tiers.cache.policy), "pinned_use": format!("{:?}", tiers.pinned_use), "staging_slots": tiers.stage_cap, "pinned_budget_bytes": budget, "free_vram_at_plan_bytes": free },
             "setup": { "open_s": open_s, "load_s": load_s, "tiers_s": tiers_s },
             "machine_after_setup": m_setup,
             "clocks": "row seconds: TokenReport::secs, row start to after the row's closing cuda::sync + greedy-id dtoh; ttft and phase wall: on entry of the report callback, after that sync; no sync added",
             "reps_detail": [],
         });
+        let lane = tiers.cpu_lane_clock();
         let mut per_rep: Vec<(Phase, Phase, f64, f64)> = Vec::new();
         let mut all_ids: Vec<Vec<i64>> = Vec::new();
         for rep in 1..=reps {
@@ -541,9 +552,13 @@ fn run(args: &[String]) -> Result<(), String> {
                 tiers.reset_cache()?;
             }
             let mut rows: Vec<Row> = Vec::with_capacity(cap);
+            let mut lane_ns = lane.read().0;
             let t0 = std::time::Instant::now();
             let mut report = |r: &TokenReport| {
                 let at = t0.elapsed().as_secs_f64();
+                let ns = lane.read().0;
+                let lane_s = (ns - lane_ns) as f64 / 1e9;
+                lane_ns = ns;
                 let per: Vec<String> = r.tiers.iter().enumerate().map(|(i, c)| format!("l{} {}/{}/{}", first_moe + i, c[0], c[1], c[2])).collect();
                 let sum = r.tiers.iter().fold([0u64; 3], |a, c| [a[0] + c[0], a[1] + c[1], a[2] + c[2]]);
                 let id = r.next.map_or("-".to_string(), |v| v.to_string());
@@ -559,7 +574,7 @@ fn run(args: &[String]) -> Result<(), String> {
                     sum[2],
                     per.join(" ")
                 );
-                rows.push(Row { r: r.clone(), at });
+                rows.push(Row { r: r.clone(), at, lane_s });
             };
             let out = run.generate(&mut o.cnq, &mut tiers, &prompt, n, false, &mut report)?;
             let wall = t0.elapsed().as_secs_f64();
@@ -707,6 +722,7 @@ mod tests {
                         moves: vec![moves(nv); 2],
                     },
                     at,
+                    lane_s: 0.0,
                 }
             })
             .collect()

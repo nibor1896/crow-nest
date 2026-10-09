@@ -1,7 +1,8 @@
 //! crow-nest #180: the CPU MUL1 trellis expert GEMV and FFN (plan step 10, CPU half; the GPU half
 //! is `kernels::mul1` / `kernels_mul1.cu`). A routed GLM-5.3-Flash expert stored as a CNQ MUL1
 //! record (#181, `converter/src/mul1.rs`) is computed where it lies, without a dequant pass.
-//! Its one caller so far is `glm5_moe` (#164); the CPU-lane wiring is plan step 19.
+//! Its callers are `glm5_moe` (#164) and, behind `CROW_GLM_CPU_LANE=1`, the #188 CPU lane
+//! ([`experts_ffn`]: every CPU expert of a MoE layer in one pool run).
 //!
 //! # Format (the #181 record, bit for bit)
 //!
@@ -1176,10 +1177,14 @@ fn prep_block(x: &[f32], m: &Mul1Matrix, b: usize, tokens: usize, xp: Out) {
     }
 }
 
+/// the FFN's activation `h = act(gate, up)`: [`silu_mul`] in [`expert_ffn`]; the GLM routed
+/// experts' clamped SwiGLU (`glm5_moe::swiglu_clamp`) in the #188 CPU lane
+pub type Act = dyn Fn(f32, f32) -> f32 + Sync;
+
 /// FFN block `b` of the intermediate dimension, for every token: `had_out` of gate and up,
-/// `silu_mul`, `had_in` of down and the lane permutation into `xd`, element for element the
+/// `act` (`silu_mul` in `expert_ffn`), `had_in` of down and the lane permutation into `xd`, element for element the
 /// operations of the whole-vector functions (each is local to its 128-block).
-fn act_block(e: &Mul1Expert, b: usize, tokens: usize, rg: Out, ru: Out, xd: Out) {
+fn act_block(e: &Mul1Expert, b: usize, tokens: usize, rg: Out, ru: Out, xd: Out, act: &Act) {
     let i = e.inter;
     let (mut g, mut u) = ([0f32; HAD], [0f32; HAD]);
     for t in 0..tokens {
@@ -1195,7 +1200,7 @@ fn act_block(e: &Mul1Expert, b: usize, tokens: usize, rg: Out, ru: Out, xd: Out)
         }
         let mut h = [0f32; HAD];
         for (r, d) in h.iter_mut().enumerate() {
-            *d = silu_mul(g[r], u[r]) * Mul1Matrix::scale(e.down.suh, b * HAD + r);
+            *d = act(g[r], u[r]) * Mul1Matrix::scale(e.down.suh, b * HAD + r);
         }
         fwht128(&mut h);
         permute_block(&h, i, b, t, xd);
@@ -1336,60 +1341,101 @@ pub(crate) fn expert_ffn_with(im: Impl, e: &Mul1Expert, x: &[f32], y: &mut [f32]
     if im.reference() {
         return reference::expert_ffn(im, e, x, y, threads, path);
     }
-    let (h, i) = (e.hidden, e.inter);
+    experts_ffn_with(im, std::slice::from_ref(e), x, y, &silu_mul, threads, path)
+}
+
+/// #188 CPU lane: the expert FFN of every expert in `es` on the same rows `x` `[T][hidden]`, in
+/// ONE pool run; `ys` `[n][T][hidden]`, expert `j`'s rows at `j T hidden`. The three phases of
+/// [`expert_ffn`] run over the experts side by side (input transforms of every expert, then the
+/// gate / up columns of every expert, then, once every expert's activation is complete, the down
+/// columns of every expert). A column, a block and its finisher do the operations of
+/// `expert_ffn` with `act` in place of `silu_mul`, so with `act = silu_mul` every output is bit
+/// for bit `expert_ffn` of that expert alone, and with any `act` bit for bit
+/// `gemv(down, act(gemv(gate, x), gemv(up, x)))`. Every expert has the shape and bitrate of the
+/// first.
+pub fn experts_ffn(es: &[Mul1Expert], x: &[f32], ys: &mut [f32], act: &Act, threads: usize, path: Path) {
+    experts_ffn_with(Impl::NEW, es, x, ys, act, threads, path)
+}
+
+fn experts_ffn_with(im: Impl, es: &[Mul1Expert], x: &[f32], ys: &mut [f32], act: &Act, threads: usize, path: Path) {
+    let n = es.len();
+    if n == 0 {
+        return;
+    }
+    let e0 = &es[0];
+    let (h, i) = (e0.hidden, e0.inter);
+    for e in es {
+        assert!(
+            e.hidden == h && e.inter == i && e.gate.bitrate == e0.gate.bitrate && e.up.bitrate == e0.up.bitrate && e.down.bitrate == e0.down.bitrate,
+            "cpu_mul1::experts_ffn: the experts differ in shape or bitrate"
+        );
+    }
     assert!(x.len() % h == 0, "cpu_mul1::expert_ffn: x is not [T][{h}]");
     let tokens = x.len() / h;
-    assert_eq!(y.len(), tokens * h, "cpu_mul1::expert_ffn: y is not [T][{h}]");
-    let (kern, tab, tab_d) = (im.kern(path), tables(e.gate.bitrate), tables(e.down.bitrate));
-    // scratch: xp_g, xp_u [T][h/16][32], raw_g, raw_u [T][i], xp_d [T][i/16][32], raw_d [T][h]
+    assert_eq!(ys.len(), n * tokens * h, "cpu_mul1::expert_ffn: y is not [{n}][T][{h}]");
+    let (kern, tab, tab_d) = (im.kern(path), tables(e0.gate.bitrate), tables(e0.down.bitrate));
+    // scratch per expert: xp_g, xp_u [T][h/16][32], raw_g, raw_u [T][i], xp_d [T][i/16][32],
+    // raw_d [T][h]; expert j's regions at j x the per-expert length of each
     let (nxh, nxi) = (tokens * (h / 16) * 32, tokens * (i / 16) * 32);
-    with_scratch(2 * nxh + 2 * tokens * i + nxi + tokens * h, |s| {
+    let (ni, nh) = (tokens * i, tokens * h);
+    with_scratch(n * (2 * nxh + 2 * ni + nxi + nh), |s| {
         let o = |v: &mut [f32]| Out(v.as_mut_ptr(), v.len());
-        let (xp_g, s) = s.split_at_mut(nxh);
-        let (xp_u, s) = s.split_at_mut(nxh);
-        let (raw_g, s) = s.split_at_mut(tokens * i);
-        let (raw_u, s) = s.split_at_mut(tokens * i);
-        let (xp_d, raw_d) = s.split_at_mut(nxi);
-        let (oxg, oxu, og, ou, oxd, od, yo) = (o(xp_g), o(xp_u), o(raw_g), o(raw_u), o(xp_d), o(raw_d), o(y));
-        let (ug, ud) = (units_of(&e.gate), units_of(&e.down));
-        let k = threads.clamp(1, (2 * ug).min(ud));
-        // the gate/up phase in block order: block b's 8 gate tiles, then its 8 up tiles
-        let (plan1, plan2) = (chunks(2 * (i / 16), k), chunks(h / 16, k));
-        let (blk1, blk2) = (Blocks::new(i / HAD, 2 * BLOCK_TILES), Blocks::new(h / HAD, BLOCK_TILES));
-        let (prep, acts) = (Phase::new(2 * (h / HAD)), AtomicUsize::new(0));
+        let (xp_g, s) = s.split_at_mut(n * nxh);
+        let (xp_u, s) = s.split_at_mut(n * nxh);
+        let (raw_g, s) = s.split_at_mut(n * ni);
+        let (raw_u, s) = s.split_at_mut(n * ni);
+        let (xp_d, raw_d) = s.split_at_mut(n * nxi);
+        // the sub-buffer of expert j inside one of the regions above
+        let sub = |v: Out, len: usize, j: usize| Out(unsafe { v.0.add(j * len) }, len);
+        let (oxg, oxu, og, ou, oxd, od, yo) = (o(xp_g), o(xp_u), o(raw_g), o(raw_u), o(xp_d), o(raw_d), o(ys));
+        let (ug, ud) = (units_of(&e0.gate), units_of(&e0.down));
+        let k = threads.clamp(1, n * (2 * ug).min(ud));
+        // the gate/up phase in block order: block b's 8 gate tiles, then its 8 up tiles; expert
+        // j's columns follow expert j - 1's (a multiple of 16 tiles: no chunk crosses experts)
+        let (c1, c2) = (2 * (i / 16), h / 16);
+        let (plan1, plan2) = (chunks(n * c1, k), chunks(n * c2, k));
+        let (blk1, blk2) = (Blocks::new(n * (i / HAD), 2 * BLOCK_TILES), Blocks::new(n * (h / HAD), BLOCK_TILES));
+        let (prep, acts) = (Phase::new(n * 2 * (h / HAD)), AtomicUsize::new(0));
         let (cols1, cols2) = (AtomicUsize::new(0), AtomicUsize::new(0));
         pool::run(k, &|_| {
-            prep.work(|j| {
-                if j < h / HAD {
-                    prep_block(x, &e.gate, j, tokens, oxg);
+            prep.work(|jj| {
+                let (j, b) = (jj / (2 * (h / HAD)), jj % (2 * (h / HAD)));
+                if b < h / HAD {
+                    prep_block(x, &es[j].gate, b, tokens, sub(oxg, nxh, j));
                 } else {
-                    prep_block(x, &e.up, j - h / HAD, tokens, oxu);
+                    prep_block(x, &es[j].up, b - h / HAD, tokens, sub(oxu, nxh, j));
                 }
             });
             prep.wait();
-            // SAFETY: every write to xp_g / xp_u is complete (`prep.wait`); read only from here on
-            let (xg, xu) = unsafe { (std::slice::from_raw_parts(oxg.0 as *const f32, oxg.1), std::slice::from_raw_parts(oxu.0 as *const f32, oxu.1)) };
-            while let Some((p0, ntc)) = take(&cols1, &plan1) {
+            while let Some((q0, ntc)) = take(&cols1, &plan1) {
+                let (j, p0) = (q0 / c1, q0 % c1);
+                // SAFETY: every write to xp_g / xp_u is complete (`prep.wait`); read only from here on
+                let (xg, xu) = unsafe {
+                    (std::slice::from_raw_parts(oxg.0.add(j * nxh) as *const f32, nxh), std::slice::from_raw_parts(oxu.0.add(j * nxh) as *const f32, nxh))
+                };
                 let (b, r) = (p0 / (2 * BLOCK_TILES), p0 % (2 * BLOCK_TILES));
+                let (gj, uj) = (sub(og, ni, j), sub(ou, ni, j));
                 if r < BLOCK_TILES {
-                    unit_new(kern, &e.gate, tab, xg, tokens, b * BLOCK_TILES + r, ntc, og);
+                    unit_new(kern, &es[j].gate, tab, xg, tokens, b * BLOCK_TILES + r, ntc, gj);
                 } else {
-                    unit_new(kern, &e.up, tab, xu, tokens, b * BLOCK_TILES + r - BLOCK_TILES, ntc, ou);
+                    unit_new(kern, &es[j].up, tab, xu, tokens, b * BLOCK_TILES + r - BLOCK_TILES, ntc, uj);
                 }
-                if blk1.complete(b, ntc) {
-                    act_block(e, b, tokens, og, ou, oxd);
+                if blk1.complete(j * (i / HAD) + b, ntc) {
+                    act_block(&es[j], b, tokens, gj, uj, sub(oxd, nxi, j), act);
                     acts.fetch_add(1, Ordering::Release);
                 }
             }
             // down needs every block of its input: wait for the work, not for the workers
-            wait_for(&acts, i / HAD);
-            // SAFETY: every block of xp_d is complete (acquire above); read only from here on
-            let xd = unsafe { std::slice::from_raw_parts(oxd.0 as *const f32, oxd.1) };
-            while let Some((nb0, ntc)) = take(&cols2, &plan2) {
-                unit_new(kern, &e.down, tab_d, xd, tokens, nb0, ntc, od);
+            wait_for(&acts, n * (i / HAD));
+            while let Some((q0, ntc)) = take(&cols2, &plan2) {
+                let (j, nb0) = (q0 / c2, q0 % c2);
+                // SAFETY: every block of xp_d is complete (acquire above); read only from here on
+                let xd = unsafe { std::slice::from_raw_parts(oxd.0.add(j * nxi) as *const f32, nxi) };
+                let dj = sub(od, nh, j);
+                unit_new(kern, &es[j].down, tab_d, xd, tokens, nb0, ntc, dj);
                 let b = nb0 / BLOCK_TILES;
-                if blk2.complete(b, ntc) {
-                    had_out_block(od, &e.down, b, tokens, yo);
+                if blk2.complete(j * (h / HAD) + b, ntc) {
+                    had_out_block(dj, &es[j].down, b, tokens, sub(yo, nh, j));
                 }
             }
         });
@@ -2523,6 +2569,69 @@ mod tests {
             expert_ffn_with(Impl::NEW_NO_FMA, &e, &x, &mut y, 8, Path::Avx2);
             assert_eq!(bits(&y), bits(&want), "GLM FFN T {t} without FMA");
         }
+    }
+
+    /// #188 CPU lane: `experts_ffn` (all experts of a call in one pool run) gives every expert
+    /// the bits of `expert_ffn` on that expert alone: 1, 2, 3, 5 and 8 GLM experts (K = 3, T 1
+    /// and 2) and 3 small K = 2.5 experts (T 1, 3), threads 1, 2, 8, 16, 24, the outputs NaN
+    /// before the call; with the clamped SwiGLU as `act` (8 threads), the bits of the staged
+    /// `gemv(down, act(gemv(gate, x), gemv(up, x)))`.
+    #[test]
+    fn cpu_mul1_experts_ffn_is_expert_ffn_per_expert_bits() {
+        let mut rng = Rng(0x188);
+        let mk = |j: usize, k: f64, hidden: usize, inter: usize| Case {
+            name: format!("lane e{j}"),
+            source: format!("synth:{}", 0x1880 + 9 * j),
+            bitrate: Bitrate::from_k(k).unwrap(),
+            hidden,
+            inter,
+            want: [String::new(), String::new(), String::new()],
+        };
+        let glm: Vec<Vec<u8>> = (0..8).map(|j| record(&mk(j, 3.0, GLM_HIDDEN, GLM_INTER))).collect();
+        let small: Vec<Vec<u8>> = (0..3).map(|j| record(&mk(10 + j, 2.5, 512, 256))).collect();
+        let check = |recs: &[Vec<u8>], c: &Case, n: usize, tokens: &[usize], rng: &mut Rng| {
+            let es: Vec<Mul1Expert> = recs[..n].iter().map(|r| Mul1Expert::from_record(r, c.hidden, c.inter, c.bitrate).unwrap()).collect();
+            for &t in tokens {
+                let x = xs(t * c.hidden, rng);
+                let want: Vec<Vec<f32>> = es
+                    .iter()
+                    .map(|e| {
+                        let mut y = vec![0f32; x.len()];
+                        expert_ffn(e, &x, &mut y, 8, Path::Auto);
+                        y
+                    })
+                    .collect();
+                for th in [1usize, 2, 8, 16, 24] {
+                    let mut ys = vec![f32::NAN; n * x.len()];
+                    experts_ffn(&es, &x, &mut ys, &silu_mul, th, Path::Auto);
+                    for (j, w) in want.iter().enumerate() {
+                        assert_eq!(bits(&ys[j * x.len()..(j + 1) * x.len()]), bits(w), "{n} experts [{}, {}] T {t} threads {th}: expert {j}", c.hidden, c.inter);
+                    }
+                }
+                // another activation (GLM's clamped SwiGLU, limit 10): the staged chain's bits
+                let clamp = |g: f32, u: f32| {
+                    let g = if g > 10.0 { 10.0 } else { g };
+                    let u = if u > 10.0 { 10.0 } else if u < -10.0 { -10.0 } else { u };
+                    (g / (1.0 + (-g).exp())) * u
+                };
+                let mut ys = vec![f32::NAN; n * x.len()];
+                experts_ffn(&es, &x, &mut ys, &clamp, 8, Path::Auto);
+                for (j, e) in es.iter().enumerate() {
+                    let (mut g, mut u) = (vec![0f32; t * c.inter], vec![0f32; t * c.inter]);
+                    gemv(&e.gate, &x, &mut g, 8, Path::Auto);
+                    gemv(&e.up, &x, &mut u, 8, Path::Auto);
+                    let hv: Vec<f32> = g.iter().zip(&u).map(|(&g, &u)| clamp(g, u)).collect();
+                    let mut w = vec![0f32; x.len()];
+                    gemv(&e.down, &hv, &mut w, 8, Path::Auto);
+                    assert_eq!(bits(&ys[j * x.len()..(j + 1) * x.len()]), bits(&w), "{n} experts [{}, {}] T {t} clamped act: expert {j}", c.hidden, c.inter);
+                }
+            }
+        };
+        let cg = mk(0, 3.0, GLM_HIDDEN, GLM_INTER);
+        for n in [1usize, 2, 3, 5, 8] {
+            check(&glm, &cg, n, &[1, 2], &mut rng);
+        }
+        check(&small, &mk(10, 2.5, 512, 256), 3, &[1, 3], &mut rng);
     }
 
     /// #183 C1: the bit-built `f16_to_f32` is the former formula for all 65,536 inputs, and the
