@@ -52,6 +52,13 @@ pub type Dev = sys::CUdeviceptr;
 
 pub const ENV: &str = "CROW_GLM_GRAPH";
 
+/// captured rows kept per run (LRU by key): one per `score_grid` value seen (a new value every
+/// 128 positions) and table set. A miss recaptures, past `KEYS` the least recently used goes.
+/// Cost (2026-10-09, RTX 5090, `glm5_graph_gpu_seen_keys_replay_without_recapture`): 4 kept rows
+/// of 266 kernel nodes dropped free VRAM by 4,194,304 B against 0 B with one kept row (the
+/// driver's 2 MiB granularity); a GLM-5.3-Flash row has about 6x the nodes. Host memory: not measured.
+pub const KEYS: usize = 8;
+
 /// `1` turns the switch on; unset or any other value leaves it off (the repo's `CROW_*` rule)
 pub fn parse(v: Option<&str>) -> bool {
     v == Some("1")
@@ -279,7 +286,9 @@ pub struct RowGraphs {
     pub stream: CUstream,
     /// `[pos, 1]` i32 for `MlaScratch::st`
     pos: cuda::Pinned,
-    pub row: Option<(Key, Captured)>,
+    /// the captured rows, most recently used first, at most [`KEYS`]: a key seen before (a new
+    /// sequence back at row 0, a later 128-position step) replays instead of recapturing
+    pub rows: Vec<(Key, Captured)>,
     pub head: Option<Captured>,
     /// row captures, row replays, head captures since construction
     pub captures: u64,
@@ -292,7 +301,7 @@ impl RowGraphs {
     /// A CUDA context is current.
     pub unsafe fn new() -> RowGraphs {
         let pos = cuda::Pinned::alloc(4096);
-        RowGraphs { stream: cuda::stream_create_non_blocking(), pos, row: None, head: None, captures: 0, replays: 0, head_captures: 0 }
+        RowGraphs { stream: cuda::stream_create_non_blocking(), pos, rows: Vec::new(), head: None, captures: 0, replays: 0, head_captures: 0 }
     }
 
     /// Queue `[pos, 1]` into the MLA scalars `st` (async from pinned memory on the legacy stream).
@@ -309,21 +318,31 @@ impl RowGraphs {
         cuda::upload_from_pinned(st, self.pos.host, 8);
     }
 
-    /// the row's graphs, if they were captured for `key`
-    pub fn ready(&self, key: &Key) -> Option<&Captured> {
-        self.row.as_ref().filter(|(k, _)| k == key).map(|(_, c)| c)
+    /// a row captured for `key` moves to the front (the one [`RowGraphs::current`] replays); false
+    /// on a miss
+    pub fn promote(&mut self, key: &Key) -> bool {
+        let Some(i) = self.rows.iter().position(|(k, _)| k == key) else { return false };
+        let hit = self.rows.remove(i);
+        self.rows.insert(0, hit);
+        true
     }
 
-    /// keep `c` as the row's graphs for `key` (the previous ones are destroyed, freed by the
-    /// driver after their last launch)
+    /// the most recently used captured row
+    pub fn current(&self) -> Option<&Captured> {
+        self.rows.first().map(|(_, c)| c)
+    }
+
+    /// keep `c` as the row's graphs for `key`, in front; past [`KEYS`] the least recently used
+    /// is destroyed (freed by the driver after its last launch)
     ///
     /// # Safety
     /// A CUDA context is current.
     pub unsafe fn keep(&mut self, key: Key, c: Captured) {
-        if let Some((_, mut old)) = self.row.take() {
+        self.rows.insert(0, (key, c));
+        while self.rows.len() > KEYS {
+            let (_, mut old) = self.rows.pop().expect("glm5_graph: non-empty");
             old.destroy();
         }
-        self.row = Some((key, c));
         self.captures += 1;
     }
 
@@ -331,7 +350,7 @@ impl RowGraphs {
     /// No launch of these graphs is pending.
     pub unsafe fn free(&mut self) {
         cuda::sync();
-        if let Some((_, mut c)) = self.row.take() {
+        for (_, mut c) in self.rows.drain(..) {
             c.destroy();
         }
         if let Some(mut c) = self.head.take() {
@@ -440,7 +459,7 @@ mod tests {
                 let gen = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |r| reps.push(r.clone())).unwrap();
                 let name = format!("{ENV} {}, {}", if graph { "on" } else { "off" }, sw.label());
                 if let Some(gr) = run.graphs() {
-                    let (_, c) = gr.row.as_ref().unwrap();
+                    let c = gr.current().unwrap();
                     eprintln!(
                         "glm5 graph {name}: ids {:?}; row captures {} replays {}; {} segments, {} seams, {} kernel nodes per row; head {} kernel nodes",
                         gen.ids, gr.captures, gr.replays, c.segs.len(), c.seams.len(), c.kernels(), gr.head.as_ref().unwrap().kernels()
@@ -496,6 +515,63 @@ mod tests {
         assert!(diff.iter().all(|&d| d == 0), "row() with the graphs: logits differ in bits {diff:?}");
     }
 
+    /// A key seen before replays: the synthetic 8-layer model, two sequences of 5 prompt + 266
+    /// generated ids on one store (rows 0-269 cross the score grid 0 -> 1 -> 2 -> 3 at rows 3,
+    /// 131, 259): the first sequence captures 4 rows, the second none (8 without the per-key
+    /// cache: every sequence starts again at grid 0), and both give the switch-off ids and logits
+    /// bit for bit. Also prints the free-VRAM drop of the first sequence's captures (the cost of
+    /// the cached rows).
+    #[test]
+    #[ignore = "needs the GPU (about 2 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_graph_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_graph_gpu_seen_keys_replay_without_recapture() {
+        let g = geo();
+        let s = synth_model(&g, REC);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let prompt = [3i64, 17, 101, 999, 5];
+        let n = 266;
+        let sizes = TierSizes { vram: 3, pinned: 4 };
+        let mut outs: Vec<Vec<Generated>> = Vec::new();
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut run = Glm5Run::load(&mut cnq, &g, &moe, prompt.len() + n, &mut |s| eprintln!("{s}"));
+            for graph in [false, true] {
+                run.set_graph(graph);
+                let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, g.topk).unwrap();
+                let mut seqs = Vec::new();
+                for seq in 0..2 {
+                    cuda::sync();
+                    let free0 = cuda::free_vram_bytes();
+                    let gen = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |_| {}).unwrap();
+                    cuda::sync();
+                    let drop = free0 as i64 - cuda::free_vram_bytes() as i64;
+                    if let Some(gr) = run.graphs() {
+                        eprintln!(
+                            "glm5 graph keys: sequence {}: row captures {} replays {}, {} rows kept ({} kernel nodes each), head captures {}; free VRAM dropped {drop} B",
+                            seq + 1, gr.captures, gr.replays, gr.rows.len(), gr.current().unwrap().kernels(), gr.head_captures
+                        );
+                        let rows = (prompt.len() + n - 1) as u64;
+                        assert_eq!((gr.captures, gr.replays), (4, (seq as u64 + 1) * rows - 4), "sequence {}: captures / replays", seq + 1);
+                    }
+                    seqs.push(gen);
+                }
+                tiers.free();
+                outs.push(seqs);
+            }
+            run.free();
+        }
+        drop(cnq);
+        let finite = outs[0][0].logits.iter().flatten().filter(|v| v.is_finite()).count();
+        assert_eq!(finite, n * g.vocab, "the synthetic model must stay finite for the comparison to mean something");
+        for seq in 0..2 {
+            let (a, b) = (&outs[0][seq], &outs[1][seq]);
+            assert_eq!(b.ids, a.ids, "sequence {}: ids", seq + 1);
+            let diff: usize = a.logits.iter().zip(&b.logits).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()).sum();
+            assert_eq!(diff, 0, "sequence {}: {diff} logits differ in bits", seq + 1);
+        }
+    }
+
     /// The measurement harness of #190 (no assertion beyond the run): the synthetic 8-layer model,
     /// `GLM_GRAPH_PROFILE_ARM` = `off` | `graph` | `graph+flags`, 5 prompt rows and 3 warm decode
     /// rows through `row`, then `cuProfilerStart`, 8 decode rows, `cuProfilerStop`. Under
@@ -545,7 +621,7 @@ mod tests {
                 pos += 1;
             }
             profiler(false);
-            let gr = run.graphs().map(|gr| (gr.captures, gr.replays, gr.row.as_ref().map(|(_, c)| (c.segs.len(), c.kernels())), gr.head.as_ref().map(|c| c.kernels())));
+            let gr = run.graphs().map(|gr| (gr.captures, gr.replays, gr.current().map(|c| (c.segs.len(), c.kernels())), gr.head.as_ref().map(|c| c.kernels())));
             eprintln!("glm5 graph profile arm {arm}: {rows} decode rows in {:.4} s (synthetic model, all records in VRAM); graphs {gr:?}", t0.elapsed().as_secs_f64());
             tiers.free();
             run.free();

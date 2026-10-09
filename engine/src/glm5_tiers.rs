@@ -1137,7 +1137,7 @@ impl Glm5Run {
             cuda::sync();
         }
         let key = glm5_graph::Key { score_grid: crate::glm5_mla::score_grid(pos, 1), tables: tiers.tables().to_vec() };
-        if gr.ready(&key).is_some() {
+        if gr.promote(&key) {
             return self.replay(tiers, pos, first);
         }
         let stream = gr.stream;
@@ -1160,7 +1160,7 @@ impl Glm5Run {
     unsafe fn replay(&mut self, tiers: &mut ExpertTiers, pos: usize, first: &mut dyn FnMut(&ExpertTiers) -> Result<(), String>) -> Result<(), String> {
         let gr = self.graph.as_mut().expect("glm5_run: replay without graphs");
         gr.replays += 1;
-        let (_, c) = gr.row.as_ref().expect("glm5_run: replay without a captured row");
+        let c = gr.current().expect("glm5_run: replay without a captured row");
         glm5_graph::launch(c, 0);
         for (i, s) in c.seams.iter().enumerate() {
             let ids = gm::router_ids(self.pass.routed.as_mut(), s.ids, s.n, s.layer).map_err(|e| format!("glm5_run: row {pos} layer {}: {e}", s.layer))?;

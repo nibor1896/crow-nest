@@ -423,8 +423,11 @@ switches of 6.2) and to `row` (serve).
   once per row from pinned memory (`RowGraphs::stage`; `MlaScratch::begin` skips its own upload
   inside a capture). The one position-dependent launch shape, the `idx_scores` grid
   (`glm5_mla::score_grid`, 0 below position 3, +1 every 128 positions), and the record tables'
-  addresses key the captured row: a new key recaptures (a fresh sequence: twice, at row 0 and row 3).
-  The t = 1 FFN plans are made before the first capture (`Glm5Pass::ensure_plans`).
+  addresses key the captured row. Up to 8 captured rows are kept, least recently used out
+  (`glm5_graph::KEYS`): a key seen before replays, only a new key captures (a new sequence over
+  positions already seen: none). Cost: 4 kept rows of 266 kernel nodes (synthetic model) dropped
+  free VRAM by 4 MiB against 0 with one kept row; a GLM-5.3-Flash row has about 6x the nodes; host
+  memory not measured. The t = 1 FFN plans are made before the first capture (`Glm5Pass::ensure_plans`).
 - **Refused**: with `CROW_GLM_CPU_LANE=1` (its host work sits inside a segment); a replayed seam
   whose table moved.
 
@@ -452,6 +455,9 @@ captures and 8 replays over the 10 rows). Shown red against: the per-row positio
 (refused: "segment 0 captured a graph node of type 1"), the score-grid key removed (1 capture, 9
 replays, 264 kernel nodes instead of 266; the ids stay equal there: 10 tokens are far below the
 selection's 2,051 (`sel_max`), so the pool scores cannot exclude any; inferred, not traced).
+`glm5_graph_gpu_seen_keys_replay_without_recapture`: two sequences of 5 + 266 ids on one store
+(rows 0-269, score grid 0 to 3): 4 captures in the first, none in the second, ids and logits bit
+for bit as switch-off; red with one kept row (8 captures, 532 replays instead of 4, 536).
 
 ## 7. Not verified
 
