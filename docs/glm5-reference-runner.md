@@ -44,7 +44,7 @@ shows what each choice changes. Threads: `ORACLE_THREADS` (default 16).
     --weights fp8-originals models/GLM-5.3-Flash-original \
     --ids ids.json --decode 4 --out runs/glm53-flash/ref-<name> \
     [--layers 0:4] [--anchors 95,96,97,98,99] [--state-dtype f32|bf16] \
-    [--prompt-chunk 512] [--delete-states-behind] [--capture-subblocks]
+    [--prompt-chunk 512] [--delete-states-behind] [--capture-subblocks] [--capture-head]
 
 # the CNQ container back end (crow-nest #156): weights as `converter dequant` decodes them;
 # a partial container (converter --layers 0-3 --with-embed-head) runs only the layers it holds
@@ -100,6 +100,12 @@ shows what each choice changes. Threads: `ORACLE_THREADS` (default 16).
   `decode glmgolden` harness of #161 reads. The hooks only read: every other file stays byte-identical
   (`test_captures_are_consistent_and_change_nothing`). Not with `--state-dtype bf16` or
   `--delete-states-behind` (exit 2), because ffn's expanded output is the f32 `l<k>-output.f32`.
+- `--capture-head` (crow-nest #165): when the pass reaches the last layer, also writes the head of
+  every row (section 5): the final stream collapse (HF's `Glm5NextTextHyperHead`, an unweighted mean),
+  the final RMSNorm and the logits. `decode glmgolden` judges the engine's head on them. The anchor
+  files stay byte-identical to a run without the flag (the lm_head rows are loaded once for both
+  products); a pass that stops before the last layer writes no head
+  (`test_head_capture_changes_nothing_else_and_needs_the_last_layer`).
 - `--state-dtype bf16` writes the hand-over state in BF16 (16 KiB per token per layer instead of
   32 KiB). Every later layer then reads a rounded input, so that run is no f32 reference. It is
   meant for long routing runs (step 8). Every golden of record is f32.
@@ -279,11 +285,14 @@ holds `prompt_chunk`, `delete_states_behind` and `deleted_states`, and per layer
 | `l<k>-<s>_hc-comb.f32` | `[N][hc][hc]` | its `comb`, HF layout: `x'_i = post_i * y + sum_j comb[j][i] * x_j` |
 | `l<k>-<s>_hc-collapsed.f32` | `[N][H]` | its `collapsed`, the sub-layer's input before the layernorm |
 | `l<k>-<s>-out.f32` | `[N][H]` | the sub-layer's output `y` (`self_attn` / `mlp`), the expand's other input |
+| `head-mean.f32` | `[N][H]` | `--capture-head`: the mean over the 4 streams of `l<L-1>-output`, the final norm's input |
+| `head-norm.f32` | `[N][H]` | its final RMSNorm (weight `w`, not `1 + w`), the lm_head's input |
+| `head-logits.f32` | `[N][V]` | the logits of every row (55.8 MB at 90 rows) |
 
 The expanded outputs are not written twice: attn's is `l<k>-ffn_hc-in.f32`, ffn's is `l<k>-output.f32`.
 The manifest's `subblocks` maps, per layer and site, each role (`in`, `post`, `comb`, `collapsed`, `out`,
 `expanded`) to its file. HF's hyper-connection does not return `pre`, so it is not captured. About 18 MB
-per layer at 90 rows.
+per layer at 90 rows. The manifest's `head` maps `mean`, `norm` and `logits` to the three head files.
 
 **Routing dump (step 8).** The routing is binary, not JSON, because of its size. At 45 layers × 8
 ids per token, JSON would be tens of bytes per id. The binary form is 64 bytes per token and MoE
@@ -303,8 +312,8 @@ with them.
 
 ## 6. Limits
 
-- On the real weights only layers 0–3 have run (step 6, section 7). Layers 4–44, the logits and the
-  run time of a whole pass are **not measured**.
+- On the real weights a whole pass has run on the 3-bit container only (section 7, 2290 s); the FP8
+  originals have run layers 0–3.
 - The chunked prompt is proven on the synthetic mini config (16 experts, 8 layers, T ≤ 604). On a
   real 32,768-token file, rows whose DSA selection boundary is an exact tie can select another set than
   a one-call or row-wise run would. The pass counts them (`dsa_tie_rows_n`).
@@ -341,6 +350,14 @@ reference for `decode glmgolden models/GLM-5.3-Flash-step06/ref-mul1` (the golde
 48 files, 68 s wall, layer 3 load / compute 50.6 / 0.58 s, RSS after the layer-3 load 28.84 GiB (peak working set
 28.88 GiB). Against the FP8 goldens (the quantisation error, reported, not gated): cosine 0.99308 / 0.99402 / 0.99806 / 0.99777 for layers 0 / 1 / 2 / 3, max |Δ| 7.0e-3 / 6.0e-3 / 2.3e-2 / 0.178, rel RMS 0.118 / 0.110 / 0.064 / 0.076; layer 3 routing top-8 overlap 0.910 (min 0.625, 39 / 90 rows the same set), DSA selection identical on 90 / 90 rows.
 Record: `runs/glm53-flash/step06/golden-mul1.json`.
+
+**All 45 layers and the head on the 3-bit container, 2026-10-09** (`ref-mul1-all`, crow-nest #156 / #165): the same
+ids and anchors, `--capture-subblocks --capture-head`, no `--layers`, runner commit `1512e09`. rc 0, 2290 s wall
+(16:45:50–17:24:00), load 48.8–58.5 s per MoE layer (2.1 s per dense layer), compute 0.27–1.00 s per layer, RSS after
+load ≤ 28.12 GiB, peak working set 28.93 GiB. 599 files, 1,133,973,160 B, manifest sha256 `420494b1…a82a0`, every file
+re-hashed equal to it. The 48 files of layers 0–3 are byte-identical to `ref-mul1`; `head-mean` equals the f32 mean of
+`l44-output` exactly; the anchor logits equal their `head-logits` rows to 3.8e-6. Record:
+`runs/glm53-flash/step06/golden-mul1-all.json` (copy in the golden dir as `evidence.json`).
 
 ## 8. Step 8: the routing passes (crow-nest #147)
 
