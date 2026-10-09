@@ -100,6 +100,8 @@ pub mod toolcall;
 pub mod toolgrammar;
 // #160: GLM-5.3-Flash prompt side - family test, reasoning words, stop tokens, goldens
 pub mod glm5_template;
+// #165: GLM-5.3-Flash head - stream mean, final RMSNorm, lm_head (wired nowhere yet)
+pub mod glm5_head;
 // #161: GLM-5.3-Flash mHC residual (Sinkhorn stream mixer) - CPU twin and kernels_glm5_mhc.cu
 pub mod glm5_mhc;
 // #162: GLM-5.3-Flash KDA sub-block (conv, gates, state) on the GPU; wired nowhere yet
