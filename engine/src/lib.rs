@@ -118,6 +118,9 @@ pub mod cpu_nvfp4;
 pub mod cpu_mul1;
 // #164: the glm5_next FFN - sigmoid router, clamped MUL1 experts, shared expert, dense FFN
 pub mod glm5_moe;
+// #161-#165: the glm5_next decoder layers wired in order (layer driver, NVFP4 projections,
+// one shared compile, layer-at-a-time loader) and the host side of `decode glmgolden`
+pub mod glm5_model;
 // #31 A9: the prefix cache (spec section 7) - snapshot, rollback and the id prefix rule
 pub mod cache;
 // #32 A10: the slot file behind POST /slots/0?action=save|restore (spec section 7)

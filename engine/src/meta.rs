@@ -985,7 +985,7 @@ silently ignoring them (Crow #300); each must be consumed or put on the ignore l
     /// `Err` names the value that has no `Geo` form (a non-integral rope pair
     /// count, an eos list that is not two ids, a malformed mrope section).
     pub fn geo(&self) -> Result<Geo, String> {
-        // #159: glm5_next has no runtime `Geo` until its arms exist; its geometry is `glm5_geo`
+        // #159: glm5_next has no runtime `Geo` (its layers run in `glm5_model`, #161); its geometry is `glm5_geo`
         if self.family == Family::Glm5Next {
             return Err(glm5_not_built(self.checks().len(), &self.config_path));
         }
@@ -1517,15 +1517,17 @@ struct GenIds {
 }
 
 /// #159: the boot refusal of a glm5_next config that passed its family row. The gate accepts
-/// the family (parse, key ledger, `Glm5Geo` equal to the row) and the planner plans it; the
-/// engine has none of its arms yet, so the boot stops here, before the container is mapped
-/// and before any CUDA call. Forward order: the residual first.
+/// the family (parse, key ledger, `Glm5Geo` equal to the row) and the planner plans it. #161:
+/// the layer arms exist (`glm5_model`, run layer by layer by `decode glmgolden`); what the boot
+/// still lacks is named here, so it stops before the container is mapped and before any CUDA
+/// call.
 pub fn glm5_not_built(checks: usize, config_path: &str) -> String {
     format!(
         "[meta] family Glm5Next ({GLM5_NEXT_MODEL_TYPE}): {checks} constants verified against the family row \
-({GLM5_NEXT_SOURCE}) [{config_path}]; mHC residual (plan step 13a) for family Glm5Next not built yet, nor KDA (13b), \
-MLA + DSA indexer (13c), the sigmoid noaux_tc router (13d), the stream-mean final norm (13e) and the 200k boot with \
-the NVMe expert tier (14) - refusing to boot (#159); `states --plan` prints its three-tier plan"
+({GLM5_NEXT_SOURCE}) [{config_path}]; its layers are built (mHC, KDA, MLA + DSA, router and MUL1 experts, head: \
+#161-#165, layer by layer in `decode glmgolden`), its boot is not yet: the dynamic expert cache (#175), the NVMe \
+expert tier and the 200k boot (#149, plan step 14) and the vision tower (plan step 20) for family Glm5Next not built \
+yet - refusing to boot (#159); `states --plan` prints its three-tier plan"
     )
 }
 
@@ -1921,7 +1923,7 @@ pub fn verdict(meta: &ModelMeta) -> Result<Geo, String> {
             meta.config_path
         ));
     }
-    // #159: glm5_next passed its family row; its boot refuses at the first unbuilt arm
+    // #159: glm5_next passed its family row; its boot refuses naming what is not built (#161)
     if meta.family == Family::Glm5Next {
         return Err(glm5_not_built(all.len(), &meta.config_path));
     }
@@ -2498,7 +2500,8 @@ mod tests {
         let m = glm_meta();
         let err = verdict(&m).unwrap_err();
         assert!(err.contains("family Glm5Next (glm5_next_text): 38 constants verified"), "{err}");
-        assert!(err.contains("mHC residual (plan step 13a) for family Glm5Next not built yet"), "{err}");
+        assert!(err.contains("its layers are built (mHC, KDA, MLA + DSA, router and MUL1 experts, head: #161-#165"), "{err}");
+        assert!(err.contains("the dynamic expert cache (#175), the NVMe expert tier and the 200k boot (#149, plan step 14) and the vision tower (plan step 20) for family Glm5Next not built yet"), "{err}");
         assert!(err.contains("refusing to boot (#159)"), "{err}");
         assert_eq!(m.geo().unwrap_err(), err, "no runtime Geo until the arms exist");
     }

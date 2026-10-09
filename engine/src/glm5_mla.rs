@@ -207,6 +207,31 @@ impl MlaKernels {
             dims,
         }
     }
+
+    /// #161: `x[r][0..n] = w * (x[r] * rsqrt(mean(x[r]^2) + 1e-5))` in place for `rows` rows
+    /// (`gm_rmsnorm`, HF `Glm5NextTextRMSNorm`: weight times the normed value, not `1 + w`); the
+    /// layer driver's `input_layernorm` and `post_attention_layernorm`. `st` is any device
+    /// buffer of two i32 (the kernel takes the call slot but reads no field of it).
+    ///
+    /// # Safety
+    /// `x` holds `rows x n` f32, `w` `n` f32.
+    pub unsafe fn rmsnorm_rows(&self, x: CUdeviceptr, w: CUdeviceptr, n: usize, rows: usize, st: CUdeviceptr) {
+        launch_v(self.rmsnorm, rows as u32, 1, 1, 256, &[x, w, n as u64, st]);
+    }
+}
+
+/// #161: the four MLA projections a caller may run in another weight codec (the container
+/// stores them NVFP4); the indexer projections stay BF16 on `gm_gemm`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MlaProj {
+    /// `x [t][hidden]` -> `qa [t][q_lora]` (normed after)
+    QA,
+    /// `qa [t][q_lora]` -> `q [t][heads * nope]`
+    QB,
+    /// `x [t][hidden]` -> `kva [t][kv_lora]`
+    KVA,
+    /// `o [t][heads * v]` -> `y [t][hidden]`
+    O,
 }
 
 /// The per-sequence state of one DSA layer: the latent cache `[cap][kv_lora]` BF16 and the indexer
@@ -446,6 +471,41 @@ impl MlaScratch {
         self.select(kn, w, c);
         self.attend(kn, w, c);
         self.linear(kn, w.o_proj, d.heads * d.v, d.hidden, self.o, d.heads * d.v, y, d.hidden);
+    }
+
+    /// #161: [`MlaScratch::forward`] with q_a, q_b, kv_a and o_proj queued by
+    /// `proj(self, which, x, y)` (the caller-projection hook of the module doc; `w.q_a`, `w.q_b`,
+    /// `w.kv_a`, `w.o_proj` are not read). Every other stage is `forward`'s, in its order;
+    /// `forward` itself is unchanged (its G3 evidence of #163). The call's rows are `self.t()`.
+    ///
+    /// # Safety
+    /// As [`MlaScratch::forward`]; `proj` queues on the current stream and writes `y` dense,
+    /// `[t][out]`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_with(
+        &mut self,
+        kn: &MlaKernels,
+        w: &MlaWeights,
+        c: &MlaCache,
+        x: CUdeviceptr,
+        y: CUdeviceptr,
+        pos0: usize,
+        t: usize,
+        proj: &mut dyn FnMut(&MlaScratch, MlaProj, CUdeviceptr, CUdeviceptr),
+    ) {
+        let d = kn.dims;
+        self.begin(pos0, t);
+        proj(self, MlaProj::QA, x, self.qa);
+        launch_v(kn.rmsnorm, self.t as u32, 1, 1, 256, &[self.qa, w.q_a_norm, d.q_lora as u64, self.st]);
+        proj(self, MlaProj::QB, self.qa, self.q);
+        proj(self, MlaProj::KVA, x, self.kva);
+        self.store_latent(kn, w, c);
+        self.linear(kn, w.idx_x, d.hidden, d.idx_proj(), x, d.hidden, self.ip, d.idx_proj());
+        self.store_index(kn, w, c);
+        self.linear(kn, w.idx_wq_b, d.q_lora, d.idx_heads * d.idx_dim, self.qa, d.q_lora, self.iq, d.idx_heads * d.idx_dim);
+        self.select(kn, w, c);
+        self.attend(kn, w, c);
+        proj(self, MlaProj::O, self.o, y);
     }
 
     /// # Safety

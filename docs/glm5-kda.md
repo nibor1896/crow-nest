@@ -3,9 +3,9 @@
 `engine/src/glm5_kda.rs` is the KDA part of step 13b of the GLM-5.3-Flash plan (crow-nest #162,
 parent nibor1896/Crow#362). It computes `a = KDA(h)` of `docs/glm5-next-recipe.md` section 6 for
 one of the 34 KDA layers: from the input-layernormed rows `h` `[T][4096]` to the `o_proj` output
-`[T][4096]`, with the per-sequence state carried across prompt calls and decode steps. Nothing in
-the engine calls it yet; the glm5_next layer loop (mHC, MLA/DSA, FFN, head) is integrated together
-with #161 and #163-#165.
+`[T][4096]`, with the per-sequence state carried across prompt calls and decode steps.
+
+**Wired (#161, 2026-10-09):** `glm5_model` calls it in the decoder order and `decode glmgolden` runs it against the layerwise goldens; see [glm5-model.md](glm5-model.md). No GPU run of the wired path yet.
 
 ## 1. Kernels: reused and new
 
@@ -56,6 +56,10 @@ glm5_kda::step(&kk, &w, &st, &sc, x, out);                      // one decode ro
   `conv` `[24576][3]` f32 = 288 KiB (`Glm5Geo::kda_conv_bytes`), the oldest row first.
 - Any split of a prompt into calls gives the one-call result; measured bit-identical for calls of
   40 + 2 + 54 rows against one call of 96.
+- #161: `prompt_with` / `step_with` are `prompt` / `step` launch for launch, with q|k|v and o_proj
+  handed to a closure (`KdaProj`): the container stores them NVFP4, `glm5_model` runs them on
+  `gemv_fp4_bs` / `gemv_fp4_b` (`w.qkv`, `w.o_proj` unused, 0). `KdaKernels::with_base` takes the
+  one shared glm5 `KERNEL_SRC` module instead of compiling its own.
 
 ## 3. Goldens and tests
 

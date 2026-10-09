@@ -6,8 +6,8 @@ over 288 experts, top-8, the routed experts as MUL1 records (#181) with the SwiG
 shared expert and the dense FFN of layers 0-2 (NVFP4). GPU kernels: `engine/src/kernels_glm5_moe.cu`,
 its own NVRTC module (`kernels::GLM5_MOE_SRC`, `kernels::glm5_moe::Kernels`).
 
-**Status:** module and tests only. Nothing in the engine calls it; `gen.rs` / `boot.rs` wire it
-with the other glm5_next arms (#161-#165). The host lane is checked against the HF oracle; the GPU
+**Status:** module and tests. `glm5_model` (#161) runs `GpuMoePlan` / `GpuFfnPlan` per layer, the
+288 MUL1 records of a layer in one VRAM buffer behind the record table ([glm5-model.md](glm5-model.md)). The host lane is checked against the HF oracle; the GPU
 lane's tests are written and compile, **not run yet** (section 5).
 
 ## 1. Commands

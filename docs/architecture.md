@@ -4795,9 +4795,9 @@ facts refuse any other value by name: sigmoid `noaux_tc` router in float32, `n_g
 `linear_attn_config`'s two lists, the dense MLP layers exactly the first `first_k_dense_replace`.
 The result is a `geo::Glm5Geo` (37 fields), checked row by row against `Glm5Geo::GLM_5_3_FLASH`
 (zai-org/GLM-5.3-Flash @ eb9eb208) plus the stop ids in the vocab: 38 checks. `verdict` then refuses
-the boot with `meta::glm5_not_built`, before the container is mapped. `Glm5Geo` is not a `Geo`: no
-engine arm of the family exists, so no `gen.rs` site can read it; the arms move into `Geo` with
-their kernels (steps 13a-13e). `states --plan` prints the family's three-tier plan from it
+the boot with `meta::glm5_not_built`, before the container is mapped, naming what the boot lacks
+(#175, #149 / step 14, step 20). `Glm5Geo` is not a `Geo`: the family's layers run in
+`glm5_model` (#161, `decode glmgolden`, [glm5-model.md](glm5-model.md)), never in `gen.rs`. `states --plan` prints the family's three-tier plan from it
 (`manager::plan_glm5_next`: VRAM holds the dense part, the latent and indexer caches at the boot
 context, the KDA state, the 32 + 128 staging slots of `Stability::GLM5_NEXT` and the reserves, then N
 experts per MoE layer under the 2 GiB headroom; pinned RAM P under `HOST_PINNED_CAP`; NVMe the rest).
@@ -4805,9 +4805,10 @@ The routed-expert record is a parameter (`geo::ExpertRecordSpec`: codec + bytes,
 whole number of 4096-B sectors): `states --plan --cnq <container>` takes it from the container index,
 `states --plan --expert-bytes N [--expert-codec nvfp4|mul1]` plans without a container; one of the two is
 required, there is no default. The staging slots and the unit (42 x record) scale with it.
-On the RTX 5090 at 200,000 tokens: N 32, P 83, NVMe 173 of 288 at the 14,155,776-B NVFP4 record; N 51,
-P 124, NVMe 113 at the plan's 9,474,048-B 3.05-bpw MUL1 record (unit 397,910,016 B, staging
-1,515,847,680 B). Planner numbers, not measured.
+The plan also books `kv_b` decoded to BF16 at load (#161: 265,289,728 B over its NVFP4 bytes).
+On the RTX 5090 at 200,000 tokens: N 32, P 83, NVMe 173 of 288 at the 14,155,776-B NVFP4 record; N 50,
+P 124, NVMe 114 at the plan's 9,474,048-B 3.05-bpw MUL1 record (unit 397,910,016 B, staging
+1,515,847,680 B; N 51 / NVMe 113 before the kv_b booking). Planner numbers, not measured.
 
 **`geo::Geo`**, 35 fields, derived by `ModelMeta::geo`:
 
