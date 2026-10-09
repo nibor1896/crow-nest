@@ -694,6 +694,8 @@ pub struct ExpertTiers {
     lane_clock: std::sync::Arc<crate::glm5_moe::lane::Clock>,
     /// #149 path B (`CROW_GLM_STAGER=1`): the stager stream and its pinned sources (`None` = off)
     stager: Option<Stager>,
+    /// `CROW_GLM_PREFETCH=1`: the pinned store of the next layer's guessed records (`None` = off)
+    prefetch: Option<glm5_flags::Prefetch>,
 }
 
 struct GpuMover<'a> {
@@ -811,11 +813,17 @@ impl ExpertTiers {
             topk: g.topk,
             lane_clock: Default::default(),
             stager: None,
+            prefetch: None,
         };
         t.set_pinned_use(pu)?;
         let env = |k: &str| std::env::var(k).ok();
         if stager_on(env(STAGER_ENV).as_deref(), env(glm5_flags::ENV_FLAGS).as_deref(), env(CPU_LANE_ENV).as_deref())? {
             t.set_stager(true)?;
+        }
+        let sw = Switches::from_env();
+        sw.check()?;
+        if sw.prefetch {
+            t.set_prefetch(true);
         }
         Ok(t)
     }
@@ -835,7 +843,7 @@ impl ExpertTiers {
 
     /// the pinned bytes this store holds
     pub fn pinned_bytes(&self) -> u64 {
-        self.pinned.iter().map(|p| p.bytes as u64).sum::<u64>() + self.stager.as_ref().map_or(0, |st| st.pinned_bytes())
+        self.pinned.iter().map(|p| p.bytes as u64).sum::<u64>() + self.stager.as_ref().map_or(0, |st| st.pinned_bytes()) + self.prefetch.as_ref().map_or(0, |p| p.pinned_bytes())
     }
 
     /// the VRAM bytes this store holds (arenas, staging, tables)
@@ -866,7 +874,10 @@ impl ExpertTiers {
             src: &self.src,
             recs: &self.records[l],
         };
-        let mut served = serve(&mut self.cache, l, &mut self.slots[l], &ids, self.stage_cap, &mut m)?;
+        let mut served = match self.prefetch.as_mut() {
+            Some(pf) => serve(&mut self.cache, l, &mut self.slots[l], &ids, self.stage_cap, &mut glm5_flags::PrefetchMover::new(&mut m, pf, &self.src, l, self.stage, None))?,
+            None => serve(&mut self.cache, l, &mut self.slots[l], &ids, self.stage_cap, &mut m)?,
+        };
         let mut table = vec![0u64; self.cache.experts];
         for &(e, loc) in &served.locs {
             table[e as usize] = match loc {
@@ -887,6 +898,9 @@ impl ExpertTiers {
             post = Some(crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone() });
         }
         crate::glm5_moe::lane::post(post);
+        if let Some(pf) = self.prefetch.as_mut() {
+            glm5_flags::prefetch_hinted(pf, &self.src, &self.records, &self.cache, self.first_moe, layer)?;
+        }
         self.nvme_reads += served.nvme_reads as u64;
         self.nvme_bytes += served.nvme_bytes;
         self.moves[l].add(&served.moves);
@@ -982,6 +996,9 @@ impl ExpertTiers {
     /// `nvme_bytes` and `moves` keep counting; the cache's own counters restart at 0.
     pub fn reset_cache(&mut self) -> Result<(), String> {
         self.settle()?;
+        if let Some(pf) = self.prefetch.as_mut() {
+            pf.forget(&self.src)?;
+        }
         reset_cache(&mut self.cache, &mut self.slots, self.sizes)
     }
 
@@ -991,6 +1008,9 @@ impl ExpertTiers {
         cuda::sync();
         if let Some(mut st) = self.stager.take() {
             st.free();
+        }
+        if let Some(mut pf) = self.prefetch.take() {
+            let _ = pf.free(&self.src);
         }
         for d in self.vram.iter_mut().chain(self.tables.iter_mut()) {
             cuda::free_dev(d);
@@ -1243,6 +1263,30 @@ impl ExpertTiers {
         self.stager.as_ref().map(|st| st.stats)
     }
 
+    /// `CROW_GLM_PREFETCH`: the store of guessed records on or off (`new` takes it from the
+    /// environment). On allocates 2 x top-k pinned records (not booked by the plan); off waits for
+    /// its reads and frees it. The cache and the slots stay as they are.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading this store is pending.
+    pub unsafe fn set_prefetch(&mut self, on: bool) {
+        match (on, self.prefetch.is_some()) {
+            (true, false) => self.prefetch = Some(glm5_flags::Prefetch::new(self.topk, self.rb)),
+            (false, true) => {
+                cuda::sync();
+                if let Some(mut pf) = self.prefetch.take() {
+                    let _ = pf.free(&self.src);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `CROW_GLM_PREFETCH`: the store's counters (`None` when it is off)
+    pub fn prefetch_stats(&self) -> Option<glm5_flags::PrefetchStats> {
+        self.prefetch.as_ref().map(|p| p.stats)
+    }
+
     /// #149 path B: the outcome of every NVMe read the stager issued and has not reported yet
     /// (each raised its flag, also on a failure). Blocks only while such a read still runs, which
     /// after a stream sync past the last call's experts is none. A no-op with the stager off.
@@ -1284,7 +1328,10 @@ impl ExpertTiers {
             pending: &mut st.pending,
             stats: &mut st.stats,
         };
-        let served = serve(&mut self.cache, l, &mut self.slots[l], ids, self.stage_cap, &mut m)?;
+        let served = match self.prefetch.as_mut() {
+            Some(pf) => serve(&mut self.cache, l, &mut self.slots[l], ids, self.stage_cap, &mut glm5_flags::PrefetchMover::new(&mut m, pf, &self.src, l, self.stage, Some(st.stream)))?,
+            None => serve(&mut self.cache, l, &mut self.slots[l], ids, self.stage_cap, &mut m)?,
+        };
         // the table into this layer's pinned row (its last upload ran before this layer's
         // previous experts), then up on the stager behind the moves
         let host = std::slice::from_raw_parts_mut((st.tables.host as *mut u64).add(row), experts);
@@ -1302,6 +1349,9 @@ impl ExpertTiers {
         cuda::stream_query(st.stream);
         cuda::stream_wait_event(cuda::cur_stream(), st.event);
         crate::glm5_moe::lane::post(None);
+        if let Some(pf) = self.prefetch.as_mut() {
+            glm5_flags::prefetch_hinted(pf, &self.src, &self.records, &self.cache, self.first_moe, self.first_moe + l)?;
+        }
         self.nvme_reads += served.nvme_reads as u64;
         self.nvme_bytes += served.nvme_bytes;
         self.moves[l].add(&served.moves);
@@ -1539,6 +1589,11 @@ impl Glm5Run {
         self.graph.as_ref()
     }
 
+    /// `CROW_GLM_PREFETCH`: the guesses' counters (`None` without the guess)
+    pub fn guess_stats(&self) -> Option<glm5_flags::GuessStats> {
+        self.pass.routed.as_ref().filter(|r| r.predicting()).map(|r| r.guess)
+    }
+
     /// the decode switches in force
     pub fn switches(&self) -> Switches {
         self.sw
@@ -1569,6 +1624,7 @@ impl Glm5Run {
         }
         self.sw_kernels = None;
         self.sw = sw;
+        self.pass.overlap = false;
         if sw == Switches::default() {
             return;
         }
@@ -1576,8 +1632,13 @@ impl Glm5Run {
         if sw.flags {
             // the decode calls' ids (one row); #186 prompt calls and #192 verify calls of more rows
             // read theirs after a stream sync
-            self.pass.routed = Some(Routed::new(&k, self.moe.topk));
+            let mut r = Routed::new(&k, self.moe.topk);
+            if sw.prefetch {
+                r.predict_on(&self.layers, &self.moe, sw.pf_side);
+            }
+            self.pass.routed = Some(r);
         }
+        self.pass.overlap = sw.flags && sw.overlap;
         if sw.lookahead {
             self.feed = Some(Feed::load(&k, cnq, &self.g));
             self.readback = Some(Readback::new(self.g.vocab));
@@ -3072,7 +3133,7 @@ mod tests_186 {
                 chunked.push((name, out, reps));
             }
             // the decode switches after a chunked prompt: flags + lookahead, then the graphs
-            run.set_switches(&mut cnq, Switches { flags: true, lookahead: true });
+            run.set_switches(&mut cnq, Switches { flags: true, lookahead: true, ..Switches::default() });
             let (sw, _) = gen_with(&mut run, &mut cnq, TierSizes { vram: 3, pinned: 4 }, None);
             run.set_switches(&mut cnq, Switches::default());
             run.set_graph(true);
@@ -3887,7 +3948,7 @@ mod spec_tests {
                 run.set_mtp_probe(Some(Box::new(move |row, b| seen2.lock().unwrap().push((row, rh.get(&row) == Some(&hash(b)))))));
                 if sw {
                     run.set_graph(true);
-                    run.set_switches(&mut cnq, Switches { flags: true, lookahead: false });
+                    run.set_switches(&mut cnq, Switches { flags: true, lookahead: false, ..Switches::default() });
                 }
                 let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, (1 + nd) * g.topk).unwrap();
                 let mut reps: Vec<TokenReport> = Vec::new();

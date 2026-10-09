@@ -458,6 +458,8 @@ pub struct GpuMoePlan {
     /// `[T][H]` the shared expert's output
     pub ys: CUdeviceptr,
     pub shared: GpuFfnPlan,
+    /// `CROW_GLM_SHARED_OVERLAP`: [`GpuMoePlan::shared_early`] queued `ys` for the next `experts`
+    shared_queued: std::cell::Cell<bool>,
     gate: mul1::GemvPlan,
     up: mul1::GemvPlan,
     down: mul1::GemvPlan,
@@ -492,7 +494,8 @@ impl GpuMoePlan {
             ye: cuda::alloc_zeroed(c * h * 4),
             ys: cuda::alloc_zeroed(tokens * h * 4),
             shared: GpuFfnPlan::new(h, geo.shared_inter, tokens, geo.swiglu_limit),
-            gate: mul1::GemvPlan::new(sg, c, 1),
+            shared_queued: std::cell::Cell::new(false),
+            gate:mul1::GemvPlan::new(sg, c, 1),
             up: mul1::GemvPlan::new(su, c, 1),
             down: mul1::GemvPlan::new(sd, c, 1),
             lane: std::cell::OnceCell::new(),
@@ -558,8 +561,28 @@ impl GpuMoePlan {
         self.up.run(mk, self.ptrs, self.xg, self.ue);
         launch_v(gk.act, (c * self.geo.expert_inter).div_ceil(256) as u32, 1, 1, 256, &[self.ge, self.ue, self.he, self.prm_n, self.prm_f]);
         self.down.run(mk, self.ptrs, self.he, self.ye);
-        self.shared.run(kn, gk, &w.shared, x, self.ys);
+        if !self.shared_queued.replace(false) {
+            self.shared.run(kn, gk, &w.shared, x, self.ys);
+        }
         launch_v(gk.combine, h.div_ceil(256) as u32, t as u32, 1, 256, &[self.ye, self.wts, self.ys, y, self.prm_kh2]);
+    }
+
+    /// `CROW_GLM_SHARED_OVERLAP`: the shared expert of the coming [`GpuMoePlan::experts`] on `x`
+    /// now (4 launches), so it runs while the host hands the routing over; that `experts` call
+    /// then skips it. The same launches on the same input into the same `ys`, so the layer's
+    /// output keeps its bits.
+    ///
+    /// # Safety
+    /// As [`GpuMoePlan::run`]; the next `experts` call of this plan has the same `w` and `x`.
+    pub unsafe fn shared_early(&self, kn: &kernels::Kernels, gk: &kernels::glm5_moe::Kernels, w: &GpuMoeWeights, x: CUdeviceptr) {
+        self.shared.run(kn, gk, &w.shared, x, self.ys);
+        self.shared_queued.set(true);
+    }
+
+    /// `CROW_GLM_SHARED_OVERLAP`: the call after [`GpuMoePlan::shared_early`] failed before its
+    /// `experts`; the next call computes its shared expert again
+    pub fn shared_forget(&self) {
+        self.shared_queued.set(false);
     }
 
     /// #188 CPU lane: [`GpuMoePlan::experts`] for a decode call (`t = 1`) whose combos
@@ -622,7 +645,9 @@ impl GpuMoePlan {
             launch_v(gk.act, (k * g.expert_inter).div_ceil(256) as u32, 1, 1, 256, &[self.ge, self.ue, self.he, self.prm_n, self.prm_f]);
             self.down.run_slots(mk, n, self.ptrs, self.he, self.ye);
         }
-        self.shared.run(kn, gk, &w.shared, x, self.ys);
+        if !self.shared_queued.replace(false) {
+            self.shared.run(kn, gk, &w.shared, x, self.ys);
+        }
         // hand the queued launches to the GPU (WDDM batches them), then wait for x only
         let _ = sys::cuStreamQuery(s);
         cuda::ck(sys::cuEventSynchronize(ev));

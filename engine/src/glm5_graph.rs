@@ -443,8 +443,8 @@ mod tests {
         let arms = [
             (false, Switches::default()),
             (true, Switches::default()),
-            (true, Switches { flags: true, lookahead: false }),
-            (true, Switches { flags: true, lookahead: true }),
+            (true, Switches { flags: true, lookahead: false, ..Switches::default() }),
+            (true, Switches { flags: true, lookahead: true, ..Switches::default() }),
         ];
         let mut outs: Vec<(String, Generated, Vec<TokenReport>)> = Vec::new();
         let mut door: (Vec<i64>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
@@ -598,7 +598,7 @@ mod tests {
             let _ctx = cuda::Ctx::init();
             let mut run = Glm5Run::load(&mut cnq, &g, &moe, prompt.len() + warm + rows, &mut |s| eprintln!("{s}"));
             run.set_graph(graph);
-            run.set_switches(&mut cnq, Switches { flags, lookahead: false });
+            run.set_switches(&mut cnq, Switches { flags, lookahead: false, ..Switches::default() });
             // every record in VRAM: the rows measured move nothing, only the decode path is counted
             let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, TierSizes { vram: 16, pinned: 0 }, 1, g.topk).unwrap();
             run.kda_states().for_each(|k| k.reset());

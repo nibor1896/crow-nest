@@ -777,6 +777,9 @@ pub struct Glm5Pass {
     /// host through mapped memory behind a flag instead of a stream sync + blocking copy; `None`
     /// (every other user of the pass) is the sync
     pub routed: Option<crate::glm5_flags::Routed>,
+    /// `CROW_GLM_SHARED_OVERLAP=1` (set by `Glm5Run`): a decode call with [`Glm5Pass::routed`]
+    /// queues the shared expert between the publish and the host's wait (outside graph captures)
+    pub overlap: bool,
 }
 
 impl Glm5Pass {
@@ -809,6 +812,7 @@ impl Glm5Pass {
             dense_plans: Vec::new(),
             last_ffn_t: 0,
             routed: None,
+            overlap: false,
             kn,
         }
     }
@@ -977,10 +981,31 @@ impl Glm5Pass {
                         p.run(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, *table, self.collapsed, self.sub);
                     }
                     Some(hook) => {
-                        p.route(&self.kn.k, &self.kn.moe, w, self.collapsed);
+                        // CROW_GLM_PREFETCH (one row): the next layer's guess around the router
+                        let guess = if t == 1 { self.routed.as_mut() } else { None };
+                        if let Some(r) = guess {
+                            r.predict_early(&self.kn.k, &self.kn.moe, lw.layer, self.collapsed);
+                            p.route(&self.kn.k, &self.kn.moe, w, self.collapsed);
+                            r.predict(&self.kn.k, &self.kn.moe, lw.layer, self.collapsed);
+                        } else {
+                            p.route(&self.kn.k, &self.kn.moe, w, self.collapsed);
+                        }
+                        // CROW_GLM_SHARED_OVERLAP: decided before the seam (a capture is open up to it)
+                        let overlap = self.overlap && t == 1 && self.routed.is_some() && !crate::glm5_graph::capturing();
                         crate::glm5_graph::seam_end(lw.layer, p.ids, t * self.moe.topk)?;
-                        let ids = router_ids(self.routed.as_mut(), p.ids, t * self.moe.topk, lw.layer)?;
-                        let tb = hook(lw.layer, &ids)?;
+                        let ids = match self.routed.as_mut().filter(|_| overlap) {
+                            Some(r) => {
+                                r.publish(p.ids, t * self.moe.topk);
+                                p.shared_early(&self.kn.k, &self.kn.moe, w, self.collapsed);
+                                cuda::stream_query(cuda::cur_stream());
+                                r.wait_layer(lw.layer).map_err(|e| {
+                                    p.shared_forget();
+                                    format!("layer {}: {e}", lw.layer)
+                                })?
+                            }
+                            None => router_ids(self.routed.as_mut(), p.ids, t * self.moe.topk, lw.layer)?,
+                        };
+                        let tb = hook(lw.layer, &ids).inspect_err(|_| p.shared_forget())?;
                         crate::glm5_graph::seam_begin(tb);
                         p.experts(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub);
                     }
@@ -1064,7 +1089,7 @@ pub unsafe fn router_ids(routed: Option<&mut crate::glm5_flags::Routed>, ids: De
         }
         Some(r) => {
             r.publish(ids, n);
-            r.wait().map_err(|e| format!("layer {layer}: {e}"))
+            r.wait_layer(layer).map_err(|e| format!("layer {layer}: {e}"))
         }
     }
 }
