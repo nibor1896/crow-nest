@@ -6933,3 +6933,60 @@ extern "C" __global__ void rd_linear(const unsigned long long* __restrict__ ptrs
         }
     }
 }
+
+// ---------------- #162: GLM-5.3-Flash KDA kernels ----------------
+
+/// #162: the KDA forget gate and the per-key-channel delta rule (`kernels_glm5_kda.cu`). Its own
+/// NVRTC module like `MUL1_SRC`: one more `.entry` in `KERNEL_SRC` would break the PTX of record
+/// (`tests_300_c4`). The layer driver is `crate::glm5_kda`.
+pub const GLM5_KDA_SRC: &str = include_str!("kernels_glm5_kda.cu");
+
+/// #162: the loader of `GLM5_KDA_SRC`.
+pub mod glm5_kda {
+    use crate::cuda;
+    use cudarc::driver::sys::CUfunction;
+
+    /// every entry of `GLM5_KDA_SRC`
+    pub const NAMES: &[&str] = &["kda_gate", "kda_persist_r", "kda_step_r"];
+    /// the head dim the source is compiled for (`KDA_D`)
+    pub const HEAD_DIM: usize = 128;
+
+    /// the compiled module and its entries
+    pub struct Kernels {
+        pub module: cuda::Module,
+        pub gate: CUfunction,
+        pub persist: CUfunction,
+        pub step: CUfunction,
+    }
+
+    impl Kernels {
+        /// # Safety
+        /// A CUDA context is current.
+        pub unsafe fn new() -> Kernels {
+            let module = cuda::compile(super::GLM5_KDA_SRC);
+            Kernels {
+                gate: module.get("kda_gate"),
+                persist: module.get("kda_persist_r"),
+                step: module.get("kda_step_r"),
+                module,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_glm5_kda_src {
+    //! #162: `GLM5_KDA_SRC` compiles with the engine's option set to one PTX module carrying every
+    //! entry `glm5_kda::NAMES` lists, and its `KDA_D` is the loader's `HEAD_DIM`; host only (NVRTC).
+    #[test]
+    fn glm5_kda_source_compiles_with_every_entry() {
+        let ptx = super::tests_300_c4::ptx(super::GLM5_KDA_SRC);
+        let names: Vec<String> = super::tests_300_c4::entries(&ptx).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names.len(), super::glm5_kda::NAMES.len(), "{names:?}");
+        for n in super::glm5_kda::NAMES {
+            assert!(names.iter().any(|m| m == n), "{n} missing from {names:?}");
+        }
+        let def = format!("#define KDA_D {}\n", super::glm5_kda::HEAD_DIM);
+        assert!(super::GLM5_KDA_SRC.contains(&def), "KDA_D is not {}", super::glm5_kda::HEAD_DIM);
+    }
+}

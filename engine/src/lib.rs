@@ -100,6 +100,8 @@ pub mod toolcall;
 pub mod toolgrammar;
 // #160: GLM-5.3-Flash prompt side - family test, reasoning words, stop tokens, goldens
 pub mod glm5_template;
+// #162: GLM-5.3-Flash KDA sub-block (conv, gates, state) on the GPU; wired nowhere yet
+pub mod glm5_kda;
 // #86: the OpenAI stop-string filter of `bin/serve.rs`, the same tail-hold
 // `toolcall::find_marker` gives `<tool_call>`, on arbitrary strings
 pub mod stopstr;
