@@ -10,6 +10,8 @@
   # 2. routing (step 7 runner, one out dir per corpus name; G1 ran on the 4.5-bit container, #147; G1d runs on
   #    the FP8 originals, #179, PREREG-dyn amendment 1):
   #    .venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py --fp8 models/GLM-5.3-Flash-original [--dry-run]
+  #    PREREG-dyn amendment 2: the calibration files' routing from the conversion's capture (dyn --capture), so only
+  #    the held-out needs a pass: ... glm_route_passes.py --fp8 models/GLM-5.3-Flash-original --files todo-1006
 
   # 3. simulation and the G1 verdict fields
   .venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py sim --corpus <dir>/corpus.json --runs <runs> \
@@ -17,7 +19,7 @@
 
   # 4. dynamic expert-cache policies (#178, plan step 2; docs/glm-tier-simulation.md section 7)
   .venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py dyn --corpus <dir>/corpus.json --runs <runs> \
-      (--slots V:P[,...] | --vram 25.6GB --pinned 46GiB) [--bpw 4.5,3.05,3.5] [--arena layer|global] \
+      [--capture decode_out/glm-step8/capture-ids] (--slots V:P[,...] | --vram 25.6GB --pinned 46GiB) [--bpw 4.5,3.05,3.5] [--arena layer|global] \
       [--policies lru,clock,lfu] [--admit-max 64] [--prefetch none,oracle,0.5,0.7,0.9] [--depths 1,2,3] \
       [--pf-budget N] [--step3 <run>.json --readers 1] [--rates <rates.json>] [--json <out.json>]
 
@@ -213,6 +215,65 @@ def g1d_book_reasons(runs_dir, names, identity):
     return out
 
 
+# PREREG-dyn amendment 2 (2026-10-09, #179 / #178): the calibration files' G1d routing may come from the conversion's
+# capture (#182, tools/glm_mul1_quantize.py capture: the same runner code, run_layer, on the same FP8 originals), saved
+# per MoE layer as <capture>/L<ll>/ids.i32 (int32 [rows][8], the four files' rows one after another) + capture.json.
+CAPTURE_FIRST_LAYER = 3     # MoE layers 3..44 -> L03..L44 (SHAPE[0] of them)
+
+
+def load_capture(cap_dir, files, identity, shape=SHAPE, first=CAPTURE_FIRST_LAYER):
+    """The conversion capture's routing of the calibration files -> ({name: uint16 [n][L][K]}, {"Lxx": ids sha256}).
+    files: [(name, rows)] in the corpus' calibration order; identity: the FP8 identity sha256 of the held-out pass dir.
+    Refused by name (SimError): a missing layer; per layer a capture.json of another layer, another identity, other
+    files or another order, other rows or top-k, an ids.i32 whose sha256 is not capture.json's or whose size is not
+    rows x K; the routing self-test of load_runner (ids 0..E-1, K distinct ascending per row)."""
+    L, E, K = shape
+    layers = list(range(first, first + L))
+    missing = [l for l in layers if not all(os.path.isfile(os.path.join(cap_dir, "L%02d" % l, f))
+                                            for f in ("capture.json", "ids.i32"))]
+    if missing:
+        raise SimError("capture %s: layer%s %s missing (ids.i32 + capture.json per MoE layer %d..%d)" % (
+            cap_dir, "s" if len(missing) > 1 else "", ", ".join("L%02d" % l for l in missing), layers[0], layers[-1]))
+    names, n_rows = [f for f, _ in files], [n for _, n in files]
+    total = sum(n_rows)
+    out = {f: np.empty((n, L, K), np.uint16) for f, n in files}
+    shas = {}
+    for j, l in enumerate(layers):
+        d = os.path.join(cap_dir, "L%02d" % l)
+        tag = "capture %s L%02d" % (cap_dir, l)
+        cj = jload(os.path.join(d, "capture.json"))
+        if cj.get("layer") != l:
+            raise SimError("%s: capture.json is of layer %s" % (tag, cj.get("layer")))
+        if cj.get("identity") != identity:
+            raise SimError("%s: identity %s is not the FP8 identity %s of the held-out pass dir (weights.json)"
+                           % (tag, cj.get("identity"), identity))
+        got = [f.get("name") for f in cj.get("files") or []]
+        if got != names:
+            raise SimError("%s: files %s, the corpus' calibration files in order are %s" % (tag, got, names))
+        rws = [f.get("rows") for f in cj["files"]]
+        if rws != n_rows or cj.get("rows") != total or cj.get("top_k") != K:
+            raise SimError("%s: rows %s (total %s, top-k %s), the corpus files have %s (total %d, top-k %d)"
+                           % (tag, rws, cj.get("rows"), cj.get("top_k"), n_rows, total, K))
+        p = os.path.join(d, "ids.i32")
+        sha = sha256_file(p)
+        if sha != cj.get("ids_sha256"):
+            raise SimError("%s: ids.i32 sha256 %s is not capture.json's %s" % (tag, sha, cj.get("ids_sha256")))
+        a = np.fromfile(p, "<i4")
+        if a.size != total * K:
+            raise SimError("%s: ids.i32 holds %d ids, expected [%d][%d]" % (tag, a.size, total, K))
+        a = a.reshape(total, K)
+        if a.min() < 0 or a.max() >= E:
+            raise SimError("self-test: %s has an id outside 0..%d" % (tag, E - 1))
+        if K > 1 and not (np.diff(a, axis=1) > 0).all():
+            raise SimError("self-test: %s has a row that is not %d distinct ascending ids" % (tag, K))
+        r0 = 0
+        for f, n in files:
+            out[f][:, j, :] = a[r0:r0 + n]
+            r0 += n
+        shas["L%02d" % l] = sha
+    return out, shas
+
+
 def gen_mask(path, n):
     m = jload(path)
     if m["tokens"] != n:
@@ -268,15 +329,22 @@ class Run:
         self.identity = identity
 
 
-def load_corpus(corpus_path, runs_dir, shape=SHAPE, source="g1"):
+def load_corpus(corpus_path, runs_dir, shape=SHAPE, source="g1", capture=None):
     """corpus.json + one runner out dir per name -> (held Run, [cal Run], [reasons the source is not of record]).
     source "g1": the G1 record's rule (source_reasons, CNQ container); "g1d": PREREG-dyn amendment 1 (FP8 originals,
-    g1d_source_reasons, one identity in every dir and in passes.jsonl), the identity on every Run."""
+    g1d_source_reasons, one identity in every dir and in passes.jsonl), the identity on every Run.
+    capture (PREREG-dyn amendment 2): the calibration files' routing from the conversion's capture dir (load_capture,
+    checked against the held-out pass dir's weights.json identity); only the held-out needs a pass dir (and, for
+    "g1d", a passes.jsonl row). Each such Run carries the per-layer ids sha256 as .capture. Under "g1" (`sim`, the
+    descriptive check 4.2 of amendment 1) it adds a "plausibility only" reason, so G1 stays "not answered"."""
     c = jload(corpus_path)
     base = os.path.dirname(os.path.abspath(corpus_path))
     check_corpus(c)
+    from_cap = [f for f in c["files"] if f["role"] == "cal"] if capture is not None else []
     runs, reasons, idents = {}, [], {}
     for f in c["files"]:
+        if f in from_cap:
+            continue
         man, routes = load_runner(os.path.join(runs_dir, f["name"]), shape)
         ids = jload(os.path.join(base, f["name"] + "-ids.json"))
         if man["ids"] != ids:
@@ -298,6 +366,29 @@ def load_corpus(corpus_path, runs_dir, shape=SHAPE, source="g1"):
             reasons.append("weights.json differs between the pass dirs (%d identities)" % len(found))
         elif found:
             reasons += g1d_book_reasons(runs_dir, list(idents), found[0])
+    if from_cap:
+        ident = idents.get(c["held"])
+        wp = os.path.join(runs_dir, c["held"], "weights.json")
+        if source != "g1d" and os.path.exists(wp):
+            ident = jload(wp).get("identity_sha256")
+        if source != "g1d":   # `sim`, check 4.2 of PREREG-dyn amendment 1: descriptive, never G1's record
+            reasons.append("calibration files: routing from the conversion's capture (FP8 originals): plausibility only")
+        if not ident:
+            raise SimError("capture %s: its identity cannot be checked, the held-out pass dir %s has no weights.json "
+                           "identity" % (capture, os.path.join(runs_dir, c["held"])))
+        ids = {}
+        for f in from_cap:
+            ids[f["name"]] = jload(os.path.join(base, f["name"] + "-ids.json"))
+            if sha256_ids(ids[f["name"]]) != f["ids_sha256"]:
+                raise SimError("%s-ids.json does not match corpus.json (sha256)" % f["name"])
+        routes, shas = load_capture(capture, [(f["name"], len(ids[f["name"]])) for f in from_cap], ident, shape)
+        for f in from_cap:
+            r = routes[f["name"]]
+            gen = gen_mask(os.path.join(base, f["name"] + "-mask.json"), len(r))
+            runs[f["name"]] = Run(f["name"], f["task"], r, gen, None, ident)
+            runs[f["name"]].capture = shas
+            print("self-test %-24s positions %7d generated %6d  capture ids.i32 == capture.json sha256: True"
+                  % (f["name"], len(r), gen.sum()))
     held = runs[c["held"]]
     cal = [runs[f["name"]] for f in c["files"] if f["role"] == "cal"]
     return held, cal, reasons
@@ -1031,13 +1122,21 @@ def dyn_configs(a, layers=SHAPE[0]):
 
 def dyn_cmd(a):
     configs = dyn_configs(a)
-    held, _cal, reasons = load_corpus(a.corpus, a.runs, source="g1d")
+    held, cal, reasons = load_corpus(a.corpus, a.runs, source="g1d", capture=a.capture)
+    if a.capture:
+        cal_src = {"from": "capture (PREREG-dyn amendment 2)", "dir": a.capture, "files": [r.name for r in cal],
+                   "ids_sha256": cal[0].capture}
+        print("calibration routing: the conversion's capture %s (%d layers, identity %s), held-out from %s"
+              % (a.capture, len(cal[0].capture), held.identity, os.path.join(a.runs, held.name)))
+    else:
+        cal_src = {"from": "pass dirs", "dir": a.runs, "files": [r.name for r in cal]}
     b, why = b_from_step3(a.step3, a.readers)
     rates, rwhy = rates_from_file(a.rates)
     pfs = tuple(None if x == "none" else x if x == "oracle" else float(x) for x in a.prefetch.split(","))
     res = dyn_simulate(held, configs, tuple(a.policies.split(",")), a.arena, a.admit_max, pfs,
                        tuple(int(x) for x in a.depths.split(",")), a.pf_budget, a.lfu_halflife, b, why, rates, rwhy,
                        reasons)
+    res["calibration_routing"] = cal_src
     if a.json:
         jdump(res, a.json, indent=1, default=float)
     return 0
@@ -1120,6 +1219,8 @@ def main(argv=None):
     s = sub.add_parser("sim")
     s.add_argument("--corpus", required=True)
     s.add_argument("--runs", required=True)
+    s.add_argument("--capture", help="calibration routing from the conversion's capture (PREREG-dyn amendment 2; "
+                                     "plausibility only for G1)")
     s.add_argument("--step3")
     s.add_argument("--readers", type=int, help="reader count fixed by a PREREG amendment (amendment 5: 1)")
     s.add_argument("--windows", default="0,8,16,32")
@@ -1128,6 +1229,9 @@ def main(argv=None):
     d = sub.add_parser("dyn", help="dynamic expert-cache policies over the held-out routing (#178)")
     d.add_argument("--corpus", required=True)
     d.add_argument("--runs", required=True)
+    d.add_argument("--capture", help="the calibration files' routing from the conversion's capture, L<ll>/ids.i32 + "
+                                     "capture.json per MoE layer (PREREG-dyn amendment 2); --runs then needs only "
+                                     "the held-out pass")
     d.add_argument("--step3")
     d.add_argument("--readers", type=int, help="reader count fixed by a PREREG amendment (amendment 5: 1)")
     d.add_argument("--rates", help='JSON {"R_pcie_gbps": x, "R_dram_gbps": y, "source": "..."}')
@@ -1150,7 +1254,7 @@ def main(argv=None):
             return corpus_cmd(a)
         if a.cmd == "dyn":
             return dyn_cmd(a)
-        held, cal, reasons = load_corpus(a.corpus, a.runs)
+        held, cal, reasons = load_corpus(a.corpus, a.runs, capture=a.capture)
         b, why = b_from_step3(a.step3, a.readers)
         res = simulate(held, cal, b, why, reasons, tuple(int(x) for x in a.windows.split(",")), a.gate_window)
         if a.json:

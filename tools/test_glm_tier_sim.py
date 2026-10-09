@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -687,6 +688,118 @@ class TestG1dSource(unittest.TestCase):
             r = " | ".join(ts.load_corpus(c4.path, c4.rdir, source="g1d")[2])
             self.assertIn("passes.jsonl row of held carries identity", r)
             self.assertIn("passes.jsonl has no ok row for cal0", r)
+
+
+def write_capture(d, cal, identity, layers=range(3, 45)):
+    """The conversion's capture as the copier keeps it (#182): per MoE layer L<ll>/ids.i32, the calibration files' rows
+    one after another (int32 [rows][8]), and capture.json as tools/glm_mul1_quantize.py capture writes it."""
+    for j, l in enumerate(layers):
+        ld = os.path.join(d, "L%02d" % l)
+        os.makedirs(ld)
+        a = np.ascontiguousarray(np.concatenate([r[:, j, :] for _, r in cal]), dtype="<i4")
+        a.tofile(os.path.join(ld, "ids.i32"))
+        ts.jdump({"layer": l, "rows": len(a), "hidden": 4096, "top_k": K,
+                  "files": [{"name": n, "rows": len(r)} for n, r in cal], "moe_in_sha256": "00" * 32,
+                  "ids_sha256": ts.sha256_file(os.path.join(ld, "ids.i32")), "identity": identity,
+                  "what": "post_attention_layernorm output ...; ids = the router's top-k, ascending"},
+                 os.path.join(ld, "capture.json"))
+
+
+def capture_corpus(root):
+    """PREREG-dyn amendment 2: the held-out from one FP8 pass dir (+ its passes.jsonl row), the two calibration files
+    only in the capture dir (their pass dirs removed). The files have different lengths, so the row split matters."""
+    held, cal = rows(300, HELD_PICKS), [uniform_routes(120, 5), uniform_routes(80, 6)]
+    c, ident = fp8_corpus(root, held, cal, book=False)
+    with open(os.path.join(c.rdir, "passes.jsonl"), "w", encoding="utf-8") as bk:
+        bk.write(json.dumps({"name": "held", "ok": True, "weights": "fp8-originals",
+                             "weights_identity_sha256": ident["identity_sha256"]}) + "\n")
+    for n in ("cal0", "cal1"):
+        shutil.rmtree(os.path.join(c.rdir, n))
+    cap = os.path.join(root, "capture-ids")
+    write_capture(cap, [("cal0", cal[0]), ("cal1", cal[1])], ident["identity_sha256"])
+    return c, ident, cap, cal
+
+
+def edit_capture(cap, layer, fn):
+    p = os.path.join(cap, "L%02d" % layer, "capture.json")
+    cj = ts.jload(p)
+    fn(cj)
+    ts.jdump(cj, p)
+
+
+class TestG1dCapture(unittest.TestCase):
+    """PREREG-dyn amendment 2 (#178, #179): `dyn --capture` takes the calibration files' routing from the conversion's
+    capture (L<ll>/ids.i32 + capture.json), checked by name against the held-out pass dir's FP8 identity."""
+
+    def test_capture_accepted_and_split_per_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            c, ident, cap, cal = capture_corpus(d)
+            held, got, reasons = ts.load_corpus(c.path, c.rdir, source="g1d", capture=cap)
+            self.assertEqual(reasons, [])
+            self.assertEqual([r.name for r in got], ["cal0", "cal1"])
+            for r, want in zip(got, cal):
+                self.assertTrue(np.array_equal(r.routes, want))
+                self.assertTrue(r.gen.all())                      # the corpus mask: [[0, n]]
+                self.assertEqual(r.identity, ident["identity_sha256"])
+                self.assertEqual(sorted(r.capture), ["L%02d" % l for l in range(3, 45)])
+            self.assertEqual(held.identity, ident["identity_sha256"])
+            out = os.path.join(d, "dyn.json")
+            self.assertEqual(ts.main(["dyn", "--corpus", c.path, "--runs", c.rdir, "--capture", cap, "--slots", "8:8",
+                                      "--policies", "lru", "--json", out]), 0)
+            doc = ts.jload(out)
+            self.assertEqual(doc["source_reasons"], [])
+            self.assertTrue(doc["calibration_routing"]["from"].startswith("capture"))
+            self.assertEqual(doc["calibration_routing"]["files"], ["cal0", "cal1"])
+            self.assertEqual(len(doc["calibration_routing"]["ids_sha256"]), 42)
+            # `sim` (check 4.2 of amendment 1) takes it too, as plausibility only: G1 stays "not answered"
+            held, got, reasons = ts.load_corpus(c.path, c.rdir, capture=cap)
+            self.assertTrue(np.array_equal(got[1].routes, cal[1]))
+            self.assertTrue(any(r.startswith("calibration files: routing from the conversion's capture") for r in reasons))
+            self.assertTrue(all("plausibility only" in r for r in reasons), reasons)
+            self.assertEqual(ts.main(["sim", "--corpus", c.path, "--runs", c.rdir, "--capture", cap, "--windows", "0"]), 0)
+
+    def test_capture_refusals_by_name(self):
+        cases = [
+            ("identity", lambda cap: edit_capture(cap, 17, lambda cj: cj.update(identity="12" * 32)),
+             ("L17", "is not the FP8 identity")),
+            ("order", lambda cap: edit_capture(cap, 5, lambda cj: cj["files"].reverse()),
+             ("L05", "calibration files in order")),
+            ("rows", lambda cap: edit_capture(cap, 9, lambda cj: cj.update(
+                files=[{"name": "cal0", "rows": 119}, {"name": "cal1", "rows": 81}])), ("L09", "rows [119, 81]")),
+            ("total rows", lambda cap: edit_capture(cap, 10, lambda cj: cj.update(rows=201)), ("L10", "total 201")),
+            ("sha", lambda cap: np.tile(np.arange(8, dtype="<i4"), (200, 1)).tofile(os.path.join(cap, "L20", "ids.i32")),
+             ("L20", "ids.i32 sha256")),
+            ("missing layer", lambda cap: shutil.rmtree(os.path.join(cap, "L44")), ("L44", "missing")),
+            ("missing ids", lambda cap: os.remove(os.path.join(cap, "L03", "ids.i32")), ("layer L03 missing",)),
+            ("other layer", lambda cap: edit_capture(cap, 30, lambda cj: cj.update(layer=31)), ("L30", "of layer 31")),
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            for i, (what, breakit, needles) in enumerate(cases):
+                c, _ident, cap, _cal = capture_corpus(os.path.join(d, str(i)))
+                breakit(cap)
+                with self.assertRaises(ts.SimError, msg=what) as cm:
+                    ts.load_corpus(c.path, c.rdir, source="g1d", capture=cap)
+                for nd in needles:
+                    self.assertIn(nd, str(cm.exception), what)
+                if what == "identity":   # the CLI refuses with exit 2
+                    self.assertEqual(ts.main(["dyn", "--corpus", c.path, "--runs", c.rdir, "--capture", cap,
+                                              "--slots", "8:8", "--policies", "lru"]), 2)
+            # a row that is not 8 distinct ascending ids, with a matching sha256: the routing self-test
+            c, _ident, cap, _cal = capture_corpus(os.path.join(d, "selftest"))
+            p = os.path.join(cap, "L12", "ids.i32")
+            a = np.fromfile(p, "<i4").reshape(-1, 8)
+            a[3] = a[3][::-1]
+            a.tofile(p)
+            edit_capture(cap, 12, lambda cj: cj.update(ids_sha256=ts.sha256_file(p)))
+            with self.assertRaises(ts.SimError) as cm:
+                ts.load_corpus(c.path, c.rdir, source="g1d", capture=cap)
+            self.assertIn("self-test", str(cm.exception))
+            # no identity to check against: the held-out pass dir lacks weights.json
+            c, _ident, cap, _cal = capture_corpus(os.path.join(d, "noident"))
+            os.remove(os.path.join(c.rdir, "held", "weights.json"))
+            with self.assertRaises(ts.SimError) as cm:
+                ts.load_corpus(c.path, c.rdir, source="g1d", capture=cap)
+            self.assertIn("cannot be checked", str(cm.exception))
 
 
 if __name__ == "__main__":

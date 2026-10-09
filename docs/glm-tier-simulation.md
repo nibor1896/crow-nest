@@ -22,8 +22,10 @@ no such dumps exist yet. Step 3's statistic gives no B on this machine; PREREG a
 # routing: the five runner passes of PREREG amendment 1, resumable per file (docs/glm5-reference-runner.md
 # section 8; --dry-run checks and prints the five commands). G1d: the FP8 originals, verified by
 # tools/fetch-glm.py (#179, PREREG-dyn amendment 1); each pass dir gets weights.json, the weights' identity.
-# --container was G1's source; that container is deleted.
+# --container was G1's source; that container is deleted. PREREG-dyn amendment 2: the four calibration files'
+# routing comes from the MUL1 conversion's capture (section 7), so only the held-out needs a pass (--files).
 .venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py --fp8 models/GLM-5.3-Flash-original [--dry-run]
+.venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py --fp8 models/GLM-5.3-Flash-original --files todo-1006
 
 # simulation, every report row, and the G1 verdict fields
 .venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py sim --corpus decode_out/glm-step8/corpus/corpus.json \
@@ -33,7 +35,8 @@ no such dumps exist yet. Step 3's statistic gives no B on this machine; PREREG a
 
 # dynamic expert-cache policies (#178, section 7)
 .venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py dyn --corpus decode_out/glm-step8/corpus/corpus.json \
-    --runs decode_out/glm-step8/runs (--slots V:P[,...] | --vram 25.6GB --pinned 46GiB) [--bpw 4.5,3.05,3.5] \
+    --runs decode_out/glm-step8/runs [--capture decode_out/glm-step8/capture-ids] \
+    (--slots V:P[,...] | --vram 25.6GB --pinned 46GiB) [--bpw 4.5,3.05,3.5] \
     [--arena layer|global] [--policies lru,clock,lfu] [--admit-max 64] [--prefetch none,oracle,0.5,0.7,0.9] \
     [--depths 1,2,3] [--pf-budget N] [--step3 <run>.json --readers 1] [--rates rates.json] [--json out.json]
 
@@ -45,8 +48,8 @@ no such dumps exist yet. Step 3's statistic gives no B on this machine; PREREG a
 Step 8 runs under `.venv-oracle` (transformers 5.16.1). The system Python's transformers (5.5.4 on the
 owner's machine, 2026-10-08) lacks `transformers.cache_utils.DynamicIndexedLayer`, which the runner's
 in-place DSA cache subclasses: `tools/test_glm_route_passes.py` fails there in `setUpClass` of its
-end-to-end test (14 tests run, 1 error; under `.venv-oracle` 17 tests, OK, 80 s; both 2026-10-09), and `corpus`
-needs GLM's tokenizer from the same venv. `tools/test_glm_tier_sim.py` alone passes under either (43 tests, OK
+end-to-end test (14 tests run, 1 error; under `.venv-oracle` 18 tests, OK, 80 s; both 2026-10-09), and `corpus`
+needs GLM's tokenizer from the same venv. `tools/test_glm_tier_sim.py` alone passes under either (45 tests, OK
 under both on 2026-10-09, about 19 s).
 
 `corpus` uses `messages` and `render` of `tools/session_ids.py` and swaps in GLM's tokenizer, so the
@@ -182,6 +185,31 @@ an ok row per file. Any failed check prints `NOT the G1d source` with the reason
 the JSON; the identity sha256 is printed and stored as `weights_identity_sha256`. `sim` keeps G1's rule: FP8 routing
 stays "plausibility only" there and G1 "not answered" on it.
 
+**Calibration routing from the conversion's capture (PREREG-dyn amendment 2, 2026-10-09).** The MUL1 conversion
+(#182) runs the four calibration files through the same `run_layer` on the same FP8 originals. Per MoE layer it
+writes the router's top-8 ids as `ids.i32`, int32 [131,072][8]: the files' 32,768 rows one after another, in the
+amendment-1 order. Beside it, `capture.json` names the files and rows, the FP8 identity and `ids_sha256`. A copier
+keeps both per layer in `decode_out/glm-step8/capture-ids/L<ll>/` before `quantize` prunes them. `--capture <dir>`
+(in `dyn` and `sim`) takes the calibration files from there; `--runs` then needs only the held-out pass dir.
+Refused by name (exit 2), per MoE layer 3..44:
+- `L<ll>/ids.i32` or `capture.json` missing (all missing layers named);
+- `capture.json` of another layer;
+- its `identity` is not the `identity_sha256` of the held-out pass dir's `weights.json` (no `weights.json`: refused);
+- its files are not the corpus' calibration files in corpus order;
+- per-file rows are not the length of each file's ids, the total is not their sum, or top-k is not 8;
+- the sha256 of `ids.i32` is not `ids_sha256`, or its size is not rows x 8;
+- the routing self-test of `load_runner`: ids 0..287, eight distinct ascending per row.
+
+Each file gets its slice in that order. Generated and prompt positions come from `<name>-mask.json`, as for pass
+dirs. Under `dyn` the G1d checks then cover the held-out pass dir and its `passes.jsonl` row. The JSON names the
+source in `calibration_routing`, with the 42 per-layer sha256. Under `sim` (check 4.2 below) the capture adds a
+"plausibility only" reason, so G1 stays "not answered". Layer 3's ids were pruned before the copier started; it is
+recomputed with `tools/glm_mul1_quantize.py capture --layers 3` in a separate work dir (amendment 2).
+
+`dyn` scores only the held-out today: LRU, CLOCK, LFU, prefetch and MIN. The calibration Runs are loaded and
+checked, but nothing uses them yet: SEED+LRU, SEED+LRU+IDPF and the calibration grid choice of PREREG-dyn are not
+built.
+
 **The model.**
 
 | element | rule |
@@ -258,6 +286,8 @@ never a default.
 | CLI | an end-to-end run with JSON; refusals exit 2 |
 | G1d source | FP8 routing with `weights.json` and `passes.jsonl`: no source reason in `dyn`, while `sim` still says "plausibility only" and G1 "not answered" |
 | G1d source refusals | CNQ weights, prompt chunk, index sha256, a tampered or foreign `weights.json`, a missing one, two identities, a missing book, a book row with another identity |
+| capture accepted (amendment 2) | calibration files of different lengths only in a capture dir: each Run equals its slice, mask from the corpus, no source reason in `dyn`, `calibration_routing` with 42 sha256; `sim --capture` runs as plausibility only |
+| capture refusals (amendment 2) | by layer name: foreign identity, file order, per-file rows, total rows, ids sha256, a missing layer dir, a missing `ids.i32`, another layer's `capture.json`, a non-ascending row, no held-out `weights.json`; the CLI exits 2 |
 
 Removing a hunk turns its test red (checked 2026-10-08):
 
@@ -273,6 +303,8 @@ Removing a hunk turns its test red (checked 2026-10-08):
 | `dyn` on the G1d rule (2026-10-09) | G1d source |
 | identity content check | G1d source refusals |
 | `passes.jsonl` check | G1d source refusals |
+| `load_corpus(capture=...)` (2026-10-09) | capture accepted, capture refusals (TypeError) |
+| each capture check alone: identity, order, rows, sha256, missing layer, layer field | its capture refusal case |
 
 **Speed** on synthetic uniform routing at full shape (4,096 positions, Windows, 2026-10-08), per config:
 LRU 0.7 s, CLOCK 1.0 s, LFU 2.8 s, LRU with prefetch 1.8 s, MIN 0.5 s (layer) and 0.9 s (global).
@@ -291,9 +323,12 @@ These are descriptive, have no threshold, and can neither pass nor fail G1d.
 
 ```
 .venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py dyn --corpus decode_out/glm-step8/corpus/corpus.json \
-    --runs decode_out/glm-step8/runs --slots 108:0,122:0,130:0,145:0,216:0 --policies lru \
+    --runs decode_out/glm-step8/runs --capture decode_out/glm-step8/capture-ids \
+    --slots 108:0,122:0,130:0,145:0,216:0 --policies lru \
     --step3 runs/glm53-flash/step03/20261008T001819Z.json --readers 1 --json <out.json>
 ```
+
+Item 2 runs `sim` with the same `--runs` and `--capture`. Without `--capture`, both need all five pass dirs.
 
 **Not modelled:** prefetch from pinned into VRAM, batched prefill steps, kernel time, and the latency a
 demand read stalls for (only bytes).
