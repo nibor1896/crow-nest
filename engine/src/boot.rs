@@ -120,9 +120,76 @@ pub unsafe fn open_model(
 /// [`model_geo`] stays the door of the `Engine` families: glm5_next has no `Geo` (`meta::verdict`),
 /// so `serve` takes this door for it (`bin/serve.rs` `engine_kind`).
 pub fn glm5_door(cnq_path: &str) -> Result<(crate::glm5_tiers::Opened, usize), String> {
+    // #185: a malformed tier option is refused here, before the container and the CUDA context;
+    // its range against the #159 plan is checked in `Glm5Device::load`, which has the plan
+    glm5_tier_ask_from_env()?;
     let o = crate::glm5_tiers::open_container(cnq_path).map_err(|e| format!("glm5_next container {cnq_path}: {e}"))?;
     let context = context_from_env(std::env::var("CROW_CONTEXT").ok().as_deref(), o.g.context_floor, o.g.context_max)?;
     Ok((o, context))
+}
+
+/// #185: serve's glm5_next tier sizes, `glm5_run --vram-slots N` as an env (slots per MoE layer)
+pub const GLM_VRAM_SLOTS_ENV: &str = "CROW_GLM_VRAM_SLOTS";
+/// #185: `glm5_run --pinned-slots N` as an env (slots per MoE layer)
+pub const GLM_PINNED_SLOTS_ENV: &str = "CROW_GLM_PINNED_SLOTS";
+/// #185: `glm5_run --readers N` as an env (NVMe reader threads of the expert tier)
+pub const GLM_NVME_READERS_ENV: &str = "CROW_GLM_NVME_READERS";
+
+/// #185: what the environment asks of serve's glm5_next expert tiers; `None` = the default
+/// (the #159 plan's VRAM and pinned slots, [`crate::glm5_engine::READERS`] readers)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Glm5TierAsk {
+    pub vram: Option<usize>,
+    pub pinned: Option<usize>,
+    pub readers: Option<usize>,
+}
+
+/// #185: the three tier options, parsed (pure). Unset or empty = default; a value that is not
+/// a whole number, or readers outside `1..=nvme_source::MAX_IN_FLIGHT`, is refused by name.
+pub fn glm5_tier_ask(vram: Option<&str>, pinned: Option<&str>, readers: Option<&str>) -> Result<Glm5TierAsk, String> {
+    let num = |name: &str, v: Option<&str>| -> Result<Option<usize>, String> {
+        let Some(v) = v.map(str::trim).filter(|v| !v.is_empty()) else { return Ok(None) };
+        v.parse::<usize>().map(Some).map_err(|_| format!("{name}={v:?} is not a whole number"))
+    };
+    let ask = Glm5TierAsk {
+        vram: num(GLM_VRAM_SLOTS_ENV, vram)?,
+        pinned: num(GLM_PINNED_SLOTS_ENV, pinned)?,
+        readers: num(GLM_NVME_READERS_ENV, readers)?,
+    };
+    let max = crate::nvme_source::MAX_IN_FLIGHT;
+    if let Some(r) = ask.readers.filter(|r| !(1..=max).contains(r)) {
+        return Err(format!("{GLM_NVME_READERS_ENV}={r} is outside 1..={max} (the NVMe tier's reader threads, nvme_source::MAX_IN_FLIGHT)"));
+    }
+    Ok(ask)
+}
+
+/// #185: [`glm5_tier_ask`] on this process's environment
+pub fn glm5_tier_ask_from_env() -> Result<Glm5TierAsk, String> {
+    let v = |n: &str| std::env::var(n).ok();
+    glm5_tier_ask(v(GLM_VRAM_SLOTS_ENV).as_deref(), v(GLM_PINNED_SLOTS_ENV).as_deref(), v(GLM_NVME_READERS_ENV).as_deref())
+}
+
+impl Glm5TierAsk {
+    /// The tier sizes and the reader count serve runs: the plan's (and `default_readers`) where
+    /// nothing is asked. The slot range is `glm5_run`'s (`glm5_tiers::tier_sizes`): at most the
+    /// plan; above it is refused by the env name.
+    pub fn resolve(&self, plan: &crate::manager::TierPlan, default_readers: usize) -> Result<(crate::glm5_tiers::TierSizes, usize), String> {
+        let sizes = crate::glm5_tiers::tier_sizes(plan, self.vram, self.pinned).map_err(|e| {
+            e.replacen("--vram-slots ", &format!("{GLM_VRAM_SLOTS_ENV}="), 1).replacen("--pinned-slots ", &format!("{GLM_PINNED_SLOTS_ENV}="), 1)
+        })?;
+        Ok((sizes, self.readers.unwrap_or(default_readers)))
+    }
+
+    /// where each figure came from, for the `[budget]` line: `plan` / `default` or `NAME=value`
+    pub fn sources(&self) -> String {
+        let one = |name: &str, v: Option<usize>, dflt: &str| v.map_or(dflt.to_string(), |n| format!("{name}={n}"));
+        format!(
+            "VRAM {}, pinned {}, readers {}",
+            one(GLM_VRAM_SLOTS_ENV, self.vram, "plan"),
+            one(GLM_PINNED_SLOTS_ENV, self.pinned, "plan"),
+            one(GLM_NVME_READERS_ENV, self.readers, "default")
+        )
+    }
 }
 
 /// #185 part 2: [`glm5_door`], then the process's CUDA context. Returned in drop order like
@@ -574,5 +641,58 @@ mod tests_300_c7 {
             Ok(_) => panic!("a Flash-Next container opened as glm5_next"),
         };
         assert!(why.starts_with(&format!("glm5_next container {fnx}: ")) && why.ends_with("family FlashNext has no Glm5Geo"), "{why}");
+    }
+}
+
+#[cfg(test)]
+mod tests_185_tiers {
+    //! #185: serve's glm5_next tier options (`CROW_GLM_VRAM_SLOTS`, `CROW_GLM_PINNED_SLOTS`,
+    //! `CROW_GLM_NVME_READERS`), pure: no env is set, no CUDA call.
+    use super::{glm5_tier_ask, Glm5TierAsk};
+    use crate::geo::{Glm5Geo, GLM5_NEXT_DENSE_BYTES, HOST_PINNED_CAP};
+    use crate::glm5_tiers::TierSizes;
+    use crate::manager::{plan_glm5_next, TierPlan};
+
+    /// the #159 plan at 200,000 tokens on the 5090 of record (32,607 MiB) with the 3.05-bpw
+    /// MUL1 record, as `glm5_tiers`' own tier test plans it
+    fn plan() -> TierPlan {
+        plan_glm5_next(&Glm5Geo::GLM_5_3_FLASH, 200_000, 32_607 << 20, HOST_PINNED_CAP, GLM5_NEXT_DENSE_BYTES, 9_474_048, 64, true).unwrap().2
+    }
+
+    #[test]
+    fn unset_or_empty_is_todays_plan_and_one_reader() {
+        let p = plan();
+        for (v, q, r) in [(None, None, None), (Some(""), Some("  "), Some(""))] {
+            let ask = glm5_tier_ask(v, q, r).unwrap();
+            assert_eq!(ask, Glm5TierAsk::default());
+            assert_eq!(ask.resolve(&p, crate::glm5_engine::READERS).unwrap(), (TierSizes { vram: p.hot, pinned: p.pinned }, 1));
+            assert_eq!(ask.sources(), "VRAM plan, pinned plan, readers default");
+        }
+    }
+
+    #[test]
+    fn asks_at_or_below_the_plan_are_taken() {
+        let p = plan();
+        let ask = glm5_tier_ask(Some("40"), Some(" 0 "), Some("2")).unwrap();
+        assert_eq!(ask.resolve(&p, 1).unwrap(), (TierSizes { vram: 40, pinned: 0 }, 2));
+        assert_eq!(ask.sources(), "VRAM CROW_GLM_VRAM_SLOTS=40, pinned CROW_GLM_PINNED_SLOTS=0, readers CROW_GLM_NVME_READERS=2");
+        let at = glm5_tier_ask(Some(&p.hot.to_string()), Some(&p.pinned.to_string()), Some("8")).unwrap();
+        assert_eq!(at.resolve(&p, 1).unwrap(), (TierSizes { vram: p.hot, pinned: p.pinned }, 8));
+    }
+
+    #[test]
+    fn out_of_range_and_malformed_values_are_refused_by_name() {
+        let p = plan();
+        let e = glm5_tier_ask(Some(&(p.hot + 1).to_string()), None, None).unwrap().resolve(&p, 1).unwrap_err();
+        assert!(e.starts_with(&format!("CROW_GLM_VRAM_SLOTS={} per MoE layer is above the #159 plan's {}", p.hot + 1, p.hot)), "{e}");
+        let e = glm5_tier_ask(None, Some(&(p.pinned + 1).to_string()), None).unwrap().resolve(&p, 1).unwrap_err();
+        assert!(e.starts_with(&format!("CROW_GLM_PINNED_SLOTS={} per MoE layer is above the #159 plan's {}", p.pinned + 1, p.pinned)), "{e}");
+        assert_eq!(glm5_tier_ask(Some("4x"), None, None).unwrap_err(), "CROW_GLM_VRAM_SLOTS=\"4x\" is not a whole number");
+        assert_eq!(glm5_tier_ask(None, Some("-1"), None).unwrap_err(), "CROW_GLM_PINNED_SLOTS=\"-1\" is not a whole number");
+        assert_eq!(glm5_tier_ask(None, None, Some("two")).unwrap_err(), "CROW_GLM_NVME_READERS=\"two\" is not a whole number");
+        for r in ["0", "9"] {
+            let e = glm5_tier_ask(None, None, Some(r)).unwrap_err();
+            assert!(e.starts_with(&format!("CROW_GLM_NVME_READERS={r} is outside 1..=8")), "{e}");
+        }
     }
 }

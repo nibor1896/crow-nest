@@ -36,7 +36,8 @@ use crate::manager::{derive_host_pinned_budget, glm5_plan_table, plan_glm5_next,
 use crate::meta::ModelMeta;
 use crate::toolcall::Markup;
 
-/// NVMe readers of serve's expert tier (PREREG amendment 5: one reader, B = 6.994 GB/s)
+/// NVMe readers of serve's expert tier by default (PREREG amendment 5: one reader,
+/// B = 6.994 GB/s); `CROW_GLM_NVME_READERS` asks for another count (#185, `boot::glm5_tier_ask`)
 pub const READERS: usize = 1;
 
 /// Is `meta` a GLM-5.3-Flash config? `serve`'s dispatch sends only `Glm5Next` here; anything
@@ -134,16 +135,23 @@ impl Glm5Device {
         for l in glm5_plan_table(&o.g, &states, &input, &plan, &sources).lines() {
             log(&format!("[budget] {l}"));
         }
-        let sizes = gt::tier_sizes(&plan, None, None)?;
+        // #185: CROW_GLM_VRAM_SLOTS / CROW_GLM_PINNED_SLOTS / CROW_GLM_NVME_READERS (glm5_run's
+        // --vram-slots / --pinned-slots / --readers); unset = the plan and READERS
+        let ask = crate::boot::glm5_tier_ask_from_env()?;
+        let (sizes, readers) = ask.resolve(&plan, READERS)?;
         let run = Glm5Run::load(&mut o.cnq, &o.g, &o.moe, context, log);
-        let tiers = ExpertTiers::new(&o.cnq, &o.path, &o.g, &o.moe, sizes, READERS, o.g.topk)?;
+        let tiers = ExpertTiers::new(&o.cnq, &o.path, &o.g, &o.moe, sizes, readers, o.g.topk)?;
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         log(&format!(
-            "[budget] glm5_next tiers per MoE layer: VRAM {} / pinned {} / NVMe {} x {} MoE layers; {:.2} GiB VRAM (slots, {} staging, tables), {:.2} GiB pinned; free VRAM now {:.2} GiB; policy {:?}, cache empty at start, NVMe readers {READERS}",
+            "[budget] glm5_next tiers per MoE layer: VRAM {} / pinned {} / NVMe {} x {} MoE layers (plan {} / {} / {}; {}); {:.2} GiB VRAM (slots, {} staging, tables), {:.2} GiB pinned; free VRAM now {:.2} GiB; policy {:?}, cache empty at start, NVMe readers {readers}",
             sizes.vram,
             sizes.pinned,
             o.g.experts - sizes.vram - sizes.pinned,
             gt::moe_layers(&o.g),
+            plan.hot,
+            plan.pinned,
+            plan.nvme,
+            ask.sources(),
             gib(tiers.vram_bytes()),
             tiers.stage_cap,
             gib(tiers.pinned_bytes()),
