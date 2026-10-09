@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! glm5_run [-n N] [--cnq PATH] [--ids a,b,c | --prompt TEXT --tokenizer tokenizer.json | --prompt-ids PATH]
-//!          [--prompt-tokens N] [--reps N] [--cold] [--json PATH]
+//!          [--prompt-tokens N] [--reps N] [--cold] [--json PATH]   (env: CROW_CHUNK=N, #186)
 //!          [--tokenizer tokenizer.json] [--vram-slots N] [--pinned-slots N] [--readers N]
 //! ```
 //!
@@ -24,6 +24,11 @@
 //!   floor 200,000 when unset) and the derived pinned budget (`HOST_PINNED_CAP` 46 GiB or less,
 //!   free RAM - `CROW_RAM_MARGIN_GB`); `--vram-slots` / `--pinned-slots` may only ask for less
 //! - NVMe readers: `--readers`, default 1 (PREREG amendment 5)
+//! - #186 prompt chunk: `CROW_CHUNK=N` runs the prompt in prompt calls of up to N rows
+//!   (`Glm5Run::prefill`, one routing sync per MoE layer per call, the prefill staging set of
+//!   `glm5_tiers::prefill_stage_slots` slots); unset or 1 = every prompt row one decode call. The
+//!   plan books the chunk (`manager::plan_glm5_next_chunk`). A prompt call reports once (its
+//!   rows, routing syncs and sub-batches); its seconds are the call's, not a row's
 //! - `--json PATH`: every rep, both phases, per MoE layer, args, env, machine state (rewritten
 //!   after every rep)
 //! - #192 `CROW_GLM_MTP=N` (1..=4): speculative decode with the MTP block (the container's
@@ -44,11 +49,11 @@
 //! MoE layer synchronizes for its routing (`glm5_model.rs`, `call_with_experts`), so these are
 //! the times of this synchronous path, not of a graph-captured one.
 use crow_nest_engine::cuda;
-use crow_nest_engine::geo::{from_engine_dir, GLM5_NEXT_DENSE_BYTES, HOST_PINNED_CAP};
+use crow_nest_engine::geo::{from_engine_dir, HOST_PINNED_CAP};
 use crow_nest_engine::glm5_model::GLM5_MUL1K3_CNQ;
 use crow_nest_engine::glm5_mtp::{self as mtp, SpecStats};
 use crow_nest_engine::glm5_tiers::{self as gt, ExpertTiers, Glm5Run, Moves, TokenReport};
-use crow_nest_engine::manager::{derive_host_pinned_budget, plan_glm5_next};
+use crow_nest_engine::manager::derive_host_pinned_budget;
 use serde_json::{json, Value};
 
 /// the spread rule of the gates (`runs/glm53-flash/PREREG.md`): max / min over repetitions
@@ -150,12 +155,19 @@ struct Phase {
     nvme_bytes: u64,
     /// #188: CPU lane pool-run seconds summed over the rows
     lane_s: f64,
+    /// #186: reports (one per row, or one per prompt call), routing syncs, serve sub-batches
+    reports: usize,
+    routing_syncs: u64,
+    sub_batches: u64,
 }
 
 impl Phase {
     fn of(rows: &[&Row], layers: usize, wall: f64) -> Phase {
-        let mut p = Phase { tokens: rows.len(), wall, tiers: vec![[0; 3]; layers], moves: vec![Moves::default(); layers], ..Phase::default() };
+        let tokens = rows.iter().map(|r| r.r.rows.max(1)).sum();
+        let mut p = Phase { tokens, wall, reports: rows.len(), tiers: vec![[0; 3]; layers], moves: vec![Moves::default(); layers], ..Phase::default() };
         for row in rows {
+            p.routing_syncs += row.r.routing_syncs;
+            p.sub_batches += row.r.sub_batches;
             p.lat.push(row.r.secs);
             p.nvme_reads += row.r.nvme_reads;
             p.nvme_bytes += row.r.nvme_bytes;
@@ -195,11 +207,11 @@ impl Phase {
     }
 }
 
-/// Split the rows of one `generate` into prefill (the prompt rows; the last one yields the first
-/// id) and decode (every later row, one generated id each). TTFT = the callback clock of the
-/// last prompt row; the decode wall = the last row's minus TTFT.
-fn phases(rows: &[Row], prompt_len: usize, layers: usize) -> (Phase, Phase, f64) {
-    let ttft = rows.get(prompt_len.saturating_sub(1)).map_or(0.0, |r| r.at);
+/// Split the reports of one `generate` into prefill (the prompt rows or prompt calls; the last one
+/// yields the first id) and decode (every later row, one generated id each). TTFT = the callback
+/// clock of the last prompt report; the decode wall = the last row's minus TTFT.
+fn phases(rows: &[Row], layers: usize) -> (Phase, Phase, f64) {
+    let ttft = rows.iter().rfind(|r| r.r.prompt).map_or(0.0, |r| r.at);
     let pre: Vec<&Row> = rows.iter().filter(|r| r.r.prompt).collect();
     let dec: Vec<&Row> = rows.iter().filter(|r| !r.r.prompt).collect();
     let end = rows.last().map_or(ttft, |r| r.at);
@@ -544,7 +556,9 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("[glm5_run] {}={drafts}: the #159 plan runs at free VRAM minus {mtp_reserved} B (the MTP block, its caches, {drafts} KDA snapshot slots; derived)", mtp::MTP_ENV);
         }
         let budget = derive_host_pinned_budget(HOST_PINNED_CAP, &mut |s| println!("{s}"));
-        let (_, _, plan) = plan_glm5_next(&o.g, context, free.saturating_sub(mtp_reserved), budget, GLM5_NEXT_DENSE_BYTES, o.spec.bytes, crow_nest_engine::gen::pf_tg(), crow_nest_engine::gen::pf_async_on())?;
+        // #186: the prompt chunk Glm5Run::load takes (CROW_CHUNK, at most the run's rows), booked by the plan
+        let (_, input, plan) = gt::plan_for_rows(&o.g, context, prompt.len() + n, free.saturating_sub(mtp_reserved), budget, o.spec.bytes)?;
+        let chunk = input.chunk;
         let sizes = gt::tier_sizes(&plan, num("--vram-slots")?, num("--pinned-slots")?)?;
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         let moe_layers = gt::moe_layers(&o.g);
@@ -560,6 +574,20 @@ fn run(args: &[String]) -> Result<(), String> {
             o.g.experts - sizes.vram - sizes.pinned,
             moe_layers
         );
+        if chunk > 1 {
+            println!(
+                "[glm5_run] #186 prompt chunk {chunk} (CROW_CHUNK): prompt calls {:?}, plan books {:.2} GiB for them (FFN plans of {:?} rows) and the {} B pageable prefill landing off the pinned budget",
+                gt::prompt_calls(prompt.len(), chunk).iter().map(|c| c.1).collect::<Vec<_>>(),
+                gib(input.chunk_scratch_bytes),
+                crow_nest_engine::manager::glm5_prompt_call_sizes(chunk),
+                gt::prefill_stage_slots(o.g.topk) as u64 * o.spec.bytes
+            );
+        } else {
+            println!("[glm5_run] #186 prompt chunk 1 (CROW_CHUNK unset or 1): every prompt row one decode call");
+        }
+        if drafts > 0 && chunk > 1 {
+            println!("[glm5_run] {}={drafts}: the prompt rows run one by one (each leaves its head-norm row for the MTP block); CROW_CHUNK does not apply", mtp::MTP_ENV);
+        }
         let t_load = std::time::Instant::now();
         let mut run = Glm5Run::load(&mut o.cnq, &o.g, &o.moe, cap, &mut |s| println!("{s}"));
         let mtp_n = run.mtp_from_env(&mut o.cnq, &mut |s| println!("{s}"))?;
@@ -567,11 +595,16 @@ fn run(args: &[String]) -> Result<(), String> {
         let t_tiers = std::time::Instant::now();
         // #192: a verify call stages the experts of 1 + N rows at once
         let mut tiers = ExpertTiers::new(&o.cnq, &o.path, &o.g, &o.moe, sizes, readers, (1 + mtp_n) * o.g.topk)?;
+        if run.prompt_chunk() > 1 {
+            // #186: allocated here, so the first prompt call's clock does not hold it
+            tiers.alloc_prefill_stage(gt::prefill_stage_slots(o.g.topk))?;
+        }
         let tiers_s = t_tiers.elapsed().as_secs_f64();
         println!(
-            "[glm5_run] tiers: {:.2} GiB VRAM (slots, {} staging, tables), {:.2} GiB pinned; free VRAM now {:.2} GiB; policy {:?}, cache empty at start; pinned {:?}",
+            "[glm5_run] tiers: {:.2} GiB VRAM (slots, {} decode + {} prefill staging, tables), {:.2} GiB pinned; free VRAM now {:.2} GiB; policy {:?}, cache empty at start; pinned {:?}",
             gib(tiers.vram_bytes()),
             tiers.stage_cap,
+            tiers.prefill_cap(),
             gib(tiers.pinned_bytes()),
             gib(cuda::free_vram_bytes()),
             tiers.cache.policy,
@@ -590,7 +623,9 @@ fn run(args: &[String]) -> Result<(), String> {
             "generate": n, "reps": reps, "cold": cold, "context": context,
             "tiers": { "plan": { "vram": plan.hot, "pinned": plan.pinned, "nvme": plan.nvme }, "vram_slots": sizes.vram, "pinned_slots": sizes.pinned,
                        "nvme": o.g.experts - sizes.vram - sizes.pinned, "moe_layers": moe_layers, "first_moe_layer": first_moe, "readers": readers,
-                       "policy": format!("{:?}", tiers.cache.policy), "pinned_use": format!("{:?}", tiers.pinned_use), "staging_slots": tiers.stage_cap, "pinned_budget_bytes": budget, "free_vram_at_plan_bytes": free },
+                       "policy": format!("{:?}", tiers.cache.policy), "pinned_use": format!("{:?}", tiers.pinned_use), "staging_slots": tiers.stage_cap, "pinned_budget_bytes": budget, "free_vram_at_plan_bytes": free,
+                       "prefill_staging_slots": tiers.prefill_cap() },
+            "prompt_chunk": { "chunk": run.prompt_chunk(), "calls": gt::prompt_calls(prompt.len(), run.prompt_chunk()).iter().map(|c| c.1).collect::<Vec<_>>(), "plan_chunk_scratch_bytes": input.chunk_scratch_bytes },
             "setup": { "open_s": open_s, "load_s": load_s, "tiers_s": tiers_s },
             "mtp": { "drafts_per_step": mtp_n, "planner_vram_reserved_bytes": mtp_reserved, "overlay": std::env::var(mtp::OVERLAY_ENV).ok() },
             "machine_after_setup": m_setup,
@@ -616,8 +651,9 @@ fn run(args: &[String]) -> Result<(), String> {
                 let per: Vec<String> = r.tiers.iter().enumerate().map(|(i, c)| format!("l{} {}/{}/{}", first_moe + i, c[0], c[1], c[2])).collect();
                 let sum = r.tiers.iter().fold([0u64; 3], |a, c| [a[0] + c[0], a[1] + c[1], a[2] + c[2]]);
                 let id = r.next.map_or("-".to_string(), |v| v.to_string());
+                let call = if r.rows > 1 { format!(" ({} rows, {} routing syncs, {} sub-batches)", r.rows, r.routing_syncs, r.sub_batches) } else { String::new() };
                 println!(
-                    "glm5_run row {:>4} {} rep {rep} next {id:>6}  {:.4} s  NVMe reads {:>3} ({:.1} MB)  tiers v/p/n {}/{}/{}  [{}]",
+                    "glm5_run row {:>4} {}{call} rep {rep} next {id:>6}  {:.4} s  NVMe reads {:>3} ({:.1} MB)  tiers v/p/n {}/{}/{}  [{}]",
                     r.pos,
                     if r.prompt { "prompt" } else { "gen   " },
                     r.secs,
@@ -632,7 +668,7 @@ fn run(args: &[String]) -> Result<(), String> {
             };
             let out = run.generate(&mut o.cnq, &mut tiers, &prompt, n, false, &mut report)?;
             let wall = t0.elapsed().as_secs_f64();
-            let (pre, dec, ttft) = phases(&rows, prompt.len(), moe_layers);
+            let (pre, dec, ttft) = phases(&rows, moe_layers);
             let tag = format!("glm5_run rep {rep}/{reps} cache {state}");
             println!("{tag} ids {:?}", out.ids);
             if let Some(t) = &tok {
@@ -640,11 +676,16 @@ fn run(args: &[String]) -> Result<(), String> {
                 println!("{tag} text {:?}", t.decode(&ids)?);
             }
             println!(
-                "{tag} prefill: {} tok, TTFT {ttft:.3} s, {} tok/s, row latency p50 {} s p99 {} s",
+                "{tag} prefill: {} tok, TTFT {ttft:.3} s, {} tok/s, {} latency p50 {} s p99 {} s; prompt chunk {}: {} reports, {} routing syncs, {} serve sub-batches",
                 pre.tokens,
                 opt(pre.rate(), 2),
+                if run.prompt_chunk() > 1 { "call" } else { "row" },
                 opt(percentile(&pre.lat, 50.0), 4),
-                opt(percentile(&pre.lat, 99.0), 4)
+                opt(percentile(&pre.lat, 99.0), 4),
+                run.prompt_chunk(),
+                pre.reports,
+                pre.routing_syncs,
+                pre.sub_batches
             );
             let dr = dec.token_rates();
             if dec.tokens == 0 {
@@ -675,11 +716,12 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("glm5_run machine after rep {rep}: {}", machine_line(&m_rep));
             doc["reps_detail"].as_array_mut().expect("reps array").push(json!({
                 "rep": rep, "cache": state, "wall_s": wall, "ids": out.ids,
-                "prefill": { "timing": timing_json(&pre, Some(ttft)), "counters": counters_json(&pre, rb), "layers": layers_json(&pre, first_moe) },
+                "prefill": { "timing": timing_json(&pre, Some(ttft)), "counters": counters_json(&pre, rb), "layers": layers_json(&pre, first_moe),
+                             "reports": pre.reports, "routing_syncs": pre.routing_syncs, "sub_batches": pre.sub_batches },
                 "decode": { "timing": timing_json(&dec, None), "counters": counters_json(&dec, rb), "layers": layers_json(&dec, first_moe),
                             "mtp": spec.as_ref().map(mtp_json) },
                 "rows": rows.iter().map(|x| json!({ "pos": x.r.pos, "prompt": x.r.prompt, "next": x.r.next, "secs": x.r.secs, "at_s": x.at,
-                    "nvme_reads": x.r.nvme_reads, "nvme_bytes": x.r.nvme_bytes })).collect::<Vec<_>>(),
+                    "nvme_reads": x.r.nvme_reads, "nvme_bytes": x.r.nvme_bytes, "rows": x.r.rows, "routing_syncs": x.r.routing_syncs, "sub_batches": x.r.sub_batches })).collect::<Vec<_>>(),
                 "machine": m_rep,
             }));
             all_ids.push(out.ids);
@@ -779,6 +821,9 @@ mod tests {
                         nvme_bytes: 2 * nv * 100,
                         tiers: vec![[2, 6 - nv, nv]; 2],
                         moves: vec![moves(nv); 2],
+                        rows: 1,
+                        routing_syncs: 2,
+                        sub_batches: 2,
                     },
                     at,
                     lane_s: 0.0,
@@ -790,7 +835,7 @@ mod tests {
     #[test]
     fn the_phases_split_at_the_last_prompt_row_and_ttft_is_its_report() {
         let rows = synthetic();
-        let (pre, dec, ttft) = phases(&rows, 3, 2);
+        let (pre, dec, ttft) = phases(&rows, 2);
         assert_eq!((pre.tokens, dec.tokens), (3, 2));
         // TTFT: the callback clock of row 2 (the last prompt row, which yields the first id)
         assert!((ttft - (0.5 + 0.25 + 0.25 + 0.03)).abs() < 1e-12, "{ttft}");
@@ -831,7 +876,7 @@ mod tests {
     #[test]
     fn one_generated_id_leaves_an_empty_decode_phase() {
         let rows: Vec<Row> = synthetic().into_iter().take(3).collect();
-        let (pre, dec, ttft) = phases(&rows, 3, 2);
+        let (pre, dec, ttft) = phases(&rows, 2);
         assert_eq!((pre.tokens, dec.tokens, dec.wall), (3, 0, 0.0));
         assert!(ttft > 0.0);
         assert_eq!(dec.rate(), None);
@@ -857,18 +902,32 @@ mod tests {
         assert_eq!(summary_json(&[10.0, 11.0])["within_spread_rule"], true);
     }
 
+    /// #186: a prompt phase of 3 rows as one prompt call (one report of 3 rows, its routing syncs
+    /// and sub-batches) counts 3 prefill tokens, TTFT is that report's clock, and decode is unchanged
+    #[test]
+    fn a_prompt_call_report_counts_its_rows() {
+        let mut rows = synthetic();
+        let call = Row { r: TokenReport { rows: 3, routing_syncs: 2, sub_batches: 5, ..rows[2].r.clone() }, at: rows[2].at, lane_s: 0.0 };
+        rows.splice(0..3, [call]);
+        let (pre, dec, ttft) = phases(&rows, 2);
+        assert_eq!((pre.tokens, pre.reports, pre.routing_syncs, pre.sub_batches, dec.tokens), (3, 1, 2, 5, 2));
+        assert!((ttft - (0.5 + 0.25 + 0.25 + 0.03)).abs() < 1e-12, "{ttft}");
+        assert!((pre.rate().unwrap() - 3.0 / ttft).abs() < 1e-12);
+        assert!((dec.wall - 0.32).abs() < 1e-12, "{}", dec.wall);
+    }
+
     /// three reps of the synthetic run, the third slower: medians over the reps, the spread rule
     /// named per metric, ids compared, warm after rep 1 unless --cold
     #[test]
     fn the_summary_gives_medians_spreads_and_the_cache_state_per_rep() {
         let rows = synthetic();
-        let (pre, dec, ttft) = phases(&rows, 3, 2);
+        let (pre, dec, ttft) = phases(&rows, 2);
         let mut slow = rows.clone();
         for r in slow.iter_mut() {
             r.r.secs *= 1.5;
             r.at *= 1.5;
         }
-        let (pre3, dec3, ttft3) = phases(&slow, 3, 2);
+        let (pre3, dec3, ttft3) = phases(&slow, 2);
         let per = vec![(pre.clone(), dec.clone(), ttft, 2.0), (pre, dec, ttft, 2.0), (pre3, dec3, ttft3, 3.0)];
         let ids = vec![vec![2, 3, 4]; 3];
         let (text, s) = summarize(&per, &ids, false);

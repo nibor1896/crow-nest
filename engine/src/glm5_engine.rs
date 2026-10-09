@@ -28,11 +28,11 @@
 //! call reads them. A cold start writes rows from 0, so it drops the snapshot.
 
 use crate::cuda;
-use crate::geo::{Family, GLM5_NEXT_DENSE_BYTES, HOST_PINNED_CAP};
+use crate::geo::{Family, Glm5Geo, HOST_PINNED_CAP};
 use crate::glm5_kda::KdaDims;
 use crate::glm5_template;
 use crate::glm5_tiers::{self as gt, ExpertTiers, Glm5Run, Opened};
-use crate::manager::{derive_host_pinned_budget, glm5_plan_table, plan_glm5_next, TierPlan};
+use crate::manager::{derive_host_pinned_budget, glm5_plan_table, Glm5States, TierInput, TierPlan};
 use crate::meta::ModelMeta;
 use crate::toolcall::Markup;
 
@@ -50,6 +50,12 @@ pub fn check_family(cnq_path: &str, meta: &ModelMeta) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// #186: serve's boot plan: `glm5_tiers::plan_for_rows` over the whole context, so the prompt
+/// chunk `CROW_CHUNK` that `Glm5Run::load` builds for is booked as in `glm5_run`
+pub fn serve_plan(g: &Glm5Geo, context: usize, vram_total: u64, pinned_budget: u64, record_bytes: u64) -> Result<(Glm5States, TierInput, TierPlan), String> {
+    gt::plan_for_rows(g, context, context, vram_total, pinned_budget, record_bytes)
 }
 
 /// What [`Glm5Engine`] needs of a model, one row at a time.
@@ -125,7 +131,7 @@ impl Glm5Device {
     pub unsafe fn load(mut o: Opened, context: usize, log: &mut dyn FnMut(&str)) -> Result<Glm5Device, String> {
         let free = cuda::free_vram_bytes();
         let budget = derive_host_pinned_budget(HOST_PINNED_CAP, &mut |s| log(s));
-        let (states, input, plan) = plan_glm5_next(&o.g, context, free, budget, GLM5_NEXT_DENSE_BYTES, o.spec.bytes, crate::gen::pf_tg(), crate::gen::pf_async_on())?;
+        let (states, input, plan) = serve_plan(&o.g, context, free, budget, o.spec.bytes)?;
         let sources = [
             ("dense", "GLM5_NEXT_DENSE_BYTES".to_string()),
             ("expert", format!("{}: {} records, codec {}", o.path, o.records, o.spec.codec.dtype())),
@@ -184,6 +190,11 @@ impl Rows for Glm5Device {
     }
     unsafe fn row(&mut self, tok: i64, pos: usize, head: bool) -> Result<Option<i64>, String> {
         self.run.row(&mut self.o.cnq, &mut self.tiers, tok, pos, head)
+    }
+    unsafe fn prefill_chunk(&mut self, ids: &[i64], pos0: usize) -> Result<i64, String> {
+        // #186: `CROW_CHUNK` > 1 runs the chunk as prompt calls; 1 (unset) is the row loop of
+        // the trait's default, row for row
+        self.run.prefill(&mut self.o.cnq, &mut self.tiers, ids, pos0, &mut |_| {})
     }
     unsafe fn logits(&self) -> Vec<f32> {
         cuda::dtoh(self.run.logits_dev(), self.o.g.vocab)
@@ -448,6 +459,31 @@ impl<R: Rows> Glm5Engine<R> {
         self.snap.greedy = greedy;
         self.snap.pos = Some(self.history.len());
         t.elapsed().as_secs_f64() * 1e3
+    }
+}
+
+#[cfg(test)]
+mod tests_186_plan {
+    //! #186: serve's boot books the prompt chunk as `glm5_run` does
+    use super::*;
+
+    /// `CROW_CHUNK=32`, RTX 5090, 200,000 rows, the 3-bit record: serve's plan is `glm5_run`'s
+    /// (`plan_for_rows`) and books chunk 32. No other lib test reads `CROW_CHUNK`.
+    #[test]
+    fn serve_books_the_prompt_chunk_as_glm5_run() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let (card, rec) = (32_607u64 << 20, 9_474_048u64);
+        let old = std::env::var("CROW_CHUNK").ok();
+        std::env::set_var("CROW_CHUNK", "32");
+        let serve = serve_plan(&g, 200_000, card, HOST_PINNED_CAP, rec);
+        let run = gt::plan_for_rows(&g, 200_000, 200_000, card, HOST_PINNED_CAP, rec);
+        match old {
+            Some(o) => std::env::set_var("CROW_CHUNK", o),
+            None => std::env::remove_var("CROW_CHUNK"),
+        }
+        let ((ss, si, sp), (rs, ri, rp)) = (serve.unwrap(), run.unwrap());
+        assert_eq!((si.chunk, si.chunk_scratch_bytes), (32, crate::manager::glm5_chunk_scratch_bytes(&g, 32, 200_000)), "serve books chunk 32");
+        assert_eq!((ss.total(), si.chunk, si.chunk_scratch_bytes, si.host_pinned_budget, sp), (rs.total(), ri.chunk, ri.chunk_scratch_bytes, ri.host_pinned_budget, rp));
     }
 }
 

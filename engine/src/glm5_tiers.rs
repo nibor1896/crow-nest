@@ -29,8 +29,11 @@
 //!   once at setup ([`ExpertRecord::glm5_table`]).
 //! - **Driver** ([`Glm5Run`]): the dense part of every layer stays in VRAM
 //!   (`glm5_model::load_layer_without_experts`), one KDA state per KDA layer and one MLA cache
-//!   per DSA layer are swapped into the `Glm5Pass` around the layer's call, every row (prompt and
-//!   generated) runs as one decode call (no chunked prefill in this path), greedy head.
+//!   per DSA layer are swapped into the `Glm5Pass` around the layer's call, every generated row
+//!   runs as one decode call, greedy head. The prompt rows run as decode calls too (`CROW_CHUNK`
+//!   unset or 1), or (#186, `CROW_CHUNK=N`) in prompt calls of up to N rows ([`prompt_calls`],
+//!   [`Glm5Run::prefill`]): one routing sync per MoE layer per call, the call's selection served
+//!   through the prefill staging set in row sub-batches that fit it ([`serve_chunk`]).
 //!
 //! The cache decides only where a record is read from; the bytes are the container's, and the
 //! MUL1 kernels read VRAM and pinned records alike (`glm5_moe_gpu_layer_matches_the_oracle`:
@@ -346,9 +349,7 @@ pub fn serve(cache: &mut ExpertCache, l: usize, slots: &mut LayerSlots, ids: &[u
     let before = tiers(cache);
     cache.observe_token(l, ids);
     let after = tiers(cache);
-    // staged: entering VRAM (any id), then the selected ids the policy left on NVMe
-    let mut staged: Vec<u32> = (0..n as u32).filter(|&e| after[e as usize] == Tier::Vram && before[e as usize] != Tier::Vram).collect();
-    staged.extend(ids.iter().copied().filter(|&e| after[e as usize] == Tier::Nvme));
+    let staged = staged_of(&before, &after, ids);
     if staged.len() > stage_cap {
         return Err(format!("expert tiers: layer {l} stages {} records in one call, {stage_cap} staging slots", staged.len()));
     }
@@ -476,6 +477,114 @@ pub fn distinct_ids(sel: &[i32], experts: usize) -> Result<Vec<u32>, String> {
     Ok(v)
 }
 
+/// the records [`serve`] stages for a call that moves the tiers from `before` to `after`: every
+/// expert entering VRAM (any id), then every selected id the policy leaves on NVMe
+fn staged_of(before: &[Tier], after: &[Tier], ids: &[u32]) -> Vec<u32> {
+    let mut staged: Vec<u32> = (0..before.len() as u32).filter(|&e| after[e as usize] == Tier::Vram && before[e as usize] != Tier::Vram).collect();
+    staged.extend(ids.iter().copied().filter(|&e| after[e as usize] == Tier::Nvme));
+    staged
+}
+
+/// #186: the records one [`serve`] of `ids` (distinct, ascending) in layer `l` would stage; the
+/// cache is left as it is ([`ExpertCache::tiers_after`])
+pub fn staged_count(cache: &ExpertCache, l: usize, ids: &[u32]) -> usize {
+    let before: Vec<Tier> = (0..cache.experts as u32).map(|e| cache.tier(l, e)).collect();
+    staged_of(&before, &cache.tiers_after(l, ids), ids).len()
+}
+
+/// #186: how many rows of a prompt call's selection `sel` (`[rows][k]` i32, from its first row)
+/// one [`serve`] with `cap` staging slots takes: every row when their staged set fits, else the
+/// largest power of two of rows that fits (the call sizes the plan books,
+/// `manager::glm5_prompt_call_sizes`). Refused by name when one row does not fit.
+pub fn fitting_rows(cache: &ExpertCache, l: usize, sel: &[i32], k: usize, cap: usize) -> Result<usize, String> {
+    let t = sel.len() / k;
+    if t == 0 || sel.len() != t * k {
+        return Err(format!("expert tiers: layer {l}: a selection of {} ids is no [rows][{k}]", sel.len()));
+    }
+    let fits = |r: usize| -> Result<bool, String> { Ok(staged_count(cache, l, &distinct_ids(&sel[..r * k], cache.experts)?) <= cap) };
+    if fits(t)? {
+        return Ok(t);
+    }
+    let mut r = 1usize << (usize::BITS - 1 - t.leading_zeros());
+    if r == t {
+        r /= 2;
+    }
+    while r >= 1 {
+        if fits(r)? {
+            return Ok(r);
+        }
+        r /= 2;
+    }
+    let one = staged_count(cache, l, &distinct_ids(&sel[..k], cache.experts)?);
+    Err(format!("expert tiers: layer {l}: one row stages {one} records, {cap} staging slots"))
+}
+
+/// #186: one prompt call of MoE layer `l`: the `[t][k]` selection `sel` served in consecutive row
+/// sub-batches, each one [`serve`] (one cache tick) of its rows' distinct ids whose staged set fits
+/// `cap` ([`fitting_rows`]). `each(row0, rows, served)` sees every sub-batch in row order, right
+/// after its records moved, and queues its experts; before every sub-batch after the first the
+/// mover's barrier waits for the previous one's (they read the staging slots this one reuses).
+/// Returns the number of sub-batches.
+#[allow(clippy::too_many_arguments)]
+pub fn serve_chunk(
+    cache: &mut ExpertCache,
+    l: usize,
+    slots: &mut LayerSlots,
+    sel: &[i32],
+    k: usize,
+    cap: usize,
+    m: &mut dyn Mover,
+    each: &mut dyn FnMut(usize, usize, &Served) -> Result<(), String>,
+) -> Result<usize, String> {
+    let t = sel.len() / k;
+    let (mut r0, mut batches) = (0, 0);
+    while r0 < t {
+        if r0 > 0 {
+            m.barrier();
+        }
+        let rows = fitting_rows(cache, l, &sel[r0 * k..], k, cap)?;
+        let ids = distinct_ids(&sel[r0 * k..(r0 + rows) * k], cache.experts)?;
+        let served = serve(cache, l, slots, &ids, cap, m)?;
+        each(r0, rows, &served)?;
+        batches += 1;
+        r0 += rows;
+    }
+    Ok(batches)
+}
+
+/// #186: the calls of a prompt phase of `n` rows at up to `chunk` rows per call, `(first row,
+/// rows)`: full chunks, then the remainder as one call (its FFN runs in the plan's sizes,
+/// `Glm5Pass::call_with_expert_batches`). Chunk 1: one row each.
+pub fn prompt_calls(n: usize, chunk: usize) -> Vec<(usize, usize)> {
+    let c = chunk.max(1);
+    let mut v: Vec<(usize, usize)> = (0..n / c).map(|i| (i * c, c)).collect();
+    if n % c > 0 {
+        v.push((n / c * c, n % c));
+    }
+    v
+}
+
+/// #186: the prompt chunk of the glm5_next path: `CROW_CHUNK` (`geo::chunk_from_env`), else 1 =
+/// every prompt row one decode call (the path of record until the lever is measured)
+pub fn prompt_chunk_from_env() -> usize {
+    crate::geo::chunk_from_env().unwrap_or(1)
+}
+
+/// #186: the #159 plan of a glm5_next run of up to `rows` rows over a cache of `context` rows on
+/// `vram_total` and `pinned_budget`, the expert record `record_bytes`: the prompt chunk
+/// `Glm5Run::load` takes (`CROW_CHUNK`, at most `rows`) booked by `plan_glm5_next_chunk`. The one
+/// plan of `glm5_run` and of serve's boot (`glm5_engine::serve_plan`), so both book the same memory.
+pub fn plan_for_rows(g: &Glm5Geo, context: usize, rows: usize, vram_total: u64, pinned_budget: u64, record_bytes: u64) -> Result<(crate::manager::Glm5States, crate::manager::TierInput, TierPlan), String> {
+    let chunk = prompt_chunk_from_env().clamp(1, rows.max(1));
+    crate::manager::plan_glm5_next_chunk(g, context, vram_total, pinned_budget, crate::geo::GLM5_NEXT_DENSE_BYTES, record_bytes, crate::gen::pf_tg(), crate::gen::pf_async_on(), chunk)
+}
+
+/// #186: the staging slots of a prompt call: the #176 prefill set the plan books
+/// (`Stability::stage_slots(..).prefill`: `PF_TG`, doubled with `CROW_PF_ASYNC`)
+pub fn prefill_stage_slots(topk: usize) -> usize {
+    crate::geo::Stability::of(crate::geo::Family::Glm5Next).stage_slots(topk, crate::gen::pf_tg(), crate::gen::pf_async_on()).prefill
+}
+
 // ---------------------------------------------------------------- the device store
 
 /// a 4096-aligned host buffer (the NVMe landing of the staging slots; pageable, not pinned, so
@@ -533,6 +642,14 @@ pub struct ExpertTiers {
     pub nvme_bytes: u64,
     /// #187: the [`Moves`] of every MoE layer since construction (host counters)
     pub moves: Vec<Moves>,
+    /// #186: MoE calls served since construction (one routing sync each) and the [`serve`]
+    /// sub-batches they took (a decode call one, a prompt call [`serve_chunk`]'s count)
+    pub routing_syncs: u64,
+    pub sub_batches: u64,
+    /// #186: the prefill staging set of prompt calls (0 slots until [`ExpertTiers::alloc_prefill_stage`])
+    pf_cap: usize,
+    pf_stage: Dev,
+    pf_landing: Landing,
     /// #188: `CROW_GLM_PINNED` / `CROW_GLM_CPU_LANE` as read at construction
     pub pinned_use: PinnedUse,
     /// the pinned arenas are write-combined (`CROW_PINNED_ALLOC`)
@@ -646,6 +763,11 @@ impl ExpertTiers {
             nvme_reads: 0,
             nvme_bytes: 0,
             moves: vec![Moves::default(); nl],
+            routing_syncs: 0,
+            sub_batches: 0,
+            pf_cap: 0,
+            pf_stage: 0,
+            pf_landing: Landing::new(0),
             pinned_use: PinnedUse::default(),
             pinned_wc,
             topk: g.topk,
@@ -673,7 +795,7 @@ impl ExpertTiers {
     /// the VRAM bytes this store holds (arenas, staging, tables)
     pub fn vram_bytes(&self) -> u64 {
         let nl = self.slots.len() as u64;
-        nl * (self.sizes.vram as u64 * self.rb + self.cache.experts as u64 * 8) + self.stage_cap as u64 * self.rb
+        nl * (self.sizes.vram as u64 * self.rb + self.cache.experts as u64 * 8) + (self.stage_cap + self.pf_cap) as u64 * self.rb
     }
 
     /// The record table of decoder layer `layer` for the selection `sel` (`[t][topk]` i32):
@@ -719,7 +841,77 @@ impl ExpertTiers {
         self.nvme_reads += served.nvme_reads as u64;
         self.nvme_bytes += served.nvme_bytes;
         self.moves[l].add(&served.moves);
+        self.routing_syncs += 1;
+        self.sub_batches += 1;
         Ok((self.tables[l], served))
+    }
+
+    /// #186: allocate the prefill staging set: `slots` VRAM staging slots and as many pageable
+    /// landing records ([`prefill_stage_slots`], the set the plan books), unless it is there.
+    /// Prompt calls ([`ExpertTiers::tables_for_chunk`]) stage through it; decode calls keep the
+    /// `stage_cap` set.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn alloc_prefill_stage(&mut self, slots: usize) -> Result<(), String> {
+        if self.pf_cap > 0 {
+            return Ok(());
+        }
+        if slots < self.topk {
+            return Err(format!("expert tiers: a prefill staging set of {slots} slots holds less than one row's top-{}", self.topk));
+        }
+        self.pf_stage = cuda::alloc_named("glm5 expert prefill staging slots", slots * self.rb as usize);
+        self.pf_landing = Landing::new(slots * self.rb as usize);
+        self.pf_cap = slots;
+        Ok(())
+    }
+
+    /// #186: the slots of the prefill staging set (0 before the first prompt call)
+    pub fn prefill_cap(&self) -> usize {
+        self.pf_cap
+    }
+
+    /// #186: the experts of one prompt call of decoder layer `layer` (`sel` = `[t][topk]` i32):
+    /// [`serve_chunk`] through the prefill staging set (allocated here on first use), the device
+    /// table rewritten per row sub-batch; `run(row0, rows, table)` queues that sub-batch's
+    /// experts. One routing sync for the call; a stream sync before every later sub-batch.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading this layer's slots, its table or the prefill
+    /// staging set is pending; `run` queues on the current stream.
+    pub unsafe fn tables_for_chunk(&mut self, layer: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<(), String> {
+        let l = layer.checked_sub(self.first_moe).filter(|&l| l < self.slots.len()).ok_or_else(|| format!("expert tiers: layer {layer} is no MoE layer"))?;
+        if self.pf_cap == 0 {
+            self.alloc_prefill_stage(prefill_stage_slots(self.topk))?;
+        }
+        // a CPU-lane post belongs to a decode call: none for this call's tables
+        crate::glm5_moe::lane::post(None);
+        let (rb, k, experts) = (self.rb, self.topk, self.cache.experts);
+        let (vram, pin_dev, stage, table_dev) = (self.vram[l], self.pinned.get(l).map_or(0, |p| p.dev), self.pf_stage, self.tables[l]);
+        let mut m = GpuMover { vram, pinned: self.pinned.get(l), stage, landing: self.pf_landing.p, rb, src: &self.src, recs: &self.records[l] };
+        let (mut reads, mut bytes, mut moves) = (0u64, 0u64, Moves::default());
+        let mut each = |r0: usize, rows: usize, served: &Served| -> Result<(), String> {
+            let mut table = vec![0u64; experts];
+            for &(e, loc) in &served.locs {
+                table[e as usize] = match loc {
+                    Loc::Vram(v) => vram + v as u64 * rb,
+                    Loc::Pinned(q) => pin_dev + q as u64 * rb,
+                    Loc::Stage(s) => stage + s as u64 * rb,
+                };
+            }
+            cuda::to_u64_into(table_dev, &table);
+            reads += served.nvme_reads as u64;
+            bytes += served.nvme_bytes;
+            moves.add(&served.moves);
+            run(r0, rows, table_dev)
+        };
+        let r = serve_chunk(&mut self.cache, l, &mut self.slots[l], sel, k, self.pf_cap, &mut m, &mut each);
+        self.nvme_reads += reads;
+        self.nvme_bytes += bytes;
+        self.moves[l].add(&moves);
+        self.routing_syncs += 1;
+        self.sub_batches += *r.as_ref().unwrap_or(&0) as u64;
+        r.map(|_| ())
     }
 
     /// #190: the device record table of every MoE layer (the buffers `table_for` rewrites)
@@ -751,6 +943,8 @@ impl ExpertTiers {
             p.free();
         }
         cuda::free_dev(&mut self.stage);
+        cuda::free_dev(&mut self.pf_stage);
+        self.pf_cap = 0;
     }
 }
 
@@ -801,6 +995,12 @@ pub struct TokenReport {
     pub tiers: Vec<[u64; 3]>,
     /// #187: the [`Moves`] of this row per MoE layer (host counters)
     pub moves: Vec<Moves>,
+    /// #186: the prompt rows this report covers (a prompt call of `CROW_CHUNK` rows reports once,
+    /// at its last row `pos`); 1 for a decode row
+    pub rows: usize,
+    /// #186: MoE calls of this report (one routing sync each) and their [`serve`] sub-batches
+    pub routing_syncs: u64,
+    pub sub_batches: u64,
 }
 
 /// what a run generated
@@ -816,6 +1016,9 @@ pub struct Glm5Run {
     pub g: Glm5Geo,
     pub moe: MoeGeo,
     pub cap: usize,
+    /// #186: prompt rows per prompt call (1 = every prompt row one decode call); at most the
+    /// pass's `max_t` (`CROW_CHUNK` at `load`, [`Glm5Run::set_prompt_chunk`])
+    prompt_chunk: usize,
     pub load: LoadReport,
     pass: Glm5Pass,
     layers: Vec<LayerW>,
@@ -852,11 +1055,20 @@ struct RowBase {
     moves: Vec<Moves>,
     nvme_reads: u64,
     nvme_bytes: u64,
+    routing_syncs: u64,
+    sub_batches: u64,
 }
 
 impl RowBase {
     fn of(t: &ExpertTiers) -> RowBase {
-        RowBase { counters: t.cache.counters().to_vec(), moves: t.moves.clone(), nvme_reads: t.nvme_reads, nvme_bytes: t.nvme_bytes }
+        RowBase {
+            counters: t.cache.counters().to_vec(),
+            moves: t.moves.clone(),
+            nvme_reads: t.nvme_reads,
+            nvme_bytes: t.nvme_bytes,
+            routing_syncs: t.routing_syncs,
+            sub_batches: t.sub_batches,
+        }
     }
 
     fn report(&self, t: &ExpertTiers, pos: usize, prompt: bool, next: Option<i64>, t0: std::time::Instant) -> TokenReport {
@@ -869,6 +1081,9 @@ impl RowBase {
             nvme_bytes: t.nvme_bytes - self.nvme_bytes,
             tiers: t.cache.counters().iter().zip(&self.counters).map(|(a, b)| [a[0] - b[0], a[1] - b[1], a[2] - b[2]]).collect(),
             moves: t.moves.iter().zip(&self.moves).map(|(a, b)| a.since(b)).collect(),
+            rows: 1,
+            routing_syncs: t.routing_syncs - self.routing_syncs,
+            sub_batches: t.sub_batches - self.sub_batches,
         }
     }
 }
@@ -900,18 +1115,23 @@ impl Glm5Run {
         let kda = (0..g.layers).map(|l| (gm::attn_kind(g, l) == AttnKind::Kda).then(|| KdaState::alloc(&kd))).collect();
         let mla = (0..g.layers).map(|l| (gm::attn_kind(g, l) == AttnKind::Mla).then(|| MlaCache::new(&md, cap))).collect();
         let row = g.hc_streams * g.hidden;
+        // #186: the pass and the residual hold a prompt call of CROW_CHUNK rows (1 = row by row)
+        let chunk = prompt_chunk_from_env().clamp(1, cap.max(1));
+        // #192: the pass and the residual also hold a verify call of 1 + CROW_GLM_MTP rows
+        let max_t = chunk.max((1 + crate::glm5_mtp::draft_rows_from_env().unwrap_or(0)).min(cap.max(1)));
         let mut run = Glm5Run {
             g: *g,
             moe: *moe,
             cap,
+            prompt_chunk: chunk,
             load,
-            pass: Glm5Pass::new(g, *moe, 1 + crate::glm5_mtp::draft_rows_from_env().unwrap_or(0), cap),
+            pass: Glm5Pass::new(g, *moe, max_t, cap),
             layers,
             kda,
             mla,
             head: Head::new(gm::head_geo(g)),
             hw,
-            x: cuda::alloc_named("glm5_run residual", row * 4),
+            x: cuda::alloc_named("glm5_run residual", max_t * row * 4),
             normed: cuda::alloc_named("glm5_run normed", g.hidden * 4),
             logits: cuda::alloc_named("glm5_run logits", g.vocab * 4),
             next: cuda::alloc_named("glm5_run greedy id", 4),
@@ -991,7 +1211,8 @@ impl Glm5Run {
         }
         let k = glm5_flags::Kernels::new(&self.g);
         if sw.flags {
-            // one decode row's ids (#192: a verify of more rows reads its ids by a sync)
+            // the decode calls' ids (one row); #186 prompt calls and #192 verify calls of more rows
+            // read theirs after a stream sync
             self.pass.routed = Some(Routed::new(&k, self.moe.topk));
         }
         if sw.lookahead {
@@ -1028,9 +1249,21 @@ impl Glm5Run {
             return self.generate_spec(cnq, tiers, prompt, n, keep_logits, report);
         }
         let mut out = Generated::default();
+        // #186: with a prompt chunk above 1 the prompt rows run as prompt calls; the rows from
+        // `start` on (the generated ones) run below as before
+        let start = if self.prompt_chunk > 1 {
+            let id = self.prefill(cnq, tiers, prompt, 0, report)?;
+            if keep_logits {
+                out.logits.push(cuda::dtoh(self.logits, self.g.vocab));
+            }
+            out.ids.push(id);
+            prompt.len()
+        } else {
+            0
+        };
         if self.feed.is_none() {
             let pn = prompt.len();
-            for pos in 0..rows {
+            for pos in start..rows {
                 let t0 = std::time::Instant::now();
                 let base = RowBase::of(tiers);
                 let tok = if pos < pn { prompt[pos] } else { out.ids[pos - pn] };
@@ -1046,14 +1279,14 @@ impl Glm5Run {
             return Ok(out);
         }
         let rb = self.readback.take().expect("glm5_run: lookahead without its readback");
-        let r = self.generate_ahead(cnq, tiers, prompt, rows, keep_logits, &rb, &mut out, report);
+        let r = self.generate_ahead(cnq, tiers, prompt, start, rows, keep_logits, &rb, &mut out, report);
         self.readback = Some(rb);
         r.map(|_| out)
     }
 
     /// [`Glm5Run::generate`] with the lookahead (#189)
     #[allow(clippy::too_many_arguments)]
-    unsafe fn generate_ahead(&mut self, cnq: &mut Cnq, tiers: &mut ExpertTiers, prompt: &[i64], rows: usize, keep_logits: bool, rb: &Readback, out: &mut Generated, report: &mut dyn FnMut(&TokenReport)) -> Result<(), String> {
+    unsafe fn generate_ahead(&mut self, cnq: &mut Cnq, tiers: &mut ExpertTiers, prompt: &[i64], start: usize, rows: usize, keep_logits: bool, rb: &Readback, out: &mut Generated, report: &mut dyn FnMut(&TokenReport)) -> Result<(), String> {
         let (pn, vocab) = (prompt.len(), self.g.vocab);
         // the host reads a pending row's id: only after a sync point that follows its readback
         let finish = |p: Pending, t: &ExpertTiers, out: &mut Generated, report: &mut dyn FnMut(&TokenReport)| -> Result<(), String> {
@@ -1069,7 +1302,7 @@ impl Glm5Run {
             Ok(())
         };
         let mut pending: Option<Pending> = None;
-        for pos in 0..rows {
+        for pos in start..rows {
             let t0 = std::time::Instant::now();
             let base = RowBase::of(tiers);
             if pos < pn {
@@ -1619,6 +1852,148 @@ mod tests {
         assert!(e.contains("stages 9 records in one call, 8 staging slots"), "{e}");
     }
 
+    /// #186: a Mover over a shared twin, so a sub-batch callback of [`serve_chunk`] can look at
+    /// the slots while the chunk is being served
+    struct SharedSim<'a>(&'a std::cell::RefCell<Sim>);
+
+    impl Mover for SharedSim<'_> {
+        fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
+            self.0.borrow_mut().nvme(jobs)
+        }
+        fn landing_to_stage(&mut self, i: u32) {
+            self.0.borrow_mut().landing_to_stage(i)
+        }
+        fn pinned_to_stage(&mut self, q: u32, s: u32) {
+            self.0.borrow_mut().pinned_to_stage(q, s)
+        }
+        fn vram_to_stage(&mut self, v: u32, s: u32) {
+            self.0.borrow_mut().vram_to_stage(v, s)
+        }
+        fn barrier(&mut self) {
+            let mut sim = self.0.borrow_mut();
+            sim.barrier();
+            sim.ops.visits += 1; // counts the barriers (no serve counts visits on the twin)
+        }
+        fn vram_to_pinned(&mut self, v: u32, q: u32) {
+            self.0.borrow_mut().vram_to_pinned(v, q)
+        }
+        fn stage_to_vram(&mut self, s: u32, v: u32) {
+            self.0.borrow_mut().stage_to_vram(s, v)
+        }
+    }
+
+    /// #186 (Expected result 5): one prompt call of 512 rows x top-8 over 288 experts, 3 MoE
+    /// layers, the 128-slot prefill staging set, at V 0 + P 0 (every record staged) and the
+    /// #159 plan's V 50 + P 124: the call is served in row sub-batches, each one `serve` whose
+    /// staged records fit the 128 slots; the sub-batches cover the 512 rows once, in order; after
+    /// each, every (row, expert) of its rows finds its record where the table points, and every
+    /// cached record sits in its slot; the mover waits between sub-batches. At V 0 + P 0 the call
+    /// needs more than one sub-batch (one `serve` of the whole call is refused: the defect).
+    #[test]
+    fn a_prompt_call_is_served_in_sub_batches_that_fit_the_prefill_set() {
+        let (layers, experts, k, rows, cap) = (3, 288, 8, 512, 128);
+        let tr = trace(rows, layers, experts as u64, k, 0x186);
+        for (v, pin) in [(0, 0), (50, 124)] {
+            let sizes = TierSizes { vram: v, pinned: pin };
+            let mut c = ExpertCache::new(Policy::Lru, Scope::PerLayer, layers, experts, v, pin).unwrap();
+            let mut slots: Vec<LayerSlots> = (0..layers).map(|_| LayerSlots::new(experts, sizes)).collect();
+            for l in 0..layers {
+                // the call's selection in pick order: [rows][k] i32
+                let sel: Vec<i32> = tr.iter().flat_map(|tok| tok[l].iter().rev().map(|&e| e as i32)).collect();
+                let sim = std::cell::RefCell::new(Sim::new(sizes, cap));
+                let mut m = SharedSim(&sim);
+                let mut seen: Vec<(usize, usize)> = Vec::new();
+                let (cache_ptr, slots_ptr) = (&c as *const ExpertCache, &slots[l] as *const LayerSlots);
+                let mut each = |r0: usize, n: usize, served: &Served| -> Result<(), String> {
+                    let staged = served.moves.vram_to_stage + served.moves.pinned_to_stage + served.moves.nvme_to_landing;
+                    assert!(staged as usize <= cap, "V {v} P {pin} layer {l}: rows {r0}..{} stage {staged} records", r0 + n);
+                    let ids = distinct_ids(&sel[r0 * k..(r0 + n) * k], experts).unwrap();
+                    assert_eq!(served.locs.iter().map(|x| x.0).collect::<Vec<_>>(), ids, "every id of the sub-batch has a location");
+                    let sim = sim.borrow();
+                    for &(e, loc) in &served.locs {
+                        let got = match loc {
+                            Loc::Vram(q) => sim.vram[q as usize],
+                            Loc::Pinned(q) => sim.pinned[q as usize],
+                            Loc::Stage(q) => sim.stage[q as usize],
+                        };
+                        assert_eq!(got, e, "V {v} P {pin} layer {l} rows {r0}..{}: expert {e} at {loc:?} holds {got}", r0 + n);
+                    }
+                    // SAFETY: read-only looks at the cache and the slots `serve` just left; no
+                    // mutable borrow is used while this callback runs
+                    let (cc, ss) = unsafe { (&*cache_ptr, &*slots_ptr) };
+                    for e in 0..experts as u32 {
+                        match cc.tier(l, e) {
+                            Tier::Vram => assert_eq!(sim.vram[ss.vram_of[e as usize] as usize], e),
+                            Tier::Pinned => assert_eq!(sim.pinned[ss.pin_of[e as usize] as usize], e),
+                            Tier::Nvme => {}
+                        }
+                    }
+                    seen.push((r0, n));
+                    Ok(())
+                };
+                let batches = serve_chunk(&mut c, l, &mut slots[l], &sel, k, cap, &mut m, &mut each).unwrap_or_else(|e| panic!("V {v} P {pin} layer {l}: {e}"));
+                assert_eq!(batches, seen.len());
+                let mut at = 0;
+                for &(r0, n) in &seen {
+                    assert_eq!(r0, at, "sub-batches in row order, no gap");
+                    assert!(n == rows - r0 || n.is_power_of_two(), "a sub-batch of {n} rows is the rest or a power of two");
+                    at += n;
+                }
+                assert_eq!(at, rows, "every row served once");
+                // every serve has its own barrier (after phase A); serve_chunk adds one before every later sub-batch
+                assert_eq!(sim.borrow().ops.visits as usize, 2 * batches - 1, "one barrier before every later sub-batch");
+                if v + pin == 0 {
+                    assert!(batches > 1, "layer {l}: V 0 + P 0 must split the call (512 rows x top-8 > 128 slots)");
+                }
+                eprintln!("glm5_tiers #186 V {v} P {pin} layer {l}: 512 rows in {batches} sub-batches {:?}", seen.iter().map(|x| x.1).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    /// #186: the prompt calls cover the prompt once, in order: full chunks, then the remainder as
+    /// one call (`ceil(n / chunk)` calls, one routing sync per MoE layer each); chunk 1 is one row
+    /// per call. The booked FFN plan sizes: every power of two below the chunk, and the chunk
+    #[test]
+    fn the_prompt_calls_cover_the_prompt_in_full_chunks_and_one_rest() {
+        for chunk in [1usize, 2, 3, 16, 32, 512] {
+            for n in [1usize, 2, 7, 31, 32, 33, 86, 600] {
+                let calls = prompt_calls(n, chunk);
+                let mut at = 0;
+                for &(r0, t) in &calls {
+                    assert_eq!(r0, at);
+                    assert!((1..=chunk).contains(&t));
+                    at += t;
+                }
+                assert_eq!(at, n);
+                assert_eq!(calls.len(), n.div_ceil(chunk));
+            }
+        }
+        assert_eq!(prompt_calls(31, 16), vec![(0, 16), (16, 15)]);
+        assert_eq!(prompt_calls(31, 32), vec![(0, 31)]);
+        assert_eq!(prompt_calls(86, 32), vec![(0, 32), (32, 32), (64, 22)]);
+        assert_eq!(crate::manager::glm5_prompt_call_sizes(1), Vec::<usize>::new());
+        assert_eq!(crate::manager::glm5_prompt_call_sizes(32), vec![2, 4, 8, 16, 32]);
+        assert_eq!(crate::manager::glm5_prompt_call_sizes(24), vec![2, 4, 8, 16, 24]);
+    }
+
+    /// #186: `fitting_rows` takes every row when they fit, else the largest power of two that
+    /// does, and refuses one row that does not fit by name
+    #[test]
+    fn fitting_rows_takes_all_or_the_largest_power_of_two() {
+        let c = ExpertCache::new(Policy::Lru, Scope::PerLayer, 1, 64, 0, 0).unwrap();
+        // 10 rows of 2 picks, all distinct: r rows stage 2r records
+        let sel: Vec<i32> = (0..20).collect();
+        assert_eq!(fitting_rows(&c, 0, &sel, 2, 20), Ok(10));
+        assert_eq!(fitting_rows(&c, 0, &sel, 2, 19), Ok(8));
+        assert_eq!(fitting_rows(&c, 0, &sel, 2, 15), Ok(4));
+        assert_eq!(fitting_rows(&c, 0, &sel, 2, 2), Ok(1));
+        let e = fitting_rows(&c, 0, &sel, 2, 1).unwrap_err();
+        assert!(e.contains("one row stages 2 records, 1 staging slots"), "{e}");
+        // the same two ids in every row: any number of rows stages 2
+        let same: Vec<i32> = (0..10).flat_map(|_| [5, 9]).collect();
+        assert_eq!(fitting_rows(&c, 0, &same, 2, 2), Ok(10));
+    }
+
     /// #188 `CROW_GLM_PINNED=zerocopy`: under every policy and capacity of the trace test, with
     /// pinned hits staying in pinned:
     /// - one id per call (no other access of the call can move it): no promotion pinned -> VRAM,
@@ -2058,6 +2433,339 @@ impl Glm5Run {
     /// the KDA state of every KDA layer, in layer order (what a prefix snapshot copies)
     pub fn kda_states(&self) -> impl Iterator<Item = &KdaState> {
         self.kda.iter().flatten()
+    }
+}
+
+// ---------------------------------------------------------------- #186: the prompt phase in calls
+
+/// #186: the prompt phase of the glm5_next path in prompt calls of up to `prompt_chunk` rows.
+impl Glm5Run {
+    /// prompt rows per prompt call (1 = every prompt row one decode call)
+    pub fn prompt_chunk(&self) -> usize {
+        self.prompt_chunk
+    }
+
+    /// Prompt rows per prompt call from now on, 1 ..= the `max_t` the pass was built with at
+    /// `load` (`CROW_CHUNK`); a larger ask is refused by name.
+    pub fn set_prompt_chunk(&mut self, chunk: usize) -> Result<(), String> {
+        if chunk == 0 || chunk > self.pass.max_t {
+            return Err(format!("glm5_run: a prompt chunk of {chunk} rows, the pass holds calls of 1 ..= {} rows (CROW_CHUNK at load)", self.pass.max_t));
+        }
+        self.prompt_chunk = chunk;
+        Ok(())
+    }
+
+    /// The prompt rows `ids` at `pos0 ..` through every layer with the experts from `tiers`, the
+    /// head on the last: its greedy id (the logits stay in [`Glm5Run::logits_dev`]). Prompt chunk
+    /// 1: every row is [`Glm5Run::row`], reported one by one. Above 1: the rows run in the calls
+    /// of [`prompt_calls`], each call one prompt call per layer (KDA's chunk path, MLA's multi-row
+    /// path) with one routing sync per MoE layer and the selection served through
+    /// [`ExpertTiers::tables_for_chunk`]; one report per call (`rows` = its rows, `pos` = its last
+    /// row). The KDA states and MLA caches continue from what the rows before `pos0` left; nothing
+    /// is reset here.
+    ///
+    /// # Safety
+    /// A CUDA context is current; `tiers` belongs to this model.
+    pub unsafe fn prefill(&mut self, cnq: &mut Cnq, tiers: &mut ExpertTiers, ids: &[i64], pos0: usize, report: &mut dyn FnMut(&TokenReport)) -> Result<i64, String> {
+        if ids.is_empty() || pos0 + ids.len() > self.cap {
+            return Err(format!("glm5_run: a prompt of {} rows at {pos0}, the caches hold {}", ids.len(), self.cap));
+        }
+        if let Some(bad) = ids.iter().find(|&&t| !(0..self.g.vocab as i64).contains(&t)) {
+            return Err(format!("glm5_run: token id {bad} outside the vocab of {}", self.g.vocab));
+        }
+        let n = ids.len();
+        if self.prompt_chunk <= 1 {
+            let mut last = None;
+            for (i, &tok) in ids.iter().enumerate() {
+                let t0 = std::time::Instant::now();
+                let base = RowBase::of(tiers);
+                last = self.row(cnq, tiers, tok, pos0 + i, i + 1 == n)?;
+                report(&base.report(tiers, pos0 + i, true, last, t0));
+            }
+            return last.ok_or_else(|| "glm5_run: the last prompt row gave no id".to_string());
+        }
+        let (g, h) = (self.g, self.g.hidden);
+        let row = g.hc_streams * h;
+        let mut next = None;
+        for (r0, t) in prompt_calls(n, self.prompt_chunk) {
+            let t0 = std::time::Instant::now();
+            let base = RowBase::of(tiers);
+            let e = gm::embed_rows(cnq, &g, &ids[r0..r0 + t]);
+            cuda::to_f32_into(self.x, &gm::trunk_input(&e, h, g.hc_streams));
+            self.layers_chunk(tiers, pos0 + r0, t)?;
+            if r0 + t == n {
+                // the head on the call's last row only
+                gm::run_head(&self.pass.kn, &self.head, &self.hw, self.x + ((t - 1) * row * 4) as u64, self.normed, self.logits, self.next, 1);
+                cuda::sync();
+                let id = cuda::dtoh_i32(self.next, 1)[0] as i64;
+                if !(0..g.vocab as i64).contains(&id) {
+                    return Err(format!("glm5_run: row {}: the greedy id {id} is outside the vocab of {}", pos0 + n - 1, g.vocab));
+                }
+                next = Some(id);
+            } else {
+                cuda::sync();
+            }
+            let mut r = base.report(tiers, pos0 + r0 + t - 1, true, next, t0);
+            r.rows = t;
+            report(&r);
+        }
+        next.ok_or_else(|| "glm5_run: the last prompt call gave no id".to_string())
+    }
+
+    /// Every layer of the prompt call `pos0 .. pos0 + t` on the first `t` rows of `x`
+    /// (`Glm5Pass::call_with_expert_batches`), the experts from `tiers` per row sub-batch.
+    ///
+    /// # Safety
+    /// A CUDA context is current; `tiers` belongs to this model; `t <= max_t`.
+    unsafe fn layers_chunk(&mut self, tiers: &mut ExpertTiers, pos0: usize, t: usize) -> Result<(), String> {
+        for l in 0..self.g.layers {
+            if let Some(s) = self.kda[l].as_mut() {
+                self.pass.swap_kda_state(s);
+            }
+            if let Some(c) = self.mla[l].as_mut() {
+                self.pass.swap_mla_cache(c);
+            }
+            let mut hook = |layer: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>| tiers.tables_for_chunk(layer, sel, run);
+            let r = self.pass.call_with_expert_batches(&self.layers[l], self.x, pos0, t, &mut hook);
+            // the layer's own state goes back even when the call failed
+            if let Some(s) = self.kda[l].as_mut() {
+                self.pass.swap_kda_state(s);
+            }
+            if let Some(c) = self.mla[l].as_mut() {
+                self.pass.swap_mla_cache(c);
+            }
+            r.map_err(|e| format!("glm5_run: prompt rows {pos0}..{} layer {l}: {e}", pos0 + t))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests_186 {
+    //! #186 on the GPU with synthetic weights (no container of record): the planner's prompt-chunk
+    //! bytes against the allocations they book, and a synthetic glm5_next model (the layer shapes
+    //! of record, 4 layers) run with its prompt in prompt calls against the row-by-row path, three
+    //! tier sizes (one forcing row sub-batches) and a layer-at-a-time chain with every record in
+    //! VRAM. `#[ignore]`: CI has no GPU. Run with
+    //! `cargo test --release --lib glm5_tiers_gpu_186 -- --ignored --nocapture --test-threads 1`.
+    use super::*;
+    use crate::geo::{ExpertCodec, ExpertRecordSpec};
+    use crate::glm5_flags::tests::synth_model;
+    use crate::glm5_moe::{GpuFfnPlan, GpuMoePlan};
+
+    /// `manager::glm5_chunk_scratch_bytes` is what a pass of `max_t = chunk`, its FFN plans of
+    /// every booked call size and the residual's extra rows register as engine allocations, above
+    /// a one-row pass: within 64 KiB (the parameter arrays the formula leaves out), GLM-5.3-Flash
+    /// shapes, chunks 2 / 16 / 32, caches of 4,096 and 200,000 rows.
+    #[test]
+    #[ignore = "needs the GPU (up to about 1 GB VRAM): cargo test --release --lib glm5_tiers_gpu_186 -- --ignored --nocapture --test-threads 1"]
+    fn glm5_tiers_gpu_186_chunk_bytes_are_what_the_prompt_phase_allocates() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let moe = MoeGeo::new(&g, ExpertRecordSpec::new(ExpertCodec::Mul1, crate::cpu_mul1::GLM_RECORD_BYTES_K3 as u64).unwrap()).unwrap();
+        let row = g.hc_streams * g.hidden;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            for cap in [4096usize, 200_000] {
+                let held = |chunk: usize| -> u64 {
+                    let before = cuda::live_dev().1;
+                    let mut pass = Glm5Pass::new(&g, moe, chunk, cap);
+                    let mut x = cuda::alloc_named("test residual", chunk * row * 4);
+                    let mut plans: Vec<GpuMoePlan> = Vec::new();
+                    let mut dense: Vec<GpuFfnPlan> = Vec::new();
+                    for t in crate::manager::glm5_prompt_call_sizes(chunk) {
+                        plans.push(GpuMoePlan::new(&moe, t));
+                        dense.push(GpuFfnPlan::new(g.hidden, g.dense_inter, t, g.swiglu_limit as f32));
+                    }
+                    let b = cuda::live_dev().1 - before;
+                    for p in plans.iter_mut() {
+                        p.free();
+                    }
+                    for p in dense.iter_mut() {
+                        p.free();
+                    }
+                    cuda::free_dev(&mut x);
+                    pass.free();
+                    b
+                };
+                let one = held(1);
+                for chunk in [2usize, 16, 32] {
+                    let got = held(chunk) - one;
+                    let want = crate::manager::glm5_chunk_scratch_bytes(&g, chunk, cap);
+                    eprintln!("glm5_tiers #186 cap {cap} chunk {chunk}: allocated {got} B above a one-row pass, the plan books {want} B");
+                    assert!(got.abs_diff(want) <= 64 << 10, "cap {cap} chunk {chunk}: allocated {got} B, booked {want} B");
+                }
+            }
+        }
+    }
+
+    /// KL(p || q) in nats of two logit rows (f64 softmax)
+    fn kl(p: &[f32], q: &[f32]) -> f64 {
+        let ls = |v: &[f32]| -> Vec<f64> {
+            let m = v.iter().fold(f64::NEG_INFINITY, |a, &x| a.max(x as f64));
+            let z: f64 = v.iter().map(|&x| (x as f64 - m).exp()).sum();
+            v.iter().map(|&x| x as f64 - m - z.ln()).collect()
+        };
+        let (a, b) = (ls(p), ls(q));
+        a.iter().zip(&b).map(|(x, y)| x.exp() * (x - y)).sum()
+    }
+
+    fn bits_differ(a: &[Vec<f32>], b: &[Vec<f32>]) -> Vec<usize> {
+        a.iter().zip(b).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()).collect()
+    }
+
+    /// A synthetic glm5_next model (glm5_flags' `synth_model`: layers 0-2 KDA + dense SwiGLU, layer
+    /// 3 MLA/DSA + MoE with 16 MUL1 experts, top-8, vocab 2048), a 37-id prompt, 5 greedy ids:
+    /// - chunk 1 on a pass built for chunk 16 gives the bits of a pass built for chunk 1 (the
+    ///   row-by-row path is unchanged by a larger pass);
+    /// - chunk 16 (prompt calls 16 + 16 + 5) at V 3 + P 4, at V 0 + P 0 with a prefill
+    ///   staging set of 8 slots (every call split into row sub-batches) and at V 16 + P 0: the
+    ///   same ids and bit-identical logits (tiers and sub-batches invisible); one report per
+    ///   prompt call with its rows, one routing sync per MoE layer per call, more sub-batches
+    ///   than syncs only where the staging set forces them; the decode switches (flags +
+    ///   lookahead, CUDA graphs) after the chunked prompt give the same bits;
+    /// - a layer-at-a-time chain with every record in VRAM (`load_layer`, `Glm5Pass::call`), the
+    ///   same call split, teacher-forced on the chunked run's ids: bit-identical head logits on
+    ///   every generated row (the chunked tiered path computes what the plain pass computes);
+    /// - chunk 16 vs chunk 1: the same ids, mean KL(row by row || chunked) over the generated rows
+    ///   <= 0.073 (the KDA chunk path and MLA's split count sum in another order: no bit identity).
+    #[test]
+    #[ignore = "needs the GPU (about 1.5 GB VRAM, a 0.9 GB synthetic container in the temp dir): cargo test --release --lib glm5_tiers_gpu_186 -- --ignored --nocapture --test-threads 1"]
+    fn glm5_tiers_gpu_186_prompt_calls_are_the_rows_tiers_and_chain() {
+        const REC: u64 = 9_474_048;
+        let mut g = Glm5Geo::GLM_5_3_FLASH;
+        (g.layers, g.dense_prefix, g.experts, g.topk, g.vocab) = (4, 3, 16, 8, 2048);
+        let s = synth_model(&g, REC);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let prompt: Vec<i64> = (0..37).map(|i| (i * 131 + 7) % 2048).collect();
+        let (n, chunk) = (5usize, 16usize);
+        let cap = prompt.len() + n;
+        let old = std::env::var("CROW_CHUNK").ok();
+        let gen_with = |run: &mut Glm5Run, cnq: &mut Cnq, sizes: TierSizes, pf: Option<usize>| -> (Generated, Vec<TokenReport>) {
+            unsafe {
+                let mut tiers = ExpertTiers::new(cnq, &s.path, &g, &moe, sizes, 1, g.topk).unwrap();
+                if let Some(slots) = pf {
+                    tiers.alloc_prefill_stage(slots).unwrap();
+                }
+                let mut reps = Vec::new();
+                let out = run.generate(cnq, &mut tiers, &prompt, n, true, &mut |r| reps.push(r.clone())).unwrap();
+                tiers.free();
+                (out, reps)
+            }
+        };
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            // the path of record: a pass of one row
+            std::env::remove_var("CROW_CHUNK");
+            let mut run1 = Glm5Run::load(&mut cnq, &g, &moe, cap, &mut |s| eprintln!("{s}"));
+            assert_eq!(run1.prompt_chunk(), 1);
+            let (a0, _) = gen_with(&mut run1, &mut cnq, TierSizes { vram: 3, pinned: 4 }, None);
+            run1.free();
+            // a pass of `chunk` rows
+            std::env::set_var("CROW_CHUNK", chunk.to_string());
+            let mut run = Glm5Run::load(&mut cnq, &g, &moe, cap, &mut |s| eprintln!("{s}"));
+            match &old {
+                Some(o) => std::env::set_var("CROW_CHUNK", o),
+                None => std::env::remove_var("CROW_CHUNK"),
+            }
+            assert_eq!(run.prompt_chunk(), chunk);
+            assert!(run.set_prompt_chunk(chunk + 1).is_err());
+            run.set_prompt_chunk(1).unwrap();
+            let (a, ra) = gen_with(&mut run, &mut cnq, TierSizes { vram: 3, pinned: 4 }, None);
+            run.set_prompt_chunk(chunk).unwrap();
+            let arms = [
+                ("V 3 + P 4", TierSizes { vram: 3, pinned: 4 }, None),
+                ("V 0 + P 0, 8 prefill slots", TierSizes { vram: 0, pinned: 0 }, Some(8)),
+                ("V 16 + P 0", TierSizes { vram: 16, pinned: 0 }, None),
+            ];
+            let mut chunked = Vec::new();
+            for (name, sizes, pf) in arms {
+                let (out, reps) = gen_with(&mut run, &mut cnq, sizes, pf);
+                eprintln!(
+                    "glm5_tiers #186 chunk {chunk} {name}: ids {:?}, prompt reports (rows, syncs, sub-batches) {:?}",
+                    out.ids,
+                    reps.iter().filter(|r| r.prompt).map(|r| (r.rows, r.routing_syncs, r.sub_batches)).collect::<Vec<_>>()
+                );
+                chunked.push((name, out, reps));
+            }
+            // the decode switches after a chunked prompt: flags + lookahead, then the graphs
+            run.set_switches(&mut cnq, Switches { flags: true, lookahead: true });
+            let (sw, _) = gen_with(&mut run, &mut cnq, TierSizes { vram: 3, pinned: 4 }, None);
+            run.set_switches(&mut cnq, Switches::default());
+            run.set_graph(true);
+            let (gr, _) = gen_with(&mut run, &mut cnq, TierSizes { vram: 3, pinned: 4 }, None);
+            run.set_graph(false);
+            // the chain: every layer with its records in VRAM, one layer at a time, the same calls
+            let ids: Vec<i64> = prompt.iter().copied().chain(chunked[0].1.ids[..n - 1].iter().copied()).collect();
+            let rows = ids.len();
+            let mut calls: Vec<(usize, usize, bool)> = prompt_calls(prompt.len(), chunk).into_iter().map(|(r0, t)| (r0, t, false)).collect();
+            calls.extend((prompt.len()..rows).map(|r| (r, 1, true)));
+            let row = g.hc_streams * g.hidden;
+            let mut pass = Glm5Pass::new(&g, moe, chunk, cap);
+            let mut xd = cuda::alloc_named("chain residual", rows * row * 4);
+            cuda::to_f32_into(xd, &gm::trunk_input(&gm::embed_rows(&mut cnq, &g, &ids), g.hidden, g.hc_streams));
+            let mut rep = LoadReport::default();
+            for l in 0..g.layers {
+                let mut lw = gm::load_layer(&mut cnq, &g, &moe, l, &mut rep);
+                pass.begin_layer();
+                for &(r0, t, decode) in &calls {
+                    pass.call(&lw, xd + (r0 * row * 4) as u64, r0, t, decode);
+                }
+                cuda::sync();
+                lw.free();
+            }
+            let mut head = Head::new(gm::head_geo(&g));
+            let mut hw = gm::load_head(&mut cnq, &g, &mut rep);
+            let (mut normed, mut logits, mut next) = (cuda::alloc_named("chain normed", g.hidden * 4), cuda::alloc_named("chain logits", g.vocab * 4), cuda::alloc_named("chain id", 4));
+            let mut chain = Vec::new();
+            for r in prompt.len() - 1..rows {
+                gm::run_head(&pass.kn, &head, &hw, xd + (r * row * 4) as u64, normed, logits, next, 1);
+                cuda::sync();
+                chain.push(cuda::dtoh(logits, g.vocab));
+            }
+            for d in [&mut xd, &mut normed, &mut logits, &mut next, &mut hw.norm, &mut hw.lm] {
+                cuda::free_dev(d);
+            }
+            head.free();
+            pass.free();
+            run.free();
+            drop(cnq);
+            // the row-by-row path is unchanged by the larger pass
+            assert_eq!(a.ids, a0.ids, "chunk 1 on a pass of {chunk}: ids");
+            assert!(bits_differ(&a.logits, &a0.logits).iter().all(|&d| d == 0), "chunk 1 on a pass of {chunk}: logits differ in bits");
+            assert_eq!(ra.iter().filter(|r| r.prompt).count(), prompt.len(), "chunk 1 reports every prompt row");
+            // tiers and sub-batches are invisible in a prompt call
+            let (_, b, rb) = &chunked[0];
+            let finite = b.logits.iter().flatten().filter(|v| v.is_finite()).count();
+            assert_eq!(finite, n * g.vocab, "the synthetic model must stay finite for the comparison to mean something");
+            for (name, x) in chunked[1..].iter().map(|c| (c.0, &c.1)).chain([("flags + lookahead", &sw), ("CROW_GLM_GRAPH", &gr)]) {
+                assert_eq!(x.ids, b.ids, "{name}: ids");
+                let d = bits_differ(&x.logits, &b.logits);
+                assert!(d.iter().all(|&v| v == 0), "{name}: logits differ in bits per generated position {d:?}");
+            }
+            // reports: one per prompt call, its rows, one routing sync per MoE layer per call
+            let want: Vec<usize> = prompt_calls(prompt.len(), chunk).iter().map(|c| c.1).collect();
+            for (name, _, reps) in &chunked {
+                let pre: Vec<&TokenReport> = reps.iter().filter(|r| r.prompt).collect();
+                assert_eq!(pre.iter().map(|r| r.rows).collect::<Vec<_>>(), want, "{name}: prompt reports");
+                assert!(pre.iter().all(|r| r.routing_syncs == 1), "{name}: one MoE layer, one routing sync per call");
+                assert_eq!(pre.last().unwrap().next, Some(b.ids[0]), "{name}: the last prompt call gives the first id");
+                assert_eq!(reps.iter().filter(|r| !r.prompt).count(), n - 1, "{name}: decode rows");
+            }
+            let sub = |reps: &[TokenReport]| reps.iter().filter(|r| r.prompt).map(|r| r.sub_batches).sum::<u64>();
+            assert_eq!(sub(rb), want.len() as u64, "V 3 + P 4 with 128 prefill slots: no call splits");
+            assert!(sub(&chunked[1].2) > want.len() as u64, "8 prefill slots must split the calls into row sub-batches");
+            // the chain computes the same bits
+            let d = bits_differ(&b.logits, &chain);
+            assert!(d.iter().all(|&v| v == 0), "chunked tiered run vs layer-at-a-time chain: logits differ in bits per generated position {d:?}");
+            // chunked vs row by row: close, not bit-identical
+            let kls: Vec<f64> = a.logits.iter().zip(&b.logits).map(|(p, q)| kl(p, q)).collect();
+            let maxabs = a.logits.iter().zip(&b.logits).map(|(p, q)| p.iter().zip(q).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)).fold(0f32, f32::max);
+            eprintln!("glm5_tiers #186 chunk {chunk} vs row by row: ids {:?} vs {:?}, KL per generated row {kls:?}, max abs logit difference {maxabs:.3e}", b.ids, a.ids);
+            assert_eq!(b.ids, a.ids, "chunk {chunk} vs row by row: ids");
+            assert!(kls.iter().sum::<f64>() / kls.len() as f64 <= 0.073, "mean KL above 0.073");
+        }
     }
 }
 

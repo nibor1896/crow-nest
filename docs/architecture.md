@@ -400,7 +400,8 @@ units, about 12 hot experts per layer), and the post-plan check below requires
 > batch mem-op node): measured green on WDDM 2026-10-09, see 3.2.
 >
 > **Wired into the glm5_next path (#175 + #149, plan steps 16–17, 2026-10-09), not into the stager.**
-> `engine/src/glm5_tiers.rs` (bin `glm5_run`) runs all 45 glm5_next layers token by token with the
+> `engine/src/glm5_tiers.rs` (bin `glm5_run`) runs all 45 glm5_next layers token by token (#186:
+> the prompt optionally in prompt calls, `CROW_CHUNK`, default off) with the
 > routed experts in three tiers: a per-layer VRAM arena and a per-layer pinned arena sized by the #159
 > plan (RTX 5090, 200,000 tokens, 3-bit record: 50 + 124 per MoE layer, 114 on NVMe), placed by
 > `ExpertCache` (LRU, G1d's choice), misses read by `NvmeSource` (1 reader) into a 4096-aligned landing

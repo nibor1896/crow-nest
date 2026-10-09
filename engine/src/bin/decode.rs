@@ -927,7 +927,7 @@ fn main() {
                 );
             }
             _ => {
-                println!("usage: decode parity <ids.json> <out> | decode run <ids.json> <gen> | decode layercheck | decode layercheck3 | decode selftest [<golden_dir>] | decode glmgolden <dir> [--chain] [--layers A:B] [--cnq PATH]");
+                println!("usage: decode parity <ids.json> <out> | decode run <ids.json> <gen> | decode layercheck | decode layercheck3 | decode selftest [<golden_dir>] | decode glmgolden <dir> [--chain] [--layers A:B] [--cnq PATH] [--prompt-chunk N]");
             }
         }
     }
@@ -971,11 +971,13 @@ struct Check {
 /// the `checks[]` of a self-test manifest, or `Err(<what is wrong, by index and key>)`.
 /// Every field is required: a manifest that leaves the gate out would otherwise be read
 /// as a gate of 0, and a self-test that cannot say what it checks is not evidence.
-/// #161: `decode glmgolden <dir> [--chain] [--layers A:B] [--cnq PATH]`. The glm5_next layers
+/// #161: `decode glmgolden <dir> [--chain] [--layers A:B] [--cnq PATH] [--prompt-chunk N]`. The glm5_next layers
 /// (`glm5_model::Glm5Pass`) on the container (default the 3-bit `GLM5_MUL1K3_CNQ`, or `CROW_CNQ`)
 /// against the layerwise runner's goldens in `<dir>` (`oracle/glm5_layerwise.py run
 /// --capture-subblocks`, docs/glm5-reference-runner.md section 5), one layer in VRAM at a time,
-/// the runner's call split (prompt in `prompt_chunk` calls, each decode row alone).
+/// the runner's call split (prompt in `prompt_chunk` calls, each decode row alone). #186:
+/// `--prompt-chunk N` splits the prompt into calls of N rows instead (the golden is the same
+/// sequence, so G3 then checks the KDA state and the MLA cache carried across the calls).
 ///
 /// Golden-fed (default): layer k reads the golden `l<k-1>-output.f32` (layer 0: `embed.f32` in
 /// the 4 streams), its FFN site the golden `l<k>-ffn_hc-in.f32`, so every site is judged on the
@@ -1001,7 +1003,7 @@ unsafe fn glmgolden(args: &[String]) -> bool {
         .get(2)
         .filter(|a| !a.starts_with("--"))
         .cloned()
-        .unwrap_or_else(|| refuse("usage: decode glmgolden <golden dir> [--chain] [--layers A:B] [--cnq PATH]".into()));
+        .unwrap_or_else(|| refuse("usage: decode glmgolden <golden dir> [--chain] [--layers A:B] [--cnq PATH] [--prompt-chunk N]".into()));
     let dirp = Path::new(&dir);
     let man_text = std::fs::read_to_string(dirp.join("manifest.json")).unwrap_or_else(|e| refuse(format!("{dir}/manifest.json: {e}")));
     let man = Manifest::parse(&man_text).unwrap_or_else(|e| refuse(e));
@@ -1029,14 +1031,21 @@ unsafe fn glmgolden(args: &[String]) -> bool {
     }
     let (n, h, t_p) = (man.n, g.hidden, man.t);
     let row = g.hc_streams * h;
-    let calls = man.calls();
+    // #186: --prompt-chunk N overrides the runner's prompt split
+    let chunk = match flag("--prompt-chunk") {
+        Some(v) => v.parse::<usize>().ok().filter(|&c| c >= 1).unwrap_or_else(|| refuse(format!("--prompt-chunk {v:?} is not a positive whole number"))),
+        None if man.prompt_chunk == 0 => man.t,
+        None => man.prompt_chunk,
+    };
+    let calls = calls(man.t, man.d, chunk);
     let max_t = calls.iter().map(|c| c.1).max().unwrap_or(1);
     println!(
-        "[glmgolden] golden {dir}: {} rows (T {} + D {}), prompt in calls of {} ({} calls), layers {:?}, {}",
+        "[glmgolden] golden {dir}: {} rows (T {} + D {}), prompt in calls of {}{} ({} calls), layers {:?}, {}",
         n,
         man.t,
         man.d,
-        if man.prompt_chunk == 0 { man.t } else { man.prompt_chunk },
+        chunk,
+        if flag("--prompt-chunk").is_some() { " (--prompt-chunk, #186)" } else { "" },
         calls.len(),
         layers,
         if chain { "chain mode (fed by its own output, not gated)" } else { "golden-fed (G3: cosine >= 0.9999 per layer, site and row group)" }
