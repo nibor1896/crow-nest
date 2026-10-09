@@ -397,7 +397,7 @@ units, about 12 hot experts per layer), and the post-plan check below requires
 > affinity are `NvmeConfig` fields. Boot refuses `CROW_COLD_TIER` together with `CROW_NVME_TIER`. The RAM
 > tier is not behind the trait yet, no decode path calls the backend, and IoRing is not built. The
 > in-graph hand-off it needs is probe `p9_job_ring` stage C (`cuStreamWaitValue64_v2` captured as a
-> batch mem-op node, built 2026-10-08, not run yet).
+> batch mem-op node): measured green on WDDM 2026-10-09, see 3.2.
 >
 > **Wired into the glm5_next path (#175 + #149, plan steps 16–17, 2026-10-09), not into the stager.**
 > `engine/src/glm5_tiers.rs` (bin `glm5_run`) runs all 45 glm5_next layers token by token with the
@@ -531,6 +531,21 @@ experts via the job ring → `shared_expert_gate` combine.
 > **Status: not built in the engine. Only `probes/src/bin/p9_job_ring.rs` (#7) exists; the decode path
 > uses zero-copy/`CROW_STAGE` staging and the residency counters are drained by the host between
 > tokens (`residency.rs`). The text below is the approved design (2026-09-02), kept as design.**
+>
+> **Measured 2026-10-09 (#149 step 17a, `p9_job_ring` stage C at `cdf59da`, RTX 5090, driver 616.56,
+> WDDM, driver API 13040): a 64-bit wait replays from a CUDA graph.** `cuStreamWaitValue64_v2` (EQ 1)
+> captured by stream capture becomes a `BATCH_MEM_OP` node (graph nodes `[12, 0]`), and
+> `cuGraphAddBatchMemOpNode` → kernel node builds the same graph. Both instantiate and hold the stream
+> until the flag is raised; 1000 / 1000 replays per build ran after their flag and saw it at 1, for a
+> flag in device memory and one in mapped pinned host memory. A consumer without the wait fails both
+> checks (50 / 50 ran before the flag). Wait-to-start p50 (writer's flag store → consumer start marker
+> seen by the host, two runs): host-mapped flag 6.8–7.6 µs in all three forms; device flag raised
+> by an 8-B H2D 30–46 µs (uncaptured 31.6 / 32.7, captured 30.4 / 42.6, explicit 32.1 / 45.6). p99
+> 134–246 µs in every form. Attributes: `CAN_USE_64_BIT_STREAM_MEM_OPS` (v2) = 1,
+> `CAN_USE_STREAM_WAIT_VALUE_NOR` (v2) = 1, all V1 memop attributes 0. So the decode graph can stay on
+> with the ring (path B of #149); the stager should raise a flag in mapped host memory, not by H2D.
+> Not measured: many waits in one graph (a whole decode step), the stager's NVMe reads behind the flag,
+> and a flag that is never raised (the probe's 200 ms guard is not exercised).
 
 - Pinned host-memory ring, job descriptors 64-byte aligned (exl3 `moe_handoff.h`
   pattern): layer id, job kind, cold expert ids (≤ 10), sequence number, flag slots.
