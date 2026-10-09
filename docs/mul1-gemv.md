@@ -10,9 +10,11 @@ dequant pass, on two paths:
 - **CPU**: `engine/src/cpu_mul1.rs`, AVX2 (+ FMA) with a scalar fallback, the API of
   `cpu_nvfp4` (#173), its own persistent worker pool (#183 C1).
 
-**Status:** kernels and tests; `glm5_moe` (#164) calls `cpu_mul1::gemv`, nothing else calls them.
-The GPU launch sites (plan step 16), the CPU lane with its hit/miss split (plan step 19) and gate
-R (#174) are open. The int8-activation fast path of exllamav3's CPU kernel is out of scope (lossy,
+**Status:** kernels and tests; `glm5_moe` (#164) calls `cpu_mul1::gemv`; the three-tier path
+(plan step 16) runs the GPU kernels; #188 wires the CPU lane for pinned hits behind
+`CROW_GLM_CPU_LANE=1` (`cpu_mul1::experts_ffn`: every CPU expert of a MoE layer in one pool run,
+the activation a parameter; `kernels::mul1::GemvPlan::run_slots` for the GPU's share,
+`docs/glm5-model.md` section 6). The lane for NVMe misses and gate R (#174) are open. The int8-activation fast path of exllamav3's CPU kernel is out of scope (lossy,
 see section 3).
 
 ## 1. Commands
@@ -113,6 +115,7 @@ held to the exllamav3 `reconstruct` digests #181 holds.
 | `cpu_mul1_decode_and_schedule_equal_v1_bits` (#183) | shuffle decoder == first decoder for every lane, bitrates 1..8, 1.5, 2.5, 3.5; the production path == `Impl::V1`: GEMV T 1, 2, 3, 5, 8 x threads 1, 3, 8, 16 on 9 experts, GLM FFN T 1, 4 x threads 1, 8, 16, 24 | bit-identical |
 | `cpu_mul1_c1_kernel_equals_v2_bits` (#183 C1) | `weights_fast` == `weights` for all 65,536 states; `decode8_fast` == `decode8` for every lane, bitrates 1..8, 1.5, 2.5, 3.5, 64 random tiles each; `unit_k3` == `unit_fast` (GLM gate, T 1..4); the production path == `Impl::V2`: GEMV T 1, 2, 3, 5, 8 x threads 1, 3, 8, 16, 24 on 9 experts, GLM gate / down T 1, 4, GLM FFN T 1, 2, 4, 5 x threads 1, 2, 8, 16, 24 | bit-identical |
 | `cpu_mul1_scales_and_chunk_plan` (#183 C1) | bit-built `f16_to_f32` == the former `powi` formula for all 65,536 inputs; the chunk plan covers every column once, in aligned chunks of 4 / 2 / 1 inside one 128-block, ending in one-column chunks | - |
+| `cpu_mul1_experts_ffn_is_expert_ffn_per_expert_bits` (#188) | `experts_ffn` (n experts, one pool run) == `expert_ffn` per expert: 1, 2, 3, 5, 8 GLM experts T 1, 2 and 3 K = 2.5 experts [512, 256] T 1, 3 x threads 1, 2, 8, 16, 24, outputs NaN before; with the clamped SwiGLU as activation == the staged `gemv(down, act(gemv(gate), gemv(up)))` | bit-identical |
 | `cpu_mul1_pool_runs_all_work_once` (#183 C1) | 300 pool runs (n 2, 3, 8, 16, 24): all work done before `run` returns, job(0) once, no worker twice or at or past n; two threads calling at once; a nested call; a worker's panic raised in the caller, the pool usable after | - |
 | `tests_mul1_src::mul1_source_compiles_with_every_entry` | `MUL1_SRC` compiles (NVRTC, compute_120a) with its 6 entries; GPU n constants; record offsets | - |
 | `mul1_gpu_decode_is_the_codec` (GPU) | GPU weight == codec for all 65,536 states | - |
@@ -121,7 +124,9 @@ held to the exllamav3 `reconstruct` digests #181 holds.
 | `mul1_gpu_ffn_matches_reference` (GPU) | VRAM == pinned; fused down == public GEMV on the FFN's own h; down stage and chain bound; GPU vs CPU; 2 slots in one launch == 1 slot | 0.0021 x chain bound, down stage 0.063 x bound |
 
 Every test was run once with its piece removed and failed (#180 implementation comment; the #183 C1
-tests with a deliberate fault each, #183 C1 implementation comment).
+tests with a deliberate fault each, #183 C1 implementation comment; the #188 test with expert 2's
+output written into expert 1's rows and with `silu_mul` in place of the activation, #188
+implementation comment).
 
 ## 5. Micro-benchmark
 

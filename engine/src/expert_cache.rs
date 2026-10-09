@@ -9,7 +9,8 @@
 //!
 //! A pinned hit is promoted into VRAM and the VRAM victim is demoted into the pinned slot the
 //! promoted expert left - the exact three-way exchange `Residency::swap_stream_a` / `swap_in`
-//! already execute. An NVMe miss is admitted into VRAM (or into pinned when `vram` is 0); the
+//! already execute. #188: [`ExpertCache::set_pinned_stays`] turns that promotion off (a pinned
+//! hit is read in place, zero-copy or by the CPU lane); NVMe misses are unaffected. An NVMe miss is admitted into VRAM (or into pinned when `vram` is 0); the
 //! demoted VRAM victim goes to pinned and the pinned victim drops to NVMe.
 //!
 //! Policies:
@@ -80,6 +81,8 @@ struct Pool {
     slot: Vec<usize>,
     cap: [usize; 2],
     len: [usize; 2],
+    /// #188: a pinned hit stays in pinned (no promotion into VRAM)
+    pin_stay: bool,
 }
 
 impl Pool {
@@ -94,6 +97,7 @@ impl Pool {
             slot: vec![usize::MAX; keys],
             cap: [vram, pinned],
             len: [0, 0],
+            pin_stay: false,
         }
     }
 
@@ -139,7 +143,8 @@ impl Pool {
     /// LRU / LFU placement of the just-accessed key `k`
     fn ranked(&mut self, p: Policy, k: usize) {
         let t = self.tier[k];
-        if t == Tier::Vram {
+        // #188 no-promote: a pinned hit keeps its slot (its recency / score is already updated)
+        if t == Tier::Vram || (t == Tier::Pinned && self.pin_stay) {
             return;
         }
         if self.cap[0] > 0 {
@@ -205,7 +210,7 @@ impl Pool {
         match self.tier[k] {
             Tier::Vram => self.refb[k] = true,
             Tier::Pinned => {
-                if self.cap[0] == 0 {
+                if self.cap[0] == 0 || self.pin_stay {
                     self.refb[k] = true;
                     return;
                 }
@@ -318,6 +323,22 @@ impl ExpertCache {
             Scope::PerLayer => (l, e as usize),
             Scope::Global => (0, l * self.experts + e as usize),
         }
+    }
+
+    /// #188 (`CROW_GLM_PINNED=zerocopy`, `CROW_GLM_CPU_LANE=1`): with `on`, a pinned hit stays
+    /// in pinned (LRU / LFU: its recency and score are updated in place; CLOCK: its reference bit
+    /// is set) instead of being promoted into VRAM; an NVMe miss keeps the policy's rule (into
+    /// VRAM, the VRAM victim to pinned, the pinned victim to NVMe). Off (the default) is the
+    /// exchange rule of the module doc, unchanged.
+    pub fn set_pinned_stays(&mut self, on: bool) {
+        for p in &mut self.pools {
+            p.pin_stay = on;
+        }
+    }
+
+    /// whether a pinned hit stays in pinned ([`ExpertCache::set_pinned_stays`])
+    pub fn pinned_stays(&self) -> bool {
+        self.pools[0].pin_stay
     }
 
     pub fn tier(&self, l: usize, e: u32) -> Tier {

@@ -181,6 +181,50 @@ R, #174). The layer math is section 1 unchanged; what changes is where an expert
   may evict a later id of the same call before its turn; its record is staged from its old slot).
 - **Memory beyond the plan**: 8 staging records in VRAM (75.8 MB; the plan books 160) and 8 landing
   records in pageable RAM (75.8 MB, not pinned).
+- **How a selected pinned expert is read** (#188, two switches, both off by default; off = the
+  path above, bit for bit):
+  - `CROW_GLM_PINNED=promote` (default): the policy's exchange rule; under LRU every pinned hit
+    enters VRAM (staged H2D) and its VRAM victim goes back to pinned (D2H). #187 baseline, warm
+    decode: 1.228 GB H2D + 1.228 GB D2H per token, zero-copy 0.
+  - `CROW_GLM_PINNED=zerocopy`: `ExpertCache::set_pinned_stays(true)`: a pinned hit refreshes its
+    recency / score / reference bit and stays in pinned; the table points the MUL1 kernels at its
+    pinned slot (zero-copy, the same bits as from VRAM). NVMe misses keep the policy's rule: they
+    enter VRAM (from the landing buffer), the VRAM victim goes to pinned (D2H), the pinned victim
+    to NVMe. Moves left: n2v, n2p, v2p, v2n, p2n; p2v and `pinned_to_stage` only for a selected id
+    that earlier misses of the same call pushed out of pinned before its own access (an NVMe access
+    by the policy's rule, staged from its old pinned slot; never with one id per call).
+  - `CROW_GLM_CPU_LANE=1` (implies `zerocopy`; `CROW_GLM_PINNED=promote` with it is refused by
+    name; refused by name on a write-combined pinned tier, i.e. it needs `CROW_PINNED_ALLOC=host`
+    on Windows): in a decode call (`t = 1`) every selected id in pinned is computed on the CPU.
+    `ExpertTiers::table_for` posts the call's combos (pick order: GPU record base, or CPU host
+    record) to `glm5_moe::lane`; `GpuMoePlan::experts` of the same thread takes the post for its
+    table: x to the host (async + event), gather, the GPU combos compacted into the first slots
+    (`mul1::GemvPlan::run_slots`), gate / up / act / down over those slots, the shared expert;
+    then, while the GPU runs them, ALL of the layer's CPU experts in one pool run
+    (`cpu_mul1::experts_ffn` with `swiglu_clamp`, 8 threads, the GPU host thread as worker 0)
+    straight from their pinned slots; then the compact GPU rows to their combo rows (D2D), one H2D
+    per CPU row into `ye`, and the unchanged `glm5_moe_combine` (`w_k ye_k` in pick order +
+    shared). The expert hook and its call site in `glm5_model.rs` are unchanged. Prompt calls
+    (`t > 1`) and NVMe misses stay on the GPU.
+  - **Bits.** `zerocopy`: identical to `promote` (VRAM and pinned reads give the same bits). CPU
+    lane: GPU combos and the combine's order are the GPU path's; a CPU combo's row is
+    `expert_ffn_mul1_cpu`'s, which differs from the GPU MUL1 kernels' (another f32 order in the
+    GEMVs, `docs/mul1-gemv.md` section 3, and the host `exp` in the clamp). Synthetic GLM layer
+    (`glm5_moe_gpu_cpu_lane_rows_are_the_cpu_and_gpu_experts`, 2026-10-09): 1 to 8 of 8 combos on
+    the CPU, against the GPU-only output max abs 1.6e-3 to 5.2e-3 at rms 1.41e3, 1 - cosine
+    3.3e-14 to 2.8e-13; against the oracle 1 - cosine 2.9e-13 to 4.8e-13 (GPU-only 2.75e-13). Not
+    bit-identical, so the lane stays switch-only; G3 on the real container is not measured.
+  - **Why `host` pinned for the lane** (`glm5_moe_gpu_lane_wc_bench`, 2026-10-09, Core Ultra 9
+    285K, one synthetic 3-bit record, 8 threads, median of 15): CPU FFN from write-combined pinned
+    32.44 ms per expert (0.29 GB/s), from cacheable pinned 0.440 ms (21.52 GB/s), from the heap
+    0.418 ms (22.65 GB/s). CUDA's `cuMemHostAlloc` documents WC memory as not readable efficiently
+    by most CPUs. The GPU's read rate from a cacheable pinned tier on this Windows box is not
+    measured here (the 2026-09-04 WDDM figure favoured WC, `docs/env.md` `CROW_PINNED_ALLOC`).
+  - **Counters** (#187 `Moves`): `cpu_lane` = selected ids the CPU computed (not counted in
+    `zero_copy`); `glm5_run` prints `CPU lane <experts> experts <s> s` per token on the counters
+    lines and writes `cpu_lane_per_token` / `cpu_lane_s_per_token` (wall time of the lane's pool
+    runs, `ExpertTiers::cpu_lane_clock`, read per row in the report callback) and `pinned_use` to
+    the JSON.
 
 ```
 cd engine
@@ -283,7 +327,12 @@ staging overflow and out-of-range ids refused by name; `nvme_source::the_record_
 #187: `the_move_counters_equal_the_twins_calls_and_the_tier_diff` (the same policies and capacities:
 per call visits = distinct ids = the cache's accesses, every mover count = the twin's calls, the six
 transitions = the before/after tier diff, zero-copy = the pinned-served ids; all-NVMe: visits = r,
-no promotion or eviction) and `reset_cache_replays_the_cold_pass_and_warm_reads_less`; the bin's
+no promotion or eviction) and `reset_cache_replays_the_cold_pass_and_warm_reads_less`. #188:
+`zerocopy_pinned_hits_stay_and_are_read_in_place` (the same policies and capacities, one id and
+top-8 per call: one id per call never promotes a pinned hit and never stages a pinned record; at
+top-8 every pinned -> VRAM transition and every staged pinned record is a selected id earlier misses
+of the call pushed out; at P >= top-k fewer pinned -> VRAM transitions than `promote`; `reset_cache`
+keeps the option), `the_pinned_switches_parse_and_refuse_by_name`, `lane_combos_follow_the_pick_order`; the bin's
 own tests (`cargo test --release --bin glm5_run`: phase split, TTFT, percentiles, spread, summary,
 prompt length, ids file, the working-set query).
 GPU (`cargo test --release --lib glm5_tiers_gpu -- --ignored --nocapture --test-threads 1`):
@@ -291,6 +340,11 @@ GPU (`cargo test --release --lib glm5_tiers_gpu -- --ignored --nocapture --test-
 capacities: the bytes at every entry are `read_range` of the record; 54 s, passed 2026-10-09; since
 #187 also the device path's visits and NVMe reads per call, and after `reset_cache` the first
 selection read from NVMe again with the right bytes; 51 s, passed 2026-10-09),
+#188 `glm5_tiers_gpu_zerocopy_and_cpu_lane_tables_hold_their_records` (synthetic container,
+`CROW_PINNED_ALLOC=host` for the test, `promote` / `zerocopy` / lane at V/P 1/7, 3/4, 4/12, 0/16:
+every entry holds its record; the lane posts the combos in pick order, CPU pointers to the record's
+bytes, counted as `cpu_lane`; at 4/12 `promote` 58 p2v + 58 pinned records staged + 60 D2H over
+24 calls, `zerocopy` 0 + 0 + 8; 61 s with the test above, passed 2026-10-09),
 `glm5_tiers_gpu_cache_size_is_invisible_in_the_logits` (the real container, the fixed prompt, 6
 ids at the plan's V/P, 1 + 7 and 0 + 0: ids and logits bit-identical; plan step 16 abort
 criterion, `docs/architecture.md` A9; not run yet) and
@@ -357,3 +411,7 @@ gather writing one stream (12,285 of 16,384 values differ).
 - `glm5_run`'s timings and counters on the real container and the reps/reset logits test (section
   6.1, #187): built, not run; no baseline figure exists.
 - The decode switches (section 6.2) on the real container: built, not run; no speed figure.
+- #188 `CROW_GLM_PINNED=zerocopy` and `CROW_GLM_CPU_LANE=1` on the real container: not run (speed,
+  ids, G3 cosine); how far the CPU lane overlaps the GPU's experts, the idle pool workers' spin
+  against the GPU host thread, and the GPU's zero-copy rate from a cacheable pinned tier on Windows:
+  not measured.

@@ -6372,6 +6372,19 @@ pub mod mul1 {
             self.launch_out(kn, ptrs, y);
         }
 
+        /// #188 CPU lane: `run` over the first `n` slots only (`1 <= n <= slots`); slot `j` reads
+        /// `ptrs[j]`, `x[j]` and writes `y[j]` exactly as in `run` (slots never interact)
+        ///
+        /// # Safety
+        /// As `run`, for the first `n` slots.
+        pub unsafe fn run_slots(&self, kn: &Kernels, n: usize, ptrs: CUdeviceptr, x: CUdeviceptr, y: CUdeviceptr) {
+            assert!((1..=self.slots).contains(&n), "mul1: {n} of {} slots", self.slots);
+            let (kc, nc, t) = ((self.spec.k / 128) as u32, (self.spec.n / 128) as u32, self.tokens as u32);
+            launch_v(kn.had_in, kc, t, n as u32, 32, &[ptrs, x, self.xh, self.prm_in]);
+            launch_v(kn.gemv, nc, self.s as u32, n as u32, 256, &[ptrs, self.xh, self.part, self.prm_gemv]);
+            launch_v(kn.had_out, nc, t, n as u32, 32, &[ptrs, self.part, y, self.prm_out]);
+        }
+
         /// # Safety
         /// No launch of this plan is pending.
         pub unsafe fn free(&mut self) {

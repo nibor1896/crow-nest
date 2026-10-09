@@ -38,6 +38,12 @@ frequency order becomes the recency order.
 | `Clock { admit }` | One second-chance ring per tier. The reference bit is set on use and on insert; a demoted expert enters the pinned ring with a clear bit. `admit` caps the NVMe admissions per layer per tick; later misses in the same tick bypass the cache. |
 | `Lfu { decay }` | Each tick multiplies the layer's scores by `decay`, and an access adds its weight. VRAM holds the highest scores, pinned the next. Equal scores go to the more recent access. |
 
+- **No-promote option** (#188, `ExpertCache::set_pinned_stays`, off by default; the glm5_next
+  tiers turn it on with `CROW_GLM_PINNED=zerocopy` or `CROW_GLM_CPU_LANE=1`, `docs/glm5-model.md`
+  section 6): a pinned hit updates its recency / score / reference bit and stays in pinned, for
+  every policy. NVMe misses follow the rules above unchanged. `reset_cache` in `glm5_tiers` keeps
+  the option.
+
 - **Scope.** `PerLayer` is the only scope `Residency` can execute, since its slots are per layer.
   `Global` is one pool of `layers x V` + `layers x P` slots, for simulation and counters only.
 - **Counters.** `[vram, pinned, nvme]` per layer: the tier each access was served from.

@@ -31,6 +31,9 @@
 //!   kernel, `glm5_moe_combine` last. The record base of every expert comes from a device table
 //!   `[E] u64` the caller owns: a VRAM slot or a pinned-host UVA address, as `gemv_fp4_ptrb` reads
 //!   them - the hook for the residency and the dynamic cache (#175). No host sync inside `run`.
+//! - **CPU lane in the GPU layer** (#188, [`lane`]): a decode call's combos posted by the tiers
+//!   are split; the CPU computes its share from the pinned records while the GPU computes the
+//!   rest, the combine is the GPU's (`GpuMoePlan::experts`, one host wait for x).
 //!
 //! Ties in the selection go to the lowest expert index (the rule of `router_top10`); torch's
 //! `topk` gives no order among equal values, so routing is compared as a set per token, and the
@@ -456,6 +459,8 @@ pub struct GpuMoePlan {
     gate: mul1::GemvPlan,
     up: mul1::GemvPlan,
     down: mul1::GemvPlan,
+    /// #188 CPU lane: host buffer and event, made on the first lane call
+    lane: std::cell::OnceCell<LaneBuf>,
 }
 
 impl GpuMoePlan {
@@ -488,6 +493,7 @@ impl GpuMoePlan {
             gate: mul1::GemvPlan::new(sg, c, 1),
             up: mul1::GemvPlan::new(su, c, 1),
             down: mul1::GemvPlan::new(sd, c, 1),
+            lane: std::cell::OnceCell::new(),
         }
     }
 
@@ -540,6 +546,9 @@ impl GpuMoePlan {
         x: CUdeviceptr,
         y: CUdeviceptr,
     ) {
+        if let Some(call) = lane::take(table, self.tokens, self.geo.topk) {
+            return self.experts_lane(kn, mk, gk, w, table, x, y, call);
+        }
         let (h, t) = (self.geo.hidden, self.tokens);
         let c = t * self.geo.topk;
         launch_v(gk.gather, h.div_ceil(256) as u32, c as u32, 1, 256, &[self.ids, table, x, self.ptrs, self.xg, self.prm_kh2]);
@@ -549,6 +558,93 @@ impl GpuMoePlan {
         self.down.run(mk, self.ptrs, self.he, self.ye);
         self.shared.run(kn, gk, &w.shared, x, self.ys);
         launch_v(gk.combine, h.div_ceil(256) as u32, t as u32, 1, 256, &[self.ye, self.wts, self.ys, y, self.prm_kh2]);
+    }
+
+    /// #188 CPU lane: [`GpuMoePlan::experts`] for a decode call (`t = 1`) whose combos
+    /// `call.combos` (pick order) are split between the GPU and the CPU. Queued: x to the host
+    /// (async, event), gather, the GPU combos' record bases compacted into the first slots (one
+    /// H2D), gate / up / act / down over those slots only, the shared expert. Then, while the
+    /// GPU runs them: wait for x, every CPU combo's expert in ONE pool run
+    /// ([`cpu_mul1::experts_ffn`] with [`swiglu_clamp`], [`LANE_THREADS`]) straight from its
+    /// pinned record, the bits of [`expert_ffn_mul1_cpu`]. Then the
+    /// compact GPU rows go to their combo rows of `ye` (D2D, descending, so no row is overwritten
+    /// before it is read), the CPU rows into theirs (H2D from the plan's pinned buffer), and the
+    /// unchanged `glm5_moe_combine` sums `w_k ye_k` in pick order + shared. GPU combos give the
+    /// bits of [`GpuMoePlan::experts`]; CPU combos the bits of `cpu_mul1::expert_ffn` (not the
+    /// GPU kernels': another f32 order in the GEMVs, `docs/mul1-gemv.md` section 3, and the
+    /// host `exp` in the clamp).
+    ///
+    /// The host buffer is rewritten by the next lane call only after the host waited for that
+    /// call's routing, which the stream orders after every copy queued here.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn experts_lane(
+        &self,
+        kn: &kernels::Kernels,
+        mk: &mul1::Kernels,
+        gk: &kernels::glm5_moe::Kernels,
+        w: &GpuMoeWeights,
+        table: CUdeviceptr,
+        x: CUdeviceptr,
+        y: CUdeviceptr,
+        call: lane::Call,
+    ) {
+        use cudarc::driver::sys;
+        let g = &self.geo;
+        let (h, k) = (g.hidden, g.topk);
+        let rb = g.record.bytes as usize;
+        let buf = self.lane.get_or_init(|| LaneBuf::new(h, k));
+        let host = buf.host.host as *mut u8;
+        let (xh, ph, yh) = (host as *mut f32, host.add(h * 4) as *mut u64, host.add(h * 4 + k * 8) as *mut f32);
+        let s = cuda::cur_stream();
+        let ev = buf.ev as sys::CUevent;
+        cuda::ck(sys::cuMemcpyDtoHAsync_v2(xh as *mut _, x, h * 4, s));
+        cuda::event_record(ev, s);
+        launch_v(gk.gather, h.div_ceil(256) as u32, k as u32, 1, 256, &[self.ids, table, x, self.ptrs, self.xg, self.prm_kh2]);
+        let mut gpu = Vec::with_capacity(k);
+        let mut cpu = Vec::with_capacity(k);
+        for (c, combo) in call.combos.iter().enumerate() {
+            match *combo {
+                lane::Combo::Gpu(base) => {
+                    *ph.add(gpu.len()) = base;
+                    gpu.push(c);
+                }
+                lane::Combo::Cpu(rec) => cpu.push((c, rec)),
+            }
+        }
+        let n = gpu.len();
+        if n > 0 {
+            // the gather wrote xg for every combo: at t = 1 every row is x, so slot j reads x too
+            cuda::upload_from_pinned(self.ptrs, ph as *const _, n * 8);
+            self.gate.run_slots(mk, n, self.ptrs, self.xg, self.ge);
+            self.up.run_slots(mk, n, self.ptrs, self.xg, self.ue);
+            launch_v(gk.act, (k * g.expert_inter).div_ceil(256) as u32, 1, 1, 256, &[self.ge, self.ue, self.he, self.prm_n, self.prm_f]);
+            self.down.run_slots(mk, n, self.ptrs, self.he, self.ye);
+        }
+        self.shared.run(kn, gk, &w.shared, x, self.ys);
+        // hand the queued launches to the GPU (WDDM batches them), then wait for x only
+        let _ = sys::cuStreamQuery(s);
+        cuda::ck(sys::cuEventSynchronize(ev));
+        let t0 = std::time::Instant::now();
+        let es: Vec<Mul1Expert> = cpu
+            .iter()
+            .map(|&(c, rec)| {
+                Mul1Expert::from_record(std::slice::from_raw_parts(rec, rb), h, g.expert_inter, g.bitrate).unwrap_or_else(|e| panic!("glm5_moe CPU lane: combo {c}: {e}"))
+            })
+            .collect();
+        let xs = std::slice::from_raw_parts(xh as *const f32, h);
+        let ys = std::slice::from_raw_parts_mut(yh, cpu.len() * h);
+        let limit = g.swiglu_limit;
+        cpu_mul1::experts_ffn(&es, xs, ys, &move |a, b| swiglu_clamp(a, b, limit), LANE_THREADS, Path::Auto);
+        call.clock.add(t0.elapsed(), cpu.len());
+        for (j, &c) in gpu.iter().enumerate().rev() {
+            if c != j {
+                cuda::d2d_async(self.ye + (c * h * 4) as u64, self.ye + (j * h * 4) as u64, h * 4);
+            }
+        }
+        for (i, &(c, _)) in cpu.iter().enumerate() {
+            cuda::upload_from_pinned(self.ye + (c * h * 4) as u64, yh.add(i * h) as *const _, h * 4);
+        }
+        launch_v(gk.combine, h.div_ceil(256) as u32, 1, 1, 256, &[self.ye, self.wts, self.ys, y, self.prm_kh2]);
     }
 
     /// the routing of the last `run` (synchronizes)
@@ -587,6 +683,97 @@ impl GpuMoePlan {
         self.gate.free();
         self.up.free();
         self.down.free();
+        if let Some(mut b) = self.lane.take() {
+            b.host.free();
+            cuda::event_destroy(b.ev as cudarc::driver::sys::CUevent);
+        }
+    }
+}
+
+/// #188: worker threads of one CPU-lane pool run (the GPU host thread is worker 0): the #183 C1
+/// point of record (8 threads: `cpu_mul1` FFN 20.77 GB/s, 0.456 ms per 3-bit expert, T 1)
+pub const LANE_THREADS: usize = 8;
+
+/// #188: the CPU lane's pinned host buffer of one plan (`[hidden]` x, `[topk]` record bases,
+/// `[topk][hidden]` CPU outputs; cacheable, the CPU reads and writes it) and its event
+struct LaneBuf {
+    host: cuda::Pinned,
+    /// `CUevent` as an integer (the plan stays `Send` like the other device handles)
+    ev: u64,
+}
+
+impl LaneBuf {
+    unsafe fn new(h: usize, k: usize) -> LaneBuf {
+        LaneBuf { host: cuda::Pinned::alloc(h * 4 + k * 8 + k * h * 4), ev: cuda::event_create() as u64 }
+    }
+}
+
+/// #188 CPU lane hand-off. `glm5_tiers::ExpertTiers::table_for` (the expert hook) posts the
+/// combos of a decode call here; [`GpuMoePlan::experts`] of the same thread takes them when its
+/// `table` is the posted one, so the expert hook and its call site (`glm5_model.rs`
+/// `call_with_experts`) stay as they are. Anything else (no post, another table, `t > 1`, no CPU
+/// combo) runs the GPU path unchanged; a post is consumed by the next `experts` call either way.
+/// Every CPU combo's table entry stays a valid pinned record base, so the GPU path is also
+/// correct for a post that is not taken.
+pub mod lane {
+    use cudarc::driver::sys::CUdeviceptr;
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// where one combo (pick order) is computed
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Combo {
+        /// on the GPU, from this record base (VRAM, pinned UVA or staging)
+        Gpu(u64),
+        /// on the CPU, from this host record (a pinned slot; `record.bytes` long)
+        Cpu(*const u8),
+    }
+
+    /// the CPU lane's wall time and expert count, summed (shared with the counters' owner)
+    #[derive(Debug, Default)]
+    pub struct Clock {
+        ns: AtomicU64,
+        experts: AtomicU64,
+        runs: AtomicU64,
+    }
+
+    impl Clock {
+        pub fn add(&self, d: std::time::Duration, experts: usize) {
+            self.ns.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+            self.experts.fetch_add(experts as u64, Ordering::Relaxed);
+            self.runs.fetch_add(1, Ordering::Relaxed);
+        }
+        /// (nanoseconds in pool runs, experts computed, pool runs) since construction
+        pub fn read(&self) -> (u64, u64, u64) {
+            (self.ns.load(Ordering::Relaxed), self.experts.load(Ordering::Relaxed), self.runs.load(Ordering::Relaxed))
+        }
+    }
+
+    /// one decode call's split
+    #[derive(Debug)]
+    pub struct Call {
+        /// the device table of the call (`experts` takes the post only for this table)
+        pub table: CUdeviceptr,
+        /// one per combo, pick order
+        pub combos: Vec<Combo>,
+        pub clock: Arc<Clock>,
+    }
+
+    thread_local! {
+        static POSTED: RefCell<Option<Call>> = const { RefCell::new(None) };
+    }
+
+    /// post (or, with `None`, clear) this thread's next call
+    pub fn post(call: Option<Call>) {
+        POSTED.with(|p| *p.borrow_mut() = call);
+    }
+
+    /// the posted call, if it is for `table`, a decode call (`tokens` 1) of `topk` combos with at
+    /// least one on the CPU; the post is consumed either way
+    pub(crate) fn take(table: CUdeviceptr, tokens: usize, topk: usize) -> Option<Call> {
+        let c = POSTED.with(|p| p.borrow_mut().take())?;
+        (c.table == table && tokens == 1 && c.combos.len() == topk && c.combos.iter().any(|x| matches!(x, Combo::Cpu(_)))).then_some(c)
     }
 }
 
@@ -1094,6 +1281,156 @@ mod tests {
                     cuda::free_dev(d);
                 }
             }
+        }
+    }
+
+    /// #188 CPU lane, synthetic GLM layer (the records of `glm5_moe_gpu_layer_matches_the_oracle`
+    /// in cacheable pinned RAM, x = the oracle's MoE row 0, T 1). For combo masks from one CPU
+    /// combo (first, last) through alternating, 6 of 8, 7 of 8 and all 8: every GPU combo's `ye`
+    /// row has the bits of the GPU-only run, every CPU combo's row the bits of
+    /// `expert_ffn_mul1_cpu` of its record (`ye` filled with NaN before each run, so a row the
+    /// lane fails to write shows), `y` = `glm5_moe_combine` of that `ye`, cosine to the oracle >=
+    /// `COS_MIN`; max abs and cosine against the GPU-only `y` printed. A post for another table,
+    /// or without a CPU combo, runs the GPU path: `y` bit-identical to the GPU-only run.
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_moe_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_moe_gpu_cpu_lane_rows_are_the_cpu_and_gpu_experts() {
+        use std::sync::Arc;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let (_m, kn) = main_kernels();
+            let mk = mul1::Kernels::new();
+            let gk = kernels::glm5_moe::Kernels::new();
+            let (s, gd, g) = (synth(), golden(), geo());
+            let (h, k) = (4096usize, g.topk);
+            let needed: Vec<u32> = {
+                let mut v: Vec<u32> = gd.moe_ids.iter().map(|&e| e as u32).collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+            let all: Vec<u8> = needed.iter().flat_map(|&e| record(e)).collect();
+            let rb = cpu_mul1::GLM_RECORD_BYTES_K3;
+            let mut pinned = cuda::Pinned::alloc(all.len());
+            pinned.write_bytes(0, &all);
+            let pos = |e: u32| needed.iter().position(|&n| n == e).unwrap_or(0);
+            let table: Vec<u64> = (0..g.experts as u32).map(|e| pinned.dev + (rb * pos(e)) as u64).collect();
+            let mut tp = cuda::to_u64_dev(&table);
+            let w = GpuMoeWeights { router: cuda::upload_dev(&le_u16(&s.router_w)), bias: cuda::to_f32_dev(&s.bias), shared: gpu_ffn(&s.shared) };
+            let mut plan = GpuMoePlan::new(&g, 1);
+            let x = &s.x_moe[..h];
+            let (mut xd, mut yd, mut y2) = (cuda::to_f32_dev(x), cuda::alloc_zeroed(h * 4), cuda::alloc_zeroed(h * 4));
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            lane::post(None);
+            plan.run(&kn, &mk, &gk, &w, tp, xd, yd);
+            cuda::sync();
+            let (y_gpu, ye_gpu) = (cuda::dtoh(yd, h), cuda::dtoh(plan.ye, k * h));
+            let ids: Vec<u32> = cuda::dtoh_i32(plan.ids, k).into_iter().map(|v| v as u32).collect();
+            let rec = |e: u32| &all[rb * pos(e)..rb * (pos(e) + 1)];
+            let ye_cpu: Vec<Vec<f32>> = ids
+                .iter()
+                .map(|&e| {
+                    let mut y = vec![0f32; h];
+                    expert_ffn_mul1_cpu(&g, rec(e), x, &mut y, 8, Path::Auto).unwrap();
+                    y
+                })
+                .collect();
+            let host = pinned.host as *const u8;
+            let combos = |mask: u32| -> Vec<lane::Combo> {
+                ids.iter()
+                    .enumerate()
+                    .map(|(c, &e)| if mask >> c & 1 == 1 { lane::Combo::Cpu(host.add(rb * pos(e))) } else { lane::Combo::Gpu(table[e as usize]) })
+                    .collect()
+            };
+            let clock = Arc::new(lane::Clock::default());
+            let mut want_experts = 0u64;
+            for mask in [0b0000_0001u32, 0b1000_0000, 0b0101_0101, 0b0011_1100, 0b1111_1100, 0b1111_1110, 0b1111_1111] {
+                cuda::to_f32_into(plan.ye, &vec![f32::NAN; k * h]);
+                lane::post(Some(lane::Call { table: tp, combos: combos(mask), clock: clock.clone() }));
+                plan.run(&kn, &mk, &gk, &w, tp, xd, yd);
+                cuda::sync();
+                want_experts += mask.count_ones() as u64;
+                let (y, ye) = (cuda::dtoh(yd, h), cuda::dtoh(plan.ye, k * h));
+                for c in 0..k {
+                    let (got, want) = (&ye[c * h..(c + 1) * h], if mask >> c & 1 == 1 { &ye_cpu[c][..] } else { &ye_gpu[c * h..(c + 1) * h] });
+                    assert!(bits(got) == bits(want), "mask {mask:08b} combo {c} ({}): the ye row differs", if mask >> c & 1 == 1 { "CPU" } else { "GPU" });
+                }
+                launch_v(gk.combine, h.div_ceil(256) as u32, 1, 1, 256, &[plan.ye, plan.wts, plan.ys, y2, plan.prm_kh2]);
+                cuda::sync();
+                assert!(bits(&y) == bits(&cuda::dtoh(y2, h)), "mask {mask:08b}: y is not the combine of ye");
+                let (co, cg) = (cosine(&y, &gd.moe_y[..h]), cosine(&y, &y_gpu));
+                eprintln!(
+                    "glm5_moe CPU lane mask {mask:08b} ({} CPU): vs GPU-only max abs {:.3e} at rms {:.3e}, 1 - cosine {:.2e}; vs oracle 1 - cosine {:.2e} (GPU-only {:.2e})",
+                    mask.count_ones(),
+                    max_abs(&y, &y_gpu),
+                    rms(&y_gpu),
+                    1.0 - cg,
+                    1.0 - co,
+                    1.0 - cosine(&y_gpu, &gd.moe_y[..h])
+                );
+                assert!(co >= COS_MIN, "mask {mask:08b}: cosine to the oracle {co:.9}");
+            }
+            let (ns, n_exp, runs) = clock.read();
+            assert_eq!((n_exp, runs), (want_experts, 7), "the lane clock");
+            eprintln!("glm5_moe CPU lane: {n_exp} experts in {runs} pool runs, {:.3} ms (test harness, not a measurement)", ns as f64 / 1e6);
+            // posts the GPU path must not take: another table, no CPU combo
+            for post in [lane::Call { table: tp + 8, combos: combos(0xFF), clock: clock.clone() }, lane::Call { table: tp, combos: combos(0), clock: clock.clone() }] {
+                lane::post(Some(post));
+                plan.run(&kn, &mk, &gk, &w, tp, xd, yd);
+                cuda::sync();
+                assert!(bits(&cuda::dtoh(yd, h)) == bits(&y_gpu), "a post that does not apply changed y");
+            }
+            assert_eq!(clock.read().1, want_experts, "a post that does not apply ran the CPU");
+            plan.free();
+            free_ffn(w.shared);
+            let (mut wr, mut wb) = (w.router, w.bias);
+            for d in [&mut tp, &mut xd, &mut yd, &mut y2, &mut wr, &mut wb] {
+                cuda::free_dev(d);
+            }
+            pinned.free();
+        }
+    }
+
+    /// #188 bench (why the CPU lane refuses a write-combined pinned tier): the CPU lane's FFN
+    /// (`experts_ffn`, 1 expert, T 1, `LANE_THREADS`) on one synthetic 3-bit GLM record in a
+    /// write-combined pinned block (`CROW_PINNED_ALLOC=wc`, the Windows default), a cacheable
+    /// pinned block (`host`) and the heap; median of 15 calls after 3 warm-up calls each, the
+    /// three alternating. Prints ms per expert and GB/s of the record.
+    #[test]
+    #[ignore = "bench, needs the GPU (pinned allocation only): cargo test --release --lib glm5_moe_gpu_lane_wc_bench -- --ignored --nocapture --test-threads 1"]
+    fn glm5_moe_gpu_lane_wc_bench() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let g = geo();
+            let r = record(1);
+            let mut wc = cuda::Pinned::alloc_wc(r.len());
+            let mut host = cuda::Pinned::alloc(r.len());
+            wc.write_bytes(0, &r);
+            host.write_bytes(0, &r);
+            let x: Vec<f32> = { let mut rng = Rng(0x188); (0..4096).map(|_| rng.f(X_AMP)).collect() };
+            let srcs: [(&str, *const u8); 3] = [("wc pinned", wc.host as *const u8), ("host pinned", host.host as *const u8), ("heap", r.as_ptr())];
+            let mut t: [Vec<f64>; 3] = Default::default();
+            let mut out: [Vec<f32>; 3] = Default::default();
+            for it in 0..18 {
+                for (i, &(_, p)) in srcs.iter().enumerate() {
+                    let e = Mul1Expert::from_record(std::slice::from_raw_parts(p, r.len()), 4096, g.expert_inter, g.bitrate).unwrap();
+                    let mut y = vec![0f32; 4096];
+                    let t0 = std::time::Instant::now();
+                    cpu_mul1::experts_ffn(&[e], &x, &mut y, &|a, b| swiglu_clamp(a, b, 10.0), LANE_THREADS, Path::Auto);
+                    if it >= 3 {
+                        t[i].push(t0.elapsed().as_secs_f64());
+                    }
+                    out[i] = y;
+                }
+            }
+            for (i, &(name, _)) in srcs.iter().enumerate() {
+                t[i].sort_by(|a, b| a.total_cmp(b));
+                let m = t[i][t[i].len() / 2];
+                eprintln!("glm5_moe lane bench {name}: median {:.3} ms per expert, {:.2} GB/s (min {:.3}, max {:.3} ms, n {})", m * 1e3, r.len() as f64 / m / 1e9, t[i][0] * 1e3, t[i][t[i].len() - 1] * 1e3, t[i].len());
+            }
+            assert!(out[0] == out[2] && out[1] == out[2], "the three copies give other outputs");
+            wc.free();
+            host.free();
         }
     }
 
