@@ -274,6 +274,24 @@ impl KdaState {
     }
 }
 
+/// #192 (MTP rollback): a KDA state as a snapshot slot of another
+impl KdaState {
+    /// device bytes of one state: S plus the conv window
+    pub fn bytes(&self) -> u64 {
+        ((self.d.state_floats() + self.d.conv_floats()) * 4) as u64
+    }
+
+    /// queue `self = src` (S and conv window, D2D on the current stream)
+    ///
+    /// # Safety
+    /// A CUDA context is current; both states have the same dims.
+    pub unsafe fn copy_from(&self, src: &KdaState) {
+        assert_eq!(self.d, src.d, "glm5_kda: a snapshot of other dims");
+        cuda::d2d_async(self.s, src.s, self.d.state_floats() * 4);
+        cuda::d2d_async(self.conv, src.conv, self.d.conv_floats() * 4);
+    }
+}
+
 // the scalar argument slots of `KdaScratch::params` (every scalar is a device pointer, the p5 rule)
 const P_T: usize = 0;
 const P_HIDDEN: usize = 1;

@@ -754,6 +754,333 @@ impl MtpPass {
     }
 }
 
+// ---------------------------------------------------------------- #192: speculative decoding
+
+/// `CROW_GLM_MTP=N`: N draft tokens per decode step (0 or unset = off, today's path)
+pub const MTP_ENV: &str = "CROW_GLM_MTP";
+/// the MTP overlay `load_mtp` reads with the container (default [`GLM5_MTP_OVERLAY_CNQ`])
+pub const OVERLAY_ENV: &str = "CROW_GLM_MTP_OVERLAY";
+/// the overlay of #182, relative to the repo root (`geo::from_engine_dir` from `engine/`)
+pub const GLM5_MTP_OVERLAY_CNQ: &str = "converter/GLM-5.3-Flash-MTP-overlay.cnq";
+/// the most drafts per step (one KDA snapshot slot each: 34 x 4,489,216 B on GLM-5.3-Flash)
+pub const MTP_MAX: usize = 4;
+/// rows per call of the block over the prompt (the catch-up of every prompt row)
+pub const MTP_CHUNK: usize = 16;
+
+/// Parse `CROW_GLM_MTP`: unset, empty or `0` = off; `1..=MTP_MAX` drafts per step; anything
+/// else refused by name.
+pub fn draft_rows(v: Option<&str>) -> Result<usize, String> {
+    match v.map(str::trim) {
+        None | Some("") => Ok(0),
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) if n <= MTP_MAX => Ok(n),
+            _ => Err(format!("{MTP_ENV}={s:?}: accepted 0 (off, default) .. {MTP_MAX} draft tokens per step")),
+        },
+    }
+}
+
+/// `CROW_GLM_MTP` from the environment (see [`draft_rows`])
+pub fn draft_rows_from_env() -> Result<usize, String> {
+    draft_rows(std::env::var(MTP_ENV).ok().as_deref())
+}
+
+/// What the speculative decode did since the start of the last `generate` (host counters).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpecStats {
+    /// drafts per step asked for (`CROW_GLM_MTP`)
+    pub n: usize,
+    /// verify steps (one multi-row trunk call each)
+    pub steps: u64,
+    /// ids the verify steps emitted (accepted drafts + the trunk's own id per step)
+    pub tokens: u64,
+    /// draft tokens verified, and those accepted
+    pub drafts: u64,
+    pub accepted: u64,
+    /// trunk rows of the verify calls (1 + drafts per step)
+    pub verify_rows: u64,
+    /// steps by accepted drafts: `hist[a]` = steps that accepted `a` drafts, `a` in `0..=n`
+    pub hist: Vec<u64>,
+    /// rows the MTP block ran (prompt catch-up, per-step catch-up, chained drafts)
+    pub mtp_rows: u64,
+    /// KDA rollback: snapshot copies (one per KDA layer per draft row) and their bytes
+    pub kda_snapshots: u64,
+    pub kda_snapshot_bytes: u64,
+    /// KDA rollback: steps that restored a snapshot (a rejected draft), copies and bytes
+    pub kda_restore_steps: u64,
+    pub kda_restores: u64,
+    pub kda_restore_bytes: u64,
+}
+
+impl SpecStats {
+    /// accepted / drafts (None before the first draft)
+    pub fn acceptance(&self) -> Option<f64> {
+        (self.drafts > 0).then(|| self.accepted as f64 / self.drafts as f64)
+    }
+}
+
+/// a draft override (`(index of the generated id the draft guesses, draft) -> draft`): the GPU
+/// tests force acceptances and rejections with it
+pub type DraftHook = Box<dyn FnMut(usize, i64) -> i64>;
+
+/// The device state of the speculative decode of one `Glm5Run` (`glm5_tiers`): the block, its
+/// pass (own MLA + indexer cache), the verify buffers of `1 + n` rows, the KDA snapshot slots
+/// (`n` per KDA layer), the counters.
+pub struct Spec {
+    pub n: usize,
+    pub block: MtpBlock,
+    pub mp: MtpPass,
+    pub mk: MtpKernels,
+    /// per decoder layer: `n` snapshot states for a KDA layer, none otherwise
+    pub snaps: Vec<Vec<crate::glm5_kda::KdaState>>,
+    /// verify rows: `x [1+n][4][H]`, `normed [1+n][H]`, `logits [1+n][V]`, `ids [1+n]` i32
+    pub x: Dev,
+    pub normed: Dev,
+    pub logits: Dev,
+    pub ids: Dev,
+    /// the block's inputs: embeddings `[MTP_CHUNK][H]`, head-norm rows `[MTP_CHUNK][H]`
+    pub e: Dev,
+    pub h: Dev,
+    /// a chained draft's logits `[V]` and greedy id
+    pub dlogits: Dev,
+    pub did: Dev,
+    pub stats: SpecStats,
+    pub hook: Option<DraftHook>,
+    /// test probe: after every rollback, (last valid trunk row, every KDA state's S and conv bytes)
+    #[cfg(test)]
+    pub probe: Option<Box<dyn FnMut(usize, &[Vec<u8>])>>,
+}
+
+impl Spec {
+    /// # Safety
+    /// A CUDA context is current; `kda_layers` = the KDA flag of every decoder layer.
+    pub unsafe fn new(g: &Glm5Geo, moe: MoeGeo, cap: usize, n: usize, block: MtpBlock, kda_layers: &[bool]) -> Spec {
+        assert!((1..=MTP_MAX).contains(&n), "glm5_mtp: {n} drafts per step (1..={MTP_MAX})");
+        let kd = crate::glm5_kda::KdaDims::of(g);
+        let (h, v, t) = (g.hidden, g.vocab, 1 + n);
+        let a = |what: &str, bytes: usize| cuda::alloc_named(what, bytes);
+        Spec {
+            n,
+            block,
+            mp: MtpPass::new(g, moe, MTP_CHUNK.max(t), cap),
+            mk: MtpKernels::new(),
+            snaps: kda_layers.iter().map(|&k| if k { (0..n).map(|_| crate::glm5_kda::KdaState::alloc(&kd)).collect() } else { Vec::new() }).collect(),
+            x: a("glm5 MTP verify residual", t * g.hc_streams * h * 4),
+            normed: a("glm5 MTP verify normed", t * h * 4),
+            logits: a("glm5 MTP verify logits", t * v * 4),
+            ids: a("glm5 MTP verify ids", t * 4),
+            e: a("glm5 MTP embeddings", MTP_CHUNK.max(t) * h * 4),
+            h: a("glm5 MTP head-norm rows", MTP_CHUNK.max(t) * h * 4),
+            dlogits: a("glm5 MTP draft logits", v * 4),
+            did: a("glm5 MTP draft id", 4),
+            stats: SpecStats { n, hist: vec![0; n + 1], ..SpecStats::default() },
+            hook: None,
+            #[cfg(test)]
+            probe: None,
+        }
+    }
+
+    /// counters back to zero (a new `generate`)
+    pub fn reset_stats(&mut self) {
+        self.stats = SpecStats { n: self.n, hist: vec![0; self.n + 1], ..SpecStats::default() };
+    }
+
+    /// bytes of one snapshot slot over every KDA layer
+    pub fn snapshot_bytes(&self) -> u64 {
+        self.snaps.iter().filter_map(|s| s.first()).map(|s| s.bytes()).sum()
+    }
+
+    /// # Safety
+    /// No launch reading this state is pending.
+    pub unsafe fn free(&mut self) {
+        cuda::sync();
+        self.block.free();
+        self.mp.free();
+        self.mk.module.unload();
+        for s in self.snaps.iter_mut().flatten() {
+            s.free();
+        }
+        for d in [&mut self.x, &mut self.normed, &mut self.logits, &mut self.ids, &mut self.e, &mut self.h, &mut self.dlogits, &mut self.did] {
+            cuda::free_dev(d);
+        }
+    }
+}
+
+/// The VRAM the speculative decode adds at `n` drafts and `cap` rows, derived (not measured; the
+/// planner of `glm5_run` takes it off the free VRAM): the block's 288 records, its 25 overlay
+/// tensors as loaded (norms f32, `kv_b` BF16, the rest as stored), the KDA snapshot slots, the
+/// block's MLA cache and scratch, the verify buffers, the MoE plans of the block's calls.
+pub fn spec_vram_bytes(g: &Glm5Geo, moe: &MoeGeo, cap: usize, n: usize) -> u64 {
+    let md = MlaDims::of(g);
+    let kd = crate::glm5_kda::KdaDims::of(g);
+    let (h, v, t) = (g.hidden as u64, g.vocab as u64, 1 + n as u64);
+    let records = g.experts as u64 * moe.record.bytes;
+    let tensors: u64 = mtp_tensors(g)
+        .iter()
+        .filter(|x| x.store != Store::Mul1)
+        .map(|x| match x.store {
+            Store::Nvfp4 if x.name.contains("kv_b_proj") => x.values() as u64 * 2,
+            Store::Bf16 if x.shape.len() == 1 => x.values() as u64 * 4,
+            _ => x.overlay_bytes(),
+        })
+        .sum();
+    let snaps = n as u64 * g.kda_layers as u64 * ((kd.state_floats() + kd.conv_floats()) * 4) as u64;
+    let mt = MTP_CHUNK.max(n + 1) as u64;
+    let cache = MlaCache::bytes(&md, cap);
+    let scratch = 4 * mt * (md.q_lora + md.heads * md.nope + md.kv_lora + md.idx_proj() + md.idx_heads * md.idx_dim + (cap / crate::glm5_mla::KPOOL).max(1) + md.sel_max() + 2 * md.heads * md.kv_lora + md.heads * md.v) as u64
+        + 4 * mt.max(16) * md.heads as u64 * (md.kv_lora as u64 + 2)
+        + 4 * mt * h * 6;
+    let verify = 4 * t * (g.hc_streams as u64 * h + h + v + 1) + 4 * (v + 1);
+    // one MoE plan per call size: [c][H] gather + output, 3 x [c][inter], the MUL1 partials
+    let plans: u64 = (1..=mt).map(|tt| 4 * tt * g.topk as u64 * (2 * h + 3 * g.expert_inter as u64) * 2).sum();
+    records + tensors + snaps + cache + scratch + verify + plans
+}
+
+/// #192 test kit: a synthetic MTP block of `g` (bounded weights as `glm5_flags`' synthetic
+/// trunk: NVFP4 codes random, scale bytes 0x30-0x38 under 0.2 / sqrt(cols); BF16 matrices
+/// +-1 / sqrt(cols); norms 1 +- 0.05; vectors +-0.05; `g.experts` MUL1 records with random
+/// trellis words and fp16 suh / svh of magnitude 0.06-0.12), all in VRAM.
+///
+/// # Safety
+/// A CUDA context is current.
+#[cfg(test)]
+pub(crate) unsafe fn synthetic_block(g: &Glm5Geo, moe: &MoeGeo, seed: u64) -> MtpBlock {
+    struct R(u64);
+    impl R {
+        fn u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn sym(&mut self) -> f32 {
+            (self.u64() >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        }
+    }
+    fn f16(v: f32) -> u16 {
+        let b = v.to_bits();
+        let e = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+        (((b >> 16) & 0x8000) | ((e as u32) << 10) | ((b & 0x7F_FFFF) >> 13)) as u16
+    }
+    let mut r = R(seed);
+    let md = MlaDims::of(g);
+    let h = g.hidden;
+    let bf = |r: &mut R, rows: usize, cols: usize| -> Dev {
+        let a = 1.0 / (cols as f32).sqrt();
+        cuda::to_dev(&(0..rows * cols).map(|_| crate::glm5_model::f32_to_bf16_rne(a * r.sym())).collect::<Vec<u16>>())
+    };
+    let norm = |r: &mut R, n: usize| -> Dev { cuda::to_f32_dev(&(0..n).map(|_| 1.0 + 0.05 * r.sym()).collect::<Vec<f32>>()) };
+    let vec = |r: &mut R, n: usize| -> Dev { cuda::to_f32_dev(&(0..n).map(|_| 0.05 * r.sym()).collect::<Vec<f32>>()) };
+    let fp4 = |r: &mut R, rows: usize, cols: usize| -> GpuNvfp4 {
+        let mut b = vec![0u8; (rows * cols).div_ceil(64) * 36];
+        for blk in b.chunks_exact_mut(36) {
+            for (i, x) in blk.iter_mut().enumerate() {
+                *x = if i < 4 { 0x30 + (r.u64() % 9) as u8 } else { r.u64() as u8 };
+            }
+        }
+        GpuNvfp4 { w: cuda::upload_dev(&b), gs: cuda::to_f32_dev(&[0.2 / (cols as f32).sqrt()]), rows, cols }
+    };
+    let attn = MlaWeights {
+        q_a: 0,
+        q_a_norm: norm(&mut r, md.q_lora),
+        q_b: 0,
+        kv_a: 0,
+        kv_a_norm: norm(&mut r, md.kv_lora),
+        kv_b: bf(&mut r, md.heads * (md.nope + md.v), md.kv_lora),
+        o_proj: 0,
+        idx_wq_b: bf(&mut r, md.idx_heads * md.idx_dim, md.q_lora),
+        idx_x: bf(&mut r, md.idx_proj(), h),
+        idx_k_norm_w: norm(&mut r, md.idx_dim),
+        idx_k_norm_b: vec(&mut r, md.idx_dim),
+        idx_ape: vec(&mut r, md.kpool * md.idx_dim),
+    };
+    let si = g.expert_inter * g.shared_experts;
+    let moe_w = GpuMoeWeights {
+        router: bf(&mut r, g.experts, h),
+        bias: vec(&mut r, g.experts),
+        shared: GpuFfnWeights { gate: fp4(&mut r, si, h), up: fp4(&mut r, si, h), down: fp4(&mut r, h, si) },
+    };
+    let (q_a, q_b, kv_a, o) = (fp4(&mut r, md.q_lora, h), fp4(&mut r, md.heads * md.nope, md.q_lora), fp4(&mut r, md.kv_lora, h), fp4(&mut r, h, md.heads * md.v));
+    let rb = moe.record.bytes as usize;
+    let specs = crate::kernels::mul1::record_specs(g.hidden, g.expert_inter, 3, false);
+    let trellis = specs[0].suh_off;
+    let records = cuda::alloc_named("glm5 MTP synthetic records", g.experts * rb);
+    let mut bases = Vec::with_capacity(g.experts);
+    for e in 0..g.experts {
+        let mut rec = vec![0u8; rb];
+        for w in rec[..trellis].chunks_exact_mut(8) {
+            w.copy_from_slice(&r.u64().to_le_bytes());
+        }
+        for s in &specs {
+            for (at, cnt) in [(s.suh_off, s.k), (s.svh_off, s.n)] {
+                for i in 0..cnt {
+                    let v = (0.06 + 0.03 * (r.sym() + 1.0)) * if r.u64() & 1 == 1 { -1.0 } else { 1.0 };
+                    rec[at + 2 * i..at + 2 * i + 2].copy_from_slice(&f16(v).to_le_bytes());
+                }
+            }
+        }
+        let base = records + (e * rb) as u64;
+        cuda::into_dev(base, rec.as_slice());
+        bases.push(base);
+    }
+    let i = |v: usize| v as i32;
+    let cols = cuda::to_i32_dev(&[i(q_a.cols), i(q_b.cols), i(kv_a.cols), i(o.cols)]);
+    MtpBlock {
+        w: MtpWeights {
+            enorm: norm(&mut r, h),
+            hnorm: norm(&mut r, h),
+            eh_proj: bf(&mut r, h, 2 * h),
+            input_norm: norm(&mut r, h),
+            post_norm: norm(&mut r, h),
+            head_norm: norm(&mut r, h),
+            attn,
+            moe: moe_w,
+            records,
+            table: cuda::to_u64_dev(&bases),
+        },
+        q_a,
+        q_b,
+        kv_a,
+        o,
+        cols,
+        bytes: 0,
+        sanitized: 0,
+        kv_b_inexact: 0,
+    }
+}
+
+#[cfg(test)]
+mod spec_host_tests {
+    use super::*;
+
+    #[test]
+    fn crow_glm_mtp_parses_and_refuses_by_name() {
+        assert_eq!(draft_rows(None), Ok(0));
+        assert_eq!(draft_rows(Some("")), Ok(0));
+        assert_eq!(draft_rows(Some("0")), Ok(0));
+        assert_eq!(draft_rows(Some(" 1 ")), Ok(1));
+        assert_eq!(draft_rows(Some("4")), Ok(4));
+        for bad in ["5", "-1", "on", "1.5"] {
+            let e = draft_rows(Some(bad)).unwrap_err();
+            assert!(e.starts_with(&format!("{MTP_ENV}=\"{bad}\": accepted 0 (off, default) .. 4")), "{e}");
+        }
+    }
+
+    #[test]
+    fn spec_stats_acceptance_and_vram_estimate() {
+        let s = SpecStats { drafts: 10, accepted: 4, ..SpecStats::default() };
+        assert_eq!(s.acceptance(), Some(0.4));
+        assert_eq!(SpecStats::default().acceptance(), None);
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let moe = MoeGeo::new(&g, crate::geo::ExpertRecordSpec::new(crate::geo::ExpertCodec::Mul1, crate::cpu_mul1::GLM_RECORD_BYTES_K3 as u64).unwrap()).unwrap();
+        let (b1, b2) = (spec_vram_bytes(&g, &moe, 4096, 1), spec_vram_bytes(&g, &moe, 4096, 2));
+        // one more draft row adds at least one KDA snapshot slot: 34 x (4 MiB + 288 KiB)
+        assert!(b2 - b1 >= 34 * 4_489_216, "{b1} {b2}");
+        // the 288 records alone are 2,728,525,824 B
+        assert!(b1 > 288 * 9_474_048, "{b1}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Host tests: the tensor plan, the pairing, the host twin's exact ops, the kernel source.

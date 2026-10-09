@@ -1069,6 +1069,103 @@ pub fn head_geo(g: &Glm5Geo) -> HeadGeo {
     HeadGeo::of(g)
 }
 
+// ---------------------------------------------------------------- #192: the MTP verify call
+
+impl Glm5Pass {
+    /// #192 (`CROW_GLM_MTP`): one layer over the `t` verify rows `pos0 .. pos0 + t` of a
+    /// speculative step, `x` `[t][4][hidden]` updated in place, each row's result bit for bit the
+    /// one-row decode call's ([`Glm5Pass::call_with_experts`] with `t = 1`, `decode`):
+    ///
+    /// - mHC coefficients and expand, both norms, the dense FFN, the router, the routed experts,
+    ///   the shared expert and the combine run over all `t` rows (their kernels compute every row
+    ///   on its own: `glm5_mhc_coeffs` / `gm_rmsnorm` a block per row, `gemv_fp4_b` and
+    ///   `gemv_bf16_b` grid y = row, MUL1 slots that never interact);
+    /// - the router ids of all rows reach `experts` in ONE hook call (`[t][topk]`), so the tiers
+    ///   stage the union of the rows' experts once;
+    /// - KDA runs the decode step row after row (`glm5_kda::step_with`; the prompt path is another
+    ///   operation order), and after row `r < t - 1` the state (S and conv window) is copied into
+    ///   `kda_snaps[r]` (queued, D2D): the caller restores the state of the last accepted row;
+    /// - MLA runs one one-row call per row (`attn_splits(t)` would change the split-K partition);
+    ///   rows of rejected positions stay in the cache and are rewritten before any later row
+    ///   reads them (absolute positions, store before select).
+    ///
+    /// Any change to the launches of `call_inner` must be mirrored here (the GPU test
+    /// `glm5_tiers::spec_tests::glm5_mtp_spec_gpu_is_lossless` compares the bits).
+    ///
+    /// # Safety
+    /// As [`Glm5Pass::call_with_experts`]; `t <= max_t`; a KDA layer needs `t - 1` snapshot
+    /// states of this pass's dims.
+    pub unsafe fn call_verify_with_experts(&mut self, lw: &LayerW, x: Dev, pos0: usize, t: usize, kda_snaps: &[KdaState], experts: &mut ExpertHook) -> Result<(), String> {
+        assert!((1..=self.max_t).contains(&t) && pos0 + t <= self.cap, "glm5_model: verify rows {pos0}..{} (max_t {}, cap {})", pos0 + t, self.max_t, self.cap);
+        let h = self.g.hidden;
+        let row = |b: Dev, r: usize| b + (r * h * 4) as u64;
+        self.mhc.coeffs(&self.kn.mhc, &lw.attn_hc, x, self.collapsed, t);
+        self.kn.mla.rmsnorm_rows(self.collapsed, lw.input_norm, h, t, self.st2);
+        match &lw.attn {
+            AttnW::Kda(a) => {
+                assert!(kda_snaps.len() + 1 >= t, "glm5_model: {t} verify rows, {} KDA snapshot slots", kda_snaps.len());
+                let (kn, ints) = (&self.kn, &self.ints);
+                let w = kn.kda.d.width();
+                let cc = kn.kda.d.conv_ch();
+                let mut proj = |p: KdaProj, xi: Dev, yo: Dev, tt: usize| match p {
+                    KdaProj::Qkv => {
+                        fp4_gemv(&kn.k, ints, &a.q, xi, yo, tt, Some(cc));
+                        fp4_gemv(&kn.k, ints, &a.k, xi, yo + (w * 4) as u64, tt, Some(cc));
+                        fp4_gemv(&kn.k, ints, &a.v, xi, yo + (2 * w * 4) as u64, tt, Some(cc));
+                    }
+                    KdaProj::O => fp4_gemv(&kn.k, ints, &a.o, xi, yo, tt, None),
+                };
+                for r in 0..t {
+                    glm5_kda::step_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, row(self.collapsed, r), row(self.sub, r), &mut proj);
+                    if r + 1 < t {
+                        kda_snaps[r].copy_from(&self.kda_st);
+                    }
+                }
+            }
+            AttnW::Mla(a) => {
+                let (kn, ints) = (&self.kn, &self.ints);
+                let mut proj = |s: &MlaScratch, p: MlaProj, xi: Dev, yo: Dev| {
+                    let m = match p {
+                        MlaProj::QA => &a.q_a,
+                        MlaProj::QB => &a.q_b,
+                        MlaProj::KVA => &a.kv_a,
+                        MlaProj::O => &a.o,
+                    };
+                    fp4_gemv(&kn.k, ints, m, xi, yo, s.t(), None);
+                };
+                for r in 0..t {
+                    self.mla_sc.forward_with(&kn.mla, &a.w, &self.mla_c, row(self.collapsed, r), row(self.sub, r), pos0 + r, 1, &mut proj);
+                }
+            }
+        }
+        self.mhc.expand(&self.kn.mhc, x, self.sub, x, t);
+        self.mhc.coeffs(&self.kn.mhc, &lw.ffn_hc, x, self.collapsed, t);
+        self.kn.mla.rmsnorm_rows(self.collapsed, lw.post_norm, h, t, self.st2);
+        match &lw.ffn {
+            FfnW::Dense(w) => {
+                if !self.dense_plans.iter().any(|p| p.tokens == t) {
+                    self.dense_plans.push(GpuFfnPlan::new(h, self.g.dense_inter, t, self.g.swiglu_limit as f32));
+                }
+                let p = self.dense_plans.iter().find(|p| p.tokens == t).unwrap();
+                p.run(&self.kn.k, &self.kn.moe, w, self.collapsed, self.sub);
+            }
+            FfnW::Moe { w, .. } => {
+                if !self.moe_plans.iter().any(|p| p.tokens == t) {
+                    self.moe_plans.push(GpuMoePlan::new(&self.moe, t));
+                }
+                let p = self.moe_plans.iter().find(|p| p.tokens == t).unwrap();
+                p.route(&self.kn.k, &self.kn.moe, w, self.collapsed);
+                let ids = router_ids(self.routed.as_mut(), p.ids, t * self.moe.topk, lw.layer)?;
+                let tb = experts(lw.layer, &ids)?;
+                p.experts(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub);
+            }
+        }
+        self.last_ffn_t = t;
+        self.mhc.expand(&self.kn.mhc, x, self.sub, x, t);
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------- the golden harness's host side
 
 /// The host side of `decode glmgolden` (#161): the layerwise runner's manifest
