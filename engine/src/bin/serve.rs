@@ -149,8 +149,9 @@
 //! | `max_tokens` | default 8192 (1024 until 2026-09-18), capped at 32768 |
 //! | `max_completion_tokens` | #112: OpenAI's current name for the same budget, same rules; both sent with different values is a 400 naming both |
 //! | `model` | echoed into every chunk, default `crow-nest` |
-//! | `chat_template_kwargs.enable_thinking` | template variable, default false |
-//! | `reasoning_effort` | #74: top level OR `chat_template_kwargs`; `none` and an absent field are the render of record, `low` / `medium` pass through, `high` and `xhigh` both render `xhigh`, anything else is a 400 |
+//! | `chat_template_kwargs.enable_thinking` | template variable, default false; #185 GLM-5.3-Flash: thinking is always on, `false` is a 400 by name (its template cannot render off), `true` is accepted |
+//! | `reasoning_effort` | #74: top level OR `chat_template_kwargs`; `none` and an absent field are the render of record, `low` / `medium` pass through, `high` and `xhigh` both render `xhigh`, anything else is a 400; #185 GLM-5.3-Flash (`glm5_template::reasoning_level`): absent and `max` render max, `low` low, `high` and `xhigh` high; `none`, `medium` and every other word are 400s by name |
+//! | `chat_template_kwargs.clear_thinking` | #185, GLM-5.3-Flash only: a boolean template variable (another type is a 400); absent leaves it undefined, the template's false. Ignored for the Qwen family |
 //! | `temperature` | #111: absent or `null` = the MODEL CARD row of the request's thinking mode (thinking 1.0, non-thinking 0.7), so an absent field SAMPLES; `<= 0` sent explicitly is GREEDY (the A4 path, gates and probes); `> 0` samples (#28 A6) |
 //! | `top_p` | nucleus mass; absent = card row (thinking 0.95, non-thinking 0.8, #111); read only when `temperature > 0` |
 //! | `top_k` | candidates kept; absent = card row (20 both rows, #111); `0` or `-1` = top-k OFF (llama.cpp/vLLM); other negatives a 400; `0` or `> 64` routes to the HOST sampler (the device kernel holds 64); read only when `temperature > 0` |
@@ -257,6 +258,10 @@
 //!   enable_thinking, reasoning_effort)` - four template variables, no string surgery.
 //! - #74: `reasoning_effort` is DEFINED only for a request that thinks, so a request that
 //!   names no level renders the ids of record and every parity and gate value stands.
+//! - #185: that is the Qwen family's call (Flash-Next, the 27B). A GLM-5.3-Flash request
+//!   renders with `render_chat_with` + `glm5_template::template_vars(level, clear_thinking)`
+//!   (`render_ids`), its generation prompt always ends in `<think>`, so its filter starts
+//!   `Inside`, and its tool parser and grammar read GLM markup (`docs/glm5-tokenizer.md`).
 //! - #74: with thinking on the generation prompt ends in `<think>\n`, so `ThinkFilter` starts
 //!   `Inside` for that request - otherwise the reasoning would leave as `content`.
 //! - #81: `reasoning_budget_tokens` caps the THINKING, not the answer. Absent, null or
@@ -270,6 +275,8 @@
 //!   Qwen's docs name `thinking_budget`; without the field the ids stay byte-identical.
 //! - Greedy decode: `Engine::prefill` gives the first id, `Engine::decode_step` the rest.
 //! - Stops on `sample::EOS_IDS` (`finish_reason` `stop`) or at `max_tokens` (`length`).
+//!   #185: the loop asks the engine (`ServeEngine::is_stop`): `Geo::eos_ids` for Flash-Next
+//!   and the 27B, `glm5_template::EOS_IDS` for glm5_next.
 //! - #86: a request with `stop` strings ALSO stops on the CONTENT text — earliest
 //!   match, longest-first on ties, the stop and everything after it swallowed, never
 //!   streamed (`StopStrings`, the tool-call tail-hold on arbitrary strings). The stop
@@ -609,12 +616,14 @@
 use crow_nest_engine::cache::{ColdPlan, PrefixCache, SLOTS};
 use crow_nest_engine::boot;
 use crow_nest_engine::cnq::Cnq;
+use crow_nest_engine::glm5_engine::Glm5Engine;
+use crow_nest_engine::glm5_template;
 use crow_nest_engine::gen::{DevSampler, Engine};
-use crow_nest_engine::geo::{apply_adapt_policy, resolve_default, Geo, DEFAULT_CNQ, DEFAULT_HOTSETS, TRICKLE_CHUNK_THRESHOLD};
+use crow_nest_engine::geo::{apply_adapt_policy, resolve_default, Family, Geo, DEFAULT_CNQ, DEFAULT_HOTSETS, TRICKLE_CHUNK_THRESHOLD};
 use crow_nest_engine::sample::{pos_logprobs, PosLogprobs, Sampler, MAX_TOP_LOGPROBS};
 use crow_nest_engine::slot;
 use crow_nest_engine::stopstr::StopStrings;
-use crow_nest_engine::toolcall::{Emit, Malformed, ToolStream, TOOL_OPEN};
+use crow_nest_engine::toolcall::{Emit, Malformed, Markup, ToolStream, TOOL_OPEN};
 use crow_nest_engine::toolgrammar::{self, Gate, ToolGrammar, Vocab};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -1205,6 +1214,115 @@ fn error_json(msg: &str) -> serde_json::Value {
     serde_json::json!({ "error": msg })
 }
 
+// ------------------------------------------------ #185: the family dispatch
+
+/// - #185: what serve's request layer reads of the engine of the loaded family: the
+///   vocabulary bound of the parse, the stop ids of the loop and the trie, and the request
+///   family (template variables, tool markup, where the reasoning filter starts).
+/// - `Geo` answers for Flash-Next and the 27B (a `Geo` exists for those two families only;
+///   glm5_next has none, `meta::verdict`), and `Engine` delegates to its own `geo`, so their
+///   path reads the same numbers it read before this trait: `geo.vocab`, `geo.eos_ids`, Qwen.
+/// - `Glm5Engine` answers from GLM-5.3-Flash's own constants (`glm5_template::EOS_IDS`).
+/// - part 1 of #185: the generation calls (prefill, decode step, logits, snapshot / restore,
+///   reset) stay on `Engine`; part 2 moves them here when `Glm5Engine` gets its body.
+trait ServeEngine {
+    /// the vocabulary size: the bound of `logit_bias` keys and `crow_force_ids`, the trie's size
+    fn vocab(&self) -> usize;
+    /// the generation stop ids, in the order the config lists them
+    fn stop_ids(&self) -> Vec<u32>;
+    /// is `id` a stop id? The loop asks this of every sampled id.
+    fn is_stop(&self, id: usize) -> bool {
+        self.stop_ids().iter().any(|&e| e as usize == id)
+    }
+    /// the request family: `Qwen` for Flash-Next and the 27B, `Glm` for GLM-5.3-Flash
+    fn markup(&self) -> Markup;
+}
+
+impl ServeEngine for Geo {
+    fn vocab(&self) -> usize {
+        self.vocab
+    }
+    fn stop_ids(&self) -> Vec<u32> {
+        self.eos_ids.iter().map(|&e| e as u32).collect()
+    }
+    fn is_stop(&self, id: usize) -> bool {
+        self.eos_ids.contains(&id)
+    }
+    fn markup(&self) -> Markup {
+        Markup::Qwen
+    }
+}
+
+impl ServeEngine for Engine {
+    fn vocab(&self) -> usize {
+        ServeEngine::vocab(&self.geo)
+    }
+    fn stop_ids(&self) -> Vec<u32> {
+        ServeEngine::stop_ids(&self.geo)
+    }
+    fn is_stop(&self, id: usize) -> bool {
+        ServeEngine::is_stop(&self.geo, id)
+    }
+    fn markup(&self) -> Markup {
+        ServeEngine::markup(&self.geo)
+    }
+}
+
+impl ServeEngine for Glm5Engine {
+    fn vocab(&self) -> usize {
+        Glm5Engine::vocab(self)
+    }
+    fn stop_ids(&self) -> Vec<u32> {
+        Glm5Engine::stop_ids(self).to_vec()
+    }
+    fn markup(&self) -> Markup {
+        Glm5Engine::markup(self)
+    }
+}
+
+/// #185: the engine a container boots
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineKind {
+    /// `gen::Engine`: Flash-Next, the 27B, and every container whose family is not read here
+    /// (`boot::open_model` then refuses or boots it exactly as before)
+    Engine,
+    /// `glm5_engine::Glm5Engine`: glm5_next
+    Glm5,
+}
+
+impl EngineKind {
+    /// the request family this engine serves; the tokenizer's (`glm5_template::markup_of`)
+    /// must be the same one
+    fn markup(self) -> Markup {
+        match self {
+            EngineKind::Engine => Markup::Qwen,
+            EngineKind::Glm5 => Markup::Glm,
+        }
+    }
+}
+
+/// - #185: the family decides the engine. Only `Glm5Next` leaves the path of record; a family
+///   this function was not told (`None`: an index v1 container, an unreadable one, a config
+///   the gate will refuse) boots `Engine`, whose front door says what it says today.
+fn engine_kind(family: Option<Family>) -> EngineKind {
+    match family {
+        Some(Family::Glm5Next) => EngineKind::Glm5,
+        Some(Family::FlashNext) | Some(Family::Qwen35Dense) | None => EngineKind::Engine,
+    }
+}
+
+/// - #185: the config an index v2 container carries, parsed without mapping the container and
+///   without the gate's checks (`meta::config_for_container`); its `family` feeds
+///   `engine_kind`.
+/// - `None` for the index v1 container of record (Flash-Next, no config inside) and for
+///   anything unreadable: those boot through `boot::open_model`, which reads and judges them.
+fn container_meta(cnq_path: &str) -> Option<crow_nest_engine::meta::ModelMeta> {
+    let peek = Cnq::peek_index(cnq_path).ok()?;
+    peek.model()?;
+    let model_dir = std::env::var("CROW_MODEL_DIR").ok();
+    crow_nest_engine::meta::config_for_container(cnq_path, &peek, model_dir.as_deref()).ok().flatten()
+}
+
 // --------------------------------------------- chat completions (#26 A4)
 
 /// the fields of a `POST /v1/chat/completions` body that A4 acts on
@@ -1232,6 +1350,13 @@ struct ChatReq {
     /// #74: the body named `chat_template_kwargs.enable_thinking`; read by the `[chat]` line
     /// only, so the `(request)` tag is true for the second door as well
     kwargs_thinking_sent: bool,
+    /// #185: the request family of the loaded engine (`Srv::markup`): which template
+    /// variables render the prompt, which reasoning words exist, which tool markup the parser
+    /// and the grammar read. `Qwen` for Flash-Next and the 27B, the path of record.
+    markup: Markup,
+    /// #185: GLM's `chat_template_kwargs.clear_thinking`, a template variable; `None` leaves
+    /// it undefined (the template's own false). Always `None` for the Qwen family.
+    clear_thinking: Option<bool>,
     /// #81: the thinking budget in TOKENS. `None` (absent, null or negative) is the
     /// behaviour of every release before #81: reasoning runs until the model closes the
     /// block itself or `max_tokens` is spent. `Some(0)` closes the block before the first
@@ -1502,7 +1627,11 @@ fn thinking_tag(req: &ChatReq) -> &'static str {
     match (req.enable_thinking, req.reasoning_effort) {
         (false, _) => "off",
         (true, Some(w)) => w,
-        (true, None) => "xhigh",
+        // #185: GLM-5.3-Flash's template defaults to max, never to off
+        (true, None) => match req.markup {
+            Markup::Qwen => "xhigh",
+            Markup::Glm => "max",
+        },
     }
 }
 
@@ -1516,6 +1645,19 @@ fn thinking_tag(req: &ChatReq) -> &'static str {
 /// - pure: the test drives it on parsed bodies, no engine and no socket.
 fn thinking_line(req: &ChatReq) -> String {
     let tag = SamplingSent::tag(req.reasoning_asked.is_some() || req.kwargs_thinking_sent);
+    // #185: a GLM request always thinks; the tag is the RENDERED level, never `off`
+    if req.markup == Markup::Glm {
+        let level = thinking_tag(req);
+        let asked = match req.reasoning_asked.as_deref() {
+            Some(w) if w != level => format!(", asked as \"{w}\""),
+            _ => String::new(),
+        };
+        return format!(
+            "[chat] thinking on ({tag}): reasoning_effort {level}{asked}; GLM-5.3-Flash's generation \
+             prompt always ends in <think> (off is not representable) and the reasoning filter \
+             starts Inside (#185)"
+        );
+    }
     let asked = match req.reasoning_asked.as_deref() {
         Some(w) if Some(w) != req.reasoning_effort => format!(", asked as \"{w}\""),
         _ => String::new(),
@@ -1546,9 +1688,51 @@ fn parse_chat(body: &[u8]) -> Result<ChatReq, String> {
     parse_chat_vocab(body, Geo::FLASH_NEXT.vocab)
 }
 
+/// the tests' two-argument form: the Qwen family, the request path of every release before #185
+#[cfg(test)]
+fn parse_chat_vocab(body: &[u8], vocab: usize) -> Result<ChatReq, String> {
+    parse_chat_as(body, vocab, Markup::Qwen)
+}
+
+/// - #185: the thinking fields of a GLM-5.3-Flash request: `(enable_thinking, the template's
+///   reasoning_effort, clear_thinking)`
+/// - thinking is always ON: the template's generation prompt always ends in `<think>` and no
+///   variable of it closes the block (`glm5_template`, #160), so `enable_thinking` is `true`
+///   and the reasoning filter starts `Inside`
+/// - `chat_template_kwargs.enable_thinking: false` asks for the one thing the template cannot
+///   render, so it is a 400 by name, never a silent "on"; `true` is what renders anyway
+/// - `reasoning_effort` (either door) goes through `glm5_template::reasoning_level`: `low`,
+///   `high` / `xhigh`, absent / `max`; `none`, `medium` and every other word are 400s by name
+/// - `chat_template_kwargs.clear_thinking`: a boolean template variable; another type is a 400
+fn glm_thinking(
+    kwargs: Option<&serde_json::Value>,
+    kw_thinking: Option<bool>,
+    asked: Option<&str>,
+) -> Result<(bool, Option<&'static str>, Option<bool>), String> {
+    if kw_thinking == Some(false) {
+        return Err(format!(
+            "chat_template_kwargs.enable_thinking false cannot be rendered by GLM-5.3-Flash's \
+             template: its generation prompt always ends in <think> and no template variable \
+             closes it (thinking is always on; reasoning_effort {})",
+            glm5_template::REASONING_WORDS
+        ));
+    }
+    let level = glm5_template::reasoning_level(asked)?;
+    let clear_thinking = match kwargs.and_then(|k| k.get("clear_thinking")) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(
+            v.as_bool()
+                .ok_or_else(|| "chat_template_kwargs.clear_thinking is not a boolean".to_string())?,
+        ),
+    };
+    Ok((true, level, clear_thinking))
+}
+
 /// - C3: `vocab` is the loaded model's vocabulary size (`Engine::geo.vocab`), the bound
 ///   `logit_bias` keys and `crow_force_ids` entries are checked against
-fn parse_chat_vocab(body: &[u8], vocab: usize) -> Result<ChatReq, String> {
+/// - #185: `markup` is the request family of the loaded engine (`Srv::markup`); `Qwen` is the
+///   parse of every release before it, field for field
+fn parse_chat_as(body: &[u8], vocab: usize, markup: Markup) -> Result<ChatReq, String> {
     let doc: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| format!("body is not JSON: {e}"))?;
     let obj = doc
@@ -1649,30 +1833,42 @@ fn parse_chat_vocab(body: &[u8], vocab: usize) -> Result<ChatReq, String> {
             .filter(|v| !v.is_null()),
         Some(v) => Some(v),
     };
+    // #185: the words of THIS family's template, for the type refusal
+    let words = match markup {
+        Markup::Qwen => REASONING_WORDS,
+        Markup::Glm => glm5_template::REASONING_WORDS,
+    };
     let reasoning_asked = match asked {
         None => None,
         Some(v) => Some(
             v.as_str()
-                .ok_or_else(|| format!("reasoning_effort is not a string (one of {REASONING_WORDS})"))?
+                .ok_or_else(|| format!("reasoning_effort is not a string (one of {words})"))?
                 .to_string(),
         ),
     };
-    // a word the engine does not have is a 400 BEFORE any GPU work, never a silent downgrade
-    let mapped = match reasoning_asked.as_deref() {
-        Some(w) => Some(map_reasoning_effort(w)?),
-        None => None,
+    let (enable_thinking, reasoning_effort, clear_thinking) = match markup {
+        Markup::Qwen => {
+            // a word the engine does not have is a 400 BEFORE any GPU work, never a silent downgrade
+            let mapped = match reasoning_asked.as_deref() {
+                Some(w) => Some(map_reasoning_effort(w)?),
+                None => None,
+            };
+            // `enable_thinking` stays the last word when the body spells it out: that is what
+            // llama-server does with the pair (it sets the kwarg and never overwrites an explicit
+            // false), and it keeps the digest path of `crow_core.py:2970` exactly as it was.
+            let (enable_thinking, reasoning_effort) = match mapped {
+                None => (kw_thinking.unwrap_or(false), None),
+                Some(None) => (false, None),
+                Some(word) => (kw_thinking.unwrap_or(true), word),
+            };
+            // a request that does not think never carries the variable, so its prompt is the prompt
+            // of record whatever word the body named
+            let reasoning_effort = if enable_thinking { reasoning_effort } else { None };
+            (enable_thinking, reasoning_effort, None)
+        }
+        // #185: GLM-5.3-Flash always thinks; `false` and the refused words are 400s by name
+        Markup::Glm => glm_thinking(kwargs, kw_thinking, reasoning_asked.as_deref())?,
     };
-    // `enable_thinking` stays the last word when the body spells it out: that is what
-    // llama-server does with the pair (it sets the kwarg and never overwrites an explicit
-    // false), and it keeps the digest path of `crow_core.py:2970` exactly as it was.
-    let (enable_thinking, reasoning_effort) = match mapped {
-        None => (kw_thinking.unwrap_or(false), None),
-        Some(None) => (false, None),
-        Some(word) => (kw_thinking.unwrap_or(true), word),
-    };
-    // a request that does not think never carries the variable, so its prompt is the prompt
-    // of record whatever word the body named
-    let reasoning_effort = if enable_thinking { reasoning_effort } else { None };
     let model = obj
         .get("model")
         .and_then(|v| v.as_str())
@@ -1982,6 +2178,8 @@ fn parse_chat_vocab(body: &[u8], vocab: usize) -> Result<ChatReq, String> {
         reasoning_effort,
         reasoning_asked,
         kwargs_thinking_sent: kw_thinking.is_some(),
+        markup,
+        clear_thinking,
         reasoning_budget,
         reasoning_budget_message,
         include_usage,
@@ -2201,14 +2399,15 @@ fn tool_grammar_on() -> bool {
 /// first request that has a grammar; `.1` is its build wall in ms
 static TOOL_VOCAB: std::sync::OnceLock<(Vocab, f64)> = std::sync::OnceLock::new();
 
-/// C3: `geo` is the loaded model's (vocabulary size and stop ids); one model per process,
-/// so the trie built for the first request is the trie of every later one
-fn tool_vocab(tk: &crow_nest_engine::tokenizer::ChatTokenizer, geo: &Geo) -> &'static (Vocab, f64) {
+/// C3: `eng` is the loaded model's (vocabulary size and stop ids; #185: through
+/// `ServeEngine`, whose `Geo` answers for Flash-Next and the 27B); one model per process, so
+/// the trie built for the first request is the trie of every later one
+fn tool_vocab(tk: &crow_nest_engine::tokenizer::ChatTokenizer, eng: &dyn ServeEngine) -> &'static (Vocab, f64) {
     TOOL_VOCAB.get_or_init(|| {
         let t = Instant::now();
-        let eos: Vec<u32> = geo.eos_ids.iter().map(|&e| e as u32).collect();
+        let eos: Vec<u32> = eng.stop_ids();
         let open = tk.token_id(TOOL_OPEN).unwrap_or(u32::MAX);
-        let v = Vocab::build(geo.vocab, |id| tk.token_bytes(id), |id| tk.is_special(id), &eos, open);
+        let v = Vocab::build(eng.vocab(), |id| tk.token_bytes(id), |id| tk.is_special(id), &eos, open);
         (v, t.elapsed().as_secs_f64() * 1e3)
     })
 }
@@ -2218,10 +2417,11 @@ fn tool_vocab(tk: &crow_nest_engine::tokenizer::ChatTokenizer, geo: &Geo) -> &'s
 /// - off: `CROW_TOOL_GRAMMAR=0`, `tool_choice: "none"`, or a tools array the grammar
 ///   cannot express (named in the line); the request then runs unconstrained
 /// - `on` is `tool_grammar_on()` in serve, a parameter so the test drives both sides
+/// - #185: the grammar frames the request family's markup (`req.markup`); `Qwen` is `build`
 fn tool_gate(
     req: &ChatReq,
     tk: &crow_nest_engine::tokenizer::ChatTokenizer,
-    geo: &Geo,
+    eng: &dyn ServeEngine,
     on: bool,
 ) -> (Option<Gate<'static>>, Option<String>) {
     let Some(tools) = req.tools.as_ref().filter(|t| t.as_array().is_some_and(|a| !a.is_empty())) else {
@@ -2239,11 +2439,11 @@ fn tool_gate(
         ToolChoice::Named(n) => (toolgrammar::Mode::Required, Some(n.as_str())),
     };
     let t = Instant::now();
-    match ToolGrammar::build(tools, mode, req.parallel_tool_calls, only) {
+    match ToolGrammar::build_markup(tools, mode, req.parallel_tool_calls, only, req.markup) {
         Ok(g) => {
             let build_ms = t.elapsed().as_secs_f64() * 1e3;
             let fresh = TOOL_VOCAB.get().is_none();
-            let (v, vocab_ms) = tool_vocab(tk, geo);
+            let (v, vocab_ms) = tool_vocab(tk, eng);
             let line = format!(
                 "[chat] tool grammar ON (CROW_TOOL_GRAMMAR): lazy at the <tool_call> id, tool_choice {}, \
                  parallel_tool_calls {}; {} tools / {} parameters compiled in {build_ms:.2} ms{}",
@@ -3023,7 +3223,20 @@ fn head200(v: &serde_json::Value) -> String {
 /// | starts with `<think>...</think>` | the whole block goes, the answer after it stays | the template puts its own think block around this; a nested pair is what the model imitates |
 /// | a `</think>` in the MIDDLE, or a `<think>` that never closes | unchanged | it can be quoted text, and neither shape nests |
 /// | `reasoning_content` | never touched | it is the template's own field for prior reasoning, and this is where the stream now puts it |
+///
+/// - #185: the #67 strip is a repair for the QWEN template only. GLM-5.3-Flash's template
+///   reads a stored `<think>X</think>` itself (`content.split('</think>')`, line 146 of its
+///   `chat_template.jinja`) and renders X as that turn's reasoning; stripping it would drop X
+///   and move the render off transformers' bytes (golden `inline_think_then_turn_without_reasoning`).
+///   For `Markup::Glm` the `arguments` rows above apply (its template iterates `_args.items()`
+///   too) and the content is left as sent.
+#[cfg(test)]
 fn normalize_messages(messages: &serde_json::Value) -> (serde_json::Value, Vec<String>) {
+    normalize_messages_as(messages, Markup::Qwen)
+}
+
+/// `normalize_messages` for the request family `markup` (#185)
+fn normalize_messages_as(messages: &serde_json::Value, markup: Markup) -> (serde_json::Value, Vec<String>) {
     let mut doc = messages.clone();
     let mut notes = Vec::new();
     let arr = match doc.as_array_mut() {
@@ -3031,8 +3244,8 @@ fn normalize_messages(messages: &serde_json::Value) -> (serde_json::Value, Vec<S
         None => return (doc, notes),
     };
     for (mi, m) in arr.iter_mut().enumerate() {
-        // #67: the stored assistant turn, before anything else looks at it
-        if m.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+        // #67: the stored assistant turn, before anything else looks at it (Qwen only, #185)
+        if markup == Markup::Qwen && m.get("role").and_then(|r| r.as_str()) == Some("assistant") {
             if let Some(c) = m.get_mut("content") {
                 let stripped = c.as_str().and_then(strip_stored_think);
                 if let Some(clean) = stripped {
@@ -3597,6 +3810,13 @@ fn accumulate_args(pieces: &[Emit], acc: &mut Vec<String>) {
     }
 }
 
+/// - #29 A7: the tool-call parser of ONE request, declared types from its `tools`
+/// - #185: it reads the request family's markup; `Qwen` is `ToolStream::new`, the parser of
+///   every release before it
+fn tool_stream(req: &ChatReq) -> ToolStream {
+    ToolStream::with_markup(req.tools.as_ref(), req.markup)
+}
+
 /// - #29 A7 / #93: the ONE place a KEPT id reaches the tool-call parser and the lazy
 ///   grammar: the `<tool_call>` id arms `ts` and opens the grammar, every id advances it.
 /// - A `<tool_call>` id written while the think filter is `Inside` a block is REASONING
@@ -3818,8 +4038,30 @@ fn respond_json(
 /// - `POST /v1/chat/completions`
 /// - every rejection happens BEFORE the first stream byte, as a JSON response
 /// - the return value is the status for the access log line
+/// - #185: the prompt ids of one request, rendered with ITS family's template variables
+/// - `Qwen` (Flash-Next, the 27B): `encode_chat_effort` with `enable_thinking` and
+///   `reasoning_effort`, the call of every release before #185
+/// - `Glm` (GLM-5.3-Flash): `encode_chat_with` + `glm5_template::template_vars(level,
+///   clear_thinking)`; `enable_thinking` is not a variable of that template, and a level of
+///   `None` leaves `reasoning_effort` undefined (the template's max)
+fn render_ids(
+    tk: &crow_nest_engine::tokenizer::ChatTokenizer,
+    msgs: &serde_json::Value,
+    req: &ChatReq,
+) -> Result<Vec<u32>, String> {
+    match req.markup {
+        Markup::Qwen => tk.encode_chat_effort(msgs, req.tools.as_ref(), true, req.enable_thinking, req.reasoning_effort),
+        Markup::Glm => tk.encode_chat_with(
+            msgs,
+            req.tools.as_ref(),
+            true,
+            &glm5_template::template_vars(req.reasoning_effort, req.clear_thinking),
+        ),
+    }
+}
+
 fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static str {
-    let mut req = match parse_chat_vocab(body, srv.eng.geo.vocab) {
+    let mut req = match parse_chat_as(body, ServeEngine::vocab(&*srv.eng), srv.markup) {
         Ok(r) => r,
         Err(e) => return respond_json(stream, "400 Bad Request", &error_json(&e)),
     };
@@ -3832,7 +4074,7 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
     // TASK J: `normalize_messages` now leaves NO non-mapping for that `|items`, and every
     // rewrite it made goes to stderr; `check_messages` refuses what the template cannot
     // render with a message that names the index and the field, before any render.
-    let (msgs, notes) = normalize_messages(&req.messages);
+    let (msgs, notes) = normalize_messages_as(&req.messages, req.markup);
     for n in &notes {
         tracing::info!(target: "chat", "[chat] normalised: {n}");
     }
@@ -3842,14 +4084,8 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
     }
     // #74: `reasoning_effort` rides as the fourth template variable. It is `None` for every
     // request that does not think, so the ids of a request that names neither door are the
-    // ids of record.
-    let ids = match tk.encode_chat_effort(
-        &msgs,
-        req.tools.as_ref(),
-        true,
-        req.enable_thinking,
-        req.reasoning_effort,
-    ) {
+    // ids of record. #185: the family picks the variables (`render_ids`).
+    let ids = match render_ids(tk, &msgs, &req) {
         Ok(v) => v,
         Err(e) => {
             // a render that still fails is a shape `check_messages` does not know: the dump
@@ -4244,7 +4480,7 @@ fn chat_generate(
     // #93: the tool grammar of THIS request (`None` without tools, with
     // `CROW_TOOL_GRAMMAR=0` or `tool_choice: "none"`), and its one request line. Built
     // before the first draw: the biased route checks inside `draw_biased`.
-    let (mut gate, gate_line) = tool_gate(req, tk, &srv.eng.geo, tool_grammar_on());
+    let (mut gate, gate_line) = tool_gate(req, tk, &*srv.eng, tool_grammar_on());
     if let Some(l) = gate_line {
         tracing::info!(target: "chat", "{l}");
     }
@@ -4345,7 +4581,8 @@ fn chat_generate(
 
     // #29 A7: the tool-call parser of THIS request. `tool_open` is the id the decode loop
     // arms it with; without that id the literal text `<tool_call>` stays content.
-    let mut ts = ToolStream::new(req.tools.as_ref());
+    // #185: the parser reads the request family's markup (`tool_stream`)
+    let mut ts = tool_stream(req);
     let tool_open = tk.token_id(TOOL_OPEN);
     // #67: the reasoning filter of THIS request. It sees `Emit::Content` only, it holds a
     // partial `</think` back across deltas, and it never touches an id: the loop below
@@ -4497,7 +4734,7 @@ fn chat_generate(
                         String::from_utf8_lossy(&tk.token_bytes(next as u32)));
                 }
             }
-            if srv.eng.geo.eos_ids.contains(&next) {
+            if ServeEngine::is_stop(&*srv.eng, next) {
                 finish = "stop";
                 break;
             }
@@ -5239,6 +5476,9 @@ fn loop_warning(rep: &RepeatStats) -> Option<String> {
 struct Srv<'a> {
     /// the one loaded engine of this process; every chat request resets it first
     eng: &'a mut Engine,
+    /// #185: the request family, chosen once at boot (`glm5_template::markup_of` on the
+    /// loaded tokenizer, checked against the engine's); `Qwen` for Flash-Next and the 27B
+    markup: Markup,
     /// the container handle `prefill` fills PLE rows from
     cnq: &'a mut Cnq,
     /// `/props` `model_path`
@@ -5764,11 +6004,12 @@ fn main() {
     // source named in the log, so a fallback to Flash-Next's files is never silent
     let (tok_path, tok_cfg, tok_why) = crow_nest_engine::tokenizer::default_source();
     tracing::info!(target: "serve", "[serve] tokenizer source: {tok_why}");
-    match crow_nest_engine::tokenizer::global() {
+    let tk = match crow_nest_engine::tokenizer::global() {
         Ok(tk) => {
             let (tp, cp) = tk.paths();
             tracing::info!(target: "serve", "[serve] tokenizer {tp}");
             tracing::info!(target: "serve", "[serve] chat template {cp}");
+            tk
         }
         Err(e) => {
             tracing::error!(target: "serve", "[serve] {e}");
@@ -5776,6 +6017,37 @@ fn main() {
             tracing::info!(target: "serve", "[serve] chat template {tok_cfg}");
             crow_nest_engine::log::shutdown();
             std::process::exit(3);
+        }
+    };
+
+    // #185: the family decides the engine, read from the container's own config before the
+    // CUDA context and before the container is mapped (`boot::open_model` reads the same
+    // `CROW_CNQ` the same way). Flash-Next and the 27B take the path below unchanged.
+    let cnq_for_family = std::env::var("CROW_CNQ").unwrap_or_else(|_| resolve_default(DEFAULT_CNQ));
+    let family_meta = container_meta(&cnq_for_family);
+    let kind = engine_kind(family_meta.as_ref().map(|m| m.family));
+    // the request family is the tokenizer's (#160 `markup_of`); it must be the engine's, or a
+    // prompt would be rendered and parsed in the other family's markup
+    let tk_markup = glm5_template::markup_of(tk);
+    if tk_markup != kind.markup() {
+        tracing::error!(target: "serve",
+            "[serve] the tokenizer's request family {tk_markup:?} is not the engine's {:?} ({cnq_for_family}) - \
+             refusing to boot (#185)", kind.markup());
+        crow_nest_engine::log::shutdown();
+        std::process::exit(3);
+    }
+    if kind == EngineKind::Glm5 {
+        let meta = family_meta.expect("engine_kind is Glm5 only for a parsed config");
+        match Glm5Engine::boot(&cnq_for_family, &meta) {
+            // part 2 of #185 serves on it; in part 1 no `Glm5Engine` value exists (its field is
+            // `Infallible`), so this arm is statically dead and the compiler knows it
+            #[allow(unreachable_code)]
+            Ok(g) => match g.placeholder() {},
+            Err(why) => {
+                tracing::error!(target: "serve", "[serve] {why}");
+                crow_nest_engine::log::shutdown();
+                std::process::exit(3);
+            }
         }
     }
 
@@ -5909,8 +6181,11 @@ fn main() {
         &cold_policy,
         cache.enabled(),
     ));
+    // #185: the engine's request family; the boot check above made the tokenizer's the same
+    let markup = ServeEngine::markup(&eng);
     let mut srv = Srv {
         eng: &mut eng,
+        markup,
         cnq: &mut cnq,
         model_path: &cnq_path,
         n_ctx,
@@ -9626,6 +9901,341 @@ Red is #FF0000."), "{off}");
             assert_eq!(gate.phase(), "markup", "{mode:?}");
             assert!(gate.armed());
             assert!(ts.feed(TOOL_OPEN).is_empty(), "the parser is armed: the opener is consumed");
+        }
+    }
+
+    // ------------------------------------------- #185: the glm5_next request layer
+
+    /// #160's goldens: transformers' renders of GLM-5.3-Flash's own template, with their ids
+    const GLM_GOLDENS: &str = include_str!("../../tests/fixtures/GLM-5.3-Flash/tokenizer-goldens.json");
+
+    /// GLM-5.3-Flash's tokenizer beside the repository root, or `None` when this machine has
+    /// not downloaded it (`models/` is not in git); the parse tests below do not need it
+    fn glm_tk() -> Option<crow_nest_engine::tokenizer::ChatTokenizer> {
+        let t = "../models/GLM-5.3-Flash-original/tokenizer.json";
+        if !std::path::Path::new(t).is_file() {
+            eprintln!("no {t} on this machine - skipped");
+            return None;
+        }
+        Some(
+            crow_nest_engine::tokenizer::ChatTokenizer::load(t, &crow_nest_engine::tokenizer::sibling_config(t))
+                .expect("GLM tokenizer loads"),
+        )
+    }
+
+    /// the GLM vocabulary bound of the parse (the head's rows, `Glm5Geo`)
+    const GLM_VOCAB: usize = crow_nest_engine::geo::Glm5Geo::GLM_5_3_FLASH.vocab;
+
+    fn glm_parse(body: &serde_json::Value) -> Result<ChatReq, String> {
+        parse_chat_as(body.to_string().as_bytes(), GLM_VOCAB, Markup::Glm)
+    }
+
+    /// one golden render case as the OpenAI body a client sends: the template variables of
+    /// the case go where a client puts them (`reasoning_effort` top level, the rest in
+    /// `chat_template_kwargs`)
+    fn glm_body(c: &serde_json::Value) -> serde_json::Value {
+        let mut body = serde_json::json!({ "messages": c["messages"], "stream": true });
+        if let Some(t) = c.get("tools").filter(|v| !v.is_null()) {
+            body["tools"] = t.clone();
+        }
+        for (k, v) in c["template_vars"].as_object().unwrap() {
+            if k == "reasoning_effort" {
+                body["reasoning_effort"] = v.clone();
+            } else {
+                if body.get("chat_template_kwargs").is_none() {
+                    body["chat_template_kwargs"] = serde_json::json!({});
+                }
+                body["chat_template_kwargs"][k] = v.clone();
+            }
+        }
+        body
+    }
+
+    /// - #185 item 2: a GLM chat request, tools included, renders through serve's own path
+    ///   (`parse_chat_as`, `normalize_messages_as`, `check_messages`, `render_ids`) to the ids
+    ///   of #160's golden renders, which are transformers' `apply_chat_template` ids
+    /// - the three goldens whose variables the template cannot honour (`medium`, `none`,
+    ///   `enable_thinking: false`; all three render max) are the request's 400s instead
+    #[test]
+    fn a_glm_request_renders_the_golden_ids_of_160() {
+        let g: serde_json::Value = serde_json::from_str(GLM_GOLDENS).unwrap();
+        let tk = glm_tk();
+        let (mut served, mut with_tools, mut refused) = (0, 0, Vec::new());
+        for c in g["render"].as_array().unwrap() {
+            let name = c["name"].as_str().unwrap();
+            if !c["add_generation_prompt"].as_bool().unwrap() {
+                continue; // serve always renders the generation prompt
+            }
+            let req = match glm_parse(&glm_body(c)) {
+                Ok(r) => r,
+                Err(e) => {
+                    refused.push(name);
+                    assert!(e.contains("GLM-5.3-Flash"), "{name}: {e}");
+                    continue;
+                }
+            };
+            assert_eq!(req.markup, Markup::Glm);
+            assert!(req.enable_thinking, "{name}: a GLM request always thinks");
+            let Some(tk) = tk.as_ref() else { continue };
+            let (msgs, _) = normalize_messages_as(&req.messages, req.markup);
+            check_messages(&msgs).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let ids = render_ids(tk, &msgs, &req).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let want: Vec<u32> = c["ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+            assert_eq!(ids, want, "{name}: serve's ids are transformers' ids");
+            assert_eq!(&ids[ids.len() - 2..], &[154828, 154841], "{name}: ends in <|assistant|><think>");
+            served += 1;
+            if req.tools.is_some() {
+                with_tools += 1;
+            }
+        }
+        refused.sort_unstable();
+        assert_eq!(refused, ["sys_user_enable_thinking_false", "sys_user_medium", "sys_user_none"]);
+        if tk.is_some() {
+            assert_eq!((served, with_tools), (12, 5));
+        }
+    }
+
+    /// - #185 item 2: the GLM 400s, by name, before any render or GPU work: `enable_thinking`
+    ///   false (off is not representable), `none`, `medium` and every unknown level, a
+    ///   non-boolean `clear_thinking`; the accepted words map to the rendered level
+    /// - the SAME bodies on the Qwen family keep their meaning of record (a dispatch that sent
+    ///   Flash-Next or the 27B through the GLM rules would refuse `none` and `false`)
+    #[test]
+    fn glm_thinking_off_and_unknown_levels_are_400s_by_name() {
+        let msg = serde_json::json!([{ "role": "user", "content": "hi" }]);
+        let body = |extra: serde_json::Value| {
+            let mut b = serde_json::json!({ "messages": msg });
+            for (k, v) in extra.as_object().unwrap() {
+                b[k] = v.clone();
+            }
+            b
+        };
+        for w in ["none", "medium", "minimal", "High", "off", ""] {
+            let e = glm_parse(&body(serde_json::json!({ "reasoning_effort": w }))).expect_err(w);
+            assert!(e.contains(&format!("\"{w}\"")), "{w}: {e}");
+            let e = glm_parse(&body(serde_json::json!({ "chat_template_kwargs": { "reasoning_effort": w } }))).expect_err(w);
+            assert!(e.contains(&format!("\"{w}\"")), "kwargs {w}: {e}");
+        }
+        let e = glm_parse(&body(serde_json::json!({ "chat_template_kwargs": { "enable_thinking": false } }))).unwrap_err();
+        assert!(e.contains("enable_thinking false cannot be rendered by GLM-5.3-Flash's template"), "{e}");
+        let e = glm_parse(&body(serde_json::json!({ "reasoning_effort": "low", "chat_template_kwargs": { "enable_thinking": false } }))).unwrap_err();
+        assert!(e.contains("enable_thinking false"), "{e}");
+        let e = glm_parse(&body(serde_json::json!({ "reasoning_effort": 3 }))).unwrap_err();
+        assert!(e.contains("low, high, xhigh, max"), "{e}");
+        let e = glm_parse(&body(serde_json::json!({ "chat_template_kwargs": { "clear_thinking": "yes" } }))).unwrap_err();
+        assert!(e.contains("clear_thinking is not a boolean"), "{e}");
+
+        // the accepted words, the rendered level and the one `[chat]` line
+        for (extra, level, tag) in [
+            (serde_json::json!({}), None, "max"),
+            (serde_json::json!({ "reasoning_effort": "max" }), None, "max"),
+            (serde_json::json!({ "reasoning_effort": "low" }), Some("low"), "low"),
+            (serde_json::json!({ "reasoning_effort": "high" }), Some("high"), "high"),
+            (serde_json::json!({ "reasoning_effort": "xhigh" }), Some("high"), "high"),
+            (serde_json::json!({ "chat_template_kwargs": { "enable_thinking": true } }), None, "max"),
+        ] {
+            let r = glm_parse(&body(extra.clone())).unwrap_or_else(|e| panic!("{extra}: {e}"));
+            assert_eq!((r.enable_thinking, r.reasoning_effort, r.clear_thinking), (true, level, None), "{extra}");
+            assert_eq!(thinking_tag(&r), tag, "{extra}");
+            let l = thinking_line(&r);
+            assert!(l.starts_with(&format!("[chat] thinking on (")), "{l}");
+            assert!(l.contains(&format!("reasoning_effort {tag}")) && l.contains("starts Inside (#185)"), "{l}");
+            assert!(!l.contains("thinking off"), "{l}");
+            // the reasoning filter of this request starts where the prompt left it
+            assert!(ThinkFilter::for_request(r.enable_thinking).is_inside(), "{extra}");
+        }
+        let r = glm_parse(&body(serde_json::json!({ "reasoning_effort": "xhigh" }))).unwrap();
+        assert!(thinking_line(&r).contains("reasoning_effort high, asked as \"xhigh\""), "{}", thinking_line(&r));
+        let r = glm_parse(&body(serde_json::json!({ "chat_template_kwargs": { "clear_thinking": true } }))).unwrap();
+        assert_eq!(r.clear_thinking, Some(true));
+
+        // the Qwen family, same bodies: the meanings of record (#74)
+        let q = |extra: serde_json::Value| parse_chat(body(extra).to_string().as_bytes());
+        let r = q(serde_json::json!({ "reasoning_effort": "none" })).unwrap();
+        assert_eq!((r.markup, r.enable_thinking, r.reasoning_effort), (Markup::Qwen, false, None));
+        let r = q(serde_json::json!({ "reasoning_effort": "medium" })).unwrap();
+        assert_eq!((r.enable_thinking, r.reasoning_effort), (true, Some("medium")));
+        let r = q(serde_json::json!({ "chat_template_kwargs": { "enable_thinking": false, "clear_thinking": "yes" } })).unwrap();
+        assert_eq!((r.enable_thinking, r.clear_thinking), (false, None));
+        assert_eq!(thinking_tag(&q(serde_json::json!({ "chat_template_kwargs": { "enable_thinking": true } })).unwrap()), "xhigh");
+        assert!(q(serde_json::json!({ "reasoning_effort": "max" })).unwrap_err().contains("none, low, medium, high, xhigh"));
+    }
+
+    /// - #185 item 3: GLM markup the model writes after its reasoning streams through serve's
+    ///   own stream code (`tool_stream`, `admit_id`, the think filter, `send_emits`, the SSE
+    ///   sink) as OpenAI `tool_calls` deltas, the reasoning as `reasoning_content`, and the
+    ///   lazy GLM grammar (`ToolGrammar::build_markup(.., req.markup)`, as `tool_gate`
+    ///   builds it) refuses none of the ids; `<|observation|>` stops the loop
+    /// - the real tokenizer gives the ids; the loop is `chat_generate`'s: decode the ids so
+    ///   far, feed the new text, filter, send
+    #[test]
+    fn glm_tool_markup_streams_as_openai_tool_calls_deltas() {
+        let Some(tk) = glm_tk() else { return };
+        let tools = serde_json::json!([{ "type": "function", "function": {
+            "name": "read_file",
+            "parameters": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }
+        } }]);
+        let req = glm_parse(&serde_json::json!({
+            "messages": [{ "role": "user", "content": "read README.md and tell me its first heading" }],
+            "tools": tools,
+            "stream": true
+        }))
+        .unwrap();
+        let text = "Ich lese die Datei zuerst.</think><tool_call>read_file<arg_key>path</arg_key>\
+                    <arg_value>README.md</arg_value></tool_call>";
+        let mut gen = tk.encode_raw(text).unwrap();
+        gen.push(glm5_template::EOS_IDS[2]); // <|observation|>, the end of a tool turn
+        assert!(gen.contains(&154843) && gen.contains(&154847) && gen.contains(&154850), "the markers are single ids: {gen:?}");
+
+        let tool_open = tk.token_id(TOOL_OPEN);
+        assert_eq!(tool_open, Some(154843));
+        let open = tool_open.unwrap();
+        let v = Vocab::build(GLM_VOCAB, |id| tk.token_bytes(id), |id| tk.is_special(id), &glm5_template::EOS_IDS, open);
+        let g = ToolGrammar::build_markup(req.tools.as_ref().unwrap(), toolgrammar::Mode::Auto, req.parallel_tool_calls, None, req.markup)
+            .expect("the GLM grammar of the request");
+        let mut gate = Gate::new(g, &v);
+        let mut ts = tool_stream(&req);
+        let mut think = ThinkFilter::for_request(req.enable_thinking);
+        let mut stops = StopStrings::new(&req.stop);
+        let mut counts = Chunks::default();
+        let mut buf: Vec<u8> = Vec::new();
+        let cx = ChunkCtx::new("id1", 5, "glm");
+        let (mut out, mut emitted, mut refused, mut stopped) = (Vec::new(), 0usize, 0, false);
+        {
+            let mut sse = SseSink::new(&mut buf);
+            for &id in &gen {
+                if glm5_template::EOS_IDS.contains(&id) {
+                    stopped = true;
+                    break;
+                }
+                out.push(id);
+                if !admit_id(id, tool_open, &think, &mut ts, Some(&mut gate)) {
+                    refused += 1;
+                }
+                let full = tk.decode(&out).unwrap();
+                if let Some(delta) = next_delta(&full, emitted) {
+                    emitted = full.len();
+                    let pieces = ts.feed(delta);
+                    assert!(send_emits(&mut sse, &cx, &pieces, &mut think, &mut stops, &mut counts));
+                }
+            }
+            let mut tail = Vec::new();
+            assert!(!ts.finish(&mut tail), "no malformed call");
+            assert!(send_emits(&mut sse, &cx, &tail, &mut think, &mut stops, &mut counts));
+            let rest = think.flush();
+            assert!(send_split(&mut sse, &cx, &rest, &mut stops, &mut counts));
+        }
+        assert!(stopped, "<|observation|> is a stop id");
+        assert_eq!(refused, 0, "the GLM grammar keeps every id of a valid call");
+        assert_eq!(gate.stats.calls_closed, 1);
+        assert_eq!(ts.closed(), 1);
+
+        let text = String::from_utf8(buf).unwrap();
+        let (mut content, mut reasoning, mut calls) = (String::new(), String::new(), Vec::<CallBuf>::new());
+        for frame in text.split("\n\n").filter(|f| !f.is_empty()) {
+            let d: serde_json::Value = serde_json::from_str(frame.trim_start_matches("data: ")).unwrap();
+            let delta = &d["choices"][0]["delta"];
+            if let Some(s) = delta.get("content").and_then(|v| v.as_str()) {
+                content.push_str(s);
+            }
+            if let Some(s) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                reasoning.push_str(s);
+            }
+            if let Some(tc) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                let i = tc[0]["index"].as_u64().unwrap() as usize;
+                if i == calls.len() {
+                    calls.push(CallBuf::default());
+                }
+                if let Some(v) = tc[0].get("id").and_then(|v| v.as_str()) {
+                    calls[i].id = v.to_string();
+                }
+                let f = &tc[0]["function"];
+                if let Some(v) = f.get("name").and_then(|v| v.as_str()) {
+                    calls[i].name = v.to_string();
+                }
+                if let Some(v) = f.get("arguments").and_then(|v| v.as_str()) {
+                    calls[i].arguments.push_str(v);
+                }
+            }
+        }
+        assert_eq!(reasoning, "Ich lese die Datei zuerst.");
+        assert_eq!(content, "", "no markup leaves as content");
+        assert_eq!(calls.len(), 1, "{text}");
+        assert_eq!((calls[0].id.as_str(), calls[0].name.as_str()), ("call_0", "read_file"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&calls[0].arguments).unwrap(), serde_json::json!({ "path": "README.md" }));
+        assert_eq!(counts.content, 0);
+        assert!(counts.reasoning >= 1 && counts.tool >= 2, "{counts:?}");
+    }
+
+    /// - #185: the dispatch keeps Flash-Next and the 27B on `Engine` with the request family,
+    ///   vocabulary and stop ids of record; only glm5_next leaves the path
+    /// - a request of the Qwen family renders through `render_ids` to the ids of the call of
+    ///   record (`encode_chat_effort`), tools and every thinking door included, and its parser
+    ///   is the Qwen parser
+    #[test]
+    fn the_dispatch_keeps_flash_next_and_the_27b_on_their_path() {
+        assert_eq!(engine_kind(Some(Family::FlashNext)), EngineKind::Engine);
+        assert_eq!(engine_kind(Some(Family::Qwen35Dense)), EngineKind::Engine);
+        assert_eq!(engine_kind(None), EngineKind::Engine);
+        assert_eq!(engine_kind(Some(Family::Glm5Next)), EngineKind::Glm5);
+        assert_eq!((EngineKind::Engine.markup(), EngineKind::Glm5.markup()), (Markup::Qwen, Markup::Glm));
+
+        // what the request layer reads of the engine: `Engine` delegates to its `Geo`
+        let fnx: &dyn ServeEngine = &Geo::FLASH_NEXT;
+        assert_eq!(fnx.vocab(), Geo::FLASH_NEXT.vocab);
+        assert_eq!(fnx.stop_ids(), EOS_IDS.iter().map(|&e| e as u32).collect::<Vec<_>>());
+        assert!(EOS_IDS.iter().all(|&e| fnx.is_stop(e)));
+        assert!(!fnx.is_stop(glm5_template::EOS_IDS[0] as usize));
+        assert_eq!(fnx.markup(), Markup::Qwen);
+        let dense = "../models/Qwen3.8-27B/config.json";
+        if std::path::Path::new(dense).is_file() {
+            let m = crow_nest_engine::meta::ModelMeta::from_config_files(dense, Some("../models/Qwen3.8-27B/generation_config.json")).unwrap();
+            let geo = m.geo().unwrap();
+            let d: &dyn ServeEngine = &geo;
+            assert_eq!((d.vocab(), d.markup()), (geo.vocab, Markup::Qwen));
+            assert_eq!(d.stop_ids(), geo.eos_ids.iter().map(|&e| e as u32).collect::<Vec<_>>());
+            assert_eq!(engine_kind(Some(m.family)), EngineKind::Engine);
+            assert!(crow_nest_engine::glm5_engine::Glm5Engine::boot("x.cnq", &m).is_err());
+        }
+
+        let tk = tk();
+        assert_eq!(glm5_template::markup_of(&tk), Markup::Qwen, "Flash-Next's tokenizer is the Qwen family");
+        if let Some(g) = glm_tk() {
+            assert_eq!(glm5_template::markup_of(&g), Markup::Glm);
+        }
+        let tools: serde_json::Value = serde_json::from_str(TOOLS_3DBC015).unwrap();
+        let msgs = serde_json::json!([
+            { "role": "system", "content": "sys" },
+            { "role": "user", "content": "read a.md" },
+            { "role": "assistant", "content": "ok</think>", "tool_calls": [{ "id": "call_0", "type": "function",
+              "function": { "name": "read_file", "arguments": "{\"path\":\"a.md\"}" } }] },
+            { "role": "tool", "tool_call_id": "call_0", "content": "# A" }
+        ]);
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({ "reasoning_effort": "none" }),
+            serde_json::json!({ "reasoning_effort": "low" }),
+            serde_json::json!({ "reasoning_effort": "high" }),
+            serde_json::json!({ "chat_template_kwargs": { "enable_thinking": true } }),
+            serde_json::json!({ "chat_template_kwargs": { "enable_thinking": true, "clear_thinking": true } }),
+        ] {
+            let mut b = serde_json::json!({ "messages": msgs, "tools": tools });
+            for (k, v) in extra.as_object().unwrap() {
+                b[k] = v.clone();
+            }
+            let req = parse_chat(b.to_string().as_bytes()).unwrap();
+            assert_eq!((req.markup, req.clear_thinking), (Markup::Qwen, None), "{extra}");
+            let (n, notes) = normalize_messages_as(&req.messages, req.markup);
+            assert_eq!((n.clone(), notes.clone()), normalize_messages(&req.messages), "{extra}");
+            assert_eq!(notes.len(), 1, "the #67 strip still runs for Qwen: {notes:?}");
+            let want = tk.encode_chat_effort(&n, req.tools.as_ref(), true, req.enable_thinking, req.reasoning_effort).unwrap();
+            assert_eq!(render_ids(&tk, &n, &req).unwrap(), want, "{extra}");
+            // the Qwen parser reads Qwen markup, not GLM's
+            let mut ts = tool_stream(&req);
+            ts.arm();
+            let mut es = ts.feed("<tool_call>\n<function=read_file>\n<parameter=path>\na.md\n</parameter>\n</function>\n</tool_call>");
+            assert!(!ts.finish(&mut es));
+            assert_eq!(ts.closed(), 1, "{extra}");
         }
     }
 }
