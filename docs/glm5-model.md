@@ -508,7 +508,11 @@ default `converter/GLM-5.3-Flash-MTP-overlay.cnq`) and verifies them in ONE trun
   drafts plus the trunk's own next id. The router ids of all rows go to the tiers in one
   `table_for` (the union is staged once; `glm5_run` gives the tiers `(1 + N) x top-k` staging slots).
   Any launch change in `call_inner` must be mirrored in `call_verify_with_experts`; the GPU test
-  below compares the bits.
+  below compares the bits. Not the #186 prompt call (`call_with_expert_batches`): it takes KDA's
+  prompt path (one `persist` over all rows, no per-row state to roll back to) and MLA's multi-row
+  call. Measured 2026-10-09 (the test below, N = 1, every draft accepted, the verify swapped onto
+  it): 1,956-2,042 of 2,048 logits per generated id differ in bits from the run without MTP (the
+  69 ids happened to match there).
 - **Rollback.** KDA is recurrent: after verify row r < t - 1 the layer's state (S 4 MiB + conv
   window 288 KiB) is copied into snapshot slot r (D2D); on a rejection every KDA state is copied
   back from the slot of the last accepted row. GLM-5.3-Flash: 34 KDA layers x 4,489,216 B =
@@ -528,7 +532,8 @@ default `converter/GLM-5.3-Flash-MTP-overlay.cnq`) and verifies them in ONE trun
   cache rows left).
 - **Switches.** `CROW_GLM_GRAPH`: the prompt rows keep their graphs; the verify and the block run
   uncaptured (another shape). `CROW_GLM_FLAGS`: one-row calls publish their ids; a verify of more
-  rows reads its ids by a sync. `CROW_GLM_LOOKAHEAD` does not apply under MTP. `CROW_GLM_CPU_LANE=1`
+  rows reads its ids by a sync. `CROW_GLM_LOOKAHEAD` and `CROW_CHUNK` (#186) do not apply under MTP
+  (the prompt runs row by row, each row leaving its head-norm row for the block). `CROW_GLM_CPU_LANE=1`
   is refused by name (its experts have other bits than the verify's GPU kernels, so the ids could
   differ from the run without MTP).
 - **Counters** (`Glm5Run::mtp_stats`, `glm5_run` line `decode MTP:` and JSON `decode.mtp` per rep):

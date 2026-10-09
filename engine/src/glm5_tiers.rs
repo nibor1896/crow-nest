@@ -2794,7 +2794,8 @@ mod tests_186 {
 /// The prompt rows run as in `generate` (`Glm5Run::row`, graphs if `CROW_GLM_GRAPH`); each also
 /// leaves its head-norm row for the block, which catches up over the prompt in calls of
 /// [`crate::glm5_mtp::MTP_CHUNK`] rows (their time is in the prompt rows' reports). The verify
-/// and the block's calls run uncaptured. `CROW_GLM_LOOKAHEAD` does not apply; the CPU lane
+/// and the block's calls run uncaptured. `CROW_GLM_LOOKAHEAD` and `CROW_CHUNK` (#186) do not apply;
+/// the verify is not the #186 prompt call (KDA prompt path, MLA multi-row: other bits). The CPU lane
 /// (`CROW_GLM_CPU_LANE=1`) is refused (its experts have other bits than the verify's GPU path).
 impl Glm5Run {
     /// Put the speculative decode in force: `n` drafts per step with `block` (`n = 0` or no block:
