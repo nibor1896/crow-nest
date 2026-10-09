@@ -612,7 +612,18 @@ pub fn plan_for_rows(g: &Glm5Geo, context: usize, rows: usize, vram_total: u64, 
     let env = |k: &str| std::env::var(k).ok();
     let stager = stager_on(env(STAGER_ENV).as_deref(), env(glm5_flags::ENV_FLAGS).as_deref(), env(CPU_LANE_ENV).as_deref())?;
     let pinned_budget = if stager { pinned_budget.saturating_sub(stager_pinned_bytes(g.moe_layers(), g.experts, g.topk, record_bytes)) } else { pinned_budget };
+    // CROW_GLM_PREFETCH's store and CROW_GLM_LA's host-mapped embedding table, the same way
+    let pinned_budget = pinned_budget.saturating_sub(decode_switch_pinned_bytes(g, &Switches::from_env(), record_bytes));
     crate::manager::plan_glm5_next_chunk(g, context, vram_total, pinned_budget, crate::geo::GLM5_NEXT_DENSE_BYTES, record_bytes, crate::gen::pf_tg(), crate::gen::pf_async_on(), chunk)
+}
+
+/// the pinned bytes the decode switches `sw` allocate besides the stager: the prefetch store
+/// (`glm5_flags::prefetch_pinned_bytes`) and the lookahead's host-mapped embedding table
+/// (`glm5_flags::feed_pinned_bytes`)
+pub fn decode_switch_pinned_bytes(g: &Glm5Geo, sw: &Switches, record_bytes: u64) -> u64 {
+    let pf = if sw.prefetch { glm5_flags::prefetch_pinned_bytes(g.topk, record_bytes) } else { 0 };
+    let la = if sw.la { glm5_flags::feed_pinned_bytes(g) } else { 0 };
+    pf + la
 }
 
 /// #186: the staging slots of a prompt call: the #176 prefill set the plan books
@@ -822,6 +833,9 @@ impl ExpertTiers {
         }
         let sw = Switches::from_env();
         sw.check()?;
+        if sw.controller && t.stager.is_none() {
+            return Err(format!("{}=1 needs {STAGER_ENV}=1: the controller serves the layers through the stager", glm5_flags::ENV_CONTROLLER));
+        }
         if sw.prefetch {
             t.set_prefetch(true);
         }
@@ -862,7 +876,7 @@ impl ExpertTiers {
         let l = layer.checked_sub(self.first_moe).filter(|&l| l < self.slots.len()).ok_or_else(|| format!("expert tiers: layer {layer} is no MoE layer"))?;
         let ids = distinct_ids(sel, self.cache.experts)?;
         if self.stager.is_some() {
-            return self.table_staged(l, &ids);
+            return self.table_staged(l, &ids, None);
         }
         let rb = self.rb;
         let mut m = GpuMover {
@@ -1287,6 +1301,38 @@ impl ExpertTiers {
         self.prefetch.as_ref().map(|p| p.stats)
     }
 
+    /// `CROW_GLM_PREFETCH`: the store's counters as of its last call, shared, so a report
+    /// callback reads them while a run holds the store (`None` when it is off)
+    pub fn prefetch_clock(&self) -> Option<std::sync::Arc<std::sync::Mutex<glm5_flags::PrefetchStats>>> {
+        self.prefetch.as_ref().map(|p| p.clock())
+    }
+
+    /// `CROW_GLM_CONTROLLER`: [`ExpertTiers::table_for`] of decoder layer `layer` through the
+    /// stager, the record table in place, and `q` written to the reply word `reply` behind the
+    /// layer's moves on the stager stream (instead of the compute stream's event wait).
+    ///
+    /// # Safety
+    /// As [`ExpertTiers::table_for`]; the device published this call's request (so every earlier
+    /// call's experts ran); `reply` is a mapped u64 the device waits on.
+    pub unsafe fn table_reply(&mut self, layer: usize, sel: &[i32], reply: Dev, q: u64) -> Result<(), String> {
+        let l = layer.checked_sub(self.first_moe).filter(|&l| l < self.slots.len()).ok_or_else(|| format!("expert tiers: layer {layer} is no MoE layer"))?;
+        if self.stager.is_none() {
+            return Err(format!("{}=1 needs {STAGER_ENV}=1", glm5_flags::ENV_CONTROLLER));
+        }
+        let ids = distinct_ids(sel, self.cache.experts)?;
+        self.table_staged(l, &ids, Some((reply, q))).map(|_| ())
+    }
+
+    /// `CROW_GLM_CONTROLLER`: wait for the stager stream (after a failure in a controller job)
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn stager_idle(&self) {
+        if let Some(st) = self.stager.as_ref() {
+            cuda::stream_sync(st.stream);
+        }
+    }
+
     /// #149 path B: the outcome of every NVMe read the stager issued and has not reported yet
     /// (each raised its flag, also on a failure). Blocks only while such a read still runs, which
     /// after a stream sync past the last call's experts is none. A no-op with the stager off.
@@ -1304,7 +1350,7 @@ impl ExpertTiers {
     ///
     /// # Safety
     /// As [`ExpertTiers::table_for`]; the host has seen this layer's router finish (its flag).
-    unsafe fn table_staged(&mut self, l: usize, ids: &[u32]) -> Result<(Dev, Served), String> {
+    unsafe fn table_staged(&mut self, l: usize, ids: &[u32], reply: Option<(Dev, u64)>) -> Result<(Dev, Served), String> {
         let rb = self.rb;
         let experts = self.cache.experts;
         let st = self.stager.as_mut().expect("table_staged without the stager");
@@ -1344,10 +1390,20 @@ impl ExpertTiers {
             };
         }
         cuda::ck(sys::cuMemcpyHtoDAsync_v2(self.tables[l], host.as_ptr() as *const _, experts * 8, st.stream));
-        cuda::event_record(st.event, st.stream);
-        // WDDM: submit the stager's batch now (it would otherwise wait for a later query or sync)
-        cuda::stream_query(st.stream);
-        cuda::stream_wait_event(cuda::cur_stream(), st.event);
+        match reply {
+            None => {
+                cuda::event_record(st.event, st.stream);
+                // WDDM: submit the stager's batch now (it would otherwise wait for a later query or sync)
+                cuda::stream_query(st.stream);
+                cuda::stream_wait_event(cuda::cur_stream(), st.event);
+            }
+            // CROW_GLM_CONTROLLER: the reply word behind the batch; the compute stream's device
+            // wait for it was queued long before
+            Some((w, q)) => {
+                cuda::ck(sys::cuStreamWriteValue64_v2(st.stream, w, q, 0));
+                cuda::stream_query(st.stream);
+            }
+        }
         crate::glm5_moe::lane::post(None);
         if let Some(pf) = self.prefetch.as_mut() {
             glm5_flags::prefetch_hinted(pf, &self.src, &self.records, &self.cache, self.first_moe, self.first_moe + l)?;
@@ -1452,6 +1508,11 @@ pub struct Glm5Run {
     graph: Option<glm5_graph::RowGraphs>,
     /// #192 (`CROW_GLM_MTP`): the speculative decode's block and state (`None` when off)
     spec: Option<Box<crate::glm5_mtp::Spec>>,
+    /// `CROW_GLM_CONTROLLER`: the controller thread (`None` when off)
+    worker: Option<glm5_flags::Worker<TokenReport>>,
+    /// `CROW_GLM_LA`: the row `decode_la` enqueued ahead, and the KDA states of its start
+    ahead: Option<Ahead>,
+    kda_bak: Vec<(Dev, Dev)>,
 }
 
 /// #189: a row whose greedy id the host has not read yet (`CROW_GLM_LOOKAHEAD`)
@@ -1554,6 +1615,9 @@ impl Glm5Run {
             readback: None,
             graph: None,
             spec: None,
+            worker: None,
+            ahead: None,
+            kda_bak: Vec::new(),
         };
         let sw = Switches::from_env();
         if sw != Switches::default() {
@@ -1591,7 +1655,18 @@ impl Glm5Run {
 
     /// `CROW_GLM_PREFETCH`: the guesses' counters (`None` without the guess)
     pub fn guess_stats(&self) -> Option<glm5_flags::GuessStats> {
-        self.pass.routed.as_ref().filter(|r| r.predicting()).map(|r| r.guess)
+        let mut g = self.pass.routed.as_ref().filter(|r| r.predicting()).map(|r| r.guess)?;
+        if let Some(c) = self.pass.ctl.as_ref() {
+            if let Ok(s) = c.score.lock() {
+                (g.compared, g.picks, g.hits) = (g.compared + s.stats.compared, g.picks + s.stats.picks, g.hits + s.stats.hits);
+            }
+        }
+        Some(g)
+    }
+
+    /// routings read through the router's flag (`CROW_GLM_FLAGS`; 0 without the publisher)
+    pub fn flag_calls(&self) -> u64 {
+        self.pass.routed.as_ref().map_or(0, |r| r.calls)
     }
 
     /// the decode switches in force
@@ -1607,6 +1682,15 @@ impl Glm5Run {
     /// A CUDA context is current; no launch of this run is pending.
     pub unsafe fn set_switches(&mut self, cnq: &mut Cnq, sw: Switches) {
         cuda::sync();
+        // CROW_GLM_CONTROLLER: the thread and the ring go (a row ahead is dropped unrestored:
+        // the switches change between sequences)
+        if let Some(mut w) = self.worker.take() {
+            w.free();
+        }
+        self.ahead = None;
+        if let Some(mut c) = self.pass.ctl.take() {
+            c.free();
+        }
         if let Some(r) = self.pass.routed.as_mut() {
             r.free();
         }
@@ -1643,6 +1727,15 @@ impl Glm5Run {
             self.feed = Some(Feed::load(&k, cnq, &self.g));
             self.readback = Some(Readback::new(self.g.vocab));
         }
+        if sw.controller && sw.flags {
+            self.pass.ctl = Some(glm5_flags::Ctl::new(&k, self.moe.topk, self.g.layers));
+            self.worker = Some(glm5_flags::Worker::new());
+            if sw.la && !sw.lookahead {
+                // the reference's prep_model: the gather reads a host-mapped table
+                self.feed = Some(Feed::load_mapped(&k, cnq, &self.g));
+                self.readback = Some(Readback::new(self.g.vocab));
+            }
+        }
         self.sw_kernels = Some(k);
     }
 
@@ -1671,6 +1764,9 @@ impl Glm5Run {
         }
         if self.spec.is_some() {
             return self.generate_spec(cnq, tiers, prompt, n, keep_logits, report);
+        }
+        if self.sw.la && self.pass.ctl.is_some() {
+            return self.generate_la(cnq, tiers, prompt, n, keep_logits, report);
         }
         let mut out = Generated::default();
         // #186: with a prompt chunk above 1 the prompt rows run as prompt calls; the rows from
@@ -1928,6 +2024,17 @@ impl Glm5Run {
         if let Some(mut sp) = self.spec.take() {
             sp.free();
         }
+        if let Some(mut w) = self.worker.take() {
+            w.free();
+        }
+        if let Some(mut c) = self.pass.ctl.take() {
+            c.free();
+        }
+        for (a, b) in self.kda_bak.iter_mut() {
+            cuda::free_dev(a);
+            cuda::free_dev(b);
+        }
+        self.kda_bak.clear();
     }
 }
 
@@ -2839,6 +2946,10 @@ impl Glm5Run {
         if !(0..self.g.vocab as i64).contains(&tok) {
             return Err(format!("glm5_run: token id {tok} outside the vocab of {}", self.g.vocab));
         }
+        self.settle_ahead(tiers)?;
+        if self.pass.ctl.is_some() {
+            return self.row_ctl(cnq, tiers, tok, pos, head);
+        }
         self.embed(cnq, tok);
         self.layers(tiers, pos, &mut |_| Ok(()))?;
         if !head {
@@ -2860,6 +2971,374 @@ impl Glm5Run {
     /// the KDA state of every KDA layer, in layer order (what a prefix snapshot copies)
     pub fn kda_states(&self) -> impl Iterator<Item = &KdaState> {
         self.kda.iter().flatten()
+    }
+}
+
+
+// ---------------------------------------------------------------- CROW_GLM_CONTROLLER / CROW_GLM_LA
+
+/// `CROW_GLM_LA`: the row enqueued ahead by [`Glm5Run::decode_la`]: its position and the id it
+/// runs on
+#[derive(Clone, Copy, Debug)]
+struct Ahead {
+    pos: usize,
+    tok: i64,
+}
+
+/// `CROW_GLM_CONTROLLER`: the controller thread's job of one row: its `n` requests read from the
+/// ring in order, each served through the stager with the reply written behind the layer's moves
+/// (`ExpertTiers::table_reply`), the next layer's guess handed to the prefetch first. The row's
+/// report (the store's counters around the job; clock, position and id are the caller's). On a
+/// failure the stager stream drains and every device wait is released, so the row runs out.
+fn ctl_job(t: &mut ExpertTiers, mut rd: glm5_flags::RingReader, n: usize, score: std::sync::Arc<std::sync::Mutex<glm5_flags::GuessScore>>) -> Result<TokenReport, String> {
+    let base = RowBase::of(t);
+    for _ in 0..n {
+        let rq = match rd.next() {
+            Ok(r) => r,
+            Err(e) => {
+                // SAFETY: the stager stream of this store, on the thread that queues on it
+                unsafe { t.stager_idle() };
+                rd.release_all();
+                return Err(e);
+            }
+        };
+        if let Ok(mut s) = score.lock() {
+            s.see(rq.layer, &rq.ids, rq.guess.as_ref());
+        }
+        glm5_flags::post_hint(rq.guess.clone());
+        // SAFETY: the host side of the protocol: the main thread does not touch the store while
+        // a job runs; the device published this layer's request after the experts of its
+        // previous call ran (see `Stager`)
+        if let Err(e) = unsafe { t.table_reply(rq.layer, &rq.ids, rd.reply_dev, rq.seq) } {
+            unsafe { t.stager_idle() };
+            rd.release_all();
+            return Err(format!("{}: layer {}: {e}", glm5_flags::ENV_CONTROLLER, rq.layer));
+        }
+    }
+    Ok(base.report(t, 0, false, None, std::time::Instant::now()))
+}
+
+impl Glm5Run {
+    /// `CROW_GLM_CONTROLLER`: what a controlled row needs, refused by name
+    fn ctl_check(&self, tiers: &ExpertTiers) -> Result<(), String> {
+        let c = glm5_flags::ENV_CONTROLLER;
+        if self.graph.is_some() {
+            return Err(format!("{c}=1 and {}=1: a controlled row has no host hand-off to cut its graphs at; turn one of them off", glm5_graph::ENV));
+        }
+        if !tiers.stager_on() {
+            return Err(format!("{c}=1 needs {STAGER_ENV}=1: the controller serves the layers through the stager"));
+        }
+        if tiers.pinned_use.cpu_lane {
+            return Err(format!("{c}=1 and {CPU_LANE_ENV}=1: the CPU lane computes on the host inside the layer"));
+        }
+        if self.spec.is_some() {
+            return Err(format!("{c}=1 and {}: the verify calls hand their routing to the host", crate::glm5_mtp::MTP_ENV));
+        }
+        match (self.pass.ctl.as_ref(), self.worker.as_ref()) {
+            (Some(ctl), Some(_)) if !ctl.poisoned => Ok(()),
+            (Some(_), Some(_)) => Err(format!("{c}: an earlier controlled row failed; put the switches in force again")),
+            _ => Err(format!("{c}: the controller is not set up (Glm5Run::set_switches)")),
+        }
+    }
+
+    /// Queue row `pos` (its input already in `x`) through the controller: the row's job to the
+    /// controller thread, then every layer's launches; no host wait. A failure here abandons
+    /// the job (it releases the device's waits) and drains the row.
+    ///
+    /// # Safety
+    /// A CUDA context is current; `tiers` belongs to this model and is not touched by the
+    /// caller until the job's result was taken.
+    unsafe fn enqueue_ctl(&mut self, tiers: &mut ExpertTiers, pos: usize) -> Result<(), String> {
+        let (g, first) = (self.g, tiers.first_moe);
+        let n = moe_layers(&g);
+        let ctl = self.pass.ctl.as_mut().expect("glm5_run: a controlled row without the controller");
+        ctl.tables = (0..g.layers).map(|l| l.checked_sub(first).and_then(|i| tiers.tables().get(i).copied()).unwrap_or(0)).collect();
+        let rd = ctl.reader(n);
+        let score = ctl.score.clone();
+        let tp = glm5_flags::SendPtr(tiers as *mut ExpertTiers);
+        self.worker.as_mut().expect("glm5_run: a controlled row without the controller thread").send(Box::new(move || {
+            let tp = tp;
+            // SAFETY: see `ctl_job`; the caller keeps off the store until this job's result
+            ctl_job(unsafe { &mut *tp.0 }, rd, n, score)
+        }));
+        let ctl = self.pass.ctl.as_mut().expect("controller");
+        ctl.active = true;
+        let r = self.layers_ctl(pos);
+        let ctl = self.pass.ctl.as_mut().expect("controller");
+        ctl.active = false;
+        if r.is_err() {
+            ctl.cancel();
+            ctl.poisoned = true;
+            self.drain_ctl();
+        }
+        r
+    }
+
+    /// every layer of row `pos` with the controller active (the expert hook is never asked)
+    unsafe fn layers_ctl(&mut self, pos: usize) -> Result<(), String> {
+        for l in 0..self.g.layers {
+            if let Some(s) = self.kda[l].as_mut() {
+                self.pass.swap_kda_state(s);
+            }
+            if let Some(c) = self.mla[l].as_mut() {
+                self.pass.swap_mla_cache(c);
+            }
+            let mut hook = |layer: usize, _: &[i32]| -> Result<Dev, String> { Err(format!("layer {layer}: a controlled row asked the host for its experts")) };
+            let r = self.pass.call_with_experts(&self.layers[l], self.x, pos, 1, true, &mut hook);
+            if let Some(s) = self.kda[l].as_mut() {
+                self.pass.swap_kda_state(s);
+            }
+            if let Some(c) = self.mla[l].as_mut() {
+                self.pass.swap_mla_cache(c);
+            }
+            r.map_err(|e| format!("glm5_run: row {pos} layer {l}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// the oldest job's result, checked against the device's timeout word; a failure poisons
+    /// the controller
+    fn ctl_result(&mut self, r: Result<TokenReport, String>) -> Result<TokenReport, String> {
+        let ctl = self.pass.ctl.as_mut().expect("controller");
+        let q = ctl.timed_out();
+        if r.is_err() || q != 0 {
+            ctl.poisoned = true;
+        }
+        let r = r?;
+        if q != 0 {
+            return Err(format!(
+                "{}: the device's wait for request {q} gave up after {} ms (bounded under the WDDM TDR); that layer's experts read a stale table",
+                glm5_flags::ENV_CONTROLLER,
+                glm5_flags::CTL_WAIT_NS / 1_000_000
+            ));
+        }
+        Ok(r)
+    }
+
+    /// after a row's launches (and its head): the stream drained, the row's job result
+    unsafe fn finish_ctl(&mut self) -> Result<TokenReport, String> {
+        cuda::sync();
+        let r = self.worker.as_mut().expect("controller thread").wait();
+        self.ctl_result(r)
+    }
+
+    /// after a failure: the stream drained and every pending job's result dropped
+    unsafe fn drain_ctl(&mut self) {
+        cuda::sync();
+        if let Some(w) = self.worker.as_mut() {
+            while w.pending > 0 {
+                let _ = w.wait();
+            }
+        }
+        self.ahead = None;
+    }
+
+    /// [`Glm5Run::row`] through the controller: the row enqueued whole, the head, one stream
+    /// sync at the end
+    unsafe fn row_ctl(&mut self, cnq: &mut Cnq, tiers: &mut ExpertTiers, tok: i64, pos: usize, head: bool) -> Result<Option<i64>, String> {
+        self.ctl_check(tiers)?;
+        self.embed(cnq, tok);
+        self.enqueue_ctl(tiers, pos)?;
+        if head {
+            if let Err(e) = self.head_row() {
+                self.drain_ctl();
+                return Err(e);
+            }
+        }
+        self.finish_ctl()?;
+        tiers.settle()?;
+        Ok(head.then(|| cuda::dtoh_i32(self.next, 1)[0] as i64))
+    }
+
+    /// `CROW_GLM_LA`: the KDA states (state and conv window of every KDA layer) into their
+    /// backups, queued
+    unsafe fn backup_kda(&mut self) {
+        let kd = KdaDims::of(&self.g);
+        let (sb, cb) = (kd.state_floats() * 4, kd.conv_floats() * 4);
+        if self.kda_bak.is_empty() {
+            self.kda_bak = self.kda.iter().flatten().map(|_| (cuda::alloc_named("glm5 LA KDA state backup", sb), cuda::alloc_named("glm5 LA KDA conv backup", cb))).collect();
+        }
+        let s = cuda::cur_stream();
+        for (k, b) in self.kda.iter().flatten().zip(&self.kda_bak) {
+            cuda::ck(sys::cuMemcpyDtoDAsync_v2(b.0, k.s, sb, s));
+            cuda::ck(sys::cuMemcpyDtoDAsync_v2(b.1, k.conv, cb, s));
+        }
+    }
+
+    /// `CROW_GLM_LA`: the backups into the KDA states, queued
+    unsafe fn restore_kda(&mut self) {
+        let kd = KdaDims::of(&self.g);
+        let (sb, cb) = (kd.state_floats() * 4, kd.conv_floats() * 4);
+        let s = cuda::cur_stream();
+        for (k, b) in self.kda.iter().flatten().zip(&self.kda_bak) {
+            cuda::ck(sys::cuMemcpyDtoDAsync_v2(k.s, b.0, sb, s));
+            cuda::ck(sys::cuMemcpyDtoDAsync_v2(k.conv, b.1, cb, s));
+        }
+    }
+
+    /// `CROW_GLM_LA`, serve's door: decode row `pos` on `tok` and its head; the greedy id. Before
+    /// the host reads it, row `pos + 1` is enqueued on the device's id (the KDA states of its start
+    /// kept). When the next call asks for that row with that id, its launches are already queued;
+    /// any other call first drops it ([`Glm5Run::settle_ahead`]). Not with MTP.
+    ///
+    /// # Safety
+    /// A CUDA context is current; `tiers` belongs to this model.
+    pub unsafe fn decode_la(&mut self, cnq: &mut Cnq, tiers: &mut ExpertTiers, tok: i64, pos: usize) -> Result<i64, String> {
+        if pos >= self.cap {
+            return Err(format!("glm5_run: row {pos} is outside the caches of {} rows", self.cap));
+        }
+        if !(0..self.g.vocab as i64).contains(&tok) {
+            return Err(format!("glm5_run: token id {tok} outside the vocab of {}", self.g.vocab));
+        }
+        self.ctl_check(tiers)?;
+        if self.feed.is_none() || self.readback.is_none() {
+            return Err(format!("{}: the lookahead is not set up (Glm5Run::set_switches)", glm5_flags::ENV_LA));
+        }
+        match self.ahead.take() {
+            Some(a) if a.pos == pos && a.tok == tok => {}
+            Some(_) => {
+                self.drop_ahead(tiers)?;
+                self.embed(cnq, tok);
+                self.enqueue_ctl(tiers, pos)?;
+            }
+            None => {
+                self.embed(cnq, tok);
+                self.enqueue_ctl(tiers, pos)?;
+            }
+        }
+        if let Err(e) = self.head_row() {
+            self.drain_ctl();
+            return Err(e);
+        }
+        self.readback.as_ref().expect("readback").enqueue_marked(self.next, None);
+        let ahead = pos + 1 < self.cap;
+        if ahead {
+            self.backup_kda();
+            self.feed.as_ref().expect("feed").gather(self.next, self.x);
+            self.enqueue_ctl(tiers, pos + 1)?;
+        }
+        let rb = self.readback.as_ref().expect("readback");
+        rb.wait_marked();
+        let id = rb.id() as i64;
+        let r = self.worker.as_mut().expect("controller thread").wait();
+        if let Err(e) = self.ctl_result(r) {
+            self.drain_ctl();
+            return Err(e);
+        }
+        if !(0..self.g.vocab as i64).contains(&id) {
+            self.drain_ctl();
+            return Err(format!("glm5_run: row {pos}: the greedy id {id} is outside the vocab of {}", self.g.vocab));
+        }
+        if ahead {
+            self.ahead = Some(Ahead { pos: pos + 1, tok: id });
+        }
+        Ok(id)
+    }
+
+    /// `CROW_GLM_LA`: the row enqueued ahead runs out (its job served), then the KDA states of its
+    /// start come back; its MLA rows are left to be overwritten
+    unsafe fn drop_ahead(&mut self, tiers: &mut ExpertTiers) -> Result<(), String> {
+        cuda::sync();
+        let r = self.worker.as_mut().expect("controller thread").wait();
+        let r = self.ctl_result(r);
+        self.restore_kda();
+        cuda::sync();
+        r?;
+        tiers.settle()
+    }
+
+    /// `CROW_GLM_LA`: drop the row enqueued ahead, if any (a no-op otherwise). Everything that
+    /// reads or replaces the sequence's state calls this first.
+    ///
+    /// # Safety
+    /// A CUDA context is current; `tiers` belongs to this model.
+    pub unsafe fn settle_ahead(&mut self, tiers: &mut ExpertTiers) -> Result<(), String> {
+        match self.ahead.take() {
+            Some(_) => self.drop_ahead(tiers),
+            None => Ok(()),
+        }
+    }
+
+    /// `CROW_GLM_LA`: a row is enqueued ahead
+    pub fn has_ahead(&self) -> bool {
+        self.ahead.is_some()
+    }
+
+    /// [`Glm5Run::generate`] with `CROW_GLM_LA` (the reference's `iterate_gen_la`): every row
+    /// through the controller; after a head that is not the last row's, the next row is enqueued
+    /// on the device's id before the host waits for that id (an event behind its readback). No
+    /// row is launched past the last one, so nothing is dropped. Reports as without it.
+    unsafe fn generate_la(&mut self, cnq: &mut Cnq, tiers: &mut ExpertTiers, prompt: &[i64], n: usize, keep_logits: bool, report: &mut dyn FnMut(&TokenReport)) -> Result<Generated, String> {
+        self.ctl_check(tiers)?;
+        if self.feed.is_none() || self.readback.is_none() {
+            return Err(format!("{}: the lookahead is not set up (Glm5Run::set_switches)", glm5_flags::ENV_LA));
+        }
+        let rows = prompt.len() + n - 1;
+        let mut out = Generated::default();
+        let start = if self.prompt_chunk > 1 {
+            let id = self.prefill(cnq, tiers, prompt, 0, report)?;
+            if keep_logits {
+                out.logits.push(cuda::dtoh(self.logits, self.g.vocab));
+            }
+            out.ids.push(id);
+            prompt.len()
+        } else {
+            0
+        };
+        let r = self.la_rows(cnq, tiers, prompt, start, rows, keep_logits, &mut out, report);
+        if r.is_err() {
+            self.drain_ctl();
+        }
+        r.map(|_| out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn la_rows(&mut self, cnq: &mut Cnq, tiers: &mut ExpertTiers, prompt: &[i64], start: usize, rows: usize, keep_logits: bool, out: &mut Generated, report: &mut dyn FnMut(&TokenReport)) -> Result<(), String> {
+        let (pn, vocab) = (prompt.len(), self.g.vocab);
+        let mut ahead: Option<std::time::Instant> = None;
+        for pos in start..rows {
+            let t0 = match ahead.take() {
+                Some(t) => t,
+                None => {
+                    let t = std::time::Instant::now();
+                    let tok = if pos < pn { prompt[pos] } else { *out.ids.last().expect("a decode row after an id") };
+                    self.embed(cnq, tok);
+                    self.enqueue_ctl(tiers, pos)?;
+                    t
+                }
+            };
+            if pos + 1 < pn {
+                let mut rep = self.finish_ctl()?;
+                (rep.pos, rep.prompt, rep.next, rep.secs) = (pos, true, None, t0.elapsed().as_secs_f64());
+                report(&rep);
+                continue;
+            }
+            self.head_row()?;
+            self.readback.as_ref().expect("readback").enqueue_marked(self.next, keep_logits.then_some(self.logits));
+            if pos + 1 < rows {
+                self.feed.as_ref().expect("feed").gather(self.next, self.x);
+                let t1 = std::time::Instant::now();
+                self.enqueue_ctl(tiers, pos + 1)?;
+                ahead = Some(t1);
+            }
+            let rb = self.readback.as_ref().expect("readback");
+            rb.wait_marked();
+            let id = rb.id() as i64;
+            let logits = keep_logits.then(|| rb.logits());
+            let r = self.worker.as_mut().expect("controller thread").wait();
+            let mut rep = self.ctl_result(r)?;
+            if !(0..vocab as i64).contains(&id) {
+                return Err(format!("glm5_run: row {pos}: the greedy id {id} is outside the vocab of {vocab}"));
+            }
+            if let Some(l) = logits {
+                out.logits.push(l);
+            }
+            out.ids.push(id);
+            (rep.pos, rep.prompt, rep.next, rep.secs) = (pos, pos < pn, Some(id), t0.elapsed().as_secs_f64());
+            report(&rep);
+        }
+        cuda::sync();
+        tiers.settle()
     }
 }
 

@@ -780,6 +780,9 @@ pub struct Glm5Pass {
     /// `CROW_GLM_SHARED_OVERLAP=1` (set by `Glm5Run`): a decode call with [`Glm5Pass::routed`]
     /// queues the shared expert between the publish and the host's wait (outside graph captures)
     pub overlap: bool,
+    /// `CROW_GLM_CONTROLLER=1` (set by `Glm5Run`): while `active`, a decode call's MoE layer hands
+    /// its routing to the controller's ring and waits for the reply on the device
+    pub ctl: Option<crate::glm5_flags::Ctl>,
 }
 
 impl Glm5Pass {
@@ -813,6 +816,7 @@ impl Glm5Pass {
             last_ffn_t: 0,
             routed: None,
             overlap: false,
+            ctl: None,
             kn,
         }
     }
@@ -989,6 +993,24 @@ impl Glm5Pass {
                             r.predict(&self.kn.k, &self.kn.moe, lw.layer, self.collapsed);
                         } else {
                             p.route(&self.kn.k, &self.kn.moe, w, self.collapsed);
+                        }
+                        // CROW_GLM_CONTROLLER: the request into the ring, the reply waited for on the
+                        // device, the experts through the layer's fixed table; no host hand-off
+                        if let Some(c) = self.ctl.as_mut().filter(|c| c.active && t == 1) {
+                            let tb = c.tables.get(lw.layer).copied().unwrap_or(0);
+                            if tb == 0 {
+                                return Err(format!("layer {}: {}: no record table for this layer", lw.layer, crate::glm5_flags::ENV_CONTROLLER));
+                            }
+                            c.publish(lw.layer, p.ids, t * self.moe.topk, self.routed.as_ref().and_then(|r| r.guess_bufs()));
+                            if self.overlap {
+                                // the shared expert while the controller serves the layer (bit-identical)
+                                p.shared_early(&self.kn.k, &self.kn.moe, w, self.collapsed);
+                            }
+                            c.wait_reply();
+                            p.experts(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub);
+                            self.last_ffn_t = t;
+                            self.mhc.expand(&self.kn.mhc, x, self.sub, x, t);
+                            return Ok(());
                         }
                         // CROW_GLM_SHARED_OVERLAP: decided before the seam (a capture is open up to it)
                         let overlap = self.overlap && t == 1 && self.routed.is_some() && !crate::glm5_graph::capturing();

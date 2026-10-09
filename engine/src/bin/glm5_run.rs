@@ -51,6 +51,7 @@
 //! the times of this synchronous path, not of a graph-captured one.
 use crow_nest_engine::cuda;
 use crow_nest_engine::geo::{from_engine_dir, HOST_PINNED_CAP};
+use crow_nest_engine::glm5_flags::PrefetchStats;
 use crow_nest_engine::glm5_model::GLM5_MUL1K3_CNQ;
 use crow_nest_engine::glm5_mtp::{self as mtp, SpecStats};
 use crow_nest_engine::glm5_tiers::{self as gt, ExpertTiers, Glm5Run, Moves, TokenReport};
@@ -108,6 +109,8 @@ struct Row {
     at: f64,
     /// #188: seconds the CPU lane's pool runs took in this row (`ExpertTiers::cpu_lane_clock`)
     lane_s: f64,
+    /// `CROW_GLM_PREFETCH`: the store's counters since the previous row (`None`: the store is off)
+    pf: Option<PrefetchStats>,
 }
 
 fn median(v: &[f64]) -> Option<f64> {
@@ -156,6 +159,8 @@ struct Phase {
     nvme_bytes: u64,
     /// #188: CPU lane pool-run seconds summed over the rows
     lane_s: f64,
+    /// `CROW_GLM_PREFETCH`: the store's counters summed over the rows (`None`: off)
+    pf: Option<PrefetchStats>,
     /// #186: reports (one per row, or one per prompt call), routing syncs, serve sub-batches
     reports: usize,
     routing_syncs: u64,
@@ -173,6 +178,9 @@ impl Phase {
             p.nvme_reads += row.r.nvme_reads;
             p.nvme_bytes += row.r.nvme_bytes;
             p.lane_s += row.lane_s;
+            if let Some(d) = row.pf {
+                p.pf.get_or_insert_with(PrefetchStats::default).add(&d);
+            }
             for (a, b) in p.tiers.iter_mut().zip(&row.r.tiers) {
                 for i in 0..3 {
                     a[i] += b[i];
@@ -245,8 +253,20 @@ fn counters_json(p: &Phase, rb: u64) -> Value {
         "cpu_lane_per_token": m.cpu_lane as f64 / t,
         "cpu_lane_s_per_token": p.lane_s / t,
         "moves": moves_json(&m),
-        "prefetch": { "mode": "none", "issued": 0, "used": 0, "wasted": 0, "demand_misses_uncovered": p.nvme_reads,
-                      "demand_misses_uncovered_per_token": p.nvme_reads as f64 / t },
+        "prefetch": prefetch_json(p, t),
+    })
+}
+
+/// `CROW_GLM_PREFETCH`: the store's counters of a phase. A staged NVMe record the store held
+/// (`used`) was read before its layer asked; the demand misses it did not cover are the phase's
+/// NVMe reads minus those.
+fn prefetch_json(p: &Phase, t: f64) -> Value {
+    let f = p.pf.unwrap_or_default();
+    let uncovered = p.nvme_reads.saturating_sub(f.used);
+    json!({
+        "mode": if p.pf.is_some() { "next-layer" } else { "none" },
+        "hints": f.hints, "resident": f.resident, "issued": f.issued, "issued_bytes": f.bytes, "used": f.used, "wasted": f.wasted,
+        "demand_misses_uncovered": uncovered, "demand_misses_uncovered_per_token": uncovered as f64 / t,
     })
 }
 
@@ -634,6 +654,7 @@ fn run(args: &[String]) -> Result<(), String> {
             "reps_detail": [],
         });
         let lane = tiers.cpu_lane_clock();
+        let pf_clock = tiers.prefetch_clock();
         let mut per_rep: Vec<(Phase, Phase, f64, f64)> = Vec::new();
         let mut all_ids: Vec<Vec<i64>> = Vec::new();
         for rep in 1..=reps {
@@ -643,6 +664,8 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             let mut rows: Vec<Row> = Vec::with_capacity(cap);
             let mut lane_ns = lane.read().0;
+            let pf_read = || pf_clock.as_ref().map(|c| c.lock().map(|g| *g).unwrap_or_default());
+            let mut pf_last = pf_read();
             let t0 = std::time::Instant::now();
             let mut report = |r: &TokenReport| {
                 let at = t0.elapsed().as_secs_f64();
@@ -665,7 +688,10 @@ fn run(args: &[String]) -> Result<(), String> {
                     sum[2],
                     per.join(" ")
                 );
-                rows.push(Row { r: r.clone(), at, lane_s });
+                let pf_now = pf_read();
+                let pf = pf_now.zip(pf_last).map(|(a, b)| a.since(&b));
+                pf_last = pf_now;
+                rows.push(Row { r: r.clone(), at, lane_s, pf });
             };
             let out = run.generate(&mut o.cnq, &mut tiers, &prompt, n, false, &mut report)?;
             let wall = t0.elapsed().as_secs_f64();
@@ -828,6 +854,8 @@ mod tests {
                     },
                     at,
                     lane_s: 0.0,
+                    // the store on in decode rows only: 1 record used of 2 read per row
+                    pf: (!prompt).then_some(PrefetchStats { hints: 1, issued: 2, bytes: 200, used: 1, wasted: 1, ..PrefetchStats::default() }),
                 }
             })
             .collect()
@@ -864,6 +892,10 @@ mod tests {
         assert_eq!((c["prefetch"]["mode"].as_str(), c["prefetch"]["issued"].as_u64(), c["prefetch"]["demand_misses_uncovered"].as_u64()), (Some("none"), Some(0), Some(24)));
         assert_eq!(c["hit_rate"]["nvme"], 0.5);
         let d = counters_json(&dec, 1);
+        let rows_dec = dec.tokens as u64;
+        assert_eq!(d["prefetch"]["mode"], "next-layer");
+        assert_eq!((d["prefetch"]["issued"].as_u64(), d["prefetch"]["used"].as_u64(), d["prefetch"]["wasted"].as_u64()), (Some(2 * rows_dec), Some(rows_dec), Some(rows_dec)));
+        assert_eq!(d["prefetch"]["demand_misses_uncovered"].as_u64(), Some(dec.nvme_reads - rows_dec));
         assert_eq!(d["m_nvme_share"], 2.0 / 16.0);
         let l = layers_json(&dec, 3);
         assert_eq!(l.as_array().unwrap().len(), 2);
@@ -908,7 +940,7 @@ mod tests {
     #[test]
     fn a_prompt_call_report_counts_its_rows() {
         let mut rows = synthetic();
-        let call = Row { r: TokenReport { rows: 3, routing_syncs: 2, sub_batches: 5, ..rows[2].r.clone() }, at: rows[2].at, lane_s: 0.0 };
+        let call = Row { r: TokenReport { rows: 3, routing_syncs: 2, sub_batches: 5, ..rows[2].r.clone() }, at: rows[2].at, lane_s: 0.0, pf: None };
         rows.splice(0..3, [call]);
         let (pre, dec, ttft) = phases(&rows, 2);
         assert_eq!((pre.tokens, pre.reports, pre.routing_syncs, pre.sub_batches, dec.tokens), (3, 1, 2, 5, 2));
