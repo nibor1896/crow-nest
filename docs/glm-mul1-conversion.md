@@ -60,7 +60,7 @@ files, their sha256 and the FP8 identity in `<work>/calibration.json`; the store
 | index entries | dtype `mul1`; gate at the record start, up at + 3,145,728, down at + 6,291,456 (`RecordLayout::tensor_offsets`); `len` 3,145,728 / 3,145,728 / 3,182,592, so "next offset - gate offset" is the record (`engine/src/nvme_source.rs:196`); `mul1: {k, record_offset, record_bytes}` |
 | index top level | `recipe` stays `cnq4.5-glm5-next` (the dense rule); new `expert_codec`: dtype, K, hidden, inter, trellis and record bytes, records, layout, the store's sha256, quantizer and calibration |
 | size | non-expert part 7,250,323,716 B + 12,384 x 9,474,048 B = 124.58 GB = 116.0 GiB (derived from `converter plan` 2026-10-08) |
-| not yet | `converter dequant` and the oracle's `--weights container` do not decode `mul1` (the Hadamard un-rotation is plan step 10/11, #180) |
+| decode | `converter dequant` and so the oracle's `--weights container` decode `mul1` to the original-basis weight `diag(suh) H W_hat H diag(svh) / 128` in f64, one f32 rounding (#156, 2026-10-09; `converter/README.md`) |
 
 ## Disk
 

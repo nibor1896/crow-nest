@@ -1,0 +1,658 @@
+{
+ "issue": "crow-nest #156: GLM-5.3-Flash layer goldens L0-3 on the 3-bit container (MUL1 K=3 experts, NVFP4 dense part)",
+ "date": "2026-10-09",
+ "start": "2026-10-09T15:59:24+02:00",
+ "end": "2026-10-09T16:00:32+02:00",
+ "wall_s": 68.0,
+ "wall_note": "from the shell's start/end timestamps, 1 s resolution; the runner's own per-layer load/compute is in per_layer",
+ "machine": "Windows 11, 63.38 GiB RAM, CPU only; torch 2.13.0+cpu, transformers 5.16.1, threads 16",
+ "commit": "eb1d92d",
+ "command": "ORACLE_THREADS=16 C:/Users/robin/dev/crow-nest/.venv-oracle/Scripts/python.exe -I oracle/glm5_layerwise.py run --weights container C:/Users/robin/dev/crow-nest/converter/GLM-5.3-Flash-MUL1K3.cnq --ids runs/glm53-flash/step06/ids.json --decode 4 --out C:/Users/robin/dev/crow-nest/models/GLM-5.3-Flash-step06/ref-mul1 --layers 0:4 --capture-subblocks",
+ "rc": 0,
+ "same_as_fp8_run_of_record": "ids, --decode 4, --layers 0:4, --capture-subblocks, prompt_chunk 512 as runs/glm53-flash/step06/golden-fp8-regen.json; only --weights differs",
+ "ids": {
+  "path": "runs/glm53-flash/step06/ids.json",
+  "sha256": "56e2037eb583a84d605ceb6d8c37404964dc4c34c3c52e2579a1b4dbe0e29bb7",
+  "N": 90,
+  "T": 86,
+  "D": 4,
+  "equal_to_fp8_run": true
+ },
+ "weights_identity": {
+  "kind": "cnq container (3-bit: routed experts MUL1 K=3, dense part NVFP4 cnq4.5-glm5-next --scales mse)",
+  "path": "C:/Users/robin/dev/crow-nest/converter/GLM-5.3-Flash-MUL1K3.cnq",
+  "container_sha256": "9ce11456c68f80926e1fe8289888a3571309a1f8558bc73d1578f0db2b30213e",
+  "container_bytes": 124591634567,
+  "container_mtime": 1791541118,
+  "index_json_sha256": "56741348e106d9e7b0a911afee846b8ca2b1152156fd78b6e443b6f3c0061612",
+  "config_json_sha256": "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f",
+  "source": {
+   "repo": "zai-org/GLM-5.3-Flash",
+   "revision": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a"
+  },
+  "recipe": "cnq4.5-glm5-next",
+  "scales": "mse",
+  "partial": null,
+  "n_tensors": 38398,
+  "n_nvfp4": 428,
+  "n_mul1": 37152,
+  "expert_codec": {
+   "dtype": "mul1",
+   "k": 3.0,
+   "hidden": 4096,
+   "inter": 2048,
+   "record_bytes": 9474048,
+   "records": 12384,
+   "store_sha256": "95c76f56fed25209fa9422d256d7e07f2ef9cf483f3127c2b0052de9e91f9fef",
+   "quantizer": {
+    "name": "exllamav3 quantize_exl3",
+    "version": "1.6.0",
+    "commit": "151539c7",
+    "codebook": "mul1"
+   }
+  },
+  "decoder": {
+   "converter": "C:\\Users\\robin\\dev\\crow-nest-wt-mul1-deq\\converter\\target\\release\\converter.exe",
+   "converter_sha256": "48cab4e122c0e18a81dc275ccdfb24dd317416186d2d4a92b14f96def591c1da",
+   "rule": "converter dequant: NVFP4 as gate 0 decodes it; MUL1 by the #181 decoder to diag(suh) H W_hat H diag(svh) / 128 in f64, one f32 rounding, [out, in]"
+  }
+ },
+ "per_layer": [
+  {
+   "layer": 0,
+   "kind": "kda+dense",
+   "load_s": 2.091,
+   "compute_s": 0.271,
+   "rss_after_load_gib": 1.543,
+   "peak_wset_gib": 2.374,
+   "prompt_chunk": 512,
+   "prompt_call_s": [
+    0.198
+   ]
+  },
+  {
+   "layer": 1,
+   "kind": "kda+dense",
+   "load_s": 2.014,
+   "compute_s": 0.264,
+   "rss_after_load_gib": 1.568,
+   "peak_wset_gib": 2.385,
+   "prompt_chunk": 512,
+   "prompt_call_s": [
+    0.168
+   ]
+  },
+  {
+   "layer": 2,
+   "kind": "kda+dense",
+   "load_s": 2.012,
+   "compute_s": 0.244,
+   "rss_after_load_gib": 2.346,
+   "peak_wset_gib": 2.53,
+   "prompt_chunk": 512,
+   "prompt_call_s": [
+    0.172
+   ]
+  },
+  {
+   "layer": 3,
+   "kind": "dsa+moe",
+   "load_s": 50.562,
+   "compute_s": 0.578,
+   "rss_after_load_gib": 28.836,
+   "peak_wset_gib": 28.88,
+   "prompt_chunk": 512,
+   "prompt_call_s": [
+    0.485
+   ],
+   "dsa_tie_rows_n": 0,
+   "dsa_tie_rows": []
+  }
+ ],
+ "peak_rss_gib": 28.836,
+ "peak_working_set_gib": 28.88,
+ "rss_note": "the runner process; the converter dequant child (one per module) is not included",
+ "golden_dir": "C:/Users/robin/dev/crow-nest/models/GLM-5.3-Flash-step06/ref-mul1",
+ "n_files": 48,
+ "manifest_json_sha256": "31b7966f92bde8c3eed62d9693d2b53a5c68e508eeccde06a3f8e54937a38b77",
+ "files": {
+  "embed.f32": {
+   "bytes": 1474560,
+   "sha256": "0b7ec9285445222fc6ef5c41ebacf630acd40e4900917649d853edfd2baa7721",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l0-attn-out.f32": {
+   "bytes": 1474560,
+   "sha256": "37d78e5c8969312ade6cc307e96d6cb8a4fc77690998ef2962c6ec1f1cd82232",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l0-attn_hc-collapsed.f32": {
+   "bytes": 1474560,
+   "sha256": "28ec12f94731a9bc9df2dd2f89ade948d3d51b0949db31b800446cc7a4754b45",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l0-attn_hc-comb.f32": {
+   "bytes": 5760,
+   "sha256": "3baaecb587b20f8deca8816d8a0ae7f103ac991d586c10b53f6f5ee2b4712cc6",
+   "shape": [
+    90,
+    4,
+    4
+   ],
+   "dtype": "f32"
+  },
+  "l0-attn_hc-in.f32": {
+   "bytes": 5898240,
+   "sha256": "d07c6ec302e4196f305a854ffc187576c6f64d96dea22eb84a840233bf87a26c",
+   "shape": [
+    90,
+    4,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l0-attn_hc-post.f32": {
+   "bytes": 1440,
+   "sha256": "7d6af30fbefbf5113911495e86f71d83ab777765c6dc103d75fa7ac875bdb85a",
+   "shape": [
+    90,
+    4
+   ],
+   "dtype": "f32"
+  },
+  "l0-ffn-out.f32": {
+   "bytes": 1474560,
+   "sha256": "bf8adaa4c2c974f8cc1d0f823d5deb635f5f2446314da475679e8b5e9d5f78e7",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l0-ffn_hc-collapsed.f32": {
+   "bytes": 1474560,
+   "sha256": "28dffa55201d1448794e95c50d77a257a47d63d8807451e9e2dee64bd1df1fc8",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l0-ffn_hc-comb.f32": {
+   "bytes": 5760,
+   "sha256": "563c7230518a00b6693da0302632ee73a86b6bd7b057722706673eda9ea9d8e5",
+   "shape": [
+    90,
+    4,
+    4
+   ],
+   "dtype": "f32"
+  },
+  "l0-ffn_hc-in.f32": {
+   "bytes": 5898240,
+   "sha256": "71fe24215fed916901f05927b5ac6867b34ee21b4652fc58c900c53bd4fb314f",
+   "shape": [
+    90,
+    4,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l0-ffn_hc-post.f32": {
+   "bytes": 1440,
+   "sha256": "cd3dbfbf39add72f858efc5b40dd1e86b203b16e2933eafcafc1f166e533d87e",
+   "shape": [
+    90,
+    4
+   ],
+   "dtype": "f32"
+  },
+  "l0-output.f32": {
+   "bytes": 5898240,
+   "sha256": "ab6256b3a844247f47889a19d74a0e99c020fcda55ba5a12064c6a40135fc53d",
+   "shape": [
+    90,
+    4,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l1-attn-out.f32": {
+   "bytes": 1474560,
+   "sha256": "86bb81d33789380be5366e2493ad5bc45e1f7b83b65214a6f016be96f1a40d2a",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l1-attn_hc-collapsed.f32": {
+   "bytes": 1474560,
+   "sha256": "186d4908a334971ba419639b87a24c5fb52b1c6145d82fb5d631e8640948ccb8",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l1-attn_hc-comb.f32": {
+   "bytes": 5760,
+   "sha256": "dd7838ceb23c8508d16e62db5d7552e3603130cadd75a9349fc6bac0a8d4df8d",
+   "shape": [
+    90,
+    4,
+    4
+   ],
+   "dtype": "f32"
+  },
+  "l1-attn_hc-in.f32": {
+   "bytes": 5898240,
+   "sha256": "ab6256b3a844247f47889a19d74a0e99c020fcda55ba5a12064c6a40135fc53d",
+   "shape": [
+    90,
+    4,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l1-attn_hc-post.f32": {
+   "bytes": 1440,
+   "sha256": "3c967048379d000bf28c9f5c628d7aac2ac47a1fcf172be74e24edcd3a2c6e85",
+   "shape": [
+    90,
+    4
+   ],
+   "dtype": "f32"
+  },
+  "l1-ffn-out.f32": {
+   "bytes": 1474560,
+   "sha256": "af19867edd920079db20d68bf7d178d40852053656285b3110f37a08cfc8e34f",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l1-ffn_hc-collapsed.f32": {
+   "bytes": 1474560,
+   "sha256": "fadb3e4779c45c0bde8b1655c26eee8b101eb3474da318839056aaef4754482b",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l1-ffn_hc-comb.f32": {
+   "bytes": 5760,
+   "sha256": "5c38a611adf7591f5ad648957f044a25c60af9fa493e9938060553e965d8c397",
+   "shape": [
+    90,
+    4,
+    4
+   ],
+   "dtype": "f32"
+  },
+  "l1-ffn_hc-in.f32": {
+   "bytes": 5898240,
+   "sha256": "edd99ef74af0fe1bdbd95e9be0f137611bb2875a084c42bc9e8606e5431339b3",
+   "shape": [
+    90,
+    4,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l1-ffn_hc-post.f32": {
+   "bytes": 1440,
+   "sha256": "058a9b8224aed95cd078aa85a70e1e314ed8f88d2817a59cbaecbe4cb0a162c8",
+   "shape": [
+    90,
+    4
+   ],
+   "dtype": "f32"
+  },
+  "l1-output.f32": {
+   "bytes": 5898240,
+   "sha256": "9e4ec619b6e8f047100ad790beeb0f39d9713b4799e19533406b3a4d63cf774f",
+   "shape": [
+    90,
+    4,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l2-attn-out.f32": {
+   "bytes": 1474560,
+   "sha256": "747215473cd35e73880cc5c126df0b33e8fcd26121adb4697ae7ef20b66f8f35",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l2-attn_hc-collapsed.f32": {
+   "bytes": 1474560,
+   "sha256": "607d4f41d5b41d6f0c5debf7959b17457327c1b1fbfbad7a2e0222cece26b24b",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l2-attn_hc-comb.f32": {
+   "bytes": 5760,
+   "sha256": "e72e8c7502e2feff9fb4fd2f86882de4e83703b25416b3f64f437edbfbd6b1ca",
+   "shape": [
+    90,
+    4,
+    4
+   ],
+   "dtype": "f32"
+  },
+  "l2-attn_hc-in.f32": {
+   "bytes": 5898240,
+   "sha256": "9e4ec619b6e8f047100ad790beeb0f39d9713b4799e19533406b3a4d63cf774f",
+   "shape": [
+    90,
+    4,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l2-attn_hc-post.f32": {
+   "bytes": 1440,
+   "sha256": "da1f045968f89ad837fecc8d0cbb24690945cbd669499ce62088f56e56ca04c4",
+   "shape": [
+    90,
+    4
+   ],
+   "dtype": "f32"
+  },
+  "l2-ffn-out.f32": {
+   "bytes": 1474560,
+   "sha256": "c1758c1d4e24dfff1b9c5c9dca7e0e499c36d7921517e5283fc443a89088b0f3",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l2-ffn_hc-collapsed.f32": {
+   "bytes": 1474560,
+   "sha256": "d2a3a8895f410642b788744fe428ed14f0c29ca52c19c2bd01acb4c7d4639140",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l2-ffn_hc-comb.f32": {
+   "bytes": 5760,
+   "sha256": "70ecb6feeecdb11785ef0db1b2cbde67615cdfb74d0e90cb95a217421f42afd9",
+   "shape": [
+    90,
+    4,
+    4
+   ],
+   "dtype": "f32"
+  },
+  "l2-ffn_hc-in.f32": {
+   "bytes": 5898240,
+   "sha256": "c788b56c7e7aedd3392743603a4071ac2b5e9604a82d880bcedd279991d500de",
+   "shape": [
+    90,
+    4,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l2-ffn_hc-post.f32": {
+   "bytes": 1440,
+   "sha256": "82733cb36295f82f0af85bb1c7bca79884a7e0e39ceb38f8294cfb12e5898cab",
+   "shape": [
+    90,
+    4
+   ],
+   "dtype": "f32"
+  },
+  "l2-output.f32": {
+   "bytes": 5898240,
+   "sha256": "00d01f7888ad05ef037ad0a3ee49ff930753256a1c271c917c92365e42930dd1",
+   "shape": [
+    90,
+    4,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l3-attn-out.f32": {
+   "bytes": 1474560,
+   "sha256": "c801b9cd1afbb0563eaad350dc6df41bb5f05f44f1ce65b0658df5e262a498a9",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l3-attn_hc-collapsed.f32": {
+   "bytes": 1474560,
+   "sha256": "89ed36d5707faed5d9e107f535420d7e97a6a29529c1e476848e1041e3dd5382",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l3-attn_hc-comb.f32": {
+   "bytes": 5760,
+   "sha256": "f778d47f0669170eaa110b59b7708adfe704a4531551e270bd2a884c1710a692",
+   "shape": [
+    90,
+    4,
+    4
+   ],
+   "dtype": "f32"
+  },
+  "l3-attn_hc-in.f32": {
+   "bytes": 5898240,
+   "sha256": "00d01f7888ad05ef037ad0a3ee49ff930753256a1c271c917c92365e42930dd1",
+   "shape": [
+    90,
+    4,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l3-attn_hc-post.f32": {
+   "bytes": 1440,
+   "sha256": "4c6f776259d3c36f322f9ff4c3b54f77483f0ab8e8325d556e76dacd95c30fe2",
+   "shape": [
+    90,
+    4
+   ],
+   "dtype": "f32"
+  },
+  "l3-dsa-topk.i32": {
+   "bytes": 738360,
+   "sha256": "b6e739b31463ade0f74782a087ad36a372ad4292f180bfeb5afc2f8bfe5b334d",
+   "shape": [
+    90,
+    2051
+   ],
+   "dtype": "i32"
+  },
+  "l3-ffn-out.f32": {
+   "bytes": 1474560,
+   "sha256": "e57d72074b7f7974dc545c45cb5e01238d2764fd45dc3225a0a65576cd588515",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l3-ffn_hc-collapsed.f32": {
+   "bytes": 1474560,
+   "sha256": "5dfe2276e766a7a40afec5d7bb7e42d05725153b4fa8827726b000c6da9c4413",
+   "shape": [
+    90,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l3-ffn_hc-comb.f32": {
+   "bytes": 5760,
+   "sha256": "73739bcdc5da0aa6768923a39793bc3706aa6fa07fb55a2556c8bba9c291e136",
+   "shape": [
+    90,
+    4,
+    4
+   ],
+   "dtype": "f32"
+  },
+  "l3-ffn_hc-in.f32": {
+   "bytes": 5898240,
+   "sha256": "1eaa3adf55be98af0df145c7e062750c27e5a58a7acb271bafdce833d39ae7a6",
+   "shape": [
+    90,
+    4,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l3-ffn_hc-post.f32": {
+   "bytes": 1440,
+   "sha256": "d140e86da8466785e3453111f20620233ac5622dc50167ecd80046203d03bd18",
+   "shape": [
+    90,
+    4
+   ],
+   "dtype": "f32"
+  },
+  "l3-output.f32": {
+   "bytes": 5898240,
+   "sha256": "0c89daa8a0e99ac6982db02f8d7f3ebee914ba262fa1e061ddb8ed5f671878e6",
+   "shape": [
+    90,
+    4,
+    4096
+   ],
+   "dtype": "f32"
+  },
+  "l3-routing-ids.i32": {
+   "bytes": 2880,
+   "sha256": "c44e2920215df917ad0c54616d1da705fff714140147b3415397694c73290507",
+   "shape": [
+    90,
+    8
+   ],
+   "dtype": "i32"
+  },
+  "l3-routing-weights.f32": {
+   "bytes": 2880,
+   "sha256": "a392cedecd0594673cdb4f72575c33f950bbc20cf2fcdb60c2d354296a2237f6",
+   "shape": [
+    90,
+    8
+   ],
+   "dtype": "f32"
+  }
+ },
+ "identical_to_fp8_goldens": [
+  "embed.f32",
+  "l0-attn_hc-collapsed.f32",
+  "l0-attn_hc-comb.f32",
+  "l0-attn_hc-in.f32",
+  "l0-attn_hc-post.f32"
+ ],
+ "consistency": {
+  "max_abs_post_y_plus_combT_x_minus_expanded": 1.1108001163329106e-07,
+  "l0_attn_hc_in_is_embed_broadcast": true,
+  "l1_3_attn_hc_in_is_previous_output": [
+   true,
+   true,
+   true
+  ]
+ },
+ "quantisation_error_vs_fp8": {
+  "reported_not_gated": "PREREG G3 robustness: reported separately",
+  "a": "C:/Users/robin/dev/crow-nest/models/GLM-5.3-Flash-step06/ref-fp8",
+  "b": "C:/Users/robin/dev/crow-nest/models/GLM-5.3-Flash-step06/ref-mul1",
+  "method": "oracle/glm5_compare.py ref-fp8 ref-mul1: each run's own chain (layer k of B reads B's layer k-1), l<k>-output.f32 over all 4 streams x 90 rows x 4096, f64",
+  "layers": [
+   {
+    "layer": 0,
+    "kind": "kda+dense",
+    "cosine": 0.9930756624972842,
+    "max_abs": 0.006975824944674969,
+    "max_abs_prompt": 0.006975824944674969,
+    "max_abs_decode": 0.005247823894023895,
+    "rel_rms": 0.11776405595131127,
+    "ref_rms": 0.005864060207854257,
+    "a_sha256": "3db55f30c8e65f0f04d151f1ddc33a09a06542043104bb8bddc43dcc7d11936d",
+    "b_sha256": "ab6256b3a844247f47889a19d74a0e99c020fcda55ba5a12064c6a40135fc53d"
+   },
+   {
+    "layer": 1,
+    "kind": "kda+dense",
+    "cosine": 0.9940233219706053,
+    "max_abs": 0.006048822775483131,
+    "max_abs_prompt": 0.006048822775483131,
+    "max_abs_decode": 0.004546390846371651,
+    "rel_rms": 0.11038151709362189,
+    "ref_rms": 0.0053982552919940325,
+    "a_sha256": "bb4ea09f895611e57795eca183b181bf72e0b756c660df5d7714317566f3afc1",
+    "b_sha256": "9e4ec619b6e8f047100ad790beeb0f39d9713b4799e19533406b3a4d63cf774f"
+   },
+   {
+    "layer": 2,
+    "kind": "kda+dense",
+    "cosine": 0.9980587439338161,
+    "max_abs": 0.023318558931350708,
+    "max_abs_prompt": 0.023318558931350708,
+    "max_abs_decode": 0.016230370849370956,
+    "rel_rms": 0.06441698784741795,
+    "ref_rms": 0.030760177824445196,
+    "a_sha256": "4a8c30b0d24348fe938209e4f6b966d2f02e51ae5d0e56a61258f7f5c0d6ea2f",
+    "b_sha256": "00d01f7888ad05ef037ad0a3ee49ff930753256a1c271c917c92365e42930dd1"
+   },
+   {
+    "layer": 3,
+    "kind": "dsa+moe",
+    "cosine": 0.9977661267392776,
+    "max_abs": 0.1775752305984497,
+    "max_abs_prompt": 0.1775752305984497,
+    "max_abs_decode": 0.044449955224990845,
+    "rel_rms": 0.07592879278297197,
+    "ref_rms": 0.0682517337864452,
+    "a_sha256": "960c649dcc15e48d858045d2cb47d3d280635c377da857780cab7da8bd153925",
+    "b_sha256": "0c89daa8a0e99ac6982db02f8d7f3ebee914ba262fa1e061ddb8ed5f671878e6",
+    "routing_overlap_mean": 0.9097222222222222,
+    "routing_overlap_min": 0.625,
+    "routing_rows_identical": 39,
+    "routing_rows": 90,
+    "dsa_rows_identical": 90,
+    "dsa_rows": 90
+   }
+  ]
+ },
+ "not_verified": [
+  "G3 (engine vs these goldens): decode glmgolden needs the GPU (robin's go), not run",
+  "MUL1 decode against exllamav3's own get_weight_tensor on a real record: exllamav3 needs CUDA here; the transform is checked against a matrix-product reference (converter test) and the real records against the FP8 originals (cosine 0.987-0.991 per projection, 18 projections)",
+  "converter dequant computes W in f64 with one f32 rounding; exllamav3's get_weight_tensor rounds to fp16 between steps and the engine's MUL1 GEMV never forms W: the three differ by f32/fp16 rounding",
+  "the sub-block captures on real weights against HF's full model (proven on the synthetic config only)",
+  "pre is not captured: HF's Glm5NextTextHyperConnection does not return it",
+  "the ids are the step-6 fixed sequence, not PREREG anchors (G3 anchors not fixed)"
+ ]
+}
