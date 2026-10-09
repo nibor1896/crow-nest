@@ -54,13 +54,38 @@ files, their sha256 and the FP8 identity in `<work>/calibration.json`; the store
 
 | item | value |
 |---|---|
-| experts | 42 MoE layers (3-44, section `text`) + the MTP block (45, section `mtp`, optional to load) = 43 x 288 = 12,384 records; the rest of the MTP block stays omitted as in `cnq4.5-glm5-next` |
+| experts | 42 MoE layers (3-44, section `text`) + the MTP block (45, section `mtp`, optional to load) = 43 x 288 = 12,384 records; the rest of the MTP block stays omitted as in `cnq4.5-glm5-next` and comes from the MTP overlay (below) |
 | record | 9,474,048 B = 2313 x 4096: `[gate.trellis][up.trellis][down.trellis][gate.suh][gate.svh][up.suh][up.svh][down.suh][down.svh]`, trellis 3,145,728 B each (`converter/src/mul1.rs`) |
 | order | the dense part first (the 4.5 recipe's units, same bytes), then the records, each on a 4096-B file offset |
 | index entries | dtype `mul1`; gate at the record start, up at + 3,145,728, down at + 6,291,456 (`RecordLayout::tensor_offsets`); `len` 3,145,728 / 3,145,728 / 3,182,592, so "next offset - gate offset" is the record (`engine/src/nvme_source.rs:196`); `mul1: {k, record_offset, record_bytes}` |
 | index top level | `recipe` stays `cnq4.5-glm5-next` (the dense rule); new `expert_codec`: dtype, K, hidden, inter, trellis and record bytes, records, layout, the store's sha256, quantizer and calibration |
 | size | non-expert part 7,250,323,716 B + 12,384 x 9,474,048 B = 124.58 GB = 116.0 GiB (derived from `converter plan` 2026-10-08) |
 | decode | `converter dequant` and so the oracle's `--weights container` decode `mul1` to the original-basis weight `diag(suh) H W_hat H diag(svh) / 128` in f64, one f32 rounding (#156, 2026-10-09; `converter/README.md`) |
+
+## MTP overlay
+
+The block's other 25 tensors (attention, indexer, router, shared expert, `eh_proj`, the norms) are a
+second, small CNQ1 file beside the container, written by the same conversion path (crow-nest #182,
+2026-10-09):
+
+| item | value |
+|---|---|
+| command | `converter --scales mse --source-repo zai-org/GLM-5.3-Flash --mtp-overlay models/GLM-5.3-Flash-original converter/GLM-5.3-Flash-MTP-overlay.cnq` (revision from `hf-revision.json`; 4 s) |
+| reads | the shard headers and the 25 tensors (+ 7 block scales) of layer 45 from shards 1 and 2 only: 0.2 GB |
+| codecs | `recipe::mtp_overlay_decision`: the trunk's DSA + MoE row (`glm5_layer_row`) in section `mtp`: NVFP4 q_a / q_b / kv_a / kv_b / o_proj and the shared expert (8), BF16 norms, indexer and router (15), F32 `e_score_correction_bias` (1); `eh_proj` BF16 (no trunk twin; D10) |
+| index | v2 with the base's `model` block (config, revision), `partial` = layer 45, `mtp_overlay` block (counts; experts "not in this file") |
+| file | 164,771,937 B, payload 164,674,176 B (= `glm5_mtp::overlay_bytes` 164,674,208 B less 8 global-scale words), sha256 `191d5e182f91aae053e544eb91080990fcf956f103eaecc398e8beb326da962a`; sidecar `converter/GLM-5.3-Flash-MTP-overlay.cnq.sidecar.jsonl` (section `mtp` NVFP4 MSE ratio 0.7696 vs ceil) |
+| engine | `glm5_mtp::load_mtp(base, overlay)`: `mtp_overlay_check` (exactly the 25, planned dtype and shape, section `mtp`, same family / repo / revision / recipe / `config.json`, the 288 records in the base) before any read; then the trunk loader's takes |
+
+Why a separate file: the #77 overlay (`Cnq::attach_overlay`, `CROW_CNQ_OVERLAY`) only shadows tensors the
+base already holds and refuses any other name; appending a section to the 124.6 GB container needs a
+rebuild. A plain index v2 container opens with the unchanged `Cnq::open`.
+
+Against the oracle golden `ref-mul1-mtp` (FP8 originals for these 25 tensors), RTX 5090, layer 45 + lm_head
+only (4.19 GB read, 20 s): eh cosine 1.000000 on 89 rows; head norm cosine mean 0.98395, min 0.96957;
+routing overlap 0.926 (39 / 89 identical sets); DSA selection 89 / 89 identical; draft top-1 = golden draft
+on 79 / 89; draft = trunk's next token on 57 / 89 (golden 55 / 89). Thresholds fixed before the run: eh
+>= 0.9999, head norm mean >= 0.98 and min >= 0.90, draft = golden on >= 75 % (`glm5_mtp_block_on_the_overlay_matches_the_oracle_golden`).
 
 ## Disk
 
@@ -117,7 +142,7 @@ converter/target/release/converter.exe --scales mse --source-repo zai-org/GLM-5.
 ## Tests
 
 ```
-cd converter && cargo test --release                                   # 100 passed, 1 ignored (2026-10-09)
+cd converter && cargo test --release                                   # 103 passed, 1 ignored (2026-10-09, MTP overlay)
 python -I tools/test_glm_mul1_quantize.py                              # pure: 10 passed, 4 skipped
 .venv-oracle/Scripts/python.exe -I tools/test_glm_mul1_quantize.py     # + capture vs HF: 12 passed, 2 skipped
 .venv-exl3/Scripts/python.exe -I tools/test_glm_mul1_quantize.py       # + quantize on the GPU and the converter: 12 passed, 2 skipped
@@ -127,6 +152,9 @@ python -I tools/test_glm_mul1_quantize.py                              # pure: 1
   and alignment, index entries under the engine's rule, dense part identical to `cnq4.5-glm5-next`,
   kill-and-resume byte identity at six points, `--mul1-wait` (also started before `store.json` exists), `--layers 3`, and the refusals (missing
   record, sha256 mismatch, other shapes / record size / K, wrong dtype, `--consume`, disk).
+- MTP overlay: the overlay row on all 25 real layer-45 tensors against their layer-7 twins, and
+  `--mtp-overlay` on the miniature (exactly the block's non-expert tensors, NVFP4 bytes = the row's
+  quantization, BF16 / F32 = source bytes, refusals of `--layers` and `--experts-mul1`).
 - Tool: capture equals HF's full model's MoE input and routing on every row of the runner's synthetic
   small checkpoint; quantize writes exllamav3's tensors, resumes without duplicates, uses the identity
   Hessian for layer 45, and the built converter accepts its store.

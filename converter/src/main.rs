@@ -663,7 +663,7 @@ fn quantize_nvfp4_cap(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], us
     (out, global, stats, sse_ceil)
 }
 
-const HELP: &str = "usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>] <model-dir | file.safetensors> <out.cnq>\n  writes an index v2 container: config.json + generation_config.json verbatim, the family's recipe, source repo/revision/shard sha256\n  (--revision defaults to the Hugging Face cache in the model dir; Crow #300 C6)\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n  --scales diag --diag-stats <f.json>  all 126 ue4m3 steps scored by the activation-weighted error (Crow #300 p2-lh)\n  --headers <dir>  read the shard headers from a header cache (<dir>/<shard>.json) (crow-nest #154)\n  --consume <shard-dir>  convert while shards come and go: wait for <shard>.verified, write <shard>.done, never delete; needs --headers (crow-nest #155)\n  an interrupted conversion resumes from <out>.cnq.journal.jsonl (crow-nest #155)\n  --layers <spec> [--with-embed-head]  a partial container: text layers <spec> only (0-3, 0,3) [+ token embedding, lm_head, final norm]; the rest is filtered and the index says so (crow-nest #156)\n  --experts-mul1 <store> [--mul1-wait] [--disk-reserve-gib N]  GLM-5.3-Flash: the routed experts (MTP layer 45 incl.) as MUL1 K=3 trellis records from a tools/glm_mul1_quantize.py store, after the dense part; --mul1-wait waits for store.json and for records still being quantized; refused when free disk < bytes to write + N GiB (default 16) (crow-nest #182)\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dequant <container.cnq> (<name>[:<r0>:<r1>] ... | --names -)\n  writes the named tensors (rows r0..r1) to stdout as f32 little endian, decoded as gate 0 decodes them (crow-nest #156);
+const HELP: &str = "usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>] <model-dir | file.safetensors> <out.cnq>\n  writes an index v2 container: config.json + generation_config.json verbatim, the family's recipe, source repo/revision/shard sha256\n  (--revision defaults to the Hugging Face cache in the model dir; Crow #300 C6)\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n  --scales diag --diag-stats <f.json>  all 126 ue4m3 steps scored by the activation-weighted error (Crow #300 p2-lh)\n  --headers <dir>  read the shard headers from a header cache (<dir>/<shard>.json) (crow-nest #154)\n  --consume <shard-dir>  convert while shards come and go: wait for <shard>.verified, write <shard>.done, never delete; needs --headers (crow-nest #155)\n  an interrupted conversion resumes from <out>.cnq.journal.jsonl (crow-nest #155)\n  --layers <spec> [--with-embed-head]  a partial container: text layers <spec> only (0-3, 0,3) [+ token embedding, lm_head, final norm]; the rest is filtered and the index says so (crow-nest #156)\n  --experts-mul1 <store> [--mul1-wait] [--disk-reserve-gib N]  GLM-5.3-Flash: the routed experts (MTP layer 45 incl.) as MUL1 K=3 trellis records from a tools/glm_mul1_quantize.py store, after the dense part; --mul1-wait waits for store.json and for records still being quantized; refused when free disk < bytes to write + N GiB (default 16) (crow-nest #182)\n  --mtp-overlay  GLM-5.3-Flash: only the MTP block's (layer 45) non-expert tensors, section mtp, with the trunk's DSA + MoE codecs (eh_proj BF16): the overlay glm5_mtp::load_mtp opens beside the 3-bit container (crow-nest #182)\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dequant <container.cnq> (<name>[:<r0>:<r1>] ... | --names -)\n  writes the named tensors (rows r0..r1) to stdout as f32 little endian, decoded as gate 0 decodes them (crow-nest #156);
   MUL1 K=3 expert records as their original-basis weight diag(suh) H W_hat H diag(svh) / 128 (#181 decoder, f64, one f32 rounding)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter layer-rule-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) --arm attn-v-out|ffn-down-rule|ffn-down-all\n  builds a bf16 overlay container for one llama.cpp-shaped layer-rule arm (#91 phase 1)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)\n       converter plan [--headers <dir>] [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  the dry run: family, recipe, per-tensor dtype/section table, GPU / host byte totals (Crow #300 C6)";
 
 /// `converter imatrix-show <imatrix.gguf> [tensor ...]` — #79. Read-only: the kv block, the
@@ -846,6 +846,7 @@ fn main() {
             "--with-embed-head" => with_embed_head = true,
             "--experts-mul1" => opts.mul1 = argv.next().map(std::path::PathBuf::from),
             "--mul1-wait" => opts.mul1_wait = true,
+            "--mtp-overlay" => opts.mtp_overlay = true,
             "--disk-reserve-gib" => match argv.next().and_then(|v| v.parse::<u64>().ok()) {
                 Some(g) => opts.disk_reserve = g << 30,
                 None => {
@@ -967,14 +968,18 @@ fn build_manifest(input: &std::path::Path) -> Result<Manifest, String> {
 }
 
 fn build_manifest_from(input: &std::path::Path, headers: Option<&std::path::Path>) -> Result<Manifest, String> {
-    build_manifest_with(input, headers, false)
+    build_manifest_with(input, headers, false, false)
 }
 
 /// `mul1` (#182, `--experts-mul1`): every GLM routed-expert weight gets
 /// [`recipe::mul1_expert_decision`], and the MTP block's routed experts (layer 45, with their
 /// block scales) stay in the manifest instead of being omitted; the rest of the MTP block is
 /// omitted as before. Without it the manifest is the one of record.
-fn build_manifest_with(input: &std::path::Path, headers: Option<&std::path::Path>, mul1: bool) -> Result<Manifest, String> {
+///
+/// `mtp` (#182, `--mtp-overlay`): the MTP block's non-expert tensors (layer 45, with their block
+/// scales) stay in the manifest with [`recipe::mtp_overlay_decision`] (section `mtp`); its routed
+/// experts stay omitted (they are the 3-bit container's MUL1 records).
+fn build_manifest_with(input: &std::path::Path, headers: Option<&std::path::Path>, mul1: bool, mtp: bool) -> Result<Manifest, String> {
     let single_file = input.is_file();
     let model_dir = if single_file { input.parent().map(|p| p.to_path_buf()).unwrap_or_default() } else { input.to_path_buf() };
     let model_dir = if model_dir.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { model_dir };
@@ -1034,7 +1039,11 @@ fn build_manifest_with(input: &std::path::Path, headers: Option<&std::path::Path
                 let end = info["data_offsets"][1].as_u64().unwrap();
                 assert_eq!(end - begin, (n * es) as u64, "{name}: length mismatch");
                 let mul1_expert = mul1 && family == recipe::Family::Glm5Next && recipe::glm_expert(name.strip_suffix("_scale_inv").unwrap_or(name)).is_some();
-                if let Some(why) = recipe::omitted(family, name).filter(|_| !mul1_expert) {
+                // #182: a non-expert tensor of the MTP block (or its block scale) in an MTP overlay
+                let mtp_rest = mtp
+                    && family == recipe::Family::Glm5Next
+                    && recipe::mtp_overlay_decision(name.strip_suffix("_scale_inv").unwrap_or(name), &shape, dt).is_some();
+                if let Some(why) = recipe::omitted(family, name).filter(|_| !mul1_expert && !mtp_rest) {
                     let e = omitted.entry(why).or_default();
                     e.0 += 1;
                     e.1 += end - begin;
@@ -1050,6 +1059,7 @@ fn build_manifest_with(input: &std::path::Path, headers: Option<&std::path::Path
                 }
                 let decided = match recipe::mul1_expert_decision(name).filter(|_| mul1_expert) {
                     Some(d) => Ok(d),
+                    None if mtp_rest => recipe::mtp_overlay_decision(name, &shape, dt).expect("an MTP-block tensor"),
                     None => recipe::decide(family, name, &shape, dt),
                 };
                 let decision = match decided {
@@ -1104,8 +1114,10 @@ fn build_manifest_with(input: &std::path::Path, headers: Option<&std::path::Path
     }
     tensors.sort_by(|a, b| a.shard.cmp(&b.shard).then(a.data_begin.cmp(&b.data_begin)));
     let geo = recipe::derive_geo(family, &config);
-    // #182: the MTP block's experts (decision section `mtp`) are no text layer of the config
-    let named: Vec<(String, Vec<usize>)> = tensors.iter().filter(|t| !mul1 || t.decision.section != "mtp").map(|t| (t.name.clone(), t.shape.clone())).collect();
+    // #182: the MTP block's experts and, in an MTP overlay, its other tensors (decision section
+    // `mtp`) are no text layer of the config
+    let named: Vec<(String, Vec<usize>)> =
+        tensors.iter().filter(|t| !(mul1 || mtp) || t.decision.section != recipe::MTP_SECTION).map(|t| (t.name.clone(), t.shape.clone())).collect();
     recipe::check_geo_against_tensors(&geo, &named)?;
     Ok(Manifest {
         family,
@@ -1484,6 +1496,9 @@ struct ConvertOpts {
     disk_reserve: u64,
     /// tests only: the free bytes the disk check sees
     disk_free: Option<u64>,
+    /// #182: `--mtp-overlay`: write only the MTP block's non-expert tensors (section `mtp`), the
+    /// overlay the engine's `glm5_mtp::load_mtp` opens beside the 3-bit container
+    mtp_overlay: bool,
 }
 
 /// #182: the default `--disk-reserve-gib` of a MUL1 conversion.
@@ -1501,6 +1516,7 @@ impl Default for ConvertOpts {
             mul1_wait: false,
             disk_reserve: MUL1_DISK_RESERVE,
             disk_free: None,
+            mtp_overlay: false,
         }
     }
 }
@@ -1784,7 +1800,11 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
     let t_start = std::time::Instant::now();
 
     // ---- manifest: scan headers only (fast), collect every tensor's location ----
-    let mut m = match build_manifest_with(input, opts.headers.as_deref(), opts.mul1.is_some()) {
+    if opts.mtp_overlay && (opts.mul1.is_some() || opts.consume.is_some() || opts.filter.is_some()) {
+        eprintln!("conversion refused: --mtp-overlay writes the MTP block's non-expert tensors only; it takes no --experts-mul1 (the block's experts are the container's records), --consume or --layers\n{HELP}");
+        return 2;
+    }
+    let mut m = match build_manifest_with(input, opts.headers.as_deref(), opts.mul1.is_some(), opts.mtp_overlay) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("conversion refused: {e}");
@@ -1795,7 +1815,17 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
     // every tensor (recipe whitelist, FP8 pairing, geometry); what the filter drops is named
     // as filtered, weight and block scale, never as missing ----
     let mut filtered: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Some(f) = &opts.filter {
+    // #182: an MTP overlay is the partial container of layer 45 (whose experts the manifest omits)
+    let mtp_filter = match opts.mtp_overlay {
+        true if m.family != recipe::Family::Glm5Next => {
+            eprintln!("conversion refused: --mtp-overlay is GLM-5.3-Flash's (glm5_next), this checkpoint is {}", m.family.name());
+            return 2;
+        }
+        true => Some(partial::LayerFilter::parse(&recipe::GLM5_NEXT_TEXT_LAYERS.to_string(), false).expect("the MTP layer")),
+        false => None,
+    };
+    let filter = opts.filter.as_ref().or(mtp_filter.as_ref());
+    if let Some(f) = filter {
         let before = m.tensors.len();
         for t in m.tensors.iter().filter(|t| !f.keeps(&t.name)) {
             filtered.insert(t.name.clone());
@@ -1893,8 +1923,11 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
         "journal": "crow-nest converter", "version": 1, "recipe": m.family.recipe(), "scales": scales_mode_str,
         "tensors": order.len(), "order_sha256": plan_sha,
     });
-    if let Some(f) = &opts.filter {
+    if let Some(f) = filter {
         head["partial"] = serde_json::Value::from(f.describe());
+    }
+    if opts.mtp_overlay {
+        head["mtp_overlay"] = serde_json::Value::from(true);
     }
     if let Some(s) = &mul1 {
         head["experts"] = serde_json::json!({ "codec": mul1::DTYPE, "k": mul1_store::K, "record_bytes": s.layout.size, "store_sha256": s.head_sha256 });
@@ -2140,7 +2173,7 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
             eprintln!("coverage check FAILED: {missing} tensors missing");
             return 3;
         }
-        match &opts.filter {
+        match filter {
             None => eprintln!("coverage check: all {} weight_map tensors present ({omitted} omitted by the {} recipe)", wm.len(), m.family.recipe()),
             Some(f) => eprintln!(
                 "coverage check (PARTIAL container, {}): {} of {} weight_map tensors present, {n_filtered} filtered by the flags, {omitted} omitted by the {} recipe, 0 missing",
@@ -2153,8 +2186,11 @@ fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: Scale
     }
 
     let mut index = index_v2(&model, scales_mode_str, blob_start, index_tensors);
-    if let Some(f) = &opts.filter {
+    if let Some(f) = filter {
         index["partial"] = f.index_block(tensors.len(), filtered.len());
+    }
+    if opts.mtp_overlay {
+        index["mtp_overlay"] = mtp_overlay_block(&m);
     }
     if let Some(s) = &mul1 {
         index["expert_codec"] = mul1_index_block(s, &m, &units);
@@ -2194,6 +2230,23 @@ expected under --scales mse, see the MSE report"
         }
     }
     0
+}
+
+/// #182: the `mtp_overlay` block of an MTP overlay's index: which layer, the tensors it holds, and
+/// where the block's routed experts are (not here: the 3-bit container's section `mtp`).
+fn mtp_overlay_block(m: &Manifest) -> serde_json::Value {
+    let ts: Vec<&TensorEntry> = m.tensors.iter().filter(|t| t.decision.section == recipe::MTP_SECTION).collect();
+    let count = |d: recipe::DtypeOut| ts.iter().filter(|t| t.decision.dtype == d).count();
+    serde_json::json!({
+        "layer": recipe::GLM5_NEXT_TEXT_LAYERS,
+        "section": recipe::MTP_SECTION,
+        "tensors": ts.len(),
+        "nvfp4": count(recipe::DtypeOut::Nvfp4),
+        "bf16": count(recipe::DtypeOut::Bf16),
+        "f32": count(recipe::DtypeOut::F32),
+        "experts": "not in this file: the base container's MUL1 records of section mtp (--experts-mul1)",
+        "issue": "crow-nest #182",
+    })
 }
 
 /// #182: a write unit of MUL1 expert projections (one record).
@@ -2848,6 +2901,28 @@ mod tests {
     /// The miniature; `mtp_expert` (#182) adds gate and down of the MTP block's expert 0 to shard
     /// 1, so layer 45 holds one whole routed expert (the miniature of record has its up only).
     fn write_glm_synth_with(dir: &std::path::Path, shard_dir: &std::path::Path, mtp_expert: bool) {
+        write_glm_synth_full(dir, shard_dir, mtp_expert, false)
+    }
+
+    /// The non-expert tensors of the miniature's MTP block (#182 overlay), one per row of the
+    /// overlay recipe: (name below `layers.45.`, source dtype, shape, the dtype the overlay writes).
+    const MINI_MTP_REST: [(&str, &str, &[usize], &str); 11] = [
+        ("eh_proj.weight", "BF16", &[128, 256], "bf16"),
+        ("enorm.weight", "BF16", &[128], "bf16"),
+        ("hnorm.weight", "BF16", &[128], "bf16"),
+        ("shared_head.norm.weight", "BF16", &[128], "bf16"),
+        ("self_attn.q_a_proj.weight", "F8_E4M3", &[192, 200], "nvfp4"),
+        ("self_attn.kv_b_proj.weight", "BF16", &[128, 64], "nvfp4"),
+        ("self_attn.o_proj.weight", "F8_E4M3", &[128, 128], "nvfp4"),
+        ("self_attn.indexer.wk.weight", "BF16", &[64, 128], "bf16"),
+        ("mlp.gate.weight", "BF16", &[2, 128], "bf16"),
+        ("mlp.gate.e_score_correction_bias", "F32", &[2], "f32"),
+        ("mlp.shared_experts.down_proj.weight", "F8_E4M3", &[128, 256], "nvfp4"),
+    ];
+
+    /// The miniature; `mtp_rest` (#182) adds [`MINI_MTP_REST`] to shard 1, the MTP block's
+    /// non-expert tensors (the miniature of record has none: the 4.5 row omits them anyway).
+    fn write_glm_synth_full(dir: &std::path::Path, shard_dir: &std::path::Path, mtp_expert: bool, mtp_rest: bool) {
         std::fs::create_dir_all(dir.join("headers")).unwrap();
         std::fs::create_dir_all(shard_dir).unwrap();
         let l = |n: &str| format!("model.language_model.layers.{n}");
@@ -2862,6 +2937,17 @@ mod tests {
             s1.extend([w, s]);
             let (w, s) = fp8_pair(&l("45.mlp.experts.0.down_proj.weight"), &[128, 256], 15);
             s1.extend([w, s]);
+        }
+        if mtp_rest {
+            for (k, (n, dt, shape, _)) in MINI_MTP_REST.iter().enumerate() {
+                let name = l(&format!("45.{n}"));
+                if *dt == "F8_E4M3" {
+                    let (w, s) = fp8_pair(&name, shape, 300 + k as u32);
+                    s1.extend([w, s]);
+                } else {
+                    s1.push(synth_tensor(&name, dt, shape, 300 + k as u32));
+                }
+            }
         }
         let mut s2 = vec![
             synth_tensor(&l("0.input_layernorm.weight"), "BF16", &[128], 4),
@@ -3906,6 +3992,73 @@ mod tests {
                 assert_eq!((12 + t["offset"].as_u64().unwrap()) % 4096, 0);
             }
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #182: `--mtp-overlay` on the miniature writes exactly the MTP block's non-expert tensors, in
+    /// section `mtp`, each with the overlay row's codec: NVFP4 = the quantization of its (FP8-
+    /// dequantized) source under the glm5 scale cap, BF16 / F32 = the source bytes; no routed expert
+    /// (the container's records), no trunk tensor, no scale. The index is a v2 with the `partial`
+    /// block of layer 45 and the `mtp_overlay` block. The conversion of record of the same miniature
+    /// still omits all of layer 45, and the flag refuses --layers and --experts-mul1.
+    #[test]
+    fn an_mtp_overlay_writes_the_mtp_blocks_non_expert_tensors_only() {
+        let dir = tmp("mtp-overlay");
+        write_glm_synth_full(&dir, &dir, true, true);
+        let out = dir.join("glm-mtp.cnq");
+        let opts = ConvertOpts { mtp_overlay: true, ..ConvertOpts::default() };
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &opts), 0);
+        let bytes = std::fs::read(&out).unwrap();
+        let idx = trailer(&bytes);
+        assert_eq!((idx["format_version"].as_u64(), idx["recipe"].as_str()), (Some(2), Some("cnq4.5-glm5-next")));
+        assert_eq!(idx["model"]["source"]["revision"], "glm-synth");
+        assert_eq!(idx["partial"]["layers"], serde_json::json!([45]));
+        let ob = &idx["mtp_overlay"];
+        assert_eq!((ob["layer"].as_u64(), ob["section"].as_str(), ob["tensors"].as_u64()), (Some(45), Some("mtp"), Some(11)));
+        assert_eq!((ob["nvfp4"].as_u64(), ob["bf16"].as_u64(), ob["f32"].as_u64()), (Some(4), Some(6), Some(1)));
+        let ts = entries(&idx);
+        let mut names: Vec<String> = ts.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        names.sort();
+        let mut want: Vec<String> = MINI_MTP_REST.iter().map(|r| format!("model.language_model.layers.45.{}", r.0)).collect();
+        want.sort();
+        assert_eq!(names, want, "exactly the block's non-expert tensors");
+        let (hdr, start) = read_safetensors_header(&dir.join(GLM_SHARDS[0])).unwrap();
+        let src = std::fs::read(dir.join(GLM_SHARDS[0])).unwrap();
+        let at = |k: &str| {
+            let o = &hdr[k]["data_offsets"];
+            &src[(start + o[0].as_u64().unwrap()) as usize..(start + o[1].as_u64().unwrap()) as usize]
+        };
+        for (n, dt, shape, out_dt) in MINI_MTP_REST {
+            let name = format!("model.language_model.layers.45.{n}");
+            let t = ts.iter().find(|t| t["name"] == name.as_str()).unwrap();
+            assert_eq!((t["section"].as_str(), t["dtype"].as_str()), (Some("mtp"), Some(out_dt)), "{name}");
+            let body = body_of(&bytes, t);
+            if out_dt == "nvfp4" {
+                let vals = if dt == "F8_E4M3" {
+                    let sc = fp8::scales_to_f32(at(&format!("{name}_scale_inv")), "F32").unwrap();
+                    fp8::dequant_fp8_block(&name, at(&name), shape[0], shape[1], &sc).unwrap()
+                } else {
+                    bytes_to_f32(at(&name), dt)
+                };
+                let (blocks, global, _, _) = quantize_nvfp4_cap(&vals, ScalesMode::Mse, None, recipe::Family::Glm5Next.scale_byte_max());
+                assert!(body == blocks, "{name}: not the overlay row's NVFP4");
+                assert_eq!(t["global_scale"].as_f64().unwrap() as f32, global, "{name}");
+            } else {
+                assert!(body == at(&name), "{name}: not the source bytes");
+            }
+        }
+        // the conversion of record of the same miniature: layer 45 stays omitted whole
+        let rec = dir.join("glm.cnq");
+        assert_eq!(convert_with(&dir, &rec, ScalesMode::Mse, &glm_prov(), None, &ConvertOpts::default()), 0);
+        let ri = trailer(&std::fs::read(&rec).unwrap());
+        assert!(entries(&ri).iter().all(|t| !t["name"].as_str().unwrap().contains("layers.45.")));
+        // refusals: the overlay sets its own filter and takes no expert store
+        let o2 = dir.join("glm-mtp2.cnq");
+        let with_layers = ConvertOpts { mtp_overlay: true, filter: Some(partial::LayerFilter::parse("3", false).unwrap()), ..ConvertOpts::default() };
+        assert_eq!(convert_with(&dir, &o2, ScalesMode::Mse, &glm_prov(), None, &with_layers), 2);
+        let with_mul1 = ConvertOpts { mtp_overlay: true, ..mul1_opts(&dir.join("store")) };
+        assert_eq!(convert_with(&dir, &o2, ScalesMode::Mse, &glm_prov(), None, &with_mul1), 2);
+        assert!(!o2.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

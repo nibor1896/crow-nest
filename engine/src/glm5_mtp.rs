@@ -21,17 +21,19 @@
 //! What this module adds besides the order: the fused `mtp_eh_norm` kernel (zero-at-position-0 +
 //! two RMSNorms + concat, vLLM's `fused_eh_norm`), the residual add, the pairing rule
 //! ([`pair_rows`]), the tensor plan of layer 45 ([`mtp_tensors`]: which tensors the 3-bit container
-//! holds - only the 288 MUL1 experts - and what an overlay would cost), and the record loader of the
-//! container's `mtp` section ([`load_mtp_records`]). Nothing in the engine calls it yet: the decode
+//! holds - only the 288 MUL1 experts - and what an overlay would cost), the record loader of the
+//! container's `mtp` section ([`load_mtp_records`]), and the whole block from the container plus
+//! the MTP overlay of `converter --mtp-overlay` ([`load_mtp`], checked by [`mtp_overlay_check`];
+//! [`MtpBlock::call`] runs the NVFP4 projections). Nothing in the engine calls it yet: the decode
 //! loop's speculative step (`gen.rs` `spec_step`, Flash-Next/27B) and a glm5 caller are the lead's
 //! wiring; `docs/glm5-mtp.md` "Integration" lists the hooks.
 
-use crate::cnq::Cnq;
+use crate::cnq::{Cnq, ModelBlock, TensorInfo};
 use crate::cuda;
 use crate::geo::Glm5Geo;
 use crate::glm5_mla::{MlaCache, MlaDims, MlaProj, MlaScratch, MlaWeights, RMS_EPS};
 use crate::glm5_model::{expert_names, Glm5Kernels};
-use crate::glm5_moe::{GpuMoePlan, GpuMoeWeights, MoeGeo};
+use crate::glm5_moe::{GpuFfnWeights, GpuMoePlan, GpuMoeWeights, GpuNvfp4, MoeGeo};
 use crate::kernels::launch_v;
 use cudarc::driver::sys::{CUdeviceptr, CUfunction};
 
@@ -347,6 +349,250 @@ pub unsafe fn load_mtp_records(cnq: &mut Cnq, g: &Glm5Geo, moe: &MoeGeo) -> (Dev
     (records, cuda::to_u64_dev(&bases))
 }
 
+// ---------------------------------------------------------------- the MTP overlay
+
+/// the index dtype of an overlay tensor stored as `s` (the converter's `--mtp-overlay` row)
+pub fn overlay_dtype(s: Store) -> &'static str {
+    match s {
+        Store::Bf16 => "bf16",
+        Store::F32 => "f32",
+        Store::Nvfp4 => "nvfp4",
+        Store::Mul1 => "mul1",
+    }
+}
+
+/// #182: whether an MTP overlay (`converter --mtp-overlay`, `docs/glm-mul1-conversion.md` "MTP
+/// overlay") belongs to this base container, before a byte of either is read. The overlay holds
+/// exactly the block's 25 non-expert tensors of [`mtp_tensors`], in section `mtp`, each with its
+/// planned dtype and shape; the base holds the block's 288 MUL1 records (section `mtp`); both were
+/// converted from the same checkpoint (family, source repo and revision, `config.json` byte for
+/// byte). `Err` names every misfit.
+pub fn mtp_overlay_check(
+    g: &Glm5Geo,
+    base: &[TensorInfo],
+    base_model: Option<&ModelBlock>,
+    ov: &[TensorInfo],
+    ov_model: Option<&ModelBlock>,
+) -> Result<(), String> {
+    let mut bad = Vec::new();
+    match (base_model, ov_model) {
+        (Some(b), Some(o)) => {
+            for (what, x, y) in [
+                ("family", &b.family, &o.family),
+                ("source repo", &b.source_repo, &o.source_repo),
+                ("source revision", &b.source_revision, &o.source_revision),
+                ("recipe", &b.recipe, &o.recipe),
+            ] {
+                if x != y {
+                    bad.push(format!("{what}: `{y}` in the overlay, `{x}` in the base container"));
+                }
+            }
+            if b.config_json != o.config_json {
+                bad.push("config.json differs between the overlay and the base container".into());
+            }
+        }
+        _ => bad.push("both files must carry an index v2 `model` block (the converter of #300 C6 writes one)".into()),
+    }
+    let p = mtp_prefix(g);
+    let plan = mtp_tensors(g);
+    let mut want = 0;
+    for t in plan.iter().filter(|t| t.store != Store::Mul1) {
+        want += 1;
+        let name = format!("{p}{}", t.name);
+        match ov.iter().find(|o| o.name == name) {
+            None => bad.push(format!("{name}: not in the overlay")),
+            Some(o) => {
+                let shape: Vec<u64> = t.shape.iter().map(|&v| v as u64).collect();
+                if (o.section.as_str(), o.dtype.as_str(), &o.shape) != (MTP_SECTION, overlay_dtype(t.store), &shape) {
+                    bad.push(format!("{name}: [{}] {} {:?} in the overlay, the plan says [{MTP_SECTION}] {} {shape:?}", o.section, o.dtype, o.shape, overlay_dtype(t.store)));
+                }
+            }
+        }
+    }
+    if ov.len() != want {
+        let extra: Vec<&str> = ov.iter().filter(|o| !plan.iter().any(|t| t.store != Store::Mul1 && format!("{p}{}", t.name) == o.name)).map(|o| o.name.as_str()).collect();
+        bad.push(format!("the overlay holds {} tensors, the block has {want} non-expert ones (not of the block: {extra:?})", ov.len()));
+    }
+    let l = mtp_layer(g);
+    let records = (0..g.experts).filter(|&e| base.iter().any(|b| b.name == expert_names(l, e)[0] && b.section == MTP_SECTION && b.dtype == "mul1")).count();
+    if records != g.experts {
+        bad.push(format!("the base container holds {records} of the block's {} MUL1 records (section {MTP_SECTION}; converter --experts-mul1)", g.experts));
+    }
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("refusing the MTP overlay (#182): {} misfit(s)\n  {}", bad.len(), bad.join("\n  ")))
+    }
+}
+
+/// The whole MTP block on the device: [`MtpWeights`] (vectors, eh_proj, the BF16 indexer and
+/// `kv_b`, router, shared expert, the 288 records) and the four NVFP4 MLA projections the codec
+/// hook ([`MtpBlock::call`]) runs on `gemv_fp4_b`, as the trunk's `glm5_model::MlaLayer` does.
+pub struct MtpBlock {
+    /// `attn.q_a`, `attn.q_b`, `attn.kv_a`, `attn.o_proj` are 0: the hook runs them
+    pub w: MtpWeights,
+    pub q_a: GpuNvfp4,
+    pub q_b: GpuNvfp4,
+    pub kv_a: GpuNvfp4,
+    pub o: GpuNvfp4,
+    /// device i32 `[4]`: the `cols` of q_a, q_b, kv_a, o (the GEMV reads its k from the device)
+    cols: Dev,
+    /// bytes uploaded; scale bytes 0x7F rewritten; `kv_b` values BF16 does not hold exactly
+    pub bytes: u64,
+    pub sanitized: u64,
+    pub kv_b_inexact: u64,
+}
+
+/// the overlay reads of [`load_mtp`], every tensor checked by [`mtp_overlay_check`] first
+struct OvLoader<'a> {
+    cnq: &'a mut Cnq,
+    prefix: String,
+    bytes: u64,
+    sanitized: u64,
+}
+
+impl OvLoader<'_> {
+    fn raw(&mut self, n: &str) -> (TensorInfo, Vec<u8>) {
+        let t = self.cnq.find(&format!("{}{n}", self.prefix), MTP_SECTION).clone();
+        let raw = self.cnq.read_bytes(&t);
+        (t, raw)
+    }
+    fn f32_host(&mut self, n: &str) -> Vec<f32> {
+        let (t, raw) = self.raw(n);
+        match t.dtype.as_str() {
+            "f32" => crate::cnq::f32_bytes_to_f32(&raw),
+            _ => crate::cnq::bf16_bytes_to_f32(&raw),
+        }
+    }
+    unsafe fn f32(&mut self, n: &str) -> Dev {
+        let v = self.f32_host(n);
+        self.bytes += v.len() as u64 * 4;
+        cuda::to_f32_dev(&v)
+    }
+    unsafe fn bf16(&mut self, n: &str) -> Dev {
+        let (_, raw) = self.raw(n);
+        self.bytes += raw.len() as u64;
+        cuda::upload_dev(&raw)
+    }
+    fn fp4_host(&mut self, n: &str) -> (TensorInfo, Vec<u8>) {
+        let (t, mut raw) = self.raw(n);
+        self.sanitized += crate::residency::sanitize_sf_slab(&mut raw);
+        (t, raw)
+    }
+    unsafe fn fp4(&mut self, n: &str) -> GpuNvfp4 {
+        let (t, raw) = self.fp4_host(n);
+        self.bytes += raw.len() as u64 + 4;
+        GpuNvfp4 { w: cuda::upload_dev(&raw), gs: cuda::to_f32_dev(&[t.global_scale]), rows: t.shape[0] as usize, cols: t.shape[1..].iter().product::<u64>() as usize }
+    }
+}
+
+/// #182: the whole MTP block from the 3-bit container (`base`: the 288 MUL1 records of section
+/// `mtp`) and the MTP overlay (`overlay`: the 25 other tensors, `converter --mtp-overlay`), after
+/// [`mtp_overlay_check`]. Takes as the trunk's DSA + MoE loader does (`glm5_model::load_layer`):
+/// norms widened to f32, BF16 matrices as stored, `kv_b` NVFP4 decoded once to BF16, the indexer's
+/// `wk | index_kpool_compress_gate | weights_proj` stacked, NVFP4 scale bytes 0x7F -> 0x7E (#177).
+///
+/// # Safety
+/// A CUDA context is current.
+pub unsafe fn load_mtp(base: &mut Cnq, overlay: &mut Cnq, g: &Glm5Geo, moe: &MoeGeo) -> Result<MtpBlock, String> {
+    mtp_overlay_check(g, &base.tensors, base.model(), &overlay.tensors, overlay.model())?;
+    let mut ld = OvLoader { cnq: overlay, prefix: mtp_prefix(g), bytes: 0, sanitized: 0 };
+    let mut idx_x = ld.raw("self_attn.indexer.wk.weight").1;
+    idx_x.extend(ld.raw("self_attn.indexer.index_kpool_compress_gate").1);
+    idx_x.extend(ld.raw("self_attn.indexer.weights_proj.weight").1);
+    ld.bytes += idx_x.len() as u64;
+    let (kvb_t, kvb_raw) = ld.fp4_host("self_attn.kv_b_proj.weight");
+    let (kv_b, kv_b_inexact) = crate::glm5_model::nvfp4_to_bf16(&kvb_raw, kvb_t.global_scale, kvb_t.n_values as usize);
+    ld.bytes += kv_b.len() as u64 * 2;
+    let attn = MlaWeights {
+        q_a: 0,
+        q_a_norm: ld.f32("self_attn.q_a_layernorm.weight"),
+        q_b: 0,
+        kv_a: 0,
+        kv_a_norm: ld.f32("self_attn.kv_a_layernorm.weight"),
+        kv_b: cuda::to_dev(&kv_b),
+        o_proj: 0,
+        idx_wq_b: ld.bf16("self_attn.indexer.wq_b.weight"),
+        idx_x: cuda::upload_dev(&idx_x),
+        idx_k_norm_w: ld.f32("self_attn.indexer.k_norm.weight"),
+        idx_k_norm_b: ld.f32("self_attn.indexer.k_norm.bias"),
+        idx_ape: ld.f32("self_attn.indexer.index_kpool_compress_ape"),
+    };
+    let moe_w = GpuMoeWeights {
+        router: ld.bf16("mlp.gate.weight"),
+        bias: ld.f32("mlp.gate.e_score_correction_bias"),
+        shared: GpuFfnWeights {
+            gate: ld.fp4("mlp.shared_experts.gate_proj.weight"),
+            up: ld.fp4("mlp.shared_experts.up_proj.weight"),
+            down: ld.fp4("mlp.shared_experts.down_proj.weight"),
+        },
+    };
+    let (q_a, q_b, kv_a, o) = (ld.fp4("self_attn.q_a_proj.weight"), ld.fp4("self_attn.q_b_proj.weight"), ld.fp4("self_attn.kv_a_proj_with_mqa.weight"), ld.fp4("self_attn.o_proj.weight"));
+    let (enorm, hnorm, eh_proj) = (ld.f32("enorm.weight"), ld.f32("hnorm.weight"), ld.bf16("eh_proj.weight"));
+    let (input_norm, post_norm, head_norm) = (ld.f32("input_layernorm.weight"), ld.f32("post_attention_layernorm.weight"), ld.f32("shared_head.norm.weight"));
+    let (bytes, sanitized) = (ld.bytes, ld.sanitized);
+    let (records, table) = load_mtp_records(base, g, moe);
+    let i = |v: usize| i32::try_from(v).expect("glm5_mtp: GEMV k beyond i32");
+    let cols = cuda::to_i32_dev(&[i(q_a.cols), i(q_b.cols), i(kv_a.cols), i(o.cols)]);
+    Ok(MtpBlock {
+        w: MtpWeights { enorm, hnorm, eh_proj, input_norm, post_norm, head_norm, attn, moe: moe_w, records, table },
+        q_a,
+        q_b,
+        kv_a,
+        o,
+        cols,
+        bytes: bytes + g.experts as u64 * moe.record.bytes,
+        sanitized,
+        kv_b_inexact,
+    })
+}
+
+impl MtpBlock {
+    /// One [`MtpPass::call`] with the block's NVFP4 projections on `gemv_fp4_b` (the trunk's MLA
+    /// codec hook, `glm5_model` `fp4_gemv`); `taps` as [`MtpPass::call_tapped`].
+    ///
+    /// # Safety
+    /// As [`MtpPass::call`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn call(&self, pass: &mut MtpPass, kn: &Glm5Kernels, mk: &MtpKernels, e: Dev, h: Dev, pos0: usize, t: usize, zero_pos0: bool, taps: Option<&mut MtpTaps>) {
+        let gemv = kn.k.f("gemv_fp4_b");
+        let mut proj = |s: &MlaScratch, p: MlaProj, xi: Dev, yo: Dev| {
+            let (m, k) = match p {
+                MlaProj::QA => (&self.q_a, 0u64),
+                MlaProj::QB => (&self.q_b, 1),
+                MlaProj::KVA => (&self.kv_a, 2),
+                MlaProj::O => (&self.o, 3),
+            };
+            launch_v(gemv, m.rows as u32, s.t() as u32, 1, 256, &[m.w, xi, m.gs, yo, self.cols + 4 * k]);
+        };
+        pass.call_tapped(kn, mk, &self.w, e, h, pos0, t, zero_pos0, Some(&mut proj), taps);
+    }
+
+    /// # Safety
+    /// No launch reading these weights is pending.
+    pub unsafe fn free(&mut self) {
+        self.w.free();
+        for m in [&mut self.q_a, &mut self.q_b, &mut self.kv_a, &mut self.o] {
+            cuda::free_dev(&mut m.w);
+            cuda::free_dev(&mut m.gs);
+        }
+        cuda::free_dev(&mut self.cols);
+    }
+}
+
+/// The block's intermediate rows of tapped calls, appended per call (`[rows][H]` each): the
+/// oracle golden's `mtp-eh`, `mtp-attn-out`, `mtp-ffn-in`, `mtp-ffn-out`, `mtp-out`, and the DSA
+/// selection per row (ascending positions).
+#[derive(Default)]
+pub struct MtpTaps {
+    pub eh: Vec<f32>,
+    pub attn_out: Vec<f32>,
+    pub ffn_in: Vec<f32>,
+    pub ffn_out: Vec<f32>,
+    pub out: Vec<f32>,
+    pub selection: Vec<Vec<usize>>,
+}
+
 /// The block's per-sequence state and scratch: its own MLA latent + indexer cache (one more DSA
 /// layer, `docs/glm5-next-recipe.md` section 13) and the buffers of one call of up to `max_t` rows.
 pub struct MtpPass {
@@ -415,21 +661,62 @@ impl MtpPass {
         zero_pos0: bool,
         proj: Option<&mut dyn FnMut(&MlaScratch, MlaProj, Dev, Dev)>,
     ) {
+        self.call_tapped(kn, mk, w, e, h, pos0, t, zero_pos0, proj, None);
+    }
+
+    /// [`MtpPass::call`], and with `taps` the call's intermediate rows appended to them (each tap
+    /// synchronizes; `None` queues exactly what `call` queues).
+    ///
+    /// # Safety
+    /// As [`MtpPass::call`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn call_tapped(
+        &mut self,
+        kn: &Glm5Kernels,
+        mk: &MtpKernels,
+        w: &MtpWeights,
+        e: Dev,
+        h: Dev,
+        pos0: usize,
+        t: usize,
+        zero_pos0: bool,
+        proj: Option<&mut dyn FnMut(&MlaScratch, MlaProj, Dev, Dev)>,
+        mut taps: Option<&mut MtpTaps>,
+    ) {
         assert!((1..=self.max_t).contains(&t) && pos0 + t <= self.cap, "glm5_mtp: call rows {pos0}..{} (max_t {}, cap {})", pos0 + t, self.max_t, self.cap);
         let hd = self.g.hidden;
         let bytes = t * hd * 4;
+        let tap = |taps: &mut Option<&mut MtpTaps>, pick: fn(&mut MtpTaps) -> &mut Vec<f32>, src: Dev| {
+            if let Some(tp) = taps.as_deref_mut() {
+                cuda::sync();
+                pick(tp).extend(cuda::dtoh(src, t * hd));
+            }
+        };
         cuda::to_i32_into(self.st, &[pos0 as i32, t as i32]);
         launch_v(mk.eh_norm, t as u32, 1, 1, 256, &[e, h, w.enorm, w.hnorm, self.eh, hd as u64, (self.g.rms_eps as f32).to_bits() as u64, zero_pos0 as u64, self.st]);
         self.mla_sc.begin(pos0, t);
         self.mla_sc.linear(&kn.mla, w.eh_proj, 2 * hd, hd, self.eh, 2 * hd, self.x, hd);
+        tap(&mut taps, |tp| &mut tp.eh, self.x);
         cuda::d2d_async(self.xn, self.x, bytes);
         kn.mla.rmsnorm_rows(self.xn, w.input_norm, hd, t, self.st);
         match proj {
             Some(p) => self.mla_sc.forward_with(&kn.mla, &w.attn, &self.mla_c, self.xn, self.sub, pos0, t, p),
             None => self.mla_sc.forward(&kn.mla, &w.attn, &self.mla_c, self.xn, self.sub, pos0, t),
         }
+        tap(&mut taps, |tp| &mut tp.attn_out, self.sub);
+        if let Some(tp) = taps.as_deref_mut() {
+            let sw = MlaDims::of(&self.g).sel_max();
+            let n = cuda::dtoh_i32(self.mla_sc.sel_n, t);
+            let s = cuda::dtoh_i32(self.mla_sc.sel, t * sw);
+            for r in 0..t {
+                let mut v: Vec<usize> = s[r * sw..r * sw + n[r] as usize].iter().map(|&x| x as usize).collect();
+                v.sort_unstable();
+                tp.selection.push(v);
+            }
+        }
         let n = (t * hd) as u64;
         launch_v(mk.add, n.div_ceil(256) as u32, 1, 1, 256, &[self.sub, self.x, n]);
+        tap(&mut taps, |tp| &mut tp.ffn_in, self.x);
         cuda::d2d_async(self.xn, self.x, bytes);
         kn.mla.rmsnorm_rows(self.xn, w.post_norm, hd, t, self.st);
         if !self.moe_plans.iter().any(|p| p.tokens == t) {
@@ -438,7 +725,9 @@ impl MtpPass {
         let p = self.moe_plans.iter().find(|p| p.tokens == t).unwrap();
         p.run(&kn.k, &kn.mul1, &kn.moe, &w.moe, w.table, self.xn, self.sub);
         self.last_t = t;
+        tap(&mut taps, |tp| &mut tp.ffn_out, self.sub);
         launch_v(mk.add, n.div_ceil(256) as u32, 1, 1, 256, &[self.sub, self.x, n]);
+        tap(&mut taps, |tp| &mut tp.out, self.x);
         cuda::d2d_async(self.normed, self.x, bytes);
         kn.mla.rmsnorm_rows(self.normed, w.head_norm, hd, t, self.st);
     }
@@ -541,6 +830,95 @@ mod tests {
         // e first: eh_proj picks the e half with its first H columns
         let w: Vec<u16> = [1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0].iter().map(|&x| crate::glm5_model::f32_to_bf16_rne(x)).collect();
         assert_eq!(eh_proj_ref(&w, &v), vec![v[0]]);
+    }
+
+    fn ti(name: String, section: &str, dtype: &str, shape: Vec<u64>) -> TensorInfo {
+        TensorInfo { name, section: section.into(), dtype: dtype.into(), offset: 0, n_values: shape.iter().product(), global_scale: 1.0, shape, overlay: false }
+    }
+
+    fn model_block(rev: &str) -> ModelBlock {
+        ModelBlock {
+            family: "Glm5Next".into(),
+            model_type: "glm5_next_text".into(),
+            recipe: "cnq4.5-glm5-next".into(),
+            config_json: "{\"text_config\": {}}".into(),
+            generation_config_json: "{}".into(),
+            source_repo: "zai-org/GLM-5.3-Flash".into(),
+            source_revision: rev.into(),
+            geo: serde_json::Value::Null,
+            shards: serde_json::Value::Null,
+        }
+    }
+
+    /// (base index, overlay index) as the 3-bit container and `converter --mtp-overlay` write them
+    fn base_and_overlay() -> (Vec<TensorInfo>, Vec<TensorInfo>) {
+        let p = mtp_prefix(&G);
+        let mut base = vec![ti("lm_head.weight".into(), "text", "bf16", vec![154880, 4096])];
+        let mut ov = Vec::new();
+        for t in mtp_tensors(&G) {
+            let shape: Vec<u64> = t.shape.iter().map(|&v| v as u64).collect();
+            match t.store {
+                Store::Mul1 => base.push(ti(format!("{p}{}", t.name), MTP_SECTION, "mul1", shape)),
+                s => ov.push(ti(format!("{p}{}", t.name), MTP_SECTION, overlay_dtype(s), shape)),
+            }
+        }
+        (base, ov)
+    }
+
+    /// #182: the overlay of `converter --mtp-overlay` fits the 3-bit container; every way it can
+    /// not fit is refused by name before a byte is read.
+    #[test]
+    fn glm5_mtp_overlay_check_accepts_the_overlay_and_names_every_misfit() {
+        let (base, ov) = base_and_overlay();
+        let (mb, mo) = (model_block("eb9eb208"), model_block("eb9eb208"));
+        assert_eq!(ov.len(), 25);
+        assert_eq!(mtp_overlay_check(&G, &base, Some(&mb), &ov, Some(&mo)), Ok(()));
+        let refused = |base: &[TensorInfo], ov: &[TensorInfo], mo: &ModelBlock, want: &str| {
+            let e = mtp_overlay_check(&G, base, Some(&mb), ov, Some(mo)).unwrap_err();
+            assert!(e.contains(want), "{want:?} not in {e}");
+        };
+        // a tensor missing
+        let gone: Vec<TensorInfo> = ov.iter().filter(|t| !t.name.ends_with("eh_proj.weight")).cloned().collect();
+        refused(&base, &gone, &mo, "layers.45.eh_proj.weight: not in the overlay");
+        // another codec than the plan's (an all-BF16 overlay is not this loader's)
+        let mut bf = ov.clone();
+        bf.iter_mut().find(|t| t.name.ends_with("q_a_proj.weight")).unwrap().dtype = "bf16".into();
+        refused(&base, &bf, &mo, "q_a_proj.weight: [mtp] bf16");
+        // another section
+        let mut sec = ov.clone();
+        sec[0].section = "text".into();
+        refused(&base, &sec, &mo, "[text]");
+        // a tensor that is not the block's
+        let mut extra = ov.clone();
+        extra.push(ti("model.language_model.layers.44.input_layernorm.weight".into(), MTP_SECTION, "bf16", vec![4096]));
+        refused(&base, &extra, &mo, "layers.44.input_layernorm.weight");
+        // another checkpoint revision
+        refused(&base, &ov, &model_block("0000000"), "source revision: `0000000` in the overlay");
+        // a base without the block's records
+        let trunk_only: Vec<TensorInfo> = base.iter().filter(|t| t.section != MTP_SECTION).cloned().collect();
+        refused(&trunk_only, &ov, &mo, "0 of the block's 288 MUL1 records");
+        // no model block
+        assert!(mtp_overlay_check(&G, &base, Some(&mb), &ov, None).unwrap_err().contains("index v2"));
+    }
+
+    /// #182: the real overlay against the real 3-bit container's index (trailers only, nothing
+    /// mapped): `GLM5_CNQ=<GLM-5.3-Flash-MUL1K3.cnq> GLM5_MTP_OVERLAY=<GLM-5.3-Flash-MTP-overlay.cnq>`.
+    #[test]
+    #[ignore = "needs the 3-bit container and the overlay: GLM5_CNQ=.. GLM5_MTP_OVERLAY=.. cargo test --release --lib glm5_mtp_real_overlay -- --ignored --nocapture"]
+    fn glm5_mtp_real_overlay_fits_the_real_container() {
+        let peek = |k: &str| Cnq::peek_index(&std::env::var(k).unwrap_or_else(|_| panic!("{k}"))).unwrap_or_else(|e| panic!("{k}: {e}"));
+        let (b, o) = (peek("GLM5_CNQ"), peek("GLM5_MTP_OVERLAY"));
+        mtp_overlay_check(&G, &b.tensors, b.model(), &o.tensors, o.model()).unwrap_or_else(|e| panic!("{e}"));
+        // the container lacks exactly the 25 the overlay brings
+        let missing: Vec<String> = mtp_tensors(&G).into_iter().map(|t| format!("{}{}", mtp_prefix(&G), t.name)).filter(|n| !b.tensors.iter().any(|t| &t.name == n)).collect();
+        let mut have: Vec<String> = o.tensors.iter().map(|t| t.name.clone()).collect();
+        have.sort();
+        let mut miss = missing.clone();
+        miss.sort();
+        assert_eq!(have, miss);
+        let bytes: u64 = o.tensors.iter().map(Cnq::byte_len).sum::<u64>() + o.tensors.iter().filter(|t| t.dtype == "nvfp4").count() as u64 * 4;
+        assert_eq!(bytes, overlay_bytes(&G).0, "the overlay's bytes (+4 per NVFP4 global scale) are the plan's");
+        eprintln!("glm5_mtp overlay fits: {} tensors, {bytes} B incl. global scales", o.tensors.len());
     }
 
     #[test]
@@ -813,6 +1191,119 @@ mod tests_gpu {
             p2.free();
             w.free();
             for d in [&mut ed, &mut hdv] {
+                cuda::free_dev(d);
+            }
+        }
+    }
+
+    fn read_f32(p: &std::path::Path, n: usize) -> Vec<f32> {
+        let b = std::fs::read(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        assert_eq!(b.len(), n * 4, "{}", p.display());
+        b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    }
+
+    fn read_i32(p: &std::path::Path) -> Vec<i32> {
+        std::fs::read(p).unwrap_or_else(|e| panic!("{}: {e}", p.display())).chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect()
+    }
+
+    /// (min, mean) cosine per row of `a` against `b`, both `[rows][h]`
+    fn row_cos(a: &[f32], b: &[f32], h: usize) -> (f64, f64) {
+        let c: Vec<f64> = a.chunks_exact(h).zip(b.chunks_exact(h)).map(|(x, y)| cos(&x.iter().map(|&v| v as f64).collect::<Vec<_>>(), y)).collect();
+        (c.iter().copied().fold(f64::INFINITY, f64::min), c.iter().sum::<f64>() / c.len() as f64)
+    }
+
+    /// #182: the whole block on the 3-bit container + the MTP overlay ([`load_mtp`]: layer 45 and
+    /// the trunk's lm_head only, ~4 GB of reads) against the oracle golden `ref-mul1-mtp`, which
+    /// took the same 288 records but the 25 other tensors from the FP8 originals (dequantized to
+    /// f32). Same inputs (`mtp-embed`, `mtp-h`), same call plan (prompt rows in one call, decode
+    /// rows singly), SGLang pairing (`Pos0::Keep`). The overlay's NVFP4 attention and shared expert
+    /// are not the FP8 weights, so the rows are not bit-equal; the thresholds were fixed before the
+    /// first run (#182 implementation comment): the eh stage (BF16 weights on both sides) cosine
+    /// >= 0.9999 on every row; head-norm cosine mean >= 0.98 and min >= 0.90; draft top-1 equal
+    /// to the golden's draft on >= 75 % of the rows. Prints every stage, the routing and DSA overlap
+    /// and the draft-vs-trunk agreement (golden: 55 / 89).
+    #[test]
+    #[ignore = "needs the GPU, the golden, the container and the overlay: GLM5_MTP_GOLDEN=<ref-mul1-mtp> GLM5_CNQ=<MUL1K3.cnq> GLM5_MTP_OVERLAY=<MTP-overlay.cnq> cargo test --release --lib glm5_mtp_block_on_the_overlay -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mtp_block_on_the_overlay_matches_the_oracle_golden() {
+        let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k}"));
+        let gd = std::path::PathBuf::from(env("GLM5_MTP_GOLDEN"));
+        let man: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(gd.join("manifest.json")).unwrap()).unwrap();
+        let (rows, prompt) = (man["rows"].as_u64().unwrap() as usize, man["prompt_rows"].as_u64().unwrap() as usize);
+        assert_eq!((man["primary_variant"].as_str(), man["draft_steps"].as_u64(), man["prompt_chunk"].as_u64()), (Some("sglang"), Some(1), Some(0)));
+        let hd = G.hidden;
+        let rd = |f: &str| read_f32(&gd.join(f), rows * hd);
+        let (e, h) = (rd("mtp-embed.f32"), rd("mtp-h.f32"));
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let t0 = std::time::Instant::now();
+            let mut base = Cnq::open(&env("GLM5_CNQ"));
+            let mut ov = Cnq::open(&env("GLM5_MTP_OVERLAY"));
+            let moe = MoeGeo::new(&G, ExpertRecordSpec::new(ExpertCodec::Mul1, crate::cpu_mul1::GLM_RECORD_BYTES_K3 as u64).unwrap()).unwrap();
+            let mut blk = load_mtp(&mut base, &mut ov, &G, &moe).unwrap_or_else(|e| panic!("{e}"));
+            let mut rep = crate::glm5_model::LoadReport::default();
+            let mut head_w = crate::glm5_model::load_head(&mut base, &G, &mut rep);
+            eprintln!(
+                "glm5_mtp load: block {} B (scale bytes rewritten {}, kv_b inexact {}), lm_head + norm {} B, {:.1} s",
+                blk.bytes, blk.sanitized, blk.kv_b_inexact, rep.bytes, t0.elapsed().as_secs_f64()
+            );
+            let kn = Glm5Kernels::new(&G);
+            let mk = MtpKernels::new();
+            let mut head = crate::glm5_head::Head::new(crate::glm5_model::head_geo(&G));
+            let mut pass = MtpPass::new(&G, moe, prompt, rows + 8);
+            let (mut ed, mut hdv) = (cuda::to_f32_dev(&e), cuda::to_f32_dev(&h));
+            let v = G.vocab;
+            let mut logits = cuda::alloc_named("glm5 MTP test logits", prompt * v * 4);
+            let mut ids = cuda::alloc_named("glm5 MTP test ids", prompt * 4);
+            let mut taps = MtpTaps::default();
+            let (mut normed, mut top1, mut routing) = (Vec::new(), Vec::new(), Vec::new());
+            let calls: Vec<(usize, usize)> = std::iter::once((0, prompt)).chain((prompt..rows).map(|r| (r, 1))).collect();
+            for &(p0, t) in &calls {
+                let off = (p0 * hd * 4) as u64;
+                blk.call(&mut pass, &kn, &mk, ed + off, hdv + off, p0, t, false, Some(&mut taps));
+                head.lm_head(&kn.k, head_w.lm, pass.normed, logits, t);
+                head.argmax(&kn.k, logits, ids, t);
+                cuda::sync();
+                normed.extend(cuda::dtoh(pass.normed, t * hd));
+                top1.extend(cuda::dtoh_i32(ids, t));
+                let r = pass.routing();
+                routing.extend(r.ids.chunks(r.topk).map(|c| c.to_vec()));
+            }
+            let stage = |name: &str, got: &[f32], file: &str| -> (f64, f64) {
+                let (mn, mean) = row_cos(got, &rd(file), hd);
+                eprintln!("glm5_mtp {name:<10} vs {file:<18}: cosine min {mn:.6}, mean {mean:.6} ({rows} rows)");
+                (mn, mean)
+            };
+            let (eh_min, _) = stage("eh", &taps.eh, "mtp-eh.f32");
+            stage("attn_out", &taps.attn_out, "mtp-attn-out.f32");
+            stage("ffn_in", &taps.ffn_in, "mtp-ffn-in.f32");
+            stage("ffn_out", &taps.ffn_out, "mtp-ffn-out.f32");
+            stage("out", &taps.out, "mtp-out.f32");
+            let (hn_min, hn_mean) = stage("head_norm", &normed, "mtp-head-norm.f32");
+            let (ro, rsame) = crate::glm5_model::golden::routing_overlap(&routing, &read_i32(&gd.join("mtp-routing-ids.i32")), G.topk);
+            let gsel = read_i32(&gd.join("mtp-dsa-topk.i32"));
+            let (so, ssame) = crate::glm5_model::golden::dsa_overlap(&taps.selection, &gsel, gsel.len() / rows);
+            eprintln!("glm5_mtp routing overlap {ro:.4} ({rsame} / {rows} rows identical), DSA selection overlap {so:.4} ({ssame} / {rows} identical)");
+            let gdraft = read_i32(&gd.join("mtp-draft-top1.i32"));
+            let trunk = read_i32(&gd.join("trunk-next-top1.i32"));
+            let same_draft = (0..rows).filter(|&r| top1[r] == gdraft[r]).count();
+            let ours: Vec<u32> = top1.iter().map(|&x| x as u32).collect();
+            let theirs: Vec<u32> = trunk.iter().map(|&x| x as u32).collect();
+            let gold: Vec<u32> = gdraft.iter().map(|&x| x as u32).collect();
+            let (agree, n) = agreement(&ours, &theirs);
+            let (gagree, _) = agreement(&gold, &theirs);
+            let (pa, _) = agreement(&ours[..prompt], &theirs[..prompt]);
+            eprintln!(
+                "glm5_mtp draft top-1 = golden draft top-1 on {same_draft} / {rows}; draft = trunk's next on {agree} / {n} (prompt {pa} / {prompt}, decode {} / {}); golden {gagree} / {n}",
+                agree - pa,
+                rows - prompt
+            );
+            assert!(eh_min >= 0.9999, "eh stage: cosine min {eh_min}");
+            assert!(hn_mean >= 0.98 && hn_min >= 0.90, "head norm: cosine mean {hn_mean}, min {hn_min}");
+            assert!(same_draft * 4 >= rows * 3, "draft top-1 = golden's on {same_draft} / {rows}");
+            pass.free();
+            blk.free();
+            head.free();
+            for d in [&mut ed, &mut hdv, &mut logits, &mut ids, &mut head_w.norm, &mut head_w.lm] {
                 cuda::free_dev(d);
             }
         }
