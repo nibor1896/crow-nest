@@ -6991,7 +6991,8 @@ mod tests_glm5_kda_src {
         for n in super::glm5_kda::NAMES {
             assert!(names.iter().any(|m| m == n), "{n} missing from {names:?}");
         }
-        let def = format!("#define KDA_D {}\n", super::glm5_kda::HEAD_DIM);
-        assert!(super::GLM5_KDA_SRC.contains(&def), "KDA_D is not {}", super::glm5_kda::HEAD_DIM);
+        // line-ending agnostic: a Windows checkout with core.autocrlf carries CRLF
+        let def = format!("#define KDA_D {}", super::glm5_kda::HEAD_DIM);
+        assert!(super::GLM5_KDA_SRC.lines().any(|l| l.trim_end() == def), "KDA_D is not {}", super::glm5_kda::HEAD_DIM);
     }
 }
