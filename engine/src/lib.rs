@@ -100,6 +100,8 @@ pub mod toolcall;
 pub mod toolgrammar;
 // #160: GLM-5.3-Flash prompt side - family test, reasoning words, stop tokens, goldens
 pub mod glm5_template;
+// #165: GLM-5.3-Flash head - stream mean, final RMSNorm, lm_head (wired nowhere yet)
+pub mod glm5_head;
 // #86: the OpenAI stop-string filter of `bin/serve.rs`, the same tail-hold
 // `toolcall::find_marker` gives `<tool_call>`, on arbitrary strings
 pub mod stopstr;

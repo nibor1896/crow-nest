@@ -1,0 +1,133 @@
+{
+ "ticket": "crow-nest #165 (plan step 13e)",
+ "generator": "oracle/export_glm5_head_golden.py",
+ "torch": "2.13.0+cpu",
+ "transformers": "5.16.1",
+ "threads": 2,
+ "hidden": 4096,
+ "hc_mult": 4,
+ "vocab": 154880,
+ "rms_norm_eps": 1e-05,
+ "anchors": 4,
+ "rows": [
+  "plain: streams a_s * randn + b_s, a_s, b_s distinct per stream",
+  "large: row 0's character x 300 (the norm must not depend on the scale)",
+  "tiny: mean(m^2) ~ eps, so eps 1e-5 (vs 1e-6) and mean (vs sum) change the result",
+  "skewed: stream 3 x 40, streams 0-2 opposite in sign (the mean is no stream)"
+ ],
+ "seed_x": 20261009,
+ "seed_lm": 23396353,
+ "seed_norm": 23396354,
+ "lm_head": "((splitmix64(seed_lm, r*hidden+c) >> 56) - 128) * 2^-9",
+ "norm_weight": "0.5 + (splitmix64(seed_norm, d) >> 57) * 2^-7",
+ "hash_samples": [
+  {
+   "seed": 23396353,
+   "i": 0,
+   "u64": "2645971467600582332"
+  },
+  {
+   "seed": 23396353,
+   "i": 1,
+   "u64": "10213336223176494527"
+  },
+  {
+   "seed": 23396353,
+   "i": 4095,
+   "u64": "7865572141991862443"
+  },
+  {
+   "seed": 23396353,
+   "i": 4096,
+   "u64": "11006584277270978247"
+  },
+  {
+   "seed": 23396353,
+   "i": 123456789,
+   "u64": "6489248034079306046"
+  },
+  {
+   "seed": 23396353,
+   "i": 634388479,
+   "u64": "12331193230864548933"
+  }
+ ],
+ "lm_head_samples": [
+  {
+   "r": 0,
+   "c": 0,
+   "v": -0.1796875
+  },
+  {
+   "r": 0,
+   "c": 4095,
+   "v": -0.037109375
+  },
+  {
+   "r": 77,
+   "c": 1234,
+   "v": -0.03125
+  },
+  {
+   "r": 154879,
+   "c": 4095,
+   "v": 0.083984375
+  }
+ ],
+ "norm_weight_samples": [
+  {
+   "d": 0,
+   "v": 1.2734375
+  },
+  {
+   "d": 1,
+   "v": 0.6328125
+  },
+  {
+   "d": 2047,
+   "v": 1.03125
+  },
+  {
+   "d": 4095,
+   "v": 0.953125
+  }
+ ],
+ "top1": [
+  84996,
+  84996,
+  60481,
+  26077
+ ],
+ "golden_vs_f64_max_abs": {
+  "normed": 7.39435511487585e-07,
+  "logits": 1.9107980946841963e-05
+ },
+ "golden_vs_f64_min_cosine_logits": 0.999999999999944,
+ "files": {
+  "x.f32": {
+   "shape": [
+    4,
+    4,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "316758e3a09e9c0f277ec75e4807539bacad1a3b2909365251901a53068a5465"
+  },
+  "normed.f32": {
+   "shape": [
+    4,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "f3ed2000cce05c63f0a29e2b09d736d27075f2dd32916691b53fd7b1ba7f0bd8"
+  },
+  "logits.f32": {
+   "shape": [
+    4,
+    154880
+   ],
+   "dtype": "f32",
+   "sha256": "e207508a46b7e9c980c94b37f19a6347f421482c82af42150dc00421073b3438"
+  }
+ }
+}

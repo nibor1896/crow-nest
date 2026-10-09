@@ -6425,6 +6425,37 @@ pub mod mul1 {
     }
 }
 
+// ---------------- #165: glm5_next head kernel ----------------
+
+/// #165: the glm5_next stream mean + final RMSNorm (`kernels_glm5_head.cu`). Its own NVRTC
+/// module, the `MUL1_SRC` pattern (one more `.entry` in `KERNEL_SRC` would break the PTX of
+/// record, `tests_300_c4`); the host side and its tests are `crate::glm5_head`.
+pub const GLM5_HEAD_SRC: &str = include_str!("kernels_glm5_head.cu");
+
+/// #165: the loader of `GLM5_HEAD_SRC`
+pub mod glm5_head {
+    use crate::cuda;
+    use cudarc::driver::sys::CUfunction;
+
+    /// every entry of `GLM5_HEAD_SRC`
+    pub const NAMES: &[&str] = &["glm5_stream_mean_rms"];
+
+    /// the compiled module and its entry
+    pub struct Kernels {
+        pub module: cuda::Module,
+        pub stream_mean_rms: CUfunction,
+    }
+
+    impl Kernels {
+        /// # Safety
+        /// A CUDA context is current.
+        pub unsafe fn new() -> Kernels {
+            let module = cuda::compile(super::GLM5_HEAD_SRC);
+            Kernels { stream_mean_rms: module.get("glm5_stream_mean_rms"), module }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests_mul1_src {
     //! #180: `MUL1_SRC` compiles with the engine's option set to one PTX module carrying every
