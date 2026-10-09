@@ -1340,6 +1340,103 @@ impl Glm5Pass {
     }
 }
 
+// ---------------------------------------------------------------- CROW_GLM_MAX_BATCH: one row per sequence
+
+impl Glm5Pass {
+    /// `CROW_GLM_MAX_BATCH`: one layer over `t = pos.len()` decode rows of `t` DIFFERENT
+    /// sequences, row `r` at position `pos[r]` of its own sequence, `x` `[t][4][hidden]` updated
+    /// in place, each row's result bit for bit the one-row decode call's of its sequence
+    /// ([`Glm5Pass::call_with_experts`] with `t = 1`, `decode`). The launches are those of
+    /// [`Glm5Pass::call_verify_with_experts`]; only the recurrent state and the cache differ:
+    ///
+    /// - mHC, both norms, the dense FFN, the router, the routed and the shared experts and the
+    ///   combine run over all `t` rows (every row on its own, as in the verify call);
+    /// - the router ids of all rows reach `experts` in ONE hook call (`[t][topk]`), so the tiers
+    ///   stage the union of the rows' experts once;
+    /// - KDA: row `r` takes the decode step on `kda[r]`, its sequence's state of this layer;
+    /// - MLA: row `r` is a one-row call on `mla[r]`, its sequence's cache of this layer, at
+    ///   `pos[r]`.
+    ///
+    /// Any change to the launches of `call_inner` must be mirrored here, as in the verify call
+    /// (the GPU test `glm5_engine::tests_batch_gpu` compares the bits with the solo rows).
+    ///
+    /// # Safety
+    /// As [`Glm5Pass::call_with_experts`]; `t <= max_t`; a KDA layer gets `t` states, a DSA
+    /// layer `t` caches of this pass's capacity, every one of a different sequence.
+    pub unsafe fn call_slots_with_experts(&mut self, lw: &LayerW, x: Dev, pos: &[usize], kda: &[&KdaState], mla: &[&MlaCache], experts: &mut ExpertHook) -> Result<(), String> {
+        let t = pos.len();
+        assert!((1..=self.max_t).contains(&t), "glm5_model: {t} sequence rows (max_t {})", self.max_t);
+        assert!(pos.iter().all(|&p| p < self.cap), "glm5_model: sequence rows at {pos:?} (cap {})", self.cap);
+        let h = self.g.hidden;
+        let row = |b: Dev, r: usize| b + (r * h * 4) as u64;
+        self.mhc.coeffs(&self.kn.mhc, &lw.attn_hc, x, self.collapsed, t);
+        self.kn.mla.rmsnorm_rows(self.collapsed, lw.input_norm, h, t, self.st2);
+        match &lw.attn {
+            AttnW::Kda(a) => {
+                assert_eq!(kda.len(), t, "glm5_model: {t} sequence rows, {} KDA states", kda.len());
+                let (kn, ints) = (&self.kn, &self.ints);
+                let w = kn.kda.d.width();
+                let cc = kn.kda.d.conv_ch();
+                let mut proj = |p: KdaProj, xi: Dev, yo: Dev, tt: usize| match p {
+                    KdaProj::Qkv => {
+                        fp4_gemv(kn, ints, &a.q, xi, yo, tt, Some(cc));
+                        fp4_gemv(kn, ints, &a.k, xi, yo + (w * 4) as u64, tt, Some(cc));
+                        fp4_gemv(kn, ints, &a.v, xi, yo + (2 * w * 4) as u64, tt, Some(cc));
+                    }
+                    KdaProj::O => fp4_gemv(kn, ints, &a.o, xi, yo, tt, None),
+                };
+                for (r, st) in kda.iter().enumerate() {
+                    glm5_kda::step_with(&kn.kda, &a.w, st, &self.kda_sc, row(self.collapsed, r), row(self.sub, r), &mut proj);
+                }
+            }
+            AttnW::Mla(a) => {
+                assert_eq!(mla.len(), t, "glm5_model: {t} sequence rows, {} MLA caches", mla.len());
+                let (kn, ints) = (&self.kn, &self.ints);
+                let mut proj = |s: &MlaScratch, p: MlaProj, xi: Dev, yo: Dev| {
+                    let m = match p {
+                        MlaProj::QA => &a.q_a,
+                        MlaProj::QB => &a.q_b,
+                        MlaProj::KVA => &a.kv_a,
+                        MlaProj::O => &a.o,
+                    };
+                    fp4_gemv(kn, ints, m, xi, yo, s.t(), None);
+                };
+                for (r, c) in mla.iter().enumerate() {
+                    assert_eq!(c.cap, self.cap, "glm5_model: an MLA cache of {} tokens on a pass of {}", c.cap, self.cap);
+                    self.mla_sc.forward_with(&kn.mla, &a.w, c, row(self.collapsed, r), row(self.sub, r), pos[r], 1, &mut proj);
+                }
+            }
+        }
+        self.mhc.expand(&self.kn.mhc, x, self.sub, x, t);
+        self.mhc.coeffs(&self.kn.mhc, &lw.ffn_hc, x, self.collapsed, t);
+        self.kn.mla.rmsnorm_rows(self.collapsed, lw.post_norm, h, t, self.st2);
+        match &lw.ffn {
+            FfnW::Dense(w) => {
+                if !self.dense_plans.iter().any(|p| p.tokens == t) {
+                    self.dense_plans.push(GpuFfnPlan::new(h, self.g.dense_inter, t, self.g.swiglu_limit as f32));
+                }
+                let p = self.dense_plans.iter().find(|p| p.tokens == t).unwrap();
+                p.run(&self.kn.k, &self.kn.moe, w, self.collapsed, self.sub);
+            }
+            FfnW::Moe { w, .. } => {
+                if !self.moe_plans.iter().any(|p| p.tokens == t) {
+                    self.moe_plans.push(GpuMoePlan::new(&self.moe, t));
+                }
+                let p = self.moe_plans.iter().find(|p| p.tokens == t).unwrap();
+                p.route(&self.kn.k, &self.kn.moe, w, self.collapsed);
+                // `CROW_GLM_FLAGS` publishes one row's ids; more rows read theirs by a sync
+                let routed = if t == 1 { self.routed.as_mut() } else { None };
+                let ids = router_ids(routed, p.ids, t * self.moe.topk, lw.layer)?;
+                let tb = experts(lw.layer, &ids)?;
+                p.experts(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub);
+            }
+        }
+        self.last_ffn_t = t;
+        self.mhc.expand(&self.kn.mhc, x, self.sub, x, t);
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------- the golden harness's host side
 
 /// The host side of `decode glmgolden` (#161): the layerwise runner's manifest
