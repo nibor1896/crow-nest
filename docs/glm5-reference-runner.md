@@ -44,7 +44,7 @@ shows what each choice changes. Threads: `ORACLE_THREADS` (default 16).
     --weights fp8-originals models/GLM-5.3-Flash-original \
     --ids ids.json --decode 4 --out runs/glm53-flash/ref-<name> \
     [--layers 0:4] [--anchors 95,96,97,98,99] [--state-dtype f32|bf16] \
-    [--prompt-chunk 512] [--delete-states-behind]
+    [--prompt-chunk 512] [--delete-states-behind] [--capture-subblocks]
 
 # the CNQ container back end (crow-nest #156): weights as `converter dequant` decodes them;
 # a partial container (converter --layers 0-3 --with-embed-head) runs only the layers it holds
@@ -95,6 +95,11 @@ shows what each choice changes. Threads: `ORACLE_THREADS` (default 16).
   logits and the manifest stay.
 - `--anchors`: the rows that get logits. Default: the last prompt row and every decode row. Logits
   are written only when the run reaches the last layer.
+- `--capture-subblocks` (crow-nest #156): also writes each layer's mHC sub-block files (section 5),
+  recorded by forward hooks on HF's `attn_hc` / `ffn_hc` / `self_attn` / `mlp`. They are what the
+  `decode glmgolden` harness of #161 reads. The hooks only read: every other file stays byte-identical
+  (`test_captures_are_consistent_and_change_nothing`). Not with `--state-dtype bf16` or
+  `--delete-states-behind` (exit 2), because ffn's expanded output is the f32 `l<k>-output.f32`.
 - `--state-dtype bf16` writes the hand-over state in BF16 (16 KiB per token per layer instead of
   32 KiB). Every later layer then reads a rounded input, so that run is no f32 reference. It is
   meant for long routing runs (step 8). Every golden of record is f32.
@@ -265,6 +270,16 @@ holds `prompt_chunk`, `delete_states_behind` and `deleted_states`, and per layer
 | `l<k>-routing-weights.f32` | `[N][8]` | their weights in the same order: sigmoid scores normalized over the 8, × `routed_scaling_factor` (what the experts are scaled with) |
 | `l<k>-dsa-topk.i32` | `[N][W]` | DSA layers only: the indexer's selected token positions per row (whole pools in score order, then the incomplete tail pool), `-1` = empty, `W = index_topk + index_kpool - 1` (2051 on rev `eb9eb208`). The layout depends on the prompt split, the set does not (section 4) |
 | `logits-anchor-<p>.f32` | `[V]` | logits of row p (V = 154,880) |
+| `l<k>-<s>_hc-in.f32` | `[N][hc][H]` | `--capture-subblocks`, site `s` = `attn` or `ffn`: the input streams of the site's hyper-connection |
+| `l<k>-<s>_hc-post.f32` | `[N][hc]` | its `post` |
+| `l<k>-<s>_hc-comb.f32` | `[N][hc][hc]` | its `comb`, HF layout: `x'_i = post_i * y + sum_j comb[j][i] * x_j` |
+| `l<k>-<s>_hc-collapsed.f32` | `[N][H]` | its `collapsed`, the sub-layer's input before the layernorm |
+| `l<k>-<s>-out.f32` | `[N][H]` | the sub-layer's output `y` (`self_attn` / `mlp`), the expand's other input |
+
+The expanded outputs are not written twice: attn's is `l<k>-ffn_hc-in.f32`, ffn's is `l<k>-output.f32`.
+The manifest's `subblocks` maps, per layer and site, each role (`in`, `post`, `comb`, `collapsed`, `out`,
+`expanded`) to its file. HF's hyper-connection does not return `pre`, so it is not captured. About 18 MB
+per layer at 90 rows.
 
 **Routing dump (step 8).** The routing is binary, not JSON, because of its size. At 45 layers × 8
 ids per token, JSON would be tens of bytes per id. The binary form is 64 bytes per token and MoE
@@ -310,6 +325,11 @@ CPU, 16 threads. Full record: `runs/glm53-flash/step06/README.md`.
 Container vs FP8 (the quantisation error, reported, not gated): cosine 0.99308 / 0.99402 / 0.99806 / 0.99789 for
 layers 0 / 1 / 2 / 3, max |Δ| 7.0e-3 / 6.0e-3 / 2.3e-2 / 0.198; layer 3 routing overlap 0.911 (40 / 90 rows with the
 same top-8), DSA selection identical on 90 / 90 rows. The engine side of G3 needs the glm5_next kernels (plan step 13).
+
+**Regenerated 2026-10-09** (the goldens of 2026-10-08 were deleted in a disk cleanup): FP8 back end only,
+with `--capture-subblocks`, 48 files, 19.8 s, RSS after the layer-3 load 28.13 GiB. The 8 files the first
+run had are byte-identical to it (sha256 of `runs/glm53-flash/step06/golden-fp8.manifest.json`). Record:
+`runs/glm53-flash/step06/golden-fp8-regen.json`.
 
 ## 8. Step 8: the routing passes (crow-nest #147)
 

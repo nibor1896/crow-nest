@@ -32,6 +32,15 @@ the format is documented in docs/glm5-reference-runner.md):
   l<k>-dsa-topk.i32         [N][W]          DSA layers: the indexer's token selection, -1 = empty,
                                             W = index_topk + index_kpool - 1
   logits-anchor-<p>.f32     [V]             logits of row p (only when the last layer was run)
+With --capture-subblocks (crow-nest #156, the golden harness of #161), per layer k and mHC site s in
+(attn, ffn), recorded by forward hooks on the HF modules:
+  l<k>-<s>_hc-in.f32        [N][hc][H]      input streams of the site's hyper-connection (attn_hc / ffn_hc)
+  l<k>-<s>_hc-post.f32      [N][hc]         its `post`
+  l<k>-<s>_hc-comb.f32      [N][hc][hc]     its `comb` (HF layout: x'_i = post_i * y + sum_j comb[j][i] * x_j)
+  l<k>-<s>_hc-collapsed.f32 [N][H]          its `collapsed` (the sub-layer's input before the layernorm)
+  l<k>-<s>-out.f32          [N][H]          the sub-layer's output y (self_attn / mlp), the expand's input
+The expanded outputs are not written twice: attn's is l<k>-ffn_hc-in.f32, ffn's is l<k>-output.f32
+(manifest `subblocks`, per layer and site, maps each role to its file).
 Rows 0..T-1 are the prompt, rows T..N-1 the decode steps (teacher-forced, one row per call).
 The prompt runs in calls of --prompt-chunk rows against the layer's cache (crow-nest #147): KDA carries
 its conv and recurrent state, the DSA slot appends K/V and indexer keys in place into N preallocated
@@ -197,15 +206,47 @@ def _watch_index_ties(indexer, rec):
     indexer.forward = forward
 
 
-def run_layer(layer, tc, l, x, T, prompt_chunk=None, timings=None, stats=None):
+SUBBLOCK_SITES = (("attn", "attn_hc", "self_attn"), ("ffn", "ffn_hc", "mlp"))
+SUBBLOCK_ROLES = ("in", "post", "comb", "collapsed", "out")
+
+
+def subblock_hooks(layer, rec):
+    """crow-nest #156 / #161: forward hooks on both mHC sites of a decoder layer. Per call, rec["<site>.in"]
+    gets the hyper-connection's input streams, rec["<site>.{post,comb,collapsed}"] its outputs
+    (Glm5NextTextHyperConnection.forward), rec["<site>.out"] the sub-layer's output y (self_attn / mlp).
+    Batch 1: each entry is one call's rows. Returns the hook handles."""
+    for site, _, _ in SUBBLOCK_SITES:
+        for role in SUBBLOCK_ROLES:
+            rec.setdefault(f"{site}.{role}", [])
+
+    def hc_hook(site):
+        def hook(m, i, o):
+            rec[f"{site}.in"].append(i[0][0].detach().clone())
+            for role, t in zip(("post", "comb", "collapsed"), o):
+                rec[f"{site}.{role}"].append(t[0].detach().clone())
+        return hook
+
+    def sub_hook(site):
+        def hook(m, i, o):  # DSA attention returns (out, weights, topk); KDA and the MLPs a tensor
+            rec[f"{site}.out"].append((o[0] if isinstance(o, tuple) else o)[0].detach().clone())
+        return hook
+
+    return [h for site, hc, sub in SUBBLOCK_SITES
+            for h in (getattr(layer, hc).register_forward_hook(hc_hook(site)),
+                      getattr(layer, sub).register_forward_hook(sub_hook(site)))]
+
+
+def run_layer(layer, tc, l, x, T, prompt_chunk=None, timings=None, stats=None, capture=None):
     """x: [N][hc][H] f32. Prompt rows 0..T-1 in calls of `prompt_chunk` rows against this layer's cache
     (None / 0 = one call), then rows T..N-1 one by one. Causal attention, so a row sees rows 0..itself
     in every split. `timings`, a list, gets the seconds of each prompt call; `stats`, a dict, gets
-    "dsa_tie_rows" (DSA layers: rows whose selection boundary is an exact tie, _watch_index_ties).
+    "dsa_tie_rows" (DSA layers: rows whose selection boundary is an exact tie, _watch_index_ties);
+    `capture`, a dict, gets the sub-block tensors of subblock_hooks as "<site>.<role>", rows 0..N-1.
     Returns (y [N][hc][H], routing (ids, weights) or None, dsa topk [N][W] or None)."""
     N = x.shape[0]
     rec = {"route": [], "topk": []}
-    hooks = []
+    sub = {}
+    hooks = subblock_hooks(layer, sub) if capture is not None else []
     if tc.mlp_layer_types[l] == "sparse":
         hooks.append(layer.mlp.gate.register_forward_hook(
             lambda m, i, o: rec["route"].append((o[2].detach().clone(), o[1].detach().clone()))))
@@ -245,6 +286,10 @@ def run_layer(layer, tc, l, x, T, prompt_chunk=None, timings=None, stats=None):
     del cache
     if stats is not None and "ties" in rec:
         stats["dsa_tie_rows"] = rec["ties"]
+    if capture is not None:
+        for k, v in sub.items():
+            capture[k] = torch.cat(v, 0)
+            assert capture[k].shape[0] == N, (k, tuple(capture[k].shape), N)
     routing = None
     if rec["route"]:
         ids = torch.cat([r[0] for r in rec["route"]], 0)
@@ -272,13 +317,18 @@ def _rss():
 
 
 def run_layerwise(ws, tc, ids, n_decode, out_dir, start=0, stop=None, anchors=None, state_dtype="f32",
-                  log=print, extra=None, prompt_chunk=None, delete_states_behind=False):
+                  log=print, extra=None, prompt_chunk=None, delete_states_behind=False, capture_subblocks=False):
     """ids: list[int] of N tokens, the last n_decode run as decode rows. Writes the files of the
     module docstring into out_dir and returns the manifest dict.
     prompt_chunk: prompt rows per call (None / 0 = all T rows in one call).
     delete_states_behind: once layer k's state is on disk and recorded, delete layer k-1's state (and the
-    last layer's after the pass); routing, DSA top-k, embed, logits and the manifest stay."""
+    last layer's after the pass); routing, DSA top-k, embed, logits and the manifest stay.
+    capture_subblocks (crow-nest #156): also write the mHC sub-block files of every layer run (module
+    docstring) and map them in manifest `subblocks`; needs the f32 states it points at, so not with
+    state_dtype bf16 or delete_states_behind."""
     assert state_dtype in ("f32", "bf16"), state_dtype
+    if capture_subblocks and (state_dtype != "f32" or delete_states_behind):
+        raise ValueError("capture_subblocks needs f32 states kept on disk (ffn's expanded output is l<k>-output.f32)")
     L, H, hc = tc.num_hidden_layers, tc.hidden_size, tc.hc_mult
     stop = L if stop is None else stop
     N = len(ids)
@@ -301,6 +351,8 @@ def run_layerwise(ws, tc, ids, n_decode, out_dir, start=0, stop=None, anchors=No
         "prompt_chunk": int(prompt_chunk or 0), "delete_states_behind": bool(delete_states_behind),
         "deleted_states": [], "complete": False,
     }
+    if capture_subblocks:
+        man["subblocks"] = {}
     if extra:
         man.update(extra)
 
@@ -335,6 +387,8 @@ def run_layerwise(ws, tc, ids, n_decode, out_dir, start=0, stop=None, anchors=No
             man["layers"] = [old["layers"][0], stop]
             man["deleted_states"] = [d for d in old.get("deleted_states", [])
                                      if int(d[1:].split("-")[0]) < start - 1]
+            if "subblocks" in old:
+                man.setdefault("subblocks", {}).update({k: v for k, v in old["subblocks"].items() if int(k) < start})
     save_manifest()
 
     def delete_state(k):
@@ -354,12 +408,27 @@ def run_layerwise(ws, tc, ids, n_decode, out_dir, start=0, stop=None, anchors=No
         t1 = time.time()
         rss_load, _ = _rss()
         call_s, stats = [], {}
-        y, routing, topk = run_layer(layer, tc, l, x, T, prompt_chunk, call_s, stats)
+        cap = {} if capture_subblocks else None
+        y, routing, topk = run_layer(layer, tc, l, x, T, prompt_chunk, call_s, stats, cap)
         t2 = time.time()
         del layer
         gc.collect()
         path = write_state(out_dir, l, y, state_dtype)
         record(os.path.basename(path), y.shape, state_dtype)
+        if cap is not None:
+            roles = {}
+            for site, _, _ in SUBBLOCK_SITES:
+                roles[site] = {}
+                for role in SUBBLOCK_ROLES:
+                    nm = f"l{l}-{site}-out.f32" if role == "out" else f"l{l}-{site}_hc-{role}.f32"
+                    t = cap[f"{site}.{role}"].float()
+                    write_raw(os.path.join(out_dir, nm), t)
+                    record(nm, t.shape, "f32")
+                    roles[site][role] = nm
+            roles["attn"]["expanded"] = roles["ffn"]["in"]  # the decoder hands attn's expand to ffn_hc
+            roles["ffn"]["expanded"] = os.path.basename(path)  # the layer output
+            man["subblocks"][str(l)] = roles
+            del cap
         if routing is not None:
             for nm, t, dt in ((f"l{l}-routing-ids.i32", routing[0], "i32"),
                               (f"l{l}-routing-weights.f32", routing[1], "f32")):
@@ -758,6 +827,9 @@ def main(argv=None):
     r.add_argument("--delete-states-behind", action="store_true",
                    help="delete layer k-1's hand-over state once layer k's is written (and the last one after "
                         "the pass); routing, DSA top-k, logits and the manifest stay")
+    r.add_argument("--capture-subblocks", action="store_true",
+                   help="also write each layer's mHC sub-block files (attn_hc / ffn_hc input, post, comb, collapsed, "
+                        "the sub-layer output; crow-nest #156 / #161); f32 states only, not with --delete-states-behind")
     s = sub.add_parser("selftest", help="the proof of the runner on a synthetic mini config")
     s.add_argument("--shapes", choices=("small", "real"), default="small")
     s.add_argument("--T", type=int, default=96)
@@ -777,6 +849,9 @@ def main(argv=None):
         return 0 if ok else 1
     if a.prompt_chunk < 0:
         ap.error("--prompt-chunk must be >= 0")
+    if a.capture_subblocks and (a.state_dtype != "f32" or a.delete_states_behind):
+        ap.error("--capture-subblocks needs --state-dtype f32 and no --delete-states-behind "
+                 "(ffn's expanded output is l<k>-output.f32)")
 
     kind, path = a.weights
     kinds = {"fp8-originals": "fp8", "container": "cnq"}
@@ -801,7 +876,8 @@ def main(argv=None):
         return 2
     anchors = [int(p) for p in a.anchors.split(",")] if a.anchors else None
     man = run_layerwise(ws, tc, ids, a.decode, a.out, start, stop, anchors, a.state_dtype,
-                        prompt_chunk=a.prompt_chunk, delete_states_behind=a.delete_states_behind)
+                        prompt_chunk=a.prompt_chunk, delete_states_behind=a.delete_states_behind,
+                        capture_subblocks=a.capture_subblocks)
     print(f"wrote {len(man['files'])} files to {a.out}")
     return 0
 

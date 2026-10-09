@@ -90,3 +90,19 @@ PREREG G3 per layer compares the ENGINE's layer output with the golden on the co
 (cosine ≥ 0.9999). The engine has no glm5_next layer math yet (kernels are plan step 13, after G1), so that half
 cannot run; the goldens of back B above are its reference when it can. The cosines in the table are the
 quantisation error (container vs FP8), not the G3 metric.
+
+## Regenerated 2026-10-09 (FP8 back end, with sub-block captures)
+
+The goldens above were deleted on 2026-10-08 in a disk cleanup, together with the partial container. Back end A was
+run again from the re-downloaded FP8 originals (62/62 shards verified by `tools/fetch-glm.py`, weights identity
+`f47bd154…bfc90`, index and config sha256 as in the first run), at commit `24fd820`, with `--capture-subblocks`:
+
+```
+ORACLE_THREADS=16 .venv-oracle/Scripts/python.exe -I oracle/glm5_layerwise.py run --weights fp8-originals models/GLM-5.3-Flash-original \
+  --ids runs/glm53-flash/step06/ids.json --decode 4 --out models/GLM-5.3-Flash-step06/ref-fp8 --layers 0:4 --capture-subblocks
+```
+
+rc 0, 19.8 s wall, layer 3 load / compute 8.81 / 0.58 s, RSS after the layer-3 load 28.13 GiB (peak working set
+28.18 GiB). 48 files: the 8 of the first run, each byte-identical to it (sha256 of `golden-fp8.manifest.json`), plus
+40 sub-block files (10 per layer). Record with every file's sha256, the weights identity and the command:
+`golden-fp8-regen.json` (a copy lies in the golden dir as `evidence.json`). Back end B (container) was not regenerated.
