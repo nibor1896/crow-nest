@@ -341,3 +341,180 @@ extern "C" __global__ void gm_out_v(const float* __restrict__ u, const unsigned 
         }
     }
 }
+
+// ---------------- the decode path (follow-up of #191) ----------------
+// gm_gemm, gm_absorb and gm_out_v above are tiled for prompt calls (16 / 8 rows per block); at one
+// row they run on 5 .. 64 blocks and read their BF16 weights at 5 .. 220 GB/s (Nsight 2026-10-09:
+// ~8.5 ms of a decode row). The three kernels below take calls of at most GM_DT rows (the host
+// routes t <= GM_DT here, larger calls to the tiled kernels) and keep every output's summation
+// chain of the kernel they replace, expression for expression, so each output is bit-identical:
+//   gm_gemv     = gm_gemm:   acc += w[k] * x[k], k ascending from 0.0f (one thread per output)
+//   gm_absorb1  = gm_absorb: acc += q[i] * W[i][j], i ascending from 0.0f (one thread per output)
+//   gm_out_v1   = gm_out_v:  lane l: d += W[i][l LPL + jj] * u[l LPL + jj], jj ascending from
+//                            0.0f, then gm_warp_sum (xor 16 .. 1)
+// What changes is how the weights reach the chains: many more blocks, 16-byte loads, many loads
+// in flight per thread.
+#define GM_DT 4       // the most rows one decode-kernel call takes (host: glm5_mla::DECODE_T)
+#define GM_GV_R 8     // output rows per gm_gemv block (host: glm5_mla::GEMV_ROWS)
+#define GM_GV_KC 1024 // k values per gm_gemv stage
+
+// y[tok][r] (row stride ldy) = sum_k W[r][k] * x[tok][k] (row stride ldx) for t <= GM_DT rows.
+// Thread r + GM_GV_R * tok owns output (row0 + r, tok). The block's GM_GV_R weight rows and the
+// call's x rows pass through shared memory in stages of GM_GV_KC values (16-byte loads, the next
+// stage in registers while the current one is summed). grid ceil(rows / GM_GV_R), block 128.
+// w, x 16-byte aligned, ldx % 4 == 0, k % 32 == 0 (host-checked).
+extern "C" __global__ void __launch_bounds__(128) gm_gemv(const unsigned short* __restrict__ w, const float* __restrict__ x,
+                                                          float* __restrict__ y, long long k, long long rows, long long ldx,
+                                                          long long ldy, const int* __restrict__ st) {
+    __shared__ __align__(16) unsigned short ws[GM_GV_R][GM_GV_KC + 8];
+    __shared__ __align__(16) float xs[GM_DT][GM_GV_KC + 4];
+    const int t = st[1];
+    const int tid = threadIdx.x;
+    const long long row0 = (long long)blockIdx.x * GM_GV_R;
+    constexpr int WQ = GM_GV_KC / 8;  // uint4 per weight row of a stage
+    constexpr int XQ = GM_GV_KC / 4;  // float4 per x row of a stage
+    constexpr int WN = GM_GV_R * WQ / 128;
+    constexpr int XN = GM_DT * XQ / 128;
+    uint4 wr[WN];
+    float4 xr[XN];
+    auto fetch = [&](long long k0) {
+        const long long kc = min((long long)GM_GV_KC, k - k0);
+#pragma unroll
+        for (int n = 0; n < WN; n++) {
+            const int q = tid + 128 * n, r = q / WQ, c = q % WQ;
+            const long long row = min(row0 + r, rows - 1);  // a tail row re-reads the last row, never stored
+            wr[n] = c * 8 < kc ? *(const uint4*)(w + row * k + k0 + c * 8) : make_uint4(0, 0, 0, 0);
+        }
+#pragma unroll
+        for (int n = 0; n < XN; n++) {
+            const int q = tid + 128 * n, tt = q / XQ, c = q % XQ;
+            xr[n] = (tt < t && c * 4 < kc) ? *(const float4*)(x + tt * ldx + k0 + c * 4) : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+    };
+    const int r = tid % GM_GV_R, tok = tid / GM_GV_R;
+    float acc = 0.0f;
+    fetch(0);
+    for (long long k0 = 0; k0 < k; k0 += GM_GV_KC) {
+        __syncthreads();  // the previous stage is summed
+#pragma unroll
+        for (int n = 0; n < WN; n++) {
+            const int q = tid + 128 * n;
+            *(uint4*)&ws[q / WQ][(q % WQ) * 8] = wr[n];
+        }
+#pragma unroll
+        for (int n = 0; n < XN; n++) {
+            const int q = tid + 128 * n;
+            *(float4*)&xs[q / XQ][(q % XQ) * 4] = xr[n];
+        }
+        __syncthreads();
+        if (k0 + GM_GV_KC < k) fetch(k0 + GM_GV_KC);
+        if (tok < t) {
+            const int kc8 = (int)(min((long long)GM_GV_KC, k - k0) / 8);
+            const uint4* wp = (const uint4*)&ws[r][0];
+            const float4* xp = (const float4*)&xs[tok][0];
+#pragma unroll 4
+            for (int c = 0; c < kc8; c++) {
+                const uint4 wv = wp[c];
+                const float4 xa = xp[2 * c], xb = xp[2 * c + 1];
+                acc += __uint_as_float(wv.x << 16) * xa.x;
+                acc += __uint_as_float(wv.x & 0xFFFF0000u) * xa.y;
+                acc += __uint_as_float(wv.y << 16) * xa.z;
+                acc += __uint_as_float(wv.y & 0xFFFF0000u) * xa.w;
+                acc += __uint_as_float(wv.z << 16) * xb.x;
+                acc += __uint_as_float(wv.z & 0xFFFF0000u) * xb.y;
+                acc += __uint_as_float(wv.w << 16) * xb.z;
+                acc += __uint_as_float(wv.w & 0xFFFF0000u) * xb.w;
+            }
+        }
+    }
+    const long long row = row0 + r;
+    if (tok < t && row < rows) y[tok * ldy + row] = acc;
+}
+
+// q~[tok][h][j] = sum_i q[tok][h][i] * kv_b[h (NOPE + V) + i][j] for t <= GM_DT rows. A thread owns
+// the columns j, j + 1 of head h (one 32-bit load per i). grid (H, ceil(LAT / 128)), block 64.
+extern "C" __global__ void __launch_bounds__(64) gm_absorb1(const float* __restrict__ q, const unsigned short* __restrict__ kvb,
+                                                            float* __restrict__ qt, const int* __restrict__ st) {
+    __shared__ float qsh[GM_DT][GM_NOPE];
+    const int t = st[1];
+    const int h = blockIdx.x;
+    for (int i = threadIdx.x; i < GM_DT * GM_NOPE; i += blockDim.x) {
+        const int tt = i / GM_NOPE, d = i % GM_NOPE;
+        qsh[tt][d] = tt < t ? q[((long long)tt * GM_HEADS + h) * GM_NOPE + d] : 0.0f;
+    }
+    __syncthreads();
+    const int j = 2 * (blockIdx.y * 64 + threadIdx.x);
+    if (j >= GM_LAT) return;
+    const unsigned int* wb = (const unsigned int*)(kvb + (long long)h * (GM_NOPE + GM_V) * GM_LAT + j);
+    float acc[GM_DT][2];
+#pragma unroll
+    for (int a = 0; a < GM_DT; a++) acc[a][0] = acc[a][1] = 0.0f;
+#pragma unroll 32
+    for (int i = 0; i < GM_NOPE; i++) {
+        const unsigned int wv = __ldg(wb + (long long)i * (GM_LAT / 2));
+        const float w0 = __uint_as_float(wv << 16), w1 = __uint_as_float(wv & 0xFFFF0000u);
+#pragma unroll
+        for (int a = 0; a < GM_DT; a++) {
+            acc[a][0] += qsh[a][i] * w0;
+            acc[a][1] += qsh[a][i] * w1;
+        }
+    }
+#pragma unroll
+    for (int a = 0; a < GM_DT; a++)
+        if (a < t) {
+            float* op = qt + ((long long)a * GM_HEADS + h) * GM_LAT + j;
+            op[0] = acc[a][0];
+            op[1] = acc[a][1];
+        }
+}
+
+// o[tok][h][i] = sum_j kv_b[h (NOPE + V) + NOPE + i][j] * u[tok][h][j] for t <= GM_DT rows with
+// gm_out_v's lane split. Warp w takes the rows i = blockIdx.y * 32 + GM_OV_RW w .. + GM_OV_RW - 1,
+// their weights loaded up front. grid (H, ceil(V / 32)), block 256. kv_b 16-byte aligned when
+// GM_LPL % 8 == 0 (host-checked).
+#define GM_OV_RW 4
+extern "C" __global__ void __launch_bounds__(256) gm_out_v1(const float* __restrict__ u, const unsigned short* __restrict__ kvb,
+                                                             float* __restrict__ o, const int* __restrict__ st) {
+    const int t = st[1];
+    const int h = blockIdx.x;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int i0 = blockIdx.y * 32 + warp * GM_OV_RW;
+    const int j0 = lane * GM_LPL;
+    const unsigned short* wb = kvb + ((long long)h * (GM_NOPE + GM_V) + GM_NOPE) * GM_LAT + j0;
+    float wv[GM_OV_RW][GM_LPL];
+#pragma unroll
+    for (int rr = 0; rr < GM_OV_RW; rr++) {
+        const unsigned short* wr = wb + (long long)min(i0 + rr, GM_V - 1) * GM_LAT;
+#if (GM_LPL % 8) == 0
+#pragma unroll
+        for (int c = 0; c < GM_LPL / 8; c++) {
+            const uint4 v = __ldg((const uint4*)wr + c);
+            wv[rr][8 * c] = __uint_as_float(v.x << 16);
+            wv[rr][8 * c + 1] = __uint_as_float(v.x & 0xFFFF0000u);
+            wv[rr][8 * c + 2] = __uint_as_float(v.y << 16);
+            wv[rr][8 * c + 3] = __uint_as_float(v.y & 0xFFFF0000u);
+            wv[rr][8 * c + 4] = __uint_as_float(v.z << 16);
+            wv[rr][8 * c + 5] = __uint_as_float(v.z & 0xFFFF0000u);
+            wv[rr][8 * c + 6] = __uint_as_float(v.w << 16);
+            wv[rr][8 * c + 7] = __uint_as_float(v.w & 0xFFFF0000u);
+        }
+#else
+#pragma unroll
+        for (int jj = 0; jj < GM_LPL; jj++) wv[rr][jj] = gm_bf(wr[jj]);
+#endif
+    }
+    for (int a = 0; a < t; a++) {
+        const float* up = u + ((long long)a * GM_HEADS + h) * GM_LAT + j0;
+        float uv[GM_LPL];
+#pragma unroll
+        for (int jj = 0; jj < GM_LPL; jj++) uv[jj] = up[jj];
+#pragma unroll
+        for (int rr = 0; rr < GM_OV_RW; rr++) {
+            float d = 0.0f;
+#pragma unroll
+            for (int jj = 0; jj < GM_LPL; jj++) d += wv[rr][jj] * uv[jj];
+            d = gm_warp_sum(d);
+            if (lane == 0 && i0 + rr < GM_V) o[((long long)a * GM_HEADS + h) * GM_V + i0 + rr] = d;
+        }
+    }
+}

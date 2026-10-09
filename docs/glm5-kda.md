@@ -58,7 +58,8 @@ glm5_kda::step(&kk, &w, &st, &sc, x, out);                      // one decode ro
   40 + 2 + 54 rows against one call of 96.
 - #161: `prompt_with` / `step_with` are `prompt` / `step` launch for launch, with q|k|v and o_proj
   handed to a closure (`KdaProj`): the container stores them NVFP4, `glm5_model` runs them on
-  `glm5_gemv_fp4` (#191, bit-identical to `gemv_fp4_bs` / `gemv_fp4_b`; `w.qkv`, `w.o_proj`
+  `glm5_gemv_fp4` (#191, bit-identical to `gemv_fp4_bs` / `gemv_fp4_b`; q|k|v as one
+  `glm5_gemv_fp4_x3` launch; `w.qkv`, `w.o_proj`
   unused, 0). `KdaKernels::with_base` takes the
   one shared glm5 `KERNEL_SRC` module instead of compiling its own.
 

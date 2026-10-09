@@ -153,6 +153,7 @@ extern "C" __global__ void glm5_moe_combine(const float* __restrict__ ye, const 
 //   glm5_gemv_fp4  grid (ceil(rows / GLM5_FP4_RB), T), block 32 * min(8, ceil(K / 2048)).
 //                  w [rows][K / 64][36] u8, x [T][K] f32, gs [1] f32 -> y [T][ldy] f32 (row < rows).
 //                  K % 64 == 0; k_dim_p, ldy_p, rows_p are device ints (the KERNEL_SRC rule).
+//   glm5_gemv_fp4_x3  three matrices of one shape in one launch (the KDA q|k|v projections).
 
 #define GLM5_FP4_RB 2
 
@@ -176,21 +177,15 @@ __device__ __forceinline__ float glm5_ue4m3(unsigned int byte) {
     return (1.0f + (float)m / 8.0f) * exp2f((float)e - 7.0f);
 }
 
-extern "C" __global__ void glm5_gemv_fp4(const unsigned char* __restrict__ w, const float* __restrict__ x,
-                                         const float* __restrict__ gs_ptr, float* __restrict__ y,
-                                         const int* __restrict__ k_dim_p, const int* __restrict__ ldy_p,
-                                         const int* __restrict__ rows_p) {
+// the body of glm5_gemv_fp4 for the block's rows r0 .. r0 + GLM5_FP4_RB - 1 of one matrix, row t of x
+__device__ __forceinline__ void glm5_gemv_fp4_rows(const unsigned char* __restrict__ w, const float* __restrict__ x,
+                                                   const float gs, float* __restrict__ y, const int k_dim,
+                                                   const int ldy, const int rows, const int r0, const int t) {
     __shared__ float red[GLM5_FP4_RB][256];
-    const int k_dim = *k_dim_p;
-    const int ldy = *ldy_p;
-    const int rows = *rows_p;
     const int bpr = k_dim >> 6;
     const int i = threadIdx.x;  // the record's thread i
     const int nw = blockDim.x >> 5;
-    const int r0 = blockIdx.x * GLM5_FP4_RB;
-    const int t = blockIdx.y;
     const float* xp = x + (size_t)t * k_dim;
-    const float gs = gs_ptr[0];
     float acc[GLM5_FP4_RB];
 #pragma unroll
     for (int r = 0; r < GLM5_FP4_RB; r++) acc[r] = 0.0f;
@@ -249,4 +244,30 @@ extern "C" __global__ void glm5_gemv_fp4(const unsigned char* __restrict__ w, co
         for (int o = 16; o > 0; o >>= 1) a0 = a0 + __shfl_down_sync(0xffffffffu, a0, o);
         if (lane == 0 && r0 + r < rows) y[(size_t)t * ldy + r0 + r] = a0;
     }
+}
+
+extern "C" __global__ void glm5_gemv_fp4(const unsigned char* __restrict__ w, const float* __restrict__ x,
+                                         const float* __restrict__ gs_ptr, float* __restrict__ y,
+                                         const int* __restrict__ k_dim_p, const int* __restrict__ ldy_p,
+                                         const int* __restrict__ rows_p) {
+    glm5_gemv_fp4_rows(w, x, gs_ptr[0], y, *k_dim_p, *ldy_p, *rows_p, blockIdx.x * GLM5_FP4_RB, blockIdx.y);
+}
+
+// glm5_gemv_fp4 over three matrices of the same shape in ONE launch (the KDA q|k|v projections of
+// a row, which read the same x): blocks m * nb .. (m + 1) * nb - 1 (nb = ceil(rows / GLM5_FP4_RB))
+// run matrix m into the columns m * rows .. (m + 1) * rows - 1 of y, each block exactly as its
+// glm5_gemv_fp4 launch (bit-identical). grid (3 * nb, T), block as glm5_gemv_fp4.
+extern "C" __global__ void glm5_gemv_fp4_x3(const unsigned char* __restrict__ w0, const unsigned char* __restrict__ w1,
+                                            const unsigned char* __restrict__ w2, const float* __restrict__ gs0,
+                                            const float* __restrict__ gs1, const float* __restrict__ gs2,
+                                            const float* __restrict__ x, float* __restrict__ y,
+                                            const int* __restrict__ k_dim_p, const int* __restrict__ ldy_p,
+                                            const int* __restrict__ rows_p) {
+    const int rows = *rows_p;
+    const int nb = (rows + GLM5_FP4_RB - 1) / GLM5_FP4_RB;
+    const int m = blockIdx.x / nb;
+    const int b = blockIdx.x - m * nb;
+    const unsigned char* w = m == 0 ? w0 : (m == 1 ? w1 : w2);
+    const float gs = m == 0 ? gs0[0] : (m == 1 ? gs1[0] : gs2[0]);
+    glm5_gemv_fp4_rows(w, x, gs, y + (size_t)m * rows, *k_dim_p, *ldy_p, rows, b * GLM5_FP4_RB, blockIdx.y);
 }

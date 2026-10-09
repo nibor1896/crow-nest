@@ -41,7 +41,7 @@ The container stores these as NVFP4 (`converter/src/recipe.rs`, PREREG "Recipe a
 
 | tensor | engine |
 |---|---|
-| KDA `q/k/v_proj`, `o_proj` | `glm5_gemv_fp4` (q, k, v strided into the `[t][24576]` row), through `glm5_kda::prompt_with` / `step_with` (`KdaProj`) |
+| KDA `q/k/v_proj`, `o_proj` | `glm5_gemv_fp4` (q, k, v in one `glm5_gemv_fp4_x3` launch into the `[t][24576]` row), through `glm5_kda::prompt_with` / `step_with` (`KdaProj`) |
 | KDA `q/k/v_conv1d` | decoded once to f32 `[24576][4]` (HF holds the conv in f32) |
 | MLA `q_a`, `q_b`, `kv_a_proj_with_mqa`, `o_proj` | `glm5_gemv_fp4` through `MlaScratch::forward_with` (`MlaProj`) |
 | MLA `kv_b_proj` | decoded once to BF16 (round to nearest even); the load line prints how many values BF16 does not hold exactly |
@@ -74,6 +74,12 @@ refused by name. The test runs it against the real container's index, cut to lay
   without the engine kernel's local-memory decode table and with several rows per block.
   `KERNEL_SRC` (Flash-Next, 27B) is unchanged. Per-shape times: #191 and
   `glm5_dense_gpu_fp4_gemv_reads_the_weights_at_vram_rate`.
+- The KDA q, k, v projections of a call are one launch, `glm5_gemv_fp4_x3` (`fp4_gemv_x3`): three
+  same-shape matrices on one x, each block doing what its block in the matrix's own `glm5_gemv_fp4`
+  launch does. The outputs are bit-identical (GPU test
+  `glm5_dense_gpu_kda_qkv_in_one_launch_is_bit_identical_to_three`), and a decode row has 34 such
+  launches instead of 102 (`glm5_dense_gpu_kda_qkv_is_one_launch`). Synthetic weights, RTX 5090,
+  2026-10-09, Nsight kernel time per layer: 3 x 26.4 -> 60.1 us.
 - `load_layer` reads one layer: the planned tensors, and for a MoE layer its 288 MUL1 records
   (9,474,048 B each, 2.73 GB) from the gate tensor's offset into one VRAM buffer behind the `[288]`
   record table `GpuMoePlan::run` reads. `LayerW::free` releases all of it after the layer. No

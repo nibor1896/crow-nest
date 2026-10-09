@@ -24,6 +24,18 @@ One call takes `t` rows `x` (the output of `input_layernorm`, `[t][4096]` f32) a
 | 7 | `u_h = Σ_{s∈sel} softmax_s(q~_h · c_s · 256^-0.5) · c_s`, split-K with online softmax, then the merge | `gm_attn`, `gm_attn_merge` |
 | 8 | `o_h = W_v,h u_h` `[256]` (`W_v,h` = `kv_b` rows `h·512+256 .. (h+1)·512`), `y = o_proj o` | `gm_out_v`, `gm_gemm` |
 
+`gm_gemm`, `gm_absorb` and `gm_out_v` are tiled for prompt calls. A call of at most
+`DECODE_T` = 4 rows runs on `gm_gemv`, `gm_absorb1` and `gm_out_v1` instead (routing in
+`MlaScratch::linear` / `absorb` / `out_v`; `linear` and `out_v` also need 16-byte aligned weights
+and x, else they fall back to the tiled kernels). Each decode kernel keeps its tiled twin's
+summation chain per output, so the outputs are bit-identical (GPU test
+`glm5_mla_decode_gpu_kernels_are_bit_identical_to_the_tiled_kernels`, t = 1..4, real and TINY
+shapes). Per decode row (11 DSA layers, t = 1, synthetic VRAM-cold weights, RTX 5090,
+2026-10-09, Nsight kernel time per layer): indexer x-side `[288 x 4096]` 443 -> 10.6 us,
+q-side `[4096 x 1536]` 160 -> 12.1 us, `gm_absorb` 87 -> 12.7 us, `gm_out_v` 73 -> 13.1 us. That is
+8.4 -> 0.53 ms per row for 533.6 MB of weights; reading them at 1.45 TB/s would take 0.37 ms
+(follow-up of #191, `glm5_mla_decode_gpu_kernels_read_the_weights_at_vram_rate`).
+
 Steps 6 to 8 are the absorbed form of HF's expanded K/V attention (DeepSeek-V2, arXiv:2405.04434,
 §2.1.2-2.1.3; with no RoPE part all of K absorbs). The host test
 `absorbed_attention_equals_the_expanded_form` shows the two orders agree to 1e-12 in f64.
@@ -63,10 +75,10 @@ s.forward(&kn, &weights, &cache, x, y, pos0, t);         // or the stages below
   bias and `ape` `[4][128]` f32.
 - `MlaScratch::begin(pos0, t)` writes the call into a device word pair every kernel reads; the stages
   `query`, `store_latent`, `store_index`, `select`, `attend` and `linear` queue on the current stream.
-  `forward` runs them all with `gm_gemm` projections. A caller with other weight codecs (the container
+  `forward` runs them all with `gm_gemm` projections (`gm_gemv` for calls of at most 4 rows). A caller with other weight codecs (the container
   plans NVFP4 for q_a, q_b, kv_a, kv_b and o_proj, `converter/src/recipe.rs`) runs its own projections
   into `qa`, `q`, `kva`, `ip`, `iq` and from `o`, and keeps the stages.
-- `kv_b` is read by `gm_absorb` and `gm_out_v` as BF16, whatever the container holds (open question 2).
+- `kv_b` is read by `gm_absorb` / `gm_absorb1` and `gm_out_v` / `gm_out_v1` as BF16, whatever the container holds (open question 2).
 - #161: `forward_with` is `forward` stage for stage with q_a, q_b, kv_a and o_proj handed to a
   closure (`MlaProj`); `glm5_model` runs them on `glm5_gemv_fp4` (#191, bit-identical to
   `gemv_fp4_b`). `MlaKernels::rmsnorm_rows` exposes
