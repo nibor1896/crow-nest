@@ -22,8 +22,10 @@
 //!   its VRAM slot, its pinned slot (zero-copy) or its staging slot.
 //! - **Pinned hits** (#188, [`PinnedUse`]): `CROW_GLM_PINNED=zerocopy` keeps a pinned hit in
 //!   pinned (no promotion, the kernels read it zero-copy); `CROW_GLM_CPU_LANE=1` also computes a
-//!   decode call's pinned ids on the CPU (`glm5_moe::lane`, posted by [`ExpertTiers::table_for`]).
-//!   Both off by default: the exchange rule above, bit for bit.
+//!   decode call's pinned ids on the CPU (`glm5_moe::lane`, posted by [`ExpertTiers::table_for`]);
+//!   `CROW_GLM_CPU_LANE=split` computes only the pinned ids [`plan_split`] gives the CPU (the
+//!   greedy min-max split of sybil's `nv2_host.cpp` `plan_and_reply`, cost model [`SplitCost`]),
+//!   the rest zero-copy on the GPU. All off by default: the exchange rule above, bit for bit.
 //! - **NVMe** (#149): [`NvmeSource`], one handle per reader, `FILE_FLAG_NO_BUFFERING`, 1 reader by
 //!   default (B = 6.994 GB/s, PREREG amendment 5); every record (9,474,048 B at 3 bit) is located
 //!   once at setup ([`ExpertRecord::glm5_table`]).
@@ -90,7 +92,8 @@ pub fn tier_sizes(plan: &TierPlan, vram: Option<usize>, pinned: Option<usize>) -
 
 /// `promote` (default) | `zerocopy`
 pub const PINNED_ENV: &str = "CROW_GLM_PINNED";
-/// `1` = the CPU lane; unset / `0` = off (default)
+/// `1` = the CPU lane, every pinned id of a decode call; `split` = the CPU lane on the pinned ids
+/// [`plan_split`] gives the CPU; unset / `0` = off (default)
 pub const CPU_LANE_ENV: &str = "CROW_GLM_CPU_LANE";
 
 /// #188: what happens to a selected expert the cache holds in pinned. Default (both false): it
@@ -100,8 +103,9 @@ pub struct PinnedUse {
     /// `CROW_GLM_PINNED=zerocopy` (or implied by the CPU lane): a pinned hit stays in pinned
     /// ([`ExpertCache::set_pinned_stays`]); the GPU kernels read it zero-copy from its slot
     pub stay: bool,
-    /// `CROW_GLM_CPU_LANE=1`: in a decode call the selected ids in pinned are computed by the
-    /// CPU from their slot (`glm5_moe::lane`), the others on the GPU
+    /// `CROW_GLM_CPU_LANE=1` (or `split`): in a decode call the selected ids in pinned are
+    /// computed by the CPU from their slot (`glm5_moe::lane`), the others on the GPU; with
+    /// `split` ([`ExpertTiers::split`]) only those [`plan_split`] gives the CPU
     pub cpu_lane: bool,
 }
 
@@ -117,11 +121,12 @@ pub fn pinned_use(pinned: Option<&str>, lane: Option<&str>) -> Result<PinnedUse,
     };
     let cpu_lane = match lane.map(str::trim) {
         None | Some("") | Some("0") => false,
-        Some("1") => true,
-        Some(v) => return Err(format!("{CPU_LANE_ENV}={v:?}: accepted 0 (default), 1")),
+        Some("1") | Some("split") => true,
+        Some(v) => return Err(format!("{CPU_LANE_ENV}={v:?}: accepted 0 (default), 1, split")),
     };
     if cpu_lane && promote_explicit == Some(true) {
-        return Err(format!("{CPU_LANE_ENV}=1 reads the selected pinned experts where they lie, {PINNED_ENV}=promote moves them to VRAM first: unset {PINNED_ENV} or set it to zerocopy"));
+        let v = lane.map(str::trim).unwrap_or_default();
+        return Err(format!("{CPU_LANE_ENV}={v} reads the selected pinned experts where they lie, {PINNED_ENV}=promote moves them to VRAM first: unset {PINNED_ENV} or set it to zerocopy"));
     }
     Ok(PinnedUse { stay: cpu_lane || promote_explicit == Some(false), cpu_lane })
 }
@@ -140,6 +145,18 @@ fn lane_on_wc(u: PinnedUse, wc: bool) -> Result<(), String> {
 /// its pinned slot goes to the CPU (its host record), every other to the GPU (its table entry).
 /// Returns the combos and the number on the CPU.
 pub fn lane_combos(sel: &[i32], locs: &[(u32, Loc)], gpu_base: impl Fn(u32, Loc) -> u64, cpu_host: impl Fn(u32) -> *const u8) -> (Vec<crate::glm5_moe::lane::Combo>, usize) {
+    lane_combos_where(sel, locs, gpu_base, cpu_host, |_| true)
+}
+
+/// [`lane_combos`] with the CPU restricted to the pinned ids `on_cpu` accepts (`split`): a pinned
+/// id it refuses stays on the GPU, read zero-copy through its table entry.
+pub fn lane_combos_where(
+    sel: &[i32],
+    locs: &[(u32, Loc)],
+    gpu_base: impl Fn(u32, Loc) -> u64,
+    cpu_host: impl Fn(u32) -> *const u8,
+    on_cpu: impl Fn(u32) -> bool,
+) -> (Vec<crate::glm5_moe::lane::Combo>, usize) {
     use crate::glm5_moe::lane::Combo;
     let mut n = 0;
     let combos = sel
@@ -147,7 +164,7 @@ pub fn lane_combos(sel: &[i32], locs: &[(u32, Loc)], gpu_base: impl Fn(u32, Loc)
         .map(|&e| {
             let loc = locs.iter().find(|x| x.0 == e as u32).expect("every selected id has a location").1;
             match loc {
-                Loc::Pinned(q) => {
+                Loc::Pinned(q) if on_cpu(e as u32) => {
                     n += 1;
                     Combo::Cpu(cpu_host(q))
                 }
@@ -156,6 +173,66 @@ pub fn lane_combos(sel: &[i32], locs: &[(u32, Loc)], gpu_base: impl Fn(u32, Loc)
         })
         .collect();
     (combos, n)
+}
+
+// ---------------------------------------------------------------- the CPU/GPU lane split
+
+/// `CROW_GLM_CPU_LANE=split`: the lane takes only the pinned ids [`plan_split`] gives the CPU
+/// (`1` keeps #188: every pinned id on the CPU). Values other than `split` are `pinned_use`'s.
+pub fn lane_split(lane: Option<&str>) -> bool {
+    lane.map(str::trim) == Some("split")
+}
+
+/// The fixed cost model of the split (ms per MoE layer of one decode row), sybil's `GLM53_NV_POL`
+/// (`g0, thit, tzc, ca, cb`, `glm53/nv2.py`) for this engine: the GPU lane costs `g0` (gather,
+/// shared expert, launches: it runs in every layer, so unlike sybil's it is charged with no VRAM
+/// hit too) + `thit` per selected id read from VRAM (slot or staging) + `tzc` per pinned id read
+/// zero-copy over PCIe; the CPU lane `ca` (x to the host, the pool run's fixed part, the rows
+/// back) + `cb` per expert. At most `maxcpu` ids per layer on the CPU (sybil: 32).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SplitCost {
+    pub g0: f64,
+    pub thit: f64,
+    pub tzc: f64,
+    pub ca: f64,
+    pub cb: f64,
+    pub maxcpu: usize,
+}
+
+impl SplitCost {
+    /// RTX 5090 (PCIe 5.0 x16), Core Ultra 9 285K, 2 x 32 GB DDR5-5600, the lane at
+    /// `glm5_moe::LANE_THREADS` (8): `glm5_tiers_gpu_split_cost_bench` (2026-10-09), the real
+    /// lane over 24 (VRAM, CPU) splits of one synthetic GLM layer, records rotated beyond the L3
+    /// and the GPU's L2; CPU and GPU zero-copy share the DRAM, so the fit takes `tzc` and `cb`
+    /// under each other's load. Solo: VRAM 0.0148 ms per expert, zero-copy 0.239 (39.6 GB/s),
+    /// CPU 0.406. The plan picked the measured best split at V 0, 2, 4 (V 0: 3 CPU, 1.609 ms vs
+    /// 1.854 all-GPU and 3.399 all-CPU) and one off at V 6 (0.625 vs 0.608 ms).
+    pub const RTX5090_285K: SplitCost = SplitCost { g0: 0.100, thit: 0.0148, tzc: 0.239, ca: 0.290, cb: 0.386, maxcpu: 32 };
+}
+
+/// The CPU/GPU split of one decode call's MoE layer (sybil `nv2_host.cpp` `plan_and_reply`,
+/// `glm53-flash-offload` @ `6769b27`, the loop over the RAM picks): `gpu_hits` selected ids the
+/// GPU reads from VRAM, `ram` the selected ids in pinned with their heat (selections so far).
+/// Colder ids first (lower heat, then lower id); each goes to the CPU when that does not raise
+/// the layer's time `max(cpu, gpu)` above sending it to the GPU (`max(c + cb, g) <= max(c, g +
+/// tzc)`), up to `maxcpu`; the other pinned ids are read zero-copy by the GPU, so both lanes
+/// finish as close together as the per-expert steps allow. Returns the CPU ids, planning order.
+pub fn plan_split(cost: &SplitCost, gpu_hits: usize, ram: &[(u32, u32)]) -> Vec<u32> {
+    let mut order = ram.to_vec();
+    order.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    let mut g = cost.g0 + cost.thit * gpu_hits as f64;
+    let mut c = if ram.is_empty() { 0.0 } else { cost.ca };
+    let mut cpu = Vec::new();
+    for &(e, _) in &order {
+        let (ce, ge) = (c + cost.cb, g + cost.tzc);
+        if cpu.len() < cost.maxcpu && ce.max(g) <= c.max(ge) {
+            c = ce;
+            cpu.push(e);
+        } else {
+            g = ge;
+        }
+    }
+    cpu
 }
 
 // ---------------------------------------------------------------- #149 path B: the stager switch
@@ -175,8 +252,8 @@ pub fn stager_on(stager: Option<&str>, flags: Option<&str>, lane: Option<&str>) 
     if flags != Some("1") {
         return Err(format!("{STAGER_ENV}=1 needs {}=1: the stager replaces the host's waits inside a MoE layer, the router's flag is the one wait it keeps", glm5_flags::ENV_FLAGS));
     }
-    if lane.map(str::trim) == Some("1") {
-        return Err(format!("{STAGER_ENV}=1 and {CPU_LANE_ENV}=1: the CPU lane reads pinned records on the host while the experts launch, before the stager's records have landed; turn one of them off"));
+    if let Some(l @ ("1" | "split")) = lane.map(str::trim) {
+        return Err(format!("{STAGER_ENV}=1 and {CPU_LANE_ENV}={l}: the CPU lane reads pinned records on the host while the experts launch, before the stager's records have landed; turn one of them off"));
     }
     Ok(true)
 }
@@ -692,6 +769,12 @@ pub struct ExpertTiers {
     pinned_wc: bool,
     topk: usize,
     lane_clock: std::sync::Arc<crate::glm5_moe::lane::Clock>,
+    /// `CROW_GLM_CPU_LANE=split` as read at construction: the cost model of [`plan_split`]
+    /// (`None` = `1` or off: the lane, if on, takes every pinned id)
+    pub split: Option<SplitCost>,
+    /// `[moe layer][expert]` selections so far (decode and prompt calls), the split's heat:
+    /// colder pinned ids go to the CPU first
+    heat: Vec<u32>,
     /// #149 path B (`CROW_GLM_STAGER=1`): the stager stream and its pinned sources (`None` = off)
     stager: Option<Stager>,
 }
@@ -810,6 +893,8 @@ impl ExpertTiers {
             pinned_wc,
             topk: g.topk,
             lane_clock: Default::default(),
+            split: lane_split(std::env::var(CPU_LANE_ENV).ok().as_deref()).then_some(SplitCost::RTX5090_285K),
+            heat: vec![0; nl * g.experts],
             stager: None,
         };
         t.set_pinned_use(pu)?;
@@ -878,15 +963,25 @@ impl ExpertTiers {
         cuda::to_u64_into(self.tables[l], &table);
         // #188: a decode call's pinned ids go to the CPU lane (`GpuMoePlan::experts` takes the
         // post); their table entries stay valid pinned bases. Anything else clears the post.
+        // `split`: only the ids `plan_split` gives the CPU (a call it gives none posts nothing)
         let mut post = None;
         if self.pinned_use.cpu_lane && sel.len() == self.topk && served.moves.zero_copy > 0 {
             let host = self.pinned[l].host as *const u8;
-            let (combos, n) = lane_combos(sel, &served.locs, |e, _| table[e as usize], |q| host.add(q as usize * rb as usize));
+            let heat = &self.heat[l * self.cache.experts..(l + 1) * self.cache.experts];
+            let cpu = self.split.map(|cost| {
+                let hits = served.locs.iter().filter(|x| !matches!(x.1, Loc::Pinned(_))).count();
+                let ram: Vec<(u32, u32)> = served.locs.iter().filter(|x| matches!(x.1, Loc::Pinned(_))).map(|x| (x.0, heat[x.0 as usize])).collect();
+                plan_split(&cost, hits, &ram)
+            });
+            let (combos, n) = lane_combos_where(sel, &served.locs, |e, _| table[e as usize], |q| host.add(q as usize * rb as usize), |e| cpu.as_ref().is_none_or(|v| v.contains(&e)));
             served.moves.cpu_lane = n as u64;
             served.moves.zero_copy -= n as u64;
-            post = Some(crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone() });
+            if n > 0 {
+                post = Some(crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone() });
+            }
         }
         crate::glm5_moe::lane::post(post);
+        self.count_heat(l, sel);
         self.nvme_reads += served.nvme_reads as u64;
         self.nvme_bytes += served.nvme_bytes;
         self.moves[l].add(&served.moves);
@@ -958,12 +1053,25 @@ impl ExpertTiers {
             run(r0, rows, table_dev)
         };
         let r = serve_chunk(&mut self.cache, l, &mut self.slots[l], sel, k, self.pf_cap, &mut m, &mut each);
+        if r.is_ok() {
+            self.count_heat(l, sel);
+        }
         self.nvme_reads += reads;
         self.nvme_bytes += bytes;
         self.moves[l].add(&moves);
         self.routing_syncs += 1;
         self.sub_batches += *r.as_ref().unwrap_or(&0) as u64;
         r.map(|_| ())
+    }
+
+    /// the split's heat: every selection of `sel` (`[t][topk]` i32, ids checked by the caller)
+    /// counts once for its expert of MoE layer `l`
+    fn count_heat(&mut self, l: usize, sel: &[i32]) {
+        let e = self.cache.experts;
+        for &id in sel {
+            let h = &mut self.heat[l * e + id as usize];
+            *h = h.saturating_add(1);
+        }
     }
 
     /// #190: the device record table of every MoE layer (the buffers `table_for` rewrites)
@@ -1963,7 +2071,7 @@ mod tests {
 
     /// the xorshift routing of `expert_cache`'s tests: `k` distinct ids per token per layer with
     /// a drifting hot set
-    fn trace(tokens: usize, layers: usize, experts: u64, k: usize, seed: u64) -> Vec<Vec<Vec<u32>>> {
+    pub(super) fn trace(tokens: usize, layers: usize, experts: u64, k: usize, seed: u64) -> Vec<Vec<Vec<u32>>> {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ seed;
         (0..tokens)
             .map(|t| {
@@ -2465,9 +2573,9 @@ mod tests {
 
     /// A synthetic glm5_next container (index v2, `glm5_next_text`): `experts` MUL1 records of
     /// 9,474,048 B for layer 3, each on a 4096-B file offset, random bytes. Removed on drop.
-    struct SynthGlm {
+    pub(super) struct SynthGlm {
         dir: std::path::PathBuf,
-        path: String,
+        pub(super) path: String,
     }
 
     impl Drop for SynthGlm {
@@ -2476,7 +2584,7 @@ mod tests {
         }
     }
 
-    fn synth_glm(experts: u32) -> SynthGlm {
+    pub(super) fn synth_glm(experts: u32) -> SynthGlm {
         use std::io::Write;
         const REC: u64 = 9_474_048;
         let dir = std::env::temp_dir().join(format!("crow-glm5-tiers-{}", std::process::id()));
@@ -4124,5 +4232,451 @@ mod spec_tests {
             None => std::env::remove_var("CROW_PINNED_ALLOC"),
         }
         drop(cnq);
+    }
+}
+
+// ---------------------------------------------------------------- the split planner's tests
+
+#[cfg(test)]
+mod split_tests {
+    //! `CROW_GLM_CPU_LANE=split`: the switch, the planner (host), and on the GPU (`#[ignore]`) the
+    //! split's posts on the synthetic container and the cost model's calibration bench.
+    use super::*;
+    use crate::cpu_mul1::{self, testkit, Mul1Expert, Path};
+    use crate::geo::{ExpertCodec, ExpertRecordSpec};
+    use crate::glm5_moe::{lane, GpuFfnWeights, GpuMoePlan, GpuMoeWeights, GpuNvfp4};
+    use crate::kernels;
+    use std::sync::Arc;
+
+    // ------------------------------------------------------------ host
+
+    /// `split` turns the lane on (implies zerocopy, like `1`) and is the only value that asks
+    /// for the planner; with an explicit `promote`, with the stager, and any other value refused
+    /// by name.
+    #[test]
+    fn the_split_switch_parses_and_refuses_by_name() {
+        assert_eq!(pinned_use(None, Some("split")), Ok(PinnedUse { stay: true, cpu_lane: true }));
+        assert_eq!(pinned_use(Some("zerocopy"), Some(" split ")), Ok(PinnedUse { stay: true, cpu_lane: true }));
+        assert!(lane_split(Some("split")) && lane_split(Some(" split")));
+        assert!(!lane_split(Some("1")) && !lane_split(Some("0")) && !lane_split(None));
+        let e = pinned_use(Some("promote"), Some("split")).unwrap_err();
+        assert!(e.starts_with("CROW_GLM_CPU_LANE=split reads the selected pinned experts where they lie"), "{e}");
+        assert!(pinned_use(None, Some("splitt")).unwrap_err().ends_with("accepted 0 (default), 1, split"));
+        let e = stager_on(Some("1"), Some("1"), Some("split")).unwrap_err();
+        assert!(e.starts_with("CROW_GLM_STAGER=1 and CROW_GLM_CPU_LANE=split"), "{e}");
+    }
+
+    /// the layer time of `nc` CPU ids out of `n` pinned ids, by the planner's own accounting
+    fn makespan(c: &SplitCost, hits: usize, n: usize, nc: usize) -> f64 {
+        let g = c.g0 + c.thit * hits as f64 + c.tzc * (n - nc) as f64;
+        let cpu = if n > 0 { c.ca + c.cb * nc as f64 } else { 0.0 };
+        g.max(cpu)
+    }
+
+    /// The greedy split is the min-max: over 20,000 random cost models, VRAM hits 0..8 and
+    /// pinned ids 0..8 (caps 1..32), the plan's layer time equals the least over every count of
+    /// CPU ids the cap allows (identical ids, so the count is the whole choice).
+    #[test]
+    fn plan_split_is_the_min_max_of_every_split() {
+        let mut rng = cpu_mul1::testkit::Rng(0x5917);
+        let mut u = |lo: f64, hi: f64| lo + (rng.next() % 1_000_000) as f64 / 1e6 * (hi - lo);
+        for i in 0..20_000 {
+            let c = SplitCost { g0: u(0.0, 0.3), thit: u(0.0, 0.05), tzc: u(0.05, 0.6), ca: u(0.0, 0.5), cb: u(0.05, 1.2), maxcpu: 1 + i % 32 };
+            let (hits, n) = (i % 9, (i / 9) % 9);
+            let ram: Vec<(u32, u32)> = (0..n as u32).map(|e| (e * 3, e % 3)).collect();
+            let got = plan_split(&c, hits, &ram).len();
+            assert!(got <= c.maxcpu.min(n));
+            let best = (0..=c.maxcpu.min(n)).map(|nc| makespan(&c, hits, n, nc)).fold(f64::MAX, f64::min);
+            assert!(makespan(&c, hits, n, got) <= best + 1e-12, "{c:?} hits {hits} n {n}: plan {got} CPU ids, {} ms vs best {best} ms", makespan(&c, hits, n, got));
+        }
+    }
+
+    /// The ids are considered colder first (lower heat, ties to the lower id), so the coldest
+    /// goes to the CPU when any does; at most `maxcpu`; no pinned id, no CPU id.
+    #[test]
+    fn plan_split_sends_colder_ids_first_up_to_maxcpu() {
+        let c = SplitCost { g0: 0.1, thit: 0.01, tzc: 0.25, ca: 0.05, cb: 0.3, maxcpu: 32 };
+        let ram = [(5u32, 9u32), (7, 1), (2, 1), (9, 4), (11, 30)];
+        // considered 2, 7, 9, 5, 11 (heat 1, 1, 4, 9, 30); each to the lane that keeps the max
+        // lower: CPU, GPU, GPU, CPU, GPU (CPU 0.05 + 2 x 0.3 = 0.65, GPU 0.1 + 3 x 0.25 = 0.85)
+        assert_eq!(plan_split(&c, 0, &ram), vec![2, 5]);
+        assert_eq!(plan_split(&SplitCost { maxcpu: 1, ..c }, 0, &ram), vec![2]);
+        assert_eq!(plan_split(&SplitCost { maxcpu: 0, ..c }, 0, &ram), Vec::<u32>::new());
+        assert_eq!(plan_split(&c, 6, &[]), Vec::<u32>::new());
+        // a CPU much faster than PCIe takes every pinned id, coldest first
+        assert_eq!(plan_split(&SplitCost { cb: 0.01, ..c }, 0, &ram), vec![2, 7, 9, 5, 11]);
+        // a CPU much slower takes none
+        assert_eq!(plan_split(&SplitCost { cb: 5.0, ..c }, 0, &ram), Vec::<u32>::new());
+    }
+
+    /// The calibrated model plans the splits the bench measured best (2026-10-09, lane at 8
+    /// threads): 8 pinned ids 3 on the CPU, 2 VRAM + 6 pinned 2, 4 + 4 1.
+    #[test]
+    fn the_calibrated_cost_model_plans_the_measured_best_splits() {
+        let c = SplitCost::RTX5090_285K;
+        for (hits, want) in [(0usize, 3usize), (2, 2), (4, 1)] {
+            let ram: Vec<(u32, u32)> = (0..(8 - hits) as u32).map(|e| (e, 0)).collect();
+            assert_eq!(plan_split(&c, hits, &ram).len(), want, "V {hits}");
+        }
+    }
+
+    /// `lane_combos_where`: a pinned id the plan refuses stays a GPU combo with its table entry;
+    /// `lane_combos` (`1`) still sends every pinned id to the CPU.
+    #[test]
+    fn lane_combos_where_keeps_refused_pinned_ids_on_the_gpu() {
+        use crate::glm5_moe::lane::Combo;
+        let sel = [7, 3, 250, 0, 12];
+        let locs = [(0u32, Loc::Vram(2)), (3, Loc::Pinned(5)), (7, Loc::Stage(1)), (12, Loc::Pinned(1)), (250, Loc::Pinned(0))];
+        let host = 0x1000 as *const u8;
+        let gpu = |e: u32, _| 0x9000 + e as u64;
+        let cpu = |q: u32| host.wrapping_add(q as usize * 16);
+        let (c, n) = lane_combos_where(&sel, &locs, gpu, cpu, |e| e == 250 || e == 12);
+        assert_eq!(n, 2);
+        assert_eq!(c, vec![Combo::Gpu(0x9007), Combo::Gpu(0x9003), Combo::Cpu(host), Combo::Gpu(0x9000), Combo::Cpu(host.wrapping_add(16))]);
+        let (c, n) = lane_combos(&sel, &locs, gpu, cpu);
+        assert_eq!(n, 3);
+        assert_eq!(c[1], Combo::Cpu(host.wrapping_add(80)));
+    }
+
+    // ------------------------------------------------------------ GPU
+
+    /// `split` on the synthetic container (as `glm5_tiers_gpu_zerocopy_and_cpu_lane_tables_hold_
+    /// their_records`, `CROW_PINNED_ALLOC=host`): at four capacities, over a routing trace, every
+    /// decode call posts exactly the CPU combos `plan_split` gives for the call's VRAM hits and
+    /// pinned ids at the heat before the call (none: no post), each a host pointer to the
+    /// record's bytes, every other combo the id's table entry; `cpu_lane` + `zero_copy` = the
+    /// pinned visits; the heat counts every selection. A cost model with a free CPU takes every
+    /// pinned id (the `1` lane's posts).
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_tiers_gpu_split -- --ignored --nocapture --test-threads 1"]
+    fn glm5_tiers_gpu_split_posts_the_planned_combos() {
+        use lane::Combo;
+        let s = super::tests::synth_glm(16);
+        let mut g = Glm5Geo::GLM_5_3_FLASH;
+        (g.layers, g.dense_prefix, g.experts, g.topk) = (4, 3, 16, 8);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let rb = spec.bytes as usize;
+        let want: Vec<Vec<u8>> = (0..16).map(|e| cnq.read_range(&cnq.find(&crate::nvme_source::glm5_expert_tensor_name(3, e, "gate"), "text").clone(), 0, rb)).collect();
+        let tr = super::tests::trace(24, 1, 16, 8, 0x5917);
+        let old = std::env::var("CROW_PINNED_ALLOC").ok();
+        std::env::set_var("CROW_PINNED_ALLOC", "host");
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            for (v, p) in [(1, 7), (3, 4), (4, 12), (0, 16)] {
+                for (name, cost) in [("calibrated", SplitCost::RTX5090_285K), ("free CPU", SplitCost { cb: 1e-6, ..SplitCost::RTX5090_285K })] {
+                    let what0 = format!("{name} V {v} P {p}");
+                    let mut t = ExpertTiers::new(&cnq, &s.path, &g, &moe, TierSizes { vram: v, pinned: p }, 1, 8).unwrap();
+                    t.set_pinned_use(PinnedUse { stay: true, cpu_lane: true }).unwrap();
+                    t.split = Some(cost);
+                    let (mut on_cpu, mut on_gpu) = (0u64, 0u64);
+                    for (i, tok) in tr.iter().enumerate() {
+                        let what = format!("{what0} call {i}");
+                        let sel: Vec<i32> = tok[0].iter().rev().map(|&e| e as i32).collect();
+                        let heat = t.heat.clone();
+                        let (tb, served) = t.table_for(3, &sel).unwrap();
+                        let posted = lane::take(tb, 1, 8);
+                        let pinned: Vec<(u32, u32)> = served.locs.iter().filter(|x| matches!(x.1, Loc::Pinned(_))).map(|x| (x.0, heat[x.0 as usize])).collect();
+                        let plan = plan_split(&cost, served.locs.len() - pinned.len(), &pinned);
+                        if name == "free CPU" {
+                            assert_eq!(plan.len(), pinned.len(), "{what}: a free CPU takes every pinned id");
+                        }
+                        assert_eq!((served.moves.cpu_lane, served.moves.zero_copy), (plan.len() as u64, (pinned.len() - plan.len()) as u64), "{what}: counters");
+                        for &e in &tok[0] {
+                            assert_eq!(t.heat[e as usize], heat[e as usize] + 1, "{what}: heat of {e}");
+                        }
+                        cuda::sync();
+                        let table = cuda::dtoh_u64(tb, 16);
+                        match posted {
+                            None => assert!(plan.is_empty(), "{what}: planned CPU ids {plan:?} but no post"),
+                            Some(call) => {
+                                for (c, combo) in call.combos.iter().enumerate() {
+                                    let e = sel[c] as usize;
+                                    match *combo {
+                                        Combo::Cpu(ptr) => {
+                                            assert!(plan.contains(&(e as u32)), "{what}: CPU combo {c} (expert {e}) not planned");
+                                            assert!(std::slice::from_raw_parts(ptr, rb) == &want[e][..], "{what}: CPU combo {c} (expert {e}) reads other bytes");
+                                        }
+                                        Combo::Gpu(base) => {
+                                            assert!(!plan.contains(&(e as u32)), "{what}: planned expert {e} on the GPU");
+                                            assert_eq!(base, table[e], "{what}: GPU combo {c} (expert {e})");
+                                        }
+                                    }
+                                }
+                                assert_eq!(call.combos.iter().filter(|x| matches!(x, Combo::Cpu(_))).count(), plan.len(), "{what}: CPU combos");
+                            }
+                        }
+                        on_cpu += plan.len() as u64;
+                        on_gpu += (pinned.len() - plan.len()) as u64;
+                    }
+                    assert_eq!((t.moves[0].cpu_lane, t.moves[0].zero_copy), (on_cpu, on_gpu), "{what0}: summed counters");
+                    eprintln!("glm5_tiers split {what0}: pinned visits {} CPU {on_cpu} zero-copy {on_gpu}", on_cpu + on_gpu);
+                    t.free();
+                }
+            }
+        }
+        match old {
+            Some(o) => std::env::set_var("CROW_PINNED_ALLOC", o),
+            None => std::env::remove_var("CROW_PINNED_ALLOC"),
+        }
+        drop(cnq);
+    }
+
+    // ------------------------------------------------------------ bench helpers
+
+    fn median(mut v: Vec<f64>) -> f64 {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    }
+
+    /// least squares `y = a + b x`
+    fn line(pts: &[(f64, f64)]) -> (f64, f64) {
+        let m = pts.len() as f64;
+        let (sx, sy) = (pts.iter().map(|p| p.0).sum::<f64>(), pts.iter().map(|p| p.1).sum::<f64>());
+        let (sxx, sxy) = (pts.iter().map(|p| p.0 * p.0).sum::<f64>(), pts.iter().map(|p| p.0 * p.1).sum::<f64>());
+        let b = (m * sxy - sx * sy) / (m * sxx - sx * sx);
+        ((sy - b * sx) / m, b)
+    }
+
+    /// the layer time the model gives a split: `k + max(gpu, cpu)` (no CPU lane: `k + gpu`)
+    fn model(c: &SplitCost, v: usize, nc: usize, k: usize) -> f64 {
+        let g = c.g0 + c.thit * v as f64 + c.tzc * (k - v - nc) as f64;
+        let cpu = if nc > 0 { c.ca + c.cb * nc as f64 } else { 0.0 };
+        g.max(cpu)
+    }
+
+    /// Calibration bench of [`SplitCost`], not a gate. One synthetic GLM MoE layer (zero router
+    /// and bias: the picks are experts 0..7; zero shared expert), 32 distinct 3-bit records in
+    /// cacheable pinned RAM (303 MB) and 16 in VRAM, rotated call by call so neither the L3 nor
+    /// the GPU's 96 MB L2 holds them. (1) Solo GPU: `mul1::FfnPlan` over n = 1..8 records from
+    /// VRAM and from pinned RAM (zero-copy), lines `a + thit n`, `a + tzc n`. (2) Solo CPU: the
+    /// lane's `experts_ffn` (clamped SwiGLU, `LANE_THREADS`) over n = 1..8 pinned records. (3) The
+    /// real lane (`GpuMoePlan::run` with a `lane::post`): every split of V VRAM picks (0, 2, 4, 6)
+    /// and nc CPU picks (the rest zero-copy), wall time per layer call (route + experts + shared
+    /// + combine + sync); fit of `k + max(g0 + thit V + tzc Z, ca + cb nc)` with `thit` from (1)
+    /// over a grid of (g0, tzc, ca, cb), and per V the best nc measured vs planned. (4) The same
+    /// split emulated with the CPU at 8, 16, 20 threads (FfnPlan zero-copy + `experts_ffn`
+    /// concurrently): what a larger `LANE_THREADS` would give. Median of 25 calls per point.
+    #[test]
+    #[ignore = "bench, needs the GPU (about 0.4 GB VRAM, 0.3 GB pinned): cargo test --release --lib glm5_tiers_gpu_split_cost_bench -- --ignored --nocapture --test-threads 1"]
+    fn glm5_tiers_gpu_split_cost_bench() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let module = cuda::compile(&kernels::KernelGeo::flash_next().source());
+            let kn = kernels::Kernels::new(&module, false);
+            let mk = kernels::mul1::Kernels::new();
+            let gk = kernels::glm5_moe::Kernels::new();
+            let g = MoeGeo::new(&Glm5Geo::GLM_5_3_FLASH, ExpertRecordSpec::new(ExpertCodec::Mul1, cpu_mul1::GLM_RECORD_BYTES_K3 as u64).unwrap()).unwrap();
+            let (h, k, rb, inter) = (g.hidden, g.topk, g.record.bytes as usize, g.expert_inter);
+            let c = &testkit::glm_cases()[0];
+            let base = testkit::record(c);
+            let tb = 3 * cpu_mul1::Mul1Matrix::trellis_bytes(c.hidden, c.inter, c.bitrate);
+            let rec = |i: u32| {
+                let mut r = base.clone();
+                r[..tb].iter_mut().for_each(|b| *b = b.rotate_left(i % 8) ^ ((i / 8) as u8).wrapping_mul(37));
+                r
+            };
+            const NP: usize = 32;
+            const NV: usize = 16;
+            let mut pinned = cuda::Pinned::alloc(NP * rb);
+            for i in 0..NP {
+                pinned.write_bytes(i * rb, &rec(i as u32));
+            }
+            let mut vram = cuda::alloc_zeroed(NV * rb);
+            for i in 0..NV {
+                cuda::upload_into(vram + (i * rb) as u64, &rec(100 + i as u32));
+            }
+            let (pdev, phost) = (pinned.dev, pinned.host as *const u8);
+            let mut rng = testkit::Rng(0x5917);
+            let x: Vec<f32> = (0..8 * h).map(|_| rng.f(0.17)).collect();
+            let act = |a: f32, b: f32| crate::glm5_moe::swiglu_clamp(a, b, 10.0);
+            const REPS: usize = 28;
+            const WARM: usize = 3;
+            eprintln!("glm5_tiers split bench: {} B per record, {NP} pinned + {NV} VRAM records, lane threads {}", rb, crate::glm5_moe::LANE_THREADS);
+
+            // (1) solo GPU
+            let (mut xd, mut yd, mut ptrs) = (cuda::to_f32_dev(&x), cuda::alloc_zeroed(8 * h * 4), cuda::alloc_zeroed(64));
+            let mut plans: Vec<kernels::mul1::FfnPlan> = (1..=8).map(|n| kernels::mul1::FfnPlan::new(h, inter, 3, false, n, 1)).collect();
+            let mut at = 0usize;
+            let mut gpu_solo = |from_vram: bool| -> Vec<(f64, f64)> {
+                let mut ms = vec![Vec::new(); 8];
+                for rep in 0..REPS + WARM {
+                    for n in 1..=8usize {
+                        let bases: Vec<u64> = (0..n)
+                            .map(|j| {
+                                at += 1;
+                                if from_vram { vram + ((at + j) % NV * rb) as u64 } else { pdev + ((at + j) % NP * rb) as u64 }
+                            })
+                            .collect();
+                        cuda::to_u64_into(ptrs, &bases);
+                        cuda::sync();
+                        let t0 = std::time::Instant::now();
+                        plans[n - 1].run(&mk, ptrs, xd, yd);
+                        cuda::sync();
+                        if rep >= WARM {
+                            ms[n - 1].push(t0.elapsed().as_secs_f64() * 1e3);
+                        }
+                    }
+                }
+                ms.into_iter().enumerate().map(|(i, v)| ((i + 1) as f64, median(v))).collect()
+            };
+            let (pv, pz) = (gpu_solo(true), gpu_solo(false));
+            let ((av, thit), (az, tzc_solo)) = (line(&pv), line(&pz));
+            let row = |p: &[(f64, f64)]| p.iter().map(|&(n, t)| format!("{n:.0}:{t:.3}")).collect::<Vec<_>>().join(" ");
+            eprintln!("  (1) GPU VRAM    ms per call {}; fit {av:.3} + {thit:.4} n", row(&pv));
+            eprintln!("  (1) GPU pinned  ms per call {}; fit {az:.3} + {tzc_solo:.4} n ({:.1} GB/s)", row(&pz), rb as f64 / tzc_solo / 1e6);
+
+            // (2) solo CPU at the lane's thread count
+            let ex = |slot: usize| Mul1Expert::from_record(std::slice::from_raw_parts(phost.add(slot % NP * rb), rb), h, inter, g.bitrate).unwrap();
+            let mut ys = vec![0f32; 8 * h];
+            let mut cpu_solo = |threads: usize| -> Vec<(f64, f64)> {
+                let mut ms = vec![Vec::new(); 8];
+                for rep in 0..REPS + WARM {
+                    for n in 1..=8usize {
+                        let es: Vec<Mul1Expert> = (0..n).map(|j| ex(at + j)).collect();
+                        at += n;
+                        let t0 = std::time::Instant::now();
+                        cpu_mul1::experts_ffn(&es, &x[..h], &mut ys[..n * h], &act, threads, Path::Auto);
+                        if rep >= WARM {
+                            ms[n - 1].push(t0.elapsed().as_secs_f64() * 1e3);
+                        }
+                    }
+                }
+                ms.into_iter().enumerate().map(|(i, v)| ((i + 1) as f64, median(v))).collect()
+            };
+            let pc = cpu_solo(crate::glm5_moe::LANE_THREADS);
+            let (ac, cb_solo) = line(&pc);
+            eprintln!("  (2) CPU {} thr   ms per call {}; fit {ac:.3} + {cb_solo:.4} n", crate::glm5_moe::LANE_THREADS, row(&pc));
+
+            // (3) the real lane
+            let shared = |rows: usize, cols: usize| GpuNvfp4 { w: cuda::alloc_zeroed(crate::cpu_nvfp4::Nvfp4Matrix::byte_len(rows, cols)), gs: cuda::to_f32_dev(&[0.3]), rows, cols };
+            let w = GpuMoeWeights {
+                router: cuda::alloc_zeroed(g.experts * h * 2),
+                bias: cuda::alloc_zeroed(g.experts * 4),
+                shared: GpuFfnWeights { gate: shared(g.shared_inter, h), up: shared(g.shared_inter, h), down: shared(h, g.shared_inter) },
+            };
+            let mut plan = GpuMoePlan::new(&g, 1);
+            let mut table = cuda::alloc_zeroed(g.experts * 8);
+            let clock = Arc::new(lane::Clock::default());
+            let splits: Vec<(usize, usize)> = [0usize, 2, 4, 6].iter().flat_map(|&v| (0..=k - v).map(move |nc| (v, nc))).collect();
+            let mut ms = vec![Vec::new(); splits.len()];
+            for rep in 0..REPS + WARM {
+                for (i, &(v, nc)) in splits.iter().enumerate() {
+                    // picks 0..nc on the CPU, nc..nc + v from VRAM, the rest zero-copy
+                    let mut tab = vec![0u64; g.experts];
+                    let mut combos = Vec::with_capacity(k);
+                    for (e, t) in tab.iter_mut().enumerate().take(k) {
+                        at += 1;
+                        let (ps, vs) = (at % NP, at % NV);
+                        *t = if (nc..nc + v).contains(&e) { vram + (vs * rb) as u64 } else { pdev + (ps * rb) as u64 };
+                        combos.push(if e < nc { lane::Combo::Cpu(phost.add(ps * rb)) } else { lane::Combo::Gpu(*t) });
+                    }
+                    cuda::to_u64_into(table, &tab);
+                    lane::post((nc > 0).then(|| lane::Call { table, combos, clock: clock.clone() }));
+                    cuda::sync();
+                    let t0 = std::time::Instant::now();
+                    plan.run(&kn, &mk, &gk, &w, table, xd, yd);
+                    cuda::sync();
+                    if rep >= WARM {
+                        ms[i].push(t0.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
+            }
+            assert_eq!(cuda::dtoh_i32(plan.ids, k), (0..k as i32).collect::<Vec<_>>(), "the zero router picks experts 0..7");
+            let meas: Vec<f64> = ms.into_iter().map(median).collect();
+            // fit: thit from (1); grid over g0, tzc, ca, cb; k = mean residual
+            let mut best = (f64::MAX, SplitCost { g0: 0.0, thit, tzc: 0.0, ca: 0.0, cb: 0.0, maxcpu: 32 }, 0.0);
+            for gi in 0..=40 {
+                for ti in 0..=40 {
+                    for ci in 0..=40 {
+                        for bi in 0..=40 {
+                            let cost = SplitCost { g0: gi as f64 * 0.01, thit, tzc: tzc_solo * (0.6 + ti as f64 * 0.025), ca: ci as f64 * 0.01, cb: cb_solo * (0.6 + bi as f64 * 0.025), maxcpu: 32 };
+                            let r: Vec<f64> = splits.iter().zip(&meas).map(|(&(v, nc), &t)| t - model(&cost, v, nc, k)).collect();
+                            let kk = r.iter().sum::<f64>() / r.len() as f64;
+                            let sse = r.iter().map(|x| (x - kk) * (x - kk)).sum::<f64>();
+                            if sse < best.0 {
+                                best = (sse, cost, kk);
+                            }
+                        }
+                    }
+                }
+            }
+            let (sse, cost, kk) = best;
+            eprintln!(
+                "  (3) lane fit: g0 {:.3} thit {:.4} tzc {:.4} ca {:.3} cb {:.4} (+ common {kk:.3}), rms residual {:.3} ms",
+                cost.g0,
+                cost.thit,
+                cost.tzc,
+                cost.ca,
+                cost.cb,
+                (sse / splits.len() as f64).sqrt()
+            );
+            for &v in &[0usize, 2, 4, 6] {
+                let pts: Vec<(usize, f64)> = splits.iter().zip(&meas).filter(|x| x.0 .0 == v).map(|(&(_, nc), &t)| (nc, t)).collect();
+                let best_nc = pts.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0;
+                let ram: Vec<(u32, u32)> = (0..(k - v) as u32).map(|e| (e, 0)).collect();
+                let planned = plan_split(&cost, v, &ram).len();
+                let t_of = |nc: usize| pts.iter().find(|p| p.0 == nc).unwrap().1;
+                eprintln!(
+                    "  (3) V {v}: ms by nc {}; best nc {best_nc} ({:.3} ms), planned nc {planned} ({:.3} ms), all-GPU {:.3}, all-CPU {:.3}",
+                    pts.iter().map(|&(nc, t)| format!("{nc}:{t:.3}")).collect::<Vec<_>>().join(" "),
+                    t_of(best_nc),
+                    t_of(planned),
+                    t_of(0),
+                    t_of(k - v)
+                );
+            }
+
+            // (4) emulated split with more CPU threads (V 0)
+            for threads in [8usize, 16, 20] {
+                let mut ms = vec![Vec::new(); k + 1];
+                for rep in 0..REPS + WARM {
+                    for nc in 0..=k {
+                        let ng = k - nc;
+                        let bases: Vec<u64> = (0..ng).map(|j| pdev + ((at + j) % NP * rb) as u64).collect();
+                        at += ng;
+                        let es: Vec<Mul1Expert> = (0..nc).map(|j| ex(at + j)).collect();
+                        at += nc;
+                        if ng > 0 {
+                            cuda::to_u64_into(ptrs, &bases);
+                        }
+                        cuda::sync();
+                        let t0 = std::time::Instant::now();
+                        if ng > 0 {
+                            plans[ng - 1].run(&mk, ptrs, xd, yd);
+                            let _ = cudarc::driver::sys::cuStreamQuery(cuda::cur_stream());
+                        }
+                        if nc > 0 {
+                            cpu_mul1::experts_ffn(&es, &x[..h], &mut ys[..nc * h], &act, threads, Path::Auto);
+                        }
+                        cuda::sync();
+                        if rep >= WARM {
+                            ms[nc].push(t0.elapsed().as_secs_f64() * 1e3);
+                        }
+                    }
+                }
+                let m: Vec<f64> = ms.into_iter().map(median).collect();
+                let (bi, bt) = m.iter().enumerate().min_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+                eprintln!(
+                    "  (4) {threads:2} CPU threads, V 0: ms by nc {}; best nc {bi} ({bt:.3} ms) vs all-GPU {:.3} ms ({:+.1} %)",
+                    m.iter().enumerate().map(|(nc, t)| format!("{nc}:{t:.3}")).collect::<Vec<_>>().join(" "),
+                    m[0],
+                    (bt / m[0] - 1.0) * 100.0
+                );
+            }
+
+            plan.free();
+            for p in plans.iter_mut() {
+                p.free();
+            }
+            for mut d in [w.router, w.bias, w.shared.gate.w, w.shared.gate.gs, w.shared.up.w, w.shared.up.gs, w.shared.down.w, w.shared.down.gs] {
+                cuda::free_dev(&mut d);
+            }
+            for d in [&mut vram, &mut table, &mut xd, &mut yd, &mut ptrs] {
+                cuda::free_dev(d);
+            }
+            pinned.free();
+        }
     }
 }
