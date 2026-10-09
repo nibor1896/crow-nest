@@ -285,6 +285,12 @@ Since 2026-10-09 a glm5_next container boots and serves (`engine/src/glm5_engine
    VRAM and the derived pinned budget, printed as `[budget]` lines (`manager::glm5_plan_table`),
    every layer's dense part and the head (`Glm5Run::load`, MLA caches of `n_ctx` rows), the three
    expert tiers at the plan's sizes (`ExpertTiers`, one NVMe reader).
+   `CROW_GLM_VRAM_SLOTS`, `CROW_GLM_PINNED_SLOTS` and `CROW_GLM_NVME_READERS` are `glm5_run`'s
+   `--vram-slots`, `--pinned-slots` and `--readers` for serve (#185, `boot::glm5_tier_ask`). Unset
+   means the plan's slots and one reader. A slot count may be at most the plan's
+   (`glm5_tiers::tier_sizes`). Readers run 1..=8. A malformed value is refused by name in
+   `glm5_door` before the CUDA context, and a value above the plan is refused in `Glm5Device::load`.
+   The `[budget] glm5_next tiers` line prints the tiers in force, the plan's, and where each came from.
 2. **Rows.** `Glm5Engine::prefill(chunk)` takes a slice of prompt ids; inside, `Rows::prefill_chunk`
    runs them one row at a time with the head on the last row (`Glm5Run::row`, the row body of
    `Glm5Run::generate`). #186 replaces `prefill_chunk` for the device with a chunked prefill;
