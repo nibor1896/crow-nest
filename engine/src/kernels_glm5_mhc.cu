@@ -17,6 +17,9 @@
 //                    record's steps 3-5 on 16 lanes of warp 0, same operations in the same order)
 //                    and collapsed (warps 1-7). done [T] u32 is a zeroed per-row counter the last
 //                    block resets.
+//   glm5_mhc_mix_norm CROW_GLM_HCFUSE: glm5_mhc_mix plus the sublayer RMSNorm (gm_rmsnorm of
+//                    kernels_glm5_mla.cu, weight nw [H] f32) over collapsed in place, by the last
+//                    block of the row: 2 launches per site (mix_norm, expand) instead of 3.
 //   glm5_mhc_coeffs  the record (kept for the #191 bit-identity test; no longer launched).
 //   glm5_mhc_expand  grid (ceil(H / 256), T), block 256. out[t][i][d] = post[i] y[t][d]
 //                    + sum_j comb[j][i] x[t][j][d]. out may be x itself (one thread reads the four
@@ -251,6 +254,25 @@ extern "C" __global__ void glm5_mhc_expand(const float* x, const float* __restri
     for (int i = 0; i < MHC_HC; i++) orow[i * H + d] = o[i];
 }
 
+// the layer driver's block sum of gm_rmsnorm (kernels_glm5_mla.cu `gm_block_sum`), copied verbatim:
+// glm5_mhc_mix_norm's norm tail must take gm_rmsnorm's reduction tree to stay bit-identical
+__device__ __forceinline__ float mhc_gm_warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+__device__ __forceinline__ float mhc_gm_block_sum(float v, float* red) {
+    v = mhc_gm_warp_sum(v);
+    int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+    __syncthreads();
+    if (l == 0) red[w] = v;
+    __syncthreads();
+    float s = (l < (blockDim.x >> 5)) ? red[l] : 0.0f;
+    if (w == 0) s = mhc_gm_warp_sum(s);
+    if (threadIdx.x == 0) red[0] = s;
+    __syncthreads();
+    return red[0];
+}
+
 // #191: steps 1-5 + 9 of one site. grid (24, T), block 256. Block m of row t: the record's RMS
 // factor (every block the same chain), then the record's dot chain, xor tree and warp sum for mix
 // row m -> logits[t][m]. The LAST of the 24 blocks of row t to finish (a per-row counter `done`,
@@ -259,11 +281,17 @@ extern "C" __global__ void glm5_mhc_expand(const float* x, const float* __restri
 // themselves (lanes 32-35, the same expression) and write collapsed [t] in the record's order. Only
 // that block reads other blocks' logits: they are published with __threadfence before the counter
 // add and read back with __ldcg (L2, not a stale L1).
-extern "C" __global__ void glm5_mhc_mix(const float* __restrict__ x, const unsigned short* __restrict__ fn,
-                                        const float* __restrict__ base, const float* __restrict__ scale,
-                                        float* logits, float* __restrict__ pre, float* __restrict__ post,
-                                        float* __restrict__ comb, float* __restrict__ collapsed,
-                                        unsigned int* done, const int* __restrict__ prm) {
+// NORM (CROW_GLM_HCFUSE, glm5_mhc_mix_norm): that last block then also runs the sublayer's weighted
+// RMSNorm over collapsed [t] in place, gm_rmsnorm's code (one 256-thread block per row, the same
+// strided chain, the same block sum, the same expressions under NVRTC's default contraction), so
+// the norm launch of the driver (MlaKernels::rmsnorm_rows) is folded into the site.
+template <bool NORM>
+__device__ __forceinline__ void mhc_mix_site(const float* __restrict__ x, const unsigned short* __restrict__ fn,
+                                             const float* __restrict__ base, const float* __restrict__ scale,
+                                             float* logits, float* __restrict__ pre, float* __restrict__ post,
+                                             float* __restrict__ comb, float* collapsed,
+                                             unsigned int* done, const int* __restrict__ prm,
+                                             const float* __restrict__ nw) {
     __shared__ float sh_red[MHC_THREADS / 32];
     __shared__ float sh_part[MHC_THREADS / 32];
     __shared__ float sh_m[MHC_MIX];
@@ -313,18 +341,50 @@ extern "C" __global__ void glm5_mhc_mix(const float* __restrict__ x, const unsig
     __syncthreads();
     if (threadIdx.x < 32) {
         mhc_coeff_tail_warp(sh_m, base, scale, sh_pre, pre, post, comb, t, true);
-        return;
+        if (!NORM) return;
+    } else {
+        // warps 1-7: pre for the collapse (the record's expression), then the collapse
+        const int u = threadIdx.x - 32;
+        if (u < MHC_HC) sh_pre1[u] = __fadd_rn(mhc_sigmoid(__fadd_rn(__fmul_rn(sh_m[u], scale[0]), base[u])), MHC_HC_EPS);
+        asm volatile("bar.sync 1, %0;" ::"r"(MHC_THREADS - 32));
+        const float p0 = sh_pre1[0], p1 = sh_pre1[1], p2 = sh_pre1[2], p3 = sh_pre1[3];
+        for (int d = u; d < H; d += MHC_THREADS - 32) {
+            float c = __fmul_rn(p0, xr[d]);
+            c = __fadd_rn(c, __fmul_rn(p1, xr[H + d]));
+            c = __fadd_rn(c, __fmul_rn(p2, xr[2 * H + d]));
+            c = __fadd_rn(c, __fmul_rn(p3, xr[3 * H + d]));
+            collapsed[(size_t)t * H + d] = c;
+        }
     }
-    // warps 1-7: pre for the collapse (the record's expression), then the collapse
-    const int u = threadIdx.x - 32;
-    if (u < MHC_HC) sh_pre1[u] = __fadd_rn(mhc_sigmoid(__fadd_rn(__fmul_rn(sh_m[u], scale[0]), base[u])), MHC_HC_EPS);
-    asm volatile("bar.sync 1, %0;" ::"r"(MHC_THREADS - 32));
-    const float p0 = sh_pre1[0], p1 = sh_pre1[1], p2 = sh_pre1[2], p3 = sh_pre1[3];
-    for (int d = u; d < H; d += MHC_THREADS - 32) {
-        float c = __fmul_rn(p0, xr[d]);
-        c = __fadd_rn(c, __fmul_rn(p1, xr[H + d]));
-        c = __fadd_rn(c, __fmul_rn(p2, xr[2 * H + d]));
-        c = __fadd_rn(c, __fmul_rn(p3, xr[3 * H + d]));
-        collapsed[(size_t)t * H + d] = c;
-    }
+    if (!NORM) return;
+
+    // NORM: gm_rmsnorm over collapsed [t] (n = H, eps = rms_norm_eps), all 256 threads; the
+    // barrier makes the collapse of warps 1-7 visible to the whole block
+    __syncthreads();
+    __shared__ float red[32];
+    float* xp = collapsed + (size_t)t * H;
+    const long long hn = H;
+    float sq = 0.0f;
+    for (long long i = threadIdx.x; i < hn; i += blockDim.x) sq += xp[i] * xp[i];
+    float rn = rsqrtf(mhc_gm_block_sum(sq, red) / (float)hn + MHC_RMS_EPS);
+    for (long long i = threadIdx.x; i < hn; i += blockDim.x) xp[i] = nw[i] * (xp[i] * rn);
+}
+
+extern "C" __global__ void glm5_mhc_mix(const float* __restrict__ x, const unsigned short* __restrict__ fn,
+                                        const float* __restrict__ base, const float* __restrict__ scale,
+                                        float* logits, float* __restrict__ pre, float* __restrict__ post,
+                                        float* __restrict__ comb, float* __restrict__ collapsed,
+                                        unsigned int* done, const int* __restrict__ prm) {
+    mhc_mix_site<false>(x, fn, base, scale, logits, pre, post, comb, collapsed, done, prm, nullptr);
+}
+
+// CROW_GLM_HCFUSE: glm5_mhc_mix, then the sublayer RMSNorm (weight nw [H] f32) over collapsed in
+// place, in one launch. grid (24, T), block 256.
+extern "C" __global__ void glm5_mhc_mix_norm(const float* __restrict__ x, const unsigned short* __restrict__ fn,
+                                             const float* __restrict__ base, const float* __restrict__ scale,
+                                             float* logits, float* __restrict__ pre, float* __restrict__ post,
+                                             float* __restrict__ comb, float* collapsed,
+                                             unsigned int* done, const int* __restrict__ prm,
+                                             const float* __restrict__ nw) {
+    mhc_mix_site<true>(x, fn, base, scale, logits, pre, post, comb, collapsed, done, prm, nw);
 }

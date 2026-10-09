@@ -905,12 +905,13 @@ impl Glm5Pass {
         assert!(!decode || t == 1, "glm5_model: a decode call is one row, got {t}");
         let h = self.g.hidden;
         let (kn, ints) = (&self.kn, &self.ints);
-        // attention site
-        self.mhc.coeffs(&kn.mhc, &lw.attn_hc, x, self.collapsed, t);
+        // attention site; CROW_GLM_HCFUSE folds the norm into the site (untapped: taps read collapsed before it)
+        let fuse = taps.is_none() && glm5_mhc::hcfuse();
+        if fuse { self.mhc.coeffs_norm(&kn.mhc, &lw.attn_hc, x, lw.input_norm, self.collapsed, t) } else { self.mhc.coeffs(&kn.mhc, &lw.attn_hc, x, self.collapsed, t) }
         if let Some(tp) = taps.as_deref_mut() {
             self.tap_coeffs(&mut tp.attn, t);
         }
-        kn.mla.rmsnorm_rows(self.collapsed, lw.input_norm, h, t, self.st2);
+        if !fuse { kn.mla.rmsnorm_rows(self.collapsed, lw.input_norm, h, t, self.st2) }
         match &lw.attn {
             AttnW::Kda(a) => {
                 let mut proj = |p: KdaProj, xi: Dev, yo: Dev, tt: usize| match p {
@@ -953,11 +954,11 @@ impl Glm5Pass {
             }
         }
         // FFN site
-        self.mhc.coeffs(&kn.mhc, &lw.ffn_hc, x, self.collapsed, t);
+        if fuse { self.mhc.coeffs_norm(&kn.mhc, &lw.ffn_hc, x, lw.post_norm, self.collapsed, t) } else { self.mhc.coeffs(&kn.mhc, &lw.ffn_hc, x, self.collapsed, t) }
         if let Some(tp) = taps.as_deref_mut() {
             self.tap_coeffs(&mut tp.ffn, t);
         }
-        kn.mla.rmsnorm_rows(self.collapsed, lw.post_norm, h, t, self.st2);
+        if !fuse { kn.mla.rmsnorm_rows(self.collapsed, lw.post_norm, h, t, self.st2) }
         match &lw.ffn {
             FfnW::Dense(w) => {
                 if !self.dense_plans.iter().any(|p| p.tokens == t) {
@@ -1089,8 +1090,9 @@ impl Glm5Pass {
         let h = self.g.hidden;
         let (kn, ints) = (&self.kn, &self.ints);
         // attention site: `call_inner`'s launches for a prompt call, without taps
-        self.mhc.coeffs(&kn.mhc, &lw.attn_hc, x, self.collapsed, t);
-        kn.mla.rmsnorm_rows(self.collapsed, lw.input_norm, h, t, self.st2);
+        let fuse = glm5_mhc::hcfuse();
+        if fuse { self.mhc.coeffs_norm(&kn.mhc, &lw.attn_hc, x, lw.input_norm, self.collapsed, t) } else { self.mhc.coeffs(&kn.mhc, &lw.attn_hc, x, self.collapsed, t) }
+        if !fuse { kn.mla.rmsnorm_rows(self.collapsed, lw.input_norm, h, t, self.st2) }
         match &lw.attn {
             AttnW::Kda(a) => {
                 let mut proj = |p: KdaProj, xi: Dev, yo: Dev, tt: usize| match p {
@@ -1117,8 +1119,8 @@ impl Glm5Pass {
         }
         self.mhc.expand(&kn.mhc, x, self.sub, x, t);
         // FFN site
-        self.mhc.coeffs(&kn.mhc, &lw.ffn_hc, x, self.collapsed, t);
-        kn.mla.rmsnorm_rows(self.collapsed, lw.post_norm, h, t, self.st2);
+        if fuse { self.mhc.coeffs_norm(&kn.mhc, &lw.ffn_hc, x, lw.post_norm, self.collapsed, t) } else { self.mhc.coeffs(&kn.mhc, &lw.ffn_hc, x, self.collapsed, t) }
+        if !fuse { kn.mla.rmsnorm_rows(self.collapsed, lw.post_norm, h, t, self.st2) }
         let w = match &lw.ffn {
             FfnW::Dense(w) => {
                 let (inter, limit) = (self.g.dense_inter, self.g.swiglu_limit as f32);
@@ -1271,8 +1273,9 @@ impl Glm5Pass {
         assert!((1..=self.max_t).contains(&t) && pos0 + t <= self.cap, "glm5_model: verify rows {pos0}..{} (max_t {}, cap {})", pos0 + t, self.max_t, self.cap);
         let h = self.g.hidden;
         let row = |b: Dev, r: usize| b + (r * h * 4) as u64;
-        self.mhc.coeffs(&self.kn.mhc, &lw.attn_hc, x, self.collapsed, t);
-        self.kn.mla.rmsnorm_rows(self.collapsed, lw.input_norm, h, t, self.st2);
+        let fuse = glm5_mhc::hcfuse();
+        if fuse { self.mhc.coeffs_norm(&self.kn.mhc, &lw.attn_hc, x, lw.input_norm, self.collapsed, t) } else { self.mhc.coeffs(&self.kn.mhc, &lw.attn_hc, x, self.collapsed, t) }
+        if !fuse { self.kn.mla.rmsnorm_rows(self.collapsed, lw.input_norm, h, t, self.st2) }
         match &lw.attn {
             AttnW::Kda(a) => {
                 assert!(kda_snaps.len() + 1 >= t, "glm5_model: {t} verify rows, {} KDA snapshot slots", kda_snaps.len());
@@ -1311,8 +1314,8 @@ impl Glm5Pass {
             }
         }
         self.mhc.expand(&self.kn.mhc, x, self.sub, x, t);
-        self.mhc.coeffs(&self.kn.mhc, &lw.ffn_hc, x, self.collapsed, t);
-        self.kn.mla.rmsnorm_rows(self.collapsed, lw.post_norm, h, t, self.st2);
+        if fuse { self.mhc.coeffs_norm(&self.kn.mhc, &lw.ffn_hc, x, lw.post_norm, self.collapsed, t) } else { self.mhc.coeffs(&self.kn.mhc, &lw.ffn_hc, x, self.collapsed, t) }
+        if !fuse { self.kn.mla.rmsnorm_rows(self.collapsed, lw.post_norm, h, t, self.st2) }
         match &lw.ffn {
             FfnW::Dense(w) => {
                 if !self.dense_plans.iter().any(|p| p.tokens == t) {
