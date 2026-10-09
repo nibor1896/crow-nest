@@ -183,6 +183,29 @@ pub fn lane_split(lane: Option<&str>) -> bool {
     lane.map(str::trim) == Some("split")
 }
 
+/// worker threads of the CPU lane's pool run (`glm5_moe::lane::THREADS`)
+pub const LANE_THREADS_ENV: &str = "CROW_GLM_LANE_THREADS";
+
+/// the lane's thread count under `CROW_GLM_CPU_LANE=split` when `CROW_GLM_LANE_THREADS` is
+/// unset: the count whose best split was fastest in `glm5_tiers_gpu_split_cost_bench`
+pub const SPLIT_LANE_THREADS: usize = 20;
+
+/// Parse `CROW_GLM_LANE_THREADS` (`threads`) against `CROW_GLM_CPU_LANE` (`lane`): a whole
+/// number from 1 to 256; unset or empty = `glm5_moe::LANE_THREADS` (8, the #188 lane as it was)
+/// or, with `split`, [`SPLIT_LANE_THREADS`]; anything else refused by name.
+pub fn lane_threads(threads: Option<&str>, lane: Option<&str>) -> Result<usize, String> {
+    match threads.map(str::trim) {
+        None | Some("") => Ok(if lane_split(lane) { SPLIT_LANE_THREADS } else { crate::glm5_moe::LANE_THREADS }),
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if (1..=256).contains(&n) => Ok(n),
+            _ => Err(format!(
+                "{LANE_THREADS_ENV}={v:?}: accepted a whole number of threads from 1 to 256 (unset: {}, or {SPLIT_LANE_THREADS} with {CPU_LANE_ENV}=split)",
+                crate::glm5_moe::LANE_THREADS
+            )),
+        },
+    }
+}
+
 /// The fixed cost model of the split (ms per MoE layer of one decode row), sybil's `GLM53_NV_POL`
 /// (`g0, thit, tzc, ca, cb`, `glm53/nv2.py`) for this engine: the GPU lane costs `g0` (gather,
 /// shared expert, launches: it runs in every layer, so unlike sybil's it is charged with no VRAM
@@ -200,14 +223,37 @@ pub struct SplitCost {
 }
 
 impl SplitCost {
-    /// RTX 5090 (PCIe 5.0 x16), Core Ultra 9 285K, 2 x 32 GB DDR5-5600, the lane at
-    /// `glm5_moe::LANE_THREADS` (8): `glm5_tiers_gpu_split_cost_bench` (2026-10-09), the real
-    /// lane over 24 (VRAM, CPU) splits of one synthetic GLM layer, records rotated beyond the L3
-    /// and the GPU's L2; CPU and GPU zero-copy share the DRAM, so the fit takes `tzc` and `cb`
-    /// under each other's load. Solo: VRAM 0.0148 ms per expert, zero-copy 0.239 (39.6 GB/s),
-    /// CPU 0.406. The plan picked the measured best split at V 0, 2, 4 (V 0: 3 CPU, 1.609 ms vs
-    /// 1.854 all-GPU and 3.399 all-CPU) and one off at V 6 (0.625 vs 0.608 ms).
-    pub const RTX5090_285K: SplitCost = SplitCost { g0: 0.100, thit: 0.0148, tzc: 0.239, ca: 0.290, cb: 0.386, maxcpu: 32 };
+    /// RTX 5090 (PCIe 5.0 x16), Core Ultra 9 285K, 2 x 32 GB DDR5-5600, by the lane's thread
+    /// count: `glm5_tiers_gpu_split_cost_bench` (2026-10-10), the real lane over 24 (VRAM, CPU)
+    /// splits of one synthetic GLM layer at 8, 12, 16 and 20 threads, records rotated beyond the
+    /// L3 and the GPU's L2; CPU and GPU zero-copy share the DRAM, so the fit takes `tzc` and `cb`
+    /// under each other's load (`thit` 0.0148 from the solo VRAM run). Best split per V 0 / 2 /
+    /// 4 / 6, ms: 8 threads 1.626 / 1.335 / 1.098 / 0.717, 12 1.675 / 1.349 / 1.022 / 0.630,
+    /// 16 1.535 / 1.226 / 0.913 / 0.614, 20 1.503 / 1.261 / 0.841 / 0.572 (all-GPU V 0 2.08-2.47).
+    pub const RTX5090_285K_BY_THREADS: [(usize, SplitCost); 4] = [
+        (8, SplitCost { g0: 0.040, thit: 0.0148, tzc: 0.2441, ca: 0.140, cb: 0.4017, maxcpu: 32 }),
+        (12, SplitCost { g0: 0.050, thit: 0.0148, tzc: 0.2589, ca: 0.110, cb: 0.3459, maxcpu: 32 }),
+        (16, SplitCost { g0: 0.220, thit: 0.0148, tzc: 0.2737, ca: 0.360, cb: 0.2849, maxcpu: 32 }),
+        (20, SplitCost { g0: 0.290, thit: 0.0148, tzc: 0.2367, ca: 0.350, cb: 0.2481, maxcpu: 32 }),
+    ];
+
+    /// the model at [`SPLIT_LANE_THREADS`], the split's default
+    pub const RTX5090_285K: SplitCost = SplitCost::for_threads(SPLIT_LANE_THREADS);
+
+    /// the calibrated model of the thread count nearest `n` (a tie to the lower count); a count
+    /// outside 8..20 takes the nearest end, whose per-expert CPU cost no longer fits it
+    pub const fn for_threads(n: usize) -> SplitCost {
+        let t = &SplitCost::RTX5090_285K_BY_THREADS;
+        let mut best = 0;
+        let mut i = 1;
+        while i < t.len() {
+            if t[i].0.abs_diff(n) < t[best].0.abs_diff(n) {
+                best = i;
+            }
+            i += 1;
+        }
+        t[best].1
+    }
 }
 
 /// The CPU/GPU split of one decode call's MoE layer (sybil `nv2_host.cpp` `plan_and_reply`,
@@ -851,6 +897,8 @@ impl ExpertTiers {
         let pu = pinned_use(std::env::var(PINNED_ENV).ok().as_deref(), std::env::var(CPU_LANE_ENV).ok().as_deref())?;
         let pinned_wc = sizes.pinned > 0 && cuda::pin_alloc_mode() == cuda::PinAlloc::Wc;
         lane_on_wc(pu, pinned_wc)?;
+        let lane_threads = lane_threads(std::env::var(LANE_THREADS_ENV).ok().as_deref(), std::env::var(CPU_LANE_ENV).ok().as_deref())?;
+        crate::glm5_moe::lane::THREADS.store(lane_threads, std::sync::atomic::Ordering::Relaxed);
         let cache = ExpertCache::new(policy, Scope::PerLayer, nl, g.experts, sizes.vram, sizes.pinned)?;
         let records = ExpertRecord::glm5_table(cnq, &moe.record, &layers, g.experts as u32)?;
         let mut cfg = NvmeConfig::new(path);
@@ -893,7 +941,7 @@ impl ExpertTiers {
             pinned_wc,
             topk: g.topk,
             lane_clock: Default::default(),
-            split: lane_split(std::env::var(CPU_LANE_ENV).ok().as_deref()).then_some(SplitCost::RTX5090_285K),
+            split: lane_split(std::env::var(CPU_LANE_ENV).ok().as_deref()).then(|| SplitCost::for_threads(lane_threads)),
             heat: vec![0; nl * g.experts],
             stager: None,
         };
@@ -4309,15 +4357,42 @@ mod split_tests {
         assert_eq!(plan_split(&SplitCost { cb: 5.0, ..c }, 0, &ram), Vec::<u32>::new());
     }
 
-    /// The calibrated model plans the splits the bench measured best (2026-10-09, lane at 8
-    /// threads): 8 pinned ids 3 on the CPU, 2 VRAM + 6 pinned 2, 4 + 4 1.
+    /// The calibrated models plan the splits the bench measured best (confirmation run
+    /// 2026-10-10, CPU ids for V 0 / 2 / 4 / 6 of 8 picks): 8 threads 3 / 2 / 1 / 1, 12 threads
+    /// 3 / 2 / 2 / 1, 16 and 20 threads 4 / 3 / 2 / 1; the split's default is the 20-thread model.
     #[test]
     fn the_calibrated_cost_model_plans_the_measured_best_splits() {
-        let c = SplitCost::RTX5090_285K;
-        for (hits, want) in [(0usize, 3usize), (2, 2), (4, 1)] {
-            let ram: Vec<(u32, u32)> = (0..(8 - hits) as u32).map(|e| (e, 0)).collect();
-            assert_eq!(plan_split(&c, hits, &ram).len(), want, "V {hits}");
+        let want = [(8usize, [3usize, 2, 1, 1]), (12, [3, 2, 2, 1]), (16, [4, 3, 2, 1]), (20, [4, 3, 2, 1])];
+        for (threads, best) in want {
+            let c = SplitCost::for_threads(threads);
+            for (hits, nc) in [0usize, 2, 4, 6].into_iter().zip(best) {
+                let ram: Vec<(u32, u32)> = (0..(8 - hits) as u32).map(|e| (e, 0)).collect();
+                assert_eq!(plan_split(&c, hits, &ram).len(), nc, "{threads} threads V {hits}");
+            }
         }
+        assert_eq!(SplitCost::RTX5090_285K, SplitCost::for_threads(SPLIT_LANE_THREADS));
+        assert_eq!(SPLIT_LANE_THREADS, 20);
+        assert_eq!(SplitCost::for_threads(1), SplitCost::for_threads(8));
+        assert_eq!(SplitCost::for_threads(14), SplitCost::for_threads(12));
+        assert_eq!(SplitCost::for_threads(17), SplitCost::for_threads(16));
+        assert_eq!(SplitCost::for_threads(24), SplitCost::for_threads(20));
+    }
+
+    /// `CROW_GLM_LANE_THREADS`: unset keeps the #188 lane's 8 threads, and gives `split` its
+    /// measured default (20); a whole number 1..=256 is taken as is; anything else refused by name.
+    #[test]
+    fn the_lane_threads_switch_parses_and_refuses_by_name() {
+        assert_eq!(lane_threads(None, None), Ok(8));
+        assert_eq!(lane_threads(None, Some("1")), Ok(8));
+        assert_eq!(lane_threads(Some(""), Some("split")), Ok(20));
+        assert_eq!(lane_threads(Some(" 12 "), Some("split")), Ok(12));
+        assert_eq!(lane_threads(Some("16"), Some("1")), Ok(16));
+        assert_eq!(lane_threads(Some("256"), None), Ok(256));
+        for bad in ["0", "257", "-4", "twenty", "1.5"] {
+            let e = lane_threads(Some(bad), Some("split")).unwrap_err();
+            assert!(e.starts_with(&format!("CROW_GLM_LANE_THREADS={bad:?}: accepted a whole number")), "{e}");
+        }
+        assert_eq!(crate::glm5_moe::lane::threads(), crate::glm5_moe::LANE_THREADS, "nothing stored: the lane keeps 8");
     }
 
     /// `lane_combos_where`: a pinned id the plan refuses stays a GPU combo with its table entry;
@@ -4451,11 +4526,13 @@ mod split_tests {
     /// cacheable pinned RAM (303 MB) and 16 in VRAM, rotated call by call so neither the L3 nor
     /// the GPU's 96 MB L2 holds them. (1) Solo GPU: `mul1::FfnPlan` over n = 1..8 records from
     /// VRAM and from pinned RAM (zero-copy), lines `a + thit n`, `a + tzc n`. (2) Solo CPU: the
-    /// lane's `experts_ffn` (clamped SwiGLU, `LANE_THREADS`) over n = 1..8 pinned records. (3) The
-    /// real lane (`GpuMoePlan::run` with a `lane::post`): every split of V VRAM picks (0, 2, 4, 6)
+    /// lane's `experts_ffn` (clamped SwiGLU) over n = 1..8 pinned records. (3) The real lane
+    /// (`GpuMoePlan::run` with a `lane::post`, (2) and (3) at lane threads 8, 12, 16, 20 through
+    /// `lane::THREADS`): every split of V VRAM picks (0, 2, 4, 6)
     /// and nc CPU picks (the rest zero-copy), wall time per layer call (route + experts + shared
     /// + combine + sync); fit of `k + max(g0 + thit V + tzc Z, ca + cb nc)` with `thit` from (1)
-    /// over a grid of (g0, tzc, ca, cb), and per V the best nc measured vs planned. (4) The same
+    /// over a grid of (g0, tzc, ca, cb), and per V the best nc measured vs planned by the fit and
+    /// by the shipped [`SplitCost::for_threads`]. (4) The same
     /// split emulated with the CPU at 8, 16, 20 threads (FfnPlan zero-copy + `experts_ffn`
     /// concurrently): what a larger `LANE_THREADS` would give. Median of 25 calls per point.
     #[test]
@@ -4493,7 +4570,7 @@ mod split_tests {
             let act = |a: f32, b: f32| crate::glm5_moe::swiglu_clamp(a, b, 10.0);
             const REPS: usize = 28;
             const WARM: usize = 3;
-            eprintln!("glm5_tiers split bench: {} B per record, {NP} pinned + {NV} VRAM records, lane threads {}", rb, crate::glm5_moe::LANE_THREADS);
+            eprintln!("glm5_tiers split bench: {} B per record, {NP} pinned + {NV} VRAM records", rb);
 
             // (1) solo GPU
             let (mut xd, mut yd, mut ptrs) = (cuda::to_f32_dev(&x), cuda::alloc_zeroed(8 * h * 4), cuda::alloc_zeroed(64));
@@ -4531,6 +4608,7 @@ mod split_tests {
             let ex = |slot: usize| Mul1Expert::from_record(std::slice::from_raw_parts(phost.add(slot % NP * rb), rb), h, inter, g.bitrate).unwrap();
             let mut ys = vec![0f32; 8 * h];
             let mut cpu_solo = |threads: usize| -> Vec<(f64, f64)> {
+                let mut at = 1000usize;
                 let mut ms = vec![Vec::new(); 8];
                 for rep in 0..REPS + WARM {
                     for n in 1..=8usize {
@@ -4545,10 +4623,6 @@ mod split_tests {
                 }
                 ms.into_iter().enumerate().map(|(i, v)| ((i + 1) as f64, median(v))).collect()
             };
-            let pc = cpu_solo(crate::glm5_moe::LANE_THREADS);
-            let (ac, cb_solo) = line(&pc);
-            eprintln!("  (2) CPU {} thr   ms per call {}; fit {ac:.3} + {cb_solo:.4} n", crate::glm5_moe::LANE_THREADS, row(&pc));
-
             // (3) the real lane
             let shared = |rows: usize, cols: usize| GpuNvfp4 { w: cuda::alloc_zeroed(crate::cpu_nvfp4::Nvfp4Matrix::byte_len(rows, cols)), gs: cuda::to_f32_dev(&[0.3]), rows, cols };
             let w = GpuMoeWeights {
@@ -4560,6 +4634,14 @@ mod split_tests {
             let mut table = cuda::alloc_zeroed(g.experts * 8);
             let clock = Arc::new(lane::Clock::default());
             let splits: Vec<(usize, usize)> = [0usize, 2, 4, 6].iter().flat_map(|&v| (0..=k - v).map(move |nc| (v, nc))).collect();
+            let mut ac = 0.0;
+            let mut cost = SplitCost::RTX5090_285K;
+            for &threads in &[8usize, 12, 16, 20] {
+            lane::THREADS.store(threads, std::sync::atomic::Ordering::Relaxed);
+            let pc = cpu_solo(threads);
+            let cb_solo;
+            (ac, cb_solo) = line(&pc);
+            eprintln!("  (2) CPU {threads:2} thr  ms per call {}; fit {ac:.3} + {cb_solo:.4} n", row(&pc));
             let mut ms = vec![Vec::new(); splits.len()];
             for rep in 0..REPS + WARM {
                 for (i, &(v, nc)) in splits.iter().enumerate() {
@@ -4602,9 +4684,10 @@ mod split_tests {
                     }
                 }
             }
-            let (sse, cost, kk) = best;
+            let (sse, fit, kk) = best;
+            cost = fit;
             eprintln!(
-                "  (3) lane fit: g0 {:.3} thit {:.4} tzc {:.4} ca {:.3} cb {:.4} (+ common {kk:.3}), rms residual {:.3} ms",
+                "  (3) {threads:2} thr lane fit: g0 {:.3} thit {:.4} tzc {:.4} ca {:.3} cb {:.4} (+ common {kk:.3}), rms residual {:.3} ms",
                 cost.g0,
                 cost.thit,
                 cost.tzc,
@@ -4617,16 +4700,20 @@ mod split_tests {
                 let best_nc = pts.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0;
                 let ram: Vec<(u32, u32)> = (0..(k - v) as u32).map(|e| (e, 0)).collect();
                 let planned = plan_split(&cost, v, &ram).len();
+                let shipped = plan_split(&SplitCost::for_threads(threads), v, &ram).len();
                 let t_of = |nc: usize| pts.iter().find(|p| p.0 == nc).unwrap().1;
                 eprintln!(
-                    "  (3) V {v}: ms by nc {}; best nc {best_nc} ({:.3} ms), planned nc {planned} ({:.3} ms), all-GPU {:.3}, all-CPU {:.3}",
+                    "  (3) {threads:2} thr V {v}: ms by nc {}; best nc {best_nc} ({:.3} ms), fit plans {planned} ({:.3} ms), shipped plans {shipped} ({:.3} ms), all-GPU {:.3}, all-CPU {:.3}",
                     pts.iter().map(|&(nc, t)| format!("{nc}:{t:.3}")).collect::<Vec<_>>().join(" "),
                     t_of(best_nc),
                     t_of(planned),
+                    t_of(shipped),
                     t_of(0),
                     t_of(k - v)
                 );
             }
+            }
+            lane::THREADS.store(0, std::sync::atomic::Ordering::Relaxed);
 
             // (4) emulated split with more CPU threads (V 0)
             for threads in [8usize, 16, 20] {
