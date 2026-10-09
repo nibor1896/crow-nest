@@ -38,6 +38,7 @@ use crate::cnq::Cnq;
 use crate::cuda::{self, Pinned};
 use crate::expert_cache::{self, ExpertCache, Scope, Tier};
 use crate::geo::{ExpertRecordSpec, Glm5Geo};
+use crate::glm5_flags::{self, Feed, Readback, Routed, Switches};
 use crate::glm5_head::Head;
 use crate::glm5_kda::{KdaDims, KdaState};
 use crate::glm5_mla::{MlaCache, MlaDims};
@@ -695,6 +696,46 @@ pub struct Glm5Run {
     normed: Dev,
     logits: Dev,
     next: Dev,
+    /// #149 path B / #189: the decode switches and what they hold (all `None` when off)
+    sw: Switches,
+    sw_kernels: Option<glm5_flags::Kernels>,
+    feed: Option<Feed>,
+    readback: Option<Readback>,
+}
+
+/// #189: a row whose greedy id the host has not read yet (`CROW_GLM_LOOKAHEAD`)
+struct Pending {
+    pos: usize,
+    prompt: bool,
+    t0: std::time::Instant,
+    base: RowBase,
+}
+
+/// the store's counters at a row's start; a row's report is the difference at its end
+struct RowBase {
+    counters: Vec<[u64; 3]>,
+    moves: Vec<Moves>,
+    nvme_reads: u64,
+    nvme_bytes: u64,
+}
+
+impl RowBase {
+    fn of(t: &ExpertTiers) -> RowBase {
+        RowBase { counters: t.cache.counters().to_vec(), moves: t.moves.clone(), nvme_reads: t.nvme_reads, nvme_bytes: t.nvme_bytes }
+    }
+
+    fn report(&self, t: &ExpertTiers, pos: usize, prompt: bool, next: Option<i64>, t0: std::time::Instant) -> TokenReport {
+        TokenReport {
+            pos,
+            prompt,
+            next,
+            secs: t0.elapsed().as_secs_f64(),
+            nvme_reads: t.nvme_reads - self.nvme_reads,
+            nvme_bytes: t.nvme_bytes - self.nvme_bytes,
+            tiers: t.cache.counters().iter().zip(&self.counters).map(|(a, b)| [a[0] - b[0], a[1] - b[1], a[2] - b[2]]).collect(),
+            moves: t.moves.iter().zip(&self.moves).map(|(a, b)| a.since(b)).collect(),
+        }
+    }
 }
 
 impl Glm5Run {
@@ -724,7 +765,7 @@ impl Glm5Run {
         let kda = (0..g.layers).map(|l| (gm::attn_kind(g, l) == AttnKind::Kda).then(|| KdaState::alloc(&kd))).collect();
         let mla = (0..g.layers).map(|l| (gm::attn_kind(g, l) == AttnKind::Mla).then(|| MlaCache::new(&md, cap))).collect();
         let row = g.hc_streams * g.hidden;
-        Glm5Run {
+        let mut run = Glm5Run {
             g: *g,
             moe: *moe,
             cap,
@@ -739,12 +780,72 @@ impl Glm5Run {
             normed: cuda::alloc_named("glm5_run normed", g.hidden * 4),
             logits: cuda::alloc_named("glm5_run logits", g.vocab * 4),
             next: cuda::alloc_named("glm5_run greedy id", 4),
+            sw: Switches::default(),
+            sw_kernels: None,
+            feed: None,
+            readback: None,
+        };
+        let sw = Switches::from_env();
+        if sw != Switches::default() {
+            run.set_switches(cnq, sw);
+            log(&format!("[glm5_run] decode switches: {}{}", sw.label(), run.feed.as_ref().map_or(String::new(), |f| format!("; lookahead embedding table {} B in VRAM (generate only)", f.bytes))));
         }
+        run
+    }
+
+    /// the decode switches in force
+    pub fn switches(&self) -> Switches {
+        self.sw
+    }
+
+    /// #149 path B / #189: put the decode switches in force (`load` takes them from the
+    /// environment): `flags` gives the pass its router-ids publisher, `lookahead` loads the
+    /// embedding table into VRAM and the pinned readback. Turning a switch off frees what it held.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch of this run is pending.
+    pub unsafe fn set_switches(&mut self, cnq: &mut Cnq, sw: Switches) {
+        cuda::sync();
+        if let Some(r) = self.pass.routed.as_mut() {
+            r.free();
+        }
+        self.pass.routed = None;
+        if let Some(f) = self.feed.as_mut() {
+            f.free();
+        }
+        self.feed = None;
+        if let Some(r) = self.readback.as_mut() {
+            r.free();
+        }
+        self.readback = None;
+        if let Some(k) = self.sw_kernels.as_mut() {
+            k.free();
+        }
+        self.sw_kernels = None;
+        self.sw = sw;
+        if sw == Switches::default() {
+            return;
+        }
+        let k = glm5_flags::Kernels::new(&self.g);
+        if sw.flags {
+            self.pass.routed = Some(Routed::new(&k, self.pass.max_t * self.moe.topk));
+        }
+        if sw.lookahead {
+            self.feed = Some(Feed::load(&k, cnq, &self.g));
+            self.readback = Some(Readback::new(self.g.vocab));
+        }
+        self.sw_kernels = Some(k);
     }
 
     /// Greedy: feed `prompt`, then generate `n` ids, every row one decode call through all
-    /// layers with the experts from `tiers`. `report` sees every row. Starts a new sequence
-    /// (every KDA state zeroed).
+    /// layers with the experts from `tiers`. `report` sees every row, in order. Starts a new
+    /// sequence (every KDA state zeroed). Switches off, every row is [`Glm5Run::row`].
+    ///
+    /// #189 (`CROW_GLM_LOOKAHEAD`): a row with a head that is not the last queues the next row
+    /// before the host reads its id. The next row's input is gathered on the GPU from the greedy
+    /// id ([`Feed::gather`]); the id (and the logits) come back through pinned memory and are read
+    /// at the next row's first MoE layer, after its routing sync or flag. That row's report fires
+    /// then, so its `secs` end there (after the next row's dense prefix and first router).
     ///
     /// # Safety
     /// A CUDA context is current; `tiers` belongs to this model.
@@ -759,58 +860,134 @@ impl Glm5Run {
         for s in self.kda.iter().flatten() {
             s.reset();
         }
-        let (g, h) = (self.g, self.g.hidden);
         let mut out = Generated::default();
+        if self.feed.is_none() {
+            let pn = prompt.len();
+            for pos in 0..rows {
+                let t0 = std::time::Instant::now();
+                let base = RowBase::of(tiers);
+                let tok = if pos < pn { prompt[pos] } else { out.ids[pos - pn] };
+                let next = self.row(cnq, tiers, tok, pos, pos + 1 >= pn)?;
+                if let Some(id) = next {
+                    if keep_logits {
+                        out.logits.push(cuda::dtoh(self.logits, self.g.vocab));
+                    }
+                    out.ids.push(id);
+                }
+                report(&base.report(tiers, pos, pos < pn, next, t0));
+            }
+            return Ok(out);
+        }
+        let rb = self.readback.take().expect("glm5_run: lookahead without its readback");
+        let r = self.generate_ahead(cnq, tiers, prompt, rows, keep_logits, &rb, &mut out, report);
+        self.readback = Some(rb);
+        r.map(|_| out)
+    }
+
+    /// [`Glm5Run::generate`] with the lookahead (#189)
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn generate_ahead(&mut self, cnq: &mut Cnq, tiers: &mut ExpertTiers, prompt: &[i64], rows: usize, keep_logits: bool, rb: &Readback, out: &mut Generated, report: &mut dyn FnMut(&TokenReport)) -> Result<(), String> {
+        let (pn, vocab) = (prompt.len(), self.g.vocab);
+        // the host reads a pending row's id: only after a sync point that follows its readback
+        let finish = |p: Pending, t: &ExpertTiers, out: &mut Generated, report: &mut dyn FnMut(&TokenReport)| -> Result<(), String> {
+            let id = rb.id() as i64;
+            if !(0..vocab as i64).contains(&id) {
+                return Err(format!("glm5_run: row {}: the greedy id {id} is outside the vocab of {vocab}", p.pos));
+            }
+            if keep_logits {
+                out.logits.push(rb.logits());
+            }
+            out.ids.push(id);
+            report(&p.base.report(t, p.pos, p.prompt, Some(id), p.t0));
+            Ok(())
+        };
+        let mut pending: Option<Pending> = None;
         for pos in 0..rows {
             let t0 = std::time::Instant::now();
-            let tok = if pos < prompt.len() { prompt[pos] } else { out.ids[pos - prompt.len()] };
-            let e = gm::embed_rows(cnq, &g, &[tok]);
-            cuda::to_f32_into(self.x, &gm::trunk_input(&e, h, g.hc_streams));
-            let c0: Vec<[u64; 3]> = tiers.cache.counters().to_vec();
-            let m0: Vec<Moves> = tiers.moves.clone();
-            let mut tick = TierTick::default();
-            for l in 0..g.layers {
-                if let Some(s) = self.kda[l].as_mut() {
-                    self.pass.swap_kda_state(s);
-                }
-                if let Some(c) = self.mla[l].as_mut() {
-                    self.pass.swap_mla_cache(c);
-                }
-                let mut hook = |layer: usize, sel: &[i32]| -> Result<Dev, String> {
-                    let (tb, s) = tiers.table_for(layer, sel)?;
-                    tick.nvme_reads += s.nvme_reads as u64;
-                    tick.nvme_bytes += s.nvme_bytes;
-                    Ok(tb)
-                };
-                let r = self.pass.call_with_experts(&self.layers[l], self.x, pos, 1, true, &mut hook);
-                // the layer's own state goes back even when the call failed
-                if let Some(s) = self.kda[l].as_mut() {
-                    self.pass.swap_kda_state(s);
-                }
-                if let Some(c) = self.mla[l].as_mut() {
-                    self.pass.swap_mla_cache(c);
-                }
-                r.map_err(|e| format!("glm5_run: row {pos} layer {l}: {e}"))?;
+            let base = RowBase::of(tiers);
+            if pos < pn {
+                self.embed(cnq, prompt[pos]);
+            } else {
+                // the previous row had the head and is pending: its greedy id is in `next`
+                self.feed.as_ref().expect("glm5_run: lookahead without its feed").gather(self.next, self.x);
             }
-            let mut next = None;
-            if pos + 1 >= prompt.len() {
-                gm::run_head(&self.pass.kn, &self.head, &self.hw, self.x, self.normed, self.logits, self.next, 1);
+            {
+                let mut first = |t: &ExpertTiers| -> Result<(), String> {
+                    match pending.take() {
+                        Some(p) => finish(p, t, out, report),
+                        None => Ok(()),
+                    }
+                };
+                self.layers(tiers, pos, &mut first)?;
+            }
+            // no MoE layer read the routing in this row: read the pending id after a sync
+            if let Some(p) = pending.take() {
                 cuda::sync();
-                if keep_logits {
-                    out.logits.push(cuda::dtoh(self.logits, g.vocab));
-                }
-                let id = cuda::dtoh_i32(self.next, 1)[0] as i64;
-                out.ids.push(id);
-                next = Some(id);
+                finish(p, tiers, out, report)?;
+            }
+            if pos + 1 < pn {
+                cuda::sync();
+                report(&base.report(tiers, pos, true, None, t0));
+                continue;
+            }
+            gm::run_head(&self.pass.kn, &self.head, &self.hw, self.x, self.normed, self.logits, self.next, 1);
+            rb.enqueue(self.next, keep_logits.then_some(self.logits));
+            let p = Pending { pos, prompt: pos < pn, t0, base };
+            if pos + 1 < rows {
+                // WDDM: submit the head, so it runs while the host queues the next row
+                cuda::stream_query(cuda::cur_stream());
+                pending = Some(p);
             } else {
                 cuda::sync();
+                finish(p, tiers, out, report)?;
             }
-            let secs = t0.elapsed().as_secs_f64();
-            let tiers_row: Vec<[u64; 3]> = tiers.cache.counters().iter().zip(&c0).map(|(a, b)| [a[0] - b[0], a[1] - b[1], a[2] - b[2]]).collect();
-            let moves: Vec<Moves> = tiers.moves.iter().zip(&m0).map(|(a, b)| a.since(b)).collect();
-            report(&TokenReport { pos, prompt: pos < prompt.len(), next, secs, nvme_reads: tick.nvme_reads, nvme_bytes: tick.nvme_bytes, tiers: tiers_row, moves });
         }
-        Ok(out)
+        Ok(())
+    }
+
+    /// the embedding row of `tok` (read from the container on the host) into every stream of `x`
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn embed(&mut self, cnq: &mut Cnq, tok: i64) {
+        let (g, h) = (self.g, self.g.hidden);
+        let e = gm::embed_rows(cnq, &g, &[tok]);
+        cuda::to_f32_into(self.x, &gm::trunk_input(&e, h, g.hc_streams));
+    }
+
+    /// Every layer of row `pos` on `x`, the experts from `tiers`. `first` sees the store once, in
+    /// the row's first MoE layer after its routing reached the host and before the store moves
+    /// anything (the lookahead reads the previous row's id there).
+    ///
+    /// # Safety
+    /// A CUDA context is current; `tiers` belongs to this model.
+    unsafe fn layers(&mut self, tiers: &mut ExpertTiers, pos: usize, first: &mut dyn FnMut(&ExpertTiers) -> Result<(), String>) -> Result<(), String> {
+        let mut seen = false;
+        for l in 0..self.g.layers {
+            if let Some(s) = self.kda[l].as_mut() {
+                self.pass.swap_kda_state(s);
+            }
+            if let Some(c) = self.mla[l].as_mut() {
+                self.pass.swap_mla_cache(c);
+            }
+            let mut hook = |layer: usize, sel: &[i32]| -> Result<Dev, String> {
+                if !seen {
+                    seen = true;
+                    first(&*tiers)?;
+                }
+                tiers.table_for(layer, sel).map(|(tb, _)| tb)
+            };
+            let r = self.pass.call_with_experts(&self.layers[l], self.x, pos, 1, true, &mut hook);
+            // the layer's own state goes back even when the call failed
+            if let Some(s) = self.kda[l].as_mut() {
+                self.pass.swap_kda_state(s);
+            }
+            if let Some(c) = self.mla[l].as_mut() {
+                self.pass.swap_mla_cache(c);
+            }
+            r.map_err(|e| format!("glm5_run: row {pos} layer {l}: {e}"))?;
+        }
+        Ok(())
     }
 
     /// # Safety
@@ -830,6 +1007,15 @@ impl Glm5Run {
         self.head.free();
         for d in [&mut self.hw.norm, &mut self.hw.lm, &mut self.x, &mut self.normed, &mut self.logits, &mut self.next] {
             cuda::free_dev(d);
+        }
+        if let Some(f) = self.feed.as_mut() {
+            f.free();
+        }
+        if let Some(r) = self.readback.as_mut() {
+            r.free();
+        }
+        if let Some(k) = self.sw_kernels.as_mut() {
+            k.free();
         }
     }
 }
@@ -1394,14 +1580,15 @@ mod tests {
 
 /// #185 part 2: the row door `glm5_engine::Glm5Device` drives for `bin/serve` (prefill a chunk
 /// row by row, decode one step, the logits row, the KDA states its prefix cache snapshots).
-/// [`Glm5Run::row`] is the body of one row of [`Glm5Run::generate`], copied: `generate` was not
-/// edited by #185 (another change owned it); the GPU test
-/// `glm5_engine::tests::glm5_engine_gpu_serve_rows_are_glm5_run_rows` holds the two equal.
+/// [`Glm5Run::generate`] runs its rows through [`Glm5Run::row`] when the lookahead is off (#189:
+/// one body); the GPU test `glm5_engine::tests::glm5_engine_gpu_serve_rows_are_glm5_run_rows`
+/// holds serve's rows equal to `generate`'s.
 impl Glm5Run {
     /// One row: `tok` at position `pos` through every layer with the experts from `tiers`; with
     /// `head` the head runs and its greedy id comes back (its logits stay in
     /// [`Glm5Run::logits_dev`] until the next head). The KDA states and MLA caches advance as in
-    /// `generate`; nothing is reset here.
+    /// `generate`; nothing is reset here. `CROW_GLM_FLAGS` applies (through the pass);
+    /// `CROW_GLM_LOOKAHEAD` does not (the caller needs the id before the next row).
     ///
     /// # Safety
     /// A CUDA context is current; `tiers` belongs to this model.
@@ -1412,26 +1599,8 @@ impl Glm5Run {
         if !(0..self.g.vocab as i64).contains(&tok) {
             return Err(format!("glm5_run: token id {tok} outside the vocab of {}", self.g.vocab));
         }
-        let (g, h) = (self.g, self.g.hidden);
-        let e = gm::embed_rows(cnq, &g, &[tok]);
-        cuda::to_f32_into(self.x, &gm::trunk_input(&e, h, g.hc_streams));
-        for l in 0..g.layers {
-            if let Some(s) = self.kda[l].as_mut() {
-                self.pass.swap_kda_state(s);
-            }
-            if let Some(c) = self.mla[l].as_mut() {
-                self.pass.swap_mla_cache(c);
-            }
-            let mut hook = |layer: usize, sel: &[i32]| -> Result<Dev, String> { tiers.table_for(layer, sel).map(|(tb, _)| tb) };
-            let r = self.pass.call_with_experts(&self.layers[l], self.x, pos, 1, true, &mut hook);
-            if let Some(s) = self.kda[l].as_mut() {
-                self.pass.swap_kda_state(s);
-            }
-            if let Some(c) = self.mla[l].as_mut() {
-                self.pass.swap_mla_cache(c);
-            }
-            r.map_err(|e| format!("glm5_run: row {pos} layer {l}: {e}"))?;
-        }
+        self.embed(cnq, tok);
+        self.layers(tiers, pos, &mut |_| Ok(()))?;
         if !head {
             cuda::sync();
             return Ok(None);

@@ -546,6 +546,13 @@ experts via the job ring → `shared_expert_gate` combine.
 > with the ring (path B of #149); the stager should raise a flag in mapped host memory, not by H2D.
 > Not measured: many waits in one graph (a whole decode step), the stager's NVMe reads behind the flag,
 > and a flag that is never raised (the probe's 200 ms guard is not exercised).
+>
+> **Built 2026-10-09 for glm5_next only, the routing half (#149 path B, `CROW_GLM_FLAGS=1`, default
+> off, `engine/src/glm5_flags.rs`):** after the router a one-block kernel writes the selected ids into
+> mapped pinned host memory and raises a 64-bit sequence flag there (`__threadfence_system`, no memop);
+> the host spins on it instead of a stream sync + blocking copy. The completion half (the GPU waiting on
+> a host-raised flag before the experts) is not built: the glm5 stager (`glm5_tiers::serve`) queues its
+> copies on the compute stream and syncs it. `docs/glm5-model.md` 6.2.
 
 - Pinned host-memory ring, job descriptors 64-byte aligned (exl3 `moe_handoff.h`
   pattern): layer id, job kind, cold expert ids (≤ 10), sequence number, flag slots.
