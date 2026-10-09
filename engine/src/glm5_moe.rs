@@ -508,10 +508,40 @@ impl GpuMoePlan {
         x: CUdeviceptr,
         y: CUdeviceptr,
     ) {
-        let (h, e, t) = (self.geo.hidden, self.geo.experts, self.tokens);
-        let c = t * self.geo.topk;
+        self.route(kn, gk, w, x);
+        self.experts(kn, mk, gk, w, table, x, y);
+    }
+
+    /// the first two launches of [`GpuMoePlan::run`]: router logits and the top-K selection into
+    /// `ids` / `wts`. #175: the three-tier path reads `ids` between `route` and `experts` to put
+    /// the selected records in place and fill `table`.
+    ///
+    /// # Safety
+    /// As [`GpuMoePlan::run`].
+    pub unsafe fn route(&self, kn: &kernels::Kernels, gk: &kernels::glm5_moe::Kernels, w: &GpuMoeWeights, x: CUdeviceptr) {
+        let (e, t) = (self.geo.experts, self.tokens);
         launch_v(kn.f("gemv_bf16_b"), e as u32, t as u32, 1, 256, &[w.router, x, self.logits, self.prm_kh]);
         launch_v(gk.router, t as u32, 1, 1, kernels::glm5_moe::ROUTER_THREADS as u32, &[self.logits, w.bias, self.ids, self.wts, self.prm_route, self.prm_f]);
+    }
+
+    /// the rest of [`GpuMoePlan::run`] after [`GpuMoePlan::route`]: gather through `table`, the
+    /// routed experts, the shared expert, the combine (11 launches, no host sync)
+    ///
+    /// # Safety
+    /// As [`GpuMoePlan::run`]; `route` ran on this plan with the same `x`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn experts(
+        &self,
+        kn: &kernels::Kernels,
+        mk: &mul1::Kernels,
+        gk: &kernels::glm5_moe::Kernels,
+        w: &GpuMoeWeights,
+        table: CUdeviceptr,
+        x: CUdeviceptr,
+        y: CUdeviceptr,
+    ) {
+        let (h, t) = (self.geo.hidden, self.tokens);
+        let c = t * self.geo.topk;
         launch_v(gk.gather, h.div_ceil(256) as u32, c as u32, 1, 256, &[self.ids, table, x, self.ptrs, self.xg, self.prm_kh2]);
         self.gate.run(mk, self.ptrs, self.xg, self.ge);
         self.up.run(mk, self.ptrs, self.xg, self.ue);

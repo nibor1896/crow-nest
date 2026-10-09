@@ -113,9 +113,24 @@ impl ExpertRecord {
     /// Refuses a missing tensor, an overlay tensor, a dtype other than the spec's codec, and a
     /// down projection that does not start inside the record.
     pub fn locate_glm5(cnq: &Cnq, spec: &ExpertRecordSpec, layer: u32, id: u32) -> Result<Self, String> {
+        Self::locate_glm5_by(cnq, spec, layer, id, &|name| cnq.tensors.iter().find(|t| t.name == name && t.section == "text"))
+    }
+
+    /// #149 / #175: the records of `experts` routed experts of every layer in `layers`, each
+    /// [`ExpertRecord::locate_glm5`] with its checks, through one name map of the index (the
+    /// linear `find` of `locate_glm5` per record would scan the index 12,096 x 2 times at
+    /// GLM-5.3-Flash). `[layer position][expert]`.
+    pub fn glm5_table(cnq: &Cnq, spec: &ExpertRecordSpec, layers: &[u32], experts: u32) -> Result<Vec<Vec<Self>>, String> {
+        let by_name: std::collections::HashMap<&str, &TensorInfo> =
+            cnq.tensors.iter().filter(|t| t.section == "text").map(|t| (t.name.as_str(), t)).collect();
+        let find = |name: &str| by_name.get(name).copied();
+        layers.iter().map(|&l| (0..experts).map(|e| Self::locate_glm5_by(cnq, spec, l, e, &find)).collect()).collect()
+    }
+
+    fn locate_glm5_by<'a>(cnq: &Cnq, spec: &ExpertRecordSpec, layer: u32, id: u32, lookup: &dyn Fn(&str) -> Option<&'a TensorInfo>) -> Result<Self, String> {
         let find = |p: &str| -> Result<&TensorInfo, String> {
             let name = glm5_expert_tensor_name(layer, id, p);
-            cnq.tensors.iter().find(|t| t.name == name && t.section == "text").ok_or_else(|| format!("{name}: not in the container index"))
+            lookup(&name).ok_or_else(|| format!("{name}: not in the container index"))
         };
         let (gate, down) = (find("gate")?, find("down")?);
         for t in [gate, down] {
@@ -1064,6 +1079,24 @@ mod tests {
         let e = ExpertRecord::locate_glm5(&cnq, &wrong, 3, 0).unwrap_err();
         assert!(e.contains("dtype mul1, the expert record says codec nvfp4"), "{e}");
         drop(src);
+        drop(cnq);
+    }
+
+    /// #175: the table of every record (one index name map) is `locate_glm5` record by record,
+    /// and a layer the container does not hold is refused by name, not left empty. 4 records, 38 MB.
+    #[test]
+    fn the_record_table_is_locate_glm5_record_by_record() {
+        let s = synth_glm("table", ExpertCodec::Mul1, MUL1_REC, 4);
+        let path = s.path.to_str().unwrap();
+        let (spec, _) = glm5_record_of_container(path).unwrap();
+        let cnq = Cnq::open_checked(path).unwrap();
+        let t = ExpertRecord::glm5_table(&cnq, &spec, &[3], 4).unwrap();
+        assert_eq!(t.len(), 1);
+        let want: Vec<ExpertRecord> = (0..4).map(|e| ExpertRecord::locate_glm5(&cnq, &spec, 3, e).unwrap()).collect();
+        assert_eq!(t[0], want);
+        assert!(t[0].windows(2).all(|w| w[1].gu.off == w[0].gu.off + MUL1_REC), "records back to back");
+        let e = ExpertRecord::glm5_table(&cnq, &spec, &[3, 4], 4).unwrap_err();
+        assert!(e.contains("layers.4.mlp.experts.0.gate_proj.weight: not in the container index"), "{e}");
         drop(cnq);
     }
 

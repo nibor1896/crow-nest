@@ -29,10 +29,15 @@
 //!   come from it.
 //! - **Layer-at-a-time weights** ([`load_layer`]): one layer's tensors in VRAM, its 288 MUL1
 //!   expert records in one VRAM buffer behind the `GpuMoePlan` record table, all freed after the
-//!   layer. No cache, no NVMe tier: that is the boot of plan step 14 (#175, #149).
+//!   layer. No cache, no NVMe tier.
+//! - **Experts from the three tiers** (#175, #149, plan steps 16-17): [`load_layer_without_experts`]
+//!   loads a layer without its records and [`Glm5Pass::call_with_experts`] asks a hook for the
+//!   record table after the router ran; `glm5_tiers` keeps every layer resident that way and
+//!   serves the experts from VRAM, pinned RAM or the container (NVMe). The layer math is the same.
 //!
 //! The `Engine` / `Geo` path of Flash-Next and the 27B does not see this module (gate R, #174).
-//! Its caller is the `decode glmgolden` harness (`bin/decode.rs`, [`golden`]).
+//! Its callers are the `decode glmgolden` harness (`bin/decode.rs`, [`golden`]) and `glm5_tiers`
+//! (`bin/glm5_run.rs`).
 
 use crate::cnq::{self, Cnq, TensorInfo};
 use crate::cuda;
@@ -521,6 +526,20 @@ impl Loader<'_> {
 /// # Safety
 /// A CUDA context is current.
 pub unsafe fn load_layer(cnq: &mut Cnq, g: &Glm5Geo, moe: &MoeGeo, l: usize, rep: &mut LoadReport) -> LayerW {
+    load_layer_with(cnq, g, moe, l, rep, true)
+}
+
+/// #175: [`load_layer`] without the routed-expert records: a MoE layer's `FfnW::Moe` has
+/// `records` and `table` 0, and its experts come from the three tiers
+/// (`glm5_tiers::ExpertTiers`, through [`Glm5Pass::call_with_experts`]).
+///
+/// # Safety
+/// A CUDA context is current.
+pub unsafe fn load_layer_without_experts(cnq: &mut Cnq, g: &Glm5Geo, moe: &MoeGeo, l: usize, rep: &mut LoadReport) -> LayerW {
+    load_layer_with(cnq, g, moe, l, rep, false)
+}
+
+unsafe fn load_layer_with(cnq: &mut Cnq, g: &Glm5Geo, moe: &MoeGeo, l: usize, rep: &mut LoadReport, with_records: bool) -> LayerW {
     let plan = layer_tensors(g, l);
     if let Err(why) = check_plan(&plan, &cnq.tensors) {
         panic!("{why}");
@@ -601,6 +620,9 @@ pub unsafe fn load_layer(cnq: &mut Cnq, g: &Glm5Geo, moe: &MoeGeo, l: usize, rep
                     down: ld.fp4("mlp.shared_experts.down_proj.weight"),
                 },
             };
+            if !with_records {
+                return LayerW { layer: l, attn_hc, ffn_hc, input_norm, post_norm, attn, ffn: FfnW::Moe { w, records: 0, table: 0 } };
+            }
             let rb = moe.record.bytes;
             let records = cuda::alloc_named("glm5 layer expert records", (g.experts as u64 * rb) as usize);
             let mut bases = Vec::with_capacity(g.experts);
@@ -706,6 +728,10 @@ pub struct Taps {
     pub ffn_in: Option<Vec<f32>>,
 }
 
+/// #175: the expert hook of [`Glm5Pass::call_with_experts`]: `(layer, selected ids [t][topk]
+/// i32)` -> the device `[E]` u64 record table the MUL1 kernels read for this call
+pub type ExpertHook<'a> = dyn FnMut(usize, &[i32]) -> Result<Dev, String> + 'a;
+
 /// The per-sequence state and scratch of a layer-at-a-time pass over up to `cap` rows in calls
 /// of up to `max_t` rows: one mHC plan, one KDA state + scratch (reset per layer), one MLA cache
 /// + scratch, the FFN plans per call size. Every launch queues on the current stream.
@@ -797,7 +823,39 @@ impl Glm5Pass {
     ///
     /// # Safety
     /// As [`Glm5Pass::call`]; `taps.ffn_in`, when set, holds `t x 4 x hidden` values.
-    pub unsafe fn call_tapped(&mut self, lw: &LayerW, x: Dev, pos0: usize, t: usize, decode: bool, mut taps: Option<&mut Taps>) {
+    pub unsafe fn call_tapped(&mut self, lw: &LayerW, x: Dev, pos0: usize, t: usize, decode: bool, taps: Option<&mut Taps>) {
+        self.call_inner(lw, x, pos0, t, decode, taps, None).expect("glm5_model: a call without an expert hook cannot fail");
+    }
+
+    /// #175: [`Glm5Pass::call`] for a layer loaded without its expert records
+    /// ([`load_layer_without_experts`]). In a MoE layer the router runs first; the host reads the
+    /// selected ids (`[t][topk]` i32, pick order; synchronizes) and hands them with the layer
+    /// index to `experts`, which puts those records where the MUL1 kernels can read them and
+    /// returns the device `[E]` u64 table of record bases; the experts then run through that
+    /// table. The launches are those of `call`, in the same order: only the table differs.
+    ///
+    /// # Safety
+    /// As [`Glm5Pass::call`]; every table entry of a selected id is a readable record base until
+    /// the next call.
+    pub unsafe fn call_with_experts(&mut self, lw: &LayerW, x: Dev, pos0: usize, t: usize, decode: bool, experts: &mut ExpertHook) -> Result<(), String> {
+        self.call_inner(lw, x, pos0, t, decode, None, Some(experts))
+    }
+
+    /// #175: swap this pass's KDA state with `s` (the token-by-token path keeps one per KDA layer
+    /// and swaps it in around the layer's call instead of [`Glm5Pass::begin_layer`])
+    pub fn swap_kda_state(&mut self, s: &mut KdaState) {
+        std::mem::swap(&mut self.kda_st, s);
+    }
+
+    /// #175: swap this pass's MLA cache with `c` (one per DSA layer in the token-by-token path);
+    /// `c` must have the pass's capacity
+    pub fn swap_mla_cache(&mut self, c: &mut MlaCache) {
+        assert_eq!(c.cap, self.cap, "glm5_model: an MLA cache of {} tokens on a pass of {}", c.cap, self.cap);
+        std::mem::swap(&mut self.mla_c, c);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn call_inner(&mut self, lw: &LayerW, x: Dev, pos0: usize, t: usize, decode: bool, mut taps: Option<&mut Taps>, experts: Option<&mut ExpertHook>) -> Result<(), String> {
         assert!((1..=self.max_t).contains(&t) && pos0 + t <= self.cap, "glm5_model: call rows {pos0}..{} (max_t {}, cap {})", pos0 + t, self.max_t, self.cap);
         assert!(!decode || t == 1, "glm5_model: a decode call is one row, got {t}");
         let h = self.g.hidden;
@@ -871,7 +929,19 @@ impl Glm5Pass {
                     self.moe_plans.push(GpuMoePlan::new(&self.moe, t));
                 }
                 let p = self.moe_plans.iter().find(|p| p.tokens == t).unwrap();
-                p.run(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, *table, self.collapsed, self.sub);
+                match experts {
+                    None => {
+                        assert!(*table != 0, "glm5_model: layer {} was loaded without its expert records: call it through call_with_experts", lw.layer);
+                        p.run(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, *table, self.collapsed, self.sub);
+                    }
+                    Some(hook) => {
+                        p.route(&self.kn.k, &self.kn.moe, w, self.collapsed);
+                        cuda::sync();
+                        let ids = cuda::dtoh_i32(p.ids, t * self.moe.topk);
+                        let tb = hook(lw.layer, &ids)?;
+                        p.experts(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub);
+                    }
+                }
             }
         }
         self.last_ffn_t = t;
@@ -884,6 +954,7 @@ impl Glm5Pass {
             cuda::sync();
             tp.ffn.expanded.extend(cuda::dtoh(x, t * HC * h));
         }
+        Ok(())
     }
 
     /// the DSA selection of the last MLA call, one ascending token list per row (synchronizes)
