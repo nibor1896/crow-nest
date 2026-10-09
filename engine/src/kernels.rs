@@ -6195,6 +6195,11 @@ mod tests_300_c4_gpu {
 /// of record (`tests_300_c4`), and these kernels use none of its helpers.
 pub const MUL1_SRC: &str = include_str!("kernels_mul1.cu");
 
+/// #161: the GLM-5.3-Flash mHC residual source (`kernels_glm5_mhc.cu`). Its own NVRTC module,
+/// compiled alone by `glm5_mhc::Kernels::new`, for the reason `MUL1_SRC` is; the host side and the
+/// CPU twin are `glm5_mhc.rs`.
+pub const GLM5_MHC_SRC: &str = include_str!("kernels_glm5_mhc.cu");
+
 /// #180: the host side of `MUL1_SRC`. A plan holds the per-launch parameter buffers and the
 /// scratch of one shape; `run` queues the launches on the current stream. A slot's record base
 /// (`ptrs[e]`) is a VRAM address or a pinned-host UVA address, residency is invisible to the
