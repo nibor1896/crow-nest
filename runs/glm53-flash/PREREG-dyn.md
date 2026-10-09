@@ -158,3 +158,7 @@ robin, 2026-10-09 (chat, translated): "I think the thresholds fit, as you said."
 2. Primary cell: per-layer arena, R 46 GiB (`HOST_PINNED_CAP` unchanged), V25, C 161.
 3. The policy grid s {0, 0.25, 0.5} x P {0, 4, 8, 16} x d {1, 2, 4} and the tie order as written.
 Items 3 and 5 of the original list were settled by amendment 1. Also decided by robin on 2026-10-09: the DSA indexer cache stays in the HF / zai-org layout (257 values, BF16, 514 B per token and layer, #163); the f32 / llama.cpp layouts are not used.
+
+## Amendment 5 (2026-10-09, before any G1d row): G1d is diagnostic, not a stop
+
+robin, 2026-10-09 (chat, translated): "G1d is no exclusion criterion for me while not all levers are in; for me the acceptance is at the end, not at an intermediate step that runs without optimisation." Therefore: the G1d verdict (bar and cell as in amendment 4) is still computed and recorded as pass / fail with its number, and it still chooses the cache policy for plan step 16; but a fail does **not** stop the series. The series runs on with all levers (dynamic cache, NVMe tier, prefetch, CPU lane, MTP); acceptance is at the end through G3–G6 (`runs/glm53-flash/PREREG.md`), G5 decode >= 40 tok/s in the Crow window unchanged. Thresholds are not changed by this amendment.
