@@ -1,0 +1,136 @@
+{
+ "ticket": "crow-nest #164 (plan step 15, gate G3)",
+ "generator": "oracle/export_glm5_moe_golden.py",
+ "inputs_writer": "engine/src/glm5_moe.rs glm5_moe_write_oracle_inputs",
+ "reference": "transformers 5.16.1 modeling_glm5_next.py: Glm5NextTextTopkRouter, Glm5NextTextMoE (experts compact, Remap), Glm5NextTextMLP",
+ "versions": {
+  "transformers": "5.16.1",
+  "torch": "2.13.0+cpu",
+  "numpy": "2.4.6",
+  "python": "3.13.3"
+ },
+ "torch_threads": 2,
+ "experts_implementation": "eager",
+ "config": {
+  "path": "engine/tests/fixtures/GLM-5.3-Flash/config.json",
+  "sha256": "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f"
+ },
+ "tokens": {
+  "router": 64,
+  "moe": 4,
+  "dense": 2
+ },
+ "synthetic": {
+  "seed": 23355653,
+  "record_seed": 5696,
+  "record_seed_step": 9,
+  "x_amp": 0.17000000178813934,
+  "router_amp": 0.550000011920929,
+  "bias_amp": 0.09000000357627869,
+  "nvfp4_global_scale": 0.30000001192092896
+ },
+ "inputs_sha256": {
+  "bias.f32": "dc7dd1539c5f4d41117034b579deabf9e30b30c1866445d93c58cae867cbd0ad",
+  "dense_down.nvfp4": "be3c4187966d5c348f37ce2ec8257db3a27ca514ae2c5a3865083a07e4db5ad0",
+  "dense_gate.nvfp4": "1d30f0e4c5d3c1cb0ca4935a098b20d21ba2487e5b23100111ed3a135059778e",
+  "dense_up.nvfp4": "6d6cef3bd27f0f08b74c1082f958c09b9e18636e635b31c8813a944f1e495b33",
+  "router.bf16": "5f87c2058f36e0f39f6f252e0e848632f651a224010ecb0731d1f53cdddd1e18",
+  "shared_down.nvfp4": "7446c93d4091cc479f907506bf9769426534f75431387d96ef54ef5a9c6d146f",
+  "shared_gate.nvfp4": "7fa561304e60a576712ffdaf7ca2b7362be567de27e2d00bb8d0a802f87822bb",
+  "shared_up.nvfp4": "3413b4e8f7ce999c95a621ec90387de482644b2f019c239828f11031431c5422",
+  "x_dense.f32": "b2f4b566b392f8b3a6c47dd9cb63c2bfa91f4d63e47ed48654ee909bb7472f72",
+  "x_moe.f32": "2a662bbdf64d9658329e9eb888d6d97130052fa4164d0ec38b725e626390d5c6",
+  "x_route.f32": "7eafa0dd1345363c40891ca269fd3f34243b7e1746d364c92c4bff6118db8439"
+ },
+ "records_sha256": {
+  "1": "d36ec159f7ffd0579a84c6a871567da7109b4f524c974fd2ecee8d85bc52582a",
+  "11": "ce04628482a4720d89750a4a98774bea39ff9ea1ad82b6a4a510374c0ba77aea",
+  "15": "a9d3cc1b241bcdacbc2a7c9a5a557705577a01e5066ca1e95133fd8b6bd3d51e",
+  "21": "ba31ed8b02828785f63ad035c770723f6dfa0435560d3d19b3e83371cb50d26b",
+  "27": "1cfe59cee14e064b05c3d00436a6b6171008e5719fb77599e3986b0d15132021",
+  "44": "95063e697cf357a218818b836bbeb3c80936ed228ae982078578c92643553f7a",
+  "48": "270efea99416f8fdff28d998f345222a20ff6aac0ae2af271f37eaa2ea824d6c",
+  "50": "8a992bb77707673085e45b71e361991c7da9b945c71d5651327ec456908d1cdf",
+  "56": "462b8a64dbe02cfd7cbab334c5816c9308b5abc4106de50fe196a8a3aa560401",
+  "57": "0ff59085fc34abeed1197272e18dd579dd5b647ac81df8450183bd2df27eb020",
+  "76": "33f7cd7388b88806b10e5ad9bf3bb32e1c3e38d5c1df76ab8849b22b7ad1c46f",
+  "96": "5faa0fadc7e359076b7789ec990b52ad75aa799d77bd29d1ecf2a9abe8d3b696",
+  "105": "e374c17ed5b48983ad6a94abb8045c0ee923ecffa41a4754ffdc039107fee4ad",
+  "108": "e0de29ec3b6aa0193df7a34cc576b742ef87e668e0d148c51f3a1a462fa49f15",
+  "114": "6bf8f99d9bef40bd3629b14d3349c906a691e6badd9c46f9406152335104abd6",
+  "128": "af737fcad2829a3f0e5dade56f7dda92b8c370b56c88a93fc6658da42b95afb7",
+  "129": "760b3f2f6b3734cc431ba21cdd1de1dadc1a64834d8865dfb160768dff9f30aa",
+  "134": "e4bd61b67d393d31568aa1175826ffaa016eba1cf8d0abd75ba4ae19e7fa80fd",
+  "152": "6da0919bca25800aeb4aaa9dcfdeb200f329522ded0909f622976969cf01e9b4",
+  "154": "a66cb1d8f7adedc1db5e0830311a32e80fdc142c60560ba4e13c28965764e2b5",
+  "160": "786ea79a22fecf6b7eb5d08e3a4cdb537e604a81b4e9aab06beb9ea0c2649a71",
+  "162": "12e91c509691fa083b34b9736ba4352a895192b5aedc2b30a6ca130cae7e5cf1",
+  "167": "915e56fd942e64bd793b3becf7ee8504d82bf2f3bd5d400162d48904f3a4a7c8",
+  "205": "770f898ca04d3a60cb3a84f62fbd5c6f57a20a9859bf300d7fa4fd44da8cc839",
+  "228": "963056f4cdc0dd0af21118d7c283f7005c994a8cb8e49de508e1214f2677d4c6",
+  "230": "c02a1bd7a7d84d9888bd5144d6813c8c4134cb19297bfbc8546bb9673ed5cde1",
+  "232": "b93544a9c828c177cb880505e9269e67f0c701c35630bd59d519b1f5ce26997d",
+  "239": "13b4c16e3bc6a84c5096ddae37bf3dc92df61b062f0ac7d57b193751d8be761e",
+  "256": "7127604e8e54d1fc4d3066a748788dac9fc933919bd8629f7a9f21d6ecf3952b",
+  "264": "366306d17466b359f834cfb00ce8cf3e625d9a902389db29b918f4183454586b"
+ },
+ "router_min_gap": 3.5881996154785156e-05,
+ "router_gap_ties": 0,
+ "lane_routing_equal_at_dump": true,
+ "clamp_fraction": {
+  "gate_gt_10": 0.0694732666015625,
+  "up_abs_gt_10": 0.13568115234375
+ },
+ "moe_y_rms": 1456.857666015625,
+ "dense_y_rms": 2679.656982421875,
+ "files": {
+  "router-ids.i32": {
+   "shape": [
+    64,
+    8
+   ],
+   "dtype": "i32",
+   "sha256": "65bc54a234ffe92c614ab45827f278d4931ecf069c76a4270b8e4ad6d20f9dee"
+  },
+  "router-weights.f32": {
+   "shape": [
+    64,
+    8
+   ],
+   "dtype": "f32",
+   "sha256": "6f54d35caccc6b68a729532655c96f2beb60879c84d987c85bd4b8065f3a631b"
+  },
+  "moe-ids.i32": {
+   "shape": [
+    4,
+    8
+   ],
+   "dtype": "i32",
+   "sha256": "84fd5303d2960e8e0961c42a0fa42a3c7d45da39448e516b1d25b32ab0cc94bb"
+  },
+  "moe-weights.f32": {
+   "shape": [
+    4,
+    8
+   ],
+   "dtype": "f32",
+   "sha256": "b6006c192d85af6e439137521246220b9f2c37fce17b1846f175cefdfe2a7f11"
+  },
+  "moe-y.f32": {
+   "shape": [
+    4,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "1ebcba1b68ad09313960d92707c8c5f08bb80ce9b4ca34f069310d2552743d7b"
+  },
+  "dense-y.f32": {
+   "shape": [
+    2,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "ab0dc179606290ff6c2cd64e75c7bcf733d88e093b622619313861541693ccc1"
+  }
+ }
+}
