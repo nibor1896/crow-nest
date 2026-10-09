@@ -43,10 +43,10 @@
 //! MoE layer synchronizes for its routing (`glm5_model.rs`, `call_with_experts`), so these are
 //! the times of this synchronous path, not of a graph-captured one.
 use crow_nest_engine::cuda;
-use crow_nest_engine::geo::{from_engine_dir, GLM5_NEXT_DENSE_BYTES, HOST_PINNED_CAP};
+use crow_nest_engine::geo::{from_engine_dir, HOST_PINNED_CAP};
 use crow_nest_engine::glm5_model::GLM5_MUL1K3_CNQ;
 use crow_nest_engine::glm5_tiers::{self as gt, ExpertTiers, Glm5Run, Moves, TokenReport};
-use crow_nest_engine::manager::{derive_host_pinned_budget, plan_glm5_next_chunk};
+use crow_nest_engine::manager::derive_host_pinned_budget;
 use serde_json::{json, Value};
 
 /// the spread rule of the gates (`runs/glm53-flash/PREREG.md`): max / min over repetitions
@@ -505,8 +505,8 @@ fn run(args: &[String]) -> Result<(), String> {
         let free = cuda::free_vram_bytes();
         let budget = derive_host_pinned_budget(HOST_PINNED_CAP, &mut |s| println!("{s}"));
         // #186: the prompt chunk Glm5Run::load takes (CROW_CHUNK, at most the run's rows), booked by the plan
-        let chunk = gt::prompt_chunk_from_env().clamp(1, prompt.len() + n);
-        let (_, input, plan) = plan_glm5_next_chunk(&o.g, context, free, budget, GLM5_NEXT_DENSE_BYTES, o.spec.bytes, crow_nest_engine::gen::pf_tg(), crow_nest_engine::gen::pf_async_on(), chunk)?;
+        let (_, input, plan) = gt::plan_for_rows(&o.g, context, prompt.len() + n, free, budget, o.spec.bytes)?;
+        let chunk = input.chunk;
         let sizes = gt::tier_sizes(&plan, num("--vram-slots")?, num("--pinned-slots")?)?;
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         let moe_layers = gt::moe_layers(&o.g);

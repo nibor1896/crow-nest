@@ -570,6 +570,15 @@ pub fn prompt_chunk_from_env() -> usize {
     crate::geo::chunk_from_env().unwrap_or(1)
 }
 
+/// #186: the #159 plan of a glm5_next run of up to `rows` rows over a cache of `context` rows on
+/// `vram_total` and `pinned_budget`, the expert record `record_bytes`: the prompt chunk
+/// `Glm5Run::load` takes (`CROW_CHUNK`, at most `rows`) booked by `plan_glm5_next_chunk`. The one
+/// plan of `glm5_run` and of serve's boot (`glm5_engine::serve_plan`), so both book the same memory.
+pub fn plan_for_rows(g: &Glm5Geo, context: usize, rows: usize, vram_total: u64, pinned_budget: u64, record_bytes: u64) -> Result<(crate::manager::Glm5States, crate::manager::TierInput, TierPlan), String> {
+    let chunk = prompt_chunk_from_env().clamp(1, rows.max(1));
+    crate::manager::plan_glm5_next_chunk(g, context, vram_total, pinned_budget, crate::geo::GLM5_NEXT_DENSE_BYTES, record_bytes, crate::gen::pf_tg(), crate::gen::pf_async_on(), chunk)
+}
+
 /// #186: the staging slots of a prompt call: the #176 prefill set the plan books
 /// (`Stability::stage_slots(..).prefill`: `PF_TG`, doubled with `CROW_PF_ASYNC`)
 pub fn prefill_stage_slots(topk: usize) -> usize {
