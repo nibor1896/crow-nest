@@ -364,7 +364,10 @@ class Subblocks(unittest.TestCase):
         finally:
             LW.transformers.logging.set_verbosity(verbosity)
         cls.hf = {}  # HF's full model, prompt in one call then one call per decode row (the runner's plan)
-        hooks = []
+        lm = hf.model.language_model
+        cls.hf_head = {"mean": [], "norm": [], "logits": []}  # crow-nest #165: the head at every row
+        hooks = [lm.hc_head.register_forward_hook(lambda m, i, o: cls.hf_head["mean"].append(o[0].detach().clone())),
+                 lm.norm.register_forward_hook(lambda m, i, o: cls.hf_head["norm"].append(o[0].detach().clone()))]
         for l, layer in enumerate(hf.model.language_model.layers):
             cls.hf[l] = {"y": []}
             hooks += LW.subblock_hooks(layer, cls.hf[l])
@@ -374,12 +377,14 @@ class Subblocks(unittest.TestCase):
         cache = LW.DynamicCache(config=hf.config)
         with torch.no_grad():
             for r0, r1 in [(0, cls.T)] + [(r, r + 1) for r in range(cls.T, cls.T + cls.D)]:
-                hf(input_ids=x[:, r0:r1], past_key_values=cache, use_cache=True)
+                out = hf(input_ids=x[:, r0:r1], past_key_values=cache, use_cache=True)
+                cls.hf_head["logits"].append(out.logits[0].float())
         for h in hooks:
             h.remove()
         del hf, cache
         for l in cls.hf:
             cls.hf[l] = {k: torch.cat(v, 0) for k, v in cls.hf[l].items()}
+        cls.hf_head = {k: torch.cat(v, 0) for k, v in cls.hf_head.items()}
         cls.ids_path = os.path.join(cls.wd, "ids.json")
         with open(cls.ids_path, "w") as f:
             json.dump(cls.ids, f)
@@ -440,6 +445,44 @@ class Subblocks(unittest.TestCase):
                 expand = p.unsqueeze(-1) * y.unsqueeze(-2) + torch.matmul(c.transpose(-1, -2), x)
                 self.assertLessEqual(float((expand - r[s]["expanded"]).abs().max()), LW.TOL, (l, s))
             prev = LW.load_file(cap, a, f"l{l}-output.f32")
+
+    def test_head_capture_is_hf_full_model_values(self):
+        # crow-nest #165: the final stream mean, the final norm and the logits of EVERY row
+        out = os.path.join(self.wd, "head")
+        self.assertEqual(self._cli(out, "--capture-head", "--capture-subblocks", "--prompt-chunk", "0"), 0)
+        with open(os.path.join(out, "manifest.json")) as f:
+            man = json.load(f)
+        N, H, V = self.T + self.D, self.tc.hidden_size, self.tc.vocab_size
+        self.assertEqual(man["head"], {"mean": "head-mean.f32", "norm": "head-norm.f32", "logits": "head-logits.f32"})
+        for role, shape in (("mean", (N, H)), ("norm", (N, H)), ("logits", (N, V))):
+            nm = man["head"][role]
+            self.assertEqual(tuple(man["files"][nm]["shape"]), shape, nm)
+            got, ref = LW.load_file(out, man, nm), self.hf_head[role]
+            self.assertEqual(tuple(ref.shape), shape, role)
+            self.assertLessEqual(float((got - ref).abs().max()), LW.TOL, role)
+            self.assertGreater(float(ref.abs().max()), 0.0, role)
+        mean = LW.load_file(out, man, "l7-output.f32").mean(dim=1)  # the collapse of the last layer's output
+        self.assertTrue(torch.equal(LW.load_file(out, man, "head-mean.f32"), mean))
+        logits = LW.load_file(out, man, "head-logits.f32")
+        for p in man["anchors"]:
+            self.assertLessEqual(float((LW.load_file(out, man, f"logits-anchor-{p}.f32") - logits[p]).abs().max()),
+                                 LW.TOL, p)
+
+    def test_head_capture_changes_nothing_else_and_needs_the_last_layer(self):
+        cap, plain, part = (os.path.join(self.wd, n) for n in ("head7", "plain-h7", "part-h7"))
+        self.assertEqual(self._cli(cap, "--capture-head", "--prompt-chunk", "7"), 0)
+        self.assertEqual(self._cli(plain, "--prompt-chunk", "7"), 0)
+        self.assertEqual(self._cli(part, "--capture-head", "--prompt-chunk", "7", "--layers", "0:3"), 0)
+        a, b, c = ({} for _ in range(3))
+        for m, d in ((a, cap), (b, plain), (c, part)):
+            with open(os.path.join(d, "manifest.json")) as f:
+                m.update(json.load(f))
+        self.assertNotIn("head", b)
+        self.assertNotIn("head", c)  # a pass that stops before the last layer has no head
+        self.assertFalse(any(n.startswith("head-") for n in c["files"]))
+        self.assertEqual(set(a["files"]) - set(b["files"]), {"head-mean.f32", "head-norm.f32", "head-logits.f32"})
+        for n, v in b["files"].items():  # anchors and states byte-identical to a run without the flag
+            self.assertEqual(a["files"][n]["sha256"], v["sha256"], n)
 
     def test_capture_refuses_states_it_cannot_point_at(self):
         for extra in (("--state-dtype", "bf16"), ("--delete-states-behind",)):
