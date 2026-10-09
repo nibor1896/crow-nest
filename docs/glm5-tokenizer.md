@@ -13,8 +13,7 @@ tokenizer, parser, grammar and `serve` test is unchanged and green.
 - `oracle/export_glm5_tokenizer_goldens.py` → `engine/tests/fixtures/GLM-5.3-Flash/tokenizer-goldens.json`.
 
 #185 part 1 wired the request side into `bin/serve.rs`; see [Wired into serve](#wired-into-serve-185-part-1).
-The glm5_next engine behind it (`glm5_engine::Glm5Engine`) still refuses to boot until the expert tiers
-of #175/#149 exist (#185 part 2).
+#185 part 2 put the glm5_next engine behind it; see [The engine behind it](#the-engine-behind-it-185-part-2).
 
 ## Inputs
 
@@ -271,16 +270,56 @@ Tests (`cargo test --release --bin serve`, CPU only, 2026-10-09; the GLM ones ne
   `reasoning_content`, no content, the GLM grammar refuses no id, `<|observation|>` stops.
 - `the_dispatch_keeps_flash_next_and_the_27b_on_their_path`.
 
-What part 2 adds: the `Glm5Engine` body on the generator of #175/#149 (boot at 200k with the #159
-plan, prefill, decode step, logits, snapshot / restore, reset), the request loop on it, and the
-prefix-cache snapshots (KDA recurrent + conv states; MLA latent and DSA indexer rows truncate).
 Not decided here: GLM's sampling card row (a GLM request takes `card_row(true)`, whose
 temperature 1.0 and top_p 0.95 equal GLM's `generation_config.json`; its top_k 20 is Qwen's card).
+
+## The engine behind it (#185 part 2)
+
+Since 2026-10-09 a glm5_next container boots and serves (`engine/src/glm5_engine.rs`,
+`engine/src/boot.rs` `open_glm5`, `engine/src/bin/serve.rs` `glm_main` / `glm_generate`):
+
+1. **Boot.** `boot::open_glm5`: the container checked as `glm5_run` checks it
+   (`glm5_tiers::open_container`: index v2, the glm5_next family row, MUL1 records), `CROW_CONTEXT`
+   (floor 200,000), the CUDA context. `boot::model_geo` stays the door of the `Engine` families and
+   still refuses glm5_next (it has no `Geo`). `Glm5Device::load`: the #159 plan at this card's free
+   VRAM and the derived pinned budget, printed as `[budget]` lines (`manager::glm5_plan_table`),
+   every layer's dense part and the head (`Glm5Run::load`, MLA caches of `n_ctx` rows), the three
+   expert tiers at the plan's sizes (`ExpertTiers`, one NVMe reader).
+2. **Rows.** `Glm5Engine::prefill(chunk)` takes a slice of prompt ids; inside, `Rows::prefill_chunk`
+   runs them one row at a time with the head on the last row (`Glm5Run::row`, the row body of
+   `Glm5Run::generate`). #186 replaces `prefill_chunk` for the device with a chunked prefill;
+   `serve` does not change. `decode_step(id)` is one head row. `/props` `prompt_chunk` is 1.
+3. **Request loop.** `glm_generate` is `chat_generate`'s twin on `Glm5Engine`: the same sinks,
+   reasoning filter, tool parser and grammar, stop strings, `logprobs`, #81 budget, #91 forced ids,
+   finish rule, `usage` (with `prompt_tokens_details.cached_tokens`) and `timings` (`prompt_n`,
+   `prompt_per_second`, `predicted_per_second`, `cache_n`; `crow_expert_selections` = every tier
+   access, `crow_expert_cold` = the NVMe-served ones, cumulative). Greedy takes the head's argmax,
+   the id `glm5_run` takes. A sampled request draws on the host from the logits row read back
+   (619,520 B per token): glm5_next has no device sampler.
+4. **Prefix cache.** One snapshot after each prompt, as for the other families (#31 A9, #36 M2b,
+   #100): the KDA recurrent state and conv window of the 34 KDA layers are copied to host RAM
+   (152,633,344 B plus the logits row); the MLA latent and DSA indexer rows are position-indexed
+   and every call reads rows `0 .. pos0 + t` only, so a prefix is a truncation. A warm request rolls
+   back to the snapshot and prefills the rest; a cold start drops it. `CROW_PREFIX_CACHE=0` turns
+   it off.
+5. **Not on this path.** MTP (#182), vision (plan step 20: image placeholders ride as ids), slot
+   files (`POST /slots/0` answers 501), VRAM lending (`POST /v1/crow/vram/lend` answers 501), the
+   park of #118, the trickle.
+
+Tests (CPU only, 2026-10-09): `glm5_engine` drives `Glm5Engine` over a host twin of the cache
+shapes (`glm5_engine::fake::FakeRows`): a prefill in chunks equals the whole, a warm turn equals a
+cold re-prefill, an identical request prefills nothing, a cold start or a failed row drops the
+snapshot. `serve`'s `glm_serve_streams_timings_and_a_warm_turn_is_a_cold_reprefill` and
+`glm_serve_document_errors_and_refusals` run `glm_request` and `glm_generate` on the GLM tokenizer
+over that twin: GLM's template renders a second turn as an extension of the first prompt, so it
+reports `cached_tokens` = the first prompt. The device side is the ignored GPU test
+`glm5_engine_gpu_serve_rows_are_glm5_run_rows` (serve rows vs `Glm5Run::generate`: ids and
+logits bits, and warm vs cold), not run yet.
 
 ## Known limitations
 
 - `tojson(indent=n)` for n > none is not implemented. It is an error by name; no template of record uses it.
 - A boolean printed raw renders `true`, where jinja2 renders `True`. The GLM template prints none.
-- Not measured live: no GLM model is booted (step 14, #185 part 2). Robin's live check: in Crow, with tools on,
+- Not measured live: no GLM container was booted under `serve` yet (#185 part 2). Robin's live check: in Crow, with tools on,
   ask for a file read. The GUI should show one `read_file` call with the right `path`, and the turn
   continues after the tool result.

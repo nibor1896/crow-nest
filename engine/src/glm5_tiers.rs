@@ -1051,3 +1051,65 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------- #185 part 2: serve's row door
+
+/// #185 part 2: the row door `glm5_engine::Glm5Device` drives for `bin/serve` (prefill a chunk
+/// row by row, decode one step, the logits row, the KDA states its prefix cache snapshots).
+/// [`Glm5Run::row`] is the body of one row of [`Glm5Run::generate`], copied: `generate` was not
+/// edited by #185 (another change owned it); the GPU test
+/// `glm5_engine::tests::glm5_engine_gpu_serve_rows_are_glm5_run_rows` holds the two equal.
+impl Glm5Run {
+    /// One row: `tok` at position `pos` through every layer with the experts from `tiers`; with
+    /// `head` the head runs and its greedy id comes back (its logits stay in
+    /// [`Glm5Run::logits_dev`] until the next head). The KDA states and MLA caches advance as in
+    /// `generate`; nothing is reset here.
+    ///
+    /// # Safety
+    /// A CUDA context is current; `tiers` belongs to this model.
+    pub unsafe fn row(&mut self, cnq: &mut Cnq, tiers: &mut ExpertTiers, tok: i64, pos: usize, head: bool) -> Result<Option<i64>, String> {
+        if pos >= self.cap {
+            return Err(format!("glm5_run: row {pos} is outside the caches of {} rows", self.cap));
+        }
+        if !(0..self.g.vocab as i64).contains(&tok) {
+            return Err(format!("glm5_run: token id {tok} outside the vocab of {}", self.g.vocab));
+        }
+        let (g, h) = (self.g, self.g.hidden);
+        let e = gm::embed_rows(cnq, &g, &[tok]);
+        cuda::to_f32_into(self.x, &gm::trunk_input(&e, h, g.hc_streams));
+        for l in 0..g.layers {
+            if let Some(s) = self.kda[l].as_mut() {
+                self.pass.swap_kda_state(s);
+            }
+            if let Some(c) = self.mla[l].as_mut() {
+                self.pass.swap_mla_cache(c);
+            }
+            let mut hook = |layer: usize, sel: &[i32]| -> Result<Dev, String> { tiers.table_for(layer, sel).map(|(tb, _)| tb) };
+            let r = self.pass.call_with_experts(&self.layers[l], self.x, pos, 1, true, &mut hook);
+            if let Some(s) = self.kda[l].as_mut() {
+                self.pass.swap_kda_state(s);
+            }
+            if let Some(c) = self.mla[l].as_mut() {
+                self.pass.swap_mla_cache(c);
+            }
+            r.map_err(|e| format!("glm5_run: row {pos} layer {l}: {e}"))?;
+        }
+        if !head {
+            cuda::sync();
+            return Ok(None);
+        }
+        gm::run_head(&self.pass.kn, &self.head, &self.hw, self.x, self.normed, self.logits, self.next, 1);
+        cuda::sync();
+        Ok(Some(cuda::dtoh_i32(self.next, 1)[0] as i64))
+    }
+
+    /// the `[vocab]` f32 logits of the last head
+    pub fn logits_dev(&self) -> Dev {
+        self.logits
+    }
+
+    /// the KDA state of every KDA layer, in layer order (what a prefix snapshot copies)
+    pub fn kda_states(&self) -> impl Iterator<Item = &KdaState> {
+        self.kda.iter().flatten()
+    }
+}

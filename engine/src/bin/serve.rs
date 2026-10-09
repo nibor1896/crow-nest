@@ -12,6 +12,9 @@
 //! - `POST /slots/0?action=save|restore` writes or reads the slot file (#32 A10).
 //! - Crow readers served: `save_session` reads `n_saved`, `load_session` reads `n_restored`.
 //! - Anything else answers 404 with a JSON body.
+//! - #185 part 2: a glm5_next container serves the same routes from its own loop (`glm_main`,
+//!   `glm_generate` on `glm5_engine::Glm5Engine`); `POST /slots/0` and `POST /v1/crow/vram/lend`
+//!   answer 501 there (`docs/glm5-tokenizer.md`, "The engine behind it").
 //!
 //! Connection handling:
 //!
@@ -616,7 +619,7 @@
 use crow_nest_engine::cache::{ColdPlan, PrefixCache, SLOTS};
 use crow_nest_engine::boot;
 use crow_nest_engine::cnq::Cnq;
-use crow_nest_engine::glm5_engine::Glm5Engine;
+use crow_nest_engine::glm5_engine::{Glm5Device, Glm5Engine, Rows};
 use crow_nest_engine::glm5_template;
 use crow_nest_engine::gen::{DevSampler, Engine};
 use crow_nest_engine::geo::{apply_adapt_policy, resolve_default, Family, Geo, DEFAULT_CNQ, DEFAULT_HOTSETS, TRICKLE_CHUNK_THRESHOLD};
@@ -1223,8 +1226,9 @@ fn error_json(msg: &str) -> serde_json::Value {
 ///   glm5_next has none, `meta::verdict`), and `Engine` delegates to its own `geo`, so their
 ///   path reads the same numbers it read before this trait: `geo.vocab`, `geo.eos_ids`, Qwen.
 /// - `Glm5Engine` answers from GLM-5.3-Flash's own constants (`glm5_template::EOS_IDS`).
-/// - part 1 of #185: the generation calls (prefill, decode step, logits, snapshot / restore,
-///   reset) stay on `Engine`; part 2 moves them here when `Glm5Engine` gets its body.
+/// - #185 part 2: the generation calls (prefill, decode step, logits, snapshot / restore,
+///   reset) are each engine's own: `chat_generate` drives `Engine`, `glm_generate` drives
+///   `Glm5Engine`; this trait is what the shared request layer reads of either.
 trait ServeEngine {
     /// the vocabulary size: the bound of `logit_bias` keys and `crow_force_ids`, the trie's size
     fn vocab(&self) -> usize;
@@ -1268,7 +1272,7 @@ impl ServeEngine for Engine {
     }
 }
 
-impl ServeEngine for Glm5Engine {
+impl<R: Rows> ServeEngine for Glm5Engine<R> {
     fn vocab(&self) -> usize {
         Glm5Engine::vocab(self)
     }
@@ -2371,7 +2375,13 @@ fn apply_logit_bias(row: &mut [f32], bias: &[(usize, f32)]) {
 ///   grammar's mask on it (llama.cpp's rejection order), so the host sampler's state
 ///   only ever sees the id that is kept.
 unsafe fn draw_biased(eng: &Engine, s: &mut Sampler, bias: &[(usize, f32)], gate: Option<&mut Gate<'static>>) -> usize {
-    let mut row = crow_nest_engine::cuda::dtoh(eng.logits(), eng.geo.vocab);
+    draw_row(crow_nest_engine::cuda::dtoh(eng.logits(), eng.geo.vocab), s, bias, gate)
+}
+
+/// - the host half of `draw_biased`, on a row already read back: the bias first, the chain,
+///   the #93 grammar check, `observe` (pure; #185: `glm_generate` draws every sampled
+///   glm5_next token here, its rows are host copies)
+fn draw_row(mut row: Vec<f32>, s: &mut Sampler, bias: &[(usize, f32)], gate: Option<&mut Gate<'static>>) -> usize {
     apply_logit_bias(&mut row, bias);
     let mut tok = s.sample(&row);
     if let Some(g) = gate {
@@ -5950,6 +5960,716 @@ fn listener_wait(listener: &TcpListener, ms: i32) -> i32 {
     unsafe { WSAPoll(&mut p, 1, ms) }
 }
 
+// ------------------------------------------------ #185 part 2: the glm5_next server
+
+/// - #185 part 2: `/props` `prompt_chunk` of a glm5_next process: the prompt runs one row at a
+///   time inside `Glm5Engine::prefill` until #186 brings the chunked prefill into `glm5_tiers`
+const GLM_PROMPT_CHUNK: usize = 1;
+
+/// - #185 part 2: the server state of a glm5_next process. The `Engine` families keep `Srv`;
+///   what a glm5_next engine does not have (the device sampler, the park of #118, slot files,
+///   VRAM lending, vision, MTP, the trickle) has no field here, and its routes answer by name.
+struct GlmSrv<'a, R: Rows> {
+    /// the one loaded engine of this process, with its held conversation and prompt snapshot
+    eng: &'a mut Glm5Engine<R>,
+    /// the request family, `Glm` (checked against the tokenizer's at boot)
+    markup: Markup,
+    /// `/props` `model_path`
+    model_path: &'a str,
+    /// `/props` `n_ctx`: the rows the boot allocated
+    n_ctx: usize,
+    /// per process request counter, the tail of every chunk `id`
+    seq: u64,
+    /// TASK K: the SSE head of the request in flight left the socket
+    stream_head_sent: bool,
+    /// #13: the cumulative `[vram, pinned, nvme]` expert accesses and NVMe bytes the previous
+    /// request left, so the routing line of one request is a difference
+    prev_counters: ([u64; 3], u64),
+    /// #68: the cross-turn repeat counter's ring
+    repeats: RepeatRing,
+}
+
+impl<'a, R: Rows> GlmSrv<'a, R> {
+    fn new(eng: &'a mut Glm5Engine<R>, model_path: &'a str) -> Self {
+        let n_ctx = eng.n_ctx();
+        let prev_counters = eng.counters();
+        let markup = ServeEngine::markup(&*eng);
+        GlmSrv { eng, markup, model_path, n_ctx, seq: 0, stream_head_sent: false, prev_counters, repeats: RepeatRing::default() }
+    }
+}
+
+/// - #185 part 2: boot and serve a glm5_next container; never returns (the process exits
+///   through the same drops and the `ctx_hard_reset` the `Engine` path ends with)
+/// - the boot: `boot::open_glm5` (the container checked, the context, the CUDA context), then
+///   `Glm5Device::load` (the #159 plan as `[budget]` lines, every layer, the tiers), then the
+///   engine with the prefix cache (`CROW_PREFIX_CACHE=0` turns it off, as for every family)
+fn glm_main(cli: &ServeArgs, cnq_path: &str, meta: &crow_nest_engine::meta::ModelMeta) -> ! {
+    let die = |why: &str| -> ! {
+        tracing::error!(target: "serve", "[serve] {why}");
+        crow_nest_engine::log::shutdown();
+        std::process::exit(3);
+    };
+    if let Err(why) = crow_nest_engine::glm5_engine::check_family(cnq_path, meta) {
+        die(&why);
+    }
+    // unsafe: creates the CUDA context; it must outlive every device allocation
+    let (opened, ctx, context) = match unsafe { boot::open_glm5(cnq_path) } {
+        Ok(x) => x,
+        Err(why) => die(&format!("[boot] refused: {why} - refusing to boot (#185)")),
+    };
+    // unsafe: device and pinned allocations under the context above
+    let dev = match unsafe { Glm5Device::load(opened, context, &mut |m| tracing::info!(target: "load", "{m}")) } {
+        Ok(d) => d,
+        Err(why) => die(&format!("[boot] refused: glm5_next {cnq_path}: {why} - refusing to boot (#185)")),
+    };
+    let cache_on = std::env::var("CROW_PREFIX_CACHE").as_deref() != Ok("0");
+    let mut eng = Glm5Engine::new(dev, cache_on);
+    if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+        drop(eng);
+        crow_nest_engine::log::shutdown();
+        unsafe { crow_nest_engine::cuda::ctx_hard_reset() };
+        std::process::exit(0);
+    }
+    tracing::info!(target: "serve", "[serve] container {cnq_path} (glm5_next, #185)");
+    tracing::info!(target: "serve", "[serve] n_ctx {}", eng.n_ctx());
+    tracing::info!(target: "serve", "[serve] prompt_chunk {GLM_PROMPT_CHUNK} (glm5_next prefills one row at a time; the chunked prefill is #186)");
+    tracing::info!(target: "serve",
+        "[serve] prefix cache {}, {} B per snapshot in HOST RAM (KDA state + conv of every KDA layer, the logits row; MLA latent and DSA indexer rows truncate), 1 snapshot after each prompt",
+        if eng.cache_enabled() { "on" } else { "off (CROW_PREFIX_CACHE=0)" },
+        eng.snapshot_bytes()
+    );
+    tracing::info!(target: "serve",
+        "[serve] glm5_next: no device sampler (sampled requests draw on the host), no MTP, no vision tower, no slot files, no VRAM lending (#185)");
+    if cli.slot_save_path.is_some() {
+        tracing::warn!(target: "serve", "[serve] --slot-save-path is not built for glm5_next: POST /slots/0 refuses save and restore (#185)");
+    }
+    let addr = format!("127.0.0.1:{}", cli.port);
+    let listener = match TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            drop(eng);
+            die(&format!("cannot bind {addr}: {e}"));
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        LISTENER_FD.store(listener.as_raw_fd(), std::sync::atomic::Ordering::SeqCst);
+    }
+    tracing::info!(target: "serve", "[serve] listening on http://{addr} (blocking, one request at a time)");
+    let mut srv = GlmSrv::new(&mut eng, cnq_path);
+    loop {
+        match listener.accept() {
+            Ok((mut s, _)) => {
+                if let Some(head) = read_conn(&mut s) {
+                    glm_dispatch(&mut s, &mut srv, head);
+                }
+            }
+            Err(e) => {
+                if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                tracing::warn!(target: "serve", "[serve] accept failed: {e}");
+            }
+        }
+    }
+    drop(srv);
+    drop(eng);
+    // #82: last CUDA act of this process - see cuda::ctx_hard_reset
+    unsafe { crow_nest_engine::cuda::ctx_hard_reset() };
+    drop(ctx);
+    crow_nest_engine::log::shutdown();
+    std::process::exit(0);
+}
+
+/// #185 part 2: `dispatch` for a glm5_next process. Chat, health, props and slots as for every
+/// family; the slot files and VRAM lending are not built for glm5_next and say so.
+fn glm_dispatch<R: Rows>(stream: &mut TcpStream, srv: &mut GlmSrv<R>, head: Head) {
+    let (label, status, doc) = match head {
+        Head::Empty => return,
+        Head::Bad => ("<no HTTP request line>".to_string(), "400 Bad Request", error_json("bad request")),
+        Head::HeadTooLarge => (
+            format!("<head over {MAX_HEAD_BYTES} bytes>"),
+            "431 Request Header Fields Too Large",
+            error_json("request header fields too large"),
+        ),
+        Head::BodyTooLarge(n) => (
+            format!("<Content-Length {n} over {MAX_BODY_BYTES} bytes>"),
+            "413 Payload Too Large",
+            error_json("payload too large"),
+        ),
+        Head::Chunked => (
+            "<Transfer-Encoding: chunked>".to_string(),
+            "501 Not Implemented",
+            error_json("chunked transfer encoding not supported"),
+        ),
+        Head::Req { method, target, body } => {
+            let path = route_path(&target).to_string();
+            let label = format!("{method} {target} (body {} bytes)", body.len());
+            match route(&method, &path) {
+                Route::Chat => {
+                    let status = glm_guarded(stream, srv, |stream, srv| glm_chat_route(stream, srv, &body));
+                    tracing::info!(target: "serve", "[serve] {label} -> {status}");
+                    let _ = stream.shutdown(Shutdown::Write);
+                    return;
+                }
+                Route::Health => (label, "200 OK", serde_json::json!({ "status": "ok" })),
+                Route::Props => (label, "200 OK", props_json(srv.model_path, srv.n_ctx, GLM_PROMPT_CHUNK, false)),
+                Route::Slots => (label, "200 OK", slots_json(srv.n_ctx, srv.eng.snapshot_pos().unwrap_or(0))),
+                Route::Slot0 => (label, "501 Not Implemented", error_json("slot files are not built for glm5_next (#185): its prompt snapshot lives in this process only")),
+                Route::VramLend => (label, "501 Not Implemented", error_json("VRAM lending is not built for glm5_next (#185)")),
+                Route::VramReturn => (label, "200 OK", serde_json::json!({ "returned_mib": 0, "note": "nothing lent" })),
+                Route::VramStatus => (
+                    label,
+                    "200 OK",
+                    serde_json::json!({ "enabled": false, "lendable_mib": 0.0, "lent": false, "lent_mib": 0.0, "ttl_remaining_s": null, "parked": 0 }),
+                ),
+                Route::NotFound => (label, "404 Not Found", not_found_json(&path)),
+            }
+        }
+    };
+    let text = doc.to_string();
+    tracing::info!(target: "serve", "[serve] {label} -> {status}");
+    if let Err(e) = respond(stream, status, &text) {
+        tracing::warn!(target: "serve", "[serve] response write failed: {e}");
+    }
+    let _ = stream.shutdown(Shutdown::Write);
+}
+
+/// - #185 part 2: `guarded` for a glm5_next request: an allocation that fails inside it is a
+///   503 that names the allocation, the engine goes back to a cold start; any other panic is
+///   re-raised
+fn glm_guarded<R: Rows, F>(stream: &mut TcpStream, srv: &mut GlmSrv<R>, f: F) -> &'static str
+where
+    F: FnOnce(&mut TcpStream, &mut GlmSrv<R>) -> &'static str,
+{
+    srv.stream_head_sent = false;
+    let caught = {
+        let _scope = crow_nest_engine::cuda::RequestScope::new();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(stream, srv)))
+    };
+    let payload = match caught {
+        Ok(status) => return status,
+        Err(p) => p,
+    };
+    let failed = match payload.downcast::<crow_nest_engine::cuda::AllocFailed>() {
+        Ok(af) => *af,
+        Err(p) => std::panic::resume_unwind(p),
+    };
+    tracing::info!(target: "serve",
+        "[serve] the request was dropped: {} - the engine stays up, the next request is served",
+        failed.message()
+    );
+    unsafe { srv.eng.reset() };
+    let body = error_json(&format!("{}. The request was dropped and the engine is up; retry with a shorter prompt", failed.message()));
+    glm_fail(stream, srv.stream_head_sent, "503 Service Unavailable", body)
+}
+
+/// - #185 part 2: an error after the request was accepted: a JSON answer while no head left the
+///   socket, else an SSE error frame and `[DONE]` (the stream's only way to say it)
+fn glm_fail(stream: &mut TcpStream, head_sent: bool, status: &'static str, body: serde_json::Value) -> &'static str {
+    if head_sent {
+        let _ = sse_send(stream, &sse_frame(&serde_json::json!({ "error": body["error"] })));
+        let _ = sse_send(stream, SSE_DONE);
+        "200 OK (an SSE error frame, the head was already sent)"
+    } else {
+        respond_json(stream, status, &body)
+    }
+}
+
+/// - #185 part 2: one glm5_next request from its body to its prompt ids, the steps of
+///   `chat_route` the family shares: the parse with GLM's 400s, the message repairs and checks,
+///   GLM's render, the 413 and the clamp
+/// - images: glm5_next has no vision tower yet (plan step 20); the template's placeholder ids
+///   ride as tokens, as under `CROW_VIT=0`, and one line says so
+/// - pure (no engine call): the test drives it with the GLM tokenizer
+fn glm_request(
+    tk: &crow_nest_engine::tokenizer::ChatTokenizer,
+    vocab: usize,
+    markup: Markup,
+    n_ctx: usize,
+    body: &[u8],
+) -> Result<(ChatReq, Vec<u32>), (&'static str, String)> {
+    let mut req = parse_chat_as(body, vocab, markup).map_err(|e| ("400 Bad Request", e))?;
+    let (msgs, notes) = normalize_messages_as(&req.messages, req.markup);
+    for n in &notes {
+        tracing::info!(target: "chat", "[chat] normalised: {n}");
+    }
+    if let Err(e) = check_messages(&msgs) {
+        log_messages_400(&e, &req.messages);
+        return Err(("400 Bad Request", e));
+    }
+    let ids = match render_ids(tk, &msgs, &req) {
+        Ok(v) => v,
+        Err(e) => {
+            log_messages_400(&e, &req.messages);
+            return Err(("400 Bad Request", e));
+        }
+    };
+    if ids.is_empty() {
+        return Err(("400 Bad Request", "the rendered prompt is empty".to_string()));
+    }
+    if !req.images.is_empty() {
+        tracing::info!(target: "vit",
+            "[vit-chat] {} image(s) in a glm5_next request: no vision tower (plan step 20), the template's image placeholder ids ride as tokens",
+            req.images.len());
+    }
+    let budget = clamped_max_tokens(ids.len(), req.max_tokens, n_ctx)
+        .ok_or_else(|| ("413 Payload Too Large", format!("prompt {} tokens over n_ctx {n_ctx}", ids.len())))?;
+    if budget != req.max_tokens {
+        tracing::info!(target: "chat", "[chat] max_tokens {} clamped to {budget} (prompt {}, n_ctx {n_ctx})", req.max_tokens, ids.len());
+        req.max_tokens = budget;
+    }
+    Ok((req, ids))
+}
+
+fn glm_chat_route<R: Rows>(stream: &mut TcpStream, srv: &mut GlmSrv<R>, body: &[u8]) -> &'static str {
+    let tk = match crow_nest_engine::tokenizer::global() {
+        Ok(t) => t,
+        Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(e)),
+    };
+    let (req, ids) = match glm_request(tk, ServeEngine::vocab(&*srv.eng), srv.markup, srv.n_ctx, body) {
+        Ok(x) => x,
+        Err((status, e)) => return respond_json(stream, status, &error_json(&e)),
+    };
+    if req.stream {
+        const HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+        if !sse_send(stream, HEAD) {
+            return "200 OK (client gone)";
+        }
+        srv.stream_head_sent = true;
+        let res = {
+            let mut sink = SseSink::new(&mut *stream);
+            glm_generate(srv, &req, &ids, tk, &mut sink)
+        };
+        match res {
+            Ok(out) if out.aborted => "200 OK (client gone)",
+            Ok(_) => "200 OK (text/event-stream)",
+            Err(e) => glm_fail(stream, true, "500 Internal Server Error", error_json(&e)),
+        }
+    } else {
+        let mut sink = CollectSink::watching(stream);
+        let out = match glm_generate(srv, &req, &ids, tk, &mut sink) {
+            Ok(o) => o,
+            Err(e) => return glm_fail(stream, false, "500 Internal Server Error", error_json(&e)),
+        };
+        let mut doc = completion_json(&ChunkCtx::new(&out.id, out.created, &req.model), &sink.content, &sink.reasoning, &sink.calls, out.finish, &out.timing);
+        attach_malformed(&mut doc, &out.malformed);
+        if req.logprobs {
+            attach_logprobs(&mut doc, &sink.logprobs);
+        }
+        let status = respond_json(stream, "200 OK", &doc);
+        if out.aborted {
+            "200 OK (client gone)"
+        } else {
+            status
+        }
+    }
+}
+
+/// - #185 part 2: THE generation loop of a glm5_next process, the twin of `chat_generate` on
+///   `Glm5Engine`. The wire is the same: the sinks, the reasoning filter, the tool-call parser
+///   and grammar, the stop strings, `logprobs`, the #81 reasoning budget and #91 forced ids,
+///   `usage` with `cached_tokens` and `timings` with `prompt_n`, `prompt_per_second`,
+///   `predicted_per_second` and `cache_n`, the finish rule, the `[cache]` / `[chat]` / routing
+///   lines.
+/// - the prefix cache (#31 A9, #36 M2b, #100): the decision first; a warm request rolls back to
+///   the prompt snapshot (KDA states copied back, MLA / DSA rows truncated) and prefills the
+///   rest, a cold one resets; ONE snapshot after the prompt, with its logits row
+/// - sampling: greedy takes the head's argmax (the id `glm5_run` takes); a sampled request
+///   draws on the HOST (`draw_row`) on the logits row read back, since glm5_next has no device
+///   sampler; a greedy request inside a tool call redraws under the grammar (`redraw_from_row`)
+/// - not on this path: MTP (#182), the trickle, vision, the park of #118
+/// - `Err` is an engine failure (a row that failed: an NVMe read, the staging); the engine has
+///   reset itself, the next request is cold
+fn glm_generate<R: Rows>(
+    srv: &mut GlmSrv<R>,
+    req: &ChatReq,
+    ids: &[u32],
+    tk: &crow_nest_engine::tokenizer::ChatTokenizer,
+    sink: &mut dyn ChatSink,
+) -> Result<GenOut, String> {
+    srv.seq += 1;
+    let created = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let id = format!("chatcmpl-{created}-{}", srv.seq);
+    let model = req.model.clone();
+    let prompt: Vec<i64> = ids.iter().map(|&v| v as i64).collect();
+
+    let plan = srv.eng.decide(&prompt);
+    let held = srv.eng.history().len();
+    let cache_on = srv.eng.cache_enabled();
+    let snaps = srv.eng.snapshot_pos();
+    let t_reset = Instant::now();
+    // unsafe: the engine's device state, this thread's
+    let cached_n = match plan.reuse {
+        Some((_, p)) => {
+            unsafe { srv.eng.rollback(p)? };
+            p
+        }
+        None => {
+            unsafe { srv.eng.reset() };
+            0
+        }
+    };
+    let reset_ms = t_reset.elapsed().as_secs_f64() * 1e3;
+    let prefilled = prompt.len() - cached_n;
+    tracing::info!(target: "cache",
+        "[cache] {} L {} (held {held}), P {cached_n}, snapshots [{snaps:?}], prefill {prefilled} of {} tok, reset {reset_ms:.3} ms (glm5_next: KDA states restored, MLA/DSA rows truncated)",
+        if plan.reuse.is_some() { "WARM" } else { "COLD" },
+        if cache_on { plan.l.to_string() } else { "n/a".to_string() },
+        prompt.len()
+    );
+    let t_pre = Instant::now();
+    let mut next = unsafe {
+        if prefilled == 0 {
+            // #100: the whole prompt is held: the snapshot's row and greedy id stand in
+            srv.eng.restore_logits()
+        } else {
+            srv.eng.prefill(&prompt[cached_n..])?
+        }
+    } as usize;
+    let prefill_ms = t_pre.elapsed().as_secs_f64() * 1e3;
+    let snap1_ms = unsafe { srv.eng.snapshot(next as i64) };
+    if cache_on {
+        tracing::info!(target: "cache", "[cache] snapshot point 1 (after prompt) at pos {}, DtoH {snap1_ms:.3} ms", srv.eng.pos());
+    }
+
+    let mut sampler = sampler_from(req);
+    if let Some(s) = sampler.as_mut() {
+        s.observe_prompt(ids);
+    }
+    // no device sampler on glm5_next: every sampled request draws on the host
+    let host = sampler.is_some();
+    let (mut gate, gate_line) = tool_gate(req, tk, &*srv.eng, tool_grammar_on());
+    if let Some(l) = gate_line {
+        tracing::info!(target: "chat", "{l}");
+    }
+    let mut redraw_ms = 0.0f64;
+    if let Some(l) = card_fill_line(req) {
+        tracing::info!(target: "chat", "{l}");
+    }
+    match sampler.as_mut() {
+        Some(s) => {
+            next = draw_row(unsafe { srv.eng.logits() }, s, &req.logit_bias, gate.as_mut());
+            let sent = req.sampling_sent;
+            if s.temperature > 0.0 {
+                tracing::info!(target: "chat", "{}", sampling_line(s, sent, req.card, true));
+            } else {
+                tracing::info!(target: "chat",
+                    "[chat] greedy with host knobs (glm5_next draws on the HOST): presence_penalty {} ({})",
+                    s.presence_penalty, SamplingSent::tag(sent.presence_penalty));
+            }
+        }
+        None => tracing::info!(target: "chat", "[chat] greedy (temperature <= 0 sent explicitly)"),
+    }
+    tracing::info!(target: "chat", "{}", thinking_line(req));
+
+    let mut ts = tool_stream(req);
+    let tool_open = tk.token_id(TOOL_OPEN);
+    let mut think = ThinkFilter::for_request(req.enable_thinking);
+    let mut stops = StopStrings::new(&req.stop);
+    let mut counts = Chunks::default();
+    let cx = ChunkCtx::new(&id, created, &model);
+    let mut aborted = !sink.open(&cx);
+    let mut shutdown = false;
+    let mut t_dec: Option<Instant> = None;
+    let mut out: Vec<u32> = Vec::with_capacity(req.max_tokens);
+    let mut emitted = 0usize;
+    let mut finish = "length";
+    let mut args_acc: Vec<String> = Vec::new();
+    let mut decode_ms = 0.0f64;
+    let mut lp_gap = (f64::INFINITY, 0usize);
+    let mut lp_ms = 0.0f64;
+    // #81 the reasoning budget and #91 the forced ids, as in `chat_generate`
+    let think_budget = if req.enable_thinking { req.reasoning_budget } else { None };
+    let mut think_tokens = 0usize;
+    let mut inject: VecDeque<usize> = VecDeque::new();
+    let mut injection_built = false;
+    let build_injection = || -> VecDeque<usize> {
+        let mut v: Vec<usize> = req
+            .reasoning_budget_message
+            .as_deref()
+            .and_then(|m| tk.encode_raw(m).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| id as usize)
+            .collect();
+        if let Some(close) = tk.token_id(THINK_CLOSE) {
+            v.push(close as usize);
+        }
+        if let Ok(tail) = tk.encode_raw("\n\n") {
+            v.extend(tail.into_iter().map(|id| id as usize));
+        }
+        VecDeque::from(v)
+    };
+    if let Some(f) = req.force_ids.as_ref() {
+        inject = f.iter().copied().collect();
+        tracing::info!(target: "chat", "[chat] teacher forcing: {} forced ids", inject.len());
+        tracing::debug!(target: "chat", "[chat] prompt ids {ids:?}");
+    }
+    if think_budget == Some(0) {
+        inject = build_injection();
+        injection_built = true;
+        tracing::info!(target: "chat", "[chat] reasoning budget 0 (request): closing the think block before it opens");
+    }
+    if !aborted {
+        for i in 0..req.max_tokens {
+            if !inject.is_empty() {
+                next = inject.pop_front().expect("checked non-empty");
+            } else if let Some(gt) = gate.as_mut() {
+                // greedy inside a call: the argmax is checked, a refused id redrawn under the
+                // mask from the same row (the host route checked inside `draw_row`)
+                if !host && gt.armed() && !gt.check(next as u32) {
+                    let t_rd = Instant::now();
+                    let drawn = next;
+                    next = redraw_from_row(req, ids, &out, gt, unsafe { srv.eng.logits() });
+                    gt.stats.redrawn += 1;
+                    redraw_ms += t_rd.elapsed().as_secs_f64() * 1e3;
+                    tracing::info!(target: "chat",
+                        "[chat] tool grammar: id {drawn} {:?} refused in phase {}, redrawn {next} {:?}",
+                        String::from_utf8_lossy(&tk.token_bytes(drawn as u32)), gt.phase(),
+                        String::from_utf8_lossy(&tk.token_bytes(next as u32)));
+                }
+            }
+            if ServeEngine::is_stop(&*srv.eng, next) {
+                finish = "stop";
+                break;
+            }
+            out.push(next as u32);
+            let phase = gate.as_ref().map_or("idle", |g| g.phase());
+            if !admit_id(next as u32, tool_open, &think, &mut ts, gate.as_mut()) {
+                tracing::warn!(target: "chat",
+                    "[chat] tool grammar: the forced id {next} is outside the grammar ({phase}); the grammar steps aside for the rest of this answer");
+            }
+            if req.logprobs {
+                let t_lp = Instant::now();
+                let row = unsafe { srv.eng.logits() };
+                let p = pos_logprobs(&row, next, req.top_logprobs);
+                lp_ms += t_lp.elapsed().as_secs_f64() * 1e3;
+                if p.top.len() >= 2 && p.top[0].1 - p.top[1].1 < lp_gap.0 {
+                    lp_gap = (p.top[0].1 - p.top[1].1, out.len() - 1);
+                }
+                let entry = logprob_entry_ids(&p, &|id| tk.token_bytes(id), req.force_ids.is_some());
+                if !sink.on_logprobs(&cx, entry) {
+                    aborted = true;
+                    break;
+                }
+            }
+            let full = match tk.decode(&out) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(target: "chat", "[chat] detokenize failed: {e}");
+                    String::new()
+                }
+            };
+            if let Some(delta) = next_delta(&full, emitted) {
+                emitted = full.len();
+                let pieces = ts.feed(delta);
+                accumulate_args(&pieces, &mut args_acc);
+                if !send_emits(sink, &cx, &pieces, &mut think, &mut stops, &mut counts) {
+                    aborted = true;
+                    break;
+                }
+                if stops.hit() {
+                    finish = "stop";
+                    break;
+                }
+            }
+            if !injection_built {
+                if let Some(cap) = think_budget {
+                    if think.is_inside() {
+                        think_tokens += 1;
+                        if think_tokens >= cap {
+                            inject = build_injection();
+                            injection_built = true;
+                            tracing::info!(target: "chat",
+                                "[chat] reasoning budget {cap} spent after {think_tokens} thinking tokens (request): closing the think block");
+                        }
+                    }
+                }
+            }
+            if i + 1 == req.max_tokens {
+                break;
+            }
+            if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                aborted = true;
+                shutdown = true;
+                break;
+            }
+            if !sink.still_there(i) {
+                aborted = true;
+                break;
+            }
+            let t = *t_dec.get_or_insert_with(Instant::now);
+            // unsafe: the engine's device state, this thread's
+            next = unsafe { srv.eng.decode_step(next as i64)? } as usize;
+            if let Some(s) = sampler.as_mut() {
+                next = draw_row(unsafe { srv.eng.logits() }, s, &req.logit_bias, gate.as_mut());
+            }
+            decode_ms = t.elapsed().as_secs_f64() * 1e3;
+        }
+    }
+    if let Some(gt) = gate.as_ref() {
+        let st = gt.stats;
+        if st.checked > 0 || st.stepped_aside {
+            tracing::info!(target: "chat",
+                "[chat] tool grammar: {} call(s) closed under it, {} id(s) checked, {} refused and redrawn ({} mask(s) built, {:.2} ms; redraw path {:.2} ms in total){}",
+                st.calls_closed, st.checked, st.redrawn, st.masks_built, st.mask_ms, redraw_ms,
+                if st.stepped_aside { "; stepped aside for a forced id" } else { "" });
+        }
+    }
+    if req.logprobs {
+        tracing::info!(target: "chat",
+            "[chat] logprobs (#91): {} entries, top_logprobs {}, raw distribution (pre-sampler), readback + log-softmax {lp_ms:.1} ms in total{}",
+            out.len(), req.top_logprobs,
+            if lp_gap.0.is_finite() { format!(", narrowest top-1/top-2 gap {:.4} nats at generated id {}", lp_gap.0, lp_gap.1) } else { String::new() });
+    }
+    let mut malformed = false;
+    if !aborted {
+        let full = tk.decode(&out).unwrap_or_default();
+        let mut pieces = if full.len() > emitted && full.is_char_boundary(emitted) { ts.feed(&full[emitted..]) } else { Vec::new() };
+        malformed = ts.finish(&mut pieces);
+        accumulate_args(&pieces, &mut args_acc);
+        if !send_emits(sink, &cx, &pieces, &mut think, &mut stops, &mut counts) {
+            aborted = true;
+        }
+    }
+    if !aborted {
+        let tail = think.flush();
+        if !send_split(sink, &cx, &tail, &mut stops, &mut counts) {
+            aborted = true;
+        }
+    }
+    if !aborted {
+        let stail = stops.flush();
+        if !stail.is_empty() {
+            counts.content += 1;
+            if !sink.on_emit(&cx, &Emit::Content(stail)) {
+                aborted = true;
+            }
+        }
+    }
+    if !aborted && stops.hit() && finish == "length" {
+        finish = "stop";
+    }
+    if stops.hit() && !aborted {
+        tracing::info!(target: "chat",
+            "[chat] stopped on a stop string (#86): {:?} at content byte {}, {} byte(s) swallowed - the sequence and everything after it stayed off the wire",
+            stops.matched().unwrap_or_default(), stops.matched_at(), stops.dropped());
+    }
+    if think.stripped() > 0 {
+        tracing::info!(target: "chat",
+            "[chat] reasoning filter: {} <think>/</think> tag(s) stripped from the content (#67); the generated ids are untouched{}",
+            think.stripped(),
+            if req.enable_thinking { ", and this request was thinking, so one of them is its own </think>" } else { "" });
+    }
+    if aborted {
+        let open = args_acc.iter().filter(|a| args_object_or_raw(a).1.is_some()).count();
+        if open > 0 {
+            tracing::info!(target: "chat",
+                "[chat] aborted with {open} tool call(s) in flight: their arguments stay unterminated on a connection nobody reads - not a parser fault, not checked (#99)");
+        }
+    } else {
+        for (i, a) in args_acc.iter().enumerate() {
+            if let (_, Some(note)) = args_object_or_raw(a) {
+                tracing::error!(target: "chat", "[chat] BUG: the arguments of tool call {i} are not a JSON object - {note}");
+            }
+        }
+    }
+    finish = decide_finish(finish, aborted, malformed, ts.closed(), stops.hit());
+    for m in ts.malformed() {
+        tracing::warn!(target: "chat",
+            "[chat] MALFORMED tool call ({}): {}; {}, finish {finish}",
+            m.kind.as_str(), m.kind.what(),
+            match (m.index, m.raw_as_content) {
+                (Some(i), _) => format!("sent once, as tool_calls[{i}] with \"_truncated\" arguments; its raw markup was dropped"),
+                (None, true) => "never named: its raw markup went out as content".to_string(),
+                (None, false) => "never named, after an earlier call: its raw markup was dropped".to_string(),
+            });
+    }
+    if ts.dropped() > 0 {
+        tracing::info!(target: "chat",
+            "[chat] {} byte(s) dropped after the first tool call started: text the template forbids, or markup after the last `</function>`",
+            ts.dropped());
+    }
+    // #30 A8 for glm5_next: the expert tier counters, cumulative since boot (never reset):
+    // every access is a selection, an NVMe-served access is a cold one; no PLE
+    let t_ctr = Instant::now();
+    let (acc, nvme_bytes) = srv.eng.counters();
+    let selections_total = acc[0] + acc[1] + acc[2];
+    let cold_total = acc[2];
+    let counters_ms = t_ctr.elapsed().as_secs_f64() * 1e3;
+    let gen = out.len();
+    let rep = srv.repeats.observe(&out, single_token_answer(gen, finish));
+    if let Some(w) = loop_warning(&rep) {
+        tracing::warn!(target: "chat", "{w}");
+    }
+    let timing = Timing {
+        prompt_n: prefilled,
+        cached_n,
+        predicted_n: gen,
+        prompt_ms: prefill_ms,
+        predicted_ms: decode_ms,
+        selections_total,
+        cold_total,
+        ple_rows_total: 0,
+        ple_miss_total: 0,
+        layers: srv.eng.layers(),
+    };
+    if !aborted {
+        let _ = sink.on_finish(
+            &cx,
+            &FinishArgs { finish, t: &timing, include_usage: req.include_usage, timings_per_token: req.timings_per_token, malformed: ts.malformed() },
+        );
+    }
+    let (log_usage, log_timings) = if req.stream { (req.include_usage, req.timings_per_token) } else { (true, true) };
+    tracing::info!(target: "chat",
+        "[chat] prompt {} tok ({cached_n} cached, {prefilled} prefilled), generated {gen} tok, prefill {prefill_ms:.1} ms ({:.1} tok/s), reset {reset_ms:.1} ms, decode {decode_ms:.1} ms, {:.1} tok/s, finish {finish}, content chunks {}, reasoning chunks {}, thinking {}, tool chunks {}, think tags stripped {}, tool calls {}, malformed {}, usage {}, timings {}, engine glm5_next{}{}",
+        ids.len(),
+        per_second(prefilled, prefill_ms),
+        (gen.saturating_sub(1)) as f64 * 1000.0 / decode_ms.max(1e-9),
+        counts.content, counts.reasoning, thinking_tag(req), counts.tool, think.stripped(), ts.closed(), ts.malformed().len(),
+        log_usage, log_timings,
+        match (aborted, shutdown) {
+            (true, true) => ", shutdown",
+            (true, false) => ", client gone",
+            _ => "",
+        },
+        repeat_note(&rep)
+    );
+    tracing::info!(target: "chat",
+        "[chat] counters (cumulative, never reset): expert accesses vram {} pinned {} nvme {}, NVMe bytes {nvme_bytes}, layers {}, counter read {counters_ms:.3} ms",
+        acc[0], acc[1], acc[2], srv.eng.layers());
+    let (prev, prev_bytes) = std::mem::replace(&mut srv.prev_counters, (acc, nvme_bytes));
+    let d_sel = selections_total.saturating_sub(prev[0] + prev[1] + prev[2]);
+    let d_cold = cold_total.saturating_sub(prev[2]);
+    crow_nest_engine::log::routing(&crow_nest_engine::log::Routing {
+        seq: srv.seq,
+        route: if req.stream { "chat_stream" } else { "chat_document" }.to_string(),
+        finish: finish.to_string(),
+        prompt_n: ids.len(),
+        cached_n,
+        predicted_n: gen,
+        prompt_ms: prefill_ms,
+        predicted_ms: decode_ms,
+        tok_s: (gen.saturating_sub(1)) as f64 * 1000.0 / decode_ms.max(1e-9),
+        selections: d_sel,
+        cold: d_cold,
+        // glm5_next counts its tiers summed over the MoE layers, not per layer
+        layers_cold: 0,
+        bytes_streamed: nvme_bytes.saturating_sub(prev_bytes),
+        ple_rows: 0,
+        ple_fills: 0,
+        trickle_swaps: 0,
+        counters_ms,
+        repeat_of: rep.repeat_of,
+        repeat_run: rep.repeat_run,
+        single_token: rep.single_token,
+    });
+    tracing::debug!(target: "chat", "[chat] ids {out:?}");
+    Ok(GenOut { id, created, finish, timing, aborted, malformed: ts.malformed().to_vec() })
+}
+
 fn main() {
     // #13: the subscriber, before the first line this process says. The guard keeps
     // the two writer threads alive for the whole process and drains them when `main`
@@ -6038,17 +6758,8 @@ fn main() {
     }
     if kind == EngineKind::Glm5 {
         let meta = family_meta.expect("engine_kind is Glm5 only for a parsed config");
-        match Glm5Engine::boot(&cnq_for_family, &meta) {
-            // part 2 of #185 serves on it; in part 1 no `Glm5Engine` value exists (its field is
-            // `Infallible`), so this arm is statically dead and the compiler knows it
-            #[allow(unreachable_code)]
-            Ok(g) => match g.placeholder() {},
-            Err(why) => {
-                tracing::error!(target: "serve", "[serve] {why}");
-                crow_nest_engine::log::shutdown();
-                std::process::exit(3);
-            }
-        }
+        // #185 part 2: glm5_next boots and serves on its own engine; this call never returns
+        glm_main(&cli, &cnq_for_family, &meta);
     }
 
     // #26 review: the gated configuration is CROW_GRAPH=1 and CROW_MMA=1 (every A2..A4 gate and
@@ -10195,7 +10906,7 @@ Red is #FF0000."), "{off}");
             assert_eq!((d.vocab(), d.markup()), (geo.vocab, Markup::Qwen));
             assert_eq!(d.stop_ids(), geo.eos_ids.iter().map(|&e| e as u32).collect::<Vec<_>>());
             assert_eq!(engine_kind(Some(m.family)), EngineKind::Engine);
-            assert!(crow_nest_engine::glm5_engine::Glm5Engine::boot("x.cnq", &m).is_err());
+            assert!(crow_nest_engine::glm5_engine::check_family("x.cnq", &m).is_err());
         }
 
         let tk = tk();
@@ -10237,5 +10948,151 @@ Red is #FF0000."), "{off}");
             assert!(!ts.finish(&mut es));
             assert_eq!(ts.closed(), 1, "{extra}");
         }
+    }
+
+    // ------------------------------------------------ #185 part 2: the glm5_next request loop
+
+    use crow_nest_engine::glm5_engine::fake::FakeRows;
+
+    /// the host twin of glm5_next (`glm5_engine::fake`) over GLM's real vocabulary: the head
+    /// picks among the ids of ordinary words, so every answer detokenizes and never stops early
+    fn glm_fake(tk: &crow_nest_engine::tokenizer::ChatTokenizer, n_ctx: usize) -> FakeRows {
+        let mut c = tk.encode_raw(" the quick brown fox jumps over a lazy dog while seven calm owls watch the river").unwrap();
+        c.sort_unstable();
+        c.dedup();
+        assert!(c.iter().all(|&id| !glm5_template::EOS_IDS.contains(&id)));
+        FakeRows::new(n_ctx, GLM_VOCAB, c)
+    }
+
+    /// one glm5_next request through `glm_request` and `glm_generate` into an SSE buffer: the
+    /// frames (without `[DONE]`), the reasoning text, the out
+    fn glm_turn(srv: &mut GlmSrv<FakeRows>, tk: &crow_nest_engine::tokenizer::ChatTokenizer, body: &serde_json::Value) -> (Vec<serde_json::Value>, String, GenOut) {
+        let (req, ids) = glm_request(tk, GLM_VOCAB, Markup::Glm, srv.n_ctx, body.to_string().as_bytes()).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        let out = {
+            let mut sink = SseSink::new(&mut buf);
+            glm_generate(srv, &req, &ids, tk, &mut sink).unwrap()
+        };
+        let text = String::from_utf8(buf).unwrap();
+        let frames: Vec<serde_json::Value> = text
+            .split("\n\n")
+            .filter_map(|f| f.strip_prefix("data: "))
+            .filter(|f| *f != "[DONE]")
+            .map(|f| serde_json::from_str(f).unwrap())
+            .collect();
+        let reasoning: String = frames.iter().filter_map(|f| f["choices"][0]["delta"]["reasoning_content"].as_str()).collect();
+        (frames, reasoning, out)
+    }
+
+    fn glm_stream_body(msgs: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "messages": msgs, "stream": true, "temperature": 0, "max_tokens": 24,
+            "timings_per_token": true, "stream_options": { "include_usage": true } })
+    }
+
+    /// #185 part 2, Expected results 2-4 on the host twin, through serve's own request path:
+    /// - the greedy ids serve feeds are the engine's argmax ids (`glm5_run`'s rule): the held
+    ///   conversation after turn 1 is the prompt plus the ids a direct greedy run produces;
+    /// - the final chunk carries `timings` (`prompt_n`, `prompt_per_second`,
+    ///   `predicted_per_second`, `cache_n`) and `usage.prompt_tokens_details.cached_tokens`;
+    /// - turn 2 extends turn 1: it reports `cached_tokens` = turn 1's prompt (> 0), streams the
+    ///   reasoning and leaves the conversation a cold re-prefill of turn 2 gives
+    #[test]
+    fn glm_serve_streams_timings_and_a_warm_turn_is_a_cold_reprefill() {
+        let Some(tk) = glm_tk() else { return };
+        let user1 = serde_json::json!({ "role": "user", "content": "read README.md and tell me its first heading" });
+        let body1 = glm_stream_body(serde_json::json!([user1]));
+        let mut eng = Glm5Engine::new(glm_fake(&tk, 4096), true);
+        let mut srv = GlmSrv::new(&mut eng, "synthetic-glm.cnq");
+        let (frames1, r1, out1) = glm_turn(&mut srv, &tk, &body1);
+        let (_, p1) = glm_request(&tk, GLM_VOCAB, Markup::Glm, 4096, body1.to_string().as_bytes()).unwrap();
+        let last = frames1.last().unwrap();
+        assert_eq!(last["choices"][0]["finish_reason"], "length");
+        let t = &last["timings"];
+        assert_eq!((t["prompt_n"].as_u64(), t["cache_n"].as_u64(), t["predicted_n"].as_u64()), (Some(p1.len() as u64), Some(0), Some(24)), "{t}");
+        for k in ["prompt_per_second", "predicted_per_second", "prompt_ms", "predicted_ms"] {
+            assert!(t[k].as_f64().is_some(), "timings.{k}: {t}");
+        }
+        assert_eq!(t["crow_layers"], 45);
+        assert_eq!(last["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+        assert_eq!((out1.timing.cached_n, out1.timing.prompt_n), (0, p1.len()));
+        // greedy: what serve fed is the direct greedy run's
+        let held1 = srv.eng.history().to_vec();
+        let mut direct = Glm5Engine::new(glm_fake(&tk, 4096), true);
+        let pi: Vec<i64> = p1.iter().map(|&v| v as i64).collect();
+        let mut want = pi.clone();
+        unsafe {
+            let mut next = direct.prefill(&pi).unwrap();
+            for _ in 1..24 {
+                want.push(next);
+                next = direct.decode_step(next).unwrap();
+            }
+        }
+        assert_eq!(held1, want, "serve's greedy ids are the engine's argmax ids");
+        assert!(!r1.is_empty(), "the answer streams as reasoning (GLM thinks, the filter starts Inside)");
+
+        // turn 2 extends turn 1 the way Crow sends it
+        let body2 = glm_stream_body(serde_json::json!([user1,
+            { "role": "assistant", "content": "", "reasoning_content": r1 },
+            { "role": "user", "content": "and the second heading?" }]));
+        let (frames2, r2, out2) = glm_turn(&mut srv, &tk, &body2);
+        let (_, p2) = glm_request(&tk, GLM_VOCAB, Markup::Glm, 4096, body2.to_string().as_bytes()).unwrap();
+        let l = crow_nest_engine::cache::common_prefix_len(&pi, &p2.iter().map(|&v| v as i64).collect::<Vec<_>>());
+        assert_eq!(l, p1.len(), "GLM's template renders turn 2 as an extension of turn 1's prompt");
+        let last2 = frames2.last().unwrap();
+        assert_eq!(last2["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64(), Some(p1.len() as u64), "{last2}");
+        assert_eq!(last2["timings"]["cache_n"].as_u64(), Some(p1.len() as u64));
+        assert_eq!(last2["timings"]["prompt_n"].as_u64(), Some((p2.len() - p1.len()) as u64));
+        assert_eq!(out2.timing.cached_n, p1.len());
+        let warm_held = srv.eng.history().to_vec();
+        drop(srv);
+
+        let mut cold_eng = Glm5Engine::new(glm_fake(&tk, 4096), true);
+        let mut cold = GlmSrv::new(&mut cold_eng, "synthetic-glm.cnq");
+        let (frames_c, rc, outc) = glm_turn(&mut cold, &tk, &body2);
+        assert_eq!(outc.timing.cached_n, 0);
+        assert_eq!(frames_c.last().unwrap()["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(r2, rc, "the warm turn streams the cold re-prefill's answer");
+        assert_eq!(warm_held, cold.eng.history(), "and leaves the same conversation");
+        assert_ne!(r2, r1);
+    }
+
+    /// #185 part 2: the document form carries `usage` / `timings` too; an identical re-request
+    /// prefills nothing (#100); a row that fails is an `Err` (the engine reset itself) and the
+    /// next request starts cold; GLM's 400 and the 413 are answered before any engine call
+    #[test]
+    fn glm_serve_document_errors_and_refusals() {
+        let Some(tk) = glm_tk() else { return };
+        let mut eng = Glm5Engine::new(glm_fake(&tk, 4096), true);
+        let mut srv = GlmSrv::new(&mut eng, "synthetic-glm.cnq");
+        let body = serde_json::json!({ "messages": [{ "role": "user", "content": "hello" }], "temperature": 0, "max_tokens": 8 });
+        let (req, ids) = glm_request(&tk, GLM_VOCAB, Markup::Glm, srv.n_ctx, body.to_string().as_bytes()).unwrap();
+        assert!(!req.stream);
+        let mut sink = CollectSink::default();
+        let out = glm_generate(&mut srv, &req, &ids, &tk, &mut sink).unwrap();
+        let doc = completion_json(&ChunkCtx::new(&out.id, out.created, &req.model), &sink.content, &sink.reasoning, &sink.calls, out.finish, &out.timing);
+        assert_eq!(doc["usage"]["completion_tokens"], 8);
+        assert_eq!(doc["timings"]["prompt_n"].as_u64(), Some(ids.len() as u64));
+        assert!(!sink.reasoning.is_empty());
+        // the same prompt again: the snapshot sits AT its length (#100), nothing is prefilled
+        let rows = srv.eng.rows().rows_run;
+        let mut again = CollectSink::default();
+        let out2 = glm_generate(&mut srv, &req, &ids, &tk, &mut again).unwrap();
+        assert_eq!((out2.timing.cached_n, out2.timing.prompt_n), (ids.len(), 0));
+        assert_eq!(again.reasoning, sink.reasoning);
+        assert_eq!(srv.eng.rows().rows_run - rows, 7, "7 decode rows, no prefill row");
+        // a failing row mid-answer: Err, the engine is cold again
+        srv.eng.rows_mut().fail_at = Some(ids.len() + 3);
+        let e = glm_generate(&mut srv, &req, &ids, &tk, &mut CollectSink::default()).err().expect("the failed row is an error");
+        assert!(e.contains("failed"), "{e}");
+        assert_eq!((srv.eng.history().len(), srv.eng.snapshot_pos()), (0, None));
+        srv.eng.rows_mut().fail_at = None;
+        let out3 = glm_generate(&mut srv, &req, &ids, &tk, &mut CollectSink::default()).unwrap();
+        assert_eq!(out3.timing.cached_n, 0);
+        // refusals before the engine
+        let off = serde_json::json!({ "messages": [{ "role": "user", "content": "x" }], "chat_template_kwargs": { "enable_thinking": false } });
+        assert_eq!(glm_request(&tk, GLM_VOCAB, Markup::Glm, 4096, off.to_string().as_bytes()).unwrap_err().0, "400 Bad Request");
+        let (status, why) = glm_request(&tk, GLM_VOCAB, Markup::Glm, 4, body.to_string().as_bytes()).unwrap_err();
+        assert_eq!(status, "413 Payload Too Large");
+        assert!(why.contains("over n_ctx 4"), "{why}");
     }
 }
