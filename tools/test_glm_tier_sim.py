@@ -17,6 +17,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -801,6 +802,220 @@ class TestG1dCapture(unittest.TestCase):
                 ts.load_corpus(c.path, c.rdir, source="g1d", capture=cap)
             self.assertIn("cannot be checked", str(cm.exception))
 
+
+G1D_TABLE = {   # PREREG-dyn "Capacity from bytes": C per layer at R 46 / 50 / 54 GiB, V25 then V37
+    ("4.5", "V25"): (108, 115, 122), ("3.5", "V25"): (138, 148, 157), ("3.05", "V25"): (161, 172, 183),
+    ("4.5", "V37"): (120, 127, 134), ("3.5", "V37"): (154, 163, 172), ("3.05", "V37"): (179, 190, 201)}
+
+
+def k1(seq):
+    """one layer, one pick per token -> ids [n][1]"""
+    return np.array(seq, np.int64)[:, None]
+
+
+def mask(e, on):
+    m = np.zeros(e, bool)
+    m[list(on)] = True
+    return m
+
+
+def small_run(name, routes, gen=None):
+    return ts.Run(name, "t", routes, np.ones(len(routes), bool) if gen is None else gen)
+
+
+class TestG1dModel(unittest.TestCase):
+    """PREREG-dyn cache model, policies and selection (#178), known answers on hand traces."""
+
+    def test_capacity_and_bar_are_the_prereg_table(self):
+        for (bpw, v), cs in G1D_TABLE.items():
+            self.assertEqual(tuple(ts.g1d_capacity(bpw, r, v) for r in (46, 50, 54)), cs, (bpw, v))
+        b = 6.9936611328                    # amendment 5: 1 reader
+        self.assertEqual(round(ts.g1d_bar(b, ts.G1D_S["3.05"]), 2), 18.45)
+        self.assertEqual(round(ts.g1d_bar(b, ts.G1D_S["4.5"]), 2), 12.35)
+        self.assertEqual(round(ts.g1d_bar(b, ts.G1D_S["3.5"]), 2), 15.88)
+        self.assertEqual(round(b * 1e9 / 40 / 1e6, 2), 174.84)   # B / 40 tok/s in MB
+        self.assertEqual(ts.G1D_PRIMARY, ("3.05", 46, "V25"))
+        self.assertEqual(len(ts.g1d_cells("all")), 18)
+
+    def test_grid_and_tie_order(self):
+        g = ts.g1d_grid()
+        self.assertEqual(len(g), 3 + 3 * 3 * 3)        # s x (P 0 + P {4,8,16} x d {1,2,4})
+        self.assertEqual(g[:3], [(0, 0.0, 0, None), (1, 0.25, 0, None), (1, 0.5, 0, None)])
+        self.assertEqual(g[3], (2, 0.0, 4, 1))
+        self.assertEqual(ts.g1d_choose({pt: 1.0 for pt in g}, g), (0, 0.0, 0, None))   # all equal: LRU
+        eq = {pt: (0.5 if pt[0] == 2 and pt[1] == 0.25 and pt[2] == 8 else 2.0) for pt in g}
+        self.assertEqual(ts.g1d_choose(eq, g), (2, 0.25, 8, 1))                          # then the smaller d
+        eq = {pt: (0.5 if pt[0] == 1 else 2.0) for pt in g}
+        self.assertEqual(ts.g1d_choose(eq, g), (1, 0.25, 0, None))                      # then the smaller s
+        eq = {pt: (0.5 if pt[0] == 2 and pt[1] == 0.5 else 0.9 if pt[0] == 2 else 2.0) for pt in g}
+        self.assertEqual(ts.g1d_choose(eq, g), (2, 0.5, 4, 1))                          # then the smaller P
+        self.assertEqual(ts.g1d_split(161, (1, 0.25, 0, None)), (40, 121))               # floor(s x C)
+        self.assertEqual(ts.g1d_split(161, (2, 0.5, 16, 2)), (80, 65))
+
+    def test_seed_lru_hand_trace(self):
+        seq = [0, 1, 2, 0, 3, 1, 2]
+        r, _, _ = ts.g1d_replay_layer(k1(seq), mask(6, ()), 3)
+        self.assertEqual(r.tolist(), [1, 1, 1, 0, 1, 1, 1])           # LRU of 3
+        r, _, _ = ts.g1d_replay_layer(k1(seq), mask(6, {0}), 2)
+        self.assertEqual(r.tolist(), [0, 1, 1, 0, 1, 1, 1])           # expert 0 seeded, LRU of 2
+        r, _, _ = ts.g1d_replay_layer(k1([1, 2, 3, 4, 5, 0]), mask(6, {0}), 1)
+        self.assertEqual(r.tolist(), [1, 1, 1, 1, 1, 0])              # the seed is never evicted
+        r, _, _ = ts.g1d_replay_layer(k1([1, 1, 1]), mask(6, ()), 0)
+        self.assertEqual(r.tolist(), [1, 1, 1])                       # no LRU slot: nothing kept
+
+    def test_prefetch_hand_trace(self):
+        E = 6
+        seq = [1, 2, 3, 4]
+
+        def keys_for(targets):            # key rows whose highest key is the target expert
+            k = np.tile(np.arange(E, 0, -1, dtype=np.int64), (len(targets), 1))
+            for t, e in enumerate(targets):
+                k[t, e] = 100
+            return k
+
+        r, iss, used = ts.g1d_replay_layer(k1(seq), mask(E, ()), 2, 1, keys_for(seq))
+        self.assertEqual((r.tolist(), iss, used), ([1, 1, 1, 1], 4, 4))   # one read each, all used, no demand miss
+        r, iss, used = ts.g1d_replay_layer(k1(seq), mask(E, ()), 2, 1, keys_for([5, 5, 0, 0]))
+        self.assertEqual((r.tolist(), iss, used), ([2, 2, 2, 2], 4, 0))   # wasted prefetches count as reads
+        # a buffered expert not demanded is dropped after the visit: 5 prefetched at t0, demanded at t1 -> a miss
+        r, _, _ = ts.g1d_replay_layer(k1([1, 5]), mask(E, ()), 2, 1, keys_for([5, 1]))
+        self.assertEqual(r.tolist(), [2, 2])
+        # a resident expert is never proposed: at t1, 1 is in the LRU part, so the next key (expert 0) is read and used
+        r, iss, used = ts.g1d_replay_layer(k1([1, 0]), mask(E, ()), 2, 1, keys_for([1, 1]))
+        self.assertEqual((r.tolist(), iss, used), ([1, 1], 2, 2))
+        # a used prefetch joins the LRU part: 3 prefetched + used at t0 is an LRU hit at t1 without prefetch reads
+        r, _, _ = ts.g1d_replay_layer(k1([3, 3]), mask(E, ()), 1, 1, keys_for([3, 3]))
+        self.assertEqual(r.tolist(), [1, 1])                          # t1: 3 resident, the prefetch reads key 0
+
+    def test_idpf_table_keys_and_layers(self):
+        shape = (6, 10, 2)
+        # layer j+1 holds layer j's ids + 1 (mod 10); calibration generated positions only
+        base = np.array([[0, 5], [2, 7], [1, 3]], np.int64)
+        rts = np.zeros((3, 6, 2), np.uint16)
+        for j in range(6):
+            rts[:, j, :] = np.sort((base + j) % 10, axis=1)
+        gen = np.array([True, True, False])
+        st = ts.G1dStats([small_run("c", rts, gen)], shape)
+        t = st.tables[1][0]
+        self.assertEqual(int(t.sum()), 2 * 2 * 2)                   # 2 generated positions x 2 x 2 pairs
+        self.assertEqual((t[0, 1], t[0, 6], t[5, 1], t[1, 2]), (1, 1, 1, 0))  # the prompt row [1, 3] is not counted
+        self.assertEqual(len(st.tables[4]), 2)                      # source layers 0..L-1-d
+        keys = ts.g1d_keys(rts, 1, 1, st)
+        self.assertEqual(int(np.argmax(keys[0])), 1)                # from [0, 5]: scores 1 at 1 and 6, tie -> lower id
+        self.assertEqual(sorted(np.argsort(-keys[0])[:2].tolist()), [1, 6])
+        # layer j < d gets no prefetch: with P 1, d 4 the first four layers read only demand
+        res = ts.g1d_replay(rts, 6, [(2, 0.0, 1, 4)], st)[(2, 0.0, 1, 4)]
+        self.assertEqual(res[0][:, :4].tolist(), [[2] * 4, [2] * 4, [2] * 4])
+        self.assertEqual(res[1], 3 * 2)                              # 3 tokens x layers 4, 5
+        with self.assertRaises(ts.SimError):                         # seed + P above C
+            ts.g1d_replay(rts, 3, [(2, 0.5, 4, 1)], st)
+
+    def test_selection_loo_and_held_guard(self):
+        shape = (6, 40, 2)
+        rng = np.random.default_rng(3)
+
+        def rr(n):
+            return np.sort(np.stack([np.stack([rng.choice(40, 2, replace=False) for _ in range(6)])
+                                     for _ in range(n)]), axis=2).astype(np.uint16)
+
+        cal = [small_run("c%d" % i, rr(60)) for i in range(3)]
+        held = small_run("held", rr(60))
+        chosen, stats, sel = ts.g1d_select(cal, 30, held=held, shape=shape)
+        self.assertEqual(stats.names, ["c0", "c1", "c2"])
+        pts = [p for p in ts.g1d_grid() if ts.g1d_split(30, p)[1] >= 0]
+        self.assertEqual(len(sel["grid"]), len(pts))                 # s .5 + P 16 = 31 > 30: skipped
+        self.assertEqual(sel["skipped_points"], [ts.g1d_point_name(p) for p in ts.g1d_grid() if p not in pts])
+        # the score is the mean over files of each file's reads per generated token, each replayed alone
+        row = [x for x in sel["grid"] if x["point"] == list(chosen)][0]
+        own = [float(ts.g1d_replay(r.routes, 30, [chosen], stats)[chosen][0].sum(1).mean()) for r in cal]
+        self.assertAlmostEqual(row["score"], float(np.mean(own)))
+        self.assertEqual(chosen, ts.g1d_choose({tuple(x["point"]): x["score"] for x in sel["grid"]}, pts))
+        # folds: chosen on the other two with their own statistics, scored on the one left out
+        self.assertEqual([f["left_out"] for f in sel["folds"]], ["c0", "c1", "c2"])
+        f0 = sel["folds"][0]
+        st0 = ts.G1dStats(cal[1:], shape)
+        ch0 = tuple(f0["point"])
+        self.assertAlmostEqual(f0["left_out_r"], ts.g1d_scores([cal[0]], 30, [ch0], st0)[ch0][0])
+        self.assertEqual(f0["equals_full_choice"], ch0 == chosen)
+        # the held-out never enters: other held-out routing, same choice and grid; held-out in the cal set refused
+        chosen2, _, sel2 = ts.g1d_select(cal, 30, held=small_run("held", rr(60)), shape=shape)
+        self.assertEqual((chosen2, sel2["grid"]), (chosen, sel["grid"]))
+        with self.assertRaises(ts.SimError):
+            ts.g1d_select(cal + [held], 30, held=held, shape=shape)
+        # only generated positions are scored
+        g = cal[0].gen.copy()
+        g[:30] = False
+        part = small_run("c0", cal[0].routes, g)
+        sc = ts.g1d_scores([part], 30, [chosen], stats)[chosen][0]
+        full = ts.g1d_replay(part.routes, 30, [chosen], stats)[chosen][0].sum(1)
+        self.assertAlmostEqual(sc, float(full[30:].mean()))
+        # worker processes give the same scores as one process
+        self.assertEqual(ts.g1d_scores(cal, 30, pts, stats, jobs=3), ts.g1d_scores(cal, 30, pts, stats))
+
+    def test_verdict(self):
+        s = ts.G1D_S["3.05"]
+        ok = {"mean": 10.0, "ci": [9.0, 18.4], "n": 26599}
+        v = ts.g1d_verdict(ok, s, 6.9936611328, "B", [])
+        self.assertTrue(v["verdict"].startswith("G1d passed: r_hi 18.400 <= 18.455"), v["verdict"])
+        self.assertIn("awaiting robin's confirmation", v["status"])
+        bad = dict(ok, ci=[9.0, 18.5])
+        self.assertTrue(ts.g1d_verdict(bad, s, 6.9936611328, "B", [])["verdict"].startswith("G1d failed"))
+        self.assertTrue(ts.g1d_verdict(ok, s, None, "no step-3 run given", [])["verdict"].startswith(
+            "G1d not answered: B: no step-3 run given"))
+        self.assertIn("no CI", ts.g1d_verdict(dict(ok, ci=[math.nan, math.nan], n=900), s, 7.0, "B", [])["verdict"])
+        self.assertIn("held: no weights.json", ts.g1d_verdict(ok, s, 7.0, "B", ["held: no weights.json"])["verdict"])
+        v = ts.g1d_verdict(ok, ts.G1D_S["4.5"], 6.9936611328, "B", [], primary=False)
+        self.assertTrue(v["verdict"].startswith("scenario (no gate role) failed: r_hi 18.400 > 12.351"), v["verdict"])
+
+
+class TestG1dCli(unittest.TestCase):
+    def test_g1d_end_to_end_choice_before_held_out(self):
+        with tempfile.TemporaryDirectory() as d:
+            held = rows(2000, HELD_PICKS)            # the same 8 experts at every position: 336 reads at token 0 only
+            cal = [uniform_routes(150, 5), uniform_routes(120, 6)]
+            c, ident = fp8_corpus(d, held, cal, book=False)
+            with open(os.path.join(c.rdir, "passes.jsonl"), "w", encoding="utf-8") as bk:
+                bk.write(json.dumps({"name": "held", "ok": True, "weights_identity_sha256": ident["identity_sha256"]})
+                         + "\n")
+            for n in ("cal0", "cal1"):
+                shutil.rmtree(os.path.join(c.rdir, n))
+            cap = os.path.join(d, "capture-ids")
+            write_capture(cap, [("cal0", cal[0]), ("cal1", cal[1])], ident["identity_sha256"])
+            out = os.path.join(d, "g1d.json")
+            seen = []
+            real = ts.g1d_replay
+
+            def spy(routes, *a, **k):                # the choice is in the book before the held-out is replayed
+                if len(routes) == 2000:
+                    seen.append(os.path.exists(out + ".choices.jsonl"))
+                return real(routes, *a, **k)
+
+            with mock.patch.object(ts, "g1d_replay", side_effect=spy):
+                rc = ts.main(["g1d", "--corpus", c.path, "--runs", c.rdir, "--capture", cap, "--step3", str(STEP3),
+                              "--readers", "1", "--json", out])
+            self.assertEqual(rc, 0)
+            self.assertTrue(seen and all(seen), seen)
+            doc = ts.jload(out)
+            cell = doc["cells"][0]
+            self.assertEqual((cell["bpw"], cell["R_GiB"], cell["V"], cell["C"], cell["primary"]), ("3.05", 46, "V25", 161, True))
+            self.assertEqual(len(cell["grid"]), 30)
+            self.assertEqual(len(cell["folds"]), 2)
+            self.assertNotEqual(cell["point"][0], 2)  # uniform calibration routing: id-only prefetch only wastes reads
+            h = cell["held_out"]["r"]
+            # token 0 reads every held-out pick that is not seeded, nothing after (C 161 >= 8, no prefetch)
+            st = ts.G1dStats([small_run("cal0", cal[0]), small_run("cal1", cal[1])])
+            nseed = ts.g1d_split(161, tuple(cell["point"]))[0]
+            want = sum(int(st.ranks[j][e] >= nseed) for j in range(L) for e in HELD_PICKS)
+            self.assertAlmostEqual(h["mean"], want / 2000)
+            self.assertLessEqual(h["ci"][1], 336 / 1000 + 1e-9)       # block 0 holds the only reads
+            self.assertTrue(cell["verdict"]["verdict"].startswith("G1d passed"), cell["verdict"]["verdict"])
+            self.assertAlmostEqual(cell["verdict"]["bar_reads"], ts.g1d_bar(6.9936611328, 9_474_048), places=6)
+            self.assertEqual(doc["calibration_routing"]["files"], ["cal0", "cal1"])
+            with open(out + ".choices.jsonl", encoding="utf-8") as f:
+                ch = [json.loads(x) for x in f]
+            self.assertEqual((ch[0]["chosen"], ch[0]["held_out_scored"]), (cell["chosen"], False))
+            self.assertEqual(ts.main(["g1d", "--corpus", c.path, "--runs", c.rdir, "--capture", cap,
+                                      "--cells", "3.1:46:V25"]), 2)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

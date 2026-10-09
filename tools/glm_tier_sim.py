@@ -23,6 +23,11 @@
       [--policies lru,clock,lfu] [--admit-max 64] [--prefetch none,oracle,0.5,0.7,0.9] [--depths 1,2,3] \
       [--pf-budget N] [--step3 <run>.json --readers 1] [--rates <rates.json>] [--json <out.json>]
 
+  # 5. the judged G1d policy and verdict (PREREG-dyn, #178; docs/glm-tier-simulation.md section 8)
+  .venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py g1d --corpus <dir>/corpus.json --runs <runs> \
+      [--capture decode_out/glm-step8/capture-ids] --step3 <run>.json --readers 1 [--cells 3.05:46:V25|all] \
+      [--jobs N] [--json <out.json>]
+
 Policy per MoE layer (PREREG G1, ticket #147): the experts are ranked by their routed count over the
 GENERATED positions of the calibration files (the `G` rule of #106: frequency order, ties lower id);
 ranks 0..N-1 are the VRAM hot set, the next 83 the pinned tier, the rest live on the NVMe. With a
@@ -1120,22 +1125,356 @@ def dyn_configs(a, layers=SHAPE[0]):
     return out
 
 
+def calibration_source(a, held, cal):
+    """Where the calibration routing came from (the JSON's calibration_routing), printed for a capture."""
+    if not a.capture:
+        return {"from": "pass dirs", "dir": a.runs, "files": [r.name for r in cal]}
+    print("calibration routing: the conversion's capture %s (%d layers, identity %s), held-out from %s"
+          % (a.capture, len(cal[0].capture), held.identity, os.path.join(a.runs, held.name)))
+    return {"from": "capture (PREREG-dyn amendment 2)", "dir": a.capture, "files": [r.name for r in cal],
+            "ids_sha256": cal[0].capture}
+
+
 def dyn_cmd(a):
     configs = dyn_configs(a)
     held, cal, reasons = load_corpus(a.corpus, a.runs, source="g1d", capture=a.capture)
-    if a.capture:
-        cal_src = {"from": "capture (PREREG-dyn amendment 2)", "dir": a.capture, "files": [r.name for r in cal],
-                   "ids_sha256": cal[0].capture}
-        print("calibration routing: the conversion's capture %s (%d layers, identity %s), held-out from %s"
-              % (a.capture, len(cal[0].capture), held.identity, os.path.join(a.runs, held.name)))
-    else:
-        cal_src = {"from": "pass dirs", "dir": a.runs, "files": [r.name for r in cal]}
+    cal_src = calibration_source(a, held, cal)
     b, why = b_from_step3(a.step3, a.readers)
     rates, rwhy = rates_from_file(a.rates)
     pfs = tuple(None if x == "none" else x if x == "oracle" else float(x) for x in a.prefetch.split(","))
     res = dyn_simulate(held, configs, tuple(a.policies.split(",")), a.arena, a.admit_max, pfs,
                        tuple(int(x) for x in a.depths.split(",")), a.pf_budget, a.lfu_halflife, b, why, rates, rwhy,
                        reasons)
+    res["calibration_routing"] = cal_src
+    if a.json:
+        jdump(res, a.json, indent=1, default=float)
+    return 0
+
+
+# ------------------------------------------------------------------ G1d: judged policy and verdict (PREREG-dyn, #178)
+
+# runs/glm53-flash/PREREG-dyn.md: "Cache model", "Parameter selection", "Judged metric" and amendments 1-3. S per bpw is
+# PREREG-dyn's (3.5 nominal 11,010,048; 3.05 the plan figure of amendment 1), not dyn's BPW_BYTES.
+G1D_S = {"4.5": 14_155_776, "3.5": 11_010_048, "3.05": 9_474_048}
+G1D_V = {"V25": 14_863_564_800, "V37": 21_998_075_904}
+G1D_R_GIB = (46, 50, 54)
+G1D_PRIMARY = ("3.05", 46, "V25")           # amendment 1: the deciding cell (per-layer arena)
+G1D_GRID_S, G1D_GRID_P, G1D_GRID_D = (0.0, 0.25, 0.5), (0, 4, 8, 16), (1, 2, 4)
+G1D_TOK_S = 40.0
+G1D_CLASSES = ("LRU", "SEED+LRU", "SEED+LRU+IDPF")
+G1D_STATUS = ("bar, primary cell, bpw scenarios, grid and tie order are 'proposed, awaiting robin's confirmation' "
+              "(PREREG-dyn, Awaiting confirmation 1-4); no G1d row may be taken before he confirms them")
+
+
+def g1d_capacity(bpw, r_gib, v, layers=SHAPE[0]):
+    """C slots per layer: floor((V + R) / S) over all layers, divided by 42 (PREREG-dyn "Capacity from bytes")."""
+    return int((G1D_V[v] + r_gib * 2 ** 30) // G1D_S[bpw]) // layers
+
+
+def g1d_bar(b, s_bytes, tok_s=G1D_TOK_S):
+    """Reads per token at the bar r_hi x S <= B / 40 tok/s."""
+    return b * 1e9 / tok_s / s_bytes
+
+
+def g1d_grid():
+    """Every grid point (class, s, P, d) in tie order: the simpler class (LRU < SEED+LRU < SEED+LRU+IDPF), then the
+    smaller s, P, d. P = 0 has no d; s = 0 with P = 0 is LRU."""
+    pts = [(2 if p else (1 if s else 0), s, p, d) for s in G1D_GRID_S for p in G1D_GRID_P
+           for d in (G1D_GRID_D if p else (None,))]
+    return sorted(pts, key=lambda x: (x[0], x[1], x[2], x[3] or 0))
+
+
+def g1d_point_name(pt):
+    return "%s s %.2f P %d d %s" % (G1D_CLASSES[pt[0]], pt[1], pt[2], "-" if pt[3] is None else pt[3])
+
+
+def g1d_split(c, pt):
+    """(seed slots floor(s x C), LRU slots C - seed - P); a point whose LRU part would be negative does not fit C."""
+    seed = int(math.floor(pt[1] * c))
+    return seed, c - seed - pt[2]
+
+
+class G1dStats:
+    """What a policy may use, fitted on the generated positions of the given (calibration) files only: per MoE layer the
+    rank of every expert by routed count (cut's rule, ties lower id: the seed), and per look-ahead d the id-only table
+    T[j][a, b] = generated positions with a among layer j's ids and b among layer j + d's ids (same token)."""
+
+    def __init__(self, runs, shape=SHAPE, depths=G1D_GRID_D):
+        L, E, _ = shape
+        self.names = [r.name for r in runs]
+        self.ranks = rank_table(gen_counts(runs, shape))
+        sel = [r.routes[r.gen].astype(np.int64) for r in runs]
+        self.tables = {}
+        for d in depths:
+            tab = []
+            for j in range(L - d):
+                c = np.zeros(E * E, np.int64)
+                for x in sel:
+                    c += np.bincount((x[:, j, :, None] * E + x[:, j + d, None, :]).ravel(), minlength=E * E)
+                tab.append(c.reshape(E, E))
+            self.tables[d] = tab
+
+
+def g1d_keys(routes, j, d, stats):
+    """Prefetch keys for layer j from the same token's layer j - d ids: score[e] = sum over the source ids a of
+    T[j - d][a, e]; key = score x E + (E - 1 - e), so the highest key is the highest score, ties the lower id."""
+    tab = stats.tables[d][j - d]
+    E = tab.shape[0]
+    src = routes[:, j - d, :]
+    sc = np.zeros((len(routes), E), np.int64)
+    for k in range(src.shape[1]):
+        sc += tab[src[:, k]]
+    return sc * E + (E - 1 - np.arange(E, dtype=np.int64))
+
+
+def g1d_replay_layer(ids, seed, cl, p=0, keys=None):
+    """One MoE layer of the per-layer arena in token order (ids [n][K] ascending, as the dumps hold them).
+    Seed experts (bool [E]) are resident and never evicted; the LRU part holds cl experts. With p > 0, before the
+    token's visit the p highest keys among the experts not resident fill the prefetch buffer, one NVMe read each; a
+    buffered expert that is demanded joins the LRU part, the rest are dropped after the visit. A demand visit that is
+    neither resident nor buffered is one NVMe read and joins the LRU part (with cl = 0 it is not kept).
+    -> (NVMe reads per token, prefetch reads issued, buffered experts used)"""
+    n, E = len(ids), len(seed)
+    reads = np.zeros(n, np.int64)
+    res = seed.copy()
+    nres = int(res.sum())
+    lru = OrderedDict()
+    rows = ids.tolist()
+    issued = used = 0
+    for t in range(n):
+        r, buf = 0, ()
+        if p:
+            q = min(p, E - nres)
+            if q:
+                k = np.where(res, -1, keys[t])
+                buf = set(np.argpartition(k, E - q)[E - q:].tolist())
+                r += q
+                issued += q
+        for e in rows[t]:
+            if res[e]:
+                if e in lru:
+                    lru.move_to_end(e)
+                continue
+            if e in buf:
+                used += 1
+            else:
+                r += 1
+            if cl > 0:
+                if len(lru) >= cl:
+                    res[lru.popitem(last=False)[0]] = False
+                    nres -= 1
+                lru[e] = None
+                res[e] = True
+                nres += 1
+        reads[t] = r
+    return reads, issued, used
+
+
+def g1d_replay(routes, c, pts, stats, start=0):
+    """Replay a file from an empty arena at position `start` (0; the first generated position for the reset variant)
+    under each point of pts (all with the same d) -> {point: (reads [n - start][L], prefetch issued, used)}."""
+    n, L, _ = routes.shape
+    ds = {pt[3] for pt in pts if pt[2]}
+    if len(ds) > 1:
+        raise SimError("g1d_replay: points of one call share d (%s)" % sorted(ds))
+    out = {}
+    for pt in pts:
+        seed_n, cl = g1d_split(c, pt)
+        if cl < 0:
+            raise SimError("%s does not fit C %d (seed %d + P %d > C)" % (g1d_point_name(pt), c, seed_n, pt[2]))
+        out[pt] = [np.zeros((n - start, L), np.int64), 0, 0]
+    for j in range(L):
+        keys = None
+        for pt in pts:
+            seed_n, cl = g1d_split(c, pt)
+            p = pt[2] if pt[2] and j - pt[3] >= 0 else 0   # the source layer is a MoE layer of the same token
+            if p and keys is None:
+                keys = g1d_keys(routes, j, pt[3], stats)[start:]
+            r, i, u = g1d_replay_layer(routes[start:, j, :], stats.ranks[j] < seed_n, cl, p, keys)
+            o = out[pt]
+            o[0][:, j] = r
+            o[1] += i
+            o[2] += u
+    return {pt: tuple(v) for pt, v in out.items()}
+
+
+def _g1d_task(args):
+    routes, gen, c, pts, stats = args
+    return {pt: float(v[0].sum(1)[gen].mean()) for pt, v in g1d_replay(routes, c, pts, stats).items()}
+
+
+def g1d_scores(runs, c, pts, stats, jobs=1):
+    """{point: [reads per generated token of each run, replayed alone from an empty arena]} (score = their mean)."""
+    groups = {}
+    for pt in pts:
+        groups.setdefault(pt[3] if pt[2] else None, []).append(pt)
+    tasks, keys = [], []
+    for i, r in enumerate(runs):
+        for g in groups.values():
+            tasks.append((r.routes, r.gen, c, g, stats))
+            keys.append(i)
+    if jobs > 1 and len(tasks) > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(min(jobs, len(tasks))) as ex:
+            got = list(ex.map(_g1d_task, tasks))
+    else:
+        got = [_g1d_task(t) for t in tasks]
+    out = {pt: [None] * len(runs) for pt in pts}
+    for i, res in zip(keys, got):
+        for pt, v in res.items():
+            out[pt][i] = v
+    return out
+
+
+def g1d_choose(mean, pts):
+    """The lowest score; pts is in tie order, so an equal score keeps the earlier (simpler, smaller) point."""
+    best = None
+    for pt in pts:
+        if pt in mean and (best is None or mean[pt] < mean[best]):
+            best = pt
+    return best
+
+
+def g1d_select(cal, c, jobs=1, held=None, shape=SHAPE):
+    """PREREG-dyn "Parameter selection" at capacity c: every grid point scored on the calibration files (statistics
+    fitted on them), the chosen point, and the leave-one-out folds (point chosen on the other files with statistics
+    fitted on those, scored on the one left out). The held-out never enters."""
+    if held is not None and any(r is held or r.name == held.name for r in cal):
+        raise SimError("the held-out file %s is in the calibration set" % held.name)
+    pts = [pt for pt in g1d_grid() if g1d_split(c, pt)[1] >= 0]
+    stats = G1dStats(cal, shape)
+    per = g1d_scores(cal, c, pts, stats, jobs)
+    mean = {pt: float(np.mean(v)) for pt, v in per.items()}
+    chosen = g1d_choose(mean, pts)
+    folds = []
+    if len(cal) > 1:
+        for f in cal:
+            rest = [r for r in cal if r is not f]
+            st = G1dStats(rest, shape)
+            m = {pt: float(np.mean(v)) for pt, v in g1d_scores(rest, c, pts, st, jobs).items()}
+            ch = g1d_choose(m, pts)
+            folds.append({"left_out": f.name, "chosen": g1d_point_name(ch), "point": list(ch),
+                          "score_on_rest": m[ch], "left_out_r": g1d_scores([f], c, [ch], st, jobs)[ch][0],
+                          "equals_full_choice": ch == chosen})
+    grid = [{"point": list(pt), "name": g1d_point_name(pt), "score": mean[pt],
+             "per_file": dict(zip([r.name for r in cal], per[pt]))} for pt in pts]
+    skipped = [g1d_point_name(pt) for pt in g1d_grid() if pt not in mean]
+    return chosen, stats, {"grid": grid, "skipped_points": skipped, "folds": folds}
+
+
+def g1d_verdict(r_stat, s_bytes, b, b_reason, reasons, primary=True):
+    """PREREG-dyn "Judged metric": passed when r_hi x S <= B / 40 tok/s (r_hi the CI upper bound of reads per generated
+    token of the held-out), else failed; not answered without B, without a CI, or on any source reason."""
+    out = {"r": r_stat["mean"], "r_ci": r_stat["ci"], "r_hi": r_stat["ci"][1], "generated": r_stat["n"],
+           "S": s_bytes, "B": b, "B_source": b_reason, "bar_reads": None, "bar_bytes": None, "r_hi_bytes": None,
+           "gate": "G1d" if primary else "scenario (no gate role)", "status": G1D_STATUS}
+    void = list(reasons)
+    if b is None:
+        void.append("B: " + b_reason)
+    else:
+        out["bar_reads"] = g1d_bar(b, s_bytes)
+        out["bar_bytes"] = b * 1e9 / G1D_TOK_S
+    if math.isnan(out["r_hi"]):
+        void.append("held-out has %d generated positions, fewer than two blocks of %d: no CI" % (r_stat["n"], BLOCK))
+    else:
+        out["r_hi_bytes"] = out["r_hi"] * s_bytes
+    word = out["gate"]
+    if void:
+        out["verdict"] = "%s not answered: %s" % (word, "; ".join(void))
+    elif out["r_hi"] <= out["bar_reads"]:
+        out["verdict"] = "%s passed: r_hi %.3f <= %.3f reads per token (r_hi x S %.2f MB <= B / 40 %.2f MB)" % (
+            word, out["r_hi"], out["bar_reads"], out["r_hi_bytes"] / 1e6, out["bar_bytes"] / 1e6)
+    else:
+        out["verdict"] = "%s failed: r_hi %.3f > %.3f reads per token (r_hi x S %.2f MB > B / 40 %.2f MB)" % (
+            word, out["r_hi"], out["bar_reads"], out["r_hi_bytes"] / 1e6, out["bar_bytes"] / 1e6)
+    return out
+
+
+def g1d_cells(spec):
+    """'3.05:46:V25,...' or 'all' (bpw 3.05 / 3.5 / 4.5 x R 46 / 50 / 54 GiB x V25 / V37) -> [(bpw, R GiB, V)]"""
+    if spec == "all":
+        return [(b, r, v) for b in ("3.05", "3.5", "4.5") for r in G1D_R_GIB for v in G1D_V]
+    out = []
+    for x in spec.split(","):
+        parts = x.split(":")
+        if len(parts) != 3 or parts[0] not in G1D_S or parts[2] not in G1D_V or not parts[1].isdigit():
+            raise SimError("cell %r: bpw:R_GiB:V with bpw %s and V %s" % (x, "/".join(G1D_S), "/".join(G1D_V)))
+        out.append((parts[0], int(parts[1]), parts[2]))
+    return out
+
+
+def g1d_run(held, cal, cells, b=None, b_reason="no step-3 run given", reasons=(), jobs=1, choice_log=None,
+            shape=SHAPE, out=print):
+    """Every cell: selection on the calibration files, the chosen point written (choice_log) BEFORE the held-out is
+    replayed, then the held-out row with that one point, the MIN reference and, for the primary cell, the verdict."""
+    import datetime
+    res = {"held": held.name, "cal": [r.name for r in cal], "arena": "layer", "B": b, "B_source": b_reason,
+           "source_reasons": list(reasons), "status": G1D_STATUS, "grid": [g1d_point_name(p) for p in g1d_grid()],
+           "cells": []}
+    out("\nG1d (PREREG-dyn): held-out %s, calibration %s, per-layer arena; %s" % (
+        held.name, ", ".join(r.name for r in cal), G1D_STATUS))
+    out("B: %s" % b_reason)
+    for r in reasons:
+        out("  source: %s" % r)
+    sel_cache = {}
+    g = held.gen
+    for bpw, rg, v in cells:
+        c, s_bytes = g1d_capacity(bpw, rg, v, shape[0]), G1D_S[bpw]
+        primary = (bpw, rg, v) == G1D_PRIMARY
+        if c not in sel_cache:
+            sel_cache[c] = g1d_select(cal, c, jobs, held, shape)
+        chosen, stats, sel = sel_cache[c]
+        cell = {"bpw": bpw, "R_GiB": rg, "V": v, "C": c, "S": s_bytes, "primary": primary,
+                "chosen": g1d_point_name(chosen), "point": list(chosen)}
+        out("\nbpw %s, R %d GiB, %s: C %d per layer, S %d B%s" % (bpw, rg, v, c, s_bytes,
+                                                                  "  [primary cell]" if primary else ""))
+        for row in sel["grid"]:
+            out("  cal %-30s score %.4f  %s" % (row["name"], row["score"], "  ".join(
+                "%s %.4f" % kv for kv in row["per_file"].items())))
+        for f in sel["folds"]:
+            out("  fold out %-20s chose %-30s rest %.4f  left-out r %.4f  %s" % (
+                f["left_out"], f["chosen"], f["score_on_rest"], f["left_out_r"],
+                "= full choice" if f["equals_full_choice"] else "differs from the full choice"))
+        out("  chosen on the calibration: %s (score %.4f)" % (cell["chosen"], [x["score"] for x in sel["grid"]
+                                                                             if x["point"] == list(chosen)][0]))
+        if choice_log:
+            with open(choice_log, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                                    "cell": [bpw, rg, v], "C": c, "chosen": cell["chosen"], "point": list(chosen),
+                                    "held_out_scored": False}) + "\n")
+        cell.update(sel)
+        rr = g1d_replay(held.routes, c, [chosen], stats)[chosen]
+        per_tok = rr[0].sum(1)
+        cell["held_out"] = {"r": stat(per_tok[g]), "per_layer_r": [float(x) for x in rr[0][g].mean(0)],
+                            "prefetch_issued_per_token": rr[1] / len(per_tok), "prefetch_used_per_token": rr[2] / len(per_tok)}
+        pos = np.arange(len(g))
+        cell["held_out"]["depth"] = [{"from": lo, "to": hi, "r": stat(per_tok[g & (pos >= lo) & (pos < (hi or 10 ** 12))])}
+                                     for lo, hi in DEPTHS]
+        gi = np.flatnonzero(g)
+        cell["held_out"]["first_1000_generated"] = stat(per_tok[gi[:1000]])
+        cell["held_out"]["after_first_1000"] = stat(per_tok[gi[1000:]])
+        if len(gi):
+            rz = g1d_replay(held.routes, c, [chosen], stats, start=int(gi[0]))[chosen][0].sum(1)
+            cell["held_out"]["reset_at_first_generated"] = stat(rz[g[gi[0]:]])
+        mn = dyn_min(held.routes, c)
+        cell["min_r"] = float(mn[g].mean())
+        cell["verdict"] = g1d_verdict(cell["held_out"]["r"], s_bytes, b, b_reason, reasons, primary)
+        h = cell["held_out"]["r"]
+        out("  held-out r %.3f [%.3f, %.3f] reads per token (n %d); Belady MIN %.3f; prefetch issued %.3f, used %.3f"
+            % (h["mean"], *h["ci"], h["n"], cell["min_r"], cell["held_out"]["prefetch_issued_per_token"],
+               cell["held_out"]["prefetch_used_per_token"]))
+        out("  " + cell["verdict"]["verdict"])
+        res["cells"].append(cell)
+    return res
+
+def g1d_cmd(a):
+    cells = g1d_cells(a.cells)
+    if a.jobs < 1:
+        raise SimError("--jobs must be >= 1")
+    held, cal, reasons = load_corpus(a.corpus, a.runs, source="g1d", capture=a.capture)
+    cal_src = calibration_source(a, held, cal)
+    b, why = b_from_step3(a.step3, a.readers)
+    res = g1d_run(held, cal, cells, b, why, reasons, a.jobs, (a.json + ".choices.jsonl") if a.json else None)
     res["calibration_routing"] = cal_src
     if a.json:
         jdump(res, a.json, indent=1, default=float)
@@ -1248,12 +1587,24 @@ def main(argv=None):
     d.add_argument("--depths", default="1", help="look-ahead in layers, comma list")
     d.add_argument("--pf-budget", type=int, help="prefetch NVMe reads per token")
     d.add_argument("--json")
+    g = sub.add_parser("g1d", help="the judged G1d policy and verdict of PREREG-dyn (#178)")
+    g.add_argument("--corpus", required=True)
+    g.add_argument("--runs", required=True)
+    g.add_argument("--capture", help="calibration routing from the conversion's capture (PREREG-dyn amendment 2)")
+    g.add_argument("--step3")
+    g.add_argument("--readers", type=int, help="reader count fixed by a PREREG amendment (amendment 5: 1)")
+    g.add_argument("--cells", default="%s:%d:%s" % G1D_PRIMARY,
+                   help="bpw:R_GiB:V[,...] or all (default the primary cell of PREREG-dyn amendment 1)")
+    g.add_argument("--jobs", type=int, default=1, help="worker processes for the grid replays")
+    g.add_argument("--json", help="the report; the chosen point per cell goes to <json>.choices.jsonl first")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "corpus":
             return corpus_cmd(a)
         if a.cmd == "dyn":
             return dyn_cmd(a)
+        if a.cmd == "g1d":
+            return g1d_cmd(a)
         held, cal, reasons = load_corpus(a.corpus, a.runs, capture=a.capture)
         b, why = b_from_step3(a.step3, a.readers)
         res = simulate(held, cal, b, why, reasons, tuple(int(x) for x in a.windows.split(",")), a.gate_window)

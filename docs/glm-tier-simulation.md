@@ -40,6 +40,11 @@ no such dumps exist yet. Step 3's statistic gives no B on this machine; PREREG a
     [--arena layer|global] [--policies lru,clock,lfu] [--admit-max 64] [--prefetch none,oracle,0.5,0.7,0.9] \
     [--depths 1,2,3] [--pf-budget N] [--step3 <run>.json --readers 1] [--rates rates.json] [--json out.json]
 
+# the judged G1d policy and verdict of PREREG-dyn (#178, section 8); --cells all for every capacity scenario
+.venv-oracle/Scripts/python.exe -I tools/glm_tier_sim.py g1d --corpus decode_out/glm-step8/corpus/corpus.json \
+    --runs decode_out/glm-step8/runs --capture decode_out/glm-step8/capture-ids \
+    --step3 runs/glm53-flash/step03/20261008T001819Z.json --readers 1 [--cells 3.05:46:V25] [--jobs 16] [--json out.json]
+
 # the tests (no GPU, no weights): the sim about 19 s, the route passes about 80 s (2026-10-09)
 .venv-oracle/Scripts/python.exe -I tools/test_glm_tier_sim.py
 .venv-oracle/Scripts/python.exe -I tools/test_glm_route_passes.py
@@ -49,7 +54,7 @@ Step 8 runs under `.venv-oracle` (transformers 5.16.1). The system Python's tran
 owner's machine, 2026-10-08) lacks `transformers.cache_utils.DynamicIndexedLayer`, which the runner's
 in-place DSA cache subclasses: `tools/test_glm_route_passes.py` fails there in `setUpClass` of its
 end-to-end test (14 tests run, 1 error; under `.venv-oracle` 18 tests, OK, 80 s; both 2026-10-09), and `corpus`
-needs GLM's tokenizer from the same venv. `tools/test_glm_tier_sim.py` alone passes under either (45 tests, OK
+needs GLM's tokenizer from the same venv. `tools/test_glm_tier_sim.py` alone passes under either (53 tests, OK
 under both on 2026-10-09, about 19 s).
 
 `corpus` uses `messages` and `render` of `tools/session_ids.py` and swaps in GLM's tokenizer, so the
@@ -206,9 +211,8 @@ source in `calibration_routing`, with the 42 per-layer sha256. Under `sim` (chec
 "plausibility only" reason, so G1 stays "not answered". Layer 3's ids were pruned before the copier started; it is
 recomputed with `tools/glm_mul1_quantize.py capture --layers 3` in a separate work dir (amendment 2).
 
-`dyn` scores only the held-out today: LRU, CLOCK, LFU, prefetch and MIN. The calibration Runs are loaded and
-checked, but nothing uses them yet: SEED+LRU, SEED+LRU+IDPF and the calibration grid choice of PREREG-dyn are not
-built.
+`dyn` scores only the held-out: LRU, CLOCK, LFU, prefetch and MIN. The judged policy, SEED+LRU, SEED+LRU+IDPF,
+the calibration grid choice and the verdict row are `g1d` (section 8).
 
 **The model.**
 
@@ -332,3 +336,58 @@ Item 2 runs `sim` with the same `--runs` and `--capture`. Without `--capture`, b
 
 **Not modelled:** prefetch from pinned into VRAM, batched prefill steps, kernel time, and the latency a
 demand read stalls for (only bytes).
+
+## 8. The judged G1d policy and verdict (`g1d`, #178)
+
+`g1d` builds what `runs/glm53-flash/PREREG-dyn.md` fixes for the verdict. The source is the same as `dyn`'s: G1d checks,
+with `--capture` from amendment 2. The details the PREREG leaves open are read as in its amendment 3.
+
+**Per cell** (bpw, R GiB, V):
+- C from bytes: floor(floor((V + R) / S) / 42), with the PREREG's S (4.5: 14,155,776; 3.5: 11,010,048;
+  3.05: 9,474,048).
+- Selection on the four calibration files, over all 30 grid points: s {0, 0.25, 0.5} x (P 0, or P {4, 8, 16} x
+  d {1, 2, 4}).
+  - Each file is replayed alone from an empty per-layer arena.
+  - Score = mean over files of reads per generated token.
+  - Ties: simpler class, then smaller s, P, d.
+- Leave-one-out folds: the point is chosen on three files, with seed and table fitted on them, and scored on the
+  fourth.
+- The chosen point goes to `<json>.choices.jsonl` before the held-out is replayed.
+- The held-out row with that one point: r with the 95 % block bootstrap CI, per-layer r, depth buckets, the first
+  1,000 generated positions against the rest, the reset variant, prefetch reads issued and used, and Belady MIN at C.
+- The verdict: `G1d passed / failed / not answered` for the primary cell (3.05, 46, V25: C 161, bar r_hi <= 18.455).
+  Every other cell is a `scenario (no gate role)` under the same rule (4.5: 12.351, 3.5: 15.880).
+  - Not answered: without B (`--step3 ... --readers 1`), without a CI (fewer than two blocks), or on any source
+    reason.
+  - Every report carries the PREREG's status line: the bar, grid and cells await robin's confirmation.
+
+**Policies** (per layer):
+- The seed is floor(s x C) experts by calibration count and is never evicted.
+- The LRU part is C - seed - P.
+- IDPF: before layer m's visit, the P highest-scoring non-resident experts are read into a buffer, one read each. The
+  scores sum T[m - d][a, .] over the same token's layer m - d ids. Demanded buffered experts join the LRU part; the
+  rest are dropped.
+
+**Runtime (derived, not measured on real routing).** 4,096 synthetic positions at full shape, C 161, Windows,
+2026-10-09, with the MUL1 conversion running beside it: 0.6 s for the three P 0 points and 16.4 s for nine IDPF
+points of one d. A 32,768-position file is about 8x that, ≈ 400 s for all 30 points. One cell replays 4 files under
+all points, then 4 folds x 3 files, then 4 left-out files under one point, then the held-out twice: about 1.8 h in
+one process. `--jobs 16` runs the 16 (file, d) groups of a step side by side, ≈ 12 min. Cells with the same C share
+the selection; `--cells all` has 18 distinct C.
+
+**Tests** (`TestG1dModel`, `TestG1dCli`, red without the change, 2026-10-09):
+
+| test | known answer |
+|---|---|
+| capacity and bar | every C of the PREREG table; bars 18.45 / 12.35 / 15.88; B / 40 = 174.84 MB |
+| grid and tie order | 30 points, LRU first; equal scores pick the simpler class, then smaller s, P, d; floor(s x C) 40 / 80 at 161 |
+| SEED+LRU hand trace | 0 1 2 0 3 1 2: LRU 3 reads 1 1 1 0 1 1 1, seed {0} + LRU 2 reads 0 1 1 0 1 1 1; the seed survives 5 misses |
+| prefetch hand trace | perfect keys 1 read per token, all used; wrong keys 2 reads per token; unused buffer dropped; resident experts never proposed; used ones join the LRU part |
+| IDPF table | counts over generated positions only; scores and lower-id ties; no prefetch for layers below d; seed + P > C refused |
+| selection | score = mean of per-file replays; folds use the other files' statistics; held-out routing changes nothing; held-out in the calibration refused; only generated positions scored; `--jobs` = one process |
+| verdict | passed at r_hi 18.400 <= 18.455, failed at 18.5, not answered without B, CI or on a source reason; a scenario cell is never "G1d" |
+| CLI | capture corpus end to end: C 161, 30 points, 2 folds, the choice written before the held-out replay, held-out r = unseeded picks of token 0 / 2,000, passed |
+
+Each rule removed alone turns a test red (checked 2026-10-09): tie order, prefetch reads counted, buffer dropped,
+seed never evicted, resident not proposed, floor(s x C), table on generated positions, fold statistics, held-out
+guard, source layer, bar comparison, and the choice written first.
