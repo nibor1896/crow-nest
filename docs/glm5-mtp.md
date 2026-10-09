@@ -146,12 +146,14 @@ identical; draft top-1 = golden draft on 79 / 89; draft = trunk's next on 57 / 8
 
 ## 6. Integration (#192)
 
-Built: the speculative decode `CROW_GLM_MTP=N` in `Glm5Run::generate` ([glm5-model.md](glm5-model.md)
-section 6.4: verify call, KDA rollback, counters, tests).
+Built: the speculative decode `CROW_GLM_MTP=N` in `Glm5Run::generate` and in `serve`
+([glm5-model.md](glm5-model.md) section 6.4: verify call, KDA rollback, counters, serve, tests).
 
 - After each step the block runs once over the accepted rows with `h` = the verify's `normed` rows
   and `e` = the embeddings of the accepted ids (the prompt likewise, in calls of `MTP_CHUNK` = 16
-  rows); its last row drafts. Chained drafts (N > 1) feed the block's own `normed` back as `h`;
+  rows from position 0, also when `CROW_CHUNK` runs the trunk's prompt in prompt calls); its last
+  row drafts. In `serve` the block lags the trunk by one row (a row's `e` is the next id, known only
+  when it is fed); the waiting head-norm row is part of the prefix snapshot. Chained drafts (N > 1) feed the block's own `normed` back as `h`;
   `index_share_for_mtp_iteration` is not built (each chained row runs its own indexer: the selection
   buffers are `MlaScratch`'s and `glm5_mla` has no "skip the indexer" entry). It changes drafts only.
 - The weights: `load_mtp(base, overlay)` -> `MtpBlock` (`Glm5Run::mtp_from_env`); one draft =

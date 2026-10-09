@@ -803,6 +803,7 @@ pub struct SpecStats {
     /// trunk rows of the verify calls (1 + drafts per step)
     pub verify_rows: u64,
     /// steps by accepted drafts: `hist[a]` = steps that accepted `a` drafts, `a` in `0..=n`
+    /// (serve: drafts the caller's ids reached, counted when the step is left)
     pub hist: Vec<u64>,
     /// rows the MTP block ran (prompt catch-up, per-step catch-up, chained drafts)
     pub mtp_rows: u64,
@@ -820,6 +821,38 @@ impl SpecStats {
     pub fn acceptance(&self) -> Option<f64> {
         (self.drafts > 0).then(|| self.accepted as f64 / self.drafts as f64)
     }
+
+    /// one line of the counters (serve's per-request `[chat] MTP` line)
+    pub fn summary(&self) -> String {
+        format!(
+            "N {}, verify steps {}, ids {} ({:.3} per step), drafts {} accepted {} (acceptance {}), accepted per step {:?}, block rows {}, KDA restores {} steps",
+            self.n,
+            self.steps,
+            self.tokens,
+            self.tokens as f64 / self.steps.max(1) as f64,
+            self.drafts,
+            self.accepted,
+            self.acceptance().map_or("-".to_string(), |a| format!("{:.1} %", 100.0 * a)),
+            self.hist,
+            self.mtp_rows,
+            self.kda_restore_steps
+        )
+    }
+}
+
+/// serve (#192): the rows of the last verify step that the caller has not all reached yet.
+/// The trunk holds rows `p0 .. p0 + fed.len()` with the ids `fed` (the caller's id, then the
+/// drafts); `ids[j]` is the head's greedy id after row `p0 + j`. The caller's sequence holds
+/// `p0 + taken` rows: row `p0 + j` is the caller's while the id it fed there is `fed[j]`, so its
+/// logits row (`Spec::logits` row `j`) is the target row of the caller's next id, whatever that id
+/// is drawn by. The KDA snapshot slot `j` holds the state after row `p0 + j` (`j < fed.len() - 1`);
+/// the verify's head-norm and logits rows stay until the next verify.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ahead {
+    pub p0: usize,
+    pub fed: Vec<i64>,
+    pub ids: Vec<i64>,
+    pub taken: usize,
 }
 
 /// a draft override (`(index of the generated id the draft guesses, draft) -> draft`): the GPU
@@ -848,6 +881,12 @@ pub struct Spec {
     pub dlogits: Dev,
     pub did: Dev,
     pub stats: SpecStats,
+    /// serve (#192): `[H]` the head-norm row of the sequence's last trunk row while the block has
+    /// not run it (its input embedding is the NEXT id, unknown until it is fed); the prefix
+    /// snapshot copies it
+    pub hp: Dev,
+    /// serve (#192): the verified ids the trunk holds ahead of the caller (`None` = level)
+    pub ahead: Option<Ahead>,
     pub hook: Option<DraftHook>,
     /// test probe: after every rollback, (last valid trunk row, every KDA state's S and conv bytes)
     #[cfg(test)]
@@ -877,6 +916,8 @@ impl Spec {
             dlogits: a("glm5 MTP draft logits", v * 4),
             did: a("glm5 MTP draft id", 4),
             stats: SpecStats { n, hist: vec![0; n + 1], ..SpecStats::default() },
+            hp: a("glm5 MTP pending head-norm row", h * 4),
+            ahead: None,
             hook: None,
             #[cfg(test)]
             probe: None,
@@ -903,7 +944,7 @@ impl Spec {
         for s in self.snaps.iter_mut().flatten() {
             s.free();
         }
-        for d in [&mut self.x, &mut self.normed, &mut self.logits, &mut self.ids, &mut self.e, &mut self.h, &mut self.dlogits, &mut self.did] {
+        for d in [&mut self.x, &mut self.normed, &mut self.logits, &mut self.ids, &mut self.e, &mut self.h, &mut self.dlogits, &mut self.did, &mut self.hp] {
             cuda::free_dev(d);
         }
     }
@@ -933,7 +974,8 @@ pub fn spec_vram_bytes(g: &Glm5Geo, moe: &MoeGeo, cap: usize, n: usize) -> u64 {
     let scratch = 4 * mt * (md.q_lora + md.heads * md.nope + md.kv_lora + md.idx_proj() + md.idx_heads * md.idx_dim + (cap / crate::glm5_mla::KPOOL).max(1) + md.sel_max() + 2 * md.heads * md.kv_lora + md.heads * md.v) as u64
         + 4 * mt.max(16) * md.heads as u64 * (md.kv_lora as u64 + 2)
         + 4 * mt * h * 6;
-    let verify = 4 * t * (g.hc_streams as u64 * h + h + v + 1) + 4 * (v + 1);
+    // + the pending head-norm row of serve (#192)
+    let verify = 4 * t * (g.hc_streams as u64 * h + h + v + 1) + 4 * (v + 1) + 4 * h;
     // one MoE plan per call size: [c][H] gather + output, 3 x [c][inter], the MUL1 partials
     let plans: u64 = (1..=mt).map(|tt| 4 * tt * g.topk as u64 * (2 * h + 3 * g.expert_inter as u64) * 2).sum();
     records + tensors + snaps + cache + scratch + verify + plans

@@ -5968,7 +5968,7 @@ const GLM_PROMPT_CHUNK: usize = 1;
 
 /// - #185 part 2: the server state of a glm5_next process. The `Engine` families keep `Srv`;
 ///   what a glm5_next engine does not have (the device sampler, the park of #118, slot files,
-///   VRAM lending, vision, MTP, the trickle) has no field here, and its routes answer by name.
+///   VRAM lending, vision, the trickle) has no field here, and its routes answer by name.
 struct GlmSrv<'a, R: Rows> {
     /// the one loaded engine of this process, with its held conversation and prompt snapshot
     eng: &'a mut Glm5Engine<R>,
@@ -6039,7 +6039,8 @@ fn glm_main(cli: &ServeArgs, cnq_path: &str, meta: &crow_nest_engine::meta::Mode
         eng.snapshot_bytes()
     );
     tracing::info!(target: "serve",
-        "[serve] glm5_next: no device sampler (sampled requests draw on the host), no MTP, no vision tower, no slot files, no VRAM lending (#185)");
+        "[serve] glm5_next: no device sampler (sampled requests draw on the host), MTP {} (#192), no vision tower, no slot files, no VRAM lending (#185)",
+        match eng.rows().mtp_drafts() { 0 => "off (CROW_GLM_MTP unset or 0)".to_string(), n => format!("{n} drafts per verify step (CROW_GLM_MTP; every id drawn from its own verify row)") });
     if cli.slot_save_path.is_some() {
         tracing::warn!(target: "serve", "[serve] --slot-save-path is not built for glm5_next: POST /slots/0 refuses save and restore (#185)");
     }
@@ -6279,7 +6280,10 @@ fn glm_chat_route<R: Rows>(stream: &mut TcpStream, srv: &mut GlmSrv<R>, body: &[
 /// - sampling: greedy takes the head's argmax (the id `glm5_run` takes); a sampled request
 ///   draws on the HOST (`draw_row`) on the logits row read back, since glm5_next has no device
 ///   sampler; a greedy request inside a tool call redraws under the grammar (`redraw_from_row`)
-/// - not on this path: MTP (#182), the trickle, vision, the park of #118
+/// - #192 MTP (`CROW_GLM_MTP`): inside `decode_step`; a verify step's ids come back one per
+///   step, every id with its own logits row (the one-row decode's bits), so greedy, sampled and
+///   forced ids are those without MTP; `timings` count the emitted ids; one `[chat] MTP` line
+/// - not on this path: the trickle, vision, the park of #118
 /// - `Err` is an engine failure (a row that failed: an NVMe read, the staging); the engine has
 ///   reset itself, the next request is cold
 fn glm_generate<R: Rows>(
@@ -6295,6 +6299,8 @@ fn glm_generate<R: Rows>(
     let model = req.model.clone();
     let prompt: Vec<i64> = ids.iter().map(|&v| v as i64).collect();
 
+    // #192: the MTP counters start at this request
+    let _ = srv.eng.rows_mut().mtp_report();
     let plan = srv.eng.decide(&prompt);
     let held = srv.eng.history().len();
     let cache_on = srv.eng.cache_enabled();
@@ -6666,6 +6672,9 @@ fn glm_generate<R: Rows>(
         repeat_run: rep.repeat_run,
         single_token: rep.single_token,
     });
+    if let Some(l) = srv.eng.rows_mut().mtp_report() {
+        tracing::info!(target: "chat", "[chat] MTP (#192): {l}");
+    }
     tracing::debug!(target: "chat", "[chat] ids {out:?}");
     Ok(GenOut { id, created, finish, timing, aborted, malformed: ts.malformed().to_vec() })
 }
