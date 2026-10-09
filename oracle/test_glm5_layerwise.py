@@ -339,5 +339,117 @@ class Cli(unittest.TestCase):
             G.open_weights("cnq", "x.cnq")
 
 
+class Subblocks(unittest.TestCase):
+    """crow-nest #156: --capture-subblocks writes the mHC sub-block files the golden harness of #161 reads
+    (attn_hc / ffn_hc input, post, comb, collapsed, the sub-layer output; expanded = the next site's input
+    and the layer output), and they are HF's full model's values"""
+
+    @classmethod
+    def setUpClass(cls):
+        from transformers import Glm5NextForConditionalGeneration
+        cls.wd = tempfile.mkdtemp(prefix="glm5-sub-")
+        cls.ck, deq = os.path.join(cls.wd, "fp8"), os.path.join(cls.wd, "hf-deq")
+        _silent(LW.make_synthetic, "small", cls.ck)
+        _silent(LW.write_hf_dequant_checkpoint, cls.ck, deq)
+        cls.tc = G.text_config(cls.ck)
+        cls.ws = G.WeightSource("fp8", cls.ck)
+        cls.T, cls.D = 40, 3
+        g = torch.Generator().manual_seed(11)
+        cls.ids = torch.randint(1, 1000, (cls.T + cls.D,), generator=g).tolist()
+        verbosity = LW.transformers.logging.get_verbosity()
+        LW.transformers.logging.set_verbosity_error()  # the load report lists the vision tower (not written)
+        try:
+            hf = _silent(Glm5NextForConditionalGeneration.from_pretrained, deq, dtype=torch.float32,
+                         attn_implementation="eager", experts_implementation="eager").eval()
+        finally:
+            LW.transformers.logging.set_verbosity(verbosity)
+        cls.hf = {}  # HF's full model, prompt in one call then one call per decode row (the runner's plan)
+        hooks = []
+        for l, layer in enumerate(hf.model.language_model.layers):
+            cls.hf[l] = {"y": []}
+            hooks += LW.subblock_hooks(layer, cls.hf[l])
+            hooks.append(layer.register_forward_hook(
+                lambda m, i, o, l=l: cls.hf[l]["y"].append(o[0][0].detach().clone())))
+        x = torch.tensor(cls.ids)[None]
+        cache = LW.DynamicCache(config=hf.config)
+        with torch.no_grad():
+            for r0, r1 in [(0, cls.T)] + [(r, r + 1) for r in range(cls.T, cls.T + cls.D)]:
+                hf(input_ids=x[:, r0:r1], past_key_values=cache, use_cache=True)
+        for h in hooks:
+            h.remove()
+        del hf, cache
+        for l in cls.hf:
+            cls.hf[l] = {k: torch.cat(v, 0) for k, v in cls.hf[l].items()}
+        cls.ids_path = os.path.join(cls.wd, "ids.json")
+        with open(cls.ids_path, "w") as f:
+            json.dump(cls.ids, f)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.wd, ignore_errors=True)
+
+    def _cli(self, out, *args):
+        return _silent(LW.main, ["run", "--weights", "fp8-originals", self.ck, "--ids", self.ids_path,
+                                 "--decode", str(self.D), "--out", out, *args])
+
+    def test_captures_are_hf_full_model_values(self):
+        out = os.path.join(self.wd, "cap")
+        self.assertEqual(self._cli(out, "--capture-subblocks", "--prompt-chunk", "0"), 0)
+        with open(os.path.join(out, "manifest.json")) as f:
+            man = json.load(f)
+        N, hc, H = self.T + self.D, self.tc.hc_mult, self.tc.hidden_size
+        shapes = {"in": (N, hc, H), "post": (N, hc), "comb": (N, hc, hc), "collapsed": (N, H), "out": (N, H),
+                  "expanded": (N, hc, H)}
+        self.assertEqual(sorted(man["subblocks"], key=int), [str(l) for l in range(8)])
+        for l in range(8):
+            for site in ("attn", "ffn"):
+                roles = man["subblocks"][str(l)][site]
+                self.assertEqual(set(roles), set(shapes))
+                for role, nm in roles.items():
+                    self.assertEqual(tuple(man["files"][nm]["shape"]), shapes[role], nm)
+                    got = LW.load_file(out, man, nm)
+                    if (site, role) == ("ffn", "expanded"):
+                        ref = self.hf[l]["y"]  # the decoder layer's output
+                    elif (site, role) == ("attn", "expanded"):
+                        ref = self.hf[l]["ffn.in"]
+                    else:
+                        ref = self.hf[l][f"{site}.{role}"]
+                    self.assertEqual(tuple(ref.shape), shapes[role], (l, site, role))
+                    self.assertLessEqual(float((got - ref).abs().max()), LW.TOL, (l, site, role))
+                    self.assertGreater(float(ref.abs().max()), 0.0, (l, site, role))
+
+    def test_captures_are_consistent_and_change_nothing(self):
+        cap, plain = os.path.join(self.wd, "cap7"), os.path.join(self.wd, "plain7")
+        self.assertEqual(self._cli(cap, "--capture-subblocks", "--prompt-chunk", "7"), 0)
+        self.assertEqual(self._cli(plain, "--prompt-chunk", "7"), 0)
+        with open(os.path.join(cap, "manifest.json")) as f:
+            a = json.load(f)
+        with open(os.path.join(plain, "manifest.json")) as f:
+            b = json.load(f)
+        self.assertNotIn("subblocks", b)
+        for n, v in b["files"].items():  # the hooks only read: every other file is byte-identical
+            self.assertEqual(a["files"][n]["sha256"], v["sha256"], n)
+        self.assertEqual(len(a["files"]) - len(b["files"]), 8 * 10)
+        prev = LW.load_file(cap, a, "embed.f32").unsqueeze(1).expand(-1, self.tc.hc_mult, -1)
+        for l in range(8):
+            r = {s: {k: LW.load_file(cap, a, nm) for k, nm in a["subblocks"][str(l)][s].items()}
+                 for s in ("attn", "ffn")}
+            self.assertTrue(torch.equal(r["attn"]["in"], prev), l)  # the layer's input, rows in call order
+            for s in ("attn", "ffn"):
+                x, p, c, y = r[s]["in"], r[s]["post"], r[s]["comb"], r[s]["out"]
+                expand = p.unsqueeze(-1) * y.unsqueeze(-2) + torch.matmul(c.transpose(-1, -2), x)
+                self.assertLessEqual(float((expand - r[s]["expanded"]).abs().max()), LW.TOL, (l, s))
+            prev = LW.load_file(cap, a, f"l{l}-output.f32")
+
+    def test_capture_refuses_states_it_cannot_point_at(self):
+        for extra in (("--state-dtype", "bf16"), ("--delete-states-behind",)):
+            with self.assertRaises(SystemExit) as e:
+                self._cli(os.path.join(self.wd, "bad"), "--capture-subblocks", *extra)
+            self.assertEqual(e.exception.code, 2)
+        with self.assertRaises(ValueError):
+            LW.run_layerwise(self.ws, self.tc, self.ids, self.D, os.path.join(self.wd, "bad"), state_dtype="bf16",
+                             log=quiet, capture_subblocks=True)
+
+
 if __name__ == "__main__":
     unittest.main()
