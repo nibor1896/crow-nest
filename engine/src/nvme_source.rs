@@ -31,6 +31,12 @@
 //!   record in the destination before [`ColdSource::wait`] returns, exactly as the load path does
 //!   (`residency.rs`, every slab), so no NVFP4 record is ever published unsanitized.
 //!
+//! - #149 path B (`CROW_GLM_STAGER`, [`NvmeSource::fetch_landed`]): a fetch may carry one
+//!   **landed flag** per record (a u64 in mapped pinned memory). The reader raises it after its
+//!   share is read and sanitized, before the ticket completes, so a device stream can wait on the
+//!   flag (`cuStreamWaitValue64`) while the host goes on; a failed read raises it too (no device
+//!   wait hangs on it) and its error comes from the ticket.
+//!
 //! Not built here: the RAM tier behind the trait, and the boot wiring beyond the refusal in
 //! `boot.rs` (`CROW_NVME_TIER` together with `CROW_COLD_TIER`). The three-tier split that uses
 //! this backend is `glm5_tiers`.
@@ -484,6 +490,8 @@ impl NvmeConfig {
 struct Job {
     rec: ExpertRecord,
     dst: RecordDst,
+    /// #149 path B: raised by the reader after this job's share ran ([`NvmeSource::fetch_landed`])
+    landed: Option<Landed>,
 }
 // the destinations are the caller's, valid until the ticket is waited on (`fetch`'s contract)
 unsafe impl Send for Job {}
@@ -532,7 +540,11 @@ impl NvmeSource {
                     }
                     let _ = ready_tx.send(Ok(()));
                     while let Ok(b) = brx.recv() {
-                        let _ = b.reply.send(reader.run(&b.jobs));
+                        let r = reader.run(&b.jobs);
+                        // SAFETY: `fetch_landed`'s contract: every flag is a live u64 until the
+                        // ticket is waited on, which cannot happen before the reply below
+                        unsafe { raise_landed(&b.jobs) };
+                        let _ = b.reply.send(r);
                     }
                 })
                 .map_err(|e| format!("NVMe tier: spawning reader {i}: {e}"))?;
@@ -566,8 +578,53 @@ impl Drop for NvmeSource {
     }
 }
 
-impl ColdSource for NvmeSource {
-    unsafe fn fetch(&self, jobs: &[(ExpertRecord, RecordDst)]) -> Result<Ticket, String> {
+/// #149 path B (`CROW_GLM_STAGER`): a u64 in host memory the reader raises to `value` once a
+/// record has landed. `flag` is the host address of a mapped pinned word; the device waits on its
+/// device alias (`cuStreamWaitValue64`, cyclic greater-or-equal).
+#[derive(Clone, Copy, Debug)]
+pub struct Landed {
+    pub flag: *mut u64,
+    pub value: u64,
+}
+
+/// Raise the landed flag of every job of a share. Called by the reader after [`Reader::run`]
+/// returned, so after the last byte of the share and its sanitize; also when the run failed, so a
+/// device waiting on a flag never waits for a read that will not come (the error reaches the host
+/// through the ticket).
+///
+/// # Safety
+///
+/// Every flag of `jobs` is a live, 8-B aligned u64 nobody else writes.
+unsafe fn raise_landed(jobs: &[Job]) {
+    if jobs.iter().all(|j| j.landed.is_none()) {
+        return;
+    }
+    // the record bytes (written by the device's DMA, then sanitized on this thread) before the flag
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    for l in jobs.iter().filter_map(|j| j.landed) {
+        std::ptr::write_volatile(l.flag, l.value);
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+impl NvmeSource {
+    /// #149 path B: [`ColdSource::fetch`] with one landed flag per job (`landed[i]` for
+    /// `jobs[i]`): the reader that reads job i raises `landed[i]` after its share is read and
+    /// sanitized, before the ticket completes. The host need not wait: a device stream waits on
+    /// the flag instead. A failed read raises the flag too; its error comes from the ticket.
+    ///
+    /// # Safety
+    ///
+    /// [`ColdSource::fetch`]'s, and every flag is a live, 8-B aligned u64 that only this fetch
+    /// writes until the ticket has been waited on (or dropped).
+    pub unsafe fn fetch_landed(&self, jobs: &[(ExpertRecord, RecordDst)], landed: &[Landed]) -> Result<Ticket, String> {
+        if landed.len() != jobs.len() {
+            return Err(format!("NVMe tier: {} landed flags for {} records", landed.len(), jobs.len()));
+        }
+        self.fetch_with(jobs, Some(landed))
+    }
+
+    unsafe fn fetch_with(&self, jobs: &[(ExpertRecord, RecordDst)], landed: Option<&[Landed]>) -> Result<Ticket, String> {
         if jobs.len() > MAX_IN_FLIGHT {
             return Err(format!("NVMe tier: {} records in one fetch, at most {MAX_IN_FLIGHT} (the misses of one layer)", jobs.len()));
         }
@@ -579,7 +636,7 @@ impl ColdSource for NvmeSource {
         let n = self.tx.len().min(jobs.len());
         let mut share: Vec<Vec<Job>> = (0..n).map(|_| Vec::new()).collect();
         for (k, (rec, dst)) in jobs.iter().enumerate() {
-            share[k % n].push(Job { rec: *rec, dst: *dst });
+            share[k % n].push(Job { rec: *rec, dst: *dst, landed: landed.map(|l| l[k]) });
         }
         let mut parts = Vec::new();
         for (i, jobs) in share.into_iter().enumerate() {
@@ -588,6 +645,12 @@ impl ColdSource for NvmeSource {
             parts.push(rx);
         }
         Ok(Ticket { parts })
+    }
+}
+
+impl ColdSource for NvmeSource {
+    unsafe fn fetch(&self, jobs: &[(ExpertRecord, RecordDst)]) -> Result<Ticket, String> {
+        self.fetch_with(jobs, None)
     }
 
     fn wait(&self, mut t: Ticket) -> Result<FetchReport, String> {
@@ -1406,6 +1469,61 @@ mod tests {
             let rep = src.wait(unsafe { src.fetch(&[(ok, RecordDst { gu: b.p, dn: std::ptr::null_mut() })]) }.unwrap()).unwrap();
             assert_eq!(rep.bytes, 8192, "{}", backend.name());
             assert!(b.bytes() == &want[8192..16384], "{}: the read after the short read differs", backend.name());
+        }
+    }
+
+    /// #149 path B: a landed flag is raised only once its record is in the destination. Eight
+    /// records read with [`NvmeSource::fetch_landed`] (1 and 2 readers, both backends): the host
+    /// spins on each flag WITHOUT waiting on the ticket, and the moment a flag shows its value the
+    /// record must already equal the plain read. A short read raises its flag too (a device
+    /// waiting on it must not hang) and the ticket carries the error by name. A count mismatch
+    /// between jobs and flags is refused.
+    #[cfg(windows)]
+    #[test]
+    fn a_landed_flag_rises_after_its_record_and_also_on_a_failed_read() {
+        const LEN: usize = 48 << 20;
+        let (f, want) = raw_file("landed", LEN);
+        let lens = [MUL1_REC as usize, 4096, 1 << 20, 2_813_952, 409_600, 3 << 20, 8192, 5_005_312];
+        let offs = [36u64 << 20, 0, 12 << 20, 20 << 20, 4096, 28 << 20, (48 << 20) - 8192, 16 << 20];
+        let recs: Vec<ExpertRecord> = (0..8).map(|k| raw_rec(k as u32, offs[k], lens[k])).collect();
+        for backend in [NvmeBackend::Iocp, NvmeBackend::IoRing] {
+            for readers in [1, 2] {
+                let mut cfg = NvmeConfig::new(&f.path);
+                cfg.readers = readers;
+                cfg.backend = Some(backend);
+                let src = NvmeSource::open(&cfg).unwrap();
+                let flags: Vec<u64> = vec![0; 8];
+                for round in 1..=3u64 {
+                    let bufs: Vec<Aligned> = recs.iter().map(|r| Aligned::new(r.gu.len)).collect();
+                    let jobs: Vec<(ExpertRecord, RecordDst)> = recs.iter().zip(&bufs).map(|(r, b)| (*r, RecordDst { gu: b.p, dn: std::ptr::null_mut() })).collect();
+                    let landed: Vec<Landed> = (0..8).map(|k| Landed { flag: &flags[k] as *const u64 as *mut u64, value: round * 100 + k as u64 }).collect();
+                    let t = unsafe { src.fetch_landed(&jobs, &landed) }.unwrap();
+                    let mut seen = [false; 8];
+                    let t0 = std::time::Instant::now();
+                    while seen.iter().any(|s| !s) {
+                        for k in 0..8 {
+                            if !seen[k] && unsafe { std::ptr::read_volatile(&flags[k]) } == landed[k].value {
+                                std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+                                let at = offs[k] as usize;
+                                assert!(bufs[k].bytes()[..lens[k]] == want[at..at + lens[k]], "{} x {readers} round {round}: record {k}'s flag rose before its bytes", backend.name());
+                                seen[k] = true;
+                            }
+                        }
+                        assert!(t0.elapsed().as_secs() < 30, "{} x {readers} round {round}: flags {seen:?} never rose", backend.name());
+                        std::hint::spin_loop();
+                    }
+                    src.wait(t).unwrap();
+                }
+                let b = Aligned::new(8192);
+                let flag = 0u64;
+                let past = raw_rec(7, (LEN - 4096) as u64, 8192);
+                let t = unsafe { src.fetch_landed(&[(past, RecordDst { gu: b.p, dn: std::ptr::null_mut() })], &[Landed { flag: &flag as *const u64 as *mut u64, value: 9 }]) }.unwrap();
+                let e = src.wait(t).unwrap_err();
+                assert!(e.contains("short read"), "{}: {e}", backend.name());
+                assert_eq!(unsafe { std::ptr::read_volatile(&flag) }, 9, "{}: a failed read must still raise its flag", backend.name());
+                let e = unsafe { src.fetch_landed(&[(past, RecordDst { gu: b.p, dn: std::ptr::null_mut() })], &[]) }.err().unwrap();
+                assert!(e.contains("0 landed flags for 1 records"), "{e}");
+            }
         }
     }
 

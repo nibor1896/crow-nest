@@ -408,7 +408,8 @@ units, about 12 hot experts per layer), and the post-plan check below requires
 > buffer or straight into a freed pinned slot. The hand-off is host-synchronous: after each MoE layer's
 > router the host reads the 8 ids, moves the records (staging, pinned entrants, VRAM entrants, in that
 > order) and writes the layer's `[288]` record table; the MUL1 kernels read VRAM records or pinned
-> records zero-copy. No job ring, no `cuStreamWaitValue`; with `CROW_GLM_GRAPH=1` (#190, default off)
+> records zero-copy. No job ring; `cuStreamWaitValue64` only with `CROW_GLM_STAGER=1` (#149 path B,
+> default off, see 3.2); with `CROW_GLM_GRAPH=1` (#190, default off)
 > the launches between two routers replay as one CUDA graph (`docs/glm5-model.md` 6.3). Flash-Next and the 27B do not reach
 > it (gate R). The A9 requirement for this path is that the cache size never changes the output:
 > `glm5_tiers_gpu_cache_size_is_invisible_in_the_logits` (ids and logits bit-identical at the plan's
@@ -552,9 +553,20 @@ experts via the job ring → `shared_expert_gate` combine.
 > **Built 2026-10-09 for glm5_next only, the routing half (#149 path B, `CROW_GLM_FLAGS=1`, default
 > off, `engine/src/glm5_flags.rs`):** after the router a one-block kernel writes the selected ids into
 > mapped pinned host memory and raises a 64-bit sequence flag there (`__threadfence_system`, no memop);
-> the host spins on it instead of a stream sync + blocking copy. The completion half (the GPU waiting on
-> a host-raised flag before the experts) is not built: the glm5 stager (`glm5_tiers::serve`) queues its
-> copies on the compute stream and syncs it. `docs/glm5-model.md` 6.2.
+> the host spins on it instead of a stream sync + blocking copy.
+>
+> **The landed half, built 2026-10-09 (`CROW_GLM_STAGER=1`, default off, needs `CROW_GLM_FLAGS=1`,
+> `glm5_tiers::Stager`):** `serve`'s copies and the record table's upload go on a non-blocking stager
+> stream from persistent pinned sources (a pinned landing, one pinned table row per MoE layer). The
+> NVMe reader threads raise a per-expert landed flag (u64 in mapped pinned memory, the call's
+> sequence) after the bytes and their sanitize (`NvmeSource::fetch_landed`); the stager stream waits
+> on it with `cuStreamWaitValue64_v2` (GEQ); the compute stream waits for the stager's batch through
+> an event, not a memop, because the driver API asks for CUDA-visible dependencies between CUDA tasks
+> a memop orders. The host's one wait per MoE layer is the router flag; inside the call only a gate
+> (a stager-stream sync before an NVMe read into a pinned slot phase A still copies from). Synthetic
+> 8-layer model (5 MoE layers, V 3 + P 4): `cuStreamSynchronize` per decode row 24.75 → 5.50, with
+> `CROW_GLM_GRAPH=1` 22.75 → 3.50, ids and logits bit-identical. The waits are eager between the
+> graph segments, not captured. Not run on the real container. `docs/glm5-model.md` 6.2.
 
 - Pinned host-memory ring, job descriptors 64-byte aligned (exl3 `moe_handoff.h`
   pattern): layer id, job kind, cold expert ids (≤ 10), sequence number, flag slots.

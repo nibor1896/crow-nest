@@ -198,7 +198,8 @@ R, #174). The layer math is section 1 unchanged; what changes is where an expert
   barrier; (B) experts entering pinned take a freed pinned slot (D2H from their VRAM slot, or read
   from the container straight into the slot); (C) VRAM entrants go from staging into freed VRAM
   slots. The `[288]` table points each selected id at its VRAM slot, its pinned slot (UVA, read
-  zero-copy by the MUL1 kernels) or its staging slot; every other entry is 0.
+  zero-copy by the MUL1 kernels) or its staging slot; every other entry is 0. With
+  `CROW_GLM_STAGER=1` the same phases run on a stager stream without host syncs (section 6.2).
 - **NVMe**: `NvmeSource`, one handle per reader, `FILE_FLAG_NO_BUFFERING` + IOCP, 1 reader
   (`--readers`, PREREG amendment 5), records located once (`ExpertRecord::glm5_table`). The
   reader backend is `CROW_NVME_BACKEND`: `iocp` (unset, default; one completion port per reader)
@@ -385,9 +386,10 @@ per-row moves = rep 1's; not run yet).
 
 ### 6.2 Decode switches (#149 path B, #189)
 
-Two switches of `Glm5Run` (`glm5_flags`), both default off; off, `generate` runs every row through
-`Glm5Run::row` (one row body) and the path is call for call the one before them. `glm5_run` prints
-`[glm5_run] decode switches: ...` at load when one is on.
+Two switches of `Glm5Run` (`glm5_flags`) and one of `ExpertTiers` (`CROW_GLM_STAGER`), all default
+off; off, `generate` runs every row through `Glm5Run::row` (one row body) and the path is call for
+call the one before them. `glm5_run` prints `[glm5_run] decode switches: ...` at load when one of
+the first two is on.
 
 - **`CROW_GLM_FLAGS=1`** (#149 path B, the routing half): after `route`, a one-block kernel copies
   the 8 selected ids into mapped pinned host memory, `__threadfence_system`, then raises a 64-bit
@@ -397,12 +399,46 @@ Two switches of `Glm5Run` (`glm5_flags`), both default off; off, `generate` runs
   pageable `cuMemcpyDtoH`. **What the host still waits for:** the flag, i.e. every launch up to and
   including the router (the GPU work the stream sync waited for), and inside
   `ExpertTiers::table_for` its own waits: the phase-A barrier (a stream sync), the NVMe reads, the
-  synchronous landing and table uploads. Applies to `generate` and to `row` (serve).
-  **Not built: the "landed" half** (the GPU waiting on a host-raised flag before `experts`, so the
-  host could queue ahead of the staging): `serve`'s mover queues its copies on the current stream and
-  syncs it, and the table goes up from a transient host vector, so experts queued ahead would run
-  before their copies or deadlock the barrier. It needs the mover on its own stream with persistent
-  pinned sources (`serve` / `GpuMover`, not this change).
+  synchronous landing and table uploads (unless `CROW_GLM_STAGER=1`, next bullet). Applies to
+  `generate` and to `row` (serve).
+- **`CROW_GLM_STAGER=1`** (#149 path B, the landed half; `glm5_tiers::Stager`, read by
+  `ExpertTiers::new`, `ExpertTiers::set_stager`): needs `CROW_GLM_FLAGS=1` and refuses
+  `CROW_GLM_CPU_LANE=1`, both by name (`stager_on`); refused by name on a device without 64-bit
+  stream memops. `table_for` serves the call through a `StagerMover` instead of `GpuMover`:
+  - a non-blocking **stager stream** carries every copy of phases A-C (H2D, D2D, D2H) and the
+    table upload, in `serve`'s order; phase A's barrier is gone (the stream orders phase B behind A);
+  - **persistent pinned sources**: the decode landing (one record per staging slot) is pinned, and
+    each MoE layer's table is written into its own row of a pinned `[layers][288]` u64 block;
+  - **landed flags**: one u64 per (MoE layer, expert) in mapped pinned memory. Misses are read with
+    `NvmeSource::fetch_landed`; the reader thread raises the record's flag to the call's sequence
+    number after the read and its sanitize (also after a failed read, whose error comes from the
+    ticket at the next call, `ExpertTiers::settle` or the end of `row`). The stager stream waits on
+    each (`cuStreamWaitValue64_v2`, GEQ) before the copies behind it; the host does not wait;
+  - the **compute stream** waits for the stager's batch through an event (`cuEventRecord` on the
+    stager, `cuStreamWaitEvent` on the current stream) before `experts`. Not a memop: the driver API
+    says memop ordering "is not visible to CUDA" and asks for CUDA-visible dependencies such as
+    events between CUDA tasks it orders (Stream Memory Operations, `cuStreamWaitValue64`).
+  - Why the slots are free without a host wait: the host enters layer l's call only after l's
+    router flag, so (in-order compute stream) every earlier call's experts ran, and with them every
+    earlier stager batch, its flags and its reads.
+  - **What the host still waits for per MoE layer:** the router flag (6.2 above). Inside `table_for`
+    only the gate: before an NVMe read straight into a pinned slot that this call's phase A still
+    copies from (the slot of a pick promoted to VRAM) the host synchronizes the stager stream
+    (`StagerStats::gate_syncs`). Under LRU that needs an NVMe miss that loses VRAM to another pick of
+    the same call (more picks than VRAM slots); with the plan's VRAM slots an older victim always
+    exists (derived, not measured). Per row: the embedding upload, the row's end sync, and without
+    `CROW_GLM_GRAPH` the 2 DSA layers' scalar uploads.
+  - **Memory**: `stager_pinned_bytes` = the pinned landing + 2 x the `[layers][288]` u64 blocks
+    (GLM-5.3-Flash, 3-bit record, top-8: 75,792,384 + 2 x 98,304 = 75,988,992 B), included in
+    `ExpertTiers::pinned_bytes` and taken off the pinned budget by `plan_for_rows` (as #186's prefill
+    landing): at the 46 GiB cap the plan's pinned slots per MoE layer are 123 instead of 124 with
+    the stager on (derived from the record size, not run). The pageable landing stays allocated.
+  - **With `CROW_GLM_GRAPH=1`**: the stager's waits are not captured. `table_for` runs in the eager
+    hand-off between two segments, so its event wait is an eager `cuStreamWaitEvent` on the legacy
+    stream before the next segment's launch; the segments still hold kernel nodes only.
+  - **With `CROW_GLM_PINNED=zerocopy`**: unchanged; a fresh NVMe-to-pinned record a pick reads
+    zero-copy is covered by its landed flag like any other.
+  - Prompt calls (`CROW_CHUNK` above 1, `tables_for_chunk`) stay on the synchronous mover.
 - **`CROW_GLM_LOOKAHEAD=1`** (#189, `generate` only): a row with a head that is not the last queues
   the next row before the host reads its id. The greedy id stays on the GPU; `Feed::gather` writes
   its embedding row (BF16 widened exactly, as `embed_rows` + `trunk_input`) into the four streams;
@@ -431,6 +467,37 @@ Each was shown red against a broken mechanism: the host not waiting for the flag
 then `CUDA_ERROR_ILLEGAL_ADDRESS`), the id read before a sync point (ids shifted by one row), the
 gather writing one stream (12,285 of 16,384 values differ).
 
+Stager tests: host `glm5_flags::tests::the_stager_switch_needs_the_flags_and_refuses_the_cpu_lane`
+(the refusals, the booked bytes) and `nvme_source::tests::a_landed_flag_rises_after_its_record_and_also_on_a_failed_read`
+(both reader backends, 1 and 2 readers: the host spins on each flag without the ticket and finds the
+record complete the moment it rises; a short read raises its flag and errs by name). GPU
+`glm5_flags_gpu_stager_is_invisible_in_ids_logits_and_reports` (the synthetic 8-layer model of 6.3,
+5 + 6 ids, V 3 + P 4, 2026-10-09, 25 s): flags + stager, + lookahead, + `CROW_GLM_GRAPH`, +
+`CROW_GLM_PINNED=zerocopy` and under LFU give the switch-off ids `[998, 1709, 1847, 1540, 1349, 189]`,
+every logit's bits, and the row reports of the synchronous arm of the same cache rule; every NVMe
+read carries a landed flag; `row` with flags + stager too. Gate syncs 15 (LRU), 18 (zerocopy), 39
+(LFU) in 50 calls. Shown red against: the compute stream's event wait removed (`CROW_GLM_FLAGS: the
+router's ids did not arrive in 30 s`: the experts read a table not yet uploaded), the stager's
+landed waits removed (ids `[1471, 1177, 327, ..]`: staging copied half-read landing slots), the
+reader raising the flag before the read (`record 0's flag rose before its bytes`).
+
+Syncs per decode row (nsys `cuda_api_sum`, 2026-10-09, RTX 5090, test
+`glm5_flags_gpu_stager_profile_rows`: the synthetic 8-layer model, 5 MoE layers, V 3 + P 4 so records
+move every row, 8 decode rows after 5 prompt + 3 warm rows, under `--capture-range=cudaProfilerApi`;
+counts / 8):
+
+| arm | `cuStreamSynchronize` | `cuStreamWaitValue64_v2` | `cuStreamWaitEvent` | `cuMemcpyHtoDAsync` | gate syncs (of the syncs) |
+|---|---|---|---|---|---|
+| `CROW_GLM_FLAGS=1` | 24.75 | 0 | 0 | 20.5 | - |
+| `CROW_GLM_FLAGS=1` + `CROW_GLM_STAGER=1` | 5.50 | 20.88 | 5 | 20.5 | 1.5 |
+| + `CROW_GLM_GRAPH=1` | 22.75 | 0 | 0 | 19.5 | - |
+| + `CROW_GLM_GRAPH=1` + `CROW_GLM_STAGER=1` | 3.50 | 20.88 | 5 | 19.5 | 1.5 |
+
+With the stager no sync is left per MoE layer on the compute stream; the rest is per row (embedding
+upload, the row's end, without the graph the 2 DSA scalar uploads) plus the gate on the stager stream
+(this synthetic V 3 / top-8 store crowds VRAM within a call). The 20.88 waits are the row's 167 / 8
+NVMe reads. No speed figure: synthetic weights, 8 rows.
+
 ### 6.3 Decode rows as CUDA graphs (`CROW_GLM_GRAPH`, #190)
 
 Default off; off, the row is the one before it call for call (`glm5_graph`'s hooks are no-ops).
@@ -444,7 +511,8 @@ switches of 6.2) and to `row` (serve).
   head is one graph (3 kernels). GLM-5.3-Flash: 42 MoE layers, so 43 row graphs + the head.
 - **What still needs the host per MoE layer** (unchanged): the router ids (`glm5_model::router_ids`:
   stream sync + copy, or the 6.2 flag) and `ExpertTiers::table_for` (staging, its syncs, the table
-  upload). The embedding upload per row stays eager too.
+  upload; with `CROW_GLM_STAGER=1` no sync, an eager event wait, 6.2). The embedding upload per row
+  stays eager too.
 - **Capture**: the row's eager body runs with a capture open on a non-blocking stream
   (thread-local capture mode); at each router `call_inner` closes the segment, which is checked
   (kernel nodes only, else refused by name), instantiated and launched on the legacy stream; the
@@ -501,6 +569,10 @@ for bit as switch-off; red with one kept row (8 captures, 532 replays instead of
 - `glm5_run`'s timings and counters on the real container and the reps/reset logits test (section
   6.1, #187): built, not run; no baseline figure exists.
 - The decode switches (section 6.2) on the real container: built, not run; no speed figure.
+- `CROW_GLM_STAGER=1` on the real container: not run (ids, syncs per row, speed, the gate count at
+  the plan's sizes); with `CROW_CHUNK` above 1 (prompt calls on the synchronous mover after stager
+  decode rows): not run; an NVMe read slower than the 2 s WDDM TDR while the stager stream waits on
+  its flag: not exercised.
 - `CROW_GLM_GRAPH` (section 6.3) on the real container: not run (ids, launches per row, speed);
   a position past 2,051 tokens, where a stale `idx_scores` grid would change the selection: not run.
 - #188 `CROW_GLM_PINNED=zerocopy` and `CROW_GLM_CPU_LANE=1` on the real container: not run (speed,

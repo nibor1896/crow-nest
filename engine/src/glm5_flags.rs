@@ -1,5 +1,5 @@
 //! #149 path B / #189: the glm5_next decode switches of `Glm5Run` (glm5_next only; nothing on the
-//! Flash-Next / 27B path constructs or calls anything here, gate R). Both default OFF; off, the
+//! Flash-Next / 27B path constructs or calls anything here, gate R). All default OFF; off, the
 //! path is the one before them, call for call.
 //!
 //! - **`CROW_GLM_FLAGS=1`** ([`Routed`]): a MoE layer's router ids reach the host through mapped
@@ -10,11 +10,12 @@
 //!   plus a blocking pageable `cuMemcpyDtoH`. What the host still waits for: the flag itself, i.e.
 //!   every launch of the stream up to and including the router (the same GPU work the stream sync
 //!   waited for), and inside `ExpertTiers::table_for` its own syncs (the phase-A barrier, the NVMe
-//!   reads, the synchronous landing and table uploads). The "landed" half of path B (the GPU
-//!   waiting on a host-raised flag before the experts) is not built: `serve`'s mover queues its
-//!   copies on the current (legacy) stream and synchronizes it, and the table is uploaded from a
-//!   transient host vector, so experts queued ahead of the staging would run before their copies or
-//!   deadlock the barrier.
+//!   reads, the synchronous landing and table uploads), unless the stager below is on.
+//! - **`CROW_GLM_STAGER=1`** (needs `CROW_GLM_FLAGS=1`, `glm5_tiers::stager_on`): the landed half
+//!   of path B (`glm5_tiers::Stager`). `table_for` queues the moves and the table upload on a
+//!   stager stream from persistent pinned sources, the NVMe readers raise a per-expert landed flag
+//!   the stager stream waits on (`cuStreamWaitValue64_v2`), and the compute stream waits on the
+//!   stager's event. The host's one wait per MoE layer is then this module's router flag.
 //! - **`CROW_GLM_LOOKAHEAD=1`** ([`Feed`], [`Readback`]): `Glm5Run::generate` queues decode row
 //!   k+1 before the host reads token k. The head's greedy id stays on the GPU; [`Feed::gather`]
 //!   writes that id's embedding row (BF16 widened exactly, `cnq::bf16_bytes_to_f32`) into all four
@@ -652,5 +653,234 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
         assert_eq!(rows_flags.0, g0.ids, "row() with the flags: ids");
         let diff = bits(&rows_flags.1, &g0.logits);
         assert!(diff.iter().all(|&d| d == 0), "row() with the flags: logits differ in bits {diff:?}");
+    }
+
+    // ---------------------------------------------------------------- #149 path B: the stager
+
+    #[test]
+    fn the_stager_switch_needs_the_flags_and_refuses_the_cpu_lane() {
+        use crate::glm5_tiers::stager_on;
+        assert_eq!(stager_on(None, None, None), Ok(false));
+        for v in ["0", "", "on", "true", " 1", "2"] {
+            assert_eq!(stager_on(Some(v), None, Some("1")), Ok(false), "{v:?}");
+        }
+        assert_eq!(stager_on(Some("1"), Some("1"), None), Ok(true));
+        assert_eq!(stager_on(Some("1"), Some("1"), Some("0")), Ok(true));
+        for flags in [None, Some("0"), Some("on")] {
+            let e = stager_on(Some("1"), flags, None).unwrap_err();
+            assert!(e.starts_with("CROW_GLM_STAGER=1 needs CROW_GLM_FLAGS=1"), "{e}");
+        }
+        let e = stager_on(Some("1"), Some("1"), Some("1")).unwrap_err();
+        assert!(e.starts_with("CROW_GLM_STAGER=1 and CROW_GLM_CPU_LANE=1"), "{e}");
+        // what the plan books for the stager: GLM-5.3-Flash, 42 MoE layers x 288, the 3-bit record, top-8
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        assert_eq!(crate::glm5_tiers::stager_pinned_bytes(g.moe_layers(), g.experts, g.topk, 9_474_048), 75_988_992);
+    }
+
+    /// the synthetic 8-layer model of the stager tests (the #190 shape): layers 0-2 KDA + dense,
+    /// 3-7 MoE with 16 MUL1 experts, top-8, DSA at 3 and 7, vocab 2048
+    fn geo8() -> Glm5Geo {
+        let mut g = Glm5Geo::GLM_5_3_FLASH;
+        (g.layers, g.dense_prefix, g.experts, g.topk, g.vocab) = (8, 3, 16, 8, 2048);
+        g
+    }
+
+    /// one arm of the stager test
+    #[derive(Clone, Copy, Debug)]
+    struct Arm {
+        name: &'static str,
+        sw: Switches,
+        graph: bool,
+        stager: bool,
+        zerocopy: bool,
+        lfu: bool,
+    }
+
+    /// The stager is invisible in the output. The synthetic 8-layer model (5 MoE layers, so the
+    /// staging slots, the landing buffer and the table rows are reused across layers and rows), a
+    /// 5-id prompt and 6 greedy ids, VRAM 3 + pinned 4 slots, a fresh store per arm. Against the
+    /// synchronous arm of the same cache rule: `CROW_GLM_STAGER` with the flags, with the
+    /// lookahead, with `CROW_GLM_GRAPH`, with `CROW_GLM_PINNED=zerocopy`, and under LFU (whose
+    /// NVMe misses can enter pinned while another pick leaves it: the gate) give the same ids,
+    /// every logit's bits and every row report except its clock. Every stager arm reads from NVMe
+    /// only through landed flags (`landed_reads` = the store's NVMe reads). Also serve's door: `row`
+    /// with flags + stager gives the switch-off ids and logits.
+    #[test]
+    #[ignore = "needs the GPU (about 2 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_flags_gpu_stager -- --ignored --nocapture --test-threads 1"]
+    fn glm5_flags_gpu_stager_is_invisible_in_ids_logits_and_reports() {
+        use crate::expert_cache::{ExpertCache, Policy, Scope};
+        use crate::glm5_tiers::PinnedUse;
+        const REC: u64 = 9_474_048;
+        let g = geo8();
+        let t0 = std::time::Instant::now();
+        let s = synth_model(&g, REC);
+        eprintln!("glm5 stager: synthetic model written in {:.1} s", t0.elapsed().as_secs_f64());
+        let (spec, records) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        assert_eq!((spec.bytes, records), (REC, 16 * 5));
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let prompt = [3i64, 17, 101, 999, 5];
+        let n = 6;
+        let sizes = TierSizes { vram: 3, pinned: 4 };
+        let off = Switches::default();
+        let flags = Switches { flags: true, lookahead: false };
+        let both = Switches { flags: true, lookahead: true };
+        let arm = |name, sw, graph, stager, zerocopy, lfu| Arm { name, sw, graph, stager, zerocopy, lfu };
+        // each stager arm is compared with the synchronous arm of its cache rule (`base`)
+        let arms = [
+            (arm("off", off, false, false, false, false), None),
+            (arm("flags", flags, false, false, false, false), Some(0)),
+            (arm("flags+stager", flags, false, true, false, false), Some(0)),
+            (arm("flags+lookahead+stager", both, false, true, false, false), Some(0)),
+            (arm("graph+flags+stager", flags, true, true, false, false), Some(0)),
+            (arm("off zerocopy", off, false, false, true, false), None),
+            (arm("flags+stager zerocopy", flags, false, true, true, false), Some(5)),
+            (arm("off lfu", off, false, false, false, true), None),
+            (arm("flags+stager lfu", flags, false, true, false, true), Some(7)),
+        ];
+        let mut outs: Vec<(Generated, Vec<TokenReport>)> = Vec::new();
+        let mut door: (Vec<i64>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
+        let mut gates = 0u64;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut run = Glm5Run::load(&mut cnq, &g, &moe, prompt.len() + n, &mut |s| eprintln!("{s}"));
+            for (a, _) in arms {
+                run.set_graph(a.graph);
+                run.set_switches(&mut cnq, a.sw);
+                let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, g.topk).unwrap();
+                if a.lfu {
+                    tiers.cache = ExpertCache::new(Policy::Lfu { decay: 0.5 }, Scope::PerLayer, g.layers - g.dense_prefix, g.experts, sizes.vram, sizes.pinned).unwrap();
+                }
+                if a.zerocopy {
+                    tiers.set_pinned_use(PinnedUse { stay: true, cpu_lane: false }).unwrap();
+                }
+                tiers.set_stager(a.stager).unwrap();
+                let mut reps: Vec<TokenReport> = Vec::new();
+                let gen = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |r| reps.push(r.clone())).unwrap();
+                let st = tiers.stager_stats();
+                eprintln!("glm5 stager {}: ids {:?}, NVMe reads {}, stager {st:?}", a.name, gen.ids, tiers.nvme_reads);
+                if let Some(st) = st {
+                    assert_eq!(st.calls, (5 * (prompt.len() + n - 1)) as u64, "{}: one stager call per MoE layer per row", a.name);
+                    assert_eq!(st.landed_reads, tiers.nvme_reads, "{}: every NVMe read carries a landed flag", a.name);
+                    gates += st.gate_syncs;
+                }
+                tiers.free();
+                outs.push((gen, reps));
+            }
+            // serve's door with flags + stager
+            run.set_graph(false);
+            run.set_switches(&mut cnq, flags);
+            let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, g.topk).unwrap();
+            tiers.set_stager(true).unwrap();
+            run.kda_states().for_each(|k| k.reset());
+            let mut tok = 0i64;
+            for (pos, &p) in prompt.iter().enumerate() {
+                if let Some(id) = run.row(&mut cnq, &mut tiers, p, pos, pos + 1 == prompt.len()).unwrap() {
+                    tok = id;
+                }
+            }
+            for i in 0..n {
+                door.0.push(tok);
+                door.1.push(cuda::dtoh(run.logits_dev(), g.vocab));
+                if i + 1 < n {
+                    tok = run.row(&mut cnq, &mut tiers, tok, prompt.len() + i, true).unwrap().unwrap();
+                }
+            }
+            tiers.free();
+            run.free();
+        }
+        drop(cnq);
+        eprintln!("glm5 stager: gate syncs over all stager arms {gates}");
+        let (g0, r0) = &outs[0];
+        assert_eq!((g0.ids.len(), g0.logits.len(), r0.len()), (n, n, prompt.len() + n - 1));
+        let finite = g0.logits.iter().flatten().filter(|v| v.is_finite()).count();
+        assert_eq!(finite, n * g.vocab, "the synthetic model must stay finite for the comparison to mean something");
+        let bits = |a: &[Vec<f32>], b: &[Vec<f32>]| a.iter().zip(b).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()).collect::<Vec<_>>();
+        for (i, (a, base)) in arms.iter().enumerate() {
+            let (gx, rx) = &outs[i];
+            // every arm, whatever its cache rule, gives the switch-off ids and logits (#188 / #190
+            // hold the cache rules lossless; the stager must not change that)
+            assert_eq!(gx.ids, g0.ids, "{}: ids", a.name);
+            let diff = bits(&gx.logits, &g0.logits);
+            assert!(diff.iter().all(|&d| d == 0), "{}: logits differ in bits per generated position {diff:?}", a.name);
+            assert!(rx.iter().map(|r| r.moves.iter().map(|m| m.nvme_reads()).sum::<u64>()).sum::<u64>() > 0, "{}: the run must read records from NVMe", a.name);
+            if let Some(b) = base {
+                let (_, rb) = &outs[*b];
+                assert_eq!(rx.iter().map(unclocked).collect::<Vec<_>>(), rb.iter().map(unclocked).collect::<Vec<_>>(), "{}: row reports against {}", a.name, arms[*b].0.name);
+            }
+        }
+        assert_eq!(door.0, g0.ids, "row() with flags + stager: ids");
+        let diff = bits(&door.1, &g0.logits);
+        assert!(diff.iter().all(|&d| d == 0), "row() with flags + stager: logits differ in bits {diff:?}");
+    }
+
+    /// The sync-count harness of #149 path B (no assertion beyond the run): the synthetic 8-layer
+    /// model with VRAM 3 + pinned 4 slots (records move every row), `GLM_STAGER_PROFILE_ARM` =
+    /// `flags` | `flags+stager` | `graph+flags` | `graph+flags+stager`, 5 prompt rows and 3 warm
+    /// decode rows through `row`, then `cuProfilerStart`, 8 decode rows, `cuProfilerStop`. Under
+    /// `nsys profile -t cuda --capture-range=cudaProfilerApi` the API counts divided by 8 are the
+    /// per-row counts of decode rows (5 MoE layers each).
+    #[test]
+    #[ignore = "measurement: nsys profile -t cuda --capture-range=cudaProfilerApi <test exe> glm5_flags_gpu_stager_profile_rows --ignored --nocapture --test-threads 1"]
+    fn glm5_flags_gpu_stager_profile_rows() {
+        const REC: u64 = 9_474_048;
+        let arm = std::env::var("GLM_STAGER_PROFILE_ARM").unwrap_or_else(|_| "flags".into());
+        let (graph, stager) = match arm.as_str() {
+            "flags" => (false, false),
+            "flags+stager" => (false, true),
+            "graph+flags" => (true, false),
+            "graph+flags+stager" => (true, true),
+            a => panic!("GLM_STAGER_PROFILE_ARM={a:?}: flags | flags+stager | graph+flags | graph+flags+stager"),
+        };
+        let g = geo8();
+        let s = synth_model(&g, REC);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let prompt = [3i64, 17, 101, 999, 5];
+        let (warm, rows) = (3usize, 8usize);
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut run = Glm5Run::load(&mut cnq, &g, &moe, prompt.len() + warm + rows, &mut |s| eprintln!("{s}"));
+            run.set_graph(graph);
+            run.set_switches(&mut cnq, Switches { flags: true, lookahead: false });
+            let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, TierSizes { vram: 3, pinned: 4 }, 1, g.topk).unwrap();
+            tiers.set_stager(stager).unwrap();
+            run.kda_states().for_each(|k| k.reset());
+            let mut tok = 0i64;
+            for (pos, &p) in prompt.iter().enumerate() {
+                if let Some(id) = run.row(&mut cnq, &mut tiers, p, pos, pos + 1 == prompt.len()).unwrap() {
+                    tok = id;
+                }
+            }
+            let mut pos = prompt.len();
+            for _ in 0..warm {
+                tok = run.row(&mut cnq, &mut tiers, tok, pos, true).unwrap().unwrap();
+                pos += 1;
+            }
+            cuda::sync();
+            let (reads0, moves0) = (tiers.nvme_reads, tiers.moves.iter().map(|m| m.h2d() + m.vram_to_stage + m.stage_to_vram + m.vram_to_pinned).sum::<u64>());
+            let st0 = tiers.stager_stats().unwrap_or_default();
+            crate::glm5_graph::profiler(true);
+            let t0 = std::time::Instant::now();
+            for _ in 0..rows {
+                tok = run.row(&mut cnq, &mut tiers, tok, pos, true).unwrap().unwrap();
+                pos += 1;
+            }
+            crate::glm5_graph::profiler(false);
+            let copies = tiers.moves.iter().map(|m| m.h2d() + m.vram_to_stage + m.stage_to_vram + m.vram_to_pinned).sum::<u64>() - moves0;
+            let st = tiers.stager_stats().unwrap_or_default();
+            eprintln!(
+                "glm5 stager profile arm {arm}: {rows} decode rows in {:.4} s (synthetic model, V 3 P 4); NVMe reads {}, record copies {copies}; stager calls {}, landed reads {}, gate syncs {}",
+                t0.elapsed().as_secs_f64(),
+                tiers.nvme_reads - reads0,
+                st.calls - st0.calls,
+                st.landed_reads - st0.landed_reads,
+                st.gate_syncs - st0.gate_syncs
+            );
+            tiers.free();
+            run.free();
+        }
+        drop(cnq);
     }
 }
