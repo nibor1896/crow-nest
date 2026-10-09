@@ -296,6 +296,13 @@ pub fn attn_splits(t: usize) -> usize {
     (16 / t.max(1)).max(1)
 }
 
+/// the `idx_scores` grid of [`MlaScratch::select`] for rows `pos0 .. pos0 + t` (0 = not launched):
+/// the one launch shape of a decode row that depends on the position (#190: `CROW_GLM_GRAPH`
+/// keys its captured row on it)
+pub fn score_grid(pos0: usize, t: usize) -> usize {
+    ((pos0 + t) / KPOOL).div_ceil(32)
+}
+
 /// The scratch of one call shape (at most `max_t` rows against caches of `cap` tokens) and the
 /// stage launches. Every stage queues on the current stream and reads the call set by [`begin`].
 ///
@@ -380,7 +387,16 @@ impl MlaScratch {
         assert!(pos0 + t <= self.cap, "glm5_mla: rows {pos0}..{} beyond the cache of {}", pos0 + t, self.cap);
         self.t = t;
         self.pos0 = pos0;
-        cuda::to_i32_into(self.st, &[pos0 as i32, t as i32]);
+        // #190: inside a CROW_GLM_GRAPH capture the row staged `st` already (a host upload would
+        // be captured from this stack array and replayed stale)
+        if !crate::glm5_graph::capturing() {
+            cuda::to_i32_into(self.st, &[pos0 as i32, t as i32]);
+        }
+    }
+
+    /// #190: the device `[pos0, t]` the call's kernels read (`CROW_GLM_GRAPH` stages it per row)
+    pub fn st_dev(&self) -> CUdeviceptr {
+        self.st
     }
 
     /// `y[tok][0..n]` (row stride `ldy`) `= W x[tok]` (row stride `ldx`), W BF16 `[n][k]`
@@ -428,9 +444,9 @@ impl MlaScratch {
     /// # Safety
     /// As [`MlaScratch::store_latent`].
     pub unsafe fn select(&self, kn: &MlaKernels, w: &MlaWeights, c: &MlaCache) {
-        let ncb_hi = (self.pos0 + self.t) / KPOOL;
-        if ncb_hi > 0 {
-            launch_v(kn.idx_scores, ncb_hi.div_ceil(32) as u32, self.t.div_ceil(16) as u32, 1, 256, &[
+        let gx = score_grid(self.pos0, self.t);
+        if gx > 0 {
+            launch_v(kn.idx_scores, gx as u32, self.t.div_ceil(16) as u32, 1, 256, &[
                 self.iq, self.ip, c.index, w.idx_ape, self.scores, (self.cap / KPOOL) as u64, self.st]);
         }
         launch_v(kn.sel_prep, self.t.div_ceil(256) as u32, 1, 1, 256, &[self.ncb, self.pos, self.st]);

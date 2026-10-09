@@ -407,7 +407,8 @@ units, about 12 hot experts per layer), and the post-plan check below requires
 > buffer or straight into a freed pinned slot. The hand-off is host-synchronous: after each MoE layer's
 > router the host reads the 8 ids, moves the records (staging, pinned entrants, VRAM entrants, in that
 > order) and writes the layer's `[288]` record table; the MUL1 kernels read VRAM records or pinned
-> records zero-copy. No job ring, no `cuStreamWaitValue`, no graph. Flash-Next and the 27B do not reach
+> records zero-copy. No job ring, no `cuStreamWaitValue`; with `CROW_GLM_GRAPH=1` (#190, default off)
+> the launches between two routers replay as one CUDA graph (`docs/glm5-model.md` 6.3). Flash-Next and the 27B do not reach
 > it (gate R). The A9 requirement for this path is that the cache size never changes the output:
 > `glm5_tiers_gpu_cache_size_is_invisible_in_the_logits` (ids and logits bit-identical at the plan's
 > sizes, 1 + 7 and 0 + 0), built, not run on the real container yet. `docs/glm5-model.md` section 6.

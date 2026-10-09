@@ -46,7 +46,7 @@ fn graph_lib() -> &'static libloading::Library {
     })
 }
 
-unsafe fn graph_sym<T: Copy>(name: &[u8]) -> T {
+pub(crate) unsafe fn graph_sym<T: Copy>(name: &[u8]) -> T {
     unsafe {
         let lib = graph_lib();
         *lib.get(name).unwrap_or_else(|e| panic!("graph symbol missing in {DRIVER_LIB}: {e}"))

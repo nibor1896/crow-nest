@@ -400,6 +400,65 @@ Each was shown red against a broken mechanism: the host not waiting for the flag
 then `CUDA_ERROR_ILLEGAL_ADDRESS`), the id read before a sync point (ids shifted by one row), the
 gather writing one stream (12,285 of 16,384 values differ).
 
+### 6.3 Decode rows as CUDA graphs (`CROW_GLM_GRAPH`, #190)
+
+Default off; off, the row is the one before it call for call (`glm5_graph`'s hooks are no-ops).
+On, `Glm5Run` captures a row's launches into piecewise CUDA graphs and replays them; `glm5_run`
+prints `[glm5_run] CROW_GLM_GRAPH on: ...` at load. Applies to `generate` (with or without the two
+switches of 6.2) and to `row` (serve).
+
+- **Segments**, cut at the only host hand-off of a row, the MoE router: segment 0 = every layer
+  before the first MoE layer and that layer up to `route`; segment m = MoE layer m-1's `experts` +
+  expand and every layer up to MoE layer m's `route`; the last = the last `experts` + expand. The
+  head is one graph (3 kernels). GLM-5.3-Flash: 42 MoE layers, so 43 row graphs + the head.
+- **What still needs the host per MoE layer** (unchanged): the router ids (`glm5_model::router_ids`:
+  stream sync + copy, or the 6.2 flag) and `ExpertTiers::table_for` (staging, its syncs, the table
+  upload). The embedding upload per row stays eager too.
+- **Capture**: the row's eager body runs with a capture open on a non-blocking stream
+  (thread-local capture mode); at each router `call_inner` closes the segment, which is checked
+  (kernel nodes only, else refused by name), instantiated and launched on the legacy stream; the
+  hand-off runs eagerly; the next segment opens. Replay launches the same segments around the same
+  hand-off. Graphs run on the legacy stream, so the eager copies and syncs stay ordered with them.
+- **Per-row inputs**: the position reaches the kernels through the MLA scalars `[pos, 1]`, written
+  once per row from pinned memory (`RowGraphs::stage`; `MlaScratch::begin` skips its own upload
+  inside a capture). The one position-dependent launch shape, the `idx_scores` grid
+  (`glm5_mla::score_grid`, 0 below position 3, +1 every 128 positions), and the record tables'
+  addresses key the captured row. Up to 8 captured rows are kept, least recently used out
+  (`glm5_graph::KEYS`): a key seen before replays, only a new key captures (a new sequence over
+  positions already seen: none). Cost: 4 kept rows of 266 kernel nodes (synthetic model) dropped
+  free VRAM by 4 MiB against 0 with one kept row; a GLM-5.3-Flash row has about 6x the nodes; host
+  memory not measured. The t = 1 FFN plans are made before the first capture (`Glm5Pass::ensure_plans`).
+- **Refused**: with `CROW_GLM_CPU_LANE=1` (its host work sits inside a segment); a replayed seam
+  whose table moved.
+
+Counts (nsys `cuda_api_sum`, 2026-10-09, RTX 5090, #190 commit, test `glm5_graph_gpu_profile_rows`:
+the synthetic 8-layer model below, every record in VRAM, 8 steady decode rows at positions 8-15
+under `--capture-range=cudaProfilerApi`, per row):
+
+| arm | `cuLaunchKernel` | `cuGraphLaunch` | `cuStreamSynchronize` | `cuMemcpyHtoDAsync` | `cuMemcpyDtoH` |
+|---|---|---|---|---|---|
+| off | 269 | 0 | 19 | 8 | 6 |
+| `CROW_GLM_GRAPH=1` | 0 | 7 | 17 | 7 | 6 |
+| `CROW_GLM_GRAPH=1` + `CROW_GLM_FLAGS=1` | 5 (publish) | 7 | 12 | 7 | 1 |
+
+The 2 syncs fewer are the 2 DSA layers' scalar uploads; the 6 row graphs + the head replace 266 + 3
+kernel launches. No speed figure: synthetic weights, 8 rows.
+
+Tests (`cargo test --release --lib glm5_graph -- --ignored --nocapture --test-threads 1`): host
+`only_1_turns_the_graph_switch_on`, `the_score_grid_is_select_s_launch_shape`; GPU
+`glm5_graph_gpu_the_graphs_are_invisible_in_ids_logits_and_reports` (a synthetic 8-layer glm5_next
+container with the real layer shapes: layers 0-2 KDA + dense, 3-7 MoE with 16 MUL1 records each, DSA
+at 3 and 7, vocab 2048; 5 + 6 ids, V 3 + P 4; the graph alone, with the flags, with both 6.2
+switches: the switch-off ids, logits bit for bit and row reports except the clock; `row` too; 2
+captures and 8 replays over the 10 rows). Shown red against: the per-row position staging removed
+(ids `[1931, 2010, ..]` instead of `[998, 1709, ..]`), the MLA upload left inside the capture
+(refused: "segment 0 captured a graph node of type 1"), the score-grid key removed (1 capture, 9
+replays, 264 kernel nodes instead of 266; the ids stay equal there: 10 tokens are far below the
+selection's 2,051 (`sel_max`), so the pool scores cannot exclude any; inferred, not traced).
+`glm5_graph_gpu_seen_keys_replay_without_recapture`: two sequences of 5 + 266 ids on one store
+(rows 0-269, score grid 0 to 3): 4 captures in the first, none in the second, ids and logits bit
+for bit as switch-off; red with one kept row (8 captures, 532 replays instead of 4, 536).
+
 ## 7. Not verified
 
 - Whether the `--chain` drift (routing flips compounding f32 rounding over depth) is the size HF's own
@@ -411,6 +470,8 @@ gather writing one stream (12,285 of 16,384 values differ).
 - `glm5_run`'s timings and counters on the real container and the reps/reset logits test (section
   6.1, #187): built, not run; no baseline figure exists.
 - The decode switches (section 6.2) on the real container: built, not run; no speed figure.
+- `CROW_GLM_GRAPH` (section 6.3) on the real container: not run (ids, launches per row, speed);
+  a position past 2,051 tokens, where a stale `idx_scores` grid would change the selection: not run.
 - #188 `CROW_GLM_PINNED=zerocopy` and `CROW_GLM_CPU_LANE=1` on the real container: not run (speed,
   ids, G3 cosine); how far the CPU lane overlaps the GPU's experts, the idle pool workers' spin
   against the GPU host thread, and the GPU's zero-copy rate from a cacheable pinned tier on Windows:

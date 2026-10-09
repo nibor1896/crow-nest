@@ -43,6 +43,7 @@ use crate::cuda::{self, Pinned};
 use crate::expert_cache::{self, ExpertCache, Scope, Tier};
 use crate::geo::{ExpertRecordSpec, Glm5Geo};
 use crate::glm5_flags::{self, Feed, Readback, Routed, Switches};
+use crate::glm5_graph;
 use crate::glm5_head::Head;
 use crate::glm5_kda::{KdaDims, KdaState};
 use crate::glm5_mla::{MlaCache, MlaDims};
@@ -721,6 +722,11 @@ impl ExpertTiers {
         Ok((self.tables[l], served))
     }
 
+    /// #190: the device record table of every MoE layer (the buffers `table_for` rewrites)
+    pub fn tables(&self) -> &[Dev] {
+        &self.tables
+    }
+
     /// #188: the CPU lane's clock (wall time of its pool runs, experts, runs) since construction,
     /// shared: a report callback reads it while `generate` holds the tiers
     pub fn cpu_lane_clock(&self) -> std::sync::Arc<crate::glm5_moe::lane::Clock> {
@@ -826,6 +832,8 @@ pub struct Glm5Run {
     sw_kernels: Option<glm5_flags::Kernels>,
     feed: Option<Feed>,
     readback: Option<Readback>,
+    /// #190 (`CROW_GLM_GRAPH=1`): the row's and the head's captured graphs (`None` when off)
+    graph: Option<glm5_graph::RowGraphs>,
 }
 
 /// #189: a row whose greedy id the host has not read yet (`CROW_GLM_LOOKAHEAD`)
@@ -909,13 +917,40 @@ impl Glm5Run {
             sw_kernels: None,
             feed: None,
             readback: None,
+            graph: None,
         };
         let sw = Switches::from_env();
         if sw != Switches::default() {
             run.set_switches(cnq, sw);
             log(&format!("[glm5_run] decode switches: {}{}", sw.label(), run.feed.as_ref().map_or(String::new(), |f| format!("; lookahead embedding table {} B in VRAM (generate only)", f.bytes))));
         }
+        if glm5_graph::on_from_env() {
+            run.set_graph(true);
+            log(&format!("[glm5_run] {} on: decode rows as piecewise CUDA graphs, one segment per MoE router + 1, the head one graph", glm5_graph::ENV));
+        }
         run
+    }
+
+    /// #190: `CROW_GLM_GRAPH` on or off (`load` takes it from the environment); off frees the
+    /// graphs and the capture stream.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch of this run is pending.
+    pub unsafe fn set_graph(&mut self, on: bool) {
+        match (on, self.graph.is_some()) {
+            (true, false) => self.graph = Some(glm5_graph::RowGraphs::new()),
+            (false, true) => {
+                if let Some(mut gr) = self.graph.take() {
+                    gr.free();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// #190: the graphs and their counters, when `CROW_GLM_GRAPH` is on
+    pub fn graphs(&self) -> Option<&glm5_graph::RowGraphs> {
+        self.graph.as_ref()
     }
 
     /// the decode switches in force
@@ -1055,7 +1090,7 @@ impl Glm5Run {
                 report(&base.report(tiers, pos, true, None, t0));
                 continue;
             }
-            gm::run_head(&self.pass.kn, &self.head, &self.hw, self.x, self.normed, self.logits, self.next, 1);
+            self.head_row()?;
             rb.enqueue(self.next, keep_logits.then_some(self.logits));
             let p = Pending { pos, prompt: pos < pn, t0, base };
             if pos + 1 < rows {
@@ -1084,9 +1119,89 @@ impl Glm5Run {
     /// the row's first MoE layer after its routing reached the host and before the store moves
     /// anything (the lookahead reads the previous row's id there).
     ///
+    /// #190: with `CROW_GLM_GRAPH` the row is replayed from its captured segments, or captured
+    /// from [`Glm5Run::layers_eager`] when there are none for this position's key.
+    ///
     /// # Safety
     /// A CUDA context is current; `tiers` belongs to this model.
     unsafe fn layers(&mut self, tiers: &mut ExpertTiers, pos: usize, first: &mut dyn FnMut(&ExpertTiers) -> Result<(), String>) -> Result<(), String> {
+        let Some(gr) = self.graph.as_mut() else {
+            return self.layers_eager(tiers, pos, first);
+        };
+        if tiers.pinned_use.cpu_lane {
+            return Err(format!("{}=1 and {CPU_LANE_ENV}=1: the CPU lane computes experts on the host inside the post-router segment; turn one of them off", glm5_graph::ENV));
+        }
+        gr.stage(self.pass.mla_st(), pos);
+        if moe_layers(&self.g) == 0 {
+            // the pinned scalars are rewritten next row: no router wait orders that after this copy
+            cuda::sync();
+        }
+        let key = glm5_graph::Key { score_grid: crate::glm5_mla::score_grid(pos, 1), tables: tiers.tables().to_vec() };
+        if gr.promote(&key) {
+            return self.replay(tiers, pos, first);
+        }
+        let stream = gr.stream;
+        self.pass.ensure_plans(1);
+        glm5_graph::begin_row(stream);
+        if let Err(e) = self.layers_eager(tiers, pos, first) {
+            glm5_graph::abort_row();
+            return Err(e);
+        }
+        let c = glm5_graph::end_row().map_err(|e| format!("glm5_run: row {pos}: {e}"))?;
+        self.graph.as_mut().expect("glm5_run: the graphs went away during a capture").keep(key, c);
+        Ok(())
+    }
+
+    /// #190: one row from the captured segments: segment 0, then per MoE layer its router ids to
+    /// the host, `first` (once), `table_for`, the next segment
+    ///
+    /// # Safety
+    /// As [`Glm5Run::layers`]; the row's graphs are ready for this position's key and `st` is staged.
+    unsafe fn replay(&mut self, tiers: &mut ExpertTiers, pos: usize, first: &mut dyn FnMut(&ExpertTiers) -> Result<(), String>) -> Result<(), String> {
+        let gr = self.graph.as_mut().expect("glm5_run: replay without graphs");
+        gr.replays += 1;
+        let c = gr.current().expect("glm5_run: replay without a captured row");
+        glm5_graph::launch(c, 0);
+        for (i, s) in c.seams.iter().enumerate() {
+            let ids = gm::router_ids(self.pass.routed.as_mut(), s.ids, s.n, s.layer).map_err(|e| format!("glm5_run: row {pos} layer {}: {e}", s.layer))?;
+            if i == 0 {
+                first(&*tiers).map_err(|e| format!("glm5_run: row {pos} layer {}: {e}", s.layer))?;
+            }
+            let (tb, _) = tiers.table_for(s.layer, &ids).map_err(|e| format!("glm5_run: row {pos} layer {}: {e}", s.layer))?;
+            if tb != s.table {
+                return Err(format!("glm5_run: row {pos} layer {}: {}: the record table moved from {:#x} to {tb:#x} after the capture", s.layer, glm5_graph::ENV, s.table));
+            }
+            glm5_graph::launch(c, i + 1);
+        }
+        Ok(())
+    }
+
+    /// #190: the head on `x` (greedy id into `next`); with `CROW_GLM_GRAPH` one graph, captured
+    /// on its first use
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn head_row(&mut self) -> Result<(), String> {
+        let Some(gr) = self.graph.as_mut() else {
+            gm::run_head(&self.pass.kn, &self.head, &self.hw, self.x, self.normed, self.logits, self.next, 1);
+            return Ok(());
+        };
+        if let Some(c) = gr.head.as_ref() {
+            glm5_graph::launch(c, 0);
+            return Ok(());
+        }
+        glm5_graph::begin_row(gr.stream);
+        gm::run_head(&self.pass.kn, &self.head, &self.hw, self.x, self.normed, self.logits, self.next, 1);
+        gr.head = Some(glm5_graph::end_row().map_err(|e| format!("glm5_run: head: {e}"))?);
+        gr.head_captures += 1;
+        Ok(())
+    }
+
+    /// [`Glm5Run::layers`], every launch eager (with a capture open, into its segments).
+    ///
+    /// # Safety
+    /// A CUDA context is current; `tiers` belongs to this model.
+    unsafe fn layers_eager(&mut self, tiers: &mut ExpertTiers, pos: usize, first: &mut dyn FnMut(&ExpertTiers) -> Result<(), String>) -> Result<(), String> {
         let mut seen = false;
         for l in 0..self.g.layers {
             if let Some(s) = self.kda[l].as_mut() {
@@ -1141,6 +1256,9 @@ impl Glm5Run {
         }
         if let Some(k) = self.sw_kernels.as_mut() {
             k.free();
+        }
+        if let Some(mut gr) = self.graph.take() {
+            gr.free();
         }
     }
 }
@@ -1917,7 +2035,7 @@ impl Glm5Run {
             cuda::sync();
             return Ok(None);
         }
-        gm::run_head(&self.pass.kn, &self.head, &self.hw, self.x, self.normed, self.logits, self.next, 1);
+        self.head_row()?;
         cuda::sync();
         Ok(Some(cuda::dtoh_i32(self.next, 1)[0] as i64))
     }
