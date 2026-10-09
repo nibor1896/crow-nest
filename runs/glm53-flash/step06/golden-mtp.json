@@ -1,0 +1,258 @@
+{
+ "issue": "crow-nest #182: MTP (NextN, layer 45) golden on the 3-bit container, first draft-agreement indication",
+ "date": "2026-10-09",
+ "wall_s": 89.2,
+ "wall_note": "bash `time` of the whole command",
+ "machine": "Windows 11, 63.38 GiB RAM, CPU only; torch 2.13.0+cpu, transformers 5.16.1, threads 16",
+ "commit": "90d3be6",
+ "command": "ORACLE_THREADS=16 .venv-oracle/Scripts/python.exe -I oracle/glm5_mtp.py run --weights container converter/GLM-5.3-Flash-MUL1K3.cnq --fallback fp8-originals models/GLM-5.3-Flash-original --trunk models/GLM-5.3-Flash-step06/ref-mul1-all --out models/GLM-5.3-Flash-step06/ref-mul1-mtp",
+ "rc": 0,
+ "out_dir": "models/GLM-5.3-Flash-step06/ref-mul1-mtp",
+ "manifest_sha256": "eaffa03a92bcf20e20ccb878ffd8ad671122c786e3b01eceee90d568a7ffc13d",
+ "weights": {
+  "experts": "288 MUL1 K=3 records of section mtp in GLM-5.3-Flash-MUL1K3.cnq (identity Hessian, #182), decoded by converter dequant",
+  "rest_of_layer_45": "25 tensors from the FP8 originals (not in the container): eh_proj.weight, enorm.weight, hnorm.weight, input_layernorm.weight, mlp.gate.e_score_correction_bias, mlp.gate.weight, mlp.shared_experts.down_proj.weight, mlp.shared_experts.gate_proj.weight, mlp.shared_experts.up_proj.weight, post_attention_layernorm.weight, self_attn.indexer.index_kpool_compress_ape, self_attn.indexer.index_kpool_compress_gate, self_attn.indexer.k_norm.bias, self_attn.indexer.k_norm.weight, self_attn.indexer.weights_proj.weight, self_attn.indexer.wk.weight, self_attn.indexer.wq_b.weight, self_attn.kv_a_layernorm.weight, self_attn.kv_a_proj_with_mqa.weight, self_attn.kv_b_proj.weight, self_attn.o_proj.weight, self_attn.q_a_layernorm.weight, self_attn.q_a_proj.weight, self_attn.q_b_proj.weight, shared_head.norm.weight",
+  "from_primary": 864,
+  "from_fallback": 25,
+  "container_index_json_sha256": "56741348e106d9e7b0a911afee846b8ca2b1152156fd78b6e443b6f3c0061612",
+  "fp8_index_json_sha256": "3c3f40366a53c3fd7974b4eab7881a365a98c2a4329150befebab99fe7c18b05"
+ },
+ "trunk": {
+  "dir": "C:\\Users\\robin\\dev\\crow-nest\\models\\GLM-5.3-Flash-step06\\ref-mul1-all",
+  "manifest_sha256": "420494b12ed2215a0db0fd1e0f37bbf1e60fdb22b4f15a4aae1148b7ae5a82a0",
+  "head_norm": "3413a72a3d45cc3bbf52b35d18c95f8cf16880a54dfa1c55525ec54bfb9d8baa",
+  "head_logits": "1804625d749c81130dcf2a80d1b2b7e8d3f61a16830cd52e2a5fd01f8459855e",
+  "weights_index_json_sha256": "56741348e106d9e7b0a911afee846b8ca2b1152156fd78b6e443b6f3c0061612"
+ },
+ "ids": {
+  "path": "runs/glm53-flash/step06/ids.json",
+  "N": 90,
+  "T": 86,
+  "D": 4,
+  "draft_rows": 89
+ },
+ "pairing": "draft row i = (embed(ids[i+1]), trunk head-norm row i) at position i of the block's own cache; drafts ids[i+2]; compared with the trunk's argmax at row i+1",
+ "timing_s": {
+  "load": 62.1,
+  "lm_head": 6.1,
+  "variants": 4.7
+ },
+ "rss_after_load_gib": 28.28,
+ "peak_wset_gib": 33.006,
+ "draft_top1_agreement": {
+  "sglang": {
+   "all": {
+    "rows": 89,
+    "agree": 55,
+    "rate": 0.618
+   },
+   "prompt": {
+    "rows": 85,
+    "agree": 55,
+    "rate": 0.6471
+   },
+   "decode": {
+    "rows": 4,
+    "agree": 0,
+    "rate": 0.0
+   },
+   "pos0": "keep",
+   "order": "eh",
+   "h": "norm"
+  },
+  "vllm": {
+   "all": {
+    "rows": 89,
+    "agree": 57,
+    "rate": 0.6404
+   },
+   "prompt": {
+    "rows": 85,
+    "agree": 57,
+    "rate": 0.6706
+   },
+   "decode": {
+    "rows": 4,
+    "agree": 0,
+    "rate": 0.0
+   },
+   "pos0": "zero_embed",
+   "order": "eh",
+   "h": "norm"
+  },
+  "llamacpp": {
+   "all": {
+    "rows": 89,
+    "agree": 56,
+    "rate": 0.6292
+   },
+   "prompt": {
+    "rows": 85,
+    "agree": 56,
+    "rate": 0.6588
+   },
+   "decode": {
+    "rows": 4,
+    "agree": 0,
+    "rate": 0.0
+   },
+   "pos0": "lead_row",
+   "order": "eh",
+   "h": "norm"
+  },
+  "paper-order": {
+   "all": {
+    "rows": 89,
+    "agree": 0,
+    "rate": 0.0
+   },
+   "prompt": {
+    "rows": 85,
+    "agree": 0,
+    "rate": 0.0
+   },
+   "decode": {
+    "rows": 4,
+    "agree": 0,
+    "rate": 0.0
+   },
+   "pos0": "keep",
+   "order": "he",
+   "h": "norm"
+  },
+  "prenorm-h": {
+   "all": {
+    "rows": 89,
+    "agree": 52,
+    "rate": 0.5843
+   },
+   "prompt": {
+    "rows": 85,
+    "agree": 52,
+    "rate": 0.6118
+   },
+   "decode": {
+    "rows": 4,
+    "agree": 0,
+    "rate": 0.0
+   },
+   "pos0": "keep",
+   "order": "eh",
+   "h": "mean"
+  }
+ },
+ "draft_vs_text_next_id": "33 of 88 rows (the trunk's own next pick: also 33 of 88)",
+ "engine_glue_check": "glm5_mtp_glue_matches_the_oracle_golden: host twin (eh_norm + eh_proj from the checkpoint's BF16 enorm/hnorm/eh_proj) vs mtp-eh.f32 over 89 rows: max abs 2.775e-6, rel rms 3.595e-7",
+ "files": {
+  "mtp-embed.f32": {
+   "shape": [
+    89,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "d02c006cf4e16632aa860fe1d71c10e865a71559f189facc8b501ae52c84a251"
+  },
+  "mtp-h.f32": {
+   "shape": [
+    89,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "a21b8b343b2ca6ace22c0f00b9dd48b450b3d9ead35928a5607674fb7b3faced"
+  },
+  "mtp-eh.f32": {
+   "shape": [
+    89,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "ee9a2ad967c7b173207a9c1722bb4204c45c35cc916a4f8276de190f228b9e26"
+  },
+  "mtp-attn-out.f32": {
+   "shape": [
+    89,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "e9b3b8962e2eba15526459c2ecbddaafaf6e3ae3d5bd2943cf2bc4f866763977"
+  },
+  "mtp-ffn-in.f32": {
+   "shape": [
+    89,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "70e312bff3cd576bb783683325ba7fb09a1fd5f75df12a9495ac85679b316c35"
+  },
+  "mtp-ffn-out.f32": {
+   "shape": [
+    89,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "92f4904a14e2f9fd543cedd3ee7944ad4cb24ec1803e7385a8d14b100f1f3abb"
+  },
+  "mtp-out.f32": {
+   "shape": [
+    89,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "2da28fc227d30d5aa758116c8af6419e64da3928a2996d3e09d33e8ac66d7b36"
+  },
+  "mtp-head-norm.f32": {
+   "shape": [
+    89,
+    4096
+   ],
+   "dtype": "f32",
+   "sha256": "6a1df19a72e2ae10412119bf6886adeea2571bbc135f387bdeb943bfd6d6d3e8"
+  },
+  "mtp-logits.f32": {
+   "shape": [
+    89,
+    154880
+   ],
+   "dtype": "f32",
+   "sha256": "18c14ffc967ca4007cea3e83dc52ceaa1ba37e46cadb32360efa38b214f369a1"
+  },
+  "mtp-routing-ids.i32": {
+   "shape": [
+    89,
+    8
+   ],
+   "dtype": "i32",
+   "sha256": "ea56ea64b0ce93ad47896405ded0992e759b77a4239620711a793b7dfd41c2eb"
+  },
+  "mtp-routing-weights.f32": {
+   "shape": [
+    89,
+    8
+   ],
+   "dtype": "f32",
+   "sha256": "2dca9db9c82ac795b21d2d1351cc0c5c92bcee8c2a516fb20637d1f3e9bee940"
+  },
+  "mtp-dsa-topk.i32": {
+   "shape": [
+    89,
+    2051
+   ],
+   "dtype": "i32",
+   "sha256": "3161160fdc564a0611718e2d87dfbd226eb2edbcb4b77f04d4ae4aaf637cc4d1"
+  },
+  "mtp-draft-top1.i32": {
+   "shape": [
+    89
+   ],
+   "dtype": "i32",
+   "sha256": "db7ae27e2f607c7eb95de94e543546d8ec7a6118079c40205576cf87f5d558b2"
+  },
+  "trunk-next-top1.i32": {
+   "shape": [
+    89
+   ],
+   "dtype": "i32",
+   "sha256": "491a217e6e76b49c4daf8782beb2a6355dca7cabb1e385878a48f9ab1a0935a5"
+  }
+ }
+}

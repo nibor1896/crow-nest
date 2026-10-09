@@ -304,6 +304,12 @@ Absent: any `hc_*` tensor (the block has no mHC), `embed_tokens`, `shared_head.h
 [r"layers\.45\.", r"layers\.\d+\.shared_head\."]`, `M:1359`) and has no MTP forward. There is no HF golden for MTP
 (open point O1).
 
+**Forward (crow-nest #182, 2026-10-09):** the formula the serving stacks run (vLLM, SGLang, llama.cpp PR #29928 at
+`b9acf138`) is `n = shared_head.norm(z)`, `z = y + MoE(post_attention_layernorm(y))`, `y = x + MLA_DSA(input_layernorm(x))`,
+`x = eh_proj([enorm(embed(t_{i+1})) | hnorm(h_i)])` with `h_i` the trunk's post-final-norm row and the trunk's `lm_head`
+on `n`; one stream, no mHC, the block's own full indexer and cache. Sources, the differences between them (row 0, the
+paper's concat order) and the reference are [glm5-mtp.md](glm5-mtp.md); the reference is `oracle/glm5_mtp.py`, not HF.
+
 ## 12. HF vs llama.cpp (`649dcb103`) — differences
 
 HF applies in every row. Rows marked *equivalent* are reformulations with identical math (different rounding); they matter for
@@ -319,7 +325,7 @@ tolerances and for the cache layout, not for the result.
 | D6 | KDA prefill chunk | 64 (`M:488`) | 16 for KDA (`dn:61`) | equivalent (exact chunk algebra) |
 | D7 | KDA conv state | last 4 pre-conv rows, model dtype (`CU:1066-1069`) | last 3 = `d_conv − 1` rows, F32, plus `n_rs_seq` rollback copies (`g5:203-226`, `lm:2476-2477`) | equivalent |
 | D8 | DSA mask | top-k mask only (`M:1230-1246`) | top-k mask + causal `kq_mask` (`g5:905-907`) | equivalent (the indexer returns causal indices only) |
-| D9 | MTP | block dropped, no forward (`M:1359`) | block loaded (`g5:177-184`), MTP graph throws "not implemented yet" (`g5:189-191`); MTP memory = one DSA layer with its own indexer (`lm:2458-2463`); the draft head would be fed the post-`output_norm` hidden state (`g5:666-670`) | no reference on either side → O1 |
+| D9 | MTP | block dropped, no forward (`M:1359`) | block loaded (`g5:177-184`), MTP graph throws "not implemented yet" (`g5:189-191`); MTP memory = one DSA layer with its own indexer (`lm:2458-2463`); the draft head would be fed the post-`output_norm` hidden state (`g5:666-670`). Since PR #29928 (`b9acf138`, 2026-10-07) the graph exists: [glm5-mtp.md](glm5-mtp.md) | HF has no reference; the formula of record is the serving stacks' (#182, O1) |
 | D10 | stored precision (recipe, not math) | FP8 for q_a, q_b, kv_a_proj_with_mqa, o_proj (DSA), dense MLP, all experts (sections 7, 10; dequant `FP8:1003-1048`); the rest BF16*, four kept f32 at run time (`M:1358`) | converter forces `hc_*`, kpool gate/ape, `ssm_a`, `ssm_dt`, `exp_probs_b` to F32 (`glm.py:575-579`); `llama-quant.cpp` never quantises `hc_*`, indexer, `ssm_f_*`, `ssm_g_*`, `ssm_beta`, `attn_kv_a_mqa`, `attn_k_b`, `attn_v_b`, and keeps `attn_q_a`, `attn_q_b`, `nextn.eh_proj` at Q8_0 or higher | input for the step-4 keep set |
 | D11 | parameter representation | `A_log`, `dt_bias` as stored (`M:315`, `M:314`) | `ssm_a = −exp(A_log)` (`glm.py:562-564`), `dt_bias` → `ssm_dt.bias` (`glm.py:566-567`), forget gate `sigmoid(−(g·ssm_a))·lb` (`g5:709-719`) | equivalent |
 
@@ -376,6 +382,13 @@ Activations between layers are 4 streams × 4096 = 16,384 values per token (`M:1
   inputs of `eh_proj` (DeepSeek-V3 convention would be `eh_proj([enorm(embed(t+1)) | hnorm(h_t)])`), which `h_t` (llama.cpp
   feeds post-`norm`, `g5:666-670`), how a block without `hc_*` tensors joins a 4-stream trunk, what
   `index_share_for_mtp_iteration` means. Step 21 needs a source of record before any MTP kernel.
+  **Settled 2026-10-09 (crow-nest #182)** from vLLM, SGLang and llama.cpp PR #29928 (`b9acf138`): `eh_proj([enorm(e) |
+  hnorm(h)])`, embedding first (the DeepSeek-V3 paper writes h first; every code base puts e
+  first, and h first gives 0 / 89 draft agreement on the real weights), `h` = the trunk's post-`norm` row, a plain pre-norm residual layer on one stream (no mHC),
+  `shared_head.norm` then the trunk's `lm_head`; `index_share_for_mtp_iteration` = draft steps 1+ reuse step 0's
+  top-k of the block's own indexer. Still open: no vendor golden (the reference is `oracle/glm5_mtp.py` over HF's
+  blocks); the stacks differ at row 0 (vLLM zeroes its embedding, llama.cpp prepends a `(t_0, 0)` row). Details
+  [glm5-mtp.md](glm5-mtp.md).
 - **O2 stored dtypes.** idx has no dtypes; the non-FP8 tensors are BF16 per cfg `dtype`, but A_log, dt_bias,
   e_score_correction_bias, `hc_*`, conv weights, norms and the `weight_scale_inv` tensors may be F32 on disk. The byte balance
   leaves 1,127,845,052 B for the vision tower plus anything wider than BF16. The converter (steps 4/5) reads the safetensors

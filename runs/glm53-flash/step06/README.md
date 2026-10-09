@@ -139,3 +139,37 @@ all 4 streams x 90 rows x 4096). Reported, not gated:
 
 Layer 3: routed top-8 overlap 0.910 on average (min 0.625), 39 of 90 rows the same set; DSA selections identical on
 90 / 90 rows. G3 itself (`decode glmgolden models/GLM-5.3-Flash-step06/ref-mul1`) needs the GPU and was not run.
+
+## MTP golden on the 3-bit container (2026-10-09, #182)
+
+The MTP block (checkpoint layer 45) on the same 90 ids: `oracle/glm5_mtp.py` (formula of record and sources in
+`docs/glm5-mtp.md`) over the trunk dir `models/GLM-5.3-Flash-step06/ref-mul1-all` (the full 45-layer pass on the
+3-bit container with `--capture-head`, #165: `head-norm.f32` is the trunk's post-final-norm row, `head-logits.f32` its
+logits). The block's 288 experts come from the container (section `mtp`, MUL1 K=3, identity Hessian); its other 25
+tensors are not in the container and come from the FP8 originals.
+
+```
+ORACLE_THREADS=16 .venv-oracle/Scripts/python.exe -I oracle/glm5_mtp.py run --weights container converter/GLM-5.3-Flash-MUL1K3.cnq \
+  --fallback fp8-originals models/GLM-5.3-Flash-original --trunk models/GLM-5.3-Flash-step06/ref-mul1-all \
+  --out models/GLM-5.3-Flash-step06/ref-mul1-mtp
+```
+
+rc 0, 89 s wall (load 62.1 s, lm_head 6.1 s, five variants 4.7 s), RSS after the load 28.28 GiB, peak working set
+33.0 GiB. 89 draft rows (row i = embed(ids[i+1]) with trunk row i, drafts ids[i+2]), 14 files, manifest sha256
+`eaffa03a…ffc13d`; record with every file's sha256: `golden-mtp.json` (copy in the golden dir as `evidence.json`).
+
+Draft top-1 = the trunk's own top-1 for the same id (first acceptance indication, reported, not gated; 89 rows, one
+draft step):
+
+| pairing | all | prompt rows | decode rows |
+|---|---|---|---|
+| SGLang (primary: row 0 = (t_1, h_0)) | 55 / 89 = 0.618 | 55 / 85 | 0 / 4 |
+| vLLM (row 0 embedding zeroed) | 57 / 89 = 0.640 | 57 / 85 | 0 / 4 |
+| llama.cpp (leading (t_0, 0) row) | 56 / 89 = 0.629 | 56 / 85 | 0 / 4 |
+| DeepSeek-V3 paper order [h; e] | 0 / 89 | 0 / 85 | 0 / 4 |
+| trunk state before the final norm | 52 / 89 = 0.584 | 52 / 85 | 0 / 4 |
+
+The paper's written order gives no agreement at all; the embedding-first order of the code bases is the trained one.
+For scale: the draft matches the text's next id on 33 of 88 rows, the trunk's own pick also on 33 of 88. Elsewhere
+(other hardware, quant and text, not comparable): adrienbrault 1.756 tokens per step at depth 1, Xxianna 89 %
+acceptance (vault note `glm-5-3-flash-recherche-0xsero-bauart-landschaft-und-3-bit-format.md`).
