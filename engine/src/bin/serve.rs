@@ -5978,10 +5978,18 @@ struct GlmSrv<'a, R: Rows> {
     model_path: &'a str,
     /// `/props` `n_ctx`: the rows the boot allocated
     n_ctx: usize,
-    /// per process request counter, the tail of every chunk `id`
-    seq: u64,
     /// TASK K: the SSE head of the request in flight left the socket
     stream_head_sent: bool,
+    /// the request counter, the counters and the repeat ring the requests share
+    book: std::sync::Mutex<GlmBook>,
+}
+
+/// - #185 part 2: what the requests of a glm5_next process share; `CROW_GLM_MAX_BATCH`: they
+///   run on threads of their own, so the book sits behind a lock taken at the start and the end
+///   of a request only
+struct GlmBook {
+    /// per process request counter, the tail of every chunk `id`
+    seq: u64,
     /// #13: the cumulative `[vram, pinned, nvme]` expert accesses and NVMe bytes the previous
     /// request left, so the routing line of one request is a difference
     prev_counters: ([u64; 3], u64),
@@ -5989,12 +5997,373 @@ struct GlmSrv<'a, R: Rows> {
     repeats: RepeatRing,
 }
 
+impl GlmBook {
+    fn new(prev_counters: ([u64; 3], u64)) -> GlmBook {
+        GlmBook { seq: 0, prev_counters, repeats: RepeatRing::default() }
+    }
+}
+
 impl<'a, R: Rows> GlmSrv<'a, R> {
     fn new(eng: &'a mut Glm5Engine<R>, model_path: &'a str) -> Self {
         let n_ctx = eng.n_ctx();
-        let prev_counters = eng.counters();
+        let book = std::sync::Mutex::new(GlmBook::new(eng.counters()));
         let markup = ServeEngine::markup(&*eng);
-        GlmSrv { eng, markup, model_path, n_ctx, seq: 0, stream_head_sent: false, prev_counters, repeats: RepeatRing::default() }
+        GlmSrv { eng, markup, model_path, n_ctx, stream_head_sent: false, book }
+    }
+}
+
+/// - `CROW_GLM_MAX_BATCH`: what one request's generation loop (`glm_generate_on`) needs of its
+///   sequence. `Glm5Engine` itself is one (the one-sequence path, unchanged); `GlmSlotSeq` is a
+///   sequence slot of the batch scheduler (`glm_schedule`), reached over a channel.
+trait GlmSeq {
+    /// the vocabulary, the stop ids and the markup (GLM-5.3-Flash's constants)
+    fn consts(&self) -> &dyn ServeEngine;
+    /// #192: the MTP counters since the last call (`None` when off)
+    fn mtp_report(&mut self) -> Option<String>;
+    /// the prompt phase: the prefix decision, rollback or reset, prefill (or the snapshot's
+    /// row), the snapshot (`glm_prompt_phase`)
+    ///
+    /// # Safety
+    /// The engine's device state is driven on its own thread.
+    unsafe fn begin(&mut self, prompt: &[i64]) -> Result<GlmBegun, String>;
+    /// the logits row of the sequence's last head (host copy)
+    ///
+    /// # Safety
+    /// As `begin`.
+    unsafe fn logits(&mut self) -> Vec<f32>;
+    /// feed `id` at the held position; the next greedy id
+    ///
+    /// # Safety
+    /// As `begin`.
+    unsafe fn decode_step(&mut self, id: i64) -> Result<i64, String>;
+    /// the cumulative expert tier counters and NVMe bytes since boot
+    fn counters(&mut self) -> ([u64; 3], u64);
+    /// decoder layers (`crow_layers`)
+    fn layers(&self) -> usize;
+}
+
+/// what the prompt phase of one request did
+struct GlmBegun {
+    cached_n: usize,
+    prefilled: usize,
+    reset_ms: f64,
+    prefill_ms: f64,
+    /// the greedy id after the prompt
+    next: usize,
+}
+
+impl<R: Rows> GlmSeq for Glm5Engine<R> {
+    fn consts(&self) -> &dyn ServeEngine {
+        self
+    }
+    fn mtp_report(&mut self) -> Option<String> {
+        self.rows_mut().mtp_report()
+    }
+    unsafe fn begin(&mut self, prompt: &[i64]) -> Result<GlmBegun, String> {
+        glm_prompt_phase(self, prompt)
+    }
+    unsafe fn logits(&mut self) -> Vec<f32> {
+        Glm5Engine::logits(self)
+    }
+    unsafe fn decode_step(&mut self, id: i64) -> Result<i64, String> {
+        Glm5Engine::decode_step(self, id)
+    }
+    fn counters(&mut self) -> ([u64; 3], u64) {
+        Glm5Engine::counters(self)
+    }
+    fn layers(&self) -> usize {
+        Glm5Engine::layers(self)
+    }
+}
+
+/// - #185 part 2: the prompt phase of a glm5_next request on the selected sequence: the prefix
+///   cache (#31 A9, #36 M2b, #100) decides; a warm request rolls back to the prompt snapshot
+///   (KDA states copied back, MLA / DSA rows truncated) and prefills the rest, a cold one
+///   resets; ONE snapshot after the prompt, with its logits row. The `[cache]` lines.
+/// - `Err` is an engine failure (the engine reset itself)
+unsafe fn glm_prompt_phase<R: Rows>(eng: &mut Glm5Engine<R>, prompt: &[i64]) -> Result<GlmBegun, String> {
+    let plan = eng.decide(prompt);
+    let held = eng.history().len();
+    let cache_on = eng.cache_enabled();
+    let snaps = eng.snapshot_pos();
+    let t_reset = Instant::now();
+    let cached_n = match plan.reuse {
+        Some((_, p)) => {
+            eng.rollback(p)?;
+            p
+        }
+        None => {
+            eng.reset();
+            0
+        }
+    };
+    let reset_ms = t_reset.elapsed().as_secs_f64() * 1e3;
+    let prefilled = prompt.len() - cached_n;
+    tracing::info!(target: "cache",
+        "[cache] {} L {} (held {held}), P {cached_n}, snapshots [{snaps:?}], prefill {prefilled} of {} tok, reset {reset_ms:.3} ms (glm5_next: KDA states restored, MLA/DSA rows truncated){}",
+        if plan.reuse.is_some() { "WARM" } else { "COLD" },
+        if cache_on { plan.l.to_string() } else { "n/a".to_string() },
+        prompt.len(),
+        if eng.slots() > 1 { format!(", sequence slot {} of {}", eng.slot(), eng.slots()) } else { String::new() }
+    );
+    let t_pre = Instant::now();
+    let next = if prefilled == 0 {
+        // #100: the whole prompt is held: the snapshot's row and greedy id stand in
+        eng.restore_logits()
+    } else {
+        eng.prefill(&prompt[cached_n..])?
+    } as usize;
+    let prefill_ms = t_pre.elapsed().as_secs_f64() * 1e3;
+    let snap1_ms = eng.snapshot(next as i64);
+    if cache_on {
+        tracing::info!(target: "cache", "[cache] snapshot point 1 (after prompt) at pos {}, DtoH {snap1_ms:.3} ms", eng.pos());
+    }
+    Ok(GlmBegun { cached_n, prefilled, reset_ms, prefill_ms, next })
+}
+
+// ------------------------------------------------ CROW_GLM_MAX_BATCH: concurrent glm5_next requests
+
+/// - `CROW_GLM_MAX_BATCH`: how long a decode step waits for the other active sequences' next
+///   ids once the first one is in (their threads detokenize and write a chunk in between)
+const GLM_BATCH_GATHER: Duration = Duration::from_millis(3);
+
+/// - `CROW_GLM_MAX_BATCH`: GLM-5.3-Flash's constants for a request thread (what
+///   `Glm5Engine`'s `ServeEngine` answers, without the engine)
+struct GlmConsts {
+    vocab: usize,
+}
+
+impl ServeEngine for GlmConsts {
+    fn vocab(&self) -> usize {
+        self.vocab
+    }
+    fn stop_ids(&self) -> Vec<u32> {
+        glm5_template::EOS_IDS.to_vec()
+    }
+    fn markup(&self) -> Markup {
+        Markup::Glm
+    }
+}
+
+/// - `CROW_GLM_MAX_BATCH`: a request thread's message to the scheduler (the engine's thread)
+enum GlmCmd {
+    /// a free slot (the one whose prompt snapshot serves the prompt best) and its prompt phase
+    Begin { prompt: Vec<i64>, reply: std::sync::mpsc::Sender<Result<(usize, GlmBegun), String>> },
+    /// the slot's logits row of its last head
+    Logits { slot: usize, reply: std::sync::mpsc::Sender<Vec<f32>> },
+    /// the id fed at the slot's held position; the reply (the next greedy id) comes after the
+    /// batched step that carried it
+    Decode { slot: usize, id: i64, reply: std::sync::mpsc::Sender<Result<i64, String>> },
+    Counters { reply: std::sync::mpsc::Sender<([u64; 3], u64)> },
+    /// `/slots`: the furthest prompt snapshot of any slot
+    SnapPos { reply: std::sync::mpsc::Sender<Option<usize>> },
+    /// the request is done with its slot (its ids and snapshot stay for the next prompt)
+    End { slot: usize },
+}
+
+/// - `CROW_GLM_MAX_BATCH`: one request's sequence slot, driven over the scheduler's channel
+struct GlmSlotSeq {
+    tx: std::sync::mpsc::Sender<GlmCmd>,
+    slot: Option<usize>,
+    consts: GlmConsts,
+    layers: usize,
+}
+
+impl GlmSlotSeq {
+    fn new(tx: std::sync::mpsc::Sender<GlmCmd>, vocab: usize, layers: usize) -> GlmSlotSeq {
+        GlmSlotSeq { tx, slot: None, consts: GlmConsts { vocab }, layers }
+    }
+
+    fn ask<T>(&self, cmd: impl FnOnce(std::sync::mpsc::Sender<T>) -> GlmCmd) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx.send(cmd(tx)).ok()?;
+        rx.recv().ok()
+    }
+}
+
+const GLM_SCHED_GONE: &str = "the glm5_next scheduler is gone (the server is shutting down)";
+
+impl GlmSeq for GlmSlotSeq {
+    fn consts(&self) -> &dyn ServeEngine {
+        &self.consts
+    }
+    fn mtp_report(&mut self) -> Option<String> {
+        // MTP is refused with sequence slots (`Glm5Run::set_slots`)
+        None
+    }
+    unsafe fn begin(&mut self, prompt: &[i64]) -> Result<GlmBegun, String> {
+        if let Some(s) = self.slot.take() {
+            let _ = self.tx.send(GlmCmd::End { slot: s });
+        }
+        let prompt = prompt.to_vec();
+        let (slot, b) = self.ask(|reply| GlmCmd::Begin { prompt, reply }).ok_or_else(|| GLM_SCHED_GONE.to_string())??;
+        self.slot = Some(slot);
+        Ok(b)
+    }
+    unsafe fn logits(&mut self) -> Vec<f32> {
+        let Some(slot) = self.slot else { return vec![0.0; self.consts.vocab] };
+        self.ask(|reply| GlmCmd::Logits { slot, reply }).unwrap_or_else(|| vec![0.0; self.consts.vocab])
+    }
+    unsafe fn decode_step(&mut self, id: i64) -> Result<i64, String> {
+        let slot = self.slot.ok_or_else(|| "glm5: a decode step before the prompt phase".to_string())?;
+        self.ask(|reply| GlmCmd::Decode { slot, id, reply }).ok_or_else(|| GLM_SCHED_GONE.to_string())?
+    }
+    fn counters(&mut self) -> ([u64; 3], u64) {
+        self.ask(|reply| GlmCmd::Counters { reply }).unwrap_or_default()
+    }
+    fn layers(&self) -> usize {
+        self.layers
+    }
+}
+
+impl Drop for GlmSlotSeq {
+    fn drop(&mut self) {
+        if let Some(s) = self.slot.take() {
+            let _ = self.tx.send(GlmCmd::End { slot: s });
+        }
+    }
+}
+
+/// - `CROW_GLM_MAX_BATCH`: an engine call on the scheduler's thread, guarded as `glm_guarded`
+///   guards a request: a failed allocation is an `Err` that names it (the caller resets the
+///   slots involved), any other panic is re-raised
+fn glm_sched_guarded<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let caught = {
+        let _scope = crow_nest_engine::cuda::RequestScope::new();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+    };
+    match caught {
+        Ok(r) => r,
+        Err(p) => match p.downcast::<crow_nest_engine::cuda::AllocFailed>() {
+            Ok(af) => Err(format!("{}. The request was dropped and the engine is up; retry with a shorter prompt", af.message())),
+            Err(p) => std::panic::resume_unwind(p),
+        },
+    }
+}
+
+/// - `CROW_GLM_MAX_BATCH`: THE engine thread of a glm5_next process with sequence slots. The
+///   request threads send `GlmCmd`s; this loop owns the engine:
+/// - a `Begin` waits for a free slot; of the free slots it takes the one whose prompt snapshot
+///   serves the prompt best (`decide_in`), selects it and runs the prompt phase there (the
+///   other sequences wait for it, as a prefill waits in the one-sequence path);
+/// - the `Decode`s of the active sequences gather until every active slot has sent its next id
+///   or `GLM_BATCH_GATHER` has passed since the first; then ONE `Glm5Engine::decode_batch`
+///   carries them all, and every sequence's ids and logits rows are those of its solo run
+///   (`glm5_engine::tests_batch_gpu`);
+/// - returns when every request thread is gone (the channel closed), or when `stop` says so
+///   and no sequence is active (5 s at most after `stop`)
+fn glm_schedule<R: Rows>(eng: &mut Glm5Engine<R>, rx: std::sync::mpsc::Receiver<GlmCmd>, stop: &dyn Fn() -> bool) {
+    use std::sync::mpsc::RecvTimeoutError;
+    let n = eng.slots();
+    let mut busy = vec![false; n];
+    let mut waiting: VecDeque<(Vec<i64>, std::sync::mpsc::Sender<Result<(usize, GlmBegun), String>>)> = VecDeque::new();
+    let mut pending: Vec<Option<(i64, std::sync::mpsc::Sender<Result<i64, String>>)>> = (0..n).map(|_| None).collect();
+    let mut first: Option<Instant> = None;
+    let mut stopping: Option<Instant> = None;
+    let mut closed = false;
+    loop {
+        let wait = match first {
+            Some(t) => GLM_BATCH_GATHER.saturating_sub(t.elapsed()),
+            None => Duration::from_millis(100),
+        };
+        let mut cmds = Vec::new();
+        if !closed {
+            match rx.recv_timeout(wait) {
+                Ok(c) => cmds.push(c),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => closed = true,
+            }
+            while let Ok(c) = rx.try_recv() {
+                cmds.push(c);
+            }
+        }
+        for c in cmds {
+            match c {
+                GlmCmd::Begin { prompt, reply } => waiting.push_back((prompt, reply)),
+                GlmCmd::Logits { slot, reply } => {
+                    // unsafe: the engine's device state, this thread's
+                    let row = unsafe { eng.select(slot).map(|_| eng.logits()) };
+                    let _ = reply.send(row.unwrap_or_default());
+                }
+                GlmCmd::Decode { slot, id, reply } => {
+                    if slot < n && busy[slot] {
+                        first.get_or_insert_with(Instant::now);
+                        pending[slot] = Some((id, reply));
+                    } else {
+                        let _ = reply.send(Err(format!("glm5: a decode step on sequence slot {slot}, which no request holds")));
+                    }
+                }
+                GlmCmd::Counters { reply } => {
+                    let _ = reply.send(eng.counters());
+                }
+                GlmCmd::SnapPos { reply } => {
+                    let _ = reply.send((0..n).filter_map(|s| eng.snapshot_pos_of(s)).max());
+                }
+                GlmCmd::End { slot } => {
+                    if slot < n {
+                        busy[slot] = false;
+                        pending[slot] = None;
+                    }
+                }
+            }
+        }
+        if pending.iter().all(Option::is_none) {
+            first = None;
+        }
+        // a new sequence into every free slot
+        while let Some(s) = (0..n).filter(|&s| !busy[s]).max_by_key(|&s| (waiting.front().and_then(|(p, _)| eng.decide_in(s, p).reuse.map(|r| r.1 + 1)).unwrap_or(0), std::cmp::Reverse(s))) {
+            let Some((prompt, reply)) = waiting.pop_front() else { break };
+            // unsafe: the engine's device state, this thread's
+            let r = glm_sched_guarded(|| unsafe {
+                eng.select(s)?;
+                glm_prompt_phase(eng, &prompt)
+            });
+            if r.is_err() {
+                // the slot's state may be part-advanced: cold for its next prompt
+                unsafe {
+                    if eng.select(s).is_ok() {
+                        eng.reset();
+                    }
+                }
+            }
+            // the slot is the request's while it waits for the answer (a thread that left already
+            // never sends its `End`)
+            let ok = r.is_ok();
+            busy[s] = reply.send(r.map(|b| (s, b))).is_ok() && ok;
+        }
+        // the batched decode step
+        let active = busy.iter().filter(|&&b| b).count();
+        let ready = pending.iter().filter(|p| p.is_some()).count();
+        if ready > 0 && (ready == active || first.is_some_and(|t| t.elapsed() >= GLM_BATCH_GATHER)) {
+            let taken: Vec<(usize, i64, std::sync::mpsc::Sender<Result<i64, String>>)> =
+                pending.iter_mut().enumerate().filter_map(|(s, p)| p.take().map(|(id, reply)| (s, id, reply))).collect();
+            first = None;
+            let steps: Vec<(usize, i64)> = taken.iter().map(|t| (t.0, t.1)).collect();
+            // unsafe: the engine's device state, this thread's
+            let r = glm_sched_guarded(|| unsafe { eng.decode_batch(&steps) });
+            if r.is_err() {
+                unsafe {
+                    for &(s, _) in &steps {
+                        if eng.select(s).is_ok() {
+                            eng.reset();
+                        }
+                    }
+                }
+            }
+            for (j, (_, _, reply)) in taken.into_iter().enumerate() {
+                let _ = reply.send(r.as_ref().map(|ids| ids[j]).map_err(|e| e.clone()));
+            }
+        }
+        let idle = !busy.iter().any(|&b| b) && waiting.is_empty();
+        if closed && idle {
+            return;
+        }
+        if stop() {
+            let t = *stopping.get_or_insert_with(Instant::now);
+            if idle || t.elapsed() >= Duration::from_secs(5) {
+                return;
+            }
+        }
     }
 }
 
@@ -6057,6 +6426,18 @@ fn glm_main(cli: &ServeArgs, cnq_path: &str, meta: &crow_nest_engine::meta::Mode
         use std::os::fd::AsRawFd;
         LISTENER_FD.store(listener.as_raw_fd(), std::sync::atomic::Ordering::SeqCst);
     }
+    if eng.slots() > 1 {
+        // CROW_GLM_MAX_BATCH=N: the requests on threads of their own, the engine on this one
+        tracing::info!(target: "serve",
+            "[serve] listening on http://{addr} ({} sequence slots, CROW_GLM_MAX_BATCH: one decode step carries the next id of every active request; more requests wait for a slot)",
+            eng.slots());
+        glm_batch_serve(listener, &mut eng, cnq_path);
+        drop(eng);
+        unsafe { crow_nest_engine::cuda::ctx_hard_reset() };
+        drop(ctx);
+        crow_nest_engine::log::shutdown();
+        std::process::exit(0);
+    }
     tracing::info!(target: "serve", "[serve] listening on http://{addr} (blocking, one request at a time)");
     let mut srv = GlmSrv::new(&mut eng, cnq_path);
     loop {
@@ -6083,9 +6464,112 @@ fn glm_main(cli: &ServeArgs, cnq_path: &str, meta: &crow_nest_engine::meta::Mode
     std::process::exit(0);
 }
 
+/// - `CROW_GLM_MAX_BATCH`: what `glm_dispatch` reads of the server: the one-sequence `GlmSrv`,
+///   or a request thread's `GlmBatchDoor`
+trait GlmDoor {
+    fn model_path(&self) -> &str;
+    fn n_ctx(&self) -> usize;
+    /// `/slots`: the prompt snapshot's position
+    fn snapshot_pos(&mut self) -> Option<usize>;
+    /// one chat request, answered on `stream`; the status for the log
+    fn chat(&mut self, stream: &mut TcpStream, body: &[u8]) -> &'static str;
+}
+
+impl<R: Rows> GlmDoor for GlmSrv<'_, R> {
+    fn model_path(&self) -> &str {
+        self.model_path
+    }
+    fn n_ctx(&self) -> usize {
+        self.n_ctx
+    }
+    fn snapshot_pos(&mut self) -> Option<usize> {
+        self.eng.snapshot_pos()
+    }
+    fn chat(&mut self, stream: &mut TcpStream, body: &[u8]) -> &'static str {
+        glm_guarded(stream, self, |stream, srv| glm_chat_route(stream, srv, body))
+    }
+}
+
+/// - `CROW_GLM_MAX_BATCH`: what the request threads share
+struct GlmShared {
+    model_path: String,
+    n_ctx: usize,
+    vocab: usize,
+    layers: usize,
+    markup: Markup,
+    book: std::sync::Mutex<GlmBook>,
+}
+
+/// - `CROW_GLM_MAX_BATCH`: one connection's door: its chat runs `glm_generate_on` on a
+///   `GlmSlotSeq` (a sequence slot of the scheduler)
+struct GlmBatchDoor {
+    tx: std::sync::mpsc::Sender<GlmCmd>,
+    shared: std::sync::Arc<GlmShared>,
+}
+
+impl GlmDoor for GlmBatchDoor {
+    fn model_path(&self) -> &str {
+        &self.shared.model_path
+    }
+    fn n_ctx(&self) -> usize {
+        self.shared.n_ctx
+    }
+    fn snapshot_pos(&mut self) -> Option<usize> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx.send(GlmCmd::SnapPos { reply: tx }).ok()?;
+        rx.recv().ok().flatten()
+    }
+    fn chat(&mut self, stream: &mut TcpStream, body: &[u8]) -> &'static str {
+        let sh = &*self.shared;
+        let mut seq = GlmSlotSeq::new(self.tx.clone(), sh.vocab, sh.layers);
+        let mut head_sent = false;
+        glm_chat_on(stream, &mut seq, &sh.book, sh.markup, sh.n_ctx, &mut head_sent, body)
+    }
+}
+
+/// - `CROW_GLM_MAX_BATCH`: serve with sequence slots: an acceptor thread takes the
+///   connections, every connection runs on a thread of its own (`glm_dispatch` through a
+///   `GlmBatchDoor`), and this thread runs the scheduler (`glm_schedule`) on the engine until
+///   the shutdown
+fn glm_batch_serve<R: Rows>(listener: TcpListener, eng: &mut Glm5Engine<R>, model_path: &str) {
+    let (tx, rx) = std::sync::mpsc::channel::<GlmCmd>();
+    let shared = std::sync::Arc::new(GlmShared {
+        model_path: model_path.to_string(),
+        n_ctx: eng.n_ctx(),
+        vocab: eng.vocab(),
+        layers: eng.layers(),
+        markup: ServeEngine::markup(&*eng),
+        book: std::sync::Mutex::new(GlmBook::new(eng.counters())),
+    });
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || loop {
+            match listener.accept() {
+                Ok((mut s, _)) => {
+                    let door = GlmBatchDoor { tx: tx.clone(), shared: shared.clone() };
+                    std::thread::spawn(move || {
+                        let mut door = door;
+                        if let Some(head) = read_conn(&mut s) {
+                            glm_dispatch(&mut s, &mut door, head);
+                        }
+                    });
+                }
+                Err(e) => {
+                    if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    tracing::warn!(target: "serve", "[serve] accept failed: {e}");
+                }
+            }
+        });
+    }
+    drop(tx);
+    glm_schedule(eng, rx, &|| SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst));
+}
+
 /// #185 part 2: `dispatch` for a glm5_next process. Chat, health, props and slots as for every
 /// family; the slot files and VRAM lending are not built for glm5_next and say so.
-fn glm_dispatch<R: Rows>(stream: &mut TcpStream, srv: &mut GlmSrv<R>, head: Head) {
+fn glm_dispatch(stream: &mut TcpStream, srv: &mut dyn GlmDoor, head: Head) {
     let (label, status, doc) = match head {
         Head::Empty => return,
         Head::Bad => ("<no HTTP request line>".to_string(), "400 Bad Request", error_json("bad request")),
@@ -6109,14 +6593,14 @@ fn glm_dispatch<R: Rows>(stream: &mut TcpStream, srv: &mut GlmSrv<R>, head: Head
             let label = format!("{method} {target} (body {} bytes)", body.len());
             match route(&method, &path) {
                 Route::Chat => {
-                    let status = glm_guarded(stream, srv, |stream, srv| glm_chat_route(stream, srv, &body));
+                    let status = srv.chat(stream, &body);
                     tracing::info!(target: "serve", "[serve] {label} -> {status}");
                     let _ = stream.shutdown(Shutdown::Write);
                     return;
                 }
                 Route::Health => (label, "200 OK", serde_json::json!({ "status": "ok" })),
-                Route::Props => (label, "200 OK", props_json(srv.model_path, srv.n_ctx, GLM_PROMPT_CHUNK, false)),
-                Route::Slots => (label, "200 OK", slots_json(srv.n_ctx, srv.eng.snapshot_pos().unwrap_or(0))),
+                Route::Props => (label, "200 OK", props_json(srv.model_path(), srv.n_ctx(), GLM_PROMPT_CHUNK, false)),
+                Route::Slots => (label, "200 OK", slots_json(srv.n_ctx(), srv.snapshot_pos().unwrap_or(0))),
                 Route::Slot0 => (label, "501 Not Implemented", error_json("slot files are not built for glm5_next (#185): its prompt snapshot lives in this process only")),
                 Route::VramLend => (label, "501 Not Implemented", error_json("VRAM lending is not built for glm5_next (#185)")),
                 Route::VramReturn => (label, "200 OK", serde_json::json!({ "returned_mib": 0, "note": "nothing lent" })),
@@ -6225,11 +6709,26 @@ fn glm_request(
 }
 
 fn glm_chat_route<R: Rows>(stream: &mut TcpStream, srv: &mut GlmSrv<R>, body: &[u8]) -> &'static str {
+    let GlmSrv { eng, markup, n_ctx, stream_head_sent, book, .. } = srv;
+    glm_chat_on(stream, &mut **eng, book, *markup, *n_ctx, stream_head_sent, body)
+}
+
+/// - #185 part 2: one glm5_next chat request on `seq` (the engine, or a sequence slot of the
+///   `CROW_GLM_MAX_BATCH` scheduler): the request, the SSE head or the document
+fn glm_chat_on(
+    stream: &mut TcpStream,
+    seq: &mut dyn GlmSeq,
+    book: &std::sync::Mutex<GlmBook>,
+    markup: Markup,
+    n_ctx: usize,
+    stream_head_sent: &mut bool,
+    body: &[u8],
+) -> &'static str {
     let tk = match crow_nest_engine::tokenizer::global() {
         Ok(t) => t,
         Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(e)),
     };
-    let (req, ids) = match glm_request(tk, ServeEngine::vocab(&*srv.eng), srv.markup, srv.n_ctx, body) {
+    let (req, ids) = match glm_request(tk, seq.consts().vocab(), markup, n_ctx, body) {
         Ok(x) => x,
         Err((status, e)) => return respond_json(stream, status, &error_json(&e)),
     };
@@ -6238,10 +6737,10 @@ fn glm_chat_route<R: Rows>(stream: &mut TcpStream, srv: &mut GlmSrv<R>, body: &[
         if !sse_send(stream, HEAD) {
             return "200 OK (client gone)";
         }
-        srv.stream_head_sent = true;
+        *stream_head_sent = true;
         let res = {
             let mut sink = SseSink::new(&mut *stream);
-            glm_generate(srv, &req, &ids, tk, &mut sink)
+            glm_generate_on(seq, book, &req, &ids, tk, &mut sink)
         };
         match res {
             Ok(out) if out.aborted => "200 OK (client gone)",
@@ -6250,7 +6749,7 @@ fn glm_chat_route<R: Rows>(stream: &mut TcpStream, srv: &mut GlmSrv<R>, body: &[
         }
     } else {
         let mut sink = CollectSink::watching(stream);
-        let out = match glm_generate(srv, &req, &ids, tk, &mut sink) {
+        let out = match glm_generate_on(seq, book, &req, &ids, tk, &mut sink) {
             Ok(o) => o,
             Err(e) => return glm_fail(stream, false, "500 Internal Server Error", error_json(&e)),
         };
@@ -6286,6 +6785,8 @@ fn glm_chat_route<R: Rows>(stream: &mut TcpStream, srv: &mut GlmSrv<R>, body: &[
 /// - not on this path: the trickle, vision, the park of #118
 /// - `Err` is an engine failure (a row that failed: an NVMe read, the staging); the engine has
 ///   reset itself, the next request is cold
+/// - the server reaches it through `glm_chat_on`; the tests call it on a `GlmSrv`
+#[cfg(test)]
 fn glm_generate<R: Rows>(
     srv: &mut GlmSrv<R>,
     req: &ChatReq,
@@ -6293,52 +6794,35 @@ fn glm_generate<R: Rows>(
     tk: &crow_nest_engine::tokenizer::ChatTokenizer,
     sink: &mut dyn ChatSink,
 ) -> Result<GenOut, String> {
-    srv.seq += 1;
+    glm_generate_on(&mut *srv.eng, &srv.book, req, ids, tk, sink)
+}
+
+/// - `glm_generate` on `seq`: the engine (the one-sequence path) or a sequence slot of the
+///   `CROW_GLM_MAX_BATCH` scheduler, whose decode steps are batched with the other requests'
+///   and give this sequence's solo ids and logits rows
+fn glm_generate_on(
+    seq: &mut dyn GlmSeq,
+    book: &std::sync::Mutex<GlmBook>,
+    req: &ChatReq,
+    ids: &[u32],
+    tk: &crow_nest_engine::tokenizer::ChatTokenizer,
+    sink: &mut dyn ChatSink,
+) -> Result<GenOut, String> {
+    let seq_no = {
+        let mut b = book.lock().unwrap_or_else(|p| p.into_inner());
+        b.seq += 1;
+        b.seq
+    };
     let created = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let id = format!("chatcmpl-{created}-{}", srv.seq);
+    let id = format!("chatcmpl-{created}-{seq_no}");
     let model = req.model.clone();
     let prompt: Vec<i64> = ids.iter().map(|&v| v as i64).collect();
 
     // #192: the MTP counters start at this request
-    let _ = srv.eng.rows_mut().mtp_report();
-    let plan = srv.eng.decide(&prompt);
-    let held = srv.eng.history().len();
-    let cache_on = srv.eng.cache_enabled();
-    let snaps = srv.eng.snapshot_pos();
-    let t_reset = Instant::now();
-    // unsafe: the engine's device state, this thread's
-    let cached_n = match plan.reuse {
-        Some((_, p)) => {
-            unsafe { srv.eng.rollback(p)? };
-            p
-        }
-        None => {
-            unsafe { srv.eng.reset() };
-            0
-        }
-    };
-    let reset_ms = t_reset.elapsed().as_secs_f64() * 1e3;
-    let prefilled = prompt.len() - cached_n;
-    tracing::info!(target: "cache",
-        "[cache] {} L {} (held {held}), P {cached_n}, snapshots [{snaps:?}], prefill {prefilled} of {} tok, reset {reset_ms:.3} ms (glm5_next: KDA states restored, MLA/DSA rows truncated)",
-        if plan.reuse.is_some() { "WARM" } else { "COLD" },
-        if cache_on { plan.l.to_string() } else { "n/a".to_string() },
-        prompt.len()
-    );
-    let t_pre = Instant::now();
-    let mut next = unsafe {
-        if prefilled == 0 {
-            // #100: the whole prompt is held: the snapshot's row and greedy id stand in
-            srv.eng.restore_logits()
-        } else {
-            srv.eng.prefill(&prompt[cached_n..])?
-        }
-    } as usize;
-    let prefill_ms = t_pre.elapsed().as_secs_f64() * 1e3;
-    let snap1_ms = unsafe { srv.eng.snapshot(next as i64) };
-    if cache_on {
-        tracing::info!(target: "cache", "[cache] snapshot point 1 (after prompt) at pos {}, DtoH {snap1_ms:.3} ms", srv.eng.pos());
-    }
+    let _ = seq.mtp_report();
+    // unsafe: the engine's device state, its thread's
+    let GlmBegun { cached_n, prefilled, reset_ms, prefill_ms, next } = unsafe { seq.begin(&prompt)? };
+    let mut next = next;
 
     let mut sampler = sampler_from(req);
     if let Some(s) = sampler.as_mut() {
@@ -6346,7 +6830,7 @@ fn glm_generate<R: Rows>(
     }
     // no device sampler on glm5_next: every sampled request draws on the host
     let host = sampler.is_some();
-    let (mut gate, gate_line) = tool_gate(req, tk, &*srv.eng, tool_grammar_on());
+    let (mut gate, gate_line) = tool_gate(req, tk, seq.consts(), tool_grammar_on());
     if let Some(l) = gate_line {
         tracing::info!(target: "chat", "{l}");
     }
@@ -6356,7 +6840,7 @@ fn glm_generate<R: Rows>(
     }
     match sampler.as_mut() {
         Some(s) => {
-            next = draw_row(unsafe { srv.eng.logits() }, s, &req.logit_bias, gate.as_mut());
+            next = draw_row(unsafe { seq.logits() }, s, &req.logit_bias, gate.as_mut());
             let sent = req.sampling_sent;
             if s.temperature > 0.0 {
                 tracing::info!(target: "chat", "{}", sampling_line(s, sent, req.card, true));
@@ -6428,7 +6912,7 @@ fn glm_generate<R: Rows>(
                 if !host && gt.armed() && !gt.check(next as u32) {
                     let t_rd = Instant::now();
                     let drawn = next;
-                    next = redraw_from_row(req, ids, &out, gt, unsafe { srv.eng.logits() });
+                    next = redraw_from_row(req, ids, &out, gt, unsafe { seq.logits() });
                     gt.stats.redrawn += 1;
                     redraw_ms += t_rd.elapsed().as_secs_f64() * 1e3;
                     tracing::info!(target: "chat",
@@ -6437,7 +6921,7 @@ fn glm_generate<R: Rows>(
                         String::from_utf8_lossy(&tk.token_bytes(next as u32)));
                 }
             }
-            if ServeEngine::is_stop(&*srv.eng, next) {
+            if seq.consts().is_stop(next) {
                 finish = "stop";
                 break;
             }
@@ -6449,7 +6933,7 @@ fn glm_generate<R: Rows>(
             }
             if req.logprobs {
                 let t_lp = Instant::now();
-                let row = unsafe { srv.eng.logits() };
+                let row = unsafe { seq.logits() };
                 let p = pos_logprobs(&row, next, req.top_logprobs);
                 lp_ms += t_lp.elapsed().as_secs_f64() * 1e3;
                 if p.top.len() >= 2 && p.top[0].1 - p.top[1].1 < lp_gap.0 {
@@ -6508,9 +6992,9 @@ fn glm_generate<R: Rows>(
             }
             let t = *t_dec.get_or_insert_with(Instant::now);
             // unsafe: the engine's device state, this thread's
-            next = unsafe { srv.eng.decode_step(next as i64)? } as usize;
+            next = unsafe { seq.decode_step(next as i64)? } as usize;
             if let Some(s) = sampler.as_mut() {
-                next = draw_row(unsafe { srv.eng.logits() }, s, &req.logit_bias, gate.as_mut());
+                next = draw_row(unsafe { seq.logits() }, s, &req.logit_bias, gate.as_mut());
             }
             decode_ms = t.elapsed().as_secs_f64() * 1e3;
         }
@@ -6601,12 +7085,15 @@ fn glm_generate<R: Rows>(
     // #30 A8 for glm5_next: the expert tier counters, cumulative since boot (never reset):
     // every access is a selection, an NVMe-served access is a cold one; no PLE
     let t_ctr = Instant::now();
-    let (acc, nvme_bytes) = srv.eng.counters();
+    let (acc, nvme_bytes) = seq.counters();
     let selections_total = acc[0] + acc[1] + acc[2];
     let cold_total = acc[2];
     let counters_ms = t_ctr.elapsed().as_secs_f64() * 1e3;
     let gen = out.len();
-    let rep = srv.repeats.observe(&out, single_token_answer(gen, finish));
+    let mut bk = book.lock().unwrap_or_else(|p| p.into_inner());
+    let rep = bk.repeats.observe(&out, single_token_answer(gen, finish));
+    let (prev, prev_bytes) = std::mem::replace(&mut bk.prev_counters, (acc, nvme_bytes));
+    drop(bk);
     if let Some(w) = loop_warning(&rep) {
         tracing::warn!(target: "chat", "{w}");
     }
@@ -6620,7 +7107,7 @@ fn glm_generate<R: Rows>(
         cold_total,
         ple_rows_total: 0,
         ple_miss_total: 0,
-        layers: srv.eng.layers(),
+        layers: seq.layers(),
     };
     if !aborted {
         let _ = sink.on_finish(
@@ -6645,12 +7132,11 @@ fn glm_generate<R: Rows>(
     );
     tracing::info!(target: "chat",
         "[chat] counters (cumulative, never reset): expert accesses vram {} pinned {} nvme {}, NVMe bytes {nvme_bytes}, layers {}, counter read {counters_ms:.3} ms",
-        acc[0], acc[1], acc[2], srv.eng.layers());
-    let (prev, prev_bytes) = std::mem::replace(&mut srv.prev_counters, (acc, nvme_bytes));
+        acc[0], acc[1], acc[2], seq.layers());
     let d_sel = selections_total.saturating_sub(prev[0] + prev[1] + prev[2]);
     let d_cold = cold_total.saturating_sub(prev[2]);
     crow_nest_engine::log::routing(&crow_nest_engine::log::Routing {
-        seq: srv.seq,
+        seq: seq_no,
         route: if req.stream { "chat_stream" } else { "chat_document" }.to_string(),
         finish: finish.to_string(),
         prompt_n: ids.len(),
@@ -6672,7 +7158,7 @@ fn glm_generate<R: Rows>(
         repeat_run: rep.repeat_run,
         single_token: rep.single_token,
     });
-    if let Some(l) = srv.eng.rows_mut().mtp_report() {
+    if let Some(l) = seq.mtp_report() {
         tracing::info!(target: "chat", "[chat] MTP (#192): {l}");
     }
     tracing::debug!(target: "chat", "[chat] ids {out:?}");
@@ -11103,5 +11589,91 @@ Red is #FF0000."), "{off}");
         let (status, why) = glm_request(&tk, GLM_VOCAB, Markup::Glm, 4, body.to_string().as_bytes()).unwrap_err();
         assert_eq!(status, "413 Payload Too Large");
         assert!(why.contains("over n_ctx 4"), "{why}");
+    }
+
+    /// `CROW_GLM_MAX_BATCH`: the requests on their own threads through `glm_generate_on` on a
+    /// `GlmSlotSeq`, the engine under `glm_schedule` on this one; (reasoning, predicted_n,
+    /// cached_n, slot) per request, in order
+    fn glm_batch_wave(eng: &mut Glm5Engine<FakeRows>, book: &std::sync::Mutex<GlmBook>, tk: &crow_nest_engine::tokenizer::ChatTokenizer, bodies: &[serde_json::Value]) -> Vec<(String, usize, usize, usize)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = bodies
+                .iter()
+                .map(|b| {
+                    let tx = tx.clone();
+                    sc.spawn(move || {
+                        let (req, ids) = glm_request(tk, GLM_VOCAB, Markup::Glm, 4096, b.to_string().as_bytes()).unwrap();
+                        let mut seq = GlmSlotSeq::new(tx, GLM_VOCAB, 45);
+                        let mut buf: Vec<u8> = Vec::new();
+                        let out = {
+                            let mut sink = SseSink::new(&mut buf);
+                            glm_generate_on(&mut seq, book, &req, &ids, tk, &mut sink).unwrap()
+                        };
+                        let slot = seq.slot.expect("the request held a slot");
+                        drop(seq);
+                        let text = String::from_utf8(buf).unwrap();
+                        let reasoning: String = text
+                            .split("\n\n")
+                            .filter_map(|f| f.strip_prefix("data: "))
+                            .filter(|f| *f != "[DONE]")
+                            .map(|f| serde_json::from_str::<serde_json::Value>(f).unwrap())
+                            .filter_map(|f| f["choices"][0]["delta"]["reasoning_content"].as_str().map(str::to_string))
+                            .collect();
+                        (reasoning, out.timing.predicted_n, out.timing.cached_n, slot)
+                    })
+                })
+                .collect();
+            drop(tx);
+            glm_schedule(eng, rx, &|| false);
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        })
+    }
+
+    /// `CROW_GLM_MAX_BATCH`, on the host twin with four slots: four requests at once each stream
+    /// the answer the same request gets alone on a one-sequence engine (reasoning, length, the
+    /// held ids of its slot), in four different slots, and the decode steps carried several
+    /// requests at once. A follow-up turn of request 1 finds its prompt snapshot in request 1's
+    /// slot (`cached_tokens` = turn 1's prompt) and streams the cold re-prefill's answer.
+    #[test]
+    fn glm_batch_serves_concurrent_requests_as_their_solo_runs() {
+        let Some(tk) = glm_tk() else { return };
+        let words = ["read README.md and tell me its first heading", "count the owls", "what does the fox jump over", "summarise the river for me in one line"];
+        let bodies: Vec<serde_json::Value> = words.iter().map(|w| glm_stream_body(serde_json::json!([{ "role": "user", "content": w }]))).collect();
+        let alone = |b: &serde_json::Value| {
+            let mut eng = Glm5Engine::new(glm_fake(&tk, 4096), true);
+            let mut srv = GlmSrv::new(&mut eng, "synthetic-glm.cnq");
+            let (_, r, out) = glm_turn(&mut srv, &tk, b);
+            (r, out.timing.predicted_n, out.timing.cached_n, srv.eng.history().to_vec())
+        };
+        let want: Vec<_> = bodies.iter().map(alone).collect();
+        let cands = glm_fake(&tk, 4096).cands;
+        let mut eng = Glm5Engine::new(FakeRows::with_slots(4096, GLM_VOCAB, cands, 4), true);
+        assert_eq!(eng.slots(), 4);
+        let book = std::sync::Mutex::new(GlmBook::new(eng.counters()));
+        let got = glm_batch_wave(&mut eng, &book, &tk, &bodies);
+        let mut slots: Vec<usize> = got.iter().map(|g| g.3).collect();
+        for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(g.0, w.0, "request {k}: the streamed reasoning vs alone");
+            assert!(!g.0.is_empty());
+            assert_eq!((g.1, g.2), (w.1, 0), "request {k}: predicted_n, cached_n");
+            assert_eq!(eng.history_of(g.3), w.3.as_slice(), "request {k}: the held ids of its slot vs alone");
+        }
+        slots.sort_unstable();
+        assert_eq!(slots, [0, 1, 2, 3], "every request had a slot of its own");
+        let widest = eng.rows().batches.iter().copied().max().unwrap_or(0);
+        assert!(widest >= 2, "a decode step carried several requests: {:?}", eng.rows().batches);
+        assert_eq!(book.lock().unwrap().seq, 4);
+        // turn 2 of request 1, while request 3 runs again: warm in request 1's slot
+        let body2 = glm_stream_body(serde_json::json!([{ "role": "user", "content": words[0] },
+            { "role": "assistant", "content": "", "reasoning_content": want[0].0 },
+            { "role": "user", "content": "and the second heading?" }]));
+        let (_, p1) = glm_request(&tk, GLM_VOCAB, Markup::Glm, 4096, bodies[0].to_string().as_bytes()).unwrap();
+        let w2 = alone(&body2);
+        let got2 = glm_batch_wave(&mut eng, &book, &tk, &[body2, bodies[3].clone()]);
+        assert_eq!(got2[0].3, got[0].3, "turn 2 found turn 1's slot");
+        assert_eq!(got2[0].2, p1.len(), "cached_tokens = turn 1's prompt");
+        assert_eq!(got2[0].0, w2.0, "the warm turn streams the cold re-prefill's answer");
+        assert_eq!(eng.history_of(got2[0].3), w2.3.as_slice());
+        assert_eq!(got2[1].0, want[3].0, "request 4 again: the same answer");
     }
 }
