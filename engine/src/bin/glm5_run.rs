@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! glm5_run [-n N] [--cnq PATH] [--ids a,b,c | --prompt TEXT --tokenizer tokenizer.json | --prompt-ids PATH]
-//!          [--prompt-tokens N] [--reps N] [--cold] [--json PATH]   (env: CROW_CHUNK=N, #186)
+//!          [--prompt-tokens N] [--random-ids SEED] [--stop-eos] [--reps N] [--cold] [--json PATH]   (env: CROW_CHUNK=N, #186)
 //!          [--tokenizer tokenizer.json] [--vram-slots N] [--pinned-slots N] [--readers N]
 //! ```
 //!
@@ -17,6 +17,13 @@
 //!   the tokenizer golden `sys_user_default` (31 ids); `--prompt-tokens N` repeats that prompt
 //!   cyclically and cuts it to N ids (synthetic, deterministic); `--tokenizer` also decodes the
 //!   output
+//! - `--random-ids SEED` (with `--prompt-tokens N`, instead of a prompt): every rep gets its own
+//!   fresh prompt of N ids drawn uniformly from `[1000, 150000)` (seed `SEED + 1000 N + rep - 1`),
+//!   the prefill prompt of `tools/glm_sweep.py` and of 0xSero's `bench/sweep.py` (`rand_ids`)
+//! - `--stop-eos`: the report ends each rep at the first id of `glm5_template::EOS_IDS`
+//!   (inclusive), the natural completion of the sweep's decode; `generate` still runs `-n` ids,
+//!   the rows after the EOS are not counted. Rep JSON: `eos_at` (ids up to the EOS, null = none
+//!   within `-n`) and `sweep_aggregate_tok_s` = ids / (last row - TTFT), the sweep's C1 aggregate
 //! - `--reps N` (default 1): `generate` N times on the one loaded model. Rep 1 starts with the
 //!   cache empty (cold); later reps start with the cache the previous rep left (warm), unless
 //!   `--cold`, which empties it before every rep (`ExpertTiers::reset_cache`, no allocation)
@@ -96,6 +103,30 @@ fn prompt_of_len(base: &[i64], n: usize) -> Result<Vec<i64>, String> {
         return Err("--prompt-tokens needs a positive count and a non-empty base prompt".into());
     }
     Ok(base.iter().copied().cycle().take(n).collect())
+}
+
+/// `--random-ids SEED`: `n` ids uniform in `[1000, 150000)` from splitmix64 on `seed` (the range
+/// of the sweep's `rand_ids`; the draw itself is not Python's, the prompts only share the law)
+fn random_ids(seed: u64, n: usize) -> Vec<i64> {
+    let mut x = seed;
+    (0..n)
+        .map(|_| {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            1000 + (z % 149_000) as i64
+        })
+        .collect()
+}
+
+/// `--stop-eos`: cut the rows after the first row whose id is an EOS (that row kept); the ids
+/// generated up to and including it, `None` when no row yields an EOS (the rows stay)
+fn cut_at_eos(rows: &mut Vec<Row>, eos: &[u32]) -> Option<usize> {
+    let i = rows.iter().position(|r| r.r.next.is_some_and(|id| eos.iter().any(|&e| e as i64 == id)))?;
+    rows.truncate(i + 1);
+    Some(rows.iter().filter(|r| r.r.next.is_some()).count())
 }
 
 // ---------------------------------------------------------------- statistics
@@ -499,6 +530,8 @@ fn run(args: &[String]) -> Result<(), String> {
         return Err("--reps 0: nothing to run".into());
     }
     let cold = args.iter().any(|a| a == "--cold");
+    let stop_eos = args.iter().any(|a| a == "--stop-eos");
+    let random_seed = flag("--random-ids")?.map(|v| v.parse::<u64>().map_err(|_| format!("--random-ids {v:?} is not a whole number"))).transpose()?;
     let json_path = flag("--json")?;
     let prompt_tokens = num("--prompt-tokens")?;
     let path = flag("--cnq")?.or_else(|| std::env::var("CROW_CNQ").ok()).unwrap_or_else(|| from_engine_dir(GLM5_MUL1K3_CNQ));
@@ -510,10 +543,17 @@ fn run(args: &[String]) -> Result<(), String> {
         None => None,
     };
     let (ids_flag, text_flag, file_flag) = (flag("--ids")?, flag("--prompt")?, flag("--prompt-ids")?);
-    if [ids_flag.is_some(), text_flag.is_some(), file_flag.is_some()].iter().filter(|&&b| b).count() > 1 {
-        return Err("give the prompt once: --ids, --prompt or --prompt-ids".into());
+    if [ids_flag.is_some(), text_flag.is_some(), file_flag.is_some(), random_seed.is_some()].iter().filter(|&&b| b).count() > 1 {
+        return Err("give the prompt once: --ids, --prompt, --prompt-ids or --random-ids".into());
     }
-    let (base, source): (Vec<i64>, String) = if let Some(ids) = ids_flag {
+    if random_seed.is_some() && prompt_tokens.is_none() {
+        return Err("--random-ids needs --prompt-tokens N".into());
+    }
+    // the seed of rep `rep` (1-based) under --random-ids, as the sweep's `seed + 1000 n + rep`
+    let rep_seed = |rep: usize| random_seed.map(|s| s.wrapping_add(1000 * prompt_tokens.unwrap_or(0) as u64).wrapping_add(rep as u64 - 1));
+    let (base, source): (Vec<i64>, String) = if let Some(s) = random_seed {
+        (random_ids(s, prompt_tokens.unwrap_or(0)), format!("--random-ids {s}, fresh ids per rep"))
+    } else if let Some(ids) = ids_flag {
         (ids.split(',').map(|v| v.trim().parse::<i64>().map_err(|_| format!("--ids: {v:?} is not a token id"))).collect::<Result<_, _>>()?, "--ids".into())
     } else if let Some(text) = text_flag {
         let t = tok.as_ref().ok_or("--prompt needs --tokenizer <tokenizer.json>")?;
@@ -532,7 +572,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let open_s = t_open.elapsed().as_secs_f64();
     let container_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     println!(
-        "[glm5_run] container {path} ({container_bytes} B): {} constants verified, routed experts {} x {} B ({} records, codec {}); prompt {} ids ({source}{}), generating {n}, reps {reps}{}",
+        "[glm5_run] container {path} ({container_bytes} B): {} constants verified, routed experts {} x {} B ({} records, codec {}); prompt {} ids ({source}{}), generating {n}, reps {reps}{}{}",
         o.constants,
         o.g.experts,
         o.spec.bytes,
@@ -540,7 +580,8 @@ fn run(args: &[String]) -> Result<(), String> {
         o.spec.codec.dtype(),
         prompt.len(),
         if prompt_tokens.is_some() { format!(", base {} ids repeated / cut", base.len()) } else { String::new() },
-        if cold { ", --cold" } else { "" }
+        if cold { ", --cold" } else { "" },
+        if stop_eos { ", --stop-eos" } else { "" }
     );
     let context = crow_nest_engine::boot::context_from_env(std::env::var("CROW_CONTEXT").ok().as_deref(), o.g.context_floor, o.g.context_max)?;
     let commit = commit();
@@ -621,7 +662,7 @@ fn run(args: &[String]) -> Result<(), String> {
             "binary": { "path": exe.as_ref().map(|p| p.display().to_string()), "mtime_unix_s": exe_mtime },
             "container": { "path": path, "bytes": container_bytes, "record_bytes": rb, "experts": o.g.experts, "codec": o.spec.codec.dtype() },
             "prompt": { "source": source, "base_ids": base.len(), "ids": prompt.len(), "prompt_tokens_flag": prompt_tokens },
-            "generate": n, "reps": reps, "cold": cold, "context": context,
+            "generate": n, "reps": reps, "cold": cold, "stop_eos": stop_eos, "random_ids_seed": random_seed, "context": context,
             "tiers": { "plan": { "vram": plan.hot, "pinned": plan.pinned, "nvme": plan.nvme }, "vram_slots": sizes.vram, "pinned_slots": sizes.pinned,
                        "nvme": o.g.experts - sizes.vram - sizes.pinned, "moe_layers": moe_layers, "first_moe_layer": first_moe, "readers": readers,
                        "policy": format!("{:?}", tiers.cache.policy), "pinned_use": format!("{:?}", tiers.pinned_use), "staging_slots": tiers.stage_cap, "pinned_budget_bytes": budget, "free_vram_at_plan_bytes": free,
@@ -667,10 +708,27 @@ fn run(args: &[String]) -> Result<(), String> {
                 );
                 rows.push(Row { r: r.clone(), at, lane_s });
             };
-            let out = run.generate(&mut o.cnq, &mut tiers, &prompt, n, false, &mut report)?;
+            let seed = rep_seed(rep);
+            let fresh = seed.map(|s| random_ids(s, prompt.len()));
+            let mut out = run.generate(&mut o.cnq, &mut tiers, fresh.as_deref().unwrap_or(&prompt), n, false, &mut report)?;
             let wall = t0.elapsed().as_secs_f64();
+            let eos_at = if stop_eos { cut_at_eos(&mut rows, &crow_nest_engine::glm5_template::EOS_IDS) } else { None };
+            if let Some(k) = eos_at {
+                out.ids.truncate(k);
+            }
             let (pre, dec, ttft) = phases(&rows, moe_layers);
             let tag = format!("glm5_run rep {rep}/{reps} cache {state}");
+            let sweep_agg = (dec.wall > 0.0).then(|| out.ids.len() as f64 / dec.wall);
+            if let Some(s) = seed {
+                println!("{tag} prompt: {} fresh random ids, seed {s}", prompt.len());
+            }
+            if stop_eos {
+                println!(
+                    "{tag} stop-eos: {}; sweep aggregate {} tok/s (ids / (last row - TTFT))",
+                    eos_at.map_or(format!("no EOS within -n {n}, all {} ids counted", out.ids.len()), |k| format!("EOS at id {k} of {n}, rows after it not counted")),
+                    opt(sweep_agg, 2)
+                );
+            }
             println!("{tag} ids {:?}", out.ids);
             if let Some(t) = &tok {
                 let ids: Vec<u32> = out.ids.iter().map(|&v| v as u32).collect();
@@ -716,7 +774,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let m_rep = machine(&tiers);
             println!("glm5_run machine after rep {rep}: {}", machine_line(&m_rep));
             doc["reps_detail"].as_array_mut().expect("reps array").push(json!({
-                "rep": rep, "cache": state, "wall_s": wall, "ids": out.ids,
+                "rep": rep, "cache": state, "wall_s": wall, "ids": out.ids, "prompt_seed": seed, "eos_at": eos_at, "sweep_aggregate_tok_s": sweep_agg,
                 "prefill": { "timing": timing_json(&pre, Some(ttft)), "counters": counters_json(&pre, rb), "layers": layers_json(&pre, first_moe),
                              "reports": pre.reports, "routing_syncs": pre.routing_syncs, "sub_batches": pre.sub_batches },
                 "decode": { "timing": timing_json(&dec, None), "counters": counters_json(&dec, rb), "layers": layers_json(&dec, first_moe),
@@ -964,6 +1022,27 @@ mod tests {
         assert_eq!(parse_ids("[1, 2,3]\n4 5\r\n").unwrap(), vec![1, 2, 3, 4, 5]);
         assert!(parse_ids("1, x").unwrap_err().contains("\"x\" is not a token id"));
         assert!(parse_ids(" \n").is_err());
+    }
+
+    /// --random-ids: N ids in [1000, 150000), the same for one seed, others for another seed;
+    /// --stop-eos: the rows end at the first EOS row, inclusive, and the ids count up to it
+    #[test]
+    fn random_ids_and_the_eos_cut() {
+        let a = random_ids(7, 8192);
+        assert_eq!(a.len(), 8192);
+        assert!(a.iter().all(|&v| (1000..150_000).contains(&v)));
+        assert_eq!(a, random_ids(7, 8192));
+        assert_ne!(a, random_ids(8, 8192));
+        let eos = crow_nest_engine::glm5_template::EOS_IDS;
+        let mut rows = synthetic();
+        rows[3].r.next = Some(eos[0] as i64);
+        assert_eq!(cut_at_eos(&mut rows, &eos), Some(2));
+        assert_eq!(rows.len(), 4);
+        let (pre, dec, _) = phases(&rows, 2);
+        assert_eq!((pre.tokens, dec.tokens), (3, 1));
+        let mut none = synthetic();
+        assert_eq!(cut_at_eos(&mut none, &eos), None);
+        assert_eq!(none.len(), 5);
     }
 
     /// #192: the MTP counters per decode token: 10 ids from 6 steps of N = 2 (12 drafts, 4
