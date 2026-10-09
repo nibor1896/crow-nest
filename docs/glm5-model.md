@@ -77,13 +77,15 @@ refused by name. The test runs it against the real container's index, cut to lay
 ```
 cd engine
 CARGO_BUILD_JOBS=4 cargo build --release --bin decode
-target/release/decode glmgolden ../models/GLM-5.3-Flash-step06/ref-fp8 [--chain] [--layers A:B] [--cnq PATH]
+target/release/decode glmgolden ../models/GLM-5.3-Flash-step06/ref-fp8 [--chain] [--layers A:B] [--cnq PATH] [--prompt-chunk N]
 ```
 
 - Container: `--cnq`, else `CROW_CNQ`, else `converter/GLM-5.3-Flash-MUL1K3.cnq`. Refused before
   CUDA unless it is an index v2 whose config passes the glm5_next family row (38 checks) with MUL1
   expert records.
 - Calls: the runner's (`prompt_chunk` rows per prompt call, 0 = one call; each decode row alone).
+  `--prompt-chunk N` (#186) splits the prompt into calls of N rows instead: the golden is the same
+  sequence, so G3 then judges the KDA state and conv window and the MLA cache carried across calls.
 - **Golden-fed** (default): layer k reads `l<k-1>-output.f32` (layer 0: `embed.f32` in 4 streams),
   its FFN site the golden `l<k>-ffn_hc-in.f32`, so each site is judged on the golden's input. Per
   layer, site (`attn`, `ffn`) and row group (prompt, decode): `collapsed`, the sub-layer `out` and the
@@ -148,8 +150,27 @@ R, #174). The layer math is section 1 unchanged; what changes is where an expert
 - **Resident model** (`Glm5Run::load`): `load_layer_without_experts` for all 45 layers (the dense
   part, `FfnW::Moe` with no records and no table) and the head. One `KdaState` per KDA layer and
   one `MlaCache` per DSA layer; `Glm5Pass::swap_kda_state` / `swap_mla_cache` put them in around
-  the layer's call. Every row, prompt and generated, is one decode call (`t = 1`, KDA's recurrent
-  step); no chunked prefill here. Greedy head after the last prompt row.
+  the layer's call. Every generated row is one decode call (`t = 1`, KDA's recurrent step). The
+  prompt rows are decode calls too by default; with `CROW_CHUNK=N` (#186) they are prompt calls,
+  next bullet. Greedy head after the last prompt row.
+- **Prompt calls** (#186, `CROW_CHUNK=N`, default 1 = off): `Glm5Run::prefill` runs the prompt in
+  calls of N rows plus one call for the rest (`prompt_calls`); the pass and the residual are built
+  for N rows at `load`. A call is `Glm5Pass::call_with_expert_batches`: the launches of a prompt
+  call (KDA's chunk path, MLA's multi-row path), the router on all rows, ONE host sync per MoE
+  layer per call, then `ExpertTiers::tables_for_chunk`: the call's selection is served through the
+  #176 prefill staging set (`prefill_stage_slots`: 128 VRAM slots and 128 pageable landing records,
+  allocated on the first prompt call or by `glm5_run`), in consecutive row sub-batches whose staged
+  records fit it (`serve_chunk`, `fitting_rows`: all rows, else the largest power of two; one cache
+  tick per sub-batch; a stream sync before every later sub-batch). Each sub-batch's experts run on
+  its rows only (`moe_rows`); the dense FFN runs in power-of-two row pieces (`dense_rows`), so the
+  FFN plans keep the sizes the planner books (`manager::glm5_prompt_call_sizes`). The head runs
+  on the last call's last row. `plan_glm5_next_chunk` books the call's device bytes
+  (`glm5_chunk_scratch_bytes`, before any expert: 0.34 GiB at N 32, 1.40 GiB at N 128, 200,000
+  rows; N 4096 is refused by name) and takes the prefill landing off the pinned budget. Checked
+  on a synthetic model (`glm5_tiers::tests_186`): prompt calls give the bits of a layer-at-a-time
+  chain with the same calls, at every tier size and with forced sub-batches; against the
+  row-by-row path the ids are the same, not the bits (KDA's chunk path and MLA's split count sum
+  in another order). Not measured on the container yet; no speed figure.
 - **Sizes** (`tier_sizes`): VRAM and pinned slots per MoE layer are the #159 plan's `hot` and
   `pinned` at the measured free VRAM, `CROW_CONTEXT` (floor 200,000) and the derived pinned budget
   (`HOST_PINNED_CAP` 46 GiB or less: free RAM − `CROW_RAM_MARGIN_GB`). RTX 5090 of record: 50 +
@@ -256,7 +277,10 @@ counters are host integers in `serve`, the clocks sit behind syncs the path alre
 | `--json PATH` | everything below per rep, phase and MoE layer, plus args, `CROW_*` env, machine state, setup times; rewritten after every rep |
 
 **Phases.** Prefill = the prompt rows; the last prompt row runs the head and yields the first id.
-Decode = every later row, one generated id each (`-n N` gives N - 1 decode rows).
+Decode = every later row, one generated id each (`-n N` gives N - 1 decode rows). With
+`CROW_CHUNK=N` (#186) a prompt call reports once (`TokenReport::rows`, its routing syncs and
+serve sub-batches; its seconds are the call's); the prefill line names the chunk, the reports, the
+routing syncs and the sub-batches.
 
 **Clocks** (no sync added):
 - Row seconds = `TokenReport::secs`: `Instant` at the row's start in `Glm5Run::generate` (before

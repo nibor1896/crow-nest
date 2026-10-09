@@ -790,6 +790,11 @@ pub struct TierInput {
     pub states_bytes: u64,
     /// the cold staging slots (`Stability::stage_slots`) times one expert block
     pub staging_bytes: u64,
+    /// #186: the prompt phase's device bytes at its chunk above a one-row pass
+    /// ([`glm5_chunk_scratch_bytes`]); 0 at chunk 1 (every row one decode call)
+    pub chunk_scratch_bytes: u64,
+    /// #186: the prompt chunk the plan books (1 = row by row)
+    pub chunk: usize,
     /// `LAUNCH_SLACK`
     pub launch_slack: u64,
     /// one routed expert of one MoE layer
@@ -838,13 +843,15 @@ pub fn plan_three_tiers(i: &TierInput) -> Result<TierPlan, String> {
     let vram_ceiling = i.stability.vram_ceiling(i.vram_total);
     // the clamp's own sum (`clamp_hot_n`): what must fit the card, the policy reserve inside pending
     let pending = planner_pending_for(&i.stability, i.vram_total, i.launch_slack, 0, 0, 0);
-    let need = i.dense_bytes + i.decoded_bytes + i.states_bytes + i.staging_bytes + pending + SAFETY;
+    let need = i.dense_bytes + i.decoded_bytes + i.states_bytes + i.staging_bytes + i.chunk_scratch_bytes + pending + SAFETY;
     // the same sum without the reserve: what lands below the ceiling
     let fixed_bytes = need - i.stability.planner_reserve(i.vram_total);
     if need > i.vram_total {
         return Err(format!(
-            "refusing config: family Glm5Next needs {:.2} GiB before any expert (dense part {:.2} + kv_b at BF16 {:.2} + states {:.2} + staging {:.2} + launch slack {:.2} + safety {:.2}) against a VRAM plan ceiling of {:.2} GiB (card {:.2} GiB - headroom {:.2} GiB, cap {}) - the dense part does not fit, no expert tier changes that (#159)",
-            gib(fixed_bytes), gib(i.dense_bytes), gib(i.decoded_bytes), gib(i.states_bytes), gib(i.staging_bytes), gib(i.launch_slack), gib(SAFETY),
+            "refusing config: family Glm5Next needs {:.2} GiB before any expert (dense part {:.2} + kv_b at BF16 {:.2} + states {:.2} + staging {:.2}{} + launch slack {:.2} + safety {:.2}) against a VRAM plan ceiling of {:.2} GiB (card {:.2} GiB - headroom {:.2} GiB, cap {}) - the dense part does not fit, no expert tier changes that (#159)",
+            gib(fixed_bytes), gib(i.dense_bytes), gib(i.decoded_bytes), gib(i.states_bytes), gib(i.staging_bytes),
+            if i.chunk > 1 { format!(" + prompt chunk {} (CROW_CHUNK, #186) {:.2}", i.chunk, gib(i.chunk_scratch_bytes)) } else { String::new() },
+            gib(i.launch_slack), gib(SAFETY),
             gib(vram_ceiling), gib(i.vram_total), gib(i.stability.vram_headroom),
             i.stability.vram_cap.map_or("none".to_string(), |c| format!("{:.2} GiB", gib(c)))
         ));
@@ -854,6 +861,57 @@ pub fn plan_three_tiers(i: &TierInput) -> Result<TierPlan, String> {
     let hot = (((i.vram_total - need) / unit) as usize).min(i.experts);
     let pinned = ((i.host_pinned_budget / unit) as usize).min(i.experts - hot);
     Ok(TierPlan { vram_ceiling, fixed_bytes, unit_bytes, hot, pinned, nvme: i.experts - hot - pinned })
+}
+
+/// #186: the FFN plan sizes of a glm5_next prompt phase at `chunk` rows per call besides the
+/// one-row decode call: every power of two above 1 and below `chunk`, then `chunk`. The MoE router
+/// runs on the `chunk` plan; a call's dense FFN and the experts of its row sub-batches run in
+/// power-of-two row pieces (`glm5_model::dense_rows`, `glm5_model::moe_rows`). Empty at chunk 1.
+pub fn glm5_prompt_call_sizes(chunk: usize) -> Vec<usize> {
+    let mut v: Vec<usize> = (1..usize::BITS).map(|i| 1usize << i).take_while(|&p| p < chunk).collect();
+    if chunk > 1 {
+        v.push(chunk);
+    }
+    v
+}
+
+/// #186: the device bytes the glm5_next prompt phase holds at `chunk` rows per call over a cache
+/// of `cap` rows, above what a one-row pass holds: the pass scratch at `max_t = chunk` minus at 1
+/// (`glm5_mhc::Plan`, `KdaScratch`, `MlaScratch` with the indexer scores `max_t x cap / kpool`,
+/// the collapsed and sublayer rows), the residual's `chunk - 1` more rows, and one MoE plan
+/// (`GpuMoePlan`: router, gathered rows, MUL1 GEMV plans of `t x topk` slots, shared expert) plus
+/// one dense FFN plan (`GpuFfnPlan`) per call size of [`glm5_prompt_call_sizes`]. The small
+/// parameter arrays are left out (the GPU test `glm5_model::tests_186_gpu` holds the sum to the
+/// bytes the allocations register). 0 at chunk 1.
+pub fn glm5_chunk_scratch_bytes(g: &Glm5Geo, chunk: usize, cap: usize) -> u64 {
+    use crate::glm5_kda::KdaDims;
+    use crate::glm5_mhc::{HC, MIX};
+    use crate::glm5_mla::{MlaDims, KPOOL};
+    if chunk <= 1 {
+        return 0;
+    }
+    let (kd, md, h) = (KdaDims::of(g), MlaDims::of(g), g.hidden);
+    let pass = |m: usize| -> u64 {
+        let mhc = m * (MIX + HC + HC + HC * HC);
+        let kda = m * (3 * kd.conv_ch() + 10 * kd.width() + 2 * kd.head_dim + 2 * kd.heads);
+        let mla_rows = md.q_lora + md.heads * md.nope + md.kv_lora + md.idx_proj() + md.idx_heads * md.idx_dim + (cap / KPOOL).max(1) + 3 + md.sel_max() + 2 * md.heads * md.kv_lora + md.heads * md.v;
+        let mla = m * mla_rows + m.max(16) * (md.heads * md.kv_lora + md.heads * 2);
+        4 * (mhc + kda + mla + 2 * m * h) as u64
+    };
+    let (sh, si) = (crate::kernels::mul1::ksplit(h) as u64, crate::kernels::mul1::ksplit(g.expert_inter) as u64);
+    let (hh, ii, ee, ss) = (h as u64, g.expert_inter as u64, g.experts as u64, (g.expert_inter * g.shared_experts) as u64);
+    let moe_plan = |t: usize| -> u64 {
+        let (t, c) = (t as u64, (t * g.topk) as u64);
+        // logits, ids, wts, ptrs (u64), xg, ge / ue / he, ye, ys, the shared expert's g / u / h
+        let plan = 4 * (t * ee + 2 * c + 2 * c + c * hh + 3 * c * ii + c * hh + t * hh + 3 * t * ss);
+        // gate and up (k = hidden, n = inter), down (k = inter, n = hidden): xh + part each
+        let gemv = 4 * (2 * (c * hh + c * sh * ii) + (c * ii + c * si * hh));
+        plan + gemv
+    };
+    let dense_plan = |t: usize| 4 * 3 * t as u64 * g.dense_inter as u64;
+    let plans: u64 = glm5_prompt_call_sizes(chunk).into_iter().map(|t| moe_plan(t) + dense_plan(t)).sum();
+    let residual = ((chunk - 1) * g.hc_streams * h * 4) as u64;
+    pass(chunk) - pass(1) + residual + plans
 }
 
 /// #159: the glm5_next plan from its geometry: the states at `context`, the staging of its
@@ -873,12 +931,35 @@ pub fn plan_glm5_next(
     pf_tg: usize,
     pf_async: bool,
 ) -> Result<(Glm5States, TierInput, TierPlan), String> {
+    plan_glm5_next_chunk(g, context, vram_total, host_pinned_budget, dense_bytes, expert_block_bytes, pf_tg, pf_async, 1)
+}
+
+/// #186: [`plan_glm5_next`] for a prompt phase in calls of up to `chunk` rows (`CROW_CHUNK`,
+/// `glm5_tiers::prompt_chunk_from_env`). Above chunk 1 the plan also books the prompt phase's
+/// device bytes ([`glm5_chunk_scratch_bytes`], in VRAM before any expert) and takes the pageable
+/// landing of the prefill staging set (one record per prefill slot, allocated next to the
+/// pinned arenas) off the pinned budget. Chunk 1 is `plan_glm5_next` byte for byte. A chunk
+/// whose bytes do not fit is refused by name (`plan_three_tiers`).
+#[allow(clippy::too_many_arguments)]
+pub fn plan_glm5_next_chunk(
+    g: &Glm5Geo,
+    context: usize,
+    vram_total: u64,
+    host_pinned_budget: u64,
+    dense_bytes: u64,
+    expert_block_bytes: u64,
+    pf_tg: usize,
+    pf_async: bool,
+    chunk: usize,
+) -> Result<(Glm5States, TierInput, TierPlan), String> {
     if let Some(why) = expert_record_refusal(expert_block_bytes) {
         return Err(why);
     }
+    let chunk = chunk.clamp(1, context.max(1));
     let stability = Stability::of(Family::Glm5Next);
     let states = Glm5States::plan(g, context);
     let slots = stability.stage_slots(g.topk, pf_tg, pf_async);
+    let landing = if chunk > 1 { slots.prefill as u64 * expert_block_bytes } else { 0 };
     let input = TierInput {
         vram_total,
         stability,
@@ -888,11 +969,13 @@ pub fn plan_glm5_next(
         states_bytes: states.total(),
         // decode and prefill sets apart (#176): both are held, one record per slot
         staging_bytes: slots.bytes(expert_block_bytes),
+        chunk_scratch_bytes: glm5_chunk_scratch_bytes(g, chunk, context),
+        chunk,
         launch_slack: LAUNCH_SLACK,
         expert_block_bytes,
         moe_layers: g.moe_layers(),
         experts: g.experts,
-        host_pinned_budget,
+        host_pinned_budget: host_pinned_budget.saturating_sub(landing),
     };
     let plan = plan_three_tiers(&input)?;
     Ok((states, input, plan))
@@ -978,6 +1061,9 @@ pub fn glm5_plan_table(g: &Glm5Geo, s: &Glm5States, i: &TierInput, p: &TierPlan,
     o.push(format!("  indexer cache        {:>16} B  {:>7.2} GiB  {} x {} tokens x {} B", s.indexer_bytes, gib(s.indexer_bytes), g.dsa_layers, s.context, s.indexer_per_token));
     o.push(format!("  KDA state + conv     {:>16} B  {:>7.2} GiB  {} layers x ({} + {} B) per sequence", s.kda_state_bytes + s.kda_conv_bytes, gib(s.kda_state_bytes + s.kda_conv_bytes), g.kda_layers, g.kda_state_bytes(), g.kda_conv_bytes()));
     o.push(format!("  cold staging         {:>16} B  {:>7.2} GiB  {} slots (decode and prefill sets apart, #176)", i.staging_bytes, gib(i.staging_bytes), slots));
+    if i.chunk > 1 {
+        o.push(format!("  prompt chunk         {:>16} B  {:>7.2} GiB  {} rows per prompt call (CROW_CHUNK, #186): pass scratch, residual rows, FFN plans of {:?} rows", i.chunk_scratch_bytes, gib(i.chunk_scratch_bytes), i.chunk, glm5_prompt_call_sizes(i.chunk)));
+    }
     o.push(format!("  launch slack + safety{:>16} B  {:>7.2} GiB", i.launch_slack + SAFETY, gib(i.launch_slack + SAFETY)));
     o.push("  activations/scratch  not measured (GLM widths; the step-14 boot measures them against free VRAM)".to_string());
     o.push(format!("  room for experts     {:>16} B  {:>7.2} GiB", p.vram_ceiling - p.fixed_bytes, gib(p.vram_ceiling - p.fixed_bytes)));
@@ -2130,5 +2216,46 @@ mod tests_rec_size {
         assert!(glm5_plan_record(&g, None, Some("9474048"), Some("nvfp4")).unwrap_err().contains("the config derives 14155776 B at nvfp4"));
         // a container that is not there is a named error, not a fallback
         assert!(glm5_plan_record(&g, Some("no-such-container.cnq"), None, None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests_186_chunk_plan {
+    //! #186: the glm5_next plan with a prompt chunk (`CROW_CHUNK`): chunk 1 is the plan of
+    //! record byte for byte; a chunk books its prompt-phase bytes before any expert and the
+    //! prefill landing off the pinned budget; a chunk that does not fit is refused by name.
+    use super::*;
+
+    const CARD: u64 = 32_607 << 20; // RTX 5090, docs/system-landscape.md:12
+    const MUL1_PLAN: u64 = 9_474_048;
+
+    fn plan(chunk: usize) -> Result<(Glm5States, TierInput, TierPlan), String> {
+        plan_glm5_next_chunk(&Glm5Geo::GLM_5_3_FLASH, 200_000, CARD, HOST_PINNED_CAP, GLM5_NEXT_DENSE_BYTES, MUL1_PLAN, 64, true, chunk)
+    }
+
+    #[test]
+    fn chunk_one_is_the_plan_of_record_and_a_chunk_books_its_bytes() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let (s0, i0, p0) = plan_glm5_next(&g, 200_000, CARD, HOST_PINNED_CAP, GLM5_NEXT_DENSE_BYTES, MUL1_PLAN, 64, true).unwrap();
+        let (s1, i1, p1) = plan(1).unwrap();
+        assert_eq!((s0.total(), p0), (s1.total(), p1));
+        assert_eq!((i1.chunk, i1.chunk_scratch_bytes, i1.host_pinned_budget), (1, 0, i0.host_pinned_budget));
+        assert_eq!(glm5_chunk_scratch_bytes(&g, 1, 200_000), 0);
+        let mut last = 0;
+        for chunk in [2, 16, 32, 128] {
+            let (_, i, p) = plan(chunk).unwrap();
+            let b = glm5_chunk_scratch_bytes(&g, chunk, 200_000);
+            assert!(b > last, "chunk {chunk}: {b} B, not above {last}");
+            last = b;
+            assert_eq!((i.chunk, i.chunk_scratch_bytes), (chunk, b));
+            assert_eq!(i.host_pinned_budget, HOST_PINNED_CAP - 128 * MUL1_PLAN, "the 128-record prefill landing comes off the pinned budget");
+            assert_eq!(p.fixed_bytes, p0.fixed_bytes + b, "the chunk's bytes are booked before any expert");
+            assert!(p.hot <= p0.hot && p.hot + p.pinned + p.nvme == g.experts);
+            let t = glm5_plan_table(&g, &s0, &i, &p, &[]);
+            assert!(t.contains(&format!("{chunk} rows per prompt call (CROW_CHUNK, #186)")), "{t}");
+            eprintln!("glm5 plan #186 chunk {chunk}: prompt-phase bytes {b} ({:.2} GiB), N {} P {} NVMe {} (chunk 1: {} / {} / {})", b as f64 / GIB, p.hot, p.pinned, p.nvme, p0.hot, p0.pinned, p0.nvme);
+        }
+        let e = plan(4096).unwrap_err();
+        assert!(e.contains("prompt chunk 4096 (CROW_CHUNK, #186)"), "{e}");
     }
 }

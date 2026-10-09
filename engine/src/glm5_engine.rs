@@ -185,6 +185,11 @@ impl Rows for Glm5Device {
     unsafe fn row(&mut self, tok: i64, pos: usize, head: bool) -> Result<Option<i64>, String> {
         self.run.row(&mut self.o.cnq, &mut self.tiers, tok, pos, head)
     }
+    unsafe fn prefill_chunk(&mut self, ids: &[i64], pos0: usize) -> Result<i64, String> {
+        // #186: `CROW_CHUNK` > 1 runs the chunk as prompt calls; 1 (unset) is the row loop of
+        // the trait's default, row for row
+        self.run.prefill(&mut self.o.cnq, &mut self.tiers, ids, pos0, &mut |_| {})
+    }
     unsafe fn logits(&self) -> Vec<f32> {
         cuda::dtoh(self.run.logits_dev(), self.o.g.vocab)
     }

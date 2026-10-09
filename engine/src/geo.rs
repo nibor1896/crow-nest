@@ -286,6 +286,13 @@ pub fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
     std::env::var(key).ok().and_then(|v| v.parse().ok())
 }
 
+/// `CROW_CHUNK=<n>` (at least 1), the one reading of the prefill chunk variable: the policy of
+/// Flash-Next and the 27B ([`apply_chunk_policy`]) and the glm5_next prompt phase (#186,
+/// `glm5_tiers::prompt_chunk_from_env`) both take it from here
+pub fn chunk_from_env() -> Option<usize> {
+    env_parse::<usize>("CROW_CHUNK").map(|c| c.max(1))
+}
+
 /// Prefill chunk policy (#16). `CROW_CHUNK=<n>` is authoritative; without it the
 /// chunk follows the prompt length (rounded up to 512, at most 4096), so a short
 /// prompt keeps the chunk-512 scratch and its larger hot set and a long prompt
@@ -299,9 +306,9 @@ pub fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
 /// deterministic since #22, chunk 4096 gated by #10b (F47 env-vs-env parity,
 /// the 16k parity form, ten-task final4 identity, the F49 prefill pairs).
 pub fn apply_chunk_policy(cfg: &mut Config, n_prompt: usize) {
-    let explicit = env_parse::<usize>("CROW_CHUNK");
+    let explicit = chunk_from_env();
     if let Some(c) = explicit {
-        cfg.prompt_chunk = c.max(1);
+        cfg.prompt_chunk = c;
     }
     let auto = match std::env::var("CROW_CHUNK_AUTO").as_deref() {
         Ok("0") => false,

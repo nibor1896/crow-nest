@@ -732,6 +732,12 @@ pub struct Taps {
 /// i32)` -> the device `[E]` u64 record table the MUL1 kernels read for this call
 pub type ExpertHook<'a> = dyn FnMut(usize, &[i32]) -> Result<Dev, String> + 'a;
 
+/// #186: the expert hook of [`Glm5Pass::call_with_expert_batches`]: `(layer, selected ids
+/// [t][topk] i32, run)`. The hook puts the records of consecutive row sub-batches in place and
+/// calls `run(row0, rows, table)` for each, in row order, every row exactly once; `run` queues
+/// that sub-batch's experts through the device `[E]` u64 `table`.
+pub type ExpertBatchHook<'a> = dyn FnMut(usize, &[i32], &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<(), String> + 'a;
+
 /// The per-sequence state and scratch of a layer-at-a-time pass over up to `cap` rows in calls
 /// of up to `max_t` rows: one mHC plan, one KDA state + scratch (reset per layer), one MLA cache
 /// + scratch, the FFN plans per call size. Every launch queues on the current stream.
@@ -1051,6 +1057,166 @@ pub unsafe fn router_ids(routed: Option<&mut crate::glm5_flags::Routed>, ids: De
             r.publish(ids, n);
             r.wait().map_err(|e| format!("layer {layer}: {e}"))
         }
+    }
+}
+
+/// #186: the prompt call with its experts in row sub-batches.
+impl Glm5Pass {
+    /// #186: one prompt call (`decode` false) of a layer loaded without its expert records, its
+    /// MoE selection served in row sub-batches. The launches of [`Glm5Pass::call_with_experts`]
+    /// for a prompt call, in the same order, up to the FFN. The FFN plans stay at the sizes the
+    /// plan books (`manager::glm5_prompt_call_sizes`) whatever `t` is: a dense FFN runs in
+    /// descending power-of-two row pieces ([`dense_rows`]); the MoE router runs on the plan of
+    /// `max_t` rows (rows `t ..` of that launch read stale rows and are never used), the host
+    /// reads the `t` rows' ids (one stream sync for the call), and `experts` hands back the
+    /// sub-batches: each one's experts run on its rows only ([`moe_rows`]). Every FFN launch is
+    /// per row or per (row, expert) combo, so each row gets the bits of one `t`-row call.
+    ///
+    /// # Safety
+    /// As [`Glm5Pass::call`]; every table entry of a sub-batch's selected id is a readable record
+    /// base until `run` for the next sub-batch is called or the call returns.
+    pub unsafe fn call_with_expert_batches(&mut self, lw: &LayerW, x: Dev, pos0: usize, t: usize, experts: &mut ExpertBatchHook) -> Result<(), String> {
+        assert!((1..=self.max_t).contains(&t) && pos0 + t <= self.cap, "glm5_model: call rows {pos0}..{} (max_t {}, cap {})", pos0 + t, self.max_t, self.cap);
+        let h = self.g.hidden;
+        let (kn, ints) = (&self.kn, &self.ints);
+        // attention site: `call_inner`'s launches for a prompt call, without taps
+        self.mhc.coeffs(&kn.mhc, &lw.attn_hc, x, self.collapsed, t);
+        kn.mla.rmsnorm_rows(self.collapsed, lw.input_norm, h, t, self.st2);
+        match &lw.attn {
+            AttnW::Kda(a) => {
+                let wd = kn.kda.d.width();
+                let mut proj = |p: KdaProj, xi: Dev, yo: Dev, tt: usize| match p {
+                    KdaProj::Qkv => {
+                        let cc = kn.kda.d.conv_ch();
+                        fp4_gemv(&kn.k, ints, &a.q, xi, yo, tt, Some(cc));
+                        fp4_gemv(&kn.k, ints, &a.k, xi, yo + (wd * 4) as u64, tt, Some(cc));
+                        fp4_gemv(&kn.k, ints, &a.v, xi, yo + (2 * wd * 4) as u64, tt, Some(cc));
+                    }
+                    KdaProj::O => fp4_gemv(&kn.k, ints, &a.o, xi, yo, tt, None),
+                };
+                glm5_kda::prompt_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, t, self.sub, &mut proj);
+            }
+            AttnW::Mla(a) => {
+                let mut proj = |s: &MlaScratch, p: MlaProj, xi: Dev, yo: Dev| {
+                    let m = match p {
+                        MlaProj::QA => &a.q_a,
+                        MlaProj::QB => &a.q_b,
+                        MlaProj::KVA => &a.kv_a,
+                        MlaProj::O => &a.o,
+                    };
+                    fp4_gemv(&kn.k, ints, m, xi, yo, s.t(), None);
+                };
+                self.mla_sc.forward_with(&kn.mla, &a.w, &self.mla_c, self.collapsed, self.sub, pos0, t, &mut proj);
+            }
+        }
+        self.mhc.expand(&kn.mhc, x, self.sub, x, t);
+        // FFN site
+        self.mhc.coeffs(&kn.mhc, &lw.ffn_hc, x, self.collapsed, t);
+        kn.mla.rmsnorm_rows(self.collapsed, lw.post_norm, h, t, self.st2);
+        let w = match &lw.ffn {
+            FfnW::Dense(w) => {
+                let (inter, limit) = (self.g.dense_inter, self.g.swiglu_limit as f32);
+                dense_rows(&self.kn.k, &self.kn.moe, &mut self.dense_plans, h, inter, limit, w, self.collapsed, self.sub, t);
+                self.last_ffn_t = t;
+                self.mhc.expand(&self.kn.mhc, x, self.sub, x, t);
+                return Ok(());
+            }
+            FfnW::Moe { w, .. } => w,
+        };
+        let mt = self.max_t;
+        if !self.moe_plans.iter().any(|p| p.tokens == mt) {
+            self.moe_plans.push(GpuMoePlan::new(&self.moe, mt));
+        }
+        let full = self.moe_plans.iter().position(|p| p.tokens == mt).unwrap();
+        self.moe_plans[full].route(&self.kn.k, &self.kn.moe, w, self.collapsed);
+        let ids = router_ids(None, self.moe_plans[full].ids, t * self.moe.topk, lw.layer)?;
+        let (kn, moe, plans, collapsed, sub) = (&self.kn, self.moe, &mut self.moe_plans, self.collapsed, self.sub);
+        let mut covered = 0usize;
+        let mut run = |r0: usize, rows: usize, table: Dev| -> Result<(), String> {
+            if r0 != covered || rows == 0 || r0 + rows > t {
+                return Err(format!("layer {}: a sub-batch of rows {r0}..{} after {covered} of {t} rows", lw.layer, r0 + rows));
+            }
+            moe_rows(&kn.k, &kn.mul1, &kn.moe, &moe, plans, full, w, table, collapsed, sub, r0, rows);
+            covered += rows;
+            Ok(())
+        };
+        experts(lw.layer, &ids, &mut run)?;
+        if covered != t {
+            return Err(format!("layer {}: the expert hook served {covered} of {t} rows", lw.layer));
+        }
+        self.last_ffn_t = t;
+        self.mhc.expand(&self.kn.mhc, x, self.sub, x, t);
+        Ok(())
+    }
+}
+
+/// #186: the dense FFN of rows `0 .. t` of `x` into `y` in descending power-of-two row pieces,
+/// each on the `GpuFfnPlan` of its size (made here on first use; the sizes the plan books,
+/// `manager::glm5_prompt_call_sizes`). Every launch is per row, so each row gets the bits of one
+/// `t`-row plan.
+///
+/// # Safety
+/// A CUDA context is current; `x` and `y` hold `t` rows of `hidden`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dense_rows(kn: &kernels::Kernels, gk: &kernels::glm5_moe::Kernels, plans: &mut Vec<GpuFfnPlan>, hidden: usize, inter: usize, limit: f32, w: &GpuFfnWeights, x: Dev, y: Dev, t: usize) {
+    let mut r = 0;
+    while r < t {
+        let s = 1usize << (usize::BITS - 1 - (t - r).leading_zeros());
+        if !plans.iter().any(|p| p.tokens == s) {
+            plans.push(GpuFfnPlan::new(hidden, inter, s, limit));
+        }
+        let p = plans.iter().find(|p| p.tokens == s).unwrap();
+        p.run(kn, gk, w, x + (r * hidden * 4) as u64, y + (r * hidden * 4) as u64);
+        r += s;
+    }
+}
+
+/// #186: the routed experts of rows `r0 .. r0 + rows` of the MoE call routed in `plans[full]`
+/// (`GpuMoePlan::route` ran on its `tokens` rows of `x`), through `table`, into those rows of `y`.
+/// The whole call is `plans[full].experts` itself; any other row range runs in descending
+/// power-of-two pieces, each on the plan of its size (made here on first use, the sizes the plan
+/// books, `manager::glm5_prompt_call_sizes`) with its rows' ids and weights copied from
+/// `plans[full]` (D2D). Every launch is per row or per (row, expert) combo, so each row gets the
+/// bits of the whole call.
+///
+/// # Safety
+/// A CUDA context is current; `x` and `y` hold `plans[full].tokens` rows; every table entry of
+/// a selected id of these rows is a readable record base until the launches finished.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn moe_rows(
+    kn: &kernels::Kernels,
+    mk: &mul1::Kernels,
+    gk: &kernels::glm5_moe::Kernels,
+    moe: &MoeGeo,
+    plans: &mut Vec<GpuMoePlan>,
+    full: usize,
+    w: &GpuMoeWeights,
+    table: Dev,
+    x: Dev,
+    y: Dev,
+    r0: usize,
+    rows: usize,
+) {
+    let t = plans[full].tokens;
+    assert!(rows >= 1 && r0 + rows <= t, "glm5_model: expert rows {r0}..{} of a {t}-row call", r0 + rows);
+    if r0 == 0 && rows == t {
+        plans[full].experts(kn, mk, gk, w, table, x, y);
+        return;
+    }
+    let (h, k) = (moe.hidden, moe.topk);
+    let (ids, wts) = (plans[full].ids, plans[full].wts);
+    let mut r = r0;
+    while r < r0 + rows {
+        let left = r0 + rows - r;
+        let s = 1usize << (usize::BITS - 1 - left.leading_zeros());
+        if !plans.iter().any(|p| p.tokens == s) {
+            plans.push(GpuMoePlan::new(moe, s));
+        }
+        let p = plans.iter().find(|p| p.tokens == s).unwrap();
+        cuda::d2d_async(p.ids, ids + (r * k * 4) as u64, s * k * 4);
+        cuda::d2d_async(p.wts, wts + (r * k * 4) as u64, s * k * 4);
+        p.experts(kn, mk, gk, w, table, x + (r * h * 4) as u64, y + (r * h * 4) as u64);
+        r += s;
     }
 }
 
