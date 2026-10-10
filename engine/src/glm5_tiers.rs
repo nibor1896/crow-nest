@@ -2030,6 +2030,46 @@ pub fn serve_chunk_global(
     Ok(batches)
 }
 
+/// #196: `CROW_GLM_STAGE_OVERLAP=1` serves the global arena's prompt sub-batches through the
+/// prefill copy stream and two staging halves ([`serve_chunk_global_overlap`]) instead of the
+/// compute stream with a host synchronize between sub-batches. Off (default) = unchanged.
+pub const STAGE_OVERLAP_ENV: &str = "CROW_GLM_STAGE_OVERLAP";
+
+/// whether [`STAGE_OVERLAP_ENV`] is `1`
+pub fn stage_overlap_on(v: Option<&str>) -> bool {
+    v.map(str::trim) == Some("1")
+}
+
+/// #196 [`serve_chunk_global`] with `CROW_GLM_STAGE_OVERLAP=1`: no host barrier between
+/// sub-batches; each sub-batch's copies are bracketed by `begin_batch` / `end_batch`, so a mover
+/// on a copy stream with staging halves (the global [`PrefillMover`]) fills half `j % 2` while
+/// the kernels of sub-batch `j - 1` read the other (template: glm53-flash-offload @ 6769b27
+/// kernels/nv2/nv2_host.cpp#L782-L852, copy stream + events, no host synchronize per copy).
+#[allow(clippy::too_many_arguments)]
+pub fn serve_chunk_global_overlap(
+    a: &mut GlobalArena,
+    l: usize,
+    sel: &[i32],
+    k: usize,
+    cap: usize,
+    m: &mut dyn Mover,
+    each: &mut dyn FnMut(usize, usize, &Served) -> Result<(), String>,
+) -> Result<usize, String> {
+    let t = sel.len() / k;
+    let (mut r0, mut batches) = (0, 0);
+    while r0 < t {
+        let rows = fitting_rows_global(a, l, &sel[r0 * k..], k, cap)?;
+        let ids = distinct_ids(&sel[r0 * k..(r0 + rows) * k], a.experts)?;
+        m.begin_batch(batches);
+        let served = serve_global_prompt(a, l, &ids, cap, m)?;
+        m.end_batch();
+        each(r0, rows, &served)?;
+        batches += 1;
+        r0 += rows;
+    }
+    Ok(batches)
+}
+
 /// a mover whose VRAM and pinned bases can be pointed at another allocation, and the stream its
 /// copies run on
 trait Rebase<'a> {
@@ -3542,21 +3582,53 @@ impl ExpertTiers {
             r.sync_all();
         }
         let (vram, pinned) = (&d.chunks, &self.pinned);
-        let inner = GpuMover { vram: 0, pinned: None, stage, landing: self.arena_landing.p, rb, src: &self.src, recs: &self.records[l] };
-        let mut m = ChunkMover { inner, vram, pinned, vpl, ppl, rb, ring: None };
         let (mut reads, mut bytes, mut moves) = (0u64, 0u64, Moves::default());
-        let mut each = |r0: usize, rows: usize, served: &Served| -> Result<(), String> {
-            let mut table = vec![0u64; experts];
-            for &(e, loc) in &served.locs {
-                table[e as usize] = arena_addr(vram, pinned, vpl, ppl, stage, rb, loc);
-            }
-            cuda::to_u64_into(table_dev, &table);
-            reads += served.nvme_reads as u64;
-            bytes += served.nvme_bytes;
-            moves.add(&served.moves);
-            run(r0, rows, table_dev)
+        let r = if stage_overlap_on(std::env::var(STAGE_OVERLAP_ENV).ok().as_deref()) {
+            // #196: two staging halves when each holds a row's top-k; sub-batch j's copies run on
+            // the prefill copy stream into half j % 2 while the kernels of sub-batch j - 1 read
+            // the other; the compute stream waits on an event, the host on nothing per copy
+            let halves = if self.pf_cap >= 2 * k { 2 } else { 1 };
+            let half = self.pf_cap / halves;
+            let pf = self.pf_ring.as_mut().expect("the prefill ring is allocated with the staging set");
+            let free_ev = pf.free_ev;
+            let tab = self.ovl_tab.get_or_insert_with(|| OvlTables::new(experts));
+            let inner = PrefillMover { pinned: None, stage, half, halves, base: stage, rb, src: &self.src, recs: &self.records[l], pf, landed: Vec::new() };
+            let mut m = GlobalPrefillMover { inner, pinned, ppl };
+            let mut j = 0usize;
+            let mut each = |r0: usize, rows: usize, served: &Served| -> Result<(), String> {
+                let h = j % halves;
+                let base = stage + (h * half) as u64 * rb;
+                let mut table = vec![0u64; experts];
+                for &(e, loc) in &served.locs {
+                    table[e as usize] = arena_addr(vram, pinned, vpl, ppl, base, rb, loc);
+                }
+                tab.upload(h, table_dev, &table);
+                reads += served.nvme_reads as u64;
+                bytes += served.nvme_bytes;
+                moves.add(&served.moves);
+                let r = run(r0, rows, table_dev);
+                // the half is free again once these kernels are done
+                cuda::event_record(free_ev[h], cuda::cur_stream());
+                j += 1;
+                r
+            };
+            serve_chunk_global_overlap(&mut d.a, l, sel, k, half, &mut m, &mut each)
+        } else {
+            let inner = GpuMover { vram: 0, pinned: None, stage, landing: self.arena_landing.p, rb, src: &self.src, recs: &self.records[l] };
+            let mut m = ChunkMover { inner, vram, pinned, vpl, ppl, rb, ring: None };
+            let mut each = |r0: usize, rows: usize, served: &Served| -> Result<(), String> {
+                let mut table = vec![0u64; experts];
+                for &(e, loc) in &served.locs {
+                    table[e as usize] = arena_addr(vram, pinned, vpl, ppl, stage, rb, loc);
+                }
+                cuda::to_u64_into(table_dev, &table);
+                reads += served.nvme_reads as u64;
+                bytes += served.nvme_bytes;
+                moves.add(&served.moves);
+                run(r0, rows, table_dev)
+            };
+            serve_chunk_global(&mut d.a, l, sel, k, self.pf_cap, &mut m, &mut each)
         };
-        let r = serve_chunk_global(&mut d.a, l, sel, k, self.pf_cap, &mut m, &mut each);
         if r.is_ok() {
             self.count_heat(l, sel);
         }
@@ -3950,6 +4022,15 @@ mod arena_tests {
     //! `CROW_GLM_ARENA=global`: the host policy ([`GlobalArena`]), its execution ([`serve_global`])
     //! on a memory twin, the switches, the ring book, and a replay on recorded routing (ignored).
     use super::*;
+
+    /// #196: `CROW_GLM_STAGE_OVERLAP` is on only at `1` (unset, `0` and anything else = the old path)
+    #[test]
+    fn the_stage_overlap_switch_is_on_only_at_1() {
+        assert!(stage_overlap_on(Some("1")) && stage_overlap_on(Some(" 1 ")));
+        for v in [None, Some("0"), Some(""), Some("on"), Some("2")] {
+            assert!(!stage_overlap_on(v), "{v:?}");
+        }
+    }
     use crate::expert_cache::Policy;
 
     /// the xorshift64 trace of `docs/expert-cache.md` (`expert_cache` tests, the same generator in
@@ -4965,7 +5046,7 @@ mod arena_gpu_tests {
 
     impl Env {
         fn set(kv: &[(&str, &str)]) -> Env {
-            let names = [ARENA_ENV, ARENA_ADMIT_MAX_ENV, ARENA_NOADMIT_ENV, ARENA_WARM_ENV, ARENA_VRING_ENV, ARENA_ELASTIC_ENV, ARENA_STAGE_ENV, ARENA_STAGE_MIN_ENV];
+            let names = [ARENA_ENV, ARENA_ADMIT_MAX_ENV, ARENA_NOADMIT_ENV, ARENA_WARM_ENV, ARENA_VRING_ENV, ARENA_ELASTIC_ENV, ARENA_STAGE_ENV, ARENA_STAGE_MIN_ENV, STAGE_OVERLAP_ENV];
             let old = names.iter().map(|n| (n.to_string(), std::env::var(n).ok())).collect();
             for n in names {
                 std::env::remove_var(n);
@@ -5279,6 +5360,123 @@ mod arena_gpu_tests {
                 assert_eq!(st.prefetched, 2 * (nl as u64 - 1), "{what}: the next layer staged ahead in every call but the last");
                 assert!(st.host_wait_ns / st.calls < 1_000_000, "{what}: no NVMe wait on the host thread: {} ns per call", st.host_wait_ns / st.calls);
                 t.free();
+            }
+        }
+        drop(cnq);
+    }
+
+    /// #196 `CROW_GLM_STAGE_OVERLAP=1`: prompt calls of the global arena without per-forward
+    /// staging, served in sub-batches of half the prefill staging set through the copy stream.
+    /// No host synchronize inside a forward: each `run` only queues (behind a long dummy copy on
+    /// the compute stream) a snapshot of the table and of the head of every staging slot; after
+    /// the forward every snapshot holds the bytes `read_range` gives, so no copy overwrote a half
+    /// its kernels still read. The default path is checked the same way.
+    #[test]
+    #[ignore = "needs the GPU (about 1.5 GB VRAM, a 606 MB synthetic container in the temp dir): cargo test --release --lib glm5_stage_overlap_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_stage_overlap_gpu_sub_batches_on_the_copy_stream_match_read_range() {
+        let (nl, ex) = (4usize, 16u32);
+        let s = synth(nl as u32, ex);
+        let mut g = Glm5Geo::GLM_5_3_FLASH;
+        (g.layers, g.dense_prefix, g.experts, g.topk) = (3 + nl, 3, ex as usize, 8);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let rb = spec.bytes as usize;
+        let want: Vec<Vec<Vec<u8>>> =
+            (0..nl).map(|l| (0..ex).map(|e| cnq.read_range(&cnq.find(&crate::nvme_source::glm5_expert_tensor_name(3 + l as u32, e, "gate"), "text").clone(), 0, rb)).collect()).collect();
+        let tr = routing(16, nl, ex as u64, 8, 0x196);
+        const HEAD: usize = 4096;
+        const SLOTS: usize = 16;
+        const MAX_SNAP: usize = 256;
+        let per = SLOTS * HEAD + ex as usize * 8;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut snap = cuda::alloc_named("overlap test snapshots", MAX_SNAP * per);
+            let dummy_bytes = 256usize << 20;
+            let mut dummy = [cuda::alloc_named("overlap test dummy a", dummy_bytes), cuda::alloc_named("overlap test dummy b", dummy_bytes)];
+            for overlap in [false, true] {
+                for (v, p, decode) in [(0, 0, 0), (2, 3, 6)] {
+                    let mut kv = vec![(ARENA_ENV, "global"), (ARENA_VRING_ENV, "0")];
+                    if overlap {
+                        kv.push((STAGE_OVERLAP_ENV, "1"));
+                    }
+                    let _env = Env::set(&kv);
+                    let what = format!("overlap {overlap} V {v} P {p}");
+                    let mut t = ExpertTiers::new(&cnq, &s.path, &g, &moe, TierSizes { vram: v, pinned: p }, 1, 16).unwrap();
+                    for tok in &tr[..decode] {
+                        for (l, ids) in tok.iter().enumerate() {
+                            let sel: Vec<i32> = ids.iter().map(|&e| e as i32).collect();
+                            t.table_for(3 + l, &sel).unwrap();
+                        }
+                    }
+                    t.decode_ready();
+                    t.alloc_prefill_stage(SLOTS).unwrap();
+                    let stage = t.pf_stage;
+                    let batches0 = t.sub_batches;
+                    for c in 0..2 {
+                        // (layer, ids of the sub-batch, snapshot index)
+                        let mut snaps: Vec<(usize, Vec<u32>, usize)> = Vec::new();
+                        for l in 0..nl {
+                            let sel: Vec<i32> = (0..4).flat_map(|r| tr[decode + 4 * c + r][l].iter().map(|&e| e as i32)).collect();
+                            let mut rows = 0;
+                            t.tables_for_chunk(3 + l, &sel, &mut |r0, n, tb| {
+                                let mut ids: Vec<u32> = sel[r0 * 8..(r0 + n) * 8].iter().map(|&e| e as u32).collect();
+                                ids.sort_unstable();
+                                ids.dedup();
+                                let j = snaps.len();
+                                assert!(j < MAX_SNAP, "{what}: more sub-batches than snapshots");
+                                // a long copy ahead of the snapshot on the compute stream: a copy
+                                // into a half still read would land before the snapshot
+                                for _ in 0..32 {
+                                    cuda::d2d_async(dummy[1], dummy[0], dummy_bytes);
+                                }
+                                let base = snap + (j * per) as u64;
+                                cuda::d2d_async(base, tb, ex as usize * 8);
+                                for sl in 0..SLOTS {
+                                    cuda::d2d_async(base + (ex as usize * 8 + sl * HEAD) as u64, stage + (sl * rb) as u64, HEAD);
+                                }
+                                snaps.push((l, ids, j));
+                                rows += n;
+                                Ok(())
+                            })
+                            .unwrap();
+                            assert_eq!(rows, 4, "{what}: every row served");
+                        }
+                        cuda::sync();
+                        for (l, ids, j) in &snaps {
+                            let base = snap + (j * per) as u64;
+                            let table = cuda::dtoh_u64(base, ex as usize);
+                            let heads: Vec<u8> = cuda::dtoh_t(base + ex as u64 * 8, SLOTS * HEAD);
+                            for e in 0..ex {
+                                let a = table[e as usize];
+                                assert_eq!(a != 0, ids.contains(&e), "{what}: call {c} layer {l} snapshot {j} table entry of expert {e}");
+                                if a == 0 {
+                                    continue;
+                                }
+                                let w = &want[*l][e as usize];
+                                if a >= stage && a < stage + (SLOTS * rb) as u64 {
+                                    let off = (a - stage) as usize;
+                                    assert_eq!(off % rb, 0, "{what}: a staged entry points at a slot start");
+                                    let sl = off / rb;
+                                    assert!(heads[sl * HEAD..(sl + 1) * HEAD] == w[..HEAD], "{what}: call {c} layer {l} snapshot {j} expert {e}: staging slot {sl} was overwritten before its kernels read it");
+                                } else {
+                                    let got: Vec<u8> = cuda::dtoh_t(a, rb);
+                                    assert!(got == *w, "{what}: call {c} layer {l} expert {e}: the VRAM bytes differ from read_range");
+                                }
+                            }
+                        }
+                    }
+                    let batches = t.sub_batches - batches0;
+                    eprintln!("glm5_stage_overlap synthetic {what}: {batches} sub-batches over {} prompt calls", 2 * nl);
+                    if overlap {
+                        assert!(batches > 2 * nl as u64, "{what}: several sub-batches per call, so both staging halves are used");
+                    }
+                    t.free();
+                }
+            }
+            cuda::free_dev(&mut snap);
+            for d in &mut dummy {
+                cuda::free_dev(d);
             }
         }
         drop(cnq);
@@ -5670,6 +5868,9 @@ pub struct ExpertTiers {
     pf_stage: Dev,
     /// the prompt calls' pinned landing ring and copy stream ([`PrefillMover`])
     pf_ring: Option<PfRing>,
+    /// #196 `CROW_GLM_STAGE_OVERLAP=1`: the pinned host tables of the global arena's prompt
+    /// sub-batches (allocated with their first call)
+    ovl_tab: Option<OvlTables>,
     /// `CROW_GLM_ARENA=global`: the pageable NVMe landing of its prompt calls (`pf_cap` records,
     /// allocated with their first call); the per-layer path lands in `pf_ring` instead
     arena_landing: Landing,
@@ -5878,6 +6079,90 @@ impl Mover for PrefillMover<'_> {
     }
 }
 
+/// #196 `CROW_GLM_STAGE_OVERLAP=1`: two pinned host record tables (one per staging half) and the
+/// event after each one's upload on the compute stream. `cuda::to_u64_into` from pageable memory
+/// synchronizes the legacy stream on the host after every upload; an upload from a pinned table
+/// does not, and the host rewrites table `h` only once its last upload ran (its event), so the
+/// host queues the next sub-batch's copies while the kernels of this one run.
+struct OvlTables {
+    host: Pinned,
+    ev: [sys::CUevent; 2],
+    experts: usize,
+}
+
+impl OvlTables {
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn new(experts: usize) -> OvlTables {
+        OvlTables { host: Pinned::alloc((2 * experts * 8).next_multiple_of(4096)), ev: [cuda::event_create(), cuda::event_create()], experts }
+    }
+
+    /// queue the upload of `table` (`experts` entries) through host table `h` into `dst` on the
+    /// current stream; the host waits only for table `h`'s previous upload to have run
+    ///
+    /// # Safety
+    /// A CUDA context is current; `dst` holds `experts` u64.
+    unsafe fn upload(&mut self, h: usize, dst: Dev, table: &[u64]) {
+        debug_assert_eq!(table.len(), self.experts);
+        cuda::ck(sys::cuEventSynchronize(self.ev[h]));
+        let hp = (self.host.host as *mut u64).add(h * self.experts);
+        std::ptr::copy_nonoverlapping(table.as_ptr(), hp, self.experts);
+        let s = cuda::cur_stream();
+        cuda::ck(sys::cuMemcpyHtoDAsync_v2(dst, hp as *const _, self.experts * 8, s));
+        cuda::event_record(self.ev[h], s);
+    }
+
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn free(&mut self) {
+        for &e in &self.ev {
+            cuda::ck(sys::cuEventSynchronize(e));
+            cuda::event_destroy(e);
+        }
+        self.host.free();
+    }
+}
+
+/// #196 `CROW_GLM_STAGE_OVERLAP=1`: the [`PrefillMover`] of the global arena's prompt calls; a
+/// global pinned slot `q` is slot `q % ppl` of `pinned[q / ppl]`. Prompt calls admit nothing and
+/// the write-back ring is synchronized before them, so no pinned slot is being written.
+struct GlobalPrefillMover<'a> {
+    inner: PrefillMover<'a>,
+    pinned: &'a [Pinned],
+    ppl: usize,
+}
+
+impl Mover for GlobalPrefillMover<'_> {
+    fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
+        self.inner.nvme(jobs)
+    }
+    fn landing_to_stage(&mut self, i: u32) {
+        self.inner.landing_to_stage(i);
+    }
+    fn pinned_to_stage(&mut self, q: u32, s: u32) {
+        self.inner.pinned = Some(&self.pinned[q as usize / self.ppl]);
+        self.inner.pinned_to_stage((q as usize % self.ppl) as u32, s);
+    }
+    fn vram_to_stage(&mut self, v: u32, s: u32) {
+        self.inner.vram_to_stage(v, s);
+    }
+    fn barrier(&mut self) {
+        self.inner.barrier();
+    }
+    fn vram_to_pinned(&mut self, v: u32, q: u32) {
+        self.inner.vram_to_pinned(v, q);
+    }
+    fn stage_to_vram(&mut self, s: u32, v: u32) {
+        self.inner.stage_to_vram(s, v);
+    }
+    fn begin_batch(&mut self, j: usize) {
+        self.inner.begin_batch(j);
+    }
+    fn end_batch(&mut self) {
+        self.inner.end_batch();
+    }
+}
+
 impl ExpertTiers {
     /// Allocate the tiers of every MoE layer of `g` (cache empty, G1d: no seed) and open the
     /// container `path` for unbuffered reads with `readers` threads (1 = PREREG amendment 5).
@@ -5939,6 +6224,7 @@ impl ExpertTiers {
             pf_cap: 0,
             pf_stage: 0,
             pf_ring: None,
+            ovl_tab: None,
             arena_landing: Landing::new(0),
             pinned_use: PinnedUse::default(),
             pinned_wc,
@@ -6227,6 +6513,9 @@ impl ExpertTiers {
         cuda::free_dev(&mut self.stage);
         if let Some(mut r) = self.pf_ring.take() {
             r.free();
+        }
+        if let Some(mut t) = self.ovl_tab.take() {
+            t.free();
         }
         cuda::free_dev(&mut self.pf_stage);
         self.pf_cap = 0;
