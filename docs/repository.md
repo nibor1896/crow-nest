@@ -14,6 +14,7 @@ Moved out of the README on 2026-09-23.
 | `oracle/` | the layer-wise reference against the unquantized originals; its output (`oracle/golden/`) is ignored. The GLM-5.3-Flash reference of 2026-10-08 (`docs/glm5-reference-runner.md`, runs under `.venv-oracle`): `glm5_common.py` (FP8 decode, the FP8-originals and CNQ-container weight sources), `glm5_layerwise.py` (the layerwise runner, issue #158; `--prompt-chunk`, issue #147), `glm5_compare.py` (per-layer agreement of two runs) and `glm5_weight_check.py` (every container tensor against the FP8 originals), both issue #156; tests `test_glm5_layerwise.py` and `test_glm5_container.py` |
 | `selftest/` | the package self-test's golden set, tracked: the layer-0 pair (two `f32` arrays of 327,680 B each, F5, issue #64, 2026-09-18), the layer-3 attention pair (81,920 B each, issue #69, 2026-09-18) and the manifest that gates them, 825,424 B in all. These are the files the quant package ships beside the container, and `tools/selftest.sh` is what runs them |
 | `probes/` | the hardware probes the plan stands on |
+| `runs/` | the GLM-5.3-Flash series (`runs/glm53-flash/`, #145 onward): the PREREGs, the step runs, the lever blocks, the cache simulations, the 3-minute checks of 2026-10-10 with the operating sets `arm2.env` / `arm3.env` (`quick/README.md`), Nsight stats and analysis scripts of the profiles; the Nsight reports (`*.nsys-rep`, `*.sqlite`) and the logs stay local (`.gitignore`) |
 | `models/`, `converter/*.cnq` | model weights and containers, ignored, never committed |
 
 ## Environment

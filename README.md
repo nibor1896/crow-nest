@@ -55,6 +55,13 @@ $env:CROW_CNQ = "converter\Qwen3.8-27B-CNQ4.5.cnq"; crow-nest-engine\serve.exe -
 
 **Linux engine without building**: no Linux package at the moment (the v0.9.0 tarball carried NVRTC and is withdrawn); build from source as above, then `tools/fetch-nvrtc.sh --target engine/target/release`.
 
+**GLM-5.3-Flash, measurement only** (3-bit container built locally: [download](docs/glm-download.md), [conversion](docs/glm-mul1-conversion.md); operating set [`arm3.env`](runs/glm53-flash/quick/README.md))
+
+```bash
+cd engine && cargo build --release --bin glm5_run && cd ..
+env $(cat runs/glm53-flash/quick/arm3.env) CROW_GLM_ARENA_WARM=runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json   engine/target/release/glm5_run --cold --reps 1 --tokenizer models/GLM-5.3-Flash-original/tokenizer.json --prompt "Explain how a CPU cache works." -n 128
+```
+
 **Use from Crow**
 
 ```bash

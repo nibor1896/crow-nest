@@ -4117,6 +4117,40 @@ and move no module edge, so the graph and the layering below are the ones of rec
 Nothing in this section is a proposal. Where a number appears it carries its date, its machine
 and its artefact, like every other number in this document.
 
+### 8.0 The tree at v0.11.0 (line counts, 2026-10-10)
+
+Counted with `wc -l` at `d3e0d87` (v0.11.0). `engine/src` grew from 53 files and 56,666 lines at
+v0.10.1 to 79 files and 115,461 lines; almost all of it is the GLM-5.3-Flash family (glm5_next,
+#145-#209). The Qwen modules of 8.1 changed where the family dispatch reaches them: `kernels.rs`
+6,189 -> 7,718 (the GLM kernel tables, `mul1`), `bin/serve.rs` 9,631 -> 11,836 (#185 family
+dispatch, batched slots), `manager.rs` 1,592 -> 2,317 (GLM prompt-call scratch), `meta.rs`
+1,956 -> 2,597 (the glm5_next ledger, #159), `boot.rs` 474 -> 698 (`open_glm5`); `gen.rs` 7,099 -> 7,107.
+
+| module (glm5_next and its tiers) | lines | role |
+|---|---|---|
+| `glm5_tiers.rs` | 15,173 | `glm5_run`'s driver: expert tiers, per-layer cache and global arena, stager, prompt calls, NVPF, CPU lane plan |
+| `glm5_moe.rs` | 4,343 | router, MUL1 experts (GPU, CPU lane, tensor-core paths), RT2, combine |
+| `glm5_flags.rs` | 4,125 | mapped flags, controller ring, prefetch / guesses, lanes |
+| `cpu_mul1.rs` | 3,906 | AVX2 MUL1 expert FFN and the persistent pool (#180, #183) |
+| `glm5_model.rs` | 3,077 | one layer in HF order, `Glm5Pass` |
+| `nvme_source.rs` | 3,066 | NVMe expert reads: IOCP, IoRing, piece pool (#149, #209) |
+| `glm5_engine.rs` | 1,846 | `serve`'s `Glm5Engine` (#185) |
+| `glm5_mtp.rs` | 1,755 | MTP block (#182, #192) |
+| `glm5_mla.rs` | 1,713 | MLA latent cache, DSA indexer, `gm_attn2` (#163, #186) |
+| `glm5_int_tests.rs` | 1,312 | integration tests of the switch sets |
+| `glm5_kda.rs` | 1,205 | KDA sub-block (#162) |
+| `glm5_mhc.rs` | 1,141 | mHC residual and its fusions (#161) |
+| `expert_cache.rs` | 876 | dynamic expert-cache policies (#175) |
+| `cpu_nvfp4.rs` | 778 | CPU NVFP4 expert FFN (#173) |
+| `glm5_graph.rs` | 631 | decode rows as CUDA graphs (#190) |
+| `glm5_head.rs`, `glm5_embed.rs`, `glm5_template.rs` | 474, 456, 316 | head, embedding gather, GLM chat template |
+| `kernels_mul1.cu`, `kernels_glm5_*.cu` (6) | 1,373, 2,102 | CUDA sources compiled into the shared `KERNEL_SRC` build |
+| `bin/glm5_run.rs` | 1,245 | the GLM measurement bin (#187) |
+
+The graph of 8.1 is not regenerated for these modules: `crate::` paths (code and doc comments,
+by `grep`) run both ways between `glm5_tiers`, `glm5_flags`, `glm5_model` and `glm5_moe`, so the
+"acyclic" statement below holds for the Qwen modules only.
+
 ### 8.1 The module graph
 
 ```mermaid
