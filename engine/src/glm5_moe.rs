@@ -716,8 +716,9 @@ impl GpuMoePlan {
         assert!(self.tokens == 1 && (1..=k).contains(&slots), "glm5_moe: a late pass of {slots} slots on a plan of {} rows x {k}", self.tokens);
         // the CPU lane's host path is not posted for the controller's tables (consumed as `experts` does)
         let _ = lane::take(table, self.tokens, k);
-        let lp = self.late.get_or_init(|| LatePass { slots, ptrs: cuda::alloc_zeroed(slots * 8), idx: cuda::alloc_zeroed(slots * 4), ye: cuda::alloc_zeroed(slots * h * 4) });
-        assert_eq!(lp.slots, slots, "glm5_moe: the late pass was made for {} slots", lp.slots);
+        // made for top-k slots once (#202 lanes runs k, the former pass fewer)
+        let lp = self.late.get_or_init(|| LatePass { slots: k, ptrs: cuda::alloc_zeroed(k * 8), idx: cuda::alloc_zeroed(k * 4), ye: cuda::alloc_zeroed(k * h * 4) });
+        assert!(slots <= lp.slots, "glm5_moe: the late pass was made for {} slots", lp.slots);
         self.experts_merge(kn, mk, gk, w, table, x, y, &mut |ye| {
             fill(self.ids, self.ptrs, lp.ptrs, lp.idx);
             self.gate.run_slots(mk, slots, lp.ptrs, self.xg, self.ge);

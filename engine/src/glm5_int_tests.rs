@@ -45,6 +45,7 @@ pub(crate) const KEYS: &[&str] = &[
     "CROW_GLM_PREFETCH_SIDE",
     "CROW_GLM_SHARED_OVERLAP",
     "CROW_GLM_MAX_BATCH",
+    "CROW_GLM_LANES2",
 ];
 
 pub(crate) struct Env(Vec<(String, Option<String>)>);
@@ -715,6 +716,61 @@ fn glm5_int_gpu_the_measurement_arm_is_the_default_path_within_the_accuracy_bar(
     let outs = run_loaded_arms(&[("default", Vec::new()), ("arm small budgets", small)], &prompt, n, TierSizes { vram: 0, pinned: 16 });
     assert!(outs[1].lane_experts > 0, "the lane ran in the arm");
     check("small budgets V0 P16", &outs);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #202 lanes: the measurement arm with `CROW_GLM_LANES2=1` (the CPU lane takes only resident
+/// records, top-k late slots with null spares, no moves-word wait without a copy the experts read,
+/// guessed reads in the pool's prefetch queue and moved up when joined) against the default path
+/// and against the measurement arm without it, on the synthetic model (300-id prompt, 6 greedy
+/// ids), small budgets (the arena spills, the pool reads) at V 3 + P 4 and V 0 + P 16 (every
+/// expert pinned, the lane computes): the same ids and a logit cosine >= 0.9999 per generated
+/// row against both (the lane's picks may differ, so accuracy, not bits).
+#[test]
+#[ignore = "needs the GPU (about 12 GB VRAM, a 2.3 GB synthetic container in the temp dir)"]
+fn glm5_int_gpu_lanes2_is_the_measurement_arm_within_the_accuracy_bar() {
+    let dir = std::env::temp_dir().join(format!("crow-int-lanes2-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let warm = synth_warm(&dir);
+    let s = |v: &str| v.to_string();
+    let gib = |records: f64| format!("{}", records * REC as f64 / (1u64 << 30) as f64);
+    let arm: Vec<(&'static str, String)> = vec![
+        ("CROW_NVME_POOL", s("1")),
+        ("CROW_NVME_POOL_THREADS", s("8")),
+        ("CROW_GLM_HCFUSE", s("1")),
+        ("CROW_GLM_DENSE_GEMM", s("1")),
+        ("CROW_GLM_CPU_LANE", s("split")),
+        ("CROW_PINNED_ALLOC", s("host")),
+        ("CROW_GLM_ARENA", s("global")),
+        ("CROW_GLM_ARENA_WARM", warm.clone()),
+        ("CROW_GLM_ARENA_ELASTIC_GB", gib(2.0 * 3.0)),
+        ("CROW_GLM_ARENA_STAGE_GB", gib(12.0)),
+        ("CROW_CHUNK", s("8192")),
+        ("CROW_GLM_FLAGS", s("1")),
+        ("CROW_GLM_STAGER", s("1")),
+        ("CROW_GLM_PREFETCH", s("1")),
+        ("CROW_GLM_PREFETCH_SIDE", s("1")),
+        ("CROW_GLM_SHARED_OVERLAP", s("1")),
+        ("CROW_GLM_CONTROLLER", s("1")),
+        ("CROW_GLM_LA", s("1")),
+    ];
+    let mut lanes2 = arm.clone();
+    lanes2.push(("CROW_GLM_LANES2", s("1")));
+    let prompt: Vec<i64> = (0..300).map(|i| (i * 77 + 3) % 2048).collect();
+    let n = 6;
+    for (what, sizes) in [("V3 P4", TierSizes { vram: 3, pinned: 4 }), ("V0 P16", TierSizes { vram: 0, pinned: 16 })] {
+        let outs = run_loaded_arms(&[("default", Vec::new()), ("arm", arm.clone()), ("arm lanes2", lanes2.clone())], &prompt, n, sizes);
+        eprintln!(
+            "glm5 int lanes2 {what}: NVMe reads arm {} lanes2 {}, CPU experts arm {} lanes2 {}, early answers / late experts arm {:?} lanes2 {:?}",
+            outs[1].nvme_reads, outs[2].nvme_reads, outs[1].lane_experts, outs[2].lane_experts, outs[1].early, outs[2].early
+        );
+        assert_g3(&format!("lanes2 {what} vs default"), &outs[2], &outs[0]);
+        assert_g3(&format!("lanes2 {what} vs arm"), &outs[2], &outs[1]);
+        if sizes.vram == 0 {
+            assert!(outs[2].lane_experts > 0, "{what}: the lane ran under lanes2");
+        }
+        assert!(outs[2].early.0 > 0, "{what}: the controller answered early under lanes2");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
