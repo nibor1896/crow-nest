@@ -6503,7 +6503,7 @@ pub mod glm5_moe {
     use cudarc::driver::sys::CUfunction;
 
     /// every entry of `GLM5_MOE_SRC`
-    pub const NAMES: &[&str] = &["glm5_router_sig_topk", "glm5_moe_gather", "glm5_swiglu_clamp", "glm5_moe_combine", "glm5_gemv_fp4", "glm5_gemv_fp4_x3", "glm5_gemm_fp4_tc"];
+    pub const NAMES: &[&str] = &["glm5_router_sig_topk", "glm5_moe_gather", "glm5_swiglu_clamp", "glm5_moe_combine", "glm5_gemv_fp4", "glm5_gemv_fp4_x3", "glm5_gemm_fp4_tc", "glm5_gemm_fp4_tcs"];
     /// #191: output rows of one `glm5_gemv_fp4` block (`GLM5_FP4_RB`)
     pub const FP4_ROWS_PER_BLOCK: usize = 2;
 
@@ -6517,10 +6517,33 @@ pub mod glm5_moe {
     pub const TC_TILE: usize = 128;
     /// #186: a dense NVFP4 projection of at least this many rows runs on `glm5_gemm_fp4_tc` when
     /// `CROW_GLM_DENSE_GEMM=1` (fewer rows: the GEMV); from the micro-bench
-    /// `glm5_dense_tc_gpu_bench_8192_row_chunk`
-    pub const TC_MIN_ROWS: usize = 16;
+    /// `glm5_dense_gpu_tc_bench_8192_row_chunk` (RTX 5090, 2026-10-10, every dense launch of one
+    /// call: t 2 GEMV 9.5 ms vs 11.3 ms, t 4 17.5 ms vs 11.3 ms)
+    pub const TC_MIN_ROWS: usize = 4;
     /// #186: the most rows one `glm5_gemm_fp4_tc` launch takes (the device row-count table)
     pub const TC_MAX_ROWS: usize = 65_536;
+    /// #186: the device bytes of the row-count table a pass holds while the tensor-core path is
+    /// on (booked by `manager::glm5_chunk_scratch_bytes`)
+    pub const TC_ROWS_BYTES: u64 = 4 * TC_MAX_ROWS as u64;
+    /// #186: calls of at most this many rows take `glm5_gemm_fp4_tcs` (32 x 32 tiles, split K over
+    /// the warps), larger ones the 128 x 128 tiles of `glm5_gemm_fp4_tc`; from the micro-bench
+    /// (t 128: 35.8 ms vs 67.4 ms, t 256: 66.8 ms vs 66.1 ms)
+    pub const TC_SMALL_MAX_ROWS: usize = 128;
+    /// #186: prompt rows of one `glm5_gemm_fp4_tcs` block (`GLM5_TCS_T`)
+    pub const TCS_TILE: usize = 32;
+    /// #186: outputs of one `glm5_gemm_fp4_tcs` block (`GLM5_TCS_N`)
+    pub const TCS_N: usize = 32;
+
+    /// #186: a call of `call_t` rows takes `glm5_gemm_fp4_tcs` (else `glm5_gemm_fp4_tc`)
+    pub fn tc_small(call_t: usize) -> bool {
+        call_t <= TC_SMALL_MAX_ROWS
+    }
+
+    /// #186: a pass of calls of up to `max_t` rows holds the tensor-core path (and its row table):
+    /// `CROW_GLM_DENSE_GEMM` on and calls that reach [`TC_MIN_ROWS`]
+    pub fn dense_tc_for(max_t: usize) -> bool {
+        max_t >= TC_MIN_ROWS && dense_gemm_from_env()
+    }
 
     /// #186: `CROW_GLM_DENSE_GEMM=1` (or `tc`): prompt calls run their dense NVFP4 projections on
     /// the FP16 tensor cores (lossless weights, FP16 activations, FP32 accumulate; not
@@ -6547,6 +6570,8 @@ pub mod glm5_moe {
         pub fp4_x3: CUfunction,
         /// #186: the FP16 tensor-core NVFP4 GEMM of a prompt call (`CROW_GLM_DENSE_GEMM=1`)
         pub tc: CUfunction,
+        /// #186: `tc` for calls of at most [`TC_SMALL_MAX_ROWS`] rows
+        pub tcs: CUfunction,
         /// #186: device i32 `0 .. TC_MAX_ROWS` (the row count `tc` reads, a device scalar by the
         /// KERNEL_SRC rule) while the tensor-core path is on, else 0
         tc_rows: cuda::CUdeviceptr,
@@ -6557,7 +6582,7 @@ pub mod glm5_moe {
         /// A CUDA context is current.
         pub unsafe fn new() -> Kernels {
             let module = cuda::compile(super::GLM5_MOE_SRC);
-            let mut k = Kernels {
+            Kernels {
                 router: module.get("glm5_router_sig_topk"),
                 gather: module.get("glm5_moe_gather"),
                 act: module.get("glm5_swiglu_clamp"),
@@ -6565,15 +6590,14 @@ pub mod glm5_moe {
                 fp4: module.get("glm5_gemv_fp4"),
                 fp4_x3: module.get("glm5_gemv_fp4_x3"),
                 tc: module.get("glm5_gemm_fp4_tc"),
+                tcs: module.get("glm5_gemm_fp4_tcs"),
                 tc_rows: 0,
                 module,
-            };
-            k.set_dense_tc(dense_gemm_from_env());
-            k
+            }
         }
 
-        /// #186: the tensor-core path of prompt calls on or off (`CROW_GLM_DENSE_GEMM` at `new`);
-        /// on, 256 KiB of device row counts
+        /// #186: the tensor-core path on or off (off at `new`; `glm5_model::Glm5Pass` sets
+        /// [`dense_tc_for`] its `max_t`); on, [`TC_ROWS_BYTES`] of device row counts
         ///
         /// # Safety
         /// A CUDA context is current; no launch reading the row counts is pending.
@@ -6599,9 +6623,19 @@ pub mod glm5_moe {
         /// [`Kernels::dense_tc`] holds for `t`; the buffers hold the shapes.
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn gemm_tc(&self, w: [cuda::CUdeviceptr; 3], gs: [cuda::CUdeviceptr; 3], n: usize, x: cuda::CUdeviceptr, y: cuda::CUdeviceptr, k_p: cuda::CUdeviceptr, ldy_p: cuda::CUdeviceptr, rows_p: cuda::CUdeviceptr, rows: usize, t: usize) {
+            self.gemm_tc_on(tc_small(t), w, gs, n, x, y, k_p, ldy_p, rows_p, rows, t)
+        }
+
+        /// [`Kernels::gemm_tc`] on `tcs` (`small`) or `tc`, whatever the row count (tests, bench)
+        ///
+        /// # Safety
+        /// As [`Kernels::gemm_tc`].
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn gemm_tc_on(&self, small: bool, w: [cuda::CUdeviceptr; 3], gs: [cuda::CUdeviceptr; 3], n: usize, x: cuda::CUdeviceptr, y: cuda::CUdeviceptr, k_p: cuda::CUdeviceptr, ldy_p: cuda::CUdeviceptr, rows_p: cuda::CUdeviceptr, rows: usize, t: usize) {
             assert!(self.tc_rows != 0 && (1..TC_MAX_ROWS).contains(&t) && (1..=3).contains(&n) && rows > 0, "glm5_gemm_fp4_tc: {n} x [{rows}] x {t} rows");
             let t_p = self.tc_rows + (t * 4) as u64;
-            super::launch_v(self.tc, rows.div_ceil(TC_TILE) as u32, t.div_ceil(TC_TILE) as u32, n as u32, 256, &[w[0], w[1], w[2], gs[0], gs[1], gs[2], x, y, k_p, ldy_p, rows_p, t_p]);
+            let (f, tn, tt) = if small { (self.tcs, TCS_N, TCS_TILE) } else { (self.tc, TC_TILE, TC_TILE) };
+            super::launch_v(f, rows.div_ceil(tn) as u32, t.div_ceil(tt) as u32, n as u32, 256, &[w[0], w[1], w[2], gs[0], gs[1], gs[2], x, y, k_p, ldy_p, rows_p, t_p]);
         }
     }
 }

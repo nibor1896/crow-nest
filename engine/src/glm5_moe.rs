@@ -427,15 +427,27 @@ impl GpuFfnPlan {
     /// # Safety
     /// As [`GpuFfnPlan::run`]; `1 <= t <= tokens`.
     pub unsafe fn run_rows(&self, gk: &kernels::glm5_moe::Kernels, w: &GpuFfnWeights, x: CUdeviceptr, y: CUdeviceptr, t: usize) {
-        assert!((1..=self.tokens).contains(&t), "glm5_moe: FFN rows {t} of a {}-row plan", self.tokens);
+        self.run_rows_of(gk, w, x, y, t, t);
+    }
+
+    /// [`GpuFfnPlan::run_rows`] for `t` rows of a call of `call_t` rows run in pieces
+    /// (`glm5_model::dense_rows`): #186 `CROW_GLM_DENSE_GEMM=1` picks the kernel by `call_t`, so
+    /// every row of the call takes the kernel one `call_t`-row plan gives it (each kernel computes
+    /// a row from that row alone: the pieces have the bits of one plan)
+    ///
+    /// # Safety
+    /// As [`GpuFfnPlan::run`]; `1 <= t <= tokens`, `t <= call_t`.
+    pub unsafe fn run_rows_of(&self, gk: &kernels::glm5_moe::Kernels, w: &GpuFfnWeights, x: CUdeviceptr, y: CUdeviceptr, t: usize, call_t: usize) {
+        assert!((1..=self.tokens).contains(&t) && t <= call_t, "glm5_moe: FFN rows {t} of a {}-row plan, call {call_t}", self.tokens);
         let (h, i) = (self.hidden, self.inter);
         assert!((w.gate.rows, w.gate.cols, w.up.rows, w.up.cols, w.down.rows, w.down.cols) == (i, h, i, h, h, i), "glm5_moe: FFN weights do not fit the plan");
-        if gk.dense_tc(t) {
+        if gk.dense_tc(call_t) {
             // #186 `CROW_GLM_DENSE_GEMM=1`: the three projections on the FP16 tensor-core GEMM
-            gk.gemm_tc([w.gate.w; 3], [w.gate.gs; 3], 1, x, self.g, self.prm_kh, self.prm_ki, self.prm_ki, i, t);
-            gk.gemm_tc([w.up.w; 3], [w.up.gs; 3], 1, x, self.u, self.prm_kh, self.prm_ki, self.prm_ki, i, t);
+            let small = kernels::glm5_moe::tc_small(call_t);
+            gk.gemm_tc_on(small, [w.gate.w; 3], [w.gate.gs; 3], 1, x, self.g, self.prm_kh, self.prm_ki, self.prm_ki, i, t);
+            gk.gemm_tc_on(small, [w.up.w; 3], [w.up.gs; 3], 1, x, self.u, self.prm_kh, self.prm_ki, self.prm_ki, i, t);
             launch_v(gk.act, (t * i).div_ceil(256) as u32, 1, 1, 256, &[self.g, self.u, self.h, self.prm_n, self.prm_f]);
-            gk.gemm_tc([w.down.w; 3], [w.down.gs; 3], 1, self.h, y, self.prm_ki, self.prm_kh, self.prm_kh, h, t);
+            gk.gemm_tc_on(small, [w.down.w; 3], [w.down.gs; 3], 1, self.h, y, self.prm_ki, self.prm_kh, self.prm_kh, h, t);
             return;
         }
         let ((gu, bu), (gd, bd)) = (kernels::glm5_moe::fp4_launch(i, h), kernels::glm5_moe::fp4_launch(h, i));
@@ -1783,6 +1795,29 @@ mod tests {
         for (rows, k, threads) in [(2048, 4096, 64), (4096, 2048, 32), (512, 4096, 64), (16384, 1536, 32), (4096, 16384, 256), (1, 64, 32), (4096, 32768, 256)] {
             assert_eq!(kernels::glm5_moe::fp4_launch(rows, k), (rows.div_ceil(rb) as u32, threads), "[{rows}, {k}]");
         }
+    }
+
+    /// #186: the tensor-core GEMMs' tiles are the host's grid arithmetic, and the planner books
+    /// the row table exactly when a pass of the chunk holds it (`CROW_GLM_DENSE_GEMM=1` and calls
+    /// of at least `TC_MIN_ROWS` rows)
+    #[test]
+    fn glm5_dense_tc_tiles_and_row_table_booking() {
+        use crate::kernels::glm5_moe::{TCS_N, TCS_TILE, TC_MIN_ROWS, TC_ROWS_BYTES, TC_SMALL_MAX_ROWS, TC_TILE};
+        let src = crate::kernels::GLM5_MOE_SRC;
+        let def = |name: &str| -> usize {
+            let pat = format!("#define {name} ");
+            let i = src.find(&pat).unwrap_or_else(|| panic!("no #define {name}")) + pat.len();
+            src[i..].split_whitespace().next().unwrap().parse().unwrap()
+        };
+        assert_eq!((def("GLM5_TC_BM"), def("GLM5_TC_BN"), def("GLM5_TCS_T"), 8 * def("GLM5_TCS_NI")), (TC_TILE, TC_TILE, TCS_TILE, TCS_N));
+        assert!(TC_MIN_ROWS <= TC_SMALL_MAX_ROWS);
+        let g = crate::geo::Glm5Geo::GLM_5_3_FLASH;
+        for (chunk, extra) in [(1, 0), (TC_MIN_ROWS - 1, 0), (TC_MIN_ROWS, TC_ROWS_BYTES), (8192, TC_ROWS_BYTES)] {
+            let on = crate::manager::glm5_chunk_scratch_bytes_tc(&g, chunk, 200_000, true);
+            let off = crate::manager::glm5_chunk_scratch_bytes_tc(&g, chunk, 200_000, false);
+            assert_eq!(on - off, extra, "chunk {chunk}");
+        }
+        assert_eq!(TC_ROWS_BYTES, 262_144);
     }
 
     unsafe fn main_kernels() -> (cuda::Module, kernels::Kernels) {

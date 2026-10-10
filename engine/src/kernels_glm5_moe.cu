@@ -412,3 +412,97 @@ extern "C" __global__ void __launch_bounds__(256) glm5_gemm_fp4_tc(
                 if (t < T && n < rows) y[(size_t)t * ldy + n] = acc[mi][ni][v] * gs;
             }
 }
+
+// glm5_gemm_fp4_tc for calls of few rows (kernels::glm5_moe::TC_SMALL_MAX_ROWS and fewer): the
+// 128 x 128 tiles leave most SMs idle there (grid ceil(rows / 128) x 1). Here a block computes
+// 32 prompt rows x 32 outputs and its 8 warps split K (warp w takes the k-tiles w, w + 8, ...),
+// fragments straight from global memory (no shared staging): lane (g, c) decodes the bytes c of
+// its four weight rows' code words, which are exactly its B fragments (e2m1 x ue4m3, exact in
+// FP16), and loads its A fragments as float2 -> FP16. The warps' partial tiles are summed in
+// warp order 0 .. 7 (deterministic), times gs. Same arguments as glm5_gemm_fp4_tc;
+// grid (ceil(rows / 32), ceil(T / 32), M), block 256.
+#define GLM5_TCS_T 32
+#define GLM5_TCS_NI 4  // n8 tiles per block (2 measured slower from 16 rows on)
+#define GLM5_TCS_N (8 * GLM5_TCS_NI)
+
+extern "C" __global__ void __launch_bounds__(256) glm5_gemm_fp4_tcs(
+    const unsigned char* __restrict__ w0, const unsigned char* __restrict__ w1, const unsigned char* __restrict__ w2,
+    const float* __restrict__ gs0, const float* __restrict__ gs1, const float* __restrict__ gs2,
+    const float* __restrict__ x, float* __restrict__ y, const int* __restrict__ k_dim_p, const int* __restrict__ ldy_p,
+    const int* __restrict__ rows_p, const int* __restrict__ t_p) {
+    __shared__ float red[8 * 8 * GLM5_TCS_NI * 32];
+    const int k_dim = *k_dim_p, ldy = *ldy_p, rows = *rows_p, T = *t_p;
+    const int m = blockIdx.z;
+    const unsigned char* w = m == 0 ? w0 : (m == 1 ? w1 : w2);
+    const float gs = m == 0 ? gs0[0] : (m == 1 ? gs1[0] : gs2[0]);
+    y += (size_t)m * rows;
+    const int bpr = k_dim >> 6;
+    const int n0 = blockIdx.x * GLM5_TCS_N, t0 = blockIdx.y * GLM5_TCS_T;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int g = lane >> 2, c = lane & 3;
+    const unsigned int* wrow[GLM5_TCS_NI];
+#pragma unroll
+    for (int ni = 0; ni < GLM5_TCS_NI; ni++) wrow[ni] = (const unsigned int*)(w + (size_t)min(n0 + ni * 8 + g, rows - 1) * bpr * 36);
+    const float* xrow[4];
+#pragma unroll
+    for (int r = 0; r < 4; r++) xrow[r] = x + (size_t)min(t0 + r * 8 + g, T - 1) * k_dim + 2 * c;  // rows g, g + 8, g + 16, g + 24
+    float acc[2][GLM5_TCS_NI][4];
+#pragma unroll
+    for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < GLM5_TCS_NI; j++)
+#pragma unroll
+            for (int v = 0; v < 4; v++) acc[i][j][v] = 0.0f;
+    for (int kt = warp; kt < bpr; kt += 8) {
+        unsigned int wd[GLM5_TCS_NI][9];
+#pragma unroll
+        for (int ni = 0; ni < GLM5_TCS_NI; ni++)
+#pragma unroll
+            for (int q = 0; q < 9; q++) wd[ni][q] = wrow[ni][kt * 9 + q];
+        float2 xv[4][4][2];
+#pragma unroll
+        for (int r = 0; r < 4; r++)
+#pragma unroll
+            for (int ks = 0; ks < 4; ks++) {
+                xv[r][ks][0] = *(const float2*)(xrow[r] + kt * 64 + ks * 16);
+                xv[r][ks][1] = *(const float2*)(xrow[r] + kt * 64 + ks * 16 + 8);
+            }
+#pragma unroll
+        for (int ks = 0; ks < 4; ks++) {
+            unsigned int b[GLM5_TCS_NI][2];
+#pragma unroll
+            for (int ni = 0; ni < GLM5_TCS_NI; ni++) {
+                const float s = glm5_ue4m3((wd[ni][0] >> (8 * ks)) & 0xFF);
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const unsigned int byte = (wd[ni][1 + 2 * ks + h] >> (8 * c)) & 0xFF;
+                    b[ni][h] = glm5_h2(glm5_e2m1(byte & 0xF) * s, glm5_e2m1(byte >> 4) * s);
+                }
+            }
+#pragma unroll
+            for (int mi = 0; mi < 2; mi++) {
+                const unsigned int a[4] = {glm5_h2(xv[2 * mi][ks][0].x, xv[2 * mi][ks][0].y), glm5_h2(xv[2 * mi + 1][ks][0].x, xv[2 * mi + 1][ks][0].y),
+                                           glm5_h2(xv[2 * mi][ks][1].x, xv[2 * mi][ks][1].y), glm5_h2(xv[2 * mi + 1][ks][1].x, xv[2 * mi + 1][ks][1].y)};
+#pragma unroll
+                for (int ni = 0; ni < GLM5_TCS_NI; ni++) glm5_mma(acc[mi][ni], a, b[ni][0], b[ni][1]);
+            }
+        }
+    }
+#pragma unroll
+    for (int mi = 0; mi < 2; mi++)
+#pragma unroll
+        for (int ni = 0; ni < GLM5_TCS_NI; ni++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) red[(warp * 8 * GLM5_TCS_NI + (mi * GLM5_TCS_NI + ni) * 4 + e) * 32 + lane] = acc[mi][ni][e];
+    __syncthreads();
+    for (int o = tid; o < 8 * GLM5_TCS_NI * 32; o += 256) {
+        const int v = o >> 5, l = o & 31;
+        float s = 0.0f;
+#pragma unroll
+        for (int wi = 0; wi < 8; wi++) s += red[(wi * 8 * GLM5_TCS_NI + v) * 32 + l];
+        const int mi = v / (4 * GLM5_TCS_NI), ni = (v >> 2) % GLM5_TCS_NI, e = v & 3;
+        const int t = t0 + mi * 16 + (l >> 2) + (e >> 1) * 8;
+        const int n = n0 + ni * 8 + 2 * (l & 3) + (e & 1);
+        if (t < T && n < rows) y[(size_t)t * ldy + n] = s * gs;
+    }
+}

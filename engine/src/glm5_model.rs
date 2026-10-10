@@ -800,7 +800,9 @@ impl Glm5Pass {
     /// A CUDA context is current.
     pub unsafe fn new(g: &Glm5Geo, moe: MoeGeo, max_t: usize, cap: usize) -> Glm5Pass {
         assert!(max_t >= 1 && cap >= max_t, "glm5_model: calls of {max_t} rows over {cap}");
-        let kn = Glm5Kernels::new(g);
+        let mut kn = Glm5Kernels::new(g);
+        // #186: the tensor-core path of prompt calls (`CROW_GLM_DENSE_GEMM`)
+        kn.moe.set_dense_tc(kernels::glm5_moe::dense_tc_for(max_t));
         let kd = KdaDims::of(g);
         let md = MlaDims::of(g);
         let h = g.hidden;
@@ -869,6 +871,7 @@ impl Glm5Pass {
         self.mla_sc = MlaScratch::new(&md, max_t, self.cap);
         self.collapsed = cuda::alloc_named("glm5 collapsed", max_t * h * 4);
         self.sub = cuda::alloc_named("glm5 sublayer out", max_t * h * 4);
+        self.kn.moe.set_dense_tc(kernels::glm5_moe::dense_tc_for(max_t));
         self.max_t = max_t;
     }
 
@@ -1286,12 +1289,12 @@ impl Glm5Pass {
 /// #186: the dense FFN of rows `0 .. t` of `x` into `y` in descending power-of-two row pieces,
 /// each on the `GpuFfnPlan` of its size (made here on first use; the sizes the plan books,
 /// `manager::glm5_prompt_call_sizes`). Every launch is per row, so each row gets the bits of one
-/// `t`-row plan.
+/// `t`-row plan (#186: the tensor-core kernel is picked by `t`, not by the piece).
 ///
 /// # Safety
 /// A CUDA context is current; `x` and `y` hold `t` rows of `hidden`.
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn dense_rows(kn: &kernels::Kernels, gk: &kernels::glm5_moe::Kernels, plans: &mut Vec<GpuFfnPlan>, hidden: usize, inter: usize, limit: f32, w: &GpuFfnWeights, x: Dev, y: Dev, t: usize) {
+pub unsafe fn dense_rows(_kn: &kernels::Kernels, gk: &kernels::glm5_moe::Kernels, plans: &mut Vec<GpuFfnPlan>, hidden: usize, inter: usize, limit: f32, w: &GpuFfnWeights, x: Dev, y: Dev, t: usize) {
     let mut r = 0;
     while r < t {
         let s = 1usize << (usize::BITS - 1 - (t - r).leading_zeros());
@@ -1299,7 +1302,7 @@ pub unsafe fn dense_rows(kn: &kernels::Kernels, gk: &kernels::glm5_moe::Kernels,
             plans.push(GpuFfnPlan::new(hidden, inter, s, limit));
         }
         let p = plans.iter().find(|p| p.tokens == s).unwrap();
-        p.run(kn, gk, w, x + (r * hidden * 4) as u64, y + (r * hidden * 4) as u64);
+        p.run_rows_of(gk, w, x + (r * hidden * 4) as u64, y + (r * hidden * 4) as u64, s, t);
         r += s;
     }
 }
@@ -2444,6 +2447,20 @@ mod tests_dense_gpu {
         out
     }
 
+    /// `m` on `t` rows of `x` on one tensor-core kernel (`small`: `glm5_gemm_fp4_tcs`, else
+    /// `glm5_gemm_fp4_tc`) whatever the row count, into a NaN-filled `[t][ldy]`
+    unsafe fn tc_kernel(kn: &mut Glm5Kernels, ints: &Ints, m: &GpuNvfp4, x: Dev, t: usize, ldy: Option<usize>, small: bool) -> Vec<f32> {
+        let ld = ldy.unwrap_or(m.rows);
+        let mut y = cuda::to_f32_dev(&vec![f32::NAN; t * ld]);
+        kn.moe.set_dense_tc(true);
+        kn.moe.gemm_tc_on(small, [m.w; 3], [m.gs; 3], 1, x, y, ints.p(m.cols), ints.p(ld), ints.p(m.rows), m.rows, t);
+        cuda::sync();
+        kn.moe.set_dense_tc(false);
+        let out = cuda::dtoh(y, t * ld);
+        cuda::free_dev(&mut y);
+        out
+    }
+
     /// the outputs of `[t][ld]` a `[rows]` projection writes: finite, the columns past `rows` untouched
     fn written(y: &[f32], t: usize, ld: usize, rows: usize, what: &str) -> Vec<f32> {
         let mut v = Vec::with_capacity(t * rows);
@@ -2462,7 +2479,8 @@ mod tests_dense_gpu {
     /// #186 `CROW_GLM_DENSE_GEMM=1` on synthetic weights: every GLM-5.3-Flash dense shape plus a
     /// shape with a tail in both tile directions, at row counts on and off the 128-row tile, the
     /// tensor-core GEMM against the GEMV: every output written once (NaN-filled outputs, the
-    /// stride columns past `rows` untouched), cosine >= 0.9999; and the q|k|v launch of three.
+    /// stride columns past `rows` untouched), cosine >= 0.9999, the dispatch and both kernels
+    /// (32 x 32 split-K tiles, 128 x 128 tiles) at every row count; and the q|k|v launch of three.
     #[test]
     #[ignore = "needs the GPU: cargo test --release --lib glm5_dense_gpu -- --ignored --nocapture --test-threads 1"]
     fn glm5_dense_gpu_tc_matches_the_gemv_on_synthetic_shapes() {
@@ -2479,15 +2497,33 @@ mod tests_dense_gpu {
             for s in &sh {
                 let wb = nvfp4(s.rows, s.cols, &mut rng, true);
                 let m = GpuNvfp4 { w: cuda::upload_dev(&wb), gs: cuda::to_f32_dev(&[0.37]), rows: s.rows, cols: s.cols };
-                for t in [kernels::glm5_moe::TC_MIN_ROWS, 17, 128, 300] {
+                for t in [2, 5, kernels::glm5_moe::TC_MIN_ROWS, 33, 128, 129, 300] {
                     let mut x = cuda::to_f32_dev(&xs(t * s.cols, &mut rng));
                     let ld = s.ldy.unwrap_or(s.rows);
-                    let (a, b) = both(&mut kn, &ints, &m, x, t, s.ldy);
                     let what = format!("{} [{} x {}] t {t}", s.what, s.rows, s.cols);
-                    let (a, b) = (written(&a, t, ld, s.rows, &what), written(&b, t, ld, s.rows, &what));
-                    let (cos, rel) = accuracy(&b, &a);
-                    eprintln!("tc {what:<34}: cosine {cos:.9}, max |d| / max |ref| {rel:.2e}");
-                    assert!(cos >= TC_COSINE, "{what}: cosine {cos} below {TC_COSINE}");
+                    let a = if t >= kernels::glm5_moe::TC_MIN_ROWS {
+                        let (a, b) = both(&mut kn, &ints, &m, x, t, s.ldy);
+                        let (a, b) = (written(&a, t, ld, s.rows, &what), written(&b, t, ld, s.rows, &what));
+                        let (cos, rel) = accuracy(&b, &a);
+                        eprintln!("tc {what:<34} dispatch: cosine {cos:.9}, max |d| / max |ref| {rel:.2e}");
+                        assert!(cos >= TC_COSINE, "{what} dispatch: cosine {cos} below {TC_COSINE}");
+                        a
+                    } else {
+                        kn.moe.set_dense_tc(false);
+                        let mut ya = cuda::to_f32_dev(&vec![f32::NAN; t * ld]);
+                        fp4_gemv(&kn, &ints, &m, x, ya, t, s.ldy);
+                        cuda::sync();
+                        let a = written(&cuda::dtoh(ya, t * ld), t, ld, s.rows, &what);
+                        cuda::free_dev(&mut ya);
+                        a
+                    };
+                    for small in [true, false] {
+                        let b = written(&tc_kernel(&mut kn, &ints, &m, x, t, s.ldy, small), t, ld, s.rows, &what);
+                        let (cos, rel) = accuracy(&b, &a);
+                        let k = if small { "32x32" } else { "128x128" };
+                        eprintln!("tc {what:<34} {k:>8}: cosine {cos:.9}, max |d| / max |ref| {rel:.2e}");
+                        assert!(cos >= TC_COSINE, "{what} {k}: cosine {cos} below {TC_COSINE}");
+                    }
                     cuda::free_dev(&mut x);
                 }
                 for mut d in [m.w, m.gs] {
@@ -2555,9 +2591,12 @@ mod tests_dense_gpu {
                 let (a, b) = both(&mut kn, &ints, &m, x, t, None);
                 let (a, b) = (written(&a, t, rows, rows, &p.name), written(&b, t, rows, rows, &p.name));
                 let (cos, rel) = accuracy(&b, &a);
-                eprintln!("tc real {:<62} [{rows:>5} x {cols:>5}]: cosine {cos:.9}, max |d| / max |ref| {rel:.2e}", p.name);
-                worst = worst.min(cos);
-                assert!(cos >= TC_COSINE, "{}: cosine {cos} below {TC_COSINE}", p.name);
+                // the 32 x 32 split-K kernel on the same rows (the dispatch takes it up to TC_SMALL_MAX_ROWS)
+                let bs = written(&tc_kernel(&mut kn, &ints, &m, x, t, None, true), t, rows, rows, &p.name);
+                let (cs, rs) = accuracy(&bs, &a);
+                eprintln!("tc real {:<62} [{rows:>5} x {cols:>5}]: cosine {cos:.9} / {cs:.9} (32x32), max |d| / max |ref| {rel:.2e} / {rs:.2e}", p.name);
+                worst = worst.min(cos).min(cs);
+                assert!(cos >= TC_COSINE && cs >= TC_COSINE, "{}: cosine {cos} / {cs} below {TC_COSINE}", p.name);
                 for mut d in [m.w, m.gs, x] {
                     cuda::free_dev(&mut d);
                 }
@@ -2754,8 +2793,8 @@ mod tests_dense_gpu {
             );
             // the crossover: every dense launch of one call of t rows, VRAM-cold weights; the GEMM
             // launched directly (below TC_MIN_ROWS the dispatch would take the GEMV)
-            for t in [1usize, 2, 4, 8, 16, 32, 64, 128] {
-                let mut us = [0f64; 2];
+            for t in [1usize, 2, 4, 8, 16, 32, 64, 128, 256, 512] {
+                let mut us = [0f64; 3];
                 for s in &sh {
                     let wb = nvfp4(s.rows, s.cols, &mut rng, false);
                     let copies = (256usize << 20).div_ceil(wb.len()).max(2);
@@ -2773,13 +2812,20 @@ mod tests_dense_gpu {
                     kn.moe.set_dense_tc(false);
                     us[0] += s.per_row as f64 * time_us(2 * copies, |i| fp4_gemv(&kn, &ints, &GpuNvfp4 { w: wsv[i % copies], gs, rows: s.rows, cols: s.cols }, x, y, t, s.ldy));
                     kn.moe.set_dense_tc(true);
-                    us[1] += s.per_row as f64 * time_us(2 * copies, |i| kn.moe.gemm_tc([wsv[i % copies]; 3], [gs; 3], 1, x, y, ints.p(s.cols), ints.p(ld), ints.p(s.rows), s.rows, t));
+                    for (k, small) in [(1, false), (2, true)] {
+                        us[k] += s.per_row as f64 * time_us(2 * copies, |i| kn.moe.gemm_tc_on(small, [wsv[i % copies]; 3], [gs; 3], 1, x, y, ints.p(s.cols), ints.p(ld), ints.p(s.rows), s.rows, t));
+                    }
                     kn.moe.set_dense_tc(false);
                     for mut d in wsv.into_iter().chain([gs, x, y]) {
                         cuda::free_dev(&mut d);
                     }
                 }
-                eprintln!("tc bench crossover t {t:>3}: dense launches of one call GEMV {:>8.2} ms | tensor cores {:>8.2} ms", us[0] / 1e3, us[1] / 1e3);
+                eprintln!(
+                    "tc bench crossover t {t:>3}: dense launches of one call GEMV {:>8.2} ms | tensor cores 128x128 {:>8.2} ms | 32x32 split-K {:>8.2} ms",
+                    us[0] / 1e3,
+                    us[1] / 1e3,
+                    us[2] / 1e3
+                );
             }
         }
     }

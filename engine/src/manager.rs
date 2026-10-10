@@ -885,10 +885,16 @@ pub fn glm5_prompt_call_sizes(chunk: usize) -> Vec<usize> {
 /// the collapsed and sublayer rows), the residual's `chunk - 1` more rows, one expert-major MoE
 /// plan of `chunk` rows (`glm5_moe::GpuMoeGroupedPlan`: router, the combos' gate / up / expert
 /// outputs, schedule, shared expert; `glm5_moe::grouped_plan_bytes`) and one dense FFN plan
-/// (`GpuFfnPlan`) per call size of [`glm5_prompt_call_sizes`]. The small
+/// (`GpuFfnPlan`) per call size of [`glm5_prompt_call_sizes`], and with `CROW_GLM_DENSE_GEMM=1`
+/// the tensor-core path's row table (`kernels::glm5_moe::TC_ROWS_BYTES`, #186). The small
 /// parameter arrays are left out (the GPU test `glm5_model::tests_186_gpu` holds the sum to the
 /// bytes the allocations register). 0 at chunk 1.
 pub fn glm5_chunk_scratch_bytes(g: &Glm5Geo, chunk: usize, cap: usize) -> u64 {
+    glm5_chunk_scratch_bytes_tc(g, chunk, cap, crate::kernels::glm5_moe::dense_gemm_from_env())
+}
+
+/// [`glm5_chunk_scratch_bytes`] with `CROW_GLM_DENSE_GEMM` given (`tc`)
+pub fn glm5_chunk_scratch_bytes_tc(g: &Glm5Geo, chunk: usize, cap: usize, tc: bool) -> u64 {
     use crate::glm5_kda::KdaDims;
     use crate::glm5_mhc::{HC, MIX};
     use crate::glm5_mla::{MlaDims, KPOOL};
@@ -907,7 +913,9 @@ pub fn glm5_chunk_scratch_bytes(g: &Glm5Geo, chunk: usize, cap: usize) -> u64 {
     let dense_plan = |t: usize| 4 * 3 * t as u64 * g.dense_inter as u64;
     let plans: u64 = moe_plan + glm5_prompt_call_sizes(chunk).into_iter().map(dense_plan).sum::<u64>();
     let residual = ((chunk - 1) * g.hc_streams * h * 4) as u64;
-    pass(chunk) - pass(1) + residual + plans
+    // #186: the tensor-core path's device row counts (`CROW_GLM_DENSE_GEMM=1`), held by a pass of `chunk` rows
+    let tc = if tc && chunk >= crate::kernels::glm5_moe::TC_MIN_ROWS { crate::kernels::glm5_moe::TC_ROWS_BYTES } else { 0 };
+    pass(chunk) - pass(1) + residual + plans + tc
 }
 
 /// #159: the glm5_next plan from its geometry: the states at `context`, the staging of its
