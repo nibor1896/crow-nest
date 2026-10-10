@@ -696,9 +696,18 @@ impl Ints {
 /// `gemv_fp4_bs`), else `rows`. #186: with `CROW_GLM_DENSE_GEMM=1` a call of at least
 /// `TC_MIN_ROWS` rows runs on the FP16 tensor-core GEMM instead (`glm5_gemm_fp4_tc`).
 unsafe fn fp4_gemv(kn: &Glm5Kernels, ints: &Ints, m: &GpuNvfp4, x: Dev, y: Dev, t: usize, ldy: Option<usize>) {
+    fp4_gemv_of(kn, ints, m, x, y, t, ldy, t)
+}
+
+/// #196: [`fp4_gemv`] for `t` rows of a call of `call_t` rows run in sub-blocks: the kernel is
+/// picked by `call_t` (`CROW_GLM_DENSE_GEMM`), so every row of the call takes the kernel the
+/// whole call gives it (as `GpuFfnPlan::run_rows_of`)
+#[allow(clippy::too_many_arguments)]
+unsafe fn fp4_gemv_of(kn: &Glm5Kernels, ints: &Ints, m: &GpuNvfp4, x: Dev, y: Dev, t: usize, ldy: Option<usize>, call_t: usize) {
     let ld = ldy.unwrap_or(m.rows);
-    if kn.moe.dense_tc(t) {
-        return kn.moe.gemm_tc([m.w; 3], [m.gs; 3], 1, x, y, ints.p(m.cols), ints.p(ld), ints.p(m.rows), m.rows, t);
+    if kn.moe.dense_tc(call_t) {
+        let small = kernels::glm5_moe::tc_small(call_t);
+        return kn.moe.gemm_tc_on(small, [m.w; 3], [m.gs; 3], 1, x, y, ints.p(m.cols), ints.p(ld), ints.p(m.rows), m.rows, t);
     }
     let (blocks, threads) = kernels::glm5_moe::fp4_launch(m.rows, m.cols);
     launch_v(kn.moe.fp4, blocks, t as u32, 1, threads, &[m.w, x, m.gs, y, ints.p(m.cols), ints.p(ld), ints.p(m.rows)]);
@@ -707,12 +716,21 @@ unsafe fn fp4_gemv(kn: &Glm5Kernels, ints: &Ints, m: &GpuNvfp4, x: Dev, y: Dev, 
 /// [`fp4_gemv`] of three `[rows, cols]` matrices on one `x` in ONE launch (`glm5_gemv_fp4_x3`):
 /// matrix `m` writes the columns `m * rows ..` of `y` (row stride `ldy`), each output bit-identical
 /// to its own `fp4_gemv` (#186: on the tensor-core GEMM as `fp4_gemv`). The KDA q|k|v projections of a call.
+#[cfg(test)]
 unsafe fn fp4_gemv_x3(kn: &Glm5Kernels, ints: &Ints, ms: [&GpuNvfp4; 3], x: Dev, y: Dev, t: usize, ldy: usize) {
+    fp4_gemv_x3_of(kn, ints, ms, x, y, t, ldy, t)
+}
+
+/// #196: [`fp4_gemv_x3`] for `t` rows of a call of `call_t` rows (the kernel picked by `call_t`,
+/// as [`fp4_gemv_of`])
+#[allow(clippy::too_many_arguments)]
+unsafe fn fp4_gemv_x3_of(kn: &Glm5Kernels, ints: &Ints, ms: [&GpuNvfp4; 3], x: Dev, y: Dev, t: usize, ldy: usize, call_t: usize) {
     let (rows, cols) = (ms[0].rows, ms[0].cols);
     assert!(ms.iter().all(|m| m.rows == rows && m.cols == cols), "glm5_model: q|k|v of different shapes");
     let [a, b, c] = ms;
-    if kn.moe.dense_tc(t) {
-        return kn.moe.gemm_tc([a.w, b.w, c.w], [a.gs, b.gs, c.gs], 3, x, y, ints.p(cols), ints.p(ldy), ints.p(rows), rows, t);
+    if kn.moe.dense_tc(call_t) {
+        let small = kernels::glm5_moe::tc_small(call_t);
+        return kn.moe.gemm_tc_on(small, [a.w, b.w, c.w], [a.gs, b.gs, c.gs], 3, x, y, ints.p(cols), ints.p(ldy), ints.p(rows), rows, t);
     }
     let (blocks, threads) = kernels::glm5_moe::fp4_launch(rows, cols);
     launch_v(kn.moe.fp4_x3, 3 * blocks, t as u32, 1, threads, &[a.w, b.w, c.w, a.gs, b.gs, c.gs, x, y, ints.p(cols), ints.p(ldy), ints.p(rows)]);
@@ -757,9 +775,31 @@ pub type ExpertHook<'a> = dyn FnMut(usize, &[i32]) -> Result<Dev, String> + 'a;
 /// pseudo-rows of its expert-major schedule ([`ExpertMajor::sel`]), not its token rows.
 pub type ExpertBatchHook<'a> = dyn FnMut(usize, &[i32], &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<(), String> + 'a;
 
+/// #196: rows of one KDA sub-block of a prompt call (the KDA scratch's rows; the recurrent state
+/// carries from one sub-block to the next, `glm5_kda::prompt_rows_with`)
+pub const KDA_SUB_ROWS: usize = 1024;
+/// #196: rows of one MLA sub-call of a prompt call (the MLA scratch's rows, so the indexer's pool
+/// scores are a fixed block of 256 rows x `cap / 4`, exllamav3's `mla_attn.py` block); the
+/// sub-calls run in position order, each storing its cache rows before it selects and attends
+pub const MLA_SUB_ROWS: usize = 256;
+
+/// #196: the (KDA, MLA) scratch rows of a pass of calls of up to `max_t` rows
+pub fn attn_rows(max_t: usize) -> (usize, usize) {
+    (max_t.min(KDA_SUB_ROWS), max_t.min(MLA_SUB_ROWS))
+}
+
+/// #196: the bytes of a pass's attention region at (KDA, MLA) scratch rows `rows` over caches of
+/// `cap` rows: the KDA and the MLA activations share it (a layer is one or the other), so it is
+/// the larger of the two (exllamav3 reserves the max over layers, not the sum)
+pub fn attn_region_bytes(g: &Glm5Geo, rows: (usize, usize), cap: usize) -> usize {
+    KdaScratch::region_bytes(&KdaDims::of(g), rows.0).max(MlaScratch::region_bytes(&MlaDims::of(g), rows.1, cap))
+}
+
 /// The per-sequence state and scratch of a layer-at-a-time pass over up to `cap` rows in calls
-/// of up to `max_t` rows: one mHC plan, one KDA state + scratch (reset per layer), one MLA cache
-/// + scratch, the FFN plans per call size. Every launch queues on the current stream.
+/// of up to `max_t` rows: one mHC plan, one KDA state, one MLA cache, the KDA and MLA scratch in
+/// one shared region at their sub-block rows ([`attn_rows`], #196), the FFN plans per call size
+/// and the prompt call's expert-major plan with the dense FFN over its region. Every launch
+/// queues on the current stream.
 pub struct Glm5Pass {
     pub g: Glm5Geo,
     pub kn: Glm5Kernels,
@@ -771,6 +811,13 @@ pub struct Glm5Pass {
     kda_sc: KdaScratch,
     mla_sc: MlaScratch,
     mla_c: MlaCache,
+    /// #196: the region `kda_sc` and `mla_sc` are views into ([`attn_region_bytes`])
+    attn: Dev,
+    /// #196: whole calls (test reference): the attention scratch at `max_t` rows and one gate /
+    /// up piece for every combo, the pre-#196 scratch
+    whole: bool,
+    /// #196: rows of the last MLA call (its selection, [`Glm5Pass::selection`])
+    last_mla_t: usize,
     ints: Ints,
     /// `[2]` i32: the slot `gm_rmsnorm` takes (reads none of it)
     st2: Dev,
@@ -799,6 +846,21 @@ impl Glm5Pass {
     /// # Safety
     /// A CUDA context is current.
     pub unsafe fn new(g: &Glm5Geo, moe: MoeGeo, max_t: usize, cap: usize) -> Glm5Pass {
+        Glm5Pass::new_with(g, moe, max_t, cap, false)
+    }
+
+    /// #196 test reference: [`Glm5Pass::new`] with the pre-#196 scratch (whole calls: the KDA
+    /// and MLA scratch at `max_t` rows, one gate / up piece for every combo), the same algorithm
+    /// in one piece per call
+    ///
+    /// # Safety
+    /// As [`Glm5Pass::new`].
+    #[cfg(test)]
+    pub(crate) unsafe fn new_whole(g: &Glm5Geo, moe: MoeGeo, max_t: usize, cap: usize) -> Glm5Pass {
+        Glm5Pass::new_with(g, moe, max_t, cap, true)
+    }
+
+    unsafe fn new_with(g: &Glm5Geo, moe: MoeGeo, max_t: usize, cap: usize, whole: bool) -> Glm5Pass {
         assert!(max_t >= 1 && cap >= max_t, "glm5_model: calls of {max_t} rows over {cap}");
         let mut kn = Glm5Kernels::new(g);
         // #186: the tensor-core path of prompt calls (`CROW_GLM_DENSE_GEMM`)
@@ -808,16 +870,20 @@ impl Glm5Pass {
         let h = g.hidden;
         let kda_st = KdaState::alloc(&kd);
         kda_st.reset();
+        let (attn, kda_sc, mla_sc) = Glm5Pass::attn_scratch(g, max_t, cap, whole);
         Glm5Pass {
             g: *g,
             moe,
             max_t,
             cap,
             mhc: glm5_mhc::Plan::new(h, max_t),
-            kda_sc: KdaScratch::alloc(&kd, max_t),
+            kda_sc,
             kda_st,
-            mla_sc: MlaScratch::new(&md, max_t, cap),
+            mla_sc,
             mla_c: MlaCache::new(&md, cap),
+            attn,
+            whole,
+            last_mla_t: 0,
             // every K, output stride and row count `fp4_gemv` passes (#191: rows too)
             ints: Ints::new(&[h, kd.width(), kd.conv_ch(), md.q_lora, md.heads * md.v, md.heads * md.nope, md.kv_lora]),
             st2: cuda::to_i32_dev(&[0i32, 0]),
@@ -831,6 +897,79 @@ impl Glm5Pass {
             overlap: false,
             ctl: None,
             kn,
+        }
+    }
+
+    /// #196: the attention region and the KDA / MLA scratch views into it for calls of up to
+    /// `max_t` rows (`whole`: at `max_t` rows, else [`attn_rows`]); the MLA selection holds
+    /// `max_t` rows
+    unsafe fn attn_scratch(g: &Glm5Geo, max_t: usize, cap: usize, whole: bool) -> (Dev, KdaScratch, MlaScratch) {
+        let rows = if whole { (max_t, max_t) } else { attn_rows(max_t) };
+        let attn = cuda::alloc_named("glm5 attention scratch (KDA | MLA)", attn_region_bytes(g, rows, cap));
+        (attn, KdaScratch::alloc_in(&KdaDims::of(g), rows.0, attn), MlaScratch::new_in(&MlaDims::of(g), rows.1, max_t, cap, attn))
+    }
+
+    /// #196: the prompt call's expert-major plan of `max_t` rows (made on first use), whose region
+    /// also holds the dense FFN of a dense layer's call
+    ///
+    /// # Safety
+    /// A CUDA context is current; no capture is open.
+    unsafe fn grouped_plan(&mut self) -> &GpuMoeGroupedPlan {
+        if self.grouped.is_none() {
+            let piece = if self.whole { usize::MAX } else { crate::glm5_moe::GROUP_PIECE_COMBOS };
+            self.grouped = Some(GpuMoeGroupedPlan::with_piece(&self.moe, self.max_t, &self.kn.mul1, piece));
+        }
+        self.grouped.as_ref().unwrap()
+    }
+
+    /// #196: the attention sub-block of a call of layer `lw`: rows `pos0 .. pos0 + t` of
+    /// `collapsed` into `sub`. KDA: the decode step (`decode`, one row) or the prompt path in
+    /// sub-blocks of the KDA scratch's rows with the state carried (`glm5_kda::prompt_rows_with`);
+    /// MLA: sub-calls of the MLA scratch's rows in position order, each appending its cache rows
+    /// before it selects and attends, its selection at its rows of the call's and the call's
+    /// split count (`MlaScratch::forward_rows_with`). The projections pick their kernel by the
+    /// call's `t` (`CROW_GLM_DENSE_GEMM`), so every row has the bits of one call of `t` rows on
+    /// a scratch of `t` rows.
+    ///
+    /// # Safety
+    /// As [`Glm5Pass::call`].
+    unsafe fn attention(&mut self, lw: &LayerW, pos0: usize, t: usize, decode: bool) {
+        let (kn, ints) = (&self.kn, &self.ints);
+        match &lw.attn {
+            AttnW::Kda(a) => {
+                let mut proj = |p: KdaProj, xi: Dev, yo: Dev, tt: usize| match p {
+                    KdaProj::Qkv => {
+                        let cc = kn.kda.d.conv_ch();
+                        fp4_gemv_x3_of(kn, ints, [&a.q, &a.k, &a.v], xi, yo, tt, cc, t);
+                    }
+                    KdaProj::O => fp4_gemv_of(kn, ints, &a.o, xi, yo, tt, None, t),
+                };
+                if decode {
+                    glm5_kda::step_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, self.sub, &mut proj);
+                } else {
+                    glm5_kda::prompt_rows_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, t, self.sub, &mut proj);
+                }
+            }
+            AttnW::Mla(a) => {
+                let mut proj = |s: &MlaScratch, p: MlaProj, xi: Dev, yo: Dev| {
+                    let m = match p {
+                        MlaProj::QA => &a.q_a,
+                        MlaProj::QB => &a.q_b,
+                        MlaProj::KVA => &a.kv_a,
+                        MlaProj::O => &a.o,
+                    };
+                    fp4_gemv_of(kn, ints, m, xi, yo, s.t(), None, t);
+                };
+                let (rb, step) = ((self.g.hidden * 4) as u64, self.mla_sc.max_t);
+                let mut r = 0;
+                while r < t {
+                    let n = step.min(t - r);
+                    let (xi, yo) = (self.collapsed + r as u64 * rb, self.sub + r as u64 * rb);
+                    self.mla_sc.forward_rows_with(&kn.mla, &a.w, &self.mla_c, xi, yo, pos0 + r, n, r, t, &mut proj);
+                    r += n;
+                }
+                self.last_mla_t = t;
+            }
         }
     }
 
@@ -849,10 +988,11 @@ impl Glm5Pass {
             return;
         }
         cuda::sync();
-        let (kd, md, h) = (KdaDims::of(&self.g), MlaDims::of(&self.g), self.g.hidden);
+        let h = self.g.hidden;
         self.mhc.free();
         self.kda_sc.free();
         self.mla_sc.free();
+        cuda::free_dev(&mut self.attn);
         cuda::free_dev(&mut self.collapsed);
         cuda::free_dev(&mut self.sub);
         if let Some(mut p) = self.grouped.take() {
@@ -867,8 +1007,7 @@ impl Glm5Pass {
         }
         self.dense_plans.retain(|p| p.tokens <= max_t);
         self.mhc = glm5_mhc::Plan::new(h, max_t);
-        self.kda_sc = KdaScratch::alloc(&kd, max_t);
-        self.mla_sc = MlaScratch::new(&md, max_t, self.cap);
+        (self.attn, self.kda_sc, self.mla_sc) = Glm5Pass::attn_scratch(&self.g, max_t, self.cap, self.whole);
         self.collapsed = cuda::alloc_named("glm5 collapsed", max_t * h * 4);
         self.sub = cuda::alloc_named("glm5 sublayer out", max_t * h * 4);
         self.kn.moe.set_dense_tc(kernels::glm5_moe::dense_tc_for(max_t));
@@ -966,7 +1105,7 @@ impl Glm5Pass {
         assert!((1..=self.max_t).contains(&t) && pos0 + t <= self.cap, "glm5_model: call rows {pos0}..{} (max_t {}, cap {})", pos0 + t, self.max_t, self.cap);
         assert!(!decode || t == 1, "glm5_model: a decode call is one row, got {t}");
         let h = self.g.hidden;
-        let (kn, ints) = (&self.kn, &self.ints);
+        let kn = &self.kn;
         // attention site; CROW_GLM_HCFUSE folds the norm into the site (untapped: taps read collapsed before it)
         let fuse = taps.is_none() && glm5_mhc::hcfuse();
         if fuse { self.mhc.coeffs_norm(&kn.mhc, &lw.attn_hc, x, lw.input_norm, self.collapsed, t) } else { self.mhc.coeffs(&kn.mhc, &lw.attn_hc, x, self.collapsed, t) }
@@ -974,34 +1113,8 @@ impl Glm5Pass {
             self.tap_coeffs(&mut tp.attn, t);
         }
         if !fuse { kn.mla.rmsnorm_rows(self.collapsed, lw.input_norm, h, t, self.st2) }
-        match &lw.attn {
-            AttnW::Kda(a) => {
-                let mut proj = |p: KdaProj, xi: Dev, yo: Dev, tt: usize| match p {
-                    KdaProj::Qkv => {
-                        let cc = kn.kda.d.conv_ch();
-                        fp4_gemv_x3(kn, ints, [&a.q, &a.k, &a.v], xi, yo, tt, cc);
-                    }
-                    KdaProj::O => fp4_gemv(kn, ints, &a.o, xi, yo, tt, None),
-                };
-                if decode {
-                    glm5_kda::step_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, self.sub, &mut proj);
-                } else {
-                    glm5_kda::prompt_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, t, self.sub, &mut proj);
-                }
-            }
-            AttnW::Mla(a) => {
-                let mut proj = |s: &MlaScratch, p: MlaProj, xi: Dev, yo: Dev| {
-                    let m = match p {
-                        MlaProj::QA => &a.q_a,
-                        MlaProj::QB => &a.q_b,
-                        MlaProj::KVA => &a.kv_a,
-                        MlaProj::O => &a.o,
-                    };
-                    fp4_gemv(kn, ints, m, xi, yo, s.t(), None);
-                };
-                self.mla_sc.forward_with(&kn.mla, &a.w, &self.mla_c, self.collapsed, self.sub, pos0, t, &mut proj);
-            }
-        }
+        self.attention(lw, pos0, t, decode);
+        let kn = &self.kn;
         if let Some(tp) = taps.as_deref_mut() {
             cuda::sync();
             tp.attn.out.extend(cuda::dtoh(self.sub, t * h));
@@ -1122,7 +1235,7 @@ impl Glm5Pass {
     /// The last call was an MLA call.
     pub unsafe fn selection(&self) -> Vec<Vec<usize>> {
         cuda::sync();
-        let (t, w) = (self.mla_sc.t(), MlaDims::of(&self.g).sel_max());
+        let (t, w) = (self.last_mla_t, MlaDims::of(&self.g).sel_max());
         let n = cuda::dtoh_i32(self.mla_sc.sel_n, t);
         let s = cuda::dtoh_i32(self.mla_sc.sel, t * w);
         (0..t)
@@ -1169,7 +1282,7 @@ impl Glm5Pass {
         if let Some(r) = self.routed.as_mut() {
             r.free();
         }
-        for d in [&mut self.ints.dev, &mut self.st2, &mut self.collapsed, &mut self.sub] {
+        for d in [&mut self.ints.dev, &mut self.st2, &mut self.collapsed, &mut self.sub, &mut self.attn] {
             cuda::free_dev(d);
         }
     }
@@ -1198,7 +1311,9 @@ pub unsafe fn router_ids(routed: Option<&mut crate::glm5_flags::Routed>, ids: De
 impl Glm5Pass {
     /// #186: one prompt call (`decode` false) of a layer loaded without its expert records. The
     /// launches of [`Glm5Pass::call_with_experts`] for a prompt call, in the same order, up to the
-    /// FFN. A dense FFN runs in descending power-of-two row pieces ([`dense_rows`]). The MoE runs
+    /// FFN (#196: the attention in sub-blocks, [`attn_rows`]). A dense FFN runs on the one dense
+    /// plan of `max_t` rows over the expert-major plan's region ([`GpuMoeGroupedPlan::dense`]).
+    /// The MoE runs
     /// expert-major on the pass's [`GpuMoeGroupedPlan`] of `max_t` rows: the router on the `t`
     /// rows, the host reads their ids (one stream sync for the call) and builds the
     /// [`ExpertMajor`] schedule, `experts` serves its pseudo-rows (every selected expert in
@@ -1213,43 +1328,24 @@ impl Glm5Pass {
     pub unsafe fn call_with_expert_batches(&mut self, lw: &LayerW, x: Dev, pos0: usize, t: usize, experts: &mut ExpertBatchHook) -> Result<(), String> {
         assert!((1..=self.max_t).contains(&t) && pos0 + t <= self.cap, "glm5_model: call rows {pos0}..{} (max_t {}, cap {})", pos0 + t, self.max_t, self.cap);
         let h = self.g.hidden;
-        let (kn, ints) = (&self.kn, &self.ints);
         // attention site: `call_inner`'s launches for a prompt call, without taps
         let fuse = glm5_mhc::hcfuse();
+        let kn = &self.kn;
         if fuse { self.mhc.coeffs_norm(&kn.mhc, &lw.attn_hc, x, lw.input_norm, self.collapsed, t) } else { self.mhc.coeffs(&kn.mhc, &lw.attn_hc, x, self.collapsed, t) }
         if !fuse { kn.mla.rmsnorm_rows(self.collapsed, lw.input_norm, h, t, self.st2) }
-        match &lw.attn {
-            AttnW::Kda(a) => {
-                let mut proj = |p: KdaProj, xi: Dev, yo: Dev, tt: usize| match p {
-                    KdaProj::Qkv => {
-                        let cc = kn.kda.d.conv_ch();
-                        fp4_gemv_x3(kn, ints, [&a.q, &a.k, &a.v], xi, yo, tt, cc);
-                    }
-                    KdaProj::O => fp4_gemv(kn, ints, &a.o, xi, yo, tt, None),
-                };
-                glm5_kda::prompt_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, t, self.sub, &mut proj);
-            }
-            AttnW::Mla(a) => {
-                let mut proj = |s: &MlaScratch, p: MlaProj, xi: Dev, yo: Dev| {
-                    let m = match p {
-                        MlaProj::QA => &a.q_a,
-                        MlaProj::QB => &a.q_b,
-                        MlaProj::KVA => &a.kv_a,
-                        MlaProj::O => &a.o,
-                    };
-                    fp4_gemv(kn, ints, m, xi, yo, s.t(), None);
-                };
-                self.mla_sc.forward_with(&kn.mla, &a.w, &self.mla_c, self.collapsed, self.sub, pos0, t, &mut proj);
-            }
-        }
+        self.attention(lw, pos0, t, false);
+        let kn = &self.kn;
         self.mhc.expand(&kn.mhc, x, self.sub, x, t);
         // FFN site
         if fuse { self.mhc.coeffs_norm(&kn.mhc, &lw.ffn_hc, x, lw.post_norm, self.collapsed, t) } else { self.mhc.coeffs(&kn.mhc, &lw.ffn_hc, x, self.collapsed, t) }
         if !fuse { kn.mla.rmsnorm_rows(self.collapsed, lw.post_norm, h, t, self.st2) }
+        let (collapsed, sub) = (self.collapsed, self.sub);
         let w = match &lw.ffn {
             FfnW::Dense(w) => {
-                let (inter, limit) = (self.g.dense_inter, self.g.swiglu_limit as f32);
-                dense_rows(&self.kn.k, &self.kn.moe, &mut self.dense_plans, h, inter, limit, w, self.collapsed, self.sub, t);
+                // #196: one dense FFN plan of `max_t` rows over the expert-major plan's region;
+                // every launch is per row, so each row has the bits of one `t`-row plan
+                self.grouped_plan();
+                self.grouped.as_ref().unwrap().dense.run_rows_of(&self.kn.moe, w, collapsed, sub, t, t);
                 self.last_ffn_t = t;
                 self.mhc.expand(&self.kn.mhc, x, self.sub, x, t);
                 return Ok(());
@@ -1259,9 +1355,7 @@ impl Glm5Pass {
         // expert-major (0xSero's glm53-flash-offload prefill): the router on the call's rows, one
         // routing sync, the call's schedule; the tiers serve its pseudo-rows (each selected expert
         // in exactly one), and each sub-batch runs every row routed to its experts
-        if self.grouped.is_none() {
-            self.grouped = Some(GpuMoeGroupedPlan::new(&self.moe, self.max_t, &self.kn.mul1));
-        }
+        self.grouped_plan();
         let gp = self.grouped.as_ref().unwrap();
         gp.route(&self.kn.k, &self.kn.moe, w, self.collapsed, t);
         let ids = router_ids(None, gp.ids, t * self.moe.topk, lw.layer)?;
@@ -1285,27 +1379,6 @@ impl Glm5Pass {
         self.last_ffn_t = t;
         self.mhc.expand(&self.kn.mhc, x, self.sub, x, t);
         Ok(())
-    }
-}
-
-/// #186: the dense FFN of rows `0 .. t` of `x` into `y` in descending power-of-two row pieces,
-/// each on the `GpuFfnPlan` of its size (made here on first use; the sizes the plan books,
-/// `manager::glm5_prompt_call_sizes`). Every launch is per row, so each row gets the bits of one
-/// `t`-row plan (#186: the tensor-core kernel is picked by `t`, not by the piece).
-///
-/// # Safety
-/// A CUDA context is current; `x` and `y` hold `t` rows of `hidden`.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn dense_rows(_kn: &kernels::Kernels, gk: &kernels::glm5_moe::Kernels, plans: &mut Vec<GpuFfnPlan>, hidden: usize, inter: usize, limit: f32, w: &GpuFfnWeights, x: Dev, y: Dev, t: usize) {
-    let mut r = 0;
-    while r < t {
-        let s = 1usize << (usize::BITS - 1 - (t - r).leading_zeros());
-        if !plans.iter().any(|p| p.tokens == s) {
-            plans.push(GpuFfnPlan::new(hidden, inter, s, limit));
-        }
-        let p = plans.iter().find(|p| p.tokens == s).unwrap();
-        p.run_rows_of(gk, w, x + (r * hidden * 4) as u64, y + (r * hidden * 4) as u64, s, t);
-        r += s;
     }
 }
 
@@ -2829,6 +2902,138 @@ mod tests_dense_gpu {
                     us[2] / 1e3
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_196_gpu {
+    //! #196: the prompt call in sub-blocks (KDA 1024 rows with the state carried, MLA sub-calls
+    //! of 256 rows, gate / up in pieces of 4096 combos, the dense FFN over the MoE plan's region)
+    //! against the pre-#196 scratch (`Glm5Pass::new_whole`: whole calls, one piece). `#[ignore]`:
+    //! CI has no GPU.
+    use super::*;
+    use crate::glm5_flags::tests::{geo8, synth_model};
+    use sha2::{Digest, Sha256};
+
+    fn hash(v: &[f32]) -> String {
+        let mut h = Sha256::new();
+        for x in v {
+            h.update(x.to_bits().to_le_bytes());
+        }
+        h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f64 {
+        let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
+        for (&x, &y) in a.iter().zip(b) {
+            let (x, y) = (x as f64, y as f64);
+            ab += x * y;
+            aa += x * x;
+            bb += y * y;
+        }
+        ab / (aa.sqrt() * bb.sqrt())
+    }
+
+    /// KL(p || q) in nats of two logit rows (f64 softmax)
+    fn kl(p: &[f32], q: &[f32]) -> f64 {
+        let ls = |v: &[f32]| -> Vec<f64> {
+            let m = v.iter().fold(f64::NEG_INFINITY, |a, &x| a.max(x as f64));
+            let z: f64 = v.iter().map(|&x| (x as f64 - m).exp()).sum();
+            v.iter().map(|&x| x as f64 - m - z.ln()).collect()
+        };
+        let (a, b) = (ls(p), ls(q));
+        a.iter().zip(&b).map(|(x, y)| x.exp() * (x - y)).sum()
+    }
+
+    /// The synthetic 8-layer model (3 KDA + dense, MLA + MoE, 3 KDA + MoE, MLA + MoE; real layer
+    /// shapes, 16 MUL1 experts top-8), a prompt of 9,221 rows (8192 + 1029: every chunk ends on a
+    /// call whose MLA sub-calls end on 5 rows) in prompt calls (`call_with_expert_batches`, every
+    /// record in VRAM) of 256 / 1024 / 8192 rows, layer by layer, the sub-blocked pass against
+    /// the whole-call reference from the same input: after every layer the residual of all rows
+    /// has cosine >= 0.9999 (reported: values that differ in bits and the residual's hash), and
+    /// the head over every row gives the same greedy ids (reported: KL mean / max, top-1).
+    #[test]
+    #[ignore = "needs the GPU (about 16 GB VRAM, a 2.3 GB synthetic container in the temp dir, a few minutes): cargo test --release --lib glm5_scratch_gpu_196 -- --ignored --nocapture --test-threads 1"]
+    fn glm5_scratch_gpu_196_sub_blocks_match_whole_calls() {
+        let g = geo8();
+        let s = synth_model(&g, 9_474_048);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let n = 8192 + 1029;
+        let ids: Vec<i64> = (0..n as i64).map(|i| (i * 131 + 7) % g.vocab as i64).collect();
+        let (row, v) = (g.hc_streams * g.hidden, g.vocab);
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let x0 = trunk_input(&embed_rows(&mut cnq, &g, &ids), g.hidden, g.hc_streams);
+            let mut rep = LoadReport::default();
+            let mut layers: Vec<LayerW> = (0..g.layers).map(|l| load_layer(&mut cnq, &g, &moe, l, &mut rep)).collect();
+            let mut head = Head::new(head_geo(&g));
+            let mut hw = load_head(&mut cnq, &g, &mut rep);
+            let (mut normed, mut logits, mut next) = (cuda::alloc_zeroed(n * g.hidden * 4), cuda::alloc_zeroed(n * v * 4), cuda::alloc_zeroed(n * 4));
+            let mut worst = 1f64;
+            for chunk in [256usize, 1024, 8192] {
+                let t0 = std::time::Instant::now();
+                let mut pn = Glm5Pass::new(&g, moe, chunk, n);
+                let mut pw = Glm5Pass::new_whole(&g, moe, chunk, n);
+                let (mut xn, mut xw) = (cuda::alloc_named("196 residual", n * row * 4), cuda::alloc_named("196 residual ref", n * row * 4));
+                cuda::to_f32_into(xn, &x0);
+                cuda::to_f32_into(xw, &x0);
+                for lw in &layers {
+                    let tb = match &lw.ffn {
+                        FfnW::Moe { table, .. } => *table,
+                        FfnW::Dense(_) => 0,
+                    };
+                    for (p, x) in [(&mut pn, xn), (&mut pw, xw)] {
+                        p.begin_layer();
+                        for (r0, t) in crate::glm5_tiers::prompt_calls(n, chunk) {
+                            let mut hook = |_l: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>| run(0, sel.len() / g.topk, tb);
+                            p.call_with_expert_batches(lw, x + (r0 * row * 4) as u64, r0, t, &mut hook).unwrap();
+                        }
+                    }
+                    cuda::sync();
+                    let (a, b) = (cuda::dtoh(xn, n * row), cuda::dtoh(xw, n * row));
+                    let cos = cosine(&a, &b);
+                    let differ = a.iter().zip(&b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+                    eprintln!("#196 chunk {chunk} layer {} ({}): residual cosine {cos:.12}, {differ} of {} values differ in bits, hash {} (whole calls {})", lw.layer, kind_label(&g, lw.layer), a.len(), hash(&a), hash(&b));
+                    assert!(a.iter().all(|x| x.is_finite()), "chunk {chunk} layer {}: the synthetic model must stay finite", lw.layer);
+                    assert!(cos >= 0.9999, "chunk {chunk} layer {}: residual cosine {cos} below 0.9999", lw.layer);
+                    worst = worst.min(cos);
+                }
+                let mut lg = Vec::new();
+                let mut top = Vec::new();
+                for x in [xn, xw] {
+                    run_head(&pn.kn, &head, &hw, x, normed, logits, next, n);
+                    cuda::sync();
+                    lg.push(cuda::dtoh(logits, n * v));
+                    top.push(cuda::dtoh_i32(next, n));
+                }
+                let kls: Vec<f64> = (0..n).map(|r| kl(&lg[1][r * v..(r + 1) * v], &lg[0][r * v..(r + 1) * v])).collect();
+                let agree = (0..n).filter(|&r| top[0][r] == top[1][r]).count();
+                eprintln!(
+                    "#196 chunk {chunk}: head over {n} rows: ids {} / {n} identical, KL mean {:.3e} max {:.3e}, logits hash {} (whole calls {}), {:.1} s",
+                    agree,
+                    kls.iter().sum::<f64>() / n as f64,
+                    kls.iter().cloned().fold(0f64, f64::max),
+                    hash(&lg[0]),
+                    hash(&lg[1]),
+                    t0.elapsed().as_secs_f64()
+                );
+                assert_eq!(top[0], top[1], "chunk {chunk}: greedy ids of the prompt rows");
+                cuda::free_dev(&mut xn);
+                cuda::free_dev(&mut xw);
+                pn.free();
+                pw.free();
+            }
+            eprintln!("#196: worst per-layer residual cosine {worst:.12}");
+            for lw in layers.iter_mut() {
+                lw.free();
+            }
+            for d in [&mut normed, &mut logits, &mut next, &mut hw.norm, &mut hw.lm] {
+                cuda::free_dev(d);
+            }
+            head.free();
         }
     }
 }

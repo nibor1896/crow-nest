@@ -387,7 +387,11 @@ extern "C" __global__ void mul1_decode_states(float* __restrict__ out) {
 // list: combo indices c, grouped by expert; the input row of entry i is list[i] / p[6] (row
 // stride k), its output row list[i] (row stride n). table [E] u64: record bases (VRAM, pinned
 // UVA or staging). p: [0] k, [1] n, [2] S, [3] n32, [4] bits, [5] half, [6] in_div, [7] mode,
-// [8] limit (f32 bits), [9 + 3 z ..] tr_off, suh_off, svh_off of matrix z. k / S <= MUL1_GXROWS.
+// [8] limit (f32 bits), [9 + 3 z ..] tr_off, suh_off, svh_off of matrix z, [15] loc. k / S <= MUL1_GXROWS.
+// #196 loc = 1: the gate / up activations live at the entry's position in this launch's piece of
+// the list (entry i -> row i - work[1], work[1] = the launch's first entry), so they hold the
+// combos of one piece only: mode 0 writes its output row there, mode 1 reads its input row there
+// (the output row stays list[i]). Positions only: every row's arithmetic is unchanged.
 #define MUL1_GT 16
 #define MUL1_GXROWS 256
 
@@ -452,8 +456,10 @@ extern "C" __global__ void __launch_bounds__(256) mul1_gemm_grp(const unsigned l
     __shared__ int in_row[MUL1_GT], out_row[MUL1_GT];
     if (threadIdx.x < MUL1_GT) {
         const int c = (int)threadIdx.x < T ? list[f + threadIdx.x] : 0;
-        in_row[threadIdx.x] = c / in_div;
-        out_row[threadIdx.x] = c;
+        const int lp = (int)threadIdx.x < T ? f + (int)threadIdx.x - work[1] : 0;
+        const bool loc = p[15] != 0;
+        in_row[threadIdx.x] = (loc && mode) ? lp : c / in_div;
+        out_row[threadIdx.x] = (loc && !mode) ? lp : c;
     }
     const int run4 = 2 * n32;
     const int stage4 = MUL1_U * run4;

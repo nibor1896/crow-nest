@@ -9163,14 +9163,15 @@ mod tests_186 {
     use super::*;
     use crate::geo::{ExpertCodec, ExpertRecordSpec};
     use crate::glm5_flags::tests::synth_model;
-    use crate::glm5_moe::{GpuFfnPlan, GpuMoeGroupedPlan};
+    use crate::glm5_moe::GpuMoeGroupedPlan;
 
-    /// `manager::glm5_chunk_scratch_bytes` is what a pass of `max_t = chunk`, its FFN plans of
-    /// every booked call size and the residual's extra rows register as engine allocations, above
-    /// a one-row pass: within 64 KiB (the parameter arrays the formula leaves out), GLM-5.3-Flash
-    /// shapes, chunks 2 / 16 / 32, caches of 4,096 and 200,000 rows.
+    /// `manager::glm5_chunk_scratch_bytes` is what a pass of `max_t = chunk`, its expert-major
+    /// plan (#196: with the dense FFN over its region) and the residual's extra rows register as
+    /// engine allocations, above a one-row pass: within 64 KiB (the parameter arrays the formula
+    /// leaves out), GLM-5.3-Flash shapes, chunks 2 / 16 / 32 / 256 / 1024 / 8192, caches of 4,096
+    /// and 200,000 rows.
     #[test]
-    #[ignore = "needs the GPU (up to about 1 GB VRAM): cargo test --release --lib glm5_tiers_gpu_186 -- --ignored --nocapture --test-threads 1"]
+    #[ignore = "needs the GPU (up to about 3.5 GB VRAM): cargo test --release --lib glm5_tiers_gpu_186 -- --ignored --nocapture --test-threads 1"]
     fn glm5_tiers_gpu_186_chunk_bytes_are_what_the_prompt_phase_allocates() {
         let g = Glm5Geo::GLM_5_3_FLASH;
         let moe = MoeGeo::new(&g, ExpertRecordSpec::new(ExpertCodec::Mul1, crate::cpu_mul1::GLM_RECORD_BYTES_K3 as u64).unwrap()).unwrap();
@@ -9183,17 +9184,10 @@ mod tests_186 {
                     let before = cuda::live_dev().1;
                     let mut pass = Glm5Pass::new(&g, moe, chunk, cap);
                     let mut x = cuda::alloc_named("test residual", chunk * row * 4);
-                    // the prompt call's one expert-major MoE plan of `chunk` rows, the dense FFN per call size
+                    // the prompt call's one expert-major plan of `chunk` rows (#196: the dense FFN over its region)
                     let mut plans: Vec<GpuMoeGroupedPlan> = if chunk > 1 { vec![GpuMoeGroupedPlan::new(&moe, chunk, &mk)] } else { Vec::new() };
-                    let mut dense: Vec<GpuFfnPlan> = Vec::new();
-                    for t in crate::manager::glm5_prompt_call_sizes(chunk) {
-                        dense.push(GpuFfnPlan::new(g.hidden, g.dense_inter, t, g.swiglu_limit as f32));
-                    }
                     let b = cuda::live_dev().1 - before;
                     for p in plans.iter_mut() {
-                        p.free();
-                    }
-                    for p in dense.iter_mut() {
                         p.free();
                     }
                     cuda::free_dev(&mut x);
@@ -9201,7 +9195,7 @@ mod tests_186 {
                     b
                 };
                 let one = held(1);
-                for chunk in [2usize, 16, 32] {
+                for chunk in [2usize, 16, 32, 256, 1024, 8192].into_iter().filter(|&c| c <= cap) {
                     let got = held(chunk) - one;
                     let want = crate::manager::glm5_chunk_scratch_bytes(&g, chunk, cap);
                     eprintln!("glm5_tiers #186 cap {cap} chunk {chunk}: allocated {got} B above a one-row pass, the plan books {want} B");
