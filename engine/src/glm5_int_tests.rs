@@ -93,6 +93,8 @@ pub(crate) struct Out {
     pub gen: Generated,
     pub nvme_reads: u64,
     pub lane_experts: u64,
+    /// #202: the stager's early answers and late experts (0 without the stager)
+    pub early: (u64, u64),
 }
 
 /// `generate` of the 5-id prompt and `n` greedy ids under every arm, a fresh tier store per arm
@@ -123,8 +125,11 @@ pub(crate) fn run_arms_sized(arms: &[Arm], n: usize, sizes: TierSizes) -> Vec<Ou
             eprintln!("glm5 int {}: ids {:?}, NVMe reads {}, prefetch {:?}", a.name, gen.ids, tiers.nvme_reads, tiers.prefetch_stats());
             let nvme_reads = tiers.nvme_reads;
             let lane_experts = tiers.cpu_lane_clock().read().1;
+            // #202: the controller's early answers and the late experts they named
+            let early = tiers.stager_stats().map_or((0, 0), |st| (st.early, st.late_items));
+            eprintln!("glm5 int {}: early answers {}, late experts {}", a.name, early.0, early.1);
             tiers.free();
-            outs.push(Out { gen, nvme_reads, lane_experts });
+            outs.push(Out { gen, nvme_reads, lane_experts, early });
         }
         run.free();
     }
@@ -196,6 +201,11 @@ fn glm5_int_gpu_the_global_arena_serves_the_controller_and_the_prefetch() {
     let outs = run_arms(&arms, 6);
     assert_bit_identical(&arms, &outs);
     assert_ne!(outs[0].nvme_reads, outs[1].nvme_reads, "the arena must move differently from the per-layer cache for the check to mean something");
+    // #202: under the controller the global arena answers early, with experts that waited for
+    // their own landing (so the bit-identity above covers the late pass)
+    for (a, o) in arms.iter().zip(&outs).filter(|(a, _)| a.sw.controller) {
+        assert!(o.early.0 > 0 && o.early.1 > 0, "{}: early answers {}, late experts {}: the early reply did not run with a late expert", a.name, o.early.0, o.early.1);
+    }
     for (a, o) in arms.iter().zip(&outs).skip(2) {
         if a.stager && a.sw.prefetch {
             assert!(o.nvme_reads < outs[1].nvme_reads, "{}: {} demand NVMe reads, the global arm {}: the guesses did not become pinned hits", a.name, o.nvme_reads, outs[1].nvme_reads);
@@ -533,9 +543,11 @@ pub(crate) fn run_loaded_arms(arms: &[(&str, Vec<(&'static str, String)>)], prom
                 run.rows_held()
             );
             let nvme_reads = tiers.nvme_reads;
+            let early = tiers.stager_stats().map_or((0, 0), |st| (st.early, st.late_items));
+            eprintln!("glm5 int full {name}: early answers {}, late experts {}", early.0, early.1);
             tiers.free();
             run.free();
-            outs.push(Out { gen, nvme_reads, lane_experts });
+            outs.push(Out { gen, nvme_reads, lane_experts, early });
         }
     }
     let finite = outs[0].gen.logits.iter().flatten().filter(|v| v.is_finite()).count();
@@ -706,7 +718,7 @@ fn glm5_int_gpu_nvme_overlap_counters() {
             let rows = (prompt.len() + n - 1) as f64;
             let (drive, left) = tiers.nvme_io();
             let Some(st) = tiers.stager_stats() else {
-                outs.push(Out { gen, nvme_reads: tiers.nvme_reads, lane_experts: 0 });
+                outs.push(Out { gen, nvme_reads: tiers.nvme_reads, lane_experts: 0, early: (0, 0) });
                 tiers.free();
                 continue;
             };
@@ -725,7 +737,7 @@ fn glm5_int_gpu_nvme_overlap_counters() {
                 pf.joins
             );
             assert!(st.answers > 0 && drive >= pf.issued, "{}: the counters", a.name);
-            outs.push(Out { gen, nvme_reads: tiers.nvme_reads, lane_experts: 0 });
+            outs.push(Out { gen, nvme_reads: tiers.nvme_reads, lane_experts: 0, early: (0, 0) });
             tiers.free();
         }
         run.free();
