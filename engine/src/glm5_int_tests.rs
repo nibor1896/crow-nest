@@ -531,3 +531,57 @@ fn glm5_int_gpu_the_full_template_arm_is_the_default_path() {
     assert_same(&["lane split chunk 12 V0 P16", "full V0 P16"], &outs[2..]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// #202 / #203 / #209, the synthetic counters: the template arm (global arena, write-back ring,
+/// NVMe piece pool of 8 workers, flags + stager + controller + LA + prefetch on the side stream +
+/// shared overlap) and flags + stager + prefetch without the controller, 5-id prompt + 10 ids,
+/// V 3 + P 4 per layer. Per row: NVMe records read from the drive (demand and prefetch), records
+/// in flight when a layer is answered, the prefetch's issued / used / wasted / joins. A
+/// measurement: it prints, and holds only that the counters are consistent.
+#[test]
+#[ignore = "needs the GPU (about 2 GB VRAM, a 2.3 GB synthetic container in the temp dir)"]
+fn glm5_int_gpu_nvme_overlap_counters() {
+    let g = geo8();
+    let s = synth_model(&g, REC);
+    let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+    let moe = MoeGeo::new(&g, spec).unwrap();
+    let mut cnq = Cnq::open_checked(&s.path).unwrap();
+    let prompt = [3i64, 17, 101, 999, 5];
+    let n = 10;
+    let ctl = Switches { flags: true, controller: true, la: true, prefetch: true, pf_side: true, overlap: true, ..Switches::default() };
+    let fsp = Switches { flags: true, prefetch: true, ..Switches::default() };
+    let env: &[(&str, &str)] = &[("CROW_GLM_ARENA", "global"), ("CROW_GLM_ARENA_VRING", "2"), ("CROW_NVME_POOL", "1"), ("CROW_NVME_POOL_THREADS", "8")];
+    let arms = [arm("template ctl", env, ctl, true), arm("flags+stager+prefetch", env, fsp, true)];
+    unsafe {
+        let _ctx = cuda::Ctx::init();
+        let mut run = Glm5Run::load(&mut cnq, &g, &moe, prompt.len() + n + 1, &mut |s| eprintln!("{s}"));
+        for a in &arms {
+            let _env = Env::set(&a.env);
+            run.set_switches(&mut cnq, a.sw);
+            let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, TierSizes { vram: 3, pinned: 4 }, 1, g.topk).unwrap();
+            tiers.set_stager(a.stager).unwrap();
+            tiers.set_prefetch(a.sw.prefetch);
+            let gen = run.generate(&mut cnq, &mut tiers, &prompt, n, false, &mut |_| {}).unwrap();
+            let rows = (prompt.len() + n - 1) as f64;
+            let (drive, left) = tiers.nvme_io();
+            let st = tiers.stager_stats().unwrap();
+            let pf = tiers.prefetch_stats().unwrap();
+            eprintln!(
+                "glm5 int counters {}: ids {:?}; per row: demand NVMe reads {:.2}, drive records {:.2}; records in flight per answered layer {:.3} ({} answers); prefetch issued {} used {} wasted {} joins {}; in flight at the end {left}",
+                a.name,
+                gen.ids,
+                tiers.nvme_reads as f64 / rows,
+                drive as f64 / rows,
+                st.inflight_at_answer as f64 / st.answers.max(1) as f64,
+                st.answers,
+                pf.issued,
+                pf.used,
+                pf.wasted,
+                pf.joins
+            );
+            assert!(st.answers > 0 && drive >= pf.issued, "{}: the counters", a.name);
+            tiers.free();
+        }
+        run.free();
+    }
+}

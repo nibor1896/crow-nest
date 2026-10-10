@@ -705,6 +705,11 @@ pub struct PrefetchStats {
     pub used: u64,
     /// store records dropped unused (their slot was needed again, or the store was emptied)
     pub wasted: u64,
+    /// #203: demands for a record whose read was still in flight (they joined it)
+    pub joins: u64,
+    /// the used records the call's NVMe read count still holds (the store: every used record,
+    /// staged as an NVMe read; the RAM tier: none, a used record is a pinned hit)
+    pub covered: u64,
 }
 
 impl PrefetchStats {
@@ -717,6 +722,8 @@ impl PrefetchStats {
             bytes: self.bytes - o.bytes,
             used: self.used - o.used,
             wasted: self.wasted - o.wasted,
+            joins: self.joins - o.joins,
+            covered: self.covered - o.covered,
         }
     }
 
@@ -727,6 +734,8 @@ impl PrefetchStats {
         self.bytes += o.bytes;
         self.used += o.used;
         self.wasted += o.wasted;
+        self.joins += o.joins;
+        self.covered += o.covered;
     }
 }
 
@@ -991,6 +1000,7 @@ impl crate::glm5_tiers::Mover for PrefetchMover<'_> {
                     if !self.pf.used[i] {
                         self.pf.used[i] = true;
                         self.pf.stats.used += 1;
+                        self.pf.stats.covered += 1;
                     }
                     bytes += self.pf.bytes[i];
                     self.redirect.push((s, i));

@@ -4142,6 +4142,11 @@ pub struct StagerStats {
     pub landed_reads: u64,
     /// host syncs of the stager stream before an NVMe read into a pinned slot phase A still reads
     pub gate_syncs: u64,
+    /// #202: calls answered (the reply or the compute stream's event queued) and the NVMe
+    /// records in flight at each answer, summed (`inflight_at_answer / answers` = records in
+    /// flight per layer)
+    pub answers: u64,
+    pub inflight_at_answer: u64,
 }
 
 impl Stager {
@@ -4386,6 +4391,11 @@ impl ExpertTiers {
         self.stager.as_ref().map(|st| st.stats)
     }
 
+    /// #202: the NVMe source's records asked for since construction and those in flight now
+    pub fn nvme_io(&self) -> (u64, u64) {
+        (self.src.records_submitted(), self.src.records_in_flight())
+    }
+
     /// `CROW_GLM_PREFETCH`: the store of guessed records on or off (`new` takes it from the
     /// environment). On allocates 2 x top-k pinned records (not booked by the plan); off waits for
     /// its reads and frees it. The cache and the slots stay as they are.
@@ -4487,6 +4497,10 @@ impl ExpertTiers {
             }
         }
         cuda::ck(sys::cuMemcpyHtoDAsync_v2(self.tables[l], trow as *const _, experts * 8, stream));
+        if let Some(st) = self.stager.as_mut() {
+            st.stats.answers += 1;
+            st.stats.inflight_at_answer += self.src.records_in_flight();
+        }
         match reply {
             None => {
                 cuda::event_record(event, stream);
