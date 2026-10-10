@@ -164,7 +164,7 @@ pub fn site(x: &[f32], fn_: &[u16], base: &[f32; MIX], scale: &[f32; 3], h: usiz
 // ---------------- the GPU half (`kernels_glm5_mhc.cu`) ----------------
 
 /// every entry of `kernels::GLM5_MHC_SRC`
-pub const NAMES: &[&str] = &["glm5_mhc_coeffs", "glm5_mhc_expand", "glm5_mhc_mix", "glm5_mhc_mix_norm"];
+pub const NAMES: &[&str] = &["glm5_mhc_coeffs", "glm5_mhc_expand", "glm5_mhc_mix", "glm5_mhc_mix_norm", "glm5_mhc_expand_mix_norm"];
 
 /// the compiled module and its entries
 pub struct Kernels {
@@ -174,6 +174,8 @@ pub struct Kernels {
     mix: CUfunction,
     /// `CROW_GLM_HCFUSE`: `mix`, then the sublayer RMSNorm over `collapsed`, one launch
     mix_norm: CUfunction,
+    /// #202 A (`CROW_GLM_ATTN_FUSE`): the previous site's `expand`, then `mix_norm`, one launch
+    expand_mix_norm: CUfunction,
 }
 
 impl Kernels {
@@ -185,6 +187,7 @@ impl Kernels {
             expand: module.get("glm5_mhc_expand"),
             mix: module.get("glm5_mhc_mix"),
             mix_norm: module.get("glm5_mhc_mix_norm"),
+            expand_mix_norm: module.get("glm5_mhc_expand_mix_norm"),
             module,
         }
     }
@@ -214,6 +217,22 @@ pub fn hcfuse() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(hcfuse_from_env)
+}
+
+/// #202 A: the switch of the fused decode-row attention chains: the KDA decode row in 6 launches
+/// instead of 12 (`glm5_kda::step_fused_with`) and, with [`HCFUSE_ENV`] on, the attention site's
+/// expand folded into the FFN site's `coeffs_norm` ([`Plan::expand_coeffs_norm`]), 1 launch
+/// instead of 2. Bit-identical. `1` on; unset or anything else off (the default).
+pub const ATTN_FUSE_ENV: &str = "CROW_GLM_ATTN_FUSE";
+
+/// [`ATTN_FUSE_ENV`] read once per process; test builds read it at every call (as [`hcfuse`])
+pub fn attn_fuse() -> bool {
+    let read = || std::env::var(ATTN_FUSE_ENV).ok().as_deref() == Some("1");
+    if cfg!(test) {
+        return read();
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(read)
 }
 
 /// The device weights of one site (`layers.L.hc_{attn,ffn}_{fn,base,scale}`): `fn_` `[24][4h]`
@@ -302,6 +321,27 @@ impl Plan {
         assert!((1..=self.max_tokens).contains(&t), "mhc: {t} rows (1..={})", self.max_tokens);
         launch_v(kn.mix_norm, MIX as u32, t as u32, 1, THREADS as u32, &[
             x, w.fn_, w.base, w.scale, self.logits, self.pre, self.post, self.comb, collapsed, self.done, self.prm, norm_w]);
+    }
+
+    /// #202 A: [`Plan::expand_coeffs_norm`] takes this width (`h / 256` columns per thread, one
+    /// of 1, 2, 4, 8, 16: the kernel's compiled arms)
+    pub fn expand_fits(&self) -> bool {
+        self.h % THREADS == 0 && matches!(self.h / THREADS, 1 | 2 | 4 | 8 | 16)
+    }
+
+    /// #202 A (`CROW_GLM_ATTN_FUSE`): [`Plan::expand`]`(x, y, x)` with the coefficients of the
+    /// last site, then [`Plan::coeffs_norm`] of site `w` on the expanded `x`, in one launch
+    /// (`glm5_mhc_expand_mix_norm`), bit-identical to the two: `x` holds the expanded streams
+    /// after it, `collapsed` the next sublayer's normed input, the plan the new coefficients.
+    ///
+    /// # Safety
+    /// As [`Plan::expand`] (in place) and [`Plan::coeffs_norm`]; [`Plan::expand_fits`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn expand_coeffs_norm(&self, kn: &Kernels, w: &SiteDev, x: CUdeviceptr, y: CUdeviceptr, norm_w: CUdeviceptr, collapsed: CUdeviceptr, t: usize) {
+        assert!((1..=self.max_tokens).contains(&t), "mhc: {t} rows (1..={})", self.max_tokens);
+        assert!(self.expand_fits(), "mhc: the fused expand takes h = 256 x 1, 2, 4, 8 or 16, not {}", self.h);
+        launch_v(kn.expand_mix_norm, MIX as u32, t as u32, 1, THREADS as u32, &[
+            x, y, w.fn_, w.base, w.scale, self.logits, self.pre, self.post, self.comb, collapsed, self.done, self.prm, norm_w]);
     }
 
     /// Queue step 6 for `t` rows with the coefficients of the last `coeffs`: `x` `[t][4][h]` (the
@@ -941,6 +981,161 @@ mod tests_gpu {
             let mut plan = plan;
             plan.free();
             assert!(fused <= rec, "the fused site takes {fused:.2} us against {rec:.2} us of record");
+        }
+    }
+
+    /// #202 A (`CROW_GLM_ATTN_FUSE`): `expand_coeffs_norm` (1 launch) against the attention
+    /// site's `expand` in place + the FFN site's `coeffs_norm` (2 launches), with the attention
+    /// site's coefficients from its own `coeffs_norm`: the expanded streams x, the FFN site's
+    /// logits, pre, post, comb and the normed collapse bit-identical, on the real fixture (its x
+    /// and y) and random sites at h 4096 (t 1, 5, 16) and h 256 / 512 (t 3), three calls each
+    /// (the per-row counters reset by every call).
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_mhc_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mhc_gpu_expand_coeffs_norm_is_expand_then_coeffs_norm() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Kernels::new();
+            let f = real();
+            let mut seed = 0x0202_a5ee_d0f1_u64;
+            let mut cases: Vec<(String, usize, usize, Vec<f32>, Vec<f32>)> = vec![("real".into(), f.h, f.t, f.x.clone(), f.y.clone())];
+            for (h, t) in [(4096usize, 1usize), (4096, 5), (4096, 16), (256, 3), (512, 3)] {
+                cases.push((format!("random h {h} t {t}"), h, t, rnd(t * HC * h, &mut seed, 3.0), rnd(t * h, &mut seed, 2.0)));
+            }
+            let mut checked = 0;
+            for (name, h, t, x, y) in &cases {
+                let (h, t) = (*h, *t);
+                // the attention site (the fixture's weights on the fixture) and an FFN site
+                let site = |seed: &mut u64| {
+                    let fn_ = bf16s(&rnd(MIX * HC * h, seed, 0.05));
+                    let base: [f32; MIX] = rnd(MIX, seed, 1.0).try_into().unwrap();
+                    let scale: [f32; 3] = rnd(3, seed, 2.0).try_into().unwrap();
+                    SiteDev::upload(&fn_, &base, &scale)
+                };
+                let mut wa = if name == "real" { SiteDev::upload(&f.fn_, &f.base, &f.scale) } else { site(&mut seed) };
+                let mut wf = site(&mut seed);
+                let (mut na, mut nf) = (cuda::to_f32_dev(&rnd(h, &mut seed, 1.5)), cuda::to_f32_dev(&rnd(h, &mut seed, 1.5)));
+                let mut yd = cuda::to_f32_dev(y);
+                let (mut pa, mut pb) = (Plan::new(h, t), Plan::new(h, t));
+                assert!(pb.expand_fits(), "{name}");
+                let (mut xa, mut xb) = (cuda::to_f32_dev(x), cuda::to_f32_dev(x));
+                let (mut ca, mut cb) = (cuda::alloc_zeroed(t * h * 4), cuda::alloc_zeroed(t * h * 4));
+                for rep in 0..3 {
+                    cuda::to_f32_into(xa, x);
+                    cuda::to_f32_into(xb, x);
+                    // the path of record: attention site, its expand, the FFN site
+                    pa.coeffs_norm(&kn, &wa, xa, na, ca, t);
+                    pa.expand(&kn, xa, yd, xa, t);
+                    pa.coeffs_norm(&kn, &wf, xa, nf, ca, t);
+                    // fused: attention site, then the expand inside the FFN site's launch
+                    pb.coeffs_norm(&kn, &wa, xb, na, cb, t);
+                    for (dv, n) in [(pb.logits, MIX), (pb.pre, HC), (cb, h)] {
+                        cuda::to_f32_into(dv, &vec![f32::NAN; t * n]);
+                    }
+                    pb.expand_coeffs_norm(&kn, &wf, xb, yd, nf, cb, t);
+                    cuda::sync();
+                    for (what, a, b, n) in [
+                        ("expanded x", xa, xb, HC * h),
+                        ("logits", pa.logits, pb.logits, MIX),
+                        ("pre", pa.pre, pb.pre, HC),
+                        ("post", pa.post, pb.post, HC),
+                        ("comb", pa.comb, pb.comb, HC * HC),
+                        ("normed collapsed", ca, cb, h),
+                    ] {
+                        assert_eq!(bits(&cuda::dtoh(b, t * n)), bits(&cuda::dtoh(a, t * n)), "{name} call {rep}: {what} differs from expand + coeffs_norm");
+                        checked += 1;
+                    }
+                }
+                for d in [&mut xa, &mut xb, &mut ca, &mut cb, &mut na, &mut nf, &mut yd] {
+                    cuda::free_dev(d);
+                }
+                pa.free();
+                pb.free();
+                wa.free();
+                wf.free();
+            }
+            eprintln!("#202 A mHC: expand_coeffs_norm == expand + coeffs_norm bit for bit ({checked} arrays over {} cases x 3 calls)", cases.len());
+        }
+    }
+
+    /// #202 A micro-bench (RTX 5090): the attention site's expand + the FFN site's coeffs_norm
+    /// (2 launches) against expand_coeffs_norm (1 launch), h 4096, t 1, VRAM-cold `fn` (copies
+    /// rotated as in `glm5_mhc_gpu_hcfuse_time_per_token`): back to back between two events, and
+    /// host wall time with a sync after each
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_mhc_gpu_expand_fold_bench -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mhc_gpu_expand_fold_bench() {
+        use cudarc::driver::sys;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Kernels::new();
+            let (h, t) = (4096usize, 1usize);
+            let layers = crate::geo::Glm5Geo::GLM_5_3_FLASH.layers;
+            let mut seed = 0x5eed_a202u64;
+            let fn_ = bf16s(&rnd(MIX * HC * h, &mut seed, 0.05));
+            let base: [f32; MIX] = rnd(MIX, &mut seed, 1.0).try_into().unwrap();
+            let scale: [f32; 3] = rnd(3, &mut seed, 2.0).try_into().unwrap();
+            let copies = (256usize << 20).div_ceil(fn_.len() * 2);
+            let mut sites: Vec<SiteDev> = (0..copies).map(|_| SiteDev::upload(&fn_, &base, &scale)).collect();
+            let mut nw = cuda::to_f32_dev(&rnd(h, &mut seed, 1.5));
+            let plan = Plan::new(h, t);
+            let mut xd = cuda::to_f32_dev(&rnd(t * HC * h, &mut seed, 3.0));
+            let mut yd = cuda::to_f32_dev(&rnd(t * h, &mut seed, 1.0e-3));
+            let mut cd = cuda::alloc_zeroed(t * h * 4);
+            plan.coeffs_norm(&kn, &sites[0], xd, nw, cd, t);
+            let n = 4 * copies;
+            let events = |f: &mut dyn FnMut(usize)| -> f64 {
+                f(0);
+                cuda::sync();
+                let mk = || {
+                    let mut e: sys::CUevent = std::ptr::null_mut();
+                    cuda::ck(sys::cuEventCreate(&mut e, 0));
+                    e
+                };
+                let (a, b) = (mk(), mk());
+                cuda::event_record(a, cuda::cur_stream());
+                for i in 0..n {
+                    f(i);
+                }
+                cuda::event_record(b, cuda::cur_stream());
+                cuda::sync();
+                let mut ms = 0f32;
+                cuda::ck(sys::cuEventElapsedTime_v2(&mut ms, a, b));
+                cuda::event_destroy(a);
+                cuda::event_destroy(b);
+                ms as f64 * 1e3 / n as f64
+            };
+            let wall = |f: &mut dyn FnMut(usize)| -> f64 {
+                let mut v: Vec<f64> = (0..n)
+                    .map(|i| {
+                        let t0 = std::time::Instant::now();
+                        f(i);
+                        cuda::sync();
+                        t0.elapsed().as_secs_f64() * 1e6
+                    })
+                    .collect();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[n / 2]
+            };
+            let mut two = |i: usize| {
+                plan.expand(&kn, xd, yd, xd, t);
+                plan.coeffs_norm(&kn, &sites[i % copies], xd, nw, cd, t);
+            };
+            let (e2, w2) = (events(&mut two), wall(&mut two));
+            let mut one = |i: usize| plan.expand_coeffs_norm(&kn, &sites[i % copies], xd, yd, nw, cd, t);
+            let (e1, w1) = (events(&mut one), wall(&mut one));
+            let ex = events(&mut |_i: usize| plan.expand(&kn, xd, yd, xd, t));
+            let cn = events(&mut |i: usize| plan.coeffs_norm(&kn, &sites[i % copies], xd, nw, cd, t));
+            eprintln!("#202 A mHC fold: the kernels alone, back-to-back: expand {ex:.2} us, coeffs_norm {cn:.2} us");
+            eprintln!("#202 A mHC fold h {h} t {t} ({copies} fn copies): back-to-back {e2:.2} -> {e1:.2} us; synced wall p50 {w2:.1} -> {w1:.1} us; launches 2 -> 1 per layer (x {layers} layers per token)");
+            for d in [&mut xd, &mut yd, &mut cd, &mut nw] {
+                cuda::free_dev(d);
+            }
+            for s in sites.iter_mut() {
+                s.free();
+            }
+            let mut plan = plan;
+            plan.free();
         }
     }
 }

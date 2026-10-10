@@ -311,6 +311,9 @@ pub struct KdaScratch {
     region: Dev,
     params: Dev,
     lb: Dev,
+    /// #202 A: the scalars of the fused decode row ([`step_fused_with`]): hidden, heads, width,
+    /// eps and lower bound (f32 bits)
+    fprm: Dev,
     qkv: Dev,
     qkv_t: Dev,
     conv_t: Dev,
@@ -370,6 +373,7 @@ impl KdaScratch {
             region: 0,
             params,
             lb: cuda::to_f32_dev(&[d.lower_bound]),
+            fprm: cuda::to_i32_dev(&[i(d.hidden), i(d.heads), i(d.width()), d.eps.to_bits() as i32, d.lower_bound.to_bits() as i32]),
             qkv: f(0),
             qkv_t: f(1),
             conv_t: f(2),
@@ -395,7 +399,7 @@ impl KdaScratch {
     /// # Safety
     /// A CUDA context is current; no launch still reads these buffers.
     pub unsafe fn free(&mut self) {
-        for p in [&mut self.params, &mut self.lb, &mut self.region] {
+        for p in [&mut self.params, &mut self.lb, &mut self.fprm, &mut self.region] {
             cuda::free_dev(p);
         }
         for p in [
@@ -549,6 +553,27 @@ pub unsafe fn step_with(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &Kda
     gemv(kk, sc, w.g_a, x, sc.ga, P_HIDDEN, d.head_dim, P_HD);
     gemv(kk, sc, w.g_b, sc.ga, sc.gate, P_HD, d.width(), P_WIDTH);
     launch_v(kk.gated_norm, heads, 1, 1, hd, &[sc.o, sc.gate, w.o_norm, sc.normed]);
+    proj(KdaProj::O, sc.normed, out, 1);
+}
+
+/// #202 A (`CROW_GLM_ATTN_FUSE`): [`step_with`] in 6 launches instead of 12, bit-identical. The
+/// q|k|v and o projections are `proj`'s as before; between them `kda_conv_l2` (conv_step +
+/// l2norm), `kda_proj_a3` (f_a | b | g_a, one launch), `kda_proj_b2_gate` (f_b with the forget
+/// gate and beta folded in | g_b) and `kda_step_norm` (the recurrence + the gated RMSNorm) carry
+/// the replaced kernels' statements (`kernels_glm5_kda.cu`, #202 A). Every scratch value of
+/// `step_with` is written as before (qkv, conv_t, qn, kn, fa, b, ga, f, g, beta, gate, o, normed),
+/// the state and window the same.
+///
+/// # Safety
+/// As [`step_with`].
+pub unsafe fn step_fused_with(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &KdaScratch, x: Dev, out: Dev, proj: &mut dyn FnMut(KdaProj, Dev, Dev, usize)) {
+    let d = &kk.d;
+    let (wb, heads, hd) = ((d.width() * 4) as u64, d.heads as u32, d.head_dim as u32);
+    proj(KdaProj::Qkv, x, sc.qkv, 1);
+    launch_v(kk.kda.conv_l2, heads, 1, 1, hd, &[sc.qkv, w.conv, st.conv, sc.conv_t, sc.qn, sc.kn, sc.fprm]);
+    launch_v(kk.kda.proj_a3, d.head_dim.max(d.heads).div_ceil(8) as u32, 3, 1, 256, &[w.f_a, w.b, w.g_a, x, sc.fa, sc.b, sc.ga, sc.fprm]);
+    launch_v(kk.kda.proj_b2_gate, d.width().div_ceil(8) as u32, 2, 1, 256, &[w.f_b, w.g_b, sc.fa, sc.ga, sc.b, w.dt_bias, w.a_log, sc.f, sc.g, sc.beta, sc.gate, sc.fprm]);
+    launch_v(kk.kda.step_norm, heads, 1, 1, hd, &[st.s, sc.qn, sc.kn, sc.conv_t + 2 * wb, sc.g, sc.beta, sc.o, sc.gate, w.o_norm, sc.normed, sc.fprm]);
     proj(KdaProj::O, sc.normed, out, 1);
 }
 
@@ -1039,6 +1064,142 @@ extern "C" __global__ void hold(long long ns)
             for p in [fd, dtd, ald, bd, gd, betad, par, lb, qd, kd, vd, sp, ss, op, os].iter_mut() {
                 cuda::free_dev(p);
             }
+        }
+    }
+
+    /// `step`'s two projections (the BF16 GEMVs) as a `proj` of [`step_with`]
+    fn gemv_proj<'a>(kk: &'a KdaKernels, w: &'a KdaWeights, sc: &'a KdaScratch) -> impl FnMut(KdaProj, Dev, Dev, usize) + 'a {
+        move |p, xi, yo, _t| unsafe {
+            match p {
+                KdaProj::Qkv => gemv(kk, sc, w.qkv, xi, yo, P_HIDDEN, kk.d.conv_ch(), P_CONV),
+                KdaProj::O => gemv(kk, sc, w.o_proj, xi, yo, P_WIDTH, kk.d.hidden, P_HIDDEN),
+            }
+        }
+    }
+
+    /// #202 A (`CROW_GLM_ATTN_FUSE`): the fused decode row (`step_fused_with`, 6 launches) against
+    /// `step_with` (12 launches) on the synthetic real-shape layer (hidden 4096, 64 heads x 128),
+    /// from a non-zero state (a 24-row prompt) over 4 decode steps, each arm on its own state
+    /// copy and scratch, the projections `step`'s BF16 GEMVs: the output row, the state S, the
+    /// conv window and every scratch value the row writes (conv_t, qn, kn, fa, b, ga, f, g,
+    /// beta, gate, o, normed) bit-identical after every step.
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_kda::tests_gpu -- --ignored --nocapture --test-threads 1"]
+    fn kda_gpu_fused_step_is_the_step() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut l = layer(24);
+            let d = l.kk.d;
+            let (h, cc) = (d.hidden, d.conv_ch());
+            let x = synth::input(28, h);
+            let mut xd = cuda::to_f32_dev(&x);
+            let mut od = cuda::alloc_zeroed(28 * h * 4);
+            prompt(&l.kk, &l.w, &l.st, &l.sc, xd, 24, od);
+            let mut st2 = KdaState::alloc(&d);
+            st2.copy_from(&l.st);
+            let mut sc2 = KdaScratch::alloc(&d, 1);
+            let mut sc1 = KdaScratch::alloc(&d, 1);
+            let (mut o1, mut o2) = (cuda::alloc_zeroed(h * 4), cuda::alloc_zeroed(h * 4));
+            let kk = &l.kk;
+            let w = &l.w;
+            let fields = |sc: &KdaScratch| -> Vec<(&'static str, Dev, usize)> {
+                vec![
+                    ("qkv", sc.qkv, cc), ("conv_t", sc.conv_t, cc), ("qn", sc.qn, d.width()), ("kn", sc.kn, d.width()),
+                    ("fa", sc.fa, d.head_dim), ("b", sc.b, d.heads), ("ga", sc.ga, d.head_dim), ("f", sc.f, d.width()),
+                    ("g", sc.g, d.width()), ("beta", sc.beta, d.heads), ("gate", sc.gate, d.width()), ("o", sc.o, d.width()),
+                    ("normed", sc.normed, d.width()),
+                ]
+            };
+            let bits = |v: Vec<f32>| v.into_iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+            let mut checked = 0;
+            for r in 24..28 {
+                let xr = xd + (r * h * 4) as u64;
+                step_with(kk, w, &l.st, &sc1, xr, o1, &mut gemv_proj(kk, w, &sc1));
+                step_fused_with(kk, w, &st2, &sc2, xr, o2, &mut gemv_proj(kk, w, &sc2));
+                cuda::sync();
+                assert_eq!(bits(cuda::dtoh(o2, h)), bits(cuda::dtoh(o1, h)), "step {r}: the output row differs");
+                for ((name, a, n), (_, b, _)) in fields(&sc1).into_iter().zip(fields(&sc2)) {
+                    assert_eq!(bits(cuda::dtoh(b, n)), bits(cuda::dtoh(a, n)), "step {r}: scratch {name} differs");
+                    checked += 1;
+                }
+                assert_eq!(bits(cuda::dtoh(st2.s, d.state_floats())), bits(cuda::dtoh(l.st.s, d.state_floats())), "step {r}: the state S differs");
+                assert_eq!(bits(cuda::dtoh(st2.conv, d.conv_floats())), bits(cuda::dtoh(l.st.conv, d.conv_floats())), "step {r}: the conv window differs");
+            }
+            let on = cuda::dtoh(o1, h);
+            eprintln!("#202 A KDA: fused row == step_with bit for bit over 4 decode steps ({checked} scratch arrays + out + S + window); |out| max {:.3e}", on.iter().fold(0f32, |m, v| m.max(v.abs())));
+            for p in [&mut xd, &mut od, &mut o1, &mut o2] {
+                cuda::free_dev(p);
+            }
+            st2.free();
+            sc1.free();
+            sc2.free();
+            l.w.free();
+            l.st.free();
+            l.sc.free();
+        }
+    }
+
+    /// #202 A micro-bench (RTX 5090): one KDA decode row between the projections (q|k|v and o
+    /// excluded, the BF16 GEMVs of `step`), `step_with`'s 10 launches against `step_fused_with`'s
+    /// 4, back to back between two events, and host wall time with a sync after each row
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib kda_gpu_fused_step_bench -- --ignored --nocapture --test-threads 1"]
+    fn kda_gpu_fused_step_bench() {
+        use cudarc::driver::sys;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut l = layer(1);
+            let d = l.kk.d;
+            let h = d.hidden;
+            let mut xd = cuda::to_f32_dev(&synth::input(1, h));
+            let mut od = cuda::alloc_zeroed(h * 4);
+            let (kk, w, st, sc) = (&l.kk, &l.w, &l.st, &l.sc);
+            let mut none = |_: KdaProj, _: Dev, _: Dev, _: usize| {};
+            let n = 400;
+            let events = |f: &mut dyn FnMut()| -> f64 {
+                f();
+                cuda::sync();
+                let mk = || {
+                    let mut e: sys::CUevent = std::ptr::null_mut();
+                    cuda::ck(sys::cuEventCreate(&mut e, 0));
+                    e
+                };
+                let (a, b) = (mk(), mk());
+                cuda::event_record(a, cuda::cur_stream());
+                for _ in 0..n {
+                    f();
+                }
+                cuda::event_record(b, cuda::cur_stream());
+                cuda::sync();
+                let mut ms = 0f32;
+                cuda::ck(sys::cuEventElapsedTime_v2(&mut ms, a, b));
+                cuda::event_destroy(a);
+                cuda::event_destroy(b);
+                ms as f64 * 1e3 / n as f64
+            };
+            let wall = |f: &mut dyn FnMut()| -> f64 {
+                let mut v: Vec<f64> = (0..n)
+                    .map(|_| {
+                        let t0 = std::time::Instant::now();
+                        f();
+                        cuda::sync();
+                        t0.elapsed().as_secs_f64() * 1e6
+                    })
+                    .collect();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[n / 2]
+            };
+            let eu = events(&mut || step_with(kk, w, st, sc, xd, od, &mut none));
+            let ef = events(&mut || step_fused_with(kk, w, st, sc, xd, od, &mut none));
+            let wu = wall(&mut || step_with(kk, w, st, sc, xd, od, &mut none));
+            let wf = wall(&mut || step_fused_with(kk, w, st, sc, xd, od, &mut none));
+            let layers = Glm5Geo::GLM_5_3_FLASH.kda_layers;
+            eprintln!("#202 A KDA row bench (projections excluded): back-to-back {eu:.1} -> {ef:.1} us; synced wall p50 {wu:.1} -> {wf:.1} us; launches 10 -> 4 per row (x {layers} KDA layers per token)");
+            cuda::free_dev(&mut xd);
+            cuda::free_dev(&mut od);
+            l.w.free();
+            l.st.free();
+            l.sc.free();
         }
     }
 }
