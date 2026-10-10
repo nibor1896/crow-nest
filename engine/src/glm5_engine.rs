@@ -822,7 +822,8 @@ mod tests_186_plan {
         let (n, hot) = gt::decode_hot_per_layer(&p8, sc, true, rec, ml, 10 << 30);
         let headroom = gt::ARENA_RESERVE_BYTES.div_ceil(p1.unit_bytes) as f64;
         eprintln!("#195 decode hot set per MoE layer: chunk 1 plan {}, chunk 8192 plan {} + {n} elastic chunks = {hot:.1} (borrowed {:.2} GiB, elastic headroom {headroom} slots)", p1.hot, p8.hot, sc as f64 / (1u64 << 30) as f64);
-        assert!(p8.hot < 10, "the plan of record at chunk 8192 books the scratch ({})", p8.hot);
+        // #196: the scratch the plan books at chunk 8192 is 2.79 GiB (15.87 GiB before), 42 slots
+        assert!(p8.hot < p1.hot && p8.hot >= p1.hot - 10, "the plan of record at chunk 8192 books the scratch ({} vs {})", p8.hot, p1.hot);
         assert!(hot <= p1.hot as f64 + 1.0 && hot >= p1.hot as f64 - headroom - 1.0, "decode hot set {hot:.1} vs chunk 1 {}", p1.hot);
     }
 

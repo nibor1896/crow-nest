@@ -391,6 +391,23 @@ pub struct GpuFfnPlan {
     pub g: CUdeviceptr,
     pub u: CUdeviceptr,
     pub h: CUdeviceptr,
+    /// #196: `g`, `u`, `h` are this plan's allocations (else views into a region its owner frees)
+    owned: bool,
+}
+
+/// #196: device alignment of every buffer carved out of a shared scratch region
+pub const CARVE_ALIGN: usize = 256;
+
+/// #196: the offsets of buffers of `bytes` each, one after the other in a region, every one on a
+/// [`CARVE_ALIGN`] boundary, and the region's size
+pub fn carve(bytes: &[usize]) -> (Vec<usize>, usize) {
+    let mut off = Vec::with_capacity(bytes.len());
+    let mut at = 0usize;
+    for &b in bytes {
+        off.push(at);
+        at += b.div_ceil(CARVE_ALIGN) * CARVE_ALIGN;
+    }
+    (off, at)
 }
 
 impl GpuFfnPlan {
@@ -398,6 +415,29 @@ impl GpuFfnPlan {
     /// A CUDA context is current.
     pub unsafe fn new(hidden: usize, inter: usize, tokens: usize, limit: f32) -> GpuFfnPlan {
         assert!(hidden % 64 == 0 && inter % 64 == 0 && tokens > 0, "glm5_moe: FFN [{inter}, {hidden}] x {tokens}");
+        let mut p = GpuFfnPlan::new_in(hidden, inter, tokens, limit, 0);
+        p.g = cuda::alloc_zeroed(tokens * inter * 4);
+        p.u = cuda::alloc_zeroed(tokens * inter * 4);
+        p.h = cuda::alloc_zeroed(tokens * inter * 4);
+        p.owned = true;
+        p
+    }
+
+    /// #196: the region bytes of `g`, `u`, `h` of a plan of `tokens` rows ([`carve`])
+    pub fn region_bytes(inter: usize, tokens: usize) -> usize {
+        carve(&[tokens * inter * 4; 3]).1
+    }
+
+    /// #196: a plan whose `g`, `u`, `h` are views into `region` ([`GpuFfnPlan::region_bytes`]
+    /// long; 0 = none yet), which its owner allocates and frees; [`GpuFfnPlan::free`] frees only
+    /// the parameter arrays
+    ///
+    /// # Safety
+    /// A CUDA context is current; `region` outlives every launch of the plan.
+    pub unsafe fn new_in(hidden: usize, inter: usize, tokens: usize, limit: f32, region: CUdeviceptr) -> GpuFfnPlan {
+        assert!(hidden % 64 == 0 && inter % 64 == 0 && tokens > 0, "glm5_moe: FFN [{inter}, {hidden}] x {tokens}");
+        let (off, _) = carve(&[tokens * inter * 4; 3]);
+        let at = |i: usize| if region == 0 { 0 } else { region + off[i] as u64 };
         GpuFfnPlan {
             hidden,
             inter,
@@ -406,9 +446,10 @@ impl GpuFfnPlan {
             prm_ki: i32_dev(&[inter]),
             prm_n: i32_dev(&[tokens * inter]),
             prm_f: cuda::to_f32_dev(&[0.0, limit]),
-            g: cuda::alloc_zeroed(tokens * inter * 4),
-            u: cuda::alloc_zeroed(tokens * inter * 4),
-            h: cuda::alloc_zeroed(tokens * inter * 4),
+            g: at(0),
+            u: at(1),
+            h: at(2),
+            owned: false,
         }
     }
 
@@ -431,7 +472,7 @@ impl GpuFfnPlan {
     }
 
     /// [`GpuFfnPlan::run_rows`] for `t` rows of a call of `call_t` rows run in pieces
-    /// (`glm5_model::dense_rows`): #186 `CROW_GLM_DENSE_GEMM=1` picks the kernel by `call_t`, so
+    /// (`glm5_model`'s prompt call: `t = call_t`): #186 `CROW_GLM_DENSE_GEMM=1` picks the kernel by `call_t`, so
     /// every row of the call takes the kernel one `call_t`-row plan gives it (each kernel computes
     /// a row from that row alone: the pieces have the bits of one plan)
     ///
@@ -461,9 +502,15 @@ impl GpuFfnPlan {
     /// # Safety
     /// No launch of this plan is pending.
     pub unsafe fn free(&mut self) {
-        for d in [&mut self.prm_kh, &mut self.prm_ki, &mut self.prm_n, &mut self.prm_f, &mut self.g, &mut self.u, &mut self.h] {
+        for d in [&mut self.prm_kh, &mut self.prm_ki, &mut self.prm_n, &mut self.prm_f] {
             cuda::free_dev(d);
         }
+        if self.owned {
+            for d in [&mut self.g, &mut self.u, &mut self.h] {
+                cuda::free_dev(d);
+            }
+        }
+        (self.g, self.u, self.h) = (0, 0, 0);
     }
 }
 
@@ -905,22 +952,43 @@ pub fn grouped_work_cap(experts: usize, topk: usize, tokens: usize) -> usize {
     c.div_ceil(GROUP_ROWS) + experts.min(c)
 }
 
+/// #196: the most combos one `mul1_gemm_grp` piece holds gate / up activations for (`ge` / `ue`
+/// `[piece][expert_inter]`, 64 MiB at GLM-5.3-Flash shapes): a sub-batch's work items run in
+/// pieces of at most this many combos, each gate / up then down (positions only, every row's
+/// bits unchanged)
+pub const GROUP_PIECE_COMBOS: usize = 4096;
+
+/// #196: the region of a [`GpuMoeGroupedPlan`]: the MoE layer's buffers (`ye` `[c][hidden]`, `ys`
+/// `[t][hidden]`, `ge` / `ue` `[piece][expert_inter]`, the shared expert's g / u / h) and, over the
+/// same bytes, the dense FFN's g / u / h of `tokens` rows (a call runs one or the other): the
+/// offsets of the MoE buffers and the region's size, the larger of the two
+fn grouped_region(hidden: usize, topk: usize, expert_inter: usize, shared_inter: usize, dense_inter: usize, tokens: usize, piece: usize) -> (Vec<usize>, usize) {
+    let (t, c) = (tokens, tokens * topk);
+    let (off, moe) = carve(&[c * hidden * 4, t * hidden * 4, piece * expert_inter * 4, piece * expert_inter * 4, GpuFfnPlan::region_bytes(shared_inter, t)]);
+    (off, moe.max(GpuFfnPlan::region_bytes(dense_inter, t)))
+}
+
 /// The device bytes of a [`GpuMoeGroupedPlan`] of `tokens` rows, without its parameter arrays,
 /// from the model's geometry alone (the planner's booking, `manager::glm5_chunk_scratch_bytes`):
-/// logits, ids, wts, ge / ue, ye, ys, the combo list, the work items, the shared expert's g / u / h.
-pub fn grouped_plan_bytes(hidden: usize, experts: usize, topk: usize, expert_inter: usize, shared_inter: usize, tokens: usize) -> u64 {
-    let (t, c) = (tokens as u64, (tokens * topk) as u64);
-    let (h, e, i, s) = (hidden as u64, experts as u64, expert_inter as u64, shared_inter as u64);
-    4 * (t * e + 2 * c + 2 * c * i + c * h + t * h + c + 3 * grouped_work_cap(experts, topk, tokens) as u64 + 3 * t * s)
+/// logits, ids, wts, the combo list, the work items, and its region (#196: `ye`, `ys`, `ge` /
+/// `ue` of one piece of at most [`GROUP_PIECE_COMBOS`] combos and the shared expert's g / u / h,
+/// shared with the dense FFN plan of `tokens` rows).
+pub fn grouped_plan_bytes(hidden: usize, experts: usize, topk: usize, expert_inter: usize, shared_inter: usize, dense_inter: usize, tokens: usize) -> u64 {
+    let c = tokens * topk;
+    let own = 4 * (tokens * experts + 2 * c + c + 3 * grouped_work_cap(experts, topk, tokens));
+    (own + grouped_region(hidden, topk, expert_inter, shared_inter, dense_inter, tokens, c.min(GROUP_PIECE_COMBOS)).1) as u64
 }
 
 /// One MoE layer of a prompt call of up to `tokens` rows, expert-major ([`ExpertMajor`]): the
 /// router as [`GpuMoePlan::route`], then per tier sub-batch two `mul1_gemm_grp` launches (gate
 /// and up in one, down with the clamp fused into its input), then the shared expert and
 /// `glm5_moe_combine` once. Every routed output row `ye[c]` has the bits of [`GpuMoePlan`]'s
-/// T = 1 slot of combo `c`, so `y` has the bits of [`GpuMoePlan::run`]. Scratch: `ge`, `ue`
-/// `[c][inter]` and `ye` `[c][hidden]` for `c = tokens * topk` combos, no per-slot GEMV plans
-/// (about 0.35 MB per row at GLM-5.3-Flash shapes against GpuMoePlan's about 5 MB).
+/// T = 1 slot of combo `c`, so `y` has the bits of [`GpuMoePlan::run`]. Scratch: `ye`
+/// `[c][hidden]` for `c = tokens * topk` combos, `ge`, `ue` `[piece][inter]` (#196: the work
+/// items run in pieces of at most `piece` combos), no per-slot GEMV plans; one region holds them
+/// and the shared expert, and over the same bytes the dense FFN plan of `tokens` rows
+/// ([`GpuMoeGroupedPlan::dense`]; about 0.18 MB per row at GLM-5.3-Flash shapes against
+/// GpuMoePlan's about 5 MB).
 pub struct GpuMoeGroupedPlan {
     pub geo: MoeGeo,
     pub tokens: usize,
@@ -943,9 +1011,17 @@ pub struct GpuMoeGroupedPlan {
     /// `[T][H]` the shared expert's output
     pub ys: CUdeviceptr,
     pub shared: GpuFfnPlan,
+    /// #196: the dense FFN of up to `tokens` rows, over the plan's region (a dense layer's call)
+    pub dense: GpuFfnPlan,
     list: CUdeviceptr,
     work: CUdeviceptr,
     work_cap: usize,
+    /// #196: the region `ye`, `ys`, `ge`, `ue`, `shared` and `dense` are views into
+    region: CUdeviceptr,
+    /// #196: the most combos of one gate / up piece (`ge` / `ue` rows)
+    piece: usize,
+    /// #196: the rows of every work item of the uploaded schedule (host copy, for the pieces)
+    item_rows: std::cell::RefCell<Vec<usize>>,
     /// `mul1_gemm_grp` (`CUfunction` as an integer, as `LaneBuf::ev`)
     grp: u64,
 }
@@ -959,25 +1035,40 @@ impl GpuMoeGroupedPlan {
     /// the device bytes [`GpuMoeGroupedPlan::new`] allocates, without its parameter arrays
     /// ([`grouped_plan_bytes`] of the plan's geometry)
     pub fn bytes(geo: &MoeGeo, tokens: usize) -> u64 {
-        grouped_plan_bytes(geo.hidden, geo.experts, geo.topk, geo.expert_inter, geo.shared_inter, tokens)
+        grouped_plan_bytes(geo.hidden, geo.experts, geo.topk, geo.expert_inter, geo.shared_inter, geo.dense_inter, tokens)
     }
 
     /// # Safety
     /// A CUDA context is current; `mk` is the module the launches run on.
     pub unsafe fn new(geo: &MoeGeo, tokens: usize, mk: &mul1::Kernels) -> GpuMoeGroupedPlan {
+        GpuMoeGroupedPlan::with_piece(geo, tokens, mk, GROUP_PIECE_COMBOS)
+    }
+
+    /// [`GpuMoeGroupedPlan::new`] with gate / up pieces of at most `piece` combos (`usize::MAX`:
+    /// one piece for every combo of `tokens` rows, the pre-#196 scratch)
+    ///
+    /// # Safety
+    /// As [`GpuMoeGroupedPlan::new`].
+    pub unsafe fn with_piece(geo: &MoeGeo, tokens: usize, mk: &mul1::Kernels, piece: usize) -> GpuMoeGroupedPlan {
         let (h, e, k, i) = (geo.hidden, geo.experts, geo.topk, geo.expert_inter);
         let c = tokens * k;
+        let piece = piece.min(c);
+        assert!(piece >= GROUP_ROWS.min(c), "glm5_moe: gate / up pieces of {piece} combos hold no work item of {GROUP_ROWS}");
         assert!(tokens > 0 && e <= kernels::glm5_moe::ROUTER_THREADS && (1..=kernels::glm5_moe::MAXK).contains(&k) && k <= e);
         let [sg, su, sd] = geo.record_specs();
         let (s_gu, s_d) = (mul1::ksplit(h), mul1::ksplit(i));
         assert!(h / s_gu <= GROUP_XROWS && i / s_d <= GROUP_XROWS && h % 128 == 0 && i % 128 == 0, "glm5_moe: grouped GEMM shapes H {h} I {i}");
         let work_cap = Self::work_cap(geo, tokens);
         assert!(work_cap <= 65_535, "glm5_moe: {work_cap} work items exceed the grid");
-        let prm = |v: [usize; 15]| v.map(|x| i32::try_from(x).expect("glm5_moe: parameter beyond i32"));
-        // [k, n, S, n32, bits, half, in_div, mode, limit bits, (tr, suh, svh) x 2]
-        let gu = prm([h, i, s_gu, sg.n32(), sg.bits as usize, sg.half as usize, k, 0, 0, sg.tr_off, sg.suh_off, sg.svh_off, su.tr_off, su.suh_off, su.svh_off]);
-        let mut d = prm([i, h, s_d, sd.n32(), sd.bits as usize, sd.half as usize, 1, 1, 0, sd.tr_off, sd.suh_off, sd.svh_off, 0, 0, 0]);
+        let prm = |v: [usize; 16]| v.map(|x| i32::try_from(x).expect("glm5_moe: parameter beyond i32"));
+        // [k, n, S, n32, bits, half, in_div, mode, limit bits, (tr, suh, svh) x 2, loc]; #196 loc:
+        // gate / up write and down reads `ge` / `ue` at the entry's position in its piece
+        let gu = prm([h, i, s_gu, sg.n32(), sg.bits as usize, sg.half as usize, k, 0, 0, sg.tr_off, sg.suh_off, sg.svh_off, su.tr_off, su.suh_off, su.svh_off, 1]);
+        let mut d = prm([i, h, s_d, sd.n32(), sd.bits as usize, sd.half as usize, 1, 1, 0, sd.tr_off, sd.suh_off, sd.svh_off, 0, 0, 0, 1]);
         d[8] = geo.swiglu_limit.to_bits() as i32;
+        let (off, bytes) = grouped_region(h, k, i, geo.shared_inter, geo.dense_inter, tokens, piece);
+        let region = cuda::alloc_named("glm5 grouped MoE / dense FFN region", bytes);
+        let at = |n: usize| region + off[n] as u64;
         GpuMoeGroupedPlan {
             geo: *geo,
             tokens,
@@ -990,16 +1081,25 @@ impl GpuMoeGroupedPlan {
             logits: cuda::alloc_zeroed(tokens * e * 4),
             ids: cuda::alloc_zeroed(c * 4),
             wts: cuda::alloc_zeroed(c * 4),
-            ge: cuda::alloc_zeroed(c * i * 4),
-            ue: cuda::alloc_zeroed(c * i * 4),
-            ye: cuda::alloc_zeroed(c * h * 4),
-            ys: cuda::alloc_zeroed(tokens * h * 4),
-            shared: GpuFfnPlan::new(h, geo.shared_inter, tokens, geo.swiglu_limit),
+            ye: at(0),
+            ys: at(1),
+            ge: at(2),
+            ue: at(3),
+            shared: GpuFfnPlan::new_in(h, geo.shared_inter, tokens, geo.swiglu_limit, at(4)),
+            dense: GpuFfnPlan::new_in(h, geo.dense_inter, tokens, geo.swiglu_limit, region),
             list: cuda::alloc_zeroed(c * 4),
             work: cuda::alloc_zeroed(work_cap * 3 * 4),
             work_cap,
+            region,
+            piece,
+            item_rows: std::cell::RefCell::new(Vec::new()),
             grp: mk.module.get(GROUP_ENTRY) as u64,
         }
+    }
+
+    /// #196: the most combos of one gate / up piece
+    pub fn piece(&self) -> usize {
+        self.piece
     }
 
     /// the router on the first `t` rows of `x` into `ids` / `wts` (the launches of
@@ -1022,10 +1122,12 @@ impl GpuMoeGroupedPlan {
         cuda::to_i32_into(self.list, &s.list);
         let flat: Vec<i32> = s.work.iter().flatten().copied().collect();
         cuda::to_i32_into(self.work, &flat);
+        *self.item_rows.borrow_mut() = s.work.iter().map(|w| w[2] as usize).collect();
     }
 
     /// queue the routed experts of work items `items` of the uploaded schedule through `table`:
-    /// `ye[c]` of their combos from rows `c / topk` of `x` (two launches)
+    /// `ye[c]` of their combos from rows `c / topk` of `x`, in pieces of at most
+    /// [`GpuMoeGroupedPlan::piece`] combos (#196), two launches each (gate / up, then down)
     ///
     /// # Safety
     /// `table` points every expert of these items at a readable record until the launches
@@ -1034,12 +1136,23 @@ impl GpuMoeGroupedPlan {
         if items.is_empty() {
             return;
         }
-        assert!(items.end <= self.work_cap);
+        let rows = self.item_rows.borrow();
+        assert!(items.end <= self.work_cap && items.end <= rows.len(), "glm5_moe: items {items:?} of a schedule of {}", rows.len());
         let (h, i) = (self.geo.hidden, self.geo.expert_inter);
-        let (f, n) = (self.grp as cudarc::driver::sys::CUfunction, items.len() as u32);
-        let work = self.work + (items.start * 12) as u64;
-        launch_v(f, (i / 128) as u32, n, 2, 256, &[table, work, self.list, x, x, self.ge, self.ue, self.prm_gu]);
-        launch_v(f, (h / 128) as u32, n, 1, 256, &[table, work, self.list, self.ge, self.ue, self.ye, self.ye, self.prm_d]);
+        let f = self.grp as cudarc::driver::sys::CUfunction;
+        let mut a = items.start;
+        while a < items.end {
+            let (mut b, mut n) = (a, 0usize);
+            while b < items.end && n + rows[b] <= self.piece {
+                n += rows[b];
+                b += 1;
+            }
+            assert!(b > a, "glm5_moe: a work item of {} rows in pieces of {}", rows[a], self.piece);
+            let (work, w) = (self.work + (a * 12) as u64, (b - a) as u32);
+            launch_v(f, (i / 128) as u32, w, 2, 256, &[table, work, self.list, x, x, self.ge, self.ue, self.prm_gu]);
+            launch_v(f, (h / 128) as u32, w, 1, 256, &[table, work, self.list, self.ge, self.ue, self.ye, self.ye, self.prm_d]);
+            a = b;
+        }
     }
 
     /// queue the shared expert on the first `t` rows of `x` and the combine into `y`
@@ -1080,16 +1193,15 @@ impl GpuMoeGroupedPlan {
             &mut self.logits,
             &mut self.ids,
             &mut self.wts,
-            &mut self.ge,
-            &mut self.ue,
-            &mut self.ye,
-            &mut self.ys,
             &mut self.list,
             &mut self.work,
+            &mut self.region,
         ] {
             cuda::free_dev(d);
         }
+        (self.ge, self.ue, self.ye, self.ys) = (0, 0, 0, 0);
         self.shared.free();
+        self.dense.free();
     }
 }
 

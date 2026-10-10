@@ -302,9 +302,13 @@ const P_HEADS: usize = 5;
 const P_ZERO: usize = 6;
 const P_ONE: usize = 7;
 
-/// the activations of up to `max_t` rows per prompt call
+/// the activations of up to `max_t` rows per prompt call, carved out of one region (#196: the
+/// region may be shared with other scratch that is never live at the same time, `glm5_model`'s
+/// attention region)
 pub struct KdaScratch {
     pub max_t: usize,
+    /// #196: the region this scratch owns (0: a view into a region its owner frees)
+    region: Dev,
     params: Dev,
     lb: Dev,
     qkv: Dev,
@@ -327,34 +331,62 @@ pub struct KdaScratch {
 }
 
 impl KdaScratch {
+    /// f32 values per row of the activations, in field order: qkv, qkv_t, conv_t, q, k, v, qn,
+    /// kn, fa, f, b, g, beta, o, ga, gate, normed
+    fn widths(d: &KdaDims) -> [usize; 17] {
+        let (cc, w, hd, h) = (d.conv_ch(), d.width(), d.head_dim, d.heads);
+        [cc, cc, cc, w, w, w, w, w, hd, w, h, w, h, w, hd, w, w]
+    }
+
+    /// #196: the bytes of the region of a scratch of `max_t` rows (`glm5_moe::carve`)
+    pub fn region_bytes(d: &KdaDims, max_t: usize) -> usize {
+        crate::glm5_moe::carve(&KdaScratch::widths(d).map(|n| max_t * n * 4)).1
+    }
+
     /// # Safety
     /// A CUDA context is current.
     pub unsafe fn alloc(d: &KdaDims, max_t: usize) -> KdaScratch {
         assert!(max_t >= 1);
-        let f = |what: &str, n: usize| cuda::alloc_named(what, max_t * n * 4);
+        let region = cuda::alloc_named("kda scratch", KdaScratch::region_bytes(d, max_t));
+        let mut s = KdaScratch::alloc_in(d, max_t, region);
+        s.region = region;
+        s
+    }
+
+    /// #196: a scratch of `max_t` rows whose activations are views into `region`
+    /// ([`KdaScratch::region_bytes`] long), which the caller allocates and frees;
+    /// [`KdaScratch::free`] frees only the parameter arrays
+    ///
+    /// # Safety
+    /// A CUDA context is current; `region` outlives every launch on this scratch.
+    pub unsafe fn alloc_in(d: &KdaDims, max_t: usize, region: Dev) -> KdaScratch {
+        assert!(max_t >= 1 && region != 0);
+        let (off, _) = crate::glm5_moe::carve(&KdaScratch::widths(d).map(|n| max_t * n * 4));
+        let f = |n: usize| region + off[n] as u64;
         let i = |v: usize| i32::try_from(v).expect("#162: KDA dim beyond i32");
         let params = cuda::to_i32_dev(&[0, i(d.hidden), i(d.width()), i(d.conv_ch()), i(d.head_dim), i(d.heads), 0, 1]);
         KdaScratch {
             max_t,
+            region: 0,
             params,
             lb: cuda::to_f32_dev(&[d.lower_bound]),
-            qkv: f("kda qkv rows", d.conv_ch()),
-            qkv_t: f("kda qkv cols", d.conv_ch()),
-            conv_t: f("kda conv out", d.conv_ch()),
-            q: f("kda q", d.width()),
-            k: f("kda k", d.width()),
-            v: f("kda v", d.width()),
-            qn: f("kda qn", d.width()),
-            kn: f("kda kn", d.width()),
-            fa: f("kda f_a", d.head_dim),
-            f: f("kda f", d.width()),
-            b: f("kda b", d.heads),
-            g: f("kda g", d.width()),
-            beta: f("kda beta", d.heads),
-            o: f("kda o", d.width()),
-            ga: f("kda g_a", d.head_dim),
-            gate: f("kda gate", d.width()),
-            normed: f("kda normed", d.width()),
+            qkv: f(0),
+            qkv_t: f(1),
+            conv_t: f(2),
+            q: f(3),
+            k: f(4),
+            v: f(5),
+            qn: f(6),
+            kn: f(7),
+            fa: f(8),
+            f: f(9),
+            b: f(10),
+            g: f(11),
+            beta: f(12),
+            o: f(13),
+            ga: f(14),
+            gate: f(15),
+            normed: f(16),
         }
     }
     fn p(&self, slot: usize) -> u64 {
@@ -363,12 +395,14 @@ impl KdaScratch {
     /// # Safety
     /// A CUDA context is current; no launch still reads these buffers.
     pub unsafe fn free(&mut self) {
-        for p in [
-            &mut self.params, &mut self.lb, &mut self.qkv, &mut self.qkv_t, &mut self.conv_t, &mut self.q, &mut self.k,
-            &mut self.v, &mut self.qn, &mut self.kn, &mut self.fa, &mut self.f, &mut self.b, &mut self.g, &mut self.beta,
-            &mut self.o, &mut self.ga, &mut self.gate, &mut self.normed,
-        ] {
+        for p in [&mut self.params, &mut self.lb, &mut self.region] {
             cuda::free_dev(p);
+        }
+        for p in [
+            &mut self.qkv, &mut self.qkv_t, &mut self.conv_t, &mut self.q, &mut self.k, &mut self.v, &mut self.qn, &mut self.kn,
+            &mut self.fa, &mut self.f, &mut self.b, &mut self.g, &mut self.beta, &mut self.o, &mut self.ga, &mut self.gate, &mut self.normed,
+        ] {
+            *p = 0;
         }
     }
 }
@@ -475,6 +509,24 @@ pub unsafe fn prompt_with(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &K
     gemm(kk, sc, w.g_b, sc.ga, sc.gate, P_HD, d.width(), P_WIDTH, t);
     launch_v(kk.gated_norm, heads, t as u32, 1, hd, &[sc.o, sc.gate, w.o_norm, sc.normed]);
     proj(KdaProj::O, sc.normed, out, t);
+}
+
+/// #196: [`prompt_with`] for a call of any `t` rows on a scratch of fewer: the rows in sub-blocks
+/// of `sc.max_t` in position order, the state (S and conv window) carried from one to the next
+/// (`kda_persist_r` stores S after a block and loads it at the next, the conv window likewise),
+/// so the sequential scan sees every row once in order; every other stage computes a row from
+/// that row alone.
+/// # Safety
+/// As [`prompt_with`], without the `t <= sc.max_t` bound.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn prompt_rows_with(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &KdaScratch, x: Dev, t: usize, out: Dev, proj: &mut dyn FnMut(KdaProj, Dev, Dev, usize)) {
+    let rb = (kk.d.hidden * 4) as u64;
+    let mut r = 0;
+    while r < t {
+        let n = sc.max_t.min(t - r);
+        prompt_with(kk, w, st, sc, x + r as u64 * rb, n, out + r as u64 * rb, proj);
+        r += n;
+    }
 }
 
 /// [`step`] with the two projections queued by `proj(which, x, y, 1)`, as [`prompt_with`].

@@ -867,10 +867,10 @@ pub fn plan_three_tiers(i: &TierInput) -> Result<TierPlan, String> {
 /// there and the copy engine moves them into the staging slots (two `MAX_IN_FLIGHT` batches)
 pub const GLM5_PREFILL_RING: usize = 2 * crate::nvme_source::MAX_IN_FLIGHT;
 
-/// #186: the dense FFN plan sizes of a glm5_next prompt phase at `chunk` rows per call besides
-/// the one-row decode call: every power of two above 1 and below `chunk`, then `chunk`. A call's
-/// dense FFN runs in power-of-two row pieces (`glm5_model::dense_rows`); its MoE runs on one
-/// expert-major plan of `chunk` rows (`glm5_moe::GpuMoeGroupedPlan`). Empty at chunk 1.
+/// #186: the call sizes a glm5_next prompt phase at `chunk` rows per call rounds a borrowed
+/// scratch up to (`glm5_tiers::prompt_borrow_rows`) besides the one-row decode call: every power
+/// of two above 1 and below `chunk`, then `chunk`. Empty at chunk 1. (#196: a call's dense FFN
+/// and MoE run on the one expert-major plan of the pass's rows, `glm5_moe::GpuMoeGroupedPlan`.)
 pub fn glm5_prompt_call_sizes(chunk: usize) -> Vec<usize> {
     let mut v: Vec<usize> = (1..usize::BITS).map(|i| 1usize << i).take_while(|&p| p < chunk).collect();
     if chunk > 1 {
@@ -880,14 +880,12 @@ pub fn glm5_prompt_call_sizes(chunk: usize) -> Vec<usize> {
 }
 
 /// #186: the device bytes the glm5_next prompt phase holds at `chunk` rows per call over a cache
-/// of `cap` rows, above what a one-row pass holds: the pass scratch at `max_t = chunk` minus at 1
-/// (`glm5_mhc::Plan`, `KdaScratch`, `MlaScratch` with the indexer scores `max_t x cap / kpool`,
-/// the collapsed and sublayer rows), the residual's `chunk - 1` more rows, one expert-major MoE
-/// plan of `chunk` rows (`glm5_moe::GpuMoeGroupedPlan`: router, the combos' gate / up / expert
-/// outputs, schedule, shared expert; `glm5_moe::grouped_plan_bytes`) and one dense FFN plan
-/// (`GpuFfnPlan`) per call size of [`glm5_prompt_call_sizes`], and with `CROW_GLM_DENSE_GEMM=1`
-/// the tensor-core path's row table (`kernels::glm5_moe::TC_ROWS_BYTES`, #186). The small
-/// parameter arrays are left out (the GPU test `glm5_model::tests_186_gpu` holds the sum to the
+/// of `cap` rows, above what a one-row pass holds ([`glm5_chunk_scratch_parts`], summed): the pass
+/// scratch at `max_t = chunk` minus at 1, the residual's `chunk - 1` more rows, the one
+/// expert-major plan of `chunk` rows with the dense FFN over its region, and with
+/// `CROW_GLM_DENSE_GEMM=1` the tensor-core path's row table (`kernels::glm5_moe::TC_ROWS_BYTES`,
+/// #186). The small parameter arrays are left out (the GPU test
+/// `glm5_tiers_gpu_186_chunk_bytes_are_what_the_prompt_phase_allocates` holds the sum to the
 /// bytes the allocations register). 0 at chunk 1.
 pub fn glm5_chunk_scratch_bytes(g: &Glm5Geo, chunk: usize, cap: usize) -> u64 {
     glm5_chunk_scratch_bytes_tc(g, chunk, cap, crate::kernels::glm5_moe::dense_gemm_from_env())
@@ -895,27 +893,42 @@ pub fn glm5_chunk_scratch_bytes(g: &Glm5Geo, chunk: usize, cap: usize) -> u64 {
 
 /// [`glm5_chunk_scratch_bytes`] with `CROW_GLM_DENSE_GEMM` given (`tc`)
 pub fn glm5_chunk_scratch_bytes_tc(g: &Glm5Geo, chunk: usize, cap: usize, tc: bool) -> u64 {
-    use crate::glm5_kda::KdaDims;
+    glm5_chunk_scratch_parts(g, chunk, cap, tc).iter().map(|p| p.1).sum()
+}
+
+/// #196: [`glm5_chunk_scratch_bytes_tc`] by buffer, above a one-row pass: (name, bytes) of
+/// - `mhc` the mHC plan (`glm5_mhc::Plan`: logits, pre, post, comb, done), `rows` the collapsed
+///   and sublayer rows, `residual` the residual's `chunk - 1` more rows;
+/// - `attention` the region the KDA and the MLA scratch share (`glm5_model::attn_region_bytes`:
+///   the larger of `KdaScratch` at `min(chunk, KDA_SUB_ROWS)` rows and `MlaScratch` at
+///   `min(chunk, MLA_SUB_ROWS)` rows with its pool scores, `cap / kpool` per row), `selection` the
+///   MLA selection of the call's rows (`MlaScratch::sel_bytes`);
+/// - `moe` the expert-major plan of `chunk` rows (`glm5_moe::grouped_plan_bytes`: router logits,
+///   ids, weights, combo list, work items, and its region: the experts' outputs, the shared
+///   expert, gate / up of one piece of at most `GROUP_PIECE_COMBOS` combos, over the same bytes
+///   the dense FFN of `chunk` rows);
+/// - `tc` the tensor-core row table.
+pub fn glm5_chunk_scratch_parts(g: &Glm5Geo, chunk: usize, cap: usize, tc: bool) -> Vec<(&'static str, u64)> {
     use crate::glm5_mhc::{HC, MIX};
-    use crate::glm5_mla::{MlaDims, KPOOL};
+    use crate::glm5_mla::{MlaDims, MlaScratch};
+    use crate::glm5_model::{attn_region_bytes, attn_rows};
     if chunk <= 1 {
-        return 0;
+        return Vec::new();
     }
-    let (kd, md, h) = (KdaDims::of(g), MlaDims::of(g), g.hidden);
-    let pass = |m: usize| -> u64 {
-        let mhc = m * (MIX + HC + HC + HC * HC);
-        let kda = m * (3 * kd.conv_ch() + 10 * kd.width() + 2 * kd.head_dim + 2 * kd.heads);
-        let mla_rows = md.q_lora + md.heads * md.nope + md.kv_lora + md.idx_proj() + md.idx_heads * md.idx_dim + (cap / KPOOL).max(1) + 3 + md.sel_max() + 2 * md.heads * md.kv_lora + md.heads * md.v;
-        let mla = m * mla_rows + m.max(16) * (md.heads * md.kv_lora + md.heads * 2);
-        4 * (mhc + kda + mla + 2 * m * h) as u64
-    };
-    let moe_plan = crate::glm5_moe::grouped_plan_bytes(h, g.experts, g.topk, g.expert_inter, g.expert_inter * g.shared_experts, chunk);
-    let dense_plan = |t: usize| 4 * 3 * t as u64 * g.dense_inter as u64;
-    let plans: u64 = moe_plan + glm5_prompt_call_sizes(chunk).into_iter().map(dense_plan).sum::<u64>();
-    let residual = ((chunk - 1) * g.hc_streams * h * 4) as u64;
+    let (md, h) = (MlaDims::of(g), g.hidden);
+    let above = |f: &dyn Fn(usize) -> usize| (f(chunk) - f(1)) as u64;
+    let moe = crate::glm5_moe::grouped_plan_bytes(h, g.experts, g.topk, g.expert_inter, g.expert_inter * g.shared_experts, g.dense_inter, chunk);
     // #186: the tensor-core path's device row counts (`CROW_GLM_DENSE_GEMM=1`), held by a pass of `chunk` rows
     let tc = if tc && chunk >= crate::kernels::glm5_moe::TC_MIN_ROWS { crate::kernels::glm5_moe::TC_ROWS_BYTES } else { 0 };
-    pass(chunk) - pass(1) + residual + plans + tc
+    vec![
+        ("mhc", above(&|m| 4 * m * (MIX + HC + HC + HC * HC + 1))),
+        ("rows", above(&|m| 4 * 2 * m * h)),
+        ("residual", ((chunk - 1) * g.hc_streams * h * 4) as u64),
+        ("attention", above(&|m| attn_region_bytes(g, attn_rows(m), cap))),
+        ("selection", above(&|m| MlaScratch::sel_bytes(&md, m))),
+        ("moe", moe),
+        ("tc", tc),
+    ]
 }
 
 /// #159: the glm5_next plan from its geometry: the states at `context`, the staging of its
@@ -1066,7 +1079,7 @@ pub fn glm5_plan_table(g: &Glm5Geo, s: &Glm5States, i: &TierInput, p: &TierPlan,
     o.push(format!("  KDA state + conv     {:>16} B  {:>7.2} GiB  {} layers x ({} + {} B) per sequence", s.kda_state_bytes + s.kda_conv_bytes, gib(s.kda_state_bytes + s.kda_conv_bytes), g.kda_layers, g.kda_state_bytes(), g.kda_conv_bytes()));
     o.push(format!("  cold staging         {:>16} B  {:>7.2} GiB  {} slots (decode and prefill sets apart, #176)", i.staging_bytes, gib(i.staging_bytes), slots));
     if i.chunk > 1 {
-        o.push(format!("  prompt chunk         {:>16} B  {:>7.2} GiB  {} rows per prompt call (CROW_CHUNK, #186): pass scratch, residual rows, the expert-major MoE plan, dense FFN plans of {:?} rows", i.chunk_scratch_bytes, gib(i.chunk_scratch_bytes), i.chunk, glm5_prompt_call_sizes(i.chunk)));
+        o.push(format!("  prompt chunk         {:>16} B  {:>7.2} GiB  {} rows per prompt call (CROW_CHUNK, #186): pass scratch (KDA | MLA in one region at their sub-block rows, #196), residual rows, the expert-major MoE plan with the dense FFN over its region", i.chunk_scratch_bytes, gib(i.chunk_scratch_bytes), i.chunk));
     }
     o.push(format!("  launch slack + safety{:>16} B  {:>7.2} GiB", i.launch_slack + SAFETY, gib(i.launch_slack + SAFETY)));
     o.push("  activations/scratch  not measured (GLM widths; the step-14 boot measures them against free VRAM)".to_string());
@@ -2261,7 +2274,42 @@ mod tests_186_chunk_plan {
             assert!(t.contains(&format!("{chunk} rows per prompt call (CROW_CHUNK, #186)")), "{t}");
             eprintln!("glm5 plan #186 chunk {chunk}: prompt-phase bytes {b} ({:.2} GiB), N {} P {} NVMe {} (chunk 1: {} / {} / {})", b as f64 / GIB, p.hot, p.pinned, p.nvme, p0.hot, p0.pinned, p0.nvme);
         }
-        let e = plan(65_536).unwrap_err();
-        assert!(e.contains("prompt chunk 65536 (CROW_CHUNK, #186)"), "{e}");
+        // #196: 65,536 rows fit since the scratch is about 0.37 MB per row; twice that does not
+        let e = plan(131_072).unwrap_err();
+        assert!(e.contains("prompt chunk 131072 (CROW_CHUNK, #186)"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod tests_196_scratch {
+    //! #196: the prompt-pass scratch the plan books at 8192 rows per call over a cache of
+    //! 200,000 rows (`CROW_CHUNK=8192`, the template's chunk) is at most 3.5 GiB: the KDA and MLA
+    //! scratch share one region at their sub-block rows, the indexer scores are one block of 256
+    //! rows, gate / up live per piece and the dense FFN shares the MoE plan's region. Printed per
+    //! row by buffer.
+    use super::*;
+
+    #[test]
+    fn glm5_prompt_scratch_at_8192_rows_is_at_most_3_5_gib() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let (chunk, cap) = (8192usize, 200_000usize);
+        let parts = glm5_chunk_scratch_parts(&g, chunk, cap, false);
+        let total: u64 = parts.iter().map(|p| p.1).sum();
+        assert_eq!(total, glm5_chunk_scratch_bytes_tc(&g, chunk, cap, false));
+        for (name, b) in &parts {
+            eprintln!("#196 chunk {chunk} cap {cap}: {name:<10} {b:>13} B  {:>9.1} B/row", *b as f64 / chunk as f64);
+        }
+        eprintln!("#196 chunk {chunk} cap {cap}: total      {total:>13} B  {:>9.1} B/row  {:.3} GiB", total as f64 / chunk as f64, total as f64 / GIB);
+        assert!(total <= 7 << 29, "the prompt scratch at {chunk} rows books {total} B ({:.2} GiB), above 3.5 GiB", total as f64 / GIB);
+        // the attention region is the larger of the two scratch kinds, not their sum
+        let attn = parts.iter().find(|p| p.0 == "attention").unwrap().1;
+        let (kd, md) = (crate::glm5_kda::KdaDims::of(&g), crate::glm5_mla::MlaDims::of(&g));
+        let (k, m) = crate::glm5_model::attn_rows(chunk);
+        let (kb, mb) = (crate::glm5_kda::KdaScratch::region_bytes(&kd, k) as u64, crate::glm5_mla::MlaScratch::region_bytes(&md, m, cap) as u64);
+        let one = crate::glm5_model::attn_region_bytes(&g, crate::glm5_model::attn_rows(1), cap) as u64;
+        assert_eq!(attn + one, kb.max(mb));
+        // the indexer scores do not grow with the call: a 262,144-row cache adds one 256-row block
+        let big = glm5_chunk_scratch_bytes_tc(&g, chunk, 262_144, false);
+        assert!(big <= 7 << 29, "cap 262144: {big} B");
     }
 }

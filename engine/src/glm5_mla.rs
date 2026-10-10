@@ -361,6 +361,18 @@ pub struct MlaScratch {
     st_ev: Vec<cudarc::driver::sys::CUevent>,
     st_used: Vec<bool>,
     st_cur: usize,
+    /// #196: the region of every activation but `sel` / `sel_n` when this scratch owns it (0: a
+    /// view into a region its owner frees)
+    region: CUdeviceptr,
+    /// #196: rows of `sel` / `sel_n` (at least `max_t`); a call of [`MlaScratch::forward_rows_with`]
+    /// writes its selection at row `row_off` of them
+    pub sel_rows: usize,
+    row_off: usize,
+    /// #196: the rows whose split count ([`attn_splits`]) the call's attention takes (its own
+    /// rows, or the whole prompt call's when it is a sub-call of one)
+    split_t: usize,
+    /// `sel_max` of the dims (the row stride of `sel`)
+    sel_max: usize,
 }
 
 /// entries of the pinned `[pos0, t]` ring of [`MlaScratch::begin`] (a decode row with `CROW_GLM_LA`
@@ -368,11 +380,59 @@ pub struct MlaScratch {
 pub const ST_RING: usize = 64;
 
 impl MlaScratch {
+    /// f32 values of the activations in the region at `max_t` rows over caches of `cap` tokens,
+    /// in field order: qa, q, kva, ip, iq, scores, ncb, pos, qt, part_o, part_ml, u, o
+    fn widths(d: &MlaDims, max_t: usize, cap: usize) -> [usize; 13] {
+        let slots = max_t.max(16); // t * attn_splits(t) <= max(t, 16)
+        [
+            max_t * d.q_lora,
+            max_t * d.heads * d.nope,
+            max_t * d.kv_lora,
+            max_t * d.idx_proj(),
+            max_t * d.idx_heads * d.idx_dim,
+            max_t * (cap / KPOOL).max(1),
+            max_t,
+            max_t,
+            max_t * d.heads * d.kv_lora,
+            slots * d.heads * d.kv_lora,
+            slots * d.heads * 2,
+            max_t * d.heads * d.kv_lora,
+            max_t * d.heads * d.v,
+        ]
+    }
+
+    /// #196: the bytes of the region of a scratch of `max_t` rows over caches of `cap` tokens
+    /// (every activation but the selection, `glm5_moe::carve`)
+    pub fn region_bytes(d: &MlaDims, max_t: usize, cap: usize) -> usize {
+        crate::glm5_moe::carve(&MlaScratch::widths(d, max_t, cap).map(|n| n * 4)).1
+    }
+
+    /// #196: the bytes of `sel` and `sel_n` at `rows` rows (allocated apart from the region)
+    pub fn sel_bytes(d: &MlaDims, rows: usize) -> usize {
+        4 * rows * (d.sel_max() + 1)
+    }
+
     /// # Safety
     /// A CUDA context is current.
     pub unsafe fn new(d: &MlaDims, max_t: usize, cap: usize) -> MlaScratch {
         assert!(max_t > 0 && cap / KPOOL <= MAX_POOLS);
-        let slots = max_t.max(16); // t * attn_splits(t) <= max(t, 16)
+        let region = cuda::alloc_named("glm5 mla scratch", MlaScratch::region_bytes(d, max_t, cap));
+        let mut s = MlaScratch::new_in(d, max_t, max_t, cap, region);
+        s.region = region;
+        s
+    }
+
+    /// #196: a scratch of calls of up to `max_t` rows whose activations are views into `region`
+    /// ([`MlaScratch::region_bytes`] long), which the caller allocates and frees, and whose
+    /// selection holds `sel_rows` rows (its own allocation; [`MlaScratch::forward_rows_with`]
+    /// writes sub-calls of a larger call at their rows)
+    ///
+    /// # Safety
+    /// A CUDA context is current; `region` outlives every launch on this scratch.
+    pub unsafe fn new_in(d: &MlaDims, max_t: usize, sel_rows: usize, cap: usize, region: CUdeviceptr) -> MlaScratch {
+        assert!(max_t > 0 && sel_rows >= max_t && cap / KPOOL <= MAX_POOLS && region != 0);
+        let (off, _) = crate::glm5_moe::carve(&MlaScratch::widths(d, max_t, cap).map(|n| n * 4));
+        let at = |i: usize| region + off[i] as u64;
         let a = |what: &str, n: usize| cuda::alloc_named(what, n * 4);
         let prm = cuda::to_i32_dev(&[d.sel_pools() as i32, (cap / KPOOL) as i32, d.sel_max() as i32]);
         MlaScratch {
@@ -382,26 +442,36 @@ impl MlaScratch {
             pos0: 0,
             st: cuda::to_i32_dev(&[0i32, 0]),
             prm,
-            qa: a("glm5 mla q_a", max_t * d.q_lora),
-            q: a("glm5 mla q", max_t * d.heads * d.nope),
-            kva: a("glm5 mla kv_a", max_t * d.kv_lora),
-            ip: a("glm5 idx x-proj", max_t * d.idx_proj()),
-            iq: a("glm5 idx q", max_t * d.idx_heads * d.idx_dim),
-            scores: a("glm5 idx scores", max_t * (cap / KPOOL).max(1)),
-            ncb: a("glm5 idx ncb", max_t),
-            pos: a("glm5 idx pos", max_t),
-            sel: a("glm5 idx selection", max_t * d.sel_max()),
-            sel_n: a("glm5 idx selection n", max_t),
-            qt: a("glm5 mla q~", max_t * d.heads * d.kv_lora),
-            part_o: a("glm5 mla partials", slots * d.heads * d.kv_lora),
-            part_ml: a("glm5 mla partial m/l", slots * d.heads * 2),
-            u: a("glm5 mla latent mix", max_t * d.heads * d.kv_lora),
-            o: a("glm5 mla o", max_t * d.heads * d.v),
+            qa: at(0),
+            q: at(1),
+            kva: at(2),
+            ip: at(3),
+            iq: at(4),
+            scores: at(5),
+            ncb: at(6),
+            pos: at(7),
+            sel: a("glm5 idx selection", sel_rows * d.sel_max()),
+            sel_n: a("glm5 idx selection n", sel_rows),
+            qt: at(8),
+            part_o: at(9),
+            part_ml: at(10),
+            u: at(11),
+            o: at(12),
             st_ring: cuda::Pinned::alloc(ST_RING * 8),
             st_ev: (0..ST_RING).map(|_| cuda::event_create()).collect(),
             st_used: vec![false; ST_RING],
             st_cur: 0,
+            region: 0,
+            sel_rows,
+            row_off: 0,
+            split_t: 0,
+            sel_max: d.sel_max(),
         }
+    }
+
+    /// the call's `sel` / `sel_n` rows (#196: at `row_off`)
+    fn sel_at(&self) -> (CUdeviceptr, CUdeviceptr) {
+        ((self.sel + (self.row_off * self.sel_max * 4) as u64), self.sel_n + (self.row_off * 4) as u64)
     }
 
     /// rows of the current call
@@ -418,6 +488,7 @@ impl MlaScratch {
         assert!(pos0 + t <= self.cap, "glm5_mla: rows {pos0}..{} beyond the cache of {}", pos0 + t, self.cap);
         self.t = t;
         self.pos0 = pos0;
+        (self.row_off, self.split_t) = (0, t);
         // #190: inside a CROW_GLM_GRAPH capture the row staged `st` already (a host upload would
         // be captured from this stack array and replayed stale)
         if !crate::glm5_graph::capturing() {
@@ -501,8 +572,9 @@ impl MlaScratch {
                 self.iq, self.ip, c.index, w.idx_ape, self.scores, (self.cap / KPOOL) as u64, self.st]);
         }
         launch_v(kn.sel_prep, self.t.div_ceil(256) as u32, 1, 1, 256, &[self.ncb, self.pos, self.st]);
+        let (sel, sel_n) = self.sel_at();
         launch_v(kn.select, self.t as u32, 1, 1, 256, &[
-            self.scores, self.ncb, self.sel, self.sel_n, self.prm, self.prm + 4, self.prm + 8, self.pos]);
+            self.scores, self.ncb, sel, sel_n, self.prm, self.prm + 4, self.prm + 8, self.pos]);
     }
 
     /// absorbed attention: `q~ = W_k^T q`, split-K softmax over the selected latent rows, `o = W_v u`
@@ -513,8 +585,10 @@ impl MlaScratch {
         let d = &kn.dims;
         let t = self.t as u32;
         self.absorb(kn, w.kv_b);
-        let ns = attn_splits(self.t) as u64;
-        launch_v(kn.attn, d.heads.div_ceil(8) as u32, t, ns as u32, 256, &[self.qt, c.latent, self.sel, self.sel_n, self.part_o, self.part_ml, ns, self.st]);
+        // #196: a sub-call of a prompt call takes the whole call's split count (its rows' bits)
+        let ns = attn_splits(self.split_t) as u64;
+        let (sel, sel_n) = self.sel_at();
+        launch_v(kn.attn, d.heads.div_ceil(8) as u32, t, ns as u32, 256, &[self.qt, c.latent, sel, sel_n, self.part_o, self.part_ml, ns, self.st]);
         launch_v(kn.merge, d.heads as u32, t, 1, 256, &[self.part_o, self.part_ml, self.u, ns, self.st]);
         self.out_v(kn, w.kv_b);
     }
@@ -582,8 +656,35 @@ impl MlaScratch {
         t: usize,
         proj: &mut dyn FnMut(&MlaScratch, MlaProj, CUdeviceptr, CUdeviceptr),
     ) {
+        self.forward_rows_with(kn, w, c, x, y, pos0, t, 0, t, proj);
+    }
+
+    /// #196: [`MlaScratch::forward_with`] for a sub-call of a prompt call of `split_t` rows: the
+    /// selection goes to rows `row_off ..` of `sel` / `sel_n` (`row_off + t <= sel_rows`) and the
+    /// attention takes the split count of `split_t` rows (`split_t >= t`), so a call run as
+    /// sub-calls in position order has the rows of one call. `forward_with` is `row_off` 0,
+    /// `split_t` = `t`.
+    ///
+    /// # Safety
+    /// As [`MlaScratch::forward_with`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_rows_with(
+        &mut self,
+        kn: &MlaKernels,
+        w: &MlaWeights,
+        c: &MlaCache,
+        x: CUdeviceptr,
+        y: CUdeviceptr,
+        pos0: usize,
+        t: usize,
+        row_off: usize,
+        split_t: usize,
+        proj: &mut dyn FnMut(&MlaScratch, MlaProj, CUdeviceptr, CUdeviceptr),
+    ) {
         let d = kn.dims;
         self.begin(pos0, t);
+        assert!(row_off + t <= self.sel_rows && split_t >= t, "glm5_mla: sub-call rows {row_off}..{} of {} (split rows {split_t})", row_off + t, self.sel_rows);
+        (self.row_off, self.split_t) = (row_off, split_t);
         proj(self, MlaProj::QA, x, self.qa);
         launch_v(kn.rmsnorm, self.t as u32, 1, 1, 256, &[self.qa, w.q_a_norm, d.q_lora as u64, self.st]);
         proj(self, MlaProj::QB, self.qa, self.q);
@@ -600,12 +701,14 @@ impl MlaScratch {
     /// # Safety
     /// No launch of this scratch is pending.
     pub unsafe fn free(&mut self) {
-        for p in [
-            &mut self.st, &mut self.prm, &mut self.qa, &mut self.q, &mut self.kva, &mut self.ip, &mut self.iq, &mut self.scores,
-            &mut self.ncb, &mut self.pos, &mut self.sel, &mut self.sel_n, &mut self.qt, &mut self.part_o, &mut self.part_ml,
-            &mut self.u, &mut self.o,
-        ] {
+        for p in [&mut self.st, &mut self.prm, &mut self.sel, &mut self.sel_n, &mut self.region] {
             cuda::free_dev(p);
+        }
+        for p in [
+            &mut self.qa, &mut self.q, &mut self.kva, &mut self.ip, &mut self.iq, &mut self.scores, &mut self.ncb, &mut self.pos,
+            &mut self.qt, &mut self.part_o, &mut self.part_ml, &mut self.u, &mut self.o,
+        ] {
+            *p = 0;
         }
         for &e in &self.st_ev {
             cuda::ck(cudarc::driver::sys::cuEventSynchronize(e));

@@ -372,7 +372,7 @@ fn glm5_int_gpu_the_prompt_borrows_its_scratch_from_the_elastic_arena() {
 
 /// Cross-wiring 3, the plan: the VRAM hot set per MoE layer during decode on the RTX 5090 at
 /// 200,000 rows (the #186 planner test's card), chunk 1 / 2048 / 8192, with the prompt scratch
-/// booked (the plan of record: chunk 8192 leaves 7 slots per layer) and borrowed from the elastic
+/// booked (the plan of record: chunk 8192 leaves 42 slots per layer, #196) and borrowed from the elastic
 /// part (`decode_hot_per_layer`, on the plan's numbers: the scratch under the plan's ceiling turns
 /// into elastic chunks above the 2.5 GiB reserve), elastic part unbounded and at 10 GiB (the
 /// template's serving setting).
@@ -400,8 +400,9 @@ fn glm5_int_decode_hot_set_with_the_borrowed_prompt_scratch() {
     }
     let (c1, c8) = (rows[0], rows[2]);
     assert_eq!(c1.2, c1.3, "chunk 1 books no prompt scratch");
-    assert_eq!(c8.1, 7, "the plan of record at chunk 8192 (#186)");
-    assert!(c8.3 > c8.2 + 20.0, "chunk 8192: the borrowed scratch holds experts during decode ({:.1} vs {:.1})", c8.3, c8.2);
+    // #196: the prompt scratch at chunk 8192 is 2.79 GiB (15.87 GiB before: 7 slots, +35 borrowed)
+    assert_eq!(c8.1, 42, "the plan of record at chunk 8192 (#186, #196)");
+    assert!(c8.3 >= c8.2 && c8.3 <= c1.1 as f64, "chunk 8192: the borrowed scratch holds experts during decode ({:.1} vs {:.1})", c8.3, c8.2);
 }
 
 /// Cross-wiring 2: the CPU lane (`1` and `split`) with the global arena, the stager, the
