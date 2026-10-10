@@ -2213,7 +2213,8 @@ mod tests {
     /// Read micro-bench on a real glm5_next container (`CROW_NVME_BENCH_CNQ`, read-only, about a
     /// minute): every routed-expert record in a shuffled order, GB/s of the per-reader backends
     /// (fetch of 8, waited one at a time - the engine's pattern) and of the pool at 1/8/16/48
-    /// workers (1 MiB pieces; 1 and 8 fetches of 8 outstanding), then the latency of a demand
+    /// workers (1 MiB pieces, and 2 MiB at 16 and 48; 1 and 8 fetches of 8 outstanding), then the
+    /// latency of a demand
     /// fetch of 8 records every 3 ms under a prefetch load of 4 outstanding fetches, as Demand
     /// and as Prefetch. `cargo test --release --lib nvme_source::tests::bench -- --ignored --nocapture`
     #[test]
@@ -2285,12 +2286,13 @@ mod tests {
             eprintln!("{} x {readers} depth 1: {g:.2} GB/s", backend.name());
             line.push(format!("{}x{readers} d1 {g:.2}", backend.name()));
         }
-        for threads in [1, 8, 16, 48] {
-            let src = NvmeSource::open(&pool_cfg(Path::new(&path), threads, 1 << 20)).unwrap();
+        // #202: 16-48 pieces of 1-2 MiB in flight (the template: 16 x 2304 KiB, 48 threads default)
+        for (threads, mib) in [(1, 1), (8, 1), (16, 1), (16, 2), (48, 1), (48, 2)] {
+            let src = NvmeSource::open(&pool_cfg(Path::new(&path), threads, mib << 20)).unwrap();
             for depth in [1, 8] {
                 let g = rate(&src, depth, &mut cursor);
-                eprintln!("pool {threads} x 1 MiB, {depth} fetch(es) of 8 outstanding: {g:.2} GB/s");
-                line.push(format!("pool{threads} d{depth} {g:.2}"));
+                eprintln!("pool {threads} x {mib} MiB, {depth} fetch(es) of 8 outstanding: {g:.2} GB/s");
+                line.push(format!("pool{threads}x{mib}M d{depth} {g:.2}"));
             }
         }
         eprintln!("GB/s: {}", line.join(" | "));
