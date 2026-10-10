@@ -265,8 +265,16 @@ fn counters_json(p: &Phase, rb: u64) -> Value {
     let m = p.total_moves();
     let visits = m.visits.max(1) as f64;
     let gb = |records: u64| records as f64 * rb as f64 / 1e9 / t;
+    // #188: the NVMe records per token split into demand (misses no guess covered) and speculative
+    // (guesses issued), and the records copied into VRAM slots (admissions and promotions)
+    let pf = p.pf.unwrap_or_default();
+    let demand = p.nvme_reads.saturating_sub(pf.covered);
     json!({
         "tokens": p.tokens,
+        "nvme_demand_reads_per_token": demand as f64 / t,
+        "nvme_speculative_reads_per_token": pf.issued as f64 / t,
+        "nvme_records_per_token": (demand + pf.issued) as f64 / t,
+        "h2d_promotion_records_per_token": m.stage_to_vram as f64 / t,
         "visits": m.visits, "visits_per_token": m.visits as f64 / t,
         "hits": { "vram": tot[0], "pinned": tot[1], "nvme": tot[2] },
         "hit_rate": { "vram": tot[0] as f64 / visits, "pinned": tot[1] as f64 / visits, "nvme": tot[2] as f64 / visits },
@@ -416,7 +424,7 @@ fn counters_line(p: &Phase, rb: u64) -> String {
     let f = |k: &str| c[k].as_f64().unwrap_or(0.0);
     let h = |k: &str| 100.0 * c["hit_rate"][k].as_f64().unwrap_or(0.0);
     format!(
-        "visits {:.1}, hits vram {:.1} % pinned {:.1} % nvme {:.1} %, r {:.2} NVMe reads ({:.3} GB), m {:.4}, H2D {:.3} GB, zero-copy {:.3} GB, host DRAM->GPU {:.3} GB, D2H {:.3} GB, promotions {:.2}, evictions {:.2}, prefetch {} (issued {:.2}, used {:.2}, wasted {:.2}, joins {:.2}, demand misses uncovered {:.2}), CPU lane {:.2} experts {:.4} s",
+        "visits {:.1}, hits vram {:.1} % pinned {:.1} % nvme {:.1} %, r {:.2} NVMe reads ({:.3} GB), m {:.4}, H2D {:.3} GB, zero-copy {:.3} GB, host DRAM->GPU {:.3} GB, D2H {:.3} GB, promotions {:.2}, evictions {:.2}, prefetch {} (issued {:.2}, used {:.2}, wasted {:.2}, joins {:.2}, demand misses uncovered {:.2}), CPU lane {:.2} experts {:.4} s; NVMe records demand {:.2} + speculative {:.2}, H2D promotion records {:.2}",
         f("visits_per_token"),
         h("vram"),
         h("pinned"),
@@ -437,7 +445,10 @@ fn counters_line(p: &Phase, rb: u64) -> String {
         c["prefetch"]["joins_per_token"].as_f64().unwrap_or(0.0),
         c["prefetch"]["demand_misses_uncovered_per_token"].as_f64().unwrap_or(0.0),
         f("cpu_lane_per_token"),
-        f("cpu_lane_s_per_token")
+        f("cpu_lane_s_per_token"),
+        f("nvme_demand_reads_per_token"),
+        f("nvme_speculative_reads_per_token"),
+        f("h2d_promotion_records_per_token")
     )
 }
 
@@ -551,6 +562,33 @@ fn machine_line(m: &Value) -> String {
         g("system_commit_free_bytes"),
         g("system_commit_limit_bytes"),
         g("tiers_pinned_bytes")
+    )
+}
+
+/// #188 `CROW_GLM_ARENA=global`: the VRAM slots the decode calls may use now (enabled: the ring
+/// and the handed-back elastic chunks left out), the elastic chunks live and the elastic part's
+/// counters (`ElasticStats`); `null` on the per-layer path
+fn arena_json(tiers: &ExpertTiers) -> Value {
+    let (Some(a), Some((live, all, vpl)), Some(e)) = (tiers.arena(), tiers.elastic_live(), tiers.arena_elastic_stats()) else { return Value::Null };
+    json!({
+        "vram_slots_enabled": a.enabled_vram(), "elastic_live_chunks": live, "elastic_chunks": all, "slots_per_chunk": vpl,
+        "elastic": {
+            "chunks": e.chunks, "enter": e.enter, "exit": e.exit, "realloc_fail": e.realloc_fail, "write_backs": e.write_backs,
+            "lifted": e.lifted, "lift_bytes": e.lift_bytes, "refills": e.refills, "refilled": e.refilled, "refill_nvme": e.refill_nvme,
+            "enter_free_bytes": e.enter_free_bytes, "exit_free_bytes": e.exit_free_bytes,
+            "regrows": e.regrows, "regrown": e.regrown, "regrow_floor_bytes": e.regrow_floor_bytes,
+        },
+    })
+}
+
+fn arena_line(a: &Value) -> String {
+    let e = &a["elastic"];
+    let gib = |v: &Value| v.as_u64().unwrap_or(0) as f64 / (1u64 << 30) as f64;
+    format!(
+        "VRAM slots {} ({} of {} elastic chunks x {} live); elastic enter {} exit {} realloc_fail {} write_backs {} refilled {} (NVMe {}), free VRAM at the last hand-back {:.2} GiB, at the last regrowth try {:.2} GiB; regrowths {} brought back {} chunks (floor {:.2} GiB)",
+        a["vram_slots_enabled"], a["elastic_live_chunks"], a["elastic_chunks"], a["slots_per_chunk"],
+        e["enter"], e["exit"], e["realloc_fail"], e["write_backs"], e["refilled"], e["refill_nvme"],
+        gib(&e["enter_free_bytes"]), gib(&e["exit_free_bytes"]), e["regrows"], e["regrown"], gib(&e["regrow_floor_bytes"])
     )
 }
 
@@ -856,6 +894,10 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{tag} wall {wall:.3} s (generate call)");
             let m_rep = machine(&tiers);
             println!("glm5_run machine after rep {rep}: {}", machine_line(&m_rep));
+            let arena_rep = arena_json(&tiers);
+            if !arena_rep.is_null() {
+                println!("glm5_run arena after rep {rep}: {}", arena_line(&arena_rep));
+            }
             doc["reps_detail"].as_array_mut().expect("reps array").push(json!({
                 "rep": rep, "cache": state, "wall_s": wall, "ids": out.ids, "controller": controller_json(&ctl), "prompt_seed": seed, "eos_at": eos_at, "sweep_aggregate_tok_s": sweep_agg,
                 "prefill": { "timing": timing_json(&pre, Some(ttft)), "counters": counters_json(&pre, rb), "layers": layers_json(&pre, first_moe),
@@ -865,6 +907,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 "rows": rows.iter().map(|x| json!({ "pos": x.r.pos, "prompt": x.r.prompt, "next": x.r.next, "secs": x.r.secs, "at_s": x.at,
                     "nvme_reads": x.r.nvme_reads, "nvme_bytes": x.r.nvme_bytes, "rows": x.r.rows, "routing_syncs": x.r.routing_syncs, "sub_batches": x.r.sub_batches })).collect::<Vec<_>>(),
                 "machine": m_rep,
+                "arena": arena_rep,
             }));
             all_ids.push(out.ids);
             per_rep.push((pre, dec, ttft, wall));
@@ -1004,6 +1047,9 @@ mod tests {
         assert_eq!(c["zero_copy_gb_per_token"], 4.0);
         assert_eq!(c["host_dram_to_gpu_gb_per_token"], 12.0);
         assert_eq!((c["promotions_per_token"].as_f64(), c["evictions_per_token"].as_f64()), (Some(2.0), Some(2.0)));
+        assert_eq!((c["nvme_demand_reads_per_token"].as_f64(), c["nvme_speculative_reads_per_token"].as_f64(), c["nvme_records_per_token"].as_f64()), (Some(8.0), Some(0.0), Some(8.0)));
+        let into_vram = pre.total_moves().stage_to_vram as f64 / pre.tokens as f64;
+        assert_eq!(c["h2d_promotion_records_per_token"].as_f64(), Some(into_vram));
         assert_eq!((c["prefetch"]["mode"].as_str(), c["prefetch"]["issued"].as_u64(), c["prefetch"]["demand_misses_uncovered"].as_u64()), (Some("none"), Some(0), Some(24)));
         assert_eq!(c["hit_rate"]["nvme"], 0.5);
         let d = counters_json(&dec, 1);

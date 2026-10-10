@@ -391,3 +391,35 @@ the selection; `--cells all` has 18 distinct C.
 Each rule removed alone turns a test red (checked 2026-10-09): tie order, prefetch reads counted, buffer dropped,
 seed never evicted, resident not proposed, floor(s x C), table on generated positions, fold statistics, held-out
 guard, source layer, bar comparison, and the choice written first.
+
+## 9. The engine's arena against alternatives (`arena`, #188)
+
+`arena` replays decode routing through a host copy of the engine's `GlobalArena` (`engine/src/glm5_tiers.rs`, 28f459a:
+one CLOCK ring of VRAM slots and one pinned tier for all MoE layers, exclusive, pinned hits stay under
+`CROW_GLM_PINNED=zerocopy`, NVMe misses admitted into VRAM, the VRAM victim written back as the newest pinned entry,
+the oldest pinned entry dropped, warm start from `CROW_GLM_ARENA_WARM`) and through the alternatives:
+
+| policy | rule |
+|---|---|
+| `today` | the engine as above |
+| `promote` | `today` with pinned hits promoted into VRAM (`CROW_GLM_PINNED=promote`) |
+| `lfu` | `today` with the pinned victim = the lowest decayed count (half-life `--halflife` decode tokens) |
+| `tinylfu` | `lfu`, and an NVMe miss scoring no higher than that victim is read for the call only (bypass) |
+| `noadmit` | NVMe misses land in pinned (`CROW_GLM_ARENA_NOADMIT=1`) |
+| `freq` | the frequency tiers of `CROW_GLM_ARENA_FREQ=1`: pinned victim = lowest score; a routed expert enters VRAM only into a free slot or above (1 + `--margin`) x the lowest VRAM score, that expert written back; other NVMe misses are read into pinned |
+| `lru` | one LRU over VRAM + pinned (the exclusive two-tier LRU with promotion), NVMe reads only |
+| `min` | Belady's MIN with bypass over VRAM + pinned from the same warm set: the ceiling, guesses included |
+
+Scores start at `--prior-tokens` (default 0.5 x half-life / ln 2) x each expert's visits per token in the warm counts.
+Workloads: the held-out file of the corpus (generated positions decode, the rest are prompt calls that only set
+reference bits), and a run's own routing written by `CROW_GLM_ROUTE_LOG` with `--boot base:ring:chunks:chunk:handback`
+(the elastic boot: ring slots disabled, warm, the handed-back chunks written back; a sixth field `:1` regrows them
+at the prompt's end and refills them from the experts the hand-back wrote out, then the warm scores, as
+`CROW_GLM_ARENA_REGROW=1` does). With `--decode-log` the `today`
+replay is compared per token and layer with the run's `tiers v/p/n` rows. Per policy: NVMe demand and speculative
+reads per token (no guesses in the replay: speculative 0), H2D records (VRAM entries), promotions (pinned -> VRAM),
+D2H write-backs, VRAM hits, pinned-served visits, zero-copy GB (pinned-served x the measured zero-copy share 0.352 x
+9,474,048 B) and a critical-path cost per token from the decode profile of #202 (1.7 ms per demand read; zero-copy and
+promotions at 27.05 ms per 0.833 GB). Run of record: `runs/glm53-flash/cache-sim-20261010/`. Tests: `TestArena` in
+`tools/test_glm_tier_sim.py` (the engine's own CLOCK figures on its xorshift trace, hand traces of `lfu` and `freq`,
+the route-log check, MIN below every policy).
