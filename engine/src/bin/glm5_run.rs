@@ -565,6 +565,33 @@ fn machine_line(m: &Value) -> String {
     )
 }
 
+/// #188 `CROW_GLM_ARENA=global`: the VRAM slots the decode calls may use now (enabled: the ring
+/// and the handed-back elastic chunks left out), the elastic chunks live and the elastic part's
+/// counters (`ElasticStats`); `null` on the per-layer path
+fn arena_json(tiers: &ExpertTiers) -> Value {
+    let (Some(a), Some((live, all, vpl)), Some(e)) = (tiers.arena(), tiers.elastic_live(), tiers.arena_elastic_stats()) else { return Value::Null };
+    json!({
+        "vram_slots_enabled": a.enabled_vram(), "elastic_live_chunks": live, "elastic_chunks": all, "slots_per_chunk": vpl,
+        "elastic": {
+            "chunks": e.chunks, "enter": e.enter, "exit": e.exit, "realloc_fail": e.realloc_fail, "write_backs": e.write_backs,
+            "lifted": e.lifted, "lift_bytes": e.lift_bytes, "refills": e.refills, "refilled": e.refilled, "refill_nvme": e.refill_nvme,
+            "enter_free_bytes": e.enter_free_bytes, "exit_free_bytes": e.exit_free_bytes,
+            "regrows": e.regrows, "regrown": e.regrown, "regrow_floor_bytes": e.regrow_floor_bytes,
+        },
+    })
+}
+
+fn arena_line(a: &Value) -> String {
+    let e = &a["elastic"];
+    let gib = |v: &Value| v.as_u64().unwrap_or(0) as f64 / (1u64 << 30) as f64;
+    format!(
+        "VRAM slots {} ({} of {} elastic chunks x {} live); elastic enter {} exit {} realloc_fail {} write_backs {} refilled {} (NVMe {}), free VRAM at the last hand-back {:.2} GiB, at the last regrowth try {:.2} GiB; regrowths {} brought back {} chunks (floor {:.2} GiB)",
+        a["vram_slots_enabled"], a["elastic_live_chunks"], a["elastic_chunks"], a["slots_per_chunk"],
+        e["enter"], e["exit"], e["realloc_fail"], e["write_backs"], e["refilled"], e["refill_nvme"],
+        gib(&e["enter_free_bytes"]), gib(&e["exit_free_bytes"]), e["regrows"], e["regrown"], gib(&e["regrow_floor_bytes"])
+    )
+}
+
 /// HEAD of the checkout this runs in (`git rev-parse HEAD`, `-dirty` with tracked changes);
 /// the binary's own build commit is not recorded (no build script), its path and mtime are
 fn commit() -> String {
@@ -867,6 +894,10 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{tag} wall {wall:.3} s (generate call)");
             let m_rep = machine(&tiers);
             println!("glm5_run machine after rep {rep}: {}", machine_line(&m_rep));
+            let arena_rep = arena_json(&tiers);
+            if !arena_rep.is_null() {
+                println!("glm5_run arena after rep {rep}: {}", arena_line(&arena_rep));
+            }
             doc["reps_detail"].as_array_mut().expect("reps array").push(json!({
                 "rep": rep, "cache": state, "wall_s": wall, "ids": out.ids, "controller": controller_json(&ctl), "prompt_seed": seed, "eos_at": eos_at, "sweep_aggregate_tok_s": sweep_agg,
                 "prefill": { "timing": timing_json(&pre, Some(ttft)), "counters": counters_json(&pre, rb), "layers": layers_json(&pre, first_moe),
@@ -876,6 +907,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 "rows": rows.iter().map(|x| json!({ "pos": x.r.pos, "prompt": x.r.prompt, "next": x.r.next, "secs": x.r.secs, "at_s": x.at,
                     "nvme_reads": x.r.nvme_reads, "nvme_bytes": x.r.nvme_bytes, "rows": x.r.rows, "routing_syncs": x.r.routing_syncs, "sub_batches": x.r.sub_batches })).collect::<Vec<_>>(),
                 "machine": m_rep,
+                "arena": arena_rep,
             }));
             all_ids.push(out.ids);
             per_rep.push((pre, dec, ttft, wall));

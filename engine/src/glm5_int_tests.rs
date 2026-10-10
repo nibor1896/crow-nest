@@ -23,6 +23,8 @@ pub(crate) const KEYS: &[&str] = &[
     "CROW_GLM_ARENA_ELASTIC_GB",
     "CROW_GLM_ARENA_STAGE_GB",
     "CROW_GLM_ARENA_STAGE_MIN",
+    "CROW_GLM_ARENA_FREQ",
+    "CROW_GLM_ARENA_REGROW",
     "CROW_GLM_STAGE_OVERLAP",
     "CROW_GLM_PREFILL_NVPF",
     "CROW_GLM_PREFILL_NVPF_MIN_ROWS",
@@ -1053,5 +1055,125 @@ fn glm5_int_gpu_decode_rows_allocate_nothing_after_warm_up() {
         tiers.free();
         run.free();
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #188 `CROW_GLM_ARENA_REGROW`: the real card's case after setup on the synthetic model. The
+/// ARM2 measurement env + RT2 + `CROW_GLM_ARENA_FREQ=1` (prompt chunk 8192: the prompt phase
+/// borrows its scratch from the elastic part), an elastic part of 12 chunks (the arena below the
+/// model's 80 experts, so a hand-back writes experts back) and the prefill staging set at setup
+/// (as glm5_run); right after construction a ballast leaves the free VRAM 2.5 chunks under the
+/// reserve (the RTX 5090 has 1.15-1.44 GiB free after setup, the reserve is 2.5 GiB), so the
+/// prompt's hand-back pays the reserve back. Off: those chunks stay down through the decode
+/// (today). On: they grow back once at the prompt's end, as far as the free VRAM read there allows
+/// down to the free VRAM of before the prompt, and are refilled before the first decode row. From
+/// the prompt's last call to the end of the first decode row the switch reads the free VRAM no
+/// more often than today's tries, and no decode row after the first calls the driver's memory API
+/// (#202). Only where records lie changes: ids equal off/on, logits to G3 (cosine >= 0.9999; the
+/// CPU lane's combos have other bits than the GPU's, so a record served from VRAM instead of
+/// pinned changes bits by design, as in `glm5_int_gpu_the_full_template_arm_is_the_default_path`).
+#[test]
+#[ignore = "needs the GPU (most of its free VRAM as a ballast, a 2.3 GB synthetic container in the temp dir)"]
+fn glm5_int_gpu_the_prompts_chunks_grow_back_at_its_end() {
+    use crate::cuda::MemApiCounts;
+    use crate::glm5_tiers::ARENA_RESERVE_BYTES;
+    let dir = std::env::temp_dir().join(format!("crow-int-regrow-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let warm = synth_warm(&dir);
+    let s = |v: &str| v.to_string();
+    let base: Vec<(&'static str, String)> = vec![
+        ("CROW_GLM_PINNED", s("zerocopy")),
+        ("CROW_GLM_FLAGS", s("1")),
+        ("CROW_GLM_STAGER", s("1")),
+        ("CROW_GLM_ARENA", s("global")),
+        ("CROW_GLM_ARENA_WARM", warm),
+        ("CROW_GLM_ARENA_ELASTIC_GB", format!("{}", 12.0 * 3.0 * REC as f64 / (1u64 << 30) as f64)),
+        ("CROW_GLM_ARENA_STAGE_GB", s("2.6")),
+        ("CROW_GLM_ARENA_FREQ", s("1")),
+        ("CROW_GLM_CPU_LANE", s("split")),
+        ("CROW_PINNED_ALLOC", s("host")),
+        ("CROW_GLM_PREFETCH", s("1")),
+        ("CROW_GLM_PREFETCH_SIDE", s("1")),
+        ("CROW_GLM_SHARED_OVERLAP", s("1")),
+        ("CROW_GLM_HCFUSE", s("1")),
+        ("CROW_GLM_DENSE_GEMM", s("1")),
+        ("CROW_CHUNK", s("8192")),
+        ("CROW_GLM_STAGE_OVERLAP", s("1")),
+        ("CROW_GLM_MOE_TC", s("2")),
+        ("CROW_GLM_ATTN2", s("1")),
+        ("CROW_GLM_PREFILL_NVPF", s("1")),
+        ("CROW_GLM_RT2", s("1")),
+    ];
+    let g = geo8();
+    let sy = synth_model(&g, REC);
+    let (spec, _) = crate::nvme_source::glm5_record_of_container(&sy.path).unwrap();
+    let moe = MoeGeo::new(&g, spec).unwrap();
+    let mut cnq = Cnq::open_checked(&sy.path).unwrap();
+    let prompt: Vec<i64> = (0..40).map(|i| (i * 61 + 7) % 2048).collect();
+    let n = 8;
+    // (generation, live elastic chunks after it, of all, the calls of every decode row: the first
+    // one's from the prompt's last report on, the prompt's end included)
+    let mut outs: Vec<(Generated, usize, usize, Vec<MemApiCounts>)> = Vec::new();
+    unsafe {
+        let _ctx = cuda::Ctx::init();
+        for regrow in [false, true] {
+            let mut env = base.clone();
+            env.push(("CROW_GLM_ARENA_REGROW", s(if regrow { "1" } else { "0" })));
+            let _env = Env::set(&env);
+            let mut run = Glm5Run::load(&mut cnq, &g, &moe, prompt.len() + n + 1, &mut |s| eprintln!("{s}"));
+            let mut tiers = ExpertTiers::new(&cnq, &sy.path, &g, &moe, TierSizes { vram: 3, pinned: 4 }, 1, g.topk).unwrap();
+            assert_eq!(tiers.arena_config().unwrap().regrow, regrow);
+            // the prefill staging set at setup, as glm5_run allocates it (not lazily in the prompt)
+            tiers.alloc_prefill_stage(crate::glm5_tiers::prefill_stage_slots(g.topk)).unwrap();
+            let (live0, all, vpl) = tiers.elastic_live().unwrap();
+            assert!(live0 == all && all == 12, "the elastic part at construction ({live0} of {all} chunks)");
+            let cb = vpl as u64 * REC;
+            let leave = ARENA_RESERVE_BYTES - 5 * cb / 2;
+            let free = cuda::free_vram_bytes();
+            assert!(free > leave + (1 << 30), "{free} B free VRAM");
+            let mut ballast = cuda::try_alloc_zeroed("test ballast", (free - leave) as usize).unwrap();
+            let mut last = cuda::mem_api_counts();
+            let mut rows = Vec::new();
+            let mut report = |r: &crate::glm5_tiers::TokenReport| {
+                let now = cuda::mem_api_counts();
+                if !r.prompt {
+                    rows.push(now.since(&last));
+                }
+                last = now;
+            };
+            let gen = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut report).unwrap();
+            let e = tiers.arena_elastic_stats().unwrap();
+            let (live, _, _) = tiers.elastic_live().unwrap();
+            let left = tiers.arena().unwrap().enabled_vram();
+            eprintln!("glm5 int regrow {regrow}: ids {:?}, elastic {live} of {all} chunks live, {left} VRAM slots, calls per decode row {rows:?}, {e:?}", gen.ids);
+            assert!(e.enter >= 1 && e.write_backs > 0, "the prompt handed chunks back ({e:?})");
+            if regrow {
+                assert_eq!(e.regrows, 1, "one regrowth at the prompt's end ({e:?})");
+                assert_eq!(e.regrow_floor_bytes, e.enter_free_bytes.min(ARENA_RESERVE_BYTES), "the floor: the free VRAM before the hand-back");
+                let down = all - live;
+                assert!(e.regrown >= 1 && e.exit_free_bytes - e.regrown * cb >= e.regrow_floor_bytes, "never below the floor ({e:?})");
+                assert!(down == 0 || e.exit_free_bytes - e.regrown * cb < e.regrow_floor_bytes + cb, "every chunk that fits above the floor ({e:?})");
+                assert!(e.refilled > 0, "the brought-back slots refilled before the decode ({e:?})");
+            } else {
+                assert_eq!(e.regrows, 0);
+                assert!(live < all, "today: the chunks that paid the reserve back stay down ({live} of {all})");
+            }
+            for (i, c) in rows.iter().enumerate().skip(1) {
+                assert_eq!(*c, MemApiCounts::default(), "regrow {regrow}: decode row {i} called the driver's memory API");
+            }
+            cuda::free_dev(&mut ballast);
+            tiers.free();
+            run.free();
+            outs.push((gen, live, all, rows));
+        }
+    }
+    let (off, on) = (&outs[0], &outs[1]);
+    assert!(on.1 > off.1, "more elastic chunks live in decode with the regrowth ({} vs {})", on.1, off.1);
+    assert!(on.3[0].infos <= off.3[0].infos, "the regrowth reads the free VRAM no more often than today's tries ({:?} vs {:?})", on.3[0], off.3[0]);
+    assert_eq!(on.0.ids, off.0.ids, "ids");
+    let r: Vec<(f64, f64, bool)> = on.0.logits.iter().zip(&off.0.logits).map(|(p, q)| g3(q, p)).collect();
+    let cos = r.iter().map(|x| x.0).fold(1.0, f64::min);
+    eprintln!("glm5 int regrow on vs off: logits cosine min {cos:.7}, KL max {:.3e}, bits differ {:?}", r.iter().map(|x| x.1).fold(0.0, f64::max), bit_diff(&on.0.logits, &off.0.logits));
+    assert!(cos >= 0.9999, "logits cosine {cos} under G3's 0.9999");
     let _ = std::fs::remove_dir_all(&dir);
 }

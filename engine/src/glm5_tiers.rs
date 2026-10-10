@@ -902,6 +902,25 @@ pub fn elastic_chunks_for(need: u64, free: u64, cb: u64, live: usize) -> usize {
     need.saturating_add(ARENA_RESERVE_BYTES).saturating_sub(free).div_ceil(cb).min(live as u64) as usize
 }
 
+/// #188 `CROW_GLM_ARENA_REGROW`: the free VRAM the regrowth at the end of a prompt phase leaves at
+/// least, from `free` read by the phase's first hand-back (before its scratch was taken): that
+/// free VRAM, at most [`ARENA_RESERVE_BYTES`]. Above the reserve this is the reserve, as for the
+/// decode calls' regrowth ([`ExpertTiers::elastic_exit`]); below it, the free VRAM the decode had
+/// before the prompt (the elastic part was allocated at construction above the reserve, later
+/// allocations took the rest), so the chunks that only paid the reserve back come back too.
+pub fn regrow_floor(free: u64) -> u64 {
+    free.min(ARENA_RESERVE_BYTES)
+}
+
+/// #188 `CROW_GLM_ARENA_REGROW`: the handed-back elastic chunks of `cb` bytes (at most `down`)
+/// that grow back at `free` bytes of free VRAM so that at least `floor` bytes stay free
+pub fn elastic_regrow_chunks(free: u64, floor: u64, cb: u64, down: usize) -> usize {
+    if cb == 0 {
+        return 0;
+    }
+    (free.saturating_sub(floor) / cb).min(down as u64) as usize
+}
+
 /// `CROW_GLM_ARENA` elastic: the prompt phase borrows its scratch (`Glm5Run::prefill_with`) when
 /// the arena is global with an elastic part (`CROW_GLM_ARENA_ELASTIC_GB` above 0) and the prompt
 /// chunk is above the decode calls' rows; `get` reads the environment. A malformed value reads as
@@ -1009,6 +1028,11 @@ pub const ARENA_STAGE_MIN_ENV: &str = "CROW_GLM_ARENA_STAGE_MIN";
 pub const ARENA_RESERVE_BYTES: u64 = 5 << 29;
 /// #188: `1` = the frequency tiers ([`GlobalArena::set_freq`]); `0` (default) = the CLOCK / LRU arena
 pub const ARENA_FREQ_ENV: &str = "CROW_GLM_ARENA_FREQ";
+/// #188: `1` = the elastic chunks a prompt phase handed back grow back once at its end
+/// ([`ExpertTiers::decode_ready`]) down to the free VRAM the arena left before the phase's first
+/// hand-back, at most [`ARENA_RESERVE_BYTES`] ([`regrow_floor`], [`elastic_regrow_chunks`]); `0`
+/// (default) = a chunk grows back only while the free VRAM stays above the reserve
+pub const ARENA_REGROW_ENV: &str = "CROW_GLM_ARENA_REGROW";
 /// #188 frequency tiers: the scores' half-life in decode tokens (`tools/glm_tier_sim.py arena`, runs/glm53-flash/cache-sim-20261010)
 pub const FREQ_HALFLIFE_TOKENS: f64 = 64.0;
 /// #188 frequency tiers: an expert enters a full VRAM tier only above (1 + margin) x the lowest VRAM score
@@ -1027,11 +1051,13 @@ pub struct ArenaConfig {
     pub stage_min: usize,
     /// #188 `CROW_GLM_ARENA_FREQ=1`: the frequency tiers
     pub freq: bool,
+    /// #188 `CROW_GLM_ARENA_REGROW=1`: the prompt phase's hand-back grows back at its end
+    pub regrow: bool,
 }
 
 impl Default for ArenaConfig {
     fn default() -> ArenaConfig {
-        ArenaConfig { admit_max: expert_cache::ADMIT_MAX, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false }
+        ArenaConfig { admit_max: expert_cache::ADMIT_MAX, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false, regrow: false }
     }
 }
 
@@ -1083,6 +1109,11 @@ pub fn arena_config(get: &dyn Fn(&str) -> Option<String>) -> Result<ArenaConfig,
         None | Some("0") => false,
         Some("1") => true,
         Some(v) => return Err(format!("{ARENA_FREQ_ENV}={v:?}: accepted 0 (default), 1")),
+    };
+    c.regrow = match val(ARENA_REGROW_ENV).as_deref() {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(v) => return Err(format!("{ARENA_REGROW_ENV}={v:?}: accepted 0 (default), 1")),
     };
     Ok(c)
 }
@@ -2779,6 +2810,15 @@ pub struct ElasticStats {
     pub refills: u64,
     pub refilled: u64,
     pub refill_nvme: u64,
+    /// #188: the free VRAM read by the last hand-back that handed a chunk back, and by the last
+    /// regrowth try that read it ([`ExpertTiers::elastic_exit`], [`ExpertTiers::elastic_regrow`])
+    pub enter_free_bytes: u64,
+    pub exit_free_bytes: u64,
+    /// #188 `CROW_GLM_ARENA_REGROW`: regrowths at the end of a prompt phase, the chunks they
+    /// brought back, and the floor of the last one ([`regrow_floor`])
+    pub regrows: u64,
+    pub regrown: u64,
+    pub regrow_floor_bytes: u64,
 }
 
 /// the staging buffers of large prompt calls (sybil's `GLM53_EC_STAGE_GB` / `GLM53_EC_STAGE_MIN`)
@@ -3259,11 +3299,14 @@ struct ArenaDev {
     /// #202: the device-memory release epoch ([`cuda::mem_release_epoch`]) of the last
     /// [`ExpertTiers::elastic_exit`] that left a chunk down (`None` after one that left none)
     exit_refused: Option<u64>,
+    /// #188 `CROW_GLM_ARENA_REGROW`: the floor ([`regrow_floor`]) of the prompt phase whose first
+    /// hand-back set it, until its end regrows the chunks ([`ExpertTiers::decode_ready`])
+    regrow_floor: Option<u64>,
 }
 
 impl ArenaDev {
     fn new(a: GlobalArena, cfg: ArenaConfig) -> ArenaDev {
-        ArenaDev { a, cfg, chunks: Vec::new(), base_chunks: 0, ring: None, stage: None, elastic: ElasticStats::default(), refill_err: None, exit_refused: None }
+        ArenaDev { a, cfg, chunks: Vec::new(), base_chunks: 0, ring: None, stage: None, elastic: ElasticStats::default(), refill_err: None, exit_refused: None, regrow_floor: None }
     }
 
     fn reset(&mut self) {
@@ -3389,11 +3432,20 @@ impl ExpertTiers {
             return;
         }
         self.nvpf_end();
-        self.stage_end();
+        // #188 CROW_GLM_ARENA_REGROW: the end of a prompt phase that handed chunks back regrows
+        // them once (one free-VRAM read); the staged forward closes without its own try
+        let regrow = self.arena.as_ref().is_some_and(|d| d.regrow_floor.is_some());
+        if regrow {
+            self.stage_close();
+        } else {
+            self.stage_end();
+        }
         if let Some(st) = self.arena.as_mut().and_then(|d| d.stage.as_mut()) {
             st.fit = None;
         }
-        if self.arena.as_ref().is_some_and(|d| d.flex().any(|c| d.chunks[c] == 0)) {
+        if regrow {
+            self.elastic_regrow();
+        } else if self.arena.as_ref().is_some_and(|d| d.flex().any(|c| d.chunks[c] == 0)) {
             self.elastic_exit();
         }
         if let Err(e) = self.elastic_refill() {
@@ -3614,9 +3666,15 @@ impl ExpertTiers {
         let (rb, vpl, ppl, stage) = (self.rb, self.sizes.vram, self.sizes.pinned, self.stage);
         let d = self.arena.as_mut().expect("elastic_enter without the global arena");
         let mut live: Vec<usize> = d.flex().filter(|&c| d.chunks[c] != 0).collect();
-        let k = elastic_chunks_for(need, cuda::free_vram_bytes(), vpl as u64 * rb, live.len());
+        let free = cuda::free_vram_bytes();
+        let k = elastic_chunks_for(need, free, vpl as u64 * rb, live.len());
         if k == 0 {
             return Ok(());
+        }
+        d.elastic.enter_free_bytes = free;
+        // #188 CROW_GLM_ARENA_REGROW: the first hand-back of a prompt phase sets its floor
+        if d.cfg.regrow {
+            d.regrow_floor.get_or_insert(regrow_floor(free));
         }
         live.drain(..live.len() - k);
         cuda::sync();
@@ -3666,7 +3724,11 @@ impl ExpertTiers {
         let mut fits = true;
         let mut refused = false;
         for c in down {
-            fits = fits && cuda::free_vram_bytes() >= cb + ARENA_RESERVE_BYTES;
+            fits = fits && {
+                let free = cuda::free_vram_bytes();
+                d.elastic.exit_free_bytes = free;
+                free >= cb + ARENA_RESERVE_BYTES
+            };
             match fits.then(|| cuda::try_alloc_zeroed("glm5 elastic VRAM expert slots", cb as usize)) {
                 Some(Ok(p)) => {
                     d.chunks[c] = p;
@@ -3680,6 +3742,50 @@ impl ExpertTiers {
         }
         d.exit_refused = refused.then_some(epoch);
         d.elastic.exit += 1;
+    }
+
+    /// #188 `CROW_GLM_ARENA_REGROW`: the end of a prompt phase whose hand-back set a floor
+    /// ([`regrow_floor`], [`ExpertTiers::decode_ready`]): ONE read of the free VRAM, and the
+    /// handed-back chunks that fit above the floor ([`elastic_regrow_chunks`]) allocated again,
+    /// their (empty) slots enabled; [`ExpertTiers::elastic_refill`] fills them right after, on the
+    /// host thread before the first decode row is enqueued (no decode landing shares the copy
+    /// engine with it). Chunks it leaves down are counted refused as [`ExpertTiers::elastic_exit`]
+    /// counts them, and the decode calls do not read the free VRAM for them before this process
+    /// releases device memory (#202).
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn elastic_regrow(&mut self) {
+        let (rb, vpl) = (self.rb, self.sizes.vram);
+        let d = self.arena.as_mut().expect("elastic_regrow without the global arena");
+        let Some(floor) = d.regrow_floor.take() else { return };
+        let down: Vec<usize> = d.flex().filter(|&c| d.chunks[c] == 0).collect();
+        if down.is_empty() {
+            return;
+        }
+        let cb = vpl as u64 * rb;
+        let epoch = cuda::mem_release_epoch();
+        let free = cuda::free_vram_bytes();
+        let n = elastic_regrow_chunks(free, floor, cb, down.len());
+        let mut back = 0;
+        for &c in &down[..n] {
+            match cuda::try_alloc_zeroed("glm5 elastic VRAM expert slots", cb as usize) {
+                Ok(p) => {
+                    d.chunks[c] = p;
+                    d.a.enable(c * vpl..(c + 1) * vpl);
+                    back += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        let left = down.len() - back;
+        d.elastic.realloc_fail += left as u64;
+        d.exit_refused = (left > 0).then_some(epoch);
+        d.elastic.exit += 1;
+        d.elastic.exit_free_bytes = free;
+        d.elastic.regrows += 1;
+        d.elastic.regrown += back as u64;
+        d.elastic.regrow_floor_bytes = floor;
     }
 
     /// #195 S: the VRAM slots the elastic part brought back ([`ExpertTiers::elastic_exit`],
@@ -3732,11 +3838,22 @@ impl ExpertTiers {
     /// # Safety
     /// A CUDA context is current; no launch reading a staging buffer is pending.
     unsafe fn stage_end(&mut self) {
+        if self.stage_close() {
+            self.elastic_exit();
+        }
+    }
+
+    /// [`ExpertTiers::stage_end`] without the elastic part's regrowth: `true` = a staged forward
+    /// was open and is closed now
+    ///
+    /// # Safety
+    /// As [`ExpertTiers::stage_end`].
+    unsafe fn stage_close(&mut self) -> bool {
         let rb = self.rb;
-        let Some(d) = self.arena.as_mut() else { return };
-        let Some(st) = d.stage.as_mut() else { return };
+        let Some(d) = self.arena.as_mut() else { return false };
+        let Some(st) = d.stage.as_mut() else { return false };
         if !st.in_forward {
-            return;
+            return false;
         }
         Self::stage_plan_end(st, rb);
         cuda::stream_sync(st.stream);
@@ -3749,7 +3866,7 @@ impl ExpertTiers {
                 *b = 0;
             }
         }
-        self.elastic_exit();
+        true
     }
 
     /// #196 NVPF: the read-ahead plan open at MoE layer `l` ([`PREFILL_NVPF_ENV`]): kept when the
@@ -4619,7 +4736,7 @@ mod arena_tests {
         }
         let none = |_: &str| None;
         assert_eq!(arena_config(&none).unwrap(), ArenaConfig::default());
-        assert_eq!(ArenaConfig::default(), ArenaConfig { admit_max: 64, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false });
+        assert_eq!(ArenaConfig::default(), ArenaConfig { admit_max: 64, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false, regrow: false });
         let set = |k: &str| match k {
             ARENA_ADMIT_MAX_ENV => Some("16".to_string()),
             ARENA_NOADMIT_ENV => Some("1".to_string()),
@@ -4631,7 +4748,7 @@ mod arena_tests {
             _ => None,
         };
         let c = arena_config(&set).unwrap();
-        assert_eq!(c, ArenaConfig { admit_max: 16, noadmit: true, warm: Some("w.json".into()), vring: 0, elastic_bytes: 10 << 30, stage_bytes: 5 << 29, stage_min: 256, freq: false });
+        assert_eq!(c, ArenaConfig { admit_max: 16, noadmit: true, warm: Some("w.json".into()), vring: 0, elastic_bytes: 10 << 30, stage_bytes: 5 << 29, stage_min: 256, freq: false, regrow: false });
         for (k, v) in [(ARENA_ADMIT_MAX_ENV, "x"), (ARENA_NOADMIT_ENV, "yes"), (ARENA_VRING_ENV, "-1"), (ARENA_ELASTIC_ENV, "nan"), (ARENA_STAGE_MIN_ENV, "0")] {
             let one = |q: &str| (q == k).then(|| v.to_string());
             assert!(arena_config(&one).unwrap_err().contains(k), "{k}={v}");
@@ -5004,6 +5121,37 @@ mod arena_tests {
         assert!(arena_config(&get("1")).unwrap().freq);
         assert!(!arena_config(&get("0")).unwrap().freq);
         assert!(arena_config(&get("yes")).unwrap_err().contains(ARENA_FREQ_ENV));
+    }
+
+    /// #188 `CROW_GLM_ARENA_REGROW` on the quick decode's numbers (RTX 5090, ARM2, q7-rt2-nopf):
+    /// free VRAM 1.15 GiB after setup (below the 2.5 GiB reserve: the elastic part was allocated
+    /// above it at construction, later allocations took the rest), a 64-row prompt scratch, chunks
+    /// of 44 slots x 9,474,048 B. The hand-back pays the reserve back (4 chunks); today's regrowth
+    /// needs a chunk + the reserve free and never gets it; the switch's regrowth brings all 4 back
+    /// down to the free VRAM of before the prompt and never below it.
+    #[test]
+    fn the_prompts_hand_back_grows_back_down_to_the_free_vram_before_it() {
+        let cb = 44 * 9_474_048u64;
+        let free0 = (1.15 * (1u64 << 30) as f64) as u64;
+        let k = elastic_chunks_for(100_000_000, free0, cb, 13);
+        assert_eq!(k, 4, "the hand-back pays the reserve back");
+        let free1 = free0 + k as u64 * cb;
+        assert!(free1 < cb + ARENA_RESERVE_BYTES, "today's regrowth refuses every chunk");
+        let floor = regrow_floor(free0);
+        assert_eq!(floor, free0);
+        assert_eq!(elastic_regrow_chunks(free1, floor, cb, k), k, "every chunk back");
+        assert_eq!(elastic_regrow_chunks(free1 - 1, floor, cb, k), k - 1, "never below the floor");
+        assert_eq!(elastic_regrow_chunks(floor - 1, floor, cb, k), 0);
+        // above the reserve the floor is the reserve: the decode calls' rule (a chunk + the reserve)
+        assert_eq!(regrow_floor(6 << 30), ARENA_RESERVE_BYTES);
+        assert_eq!(elastic_regrow_chunks(ARENA_RESERVE_BYTES + 2 * cb + 5, regrow_floor(6 << 30), cb, 4), 2);
+        assert_eq!(elastic_regrow_chunks(u64::MAX, 0, cb, 3), 3, "at most the chunks down");
+        assert_eq!(elastic_regrow_chunks(u64::MAX, 0, 0, 3), 0);
+        let get = |v: &'static str| move |k: &str| (k == ARENA_REGROW_ENV).then(|| v.to_string());
+        assert!(arena_config(&get("1")).unwrap().regrow);
+        assert!(!arena_config(&get("0")).unwrap().regrow);
+        assert!(!arena_config(&|_: &str| None).unwrap().regrow, "off by default");
+        assert!(arena_config(&get("on")).unwrap_err().contains(ARENA_REGROW_ENV));
     }
 
     /// #188 the frequency tiers' prior: half the decayed count each expert's warm rate settles at

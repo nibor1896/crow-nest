@@ -413,7 +413,9 @@ the oldest pinned entry dropped, warm start from `CROW_GLM_ARENA_WARM`) and thro
 Scores start at `--prior-tokens` (default 0.5 x half-life / ln 2) x each expert's visits per token in the warm counts.
 Workloads: the held-out file of the corpus (generated positions decode, the rest are prompt calls that only set
 reference bits), and a run's own routing written by `CROW_GLM_ROUTE_LOG` with `--boot base:ring:chunks:chunk:handback`
-(the elastic boot: ring slots disabled, warm, the handed-back chunks written back). With `--decode-log` the `today`
+(the elastic boot: ring slots disabled, warm, the handed-back chunks written back; a sixth field `:1` regrows them
+at the prompt's end and refills them from the experts the hand-back wrote out, then the warm scores, as
+`CROW_GLM_ARENA_REGROW=1` does). With `--decode-log` the `today`
 replay is compared per token and layer with the run's `tiers v/p/n` rows. Per policy: NVMe demand and speculative
 reads per token (no guesses in the replay: speculative 0), H2D records (VRAM entries), promotions (pinned -> VRAM),
 D2H write-backs, VRAM hits, pinned-served visits, zero-copy GB (pinned-served x the measured zero-copy share 0.352 x

@@ -1,0 +1,6 @@
+
+route log route.log: 127 decode tokens, 1 prompt positions/calls; boot (1848, 24, 13, 44, 4, 1), pinned 4956; halflife 64 tokens, margin 1, prior 46.2 tokens
+  policy     demand     spec  H2D/tok    promo  D2H/tok VRAM/tok  pin/tok ZC GB/tok   ms/tok     check
+  today       30.23     0.00    30.23     0.00    30.23    127.8    178.0     0.593     70.7    0.6342
+           check against the run's own log: NVMe 32.07 logged; per (token, layer) v/p/n cells equal 0.6342, tokens equal 0 of 127
+  freq        27.73     0.00    17.76    17.76    17.76    184.7    133.5     0.445     67.1         -

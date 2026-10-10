@@ -1081,6 +1081,29 @@ class TestArena(unittest.TestCase):
             b.step(0, ids)
         self.assertEqual(b.vram_keys(), [0], "3 > 4 x 1 is false: no promotion at margin 3")
 
+    def test_regrow_brings_the_handed_back_experts_back(self):
+        # #188 CROW_GLM_ARENA_REGROW: 4 VRAM slots warm with 0..3, 3 pinned with 4..6; slots 2-3 are a handed-back
+        # chunk: 2 and 3 are written into pinned (evicting 4 and 5), then come back into the re-enabled slots and
+        # leave pinned (the evicted ones stay out)
+        counts = np.asarray([[8.0, 7, 6, 5, 4, 3, 2, 1]])
+        score = counts.reshape(-1).tolist()
+        a = ts.EngineArena(4, 3, layers=1, experts=8)
+        a.warm(counts)
+        lent = a.disable(range(2, 4))
+        self.assertEqual((lent, a.vram_keys(), sorted(a.pinned_keys())), ([2, 3], [0, 1], [2, 3, 6]))
+        a.regrow(range(2, 4), lent, score)
+        self.assertEqual((a.vowner, sorted(a.pinned_keys()), a.dis), ([0, 1, 2, 3], [6], [False] * 4))
+        f = ts.FreqTiers(4, 3, prior=score, layers=1, experts=8)   # the pinned victim: the lowest score (6, then 5)
+        f.warm(counts)
+        f.nv = 2
+        lent = f.disable([2, 3])
+        self.assertEqual((lent, sorted(f.vram_keys()), sorted(f.pinned_keys())), ([2, 3], [0, 1], [2, 3, 4]))
+        f.regrow(4, lent, score)
+        self.assertEqual((sorted(f.vram_keys()), sorted(f.pinned_keys())), ([0, 1, 2, 3], [4]))
+        # the plan: the hand-back's experts first, then the best warm scores (ties the lower key), none busy
+        self.assertEqual(ts.arena_refill_plan([5], [1, 0, 3, 3], 3, lambda k: k == 0), [2, 3, 5])
+        self.assertEqual(ts.arena_refill_plan([5], [1, 0, 3, 3], 9, lambda k: k == 0), [2, 3, 5])
+
     def test_route_log_check_and_min_bounds_every_policy(self):
         tr = xorshift_trace(60, L, E, K)
         with tempfile.TemporaryDirectory() as d:

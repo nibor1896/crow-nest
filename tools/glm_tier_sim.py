@@ -30,7 +30,7 @@
 
   # 6. the engine's global arena (today's policy, checked against a run's own routing) against alternatives (#188;
   #    docs/glm-tier-simulation.md section 9)
-  python -I tools/glm_tier_sim.py arena --corpus <dir>/corpus.json --runs <runs> --capture <capture-ids>       [--warm <warm.json>] [--route-log <CROW_GLM_ROUTE_LOG file> --decode-log <glm5_run log> --boot 1848:24:13:44:4]       [--vram 2220 --pinned 4956] [--policies today,promote,lfu,tinylfu,noadmit,freq,lru,min] [--halflife 64]       [--margin 1] [--json <out.json>]
+  python -I tools/glm_tier_sim.py arena --corpus <dir>/corpus.json --runs <runs> --capture <capture-ids>       [--warm <warm.json>] [--route-log <CROW_GLM_ROUTE_LOG file> --decode-log <glm5_run log> --boot 1848:24:13:44:4[:1]]       [--vram 2220 --pinned 4956] [--policies today,promote,lfu,tinylfu,noadmit,freq,lru,min] [--halflife 64]       [--margin 1] [--json <out.json>]
 
 Policy per MoE layer (PREREG G1, ticket #147): the experts are ranked by their routed count over the
 GENERATED positions of the calibration files (the `G` rule of #106: frequency order, ties lower id);
@@ -1647,14 +1647,29 @@ class EngineArena:
 
     def disable(self, slots):
         """GlobalArena::disable: the slots' experts written back into pinned as the most recent (an elastic hand-back
-        or the write-back ring)"""
+        or the write-back ring); returns the experts written out, in slot order"""
         self.ep += 1
+        out = []
         for s in slots:
             self.dis[s], self.refb[s] = True, 0
             v, self.vowner[s] = self.vowner[s], -1
             if v >= 0:
                 self.vslot[v] = -1
                 self._ram_insert(v)
+                out.append(v)
+        return out
+
+    def regrow(self, slots, lent, score):
+        """#188 CROW_GLM_ARENA_REGROW: the handed-back slots enabled again at the prompt's end and refilled before the
+        first decode call (GlobalArena::enable, refill_plan, fill; ExpertTiers::elastic_refill): arena_refill_plan's
+        experts, ascending key, into the empty enabled slots lowest first; a pinned copy is freed"""
+        self.ep += 1
+        for s in slots:
+            self.dis[s], self.refb[s] = False, 0
+        free = [s for s in range(self.nv) if self.vowner[s] < 0 and not self.dis[s]]
+        for k, s in zip(arena_refill_plan(lent, score, len(free), lambda x: self.vslot[x] >= 0), free):
+            self.ram.pop(k, None)
+            self.vowner[s], self.vslot[k], self.refb[s], self.vpin[s] = k, s, 1, self.ep
 
     def vram_keys(self):
         return [k for k in self.vowner if k >= 0]
@@ -1780,12 +1795,25 @@ class FreqTiers:
         pass
 
     def disable(self, keys):
-        """an elastic hand-back of the VRAM experts `keys` (FreqTiers has no slot numbers): into pinned"""
+        """an elastic hand-back of the VRAM experts `keys` (FreqTiers has no slot numbers): into pinned; returns the
+        experts written out"""
         self.ep += 1
+        out = []
         for k in keys:
             if k in self.vset:
                 self.vset.discard(k)
                 self._ram_insert(k)
+                out.append(k)
+        return out
+
+    def regrow(self, nv, lent, score):
+        """#188 CROW_GLM_ARENA_REGROW: VRAM back to `nv` slots at the prompt's end, refilled with arena_refill_plan's
+        experts (a pinned copy freed)"""
+        self.nv = nv
+        for k in arena_refill_plan(lent, score, nv - len(self.vset), lambda x: x in self.vset):
+            self.rset.discard(k)
+            self.vset.add(k)
+            self._push(self.vheap, self.vset, k)
 
     def vram_keys(self):
         return list(self.vset)
@@ -1881,17 +1909,36 @@ def arena_make(pol, nv, nr, prior, halflife, margin):
     raise SimError("arena policy %r: one of %s" % (pol, ", ".join(ARENA_POLICIES)))
 
 
+def arena_refill_plan(lent, score, room, busy):
+    """GlobalArena::refill_plan: at most `room` experts for brought-back VRAM slots, first the ones the hand-back wrote
+    out (`lent`, in order), then the highest warm scores > 0 (ties the lower key), none `busy` (in VRAM) or taken
+    twice; ascending key (the engine fills per layer, ascending ids, lowest slot first)"""
+    by = sorted((k for k in range(len(score)) if score[k] > 0), key=lambda k: (-score[k], k))
+    out, taken = [], set()
+    for k in list(lent) + by:
+        if len(out) >= room:
+            break
+        if busy(k) or k in taken:
+            continue
+        taken.add(k)
+        out.append(k)
+    return sorted(out)
+
+
 def arena_boot(pol, counts, boot, nr, prior, halflife, margin):
     """The arena at the first decode call. boot = (V, P) slots, warmed at V; or the engine's elastic boot
-    (base, ring, chunks, chunk, handback): base + chunks x chunk VRAM slots, the last `ring` base slots disabled (the
-    write-back ring), warmed, then the last `handback` chunks disabled (handed back for the prompt scratch, written
-    back into pinned)."""
+    (base, ring, chunks, chunk, handback[, regrow]): base + chunks x chunk VRAM slots, the last `ring` base slots
+    disabled (the write-back ring), warmed, then the last `handback` chunks disabled (handed back for the prompt
+    scratch, written back into pinned); regrow 1 (#188 CROW_GLM_ARENA_REGROW) = those chunks enabled again at the
+    prompt's end and refilled from the hand-back's experts, then the warm scores (ExpertTiers::elastic_refill)."""
     if len(boot) == 2:
         a = arena_make(pol, boot[0], nr, prior, halflife, margin)
         a.warm(counts)
         return a
-    base, ring, chunks, chunk, hb = boot
+    base, ring, chunks, chunk, hb = boot[:5]
+    regrow = len(boot) > 5 and boot[5] == 1
     top = base + chunks * chunk
+    score = np.asarray(counts, float).reshape(-1).tolist()
     if pol == "freq":
         # FreqTiers has no slot numbers: the same experts the engine's hand-back writes out
         t = arena_boot("today", counts, boot[:4] + (0,), nr, prior, halflife, margin)
@@ -1899,13 +1946,17 @@ def arena_boot(pol, counts, boot, nr, prior, halflife, margin):
         a = FreqTiers(top - ring, nr, halflife, margin, prior)
         a.warm(counts)
         a.nv = top - ring - hb * chunk
-        a.disable(out)
+        lent = a.disable(out)
+        if regrow:
+            a.regrow(top - ring, lent, score)
         a.c = dict.fromkeys(ARENA_COUNTERS, 0)
         return a
     a = arena_make(pol, top, nr, prior, halflife, margin)
     a.disable(range(base - ring, base))
     a.warm(counts)
-    a.disable(range(top - hb * chunk, top))
+    lent = a.disable(range(top - hb * chunk, top))
+    if regrow:
+        a.regrow(range(top - hb * chunk, top), lent, score)
     a.c = dict.fromkeys(ARENA_COUNTERS, 0)
     return a
 
@@ -2062,8 +2113,8 @@ def arena_cmd(a):
         if counts is None:
             raise SimError("--route-log needs --warm or --corpus for the warm counts")
         boot = tuple(int(x) for x in a.boot.split(":")) if a.boot else (a.vram, nr)
-        if len(boot) not in (2, 5):
-            raise SimError("--boot base:ring:chunks:chunk:handback")
+        if len(boot) not in (2, 5, 6) or (len(boot) == 6 and boot[5] not in (0, 1)):
+            raise SimError("--boot base:ring:chunks:chunk:handback[:regrow 0|1]")
         check = arena_log_rows(a.decode_log) if a.decode_log else None
         workloads.append(("route log %s" % os.path.basename(a.route_log), arena_events_log(a.route_log), boot, check))
     if not workloads:
@@ -2221,8 +2272,9 @@ def main(argv=None):
                                   "calibration files' generated-position counts)")
     r.add_argument("--route-log", help="a run's own routing (CROW_GLM_ROUTE_LOG) to replay")
     r.add_argument("--decode-log", help="that run's glm5_run log: today's replay is checked per token and layer")
-    r.add_argument("--boot", help="base:ring:chunks:chunk:handback, the engine's elastic boot for --route-log "
-                                  "(e.g. 1848:24:13:44:4); default --vram:--pinned")
+    r.add_argument("--boot", help="base:ring:chunks:chunk:handback[:regrow], the engine's elastic boot for "
+                                  "--route-log (e.g. 1848:24:13:44:4; :1 = the handed-back chunks regrown and refilled "
+                                  "at the prompt's end, CROW_GLM_ARENA_REGROW=1); default --vram:--pinned")
     r.add_argument("--vram", type=int, default=2220, help="VRAM slots in all")
     r.add_argument("--pinned", type=int, default=4956, help="pinned slots in all")
     r.add_argument("--policies", default=",".join(ARENA_POLICIES))
