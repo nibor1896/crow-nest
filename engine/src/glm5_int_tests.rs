@@ -408,10 +408,13 @@ fn glm5_int_decode_hot_set_with_the_borrowed_prompt_scratch() {
 /// controller and its lookahead. The lane's CPU combos have other bits than the GPU's, so a
 /// comparison holds when the same experts go to the CPU: with every expert in pinned (V 0 + P 16
 /// of 16 per layer) `1` gives every pick to the CPU on every path, and `split` plans from the same
-/// heat on every path (every call counts it). Every arm gives the bits of the synchronous
-/// per-layer lane of its mode, and the CPU computed experts in every arm. Then V 3 + P 4: the
-/// controller (with LA and the prefetch) gives the bits of flags + stager with the lane on, per
-/// layer and on the global arena (same placement, same plan).
+/// heat on every path (every call counts it). Every arm without the controller gives the bits of
+/// the synchronous per-layer lane of its mode, and the CPU computed experts in every arm. Then
+/// V 3 + P 4: the controller (with LA and the prefetch) against flags + stager with the lane on,
+/// per layer and on the global arena (same placement, same plan). #202 D-C: under the controller
+/// the CPU sums its experts weighted into one row that one kernel adds behind the combine, another
+/// f32 order than the combine over every combo, so the controller's arms are held to G3 (robin
+/// 2026-10-10: accuracy, not bits): the same ids, logits cosine >= 0.9999.
 #[test]
 #[ignore = "needs the GPU (about 2 GB VRAM, a 2.3 GB synthetic container in the temp dir)"]
 fn glm5_int_gpu_the_cpu_lane_runs_with_the_arena_the_stager_and_the_controller() {
@@ -435,7 +438,10 @@ fn glm5_int_gpu_the_cpu_lane_runs_with_the_arena_the_stager_and_the_controller()
             eprintln!("glm5 int lane {mode} {}: CPU experts {}", a.name, o.lane_experts);
             assert!(o.lane_experts > 0, "{mode} {}: the CPU lane computed nothing", a.name);
         }
-        assert_bit_identical(&arms, &outs);
+        assert_bit_identical(&arms[..4], &outs[..4]);
+        for (a, o) in arms.iter().zip(&outs).skip(4) {
+            assert_g3(&format!("lane {mode} {}", a.name), o, &outs[0]);
+        }
         if mode == "1" {
             assert!(outs.iter().all(|o| o.lane_experts == outs[0].lane_experts), "every pick on the CPU on every path");
         }
@@ -454,13 +460,10 @@ fn glm5_int_gpu_the_cpu_lane_runs_with_the_arena_the_stager_and_the_controller()
             eprintln!("glm5 int lane split V3 P4 {what} {}: CPU experts {}, ids {:?}", a.name, o.lane_experts, o.gen.ids);
         }
         assert!(outs[0].lane_experts > 0, "{what}: the CPU lane computed nothing");
-        // #203: on the global arena the guesses become pinned hits, so the split hands the CPU
-        // other experts (other bits by design, #188): held to G3 there
-        if what == "global" {
-            assert_bit_identical(&arms[..2], &outs[..2]);
-            assert_g3("lane split V3 P4 global ctl+la+prefetch+overlap", &outs[2], &outs[0]);
-        } else {
-            assert_bit_identical(&arms, &outs);
+        // #202 D-C: the controller's lane row (and #203 on the global arena: the guesses become
+        // pinned hits, so the split hands the CPU other experts): held to G3
+        for (a, o) in arms.iter().zip(&outs).skip(1) {
+            assert_g3(&format!("lane split V3 P4 {what} {}", a.name), o, &outs[0]);
         }
     }
 }
@@ -554,7 +557,8 @@ fn assert_same(names: &[&str], outs: &[Out]) {
 /// - V 0 + P 16 (every expert pinned) with `CROW_GLM_CPU_LANE=split` (`CROW_PINNED_ALLOC=host`):
 ///   the lane's CPU combos have other bits than the GPU's by design (#188), so the full arm with
 ///   the lane is held against the default path with the same lane (same CPU set: same heat, no
-///   VRAM hit), at chunk 12 and row by row.
+///   VRAM hit), at chunk 12 and row by row; to G3, since under the controller the CPU sums its
+///   experts into one row added behind the combine (#202 D-C, another f32 order).
 #[test]
 #[ignore = "needs the GPU (about 3 GB VRAM, a 2.3 GB synthetic container in the temp dir)"]
 fn glm5_int_gpu_the_full_template_arm_is_the_default_path() {
@@ -576,8 +580,8 @@ fn glm5_int_gpu_the_full_template_arm_is_the_default_path() {
     let b = [("lane split", lane.clone()), ("full with the lane, without the chunk", plus(&no_chunk(&full), &lane)), ("lane split chunk 12", plus(&chunk, &lane)), ("full", plus(&full, &lane))];
     let outs = run_loaded_arms(&b, &prompt, n, TierSizes { vram: 0, pinned: 16 });
     assert!(outs.iter().all(|o| o.lane_experts > 0), "the lane ran in every arm");
-    assert_same(&["lane split V0 P16", "full with the lane, without the chunk V0 P16"], &outs[..2]);
-    assert_same(&["lane split chunk 12 V0 P16", "full V0 P16"], &outs[2..]);
+    assert_g3("full with the lane, without the chunk V0 P16", &outs[1], &outs[0]);
+    assert_g3("full V0 P16", &outs[3], &outs[2]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
