@@ -345,6 +345,10 @@ pub trait Mover {
     fn barrier(&mut self);
     fn vram_to_pinned(&mut self, v: u32, q: u32);
     fn stage_to_vram(&mut self, s: u32, v: u32);
+    /// #203 D3: the call reads expert `e` of this layer from the pinned slot an NVMe read still
+    /// writes; its moves and kernels wait until that read's landed flag reaches `landed`
+    /// (default: nothing, a mover without landed flags has no read in flight)
+    fn join(&mut self, _e: u32, _landed: u64) {}
     /// [`serve_chunk_prefill`]: sub-batch `j` of a prompt call starts its moves (default: nothing)
     fn begin_batch(&mut self, _j: usize) {}
     /// [`serve_chunk_prefill`]: the moves of the current sub-batch are all issued; the kernels
@@ -1618,6 +1622,13 @@ pub fn serve_global(a: &mut GlobalArena, l: usize, ids: &[u32], admit: bool, sta
     let before: Vec<Place> = ids.iter().map(|&e| a.place(l, e)).collect();
     let changes = a.step(l, ids, admit);
     let after: Vec<Place> = ids.iter().map(|&e| a.place(l, e)).collect();
+    // #203 D3: a selected expert whose read is still in flight (a guess read ahead) is read
+    // where it lands; everything behind waits for its landed flag (sybil's `inflight_hit`)
+    for &e in ids {
+        if let Some(v) = a.in_flight(l, e) {
+            m.join(e, v);
+        }
+    }
     let own = |k: u32| -> Result<u32, String> {
         let (kl, e) = (k as usize / n, k as usize % n);
         if kl != l {
@@ -1969,6 +1980,9 @@ impl<'a, M: Mover + Rebase<'a>> ChunkMover<'a, '_, M> {
 }
 
 impl<'a, M: Mover + Rebase<'a>> Mover for ChunkMover<'a, '_, M> {
+    fn join(&mut self, e: u32, landed: u64) {
+        self.inner.join(e, landed);
+    }
     fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
         let ppl = self.ppl;
         let chunk = |d: Dst| match d {
@@ -2151,6 +2165,71 @@ impl ArenaDev {
     fn flex(&self) -> std::ops::Range<usize> {
         self.base_chunks..self.chunks.len()
     }
+}
+
+/// #203 D2 / #209 D3, a decode call of MoE layer `l` through the global arena and the stager,
+/// after its demand reads were issued: the guess [`glm5_flags::Routed::wait_layer`] (or the
+/// controller's request) left for decoder layer `first_moe + l + 1`; each guessed expert on the
+/// NVMe goes into a pinned slot of the arena at the LRU's old end ([`GlobalArena::prefetch_admit`])
+/// and is read there right behind the call's demand (the pool's demand queue), its landed flag
+/// in the stager's row of that layer at this call's sequence number. Nothing waits: the reads
+/// are polled at the next call ([`Stager::harvest`]); a demand that finds one still in flight
+/// joins it ([`Mover::join`]). A guess for another layer is dropped.
+#[allow(clippy::too_many_arguments)]
+unsafe fn guess_into_ram(
+    pf: &mut glm5_flags::Prefetch,
+    st: &mut Stager,
+    d: &mut ArenaDev,
+    pinned: &[Pinned],
+    ppl: usize,
+    rb: u64,
+    records: &[Vec<ExpertRecord>],
+    src: &NvmeSource,
+    experts: usize,
+    first_moe: usize,
+    l: usize,
+) -> Result<(), String> {
+    let Some(h) = glm5_flags::take_hint() else { return Ok(()) };
+    let ln = l + 1;
+    if h.layer != first_moe + ln || ln >= records.len() {
+        return Ok(());
+    }
+    pf.stats.hints += 1;
+    let mut seen: Vec<u32> = Vec::with_capacity(h.ids.len());
+    for &e in &h.ids {
+        if e < 0 || e as usize >= experts || seen.contains(&(e as u32)) {
+            continue;
+        }
+        let e = e as u32;
+        seen.push(e);
+        if d.a.place(ln, e) != Place::Nvme {
+            pf.stats.resident += 1;
+            continue;
+        }
+        let Some(q) = d.a.prefetch_admit(ln, e, st.seq) else { continue };
+        // a write-back still landing in the slot goes first (as `ChunkMover::nvme`)
+        if let Some(WbRing { book, wb, .. }) = d.ring.as_mut() {
+            for r in book.pending(q, &mut |r| event_done(wb[r])) {
+                cuda::ck(sys::cuEventSynchronize(wb[r]));
+            }
+        }
+        let dst = RecordDst { gu: (pinned[q as usize / ppl].host as *mut u8).add((q as usize % ppl) * rb as usize), dn: std::ptr::null_mut() };
+        let rec = records[ln][e as usize];
+        let bytes = rec.parts(&dst).iter().map(|p| p.1.len as u64).sum::<u64>();
+        let flag = crate::nvme_source::Landed { flag: (st.landed.host as *mut u64).add(ln * experts + e as usize), value: st.seq };
+        // SAFETY: the slot is the arena's for this read (in flight: never a victim, never
+        // admitted, never read before its flag); the flag is this key's word, written only by it
+        match src.fetch_prio(&[(rec, dst)], Some(&[flag]), crate::nvme_source::ReadPriority::Demand) {
+            Ok(t) => st.flying.push((t, q)),
+            Err(err) => {
+                d.a.landed(q);
+                return Err(format!("{}: layer {} expert {e}: {err}", glm5_flags::ENV_PREFETCH, first_moe + ln));
+            }
+        }
+        pf.stats.issued += 1;
+        pf.stats.bytes += bytes;
+    }
+    Ok(())
 }
 
 impl ExpertTiers {
@@ -2469,9 +2548,11 @@ impl ExpertTiers {
             }
             Some(st) => {
                 st.settle(&self.src)?;
+                st.harvest(Some(&mut d.a))?;
                 st.seq += 1;
                 st.stats.calls += 1;
                 let row = l * experts;
+                let a0 = d.a.stats;
                 let inner = StagerMover {
                     s: st.stream,
                     vram: 0,
@@ -2489,10 +2570,9 @@ impl ExpertTiers {
                     stats: &mut st.stats,
                 };
                 let mut m = ChunkMover { inner, vram: &d.chunks, pinned: &self.pinned, vpl, ppl, rb, ring: d.ring.as_mut() };
-                let served = match self.prefetch.as_mut() {
-                    Some(pf) => serve_global(&mut d.a, l, ids, admit, self.stage_cap, &mut glm5_flags::PrefetchMover::new(&mut m, pf, &self.src, l, stage, Some(st.stream)))?,
-                    None => serve_global(&mut d.a, l, ids, admit, self.stage_cap, &mut m)?,
-                };
+                // #203: with the stager the guesses go into the arena's pinned tier (below), not
+                // the store
+                let served = serve_global(&mut d.a, l, ids, admit, self.stage_cap, &mut m)?;
                 m.settle_locs(&served.locs);
                 if self.pinned_use.cpu_lane {
                     for &(_, loc) in &served.locs {
@@ -2500,6 +2580,17 @@ impl ExpertTiers {
                             m.wait_host(q);
                         }
                     }
+                }
+                drop(m);
+                // #202 D1 / #209 D3: the next layer's guess read right behind this layer's demand
+                // (the pool's demand queue), before the answer
+                if let Some(pf) = self.prefetch.as_mut() {
+                    guess_into_ram(pf, st, d, &self.pinned, ppl, rb, &self.records, &self.src, experts, self.first_moe, l)?;
+                    let a1 = d.a.stats;
+                    pf.stats.used += a1.pf_used - a0.pf_used;
+                    pf.stats.wasted += a1.pf_wasted - a0.pf_wasted;
+                    pf.stats.joins += a1.joins - a0.joins;
+                    pf.publish_stats();
                 }
                 // as `table_staged`: the table into this layer's pinned row, up on the stager
                 let trow = (st.tables.host as *mut u64).add(row);
@@ -2536,7 +2627,7 @@ impl ExpertTiers {
             }
         }
         self.count_heat(l, sel);
-        if let Some(pf) = self.prefetch.as_mut() {
+        if let (Some(pf), None) = (self.prefetch.as_mut(), self.stager.as_ref()) {
             let a = &self.arena.as_ref().expect("table_global without the global arena").a;
             glm5_flags::prefetch_hinted(pf, &self.src, &self.records, experts, &|l, e| a.place(l, e) == Place::Nvme, self.first_moe, self.first_moe + l)?;
         }
@@ -2562,6 +2653,8 @@ impl ExpertTiers {
             self.arena_landing = Landing::new(self.pf_cap * self.rb as usize);
         }
         self.settle()?;
+        // a prompt call reads pinned slots without joining a read still in flight
+        self.drain_flying()?;
         crate::glm5_moe::lane::post(None);
         let d = self.arena.as_ref().expect("tables_for_chunk_global without the global arena");
         if d.stage.is_some() && sel.len() >= d.cfg.stage_min {
@@ -4176,6 +4269,7 @@ impl ExpertTiers {
     /// `nvme_bytes` and `moves` keep counting; the cache's own counters restart at 0.
     pub fn reset_cache(&mut self) -> Result<(), String> {
         self.settle()?;
+        self.drain_flying()?;
         if let Some(a) = self.arena.as_mut() {
             a.reset();
         }
@@ -4189,6 +4283,7 @@ impl ExpertTiers {
     /// No launch reading the store is pending.
     pub unsafe fn free(&mut self) {
         cuda::sync();
+        let _ = self.drain_flying();
         self.free_arena();
         if let Some(mut st) = self.stager.take() {
             st.free();
@@ -4262,6 +4357,9 @@ struct Stager {
     seq: u64,
     /// the NVMe tickets of earlier calls, drained at the next call, [`ExpertTiers::settle`] or free
     pending: Vec<crate::nvme_source::Ticket>,
+    /// #203: the reads of guessed records into pinned slots (ticket, global pinned slot), polled
+    /// without blocking at every call ([`Stager::harvest`]); the arena marks a slot landed then
+    flying: Vec<(crate::nvme_source::Ticket, u32)>,
     stats: StagerStats,
 }
 
@@ -4279,6 +4377,8 @@ pub struct StagerStats {
     /// flight per layer)
     pub answers: u64,
     pub inflight_at_answer: u64,
+    /// #203: waits of the stager stream on a read already in flight (a demand that joined it)
+    pub joins: u64,
 }
 
 impl Stager {
@@ -4303,6 +4403,7 @@ impl Stager {
             landed: Pinned::alloc(words),
             seq: 0,
             pending: Vec::new(),
+            flying: Vec::new(),
             stats: StagerStats::default(),
         };
         std::ptr::write_bytes(st.tables.host as *mut u8, 0, st.tables.bytes);
@@ -4313,6 +4414,39 @@ impl Stager {
 
     fn pinned_bytes(&self) -> u64 {
         (self.landing.bytes + self.tables.bytes + self.landed.bytes) as u64
+    }
+
+    /// #203: the guessed reads that have landed, without blocking: their slots marked landed in
+    /// the arena (`None`: no arena); the first failed read by name
+    fn harvest(&mut self, mut a: Option<&mut GlobalArena>) -> Result<(), String> {
+        let mut err = None;
+        self.flying.retain_mut(|(t, q)| match t.try_done() {
+            None => true,
+            Some(r) => {
+                if let Some(a) = a.as_deref_mut() {
+                    a.landed(*q);
+                }
+                if let Err(e) = r {
+                    err.get_or_insert(format!("{}: a read of a guessed record: {e}", glm5_flags::ENV_PREFETCH));
+                }
+                false
+            }
+        });
+        err.map_or(Ok(()), Err)
+    }
+
+    /// #203: every guessed read waited for (blocking), its slot marked landed
+    fn drain_flying(&mut self, src: &NvmeSource, mut a: Option<&mut GlobalArena>) -> Result<(), String> {
+        let mut err = None;
+        for (t, q) in self.flying.drain(..) {
+            if let Err(e) = src.wait(t) {
+                err.get_or_insert(format!("{}: a read of a guessed record: {e}", glm5_flags::ENV_PREFETCH));
+            }
+            if let Some(a) = a.as_deref_mut() {
+                a.landed(q);
+            }
+        }
+        err.map_or(Ok(()), Err)
     }
 
     /// every pending read's report; the first error by name
@@ -4361,6 +4495,12 @@ struct StagerMover<'a> {
 }
 
 impl Mover for StagerMover<'_> {
+    /// the stager stream waits on the in-flight read's landed flag (this layer's row), so every
+    /// copy, the table and the answer behind it come after the record
+    fn join(&mut self, e: u32, landed: u64) {
+        unsafe { cuda::ck(sys::cuStreamWaitValue64_v2(self.s, self.landed_dev + e as u64 * 8, landed, WAIT_GEQ)) };
+        self.stats.joins += 1;
+    }
     fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
         // a reader writes a pinned slot from the host: not while a queued copy still reads it
         if jobs.iter().any(|(_, d)| matches!(d, Dst::Pinned(q) if self.read_pinned.contains(q))) {
@@ -4434,7 +4574,7 @@ impl ExpertTiers {
             }
             (false, true) => {
                 cuda::sync();
-                let r = self.settle();
+                let r = self.settle().and(self.drain_flying());
                 if let Some(mut st) = self.stager.take() {
                     st.free();
                 }
@@ -4592,7 +4732,19 @@ impl ExpertTiers {
     /// after a stream sync past the last call's experts is none. A no-op with the stager off.
     pub fn settle(&mut self) -> Result<(), String> {
         match self.stager.as_mut() {
-            Some(st) => st.settle(&self.src),
+            Some(st) => {
+                st.settle(&self.src)?;
+                st.harvest(self.arena.as_mut().map(|d| &mut d.a))
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// #203: every read of a guessed record waited for (blocking) and its slot marked landed:
+    /// before the arena is reset or used by a prompt call, and before the stager goes
+    fn drain_flying(&mut self) -> Result<(), String> {
+        match self.stager.as_mut() {
+            Some(st) => st.drain_flying(&self.src, self.arena.as_mut().map(|d| &mut d.a)),
             None => Ok(()),
         }
     }
@@ -8962,5 +9114,124 @@ mod batch_env_tests {
         assert!(b3 - b2 > MlaCache::bytes(&md, 4096), "{b2} {b3}");
         // the caches scale with the rows
         assert!(batch_vram_bytes(&g, 8192, 2) > b2);
+    }
+}
+
+/// #202 / #203 / #209 on the synthetic 8-layer model (16 experts, top-8, 5 MoE layers from 3),
+/// global arena V 3 + P 4 per layer, the stager and the prefetch, a deliberately slow NVMe piece
+/// pool (1 worker, 4 KiB pieces: a 9.47 MB record takes 2,313 reads) so a read is still in flight
+/// when the host looks.
+#[cfg(test)]
+mod nvme_par_tests {
+    use super::*;
+    use crate::glm5_flags::tests::{geo8, synth_model};
+    use crate::glm5_flags::{post_hint, Hint};
+    use crate::glm5_int_tests::Env;
+
+    const REC: u64 = 9_474_048;
+
+    /// a tier store on the slow pool (`threads`, `piece_kb`) with the stager and the prefetch
+    unsafe fn slow_tiers(cnq: &Cnq, path: &str, g: &Glm5Geo, moe: &MoeGeo, threads: usize, piece_kb: usize) -> ExpertTiers {
+        let _env = Env::set(&[
+            ("CROW_GLM_ARENA", "global".to_string()),
+            ("CROW_GLM_ARENA_VRING", "0".to_string()),
+            ("CROW_NVME_POOL", "1".to_string()),
+            ("CROW_NVME_POOL_THREADS", threads.to_string()),
+            ("CROW_NVME_POOL_PIECE_KB", piece_kb.to_string()),
+        ]);
+        let mut t = ExpertTiers::new(cnq, path, g, moe, TierSizes { vram: 3, pinned: 4 }, 1, g.topk).unwrap();
+        t.set_stager(true).unwrap();
+        t.set_prefetch(true);
+        t
+    }
+
+    /// The bytes of record `e` of cache layer `l` as the container holds them (one read through
+    /// the tier store's source into a fresh pinned buffer)
+    unsafe fn record_bytes(t: &ExpertTiers, l: usize, e: u32) -> Vec<u8> {
+        let mut p = Pinned::alloc(t.rb as usize);
+        let tk = t.src.fetch(&[(t.records[l][e as usize], RecordDst { gu: p.host as *mut u8, dn: std::ptr::null_mut() })]).unwrap();
+        t.src.wait(tk).unwrap();
+        let v = std::slice::from_raw_parts(p.host as *const u8, t.rb as usize).to_vec();
+        p.free();
+        v
+    }
+
+    /// #202 D1 + #209 D3: layer l's answer (its table queued behind the moves) comes while its
+    /// own 8 misses AND the 8 guessed records of layer l + 1 are in flight together (the guess
+    /// is read right behind the demand, before the answer), and the guess sits in the pool's
+    /// demand queue directly behind the layer's demand: a demand read submitted after the call
+    /// lands only after every one of them (a prefetch queue would let it overtake them).
+    #[test]
+    #[ignore = "needs the GPU (about 1.5 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib nvme_par_tests -- --ignored --nocapture --test-threads 1"]
+    fn glm5_nvme_par_gpu_the_guess_is_in_flight_beside_the_demand_at_the_answer() {
+        let g = geo8();
+        let s = synth_model(&g, REC);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let cnq = Cnq::open_checked(&s.path).unwrap();
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut t = slow_tiers(&cnq, &s.path, &g, &moe, 1, 4);
+            let first = t.first_moe;
+            let sel: Vec<i32> = (0..8).collect();
+            post_hint(Some(Hint { layer: first + 1, ids: (8..16).collect() }));
+            t.table_for(first, &sel).unwrap();
+            let st = t.stager_stats().unwrap();
+            eprintln!("glm5 nvme par: records in flight at the answer {} (answers {}), io {:?}", st.inflight_at_answer, st.answers, t.nvme_io());
+            assert_eq!(st.answers, 1);
+            assert!(st.inflight_at_answer >= 16, "the answer saw {} records in flight: the guess of layer l + 1 was not read beside layer l's 8 misses", st.inflight_at_answer);
+            // a later demand read lands behind every read of the call
+            let mut p = Pinned::alloc(t.rb as usize);
+            let tk = t.src.fetch_prio(&[(t.records[2][0], RecordDst { gu: p.host as *mut u8, dn: std::ptr::null_mut() })], None, crate::nvme_source::ReadPriority::Demand).unwrap();
+            t.src.wait(tk).unwrap();
+            let left = t.nvme_io().1;
+            p.free();
+            cuda::sync();
+            t.free();
+            assert_eq!(left, 0, "{left} records of the call were still in flight when a later demand read landed: the guess did not queue directly behind the demand");
+        }
+    }
+
+    /// #203 D2 + D3: the guessed records go into the RAM tier; layer l + 1's demand for them,
+    /// while their reads are still in flight, joins those reads (no NVMe read of its own, a
+    /// pinned hit, the prefetch used), the device waits for them, and the table entries then
+    /// hold the container's bytes.
+    #[test]
+    #[ignore = "needs the GPU (about 1.5 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib nvme_par_tests -- --ignored --nocapture --test-threads 1"]
+    fn glm5_nvme_par_gpu_a_demand_joins_the_guessed_read_in_flight() {
+        let g = geo8();
+        let s = synth_model(&g, REC);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let cnq = Cnq::open_checked(&s.path).unwrap();
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut t = slow_tiers(&cnq, &s.path, &g, &moe, 1, 4);
+            let first = t.first_moe;
+            let guess: Vec<i32> = (8..16).collect();
+            post_hint(Some(Hint { layer: first + 1, ids: guess.clone() }));
+            t.table_for(first, &(0..8).collect::<Vec<i32>>()).unwrap();
+            let (sub0, _) = t.nvme_io();
+            let r0 = t.nvme_reads;
+            let (table, served) = t.table_for(first + 1, &guess).unwrap();
+            let (sub1, flying) = t.nvme_io();
+            let pf = t.prefetch_stats().unwrap();
+            eprintln!("glm5 nvme par join: call NVMe reads {}, drive records {} -> {sub1}, in flight {flying}, prefetch {pf:?}", t.nvme_reads - r0, sub0);
+            assert!(flying > 0, "the reads had landed before the demand came: the test means nothing");
+            assert_eq!(t.nvme_reads - r0, 0, "layer l + 1 read its guessed experts again");
+            assert_eq!(sub1, sub0, "the call submitted NVMe reads");
+            assert!(pf.joins >= 1 && pf.used == 8, "joins {} used {}", pf.joins, pf.used);
+            assert!(served.locs.iter().all(|x| matches!(x.1, Loc::Pinned(_))), "the guessed experts are pinned hits: {:?}", served.locs);
+            cuda::sync();
+            let addrs = cuda::dtoh_u64(table, g.experts);
+            let pinned: Vec<(Dev, *const u8)> = t.pinned.iter().map(|p| (p.dev, p.host as *const u8)).collect();
+            for &e in &guess {
+                let a = addrs[e as usize];
+                let (base, host) = pinned.iter().copied().find(|&(d, _)| a >= d && a < d + (t.sizes.pinned as u64) * t.rb).expect("a pinned slot");
+                let got = std::slice::from_raw_parts(host.add((a - base) as usize), t.rb as usize).to_vec();
+                assert!(got == record_bytes(&t, 1, e as u32), "expert {e}: the table's slot does not hold the record");
+            }
+            t.free();
+        }
     }
 }

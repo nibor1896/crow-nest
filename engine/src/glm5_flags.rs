@@ -797,7 +797,7 @@ impl Prefetch {
         self.shared.clone()
     }
 
-    fn publish_stats(&self) {
+    pub fn publish_stats(&self) {
         if let Ok(mut g) = self.shared.lock() {
             *g = self.stats;
         }
@@ -980,6 +980,9 @@ impl<'a> PrefetchMover<'a> {
 }
 
 impl crate::glm5_tiers::Mover for PrefetchMover<'_> {
+    fn join(&mut self, e: u32, landed: u64) {
+        self.inner.join(e, landed)
+    }
     fn nvme(&mut self, jobs: &[(u32, crate::glm5_tiers::Dst)]) -> Result<u64, String> {
         use crate::glm5_tiers::Dst;
         let mut rest = Vec::with_capacity(jobs.len());
