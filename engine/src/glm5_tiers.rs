@@ -1918,6 +1918,26 @@ impl GlobalArena {
         }
     }
 
+    /// #202 N2: the guessed read of expert `e` of layer `l` ([`GlobalArena::prefetch_admit`]) was
+    /// taken out before any byte of it was read: the expert is back on the NVMe and its pinned
+    /// slot on the free list. `false` (nothing changed) unless `e` is an unused guess in flight.
+    pub fn prefetch_cancel(&mut self, l: usize, e: u32) -> bool {
+        let k = l * self.experts + e as usize;
+        let Place::Ram(q) = self.place[k] else { return false };
+        let qi = q as usize;
+        if self.rflight[qi] == 0 || !self.rpf[qi] {
+            return false;
+        }
+        self.gen += 1;
+        self.ram_unlink(q);
+        self.rowner[qi] = NONE;
+        self.rflight[qi] = 0;
+        self.rpf[qi] = false;
+        self.place[k] = Place::Nvme;
+        self.rfree.push(q);
+        true
+    }
+
     /// CLOCK: the VRAM slot the hand stops at (skipping slots pinned in this call, clearing set
     /// reference bits), at most 2 x slots steps
     fn victim(&mut self) -> Option<usize> {
@@ -3451,7 +3471,7 @@ unsafe fn guess_into_ram(
     l: usize,
     prio: crate::nvme_source::ReadPriority,
 ) -> Result<(), String> {
-    let Some(h) = glm5_flags::take_hint() else { return Ok(()) };
+    let Some(h) = glm5_flags::take_guess(pf) else { return Ok(()) };
     let ln = l + 1;
     if h.layer != first_moe + ln || ln >= records.len() {
         return Ok(());
@@ -3497,6 +3517,35 @@ unsafe fn guess_into_ram(
         pf.stats.bytes += bytes;
     }
     Ok(())
+}
+
+/// #202 N2 (`CROW_GLM_GUESS_TRIM`), a decode call of MoE layer `l` through the global arena and
+/// the stager, before its arena step: every guessed read of layer `l` in flight whose expert the
+/// call did not select (`ids`, distinct, ascending) is taken out of its reader queue when no
+/// reader started it ([`NvmeSource::cancel`], which leaves its landed flag down: nothing waits on
+/// it, the call joins only selected experts); its pinned slot goes back to the free list
+/// ([`GlobalArena::prefetch_cancel`]) and its ticket leaves `flying`. A read deferred behind a
+/// write-back, or already being read, stays. Returns the reads dropped.
+fn drop_stale_guesses(st: &mut Stager, a: &mut GlobalArena, src: &NvmeSource, experts: usize, l: usize, ids: &[u32]) -> u64 {
+    let mut n = 0;
+    for e in 0..experts as u32 {
+        if ids.binary_search(&e).is_ok() {
+            continue;
+        }
+        let (Some(v), Place::Ram(q)) = (a.in_flight(l, e), a.place(l, e)) else { continue };
+        if !st.flying.iter().any(|f| f.1 == q) {
+            continue;
+        }
+        // SAFETY: this key's word of the stager's live landed flags
+        let flag = unsafe { (st.landed.host as *const u64).add(l * experts + e as usize) };
+        if src.cancel(flag, v) == 0 {
+            continue;
+        }
+        assert!(a.prefetch_cancel(l, e), "global arena: a cancelled guess of layer {l} expert {e} was no guess in flight");
+        st.flying.retain(|f| f.1 != q);
+        n += 1;
+    }
+    n
 }
 
 impl ExpertTiers {
@@ -4135,6 +4184,10 @@ impl ExpertTiers {
             Some(st) => {
                 st.settle(&self.src)?;
                 st.harvest(Some(&mut d.a))?;
+                // #202 N2: this layer's guessed reads it did not select leave the reader queue
+                if let Some(pf) = self.prefetch.as_mut().filter(|pf| pf.trim.is_some()) {
+                    pf.stats.dropped += drop_stale_guesses(st, &mut d.a, &self.src, experts, l, ids);
+                }
                 st.seq += 1;
                 st.stats.calls += 1;
                 let row = l * experts;
@@ -4174,7 +4227,8 @@ impl ExpertTiers {
                     landed: Vec::new(),
                     d2h: Vec::new(),
                     early,
-                    promote: self.lanes2,
+                    // #202 N1: a joined guess still queued moves up to the demand queue
+                    promote: self.lanes2 || self.src.demand_first(),
                     moved: 0,
                     written: Vec::new(),
                 };
@@ -4211,8 +4265,10 @@ impl ExpertTiers {
                 // (the pool's demand queue), before the answer
                 if let Some(pf) = self.prefetch.as_mut() {
                     // #202 lanes: the guesses behind every demand read (the pool's `Prefetch` queue)
-                    let prio = if self.lanes2 { glm5_flags::prefetch_priority(&self.src) } else { crate::nvme_source::ReadPriority::Demand };
+                    // #202 N1: the guesses behind every demand read (each reader's `Prefetch` queue)
+                    let prio = if self.lanes2 || self.src.demand_first() { glm5_flags::prefetch_priority(&self.src) } else { crate::nvme_source::ReadPriority::Demand };
                     guess_into_ram(pf, st, d, &self.pinned, ppl, rb, &self.records, &self.src, experts, self.first_moe, l, prio)?;
+                    (pf.stats.overtakes, pf.stats.promoted, _) = self.src.queue_counts();
                     let a1 = d.a.stats;
                     pf.stats.used += a1.pf_used - a0.pf_used;
                     pf.stats.wasted += a1.pf_wasted - a0.pf_wasted;
@@ -5002,6 +5058,30 @@ mod arena_tests {
         assert_eq!(c.prefetch_admit(1, 2, 1), None, "the only pinned slot was freed in this call");
         b.check().unwrap();
         c.check().unwrap();
+    }
+
+    /// #202 N2: a guess dropped before its read started leaves the arena as if it never came:
+    /// the expert back on the NVMe, its slot free (the next guess takes it), the invariants
+    /// whole; a landed guess, a resident expert and an expert on the NVMe are not cancelled
+    #[test]
+    fn n2_a_cancelled_guess_frees_its_pinned_slot() {
+        let mut a = GlobalArena::new(2, 16, 0, 4).unwrap();
+        a.step(0, &[0, 1], true);
+        let q = a.prefetch_admit(1, 5, 7).expect("a free slot");
+        let q2 = a.prefetch_admit(1, 6, 7).expect("a free slot");
+        assert!(a.prefetch_cancel(1, 5));
+        assert_eq!((a.place(1, 5), a.in_flight(1, 5)), (Place::Nvme, None));
+        a.check().unwrap();
+        assert!(!a.prefetch_cancel(1, 5), "cancelled twice");
+        assert!(!a.prefetch_cancel(0, 0), "a resident expert");
+        assert!(!a.prefetch_cancel(1, 9), "an expert on the NVMe");
+        a.landed(q2);
+        assert!(!a.prefetch_cancel(1, 6), "a landed guess");
+        assert_eq!(a.prefetch_admit(1, 8, 9), Some(q), "the freed slot is taken by the next guess");
+        assert_eq!((a.place(0, 0), a.place(0, 1)), (Place::Ram(0), Place::Ram(1)), "no resident expert was evicted");
+        a.step(1, &[8], true);
+        assert_eq!((a.stats.joins, a.stats.pf_used, a.stats.pf_wasted), (1, 1, 0));
+        a.check().unwrap();
     }
 
     #[test]
@@ -13696,6 +13776,78 @@ mod nvme_par_tests {
             cuda::sync();
             t.free();
             assert_eq!(left, 0, "{left} records of the call were still in flight when a later demand read landed: the guess did not queue directly behind the demand");
+        }
+    }
+
+    /// #202 N1 + N2 on the per-reader backend (one reader at the drive's speed,
+    /// `CROW_NVME_DEMAND_FIRST=1`): layer l's 8 misses and the guess of layer l + 1 (8 ids, the
+    /// trim's cap at 8) queue on the reader; layer l + 1 then selects 4 guessed experts and 4
+    /// others. With the trim the 4 guesses it did not select never reach the drive (dropped and
+    /// cancelled 4, back on the NVMe, the arena whole), the 4 it selected are pinned hits on their
+    /// guessed reads and their slots hold the container's bytes; without the trim all 8 guesses
+    /// are read (nothing dropped).
+    #[test]
+    #[ignore = "needs the GPU (about 1.5 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib nvme_par_tests -- --ignored --nocapture --test-threads 1"]
+    fn glm5_nvme_par_gpu_n2_unselected_guesses_never_reach_the_drive() {
+        let g = geo8();
+        let s = synth_model(&g, REC);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let cnq = Cnq::open_checked(&s.path).unwrap();
+        for trim in [true, false] {
+            unsafe {
+                let _ctx = cuda::Ctx::init();
+                let mut t = {
+                    let _env = Env::set(&[("CROW_GLM_ARENA", "global".to_string()), ("CROW_GLM_ARENA_VRING", "0".to_string())]);
+                    // (not one of `Env`'s keys: set and restored here)
+                    let old = std::env::var(crate::nvme_source::DEMAND_FIRST_ENV).ok();
+                    std::env::set_var(crate::nvme_source::DEMAND_FIRST_ENV, "1");
+                    let t = ExpertTiers::new(&cnq, &s.path, &g, &moe, TierSizes { vram: 3, pinned: 4 }, 1, g.topk);
+                    match old {
+                        Some(v) => std::env::set_var(crate::nvme_source::DEMAND_FIRST_ENV, v),
+                        None => std::env::remove_var(crate::nvme_source::DEMAND_FIRST_ENV),
+                    }
+                    t.unwrap()
+                };
+                assert!(t.src.demand_first() && t.src.pool().is_none() && t.src.readers() == 1);
+                t.set_stager(true).unwrap();
+                t.set_prefetch(true);
+                t.prefetch.as_mut().unwrap().trim = trim.then_some(8);
+                let first = t.first_moe;
+                post_hint(Some(Hint { layer: first + 1, ids: (8..16).collect() }));
+                t.table_for(first, &(0..8).collect::<Vec<i32>>()).unwrap();
+                let sel: Vec<i32> = vec![0, 1, 2, 3, 8, 9, 10, 11];
+                let (table, served) = t.table_for(first + 1, &sel).unwrap();
+                let pf = t.prefetch_stats().unwrap();
+                let (_, promoted, cancelled) = t.src.queue_counts();
+                eprintln!("glm5 nvme N2 trim {trim}: prefetch {pf:?}, promoted {promoted}, cancelled {cancelled}");
+                let a = t.arena().unwrap();
+                a.check().unwrap();
+                let unselected: Vec<Place> = (12..16).map(|e| a.place(1, e)).collect();
+                if trim {
+                    assert_eq!((pf.dropped, cancelled), (4, 4), "the unselected guesses were not taken out");
+                    assert!(unselected.iter().all(|&p| p == Place::Nvme), "{unselected:?}");
+                } else {
+                    assert_eq!((pf.dropped, cancelled), (0, 0));
+                    assert!(unselected.iter().all(|p| matches!(p, Place::Ram(_))), "{unselected:?}");
+                }
+                assert_eq!(pf.issued, 8);
+                for e in 8..12u32 {
+                    let loc = served.locs.iter().find(|x| x.0 == e).map(|x| x.1);
+                    assert!(matches!(loc, Some(Loc::Pinned(_))), "guessed expert {e} is no pinned hit: {loc:?}");
+                }
+                t.settle().unwrap();
+                cuda::sync();
+                let addrs = cuda::dtoh_u64(table, g.experts);
+                let pinned: Vec<(Dev, *const u8)> = t.pinned.iter().map(|p| (p.dev, p.host as *const u8)).collect();
+                for e in 8..12usize {
+                    let ad = addrs[e];
+                    let (base, host) = pinned.iter().copied().find(|&(d, _)| ad >= d && ad < d + (t.sizes.pinned as u64) * t.rb).expect("a pinned slot");
+                    let got = std::slice::from_raw_parts(host.add((ad - base) as usize), t.rb as usize).to_vec();
+                    assert!(got == record_bytes(&t, 1, e as u32), "trim {trim}: expert {e}: the table's slot does not hold the record");
+                }
+                t.free();
+            }
         }
     }
 

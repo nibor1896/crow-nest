@@ -46,6 +46,15 @@
 //!   demand read overtakes queued prefetch pieces (not one already being read). A record's last
 //!   piece sanitizes it and raises its landed flag; the fetch's last record completes the ticket.
 //!
+//! - #202 N1 (`CROW_NVME_DEMAND_FIRST=1`, [`DEMAND_FIRST_ENV`], off by default): the per-reader
+//!   backends get the pool's two queues. Each reader keeps a `Demand` and a `Prefetch` FIFO of
+//!   fetches and takes the demand queue's front whenever it is non-empty, so a demand fetch
+//!   overtakes every queued guess (never the fetch the reader is running); a fetch goes to the
+//!   least-loaded readers instead of always starting at reader 0; [`NvmeSource::promote`] moves a
+//!   queued guess its layer now needs into the demand queue. [`NvmeSource::cancel`] (#202 N2)
+//!   takes a queued guess out before it reaches the drive. Off, every fetch joins one FIFO per
+//!   reader from reader 0 on, as before.
+//!
 //! Not built here: the RAM tier behind the trait, and the boot wiring beyond the refusal in
 //! `boot.rs` (`CROW_NVME_TIER` together with `CROW_COLD_TIER`). The three-tier split that uses
 //! this backend is `glm5_tiers`.
@@ -527,11 +536,14 @@ pub struct NvmeConfig {
     pub backend: Option<NvmeBackend>,
     /// the piece pool; [`PoolAsk::Env`] (default) = [`POOL_ENV`], unset = off
     pub pool: PoolAsk,
+    /// #202 N1: the per-reader backends' demand-first queues; `None` (default) =
+    /// [`DEMAND_FIRST_ENV`], unset = off
+    pub demand_first: Option<bool>,
 }
 
 impl NvmeConfig {
     pub fn new(path: impl AsRef<Path>) -> Self {
-        NvmeConfig { path: path.as_ref().to_path_buf(), readers: 1, affinity: None, backend: None, pool: PoolAsk::Env }
+        NvmeConfig { path: path.as_ref().to_path_buf(), readers: 1, affinity: None, backend: None, pool: PoolAsk::Env, demand_first: None }
     }
 }
 
@@ -624,8 +636,24 @@ pub fn resolve_pool(ask: PoolAsk, on: Option<&str>, threads: Option<&str>, piece
     }
 }
 
+/// #202 N1: `1` gives the per-reader backends a `Demand` and a `Prefetch` queue per reader (a
+/// demand fetch overtakes every queued guess); unset, empty or `0` is off (the default: one FIFO
+/// per reader); anything else refused by name. No effect under the piece pool (it has its queues).
+pub const DEMAND_FIRST_ENV: &str = "CROW_NVME_DEMAND_FIRST";
+
+/// [`DEMAND_FIRST_ENV`]: the config's field if set, else the variable's value
+pub fn resolve_demand_first(field: Option<bool>, env: Option<&str>) -> Result<bool, String> {
+    match (field, env.map(str::trim)) {
+        (Some(b), _) => Ok(b),
+        (None, None) | (None, Some("")) | (None, Some("0")) => Ok(false),
+        (None, Some("1")) => Ok(true),
+        (None, Some(v)) => Err(format!("{DEMAND_FIRST_ENV}={v:?}: 1 puts demand reads ahead of queued guesses, unset/empty/0 leaves one FIFO per reader")),
+    }
+}
+
 /// Which queue a fetch's pieces join. The piece pool serves every queued `Demand` piece before
-/// any `Prefetch` piece; the per-reader backends have one FIFO per reader and ignore it.
+/// any `Prefetch` piece; the per-reader backends have one FIFO per reader and ignore it, unless
+/// [`DEMAND_FIRST_ENV`] gives them the same two queues per reader.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReadPriority {
     #[default]
@@ -647,11 +675,80 @@ struct Batch {
     reply: mpsc::Sender<Result<FetchReport, String>>,
 }
 
+/// One reader's queues: `hi` every fetch (off) or the `Demand` fetches (#202 N1), `lo` the
+/// `Prefetch` fetches (N1 only); the reader takes `hi`'s front whenever there is one.
+#[derive(Default)]
+struct ReaderQueue {
+    hi: VecDeque<Batch>,
+    lo: VecDeque<Batch>,
+    /// the reader is running a fetch
+    running: bool,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct ReaderShared {
+    q: Mutex<ReaderQueue>,
+    cv: Condvar,
+}
+
+impl ReaderShared {
+    /// queue `b` (`lo`: in the `Prefetch` queue); `Ok(true)` when it is a demand fetch queued
+    /// while a guess waits (it goes ahead of it); `Err` once the reader is closed
+    fn push(&self, b: Batch, lo: bool) -> Result<bool, ()> {
+        let mut q = self.q.lock().unwrap();
+        if q.closed {
+            return Err(());
+        }
+        let ahead = !lo && !q.lo.is_empty();
+        if lo {
+            q.lo.push_back(b);
+        } else {
+            q.hi.push_back(b);
+        }
+        drop(q);
+        self.cv.notify_one();
+        Ok(ahead)
+    }
+
+    /// the reader's next fetch: `hi`'s front, else `lo`'s; `None` once closed and both are empty
+    fn next(&self) -> Option<Batch> {
+        let mut q = self.q.lock().unwrap();
+        loop {
+            if let Some(b) = q.hi.pop_front().or_else(|| q.lo.pop_front()) {
+                q.running = true;
+                return Some(b);
+            }
+            if q.closed {
+                return None;
+            }
+            q = self.cv.wait(q).unwrap();
+        }
+    }
+
+    /// the reader finished its fetch
+    fn done(&self) {
+        self.q.lock().unwrap().running = false;
+    }
+
+    /// queued + running fetches
+    fn load(&self) -> usize {
+        let q = self.q.lock().unwrap();
+        q.hi.len() + q.lo.len() + q.running as usize
+    }
+}
+
 /// The records a source was asked to read and those not landed yet (#202: records in flight)
 #[derive(Debug, Default)]
 struct IoCount {
     submitted: AtomicU64,
     in_flight: AtomicU64,
+    /// #202 N1: demand fetches queued while a guess waited in their reader's queue (they went
+    /// ahead of it) and guessed records moved up to the demand queue; N2: queued guessed records
+    /// taken out before any read
+    overtakes: AtomicU64,
+    promoted: AtomicU64,
+    cancelled: AtomicU64,
 }
 
 impl IoCount {
@@ -662,7 +759,10 @@ impl IoCount {
 
 /// The NVMe backend: `readers` threads, one container handle each, or the piece pool.
 pub struct NvmeSource {
-    tx: Vec<mpsc::Sender<Batch>>,
+    /// the readers' queues, one per reader (empty under the piece pool)
+    rq: Vec<Arc<ReaderShared>>,
+    /// #202 N1: two queues per reader ([`DEMAND_FIRST_ENV`])
+    demand_first: bool,
     threads: Vec<std::thread::JoinHandle<()>>,
     backend: NvmeBackend,
     pool: Option<Pool>,
@@ -678,6 +778,7 @@ impl NvmeSource {
         let backend = resolve_backend(cfg.backend, std::env::var(BACKEND_ENV).ok().as_deref())?;
         let env = |k: &str| std::env::var(k).ok();
         let pool = resolve_pool(cfg.pool, env(POOL_ENV).as_deref(), env(POOL_THREADS_ENV).as_deref(), env(POOL_PIECE_KB_ENV).as_deref())?;
+        let demand_first = resolve_demand_first(cfg.demand_first, env(DEMAND_FIRST_ENV).as_deref())?;
         if let Some(a) = &cfg.affinity {
             if a.is_empty() {
                 return Err("NVMe tier: empty affinity list".into());
@@ -691,19 +792,21 @@ impl NvmeSource {
             }
             let io = Arc::new(IoCount::default());
             let p = Pool::open(&cfg.path, pc, cfg.affinity.as_deref(), io.clone())?;
-            return Ok(NvmeSource { tx: Vec::new(), threads: Vec::new(), backend, pool: Some(p), io });
+            return Ok(NvmeSource { rq: Vec::new(), demand_first: false, threads: Vec::new(), backend, pool: Some(p), io });
         }
         if cfg.readers == 0 || cfg.readers > MAX_IN_FLIGHT {
             return Err(format!("NVMe tier: readers {} outside 1..={MAX_IN_FLIGHT}", cfg.readers));
         }
-        let mut tx = Vec::new();
-        let mut threads = Vec::new();
         let io = Arc::new(IoCount::default());
+        // built up in place: a failure below drops it, which closes the queues and joins the
+        // readers already started
+        let mut src = NvmeSource { rq: Vec::new(), demand_first, threads: Vec::new(), backend, pool: None, io: io.clone() };
         for i in 0..cfg.readers {
             let count = io.clone();
             let cpu = cfg.affinity.as_ref().map(|a| a[i % a.len()]);
             let mut reader = Reader::open(&cfg.path, backend)?;
-            let (btx, brx) = mpsc::channel::<Batch>();
+            let sh = Arc::new(ReaderShared::default());
+            let brx = sh.clone();
             let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
             let h = std::thread::Builder::new()
                 .name(format!("nvme-reader-{i}"))
@@ -715,25 +818,27 @@ impl NvmeSource {
                         }
                     }
                     let _ = ready_tx.send(Ok(()));
-                    while let Ok(b) = brx.recv() {
+                    // off: one FIFO (`hi`), as the former channel; #202 N1: `hi` before `lo`
+                    while let Some(b) = brx.next() {
                         let r = reader.run(&b.jobs);
                         // SAFETY: `fetch_landed`'s contract: every flag is a live u64 until the
                         // ticket is waited on, which cannot happen before the reply below
                         unsafe { raise_landed(&b.jobs) };
                         count.landed(b.jobs.len());
+                        brx.done();
                         let _ = b.reply.send(r);
                     }
                 })
                 .map_err(|e| format!("NVMe tier: spawning reader {i}: {e}"))?;
+            src.rq.push(sh);
+            src.threads.push(h);
             match ready_rx.recv() {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return Err(e),
                 Err(_) => return Err(format!("NVMe tier: reader {i} died at start")),
             }
-            tx.push(btx);
-            threads.push(h);
         }
-        Ok(NvmeSource { tx, threads, backend, pool: None, io })
+        Ok(src)
     }
 
     /// #202: records asked for since the source opened (every fetch, demand and prefetch)
@@ -751,8 +856,19 @@ impl NvmeSource {
     pub fn readers(&self) -> usize {
         match &self.pool {
             Some(p) => p.cfg.threads,
-            None => self.tx.len(),
+            None => self.rq.len(),
         }
+    }
+
+    /// #202 N1: the per-reader backends run demand-first queues ([`DEMAND_FIRST_ENV`])
+    pub fn demand_first(&self) -> bool {
+        self.demand_first
+    }
+
+    /// #202 N1 / N2: (demand fetches that went ahead of a queued guess, guessed records moved up
+    /// to the demand queue, queued guessed records cancelled) since the source opened
+    pub fn queue_counts(&self) -> (u64, u64, u64) {
+        (self.io.overtakes.load(Ordering::Acquire), self.io.promoted.load(Ordering::Acquire), self.io.cancelled.load(Ordering::Acquire))
     }
 
     /// the piece pool's shape, `None` = the per-reader backends
@@ -779,9 +895,27 @@ impl NvmeSource {
 
     /// #202 lanes: the record whose landed flag is `flag` is needed now: its `Prefetch` pieces
     /// still queued move to the back of the `Demand` queue (in their order). Returns the pieces
-    /// moved (0 on the per-reader backends, or when none is queued).
+    /// moved (0 when none is queued). #202 N1: on the per-reader backends with
+    /// [`DEMAND_FIRST_ENV`] the queued `Prefetch` fetches whose every record has that flag move
+    /// to the back of their reader's `Demand` queue (returns their records; 0 without the switch).
     pub fn promote(&self, flag: *const u64) -> usize {
-        let Some(p) = &self.pool else { return 0 };
+        let Some(p) = &self.pool else {
+            let mine = |b: &Batch| !b.jobs.is_empty() && b.jobs.iter().all(|j| j.landed.is_some_and(|l| std::ptr::eq(l.flag as *const u64, flag)));
+            let mut n = 0;
+            for sh in self.rq.iter().filter(|_| self.demand_first) {
+                let mut q = sh.q.lock().unwrap();
+                if !q.lo.iter().any(mine) {
+                    continue;
+                }
+                let lo = std::mem::take(&mut q.lo);
+                let (up, keep): (VecDeque<Batch>, VecDeque<Batch>) = lo.into_iter().partition(mine);
+                n += up.iter().map(|b| b.jobs.len()).sum::<usize>();
+                q.lo = keep;
+                q.hi.extend(up);
+            }
+            self.io.promoted.fetch_add(n as u64, Ordering::AcqRel);
+            return n;
+        };
         let mut q = p.shared.q.lock().unwrap();
         let mine = |x: &Piece| x.rec.job.landed.is_some_and(|l| std::ptr::eq(l.flag as *const u64, flag));
         if !q.lo.iter().any(mine) {
@@ -798,9 +932,42 @@ impl NvmeSource {
     }
 }
 
+impl NvmeSource {
+    /// #202 N2: the guessed read whose landed flag is `flag` at `value` is no longer wanted. When
+    /// it is still queued as a fetch of its own (every record with that flag and value) and no
+    /// reader has started it, it leaves the queue, its ticket completes with no record read (no
+    /// byte written, the flag NOT raised: nothing may wait on it) and this returns the records
+    /// taken out; else 0 (being read or read, not found, or the piece pool).
+    pub fn cancel(&self, flag: *const u64, value: u64) -> usize {
+        let mine = |b: &Batch| !b.jobs.is_empty() && b.jobs.iter().all(|j| j.landed.is_some_and(|l| std::ptr::eq(l.flag as *const u64, flag) && l.value == value));
+        for sh in &self.rq {
+            let b = {
+                let mut q = sh.q.lock().unwrap();
+                match (q.lo.iter().position(mine), q.hi.iter().position(mine)) {
+                    (Some(i), _) => q.lo.remove(i),
+                    (None, Some(i)) => q.hi.remove(i),
+                    (None, None) => None,
+                }
+            };
+            if let Some(b) = b {
+                let n = b.jobs.len();
+                self.io.landed(n);
+                self.io.cancelled.fetch_add(n as u64, Ordering::AcqRel);
+                let _ = b.reply.send(Ok(FetchReport::default()));
+                return n;
+            }
+        }
+        0
+    }
+}
+
 impl Drop for NvmeSource {
     fn drop(&mut self) {
-        self.tx.clear(); // closes every channel: the readers fall out of `recv`
+        // the readers drain their queues before they leave: an outstanding ticket still completes
+        for sh in &self.rq {
+            sh.q.lock().unwrap().closed = true;
+            sh.cv.notify_all();
+        }
         for h in self.threads.drain(..) {
             let _ = h.join();
         }
@@ -880,16 +1047,25 @@ impl NvmeSource {
         if let Some(p) = &self.pool {
             return Ok(p.submit(jobs, landed, prio));
         }
-        let _ = prio; // one FIFO per reader
-        let n = self.tx.len().min(jobs.len());
+        let n = self.rq.len().min(jobs.len());
+        // off: one FIFO per reader, the records dealt from reader 0 on; #202 N1: from the least
+        // loaded reader on (queued + running fetches; ties to the lower index)
+        let mut order: Vec<usize> = (0..self.rq.len()).collect();
+        if self.demand_first && self.rq.len() > 1 {
+            order.sort_by_key(|&i| self.rq[i].load());
+        }
         let mut share: Vec<Vec<Job>> = (0..n).map(|_| Vec::new()).collect();
         for (k, (rec, dst)) in jobs.iter().enumerate() {
             share[k % n].push(Job { rec: *rec, dst: *dst, landed: landed.map(|l| l[k]) });
         }
+        let lo = self.demand_first && prio == ReadPriority::Prefetch;
         let mut parts = Vec::new();
-        for (i, jobs) in share.into_iter().enumerate() {
+        for (k, jobs) in share.into_iter().enumerate() {
+            let i = order[k];
             let (reply, rx) = mpsc::channel();
-            self.tx[i].send(Batch { jobs, reply }).map_err(|_| format!("NVMe tier: reader {i} is gone"))?;
+            if self.rq[i].push(Batch { jobs, reply }, lo).map_err(|_| format!("NVMe tier: reader {i} is gone"))? {
+                self.io.overtakes.fetch_add(1, Ordering::AcqRel);
+            }
             parts.push(rx);
         }
         Ok(Ticket::new(parts))
@@ -2294,6 +2470,175 @@ mod tests {
         }
         assert_eq!(six, 0, "record 6 landed before the promoted record 7");
         assert_eq!(src.promote(&flags[7]), 0);
+    }
+
+    /// #202 N1: the per-reader backend with `demand_first` (`Some`, the variable ignored), one
+    /// reader, the pool off
+    fn reader_cfg(path: &Path, demand_first: bool) -> NvmeConfig {
+        let mut cfg = NvmeConfig::new(path);
+        cfg.pool = PoolAsk::Off;
+        cfg.demand_first = Some(demand_first);
+        cfg
+    }
+
+    /// 8 guessed records of 1 MiB, each its own `Prefetch` fetch with its own landed flag at
+    /// `value` (as the stager's guesses): the tickets, the buffers and the flags
+    #[allow(clippy::type_complexity)]
+    fn queue_guesses(src: &NvmeSource, value: u64) -> (Vec<Ticket>, Vec<Aligned>, Box<[u64; 8]>) {
+        let bufs: Vec<Aligned> = (0..8).map(|_| Aligned::new(1 << 20)).collect();
+        let flags = Box::new([0u64; 8]);
+        let tickets = (0..8)
+            .map(|k| {
+                let rec = pool_rec(k as u32, (k as u64) << 20, 1 << 20);
+                let landed = Landed { flag: &flags[k] as *const u64 as *mut u64, value };
+                unsafe { src.fetch_prio(&[(rec, RecordDst { gu: bufs[k].p, dn: std::ptr::null_mut() })], Some(&[landed]), ReadPriority::Prefetch) }.unwrap()
+            })
+            .collect();
+        (tickets, bufs, flags)
+    }
+
+    /// #202 N1: unset, empty and `0` are off, `1` on, the config's field wins, anything else
+    /// refused by name
+    #[test]
+    fn demand_first_is_off_unless_asked_and_bad_values_are_refused_by_name() {
+        assert_eq!(NvmeConfig::new("x").demand_first, None);
+        for off in [None, Some(""), Some("0"), Some(" 0 ")] {
+            assert_eq!(resolve_demand_first(None, off), Ok(false));
+        }
+        assert_eq!(resolve_demand_first(None, Some("1")), Ok(true));
+        assert_eq!(resolve_demand_first(Some(false), Some("1")), Ok(false));
+        assert_eq!(resolve_demand_first(Some(true), Some("yes")), Ok(true));
+        let e = resolve_demand_first(None, Some("yes")).unwrap_err();
+        assert!(e.contains(DEMAND_FIRST_ENV) && e.contains("yes"), "{e}");
+    }
+
+    /// #202 N1, the queue order on one reader: 8 guessed records queued as `Prefetch` fetches,
+    /// then one demand fetch. With `demand_first` the demand completes while the last guess has
+    /// not landed (it overtook the queued guesses, counted once); off, the demand waits behind
+    /// every guess (one FIFO: the last guess's flag is up when the demand completes) and nothing
+    /// is counted. Every byte is the file's.
+    #[test]
+    fn n1_a_demand_read_overtakes_queued_guesses_on_one_reader() {
+        const LEN: usize = 16 << 20;
+        let (f, want) = pool_raw_file("n1order", LEN);
+        for on in [true, false] {
+            let src = NvmeSource::open(&reader_cfg(&f.path, on)).unwrap();
+            assert_eq!((src.demand_first(), src.readers(), src.pool()), (on, 1, None));
+            let (tickets, bufs, flags) = queue_guesses(&src, 3);
+            let b = Aligned::new(8192);
+            let d = pool_rec(99, 12 << 20, 8192);
+            let td = unsafe { src.fetch_prio(&[(d, RecordDst { gu: b.p, dn: std::ptr::null_mut() })], None, ReadPriority::Demand) }.unwrap();
+            src.wait(td).unwrap();
+            let last = unsafe { std::ptr::read_volatile(&flags[7]) };
+            assert!(b.bytes() == &want[12 << 20..(12 << 20) + 8192]);
+            for t in tickets {
+                assert_eq!(src.wait(t).unwrap().records, 1);
+            }
+            for (k, buf) in bufs.iter().enumerate() {
+                assert!(buf.bytes() == &want[k << 20..(k + 1) << 20], "on {on}: guess {k}");
+            }
+            assert_eq!(last == 0, on, "on {on}: the last guess had {}landed when the demand read completed", if last == 0 { "not " } else { "" });
+            assert_eq!(src.queue_counts(), (on as u64, 0, 0), "on {on}");
+            assert_eq!(src.records_in_flight(), 0);
+        }
+    }
+
+    /// #202 N1: on one reader with `demand_first`, `promote` moves a queued guess into the demand
+    /// queue: the last of 8 guesses lands while the 7th has not; a second promote moves nothing;
+    /// off, promote moves nothing (one FIFO)
+    #[test]
+    fn n1_promote_moves_a_queued_guess_ahead_on_one_reader() {
+        const LEN: usize = 16 << 20;
+        let (f, want) = pool_raw_file("n1promote", LEN);
+        let src = NvmeSource::open(&reader_cfg(&f.path, true)).unwrap();
+        let (tickets, bufs, flags) = queue_guesses(&src, 1);
+        assert_eq!(src.promote(&flags[7]), 1, "guess 7 was not queued");
+        let t0 = std::time::Instant::now();
+        while unsafe { std::ptr::read_volatile(&flags[7]) } == 0 {
+            assert!(t0.elapsed().as_secs() < 30);
+            std::hint::spin_loop();
+        }
+        let six = unsafe { std::ptr::read_volatile(&flags[6]) };
+        for t in tickets {
+            src.wait(t).unwrap();
+        }
+        for (k, buf) in bufs.iter().enumerate() {
+            assert!(buf.bytes() == &want[k << 20..(k + 1) << 20], "guess {k}");
+        }
+        assert_eq!(six, 0, "guess 6 landed before the promoted guess 7");
+        assert_eq!(src.promote(&flags[7]), 0);
+        assert_eq!(src.queue_counts().1, 1);
+        drop(src);
+        let off = NvmeSource::open(&reader_cfg(&f.path, false)).unwrap();
+        let (tickets, _bufs, flags) = queue_guesses(&off, 1);
+        assert_eq!(off.promote(&flags[7]), 0, "promote without the switch");
+        for t in tickets {
+            off.wait(t).unwrap();
+        }
+    }
+
+    /// #202 N2, the stale drop on one reader: of 8 queued guesses, `cancel` takes out guess 7
+    /// (still queued) once: its ticket completes with no record, its buffer stays zero, its flag
+    /// stays down and it leaves the in-flight count; a wrong value, a second cancel and a guess
+    /// already read take nothing out; every other guess lands with the file's bytes. Off
+    /// (`demand_first` false) a queued guess is taken out of the one FIFO the same way.
+    #[test]
+    fn n2_cancel_takes_a_queued_guess_out_before_the_drive() {
+        const LEN: usize = 16 << 20;
+        let (f, want) = pool_raw_file("n2cancel", LEN);
+        for on in [true, false] {
+            let src = NvmeSource::open(&reader_cfg(&f.path, on)).unwrap();
+            let (mut tickets, bufs, flags) = queue_guesses(&src, 5);
+            assert_eq!(src.cancel(&flags[7], 4), 0, "on {on}: a cancel with another value");
+            assert_eq!(src.cancel(&flags[7], 5), 1, "on {on}: guess 7 was not queued any more");
+            assert_eq!(src.cancel(&flags[7], 5), 0, "on {on}: a second cancel");
+            let r7 = src.wait(tickets.pop().unwrap()).unwrap();
+            assert_eq!(r7, FetchReport::default(), "on {on}: the cancelled ticket read something");
+            src.wait(tickets.remove(0)).unwrap();
+            assert_eq!(src.cancel(&flags[0], 5), 0, "on {on}: a guess already read");
+            for t in tickets {
+                assert_eq!(src.wait(t).unwrap().records, 1);
+            }
+            for (k, buf) in bufs.iter().enumerate().take(7) {
+                assert!(buf.bytes() == &want[k << 20..(k + 1) << 20], "on {on}: guess {k}");
+                assert_eq!(unsafe { std::ptr::read_volatile(&flags[k]) }, 5);
+            }
+            assert!(bufs[7].bytes().iter().all(|&x| x == 0), "on {on}: the cancelled guess wrote its buffer");
+            assert_eq!(unsafe { std::ptr::read_volatile(&flags[7]) }, 0, "on {on}: the cancelled guess raised its flag");
+            assert_eq!((src.records_in_flight(), src.records_submitted(), src.queue_counts().2), (0, 8, 1), "on {on}");
+        }
+    }
+
+    /// #202 N1: two readers. With `demand_first` 8 single-record guesses are spread over both
+    /// readers (the less loaded first), and a single demand read still overtakes the guesses
+    /// queued on its reader; off, every single-record fetch goes to reader 0 (reader 1 idles).
+    #[test]
+    fn n1_single_record_fetches_spread_over_two_readers() {
+        const LEN: usize = 16 << 20;
+        let (f, want) = pool_raw_file("n1two", LEN);
+        for on in [true, false] {
+            let mut cfg = reader_cfg(&f.path, on);
+            cfg.readers = 2;
+            let src = NvmeSource::open(&cfg).unwrap();
+            let (tickets, bufs, _flags) = queue_guesses(&src, 2);
+            let loads = (src.rq[0].load(), src.rq[1].load());
+            let b = Aligned::new(8192);
+            let d = pool_rec(99, 12 << 20, 8192);
+            let td = unsafe { src.fetch_prio(&[(d, RecordDst { gu: b.p, dn: std::ptr::null_mut() })], None, ReadPriority::Demand) }.unwrap();
+            src.wait(td).unwrap();
+            assert!(b.bytes() == &want[12 << 20..(12 << 20) + 8192]);
+            for t in tickets {
+                src.wait(t).unwrap();
+            }
+            for (k, buf) in bufs.iter().enumerate() {
+                assert!(buf.bytes() == &want[k << 20..(k + 1) << 20], "on {on}: guess {k}");
+            }
+            if on {
+                assert!(loads.0 >= 2 && loads.1 >= 2, "the guesses were not spread: loads {loads:?}");
+            } else {
+                assert_eq!(loads.1, 0, "off, a single-record fetch went to reader 1: loads {loads:?}");
+            }
+        }
     }
 
     /// #202 lanes bench (about a minute, writes and removes a 768 MiB temp file on the temp
