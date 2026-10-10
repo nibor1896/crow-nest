@@ -309,6 +309,10 @@ fn prefetch_json(p: &Phase, t: f64) -> Value {
         "hints": f.hints, "resident": f.resident, "issued": f.issued, "issued_bytes": f.bytes, "used": f.used, "wasted": f.wasted, "joins": f.joins, "covered": f.covered,
         "issued_per_token": f.issued as f64 / t, "used_per_token": f.used as f64 / t, "wasted_per_token": f.wasted as f64 / t, "joins_per_token": f.joins as f64 / t,
         "demand_misses_uncovered": uncovered, "demand_misses_uncovered_per_token": uncovered as f64 / t,
+        // #202 N2 (CROW_GLM_GUESS_TRIM), S (CROW_GLM_SIDE_NOJOIN), N1 (CROW_NVME_DEMAND_FIRST)
+        "capped": f.capped, "dropped": f.dropped, "capped_per_token": f.capped as f64 / t, "dropped_per_token": f.dropped as f64 / t,
+        "side_ready": f.side_ready, "side_waited": f.side_waited, "side_late": f.side_late,
+        "demand_overtakes": f.overtakes, "promoted": f.promoted, "demand_overtakes_per_token": f.overtakes as f64 / t, "promoted_per_token": f.promoted as f64 / t,
     })
 }
 

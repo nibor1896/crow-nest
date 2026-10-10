@@ -1156,9 +1156,16 @@ impl Glm5Pass {
                     }
                     Some(hook) => {
                         // CROW_GLM_PREFETCH (one row): the next layer's guess around the router
+                        // #202 S (CROW_GLM_SIDE_NOJOIN): off the controller the side guess publishes
+                        // itself and is joined behind the layer's experts (`join_late` below)
+                        let ctl_call = self.ctl.as_ref().is_some_and(|c| c.active);
                         let guess = if t == 1 { self.routed.as_mut() } else { None };
                         if let Some(r) = guess {
-                            r.predict_early(&self.kn.k, &self.kn.moe, lw.layer, self.collapsed);
+                            if ctl_call {
+                                r.predict_early(&self.kn.k, &self.kn.moe, lw.layer, self.collapsed);
+                            } else {
+                                r.predict_early_unjoined(&self.kn.k, &self.kn.moe, lw.layer, self.collapsed);
+                            }
                             p.route(&self.kn.k, &self.kn.moe, w, self.collapsed);
                             r.predict(&self.kn.k, &self.kn.moe, lw.layer, self.collapsed);
                         } else {
@@ -1224,6 +1231,11 @@ impl Glm5Pass {
                         let tb = hook(lw.layer, &ids).inspect_err(|_| p.shared_forget())?;
                         crate::glm5_graph::seam_begin(tb);
                         p.experts(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub);
+                        // #202 S: the self-published side guess read `collapsed`; joined before
+                        // the next layer overwrites it (a no-op when none is owed)
+                        if let Some(r) = self.routed.as_mut() {
+                            r.join_late();
+                        }
                     }
                 }
             }

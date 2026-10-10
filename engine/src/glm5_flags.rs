@@ -49,6 +49,23 @@
 //!   `GLM53_NV_PFSIDE`, `nv2.py` `predict_early`): the guess runs on a side stream, launched before
 //!   layer l's own router so the two overlap; the compute stream joins it before the publish. One
 //!   row only; inside a `CROW_GLM_GRAPH` capture it stays on the compute stream.
+//! - **`CROW_GLM_SIDE_NOJOIN=1`** (#202 S, with `CROW_GLM_PREFETCH_SIDE=1`; [`ENV_SIDE_NOJOIN`]):
+//!   the side guess publishes itself. Behind its router the side stream copies the guess and its
+//!   layer into its own area of the mapped block and raises its own sequence word
+//!   (`glm5_guess_publish`); the compute stream publishes the router's ids alone (`glm5_publish`)
+//!   without waiting for the side stream, and joins it only after the layer's experts are queued
+//!   ([`Routed::join_late`]: the guess's input row must not be overwritten before the guess read
+//!   it). The host reads the guess where the next layer's reads are issued ([`take_guess`]),
+//!   spinning at most [`SIDE_WAIT`] for its word, else the guess is dropped (a hint only). Not
+//!   under `CROW_GLM_CONTROLLER` (its request carries the guess) nor inside a graph capture (the
+//!   guess then runs on the compute stream as without the switch).
+//! - **`CROW_GLM_GUESS_TRIM=1`** (#202 N2, with `CROW_GLM_PREFETCH=1`; [`ENV_GUESS_TRIM`]): with
+//!   the stager on the global arena a guessed read of layer l still queued when layer l's routing
+//!   came without it is taken out of the reader queue before it reaches the drive
+//!   (`NvmeSource::cancel`; its pinned slot goes back to the arena's free list); with
+//!   [`ENV_GUESS_TRIM_K`] set a guess is also cut to its K best-scored ids (unset: no cut. The
+//!   simulation's top-3, `docs/glm-tier-simulation.md` §9 on glm-pf2, doubled the demand reads on
+//!   the real container: smoke 2026-10-10, 14.0 -> 28.5 per token).
 //! - **`CROW_GLM_SHARED_OVERLAP=1`** (needs `CROW_GLM_FLAGS=1`; the reference's `GLM53_K_OVL`,
 //!   `glm53/k_overlap.py`): in a decode call the shared expert is queued right behind the publish,
 //!   before the host's hand-off, so the GPU computes it while the host waits for the flag and plans
@@ -93,6 +110,35 @@ pub const ENV_PREFETCH_SIDE: &str = "CROW_GLM_PREFETCH_SIDE";
 pub const ENV_SHARED_OVERLAP: &str = "CROW_GLM_SHARED_OVERLAP";
 pub const ENV_CONTROLLER: &str = "CROW_GLM_CONTROLLER";
 pub const ENV_LA: &str = "CROW_GLM_LA";
+/// #202 S: `1` lets the side guess publish itself (see the module doc); unset or anything else off
+pub const ENV_SIDE_NOJOIN: &str = "CROW_GLM_SIDE_NOJOIN";
+/// #202 N2: `1` caps a guess by score and drops its stale queued reads; unset or anything else off
+pub const ENV_GUESS_TRIM: &str = "CROW_GLM_GUESS_TRIM";
+/// #202 N2: the guess's best-scored ids kept under [`ENV_GUESS_TRIM`], a whole number from 1;
+/// unset/empty = every id (no cut); anything else refused by name
+pub const ENV_GUESS_TRIM_K: &str = "CROW_GLM_GUESS_TRIM_K";
+/// #202 S: how long the host spins for a self-published side guess before it drops it
+pub const SIDE_WAIT: std::time::Duration = std::time::Duration::from_micros(500);
+
+/// `CROW_GLM_SIDE_NOJOIN=1` (the repo's `CROW_*` rule: only `1` turns it on)
+pub fn side_nojoin_on() -> bool {
+    std::env::var(ENV_SIDE_NOJOIN).ok().as_deref() == Some("1")
+}
+
+/// #202 N2: the rank cap of [`ENV_GUESS_TRIM`] from the variables' values: `None` = off; `k`
+/// unset/empty = `usize::MAX` (on, no cut); a `k` that is no whole number from 1 refused by name
+pub fn guess_trim_from(on: Option<&str>, k: Option<&str>) -> Result<Option<usize>, String> {
+    if on != Some("1") {
+        return Ok(None);
+    }
+    match k.map(str::trim) {
+        None | Some("") => Ok(Some(usize::MAX)),
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(Some(n)),
+            _ => Err(format!("{ENV_GUESS_TRIM_K}={v:?}: the guess's best-scored ids kept, a whole number from 1")),
+        },
+    }
+}
 /// #202 lanes: `1` lets the GPU experts, the CPU lane and the NVMe reads of a controlled decode
 /// layer run side by side (see [`lanes2_on`]); unset or anything else keeps the former path
 pub const ENV_LANES2: &str = "CROW_GLM_LANES2";
@@ -230,6 +276,22 @@ extern "C" __global__ void glm5_publish(const int* __restrict__ ids, const int* 
 extern "C" __global__ void glm5_pred_tag(int* tag, int v)
 {{
     if (threadIdx.x == 0) *tag = v;
+}}
+// #202 S (CROW_GLM_SIDE_NOJOIN): the side stream's own publish of its guess: the k ids and the
+// guessed layer into mapped host memory, then its own sequence word (one block)
+extern "C" __global__ void glm5_guess_publish(const int* __restrict__ pids, int k, volatile int* host_pids, volatile int* host_tag, int tag, unsigned long long* ctr, volatile unsigned long long* flag)
+{{
+    for (int j = threadIdx.x; j < k; j += blockDim.x) host_pids[j] = pids[j];
+    if (threadIdx.x == 0) *host_tag = tag;
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {{
+        const unsigned long long q = *ctr + 1;
+        *ctr = q;
+        __threadfence_system();
+        *flag = q;
+        __threadfence_system();
+    }}
 }}
 // CROW_GLM_PREFETCH: glm5_publish + the guess (k ids) and its layer tag, which goes back to -1 on
 // the device, so a later publish without a guess hands over no stale one
@@ -449,6 +511,7 @@ pub struct Kernels {
     publish: CUfunction,
     publish_pred: CUfunction,
     pred_tag: CUfunction,
+    guess_publish: CUfunction,
     ctl_publish: CUfunction,
     ctl_wait: CUfunction,
     lane_add: CUfunction,
@@ -467,6 +530,7 @@ impl Kernels {
             publish: module.get("glm5_publish"),
             publish_pred: module.get("glm5_publish_pred"),
             pred_tag: module.get("glm5_pred_tag"),
+            guess_publish: module.get("glm5_guess_publish"),
             ctl_publish: module.get("glm5_ctl_publish"),
             ctl_wait: module.get("glm5_ctl_wait"),
             lane_add: module.get("glm5_lane_add"),
@@ -490,7 +554,8 @@ impl Kernels {
 /// sequence flag (see the module doc)
 pub struct Routed {
     /// `[0]` the flag (u64), `[8]` the guess's layer (i32, prefetch), `[64..]` the ids (i32),
-    /// then the guess's `topk` ids (prefetch)
+    /// then the guess's `topk` ids (prefetch); at [`side_at`] the side guess's own publish (#202
+    /// S): its sequence word (u64), its layer (i32), its ids (i32)
     host: Pinned,
     /// device: `[0]` the publish counter (u64), `[8]` the id count (i32)
     dev: Dev,
@@ -499,6 +564,11 @@ pub struct Routed {
     publish: CUfunction,
     publish_pred: CUfunction,
     pred_tag: CUfunction,
+    guess_publish: CUfunction,
+    /// #202 S: side guesses that published themselves, and the one the next publish leaves to
+    /// the host: (guessed layer, its sequence number)
+    side_seq: u64,
+    side_pending: Option<(usize, u64)>,
     /// calls since construction, and how many of them found the flag already up on the first look
     pub calls: u64,
     pub ready_first_look: u64,
@@ -512,6 +582,11 @@ pub struct Routed {
 
 const IDS_AT: usize = 64;
 const TAG_AT: usize = 8;
+
+/// #202 S: where the side guess's own publish starts in a block of `n` ids
+fn side_at(n: usize) -> usize {
+    (IDS_AT + (n + crate::kernels::glm5_moe::MAXK) * 4).next_multiple_of(64)
+}
 
 /// `CROW_GLM_PREFETCH`: the guesses compared with the layer's own routing when it came
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -554,6 +629,13 @@ pub struct Predict {
     side: Option<(sys::CUstream, sys::CUevent, sys::CUevent)>,
     /// no side guess is waiting for the compute stream's join
     joined: bool,
+    /// #202 S (`CROW_GLM_SIDE_NOJOIN`, with the side stream): the device counter of the side
+    /// guess's own publish (0 = off); the side guess in flight published itself (the router's
+    /// publish does not wait for it); the compute stream still owes it the join behind the layer
+    /// ([`Routed::join_late`])
+    sctr: Dev,
+    unjoined: bool,
+    late: bool,
 }
 
 impl Predict {
@@ -590,6 +672,20 @@ impl Predict {
             prm_f: cuda::to_f32_dev(&[scaling, limit]),
             side: side.then(|| (cuda::stream_create_non_blocking(), cuda::event_create(), cuda::event_create())),
             joined: true,
+            sctr: 0,
+            unjoined: false,
+            late: false,
+        }
+    }
+
+    /// #202 S: the side guess may publish itself (a counter for its sequence word); a no-op
+    /// without the side stream
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn nojoin_on(&mut self) {
+        if self.side.is_some() && self.sctr == 0 {
+            self.sctr = cuda::alloc_zeroed(8);
         }
     }
 
@@ -599,15 +695,23 @@ impl Predict {
     }
 
     /// the three launches of the guess on the current stream
-    unsafe fn launch(&self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, tagk: CUfunction, layer: usize, x: Dev, (r, b): (Dev, Dev)) {
+    unsafe fn launch(&self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, tagk: CUfunction, layer: usize, x: Dev, w: (Dev, Dev)) {
+        self.launch_router(kn, gk, x, w);
+        launch_v(tagk, 1, 1, 1, 32, &[self.tag, (layer + 1) as u64]);
+    }
+
+    /// the guess's router (GEMV + selection) on the current stream
+    unsafe fn launch_router(&self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, x: Dev, (r, b): (Dev, Dev)) {
         launch_v(kn.f("gemv_bf16_b"), self.experts as u32, 1, 1, 256, &[r, x, self.logits, self.prm_kh]);
         launch_v(gk.router, 1, 1, 1, crate::kernels::glm5_moe::ROUTER_THREADS as u32, &[self.logits, b, self.ids, self.wts, self.prm_route, self.prm_f]);
-        launch_v(tagk, 1, 1, 1, 32, &[self.tag, (layer + 1) as u64]);
     }
 
     unsafe fn free(&mut self) {
         for d in [&mut self.logits, &mut self.ids, &mut self.wts, &mut self.tag, &mut self.prm_kh, &mut self.prm_route, &mut self.prm_f] {
             cuda::free_dev(d);
+        }
+        if self.sctr != 0 {
+            cuda::free_dev(&mut self.sctr);
         }
         if let Some((s, e0, e1)) = self.side.take() {
             cuda::stream_sync(s);
@@ -625,7 +729,7 @@ impl Routed {
     /// A CUDA context is current; `k` outlives this publisher.
     pub unsafe fn new(k: &Kernels, n: usize) -> Routed {
         assert!(n > 0);
-        let host = Pinned::alloc((IDS_AT + (n + crate::kernels::glm5_moe::MAXK) * 4).next_multiple_of(4096));
+        let host = Pinned::alloc((side_at(n) + 16 + crate::kernels::glm5_moe::MAXK * 4).next_multiple_of(4096));
         std::ptr::write_bytes(host.host as *mut u8, 0, host.bytes);
         let dev = cuda::alloc_named("glm5 routed-ids counter", 16);
         cuda::to_i32_into(dev + 8, &[n as i32]);
@@ -637,6 +741,9 @@ impl Routed {
             publish: k.publish,
             publish_pred: k.publish_pred,
             pred_tag: k.pred_tag,
+            guess_publish: k.guess_publish,
+            side_seq: 0,
+            side_pending: None,
             calls: 0,
             ready_first_look: 0,
             pred: None,
@@ -655,7 +762,17 @@ impl Routed {
         if let Some(mut p) = self.pred.take() {
             p.free();
         }
-        self.pred = Some(Predict::new(layers, moe, side));
+        let mut p = Predict::new(layers, moe, side);
+        // #202 S: read once here, with the side stream only
+        if side_nojoin_on() {
+            p.nojoin_on();
+        }
+        self.pred = Some(p);
+    }
+
+    /// #202 S (`CROW_GLM_SIDE_NOJOIN`): the side guess can publish itself
+    pub fn side_nojoin(&self) -> bool {
+        self.pred.as_ref().is_some_and(|p| p.sctr != 0)
     }
 
     /// the guess is on
@@ -675,22 +792,75 @@ impl Routed {
     /// # Safety
     /// `x` holds the MoE input `[hidden]` f32, written by work queued before.
     pub unsafe fn predict_early(&mut self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, layer: usize, x: Dev) {
-        let tagk = self.pred_tag;
+        self.predict_early_with(kn, gk, layer, x, false)
+    }
+
+    /// #202 S: [`Routed::predict_early`] whose side guess publishes itself when
+    /// `CROW_GLM_SIDE_NOJOIN` is on ([`Routed::side_nojoin`]): the next [`Routed::predict`] then
+    /// does not join it, the next [`Routed::publish`] publishes the router's ids alone and
+    /// [`Routed::wait_layer`] leaves the guess for [`take_guess`]; the caller joins it with
+    /// [`Routed::join_late`] once the layer's work that reads `x` is queued. Without the switch
+    /// (or in a capture, or without a next MoE layer) as [`Routed::predict_early`].
+    ///
+    /// # Safety
+    /// As [`Routed::predict_early`].
+    pub unsafe fn predict_early_unjoined(&mut self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, layer: usize, x: Dev) {
+        let on = self.side_nojoin();
+        self.predict_early_with(kn, gk, layer, x, on)
+    }
+
+    unsafe fn predict_early_with(&mut self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, layer: usize, x: Dev, unjoined: bool) {
+        let (tagk, gpub, host, sat) = (self.pred_tag, self.guess_publish, self.host.dev, side_at(self.n) as u64);
         let Some(p) = self.pred.as_mut() else { return };
         let (Some((s, e0, e1)), Some(w)) = (p.side, p.next(layer)) else { return };
         if crate::glm5_graph::capturing() {
             return;
         }
         let main = cuda::cur_stream();
+        // #202 S: a guess not joined yet (an error path skipped its late join) is joined first
+        if p.late {
+            cuda::stream_wait_event(main, e1);
+            p.late = false;
+        }
         cuda::event_record(e0, main);
         cuda::stream_wait_event(s, e0);
         cuda::set_stream(s as u64);
-        p.launch(kn, gk, tagk, layer, x, w);
+        if unjoined {
+            p.launch_router(kn, gk, x, w);
+            launch_v(gpub, 1, 1, 1, 32, &[p.ids, p.topk as u64, host + sat + 16, host + sat + 8, (layer + 1) as u64, p.sctr, host + sat]);
+        } else {
+            p.launch(kn, gk, tagk, layer, x, w);
+        }
         cuda::set_stream(main as u64);
         cuda::event_record(e1, s);
         p.joined = false;
+        p.unjoined = unjoined;
+        if unjoined {
+            // submit the side stream now: nothing on the compute stream waits for it any more
+            // (WDDM batches launches until a query or a sync)
+            cuda::stream_query(s);
+            self.side_seq += 1;
+            self.side_pending = Some((layer + 1, self.side_seq));
+        }
         self.guess.launched += 1;
         self.guess.side += 1;
+    }
+
+    /// #202 S: the compute stream's join of a self-published side guess, owed since
+    /// [`Routed::predict`] skipped it: from here on the compute stream may overwrite the guess's
+    /// input row. A no-op when none is owed.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn join_late(&mut self) {
+        let Some(p) = self.pred.as_mut() else { return };
+        // (inside a graph capture no side guess is launched; one owed from before waits for the
+        // next launch's own join)
+        if p.late && !crate::glm5_graph::capturing() {
+            let (_, _, e1) = p.side.expect("a side guess without its stream");
+            cuda::stream_wait_event(cuda::cur_stream(), e1);
+            p.late = false;
+        }
     }
 
     /// After layer `layer`'s router: the guess of layer + 1 on the current stream, or the join of
@@ -702,6 +872,13 @@ impl Routed {
     pub unsafe fn predict(&mut self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, layer: usize, x: Dev) {
         let tagk = self.pred_tag;
         let Some(p) = self.pred.as_mut() else { return };
+        if !p.joined && p.unjoined {
+            // #202 S: the side guess published itself; the join waits behind the layer
+            p.joined = true;
+            p.unjoined = false;
+            p.late = true;
+            return;
+        }
         if !p.joined {
             let (_, _, e1) = p.side.expect("a side guess without its stream");
             cuda::stream_wait_event(cuda::cur_stream(), e1);
@@ -726,7 +903,8 @@ impl Routed {
     /// A CUDA context is current; `ids` holds `n` i32 written by work queued before.
     pub unsafe fn publish(&mut self, ids: Dev, n: usize) {
         assert_eq!(n, self.n, "glm5 flags: a call of {n} ids on a publisher of {}", self.n);
-        match self.pred.as_ref() {
+        // #202 S: the call's guess published itself on the side stream: the ids alone
+        match self.pred.as_ref().filter(|_| self.side_pending.is_none()) {
             None => launch_v(self.publish, 1, 1, 1, 32, &[ids, self.dev + 8, self.host.dev + IDS_AT as u64, self.dev, self.host.dev]),
             Some(p) => launch_v(
                 self.publish_pred,
@@ -784,12 +962,19 @@ impl Routed {
     pub fn wait_layer(&mut self, layer: usize) -> Result<Vec<i32>, String> {
         let ids = self.wait()?;
         let Some(p) = self.pred.as_ref() else { return Ok(ids) };
-        if let Some((gl, g)) = self.last_guess.take() {
+        // #202 S: a self-published guess is scored as the host read it ([`take_guess`])
+        if let Some((gl, g)) = self.last_guess.take().or_else(take_side_read) {
             if gl == layer {
                 self.guess.compared += 1;
                 self.guess.picks += ids.len() as u64;
                 self.guess.hits += ids.iter().filter(|e| g.contains(e)).count() as u64;
             }
+        }
+        if let Some((gl, seq)) = self.side_pending.take() {
+            // SAFETY: the side area of this live block (`side_at`)
+            let base = unsafe { (self.host.host as *const u8).add(side_at(self.n)) };
+            post_side(SideHint { word: base as *const u64, tag: unsafe { base.add(8) } as *const i32, ids: unsafe { base.add(16) } as *const i32, k: p.topk, layer: gl, seq });
+            return Ok(ids);
         }
         // SAFETY: inside the block, written by the publish before the flag
         let tag = unsafe { std::ptr::read_volatile((self.host.host as *const u8).add(TAG_AT) as *const i32) };
@@ -824,19 +1009,110 @@ pub struct Hint {
     pub ids: Vec<i32>,
 }
 
+/// #202 S: a guess the side stream publishes itself: its sequence word, layer and ids in the
+/// mapped block of a live [`Routed`], the layer it guesses and the sequence number to wait for
+#[derive(Clone, Copy, Debug)]
+pub struct SideHint {
+    word: *const u64,
+    tag: *const i32,
+    ids: *const i32,
+    k: usize,
+    layer: usize,
+    seq: u64,
+}
+
 thread_local! {
     static HINT: std::cell::RefCell<Option<Hint>> = const { std::cell::RefCell::new(None) };
+    static SIDE: std::cell::Cell<Option<SideHint>> = const { std::cell::Cell::new(None) };
+    static SIDE_READ: std::cell::RefCell<Option<(usize, Vec<i32>)>> = const { std::cell::RefCell::new(None) };
 }
 
 /// [`Routed::wait_layer`] leaves the call's guess here: the hand-off to the expert hook, the way
 /// `glm5_moe::lane::post` hands the CPU lane its call
 pub fn post_hint(h: Option<Hint>) {
+    SIDE.with(|c| c.set(None));
     HINT.with(|c| *c.borrow_mut() = h);
 }
 
-/// the guess the last [`Routed::wait_layer`] left, once
+/// #202 S: [`post_hint`] of a guess still on its way from the side stream
+fn post_side(s: SideHint) {
+    HINT.with(|c| *c.borrow_mut() = None);
+    SIDE.with(|c| c.set(Some(s)));
+}
+
+/// #202 S: the self-published guess the host read last (for [`Routed::wait_layer`]'s score), once
+fn take_side_read() -> Option<(usize, Vec<i32>)> {
+    SIDE_READ.with(|c| c.borrow_mut().take())
+}
+
+/// the guess the last [`Routed::wait_layer`] left, once (a self-published side guess is read by
+/// [`take_guess`] only)
 pub fn take_hint() -> Option<Hint> {
     HINT.with(|c| c.borrow_mut().take())
+}
+
+/// #202 S: how the host found self-published side guesses
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SideRead {
+    /// up at the first look, up after a spin, dropped after [`SIDE_WAIT`]
+    pub ready: u64,
+    pub waited: u64,
+    pub late: u64,
+}
+
+/// #202 S: the self-published guess `s`, its word waited for at most `wait`
+fn read_side(s: SideHint, wait: std::time::Duration, how: &mut SideRead) -> Option<Hint> {
+    // SAFETY: the words of a live block the side stream's publish writes (`SideHint`)
+    let word = || unsafe { std::ptr::read_volatile(s.word) };
+    if word() >= s.seq {
+        how.ready += 1;
+    } else {
+        let t0 = std::time::Instant::now();
+        while word() < s.seq {
+            if t0.elapsed() > wait {
+                how.late += 1;
+                return None;
+            }
+            std::hint::spin_loop();
+        }
+        how.waited += 1;
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    // SAFETY: as above; the kernel wrote them before the word (fence_system)
+    let tag = unsafe { std::ptr::read_volatile(s.tag) };
+    if tag != s.layer as i32 {
+        return None;
+    }
+    let ids: Vec<i32> = (0..s.k).map(|i| unsafe { std::ptr::read_volatile(s.ids.add(i)) }).collect();
+    Some(Hint { layer: s.layer, ids })
+}
+
+/// The guess for the expert hook's next reads: [`take_hint`], or #202 S the self-published side
+/// guess (read once its word is up, at most [`SIDE_WAIT`]; [`Routed::wait_layer`] scores it as
+/// read here); #202 N2 cut to the store's rank cap ([`ENV_GUESS_TRIM`]). The counts go to
+/// `pf.stats`.
+pub fn take_guess(pf: &mut Prefetch) -> Option<Hint> {
+    let mut h = match take_hint() {
+        Some(h) => h,
+        None => {
+            let s = SIDE.with(|c| c.take())?;
+            let mut how = SideRead::default();
+            let h = read_side(s, SIDE_WAIT, &mut how);
+            pf.stats.side_ready += how.ready;
+            pf.stats.side_waited += how.waited;
+            pf.stats.side_late += how.late;
+            let h = h?;
+            SIDE_READ.with(|c| *c.borrow_mut() = Some((h.layer, h.ids.clone())));
+            h
+        }
+    };
+    if let Some(k) = pf.trim {
+        if h.ids.len() > k {
+            pf.stats.capped += (h.ids.len() - k) as u64;
+            h.ids.truncate(k);
+        }
+    }
+    Some(h)
 }
 
 /// `CU_STREAM_WAIT_VALUE_GEQ`
@@ -844,9 +1120,10 @@ const WAIT_GEQ: u32 = 0;
 
 /// `CROW_GLM_PREFETCH` with `CROW_NVME_POOL=1`: the store's reads join the piece pool's
 /// `Prefetch` queue (every queued demand piece first, as nv2's two queues); the per-reader
-/// backends have one FIFO each and keep `Demand`, the read of record
+/// backends have one FIFO each and keep `Demand`, the read of record, unless #202 N1
+/// (`CROW_NVME_DEMAND_FIRST=1`) gives them the two queues too
 pub fn prefetch_priority(src: &crate::nvme_source::NvmeSource) -> crate::nvme_source::ReadPriority {
-    if src.pool().is_some() {
+    if src.pool().is_some() || src.demand_first() {
         crate::nvme_source::ReadPriority::Prefetch
     } else {
         crate::nvme_source::ReadPriority::Demand
@@ -884,6 +1161,20 @@ pub struct PrefetchStats {
     /// the used records the call's NVMe read count still holds (the store: every used record,
     /// staged as an NVMe read; the RAM tier: none, a used record is a pinned hit)
     pub covered: u64,
+    /// #202 N2 (`CROW_GLM_GUESS_TRIM`): guessed ids cut by the rank cap, and guessed reads taken
+    /// out of the reader queue before the drive (their layer came without them)
+    pub capped: u64,
+    pub dropped: u64,
+    /// #202 S (`CROW_GLM_SIDE_NOJOIN`): self-published side guesses up at the host's first look,
+    /// up after a spin, dropped after [`SIDE_WAIT`]
+    pub side_ready: u64,
+    pub side_waited: u64,
+    pub side_late: u64,
+    /// #202 N1 (`CROW_NVME_DEMAND_FIRST`): the NVMe source's demand fetches that went ahead of a
+    /// queued guess, and guessed records moved up to the demand queue (`NvmeSource::queue_counts`,
+    /// since the source opened)
+    pub overtakes: u64,
+    pub promoted: u64,
 }
 
 impl PrefetchStats {
@@ -898,6 +1189,13 @@ impl PrefetchStats {
             wasted: self.wasted - o.wasted,
             joins: self.joins - o.joins,
             covered: self.covered - o.covered,
+            capped: self.capped - o.capped,
+            dropped: self.dropped - o.dropped,
+            side_ready: self.side_ready - o.side_ready,
+            side_waited: self.side_waited - o.side_waited,
+            side_late: self.side_late - o.side_late,
+            overtakes: self.overtakes - o.overtakes,
+            promoted: self.promoted - o.promoted,
         }
     }
 
@@ -910,6 +1208,13 @@ impl PrefetchStats {
         self.wasted += o.wasted;
         self.joins += o.joins;
         self.covered += o.covered;
+        self.capped += o.capped;
+        self.dropped += o.dropped;
+        self.side_ready += o.side_ready;
+        self.side_waited += o.side_waited;
+        self.side_late += o.side_late;
+        self.overtakes += o.overtakes;
+        self.promoted += o.promoted;
     }
 }
 
@@ -937,6 +1242,9 @@ pub struct Prefetch {
     pub stats: PrefetchStats,
     /// a copy of `stats` after every call, for a report callback while the run holds the store
     shared: std::sync::Arc<std::sync::Mutex<PrefetchStats>>,
+    /// #202 N2 ([`ENV_GUESS_TRIM`], read by [`Prefetch::new`]): on (the stale drop) with the
+    /// guess's best-scored ids kept (`usize::MAX`: every id); `None` = off
+    pub trim: Option<usize>,
 }
 
 impl Prefetch {
@@ -962,6 +1270,7 @@ impl Prefetch {
             seq: 0,
             stats: PrefetchStats::default(),
             shared: Default::default(),
+            trim: guess_trim_from(std::env::var(ENV_GUESS_TRIM).ok().as_deref(), std::env::var(ENV_GUESS_TRIM_K).ok().as_deref()).unwrap_or_else(|e| panic!("{e}")),
         };
         assert_eq!(p.pinned_bytes(), prefetch_pinned_bytes(k, rb), "the prefetch store allocates what the plan books");
         p
@@ -1128,7 +1437,7 @@ unsafe fn hinted(
     first_moe: usize,
     layer: usize,
 ) -> Result<(), String> {
-    let Some(h) = take_hint() else { return Ok(()) };
+    let Some(h) = take_guess(pf) else { return Ok(()) };
     if h.layer != layer + 1 {
         return Ok(());
     }
@@ -2336,6 +2645,52 @@ pub(crate) mod tests {
     use crate::glm5_moe::MoeGeo;
     use crate::glm5_tiers::{ExpertTiers, Generated, Glm5Run, TierSizes, TokenReport};
 
+    /// #202 N2: the trim is off unless `1`, its cap defaults to no cut, a cap that is no whole
+    /// number from 1 is refused by name
+    #[test]
+    fn n2_the_guess_trim_is_off_unless_asked() {
+        for off in [None, Some(""), Some("0"), Some("yes")] {
+            assert_eq!(guess_trim_from(off, Some("5")), Ok(None));
+        }
+        assert_eq!(guess_trim_from(Some("1"), None), Ok(Some(usize::MAX)));
+        assert_eq!(guess_trim_from(Some("1"), Some(" ")), Ok(Some(usize::MAX)));
+        assert_eq!(guess_trim_from(Some("1"), Some("3")), Ok(Some(3)));
+        assert_eq!(guess_trim_from(Some("1"), Some("8")), Ok(Some(8)));
+        for bad in ["0", "-1", "three"] {
+            let e = guess_trim_from(Some("1"), Some(bad)).unwrap_err();
+            assert!(e.contains(ENV_GUESS_TRIM_K) && e.contains(bad), "{e}");
+        }
+    }
+
+    /// #202 S, the host side of a self-published guess on a block of host words: read at once
+    /// when its word is up (counted ready), dropped after the wait when it is not (counted late),
+    /// dropped when the block holds another layer's guess
+    #[test]
+    fn s_a_side_guess_is_read_when_its_word_is_up_and_dropped_when_late() {
+        let mut block = [0u64; 8];
+        let base = block.as_mut_ptr() as *mut u8;
+        let ids = [5i32, 9, 2];
+        unsafe {
+            std::ptr::write(base as *mut u64, 4);
+            std::ptr::write(base.add(8) as *mut i32, 7);
+            for (i, &v) in ids.iter().enumerate() {
+                std::ptr::write((base.add(16) as *mut i32).add(i), v);
+            }
+        }
+        let hint = |layer: usize, seq: u64| SideHint { word: base as *const u64, tag: unsafe { base.add(8) } as *const i32, ids: unsafe { base.add(16) } as *const i32, k: 3, layer, seq };
+        let mut how = SideRead::default();
+        assert_eq!(read_side(hint(7, 4), SIDE_WAIT, &mut how), Some(Hint { layer: 7, ids: ids.to_vec() }));
+        assert_eq!(how, SideRead { ready: 1, waited: 0, late: 0 });
+        assert_eq!(read_side(hint(7, 5), std::time::Duration::from_micros(50), &mut how), None);
+        assert_eq!(how.late, 1);
+        assert_eq!(read_side(hint(6, 4), SIDE_WAIT, &mut how), None, "another layer's guess");
+        // the hand-off: posted once, a later post of a plain hint replaces it
+        post_side(hint(7, 4));
+        assert_eq!(take_hint(), None);
+        post_hint(None);
+        assert!(SIDE.with(|c| c.get()).is_none());
+    }
+
     #[test]
     fn only_1_turns_a_switch_on() {
         let parse = |pairs: Vec<(&str, &str)>| Switches::parse(&|k: &str| pairs.iter().find(|p| p.0 == k).map(|p| p.1.to_string()));
@@ -3012,6 +3367,102 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
                 eprintln!("glm5 guess side {side}: {gs:?}");
                 r.free();
             }
+            for d in [&mut wr, &mut wb, &mut xd, &mut ids] {
+                cuda::free_dev(d);
+            }
+            km.unload();
+            k5.free();
+        }
+    }
+
+    /// #202 S (`CROW_GLM_SIDE_NOJOIN`): the side guess publishes itself. Layer 0's call on the
+    /// side stream, unjoined: the router's publish carries the ids alone (no hint by
+    /// [`take_hint`]), [`take_guess`] reads the guess the side stream published (the router
+    /// kernel's top-8 of its own logits, for layer 1) once, the trim cap cuts it to its 3
+    /// best-scored ids, and layer 1's call scores the guess as read; [`Routed::join_late`] then
+    /// owes nothing. Without the switch the same calls hand the guess over with the flag.
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_flags_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_flags_gpu_s_the_side_guess_publishes_itself() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let (e, k, h) = (g.experts, g.topk, g.hidden);
+        let mut rng = Rng(0x0202_5E1F);
+        let w_bf: Vec<u16> = (0..e * h).map(|_| gm::f32_to_bf16_rne(rng.sym() / (h as f32).sqrt())).collect();
+        let bias: Vec<f32> = (0..e).map(|_| 0.05 * rng.sym()).collect();
+        let x: Vec<f32> = (0..h).map(|_| rng.sym()).collect();
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut km = cuda::compile(&crate::kernels::KernelGeo::flash_next().source());
+            let kn = crate::kernels::Kernels::new(&km, false);
+            let gk = crate::kernels::glm5_moe::Kernels::new();
+            let mut k5 = Kernels::new(&g);
+            let mut wr = cuda::upload_dev(&w_bf.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+            let mut wb = cuda::to_f32_dev(&bias);
+            let mut xd = cuda::to_f32_dev(&x);
+            let mut ids = cuda::to_i32_dev(&[7, 1, 2, 3, 4, 5, 6, 0]);
+            let mut pf = Prefetch::new(k, 4096);
+            for nojoin in [true, false] {
+                let mut r = Routed::new(&k5, k);
+                let mut p = Predict::with(vec![None, Some((wr, wb))], e, k, h, 2.5, 7.0, true);
+                if nojoin {
+                    p.nojoin_on();
+                }
+                r.pred = Some(p);
+                assert_eq!(r.side_nojoin(), nojoin);
+                let s0 = pf.stats;
+                for call in 0..3 {
+                    cuda::to_i32_into(ids, &[7, 1, 2, 3, 4, 5, 6, 0]);
+                    r.predict_early_unjoined(&kn, &gk, 0, xd);
+                    r.predict(&kn, &gk, 0, xd);
+                    r.publish(ids, k);
+                    let got = r.wait_layer(0).unwrap();
+                    assert_eq!(got, vec![7, 1, 2, 3, 4, 5, 6, 0], "nojoin {nojoin} call {call}: layer 0's own ids");
+                    let want = {
+                        let pr = r.pred.as_ref().unwrap();
+                        let (_, _, e1) = pr.side.unwrap();
+                        cuda::ck(sys::cuEventSynchronize(e1));
+                        host_select(&cuda::dtoh(pr.logits, e), &bias, k)
+                    };
+                    if nojoin {
+                        assert_eq!(take_hint(), None, "call {call}: the router's publish carried a guess");
+                    }
+                    pf.trim = None;
+                    let hint = take_guess(&mut pf);
+                    assert_eq!(hint, Some(Hint { layer: 1, ids: want.clone() }), "nojoin {nojoin} call {call}: the guess");
+                    assert_eq!(take_guess(&mut pf), None, "a guess is handed over once");
+                    r.join_late();
+                    assert!(!r.pred.as_ref().unwrap().late, "the late join is still owed");
+                    // layer 1's own call (no next MoE layer: no guess), scored against the guess
+                    let mut own: Vec<i32> = want.iter().rev().copied().take(6).collect();
+                    own.extend([-1, e as i32]);
+                    cuda::to_i32_into(ids, &own);
+                    r.predict_early_unjoined(&kn, &gk, 1, xd);
+                    r.predict(&kn, &gk, 1, xd);
+                    r.publish(ids, k);
+                    r.wait_layer(1).unwrap();
+                    assert_eq!(take_guess(&mut pf), None, "nojoin {nojoin} call {call}: a call without a guess hands over none");
+                }
+                let gs = r.guess;
+                assert_eq!((gs.launched, gs.side, gs.compared, gs.picks, gs.hits), (3, 3, 3, 3 * k as u64, 3 * 6), "nojoin {nojoin}: {gs:?}");
+                let d = pf.stats.since(&s0);
+                let read = d.side_ready + d.side_waited;
+                assert_eq!((read, d.side_late), (if nojoin { 3 } else { 0 }, 0), "nojoin {nojoin}: {d:?}");
+                // the rank cap
+                cuda::to_i32_into(ids, &[7, 1, 2, 3, 4, 5, 6, 0]);
+                r.predict_early_unjoined(&kn, &gk, 0, xd);
+                r.predict(&kn, &gk, 0, xd);
+                r.publish(ids, k);
+                r.wait_layer(0).unwrap();
+                pf.trim = Some(3);
+                let c0 = pf.stats.capped;
+                let hint = take_guess(&mut pf).expect("the guess");
+                assert_eq!((hint.ids.len(), pf.stats.capped - c0), (3, k as u64 - 3), "nojoin {nojoin}: the cap");
+                r.join_late();
+                eprintln!("glm5 guess S nojoin {nojoin}: {gs:?}, side reads {d:?}");
+                r.free();
+            }
+            pf.buf.free();
+            pf.flags.free();
             for d in [&mut wr, &mut wb, &mut xd, &mut ids] {
                 cuda::free_dev(d);
             }
