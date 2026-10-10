@@ -518,3 +518,164 @@ extern "C" __global__ void __launch_bounds__(256) gm_out_v1(const float* __restr
         }
     }
 }
+
+// #186 CROW_GLM_ATTN2: the prompt attention (one split) on tensor cores, flash-attention style. The
+// heads of a token share its selection list, so one block takes 64 heads of one token (FlashMLA's
+// MQA layout): a tile of GM_A2_BN selected latent rows is staged once in shared memory (cp.async,
+// double buffered) and serves as K and as V of all 64 heads. Warp w: heads 16 (w & 3) .. +16 and
+// latent half (w >> 2). S = q~ c^T (BF16 mma m16n8k16, f32 accumulation) is split over the latent
+// halves and summed through shared memory (a + b == b + a, so both warps of a head group hold the
+// same S), then an online softmax in f32, P in BF16, O += P c over the warp's half. Writes the
+// normalized u directly (no merge). grid (t, GM_HEADS / 64), block 256.
+#define GM_A2_BN 16
+#define GM_A2_LDK (GM_LAT + 8)
+#define GM_A2_HALF (GM_LAT / 2)
+#if (GM_HEADS % 64 == 0) && (GM_A2_HALF % 16 == 0)
+__device__ __forceinline__ unsigned gm_pack2(float lo, float hi) {
+    return (unsigned)gm_f2bf(lo) | ((unsigned)gm_f2bf(hi) << 16);
+}
+__device__ __forceinline__ void gm_mma16816(float* c, const unsigned* a, unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void gm_a2_load(unsigned short (*ks)[GM_A2_LDK], const unsigned short* __restrict__ lat,
+                                           const int* __restrict__ list, int e0, int n) {
+    for (int i = threadIdx.x; i < GM_A2_BN * (GM_LAT / 8); i += blockDim.x) {
+        int r = i / (GM_LAT / 8), cc = (i % (GM_LAT / 8)) * 8;
+        int e = e0 + r;
+        if (e < n) {
+            unsigned sa = (unsigned)__cvta_generic_to_shared(&ks[r][cc]);
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(sa), "l"(lat + (long long)list[e] * GM_LAT + cc));
+        } else {
+            *(uint4*)&ks[r][cc] = make_uint4(0u, 0u, 0u, 0u);
+        }
+    }
+    asm volatile("cp.async.commit_group;");
+}
+extern "C" __global__ void __launch_bounds__(256, 1)
+gm_attn2(const float* __restrict__ qt, const unsigned short* __restrict__ lat, const int* __restrict__ sel,
+         const int* __restrict__ sel_n, float* __restrict__ u, const int* __restrict__ st) {
+    __shared__ __align__(16) unsigned short ks[2][GM_A2_BN][GM_A2_LDK];
+    __shared__ float sx[8][8][32];
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3;
+    int ch = warp >> 2;
+    int tok = blockIdx.x;
+    int h0 = blockIdx.y * 64 + (warp & 3) * 16;
+    int k0 = ch * GM_A2_HALF;
+    const int* list = sel + (long long)tok * GM_SEL_MAX;
+    int n = sel_n[tok];
+    int ntile = (n + GM_A2_BN - 1) / GM_A2_BN;
+    gm_a2_load(ks[0], lat, list, 0, n);
+    // q~ rows h0 + g and h0 + g + 8 over the warp's latent half, as BF16 A fragments
+    unsigned qa[GM_A2_HALF / 16][4];
+    {
+        const float* q0 = qt + ((long long)tok * GM_HEADS + h0 + g) * GM_LAT + k0;
+        const float* q1 = q0 + 8 * GM_LAT;
+        #pragma unroll
+        for (int kk = 0; kk < GM_A2_HALF / 16; kk++) {
+            int c = kk * 16 + 2 * tq;
+            float2 a = *(const float2*)(q0 + c), b = *(const float2*)(q1 + c);
+            float2 a8 = *(const float2*)(q0 + c + 8), b8 = *(const float2*)(q1 + c + 8);
+            qa[kk][0] = gm_pack2(a.x, a.y);
+            qa[kk][1] = gm_pack2(b.x, b.y);
+            qa[kk][2] = gm_pack2(a8.x, a8.y);
+            qa[kk][3] = gm_pack2(b8.x, b8.y);
+        }
+    }
+    float o[GM_A2_HALF / 8][4];
+    #pragma unroll
+    for (int j = 0; j < GM_A2_HALF / 8; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
+    const float NEG = -__int_as_float(0x7f800000);
+    float m0 = NEG, m1 = NEG, l0 = 0.0f, l1 = 0.0f;
+    for (int it = 0; it < ntile; it++) {
+        int buf = it & 1;
+        if (it + 1 < ntile) {
+            gm_a2_load(ks[buf ^ 1], lat, list, (it + 1) * GM_A2_BN, n);
+            asm volatile("cp.async.wait_group 1;");
+        } else {
+            asm volatile("cp.async.wait_group 0;");
+        }
+        __syncthreads();
+        float s[2][4];
+        #pragma unroll
+        for (int nt = 0; nt < 2; nt++) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.0f;
+        #pragma unroll
+        for (int kk = 0; kk < GM_A2_HALF / 16; kk++) {
+            #pragma unroll
+            for (int nt = 0; nt < 2; nt++) {
+                const unsigned short* kr = &ks[buf][nt * 8 + g][k0 + kk * 16 + 2 * tq];
+                gm_mma16816(s[nt], qa[kk], *(const unsigned*)kr, *(const unsigned*)(kr + 8));
+            }
+        }
+        #pragma unroll
+        for (int nt = 0; nt < 2; nt++)
+            #pragma unroll
+            for (int i = 0; i < 4; i++) sx[warp][nt * 4 + i][lane] = s[nt][i];
+        __syncthreads();
+        float mx0 = NEG, mx1 = NEG;
+        #pragma unroll
+        for (int nt = 0; nt < 2; nt++)
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float v = (s[nt][i] + sx[warp ^ 4][nt * 4 + i][lane]) * GM_SCALE;
+                int e = it * GM_A2_BN + nt * 8 + 2 * tq + (i & 1);
+                v = e < n ? v : NEG;
+                s[nt][i] = v;
+                if (i < 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
+            }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+        float c0 = expf(m0 - mn0), c1 = expf(m1 - mn1);
+        float ps0 = 0.0f, ps1 = 0.0f;
+        #pragma unroll
+        for (int nt = 0; nt < 2; nt++) {
+            s[nt][0] = expf(s[nt][0] - mn0);
+            s[nt][1] = expf(s[nt][1] - mn0);
+            s[nt][2] = expf(s[nt][2] - mn1);
+            s[nt][3] = expf(s[nt][3] - mn1);
+            ps0 += s[nt][0] + s[nt][1];
+            ps1 += s[nt][2] + s[nt][3];
+        }
+        ps0 += __shfl_xor_sync(0xffffffffu, ps0, 1);
+        ps0 += __shfl_xor_sync(0xffffffffu, ps0, 2);
+        ps1 += __shfl_xor_sync(0xffffffffu, ps1, 1);
+        ps1 += __shfl_xor_sync(0xffffffffu, ps1, 2);
+        l0 = l0 * c0 + ps0;
+        l1 = l1 * c1 + ps1;
+        m0 = mn0;
+        m1 = mn1;
+        unsigned pa[4] = {gm_pack2(s[0][0], s[0][1]), gm_pack2(s[0][2], s[0][3]), gm_pack2(s[1][0], s[1][1]),
+                          gm_pack2(s[1][2], s[1][3])};
+        const unsigned short* v0 = &ks[buf][2 * tq][k0 + g];
+        #pragma unroll
+        for (int j = 0; j < GM_A2_HALF / 8; j++) {
+            o[j][0] *= c0;
+            o[j][1] *= c0;
+            o[j][2] *= c1;
+            o[j][3] *= c1;
+            const unsigned short* vp = v0 + j * 8;
+            unsigned b0 = (unsigned)vp[0] | ((unsigned)vp[GM_A2_LDK] << 16);
+            unsigned b1 = (unsigned)vp[8 * GM_A2_LDK] | ((unsigned)vp[9 * GM_A2_LDK] << 16);
+            gm_mma16816(o[j], pa, b0, b1);
+        }
+        __syncthreads();
+    }
+    float i0 = 1.0f / l0, i1 = 1.0f / l1;
+    float* u0 = u + ((long long)tok * GM_HEADS + h0 + g) * GM_LAT + k0 + 2 * tq;
+    float* u1 = u0 + 8 * GM_LAT;
+    #pragma unroll
+    for (int j = 0; j < GM_A2_HALF / 8; j++) {
+        *(float2*)(u0 + j * 8) = make_float2(o[j][0] * i0, o[j][1] * i0);
+        *(float2*)(u1 + j * 8) = make_float2(o[j][2] * i1, o[j][3] * i1);
+    }
+}
+#else
+// shapes the tensor-core path does not tile (the small test shapes): never launched
+extern "C" __global__ void gm_attn2(const float* __restrict__ qt, const unsigned short* __restrict__ lat,
+                                    const int* __restrict__ sel, const int* __restrict__ sel_n,
+                                    float* __restrict__ u, const int* __restrict__ st) {}
+#endif

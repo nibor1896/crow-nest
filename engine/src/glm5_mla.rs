@@ -187,6 +187,8 @@ pub struct MlaKernels {
     absorb: CUfunction,
     attn: CUfunction,
     merge: CUfunction,
+    /// #186: `gm_attn2`, the tensor-core prompt attention (`CROW_GLM_ATTN2=1`)
+    attn2: CUfunction,
     out_v: CUfunction,
     gemv: CUfunction,
     absorb1: CUfunction,
@@ -215,6 +217,7 @@ impl MlaKernels {
             absorb: module.get("gm_absorb"),
             attn: module.get("gm_attn"),
             merge: module.get("gm_attn_merge"),
+            attn2: module.get("gm_attn2"),
             out_v: module.get("gm_out_v"),
             gemv: module.get("gm_gemv"),
             absorb1: module.get("gm_absorb1"),
@@ -309,6 +312,18 @@ pub struct MlaWeights {
 }
 
 /// split count of the decode-shaped attention: enough blocks for a few rows, one split from 16 rows
+/// #186 `CROW_GLM_ATTN2=1`: the one-split (prompt) attention runs `gm_attn2` on tensor cores
+/// (BF16 q~, P and latent rows, f32 accumulation and softmax); default off
+pub fn attn2_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CROW_GLM_ATTN2").ok().as_deref() == Some("1"))
+}
+
+/// the shapes `gm_attn2` tiles (64 heads per block, each latent half a multiple of 16)
+pub const fn attn2_fits(d: &MlaDims) -> bool {
+    d.heads % 64 == 0 && d.kv_lora % 32 == 0
+}
+
 pub fn attn_splits(t: usize) -> usize {
     (16 / t.max(1)).max(1)
 }
@@ -588,8 +603,13 @@ impl MlaScratch {
         // #196: a sub-call of a prompt call takes the whole call's split count (its rows' bits)
         let ns = attn_splits(self.split_t) as u64;
         let (sel, sel_n) = self.sel_at();
-        launch_v(kn.attn, d.heads.div_ceil(8) as u32, t, ns as u32, 256, &[self.qt, c.latent, sel, sel_n, self.part_o, self.part_ml, ns, self.st]);
-        launch_v(kn.merge, d.heads as u32, t, 1, 256, &[self.part_o, self.part_ml, self.u, ns, self.st]);
+        if ns == 1 && attn2_on() && attn2_fits(d) {
+            // #186: one split on tensor cores writes u directly
+            launch_v(kn.attn2, t, (d.heads / 64) as u32, 1, 256, &[self.qt, c.latent, sel, sel_n, self.u, self.st]);
+        } else {
+            launch_v(kn.attn, d.heads.div_ceil(8) as u32, t, ns as u32, 256, &[self.qt, c.latent, sel, sel_n, self.part_o, self.part_ml, ns, self.st]);
+            launch_v(kn.merge, d.heads as u32, t, 1, 256, &[self.part_o, self.part_ml, self.u, ns, self.st]);
+        }
         self.out_v(kn, w.kv_b);
     }
 
@@ -1346,6 +1366,128 @@ mod tests_gpu {
         println!("selection: {} rows, sparse rows {s0}..={s1}, 0 differ from bf16kv (tie rows skipped {tie_skips}); {vs_f32} sparse rows differ from the f32 golden", n);
         println!("worst anchor cosine vs bf16kv {:.9} (row {}), vs f32 {:.9} (row {})", worst.0, worst.1, worst32.0, worst32.1);
         assert!(worst.0 >= 0.9999, "G3: anchor {} cosine {:.9} < 0.9999", worst.1, worst.0);
+    }
+
+    /// #186 `CROW_GLM_ATTN2`: `gm_attn2` (tensor cores) against `gm_attn` + `gm_attn_merge` (one
+    /// split, the prompt path) at the real shapes, 8192 prompt rows over a synthetic latent cache of
+    /// 16384 rows, selections of 512 random pools of 4 plus 3 tail rows (short dense rows first);
+    /// cosine of u and the time of both
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_mla::tests_gpu::glm5_attn2 -- --ignored --nocapture"]
+    fn glm5_attn2_matches_gm_attn_at_8192_prompt_rows() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let d = MlaDims::of(&Glm5Geo::GLM_5_3_FLASH);
+            assert!(attn2_fits(&d));
+            let m = crate::kernels::glm5_mla_module(&d.prelude());
+            let (attn, merge, attn2) = (m.get("gm_attn"), m.get("gm_attn_merge"), m.get("gm_attn2"));
+            let (t, cap, sm) = (8192usize, 16384usize, d.sel_max());
+            let (h, lat) = (d.heads, d.kv_lora);
+            let mut rng = 0x2545F4914F6CDD1Du64;
+            let mut next = move || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            let unif = |r: u64| (r >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0;
+            let lat_h: Vec<u16> = (0..cap * lat).map(|_| synth::bf16_bits(unif(next()) * 1.7)).collect();
+            let qt_h: Vec<f32> = (0..t * h * lat).map(|_| unif(next()) * 3.5).collect();
+            let mut sel_h = vec![0i32; t * sm];
+            let mut sel_n_h = vec![0i32; t];
+            for tok in 0..t {
+                let row = &mut sel_h[tok * sm..(tok + 1) * sm];
+                let n = if tok < 40 {
+                    for (i, v) in row.iter_mut().take(tok + 1).enumerate() {
+                        *v = i as i32;
+                    }
+                    tok + 1
+                } else {
+                    for p in 0..d.sel_pools() {
+                        let pool = (next() % (cap as u64 / 4)) as i32;
+                        for j in 0..4 {
+                            row[p * 4 + j] = pool * 4 + j as i32;
+                        }
+                    }
+                    for j in 0..3 {
+                        row[d.sel_pools() * 4 + j] = (next() % cap as u64) as i32;
+                    }
+                    sm
+                };
+                sel_n_h[tok] = n as i32;
+            }
+            let latd = cuda::to_dev(&lat_h);
+            let qtd = cuda::to_f32_dev(&qt_h);
+            drop(qt_h);
+            let seld = cuda::to_dev(&sel_h);
+            let selnd = cuda::to_dev(&sel_n_h);
+            let std_ = cuda::to_dev(&[0i32, t as i32]);
+            let part_o = cuda::alloc_zeroed(t * h * lat * 4);
+            let part_ml = cuda::alloc_zeroed(t * h * 2 * 4);
+            let u_old = cuda::alloc_zeroed(t * h * lat * 4);
+            let u_new = cuda::alloc_zeroed(t * h * lat * 4);
+            let run_old = || {
+                launch_v(attn, h.div_ceil(8) as u32, t as u32, 1, 256, &[qtd, latd, seld, selnd, part_o, part_ml, 1, std_]);
+                launch_v(merge, h as u32, t as u32, 1, 256, &[part_o, part_ml, u_old, 1, std_]);
+            };
+            let run_new = || launch_v(attn2, t as u32, (h / 64) as u32, 1, 256, &[qtd, latd, seld, selnd, u_new, std_]);
+            let time = |f: &dyn Fn()| {
+                f();
+                cuda::sync();
+                let mut best = f64::MAX;
+                for _ in 0..3 {
+                    let s = std::time::Instant::now();
+                    f();
+                    cuda::sync();
+                    best = best.min(s.elapsed().as_secs_f64() * 1e3);
+                }
+                best
+            };
+            let t_old = time(&run_old);
+            let t_new = time(&run_new);
+            // sub-call sizes: rows 4096 .. 4096 + ts (all sparse, full selections)
+            for ts in [256usize, 1024] {
+                let (q, sl, sn) = (qtd + (4096 * h * lat * 4) as u64, seld + (4096 * sm * 4) as u64, selnd + 4096 * 4);
+                let o = || {
+                    launch_v(attn, h.div_ceil(8) as u32, ts as u32, 1, 256, &[q, latd, sl, sn, part_o, part_ml, 1, std_]);
+                    launch_v(merge, h as u32, ts as u32, 1, 256, &[part_o, part_ml, u_old, 1, std_]);
+                };
+                let nw = || launch_v(attn2, ts as u32, (h / 64) as u32, 1, 256, &[q, latd, sl, sn, u_new, std_]);
+                let (a, b) = (time(&o), time(&nw));
+                println!("{ts} rows: gm_attn + merge {a:.3} ms, gm_attn2 {b:.3} ms ({:.2}x)", a / b);
+            }
+            run_old();
+            run_new();
+            cuda::sync();
+            let a = cuda::dtoh(u_old, t * h * lat);
+            let b = cuda::dtoh(u_new, t * h * lat);
+            let (mut ab, mut aa, mut bb, mut worst, mut worst_at) = (0f64, 0f64, 0f64, 1f64, 0usize);
+            for r in 0..t * h {
+                let (mut rab, mut raa, mut rbb) = (0f64, 0f64, 0f64);
+                for j in 0..lat {
+                    let (x, y) = (a[r * lat + j] as f64, b[r * lat + j] as f64);
+                    rab += x * y;
+                    raa += x * x;
+                    rbb += y * y;
+                }
+                ab += rab;
+                aa += raa;
+                bb += rbb;
+                let c = rab / (raa.sqrt() * rbb.sqrt());
+                if !(c >= worst) {
+                    (worst, worst_at) = (c, r);
+                }
+            }
+            let cos = ab / (aa.sqrt() * bb.sqrt());
+            println!("gm_attn + merge {t_old:.2} ms, gm_attn2 {t_new:.2} ms ({:.2}x) at {t} rows x {h} heads, sel {sm}", t_old / t_new);
+            println!("u cosine {cos:.9}, worst (row, head) {worst:.9} at tok {} head {}", worst_at / h, worst_at % h);
+            for p in [latd, qtd, seld, selnd, std_, part_o, part_ml, u_old, u_new] {
+                let mut p = p;
+                cuda::free_dev(&mut p);
+            }
+            assert!(cos >= 0.9999, "u cosine {cos:.9} < 0.9999");
+            assert!(worst >= 0.999, "worst row cosine {worst:.9} < 0.999");
+        }
     }
 }
 
