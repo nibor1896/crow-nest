@@ -65,8 +65,7 @@
 //!   so ids and logits are the same. Refused with `CROW_GLM_GRAPH`, `CROW_GLM_LOOKAHEAD` and MTP.
 //!   The controller thread waits neither for a landing nor for the CPU: it plans, starts the NVMe
 //!   reads, queues the reply and hands the CPU lane's job to the lane's own thread ([`DevLane`])
-//!   (left: the stager's gate before an NVMe read into a pinned slot a queued copy still reads,
-//!   and a write-back still landing in a guessed record's slot, both rare), which
+//!   (a read into a pinned slot a copy still uses goes to the stager's deferred-read thread), which
 //!   waits per expert for its record to land and sums its experts into one row that
 //!   [`Ctl::combine_lane`] adds behind the combine (#202 D-A, D-C; held to accuracy, not bits).
 //!   [`CtlClock`] counts plan / reply / serve per layer.
