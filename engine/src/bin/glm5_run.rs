@@ -58,7 +58,7 @@
 //! the times of this synchronous path, not of a graph-captured one.
 use crow_nest_engine::cuda;
 use crow_nest_engine::geo::{from_engine_dir, HOST_PINNED_CAP};
-use crow_nest_engine::glm5_flags::PrefetchStats;
+use crow_nest_engine::glm5_flags::{CtlTimes, PrefetchStats};
 use crow_nest_engine::glm5_model::GLM5_MUL1K3_CNQ;
 use crow_nest_engine::glm5_mtp::{self as mtp, SpecStats};
 use crow_nest_engine::glm5_tiers::{self as gt, ExpertTiers, Glm5Run, Moves, TokenReport};
@@ -348,6 +348,31 @@ fn mtp_line(s: &SpecStats) -> String {
         f("kda_snapshot_gb_per_token"),
         s.kda_restore_steps,
         f("kda_restore_gb_per_token")
+    )
+}
+
+/// `CROW_GLM_CONTROLLER`: the controller's and the CPU lane's clocks of one rep, per controlled
+/// MoE layer (the template's `plan_ns` / `reply_ns` / `ctl_busy_ns`, nv2_host.cpp#L140-L149)
+fn controller_json(c: &CtlTimes) -> Value {
+    json!({
+        "requests": c.requests, "plan_us_per_layer": c.per_layer_us(c.plan_ns), "reply_us_per_layer": c.per_layer_us(c.reply_ns),
+        "serve_us_per_layer": c.per_layer_us(c.serve_ns), "serve_max_us": c.serve_max_ns as f64 / 1e3,
+        "cpu_jobs": c.cpu_jobs, "cpu_busy_us_per_layer": c.per_layer_us(c.cpu_busy_ns), "cpu_wait_land_us_per_layer": c.per_layer_us(c.cpu_wait_land_ns),
+        "plan_ns": c.plan_ns, "reply_ns": c.reply_ns, "serve_ns": c.serve_ns, "cpu_busy_ns": c.cpu_busy_ns, "cpu_wait_land_ns": c.cpu_wait_land_ns,
+    })
+}
+
+fn controller_line(c: &CtlTimes) -> String {
+    format!(
+        "{} requests, per layer plan {:.1} us reply {:.1} us serve {:.1} us (max {:.1} us); CPU lane {} jobs, busy {:.1} us waiting for landings {:.1} us per layer",
+        c.requests,
+        c.per_layer_us(c.plan_ns),
+        c.per_layer_us(c.reply_ns),
+        c.per_layer_us(c.serve_ns),
+        c.serve_max_ns as f64 / 1e3,
+        c.cpu_jobs,
+        c.per_layer_us(c.cpu_busy_ns),
+        c.per_layer_us(c.cpu_wait_land_ns)
     )
 }
 
@@ -722,6 +747,7 @@ fn run(args: &[String]) -> Result<(), String> {
         });
         let lane = tiers.cpu_lane_clock();
         let pf_clock = tiers.prefetch_clock();
+        let ctl_clock = tiers.ctl_clock();
         let mut per_rep: Vec<(Phase, Phase, f64, f64)> = Vec::new();
         let mut all_ids: Vec<Vec<i64>> = Vec::new();
         for rep in 1..=reps {
@@ -733,6 +759,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let mut lane_ns = lane.read().0;
             let pf_read = || pf_clock.as_ref().map(|c| c.lock().map(|g| *g).unwrap_or_default());
             let mut pf_last = pf_read();
+            let ctl0 = ctl_clock.read();
             let t0 = std::time::Instant::now();
             let mut report = |r: &TokenReport| {
                 let at = t0.elapsed().as_secs_f64();
@@ -764,6 +791,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let fresh = seed.map(|s| random_ids(s, prompt.len()));
             let mut out = run.generate(&mut o.cnq, &mut tiers, fresh.as_deref().unwrap_or(&prompt), n, false, &mut report)?;
             let wall = t0.elapsed().as_secs_f64();
+            let ctl = ctl_clock.read().since(&ctl0);
             let eos_at = if stop_eos { cut_at_eos(&mut rows, &crow_nest_engine::glm5_template::EOS_IDS) } else { None };
             if let Some(k) = eos_at {
                 out.ids.truncate(k);
@@ -822,11 +850,14 @@ fn run(args: &[String]) -> Result<(), String> {
             if let Some(s) = &spec {
                 println!("{tag} decode MTP: {}", mtp_line(s));
             }
+            if ctl.requests > 0 {
+                println!("{tag} controller: {}", controller_line(&ctl));
+            }
             println!("{tag} wall {wall:.3} s (generate call)");
             let m_rep = machine(&tiers);
             println!("glm5_run machine after rep {rep}: {}", machine_line(&m_rep));
             doc["reps_detail"].as_array_mut().expect("reps array").push(json!({
-                "rep": rep, "cache": state, "wall_s": wall, "ids": out.ids, "prompt_seed": seed, "eos_at": eos_at, "sweep_aggregate_tok_s": sweep_agg,
+                "rep": rep, "cache": state, "wall_s": wall, "ids": out.ids, "controller": controller_json(&ctl), "prompt_seed": seed, "eos_at": eos_at, "sweep_aggregate_tok_s": sweep_agg,
                 "prefill": { "timing": timing_json(&pre, Some(ttft)), "counters": counters_json(&pre, rb), "layers": layers_json(&pre, first_moe),
                              "reports": pre.reports, "routing_syncs": pre.routing_syncs, "sub_batches": pre.sub_batches },
                 "decode": { "timing": timing_json(&dec, None), "counters": counters_json(&dec, rb), "layers": layers_json(&dec, first_moe),

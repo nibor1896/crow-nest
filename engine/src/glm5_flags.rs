@@ -1152,6 +1152,97 @@ impl GuessScore {
     }
 }
 
+/// `CROW_GLM_CONTROLLER`: the controller thread's and the CPU lane's clocks, summed over the
+/// requests (the template's counters, sybil-solutions/glm53-flash-offload 6769b27
+/// `kernels/nv2/nv2_host.cpp#L140-L149`: `plan_ns`, `reply_ns`, `ctl_busy_ns` / `serve_max_ns`,
+/// `cpu_busy_ns`, `cpu_wait_land_ns`). Every span starts when the controller thread sees the
+/// request in the ring.
+#[derive(Debug, Default)]
+pub struct CtlClock {
+    requests: std::sync::atomic::AtomicU64,
+    /// up to the plan's end: the cache's moves issued (NVMe reads started), the table row and the
+    /// CPU lane's share decided, the next layer's guess read; before the reply is queued
+    plan_ns: std::sync::atomic::AtomicU64,
+    /// up to the reply word's write queued on the stager stream (and submitted)
+    reply_ns: std::sync::atomic::AtomicU64,
+    /// up to the controller thread being free for the next request
+    serve_ns: std::sync::atomic::AtomicU64,
+    serve_max_ns: std::sync::atomic::AtomicU64,
+    /// CPU lane jobs, their time from start to the lane flag, and the part of it spent waiting
+    /// for records to land
+    cpu_jobs: std::sync::atomic::AtomicU64,
+    cpu_busy_ns: std::sync::atomic::AtomicU64,
+    cpu_wait_land_ns: std::sync::atomic::AtomicU64,
+}
+
+/// a snapshot of [`CtlClock`]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CtlTimes {
+    pub requests: u64,
+    pub plan_ns: u64,
+    pub reply_ns: u64,
+    pub serve_ns: u64,
+    pub serve_max_ns: u64,
+    pub cpu_jobs: u64,
+    pub cpu_busy_ns: u64,
+    pub cpu_wait_land_ns: u64,
+}
+
+impl CtlClock {
+    /// one request served: `plan`, `reply`, `serve` from the request's sight
+    pub fn served(&self, plan: std::time::Duration, reply: std::time::Duration, serve: std::time::Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.requests.fetch_add(1, Relaxed);
+        self.plan_ns.fetch_add(plan.as_nanos() as u64, Relaxed);
+        self.reply_ns.fetch_add(reply.as_nanos() as u64, Relaxed);
+        self.serve_ns.fetch_add(serve.as_nanos() as u64, Relaxed);
+        self.serve_max_ns.fetch_max(serve.as_nanos() as u64, Relaxed);
+    }
+
+    /// one CPU lane job: `busy` from its start to its flag, `wait` of it waiting for landings
+    pub fn cpu_job(&self, busy: std::time::Duration, wait: std::time::Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.cpu_jobs.fetch_add(1, Relaxed);
+        self.cpu_busy_ns.fetch_add(busy.as_nanos() as u64, Relaxed);
+        self.cpu_wait_land_ns.fetch_add(wait.as_nanos() as u64, Relaxed);
+    }
+
+    pub fn read(&self) -> CtlTimes {
+        use std::sync::atomic::Ordering::Relaxed;
+        CtlTimes {
+            requests: self.requests.load(Relaxed),
+            plan_ns: self.plan_ns.load(Relaxed),
+            reply_ns: self.reply_ns.load(Relaxed),
+            serve_ns: self.serve_ns.load(Relaxed),
+            serve_max_ns: self.serve_max_ns.load(Relaxed),
+            cpu_jobs: self.cpu_jobs.load(Relaxed),
+            cpu_busy_ns: self.cpu_busy_ns.load(Relaxed),
+            cpu_wait_land_ns: self.cpu_wait_land_ns.load(Relaxed),
+        }
+    }
+}
+
+impl CtlTimes {
+    /// `self - o` (a later snapshot minus an earlier one; the maximum is the later one's)
+    pub fn since(&self, o: &CtlTimes) -> CtlTimes {
+        CtlTimes {
+            requests: self.requests - o.requests,
+            plan_ns: self.plan_ns - o.plan_ns,
+            reply_ns: self.reply_ns - o.reply_ns,
+            serve_ns: self.serve_ns - o.serve_ns,
+            serve_max_ns: self.serve_max_ns,
+            cpu_jobs: self.cpu_jobs - o.cpu_jobs,
+            cpu_busy_ns: self.cpu_busy_ns - o.cpu_busy_ns,
+            cpu_wait_land_ns: self.cpu_wait_land_ns - o.cpu_wait_land_ns,
+        }
+    }
+
+    /// microseconds per request (per controlled MoE layer) of a nanosecond sum
+    pub fn per_layer_us(&self, ns: u64) -> f64 {
+        ns as f64 / 1e3 / self.requests.max(1) as f64
+    }
+}
+
 /// one request of the ring
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -2545,6 +2636,20 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
     }
 
     #[test]
+    fn the_controller_clock_sums_spans_per_layer() {
+        let ms = std::time::Duration::from_millis;
+        let c = CtlClock::default();
+        c.served(ms(1), ms(2), ms(4));
+        let a = c.read();
+        c.served(ms(3), ms(4), ms(10));
+        c.cpu_job(ms(5), ms(1));
+        let d = c.read().since(&a);
+        assert_eq!((d.requests, d.plan_ns, d.reply_ns, d.serve_ns, d.serve_max_ns), (1, 3_000_000, 4_000_000, 10_000_000, 10_000_000));
+        assert_eq!((d.cpu_jobs, d.cpu_busy_ns, d.cpu_wait_land_ns), (1, 5_000_000, 1_000_000));
+        assert_eq!(c.read().per_layer_us(c.read().serve_ns), 7_000.0);
+    }
+
+    #[test]
     fn the_controller_scores_a_guess_against_the_layer_it_named() {
         let mut s = GuessScore::default();
         s.see(3, &[1, 2, 3, 4], Some(&Hint { layer: 4, ids: vec![2, 3, 9, 8] }));
@@ -2651,6 +2756,87 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
             c.free();
             k.free();
         }
+    }
+
+    /// #202 D-A / D-D, a measurement on the synthetic model: the controller's clocks per
+    /// controlled MoE layer (plan, reply, serve = the controller thread busy; the CPU lane's busy
+    /// time and its wait for landings) under the measurement arm of the GLM-5.3-Flash rows with
+    /// small budgets (global arena with warm start, NVMe piece pool of 8 workers, flags + stager +
+    /// prefetch on the side stream + shared overlap + controller + LA, CPU lane split on host
+    /// pinned memory), a 20-id prompt and 16 greedy ids, at V 3 + P 4 (NVMe reads) and V 0 + P 16
+    /// (every expert pinned: the lane computes). Prints; holds that every decode row went through
+    /// the controller and the lane ran.
+    #[test]
+    #[ignore = "needs the GPU (about 3 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_flags_gpu_controller_clock -- --ignored --nocapture --test-threads 1"]
+    fn glm5_flags_gpu_controller_clock_per_layer() {
+        use crate::glm5_int_tests::{synth_warm, Env};
+        const REC: u64 = 9_474_048;
+        let g = geo8();
+        let s = synth_model(&g, REC);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let dir = std::env::temp_dir().join(format!("crow-ctl-clock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let warm = synth_warm(&dir);
+        let gib = |records: f64| format!("{}", records * REC as f64 / (1u64 << 30) as f64);
+        let env: Vec<(&str, String)> = vec![
+            ("CROW_NVME_POOL", "1".into()),
+            ("CROW_NVME_POOL_THREADS", "8".into()),
+            ("CROW_GLM_CPU_LANE", "split".into()),
+            ("CROW_PINNED_ALLOC", "host".into()),
+            ("CROW_GLM_ARENA", "global".into()),
+            ("CROW_GLM_ARENA_WARM", warm),
+            ("CROW_GLM_ARENA_ELASTIC_GB", gib(6.0)),
+            ("CROW_GLM_ARENA_STAGE_GB", gib(12.0)),
+            ("CROW_GLM_FLAGS", "1".into()),
+            ("CROW_GLM_STAGER", "1".into()),
+            ("CROW_GLM_PREFETCH", "1".into()),
+            ("CROW_GLM_PREFETCH_SIDE", "1".into()),
+            ("CROW_GLM_SHARED_OVERLAP", "1".into()),
+            ("CROW_GLM_CONTROLLER", "1".into()),
+            ("CROW_GLM_LA", "1".into()),
+        ];
+        let prompt: Vec<i64> = (0..20).map(|i| (i * 53 + 11) % 2048).collect();
+        let n = 16;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            for sizes in [TierSizes { vram: 3, pinned: 4 }, TierSizes { vram: 0, pinned: 16 }] {
+                let _env = Env::set(&env);
+                let mut run = Glm5Run::load(&mut cnq, &g, &moe, prompt.len() + n + 1, &mut |_| {});
+                let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, g.topk).unwrap();
+                let clock = tiers.ctl_clock();
+                let t0 = std::time::Instant::now();
+                let gen = run.generate(&mut cnq, &mut tiers, &prompt, n, false, &mut |_| {}).unwrap();
+                let wall = t0.elapsed().as_secs_f64();
+                let c = clock.read();
+                let lane = tiers.cpu_lane_clock().read();
+                eprintln!(
+                    "glm5 controller clock V {} P {}: {} requests, per layer plan {:.1} us reply {:.1} us serve {:.1} us (max {:.1} us); CPU lane {} jobs ({} experts) busy {:.1} us, waiting for landings {:.1} us per layer; NVMe reads {}; generate {wall:.3} s; ids {:?}",
+                    sizes.vram,
+                    sizes.pinned,
+                    c.requests,
+                    c.per_layer_us(c.plan_ns),
+                    c.per_layer_us(c.reply_ns),
+                    c.per_layer_us(c.serve_ns),
+                    c.serve_max_ns as f64 / 1e3,
+                    c.cpu_jobs,
+                    lane.1,
+                    c.per_layer_us(c.cpu_busy_ns),
+                    c.per_layer_us(c.cpu_wait_land_ns),
+                    tiers.nvme_reads,
+                    gen.ids
+                );
+                assert!(c.requests >= 5 * (n as u64 - 1), "every MoE layer of every decode row through the controller ({} requests)", c.requests);
+                if sizes.vram == 0 {
+                    assert!(lane.1 > 0, "the lane computed nothing");
+                }
+                tiers.free();
+                run.free();
+            }
+        }
+        drop(cnq);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The controller and its lookahead are invisible in the output. The synthetic 8-layer model,

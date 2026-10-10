@@ -4468,6 +4468,12 @@ pub struct ExpertTiers {
     lane_geo: MoeGeo,
     /// `CROW_GLM_CONTROLLER` with the CPU lane: the lane's device side (lane and stager on)
     dev_lane: Option<glm5_flags::DevLane>,
+    /// `CROW_GLM_CONTROLLER`: the controller's and the CPU lane's clocks, and when the
+    /// controller thread saw the request it is serving (`None` outside a controller job)
+    ctl_clock: std::sync::Arc<glm5_flags::CtlClock>,
+    ctl_seen: Option<std::time::Instant>,
+    /// the serving request's plan and reply spans (from `ctl_seen`), set by `finish_staged`
+    ctl_spans: (std::time::Duration, std::time::Duration),
     /// `CROW_GLM_CPU_LANE=split` as read at construction: the cost model of [`plan_split`]
     /// (`None` = `1` or off: the lane, if on, takes every pinned id)
     pub split: Option<SplitCost>,
@@ -4725,6 +4731,9 @@ impl ExpertTiers {
             lane_clock: Default::default(),
             lane_geo: *moe,
             dev_lane: None,
+            ctl_clock: Default::default(),
+            ctl_seen: None,
+            ctl_spans: Default::default(),
             split: lane_split(std::env::var(CPU_LANE_ENV).ok().as_deref()).then(|| SplitCost::for_threads(lane_threads)),
             heat: vec![0; nl * g.experts],
             stager: None,
@@ -4944,6 +4953,12 @@ impl ExpertTiers {
     /// shared: a report callback reads it while `generate` holds the tiers
     pub fn cpu_lane_clock(&self) -> std::sync::Arc<crate::glm5_moe::lane::Clock> {
         self.lane_clock.clone()
+    }
+
+    /// `CROW_GLM_CONTROLLER`: the controller's and the CPU lane's clocks since construction,
+    /// shared (a report reads them while `generate` holds the tiers)
+    pub fn ctl_clock(&self) -> std::sync::Arc<glm5_flags::CtlClock> {
+        self.ctl_clock.clone()
     }
 
     /// #187 (`glm5_run --cold`): empty the cache again, as after [`ExpertTiers::new`] (see
@@ -5388,6 +5403,18 @@ impl ExpertTiers {
     /// As [`ExpertTiers::table_for`]; the device published this call's request (so every earlier
     /// call's experts ran); `reply` is a mapped u64 the device waits on.
     pub unsafe fn table_reply(&mut self, layer: usize, sel: &[i32], reply: Dev, q: u64) -> Result<(), String> {
+        let seen = std::time::Instant::now();
+        self.ctl_seen = Some(seen);
+        let r = self.table_reply_seen(layer, sel, reply, q);
+        self.ctl_seen = None;
+        let (plan, rep) = std::mem::take(&mut self.ctl_spans);
+        if r.is_ok() {
+            self.ctl_clock.served(plan, rep, seen.elapsed());
+        }
+        r
+    }
+
+    unsafe fn table_reply_seen(&mut self, layer: usize, sel: &[i32], reply: Dev, q: u64) -> Result<(), String> {
         let l = layer.checked_sub(self.first_moe).filter(|&l| l < self.slots.len()).ok_or_else(|| format!("expert tiers: layer {layer} is no MoE layer"))?;
         if self.stager.is_none() {
             return Err(format!("{}=1 needs {STAGER_ENV}=1", glm5_flags::ENV_CONTROLLER));
@@ -5453,6 +5480,7 @@ impl ExpertTiers {
         reply: Option<(Dev, u64)>,
     ) -> Result<(), String> {
         let experts = self.cache.experts;
+        let plan_at = self.ctl_seen.map(|t| t.elapsed());
         let dev_lane = reply.is_some() && self.dev_lane.is_some();
         if dev_lane {
             if let Some((_, cpu)) = lane.as_ref() {
@@ -5481,8 +5509,12 @@ impl ExpertTiers {
             Some((w, q)) => {
                 cuda::ck(sys::cuStreamWriteValue64_v2(stream, w, q, 0));
                 cuda::stream_query(stream);
+                if let (Some(t), Some(p)) = (self.ctl_seen, plan_at) {
+                    self.ctl_spans = (p, t.elapsed());
+                }
                 crate::glm5_moe::lane::post(None);
                 if dev_lane {
+                    let t0 = std::time::Instant::now();
                     let cpu: Vec<(usize, *const u8)> = match lane.as_ref() {
                         Some((combos, _)) => {
                             // the CPU reads its records once the moves that put them there ran
@@ -5492,7 +5524,9 @@ impl ExpertTiers {
                         }
                         None => Vec::new(),
                     };
+                    let wait = t0.elapsed();
                     self.dev_lane.as_ref().expect("dev lane").serve(q, &cpu, &self.lane_geo, &self.lane_clock);
+                    self.ctl_clock.cpu_job(t0.elapsed(), wait);
                 }
             }
         }
