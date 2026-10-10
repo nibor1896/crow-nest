@@ -277,6 +277,8 @@ fn counters_json(p: &Phase, rb: u64) -> Value {
         "h2d_promotion_records_per_token": m.stage_to_vram as f64 / t,
         "visits": m.visits, "visits_per_token": m.visits as f64 / t,
         "hits": { "vram": tot[0], "pinned": tot[1], "nvme": tot[2] },
+        // #188: the tier each routed pick was served from, per token
+        "hits_per_token": { "vram": tot[0] as f64 / t, "pinned": tot[1] as f64 / t, "nvme": tot[2] as f64 / t },
         "hit_rate": { "vram": tot[0] as f64 / visits, "pinned": tot[1] as f64 / visits, "nvme": tot[2] as f64 / visits },
         "tier_sum_equals_visits": tot[0] + tot[1] + tot[2] == m.visits,
         "nvme_reads": p.nvme_reads, "r_nvme_reads_per_token": p.nvme_reads as f64 / t,
@@ -566,17 +568,22 @@ fn machine_line(m: &Value) -> String {
 }
 
 /// #188 `CROW_GLM_ARENA=global`: the VRAM slots the decode calls may use now (enabled: the ring
-/// and the handed-back elastic chunks left out), the elastic chunks live and the elastic part's
-/// counters (`ElasticStats`); `null` on the per-layer path
+/// and the handed-back elastic chunks left out; the lent prefill staging set in), the elastic
+/// chunks live, the elastic part's counters (`ElasticStats`: T's skipped refills, the lent
+/// staging set), whether the staging set is lent now, and the VRAM the `CROW_GLM_ARENA_STAGE_GB`
+/// buffers hold now (0 between staged forwards with an elastic part); `null` on the per-layer path
 fn arena_json(tiers: &ExpertTiers) -> Value {
     let (Some(a), Some((live, all, vpl)), Some(e)) = (tiers.arena(), tiers.elastic_live(), tiers.arena_elastic_stats()) else { return Value::Null };
     json!({
         "vram_slots_enabled": a.enabled_vram(), "elastic_live_chunks": live, "elastic_chunks": all, "slots_per_chunk": vpl,
+        "stage_lent": tiers.stage_lent(), "stage_buffers_vram_bytes": tiers.arena_stage_vram_bytes(),
         "elastic": {
             "chunks": e.chunks, "enter": e.enter, "exit": e.exit, "realloc_fail": e.realloc_fail, "write_backs": e.write_backs,
             "lifted": e.lifted, "lift_bytes": e.lift_bytes, "refills": e.refills, "refilled": e.refilled, "refill_nvme": e.refill_nvme,
             "enter_free_bytes": e.enter_free_bytes, "exit_free_bytes": e.exit_free_bytes,
             "regrows": e.regrows, "regrown": e.regrown, "regrow_floor_bytes": e.regrow_floor_bytes,
+            "lazy_refills": e.lazy_refills, "lazy_slots": e.lazy_slots,
+            "lend_slots": e.lend_slots, "lends": e.lends, "take_backs": e.take_backs, "lend_write_backs": e.lend_write_backs,
         },
     })
 }
@@ -585,10 +592,11 @@ fn arena_line(a: &Value) -> String {
     let e = &a["elastic"];
     let gib = |v: &Value| v.as_u64().unwrap_or(0) as f64 / (1u64 << 30) as f64;
     format!(
-        "VRAM slots {} ({} of {} elastic chunks x {} live); elastic enter {} exit {} realloc_fail {} write_backs {} refilled {} (NVMe {}), free VRAM at the last hand-back {:.2} GiB, at the last regrowth try {:.2} GiB; regrowths {} brought back {} chunks (floor {:.2} GiB)",
+        "VRAM slots {} ({} of {} elastic chunks x {} live); elastic enter {} exit {} realloc_fail {} write_backs {} refilled {} (NVMe {}), free VRAM at the last hand-back {:.2} GiB, at the last regrowth try {:.2} GiB; regrowths {} brought back {} chunks (floor {:.2} GiB); lazy refills {} left {} slots empty; staging set lent {} ({} slots, lends {} take-backs {} write-backs {}); staging buffers {:.2} GiB now",
         a["vram_slots_enabled"], a["elastic_live_chunks"], a["elastic_chunks"], a["slots_per_chunk"],
         e["enter"], e["exit"], e["realloc_fail"], e["write_backs"], e["refilled"], e["refill_nvme"],
-        gib(&e["enter_free_bytes"]), gib(&e["exit_free_bytes"]), e["regrows"], e["regrown"], gib(&e["regrow_floor_bytes"])
+        gib(&e["enter_free_bytes"]), gib(&e["exit_free_bytes"]), e["regrows"], e["regrown"], gib(&e["regrow_floor_bytes"]),
+        e["lazy_refills"], e["lazy_slots"], a["stage_lent"], e["lend_slots"], e["lends"], e["take_backs"], e["lend_write_backs"], gib(&a["stage_buffers_vram_bytes"])
     )
 }
 
