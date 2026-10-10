@@ -2381,6 +2381,108 @@ pub fn nvpf_plan(place: &dyn Fn(usize, u32) -> Place, l0: usize, nl: usize, expe
     StagePlan { l0, layers, nv, gen }
 }
 
+/// #196 NVPF early (`CROW_GLM_PREFILL_NVPF_EARLY=1`, with [`PREFILL_NVPF_ENV`] on): the
+/// read-ahead plan of a prompt call begins right after its embedding
+/// ([`ExpertTiers::nvpf_early`], before the dense layers and the first MoE layer's attention), and
+/// it plans every NVMe-tier expert of each layer instead of at most the ring's slots
+/// ([`nvpf_plan`] `per_layer` = the experts), so no planned layer reads a record on the host path.
+/// The copy stream then takes a layer's planned reads in ascending plan order ([`NvpfRowOrder`]),
+/// which keeps the ring free of deadlock however many reads a layer has. The bytes copied are the
+/// same records, so the ids are the same. Off (default) = unchanged.
+pub const PREFILL_NVPF_EARLY_ENV: &str = "CROW_GLM_PREFILL_NVPF_EARLY";
+
+/// whether [`PREFILL_NVPF_EARLY_ENV`] is `1`
+pub fn prefill_nvpf_early_on(v: Option<&str>) -> bool {
+    v.map(str::trim) == Some("1")
+}
+
+/// #196 NVPF early: the copy-stream order of one layer's planned ring reads (row entries `0..n`,
+/// plan reads ascending with `j`), for a layer that plans more reads than the ring has slots.
+///
+/// Why the ring cannot deadlock. The ring reader reads the plan in FIFO order `g`; read `g` goes
+/// into slot `g % slots` only once the copy stream raised the done flag of read `g - slots` (the
+/// slot's previous occupant). The copy stream takes read `g` behind a device wait on its landed
+/// flag. A deadlock needs the stream to wait at some read `g` while read `g - slots` is queued
+/// *behind* `g` on the stream (or not queued yet): only then can the reader not land `g`. In this
+/// order every planned read of the forward is queued on the stream exactly once and strictly
+/// ascending in `g`: a layer's reads are all queued before the next layer's ([`NvpfRowOrder::finish`]
+/// at its end, the plan's per-layer cursor), and inside a layer each sub-batch's reads are queued
+/// sorted at its end, every not-taken read below them consumed in place first (a consumed entry
+/// can no longer be taken: a later sub-batch wanting it reads it on the host path). So while the
+/// stream waits at `g`, every read below `g`, `g - slots` among them, is ahead of it on the stream
+/// and has passed (its landed wait passed, by induction), its done flag is up without any host
+/// action, the reader has submitted every read below `g` and can read `g`, and that NVMe read
+/// lands: the stream drains. The expert-major prompt call (`glm5_model::ExpertMajor`) hands over
+/// its experts ascending, each in exactly one sub-batch, so its sub-batches take ascending row
+/// entries and none falls back to the host path. The capped plan of [`PREFILL_NVPF_ENV`] consumes
+/// a layer's untaken reads only at the layer's end: a row longer than the ring could then wait at
+/// read `g` for the slot of an unrouted read `g - slots` queued behind it, which is why that plan
+/// stops at `slots` reads a layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NvpfRowOrder {
+    /// 0 free, 1 taken by the current sub-batch, 2 queued on the stream (copied or consumed)
+    state: Vec<u8>,
+    /// every entry below is queued
+    next: usize,
+    /// entries consumed without a copy that no sub-batch took
+    pub unused: u64,
+}
+
+impl NvpfRowOrder {
+    pub fn new(n: usize) -> NvpfRowOrder {
+        NvpfRowOrder { state: vec![0; n], next: 0, unused: 0 }
+    }
+
+    /// whether the current sub-batch may take row entry `j` (free and not below the queued part);
+    /// taken now if so
+    pub fn take(&mut self, j: usize) -> bool {
+        if j >= self.next && self.state[j] == 0 {
+            self.state[j] = 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// the stream order of the current sub-batch's end: `copy` = its taken entries
+    /// `(j, staging slot)` whose landing is staged; returns `(j, Some(slot))` copies and
+    /// `(j, None)` consumptions, strictly ascending in `j`: every entry below a copy not queued yet
+    /// is consumed first (also one taken but missing from `copy`, after a failed read batch)
+    pub fn flush(&mut self, mut copy: Vec<(usize, u32)>) -> Vec<(usize, Option<u32>)> {
+        copy.sort_unstable_by_key(|x| x.0);
+        let mut out = Vec::with_capacity(copy.len());
+        for (j, s) in copy {
+            debug_assert!(j >= self.next && self.state[j] == 1, "NVPF early: row entry {j} copied twice or below the queued part {}", self.next);
+            if j < self.next || self.state[j] != 1 {
+                continue;
+            }
+            self.consume_to(j, &mut out);
+            self.state[j] = 2;
+            out.push((j, Some(s)));
+            self.next = j + 1;
+        }
+        out
+    }
+
+    /// the layer's end: every entry not queued yet, consumed in order
+    pub fn finish(&mut self) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.consume_to(self.state.len(), &mut out);
+        out.into_iter().map(|x| x.0).collect()
+    }
+
+    fn consume_to(&mut self, end: usize, out: &mut Vec<(usize, Option<u32>)>) {
+        for x in self.next..end {
+            if self.state[x] != 2 {
+                self.unused += u64::from(self.state[x] == 0);
+                self.state[x] = 2;
+                out.push((x, None));
+            }
+        }
+        self.next = self.next.max(end);
+    }
+}
+
 /// #196 [`serve_chunk_global`] with `CROW_GLM_STAGE_OVERLAP=1`: no host barrier between
 /// sub-batches; each sub-batch's copies are bracketed by `begin_batch` / `end_batch`, so a mover
 /// on a copy stream with staging halves (the global [`PrefillMover`]) fills half `j % 2` while
@@ -3279,6 +3381,9 @@ struct StageSet {
     /// #196 NVPF: the engine's open plan is a read-ahead plan of sub-batched prompt calls
     /// ([`nvpf_plan`]), not a staged forward's
     nvpf: bool,
+    /// #196 NVPF early ([`PREFILL_NVPF_EARLY_ENV`]): that plan holds every NVMe-tier expert of
+    /// each layer (uncapped), consumed in plan order ([`NvpfRowOrder`])
+    nvpf_all: bool,
 }
 
 /// The global arena on the device: the host policy, its switches, the VRAM chunks its slots live
@@ -3615,6 +3720,7 @@ impl ExpertTiers {
                 in_forward: false,
                 stats: StageStats { ring_slots: prefill_ring_slots(nst) as u64, ..StageStats::default() },
                 nvpf: false,
+                nvpf_all: false,
             });
         }
         if let Some(path) = d.cfg.warm.clone() {
@@ -3885,13 +3991,48 @@ impl ExpertTiers {
         if !open {
             st.stats.host_wait_ns += Self::stage_plan_end(st, rb);
             let a = &d.a;
-            let plan = nvpf_plan(&|l, e| a.place(l, e), l, nl, experts, st.eng.slots, gen);
+            // #196 NVPF early: every NVMe-tier expert of each layer, read in plan order (the ring
+            // cannot deadlock, [`NvpfRowOrder`]); else at most the ring's slots a layer
+            let all = prefill_nvpf_early_on(std::env::var(PREFILL_NVPF_EARLY_ENV).ok().as_deref());
+            let per_layer = if all { experts } else { st.eng.slots };
+            let plan = nvpf_plan(&|l, e| a.place(l, e), l, nl, experts, per_layer, gen);
             st.eng.begin(plan, &self.records, &self.src, rb);
             st.nvpf = true;
+            st.nvpf_all = all;
             st.stats.nvpf_plans += 1;
         }
         let err = st.eng.sh.err.lock().unwrap().take();
         err.map_or(Ok(()), Err)
+    }
+
+    /// #196 NVPF early ([`PREFILL_NVPF_EARLY_ENV`]): the read-ahead plan of a prompt call of
+    /// `rows` rows begins now, right after its embedding (`Glm5Run::prompt_calls_with`), at the
+    /// first MoE layer, so the ring reader reads that layer's NVMe records while the dense layers
+    /// and its attention run instead of from its routing on. Only when the call's first MoE layer
+    /// will be served on that plan ([`ExpertTiers::tables_for_chunk_global`]): the switch,
+    /// [`PREFILL_NVPF_ENV`] and [`STAGE_OVERLAP_ENV`] on, staging on and no staged forward open,
+    /// at least the NVPF minimum rows, and the call not staged (below the staging minimum, or the
+    /// prompt's per-forward buffers do not fit: `fit` 0). That call then keeps the plan (same
+    /// layer, same placement generation; else it plans again, as without this). Else a no-op.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn nvpf_early(&mut self, rows: usize) -> Result<(), String> {
+        let env = |k: &str| std::env::var(k).ok();
+        if !prefill_nvpf_early_on(env(PREFILL_NVPF_EARLY_ENV).as_deref()) || !prefill_nvpf_on(env(PREFILL_NVPF_ENV).as_deref()) || !stage_overlap_on(env(STAGE_OVERLAP_ENV).as_deref()) {
+            return Ok(());
+        }
+        let Some(d) = self.arena.as_ref() else { return Ok(()) };
+        let Some(st) = d.stage.as_ref() else { return Ok(()) };
+        // the first MoE call stages (`stage_call`) at the staging minimum unless its buffers do not fit
+        let staged = rows * self.topk >= d.cfg.stage_min && (st.permanent || st.fit != Some(0));
+        if st.in_forward || staged || rows < prefill_nvpf_min_rows(env(PREFILL_NVPF_MIN_ROWS_ENV).as_deref())? {
+            return Ok(());
+        }
+        // what that call does before it plans: the stager's reads of earlier decode calls settled
+        self.settle()?;
+        self.drain_flying()?;
+        self.nvpf_begin(0)
     }
 
     /// #196 NVPF tests: per read of the open read-ahead plan (MoE layer, expert, landed in the
@@ -4201,6 +4342,7 @@ impl ExpertTiers {
         }
         let cs = self.pf_ring.as_ref().expect("the prefill ring is allocated with the staging set").cs;
         let d = self.arena.as_mut().expect("tables_for_chunk_global without the global arena");
+        let st_all = nvpf && d.stage.as_ref().is_some_and(|st| st.nvpf_all);
         d.a.set_pin_stay(self.pinned_use.stay);
         // prompt calls admit nothing, so write no ring entry: let the pending ones land first (NVPF:
         // the copy stream that reads the pinned slots waits for them, the host does not)
@@ -4248,7 +4390,9 @@ impl ExpertTiers {
                 let eng = &d.stage.as_ref().expect("NVPF without staging").eng;
                 let plan = eng.plan.as_ref().expect("NVPF without a plan");
                 let row = &plan.layers[l - plan.l0];
-                let mut m = NvpfMover { inner: gm, eng, row, taken: vec![false; row.len()], planned: Vec::new(), copied: 0, host: 0 };
+                // #196 NVPF early: a plan of every NVMe-tier expert is consumed in plan order
+                let order = st_all.then(|| NvpfRowOrder::new(row.len()));
+                let mut m = NvpfMover { inner: gm, eng, row, taken: vec![false; row.len()], planned: Vec::new(), copied: 0, host: 0, order, ready: Vec::new() };
                 let r = serve_chunk_global_overlap(&mut d.a, l, sel, k, half, &mut m, &mut each);
                 let unused = m.finish_layer();
                 nv = Some((m.copied, m.host, unused, row.last().map(|&(_, s)| s)));
@@ -5821,6 +5965,7 @@ mod arena_gpu_tests {
                 STAGE_OVERLAP_ENV,
                 PREFILL_NVPF_ENV,
                 PREFILL_NVPF_MIN_ROWS_ENV,
+                PREFILL_NVPF_EARLY_ENV,
             ];
             let old = names.iter().map(|n| (n.to_string(), std::env::var(n).ok())).collect();
             for n in names {
@@ -6072,6 +6217,164 @@ mod arena_gpu_tests {
         let p = nvpf_plan(&place, 0, 2, 8, 3, 0);
         assert_eq!(p.layers.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![3, 3]);
         assert_eq!(p.nv, vec![(0, 2), (0, 3), (0, 6), (1, 2), (1, 3), (1, 6)]);
+    }
+
+    /// the stage engine's ring of `slots` slots on the host: the reader reads plan reads `0..reads`
+    /// in FIFO order, read `g` only once the done flag of read `g - slots` (its slot's previous
+    /// occupant) is up; the copy stream takes `ops` in order, each behind a wait on the read's
+    /// landed flag, raising its done flag. Whether the stream drains (`false` = deadlock).
+    fn ring_drains(ops: &[usize], reads: usize, slots: usize) -> bool {
+        let (mut landed, mut done) = (vec![false; reads], vec![false; reads]);
+        let (mut rd, mut sp) = (0usize, 0usize);
+        loop {
+            let mut moved = false;
+            while rd < reads && (rd < slots || done[rd - slots]) {
+                landed[rd] = true;
+                rd += 1;
+                moved = true;
+            }
+            while sp < ops.len() && landed[ops[sp]] {
+                done[ops[sp]] = true;
+                sp += 1;
+                moved = true;
+            }
+            if sp == ops.len() {
+                return true;
+            }
+            if !moved {
+                return false;
+            }
+        }
+    }
+
+    /// the copy-stream order of a forward's planned reads under [`NvpfMover`]'s rules: `layers[l]`
+    /// = per sub-batch the row entries it wants, in landing order, rows of `n` entries (read
+    /// `l * n + j`). `ordered` = NVPF early ([`NvpfRowOrder`]), else the capped plan's mover
+    /// (each copy queued at its landing, untaken reads at the layer's end). Returns (stream order,
+    /// records copied out of the ring, records read on the host path, unused reads).
+    fn nvpf_stream(layers: &[Vec<Vec<usize>>], n: usize, ordered: bool) -> (Vec<usize>, u64, u64, u64) {
+        let (mut ops, mut copied, mut host, mut unused) = (Vec::new(), 0u64, 0u64, 0u64);
+        for (l, batches) in layers.iter().enumerate() {
+            if ordered {
+                let mut o = NvpfRowOrder::new(n);
+                for b in batches {
+                    let mut copy = Vec::new();
+                    for (s, &j) in b.iter().enumerate() {
+                        if o.take(j) {
+                            copy.push((j, s as u32));
+                        } else {
+                            host += 1;
+                        }
+                    }
+                    for (j, slot) in o.flush(copy) {
+                        ops.push(l * n + j);
+                        copied += u64::from(slot.is_some());
+                    }
+                }
+                ops.extend(o.finish().into_iter().map(|j| l * n + j));
+                unused += o.unused;
+            } else {
+                let mut taken = vec![false; n];
+                for b in batches {
+                    for &j in b {
+                        if taken[j] {
+                            host += 1;
+                        } else {
+                            taken[j] = true;
+                            ops.push(l * n + j);
+                            copied += 1;
+                        }
+                    }
+                }
+                let rest: Vec<usize> = (0..n).filter(|&j| !taken[j]).collect();
+                unused += rest.len() as u64;
+                ops.extend(rest.into_iter().map(|j| l * n + j));
+            }
+        }
+        (ops, copied, host, unused)
+    }
+
+    /// #196 NVPF early (`CROW_GLM_PREFILL_NVPF_EARLY=1`): the switch; the uncapped plan holds every
+    /// NVMe-tier expert; the row order queues every planned read once, strictly ascending, so the
+    /// ring drains for any row length and ring size, while the capped plan's mover order deadlocks
+    /// a row longer than the ring (why that plan stops at the ring's slots). Expert-major
+    /// sub-batches (ascending experts, each once) read nothing on the host path; token-row
+    /// sub-batches (any order, repeats) stay correct, a repeat or a passed entry on the host path.
+    #[test]
+    fn glm5_nvpf_early_row_order_drains_the_ring_and_the_capped_order_would_not() {
+        assert!(prefill_nvpf_early_on(Some("1")) && prefill_nvpf_early_on(Some(" 1 ")));
+        assert!(!prefill_nvpf_early_on(None) && !prefill_nvpf_early_on(Some("0")) && !prefill_nvpf_early_on(Some("on")));
+        // every expert on the NVMe but the VRAM ones (e % 4 == 0): 12 of 16 a layer
+        let place = |_: usize, e: u32| if e % 4 == 0 { Place::Vram(e) } else { Place::Nvme };
+        assert_eq!(nvpf_plan(&place, 0, 3, 16, 16, 0).layers.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![12; 3], "uncapped: every NVMe-tier expert");
+        assert_eq!(nvpf_plan(&place, 0, 3, 16, 4, 0).layers.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![4; 3], "capped at the ring's slots");
+        // an expert-major forward: 3 layers of 40 planned reads, a ring of 4 slots; the unrouted
+        // entries include runs longer than the ring; sub-batches of 6 ascending experts, each
+        // sub-batch's landings in a scrambled order
+        let (n, nl, slots) = (40usize, 3usize, 4usize);
+        let unrouted = [1usize, 2, 3, 7, 20, 21, 22, 23, 24, 25, 39];
+        let routed: Vec<usize> = (0..n).filter(|j| !unrouted.contains(j)).collect();
+        let batches: Vec<Vec<usize>> = routed.chunks(6).map(|c| c.iter().rev().copied().collect()).collect();
+        let layers = vec![batches; nl];
+        let (ops, copied, host, unused) = nvpf_stream(&layers, n, true);
+        assert_eq!(ops, (0..nl * n).collect::<Vec<_>>(), "every planned read once, in plan order");
+        assert_eq!((copied, host, unused), ((nl * routed.len()) as u64, 0, (nl * unrouted.len()) as u64));
+        assert!(ring_drains(&ops, nl * n, slots), "NVPF early drains a ring of {slots} slots");
+        let (old, ..) = nvpf_stream(&layers, n, false);
+        assert!(!ring_drains(&old, nl * n, slots), "the capped mover's order on an uncapped row deadlocks");
+        // the capped plan itself (rows of at most the ring's slots) drains in that order
+        let capped: Vec<Vec<Vec<usize>>> = vec![vec![vec![3, 1], vec![2]]; nl];
+        assert!(ring_drains(&nvpf_stream(&capped, slots, false).0, nl * slots, slots));
+        // fuzz: token-row sub-batches (random entries, any order, repeats) and expert-major ones,
+        // rows of 1..48 entries, rings of 1..8 slots
+        let mut x = 0x0196_EA41_u64;
+        let mut rnd = |m: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % m as u64) as usize
+        };
+        for case in 0..400 {
+            let n = 1 + rnd(48);
+            let major = case % 2 == 0;
+            let nl = 1 + rnd(3);
+            let mut layers: Vec<Vec<Vec<usize>>> = Vec::new();
+            for _ in 0..nl {
+                if major {
+                    let want: Vec<usize> = (0..n).filter(|_| rnd(5) != 0).collect();
+                    let mut out = Vec::new();
+                    let mut i = 0;
+                    while i < want.len() {
+                        let k = 1 + rnd(9);
+                        let mut b = want[i..(i + k).min(want.len())].to_vec();
+                        b.reverse();
+                        out.push(b);
+                        i += k;
+                    }
+                    layers.push(out);
+                } else {
+                    let nb = 1 + rnd(8);
+                    let mut out = Vec::new();
+                    for _ in 0..nb {
+                        let k = 1 + rnd(8);
+                        out.push((0..k).map(|_| rnd(n)).collect());
+                    }
+                    layers.push(out);
+                }
+            }
+            let reads = nl * n;
+            let wanted: u64 = layers.iter().flatten().map(|b| b.len() as u64).sum();
+            let (ops, copied, host, unused) = nvpf_stream(&layers, n, true);
+            assert_eq!(ops, (0..reads).collect::<Vec<_>>(), "case {case}: every planned read once, ascending");
+            assert_eq!(copied + host, wanted, "case {case}: every wanted record copied or read on the host path");
+            assert_eq!(copied + unused, reads as u64, "case {case}: every planned read copied or unused (none taken twice)");
+            if major {
+                assert_eq!(host, 0, "case {case}: expert-major sub-batches read nothing on the host path");
+            }
+            for slots in 1..=8 {
+                assert!(ring_drains(&ops, reads, slots), "case {case}: n {n}, {slots} slots");
+            }
+        }
     }
 
     #[test]
@@ -6403,6 +6706,166 @@ extern "C" __global__ void hold(long long ns)
             t.free();
             m.unload();
         }
+        drop(cnq);
+    }
+
+    /// #196 NVPF early (`CROW_GLM_PREFILL_NVPF_EARLY=1`) against off, every expert on the NVMe
+    /// (16 a layer) and a ring of 4 slots (a quarter of a layer's reads, 2 in flight): a forward
+    /// of expert-major prompt calls (each layer's selected experts ascending, 8 per pseudo-row,
+    /// 6 unrouted, among them a run longer than the ring), then a forward of token-row calls.
+    /// Every table entry holds its record's bytes (read_range) in both arms, so the experts
+    /// served are the same on and off. On: `nvpf_early` opens the plan before any prompt call and
+    /// layer 0's first ring-full lands before it; the expert-major forward runs on that one plan,
+    /// every NVMe record copied out of the ring (none on the host path), each planned read copied
+    /// or consumed once; off: the plan stops at the ring's 4 slots a layer, the rest is read on
+    /// the host path. A watchdog aborts the test process if a forward hangs (a deadlocked ring).
+    #[test]
+    #[ignore = "needs the GPU (about 1 GB VRAM, a 606 MB synthetic container in the temp dir): cargo test --release --lib glm5_nvpf_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_nvpf_gpu_early_uncapped_plan_through_a_ring_smaller_than_a_layer() {
+        let (nl, ex, k) = (4usize, 16u32, 8usize);
+        let s = synth(nl as u32, ex);
+        let mut g = Glm5Geo::GLM_5_3_FLASH;
+        (g.layers, g.dense_prefix, g.experts, g.topk) = (3 + nl, 3, ex as usize, k);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let rb = spec.bytes as usize;
+        let want: Vec<Vec<Vec<u8>>> =
+            (0..nl).map(|l| (0..ex).map(|e| cnq.read_range(&cnq.find(&crate::nvme_source::glm5_expert_tensor_name(3 + l as u32, e, "gate"), "text").clone(), 0, rb)).collect()).collect();
+        let tr = routing(16, nl, ex as u64, k, 0x196E);
+        // layer l leaves out experts l+1 ..= l+5 (a run of 5 > 4 slots) and l+9; the rest routed,
+        // handed over as `ExpertMajor::sel` does: ascending, 8 a pseudo-row, the last one padded
+        let unrouted = |l: usize| -> Vec<u32> { (1..=5).chain([9]).map(|i| ((l + i) % ex as usize) as u32).collect() };
+        let major = |l: usize| -> Vec<i32> {
+            let u = unrouted(l);
+            let e: Vec<u32> = (0..ex).filter(|x| !u.contains(x)).collect();
+            let mut v = Vec::new();
+            for row in e.chunks(k) {
+                v.extend(row.iter().map(|&x| x as i32));
+                v.extend(std::iter::repeat_n(row[0] as i32, k - row.len()));
+            }
+            v
+        };
+        let stage_gb = format!("{}", ex as f64 * REC as f64 / (1u64 << 30) as f64);
+        // the watchdog stops when this test returns or panics
+        struct Done(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let done = Done(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        {
+            let done = done.0.clone();
+            std::thread::spawn(move || {
+                let t0 = std::time::Instant::now();
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    if t0.elapsed() > std::time::Duration::from_secs(240) {
+                        eprintln!("glm5_nvpf_gpu_early: no progress in 240 s, the ring deadlocked");
+                        std::process::abort();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
+        }
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            for early in [false, true] {
+                let mut kv = vec![
+                    (ARENA_ENV, "global"),
+                    (ARENA_VRING_ENV, "0"),
+                    (ARENA_STAGE_ENV, stage_gb.as_str()),
+                    (ARENA_STAGE_MIN_ENV, "1000000"),
+                    (STAGE_OVERLAP_ENV, "1"),
+                    (PREFILL_NVPF_ENV, "1"),
+                    (PREFILL_NVPF_MIN_ROWS_ENV, "1"),
+                ];
+                if early {
+                    kv.push((PREFILL_NVPF_EARLY_ENV, "1"));
+                }
+                let _env = Env::set(&kv);
+                let what = format!("early {early}");
+                let mut t = ExpertTiers::new(&cnq, &s.path, &g, &moe, TierSizes { vram: 0, pinned: 0 }, 1, 16).unwrap();
+                t.set_stage_ring(4, 2);
+                t.alloc_prefill_stage(16).unwrap();
+                // check every served entry of a sub-batch against read_range (the host waits for
+                // the copy stream, which waits for the ring)
+                let check = |l: usize, sel: &[i32], r0: usize, n: usize, tb: Dev| {
+                    cuda::sync();
+                    let table = cuda::dtoh_u64(tb, ex as usize);
+                    let mut ids: Vec<u32> = sel[r0 * k..(r0 + n) * k].iter().map(|&e| e as u32).collect();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    for &e in &ids {
+                        let got: Vec<u8> = cuda::dtoh_t(table[e as usize], rb);
+                        assert!(got == want[l][e as usize], "{what}: layer {l} expert {e}: the bytes differ from read_range");
+                    }
+                    ids.len()
+                };
+                // forward 1: expert-major prompt calls of 4 token rows (32 picks)
+                t.nvpf_early(4).unwrap();
+                match t.nvpf_landed() {
+                    Some(plan) => {
+                        assert!(early, "{what}: no plan before the first prompt call when off");
+                        let per: Vec<usize> = (0..nl).map(|x| plan.iter().filter(|p| p.0 == x).count()).collect();
+                        assert_eq!(per, vec![ex as usize; nl], "{what}: the plan holds every NVMe expert of every layer");
+                        let t0 = std::time::Instant::now();
+                        while !t.nvpf_landed().unwrap()[..4].iter().all(|x| x.2) && t0.elapsed() < std::time::Duration::from_secs(10) {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        assert!(t.nvpf_landed().unwrap()[..4].iter().all(|x| x.2), "{what}: layer 0's first ring-full landed before its prompt call");
+                        eprintln!("glm5_nvpf_gpu_early {what}: layer 0's first 4 reads landed {:?} after nvpf_early, before any prompt call", t0.elapsed());
+                    }
+                    None => assert!(!early, "{what}: nvpf_early opens the plan"),
+                }
+                let mut served = 0usize;
+                for l in 0..nl {
+                    let sel = major(l);
+                    let mut rows = 0;
+                    t.tables_for_prompt(3 + l, &sel, 4 * k, &mut |r0, n, tb| {
+                        served += check(l, &sel, r0, n, tb);
+                        rows += n;
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(rows, sel.len() / k, "{what}: layer {l}: every pseudo-row served");
+                }
+                let st = t.arena_stage_stats().unwrap().0;
+                eprintln!("glm5_nvpf_gpu_early {what}: expert-major forward {st:?}");
+                let routed = (nl * (ex as usize - 6)) as u64;
+                assert_eq!(served as u64, routed, "{what}: every routed expert served once");
+                assert_eq!((st.nvpf_plans, st.nvpf_calls, st.calls), (1, nl as u64, 0), "{what}: one read-ahead plan for the forward, every call on it");
+                if early {
+                    assert_eq!((st.nvpf_copied, st.nvpf_host, st.nvpf_unused), (routed, 0, (nl * 6) as u64), "{what}: every NVMe record out of the ring, the unrouted reads consumed");
+                } else {
+                    assert_eq!(st.nvpf_copied + st.nvpf_host, routed, "{what}");
+                    assert!(st.nvpf_host > 0 && st.nvpf_copied + st.nvpf_unused == (nl * 4) as u64, "{what}: the capped plan, 4 reads a layer, the rest on the host path");
+                }
+                // forward 2: token-row prompt calls (sub-batches in any expert order, repeats)
+                t.nvpf_early(4).unwrap();
+                for l in 0..nl {
+                    let sel: Vec<i32> = (0..4).flat_map(|r| tr[r][l].iter().map(|&e| e as i32)).collect();
+                    let mut rows = 0;
+                    t.tables_for_chunk(3 + l, &sel, &mut |r0, n, tb| {
+                        check(l, &sel, r0, n, tb);
+                        rows += n;
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(rows, 4, "{what}: layer {l}: every row served");
+                }
+                let st2 = t.arena_stage_stats().unwrap().0;
+                eprintln!("glm5_nvpf_gpu_early {what}: after the token-row forward {st2:?}");
+                assert_eq!((st2.nvpf_plans, st2.nvpf_calls), (2, 2 * nl as u64), "{what}: one plan per forward");
+                if early {
+                    assert_eq!(st2.nvpf_copied + st2.nvpf_unused, 2 * (nl * ex as usize) as u64, "{what}: every planned read copied or consumed once");
+                }
+                t.decode_ready();
+                assert!(t.nvpf_landed().is_none(), "{what}: the decode phase ends the plan");
+                t.free();
+            }
+        }
+        drop(done);
         drop(cnq);
     }
 }
@@ -7097,24 +7560,69 @@ impl Mover for GlobalPrefillMover<'_> {
 /// landed flag ([`StageEngine::enqueue`]), the host waits on nothing; a record outside the row,
 /// or one a second sub-batch of the call wants again (its ring slot may be reused by then), goes
 /// the host path ([`PrefillMover`]'s landing ring). [`NvpfMover::finish_layer`] consumes the
-/// row's records no copy was enqueued for, so the reader can reuse their slots.
+/// row's records no copy was enqueued for, so the reader can reuse their slots. #196 NVPF early
+/// ([`PREFILL_NVPF_EARLY_ENV`], `order` set): a sub-batch's planned copies are queued at its end
+/// in ascending plan order, untaken reads below them consumed first ([`NvpfRowOrder`]).
 struct NvpfMover<'a, 'e> {
     inner: GlobalPrefillMover<'a>,
     eng: &'e StageEngine,
     /// the layer's planned reads (ascending expert) and whether a sub-batch took each
     row: &'e [(u32, StageSrc)],
     taken: Vec<bool>,
-    /// staging slot of the current sub-batch -> its plan read (until its copy is enqueued)
+    /// staging slot of the current sub-batch -> its plan read (until its copy is enqueued); NVPF
+    /// early: -> its row entry
     planned: Vec<(u32, usize)>,
     copied: u64,
     host: u64,
+    /// NVPF early: the row's stream order (`None` = the capped plan's, copies queued at once)
+    order: Option<NvpfRowOrder>,
+    /// NVPF early: (row entry, staging slot) of the current sub-batch's staged landings, queued
+    /// at its end
+    ready: Vec<(usize, u32)>,
 }
 
 impl NvpfMover<'_, '_> {
+    /// the plan read of row entry `j`
+    fn read_of(&self, j: usize) -> usize {
+        let StageSrc::Nvme(g) = self.row[j].1 else { unreachable!("an NVPF plan holds NVMe reads only") };
+        g
+    }
+
+    /// NVPF early: queue the current sub-batch's planned copies on the copy stream in ascending
+    /// plan order, every untaken read below them consumed first ([`NvpfRowOrder::flush`])
+    fn flush_ready(&mut self) {
+        let Some(o) = self.order.as_mut() else { return };
+        let ops = o.flush(std::mem::take(&mut self.ready));
+        // a taken read whose landing was never staged (a failed read batch) is consumed by order
+        self.planned.clear();
+        let pm = &self.inner.inner;
+        for (j, slot) in ops {
+            let g = self.read_of(j);
+            // SAFETY: the stage engine's open plan holds read g; slot s of the current staging
+            // half takes a record, the copy stream waited for the half's last readers
+            unsafe { self.eng.enqueue(g, slot.map(|s| pm.base + s as u64 * pm.rb), pm.rb, pm.pf.cs) };
+            self.copied += u64::from(slot.is_some());
+        }
+    }
+
     /// consume (wait for, raise the done flag of) every planned read of the layer no copy was
     /// enqueued for, on the copy stream; returns how many no sub-batch took
     fn finish_layer(&mut self) -> u64 {
         let (rb, cs) = (self.inner.inner.rb, self.inner.inner.pf.cs);
+        if self.order.is_some() {
+            // a sub-batch that failed before its end: its staged landings are not copied
+            self.ready.clear();
+            self.planned.clear();
+            let o = self.order.as_mut().expect("NVPF early order");
+            let rest = o.finish();
+            let unused = o.unused;
+            for j in rest {
+                // SAFETY: the stage engine's open plan holds the read; nothing is copied
+                unsafe { self.eng.enqueue(self.read_of(j), None, rb, cs) };
+            }
+            unsafe { cuda::stream_query(cs) };
+            return unused;
+        }
         let mut n = 0;
         for (j, &(_, s)) in self.row.iter().enumerate() {
             let StageSrc::Nvme(g) = s else { continue };
@@ -7136,6 +7644,17 @@ impl Mover for NvpfMover<'_, '_> {
         let (mut rest, mut bytes) = (Vec::new(), 0u64);
         for &(e, d) in jobs {
             let Dst::Landing(i) = d else { panic!("a prompt call reads no record into a pinned slot") };
+            if let Some(o) = self.order.as_mut() {
+                match self.row.binary_search_by_key(&e, |x| x.0) {
+                    Ok(j) if o.take(j) => {
+                        self.planned.retain(|&(s, _)| s != i);
+                        self.planned.push((i, j));
+                        bytes += rb;
+                    }
+                    _ => rest.push((e, d)),
+                }
+                continue;
+            }
             match self.row.binary_search_by_key(&e, |x| x.0) {
                 Ok(j) if !self.taken[j] => {
                     let StageSrc::Nvme(g) = self.row[j].1 else { unreachable!("an NVPF plan holds NVMe reads only") };
@@ -7155,6 +7674,11 @@ impl Mover for NvpfMover<'_, '_> {
     }
     fn landing_to_stage(&mut self, i: u32) {
         match self.planned.iter().position(|&(s, _)| s == i) {
+            Some(p) if self.order.is_some() => {
+                // NVPF early: queued in plan order at the sub-batch's end
+                let (_, j) = self.planned.swap_remove(p);
+                self.ready.push((j, i));
+            }
             Some(p) => {
                 let (_, g) = self.planned.swap_remove(p);
                 let pm = &self.inner.inner;
@@ -7185,6 +7709,7 @@ impl Mover for NvpfMover<'_, '_> {
         self.inner.begin_batch(j);
     }
     fn end_batch(&mut self) {
+        self.flush_ready();
         self.inner.end_batch();
     }
 }
@@ -11042,6 +11567,8 @@ impl Glm5Run {
             let t0 = std::time::Instant::now();
             let base = RowBase::of(tiers);
             crate::glm5_embed::trunk_into(self.pass.kn.embed.as_ref(), cnq, &g, &ids[r0..r0 + t], self.x);
+            // #196 NVPF early: the call's read-ahead plan starts here, before the dense layers
+            tiers.nvpf_early(t)?;
             self.layers_chunk(tiers, pos0 + r0, t)?;
             rows(self, cnq, r0, t)?;
             if r0 + t == n {
