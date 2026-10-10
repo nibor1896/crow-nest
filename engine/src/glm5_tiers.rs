@@ -1159,6 +1159,14 @@ pub struct GlobalArena {
     gen: u64,
     counters: Vec<[u64; 3]>,
     pub stats: ArenaStats,
+    /// #195 S: the experts [`GlobalArena::disable`] wrote out of VRAM (an elastic hand-back) and
+    /// the VRAM slots [`GlobalArena::enable`] / [`GlobalArena::add_slots`] brought (back) since the
+    /// last refill ([`GlobalArena::refill_plan`])
+    lent: Vec<u32>,
+    fresh: Vec<u32>,
+    /// sybil's warm scores per key (`CROW_GLM_ARENA_WARM`, [`GlobalArena::set_scores`]); empty
+    /// without a warm file
+    score: Vec<f64>,
 }
 
 /// `vpin` of a disabled VRAM slot (the write-back ring, an elastic chunk handed back): never a victim
@@ -1198,15 +1206,19 @@ impl GlobalArena {
             gen: 0,
             counters: vec![[0; 3]; layers],
             stats: ArenaStats::default(),
+            lent: Vec::new(),
+            fresh: Vec::new(),
+            score: Vec::new(),
         })
     }
 
-    /// empty again (as [`GlobalArena::new`]); the switches and the disabled slots are kept
+    /// empty again (as [`GlobalArena::new`]); the switches, the warm scores and the disabled slots
+    /// are kept
     pub fn reset(&mut self) {
-        let (stay, noadmit, gen) = (self.pin_stay, self.noadmit, self.gen);
+        let (stay, noadmit, gen, score) = (self.pin_stay, self.noadmit, self.gen, std::mem::take(&mut self.score));
         let off: Vec<bool> = self.vpin.iter().map(|&p| p == DISABLED).collect();
         *self = GlobalArena::new(self.layers, self.experts, self.vowner.len(), self.rowner.len()).expect("the same shape");
-        (self.pin_stay, self.noadmit, self.gen) = (stay, noadmit, gen + 1);
+        (self.pin_stay, self.noadmit, self.gen, self.score) = (stay, noadmit, gen + 1, score);
         for (p, off) in self.vpin.iter_mut().zip(off) {
             if off {
                 *p = DISABLED;
@@ -1233,6 +1245,7 @@ impl GlobalArena {
     /// `n` more VRAM slots (an elastic chunk), empty and enabled, after the existing ones
     pub fn add_slots(&mut self, n: usize) {
         let m = self.vowner.len() + n;
+        self.fresh.extend(self.vowner.len() as u32..m as u32);
         self.vowner.resize(m, NONE);
         self.refb.resize(m, false);
         self.vpin.resize(m, 0);
@@ -1251,6 +1264,7 @@ impl GlobalArena {
             self.refb[s] = false;
             let v = std::mem::replace(&mut self.vowner[s], NONE);
             if v != NONE {
+                self.lent.push(v);
                 let v = v as usize;
                 self.record(v);
                 self.place[v] = Place::Nvme;
@@ -1272,8 +1286,121 @@ impl GlobalArena {
             debug_assert_eq!(self.vowner[s], NONE, "an enabled slot comes back empty");
             self.vpin[s] = 0;
             self.refb[s] = false;
+            self.fresh.push(s as u32);
         }
         self.gen += 1;
+    }
+
+    /// sybil's warm scores per MoE layer (as [`GlobalArena::warm_plan`]; a layer without scores
+    /// scores 0): the refill's second choice ([`GlobalArena::refill_plan`])
+    pub fn set_scores(&mut self, scores: &[Vec<f64>]) {
+        self.score = vec![0.0; self.layers * self.experts];
+        for (l, sc) in scores.iter().enumerate().take(self.layers).filter(|(_, s)| s.len() == self.experts) {
+            self.score[l * self.experts..(l + 1) * self.experts].copy_from_slice(sc);
+        }
+    }
+
+    /// #195 S: the brought-back VRAM slots ([`GlobalArena::enable`], [`GlobalArena::add_slots`])
+    /// still empty and enabled
+    pub fn refill_room(&self) -> usize {
+        let mut f: Vec<u32> = self.fresh.iter().copied().filter(|&s| self.vowner[s as usize] == NONE && self.vpin[s as usize] != DISABLED).collect();
+        f.sort_unstable();
+        f.dedup();
+        f.len()
+    }
+
+    /// #195 S: what goes into the brought-back VRAM slots after a prompt instead of leaving them
+    /// empty, per MoE layer (ascending ids): first the experts the hand-back wrote out of VRAM
+    /// ([`GlobalArena::disable`], the decode's set before the prompt), then the highest warm
+    /// scores (ties the lower key); never an expert in VRAM or whose read is in flight, at most
+    /// [`GlobalArena::refill_room`]. [`GlobalArena::fill`] places them; [`GlobalArena::refill_end`]
+    /// forgets the hand-back.
+    pub fn refill_plan(&self) -> Vec<Vec<u32>> {
+        let mut room = self.refill_room();
+        let mut out = vec![Vec::new(); self.layers];
+        if room == 0 {
+            return out;
+        }
+        let mut taken = vec![false; self.place.len()];
+        let mut by_score: Vec<u32> = (0..self.score.len() as u32).filter(|&k| self.score[k as usize] > 0.0).collect();
+        by_score.sort_by(|&a, &b| self.score[b as usize].partial_cmp(&self.score[a as usize]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+        for &k in self.lent.iter().chain(&by_score) {
+            if room == 0 {
+                break;
+            }
+            let ku = k as usize;
+            let busy = match self.place[ku] {
+                Place::Vram(_) => true,
+                Place::Ram(q) => self.rflight[q as usize] != 0,
+                Place::Nvme => false,
+            };
+            if busy || std::mem::replace(&mut taken[ku], true) {
+                continue;
+            }
+            out[ku / self.experts].push((ku % self.experts) as u32);
+            room -= 1;
+        }
+        for v in &mut out {
+            v.sort_unstable();
+        }
+        out
+    }
+
+    /// #195 S: experts `ids` of MoE layer `l` (none in VRAM, none in flight) into brought-back
+    /// empty VRAM slots, the lowest first: a pinned copy is freed (exclusive), an NVMe one is read
+    /// by the caller. No access is counted and no resident is evicted; an id without such a slot
+    /// stays where it is. Returns the net changes as [`GlobalArena::step`] does.
+    pub fn fill(&mut self, l: usize, ids: &[u32]) -> Vec<(u32, Place, Place)> {
+        assert!(l < self.layers, "global arena: layer {l} outside 0..{}", self.layers);
+        self.epoch += 1;
+        self.gen += 1;
+        let ep = self.epoch;
+        self.touched.clear();
+        self.fresh.sort_unstable_by(|a, b| b.cmp(a));
+        self.fresh.dedup();
+        for &e in ids {
+            assert!((e as usize) < self.experts, "global arena: expert {e} outside 0..{}", self.experts);
+            let k = l * self.experts + e as usize;
+            let s = loop {
+                match self.fresh.pop() {
+                    Some(s) if self.vowner[s as usize] == NONE && self.vpin[s as usize] != DISABLED => break Some(s as usize),
+                    Some(_) => continue,
+                    None => break None,
+                }
+            };
+            let Some(s) = s else { break };
+            self.record(k);
+            match self.place[k] {
+                Place::Vram(_) => panic!("global arena: a refill of layer {l} expert {e} that is in VRAM"),
+                Place::Ram(q) => {
+                    assert_eq!(self.rflight[q as usize], 0, "global arena: a refill of layer {l} expert {e} whose read is in flight");
+                    self.ram_unlink(q);
+                    self.rowner[q as usize] = NONE;
+                    self.rpf[q as usize] = false;
+                    self.rfreed[q as usize] = ep;
+                    self.rfree.push(q);
+                }
+                Place::Nvme => {}
+            }
+            self.vowner[s] = k as u32;
+            self.place[k] = Place::Vram(s as u32);
+            self.refb[s] = true;
+            self.vpin[s] = ep;
+        }
+        let mut ch: Vec<(u32, Place, Place)> = self.touched.iter().filter(|&&(k, b)| self.place[k as usize] != b).map(|&(k, b)| (k, b, self.place[k as usize])).collect();
+        ch.sort_unstable_by_key(|c| c.0);
+        ch
+    }
+
+    /// #195 S: VRAM slots came (back) since the last refill
+    pub fn refill_pending(&self) -> bool {
+        !self.fresh.is_empty()
+    }
+
+    /// #195 S: the refill is done: the hand-back and the brought-back slots are forgotten
+    pub fn refill_end(&mut self) {
+        self.lent.clear();
+        self.fresh.clear();
     }
 
     /// A staged call (sybil's `_ec_hits`): the routed experts of layer `l` are counted and the VRAM
@@ -2113,6 +2240,55 @@ fn write_back(changes: &[(u32, Place, Place)], m: &mut dyn Mover) -> Result<u64,
     Ok(n)
 }
 
+/// #195 S: a refill of MoE layer `l` ([`GlobalArena::fill`], at most `stage_cap` ids) executed as
+/// [`serve_global`]'s phases A and C: every entrant into a staging slot (from its pinned slot, or
+/// read from the NVMe through the landing), barrier, staging into its VRAM slot. Returns the
+/// moves and the NVMe reads and bytes (no locations: nothing is selected).
+pub fn serve_fill(a: &mut GlobalArena, l: usize, ids: &[u32], stage_cap: usize, m: &mut dyn Mover) -> Result<Served, String> {
+    if ids.len() > stage_cap {
+        return Err(format!("expert tiers: a refill of layer {l} stages {} records, {stage_cap} staging slots", ids.len()));
+    }
+    let n = a.experts;
+    let changes = a.fill(l, ids);
+    let mut out = Served::default();
+    let mut from_nvme = Vec::new();
+    for (s, &(k, b, af)) in changes.iter().enumerate() {
+        if k as usize / n != l || !matches!(af, Place::Vram(_)) {
+            return Err(format!("global arena: a refill of layer {l} moved key {k} from {b:?} to {af:?}"));
+        }
+        match b {
+            Place::Ram(q) => {
+                m.pinned_to_stage(q, s as u32);
+                out.moves.pinned_to_stage += 1;
+                out.moves.p2v += 1;
+            }
+            Place::Nvme => {
+                from_nvme.push(((k as usize % n) as u32, Dst::Landing(s as u32)));
+                out.moves.n2v += 1;
+            }
+            Place::Vram(_) => return Err(format!("global arena: a refill of layer {l} moved key {k} between VRAM slots")),
+        }
+    }
+    for c in from_nvme.chunks(MAX_IN_FLIGHT) {
+        out.nvme_bytes += m.nvme(c)?;
+    }
+    for &(_, d) in &from_nvme {
+        if let Dst::Landing(i) = d {
+            m.landing_to_stage(i);
+            out.moves.landing_to_stage += 1;
+        }
+    }
+    m.barrier();
+    for (s, &(_, _, af)) in changes.iter().enumerate() {
+        let Place::Vram(v) = af else { unreachable!("a refill lands in VRAM") };
+        m.stage_to_vram(s as u32, v);
+        out.moves.stage_to_vram += 1;
+    }
+    out.nvme_reads = from_nvme.len();
+    out.moves.nvme_to_landing = from_nvme.len() as u64;
+    Ok(out)
+}
+
 /// the elastic part of the global arena (sybil's `GLM53_EC_ELASTIC_GB`), since construction
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ElasticStats {
@@ -2129,6 +2305,11 @@ pub struct ElasticStats {
     /// bytes it was asked for
     pub lifted: usize,
     pub lift_bytes: u64,
+    /// #195 S: refills of the brought-back slots ([`ExpertTiers::elastic_refill`]), the experts
+    /// they placed and of those the ones read from the NVMe
+    pub refills: u64,
+    pub refilled: u64,
+    pub refill_nvme: u64,
 }
 
 /// the staging buffers of large prompt calls (sybil's `GLM53_EC_STAGE_GB` / `GLM53_EC_STAGE_MIN`)
@@ -2528,11 +2709,14 @@ struct ArenaDev {
     ring: Option<WbRing>,
     stage: Option<StageSet>,
     elastic: ElasticStats,
+    /// #195 S: a refill's error on the host thread ([`ExpertTiers::decode_ready`]), returned by the
+    /// next decode call
+    refill_err: Option<String>,
 }
 
 impl ArenaDev {
     fn new(a: GlobalArena, cfg: ArenaConfig) -> ArenaDev {
-        ArenaDev { a, cfg, chunks: Vec::new(), base_chunks: 0, ring: None, stage: None, elastic: ElasticStats::default() }
+        ArenaDev { a, cfg, chunks: Vec::new(), base_chunks: 0, ring: None, stage: None, elastic: ElasticStats::default(), refill_err: None }
     }
 
     fn reset(&mut self) {
@@ -2641,7 +2825,9 @@ impl ExpertTiers {
     /// back. `table_global` does the same at a decode call, but under `CROW_GLM_CONTROLLER` that
     /// call runs on the controller thread while the device waits for its reply, where a stream
     /// sync would wait for the device's own wait; so the host calls this before it enqueues a
-    /// controlled row, and after a prompt phase. A no-op without the global arena.
+    /// controlled row, and after a prompt phase. #195 S: the brought-back slots are refilled here
+    /// ([`ExpertTiers::elastic_refill`]); its error is returned by the next decode call. A no-op
+    /// without the global arena.
     ///
     /// # Safety
     /// A CUDA context is current; no launch reading a staging buffer is pending.
@@ -2652,6 +2838,9 @@ impl ExpertTiers {
         self.stage_end();
         if self.arena.as_ref().is_some_and(|d| d.flex().any(|c| d.chunks[c] == 0)) {
             self.elastic_exit();
+        }
+        if let Err(e) = self.elastic_refill() {
+            self.arena.as_mut().expect("the global arena").refill_err.get_or_insert(e);
         }
     }
 
@@ -2828,6 +3017,7 @@ impl ExpertTiers {
         let (rb, vpl, ppl, stage) = (self.rb, self.sizes.vram, self.sizes.pinned, self.stage);
         let d = self.arena.as_mut().expect("arena_warm without the global arena");
         let (vr, pr) = d.a.warm_plan(scores);
+        d.a.set_scores(scores);
         for (l, (v, p)) in vr.iter().zip(&pr).enumerate() {
             let inner = GpuMover { vram: 0, pinned: None, stage, landing: self.landing.p, rb, src: &self.src, recs: &self.records[l] };
             let mut m = ChunkMover { inner, vram: &d.chunks, pinned: &self.pinned, vpl, ppl, rb, ring: None };
@@ -2909,6 +3099,50 @@ impl ExpertTiers {
         d.elastic.exit += 1;
     }
 
+    /// #195 S: the VRAM slots the elastic part brought back ([`ExpertTiers::elastic_exit`],
+    /// [`ExpertTiers::elastic_lift`]) refilled instead of left empty: the experts the hand-back
+    /// wrote out to pinned, then the warm list ([`GlobalArena::refill_plan`]), moved in through
+    /// staging ([`serve_fill`], pinned copies H2D, the rest read from the NVMe). Pending reads and
+    /// write-backs land first; the device is synchronized at the end. A no-op when nothing came
+    /// back since the last refill.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading the arena is pending.
+    unsafe fn elastic_refill(&mut self) -> Result<(), String> {
+        if !self.arena.as_ref().is_some_and(|d| d.a.refill_pending()) {
+            return Ok(());
+        }
+        cuda::sync();
+        self.settle()?;
+        self.drain_flying()?;
+        let (rb, vpl, ppl, stage, cap) = (self.rb, self.sizes.vram, self.sizes.pinned, self.stage, self.stage_cap.max(1));
+        let d = self.arena.as_mut().expect("elastic_refill without the global arena");
+        if let Some(r) = d.ring.as_mut() {
+            r.sync_all();
+        }
+        let plan = d.a.refill_plan();
+        let (mut placed, mut reads) = (0u64, 0u64);
+        for (l, ids) in plan.iter().enumerate().filter(|(_, ids)| !ids.is_empty()) {
+            let inner = GpuMover { vram: 0, pinned: None, stage, landing: self.landing.p, rb, src: &self.src, recs: &self.records[l] };
+            let mut m = ChunkMover { inner, vram: &d.chunks, pinned: &self.pinned, vpl, ppl, rb, ring: None };
+            for g in ids.chunks(cap) {
+                let s = serve_fill(&mut d.a, l, g, cap, &mut m)?;
+                m.barrier();
+                placed += s.moves.stage_to_vram;
+                reads += s.nvme_reads as u64;
+                self.nvme_reads += s.nvme_reads as u64;
+                self.nvme_bytes += s.nvme_bytes;
+                self.moves[l].add(&s.moves);
+            }
+        }
+        cuda::sync();
+        d.a.refill_end();
+        d.elastic.refills += 1;
+        d.elastic.refilled += placed;
+        d.elastic.refill_nvme += reads;
+        Ok(())
+    }
+
     /// end a staged forward: the copy stream drained, per-forward buffers freed, the elastic part
     /// grown back
     ///
@@ -2941,10 +3175,18 @@ impl ExpertTiers {
     /// # Safety
     /// As [`ExpertTiers::table_for`].
     unsafe fn table_global(&mut self, l: usize, sel: &[i32], ids: &[u32], reply: Option<(Dev, u64)>) -> Result<(Dev, Served), String> {
+        if let Some(e) = self.arena.as_mut().and_then(|d| d.refill_err.take()) {
+            return Err(e);
+        }
         // a decode call ends a staged forward; the elastic part grows back when it can
         self.stage_end();
         if l == 0 && self.arena.as_ref().is_some_and(|d| d.flex().any(|c| d.chunks[c] == 0)) {
             self.elastic_exit();
+        }
+        // #195 S: and is refilled, here only off the controller and without the stager (else at
+        // `decode_ready` on the host thread)
+        if reply.is_none() && self.stager.is_none() {
+            self.elastic_refill()?;
         }
         let (rb, experts, vpl, ppl, stage) = (self.rb, self.cache.experts, self.sizes.vram, self.sizes.pinned, self.stage);
         let d = self.arena.as_mut().expect("table_global without the global arena");
@@ -3665,6 +3907,141 @@ mod arena_tests {
         a.check().unwrap();
     }
 
+    /// #195 S: the refill fills only brought-back empty slots, the hand-back's experts first (from
+    /// pinned or the NVMe), then the warm scores; it never takes a resident, never counts an
+    /// access, and frees the pinned copy (exclusive)
+    #[test]
+    fn the_refill_brings_the_hand_back_into_the_returned_slots_then_the_warm_list() {
+        let mut a = GlobalArena::new(1, 16, 6, 3).unwrap();
+        a.set_scores(&[(0..16).map(|e| if e >= 12 { 10.0 + e as f64 } else { 0.0 }).collect()]);
+        a.step(0, &[0, 1, 2, 3, 4, 5], true);
+        a.step(0, &[6, 7], false);
+        assert!(!a.refill_pending(), "nothing came back yet");
+        // the last three slots handed back: 3, 4, 5 written back as the newest, 6 and 7 dropped
+        a.disable(3..6);
+        assert!((3..6).all(|e| matches!(a.place(0, e), Place::Ram(_))) && (6..8).all(|e| a.place(0, e) == Place::Nvme), "written back");
+        a.step(0, &[8], false);
+        assert_eq!(a.place(0, 3), Place::Nvme, "the oldest write-back dropped by a later miss");
+        let c0 = a.counters()[0];
+        a.enable(3..6);
+        assert_eq!(a.refill_room(), 3);
+        let plan = a.refill_plan();
+        assert_eq!(plan, vec![vec![3, 4, 5]], "the hand-back first");
+        let ch = a.fill(0, &plan[0]);
+        assert_eq!(ch.len(), 3);
+        assert!(ch.iter().all(|c| matches!(c.2, Place::Vram(3..=5))));
+        assert_eq!(ch[0].1, Place::Nvme, "expert 3 is read from the NVMe");
+        assert!(matches!(ch[1].1, Place::Ram(_)) && matches!(ch[2].1, Place::Ram(_)), "4 and 5 from their pinned slots");
+        assert_eq!(a.counters()[0], c0, "a refill is no access");
+        a.refill_end();
+        a.check().unwrap();
+        assert!(!a.refill_pending() && a.refill_plan().iter().all(|x| x.is_empty()));
+        // grown slots without a hand-back: the warm list, highest first, never a resident
+        a.step(0, &[15], true);
+        a.add_slots(2);
+        assert_eq!(a.refill_plan(), vec![vec![13, 14]], "15 is in VRAM: the next two scores");
+        let ch = a.fill(0, &[13, 14]);
+        assert_eq!(ch.iter().map(|c| c.2).collect::<Vec<_>>(), vec![Place::Vram(6), Place::Vram(7)]);
+        assert_eq!(a.fill(0, &[12]), vec![], "no brought-back slot left: nothing moves");
+        a.refill_end();
+        a.check().unwrap();
+        // reset forgets a pending refill
+        a.disable(6..8);
+        a.enable(6..8);
+        a.reset();
+        assert!(!a.refill_pending());
+    }
+
+    /// #195 S on the serve configuration (`CROW_GLM_CPU_LANE=split`: pinned hits stay; a warm
+    /// start; most VRAM slots in the elastic part; a staged prompt moves nothing): decode on a
+    /// skewed routing, a long prompt that takes every elastic chunk (handed back with write-back),
+    /// the chunks grown back, then decode again. Left empty (before #195 S) the grown-back slots
+    /// cost decode VRAM hits: the decode's set waits in pinned, where its hits stay; refilled, the
+    /// decode hits per token after the prompt are at least those before it.
+    #[test]
+    fn decode_hits_after_a_long_prompt_come_back_with_the_refill() {
+        let (nl, ex, k, hot) = (4usize, 64usize, 8usize, 6usize);
+        let (base, chunk, chunks, pinned) = (nl, nl, 15usize, nl * 16);
+        let mut x: u64 = 0x195_5EED;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        // decode: 80 % of the picks from the layer's `hot` experts; the prompt: uniform
+        let mut row = |skew: bool| -> Vec<Vec<u32>> {
+            (0..nl)
+                .map(|l| {
+                    let mut got: Vec<u32> = Vec::with_capacity(k);
+                    while got.len() < k {
+                        let r = rnd();
+                        let e = if skew && r % 10 < 8 { l * 5 + (r >> 8) as usize % hot } else { (r >> 16) as usize % ex } as u32;
+                        if !got.contains(&e) {
+                            got.push(e);
+                        }
+                    }
+                    got.sort_unstable();
+                    got
+                })
+                .collect()
+        };
+        let decode: Vec<Vec<Vec<u32>>> = (0..700).map(|_| row(true)).collect();
+        let prompt: Vec<Vec<Vec<u32>>> = (0..512).map(|_| row(false)).collect();
+        let vram_hits = |a: &GlobalArena| a.counters().iter().map(|c| c[0]).sum::<u64>();
+        let run = |a: &mut GlobalArena, toks: &[Vec<Vec<u32>>]| -> u64 {
+            let h0 = vram_hits(a);
+            for tok in toks {
+                for (l, ids) in tok.iter().enumerate() {
+                    a.step(l, ids, arena_admits(ids.len(), false, 64));
+                }
+            }
+            vram_hits(a) - h0
+        };
+        let mut a = GlobalArena::new(nl, ex, base, pinned).unwrap();
+        a.add_slots(chunks * chunk);
+        a.set_pin_stay(true);
+        let scores: Vec<Vec<f64>> = (0..nl).map(|l| (0..ex).map(|e| if (l * 5..l * 5 + hot).contains(&e) { 10.0 } else { 1.0 / (1 + e) as f64 }).collect()).collect();
+        let (vr, pr) = a.warm_plan(&scores);
+        for l in 0..nl {
+            a.step(l, &vr[l], true);
+            a.step(l, &pr[l], false);
+        }
+        a.set_scores(&scores);
+        a.refill_end();
+        run(&mut a, &decode[..200]);
+        let before = run(&mut a, &decode[200..300]);
+        // the prompt: every elastic chunk handed back (the last first), its calls staged
+        for c in (0..chunks).rev() {
+            a.disable(base + c * chunk..base + (c + 1) * chunk);
+        }
+        for l in 0..nl {
+            let mut ids: Vec<u32> = prompt.iter().flat_map(|r| r[l].iter().copied()).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            a.mark(l, &ids);
+        }
+        for c in 0..chunks {
+            a.enable(base + c * chunk..base + (c + 1) * chunk);
+        }
+        let mut empty = a.clone();
+        empty.refill_end();
+        let mut filled = a.clone();
+        let plan = filled.refill_plan();
+        assert_eq!(plan.iter().map(|x| x.len()).sum::<usize>(), chunks * chunk, "every grown-back slot refilled");
+        for (l, ids) in plan.iter().enumerate() {
+            filled.fill(l, ids);
+        }
+        filled.refill_end();
+        filled.check().unwrap();
+        let (after_empty, after_filled) = (run(&mut empty, &decode[300..400]), run(&mut filled, &decode[300..400]));
+        let (later_empty, later_filled) = (run(&mut empty, &decode[400..700]), run(&mut filled, &decode[400..700]));
+        eprintln!("decode VRAM hits per 100 tokens: before the prompt {before}; after it left empty {after_empty} (then {later_empty} per 300), refilled {after_filled} (then {later_filled} per 300)");
+        assert!(after_empty < before, "left empty, the grown-back slots cost decode hits ({after_empty} vs {before})");
+        assert!(after_filled >= before, "refilled, the decode hits come back ({after_filled} vs {before})");
+        assert!(later_filled > later_empty, "and stay higher ({later_filled} vs {later_empty})");
+    }
+
     /// The VRAM hits of the global CLOCK arena are sybil's `ec_step_k` as `tools/glm_tier_sim.py`
     /// `dyn_run(.., "clock", "global", 64)` replays it (its pinned tier does not change VRAM):
     /// 600 tokens of the shared trace, 42 x 288 experts, top-8; the figures are the sim's.
@@ -3817,6 +4194,30 @@ mod arena_tests {
                     }
                     if variant == 3 && v >= 6 && t == 120 {
                         a.enable(v - 3..v);
+                        // #195 S: the brought-back slots refilled (the hand-back, then the scores)
+                        a.set_scores(&(0..nl).map(|l| (0..ex).map(|e| ((e * 5 + l as u64) % 11) as f64).collect()).collect::<Vec<_>>());
+                        let plan = a.refill_plan();
+                        assert_eq!(plan.iter().map(|x| x.len()).sum::<usize>(), 3, "V {v} P {p}: the three brought-back slots refilled");
+                        for (l, ids) in plan.iter().enumerate() {
+                            sim.layer = l;
+                            let before = sim.ops;
+                            let s = serve_fill(&mut a, l, ids, 2 * k, &mut sim).unwrap();
+                            sim.barrier();
+                            let ops = sim.ops.since(&before);
+                            assert_eq!((ops.nvme_to_landing, ops.landing_to_stage, ops.pinned_to_stage, ops.stage_to_vram), (s.moves.nvme_to_landing, s.moves.landing_to_stage, s.moves.pinned_to_stage, s.moves.stage_to_vram));
+                            assert_eq!(s.moves.stage_to_vram as usize, ids.len());
+                        }
+                        a.refill_end();
+                        assert_eq!(a.refill_room(), 0);
+                        for (l, e) in keys(&a, |p| p != Place::Nvme) {
+                            let loc = match a.place(l, e) {
+                                Place::Vram(s) => Loc::Vram(s),
+                                Place::Ram(q) => Loc::Pinned(q),
+                                Place::Nvme => unreachable!(),
+                            };
+                            assert!(holds(&sim, l, e, loc), "V {v} P {p}: after the refill expert {e} of layer {l} at {loc:?}");
+                        }
+                        a.check().unwrap();
                     }
                     for (l, ids) in tok.iter().enumerate() {
                         let admit = arena_admits(ids.len() * if t % 7 == 3 { 20 } else { 1 }, false, 64);
@@ -4026,6 +4427,118 @@ mod arena_tests {
             }
             a.check().unwrap();
             report(&format!("global CLOCK{}{}{} ring {vring}", if stay { " zerocopy" } else { "" }, if noadmit { " noadmit" } else { "" }, if warm.is_some() { " warm" } else { "" }), tot);
+        }
+    }
+
+    /// #195 S on recorded routing, the serve configuration of `runs/glm53-flash/sweep-20261010b`
+    /// (V 3 per layer, ring 24, P 115, pinned hits stay, admission up to 64, `$ARENA_REPLAY_WARM`;
+    /// 378 elastic chunks of 3 slots at boot = `CROW_GLM_ARENA_ELASTIC_GB=10`, 235 more lifted by
+    /// the borrowed scratch after the first prompt = the 613 of its log): the generated positions
+    /// of `$ARENA_REPLAY_DIR` decoded up to `$ARENA_REPLAY_SPLIT` (default 13000), then a prompt
+    /// (`prompt.u16` `[n][42][8]` in the same dir, 8192 rows per forward, every call staged: `mark`)
+    /// that takes every elastic chunk (handed back with write-back), the chunks grown back and the
+    /// lift added, and the decode goes on. Per token, the window before the prompt and the windows
+    /// after it: the slots left empty (before #195 S), the refill, and a refill from the warm list
+    /// alone. The boot's own refill (slots the warm plan left empty) runs in the refill arms.
+    #[test]
+    #[ignore = "needs exported routing: ARENA_REPLAY_DIR=<dir> ARENA_REPLAY_WARM=<warm.json> cargo test --release --lib arena_elastic_replay -- --ignored --nocapture"]
+    fn arena_elastic_replay_after_a_long_prompt() {
+        let dir = std::env::var("ARENA_REPLAY_DIR").expect("ARENA_REPLAY_DIR");
+        let (nl, ex, k) = (42usize, 288usize, 8usize);
+        let load = |f: &str| -> Vec<Vec<Vec<u32>>> {
+            let r = std::fs::read(format!("{dir}/{f}")).unwrap();
+            assert_eq!(r.len() % (nl * k * 2), 0);
+            r.chunks_exact(nl * k * 2).map(|t| t.chunks_exact(k * 2).map(|l| l.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]]) as u32).collect()).collect()).collect()
+        };
+        let mask = std::fs::read(format!("{dir}/mask.u8")).unwrap();
+        let all = load("routes.u16");
+        let gen: Vec<&Vec<Vec<u32>>> = all.iter().zip(&mask).filter(|(_, &m)| m == 1).map(|(t, _)| t).collect();
+        let prompt = load("prompt.u16");
+        let warm = std::env::var("ARENA_REPLAY_WARM").ok().map(|f| parse_warm(&std::fs::read_to_string(f).unwrap(), nl, 3, ex).unwrap());
+        let split: usize = std::env::var("ARENA_REPLAY_SPLIT").ok().map_or(13000, |s| s.parse().unwrap());
+        let (vpl, ring, boot_chunks, lift, ppl) = (3usize, 24usize, 378usize, 235usize, 115usize);
+        let tot = |a: &GlobalArena| a.counters().iter().fold([0u64; 3], |s, x| [s[0] + x[0], s[1] + x[1], s[2] + x[2]]);
+        let run = |a: &mut GlobalArena, toks: &[&Vec<Vec<u32>>]| -> [f64; 3] {
+            let c0 = tot(a);
+            for tok in toks {
+                for (l, ids) in tok.iter().enumerate() {
+                    a.step(l, ids, arena_admits(ids.len(), false, 64));
+                }
+            }
+            let c1 = tot(a);
+            [0, 1, 2].map(|i| (c1[i] - c0[i]) as f64 / toks.len() as f64)
+        };
+        let refill = |a: &mut GlobalArena, plan: Vec<Vec<u32>>| -> (usize, usize) {
+            let mut n = (0, 0);
+            for (l, ids) in plan.iter().enumerate() {
+                for c in a.fill(l, ids) {
+                    n.0 += 1;
+                    n.1 += (c.1 == Place::Nvme) as usize;
+                }
+            }
+            a.refill_end();
+            n
+        };
+        // boot as `arena_boot`: base slots, the ring carved off their end, the elastic chunks, the
+        // warm start
+        let mut a = GlobalArena::new(nl, ex, nl * vpl, nl * ppl).unwrap();
+        a.disable(nl * vpl - ring..nl * vpl);
+        a.add_slots(boot_chunks * vpl);
+        a.set_pin_stay(true);
+        if let Some(w) = &warm {
+            let (vr, pr) = a.warm_plan(w);
+            for l in 0..nl {
+                a.step(l, &vr[l], true);
+                a.step(l, &pr[l], false);
+            }
+            a.clear_counters();
+            a.set_scores(w);
+        }
+        let mut today = a.clone();
+        today.refill_end();
+        let p = a.refill_plan();
+        let boot = refill(&mut a, p);
+        println!("replay: {} generated positions, split at {split}, prompt {} rows, warm {}, boot refill {boot:?}", gen.len(), prompt.len(), warm.is_some());
+        let line = |name: &str, w: usize, c: [f64; 3]| println!("{name:<46} {w:>5} tokens: VRAM hits/token {:6.1}  pinned/token {:6.1}  NVMe reads/token {:6.2}", c[0], c[1], c[2]);
+        for (a, arm) in [(&mut today, "slots left empty"), (&mut a, "refill")] {
+            run(a, &gen[..split - 2000]);
+            line(&format!("{arm}: before the prompt"), 2000, run(a, &gen[split - 2000..split]));
+            for c in (0..boot_chunks).rev() {
+                let s0 = nl * vpl + c * vpl;
+                a.disable(s0..s0 + vpl);
+            }
+            for f in prompt.chunks(8192) {
+                for l in 0..nl {
+                    let mut ids: Vec<u32> = f.iter().flat_map(|r| r[l].iter().copied()).collect();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    a.mark(l, &ids);
+                }
+            }
+            for c in 0..boot_chunks {
+                let s0 = nl * vpl + c * vpl;
+                a.enable(s0..s0 + vpl);
+            }
+            a.add_slots(lift * vpl);
+            let mut variants = vec![(arm.to_string(), a.clone())];
+            if arm == "refill" {
+                let mut w = a.clone();
+                w.lent.clear();
+                let p = w.refill_plan();
+                let n = refill(&mut w, p);
+                variants.push((format!("warm-list refill {n:?}"), w));
+                let p = variants[0].1.refill_plan();
+                let n = refill(&mut variants[0].1, p);
+                variants[0].0 = format!("refill {n:?}");
+            } else {
+                variants[0].1.refill_end();
+            }
+            for (name, v) in &variants {
+                for w in [500usize, 2000, 6000] {
+                    line(&format!("{name}: after the prompt"), w, run(&mut v.clone(), &gen[split..split + w]));
+                }
+                v.check().unwrap();
+            }
         }
     }
 }
@@ -4245,6 +4758,11 @@ mod arena_gpu_tests {
                                 .unwrap();
                                 assert_eq!(calls.iter().sum::<usize>(), 4, "{what}: every row served");
                             }
+                            // #195 S: every elastic chunk handed back (written back first); the
+                            // next decode call grows them back and refills them
+                            if name.ends_with("elastic") {
+                                t.elastic_hand_back(1 << 40).unwrap();
+                            }
                         }
                     }
                     let a = t.arena().unwrap();
@@ -4257,6 +4775,13 @@ mod arena_gpu_tests {
                         t.arena_elastic_stats(),
                         t.arena_stage_stats()
                     );
+                    if name.ends_with("elastic") && v > 0 {
+                        // the last hand-back: grown back and refilled on the host thread
+                        t.decode_ready();
+                        let e = t.arena_elastic_stats().unwrap();
+                        assert!(e.enter > 0 && (e.write_backs > 0 || p == 0) && e.refilled > 0 && e.realloc_fail == 0, "{what}: chunks handed back and refilled: {e:?}");
+                        assert_eq!(t.elastic_live().unwrap().0, e.chunks, "{what}: every chunk live again");
+                    }
                     if name.starts_with("stage") && v >= 6 {
                         let st = t.arena_stage_stats().unwrap().0;
                         assert!(st.calls > 0 && st.prefetch_used > 0, "{what}: staged calls ran, some on their prefetch: {st:?}");
