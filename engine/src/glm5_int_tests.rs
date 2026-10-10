@@ -32,6 +32,7 @@ pub(crate) const KEYS: &[&str] = &[
     "CROW_NVME_POOL_PIECE_KB",
     "CROW_GLM_HCFUSE",
     "CROW_GLM_DENSE_GEMM",
+    "CROW_GLM_MOE_TC",
     "CROW_CHUNK",
     "CROW_GLM_FLAGS",
     "CROW_GLM_STAGER",

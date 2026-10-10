@@ -907,7 +907,8 @@ pub fn glm5_chunk_scratch_bytes_tc(g: &Glm5Geo, chunk: usize, cap: usize, tc: bo
 ///   ids, weights, combo list, work items, and its region: the experts' outputs, the shared
 ///   expert, gate / up of one piece of at most `GROUP_PIECE_COMBOS` combos, over the same bytes
 ///   the dense FFN of `chunk` rows);
-/// - `tc` the tensor-core row table.
+/// - `tc` the tensor-core row table;
+/// - `moe_tc` #186 the tensor-core expert scratch (`CROW_GLM_MOE_TC=1`, `glm5_moe::moe_tc_bytes`).
 pub fn glm5_chunk_scratch_parts(g: &Glm5Geo, chunk: usize, cap: usize, tc: bool) -> Vec<(&'static str, u64)> {
     use crate::glm5_mhc::{HC, MIX};
     use crate::glm5_mla::{MlaDims, MlaScratch};
@@ -928,6 +929,7 @@ pub fn glm5_chunk_scratch_parts(g: &Glm5Geo, chunk: usize, cap: usize, tc: bool)
         ("selection", above(&|m| MlaScratch::sel_bytes(&md, m))),
         ("moe", moe),
         ("tc", tc),
+        ("moe_tc", if crate::glm5_moe::moe_tc_from_env() { crate::glm5_moe::moe_tc_bytes(h, g.expert_inter, chunk) } else { 0 }),
     ]
 }
 
