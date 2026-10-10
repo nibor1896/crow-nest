@@ -271,3 +271,144 @@ extern "C" __global__ void glm5_gemv_fp4_x3(const unsigned char* __restrict__ w0
     const float gs = m == 0 ? gs0[0] : (m == 1 ? gs1[0] : gs2[0]);
     glm5_gemv_fp4_rows(w, x, gs, y + (size_t)m * rows, *k_dim_p, *ldy_p, rows, b * GLM5_FP4_RB, blockIdx.y);
 }
+
+// ---------------- crow-nest #186: the glm5_next dense NVFP4 GEMM of a prompt call ----------------
+// Y[t][n] = gs * sum_k X[t][k] W[n][k] for T >= kernels::glm5_moe::TC_MIN_ROWS prompt rows on the
+// FP16 tensor cores (`CROW_GLM_DENSE_GEMM=1`), the way exllamav3 runs its large-batch EXL3 GEMM
+// (exl3.py: reconstruct the weight to FP16 once, hgemm with FP32 accumulate). Each NVFP4 block
+// is decoded once per 128-row tile of prompt rows into shared memory as FP16: e2m1 * ue4m3 has
+// at most 6 significant bits and lies in [2^-10, 2880], so the FP16 weight is EXACT (lossless);
+// the global scale gs is applied once in the epilogue. X is rounded to FP16 (the one rounding of
+// this path) and every product is accumulated in FP32 by mma.m16n8k16. Not bit-identical to
+// glm5_gemv_fp4: the accumulation order is the tensor core's.
+//
+//   glm5_gemm_fp4_tc  grid (ceil(rows / 128), ceil(T / 128), M), block 256 (8 warps, 2 x 4, each
+//                     64 prompt rows x 32 outputs). Matrix m (M <= 3, the KDA q|k|v of one launch)
+//                     is w_m / gs_m and writes the columns m * rows .. of y (row stride ldy).
+//                     w [rows][K / 64][36] u8, x [T][K] f32 -> y [T][ldy] f32; K % 64 == 0;
+//                     k_dim_p, ldy_p, rows_p, t_p are device ints (the KERNEL_SRC rule).
+
+#define GLM5_TC_BM 128
+#define GLM5_TC_BN 128
+#define GLM5_TC_LDS 72  // halves per shared row: 64 + 8, so ldmatrix's 8 row reads hit 32 banks
+
+__device__ __forceinline__ unsigned int glm5_h2(float lo, float hi) {
+    unsigned int r;
+    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
+    return r;
+}
+__device__ __forceinline__ unsigned int glm5_smem(const void* p) {
+    unsigned int r;
+    asm("{ .reg .u64 a; cvta.to.shared.u64 a, %1; cvt.u32.u64 %0, a; }" : "=r"(r) : "l"(p));
+    return r;
+}
+__device__ __forceinline__ void glm5_ldsm4(unsigned int addr, unsigned int& r0, unsigned int& r1, unsigned int& r2, unsigned int& r3) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+__device__ __forceinline__ void glm5_mma(float* c, const unsigned int* a, unsigned int b0, unsigned int b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+extern "C" __global__ void __launch_bounds__(256) glm5_gemm_fp4_tc(
+    const unsigned char* __restrict__ w0, const unsigned char* __restrict__ w1, const unsigned char* __restrict__ w2,
+    const float* __restrict__ gs0, const float* __restrict__ gs1, const float* __restrict__ gs2,
+    const float* __restrict__ x, float* __restrict__ y, const int* __restrict__ k_dim_p, const int* __restrict__ ldy_p,
+    const int* __restrict__ rows_p, const int* __restrict__ t_p) {
+    __shared__ __align__(16) unsigned short xs[GLM5_TC_BM * GLM5_TC_LDS];
+    __shared__ __align__(16) unsigned short ws[GLM5_TC_BN * GLM5_TC_LDS];
+    const int k_dim = *k_dim_p, ldy = *ldy_p, rows = *rows_p, T = *t_p;
+    const int m = blockIdx.z;
+    const unsigned char* w = m == 0 ? w0 : (m == 1 ? w1 : w2);
+    const float gs = m == 0 ? gs0[0] : (m == 1 ? gs1[0] : gs2[0]);
+    y += (size_t)m * rows;
+    const int bpr = k_dim >> 6;
+    const int n0 = blockIdx.x * GLM5_TC_BN, t0 = blockIdx.y * GLM5_TC_BM;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = warp >> 2, wn = warp & 3;
+
+    // the loads of one k-tile (64 values): X 128 x 64 f32 as 8 float4 per thread (16 per row,
+    // coalesced), W one 36-byte block of row tid / 2, sub-blocks 2 (tid & 1) and 2 (tid & 1) + 1
+    float4 xr[8];
+    unsigned int wr[5];
+    const int wrow = tid >> 1, wh = tid & 1;
+    const unsigned int* wbase = (const unsigned int*)(w + (size_t)min(n0 + wrow, rows - 1) * bpr * 36);
+    auto load = [&](int kt) {
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const int q = tid + 256 * j, r = q >> 4, c4 = q & 15;
+            xr[j] = *(const float4*)(x + (size_t)min(t0 + r, T - 1) * k_dim + kt * 64 + c4 * 4);
+        }
+        const unsigned int* bp = wbase + kt * 9;
+        wr[0] = bp[0];
+#pragma unroll
+        for (int q = 0; q < 4; q++) wr[1 + q] = bp[1 + 4 * wh + q];
+    };
+    auto store = [&]() {
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const int q = tid + 256 * j, r = q >> 4, c4 = q & 15;
+            *(uint2*)(xs + r * GLM5_TC_LDS + c4 * 4) = make_uint2(glm5_h2(xr[j].x, xr[j].y), glm5_h2(xr[j].z, xr[j].w));
+        }
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const int sb = 2 * wh + h;
+            const float s = glm5_ue4m3((wr[0] >> (8 * sb)) & 0xFF);
+            unsigned int p[8];
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const unsigned int byte = (wr[1 + 2 * h + (j >> 2)] >> ((j & 3) * 8)) & 0xFF;
+                p[j] = glm5_h2(glm5_e2m1(byte & 0xF) * s, glm5_e2m1(byte >> 4) * s);
+            }
+            uint4* dst = (uint4*)(ws + wrow * GLM5_TC_LDS + sb * 16);
+            dst[0] = make_uint4(p[0], p[1], p[2], p[3]);
+            dst[1] = make_uint4(p[4], p[5], p[6], p[7]);
+        }
+    };
+
+    float acc[4][4][4];
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+#pragma unroll
+            for (int v = 0; v < 4; v++) acc[i][j][v] = 0.0f;
+
+    const unsigned int xs_a = glm5_smem(xs) + 2 * ((wm * 64 + (lane & 15)) * GLM5_TC_LDS + (lane >> 4) * 8);
+    const unsigned int ws_a = glm5_smem(ws) + 2 * ((wn * 32 + ((lane >> 4) << 3) + (lane & 7)) * GLM5_TC_LDS + ((lane >> 3) & 1) * 8);
+    load(0);
+    store();
+    __syncthreads();
+    for (int kt = 0; kt < bpr; kt++) {
+        if (kt + 1 < bpr) load(kt + 1);
+#pragma unroll
+        for (int ks = 0; ks < 4; ks++) {
+            unsigned int a[4][4], b[4][2];
+#pragma unroll
+            for (int mi = 0; mi < 4; mi++) glm5_ldsm4(xs_a + 2 * (mi * 16 * GLM5_TC_LDS + ks * 16), a[mi][0], a[mi][1], a[mi][2], a[mi][3]);
+#pragma unroll
+            for (int nj = 0; nj < 2; nj++) glm5_ldsm4(ws_a + 2 * (nj * 16 * GLM5_TC_LDS + ks * 16), b[2 * nj][0], b[2 * nj][1], b[2 * nj + 1][0], b[2 * nj + 1][1]);
+#pragma unroll
+            for (int mi = 0; mi < 4; mi++)
+#pragma unroll
+                for (int ni = 0; ni < 4; ni++) glm5_mma(acc[mi][ni], a[mi], b[ni][0], b[ni][1]);
+        }
+        __syncthreads();
+        if (kt + 1 < bpr) {
+            store();
+            __syncthreads();
+        }
+    }
+    const int g = lane >> 2, c = lane & 3;
+#pragma unroll
+    for (int mi = 0; mi < 4; mi++)
+#pragma unroll
+        for (int ni = 0; ni < 4; ni++)
+#pragma unroll
+            for (int v = 0; v < 4; v++) {
+                const int t = t0 + wm * 64 + mi * 16 + g + (v >> 1) * 8;
+                const int n = n0 + wn * 32 + ni * 8 + 2 * c + (v & 1);
+                if (t < T && n < rows) y[(size_t)t * ldy + n] = acc[mi][ni][v] * gs;
+            }
+}

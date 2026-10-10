@@ -6503,7 +6503,7 @@ pub mod glm5_moe {
     use cudarc::driver::sys::CUfunction;
 
     /// every entry of `GLM5_MOE_SRC`
-    pub const NAMES: &[&str] = &["glm5_router_sig_topk", "glm5_moe_gather", "glm5_swiglu_clamp", "glm5_moe_combine", "glm5_gemv_fp4", "glm5_gemv_fp4_x3"];
+    pub const NAMES: &[&str] = &["glm5_router_sig_topk", "glm5_moe_gather", "glm5_swiglu_clamp", "glm5_moe_combine", "glm5_gemv_fp4", "glm5_gemv_fp4_x3", "glm5_gemm_fp4_tc"];
     /// #191: output rows of one `glm5_gemv_fp4` block (`GLM5_FP4_RB`)
     pub const FP4_ROWS_PER_BLOCK: usize = 2;
 
@@ -6513,6 +6513,22 @@ pub mod glm5_moe {
         assert!(k % 64 == 0 && rows > 0, "glm5_gemv_fp4: [{rows}, {k}]");
         ((rows.div_ceil(FP4_ROWS_PER_BLOCK)) as u32, (32 * (k / 64).div_ceil(32).clamp(1, 8)) as u32)
     }
+    /// #186: prompt rows and outputs of one `glm5_gemm_fp4_tc` block (`GLM5_TC_BM`, `GLM5_TC_BN`)
+    pub const TC_TILE: usize = 128;
+    /// #186: a dense NVFP4 projection of at least this many rows runs on `glm5_gemm_fp4_tc` when
+    /// `CROW_GLM_DENSE_GEMM=1` (fewer rows: the GEMV); from the micro-bench
+    /// `glm5_dense_tc_gpu_bench_8192_row_chunk`
+    pub const TC_MIN_ROWS: usize = 16;
+    /// #186: the most rows one `glm5_gemm_fp4_tc` launch takes (the device row-count table)
+    pub const TC_MAX_ROWS: usize = 65_536;
+
+    /// #186: `CROW_GLM_DENSE_GEMM=1` (or `tc`): prompt calls run their dense NVFP4 projections on
+    /// the FP16 tensor cores (lossless weights, FP16 activations, FP32 accumulate; not
+    /// bit-identical to the GEMV). Unset or anything else: the GEMV (the path of record).
+    pub fn dense_gemm_from_env() -> bool {
+        matches!(std::env::var("CROW_GLM_DENSE_GEMM").ok().as_deref(), Some("1") | Some("tc"))
+    }
+
     /// threads of one router block, the most experts the router takes (`GLM5_ROUTER_THREADS`)
     pub const ROUTER_THREADS: usize = 512;
     /// the largest top-k the router takes (`GLM5_MAXK`)
@@ -6529,6 +6545,11 @@ pub mod glm5_moe {
         /// `fp4` over three matrices of one shape in one launch (the KDA q|k|v projections),
         /// grid x `3 *` [`fp4_launch`]'s
         pub fp4_x3: CUfunction,
+        /// #186: the FP16 tensor-core NVFP4 GEMM of a prompt call (`CROW_GLM_DENSE_GEMM=1`)
+        pub tc: CUfunction,
+        /// #186: device i32 `0 .. TC_MAX_ROWS` (the row count `tc` reads, a device scalar by the
+        /// KERNEL_SRC rule) while the tensor-core path is on, else 0
+        tc_rows: cuda::CUdeviceptr,
     }
 
     impl Kernels {
@@ -6536,15 +6557,51 @@ pub mod glm5_moe {
         /// A CUDA context is current.
         pub unsafe fn new() -> Kernels {
             let module = cuda::compile(super::GLM5_MOE_SRC);
-            Kernels {
+            let mut k = Kernels {
                 router: module.get("glm5_router_sig_topk"),
                 gather: module.get("glm5_moe_gather"),
                 act: module.get("glm5_swiglu_clamp"),
                 combine: module.get("glm5_moe_combine"),
                 fp4: module.get("glm5_gemv_fp4"),
                 fp4_x3: module.get("glm5_gemv_fp4_x3"),
+                tc: module.get("glm5_gemm_fp4_tc"),
+                tc_rows: 0,
                 module,
+            };
+            k.set_dense_tc(dense_gemm_from_env());
+            k
+        }
+
+        /// #186: the tensor-core path of prompt calls on or off (`CROW_GLM_DENSE_GEMM` at `new`);
+        /// on, 256 KiB of device row counts
+        ///
+        /// # Safety
+        /// A CUDA context is current; no launch reading the row counts is pending.
+        pub unsafe fn set_dense_tc(&mut self, on: bool) {
+            if on && self.tc_rows == 0 {
+                self.tc_rows = cuda::to_i32_dev(&(0..TC_MAX_ROWS as i32).collect::<Vec<_>>());
+            } else if !on && self.tc_rows != 0 {
+                cuda::free_dev(&mut self.tc_rows);
+                self.tc_rows = 0;
             }
+        }
+
+        /// #186: a projection of `t` rows runs on `tc`
+        pub fn dense_tc(&self, t: usize) -> bool {
+            self.tc_rows != 0 && t >= TC_MIN_ROWS
+        }
+
+        /// #186: queue `y = W x` for `t` rows on `glm5_gemm_fp4_tc`: `n` matrices (1 or 3) of
+        /// `[rows, K]` from `w` / `gs`, matrix m into the columns `m * rows ..` of `y` (row stride
+        /// ldy); `k_p`, `ldy_p`, `rows_p` device ints of K, ldy, rows
+        ///
+        /// # Safety
+        /// [`Kernels::dense_tc`] holds for `t`; the buffers hold the shapes.
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn gemm_tc(&self, w: [cuda::CUdeviceptr; 3], gs: [cuda::CUdeviceptr; 3], n: usize, x: cuda::CUdeviceptr, y: cuda::CUdeviceptr, k_p: cuda::CUdeviceptr, ldy_p: cuda::CUdeviceptr, rows_p: cuda::CUdeviceptr, rows: usize, t: usize) {
+            assert!(self.tc_rows != 0 && (1..TC_MAX_ROWS).contains(&t) && (1..=3).contains(&n) && rows > 0, "glm5_gemm_fp4_tc: {n} x [{rows}] x {t} rows");
+            let t_p = self.tc_rows + (t * 4) as u64;
+            super::launch_v(self.tc, rows.div_ceil(TC_TILE) as u32, t.div_ceil(TC_TILE) as u32, n as u32, 256, &[w[0], w[1], w[2], gs[0], gs[1], gs[2], x, y, k_p, ldy_p, rows_p, t_p]);
         }
     }
 }

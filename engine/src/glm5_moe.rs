@@ -430,6 +430,14 @@ impl GpuFfnPlan {
         assert!((1..=self.tokens).contains(&t), "glm5_moe: FFN rows {t} of a {}-row plan", self.tokens);
         let (h, i) = (self.hidden, self.inter);
         assert!((w.gate.rows, w.gate.cols, w.up.rows, w.up.cols, w.down.rows, w.down.cols) == (i, h, i, h, h, i), "glm5_moe: FFN weights do not fit the plan");
+        if gk.dense_tc(t) {
+            // #186 `CROW_GLM_DENSE_GEMM=1`: the three projections on the FP16 tensor-core GEMM
+            gk.gemm_tc([w.gate.w; 3], [w.gate.gs; 3], 1, x, self.g, self.prm_kh, self.prm_ki, self.prm_ki, i, t);
+            gk.gemm_tc([w.up.w; 3], [w.up.gs; 3], 1, x, self.u, self.prm_kh, self.prm_ki, self.prm_ki, i, t);
+            launch_v(gk.act, (t * i).div_ceil(256) as u32, 1, 1, 256, &[self.g, self.u, self.h, self.prm_n, self.prm_f]);
+            gk.gemm_tc([w.down.w; 3], [w.down.gs; 3], 1, self.h, y, self.prm_ki, self.prm_kh, self.prm_kh, h, t);
+            return;
+        }
         let ((gu, bu), (gd, bd)) = (kernels::glm5_moe::fp4_launch(i, h), kernels::glm5_moe::fp4_launch(h, i));
         // [w, x, gs, y, K, ldy, rows]: gate / up K = hidden, ldy = rows = inter; down the reverse
         launch_v(gk.fp4, gu, t as u32, 1, bu, &[w.gate.w, x, w.gate.gs, self.g, self.prm_kh, self.prm_ki, self.prm_ki]);
