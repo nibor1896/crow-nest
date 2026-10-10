@@ -274,6 +274,108 @@ extern "C" __global__ void __launch_bounds__(256) mul1_gemv(const unsigned long 
     mul1_store_part(part, acc0, acc1, e, S, sp, T, n, nb, lane);
 }
 
+// #187 (CROW_GLM_GEMV2=1): the T = 1 GEMV for decode. Grid, block, k-split and the f32 order
+// are those of mul1_gemv (mul1_tile_fma2 is mul1_tile_fma at T = 1, mul1_store_part as there), so
+// the bits are the same. Two changes: (1) the block loads its whole k-split at once (tps tile
+// rows x 8 tiles, at most MUL1_G2_WORDS words, 16-byte loads from every thread issued before
+// any store) and syncs once, instead of MUL1_U rows per stage with a sync each: more bytes in
+// flight per SM and no stage bubbles; small shared memory (T = 1 activations only), so more
+// blocks fit on an SM. (2) The weights decode two at a time the way the codec defines them
+// (exllamav3 decode_mul1_product_2): dp4a byte sum + 0x6400 as fp16 bits, one fma.rn.f16x2
+// with k_inv, k_bias; that single fp16 rounding is the one mul1_w emulates in f32, so the
+// weights are the same, without mul1_w's int-to-float and float-to-half conversions.
+#define MUL1_G2_WORDS 4096
+
+__device__ __forceinline__ void mul1_w2(unsigned int st0, unsigned int st1, float& w0, float& w1) {
+    unsigned int x0 = st0 * 0x83DCD12Du, x1 = st1 * 0x83DCD12Du, s0, s1, r;
+    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(s0) : "r"(x0), "r"(0x01010101u), "r"(0x6400u));
+    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(s1) : "r"(x1), "r"(0x01010101u), "r"(0x6400u));
+    unsigned int h = __byte_perm(s0, s1, 0x5410);
+    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(r) : "r"(h), "r"(0x1eee1eeeu), "r"(0xc931c931u));
+    unsigned short lo, hi;
+    asm("mov.b32 {%0, %1}, %2;" : "=h"(lo), "=h"(hi) : "r"(r));
+    w0 = mul1_h2f(lo);
+    w1 = mul1_h2f(hi);
+}
+
+__device__ __forceinline__ unsigned int mul1_state(const unsigned int* w, int i, int i1, int o) {
+    unsigned long long pair = ((unsigned long long)w[i] << 32) | w[i1];
+    return (unsigned int)(pair >> (48 - o)) & 0xffffu;
+}
+
+// p as mul1_gemv (p[7] = T must be 1). xh: [E][1][k]; part: [E][S][1][n]
+extern "C" __global__ void __launch_bounds__(256) mul1_gemv2(const unsigned long long* __restrict__ ptrs, const float* __restrict__ xh,
+                                                             float* __restrict__ part, const int* __restrict__ p) {
+    const int k = p[0], n = p[1], S = p[2], n32 = p[4], bits = p[5], half = p[6];
+    const int e = blockIdx.z, sp = blockIdx.y;
+    const unsigned long long tbase = ptrs[e] + (unsigned long long)p[3];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int tiles_n = n >> 4, tps = (k >> 4) / S;
+    const int nb0 = blockIdx.x * 8, nb = nb0 + warp;
+    const int kb0 = sp * tps, rows = tps * 16;
+    __shared__ float xs[MUL1_XROWS];
+    __shared__ __align__(16) unsigned int tw[MUL1_G2_WORDS];
+    const int run4 = 2 * n32, tot4 = tps * run4;
+    uint4 rg[MUL1_G2_WORDS / 4 / 256];
+    if ((tbase & 15ull) == 0) {
+        #pragma unroll
+        for (int q = 0; q < MUL1_G2_WORDS / 4 / 256; q++) {
+            const int i = threadIdx.x + q * 256;
+            if (i < tot4) {
+                const int u = i / run4, c = i - u * run4;
+                rg[q] = ((const uint4*)tbase)[((((size_t)(kb0 + u) * tiles_n + nb0) * n32) >> 2) + c];
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int q = 0; q < MUL1_G2_WORDS / 4 / 256; q++) {
+            const int i = threadIdx.x + q * 256;
+            if (i < tot4) {
+                const int u = i / run4, c = i - u * run4;
+                const unsigned int* s = (const unsigned int*)tbase + ((size_t)(kb0 + u) * tiles_n + nb0) * n32 + 4 * c;
+                rg[q] = make_uint4(s[0], s[1], s[2], s[3]);
+            }
+        }
+    }
+    for (int i = threadIdx.x; i < rows; i += blockDim.x) xs[i] = xh[(size_t)e * k + (size_t)kb0 * 16 + i];
+    #pragma unroll
+    for (int q = 0; q < MUL1_G2_WORDS / 4 / 256; q++) {
+        const int i = threadIdx.x + q * 256;
+        if (i < tot4) ((uint4*)tw)[i] = rg[q];
+    }
+    int lo[8], wi[8], wi1[8], wo[8];
+    mul1_lane_lo(lo, lane, bits, half, n32);
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        wi[j] = lo[j] >> 5;
+        wo[j] = lo[j] & 31;
+        wi1[j] = (wi[j] + 1 == n32) ? 0 : wi[j] + 1;
+    }
+    __syncthreads();
+    const int rbase = 2 * (lane & 3);
+    float a = 0.0f, b = 0.0f;
+    for (int u = 0; u < tps; u++) {
+        const unsigned int* w = tw + u * 8 * n32 + warp * n32;
+        float wv[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j += 2) mul1_w2(mul1_state(w, wi[j], wi1[j], wo[j]), mul1_state(w, wi[j + 1], wi1[j + 1], wo[j + 1]), wv[j], wv[j + 1]);
+        const float* xr = xs + u * 16 + rbase;
+        float x0 = xr[0], x1 = xr[1], x8 = xr[8], x9 = xr[9];
+        a = fmaf(wv[0], x0, a);
+        a = fmaf(wv[1], x1, a);
+        a = fmaf(wv[2], x8, a);
+        a = fmaf(wv[3], x9, a);
+        b = fmaf(wv[4], x0, b);
+        b = fmaf(wv[5], x1, b);
+        b = fmaf(wv[6], x8, b);
+        b = fmaf(wv[7], x9, b);
+    }
+    float acc0[MUL1_MAXT], acc1[MUL1_MAXT];
+    acc0[0] = a;
+    acc1[0] = b;
+    mul1_store_part(part, acc0, acc1, e, S, sp, 1, n, nb, lane);
+}
+
 // The first GEMV kernel of #180, kept as the reference arm of the bit-identity test and the
 // benchmark: grid and block as mul1_gemv, but warp w loads its own tile (lane i < n32 loads word
 // i, MUL1_U tiles, through warp-private shared memory, no prefetch). From pinned RAM that load
