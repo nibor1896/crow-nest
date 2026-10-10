@@ -2440,6 +2440,12 @@ pub struct StageStats {
     /// calls restaged synchronously through the pageable landing (a selected id outside the
     /// layer's plan: more non-VRAM experts than a staging buffer holds)
     pub sync_restaged: u64,
+    /// #196 round 3: calls of at least `stage_min` picks run in row sub-batches because no pair of
+    /// per-forward buffers fit next to the prompt scratch (or their allocation was refused), the
+    /// refused allocations, and the records per buffer of the last staged forward
+    pub unfit: u64,
+    pub alloc_fail: u64,
+    pub fit: u64,
 }
 
 /// #196: the template's prefill ring (`GLM53_NV_PF_RING` 192 slots, glm53-flash-offload @ 6769b27
@@ -2468,6 +2474,41 @@ pub fn stage_records(c: &ArenaConfig, experts: usize, record_bytes: u64) -> usiz
     } else {
         ((c.stage_bytes / record_bytes) as usize).min(experts)
     }
+}
+
+/// #196 round 3: the records each of the two per-forward staging buffers holds when `avail` bytes
+/// of VRAM are left for both (above [`ARENA_RESERVE_BYTES`], after the prompt scratch the plan
+/// books): a whole layer (`whole`) when two fit, else the `CROW_GLM_ARENA_STAGE_GB` size
+/// (`cfg_records`, at least one row's `topk`) when two of those fit, else 0 = the forward runs
+/// unstaged, every call in row sub-batches through the prefill staging set.
+pub fn stage_fit_records(avail: u64, rb: u64, whole: usize, cfg_records: usize, topk: usize) -> usize {
+    if rb == 0 {
+        return 0;
+    }
+    let per = (avail / 2 / rb) as usize;
+    let cfg = cfg_records.min(whole);
+    if per >= whole {
+        whole
+    } else if cfg >= topk.max(1) && per >= cfg {
+        cfg
+    } else {
+        0
+    }
+}
+
+// #196 round 3, tests: the per-forward staging buffer (0 or 1) whose allocation is refused
+#[cfg(test)]
+thread_local! {
+    static STAGE_ALLOC_FAIL_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// #196 round 3: per-forward staging buffer `i` of `bytes`
+unsafe fn stage_alloc(i: usize, bytes: usize) -> Result<Dev, String> {
+    #[cfg(test)]
+    if STAGE_ALLOC_FAIL_TEST.with(|c| c.get()) == Some(i) {
+        return Err(format!("test: staging buffer {i} refused"));
+    }
+    cuda::try_alloc_zeroed("glm5 arena staging buffer", bytes).map_err(|e| format!("{e:?}"))
 }
 
 /// #196: the pinned bytes of the stage engine (ring slots plus two flag words per slot, rounded up
@@ -2800,6 +2841,11 @@ impl Drop for StageEngine {
 struct StageSet {
     bufs: [Dev; 2],
     nst: usize,
+    /// #196 round 3: the records per buffer of the open forward (`nst` when permanent), and the
+    /// size the prompt about to run planned for its forwards ([`ExpertTiers::stage_plan_prompt`];
+    /// `None` = sized at the forward's start)
+    fwd: usize,
+    fit: Option<usize>,
     /// allocated at construction (no elastic part), else for one staged forward
     permanent: bool,
     stream: sys::CUstream,
@@ -2959,6 +3005,9 @@ impl ExpertTiers {
             return;
         }
         self.stage_end();
+        if let Some(st) = self.arena.as_mut().and_then(|d| d.stage.as_mut()) {
+            st.fit = None;
+        }
         if self.arena.as_ref().is_some_and(|d| d.flex().any(|c| d.chunks[c] == 0)) {
             self.elastic_exit();
         }
@@ -3045,7 +3094,7 @@ impl ExpertTiers {
     fn arena_extra_vram_bytes(&self) -> u64 {
         let Some(d) = self.arena.as_ref() else { return 0 };
         let flex = d.chunks[d.base_chunks..].iter().filter(|&&c| c != 0).count() as u64 * self.sizes.vram as u64 * self.rb;
-        let stage = d.stage.as_ref().map_or(0, |s| if s.bufs[0] != 0 { 2 * s.nst as u64 * self.rb } else { 0 });
+        let stage = d.stage.as_ref().map_or(0, |s| if s.bufs[0] != 0 { 2 * s.fwd as u64 * self.rb } else { 0 });
         flex + stage
     }
 
@@ -3113,6 +3162,8 @@ impl ExpertTiers {
                 eng: StageEngine::new(prefill_ring_slots(nst), PREFILL_RING_QD, rb),
                 bufs,
                 nst,
+                fwd: if permanent { nst } else { 0 },
+                fit: None,
                 permanent,
                 stream: cuda::stream_create_non_blocking(),
                 ready: [cuda::event_create(), cuda::event_create()],
@@ -3613,7 +3664,7 @@ impl ExpertTiers {
         let st = d.stage.as_mut().expect("stage_plan_start without staging");
         st.stats.host_wait_ns += Self::stage_plan_end(st, rb);
         let a = &d.a;
-        let plan = stage_plan(&|l, e| a.place(l, e), l, nl, experts, st.nst, a.generation());
+        let plan = stage_plan(&|l, e| a.place(l, e), l, nl, experts, st.fwd, a.generation());
         st.eng.begin(plan, &self.records, &self.src, rb);
         st.stats.plans += 1;
     }
@@ -3686,31 +3737,33 @@ impl ExpertTiers {
     /// (every non-VRAM expert of the layer, up to the buffer) or now when that prefetch is stale
     /// or misses a selected id. One `run` for all rows; then the next MoE layer is prefetched into
     /// the other buffer while this one computes. `false` = more selected records than a buffer
-    /// holds: the caller serves the call in sub-batches.
+    /// holds, or no pair of per-forward buffers fits next to the prompt scratch: the caller serves
+    /// the call in sub-batches.
     ///
     /// # Safety
     /// As [`ExpertTiers::tables_for_chunk`].
     unsafe fn stage_call(&mut self, l: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<bool, String> {
         let (experts, rb, vpl, ppl, nl) = (self.cache.experts, self.rb, self.sizes.vram, self.sizes.pinned, self.slots.len());
         let ids = distinct_ids(sel, experts)?;
-        let nst = self.arena.as_ref().and_then(|d| d.stage.as_ref()).expect("stage_call without staging").nst;
         // a staged forward begins: per-forward buffers come from the elastic part's memory (its
-        // hand-back moves VRAM experts, so the staged set is taken after it)
+        // hand-back moves VRAM experts, so the staged set is taken after it), sized to what fits
+        // (#196 round 3: [`ExpertTiers::stage_plan_prompt`], else now)
         let begin = !self.arena.as_ref().and_then(|d| d.stage.as_ref()).expect("staging").in_forward;
         if begin {
             if let Some(r) = self.arena.as_mut().and_then(|d| d.ring.as_mut()) {
                 r.sync_all();
             }
-            let permanent = self.arena.as_ref().and_then(|d| d.stage.as_ref()).expect("staging").permanent;
+            let (permanent, planned) = self.arena.as_ref().and_then(|d| d.stage.as_ref()).map(|s| (s.permanent, s.fit)).expect("staging");
             if !permanent {
-                self.elastic_enter(2 * nst as u64 * rb)?;
-                let st = self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging");
-                for i in 0..2 {
-                    st.bufs[i] = cuda::try_alloc_zeroed("glm5 arena staging buffer", nst * rb as usize).map_err(|e| format!("{ARENA_STAGE_ENV}: a staging buffer does not fit after the elastic hand-back: {e:?}"))?;
+                let fit = planned.unwrap_or_else(|| self.stage_fit_now(0));
+                if fit == 0 || !self.stage_open(fit)? {
+                    self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging").stats.unfit += 1;
+                    return Ok(false);
                 }
             }
             self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging").in_forward = true;
         }
+        let nst = self.arena.as_ref().and_then(|d| d.stage.as_ref()).expect("stage_call without staging").fwd;
         let need: Vec<u32> = {
             let d = self.arena.as_ref().expect("stage_call without the global arena");
             ids.iter().copied().filter(|&e| !matches!(d.a.place(l, e), Place::Vram(_))).collect()
@@ -3790,6 +3843,71 @@ impl ExpertTiers {
             self.stage_issue_plan(l + 1, (l + 1) % 2, None)?;
             self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging").stats.prefetched += 1;
         }
+        Ok(true)
+    }
+
+    /// #196 round 3: the records per per-forward staging buffer that fit with `scratch` more bytes
+    /// still to be taken by the prompt (the plan's booked prompt scratch): free VRAM, the live
+    /// elastic chunks (the hand-back frees them) and an open forward's buffers, less
+    /// [`ARENA_RESERVE_BYTES`], the scratch and a prefill staging set not yet allocated
+    /// ([`stage_fit_records`]). 0 without staging.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn stage_fit_now(&self, scratch: u64) -> usize {
+        let Some(d) = self.arena.as_ref() else { return 0 };
+        let Some(st) = d.stage.as_ref() else { return 0 };
+        let rb = self.rb;
+        let live = d.flex().filter(|&c| d.chunks[c] != 0).count() as u64 * self.sizes.vram as u64 * rb;
+        let open = if st.permanent { 0 } else { st.bufs.iter().filter(|&&b| b != 0).count() as u64 * st.fwd as u64 * rb };
+        let pf = if self.pf_cap == 0 { prefill_stage_slots(self.topk) as u64 * rb } else { 0 };
+        let avail = (cuda::free_vram_bytes() + live + open).saturating_sub(ARENA_RESERVE_BYTES + scratch + pf);
+        stage_fit_records(avail, rb, self.cache.experts, (d.cfg.stage_bytes / rb.max(1)) as usize, self.topk)
+    }
+
+    /// #196 round 3: size the per-forward staging buffers of the prompt about to run, before it
+    /// borrows `scratch` bytes (`Glm5Run::borrow_bytes`, the scratch the plan books; 0 = none):
+    /// a whole layer, the `CROW_GLM_ARENA_STAGE_GB` size or none ([`ExpertTiers::stage_fit_now`]),
+    /// kept for the prompt's forwards until [`ExpertTiers::decode_ready`]. A no-op without
+    /// per-forward staging.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn stage_plan_prompt(&mut self, scratch: u64) {
+        if !self.arena.as_ref().and_then(|d| d.stage.as_ref()).is_some_and(|s| !s.permanent) {
+            return;
+        }
+        let fit = self.stage_fit_now(scratch);
+        self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging").fit = Some(fit);
+    }
+
+    /// #196 round 3: the per-forward staging buffers of `fit` records each from the elastic
+    /// part's memory. `false` = an allocation was refused: the buffer taken before it is freed
+    /// (no forward is open, so [`ExpertTiers::stage_end`] would not), and the prompt's remaining
+    /// forwards run in row sub-batches.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no staged forward is open.
+    unsafe fn stage_open(&mut self, fit: usize) -> Result<bool, String> {
+        let rb = self.rb;
+        self.elastic_enter(2 * fit as u64 * rb)?;
+        let st = self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging");
+        for i in 0..2 {
+            match stage_alloc(i, fit * rb as usize) {
+                Ok(p) => st.bufs[i] = p,
+                Err(e) => {
+                    for b in &mut st.bufs {
+                        cuda::free_dev(b);
+                    }
+                    st.stats.alloc_fail += 1;
+                    st.fit = Some(0);
+                    tracing::info!(target: "glm5", "[glm5] {ARENA_STAGE_ENV}: a staging buffer of {fit} records does not fit after the elastic hand-back ({e}); the prompt runs in row sub-batches");
+                    return Ok(false);
+                }
+            }
+        }
+        st.fwd = fit;
+        st.stats.fit = fit as u64;
         Ok(true)
     }
 
@@ -5048,6 +5166,28 @@ mod arena_gpu_tests {
         assert_eq!(p.nv, vec![(1, 2), (1, 3), (2, 2), (2, 3)]);
     }
 
+    /// #196 round 3: the per-forward buffers hold a whole layer when two fit, else the
+    /// `CROW_GLM_ARENA_STAGE_GB` size, else none (the forward runs in row sub-batches); the
+    /// measured case (606 elastic chunks of 27.1 MiB, 15.87 GiB scratch borrowed) leaves no pair
+    #[test]
+    fn the_staging_buffers_are_sized_to_what_the_scratch_leaves() {
+        let rb = 9_474_048u64;
+        let pair = |r: u64| 2 * r * rb;
+        assert_eq!(stage_fit_records(pair(288), rb, 288, 96, 8), 288, "two whole layers");
+        assert_eq!(stage_fit_records(u64::MAX / 4, rb, 288, 96, 8), 288);
+        assert_eq!(stage_fit_records(pair(288) - 1, rb, 288, 96, 8), 96, "the CROW_GLM_ARENA_STAGE_GB size");
+        assert_eq!(stage_fit_records(pair(96), rb, 288, 96, 8), 96);
+        assert_eq!(stage_fit_records(pair(96) - 1, rb, 288, 96, 8), 0, "row sub-batches");
+        assert_eq!(stage_fit_records(0, rb, 288, 96, 8), 0);
+        assert_eq!(stage_fit_records(pair(288), rb, 288, 4, 8), 288, "a whole layer needs no STAGE_GB size");
+        assert_eq!(stage_fit_records(pair(200), rb, 288, 4, 8), 0, "a STAGE_GB size under top-k never stages");
+        assert_eq!(stage_fit_records(pair(200), rb, 288, 1000, 8), 0, "the STAGE_GB size is at most a layer");
+        assert_eq!(stage_fit_records(pair(288), 0, 288, 96, 8), 0);
+        let (live, scratch, free) = (606 * (27.1 * 1048576.0) as u64, (15.87 * GIB) as u64, ARENA_RESERVE_BYTES + (1 << 28));
+        let avail = (free + live).saturating_sub(ARENA_RESERVE_BYTES + scratch);
+        assert_eq!(stage_fit_records(avail, rb, 288, (2.5 * GIB) as usize / rb as usize, 8), 0);
+    }
+
     #[test]
     fn the_prefill_ring_is_sized_from_the_staging_buffers_and_booked_off_the_pinned_budget() {
         assert_eq!((prefill_ring_slots(0), prefill_ring_slots(16), prefill_ring_slots(288), PREFILL_RING_QD), (1, 16, PREFILL_RING_MAX, 24));
@@ -5250,6 +5390,110 @@ mod stage2_gpu_tests {
         let kl = r.iter().map(|x| x.1).fold(0.0, f64::max);
         eprintln!("glm5_stage2 G3: logits cosine min {cos:.7}, KL max {kl:.3e}, top-1 {}/{}", r.iter().filter(|x| x.2).count(), r.len());
         assert!(cos >= 0.9999, "logits cosine {cos} under G3's 0.9999");
+    }
+
+    /// #196 round 3: the stage2 model with an elastic part (`CROW_GLM_ARENA_ELASTIC_GB=1`) whose
+    /// prompt borrows its scratch, staging at 48 records (`CROW_GLM_ARENA_STAGE_GB`, a whole
+    /// layer is 144). A VRAM ballast leaves what the arm's prompt needs (the plan's booked
+    /// scratch, the prefill staging set, the reserve) plus `a` bytes for the staging buffers:
+    /// -0.5 GB (red before: two whole-layer buffers taken whatever the scratch leaves; WDDM pages
+    /// what does not fit instead of refusing it), 1.3 GB (two 48-record buffers, not two layers);
+    /// without a ballast two whole layers; and with the second buffer's allocation refused (red
+    /// before: the first one outlives the prompt). Every prompt succeeds, staged or in row
+    /// sub-batches, no staging buffer survives a prompt, ids equal and logits within G3 (cosine
+    /// >= 0.9999) of the per-layer run.
+    #[test]
+    #[ignore = "needs the GPU (it fills the free VRAM for a moment, a 3.6 GB synthetic container in the temp dir): cargo test --release --lib glm5_stage_fit_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_stage_fit_gpu_a_prompt_never_fails_on_a_staging_allocation() {
+        let mut g = Glm5Geo::GLM_5_3_FLASH;
+        (g.layers, g.dense_prefix, g.experts, g.topk, g.vocab) = (5, 3, 144, 8, 2048);
+        let s = synth_model(&g, REC);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let p1: Vec<i64> = (0..80).map(|i| (i * 37 + 5) % 2048).collect();
+        let p2: Vec<i64> = (0..80).map(|i| (i * 53 + 11) % 2048).collect();
+        let n = 6;
+        let pos2 = p1.len() + n - 1;
+        let sizes = TierSizes { vram: 3, pinned: 40 };
+        let cfg = 48usize;
+        let stage_gb = format!("{}", cfg as f64 * REC as f64 / GIB);
+        let global = || -> Vec<(&str, String)> {
+            vec![
+                ("CROW_CHUNK", "80".into()),
+                ("CROW_GLM_ARENA", "global".into()),
+                ("CROW_GLM_ARENA_VRING", "0".into()),
+                ("CROW_GLM_ARENA_STAGE_GB", stage_gb.clone()),
+                ("CROW_GLM_ARENA_ELASTIC_GB", "1".into()),
+            ]
+        };
+        // (name, env, VRAM left for the staging buffers, staging buffer refused, records per buffer)
+        let arms: [(&str, Vec<(&str, String)>, Option<i64>, Option<usize>, u64); 5] = [
+            ("per-layer", vec![("CROW_CHUNK", "80".into())], None, None, 0),
+            ("whole layer", global(), None, None, 144),
+            ("no pair fits", global(), Some(-500_000_000), None, 0),
+            ("STAGE_GB pair", global(), Some(1_300_000_000), None, cfg as u64),
+            ("second buffer refused", global(), None, Some(1), 0),
+        ];
+        let mut outs: Vec<(Generated, i64, Vec<f32>)> = Vec::new();
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            for (name, env, left, refuse, fit) in &arms {
+                let _env = Env::set(env);
+                let mut run = Glm5Run::load(&mut cnq, &g, &moe, pos2 + p2.len() + 1, &mut |s| eprintln!("{s}"));
+                let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, g.topk).unwrap();
+                let mut ballast: Dev = 0;
+                if let Some(a) = left {
+                    let (held, _) = run.borrow_rows().expect("the prompt borrows its scratch");
+                    let scratch = run.borrow_bytes(prompt_borrow_rows(p1.len(), 80, held));
+                    let (live, _, vpl) = tiers.elastic_live().unwrap();
+                    assert_eq!(tiers.prefill_cap(), 0);
+                    let pf = prefill_stage_slots(g.topk) as u64 * REC;
+                    let want = (ARENA_RESERVE_BYTES + scratch + pf).checked_add_signed(*a).and_then(|w| w.checked_sub((live * vpl) as u64 * REC)).expect("the elastic part is under the scratch");
+                    let free = cuda::free_vram_bytes();
+                    assert!(free > want + (1 << 30), "{name}: {free} B free, {want} B wanted");
+                    ballast = cuda::try_alloc_zeroed("test ballast", (free - want) as usize).unwrap();
+                    eprintln!("glm5_stage_fit {name}: scratch {scratch} B, elastic {} B, ballast {} B", (live * vpl) as u64 * REC, free - want);
+                }
+                STAGE_ALLOC_FAIL_TEST.with(|c| c.set(*refuse));
+                let gen = run.generate(&mut cnq, &mut tiers, &p1, n, true, &mut |_| {});
+                let gen = gen.unwrap_or_else(|e| panic!("{name}: the first prompt failed: {e}"));
+                let staged = tiers.arena_stage_stats();
+                let id2 = run.prefill(&mut cnq, &mut tiers, &p2, pos2, &mut |_| {}).unwrap_or_else(|e| panic!("{name}: the second prompt failed: {e}"));
+                STAGE_ALLOC_FAIL_TEST.with(|c| c.set(None));
+                let lg = cuda::dtoh(run.logits_dev(), g.vocab);
+                if let Some((st0, _)) = staged {
+                    let st = tiers.arena_stage_stats().unwrap().0;
+                    eprintln!("glm5_stage_fit {name}: stage after prompt 1 {st0:?}, after prompt 2 {st:?}");
+                    let bufs = tiers.arena.as_ref().and_then(|d| d.stage.as_ref()).map(|s| s.bufs).unwrap();
+                    assert_eq!(bufs, [0, 0], "{name}: no staging buffer outlives the prompt");
+                    let top = cuda::live_dev_top(4096);
+                    assert!(!top.contains(&(144 * REC as usize)) && !top.contains(&(cfg * REC as usize)), "{name}: a staging buffer leaked");
+                    assert_eq!(st0.fit, *fit, "{name}: the records per buffer of prompt 1");
+                    match (left, refuse) {
+                        (None, None) => assert_eq!((st0.calls, st0.unfit, st0.alloc_fail), (2, 0, 0), "{name}: every MoE layer staged"),
+                        (Some(a), _) if *a <= 0 => assert_eq!((st0.calls, st0.unfit, st0.alloc_fail), (0, 2, 0), "{name}: every MoE layer in row sub-batches, nothing allocated"),
+                        (Some(_), _) => assert_eq!((st0.calls + st0.fallbacks, st0.unfit, st0.alloc_fail), (2, 0, 0), "{name}: every MoE layer on the smaller pair"),
+                        (None, Some(_)) => assert_eq!((st0.calls, st0.unfit, st0.alloc_fail), (0, 2, 1), "{name}: refused once, every MoE layer in row sub-batches"),
+                    }
+                }
+                tiers.free();
+                run.free();
+                if ballast != 0 {
+                    cuda::free_dev(&mut ballast);
+                }
+                outs.push((gen, id2, lg));
+            }
+        }
+        let base = &outs[0];
+        for ((name, ..), got) in arms.iter().zip(&outs).skip(1) {
+            assert_eq!((&got.0.ids, got.1), (&base.0.ids, base.1), "{name}: ids");
+            let mut r: Vec<(f64, f64, bool)> = got.0.logits.iter().zip(&base.0.logits).map(|(p, q)| g3(q, p)).collect();
+            r.push(g3(&base.2, &got.2));
+            let cos = r.iter().map(|x| x.0).fold(1.0, f64::min);
+            eprintln!("glm5_stage_fit {name} G3: logits cosine min {cos:.7}");
+            assert!(cos >= 0.9999, "{name}: logits cosine {cos} under G3's 0.9999");
+        }
     }
 
     /// Bench: the routed experts of one 8192-row prompt call at GLM-5.3-Flash shapes, uniform
@@ -9008,6 +9252,8 @@ impl Glm5Run {
         // CROW_GLM_ARENA elastic: borrow the scratch this prompt's calls need, give it back
         // whatever happens
         let borrow_t = self.borrow.map_or(0, |b| prompt_borrow_rows(n, self.prompt_chunk, b.0));
+        // #196 round 3: the staging buffers sized to what the scratch leaves, before it is taken
+        tiers.stage_plan_prompt(self.borrow_bytes(borrow_t));
         if borrow_t > 0 {
             self.borrow_scratch(tiers, borrow_t)?;
         }
